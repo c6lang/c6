@@ -13,6 +13,7 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 | `package NAME { ... }` / `import NAME;` | 单文件与跨 TU 的包与名字修饰（`NAME__sym`） |
 | `interface` / `impl` | 胖指针（`{void *self; const VT *vt;}`）+ vtable 的接口抽象 |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
+| 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
 
 扩展默认不启用，且是**编译期可裁剪**的：不定义 `TCC_EXT` 构建出的编译器与上游 TCC 行为完全一致。
 
@@ -229,6 +230,69 @@ import math;
 int main(void) { return add(1, 2); }   /* 也叫 math__add */
 ```
 
+### 变量必须初始化
+
+扩展模式下，**每个变量定义都必须带初始化器**，否则编译报错
+（`variable 'x' must be initialized`）：
+
+```c
+int counter = 0;                  /* 文件作用域的定义也要写 */
+static int instances = 0;
+
+int main(void)
+{
+    int i = 0;
+    int a[3] = {1, 2, 3};
+    struct Circle c = {0};
+    const char *p = 0;
+    for (int k = 0; k < 3; k++)   /* C99 for 声明同样受限 */
+        i += k;
+    return i;
+}
+```
+
+速查：
+
+| 写法 | 行为 |
+|---|---|
+| `int x = 0;` / `int a[3] = {0};` / `struct S s = {0};` | 合法 |
+| `int x;`（自动变量、全局、`static` 局部/全局、`for` 声明） | 报错 |
+| `extern int x;` | 合法（声明，不是定义） |
+| 函数形参、结构体/联合体成员、`typedef` | 合法（不受此规则约束） |
+| `int a[n];`（VLA） | 合法：标准 C 不允许 VLA 带初始化器，故唯一豁免 |
+
+规则是**定义点检查**，不做数据流分析：`int x; x = 1;` 一样报错。
+诊断使用源码里书写的标识符，`package` 内的变量也报原名而不是 `pkg__x`。
+
+旧代码怎么处理：
+
+- **不开启扩展就完全不变**：不带 `-std=tcc-ext` 编译的翻译单元与上游 TCC
+  逐字节一致，老项目（包括 TCC 自己的源码）不需要改任何一行；
+- 扩展是**按翻译单元**开启的：一旦给某个 `.c` 加了 `-std=tcc-ext`，这个 TU
+  里出现的所有定义都要满足规则（包括它包含的头文件里的函数体）；
+  系统头文件实测可以正常通过（`stdio.h` / `stdlib.h` / `pthread.h` 等）；
+- K&R 老式定义：**形参声明表不受影响**（它们是形参），函数体里的局部变量
+  仍然要初始化；
+- 常见迁移写法：
+
+```c
+int i;                    ->  int i = 0;
+char buf[64];             ->  char buf[64] = {0};
+struct S s;               ->  struct S s = {0};
+int *p;                   ->  int *p = 0;
+int g;                    ->  int g = 0;      /* 全局定义同样要写 */
+for (int k; ...)          ->  for (int k = 0; ...)
+int a[n];                 ->  不用改（VLA 豁免）
+```
+
+注意两个开销：
+
+- 局部的大数组/大结构体加 `= {0}` 会真的清零（编译成一次 `memset`）；
+  如果原来就靠后续 `read`/`memset` 填满，这次清零是新增开销；
+- 在 TCC 里，**显式**写 `= {0}` 的全局/`static` 对象会落到 `.data`
+  （文件里真的存一份零），而不带初始化器的全局对象在 `.bss`。所以给
+  大缓冲区补初始化器会让可执行文件变大；迁移大型静态表时要留意这一点。
+
 ### interface / impl
 
 ```c
@@ -246,7 +310,7 @@ int describe(Shape s) { return s.area(); }   /* 结构体值隐式转换为胖�
 
 int main(void)
 {
-    Circle c; c.r = 2;
+    Circle c = {2};
     return describe(c) == 12 ? 0 : 1;
 }
 ```
@@ -287,7 +351,7 @@ PASS: errdefer 只在错误路径执行
 更完整的回归：
 
 ```sh
-make test          # 扩展模式：tests/tests2 全量（含 156..164 的 superc 专项测试）
+make test          # 扩展模式：tests/tests2 全量（含 156..165 的 superc 专项测试）
 make test-plain    # 关闭 TCC_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make test-all      # selftest + tests2
 ```
@@ -303,6 +367,8 @@ make test-all      # selftest + tests2
 - `interface` 的 `impl` 必须先于使用点可见（TCC 单趟编译的固有限制）。
 - 跨 TU：头文件里用 `package NAME { ... }` 声明 API；`impl IFACE for TYPE;` 只声明，
   vtable 由另一个 TU 提供。
+- 变量初始化检查在**定义点**做，不做数据流分析；VLA 是唯一豁免
+  （标准 C 禁止给变长数组写初始化器）。
 
 ## 上游与许可
 

@@ -239,7 +239,7 @@ void render(Drawable d) {
 }
 
 void use(void) {
-    struct Circle c;
+    struct Circle c = {0};
     render(c);              // 调用点构造 {&c, vt_Circle_Drawable}
 }
 ```
@@ -410,6 +410,7 @@ int main(void) { return add(1, 2); }
 | `interface` | 正常 impl 与调用 | 缺方法/签名不符/impl 不可见 | 多 impl、跨 TU |
 | 包管理 | 单文件导入 | 冲突、未导入使用 | 跨 TU 链接 |
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
+| 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
 
 ### 9.2 工程要求
 
@@ -453,11 +454,12 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 | 5 `interface`/`impl` | ✅ | `superc_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`superc_impl_parse`（vtable 对象 `__tcc_vt_TYPE_IFACE`）、`superc_check_impl`（缺方法/参数个数/参数类型/返回类型检查）、`superc_iface_call_prep`（调用点改写）、`superc_iface_convert`（隐式/显式转换） |
 | 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；`impl IFACE for TYPE;` 仅声明并 `extern` 引入 vtable，另一 TU 提供实现 |
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_superc_macro` / `superc_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
+| 10 变量必须初始化 | ✅ | `tccgen.c`：`superc_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 
-验收测试：`tcc/tests/tests2/156_superc_defer.c` … `164_superc_try_errors.c`，由
+验收测试：`tcc/tests/tests2/156_superc_defer.c` … `165_superc_init.c`，由
 `tests/tests2/Makefile` 自动加 `-std=tcc-ext`；未编译 `-DTCC_EXT` 时自动 SKIP
 （以 `__TCC_EXT__` 预定义探测）。`make -C tests/tests2 tests2.all` 两种构建下
-分别为 143 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
+分别为 144 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
 
 根目录自测（`tests/test.c`，21 个 test 块）：`make selftest`。
 
@@ -473,4 +475,14 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
   不引入隐藏参数，也不改变调用约定；
 - `!error` 的函数返回类型必须能表示哨兵 `-1`，因此结构体返回类型不能标注；
 - `interface` 的 `impl` 必须先于使用可见（单趟编译约束）；
+- 变量初始化检查在**定义点**做（`superc_check_var_initialized`），不做数据流
+  分析，因此 `int x; x = 1;` 也会报错；`extern` 声明、形参、结构体/联合体
+  成员、`typedef` 不是定义，不受约束；
+- VLA 是初始化规则的唯一豁免：标准 C 不允许 `int a[n] = …`，所以 VLA 仍可
+  不带初始化器；
+- 这条规则是**按翻译单元**生效的：不加 `-std=tcc-ext` 的旧代码零变化
+  （plain 构建下 tests2 仍 134 项全过）；给某个 TU 开启扩展后，该 TU 内
+  所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
+  全局/`static` 对象放进 `.data`（不写初始化器时在 `.bss`），因此给大型
+  静态缓冲区补初始化器会增大输出文件；
 - `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）。
