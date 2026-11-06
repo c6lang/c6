@@ -13047,7 +13047,7 @@ static void c6_go_parse(void)
     CType ft, fnt;
     Sym *tramp_sym, *p;
     AttributeDef ad;
-    int name, tramp, slot = 0, i, ofs, align, size;
+    int name, tramp, slot = 0, i, ofs, size;
 
     if (!fs || (fs->type.t & VT_BTYPE) != VT_FUNC || !fs->type.ref)
         tcc_error("the operand of 'go' must be a call of a plain function");
