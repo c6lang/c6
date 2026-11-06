@@ -60,6 +60,10 @@ make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 未提交的手改，bootstrap 会报错而不是静默覆盖——请把手改做成 `patches/` 里的
 补丁，或者用 `make distclean` 丢弃。
 
+补丁按纯 diff 应用，不重放补丁里的提交（作者、日期、提交说明都不带进来），
+一个补丁在 `tcc/` 里落成一个提交：提交说明取补丁标题，正文里 `patch:` 一行
+记补丁文件名。所以 `patches/` 永远是唯一真相，`tcc/` 的提交历史随时可以重建。
+
 如果网络需要代理，按环境要求导出即可（`git` 会读取）：
 
 ```sh
