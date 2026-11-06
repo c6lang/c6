@@ -1,7 +1,7 @@
 From 718b329ff217bd6bee727f53fc4f3036794e47ba Mon Sep 17 00:00:00 2001
 From: superc-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 18:46:44 +0800
-Subject: [PATCH 6/7] superc: 'error' is return-only, reject it as a parameter
+Subject: [PATCH 6/10] superc: 'error' is return-only, reject it as a parameter
 
 The error value travels back through the 'T!error' return channel (sentinel
 value + global error slot), never through arguments, so declaring

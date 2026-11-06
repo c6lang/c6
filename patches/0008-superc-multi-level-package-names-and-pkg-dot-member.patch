@@ -1,0 +1,627 @@
+From 1cf4c65f4c2c318e7a68707f1890fb11154b59dc Mon Sep 17 00:00:00 2001
+From: superc <superc@localhost>
+Date: Fri, 6 Nov 2026 20:26:24 +0800
+Subject: [PATCH 8/10] superc: multi-level package names and 'pkg.member' access
+
+A package name is purely lexical: 'acme.util' and the nested spelling
+'package acme { package util { ... } }' both compose the prefix
+'acme__util', so a symbol declared inside becomes 'acme__util__sym'.
+Nothing looks at directories or file names, and a dotted import does
+not open anything either.  Nesting composes instead of being rejected,
+which also fixes 'package a;' followed by an imported header carrying
+'package b { ... }' being reported as a nested package.
+
+'pkg.member' (any number of leading segments) resolves to the mangled
+symbol and is accepted only for a package that was imported before the
+use, or for the package the code is currently inside of.  The package
+part is grown one segment at a time, so 'pkg.obj.field' reaches the
+package global and hands the trailing '.field' back to the normal
+postfix code.  A visible identifier keeps plain C member-access
+semantics, diagnostics use the dotted spelling from the source.
+
+Tests: 166 'pkg.member', 167 diagnostics, 168 across translation units,
+172 an extension unit against a plain-C unit, 173 multi-level packages.
+tests2 149/149 with TCC_EXT.
+---
+ tccgen.c                                      | 152 ++++++++++++++++--
+ tests/tests2/166_superc_pkg_dot.c             |  62 +++++++
+ tests/tests2/166_superc_pkg_dot.expect        |  12 ++
+ tests/tests2/167_superc_pkg_dot_errors.c      |  34 ++++
+ tests/tests2/167_superc_pkg_dot_errors.expect |  24 +++
+ tests/tests2/168+_superc_pkg_dot_tu.c         |   6 +
+ tests/tests2/168_superc_pkg_dot_tu.c          |  21 +++
+ tests/tests2/168_superc_pkg_dot_tu.expect     |   3 +
+ tests/tests2/172+_superc_plain_interop.c      |   5 +
+ tests/tests2/172_superc_plain_interop.c       |  24 +++
+ tests/tests2/172_superc_plain_interop.expect  |   2 +
+ tests/tests2/173_superc_pkg_multi.c           |  45 ++++++
+ tests/tests2/173_superc_pkg_multi.expect      |   5 +
+ tests/tests2/Makefile                         |  16 ++
+ 14 files changed, 399 insertions(+), 12 deletions(-)
+ create mode 100644 tests/tests2/166_superc_pkg_dot.c
+ create mode 100644 tests/tests2/166_superc_pkg_dot.expect
+ create mode 100644 tests/tests2/167_superc_pkg_dot_errors.c
+ create mode 100644 tests/tests2/167_superc_pkg_dot_errors.expect
+ create mode 100644 tests/tests2/168+_superc_pkg_dot_tu.c
+ create mode 100644 tests/tests2/168_superc_pkg_dot_tu.c
+ create mode 100644 tests/tests2/168_superc_pkg_dot_tu.expect
+ create mode 100644 tests/tests2/172+_superc_plain_interop.c
+ create mode 100644 tests/tests2/172_superc_plain_interop.c
+ create mode 100644 tests/tests2/172_superc_plain_interop.expect
+ create mode 100644 tests/tests2/173_superc_pkg_multi.c
+ create mode 100644 tests/tests2/173_superc_pkg_multi.expect
+
+diff --git a/tccgen.c b/tccgen.c
+index fca3d3d..3be7822 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -191,6 +191,8 @@ static SupercIface *superc_iface_of_type(CType *type);
+ static int superc_iface_has_method(SupercIface *ifc, int m);
+ static void superc_iface_call_prep(SupercIface *ifc, int mname);
+ static Sym *superc_import_lookup(int v);
++static int superc_mangle_tok(const char *pkg, int v);
++static int superc_pkg_imported(const char *name);
+ static void gen_function(Sym *sym);
+ /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
+    already interned as TOK_ASM_test, so accept both spellings. */
+@@ -5808,6 +5810,11 @@ ST_FUNC void unary(void)
+     CType type;
+     Sym *s;
+     AttributeDef ad;
++#ifdef TCC_EXT
++    /* how the current identifier was spelled in the source, when it was a
++       'pkg.member' package-qualified access (kept for diagnostics) */
++    int dot_disp = 0;
++#endif
+ 
+     /* generate line number info */
+     if (debug_modes)
+@@ -6346,8 +6353,79 @@ special_math_val:
+         t = tok;
+         next();
+         s = sym_find(t);
++#ifdef TCC_EXT
++        /* 'pkg.member', possibly multi-level: the dotted spelling is a
++           package-qualified access that resolves to 'pkg__member'.  The
++           package part is grown one segment at a time, so 'a.b.f' first
++           tries 'a__b' and only then 'a__b__f': 'pkg.obj.field' therefore
++           still reaches a package global and hands the trailing '.field'
++           back to the normal postfix code.  A qualified access is only
++           accepted for a package imported before this point (or for the
++           package we are currently inside of); a plain visible identifier
++           keeps normal C member-access semantics. */
++        if (!s && tcc_state->superc_ext && tok == '.') {
++            char pfx[160], pkgdisp[200], disp[200];
++            int mt, n, seg;
++
++            n = snprintf(pfx, sizeof pfx, "%s", get_tok_str(t, NULL));
++            if (n >= (int)sizeof pfx)
++                tcc_error("package name too long");
++            snprintf(pkgdisp, sizeof pkgdisp, "%s", pfx);
++            snprintf(disp, sizeof disp, "%s", pfx);
++            for (;;) {
++                next();                 /* skip '.' */
++                if (tok < TOK_UIDENT)
++                    tcc_error("identifier expected after '.'");
++                seg = tok;
++                n = strlen(disp);
++                snprintf(disp + n, sizeof disp - n, ".%s",
++                         get_tok_str(seg, NULL));
++                if (n + 1 >= (int)sizeof disp)
++                    tcc_error("package name too long");
++                mt = superc_mangle_tok(pfx, seg);
++                if (!(s = sym_find_raw(mt))) {
++                    /* no such member: either the segment was part of the
++                       package name after all, or the member is missing */
++                    next();
++                    if (tok == '.') {
++                        /* one more segment follows: grow the package name */
++                        n = strlen(pfx);
++                        if (n + 2 + strlen(get_tok_str(seg, NULL))
++                            >= (int)sizeof pfx)
++                            tcc_error("package name too long");
++                        sprintf(pfx + n, "__%s", get_tok_str(seg, NULL));
++                        n = strlen(pkgdisp);
++                        snprintf(pkgdisp + n, sizeof pkgdisp - n, ".%s",
++                                 get_tok_str(seg, NULL));
++                        if (n + 1 >= (int)sizeof pkgdisp)
++                            tcc_error("package name too long");
++                        continue;
++                    }
++                    /* nothing left to name a member: report it */
++                    if (!superc_pkg_imported(pfx))
++                        tcc_error("'%s' is not an imported package "
++                                  "(use 'import %s;')", pkgdisp, pkgdisp);
++                    dot_disp = tok_alloc_const(disp);
++                    t = mt;
++                    break;
++                }
++                if (!superc_pkg_imported(pfx))
++                    tcc_error("'%s' is not an imported package "
++                              "(use 'import %s;')", pkgdisp, pkgdisp);
++                dot_disp = tok_alloc_const(disp);
++                t = mt;
++                next();                 /* skip the member name */
++                break;
++            }
++        }
++#endif
+         if (!s || IS_ASM_SYM(s)) {
+             const char *name = get_tok_str(t, NULL);
++#ifdef TCC_EXT
++            /* report the spelling used in the source, not the mangled name */
++            if (dot_disp)
++                name = get_tok_str(dot_disp, NULL);
++#endif
+             if (tok != '(')
+                 tcc_error("'%s' undeclared", name);
+             /* for simple function calls, we tolerate undeclared
+@@ -7354,7 +7432,7 @@ static void block_cleanup(struct scope *o)
+ 
+ static int superc_mangle_tok(const char *pkg, int v)
+ {
+-    char buf[192];
++    char buf[512];
+     const char *name = get_tok_str(v, NULL);
+     if (strlen(pkg) + strlen(name) + 3 > sizeof(buf))
+         tcc_error("package symbol name too long");
+@@ -7362,6 +7440,48 @@ static int superc_mangle_tok(const char *pkg, int v)
+     return tok_alloc_const(buf);
+ }
+ 
++/* Parse 'ident ( "." ident )*' and return the package prefix: the dotted
++   spelling is purely a name separator, so 'acme.util' becomes
++   "acme__util".  Nothing here looks at directories or files. */
++static char *superc_pkg_name(int *ptok)
++{
++    char buf[128];
++    int n;
++
++    if (*ptok < TOK_UIDENT)
++        expect("package name");
++    n = snprintf(buf, sizeof buf, "%s", get_tok_str(*ptok, NULL));
++    if (n >= (int)sizeof buf)
++        tcc_error("package name too long");
++    next();
++    while (*ptok == '.') {
++        next();
++        if (*ptok < TOK_UIDENT)
++            tcc_error("package name expected after '.'");
++        n += snprintf(buf + n, sizeof buf - n, "__%s",
++                      get_tok_str(*ptok, NULL));
++        if (n >= (int)sizeof buf)
++            tcc_error("package name too long");
++        next();
++    }
++    return tcc_strdup(buf);
++}
++
++/* 'pkg.member' is only allowed for a package that was imported, or for the
++   package the code currently sits in */
++static int superc_pkg_imported(const char *name)
++{
++    int i;
++
++    if (tcc_state->superc_package
++        && !strcmp(tcc_state->superc_package, name))
++        return 1;
++    for (i = 0; i < tcc_state->superc_nb_imports; i++)
++        if (!strcmp(tcc_state->superc_imports[i], name))
++            return 1;
++    return 0;
++}
++
+ /* resolve V as a member of the current package or of an imported package */
+ static Sym *superc_import_lookup(int v)
+ {
+@@ -7386,14 +7506,19 @@ static Sym *superc_import_lookup(int v)
+     return NULL;
+ }
+ 
+-static char *superc_ident_str(int *ptok)
++/* Compose 'outer' and 'inner' into a single prefix.  Nesting is not a
++   separate namespace layer: 'package a { package b { ... } }' simply
++   prefixes twice, so a symbol declared inside becomes 'a__b__sym'. */
++static char *superc_pkg_compose(const char *outer, char *inner)
+ {
+-    char *name;
+-    if (*ptok < TOK_UIDENT)
+-        expect("identifier");
+-    name = tcc_strdup(get_tok_str(*ptok, NULL));
+-    next();
+-    return name;
++    char buf[128];
++    int n;
++
++    n = snprintf(buf, sizeof buf, "%s__%s", outer, inner);
++    tcc_free(inner);
++    if (n >= (int)sizeof buf)
++        tcc_error("package name too long");
++    return tcc_strdup(buf);
+ }
+ 
+ static void superc_package_parse(void)
+@@ -7401,11 +7526,11 @@ static void superc_package_parse(void)
+     char *name, *saved;
+ 
+     next();  /* skip 'package' */
+-    name = superc_ident_str(&tok);
++    name = superc_pkg_name(&tok);
++    if (tcc_state->superc_package)
++        name = superc_pkg_compose(tcc_state->superc_package, name);
+     if (tok == '{') {
+         /* 'package NAME { ... }': the package ends with the block */
+-        if (tcc_state->superc_package)
+-            tcc_error("nested 'package' is not allowed");
+         saved = tcc_state->superc_package;
+         tcc_state->superc_package = name;
+         next();
+@@ -7413,9 +7538,11 @@ static void superc_package_parse(void)
+             decl(VT_CONST);
+         skip('}');
+         tcc_state->superc_package = saved;
++        tcc_free(name);
+     } else {
+         /* 'package NAME;' names the rest of the file (or until the next
+            'package' statement); include system headers before it */
++        tcc_free(tcc_state->superc_package);
+         tcc_state->superc_package = name;
+         skip(';');
+     }
+@@ -7424,8 +7551,9 @@ static void superc_package_parse(void)
+ static void superc_import_parse(void)
+ {
+     char *name;
++
+     next();  /* skip 'import' */
+-    name = superc_ident_str(&tok);
++    name = superc_pkg_name(&tok);
+     skip(';');
+     dynarray_add(&tcc_state->superc_imports,
+                  &tcc_state->superc_nb_imports, name);
+diff --git a/tests/tests2/166_superc_pkg_dot.c b/tests/tests2/166_superc_pkg_dot.c
+new file mode 100644
+index 0000000..2111b47
+--- /dev/null
++++ b/tests/tests2/166_superc_pkg_dot.c
+@@ -0,0 +1,62 @@
++/* superc extension: 'pkg.member' explicit package access */
++#include <stdio.h>
++
++package math {
++    int counter = 0;
++    int add(int a, int b) { return a + b; }
++    /* inside 'package math' the qualified spelling needs no import */
++    int twice(int a) { return math.add(a, a); }
++    struct Point { int x, y; };
++    struct Point origin = {3, 4};
++    int bump(void) { return ++counter; }
++}
++
++/* 'import' is allowed inside a package block and names the rest of it */
++package text {
++    import math;
++    int len(const char *s)
++    {
++        int n = 0;
++        while (s[n])
++            n++;
++        return n;
++    }
++    int len_plus(int k) { return len("ab") + math.add(k, 1); }
++}
++
++import math;
++import text;
++
++/* a qualified package function is an ordinary symbol: its address works */
++int (*add_ref)(int, int) = math.add;
++
++int main(void)
++{
++    /* qualified access, mixed with unqualified access from 'import' */
++    printf("add=%d %d\n", math.add(2, 3), add(4, 5));
++    printf("twice=%d len=%d\n", math.twice(21), text.len("hello"));
++    printf("len_plus=%d\n", text.len_plus(1));
++
++    /* package globals: read, address-of and assignment */
++    printf("counter=%d\n", math.counter);
++    printf("bump=%d\n", math.bump());
++    printf("bump=%d\n", math.bump());
++    math.counter = 10;
++    printf("counter=%d\n", math.counter);
++    printf("origin=%d,%d\n", math.origin.x, math.origin.y);
++    *&math.origin.x = 8;
++    printf("origin=%d\n", math.origin.x);
++    printf("add_ref=%d\n", add_ref(20, 22));
++
++    /* the mangled spelling keeps working and names the same object */
++    math__counter = 42;
++    printf("mangled=%d %d\n", math__add(10, 20), math__counter);
++
++    /* a visible object wins over the package name: plain C member access */
++    {
++        struct Point math = {7, 8};
++        printf("shadow=%d\n", math.x);
++    }
++
++    return 0;
++}
+diff --git a/tests/tests2/166_superc_pkg_dot.expect b/tests/tests2/166_superc_pkg_dot.expect
+new file mode 100644
+index 0000000..21a8a57
+--- /dev/null
++++ b/tests/tests2/166_superc_pkg_dot.expect
+@@ -0,0 +1,12 @@
++add=5 9
++twice=42 len=5
++len_plus=4
++counter=0
++bump=1
++bump=2
++counter=10
++origin=3,4
++origin=8
++add_ref=42
++mangled=30 42
++shadow=7
+diff --git a/tests/tests2/167_superc_pkg_dot_errors.c b/tests/tests2/167_superc_pkg_dot_errors.c
+new file mode 100644
+index 0000000..3ade96e
+--- /dev/null
++++ b/tests/tests2/167_superc_pkg_dot_errors.c
+@@ -0,0 +1,34 @@
++/* superc extension: diagnostics for 'pkg.member' */
++package math {
++    int counter = 0;
++    int add(int a, int b) { return a + b; }
++}
++
++#if defined test_not_imported
++int main(void) { return math.add(1, 2); }
++#elif defined test_not_imported_multi
++package acme { package util { int f(void) { return 1; } } }
++int main(void) { return acme.util.f(); }
++#elif defined test_parent_only_import
++package acme { package util { int f(void) { return 1; } } }
++import acme;
++int main(void) { return acme.util.f(); }
++#elif defined test_unknown_member
++import math;
++int main(void) { return math.nope; }
++#elif defined test_unknown_member_call
++import math;
++int main(void) { return math.nope(1, 2); }
++#elif defined test_missing_member_name
++import math;
++int main(void) { return math.; }
++#elif defined test_arrow_is_not_package_access
++import math;
++int main(void) { return math->add(1, 2); }
++#elif defined test_import_after_use
++int main(void) { return math.add(1, 2); }
++import math;
++#else
++import math;
++int main(void) { return math.add(1, 2) == 3 ? 0 : 1; }
++#endif
+diff --git a/tests/tests2/167_superc_pkg_dot_errors.expect b/tests/tests2/167_superc_pkg_dot_errors.expect
+new file mode 100644
+index 0000000..eae9555
+--- /dev/null
++++ b/tests/tests2/167_superc_pkg_dot_errors.expect
+@@ -0,0 +1,24 @@
++[test_not_imported]
++167_superc_pkg_dot_errors.c:8: error: 'math' is not an imported package (use 'import math;')
++
++[test_not_imported_multi]
++167_superc_pkg_dot_errors.c:11: error: 'acme.util' is not an imported package (use 'import acme.util;')
++
++[test_parent_only_import]
++167_superc_pkg_dot_errors.c:15: error: 'acme.util' is not an imported package (use 'import acme.util;')
++
++[test_unknown_member]
++167_superc_pkg_dot_errors.c:18: error: 'math.nope' undeclared
++
++[test_unknown_member_call]
++167_superc_pkg_dot_errors.c:21: warning: implicit declaration of function 'math.nope'
++tcc: error: unresolved reference to 'math__nope'
++
++[test_missing_member_name]
++167_superc_pkg_dot_errors.c:24: error: identifier expected after '.'
++
++[test_arrow_is_not_package_access]
++167_superc_pkg_dot_errors.c:27: error: 'math' undeclared
++
++[test_import_after_use]
++167_superc_pkg_dot_errors.c:29: error: 'math' is not an imported package (use 'import math;')
+diff --git a/tests/tests2/168+_superc_pkg_dot_tu.c b/tests/tests2/168+_superc_pkg_dot_tu.c
+new file mode 100644
+index 0000000..5d49a97
+--- /dev/null
++++ b/tests/tests2/168+_superc_pkg_dot_tu.c
+@@ -0,0 +1,6 @@
++/* superc extension: definitions for 168_superc_pkg_dot_tu.c */
++package math {
++    int counter = 0;
++    int add(int a, int b) { return a + b; }
++    int bump(void) { return ++counter; }
++}
+diff --git a/tests/tests2/168_superc_pkg_dot_tu.c b/tests/tests2/168_superc_pkg_dot_tu.c
+new file mode 100644
+index 0000000..eb256f4
+--- /dev/null
++++ b/tests/tests2/168_superc_pkg_dot_tu.c
+@@ -0,0 +1,21 @@
++/* superc extension: 'pkg.member' across translation units.
++   This file plays the part of a header: it declares the package API with
++   'pkg.member' and lets the other unit provide the symbols. */
++#include <stdio.h>
++
++package math {
++    int add(int a, int b);
++    int bump(void);
++    extern int counter;
++}
++
++import math;
++
++int main(void)
++{
++    printf("add=%d\n", math.add(2, 3));
++    math.counter = 5;
++    printf("counter=%d\n", math.counter);
++    printf("bump=%d\n", math.bump());
++    return 0;
++}
+diff --git a/tests/tests2/168_superc_pkg_dot_tu.expect b/tests/tests2/168_superc_pkg_dot_tu.expect
+new file mode 100644
+index 0000000..eea48cc
+--- /dev/null
++++ b/tests/tests2/168_superc_pkg_dot_tu.expect
+@@ -0,0 +1,3 @@
++add=5
++counter=5
++bump=6
+diff --git a/tests/tests2/172+_superc_plain_interop.c b/tests/tests2/172+_superc_plain_interop.c
+new file mode 100644
+index 0000000..33f61d6
+--- /dev/null
++++ b/tests/tests2/172+_superc_plain_interop.c
+@@ -0,0 +1,5 @@
++/* built for plain C (no -std=tcc-ext): the package exports are ordinary
++   symbols, so declaring the mangled name is enough to call them. */
++int math__add(int a, int b);
++
++int plain_double(int x) { return math__add(x, x); }
+diff --git a/tests/tests2/172_superc_plain_interop.c b/tests/tests2/172_superc_plain_interop.c
+new file mode 100644
+index 0000000..e4ad9f1
+--- /dev/null
++++ b/tests/tests2/172_superc_plain_interop.c
+@@ -0,0 +1,24 @@
++/* superc extension: an extension unit calling into a unit built for plain C.
++   The package symbols stay ordinary C symbols, so a plain unit can provide
++   them and can call the exported ones. */
++#include <stdio.h>
++
++package math {
++    int add(int a, int b);
++}
++
++import math;
++
++/* provided by 172+_superc_plain_interop.c, compiled without -std=tcc-ext */
++int plain_double(int x);
++
++int main(void)
++{
++    printf("add=%d\n", math.add(2, 3));
++    printf("plain_double=%d\n", plain_double(21));
++    return 0;
++}
++
++package math {
++    int add(int a, int b) { return a + b; }
++}
+diff --git a/tests/tests2/172_superc_plain_interop.expect b/tests/tests2/172_superc_plain_interop.expect
+new file mode 100644
+index 0000000..dd3dff3
+--- /dev/null
++++ b/tests/tests2/172_superc_plain_interop.expect
+@@ -0,0 +1,2 @@
++add=5
++plain_double=42
+diff --git a/tests/tests2/173_superc_pkg_multi.c b/tests/tests2/173_superc_pkg_multi.c
+new file mode 100644
+index 0000000..9a3d4e2
+--- /dev/null
++++ b/tests/tests2/173_superc_pkg_multi.c
+@@ -0,0 +1,45 @@
++/* superc extension: multi-level package names are purely lexical.
++   'acme.util' is just the prefix 'acme__util'; nothing here looks at
++   directories or file names. */
++#include <stdio.h>
++
++package acme.util {
++    int counter = 0;
++    int add(int a, int b) { return a + b; }
++    /* inside the package the qualified spelling needs no import */
++    int twice(int a) { return acme.util.add(a, a); }
++}
++
++/* nested blocks compose their prefixes: 'acme' + 'util' */
++package acme {
++    package util {
++        int len(const char *s)
++        {
++            int n = 0;
++            while (s[n])
++                n++;
++            return n;
++        }
++    }
++}
++
++/* the file-level form names the rest of the file: 'acme.crc' */
++package acme.crc;
++int sum(int a, int b) { return a + b; }
++
++import acme.util;
++import acme.crc;
++
++int main(void)
++{
++    printf("add=%d twice=%d\n", acme.util.add(2, 3), acme.util.twice(21));
++    printf("len=%d\n", acme.util.len("hello"));
++    printf("sum=%d\n", acme.crc.sum(20, 22));
++
++    /* the mangled names are the very same ordinary symbols */
++    printf("mangled=%d %d\n", acme__util__add(1, 2), acme__crc__sum(3, 4));
++
++    acme.util.counter = 7;
++    printf("counter=%d\n", acme.util.counter);
++    return 0;
++}
+diff --git a/tests/tests2/173_superc_pkg_multi.expect b/tests/tests2/173_superc_pkg_multi.expect
+new file mode 100644
+index 0000000..ca5cc5b
+--- /dev/null
++++ b/tests/tests2/173_superc_pkg_multi.expect
+@@ -0,0 +1,5 @@
++add=5 twice=42
++len=5
++sum=42
++mangled=3 7
++counter=7
+diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
+index 5962f26..6723a37 100644
+--- a/tests/tests2/Makefile
++++ b/tests/tests2/Makefile
+@@ -85,10 +85,26 @@ SUPERC_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_super
+ SUPERC_OK := $(shell echo | $(TCC_LOCAL) -std=tcc-ext -dD -E - 2>/dev/null | grep -q __TCC_EXT__ && echo yes)
+ ifneq (,$(SUPERC_OK))
+  $(SUPERC_TESTS): FLAGS += -std=tcc-ext
++ # gcc cannot build them, so their .expect files come from tcc itself
++ $(SUPERC_TESTS): GEN = $(GEN-TCC)
+  158_superc_test.test: FLAGS += -test
+  162_superc_iface_errors.test: FLAGS += -dt
+  164_superc_try_errors.test: FLAGS += -dt
+  165_superc_init.test: FLAGS += -dt
++ 167_superc_pkg_dot_errors.test: FLAGS += -dt
++ 170_superc_method_errors.test: FLAGS += -dt
++ # these compile a second file before '-run'
++ 168_superc_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
++ 168_superc_pkg_dot_tu.test: GEN = $(GEN-TCC)
++ 171_superc_method_tu.test: FLAGS += $(subst 171,171+,$1)
++ 171_superc_method_tu.test: GEN = $(GEN-TCC)
++ # 172 mixes an extension unit with a unit built for plain C
++ 172_superc_plain_interop.test: NORUN = true
++ 172_superc_plain_interop.test: GEN = $(GEN-TCC)
++ 172_superc_plain_interop.test: T1 = \
++     $(TCC) -std=tcc-ext -c $(SRC)/172_superc_plain_interop.c -o $*-ext.o && \
++     $(TCC) -c $(SRC)/172+_superc_plain_interop.c -o $*-plain.o && \
++     $(TCC) $*-ext.o $*-plain.o -o $*.exe && ./$*.exe
+ else
+  SKIP += $(SUPERC_TESTS)
+ endif

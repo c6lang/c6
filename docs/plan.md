@@ -10,7 +10,7 @@
 | **G1** | `defer` 的 `active_slot` 分配在函数 prologue，但条件/循环中 `defer` 可能多次注册，单一槽位无法表达“多次注册、多次执行” | 阻塞 | 改为**运行时 defer 记录链表**（每注册一次生成一条记录，含函数指针+参数），而非编译期单槽；清理时遍历链表逆序调用 |
 | **G2** | `defer` 清理代码“生成在函数末尾清理区”与 TCC 的代码生成模型冲突：TCC 顺序追加机器码，不能在中间“预留”末尾区域 | 阻塞 | 采用**就地生成清理块 + 跳转绕过**模式：注册时立即生成清理块和跳过跳转；清理序列通过跳转链调用，不依赖“末尾集中区域” |
 | **G3** | `goto` 跨 defer 作用域的清理判定：原方案说“复用 `local_label_stack`”，但 TCC 的 `local_label_stack` 仅记录标签，不记录作用域深度 | 高 | 引入独立的**`ScopeTracker` 栈**，与块解析同步压入/弹出，记录每层的 defer 记录起始位置；`goto` 时比对源/目标作用域，生成对应清理 |
-| **G4** | `interface` 的 vtable/thunk 在 `impl` 解析点生成，但 `impl` 可能出现在调用点之后；单趟下“调用点查找可见 impl”要求 `impl` 必须先于使用 | 高 | 首版强制 **`impl` 必须先于任何使用点的 `interface` 值构造**；跨 TU 通过 `extern` vtable 声明前置。调用点只做“查找已注册 ImplDesc”，不做代码生成回填 |
+| **G4** | `interface` 的 vtable 生成时机与单趟编译冲突：转换点可能早于实现声明 | 高 | 方法先于转换点可见即可；首次转换时登记 (类型, 接口) 并建 vtable 前置符号，**TU 末尾统一生成** `static` vtable 对象，调用点只查表不做代码回填 |
 | **G5** | `err()` 的 `goto __err_exit` 假设存在统一出口，但 TCC 没有“函数末尾统一清理标签”的现成机制 | 高 | 采用**每错误返回点就地生成清理序列**：`err()` 处直接展开 errdefer/defer 的逆序调用，然后 `return` 哨兵；不依赖间接跳转 |
 | **G6** | `test` 块的 runner 在 `-run` 模式下由 `libtcc.c` 遍历 `TCCState->tests`，但 TCC 的 `-run` 入口是用户 `main`，没有“先跑测试再跑 main”的钩子 | 中 | `-test` 模式下**不调用用户 `main`**，`libtcc.c` 直接遍历测试表；`-test` 与正常 `-run` 互斥，文档明确 |
 | **G7** | 扩展开关通过“运行时关键字映射”实现，但 TCC 的 `tok_alloc` 在词法阶段就将字符串 intern 为 `TokenSym`，后期切换映射不可行 | 中 | 改为**编译期条件编译**：`tcctok.h` 中 `#ifdef TCC_EXT` 注册新 token；扩展关闭时这些字符串根本不进入关键字映射，零运行时开销 |
@@ -27,7 +27,7 @@
 |---|---|---|
 | `tcctok.h` | 关键字与 token 编号 | `#ifdef TCC_EXT` 注册新 token；关闭时零映射 |
 | `tccpp.c` | 预处理与词法分析 | `#macro` 指令识别、`__local` 重命名、include 路径扩展 |
-| `tccgen.c` | 语法分析与代码生成 | `package/import` mangle、`interface/impl` 注册与检查、`defer/errdefer/err` 就地代码生成、`test` 块注册 |
+| `tccgen.c` | 语法分析与代码生成 | `package/import` mangle 与 `pkg.member`、结构体方法注册、`interface` 转换与 vtable 生成、`defer/errdefer/err` 就地代码生成、`test` 块注册 |
 | `tcc.h` / `libtcc.c` | 符号表与编译状态 | `TCCState` 扩展字段、`-test` runner、扩展开关 |
 
 ### 1.2 扩展开关（修复 G7）
@@ -38,7 +38,6 @@
 DEF(TOK_PACKAGE,   "package")
 DEF(TOK_IMPORT,    "import")
 DEF(TOK_INTERFACE, "interface")
-DEF(TOK_IMPL,      "impl")
 DEF(TOK_DEFER,     "defer")
 DEF(TOK_ERRDEFER,  "errdefer")
 DEF(TOK_ERR,       "err")
@@ -213,11 +212,16 @@ int handle(int n) {
   的错误，连续两个 `catch` 也不会把上一次的错误误判成这一次的。
 
 
-## 4. `interface`：显式实现 + 胖指针 ABI（修复 G4）
+## 4. `interface`：结构化实现 + 胖指针 ABI（修复 G4）
 
 ### 4.1 设计
 
-**函数体只依赖固定 ABI（胖指针 + vtable），调用点根据可见 `impl` 构造接口值。** 这样函数体代码生成与具体类型解耦。
+**函数体只依赖固定 ABI（胖指针 + vtable），调用点构造接口值。** 这样函数体代码生成与具体类型解耦。
+
+实现关系不显式声明：**结构体拥有接口要求的全部方法，就实现了该接口**。方法本身
+也是普通函数——文件作用域里首参是指向该结构体指针的函数（见 6.4），因此
+`impl Drawable for Circle { void draw(Circle *self) ... }` 里唯一有价值的信息
+（方法集合）已经由方法表提供，`impl` 语法被删除。
 
 ### 4.2 语法
 
@@ -229,17 +233,16 @@ interface Drawable {
 
 struct Circle { int r; };
 
-impl Drawable for Circle {
-    void draw(Circle *self) { /* ... */ }
-    int  area(Circle *self) { return 3 * self->r * self->r; }
-}
+/* 这两个函数就是实现：不改名、不改调用约定 */
+void draw(Circle *self) { /* ... */ }
+int  area(Circle *self) { return 3 * self->r * self->r; }
 
 void render(Drawable d) {
     d.draw();               // 生成 d.vt->draw(d.self)
 }
 
 void use(void) {
-    struct Circle c = {0};
+    Circle c = {0};
     render(c);              // 调用点构造 {&c, vt_Circle_Drawable}
 }
 ```
@@ -257,27 +260,36 @@ struct DrawableVTable {
 };
 ```
 
-`impl` 生成静态 vtable 和 thunk：
+方法就是首参为 `void *` 的普通函数，因此 vtable 直接存放方法地址，**不需要 thunk**
+（`void *self` 与 `struct Circle *self` 的表示相同）：
 
 ```c
-static void thunk_Circle_Drawable_draw(void *self) {
-    Circle_draw((struct Circle *)self);
-}
-static const struct DrawableVTable vt_Circle_Drawable = { thunk_..._draw, ... };
+static const struct Drawable_vt __tcc_vt_Circle_Drawable = {
+    (void (*)(void))draw, (void (*)(void))area
+};
 ```
 
-符号 mangle：`__tcc_vt_<Type>_<Interface>`、`__tcc_thunk_<Type>_<Interface>_<Method>`。
+符号命名：vtable 对象 `__tcc_vt_<Type>_<Interface>`（每个 TU 一份 `static`）。
 
 ### 4.4 可见性规则（修复 G4）
 
-- `impl Drawable for Circle` **必须在任何 `render(c)` 或 `Drawable d = c` 之前解析**；
-- 解析 `impl` 时立即生成 vtable/thunk，并注册 `ImplDesc{Circle, Drawable, vtable_sym}` 到 `TCCState`；
-- 调用点只做“查找 `ImplDesc`”，**不做代码生成回填**；
-- 跨 TU：头文件中 `extern const struct DrawableVTable __tcc_vt_...;` 前置声明，调用点据此构造。
+- 方法**必须在转换点之前**声明或定义（单趟编译约束）；
+- 第一次发生 `render(c)` / `Drawable d = c` / `(Drawable)c` 时校验并登记
+  `SupercAutoImpl{Circle, Drawable, vt_sym}` 到 `TCCState`，同时创建 vtable 的
+  前置符号（`extern`，还不是定义）；
+- 每个 TU 末尾由 `superc_emit_auto_impls()` 生成
+  `static const struct Drawable_vt __tcc_vt_Circle_Drawable = { ... };`；
+  生成与 `gen_inline_functions()` 交替进行（`static inline` 函数体在
+  TU 末尾才编译，其中可能又发生转换）；每个 TU 一份 `static`，因此多个
+  TU 转换同一类型不会符号冲突；
+- 跨 TU：头文件里放 `interface` 与方法声明，vtable 由各 TU 按需自行生成。
 
-### 4.5 编译期检查
+### 4.5 编译期检查（惰性）
 
-在 `impl` 解析点立即执行：接口已存在、struct 完整定义可见、方法齐全、首参为 `Type *`、去掉 self 后签名兼容、无多余方法。调用点检查：实参类型是否有可见 `ImplDesc`，否则报错。
+第一次转换时执行：接口存在、类型的方法集合覆盖接口、去掉 self 后签名（返回类型、
+参数个数、参数类型）兼容；缺方法或签名不符时诊断为
+`'Circle' does not implement interface 'Drawable': missing method 'draw'` 等。
+没有“多余方法”检查：类型可以同时实现任意多个接口。
 
 
 ## 5. `test "desc" {}`：内建测试框架（修复 G6）
@@ -332,25 +344,53 @@ test 函数内 `err(id, msg)` 就地展开清理后返回哨兵 `1`；`__tcc_err
 ```c
 package math {
     int add(int a, int b) { return a + b; }
+    int counter = 0;
 }
 import math;
-int main(void) { return add(1, 2); }
+
+int main(void) { return math.add(1, 2) + add(1, 2); }
+```
+
+包名可以是多级的，且三种写法等价（前缀都是 `math__util`）：
+
+```c
+package math.util { ... }
+package math { package util { ... } }
+package math.util;                 /* 文件级：命名文件的其余部分 */
+import math.util;
 ```
 
 ### 6.2 实现（修复 G9）
 
-`package NAME { ... }` 不引入真正的顶层块作用域，而是**mangle 语法糖**：
+`package` 不引入真正的顶层块作用域，而是**mangle 语法糖**：
 
-1. 解析 `package NAME`：在 `TCCState` 中设置 `current_package = "NAME"`；
-2. 块内每个全局符号注册时，符号名施加前缀 `NAME__`（如 `math__add`）；
-3. `import NAME;`：在当前作用域的标识符查找链中插入“尝试 `NAME__` + 原名”的重定向；
-4. 块结束恢复 `current_package = NULL`。
+1. 解析 `package NAME`：在 `TCCState` 中设置 `current_package = "NAME"`；点号与嵌套
+   都只是前缀组合（`a.b` → `a__b`，`a { b { } }` → `a__b`）；
+2. 块内每个全局符号注册时，符号名施加前缀 `NAME__`（如 `math__add`），`main` 除外；
+3. `import NAME;`：把包名登记进 `superc_imports`，不作为声明、不打开文件；
+4. 块结束恢复 `current_package = NULL`；`package NAME;` 命名文件其余部分。
+
+`pkg.member`（可多级）由 `unary()` 解析：先按普通 C 标识符查找，命中可见对象则保持
+C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sym_find_raw(pkg__seg)` 查找，
+命中且该包已 import（或就是当前包）才接受，剩下的 `.field` 交回普通 postfix 路径。
+未 import 时报 `'pkg' is not an imported package (use 'import pkg;')`。
 
 首版**不导出宏**；typedef/tag 命名空间按包隔离；`static` 保持文件内可见。
 
 ### 6.3 跨文件
 
-包清单 `package.tccpkg` 描述包路径和导出符号；编译启动时读取并生成声明头（或预声明 `Sym`）注入当前 TU。链接名固定为 mangle 规则。
+没有包清单：跨 TU 就是同名 mangle 的普通 C 符号。头文件里用
+`package NAME { ... }` 写出声明（`extern` 也行），实现在另一个 TU 的同一个包里；
+老 C 代码想调用包导出，手写 `int math__add(int, int);` 即可，反之扩展 TU 也能直接
+调用普通 C 函数。`import` 只影响源码里的 `.` 写法，不产生也不引入任何文件/目录语义。
+
+### 6.4 结构体方法
+
+`ret f(struct T *self, ...)` 在文件作用域注册为 `T` 的方法，符号名不变；
+`p->f(a)` 被改写成 `f(p, a)`（接收者先存临时槽，返回结构体时排在 sret 缓冲之后）。
+字段优先，方法须先于调用点声明，`duplicate method` 检查按 (类型, 源码名) 做，
+因此同名方法服务不同类型时要放进不同包。方法表与包 mangle 正交：包内定义的方法
+仍然用源码里写的名字注册，所以 `import` 后可直接 `p->f()`。
 
 
 ## 7. 卫生宏：`#macro` + `__local`（修复 G8）
@@ -391,7 +431,7 @@ int main(void) { return add(1, 2); }
 | **2** | `errdefer + err`：线程局部错误槽 + 就地清理 + 哨兵传播 | 多层传播逐层执行 errdefer；递归不串错误 | 1 |
 | **3** | **`test "desc" {}`**：顶层注册、`-test` 模式、`--test-filter`、与 `err` 集成 | PASS/FAIL 正确；退出码正确；后续特性用 `test` 验收 | 2 |
 | **4** | 包管理单文件：`current_package` mangle、import 重定向 | 符号可见性/冲突正确；不导出宏 | 3 |
-| **5** | `interface`：胖指针 ABI、vtable/thunk、`ImplDesc` 注册、调用点查找 | impl 先于使用强制；签名检查；用 `test` 验收 | 3 |
+| **5** | `interface`：胖指针 ABI、结构化实现、vtable 生成 | 方法先于转换点；签名检查；用 `test` 验收 | 3 |
 | **6** | 跨文件包 + 跨 TU interface：包清单、`extern` vtable 声明 | 跨 TU 链接正确 | 4, 5 |
 | **7** | 卫生宏：`#macro` + `__local`、展开计数器重命名 | 正反例通过；用 `test` 验收 | 3 |
 
@@ -407,8 +447,9 @@ int main(void) { return add(1, 2); }
 | `defer` | 条件/循环/递归/多 defer 逆序 | `defer` 内控制流报错 | `goto` 跨作用域、返回值 clobber |
 | `errdefer/err` | 单层/多层传播、递归 | 非错误路径不执行 | 哨兵冲突、错误槽串扰 |
 | `test` | PASS/FAIL 报告、过滤 | 空 test 报 PASS、`err` 报 FAIL | 与用户 `main` 共存 |
-| `interface` | 正常 impl 与调用 | 缺方法/签名不符/impl 不可见 | 多 impl、跨 TU |
-| 包管理 | 单文件导入 | 冲突、未导入使用 | 跨 TU 链接 |
+| `interface` | 结构体自动实现、多接口、调用/赋值/强转 | 缺方法/签名不符/方法晚于转换点 | 同一类型跨 TU、每 TU 一份 vtable |
+| 包管理 | 单文件导入、`pkg.member`、多级包 | 未导入使用、未知成员 | 跨 TU 链接、与老 C 代码互操作 |
+| 结构体方法 | `p->f()`、方法调方法、sret、`T!error` 方法 | 不带调用、重复方法、只有 `->` | 跨 TU、与 `impl` 无关的普通函数调用 |
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
 | 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
 
@@ -427,7 +468,8 @@ int main(void) { return add(1, 2); }
 
 - `defer` 从“静态 active 槽”改为**运行时记录链表 + 就地生成清理块 + `ScopeTracker`**，解决了条件/循环/多次注册和 `goto` 跨作用域问题，与 TCC 顺序代码生成模型一致，并借鉴了 slimcc 已验证的 VLA 跟踪复用路径；
 - `err(id, msg)` 放弃“统一出口跳转”，改为**就地展开清理序列 + 哨兵返回**，消除了对不存在机制的假设；
-- `interface` 的可见性规则强制 **`impl` 先于使用**，调用点只查找 `ImplDesc`，符合单趟约束；
+- `interface` 的可见性规则只要求**方法先于转换点**，vtable 在 TU 末尾统一生成并保持
+  `static`，符合单趟编译与多 TU 约束；
 - 扩展开关改为**编译期条件编译**，零运行时开销；
 - `test` 的 `-test` 模式与 `-run` 互斥，runner 直接遍历测试表，不依赖用户 `main` 钩子。
 
@@ -450,16 +492,17 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 | 2 `errdefer`/`err` | ✅ | `superc_errdefer_parse` / `superc_err_parse`、`__tcc_err_set/get/clear`；`err` 直接返回哨兵 `-1`，转发由 `try` 负责 |
 | 2b `T!error` / `try` / `catch` | ✅ | `superc_parse_fallible_suffix` / `superc_apply_fallible`（`FuncAttr.func_fallible`）、`superc_try_parse`（`unary()` 前缀分支）、`superc_catch_parse`（`expr_catch()` 层）、`superc_emit_propagate`（与 `err` 共用清理+哨兵路径）、`__tcc_error_take` / `__tcc_err_flag_peek` |
 | 3 `test` / `-test` / `-test-filter` | ✅ | `superc_test_parse`、`tccrun.c:tcc_run_tests`、`libtcc.c` 选项 |
-| 4 `package`/`import` | ✅ | `superc_package_parse` / `superc_import_parse`、`superc_mangle_tok`（`NAME__sym`）、`sym_find` 包回落 |
-| 5 `interface`/`impl` | ✅ | `superc_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`superc_impl_parse`（vtable 对象 `__tcc_vt_TYPE_IFACE`）、`superc_check_impl`（缺方法/参数个数/参数类型/返回类型检查）、`superc_iface_call_prep`（调用点改写）、`superc_iface_convert`（隐式/显式转换） |
-| 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；`impl IFACE for TYPE;` 仅声明并 `extern` 引入 vtable，另一 TU 提供实现 |
+| 4 `package`/`import`/`pkg.member` | ✅ | `superc_package_parse` / `superc_import_parse`、`superc_pkg_name` / `superc_pkg_compose` / `superc_pkg_imported`、`superc_mangle_tok`（`NAME__sym`）、`unary()` 里的逐段点号解析与 `sym_find_raw` |
+| 4b 结构体方法 | ✅ | `decl()` 里 `superc_method_register`、`superc_method_lookup` / `superc_has_field` / `superc_method_call_prep`、`unary()` 的 `->` 分支、`superc_self_*` 隐藏接收者（sret 之后） |
+| 5 `interface` | ✅ | `superc_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`superc_auto_impl_ensure` / `superc_check_method`（惰性校验）、`superc_emit_auto_impls`（TU 末尾生成 `static` vtable）、`superc_iface_call_prep`（调用点改写）、`superc_iface_convert`（隐式/显式转换） |
+| 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；`superc_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_superc_macro` / `superc_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`superc_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 
-验收测试：`tcc/tests/tests2/156_superc_defer.c` … `165_superc_init.c`，由
+验收测试：`tcc/tests/tests2/156_superc_defer.c` … `174_superc_iface_tu.c`，由
 `tests/tests2/Makefile` 自动加 `-std=tcc-ext`；未编译 `-DTCC_EXT` 时自动 SKIP
 （以 `__TCC_EXT__` 预定义探测）。`make -C tests/tests2 tests2.all` 两种构建下
-分别为 144 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
+分别为 153 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
 
 根目录自测（`tests/test.c`，21 个 test 块）：`make selftest`。
 
@@ -474,7 +517,15 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
   报错（`superc_check_error_param`），错误通道只有返回值 + 错误槽，
   不引入隐藏参数，也不改变调用约定；
 - `!error` 的函数返回类型必须能表示哨兵 `-1`，因此结构体返回类型不能标注；
-- `interface` 的 `impl` 必须先于使用可见（单趟编译约束）；
+- 结构体方法必须在调用点之前声明或定义（单趟编译约束）；只支持 `->`，
+  `v.f()` 按普通成员访问处理，同名字段优先于方法；
+- 方法名共享 C 的全局命名空间：同一类型不能有两个同名方法，不同类型要用同名方法
+  时必须放进不同 `package`；
+- `interface` 的一致性检查发生在第一次结构体→接口转换点，因此方法也要在转换点
+  之前可见；文件作用域的接口初始化器不支持（没有运行时代码可生成），接口→接口
+  是普通拷贝；
+- `pkg.member` 必须先 `import`（或位于该包内）；包只是词法前缀，没有目录/文件语义，
+  多级包名只是把点号换成 `__`；
 - 变量初始化检查在**定义点**做（`superc_check_var_initialized`），不做数据流
   分析，因此 `int x; x = 1;` 也会报错；`extern` 声明、形参、结构体/联合体
   成员、`typedef` 不是定义，不受约束；
