@@ -1,6 +1,0 @@
-PASS: arithmetic works
-PASS: defer runs inside a test block
-PASS: errdefer is skipped on the normal path
-PASS: strings and loops
-PASS: helpers propagate errors
-5 test(s), 0 failure(s)

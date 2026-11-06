@@ -1,7 +1,0 @@
-circle:75 rect:24 total=99
-[circle][rect]
-Circle(5) Rect(4x6) 
-[circle][circle]
-[circle]
-sizeof=16
-inline=75
