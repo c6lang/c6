@@ -177,6 +177,33 @@ typedef struct C6AutoImpl {
 } C6AutoImpl;
 static C6AutoImpl **c6_auto_impls;
 static int c6_nb_auto_impls;
+/* 'T[:]' slice views: one internal struct per (unqualified) element type,
+   'struct { T *const data; const size_t len; }'.  The layout is fixed (data
+   at 0, len at PTR_SIZE) and is the ABI shared with libtcc1 and with other
+   translation units, so the object is built here instead of going through
+   struct_layout() (which #pragma pack could alter).  Slice tags live on the
+   global stack: a type built inside a function must survive the block. */
+typedef struct C6Slice {
+    CType elem;          /* element type, top level qualifiers dropped */
+    CType elem_ptr;      /* 'elem *' */
+    Sym *tag;            /* the internal struct tag */
+    int elem_size;       /* sizeof(elem) */
+    struct C6Slice *next;
+} C6Slice;
+static C6Slice *c6_slices;
+/* the descriptor of TYPE when TYPE is a slice, NULL otherwise */
+static C6Slice *c6_slice_of_type(CType *type)
+{
+    C6Slice *sl;
+    if (!tcc_state->c6_ext)
+        return NULL;
+    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+        return NULL;
+    for (sl = c6_slices; sl; sl = sl->next)
+        if (sl->tag == type->ref)
+            return sl;
+    return NULL;
+}
 /* non-zero while vtop holds the result of a call to a 'T!error' function */
 static int c6_value_fallible;
 /* symbol of the function being compiled (needed by 'try' to check that the
@@ -220,6 +247,10 @@ static void c6_method_register(int name, int sym_tok, CType *type);
 static C6Method *c6_method_lookup(CType *type, int name);
 static int c6_has_field(CType *type, int v);
 static void c6_method_call_prep(C6Method *m);
+static CType c6_slice_ctype(C6Slice *sl);
+static C6Slice *c6_slice_get(CType *elem);
+static void c6_slice_subscript(void);
+static int c6_slice_convert(CType *dt);
 static void gen_function(Sym *sym);
 /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
    already interned as TOK_ASM_test, so accept both spellings. */
@@ -2898,6 +2929,18 @@ static void type_to_str(char *buf, int buf_size,
         pstrcat(buf, buf_size, tstr);
         break;
     case VT_STRUCT:
+#ifdef C6_EXT
+        /* a slice prints as 'elem[:]', so that diagnostics talk about the
+           type the user wrote instead of the internal struct tag */
+        {
+            C6Slice *sl = c6_slice_of_type(type);
+            if (sl) {
+                type_to_str(buf, buf_size, &sl->elem, NULL);
+                pstrcat(buf, buf_size, "[:]");
+                break;
+            }
+        }
+#endif
         tstr = "struct ";
         if (IS_UNION(t))
             tstr = "union ";
@@ -3881,6 +3924,8 @@ static void verify_assign_cast(CType *dt)
 static void gen_assign_cast(CType *dt)
 {
 #ifdef C6_EXT
+    if (c6_slice_convert(dt))
+        return;
     if (c6_iface_convert(dt))
         return;
 #endif
@@ -3898,7 +3943,9 @@ ST_FUNC void vstore(void)
 
     ft = vtop[-1].type.t;
 #ifdef C6_EXT
-    c6_iface_convert(&vtop[-1].type);
+    /* an array assigned to a slice becomes a view of the array */
+    if (!c6_slice_convert(&vtop[-1].type))
+        c6_iface_convert(&vtop[-1].type);
     ft = vtop[-1].type.t;
 #endif
     sbt = vtop->type.t & VT_BTYPE;
@@ -5046,6 +5093,32 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
             struct_decl(&type1, VT_UNION);
             goto basic_type2;
 
+        case '[':
+#ifdef C6_EXT
+            /* 'T[:]' - a slice type.  A '[' directly after a type specifier
+               is not valid C (array declarators come after the declarator
+               name), so only '[:]' is claimed here; anything else, e.g.
+               'int [3] a;', is handed back to the original code. */
+            if (tcc_state->c6_ext && typespec_found) {
+                CType elem, st;
+                int storage;
+                next();                 /* skip '[' */
+                if (tok == ':') {
+                    next();             /* skip ':' */
+                    skip(']');
+                    elem.t = t & ~VT_STORAGE;
+                    elem.ref = type->ref;
+                    storage = t & VT_STORAGE;
+                    st = c6_slice_ctype(c6_slice_get(&elem));
+                    t = st.t | storage;
+                    type->ref = st.ref;
+                    break;
+                }
+                unget_tok('[');         /* not a slice: restore and stop */
+            }
+#endif
+            goto the_end;
+
             /* type modifiers */
         case TOK__Atomic:
             next();
@@ -5967,7 +6040,9 @@ ST_FUNC void unary(void)
             } else {
                 unary();
 #ifdef C6_EXT
-                /* '(Shape)circle' converts explicitly */
+                /* '(int[:])a' and '(Shape)circle' convert explicitly */
+                if (c6_slice_convert(&type))
+                    break;
                 if (c6_iface_convert(&type))
                     break;
 #endif
@@ -6579,11 +6654,21 @@ special_math_val:
             }
             next();
         } else if (tok == '[') {
-            next();
-            gexpr();
-            gen_op('+');
-            indir();
-            skip(']');
+#ifdef C6_EXT
+            /* a slice subscript and a range are bounds checked and may
+               produce a value, so they need their own parser; an array or
+               pointer subscript with no ':' keeps the original code */
+            if (tcc_state->c6_ext) {
+                c6_slice_subscript();
+            } else
+#endif
+            {
+                next();
+                gexpr();
+                gen_op('+');
+                indir();
+                skip(']');
+            }
 #ifdef C6_EXT
             c6_value_fallible = 0;
 #endif
@@ -8162,6 +8247,389 @@ static int c6_emit_auto_impls(void)
     return n;
 }
 
+/* ------------------------------------------------------------------ */
+/* slices 'T[:]'                                                       */
+/*                                                                     */
+/* A slice is a two word view of a run of elements:                   */
+/*                                                                     */
+/*     struct { T *const data; const size_t len; }                    */
+/*                                                                     */
+/* The compiler builds that struct by hand (fixed layout, no packing)  */
+/* and the runtime helpers in libtcc1.c take the very same shape, so a */
+/* slice can be passed to and returned from another translation unit   */
+/* without any extra declaration.                                      */
+
+/* a size_t value: exactly the type 'sizeof' produces */
+static CType c6_size_type(void)
+{
+    CType t;
+    t.t = VT_SIZE_T;
+    t.ref = NULL;
+    return t;
+}
+
+/* the value type of slice SL */
+static CType c6_slice_ctype(C6Slice *sl)
+{
+    CType t;
+    t.t = VT_STRUCT;
+    t.ref = sl->tag;
+    return t;
+}
+
+/* like mk_pointer() but the pointer symbol always goes to the global stack:
+   a slice type is shared by the whole translation unit, so it must not point
+   at a symbol that is popped when the enclosing block ends */
+static void c6_global_pointer(CType *type)
+{
+    Sym *s = sym_push2(&global_stack, SYM_FIELD, 0, -1);
+    s->type = *type;
+    type->t = VT_PTR | (type->t & VT_STORAGE);
+    type->ref = s;
+}
+
+/* is the tag of TYPE (through one level of pointer) reachable from file
+   scope?  A tag declared inside a function is popped with its block while
+   the slice type lives until the end of the unit. */
+static int c6_tag_is_global(CType *type)
+{
+    Sym *s;
+    while ((type->t & VT_BTYPE) == VT_PTR && type->ref)
+        type = pointed_type(type);
+    if ((type->t & VT_BTYPE) != VT_STRUCT && !IS_ENUM(type->t))
+        return 1;
+    for (s = global_stack; s; s = s->prev)
+        if (s == type->ref)
+            return 1;
+    return 0;
+}
+
+static int c6_is_error_type(CType *type)
+{
+    Sym *tag;
+    while (((type->t & VT_BTYPE) == VT_PTR || (type->t & VT_ARRAY))
+           && type->ref)
+        type = pointed_type(type);
+    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+        return 0;
+    tag = struct_find(tok_alloc_const("__tcc_error"));
+    return tag && type->ref == tag;
+}
+
+/* Build (or find) the slice type whose elements are ELEM. */
+static C6Slice *c6_slice_get(CType *elem)
+{
+    C6Slice *sl;
+    CType el = *elem;
+    int size, align;
+
+    el.t &= ~VT_STORAGE;
+    if ((el.t & VT_BTYPE) == VT_VOID)
+        tcc_error("'[:]' cannot have a 'void' element type");
+    if ((el.t & VT_BTYPE) == VT_FUNC)
+        tcc_error("'[:]' cannot have a function element type");
+    if (el.t & VT_VLA)
+        tcc_error("'[:]' cannot have a variable length array element");
+    /* the documented rule: top level qualifiers of the element are dropped,
+       the slice itself controls writability through 'data' being const */
+    el.t &= ~VT_QUAL;
+    size = type_size(&el, &align);
+    if (size < 0) {
+        char buf[256];
+        type_to_str(buf, sizeof buf, &el, NULL);
+        tcc_error("'[:]' requires a complete element type, not '%s'", buf);
+    }
+    if (c6_is_error_type(&el))
+        tcc_error("'error' can only be a return type, not a slice element");
+    if (!c6_tag_is_global(&el)) {
+        char buf[256];
+        type_to_str(buf, sizeof buf, &el, NULL);
+        tcc_error("the element type of '[:]' must be declared at file "
+                  "scope, but '%s' is local", buf);
+    }
+
+    for (sl = c6_slices; sl; sl = sl->next)
+        if (is_compatible_types(&sl->elem, &el))
+            return sl;
+
+    sl = tcc_mallocz(sizeof *sl);
+    sl->elem = el;
+    sl->elem_ptr = el;
+    c6_global_pointer(&sl->elem_ptr);
+    sl->elem_size = size;
+    /* 'struct { elem *const data; const size_t len; }' */
+    sl->tag = sym_push2(&global_stack, anon_sym++ | SYM_STRUCT, 0,
+                        2 * PTR_SIZE);
+    sl->tag->type.t = VT_STRUCT;
+    sl->tag->type.ref = NULL;
+    sl->tag->c = 2 * PTR_SIZE;   /* size */
+    sl->tag->r = PTR_SIZE;       /* alignment */
+    /* fields in declaration order: struct field chains use 'next', which is
+       not the link sym_push2 builds, so it is wired up explicitly */
+    {
+        CType lt = c6_size_type(), dt = sl->elem_ptr;
+        Sym *scratch = NULL, *data_f, *len_f;
+        lt.t |= VT_CONSTANT;
+        dt.t |= VT_CONSTANT;
+        data_f = sym_push2(&scratch, tok_alloc_const("data") | SYM_FIELD,
+                           0, 0);
+        data_f->type = dt;
+        data_f->c = 0;
+        data_f->r = 0;
+        len_f = sym_push2(&scratch, tok_alloc_const("len") | SYM_FIELD,
+                          0, PTR_SIZE);
+        len_f->type = lt;
+        len_f->c = PTR_SIZE;
+        len_f->r = 0;
+        data_f->next = len_f;
+        len_f->next = NULL;
+        sl->tag->next = data_f;
+    }
+    sl->next = c6_slices;
+    c6_slices = sl;
+    return sl;
+}
+
+/* Spill the slice or complete array value on vtop into a local
+   '{ void *data; size_t len; }' pair and pop it.  Returns the offset of the
+   pair, so that the runtime helpers can read both words from it (this is
+   also the only way to keep the base value while the bounds are evaluated:
+   local slots survive the calls that a bound expression may generate). */
+static int c6_slice_spill(C6Slice *sl)
+{
+    CType sz = c6_size_type();
+    int off = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
+
+    loc = off;
+    if (sl) {
+        CType st = c6_slice_ctype(sl);
+        /* the struct layout is exactly the runtime pair */
+        vset(&st, VT_LOCAL | VT_LVAL, off);
+        vswap();
+        vstore();
+        vpop();
+    } else {
+        CType ept = *pointed_type(&vtop->type);
+        int n = vtop->type.ref->c;
+        mk_pointer(&ept);
+        vtop->type = ept;
+        gaddrof();                       /* 'elem *' pointing at the first */
+        vset(&ept, VT_LOCAL | VT_LVAL, off);
+        vswap();
+        vstore();
+        vpop();
+        vpushs(n);
+        vset(&sz, VT_LOCAL | VT_LVAL, off + PTR_SIZE);
+        vswap();
+        vstore();
+        vpop();
+    }
+    return off;
+}
+
+/* f(.., a, b, ..): push the pointer to local slot OFF as an argument */
+static void c6_slice_push_addr(int off)
+{
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, off);
+    gaddrof();
+}
+
+/* complain about a range applied to something that is neither a slice nor a
+   complete array */
+static void c6_slice_base_error(CType *base)
+{
+    if (base->t & VT_VLA)
+        tcc_error("cannot slice a variable length array");
+    if (base->t & VT_ARRAY)
+        tcc_error("cannot slice an array of unknown length");
+    if ((base->t & VT_BTYPE) == VT_PTR)
+        tcc_error("cannot slice a pointer; use '(T[:]){p, n}'");
+    tcc_error("cannot slice this expression");
+}
+
+/* Parse the postfix '[' of an expression, with the token already at '['.
+   Consumes '[' ... ']' and leaves the addressed element lvalue (or, for a
+   range, the resulting slice value) on the value stack.  A plain subscript
+   of an array or of a pointer keeps the original code generation. */
+static void c6_slice_subscript(void)
+{
+    C6Slice *sl, *rsl;
+    CType sz = c6_size_type(), base, array_elem;
+    int have_first = 0, have_array_elem = 0, first_off = 0, pair, res;
+
+    next();                              /* '[' */
+    base = vtop->type;
+    sl = c6_slice_of_type(&base);
+    if ((base.t & VT_ARRAY) && !(base.t & VT_VLA)
+        && base.ref && base.ref->c >= 0) {
+        /* remember the element type: the base ends up below the bounds once
+           the first expression has been parsed */
+        array_elem = *pointed_type(&base);
+        have_array_elem = 1;
+    }
+    if (tok == ':' && !sl && !have_array_elem)
+        c6_slice_base_error(&base);
+
+    if (tok != ':') {
+        gexpr();                         /* index or low bound */
+        have_first = 1;
+    }
+    if (tok != ':') {
+        if (!sl) {
+            /* plain C subscript: byte for byte the original path */
+            gen_op('+');
+            indir();
+            skip(']');
+            return;
+        }
+        /* bounds checked slice index */
+        first_off = (loc - PTR_SIZE) & -PTR_SIZE;
+        loc = first_off;
+        vset(&sz, VT_LOCAL | VT_LVAL, first_off);
+        vswap();
+        vstore();                        /* also converts to size_t */
+        vpop();
+        skip(']');
+        pair = c6_slice_spill(sl);
+        res = (loc - PTR_SIZE) & -PTR_SIZE;
+        loc = res;
+        /* __tcc_slice_index(&ptr, &pair, idx, elem_size) */
+        vpush_helper_func(tok_alloc_const("__tcc_slice_index"));
+        c6_slice_push_addr(res);
+        c6_slice_push_addr(pair);
+        vset(&sz, VT_LOCAL | VT_LVAL, first_off);
+        vpushs(sl->elem_size);
+        gfunc_call(4);
+        vset(&sl->elem_ptr, VT_LOCAL | VT_LVAL, res);
+        indir();
+        return;
+    }
+
+    /* a range: keep the bounds in scratch slots, so that the base value is
+       back on top of the stack when it is spilled below */
+    if (!sl && !have_array_elem)
+        c6_slice_base_error(&base);
+    rsl = sl;
+    if (!rsl)
+        rsl = c6_slice_get(&array_elem);   /* the array decays */
+    {
+        CType rt = c6_slice_ctype(rsl);
+        int lo_off, hi_off = 0, have_hi = 0;
+
+        lo_off = (loc - PTR_SIZE) & -PTR_SIZE;
+        loc = lo_off;
+        if (!have_first)
+            vpushi(0);                   /* lo defaults to 0 */
+        vset(&sz, VT_LOCAL | VT_LVAL, lo_off);
+        vswap();
+        vstore();
+        vpop();
+        next();                          /* ':' */
+        if (tok != ']') {
+            gexpr();                     /* high bound */
+            hi_off = (loc - PTR_SIZE) & -PTR_SIZE;
+            loc = hi_off;
+            vset(&sz, VT_LOCAL | VT_LVAL, hi_off);
+            vswap();
+            vstore();
+            vpop();
+            have_hi = 1;
+        }
+        if (tok == ':')
+            tcc_error("slice bounds have no capacity");
+        skip(']');
+        pair = c6_slice_spill(sl);
+        res = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
+        loc = res;
+        /* __tcc_slice_sub(&out, &pair, lo, hi, elem_size) */
+        vpush_helper_func(tok_alloc_const("__tcc_slice_sub"));
+        c6_slice_push_addr(res);
+        c6_slice_push_addr(pair);
+        vset(&sz, VT_LOCAL | VT_LVAL, lo_off);
+        if (have_hi)
+            vset(&sz, VT_LOCAL | VT_LVAL, hi_off);
+        else
+            vset(&sz, VT_LOCAL | VT_LVAL, pair + PTR_SIZE);  /* hi = len */
+        vpushs(rsl->elem_size);
+        gfunc_call(5);
+        vset(&rt, VT_LOCAL | VT_LVAL, res);
+    }
+}
+
+/* Implicit conversion of a complete array to a slice value, e.g.
+   'int[:] s = a;', 'f(a)' or 'return a;'.  Returns 0 when no conversion
+   applies. */
+static int c6_slice_convert(CType *dt)
+{
+    C6Slice *sl;
+    CType *se;
+    char b1[256], b2[256];
+
+    if (!tcc_state->c6_ext)
+        return 0;
+    sl = c6_slice_of_type(dt);
+    if (!sl)
+        return 0;
+    {
+        /* a slice stays a slice: plain struct copy, but only of its own
+           element type */
+        C6Slice *src = c6_slice_of_type(&vtop->type);
+        if (src) {
+            if (src != sl) {
+                type_to_str(b1, sizeof b1, &vtop->type, NULL);
+                type_to_str(b2, sizeof b2, dt, NULL);
+                tcc_error("cannot convert '%s' to '%s'", b1, b2);
+            }
+            return 0;
+        }
+    }
+    if (vtop->type.t & VT_VLA)
+        tcc_error("cannot slice a variable length array");
+    if ((vtop->type.t & VT_ARRAY) && vtop->type.ref->c < 0)
+        tcc_error("cannot slice an array of unknown length");
+    if (vtop->type.t & VT_ARRAY) {
+        se = pointed_type(&vtop->type);
+        if (!is_compatible_unqualified_types(se, &sl->elem)) {
+            type_to_str(b1, sizeof b1, se, NULL);
+            type_to_str(b2, sizeof b2, &sl->elem, NULL);
+            tcc_error("cannot make a slice of '%s' from an array of '%s'",
+                      b2, b1);
+        }
+        if (nocode_wanted & NOEVAL_WANTED) {
+            /* 'sizeof((T[:])a)' / 'typeof': only the type matters and the
+               value is discarded, so no code has to be generated */
+            vtop->type = c6_slice_ctype(sl);
+            return 1;
+        }
+        if (nocode_wanted & DATA_ONLY_WANTED)
+            tcc_error("a slice cannot be initialized from an array in a "
+                      "static initializer; use '{ data, len }'");
+        {
+            CType ept = sl->elem_ptr, st = c6_slice_ctype(sl);
+            CType sz = c6_size_type();
+            int n = vtop->type.ref->c;
+            int off = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
+            loc = off;
+            vtop->type = ept;
+            gaddrof();                   /* &a[0] */
+            vset(&ept, VT_LOCAL | VT_LVAL, off);
+            vswap();
+            vstore();
+            vpop();
+            vpushs(n);
+            vset(&sz, VT_LOCAL | VT_LVAL, off + PTR_SIZE);
+            vswap();
+            vstore();
+            vpop();
+            vset(&st, VT_LOCAL | VT_LVAL, off);
+        }
+        return 1;
+    }
+    if ((vtop->type.t & VT_BTYPE) == VT_PTR)
+        tcc_error("cannot make a slice from a pointer; use '(T[:]){p, n}'");
+    return 0;
+}
+
 /* drop everything that must not survive into the next translation unit.
    The scanner restarts its token table for every unit, and the state below
    holds tokens and descriptors that would otherwise dangle or leak into the
@@ -8192,6 +8660,14 @@ static void c6_tu_reset(void)
     tcc_free(tcc_state->c6_package);
     tcc_state->c6_package = NULL;
     c6_self_pending = 0;
+    /* the slice descriptors hold Sym pointers into the symbol pools that
+       tccgen_finish() has released: they must not be looked at again */
+    while (c6_slices) {
+        C6Slice *sl = c6_slices;
+        c6_slices = sl->next;
+        tcc_free(sl);
+    }
+    c6_slices = NULL;
 }
 
 /* Implicit conversion of a struct value to an interface value, e.g.
@@ -9839,6 +10315,18 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
     if (debug_modes && !(flags & DIF_SIZE_ONLY) && !p->sec)
         tcc_debug_line(tcc_state), tcc_tcov_check_line (tcc_state, 1);
 
+#ifdef C6_EXT
+    /* a slice initializer is read as a single value, a string literal
+       included: 'char[:] m = "text";' views the literal */
+    if (!(flags & DIF_HAVE_ELEM) && tok != '{' && c6_slice_of_type(type)) {
+        int ncw_prev = nocode_wanted;
+        if ((flags & DIF_SIZE_ONLY) && !p->sec)
+            ++nocode_wanted;
+        parse_init_elem(!p->sec ? EXPR_ANY : EXPR_CONST);
+        nocode_wanted = ncw_prev;
+        flags |= DIF_HAVE_ELEM;
+    } else
+#endif
     if (!(flags & DIF_HAVE_ELEM) && tok != '{' &&
 	/* In case of strings we have special handling for arrays, so
 	   don't consume them as initializer value (which would commit them
@@ -9998,6 +10486,12 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
            of course assignable to non-const elements.  */
             && is_compatible_unqualified_types(type, &vtop->type)) {
         goto one_elem;
+
+#ifdef C6_EXT
+    } else if ((flags & DIF_HAVE_ELEM) && c6_slice_convert(type)) {
+        /* 'int[:] s = array;': vtop now holds the slice value */
+        goto one_elem;
+#endif
 
     } else if ((type->t & VT_BTYPE) == VT_STRUCT) {
         no_oblock = 1;

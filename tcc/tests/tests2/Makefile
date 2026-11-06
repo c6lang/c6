@@ -93,6 +93,7 @@ ifneq (,$(C6_OK))
  165_c6_init.test: FLAGS += -dt
  167_c6_pkg_dot_errors.test: FLAGS += -dt
  170_c6_method_errors.test: FLAGS += -dt
+ 176_c6_slice_errors.test: FLAGS += -dt
  # these compile a second file before '-run'
  168_c6_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
  168_c6_pkg_dot_tu.test: GEN = $(GEN-TCC)
@@ -100,6 +101,8 @@ ifneq (,$(C6_OK))
  171_c6_method_tu.test: GEN = $(GEN-TCC)
  174_c6_iface_tu.test: FLAGS += $(subst 174,174+,$1)
  174_c6_iface_tu.test: GEN = $(GEN-TCC)
+ 177_c6_slice_tu.test: FLAGS += $(subst 177,177+,$1)
+ 177_c6_slice_tu.test: GEN = $(GEN-TCC)
  # 172 mixes an extension unit with a unit built for plain C
  172_c6_plain_interop.test: NORUN = true
  172_c6_plain_interop.test: GEN = $(GEN-TCC)

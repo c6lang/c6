@@ -1,0 +1,35 @@
+[test_void_element]
+176_c6_slice_errors.c:5: error: '[:]' cannot have a 'void' element type
+
+[test_incomplete_element]
+176_c6_slice_errors.c:8: error: '[:]' requires a complete element type, not 'struct S'
+
+[test_local_element]
+176_c6_slice_errors.c:15: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
+
+[test_error_element]
+176_c6_slice_errors.c:19: error: 'error' can only be a return type, not a slice element
+
+[test_element_mismatch]
+176_c6_slice_errors.c:25: error: cannot make a slice of 'char' from an array of 'int'
+
+[test_pointer_source]
+176_c6_slice_errors.c:33: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
+
+[test_vla_source]
+176_c6_slice_errors.c:41: error: cannot slice a variable length array
+
+[test_pointer_slice]
+176_c6_slice_errors.c:49: error: cannot slice a pointer; use '(T[:]){p, n}'
+
+[test_capacity]
+176_c6_slice_errors.c:56: error: slice bounds have no capacity
+
+[test_file_scope_array]
+176_c6_slice_errors.c:60: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
+
+[test_uninitialized]
+176_c6_slice_errors.c:65: error: variable 's' must be initialized
+
+[test_slice_to_int]
+176_c6_slice_errors.c:73: error: cannot convert 'int[:]' to 'int'

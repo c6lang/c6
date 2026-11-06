@@ -804,3 +804,50 @@ void __tcc_catch_fallthrough(void)
     *p = 0;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* c6 extension runtime: slices 'T[:]'                                   */
+/*                                                                           */
+/* A slice value is '{ void *data; size_t len; }' with the two words          */
+/* adjacent, so the compiler only hands over a pointer to such a pair and    */
+/* the helpers never depend on the element type: everything is byte          */
+/* arithmetic.  A bounds violation is part of the language, so it must stop  */
+/* the program: libtcc1 is freestanding (no libc), hence the same deliberate */
+/* null store that __tcc_catch_fallthrough() uses.                          */
+
+typedef __SIZE_TYPE__ TccSliceSize;
+
+#define TCC_SLICE_LEN(slice) \
+    (*(const TccSliceSize *)((const char *)(slice) + sizeof(void *)))
+
+static void tcc_slice_trap(void)
+{
+    volatile int *p = (volatile int *)0;
+    *p = 0;
+}
+
+/* Write the address of element IDX of SLICE through OUT. */
+void __tcc_slice_index(void **out, const void *slice,
+                       TccSliceSize idx, TccSliceSize elem_size)
+{
+    const char *base = *(const char * const *)slice;
+    TccSliceSize len = TCC_SLICE_LEN(slice);
+
+    if (idx >= len)
+        tcc_slice_trap();
+    *out = (void *)(base + idx * elem_size);
+}
+
+/* Write the [LO, HI) sub-slice of SLICE through OUT, which must address two
+   adjacent machine words (a fresh slice value). */
+void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
+                     TccSliceSize hi, TccSliceSize elem_size)
+{
+    const char *base = *(const char * const *)slice;
+    TccSliceSize len = TCC_SLICE_LEN(slice);
+
+    if (lo > hi || hi > len)
+        tcc_slice_trap();
+    *(void **)out = (void *)(base + lo * elem_size);
+    *(TccSliceSize *)((char *)out + sizeof(void *)) = hi - lo;
+}
