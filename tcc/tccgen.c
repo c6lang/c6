@@ -151,10 +151,22 @@ static struct {
 } defer_state;
 static int c6_label_seq;
 static int c6_implicit_ret0;
-/* pending hidden 'self' argument of an interface method call */
-static int c6_iface_self_pending;
-static int c6_iface_self_loc;
-static CType c6_iface_self_type;  /* generated 'test' function: return 0 */
+/* pending hidden 'self' argument of a method / interface method call */
+static int c6_self_pending;
+static int c6_self_loc;
+static CType c6_self_type;
+/* registered 'ret f(struct T *self, ...)' methods: an ordinary function
+   whose first parameter points at a struct or union type; 'name' is the
+   spelling used in the source, so a method defined inside a package is
+   still found under its bare name */
+typedef struct C6Method {
+    int type_tag;    /* struct/union tag of the receiver */
+    int name;        /* method name as written (before package mangling) */
+    int sym_tok;     /* token of the emitted function symbol */
+    struct C6Method *next;
+} C6Method;
+static C6Method *c6_methods;
+static int c6_nb_methods;
 /* non-zero while vtop holds the result of a call to a 'T!error' function */
 static int c6_value_fallible;
 /* symbol of the function being compiled (needed by 'try' to check that the
@@ -193,6 +205,10 @@ static void c6_iface_call_prep(C6Iface *ifc, int mname);
 static Sym *c6_import_lookup(int v);
 static int c6_mangle_tok(const char *pkg, int v);
 static int c6_pkg_imported(const char *name);
+static void c6_method_register(int name, int sym_tok, CType *type);
+static C6Method *c6_method_lookup(CType *type, int name);
+static int c6_has_field(CType *type, int v);
+static void c6_method_call_prep(C6Method *m);
 static void gen_function(Sym *sym);
 /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
    already interned as TOK_ASM_test, so accept both spellings. */
@@ -6472,19 +6488,40 @@ special_math_val:
             inc(1, tok);
             next();
         } else if (tok == '.' || tok == TOK_ARROW) {
-#ifdef C6_EXT
-            c6_fallible_use();  /* 'f().x' would drop the error */
-#endif
             int qualifiers, cumofs;
-            /* field */ 
-            if (tok == TOK_ARROW) 
+#ifdef C6_EXT
+            int arrow;
+            c6_fallible_use();  /* 'f().x' would drop the error */
+            arrow = tok == TOK_ARROW;
+            next();                     /* skip '.' / '->' */
+            if (arrow && tok >= TOK_UIDENT) {
+                /* 'p->f(...)' is a method call when F is a registered method
+                   of the type P points at; a real field of that name keeps
+                   plain C semantics */
+                C6Method *m = c6_method_lookup(&vtop->type, tok);
+                if (m && !c6_has_field(&vtop->type, tok)) {
+                    int mname = tok;
+                    next();
+                    if (tok != '(')
+                        tcc_error("method '%s' must be called",
+                                  get_tok_str(mname, NULL));
+                    c6_method_call_prep(m);
+                    continue;           /* let the '(' case do the call */
+                }
+            }
+            if (arrow)
                 indir();
+#else
+            /* field */
+            if (tok == TOK_ARROW)
+                indir();
+            next();
+#endif
             qualifiers = vtop->type.t & VT_QUAL;
             test_lvalue();
-            /* expect pointer on structure */
-            next();
 #ifdef C6_EXT
-            if (tcc_state->c6_ext && tok >= TOK_UIDENT) {
+            /* an interface value dispatches through its vtable */
+            if (tok >= TOK_UIDENT) {
                 C6Iface *ifc = c6_iface_of_type(&vtop->type);
                 if (ifc) {
                     int mname = tok;
@@ -6497,6 +6534,7 @@ special_math_val:
                 }
             }
 #endif
+            /* expect pointer on structure */
 	    s = find_field(&vtop->type, tok, &cumofs);
             /* add field offset to pointer */
             gaddrof();
@@ -6561,18 +6599,6 @@ special_math_val:
 #endif
             sa = s->next; /* first parameter */
             nb_args = regsize = 0;
-#ifdef C6_EXT
-            if (c6_iface_self_pending) {
-                /* interface method call: the hidden 'self' pointer is the
-                   first argument, its parameter is skipped */
-                c6_iface_self_pending = 0;
-                vset(&c6_iface_self_type, VT_LOCAL | VT_LVAL,
-                     c6_iface_self_loc);
-                nb_args = 1;
-                if (sa)
-                    sa = sa->next;
-            }
-#endif
             ret.r2 = VT_CONST;
             /* compute first implicit argument if a structure is returned */
             if ((s->type.t & VT_BTYPE) == VT_STRUCT) {
@@ -6611,6 +6637,19 @@ special_math_val:
                 ret_nregs = 1;
                 ret.type = s->type;
             }
+#ifdef C6_EXT
+            if (c6_self_pending) {
+                /* method / interface method call: the hidden 'self' pointer
+                   is the first explicit argument, so it must come after a
+                   possible structure-return buffer and before the rest */
+                c6_self_pending = 0;
+                vset(&c6_self_type, VT_LOCAL | VT_LVAL, c6_self_loc);
+                gfunc_param_typed(s, sa);
+                nb_args++;
+                if (sa)
+                    sa = sa->next;
+            }
+#endif
 
             if (ret_nregs > 0) {
                 /* return in register */
@@ -7561,6 +7600,153 @@ static void c6_import_parse(void)
 
 
 /* ------------------------------------------------------------------ */
+/* struct methods: 'ret f(struct T *self, ...)' called as 'p->f(...)'  */
+/*                                                                     */
+/* A method is an ordinary global function whose first parameter is a  */
+/* pointer to a struct (or union).  The receiver is that pointer, so   */
+/* the symbol name and the calling convention stay untouched; only the */
+/* call syntax 'p->f(a)' is rewritten into 'f(p, a)'.                  */
+
+/* the struct/union tag a pointer type points at, or 0 */
+static int c6_ptr_tag(CType *type)
+{
+    CType *pt;
+
+    if ((type->t & VT_BTYPE) != VT_PTR || !type->ref)
+        return 0;
+    pt = pointed_type(type);
+    if ((pt->t & VT_BTYPE) != VT_STRUCT || !pt->ref)
+        return 0;
+    return pt->ref->v & ~SYM_STRUCT;
+}
+
+/* the receiver type name, for diagnostics */
+static const char *c6_tag_name(int tag)
+{
+    static char buf[64];
+
+    if (tag >= SYM_FIRST_ANOM) {
+        snprintf(buf, sizeof buf, "<anonymous>");
+        return buf;
+    }
+    return get_tok_str(tag, NULL);
+}
+
+/* register 'ret NAME(struct T *self, ...)'; NAME is the spelling used in
+   the source, SYM_TOK the (possibly package-mangled) symbol */
+static void c6_method_register(int name, int sym_tok, CType *type)
+{
+    C6Method *m, **pm;
+    int tag;
+
+    if (!tcc_state->c6_ext || !type->ref)
+        return;
+    if ((type->t & VT_BTYPE) != VT_FUNC)
+        return;
+    if (type->ref->f.func_type == FUNC_OLD)
+        return;
+    /* the first parameter is the receiver */
+    if (!type->ref->next)
+        return;
+    tag = c6_ptr_tag(&type->ref->next->type);
+    if (!tag)
+        return;
+    for (m = c6_methods; m; m = m->next) {
+        if (m->type_tag == tag && m->name == name) {
+            if (m->sym_tok == sym_tok)
+                return;         /* prototype plus definition */
+            tcc_error("duplicate method '%s' for '%s'",
+                      get_tok_str(name, NULL), c6_tag_name(tag));
+        }
+    }
+    m = tcc_mallocz(sizeof *m);
+    m->type_tag = tag;
+    m->name = name;
+    m->sym_tok = sym_tok;
+    for (pm = &c6_methods; *pm; pm = &(*pm)->next)
+        ;
+    *pm = m;
+    c6_nb_methods++;
+}
+
+/* is there a method NAME taking a pointer to the type TYPE points at? */
+static C6Method *c6_method_lookup(CType *type, int name)
+{
+    C6Method *m;
+    int tag;
+
+    if (!tcc_state->c6_ext || !c6_nb_methods)
+        return NULL;
+    tag = c6_ptr_tag(type);
+    if (!tag)
+        return NULL;
+    /* an interface value dispatches through its vtable instead */
+    if (c6_iface_of_type(pointed_type(type)))
+        return NULL;
+    for (m = c6_methods; m; m = m->next)
+        if (m->type_tag == tag && m->name == name)
+            return m;
+    return NULL;
+}
+
+/* find_field() without the diagnostic: used to give a real field
+   precedence over a method of the same name */
+static Sym *c6_find_field_quiet(CType *type, int v)
+{
+    Sym *s = type->ref;
+
+    if (!s || (type->t & VT_BTYPE) != VT_STRUCT || s->c < 0)
+        return NULL;
+    while ((s = s->next) != NULL) {
+        if (s->v == v)
+            return s;
+        if ((s->type.t & VT_BTYPE) == VT_STRUCT
+            && s->v >= (SYM_FIRST_ANOM | SYM_FIELD)) {
+            if (c6_find_field_quiet(&s->type, v | SYM_FIELD))
+                return s;
+        }
+    }
+    return NULL;
+}
+
+static int c6_has_field(CType *type, int v)
+{
+    if (!c6_ptr_tag(type))
+        return 0;
+    return c6_find_field_quiet(pointed_type(type), v | SYM_FIELD) != 0;
+}
+
+/* leave the receiver in a temporary slot and push the method symbol, so
+   that the '(' case can treat the call like any other, with the hidden
+   receiver as the first argument */
+static void c6_method_call_prep(C6Method *m)
+{
+    Sym *fs = sym_find_raw(m->sym_tok);
+    int r;
+
+    if (!fs)
+        tcc_error("method '%s' is not a function",
+                  get_tok_str(m->name, NULL));
+    c6_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = c6_self_loc;
+    c6_self_type = vtop->type;
+    vset(&c6_self_type, VT_LOCAL | VT_LVAL, c6_self_loc);
+    vswap();
+    vstore();
+    vpop();
+    r = fs->r;
+    if ((r & VT_VALMASK) < VT_CONST)
+        r = (r & ~VT_VALMASK) | VT_LOCAL;
+    vset(&fs->type, r, fs->c);
+    vtop->sym = fs;
+    if (r & VT_SYM)
+        vtop->c.i = 0;
+    c6_self_pending = 1;
+}
+
+
+
+/* ------------------------------------------------------------------ */
 /* interface / impl                                                    */
 
 static C6Iface *c6_iface_find(int tag)
@@ -7946,7 +8132,7 @@ static void c6_impl_parse(void)
 
 /* rewrite 'iface.meth (args...)' into a vtable call passing the hidden
    'self' pointer as the first argument; leaves the function pointer on
-   the stack and arms 'c6_iface_self_pending' for the call code */
+   the stack and arms 'c6_self_pending' for the call code */
 static void c6_iface_call_prep(C6Iface *ifc, int mname)
 {
     Sym *fself, *fvt, *fmeth;
@@ -7969,13 +8155,13 @@ static void c6_iface_call_prep(C6Iface *ifc, int mname)
     mk_pointer(&t);
     vtop->type = t;
     indir();                         /* the 'self' pointer value */
-    c6_iface_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
-    loc = c6_iface_self_loc;
-    vset(&fself->type, VT_LOCAL | VT_LVAL, c6_iface_self_loc);
+    c6_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = c6_self_loc;
+    vset(&fself->type, VT_LOCAL | VT_LVAL, c6_self_loc);
     vswap();
     vstore();
     vpop();
-    c6_iface_self_type = fself->type;
+    c6_self_type = fself->type;
 
     /* method: d.vt->name */
     vpushi(off_vt);
@@ -7995,7 +8181,7 @@ static void c6_iface_call_prep(C6Iface *ifc, int mname)
     mk_pointer(&t);
     vtop->type = t;
     indir();                         /* the function pointer */
-    c6_iface_self_pending = 1;
+    c6_self_pending = 1;
 }
 
 /* Implicit conversion of a struct value to an interface value, e.g.
@@ -10652,6 +10838,10 @@ static int decl(int l)
                 /* put function symbol */
                 type.t &= ~VT_EXTERN;
                 sym = external_sym(v, &type, 0, &ad);
+#ifdef C6_EXT
+                /* 'ret f(struct T *self, ...)' becomes callable as p->f() */
+                c6_method_register(decl_name, v, &type);
+#endif
 
                 /* reject abstract declarators in function definition
                    make old-style float params double */
@@ -10752,7 +10942,12 @@ static int decl(int l)
                         ) {
                         /* external variable or function */
                         type.t |= VT_EXTERN;
-                        external_sym(v, &type, r, &ad);
+                        sym = external_sym(v, &type, r, &ad);
+#ifdef C6_EXT
+                        /* a prototype is enough to call it as p->f() */
+                        if ((type.t & VT_BTYPE) == VT_FUNC && l == VT_CONST)
+                            c6_method_register(decl_name, v, &type);
+#endif
                     } else {
                         if (l == VT_CONST || (type.t & VT_STATIC))
                             r |= VT_CONST;
