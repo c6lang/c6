@@ -252,6 +252,20 @@ static C6Slice *c6_slice_get(CType *elem);
 static void c6_slice_subscript(void);
 static int c6_slice_convert(CType *dt);
 static void gen_function(Sym *sym);
+/* c6 async/await: an 'async' function compiles to the body
+   'int __c6_body_NAME(void *task)'.  A declared call becomes a task
+   creation, and 'await' suspends the body and resumes it later. */
+static void c6_async_declare(CType *ftype, int name);
+static void c6_async_definition(Sym *sym, CType *ftype);
+static void c6_async_call(Sym *s);
+static void c6_async_func_begin(void);
+static void c6_async_params_copy(void);
+static void c6_async_func_end(void);
+static void c6_await_parse(void);
+static void c6_async_return(void);
+static void c6_async_await_io(Sym *s);
+static int c6_async_cur;      /* non-zero while generating an async body */
+static int c6_await_pending;  /* set by 'await', cleared by the call hook */
 /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
    already interned as TOK_ASM_test, so accept both spellings. */
 static int c6_is_test_kw(int t)
@@ -5199,6 +5213,13 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
             t |= VT_INLINE;
             next();
             break;
+#ifdef C6_EXT
+        case TOK_C6_ASYNC:
+            /* 'async T f(...)' : the function is a stackless coroutine */
+            ad->f.func_async = 1;
+            next();
+            break;
+#endif
         case TOK_NORETURN3:
             next();
             ad->f.func_noreturn = 1;
@@ -6458,6 +6479,9 @@ special_math_val:
     case TOK_C6_TRY:
         c6_try_parse();
         break;
+    case TOK_C6_AWAIT:
+        c6_await_parse();
+        break;
 #endif
 
     default:
@@ -6574,6 +6598,29 @@ special_math_val:
         } else if (r == VT_CONST && IS_ENUM_VAL(s->type.t)) {
             vtop->c.i = s->enum_val;
         }
+#ifdef C6_EXT
+        /* a call of an 'async' function creates a task; the handle replaces
+           the call expression, so the postfix operators still apply */
+        if (tcc_state->c6_ext && (s->type.t & VT_BTYPE) == VT_FUNC
+            && s->type.ref->f.func_async) {
+            if (tok != '(')
+                tcc_error("an 'async' function can only be called");
+            vpop();
+            c6_async_call(s);
+            break;
+        }
+        /* 'c6_io(fd, ev)' is the leaf suspension primitive */
+        if (tcc_state->c6_ext && (s->type.t & VT_BTYPE) == VT_FUNC
+            && s->v == tok_alloc_const("c6_io")) {
+            if (!c6_await_pending)
+                tcc_error("'c6_io' can only be used as "
+                          "'await c6_io(fd, ev)'");
+            c6_await_pending = 0;
+            vpop();
+            c6_async_await_io(s);
+            break;
+        }
+#endif
         break;
     }
     
@@ -9430,7 +9477,11 @@ again:
             tcc_debug_stabn(tcc_state, N_RBRAC, ind - func_ind);
         if (local_scope)
             next();
-        else if (!nocode_wanted)
+        else if (!nocode_wanted
+#ifdef C6_EXT
+                 && !c6_async_cur     /* an async body always returns a kind */
+#endif
+                 )
             check_func_return();
 
     } else if (t == TOK_RETURN) {
@@ -9440,6 +9491,11 @@ again:
             tcc_error("'return' is not allowed in a defer body");
         ret_off = 0;
         ret_saved = 0;
+        if (c6_async_cur) {
+            /* in an async body 'return' stores the value into the task */
+            c6_async_return();
+            goto c6_ret_done;
+        }
 #endif
         b = (func_vt.t & VT_BTYPE) != VT_VOID;
         if (tok != ';') {
@@ -9493,6 +9549,9 @@ again:
         if (debug_modes)
 	    tcc_tcov_block_end (tcc_state, -1);
         CODE_OFF();
+#ifdef C6_EXT
+    c6_ret_done: ;
+#endif
 
     } else if (t == TOK_BREAK) {
 #ifdef C6_EXT
@@ -10893,6 +10952,636 @@ static void sym_push_params(Sym *ref)
 
 /* parse a function defined by symbol 'sym' and generate its code in
    'cur_text_section' */
+/* ------------------------------------------------------------------ */
+/* c6: async / await (stackless coroutines)                            */
+#ifdef C6_EXT
+/*                                                                     */
+/* 'async T f(params)' compiles to 'int __c6_body_f(void *task)'.  The  */
+/* body runs on the caller's stack; a suspension mirrors the used part  */
+/* of the native frame, the pending defer records and the error slot    */
+/* into the task and returns to the driver, and a resume copies them    */
+/* back to the same offsets and jumps to the recorded resume point.     */
+/* No back end change is involved and every local keeps exactly the      */
+/* semantics it has in an ordinary function.                            */
+/*                                                                     */
+/* 'struct f_task { struct __c6_task head; T val; P0 p0; ... };' is the  */
+/* cross-TU frame prefix: it follows from the declaration alone, so the  */
+/* defining and the calling translation unit agree on it.  All header    */
+/* accesses go through the __c6_co_* accessors so the layout has a       */
+/* single source of truth.                                              */
+
+typedef struct C6AsyncSite {
+    int state;                        /* resume point number (> 0) */
+    Sym *label;
+    struct C6AsyncSite *next;
+} C6AsyncSite;
+
+static int c6_async_name;             /* name of the body being compiled */
+static CType c6_async_ftype;          /* its declared function type */
+static C6AsyncSite *c6_async_sites;
+static int c6_async_nstates;
+static int c6_async_dispatch;         /* jump chain to the resume dispatcher */
+static int c6_async_base_off;         /* slot holding the frame base marker */
+static int c6_async_fr_off;           /* slot of the 'void *task' parameter */
+
+#define C6_CO_KIND_DONE  0
+#define C6_CO_KIND_IO    1
+#define C6_CO_KIND_CHILD 2
+
+/* '__c6_body_<name>', '__c6_desc_<name>' and '<name>_task' */
+static int c6_async_tok(const char *prefix, int name, const char *suffix)
+{
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s%s%s", prefix,
+             get_tok_str(name, NULL), suffix);
+    return tok_alloc_const(buf);
+}
+
+/* the declaration of runtime helper NAME, which tcc_predefs() always emits */
+static Sym *c6_rt(const char *name)
+{
+    Sym *s = sym_find(tok_alloc_const(name));
+    if (!s)
+        tcc_error("internal: runtime declaration '%s' is missing", name);
+    return s;
+}
+
+/* push the helper symbol; the arguments go on top of it and c6_rt_end()
+   performs the call and pushes the declared result */
+static void c6_rt_begin(const char *name)
+{
+    Sym *s = c6_rt(name);
+    vpushsym(&s->type, s);
+}
+
+static void c6_rt_end(const char *name, int nargs)
+{
+    Sym *s = c6_rt(name);
+    CType rt = s->type.ref->type;
+
+    gfunc_call(nargs);
+    if ((rt.t & VT_BTYPE) != VT_VOID) {
+        vpushi(0);
+        vtop->r = REG_IRET;
+        vtop->type = rt;
+    }
+}
+
+/* the parameters of an async signature, skipping the '(void)' spelling */
+static Sym *c6_async_params(CType *ft)
+{
+    Sym *p = ft->ref->next;
+    if (p && (p->type.t & VT_BTYPE) == VT_VOID)
+        return NULL;
+    return p;
+}
+
+/* Append an integer constant to TS (the parser's current token is saved and
+   restored, since tok_str_add_tok() reads it). */
+static void c6_async_add_int(TokenString *ts, int v)
+{
+    int save_tok = tok;
+    CValue save_val = tokc;
+
+    tok = TOK_CINT;
+    tokc.i = v;
+    tok_str_add_tok(ts);
+    tok = save_tok;
+    tokc = save_val;
+}
+
+/* Append the tokens that spell TYPE as a type specifier (no declarator).
+   'async' signatures are restricted to types that can be written back out,
+   because the task structure is rebuilt from the declaration. */
+static int c6_async_type_tokens(TokenString *ts, CType *type)
+{
+    C6Slice *sl;
+    int t = type->t;
+
+    if (t & (VT_ARRAY | VT_VLA))
+        return 0;
+    sl = c6_slice_of_type(type);
+    if (sl) {
+        if (!c6_async_type_tokens(ts, &sl->elem))
+            return 0;
+        tok_str_add(ts, '[');
+        tok_str_add(ts, ':');
+        tok_str_add(ts, ']');
+        return 1;
+    }
+    if (t & VT_CONSTANT)
+        tok_str_add(ts, TOK_CONST1);
+    switch (t & VT_BTYPE) {
+    case VT_VOID:   tok_str_add(ts, TOK_VOID);   return 1;
+    case VT_FLOAT:  tok_str_add(ts, TOK_FLOAT);  return 1;
+    case VT_DOUBLE: tok_str_add(ts, TOK_DOUBLE); return 1;
+    case VT_LDOUBLE:
+        tok_str_add(ts, TOK_LONG);
+        tok_str_add(ts, TOK_DOUBLE);
+        return 1;
+    case VT_BOOL:   tok_str_add(ts, TOK_BOOL);   return 1;
+    case VT_BYTE:   tok_str_add(ts, TOK_CHAR);   break;
+    case VT_SHORT:  tok_str_add(ts, TOK_SHORT);  break;
+    case VT_INT:    tok_str_add(ts, TOK_INT);    break;
+    case VT_LLONG:
+        tok_str_add(ts, TOK_LONG);
+        tok_str_add(ts, TOK_LONG);
+        break;
+    case VT_PTR:
+        if (!c6_async_type_tokens(ts, &type->ref->type))
+            return 0;
+        tok_str_add(ts, '*');
+        return 1;
+    case VT_STRUCT:
+    case VT_UNION:
+        if (!type->ref)
+            return 0;
+        tok_str_add(ts, (t & VT_UNION) == VT_UNION ? TOK_UNION : TOK_STRUCT);
+        tok_str_add(ts, type->ref->v & ~SYM_STRUCT);
+        return 1;
+    default:
+        return 0;
+    }
+    if (t & VT_UNSIGNED)
+        tok_str_add(ts, TOK_UNSIGNED);
+    return 1;
+}
+
+/* Declare 'struct NAME_task { struct __c6_task head; T val; P0 p0; ... };'
+   Idempotent, so a repeated prototype is cheap. */
+static void c6_async_declare(CType *ftype, int name)
+{
+    TokenString *ts;
+    Sym *p;
+    char buf[32];
+    int tag, i;
+
+    tag = c6_async_tok("", name, "_task");
+    if (struct_find(tag))
+        return;
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, tag);
+    tok_str_add(ts, '{');
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, tok_alloc_const("__c6_task"));
+    tok_str_add(ts, tok_alloc_const("head"));
+    tok_str_add(ts, ';');
+    if ((ftype->ref->type.t & VT_BTYPE) != VT_VOID) {
+        if (!c6_async_type_tokens(ts, &ftype->ref->type))
+            goto bad;
+        tok_str_add(ts, tok_alloc_const("val"));
+        tok_str_add(ts, ';');
+    }
+    for (i = 0, p = c6_async_params(ftype); p; p = p->next, i++) {
+        if (!c6_async_type_tokens(ts, &p->type))
+            goto bad;
+        snprintf(buf, sizeof buf, "p%d", i);
+        tok_str_add(ts, tok_alloc_const(buf));
+        tok_str_add(ts, ';');
+    }
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+    return;
+bad:
+    {
+        char tbuf[256];
+        type_to_str(tbuf, sizeof tbuf, ftype, NULL);
+        tcc_error("'async' does not support this signature: '%s'", tbuf);
+    }
+}
+
+/* push the task pointer (the body's only parameter) */
+static void c6_async_push_task(void)
+{
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, c6_async_fr_off);
+}
+
+/* push the frame base (rbp), recovered from the marker's own address */
+static void c6_async_push_base(void)
+{
+    vset(&char_pointer_type, VT_LOCAL, c6_async_base_off);
+    vpushi(-c6_async_base_off);
+    gen_op('+');
+}
+
+/* the task structure of async function NAME */
+static CType c6_async_task_ctype(int name)
+{
+    CType t;
+    Sym *s = struct_find(c6_async_tok("", name, "_task"));
+    if (!s)
+        tcc_error("'%s' is not an async function", get_tok_str(name, NULL));
+    t.t = VT_STRUCT;
+    t.ref = s;
+    return t;
+}
+
+/* push the lvalue of TASK.FIELD; TASK_OFF is the slot holding the task
+   pointer, or 0 for the task of the body being compiled */
+static void c6_async_push_field(int name, const char *field, int task_off)
+{
+    CType st = c6_async_task_ctype(name);
+    Sym *f;
+    int ofs = 0;
+
+    f = find_field(&st, tok_alloc_const(field), &ofs);
+    if (task_off)
+        vset(&char_pointer_type, VT_LOCAL | VT_LVAL, task_off);
+    else
+        c6_async_push_task();
+    vtop->type = char_pointer_type;
+    vpushi(ofs);
+    gen_op('+');
+    vtop->type = f->type;
+    vtop->r |= VT_LVAL;        /* async signatures cannot contain arrays */
+}
+
+/* address of the descriptor of async function NAME */
+static void c6_async_push_desc(int name)
+{
+    CType dt;
+    Sym *st = struct_find(tok_alloc_const("__c6_desc"));
+    AttributeDef ad;
+    Sym *s;
+
+    if (!st)
+        tcc_error("internal: 'struct __c6_desc' is missing");
+    dt.t = VT_STRUCT | VT_CONSTANT | VT_EXTERN;
+    dt.ref = st;
+    memset(&ad, 0, sizeof ad);
+    s = external_sym(c6_async_tok("__c6_desc_", name, ""), &dt, 0, &ad);
+    vpushsym(&dt, s);
+    mk_pointer(&vtop->type);        /* the symbol's address, as '... *' */
+}
+
+/* __c6_co_finish(task, kind); return kind; -- leaves the body for good */
+static void c6_async_finish(int kind)
+{
+    c6_rt_begin("__c6_co_finish");
+    c6_async_push_task();
+    vpushi(kind);
+    c6_rt_end("__c6_co_finish", 2);
+    vpushi(kind);
+    gfunc_return(&int_type);
+    rsym = gjmp(rsym);
+    CODE_OFF();
+}
+
+/* Park the frame and return to the driver; execution continues at the
+   freshly defined resume label when the task is stepped again. */
+static void c6_async_suspend(int kind)
+{
+    int size = -loc;
+    int state = ++c6_async_nstates;
+    int vsp = vtop - vstack;
+    C6AsyncSite *site;
+    Sym *label;
+    int i;
+
+    /* Everything already on the value stack has to survive the suspension.
+       Frame slots do, because a resume restores the frame to the same
+       offsets; registers and pending jump chains do not. */
+    for (i = 0; i < vsp; i++) {
+        int r = vstack[i].r & VT_VALMASK;
+        if (r < VT_CONST || r == VT_CMP || r == VT_JMP || r == VT_JMPI)
+            tcc_error("the value pending across 'await' must live in a "
+                      "variable: store it in a local first");
+    }
+
+    /* __c6_co_suspend(task, kind, state, base, size, defer_base) */
+    c6_rt_begin("__c6_co_suspend");
+    c6_async_push_task();
+    vpushi(kind);
+    vpushi(state);
+    c6_async_push_base();
+    vpushi(size);
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
+    c6_rt_end("__c6_co_suspend", 6);
+    vpushi(kind);
+    gfunc_return(&int_type);
+    rsym = gjmp(rsym);
+    CODE_OFF();
+    /* the resume path must find the value stack exactly as the suspending
+       path left it */
+    vtop = vstack + vsp;
+
+    label = c6_new_label("co_resume");
+    c6_def_label(label);                /* CODE_ON() at the resume point */
+    site = tcc_mallocz(sizeof *site);
+    site->state = state;
+    site->label = label;
+    site->next = c6_async_sites;
+    c6_async_sites = site;
+}
+
+/* 'return [expr];' inside an async body */
+static void c6_async_return(void)
+{
+    CType vt = c6_async_ftype.ref->type;
+
+    if (defer_state.body_depth > 0)
+        tcc_error("'return' is not allowed in a defer body");
+    if (tok != ';') {
+        if ((vt.t & VT_BTYPE) == VT_VOID) {
+            gexpr();
+            c6_fallible_use();
+            vpop();
+        } else {
+            c6_async_push_field(c6_async_name, "val", 0);
+            gexpr();
+            c6_fallible_use();
+            gen_assign_cast(&vt);
+            vstore();
+            vpop();
+        }
+    }
+    if (defer_state.enabled && (defer_state.has_sites || defer_state.disp_jmps))
+        c6_defer_begin(1, 0);
+    c6_async_finish(C6_CO_KIND_DONE);
+}
+
+/* 'await c6_io(fd, ev)': the only leaf suspension primitive */
+static void c6_async_await_io(Sym *s)
+{
+    CType iot = s->type.ref->next->type;   /* fd */
+    CType evt = s->type.ref->next->next->type;   /* ev */
+
+    next();                                /* '(' */
+    c6_rt_begin("__c6_co_set_io");
+    c6_async_push_task();
+    expr_eq();
+    gen_assign_cast(&iot);
+    skip(',');
+    expr_eq();
+    gen_assign_cast(&evt);
+    skip(')');
+    c6_rt_end("__c6_co_set_io", 3);
+
+    c6_async_suspend(C6_CO_KIND_IO);
+    /* the value of the await is the readiness mask */
+    c6_rt_begin("__c6_co_rev");
+    c6_async_push_task();
+    c6_rt_end("__c6_co_rev", 1);
+}
+
+/* 'await f(args)' of async function S, whose task lives in slot TASK_OFF */
+static void c6_async_await_task(int task_off, Sym *s)
+{
+    CType ct = s->type.ref->type;
+    int j, skip;
+
+    /* __c6_co_await(child, task) is 0 when the child already finished */
+    c6_rt_begin("__c6_co_await");
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, task_off);
+    c6_async_push_task();
+    c6_rt_end("__c6_co_await", 2);
+    gen_test_zero(TOK_NE);
+    j = gvtst(0, 0);                       /* jump when the child must run */
+    skip = gjmp(0);
+    gsym(j);
+    c6_async_suspend(C6_CO_KIND_CHILD);
+    gsym(skip);
+    /* the value of the await is the child's completed value */
+    if ((ct.t & VT_BTYPE) == VT_VOID) {
+        CType vt;
+        vt.t = VT_VOID;
+        vt.ref = NULL;
+        vpush(&vt);
+    } else {
+        c6_async_push_field(s->v, "val", task_off);
+    }
+}
+
+/* Rewrite 'f(args)' of an async function into a task creation.  Leaves the
+   handle ('struct f_task *') on the value stack, or the completed value when
+   the call is awaited.  On entry the token is at '('. */
+static void c6_async_call(Sym *s)
+{
+    CType taskt = c6_async_task_ctype(s->v);
+    Sym *p;
+    char buf[32];
+    int task_off, i, awaited = c6_await_pending;
+
+    c6_await_pending = 0;
+
+    /* task = __c6_co_new(&__c6_desc_NAME) */
+    c6_rt_begin("__c6_co_new");
+    c6_async_push_desc(s->v);
+    c6_rt_end("__c6_co_new", 1);
+    loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    task_off = loc;
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, task_off);
+    vswap();
+    vstore();
+    vpop();
+
+    /* copy the arguments into the frame prefix */
+    next();                                /* '(' */
+    for (i = 0, p = c6_async_params(&s->type); p; p = p->next, i++) {
+        if (i)
+            skip(',');
+        snprintf(buf, sizeof buf, "p%d", i);
+        c6_async_push_field(s->v, buf, task_off);
+        expr_eq();
+        c6_fallible_use();
+        gen_assign_cast(&p->type);
+        vstore();
+        vpop();
+    }
+    skip(')');
+
+    if (awaited) {
+        c6_async_await_task(task_off, s);
+        return;
+    }
+    vset(&taskt, VT_LOCAL | VT_LVAL, task_off);
+    mk_pointer(&vtop->type);
+}
+
+/* prologue of an async body: locate the frame base, then either dispatch to a
+   resume point or fall through into the ordinary body code */
+static void c6_async_func_begin(void)
+{
+    Sym *arg = sym_find(tok_alloc_const("__c6_arg"));
+    int j, skip;
+
+    if (!arg)
+        tcc_error("internal: async body has no frame argument");
+    c6_async_fr_off = arg->c;
+    loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    c6_async_base_off = loc;
+
+    /* if (__c6_co_state(task)) { __c6_co_restore(task, base); goto dispatch; } */
+    c6_rt_begin("__c6_co_state");
+    c6_async_push_task();
+    c6_rt_end("__c6_co_state", 1);
+    gen_test_zero(TOK_NE);
+    j = gvtst(0, 0);                       /* jump when resuming */
+    skip = gjmp(0);
+    gsym(j);
+    c6_rt_begin("__c6_co_restore");
+    c6_async_push_task();
+    c6_async_push_base();
+    c6_rt_end("__c6_co_restore", 2);
+    c6_async_dispatch = gjmp(c6_async_dispatch);
+    gsym(skip);
+}
+
+/* Declare the declared parameters as ordinary locals and copy them in from
+   the frame prefix.  Only the first entry runs this: a resume restores the
+   whole native frame instead. */
+static void c6_async_params_copy(void)
+{
+    Sym *p;
+    int i, align, size;
+    char buf[32];
+
+    for (i = 0, p = c6_async_params(&c6_async_ftype); p; p = p->next, i++) {
+        CType pt = p->type;
+        Sym *ls;
+
+        snprintf(buf, sizeof buf, "p%d", i);
+        convert_parameter_type(&pt);
+        size = type_size(&pt, &align);
+        loc = (loc - size) & -align;
+        ls = sym_push(p->v & ~SYM_FIELD, &pt, VT_LOCAL | VT_LVAL, loc);
+        c6_async_push_field(c6_async_name, buf, 0);
+        vset(&pt, VT_LOCAL | VT_LVAL, ls->c);
+        vswap();
+        vstore();
+        vpop();
+    }
+}
+
+/* resume dispatcher, emitted after the body and after the defer dispatcher */
+static void c6_async_func_end(void)
+{
+    C6AsyncSite *s;
+    int st_off;
+
+    CODE_ON();
+    if (c6_async_dispatch)
+        gsym(c6_async_dispatch);
+    loc = (loc - (int)sizeof(int)) & -PTR_SIZE;
+    st_off = loc;
+    c6_rt_begin("__c6_co_state");
+    c6_async_push_task();
+    c6_rt_end("__c6_co_state", 1);
+    vset(&int_type, VT_LOCAL | VT_LVAL, st_off);
+    vswap();
+    vstore();
+    vpop();
+    for (s = c6_async_sites; s; s = s->next) {
+        int j;
+        vset(&int_type, VT_LOCAL | VT_LVAL, st_off);
+        gv(RC_INT);
+        vpushi(s->state);
+        gen_op(TOK_EQ);
+        j = gvtst(1, 0);          /* fall through when it matches */
+        gjmp_addr(s->label->jind);
+        gsym(j);
+    }
+    /* nothing matched: end the task rather than run off the end */
+    c6_async_finish(C6_CO_KIND_DONE);
+
+    while (c6_async_sites) {
+        C6AsyncSite *n = c6_async_sites->next;
+        tcc_free(c6_async_sites);
+        c6_async_sites = n;
+    }
+    c6_async_cur = 0;
+    c6_async_nstates = 0;
+    c6_async_dispatch = 0;
+}
+
+/* 'await expr': the operand must become a call of an async function or of
+   'c6_io', which the call hook rewrites into a suspension. */
+static void c6_await_parse(void)
+{
+    int save;
+
+    if (!c6_async_cur)
+        tcc_error("'await' is only allowed inside an 'async' function");
+    if (defer_state.body_depth > 0)
+        tcc_error("'await' is not allowed in a 'defer' body");
+    if (nocode_wanted)
+        tcc_error("'await' is not allowed in an unevaluated context");
+    next();                             /* 'await' */
+    save = c6_await_pending;
+    c6_await_pending = 1;
+    unary();
+    if (c6_await_pending)
+        tcc_error("'await' requires a call to an 'async' function");
+    c6_await_pending = save;
+}
+
+/* 'async' function definition: declare the task type, compile the body under
+   its own name, then emit the descriptor the runtime creates tasks from. */
+static void c6_async_definition(Sym *sym, CType *ftype)
+{
+    int name = sym->v;
+    int body = c6_async_tok("__c6_body_", name, "");
+    TokenString *ts;
+    Sym *body_sym;
+    int align, size;
+
+    c6_async_declare(ftype, name);
+
+    /* 'int __c6_body_NAME(void *__c6_arg);' */
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_INT);
+    tok_str_add(ts, body);
+    tok_str_add(ts, '(');
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, tok_alloc_const("__c6_arg"));
+    tok_str_add(ts, ')');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+    body_sym = sym_find(body);
+    if (!body_sym)
+        tcc_error("internal: cannot declare '%s'", get_tok_str(body, NULL));
+
+    c6_async_cur = 1;
+    c6_async_name = name;
+    c6_async_ftype = *ftype;
+    c6_async_sites = NULL;
+    c6_async_nstates = 0;
+    c6_async_dispatch = 0;
+
+    cur_text_section = text_section;
+    gen_function(body_sym);
+
+    /* 'const struct __c6_desc __c6_desc_NAME = { size, align, max, body };' */
+    {
+        CType taskt = c6_async_task_ctype(name);
+        size = type_size(&taskt, &align);
+    }
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_CONST1);
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, tok_alloc_const("__c6_desc"));
+    tok_str_add(ts, c6_async_tok("__c6_desc_", name, ""));
+    tok_str_add(ts, '=');
+    tok_str_add(ts, '{');
+    c6_async_add_int(ts, size);
+    tok_str_add(ts, ',');
+    c6_async_add_int(ts, align);
+    tok_str_add(ts, ',');
+    c6_async_add_int(ts, 64);   /* defer records parked per task */
+    tok_str_add(ts, ',');
+    tok_str_add(ts, body);
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+}
+#endif /* C6_EXT */
+
 static void gen_function(Sym *sym)
 {
     struct scope f = { 0 };
@@ -10941,14 +11630,31 @@ static void gen_function(Sym *sym)
 
     gfunc_prolog(sym);
 #ifdef C6_EXT
-    if (tcc_state->c6_ext)
+    if (tcc_state->c6_ext) {
+        /* an async body first checks whether it is being resumed, then
+           records its defer frame base and copies the parameters in */
+        if (c6_async_cur)
+            c6_async_func_begin();
         c6_defer_func_init();
+        if (c6_async_cur)
+            c6_async_params_copy();
+    }
 #endif
     tcc_debug_prolog_epilog(tcc_state, 0);
     func_vla_arg(sym);
     block(0);
 #ifdef C6_EXT
-    if (defer_state.enabled) {
+    if (c6_async_cur && tcc_state->c6_ext) {
+        /* falling off the end finishes the task */
+        if (!nocode_wanted) {
+            if (defer_state.enabled)
+                c6_defer_begin(1, 0);
+            c6_async_finish(C6_CO_KIND_DONE);
+        }
+        if (defer_state.enabled)
+            c6_defer_func_end();
+        c6_async_func_end();
+    } else if (defer_state.enabled) {
         /* fall-through function exit also runs the cleanups; the dispatcher
            itself must be emitted even if the body ended with a jump. */
         if (!nocode_wanted) {
@@ -11283,6 +11989,18 @@ static int decl(int l)
             if ((type.t & VT_BTYPE) == VT_FUNC) {
                 if ((type.t & VT_STATIC) && (l != VT_CONST))
                     tcc_error("function without file scope cannot be static");
+#ifdef C6_EXT
+                if (tcc_state->c6_ext && type.ref->f.func_async) {
+                    if (type.t & VT_INLINE)
+                        tcc_error("'async' cannot be combined with 'inline'");
+                    if (l != VT_CONST)
+                        tcc_error("'async' functions must have file scope");
+                    if (v >= TOK_UIDENT
+                        && !strcmp(get_tok_str(v, NULL), "main"))
+                        tcc_error("'main' cannot be async");
+                    c6_async_declare(&type, v);
+                }
+#endif
                 /* if old style function prototype, we accept a
                    declaration list */
                 sym = type.ref;
@@ -11337,6 +12055,9 @@ static int decl(int l)
                     if (ps && (ps->type.t & VT_BTYPE) == VT_FUNC
                         && ps->type.ref->f.func_fallible)
                         type.ref->f.func_fallible = 1;
+                    if (ps && (ps->type.t & VT_BTYPE) == VT_FUNC
+                        && ps->type.ref->f.func_async)
+                        type.ref->f.func_async = 1;
                 }
 #endif
                 /* put function symbol */
@@ -11377,6 +12098,14 @@ static int decl(int l)
                         if (ad.new_section)
                             ad.section->sh_flags = text_section->sh_flags;
                     }
+#ifdef C6_EXT
+                    if (tcc_state->c6_ext && type.ref->f.func_async) {
+                        if (c6_async_cur)
+                            tcc_error("'async' functions cannot be nested");
+                        c6_async_definition(sym, &type);
+                        break;
+                    }
+#endif
                     gen_function(sym);
                 }
                 break;

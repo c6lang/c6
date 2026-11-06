@@ -851,3 +851,310 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
     *(void **)out = (void *)(base + lo * elem_size);
     *(TccSliceSize *)((char *)out + sizeof(void *)) = hi - lo;
 }
+
+/* ------------------------------------------------------------------------- */
+/* c6 extension runtime: async / await (stackless coroutines)                */
+/*                                                                           */
+/* An 'async' function is compiled to 'int __c6_body_NAME(void *task)'.  The */
+/* body runs on the caller's stack; every suspension ("await" that has to    */
+/* wait) copies the used part of the native frame into the task and returns  */
+/* to whoever drives the task (__c6_co_wait).  Resuming re-enters the body,  */
+/* copies the saved frame back to the same offsets and jumps to the recorded */
+/* resume point.  Task objects live in this file so that 'struct __c6_task'  */
+/* has exactly the layout that tcc_predefs() declares to compiled programs;  */
+/* generated code only ever touches it through the __c6_co_* accessors.      */
+
+#define C6_CO_MAX        64     /* concurrent tasks (frames + slots) */
+#define C6_CO_FRAME_MAX  4096   /* largest native frame an async body may use */
+#define C6_CO_TASK_MAX   1024   /* largest 'struct NAME_task' */
+#define C6_CO_DEFER_MAX  256    /* parked defer records per task */
+
+#define C6_CO_KIND_DONE   0
+#define C6_CO_KIND_IO     1
+#define C6_CO_KIND_CHILD  2
+#define C6_CO_KIND_ERR    3
+
+#define C6_CO_STATE_NEW   0
+#define C6_CO_STATE_DONE  (-1)
+
+/* lays out exactly like the predef in tccpp.c:tcc_predefs() */
+typedef struct TccCoTask {
+    int state, kind;
+    int defer_max, defer_base, defer_cap, defer_csp;
+    int wait_fd, wait_ev, wait_rev;
+    int err_flag, err_id, __pad0;
+    void *desc, *frame, *defer_arena, *parent, *child;
+    const char *err_msg;
+    int frame_size, __pad1;
+} TccCoTask;
+
+typedef struct TccCoDesc {
+    unsigned size, align;
+    int defer_max;
+    int (*entry)(void *);
+} TccCoDesc;
+
+/* One slot per task, big enough for 'struct NAME_task' (the header plus the
+   declared return value and parameters).  'long long' keeps every slot
+   8-byte aligned. */
+static long long tcc_co_task_mem[C6_CO_MAX][C6_CO_TASK_MAX / 8];
+#define C6_CO_TASK(i) ((TccCoTask *)(void *)tcc_co_task_mem[i])
+static char tcc_co_frames[C6_CO_MAX][C6_CO_FRAME_MAX];
+static TccDeferRec tcc_co_parked[C6_CO_MAX][C6_CO_DEFER_MAX];
+static char tcc_co_live[C6_CO_MAX];
+
+extern int select(int, void *, void *, void *, void *);
+
+static void tcc_co_trap(void)
+{
+    volatile int *p = (volatile int *)0;
+    *p = 0;
+}
+
+static void tcc_co_copy(void *dst, const void *src, int n)
+{
+    char *d = (char *)dst;
+    const char *s = (const char *)src;
+    while (n-- > 0)
+        *d++ = *s++;
+}
+
+static int tcc_co_index(TccCoTask *t)
+{
+    long off = (long)((char *)t - (char *)(void *)tcc_co_task_mem);
+    int i;
+
+    if (off < 0 || off >= (long)C6_CO_MAX * C6_CO_TASK_MAX
+        || off % C6_CO_TASK_MAX)
+        tcc_co_trap();
+    i = (int)(off / C6_CO_TASK_MAX);
+    if (!tcc_co_live[i])
+        tcc_co_trap();
+    return i;
+}
+
+/* Allocate a task.  The returned pointer is both the 'void *task' handle and
+   the address of its 'struct __c6_task head', which is field 0 of the
+   generated 'struct NAME_task', so the frame prefix needs no fixups. */
+void *__c6_co_new(const TccCoDesc *d)
+{
+    int i;
+    TccCoTask *t;
+
+    for (i = 0; i < C6_CO_MAX; i++)
+        if (!tcc_co_live[i])
+            break;
+    if (i >= C6_CO_MAX)
+        tcc_co_trap();          /* too many live tasks */
+    if (d->size > C6_CO_TASK_MAX)
+        tcc_co_trap();          /* frame prefix larger than the pool */
+    tcc_co_live[i] = 1;
+    t = C6_CO_TASK(i);
+    {
+        char *p = (char *)t;
+        int n = (int)d->size;
+        while (n-- > 0)
+            *p++ = 0;
+    }
+    t->state = C6_CO_STATE_NEW;
+    t->kind = C6_CO_KIND_DONE;
+    t->desc = (void *)d;
+    t->defer_max = d->defer_max;
+    if (t->defer_max > C6_CO_DEFER_MAX)
+        t->defer_max = C6_CO_DEFER_MAX;
+    return t;
+}
+
+/* Link CHILD under SELF.  Returns 0 when the child has already finished (the
+   caller can read its value without suspending), 1 when it must wait. */
+int __c6_co_await(void *child, void *self)
+{
+    TccCoTask *c = (TccCoTask *)child;
+    TccCoTask *t = (TccCoTask *)self;
+
+    t->child = c;
+    c->parent = t;
+    return c->state == C6_CO_STATE_DONE ? 0 : 1;
+}
+
+/* Park the native frame, the defer records of this frame and the error slot,
+   then record where the body has to resume. */
+void __c6_co_suspend(void *self, int kind, int state,
+                     char *base, int size, int defer_base)
+{
+    TccCoTask *t = (TccCoTask *)self;
+    int idx = tcc_co_index(t);
+    int i, n;
+
+    if (size < 0 || size > C6_CO_FRAME_MAX)
+        tcc_co_trap();
+    t->frame_size = size;
+    tcc_co_copy(tcc_co_frames[idx], base - size, size);
+    t->frame = tcc_co_frames[idx];
+    t->state = state;
+    t->kind = kind;
+
+    t->defer_base = defer_base;
+    n = tcc_defer_sp - defer_base;
+    if (n < 0)
+        n = 0;
+    if (n > t->defer_max)
+        n = t->defer_max;
+    for (i = 0; i < n; i++)
+        tcc_co_parked[idx][i] = tcc_defer_stack[defer_base + i];
+    t->defer_cap = n;
+    t->defer_csp = tcc_defer_csp;
+    if (tcc_defer_sp > defer_base)
+        tcc_defer_sp = defer_base;
+    tcc_defer_csp = 0;
+
+    t->err_flag = tcc_err_flag;
+    t->err_id = tcc_err_id;
+    t->err_msg = tcc_err_msg;
+    tcc_err_flag = 0;
+    tcc_err_id = 0;
+    tcc_err_msg = 0;
+}
+
+/* Put the parked native frame back where it belongs and re-establish the
+   task's defer and error state (the generated prologue calls this before it
+   jumps to the resume point). */
+void __c6_co_restore(void *self, char *base)
+{
+    TccCoTask *t = (TccCoTask *)self;
+    int idx = tcc_co_index(t);
+    int i, n = t->defer_cap;
+
+    tcc_co_copy(base - t->frame_size, tcc_co_frames[idx], t->frame_size);
+    for (i = 0; i < n; i++)
+        tcc_defer_stack[t->defer_base + i] = tcc_co_parked[idx][i];
+    tcc_defer_sp = t->defer_base + n;
+    tcc_defer_csp = t->defer_csp;
+    tcc_err_flag = t->err_flag;
+    tcc_err_id = t->err_id;
+    tcc_err_msg = t->err_msg;
+    tcc_err_flag = 0;           /* a resumed body starts from a clean slot */
+    tcc_err_id = 0;
+    tcc_err_msg = 0;
+}
+
+void __c6_co_finish(void *self, int kind)
+{
+    TccCoTask *t = (TccCoTask *)self;
+    t->state = C6_CO_STATE_DONE;
+    t->kind = kind;
+}
+
+int __c6_co_state(void *self)
+{
+    return ((TccCoTask *)self)->state;
+}
+
+int __c6_co_kind(void *self)
+{
+    return ((TccCoTask *)self)->kind;
+}
+
+void __c6_co_set_io(void *self, int fd, int ev)
+{
+    TccCoTask *t = (TccCoTask *)self;
+    t->wait_fd = fd;
+    t->wait_ev = ev;
+    t->wait_rev = 0;
+}
+
+int __c6_co_rev(void *self)
+{
+    return ((TccCoTask *)self)->wait_rev;
+}
+
+/* Wait for FD to become ready for EV (1 = readable, 2 = writable).  libtcc1
+   carries no headers, so 'select' is declared by hand and the descriptor set
+   is a plain word array; fds must be below 1024 (FD_SETSIZE). */
+static int tcc_co_select(int fd, int ev)
+{
+    unsigned long r[16], w[16], e[16];
+    int i, res, rev = 0;
+
+    if (fd < 0 || fd >= 1024)
+        return -1;
+    for (i = 0; i < 16; i++)
+        r[i] = w[i] = e[i] = 0;
+    if (ev & 1)
+        r[fd >> 6] |= 1UL << (fd & 63);
+    if (ev & 2)
+        w[fd >> 6] |= 1UL << (fd & 63);
+    res = select(fd + 1, r, w, e, (void *)0);
+    if (res <= 0)
+        return res;
+    if (r[fd >> 6] & (1UL << (fd & 63)))
+        rev |= 1;
+    if (w[fd >> 6] & (1UL << (fd & 63)))
+        rev |= 2;
+    if (e[fd >> 6] & (1UL << (fd & 63)))
+        rev |= 3;
+    return rev;
+}
+
+/* Drive the task tree rooted at SELF until it finishes: 0 = done, -1 = the
+   root raised an error (the error slot of the root still holds it). */
+int __c6_co_wait(void *self)
+{
+    TccCoTask *root = (TccCoTask *)self;
+
+    for (;;) {
+        TccCoTask *t = root;
+        TccCoDesc *d;
+        int k;
+
+        while (t->child && ((TccCoTask *)t->child)->state != C6_CO_STATE_DONE)
+            t = (TccCoTask *)t->child;
+        if (t == root && t->state == C6_CO_STATE_DONE)
+            return t->kind == C6_CO_KIND_ERR ? -1 : 0;
+        d = (TccCoDesc *)t->desc;
+        k = d->entry(t);
+        switch (k) {
+        case C6_CO_KIND_DONE:
+        case C6_CO_KIND_ERR:
+            t->state = C6_CO_STATE_DONE;
+            t->kind = k;
+            break;
+        case C6_CO_KIND_IO: {
+            int rev = tcc_co_select(t->wait_fd, t->wait_ev);
+            if (rev < 0)
+                return -1;
+            t->wait_rev = rev;
+            break;
+        }
+        case C6_CO_KIND_CHILD:
+            break;
+        default:
+            tcc_co_trap();
+        }
+    }
+}
+
+/* Release a task and everything it owns.  A still-suspended body is dropped
+   without running its remaining 'defer' statements. */
+void __c6_co_destroy(void *self)
+{
+    TccCoTask *t = (TccCoTask *)self;
+    int idx;
+
+    if (!t)
+        return;
+    if (t->child)
+        __c6_co_destroy(t->child);
+    t->child = 0;
+    t->parent = 0;
+    tcc_co_live[tcc_co_index(t)] = 0;
+}
+
+/* 'await c6_io(fd, ev)' is rewritten by the compiler and never calls this;
+   the definition only keeps a stray direct call linkable. */
+int c6_io(int fd, int ev)
+{
+    (void)fd;
+    (void)ev;
+    return -1;
+}

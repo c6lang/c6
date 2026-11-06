@@ -521,7 +521,8 @@ struct FuncAttr {
     func_args   : 8, /* PE __stdcall args */
     func_alwinl : 1, /* always_inline */
     func_fallible : 1, /* c6: declared with the 'T!error' suffix */
-    xxxx        : 14;
+    func_async  : 1, /* c6: declared with the 'async' specifier */
+    xxxx        : 13;
 };
 
 /* symbol management */

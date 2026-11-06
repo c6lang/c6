@@ -3859,6 +3859,39 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "#define __TCC_ERROR_DEFINED 1\n"
           "typedef struct __tcc_error { int id; const char *msg; } error;\n"
           "#endif\n"
+          /* c6 async/await: the task header is owned by libtcc1 (its layout
+             is fixed there); the compiler only needs the right size and
+             alignment, since a 'struct NAME_task' starts with it.  Every
+             generated access goes through the __c6_co_* accessors. */
+          "#ifndef __TCC_ASYNC_DEFINED\n"
+          "#define __TCC_ASYNC_DEFINED 1\n"
+          "struct __c6_task {\n"
+          "    int state, kind;\n"
+          "    int defer_max, defer_base, defer_cap, defer_csp;\n"
+          "    int wait_fd, wait_ev, wait_rev;\n"
+          "    int err_flag, err_id, __pad0;\n"
+          "    void *desc, *frame, *defer_arena, *parent, *child;\n"
+          "    const char *err_msg;\n"
+          "    int frame_size, __pad1;\n"
+          "};\n"
+          "struct __c6_desc { unsigned size, align; int defer_max;\n"
+          "                   int (*entry)(void *); };\n"
+          "void *__c6_co_new(const struct __c6_desc *d);\n"
+          "int __c6_co_await(void *child, void *self);\n"
+          "void __c6_co_suspend(void *self, int kind, int state,\n"
+          "                     char *base, int size, int defer_base);\n"
+          "void __c6_co_restore(void *self, char *base);\n"
+          "void __c6_co_finish(void *self, int kind);\n"
+          "int __c6_co_state(void *self);\n"
+          "int __c6_co_kind(void *self);\n"
+          "void __c6_co_set_io(void *self, int fd, int ev);\n"
+          "int __c6_co_rev(void *self);\n"
+          "int __c6_co_wait(void *self);\n"
+          "void __c6_co_destroy(void *self);\n"
+          "int c6_io(int fd, int ev);\n"
+          "#define C6_CO_EV_READ  1\n"
+          "#define C6_CO_EV_WRITE 2\n"
+          "#endif\n"
           , -1);
 #endif
     }
@@ -3972,7 +4005,7 @@ ST_FUNC void tccpp_new(TCCState *s)
            'test' may already be interned as an asm keyword, in which
            case the range ends before TOK_C6_TEST. */
         int t;
-        for (t = TOK_C6_PACKAGE; t <= TOK_C6_CATCH && t < tok_ident; t++)
+        for (t = TOK_C6_PACKAGE; t <= TOK_C6_AWAIT && t < tok_ident; t++)
             tok_unintern(t);
         if (TOK_C6_PACKAGE < tok_ident)
             tok_ident = TOK_C6_PACKAGE;

@@ -452,4 +452,6 @@
      DEF(TOK_C6_TEST,      "test")
      DEF(TOK_C6_TRY,       "try")
      DEF(TOK_C6_CATCH,     "catch")
+     DEF(TOK_C6_ASYNC,     "async")
+     DEF(TOK_C6_AWAIT,     "await")
 #endif
