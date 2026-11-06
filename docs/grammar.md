@@ -529,7 +529,7 @@ tuple-element-access   = postfix-expression , "[" , integer-constant , "]" ;
   `off = (off + align - 1) & -align`），与 `#pragma pack` 无关，因此同一个
   元组在任何 TU 都是同一个 ABI，并且与等价的 struct 完全一致——元组不引入
   任何新 ABI，参数和返回值都走已有的 struct 路径；
-* 元素类型必须完整、非 `void`、非函数类型、非变长数组（C51），并且必须
+* 元素类型必须完整、非 `void`、非函数类型、非变长数组、非数组（C51），并且必须
   **在文件作用域可见**（C52，内部 tag 注册在全局作用域）；`error` 不能作
   元素（C53）；
 * 至少两个元素（C54）。一元括号仍然只是普通括号：`(int)` 是强转，不是元组；
@@ -608,6 +608,11 @@ pattern-element        = type-specifier , declarator      (* 解构声明 *)
 （解构声明，新声明这些变量），要么全是左值或 `_`（解构赋值）。`_` 表示丢弃
 对应元素，不建符号、不生成加载（C60）；混写两种形式会退回普通表达式解析，
 因此会得到普通 C 的语法错误（C56）。
+
+因为它是语句，所以可以出现在任何能写语句的地方：复合语句里、`if` / `while`
+/ `do` / `for` / `switch` 的无花括号单条语句体里（`if (c) (int q, int r) = f();`）、
+标签之后、语句表达式 `({ … })` 里，以及 `defer` / `errdefer` 的单条语句体里
+（`defer (a, b) = f();`）。
 
 `foreach` 的三种可迭代对象与绑定数量一一对应：
 
@@ -797,7 +802,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C48 | 区间两个界必须是整数 | `range bounds must be integers` |
 | C49 | 元素类型必须可赋值且完整 | `'foreach' cannot copy an element of type 'T'`；`cannot iterate over incomplete element type 'T'` |
 | C50 | 循环体必须是复合语句 | `'{' expected` |
-| C51 | 元组元素类型必须完整、非 `void`、非函数类型、非变长数组 | `'tuple' element cannot be 'void'`；`'tuple' element cannot be a function type`；`'tuple' element cannot be a variable length array`；`'tuple' requires a complete element type, not 'T'` |
+| C51 | 元组元素类型必须完整、非 `void`、非函数类型、非变长数组、非数组 | `'tuple' element cannot be 'void'`；`'tuple' element cannot be a function type`；`'tuple' element cannot be a variable length array`；`'tuple' element cannot be an array type (use a pointer, a slice 'T[:]' or a struct)`；`'tuple' requires a complete element type, not 'T'` |
 | C52 | 元素类型的 tag 必须在文件作用域 | `the element type of a tuple must be declared at file scope, but 'T' is local` |
 | C53 | `error` 不能作元组元素 | `'error' can only be a return type, not a tuple element` |
 | C54 | 元组至少两个元素（`(T)` 仍是普通括号表达式） | — |
@@ -1422,6 +1427,9 @@ int main(void)
 | `(void, int)` / `(int[3], int)` / `(int f(), int)` / `(error, int)` | 约束 C51 / C53 |
 | 用 `#pragma pack` 改变元组布局 | 元组固定按自然对齐：跨 TU 的 ABI 不能随 pragma 状态变化 |
 | `(int, int) t; &t[0]` / 把元组直接当 `T[:]` 的底层数组 | 不支持：元素之间可能有 padding，不保证连续 |
+| `(int[2], int)`（数组作元素） | 约束 C51：数组不可赋值，请用指针、切片 `T[:]` 或包一层 struct |
+| `((int,int){1,2}[0])`（复合字面量外面再套一层括号、下标写在括号里） | 报 `')' expected (got '[')`：写成 `(int,int){1,2}[0]` 或 `((int,int){1,2})[0]` |
+| 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | 声明能过，但结构体→接口的转换点会报 `'{' expected (got ';')`——接口方法目前只支持标量签名，这是元组之前就有的缺口（与约束 C51–C60 无关） |
 | `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
 ---

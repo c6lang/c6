@@ -110,6 +110,61 @@ test "返回多值：解构赋值" {
     }
 }
 
+test "解构是语句：单条语句体、语句表达式、defer 体里都能用" {
+    int a = 0, b = 0, c = 1;
+
+    /* if/while/do/for/switch 的单条语句体不经过 decl()，也要认出来 */
+    if (c) (a, b) = divmod(17, 5);
+    if (a != 3 || b != 2)
+        err(1, "if 的单条语句体不对");
+    while (c--) (a, b) = divmod(20, 6);
+    if (a != 3 || b != 2)
+        err(2, "while 的单条语句体不对");
+    c = 1;
+    do (a, b) = divmod(23, 7); while (c-- > 0);
+    if (a != 3 || b != 2)
+        err(3, "do 的单条语句体不对");
+    for (c = 0; c < 1; c++) (a, b) = divmod(11, 3);
+    if (a != 3 || b != 2)
+        err(4, "for 的单条语句体不对");
+    c = 1;
+    switch (c) {
+    case 1: (a, b) = divmod(7, 2);
+    }
+    if (a != 3 || b != 1)
+        err(5, "case 后面的单条语句不对");
+    /* 声明形式同样可以当单条语句体 */
+    if (c) (int q, int r) = divmod(9, 4);
+    /* '_' 在单条语句体里照常丢弃 */
+    c = 1;
+    if (c) (_, b) = divmod(8, 3);
+    else (b, _) = divmod(8, 3);
+    if (b != 2)
+        err(6, "单条语句体里的 '_' 不对");
+    /* 语句表达式（c6 保留的 GCC 扩展）里也能用 */
+    {
+        int z = ({ (a, b) = divmod(20, 6); a + b; });
+
+        if (z != 5 || a != 3 || b != 2)
+            err(7, "语句表达式里的解构不对");
+    }
+    /* defer 的单条语句体里也能用，赋值在离开作用域时发生 */
+    a = 0; b = 0;
+    {
+        defer (a, b) = divmod(17, 5);
+
+        if (a != 0 || b != 0)
+            err(8, "defer 体不该立刻执行");
+    }
+    if (a != 3 || b != 2)
+        err(9, "defer 的单条语句体没执行");
+    /* 普通的括号表达式语句不受影响 */
+    (a, b);
+    if ((a = 1, b = 2) != 2)
+        err(10, "逗号表达式语句被误判了");
+    (void)divmod(1, 1);
+}
+
 test "'_' 占位符：只取需要的元素" {
     int a = 0, b = 0;
 
