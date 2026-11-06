@@ -1,0 +1,68 @@
+From 77057341a868ac1beb908a644052a4d13af3e83d Mon Sep 17 00:00:00 2001
+From: c6 <c6@localhost>
+Date: Sat, 7 Nov 2026 04:33:37 +0800
+Subject: [PATCH] c6: struct/union/enum tags are type names without the keyword
+
+'struct Vec v;' can now be written 'Vec v;': when a type specifier is
+expected and no ordinary symbol owns the name, a visible struct/union/enum
+tag is the type, exactly as if the keyword had been written (same CType,
+same tag symbol, same code paths).
+
+The ordinary namespace keeps priority, so headers that pair a tag with a
+function of the same name keep working: with 'struct stat' and 'stat()',
+'stat(path, &st)' is still a call and 'stat st;' is still not a
+declaration (write 'struct stat').  A typedef of the same name also wins,
+which 'typedef struct Vec Vec;' already relies on, and interfaces are
+unaffected (they synthesize 'typedef struct Shape Shape;').
+
+Because every type position goes through parse_btype(), the fallback
+covers declarations at file and block scope, parameters and return types,
+struct/union members, casts, sizeof/alignof, compound literals, 'T[:]'
+element types, method receivers and interface method signatures.  At
+statement start 'TAG:' stays a label (the same ignore_label guard the
+typedef path uses), and tags are never declared implicitly: an unknown
+name still reports the usual undeclared error.
+
+Only '-std=c6' translation units are affected.
+---
+ tccgen.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/tccgen.c b/tccgen.c
+index ab3ef07..a687cb7 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -5281,7 +5281,29 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
+             if (typespec_found)
+                 goto the_end;
+             s = sym_find(tok);
+-            if (!s || !(s->type.t & VT_TYPEDEF))
++            if (!s) {
++#ifdef C6_EXT
++                Sym *tag;
++                /* c6: a visible struct/union/enum tag is a type name even
++                   without the keyword.  Only when the ordinary namespace
++                   does not own the name: 'struct stat' next to 'stat()'
++                   keeps C's meaning, so 'stat(...)' stays a call. */
++                if (tcc_state->c6_ext && (tag = struct_find(tok)) != NULL) {
++                    n = tok, next();
++                    if (tok == ':' && ignore_label) {
++                        /* ignore if it's a label */
++                        unget_tok(n);
++                        goto the_end;
++                    }
++                    /* same as 'struct/union/enum TAG' */
++                    type1.t = tag->type.t;
++                    type1.ref = tag;
++                    goto basic_type2;
++                }
++#endif
++                goto the_end;
++            }
++            if (!(s->type.t & VT_TYPEDEF))
+                 goto the_end;
+ 
+             n = tok, next();
+-- 
+2.51.0
+

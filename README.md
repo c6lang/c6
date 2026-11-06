@@ -14,6 +14,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
 | `package` / `import` | 包与名字修饰（`pkg__sym`），`pkg.member` 访问导出符号，支持多级包名 |
 | 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用 |
+| 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]`；被普通符号遮蔽时仍写 `struct` |
 | `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
 | `foreach \|i, v\| a { ... }` | 遍历数组、切片与整数区间：绑定表在前，值绑定是元素副本 |
@@ -31,7 +32,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 ├── patches/          c6 扩展补丁（相对上游固定基线）
 ├── scripts/          bootstrap.sh：生成并搭建 TCC 工作树
 ├── tests/            c6 全部自测：*.c 是 test 块，errors/ 是编译期诊断
-├── examples/         可运行示例（err_demo.c、try_demo.c、slice_demo.c）
+├── examples/         可运行示例（每个特性一个 *_demo.c）
 ├── Makefile          便捷入口（bootstrap / build / selftest / test / clean）
 └── tcc/              TCC 源码树（由 bootstrap.sh 生成，不纳入本仓库）
 ```
@@ -288,6 +289,47 @@ int main(void)
   可以共存，各自 `p->area()`）；
 - 返回结构体的方法也支持（隐藏的 `self` 排在 sret 缓冲之后）；
 - `T!error` 方法照常工作：`int!error f(struct T *self)` 可用 `try p->f()` / `p->f() catch e { ... }`。
+
+### 省略 struct / union / enum
+
+tag 本身就是类型名，不用再写 `struct`（`union` / `enum` 同样）：
+
+```c
+struct Vec { int x, y; };
+struct Node { int v; Node *next; };      /* 定义体内就能省 */
+union Word { int i; float f; };
+enum Color { RED = 1, GREEN = 2 };
+
+Vec vec_add(Vec a, Vec b) { Vec r = { a.x + b.x, a.y + b.y }; return r; }
+
+int main(void)
+{
+    Vec v = { 3, 4 };                    /* 变量定义 */
+    Vec *p = &v;                         /* 语句开头的 'Vec *p' 是声明 */
+    const Vec *cp = &v;                  /* 限定符照常 */
+    Color c = (Color)GREEN;              /* 强转、sizeof(Vec)、复合字面量 (Vec){1,2} */
+    Vec arr[2] = { { 1, 2 }, { 3, 4 } };
+    Vec[:] vs = arr;                     /* 切片元素 */
+    return (int)sizeof(Vec) + p->x + c;
+}
+```
+
+- 规则只有一条：**普通命名空间优先**。名字被变量/函数/枚举常量占住时仍是老 C 语义，
+  需要类型就写 `struct`。所以 `<sys/stat.h>` 里 `struct stat` 与函数 `stat()` 共存时，
+  `struct stat st;` 与 `stat(path, &st)` 都照旧，`stat st;` 不行；
+- 同名 `typedef` 也优先（`typedef struct Vec Vec;` 之后 `Vec` 按 typedef 解析，结果相同）；
+  `interface` 名字本来就是这么生成的，行为不变；
+- 只接受**已经可见**的 tag，不会隐式前置声明：`S *p;` 在 `S` 没声明时仍是 `'S' undeclared`；
+- 语句开头的 `TAG:` 仍是标签；`TAG` 只是 tag 时 `TAG(...)` 按声明解析（与 C 里 typedef 名
+  的规则一致），被函数遮蔽时按调用解析。同一条规则也意味着 K&R 定义里「形参名恰好与
+  文件作用域 tag 同名」会按原型解析（`int f(S) int *S; {…}`），写 `struct S` 即可；
+- 只在 `-std=c6` 的翻译单元里生效，`struct Vec v;` 永远可用。
+
+完整可运行示例见 [examples/typename_demo.c](examples/typename_demo.c)：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -run examples/typename_demo.c
+```
 
 ### 变量必须初始化
 
@@ -653,7 +695,11 @@ tests/
 ├── method.c          结构体方法
 ├── interface.c       结构化接口
 ├── slice.c           切片
+├── async.c           async / await / co / task
+├── thread.c          go（OS 线程）
+├── typename.c        裸 tag 类型名（省略 struct / union / enum）
 ├── tu/               跨翻译单元的第二个 .c（同名的主文件会一起编译）
+├── exit/             退出码（`// EXIT <n>` 声明期望的进程退出码）
 └── errors/           编译期诊断（每个片段一个 -D 开关）
 ```
 
@@ -678,7 +724,7 @@ tests/run-tests.sh --list           # 列出会跑的文件
 ok   err: 18 test(s), 0 failure(s)
 ok   errors/slice: 12 个诊断片段
 ...
-run-tests: 15 通过, 0 失败
+run-tests: 23 通过, 0 失败
 ```
 
 `-test` 模式下 `main` 可有可无（运行器不调用它）。
@@ -724,6 +770,10 @@ make test-all      # selftest + tests2
 - 跨 TU：头文件里用 `package NAME { ... }` 声明 API；接口的方法声明放头文件里，
   vtable 由每个 TU 按需自行生成。
 - 方法名共享 C 的全局命名空间；同名方法服务不同类型时用 `package` 隔离。
+- 裸 tag 类型名在 `parse_btype()` 里解析：普通命名空间命中（变量/函数/枚举常量/typedef）
+  就按老 C 语义走，否则再看 tag 命名空间；解析结果与写 `struct TAG` 完全同一个
+  `CType`，所以 `sizeof`、方法注册、切片元素检查都自动一致。因为 tag 与普通符号
+  分属两个命名空间，**同名时必须写 `struct`**（`struct stat` + `stat()` 就是例子）。
 - 变量初始化检查在**定义点**做，不做数据流分析；VLA 是唯一豁免
   （标准 C 禁止给变长数组写初始化器）。
 - 切片是普通 `static`/自动对象，没有隐藏状态也没有 GC：越界检查由

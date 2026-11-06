@@ -15,6 +15,9 @@
 #   tests/errors/*.c  编译期诊断；每个 `// EXPECT <片段>: <诊断>` 注释对应一次
 #                     -D<片段> 编译，要求 stderr 含该诊断；不带 -D 时该文件
 #                     必须能编译并运行通过。
+#   tests/exit/*.c    退出码；`// EXIT <n>` 注释声明期望的进程退出码，编译成
+#                     可执行文件后运行，比对退出码（main 的返回值必须穿过
+#                     c6 的清理链）。
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -57,6 +60,9 @@ if [ "${1:-}" = "--list" ]; then
     done
     for f in "$ROOT"/tests/errors/*.c; do
         [ -e "$f" ] && echo "errors/$(basename "$f" .c)"
+    done
+    for f in "$ROOT"/tests/exit/*.c; do
+        [ -e "$f" ] && echo "exit/$(basename "$f" .c)"
     done
     exit 0
 fi
@@ -133,6 +139,29 @@ $(cat "$TMP/missing")"
         note_pass "$name: $(echo "$frags" | wc -w | tr -d ' ') 个诊断片段"
     else
         fail "$name" "$detail"
+    fi
+done
+
+# ---- 3. 退出码 ----
+for src in "$ROOT"/tests/exit/*.c; do
+    [ -e "$src" ] || continue
+    name="exit/$(basename "$src" .c)"
+    is_wanted "$name" || continue
+    want=$(sed -n 's,^// *EXIT *\([0-9][0-9]*\)$,\1,p' "$src" | head -n 1)
+    if [ -z "$want" ]; then
+        fail "$name" "缺少 '// EXIT <n>' 注释"
+        continue
+    fi
+    if ! $TCC $BASE $TCCFLAGS -o "$TMP/exit.bin" "$src" 2>"$TMP/err" >/dev/null; then
+        fail "$name" "$(cat "$TMP/err")"
+        continue
+    fi
+    "$TMP/exit.bin" >/dev/null 2>"$TMP/err"
+    got=$?
+    if [ "$got" = "$want" ]; then
+        note_pass "$name: 退出码 $got"
+    else
+        fail "$name" "退出码 $got，期望 $want"
     fi
 done
 
