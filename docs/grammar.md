@@ -40,7 +40,8 @@ c6-keyword =
       "package" | "import" | "interface"
     | "defer"   | "errdefer" | "err" | "test"
     | "try"     | "catch"
-    | "async"   | "await" ;
+    | "async"   | "await"
+    | "foreach" ;
 
 (* 软关键字：只在语句开头、且后面紧跟一个标识符时才是关键字 *)
 c6-soft-keyword = "co" | "go" | "task" ;
@@ -56,9 +57,15 @@ error-type-name = "error" ;
 只在「声明说明符之后」这个 C 里本来非法的位置被识别（见 3.3）。
 
 `try`、`catch`、`err`、`defer`、`errdefer`、`package`、`import`、
-`interface` 只会作为关键字出现在下列产生式允许的位置；在其余
+`interface`、`foreach` 只会作为关键字出现在下列产生式允许的位置；在其余
 位置（例如声明说明符中）它们仍可被当作标识符使用，这一点与 C 关键字
 不同，是单趟实现的已知宽松之处。`impl` 自 0010 起不再是关键字。
+
+`foreach` 还多一条限制：它只在**语句开头**、且下一个记号是 `|` 时才算
+语句（分派在 `block()` 里做，此时下一个记号已经在手），所以
+`int foreach = 1;`、`foreach = 2;`、`x = foreach;`、`foreach(x);`、
+`p->foreach`、`goto foreach;` 全部照常工作。空的绑定表 `||` 是逻辑或，
+不会命中这条语句，仍按表达式解析。
 
 `async`、`await` 不享受这条宽松：它们在词法阶段就是关键字，所以
 `int async;`、`int await;` 会报错（成员名不受影响：
@@ -501,7 +508,8 @@ statement              = labeled-statement
                        | try-statement
                        | co-statement
                        | go-statement
-                       | task-declaration ;
+                       | task-declaration
+                       | foreach-statement ;
 
 defer-statement        = "defer" , statement ;
                          (* 注册时跳过；离开作用域或返回/重抛时按注册的
@@ -525,7 +533,43 @@ go-statement           = "go" , expression , ";" ;
 task-declaration       = "task" , identifier , "=" , expression ,
                          { "," , identifier , "=" , expression } , ";" ;
                          (* 句柄在作用域退出时自动 __c6_co_destroy *)
+
+foreach-statement      = "foreach" , binders , iterable , compound-statement ;
+
+binders                = "|" , binder , [ "," , binder ] , "|" ;
+binder                 = identifier | "_" ;
+                         (* '_' 丢弃这个绑定 *)
+
+iterable               = range | conditional-expression ;
+range                  = conditional-expression , ":" , conditional-expression ;
+                         (* 半开区间 [lo, hi)：两个界都只求值一次 *)
 ```
+
+`foreach` 的三种可迭代对象与绑定数量一一对应：
+
+| 可迭代对象 | 绑定 | 下标类型 | 值绑定 |
+|---|---|---|---|
+| 完整数组 `E[N]`（含字符串字面量） | `\|i, v\|` | `size_t` | 元素的一份副本 |
+| 切片 `E[:]` | `\|i, v\|` | `size_t` | 元素的一份副本 |
+| 整数区间 `lo:hi` | `\|i\|` | 两个界的公共整数类型（至少 `int`） | 无 |
+
+语义要点：
+
+- 可迭代对象**只求值一次**：数组/切片落到一个隐藏的
+  `{ E *data; size_t len }` 帧槽（与切片的运行期布局相同，所以
+  `foreach |i, v| obj.items` 直接可用），区间的上界落到一个隐藏的整数槽；
+- 数组每轮重新按 `data[i]` 取元素（数组可能在循环体里被改），切片用求值
+  那一刻的 `{data, len}` 快照；
+- 值绑定是**副本**：写它不改变容器。下标绑定就是循环变量，写它会改变
+  后续迭代（与 `for (i = 0; i < n; i++)` 完全一样）；
+- `lo >= hi` 是零次迭代，两个界各只求值一次；
+- `break`、`continue`、`defer`、`errdefer`、`await`、`goto` 与写在 `for`
+  体里完全一致（循环体是普通复合语句，`break` 只跳出一层）；
+- 循环体**必须**是复合语句（花括号不能省），绑定的作用域就是这条语句；
+- 元素类型必须是可赋值的完整对象类型：元素是数组时先 `typedef` 起名
+  （`typedef int Row[3]; foreach |i, r| rows { … }`）；
+- VLA、不完整数组、指针、整数、没有暴露切片的其它结构体都不可迭代
+  （见第 10 节）。
 
 ---
 
@@ -679,6 +723,15 @@ parameter-list    = identifier , { "," , identifier } ;
 | C39 | `go` 不支持变参函数（参数块要按声明的形参布局） | `'go' does not support variadic functions: 'f'` |
 | C40 | `go` 不支持 `!error` 函数（错误没人接） | `'go' does not support fallible functions: 'f'` |
 | C41 | 裸 tag 只有在该 tag 可见、且同名**普通符号**（变量/函数/枚举常量/typedef）不在作用域内时才当作类型名；只接受已声明的 tag，不隐式前置声明；语句开头的 `TAG:` 仍是标签；K&R 定义里形参名与 tag 同名时按原型解析 | —（遮蔽/未声明时按普通 C 解析：`';' expected`、`'X' undeclared`、`initialization of incomplete type`） |
+| C42 | `foreach` 只能出现在函数体内 | `'foreach' can only be used inside a function` |
+| C43 | 绑定表是 1 或 2 个标识符（`_` 表示丢弃） | `'foreach' expects a binding name`；`'foreach' takes at most two bindings` |
+| C44 | 数组/切片要两个绑定 | `an array or slice yields an index and a value: write 'foreach \|i, v\| a'` |
+| C45 | 区间只要一个绑定 | `a range yields only an index: write 'foreach \|i\| lo:hi'` |
+| C46 | 两个绑定不能都丢弃 | `'foreach' discards both binders` |
+| C47 | 可迭代对象只能是完整数组、切片或整数区间 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi')`；`cannot iterate over 'T' (expose a slice member, e.g. 'T[:] items')` |
+| C48 | 区间两个界必须是整数 | `range bounds must be integers` |
+| C49 | 元素类型必须可赋值且完整 | `'foreach' cannot copy an element of type 'T'`；`cannot iterate over incomplete element type 'T'` |
+| C50 | 循环体必须是复合语句 | `'{' expected` |
 
 ---
 
@@ -833,6 +886,32 @@ E[:] s = arr;                    (* arr 的类型是 E[N] *)
 `__tcc_slice_*`，它执行一次故意的空指针写。libtcc1 里没有格式化输出
 （只用到 `pthread_*` 和最基础的 libc 入口），因此不产生诊断文本，与
 `catch` 落空时一致。
+
+**R14 — `foreach |i, v| iterable { body }`**
+
+```
+foreach |i, v| a { body }                  (* a 的类型是 E[N] 或 E[:] *)
+=>
+    pair = { E *data; size_t len };        (* 只求值一次，落在隐藏帧槽 *)
+    pair.data = &a[0] / a.data;
+    pair.len  = N     / a.len;
+    i = 0;                                 (* 两个绑定都是普通局部 *)
+    for (; i < pair.len; i++) {
+        v = pair.data[i];                  (* 副本；'_' 时连加载都省掉 *)
+        body
+    }
+
+foreach |i| lo:hi { body }
+=>
+    T hi_tmp = (T)hi;                      (* T = 两个界的公共整数类型 *)
+    for (i = (T)lo; i < hi_tmp; i++) { body }
+```
+
+生成的代码就是上面那段 `for`（同一套 `lblock` / `gvtst` / `gjmp_addr`），
+没有运行期辅助函数、没有虚调用、没有迭代器对象：数组/切片的隐藏槽就是
+`c6_slice_spill` 用的 `{data, len}` 对，所以 `foreach |i, v| f()`（`f`
+返回切片）与 `foreach |i, v| obj.items` 走同一条路径。`_` 绑定时对应的
+加载/存储整段不生成。
 
 ## 9. 示例
 
@@ -1032,6 +1111,37 @@ int main(void)
 
 跨翻译单元：两边各自写 `int[:]`，布局固定，直接按值传递/返回即可。
 
+`foreach` 是上面这些遍历写法的语句形式：
+
+```c
+struct Pair { int a, b; };
+
+int main(void)
+{
+    int a[5] = {1, 2, 3, 4, 5};
+    int[:] s = a[1:4];                      /* 2 3 4 */
+    struct Pair pairs[2] = {{1, 2}, {3, 4}};
+    int total = 0;
+
+    foreach |i, v| a {                      /* 数组：下标 + 元素副本 */
+        total += v;                         /* i 的类型是 size_t */
+    }
+    foreach |i, v| s {                      /* 切片：同样两个绑定 */
+        total += v;
+    }
+    foreach |i| 0:3 {                       /* 区间 [0, 3)：只要一个绑定 */
+        total += i;
+    }
+    foreach |_, v| a {                      /* '_' 丢弃下标 */
+        total += v;
+    }
+    foreach |i, p| pairs {                  /* 元素是结构体时也是副本 */
+        p.b = 0;                            /* 不改 pairs */
+    }
+    return total == 42 ? 0 : 1;             /* 15 + 9 + 3 + 15 */
+}
+```
+
 ### 9.1 async / await：一次 HTTP 请求
 
 ```c
@@ -1148,6 +1258,19 @@ int main(void)
 | 抢占式调度、把阻塞的 libc 调用（`read`/`printf`/…）自动变成让出点 | 不在本扩展范围：`co`/`__c6_co_run` 只推进协程，不 hook libc |
 | PE 目标上的 `go` | 还没有 PE 线程支持，运行时 trap |
 | 取消 / 强杀一个 `go` 出去的线程 | 不提供：线程总是被启动它的线程 join |
+| `for a \|i, v\| { }` / `for 0..n` | `for` 保持纯 C；迭代请用 `foreach` |
+| `foreach a { }`（不写绑定表） | 语法错误：绑定表必须紧跟 `foreach` |
+| `foreach (a) \|i, v\| { }`（括号形式） | 不支持：`foreach` 后面直接跟绑定表 |
+| `foreach \|i, v\| a v = 1;`（没有花括号） | 约束 C50 |
+| 文件作用域的 `foreach \|i, v\| a { }` | 约束 C42 |
+| `foreach \|i, v\| p { }`（`p` 是指针） | 约束 C47：先写 `(T[:]){p, n}` |
+| `foreach \|i, v\| 5 { }`（整数） | 约束 C47：整数要先写成区间 `0:5` |
+| `foreach \|i, v\| s { }`（`s` 是没暴露切片的 `struct`） | 约束 C47：用类型暴露的切片成员，例如 `foreach \|i, v\| s.items` |
+| `foreach \|i, v\| vla { }` | 约束 C47：VLA 的长度运行期才知道 |
+| `foreach \|_, _\| a { }` | 约束 C46：两个绑定都丢弃没有意义 |
+| `foreach \|i\| a { }` / `foreach \|i, v\| 0:n { }` | 约束 C44/C45：绑定数量由可迭代对象决定 |
+| `interface iterator { bool has(); void *next(); }` + `for a \|i, v\| { }` | v1 不做运行期迭代协议：`void *next()` 会擦掉元素类型（每轮都要装箱/分配），而方法名不按接收者改名，`has`/`len`/`at` 会和用户函数撞名。可迭代对象限定为数组、切片和区间，其它类型请暴露一个切片成员 |
+| `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
 ---
 
 ## 11. 实现位置
@@ -1177,6 +1300,7 @@ int main(void)
 | `T[:]` 类型 | `parse_btype()` 的 `case '['`、`c6_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
 | 切片下标 / 区间 | `c6_slice_subscript`（`unary()` 的 `[` 分支）、`c6_slice_spill` | `tcc/tccgen.c` |
 | 数组 → 切片 | `c6_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
+| `foreach` | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句）、`c6_common_int_type` / `c6_is_int_type`；数组/切片的隐藏槽复用 `c6_slice_spill`，循环体走 `lblock`；文件作用域诊断在 `decl()` | `tcc/tccgen.c` |
 | 切片运行期 | `__tcc_slice_index` / `__tcc_slice_sub` | `tcc/lib/libtcc1.c` |
 | `async` 声明 | `c6_async_declare`（合成 `struct NAME_task` 的 token）、`FuncAttr.func_async`、`parse_btype()` 的 `TOK_C6_ASYNC` | `tcc/tccgen.c`、`tcc/tcc.h` |
 | `async` 定义 | `c6_async_definition` / `c6_async_func_begin` / `c6_async_params_copy` / `c6_async_func_end`（恢复分发器）、`c6_async_finish` | `tcc/tccgen.c` |

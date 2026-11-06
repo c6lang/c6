@@ -513,6 +513,24 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 14 `go` = OS 线程 | ✅ | `c6_go_parse` 只在 `-std=c6` 下生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `go` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（defer 栈 / 错误槽 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS） |
 | 15 裸 tag 类型名（省略 `struct`） | ✅ | `tccgen.c`：`parse_btype()` 的 `default` 分支——`typespec_found` 为 0、`sym_find(tok)` 未命中（普通命名空间优先）时试 `struct_find(tok)`，命中则把 tag 符号的 `type.t` / `ref` 交给 `basic_type2`，与 `struct/union/enum TAG` 走完全同一条路径（所以 `sizeof`、方法注册、`c6_tag_is_global` 的切片元素检查、`type_to_str` 自动一致）；`ignore_label` 时 `TAG:` 仍退回标签（与 typedef 路径同一个 guard）；不隐式前置声明，也不支持定义处省略 `struct`；只在 `-std=c6` 生效 |
 
+| 15 `foreach` | ✅ | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句，所以 `foreach` 仍可当标识符）；词法是 `tcctok.h` 末尾追加的硬关键字，`-std=c6` 关闭时由 `tccpp.c` 的还原循环改回普通标识符（区间同步扩到 `TOK_C6_FOREACH`）；数组/切片的隐藏槽直接复用 `c6_slice_spill`（`{data, len}` 对，与切片运行期布局相同），区间把上界落进隐藏整数槽、下标绑定当计数器；`i`/`v` 是 `sym_push` 出来的普通局部，循环体走 `lblock`，所以 `break`/`continue`/`defer`/`await` 与 `for` 一致；`size_t` 下标用 `c6_size_type`，区间用 `c6_common_int_type`（C 的通常算术转换子集）；文件作用域的 `foreach \|…\|` 在 `decl()` 里报错 |
+
+`foreach` 的设计取舍（评审结论）：
+
+- **绑定在前**（`foreach |i, v| a`）而不是 Go 风格的 `for a |i, v|`：`for`
+  必须保持纯 C，而 `|` 本来是按位或的记号；把绑定表放在可迭代对象前面，
+  表达式中间就不必再猜“这个 `|` 是绑定表的开始还是按位或”；
+- **不做运行期迭代协议**（P1）：方法名不按接收者改名，`len`/`at`/`has`
+  会和用户函数撞名（同名方法只能靠 `package` 分开），而 `void *next()`
+  会擦掉元素类型，每轮都得装箱/分配。可迭代对象限定为数组、切片、区间，
+  其它类型走“暴露切片成员”，语义完全静态；
+- **`lo:hi` 而不是 `0..n`**（P14）：`0..3` 在词法阶段是两个浮点常量
+  （`0.`、`.3`），为它改词法会波及现有代码；`:` 在表达式里本来只出现在
+  三目运算符里，而可迭代对象按 `conditional-expression` 解析，三目的
+  `:` 已经被吃掉，所以 `lo:hi` 没有歧义；
+- 隐藏槽复用切片运行期布局，因此 `foreach` 不带运行期辅助函数、不改变
+  调用约定；`async` 体里照常可用（帧整体保存/恢复）。
+
 测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：c6 的
 测试一律用 c6 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
 比对 stdout，改一行输出就得重生成期望文件）。
@@ -533,6 +551,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
 | `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`typeof`/`_Generic`/`_Alignof`、接口方法签名、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
 | `tests/errors/typename.c` | 裸 tag 的退回路径：被函数/局部变量/POSIX `stat` 遮蔽、tag 未声明、tag 当值用、tag 出作用域、局部 tag 的切片、不完整类型 |
+| `tests/foreach.c` | 数组/切片/区间三种可迭代对象、值绑定是副本、可迭代值只求值一次、`_` 丢弃、`break`/`continue`/`defer`/嵌套、绑定不泄漏、`size_t` 下标可写、`await` 跨挂起 |
+| `tests/errors/foreach.c` | `foreach` 的全部编译期诊断（绑定数量、指针/整数/结构体/VLA/不完整数组、元素是数组、文件作用域、缺花括号） |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
 | `tests/errors/*.c` | 编译期诊断，见下 |
 
@@ -656,4 +676,16 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   （`int f(S) int *S; { … }`），`TAG` 后跟标识符按原型解析而报
   `';' expected`，写 `struct S` 即可；块作用域的 `TAG;` 只是引用外层 tag，
   不会像 `struct TAG;` 那样声明一个新的局部不完整 tag。
+- `foreach` 的可迭代对象只有三种：完整数组、切片 `T[:]`、整数区间
+  `lo:hi`（半开）。不做运行期迭代协议（`has()`/`next()`）：`void *next()`
+  会把元素类型擦掉，每轮都得装箱/分配；而方法名不按接收者改名，
+  `has`/`len`/`at` 会和用户函数撞名。其它类型请暴露一个切片成员，再
+  `foreach |i, v| obj.items`；
+- 绑定表是 binder-first（`|i, v|` 在可迭代对象前面），循环体必须带
+  花括号：省掉绑定、省掉花括号、两个绑定都写 `_` 都会报错而不是猜；
+  点号区间 `0..count` 不做（词法上是两个浮点常量），统一写 `0:count`；
+- 隐藏槽只对“求值一次”负责：数组每轮重新按 `data[i]` 取元素（数组本身
+  可能被改），切片用求值时的 `{data, len}` 快照；值绑定是副本，写下标
+  绑定等于改循环变量（与 `for` 一致）。
+
 
