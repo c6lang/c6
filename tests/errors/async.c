@@ -13,11 +13,11 @@
 // EXPECT test_in_defer: error: 'await' is not allowed in a 'defer' body
 // EXPECT test_bad_signature: error: 'async' does not support this signature
 // EXPECT test_nested: error: 'async' functions must have file scope
-// EXPECT test_go_outside: error: 'go' can only be used inside a function
+// EXPECT test_co_outside: error: 'co' can only be used inside a function
 // EXPECT test_task_outside: error: 'task' can only be used inside a function
-// EXPECT test_go_non_async: error: 'go' on a non-async function needs stackful coroutines (not implemented yet)
-// EXPECT test_go_value: error: the operand of 'go' must be the handle of an 'async' call
-// EXPECT test_go_call_non_async: error: the operand of 'go' must be the handle of an 'async' call
+// EXPECT test_co_non_async: error: 'co' requires an 'async' function: 'plain' is a plain function (use 'go')
+// EXPECT test_co_value: error: the operand of 'co' must be the handle of an 'async' call
+// EXPECT test_co_call_non_async: error: the operand of 'co' must be the handle of an 'async' call
 // EXPECT test_task_init: error: the initializer of a 'task' variable must be a call of an 'async' function
 // EXPECT test_task_no_init: error: '=' expected
 // EXPECT test_async_method: error: 'async' functions cannot be methods
@@ -111,13 +111,13 @@ int main(void)
 {
     return 0;
 }
-#elif defined test_go_outside
-/* go 是语句，只能写在函数里 */
+#elif defined test_co_outside
+/* co 是语句，只能写在函数里 */
 async int f(void)
 {
     return 0;
 }
-go f();
+co f();
 int main(void)
 {
     return 0;
@@ -133,26 +133,26 @@ int main(void)
 {
     return 0;
 }
-#elif defined test_go_non_async
-/* go 的操作数必须是一次 async 调用 */
+#elif defined test_co_non_async
+/* co 的操作数必须是一次 async 调用 */
 int plain(void)
 {
     return 1;
 }
 int main(void)
 {
-    go plain();
+    co plain();
     return 0;
 }
-#elif defined test_go_value
+#elif defined test_co_value
 /* 值不是 async 调用的句柄 */
 int main(void)
 {
     int v = 1;
-    go v;
+    co v;
     return 0;
 }
-#elif defined test_go_call_non_async
+#elif defined test_co_call_non_async
 /* 通过表达式的普通调用：走通用的句柄检查 */
 typedef int (*fn)(void);
 int plain(void)
@@ -162,7 +162,7 @@ int plain(void)
 int main(void)
 {
     fn p = plain;
-    go p();
+    co p();
     return 0;
 }
 #elif defined test_task_init

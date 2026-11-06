@@ -14,9 +14,9 @@
  * 为了让示例离线可跑，传输层用 pipe() 代替 socket，服务端由本文件里的
  * respond() 扮演；换成 socket + connect() 时异步结构完全不变。
  *
- * 后半段演示 go / task 两个关键字：
+ * 后半段演示 co / task 两个关键字：
  *   task t = http_get(...);   句柄留在手上，作用域退出自动 destroy
- *   go worker(...);           顶层任务，交给 __c6_co_run() 跑完
+ *   co worker(...);           顶层任务，交给 __c6_co_run() 跑完
  */
 #include <stdio.h>
 #include <string.h>
@@ -110,7 +110,7 @@ static void respond(int wfd)
     close(wfd);
 }
 
-/* ---- go / task：两个协程互相唤醒 ---- */
+/* ---- co / task：两个协程互相唤醒 ---- */
 
 /* 等自己的 fd 就绪，然后往下一个 fd 写一个字节，把下一个协程叫醒。
    next_wfd < 0 表示"我是最后一个"。 */
@@ -136,7 +136,7 @@ int main(void)
 {
     int up[2] = {0, 0};       /* 客户端 -> 服务端 */
     int down[2] = {0, 0};     /* 服务端 -> 客户端 */
-    int c1[2] = {0, 0};       /* go 演示用的两个管道 */
+    int c1[2] = {0, 0};       /* co 演示用的两个管道 */
     int c2[2] = {0, 0};
     char buf[256] = {0};
     int rc = 0;
@@ -161,15 +161,15 @@ int main(void)
     close(up[1]);
     close(down[0]);
 
-    /* go：先起一个会 park 在 c2 上的，再起一个把 c2 叫醒的 */
+    /* co：先起一个会 park 在 c2 上的，再起一个把 c2 叫醒的 */
     if (pipe(c1) || pipe(c2))
         return 1;
     write(c1[1], "x", 1);        /* 只让 c1 先就绪 */
-    printf("go stage2：c2 还没数据，它在 go 语句里 park 住\n");
-    go stage(c2[0], -1, 2);
-    printf("go stage1：c1 已就绪，但 await c6_io 也要等一轮 select\n");
-    go stage(c1[0], c2[1], 1);
-    printf("回到 main：两个 go 都返回了，两个任务都还 park 着\n");
+    printf("co stage2：c2 还没数据，它在 co 语句里 park 住\n");
+    co stage(c2[0], -1, 2);
+    printf("co stage1：c1 已就绪，但 await c6_io 也要等一轮 select\n");
+    co stage(c1[0], c2[1], 1);
+    printf("回到 main：两个 co 都返回了，两个任务都还 park 着\n");
     printf("__c6_co_run：唤醒 stage1，它写 c2 再唤醒 stage2；errs=%d\n",
            __c6_co_run());
     close(c1[1]);

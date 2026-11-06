@@ -9,6 +9,8 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `errdefer { ... }` | 仅在错误路径上执行的 `defer` |
 | `err(code, "msg")` | 设置错误槽、就地展开清理并直接返回 |
 | `func() T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 |
+| `async` / `await` / `co` / `task` | 无栈协程：`co f();` 顶层跑、`task t = f();` 拿句柄 |
+| `go f(...)` | OS 线程（`pthread_create`），语句立刻返回、真并发 |
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
 | `package` / `import` | 包与名字修饰（`pkg__sym`），`pkg.member` 访问导出符号，支持多级包名 |
 | 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用 |
@@ -423,7 +425,7 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 - 切片元素的 `const`/`volatile` 限定符按**忽略**处理（`const int[:]` 与
   `int[:]` 同类型）：`data` 指针本身是 `const`，切片头不能被重定向；
 - 越界是**运行时陷阱**（SIGSEGV），与 `catch` 落空时的处理一致：libtcc1
-  不依赖 libc，没有诊断文本；
+  里没有格式化输出，不产生诊断文本；
 - 静态初始化器（文件作用域或 `static` 局部）没有运行时代码，所以
   `int[:] g = arr;` 不支持，写 `int[:] g = { arr, 5 };`（两个字段都是常量，可用）；
 - 只是普通 C 语义的补充：`int a[3]`、`int a[] = {…}`、`void f(int[])`、
@@ -477,9 +479,9 @@ int main(void)
 | `t->val` / `t->pN` | 结果值 / 第 N 个实参（任务结构由声明推导） |
 | `__c6_co_wait(t)` | 驱动到完成；`0` = 正常结束，`-1` = 子任务以 `err` 结束 |
 | `__c6_co_destroy(t)` | 释放任务槽（含未完成的子任务） |
-| `go f(…)` | 顶层任务：建完立刻跑到第一个必须等待的点，然后返回 |
+| `co f(…)` | 顶层协程：建完立刻跑到第一个必须等待的点，然后返回 |
 | `task t = f(…)` | 建任务并拿句柄；作用域退出时自动 `__c6_co_destroy(t)` |
-| `__c6_co_run()` | 把 `go` 出去的任务都跑完；返回其中以 `err` 结束的个数 |
+| `__c6_co_run()` | 把 `co` 出去的任务都跑完；返回其中以 `err` 结束的个数 |
 
 规则：
 
@@ -494,28 +496,86 @@ int main(void)
   寄存器不会——不过调用点本来就会把活寄存器落到帧槽，所以
   `x + await f()` 也能用；
 - `await` 不能写进 `defer` / `errdefer` 体和 `sizeof` 里；
-- `go f(a);` 和 `task t = f(a);` 的操作数都必须是一次 `async` 调用：
-  `go` 建的是**顶层**任务（不归调用者、不做作用域回收，交给
+- `co f(a);` 和 `task t = f(a);` 的操作数都必须是一次 `async` 调用：
+  `co` 建的是**顶层**任务（不归调用者、不做作用域回收，交给
   `__c6_co_run()`），`task` 建的任务归作用域管；
-- `go` 是**同步起点**：任务在 `go` 语句处就开始跑，跑到第一个必须等待的
+- `co` 是**同步起点**：任务在 `co` 语句处就开始跑，跑到第一个必须等待的
   点才把控制权交回来。`await c6_io` 总要停一轮（即使 fd 已经就绪，唤醒是
   下一轮 `select()` 的事）；`await` 子任务不算等待，所以不碰 fd 的
-  `go f();` 会在 `go` 语句里跑完并当场回收槽位。`f` 是普通函数时（未来的
-  有栈协程）同一套约定成立：只有显式让出原语才让出，没有让出点就和直接
-  调用完全一样；
+  `co f();` 会在 `co` 语句里跑完并当场回收槽位；
+- `co`、`go`、`task` 是**软关键字**：只有在语句开头、后面紧跟一个标识符
+  时才是关键字。`int go = 1;`、`go = 2;`、`x = go;`、`go(x);`、
+  `typedef int co; co v;`、`task` 做变量名和 `go:` 标签都照常工作；
 - `c6_io` 只有 `await c6_io(fd, ev)` 一种写法；`ev` 是
   `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
 - `c6_io` 的 `fd` 必须在 `[0, 1024)` 内；越界的任务按失败回收，
   `__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败；
-- 运行时是单线程的固定池（64 个任务、每个 4 KiB 帧、每个 64 条 defer
-  记录），`__c6_co_wait` 和 `__c6_co_run` 都用 `select()` 等 fd，
-  `__c6_co_run` 对顶层任务做轮转。libtcc1 不依赖 libc。
+- 运行时池是**每线程**一个固定池（64 个任务、每个 4 KiB 帧、每个 64 条
+  defer 记录），`__c6_co_wait` 和 `__c6_co_run` 都用 `select()` 等 fd，
+  `__c6_co_run` 对顶层任务做轮转。协程本身是协作式、单线程的；要真并发
+  用 `go`。
 
 完整可运行示例见 [examples/async_demo.c](examples/async_demo.c)
 （一次 HTTP 请求，传输层用 `pipe()` 代替 socket，离线可跑）：
 
 ```sh
 ./tcc/tcc -B tcc -std=c6 -run examples/async_demo.c
+```
+
+### go（OS 线程）
+
+```c
+int download(int id)               /* 普通函数，阻塞也没关系 */
+{
+    defer printf("worker %d 结束\n", id);
+    printf("worker %d 开始\n", id);
+    sleep(1);
+    return id;
+}
+
+int main(void)
+{
+    go download(1);                /* pthread_create，立刻往下走 */
+    go download(2);
+    printf("main 继续跑\n");       /* 上面两行可能还没打印 */
+    return 0;                      /* 退出前编译器插入 __c6_th_join_all() */
+}
+```
+
+`go f(a);` 是一条**语句**，不产生值：
+
+| 写法 | 对函数的要求 | 引擎 | 返回 | 真并发 |
+|---|---|---|---|---|
+| `co f(a);` | 必须是 `async` | 无栈协程（帧拷贝） | 跑到第一个真正要等的地方 | 否 |
+| `task t = f(a);` | 初始化式是 `async` 调用 | 同上（保留句柄） | 同上 | 否 |
+| `go f(a);` | 任意普通函数 | `pthread_create` | **立刻** | **是** |
+
+规则：
+
+- 参数在 `go` 语句处**求值一次**，按值复制到堆上的参数块，线程解开参数块
+  再调用 `f`；之后改局部变量不影响线程。支持标量、枚举、指针、`T[:]`、
+  文件作用域的 struct/union；
+- 不能 `go` 一个 `async` 函数（用 `co`，错误信息会提示）、不能 `go`
+  变参函数、不能 `go` 带 `!error` 的函数（错误没人接）、不能通过函数指针
+  `go`；
+- 被调函数只要在调用点有个**文件作用域的声明**就行，定义可以在任何一个
+  翻译单元；跳板按被调函数生成，每个 TU 各生成一份（`static`），没有被
+  `go` 用到的原型不产生任何代码；
+- 线程由**启动它的线程**回收：`main` 结束时编译器插入
+  `__c6_th_join_all()`，别的线程在退出时回收自己的子线程，所以
+  `-run` 也不会在线程还在跑的时候释放 JIT 内存。需要中途等待时可以自己
+  调用 `__c6_th_join_all();`；
+- 每个线程有自己的 defer 栈、错误槽和协程池（`pthread_key`，不是
+  `__thread`，`-run` 不支持 TLS），所以线程里照常写 `defer`、`err`、
+  `async`/`await`、甚至再 `go`；
+- 运行时只用 `pthread_create` / `pthread_join` / `pthread_key_*`；
+  glibc 2.34 起这些都在 libc 里，老系统需要 `-lpthread`；
+- PE 目标还没有线程支持，`go` 在那边会触发 trap。
+
+完整可运行示例见 [examples/thread_demo.c](examples/thread_demo.c)：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -run examples/thread_demo.c
 ```
 
 ### #macro / __local
@@ -607,8 +667,9 @@ make test-all      # selftest + tests2
 
 - 设计文档：[docs/plan.md](docs/plan.md)（第 11 节为各阶段实现状态与限制）。
 - 语法规范：[docs/grammar.md](docs/grammar.md)（EBNF 增量语法、静态约束与重写规则）。
-- 运行时状态（defer 记录栈、错误槽）是普通全局变量：`tcc -run` 不支持 TLS，
-  因此这一版是单线程语义。
+- 运行时状态（defer 记录栈、错误槽、协程池、子线程链表）是**每线程**一份，
+  通过 `pthread_key` 查找而不是 `__thread`：`tcc -run` 不支持 TLS。`go`
+  出去的线程拿到自己的一份，所以线程里可以照常写 `defer`/`err`/`co`。
 - 方法必须在调用点之前声明或定义（TCC 单趟编译的固有限制）；接口一致性检查发生在
   第一次转换点，因此方法也要在转换点之前可见。
 - 跨 TU：头文件里用 `package NAME { ... }` 声明 API；接口的方法声明放头文件里，
