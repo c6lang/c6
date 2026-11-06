@@ -264,7 +264,23 @@ static void c6_async_func_end(void);
 static void c6_await_parse(void);
 static void c6_async_return(void);
 static void c6_async_await_io(Sym *s);
-static void c6_go_stmt(void);
+static void c6_co_parse(void);
+static void c6_go_parse(void);
+static void c6_sp_flush(void);
+static int c6_soft_kw(int t);
+static int c6_soft_kw_shadowed(int t);
+#define C6_KW_NONE 0
+#define C6_KW_CO   1
+#define C6_KW_GO   2
+#define C6_KW_TASK 3
+/* trampolines that still have to be emitted (one per spawned function) */
+typedef struct C6SpPending {
+    struct C6SpPending *next;
+    int name;      /* the spawned function (already mangled) */
+    int tramp;     /* its trampoline */
+    CType ftype;
+} C6SpPending;
+static C6SpPending *c6_sp_pending;
 static void c6_task_decl(void);
 static void c6_task_check_handle(CType *t, const char *what);
 static void c6_task_defer_destroy(int slot);
@@ -603,6 +619,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     next();
     decl(VT_CONST);
 #ifdef C6_EXT
+    /* trampolines for the functions some 'go' of this unit spawned */
+    c6_sp_flush();
     /* interfaces converted in this unit get their vtable object here, but a
        'static inline' body is only compiled now, and such a body may contain
        a conversion itself: alternate until nothing new turns up */
@@ -8695,6 +8713,12 @@ static void c6_tu_reset(void)
     C6Method *m, *next;
     int i;
 
+    while (c6_sp_pending) {
+        C6SpPending *p = c6_sp_pending;
+        c6_sp_pending = p->next;
+        tcc_free(p);
+    }
+
     dynarray_reset(&c6_auto_impls, &c6_nb_auto_impls);
     for (m = c6_methods; m; m = next) {
         next = m->next;
@@ -9429,6 +9453,19 @@ again:
         goto expr;
     next();
 
+#ifdef C6_EXT
+    if (tcc_state->c6_ext && tok >= TOK_IDENT) {
+        int kw = c6_soft_kw(t);
+        if (kw != C6_KW_NONE && !c6_soft_kw_shadowed(t)) {
+            switch (kw) {
+            case C6_KW_CO:   c6_co_parse();   break;
+            case C6_KW_GO:   c6_go_parse();   break;
+            default:         c6_task_decl();  break;
+            }
+            goto c6_stmt_done;
+        }
+    }
+#endif
     if (debug_modes)
         tcc_tcov_check_line (tcc_state, 0), tcc_tcov_block_begin (tcc_state);
 
@@ -9599,14 +9636,6 @@ again:
         skip(';');
 
 #ifdef C6_EXT
-    } else if (t == TOK_C6_GO || t == TOK_C6_TASK) {
-        if (!c6_ext_on())
-            tcc_error("'%s' requires -std=c6", get_tok_str(t, NULL));
-        else if (t == TOK_C6_GO)
-            c6_go_stmt();
-        else
-            c6_task_decl();
-
     } else if (t == TOK_C6_DEFER) {
         if (!c6_ext_on())
             tcc_error("'defer' requires -std=c6");
@@ -9876,6 +9905,9 @@ again:
         }
     }
 
+#ifdef C6_EXT
+c6_stmt_done:
+#endif
     if (debug_modes)
         tcc_tcov_check_line (tcc_state, 0), tcc_tcov_block_end (tcc_state, 0);
 }
@@ -11682,10 +11714,10 @@ static void c6_task_defer_destroy(int slot)
     defer_state.body_depth--;
 }
 
-/* 'go f(args);' : start a top-level coroutine.  It is not a child of the
+/* 'co f(args);' : start a top-level coroutine.  It is not a child of the
    current task and belongs to no scope, so nothing but completion releases
    it; see __tcc_co_spawn() in libtcc1. */
-static void c6_go_stmt(void)
+static void c6_co_parse(void)
 {
     CType ht;
     int slot;
@@ -11694,14 +11726,14 @@ static void c6_go_stmt(void)
         Sym *s = sym_find(tok);
         if (s && (s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref
             && !s->type.ref->f.func_async)
-            tcc_error("'go' on a non-async function needs stackful "
-                      "coroutines (not implemented yet)");
+            tcc_error("'co' requires an 'async' function: '%s' is a plain "
+                      "function (use 'go')", get_tok_str(tok, NULL));
     }
     expr_eq();
     c6_fallible_use();
     ht = vtop->type;
     c6_task_check_handle(&ht,
-        "the operand of 'go' must be the handle of an 'async' call");
+        "the operand of 'co' must be the handle of an 'async' call");
     /* park the handle in a frame slot so the call can push its symbol below */
     loc = (loc - PTR_SIZE) & -PTR_SIZE;
     slot = loc;
@@ -11749,6 +11781,290 @@ static void c6_task_decl(void)
             break;
         next();                         /* ',' */
     }
+    skip(';');
+}
+
+/* ---------------------------------------------------------------------- */
+/* soft keywords                                                           */
+/*                                                                         */
+/* 'co', 'go' and 'task' are keywords only at the start of a statement      */
+/* inside a function, and only when an identifier follows: 'go f();' starts  */
+/* a thread, while 'go = 1;', 'go(x);', 'typedef int go; go v;' and 'go:'    */
+/* keep using the name.  The statement parser already holds the next token   */
+/* in TOK when it dispatches, so the test is a string compare.              */
+
+static int c6_soft_kw(int t)
+{
+    const char *s;
+
+    if (t < TOK_IDENT)
+        return C6_KW_NONE;
+    s = get_tok_str(t, NULL);
+    switch (*s) {
+    case 'c': if (!strcmp(s, "co"))   return C6_KW_CO;   break;
+    case 'g': if (!strcmp(s, "go"))   return C6_KW_GO;   break;
+    case 't': if (!strcmp(s, "task")) return C6_KW_TASK; break;
+    }
+    return C6_KW_NONE;
+}
+
+/* A typedef of the same name keeps declaring variables: 'co v;' declares a
+   variable when 'co' names a type, it never starts a coroutine. */
+static int c6_soft_kw_shadowed(int t)
+{
+    Sym *s = sym_find(t);
+
+    return s && (s->r & VT_TYPEDEF);
+}
+
+/* ---------------------------------------------------------------------- */
+/* 'go f(a);' : run f on an OS thread                                      */
+/*                                                                         */
+/* The arguments are evaluated at the 'go' statement and copied into a heap */
+/* block; the runtime starts a thread on a trampoline that unpacks the block */
+/* and calls f.  The trampoline is generated at the end of the unit, once per */
+/* spawned function, and is hidden from other units - a header full of       */
+/* prototypes costs nothing at all until something is spawned.               */
+/*                                                                          */
+/* Block layout: the parameters in declaration order, each aligned like a    */
+/* structure member.  The same loop lays the block out here and in the       */
+/* trampoline, so there is one description of the layout.                    */
+
+static int c6_sp_name(const char *prefix, int name, const char *suffix)
+{
+    char buf[192];
+
+    snprintf(buf, sizeof buf, "%s%s%s", prefix, get_tok_str(name, NULL),
+             suffix);
+    return tok_alloc_const(buf);
+}
+
+/* Can the signature of FT travel through an argument block? */
+static int c6_sp_ok(CType *ft)
+{
+    if ((ft->t & VT_BTYPE) != VT_FUNC || !ft->ref)
+        return 0;
+    if (ft->ref->f.func_async || ft->ref->f.func_fallible)
+        return 0;
+    if (ft->ref->f.func_type == FUNC_OLD
+        || ft->ref->f.func_type == FUNC_ELLIPSIS)
+        return 0;
+    return 1;
+}
+
+/* Can the type be written back as source?  Types that cannot are not
+   spawnable: the trampoline has to spell every parameter out. */
+static int c6_sp_type_ok(CType *t)
+{
+    TokenString *ts = tok_str_alloc();
+    int ok = c6_async_type_tokens(ts, t);
+
+    tok_str_free(ts);
+    return ok;
+}
+
+/* the type of a trampoline, 'void *(*)(void *)', as declared for
+   __tcc_th_start() in the predefs */
+static CType c6_sp_fn_type(void)
+{
+    Sym *s = sym_find(tok_alloc_const("__tcc_th_start"));
+    CType ft;
+
+    if (!s || (s->type.t & VT_BTYPE) != VT_FUNC || !s->type.ref
+        || !s->type.ref->next)
+        tcc_error("internal: '__tcc_th_start' is missing");
+    ft = s->type.ref->next->type;   /* 'void *(*)(void *)' */
+    if ((ft.t & VT_BTYPE) != VT_PTR || !ft.ref)
+        tcc_error("internal: '__tcc_th_start' takes no function pointer");
+    return ft.ref->type;            /* 'void *(void *)' */
+}
+
+static void c6_sp_remember(int name, int tramp, CType *ftype)
+{
+    C6SpPending *p;
+
+    for (p = c6_sp_pending; p; p = p->next)
+        if (p->tramp == tramp)
+            return;
+    p = tcc_mallocz(sizeof *p);
+    p->name = name;
+    p->tramp = tramp;
+    p->ftype = *ftype;
+    p->next = c6_sp_pending;
+    c6_sp_pending = p;
+}
+
+/* 'static void *__c6_sp_NAME(void *__c6_arg) {
+       NAME(*(int *)((char *)__c6_arg + 0), ...);
+       return 0;
+   }' */
+static void c6_sp_emit(C6SpPending *sp)
+{
+    TokenString *ts;
+    Sym *p;
+    char *save_pkg;
+    int arg = tok_alloc_const("__c6_arg");
+    int i, ofs = 0;
+
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_STATIC);
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, sp->tramp);
+    tok_str_add(ts, '(');
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, arg);
+    tok_str_add(ts, ')');
+    tok_str_add(ts, '{');
+    tok_str_add(ts, sp->name);
+    tok_str_add(ts, '(');
+    for (i = 0, p = c6_async_params(&sp->ftype); p; p = p->next, i++) {
+        CType pt = p->type;
+        int align, size;
+
+        if (i)
+            tok_str_add(ts, ',');
+        convert_parameter_type(&pt);
+        size = type_size(&pt, &align);
+        ofs = (ofs + align - 1) & -align;
+        /* *(T *)((char *)__c6_arg + ofs) */
+        tok_str_add(ts, '*');
+        tok_str_add(ts, '(');
+        if (!c6_async_type_tokens(ts, &pt))
+            tcc_error("internal: cannot write the signature of 'go'");
+        tok_str_add(ts, '*');
+        tok_str_add(ts, ')');
+        tok_str_add(ts, '(');
+        tok_str_add(ts, '(');
+        tok_str_add(ts, TOK_CHAR);
+        tok_str_add(ts, '*');
+        tok_str_add(ts, ')');
+        tok_str_add(ts, arg);
+        tok_str_add(ts, '+');
+        c6_async_add_int(ts, ofs);
+        tok_str_add(ts, ')');
+        ofs += size;
+    }
+    tok_str_add(ts, ')');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_RETURN);
+    c6_async_add_int(ts, 0);
+    tok_str_add(ts, ';');
+    tok_str_add(ts, '}');
+    tok_str_add(ts, TOK_EOF);
+    /* the callee name was mangled when it was declared: keep it as it is */
+    save_pkg = tcc_state->c6_package;
+    tcc_state->c6_package = NULL;
+    c6_decl_tokens(ts);
+    tcc_state->c6_package = save_pkg;
+}
+
+static void c6_sp_flush(void)
+{
+    C6SpPending *p;
+
+    for (p = c6_sp_pending; p; p = p->next)
+        c6_sp_emit(p);
+}
+
+/* 'go f(args);' : evaluate the arguments, hand them and the trampoline to
+   the runtime and return at once. */
+static void c6_go_parse(void)
+{
+    Sym *fs = sym_find(tok);
+    CType ft, fnt;
+    Sym *tramp_sym, *p;
+    AttributeDef ad;
+    int name, tramp, slot = 0, i, ofs, align, size;
+
+    if (!fs || (fs->type.t & VT_BTYPE) != VT_FUNC || !fs->type.ref)
+        tcc_error("the operand of 'go' must be a call of a plain function");
+    name = fs->v;                   /* the symbol's own name, after mangling */
+    ft = fs->type;
+    if (ft.ref->f.func_async)
+        tcc_error("'go' requires a plain function: '%s' is 'async' (use "
+                  "'co')", get_tok_str(name, NULL));
+    if (ft.ref->f.func_fallible)
+        tcc_error("'go' does not support fallible functions: '%s'",
+                  get_tok_str(name, NULL));
+    if (ft.ref->f.func_type == FUNC_ELLIPSIS)
+        tcc_error("'go' does not support variadic functions: '%s'",
+                  get_tok_str(name, NULL));
+    if (!c6_sp_ok(&ft))
+        tcc_error("'go' does not support this signature: '%s'",
+                  get_tok_str(name, NULL));
+    for (p = c6_async_params(&ft); p; p = p->next)
+        if (!c6_sp_type_ok(&p->type))
+            tcc_error("'go' does not support this signature: '%s'",
+                      get_tok_str(name, NULL));
+
+    /* a forward reference to the trampoline, which c6_sp_flush() defines at
+       the end of this unit */
+    tramp = c6_sp_name("__c6_sp_", name, "");
+    fnt = c6_sp_fn_type();
+    fnt.t |= VT_STATIC | VT_EXTERN;
+    memset(&ad, 0, sizeof ad);
+    tramp_sym = external_sym(tramp, &fnt, 0, &ad);
+    c6_sp_remember(name, tramp, &ft);
+
+    next();                             /* the callee name */
+    skip('(');
+    size = 0;
+    for (p = c6_async_params(&ft); p; p = p->next) {
+        CType pt = p->type;
+        int a2, sz;
+
+        convert_parameter_type(&pt);
+        sz = type_size(&pt, &a2);
+        size = (size + a2 - 1) & -a2;
+        size += sz;
+    }
+    if (size) {
+        loc = (loc - PTR_SIZE) & -PTR_SIZE;
+        slot = loc;
+        /* __c6_p = __tcc_sp_args(size); */
+        c6_rt_begin("__tcc_sp_args");
+        vpushi(size);
+        c6_rt_end("__tcc_sp_args", 1);
+        vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
+        vswap();
+        vstore();
+        vpop();
+    }
+    ofs = 0;
+    for (i = 0, p = c6_async_params(&ft); p; p = p->next, i++) {
+        CType pt = p->type;
+        int a2, sz;
+
+        if (i)
+            skip(',');
+        convert_parameter_type(&pt);
+        sz = type_size(&pt, &a2);
+        ofs = (ofs + a2 - 1) & -a2;
+        /* __c6_p->pN = argN; */
+        vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
+        vpushi(ofs);
+        gen_op('+');
+        vtop->type = pt;
+        vtop->r |= VT_LVAL;
+        expr_eq();
+        vstore();
+        vpop();
+        ofs += sz;
+    }
+    skip(')');
+    /* __tcc_th_start(&__c6_sp_NAME, __c6_p); */
+    c6_rt_begin("__tcc_th_start");
+    fnt = c6_sp_fn_type();
+    vpushsym(&fnt, tramp_sym);
+    mk_pointer(&vtop->type);
+    if (size)
+        vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
+    else
+        vpushi(0);
+    c6_rt_end("__tcc_th_start", 2);
+    vpop();
     skip(';');
 }
 #endif /* C6_EXT */
@@ -11846,6 +12162,15 @@ static void gen_function(Sym *sym)
 #endif
     gsym(rsym);
     nocode_wanted = 0;
+#ifdef C6_EXT
+    /* 'go' threads of main are reaped here: whatever the program does next
+       (return to -run, exit, or a plain executable's teardown) the threads
+       are gone before the code they run can be released */
+    if (tcc_state->c6_ext && funcname && !strcmp(funcname, "main")) {
+        c6_rt_begin("__c6_th_join_all");
+        c6_rt_end("__c6_th_join_all", 0);
+    }
+#endif
     tcc_debug_end_scope(NULL, !func_var);
     tcc_debug_prolog_epilog(tcc_state, 1);
     gfunc_epilog();
@@ -12070,19 +12395,21 @@ static int decl(int l)
                 continue;
             }
         }
-        if (tcc_state->c6_ext
-            && (tok == TOK_C6_TASK || tok == TOK_C6_GO)) {
-            if (l != VT_LOCAL)
-                tcc_error("'%s' can only be used inside a function",
-                          get_tok_str(tok, NULL));
-            if (tok == TOK_C6_TASK) {
-                next();                 /* 'task' */
-                c6_task_decl();
-            } else {
-                next();                 /* 'go' */
-                c6_go_stmt();
+        /* 'co', 'go' and 'task' are soft keywords: at file scope they stay
+           plain identifiers, so 'go f();' only fails when the declaration
+           does.  Say what is wrong instead of reporting an implicit int. */
+        if (tcc_state->c6_ext && l == VT_CONST) {
+            int c6_kw = c6_soft_kw(tok);
+            if (c6_kw != C6_KW_NONE && !c6_soft_kw_shadowed(tok)) {
+                int c6_name = tok;
+                next();
+                if (tok >= TOK_IDENT) {
+                    unget_tok(c6_name);
+                    tcc_error("'%s' can only be used inside a function",
+                              get_tok_str(c6_name, NULL));
+                }
+                unget_tok(c6_name);
             }
-            continue;
         }
 #endif
         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {

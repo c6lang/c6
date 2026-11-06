@@ -661,6 +661,7 @@ typedef struct TccDeferCtx {
 } TccDeferCtx;
 
 typedef struct TccCoPool TccCoPool;   /* completed with the async runtime */
+typedef struct TccThRec TccThRec;     /* threads started by this thread */
 
 typedef struct TccThCtx {
     TccDeferRec *dstack;  int dsp, stack_cap;
@@ -668,6 +669,8 @@ typedef struct TccThCtx {
     int err_flag, err_id;
     const char *err_msg;
     TccCoPool *co;
+    TccThRec *th_list;    /* children, joined when the thread exits */
+    int th_freed;
 } TccThCtx;
 
 #ifdef TCC_TARGET_PE
@@ -681,10 +684,22 @@ extern int pthread_once(pthread_once_t *, void (*)(void));
 extern int pthread_key_create(pthread_key_t *, void (*)(void *));
 extern void *pthread_getspecific(pthread_key_t);
 extern int pthread_setspecific(pthread_key_t, const void *);
+extern int pthread_create(pthread_t *, const void *, void *(*)(void *), void *);
+extern int pthread_join(pthread_t, void **);
 #endif
 
 extern void *calloc(unsigned long, unsigned long);
 extern void free(void *);
+
+/* a thread started by 'go', always joined by the thread that started it */
+struct TccThRec {
+    TccThRec *next;
+#ifndef TCC_TARGET_PE
+    pthread_t tid;
+#else
+    void *handle;
+#endif
+};
 
 static void tcc_th_trap(void)
 {
@@ -703,10 +718,29 @@ static void *tcc_th_alloc(unsigned long size)
 
 static void tcc_th_co_free(TccCoPool *co);
 
+/* Join every thread this thread started.  A 'go' statement has no place
+   where it could be joined, so the starter reaps its threads when it exits;
+   the main thread does it from exit(), early enough that -run can still tear
+   the JIT memory down afterwards. */
+static void tcc_th_join_children(TccThCtx *th)
+{
+    TccThRec *r;
+
+    while ((r = th->th_list) != 0) {
+        th->th_list = r->next;
+#ifndef TCC_TARGET_PE
+        pthread_join(r->tid, (void **)0);
+#endif
+        free(r);
+    }
+}
+
 static void tcc_th_free(TccThCtx *th)
 {
-    if (!th)
+    if (!th || th->th_freed)
         return;
+    th->th_freed = 1;
+    tcc_th_join_children(th);
     if (th->dstack)
         free(th->dstack);
     if (th->dctx)
@@ -749,6 +783,72 @@ static TccThCtx *tcc_th(void)
     return th;
 }
 #endif
+
+/* The argument block of one 'go f(a);'.  The thread that runs the call
+   releases it, so a failed start releases it here. */
+void *__tcc_sp_args(unsigned long size)
+{
+    return tcc_th_alloc(size);
+}
+
+typedef struct TccThStart {
+    void *(*fn)(void *);
+    void *arg;
+} TccThStart;
+
+/* Thread entry: unpack the call, release the block, drop the result. */
+static void *tcc_th_tramp(void *p)
+{
+    TccThStart st = *(TccThStart *)p;
+    void *ret;
+
+    free(p);
+    ret = st.fn(st.arg);
+    free(st.arg);
+    return ret;
+}
+
+/* __tcc_th_start(&trampoline, block): run the trampoline on a new thread.
+   The block belongs to the thread from here on, and the thread is joined by
+   the thread that started it.  Returns 0 when the thread was started. */
+int __tcc_th_start(void *(*fn)(void *), void *arg)
+{
+#ifdef TCC_TARGET_PE
+    (void)fn;
+    (void)arg;
+    tcc_th_trap();              /* the PE port has no thread support yet */
+    return -1;
+#else
+    TccThCtx *th = tcc_th();
+    TccThRec *r;
+    TccThStart *st;
+    pthread_t tid;
+
+    st = (TccThStart *)tcc_th_alloc(sizeof *st);
+    st->fn = fn;
+    st->arg = arg;
+    if (pthread_create(&tid, (const void *)0, tcc_th_tramp, st) != 0) {
+        free(st);
+        free(arg);
+        return -1;
+    }
+    r = (TccThRec *)tcc_th_alloc(sizeof *r);
+    r->tid = tid;
+    r->next = th->th_list;
+    th->th_list = r;
+    return 0;
+#endif
+}
+
+/* Wait for the threads this thread started.  A 'go' statement has no place
+   where it could be joined, so the compiler calls this at the end of main
+   and the test runner calls it when the tests are done; a thread that was
+   started by another threads is joined when that thread exits.  Doing it from
+   the program keeps -run safe: the JIT memory is only released afterwards. */
+void __c6_th_join_all(void)
+{
+    tcc_th_join_children(tcc_th());
+}
 
 static TccDeferRec *tcc_th_dstack(TccThCtx *th)
 {

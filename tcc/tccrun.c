@@ -219,6 +219,7 @@ static int tcc_run_tests(TCCState *s1)
     int i, nrun = 0, nfail = 0;
     const char *(*err_msg)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_msg_get");
     void (*err_clear)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_clear");
+    void (*th_join)(void) = (void*)tcc_get_symbol(s1, "__c6_th_join_all");
 
     for (i = 0; i < s1->c6_test_count; i++) {
         C6TestEntry *e = s1->c6_tests[i];
@@ -246,6 +247,10 @@ static int tcc_run_tests(TCCState *s1)
         }
         fflush(stdout);
     }
+    /* the threads a test started by 'go' must be gone before tcc_run()
+       releases the code they run */
+    if (th_join)
+        th_join();
     printf("%d test(s), %d failure(s)\n", nrun, nfail);
     fflush(stdout);
     return nfail ? 1 : 0;
