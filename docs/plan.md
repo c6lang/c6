@@ -459,6 +459,7 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 | 结构体方法 | `p->f()`、方法调方法、sret、`T!error` 方法 | 不带调用、重复方法、只有 `->` | 跨 TU、与 `impl` 无关的普通函数调用 |
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
 | 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
+| 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、跨 TU |
 
 ### 9.2 工程要求
 
@@ -510,6 +511,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 
 | 13 `co` / `task` 软关键字 | ✅ | `co`/`go`/`task` 不进 `tcctok.h`：词法阶段仍是标识符，`block()` 里 `tok >= TOK_IDENT` 且 `c6_soft_kw(t)` 命中、名字没有被 `VT_TYPEDEF` 占用时按关键字分派（`c6_soft_kw_shadowed`），所以 `int go = 1;`、`go(x);`、`typedef int co;`、`go:` 都还成立；`c6_co_parse`（`decl()` 与 `block()` 两个入口——单条语句不走 `decl()`）+ `__tcc_co_spawn`；`c6_task_decl` / `c6_task_check_handle`（`struct NAME_task` 的 `head` 必须是 `struct __c6_task`）/ `c6_task_defer_destroy`（复用 `__tcc_defer_push` 注册作用域清理）；运行期 `libtcc1.c` 的顶层就绪链表（`snext`/`busy`/`waiting`）与 `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run`，`__c6_co_wait` 也改成先推进顶层任务；`async` 体里的 `err` 走 `c6_async_propagate`（`KIND_ERR`），并禁止 `async` 方法是方法；预置声明同步加 `__tcc_co_spawn` / `__c6_co_run` |
 | 14 `go` = OS 线程 | ✅ | `c6_go_parse` 只在 `-std=c6` 下生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `go` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（defer 栈 / 错误槽 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS） |
+| 15 裸 tag 类型名（省略 `struct`） | ✅ | `tccgen.c`：`parse_btype()` 的 `default` 分支——`typespec_found` 为 0、`sym_find(tok)` 未命中（普通命名空间优先）时试 `struct_find(tok)`，命中则把 tag 符号的 `type.t` / `ref` 交给 `basic_type2`，与 `struct/union/enum TAG` 走完全同一条路径（所以 `sizeof`、方法注册、`c6_tag_is_global` 的切片元素检查、`type_to_str` 自动一致）；`ignore_label` 时 `TAG:` 仍退回标签（与 typedef 路径同一个 guard）；不隐式前置声明，也不支持定义处省略 `struct`；只在 `-std=c6` 生效 |
 
 测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：c6 的
 测试一律用 c6 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
@@ -529,6 +531,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/method.c` | 结构体方法与 `T!error` 方法 |
 | `tests/interface.c` | 接口、vtable、隐式/显式转换、跨 TU |
 | `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
+| `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
+| `tests/errors/typename.c` | 裸 tag 的退回路径：被函数/局部变量/POSIX `stat` 遮蔽、tag 未声明、tag 当值用、tag 出作用域、不完整类型 |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
 | `tests/errors/*.c` | 编译期诊断，见下 |
 
@@ -638,4 +642,14 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - 同时存活的协程上限是 64（含 `await` 出来的子任务），超了是运行时陷阱；
   `co` 出去但已在 `co` 语句里跑完的任务会立刻回收，所以循环里 `co` 短
   任务不会占满池子。
+- 裸 tag 类型名只在**普通命名空间里没有同名符号**时生效（约束 C41）：
+  `struct stat` 与 `stat()` 共存时，`stat(path, &st)` 仍是调用，`stat st;`
+  必须写 `struct stat`。这条规则是刻意的——否则 `S = 3;`、`S * 2;`、
+  `S(x);` 这些合法 C 会被 tag 抢走；
+- 只接受**已经可见**的 tag，不会隐式前置声明：`S *p;` 在 `S` 未声明时
+  仍报 `'S' undeclared`；定义处不能省略关键字（`Vec { int x, y; };` 不是
+  语法，裸 `TAG { … }` 分不清 struct/union）；
+- 语句开头的 `TAG(...)` 在 `TAG` 只是 tag 时按声明解析（与 C 里 typedef 名
+  的规则一致），不再落到「隐式函数声明」；被函数遮蔽时不受影响。`TAG:`
+  仍然是标签。
 
