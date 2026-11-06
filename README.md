@@ -437,6 +437,72 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 
 跨 TU 时两边各自写 `T[:]` 即可（布局固定），不需要额外声明。
 
+### async / await（无栈协程）
+
+```c
+async int add(int a, int b) { return a + b; }
+
+async int worker(void)
+{
+    int got = 0;
+    await connect();               /* 语句式 */
+    await send();                  /* 语句式 */
+    got = await recv();            /* 赋值式 */
+    return got;
+}
+
+int main(void)
+{
+    struct worker_task *t = worker();   /* 调用只建任务，不执行函数体 */
+    int rc = __c6_co_wait(t);           /* 驱动到完成，0 = 正常结束 */
+    printf("%d\n", t->val);
+    __c6_co_destroy(t);
+    return rc;
+}
+```
+
+`async` 和无栈协程的区别在于**没有自己的栈**：函数体仍然跑在调用方的
+栈上，`await` 处把已经用到的帧、defer 记录和错误槽存进任务，然后
+`return` 回驱动方；恢复时把帧原样拷回同样的偏移，再跳到那个恢复点。
+所以局部变量、`defer`、`err` 状态在挂起前后完全不变，也不需要上下文
+切换。
+
+速查：
+
+| 写法 | 行为 |
+|---|---|
+| `async T f(…)` | 声明一个协程；调用 `f(…)` 得到 `struct f_task *` |
+| `await f(…)` | 建子任务、推进它、等它完成后取 `val` |
+| `await c6_io(fd, ev)` | 唯一的叶子挂起原语：等 `fd` 就绪，值是就绪掩码 |
+| `t->val` / `t->pN` | 结果值 / 第 N 个实参（任务结构由声明推导） |
+| `__c6_co_wait(t)` | 驱动到完成；`0` = 正常结束，`-1` = 子任务以 `err` 结束 |
+| `__c6_co_destroy(t)` | 释放任务槽（含未完成的子任务） |
+
+规则：
+
+- `async` 是声明说明符，和 `static` / `inline` 同级；只能定义在**文件
+  作用域**，不能嵌套、不能 `async inline`、不能是 `main`；
+- 签名必须是能从声明写回任务结构的类型：标量、枚举、指针、`T[:]`、
+  文件作用域的 struct/union。数组、VLA、函数指针参数都会报错；
+- 三种写法都可用：`await f();`、`a = await f();`、`await f(), a = await g();`
+  也可以写在参数里（`f(a, await g())`）和条件里
+  （`while (await c6_io(fd, C6_CO_EV_READ) > 0)`）；
+- 挂起点上压在求值栈里的中间值必须落在**变量**里。帧槽会随帧一起恢复，
+  寄存器不会——不过调用点本来就会把活寄存器落到帧槽，所以
+  `x + await f()` 也能用；
+- `await` 不能写进 `defer` / `errdefer` 体和 `sizeof` 里；
+- `c6_io` 只有 `await c6_io(fd, ev)` 一种写法；`ev` 是
+  `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
+- 运行时是单线程的固定池（64 个任务、每个 4 KiB 帧、每个 64 条 defer
+  记录），`__c6_co_wait` 用 `select()` 等 fd。libtcc1 不依赖 libc。
+
+完整可运行示例见 [examples/async_demo.c](examples/async_demo.c)
+（一次 HTTP 请求，传输层用 `pipe()` 代替 socket，离线可跑）：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -run examples/async_demo.c
+```
+
 ### #macro / __local
 
 ```c
