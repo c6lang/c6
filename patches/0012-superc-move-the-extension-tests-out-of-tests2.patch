@@ -1,0 +1,2297 @@
+From a83ea73a4ed0bb88cdbfb4021ce665f68225b33e Mon Sep 17 00:00:00 2001
+From: superc <superc@localhost>
+Date: Fri, 6 Nov 2026 22:32:39 +0800
+Subject: [PATCH] superc: move the extension tests out of tests2
+
+The superc tests are written as superc 'test' blocks and live in the
+top-level tests/ directory now, so tests2 stays exactly the upstream
+suite (134 tests in both the extension and the plain build).
+
+Drop 156..177 from tests/tests2 and the SUPERC_TESTS block in
+tests/tests2/Makefile.
+---
+ tests/tests2/156_superc_defer.c               | 107 ---------
+ tests/tests2/156_superc_defer.expect          |   6 -
+ tests/tests2/157_superc_err.c                 | 171 --------------
+ tests/tests2/157_superc_err.expect            |  14 --
+ tests/tests2/158_superc_test.c                |  62 -----
+ tests/tests2/158_superc_test.expect           |   6 -
+ tests/tests2/159_superc_package.c             |  36 ---
+ tests/tests2/159_superc_package.expect        |   5 -
+ tests/tests2/160_superc_interface.c           |  99 --------
+ tests/tests2/160_superc_interface.expect      |   7 -
+ tests/tests2/161_superc_macro.c               |  58 -----
+ tests/tests2/161_superc_macro.expect          |   8 -
+ tests/tests2/162_superc_iface_errors.c        |  40 ----
+ tests/tests2/162_superc_iface_errors.expect   |  17 --
+ tests/tests2/163_superc_try.c                 | 213 ------------------
+ tests/tests2/163_superc_try.expect            |  29 ---
+ tests/tests2/164_superc_try_errors.c          |  50 ----
+ tests/tests2/164_superc_try_errors.expect     |  41 ----
+ tests/tests2/165_superc_init.c                |  66 ------
+ tests/tests2/165_superc_init.expect           |  30 ---
+ tests/tests2/166_superc_pkg_dot.c             |  62 -----
+ tests/tests2/166_superc_pkg_dot.expect        |  12 -
+ tests/tests2/167_superc_pkg_dot_errors.c      |  34 ---
+ tests/tests2/167_superc_pkg_dot_errors.expect |  24 --
+ tests/tests2/168+_superc_pkg_dot_tu.c         |   6 -
+ tests/tests2/168_superc_pkg_dot_tu.c          |  21 --
+ tests/tests2/168_superc_pkg_dot_tu.expect     |   3 -
+ tests/tests2/169_superc_method.c              |  93 --------
+ tests/tests2/169_superc_method.expect         |  10 -
+ tests/tests2/170_superc_method_errors.c       |  45 ----
+ tests/tests2/170_superc_method_errors.expect  |  13 --
+ tests/tests2/171+_superc_method_tu.c          |   5 -
+ tests/tests2/171_superc_method_tu.c           |  20 --
+ tests/tests2/171_superc_method_tu.expect      |   2 -
+ tests/tests2/172+_superc_plain_interop.c      |   5 -
+ tests/tests2/172_superc_plain_interop.c       |  24 --
+ tests/tests2/172_superc_plain_interop.expect  |   2 -
+ tests/tests2/173_superc_pkg_multi.c           |  45 ----
+ tests/tests2/173_superc_pkg_multi.expect      |   5 -
+ tests/tests2/174+_superc_iface_tu.c           |  19 --
+ tests/tests2/174_superc_iface_tu.c            |  30 ---
+ tests/tests2/174_superc_iface_tu.expect       |   1 -
+ tests/tests2/175_superc_slice.c               | 119 ----------
+ tests/tests2/175_superc_slice.expect          |  16 --
+ tests/tests2/176_superc_slice_errors.c        |  82 -------
+ tests/tests2/176_superc_slice_errors.expect   |  35 ---
+ tests/tests2/177+_superc_slice_tu.c           |  18 --
+ tests/tests2/177_superc_slice_tu.c            |  23 --
+ tests/tests2/177_superc_slice_tu.expect       |   3 -
+ tests/tests2/Makefile                         |  37 ---
+ 50 files changed, 1879 deletions(-)
+ delete mode 100644 tests/tests2/156_superc_defer.c
+ delete mode 100644 tests/tests2/156_superc_defer.expect
+ delete mode 100644 tests/tests2/157_superc_err.c
+ delete mode 100644 tests/tests2/157_superc_err.expect
+ delete mode 100644 tests/tests2/158_superc_test.c
+ delete mode 100644 tests/tests2/158_superc_test.expect
+ delete mode 100644 tests/tests2/159_superc_package.c
+ delete mode 100644 tests/tests2/159_superc_package.expect
+ delete mode 100644 tests/tests2/160_superc_interface.c
+ delete mode 100644 tests/tests2/160_superc_interface.expect
+ delete mode 100644 tests/tests2/161_superc_macro.c
+ delete mode 100644 tests/tests2/161_superc_macro.expect
+ delete mode 100644 tests/tests2/162_superc_iface_errors.c
+ delete mode 100644 tests/tests2/162_superc_iface_errors.expect
+ delete mode 100644 tests/tests2/163_superc_try.c
+ delete mode 100644 tests/tests2/163_superc_try.expect
+ delete mode 100644 tests/tests2/164_superc_try_errors.c
+ delete mode 100644 tests/tests2/164_superc_try_errors.expect
+ delete mode 100644 tests/tests2/165_superc_init.c
+ delete mode 100644 tests/tests2/165_superc_init.expect
+ delete mode 100644 tests/tests2/166_superc_pkg_dot.c
+ delete mode 100644 tests/tests2/166_superc_pkg_dot.expect
+ delete mode 100644 tests/tests2/167_superc_pkg_dot_errors.c
+ delete mode 100644 tests/tests2/167_superc_pkg_dot_errors.expect
+ delete mode 100644 tests/tests2/168+_superc_pkg_dot_tu.c
+ delete mode 100644 tests/tests2/168_superc_pkg_dot_tu.c
+ delete mode 100644 tests/tests2/168_superc_pkg_dot_tu.expect
+ delete mode 100644 tests/tests2/169_superc_method.c
+ delete mode 100644 tests/tests2/169_superc_method.expect
+ delete mode 100644 tests/tests2/170_superc_method_errors.c
+ delete mode 100644 tests/tests2/170_superc_method_errors.expect
+ delete mode 100644 tests/tests2/171+_superc_method_tu.c
+ delete mode 100644 tests/tests2/171_superc_method_tu.c
+ delete mode 100644 tests/tests2/171_superc_method_tu.expect
+ delete mode 100644 tests/tests2/172+_superc_plain_interop.c
+ delete mode 100644 tests/tests2/172_superc_plain_interop.c
+ delete mode 100644 tests/tests2/172_superc_plain_interop.expect
+ delete mode 100644 tests/tests2/173_superc_pkg_multi.c
+ delete mode 100644 tests/tests2/173_superc_pkg_multi.expect
+ delete mode 100644 tests/tests2/174+_superc_iface_tu.c
+ delete mode 100644 tests/tests2/174_superc_iface_tu.c
+ delete mode 100644 tests/tests2/174_superc_iface_tu.expect
+ delete mode 100644 tests/tests2/175_superc_slice.c
+ delete mode 100644 tests/tests2/175_superc_slice.expect
+ delete mode 100644 tests/tests2/176_superc_slice_errors.c
+ delete mode 100644 tests/tests2/176_superc_slice_errors.expect
+ delete mode 100644 tests/tests2/177+_superc_slice_tu.c
+ delete mode 100644 tests/tests2/177_superc_slice_tu.c
+ delete mode 100644 tests/tests2/177_superc_slice_tu.expect
+
+diff --git a/tests/tests2/156_superc_defer.c b/tests/tests2/156_superc_defer.c
+deleted file mode 100644
+index 3ad87b4..0000000
+--- a/tests/tests2/156_superc_defer.c
++++ /dev/null
+@@ -1,107 +0,0 @@
+-/* superc extension: defer */
+-#include <stdio.h>
+-
+-static char log_buf[512] = {0};
+-static int log_pos = 0;
+-
+-static void log_reset(void) { log_pos = 0; log_buf[0] = '\0'; }
+-static void log_add(const char *s)
+-{
+-    int n = 0;
+-    while (s[n])
+-        n++;
+-    if (log_pos + n < (int)sizeof(log_buf)) {
+-        int i = 0;
+-        for (i = 0; i < n; i++)
+-            log_buf[log_pos++] = s[i];
+-        log_buf[log_pos] = '\0';
+-    }
+-}
+-static void log_print(const char *tag) { printf("%s: %s\n", tag, log_buf); }
+-
+-/* 1: basic LIFO order in a block */
+-static void t_basic(void)
+-{
+-    log_reset();
+-    {
+-        defer log_add("a");
+-        defer log_add("b");
+-        defer log_add("c");
+-        log_add("body");
+-    }
+-    log_print("basic");
+-}
+-
+-/* 2: defer runs when the block is left by break/continue */
+-static void t_loop(void)
+-{
+-    int i = 0;
+-    log_reset();
+-    for (i = 0; i < 3; i++) {
+-        defer log_add("d");
+-        if (i == 1)
+-            continue;
+-        log_add("i");
+-        if (i == 2)
+-            break;
+-    }
+-    log_print("loop");
+-}
+-
+-/* 3: defer runs on return, and the return value is preserved */
+-static int t_return(int x)
+-{
+-    log_reset();
+-    defer log_add("one");
+-    if (x > 0) {
+-        defer log_add("two");
+-        return x * 2;
+-    }
+-    defer log_add("three");
+-    return -1;
+-}
+-
+-/* 4: goto out of a block runs the defers of the scopes being left */
+-static void t_goto(void)
+-{
+-    log_reset();
+-    {
+-        defer log_add("outer");
+-        {
+-            defer log_add("inner");
+-            goto out;
+-        }
+-    }
+-out:
+-    log_print("goto");
+-}
+-
+-/* 5: recursion keeps each frame's defers separate */
+-static int rec(int n)
+-{
+-    defer log_add("r");
+-    if (n <= 0)
+-        return 0;
+-    return n + rec(n - 1);
+-}
+-
+-static void t_rec(void)
+-{
+-    int r = 0;
+-    log_reset();
+-    r = rec(3);
+-    printf("rec: %d %d\n", r, (int)(log_pos / 1));
+-}
+-
+-int main(void)
+-{
+-    t_basic();
+-    t_loop();
+-    printf("ret1: %d ", t_return(5));
+-    log_print("ret1log");
+-    printf("ret2: %d ", t_return(-5));
+-    log_print("ret2log");
+-    t_goto();
+-    t_rec();
+-    return 0;
+-}
+diff --git a/tests/tests2/156_superc_defer.expect b/tests/tests2/156_superc_defer.expect
+deleted file mode 100644
+index 5282be6..0000000
+--- a/tests/tests2/156_superc_defer.expect
++++ /dev/null
+@@ -1,6 +0,0 @@
+-basic: bodycba
+-loop: iddid
+-ret1: 10 ret1log: twoone
+-ret2: -1 ret2log: threeone
+-goto: innerouter
+-rec: 6 4
+diff --git a/tests/tests2/157_superc_err.c b/tests/tests2/157_superc_err.c
+deleted file mode 100644
+index d917b6a..0000000
+--- a/tests/tests2/157_superc_err.c
++++ /dev/null
+@@ -1,171 +0,0 @@
+-/* superc extension: errdefer + err + try */
+-#include <stdio.h>
+-#include <string.h>
+-
+-int __tcc_err_flag_get(void);
+-int __tcc_err_id_get(void);
+-const char *__tcc_err_msg_get(void);
+-void __tcc_err_clear(void);
+-
+-#define SENT (-1)
+-
+-static char buf[256] = {0};
+-static int blen = 0;
+-
+-/* the last error observed by a 'catch' handler (the slot itself is cleared
+-   by 'catch', so the values have to be copied out) */
+-static int last_id = 0;
+-static const char *last_msg = 0;
+-
+-static void log_reset(void) { blen = 0; buf[0] = '\0'; }
+-static void log_add(const char *s)
+-{
+-    while (*s && blen < (int)sizeof(buf) - 2)
+-        buf[blen++] = *s++;
+-    buf[blen] = '\0';
+-}
+-static void log_print(const char *tag) { printf("%s: %s\n", tag, buf); }
+-
+-static void note(int id, const char *msg)
+-{
+-    last_id = id;
+-    last_msg = msg;
+-}
+-
+-/* errdefer is skipped on the normal path and runs in reverse on the
+-   error path; plain defer always runs */
+-static int!error e1(int fail)
+-{
+-    defer log_add("1");
+-    errdefer log_add("2");
+-    errdefer log_add("3");
+-    if (fail)
+-        err(7, "boom");
+-    log_add("4");
+-    return 0;
+-}
+-
+-static int!error inner(int fail)
+-{
+-    defer log_add("A");
+-    errdefer log_add("B");
+-    if (fail)
+-        err(9, "inner");
+-    return 0;
+-}
+-
+-/* propagation through two frames: 'try' hands the error back after running
+-   the local cleanups, the statement form drops the value */
+-static int!error outer(int fail)
+-{
+-    defer log_add("C");
+-    errdefer log_add("D");
+-    try inner(fail);
+-    log_add("E");
+-    return 0;
+-}
+-
+-/* err inside a loop leaves the whole frame */
+-static void!error loop_err(int fail)
+-{
+-    int i = 0;
+-    for (i = 0; i < 3; i++) {
+-        defer log_add("d");
+-        if (fail && i == 1)
+-            err(12, "loop");
+-        log_add("i");
+-    }
+-    log_add("z");
+-}
+-
+-static int!error *ptr_err(int fail)
+-{
+-    defer log_add("p");
+-    if (fail)
+-        err(11, "ptr");
+-    return 0;
+-}
+-
+-/* callers that only want "value or sentinel" catch and report SENT */
+-static int run_e1(int fail)
+-{
+-    int v = e1(fail) catch e {
+-        note(e.id, e.msg);
+-        return SENT;
+-    };
+-    return v;
+-}
+-
+-static int run_outer(int fail)
+-{
+-    int v = outer(fail) catch e {
+-        note(e.id, e.msg);
+-        return SENT;
+-    };
+-    return v;
+-}
+-
+-static int run_loop(int fail)
+-{
+-    loop_err(fail) catch e {
+-        note(e.id, e.msg);
+-        return SENT;
+-    };
+-    return 0;
+-}
+-
+-static int *run_ptr(int fail)
+-{
+-    int *v = ptr_err(fail) catch e {
+-        note(e.id, e.msg);
+-        return (int *)(long)SENT;
+-    };
+-    return v;
+-}
+-
+-int main(void)
+-{
+-    log_reset();
+-    printf("e1-normal=%d ", run_e1(0));
+-    log_print("e1-normal");
+-    printf("flag=%d\n", __tcc_err_flag_get());
+-
+-    __tcc_err_clear();
+-    log_reset();
+-    printf("e1-error=%d ", run_e1(1));
+-    log_print("e1-error");
+-    printf("id=%d msg=%s\n", last_id, last_msg);
+-
+-    __tcc_err_clear();
+-    log_reset();
+-    printf("outer-error=%d ", run_outer(1));
+-    log_print("outer-error");
+-    printf("id=%d msg=%s\n", last_id, last_msg);
+-
+-    __tcc_err_clear();
+-    log_reset();
+-    printf("outer-normal=%d ", run_outer(0));
+-    log_print("outer-normal");
+-    printf("flag=%d\n", __tcc_err_flag_get());
+-
+-    __tcc_err_clear();
+-    log_reset();
+-    run_loop(1);
+-    log_print("loop-error");
+-    printf("id=%d\n", last_id);
+-
+-    __tcc_err_clear();
+-    log_reset();
+-    run_loop(0);
+-    log_print("loop-normal");
+-
+-    __tcc_err_clear();
+-    log_reset();
+-    printf("ptr=%d ", run_ptr(1) == (int *)(long)SENT);
+-    log_print("ptr");
+-    printf("id=%d msg=%s\n", last_id, last_msg);
+-
+-    __tcc_err_clear();
+-    printf("final-flag=%d\n", __tcc_err_flag_get());
+-    return 0;
+-}
+diff --git a/tests/tests2/157_superc_err.expect b/tests/tests2/157_superc_err.expect
+deleted file mode 100644
+index a555c95..0000000
+--- a/tests/tests2/157_superc_err.expect
++++ /dev/null
+@@ -1,14 +0,0 @@
+-e1-normal=0 e1-normal: 41
+-flag=0
+-e1-error=-1 e1-error: 321
+-id=7 msg=boom
+-outer-error=-1 outer-error: BADC
+-id=9 msg=inner
+-outer-normal=0 outer-normal: AEC
+-flag=0
+-loop-error: idd
+-id=12
+-loop-normal: idididz
+-ptr=1 ptr: p
+-id=11 msg=ptr
+-final-flag=0
+diff --git a/tests/tests2/158_superc_test.c b/tests/tests2/158_superc_test.c
+deleted file mode 100644
+index dcd6a25..0000000
+--- a/tests/tests2/158_superc_test.c
++++ /dev/null
+@@ -1,62 +0,0 @@
+-/* superc extension: 'test "desc" { ... }' blocks and -test mode */
+-#include <stdio.h>
+-
+-int __tcc_err_flag_get(void);
+-int __tcc_err_id_get(void);
+-void __tcc_err_clear(void);
+-
+-test "arithmetic works" {
+-    if (1 + 1 != 2)
+-        err(1, "1 + 1 != 2");
+-}
+-
+-test "defer runs inside a test block" {
+-    int n = 0;
+-    {
+-        defer n++;
+-        n += 2;
+-    }
+-    if (n != 3)
+-        err(2, "defer did not run");
+-}
+-
+-test "errdefer is skipped on the normal path" {
+-    errdefer printf("not reached\n");
+-    if (0)
+-        err(3, "never");
+-}
+-
+-test "strings and loops" {
+-    int i = 0, sum = 0;
+-    const char *s = "abcd";
+-    for (i = 0; s[i]; i++)
+-        sum += s[i];
+-    if (sum != 'a' + 'b' + 'c' + 'd')
+-        err(4, "bad sum");
+-}
+-
+-/* a helper used by a test; a failing helper propagates via 'try' */
+-static int!error helper(int x)
+-{
+-    if (x < 0)
+-        err(5, "negative");
+-    return x * 2;
+-}
+-
+-test "helpers propagate errors" {
+-    if ((try helper(3)) != 6)
+-        err(6, "helper(3) != 6");
+-    helper(-1) catch e {
+-        if (e.id != 5)
+-            err(7, "wrong error id");
+-        return 0;           /* handled here: the test itself passes */
+-    };
+-    err(8, "helper did not fail");
+-}
+-
+-int main(void)
+-{
+-    /* -test mode never calls main */
+-    printf("main should not run\n");
+-    return 0;
+-}
+diff --git a/tests/tests2/158_superc_test.expect b/tests/tests2/158_superc_test.expect
+deleted file mode 100644
+index 5fc4185..0000000
+--- a/tests/tests2/158_superc_test.expect
++++ /dev/null
+@@ -1,6 +0,0 @@
+-PASS: arithmetic works
+-PASS: defer runs inside a test block
+-PASS: errdefer is skipped on the normal path
+-PASS: strings and loops
+-PASS: helpers propagate errors
+-5 test(s), 0 failure(s)
+diff --git a/tests/tests2/159_superc_package.c b/tests/tests2/159_superc_package.c
+deleted file mode 100644
+index a1c6d5d..0000000
+--- a/tests/tests2/159_superc_package.c
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/* superc extension: package / import */
+-#include <stdio.h>
+-
+-package math {
+-    int add(int a, int b) { return a + b; }
+-    int twice(int a) { return add(a, a); }
+-    int hidden_helper(int a) { return a + 1; }
+-}
+-
+-package text {
+-    int len(const char *s)
+-    {
+-        int n = 0;
+-        while (s[n])
+-            n++;
+-        return n;
+-    }
+-}
+-
+-import math;
+-import text;
+-
+-int main(void)
+-{
+-    /* imported names resolve to the mangled symbols */
+-    printf("add=%d\n", add(2, 3));
+-    printf("twice=%d\n", twice(21));
+-    printf("len=%d\n", len("hello"));
+-
+-    /* the mangled names are ordinary global symbols */
+-    printf("mangled=%d %d\n", math__add(10, 20), text__len("abc"));
+-
+-    /* a package can see its own members without qualification */
+-    printf("helper=%d\n", math__hidden_helper(41));
+-    return 0;
+-}
+diff --git a/tests/tests2/159_superc_package.expect b/tests/tests2/159_superc_package.expect
+deleted file mode 100644
+index 63e3428..0000000
+--- a/tests/tests2/159_superc_package.expect
++++ /dev/null
+@@ -1,5 +0,0 @@
+-add=5
+-twice=42
+-len=5
+-mangled=30 3
+-helper=42
+diff --git a/tests/tests2/160_superc_interface.c b/tests/tests2/160_superc_interface.c
+deleted file mode 100644
+index 1bd1432..0000000
+--- a/tests/tests2/160_superc_interface.c
++++ /dev/null
+@@ -1,99 +0,0 @@
+-/* superc extension: interfaces (fat pointer + vtable).
+-   A struct implements an interface by having the methods: there is no
+-   'impl' declaration any more, the vtable is generated on demand. */
+-#include <stdio.h>
+-
+-interface Shape {
+-    int area();
+-    const char *name();
+-}
+-
+-interface Printable {
+-    void print();
+-}
+-
+-struct Circle { int r; };
+-struct Rect { int w, h; };
+-typedef struct Circle Circle;
+-typedef struct Rect Rect;
+-
+-/* same method names for different types: the package keeps them apart */
+-package circle {
+-    int area(Circle *self) { return 3 * self->r * self->r; }
+-    const char *name(Circle *self) { return "circle"; }
+-    void print(Circle *self) { printf("Circle(%d)", self->r); }
+-}
+-
+-package rect {
+-    int area(Rect *self) { return self->w * self->h; }
+-    const char *name(Rect *self) { return "rect"; }
+-    void print(Rect *self) { printf("Rect(%dx%d)", self->w, self->h); }
+-}
+-
+-import circle;
+-import rect;
+-
+-/* implicit conversion of a struct value to the interface value */
+-static int describe(Shape s)
+-{
+-    printf("%s:%d ", s.name(), s.area());
+-    return s.area();
+-}
+-
+-/* an interface value as an ordinary struct local */
+-static void show(Shape s)
+-{
+-    printf("[%s]", s.name());
+-}
+-
+-static void dump(Printable p)
+-{
+-    p.print();
+-    printf(" ");
+-}
+-
+-/* a conversion inside a 'static inline' body: the body is compiled at the
+-   very end of the unit, so its vtable must still be generated */
+-static inline int inline_area(Circle c)
+-{
+-    Shape s = {0};
+-    s = c;
+-    return s.area();
+-}
+-
+-int main(void)
+-{
+-    Circle c = {0};
+-    Rect r = {0};
+-    Shape s = {0};
+-
+-    c.r = 5;
+-    r.w = 4;
+-    r.h = 6;
+-
+-    printf("total=%d\n", describe(c) + describe(r));
+-
+-    s = c;
+-    show(s);
+-    s = r;
+-    show(s);
+-    printf("\n");
+-
+-    dump(c);
+-    dump(r);
+-    printf("\n");
+-
+-    /* a copy of an interface value still points at the same object */
+-    s = c;
+-    show(s);
+-    show(s);
+-    printf("\n");
+-
+-    /* explicit cast syntax also works */
+-    show((Shape)c);
+-    printf("\n");
+-
+-    printf("sizeof=%d\n", (int)sizeof(Shape));
+-    printf("inline=%d\n", inline_area(c));
+-    return 0;
+-}
+diff --git a/tests/tests2/160_superc_interface.expect b/tests/tests2/160_superc_interface.expect
+deleted file mode 100644
+index 6cb51d3..0000000
+--- a/tests/tests2/160_superc_interface.expect
++++ /dev/null
+@@ -1,7 +0,0 @@
+-circle:75 rect:24 total=99
+-[circle][rect]
+-Circle(5) Rect(4x6) 
+-[circle][circle]
+-[circle]
+-sizeof=16
+-inline=75
+diff --git a/tests/tests2/161_superc_macro.c b/tests/tests2/161_superc_macro.c
+deleted file mode 100644
+index 0611ab4..0000000
+--- a/tests/tests2/161_superc_macro.c
++++ /dev/null
+@@ -1,58 +0,0 @@
+-/* superc extension: '#macro' with hygienic '__local' names */
+-#include <stdio.h>
+-
+-#macro swap(a, b) {
+-    typeof(a) __local tmp = (a);
+-    (a) = (b);
+-    (b) = tmp;
+-}
+-
+-#macro maxv(x, y, out) {
+-    typeof(x) __local m = (x);
+-    if ((y) > m)
+-        m = (y);
+-    (out) = m;
+-}
+-
+-#macro twice(stmt) {
+-    stmt;
+-    stmt;
+-}
+-
+-#macro outer(a, b) {
+-    typeof(a) __local t = (a);
+-    swap(t, b);
+-    (a) = t;
+-}
+-
+-int main(void)
+-{
+-    int a = 3, b = 9, m = 0;
+-
+-    swap(a, b);
+-    printf("swap: %d %d\n", a, b);
+-
+-    maxv(a, b, m);
+-    printf("maxv: %d\n", m);
+-
+-    outer(a, b);
+-    printf("outer: %d %d\n", a, b);
+-
+-    twice(printf("twice\n"));
+-
+-    /* a user variable with the same name must not be captured */
+-    {
+-        int tmp = 42;
+-        swap(tmp, a);
+-        printf("user: tmp=%d a=%d\n", tmp, a);
+-    }
+-
+-    /* two expansions in one scope must not clash */
+-    swap(a, b);
+-    swap(a, b);
+-    printf("twice-swap: %d %d\n", a, b);
+-
+-    /* no leftover identifiers */
+-    printf("names: %d\n", (int)sizeof(a));
+-    return 0;
+-}
+diff --git a/tests/tests2/161_superc_macro.expect b/tests/tests2/161_superc_macro.expect
+deleted file mode 100644
+index aa2e0b7..0000000
+--- a/tests/tests2/161_superc_macro.expect
++++ /dev/null
+@@ -1,8 +0,0 @@
+-swap: 9 3
+-maxv: 9
+-outer: 3 9
+-twice
+-twice
+-user: tmp=3 a=42
+-twice-swap: 42 9
+-names: 4
+diff --git a/tests/tests2/162_superc_iface_errors.c b/tests/tests2/162_superc_iface_errors.c
+deleted file mode 100644
+index 058c918..0000000
+--- a/tests/tests2/162_superc_iface_errors.c
++++ /dev/null
+@@ -1,40 +0,0 @@
+-/* superc extension: diagnostics for structured interfaces.
+-   A struct implements an interface by having the methods; the check
+-   happens at the first conversion, so every branch below converts. */
+-struct Circle { int r; };
+-
+-#if defined test_missing_method
+-interface Shape { int area(); void dump(int n); }
+-int area(struct Circle *self) { return self->r; }
+-static int use(Shape s) { return s.area(); }
+-int main(void) { struct Circle c = {1}; return use(c); }
+-#elif defined test_wrong_param_count
+-interface Shape { int area(); }
+-int area(struct Circle *self, int extra) { return self->r + extra; }
+-static int use(Shape s) { return s.area(); }
+-int main(void) { struct Circle c = {1}; return use(c); }
+-#elif defined test_wrong_return_type
+-interface Shape { int area(); }
+-char *area(struct Circle *self) { return 0; }
+-static int use(Shape s) { return s.area(); }
+-int main(void) { struct Circle c = {1}; return use(c); }
+-#elif defined test_incompatible_param
+-interface Shape { int scale(int n); }
+-int scale(struct Circle *self, char *n) { return self->r + (n != 0); }
+-static int use(Shape s) { return s.scale(2); }
+-int main(void) { struct Circle c = {1}; return use(c); }
+-#elif defined test_duplicate_method
+-package a { int area(struct Circle *self) { return self->r; } }
+-package b { int area(struct Circle *self) { return self->r + 1; } }
+-int main(void) { return 0; }
+-#elif defined test_method_after_use
+-interface Shape { int area(); }
+-static int use(Shape s) { return s.area(); }
+-/* the conversion below cannot see a method that is declared only later */
+-int main(void) { struct Circle c = {1}; return use(c); }
+-int area(struct Circle *self) { return self->r; }
+-#else
+-interface Shape { int area(); }
+-int area(struct Circle *self) { return self->r; }
+-int main(void) { struct Circle c = {1}; Shape s = {0}; s = c; return s.area(); }
+-#endif
+diff --git a/tests/tests2/162_superc_iface_errors.expect b/tests/tests2/162_superc_iface_errors.expect
+deleted file mode 100644
+index 154970c..0000000
+--- a/tests/tests2/162_superc_iface_errors.expect
++++ /dev/null
+@@ -1,17 +0,0 @@
+-[test_missing_method]
+-162_superc_iface_errors.c:10: error: 'Circle' does not implement interface 'Shape': missing method 'dump'
+-
+-[test_wrong_param_count]
+-162_superc_iface_errors.c:15: error: method 'area' of 'Shape' has the wrong number of parameters
+-
+-[test_wrong_return_type]
+-162_superc_iface_errors.c:20: error: method 'area' of 'Shape' has an incompatible return type
+-
+-[test_incompatible_param]
+-162_superc_iface_errors.c:25: error: method 'scale' of 'Shape' has an incompatible parameter
+-
+-[test_duplicate_method]
+-162_superc_iface_errors.c:28: error: duplicate method 'area' for 'Circle'
+-
+-[test_method_after_use]
+-162_superc_iface_errors.c:34: error: 'Circle' does not implement interface 'Shape': missing method 'area'
+diff --git a/tests/tests2/163_superc_try.c b/tests/tests2/163_superc_try.c
+deleted file mode 100644
+index c01880f..0000000
+--- a/tests/tests2/163_superc_try.c
++++ /dev/null
+@@ -1,213 +0,0 @@
+-/* superc extension: 'T!error' functions, 'try' and 'catch' */
+-#include <stdio.h>
+-#include <string.h>
+-
+-int __tcc_err_flag_get(void);
+-int __tcc_err_id_get(void);
+-const char *__tcc_err_msg_get(void);
+-void __tcc_err_clear(void);
+-
+-static char buf[256] = {0};
+-static int blen = 0;
+-
+-static void log_reset(void) { blen = 0; buf[0] = '\0'; }
+-static void log_add(const char *s)
+-{
+-    while (*s && blen < (int)sizeof(buf) - 2)
+-        buf[blen++] = *s++;
+-    buf[blen] = '\0';
+-}
+-
+-/* a fallible function: 'err()' behaves like 'return err()' */
+-static int!error fetch(int n)
+-{
+-    if (n < 0)
+-        err(100, "negative");
+-    if (n == 0)
+-        err(101, "zero");
+-    return n * 10;
+-}
+-
+-/* the marker may also be written after the declarator, and a prototype
+-   marked '!error' also marks the later definition */
+-static int fetch2(int n)!error;
+-
+-static int fetch2(int n)
+-{
+-    if (n > 99)
+-        err(102, "too big");
+-    return n + 1;
+-}
+-
+-/* a fallible function without a value */
+-static void!error check(int n)
+-{
+-    if (n != 0)
+-        err(200, "check failed");
+-}
+-
+-/* 1) 'try' hands the value through on the success path and propagates the
+-   error otherwise */
+-static int!error propagates(int n)
+-{
+-    int v = (try fetch(n));
+-    log_add("A");
+-    return v + 1;
+-}
+-
+-static int call_propagates(int n)
+-{
+-    int v = propagates(n) catch e {
+-        printf("propagates(%d) caught %d/%s\n", n, e.id, e.msg);
+-        return -1;
+-    };
+-    return v;
+-}
+-
+-/* 2) 'catch' snapshots the error and clears the slot */
+-static int catches(int n)
+-{
+-    int v = fetch(n) catch e {
+-        printf("caught %d %s\n", e.id, e.msg);
+-        printf("slot-in-handler flag=%d id=%d\n",
+-               __tcc_err_flag_get(), __tcc_err_id_get());
+-        return -1000 + e.id;
+-    };
+-    return v;
+-}
+-
+-/* 3) the handler may omit the variable and the parentheses */
+-static int catches_plain(int n)
+-{
+-    int v = fetch(n) catch {
+-        printf("plain handler, slot=%d\n", __tcc_err_flag_get());
+-        return -2;
+-    };
+-    return v;
+-}
+-
+-static int catches_paren(int n)
+-{
+-    int v = fetch(n) catch (e) {
+-        printf("paren handler %d\n", e.id);
+-        return -3;
+-    };
+-    return v;
+-}
+-
+-/* 4) a handler may also leave with 'goto' */
+-static int catches_goto(int n)
+-{
+-    int v = fetch(n) catch e {
+-        goto failed;
+-    };
+-    return v;
+-failed:
+-    return -4;
+-}
+-
+-/* 5) 'try' on a void function, and 'catch' on a void function */
+-static void!error void_try(int n)
+-{
+-    try check(n);
+-    log_add("V");
+-}
+-
+-static int use_void(int n)
+-{
+-    void_try(n) catch e {
+-        printf("void handler %d/%s\n", e.id, e.msg);
+-        return -5;
+-    };
+-    log_add("W");
+-    return 0;
+-}
+-
+-/* 6) 'try' inside a loop: one failing iteration aborts the whole function */
+-static int!error loop(int n)
+-{
+-    int i = 0, sum = 0;
+-    for (i = 0; i < n; i++) {
+-        if (i == 3)
+-            err(300, "loop");
+-        sum += (try fetch(i + 1));
+-    }
+-    return sum;
+-}
+-
+-static int call_loop(int n)
+-{
+-    int v = loop(n) catch e {
+-        printf("loop caught %d\n", e.id);
+-        return -6;
+-    };
+-    return v;
+-}
+-
+-/* 7) nested try: either failing call propagates out of 'nested' */
+-static int!error nested(int n)
+-{
+-    return (try fetch(n)) + (try fetch2(n));
+-}
+-
+-static int call_nested(int n)
+-{
+-    int v = nested(n) catch e {
+-        printf("nested caught %d/%s\n", e.id, e.msg);
+-        return -7;
+-    };
+-    return v;
+-}
+-
+-int main(void)
+-{
+-    int a = 0, b = 0, c = 0;
+-
+-    log_reset();
+-    a = call_propagates(2);
+-    printf("1 ok=%d log=%s\n", a, buf);
+-    printf("1 err=%d\n", call_propagates(-1));
+-    printf("1 flag=%d\n", __tcc_err_flag_get());
+-
+-    log_reset();
+-    a = catches(3);
+-    printf("2 ok=%d log=%s\n", a, buf);
+-    printf("2 err=%d\n", catches(0));
+-    printf("2 flag=%d\n", __tcc_err_flag_get());
+-
+-    a = catches_plain(1);
+-    b = catches_plain(0);
+-    printf("3 plain-ok=%d plain-err=%d\n", a, b);
+-    a = catches_paren(1);
+-    b = catches_paren(0);
+-    printf("3 paren-ok=%d paren-err=%d\n", a, b);
+-    a = catches_goto(1);
+-    b = catches_goto(0);
+-    printf("3 goto-ok=%d goto-err=%d\n", a, b);
+-
+-    log_reset();
+-    a = use_void(0);
+-    printf("5 ok=%d log=%s\n", a, buf);
+-    printf("5 err=%d\n", use_void(1));
+-
+-    log_reset();
+-    a = call_loop(3);
+-    printf("6 ok=%d log=%s\n", a, buf);
+-    printf("6 err=%d\n", call_loop(5));
+-
+-    a = call_nested(1);
+-    b = call_nested(0);
+-    printf("7 ok=%d err=%d\n", a, b);
+-    printf("7 too-big=%d\n", call_nested(120));
+-
+-    a = call_propagates(3);
+-    printf("8 proto-ok=%d\n", a);
+-    printf("8 small=%d\n", fetch2(4));
+-    printf("8 flag=%d\n", __tcc_err_flag_get());
+-
+-    c = __tcc_err_flag_get();
+-    printf("9 flag=%d id=%d\n", c, __tcc_err_id_get());
+-    __tcc_err_clear();
+-    printf("final flag=%d\n", __tcc_err_flag_get());
+-    return 0;
+-}
+diff --git a/tests/tests2/163_superc_try.expect b/tests/tests2/163_superc_try.expect
+deleted file mode 100644
+index 88e35a4..0000000
+--- a/tests/tests2/163_superc_try.expect
++++ /dev/null
+@@ -1,29 +0,0 @@
+-1 ok=21 log=A
+-propagates(-1) caught 100/negative
+-1 err=-1
+-1 flag=0
+-2 ok=30 log=
+-caught 101 zero
+-slot-in-handler flag=0 id=0
+-2 err=-899
+-2 flag=0
+-plain handler, slot=0
+-3 plain-ok=10 plain-err=-2
+-paren handler 101
+-3 paren-ok=10 paren-err=-3
+-3 goto-ok=10 goto-err=-4
+-5 ok=0 log=VW
+-void handler 200/check failed
+-5 err=-5
+-6 ok=60 log=
+-loop caught 300
+-6 err=-6
+-nested caught 101/zero
+-7 ok=12 err=-7
+-nested caught 102/too big
+-7 too-big=-7
+-8 proto-ok=31
+-8 small=5
+-8 flag=0
+-9 flag=0 id=0
+-final flag=0
+diff --git a/tests/tests2/164_superc_try_errors.c b/tests/tests2/164_superc_try_errors.c
+deleted file mode 100644
+index cb5a9ec..0000000
+--- a/tests/tests2/164_superc_try_errors.c
++++ /dev/null
+@@ -1,50 +0,0 @@
+-/* superc extension: diagnostics for malformed 'try' / 'catch' / 'T!error' */
+-static int ok_int(void) { return 1; }
+-static int!error fails(int n) { if (n) err(1, "x"); return 0; }
+-struct S { int a; };
+-
+-#if defined test_try_in_plain_fn
+-static int plain(void) { try fails(0); return 0; }
+-int main(void) { return plain(); }
+-#elif defined test_try_not_fallible
+-static int!error bad(void) { try ok_int(); return 0; }
+-int main(void) { return bad(); }
+-#elif defined test_try_not_a_call
+-static int!error bad(int n) { try n; return 0; }
+-int main(void) { return bad(1); }
+-#elif defined test_try_assignment
+-static int!error bad(void) { int v = 0; try v = 1; return v; }
+-int main(void) { return bad(); }
+-#elif defined test_catch_not_fallible
+-static int bad(void) { int v = ok_int() catch e { return -1; }; return v; }
+-int main(void) { return bad(); }
+-#elif defined test_catch_falls_through
+-static int!error bad(void) { int v = fails(0) catch e { v = 1; }; return v; }
+-int main(void) { return bad(); }
+-#elif defined test_bare_catch
+-static int bad(void) { catch e { return -1; } return 0; }
+-int main(void) { return bad(); }
+-#elif defined test_fallible_not_a_function
+-static int!error x = 1;
+-int main(void) { return x; }
+-#elif defined test_fallible_struct_return
+-static struct S!error bad_ret(void) { struct S s = {0}; return s; }
+-int main(void) { return bad_ret().a; }
+-#elif defined test_try_in_defer
+-static int!error bad(void) { defer { try fails(0); } return 0; }
+-int main(void) { return bad(); }
+-#elif defined test_error_parameter
+-static void take(error e) { }
+-int main(void) { return 0; }
+-#elif defined test_error_out_parameter
+-static void take(error *e) { }
+-int main(void) { return 0; }
+-#elif defined test_error_parameter_knr
+-static void take(e) error e; { }
+-int main(void) { return 0; }
+-#elif defined test_catch_in_defer
+-static int!error bad(void) { defer { int v = fails(0) catch e { return -1; }; } return 0; }
+-int main(void) { return bad(); }
+-#else
+-int main(void) { return 0; }
+-#endif
+diff --git a/tests/tests2/164_superc_try_errors.expect b/tests/tests2/164_superc_try_errors.expect
+deleted file mode 100644
+index 0002534..0000000
+--- a/tests/tests2/164_superc_try_errors.expect
++++ /dev/null
+@@ -1,41 +0,0 @@
+-[test_try_in_plain_fn]
+-164_superc_try_errors.c:7: error: 'try' requires the enclosing function to return 'T!error'
+-
+-[test_try_not_fallible]
+-164_superc_try_errors.c:10: error: 'try' requires a call to a function returning 'T!error'
+-
+-[test_try_not_a_call]
+-164_superc_try_errors.c:13: error: 'try' requires a call to a function returning 'T!error'
+-
+-[test_try_assignment]
+-164_superc_try_errors.c:16: error: 'try' requires a call to a function returning 'T!error'
+-
+-[test_catch_not_fallible]
+-164_superc_try_errors.c:19: error: 'catch' requires a call to a function returning 'T!error'
+-
+-[test_catch_falls_through]
+-164_superc_try_errors.c:22: error: 'catch' body must end with 'return', 'err()' or 'goto'
+-
+-[test_bare_catch]
+-164_superc_try_errors.c:25: error: 'catch' has no operand
+-
+-[test_fallible_not_a_function]
+-164_superc_try_errors.c:28: error: '!error' requires a function declarator
+-
+-[test_fallible_struct_return]
+-164_superc_try_errors.c:31: error: '!error' requires a return type representable by -1
+-
+-[test_try_in_defer]
+-164_superc_try_errors.c:34: error: 'try' is not allowed in a defer body
+-
+-[test_error_parameter]
+-164_superc_try_errors.c:37: error: 'error' can only be a return type, not a parameter
+-
+-[test_error_out_parameter]
+-164_superc_try_errors.c:40: error: 'error' can only be a return type, not a parameter
+-
+-[test_error_parameter_knr]
+-164_superc_try_errors.c:43: error: 'error' can only be a return type, not a parameter
+-
+-[test_catch_in_defer]
+-164_superc_try_errors.c:46: error: 'catch' is not allowed in a defer body
+diff --git a/tests/tests2/165_superc_init.c b/tests/tests2/165_superc_init.c
+deleted file mode 100644
+index b9e3723..0000000
+--- a/tests/tests2/165_superc_init.c
++++ /dev/null
+@@ -1,66 +0,0 @@
+-/* superc extension: every variable definition must be initialized.
+- * VLAs are the only exception: C does not allow initializing them. */
+-struct S { int a; };
+-
+-#if defined test_local_int
+-static int f(void) { int x; return x; }
+-int main(void) { return f(); }
+-#elif defined test_local_multi
+-static int f(void) { int x = 0, y; return x + y; }
+-int main(void) { return f(); }
+-#elif defined test_local_array
+-static int f(void) { int a[3]; return a[0]; }
+-int main(void) { return f(); }
+-#elif defined test_local_struct
+-static int f(void) { struct S s; return s.a; }
+-int main(void) { return f(); }
+-#elif defined test_local_pointer
+-static int f(void) { int *p; return p == 0; }
+-int main(void) { return f(); }
+-#elif defined test_global_int
+-int g;
+-int main(void) { return g; }
+-#elif defined test_static_global
+-static int sg;
+-int main(void) { return sg; }
+-#elif defined test_static_local
+-static int f(void) { static int sl; return sl; }
+-int main(void) { return f(); }
+-#elif defined test_for_init
+-static int f(void) { int n = 0; for (int k; k < 1; k++) n++; return n; }
+-int main(void) { return f(); }
+-#elif defined test_ok
+-extern int e;
+-typedef int myint;
+-struct S2 { int a; };
+-int g = 0;
+-static int sg = 0;
+-int array[3] = {1, 2, 3};
+-struct S s = {0};
+-int main(void)
+-{
+-    int x = 0;
+-    int y = 1, z = 2;
+-    int a[2] = {0};
+-    int *p = 0;
+-    struct S ls = {0};
+-    static int sl = 0;
+-    myint m = 3;
+-    extern int le;
+-    for (int k = 0; k < 1; k++) x += k;
+-    if (x + y + z + a[0] + (p == 0) + ls.a + sl + m + g + sg + array[0]
+-        + s.a != 8)
+-        return 1;
+-    return 0;
+-}
+-#elif defined test_vla_ok
+-int main(void)
+-{
+-    int n = 3;
+-    int a[n];
+-    a[0] = 1;
+-    return a[0] + n - 4;
+-}
+-#else
+-int main(void) { return 0; }
+-#endif
+diff --git a/tests/tests2/165_superc_init.expect b/tests/tests2/165_superc_init.expect
+deleted file mode 100644
+index 2132239..0000000
+--- a/tests/tests2/165_superc_init.expect
++++ /dev/null
+@@ -1,30 +0,0 @@
+-[test_local_int]
+-165_superc_init.c:6: error: variable 'x' must be initialized
+-
+-[test_local_multi]
+-165_superc_init.c:9: error: variable 'y' must be initialized
+-
+-[test_local_array]
+-165_superc_init.c:12: error: variable 'a' must be initialized
+-
+-[test_local_struct]
+-165_superc_init.c:15: error: variable 's' must be initialized
+-
+-[test_local_pointer]
+-165_superc_init.c:18: error: variable 'p' must be initialized
+-
+-[test_global_int]
+-165_superc_init.c:21: error: variable 'g' must be initialized
+-
+-[test_static_global]
+-165_superc_init.c:24: error: variable 'sg' must be initialized
+-
+-[test_static_local]
+-165_superc_init.c:27: error: variable 'sl' must be initialized
+-
+-[test_for_init]
+-165_superc_init.c:30: error: variable 'k' must be initialized
+-
+-[test_ok]
+-
+-[test_vla_ok]
+diff --git a/tests/tests2/166_superc_pkg_dot.c b/tests/tests2/166_superc_pkg_dot.c
+deleted file mode 100644
+index 2111b47..0000000
+--- a/tests/tests2/166_superc_pkg_dot.c
++++ /dev/null
+@@ -1,62 +0,0 @@
+-/* superc extension: 'pkg.member' explicit package access */
+-#include <stdio.h>
+-
+-package math {
+-    int counter = 0;
+-    int add(int a, int b) { return a + b; }
+-    /* inside 'package math' the qualified spelling needs no import */
+-    int twice(int a) { return math.add(a, a); }
+-    struct Point { int x, y; };
+-    struct Point origin = {3, 4};
+-    int bump(void) { return ++counter; }
+-}
+-
+-/* 'import' is allowed inside a package block and names the rest of it */
+-package text {
+-    import math;
+-    int len(const char *s)
+-    {
+-        int n = 0;
+-        while (s[n])
+-            n++;
+-        return n;
+-    }
+-    int len_plus(int k) { return len("ab") + math.add(k, 1); }
+-}
+-
+-import math;
+-import text;
+-
+-/* a qualified package function is an ordinary symbol: its address works */
+-int (*add_ref)(int, int) = math.add;
+-
+-int main(void)
+-{
+-    /* qualified access, mixed with unqualified access from 'import' */
+-    printf("add=%d %d\n", math.add(2, 3), add(4, 5));
+-    printf("twice=%d len=%d\n", math.twice(21), text.len("hello"));
+-    printf("len_plus=%d\n", text.len_plus(1));
+-
+-    /* package globals: read, address-of and assignment */
+-    printf("counter=%d\n", math.counter);
+-    printf("bump=%d\n", math.bump());
+-    printf("bump=%d\n", math.bump());
+-    math.counter = 10;
+-    printf("counter=%d\n", math.counter);
+-    printf("origin=%d,%d\n", math.origin.x, math.origin.y);
+-    *&math.origin.x = 8;
+-    printf("origin=%d\n", math.origin.x);
+-    printf("add_ref=%d\n", add_ref(20, 22));
+-
+-    /* the mangled spelling keeps working and names the same object */
+-    math__counter = 42;
+-    printf("mangled=%d %d\n", math__add(10, 20), math__counter);
+-
+-    /* a visible object wins over the package name: plain C member access */
+-    {
+-        struct Point math = {7, 8};
+-        printf("shadow=%d\n", math.x);
+-    }
+-
+-    return 0;
+-}
+diff --git a/tests/tests2/166_superc_pkg_dot.expect b/tests/tests2/166_superc_pkg_dot.expect
+deleted file mode 100644
+index 21a8a57..0000000
+--- a/tests/tests2/166_superc_pkg_dot.expect
++++ /dev/null
+@@ -1,12 +0,0 @@
+-add=5 9
+-twice=42 len=5
+-len_plus=4
+-counter=0
+-bump=1
+-bump=2
+-counter=10
+-origin=3,4
+-origin=8
+-add_ref=42
+-mangled=30 42
+-shadow=7
+diff --git a/tests/tests2/167_superc_pkg_dot_errors.c b/tests/tests2/167_superc_pkg_dot_errors.c
+deleted file mode 100644
+index 3ade96e..0000000
+--- a/tests/tests2/167_superc_pkg_dot_errors.c
++++ /dev/null
+@@ -1,34 +0,0 @@
+-/* superc extension: diagnostics for 'pkg.member' */
+-package math {
+-    int counter = 0;
+-    int add(int a, int b) { return a + b; }
+-}
+-
+-#if defined test_not_imported
+-int main(void) { return math.add(1, 2); }
+-#elif defined test_not_imported_multi
+-package acme { package util { int f(void) { return 1; } } }
+-int main(void) { return acme.util.f(); }
+-#elif defined test_parent_only_import
+-package acme { package util { int f(void) { return 1; } } }
+-import acme;
+-int main(void) { return acme.util.f(); }
+-#elif defined test_unknown_member
+-import math;
+-int main(void) { return math.nope; }
+-#elif defined test_unknown_member_call
+-import math;
+-int main(void) { return math.nope(1, 2); }
+-#elif defined test_missing_member_name
+-import math;
+-int main(void) { return math.; }
+-#elif defined test_arrow_is_not_package_access
+-import math;
+-int main(void) { return math->add(1, 2); }
+-#elif defined test_import_after_use
+-int main(void) { return math.add(1, 2); }
+-import math;
+-#else
+-import math;
+-int main(void) { return math.add(1, 2) == 3 ? 0 : 1; }
+-#endif
+diff --git a/tests/tests2/167_superc_pkg_dot_errors.expect b/tests/tests2/167_superc_pkg_dot_errors.expect
+deleted file mode 100644
+index eae9555..0000000
+--- a/tests/tests2/167_superc_pkg_dot_errors.expect
++++ /dev/null
+@@ -1,24 +0,0 @@
+-[test_not_imported]
+-167_superc_pkg_dot_errors.c:8: error: 'math' is not an imported package (use 'import math;')
+-
+-[test_not_imported_multi]
+-167_superc_pkg_dot_errors.c:11: error: 'acme.util' is not an imported package (use 'import acme.util;')
+-
+-[test_parent_only_import]
+-167_superc_pkg_dot_errors.c:15: error: 'acme.util' is not an imported package (use 'import acme.util;')
+-
+-[test_unknown_member]
+-167_superc_pkg_dot_errors.c:18: error: 'math.nope' undeclared
+-
+-[test_unknown_member_call]
+-167_superc_pkg_dot_errors.c:21: warning: implicit declaration of function 'math.nope'
+-tcc: error: unresolved reference to 'math__nope'
+-
+-[test_missing_member_name]
+-167_superc_pkg_dot_errors.c:24: error: identifier expected after '.'
+-
+-[test_arrow_is_not_package_access]
+-167_superc_pkg_dot_errors.c:27: error: 'math' undeclared
+-
+-[test_import_after_use]
+-167_superc_pkg_dot_errors.c:29: error: 'math' is not an imported package (use 'import math;')
+diff --git a/tests/tests2/168+_superc_pkg_dot_tu.c b/tests/tests2/168+_superc_pkg_dot_tu.c
+deleted file mode 100644
+index 5d49a97..0000000
+--- a/tests/tests2/168+_superc_pkg_dot_tu.c
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/* superc extension: definitions for 168_superc_pkg_dot_tu.c */
+-package math {
+-    int counter = 0;
+-    int add(int a, int b) { return a + b; }
+-    int bump(void) { return ++counter; }
+-}
+diff --git a/tests/tests2/168_superc_pkg_dot_tu.c b/tests/tests2/168_superc_pkg_dot_tu.c
+deleted file mode 100644
+index eb256f4..0000000
+--- a/tests/tests2/168_superc_pkg_dot_tu.c
++++ /dev/null
+@@ -1,21 +0,0 @@
+-/* superc extension: 'pkg.member' across translation units.
+-   This file plays the part of a header: it declares the package API with
+-   'pkg.member' and lets the other unit provide the symbols. */
+-#include <stdio.h>
+-
+-package math {
+-    int add(int a, int b);
+-    int bump(void);
+-    extern int counter;
+-}
+-
+-import math;
+-
+-int main(void)
+-{
+-    printf("add=%d\n", math.add(2, 3));
+-    math.counter = 5;
+-    printf("counter=%d\n", math.counter);
+-    printf("bump=%d\n", math.bump());
+-    return 0;
+-}
+diff --git a/tests/tests2/168_superc_pkg_dot_tu.expect b/tests/tests2/168_superc_pkg_dot_tu.expect
+deleted file mode 100644
+index eea48cc..0000000
+--- a/tests/tests2/168_superc_pkg_dot_tu.expect
++++ /dev/null
+@@ -1,3 +0,0 @@
+-add=5
+-counter=5
+-bump=6
+diff --git a/tests/tests2/169_superc_method.c b/tests/tests2/169_superc_method.c
+deleted file mode 100644
+index 17b86dd..0000000
+--- a/tests/tests2/169_superc_method.c
++++ /dev/null
+@@ -1,93 +0,0 @@
+-/* superc extension: struct methods, 'ret f(struct T *self, ...)' */
+-#include <stdio.h>
+-
+-void __tcc_err_clear(void);
+-
+-struct Vec { int x, y; };
+-struct Pair { int a, b; };
+-
+-/* a method is an ordinary function whose first parameter is the receiver */
+-int vec_sum(struct Vec *v) { return v->x + v->y; }
+-
+-/* a method can call other methods of the same receiver */
+-int vec_twice(struct Vec *v) { return v->vec_sum() * 2; }
+-
+-/* a structure return puts the hidden receiver after the sret buffer */
+-struct Pair vec_pair(struct Vec *v)
+-{
+-    struct Pair p = { v->x * 2, v->y * 3 };
+-    return p;
+-}
+-
+-/* a real field wins over a method of the same name */
+-struct Holder { int v; int area; };
+-int holder_area(struct Holder *h) { return h->v * 2; }
+-
+-/* a prototype is enough: the type may still be incomplete */
+-struct Node;
+-int node_depth(struct Node *n);
+-struct Node { int d; };
+-int node_depth(struct Node *n) { return n->d; }
+-
+-/* methods defined inside a package are still found by their bare name */
+-package shape {
+-    int scaled(struct Vec *v, int k) { return vec_sum(v) * k; }
+-    int vec_area(struct Vec *v) { return v->x * v->y; }
+-}
+-
+-/* 'T!error' methods work through the receiver syntax as well */
+-int!error vec_checked(struct Vec *v)
+-{
+-    if (v->x < 0)
+-        err(1, "negative x");
+-    return v->x;
+-}
+-
+-/* 'try' propagates an error raised through the receiver syntax */
+-int!error checked_times_ten(struct Vec *v)
+-{
+-    return (try v->vec_checked()) * 10;
+-}
+-
+-static int probe(struct Vec *v)
+-{
+-    int x = checked_times_ten(v) catch e {
+-        printf("caught=%d:%s\n", e.id, e.msg);
+-        return -1;
+-    };
+-    return x;
+-}
+-
+-import shape;
+-
+-int main(void)
+-{
+-    struct Vec v = { 3, 4 };
+-    struct Vec *p = &v;
+-    struct Pair q = p->vec_pair();
+-    struct Holder h = { 5, 99 };
+-    struct Node n = { 7 };
+-
+-    printf("sum=%d twice=%d\n", p->vec_sum(), p->vec_twice());
+-    printf("pair=%d,%d\n", q.a, q.b);
+-    printf("field=%d plain=%d\n", h.area, holder_area(&h));
+-    printf("depth=%d\n", (&n)->node_depth());
+-    printf("pkg=%d area=%d\n", p->scaled(10), p->vec_area());
+-
+-    /* the method is still an ordinary function */
+-    printf("plain=%d %d\n", vec_sum(p), shape.vec_area(p));
+-
+-    /* 'impl' is a plain identifier now */
+-    {
+-        int impl = 1;
+-        printf("impl=%d\n", impl);
+-    }
+-
+-    /* a fallible method, handled with 'catch' */
+-    printf("probe=%d\n", probe(p));
+-    p->x = -1;
+-    printf("probe=%d\n", probe(p));
+-    p->x = 3;
+-    __tcc_err_clear();
+-    return 0;
+-}
+diff --git a/tests/tests2/169_superc_method.expect b/tests/tests2/169_superc_method.expect
+deleted file mode 100644
+index 3a22f1b..0000000
+--- a/tests/tests2/169_superc_method.expect
++++ /dev/null
+@@ -1,10 +0,0 @@
+-sum=7 twice=14
+-pair=6,12
+-field=99 plain=10
+-depth=7
+-pkg=70 area=12
+-plain=7 12
+-impl=1
+-probe=30
+-caught=1:negative x
+-probe=-1
+diff --git a/tests/tests2/170_superc_method_errors.c b/tests/tests2/170_superc_method_errors.c
+deleted file mode 100644
+index 51b8dec..0000000
+--- a/tests/tests2/170_superc_method_errors.c
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/* superc extension: diagnostics for struct methods */
+-struct Vec { int x, y; };
+-
+-int vec_sum(struct Vec *v) { return v->x + v->y; }
+-
+-#if defined test_method_without_call
+-int main(void)
+-{
+-    struct Vec v = { 1, 2 };
+-    struct Vec *p = &v;
+-    return p->vec_sum;
+-}
+-#elif defined test_duplicate_method
+-package a { int area(struct Vec *v) { return v->x; } }
+-package b { int area(struct Vec *v) { return v->y; } }
+-int main(void) { return 0; }
+-#elif defined test_field_takes_precedence
+-struct Holder { int v; int vec_sum; };
+-int main(void)
+-{
+-    struct Holder h = { 1, 2 };
+-    struct Holder *p = &h;
+-    return p->vec_sum == 2 ? 0 : 1;     /* a field, not a method */
+-}
+-#elif defined test_value_receiver_needs_arrow
+-int main(void)
+-{
+-    struct Vec v = { 1, 2 };
+-    return v.vec_sum();         /* only '->' is a method call */
+-}
+-#elif defined test_unknown_member
+-int main(void)
+-{
+-    struct Vec v = { 1, 2 };
+-    struct Vec *p = &v;
+-    return p->nope;
+-}
+-#else
+-int main(void)
+-{
+-    struct Vec v = { 1, 2 };
+-    struct Vec *p = &v;
+-    return p->vec_sum() == 3 ? 0 : 1;
+-}
+-#endif
+diff --git a/tests/tests2/170_superc_method_errors.expect b/tests/tests2/170_superc_method_errors.expect
+deleted file mode 100644
+index 12761a2..0000000
+--- a/tests/tests2/170_superc_method_errors.expect
++++ /dev/null
+@@ -1,13 +0,0 @@
+-[test_method_without_call]
+-170_superc_method_errors.c:11: error: method 'vec_sum' must be called
+-
+-[test_duplicate_method]
+-170_superc_method_errors.c:15: error: duplicate method 'area' for 'Vec'
+-
+-[test_field_takes_precedence]
+-
+-[test_value_receiver_needs_arrow]
+-170_superc_method_errors.c:29: error: field not found: vec_sum
+-
+-[test_unknown_member]
+-170_superc_method_errors.c:36: error: field not found: nope
+diff --git a/tests/tests2/171+_superc_method_tu.c b/tests/tests2/171+_superc_method_tu.c
+deleted file mode 100644
+index 86ca433..0000000
+--- a/tests/tests2/171+_superc_method_tu.c
++++ /dev/null
+@@ -1,5 +0,0 @@
+-/* superc extension: definitions for 171_superc_method_tu.c */
+-struct Vec { int x, y; };
+-
+-int vec_sum(struct Vec *v) { return v->x + v->y; }
+-int vec_scale(struct Vec *v, int k) { return v->vec_sum() * k; }
+diff --git a/tests/tests2/171_superc_method_tu.c b/tests/tests2/171_superc_method_tu.c
+deleted file mode 100644
+index 94c1f5e..0000000
+--- a/tests/tests2/171_superc_method_tu.c
++++ /dev/null
+@@ -1,20 +0,0 @@
+-/* superc extension: a method declared in this unit, defined in another */
+-#include <stdio.h>
+-
+-struct Vec { int x, y; };
+-
+-/* the prototype alone makes the call syntax available */
+-int vec_sum(struct Vec *v);
+-int vec_scale(struct Vec *v, int k);
+-
+-int main(void)
+-{
+-    struct Vec v = { 3, 4 };
+-    struct Vec *p = &v;
+-
+-    printf("sum=%d scaled=%d\n", p->vec_sum(), p->vec_scale(10));
+-
+-    /* still an ordinary function */
+-    printf("plain=%d\n", vec_sum(p));
+-    return 0;
+-}
+diff --git a/tests/tests2/171_superc_method_tu.expect b/tests/tests2/171_superc_method_tu.expect
+deleted file mode 100644
+index 28dd046..0000000
+--- a/tests/tests2/171_superc_method_tu.expect
++++ /dev/null
+@@ -1,2 +0,0 @@
+-sum=7 scaled=70
+-plain=7
+diff --git a/tests/tests2/172+_superc_plain_interop.c b/tests/tests2/172+_superc_plain_interop.c
+deleted file mode 100644
+index 33f61d6..0000000
+--- a/tests/tests2/172+_superc_plain_interop.c
++++ /dev/null
+@@ -1,5 +0,0 @@
+-/* built for plain C (no -std=tcc-ext): the package exports are ordinary
+-   symbols, so declaring the mangled name is enough to call them. */
+-int math__add(int a, int b);
+-
+-int plain_double(int x) { return math__add(x, x); }
+diff --git a/tests/tests2/172_superc_plain_interop.c b/tests/tests2/172_superc_plain_interop.c
+deleted file mode 100644
+index e4ad9f1..0000000
+--- a/tests/tests2/172_superc_plain_interop.c
++++ /dev/null
+@@ -1,24 +0,0 @@
+-/* superc extension: an extension unit calling into a unit built for plain C.
+-   The package symbols stay ordinary C symbols, so a plain unit can provide
+-   them and can call the exported ones. */
+-#include <stdio.h>
+-
+-package math {
+-    int add(int a, int b);
+-}
+-
+-import math;
+-
+-/* provided by 172+_superc_plain_interop.c, compiled without -std=tcc-ext */
+-int plain_double(int x);
+-
+-int main(void)
+-{
+-    printf("add=%d\n", math.add(2, 3));
+-    printf("plain_double=%d\n", plain_double(21));
+-    return 0;
+-}
+-
+-package math {
+-    int add(int a, int b) { return a + b; }
+-}
+diff --git a/tests/tests2/172_superc_plain_interop.expect b/tests/tests2/172_superc_plain_interop.expect
+deleted file mode 100644
+index dd3dff3..0000000
+--- a/tests/tests2/172_superc_plain_interop.expect
++++ /dev/null
+@@ -1,2 +0,0 @@
+-add=5
+-plain_double=42
+diff --git a/tests/tests2/173_superc_pkg_multi.c b/tests/tests2/173_superc_pkg_multi.c
+deleted file mode 100644
+index 9a3d4e2..0000000
+--- a/tests/tests2/173_superc_pkg_multi.c
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/* superc extension: multi-level package names are purely lexical.
+-   'acme.util' is just the prefix 'acme__util'; nothing here looks at
+-   directories or file names. */
+-#include <stdio.h>
+-
+-package acme.util {
+-    int counter = 0;
+-    int add(int a, int b) { return a + b; }
+-    /* inside the package the qualified spelling needs no import */
+-    int twice(int a) { return acme.util.add(a, a); }
+-}
+-
+-/* nested blocks compose their prefixes: 'acme' + 'util' */
+-package acme {
+-    package util {
+-        int len(const char *s)
+-        {
+-            int n = 0;
+-            while (s[n])
+-                n++;
+-            return n;
+-        }
+-    }
+-}
+-
+-/* the file-level form names the rest of the file: 'acme.crc' */
+-package acme.crc;
+-int sum(int a, int b) { return a + b; }
+-
+-import acme.util;
+-import acme.crc;
+-
+-int main(void)
+-{
+-    printf("add=%d twice=%d\n", acme.util.add(2, 3), acme.util.twice(21));
+-    printf("len=%d\n", acme.util.len("hello"));
+-    printf("sum=%d\n", acme.crc.sum(20, 22));
+-
+-    /* the mangled names are the very same ordinary symbols */
+-    printf("mangled=%d %d\n", acme__util__add(1, 2), acme__crc__sum(3, 4));
+-
+-    acme.util.counter = 7;
+-    printf("counter=%d\n", acme.util.counter);
+-    return 0;
+-}
+diff --git a/tests/tests2/173_superc_pkg_multi.expect b/tests/tests2/173_superc_pkg_multi.expect
+deleted file mode 100644
+index ca5cc5b..0000000
+--- a/tests/tests2/173_superc_pkg_multi.expect
++++ /dev/null
+@@ -1,5 +0,0 @@
+-add=5 twice=42
+-len=5
+-sum=42
+-mangled=3 7
+-counter=7
+diff --git a/tests/tests2/174+_superc_iface_tu.c b/tests/tests2/174+_superc_iface_tu.c
+deleted file mode 100644
+index 956190f..0000000
+--- a/tests/tests2/174+_superc_iface_tu.c
++++ /dev/null
+@@ -1,19 +0,0 @@
+-/* superc extension: definitions for 174_superc_iface_tu.c.
+-   This unit converts the very same struct to the very same interface, so
+-   it emits its own copy of the vtable. */
+-interface Shape {
+-    int area();
+-}
+-
+-struct Circle { int r; };
+-
+-package shapes {
+-    int area(struct Circle *self) { return self->r * self->r; }
+-}
+-
+-int area_via_vt(struct Circle *c)
+-{
+-    Shape s = { 0 };
+-    s = *c;
+-    return s.area();
+-}
+diff --git a/tests/tests2/174_superc_iface_tu.c b/tests/tests2/174_superc_iface_tu.c
+deleted file mode 100644
+index c319ed5..0000000
+--- a/tests/tests2/174_superc_iface_tu.c
++++ /dev/null
+@@ -1,30 +0,0 @@
+-/* superc extension: an interface used from two translation units.
+-   Each unit declares the interface itself and converts the same struct,
+-   so each gets its own (static) vtable object. */
+-#include <stdio.h>
+-
+-interface Shape {
+-    int area();
+-}
+-
+-struct Circle { int r; };
+-
+-/* implemented in 174+_superc_iface_tu.c */
+-package shapes {
+-    int area(struct Circle *self);
+-}
+-import shapes;
+-
+-int area_via_vt(struct Circle *c);
+-
+-static int use(Shape s) { return s.area(); }
+-
+-int main(void)
+-{
+-    struct Circle c = { 4 };
+-    Shape s = { 0 };
+-
+-    s = c;
+-    printf("area=%d again=%d other=%d\n", s.area(), use(c), area_via_vt(&c));
+-    return 0;
+-}
+diff --git a/tests/tests2/174_superc_iface_tu.expect b/tests/tests2/174_superc_iface_tu.expect
+deleted file mode 100644
+index 46e25f6..0000000
+--- a/tests/tests2/174_superc_iface_tu.expect
++++ /dev/null
+@@ -1 +0,0 @@
+-area=16 again=16 other=16
+diff --git a/tests/tests2/175_superc_slice.c b/tests/tests2/175_superc_slice.c
+deleted file mode 100644
+index 11f8a11..0000000
+--- a/tests/tests2/175_superc_slice.c
++++ /dev/null
+@@ -1,119 +0,0 @@
+-/* superc extension: slices 'T[:]' */
+-#include <stdio.h>
+-
+-struct Pair { int a, b; };
+-typedef int Row[3];                 /* an array element type needs a name */
+-
+-/* a slice is passed by value and may be returned */
+-int sum(int[:] s)
+-{
+-    int i = 0, total = 0;
+-    for (i = 0; i < (int)s.len; i++)
+-        total += s[i];
+-    return total;
+-}
+-
+-int[:] tail(int[:] s)
+-{
+-    return s[1:];
+-}
+-
+-/* a slice can be a struct member */
+-struct Holder { int[:] s; };
+-
+-int holder_sum(struct Holder *h)
+-{
+-    return sum(h->s);
+-}
+-
+-package view {
+-    int first(int[:] s) { return s.len > 0 ? s[0] : -1; }
+-}
+-import view;
+-
+-int main(void)
+-{
+-    int a[5] = { 10, 20, 30, 40, 50 };
+-    int[:] s = a;
+-    int i = 0;
+-
+-    /* array to slice, .len and .data, plain indexing */
+-    printf("len=%d s0=%d s4=%d\n", (int)s.len, s[0], s[4]);
+-    printf("data=%d\n", s.data == a);
+-
+-    /* writes go through to the array and vice versa */
+-    s[0] = 99;
+-    a[1] = 21;
+-    printf("a0=%d s1=%d\n", a[0], s[1]);
+-
+-    /* ranges: [lo:hi], [lo:], [:hi], [:] */
+-    {
+-        int[:] t = a[1:4];
+-        int[:] u = t[1:];
+-        int[:] v = s[:2];
+-        int[:] w = t[:];
+-        printf("t=%d,%d,%d u=%d,%d v=%d w=%d\n",
+-               (int)t.len, t[0], t[2], (int)u.len, u[0], (int)v.len, (int)w.len);
+-    }
+-
+-    /* an empty range is legal */
+-    printf("empty=%d\n", (int)s[2:2].len);
+-
+-    /* slices through functions */
+-    printf("sum=%d tail=%d,%d\n", sum(s), (int)tail(s).len, tail(s)[0]);
+-
+-    /* slices in structs and packages */
+-    {
+-        struct Holder h = { s[2:4] };
+-        printf("holder=%d pkg=%d\n", holder_sum(&h), view.first(h.s));
+-    }
+-
+-    /* an array of slices */
+-    {
+-        int[:] parts[2] = { s[0:2], s[2:4] };
+-        printf("parts=%d,%d,%d\n", (int)parts[0].len, parts[0][1], parts[1][0]);
+-    }
+-
+-    /* a pointer to a slice */
+-    {
+-        int[:] *p = &s;
+-        printf("ptr=%d,%d\n", (int)p->len, (*p)[3]);
+-    }
+-
+-    /* element types: struct, char (string literal), array via typedef */
+-    {
+-        struct Pair pairs[3] = { {1, 2}, {3, 4}, {5, 6} };
+-        struct Pair[:] ps = pairs;
+-        ps[1].a = 30;
+-        printf("pairs=%d,%d,%d\n", ps[1].a, ps[2].b, (int)ps.len);
+-    }
+-    {
+-        char[:] m = "hello";
+-        printf("str=%d,%c,%c\n", (int)m.len, m[0], m[4]);
+-    }
+-    {
+-        int grid[2][3] = { {1, 2, 3}, {4, 5, 6} };
+-        Row[:] rows = grid;
+-        printf("rows=%d,%d,%d\n", (int)rows.len, rows[0][1], rows[1][2]);
+-    }
+-
+-    /* a compound literal builds a slice from a pointer and a length */
+-    {
+-        int[:] lit = (int[:]){ a + 2, 2 };
+-        printf("lit=%d,%d,%d\n", (int)lit.len, lit[0], lit[1]);
+-    }
+-
+-    /* sizeof: the slice is two machine words, an element is a plain object */
+-    printf("sizes=%d,%d,%d\n", (int)sizeof(int[:]),
+-           (int)sizeof(s[0]), (int)sizeof(s.len));
+-
+-    /* loops, side effects in the index, re-slicing */
+-    for (i = 0; i < (int)s.len; i++)
+-        s[i] += 1;
+-    printf("bumped=%d,%d\n", a[0], a[4]);
+-    {
+-        int j = 1;
+-        printf("post=%d j=%d\n", s[j++], j);
+-    }
+-    return 0;
+-}
+diff --git a/tests/tests2/175_superc_slice.expect b/tests/tests2/175_superc_slice.expect
+deleted file mode 100644
+index 514e542..0000000
+--- a/tests/tests2/175_superc_slice.expect
++++ /dev/null
+@@ -1,16 +0,0 @@
+-len=5 s0=10 s4=50
+-data=1
+-a0=99 s1=21
+-t=3,21,40 u=2,30 v=2 w=3
+-empty=0
+-sum=240 tail=4,21
+-holder=70 pkg=30
+-parts=2,21,30
+-ptr=5,40
+-pairs=30,6,3
+-str=6,h,o
+-rows=2,2,6
+-lit=2,30,40
+-sizes=16,4,8
+-bumped=100,51
+-post=22 j=2
+diff --git a/tests/tests2/176_superc_slice_errors.c b/tests/tests2/176_superc_slice_errors.c
+deleted file mode 100644
+index 3a176f3..0000000
+--- a/tests/tests2/176_superc_slice_errors.c
++++ /dev/null
+@@ -1,82 +0,0 @@
+-/* superc extension: diagnostics for slices 'T[:]' */
+-struct S;
+-
+-#if defined test_void_element
+-void f(void[:] s);
+-int main(void) { return 0; }
+-#elif defined test_incomplete_element
+-void f(struct S[:] s);
+-int main(void) { return 0; }
+-#elif defined test_local_element
+-int main(void)
+-{
+-    struct Local { int a; };
+-    struct Local l = { 1 };
+-    struct Local[:] s = &l;
+-    return 0;
+-}
+-#elif defined test_error_element
+-void f(error[:] s);
+-int main(void) { return 0; }
+-#elif defined test_element_mismatch
+-int main(void)
+-{
+-    int a[2] = { 1, 2 };
+-    char[:] s = a;
+-    return 0;
+-}
+-#elif defined test_pointer_source
+-int main(void)
+-{
+-    int a[2] = { 1, 2 };
+-    int *p = a;
+-    int[:] s = p;
+-    return 0;
+-}
+-#elif defined test_vla_source
+-int main(void)
+-{
+-    int n = 3;
+-    int a[n];
+-    int[:] s = a;
+-    return 0;
+-}
+-#elif defined test_pointer_slice
+-int main(void)
+-{
+-    int a[2] = { 1, 2 };
+-    int *p = a;
+-    return p[0:1] != 0;
+-}
+-#elif defined test_capacity
+-int main(void)
+-{
+-    int a[2] = { 1, 2 };
+-    int[:] s = a;
+-    return (int)s[0:1:2].len;
+-}
+-#elif defined test_file_scope_array
+-int a[3] = { 1, 2, 3 };
+-int[:] g = a;
+-int main(void) { return 0; }
+-#elif defined test_uninitialized
+-int main(void)
+-{
+-    int[:] s;
+-    return 0;
+-}
+-#elif defined test_slice_to_int
+-int main(void)
+-{
+-    int a[2] = { 1, 2 };
+-    int[:] s = a;
+-    return (int)s;
+-}
+-#else
+-int main(void)
+-{
+-    int a[3] = { 1, 2, 3 };
+-    int[:] s = a[1:];
+-    return (int)s.len == 2 && s[0] == 2 ? 0 : 1;
+-}
+-#endif
+diff --git a/tests/tests2/176_superc_slice_errors.expect b/tests/tests2/176_superc_slice_errors.expect
+deleted file mode 100644
+index 3db4cd7..0000000
+--- a/tests/tests2/176_superc_slice_errors.expect
++++ /dev/null
+@@ -1,35 +0,0 @@
+-[test_void_element]
+-176_superc_slice_errors.c:5: error: '[:]' cannot have a 'void' element type
+-
+-[test_incomplete_element]
+-176_superc_slice_errors.c:8: error: '[:]' requires a complete element type, not 'struct S'
+-
+-[test_local_element]
+-176_superc_slice_errors.c:15: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
+-
+-[test_error_element]
+-176_superc_slice_errors.c:19: error: 'error' can only be a return type, not a slice element
+-
+-[test_element_mismatch]
+-176_superc_slice_errors.c:25: error: cannot make a slice of 'char' from an array of 'int'
+-
+-[test_pointer_source]
+-176_superc_slice_errors.c:33: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
+-
+-[test_vla_source]
+-176_superc_slice_errors.c:41: error: cannot slice a variable length array
+-
+-[test_pointer_slice]
+-176_superc_slice_errors.c:49: error: cannot slice a pointer; use '(T[:]){p, n}'
+-
+-[test_capacity]
+-176_superc_slice_errors.c:56: error: slice bounds have no capacity
+-
+-[test_file_scope_array]
+-176_superc_slice_errors.c:60: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
+-
+-[test_uninitialized]
+-176_superc_slice_errors.c:65: error: variable 's' must be initialized
+-
+-[test_slice_to_int]
+-176_superc_slice_errors.c:73: error: cannot convert 'int[:]' to 'int'
+diff --git a/tests/tests2/177+_superc_slice_tu.c b/tests/tests2/177+_superc_slice_tu.c
+deleted file mode 100644
+index ac9e583..0000000
+--- a/tests/tests2/177+_superc_slice_tu.c
++++ /dev/null
+@@ -1,18 +0,0 @@
+-/* superc extension: definitions for 177_superc_slice_tu.c */
+-int sum(int[:] s)
+-{
+-    int i = 0, total = 0;
+-    for (i = 0; i < (int)s.len; i++)
+-        total += s[i];
+-    return total;
+-}
+-
+-int[:] tail(int[:] s)
+-{
+-    return s[1:];
+-}
+-
+-int first(int[:] s)
+-{
+-    return s.len > 0 ? s[0] : -1;
+-}
+diff --git a/tests/tests2/177_superc_slice_tu.c b/tests/tests2/177_superc_slice_tu.c
+deleted file mode 100644
+index 72795dc..0000000
+--- a/tests/tests2/177_superc_slice_tu.c
++++ /dev/null
+@@ -1,23 +0,0 @@
+-/* superc extension: a slice API shared by two translation units.
+-   Each unit declares 'int[:]' itself; the layout is the same on both
+-   sides, so no extra declaration is needed. */
+-#include <stdio.h>
+-
+-/* defined in 177+_superc_slice_tu.c */
+-int sum(int[:] s);
+-int[:] tail(int[:] s);
+-int first(int[:] s);
+-
+-int main(void)
+-{
+-    int a[5] = { 1, 2, 3, 4, 5 };
+-    int[:] s = a;
+-    int[:] t = tail(s);
+-
+-    printf("sum=%d first=%d\n", sum(s), first(s));
+-    printf("tail=%d,%d,%d\n", (int)t.len, t[0], t[t.len - 1]);
+-
+-    /* a slice made in this unit, consumed by the other one */
+-    printf("sum2=%d\n", sum(a[1:3]));
+-    return 0;
+-}
+diff --git a/tests/tests2/177_superc_slice_tu.expect b/tests/tests2/177_superc_slice_tu.expect
+deleted file mode 100644
+index 11f85ee..0000000
+--- a/tests/tests2/177_superc_slice_tu.expect
++++ /dev/null
+@@ -1,3 +0,0 @@
+-sum=15 first=1
+-tail=4,2,5
+-sum2=5
+diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
+index 931a1b6..83933e6 100644
+--- a/tests/tests2/Makefile
++++ b/tests/tests2/Makefile
+@@ -77,43 +77,6 @@ ifneq (-$(ARCH)-$(CONFIG_WIN32)-,-arm64-yes-)
+  SKIP += 145_winarm64_interlocked.test
+ endif
+ 
+-# superc language extension tests: they need a TCC_EXT build and are
+-# always run with '-std=tcc-ext' (gcc cannot compile them, so the
+-# .expect files are committed)
+-SUPERC_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_superc_*.c))))
+-# the compiler itself decides whether the extensions are compiled in
+-SUPERC_OK := $(shell echo | $(TCC_LOCAL) -std=tcc-ext -dD -E - 2>/dev/null | grep -q __TCC_EXT__ && echo yes)
+-ifneq (,$(SUPERC_OK))
+- $(SUPERC_TESTS): FLAGS += -std=tcc-ext
+- # gcc cannot build them, so their .expect files come from tcc itself
+- $(SUPERC_TESTS): GEN = $(GEN-TCC)
+- 158_superc_test.test: FLAGS += -test
+- 162_superc_iface_errors.test: FLAGS += -dt
+- 164_superc_try_errors.test: FLAGS += -dt
+- 165_superc_init.test: FLAGS += -dt
+- 167_superc_pkg_dot_errors.test: FLAGS += -dt
+- 170_superc_method_errors.test: FLAGS += -dt
+- 176_superc_slice_errors.test: FLAGS += -dt
+- # these compile a second file before '-run'
+- 168_superc_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
+- 168_superc_pkg_dot_tu.test: GEN = $(GEN-TCC)
+- 171_superc_method_tu.test: FLAGS += $(subst 171,171+,$1)
+- 171_superc_method_tu.test: GEN = $(GEN-TCC)
+- 174_superc_iface_tu.test: FLAGS += $(subst 174,174+,$1)
+- 174_superc_iface_tu.test: GEN = $(GEN-TCC)
+- 177_superc_slice_tu.test: FLAGS += $(subst 177,177+,$1)
+- 177_superc_slice_tu.test: GEN = $(GEN-TCC)
+- # 172 mixes an extension unit with a unit built for plain C
+- 172_superc_plain_interop.test: NORUN = true
+- 172_superc_plain_interop.test: GEN = $(GEN-TCC)
+- 172_superc_plain_interop.test: T1 = \
+-     $(TCC) -std=tcc-ext -c $(SRC)/172_superc_plain_interop.c -o $*-ext.o && \
+-     $(TCC) -c $(SRC)/172+_superc_plain_interop.c -o $*-plain.o && \
+-     $(TCC) $*-ext.o $*-plain.o -o $*.exe && ./$*.exe
+-else
+- SKIP += $(SUPERC_TESTS)
+-endif
+-
+ # Some tests might need arguments
+ ARGS =
+ 31_args.test : ARGS = arg1 arg2 arg3 arg4 arg5

@@ -27,9 +27,9 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 ├── docs/grammar.md   扩展语法的 BNF/EBNF 规范
 ├── patches/          superc 扩展补丁（相对上游固定基线）
 ├── scripts/          bootstrap.sh：生成并搭建 TCC 工作树
-├── tests/test.c      自测：用 superc 的 test 块覆盖 defer/err/try/catch
+├── tests/            superc 全部自测：*.c 是 test 块，errors/ 是编译期诊断
 ├── examples/         可运行示例（err_demo.c、try_demo.c、slice_demo.c）
-├── Makefile          便捷入口（bootstrap / build / test / selftest / clean）
+├── Makefile          便捷入口（bootstrap / build / selftest / test / clean）
 └── tcc/              TCC 源码树（由 bootstrap.sh 生成，不纳入本仓库）
 ```
 
@@ -449,29 +449,73 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 
 ## 测试
 
-`tests/test.c` 用 superc 的 `test` 块自测 `defer` / `err` / `try` / `catch` 的语义：
+superc 的测试全部在 `tests/` 下，都用 superc 自己的 `test` 块写：
+
+```
+tests/
+├── run-tests.sh      运行器（make selftest 调它）
+├── defer.c           defer 的时机、顺序与作用域
+├── err.c             err / errdefer / 清理顺序
+├── try.c             try / catch
+├── test-block.c      test 块与 -test 模式本身
+├── macro.c           #macro 与 __local 名字卫生
+├── package.c         package / import / pkg.member
+├── method.c          结构体方法
+├── interface.c       结构化接口
+├── slice.c           切片
+├── tu/               跨翻译单元的第二个 .c（同名的主文件会一起编译）
+└── errors/           编译期诊断（每个片段一个 -D 开关）
+```
 
 ```sh
-make selftest                            # 跑 tests/test.c
-./tcc/tcc -B tcc -std=tcc-ext -test tests/test.c
-./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=errdefer tests/test.c   # 按描述过滤
+make selftest                       # 跑全部
+tests/run-tests.sh                  # 同上
+tests/run-tests.sh slice package    # 只跑这几个
+tests/run-tests.sh --list           # 列出会跑的文件
+```
+
+单个文件也可以直接跑：
+
+```sh
+./tcc/tcc -B tcc -std=tcc-ext -test tests/err.c
+./tcc/tcc -B tcc -std=tcc-ext -test tests/slice.c tests/tu/slice.c
+./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=切片 tests/slice.c   # 按描述过滤
 ```
 
 输出形如：
 
 ```
-PASS: err 写入错误码与消息并返回 -1
-PASS: errdefer 只在错误路径执行
+ok   err: 18 test(s), 0 failure(s)
+ok   errors/slice: 12 个诊断片段
 ...
-21 test(s), 0 failure(s)
+run-tests: 15 通过, 0 失败
 ```
 
 `-test` 模式下 `main` 可有可无（运行器不调用它）。
 
-更完整的回归：
+### 编译期诊断怎么写
+
+`tests/errors/*.c` 用 `#if defined <片段名>` 把每个报错场景放在一个片段里，
+用注释声明该片段必须产生的诊断，不需要维护行号：
+
+```c
+// EXPECT test_void_element: error: '[:]' cannot have a 'void' element type
+
+#if defined test_void_element
+void f(void[:] s);
+int main(void) { return 0; }
+#else
+int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
+#endif
+```
+
+运行器为每个 `EXPECT` 片段跑一次 `-D<片段>`，检查 stderr 含声明的文本，
+再检查不带 `-D` 时该文件能编译并运行通过。
+
+### 完整回归
 
 ```sh
-make test          # 扩展模式：tests/tests2 全量（含 156..177 的 superc 专项测试）
+make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 TCC_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make test-all      # selftest + tests2
 ```

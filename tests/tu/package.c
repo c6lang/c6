@@ -1,0 +1,15 @@
+/* tests/package.c 的第二个翻译单元：remote 包的实现。
+ *
+ * 包成员就是普通的 C 全局符号，所以另一个 TU 只要声明出来就能用。
+ */
+package remote {
+    int counter = 0;
+    int add(int a, int b) { return a + b; }
+    int bump(void) { return ++counter; }
+}
+
+/* 纯 C 代码：包成员导出为普通符号，声明 mangled 名字就能调用，
+   完全不需要 -std=tcc-ext。 */
+int math__add(int a, int b);
+
+int plain_double(int x) { return math__add(x, x); }

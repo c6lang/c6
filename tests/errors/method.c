@@ -1,0 +1,55 @@
+/* superc 编译期诊断：结构体方法
+ *
+ * 每个片段单独用 -D<片段名> 编译（tests/run-errors.sh 驱动），
+ * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
+ * 不带任何 -D 时是本文件的“正常路径”，必须编译通过。
+ */
+struct Vec { int x, y; };
+
+int vec_sum(struct Vec *v) { return v->x + v->y; }
+
+// EXPECT test_method_without_call: error: method 'vec_sum' must be called
+// EXPECT test_duplicate_method: error: duplicate method 'area' for 'Vec'
+// EXPECT test_value_receiver_needs_arrow: error: field not found: vec_sum
+// EXPECT test_unknown_member: error: field not found: nope
+
+#if defined test_method_without_call
+int main(void)
+{
+    struct Vec v = { 1, 2 };
+    struct Vec *p = &v;
+    return p->vec_sum;
+}
+#elif defined test_duplicate_method
+package a { int area(struct Vec *v) { return v->x; } }
+package b { int area(struct Vec *v) { return v->y; } }
+int main(void) { return 0; }
+#elif defined test_field_takes_precedence
+struct Holder { int v; int vec_sum; };
+int main(void)
+{
+    struct Holder h = { 1, 2 };
+    struct Holder *p = &h;
+    return p->vec_sum == 2 ? 0 : 1;     /* 字段优先于方法 */
+}
+#elif defined test_value_receiver_needs_arrow
+int main(void)
+{
+    struct Vec v = { 1, 2 };
+    return v.vec_sum();         /* 只有 '->' 才是方法调用 */
+}
+#elif defined test_unknown_member
+int main(void)
+{
+    struct Vec v = { 1, 2 };
+    struct Vec *p = &v;
+    return p->nope;
+}
+#else
+int main(void)
+{
+    struct Vec v = { 1, 2 };
+    struct Vec *p = &v;
+    return p->vec_sum() == 3 ? 0 : 1;
+}
+#endif

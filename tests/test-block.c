@@ -1,0 +1,94 @@
+/* superc 自测：test 块与 -test 模式本身
+ *
+ * 运行（仓库根目录）：
+ *   make selftest
+ * 或单个文件：
+ *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/test-block.c
+ *   ./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=算术 tests/test-block.c
+ */
+#include <stdio.h>
+#include <string.h>
+
+int __tcc_err_flag_get(void);
+void __tcc_err_clear(void);
+
+static char logbuf[128] = {0};
+static int loglen = 0;
+
+static void lg_reset(void)
+{
+    loglen = 0;
+    logbuf[0] = '\0';
+}
+
+static void lg(const char *s)
+{
+    while (*s && loglen < (int)sizeof(logbuf) - 2)
+        logbuf[loglen++] = *s++;
+    logbuf[loglen] = '\0';
+}
+
+#define LG_IS(s) (0 == strcmp(logbuf, (s)))
+
+/* 被 test 块调用的辅助函数：失败经 try 传回 test 块 */
+static int!error helper(int x)
+{
+    if (x < 0)
+        err(5, "negative");
+    return x * 2;
+}
+
+test "算术" {
+    if (1 + 1 != 2)
+        err(1, "1 + 1 != 2");
+}
+
+test "test 块里可以使用 defer" {
+    int n = 0;
+    {
+        defer n++;
+        n += 2;
+    }
+    if (n != 3)
+        err(1, "defer 没有执行");
+}
+
+test "正常路径不执行 errdefer" {
+    errdefer lg("not-reached");
+    if (0)
+        err(1, "不会到这里");
+}
+
+test "test 块里可以使用字符串与循环" {
+    int i = 0, sum = 0;
+    const char *s = "abcd";
+    for (i = 0; s[i]; i++)
+        sum += s[i];
+    if (sum != 'a' + 'b' + 'c' + 'd')
+        err(1, "求和不对");
+}
+
+test "test 块里可以 try 辅助函数" {
+    if ((try helper(3)) != 6)
+        err(1, "helper(3) != 6");
+    helper(-1) catch e {
+        if (e.id != 5)
+            err(2, "错误码不对");
+        return 0;           /* 处理掉：本 test 块照样通过 */
+    };
+    err(3, "helper 没有失败");
+}
+
+test "test 块之间的状态是共享的" {
+    lg_reset();
+    lg("x");
+    if (!LG_IS("x"))
+        err(1, "日志没有写进去");
+}
+
+/* -test 模式下 main 不会被调用 */
+int main(void)
+{
+    printf("main should not run\n");
+    return 0;
+}

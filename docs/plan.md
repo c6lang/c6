@@ -500,12 +500,32 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`superc_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `superc_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`superc_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`superc_slice_spill`（把基值落到本地 `{data, len}` 对）、`superc_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
 
-验收测试：`tcc/tests/tests2/156_superc_defer.c` … `177_superc_slice_tu.c`，由
-`tests/tests2/Makefile` 自动加 `-std=tcc-ext`；未编译 `-DTCC_EXT` 时自动 SKIP
-（以 `__TCC_EXT__` 预定义探测）。`make -C tests/tests2 tests2.all` 两种构建下
-分别为 156 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
+测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：superc 的
+测试一律用 superc 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
+比对 stdout，改一行输出就得重生成期望文件）。
 
-根目录自测（`tests/test.c`，21 个 test 块）：`make selftest`。
+| 位置 | 内容 |
+|---|---|
+| `tests/defer.c` | defer 的时机、顺序、`break`/`continue`/`goto`/`return`、递归 |
+| `tests/err.c` | `err` / `errdefer` 与清理顺序、错误槽 |
+| `tests/try.c` | `try` / `catch`，含 `goto` 离开、嵌套传播、`void!error` |
+| `tests/test-block.c` | `test` 块、`-test`、`-test-filter` |
+| `tests/macro.c` | `#macro` 与卫生的 `__local` |
+| `tests/package.c` | `package` / `import` / `pkg.member`、多级包名、跨 TU |
+| `tests/method.c` | 结构体方法与 `T!error` 方法 |
+| `tests/interface.c` | 接口、vtable、隐式/显式转换、跨 TU |
+| `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
+| `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
+| `tests/errors/*.c` | 编译期诊断，见下 |
+
+`tests/run-tests.sh`（`make selftest`）先对每个 `tests/*.c` 跑一次
+`-test`，若存在同名 `tests/tu/<name>.c` 就一起编译成两个 TU；再对
+`tests/errors/*.c` 的每个 `// EXPECT <片段>: <诊断>` 注释跑一次
+`-D<片段>`，要求 stderr 含该诊断，并要求不带 `-D` 时该文件能编译运行通过。
+诊断测试因此不需要维护行号。
+
+`make test` / `make test-plain` 仍旧跑上游 `tests/tests2` 全量（134 项），
+两种构建下都全过——superc 不再往 tests2 里加用例。
 
 已知限制（与设计一致）：
 
@@ -533,8 +553,8 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 - VLA 是初始化规则的唯一豁免：标准 C 不允许 `int a[n] = …`，所以 VLA 仍可
   不带初始化器；
 - 这条规则是**按翻译单元**生效的：不加 `-std=tcc-ext` 的旧代码零变化
-  （plain 构建下 tests2 仍 134 项全过）；给某个 TU 开启扩展后，该 TU 内
-  所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
+  （plain 构建下 tests2 仍 134 项全过，superc 的自测在 `tests/` 单独跑）；
+  给某个 TU 开启扩展后，该 TU 内所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
   全局/`static` 对象放进 `.data`（不写初始化器时在 `.bss`），因此给大型
   静态缓冲区补初始化器会增大输出文件；
 - `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）；
