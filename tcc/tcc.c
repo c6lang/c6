@@ -73,7 +73,11 @@ static const char help[] =
     "  -bt[N]       link with backtrace (stack dump) support [show max N callers]\n"
 #endif
     "Misc. options:\n"
+#ifdef C6_EXT
+    "  -std=version define __STDC_VERSION__ according to version (c11/gnu11/c6)\n"
+#else
     "  -std=version define __STDC_VERSION__ according to version (c11/gnu11)\n"
+#endif
     "  -x[c|a|b|n]  specify type of the next infile (C,ASM,BIN,NONE)\n"
     "  -Bdir        set tcc's private include/library dir\n"
     "  -M[M]D       generate make dependency file [ignore system files]\n"
