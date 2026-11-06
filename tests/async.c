@@ -13,6 +13,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/* 只用到这三个 libc 函数（不给 libtcc1 添依赖） */
+int pipe(int *fds);
+int read(int fd, void *buf, int len);
+int write(int fd, const void *buf, int len);
+
 /* ---- 日志（按执行顺序拼接） ---- */
 static char logbuf[128] = {0};
 static int loglen = 0;
@@ -31,6 +36,14 @@ static void lg(const char *s)
 }
 
 #define LG_IS(s) (0 == strcmp(logbuf, (s)))
+
+static void lgc(char c)
+{
+    if (loglen < (int)sizeof(logbuf) - 2) {
+        logbuf[loglen++] = c;
+        logbuf[loglen] = '\0';
+    }
+}
 
 /* ---- 被测的 async 函数 ---- */
 
@@ -222,3 +235,285 @@ test "任务槽会被回收，超过池容量也能跑" {
         __c6_co_destroy(t);
     }
 }
+
+/* ---- task / go ---- */
+
+static int pipe_a[2] = {0, 0};
+static int pipe_b[2] = {0, 0};
+
+/* 每个任务等自己的 fd 就绪，跑的顺序能从日志里看出来 */
+async int on_fd(int fd, int id)
+{
+    char buf[2] = {0};
+    int rev = 0;
+    lgc((char)('a' + id));
+    rev = await c6_io(fd, C6_CO_EV_READ);
+    if (rev > 0)
+        read(fd, buf, 1);
+    lgc((char)('A' + id));
+    return rev;
+}
+
+async int next_id(int i)
+{
+    return await add(i, 1);
+}
+
+/* go 写在 async 体里也必须是顶层任务：handler 挂起时它照样往前跑 */
+async int wait_own(void)
+{
+    char buf[2] = {0};
+    int rev = 0;
+    lgc('g');
+    rev = await c6_io(pipe_b[0], C6_CO_EV_READ);
+    if (rev > 0)
+        read(pipe_b[0], buf, 1);
+    lgc('G');
+    return rev;
+}
+
+async int wait_other(void)
+{
+    char buf[2] = {0};
+    int rev = await c6_io(pipe_a[0], C6_CO_EV_READ);
+    if (rev > 0)
+        read(pipe_a[0], buf, 1);
+    return rev;
+}
+
+async int spawner(void)
+{
+    go wait_own();
+    lgc('h');
+    await wait_other();
+    lgc('H');
+    return 3;
+}
+
+async int!error failing(void)
+{
+    err(9, "failing task");
+}
+
+test "task 声明的句柄能拿到返回值" {
+    task t = add(20, 22);
+    if (__c6_co_wait(t) != 0)
+        err(1, "驱动失败");
+    if (t->val != 42)
+        err(2, "task 句柄的值不对");
+}
+
+test "一行多个 task 声明" {
+    task a = add(1, 2), b = add(3, 4);
+    if (__c6_co_wait(a) != 0 || __c6_co_wait(b) != 0)
+        err(1, "驱动失败");
+    if (a->val != 3 || b->val != 7)
+        err(2, "多个 task 声明的值不对");
+}
+
+test "task 句柄在作用域退出时自动回收（超过池容量）" {
+    int i = 0;
+    for (i = 0; i < 200; i++) {
+        task h = next_id(i);
+        if (__c6_co_wait(h) != 0)
+            err(1, "驱动失败");
+        if (h->val != i + 1)
+            err(2, "自动回收后的返回值不对");
+    }
+}
+
+test "go 立刻跑到第一个 await 点" {
+    int fds[2] = {0, 0};
+    char one = 'x';
+    char buf[2] = {0};
+    if (pipe(fds))
+        err(1, "pipe 失败");
+    write(fds[1], &one, 1);
+    lg_reset();
+    go on_fd(fds[0], 0);        /* 日志里应立刻出现 'a' */
+    if (!LG_IS("a"))
+        err(2, "go 没有在语句处先跑到第一个 await");
+    __c6_co_run();              /* 这里才继续跑完 */
+    if (!LG_IS("aA"))
+        err(3, "go 的任务没有被调度器推进完");
+    (void)buf;
+}
+
+test "多个 go 会被轮转推进（真交替，不是顺序跑完）" {
+    char one = 'x';
+    if (pipe(pipe_a) || pipe(pipe_b))
+        err(1, "pipe 失败");
+    write(pipe_a[1], &one, 1);
+    write(pipe_b[1], &one, 1);
+    lg_reset();
+    go on_fd(pipe_a[0], 0);
+    go on_fd(pipe_b[0], 1);
+    /* 两个都停在第一个 await 上 */
+    if (!LG_IS("ab"))
+        err(2, "两个 go 的首步顺序不对");
+    __c6_co_run();
+    /* 顺序是后进先出：b 先被推进一步，然后 a —— 关键是两者交叉（abBA），
+       而不是把某一个直接跑完（那会是 abBB… 之类） */
+    if (!LG_IS("abBA"))
+        err(3, "两个 go 不是交替推进的");
+}
+
+test "go 写在 async 体里也是顶层任务" {
+    char one = 'x';
+    if (pipe(pipe_a) || pipe(pipe_b))
+        err(1, "pipe 失败");
+    write(pipe_a[1], &one, 1);
+    write(pipe_b[1], &one, 1);
+    lg_reset();
+    {
+        task h = spawner();
+        if (__c6_co_wait(h) != 0)
+            err(1, "驱动失败");
+        if (h->val != 3)
+            err(2, "spawner 的返回值不对");
+    }
+    /* g: go 的首步；h: 继续往下；G: handler 挂起期间 go 出去的顶层任务
+       被推进；H: handler 恢复 */
+    if (!LG_IS("ghGH"))
+        err(3, "go 出去的协程不是顶层的（被外层挂起冻结了）");
+}
+
+test "go 不产生值，但 __c6_co_run 会报告失败的任务数" {
+    int i = 0;
+    for (i = 0; i < 40; i++)         /* 每个都在首步完成并回收 */
+        go next_id(i);
+    if (__c6_co_run() != 0)
+        err(1, "成功的 go 不该被计为失败");
+    go failing();
+    go failing();
+    if (__c6_co_run() != 2)
+        err(2, "__c6_co_run 没有报告失败的 go 任务");
+}
+
+/* ---- task 句柄的回收路径 ---- */
+
+async int!error fail_after_task(int id)
+{
+    task h = add(id, 2);
+    if (__c6_co_wait(h) != 0)
+        err(1, "wait");
+    err(43, "async 体里失败");
+}
+
+static int!error plain_fail(int id)
+{
+    task h = add(id, 1);
+    if (__c6_co_wait(h) != 0)
+        err(1, "wait");
+    err(42, "普通函数里失败");
+    return h->val;
+}
+
+/* 从非 fallible 函数里观察错误码：catch 体必须以 return/err/goto 结束 */
+static int call_plain_fail(int id)
+{
+    int v = plain_fail(id) catch e {
+        return e.id;
+    };
+    return v;
+}
+
+async int!error return_after_task(int id)
+{
+    task h = add(id, 3);
+    if (__c6_co_wait(h) != 0)
+        err(1, "wait");
+    return h->val;
+}
+
+async int wait_bad_fd(void)
+{
+    return await c6_io(-1, C6_CO_EV_READ);
+}
+
+/* 句柄落在帧槽里，跨挂起必须还在 */
+async int handle_across_park(void)
+{
+    char b[2] = {0};
+    int rev = 0;
+    task h = add(20, 22);
+    rev = await c6_io(pipe_a[0], C6_CO_EV_READ);
+    if (rev > 0)
+        read(pipe_a[0], b, 1);
+    if (__c6_co_wait(h) != 0)
+        return -1;
+    return h->val;
+}
+
+async int in_defer_body(void)
+{
+    int bad = 0;
+    defer {
+        task q = add(2, 3);
+        if (__c6_co_wait(q) != 0 || q->val != 5)
+            bad = 1;
+    }
+    return bad;
+}
+
+test "task 句柄在 err / return 路径上都会被回收（超过池容量）" {
+    int i = 0;
+    for (i = 0; i < 300; i++) {
+        if (call_plain_fail(i) != 42)
+            err(1, "普通函数的错误路径没有拿到错误码");
+    }
+    for (i = 0; i < 300; i++) {
+        task t = fail_after_task(i);
+        if (__c6_co_wait(t) != -1)
+            err(2, "async 体里的 err 没有让任务以失败结束");
+    }
+    for (i = 0; i < 300; i++) {
+        task t = return_after_task(i);
+        if (__c6_co_wait(t) != 0)
+            err(3, "驱动失败");
+        if (t->val != i + 3)
+            err(4, "return 之前句柄就被清掉了");
+    }
+}
+
+test "task 句柄跨挂起保持有效" {
+    int i = 0;
+    char one = 'x';
+    if (pipe(pipe_a))
+        err(1, "pipe 失败");
+    write(pipe_a[1], &one, 1);
+    for (i = 0; i < 50; i++) {
+        task t = handle_across_park();
+        if (__c6_co_wait(t) != 0)
+            err(2, "驱动失败");
+        if (t->val != 42)
+            err(3, "帧槽里的句柄在挂起后失效了");
+        write(pipe_a[1], &one, 1);
+    }
+}
+
+test "task / go 写在 defer 体里也能工作" {
+    {
+        task d = in_defer_body();
+        if (__c6_co_wait(d) != 0 || d->val != 0)
+            err(1, "defer 体里的 task 没跑通");
+    }
+    {
+        defer {
+            go add(1, 1);
+        }
+    }
+    if (__c6_co_run() != 0)
+        err(2, "defer 体里 go 出去的任务失败");
+}
+
+test "c6_io 的 fd 不合法时任务被计为失败并回收" {
+    go wait_bad_fd();
+    if (__c6_co_run() != 1)
+        err(1, "非法 fd 的任务没有被计为失败");
+    go wait_bad_fd();
+    go wait_bad_fd();
+    if (__c6_co_run() != 2)
+        err(2, "非法 fd 的任务没有被回收");
+}
+

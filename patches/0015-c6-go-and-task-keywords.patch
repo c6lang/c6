@@ -1,0 +1,648 @@
+From 62b0ebdf5a5b127e5a6fcf3039133894c0531f14 Mon Sep 17 00:00:00 2001
+From: c6 <c6@localhost>
+Date: Sat, 7 Nov 2026 02:29:55 +0800
+Subject: [PATCH] c6: 'go' and 'task' keywords for top-level coroutines
+
+'go f(a);' starts a top-level coroutine: it runs synchronously from the 'go'
+statement up to the first point where it really has to wait, then returns to
+the next statement.  A task that is finished by then is released on the spot,
+so a loop of short 'go' calls does not fill the pool.
+
+'task t = f(a);' keeps the handle; it is __c6_co_destroy'd when the enclosing
+scope exits, reusing the defer machinery, so return/err/break release it too.
+
+Both are real keywords (no more variables named go/task), both require an
+'async' callee -- 'go' on a plain function reports that stackful coroutines
+are not implemented yet.  An 'async' function can no longer be a method, and
+'err' inside an async body now ends the task with KIND_ERR instead of
+returning the sentinel to the scheduler.
+
+The scheduler grows a top-level ready list with round-robin stepping and one
+select() for all parked leaves: __tcc_co_spawn / tcc_co_pump / __c6_co_run.
+A leaf whose fd is not ready stays parked instead of waking with rev 0; a
+leaf whose fd select() cannot wait for at all fails the task instead of
+parking it forever; and the resume point after a suspension is emitted with
+code generation on again (it was silently suppressing the awaited value).
+---
+ lib/libtcc1.c | 255 ++++++++++++++++++++++++++++++++++++++++++++------
+ tccgen.c      | 187 +++++++++++++++++++++++++++++++++++-
+ tccpp.c       |   7 +-
+ tcctok.h      |   2 +
+ 4 files changed, 420 insertions(+), 31 deletions(-)
+
+diff --git a/lib/libtcc1.c b/lib/libtcc1.c
+index 45f6195..ec0378c 100644
+--- a/lib/libtcc1.c
++++ b/lib/libtcc1.c
+@@ -858,9 +858,11 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
+ /* An 'async' function is compiled to 'int __c6_body_NAME(void *task)'.  The */
+ /* body runs on the caller's stack; every suspension ("await" that has to    */
+ /* wait) copies the used part of the native frame into the task and returns  */
+-/* to whoever drives the task (__c6_co_wait).  Resuming re-enters the body,  */
+-/* copies the saved frame back to the same offsets and jumps to the recorded */
+-/* resume point.  Task objects live in this file so that 'struct __c6_task'  */
++/* to whoever drives the task.  Resuming re-enters the body, copies the      */
++/* saved frame back to the same offsets and jumps to the recorded resume      */
++/* point.  'go f();' makes a coroutine top-level: it is put on the ready list */
++/* below and stepped by tcc_co_pump(), which is the scheduler.  Task objects   */
++/* live in this file so that 'struct __c6_task'                              */
+ /* has exactly the layout that tcc_predefs() declares to compiled programs;  */
+ /* generated code only ever touches it through the __c6_co_* accessors.      */
+ 
+@@ -886,6 +888,9 @@ typedef struct TccCoTask {
+     void *desc, *frame, *defer_arena, *parent, *child;
+     const char *err_msg;
+     int frame_size, __pad1;
++    void *snext;                /* next task on the top-level ready list */
++    int busy;                   /* currently being stepped (re-entrancy) */
++    int waiting;                /* parked on wait_fd, waiting for select() */
+ } TccCoTask;
+ 
+ typedef struct TccCoDesc {
+@@ -903,6 +908,10 @@ static char tcc_co_frames[C6_CO_MAX][C6_CO_FRAME_MAX];
+ static TccDeferRec tcc_co_parked[C6_CO_MAX][C6_CO_DEFER_MAX];
+ static char tcc_co_live[C6_CO_MAX];
+ 
++/* Top-level coroutines started with 'go': they belong to no scope and to no
++   parent, so the scheduler below owns them from creation to completion. */
++static void *tcc_co_runlist;
++
+ extern int select(int, void *, void *, void *, void *);
+ 
+ static void tcc_co_trap(void)
+@@ -1096,42 +1105,230 @@ static int tcc_co_select(int fd, int ev)
+     return rev;
+ }
+ 
+-/* Drive the task tree rooted at SELF until it finishes: 0 = done, -1 = the
+-   root raised an error (the error slot of the root still holds it). */
++/* 'go' wants "run until you have to wait" and nothing more specific */
++#define C6_CO_KIND_SKIP   4
++
++void __c6_co_destroy(void *self);
++
++static TccCoTask *tcc_co_leaf(TccCoTask *t)
++{
++    while (t->child && ((TccCoTask *)t->child)->state != C6_CO_STATE_DONE)
++        t = (TccCoTask *)t->child;
++    return t;
++}
++
++static void tcc_co_link(TccCoTask **head, TccCoTask *t)
++{
++    t->snext = *head;
++    *head = t;
++}
++
++static void tcc_co_unlink(TccCoTask **head, TccCoTask *t)
++{
++    while (*head) {
++        if (*head == t) {
++            *head = (TccCoTask *)t->snext;
++            t->snext = 0;
++            return;
++        }
++        head = (TccCoTask **)&(*head)->snext;
++    }
++}
++
++/* Run one step of the leaf of T: call its body until it suspends or ends.
++   Never blocks.  Returns the kind the body reported, or C6_CO_KIND_SKIP when
++   there is nothing to do right now (re-entered, or parked on its fd and the
++   caller has not waited for it yet). */
++static int tcc_co_step_once(TccCoTask *t)
++{
++    TccCoTask *leaf = tcc_co_leaf(t);
++    TccCoDesc *d;
++    int k;
++
++    if (leaf->state == C6_CO_STATE_DONE)
++        return C6_CO_KIND_DONE;
++    if (leaf->busy)
++        return C6_CO_KIND_SKIP;         /* re-entered from a nested pump */
++    if (leaf->waiting)
++        return C6_CO_KIND_IO;           /* still parked on wait_fd */
++    d = (TccCoDesc *)leaf->desc;
++    leaf->busy++;
++    k = d->entry(leaf);
++    leaf->busy--;
++    switch (k) {
++    case C6_CO_KIND_DONE:
++    case C6_CO_KIND_ERR:
++        leaf->state = C6_CO_STATE_DONE;
++        leaf->kind = k;
++        break;
++    case C6_CO_KIND_IO:
++        leaf->waiting = 1;              /* the pump has to select() for it */
++        break;
++    case C6_CO_KIND_CHILD:
++        break;
++    default:
++        tcc_co_trap();
++    }
++    return k;
++}
++
++/* One round over the top-level ready list: step every task once, then wait for
++   whatever is parked on a descriptor and hand each one its readiness mask.
++   Finished tasks are released here; ERRS, when not NULL, collects how many of
++   them ended with 'err'.  Returns 0, or -1 when select() failed. */
++static int tcc_co_pump(int *errs)
++{
++    unsigned long r[16], w[16], e[16];
++    int fds[C6_CO_MAX], evs[C6_CO_MAX];
++    TccCoTask *leafs[C6_CO_MAX];
++    TccCoTask *t, **pp;
++
++    for (;;) {
++        int nio = 0, maxfd = -1, ran = 0, i;
++
++        pp = (TccCoTask **)&tcc_co_runlist;
++        while ((t = *pp) != 0) {
++            int k;
++
++            if (t->state == C6_CO_STATE_DONE) {
++                *pp = (TccCoTask *)t->snext;
++                t->snext = 0;
++                if (errs && t->kind == C6_CO_KIND_ERR)
++                    (*errs)++;
++                __c6_co_destroy(t);
++                continue;
++            }
++            k = tcc_co_step_once(t);
++            if (k == C6_CO_KIND_IO && nio < C6_CO_MAX) {
++                TccCoTask *leaf = tcc_co_leaf(t);
++                int fd = leaf->wait_fd;
++                if (fd >= 0 && fd < 1024) {
++                    fds[nio] = fd;
++                    evs[nio] = leaf->wait_ev;
++                    leafs[nio] = leaf;
++                    nio++;
++                    if (fd > maxfd)
++                        maxfd = fd;
++                } else {
++                    /* c6_io() with an fd select() cannot wait for: fail the
++                       task and release it, like __c6_co_wait() returning -1.
++                       Leaving it in the list would park it forever. */
++                    *pp = (TccCoTask *)t->snext;
++                    t->snext = 0;
++                    if (errs)
++                        (*errs)++;
++                    __c6_co_destroy(t);
++                    continue;
++                }
++            } else if (k != C6_CO_KIND_SKIP) {
++                ran = 1;
++            }
++            pp = (TccCoTask **)&t->snext;
++        }
++        if (!nio) {
++            if (!ran)
++                return 0;               /* nothing left to do */
++            continue;                   /* someone made progress: go again */
++        }
++        for (i = 0; i < 16; i++)
++            r[i] = w[i] = e[i] = 0;
++        for (i = 0; i < nio; i++) {
++            if (evs[i] & 1)
++                r[fds[i] >> 6] |= 1UL << (fds[i] & 63);
++            if (evs[i] & 2)
++                w[fds[i] >> 6] |= 1UL << (fds[i] & 63);
++        }
++        if (select(maxfd + 1, r, w, e, (void *)0) <= 0)
++            return -1;
++        for (i = 0; i < nio; i++) {
++            int rev = 0;
++            if (r[fds[i] >> 6] & (1UL << (fds[i] & 63)))
++                rev |= 1;
++            if (w[fds[i] >> 6] & (1UL << (fds[i] & 63)))
++                rev |= 2;
++            if (!rev)
++                continue;           /* not this one yet: keep it parked */
++            leafs[i]->wait_rev = rev;
++            leafs[i]->waiting = 0;
++        }
++    }
++}
++
++/* Failures of tasks that finished inside the 'go' statement itself: they are
++   already gone by the time anyone can call __c6_co_run(), so the count has to
++   be remembered here. */
++static int tcc_co_eager_errs;
++
++/* 'go f();' : make T a top-level coroutine and run it up to its first real
++   suspension (or to completion), then return to the 'go' statement.  A task
++   that is already finished has no observer and no handle, so it is released
++   right here -- otherwise a loop of non-suspending 'go' calls would fill the
++   task pool. */
++void __tcc_co_spawn(void *task)
++{
++    TccCoTask *t = (TccCoTask *)task;
++
++    if (!t)
++        return;
++    t->parent = 0;
++    tcc_co_link((TccCoTask **)&tcc_co_runlist, t);
++    /* Run it until it has to wait for a descriptor: awaiting a child is not
++       waiting, so keep descending.  A task that is finished by the time the
++       'go' statement returns has no handle and no observer, so it is released
++       here -- otherwise a loop of short 'go' calls would fill the pool. */
++    for (;;) {
++        int k = tcc_co_step_once(t);
++        if (k == C6_CO_KIND_IO || k == C6_CO_KIND_SKIP)
++            break;                      /* the pump waits for the fd */
++        if (t->state == C6_CO_STATE_DONE) {
++            tcc_co_unlink((TccCoTask **)&tcc_co_runlist, t);
++            if (t->kind == C6_CO_KIND_ERR)
++                tcc_co_eager_errs++;
++            __c6_co_destroy(t);
++            break;
++        }
++        /* KIND_CHILD: step the awaited child next */
++    }
++}
++
++/* Drain the top-level ready list; returns how many tasks ended with 'err'. */
++int __c6_co_run(void)
++{
++    int errs = tcc_co_eager_errs;
++
++    tcc_co_eager_errs = 0;
++    if (tcc_co_pump(&errs) < 0)
++        return -1;
++    return errs;
++}
++
++/* Drive the task tree rooted at SELF until it finishes, letting the top-level
++   coroutines make progress in between: 0 = done, -1 = error. */
+ int __c6_co_wait(void *self)
+ {
+-    TccCoTask *root = (TccCoTask *)self;
++    int ignored;
+ 
++    if (!self)
++        return -1;
+     for (;;) {
+-        TccCoTask *t = root;
+-        TccCoDesc *d;
++        TccCoTask *root = (TccCoTask *)self;
+         int k;
+ 
+-        while (t->child && ((TccCoTask *)t->child)->state != C6_CO_STATE_DONE)
+-            t = (TccCoTask *)t->child;
+-        if (t == root && t->state == C6_CO_STATE_DONE)
+-            return t->kind == C6_CO_KIND_ERR ? -1 : 0;
+-        d = (TccCoDesc *)t->desc;
+-        k = d->entry(t);
+-        switch (k) {
+-        case C6_CO_KIND_DONE:
+-        case C6_CO_KIND_ERR:
+-            t->state = C6_CO_STATE_DONE;
+-            t->kind = k;
++        if (root->state == C6_CO_STATE_DONE)
+             break;
+-        case C6_CO_KIND_IO: {
+-            int rev = tcc_co_select(t->wait_fd, t->wait_ev);
++        k = tcc_co_step_once(root);
++        if (k == C6_CO_KIND_IO) {
++            TccCoTask *leaf = tcc_co_leaf(root);
++            int rev = tcc_co_select(leaf->wait_fd, leaf->wait_ev);
+             if (rev < 0)
+                 return -1;
+-            t->wait_rev = rev;
+-            break;
+-        }
+-        case C6_CO_KIND_CHILD:
+-            break;
+-        default:
+-            tcc_co_trap();
++            leaf->wait_rev = rev;
++            leaf->waiting = 0;
+         }
++        if (tcc_co_pump(&ignored) < 0)
++            return -1;
+     }
++    return ((TccCoTask *)self)->kind == C6_CO_KIND_ERR ? -1 : 0;
+ }
+ 
+ /* Release a task and everything it owns.  A still-suspended body is dropped
+@@ -1139,7 +1336,6 @@ int __c6_co_wait(void *self)
+ void __c6_co_destroy(void *self)
+ {
+     TccCoTask *t = (TccCoTask *)self;
+-    int idx;
+ 
+     if (!t)
+         return;
+@@ -1147,6 +1343,7 @@ void __c6_co_destroy(void *self)
+         __c6_co_destroy(t->child);
+     t->child = 0;
+     t->parent = 0;
++    tcc_co_unlink((TccCoTask **)&tcc_co_runlist, t);
+     tcc_co_live[tcc_co_index(t)] = 0;
+ }
+ 
+diff --git a/tccgen.c b/tccgen.c
+index ccd8ca0..2efc2e7 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -264,6 +264,11 @@ static void c6_async_func_end(void);
+ static void c6_await_parse(void);
+ static void c6_async_return(void);
+ static void c6_async_await_io(Sym *s);
++static void c6_go_stmt(void);
++static void c6_task_decl(void);
++static void c6_task_check_handle(CType *t, const char *what);
++static void c6_task_defer_destroy(int slot);
++static void c6_async_propagate(void);
+ static int c6_async_cur;      /* non-zero while generating an async body */
+ static int c6_await_pending;  /* set by 'await', cleared by the call hook */
+ /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
+@@ -7806,6 +7811,9 @@ static void c6_method_register(int name, int sym_tok, CType *type)
+     tag = c6_ptr_tag(&type->ref->next->type);
+     if (!tag)
+         return;
++    if (type->ref->f.func_async)
++        tcc_error("'async' functions cannot be methods: '%s'",
++                  get_tok_str(name, NULL));
+     for (m = c6_methods; m; m = m->next) {
+         if (m->type_tag == tag && m->name == name) {
+             if (m->sym_tok == sym_tok)
+@@ -8917,6 +8925,14 @@ static void c6_errdefer_parse(void)
+ static void c6_emit_propagate(void)
+ {
+     int b, ret_off = 0, ret_saved = 0;
++#ifdef C6_EXT
++    if (c6_async_cur) {
++        /* an async body ends the task with KIND_ERR instead of returning the
++           sentinel to a caller that is the scheduler */
++        c6_async_propagate();
++        return;
++    }
++#endif
+ 
+     b = (func_vt.t & VT_BTYPE) != VT_VOID;
+     if (b) {
+@@ -9583,6 +9599,14 @@ again:
+         skip(';');
+ 
+ #ifdef C6_EXT
++    } else if (t == TOK_C6_GO || t == TOK_C6_TASK) {
++        if (!c6_ext_on())
++            tcc_error("'%s' requires -std=c6", get_tok_str(t, NULL));
++        else if (t == TOK_C6_GO)
++            c6_go_stmt();
++        else
++            c6_task_decl();
++
+     } else if (t == TOK_C6_DEFER) {
+         if (!c6_ext_on())
+             tcc_error("'defer' requires -std=c6");
+@@ -10987,6 +11011,7 @@ static int c6_async_fr_off;           /* slot of the 'void *task' parameter */
+ #define C6_CO_KIND_DONE  0
+ #define C6_CO_KIND_IO    1
+ #define C6_CO_KIND_CHILD 2
++#define C6_CO_KIND_ERR   3
+ 
+ /* '__c6_body_<name>', '__c6_desc_<name>' and '<name>_task' */
+ static int c6_async_tok(const char *prefix, int name, const char *suffix)
+@@ -11269,7 +11294,8 @@ static void c6_async_suspend(int kind)
+     vtop = vstack + vsp;
+ 
+     label = c6_new_label("co_resume");
+-    c6_def_label(label);                /* CODE_ON() at the resume point */
++    c6_def_label(label);
++    CODE_ON();                          /* the resumed code is real code */
+     site = tcc_mallocz(sizeof *site);
+     site->state = state;
+     site->label = label;
+@@ -11303,6 +11329,25 @@ static void c6_async_return(void)
+     c6_async_finish(C6_CO_KIND_DONE);
+ }
+ 
++/* 'err()' or a propagated 'try' inside an async body: park the sentinel as
++   the task value, run the deferred cleanups and end the body with KIND_ERR so
++   that the driver reports the failure and not a value. */
++static void c6_async_propagate(void)
++{
++    CType vt = c6_async_ftype.ref->type;
++
++    if ((vt.t & VT_BTYPE) != VT_VOID) {
++        c6_async_push_field(c6_async_name, "val", 0);
++        vpushi(TCC_ERR_SENTINEL);
++        vtop->type = vt;            /* '(TYPE)-1', no conversion warning */
++        vstore();
++        vpop();
++    }
++    if (defer_state.has_sites)
++        c6_defer_begin(2, 0);
++    c6_async_finish(C6_CO_KIND_ERR);
++}
++
+ /* 'await c6_io(fd, ev)': the only leaf suspension primitive */
+ static void c6_async_await_io(Sym *s)
+ {
+@@ -11545,6 +11590,8 @@ static void c6_async_definition(Sym *sym, CType *ftype)
+     body_sym = sym_find(body);
+     if (!body_sym)
+         tcc_error("internal: cannot declare '%s'", get_tok_str(body, NULL));
++    if (ftype->ref->f.func_fallible)
++        body_sym->type.ref->f.func_fallible = 1;
+ 
+     c6_async_cur = 1;
+     c6_async_name = name;
+@@ -11580,6 +11627,130 @@ static void c6_async_definition(Sym *sym, CType *ftype)
+     tok_str_add(ts, TOK_EOF);
+     c6_decl_tokens(ts);
+ }
++
++/* ---- 'go f();' and 'task t = f();' ---------------------------------- */
++
++/* Reject anything that is not the handle of an async call.  A handle is a
++   pointer to one of the generated 'struct NAME_task' structures, which always
++   begin with 'struct __c6_task head'. */
++static void c6_task_check_handle(CType *t, const char *what)
++{
++    CType *inner;
++    Sym *head, *rt;
++
++    if ((t->t & VT_BTYPE) != VT_PTR || !t->ref)
++        tcc_error("%s", what);
++    inner = pointed_type(t);
++    if ((inner->t & VT_BTYPE) != VT_STRUCT || !inner->ref)
++        tcc_error("%s", what);
++    head = c6_find_field_quiet(inner, tok_alloc_const("head") | SYM_FIELD);
++    rt = struct_find(tok_alloc_const("__c6_task"));
++    if (!head || !rt || (head->type.t & VT_BTYPE) != VT_STRUCT
++        || head->type.ref != rt)
++        tcc_error("%s", what);
++}
++
++/* Register 'defer { __c6_co_destroy(slot); }' so the handle is released when
++   the enclosing scope exits, on every path that already runs defer bodies.
++   Same registration as c6_defer_parse(), with the cleanup body emitted here
++   instead of being parsed from a statement. */
++static void c6_task_defer_destroy(int slot)
++{
++    int skip, id;
++    Sym *l;
++
++    if (!defer_state.enabled || nocode_wanted)
++        return;
++    defer_state.body_depth++;
++    id = ++defer_state.next_site;
++    l = c6_new_label("dcl");
++    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
++    vpushi(id);
++    vpushi(local_scope);
++    vpushi(0);                          /* kind: defer */
++    gfunc_call(3);
++    skip = gjmp(0);
++    c6_def_label(l);
++    CODE_ON();
++    c6_add_site(id, l);
++    defer_state.has_sites = 1;
++    c6_rt_begin("__c6_co_destroy");
++    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
++    c6_rt_end("__c6_co_destroy", 1);
++    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
++    gsym(skip);
++    defer_state.body_depth--;
++}
++
++/* 'go f(args);' : start a top-level coroutine.  It is not a child of the
++   current task and belongs to no scope, so nothing but completion releases
++   it; see __tcc_co_spawn() in libtcc1. */
++static void c6_go_stmt(void)
++{
++    CType ht;
++    int slot;
++
++    if (tok >= TOK_UIDENT) {
++        Sym *s = sym_find(tok);
++        if (s && (s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref
++            && !s->type.ref->f.func_async)
++            tcc_error("'go' on a non-async function needs stackful "
++                      "coroutines (not implemented yet)");
++    }
++    expr_eq();
++    c6_fallible_use();
++    ht = vtop->type;
++    c6_task_check_handle(&ht,
++        "the operand of 'go' must be the handle of an 'async' call");
++    /* park the handle in a frame slot so the call can push its symbol below */
++    loc = (loc - PTR_SIZE) & -PTR_SIZE;
++    slot = loc;
++    vset(&ht, VT_LOCAL | VT_LVAL, slot);
++    vswap();
++    vstore();
++    vpop();
++    c6_rt_begin("__tcc_co_spawn");
++    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
++    c6_rt_end("__tcc_co_spawn", 1);
++    skip(';');
++}
++
++/* 'task NAME = f(args), ... ;' : declare the handle and release it when the
++   enclosing scope exits.  The type comes from the initializer, which makes
++   the declaration independent of how the callee happens to be spelled. */
++static void c6_task_decl(void)
++{
++    for (;;) {
++        CType ht;
++        Sym *ls;
++        int v, align, size, slot;
++
++        if (tok < TOK_UIDENT)
++            expect("variable name");
++        v = tok;
++        next();
++        skip('=');
++        expr_eq();
++        c6_fallible_use();
++        ht = vtop->type;
++        c6_task_check_handle(&ht,
++            "the initializer of a 'task' variable must be a call of an "
++            "'async' function");
++        size = type_size(&ht, &align);
++        loc = (loc - size) & -align;
++        slot = loc;
++        ls = sym_push(v, &ht, VT_LOCAL | VT_LVAL, slot);
++        vset(&ht, VT_LOCAL | VT_LVAL, ls->c);
++        vswap();
++        vstore();
++        vpop();
++        c6_task_defer_destroy(slot);
++        if (tok != ',')
++            break;
++        next();                         /* ',' */
++    }
++    skip(';');
++}
+ #endif /* C6_EXT */
+ 
+ static void gen_function(Sym *sym)
+@@ -11899,6 +12070,20 @@ static int decl(int l)
+                 continue;
+             }
+         }
++        if (tcc_state->c6_ext
++            && (tok == TOK_C6_TASK || tok == TOK_C6_GO)) {
++            if (l != VT_LOCAL)
++                tcc_error("'%s' can only be used inside a function",
++                          get_tok_str(tok, NULL));
++            if (tok == TOK_C6_TASK) {
++                next();                 /* 'task' */
++                c6_task_decl();
++            } else {
++                next();                 /* 'go' */
++                c6_go_stmt();
++            }
++            continue;
++        }
+ #endif
+         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {
+             if (l == VT_JMP)
+diff --git a/tccpp.c b/tccpp.c
+index 44a51a5..2c6938c 100644
+--- a/tccpp.c
++++ b/tccpp.c
+@@ -3873,6 +3873,9 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
+           "    void *desc, *frame, *defer_arena, *parent, *child;\n"
+           "    const char *err_msg;\n"
+           "    int frame_size, __pad1;\n"
++          "    void *snext;               /* top-level ready list */\n"
++          "    int busy;                  /* being stepped right now */\n"
++          "    int waiting;               /* parked on wait_fd */\n"
+           "};\n"
+           "struct __c6_desc { unsigned size, align; int defer_max;\n"
+           "                   int (*entry)(void *); };\n"
+@@ -3888,6 +3891,8 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
+           "int __c6_co_rev(void *self);\n"
+           "int __c6_co_wait(void *self);\n"
+           "void __c6_co_destroy(void *self);\n"
++          "void __tcc_co_spawn(void *task);\n"
++          "int __c6_co_run(void);\n"
+           "int c6_io(int fd, int ev);\n"
+           "#define C6_CO_EV_READ  1\n"
+           "#define C6_CO_EV_WRITE 2\n"
+@@ -4005,7 +4010,7 @@ ST_FUNC void tccpp_new(TCCState *s)
+            'test' may already be interned as an asm keyword, in which
+            case the range ends before TOK_C6_TEST. */
+         int t;
+-        for (t = TOK_C6_PACKAGE; t <= TOK_C6_AWAIT && t < tok_ident; t++)
++        for (t = TOK_C6_PACKAGE; t <= TOK_C6_GO && t < tok_ident; t++)
+             tok_unintern(t);
+         if (TOK_C6_PACKAGE < tok_ident)
+             tok_ident = TOK_C6_PACKAGE;
+diff --git a/tcctok.h b/tcctok.h
+index 4e8270c..96d1a88 100644
+--- a/tcctok.h
++++ b/tcctok.h
+@@ -454,4 +454,6 @@
+      DEF(TOK_C6_CATCH,     "catch")
+      DEF(TOK_C6_ASYNC,     "async")
+      DEF(TOK_C6_AWAIT,     "await")
++     DEF(TOK_C6_TASK,      "task")
++     DEF(TOK_C6_GO,        "go")
+ #endif
