@@ -3,7 +3,9 @@
 #   1. 首次：克隆上游 TinyCC，检出固定基线（BASE_COMMIT）；
 #   2. 已有：把工作树同步到 patches/ 的当前内容——补丁增删、改名或内容
 #      修改后，回到基线重新应用全部补丁（tcc/ 是生成物，不手工编辑）；
-#   3. 依次应用 patches/*.patch；
+#   3. 依次应用 patches/*.patch：补丁按纯 diff 打上去（不重放补丁里的
+#      提交：作者、日期、提交说明都不带进来），每个补丁单独提交一次，
+#      提交说明取补丁的标题；
 #   4. 运行 ./configure 生成 config.mak。
 #
 # 是否需要同步由 tcc/.c6-stamp 判断：它记录基线提交和每个补丁文件的内容
@@ -41,17 +43,35 @@ worktree_stamp() {
     done
 }
 
+# 回到基线：补丁序列重来一遍，工作树里不留半套改动。
+reset_to_base() {
+    git -C "$TCC_DIR" reset --hard --quiet "$BASE_COMMIT"
+    git -C "$TCC_DIR" clean -fdxq
+}
+
+# 补丁标题：交给 git mailinfo 取（它顺带处理 [PATCH n/m] 前缀、折行和
+# RFC 2047 编码）。只用来给 tcc/ 里的提交起名——补丁本身是按纯 diff 应用的；
+# 纯 diff 的补丁没有标题，就退回文件名。
+patch_subject() {
+    git mailinfo /dev/null /dev/null < "$1" 2>/dev/null \
+        | sed -n 's/^Subject:[[:space:]]*//p'
+}
+
+# 一个补丁一个提交：git apply 只打 diff，提交信息由我们现写。
 apply_patches() {
     for p in "$ROOT"/patches/*.patch; do
         [ -e "$p" ] || continue
         echo "bootstrap: 应用 $(basename "$p")"
-        if ! git -C "$TCC_DIR" -c user.name=c6 -c user.email=c6@localhost \
-                am --quiet "$p"; then
+        if ! git -C "$TCC_DIR" apply --index --whitespace=nowarn "$p"; then
             echo "bootstrap: 补丁应用失败：$(basename "$p")" >&2
             echo "bootstrap: 已回滚到基线；修正补丁后重试。" >&2
-            git -C "$TCC_DIR" am --abort >/dev/null 2>&1 || true
+            reset_to_base
             return 1
         fi
+        subject=$(patch_subject "$p")
+        [ -n "$subject" ] || subject=$(basename "$p" .patch)
+        git -C "$TCC_DIR" -c user.name=c6 -c user.email=c6@localhost \
+            commit --quiet -m "$subject" -m "patch: $(basename "$p")"
     done
 }
 
@@ -100,8 +120,7 @@ if ! git -C "$TCC_DIR" rev-parse --verify --quiet "$BASE_COMMIT^{commit}" >/dev/
 fi
 
 echo "bootstrap: 同步 $TCC_DIR 到当前 $(patch_count) 个补丁（基线 $BASE_COMMIT）"
-git -C "$TCC_DIR" reset --hard --quiet "$BASE_COMMIT"
-git -C "$TCC_DIR" clean -fdxq
+reset_to_base
 apply_patches
 configure_tcc
 printf '%s\n' "$want" > "$STAMP"
