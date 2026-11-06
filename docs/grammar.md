@@ -40,7 +40,10 @@ c6-keyword =
       "package" | "import" | "interface"
     | "defer"   | "errdefer" | "err" | "test"
     | "try"     | "catch"
-    | "async"   | "await" | "go" | "task" ;
+    | "async"   | "await" ;
+
+(* 软关键字：只在语句开头、且后面紧跟一个标识符时才是关键字 *)
+c6-soft-keyword = "co" | "go" | "task" ;
 
 (* 扩展内建的错误值类型，由编译器预置的 typedef 提供，等价于
    typedef struct __tcc_error { int id; const char *msg; } error;
@@ -57,10 +60,30 @@ error-type-name = "error" ;
 位置（例如声明说明符中）它们仍可被当作标识符使用，这一点与 C 关键字
 不同，是单趟实现的已知宽松之处。`impl` 自 0010 起不再是关键字。
 
-`async`、`await`、`go`、`task` 不享受这条宽松：它们在词法阶段就是关键字，
-所以 `int go;`、`void f(int task)`、`go:` 标签都会报错（成员名不受影响：
-`struct S { int go; }; s.go` 仍然合法，因为成员查找比较的是记号值）。
-这是破坏性变更，迁移旧代码时把这几个词改名即可。
+`async`、`await` 不享受这条宽松：它们在词法阶段就是关键字，所以
+`int async;`、`int await;` 会报错（成员名不受影响：
+`struct S { int async; }; s.async` 仍然合法，因为成员查找比较的是记号值）。
+
+`co`、`go`、`task` 是**软关键字**，词法阶段仍是普通标识符，只在语句开头
+且后面紧跟一个标识符时才被当作关键字（判定发生在语句分派处，此时下一个
+记号已经在手）：
+
+```c
+int go = 1;          /* 变量：'go' 后面是 '=' */
+go = 2;              /* 赋值 */
+x = go;              /* 取值 */
+go(x);               /* 调用名为 go 的函数：后面是 '(' */
+typedef int co;      /* 类型名 */
+co v;                /* 声明：'co' 是 typedef 名，不是 co 语句 */
+task:                /* 标签：后面是 ':' */
+go f(a);             /* 语句：'go' 在语句开头且后面是标识符 -> 线程 */
+co f(a);             /* 同理 -> 顶层协程 */
+task t = f(a);       /* 同理 -> 句柄 */
+```
+
+形状相同的两个意思（局部变量 `go` 后面紧跟一个标识符、且这一行又是语句
+开头）无法区分，此时按关键字处理。`typedef` 名会让软关键字让路：
+`co` 已经被声明成类型名时，`co v;` 一定是声明。
 
 ---
 
@@ -323,54 +346,97 @@ int   c6_io(int fd, int ev);           (* 只能写成 await c6_io(fd, ev) *)
 
 约束见 C29–C33。
 
-### 3.5 go / task（顶层协程与句柄）
+### 3.5 co / task（顶层协程与句柄）
 
 ```
-go-statement     = "go" , expression , ";" ;
+co-statement     = "co" , expression , ";" ;
 task-declaration = "task" , identifier , "=" , expression ,
                    { "," , identifier , "=" , expression } , ";" ;
 ```
 
-`go` 和 `task` 是**关键字**，是使用 `async` 函数的两种方式：
+`co` 和 `task` 是使用 `async` 函数的两种方式（两者都是软关键字，见 §1）：
 
 ```
-    go worker(1);               (* 顶层、fire-and-forget：没有人等它 *)
+    co worker(1);               (* 顶层、fire-and-forget：没有人等它 *)
     task t = worker(2);         (* 把句柄留在手上 *)
 ```
 
-* `go f(a);` 建任务，并把它当成**顶层任务**（`parent == 0`）：不属于调用
+* `co f(a);` 建任务，并把它当成**顶层任务**（`parent == 0`）：不属于调用
   者，作用域结束也不回收，交给调度器；`__c6_co_run()` 把它们全部跑完，
-  返回其中以 `err` 结束的个数（在 `go` 语句里当场就跑完、当场失败的也
+  返回其中以 `err` 结束的个数（在 `co` 语句里当场就跑完、当场失败的也
   算在下次 `__c6_co_run()` 的计数里）。
 * `task t = f(a);` 建任务、把句柄存进 `t`（类型从初始化器推出，所以必须
   写初始化器），并在**作用域退出时自动 `__c6_co_destroy(t)`**——走的就
   是 `defer` 那套清理路径，所以 `return` / `err` / `break` 出去一样会
   释放。一行可以声明多个（`task a = f(), b = g();`）。
-* 两者的操作数都必须是一次 `async` 调用；普通函数要等未来的有栈协程，
-  现在明确报错（见 C35）。
+* 两者的操作数都必须是一次 `async` 调用；普通函数用 `go`（§3.6），
+  写成 `co` 会明确报错（见 C35）。
 
-**执行顺序**（`go` 唯一的“魔法”，有栈/无栈一致）：
+**执行顺序**（`co` 唯一的“魔法”）：
 
-`go` 是**同步起点**。任务在 `go` 语句处就开始执行，一直跑到第一个“必须
-等待”的点，然后把控制权交还给 `go` 的下一条语句：
+`co` 是**同步起点**。任务在 `co` 语句处就开始执行，一直跑到第一个“必须
+等待”的点，然后把控制权交还给 `co` 的下一条语句：
 
 ```
-    go worker(1);           (* worker 跑起来了，可能已经打印过东西 *)
+    co worker(1);           (* worker 跑起来了，可能已经打印过东西 *)
     printf("spawned\n");    (* 然后才轮到这句 *)
 ```
 
 “必须等待”就是 `await c6_io(fd, ev)` 那种挂起：它总要停一轮，即使 fd 已经
 就绪——唤醒是下一轮 `select()` 的事。`await` 一个 `async` 子任务不算等待，
-子任务能立刻往下跑就跑完了。所以完全不碰 fd 的 `go f();` 会在 `go` 语句里
+子任务能立刻往下跑就跑完了。所以完全不碰 fd 的 `co f();` 会在 `co` 语句里
 一路跑完，并**当场回收任务槽**（没人能观察到它，句柄也没人拿得到）；park
 在 fd 上的任务才留给 `__c6_co_run()`。
 
-以后的有栈协程 `go f();`（`f` 是普通函数）沿用同一套约定：从 `go` 处开始
-跑，只有调用显式的让出原语（`c6_go_yield()` / `c6_go_wait_fd()`）时才会
-让出。没有让出点时，`go f();` 和直接写 `f();` 完全一样——协作式，不抢占，
-不 hook libc。
+约束见 C34–C37（`go` 的约束是 C38–C40，见 §3.6）；同时存活的协程最多
+64 个（含 `await` 出来的子任务）。
+`co` 出去的协程和调用方在同一线程上协作式运行；要真并发用 `go`（§3.6）。
 
-约束见 C34–C37；同时存活的协程最多 64 个（含 `await` 出来的子任务）。
+### 3.6 go（OS 线程）
+
+```
+go-statement = "go" , expression , ";" ;
+```
+
+`go f(a);` 在真正的 OS 线程（`pthread_create`）上运行普通函数 `f`，语句
+立刻返回：
+
+```
+    go download(1);             (* 起线程，马上往下走 *)
+    go download(2);             (* 和上一行并行 *)
+    printf("main 继续\n");
+```
+
+* 三种写法的分工：
+
+  | 写法 | 对函数的要求 | 引擎 | 返回 | 真并发 |
+  |---|---|---|---|---|
+  | `co f(a);` | 必须是 `async` | 无栈协程（帧拷贝） | 跑到第一个真正要等的地方 | 否 |
+  | `task t = f(a);` | 初始化式是 `async` 调用 | 同上（保留句柄） | 同上 | 否 |
+  | `go f(a);` | 任意普通函数 | `pthread_create` | **立刻** | **是** |
+
+* 参数在 `go` 语句处**求值一次**，按值复制到堆上的参数块；线程入口
+  （跳板）解开参数块再调用 `f`。之后改局部变量不影响线程。
+* 能进参数块的类型：标量、枚举、指针、`T[:]`、文件作用域的
+  struct/union。数组、VLA、函数指针参数（C38）、变参函数（C39）都不行。
+* 被调函数不能是 `async`（用 `co`），也不能带 `!error`（C40）。
+* 调用点能看到 `f` 的**文件作用域声明**就够了，定义可以在任何 TU。
+  跳板按（本 TU，被调函数）生成，是 `static` 函数，在 TU 末尾定义；
+  没有被 `go` 用到的原型不产生任何代码。
+* 线程由**启动它的线程**回收：`main` 结束时编译器插入
+  `__c6_th_join_all()`，别的线程在退出时回收自己的子线程。需要中途等待
+  可以直接调用它。
+* 每个线程有自己的 defer 栈、错误槽和协程池（`pthread_key`，不是
+  `__thread`：`-run` 不支持 TLS），所以线程里可以照常写 `defer`、`err`、
+  `async`/`await`，也可以再 `go`。
+
+运行时接口（`-std=c6` 时预置声明）：
+
+```
+void *__tcc_sp_args(unsigned long size);   (* 参数块 *)
+int   __tcc_th_start(void *(*fn)(void *), void *arg);   (* 起线程，0 = 成功 *)
+void  __c6_th_join_all(void);              (* 等本线程 go 出去的线程 *)
+```
 
 ---
 
@@ -387,6 +453,7 @@ statement              = labeled-statement
                        | errdefer-statement
                        | err-statement
                        | try-statement
+                       | co-statement
                        | go-statement
                        | task-declaration ;
 
@@ -404,6 +471,7 @@ err-statement          = "err" , "(" , expression , "," , expression ,
 try-statement          = "try" , try-operand , ";" ;
                          (* 见第 5 节；作为语句时返回值被丢弃 *)
 
+co-statement           = "co" , expression , ";" ;
 go-statement           = "go" , expression , ";" ;
                          (* 顶层任务：建完立刻跑到第一个必须等待的点，
                             见 3.5 *)
@@ -557,10 +625,13 @@ parameter-list    = identifier , { "," , identifier } ;
 | C31 | `await` 不能出现在 `defer` / `errdefer` 体或 `sizeof` 等不求值上下文里 | `'await' is not allowed in a 'defer' body`；`'await' is not allowed in an unevaluated context` |
 | C32 | `c6_io` 只有 `await c6_io(fd, ev)` 一种写法 | `'c6_io' can only be used as 'await c6_io(fd, ev)'` |
 | C33 | 挂起点上已经压在求值栈里的中间值必须落在变量里（帧槽会随帧一起恢复，寄存器不会） | `the value pending across 'await' must live in a variable: store it in a local first` |
-| C34 | `go` / `task` 只能出现在函数体内 | `'go' can only be used inside a function`；`'task' can only be used inside a function` |
-| C35 | `go` 的操作数必须是一次 `async` 调用；普通函数需要未来的有栈协程 | `the operand of 'go' must be the handle of an 'async' call`；`'go' on a non-async function needs stackful coroutines (not implemented yet)` |
+| C34 | `co` / `go` / `task` 只能出现在函数体内 | `'co' can only be used inside a function`；`'go' can only be used inside a function`；`'task' can only be used inside a function` |
+| C35 | `co` 的操作数必须是一次 `async` 调用 | `the operand of 'co' must be the handle of an 'async' call`；`'co' requires an 'async' function: 'f' is a plain function (use 'go')` |
 | C36 | `task` 的初始化器必须是一次 `async` 调用（类型从初始化器推出，所以不能省） | `the initializer of a 'task' variable must be a call of an 'async' function`；`'=' expected` |
 | C37 | `async` 函数不能是方法（方法调用会被改写成普通调用，指向不存在的函数体） | `'async' functions cannot be methods: '…'` |
+| C38 | `go` 的操作数必须是**普通函数**的调用：不能是 `async` 函数（用 `co`）、不能是函数指针、参数类型必须能写进参数块（数组/VLA/函数指针形参不行） | `the operand of 'go' must be a call of a plain function`；`'go' requires a plain function: 'f' is 'async' (use 'co')`；`'go' does not support this signature: 'f'` |
+| C39 | `go` 不支持变参函数（参数块要按声明的形参布局） | `'go' does not support variadic functions: 'f'` |
+| C40 | `go` 不支持 `!error` 函数（错误没人接） | `'go' does not support fallible functions: 'f'` |
 
 ---
 
@@ -712,8 +783,9 @@ E[:] s = arr;                    (* arr 的类型是 E[N] *)
 **R13 — 越界**
 
 越界（`i >= len`、`lo > hi`、`hi > len`）调用运行时陷阱
-`__tcc_slice_*`，它执行一次故意的空指针写。libtcc1 是 freestanding 的
-（没有 libc），因此不产生诊断文本，与 `catch` 落空时一致。
+`__tcc_slice_*`，它执行一次故意的空指针写。libtcc1 里没有格式化输出
+（只用到 `pthread_*` 和最基础的 libc 入口），因此不产生诊断文本，与
+`catch` 落空时一致。
 
 ## 9. 示例
 
@@ -853,10 +925,10 @@ defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再�
 `DONE` / `IO` / `CHILD`，为 `CHILD` 时先往子任务里钻，为 `IO` 时用
 `select()` 等 fd 就绪并把掩码放进 `wait_rev`。
 
-**R16 — `go f(a);` / `task t = f(a);`**
+**R16 — `co f(a);` / `task t = f(a);`**
 
 ```
-    go f(a)                 ⇒  h = __c6_co_new(&__c6_desc_f);   (* 同 R14 的调用 *)
+    co f(a)                 ⇒  h = __c6_co_new(&__c6_desc_f);   (* 同 R14 的调用 *)
                                h->p0 = a;
                                __tcc_co_spawn(h);
                                (* 返回时 h 可能已经跑完并被回收 *)
@@ -1010,13 +1082,21 @@ int main(void)
 | 函数指针 / 数组 / VLA 作为 `async` 函数的形参或返回值 | 约束 C29：任务结构要能从声明写回，这几类写不回去 |
 | `async` 嵌套定义、`async inline`、`async int main` | 约束 C29 |
 | 用 `setjmp`/`ucontext`/独立栈实现的有栈协程 | 不在本扩展范围：`async` 体始终跑在调用方的栈上 |
-| `go f();`（`f` 是普通函数） | 约束 C35：有栈协程还没实现 |
-| `go` / `task` 写在函数外 | 约束 C34 |
+| `co f();`（`f` 是普通函数） | 约束 C35：普通函数用 `go` |
+| `co` / `go` / `task` 写在函数外 | 约束 C34 |
+| `go f();`（`f` 是 `async`） | 约束 C38：协程用 `co` |
+| `go p();`（`p` 是函数指针） | 约束 C38：跳板要按被调函数生成 |
+| `go f();` 而 `f` 的形参是数组 / VLA / 函数指针 | 约束 C38：参数块写不回去 |
+| `go vf(1);`（`vf` 是变参函数） | 约束 C39 |
+| `go ff();`（`ff` 带 `!error`） | 约束 C40 |
+| `go f();` 而 `f` 只有块作用域声明 | 约束 C38：需要文件作用域声明才能生成跳板 |
 | `task t;`（不带初始化器） | 约束 C36：句柄类型从初始化器推出 |
 | `async` 函数当方法用（`p->f()`） | 约束 C37 |
 | 同时存活超过 64 个协程 | 固定池（`C6_CO_MAX`）：超了会 trap，不是语法错误 |
 | `await c6_io(fd, ev)` 的 `fd` 不在 `[0, 1024)` | 任务按失败回收：`__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败（不会永远 park） |
-| 抢占式调度、把阻塞的 libc 调用（`read`/`printf`/…）自动变成让出点 | 不在本扩展范围：`go`/`__c6_co_run` 只推进协程，不 hook libc |
+| 抢占式调度、把阻塞的 libc 调用（`read`/`printf`/…）自动变成让出点 | 不在本扩展范围：`co`/`__c6_co_run` 只推进协程，不 hook libc |
+| PE 目标上的 `go` | 还没有 PE 线程支持，运行时 trap |
+| 取消 / 强杀一个 `go` 出去的线程 | 不提供：线程总是被启动它的线程 join |
 ---
 
 ## 11. 实现位置
@@ -1031,7 +1111,10 @@ int main(void)
 | `test` | `c6_test_parse`、`tcc_run_tests` | `tcc/tccgen.c`、`tcc/tccrun.c` |
 | `defer` / `errdefer` | `c6_defer_parse`、`c6_defer_begin`、`c6_defer_func_end` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
 | `err` | `c6_err_parse` / `c6_emit_propagate` | `tcc/tccgen.c` |
-| `go` | `c6_go_stmt`（`decl()` 与 `block()` 两个入口）、`__tcc_co_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `co` | `c6_co_parse`、`__tcc_co_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `go` | `c6_go_parse` / `c6_sp_emit` / `c6_sp_flush`、`__tcc_sp_args` / `__tcc_th_start` / `__c6_th_join_all` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| 软关键字 | `c6_soft_kw` / `c6_soft_kw_shadowed`（`block()` 与 `decl()` 两个入口） | `tcc/tccgen.c` |
+| 每线程状态 | `tcc_th()` / `tcc_th_join_children`（`pthread_key`） | `tcc/lib/libtcc1.c` |
 | `task` | `c6_task_decl` / `c6_task_check_handle` / `c6_task_defer_destroy` | `tcc/tccgen.c` |
 | 顶层调度（64 槽就绪链表 + 一次 `select()`） | `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run` | `tcc/lib/libtcc1.c` |
 | `!error` | `c6_parse_fallible_suffix` / `c6_apply_fallible`，`FuncAttr.func_fallible` | `tcc/tccgen.c`、`tcc/tcc.h` |

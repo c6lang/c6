@@ -236,7 +236,7 @@ test "任务槽会被回收，超过池容量也能跑" {
     }
 }
 
-/* ---- task / go ---- */
+/* ---- task / co ---- */
 
 static int pipe_a[2] = {0, 0};
 static int pipe_b[2] = {0, 0};
@@ -259,7 +259,7 @@ async int next_id(int i)
     return await add(i, 1);
 }
 
-/* go 写在 async 体里也必须是顶层任务：handler 挂起时它照样往前跑 */
+/* co 写在 async 体里也必须是顶层任务：handler 挂起时它照样往前跑 */
 async int wait_own(void)
 {
     char buf[2] = {0};
@@ -283,7 +283,7 @@ async int wait_other(void)
 
 async int spawner(void)
 {
-    go wait_own();
+    co wait_own();
     lgc('h');
     await wait_other();
     lgc('H');
@@ -322,7 +322,7 @@ test "task 句柄在作用域退出时自动回收（超过池容量）" {
     }
 }
 
-test "go 立刻跑到第一个 await 点" {
+test "co 立刻跑到第一个 await 点" {
     int fds[2] = {0, 0};
     char one = 'x';
     char buf[2] = {0};
@@ -330,35 +330,35 @@ test "go 立刻跑到第一个 await 点" {
         err(1, "pipe 失败");
     write(fds[1], &one, 1);
     lg_reset();
-    go on_fd(fds[0], 0);        /* 日志里应立刻出现 'a' */
+    co on_fd(fds[0], 0);        /* 日志里应立刻出现 'a' */
     if (!LG_IS("a"))
-        err(2, "go 没有在语句处先跑到第一个 await");
+        err(2, "co 没有在语句处先跑到第一个 await");
     __c6_co_run();              /* 这里才继续跑完 */
     if (!LG_IS("aA"))
-        err(3, "go 的任务没有被调度器推进完");
+        err(3, "co 的任务没有被调度器推进完");
     (void)buf;
 }
 
-test "多个 go 会被轮转推进（真交替，不是顺序跑完）" {
+test "多个 co 会被轮转推进（真交替，不是顺序跑完）" {
     char one = 'x';
     if (pipe(pipe_a) || pipe(pipe_b))
         err(1, "pipe 失败");
     write(pipe_a[1], &one, 1);
     write(pipe_b[1], &one, 1);
     lg_reset();
-    go on_fd(pipe_a[0], 0);
-    go on_fd(pipe_b[0], 1);
+    co on_fd(pipe_a[0], 0);
+    co on_fd(pipe_b[0], 1);
     /* 两个都停在第一个 await 上 */
     if (!LG_IS("ab"))
-        err(2, "两个 go 的首步顺序不对");
+        err(2, "两个 co 的首步顺序不对");
     __c6_co_run();
     /* 顺序是后进先出：b 先被推进一步，然后 a —— 关键是两者交叉（abBA），
        而不是把某一个直接跑完（那会是 abBB… 之类） */
     if (!LG_IS("abBA"))
-        err(3, "两个 go 不是交替推进的");
+        err(3, "两个 co 不是交替推进的");
 }
 
-test "go 写在 async 体里也是顶层任务" {
+test "co 写在 async 体里也是顶层任务" {
     char one = 'x';
     if (pipe(pipe_a) || pipe(pipe_b))
         err(1, "pipe 失败");
@@ -372,22 +372,22 @@ test "go 写在 async 体里也是顶层任务" {
         if (h->val != 3)
             err(2, "spawner 的返回值不对");
     }
-    /* g: go 的首步；h: 继续往下；G: handler 挂起期间 go 出去的顶层任务
+    /* g: co 的首步；h: 继续往下；G: handler 挂起期间 co 出去的顶层任务
        被推进；H: handler 恢复 */
     if (!LG_IS("ghGH"))
-        err(3, "go 出去的协程不是顶层的（被外层挂起冻结了）");
+        err(3, "co 出去的协程不是顶层的（被外层挂起冻结了）");
 }
 
-test "go 不产生值，但 __c6_co_run 会报告失败的任务数" {
+test "co 不产生值，但 __c6_co_run 会报告失败的任务数" {
     int i = 0;
     for (i = 0; i < 40; i++)         /* 每个都在首步完成并回收 */
-        go next_id(i);
+        co next_id(i);
     if (__c6_co_run() != 0)
-        err(1, "成功的 go 不该被计为失败");
-    go failing();
-    go failing();
+        err(1, "成功的 co 不该被计为失败");
+    co failing();
+    co failing();
     if (__c6_co_run() != 2)
-        err(2, "__c6_co_run 没有报告失败的 go 任务");
+        err(2, "__c6_co_run 没有报告失败的 co 任务");
 }
 
 /* ---- task 句柄的回收路径 ---- */
@@ -492,7 +492,7 @@ test "task 句柄跨挂起保持有效" {
     }
 }
 
-test "task / go 写在 defer 体里也能工作" {
+test "task / co 写在 defer 体里也能工作" {
     {
         task d = in_defer_body();
         if (__c6_co_wait(d) != 0 || d->val != 0)
@@ -500,19 +500,19 @@ test "task / go 写在 defer 体里也能工作" {
     }
     {
         defer {
-            go add(1, 1);
+            co add(1, 1);
         }
     }
     if (__c6_co_run() != 0)
-        err(2, "defer 体里 go 出去的任务失败");
+        err(2, "defer 体里 co 出去的任务失败");
 }
 
 test "c6_io 的 fd 不合法时任务被计为失败并回收" {
-    go wait_bad_fd();
+    co wait_bad_fd();
     if (__c6_co_run() != 1)
         err(1, "非法 fd 的任务没有被计为失败");
-    go wait_bad_fd();
-    go wait_bad_fd();
+    co wait_bad_fd();
+    co wait_bad_fd();
     if (__c6_co_run() != 2)
         err(2, "非法 fd 的任务没有被回收");
 }
