@@ -468,6 +468,9 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 - `err` 一旦执行就直接返回，没有重抛形式；转发用 `try`（在返回 `T!error`
   的函数里自动传播），就地处理用 `catch`（快照并清空错误槽）；
 - `T!error` 调用的返回值必须被 `try` 或 `catch` 消费，否则编译报错；
+- `error` 只能作为返回值：形参表里的 `error` / `error*` / `error[]` 一律
+  报错（`superc_check_error_param`），错误通道只有返回值 + 错误槽，
+  不引入隐藏参数，也不改变调用约定；
 - `!error` 的函数返回类型必须能表示哨兵 `-1`，因此结构体返回类型不能标注；
 - `interface` 的 `impl` 必须先于使用可见（单趟编译约束）；
 - `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）。

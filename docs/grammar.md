@@ -42,7 +42,9 @@ superc-keyword =
     | "try"     | "catch" ;
 
 (* 扩展内建的错误值类型，由编译器预置的 typedef 提供，等价于
-   typedef struct __tcc_error { int id; const char *msg; } error; *)
+   typedef struct __tcc_error { int id; const char *msg; } error;
+   'error' 只能出现在返回类型里（作为 'T!error' 的错误载荷），
+   不能作为函数参数，见约束 C18。 *)
 error-type-name = "error" ;
 ```
 
@@ -134,6 +136,20 @@ function-definition    = declaration-specifiers ,
 ```
 
 约束 C8 要求被标记的最终类型必须是一个函数（或指向函数的指针）。
+
+`error` 本身是**只出不进**的类型：它可以出现在返回类型里，但不能出现在
+形参表里（`error`、`error*`、`error[]` 都算），因为错误只能通过返回值
+离开函数，不能通过实参传进来或用出参带回：
+
+```
+    error  make(void);              (* 合法：作为返回值 *)
+    int!error f(void);              (* 合法：'!error' 是个标记，不是形参 *)
+    void   take(error e);           (* 不合法 *)
+    void   take(error *e);          (* 不合法：出参形式 *)
+    void   take(error a[]);         (* 不合法 *)
+```
+
+函数体内的 `error e;` 局部变量是允许的（`catch` 的处理变量就是这种形式）。
 
 `!error` 同样适用于函数指针的声明符：
 
@@ -275,6 +291,7 @@ parameter-list         = identifier , { "," , identifier } ;
 | C15 | `T!error` 调用的结果必须被 `try` 或 `catch` 消费（`sizeof` / `typeof` 的操作数不产生调用，不受此限） | `the result of a 'T!error' function must be used with 'try' or 'catch'` |
 | C16 | `err` 必须带 `id` 与 `msg` 两个实参（没有重抛形式） | `'err' requires an error id and a message` |
 | C17 | `err` 只能出现在返回 `T!error` 的函数里 | `'err' requires the enclosing function to return 'T!error'` |
+| C18 | `error` 只能作为返回值，不能作为形参（含 `error*` / `error[]`，K&R 形参声明也算） | `'error' can only be a return type, not a parameter` |
 
 ---
 
@@ -339,7 +356,9 @@ expr catch e { body }
 `__tcc_catch_fallthrough()` 作为陷阱，避免悄悄落回成功路径。
 
 **R6 — `T!error f(…)`**：只改变调用点的类型信息（允许 `try` / `catch`
-作用其上），不改变调用约定；哨兵值 `-1` 由失败方写入返回值。
+作用其上），不改变调用约定；错误只通过返回值送出（失败方返回哨兵 `-1`，
+id/msg 走错误槽），从不经过形参，因此 `error` 被禁止出现在形参表里
+（约束 C18）。
 
 ---
 
@@ -418,6 +437,7 @@ int use(int n)
 | `int!error x;` | 约束 C8 |
 | `try` / `catch` / `err` 写在 `defer` 体内 | 约束 C11 |
 | `err();`（无参数重抛） | 约束 C16，请改用 `try` |
+| `void f(error e);` / `void f(error *e);` | 约束 C18：错误只从返回值出来 |
 | `f() catch e;`（无处理块） | 语法错误 |
 | `catch e { … }` 单独出现 | 约束 C7 |
 

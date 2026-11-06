@@ -188,6 +188,9 @@ int handle(const char *s)
 - `try` / `catch` / `err` 不能写在 `defer` / `errdefer` 体内；
 - `T!error` 函数的返回值**必须**被 `try` 或 `catch` 消费；直接赋值、参与运算、
   作条件、`return` 出去或者当语句丢弃都会编译报错；
+- `error` 是**只出不进**的类型：可以作为返回值，但不能作为函数参数
+  （`error`、`error*`、`error[]` 都不行）——错误只能从返回值出来，
+  不走实参、也不走 out 参数；函数体内的 `error e;` 局部变量仍然可用；
 - `!error` 的函数返回类型必须能表示哨兵 `-1`（标量或枚举，不能是结构体）。
 
 完整可运行示例见 [examples/try_demo.c](examples/try_demo.c)：
