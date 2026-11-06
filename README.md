@@ -10,8 +10,9 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 | `err(code, "msg")` | 设置错误槽、就地展开清理并直接返回 |
 | `func() T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 |
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
-| `package NAME { ... }` / `import NAME;` | 单文件与跨 TU 的包与名字修饰（`NAME__sym`） |
-| `interface` / `impl` | 胖指针（`{void *self; const VT *vt;}`）+ vtable 的接口抽象 |
+| `package` / `import` | 包与名字修饰（`pkg__sym`），`pkg.member` 访问导出符号，支持多级包名 |
+| 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用 |
+| `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
 
@@ -223,12 +224,66 @@ test "add works" {
 ```c
 package math {
     int add(int a, int b) { return a + b; }
+    int counter = 0;
 }
 
 import math;
 
-int main(void) { return add(1, 2); }   /* 也叫 math__add */
+int main(void)
+{
+    math.counter = 1;                 /* 包限定访问 */
+    return math.add(1, 2) + math__add(1, 2);   /* 也叫 math__add */
+}
 ```
+
+规则：
+
+- `package NAME { ... }` 里的符号被词法修饰成 `NAME__sym`（`main` 除外）；包只是
+  名字前缀，**不引入目录或文件语义**；
+- `import NAME;` 打开 `NAME.member` 这种写法，必须在**使用点之前**出现；包块内部
+  引用自己的成员不需要 import。不 import 而写 `math.add` 会报
+  `'math' is not an imported package (use 'import math;')`；
+- 点号也可以写成多级：`package acme.util { ... }` / `import acme.util;`，
+  前缀是 `acme__util`；嵌套块 `package acme { package util { ... } }` 与
+  `package acme.util;`（文件级）都会组合前缀，结果相同；
+- `pkg.member` 只解析到「包里的符号」这一层：`math.origin.x`、`*&math.origin.x`
+  会把尾部 `.x` 交回普通成员访问，因此包里的全局结构体对象可以照常使用；
+- 局部变量或字段与包同名时**字段优先**（普通 C 成员访问语义不受影响）；
+- 未声明的包成员按普通未声明标识符报错，诊断使用源码里写的 `pkg.member` 而不是
+  修饰后的名字。
+
+跨 TU 时，头文件里用 `package NAME { ... }` 写出声明（或写 `extern`），实现放在
+另一个 TU 的同一个包里即可；两边的符号名都是 `NAME__sym`，链接后就是普通 C 符号。
+反过来，手写的老 C 代码只要声明 `int math__add(int, int);` 就能直接调用包的导出，
+扩展 TU 也能直接调用普通的 C 函数。
+
+### 结构体方法
+
+```c
+struct Vec { int x, y; };
+
+int vec_sum(struct Vec *self) { return self->x + self->y; }
+int vec_twice(struct Vec *self) { return self->vec_sum() * 2; }
+
+int main(void)
+{
+    struct Vec v = {3, 4};
+    return (&v)->vec_twice();     /* 等价于 vec_twice(&v) */
+}
+```
+
+- 文件作用域的函数声明/定义，只要**第一个参数是指向结构体（或联合体）的指针**，
+  就注册为该类型的方法；调用 `p->f(a)` 被改写为 `f(p, a)`；
+- 方法就是普通函数：**不改名、不改调用约定**（`fflush(FILE *)`、`gettimeofday(struct timeval *)`
+  这类 libc 函数照旧可用），因此也能继续用 `f(p, a)` 调用；
+- 只支持 `->`（`p->f()`）；`v.f()` 仍是普通成员访问，`v->f`（不带调用）会报
+  `method 'f' must be called`；
+- 结构体同名字段优先于方法；方法须在**使用点之前**可见（TCC 单趟编译）；
+- 方法名共享 C 的全局命名空间，不同类型想要同名方法就放进不同 `package`
+  （例：`package circle { int area(Circle *self) ... }` 与 `package rect { int area(Rect *self) ... }`
+  可以共存，各自 `p->area()`）；
+- 返回结构体的方法也支持（隐藏的 `self` 排在 sret 缓冲之后）；
+- `T!error` 方法照常工作：`int!error f(struct T *self)` 可用 `try p->f()` / `p->f() catch e { ... }`。
 
 ### 变量必须初始化
 
@@ -293,29 +348,39 @@ int a[n];                 ->  不用改（VLA 豁免）
   （文件里真的存一份零），而不带初始化器的全局对象在 `.bss`。所以给
   大缓冲区补初始化器会让可执行文件变大；迁移大型静态表时要留意这一点。
 
-### interface / impl
+### interface
 
 ```c
 interface Shape {
     int area();
+    const char *name();
 }
 
 struct Circle { int r; };
 
-impl Shape for Circle {
-    int area(Circle *self) { return 3 * self->r * self->r; }
-}
+/* 结构体「拥有」接口声明的方法，就实现了这个接口；不再有 impl 语法 */
+int area(struct Circle *self) { return 3 * self->r * self->r; }
+const char *name(struct Circle *self) { return "circle"; }
 
 int describe(Shape s) { return s.area(); }   /* 结构体值隐式转换为胖指针 */
 
 int main(void)
 {
-    Circle c = {2};
+    struct Circle c = {2};
     return describe(c) == 12 ? 0 : 1;
 }
 ```
 
-`impl` 的方法签名会与接口声明比对：缺方法、参数个数、参数类型、返回类型不一致都会编译报错。
+- 接口值是 `{void *self; const VT *vt;}` 胖指针，`s.area()` 通过 vtable 分派；
+- **没有 `impl` 声明**：结构体是否实现接口，由「是否声明了接口要求的全部方法」
+  决定；检查是惰性的——第一次发生结构体到接口的转换（函数实参、赋值、显式强转）
+  时才比对方法集合与签名，缺方法、参数个数/类型、返回类型不一致都会编译报错，
+  诊断指出具体的接口与方法；
+- 转换点的前提是方法**在此之前**已经声明或定义；结构体到接口的转换在
+  **文件作用域初始化器**里仍然不支持（没有运行时代码可生成），接口到接口是普通拷贝；
+- vtable 是一个 `static const` 对象，每个 TU 对「用到的 (类型, 接口) 对」各生成一份，
+  因此两个 TU 可以同时转换同一个类型而不会符号冲突；
+- `impl` 现在是普通标识符，`int impl = 1;` 合法。
 
 ### #macro / __local
 
@@ -351,7 +416,7 @@ PASS: errdefer 只在错误路径执行
 更完整的回归：
 
 ```sh
-make test          # 扩展模式：tests/tests2 全量（含 156..165 的 superc 专项测试）
+make test          # 扩展模式：tests/tests2 全量（含 156..174 的 superc 专项测试）
 make test-plain    # 关闭 TCC_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make test-all      # selftest + tests2
 ```
@@ -364,9 +429,11 @@ make test-all      # selftest + tests2
 - 语法规范：[docs/grammar.md](docs/grammar.md)（EBNF 增量语法、静态约束与重写规则）。
 - 运行时状态（defer 记录栈、错误槽）是普通全局变量：`tcc -run` 不支持 TLS，
   因此这一版是单线程语义。
-- `interface` 的 `impl` 必须先于使用点可见（TCC 单趟编译的固有限制）。
-- 跨 TU：头文件里用 `package NAME { ... }` 声明 API；`impl IFACE for TYPE;` 只声明，
-  vtable 由另一个 TU 提供。
+- 方法必须在调用点之前声明或定义（TCC 单趟编译的固有限制）；接口一致性检查发生在
+  第一次转换点，因此方法也要在转换点之前可见。
+- 跨 TU：头文件里用 `package NAME { ... }` 声明 API；接口的方法声明放头文件里，
+  vtable 由每个 TU 按需自行生成。
+- 方法名共享 C 的全局命名空间；同名方法服务不同类型时用 `package` 隔离。
 - 变量初始化检查在**定义点**做，不做数据流分析；VLA 是唯一豁免
   （标准 C 禁止给变长数组写初始化器）。
 

@@ -37,7 +37,7 @@ identifier    = ( letter | "_" ) , { letter | digit } ;
 
 (* 扩展新增的关键字 *)
 superc-keyword =
-      "package" | "import" | "interface" | "impl"
+      "package" | "import" | "interface"
     | "defer"   | "errdefer" | "err" | "test"
     | "try"     | "catch" ;
 
@@ -49,9 +49,9 @@ error-type-name = "error" ;
 ```
 
 `try`、`catch`、`err`、`defer`、`errdefer`、`package`、`import`、
-`interface`、`impl` 只会作为关键字出现在下列产生式允许的位置；在其余
+`interface` 只会作为关键字出现在下列产生式允许的位置；在其余
 位置（例如声明说明符中）它们仍可被当作标识符使用，这一点与 C 关键字
-不同，是单趟实现的已知宽松之处。
+不同，是单趟实现的已知宽松之处。`impl` 自 0010 起不再是关键字。
 
 ---
 
@@ -63,22 +63,27 @@ translation-unit       = { top-level-declaration } , EOF ;
 top-level-declaration  = package-declaration
                        | import-declaration
                        | interface-declaration
-                       | impl-declaration
                        | test-declaration
                        | declaration ;
 
 (* ---- package / import ---- *)
 
-package-declaration    = "package" , identifier , "{" ,
-                             { package-item } ,
-                         "}" ;
+package-declaration    = "package" , package-name ,
+                         ( "{" , { package-item } , "}" | ";" ) ;
+                         (* 点号形式与嵌套块、文件级形式等价地组合前缀：
+                            'package a.b' 与 'package a { package b { … } }'
+                            都产生前缀 'a__b' *)
 
-package-item           = function-definition
+package-name           = identifier , { "." , identifier } ;
+
+package-item           = package-declaration
+                       | function-definition
                        | declaration ;
 
-import-declaration     = "import" , identifier , ";" ;
+import-declaration     = "import" , package-name , ";" ;
+                         (* 打开 'pkg.member' 写法，必须出现在使用点之前 *)
 
-(* ---- interface / impl ---- *)
+(* ---- interface ---- *)
 
 interface-declaration  = "interface" , identifier , "{" ,
                              { method-declaration } ,
@@ -88,12 +93,8 @@ method-declaration     = declaration-specifiers , identifier ,
                          "(" , [ parameter-type-list ] , ")" , ";" ;
                          (* 只能是函数声明，不能带函数体 *)
 
-impl-declaration       = "impl" , identifier , "for" ,
-                         [ "struct" ] , identifier ,
-                         ( impl-body | ";" ) ;
-
-impl-body              = "{" , { function-definition } , "}" ;
-                         (* 'impl I for T;' 只声明实现存在于另一个 TU *)
+(* 结构体如何实现接口没有专门的声明语法：文件作用域里第一个参数是指向
+   该结构体（或联合体）指针的函数，就是它的方法，见 3.2 与 C20/C21。 *)
 
 (* ---- test ---- *)
 
@@ -192,6 +193,22 @@ VLA 是唯一例外——标准 C 不允许给变长数组写初始化器，所�
 完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
 函数体）都要满足。K&R 老式定义的形参声明表属于形参，不受约束。
 
+### 3.2 结构体方法
+
+文件作用域的函数声明或定义，只要**第一个参数是指向结构体（或联合体）的
+指针**，就同时注册为该类型的方法：
+
+```
+    struct Vec { int x, y; };
+
+    int vec_sum(struct Vec *self) { return self->x + self->y; }
+
+    void f(struct Vec *p) { p->vec_sum(); }   (* 等价于 vec_sum(p) *)
+```
+
+方法**不是**新的函数类型：符号名和调用约定都不变，`vec_sum(p)` 与
+`p->vec_sum()` 等价。约束见 C20。
+
 ---
 
 ## 4. 语句
@@ -229,9 +246,19 @@ try-statement          = "try" , try-operand , ";" ;
 
 ```
 primary-expression     = …
+                       | qualified-identifier
                        | try-expression ;
 
+qualified-identifier   = identifier , "." , identifier ,
+                         { "." , identifier } ;
+                         (* 'pkg.member'：第一段必须是已 import 的包名，
+                            否则按普通 C 的成员访问解析；见 C14/R7 *)
+
 postfix-expression     = …
+                       | postfix-expression , "->" , identifier ,
+                         "(" , [ argument-expression-list ] , ")"
+                         (* 方法调用：接收者须为指向结构体/联合体的指针，
+                            且该类型有同名方法、没有同名字段；见 C20/R8 *)
                        | postfix-expression , catch-clause ;
 
 try-expression         = "try" , try-operand ;
@@ -318,13 +345,15 @@ parameter-list         = identifier , { "," , identifier } ;
 | C10 | `expr` 中不能直接写裸 `catch` | 同 C7 |
 | C11 | `try` / `catch` / `err` 不得出现在 `defer` / `errdefer` 体内 | `'try' is not allowed in a defer body` 等 |
 | C12 | 返回类型大小未知（不完整类型）的函数不能传播错误 | `cannot propagate an error from a function with an incomplete return type` |
-| C13 | `package` 内的符号被改写为 `NAME__sym`，`main` 除外 | — |
-| C14 | `impl IFACE for TYPE` 必须定义接口中的全部方法且签名兼容 | `impl of 'I' does not define method 'm'` 等 |
+| C13 | `package` 内的符号被改写为 `NAME__sym`，`main` 除外；嵌套与点号形式组合前缀 | — |
+| C14 | `pkg.member` 只在 `pkg` 已 `import`（或就是当前包）时成立 | `'pkg' is not an imported package (use 'import pkg;')` |
 | C15 | `T!error` 调用的结果必须被 `try` 或 `catch` 消费（`sizeof` / `typeof` 的操作数不产生调用，不受此限） | `the result of a 'T!error' function must be used with 'try' or 'catch'` |
 | C16 | `err` 必须带 `id` 与 `msg` 两个实参（没有重抛形式） | `'err' requires an error id and a message` |
 | C17 | `err` 只能出现在返回 `T!error` 的函数里 | `'err' requires the enclosing function to return 'T!error'` |
 | C18 | `error` 只能作为返回值，不能作为形参（含 `error*` / `error[]`，K&R 形参声明也算） | `'error' can only be a return type, not a parameter` |
 | C19 | 每个变量定义都必须带初始化器（`extern` 声明、形参、成员、`typedef` 除外；VLA 豁免） | `variable 'x' must be initialized` |
+| C20 | 方法调用要求：接收者是指向结构体/联合体的指针、该类型有同名方法、没有同名字段、方法在调用点之前已声明，且方法后面必须紧跟 `(` | `method 'f' must be called`；`duplicate method 'f' for 'T'`；其它情况按普通成员访问报 `field not found: f` |
+| C21 | 结构体到接口的转换要求接口的每个方法都在**转换点之前**可见且签名兼容 | `'T' does not implement interface 'I': missing method 'm'`；`method 'm' of 'I' has an incompatible return type` / `… parameter` / `… wrong number of parameters` |
 
 ---
 
@@ -393,6 +422,44 @@ expr catch e { body }
 id/msg 走错误槽），从不经过形参，因此 `error` 被禁止出现在形参表里
 （约束 C18）。
 
+**R7 — 包限定访问 `pkg.member`**
+
+```
+pkg.member                       (* 'pkg' 已 import，或就是当前包 *)
+=>
+    pkg__member                  (* 与原符号是同一个普通 C 符号 *)
+```
+
+点号逐段增长：`a.b.f` 先试 `a__b`，再试 `a__b__f`；命中后剩下的
+`.field` 交回普通成员访问，所以 `pkg.obj.field` 可用。第一段若命中
+当前可见的普通标识符，则**不**做包解析（保持 C 的成员访问语义）。
+
+**R8 — 方法调用 `p->f(args)`**
+
+```
+p->f(args)                       (* T 有方法 f，且没有同名字段 *)
+=>
+    f(p, args)                   (* 同一次调用，符号名与调用约定都不变 *)
+```
+
+接收者先求值并存入一个临时槽，再作为第一个实参压栈：若方法返回结构体，
+隐藏的 `self` 排在 sret 缓冲之后。
+
+**R9 — 结构体到接口的隐式转换**
+
+```
+Shape s = circle;                (* 结构体值 -> 接口值，C21 通过 *)
+=>
+    static const struct Shape_vt __tcc_vt_Circle_Shape = {
+        (void (*)(void))area, (void (*)(void))name
+    };
+    __tcc_iface_init(&circle, &__tcc_vt_Circle_Shape, &s);
+```
+
+vtable 对象在**翻译单元末尾**按用到的 (类型, 接口) 对生成，每个 TU 一份
+`static`，因此多个 TU 转换同一类型不会符号冲突。文件作用域的初始化器没有
+可执行代码，因此不在支持范围（见第 10 节）。
+
 ---
 
 ## 9. 示例
@@ -454,6 +521,40 @@ int use(int n)
     g() catch e { return 2; };   /* 不会误判为 g 失败 */
 ```
 
+包、方法与接口一起用（多级包 + 自动 vtable）：
+
+```c
+interface Shape { int area(); }
+
+struct Circle { int r; };
+struct Rect { int w, h; };
+typedef struct Circle Circle;
+typedef struct Rect Rect;
+
+/* 方法名共享 C 的全局命名空间：不同类型要用同名方法，就放进不同包 */
+package geo.circle {
+    int area(Circle *self) { return 3 * self->r * self->r; }
+}
+
+package geo.rect {
+    int area(Rect *self) { return self->w * self->h; }
+    int twice(Rect *self) { return self->area() * 2; }   /* 方法可调方法 */
+}
+
+import geo.circle;
+import geo.rect;
+
+int describe(Shape s) { return s.area(); }   /* 结构体值 -> 接口值 */
+
+int main(void)
+{
+    Circle c = {2};
+    Rect r = {2, 3};
+    return describe(c) == 12 && describe(r) == 6 &&
+           (&r)->twice() == 12 && geo.rect.area(&r) == 6 ? 0 : 1;
+}
+```
+
 ---
 
 ## 10. 未支持的写法
@@ -474,6 +575,13 @@ int use(int n)
 | `f() catch e;`（无处理块） | 语法错误 |
 | `catch e { … }` 单独出现 | 约束 C7 |
 | `int x;` / `static int x;` / `int a[3];`（不带初始化器的定义） | 约束 C19，VLA 除外 |
+| `math.add(1, 2)` 而此前没有 `import math;` | 约束 C14 |
+| `impl Shape for Circle { … }` | `impl` 不再是关键字，按普通声明解析而报错；改用「结构体拥有方法」实现接口 |
+| `v.f()`（值是结构体而不是指针） | 按普通成员访问报 `field not found: f`；方法调用只支持 `->` |
+| `p->f`（方法不带调用） | 约束 C20：`method 'f' must be called` |
+| 方法在使用点之后才声明 | 约束 C20/C21（TCC 单趟编译） |
+| 文件作用域 `Shape s = circle;` | 结构体到接口的转换没有运行时代码可生成 |
+| `Shape s = circle;` 而 `circle` 的方法声明在转换点之后 | 约束 C21 |
 
 ---
 
@@ -481,8 +589,11 @@ int use(int n)
 
 | 语法 | 实现 | 位置 |
 |---|---|---|
-| `package` / `import` | `superc_package_parse` / `superc_import_parse` | `tcc/tccgen.c` |
-| `interface` / `impl` | `superc_interface_parse` / `superc_impl_parse` / `superc_check_impl` | `tcc/tccgen.c` |
+| `package` / `import` | `superc_package_parse` / `superc_import_parse` / `superc_pkg_name` / `superc_pkg_compose` / `superc_pkg_imported`，`unary()` 里的点号解析 | `tcc/tccgen.c` |
+| `pkg.member` | `unary()` 的 `tok_identifier` 分支（逐段增长前缀 + `sym_find_raw`） | `tcc/tccgen.c` |
+| 结构体方法 | `superc_method_register`（在 `decl()` 里注册）/ `superc_method_lookup` / `superc_has_field` / `superc_method_call_prep`，`unary()` 的 `->` 分支 | `tcc/tccgen.c` |
+| `interface` | `superc_interface_parse`、`superc_auto_impl_ensure` / `superc_check_method` / `superc_emit_auto_impls` / `superc_iface_convert` | `tcc/tccgen.c` |
+| 每 TU 状态复位 | `superc_tu_reset`（在 `tccgen_compile` 开头调用） | `tcc/tccgen.c` |
 | `test` | `superc_test_parse`、`tcc_run_tests` | `tcc/tccgen.c`、`tcc/tccrun.c` |
 | `defer` / `errdefer` | `superc_defer_parse`、`superc_defer_begin`、`superc_defer_func_end` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
 | `err` | `superc_err_parse` / `superc_emit_propagate` | `tcc/tccgen.c` |
