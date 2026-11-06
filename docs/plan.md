@@ -160,22 +160,56 @@ return ERR_SENTINEL;   /* 哨兵值 */
 
 `errdefer` 的清理调用条件：`if (__tcc_err.flag) { call fn(arg); }`。
 
-### 3.4 调用者传播
+### 3.4 调用者传播（`try` / `catch` / `T!error`）
+
+被调函数在返回类型上标注 `!error`，调用方用 `try` 原样传播、用 `catch`
+就地处理：
 
 ```c
-ret = may_fail();
-if (ret == ERR_SENTINEL) {
-    /* __tcc_err 已携带 id/msg，决定继续传播或恢复 */
+static int!error may_fail(int n) {
+    if (n > 0) err(n, "nope");
+    return n * 10;
+}
+
+static int!error propagate(int n) {
+    int v = (try may_fail(n));       /* 失败时执行本帧清理并返回哨兵 */
+    return v + 1;
+}
+
+int handle(int n) {
+    int v = may_fail(n) catch e {    /* e.id / e.msg 即 err() 传入的值 */
+        printf("caught %d: %s\n", e.id, e.msg);
+        return -1;                   /* 处理块必须自己离开 */
+    };
+    return v;
 }
 ```
 
-首版不提供 `try` 语法糖，调用者显式检查。
+实现要点（单趟、无 AST 的约束下）：
+
+- `!error` 只是函数类型上的一个属性位（`FuncAttr.func_fallible`），不改变调用约定；
+  它在 `decl()` 里由 `superc_parse_fallible_suffix()` 解析，前置/后缀两种位置等价，
+  原型上的标记会传递到之后的定义；
+- `try` 挂在 `unary()` 的前缀分支（`superc_try_parse`）：就地调用、检查错误槽、
+  失败时走 `superc_emit_propagate()`（与 `err()` 共用同一条清理+哨兵返回路径）；
+- `catch` 挂在 `expr_cond()` 之下的独立一层 `expr_catch()`（`superc_catch_parse`）：
+  先求出调用值并 `save_regs(0)` 落到栈上，再测错误槽；失败分支用
+  `__tcc_error_take(&e)` 快照并**清空**错误槽，然后编译处理块；
+- 判断“操作数确实是调用”用的是代码生成期的标志 `superc_value_fallible`：
+  函数调用处置位，任何把它组合掉的操作（`gen_op` / `gen_cast` / `vstore` /
+  `indir` / `gaddrof` / `inc` / 后缀运算）都会清零；
+- `catch` 处理块用 `superc_last_stmt_leaves` 检查是否以 `return` / `err()` /
+  `goto` / `break` / `continue` 离开，否则编译报错，避免静默落回成功路径；
+- `test` 块合成的函数也带 `func_fallible`，因此 test 块里可以直接 `try`；
+- `--run` 下错误槽接口是普通全局变量（无 TLS），与 `err` 的限制一致。
 
 ### 3.5 规则
 
 - 普通 `return` **不清除** `__tcc_err.flag`，由调用者负责；文档明确此约定；
 - `msg` 生命周期：首版要求静态字符串或调用者管理；
-- 递归中每层调用子函数后应立即检查并快照 `__tcc_err`，再清除，避免串扰。
+- 递归中每层调用子函数后应立即检查并快照 `__tcc_err`，再清除，避免串扰；
+- `catch` 进入处理块前**快照并清空**错误槽（`__tcc_error_take`），因此连续两个
+  `catch` 不会把上一次的错误误判成这一次的。
 
 
 ## 4. `interface`：显式实现 + 胖指针 ABI（修复 G4）
@@ -411,22 +445,28 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 |---|---|---|
 | 0 `TCC_EXT` 门控 | ✅ | `tcctok.h`（新 token 追加在文件末尾，避免破坏 i386 asm 关键字）、`libtcc.c`（`-std=tcc-ext`）、`tccpp.c`（`__TCC_EXT__`、未开启时把新关键字还原为普通标识符） |
 | 1 `defer` | ✅ | `tccgen.c`：`superc_defer_parse` / `superc_defer_begin` / `superc_defer_func_end`（运行时记录栈 + 每函数调度器）、`lib/libtcc1.c`：`__tcc_defer_*` |
-| 2 `errdefer`/`err` | ✅ | `superc_errdefer_parse` / `superc_err_parse`、`__tcc_err_set/get/clear`；哨兵 `-1` + `err();` 逐层重抛 |
+| 2 `errdefer`/`err` | ✅ | `superc_errdefer_parse` / `superc_err_parse`、`__tcc_err_set/get/clear`；`err` 直接返回哨兵 `-1`，转发由 `try` 负责 |
+| 2b `T!error` / `try` / `catch` | ✅ | `superc_parse_fallible_suffix` / `superc_apply_fallible`（`FuncAttr.func_fallible`）、`superc_try_parse`（`unary()` 前缀分支）、`superc_catch_parse`（`expr_catch()` 层）、`superc_emit_propagate`（与 `err` 共用清理+哨兵路径）、`__tcc_error_take` / `__tcc_err_flag_peek` |
 | 3 `test` / `-test` / `-test-filter` | ✅ | `superc_test_parse`、`tccrun.c:tcc_run_tests`、`libtcc.c` 选项 |
 | 4 `package`/`import` | ✅ | `superc_package_parse` / `superc_import_parse`、`superc_mangle_tok`（`NAME__sym`）、`sym_find` 包回落 |
 | 5 `interface`/`impl` | ✅ | `superc_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`superc_impl_parse`（vtable 对象 `__tcc_vt_TYPE_IFACE`）、`superc_check_impl`（缺方法/参数个数/参数类型/返回类型检查）、`superc_iface_call_prep`（调用点改写）、`superc_iface_convert`（隐式/显式转换） |
 | 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；`impl IFACE for TYPE;` 仅声明并 `extern` 引入 vtable，另一 TU 提供实现 |
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_superc_macro` / `superc_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
 
-验收测试：`tcc/tests/tests2/156_superc_defer.c` … `162_superc_iface_errors.c`，由
+验收测试：`tcc/tests/tests2/156_superc_defer.c` … `164_superc_try_errors.c`，由
 `tests/tests2/Makefile` 自动加 `-std=tcc-ext`；未编译 `-DTCC_EXT` 时自动 SKIP
 （以 `__TCC_EXT__` 预定义探测）。`make -C tests/tests2 tests2.all` 两种构建下
-分别为 141 / 134 项全通过。
+分别为 143 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
+
+根目录自测（`tests/test.c`，21 个 test 块）：`make selftest`。
 
 已知限制（与设计一致）：
 
 - 运行时状态是普通全局变量（`-run` 不支持 TLS），因此 `defer`/`err` 状态是
   单线程的；
-- `err` 不做自动传播，调用方需检查哨兵并调用 `err();` 重抛；
+- `err` 一旦执行就直接返回，没有重抛形式；转发用 `try`（在返回 `T!error`
+  的函数里自动传播），就地处理用 `catch`（快照并清空错误槽）；
+- `T!error` 调用的返回值必须被 `try` 或 `catch` 消费，否则编译报错；
+- `!error` 的函数返回类型必须能表示哨兵 `-1`，因此结构体返回类型不能标注；
 - `interface` 的 `impl` 必须先于使用可见（单趟编译约束）；
 - `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）。

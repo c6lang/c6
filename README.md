@@ -7,7 +7,8 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 |---|---|
 | `defer { ... }` | 作用域/函数退出时逆序执行清理代码 |
 | `errdefer { ... }` | 仅在错误路径上执行的 `defer` |
-| `err(code, "msg")` | 设置错误槽并就地展开清理，返回哨兵值 `-1` |
+| `err(code, "msg")` | 设置错误槽、就地展开清理并直接返回 |
+| `func() T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 |
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
 | `package NAME { ... }` / `import NAME;` | 单文件与跨 TU 的包与名字修饰（`NAME__sym`） |
 | `interface` / `impl` | 胖指针（`{void *self; const VT *vt;}`）+ vtable 的接口抽象 |
@@ -20,10 +21,11 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 ```
 .
 ├── docs/plan.md      设计与实施方案（含实现状态）
+├── docs/grammar.md   扩展语法的 BNF/EBNF 规范
 ├── patches/          superc 扩展补丁（相对上游固定基线）
 ├── scripts/          bootstrap.sh：生成并搭建 TCC 工作树
-├── test.c            根目录自测：用 superc 的 test 块覆盖 err/errdefer/defer
-├── examples/         可运行示例（目前是 err_demo.c）
+├── tests/test.c      自测：用 superc 的 test 块覆盖 defer/err/try/catch
+├── examples/         可运行示例（err_demo.c、try_demo.c）
 ├── Makefile          便捷入口（bootstrap / build / test / selftest / clean）
 └── tcc/              TCC 源码树（由 bootstrap.sh 生成，不纳入本仓库）
 ```
@@ -107,8 +109,7 @@ int main(void)
 
 | 写法 | 行为 |
 |---|---|
-| `err(code, msg)` | 写入错误槽（`flag=1`），逆序执行本帧的 `errdefer` 与 `defer`，返回哨兵 `-1`（按函数返回类型转换） |
-| `err()` | **重抛**：保留已有 `id`/`msg`，继续展开清理并返回哨兵 |
+| `err(code, msg)` | 写入错误槽（`flag=1`），逆序执行本帧的 `errdefer` 与 `defer`，然后**直接返回**（返回值是哨兵 `-1`） |
 | `defer stmt;` | 任何离开作用域的路径都执行（正常 `return`、`break`、`continue`、`goto`） |
 | `errdefer stmt;` | 仅在错误路径（本帧执行了 `err`）执行，正常返回时跳过 |
 
@@ -123,11 +124,77 @@ int main(void)
 
 约定与限制：
 
-- `err` 不自动传播：调用方必须自己检查哨兵 `-1`，否则错误会被忽略；
-- 处理掉错误后要 `__tcc_err_clear()`；若只是转发，调用 `err();` 原样重抛；
+- `err` 在**返回类型标注了 `!error` 的函数里**才能用，而且一旦执行就**直接返回**，
+  同一函数里它后面的语句不会执行；
+- `err` 没有“重抛”形式：要原样转发错误，用 `try`（见下一节），它会带着错误槽一起
+  返回给调用者；
 - `err` 会离开**整个函数帧**（循环/嵌套块里的 `defer` 都会执行），无法只退出内层块；
 - `err` 不能出现在 `defer`/`errdefer` 体内（会编译报错）；
 - 返回类型为 `void` 的函数里 `err` 直接返回，不产生哨兵值。
+
+### `T!error` / `try` / `catch`
+
+函数返回类型后面加 `!error` 表示“可能失败”。`err(id, msg)` 在这类函数里是
+直接返回的简写；调用方可以用 `try` 原样传播，或用 `catch` 就地处理。
+
+```c
+/* 返回类型后面加 '!error'（也可以写在声明符后面：int parse(const char *)!error） */
+static int!error parse(const char *s)
+{
+    if (!s)
+        err(1, "string is NULL");         /* 设置错误槽并直接返回 */
+    return s[0] - '0';
+}
+
+/* try：成功时原样给出返回值，失败时把错误原样交还给调用者 */
+static int!error twice(const char *s)
+{
+    int v = (try parse(s));
+    return v * 2;
+}
+
+/* catch：拿到 err(id, msg) 的值，并自动清空错误槽 */
+int handle(const char *s)
+{
+    int v = twice(s) catch e {
+        printf("caught %d: %s\n", e.id, e.msg);
+        return -1;                        /* 处理块必须自己离开 */
+    };
+    return v;
+}
+```
+
+速查：
+
+| 写法 | 行为 |
+|---|---|
+| `int!error f(void)` / `int f(void)!error` | 声明可能失败的函数；两种位置等价 |
+| `try f()` | 调用 + 检查错误槽；失败时执行本帧 `errdefer`/`defer` 并返回哨兵 `-1` |
+| `try f();` | 语句形式，返回值被丢弃 |
+| `e = f() catch { ... }` | 只在失败时进入处理块，不绑定错误值 |
+| `f() catch e { ... }` / `f() catch (e) { ... }` | 处理块里可用 `e.id` / `e.msg` |
+| `err(id, msg)` | 设置错误槽并立即返回；必须在 `T!error` 函数里使用 |
+
+`e` 的类型就是 `error`（编译器预置的 `typedef struct __tcc_error { int id; const char *msg; } error;`），
+`catch` 在进入处理块前**快照并清空**错误槽，所以连续两个 `catch` 不会串扰。
+
+约束（违反时编译报错）：
+
+- `try` 只能出现在返回类型带 `!error` 的函数里，且操作数必须是一次调用；
+- `catch` 的操作数也必须是一次调用，被调函数要返回 `T!error`；
+- `catch` 处理块必须自己离开：`return` / `err(id, msg)` / `goto`；
+- `try` / `catch` / `err` 不能写在 `defer` / `errdefer` 体内；
+- `T!error` 函数的返回值**必须**被 `try` 或 `catch` 消费；直接赋值、参与运算、
+  作条件、`return` 出去或者当语句丢弃都会编译报错；
+- `!error` 的函数返回类型必须能表示哨兵 `-1`（标量或枚举，不能是结构体）。
+
+完整可运行示例见 [examples/try_demo.c](examples/try_demo.c)：
+
+```sh
+./tcc/tcc -B tcc -std=tcc-ext -run examples/try_demo.c
+```
+
+语法规范（EBNF）见 [docs/grammar.md](docs/grammar.md)。
 
 ### test 块
 
@@ -193,12 +260,12 @@ int main(void)
 
 ## 测试
 
-根目录的 `test.c` 用 superc 的 `test` 块自测 `err` / `errdefer` / `defer` 的语义：
+`tests/test.c` 用 superc 的 `test` 块自测 `defer` / `err` / `try` / `catch` 的语义：
 
 ```sh
-make selftest                            # 跑 test.c
-./tcc/tcc -B tcc -std=tcc-ext -test test.c
-./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=errdefer test.c   # 按描述过滤
+make selftest                            # 跑 tests/test.c
+./tcc/tcc -B tcc -std=tcc-ext -test tests/test.c
+./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=errdefer tests/test.c   # 按描述过滤
 ```
 
 输出形如：
@@ -207,7 +274,7 @@ make selftest                            # 跑 test.c
 PASS: err 写入错误码与消息并返回 -1
 PASS: errdefer 只在错误路径执行
 ...
-11 test(s), 0 failure(s)
+21 test(s), 0 failure(s)
 ```
 
 `-test` 模式下 `main` 可有可无（运行器不调用它）。
@@ -215,7 +282,7 @@ PASS: errdefer 只在错误路径执行
 更完整的回归：
 
 ```sh
-make test          # 扩展模式：tests/tests2 全量（含 156..162 的 superc 专项测试）
+make test          # 扩展模式：tests/tests2 全量（含 156..164 的 superc 专项测试）
 make test-plain    # 关闭 TCC_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make test-all      # selftest + tests2
 ```
@@ -225,6 +292,7 @@ make test-all      # selftest + tests2
 ## 实现说明
 
 - 设计文档：[docs/plan.md](docs/plan.md)（第 11 节为各阶段实现状态与限制）。
+- 语法规范：[docs/grammar.md](docs/grammar.md)（EBNF 增量语法、静态约束与重写规则）。
 - 运行时状态（defer 记录栈、错误槽）是普通全局变量：`tcc -run` 不支持 TLS，
   因此这一版是单线程语义。
 - `interface` 的 `impl` 必须先于使用点可见（TCC 单趟编译的固有限制）。

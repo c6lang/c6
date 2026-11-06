@@ -5,7 +5,7 @@
 #   make build-plain 以上游模式构建（不定义 TCC_EXT）
 #   make test        跑 tests2 全量测试（扩展模式）
 #   make test-plain  关闭扩展构建并跑同一套测试
-#   make selftest    跑根目录 test.c 里的 superc test 块
+#   make selftest    跑 tests/test.c 里的 superc test 块
 #   make test-all    selftest + tests2 全量
 #   make clean       清理 tcc/ 的构建产物
 #   make distclean   连 tcc/ 工作树一起删除
@@ -13,6 +13,7 @@
 # TCC_EXT 是编译期开关，切换模式时会自动先清理旧产物。
 
 TCC_DIR  := tcc
+SELFTEST := tests/test.c
 JOBS     ?= $(shell nproc 2>/dev/null || echo 4)
 CFLAGS   ?= -g -O0 -Wall -Wno-unused-result
 EXT      := EXTRA-DEFS=-DTCC_EXT
@@ -60,9 +61,9 @@ test: build
 test-plain: build-plain
 	$(MAKE) -C $(TCC_DIR)/tests/tests2 tests2.all
 
-# 根目录 test.c：用 superc 的 test 块自测 err / errdefer / defer
+# tests/test.c：用 superc 的 test 块自测 defer / err / try / catch
 selftest: build
-	./$(TCC_DIR)/tcc -B $(TCC_DIR) -std=tcc-ext -test test.c
+	./$(TCC_DIR)/tcc -B $(TCC_DIR) -std=tcc-ext -test $(SELFTEST)
 
 test-all: selftest test
 
