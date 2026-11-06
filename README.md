@@ -1,6 +1,6 @@
-# superc —— 带语言扩展的 TinyCC
+# c6 —— 带语言扩展的 TinyCC
 
-superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏原有 C 语义的前提下
+c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏原有 C 语义的前提下
 加入了一组系统编程友好的语言扩展：
 
 | 扩展 | 作用 |
@@ -17,7 +17,7 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
 
-扩展默认不启用，且是**编译期可裁剪**的：不定义 `TCC_EXT` 构建出的编译器与上游 TCC 行为完全一致。
+扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
 
 ## 目录结构
 
@@ -25,9 +25,9 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 .
 ├── docs/plan.md      设计与实施方案（含实现状态）
 ├── docs/grammar.md   扩展语法的 BNF/EBNF 规范
-├── patches/          superc 扩展补丁（相对上游固定基线）
+├── patches/          c6 扩展补丁（相对上游固定基线）
 ├── scripts/          bootstrap.sh：生成并搭建 TCC 工作树
-├── tests/            superc 全部自测：*.c 是 test 块，errors/ 是编译期诊断
+├── tests/            c6 全部自测：*.c 是 test 块，errors/ 是编译期诊断
 ├── examples/         可运行示例（err_demo.c、try_demo.c、slice_demo.c）
 ├── Makefile          便捷入口（bootstrap / build / selftest / test / clean）
 └── tcc/              TCC 源码树（由 bootstrap.sh 生成，不纳入本仓库）
@@ -38,14 +38,14 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 依赖：`git`、`make`、C 编译器（gcc/clang）、`binutils`。
 
 ```sh
-# 1. 拉取上游 TCC，检出固定基线并应用 superc 补丁
+# 1. 拉取上游 TCC，检出固定基线并应用 c6 补丁
 ./scripts/bootstrap.sh          # 等价于 make bootstrap
 
 # 2. 构建（打开扩展）
-make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DTCC_EXT
+make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 
 # 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
-./tcc/tcc -B tcc -std=tcc-ext -run hello.c
+./tcc/tcc -B tcc -std=c6 -run hello.c
 ```
 
 如果网络需要代理，按环境要求导出即可（`git` 会读取）：
@@ -56,16 +56,16 @@ export https_proxy=http://localhost:2334
 export all_proxy=http://localhost:2334
 ```
 
-离线环境可以用 `SUPERC_TCC_URL` 指向本地 TCC 克隆：
+离线环境可以用 `C6_TCC_URL` 指向本地 TCC 克隆：
 
 ```sh
-SUPERC_TCC_URL=/path/to/tinycc ./scripts/bootstrap.sh
+C6_TCC_URL=/path/to/tinycc ./scripts/bootstrap.sh
 ```
 
 ## 使用
 
-扩展需要**编译器打开 `TCC_EXT`** 并且**每个翻译单元加 `-std=tcc-ext`**（该开关同时定义
-`__TCC_EXT__`，方便写条件编译）。
+扩展需要**编译器打开 `C6_EXT`** 并且**每个翻译单元加 `-std=c6`**（该开关同时定义
+`__C6__`，方便写条件编译）。
 
 ### defer / errdefer / err
 
@@ -105,7 +105,7 @@ int main(void)
 完整可运行示例见 [examples/err_demo.c](examples/err_demo.c)：
 
 ```sh
-./tcc/tcc -B tcc -std=tcc-ext -run examples/err_demo.c
+./tcc/tcc -B tcc -std=c6 -run examples/err_demo.c
 ```
 
 `err` 速查：
@@ -199,7 +199,7 @@ int handle(const char *s)
 完整可运行示例见 [examples/try_demo.c](examples/try_demo.c)：
 
 ```sh
-./tcc/tcc -B tcc -std=tcc-ext -run examples/try_demo.c
+./tcc/tcc -B tcc -std=c6 -run examples/try_demo.c
 ```
 
 语法规范（EBNF）见 [docs/grammar.md](docs/grammar.md)。
@@ -214,8 +214,8 @@ test "add works" {
 ```
 
 ```sh
-./tcc/tcc -B tcc -std=tcc-ext -test tests.c               # 运行全部 test 块
-./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=add tests.c
+./tcc/tcc -B tcc -std=c6 -test tests.c               # 运行全部 test 块
+./tcc/tcc -B tcc -std=c6 -test -test-filter=add tests.c
 ```
 
 运行器输出 `PASS:` / `FAIL:` 行与 `N test(s), M failure(s)`，全部通过时退出码为 0。
@@ -322,9 +322,9 @@ int main(void)
 
 旧代码怎么处理：
 
-- **不开启扩展就完全不变**：不带 `-std=tcc-ext` 编译的翻译单元与上游 TCC
+- **不开启扩展就完全不变**：不带 `-std=c6` 编译的翻译单元与上游 TCC
   逐字节一致，老项目（包括 TCC 自己的源码）不需要改任何一行；
-- 扩展是**按翻译单元**开启的：一旦给某个 `.c` 加了 `-std=tcc-ext`，这个 TU
+- 扩展是**按翻译单元**开启的：一旦给某个 `.c` 加了 `-std=c6`，这个 TU
   里出现的所有定义都要满足规则（包括它包含的头文件里的函数体）；
   系统头文件实测可以正常通过（`stdio.h` / `stdlib.h` / `pthread.h` 等）；
 - K&R 老式定义：**形参声明表不受影响**（它们是形参），函数体里的局部变量
@@ -432,7 +432,7 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 完整可运行示例见 [examples/slice_demo.c](examples/slice_demo.c)：
 
 ```sh
-./tcc/tcc -B tcc -std=tcc-ext -run examples/slice_demo.c
+./tcc/tcc -B tcc -std=c6 -run examples/slice_demo.c
 ```
 
 跨 TU 时两边各自写 `T[:]` 即可（布局固定），不需要额外声明。
@@ -449,7 +449,7 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 
 ## 测试
 
-superc 的测试全部在 `tests/` 下，都用 superc 自己的 `test` 块写：
+c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 
 ```
 tests/
@@ -477,9 +477,9 @@ tests/run-tests.sh --list           # 列出会跑的文件
 单个文件也可以直接跑：
 
 ```sh
-./tcc/tcc -B tcc -std=tcc-ext -test tests/err.c
-./tcc/tcc -B tcc -std=tcc-ext -test tests/slice.c tests/tu/slice.c
-./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=切片 tests/slice.c   # 按描述过滤
+./tcc/tcc -B tcc -std=c6 -test tests/err.c
+./tcc/tcc -B tcc -std=c6 -test tests/slice.c tests/tu/slice.c
+./tcc/tcc -B tcc -std=c6 -test -test-filter=切片 tests/slice.c   # 按描述过滤
 ```
 
 输出形如：
@@ -516,11 +516,11 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 
 ```sh
 make test          # 扩展模式：上游 tests2 全量
-make test-plain    # 关闭 TCC_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
+make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make test-all      # selftest + tests2
 ```
 
-> 切换模式会先 `make clean` 重建，因为 `TCC_EXT` 是编译期开关。
+> 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
 
 ## 实现说明
 

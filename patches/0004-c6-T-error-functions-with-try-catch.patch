@@ -1,7 +1,7 @@
 From dfa79b74ef00449b33caeb06eec776c4ead277ca Mon Sep 17 00:00:00 2001
-From: superc <superc@localhost>
+From: c6 <c6@localhost>
 Date: Fri, 6 Nov 2026 18:16:22 +0800
-Subject: [PATCH 4/10] superc: T!error functions with try/catch
+Subject: [PATCH 4/10] c6: T!error functions with try/catch
 
 - 'T!error' suffix on function declarators (before the declarator,
   after a '*' or after the whole declarator), stored in FuncAttr and
@@ -18,33 +18,33 @@ Subject: [PATCH 4/10] superc: T!error functions with try/catch
 - A 'T!error' call result must be consumed by 'try' or 'catch';
   dropping it (assignment, operator, condition, return, statement) is
   diagnosed instead of silently losing the error.
-- Reset the superc parser state per translation unit so that an error
+- Reset the c6 parser state per translation unit so that an error
   longjmp cannot leak into the next tcc state.
 - Keyword ids stay aligned with the enum when a keyword name is
   already interned (the x86 'test' mnemonic).
-- Tests: 163_superc_try, 164_superc_try_errors; 157/158 updated.
-- Drop the accidentally committed .superc-mode build marker.
+- Tests: 163_c6_try, 164_c6_try_errors; 157/158 updated.
+- Drop the accidentally committed .c6-mode build marker.
 ---
  .gitignore                                |   3 +
- .superc-mode                              |   1 -
+ .c6-mode                              |   1 -
  lib/libtcc1.c                             |  38 ++
  tcc.h                                     |   3 +-
  tccgen.c                                  | 433 ++++++++++++++++++++--
  tccpp.c                                   |  31 +-
  tcctok.h                                  |   2 +
- tests/tests2/157_superc_err.c             |  88 ++++-
- tests/tests2/158_superc_test.c            |  17 +-
- tests/tests2/163_superc_try.c             | 213 +++++++++++
- tests/tests2/163_superc_try.expect        |  29 ++
- tests/tests2/164_superc_try_errors.c      |  41 ++
- tests/tests2/164_superc_try_errors.expect |  32 ++
+ tests/tests2/157_c6_err.c             |  88 ++++-
+ tests/tests2/158_c6_test.c            |  17 +-
+ tests/tests2/163_c6_try.c             | 213 +++++++++++
+ tests/tests2/163_c6_try.expect        |  29 ++
+ tests/tests2/164_c6_try_errors.c      |  41 ++
+ tests/tests2/164_c6_try_errors.expect |  32 ++
  tests/tests2/Makefile                     |   1 +
  14 files changed, 877 insertions(+), 55 deletions(-)
- delete mode 100644 .superc-mode
- create mode 100644 tests/tests2/163_superc_try.c
- create mode 100644 tests/tests2/163_superc_try.expect
- create mode 100644 tests/tests2/164_superc_try_errors.c
- create mode 100644 tests/tests2/164_superc_try_errors.expect
+ delete mode 100644 .c6-mode
+ create mode 100644 tests/tests2/163_c6_try.c
+ create mode 100644 tests/tests2/163_c6_try.expect
+ create mode 100644 tests/tests2/164_c6_try_errors.c
+ create mode 100644 tests/tests2/164_c6_try_errors.expect
 
 diff --git a/.gitignore b/.gitignore
 index 6870b8d..622606e 100644
@@ -55,12 +55,12 @@ index 6870b8d..622606e 100644
  tests/tests2/fred.txt
  libtcc.dylib
 +
-+# superc: build-mode marker written by the wrapper Makefile
-+.superc-mode
-diff --git a/.superc-mode b/.superc-mode
++# c6: build-mode marker written by the wrapper Makefile
++.c6-mode
+diff --git a/.c6-mode b/.c6-mode
 deleted file mode 100644
 index bdcc60e..0000000
---- a/.superc-mode
+--- a/.c6-mode
 +++ /dev/null
 @@ -1 +0,0 @@
 -ext
@@ -87,7 +87,7 @@ index 45211ec..86925ed 100644
      tcc_err_msg = 0;
  }
  
-+/* superc 'error' value: layout must match the 'error' typedef emitted by
++/* c6 'error' value: layout must match the 'error' typedef emitted by
 +   tcc_predefs(), i.e. 'struct __tcc_error { int id; const char *msg; }'. */
 +typedef struct TccErrorValue {
 +    int id;
@@ -126,7 +126,7 @@ index 86684e9..394971f 100644
      func_args   : 8, /* PE __stdcall args */
      func_alwinl : 1, /* always_inline */
 -    xxxx        : 15;
-+    func_fallible : 1, /* superc: declared with the 'T!error' suffix */
++    func_fallible : 1, /* c6: declared with the 'T!error' suffix */
 +    xxxx        : 14;
  };
  
@@ -135,50 +135,50 @@ diff --git a/tccgen.c b/tccgen.c
 index cb52e43..5ad0c66 100644
 --- a/tccgen.c
 +++ b/tccgen.c
-@@ -155,13 +155,28 @@ static int superc_implicit_ret0;
- static int superc_iface_self_pending;
- static int superc_iface_self_loc;
- static CType superc_iface_self_type;  /* generated 'test' function: return 0 */
+@@ -155,13 +155,28 @@ static int c6_implicit_ret0;
+ static int c6_iface_self_pending;
+ static int c6_iface_self_loc;
+ static CType c6_iface_self_type;  /* generated 'test' function: return 0 */
 -
 +/* non-zero while vtop holds the result of a call to a 'T!error' function */
-+static int superc_value_fallible;
++static int c6_value_fallible;
 +/* symbol of the function being compiled (needed by 'try' to check that the
 +   enclosing function may propagate errors) */
-+static Sym *superc_func_sym;
++static Sym *c6_func_sym;
 +/* set by block() when the statement just parsed leaves the block */
-+static int superc_last_stmt_leaves;
++static int c6_last_stmt_leaves;
 +/* set by type_decl() when it consumed a '!error' suffix that sits between
 +   the pointer stars and the declarator name ('int *!error f(void)') */
-+static int superc_decl_fallible;
++static int c6_decl_fallible;
 +
-+static void superc_fallible_use(void);
-+static int superc_parse_fallible_suffix(void);
- static void superc_defer_func_init(void);
- static void superc_defer_func_end(void);
- static void superc_defer_begin(int mode, int depth);
- static void superc_defer_parse(int kind);
- static void superc_err_parse(void);
- static void superc_errdefer_parse(void);
-+static void superc_emit_propagate(void);
-+static void superc_try_parse(void);
-+static void superc_catch_parse(void);
- static void superc_test_parse(void);
- static void superc_package_parse(void);
- static void superc_import_parse(void);
++static void c6_fallible_use(void);
++static int c6_parse_fallible_suffix(void);
+ static void c6_defer_func_init(void);
+ static void c6_defer_func_end(void);
+ static void c6_defer_begin(int mode, int depth);
+ static void c6_defer_parse(int kind);
+ static void c6_err_parse(void);
+ static void c6_errdefer_parse(void);
++static void c6_emit_propagate(void);
++static void c6_try_parse(void);
++static void c6_catch_parse(void);
+ static void c6_test_parse(void);
+ static void c6_package_parse(void);
+ static void c6_import_parse(void);
 @@ -479,6 +494,17 @@ ST_FUNC int tccgen_compile(TCCState *s1)
      func_ind = -1;
      anon_sym = SYM_FIRST_ANOM;
      nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    /* the state below outlives a translation unit: after an error the
 +       parser is abandoned mid-recursion, so start each unit from scratch */
 +    defer_state.body_depth = 0;
 +    defer_state.enabled = 0;
 +    defer_state.has_sites = 0;
-+    superc_func_sym = NULL;
-+    superc_value_fallible = 0;
-+    superc_last_stmt_leaves = 0;
-+    superc_decl_fallible = 0;
++    c6_func_sym = NULL;
++    c6_value_fallible = 0;
++    c6_last_stmt_leaves = 0;
++    c6_decl_fallible = 0;
 +#endif
      debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
      global_expr = 0;
@@ -187,8 +187,8 @@ index cb52e43..5ad0c66 100644
  {
      int op, x, u;
  
-+#ifdef TCC_EXT
-+    superc_fallible_use();  /* 'if (f())' would drop the error */
++#ifdef C6_EXT
++    c6_fallible_use();  /* 'if (f())' would drop the error */
 +#endif
      gvtst_set(inv, t);
      t = vtop->jtrue, u = vtop->jfalse;
@@ -197,7 +197,7 @@ index cb52e43..5ad0c66 100644
        fa->func_ctor = 1;
      if (fa1->func_dtor)
        fa->func_dtor = 1;
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    if (fa1->func_fallible)
 +      fa->func_fallible = 1;
 +#endif
@@ -208,8 +208,8 @@ index cb52e43..5ad0c66 100644
  /* get address of vtop (vtop MUST BE an lvalue) */
  ST_FUNC void gaddrof(void)
  {
-+#ifdef TCC_EXT
-+    superc_value_fallible = 0;      /* gaddrof only applies to lvalues */
++#ifdef C6_EXT
++    c6_value_fallible = 0;      /* gaddrof only applies to lvalues */
 +#endif
      vtop->r &= ~VT_LVAL;
      /* tricky: if saved lvalue, then we can go back to lvalue */
@@ -218,8 +218,8 @@ index cb52e43..5ad0c66 100644
      int t1, t2, bt1, bt2, t;
      CType type1, combtype;
      int op_class = op;
-+#ifdef TCC_EXT
-+    superc_fallible_use();          /* 'f() + x' loses the error */
++#ifdef C6_EXT
++    c6_fallible_use();          /* 'f() + x' loses the error */
 +#endif
  
      if (op == TOK_SHR || op == TOK_SAR || op == TOK_SHL)
@@ -228,8 +228,8 @@ index cb52e43..5ad0c66 100644
  /* cast 'vtop' to 'type'. Casting to bitfields is forbidden. */
  static void gen_cast(CType *type)
  {
-+#ifdef TCC_EXT
-+    superc_fallible_use();          /* a cast would drop the error */
++#ifdef C6_EXT
++    c6_fallible_use();          /* a cast would drop the error */
 +#endif
      int sbt, dbt, sf, df, c;
      int dbt_bt, sbt_bt, ds, ss, bits, trunc;
@@ -238,18 +238,18 @@ index cb52e43..5ad0c66 100644
  ST_FUNC void vstore(void)
  {
      int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
-+#ifdef TCC_EXT
-+    superc_fallible_use();          /* 'x = f()' would drop the error */
++#ifdef C6_EXT
++    c6_fallible_use();          /* 'x = f()' would drop the error */
 +#endif
  
      ft = vtop[-1].type.t;
- #ifdef TCC_EXT
+ #ifdef C6_EXT
 @@ -3982,6 +4027,9 @@ ST_FUNC void vstore(void)
  /* post defines POST/PRE add. c is the token ++ or -- */
  ST_FUNC void inc(int post, int c)
  {
-+#ifdef TCC_EXT
-+    superc_fallible_use();
++#ifdef C6_EXT
++    c6_fallible_use();
 +#endif
      test_lvalue();
      vdup(); /* save lvalue */
@@ -258,11 +258,11 @@ index cb52e43..5ad0c66 100644
  	    ret = pointed_type(type);
      }
  
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    /* 'int *!error f(void)': the annotation may also sit between the
 +       pointer stars and the declarator name */
-+    if (tcc_state->superc_ext && superc_parse_fallible_suffix())
-+        superc_decl_fallible = 1;
++    if (tcc_state->c6_ext && c6_parse_fallible_suffix())
++        c6_decl_fallible = 1;
 +#endif
      if (tok == '(') {
  	/* This is possibly a parameter type list for abstract declarators
@@ -271,8 +271,8 @@ index cb52e43..5ad0c66 100644
  /* indirection with full error checking and bound check */
  ST_FUNC void indir(void)
  {
-+#ifdef TCC_EXT
-+    superc_fallible_use();          /* '*f()' would drop the error */
++#ifdef C6_EXT
++    c6_fallible_use();          /* '*f()' would drop the error */
 +#endif
      if ((vtop->type.t & VT_BTYPE) != VT_PTR) {
          if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
@@ -281,9 +281,9 @@ index cb52e43..5ad0c66 100644
  	n = 0x7f800000;
  	goto special_math_val;
  
-+#ifdef TCC_EXT
-+    case TOK_SUPERC_TRY:
-+        superc_try_parse();
++#ifdef C6_EXT
++    case TOK_C6_TRY:
++        c6_try_parse();
 +        break;
 +#endif
 +
@@ -294,14 +294,14 @@ index cb52e43..5ad0c66 100644
      /* post operations */
      while (1) {
          if (tok == TOK_INC || tok == TOK_DEC) {
-+#ifdef TCC_EXT
-+            superc_fallible_use();
++#ifdef C6_EXT
++            c6_fallible_use();
 +#endif
              inc(1, tok);
              next();
          } else if (tok == '.' || tok == TOK_ARROW) {
-+#ifdef TCC_EXT
-+            superc_fallible_use();  /* 'f().x' would drop the error */
++#ifdef C6_EXT
++            c6_fallible_use();  /* 'f().x' would drop the error */
 +#endif
              int qualifiers, cumofs;
              /* field */ 
@@ -310,8 +310,8 @@ index cb52e43..5ad0c66 100644
              gen_op('+');
              indir();
              skip(']');
-+#ifdef TCC_EXT
-+            superc_value_fallible = 0;
++#ifdef C6_EXT
++            c6_value_fallible = 0;
 +#endif
          } else if (tok == '(') {
              SValue ret;
@@ -320,11 +320,11 @@ index cb52e43..5ad0c66 100644
              next();
              vcheck_cmp(); /* the generators don't like VT_CMP on vtop */
              gfunc_call(nb_args);
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            /* remember whether this value is the result of a call to a
 +               function declared with the 'T!error' suffix ('try'/'catch'
 +               consume this flag) */
-+            superc_value_fallible = s->f.func_fallible;
++            c6_value_fallible = s->f.func_fallible;
 +#endif
  
              if (ret_nregs < 0) {
@@ -333,15 +333,15 @@ index cb52e43..5ad0c66 100644
      return 0;
  }
  
-+/* superc: 'f() catch e { ... }' binds tighter than '?:' and '=' but looser
++/* c6: 'f() catch e { ... }' binds tighter than '?:' and '=' but looser
 +   than '||', so 'x = f() catch e {...}' initializes 'x' with the value of
 +   the whole catch expression (only on the success path). */
 +static void expr_catch(void)
 +{
 +    expr_lor();
-+#ifdef TCC_EXT
-+    if (tok == TOK_SUPERC_CATCH && tcc_state->superc_ext)
-+        superc_catch_parse();
++#ifdef C6_EXT
++    if (tok == TOK_C6_CATCH && tcc_state->c6_ext)
++        c6_catch_parse();
 +#endif
 +}
 +
@@ -356,18 +356,18 @@ index cb52e43..5ad0c66 100644
      if (tok == '?') {
          next();
  	c = condition_3way();
-@@ -7950,32 +8040,19 @@ static void superc_errdefer_parse(void)
-     superc_defer_parse(1);
+@@ -7950,32 +8040,19 @@ static void c6_errdefer_parse(void)
+     c6_defer_parse(1);
  }
  
 -/* parse "err(ID, MSG)" or "err()": record the error, run the error-path
 -   cleanups (errdefer and defer) of the whole function frame and return the
 -   sentinel value so that callers can propagate. */
--static void superc_err_parse(void)
+-static void c6_err_parse(void)
 +/* Emit the error-path exit of the current function: build the sentinel
 +   value of the declared return type, run this frame's errdefer/defer in
 +   reverse order and return the sentinel.  Used by 'err()' and by 'try'. */
-+static void superc_emit_propagate(void)
++static void c6_emit_propagate(void)
  {
      int b, ret_off = 0, ret_saved = 0;
  
@@ -396,7 +396,7 @@ index cb52e43..5ad0c66 100644
          vpushi(TCC_ERR_SENTINEL);
          vtop->type = func_vt;   /* '(TYPE)-1', no conversion warning */
          loc = (loc - size) & -align;
-@@ -7992,11 +8069,37 @@ static void superc_err_parse(void)
+@@ -7992,11 +8069,37 @@ static void c6_err_parse(void)
          vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
      if (b)
          gfunc_return(&func_vt);
@@ -409,11 +409,11 @@ index cb52e43..5ad0c66 100644
 +   (errdefer and defer) of the whole function frame and return.  'err'
 +   always returns immediately, so there is no re-raise form: callers that
 +   want to forward an error use 'try' instead. */
-+static void superc_err_parse(void)
++static void c6_err_parse(void)
 +{
 +    if (defer_state.body_depth > 0)
 +        tcc_error("'err' is not allowed in a defer body");
-+    if (!superc_func_sym || !superc_func_sym->type.ref->f.func_fallible)
++    if (!c6_func_sym || !c6_func_sym->type.ref->f.func_fallible)
 +        tcc_error("'err' requires the enclosing function to return 'T!error'");
 +
 +    skip('(');
@@ -427,7 +427,7 @@ index cb52e43..5ad0c66 100644
 +    skip(')');
 +    gfunc_call(2);
 +
-+    superc_emit_propagate();
++    c6_emit_propagate();
 +    skip(';');
 +}
 +
@@ -435,7 +435,7 @@ index cb52e43..5ad0c66 100644
  /* parse 'test "description" { ... }' at file scope: synthesize
     'static int __tcc_test_N(void) { ... }' and remember the description
     so that -test can run it. */
-@@ -8037,6 +8140,8 @@ static void superc_test_parse(void)
+@@ -8037,6 +8140,8 @@ static void c6_test_parse(void)
      fs = sym_push(SYM_FIELD, &int_type, 0, 0);
      fs->f.func_call = FUNC_CDECL;
      fs->f.func_type = FUNC_NEW;
@@ -448,9 +448,9 @@ index cb52e43..5ad0c66 100644
      --local_scope;
  }
  
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +/* ------------------------------------------------------------------------- */
-+/* superc 'try' / 'catch'                                                    */
++/* c6 'try' / 'catch'                                                    */
 +/*                                                                           */
 +/* 'try f()'             : if the error slot is set after the call, run this  */
 +/*                         frame's errdefer/defer in reverse order and return */
@@ -462,7 +462,7 @@ index cb52e43..5ad0c66 100644
 +
 +/* emit "__tcc_err_flag_get() != 0" and return a jump that is taken when the
 +   error slot is empty, i.e. the success path of 'try' / 'catch' */
-+static int superc_err_flag_jump(void)
++static int c6_err_flag_jump(void)
 +{
 +    int slot = (loc - (int)sizeof(int)) & -(int)PTR_SIZE;
 +
@@ -481,17 +481,17 @@ index cb52e43..5ad0c66 100644
 +/* A value of a 'T!error' function may only be consumed by 'try' or by
 +   'catch'.  Any other use (operator, cast, assignment, discarded result)
 +   would drop the error silently, so it is rejected here. */
-+static void superc_fallible_use(void)
++static void c6_fallible_use(void)
 +{
-+    if (superc_value_fallible) {
-+        superc_value_fallible = 0;
++    if (c6_value_fallible) {
++        c6_value_fallible = 0;
 +        tcc_error("the result of a 'T!error' function must be used with "
 +                  "'try' or 'catch'");
 +    }
 +}
 +
 +/* push a void value: the expression statement parser always pops one */
-+static void superc_push_void(void)
++static void c6_push_void(void)
 +{
 +    vpushi(0);
 +    vtop->type.t = VT_VOID;
@@ -500,14 +500,14 @@ index cb52e43..5ad0c66 100644
 +/* Take the already-evaluated operand off the value stack, remembering its
 +   value for the success path (registers are flushed so that the cleanup
 +   calls emitted below cannot clobber it). */
-+static int superc_save_operand(const char *kw, SValue *sv)
++static int c6_save_operand(const char *kw, SValue *sv)
 +{
 +    int has_value;
 +
-+    if (!superc_value_fallible)
++    if (!c6_value_fallible)
 +        tcc_error("'%s' requires a call to a function returning 'T!error'",
 +                  kw);
-+    superc_value_fallible = 0;
++    c6_value_fallible = 0;
 +    has_value = (vtop->type.t & VT_BTYPE) != VT_VOID;
 +    if (has_value) {
 +        save_regs(0);
@@ -520,50 +520,50 @@ index cb52e43..5ad0c66 100644
 +}
 +
 +/* 'try f()': the operand is parsed here (prefix position in unary()). */
-+static void superc_try_parse(void)
++static void c6_try_parse(void)
 +{
 +    SValue sv;
 +    int has_value, skip;
 +
-+    if (!superc_ext_on())
-+        tcc_error("'try' requires -std=tcc-ext");
++    if (!c6_ext_on())
++        tcc_error("'try' requires -std=c6");
 +    if (defer_state.body_depth > 0)
 +        tcc_error("'try' is not allowed in a defer body");
-+    if (!superc_func_sym || !superc_func_sym->type.ref->f.func_fallible)
++    if (!c6_func_sym || !c6_func_sym->type.ref->f.func_fallible)
 +        tcc_error("'try' requires the enclosing function to return 'T!error'");
 +    next();                             /* skip 'try' */
-+    superc_value_fallible = 0;
++    c6_value_fallible = 0;
 +    /* 'try' starts from a clean slot: only errors raised by the operand
 +       itself can be propagated, and the slot is empty afterwards */
 +    save_regs(0);
 +    vpush_helper_func(tok_alloc_const("__tcc_err_clear"));
 +    gfunc_call(0);
 +    unary();                            /* the called function */
-+    has_value = superc_save_operand("try", &sv);
-+    skip = superc_err_flag_jump();      /* taken when no error is pending */
-+    superc_emit_propagate();            /* failure path: clean up + return */
++    has_value = c6_save_operand("try", &sv);
++    skip = c6_err_flag_jump();      /* taken when no error is pending */
++    c6_emit_propagate();            /* failure path: clean up + return */
 +    gsym(skip);
 +    if (has_value)
 +        vpushv(&sv);
 +    else
-+        superc_push_void();
++        c6_push_void();
 +}
 +
 +/* 'f() catch [e] { ... }': the operand has already been parsed by
 +   expr_catch(), so only the handler is compiled here. */
-+static void superc_catch_parse(void)
++static void c6_catch_parse(void)
 +{
 +    SValue sv;
 +    struct scope o;
 +    Sym *ev;
 +    int has_value, succ, saved_nocode;
 +
-+    if (!superc_ext_on())
-+        tcc_error("'catch' requires -std=tcc-ext");
++    if (!c6_ext_on())
++        tcc_error("'catch' requires -std=c6");
 +    if (defer_state.body_depth > 0)
 +        tcc_error("'catch' is not allowed in a defer body");
-+    has_value = superc_save_operand("catch", &sv);
-+    succ = superc_err_flag_jump();      /* taken when no error is pending */
++    has_value = c6_save_operand("catch", &sv);
++    succ = c6_err_flag_jump();      /* taken when no error is pending */
 +    next();                             /* skip 'catch' */
 +
 +    new_scope(&o);
@@ -613,7 +613,7 @@ index cb52e43..5ad0c66 100644
 +       success path.  When the compiler cannot prove that the body always
 +       leaves, emit a trap rather than silently resuming the success path. */
 +    if (!(nocode_wanted & CODE_OFF_BIT) && !(saved_nocode & CODE_OFF_BIT)) {
-+        if (!superc_last_stmt_leaves)
++        if (!c6_last_stmt_leaves)
 +            tcc_error("'catch' body must end with 'return', 'err()' or 'goto'");
 +        vpush_helper_func(tok_alloc_const("__tcc_catch_fallthrough"));
 +        gfunc_call(0);
@@ -625,7 +625,7 @@ index cb52e43..5ad0c66 100644
 +    if (has_value)
 +        vpushv(&sv);
 +    else
-+        superc_push_void();
++        c6_push_void();
 +}
 +#endif
 +
@@ -636,8 +636,8 @@ index cb52e43..5ad0c66 100644
  
  again:
      t = tok;
-+#ifdef TCC_EXT
-+    superc_last_stmt_leaves = 0;
++#ifdef C6_EXT
++    c6_last_stmt_leaves = 0;
 +#endif
      /* If the token carries a value, next() might destroy it. Only with
         invalid code such as f(){"123"4;} */
@@ -645,8 +645,8 @@ index cb52e43..5ad0c66 100644
 @@ -8317,6 +8606,7 @@ again:
  
      } else if (t == TOK_RETURN) {
- #ifdef TCC_EXT
-+        superc_last_stmt_leaves = 1;
+ #ifdef C6_EXT
++        c6_last_stmt_leaves = 1;
          if (defer_state.body_depth > 0)
              tcc_error("'return' is not allowed in a defer body");
          ret_off = 0;
@@ -654,8 +654,8 @@ index cb52e43..5ad0c66 100644
          b = (func_vt.t & VT_BTYPE) != VT_VOID;
          if (tok != ';') {
              gexpr();
-+#ifdef TCC_EXT
-+            superc_fallible_use();  /* 'return f();' would drop the error */
++#ifdef C6_EXT
++            c6_fallible_use();  /* 'return f();' would drop the error */
 +#endif
              if (b) {
                  gen_assign_cast(&func_vt);
@@ -663,39 +663,39 @@ index cb52e43..5ad0c66 100644
 @@ -8374,6 +8667,7 @@ again:
  
      } else if (t == TOK_BREAK) {
- #ifdef TCC_EXT
-+        superc_last_stmt_leaves = 1;
+ #ifdef C6_EXT
++        c6_last_stmt_leaves = 1;
          if (defer_state.body_depth > 0)
              tcc_error("'break' is not allowed in a defer body");
  #endif
 @@ -8389,6 +8683,7 @@ again:
  
      } else if (t == TOK_CONTINUE) {
- #ifdef TCC_EXT
-+        superc_last_stmt_leaves = 1;
+ #ifdef C6_EXT
++        c6_last_stmt_leaves = 1;
          if (defer_state.body_depth > 0)
              tcc_error("'continue' is not allowed in a defer body");
  #endif
 @@ -8415,8 +8710,22 @@ again:
-     } else if (t == TOK_SUPERC_ERR) {
-         if (!superc_ext_on())
-             tcc_error("'err' requires -std=tcc-ext");
+     } else if (t == TOK_C6_ERR) {
+         if (!c6_ext_on())
+             tcc_error("'err' requires -std=c6");
 -        else
 +        else {
-+            superc_last_stmt_leaves = 1;
-             superc_err_parse();
++            c6_last_stmt_leaves = 1;
+             c6_err_parse();
 +        }
 +
-+    } else if (t == TOK_SUPERC_TRY) {
++    } else if (t == TOK_C6_TRY) {
 +        /* 'try f();' is an ordinary expression statement */
-+        if (!superc_ext_on())
-+            tcc_error("'try' requires -std=tcc-ext");
++        if (!c6_ext_on())
++            tcc_error("'try' requires -std=c6");
 +        unget_tok(t);
 +        goto expr;
 +
-+    } else if (t == TOK_SUPERC_CATCH) {
-+        if (!superc_ext_on())
-+            tcc_error("'catch' requires -std=tcc-ext");
++    } else if (t == TOK_C6_CATCH) {
++        if (!c6_ext_on())
++            tcc_error("'catch' requires -std=c6");
 +        tcc_error("'catch' has no operand");
  #endif
  
@@ -703,8 +703,8 @@ index cb52e43..5ad0c66 100644
 @@ -8543,6 +8852,7 @@ again:
  
      } else if (t == TOK_GOTO) {
- #ifdef TCC_EXT
-+        superc_last_stmt_leaves = 1;
+ #ifdef C6_EXT
++        c6_last_stmt_leaves = 1;
          if (defer_state.body_depth > 0)
              tcc_error("'goto' is not allowed in a defer body");
  #endif
@@ -712,13 +712,13 @@ index cb52e43..5ad0c66 100644
                  if (flags & STMT_EXPR) {
                      vpop();
                      gexpr();
-+#ifdef TCC_EXT
-+                    superc_fallible_use();  /* 'f();' would drop the error */
++#ifdef C6_EXT
++                    c6_fallible_use();  /* 'f();' would drop the error */
 +#endif
                  } else {
                      gexpr();
-+#ifdef TCC_EXT
-+                    superc_fallible_use();
++#ifdef C6_EXT
++                    c6_fallible_use();
 +#endif
                      vpop();
                  }
@@ -727,10 +727,10 @@ index cb52e43..5ad0c66 100644
      func_vt = sym->type.ref->type;
      func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
      func_old = sym->type.ref->f.func_type == FUNC_OLD;
-+#ifdef TCC_EXT
-+    superc_func_sym = sym;
-+    superc_value_fallible = 0;
-+    superc_last_stmt_leaves = 0;
++#ifdef C6_EXT
++    c6_func_sym = sym;
++    c6_value_fallible = 0;
++    c6_last_stmt_leaves = 0;
 +#endif
  
      /* NOTE: we patch the symbol size later */
@@ -739,10 +739,10 @@ index cb52e43..5ad0c66 100644
  }
  #endif
  
-+#ifdef TCC_EXT
-+/* Consume the superc '!error' suffix when present: 'int!error f(void)' and
++#ifdef C6_EXT
++/* Consume the c6 '!error' suffix when present: 'int!error f(void)' and
 +   'int f(void)!error' mean the same, namely that f propagates errors. */
-+static int superc_parse_fallible_suffix(void)
++static int c6_parse_fallible_suffix(void)
 +{
 +    if (tok != '!')
 +        return 0;
@@ -754,7 +754,7 @@ index cb52e43..5ad0c66 100644
 +}
 +
 +/* Turn the '!error' annotation of TYPE into a property of the function. */
-+static void superc_apply_fallible(CType *type)
++static void c6_apply_fallible(CType *type)
 +{
 +    CType *ft = type;
 +    int bt;
@@ -780,25 +780,25 @@ index cb52e43..5ad0c66 100644
      Sym *sym, *sa;
      AttributeDef ad, adbase;
      ElfSym *esym;
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    int fallible;
 +#endif
  
      while (1) {
  
          oldint = 0;
- #ifdef TCC_EXT
+ #ifdef C6_EXT
 +        fallible = 0;
-         if (l == VT_CONST && tcc_state->superc_ext) {
-             if (superc_is_test_kw(tok)) {
-                 superc_test_parse();
+         if (l == VT_CONST && tcc_state->c6_ext) {
+             if (c6_is_test_kw(tok)) {
+                 c6_test_parse();
 @@ -9989,6 +10348,11 @@ static int decl(int l)
                  break;
              }
          }
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        /* 'T!error ...' : the annotation comes before the declarator */
-+        if (tcc_state->superc_ext && superc_parse_fallible_suffix())
++        if (tcc_state->c6_ext && c6_parse_fallible_suffix())
 +            fallible = 1;
 +#endif
  
@@ -808,30 +808,30 @@ index cb52e43..5ad0c66 100644
          while (1) { /* iterate thru each declaration */
              type = btype;
  	    ad = adbase;
-+#ifdef TCC_EXT
-+            superc_decl_fallible = 0;
++#ifdef C6_EXT
++            c6_decl_fallible = 0;
 +#endif
              type_decl(&type, &ad, &v, l == VT_CMP ? TYPE_DIRECT | TYPE_PARAM : TYPE_DIRECT);
              /*ptype("decl", &type, v);*/
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            /* 'T f(...)!error' : the same annotation after the declarator */
-+            if (tcc_state->superc_ext && superc_parse_fallible_suffix())
++            if (tcc_state->c6_ext && c6_parse_fallible_suffix())
 +                fallible = 1;
-+            if (superc_decl_fallible)
-+                fallible = 1, superc_decl_fallible = 0;
++            if (c6_decl_fallible)
++                fallible = 1, c6_decl_fallible = 0;
 +            if (fallible)
-+                superc_apply_fallible(&type);
++                c6_apply_fallible(&type);
 +#endif
- #ifdef TCC_EXT
+ #ifdef C6_EXT
              /* symbols declared inside a package are name-mangled; the
                 program entry point always keeps its name */
 @@ -10067,6 +10443,15 @@ static int decl(int l)
  
                  /* apply post-declaraton attributes */
                  merge_funcattr(&type.ref->f, &ad.f);
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +                /* a prototype marked '!error' also marks the definition */
-+                if (tcc_state->superc_ext) {
++                if (tcc_state->c6_ext) {
 +                    Sym *ps = sym_find(v);
 +                    if (ps && (ps->type.t & VT_BTYPE) == VT_FUNC
 +                        && ps->type.ref->f.func_fallible)
@@ -863,18 +863,18 @@ index a1b98cc..e0302d8 100644
 +    tok_ident++;
 +}
 +
- #ifdef TCC_EXT
- /* Drop the last interned token again: used to keep the superc keywords
-    ordinary identifiers unless -std=tcc-ext is active. */
+ #ifdef C6_EXT
+ /* Drop the last interned token again: used to keep the c6 keywords
+    ordinary identifiers unless -std=c6 is active. */
 @@ -3835,6 +3849,18 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
          "#include <tccdefs.h>\n" /* load at runtime */
  #endif
          , -1);
-+#ifdef TCC_EXT
-+      /* superc: 'error' is the value type produced by err(id, msg).  It is
++#ifdef C6_EXT
++      /* c6: 'error' is the value type produced by err(id, msg).  It is
 +         only declared in the extension mode and never for -E, so that the
 +         preprocessor output does not depend on it. */
-+      if (s1->superc_ext && s1->output_type != TCC_OUTPUT_PREPROCESS)
++      if (s1->c6_ext && s1->output_type != TCC_OUTPUT_PREPROCESS)
 +        cstr_cat(cs,
 +          "#ifndef __TCC_ERROR_DEFINED\n"
 +          "#define __TCC_ERROR_DEFINED 1\n"
@@ -904,31 +904,31 @@ index a1b98cc..e0302d8 100644
  
 @@ -3943,7 +3972,7 @@ ST_FUNC void tccpp_new(TCCState *s)
             'test' may already be interned as an asm keyword, in which
-            case the range ends before TOK_SUPERC_TEST. */
+            case the range ends before TOK_C6_TEST. */
          int t;
--        for (t = TOK_SUPERC_PACKAGE; t < TOK_SUPERC_TEST && t < tok_ident; t++)
-+        for (t = TOK_SUPERC_PACKAGE; t <= TOK_SUPERC_CATCH && t < tok_ident; t++)
+-        for (t = TOK_C6_PACKAGE; t < TOK_C6_TEST && t < tok_ident; t++)
++        for (t = TOK_C6_PACKAGE; t <= TOK_C6_CATCH && t < tok_ident; t++)
              tok_unintern(t);
-         if (TOK_SUPERC_PACKAGE < tok_ident)
-             tok_ident = TOK_SUPERC_PACKAGE;
+         if (TOK_C6_PACKAGE < tok_ident)
+             tok_ident = TOK_C6_PACKAGE;
 diff --git a/tcctok.h b/tcctok.h
 index caa23e9..a758720 100644
 --- a/tcctok.h
 +++ b/tcctok.h
 @@ -451,4 +451,6 @@
-      DEF(TOK_SUPERC_ERRDEFER,  "errdefer")
-      DEF(TOK_SUPERC_ERR,       "err")
-      DEF(TOK_SUPERC_TEST,      "test")
-+     DEF(TOK_SUPERC_TRY,       "try")
-+     DEF(TOK_SUPERC_CATCH,     "catch")
+      DEF(TOK_C6_ERRDEFER,  "errdefer")
+      DEF(TOK_C6_ERR,       "err")
+      DEF(TOK_C6_TEST,      "test")
++     DEF(TOK_C6_TRY,       "try")
++     DEF(TOK_C6_CATCH,     "catch")
  #endif
-diff --git a/tests/tests2/157_superc_err.c b/tests/tests2/157_superc_err.c
+diff --git a/tests/tests2/157_c6_err.c b/tests/tests2/157_c6_err.c
 index 2522e83..b2c4808 100644
---- a/tests/tests2/157_superc_err.c
-+++ b/tests/tests2/157_superc_err.c
+--- a/tests/tests2/157_c6_err.c
++++ b/tests/tests2/157_c6_err.c
 @@ -1,4 +1,4 @@
--/* superc extension: errdefer + err */
-+/* superc extension: errdefer + err + try */
+-/* c6 extension: errdefer + err */
++/* c6 extension: errdefer + err + try */
  #include <stdio.h>
  #include <string.h>
  
@@ -1100,10 +1100,10 @@ index 2522e83..b2c4808 100644
  
      __tcc_err_clear();
      printf("final-flag=%d\n", __tcc_err_flag_get());
-diff --git a/tests/tests2/158_superc_test.c b/tests/tests2/158_superc_test.c
+diff --git a/tests/tests2/158_c6_test.c b/tests/tests2/158_c6_test.c
 index ad3cc03..7a647e4 100644
---- a/tests/tests2/158_superc_test.c
-+++ b/tests/tests2/158_superc_test.c
+--- a/tests/tests2/158_c6_test.c
++++ b/tests/tests2/158_c6_test.c
 @@ -35,8 +35,8 @@ test "strings and loops" {
          err(4, "bad sum");
  }
@@ -1136,13 +1136,13 @@ index ad3cc03..7a647e4 100644
  }
  
  int main(void)
-diff --git a/tests/tests2/163_superc_try.c b/tests/tests2/163_superc_try.c
+diff --git a/tests/tests2/163_c6_try.c b/tests/tests2/163_c6_try.c
 new file mode 100644
 index 0000000..95a0eac
 --- /dev/null
-+++ b/tests/tests2/163_superc_try.c
++++ b/tests/tests2/163_c6_try.c
 @@ -0,0 +1,213 @@
-+/* superc extension: 'T!error' functions, 'try' and 'catch' */
++/* c6 extension: 'T!error' functions, 'try' and 'catch' */
 +#include <stdio.h>
 +#include <string.h>
 +
@@ -1355,11 +1355,11 @@ index 0000000..95a0eac
 +    printf("final flag=%d\n", __tcc_err_flag_get());
 +    return 0;
 +}
-diff --git a/tests/tests2/163_superc_try.expect b/tests/tests2/163_superc_try.expect
+diff --git a/tests/tests2/163_c6_try.expect b/tests/tests2/163_c6_try.expect
 new file mode 100644
 index 0000000..88e35a4
 --- /dev/null
-+++ b/tests/tests2/163_superc_try.expect
++++ b/tests/tests2/163_c6_try.expect
 @@ -0,0 +1,29 @@
 +1 ok=21 log=A
 +propagates(-1) caught 100/negative
@@ -1390,13 +1390,13 @@ index 0000000..88e35a4
 +8 flag=0
 +9 flag=0 id=0
 +final flag=0
-diff --git a/tests/tests2/164_superc_try_errors.c b/tests/tests2/164_superc_try_errors.c
+diff --git a/tests/tests2/164_c6_try_errors.c b/tests/tests2/164_c6_try_errors.c
 new file mode 100644
 index 0000000..ce8ed4f
 --- /dev/null
-+++ b/tests/tests2/164_superc_try_errors.c
++++ b/tests/tests2/164_c6_try_errors.c
 @@ -0,0 +1,41 @@
-+/* superc extension: diagnostics for malformed 'try' / 'catch' / 'T!error' */
++/* c6 extension: diagnostics for malformed 'try' / 'catch' / 'T!error' */
 +static int ok_int(void) { return 1; }
 +static int!error fails(int n) { if (n) err(1, "x"); return 0; }
 +struct S { int a; };
@@ -1437,53 +1437,53 @@ index 0000000..ce8ed4f
 +#else
 +int main(void) { return 0; }
 +#endif
-diff --git a/tests/tests2/164_superc_try_errors.expect b/tests/tests2/164_superc_try_errors.expect
+diff --git a/tests/tests2/164_c6_try_errors.expect b/tests/tests2/164_c6_try_errors.expect
 new file mode 100644
 index 0000000..67e1cc7
 --- /dev/null
-+++ b/tests/tests2/164_superc_try_errors.expect
++++ b/tests/tests2/164_c6_try_errors.expect
 @@ -0,0 +1,32 @@
 +[test_try_in_plain_fn]
-+164_superc_try_errors.c:7: error: 'try' requires the enclosing function to return 'T!error'
++164_c6_try_errors.c:7: error: 'try' requires the enclosing function to return 'T!error'
 +
 +[test_try_not_fallible]
-+164_superc_try_errors.c:10: error: 'try' requires a call to a function returning 'T!error'
++164_c6_try_errors.c:10: error: 'try' requires a call to a function returning 'T!error'
 +
 +[test_try_not_a_call]
-+164_superc_try_errors.c:13: error: 'try' requires a call to a function returning 'T!error'
++164_c6_try_errors.c:13: error: 'try' requires a call to a function returning 'T!error'
 +
 +[test_try_assignment]
-+164_superc_try_errors.c:16: error: 'try' requires a call to a function returning 'T!error'
++164_c6_try_errors.c:16: error: 'try' requires a call to a function returning 'T!error'
 +
 +[test_catch_not_fallible]
-+164_superc_try_errors.c:19: error: 'catch' requires a call to a function returning 'T!error'
++164_c6_try_errors.c:19: error: 'catch' requires a call to a function returning 'T!error'
 +
 +[test_catch_falls_through]
-+164_superc_try_errors.c:22: error: 'catch' body must end with 'return', 'err()' or 'goto'
++164_c6_try_errors.c:22: error: 'catch' body must end with 'return', 'err()' or 'goto'
 +
 +[test_bare_catch]
-+164_superc_try_errors.c:25: error: 'catch' has no operand
++164_c6_try_errors.c:25: error: 'catch' has no operand
 +
 +[test_fallible_not_a_function]
-+164_superc_try_errors.c:28: error: '!error' requires a function declarator
++164_c6_try_errors.c:28: error: '!error' requires a function declarator
 +
 +[test_fallible_struct_return]
-+164_superc_try_errors.c:31: error: '!error' requires a return type representable by -1
++164_c6_try_errors.c:31: error: '!error' requires a return type representable by -1
 +
 +[test_try_in_defer]
-+164_superc_try_errors.c:34: error: 'try' is not allowed in a defer body
++164_c6_try_errors.c:34: error: 'try' is not allowed in a defer body
 +
 +[test_catch_in_defer]
-+164_superc_try_errors.c:37: error: 'catch' is not allowed in a defer body
++164_c6_try_errors.c:37: error: 'catch' is not allowed in a defer body
 diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
 index 3beee5c..8eaa875 100644
 --- a/tests/tests2/Makefile
 +++ b/tests/tests2/Makefile
-@@ -87,6 +87,7 @@ ifneq (,$(SUPERC_OK))
-  $(SUPERC_TESTS): FLAGS += -std=tcc-ext
-  158_superc_test.test: FLAGS += -test
-  162_superc_iface_errors.test: FLAGS += -dt
-+ 164_superc_try_errors.test: FLAGS += -dt
+@@ -87,6 +87,7 @@ ifneq (,$(C6_OK))
+  $(C6_TESTS): FLAGS += -std=c6
+  158_c6_test.test: FLAGS += -test
+  162_c6_iface_errors.test: FLAGS += -dt
++ 164_c6_try_errors.test: FLAGS += -dt
  else
-  SKIP += $(SUPERC_TESTS)
+  SKIP += $(C6_TESTS)
  endif

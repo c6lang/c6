@@ -2,7 +2,7 @@
  *
  * 编译运行（在仓库根目录）：
  *   make build
- *   ./tcc/tcc -B tcc -std=tcc-ext -run examples/err_demo.c
+ *   ./tcc/tcc -B tcc -std=c6 -run examples/err_demo.c
  *
  * 用 err(id, msg) 的函数必须声明成 'T!error'，调用方必须用 try 或 catch 消费
  * 错误；catch 的处理块必须自己离开（return / err(id, msg) / goto）。

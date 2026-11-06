@@ -1,4 +1,4 @@
-/* superc 编译期诊断：import 与 pkg.member
+/* c6 编译期诊断：import 与 pkg.member
  *
  * 每个片段单独用 -D<片段名> 编译（tests/run-errors.sh 驱动），
  * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。

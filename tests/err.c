@@ -1,10 +1,10 @@
-/* superc 自测：err() / errdefer / 清理顺序
+/* c6 自测：err() / errdefer / 清理顺序
  *
  * 检查 err 的返回值、清理顺序（LG_IS 比对日志）、错误槽接口，以及
  * catch 拿到的 e.id / e.msg。全部是直接断言，不比较 stdout。
  *
  * 运行（仓库根目录）：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/err.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/err.c
  */
 #include <stdio.h>
 #include <string.h>
@@ -47,7 +47,7 @@ static void note(int id, const char *msg)
     last_msg = msg;
 }
 
-/* ---- 被测函数（来自 157_superc_err.c） ---- */
+/* ---- 被测函数（来自 157_c6_err.c） ---- */
 
 /* errdefer 正常路径跳过、错误路径逆序执行；defer 两条路径都执行 */
 static int!error e1(int fail)
@@ -220,7 +220,7 @@ static void!error loop_fail(void)
     lg("z");
 }
 
-/* ---- 157_superc_err.expect 的逐行覆盖 ---- */
+/* ---- 157_c6_err.expect 的逐行覆盖 ---- */
 
 /* expect: e1-normal=0 e1-normal: 41 / flag=0 */
 test "e1 正常路径只执行 defer，顺序为 41" {

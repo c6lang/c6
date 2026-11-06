@@ -1,51 +1,51 @@
 From 89a1fa191535cb2dd5808ae025e21ba6e62ad81e Mon Sep 17 00:00:00 2001
-From: superc-agent <agent@localhost>
+From: c6-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 19:13:39 +0800
-Subject: [PATCH 7/10] superc: every variable definition must be initialized
+Subject: [PATCH 7/10] c6: every variable definition must be initialized
 
 VLA is the only exception (C forbids initializing a variable length array).
 'extern' declarations, parameters, struct/union members, typedefs and alias
 objects are declarations, not definitions, and stay exempt.
 
-The new check lives in superc_check_var_initialized() and is called from the
+The new check lives in c6_check_var_initialized() and is called from the
 object-definition branch of decl(), after 'has_init' is known and before TCC
 rewrites a tentative global definition into an 'extern' one.  The diagnostic
 uses the identifier as written: a 'package' mangles the name only afterwards.
 
-superc test fixtures gain the missing initializers, and 165_superc_init
+c6 test fixtures gain the missing initializers, and 165_c6_init
 covers both directions plus the VLA / extern / parameter / member exemptions.
 
-Tests: tests2 144/144 with TCC_EXT, 165_superc_init uses -dt.
+Tests: tests2 144/144 with C6_EXT, 165_c6_init uses -dt.
 ---
  tccgen.c                             | 32 +++++++++++++-
- tests/tests2/156_superc_defer.c      | 10 ++---
- tests/tests2/157_superc_err.c        | 10 ++---
- tests/tests2/158_superc_test.c       |  2 +-
- tests/tests2/160_superc_interface.c  |  6 +--
- tests/tests2/161_superc_macro.c      |  2 +-
- tests/tests2/163_superc_try.c        |  8 ++--
- tests/tests2/164_superc_try_errors.c |  4 +-
- tests/tests2/165_superc_init.c       | 66 ++++++++++++++++++++++++++++
- tests/tests2/165_superc_init.expect  | 30 +++++++++++++
+ tests/tests2/156_c6_defer.c      | 10 ++---
+ tests/tests2/157_c6_err.c        | 10 ++---
+ tests/tests2/158_c6_test.c       |  2 +-
+ tests/tests2/160_c6_interface.c  |  6 +--
+ tests/tests2/161_c6_macro.c      |  2 +-
+ tests/tests2/163_c6_try.c        |  8 ++--
+ tests/tests2/164_c6_try_errors.c |  4 +-
+ tests/tests2/165_c6_init.c       | 66 ++++++++++++++++++++++++++++
+ tests/tests2/165_c6_init.expect  | 30 +++++++++++++
  tests/tests2/Makefile                |  1 +
  11 files changed, 149 insertions(+), 22 deletions(-)
- create mode 100644 tests/tests2/165_superc_init.c
- create mode 100644 tests/tests2/165_superc_init.expect
+ create mode 100644 tests/tests2/165_c6_init.c
+ create mode 100644 tests/tests2/165_c6_init.expect
 
 diff --git a/tccgen.c b/tccgen.c
 index e5808b9..fca3d3d 100644
 --- a/tccgen.c
 +++ b/tccgen.c
-@@ -169,6 +169,8 @@ static int superc_decl_fallible;
- static void superc_fallible_use(void);
- static int superc_parse_fallible_suffix(void);
- static void superc_check_error_param(CType *type);
-+static void superc_check_var_initialized(CType *type, int has_init, int v,
+@@ -169,6 +169,8 @@ static int c6_decl_fallible;
+ static void c6_fallible_use(void);
+ static int c6_parse_fallible_suffix(void);
+ static void c6_check_error_param(CType *type);
++static void c6_check_var_initialized(CType *type, int has_init, int v,
 +                                         AttributeDef *ad);
- static void superc_defer_func_init(void);
- static void superc_defer_func_end(void);
- static void superc_defer_begin(int mode, int depth);
-@@ -10291,6 +10293,27 @@ static void superc_check_error_param(CType *type)
+ static void c6_defer_func_init(void);
+ static void c6_defer_func_end(void);
+ static void c6_defer_begin(int mode, int depth);
+@@ -10291,6 +10293,27 @@ static void c6_check_error_param(CType *type)
          tcc_error("'error' can only be a return type, not a parameter");
  }
  
@@ -56,10 +56,10 @@ index e5808b9..fca3d3d 100644
 +   before TCC turns a tentative global definition into an 'extern' one, and
 +   before a 'package' mangles the name, so the diagnostic shows the name as
 +   written. */
-+static void superc_check_var_initialized(CType *type, int has_init, int v,
++static void c6_check_var_initialized(CType *type, int has_init, int v,
 +                                         AttributeDef *ad)
 +{
-+    if (!tcc_state->superc_ext || has_init)
++    if (!tcc_state->c6_ext || has_init)
 +        return;
 +    if (type->t & (VT_EXTERN | VT_TYPEDEF | VT_VLA))
 +        return;
@@ -71,44 +71,44 @@ index e5808b9..fca3d3d 100644
 +}
 +
  /* Turn the '!error' annotation of TYPE into a property of the function. */
- static void superc_apply_fallible(CType *type)
+ static void c6_apply_fallible(CType *type)
  {
 @@ -10322,7 +10345,7 @@ static int decl(int l)
      AttributeDef ad, adbase;
      ElfSym *esym;
- #ifdef TCC_EXT
+ #ifdef C6_EXT
 -    int fallible;
 +    int fallible, decl_name;
  #endif
  
      while (1) {
 @@ -10429,6 +10452,9 @@ static int decl(int l)
-                 superc_apply_fallible(&type);
+                 c6_apply_fallible(&type);
  #endif
- #ifdef TCC_EXT
+ #ifdef C6_EXT
 +            /* keep the name as written: a 'package' mangles it below, but
 +               diagnostics must talk about the identifier the user wrote */
 +            decl_name = v;
              /* symbols declared inside a package are name-mangled; the
                 program entry point always keeps its name */
-             if (l == VT_CONST && tcc_state->superc_package
+             if (l == VT_CONST && tcc_state->c6_package
 @@ -10584,6 +10610,10 @@ static int decl(int l)
  
                      if (tok == '=')
                          has_init = 1;
-+#ifdef TCC_EXT
-+                    superc_check_var_initialized(&type, has_init, decl_name,
++#ifdef C6_EXT
++                    c6_check_var_initialized(&type, has_init, decl_name,
 +                                                 &ad);
 +#endif
  
                      if (((type.t & VT_EXTERN) && (!has_init || l != VT_CONST))
  		        || (type.t & VT_BTYPE) == VT_FUNC
-diff --git a/tests/tests2/156_superc_defer.c b/tests/tests2/156_superc_defer.c
+diff --git a/tests/tests2/156_c6_defer.c b/tests/tests2/156_c6_defer.c
 index b270286..3ad87b4 100644
---- a/tests/tests2/156_superc_defer.c
-+++ b/tests/tests2/156_superc_defer.c
+--- a/tests/tests2/156_c6_defer.c
++++ b/tests/tests2/156_c6_defer.c
 @@ -1,8 +1,8 @@
- /* superc extension: defer */
+ /* c6 extension: defer */
  #include <stdio.h>
  
 -static char log_buf[512];
@@ -145,10 +145,10 @@ index b270286..3ad87b4 100644
      log_reset();
      r = rec(3);
      printf("rec: %d %d\n", r, (int)(log_pos / 1));
-diff --git a/tests/tests2/157_superc_err.c b/tests/tests2/157_superc_err.c
+diff --git a/tests/tests2/157_c6_err.c b/tests/tests2/157_c6_err.c
 index b2c4808..d917b6a 100644
---- a/tests/tests2/157_superc_err.c
-+++ b/tests/tests2/157_superc_err.c
+--- a/tests/tests2/157_c6_err.c
++++ b/tests/tests2/157_c6_err.c
 @@ -9,13 +9,13 @@ void __tcc_err_clear(void);
  
  #define SENT (-1)
@@ -176,10 +176,10 @@ index b2c4808..d917b6a 100644
      for (i = 0; i < 3; i++) {
          defer log_add("d");
          if (fail && i == 1)
-diff --git a/tests/tests2/158_superc_test.c b/tests/tests2/158_superc_test.c
+diff --git a/tests/tests2/158_c6_test.c b/tests/tests2/158_c6_test.c
 index 7a647e4..dcd6a25 100644
---- a/tests/tests2/158_superc_test.c
-+++ b/tests/tests2/158_superc_test.c
+--- a/tests/tests2/158_c6_test.c
++++ b/tests/tests2/158_c6_test.c
 @@ -27,7 +27,7 @@ test "errdefer is skipped on the normal path" {
  }
  
@@ -189,10 +189,10 @@ index 7a647e4..dcd6a25 100644
      const char *s = "abcd";
      for (i = 0; s[i]; i++)
          sum += s[i];
-diff --git a/tests/tests2/160_superc_interface.c b/tests/tests2/160_superc_interface.c
+diff --git a/tests/tests2/160_c6_interface.c b/tests/tests2/160_c6_interface.c
 index 5c95819..45bdeea 100644
---- a/tests/tests2/160_superc_interface.c
-+++ b/tests/tests2/160_superc_interface.c
+--- a/tests/tests2/160_c6_interface.c
++++ b/tests/tests2/160_c6_interface.c
 @@ -52,9 +52,9 @@ static void dump(Printable p)
  
  int main(void)
@@ -206,10 +206,10 @@ index 5c95819..45bdeea 100644
  
      c.r = 5;
      r.w = 4;
-diff --git a/tests/tests2/161_superc_macro.c b/tests/tests2/161_superc_macro.c
+diff --git a/tests/tests2/161_c6_macro.c b/tests/tests2/161_c6_macro.c
 index 391242b..0611ab4 100644
---- a/tests/tests2/161_superc_macro.c
-+++ b/tests/tests2/161_superc_macro.c
+--- a/tests/tests2/161_c6_macro.c
++++ b/tests/tests2/161_c6_macro.c
 @@ -27,7 +27,7 @@
  
  int main(void)
@@ -219,10 +219,10 @@ index 391242b..0611ab4 100644
  
      swap(a, b);
      printf("swap: %d %d\n", a, b);
-diff --git a/tests/tests2/163_superc_try.c b/tests/tests2/163_superc_try.c
+diff --git a/tests/tests2/163_c6_try.c b/tests/tests2/163_c6_try.c
 index 95a0eac..c01880f 100644
---- a/tests/tests2/163_superc_try.c
-+++ b/tests/tests2/163_superc_try.c
+--- a/tests/tests2/163_c6_try.c
++++ b/tests/tests2/163_c6_try.c
 @@ -7,8 +7,8 @@ int __tcc_err_id_get(void);
  const char *__tcc_err_msg_get(void);
  void __tcc_err_clear(void);
@@ -252,10 +252,10 @@ index 95a0eac..c01880f 100644
  
      log_reset();
      a = call_propagates(2);
-diff --git a/tests/tests2/164_superc_try_errors.c b/tests/tests2/164_superc_try_errors.c
+diff --git a/tests/tests2/164_c6_try_errors.c b/tests/tests2/164_c6_try_errors.c
 index 2f28f19..cb5a9ec 100644
---- a/tests/tests2/164_superc_try_errors.c
-+++ b/tests/tests2/164_superc_try_errors.c
+--- a/tests/tests2/164_c6_try_errors.c
++++ b/tests/tests2/164_c6_try_errors.c
 @@ -13,7 +13,7 @@ int main(void) { return bad(); }
  static int!error bad(int n) { try n; return 0; }
  int main(void) { return bad(1); }
@@ -274,13 +274,13 @@ index 2f28f19..cb5a9ec 100644
  int main(void) { return bad_ret().a; }
  #elif defined test_try_in_defer
  static int!error bad(void) { defer { try fails(0); } return 0; }
-diff --git a/tests/tests2/165_superc_init.c b/tests/tests2/165_superc_init.c
+diff --git a/tests/tests2/165_c6_init.c b/tests/tests2/165_c6_init.c
 new file mode 100644
 index 0000000..b9e3723
 --- /dev/null
-+++ b/tests/tests2/165_superc_init.c
++++ b/tests/tests2/165_c6_init.c
 @@ -0,0 +1,66 @@
-+/* superc extension: every variable definition must be initialized.
++/* c6 extension: every variable definition must be initialized.
 + * VLAs are the only exception: C does not allow initializing them. */
 +struct S { int a; };
 +
@@ -346,38 +346,38 @@ index 0000000..b9e3723
 +#else
 +int main(void) { return 0; }
 +#endif
-diff --git a/tests/tests2/165_superc_init.expect b/tests/tests2/165_superc_init.expect
+diff --git a/tests/tests2/165_c6_init.expect b/tests/tests2/165_c6_init.expect
 new file mode 100644
 index 0000000..2132239
 --- /dev/null
-+++ b/tests/tests2/165_superc_init.expect
++++ b/tests/tests2/165_c6_init.expect
 @@ -0,0 +1,30 @@
 +[test_local_int]
-+165_superc_init.c:6: error: variable 'x' must be initialized
++165_c6_init.c:6: error: variable 'x' must be initialized
 +
 +[test_local_multi]
-+165_superc_init.c:9: error: variable 'y' must be initialized
++165_c6_init.c:9: error: variable 'y' must be initialized
 +
 +[test_local_array]
-+165_superc_init.c:12: error: variable 'a' must be initialized
++165_c6_init.c:12: error: variable 'a' must be initialized
 +
 +[test_local_struct]
-+165_superc_init.c:15: error: variable 's' must be initialized
++165_c6_init.c:15: error: variable 's' must be initialized
 +
 +[test_local_pointer]
-+165_superc_init.c:18: error: variable 'p' must be initialized
++165_c6_init.c:18: error: variable 'p' must be initialized
 +
 +[test_global_int]
-+165_superc_init.c:21: error: variable 'g' must be initialized
++165_c6_init.c:21: error: variable 'g' must be initialized
 +
 +[test_static_global]
-+165_superc_init.c:24: error: variable 'sg' must be initialized
++165_c6_init.c:24: error: variable 'sg' must be initialized
 +
 +[test_static_local]
-+165_superc_init.c:27: error: variable 'sl' must be initialized
++165_c6_init.c:27: error: variable 'sl' must be initialized
 +
 +[test_for_init]
-+165_superc_init.c:30: error: variable 'k' must be initialized
++165_c6_init.c:30: error: variable 'k' must be initialized
 +
 +[test_ok]
 +
@@ -386,13 +386,13 @@ diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
 index 8eaa875..5962f26 100644
 --- a/tests/tests2/Makefile
 +++ b/tests/tests2/Makefile
-@@ -88,6 +88,7 @@ ifneq (,$(SUPERC_OK))
-  158_superc_test.test: FLAGS += -test
-  162_superc_iface_errors.test: FLAGS += -dt
-  164_superc_try_errors.test: FLAGS += -dt
-+ 165_superc_init.test: FLAGS += -dt
+@@ -88,6 +88,7 @@ ifneq (,$(C6_OK))
+  158_c6_test.test: FLAGS += -test
+  162_c6_iface_errors.test: FLAGS += -dt
+  164_c6_try_errors.test: FLAGS += -dt
++ 165_c6_init.test: FLAGS += -dt
  else
-  SKIP += $(SUPERC_TESTS)
+  SKIP += $(C6_TESTS)
  endif
 -- 
 2.51.0

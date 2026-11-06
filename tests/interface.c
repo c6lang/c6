@@ -1,10 +1,10 @@
-/* superc 自测：结构化接口（胖指针 + vtable）
+/* c6 自测：结构化接口（胖指针 + vtable）
  *
  * 结构体只要声明了接口要求的全部方法就实现了该接口，没有 impl 声明；
  * 检查是惰性的，在第一次转换（赋值、实参、强转）时进行。
  *
  * 运行（仓库根目录）：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/interface.c tests/tu/interface.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/interface.c tests/tu/interface.c
  */
 #include <stdio.h>
 #include <string.h>

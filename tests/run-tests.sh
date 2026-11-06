@@ -1,5 +1,5 @@
 #!/bin/sh
-# superc 自测运行器：跑 tests/ 下的所有 superc 测试。
+# c6 自测运行器：跑 tests/ 下的所有 c6 测试。
 #
 #   tests/run-tests.sh                 跑全部
 #   tests/run-tests.sh defer err       只跑这几个（按文件名，可写 errors/xxx）
@@ -20,14 +20,14 @@ set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TCC=${TCC:-$ROOT/tcc/tcc}
 TCCFLAGS=${TCCFLAGS:-}
-BASE="-B $ROOT/tcc -std=tcc-ext"
+BASE="-B $ROOT/tcc -std=c6"
 
 if [ ! -x "$TCC" ]; then
     echo "run-tests: 找不到 $TCC，先执行 'make build'" >&2
     exit 1
 fi
 
-TMP=${TMPDIR:-/tmp}/superc-tests.$$
+TMP=${TMPDIR:-/tmp}/c6-tests.$$
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 

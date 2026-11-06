@@ -1,12 +1,12 @@
-# superc 语言扩展语法规范（BNF / EBNF）
+# c6 语言扩展语法规范（BNF / EBNF）
 
-本文件用 **ISO/IEC 14977 扩展巴科斯范式（EBNF）**给出 TinyCC 的 superc
+本文件用 **ISO/IEC 14977 扩展巴科斯范式（EBNF）**给出 TinyCC 的 c6
 扩展相对 ISO C 的**增量语法**。标准 C 的语法不再重复；文中出现的
 `declaration`、`statement`、`expression` 等未定义非终结符一律指 ISO C
 （C11 / N1570）中的同名产生式。
 
-扩展只在编译期定义了 `TCC_EXT` 且命令行给了 `-std=tcc-ext` 时生效；此时
-预处理器额外定义宏 `__TCC_EXT__`。未开启时，下列新关键字全部退化为普通
+扩展只在编译期定义了 `C6_EXT` 且命令行给了 `-std=c6` 时生效；此时
+预处理器额外定义宏 `__C6__`。未开启时，下列新关键字全部退化为普通
 标识符，本文档描述的产生式一条都不适用。
 
 ---
@@ -36,7 +36,7 @@ letter        = lower-letter | upper-letter | "_" ;
 identifier    = ( letter | "_" ) , { letter | digit } ;
 
 (* 扩展新增的关键字 *)
-superc-keyword =
+c6-keyword =
       "package" | "import" | "interface"
     | "defer"   | "errdefer" | "err" | "test"
     | "try"     | "catch" ;
@@ -192,7 +192,7 @@ VLA 是唯一例外——标准 C 不允许给变长数组写初始化器，所�
 诊断里使用源码中书写的标识符：`package` 内的变量报原名，而不是
 `NAME__x`。
 
-这条约束只作用于开启了 `-std=tcc-ext` 的翻译单元：不带该开关的老代码
+这条约束只作用于开启了 `-std=c6` 的翻译单元：不带该开关的老代码
 完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
 函数体）都要满足。K&R 老式定义的形参声明表属于形参，不受约束。
 
@@ -362,11 +362,11 @@ unary-expression，随后由约束 C2 要求该表达式的**根**必须是一�
 ## 6. 预处理
 
 ```
-superc-directive       = "#" , "macro" , identifier ,
-                         [ "(" , [ parameter-list ] , ")" ] ,
-                         "{" , { preprocessing-token } , "}" ;
+c6-directive      = "#" , "macro" , identifier ,
+                      [ "(" , [ parameter-list ] , ")" ] ,
+                      "{" , { preprocessing-token } , "}" ;
 
-parameter-list         = identifier , { "," , identifier } ;
+parameter-list    = identifier , { "," , identifier } ;
 ```
 
 `#macro` 与 `#define` 的区别：
@@ -747,25 +747,25 @@ int main(void)
 
 | 语法 | 实现 | 位置 |
 |---|---|---|
-| `package` / `import` | `superc_package_parse` / `superc_import_parse` / `superc_pkg_name` / `superc_pkg_compose` / `superc_pkg_imported`，`unary()` 里的点号解析 | `tcc/tccgen.c` |
+| `package` / `import` | `c6_package_parse` / `c6_import_parse` / `c6_pkg_name` / `c6_pkg_compose` / `c6_pkg_imported`，`unary()` 里的点号解析 | `tcc/tccgen.c` |
 | `pkg.member` | `unary()` 的 `tok_identifier` 分支（逐段增长前缀 + `sym_find_raw`） | `tcc/tccgen.c` |
-| 结构体方法 | `superc_method_register`（在 `decl()` 里注册）/ `superc_method_lookup` / `superc_has_field` / `superc_method_call_prep`，`unary()` 的 `->` 分支 | `tcc/tccgen.c` |
-| `interface` | `superc_interface_parse`、`superc_auto_impl_ensure` / `superc_check_method` / `superc_emit_auto_impls` / `superc_iface_convert` | `tcc/tccgen.c` |
-| 每 TU 状态复位 | `superc_tu_reset`（在 `tccgen_compile` 开头调用） | `tcc/tccgen.c` |
-| `test` | `superc_test_parse`、`tcc_run_tests` | `tcc/tccgen.c`、`tcc/tccrun.c` |
-| `defer` / `errdefer` | `superc_defer_parse`、`superc_defer_begin`、`superc_defer_func_end` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
-| `err` | `superc_err_parse` / `superc_emit_propagate` | `tcc/tccgen.c` |
-| `!error` | `superc_parse_fallible_suffix` / `superc_apply_fallible`，`FuncAttr.func_fallible` | `tcc/tccgen.c`、`tcc/tcc.h` |
-| `try` | `superc_try_parse`（`unary()` 的前缀分支） | `tcc/tccgen.c` |
-| `catch` | `superc_catch_parse`（`expr_catch()` 层，位于 `expr_cond()` 之下） | `tcc/tccgen.c` |
-| `#macro` / `__local` | `parse_superc_macro` / `superc_hygiene_body` | `tcc/tccpp.c` |
-| 变量初始化 | `superc_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
-| `T[:]` 类型 | `parse_btype()` 的 `case '['`、`superc_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
-| 切片下标 / 区间 | `superc_slice_subscript`（`unary()` 的 `[` 分支）、`superc_slice_spill` | `tcc/tccgen.c` |
-| 数组 → 切片 | `superc_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
+| 结构体方法 | `c6_method_register`（在 `decl()` 里注册）/ `c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`，`unary()` 的 `->` 分支 | `tcc/tccgen.c` |
+| `interface` | `c6_interface_parse`、`c6_auto_impl_ensure` / `c6_check_method` / `c6_emit_auto_impls` / `c6_iface_convert` | `tcc/tccgen.c` |
+| 每 TU 状态复位 | `c6_tu_reset`（在 `tccgen_compile` 开头调用） | `tcc/tccgen.c` |
+| `test` | `c6_test_parse`、`tcc_run_tests` | `tcc/tccgen.c`、`tcc/tccrun.c` |
+| `defer` / `errdefer` | `c6_defer_parse`、`c6_defer_begin`、`c6_defer_func_end` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `err` | `c6_err_parse` / `c6_emit_propagate` | `tcc/tccgen.c` |
+| `!error` | `c6_parse_fallible_suffix` / `c6_apply_fallible`，`FuncAttr.func_fallible` | `tcc/tccgen.c`、`tcc/tcc.h` |
+| `try` | `c6_try_parse`（`unary()` 的前缀分支） | `tcc/tccgen.c` |
+| `catch` | `c6_catch_parse`（`expr_catch()` 层，位于 `expr_cond()` 之下） | `tcc/tccgen.c` |
+| `#macro` / `__local` | `parse_c6_macro` / `c6_hygiene_body` | `tcc/tccpp.c` |
+| 变量初始化 | `c6_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
+| `T[:]` 类型 | `parse_btype()` 的 `case '['`、`c6_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
+| 切片下标 / 区间 | `c6_slice_subscript`（`unary()` 的 `[` 分支）、`c6_slice_spill` | `tcc/tccgen.c` |
+| 数组 → 切片 | `c6_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
 | 切片运行期 | `__tcc_slice_index` / `__tcc_slice_sub` | `tcc/lib/libtcc1.c` |
 
-关键字表：`tcc/tcctok.h` 末尾的 `TOK_SUPERC_*` 追加项。改动词法器时
+关键字表：`tcc/tcctok.h` 末尾的 `TOK_C6_*` 追加项。改动词法器时
 注意它们必须留在文件的**最后**，否则会破坏 i386 内联汇编的
 `TOK_ASM_first/last/alllast` 区间。
 

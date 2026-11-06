@@ -1,7 +1,7 @@
-/* superc 自测：#macro 与卫生的 __local 名字
+/* c6 自测：#macro 与卫生的 __local 名字
  *
  * 运行（仓库根目录）：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/macro.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/macro.c
  */
 #include <stdio.h>
 #include <string.h>

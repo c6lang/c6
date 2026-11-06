@@ -1,4 +1,4 @@
-# TCC 语言扩展实现方案（深度评审修订版）
+# c6 语言扩展实现方案（深度评审修订版）
 
 > 本文档在上一版基础上，结合 TCC 源码级约束进行深度评审与修复。核心约束重申：**TCC 是单趟编译器，无 AST，解析与代码生成交织，任何扩展必须在递归下降的特定时机就地插入，不得依赖事后重写**。以下先给出本轮深度评审发现的**阻塞性缺口与修复**，再输出完整方案。
 
@@ -13,7 +13,7 @@
 | **G4** | `interface` 的 vtable 生成时机与单趟编译冲突：转换点可能早于实现声明 | 高 | 方法先于转换点可见即可；首次转换时登记 (类型, 接口) 并建 vtable 前置符号，**TU 末尾统一生成** `static` vtable 对象，调用点只查表不做代码回填 |
 | **G5** | `err()` 的 `goto __err_exit` 假设存在统一出口，但 TCC 没有“函数末尾统一清理标签”的现成机制 | 高 | 采用**每错误返回点就地生成清理序列**：`err()` 处直接展开 errdefer/defer 的逆序调用，然后 `return` 哨兵；不依赖间接跳转 |
 | **G6** | `test` 块的 runner 在 `-run` 模式下由 `libtcc.c` 遍历 `TCCState->tests`，但 TCC 的 `-run` 入口是用户 `main`，没有“先跑测试再跑 main”的钩子 | 中 | `-test` 模式下**不调用用户 `main`**，`libtcc.c` 直接遍历测试表；`-test` 与正常 `-run` 互斥，文档明确 |
-| **G7** | 扩展开关通过“运行时关键字映射”实现，但 TCC 的 `tok_alloc` 在词法阶段就将字符串 intern 为 `TokenSym`，后期切换映射不可行 | 中 | 改为**编译期条件编译**：`tcctok.h` 中 `#ifdef TCC_EXT` 注册新 token；扩展关闭时这些字符串根本不进入关键字映射，零运行时开销 |
+| **G7** | 扩展开关通过“运行时关键字映射”实现，但 TCC 的 `tok_alloc` 在词法阶段就将字符串 intern 为 `TokenSym`，后期切换映射不可行 | 中 | 改为**编译期条件编译**：`tcctok.h` 中 `#ifdef C6_EXT` 注册新 token；扩展关闭时这些字符串根本不进入关键字映射，零运行时开销 |
 | **G8** | `#macro` 的 `__local` 重命名通过 `TokenSym` 插入唯一名，但 TCC 的 `TokenSym` 是全局 intern 表，宏展开产生的临时标识符会永久累积 | 中 | 重命名使用**展开计数器后缀**（如 `tmp__h17`），但不在 `TokenSym` 中持久化；展开结束后从 intern 表移除，或接受可控的内存增长（首版可接受，后续优化） |
 | **G9** | 包管理的 `package NAME { ... }` 在 `tccgen.c` 顶层处理，但 TCC 的顶层声明循环 (`decl`) 不天然支持“命名块”语法 | 中 | 将 `package NAME { ... }` 解析为**语法糖**：读取包名后进入特殊声明上下文，对块内每个全局符号在注册时施加 `NAME__` 前缀；块结束后恢复。不引入真正的“顶层块作用域”，只做 mangle |
 | **G10** | `err` 的错误槽“通过隐藏参数传递”在 TCC 的调用约定中无现成支持 | 中 | 首版使用**线程局部错误槽**（`__thread`），调用者从槽读取；跨线程传播需手动复制。隐藏参数作为后续优化 |
@@ -25,7 +25,7 @@
 
 | 源文件 | 职责 | 扩展挂载点 |
 |---|---|---|
-| `tcctok.h` | 关键字与 token 编号 | `#ifdef TCC_EXT` 注册新 token；关闭时零映射 |
+| `tcctok.h` | 关键字与 token 编号 | `#ifdef C6_EXT` 注册新 token；关闭时零映射 |
 | `tccpp.c` | 预处理与词法分析 | `#macro` 指令识别、`__local` 重命名、include 路径扩展 |
 | `tccgen.c` | 语法分析与代码生成 | `package/import` mangle 与 `pkg.member`、结构体方法注册、`interface` 转换与 vtable 生成、`defer/errdefer/err` 就地代码生成、`test` 块注册 |
 | `tcc.h` / `libtcc.c` | 符号表与编译状态 | `TCCState` 扩展字段、`-test` runner、扩展开关 |
@@ -34,7 +34,7 @@
 
 ```c
 /* tcctok.h */
-#ifdef TCC_EXT
+#ifdef C6_EXT
 DEF(TOK_PACKAGE,   "package")
 DEF(TOK_IMPORT,    "import")
 DEF(TOK_INTERFACE, "interface")
@@ -45,10 +45,10 @@ DEF(TOK_TEST,      "test")
 #endif
 ```
 
-- 开关：`-std=tcc-ext`，默认关闭。
-- 关闭时：`TCC_EXT` 不定义，这些字符串保持普通标识符，**零运行时映射开销**。
-- 开启时：`TCC_EXT` 定义，token 进入 lexer 关键字映射。
-- `__TCC_EXT__` 宏同步定义，供源码条件编译。
+- 开关：`-std=c6`，默认关闭。
+- 关闭时：`C6_EXT` 不定义，这些字符串保持普通标识符，**零运行时映射开销**。
+- 开启时：`C6_EXT` 定义，token 进入 lexer 关键字映射。
+- `__C6__` 宏同步定义，供源码条件编译。
 
 
 ## 2. `defer`：就地生成 + 运行时记录（修复 G1–G3）
@@ -187,17 +187,17 @@ int handle(int n) {
 实现要点（单趟、无 AST 的约束下）：
 
 - `!error` 只是函数类型上的一个属性位（`FuncAttr.func_fallible`），不改变调用约定；
-  它在 `decl()` 里由 `superc_parse_fallible_suffix()` 解析，前置/后缀两种位置等价，
+  它在 `decl()` 里由 `c6_parse_fallible_suffix()` 解析，前置/后缀两种位置等价，
   原型上的标记会传递到之后的定义；
-- `try` 挂在 `unary()` 的前缀分支（`superc_try_parse`）：就地调用、检查错误槽、
-  失败时走 `superc_emit_propagate()`（与 `err()` 共用同一条清理+哨兵返回路径）；
-- `catch` 挂在 `expr_cond()` 之下的独立一层 `expr_catch()`（`superc_catch_parse`）：
+- `try` 挂在 `unary()` 的前缀分支（`c6_try_parse`）：就地调用、检查错误槽、
+  失败时走 `c6_emit_propagate()`（与 `err()` 共用同一条清理+哨兵返回路径）；
+- `catch` 挂在 `expr_cond()` 之下的独立一层 `expr_catch()`（`c6_catch_parse`）：
   先求出调用值并 `save_regs(0)` 落到栈上，再测错误槽；失败分支用
   `__tcc_error_take(&e)` 快照并**清空**错误槽，然后编译处理块；
-- 判断“操作数确实是调用”用的是代码生成期的标志 `superc_value_fallible`：
+- 判断“操作数确实是调用”用的是代码生成期的标志 `c6_value_fallible`：
   函数调用处置位，任何把它组合掉的操作（`gen_op` / `gen_cast` / `vstore` /
   `indir` / `gaddrof` / `inc` / 后缀运算）都会清零；
-- `catch` 处理块用 `superc_last_stmt_leaves` 检查是否以 `return` / `err(id, msg)` /
+- `catch` 处理块用 `c6_last_stmt_leaves` 检查是否以 `return` / `err(id, msg)` /
   `goto` / `break` / `continue` 离开，否则编译报错，避免静默落回成功路径；
 - `test` 块合成的函数也带 `func_fallible`，因此 test 块里可以直接 `try`；
 - `--run` 下错误槽接口是普通全局变量（无 TLS），与 `err` 的限制一致。
@@ -275,9 +275,9 @@ static const struct Drawable_vt __tcc_vt_Circle_Drawable = {
 
 - 方法**必须在转换点之前**声明或定义（单趟编译约束）；
 - 第一次发生 `render(c)` / `Drawable d = c` / `(Drawable)c` 时校验并登记
-  `SupercAutoImpl{Circle, Drawable, vt_sym}` 到 `TCCState`，同时创建 vtable 的
+  `C6AutoImpl{Circle, Drawable, vt_sym}` 到 `TCCState`，同时创建 vtable 的
   前置符号（`extern`，还不是定义）；
-- 每个 TU 末尾由 `superc_emit_auto_impls()` 生成
+- 每个 TU 末尾由 `c6_emit_auto_impls()` 生成
   `static const struct Drawable_vt __tcc_vt_Circle_Drawable = { ... };`；
   生成与 `gen_inline_functions()` 交替进行（`static inline` 函数体在
   TU 末尾才编译，其中可能又发生转换）；每个 TU 一份 `static`，因此多个
@@ -367,7 +367,7 @@ import math.util;
 1. 解析 `package NAME`：在 `TCCState` 中设置 `current_package = "NAME"`；点号与嵌套
    都只是前缀组合（`a.b` → `a__b`，`a { b { } }` → `a__b`）；
 2. 块内每个全局符号注册时，符号名施加前缀 `NAME__`（如 `math__add`），`main` 除外；
-3. `import NAME;`：把包名登记进 `superc_imports`，不作为声明、不打开文件；
+3. `import NAME;`：把包名登记进 `c6_imports`，不作为声明、不打开文件；
 4. 块结束恢复 `current_package = NULL`；`package NAME;` 命名文件其余部分。
 
 `pkg.member`（可多级）由 `unary()` 解析：先按普通 C 标识符查找，命中可见对象则保持
@@ -426,7 +426,7 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 
 | 阶段 | 内容 | 关键验收 | 依赖 |
 |---|---|---|---|
-| **0** | 语义规范、`TCC_EXT` 条件编译、测试矩阵 | 扩展关闭零行为变化 | — |
+| **0** | 语义规范、`C6_EXT` 条件编译、测试矩阵 | 扩展关闭零行为变化 | — |
 | **1** | `defer`：就地生成清理块 + 运行时记录链表 + `ScopeTracker` | 条件/循环/递归/多 defer 逆序正确；`goto` 跨作用域清理；返回值落栈保护 | 0 |
 | **2** | `errdefer + err`：线程局部错误槽 + 就地清理 + 哨兵传播 | 多层传播逐层执行 errdefer；递归不串错误 | 1 |
 | **3** | **`test "desc" {}`**：顶层注册、`-test` 模式、`--test-filter`、与 `err` 集成 | PASS/FAIL 正确；退出码正确；后续特性用 `test` 验收 | 2 |
@@ -455,7 +455,7 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 
 ### 9.2 工程要求
 
-- 现有 TCC 测试套件在 `TCC_EXT` 开/关两种模式下全回归；
+- 现有 TCC 测试套件在 `C6_EXT` 开/关两种模式下全回归；
 - 调试信息保留原始源位置（尤其 `defer` 清理块和卫生宏）；
 - `TCCState` 扩展字段保持 ABI 兼容；
 - `__tcc_err` 线程局部槽需明确线程模型；
@@ -480,28 +480,28 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 构建与运行：
 
 ```bash
-cd tcc && make clean && make -j$(nproc) EXTRA-DEFS=-DTCC_EXT CFLAGS="-g -O0"
-tcc/tcc -std=tcc-ext -B. -run file.c        # 扩展开启
-tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
+cd tcc && make clean && make -j$(nproc) EXTRA-DEFS=-DC6_EXT CFLAGS="-g -O0"
+tcc/tcc -std=c6 -B. -run file.c        # 扩展开启
+tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 ```
 
 | 阶段 | 状态 | 关键实现位置 |
 |---|---|---|
-| 0 `TCC_EXT` 门控 | ✅ | `tcctok.h`（新 token 追加在文件末尾，避免破坏 i386 asm 关键字）、`libtcc.c`（`-std=tcc-ext`）、`tccpp.c`（`__TCC_EXT__`、未开启时把新关键字还原为普通标识符） |
-| 1 `defer` | ✅ | `tccgen.c`：`superc_defer_parse` / `superc_defer_begin` / `superc_defer_func_end`（运行时记录栈 + 每函数调度器）、`lib/libtcc1.c`：`__tcc_defer_*` |
-| 2 `errdefer`/`err` | ✅ | `superc_errdefer_parse` / `superc_err_parse`、`__tcc_err_set/get/clear`；`err` 直接返回哨兵 `-1`，转发由 `try` 负责 |
-| 2b `T!error` / `try` / `catch` | ✅ | `superc_parse_fallible_suffix` / `superc_apply_fallible`（`FuncAttr.func_fallible`）、`superc_try_parse`（`unary()` 前缀分支）、`superc_catch_parse`（`expr_catch()` 层）、`superc_emit_propagate`（与 `err` 共用清理+哨兵路径）、`__tcc_error_take` / `__tcc_err_flag_peek` |
-| 3 `test` / `-test` / `-test-filter` | ✅ | `superc_test_parse`、`tccrun.c:tcc_run_tests`、`libtcc.c` 选项 |
-| 4 `package`/`import`/`pkg.member` | ✅ | `superc_package_parse` / `superc_import_parse`、`superc_pkg_name` / `superc_pkg_compose` / `superc_pkg_imported`、`superc_mangle_tok`（`NAME__sym`）、`unary()` 里的逐段点号解析与 `sym_find_raw` |
-| 4b 结构体方法 | ✅ | `decl()` 里 `superc_method_register`、`superc_method_lookup` / `superc_has_field` / `superc_method_call_prep`、`unary()` 的 `->` 分支、`superc_self_*` 隐藏接收者（sret 之后） |
-| 5 `interface` | ✅ | `superc_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`superc_auto_impl_ensure` / `superc_check_method`（惰性校验）、`superc_emit_auto_impls`（TU 末尾生成 `static` vtable）、`superc_iface_call_prep`（调用点改写）、`superc_iface_convert`（隐式/显式转换） |
-| 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；`superc_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
-| 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_superc_macro` / `superc_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
-| 10 变量必须初始化 | ✅ | `tccgen.c`：`superc_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
-| 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `superc_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`superc_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`superc_slice_spill`（把基值落到本地 `{data, len}` 对）、`superc_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
+| 0 `C6_EXT` 门控 | ✅ | `tcctok.h`（新 token 追加在文件末尾，避免破坏 i386 asm 关键字）、`libtcc.c`（`-std=c6`）、`tccpp.c`（`__C6__`、未开启时把新关键字还原为普通标识符） |
+| 1 `defer` | ✅ | `tccgen.c`：`c6_defer_parse` / `c6_defer_begin` / `c6_defer_func_end`（运行时记录栈 + 每函数调度器）、`lib/libtcc1.c`：`__tcc_defer_*` |
+| 2 `errdefer`/`err` | ✅ | `c6_errdefer_parse` / `c6_err_parse`、`__tcc_err_set/get/clear`；`err` 直接返回哨兵 `-1`，转发由 `try` 负责 |
+| 2b `T!error` / `try` / `catch` | ✅ | `c6_parse_fallible_suffix` / `c6_apply_fallible`（`FuncAttr.func_fallible`）、`c6_try_parse`（`unary()` 前缀分支）、`c6_catch_parse`（`expr_catch()` 层）、`c6_emit_propagate`（与 `err` 共用清理+哨兵路径）、`__tcc_error_take` / `__tcc_err_flag_peek` |
+| 3 `test` / `-test` / `-test-filter` | ✅ | `c6_test_parse`、`tccrun.c:tcc_run_tests`、`libtcc.c` 选项 |
+| 4 `package`/`import`/`pkg.member` | ✅ | `c6_package_parse` / `c6_import_parse`、`c6_pkg_name` / `c6_pkg_compose` / `c6_pkg_imported`、`c6_mangle_tok`（`NAME__sym`）、`unary()` 里的逐段点号解析与 `sym_find_raw` |
+| 4b 结构体方法 | ✅ | `decl()` 里 `c6_method_register`、`c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`、`unary()` 的 `->` 分支、`c6_self_*` 隐藏接收者（sret 之后） |
+| 5 `interface` | ✅ | `c6_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`c6_auto_impl_ensure` / `c6_check_method`（惰性校验）、`c6_emit_auto_impls`（TU 末尾生成 `static` vtable）、`c6_iface_call_prep`（调用点改写）、`c6_iface_convert`（隐式/显式转换） |
+| 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；`c6_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
+| 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_c6_macro` / `c6_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
+| 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
+| 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
 
-测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：superc 的
-测试一律用 superc 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
+测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：c6 的
+测试一律用 c6 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
 比对 stdout，改一行输出就得重生成期望文件）。
 
 | 位置 | 内容 |
@@ -525,7 +525,7 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 诊断测试因此不需要维护行号。
 
 `make test` / `make test-plain` 仍旧跑上游 `tests/tests2` 全量（134 项），
-两种构建下都全过——superc 不再往 tests2 里加用例。
+两种构建下都全过——c6 不再往 tests2 里加用例。
 
 已知限制（与设计一致）：
 
@@ -535,7 +535,7 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
   的函数里自动传播），就地处理用 `catch`（快照并清空错误槽）；
 - `T!error` 调用的返回值必须被 `try` 或 `catch` 消费，否则编译报错；
 - `error` 只能作为返回值：形参表里的 `error` / `error*` / `error[]` 一律
-  报错（`superc_check_error_param`），错误通道只有返回值 + 错误槽，
+  报错（`c6_check_error_param`），错误通道只有返回值 + 错误槽，
   不引入隐藏参数，也不改变调用约定；
 - `!error` 的函数返回类型必须能表示哨兵 `-1`，因此结构体返回类型不能标注；
 - 结构体方法必须在调用点之前声明或定义（单趟编译约束）；只支持 `->`，
@@ -547,13 +547,13 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
   是普通拷贝；
 - `pkg.member` 必须先 `import`（或位于该包内）；包只是词法前缀，没有目录/文件语义，
   多级包名只是把点号换成 `__`；
-- 变量初始化检查在**定义点**做（`superc_check_var_initialized`），不做数据流
+- 变量初始化检查在**定义点**做（`c6_check_var_initialized`），不做数据流
   分析，因此 `int x; x = 1;` 也会报错；`extern` 声明、形参、结构体/联合体
   成员、`typedef` 不是定义，不受约束；
 - VLA 是初始化规则的唯一豁免：标准 C 不允许 `int a[n] = …`，所以 VLA 仍可
   不带初始化器；
-- 这条规则是**按翻译单元**生效的：不加 `-std=tcc-ext` 的旧代码零变化
-  （plain 构建下 tests2 仍 134 项全过，superc 的自测在 `tests/` 单独跑）；
+- 这条规则是**按翻译单元**生效的：不加 `-std=c6` 的旧代码零变化
+  （plain 构建下 tests2 仍 134 项全过，c6 的自测在 `tests/` 单独跑）；
   给某个 TU 开启扩展后，该 TU 内所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
   全局/`static` 对象放进 `.data`（不写初始化器时在 `.bss`），因此给大型
   静态缓冲区补初始化器会增大输出文件；

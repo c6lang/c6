@@ -1,5 +1,5 @@
 From f2a53238f856ba32ebe1c54ad626ebc6e94ffa00 Mon Sep 17 00:00:00 2001
-From: superc <superc@localhost>
+From: c6 <c6@localhost>
 Date: Fri, 6 Nov 2026 17:03:54 +0800
 Subject: [PATCH 3/10] =?UTF-8?q?tccrun:=20'-test'=20=E6=A8=A1=E5=BC=8F?=
  =?UTF-8?q?=E4=B8=8B=20runmain.o=20=E5=8F=AA=E5=9C=A8=E5=AD=98=E5=9C=A8=20?=
@@ -12,16 +12,16 @@ test 运行器直接调用 test 函数，用户 main 是可选的；runmain.o �
 main，之前会让“只有 test 块、没有 main”的文件报 unresolved reference
 to 'main'。现在 -test 模式且在符号表里找不到 main 时不再拉入 runmain.o。
 ---
- .superc-mode | 1 +
+ .c6-mode | 1 +
  tccrun.c     | 8 +++++++-
  2 files changed, 8 insertions(+), 1 deletion(-)
- create mode 100644 .superc-mode
+ create mode 100644 .c6-mode
 
-diff --git a/.superc-mode b/.superc-mode
+diff --git a/.c6-mode b/.c6-mode
 new file mode 100644
 index 0000000..bdcc60e
 --- /dev/null
-+++ b/.superc-mode
++++ b/.c6-mode
 @@ -0,0 +1 @@
 +ext
 diff --git a/tccrun.c b/tccrun.c
@@ -33,11 +33,11 @@ index ccf684d..196580a 100644
      if (s1->elf_entryname)
          s1->run_main = top_sym = s1->elf_entryname;
 -    tcc_add_support(s1, "runmain.o");
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    /* with '-test' the runner calls the test functions directly and a
 +       user 'main' is optional; runmain.o references 'main', so pull it
 +       in only when there is one */
-+    if (!s1->superc_test_mode || (addr_t)-1 != get_sym_addr(s1, "main", 0, 1))
++    if (!s1->c6_test_mode || (addr_t)-1 != get_sym_addr(s1, "main", 0, 1))
 +#endif
 +        tcc_add_support(s1, "runmain.o");
  

@@ -1,123 +1,123 @@
 From a83ea73a4ed0bb88cdbfb4021ce665f68225b33e Mon Sep 17 00:00:00 2001
-From: superc <superc@localhost>
+From: c6 <c6@localhost>
 Date: Fri, 6 Nov 2026 22:32:39 +0800
-Subject: [PATCH] superc: move the extension tests out of tests2
+Subject: [PATCH] c6: move the extension tests out of tests2
 
-The superc tests are written as superc 'test' blocks and live in the
+The c6 tests are written as c6 'test' blocks and live in the
 top-level tests/ directory now, so tests2 stays exactly the upstream
 suite (134 tests in both the extension and the plain build).
 
-Drop 156..177 from tests/tests2 and the SUPERC_TESTS block in
+Drop 156..177 from tests/tests2 and the C6_TESTS block in
 tests/tests2/Makefile.
 ---
- tests/tests2/156_superc_defer.c               | 107 ---------
- tests/tests2/156_superc_defer.expect          |   6 -
- tests/tests2/157_superc_err.c                 | 171 --------------
- tests/tests2/157_superc_err.expect            |  14 --
- tests/tests2/158_superc_test.c                |  62 -----
- tests/tests2/158_superc_test.expect           |   6 -
- tests/tests2/159_superc_package.c             |  36 ---
- tests/tests2/159_superc_package.expect        |   5 -
- tests/tests2/160_superc_interface.c           |  99 --------
- tests/tests2/160_superc_interface.expect      |   7 -
- tests/tests2/161_superc_macro.c               |  58 -----
- tests/tests2/161_superc_macro.expect          |   8 -
- tests/tests2/162_superc_iface_errors.c        |  40 ----
- tests/tests2/162_superc_iface_errors.expect   |  17 --
- tests/tests2/163_superc_try.c                 | 213 ------------------
- tests/tests2/163_superc_try.expect            |  29 ---
- tests/tests2/164_superc_try_errors.c          |  50 ----
- tests/tests2/164_superc_try_errors.expect     |  41 ----
- tests/tests2/165_superc_init.c                |  66 ------
- tests/tests2/165_superc_init.expect           |  30 ---
- tests/tests2/166_superc_pkg_dot.c             |  62 -----
- tests/tests2/166_superc_pkg_dot.expect        |  12 -
- tests/tests2/167_superc_pkg_dot_errors.c      |  34 ---
- tests/tests2/167_superc_pkg_dot_errors.expect |  24 --
- tests/tests2/168+_superc_pkg_dot_tu.c         |   6 -
- tests/tests2/168_superc_pkg_dot_tu.c          |  21 --
- tests/tests2/168_superc_pkg_dot_tu.expect     |   3 -
- tests/tests2/169_superc_method.c              |  93 --------
- tests/tests2/169_superc_method.expect         |  10 -
- tests/tests2/170_superc_method_errors.c       |  45 ----
- tests/tests2/170_superc_method_errors.expect  |  13 --
- tests/tests2/171+_superc_method_tu.c          |   5 -
- tests/tests2/171_superc_method_tu.c           |  20 --
- tests/tests2/171_superc_method_tu.expect      |   2 -
- tests/tests2/172+_superc_plain_interop.c      |   5 -
- tests/tests2/172_superc_plain_interop.c       |  24 --
- tests/tests2/172_superc_plain_interop.expect  |   2 -
- tests/tests2/173_superc_pkg_multi.c           |  45 ----
- tests/tests2/173_superc_pkg_multi.expect      |   5 -
- tests/tests2/174+_superc_iface_tu.c           |  19 --
- tests/tests2/174_superc_iface_tu.c            |  30 ---
- tests/tests2/174_superc_iface_tu.expect       |   1 -
- tests/tests2/175_superc_slice.c               | 119 ----------
- tests/tests2/175_superc_slice.expect          |  16 --
- tests/tests2/176_superc_slice_errors.c        |  82 -------
- tests/tests2/176_superc_slice_errors.expect   |  35 ---
- tests/tests2/177+_superc_slice_tu.c           |  18 --
- tests/tests2/177_superc_slice_tu.c            |  23 --
- tests/tests2/177_superc_slice_tu.expect       |   3 -
+ tests/tests2/156_c6_defer.c               | 107 ---------
+ tests/tests2/156_c6_defer.expect          |   6 -
+ tests/tests2/157_c6_err.c                 | 171 --------------
+ tests/tests2/157_c6_err.expect            |  14 --
+ tests/tests2/158_c6_test.c                |  62 -----
+ tests/tests2/158_c6_test.expect           |   6 -
+ tests/tests2/159_c6_package.c             |  36 ---
+ tests/tests2/159_c6_package.expect        |   5 -
+ tests/tests2/160_c6_interface.c           |  99 --------
+ tests/tests2/160_c6_interface.expect      |   7 -
+ tests/tests2/161_c6_macro.c               |  58 -----
+ tests/tests2/161_c6_macro.expect          |   8 -
+ tests/tests2/162_c6_iface_errors.c        |  40 ----
+ tests/tests2/162_c6_iface_errors.expect   |  17 --
+ tests/tests2/163_c6_try.c                 | 213 ------------------
+ tests/tests2/163_c6_try.expect            |  29 ---
+ tests/tests2/164_c6_try_errors.c          |  50 ----
+ tests/tests2/164_c6_try_errors.expect     |  41 ----
+ tests/tests2/165_c6_init.c                |  66 ------
+ tests/tests2/165_c6_init.expect           |  30 ---
+ tests/tests2/166_c6_pkg_dot.c             |  62 -----
+ tests/tests2/166_c6_pkg_dot.expect        |  12 -
+ tests/tests2/167_c6_pkg_dot_errors.c      |  34 ---
+ tests/tests2/167_c6_pkg_dot_errors.expect |  24 --
+ tests/tests2/168+_c6_pkg_dot_tu.c         |   6 -
+ tests/tests2/168_c6_pkg_dot_tu.c          |  21 --
+ tests/tests2/168_c6_pkg_dot_tu.expect     |   3 -
+ tests/tests2/169_c6_method.c              |  93 --------
+ tests/tests2/169_c6_method.expect         |  10 -
+ tests/tests2/170_c6_method_errors.c       |  45 ----
+ tests/tests2/170_c6_method_errors.expect  |  13 --
+ tests/tests2/171+_c6_method_tu.c          |   5 -
+ tests/tests2/171_c6_method_tu.c           |  20 --
+ tests/tests2/171_c6_method_tu.expect      |   2 -
+ tests/tests2/172+_c6_plain_interop.c      |   5 -
+ tests/tests2/172_c6_plain_interop.c       |  24 --
+ tests/tests2/172_c6_plain_interop.expect  |   2 -
+ tests/tests2/173_c6_pkg_multi.c           |  45 ----
+ tests/tests2/173_c6_pkg_multi.expect      |   5 -
+ tests/tests2/174+_c6_iface_tu.c           |  19 --
+ tests/tests2/174_c6_iface_tu.c            |  30 ---
+ tests/tests2/174_c6_iface_tu.expect       |   1 -
+ tests/tests2/175_c6_slice.c               | 119 ----------
+ tests/tests2/175_c6_slice.expect          |  16 --
+ tests/tests2/176_c6_slice_errors.c        |  82 -------
+ tests/tests2/176_c6_slice_errors.expect   |  35 ---
+ tests/tests2/177+_c6_slice_tu.c           |  18 --
+ tests/tests2/177_c6_slice_tu.c            |  23 --
+ tests/tests2/177_c6_slice_tu.expect       |   3 -
  tests/tests2/Makefile                         |  37 ---
  50 files changed, 1879 deletions(-)
- delete mode 100644 tests/tests2/156_superc_defer.c
- delete mode 100644 tests/tests2/156_superc_defer.expect
- delete mode 100644 tests/tests2/157_superc_err.c
- delete mode 100644 tests/tests2/157_superc_err.expect
- delete mode 100644 tests/tests2/158_superc_test.c
- delete mode 100644 tests/tests2/158_superc_test.expect
- delete mode 100644 tests/tests2/159_superc_package.c
- delete mode 100644 tests/tests2/159_superc_package.expect
- delete mode 100644 tests/tests2/160_superc_interface.c
- delete mode 100644 tests/tests2/160_superc_interface.expect
- delete mode 100644 tests/tests2/161_superc_macro.c
- delete mode 100644 tests/tests2/161_superc_macro.expect
- delete mode 100644 tests/tests2/162_superc_iface_errors.c
- delete mode 100644 tests/tests2/162_superc_iface_errors.expect
- delete mode 100644 tests/tests2/163_superc_try.c
- delete mode 100644 tests/tests2/163_superc_try.expect
- delete mode 100644 tests/tests2/164_superc_try_errors.c
- delete mode 100644 tests/tests2/164_superc_try_errors.expect
- delete mode 100644 tests/tests2/165_superc_init.c
- delete mode 100644 tests/tests2/165_superc_init.expect
- delete mode 100644 tests/tests2/166_superc_pkg_dot.c
- delete mode 100644 tests/tests2/166_superc_pkg_dot.expect
- delete mode 100644 tests/tests2/167_superc_pkg_dot_errors.c
- delete mode 100644 tests/tests2/167_superc_pkg_dot_errors.expect
- delete mode 100644 tests/tests2/168+_superc_pkg_dot_tu.c
- delete mode 100644 tests/tests2/168_superc_pkg_dot_tu.c
- delete mode 100644 tests/tests2/168_superc_pkg_dot_tu.expect
- delete mode 100644 tests/tests2/169_superc_method.c
- delete mode 100644 tests/tests2/169_superc_method.expect
- delete mode 100644 tests/tests2/170_superc_method_errors.c
- delete mode 100644 tests/tests2/170_superc_method_errors.expect
- delete mode 100644 tests/tests2/171+_superc_method_tu.c
- delete mode 100644 tests/tests2/171_superc_method_tu.c
- delete mode 100644 tests/tests2/171_superc_method_tu.expect
- delete mode 100644 tests/tests2/172+_superc_plain_interop.c
- delete mode 100644 tests/tests2/172_superc_plain_interop.c
- delete mode 100644 tests/tests2/172_superc_plain_interop.expect
- delete mode 100644 tests/tests2/173_superc_pkg_multi.c
- delete mode 100644 tests/tests2/173_superc_pkg_multi.expect
- delete mode 100644 tests/tests2/174+_superc_iface_tu.c
- delete mode 100644 tests/tests2/174_superc_iface_tu.c
- delete mode 100644 tests/tests2/174_superc_iface_tu.expect
- delete mode 100644 tests/tests2/175_superc_slice.c
- delete mode 100644 tests/tests2/175_superc_slice.expect
- delete mode 100644 tests/tests2/176_superc_slice_errors.c
- delete mode 100644 tests/tests2/176_superc_slice_errors.expect
- delete mode 100644 tests/tests2/177+_superc_slice_tu.c
- delete mode 100644 tests/tests2/177_superc_slice_tu.c
- delete mode 100644 tests/tests2/177_superc_slice_tu.expect
+ delete mode 100644 tests/tests2/156_c6_defer.c
+ delete mode 100644 tests/tests2/156_c6_defer.expect
+ delete mode 100644 tests/tests2/157_c6_err.c
+ delete mode 100644 tests/tests2/157_c6_err.expect
+ delete mode 100644 tests/tests2/158_c6_test.c
+ delete mode 100644 tests/tests2/158_c6_test.expect
+ delete mode 100644 tests/tests2/159_c6_package.c
+ delete mode 100644 tests/tests2/159_c6_package.expect
+ delete mode 100644 tests/tests2/160_c6_interface.c
+ delete mode 100644 tests/tests2/160_c6_interface.expect
+ delete mode 100644 tests/tests2/161_c6_macro.c
+ delete mode 100644 tests/tests2/161_c6_macro.expect
+ delete mode 100644 tests/tests2/162_c6_iface_errors.c
+ delete mode 100644 tests/tests2/162_c6_iface_errors.expect
+ delete mode 100644 tests/tests2/163_c6_try.c
+ delete mode 100644 tests/tests2/163_c6_try.expect
+ delete mode 100644 tests/tests2/164_c6_try_errors.c
+ delete mode 100644 tests/tests2/164_c6_try_errors.expect
+ delete mode 100644 tests/tests2/165_c6_init.c
+ delete mode 100644 tests/tests2/165_c6_init.expect
+ delete mode 100644 tests/tests2/166_c6_pkg_dot.c
+ delete mode 100644 tests/tests2/166_c6_pkg_dot.expect
+ delete mode 100644 tests/tests2/167_c6_pkg_dot_errors.c
+ delete mode 100644 tests/tests2/167_c6_pkg_dot_errors.expect
+ delete mode 100644 tests/tests2/168+_c6_pkg_dot_tu.c
+ delete mode 100644 tests/tests2/168_c6_pkg_dot_tu.c
+ delete mode 100644 tests/tests2/168_c6_pkg_dot_tu.expect
+ delete mode 100644 tests/tests2/169_c6_method.c
+ delete mode 100644 tests/tests2/169_c6_method.expect
+ delete mode 100644 tests/tests2/170_c6_method_errors.c
+ delete mode 100644 tests/tests2/170_c6_method_errors.expect
+ delete mode 100644 tests/tests2/171+_c6_method_tu.c
+ delete mode 100644 tests/tests2/171_c6_method_tu.c
+ delete mode 100644 tests/tests2/171_c6_method_tu.expect
+ delete mode 100644 tests/tests2/172+_c6_plain_interop.c
+ delete mode 100644 tests/tests2/172_c6_plain_interop.c
+ delete mode 100644 tests/tests2/172_c6_plain_interop.expect
+ delete mode 100644 tests/tests2/173_c6_pkg_multi.c
+ delete mode 100644 tests/tests2/173_c6_pkg_multi.expect
+ delete mode 100644 tests/tests2/174+_c6_iface_tu.c
+ delete mode 100644 tests/tests2/174_c6_iface_tu.c
+ delete mode 100644 tests/tests2/174_c6_iface_tu.expect
+ delete mode 100644 tests/tests2/175_c6_slice.c
+ delete mode 100644 tests/tests2/175_c6_slice.expect
+ delete mode 100644 tests/tests2/176_c6_slice_errors.c
+ delete mode 100644 tests/tests2/176_c6_slice_errors.expect
+ delete mode 100644 tests/tests2/177+_c6_slice_tu.c
+ delete mode 100644 tests/tests2/177_c6_slice_tu.c
+ delete mode 100644 tests/tests2/177_c6_slice_tu.expect
 
-diff --git a/tests/tests2/156_superc_defer.c b/tests/tests2/156_superc_defer.c
+diff --git a/tests/tests2/156_c6_defer.c b/tests/tests2/156_c6_defer.c
 deleted file mode 100644
 index 3ad87b4..0000000
---- a/tests/tests2/156_superc_defer.c
+--- a/tests/tests2/156_c6_defer.c
 +++ /dev/null
 @@ -1,107 +0,0 @@
--/* superc extension: defer */
+-/* c6 extension: defer */
 -#include <stdio.h>
 -
 -static char log_buf[512] = {0};
@@ -224,10 +224,10 @@ index 3ad87b4..0000000
 -    t_rec();
 -    return 0;
 -}
-diff --git a/tests/tests2/156_superc_defer.expect b/tests/tests2/156_superc_defer.expect
+diff --git a/tests/tests2/156_c6_defer.expect b/tests/tests2/156_c6_defer.expect
 deleted file mode 100644
 index 5282be6..0000000
---- a/tests/tests2/156_superc_defer.expect
+--- a/tests/tests2/156_c6_defer.expect
 +++ /dev/null
 @@ -1,6 +0,0 @@
 -basic: bodycba
@@ -236,13 +236,13 @@ index 5282be6..0000000
 -ret2: -1 ret2log: threeone
 -goto: innerouter
 -rec: 6 4
-diff --git a/tests/tests2/157_superc_err.c b/tests/tests2/157_superc_err.c
+diff --git a/tests/tests2/157_c6_err.c b/tests/tests2/157_c6_err.c
 deleted file mode 100644
 index d917b6a..0000000
---- a/tests/tests2/157_superc_err.c
+--- a/tests/tests2/157_c6_err.c
 +++ /dev/null
 @@ -1,171 +0,0 @@
--/* superc extension: errdefer + err + try */
+-/* c6 extension: errdefer + err + try */
 -#include <stdio.h>
 -#include <string.h>
 -
@@ -413,10 +413,10 @@ index d917b6a..0000000
 -    printf("final-flag=%d\n", __tcc_err_flag_get());
 -    return 0;
 -}
-diff --git a/tests/tests2/157_superc_err.expect b/tests/tests2/157_superc_err.expect
+diff --git a/tests/tests2/157_c6_err.expect b/tests/tests2/157_c6_err.expect
 deleted file mode 100644
 index a555c95..0000000
---- a/tests/tests2/157_superc_err.expect
+--- a/tests/tests2/157_c6_err.expect
 +++ /dev/null
 @@ -1,14 +0,0 @@
 -e1-normal=0 e1-normal: 41
@@ -433,13 +433,13 @@ index a555c95..0000000
 -ptr=1 ptr: p
 -id=11 msg=ptr
 -final-flag=0
-diff --git a/tests/tests2/158_superc_test.c b/tests/tests2/158_superc_test.c
+diff --git a/tests/tests2/158_c6_test.c b/tests/tests2/158_c6_test.c
 deleted file mode 100644
 index dcd6a25..0000000
---- a/tests/tests2/158_superc_test.c
+--- a/tests/tests2/158_c6_test.c
 +++ /dev/null
 @@ -1,62 +0,0 @@
--/* superc extension: 'test "desc" { ... }' blocks and -test mode */
+-/* c6 extension: 'test "desc" { ... }' blocks and -test mode */
 -#include <stdio.h>
 -
 -int __tcc_err_flag_get(void);
@@ -501,10 +501,10 @@ index dcd6a25..0000000
 -    printf("main should not run\n");
 -    return 0;
 -}
-diff --git a/tests/tests2/158_superc_test.expect b/tests/tests2/158_superc_test.expect
+diff --git a/tests/tests2/158_c6_test.expect b/tests/tests2/158_c6_test.expect
 deleted file mode 100644
 index 5fc4185..0000000
---- a/tests/tests2/158_superc_test.expect
+--- a/tests/tests2/158_c6_test.expect
 +++ /dev/null
 @@ -1,6 +0,0 @@
 -PASS: arithmetic works
@@ -513,13 +513,13 @@ index 5fc4185..0000000
 -PASS: strings and loops
 -PASS: helpers propagate errors
 -5 test(s), 0 failure(s)
-diff --git a/tests/tests2/159_superc_package.c b/tests/tests2/159_superc_package.c
+diff --git a/tests/tests2/159_c6_package.c b/tests/tests2/159_c6_package.c
 deleted file mode 100644
 index a1c6d5d..0000000
---- a/tests/tests2/159_superc_package.c
+--- a/tests/tests2/159_c6_package.c
 +++ /dev/null
 @@ -1,36 +0,0 @@
--/* superc extension: package / import */
+-/* c6 extension: package / import */
 -#include <stdio.h>
 -
 -package math {
@@ -555,10 +555,10 @@ index a1c6d5d..0000000
 -    printf("helper=%d\n", math__hidden_helper(41));
 -    return 0;
 -}
-diff --git a/tests/tests2/159_superc_package.expect b/tests/tests2/159_superc_package.expect
+diff --git a/tests/tests2/159_c6_package.expect b/tests/tests2/159_c6_package.expect
 deleted file mode 100644
 index 63e3428..0000000
---- a/tests/tests2/159_superc_package.expect
+--- a/tests/tests2/159_c6_package.expect
 +++ /dev/null
 @@ -1,5 +0,0 @@
 -add=5
@@ -566,13 +566,13 @@ index 63e3428..0000000
 -len=5
 -mangled=30 3
 -helper=42
-diff --git a/tests/tests2/160_superc_interface.c b/tests/tests2/160_superc_interface.c
+diff --git a/tests/tests2/160_c6_interface.c b/tests/tests2/160_c6_interface.c
 deleted file mode 100644
 index 1bd1432..0000000
---- a/tests/tests2/160_superc_interface.c
+--- a/tests/tests2/160_c6_interface.c
 +++ /dev/null
 @@ -1,99 +0,0 @@
--/* superc extension: interfaces (fat pointer + vtable).
+-/* c6 extension: interfaces (fat pointer + vtable).
 -   A struct implements an interface by having the methods: there is no
 -   'impl' declaration any more, the vtable is generated on demand. */
 -#include <stdio.h>
@@ -671,10 +671,10 @@ index 1bd1432..0000000
 -    printf("inline=%d\n", inline_area(c));
 -    return 0;
 -}
-diff --git a/tests/tests2/160_superc_interface.expect b/tests/tests2/160_superc_interface.expect
+diff --git a/tests/tests2/160_c6_interface.expect b/tests/tests2/160_c6_interface.expect
 deleted file mode 100644
 index 6cb51d3..0000000
---- a/tests/tests2/160_superc_interface.expect
+--- a/tests/tests2/160_c6_interface.expect
 +++ /dev/null
 @@ -1,7 +0,0 @@
 -circle:75 rect:24 total=99
@@ -684,13 +684,13 @@ index 6cb51d3..0000000
 -[circle]
 -sizeof=16
 -inline=75
-diff --git a/tests/tests2/161_superc_macro.c b/tests/tests2/161_superc_macro.c
+diff --git a/tests/tests2/161_c6_macro.c b/tests/tests2/161_c6_macro.c
 deleted file mode 100644
 index 0611ab4..0000000
---- a/tests/tests2/161_superc_macro.c
+--- a/tests/tests2/161_c6_macro.c
 +++ /dev/null
 @@ -1,58 +0,0 @@
--/* superc extension: '#macro' with hygienic '__local' names */
+-/* c6 extension: '#macro' with hygienic '__local' names */
 -#include <stdio.h>
 -
 -#macro swap(a, b) {
@@ -748,10 +748,10 @@ index 0611ab4..0000000
 -    printf("names: %d\n", (int)sizeof(a));
 -    return 0;
 -}
-diff --git a/tests/tests2/161_superc_macro.expect b/tests/tests2/161_superc_macro.expect
+diff --git a/tests/tests2/161_c6_macro.expect b/tests/tests2/161_c6_macro.expect
 deleted file mode 100644
 index aa2e0b7..0000000
---- a/tests/tests2/161_superc_macro.expect
+--- a/tests/tests2/161_c6_macro.expect
 +++ /dev/null
 @@ -1,8 +0,0 @@
 -swap: 9 3
@@ -762,13 +762,13 @@ index aa2e0b7..0000000
 -user: tmp=3 a=42
 -twice-swap: 42 9
 -names: 4
-diff --git a/tests/tests2/162_superc_iface_errors.c b/tests/tests2/162_superc_iface_errors.c
+diff --git a/tests/tests2/162_c6_iface_errors.c b/tests/tests2/162_c6_iface_errors.c
 deleted file mode 100644
 index 058c918..0000000
---- a/tests/tests2/162_superc_iface_errors.c
+--- a/tests/tests2/162_c6_iface_errors.c
 +++ /dev/null
 @@ -1,40 +0,0 @@
--/* superc extension: diagnostics for structured interfaces.
+-/* c6 extension: diagnostics for structured interfaces.
 -   A struct implements an interface by having the methods; the check
 -   happens at the first conversion, so every branch below converts. */
 -struct Circle { int r; };
@@ -808,36 +808,36 @@ index 058c918..0000000
 -int area(struct Circle *self) { return self->r; }
 -int main(void) { struct Circle c = {1}; Shape s = {0}; s = c; return s.area(); }
 -#endif
-diff --git a/tests/tests2/162_superc_iface_errors.expect b/tests/tests2/162_superc_iface_errors.expect
+diff --git a/tests/tests2/162_c6_iface_errors.expect b/tests/tests2/162_c6_iface_errors.expect
 deleted file mode 100644
 index 154970c..0000000
---- a/tests/tests2/162_superc_iface_errors.expect
+--- a/tests/tests2/162_c6_iface_errors.expect
 +++ /dev/null
 @@ -1,17 +0,0 @@
 -[test_missing_method]
--162_superc_iface_errors.c:10: error: 'Circle' does not implement interface 'Shape': missing method 'dump'
+-162_c6_iface_errors.c:10: error: 'Circle' does not implement interface 'Shape': missing method 'dump'
 -
 -[test_wrong_param_count]
--162_superc_iface_errors.c:15: error: method 'area' of 'Shape' has the wrong number of parameters
+-162_c6_iface_errors.c:15: error: method 'area' of 'Shape' has the wrong number of parameters
 -
 -[test_wrong_return_type]
--162_superc_iface_errors.c:20: error: method 'area' of 'Shape' has an incompatible return type
+-162_c6_iface_errors.c:20: error: method 'area' of 'Shape' has an incompatible return type
 -
 -[test_incompatible_param]
--162_superc_iface_errors.c:25: error: method 'scale' of 'Shape' has an incompatible parameter
+-162_c6_iface_errors.c:25: error: method 'scale' of 'Shape' has an incompatible parameter
 -
 -[test_duplicate_method]
--162_superc_iface_errors.c:28: error: duplicate method 'area' for 'Circle'
+-162_c6_iface_errors.c:28: error: duplicate method 'area' for 'Circle'
 -
 -[test_method_after_use]
--162_superc_iface_errors.c:34: error: 'Circle' does not implement interface 'Shape': missing method 'area'
-diff --git a/tests/tests2/163_superc_try.c b/tests/tests2/163_superc_try.c
+-162_c6_iface_errors.c:34: error: 'Circle' does not implement interface 'Shape': missing method 'area'
+diff --git a/tests/tests2/163_c6_try.c b/tests/tests2/163_c6_try.c
 deleted file mode 100644
 index c01880f..0000000
---- a/tests/tests2/163_superc_try.c
+--- a/tests/tests2/163_c6_try.c
 +++ /dev/null
 @@ -1,213 +0,0 @@
--/* superc extension: 'T!error' functions, 'try' and 'catch' */
+-/* c6 extension: 'T!error' functions, 'try' and 'catch' */
 -#include <stdio.h>
 -#include <string.h>
 -
@@ -1050,10 +1050,10 @@ index c01880f..0000000
 -    printf("final flag=%d\n", __tcc_err_flag_get());
 -    return 0;
 -}
-diff --git a/tests/tests2/163_superc_try.expect b/tests/tests2/163_superc_try.expect
+diff --git a/tests/tests2/163_c6_try.expect b/tests/tests2/163_c6_try.expect
 deleted file mode 100644
 index 88e35a4..0000000
---- a/tests/tests2/163_superc_try.expect
+--- a/tests/tests2/163_c6_try.expect
 +++ /dev/null
 @@ -1,29 +0,0 @@
 -1 ok=21 log=A
@@ -1085,13 +1085,13 @@ index 88e35a4..0000000
 -8 flag=0
 -9 flag=0 id=0
 -final flag=0
-diff --git a/tests/tests2/164_superc_try_errors.c b/tests/tests2/164_superc_try_errors.c
+diff --git a/tests/tests2/164_c6_try_errors.c b/tests/tests2/164_c6_try_errors.c
 deleted file mode 100644
 index cb5a9ec..0000000
---- a/tests/tests2/164_superc_try_errors.c
+--- a/tests/tests2/164_c6_try_errors.c
 +++ /dev/null
 @@ -1,50 +0,0 @@
--/* superc extension: diagnostics for malformed 'try' / 'catch' / 'T!error' */
+-/* c6 extension: diagnostics for malformed 'try' / 'catch' / 'T!error' */
 -static int ok_int(void) { return 1; }
 -static int!error fails(int n) { if (n) err(1, "x"); return 0; }
 -struct S { int a; };
@@ -1141,60 +1141,60 @@ index cb5a9ec..0000000
 -#else
 -int main(void) { return 0; }
 -#endif
-diff --git a/tests/tests2/164_superc_try_errors.expect b/tests/tests2/164_superc_try_errors.expect
+diff --git a/tests/tests2/164_c6_try_errors.expect b/tests/tests2/164_c6_try_errors.expect
 deleted file mode 100644
 index 0002534..0000000
---- a/tests/tests2/164_superc_try_errors.expect
+--- a/tests/tests2/164_c6_try_errors.expect
 +++ /dev/null
 @@ -1,41 +0,0 @@
 -[test_try_in_plain_fn]
--164_superc_try_errors.c:7: error: 'try' requires the enclosing function to return 'T!error'
+-164_c6_try_errors.c:7: error: 'try' requires the enclosing function to return 'T!error'
 -
 -[test_try_not_fallible]
--164_superc_try_errors.c:10: error: 'try' requires a call to a function returning 'T!error'
+-164_c6_try_errors.c:10: error: 'try' requires a call to a function returning 'T!error'
 -
 -[test_try_not_a_call]
--164_superc_try_errors.c:13: error: 'try' requires a call to a function returning 'T!error'
+-164_c6_try_errors.c:13: error: 'try' requires a call to a function returning 'T!error'
 -
 -[test_try_assignment]
--164_superc_try_errors.c:16: error: 'try' requires a call to a function returning 'T!error'
+-164_c6_try_errors.c:16: error: 'try' requires a call to a function returning 'T!error'
 -
 -[test_catch_not_fallible]
--164_superc_try_errors.c:19: error: 'catch' requires a call to a function returning 'T!error'
+-164_c6_try_errors.c:19: error: 'catch' requires a call to a function returning 'T!error'
 -
 -[test_catch_falls_through]
--164_superc_try_errors.c:22: error: 'catch' body must end with 'return', 'err()' or 'goto'
+-164_c6_try_errors.c:22: error: 'catch' body must end with 'return', 'err()' or 'goto'
 -
 -[test_bare_catch]
--164_superc_try_errors.c:25: error: 'catch' has no operand
+-164_c6_try_errors.c:25: error: 'catch' has no operand
 -
 -[test_fallible_not_a_function]
--164_superc_try_errors.c:28: error: '!error' requires a function declarator
+-164_c6_try_errors.c:28: error: '!error' requires a function declarator
 -
 -[test_fallible_struct_return]
--164_superc_try_errors.c:31: error: '!error' requires a return type representable by -1
+-164_c6_try_errors.c:31: error: '!error' requires a return type representable by -1
 -
 -[test_try_in_defer]
--164_superc_try_errors.c:34: error: 'try' is not allowed in a defer body
+-164_c6_try_errors.c:34: error: 'try' is not allowed in a defer body
 -
 -[test_error_parameter]
--164_superc_try_errors.c:37: error: 'error' can only be a return type, not a parameter
+-164_c6_try_errors.c:37: error: 'error' can only be a return type, not a parameter
 -
 -[test_error_out_parameter]
--164_superc_try_errors.c:40: error: 'error' can only be a return type, not a parameter
+-164_c6_try_errors.c:40: error: 'error' can only be a return type, not a parameter
 -
 -[test_error_parameter_knr]
--164_superc_try_errors.c:43: error: 'error' can only be a return type, not a parameter
+-164_c6_try_errors.c:43: error: 'error' can only be a return type, not a parameter
 -
 -[test_catch_in_defer]
--164_superc_try_errors.c:46: error: 'catch' is not allowed in a defer body
-diff --git a/tests/tests2/165_superc_init.c b/tests/tests2/165_superc_init.c
+-164_c6_try_errors.c:46: error: 'catch' is not allowed in a defer body
+diff --git a/tests/tests2/165_c6_init.c b/tests/tests2/165_c6_init.c
 deleted file mode 100644
 index b9e3723..0000000
---- a/tests/tests2/165_superc_init.c
+--- a/tests/tests2/165_c6_init.c
 +++ /dev/null
 @@ -1,66 +0,0 @@
--/* superc extension: every variable definition must be initialized.
+-/* c6 extension: every variable definition must be initialized.
 - * VLAs are the only exception: C does not allow initializing them. */
 -struct S { int a; };
 -
@@ -1260,49 +1260,49 @@ index b9e3723..0000000
 -#else
 -int main(void) { return 0; }
 -#endif
-diff --git a/tests/tests2/165_superc_init.expect b/tests/tests2/165_superc_init.expect
+diff --git a/tests/tests2/165_c6_init.expect b/tests/tests2/165_c6_init.expect
 deleted file mode 100644
 index 2132239..0000000
---- a/tests/tests2/165_superc_init.expect
+--- a/tests/tests2/165_c6_init.expect
 +++ /dev/null
 @@ -1,30 +0,0 @@
 -[test_local_int]
--165_superc_init.c:6: error: variable 'x' must be initialized
+-165_c6_init.c:6: error: variable 'x' must be initialized
 -
 -[test_local_multi]
--165_superc_init.c:9: error: variable 'y' must be initialized
+-165_c6_init.c:9: error: variable 'y' must be initialized
 -
 -[test_local_array]
--165_superc_init.c:12: error: variable 'a' must be initialized
+-165_c6_init.c:12: error: variable 'a' must be initialized
 -
 -[test_local_struct]
--165_superc_init.c:15: error: variable 's' must be initialized
+-165_c6_init.c:15: error: variable 's' must be initialized
 -
 -[test_local_pointer]
--165_superc_init.c:18: error: variable 'p' must be initialized
+-165_c6_init.c:18: error: variable 'p' must be initialized
 -
 -[test_global_int]
--165_superc_init.c:21: error: variable 'g' must be initialized
+-165_c6_init.c:21: error: variable 'g' must be initialized
 -
 -[test_static_global]
--165_superc_init.c:24: error: variable 'sg' must be initialized
+-165_c6_init.c:24: error: variable 'sg' must be initialized
 -
 -[test_static_local]
--165_superc_init.c:27: error: variable 'sl' must be initialized
+-165_c6_init.c:27: error: variable 'sl' must be initialized
 -
 -[test_for_init]
--165_superc_init.c:30: error: variable 'k' must be initialized
+-165_c6_init.c:30: error: variable 'k' must be initialized
 -
 -[test_ok]
 -
 -[test_vla_ok]
-diff --git a/tests/tests2/166_superc_pkg_dot.c b/tests/tests2/166_superc_pkg_dot.c
+diff --git a/tests/tests2/166_c6_pkg_dot.c b/tests/tests2/166_c6_pkg_dot.c
 deleted file mode 100644
 index 2111b47..0000000
---- a/tests/tests2/166_superc_pkg_dot.c
+--- a/tests/tests2/166_c6_pkg_dot.c
 +++ /dev/null
 @@ -1,62 +0,0 @@
--/* superc extension: 'pkg.member' explicit package access */
+-/* c6 extension: 'pkg.member' explicit package access */
 -#include <stdio.h>
 -
 -package math {
@@ -1364,10 +1364,10 @@ index 2111b47..0000000
 -
 -    return 0;
 -}
-diff --git a/tests/tests2/166_superc_pkg_dot.expect b/tests/tests2/166_superc_pkg_dot.expect
+diff --git a/tests/tests2/166_c6_pkg_dot.expect b/tests/tests2/166_c6_pkg_dot.expect
 deleted file mode 100644
 index 21a8a57..0000000
---- a/tests/tests2/166_superc_pkg_dot.expect
+--- a/tests/tests2/166_c6_pkg_dot.expect
 +++ /dev/null
 @@ -1,12 +0,0 @@
 -add=5 9
@@ -1382,13 +1382,13 @@ index 21a8a57..0000000
 -add_ref=42
 -mangled=30 42
 -shadow=7
-diff --git a/tests/tests2/167_superc_pkg_dot_errors.c b/tests/tests2/167_superc_pkg_dot_errors.c
+diff --git a/tests/tests2/167_c6_pkg_dot_errors.c b/tests/tests2/167_c6_pkg_dot_errors.c
 deleted file mode 100644
 index 3ade96e..0000000
---- a/tests/tests2/167_superc_pkg_dot_errors.c
+--- a/tests/tests2/167_c6_pkg_dot_errors.c
 +++ /dev/null
 @@ -1,34 +0,0 @@
--/* superc extension: diagnostics for 'pkg.member' */
+-/* c6 extension: diagnostics for 'pkg.member' */
 -package math {
 -    int counter = 0;
 -    int add(int a, int b) { return a + b; }
@@ -1422,55 +1422,55 @@ index 3ade96e..0000000
 -import math;
 -int main(void) { return math.add(1, 2) == 3 ? 0 : 1; }
 -#endif
-diff --git a/tests/tests2/167_superc_pkg_dot_errors.expect b/tests/tests2/167_superc_pkg_dot_errors.expect
+diff --git a/tests/tests2/167_c6_pkg_dot_errors.expect b/tests/tests2/167_c6_pkg_dot_errors.expect
 deleted file mode 100644
 index eae9555..0000000
---- a/tests/tests2/167_superc_pkg_dot_errors.expect
+--- a/tests/tests2/167_c6_pkg_dot_errors.expect
 +++ /dev/null
 @@ -1,24 +0,0 @@
 -[test_not_imported]
--167_superc_pkg_dot_errors.c:8: error: 'math' is not an imported package (use 'import math;')
+-167_c6_pkg_dot_errors.c:8: error: 'math' is not an imported package (use 'import math;')
 -
 -[test_not_imported_multi]
--167_superc_pkg_dot_errors.c:11: error: 'acme.util' is not an imported package (use 'import acme.util;')
+-167_c6_pkg_dot_errors.c:11: error: 'acme.util' is not an imported package (use 'import acme.util;')
 -
 -[test_parent_only_import]
--167_superc_pkg_dot_errors.c:15: error: 'acme.util' is not an imported package (use 'import acme.util;')
+-167_c6_pkg_dot_errors.c:15: error: 'acme.util' is not an imported package (use 'import acme.util;')
 -
 -[test_unknown_member]
--167_superc_pkg_dot_errors.c:18: error: 'math.nope' undeclared
+-167_c6_pkg_dot_errors.c:18: error: 'math.nope' undeclared
 -
 -[test_unknown_member_call]
--167_superc_pkg_dot_errors.c:21: warning: implicit declaration of function 'math.nope'
+-167_c6_pkg_dot_errors.c:21: warning: implicit declaration of function 'math.nope'
 -tcc: error: unresolved reference to 'math__nope'
 -
 -[test_missing_member_name]
--167_superc_pkg_dot_errors.c:24: error: identifier expected after '.'
+-167_c6_pkg_dot_errors.c:24: error: identifier expected after '.'
 -
 -[test_arrow_is_not_package_access]
--167_superc_pkg_dot_errors.c:27: error: 'math' undeclared
+-167_c6_pkg_dot_errors.c:27: error: 'math' undeclared
 -
 -[test_import_after_use]
--167_superc_pkg_dot_errors.c:29: error: 'math' is not an imported package (use 'import math;')
-diff --git a/tests/tests2/168+_superc_pkg_dot_tu.c b/tests/tests2/168+_superc_pkg_dot_tu.c
+-167_c6_pkg_dot_errors.c:29: error: 'math' is not an imported package (use 'import math;')
+diff --git a/tests/tests2/168+_c6_pkg_dot_tu.c b/tests/tests2/168+_c6_pkg_dot_tu.c
 deleted file mode 100644
 index 5d49a97..0000000
---- a/tests/tests2/168+_superc_pkg_dot_tu.c
+--- a/tests/tests2/168+_c6_pkg_dot_tu.c
 +++ /dev/null
 @@ -1,6 +0,0 @@
--/* superc extension: definitions for 168_superc_pkg_dot_tu.c */
+-/* c6 extension: definitions for 168_c6_pkg_dot_tu.c */
 -package math {
 -    int counter = 0;
 -    int add(int a, int b) { return a + b; }
 -    int bump(void) { return ++counter; }
 -}
-diff --git a/tests/tests2/168_superc_pkg_dot_tu.c b/tests/tests2/168_superc_pkg_dot_tu.c
+diff --git a/tests/tests2/168_c6_pkg_dot_tu.c b/tests/tests2/168_c6_pkg_dot_tu.c
 deleted file mode 100644
 index eb256f4..0000000
---- a/tests/tests2/168_superc_pkg_dot_tu.c
+--- a/tests/tests2/168_c6_pkg_dot_tu.c
 +++ /dev/null
 @@ -1,21 +0,0 @@
--/* superc extension: 'pkg.member' across translation units.
+-/* c6 extension: 'pkg.member' across translation units.
 -   This file plays the part of a header: it declares the package API with
 -   'pkg.member' and lets the other unit provide the symbols. */
 -#include <stdio.h>
@@ -1491,22 +1491,22 @@ index eb256f4..0000000
 -    printf("bump=%d\n", math.bump());
 -    return 0;
 -}
-diff --git a/tests/tests2/168_superc_pkg_dot_tu.expect b/tests/tests2/168_superc_pkg_dot_tu.expect
+diff --git a/tests/tests2/168_c6_pkg_dot_tu.expect b/tests/tests2/168_c6_pkg_dot_tu.expect
 deleted file mode 100644
 index eea48cc..0000000
---- a/tests/tests2/168_superc_pkg_dot_tu.expect
+--- a/tests/tests2/168_c6_pkg_dot_tu.expect
 +++ /dev/null
 @@ -1,3 +0,0 @@
 -add=5
 -counter=5
 -bump=6
-diff --git a/tests/tests2/169_superc_method.c b/tests/tests2/169_superc_method.c
+diff --git a/tests/tests2/169_c6_method.c b/tests/tests2/169_c6_method.c
 deleted file mode 100644
 index 17b86dd..0000000
---- a/tests/tests2/169_superc_method.c
+--- a/tests/tests2/169_c6_method.c
 +++ /dev/null
 @@ -1,93 +0,0 @@
--/* superc extension: struct methods, 'ret f(struct T *self, ...)' */
+-/* c6 extension: struct methods, 'ret f(struct T *self, ...)' */
 -#include <stdio.h>
 -
 -void __tcc_err_clear(void);
@@ -1599,10 +1599,10 @@ index 17b86dd..0000000
 -    __tcc_err_clear();
 -    return 0;
 -}
-diff --git a/tests/tests2/169_superc_method.expect b/tests/tests2/169_superc_method.expect
+diff --git a/tests/tests2/169_c6_method.expect b/tests/tests2/169_c6_method.expect
 deleted file mode 100644
 index 3a22f1b..0000000
---- a/tests/tests2/169_superc_method.expect
+--- a/tests/tests2/169_c6_method.expect
 +++ /dev/null
 @@ -1,10 +0,0 @@
 -sum=7 twice=14
@@ -1615,13 +1615,13 @@ index 3a22f1b..0000000
 -probe=30
 -caught=1:negative x
 -probe=-1
-diff --git a/tests/tests2/170_superc_method_errors.c b/tests/tests2/170_superc_method_errors.c
+diff --git a/tests/tests2/170_c6_method_errors.c b/tests/tests2/170_c6_method_errors.c
 deleted file mode 100644
 index 51b8dec..0000000
---- a/tests/tests2/170_superc_method_errors.c
+--- a/tests/tests2/170_c6_method_errors.c
 +++ /dev/null
 @@ -1,45 +0,0 @@
--/* superc extension: diagnostics for struct methods */
+-/* c6 extension: diagnostics for struct methods */
 -struct Vec { int x, y; };
 -
 -int vec_sum(struct Vec *v) { return v->x + v->y; }
@@ -1666,43 +1666,43 @@ index 51b8dec..0000000
 -    return p->vec_sum() == 3 ? 0 : 1;
 -}
 -#endif
-diff --git a/tests/tests2/170_superc_method_errors.expect b/tests/tests2/170_superc_method_errors.expect
+diff --git a/tests/tests2/170_c6_method_errors.expect b/tests/tests2/170_c6_method_errors.expect
 deleted file mode 100644
 index 12761a2..0000000
---- a/tests/tests2/170_superc_method_errors.expect
+--- a/tests/tests2/170_c6_method_errors.expect
 +++ /dev/null
 @@ -1,13 +0,0 @@
 -[test_method_without_call]
--170_superc_method_errors.c:11: error: method 'vec_sum' must be called
+-170_c6_method_errors.c:11: error: method 'vec_sum' must be called
 -
 -[test_duplicate_method]
--170_superc_method_errors.c:15: error: duplicate method 'area' for 'Vec'
+-170_c6_method_errors.c:15: error: duplicate method 'area' for 'Vec'
 -
 -[test_field_takes_precedence]
 -
 -[test_value_receiver_needs_arrow]
--170_superc_method_errors.c:29: error: field not found: vec_sum
+-170_c6_method_errors.c:29: error: field not found: vec_sum
 -
 -[test_unknown_member]
--170_superc_method_errors.c:36: error: field not found: nope
-diff --git a/tests/tests2/171+_superc_method_tu.c b/tests/tests2/171+_superc_method_tu.c
+-170_c6_method_errors.c:36: error: field not found: nope
+diff --git a/tests/tests2/171+_c6_method_tu.c b/tests/tests2/171+_c6_method_tu.c
 deleted file mode 100644
 index 86ca433..0000000
---- a/tests/tests2/171+_superc_method_tu.c
+--- a/tests/tests2/171+_c6_method_tu.c
 +++ /dev/null
 @@ -1,5 +0,0 @@
--/* superc extension: definitions for 171_superc_method_tu.c */
+-/* c6 extension: definitions for 171_c6_method_tu.c */
 -struct Vec { int x, y; };
 -
 -int vec_sum(struct Vec *v) { return v->x + v->y; }
 -int vec_scale(struct Vec *v, int k) { return v->vec_sum() * k; }
-diff --git a/tests/tests2/171_superc_method_tu.c b/tests/tests2/171_superc_method_tu.c
+diff --git a/tests/tests2/171_c6_method_tu.c b/tests/tests2/171_c6_method_tu.c
 deleted file mode 100644
 index 94c1f5e..0000000
---- a/tests/tests2/171_superc_method_tu.c
+--- a/tests/tests2/171_c6_method_tu.c
 +++ /dev/null
 @@ -1,20 +0,0 @@
--/* superc extension: a method declared in this unit, defined in another */
+-/* c6 extension: a method declared in this unit, defined in another */
 -#include <stdio.h>
 -
 -struct Vec { int x, y; };
@@ -1722,32 +1722,32 @@ index 94c1f5e..0000000
 -    printf("plain=%d\n", vec_sum(p));
 -    return 0;
 -}
-diff --git a/tests/tests2/171_superc_method_tu.expect b/tests/tests2/171_superc_method_tu.expect
+diff --git a/tests/tests2/171_c6_method_tu.expect b/tests/tests2/171_c6_method_tu.expect
 deleted file mode 100644
 index 28dd046..0000000
---- a/tests/tests2/171_superc_method_tu.expect
+--- a/tests/tests2/171_c6_method_tu.expect
 +++ /dev/null
 @@ -1,2 +0,0 @@
 -sum=7 scaled=70
 -plain=7
-diff --git a/tests/tests2/172+_superc_plain_interop.c b/tests/tests2/172+_superc_plain_interop.c
+diff --git a/tests/tests2/172+_c6_plain_interop.c b/tests/tests2/172+_c6_plain_interop.c
 deleted file mode 100644
 index 33f61d6..0000000
---- a/tests/tests2/172+_superc_plain_interop.c
+--- a/tests/tests2/172+_c6_plain_interop.c
 +++ /dev/null
 @@ -1,5 +0,0 @@
--/* built for plain C (no -std=tcc-ext): the package exports are ordinary
+-/* built for plain C (no -std=c6): the package exports are ordinary
 -   symbols, so declaring the mangled name is enough to call them. */
 -int math__add(int a, int b);
 -
 -int plain_double(int x) { return math__add(x, x); }
-diff --git a/tests/tests2/172_superc_plain_interop.c b/tests/tests2/172_superc_plain_interop.c
+diff --git a/tests/tests2/172_c6_plain_interop.c b/tests/tests2/172_c6_plain_interop.c
 deleted file mode 100644
 index e4ad9f1..0000000
---- a/tests/tests2/172_superc_plain_interop.c
+--- a/tests/tests2/172_c6_plain_interop.c
 +++ /dev/null
 @@ -1,24 +0,0 @@
--/* superc extension: an extension unit calling into a unit built for plain C.
+-/* c6 extension: an extension unit calling into a unit built for plain C.
 -   The package symbols stay ordinary C symbols, so a plain unit can provide
 -   them and can call the exported ones. */
 -#include <stdio.h>
@@ -1758,7 +1758,7 @@ index e4ad9f1..0000000
 -
 -import math;
 -
--/* provided by 172+_superc_plain_interop.c, compiled without -std=tcc-ext */
+-/* provided by 172+_c6_plain_interop.c, compiled without -std=c6 */
 -int plain_double(int x);
 -
 -int main(void)
@@ -1771,21 +1771,21 @@ index e4ad9f1..0000000
 -package math {
 -    int add(int a, int b) { return a + b; }
 -}
-diff --git a/tests/tests2/172_superc_plain_interop.expect b/tests/tests2/172_superc_plain_interop.expect
+diff --git a/tests/tests2/172_c6_plain_interop.expect b/tests/tests2/172_c6_plain_interop.expect
 deleted file mode 100644
 index dd3dff3..0000000
---- a/tests/tests2/172_superc_plain_interop.expect
+--- a/tests/tests2/172_c6_plain_interop.expect
 +++ /dev/null
 @@ -1,2 +0,0 @@
 -add=5
 -plain_double=42
-diff --git a/tests/tests2/173_superc_pkg_multi.c b/tests/tests2/173_superc_pkg_multi.c
+diff --git a/tests/tests2/173_c6_pkg_multi.c b/tests/tests2/173_c6_pkg_multi.c
 deleted file mode 100644
 index 9a3d4e2..0000000
---- a/tests/tests2/173_superc_pkg_multi.c
+--- a/tests/tests2/173_c6_pkg_multi.c
 +++ /dev/null
 @@ -1,45 +0,0 @@
--/* superc extension: multi-level package names are purely lexical.
+-/* c6 extension: multi-level package names are purely lexical.
 -   'acme.util' is just the prefix 'acme__util'; nothing here looks at
 -   directories or file names. */
 -#include <stdio.h>
@@ -1830,10 +1830,10 @@ index 9a3d4e2..0000000
 -    printf("counter=%d\n", acme.util.counter);
 -    return 0;
 -}
-diff --git a/tests/tests2/173_superc_pkg_multi.expect b/tests/tests2/173_superc_pkg_multi.expect
+diff --git a/tests/tests2/173_c6_pkg_multi.expect b/tests/tests2/173_c6_pkg_multi.expect
 deleted file mode 100644
 index ca5cc5b..0000000
---- a/tests/tests2/173_superc_pkg_multi.expect
+--- a/tests/tests2/173_c6_pkg_multi.expect
 +++ /dev/null
 @@ -1,5 +0,0 @@
 -add=5 twice=42
@@ -1841,13 +1841,13 @@ index ca5cc5b..0000000
 -sum=42
 -mangled=3 7
 -counter=7
-diff --git a/tests/tests2/174+_superc_iface_tu.c b/tests/tests2/174+_superc_iface_tu.c
+diff --git a/tests/tests2/174+_c6_iface_tu.c b/tests/tests2/174+_c6_iface_tu.c
 deleted file mode 100644
 index 956190f..0000000
---- a/tests/tests2/174+_superc_iface_tu.c
+--- a/tests/tests2/174+_c6_iface_tu.c
 +++ /dev/null
 @@ -1,19 +0,0 @@
--/* superc extension: definitions for 174_superc_iface_tu.c.
+-/* c6 extension: definitions for 174_c6_iface_tu.c.
 -   This unit converts the very same struct to the very same interface, so
 -   it emits its own copy of the vtable. */
 -interface Shape {
@@ -1866,13 +1866,13 @@ index 956190f..0000000
 -    s = *c;
 -    return s.area();
 -}
-diff --git a/tests/tests2/174_superc_iface_tu.c b/tests/tests2/174_superc_iface_tu.c
+diff --git a/tests/tests2/174_c6_iface_tu.c b/tests/tests2/174_c6_iface_tu.c
 deleted file mode 100644
 index c319ed5..0000000
---- a/tests/tests2/174_superc_iface_tu.c
+--- a/tests/tests2/174_c6_iface_tu.c
 +++ /dev/null
 @@ -1,30 +0,0 @@
--/* superc extension: an interface used from two translation units.
+-/* c6 extension: an interface used from two translation units.
 -   Each unit declares the interface itself and converts the same struct,
 -   so each gets its own (static) vtable object. */
 -#include <stdio.h>
@@ -1883,7 +1883,7 @@ index c319ed5..0000000
 -
 -struct Circle { int r; };
 -
--/* implemented in 174+_superc_iface_tu.c */
+-/* implemented in 174+_c6_iface_tu.c */
 -package shapes {
 -    int area(struct Circle *self);
 -}
@@ -1902,20 +1902,20 @@ index c319ed5..0000000
 -    printf("area=%d again=%d other=%d\n", s.area(), use(c), area_via_vt(&c));
 -    return 0;
 -}
-diff --git a/tests/tests2/174_superc_iface_tu.expect b/tests/tests2/174_superc_iface_tu.expect
+diff --git a/tests/tests2/174_c6_iface_tu.expect b/tests/tests2/174_c6_iface_tu.expect
 deleted file mode 100644
 index 46e25f6..0000000
---- a/tests/tests2/174_superc_iface_tu.expect
+--- a/tests/tests2/174_c6_iface_tu.expect
 +++ /dev/null
 @@ -1 +0,0 @@
 -area=16 again=16 other=16
-diff --git a/tests/tests2/175_superc_slice.c b/tests/tests2/175_superc_slice.c
+diff --git a/tests/tests2/175_c6_slice.c b/tests/tests2/175_c6_slice.c
 deleted file mode 100644
 index 11f8a11..0000000
---- a/tests/tests2/175_superc_slice.c
+--- a/tests/tests2/175_c6_slice.c
 +++ /dev/null
 @@ -1,119 +0,0 @@
--/* superc extension: slices 'T[:]' */
+-/* c6 extension: slices 'T[:]' */
 -#include <stdio.h>
 -
 -struct Pair { int a, b; };
@@ -2034,10 +2034,10 @@ index 11f8a11..0000000
 -    }
 -    return 0;
 -}
-diff --git a/tests/tests2/175_superc_slice.expect b/tests/tests2/175_superc_slice.expect
+diff --git a/tests/tests2/175_c6_slice.expect b/tests/tests2/175_c6_slice.expect
 deleted file mode 100644
 index 514e542..0000000
---- a/tests/tests2/175_superc_slice.expect
+--- a/tests/tests2/175_c6_slice.expect
 +++ /dev/null
 @@ -1,16 +0,0 @@
 -len=5 s0=10 s4=50
@@ -2056,13 +2056,13 @@ index 514e542..0000000
 -sizes=16,4,8
 -bumped=100,51
 -post=22 j=2
-diff --git a/tests/tests2/176_superc_slice_errors.c b/tests/tests2/176_superc_slice_errors.c
+diff --git a/tests/tests2/176_c6_slice_errors.c b/tests/tests2/176_c6_slice_errors.c
 deleted file mode 100644
 index 3a176f3..0000000
---- a/tests/tests2/176_superc_slice_errors.c
+--- a/tests/tests2/176_c6_slice_errors.c
 +++ /dev/null
 @@ -1,82 +0,0 @@
--/* superc extension: diagnostics for slices 'T[:]' */
+-/* c6 extension: diagnostics for slices 'T[:]' */
 -struct S;
 -
 -#if defined test_void_element
@@ -2144,54 +2144,54 @@ index 3a176f3..0000000
 -    return (int)s.len == 2 && s[0] == 2 ? 0 : 1;
 -}
 -#endif
-diff --git a/tests/tests2/176_superc_slice_errors.expect b/tests/tests2/176_superc_slice_errors.expect
+diff --git a/tests/tests2/176_c6_slice_errors.expect b/tests/tests2/176_c6_slice_errors.expect
 deleted file mode 100644
 index 3db4cd7..0000000
---- a/tests/tests2/176_superc_slice_errors.expect
+--- a/tests/tests2/176_c6_slice_errors.expect
 +++ /dev/null
 @@ -1,35 +0,0 @@
 -[test_void_element]
--176_superc_slice_errors.c:5: error: '[:]' cannot have a 'void' element type
+-176_c6_slice_errors.c:5: error: '[:]' cannot have a 'void' element type
 -
 -[test_incomplete_element]
--176_superc_slice_errors.c:8: error: '[:]' requires a complete element type, not 'struct S'
+-176_c6_slice_errors.c:8: error: '[:]' requires a complete element type, not 'struct S'
 -
 -[test_local_element]
--176_superc_slice_errors.c:15: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
+-176_c6_slice_errors.c:15: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
 -
 -[test_error_element]
--176_superc_slice_errors.c:19: error: 'error' can only be a return type, not a slice element
+-176_c6_slice_errors.c:19: error: 'error' can only be a return type, not a slice element
 -
 -[test_element_mismatch]
--176_superc_slice_errors.c:25: error: cannot make a slice of 'char' from an array of 'int'
+-176_c6_slice_errors.c:25: error: cannot make a slice of 'char' from an array of 'int'
 -
 -[test_pointer_source]
--176_superc_slice_errors.c:33: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
+-176_c6_slice_errors.c:33: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
 -
 -[test_vla_source]
--176_superc_slice_errors.c:41: error: cannot slice a variable length array
+-176_c6_slice_errors.c:41: error: cannot slice a variable length array
 -
 -[test_pointer_slice]
--176_superc_slice_errors.c:49: error: cannot slice a pointer; use '(T[:]){p, n}'
+-176_c6_slice_errors.c:49: error: cannot slice a pointer; use '(T[:]){p, n}'
 -
 -[test_capacity]
--176_superc_slice_errors.c:56: error: slice bounds have no capacity
+-176_c6_slice_errors.c:56: error: slice bounds have no capacity
 -
 -[test_file_scope_array]
--176_superc_slice_errors.c:60: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
+-176_c6_slice_errors.c:60: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
 -
 -[test_uninitialized]
--176_superc_slice_errors.c:65: error: variable 's' must be initialized
+-176_c6_slice_errors.c:65: error: variable 's' must be initialized
 -
 -[test_slice_to_int]
--176_superc_slice_errors.c:73: error: cannot convert 'int[:]' to 'int'
-diff --git a/tests/tests2/177+_superc_slice_tu.c b/tests/tests2/177+_superc_slice_tu.c
+-176_c6_slice_errors.c:73: error: cannot convert 'int[:]' to 'int'
+diff --git a/tests/tests2/177+_c6_slice_tu.c b/tests/tests2/177+_c6_slice_tu.c
 deleted file mode 100644
 index ac9e583..0000000
---- a/tests/tests2/177+_superc_slice_tu.c
+--- a/tests/tests2/177+_c6_slice_tu.c
 +++ /dev/null
 @@ -1,18 +0,0 @@
--/* superc extension: definitions for 177_superc_slice_tu.c */
+-/* c6 extension: definitions for 177_c6_slice_tu.c */
 -int sum(int[:] s)
 -{
 -    int i = 0, total = 0;
@@ -2209,18 +2209,18 @@ index ac9e583..0000000
 -{
 -    return s.len > 0 ? s[0] : -1;
 -}
-diff --git a/tests/tests2/177_superc_slice_tu.c b/tests/tests2/177_superc_slice_tu.c
+diff --git a/tests/tests2/177_c6_slice_tu.c b/tests/tests2/177_c6_slice_tu.c
 deleted file mode 100644
 index 72795dc..0000000
---- a/tests/tests2/177_superc_slice_tu.c
+--- a/tests/tests2/177_c6_slice_tu.c
 +++ /dev/null
 @@ -1,23 +0,0 @@
--/* superc extension: a slice API shared by two translation units.
+-/* c6 extension: a slice API shared by two translation units.
 -   Each unit declares 'int[:]' itself; the layout is the same on both
 -   sides, so no extra declaration is needed. */
 -#include <stdio.h>
 -
--/* defined in 177+_superc_slice_tu.c */
+-/* defined in 177+_c6_slice_tu.c */
 -int sum(int[:] s);
 -int[:] tail(int[:] s);
 -int first(int[:] s);
@@ -2238,10 +2238,10 @@ index 72795dc..0000000
 -    printf("sum2=%d\n", sum(a[1:3]));
 -    return 0;
 -}
-diff --git a/tests/tests2/177_superc_slice_tu.expect b/tests/tests2/177_superc_slice_tu.expect
+diff --git a/tests/tests2/177_c6_slice_tu.expect b/tests/tests2/177_c6_slice_tu.expect
 deleted file mode 100644
 index 11f85ee..0000000
---- a/tests/tests2/177_superc_slice_tu.expect
+--- a/tests/tests2/177_c6_slice_tu.expect
 +++ /dev/null
 @@ -1,3 +0,0 @@
 -sum=15 first=1
@@ -2255,41 +2255,41 @@ index 931a1b6..83933e6 100644
   SKIP += 145_winarm64_interlocked.test
  endif
  
--# superc language extension tests: they need a TCC_EXT build and are
--# always run with '-std=tcc-ext' (gcc cannot compile them, so the
+-# c6 language extension tests: they need a C6_EXT build and are
+-# always run with '-std=c6' (gcc cannot compile them, so the
 -# .expect files are committed)
--SUPERC_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_superc_*.c))))
+-C6_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_c6_*.c))))
 -# the compiler itself decides whether the extensions are compiled in
--SUPERC_OK := $(shell echo | $(TCC_LOCAL) -std=tcc-ext -dD -E - 2>/dev/null | grep -q __TCC_EXT__ && echo yes)
--ifneq (,$(SUPERC_OK))
-- $(SUPERC_TESTS): FLAGS += -std=tcc-ext
+-C6_OK := $(shell echo | $(TCC_LOCAL) -std=c6 -dD -E - 2>/dev/null | grep -q __C6__ && echo yes)
+-ifneq (,$(C6_OK))
+- $(C6_TESTS): FLAGS += -std=c6
 - # gcc cannot build them, so their .expect files come from tcc itself
-- $(SUPERC_TESTS): GEN = $(GEN-TCC)
-- 158_superc_test.test: FLAGS += -test
-- 162_superc_iface_errors.test: FLAGS += -dt
-- 164_superc_try_errors.test: FLAGS += -dt
-- 165_superc_init.test: FLAGS += -dt
-- 167_superc_pkg_dot_errors.test: FLAGS += -dt
-- 170_superc_method_errors.test: FLAGS += -dt
-- 176_superc_slice_errors.test: FLAGS += -dt
+- $(C6_TESTS): GEN = $(GEN-TCC)
+- 158_c6_test.test: FLAGS += -test
+- 162_c6_iface_errors.test: FLAGS += -dt
+- 164_c6_try_errors.test: FLAGS += -dt
+- 165_c6_init.test: FLAGS += -dt
+- 167_c6_pkg_dot_errors.test: FLAGS += -dt
+- 170_c6_method_errors.test: FLAGS += -dt
+- 176_c6_slice_errors.test: FLAGS += -dt
 - # these compile a second file before '-run'
-- 168_superc_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
-- 168_superc_pkg_dot_tu.test: GEN = $(GEN-TCC)
-- 171_superc_method_tu.test: FLAGS += $(subst 171,171+,$1)
-- 171_superc_method_tu.test: GEN = $(GEN-TCC)
-- 174_superc_iface_tu.test: FLAGS += $(subst 174,174+,$1)
-- 174_superc_iface_tu.test: GEN = $(GEN-TCC)
-- 177_superc_slice_tu.test: FLAGS += $(subst 177,177+,$1)
-- 177_superc_slice_tu.test: GEN = $(GEN-TCC)
+- 168_c6_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
+- 168_c6_pkg_dot_tu.test: GEN = $(GEN-TCC)
+- 171_c6_method_tu.test: FLAGS += $(subst 171,171+,$1)
+- 171_c6_method_tu.test: GEN = $(GEN-TCC)
+- 174_c6_iface_tu.test: FLAGS += $(subst 174,174+,$1)
+- 174_c6_iface_tu.test: GEN = $(GEN-TCC)
+- 177_c6_slice_tu.test: FLAGS += $(subst 177,177+,$1)
+- 177_c6_slice_tu.test: GEN = $(GEN-TCC)
 - # 172 mixes an extension unit with a unit built for plain C
-- 172_superc_plain_interop.test: NORUN = true
-- 172_superc_plain_interop.test: GEN = $(GEN-TCC)
-- 172_superc_plain_interop.test: T1 = \
--     $(TCC) -std=tcc-ext -c $(SRC)/172_superc_plain_interop.c -o $*-ext.o && \
--     $(TCC) -c $(SRC)/172+_superc_plain_interop.c -o $*-plain.o && \
+- 172_c6_plain_interop.test: NORUN = true
+- 172_c6_plain_interop.test: GEN = $(GEN-TCC)
+- 172_c6_plain_interop.test: T1 = \
+-     $(TCC) -std=c6 -c $(SRC)/172_c6_plain_interop.c -o $*-ext.o && \
+-     $(TCC) -c $(SRC)/172+_c6_plain_interop.c -o $*-plain.o && \
 -     $(TCC) $*-ext.o $*-plain.o -o $*.exe && ./$*.exe
 -else
-- SKIP += $(SUPERC_TESTS)
+- SKIP += $(C6_TESTS)
 -endif
 -
  # Some tests might need arguments

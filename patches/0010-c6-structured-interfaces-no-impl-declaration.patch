@@ -1,7 +1,7 @@
 From e460850db297df44dccb57fb4e5d8e122275bd59 Mon Sep 17 00:00:00 2001
-From: superc <superc@localhost>
+From: c6 <c6@localhost>
 Date: Fri, 6 Nov 2026 20:42:51 +0800
-Subject: [PATCH 10/10] superc: structured interfaces, no 'impl' declaration
+Subject: [PATCH 10/10] c6: structured interfaces, no 'impl' declaration
 
 A struct implements an interface when it has the methods the interface
 declares.  The 'impl IFACE for TYPE { ... }' block is gone: methods are
@@ -34,54 +34,54 @@ entries are deliberately kept, since '-test' collects them across units.
 
 Tests: 160 rewritten without 'impl' (plus a conversion inside a static
 inline body), 162 checks the new diagnostics, 174 converts the same type
-in two units.  tests2 153/153 with TCC_EXT, 134/134 without.
+in two units.  tests2 153/153 with C6_EXT, 134/134 without.
 ---
  tcc.h                                       |   9 -
  tccgen.c                                    | 474 ++++++++++----------
  tcctok.h                                    |   1 -
- tests/tests2/160_superc_interface.c         |  33 +-
- tests/tests2/160_superc_interface.expect    |   1 +
- tests/tests2/162_superc_iface_errors.c      |  60 ++-
- tests/tests2/162_superc_iface_errors.expect |  14 +-
- tests/tests2/171+_superc_method_tu.c        |   5 +
- tests/tests2/171_superc_method_tu.c         |  20 +
- tests/tests2/171_superc_method_tu.expect    |   2 +
- tests/tests2/174+_superc_iface_tu.c         |  19 +
- tests/tests2/174_superc_iface_tu.c          |  30 ++
- tests/tests2/174_superc_iface_tu.expect     |   1 +
+ tests/tests2/160_c6_interface.c         |  33 +-
+ tests/tests2/160_c6_interface.expect    |   1 +
+ tests/tests2/162_c6_iface_errors.c      |  60 ++-
+ tests/tests2/162_c6_iface_errors.expect |  14 +-
+ tests/tests2/171+_c6_method_tu.c        |   5 +
+ tests/tests2/171_c6_method_tu.c         |  20 +
+ tests/tests2/171_c6_method_tu.expect    |   2 +
+ tests/tests2/174+_c6_iface_tu.c         |  19 +
+ tests/tests2/174_c6_iface_tu.c          |  30 ++
+ tests/tests2/174_c6_iface_tu.expect     |   1 +
  tests/tests2/Makefile                       |   2 +
  14 files changed, 379 insertions(+), 292 deletions(-)
- create mode 100644 tests/tests2/171+_superc_method_tu.c
- create mode 100644 tests/tests2/171_superc_method_tu.c
- create mode 100644 tests/tests2/171_superc_method_tu.expect
- create mode 100644 tests/tests2/174+_superc_iface_tu.c
- create mode 100644 tests/tests2/174_superc_iface_tu.c
- create mode 100644 tests/tests2/174_superc_iface_tu.expect
+ create mode 100644 tests/tests2/171+_c6_method_tu.c
+ create mode 100644 tests/tests2/171_c6_method_tu.c
+ create mode 100644 tests/tests2/171_c6_method_tu.expect
+ create mode 100644 tests/tests2/174+_c6_iface_tu.c
+ create mode 100644 tests/tests2/174_c6_iface_tu.c
+ create mode 100644 tests/tests2/174_c6_iface_tu.expect
 
 diff --git a/tcc.h b/tcc.h
 index 394971f..1ede664 100644
 --- a/tcc.h
 +++ b/tcc.h
-@@ -753,13 +753,6 @@ typedef struct SupercIface {
+@@ -753,13 +753,6 @@ typedef struct C6Iface {
      int *methods;    /* method name tokens, in declaration order */
- } SupercIface;
+ } C6Iface;
  
 -/* one 'impl IFACE for TYPE { ... }' block */
--typedef struct SupercImpl {
--    SupercIface *iface;
+-typedef struct C6Impl {
+-    C6Iface *iface;
 -    int type_tag;    /* struct tag of the implemented type */
 -    int vt_tok;      /* token of the emitted vtable object */
 -    int is_decl;     /* only declared here, defined in another TU */
--} SupercImpl;
+-} C6Impl;
  #endif
  
  struct TCCState {
 @@ -835,8 +828,6 @@ struct TCCState {
      /* 'interface' / 'impl' declarations */
-     struct SupercIface **superc_ifaces;
-     int superc_nb_ifaces;
--    struct SupercImpl **superc_impls;
--    int superc_nb_impls;
+     struct C6Iface **c6_ifaces;
+     int c6_nb_ifaces;
+-    struct C6Impl **c6_impls;
+-    int c6_nb_impls;
  #endif
  
      unsigned char dflag; /* -dX value */
@@ -89,38 +89,38 @@ diff --git a/tccgen.c b/tccgen.c
 index 75093dd..05bc38d 100644
 --- a/tccgen.c
 +++ b/tccgen.c
-@@ -167,6 +167,16 @@ typedef struct SupercMethod {
- } SupercMethod;
- static SupercMethod *superc_methods;
- static int superc_nb_methods;
+@@ -167,6 +167,16 @@ typedef struct C6Method {
+ } C6Method;
+ static C6Method *c6_methods;
+ static int c6_nb_methods;
 +/* an interface converted from a struct type: one vtable object per pair */
-+typedef struct SupercAutoImpl {
-+    struct SupercIface *iface;
++typedef struct C6AutoImpl {
++    struct C6Iface *iface;
 +    int type_tag;
 +    int vt_tok;      /* token of the emitted vtable object */
 +    Sym *vt_sym;     /* its forward symbol */
 +    int vt_emitted;  /* the object definition has been generated */
-+} SupercAutoImpl;
-+static SupercAutoImpl **superc_auto_impls;
-+static int superc_nb_auto_impls;
++} C6AutoImpl;
++static C6AutoImpl **c6_auto_impls;
++static int c6_nb_auto_impls;
  /* non-zero while vtop holds the result of a call to a 'T!error' function */
- static int superc_value_fallible;
+ static int c6_value_fallible;
  /* symbol of the function being compiled (needed by 'try' to check that the
-@@ -196,7 +206,8 @@ static void superc_test_parse(void);
- static void superc_package_parse(void);
- static void superc_import_parse(void);
- static void superc_interface_parse(void);
--static void superc_impl_parse(void);
-+static int superc_emit_auto_impls(void);
-+static void superc_tu_reset(void);
- static int superc_iface_convert(CType *dt);
- typedef struct SupercIface SupercIface_t;
- static SupercIface *superc_iface_of_type(CType *type);
+@@ -196,7 +206,8 @@ static void c6_test_parse(void);
+ static void c6_package_parse(void);
+ static void c6_import_parse(void);
+ static void c6_interface_parse(void);
+-static void c6_impl_parse(void);
++static int c6_emit_auto_impls(void);
++static void c6_tu_reset(void);
+ static int c6_iface_convert(CType *dt);
+ typedef struct C6Iface C6Iface_t;
+ static C6Iface *c6_iface_of_type(CType *type);
 @@ -525,6 +536,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
-     superc_value_fallible = 0;
-     superc_last_stmt_leaves = 0;
-     superc_decl_fallible = 0;
-+    superc_tu_reset();
+     c6_value_fallible = 0;
+     c6_last_stmt_leaves = 0;
+     c6_decl_fallible = 0;
++    c6_tu_reset();
  #endif
      debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
      global_expr = 0;
@@ -128,13 +128,13 @@ index 75093dd..05bc38d 100644
      parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
      next();
      decl(VT_CONST);
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    /* interfaces converted in this unit get their vtable object here, but a
 +       'static inline' body is only compiled now, and such a body may contain
 +       a conversion itself: alternate until nothing new turns up */
 +    for (;;) {
 +        gen_inline_functions(s1);
-+        if (!superc_emit_auto_impls())
++        if (!c6_emit_auto_impls())
 +            break;
 +    }
 +#else
@@ -143,15 +143,15 @@ index 75093dd..05bc38d 100644
      check_vstack();
      /* end of translation unit info */
  #if TCC_EH_FRAME
-@@ -7781,31 +7804,6 @@ static int superc_iface_has_method(SupercIface *ifc, int m)
+@@ -7781,31 +7804,6 @@ static int c6_iface_has_method(C6Iface *ifc, int m)
      return 0;
  }
  
--static SupercImpl *superc_impl_find(SupercIface *ifc, int type_tag)
+-static C6Impl *c6_impl_find(C6Iface *ifc, int type_tag)
 -{
 -    int i;
--    for (i = 0; i < tcc_state->superc_nb_impls; i++) {
--        SupercImpl *imp = tcc_state->superc_impls[i];
+-    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
+-        C6Impl *imp = tcc_state->c6_impls[i];
 -        if (imp->iface == ifc && imp->type_tag == type_tag)
 -            return imp;
 -    }
@@ -159,7 +159,7 @@ index 75093dd..05bc38d 100644
 -}
 -
 -/* resolve TYPE (a typedef name or a 'struct' tag) to its struct tag token */
--static int superc_struct_tag(int type_tok)
+-static int c6_struct_tag(int type_tok)
 -{
 -    Sym *st = struct_find(type_tok);
 -    if (!st) {
@@ -175,13 +175,13 @@ index 75093dd..05bc38d 100644
  /* Parse TS (a synthetic token string ending in TOK_EOF) as file scope
     declarations.  The current token is left untouched and warnings are
     suppressed, since the generated declarations are compiler-internal. */
-@@ -7936,200 +7934,6 @@ static void superc_interface_parse(void)
+@@ -7936,200 +7934,6 @@ static void c6_interface_parse(void)
      tok_str_free(body);
  }
  
 -/* Verify that 'impl IFACE for TYPE' defines every method with a
 -   compatible signature.  'pkg' is the pseudo package holding them. */
--static void superc_check_impl(SupercIface *ifc, const char *pkg)
+-static void c6_check_impl(C6Iface *ifc, const char *pkg)
 -{
 -    Sym *vt = struct_find(ifc->vt_tag);
 -    CType vtt;
@@ -205,7 +205,7 @@ index 75093dd..05bc38d 100644
 -        fptr = pointed_type(&f->type);      /* RET (*)(void *, ...) */
 -        if ((fptr->t & VT_BTYPE) != VT_FUNC || !fptr->ref)
 -            continue;
--        g = sym_find(superc_mangle_tok(pkg, m));
+-        g = sym_find(c6_mangle_tok(pkg, m));
 -        if (!g)
 -            tcc_error("impl of '%s' does not define method '%s'",
 -                      ifc->name, mname);
@@ -238,10 +238,10 @@ index 75093dd..05bc38d 100644
 -    }
 -}
 -
--static void superc_impl_parse(void)
+-static void c6_impl_parse(void)
 -{
--    SupercIface *ifc;
--    SupercImpl *imp;
+-    C6Iface *ifc;
+-    C6Impl *imp;
 -    TokenString *ts;
 -    char *saved_pkg, *pkgname;
 -    char buf[256];
@@ -262,23 +262,23 @@ index 75093dd..05bc38d 100644
 -    type_tok = tok;
 -    next();
 -
--    ifc = superc_iface_find(iface_tok);
+-    ifc = c6_iface_find(iface_tok);
 -    if (!ifc)
 -        tcc_error("unknown interface '%s'", get_tok_str(iface_tok, NULL));
--    type_tag = superc_struct_tag(type_tok);
+-    type_tag = c6_struct_tag(type_tok);
 -    if (!type_tag)
 -        tcc_error("'%s' is not a struct or union type",
 -                  get_tok_str(type_tok, NULL));
 -    /* a declaration-only impl may be followed by the real definition */
--    for (i = 0; i < tcc_state->superc_nb_impls; i++) {
--        SupercImpl *o = tcc_state->superc_impls[i];
+-    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
+-        C6Impl *o = tcc_state->c6_impls[i];
 -        if (o->iface == ifc && o->type_tag == type_tag) {
 -            if (!o->is_decl)
 -                tcc_error("duplicate impl of '%s' for '%s'", ifc->name,
 -                          get_tok_str(type_tok, NULL));
--            memmove(&tcc_state->superc_impls[i], &tcc_state->superc_impls[i + 1],
--                    (tcc_state->superc_nb_impls - i - 1) * sizeof(SupercImpl *));
--            tcc_state->superc_nb_impls--;
+-            memmove(&tcc_state->c6_impls[i], &tcc_state->c6_impls[i + 1],
+-                    (tcc_state->c6_nb_impls - i - 1) * sizeof(C6Impl *));
+-            tcc_state->c6_nb_impls--;
 -            tcc_free(o);
 -            break;
 -        }
@@ -293,7 +293,7 @@ index 75093dd..05bc38d 100644
 -    tok_str_add(ts, type_tok);
 -    tok_str_add(ts, ';');
 -    tok_str_add(ts, TOK_EOF);
--    superc_decl_tokens(ts);
+-    c6_decl_tokens(ts);
 -
 -    if (tok == ';') {
 -        /* 'impl IFACE for TYPE;' only declares that the impl exists (it is
@@ -314,9 +314,9 @@ index 75093dd..05bc38d 100644
 -        tok_str_add(ts, imp->vt_tok);
 -        tok_str_add(ts, ';');
 -        tok_str_add(ts, TOK_EOF);
--        superc_decl_tokens(ts);
--        dynarray_add(&tcc_state->superc_impls,
--                     &tcc_state->superc_nb_impls, imp);
+-        c6_decl_tokens(ts);
+-        dynarray_add(&tcc_state->c6_impls,
+-                     &tcc_state->c6_nb_impls, imp);
 -        return;
 -    }
 -
@@ -325,14 +325,14 @@ index 75093dd..05bc38d 100644
 -    snprintf(buf, sizeof buf, "__tcc_impl_%s_%s",
 -             get_tok_str(type_tag, NULL), ifc->name);
 -    pkgname = tcc_strdup(buf);
--    saved_pkg = tcc_state->superc_package;
--    tcc_state->superc_package = pkgname;
+-    saved_pkg = tcc_state->c6_package;
+-    tcc_state->c6_package = pkgname;
 -    skip('{');
 -    while (tok != '}' && tok != TOK_EOF)
 -        decl(VT_CONST);
 -    skip('}');
--    tcc_state->superc_package = saved_pkg;
--    superc_check_impl(ifc, pkgname);
+-    tcc_state->c6_package = saved_pkg;
+-    c6_check_impl(ifc, pkgname);
 -
 -    /* Emit the vtable object:
 -       'const struct NAME_vt __tcc_vt_TYPE_NAME = { (void(*)(void))m, ... };' */
@@ -362,22 +362,22 @@ index 75093dd..05bc38d 100644
 -        tok_str_add(ts, TOK_VOID);
 -        tok_str_add(ts, ')');
 -        tok_str_add(ts, ')');
--        tok_str_add(ts, superc_mangle_tok(pkgname, ifc->methods[i]));
+-        tok_str_add(ts, c6_mangle_tok(pkgname, ifc->methods[i]));
 -    }
 -    tok_str_add(ts, '}');
 -    tok_str_add(ts, ';');
 -    tok_str_add(ts, TOK_EOF);
--    superc_decl_tokens(ts);
+-    c6_decl_tokens(ts);
 -
--    dynarray_add(&tcc_state->superc_impls,
--                 &tcc_state->superc_nb_impls, imp);
+-    dynarray_add(&tcc_state->c6_impls,
+-                 &tcc_state->c6_nb_impls, imp);
 -}
 -
  /* rewrite 'iface.meth (args...)' into a vtable call passing the hidden
     'self' pointer as the first argument; leaves the function pointer on
-    the stack and arms 'superc_self_pending' for the call code */
-@@ -8184,30 +7988,239 @@ static void superc_iface_call_prep(SupercIface *ifc, int mname)
-     superc_self_pending = 1;
+    the stack and arms 'c6_self_pending' for the call code */
+@@ -8184,30 +7988,239 @@ static void c6_iface_call_prep(C6Iface *ifc, int mname)
+     c6_self_pending = 1;
  }
  
 +/* ------------------------------------------------------------------ */
@@ -386,29 +386,29 @@ index 75093dd..05bc38d 100644
 +/* more: the conformance check happens at the first conversion, and the  */
 +/* vtable is an ordinary static object emitted at the end of the unit.  */
 +
-+static SupercAutoImpl *superc_auto_impl_find(SupercIface *ifc, int tag)
++static C6AutoImpl *c6_auto_impl_find(C6Iface *ifc, int tag)
 +{
 +    int i;
 +
-+    for (i = 0; i < superc_nb_auto_impls; i++)
-+        if (superc_auto_impls[i]->iface == ifc
-+            && superc_auto_impls[i]->type_tag == tag)
-+            return superc_auto_impls[i];
++    for (i = 0; i < c6_nb_auto_impls; i++)
++        if (c6_auto_impls[i]->iface == ifc
++            && c6_auto_impls[i]->type_tag == tag)
++            return c6_auto_impls[i];
 +    return NULL;
 +}
 +
-+static SupercMethod *superc_method_of(int tag, int name)
++static C6Method *c6_method_of(int tag, int name)
 +{
-+    SupercMethod *m;
++    C6Method *m;
 +
-+    for (m = superc_methods; m; m = m->next)
++    for (m = c6_methods; m; m = m->next)
 +        if (m->type_tag == tag && m->name == name)
 +            return m;
 +    return NULL;
 +}
 +
 +/* compare one vtable field 'RET (*)(void *, ...)' with the method type */
-+static void superc_check_method(SupercIface *ifc, int m, Sym *meth)
++static void c6_check_method(C6Iface *ifc, int m, Sym *meth)
 +{
 +    Sym *vt = struct_find(ifc->vt_tag);
 +    CType vtt;
@@ -454,27 +454,27 @@ index 75093dd..05bc38d 100644
 +}
 +
 +/* register (once) that TYPE implements IFACE and create its vtable symbol */
-+static SupercAutoImpl *superc_auto_impl_ensure(SupercIface *ifc, int tag)
++static C6AutoImpl *c6_auto_impl_ensure(C6Iface *ifc, int tag)
 +{
-+    SupercAutoImpl *a;
-+    SupercMethod *meth;
++    C6AutoImpl *a;
++    C6Method *meth;
 +    CType vtt;
 +    AttributeDef ad;
 +    Sym *vt;
 +    char buf[256];
 +    int i;
 +
-+    a = superc_auto_impl_find(ifc, tag);
++    a = c6_auto_impl_find(ifc, tag);
 +    if (a)
 +        return a;
 +    for (i = 0; i < ifc->nb_methods; i++) {
 +        int m = ifc->methods[i];
-+        meth = superc_method_of(tag, m);
++        meth = c6_method_of(tag, m);
 +        if (!meth)
 +            tcc_error("'%s' does not implement interface '%s': "
-+                      "missing method '%s'", superc_tag_name(tag), ifc->name,
++                      "missing method '%s'", c6_tag_name(tag), ifc->name,
 +                      get_tok_str(m, NULL));
-+        superc_check_method(ifc, m, sym_find_raw(meth->sym_tok));
++        c6_check_method(ifc, m, sym_find_raw(meth->sym_tok));
 +    }
 +    vt = struct_find(ifc->vt_tag);
 +    if (!vt)
@@ -490,33 +490,33 @@ index 75093dd..05bc38d 100644
 +    a->type_tag = tag;
 +    a->vt_tok = tok_alloc_const(buf);
 +    /* a forward reference (extern, so it is no definition yet), defined by
-+       superc_emit_auto_impls() at the end of the unit */
++       c6_emit_auto_impls() at the end of the unit */
 +    vtt.t = VT_STRUCT | VT_STATIC | VT_CONSTANT | VT_EXTERN;
 +    vtt.ref = vt;
 +    memset(&ad, 0, sizeof ad);
 +    a->vt_sym = external_sym(a->vt_tok, &vtt, 0, &ad);
-+    dynarray_add(&superc_auto_impls, &superc_nb_auto_impls, a);
++    dynarray_add(&c6_auto_impls, &c6_nb_auto_impls, a);
 +    return a;
 +}
 +
 +/* emit 'static const struct IFACE_vt __tcc_vt_TYPE_IFACE = { m... };' for
 +   every conversion that was used in this unit; returns how many were emitted */
-+static int superc_emit_auto_impls(void)
++static int c6_emit_auto_impls(void)
 +{
-+    SupercAutoImpl *a;
-+    SupercIface *ifc;
++    C6AutoImpl *a;
++    C6Iface *ifc;
 +    TokenString *ts;
 +    char *saved_pkg;
 +    int i, j, n = 0;
 +
-+    if (!superc_nb_auto_impls)
++    if (!c6_nb_auto_impls)
 +        return 0;
 +    /* the object name is fixed: a file level 'package NAME;' must not
 +       mangle it a second time */
-+    saved_pkg = tcc_state->superc_package;
-+    tcc_state->superc_package = NULL;
-+    for (i = 0; i < superc_nb_auto_impls; i++) {
-+        a = superc_auto_impls[i];
++    saved_pkg = tcc_state->c6_package;
++    tcc_state->c6_package = NULL;
++    for (i = 0; i < c6_nb_auto_impls; i++) {
++        a = c6_auto_impls[i];
 +        if (a->vt_emitted)
 +            continue;
 +        a->vt_emitted = 1;
@@ -542,15 +542,15 @@ index 75093dd..05bc38d 100644
 +            tok_str_add(ts, TOK_VOID);
 +            tok_str_add(ts, ')');
 +            tok_str_add(ts, ')');
-+            tok_str_add(ts, superc_method_of(a->type_tag,
++            tok_str_add(ts, c6_method_of(a->type_tag,
 +                                             ifc->methods[j])->sym_tok);
 +        }
 +        tok_str_add(ts, '}');
 +        tok_str_add(ts, ';');
 +        tok_str_add(ts, TOK_EOF);
-+        superc_decl_tokens(ts);
++        c6_decl_tokens(ts);
 +    }
-+    tcc_state->superc_package = saved_pkg;
++    tcc_state->c6_package = saved_pkg;
 +    return n;
 +}
 +
@@ -559,56 +559,56 @@ index 75093dd..05bc38d 100644
 +   holds tokens and descriptors that would otherwise dangle or leak into the
 +   next unit's lookup (imports, interfaces, methods, vtables).  The 'test'
 +   entries are deliberately kept: '-test' collects them across units. */
-+static void superc_tu_reset(void)
++static void c6_tu_reset(void)
 +{
-+    SupercMethod *m, *next;
++    C6Method *m, *next;
 +    int i;
 +
-+    dynarray_reset(&superc_auto_impls, &superc_nb_auto_impls);
-+    for (m = superc_methods; m; m = next) {
++    dynarray_reset(&c6_auto_impls, &c6_nb_auto_impls);
++    for (m = c6_methods; m; m = next) {
 +        next = m->next;
 +        tcc_free(m);
 +    }
-+    superc_methods = NULL;
-+    superc_nb_methods = 0;
-+    for (i = 0; i < tcc_state->superc_nb_ifaces; i++) {
-+        SupercIface *ifc = tcc_state->superc_ifaces[i];
++    c6_methods = NULL;
++    c6_nb_methods = 0;
++    for (i = 0; i < tcc_state->c6_nb_ifaces; i++) {
++        C6Iface *ifc = tcc_state->c6_ifaces[i];
 +        if (!ifc)
 +            continue;
 +        tcc_free(ifc->name);
 +        tcc_free(ifc->methods);
 +        /* the descriptor itself goes with the array */
 +    }
-+    dynarray_reset(&tcc_state->superc_ifaces, &tcc_state->superc_nb_ifaces);
-+    dynarray_reset(&tcc_state->superc_imports, &tcc_state->superc_nb_imports);
-+    tcc_free(tcc_state->superc_package);
-+    tcc_state->superc_package = NULL;
-+    superc_self_pending = 0;
++    dynarray_reset(&tcc_state->c6_ifaces, &tcc_state->c6_nb_ifaces);
++    dynarray_reset(&tcc_state->c6_imports, &tcc_state->c6_nb_imports);
++    tcc_free(tcc_state->c6_package);
++    tcc_state->c6_package = NULL;
++    c6_self_pending = 0;
 +}
 +
  /* Implicit conversion of a struct value to an interface value, e.g.
     'render(circle)' or 'Drawable d = circle;'.  Returns 0 when no
     conversion applies. */
- static int superc_iface_convert(CType *dt)
+ static int c6_iface_convert(CType *dt)
  {
-     SupercIface *ifc;
--    SupercImpl *imp;
-+    SupercAutoImpl *a;
+     C6Iface *ifc;
+-    C6Impl *imp;
++    C6AutoImpl *a;
      Sym *vs;
      int size, align, loc2;
  
--    if (!tcc_state->superc_ext || tcc_state->superc_nb_impls == 0)
-+    if (!tcc_state->superc_ext || !tcc_state->superc_nb_ifaces)
+-    if (!tcc_state->c6_ext || tcc_state->c6_nb_impls == 0)
++    if (!tcc_state->c6_ext || !tcc_state->c6_nb_ifaces)
          return 0;
      if ((vtop->type.t & VT_BTYPE) != VT_STRUCT || !vtop->type.ref)
          return 0;
-     ifc = superc_iface_of_type(dt);
+     ifc = c6_iface_of_type(dt);
      if (!ifc)
          return 0;
--    imp = superc_impl_find(ifc, vtop->type.ref->v & ~SYM_STRUCT);
+-    imp = c6_impl_find(ifc, vtop->type.ref->v & ~SYM_STRUCT);
 -    if (!imp)
 +    /* an interface value stays an interface value: plain copy */
-+    if (superc_iface_of_type(&vtop->type))
++    if (c6_iface_of_type(&vtop->type))
          return 0;
 -    vs = sym_find(imp->vt_tok);
 -    if (!vs)
@@ -617,27 +617,27 @@ index 75093dd..05bc38d 100644
 +    /* a file scope initializer has no runtime code to build the value */
 +    if (nocode_wanted)
 +        return 0;
-+    a = superc_auto_impl_ensure(ifc, vtop->type.ref->v & ~SYM_STRUCT);
++    a = c6_auto_impl_ensure(ifc, vtop->type.ref->v & ~SYM_STRUCT);
 +    if (!a)
 +        return 0;
 +    vs = a->vt_sym;
  
      size = type_size(dt, &align);
      loc2 = (loc - size) & -align;
-@@ -8231,6 +8244,7 @@ static int superc_iface_convert(CType *dt)
+@@ -8231,6 +8244,7 @@ static int c6_iface_convert(CType *dt)
      return 1;
  }
  
 +
- static int superc_ext_on(void)
+ static int c6_ext_on(void)
  {
-     return tcc_state->superc_ext;
+     return tcc_state->c6_ext;
 @@ -10684,10 +10698,6 @@ static int decl(int l)
-                 superc_interface_parse();
+                 c6_interface_parse();
                  continue;
              }
--            if (tok == TOK_SUPERC_IMPL) {
--                superc_impl_parse();
+-            if (tok == TOK_C6_IMPL) {
+-                c6_impl_parse();
 -                continue;
 -            }
          }
@@ -648,20 +648,20 @@ index a758720..9e4c0cf 100644
 --- a/tcctok.h
 +++ b/tcctok.h
 @@ -446,7 +446,6 @@
-      DEF(TOK_SUPERC_PACKAGE,   "package")
-      DEF(TOK_SUPERC_IMPORT,    "import")
-      DEF(TOK_SUPERC_INTERFACE, "interface")
--     DEF(TOK_SUPERC_IMPL,      "impl")
-      DEF(TOK_SUPERC_DEFER,     "defer")
-      DEF(TOK_SUPERC_ERRDEFER,  "errdefer")
-      DEF(TOK_SUPERC_ERR,       "err")
-diff --git a/tests/tests2/160_superc_interface.c b/tests/tests2/160_superc_interface.c
+      DEF(TOK_C6_PACKAGE,   "package")
+      DEF(TOK_C6_IMPORT,    "import")
+      DEF(TOK_C6_INTERFACE, "interface")
+-     DEF(TOK_C6_IMPL,      "impl")
+      DEF(TOK_C6_DEFER,     "defer")
+      DEF(TOK_C6_ERRDEFER,  "errdefer")
+      DEF(TOK_C6_ERR,       "err")
+diff --git a/tests/tests2/160_c6_interface.c b/tests/tests2/160_c6_interface.c
 index 45bdeea..1bd1432 100644
---- a/tests/tests2/160_superc_interface.c
-+++ b/tests/tests2/160_superc_interface.c
+--- a/tests/tests2/160_c6_interface.c
++++ b/tests/tests2/160_c6_interface.c
 @@ -1,4 +1,6 @@
--/* superc extension: interface / impl (fat pointer + vtable) */
-+/* superc extension: interfaces (fat pointer + vtable).
+-/* c6 extension: interface / impl (fat pointer + vtable) */
++/* c6 extension: interfaces (fat pointer + vtable).
 +   A struct implements an interface by having the methods: there is no
 +   'impl' declaration any more, the vtable is generated on demand. */
  #include <stdio.h>
@@ -733,22 +733,22 @@ index 45bdeea..1bd1432 100644
 +    printf("inline=%d\n", inline_area(c));
      return 0;
  }
-diff --git a/tests/tests2/160_superc_interface.expect b/tests/tests2/160_superc_interface.expect
+diff --git a/tests/tests2/160_c6_interface.expect b/tests/tests2/160_c6_interface.expect
 index 80f15a4..6cb51d3 100644
---- a/tests/tests2/160_superc_interface.expect
-+++ b/tests/tests2/160_superc_interface.expect
+--- a/tests/tests2/160_c6_interface.expect
++++ b/tests/tests2/160_c6_interface.expect
 @@ -4,3 +4,4 @@ Circle(5) Rect(4x6)
  [circle][circle]
  [circle]
  sizeof=16
 +inline=75
-diff --git a/tests/tests2/162_superc_iface_errors.c b/tests/tests2/162_superc_iface_errors.c
+diff --git a/tests/tests2/162_c6_iface_errors.c b/tests/tests2/162_c6_iface_errors.c
 index 1bcaae0..058c918 100644
---- a/tests/tests2/162_superc_iface_errors.c
-+++ b/tests/tests2/162_superc_iface_errors.c
+--- a/tests/tests2/162_c6_iface_errors.c
++++ b/tests/tests2/162_c6_iface_errors.c
 @@ -1,44 +1,40 @@
--/* superc extension: diagnostics for malformed 'impl' blocks */
-+/* superc extension: diagnostics for structured interfaces.
+-/* c6 extension: diagnostics for malformed 'impl' blocks */
++/* c6 extension: diagnostics for structured interfaces.
 +   A struct implements an interface by having the methods; the check
 +   happens at the first conversion, so every branch below converts. */
 +struct Circle { int r; };
@@ -819,53 +819,53 @@ index 1bcaae0..058c918 100644
 +int area(struct Circle *self) { return self->r; }
 +int main(void) { struct Circle c = {1}; Shape s = {0}; s = c; return s.area(); }
  #endif
-diff --git a/tests/tests2/162_superc_iface_errors.expect b/tests/tests2/162_superc_iface_errors.expect
+diff --git a/tests/tests2/162_c6_iface_errors.expect b/tests/tests2/162_c6_iface_errors.expect
 index 1dc9596..154970c 100644
---- a/tests/tests2/162_superc_iface_errors.expect
-+++ b/tests/tests2/162_superc_iface_errors.expect
+--- a/tests/tests2/162_c6_iface_errors.expect
++++ b/tests/tests2/162_c6_iface_errors.expect
 @@ -1,17 +1,17 @@
  [test_missing_method]
--162_superc_iface_errors.c:8: error: impl of 'Shape' does not define method 'dump'
-+162_superc_iface_errors.c:10: error: 'Circle' does not implement interface 'Shape': missing method 'dump'
+-162_c6_iface_errors.c:8: error: impl of 'Shape' does not define method 'dump'
++162_c6_iface_errors.c:10: error: 'Circle' does not implement interface 'Shape': missing method 'dump'
  
  [test_wrong_param_count]
- 162_superc_iface_errors.c:15: error: method 'area' of 'Shape' has the wrong number of parameters
+ 162_c6_iface_errors.c:15: error: method 'area' of 'Shape' has the wrong number of parameters
  
  [test_wrong_return_type]
--162_superc_iface_errors.c:22: error: method 'area' of 'Shape' has an incompatible return type
-+162_superc_iface_errors.c:20: error: method 'area' of 'Shape' has an incompatible return type
+-162_c6_iface_errors.c:22: error: method 'area' of 'Shape' has an incompatible return type
++162_c6_iface_errors.c:20: error: method 'area' of 'Shape' has an incompatible return type
  
  [test_incompatible_param]
--162_superc_iface_errors.c:29: error: method 'scale' of 'Shape' has an incompatible parameter
-+162_superc_iface_errors.c:25: error: method 'scale' of 'Shape' has an incompatible parameter
+-162_c6_iface_errors.c:29: error: method 'scale' of 'Shape' has an incompatible parameter
++162_c6_iface_errors.c:25: error: method 'scale' of 'Shape' has an incompatible parameter
  
 -[test_unknown_interface]
--162_superc_iface_errors.c:32: error: unknown interface 'Nope'
+-162_c6_iface_errors.c:32: error: unknown interface 'Nope'
 +[test_duplicate_method]
-+162_superc_iface_errors.c:28: error: duplicate method 'area' for 'Circle'
++162_c6_iface_errors.c:28: error: duplicate method 'area' for 'Circle'
  
 -[test_duplicate_impl]
--162_superc_iface_errors.c:40: error: duplicate impl of 'Shape' for 'Circle'
+-162_c6_iface_errors.c:40: error: duplicate impl of 'Shape' for 'Circle'
 +[test_method_after_use]
-+162_superc_iface_errors.c:34: error: 'Circle' does not implement interface 'Shape': missing method 'area'
-diff --git a/tests/tests2/171+_superc_method_tu.c b/tests/tests2/171+_superc_method_tu.c
++162_c6_iface_errors.c:34: error: 'Circle' does not implement interface 'Shape': missing method 'area'
+diff --git a/tests/tests2/171+_c6_method_tu.c b/tests/tests2/171+_c6_method_tu.c
 new file mode 100644
 index 0000000..86ca433
 --- /dev/null
-+++ b/tests/tests2/171+_superc_method_tu.c
++++ b/tests/tests2/171+_c6_method_tu.c
 @@ -0,0 +1,5 @@
-+/* superc extension: definitions for 171_superc_method_tu.c */
++/* c6 extension: definitions for 171_c6_method_tu.c */
 +struct Vec { int x, y; };
 +
 +int vec_sum(struct Vec *v) { return v->x + v->y; }
 +int vec_scale(struct Vec *v, int k) { return v->vec_sum() * k; }
-diff --git a/tests/tests2/171_superc_method_tu.c b/tests/tests2/171_superc_method_tu.c
+diff --git a/tests/tests2/171_c6_method_tu.c b/tests/tests2/171_c6_method_tu.c
 new file mode 100644
 index 0000000..94c1f5e
 --- /dev/null
-+++ b/tests/tests2/171_superc_method_tu.c
++++ b/tests/tests2/171_c6_method_tu.c
 @@ -0,0 +1,20 @@
-+/* superc extension: a method declared in this unit, defined in another */
++/* c6 extension: a method declared in this unit, defined in another */
 +#include <stdio.h>
 +
 +struct Vec { int x, y; };
@@ -885,21 +885,21 @@ index 0000000..94c1f5e
 +    printf("plain=%d\n", vec_sum(p));
 +    return 0;
 +}
-diff --git a/tests/tests2/171_superc_method_tu.expect b/tests/tests2/171_superc_method_tu.expect
+diff --git a/tests/tests2/171_c6_method_tu.expect b/tests/tests2/171_c6_method_tu.expect
 new file mode 100644
 index 0000000..28dd046
 --- /dev/null
-+++ b/tests/tests2/171_superc_method_tu.expect
++++ b/tests/tests2/171_c6_method_tu.expect
 @@ -0,0 +1,2 @@
 +sum=7 scaled=70
 +plain=7
-diff --git a/tests/tests2/174+_superc_iface_tu.c b/tests/tests2/174+_superc_iface_tu.c
+diff --git a/tests/tests2/174+_c6_iface_tu.c b/tests/tests2/174+_c6_iface_tu.c
 new file mode 100644
 index 0000000..956190f
 --- /dev/null
-+++ b/tests/tests2/174+_superc_iface_tu.c
++++ b/tests/tests2/174+_c6_iface_tu.c
 @@ -0,0 +1,19 @@
-+/* superc extension: definitions for 174_superc_iface_tu.c.
++/* c6 extension: definitions for 174_c6_iface_tu.c.
 +   This unit converts the very same struct to the very same interface, so
 +   it emits its own copy of the vtable. */
 +interface Shape {
@@ -918,13 +918,13 @@ index 0000000..956190f
 +    s = *c;
 +    return s.area();
 +}
-diff --git a/tests/tests2/174_superc_iface_tu.c b/tests/tests2/174_superc_iface_tu.c
+diff --git a/tests/tests2/174_c6_iface_tu.c b/tests/tests2/174_c6_iface_tu.c
 new file mode 100644
 index 0000000..c319ed5
 --- /dev/null
-+++ b/tests/tests2/174_superc_iface_tu.c
++++ b/tests/tests2/174_c6_iface_tu.c
 @@ -0,0 +1,30 @@
-+/* superc extension: an interface used from two translation units.
++/* c6 extension: an interface used from two translation units.
 +   Each unit declares the interface itself and converts the same struct,
 +   so each gets its own (static) vtable object. */
 +#include <stdio.h>
@@ -935,7 +935,7 @@ index 0000000..c319ed5
 +
 +struct Circle { int r; };
 +
-+/* implemented in 174+_superc_iface_tu.c */
++/* implemented in 174+_c6_iface_tu.c */
 +package shapes {
 +    int area(struct Circle *self);
 +}
@@ -954,23 +954,23 @@ index 0000000..c319ed5
 +    printf("area=%d again=%d other=%d\n", s.area(), use(c), area_via_vt(&c));
 +    return 0;
 +}
-diff --git a/tests/tests2/174_superc_iface_tu.expect b/tests/tests2/174_superc_iface_tu.expect
+diff --git a/tests/tests2/174_c6_iface_tu.expect b/tests/tests2/174_c6_iface_tu.expect
 new file mode 100644
 index 0000000..46e25f6
 --- /dev/null
-+++ b/tests/tests2/174_superc_iface_tu.expect
++++ b/tests/tests2/174_c6_iface_tu.expect
 @@ -0,0 +1 @@
 +area=16 again=16 other=16
 diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
 index 6723a37..5c7e39a 100644
 --- a/tests/tests2/Makefile
 +++ b/tests/tests2/Makefile
-@@ -98,6 +98,8 @@ ifneq (,$(SUPERC_OK))
-  168_superc_pkg_dot_tu.test: GEN = $(GEN-TCC)
-  171_superc_method_tu.test: FLAGS += $(subst 171,171+,$1)
-  171_superc_method_tu.test: GEN = $(GEN-TCC)
-+ 174_superc_iface_tu.test: FLAGS += $(subst 174,174+,$1)
-+ 174_superc_iface_tu.test: GEN = $(GEN-TCC)
+@@ -98,6 +98,8 @@ ifneq (,$(C6_OK))
+  168_c6_pkg_dot_tu.test: GEN = $(GEN-TCC)
+  171_c6_method_tu.test: FLAGS += $(subst 171,171+,$1)
+  171_c6_method_tu.test: GEN = $(GEN-TCC)
++ 174_c6_iface_tu.test: FLAGS += $(subst 174,174+,$1)
++ 174_c6_iface_tu.test: GEN = $(GEN-TCC)
   # 172 mixes an extension unit with a unit built for plain C
-  172_superc_plain_interop.test: NORUN = true
-  172_superc_plain_interop.test: GEN = $(GEN-TCC)
+  172_c6_plain_interop.test: NORUN = true
+  172_c6_plain_interop.test: GEN = $(GEN-TCC)

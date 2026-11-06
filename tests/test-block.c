@@ -1,10 +1,10 @@
-/* superc 自测：test 块与 -test 模式本身
+/* c6 自测：test 块与 -test 模式本身
  *
  * 运行（仓库根目录）：
  *   make selftest
  * 或单个文件：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/test-block.c
- *   ./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=算术 tests/test-block.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/test-block.c
+ *   ./tcc/tcc -B tcc -std=c6 -test -test-filter=算术 tests/test-block.c
  */
 #include <stdio.h>
 #include <string.h>

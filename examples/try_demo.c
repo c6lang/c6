@@ -2,7 +2,7 @@
  *
  * 编译运行（在仓库根目录）：
  *   make build
- *   ./tcc/tcc -B tcc -std=tcc-ext -run examples/try_demo.c
+ *   ./tcc/tcc -B tcc -std=c6 -run examples/try_demo.c
  */
 #include <stdio.h>
 

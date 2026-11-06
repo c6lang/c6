@@ -1,7 +1,7 @@
-/* superc 自测：结构体方法（'ret f(struct T *self, ...)'，调用写作 p->f()）
+/* c6 自测：结构体方法（'ret f(struct T *self, ...)'，调用写作 p->f()）
  *
  * 运行（仓库根目录）：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/method.c tests/tu/method.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/method.c tests/tu/method.c
  */
 #include <stdio.h>
 #include <string.h>

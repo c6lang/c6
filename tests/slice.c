@@ -1,7 +1,7 @@
-/* superc 自测：切片 'T[:]'
+/* c6 自测：切片 'T[:]'
  *
  * 运行（仓库根目录）：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/slice.c tests/tu/slice.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/slice.c tests/tu/slice.c
  */
 #include <stdio.h>
 #include <string.h>

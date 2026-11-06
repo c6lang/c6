@@ -1,9 +1,9 @@
-/* superc 自测：defer 的执行时机、顺序与作用域
+/* c6 自测：defer 的执行时机、顺序与作用域
  *
  * 运行（仓库根目录）：
  *   make selftest
  * 或单个文件：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/defer.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/defer.c
  */
 #include <stdio.h>
 #include <string.h>

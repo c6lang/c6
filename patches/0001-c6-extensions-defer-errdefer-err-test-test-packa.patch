@@ -1,12 +1,12 @@
 From 3ed76c0d2c1011926e89eed607dd51f84c5831d0 Mon Sep 17 00:00:00 2001
-From: superc-agent <agent@localhost>
+From: c6-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 16:52:10 +0800
-Subject: [PATCH 1/10] superc extensions: defer, errdefer/err, test/-test,
+Subject: [PATCH 1/10] c6 extensions: defer, errdefer/err, test/-test,
  package/import, interface/impl, #macro with __local hygiene
 
-All superc language extensions from docs/plan.md, gated behind TCC_EXT
-(build with EXTRA-DEFS=-DTCC_EXT, enable per-TU with -std=tcc-ext, which
-also defines __TCC_EXT__). Without the extension all new keywords are
+All c6 language extensions from docs/plan.md, gated behind C6_EXT
+(build with EXTRA-DEFS=-DC6_EXT, enable per-TU with -std=c6, which
+also defines __C6__). Without the extension all new keywords are
 un-interned again, so a plain build behaves exactly like upstream tcc.
 
 - defer: runtime record stack plus a per-function dispatcher; scope,
@@ -24,8 +24,8 @@ un-interned again, so a plain build behaves exactly like upstream tcc.
 - #macro/__local: hygienic macros; __local names are renamed with an
   expansion counter before arguments are substituted.
 
-Tests: tests/tests2/156_superc_defer .. 161_superc_macro, enabled only
-when the compiler was built with -DTCC_EXT. Full tests2 suite passes
+Tests: tests/tests2/156_c6_defer .. 161_c6_macro, enabled only
+when the compiler was built with -DC6_EXT. Full tests2 suite passes
 with (140) and without (134) the extension.
 ---
  lib/libtcc1.c                            |  145 +++
@@ -35,32 +35,32 @@ with (140) and without (134) the extension.
  tccpp.c                                  |  223 ++++-
  tccrun.c                                 |   56 +-
  tcctok.h                                 |   12 +
- tests/tests2/156_superc_defer.c          |  107 +++
- tests/tests2/156_superc_defer.expect     |    6 +
- tests/tests2/157_superc_err.c            |  123 +++
- tests/tests2/157_superc_err.expect       |   14 +
- tests/tests2/158_superc_test.c           |   61 ++
- tests/tests2/158_superc_test.expect      |    6 +
- tests/tests2/159_superc_package.c        |   36 +
- tests/tests2/159_superc_package.expect   |    5 +
- tests/tests2/160_superc_interface.c      |   88 ++
- tests/tests2/160_superc_interface.expect |    6 +
- tests/tests2/161_superc_macro.c          |   58 ++
- tests/tests2/161_superc_macro.expect     |    8 +
+ tests/tests2/156_c6_defer.c          |  107 +++
+ tests/tests2/156_c6_defer.expect     |    6 +
+ tests/tests2/157_c6_err.c            |  123 +++
+ tests/tests2/157_c6_err.expect       |   14 +
+ tests/tests2/158_c6_test.c           |   61 ++
+ tests/tests2/158_c6_test.expect      |    6 +
+ tests/tests2/159_c6_package.c        |   36 +
+ tests/tests2/159_c6_package.expect   |    5 +
+ tests/tests2/160_c6_interface.c      |   88 ++
+ tests/tests2/160_c6_interface.expect |    6 +
+ tests/tests2/161_c6_macro.c          |   58 ++
+ tests/tests2/161_c6_macro.expect     |    8 +
  tests/tests2/Makefile                    |   13 +
  20 files changed, 2134 insertions(+), 9 deletions(-)
- create mode 100644 tests/tests2/156_superc_defer.c
- create mode 100644 tests/tests2/156_superc_defer.expect
- create mode 100644 tests/tests2/157_superc_err.c
- create mode 100644 tests/tests2/157_superc_err.expect
- create mode 100644 tests/tests2/158_superc_test.c
- create mode 100644 tests/tests2/158_superc_test.expect
- create mode 100644 tests/tests2/159_superc_package.c
- create mode 100644 tests/tests2/159_superc_package.expect
- create mode 100644 tests/tests2/160_superc_interface.c
- create mode 100644 tests/tests2/160_superc_interface.expect
- create mode 100644 tests/tests2/161_superc_macro.c
- create mode 100644 tests/tests2/161_superc_macro.expect
+ create mode 100644 tests/tests2/156_c6_defer.c
+ create mode 100644 tests/tests2/156_c6_defer.expect
+ create mode 100644 tests/tests2/157_c6_err.c
+ create mode 100644 tests/tests2/157_c6_err.expect
+ create mode 100644 tests/tests2/158_c6_test.c
+ create mode 100644 tests/tests2/158_c6_test.expect
+ create mode 100644 tests/tests2/159_c6_package.c
+ create mode 100644 tests/tests2/159_c6_package.expect
+ create mode 100644 tests/tests2/160_c6_interface.c
+ create mode 100644 tests/tests2/160_c6_interface.expect
+ create mode 100644 tests/tests2/161_c6_macro.c
+ create mode 100644 tests/tests2/161_c6_macro.expect
 
 diff --git a/lib/libtcc1.c b/lib/libtcc1.c
 index 878f951..45211ec 100644
@@ -72,7 +72,7 @@ index 878f951..45211ec 100644
  #endif /* !ARM */
 +
 +/* ------------------------------------------------------------------------- */
-+/* superc extension runtime: defer / errdefer / err                          */
++/* c6 extension runtime: defer / errdefer / err                          */
 +/*                                                                           */
 +/* Deferred statements are recorded on a global (v1: single-threaded) stack.  */
 +/* Each function stores the stack top at entry ("frame base") in a local slot */
@@ -223,7 +223,7 @@ index 44ea25f..e0866b9 100644
      TCC_OPTION_pthread,
      TCC_OPTION_run,
      TCC_OPTION_rstdin,
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    TCC_OPTION_test,
 +    TCC_OPTION_test_filter,
 +#endif
@@ -234,7 +234,7 @@ index 44ea25f..e0866b9 100644
      { "pthread", TCC_OPTION_pthread, 0},
      { "run", TCC_OPTION_run, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
      { "rstdin", TCC_OPTION_rstdin, TCC_OPTION_HAS_ARG },
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    { "test", TCC_OPTION_test, 0 },
 +    { "test-filter", TCC_OPTION_test_filter, TCC_OPTION_HAS_ARG },
 +#endif
@@ -249,8 +249,8 @@ index 44ea25f..e0866b9 100644
 +            /* '-test' already selects TCC_OUTPUT_MEMORY, so the usual
 +               '-run' afterwards is not worth a warning */
 +            if (s->output_type
-+#ifdef TCC_EXT
-+                && !(s->superc_test_mode && x == TCC_OUTPUT_MEMORY)
++#ifdef C6_EXT
++                && !(s->c6_test_mode && x == TCC_OUTPUT_MEMORY)
 +#endif
 +                )
                  tcc_warning("-%s: overriding compiler action already specified", popt->name);
@@ -260,9 +260,9 @@ index 44ea25f..e0866b9 100644
          case TCC_OPTION_std:
              if (strcmp(optarg, "=c11") == 0 || strcmp(optarg, "=gnu11") == 0)
                  s->cversion = 201112;
-+#ifdef TCC_EXT
-+            else if (strcmp(optarg, "=tcc-ext") == 0) {
-+                s->superc_ext = 1;
++#ifdef C6_EXT
++            else if (strcmp(optarg, "=c6") == 0) {
++                s->c6_ext = 1;
 +                s->tcc_ext = 1;
 +            }
 +#endif
@@ -273,16 +273,16 @@ index 44ea25f..e0866b9 100644
              return tcc_error_noabort("-run is not available in a cross compiler");
  #endif
  #ifdef TCC_IS_NATIVE
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        case TCC_OPTION_test:
 +            /* run the 'test' blocks instead of main() */
-+            s->superc_test_mode = 1;
++            s->c6_test_mode = 1;
 +            x = TCC_OUTPUT_MEMORY;
 +            goto set_output_type;
 +        case TCC_OPTION_test_filter:
 +            if (*optarg == '=')
 +                ++optarg;
-+            s->superc_test_filter = optarg;
++            s->c6_test_filter = optarg;
 +            break;
 +#endif
          case TCC_OPTION_rstdin:
@@ -296,7 +296,7 @@ index 864a4e3..86684e9 100644
          struct Sym *cleanup_sym; /* symbol from __attribute__((cleanup())) */
          struct Sym *cleanup_label; /* label in 'pending_gotos' chain */
      };
-+    int defer_depth; /* superc: lexical depth of a defined label */
++    int defer_depth; /* c6: lexical depth of a defined label */
  } Sym;
  
  /* section definition */
@@ -304,8 +304,8 @@ index 864a4e3..86684e9 100644
  #define MACRO_OBJ      0 /* object like macro */
  #define MACRO_FUNC     1 /* function like macro */
  #define MACRO_JOIN     2 /* macro uses ## */
-+#ifdef TCC_EXT
-+#define MACRO_SUPERC_LOCAL 8 /* '#macro' body: '__local' is renamed per expansion */
++#ifdef C6_EXT
++#define MACRO_C6_LOCAL 8 /* '#macro' body: '__local' is renamed per expansion */
 +#endif
  
  /* field 'Sym.r' for C labels */
@@ -314,29 +314,29 @@ index 864a4e3..86684e9 100644
  #endif
  };
  
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +/* one 'test "desc" { ... }' block */
-+typedef struct SupercTestEntry {
++typedef struct C6TestEntry {
 +    char *desc;      /* description text */
 +    char *fn_name;   /* name of the generated test function */
-+} SupercTestEntry;
++} C6TestEntry;
 +
 +/* one 'interface NAME { methods }' declaration */
-+typedef struct SupercIface {
++typedef struct C6Iface {
 +    char *name;      /* interface name, e.g. "Drawable" */
 +    int tag;         /* struct tag of the interface value type */
 +    int vt_tag;      /* struct tag of the vtable type */
 +    int nb_methods;
 +    int *methods;    /* method name tokens, in declaration order */
-+} SupercIface;
++} C6Iface;
 +
 +/* one 'impl IFACE for TYPE { ... }' block */
-+typedef struct SupercImpl {
-+    SupercIface *iface;
++typedef struct C6Impl {
++    C6Iface *iface;
 +    int type_tag;    /* struct tag of the implemented type */
 +    int vt_tok;      /* token of the emitted vtable object */
 +    int is_decl;     /* only declared here, defined in another TU */
-+} SupercImpl;
++} C6Impl;
 +#endif
 +
  struct TCCState {
@@ -346,23 +346,23 @@ index 864a4e3..86684e9 100644
      unsigned char gnu_ext;
      /* use TinyCC extensions */
      unsigned char tcc_ext;
-+#ifdef TCC_EXT
-+    /* superc language extensions (-std=tcc-ext) */
-+    unsigned char superc_ext;
-+    unsigned char superc_test_mode; /* -test: run 'test' blocks, not main */
-+    const char *superc_test_filter; /* -test-filter=SUBSTR */
++#ifdef C6_EXT
++    /* c6 language extensions (-std=c6) */
++    unsigned char c6_ext;
++    unsigned char c6_test_mode; /* -test: run 'test' blocks, not main */
++    const char *c6_test_filter; /* -test-filter=SUBSTR */
 +    /* 'test' blocks collected while compiling */
-+    struct SupercTestEntry **superc_tests;
-+    int superc_test_count;
++    struct C6TestEntry **c6_tests;
++    int c6_test_count;
 +    /* 'package NAME { ... }' support */
-+    char *superc_package;      /* current package, NULL at top level */
-+    char **superc_imports;     /* 'import NAME;' names */
-+    int superc_nb_imports;
++    char *c6_package;      /* current package, NULL at top level */
++    char **c6_imports;     /* 'import NAME;' names */
++    int c6_nb_imports;
 +    /* 'interface' / 'impl' declarations */
-+    struct SupercIface **superc_ifaces;
-+    int superc_nb_ifaces;
-+    struct SupercImpl **superc_impls;
-+    int superc_nb_impls;
++    struct C6Iface **c6_ifaces;
++    int c6_nb_ifaces;
++    struct C6Impl **c6_impls;
++    int c6_nb_impls;
 +#endif
  
      unsigned char dflag; /* -dX value */
@@ -378,24 +378,24 @@ index b00e0a6..9449490 100644
 +    int depth; /* lexical scope depth (new_scope only) */
  } *cur_scope, *loop_scope, *root_scope;
  
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +/* ------------------------------------------------------------------------- */
-+/* superc extensions: defer / errdefer state (per function)                  */
++/* c6 extensions: defer / errdefer state (per function)                  */
 +
-+typedef struct SupercDeferSite {
++typedef struct C6DeferSite {
 +    int id;
 +    Sym *label;
-+    struct SupercDeferSite *next;
-+} SupercDeferSite;
++    struct C6DeferSite *next;
++} C6DeferSite;
 +
-+typedef struct SupercDeferResume {
++typedef struct C6DeferResume {
 +    int id;
 +    Sym *label;
-+    struct SupercDeferResume *next;
-+} SupercDeferResume;
++    struct C6DeferResume *next;
++} C6DeferResume;
 +
 +static struct {
-+    int enabled;      /* superc extensions active for current function */
++    int enabled;      /* c6 extensions active for current function */
 +    int has_sites;    /* at least one defer/errdefer site parsed so far */
 +    int body_depth;   /* > 0 while compiling a deferred statement body */
 +    int next_site;
@@ -403,41 +403,41 @@ index b00e0a6..9449490 100644
 +    int sp0_off;      /* local slot holding this frame's defer stack base */
 +    int step_off;     /* local slot for __tcc_defer_step() result */
 +    int disp_jmps;    /* pending jumps to the function dispatcher */
-+    SupercDeferSite *sites;
-+    SupercDeferSite **sites_tail;
-+    SupercDeferResume *resumes;
-+    SupercDeferResume **resumes_tail;
++    C6DeferSite *sites;
++    C6DeferSite **sites_tail;
++    C6DeferResume *resumes;
++    C6DeferResume **resumes_tail;
 +} defer_state;
-+static int superc_label_seq;
-+static int superc_implicit_ret0;
++static int c6_label_seq;
++static int c6_implicit_ret0;
 +/* pending hidden 'self' argument of an interface method call */
-+static int superc_iface_self_pending;
-+static int superc_iface_self_loc;
-+static CType superc_iface_self_type;  /* generated 'test' function: return 0 */
++static int c6_iface_self_pending;
++static int c6_iface_self_loc;
++static CType c6_iface_self_type;  /* generated 'test' function: return 0 */
 +
-+static void superc_defer_func_init(void);
-+static void superc_defer_func_end(void);
-+static void superc_defer_begin(int mode, int depth);
-+static void superc_defer_parse(int kind);
-+static void superc_err_parse(void);
-+static void superc_errdefer_parse(void);
-+static void superc_test_parse(void);
-+static void superc_package_parse(void);
-+static void superc_import_parse(void);
-+static void superc_interface_parse(void);
-+static void superc_impl_parse(void);
-+static int superc_iface_convert(CType *dt);
-+typedef struct SupercIface SupercIface_t;
-+static SupercIface *superc_iface_of_type(CType *type);
-+static int superc_iface_has_method(SupercIface *ifc, int m);
-+static void superc_iface_call_prep(SupercIface *ifc, int mname);
-+static Sym *superc_import_lookup(int v);
++static void c6_defer_func_init(void);
++static void c6_defer_func_end(void);
++static void c6_defer_begin(int mode, int depth);
++static void c6_defer_parse(int kind);
++static void c6_err_parse(void);
++static void c6_errdefer_parse(void);
++static void c6_test_parse(void);
++static void c6_package_parse(void);
++static void c6_import_parse(void);
++static void c6_interface_parse(void);
++static void c6_impl_parse(void);
++static int c6_iface_convert(CType *dt);
++typedef struct C6Iface C6Iface_t;
++static C6Iface *c6_iface_of_type(CType *type);
++static int c6_iface_has_method(C6Iface *ifc, int m);
++static void c6_iface_call_prep(C6Iface *ifc, int mname);
++static Sym *c6_import_lookup(int v);
 +static void gen_function(Sym *sym);
 +/* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
 +   already interned as TOK_ASM_test, so accept both spellings. */
-+static int superc_is_test_kw(int t)
++static int c6_is_test_kw(int t)
 +{
-+    if (t == TOK_SUPERC_TEST)
++    if (t == TOK_C6_TEST)
 +        return 1;
 +#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
 +    if (t == TOK_ASM_test)
@@ -445,9 +445,9 @@ index b00e0a6..9449490 100644
 +#endif
 +    return 0;
 +}
-+static Sym *superc_new_label(const char *tag);
-+static void superc_def_label(Sym *s);
-+static int superc_ext_on(void);
++static Sym *c6_new_label(const char *tag);
++static void c6_def_label(Sym *s);
++static int c6_ext_on(void);
 +#endif
 +
  typedef struct {
@@ -472,10 +472,10 @@ index b00e0a6..9449490 100644
 +ST_INLN Sym *sym_find(int v)
 +{
 +    Sym *s = sym_find_raw(v);
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    if (!s && tcc_state
-+        && (tcc_state->superc_package || tcc_state->superc_nb_imports))
-+        s = superc_import_lookup(v);
++        && (tcc_state->c6_package || tcc_state->c6_nb_imports))
++        s = c6_import_lookup(v);
 +#endif
 +    return s;
 +}
@@ -487,8 +487,8 @@ index b00e0a6..9449490 100644
  
  static void gen_assign_cast(CType *dt)
  {
-+#ifdef TCC_EXT
-+    if (superc_iface_convert(dt))
++#ifdef C6_EXT
++    if (c6_iface_convert(dt))
 +        return;
 +#endif
      verify_assign_cast(dt);
@@ -498,8 +498,8 @@ index b00e0a6..9449490 100644
      int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
  
      ft = vtop[-1].type.t;
-+#ifdef TCC_EXT
-+    superc_iface_convert(&vtop[-1].type);
++#ifdef C6_EXT
++    c6_iface_convert(&vtop[-1].type);
 +    ft = vtop[-1].type.t;
 +#endif
      sbt = vtop->type.t & VT_BTYPE;
@@ -509,9 +509,9 @@ index b00e0a6..9449490 100644
                  return;
              } else {
                  unary();
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +                /* '(Shape)circle' converts explicitly */
-+                if (superc_iface_convert(&type))
++                if (c6_iface_convert(&type))
 +                    break;
 +#endif
                  gen_cast(&type);
@@ -521,14 +521,14 @@ index b00e0a6..9449490 100644
              test_lvalue();
              /* expect pointer on structure */
              next();
-+#ifdef TCC_EXT
-+            if (tcc_state->superc_ext && tok >= TOK_UIDENT) {
-+                SupercIface *ifc = superc_iface_of_type(&vtop->type);
++#ifdef C6_EXT
++            if (tcc_state->c6_ext && tok >= TOK_UIDENT) {
++                C6Iface *ifc = c6_iface_of_type(&vtop->type);
 +                if (ifc) {
 +                    int mname = tok;
 +                    next();
-+                    if (tok == '(' && superc_iface_has_method(ifc, mname)) {
-+                        superc_iface_call_prep(ifc, mname);
++                    if (tok == '(' && c6_iface_has_method(ifc, mname)) {
++                        c6_iface_call_prep(ifc, mname);
 +                        continue;   /* let the '(' case handle the call */
 +                    }
 +                    unget_tok(mname);   /* plain field access */
@@ -542,13 +542,13 @@ index b00e0a6..9449490 100644
              next();
              sa = s->next; /* first parameter */
              nb_args = regsize = 0;
-+#ifdef TCC_EXT
-+            if (superc_iface_self_pending) {
++#ifdef C6_EXT
++            if (c6_iface_self_pending) {
 +                /* interface method call: the hidden 'self' pointer is the
 +                   first argument, its parameter is skipped */
-+                superc_iface_self_pending = 0;
-+                vset(&superc_iface_self_type, VT_LOCAL | VT_LVAL,
-+                     superc_iface_self_loc);
++                c6_iface_self_pending = 0;
++                vset(&c6_iface_self_type, VT_LOCAL | VT_LVAL,
++                     c6_iface_self_loc);
 +                nb_args = 1;
 +                if (sa)
 +                    sa = sa->next;
@@ -564,8 +564,8 @@ index b00e0a6..9449490 100644
 -    if ((!strcmp(funcname, "main") || func_old)
 -        && (func_vt.t & VT_BTYPE) == VT_INT) {
 +    if ((!strcmp(funcname, "main") || func_old
-+#ifdef TCC_EXT
-+         || superc_implicit_ret0
++#ifdef C6_EXT
++         || c6_implicit_ret0
 +#endif
 +        ) && (func_vt.t & VT_BTYPE) == VT_INT) {
          /* main returns 0 by default */
@@ -575,21 +575,21 @@ index b00e0a6..9449490 100644
      try_call_scope_cleanup(o->cl.s);
  }
  
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +/* ------------------------------------------------------------------------- */
-+/* superc extensions: defer / errdefer code generation                      */
++/* c6 extensions: defer / errdefer code generation                      */
 +
 +/* value returned by a function that raised an error with 'err(...)' */
 +#define TCC_ERR_SENTINEL (-1)
 +
 +/* ------------------------------------------------------------------------- */
-+/* superc extensions: 'package NAME { ... }' and 'import NAME;'             */
++/* c6 extensions: 'package NAME { ... }' and 'import NAME;'             */
 +/*                                                                          */
 +/* A package is a name-mangling sugar: global symbols declared inside are   */
 +/* registered as NAME__symbol.  'import NAME;' makes unqualified lookups    */
 +/* fall back to NAME__symbol.  Macro and tag namespaces are not affected.   */
 +
-+static int superc_mangle_tok(const char *pkg, int v)
++static int c6_mangle_tok(const char *pkg, int v)
 +{
 +    char buf[192];
 +    const char *name = get_tok_str(v, NULL);
@@ -600,22 +600,22 @@ index b00e0a6..9449490 100644
 +}
 +
 +/* resolve V as a member of the current package or of an imported package */
-+static Sym *superc_import_lookup(int v)
++static Sym *c6_import_lookup(int v)
 +{
 +    TCCState *s1 = tcc_state;
 +    int i, t;
 +    Sym *s;
 +
-+    if (!s1->superc_ext || v < TOK_UIDENT)
++    if (!s1->c6_ext || v < TOK_UIDENT)
 +        return NULL;
-+    if (s1->superc_package) {
-+        t = superc_mangle_tok(s1->superc_package, v);
++    if (s1->c6_package) {
++        t = c6_mangle_tok(s1->c6_package, v);
 +        s = sym_find_raw(t);
 +        if (s)
 +            return s;
 +    }
-+    for (i = 0; i < s1->superc_nb_imports; i++) {
-+        t = superc_mangle_tok(s1->superc_imports[i], v);
++    for (i = 0; i < s1->c6_nb_imports; i++) {
++        t = c6_mangle_tok(s1->c6_imports[i], v);
 +        s = sym_find_raw(t);
 +        if (s)
 +            return s;
@@ -623,7 +623,7 @@ index b00e0a6..9449490 100644
 +    return NULL;
 +}
 +
-+static char *superc_ident_str(int *ptok)
++static char *c6_ident_str(int *ptok)
 +{
 +    char *name;
 +    if (*ptok < TOK_UIDENT)
@@ -633,69 +633,69 @@ index b00e0a6..9449490 100644
 +    return name;
 +}
 +
-+static void superc_package_parse(void)
++static void c6_package_parse(void)
 +{
 +    char *name, *saved;
 +
 +    next();  /* skip 'package' */
-+    name = superc_ident_str(&tok);
++    name = c6_ident_str(&tok);
 +    if (tok == '{') {
 +        /* 'package NAME { ... }': the package ends with the block */
-+        if (tcc_state->superc_package)
++        if (tcc_state->c6_package)
 +            tcc_error("nested 'package' is not allowed");
-+        saved = tcc_state->superc_package;
-+        tcc_state->superc_package = name;
++        saved = tcc_state->c6_package;
++        tcc_state->c6_package = name;
 +        next();
 +        while (tok != '}' && tok != TOK_EOF)
 +            decl(VT_CONST);
 +        skip('}');
-+        tcc_state->superc_package = saved;
++        tcc_state->c6_package = saved;
 +    } else {
 +        /* 'package NAME;' names the rest of the file (or until the next
 +           'package' statement); include system headers before it */
-+        tcc_state->superc_package = name;
++        tcc_state->c6_package = name;
 +        skip(';');
 +    }
 +}
 +
-+static void superc_import_parse(void)
++static void c6_import_parse(void)
 +{
 +    char *name;
 +    next();  /* skip 'import' */
-+    name = superc_ident_str(&tok);
++    name = c6_ident_str(&tok);
 +    skip(';');
-+    dynarray_add(&tcc_state->superc_imports,
-+                 &tcc_state->superc_nb_imports, name);
++    dynarray_add(&tcc_state->c6_imports,
++                 &tcc_state->c6_nb_imports, name);
 +}
 +
 +
 +/* ------------------------------------------------------------------ */
 +/* interface / impl                                                    */
 +
-+static SupercIface *superc_iface_find(int tag)
++static C6Iface *c6_iface_find(int tag)
 +{
 +    int i;
-+    for (i = 0; i < tcc_state->superc_nb_ifaces; i++)
-+        if (tcc_state->superc_ifaces[i]->tag == tag)
-+            return tcc_state->superc_ifaces[i];
++    for (i = 0; i < tcc_state->c6_nb_ifaces; i++)
++        if (tcc_state->c6_ifaces[i]->tag == tag)
++            return tcc_state->c6_ifaces[i];
 +    return NULL;
 +}
 +
 +/* if TYPE denotes an interface value type, return its descriptor */
-+static SupercIface *superc_iface_of_type(CType *type)
++static C6Iface *c6_iface_of_type(CType *type)
 +{
 +    Sym *st;
-+    if (!tcc_state->superc_ext || tcc_state->superc_nb_ifaces == 0)
++    if (!tcc_state->c6_ext || tcc_state->c6_nb_ifaces == 0)
 +        return NULL;
 +    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
 +        return NULL;
 +    st = type->ref;
 +    if (!(st->v & SYM_STRUCT))
 +        return NULL;
-+    return superc_iface_find(st->v & ~SYM_STRUCT);
++    return c6_iface_find(st->v & ~SYM_STRUCT);
 +}
 +
-+static int superc_iface_has_method(SupercIface *ifc, int m)
++static int c6_iface_has_method(C6Iface *ifc, int m)
 +{
 +    int i;
 +    for (i = 0; i < ifc->nb_methods; i++)
@@ -704,11 +704,11 @@ index b00e0a6..9449490 100644
 +    return 0;
 +}
 +
-+static SupercImpl *superc_impl_find(SupercIface *ifc, int type_tag)
++static C6Impl *c6_impl_find(C6Iface *ifc, int type_tag)
 +{
 +    int i;
-+    for (i = 0; i < tcc_state->superc_nb_impls; i++) {
-+        SupercImpl *imp = tcc_state->superc_impls[i];
++    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
++        C6Impl *imp = tcc_state->c6_impls[i];
 +        if (imp->iface == ifc && imp->type_tag == type_tag)
 +            return imp;
 +    }
@@ -716,7 +716,7 @@ index b00e0a6..9449490 100644
 +}
 +
 +/* resolve TYPE (a typedef name or a 'struct' tag) to its struct tag token */
-+static int superc_struct_tag(int type_tok)
++static int c6_struct_tag(int type_tok)
 +{
 +    Sym *st = struct_find(type_tok);
 +    if (!st) {
@@ -732,7 +732,7 @@ index b00e0a6..9449490 100644
 +/* Parse TS (a synthetic token string ending in TOK_EOF) as file scope
 +   declarations.  The current token is left untouched and warnings are
 +   suppressed, since the generated declarations are compiler-internal. */
-+static void superc_decl_tokens(TokenString *ts)
++static void c6_decl_tokens(TokenString *ts)
 +{
 +    int warn_none = tcc_state->warn_none;
 +    int save_tok = tok;
@@ -746,9 +746,9 @@ index b00e0a6..9449490 100644
 +    tok = save_tok, tokc = save_val;
 +}
 +
-+static void superc_interface_parse(void)
++static void c6_interface_parse(void)
 +{
-+    SupercIface *ifc;
++    C6Iface *ifc;
 +    TokenString *body = NULL, *ts;
 +    int name_tok, i, n, *p, is_method;
 +    char buf[256];
@@ -820,7 +820,7 @@ index b00e0a6..9449490 100644
 +    tok_str_add(ts, TOK_EOF);
 +    if (ifc->nb_methods == 0)
 +        tcc_error("interface '%s' has no methods", ifc->name);
-+    superc_decl_tokens(ts);
++    c6_decl_tokens(ts);
 +
 +    /* Build the interface value type:
 +       'struct NAME { void *self; const struct NAME_vt *vt; };' */
@@ -841,7 +841,7 @@ index b00e0a6..9449490 100644
 +    tok_str_add(ts, '}');
 +    tok_str_add(ts, ';');
 +    tok_str_add(ts, TOK_EOF);
-+    superc_decl_tokens(ts);
++    c6_decl_tokens(ts);
 +
 +    /* 'typedef struct NAME NAME;' so that the interface name can be
 +       used as a type, e.g. 'int describe(Shape s)' */
@@ -852,17 +852,17 @@ index b00e0a6..9449490 100644
 +    tok_str_add(ts, ifc->tag);
 +    tok_str_add(ts, ';');
 +    tok_str_add(ts, TOK_EOF);
-+    superc_decl_tokens(ts);
++    c6_decl_tokens(ts);
 +
-+    dynarray_add(&tcc_state->superc_ifaces,
-+                 &tcc_state->superc_nb_ifaces, ifc);
++    dynarray_add(&tcc_state->c6_ifaces,
++                 &tcc_state->c6_nb_ifaces, ifc);
 +    tok_str_free(body);
 +}
 +
-+static void superc_impl_parse(void)
++static void c6_impl_parse(void)
 +{
-+    SupercIface *ifc;
-+    SupercImpl *imp;
++    C6Iface *ifc;
++    C6Impl *imp;
 +    TokenString *ts;
 +    char *saved_pkg, *pkgname;
 +    char buf[256];
@@ -883,23 +883,23 @@ index b00e0a6..9449490 100644
 +    type_tok = tok;
 +    next();
 +
-+    ifc = superc_iface_find(iface_tok);
++    ifc = c6_iface_find(iface_tok);
 +    if (!ifc)
 +        tcc_error("unknown interface '%s'", get_tok_str(iface_tok, NULL));
-+    type_tag = superc_struct_tag(type_tok);
++    type_tag = c6_struct_tag(type_tok);
 +    if (!type_tag)
 +        tcc_error("'%s' is not a struct or union type",
 +                  get_tok_str(type_tok, NULL));
 +    /* a declaration-only impl may be followed by the real definition */
-+    for (i = 0; i < tcc_state->superc_nb_impls; i++) {
-+        SupercImpl *o = tcc_state->superc_impls[i];
++    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
++        C6Impl *o = tcc_state->c6_impls[i];
 +        if (o->iface == ifc && o->type_tag == type_tag) {
 +            if (!o->is_decl)
 +                tcc_error("duplicate impl of '%s' for '%s'", ifc->name,
 +                          get_tok_str(type_tok, NULL));
-+            memmove(&tcc_state->superc_impls[i], &tcc_state->superc_impls[i + 1],
-+                    (tcc_state->superc_nb_impls - i - 1) * sizeof(SupercImpl *));
-+            tcc_state->superc_nb_impls--;
++            memmove(&tcc_state->c6_impls[i], &tcc_state->c6_impls[i + 1],
++                    (tcc_state->c6_nb_impls - i - 1) * sizeof(C6Impl *));
++            tcc_state->c6_nb_impls--;
 +            tcc_free(o);
 +            break;
 +        }
@@ -914,7 +914,7 @@ index b00e0a6..9449490 100644
 +    tok_str_add(ts, type_tok);
 +    tok_str_add(ts, ';');
 +    tok_str_add(ts, TOK_EOF);
-+    superc_decl_tokens(ts);
++    c6_decl_tokens(ts);
 +
 +    if (tok == ';') {
 +        /* 'impl IFACE for TYPE;' only declares that the impl exists (it is
@@ -935,9 +935,9 @@ index b00e0a6..9449490 100644
 +        tok_str_add(ts, imp->vt_tok);
 +        tok_str_add(ts, ';');
 +        tok_str_add(ts, TOK_EOF);
-+        superc_decl_tokens(ts);
-+        dynarray_add(&tcc_state->superc_impls,
-+                     &tcc_state->superc_nb_impls, imp);
++        c6_decl_tokens(ts);
++        dynarray_add(&tcc_state->c6_impls,
++                     &tcc_state->c6_nb_impls, imp);
 +        return;
 +    }
 +
@@ -946,13 +946,13 @@ index b00e0a6..9449490 100644
 +    snprintf(buf, sizeof buf, "__tcc_impl_%s_%s",
 +             get_tok_str(type_tag, NULL), ifc->name);
 +    pkgname = tcc_strdup(buf);
-+    saved_pkg = tcc_state->superc_package;
-+    tcc_state->superc_package = pkgname;
++    saved_pkg = tcc_state->c6_package;
++    tcc_state->c6_package = pkgname;
 +    skip('{');
 +    while (tok != '}' && tok != TOK_EOF)
 +        decl(VT_CONST);
 +    skip('}');
-+    tcc_state->superc_package = saved_pkg;
++    tcc_state->c6_package = saved_pkg;
 +
 +    /* Emit the vtable object:
 +       'const struct NAME_vt __tcc_vt_TYPE_NAME = { (void(*)(void))m, ... };' */
@@ -982,21 +982,21 @@ index b00e0a6..9449490 100644
 +        tok_str_add(ts, TOK_VOID);
 +        tok_str_add(ts, ')');
 +        tok_str_add(ts, ')');
-+        tok_str_add(ts, superc_mangle_tok(pkgname, ifc->methods[i]));
++        tok_str_add(ts, c6_mangle_tok(pkgname, ifc->methods[i]));
 +    }
 +    tok_str_add(ts, '}');
 +    tok_str_add(ts, ';');
 +    tok_str_add(ts, TOK_EOF);
-+    superc_decl_tokens(ts);
++    c6_decl_tokens(ts);
 +
-+    dynarray_add(&tcc_state->superc_impls,
-+                 &tcc_state->superc_nb_impls, imp);
++    dynarray_add(&tcc_state->c6_impls,
++                 &tcc_state->c6_nb_impls, imp);
 +}
 +
 +/* rewrite 'iface.meth (args...)' into a vtable call passing the hidden
 +   'self' pointer as the first argument; leaves the function pointer on
-+   the stack and arms 'superc_iface_self_pending' for the call code */
-+static void superc_iface_call_prep(SupercIface *ifc, int mname)
++   the stack and arms 'c6_iface_self_pending' for the call code */
++static void c6_iface_call_prep(C6Iface *ifc, int mname)
 +{
 +    Sym *fself, *fvt, *fmeth;
 +    CType t;
@@ -1018,13 +1018,13 @@ index b00e0a6..9449490 100644
 +    mk_pointer(&t);
 +    vtop->type = t;
 +    indir();                         /* the 'self' pointer value */
-+    superc_iface_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
-+    loc = superc_iface_self_loc;
-+    vset(&fself->type, VT_LOCAL | VT_LVAL, superc_iface_self_loc);
++    c6_iface_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
++    loc = c6_iface_self_loc;
++    vset(&fself->type, VT_LOCAL | VT_LVAL, c6_iface_self_loc);
 +    vswap();
 +    vstore();
 +    vpop();
-+    superc_iface_self_type = fself->type;
++    c6_iface_self_type = fself->type;
 +
 +    /* method: d.vt->name */
 +    vpushi(off_vt);
@@ -1044,27 +1044,27 @@ index b00e0a6..9449490 100644
 +    mk_pointer(&t);
 +    vtop->type = t;
 +    indir();                         /* the function pointer */
-+    superc_iface_self_pending = 1;
++    c6_iface_self_pending = 1;
 +}
 +
 +/* Implicit conversion of a struct value to an interface value, e.g.
 +   'render(circle)' or 'Drawable d = circle;'.  Returns 0 when no
 +   conversion applies. */
-+static int superc_iface_convert(CType *dt)
++static int c6_iface_convert(CType *dt)
 +{
-+    SupercIface *ifc;
-+    SupercImpl *imp;
++    C6Iface *ifc;
++    C6Impl *imp;
 +    Sym *vs;
 +    int size, align, loc2;
 +
-+    if (!tcc_state->superc_ext || tcc_state->superc_nb_impls == 0)
++    if (!tcc_state->c6_ext || tcc_state->c6_nb_impls == 0)
 +        return 0;
 +    if ((vtop->type.t & VT_BTYPE) != VT_STRUCT || !vtop->type.ref)
 +        return 0;
-+    ifc = superc_iface_of_type(dt);
++    ifc = c6_iface_of_type(dt);
 +    if (!ifc)
 +        return 0;
-+    imp = superc_impl_find(ifc, vtop->type.ref->v & ~SYM_STRUCT);
++    imp = c6_impl_find(ifc, vtop->type.ref->v & ~SYM_STRUCT);
 +    if (!imp)
 +        return 0;
 +    vs = sym_find(imp->vt_tok);
@@ -1094,30 +1094,30 @@ index b00e0a6..9449490 100644
 +    return 1;
 +}
 +
-+static int superc_ext_on(void)
++static int c6_ext_on(void)
 +{
-+    return tcc_state->superc_ext;
++    return tcc_state->c6_ext;
 +}
 +
-+static Sym *superc_new_label(const char *tag)
++static Sym *c6_new_label(const char *tag)
 +{
 +    char buf[64];
 +    int v;
-+    snprintf(buf, sizeof(buf), "__tcc_%s_%d", tag, ++superc_label_seq);
++    snprintf(buf, sizeof(buf), "__tcc_%s_%d", tag, ++c6_label_seq);
 +    v = tok_alloc_const(buf);
 +    return label_push(&global_label_stack, v, LABEL_FORWARD);
 +}
 +
-+static void superc_def_label(Sym *s)
++static void c6_def_label(Sym *s)
 +{
 +    s->r = LABEL_DEFINED;
 +    s->jind = gind();
 +    s->cleanupstate = cur_scope->cl.s;
 +}
 +
-+static void superc_add_site(int id, Sym *label)
++static void c6_add_site(int id, Sym *label)
 +{
-+    SupercDeferSite *s = tcc_malloc(sizeof *s);
++    C6DeferSite *s = tcc_malloc(sizeof *s);
 +    s->id = id;
 +    s->label = label;
 +    s->next = NULL;
@@ -1125,9 +1125,9 @@ index b00e0a6..9449490 100644
 +    defer_state.sites_tail = &s->next;
 +}
 +
-+static void superc_add_resume(int id, Sym *label)
++static void c6_add_resume(int id, Sym *label)
 +{
-+    SupercDeferResume *r = tcc_malloc(sizeof *r);
++    C6DeferResume *r = tcc_malloc(sizeof *r);
 +    r->id = id;
 +    r->label = label;
 +    r->next = NULL;
@@ -1135,10 +1135,10 @@ index b00e0a6..9449490 100644
 +    defer_state.resumes_tail = &r->next;
 +}
 +
-+static void superc_free_lists(void)
++static void c6_free_lists(void)
 +{
-+    SupercDeferSite *s, *sn;
-+    SupercDeferResume *r, *rn;
++    C6DeferSite *s, *sn;
++    C6DeferResume *r, *rn;
 +    for (s = defer_state.sites; s; s = sn) {
 +        sn = s->next;
 +        tcc_free(s);
@@ -1153,7 +1153,7 @@ index b00e0a6..9449490 100644
 +    defer_state.resumes_tail = &defer_state.resumes;
 +}
 +
-+static void superc_defer_func_init(void)
++static void c6_defer_func_init(void)
 +{
 +    int align = PTR_SIZE;
 +    defer_state.enabled = 1;
@@ -1162,7 +1162,7 @@ index b00e0a6..9449490 100644
 +    defer_state.next_site = 0;
 +    defer_state.next_resume = 0;
 +    defer_state.disp_jmps = 0;
-+    superc_free_lists();
++    c6_free_lists();
 +    loc = (loc - (int)sizeof(int)) & -align;
 +    defer_state.sp0_off = loc;
 +    loc = (loc - (int)sizeof(int)) & -align;
@@ -1176,14 +1176,14 @@ index b00e0a6..9449490 100644
 +}
 +
 +/* emit "begin cleanup" (mode 0: scopes above DEPTH, mode 1: whole function) */
-+static void superc_defer_begin(int mode, int depth)
++static void c6_defer_begin(int mode, int depth)
 +{
 +    int rid;
 +    Sym *rl;
 +    if (!defer_state.enabled || !defer_state.has_sites || nocode_wanted)
 +        return;
 +    rid = ++defer_state.next_resume;
-+    rl = superc_new_label("drs");
++    rl = c6_new_label("drs");
 +    /* third argument: this frame's defer stack base */
 +    if (mode == 0) {
 +        vpush_helper_func(tok_alloc_const("__tcc_defer_begin_scope"));
@@ -1198,14 +1198,14 @@ index b00e0a6..9449490 100644
 +    gfunc_call(3);
 +    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
 +    /* resume point: execution continues right after the cleanup run */
-+    superc_def_label(rl);
-+    superc_add_resume(rid, rl);
++    c6_def_label(rl);
++    c6_add_resume(rid, rl);
 +}
 +
 +/* parse "defer STATEMENT" / "errdefer STATEMENT": register a cleanup site,
 +   compile the body into a cleanup block that is skipped over at
 +   registration time.  KIND selects defer (0) or errdefer (1). */
-+static void superc_defer_parse(int kind)
++static void c6_defer_parse(int kind)
 +{
 +    int skip = 0, id;
 +    Sym *l = NULL;
@@ -1213,15 +1213,15 @@ index b00e0a6..9449490 100644
 +    defer_state.body_depth++;
 +    if (!nocode_wanted) {
 +        id = ++defer_state.next_site;
-+        l = superc_new_label("dcl");
++        l = c6_new_label("dcl");
 +        vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
 +        vpushi(id);
 +        vpushi(local_scope);
 +        vpushi(kind);
 +        gfunc_call(3);
 +        skip = gjmp(0);
-+        superc_def_label(l);
-+        superc_add_site(id, l);
++        c6_def_label(l);
++        c6_add_site(id, l);
 +        defer_state.has_sites = 1;
 +    }
 +    block(STMT_COMPOUND);
@@ -1232,15 +1232,15 @@ index b00e0a6..9449490 100644
 +    defer_state.body_depth--;
 +}
 +
-+static void superc_errdefer_parse(void)
++static void c6_errdefer_parse(void)
 +{
-+    superc_defer_parse(1);
++    c6_defer_parse(1);
 +}
 +
 +/* parse "err(ID, MSG)" or "err()": record the error, run the error-path
 +   cleanups (errdefer and defer) of the whole function frame and return the
 +   sentinel value so that callers can propagate. */
-+static void superc_err_parse(void)
++static void c6_err_parse(void)
 +{
 +    int b, ret_off = 0, ret_saved = 0;
 +
@@ -1274,7 +1274,7 @@ index b00e0a6..9449490 100644
 +        vpop();
 +    }
 +    if (defer_state.has_sites)
-+        superc_defer_begin(2, 0);
++        c6_defer_begin(2, 0);
 +    if (ret_saved)
 +        vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
 +    if (b)
@@ -1287,10 +1287,10 @@ index b00e0a6..9449490 100644
 +/* parse 'test "description" { ... }' at file scope: synthesize
 +   'static int __tcc_test_N(void) { ... }' and remember the description
 +   so that -test can run it. */
-+static void superc_test_parse(void)
++static void c6_test_parse(void)
 +{
 +    TCCState *s1 = tcc_state;
-+    SupercTestEntry *e;
++    C6TestEntry *e;
 +    CType ft;
 +    Sym *fs, *sym;
 +    AttributeDef ad;
@@ -1300,7 +1300,7 @@ index b00e0a6..9449490 100644
 +    next();             /* skip the 'test' keyword */
 +    if (tok != TOK_STR)
 +        expect("string");
-+    snprintf(name, sizeof(name), "__tcc_test_%d", s1->superc_test_count);
++    snprintf(name, sizeof(name), "__tcc_test_%d", s1->c6_test_count);
 +    {
 +        int n = 0;
 +        /* the description token value is the decoded string */
@@ -1312,7 +1312,7 @@ index b00e0a6..9449490 100644
 +        memcpy(e->desc, d, n + 1);
 +        e->fn_name = tcc_strdup(name);
 +    }
-+    dynarray_add(&s1->superc_tests, &s1->superc_test_count, e);
++    dynarray_add(&s1->c6_tests, &s1->c6_test_count, e);
 +    v = tok_alloc_const(name);
 +
 +    next();             /* skip the description */
@@ -1329,22 +1329,22 @@ index b00e0a6..9449490 100644
 +    sym = external_sym(v, &ft, 0, &ad);
 +
 +    cur_text_section = text_section;
-+    superc_implicit_ret0 = 1;
++    c6_implicit_ret0 = 1;
 +    gen_function(sym);
 +}
 +
 +/* emit the per-function cleanup dispatcher */
-+static void superc_defer_func_end(void)
++static void c6_defer_func_end(void)
 +{
-+    SupercDeferSite *s;
-+    SupercDeferResume *r;
++    C6DeferSite *s;
++    C6DeferResume *r;
 +    int fall;
 +
 +    if (!defer_state.enabled)
 +        return;
 +    if (!defer_state.has_sites && !defer_state.resumes) {
 +        /* no defer/errdefer in this function: nothing to dispatch */
-+        superc_free_lists();
++        c6_free_lists();
 +        defer_state.enabled = 0;
 +        return;
 +    }
@@ -1379,10 +1379,10 @@ index b00e0a6..9449490 100644
 +        gsym(j);
 +    }
 +    gsym(fall);
-+    superc_free_lists();
++    c6_free_lists();
 +    defer_state.enabled = 0;
 +}
-+#endif /* TCC_EXT */
++#endif /* C6_EXT */
 +
  /* ------------------------------------------------------------------------- */
  /* VLA */
@@ -1396,9 +1396,9 @@ index b00e0a6..9449490 100644
  
  static void prev_scope(struct scope *o, int is_expr)
  {
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    if (defer_state.enabled && !nocode_wanted && o->depth > 0)
-+        superc_defer_begin(0, o->depth - 1);
++        c6_defer_begin(0, o->depth - 1);
 +#endif
      vla_leave(o->prev);
  
@@ -1407,12 +1407,12 @@ index b00e0a6..9449490 100644
  {
      if (!o)
          return;
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    if (defer_state.enabled && !nocode_wanted) {
 +        if (o == root_scope)
-+            superc_defer_begin(1, 0);
++            c6_defer_begin(1, 0);
 +        else
-+            superc_defer_begin(0, o->depth);
++            c6_defer_begin(0, o->depth);
 +    }
 +#endif
      try_call_scope_cleanup(o->cl.s);
@@ -1422,7 +1422,7 @@ index b00e0a6..9449490 100644
  static void block(int flags)
  {
      int a, b, c, d, e, t;
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    int ret_off, ret_saved;
 +#endif
      struct scope o;
@@ -1432,7 +1432,7 @@ index b00e0a6..9449490 100644
              check_func_return();
  
      } else if (t == TOK_RETURN) {
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        if (defer_state.body_depth > 0)
 +            tcc_error("'return' is not allowed in a defer body");
 +        ret_off = 0;
@@ -1445,7 +1445,7 @@ index b00e0a6..9449490 100644
              tcc_warning("'return' with no value");
              b = 0;
          }
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        /* protect the return value from cleanup calls */
 +        if (b && defer_state.enabled && defer_state.has_sites) {
 +            int align, size = type_size(&func_vt, &align);
@@ -1459,7 +1459,7 @@ index b00e0a6..9449490 100644
 +        }
 +#endif
          leave_scope(root_scope);
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        if (ret_saved)
 +            vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
 +#endif
@@ -1472,7 +1472,7 @@ index b00e0a6..9449490 100644
 +           active the jump is required: the function-exit dispatcher must
 +           not be reached by falling through) */
 +        if (tok != '}' || local_scope != 1
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            || defer_state.enabled
 +#endif
 +            )
@@ -1482,7 +1482,7 @@ index b00e0a6..9449490 100644
          CODE_OFF();
  
      } else if (t == TOK_BREAK) {
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        if (defer_state.body_depth > 0)
 +            tcc_error("'break' is not allowed in a defer body");
 +#endif
@@ -1493,7 +1493,7 @@ index b00e0a6..9449490 100644
          skip(';');
  
      } else if (t == TOK_CONTINUE) {
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        if (defer_state.body_depth > 0)
 +            tcc_error("'continue' is not allowed in a defer body");
 +#endif
@@ -1504,24 +1504,24 @@ index b00e0a6..9449490 100644
          *cur_scope->csym = gjmp(*cur_scope->csym);
          skip(';');
  
-+#ifdef TCC_EXT
-+    } else if (t == TOK_SUPERC_DEFER) {
-+        if (!superc_ext_on())
-+            tcc_error("'defer' requires -std=tcc-ext");
++#ifdef C6_EXT
++    } else if (t == TOK_C6_DEFER) {
++        if (!c6_ext_on())
++            tcc_error("'defer' requires -std=c6");
 +        else
-+            superc_defer_parse(0);
++            c6_defer_parse(0);
 +
-+    } else if (t == TOK_SUPERC_ERRDEFER) {
-+        if (!superc_ext_on())
-+            tcc_error("'errdefer' requires -std=tcc-ext");
++    } else if (t == TOK_C6_ERRDEFER) {
++        if (!c6_ext_on())
++            tcc_error("'errdefer' requires -std=c6");
 +        else
-+            superc_errdefer_parse();
++            c6_errdefer_parse();
 +
-+    } else if (t == TOK_SUPERC_ERR) {
-+        if (!superc_ext_on())
-+            tcc_error("'err' requires -std=tcc-ext");
++    } else if (t == TOK_C6_ERR) {
++        if (!c6_ext_on())
++            tcc_error("'err' requires -std=c6");
 +        else
-+            superc_err_parse();
++            c6_err_parse();
 +#endif
 +
      } else if (t == TOK_FOR) {
@@ -1531,7 +1531,7 @@ index b00e0a6..9449490 100644
          goto block_after_label;
  
      } else if (t == TOK_GOTO) {
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        if (defer_state.body_depth > 0)
 +            tcc_error("'goto' is not allowed in a defer body");
 +#endif
@@ -1542,16 +1542,16 @@ index b00e0a6..9449490 100644
              } else {
                  s = label_push(&global_label_stack, t, LABEL_DEFINED);
              }
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            s->defer_depth = local_scope;
 +#endif
              s->jind = gind();
              s->cleanupstate = cur_scope->cl.s;
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            /* every label entry point dispatches deferred calls that belong
 +               to scopes being left by the goto */
 +            if (defer_state.enabled && !nocode_wanted)
-+                superc_defer_begin(0, s->defer_depth);
++                c6_defer_begin(0, s->defer_depth);
 +#endif
  
      block_after_label:
@@ -1560,32 +1560,32 @@ index b00e0a6..9449490 100644
      nb_temp_local_vars = 0;
  
      gfunc_prolog(sym);
-+#ifdef TCC_EXT
-+    if (tcc_state->superc_ext)
-+        superc_defer_func_init();
++#ifdef C6_EXT
++    if (tcc_state->c6_ext)
++        c6_defer_func_init();
 +#endif
      tcc_debug_prolog_epilog(tcc_state, 0);
      func_vla_arg(sym);
      block(0);
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    if (defer_state.enabled) {
 +        /* fall-through function exit also runs the cleanups; the dispatcher
 +           itself must be emitted even if the body ended with a jump. */
 +        if (!nocode_wanted) {
-+            superc_defer_begin(1, 0);
-+            if (superc_implicit_ret0) {
++            c6_defer_begin(1, 0);
++            if (c6_implicit_ret0) {
 +                vpushi(0);
 +                gfunc_return(&func_vt);
 +            } else {
 +                rsym = gjmp(rsym); /* after the cleanups: function epilogue */
 +            }
 +        }
-+        superc_defer_func_end();
-+    } else if (superc_implicit_ret0 && !nocode_wanted) {
++        c6_defer_func_end();
++    } else if (c6_implicit_ret0 && !nocode_wanted) {
 +        vpushi(0);
 +        gfunc_return(&func_vt);
 +    }
-+    superc_implicit_ret0 = 0;
++    c6_implicit_ret0 = 0;
 +#endif
      gsym(rsym);
      nocode_wanted = 0;
@@ -1594,26 +1594,26 @@ index b00e0a6..9449490 100644
      while (1) {
  
          oldint = 0;
-+#ifdef TCC_EXT
-+        if (l == VT_CONST && tcc_state->superc_ext) {
-+            if (superc_is_test_kw(tok)) {
-+                superc_test_parse();
++#ifdef C6_EXT
++        if (l == VT_CONST && tcc_state->c6_ext) {
++            if (c6_is_test_kw(tok)) {
++                c6_test_parse();
 +                continue;
 +            }
-+            if (tok == TOK_SUPERC_PACKAGE) {
-+                superc_package_parse();
++            if (tok == TOK_C6_PACKAGE) {
++                c6_package_parse();
 +                continue;
 +            }
-+            if (tok == TOK_SUPERC_IMPORT) {
-+                superc_import_parse();
++            if (tok == TOK_C6_IMPORT) {
++                c6_import_parse();
 +                continue;
 +            }
-+            if (tok == TOK_SUPERC_INTERFACE) {
-+                superc_interface_parse();
++            if (tok == TOK_C6_INTERFACE) {
++                c6_interface_parse();
 +                continue;
 +            }
-+            if (tok == TOK_SUPERC_IMPL) {
-+                superc_impl_parse();
++            if (tok == TOK_C6_IMPL) {
++                c6_impl_parse();
 +                continue;
 +            }
 +        }
@@ -1625,9 +1625,9 @@ index b00e0a6..9449490 100644
                  btype.t = VT_INT;
                  oldint = 1;
              } else {
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +                /* end of a 'package NAME { ... }' body */
-+                if (tok == '}' && tcc_state->superc_package)
++                if (tok == '}' && tcc_state->c6_package)
 +                    break;
 +#endif
                  if (tok != TOK_EOF)
@@ -1637,13 +1637,13 @@ index b00e0a6..9449490 100644
  	    ad = adbase;
              type_decl(&type, &ad, &v, l == VT_CMP ? TYPE_DIRECT | TYPE_PARAM : TYPE_DIRECT);
              /*ptype("decl", &type, v);*/
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            /* symbols declared inside a package are name-mangled; the
 +               program entry point always keeps its name */
-+            if (l == VT_CONST && tcc_state->superc_package
++            if (l == VT_CONST && tcc_state->c6_package
 +                && v >= TOK_UIDENT
 +                && strcmp(get_tok_str(v, NULL), "main") != 0)
-+                v = superc_mangle_tok(tcc_state->superc_package, v);
++                v = c6_mangle_tok(tcc_state->c6_package, v);
 +#endif
              if ((type.t & VT_BTYPE) == VT_FUNC) {
                  if ((type.t & VT_STATIC) && (l != VT_CONST))
@@ -1656,9 +1656,9 @@ index 214e9cd..a1b98cc 100644
      return tok_alloc(str, strlen(str))->tok;
  }
  
-+#ifdef TCC_EXT
-+/* Drop the last interned token again: used to keep the superc keywords
-+   ordinary identifiers unless -std=tcc-ext is active. */
++#ifdef C6_EXT
++/* Drop the last interned token again: used to keep the c6 keywords
++   ordinary identifiers unless -std=c6 is active. */
 +static void tok_unintern(int v)
 +{
 +    TokenSym *ts;
@@ -1701,18 +1701,18 @@ index 214e9cd..a1b98cc 100644
      tcc_debug_newfile(tcc_state);
  }
  
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +/* rename the identifiers marked with '__local' in a '#macro' body.
 +   The whole body is processed before macro arguments are substituted,
 +   so that hygiene does not leak into caller-supplied tokens. */
-+static int superc_local_name(int v, int id)
++static int c6_local_name(int v, int id)
 +{
 +    char buf[512];
 +    snprintf(buf, sizeof buf, "%s__h%d", get_tok_str(v, NULL), id);
 +    return tok_alloc(buf, strlen(buf))->tok;
 +}
 +
-+static int *superc_hygiene_body(const int *body)
++static int *c6_hygiene_body(const int *body)
 +{
 +    static int seq;
 +    TokenString out;
@@ -1755,13 +1755,13 @@ index 214e9cd..a1b98cc 100644
 +            do {
 +                TOK_GET(&t, &p, &cval);
 +            } while (t && (is_space(t) || t == TOK_LINEFEED));
-+            tok_str_add2(&out, superc_local_name(t, id), &cval);
++            tok_str_add2(&out, c6_local_name(t, id), &cval);
 +            continue;
 +        }
 +        if (t >= TOK_IDENT) {
 +            for (i = 0; i < nb; i++)
 +                if (locals[i] == t) {
-+                    t = superc_local_name(t, id);
++                    t = c6_local_name(t, id);
 +                    break;
 +                }
 +        }
@@ -1773,7 +1773,7 @@ index 214e9cd..a1b98cc 100644
 +}
 +
 +/* parse '#macro NAME(params) { body }' */
-+static void parse_superc_macro(void)
++static void parse_c6_macro(void)
 +{
 +    Sym *s, *first, **ps;
 +    int v, t, t0, level;
@@ -1850,12 +1850,12 @@ index 214e9cd..a1b98cc 100644
 +    if (t0 == TOK_PPJOIN)
 +bad_twosharp:
 +        tcc_error("'##' cannot appear at either end of macro");
-+    t |= MACRO_SUPERC_LOCAL;
++    t |= MACRO_C6_LOCAL;
 +    define_push(v, t, str.str, first);
 +    next_nomacro();          /* consume '}' */
 +}
 +
-+#endif /* TCC_EXT */
++#endif /* C6_EXT */
 +
  /* is_bof is true if first non space token at beginning of file */
  ST_FUNC void preprocess(int is_bof)
@@ -1864,12 +1864,12 @@ index 214e9cd..a1b98cc 100644
      case TOK_LINEFEED:
          goto the_end;
      default:
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        if (tok >= TOK_IDENT && tok < tok_ident
 +            && !strcmp(get_tok_str(tok, NULL), "macro")) {
-+            if (!s1->superc_ext)
-+                tcc_error("'#macro' requires -std=tcc-ext");
-+            parse_superc_macro();
++            if (!s1->c6_ext)
++                tcc_error("'#macro' requires -std=c6");
++            parse_c6_macro();
 +            break;
 +        }
 +#endif
@@ -1880,10 +1880,10 @@ index 214e9cd..a1b98cc 100644
          int *jstr;
          Sym *sa;
          int ret;
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        int *hbody = NULL;
-+        if (s->type.t & MACRO_SUPERC_LOCAL)
-+            mstr = hbody = superc_hygiene_body(mstr);
++        if (s->type.t & MACRO_C6_LOCAL)
++            mstr = hbody = c6_hygiene_body(mstr);
 +#endif
  
          if (s->type.t & MACRO_FUNC) {
@@ -1892,7 +1892,7 @@ index 214e9cd..a1b98cc 100644
              tok_str_free_str(jstr);
          if (mstr != s->d)
              tok_str_free_str(mstr);
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        if (hbody && mstr != hbody)
 +            tok_str_free_str(hbody);
 +#endif
@@ -1903,9 +1903,9 @@ index 214e9cd..a1b98cc 100644
  static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
  {
      cstr_printf(cs, "#define __TINYC__ 9%.2s\n", &TCC_VERSION[4]);
-+#ifdef TCC_EXT
-+    if (s1->superc_ext)
-+        putdef(cs, "__TCC_EXT__");
++#ifdef C6_EXT
++    if (s1->c6_ext)
++        putdef(cs, "__C6__");
 +#endif
      putdefs(cs, target_machine_defs);
      putdefs(cs, target_os_defs);
@@ -1914,17 +1914,17 @@ index 214e9cd..a1b98cc 100644
          p = r;
      }
  
-+#ifdef TCC_EXT
-+    if (!s->superc_ext) {
-+        /* The superc keywords are interned last; make them plain
++#ifdef C6_EXT
++    if (!s->c6_ext) {
++        /* The c6 keywords are interned last; make them plain
 +           identifiers when the extension is not enabled.  Note that
 +           'test' may already be interned as an asm keyword, in which
-+           case the range ends before TOK_SUPERC_TEST. */
++           case the range ends before TOK_C6_TEST. */
 +        int t;
-+        for (t = TOK_SUPERC_PACKAGE; t < TOK_SUPERC_TEST && t < tok_ident; t++)
++        for (t = TOK_C6_PACKAGE; t < TOK_C6_TEST && t < tok_ident; t++)
 +            tok_unintern(t);
-+        if (TOK_SUPERC_PACKAGE < tok_ident)
-+            tok_ident = TOK_SUPERC_PACKAGE;
++        if (TOK_C6_PACKAGE < tok_ident)
++            tok_ident = TOK_C6_PACKAGE;
 +    }
 +#endif
 +
@@ -1939,7 +1939,7 @@ index 1003ea5..ccf684d 100644
  #define RT_EXIT_ZERO 0xE0E00E0E /* passed from longjmp instead of '0' */
  
  /* launch the compiled program with the given arguments */
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +/* run all compiled 'test' blocks (the -test option) */
 +static int tcc_run_tests(TCCState *s1)
 +{
@@ -1947,14 +1947,14 @@ index 1003ea5..ccf684d 100644
 +    const char *(*err_msg)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_msg_get");
 +    void (*err_clear)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_clear");
 +
-+    for (i = 0; i < s1->superc_test_count; i++) {
-+        SupercTestEntry *e = s1->superc_tests[i];
++    for (i = 0; i < s1->c6_test_count; i++) {
++        C6TestEntry *e = s1->c6_tests[i];
 +        int (*fn)(void) = (void*)tcc_get_symbol(s1, e->fn_name);
 +        int r;
 +        if (!fn)
 +            continue;
-+        if (s1->superc_test_filter
-+            && !strstr(e->desc, s1->superc_test_filter))
++        if (s1->c6_test_filter
++            && !strstr(e->desc, s1->c6_test_filter))
 +            continue;
 +        ++nrun;
 +        if (err_clear)
@@ -1986,16 +1986,16 @@ index 1003ea5..ccf684d 100644
      char **envp = environ;
  #endif
  
-+#ifdef TCC_EXT
-+    if (s1->superc_test_mode && s1->superc_test_count == 0
++#ifdef C6_EXT
++    if (s1->c6_test_mode && s1->c6_test_count == 0
 +        && s1->nb_errors == 0)
 +        return 0;
 +#endif
      /* tcc -dt -run ... nothing to do if no main() */
 -    if ((s1->dflag & 16) && (addr_t)-1 == get_sym_addr(s1, "main", 0, 1))
 +    if ((s1->dflag & 16) && (addr_t)-1 == get_sym_addr(s1, "main", 0, 1)
-+#ifdef TCC_EXT
-+        && !s1->superc_test_mode
++#ifdef C6_EXT
++        && !s1->c6_test_mode
 +#endif
 +        )
          return 0;
@@ -2005,8 +2005,8 @@ index 1003ea5..ccf684d 100644
      if (tcc_relocate(s1) < 0)
          return -1;
  
-+#ifdef TCC_EXT
-+    if (s1->superc_test_mode)
++#ifdef C6_EXT
++    if (s1->c6_test_mode)
 +        return tcc_run_tests(s1);
 +#endif
 +
@@ -2022,24 +2022,24 @@ index d8e7b44..caa23e9 100644
  #include "riscv64-tok.h"
  #endif
 +
-+#ifdef TCC_EXT
-+     /* superc language extensions (active with -std=tcc-ext) */
-+     DEF(TOK_SUPERC_PACKAGE,   "package")
-+     DEF(TOK_SUPERC_IMPORT,    "import")
-+     DEF(TOK_SUPERC_INTERFACE, "interface")
-+     DEF(TOK_SUPERC_IMPL,      "impl")
-+     DEF(TOK_SUPERC_DEFER,     "defer")
-+     DEF(TOK_SUPERC_ERRDEFER,  "errdefer")
-+     DEF(TOK_SUPERC_ERR,       "err")
-+     DEF(TOK_SUPERC_TEST,      "test")
++#ifdef C6_EXT
++     /* c6 language extensions (active with -std=c6) */
++     DEF(TOK_C6_PACKAGE,   "package")
++     DEF(TOK_C6_IMPORT,    "import")
++     DEF(TOK_C6_INTERFACE, "interface")
++     DEF(TOK_C6_IMPL,      "impl")
++     DEF(TOK_C6_DEFER,     "defer")
++     DEF(TOK_C6_ERRDEFER,  "errdefer")
++     DEF(TOK_C6_ERR,       "err")
++     DEF(TOK_C6_TEST,      "test")
 +#endif
-diff --git a/tests/tests2/156_superc_defer.c b/tests/tests2/156_superc_defer.c
+diff --git a/tests/tests2/156_c6_defer.c b/tests/tests2/156_c6_defer.c
 new file mode 100644
 index 0000000..b270286
 --- /dev/null
-+++ b/tests/tests2/156_superc_defer.c
++++ b/tests/tests2/156_c6_defer.c
 @@ -0,0 +1,107 @@
-+/* superc extension: defer */
++/* c6 extension: defer */
 +#include <stdio.h>
 +
 +static char log_buf[512];
@@ -2146,11 +2146,11 @@ index 0000000..b270286
 +    t_rec();
 +    return 0;
 +}
-diff --git a/tests/tests2/156_superc_defer.expect b/tests/tests2/156_superc_defer.expect
+diff --git a/tests/tests2/156_c6_defer.expect b/tests/tests2/156_c6_defer.expect
 new file mode 100644
 index 0000000..5282be6
 --- /dev/null
-+++ b/tests/tests2/156_superc_defer.expect
++++ b/tests/tests2/156_c6_defer.expect
 @@ -0,0 +1,6 @@
 +basic: bodycba
 +loop: iddid
@@ -2158,13 +2158,13 @@ index 0000000..5282be6
 +ret2: -1 ret2log: threeone
 +goto: innerouter
 +rec: 6 4
-diff --git a/tests/tests2/157_superc_err.c b/tests/tests2/157_superc_err.c
+diff --git a/tests/tests2/157_c6_err.c b/tests/tests2/157_c6_err.c
 new file mode 100644
 index 0000000..2522e83
 --- /dev/null
-+++ b/tests/tests2/157_superc_err.c
++++ b/tests/tests2/157_c6_err.c
 @@ -0,0 +1,123 @@
-+/* superc extension: errdefer + err */
++/* c6 extension: errdefer + err */
 +#include <stdio.h>
 +#include <string.h>
 +
@@ -2287,11 +2287,11 @@ index 0000000..2522e83
 +    printf("final-flag=%d\n", __tcc_err_flag_get());
 +    return 0;
 +}
-diff --git a/tests/tests2/157_superc_err.expect b/tests/tests2/157_superc_err.expect
+diff --git a/tests/tests2/157_c6_err.expect b/tests/tests2/157_c6_err.expect
 new file mode 100644
 index 0000000..a555c95
 --- /dev/null
-+++ b/tests/tests2/157_superc_err.expect
++++ b/tests/tests2/157_c6_err.expect
 @@ -0,0 +1,14 @@
 +e1-normal=0 e1-normal: 41
 +flag=0
@@ -2307,13 +2307,13 @@ index 0000000..a555c95
 +ptr=1 ptr: p
 +id=11 msg=ptr
 +final-flag=0
-diff --git a/tests/tests2/158_superc_test.c b/tests/tests2/158_superc_test.c
+diff --git a/tests/tests2/158_c6_test.c b/tests/tests2/158_c6_test.c
 new file mode 100644
 index 0000000..ad3cc03
 --- /dev/null
-+++ b/tests/tests2/158_superc_test.c
++++ b/tests/tests2/158_c6_test.c
 @@ -0,0 +1,61 @@
-+/* superc extension: 'test "desc" { ... }' blocks and -test mode */
++/* c6 extension: 'test "desc" { ... }' blocks and -test mode */
 +#include <stdio.h>
 +
 +int __tcc_err_flag_get(void);
@@ -2374,11 +2374,11 @@ index 0000000..ad3cc03
 +    printf("main should not run\n");
 +    return 0;
 +}
-diff --git a/tests/tests2/158_superc_test.expect b/tests/tests2/158_superc_test.expect
+diff --git a/tests/tests2/158_c6_test.expect b/tests/tests2/158_c6_test.expect
 new file mode 100644
 index 0000000..5fc4185
 --- /dev/null
-+++ b/tests/tests2/158_superc_test.expect
++++ b/tests/tests2/158_c6_test.expect
 @@ -0,0 +1,6 @@
 +PASS: arithmetic works
 +PASS: defer runs inside a test block
@@ -2386,13 +2386,13 @@ index 0000000..5fc4185
 +PASS: strings and loops
 +PASS: helpers propagate errors
 +5 test(s), 0 failure(s)
-diff --git a/tests/tests2/159_superc_package.c b/tests/tests2/159_superc_package.c
+diff --git a/tests/tests2/159_c6_package.c b/tests/tests2/159_c6_package.c
 new file mode 100644
 index 0000000..a1c6d5d
 --- /dev/null
-+++ b/tests/tests2/159_superc_package.c
++++ b/tests/tests2/159_c6_package.c
 @@ -0,0 +1,36 @@
-+/* superc extension: package / import */
++/* c6 extension: package / import */
 +#include <stdio.h>
 +
 +package math {
@@ -2428,24 +2428,24 @@ index 0000000..a1c6d5d
 +    printf("helper=%d\n", math__hidden_helper(41));
 +    return 0;
 +}
-diff --git a/tests/tests2/159_superc_package.expect b/tests/tests2/159_superc_package.expect
+diff --git a/tests/tests2/159_c6_package.expect b/tests/tests2/159_c6_package.expect
 new file mode 100644
 index 0000000..63e3428
 --- /dev/null
-+++ b/tests/tests2/159_superc_package.expect
++++ b/tests/tests2/159_c6_package.expect
 @@ -0,0 +1,5 @@
 +add=5
 +twice=42
 +len=5
 +mangled=30 3
 +helper=42
-diff --git a/tests/tests2/160_superc_interface.c b/tests/tests2/160_superc_interface.c
+diff --git a/tests/tests2/160_c6_interface.c b/tests/tests2/160_c6_interface.c
 new file mode 100644
 index 0000000..5c95819
 --- /dev/null
-+++ b/tests/tests2/160_superc_interface.c
++++ b/tests/tests2/160_c6_interface.c
 @@ -0,0 +1,88 @@
-+/* superc extension: interface / impl (fat pointer + vtable) */
++/* c6 extension: interface / impl (fat pointer + vtable) */
 +#include <stdio.h>
 +
 +interface Shape {
@@ -2533,11 +2533,11 @@ index 0000000..5c95819
 +    printf("sizeof=%d\n", (int)sizeof(Shape));
 +    return 0;
 +}
-diff --git a/tests/tests2/160_superc_interface.expect b/tests/tests2/160_superc_interface.expect
+diff --git a/tests/tests2/160_c6_interface.expect b/tests/tests2/160_c6_interface.expect
 new file mode 100644
 index 0000000..80f15a4
 --- /dev/null
-+++ b/tests/tests2/160_superc_interface.expect
++++ b/tests/tests2/160_c6_interface.expect
 @@ -0,0 +1,6 @@
 +circle:75 rect:24 total=99
 +[circle][rect]
@@ -2545,13 +2545,13 @@ index 0000000..80f15a4
 +[circle][circle]
 +[circle]
 +sizeof=16
-diff --git a/tests/tests2/161_superc_macro.c b/tests/tests2/161_superc_macro.c
+diff --git a/tests/tests2/161_c6_macro.c b/tests/tests2/161_c6_macro.c
 new file mode 100644
 index 0000000..391242b
 --- /dev/null
-+++ b/tests/tests2/161_superc_macro.c
++++ b/tests/tests2/161_c6_macro.c
 @@ -0,0 +1,58 @@
-+/* superc extension: '#macro' with hygienic '__local' names */
++/* c6 extension: '#macro' with hygienic '__local' names */
 +#include <stdio.h>
 +
 +#macro swap(a, b) {
@@ -2609,11 +2609,11 @@ index 0000000..391242b
 +    printf("names: %d\n", (int)sizeof(a));
 +    return 0;
 +}
-diff --git a/tests/tests2/161_superc_macro.expect b/tests/tests2/161_superc_macro.expect
+diff --git a/tests/tests2/161_c6_macro.expect b/tests/tests2/161_c6_macro.expect
 new file mode 100644
 index 0000000..aa2e0b7
 --- /dev/null
-+++ b/tests/tests2/161_superc_macro.expect
++++ b/tests/tests2/161_c6_macro.expect
 @@ -0,0 +1,8 @@
 +swap: 9 3
 +maxv: 9
@@ -2631,17 +2631,17 @@ index 83933e6..27640f5 100644
   SKIP += 145_winarm64_interlocked.test
  endif
  
-+# superc language extension tests: they need a TCC_EXT build and are
-+# always run with '-std=tcc-ext' (gcc cannot compile them, so the
++# c6 language extension tests: they need a C6_EXT build and are
++# always run with '-std=c6' (gcc cannot compile them, so the
 +# .expect files are committed)
-+SUPERC_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_superc_*.c))))
++C6_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_c6_*.c))))
 +# the compiler itself decides whether the extensions are compiled in
-+SUPERC_OK := $(shell echo | $(TCC_LOCAL) -std=tcc-ext -dD -E - 2>/dev/null | grep -q __TCC_EXT__ && echo yes)
-+ifneq (,$(SUPERC_OK))
-+ $(SUPERC_TESTS): FLAGS += -std=tcc-ext
-+ 158_superc_test.test: FLAGS += -test
++C6_OK := $(shell echo | $(TCC_LOCAL) -std=c6 -dD -E - 2>/dev/null | grep -q __C6__ && echo yes)
++ifneq (,$(C6_OK))
++ $(C6_TESTS): FLAGS += -std=c6
++ 158_c6_test.test: FLAGS += -test
 +else
-+ SKIP += $(SUPERC_TESTS)
++ SKIP += $(C6_TESTS)
 +endif
 +
  # Some tests might need arguments

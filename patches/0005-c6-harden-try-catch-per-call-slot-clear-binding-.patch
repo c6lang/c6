@@ -1,7 +1,7 @@
 From eae7039913fb8680c27f94388228376835ee3a69 Mon Sep 17 00:00:00 2001
-From: superc-agent <agent@localhost>
+From: c6-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 18:31:42 +0800
-Subject: [PATCH 5/10] superc: harden try/catch (per-call slot clear, binding
+Subject: [PATCH 5/10] c6: harden try/catch (per-call slot clear, binding
  check)
 
 Review findings:
@@ -15,7 +15,7 @@ Review findings:
   generated; the mark is dropped in expr_type() instead.
 - '({ ... })' no longer consumes the mark, so the enclosing expression
   decides (a statement expression used as a value may still be caught).
-- Reset superc parser state per translation unit so that an error
+- Reset c6 parser state per translation unit so that an error
   longjmp cannot leak into the next tcc state (-dt).
 ---
  tccgen.c | 49 +++++++++++++++++++++++++++++++++----------------
@@ -29,9 +29,9 @@ index 5ad0c66..465c4f6 100644
      *type = vtop->type;
      vpop();
      nocode_wanted--;
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    /* nothing is called in this context, so a 'T!error' mark is moot */
-+    superc_value_fallible = 0;
++    c6_value_fallible = 0;
 +#endif
  }
  
@@ -40,7 +40,7 @@ index 5ad0c66..465c4f6 100644
              /* get return type */
              s = vtop->type.ref;
              next();
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            if (s->f.func_fallible) {
 +                /* a 'T!error' call starts from a clean slot: only the error
 +                   raised by this very call may be observed afterwards, so a
@@ -52,19 +52,19 @@ index 5ad0c66..465c4f6 100644
 +#endif
              sa = s->next; /* first parameter */
              nb_args = regsize = 0;
- #ifdef TCC_EXT
-@@ -8305,11 +8319,15 @@ static int superc_err_flag_jump(void)
+ #ifdef C6_EXT
+@@ -8305,11 +8319,15 @@ static int c6_err_flag_jump(void)
     would drop the error silently, so it is rejected here. */
- static void superc_fallible_use(void)
+ static void c6_fallible_use(void)
  {
--    if (superc_value_fallible) {
--        superc_value_fallible = 0;
+-    if (c6_value_fallible) {
+-        c6_value_fallible = 0;
 -        tcc_error("the result of a 'T!error' function must be used with "
 -                  "'try' or 'catch'");
 -    }
-+    if (!superc_value_fallible)
++    if (!c6_value_fallible)
 +        return;
-+    superc_value_fallible = 0;
++    c6_value_fallible = 0;
 +    /* 'sizeof(f())' / 'typeof(f())' never call f, so there is no error to
 +       lose: just drop the mark instead of rejecting the expression */
 +    if (NOEVAL_WANTED)
@@ -74,10 +74,10 @@ index 5ad0c66..465c4f6 100644
  }
  
  /* push a void value: the expression statement parser always pops one */
-@@ -8355,12 +8373,8 @@ static void superc_try_parse(void)
+@@ -8355,12 +8373,8 @@ static void c6_try_parse(void)
          tcc_error("'try' requires the enclosing function to return 'T!error'");
      next();                             /* skip 'try' */
-     superc_value_fallible = 0;
+     c6_value_fallible = 0;
 -    /* 'try' starts from a clean slot: only errors raised by the operand
 -       itself can be propagated, and the slot is empty afterwards */
 -    save_regs(0);
@@ -86,10 +86,10 @@ index 5ad0c66..465c4f6 100644
 -    unary();                            /* the called function */
 +    unary();                            /* the called function (clears the
 +                                           slot itself before the call) */
-     has_value = superc_save_operand("try", &sv);
-     skip = superc_err_flag_jump();      /* taken when no error is pending */
-     superc_emit_propagate();            /* failure path: clean up + return */
-@@ -8395,9 +8409,14 @@ static void superc_catch_parse(void)
+     has_value = c6_save_operand("try", &sv);
+     skip = c6_err_flag_jump();      /* taken when no error is pending */
+     c6_emit_propagate();            /* failure path: clean up + return */
+@@ -8395,9 +8409,14 @@ static void c6_catch_parse(void)
          if (tok == '(') {
              paren = 1;
              next();
@@ -110,11 +110,11 @@ index 5ad0c66..465c4f6 100644
                  if (flags & STMT_EXPR) {
                      vpop();
 -                    gexpr();
--#ifdef TCC_EXT
--                    superc_fallible_use();  /* 'f();' would drop the error */
+-#ifdef C6_EXT
+-                    c6_fallible_use();  /* 'f();' would drop the error */
 -#endif
 +                    gexpr();   /* the value belongs to the enclosing
 +                                  expression, checked there */
                  } else {
                      gexpr();
- #ifdef TCC_EXT
+ #ifdef C6_EXT

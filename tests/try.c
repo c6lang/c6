@@ -1,11 +1,11 @@
-/* superc 自测：try / catch 的错误传播、错误槽与处理块语义
+/* c6 自测：try / catch 的错误传播、错误槽与处理块语义
  *
  * 全部检查都是对返回值、错误码、错误消息的直接断言，不比较 stdout。
  *
  * 运行（仓库根目录）：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/try.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/try.c
  * 只跑其中一部分：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=catch tests/try.c
+ *   ./tcc/tcc -B tcc -std=c6 -test -test-filter=catch tests/try.c
  */
 #include <stdio.h>
 #include <string.h>
@@ -56,7 +56,7 @@ static void note_err(int id, const char *msg)
     last_msg[i] = '\0';
 }
 
-/* ---- 163_superc_try.c 里的 T!error 辅助函数 ---- */
+/* ---- 163_c6_try.c 里的 T!error 辅助函数 ---- */
 
 /* 会失败（T!error）的函数：err() 等价于带错误码的 return */
 static int!error fetch(int n)
@@ -341,7 +341,7 @@ test "T!error 函数里的 defer 在错误路径上照样执行" {
     err(3, "catch 没有被执行");
 }
 
-/* ==== 163_superc_try.c：原 .expect 的 29 行逐项覆盖 ==== */
+/* ==== 163_c6_try.c：原 .expect 的 29 行逐项覆盖 ==== */
 
 /* 对应 1 ok=21 log=A / propagates(-1) caught 100/negative / 1 err=-1 / 1 flag=0 */
 test "try 传出成功路径的返回值并执行后续语句" {

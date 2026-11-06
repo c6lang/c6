@@ -1,0 +1,25 @@
+From 7d9b2420adb99617bc0309f2257698822a245fc7 Mon Sep 17 00:00:00 2001
+From: c6 <c6@localhost>
+Date: Fri, 6 Nov 2026 23:11:36 +0800
+Subject: [PATCH] c6: list 'c6' in the -std= help text
+
+---
+ tcc.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tcc.c b/tcc.c
+index c2274fb..46a6b62 100644
+--- a/tcc.c
++++ b/tcc.c
+@@ -73,7 +73,11 @@ static const char help[] =
+     "  -bt[N]       link with backtrace (stack dump) support [show max N callers]\n"
+ #endif
+     "Misc. options:\n"
++#ifdef C6_EXT
++    "  -std=version define __STDC_VERSION__ according to version (c11/gnu11/c6)\n"
++#else
+     "  -std=version define __STDC_VERSION__ according to version (c11/gnu11)\n"
++#endif
+     "  -x[c|a|b|n]  specify type of the next infile (C,ASM,BIN,NONE)\n"
+     "  -Bdir        set tcc's private include/library dir\n"
+     "  -M[M]D       generate make dependency file [ignore system files]\n"

@@ -1,6 +1,6 @@
-/* superc 切片 'T[:]' 示例
+/* c6 切片 'T[:]' 示例
  *
- *   ./tcc/tcc -B tcc -std=tcc-ext -run examples/slice_demo.c
+ *   ./tcc/tcc -B tcc -std=c6 -run examples/slice_demo.c
  *
  * 切片是「视图」：{元素指针, 长度} 两个机器字，不拥有元素、不扩容。
  */

@@ -1,7 +1,7 @@
 From 3ab4df277b5aa922b379156ddb350073f3024175 Mon Sep 17 00:00:00 2001
-From: superc <superc@localhost>
+From: c6 <c6@localhost>
 Date: Fri, 6 Nov 2026 22:00:50 +0800
-Subject: [PATCH 11/11] superc: slices 'T[:]' with bounds checking
+Subject: [PATCH 11/11] c6: slices 'T[:]' with bounds checking
 
 Add a slice view type 'T[:]': two machine words '{ T *const data; const
 size_t len; }' with a fixed layout (data at 0, len at PTR_SIZE) that
@@ -35,27 +35,27 @@ const, which is what prevents rebinding it.
 Tests: 175 covers arrays, ranges, struct/array/char elements, function
 parameters and results, struct members, typdefs, compound literals,
 size and alignment; 176 checks the diagnostics; 177 passes and
-returns slices across two units.  tests2 156/156 with TCC_EXT,
+returns slices across two units.  tests2 156/156 with C6_EXT,
 134/134 without.
 ---
  lib/libtcc1.c                               |  47 ++
  tccgen.c                                    | 508 +++++++++++++++++++-
- tests/tests2/175_superc_slice.c             | 119 +++++
- tests/tests2/175_superc_slice.expect        |  16 +
- tests/tests2/176_superc_slice_errors.c      |  82 ++++
- tests/tests2/176_superc_slice_errors.expect |  35 ++
- tests/tests2/177+_superc_slice_tu.c         |  18 +
- tests/tests2/177_superc_slice_tu.c          |  23 +
- tests/tests2/177_superc_slice_tu.expect     |   3 +
+ tests/tests2/175_c6_slice.c             | 119 +++++
+ tests/tests2/175_c6_slice.expect        |  16 +
+ tests/tests2/176_c6_slice_errors.c      |  82 ++++
+ tests/tests2/176_c6_slice_errors.expect |  35 ++
+ tests/tests2/177+_c6_slice_tu.c         |  18 +
+ tests/tests2/177_c6_slice_tu.c          |  23 +
+ tests/tests2/177_c6_slice_tu.expect     |   3 +
  tests/tests2/Makefile                       |   3 +
  10 files changed, 847 insertions(+), 7 deletions(-)
- create mode 100644 tests/tests2/175_superc_slice.c
- create mode 100644 tests/tests2/175_superc_slice.expect
- create mode 100644 tests/tests2/176_superc_slice_errors.c
- create mode 100644 tests/tests2/176_superc_slice_errors.expect
- create mode 100644 tests/tests2/177+_superc_slice_tu.c
- create mode 100644 tests/tests2/177_superc_slice_tu.c
- create mode 100644 tests/tests2/177_superc_slice_tu.expect
+ create mode 100644 tests/tests2/175_c6_slice.c
+ create mode 100644 tests/tests2/175_c6_slice.expect
+ create mode 100644 tests/tests2/176_c6_slice_errors.c
+ create mode 100644 tests/tests2/176_c6_slice_errors.expect
+ create mode 100644 tests/tests2/177+_c6_slice_tu.c
+ create mode 100644 tests/tests2/177_c6_slice_tu.c
+ create mode 100644 tests/tests2/177_c6_slice_tu.expect
 
 diff --git a/lib/libtcc1.c b/lib/libtcc1.c
 index 86925edd..1e9164c5 100644
@@ -67,7 +67,7 @@ index 86925edd..1e9164c5 100644
  
 +
 +/* ------------------------------------------------------------------------- */
-+/* superc extension runtime: slices 'T[:]'                                   */
++/* c6 extension runtime: slices 'T[:]'                                   */
 +/*                                                                           */
 +/* A slice value is '{ void *data; size_t len; }' with the two words          */
 +/* adjacent, so the compiler only hands over a pointer to such a pair and    */
@@ -116,48 +116,48 @@ diff --git a/tccgen.c b/tccgen.c
 index 05bc38d2..0597a767 100644
 --- a/tccgen.c
 +++ b/tccgen.c
-@@ -177,6 +177,33 @@ typedef struct SupercAutoImpl {
- } SupercAutoImpl;
- static SupercAutoImpl **superc_auto_impls;
- static int superc_nb_auto_impls;
+@@ -177,6 +177,33 @@ typedef struct C6AutoImpl {
+ } C6AutoImpl;
+ static C6AutoImpl **c6_auto_impls;
+ static int c6_nb_auto_impls;
 +/* 'T[:]' slice views: one internal struct per (unqualified) element type,
 +   'struct { T *const data; const size_t len; }'.  The layout is fixed (data
 +   at 0, len at PTR_SIZE) and is the ABI shared with libtcc1 and with other
 +   translation units, so the object is built here instead of going through
 +   struct_layout() (which #pragma pack could alter).  Slice tags live on the
 +   global stack: a type built inside a function must survive the block. */
-+typedef struct SupercSlice {
++typedef struct C6Slice {
 +    CType elem;          /* element type, top level qualifiers dropped */
 +    CType elem_ptr;      /* 'elem *' */
 +    Sym *tag;            /* the internal struct tag */
 +    int elem_size;       /* sizeof(elem) */
-+    struct SupercSlice *next;
-+} SupercSlice;
-+static SupercSlice *superc_slices;
++    struct C6Slice *next;
++} C6Slice;
++static C6Slice *c6_slices;
 +/* the descriptor of TYPE when TYPE is a slice, NULL otherwise */
-+static SupercSlice *superc_slice_of_type(CType *type)
++static C6Slice *c6_slice_of_type(CType *type)
 +{
-+    SupercSlice *sl;
-+    if (!tcc_state->superc_ext)
++    C6Slice *sl;
++    if (!tcc_state->c6_ext)
 +        return NULL;
 +    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
 +        return NULL;
-+    for (sl = superc_slices; sl; sl = sl->next)
++    for (sl = c6_slices; sl; sl = sl->next)
 +        if (sl->tag == type->ref)
 +            return sl;
 +    return NULL;
 +}
  /* non-zero while vtop holds the result of a call to a 'T!error' function */
- static int superc_value_fallible;
+ static int c6_value_fallible;
  /* symbol of the function being compiled (needed by 'try' to check that the
-@@ -220,6 +247,10 @@ static void superc_method_register(int name, int sym_tok, CType *type);
- static SupercMethod *superc_method_lookup(CType *type, int name);
- static int superc_has_field(CType *type, int v);
- static void superc_method_call_prep(SupercMethod *m);
-+static CType superc_slice_ctype(SupercSlice *sl);
-+static SupercSlice *superc_slice_get(CType *elem);
-+static void superc_slice_subscript(void);
-+static int superc_slice_convert(CType *dt);
+@@ -220,6 +247,10 @@ static void c6_method_register(int name, int sym_tok, CType *type);
+ static C6Method *c6_method_lookup(CType *type, int name);
+ static int c6_has_field(CType *type, int v);
+ static void c6_method_call_prep(C6Method *m);
++static CType c6_slice_ctype(C6Slice *sl);
++static C6Slice *c6_slice_get(CType *elem);
++static void c6_slice_subscript(void);
++static int c6_slice_convert(CType *dt);
  static void gen_function(Sym *sym);
  /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
     already interned as TOK_ASM_test, so accept both spellings. */
@@ -165,11 +165,11 @@ index 05bc38d2..0597a767 100644
          pstrcat(buf, buf_size, tstr);
          break;
      case VT_STRUCT:
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +        /* a slice prints as 'elem[:]', so that diagnostics talk about the
 +           type the user wrote instead of the internal struct tag */
 +        {
-+            SupercSlice *sl = superc_slice_of_type(type);
++            C6Slice *sl = c6_slice_of_type(type);
 +            if (sl) {
 +                type_to_str(buf, buf_size, &sl->elem, NULL);
 +                pstrcat(buf, buf_size, "[:]");
@@ -183,20 +183,20 @@ index 05bc38d2..0597a767 100644
 @@ -3881,6 +3924,8 @@ static void verify_assign_cast(CType *dt)
  static void gen_assign_cast(CType *dt)
  {
- #ifdef TCC_EXT
-+    if (superc_slice_convert(dt))
+ #ifdef C6_EXT
++    if (c6_slice_convert(dt))
 +        return;
-     if (superc_iface_convert(dt))
+     if (c6_iface_convert(dt))
          return;
  #endif
 @@ -3898,7 +3943,9 @@ ST_FUNC void vstore(void)
  
      ft = vtop[-1].type.t;
- #ifdef TCC_EXT
--    superc_iface_convert(&vtop[-1].type);
+ #ifdef C6_EXT
+-    c6_iface_convert(&vtop[-1].type);
 +    /* an array assigned to a slice becomes a view of the array */
-+    if (!superc_slice_convert(&vtop[-1].type))
-+        superc_iface_convert(&vtop[-1].type);
++    if (!c6_slice_convert(&vtop[-1].type))
++        c6_iface_convert(&vtop[-1].type);
      ft = vtop[-1].type.t;
  #endif
      sbt = vtop->type.t & VT_BTYPE;
@@ -205,12 +205,12 @@ index 05bc38d2..0597a767 100644
              goto basic_type2;
  
 +        case '[':
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            /* 'T[:]' - a slice type.  A '[' directly after a type specifier
 +               is not valid C (array declarators come after the declarator
 +               name), so only '[:]' is claimed here; anything else, e.g.
 +               'int [3] a;', is handed back to the original code. */
-+            if (tcc_state->superc_ext && typespec_found) {
++            if (tcc_state->c6_ext && typespec_found) {
 +                CType elem, st;
 +                int storage;
 +                next();                 /* skip '[' */
@@ -220,7 +220,7 @@ index 05bc38d2..0597a767 100644
 +                    elem.t = t & ~VT_STORAGE;
 +                    elem.ref = type->ref;
 +                    storage = t & VT_STORAGE;
-+                    st = superc_slice_ctype(superc_slice_get(&elem));
++                    st = c6_slice_ctype(c6_slice_get(&elem));
 +                    t = st.t | storage;
 +                    type->ref = st.ref;
 +                    break;
@@ -236,12 +236,12 @@ index 05bc38d2..0597a767 100644
 @@ -5967,7 +6040,9 @@ ST_FUNC void unary(void)
              } else {
                  unary();
- #ifdef TCC_EXT
+ #ifdef C6_EXT
 -                /* '(Shape)circle' converts explicitly */
 +                /* '(int[:])a' and '(Shape)circle' convert explicitly */
-+                if (superc_slice_convert(&type))
++                if (c6_slice_convert(&type))
 +                    break;
-                 if (superc_iface_convert(&type))
+                 if (c6_iface_convert(&type))
                      break;
  #endif
 @@ -6579,11 +6654,21 @@ special_math_val:
@@ -253,12 +253,12 @@ index 05bc38d2..0597a767 100644
 -            gen_op('+');
 -            indir();
 -            skip(']');
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +            /* a slice subscript and a range are bounds checked and may
 +               produce a value, so they need their own parser; an array or
 +               pointer subscript with no ':' keeps the original code */
-+            if (tcc_state->superc_ext) {
-+                superc_slice_subscript();
++            if (tcc_state->c6_ext) {
++                c6_slice_subscript();
 +            } else
 +#endif
 +            {
@@ -268,10 +268,10 @@ index 05bc38d2..0597a767 100644
 +                indir();
 +                skip(']');
 +            }
- #ifdef TCC_EXT
-             superc_value_fallible = 0;
+ #ifdef C6_EXT
+             c6_value_fallible = 0;
  #endif
-@@ -8162,6 +8247,389 @@ static int superc_emit_auto_impls(void)
+@@ -8162,6 +8247,389 @@ static int c6_emit_auto_impls(void)
      return n;
  }
  
@@ -288,7 +288,7 @@ index 05bc38d2..0597a767 100644
 +/* without any extra declaration.                                      */
 +
 +/* a size_t value: exactly the type 'sizeof' produces */
-+static CType superc_size_type(void)
++static CType c6_size_type(void)
 +{
 +    CType t;
 +    t.t = VT_SIZE_T;
@@ -297,7 +297,7 @@ index 05bc38d2..0597a767 100644
 +}
 +
 +/* the value type of slice SL */
-+static CType superc_slice_ctype(SupercSlice *sl)
++static CType c6_slice_ctype(C6Slice *sl)
 +{
 +    CType t;
 +    t.t = VT_STRUCT;
@@ -308,7 +308,7 @@ index 05bc38d2..0597a767 100644
 +/* like mk_pointer() but the pointer symbol always goes to the global stack:
 +   a slice type is shared by the whole translation unit, so it must not point
 +   at a symbol that is popped when the enclosing block ends */
-+static void superc_global_pointer(CType *type)
++static void c6_global_pointer(CType *type)
 +{
 +    Sym *s = sym_push2(&global_stack, SYM_FIELD, 0, -1);
 +    s->type = *type;
@@ -319,7 +319,7 @@ index 05bc38d2..0597a767 100644
 +/* is the tag of TYPE (through one level of pointer) reachable from file
 +   scope?  A tag declared inside a function is popped with its block while
 +   the slice type lives until the end of the unit. */
-+static int superc_tag_is_global(CType *type)
++static int c6_tag_is_global(CType *type)
 +{
 +    Sym *s;
 +    while ((type->t & VT_BTYPE) == VT_PTR && type->ref)
@@ -332,7 +332,7 @@ index 05bc38d2..0597a767 100644
 +    return 0;
 +}
 +
-+static int superc_is_error_type(CType *type)
++static int c6_is_error_type(CType *type)
 +{
 +    Sym *tag;
 +    while (((type->t & VT_BTYPE) == VT_PTR || (type->t & VT_ARRAY))
@@ -345,9 +345,9 @@ index 05bc38d2..0597a767 100644
 +}
 +
 +/* Build (or find) the slice type whose elements are ELEM. */
-+static SupercSlice *superc_slice_get(CType *elem)
++static C6Slice *c6_slice_get(CType *elem)
 +{
-+    SupercSlice *sl;
++    C6Slice *sl;
 +    CType el = *elem;
 +    int size, align;
 +
@@ -367,23 +367,23 @@ index 05bc38d2..0597a767 100644
 +        type_to_str(buf, sizeof buf, &el, NULL);
 +        tcc_error("'[:]' requires a complete element type, not '%s'", buf);
 +    }
-+    if (superc_is_error_type(&el))
++    if (c6_is_error_type(&el))
 +        tcc_error("'error' can only be a return type, not a slice element");
-+    if (!superc_tag_is_global(&el)) {
++    if (!c6_tag_is_global(&el)) {
 +        char buf[256];
 +        type_to_str(buf, sizeof buf, &el, NULL);
 +        tcc_error("the element type of '[:]' must be declared at file "
 +                  "scope, but '%s' is local", buf);
 +    }
 +
-+    for (sl = superc_slices; sl; sl = sl->next)
++    for (sl = c6_slices; sl; sl = sl->next)
 +        if (is_compatible_types(&sl->elem, &el))
 +            return sl;
 +
 +    sl = tcc_mallocz(sizeof *sl);
 +    sl->elem = el;
 +    sl->elem_ptr = el;
-+    superc_global_pointer(&sl->elem_ptr);
++    c6_global_pointer(&sl->elem_ptr);
 +    sl->elem_size = size;
 +    /* 'struct { elem *const data; const size_t len; }' */
 +    sl->tag = sym_push2(&global_stack, anon_sym++ | SYM_STRUCT, 0,
@@ -395,7 +395,7 @@ index 05bc38d2..0597a767 100644
 +    /* fields in declaration order: struct field chains use 'next', which is
 +       not the link sym_push2 builds, so it is wired up explicitly */
 +    {
-+        CType lt = superc_size_type(), dt = sl->elem_ptr;
++        CType lt = c6_size_type(), dt = sl->elem_ptr;
 +        Sym *scratch = NULL, *data_f, *len_f;
 +        lt.t |= VT_CONSTANT;
 +        dt.t |= VT_CONSTANT;
@@ -413,8 +413,8 @@ index 05bc38d2..0597a767 100644
 +        len_f->next = NULL;
 +        sl->tag->next = data_f;
 +    }
-+    sl->next = superc_slices;
-+    superc_slices = sl;
++    sl->next = c6_slices;
++    c6_slices = sl;
 +    return sl;
 +}
 +
@@ -423,14 +423,14 @@ index 05bc38d2..0597a767 100644
 +   pair, so that the runtime helpers can read both words from it (this is
 +   also the only way to keep the base value while the bounds are evaluated:
 +   local slots survive the calls that a bound expression may generate). */
-+static int superc_slice_spill(SupercSlice *sl)
++static int c6_slice_spill(C6Slice *sl)
 +{
-+    CType sz = superc_size_type();
++    CType sz = c6_size_type();
 +    int off = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
 +
 +    loc = off;
 +    if (sl) {
-+        CType st = superc_slice_ctype(sl);
++        CType st = c6_slice_ctype(sl);
 +        /* the struct layout is exactly the runtime pair */
 +        vset(&st, VT_LOCAL | VT_LVAL, off);
 +        vswap();
@@ -456,7 +456,7 @@ index 05bc38d2..0597a767 100644
 +}
 +
 +/* f(.., a, b, ..): push the pointer to local slot OFF as an argument */
-+static void superc_slice_push_addr(int off)
++static void c6_slice_push_addr(int off)
 +{
 +    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, off);
 +    gaddrof();
@@ -464,7 +464,7 @@ index 05bc38d2..0597a767 100644
 +
 +/* complain about a range applied to something that is neither a slice nor a
 +   complete array */
-+static void superc_slice_base_error(CType *base)
++static void c6_slice_base_error(CType *base)
 +{
 +    if (base->t & VT_VLA)
 +        tcc_error("cannot slice a variable length array");
@@ -479,15 +479,15 @@ index 05bc38d2..0597a767 100644
 +   Consumes '[' ... ']' and leaves the addressed element lvalue (or, for a
 +   range, the resulting slice value) on the value stack.  A plain subscript
 +   of an array or of a pointer keeps the original code generation. */
-+static void superc_slice_subscript(void)
++static void c6_slice_subscript(void)
 +{
-+    SupercSlice *sl, *rsl;
-+    CType sz = superc_size_type(), base, array_elem;
++    C6Slice *sl, *rsl;
++    CType sz = c6_size_type(), base, array_elem;
 +    int have_first = 0, have_array_elem = 0, first_off = 0, pair, res;
 +
 +    next();                              /* '[' */
 +    base = vtop->type;
-+    sl = superc_slice_of_type(&base);
++    sl = c6_slice_of_type(&base);
 +    if ((base.t & VT_ARRAY) && !(base.t & VT_VLA)
 +        && base.ref && base.ref->c >= 0) {
 +        /* remember the element type: the base ends up below the bounds once
@@ -496,7 +496,7 @@ index 05bc38d2..0597a767 100644
 +        have_array_elem = 1;
 +    }
 +    if (tok == ':' && !sl && !have_array_elem)
-+        superc_slice_base_error(&base);
++        c6_slice_base_error(&base);
 +
 +    if (tok != ':') {
 +        gexpr();                         /* index or low bound */
@@ -518,13 +518,13 @@ index 05bc38d2..0597a767 100644
 +        vstore();                        /* also converts to size_t */
 +        vpop();
 +        skip(']');
-+        pair = superc_slice_spill(sl);
++        pair = c6_slice_spill(sl);
 +        res = (loc - PTR_SIZE) & -PTR_SIZE;
 +        loc = res;
 +        /* __tcc_slice_index(&ptr, &pair, idx, elem_size) */
 +        vpush_helper_func(tok_alloc_const("__tcc_slice_index"));
-+        superc_slice_push_addr(res);
-+        superc_slice_push_addr(pair);
++        c6_slice_push_addr(res);
++        c6_slice_push_addr(pair);
 +        vset(&sz, VT_LOCAL | VT_LVAL, first_off);
 +        vpushs(sl->elem_size);
 +        gfunc_call(4);
@@ -536,12 +536,12 @@ index 05bc38d2..0597a767 100644
 +    /* a range: keep the bounds in scratch slots, so that the base value is
 +       back on top of the stack when it is spilled below */
 +    if (!sl && !have_array_elem)
-+        superc_slice_base_error(&base);
++        c6_slice_base_error(&base);
 +    rsl = sl;
 +    if (!rsl)
-+        rsl = superc_slice_get(&array_elem);   /* the array decays */
++        rsl = c6_slice_get(&array_elem);   /* the array decays */
 +    {
-+        CType rt = superc_slice_ctype(rsl);
++        CType rt = c6_slice_ctype(rsl);
 +        int lo_off, hi_off = 0, have_hi = 0;
 +
 +        lo_off = (loc - PTR_SIZE) & -PTR_SIZE;
@@ -566,13 +566,13 @@ index 05bc38d2..0597a767 100644
 +        if (tok == ':')
 +            tcc_error("slice bounds have no capacity");
 +        skip(']');
-+        pair = superc_slice_spill(sl);
++        pair = c6_slice_spill(sl);
 +        res = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
 +        loc = res;
 +        /* __tcc_slice_sub(&out, &pair, lo, hi, elem_size) */
 +        vpush_helper_func(tok_alloc_const("__tcc_slice_sub"));
-+        superc_slice_push_addr(res);
-+        superc_slice_push_addr(pair);
++        c6_slice_push_addr(res);
++        c6_slice_push_addr(pair);
 +        vset(&sz, VT_LOCAL | VT_LVAL, lo_off);
 +        if (have_hi)
 +            vset(&sz, VT_LOCAL | VT_LVAL, hi_off);
@@ -587,21 +587,21 @@ index 05bc38d2..0597a767 100644
 +/* Implicit conversion of a complete array to a slice value, e.g.
 +   'int[:] s = a;', 'f(a)' or 'return a;'.  Returns 0 when no conversion
 +   applies. */
-+static int superc_slice_convert(CType *dt)
++static int c6_slice_convert(CType *dt)
 +{
-+    SupercSlice *sl;
++    C6Slice *sl;
 +    CType *se;
 +    char b1[256], b2[256];
 +
-+    if (!tcc_state->superc_ext)
++    if (!tcc_state->c6_ext)
 +        return 0;
-+    sl = superc_slice_of_type(dt);
++    sl = c6_slice_of_type(dt);
 +    if (!sl)
 +        return 0;
 +    {
 +        /* a slice stays a slice: plain struct copy, but only of its own
 +           element type */
-+        SupercSlice *src = superc_slice_of_type(&vtop->type);
++        C6Slice *src = c6_slice_of_type(&vtop->type);
 +        if (src) {
 +            if (src != sl) {
 +                type_to_str(b1, sizeof b1, &vtop->type, NULL);
@@ -626,15 +626,15 @@ index 05bc38d2..0597a767 100644
 +        if (nocode_wanted & NOEVAL_WANTED) {
 +            /* 'sizeof((T[:])a)' / 'typeof': only the type matters and the
 +               value is discarded, so no code has to be generated */
-+            vtop->type = superc_slice_ctype(sl);
++            vtop->type = c6_slice_ctype(sl);
 +            return 1;
 +        }
 +        if (nocode_wanted & DATA_ONLY_WANTED)
 +            tcc_error("a slice cannot be initialized from an array in a "
 +                      "static initializer; use '{ data, len }'");
 +        {
-+            CType ept = sl->elem_ptr, st = superc_slice_ctype(sl);
-+            CType sz = superc_size_type();
++            CType ept = sl->elem_ptr, st = c6_slice_ctype(sl);
++            CType sz = c6_size_type();
 +            int n = vtop->type.ref->c;
 +            int off = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
 +            loc = off;
@@ -661,18 +661,18 @@ index 05bc38d2..0597a767 100644
  /* drop everything that must not survive into the next translation unit.
     The scanner restarts its token table for every unit, and the state below
     holds tokens and descriptors that would otherwise dangle or leak into the
-@@ -8192,6 +8660,14 @@ static void superc_tu_reset(void)
-     tcc_free(tcc_state->superc_package);
-     tcc_state->superc_package = NULL;
-     superc_self_pending = 0;
+@@ -8192,6 +8660,14 @@ static void c6_tu_reset(void)
+     tcc_free(tcc_state->c6_package);
+     tcc_state->c6_package = NULL;
+     c6_self_pending = 0;
 +    /* the slice descriptors hold Sym pointers into the symbol pools that
 +       tccgen_finish() has released: they must not be looked at again */
-+    while (superc_slices) {
-+        SupercSlice *sl = superc_slices;
-+        superc_slices = sl->next;
++    while (c6_slices) {
++        C6Slice *sl = c6_slices;
++        c6_slices = sl->next;
 +        tcc_free(sl);
 +    }
-+    superc_slices = NULL;
++    c6_slices = NULL;
  }
  
  /* Implicit conversion of a struct value to an interface value, e.g.
@@ -680,10 +680,10 @@ index 05bc38d2..0597a767 100644
      if (debug_modes && !(flags & DIF_SIZE_ONLY) && !p->sec)
          tcc_debug_line(tcc_state), tcc_tcov_check_line (tcc_state, 1);
  
-+#ifdef TCC_EXT
++#ifdef C6_EXT
 +    /* a slice initializer is read as a single value, a string literal
 +       included: 'char[:] m = "text";' views the literal */
-+    if (!(flags & DIF_HAVE_ELEM) && tok != '{' && superc_slice_of_type(type)) {
++    if (!(flags & DIF_HAVE_ELEM) && tok != '{' && c6_slice_of_type(type)) {
 +        int ncw_prev = nocode_wanted;
 +        if ((flags & DIF_SIZE_ONLY) && !p->sec)
 +            ++nocode_wanted;
@@ -699,8 +699,8 @@ index 05bc38d2..0597a767 100644
              && is_compatible_unqualified_types(type, &vtop->type)) {
          goto one_elem;
  
-+#ifdef TCC_EXT
-+    } else if ((flags & DIF_HAVE_ELEM) && superc_slice_convert(type)) {
++#ifdef C6_EXT
++    } else if ((flags & DIF_HAVE_ELEM) && c6_slice_convert(type)) {
 +        /* 'int[:] s = array;': vtop now holds the slice value */
 +        goto one_elem;
 +#endif
@@ -708,13 +708,13 @@ index 05bc38d2..0597a767 100644
      } else if ((type->t & VT_BTYPE) == VT_STRUCT) {
          no_oblock = 1;
          if ((flags & DIF_FIRST) || tok == '{') {
-diff --git a/tests/tests2/175_superc_slice.c b/tests/tests2/175_superc_slice.c
+diff --git a/tests/tests2/175_c6_slice.c b/tests/tests2/175_c6_slice.c
 new file mode 100644
 index 00000000..11f8a110
 --- /dev/null
-+++ b/tests/tests2/175_superc_slice.c
++++ b/tests/tests2/175_c6_slice.c
 @@ -0,0 +1,119 @@
-+/* superc extension: slices 'T[:]' */
++/* c6 extension: slices 'T[:]' */
 +#include <stdio.h>
 +
 +struct Pair { int a, b; };
@@ -833,11 +833,11 @@ index 00000000..11f8a110
 +    }
 +    return 0;
 +}
-diff --git a/tests/tests2/175_superc_slice.expect b/tests/tests2/175_superc_slice.expect
+diff --git a/tests/tests2/175_c6_slice.expect b/tests/tests2/175_c6_slice.expect
 new file mode 100644
 index 00000000..514e5426
 --- /dev/null
-+++ b/tests/tests2/175_superc_slice.expect
++++ b/tests/tests2/175_c6_slice.expect
 @@ -0,0 +1,16 @@
 +len=5 s0=10 s4=50
 +data=1
@@ -855,13 +855,13 @@ index 00000000..514e5426
 +sizes=16,4,8
 +bumped=100,51
 +post=22 j=2
-diff --git a/tests/tests2/176_superc_slice_errors.c b/tests/tests2/176_superc_slice_errors.c
+diff --git a/tests/tests2/176_c6_slice_errors.c b/tests/tests2/176_c6_slice_errors.c
 new file mode 100644
 index 00000000..3a176f3c
 --- /dev/null
-+++ b/tests/tests2/176_superc_slice_errors.c
++++ b/tests/tests2/176_c6_slice_errors.c
 @@ -0,0 +1,82 @@
-+/* superc extension: diagnostics for slices 'T[:]' */
++/* c6 extension: diagnostics for slices 'T[:]' */
 +struct S;
 +
 +#if defined test_void_element
@@ -943,54 +943,54 @@ index 00000000..3a176f3c
 +    return (int)s.len == 2 && s[0] == 2 ? 0 : 1;
 +}
 +#endif
-diff --git a/tests/tests2/176_superc_slice_errors.expect b/tests/tests2/176_superc_slice_errors.expect
+diff --git a/tests/tests2/176_c6_slice_errors.expect b/tests/tests2/176_c6_slice_errors.expect
 new file mode 100644
 index 00000000..3db4cd77
 --- /dev/null
-+++ b/tests/tests2/176_superc_slice_errors.expect
++++ b/tests/tests2/176_c6_slice_errors.expect
 @@ -0,0 +1,35 @@
 +[test_void_element]
-+176_superc_slice_errors.c:5: error: '[:]' cannot have a 'void' element type
++176_c6_slice_errors.c:5: error: '[:]' cannot have a 'void' element type
 +
 +[test_incomplete_element]
-+176_superc_slice_errors.c:8: error: '[:]' requires a complete element type, not 'struct S'
++176_c6_slice_errors.c:8: error: '[:]' requires a complete element type, not 'struct S'
 +
 +[test_local_element]
-+176_superc_slice_errors.c:15: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
++176_c6_slice_errors.c:15: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
 +
 +[test_error_element]
-+176_superc_slice_errors.c:19: error: 'error' can only be a return type, not a slice element
++176_c6_slice_errors.c:19: error: 'error' can only be a return type, not a slice element
 +
 +[test_element_mismatch]
-+176_superc_slice_errors.c:25: error: cannot make a slice of 'char' from an array of 'int'
++176_c6_slice_errors.c:25: error: cannot make a slice of 'char' from an array of 'int'
 +
 +[test_pointer_source]
-+176_superc_slice_errors.c:33: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
++176_c6_slice_errors.c:33: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
 +
 +[test_vla_source]
-+176_superc_slice_errors.c:41: error: cannot slice a variable length array
++176_c6_slice_errors.c:41: error: cannot slice a variable length array
 +
 +[test_pointer_slice]
-+176_superc_slice_errors.c:49: error: cannot slice a pointer; use '(T[:]){p, n}'
++176_c6_slice_errors.c:49: error: cannot slice a pointer; use '(T[:]){p, n}'
 +
 +[test_capacity]
-+176_superc_slice_errors.c:56: error: slice bounds have no capacity
++176_c6_slice_errors.c:56: error: slice bounds have no capacity
 +
 +[test_file_scope_array]
-+176_superc_slice_errors.c:60: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
++176_c6_slice_errors.c:60: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
 +
 +[test_uninitialized]
-+176_superc_slice_errors.c:65: error: variable 's' must be initialized
++176_c6_slice_errors.c:65: error: variable 's' must be initialized
 +
 +[test_slice_to_int]
-+176_superc_slice_errors.c:73: error: cannot convert 'int[:]' to 'int'
-diff --git a/tests/tests2/177+_superc_slice_tu.c b/tests/tests2/177+_superc_slice_tu.c
++176_c6_slice_errors.c:73: error: cannot convert 'int[:]' to 'int'
+diff --git a/tests/tests2/177+_c6_slice_tu.c b/tests/tests2/177+_c6_slice_tu.c
 new file mode 100644
 index 00000000..ac9e583f
 --- /dev/null
-+++ b/tests/tests2/177+_superc_slice_tu.c
++++ b/tests/tests2/177+_c6_slice_tu.c
 @@ -0,0 +1,18 @@
-+/* superc extension: definitions for 177_superc_slice_tu.c */
++/* c6 extension: definitions for 177_c6_slice_tu.c */
 +int sum(int[:] s)
 +{
 +    int i = 0, total = 0;
@@ -1008,18 +1008,18 @@ index 00000000..ac9e583f
 +{
 +    return s.len > 0 ? s[0] : -1;
 +}
-diff --git a/tests/tests2/177_superc_slice_tu.c b/tests/tests2/177_superc_slice_tu.c
+diff --git a/tests/tests2/177_c6_slice_tu.c b/tests/tests2/177_c6_slice_tu.c
 new file mode 100644
 index 00000000..72795dc5
 --- /dev/null
-+++ b/tests/tests2/177_superc_slice_tu.c
++++ b/tests/tests2/177_c6_slice_tu.c
 @@ -0,0 +1,23 @@
-+/* superc extension: a slice API shared by two translation units.
++/* c6 extension: a slice API shared by two translation units.
 +   Each unit declares 'int[:]' itself; the layout is the same on both
 +   sides, so no extra declaration is needed. */
 +#include <stdio.h>
 +
-+/* defined in 177+_superc_slice_tu.c */
++/* defined in 177+_c6_slice_tu.c */
 +int sum(int[:] s);
 +int[:] tail(int[:] s);
 +int first(int[:] s);
@@ -1037,11 +1037,11 @@ index 00000000..72795dc5
 +    printf("sum2=%d\n", sum(a[1:3]));
 +    return 0;
 +}
-diff --git a/tests/tests2/177_superc_slice_tu.expect b/tests/tests2/177_superc_slice_tu.expect
+diff --git a/tests/tests2/177_c6_slice_tu.expect b/tests/tests2/177_c6_slice_tu.expect
 new file mode 100644
 index 00000000..11f85ee9
 --- /dev/null
-+++ b/tests/tests2/177_superc_slice_tu.expect
++++ b/tests/tests2/177_c6_slice_tu.expect
 @@ -0,0 +1,3 @@
 +sum=15 first=1
 +tail=4,2,5
@@ -1050,23 +1050,23 @@ diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
 index 5c7e39ae..931a1b61 100644
 --- a/tests/tests2/Makefile
 +++ b/tests/tests2/Makefile
-@@ -93,6 +93,7 @@ ifneq (,$(SUPERC_OK))
-  165_superc_init.test: FLAGS += -dt
-  167_superc_pkg_dot_errors.test: FLAGS += -dt
-  170_superc_method_errors.test: FLAGS += -dt
-+ 176_superc_slice_errors.test: FLAGS += -dt
+@@ -93,6 +93,7 @@ ifneq (,$(C6_OK))
+  165_c6_init.test: FLAGS += -dt
+  167_c6_pkg_dot_errors.test: FLAGS += -dt
+  170_c6_method_errors.test: FLAGS += -dt
++ 176_c6_slice_errors.test: FLAGS += -dt
   # these compile a second file before '-run'
-  168_superc_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
-  168_superc_pkg_dot_tu.test: GEN = $(GEN-TCC)
-@@ -100,6 +101,8 @@ ifneq (,$(SUPERC_OK))
-  171_superc_method_tu.test: GEN = $(GEN-TCC)
-  174_superc_iface_tu.test: FLAGS += $(subst 174,174+,$1)
-  174_superc_iface_tu.test: GEN = $(GEN-TCC)
-+ 177_superc_slice_tu.test: FLAGS += $(subst 177,177+,$1)
-+ 177_superc_slice_tu.test: GEN = $(GEN-TCC)
+  168_c6_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
+  168_c6_pkg_dot_tu.test: GEN = $(GEN-TCC)
+@@ -100,6 +101,8 @@ ifneq (,$(C6_OK))
+  171_c6_method_tu.test: GEN = $(GEN-TCC)
+  174_c6_iface_tu.test: FLAGS += $(subst 174,174+,$1)
+  174_c6_iface_tu.test: GEN = $(GEN-TCC)
++ 177_c6_slice_tu.test: FLAGS += $(subst 177,177+,$1)
++ 177_c6_slice_tu.test: GEN = $(GEN-TCC)
   # 172 mixes an extension unit with a unit built for plain C
-  172_superc_plain_interop.test: NORUN = true
-  172_superc_plain_interop.test: GEN = $(GEN-TCC)
+  172_c6_plain_interop.test: NORUN = true
+  172_c6_plain_interop.test: GEN = $(GEN-TCC)
 -- 
 2.51.0
 

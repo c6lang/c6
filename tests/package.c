@@ -1,7 +1,7 @@
-/* superc 自测：package / import / pkg.member
+/* c6 自测：package / import / pkg.member
  *
  * 运行（仓库根目录）：
- *   ./tcc/tcc -B tcc -std=tcc-ext -test tests/package.c tests/tu/package.c
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/package.c tests/tu/package.c
  */
 #include <stdio.h>
 #include <string.h>
