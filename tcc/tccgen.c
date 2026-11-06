@@ -11084,6 +11084,34 @@ static void c6_rt_end(const char *name, int nargs)
     }
 }
 
+/* Register a cleanup site whose body is one runtime call.  It runs on every
+   exit of the function, and -- being a cleanup -- it runs before the return
+   value is put back into the return registers, so a call emitted here cannot
+   clobber it.  Used for the end-of-main thread join. */
+static void c6_defer_rt_call(const char *name)
+{
+    int skip, id;
+    Sym *l;
+
+    if (!defer_state.enabled || nocode_wanted)
+        return;
+    id = ++defer_state.next_site;
+    l = c6_new_label("dcl");
+    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
+    vpushi(id);
+    vpushi(0);                  /* scope 0: only the function-exit run */
+    vpushi(0);                  /* defer, not errdefer */
+    gfunc_call(3);
+    skip = gjmp(0);
+    c6_def_label(l);
+    c6_add_site(id, l);
+    defer_state.has_sites = 1;
+    c6_rt_begin(name);
+    c6_rt_end(name, 0);
+    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
+    gsym(skip);
+}
+
 /* the parameters of an async signature, skipping the '(void)' spelling */
 static Sym *c6_async_params(CType *ft)
 {
@@ -12125,6 +12153,13 @@ static void gen_function(Sym *sym)
         c6_defer_func_init();
         if (c6_async_cur)
             c6_async_params_copy();
+        /* 'go' threads have no handler to wait for them, so the thread that
+           started them reaps them when it exits.  For main that is a cleanup
+           site: it must run through the same path as 'defer' so the return
+           value survives the call (the return value is only reloaded after
+           the cleanups have run). */
+        else if (funcname && !strcmp(funcname, "main"))
+            c6_defer_rt_call("__c6_th_join_all");
     }
 #endif
     tcc_debug_prolog_epilog(tcc_state, 0);
@@ -12162,15 +12197,6 @@ static void gen_function(Sym *sym)
 #endif
     gsym(rsym);
     nocode_wanted = 0;
-#ifdef C6_EXT
-    /* 'go' threads of main are reaped here: whatever the program does next
-       (return to -run, exit, or a plain executable's teardown) the threads
-       are gone before the code they run can be released */
-    if (tcc_state->c6_ext && funcname && !strcmp(funcname, "main")) {
-        c6_rt_begin("__c6_th_join_all");
-        c6_rt_end("__c6_th_join_all", 0);
-    }
-#endif
     tcc_debug_end_scope(NULL, !func_var);
     tcc_debug_prolog_epilog(tcc_state, 1);
     gfunc_epilog();
