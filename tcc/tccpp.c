@@ -523,6 +523,35 @@ ST_FUNC int tok_alloc_const(const char *str)
     return tok_alloc(str, strlen(str))->tok;
 }
 
+#ifdef C6_EXT
+/* Drop the last interned token again: used to keep the c6 keywords
+   ordinary identifiers unless -std=c6 is active. */
+static void tok_unintern(int v)
+{
+    TokenSym *ts;
+    TokenSym **pts;
+    unsigned int h;
+    int i;
+
+    if (!table_ident || v < TOK_IDENT || v >= tok_ident)
+        return;
+    ts = table_ident[v - TOK_IDENT];
+    if (!ts || ts->tok != v)
+        return;
+    h = TOK_HASH_INIT;
+    for (i = 0; i < ts->len; i++)
+        h = TOK_HASH_FUNC(h, ((unsigned char *)ts->str)[i]);
+    h &= (TOK_HASH_SIZE - 1);
+    pts = &hash_ident[h];
+    while (*pts && *pts != ts)
+        pts = &(*pts)->hash_next;
+    if (*pts)
+        *pts = ts->hash_next;
+    tal_free(&toksym_alloc, ts);
+    table_ident[v - TOK_IDENT] = NULL;
+}
+#endif
+
 
 /* XXX: buffer overflow */
 /* XXX: float tokens */
@@ -1579,7 +1608,7 @@ ST_FUNC void parse_define(void)
     tok_str_new(&str);
     t0 = 0;
     while (tok != TOK_LINEFEED && tok != TOK_EOF) {
-        if (is_space(tok)) {
+        if (is_space(tok) || tok == TOK_LINEFEED) {
             str.need_spc |= 1;
         } else {
             if (TOK_TWOSHARPS == tok) {
@@ -1788,6 +1817,162 @@ ST_FUNC void tccpp_putfile(const char *filename)
     tcc_debug_newfile(tcc_state);
 }
 
+#ifdef C6_EXT
+/* rename the identifiers marked with '__local' in a '#macro' body.
+   The whole body is processed before macro arguments are substituted,
+   so that hygiene does not leak into caller-supplied tokens. */
+static int c6_local_name(int v, int id)
+{
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s__h%d", get_tok_str(v, NULL), id);
+    return tok_alloc(buf, strlen(buf))->tok;
+}
+
+static int *c6_hygiene_body(const int *body)
+{
+    static int seq;
+    TokenString out;
+    CValue cval;
+    const int *p;
+    int hl, id, t, i, prev, nb = 0, *locals = NULL;
+
+    hl = tok_alloc("__local", 7)->tok;
+    id = ++seq;
+    p = body;
+    prev = 0;
+    for (;;) {
+        TOK_GET(&t, &p, &cval);
+        if (t == 0)
+            break;
+        if (t == hl) {
+            do {
+                TOK_GET(&t, &p, &cval);
+            } while (t && (is_space(t) || t == TOK_LINEFEED));
+            if (t < TOK_IDENT || TOK_HAS_VALUE(t))
+                tcc_error("'__local' must be followed by an identifier");
+            if (prev == '#' || prev == TOK_PPJOIN || prev == TOK_TWOSHARPS)
+                tcc_error("cannot apply '#' or '##' to a '__local' name");
+            locals = tcc_realloc(locals, (nb + 1) * sizeof(int));
+            locals[nb++] = t;
+            prev = t;
+            continue;
+        }
+        if (!is_space(t) && t != TOK_LINEFEED)
+            prev = t;
+    }
+    tok_str_new(&out);
+    p = body;
+    prev = 0;
+    for (;;) {
+        TOK_GET(&t, &p, &cval);
+        if (t == 0)
+            break;
+        if (t == hl) {
+            do {
+                TOK_GET(&t, &p, &cval);
+            } while (t && (is_space(t) || t == TOK_LINEFEED));
+            tok_str_add2(&out, c6_local_name(t, id), &cval);
+            continue;
+        }
+        if (t >= TOK_IDENT) {
+            for (i = 0; i < nb; i++)
+                if (locals[i] == t) {
+                    t = c6_local_name(t, id);
+                    break;
+                }
+        }
+        tok_str_add2(&out, t, &cval);
+    }
+    tok_str_add(&out, 0);
+    tcc_free(locals);
+    return out.str;
+}
+
+/* parse '#macro NAME(params) { body }' */
+static void parse_c6_macro(void)
+{
+    Sym *s, *first, **ps;
+    int v, t, t0, level;
+    int saved_parse_flags = parse_flags;
+    TokenString str;
+
+    next_nomacro();
+    v = tok;
+    if (v < TOK_IDENT || v == TOK_DEFINED)
+        tcc_error("invalid macro name '%s'", get_tok_str(tok, &tokc));
+    first = NULL;
+    t = MACRO_FUNC;
+    parse_flags = ((parse_flags & ~PARSE_FLAG_ASM_FILE) | PARSE_FLAG_SPACES);
+    next_nomacro();
+    parse_flags &= ~PARSE_FLAG_SPACES;
+    if (tok == '(') {
+        int dotid = set_idnum('.', 0);
+        next_nomacro();
+        ps = &first;
+        if (tok != ')') for (;;) {
+            int varg = tok;
+            next_nomacro();
+            if (varg < TOK_IDENT)
+        bad_list:
+                tcc_error("bad macro parameter list");
+            s = sym_push2(&define_stack, varg | SYM_FIELD, 0, 0);
+            *ps = s;
+            ps = &s->next;
+            if (tok == ')')
+                break;
+            if (tok != ',')
+                goto bad_list;
+            next_nomacro();
+        }
+        parse_flags |= PARSE_FLAG_SPACES;
+        next_nomacro();
+        set_idnum('.', dotid);
+    }
+    while (is_space(tok))
+        next_nomacro();
+    if (tok != '{')
+        tcc_error("'{' expected in '#macro' definition");
+    parse_flags |= PARSE_FLAG_ACCEPT_STRAYS | PARSE_FLAG_SPACES;
+    tok_str_new(&str);
+    t0 = 0;
+    level = 1;
+    next_nomacro();
+    while (level > 0) {
+        if (tok == TOK_EOF)
+            tcc_error("unexpected end of file in '#macro' definition");
+        if (tok == '{') {
+            level++;
+        } else if (tok == '}') {
+            level--;
+            if (level == 0)
+                break;
+        }
+        if (is_space(tok) || tok == TOK_LINEFEED) {
+            str.need_spc |= 1;
+        } else {
+            if (TOK_TWOSHARPS == tok) {
+                if (0 == t0)
+                    goto bad_twosharp;
+                tok = TOK_PPJOIN;
+                t |= MACRO_JOIN;
+            }
+            tok_str_add2_spc(&str, tok, &tokc);
+            t0 = tok;
+        }
+        next_nomacro();
+    }
+    parse_flags = saved_parse_flags;
+    tok_str_add(&str, 0);
+    if (t0 == TOK_PPJOIN)
+bad_twosharp:
+        tcc_error("'##' cannot appear at either end of macro");
+    t |= MACRO_C6_LOCAL;
+    define_push(v, t, str.str, first);
+    next_nomacro();          /* consume '}' */
+}
+
+#endif /* C6_EXT */
+
 /* is_bof is true if first non space token at beginning of file */
 ST_FUNC void preprocess(int is_bof)
 {
@@ -1967,6 +2152,15 @@ ST_FUNC void preprocess(int is_bof)
     case TOK_LINEFEED:
         goto the_end;
     default:
+#ifdef C6_EXT
+        if (tok >= TOK_IDENT && tok < tok_ident
+            && !strcmp(get_tok_str(tok, NULL), "macro")) {
+            if (!s1->c6_ext)
+                tcc_error("'#macro' requires -std=c6");
+            parse_c6_macro();
+            break;
+        }
+#endif
         /* ignore gas line comment in an 'S' file. */
         if (saved_parse_flags & PARSE_FLAG_ASM_FILE)
             goto ignore;
@@ -3248,6 +3442,11 @@ static int macro_subst_tok(
         int *jstr;
         Sym *sa;
         int ret;
+#ifdef C6_EXT
+        int *hbody = NULL;
+        if (s->type.t & MACRO_C6_LOCAL)
+            mstr = hbody = c6_hygiene_body(mstr);
+#endif
 
         if (s->type.t & MACRO_FUNC) {
             int saved_parse_flags = parse_flags;
@@ -3358,6 +3557,10 @@ static int macro_subst_tok(
             tok_str_free_str(jstr);
         if (mstr != s->d)
             tok_str_free_str(mstr);
+#ifdef C6_EXT
+        if (hbody && mstr != hbody)
+            tok_str_free_str(hbody);
+#endif
         return ret;
 
     } else {
@@ -3585,6 +3788,10 @@ static void putdefs(CString *cs, const char *p)
 static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
 {
     cstr_printf(cs, "#define __TINYC__ 9%.2s\n", &TCC_VERSION[4]);
+#ifdef C6_EXT
+    if (s1->c6_ext)
+        putdef(cs, "__C6__");
+#endif
     putdefs(cs, target_machine_defs);
     putdefs(cs, target_os_defs);
 
@@ -3728,6 +3935,20 @@ ST_FUNC void tccpp_new(TCCState *s)
         tok_alloc(p, r - p - 1);
         p = r;
     }
+
+#ifdef C6_EXT
+    if (!s->c6_ext) {
+        /* The c6 keywords are interned last; make them plain
+           identifiers when the extension is not enabled.  Note that
+           'test' may already be interned as an asm keyword, in which
+           case the range ends before TOK_C6_TEST. */
+        int t;
+        for (t = TOK_C6_PACKAGE; t < TOK_C6_TEST && t < tok_ident; t++)
+            tok_unintern(t);
+        if (TOK_C6_PACKAGE < tok_ident)
+            tok_ident = TOK_C6_PACKAGE;
+    }
+#endif
 
     /* we add dummy defines for some special macros to speed up tests
        and to have working defined() */

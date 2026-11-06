@@ -440,3 +440,15 @@
 #if defined TCC_TARGET_RISCV64
 #include "riscv64-tok.h"
 #endif
+
+#ifdef C6_EXT
+     /* c6 language extensions (active with -std=c6) */
+     DEF(TOK_C6_PACKAGE,   "package")
+     DEF(TOK_C6_IMPORT,    "import")
+     DEF(TOK_C6_INTERFACE, "interface")
+     DEF(TOK_C6_IMPL,      "impl")
+     DEF(TOK_C6_DEFER,     "defer")
+     DEF(TOK_C6_ERRDEFER,  "errdefer")
+     DEF(TOK_C6_ERR,       "err")
+     DEF(TOK_C6_TEST,      "test")
+#endif

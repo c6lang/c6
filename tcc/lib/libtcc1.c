@@ -621,3 +621,148 @@ long long __fixxfdi (long double a1)
     return s ? ret : -ret;
 }
 #endif /* !ARM */
+
+/* ------------------------------------------------------------------------- */
+/* c6 extension runtime: defer / errdefer / err                          */
+/*                                                                           */
+/* Deferred statements are recorded on a global (v1: single-threaded) stack.  */
+/* Each function stores the stack top at entry ("frame base") in a local slot */
+/* and passes it to every cleanup request, so a cleanup never touches records */
+/* that belong to the caller's frames.  Scope cleanups additionally filter by */
+/* lexical depth, which makes conditional registration and loops work.       */
+
+#define TCC_DEFER_MAX     8192
+#define TCC_DEFER_CTX_MAX 512
+
+#define TCC_DEFER_KIND_DEFER    0
+#define TCC_DEFER_KIND_ERRDEFER 1
+
+#define TCC_DEFER_MODE_SCOPE 0   /* run records of scopes deeper than depth */
+#define TCC_DEFER_MODE_FUNC  1   /* run all records of this function frame */
+#define TCC_DEFER_MODE_ERR   2   /* run only errdefer records, frame wide   */
+
+typedef struct TccDeferRec {
+    int id;      /* cleanup site id (> 0) */
+    int depth;   /* lexical scope depth at registration */
+    int kind;    /* TCC_DEFER_KIND_* */
+} TccDeferRec;
+
+typedef struct TccDeferCtx {
+    int mode;    /* TCC_DEFER_MODE_* */
+    int depth;   /* target scope depth (scope mode) */
+    int resume;  /* resume id (reported as -resume when finished) */
+    int base;    /* frame base: never pop records below this index */
+} TccDeferCtx;
+
+static TccDeferRec tcc_defer_stack[TCC_DEFER_MAX];
+static int tcc_defer_sp;
+static TccDeferCtx tcc_defer_ctx[TCC_DEFER_CTX_MAX];
+static int tcc_defer_csp;
+
+static int tcc_err_flag;
+static int tcc_err_id;
+static const char *tcc_err_msg;
+
+/* Called once at function entry: remember where the frame starts.  The
+   result is stored through OUT because helper functions are void-typed. */
+void __tcc_defer_func_enter(int *out)
+{
+    *out = tcc_defer_sp;
+}
+
+void __tcc_defer_push(int id, int depth, int kind)
+{
+    TccDeferRec *r;
+    if (tcc_defer_sp >= TCC_DEFER_MAX)
+        return;
+    r = &tcc_defer_stack[tcc_defer_sp++];
+    r->id = id;
+    r->depth = depth;
+    r->kind = kind;
+}
+
+void __tcc_defer_begin_scope(int depth, int resume, int base)
+{
+    TccDeferCtx *c;
+    if (tcc_defer_csp >= TCC_DEFER_CTX_MAX)
+        return;
+    c = &tcc_defer_ctx[tcc_defer_csp++];
+    c->mode = TCC_DEFER_MODE_SCOPE;
+    c->depth = depth;
+    c->resume = resume;
+    c->base = base;
+}
+
+void __tcc_defer_begin_func(int mode, int resume, int base)
+{
+    TccDeferCtx *c;
+    if (tcc_defer_csp >= TCC_DEFER_CTX_MAX)
+        return;
+    c = &tcc_defer_ctx[tcc_defer_csp++];
+    c->mode = mode;
+    c->depth = 0;
+    c->resume = resume;
+    c->base = base;
+}
+
+/* Store the next cleanup site id to run (> 0), or -resume when the current
+   cleanup request is finished, through OUT so generated code needs no
+   return-value handling. */
+void __tcc_defer_step(int *out)
+{
+    *out = -1;
+    while (tcc_defer_csp > 0) {
+        TccDeferCtx *c = &tcc_defer_ctx[tcc_defer_csp - 1];
+        while (tcc_defer_sp > c->base) {
+            TccDeferRec *r = &tcc_defer_stack[tcc_defer_sp - 1];
+            if (c->mode == TCC_DEFER_MODE_SCOPE && r->depth <= c->depth)
+                break;              /* belongs to an enclosing scope */
+            tcc_defer_sp--;
+            if (r->kind == TCC_DEFER_KIND_ERRDEFER
+                && c->mode != TCC_DEFER_MODE_ERR)
+                continue;           /* errdefer only runs on the error path */
+            *out = r->id;
+            return;
+        }
+        tcc_defer_csp--;
+        *out = -c->resume;
+        return;
+    }
+}
+
+void __tcc_err_set(int id, const char *msg)
+{
+    tcc_err_flag = 1;
+    tcc_err_id = id;
+    tcc_err_msg = msg;
+}
+
+int __tcc_err_flag_get(void)
+{
+    return tcc_err_flag;
+}
+
+int __tcc_err_id_get(void)
+{
+    return tcc_err_id;
+}
+
+const char *__tcc_err_msg_get(void)
+{
+    return tcc_err_msg;
+}
+
+void __tcc_iface_init(void *self, const void *vt, void *dst)
+{
+    void **d = (void **)dst;
+    d[0] = self;
+    d[1] = (void *)vt;
+}
+
+void __tcc_err_clear(void)
+{
+    tcc_err_flag = 0;
+    tcc_err_id = 0;
+    tcc_err_msg = 0;
+}
+

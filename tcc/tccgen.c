@@ -116,7 +116,80 @@ static struct scope {
     struct { Sym *s; int n; } cl;
     int *bsym, *csym;
     Sym *lstk, *llstk;
+    int depth; /* lexical scope depth (new_scope only) */
 } *cur_scope, *loop_scope, *root_scope;
+
+#ifdef C6_EXT
+/* ------------------------------------------------------------------------- */
+/* c6 extensions: defer / errdefer state (per function)                  */
+
+typedef struct C6DeferSite {
+    int id;
+    Sym *label;
+    struct C6DeferSite *next;
+} C6DeferSite;
+
+typedef struct C6DeferResume {
+    int id;
+    Sym *label;
+    struct C6DeferResume *next;
+} C6DeferResume;
+
+static struct {
+    int enabled;      /* c6 extensions active for current function */
+    int has_sites;    /* at least one defer/errdefer site parsed so far */
+    int body_depth;   /* > 0 while compiling a deferred statement body */
+    int next_site;
+    int next_resume;
+    int sp0_off;      /* local slot holding this frame's defer stack base */
+    int step_off;     /* local slot for __tcc_defer_step() result */
+    int disp_jmps;    /* pending jumps to the function dispatcher */
+    C6DeferSite *sites;
+    C6DeferSite **sites_tail;
+    C6DeferResume *resumes;
+    C6DeferResume **resumes_tail;
+} defer_state;
+static int c6_label_seq;
+static int c6_implicit_ret0;
+/* pending hidden 'self' argument of an interface method call */
+static int c6_iface_self_pending;
+static int c6_iface_self_loc;
+static CType c6_iface_self_type;  /* generated 'test' function: return 0 */
+
+static void c6_defer_func_init(void);
+static void c6_defer_func_end(void);
+static void c6_defer_begin(int mode, int depth);
+static void c6_defer_parse(int kind);
+static void c6_err_parse(void);
+static void c6_errdefer_parse(void);
+static void c6_test_parse(void);
+static void c6_package_parse(void);
+static void c6_import_parse(void);
+static void c6_interface_parse(void);
+static void c6_impl_parse(void);
+static int c6_iface_convert(CType *dt);
+typedef struct C6Iface C6Iface_t;
+static C6Iface *c6_iface_of_type(CType *type);
+static int c6_iface_has_method(C6Iface *ifc, int m);
+static void c6_iface_call_prep(C6Iface *ifc, int mname);
+static Sym *c6_import_lookup(int v);
+static void gen_function(Sym *sym);
+/* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
+   already interned as TOK_ASM_test, so accept both spellings. */
+static int c6_is_test_kw(int t)
+{
+    if (t == TOK_C6_TEST)
+        return 1;
+#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
+    if (t == TOK_ASM_test)
+        return 1;
+#endif
+    return 0;
+}
+static Sym *c6_new_label(const char *tag);
+static void c6_def_label(Sym *s);
+static int c6_ext_on(void);
+#endif
 
 typedef struct {
     Section *sec;
@@ -707,13 +780,25 @@ ST_INLN Sym *struct_find(int v)
     return table_ident[v]->sym_struct;
 }
 
-/* find an identifier */
-ST_INLN Sym *sym_find(int v)
+/* find an identifier, no package fallback */
+static inline Sym *sym_find_raw(int v)
 {
     v -= TOK_IDENT;
     if ((unsigned)v >= (unsigned)(tok_ident - TOK_IDENT))
         return NULL;
     return table_ident[v]->sym_identifier;
+}
+
+/* find an identifier */
+ST_INLN Sym *sym_find(int v)
+{
+    Sym *s = sym_find_raw(v);
+#ifdef C6_EXT
+    if (!s && tcc_state
+        && (tcc_state->c6_package || tcc_state->c6_nb_imports))
+        s = c6_import_lookup(v);
+#endif
+    return s;
 }
 
 /* make sym in-/visible to the parser */
@@ -3709,6 +3794,10 @@ static void verify_assign_cast(CType *dt)
 
 static void gen_assign_cast(CType *dt)
 {
+#ifdef C6_EXT
+    if (c6_iface_convert(dt))
+        return;
+#endif
     verify_assign_cast(dt);
     gen_cast(dt);
 }
@@ -3719,6 +3808,10 @@ ST_FUNC void vstore(void)
     int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
 
     ft = vtop[-1].type.t;
+#ifdef C6_EXT
+    c6_iface_convert(&vtop[-1].type);
+    ft = vtop[-1].type.t;
+#endif
     sbt = vtop->type.t & VT_BTYPE;
     dbt = ft & VT_BTYPE;
     verify_assign_cast(&vtop[-1].type);
@@ -5760,6 +5853,11 @@ ST_FUNC void unary(void)
                 return;
             } else {
                 unary();
+#ifdef C6_EXT
+                /* '(Shape)circle' converts explicitly */
+                if (c6_iface_convert(&type))
+                    break;
+#endif
                 gen_cast(&type);
             }
         } else if (tok == '{') {
@@ -6228,6 +6326,20 @@ special_math_val:
             test_lvalue();
             /* expect pointer on structure */
             next();
+#ifdef C6_EXT
+            if (tcc_state->c6_ext && tok >= TOK_UIDENT) {
+                C6Iface *ifc = c6_iface_of_type(&vtop->type);
+                if (ifc) {
+                    int mname = tok;
+                    next();
+                    if (tok == '(' && c6_iface_has_method(ifc, mname)) {
+                        c6_iface_call_prep(ifc, mname);
+                        continue;   /* let the '(' case handle the call */
+                    }
+                    unget_tok(mname);   /* plain field access */
+                }
+            }
+#endif
 	    s = find_field(&vtop->type, tok, &cumofs);
             /* add field offset to pointer */
             gaddrof();
@@ -6279,6 +6391,18 @@ special_math_val:
             next();
             sa = s->next; /* first parameter */
             nb_args = regsize = 0;
+#ifdef C6_EXT
+            if (c6_iface_self_pending) {
+                /* interface method call: the hidden 'self' pointer is the
+                   first argument, its parameter is skipped */
+                c6_iface_self_pending = 0;
+                vset(&c6_iface_self_type, VT_LOCAL | VT_LVAL,
+                     c6_iface_self_loc);
+                nb_args = 1;
+                if (sa)
+                    sa = sa->next;
+            }
+#endif
             ret.r2 = VT_CONST;
             /* compute first implicit argument if a structure is returned */
             if ((s->type.t & VT_BTYPE) == VT_STRUCT) {
@@ -6928,8 +7052,11 @@ static void check_func_return(void)
 {
     if ((func_vt.t & VT_BTYPE) == VT_VOID)
         return;
-    if ((!strcmp(funcname, "main") || func_old)
-        && (func_vt.t & VT_BTYPE) == VT_INT) {
+    if ((!strcmp(funcname, "main") || func_old
+#ifdef C6_EXT
+         || c6_implicit_ret0
+#endif
+        ) && (func_vt.t & VT_BTYPE) == VT_INT) {
         /* main returns 0 by default */
         vpushi(0);
         gfunc_return(&func_vt);
@@ -7101,6 +7228,815 @@ static void block_cleanup(struct scope *o)
     try_call_scope_cleanup(o->cl.s);
 }
 
+#ifdef C6_EXT
+/* ------------------------------------------------------------------------- */
+/* c6 extensions: defer / errdefer code generation                      */
+
+/* value returned by a function that raised an error with 'err(...)' */
+#define TCC_ERR_SENTINEL (-1)
+
+/* ------------------------------------------------------------------------- */
+/* c6 extensions: 'package NAME { ... }' and 'import NAME;'             */
+/*                                                                          */
+/* A package is a name-mangling sugar: global symbols declared inside are   */
+/* registered as NAME__symbol.  'import NAME;' makes unqualified lookups    */
+/* fall back to NAME__symbol.  Macro and tag namespaces are not affected.   */
+
+static int c6_mangle_tok(const char *pkg, int v)
+{
+    char buf[192];
+    const char *name = get_tok_str(v, NULL);
+    if (strlen(pkg) + strlen(name) + 3 > sizeof(buf))
+        tcc_error("package symbol name too long");
+    sprintf(buf, "%s__%s", pkg, name);
+    return tok_alloc_const(buf);
+}
+
+/* resolve V as a member of the current package or of an imported package */
+static Sym *c6_import_lookup(int v)
+{
+    TCCState *s1 = tcc_state;
+    int i, t;
+    Sym *s;
+
+    if (!s1->c6_ext || v < TOK_UIDENT)
+        return NULL;
+    if (s1->c6_package) {
+        t = c6_mangle_tok(s1->c6_package, v);
+        s = sym_find_raw(t);
+        if (s)
+            return s;
+    }
+    for (i = 0; i < s1->c6_nb_imports; i++) {
+        t = c6_mangle_tok(s1->c6_imports[i], v);
+        s = sym_find_raw(t);
+        if (s)
+            return s;
+    }
+    return NULL;
+}
+
+static char *c6_ident_str(int *ptok)
+{
+    char *name;
+    if (*ptok < TOK_UIDENT)
+        expect("identifier");
+    name = tcc_strdup(get_tok_str(*ptok, NULL));
+    next();
+    return name;
+}
+
+static void c6_package_parse(void)
+{
+    char *name, *saved;
+
+    next();  /* skip 'package' */
+    name = c6_ident_str(&tok);
+    if (tok == '{') {
+        /* 'package NAME { ... }': the package ends with the block */
+        if (tcc_state->c6_package)
+            tcc_error("nested 'package' is not allowed");
+        saved = tcc_state->c6_package;
+        tcc_state->c6_package = name;
+        next();
+        while (tok != '}' && tok != TOK_EOF)
+            decl(VT_CONST);
+        skip('}');
+        tcc_state->c6_package = saved;
+    } else {
+        /* 'package NAME;' names the rest of the file (or until the next
+           'package' statement); include system headers before it */
+        tcc_state->c6_package = name;
+        skip(';');
+    }
+}
+
+static void c6_import_parse(void)
+{
+    char *name;
+    next();  /* skip 'import' */
+    name = c6_ident_str(&tok);
+    skip(';');
+    dynarray_add(&tcc_state->c6_imports,
+                 &tcc_state->c6_nb_imports, name);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* interface / impl                                                    */
+
+static C6Iface *c6_iface_find(int tag)
+{
+    int i;
+    for (i = 0; i < tcc_state->c6_nb_ifaces; i++)
+        if (tcc_state->c6_ifaces[i]->tag == tag)
+            return tcc_state->c6_ifaces[i];
+    return NULL;
+}
+
+/* if TYPE denotes an interface value type, return its descriptor */
+static C6Iface *c6_iface_of_type(CType *type)
+{
+    Sym *st;
+    if (!tcc_state->c6_ext || tcc_state->c6_nb_ifaces == 0)
+        return NULL;
+    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+        return NULL;
+    st = type->ref;
+    if (!(st->v & SYM_STRUCT))
+        return NULL;
+    return c6_iface_find(st->v & ~SYM_STRUCT);
+}
+
+static int c6_iface_has_method(C6Iface *ifc, int m)
+{
+    int i;
+    for (i = 0; i < ifc->nb_methods; i++)
+        if (ifc->methods[i] == m)
+            return 1;
+    return 0;
+}
+
+static C6Impl *c6_impl_find(C6Iface *ifc, int type_tag)
+{
+    int i;
+    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
+        C6Impl *imp = tcc_state->c6_impls[i];
+        if (imp->iface == ifc && imp->type_tag == type_tag)
+            return imp;
+    }
+    return NULL;
+}
+
+/* resolve TYPE (a typedef name or a 'struct' tag) to its struct tag token */
+static int c6_struct_tag(int type_tok)
+{
+    Sym *st = struct_find(type_tok);
+    if (!st) {
+        Sym *ts = sym_find(type_tok);
+        if (ts && (ts->type.t & VT_BTYPE) == VT_STRUCT && ts->type.ref)
+            st = ts->type.ref;
+    }
+    if (!st || !(st->v & SYM_STRUCT))
+        return 0;
+    return st->v & ~SYM_STRUCT;
+}
+
+/* Parse TS (a synthetic token string ending in TOK_EOF) as file scope
+   declarations.  The current token is left untouched and warnings are
+   suppressed, since the generated declarations are compiler-internal. */
+static void c6_decl_tokens(TokenString *ts)
+{
+    int warn_none = tcc_state->warn_none;
+    int save_tok = tok;
+    CValue save_val = tokc;
+    tcc_state->warn_none = 1;
+    begin_macro(ts, 1);
+    next();
+    decl(VT_CONST);
+    end_macro();
+    tcc_state->warn_none = warn_none;
+    tok = save_tok, tokc = save_val;
+}
+
+static void c6_interface_parse(void)
+{
+    C6Iface *ifc;
+    TokenString *body = NULL, *ts;
+    int name_tok, i, n, *p, is_method;
+    char buf[256];
+
+    next();                          /* skip 'interface' */
+    if (tok < TOK_UIDENT)
+        expect("interface name");
+    if (struct_find(tok))
+        tcc_error("redefinition of 'struct %s'", get_tok_str(tok, NULL));
+    name_tok = tok;
+    next();
+    skip_or_save_block(&body);
+
+    ifc = tcc_mallocz(sizeof *ifc);
+    ifc->name = tcc_strdup(get_tok_str(name_tok, NULL));
+    ifc->tag = name_tok;
+    snprintf(buf, sizeof buf, "%s_vt", ifc->name);
+    ifc->vt_tag = tok_alloc_const(buf);
+
+    /* Build 'struct NAME_vt { RET (*meth)(void *, ...); ... };', that is,
+       turn each method declaration into a function-pointer field whose
+       first parameter is the hidden 'self' pointer. */
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, ifc->vt_tag);
+    tok_str_add(ts, '{');
+    p = body->str;
+    n = body->len;
+    is_method = 0;
+    for (i = 0; i < n; i++) {
+        int t = p[i];
+        if (t == 0 || t == TOK_EOF)
+            break;
+        if (t == '{' || t == '}')
+            continue;
+        if (TOK_HAS_VALUE(t)) {
+            /* only int-valued tokens can appear in method declarations */
+            tok_str_add(ts, t);
+            tok_str_add(ts, p[++i]);
+            continue;
+        }
+        if (t == '(') {
+            tok_str_add(ts, '(');
+            if (is_method) {
+                tok_str_add(ts, TOK_VOID);
+                tok_str_add(ts, '*');
+                if (i + 1 < n && p[i + 1] != ')')
+                    tok_str_add(ts, ',');
+            }
+            is_method = 0;
+            continue;
+        }
+        if (t >= TOK_UIDENT && i + 1 < n && p[i + 1] == '(') {
+            /* method name: '( * name )' */
+            tok_str_add(ts, '(');
+            tok_str_add(ts, '*');
+            tok_str_add(ts, t);
+            tok_str_add(ts, ')');
+            ifc->methods = tcc_realloc(ifc->methods,
+                                       (ifc->nb_methods + 1) * sizeof(int));
+            ifc->methods[ifc->nb_methods++] = t;
+            is_method = 1;
+            continue;
+        }
+        tok_str_add(ts, t);
+    }
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    if (ifc->nb_methods == 0)
+        tcc_error("interface '%s' has no methods", ifc->name);
+    c6_decl_tokens(ts);
+
+    /* Build the interface value type:
+       'struct NAME { void *self; const struct NAME_vt *vt; };' */
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, ifc->tag);
+    tok_str_add(ts, '{');
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, tok_alloc_const("self"));
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_CONST1);
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, ifc->vt_tag);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, tok_alloc_const("vt"));
+    tok_str_add(ts, ';');
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+
+    /* 'typedef struct NAME NAME;' so that the interface name can be
+       used as a type, e.g. 'int describe(Shape s)' */
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_TYPEDEF);
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, ifc->tag);
+    tok_str_add(ts, ifc->tag);
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+
+    dynarray_add(&tcc_state->c6_ifaces,
+                 &tcc_state->c6_nb_ifaces, ifc);
+    tok_str_free(body);
+}
+
+static void c6_impl_parse(void)
+{
+    C6Iface *ifc;
+    C6Impl *imp;
+    TokenString *ts;
+    char *saved_pkg, *pkgname;
+    char buf[256];
+    int iface_tok, type_tok, type_tag, i;
+
+    next();                          /* skip 'impl' */
+    if (tok < TOK_UIDENT)
+        expect("interface name");
+    iface_tok = tok;
+    next();
+    if (tok != TOK_FOR)
+        expect("for");
+    next();
+    if (tok == TOK_STRUCT)
+        next();
+    if (tok < TOK_UIDENT)
+        expect("type name");
+    type_tok = tok;
+    next();
+
+    ifc = c6_iface_find(iface_tok);
+    if (!ifc)
+        tcc_error("unknown interface '%s'", get_tok_str(iface_tok, NULL));
+    type_tag = c6_struct_tag(type_tok);
+    if (!type_tag)
+        tcc_error("'%s' is not a struct or union type",
+                  get_tok_str(type_tok, NULL));
+    /* a declaration-only impl may be followed by the real definition */
+    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
+        C6Impl *o = tcc_state->c6_impls[i];
+        if (o->iface == ifc && o->type_tag == type_tag) {
+            if (!o->is_decl)
+                tcc_error("duplicate impl of '%s' for '%s'", ifc->name,
+                          get_tok_str(type_tok, NULL));
+            memmove(&tcc_state->c6_impls[i], &tcc_state->c6_impls[i + 1],
+                    (tcc_state->c6_nb_impls - i - 1) * sizeof(C6Impl *));
+            tcc_state->c6_nb_impls--;
+            tcc_free(o);
+            break;
+        }
+    }
+
+    /* Make the type name usable as a type inside the impl body, so that
+       'void draw(Circle *self)' works for 'impl Drawable for Circle'. */
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_TYPEDEF);
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, type_tag);
+    tok_str_add(ts, type_tok);
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+
+    if (tok == ';') {
+        /* 'impl IFACE for TYPE;' only declares that the impl exists (it is
+           defined in another translation unit): reference its vtable. */
+        next();
+        imp = tcc_mallocz(sizeof *imp);
+        imp->iface = ifc;
+        imp->type_tag = type_tag;
+        snprintf(buf, sizeof buf, "__tcc_vt_%s_%s",
+                 get_tok_str(type_tag, NULL), ifc->name);
+        imp->vt_tok = tok_alloc_const(buf);
+        imp->is_decl = 1;
+        ts = tok_str_alloc();
+        tok_str_add(ts, TOK_EXTERN);
+        tok_str_add(ts, TOK_CONST1);
+        tok_str_add(ts, TOK_STRUCT);
+        tok_str_add(ts, ifc->vt_tag);
+        tok_str_add(ts, imp->vt_tok);
+        tok_str_add(ts, ';');
+        tok_str_add(ts, TOK_EOF);
+        c6_decl_tokens(ts);
+        dynarray_add(&tcc_state->c6_impls,
+                     &tcc_state->c6_nb_impls, imp);
+        return;
+    }
+
+    /* The method definitions are ordinary functions.  Parse them inside a
+       pseudo package so that their names do not collide between impls. */
+    snprintf(buf, sizeof buf, "__tcc_impl_%s_%s",
+             get_tok_str(type_tag, NULL), ifc->name);
+    pkgname = tcc_strdup(buf);
+    saved_pkg = tcc_state->c6_package;
+    tcc_state->c6_package = pkgname;
+    skip('{');
+    while (tok != '}' && tok != TOK_EOF)
+        decl(VT_CONST);
+    skip('}');
+    tcc_state->c6_package = saved_pkg;
+
+    /* Emit the vtable object:
+       'const struct NAME_vt __tcc_vt_TYPE_NAME = { (void(*)(void))m, ... };' */
+    imp = tcc_mallocz(sizeof *imp);
+    imp->iface = ifc;
+    imp->type_tag = type_tag;
+    snprintf(buf, sizeof buf, "__tcc_vt_%s_%s",
+             get_tok_str(type_tag, NULL), ifc->name);
+    imp->vt_tok = tok_alloc_const(buf);
+
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_CONST1);
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, ifc->vt_tag);
+    tok_str_add(ts, imp->vt_tok);
+    tok_str_add(ts, '=');
+    tok_str_add(ts, '{');
+    for (i = 0; i < ifc->nb_methods; i++) {
+        if (i)
+            tok_str_add(ts, ',');
+        tok_str_add(ts, '(');
+        tok_str_add(ts, TOK_VOID);
+        tok_str_add(ts, '(');
+        tok_str_add(ts, '*');
+        tok_str_add(ts, ')');
+        tok_str_add(ts, '(');
+        tok_str_add(ts, TOK_VOID);
+        tok_str_add(ts, ')');
+        tok_str_add(ts, ')');
+        tok_str_add(ts, c6_mangle_tok(pkgname, ifc->methods[i]));
+    }
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+
+    dynarray_add(&tcc_state->c6_impls,
+                 &tcc_state->c6_nb_impls, imp);
+}
+
+/* rewrite 'iface.meth (args...)' into a vtable call passing the hidden
+   'self' pointer as the first argument; leaves the function pointer on
+   the stack and arms 'c6_iface_self_pending' for the call code */
+static void c6_iface_call_prep(C6Iface *ifc, int mname)
+{
+    Sym *fself, *fvt, *fmeth;
+    CType t;
+    int off_self, off_vt, off_m;
+
+    fself = find_field(&vtop->type, tok_alloc_const("self"), &off_self);
+    fvt = find_field(&vtop->type, tok_alloc_const("vt"), &off_vt);
+    if (!fself || !fvt)
+        tcc_error("bad interface type");
+
+    gaddrof();                       /* address of the interface value */
+    vtop->type = char_pointer_type;
+
+    /* self (kept in a temporary local slot) */
+    gv_dup();
+    vpushi(off_self);
+    gen_op('+');
+    t = fself->type;
+    mk_pointer(&t);
+    vtop->type = t;
+    indir();                         /* the 'self' pointer value */
+    c6_iface_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = c6_iface_self_loc;
+    vset(&fself->type, VT_LOCAL | VT_LVAL, c6_iface_self_loc);
+    vswap();
+    vstore();
+    vpop();
+    c6_iface_self_type = fself->type;
+
+    /* method: d.vt->name */
+    vpushi(off_vt);
+    gen_op('+');
+    t = fvt->type;
+    mk_pointer(&t);
+    vtop->type = t;
+    indir();                         /* d.vt */
+    fmeth = find_field(pointed_type(&vtop->type), mname, &off_m);
+    if (!fmeth)
+        tcc_error("interface '%s' has no method '%s'", ifc->name,
+                  get_tok_str(mname, NULL));
+    vtop->type = char_pointer_type;
+    vpushi(off_m);
+    gen_op('+');
+    t = fmeth->type;
+    mk_pointer(&t);
+    vtop->type = t;
+    indir();                         /* the function pointer */
+    c6_iface_self_pending = 1;
+}
+
+/* Implicit conversion of a struct value to an interface value, e.g.
+   'render(circle)' or 'Drawable d = circle;'.  Returns 0 when no
+   conversion applies. */
+static int c6_iface_convert(CType *dt)
+{
+    C6Iface *ifc;
+    C6Impl *imp;
+    Sym *vs;
+    int size, align, loc2;
+
+    if (!tcc_state->c6_ext || tcc_state->c6_nb_impls == 0)
+        return 0;
+    if ((vtop->type.t & VT_BTYPE) != VT_STRUCT || !vtop->type.ref)
+        return 0;
+    ifc = c6_iface_of_type(dt);
+    if (!ifc)
+        return 0;
+    imp = c6_impl_find(ifc, vtop->type.ref->v & ~SYM_STRUCT);
+    if (!imp)
+        return 0;
+    vs = sym_find(imp->vt_tok);
+    if (!vs)
+        tcc_error("impl of interface '%s' used before its definition",
+                  ifc->name);
+
+    size = type_size(dt, &align);
+    loc2 = (loc - size) & -align;
+    loc = loc2;
+
+    /* __tcc_iface_init(&src, &vtable, &tmp) */
+    gaddrof();                       /* &source struct */
+    vtop->type = char_pointer_type;
+    vpushsym(&vs->type, vs);
+    vtop->r |= VT_LVAL;
+    gaddrof();                       /* &vtable */
+    vtop->type = char_pointer_type;
+    vset(dt, VT_LOCAL | VT_LVAL, loc2);
+    gaddrof();                       /* &tmp */
+    vtop->type = char_pointer_type;
+    vpush_helper_func(tok_alloc_const("__tcc_iface_init"));
+    vrott(4);
+    gfunc_call(3);
+
+    vset(dt, VT_LOCAL | VT_LVAL, loc2);
+    return 1;
+}
+
+static int c6_ext_on(void)
+{
+    return tcc_state->c6_ext;
+}
+
+static Sym *c6_new_label(const char *tag)
+{
+    char buf[64];
+    int v;
+    snprintf(buf, sizeof(buf), "__tcc_%s_%d", tag, ++c6_label_seq);
+    v = tok_alloc_const(buf);
+    return label_push(&global_label_stack, v, LABEL_FORWARD);
+}
+
+static void c6_def_label(Sym *s)
+{
+    s->r = LABEL_DEFINED;
+    s->jind = gind();
+    s->cleanupstate = cur_scope->cl.s;
+}
+
+static void c6_add_site(int id, Sym *label)
+{
+    C6DeferSite *s = tcc_malloc(sizeof *s);
+    s->id = id;
+    s->label = label;
+    s->next = NULL;
+    *defer_state.sites_tail = s;
+    defer_state.sites_tail = &s->next;
+}
+
+static void c6_add_resume(int id, Sym *label)
+{
+    C6DeferResume *r = tcc_malloc(sizeof *r);
+    r->id = id;
+    r->label = label;
+    r->next = NULL;
+    *defer_state.resumes_tail = r;
+    defer_state.resumes_tail = &r->next;
+}
+
+static void c6_free_lists(void)
+{
+    C6DeferSite *s, *sn;
+    C6DeferResume *r, *rn;
+    for (s = defer_state.sites; s; s = sn) {
+        sn = s->next;
+        tcc_free(s);
+    }
+    for (r = defer_state.resumes; r; r = rn) {
+        rn = r->next;
+        tcc_free(r);
+    }
+    defer_state.sites = NULL;
+    defer_state.sites_tail = &defer_state.sites;
+    defer_state.resumes = NULL;
+    defer_state.resumes_tail = &defer_state.resumes;
+}
+
+static void c6_defer_func_init(void)
+{
+    int align = PTR_SIZE;
+    defer_state.enabled = 1;
+    defer_state.has_sites = 0;
+    defer_state.body_depth = 0;
+    defer_state.next_site = 0;
+    defer_state.next_resume = 0;
+    defer_state.disp_jmps = 0;
+    c6_free_lists();
+    loc = (loc - (int)sizeof(int)) & -align;
+    defer_state.sp0_off = loc;
+    loc = (loc - (int)sizeof(int)) & -align;
+    defer_state.step_off = loc;
+    /* __tcc_defer_func_enter(&sp0); */
+    vpush_helper_func(tok_alloc_const("__tcc_defer_func_enter"));
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
+    gaddrof();
+    mk_pointer(&vtop->type);
+    gfunc_call(1);
+}
+
+/* emit "begin cleanup" (mode 0: scopes above DEPTH, mode 1: whole function) */
+static void c6_defer_begin(int mode, int depth)
+{
+    int rid;
+    Sym *rl;
+    if (!defer_state.enabled || !defer_state.has_sites || nocode_wanted)
+        return;
+    rid = ++defer_state.next_resume;
+    rl = c6_new_label("drs");
+    /* third argument: this frame's defer stack base */
+    if (mode == 0) {
+        vpush_helper_func(tok_alloc_const("__tcc_defer_begin_scope"));
+        vpushi(depth);
+        vpushi(rid);
+    } else {
+        vpush_helper_func(tok_alloc_const("__tcc_defer_begin_func"));
+        vpushi(mode);
+        vpushi(rid);
+    }
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
+    gfunc_call(3);
+    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
+    /* resume point: execution continues right after the cleanup run */
+    c6_def_label(rl);
+    c6_add_resume(rid, rl);
+}
+
+/* parse "defer STATEMENT" / "errdefer STATEMENT": register a cleanup site,
+   compile the body into a cleanup block that is skipped over at
+   registration time.  KIND selects defer (0) or errdefer (1). */
+static void c6_defer_parse(int kind)
+{
+    int skip = 0, id;
+    Sym *l = NULL;
+
+    defer_state.body_depth++;
+    if (!nocode_wanted) {
+        id = ++defer_state.next_site;
+        l = c6_new_label("dcl");
+        vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
+        vpushi(id);
+        vpushi(local_scope);
+        vpushi(kind);
+        gfunc_call(3);
+        skip = gjmp(0);
+        c6_def_label(l);
+        c6_add_site(id, l);
+        defer_state.has_sites = 1;
+    }
+    block(STMT_COMPOUND);
+    if (!nocode_wanted) {
+        defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
+        gsym(skip);
+    }
+    defer_state.body_depth--;
+}
+
+static void c6_errdefer_parse(void)
+{
+    c6_defer_parse(1);
+}
+
+/* parse "err(ID, MSG)" or "err()": record the error, run the error-path
+   cleanups (errdefer and defer) of the whole function frame and return the
+   sentinel value so that callers can propagate. */
+static void c6_err_parse(void)
+{
+    int b, ret_off = 0, ret_saved = 0;
+
+    if (defer_state.body_depth > 0)
+        tcc_error("'err' is not allowed in a defer body");
+
+    skip('(');
+    if (tok != ')') {
+        /* __tcc_err_set(id, msg) */
+        vpush_helper_func(tok_alloc_const("__tcc_err_set"));
+        expr_eq();
+        skip(',');
+        expr_eq();
+        skip(')');
+        gfunc_call(2);
+    } else {
+        next();  /* keep the error slot: this is a re-raise */
+    }
+
+    b = (func_vt.t & VT_BTYPE) != VT_VOID;
+    if (b) {
+        int align, size = type_size(&func_vt, &align);
+        vpushi(TCC_ERR_SENTINEL);
+        vtop->type = func_vt;   /* '(TYPE)-1', no conversion warning */
+        loc = (loc - size) & -align;
+        ret_off = loc;
+        ret_saved = 1;
+        vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
+        vswap();
+        vstore();
+        vpop();
+    }
+    if (defer_state.has_sites)
+        c6_defer_begin(2, 0);
+    if (ret_saved)
+        vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
+    if (b)
+        gfunc_return(&func_vt);
+    skip(';');
+    rsym = gjmp(rsym);
+    CODE_OFF();
+}
+
+/* parse 'test "description" { ... }' at file scope: synthesize
+   'static int __tcc_test_N(void) { ... }' and remember the description
+   so that -test can run it. */
+static void c6_test_parse(void)
+{
+    TCCState *s1 = tcc_state;
+    C6TestEntry *e;
+    CType ft;
+    Sym *fs, *sym;
+    AttributeDef ad;
+    char name[64];
+    int v;
+
+    next();             /* skip the 'test' keyword */
+    if (tok != TOK_STR)
+        expect("string");
+    snprintf(name, sizeof(name), "__tcc_test_%d", s1->c6_test_count);
+    {
+        int n = 0;
+        /* the description token value is the decoded string */
+        const char *d = tokc.str.data;
+        while (d[n])
+            n++;
+        e = tcc_malloc(sizeof *e);
+        e->desc = tcc_malloc(n + 1);
+        memcpy(e->desc, d, n + 1);
+        e->fn_name = tcc_strdup(name);
+    }
+    dynarray_add(&s1->c6_tests, &s1->c6_test_count, e);
+    v = tok_alloc_const(name);
+
+    next();             /* skip the description */
+    if (tok != '{')
+        expect("{");
+
+    /* build the type of "int NAME(void)" */
+    memset(&ad, 0, sizeof ad);
+    fs = sym_push(SYM_FIELD, &int_type, 0, 0);
+    fs->f.func_call = FUNC_CDECL;
+    fs->f.func_type = FUNC_NEW;
+    ft.t = VT_FUNC;
+    ft.ref = fs;
+    sym = external_sym(v, &ft, 0, &ad);
+
+    cur_text_section = text_section;
+    c6_implicit_ret0 = 1;
+    gen_function(sym);
+}
+
+/* emit the per-function cleanup dispatcher */
+static void c6_defer_func_end(void)
+{
+    C6DeferSite *s;
+    C6DeferResume *r;
+    int fall;
+
+    if (!defer_state.enabled)
+        return;
+    if (!defer_state.has_sites && !defer_state.resumes) {
+        /* no defer/errdefer in this function: nothing to dispatch */
+        c6_free_lists();
+        defer_state.enabled = 0;
+        return;
+    }
+    CODE_ON();
+    fall = gjmp(0);
+    gsym(defer_state.disp_jmps);
+    defer_state.disp_jmps = 0;
+    /* __tcc_defer_step(&answer); */
+    vpush_helper_func(tok_alloc_const("__tcc_defer_step"));
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
+    gaddrof();
+    mk_pointer(&vtop->type);
+    gfunc_call(1);
+    for (s = defer_state.sites; s; s = s->next) {
+        int j;
+        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
+        gv(RC_INT);
+        vpushi(s->id);
+        gen_op(TOK_EQ);
+        j = gvtst(1, 0);
+        gjmp_addr(s->label->jind);
+        gsym(j);
+    }
+    for (r = defer_state.resumes; r; r = r->next) {
+        int j;
+        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
+        gv(RC_INT);
+        vpushi(-r->id);
+        gen_op(TOK_EQ);
+        j = gvtst(1, 0);
+        gjmp_addr(r->label->jind);
+        gsym(j);
+    }
+    gsym(fall);
+    c6_free_lists();
+    defer_state.enabled = 0;
+}
+#endif /* C6_EXT */
+
 /* ------------------------------------------------------------------------- */
 /* VLA */
 
@@ -7135,10 +8071,15 @@ static void new_scope(struct scope *o)
     o->lstk = local_stack;
     o->llstk = local_label_stack;
     ++local_scope;
+    o->depth = local_scope;
 }
 
 static void prev_scope(struct scope *o, int is_expr)
 {
+#ifdef C6_EXT
+    if (defer_state.enabled && !nocode_wanted && o->depth > 0)
+        c6_defer_begin(0, o->depth - 1);
+#endif
     vla_leave(o->prev);
 
     if (o->cl.s != o->prev->cl.s)
@@ -7169,6 +8110,14 @@ static void leave_scope(struct scope *o)
 {
     if (!o)
         return;
+#ifdef C6_EXT
+    if (defer_state.enabled && !nocode_wanted) {
+        if (o == root_scope)
+            c6_defer_begin(1, 0);
+        else
+            c6_defer_begin(0, o->depth);
+    }
+#endif
     try_call_scope_cleanup(o->cl.s);
     vla_leave(o);
 }
@@ -7225,6 +8174,9 @@ static void gexpr_decl(void)
 static void block(int flags)
 {
     int a, b, c, d, e, t;
+#ifdef C6_EXT
+    int ret_off, ret_saved;
+#endif
     struct scope o;
     Sym *s;
 
@@ -7304,6 +8256,12 @@ again:
             check_func_return();
 
     } else if (t == TOK_RETURN) {
+#ifdef C6_EXT
+        if (defer_state.body_depth > 0)
+            tcc_error("'return' is not allowed in a defer body");
+        ret_off = 0;
+        ret_saved = 0;
+#endif
         b = (func_vt.t & VT_BTYPE) != VT_VOID;
         if (tok != ';') {
             gexpr();
@@ -7320,18 +8278,45 @@ again:
             tcc_warning("'return' with no value");
             b = 0;
         }
+#ifdef C6_EXT
+        /* protect the return value from cleanup calls */
+        if (b && defer_state.enabled && defer_state.has_sites) {
+            int align, size = type_size(&func_vt, &align);
+            loc = (loc - size) & -align;
+            ret_off = loc;
+            ret_saved = 1;
+            vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
+            vswap();
+            vstore();
+            vpop();
+        }
+#endif
         leave_scope(root_scope);
+#ifdef C6_EXT
+        if (ret_saved)
+            vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
+#endif
         if (b)
             gfunc_return(&func_vt);
         skip(';');
-        /* jump unless last stmt in top-level block */
-        if (tok != '}' || local_scope != 1)
+        /* jump unless last stmt in top-level block (with defer/errdefer
+           active the jump is required: the function-exit dispatcher must
+           not be reached by falling through) */
+        if (tok != '}' || local_scope != 1
+#ifdef C6_EXT
+            || defer_state.enabled
+#endif
+            )
             rsym = gjmp(rsym);
         if (debug_modes)
 	    tcc_tcov_block_end (tcc_state, -1);
         CODE_OFF();
 
     } else if (t == TOK_BREAK) {
+#ifdef C6_EXT
+        if (defer_state.body_depth > 0)
+            tcc_error("'break' is not allowed in a defer body");
+#endif
         /* compute jump */
         if (!cur_scope->bsym)
             tcc_error("cannot break");
@@ -7343,12 +8328,36 @@ again:
         skip(';');
 
     } else if (t == TOK_CONTINUE) {
+#ifdef C6_EXT
+        if (defer_state.body_depth > 0)
+            tcc_error("'continue' is not allowed in a defer body");
+#endif
         /* compute jump */
         if (!cur_scope->csym)
             tcc_error("cannot continue");
         leave_scope(loop_scope);
         *cur_scope->csym = gjmp(*cur_scope->csym);
         skip(';');
+
+#ifdef C6_EXT
+    } else if (t == TOK_C6_DEFER) {
+        if (!c6_ext_on())
+            tcc_error("'defer' requires -std=c6");
+        else
+            c6_defer_parse(0);
+
+    } else if (t == TOK_C6_ERRDEFER) {
+        if (!c6_ext_on())
+            tcc_error("'errdefer' requires -std=c6");
+        else
+            c6_errdefer_parse();
+
+    } else if (t == TOK_C6_ERR) {
+        if (!c6_ext_on())
+            tcc_error("'err' requires -std=c6");
+        else
+            c6_err_parse();
+#endif
 
     } else if (t == TOK_FOR) {
         new_scope(&o);
@@ -7473,6 +8482,10 @@ again:
         goto block_after_label;
 
     } else if (t == TOK_GOTO) {
+#ifdef C6_EXT
+        if (defer_state.body_depth > 0)
+            tcc_error("'goto' is not allowed in a defer body");
+#endif
         vla_restore(cur_scope->vla.locorig);
         if (tok == '*' && gnu_ext) {
             /* computed goto */
@@ -7532,8 +8545,17 @@ again:
             } else {
                 s = label_push(&global_label_stack, t, LABEL_DEFINED);
             }
+#ifdef C6_EXT
+            s->defer_depth = local_scope;
+#endif
             s->jind = gind();
             s->cleanupstate = cur_scope->cl.s;
+#ifdef C6_EXT
+            /* every label entry point dispatches deferred calls that belong
+               to scopes being left by the goto */
+            if (defer_state.enabled && !nocode_wanted)
+                c6_defer_begin(0, s->defer_depth);
+#endif
 
     block_after_label:
             /* Accept attributes after labels (e.g. 'unused') */
@@ -8692,9 +9714,33 @@ static void gen_function(Sym *sym)
     nb_temp_local_vars = 0;
 
     gfunc_prolog(sym);
+#ifdef C6_EXT
+    if (tcc_state->c6_ext)
+        c6_defer_func_init();
+#endif
     tcc_debug_prolog_epilog(tcc_state, 0);
     func_vla_arg(sym);
     block(0);
+#ifdef C6_EXT
+    if (defer_state.enabled) {
+        /* fall-through function exit also runs the cleanups; the dispatcher
+           itself must be emitted even if the body ended with a jump. */
+        if (!nocode_wanted) {
+            c6_defer_begin(1, 0);
+            if (c6_implicit_ret0) {
+                vpushi(0);
+                gfunc_return(&func_vt);
+            } else {
+                rsym = gjmp(rsym); /* after the cleanups: function epilogue */
+            }
+        }
+        c6_defer_func_end();
+    } else if (c6_implicit_ret0 && !nocode_wanted) {
+        vpushi(0);
+        gfunc_return(&func_vt);
+    }
+    c6_implicit_ret0 = 0;
+#endif
     gsym(rsym);
     nocode_wanted = 0;
     tcc_debug_end_scope(NULL, !func_var);
@@ -8824,6 +9870,30 @@ static int decl(int l)
     while (1) {
 
         oldint = 0;
+#ifdef C6_EXT
+        if (l == VT_CONST && tcc_state->c6_ext) {
+            if (c6_is_test_kw(tok)) {
+                c6_test_parse();
+                continue;
+            }
+            if (tok == TOK_C6_PACKAGE) {
+                c6_package_parse();
+                continue;
+            }
+            if (tok == TOK_C6_IMPORT) {
+                c6_import_parse();
+                continue;
+            }
+            if (tok == TOK_C6_INTERFACE) {
+                c6_interface_parse();
+                continue;
+            }
+            if (tok == TOK_C6_IMPL) {
+                c6_impl_parse();
+                continue;
+            }
+        }
+#endif
         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {
             if (l == VT_JMP)
                 return 0;
@@ -8849,6 +9919,11 @@ static int decl(int l)
                 btype.t = VT_INT;
                 oldint = 1;
             } else {
+#ifdef C6_EXT
+                /* end of a 'package NAME { ... }' body */
+                if (tok == '}' && tcc_state->c6_package)
+                    break;
+#endif
                 if (tok != TOK_EOF)
                     expect("declaration");
                 break;
@@ -8874,6 +9949,14 @@ static int decl(int l)
 	    ad = adbase;
             type_decl(&type, &ad, &v, l == VT_CMP ? TYPE_DIRECT | TYPE_PARAM : TYPE_DIRECT);
             /*ptype("decl", &type, v);*/
+#ifdef C6_EXT
+            /* symbols declared inside a package are name-mangled; the
+               program entry point always keeps its name */
+            if (l == VT_CONST && tcc_state->c6_package
+                && v >= TOK_UIDENT
+                && strcmp(get_tok_str(v, NULL), "main") != 0)
+                v = c6_mangle_tok(tcc_state->c6_package, v);
+#endif
             if ((type.t & VT_BTYPE) == VT_FUNC) {
                 if ((type.t & VT_STATIC) && (l != VT_CONST))
                     tcc_error("function without file scope cannot be static");

@@ -1,0 +1,8 @@
+swap: 9 3
+maxv: 9
+outer: 3 9
+twice
+twice
+user: tmp=3 a=42
+twice-swap: 42 9
+names: 4

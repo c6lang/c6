@@ -212,6 +212,46 @@ ST_FUNC void tcc_run_free(TCCState *s1)
 #define RT_EXIT_ZERO 0xE0E00E0E /* passed from longjmp instead of '0' */
 
 /* launch the compiled program with the given arguments */
+#ifdef C6_EXT
+/* run all compiled 'test' blocks (the -test option) */
+static int tcc_run_tests(TCCState *s1)
+{
+    int i, nrun = 0, nfail = 0;
+    const char *(*err_msg)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_msg_get");
+    void (*err_clear)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_clear");
+
+    for (i = 0; i < s1->c6_test_count; i++) {
+        C6TestEntry *e = s1->c6_tests[i];
+        int (*fn)(void) = (void*)tcc_get_symbol(s1, e->fn_name);
+        int r;
+        if (!fn)
+            continue;
+        if (s1->c6_test_filter
+            && !strstr(e->desc, s1->c6_test_filter))
+            continue;
+        ++nrun;
+        if (err_clear)
+            err_clear();
+        fflush(stdout);
+        fflush(stderr);
+        r = fn();
+        if (r) {
+            ++nfail;
+            fprintf(stderr, "FAIL: %s", e->desc);
+            if (err_msg && err_msg())
+                fprintf(stderr, ": %s", err_msg());
+            fprintf(stderr, "\n");
+        } else {
+            printf("PASS: %s\n", e->desc);
+        }
+        fflush(stdout);
+    }
+    printf("%d test(s), %d failure(s)\n", nrun, nfail);
+    fflush(stdout);
+    return nfail ? 1 : 0;
+}
+#endif
+
 LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
 {
     int (*prog_main)(int, char **, char **), ret;
@@ -228,8 +268,17 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
     char **envp = environ;
 #endif
 
+#ifdef C6_EXT
+    if (s1->c6_test_mode && s1->c6_test_count == 0
+        && s1->nb_errors == 0)
+        return 0;
+#endif
     /* tcc -dt -run ... nothing to do if no main() */
-    if ((s1->dflag & 16) && (addr_t)-1 == get_sym_addr(s1, "main", 0, 1))
+    if ((s1->dflag & 16) && (addr_t)-1 == get_sym_addr(s1, "main", 0, 1)
+#ifdef C6_EXT
+        && !s1->c6_test_mode
+#endif
+        )
         return 0;
 
     tcc_add_symbol(s1, "__rt_exit", rt_exit);
@@ -240,6 +289,11 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
 
     if (tcc_relocate(s1) < 0)
         return -1;
+
+#ifdef C6_EXT
+    if (s1->c6_test_mode)
+        return tcc_run_tests(s1);
+#endif
 
     prog_main = (void*)get_sym_addr(s1, s1->run_main, 1, 1);
     if ((addr_t)-1 == (addr_t)prog_main)

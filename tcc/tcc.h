@@ -558,6 +558,7 @@ typedef struct Sym {
         struct Sym *cleanup_sym; /* symbol from __attribute__((cleanup())) */
         struct Sym *cleanup_label; /* label in 'pending_gotos' chain */
     };
+    int defer_depth; /* c6: lexical depth of a defined label */
 } Sym;
 
 /* section definition */
@@ -615,6 +616,9 @@ typedef struct DLLReference {
 #define MACRO_OBJ      0 /* object like macro */
 #define MACRO_FUNC     1 /* function like macro */
 #define MACRO_JOIN     2 /* macro uses ## */
+#ifdef C6_EXT
+#define MACRO_C6_LOCAL 8 /* '#macro' body: '__local' is renamed per expansion */
+#endif
 
 /* field 'Sym.r' for C labels */
 #define LABEL_DEFINED  0 /* label is defined */
@@ -732,6 +736,31 @@ struct sym_attr {
 #endif
 };
 
+#ifdef C6_EXT
+/* one 'test "desc" { ... }' block */
+typedef struct C6TestEntry {
+    char *desc;      /* description text */
+    char *fn_name;   /* name of the generated test function */
+} C6TestEntry;
+
+/* one 'interface NAME { methods }' declaration */
+typedef struct C6Iface {
+    char *name;      /* interface name, e.g. "Drawable" */
+    int tag;         /* struct tag of the interface value type */
+    int vt_tag;      /* struct tag of the vtable type */
+    int nb_methods;
+    int *methods;    /* method name tokens, in declaration order */
+} C6Iface;
+
+/* one 'impl IFACE for TYPE { ... }' block */
+typedef struct C6Impl {
+    C6Iface *iface;
+    int type_tag;    /* struct tag of the implemented type */
+    int vt_tok;      /* token of the emitted vtable object */
+    int is_decl;     /* only declared here, defined in another TU */
+} C6Impl;
+#endif
+
 struct TCCState {
     unsigned char verbose; /* if true, display some information during compilation */
     unsigned char nostdinc; /* if true, no standard headers are added */
@@ -790,6 +819,24 @@ struct TCCState {
     unsigned char gnu_ext;
     /* use TinyCC extensions */
     unsigned char tcc_ext;
+#ifdef C6_EXT
+    /* c6 language extensions (-std=c6) */
+    unsigned char c6_ext;
+    unsigned char c6_test_mode; /* -test: run 'test' blocks, not main */
+    const char *c6_test_filter; /* -test-filter=SUBSTR */
+    /* 'test' blocks collected while compiling */
+    struct C6TestEntry **c6_tests;
+    int c6_test_count;
+    /* 'package NAME { ... }' support */
+    char *c6_package;      /* current package, NULL at top level */
+    char **c6_imports;     /* 'import NAME;' names */
+    int c6_nb_imports;
+    /* 'interface' / 'impl' declarations */
+    struct C6Iface **c6_ifaces;
+    int c6_nb_ifaces;
+    struct C6Impl **c6_impls;
+    int c6_nb_impls;
+#endif
 
     unsigned char dflag; /* -dX value */
     unsigned char Pflag; /* -P switch (LINE_MACRO_OUTPUT_FORMAT) */

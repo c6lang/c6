@@ -77,6 +77,19 @@ ifneq (-$(ARCH)-$(CONFIG_WIN32)-,-arm64-yes-)
  SKIP += 145_winarm64_interlocked.test
 endif
 
+# c6 language extension tests: they need a C6_EXT build and are
+# always run with '-std=c6' (gcc cannot compile them, so the
+# .expect files are committed)
+C6_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_c6_*.c))))
+# the compiler itself decides whether the extensions are compiled in
+C6_OK := $(shell echo | $(TCC_LOCAL) -std=c6 -dD -E - 2>/dev/null | grep -q __C6__ && echo yes)
+ifneq (,$(C6_OK))
+ $(C6_TESTS): FLAGS += -std=c6
+ 158_c6_test.test: FLAGS += -test
+else
+ SKIP += $(C6_TESTS)
+endif
+
 # Some tests might need arguments
 ARGS =
 31_args.test : ARGS = arg1 arg2 arg3 arg4 arg5

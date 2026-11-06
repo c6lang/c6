@@ -1,0 +1,6 @@
+basic: bodycba
+loop: iddid
+ret1: 10 ret1log: twoone
+ret2: -1 ret2log: threeone
+goto: innerouter
+rec: 6 4

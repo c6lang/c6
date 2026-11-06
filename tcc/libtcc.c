@@ -1586,6 +1586,10 @@ enum {
     TCC_OPTION_pthread,
     TCC_OPTION_run,
     TCC_OPTION_rstdin,
+#ifdef C6_EXT
+    TCC_OPTION_test,
+    TCC_OPTION_test_filter,
+#endif
     TCC_OPTION_w,
     TCC_OPTION_E,
     TCC_OPTION_M,
@@ -1653,6 +1657,10 @@ static const TCCOption tcc_options[] = {
     { "pthread", TCC_OPTION_pthread, 0},
     { "run", TCC_OPTION_run, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
     { "rstdin", TCC_OPTION_rstdin, TCC_OPTION_HAS_ARG },
+#ifdef C6_EXT
+    { "test", TCC_OPTION_test, 0 },
+    { "test-filter", TCC_OPTION_test_filter, TCC_OPTION_HAS_ARG },
+#endif
     { "rdynamic", TCC_OPTION_rdynamic, 0 },
     { "r", TCC_OPTION_r, 0 },
     { "Wl,", TCC_OPTION_Wl, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
@@ -1972,7 +1980,13 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
         case TCC_OPTION_c:
             x = TCC_OUTPUT_OBJ;
         set_output_type:
-            if (s->output_type)
+            /* '-test' already selects TCC_OUTPUT_MEMORY, so the usual
+               '-run' afterwards is not worth a warning */
+            if (s->output_type
+#ifdef C6_EXT
+                && !(s->c6_test_mode && x == TCC_OUTPUT_MEMORY)
+#endif
+                )
                 tcc_warning("-%s: overriding compiler action already specified", popt->name);
             s->output_type = x;
             break;
@@ -1994,6 +2008,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
         case TCC_OPTION_std:
             if (strcmp(optarg, "=c11") == 0 || strcmp(optarg, "=gnu11") == 0)
                 s->cversion = 201112;
+#ifdef C6_EXT
+            else if (strcmp(optarg, "=c6") == 0) {
+                s->c6_ext = 1;
+                s->tcc_ext = 1;
+            }
+#endif
             break;
         case TCC_OPTION_shared:
             x = TCC_OUTPUT_DLL;
@@ -2035,6 +2055,18 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             return tcc_error_noabort("-run is not available in a cross compiler");
 #endif
 #ifdef TCC_IS_NATIVE
+#ifdef C6_EXT
+        case TCC_OPTION_test:
+            /* run the 'test' blocks instead of main() */
+            s->c6_test_mode = 1;
+            x = TCC_OUTPUT_MEMORY;
+            goto set_output_type;
+        case TCC_OPTION_test_filter:
+            if (*optarg == '=')
+                ++optarg;
+            s->c6_test_filter = optarg;
+            break;
+#endif
         case TCC_OPTION_rstdin:
             /* custom stdin for run_main */
             s->run_stdin = optarg;
