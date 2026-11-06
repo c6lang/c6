@@ -175,14 +175,16 @@ int handle(const char *s)
 | `f() catch e { ... }` / `f() catch (e) { ... }` | 处理块里可用 `e.id` / `e.msg` |
 | `err(id, msg)` | 设置错误槽并立即返回；必须在 `T!error` 函数里使用 |
 
-`e` 的类型就是 `error`（编译器预置的 `typedef struct __tcc_error { int id; const char *msg; } error;`），
-`catch` 在进入处理块前**快照并清空**错误槽，所以连续两个 `catch` 不会串扰。
+`e` 的类型就是 `error`（编译器预置的 `typedef struct __tcc_error { int id; const char *msg; } error;`）。
+每次 `T!error` 调用之前都会先清空错误槽，`catch` 在进入处理块前再**快照并清空**一次，
+所以连续两个 `catch` 不会串扰，也不会把之前遗留的错误误判成这次调用的失败。
 
 约束（违反时编译报错）：
 
 - `try` 只能出现在返回类型带 `!error` 的函数里，且操作数必须是一次调用；
 - `catch` 的操作数也必须是一次调用，被调函数要返回 `T!error`；
-- `catch` 处理块必须自己离开：`return` / `err(id, msg)` / `goto`；
+- `catch` 处理块必须自己离开：`return` / `err(id, msg)` / `goto`；编译器判断
+  不出来时会在处理块末尾插入一个陷阱，运行时崩溃而不是悄悄走成功路径；
 - `try` / `catch` / `err` 不能写在 `defer` / `errdefer` 体内；
 - `T!error` 函数的返回值**必须**被 `try` 或 `catch` 消费；直接赋值、参与运算、
   作条件、`return` 出去或者当语句丢弃都会编译报错；

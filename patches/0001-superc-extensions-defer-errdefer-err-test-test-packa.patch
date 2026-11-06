@@ -1,7 +1,7 @@
 From 3ed76c0d2c1011926e89eed607dd51f84c5831d0 Mon Sep 17 00:00:00 2001
 From: superc-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 16:52:10 +0800
-Subject: [PATCH 1/4] superc extensions: defer, errdefer/err, test/-test,
+Subject: [PATCH 1/5] superc extensions: defer, errdefer/err, test/-test,
  package/import, interface/impl, #macro with __local hygiene
 
 All superc language extensions from docs/plan.md, gated behind TCC_EXT

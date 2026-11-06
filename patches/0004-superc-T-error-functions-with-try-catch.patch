@@ -1,7 +1,7 @@
 From dfa79b74ef00449b33caeb06eec776c4ead277ca Mon Sep 17 00:00:00 2001
 From: superc <superc@localhost>
 Date: Fri, 6 Nov 2026 18:16:22 +0800
-Subject: [PATCH 4/4] superc: T!error functions with try/catch
+Subject: [PATCH 4/5] superc: T!error functions with try/catch
 
 - 'T!error' suffix on function declarators (before the declarator,
   after a '*' or after the whole declarator), stored in FuncAttr and

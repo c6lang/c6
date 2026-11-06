@@ -195,6 +195,7 @@ catch-clause           = "catch" , [ catch-binding ] , compound-statement ;
 
 catch-binding          = identifier
                        | "(" , [ identifier ] , ")" ;
+                         (* 只接受标识符，写别的记号会报 '{' expected *)
 
 call-expression        = postfix-expression , "(" ,
                          [ argument-expression-list ] , ")" ;
@@ -262,7 +263,7 @@ parameter-list         = identifier , { "," , identifier } ;
 | C3 | `try` 的被调函数返回类型必须标记了 `!error` | 同 C2 |
 | C4 | `catch` 的操作数必须是调用表达式 | `'catch' requires a call to a function returning 'T!error'` |
 | C5 | `catch` 的被调函数返回类型必须标记了 `!error` | 同 C4 |
-| C6 | `catch` 的处理块必须自己离开（`return` / `err(id, msg)` / `goto`） | `'catch' body must end with 'return', 'err()' or 'goto'` |
+| C6 | `catch` 的处理块必须自己离开（`return` / `err(id, msg)` / `goto`） | `'catch' body must end with 'return', 'err()' or 'goto'`；静态判断不出来时改为插入运行时陷阱 |
 | C7 | `catch` 必须带操作数 | `'catch' has no operand` |
 | C8 | `!error` 必须修饰函数（或函数指针）声明符 | `'!error' requires a function declarator` |
 | C9 | `!error` 的函数返回类型必须能表示哨兵 `-1`（标量或枚举） | `'!error' requires a return type representable by -1` |
@@ -271,7 +272,7 @@ parameter-list         = identifier , { "," , identifier } ;
 | C12 | 返回类型大小未知（不完整类型）的函数不能传播错误 | `cannot propagate an error from a function with an incomplete return type` |
 | C13 | `package` 内的符号被改写为 `NAME__sym`，`main` 除外 | — |
 | C14 | `impl IFACE for TYPE` 必须定义接口中的全部方法且签名兼容 | `impl of 'I' does not define method 'm'` 等 |
-| C15 | `T!error` 调用的结果必须被 `try` 或 `catch` 消费 | `the result of a 'T!error' function must be used with 'try' or 'catch'` |
+| C15 | `T!error` 调用的结果必须被 `try` 或 `catch` 消费（`sizeof` / `typeof` 的操作数不产生调用，不受此限） | `the result of a 'T!error' function must be used with 'try' or 'catch'` |
 | C16 | `err` 必须带 `id` 与 `msg` 两个实参（没有重抛形式） | `'err' requires an error id and a message` |
 | C17 | `err` 只能出现在返回 `T!error` 的函数里 | `'err' requires the enclosing function to return 'T!error'` |
 
@@ -297,15 +298,17 @@ err(id, msg);
 （`the result of a 'T!error' function must be used with 'try' or 'catch'`），
 保证错误不会被静默忽略。
 
-**R3 — `try` 清空错误槽**：进入 `try` 之前先把错误槽清零，只有本次调用
-写入的错误才会被传播，`try` 之后槽里也是空的。
+**R3 — 每次 `T!error` 调用都从干净的错误槽开始**：调用之前先执行
+`__tcc_err_clear()`，因此调用之后的错误槽只反映这一次调用。这样
+`catch` 不会把之前遗留的错误误判成这次调用的失败，`try` 之后槽里也
+必然是空的。
 
 **R4 — `try f(args)`**
 
 ```
 try f(args)
 =>
-    __tcc_err_clear();             (* 从干净的错误槽开始 *)
+    __tcc_err_clear();             (* 由调用点插入，见 R3 *)
     $T tmp = f(args);              (* 记下返回值，失败时哨兵即 -1 *)
     if (__tcc_err_flag_get()) {
         <本函数帧的 errdefer 与 defer，按注册逆序就地展开>
@@ -321,7 +324,7 @@ try f(args)
 ```
 expr catch e { body }
 =>
-    $T tmp = expr;                 (* expr 必须是一次调用 *)
+    $T tmp = expr;                 (* expr 必须是一次调用，调用前清槽 *)
     if (__tcc_err_flag_get()) {
         error e = __tcc_error_take();   (* 快照 id/msg，并清空错误槽 *)
         body;                           (* body 必须自己离开 *)
@@ -331,7 +334,9 @@ expr catch e { body }
 ```
 
 绑定形式 `catch { … }` 与 `catch (e) { … }` 等价于不绑定变量或绑定变量，
-`catch () { … }` 等价于 `catch { … }`。
+`catch () { … }` 等价于 `catch { … }`。处理块必须先离开；当编译器无法
+静态证明（例如 `if (c) return 1;` 没有 else）时，仍在处理块末尾插入
+`__tcc_catch_fallthrough()` 作为陷阱，避免悄悄落回成功路径。
 
 **R6 — `T!error f(…)`**：只改变调用点的类型信息（允许 `try` / `catch`
 作用其上），不改变调用约定；哨兵值 `-1` 由失败方写入返回值。
