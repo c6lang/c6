@@ -491,6 +491,55 @@ tag 本身就是类型名，`struct` / `union` / `enum` 关键字可以省略（
   新的局部不完整 tag：本特性**不做任何隐式前置声明**。
 * 只在 `-std=c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
 
+### 3.8 元组类型 `(T1, T2, ...)`
+
+```
+type-specifier         = "(" , type-name , "," , type-name ,
+                         { "," , type-name } , ")" ;      (* c6：≥2 个元素 *)
+
+tuple-literal          = "(" , type-name , "," , type-name ,
+                         { "," , type-name } , ")" , initializer-list ;
+tuple-element-access   = postfix-expression , "[" , integer-constant , "]" ;
+```
+
+元组是布局固定的值类型，用来把多个值一起传出去；元素用**常量下标**访问
+（约束 C51–C60）：
+
+```c
+    (int, int) divmod(int a, int b) { return {a / b, a % b}; }
+    (int, double) average(int a, int b) { return {(a + b) / 2, (a + b) / 2.0}; }
+
+    (int q, int r) = divmod(17, 5);     (* 解构声明 *)
+    (a, b) = divmod(100, 7);            (* 解构赋值 *)
+    (int high, _) = divmod(100, 7);     (* '_' 丢弃这个元素 *)
+
+    (int, int) t = {1, 2};
+    t[0] = 9;                           (* 常量下标读写 *)
+    int n = sizeof((int, int));         (* 8 *)
+    (int, int) u = (int, int){3, 4};    (* 复合字面量 *)
+    int z = ((int, int){5, 6})[1];      (* 6 *)
+
+    struct Holder { (int, int) t; };    (* 结构体成员 *)
+    (int, int) arr[4];                  (* 数组元素 *)
+    ((int, int), int) nested;           (* 元素也可以是元组 *)
+```
+
+* 元组复用 `VT_STRUCT`：内部有一个 tag `__c6_tuple_N`，成员名 `__c6_t0`…
+  只为实现细节。布局在**构造类型时**按自然对齐算好（
+  `off = (off + align - 1) & -align`），与 `#pragma pack` 无关，因此同一个
+  元组在任何 TU 都是同一个 ABI，并且与等价的 struct 完全一致——元组不引入
+  任何新 ABI，参数和返回值都走已有的 struct 路径；
+* 元素类型必须完整、非 `void`、非函数类型、非变长数组（C51），并且必须
+  **在文件作用域可见**（C52，内部 tag 注册在全局作用域）；`error` 不能作
+  元素（C53）；
+* 至少两个元素（C54）。一元括号仍然只是普通括号：`(int)` 是强转，不是元组；
+* 元组类型可以出现在任何类型位置：变量定义、形参、返回值、结构体成员、
+  typedef、数组元素、强制转换、复合字面量、`sizeof` / `_Alignof`、切片元素；
+* 括号表达式的原有语义**不受影响**：`(void)printf(…)`、`(int)x`、`(T)(x)`、
+  `(struct S){…}`、语句表达式 `({ … })`、逗号表达式 `(a, b)` 全部按老 C
+  解析——只有当括号里是一串“类型 [, 类型…]”且右括号前没有名字时才按元组
+  类型解析（解析器做投机 + 回滚）。
+
 ---
 
 ## 4. 语句
@@ -509,7 +558,8 @@ statement              = labeled-statement
                        | co-statement
                        | go-statement
                        | task-declaration
-                       | foreach-statement ;
+                       | foreach-statement
+                       | tuple-destructuring ;
 
 defer-statement        = "defer" , statement ;
                          (* 注册时跳过；离开作用域或返回/重抛时按注册的
@@ -543,7 +593,21 @@ binder                 = identifier | "_" ;
 iterable               = range | conditional-expression ;
 range                  = conditional-expression , ":" , conditional-expression ;
                          (* 半开区间 [lo, hi)：两个界都只求值一次 *)
+
+tuple-destructuring    = "(" , tuple-pattern , ")" , "=" ,
+                         conditional-expression , ";" ;
+tuple-pattern          = pattern-element , "," , pattern-element ,
+                         { "," , pattern-element } ;
+pattern-element        = type-specifier , declarator      (* 解构声明 *)
+                       | "_"                              (* 丢弃这个元素 *)
+                       | unary-expression ;               (* 解构赋值 *)
 ```
+
+`tuple-destructuring` 只做**语句**形式，不产生表达式：右边必须是一个元组
+值（C57），元素个数必须与模式一致（C55），模式要么全是“类型 + 名字”
+（解构声明，新声明这些变量），要么全是左值或 `_`（解构赋值）。`_` 表示丢弃
+对应元素，不建符号、不生成加载（C60）；混写两种形式会退回普通表达式解析，
+因此会得到普通 C 的语法错误（C56）。
 
 `foreach` 的三种可迭代对象与绑定数量一一对应：
 
@@ -690,7 +754,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C6 | `catch` 的处理块必须自己离开（`return` / `err(id, msg)` / `goto`） | `'catch' body must end with 'return', 'err()' or 'goto'`；静态判断不出来时改为插入运行时陷阱 |
 | C7 | `catch` 必须带操作数 | `'catch' has no operand` |
 | C8 | `!error` 必须修饰函数（或函数指针）声明符 | `'!error' requires a function declarator` |
-| C9 | `!error` 的函数返回类型必须能表示哨兵 `-1`（标量或枚举） | `'!error' requires a return type representable by -1` |
+| C9 | `!error` 的函数返回类型必须是标量、枚举、指针、struct、union 或元组：标量失败时返回 `-1`，聚合类型失败时清零 | `'!error' does not support a 'double' return type` |
 | C10 | `expr` 中不能直接写裸 `catch` | 同 C7 |
 | C11 | `try` / `catch` / `err` 不得出现在 `defer` / `errdefer` 体内 | `'try' is not allowed in a defer body` 等 |
 | C12 | 返回类型大小未知（不完整类型）的函数不能传播错误 | `cannot propagate an error from a function with an incomplete return type` |
@@ -732,6 +796,16 @@ parameter-list    = identifier , { "," , identifier } ;
 | C48 | 区间两个界必须是整数 | `range bounds must be integers` |
 | C49 | 元素类型必须可赋值且完整 | `'foreach' cannot copy an element of type 'T'`；`cannot iterate over incomplete element type 'T'` |
 | C50 | 循环体必须是复合语句 | `'{' expected` |
+| C51 | 元组元素类型必须完整、非 `void`、非函数类型、非变长数组 | `'tuple' element cannot be 'void'`；`'tuple' element cannot be a function type`；`'tuple' element cannot be a variable length array`；`'tuple' requires a complete element type, not 'T'` |
+| C52 | 元素类型的 tag 必须在文件作用域 | `the element type of a tuple must be declared at file scope, but 'T' is local` |
+| C53 | `error` 不能作元组元素 | `'error' can only be a return type, not a tuple element` |
+| C54 | 元组至少两个元素（`(T)` 仍是普通括号表达式） | — |
+| C55 | 解构的元素个数必须与元组一致 | `the tuple has %d elements but the pattern has %d` |
+| C56 | 解构模式要么全是“类型 + 名字”，要么全是左值 / `_`，不能混写 | 退回普通表达式解析：`')' expected`、`expression expected before …`、`lvalue expected` |
+| C57 | 解构右边必须是元组 | `destructuring requires a tuple value` |
+| C58 | 元素下标必须是整数常量且在 `[0, n)` 内 | `constant expression expected`；`tuple index 2 is out of range (0..1)` |
+| C59 | `return { … };` 只能出现在返回类型为 struct / union / 元组的函数里 | `'return {…}' requires a struct, union or tuple return type` |
+| C60 | 解构不能把所有元素都丢弃 | `'tuple' discards every element` |
 
 ---
 
@@ -1070,6 +1144,70 @@ defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再�
 结束的只把计数留给下一次 `__c6_co_run()`。`task` 的清理登记复用
 `__tcc_defer_push`，因此和手写 `defer { __c6_co_destroy(t); }` 等价。
 
+**R17 — 元组类型与元素访问**
+
+```
+    (T1, T2) t;                 ⇒  struct __c6_tuple_N t;   (* 自然对齐布局 *)
+    t[k]                        ⇒  (*((T_{k+1} *)((char *)&t + off_k)))
+    t[k] = v                    ⇒  (*((T_{k+1} *)((char *)&t + off_k))) = v
+```
+
+`off_k` 与 `__c6_tuple_N` 的总大小在**构造类型时**一次算完并缓存，因此
+`t[k]` 不生成任何函数调用，也不依赖 `#pragma pack`。同一个元素类型序列
+只规范化出一个内部 tag，所以 `(int, int)` 在任何位置、任何 TU、任何
+`#pragma pack` 状态下都是同一个 `CType`。
+
+**R18 — 解构声明**
+
+```
+    (int q, int r) = expr;
+=>
+    (int, int) __c6_tuple_tmpK = expr;      (* 隐藏局部，左值 *)
+    int q = __c6_tuple_tmpK.__c6_t0;
+    int r = __c6_tuple_tmpK.__c6_t1;
+```
+
+`_` 位置的语句不生成（不建符号、不生成加载）。`expr` 只求值一次。
+
+**R19 — 解构赋值**
+
+```
+    (a, b) = expr;                          (* a、b 是左值 *)
+=>
+    (T1, T2) __c6_tuple_tmpK = expr;
+    a = __c6_tuple_tmpK.__c6_t0;
+    b = __c6_tuple_tmpK.__c6_t1;
+```
+
+逐元素走普通赋值（含通常的赋值类型检查），因此目标可以是变量、数组元素、
+`->` / `.` 成员、`*p` 等任何左值；元素个数不符是 C55。
+
+**R20 — `return { … };`**
+
+```
+    (T1, T2) f(void) { return {a, b}; }
+=>
+    (T1, T2) __c6_ret;                      (* 落在返回槽里 *)
+    __c6_ret.__c6_t0 = a;
+    __c6_ret.__c6_t1 = b;
+    return __c6_ret;
+```
+
+同样适用于 struct / union 返回值（C59 只要求返回类型是这三种之一）。
+
+**R21 — `!error` 的聚合返回值**
+
+```
+    return $S(T);                           (* 失败路径：$S(T) 是聚合类型 *)
+=>
+    memset(&__c6_ret, 0, sizeof(T));        (* 全零，而不是 -1 *)
+    return __c6_ret;
+```
+
+失败与否只由错误槽（`__tcc_err_flag_peek`）判定，返回值只承载成功路径的值，
+而 C15 又强制 `T!error` 的返回值必须被 `try` / `catch` 消费，因此失败路径上
+那个全零的值永远不可观测。标量返回类型仍用哨兵 `-1`（C9）。
+
 ---
 
 切片配合数组、函数与结构体：
@@ -1210,7 +1348,7 @@ int main(void)
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |
 | `catch` 处理块自然落到末尾 | 约束 C6 |
 | `int v = 0; try v;` | 约束 C1/C2 |
-| `struct S!error f(void)` | 约束 C9（结构体无法用 `-1` 表示哨兵） |
+| `double!error f(void)` | 约束 C9：`float`/`double` 既没有哨兵也不是聚合类型；struct / union / 元组可以 |
 | `int!error x;` | 约束 C8 |
 | `try` / `catch` / `err` 写在 `defer` 体内 | 约束 C11 |
 | `err();`（无参数重抛） | 约束 C16，请改用 `try` |
@@ -1270,6 +1408,19 @@ int main(void)
 | `foreach \|_, _\| a { }` | 约束 C46：两个绑定都丢弃没有意义 |
 | `foreach \|i\| a { }` / `foreach \|i, v\| 0:n { }` | 约束 C44/C45：绑定数量由可迭代对象决定 |
 | `interface iterator { bool has(); void *next(); }` + `for a \|i, v\| { }` | v1 不做运行期迭代协议：`void *next()` 会擦掉元素类型（每轮都要装箱/分配），而方法名不按接收者改名，`has`/`len`/`at` 会和用户函数撞名。可迭代对象限定为数组、切片和区间，其它类型请暴露一个切片成员 |
+| `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
+| `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
+| `t = {1, 2}` / `f({1, 2})`（元组字面量糖） | 不支持：显式写复合字面量 `(int, int){1, 2}` |
+| `(int q, int r) = 5;` | 约束 C57：右边必须是元组 |
+| `(int a, int) = f();` / `(a, int b) = f();` | 约束 C56：模式不能混写，退回普通表达式解析而报错 |
+| `(_, _) = f();` | 约束 C60：全丢弃应该直接写 `f();` |
+| `((int a, int b), int c) = f();`（嵌套解构） | 不支持：先解构外层，再解构内层 |
+| `(q, r) := f();`（`:=` 类型推断） | 不支持：解构声明要把元素类型写全 |
+| 函数里定义的 struct 当元组元素 | 约束 C52：元素类型必须在文件作用域可见 |
+| `(void, int)` / `(int[3], int)` / `(int f(), int)` / `(error, int)` | 约束 C51 / C53 |
+| 用 `#pragma pack` 改变元组布局 | 元组固定按自然对齐：跨 TU 的 ABI 不能随 pragma 状态变化 |
+| `(int, int) t; &t[0]` / 把元组直接当 `T[:]` 的底层数组 | 不支持：元素之间可能有 padding，不保证连续 |
+| `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
 ---
 
@@ -1298,6 +1449,13 @@ int main(void)
 | 变量初始化 | `c6_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
 | 裸 tag 类型名 | `parse_btype()` 的 `default` 分支：`sym_find()` 未命中时试 `struct_find()`，命中则走 `basic_type2`（与 `struct TAG` 同一条路径）；`ignore_label` 时 `TAG:` 退回标签 | `tcc/tccgen.c` |
 | `T[:]` 类型 | `parse_btype()` 的 `case '['`、`c6_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
+| `(T1, T2)` 元组类型 | `parse_btype()` 的 `case '('`（`c6_ext` 且还没有 `typespec_found` 时）：`c6_tuple_btype` 扫平衡括号、`c6_tuple_speculate` 重放 token 试一遍 `type_decl(TYPE_ABSTRACT\|TYPE_DIRECT)`，成功才认；`c6_tuple_get` 校验元素并规范化出内部 tag `__c6_tuple_N`；`c6_tuple_of_type` / `c6_tuple_ctype` 查询 | `tcc/tccgen.c` |
+| `t[k]` 元素访问 | `c6_tuple_subscript`（`unary()` 的 `[` 后置分支，先于切片下标） | `tcc/tccgen.c` |
+| 元组强转 / 复合字面量 / `sizeof` / `_Alignof` | `unary()` 的 `case '('` 元组分支（`c6_tuple_ate_paren` + `wrap` 处理多包一层括号的情形） | `tcc/tccgen.c` |
+| 解构声明 / 解构赋值 | `c6_tuple_lead_kind`（分类：表达式/类型/模式/赋值，全部靠 token 重放，失败即回滚）、`c6_tuple_destructure`（溢到隐藏局部再逐元素赋值，并重放语句） | `tcc/tccgen.c` |
+| `return { … };` | `c6_return_value`（普通函数与 `async` 函数共用） | `tcc/tccgen.c` |
+| 元组的类型回放 | `c6_async_type_tokens` 对元组输出 `(T1, T2)`（不复用内部 tag 名，否则跳板里会声明出一个作用域不同的新 struct） | `tcc/tccgen.c` |
+| `!error` 的聚合返回值 | `c6_apply_fallible`（白名单加 `VT_STRUCT` / `VT_UNION`）、`c6_zero_local`、`c6_emit_propagate` / `c6_async_propagate`（失败路径清零） | `tcc/tccgen.c` |
 | 切片下标 / 区间 | `c6_slice_subscript`（`unary()` 的 `[` 分支）、`c6_slice_spill` | `tcc/tccgen.c` |
 | 数组 → 切片 | `c6_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
 | `foreach` | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句）、`c6_common_int_type` / `c6_is_int_type`；数组/切片的隐藏槽复用 `c6_slice_spill`，循环体走 `lblock`；文件作用域诊断在 `decl()` | `tcc/tccgen.c` |
