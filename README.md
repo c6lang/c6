@@ -44,14 +44,21 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 
 ```sh
 # 1. 拉取上游 TCC，检出固定基线并应用 c6 补丁
+#    （tcc/ 已存在时改为同步到 patches/ 的当前内容）
 ./scripts/bootstrap.sh          # 等价于 make bootstrap
 
-# 2. 构建（打开扩展）
+# 2. 构建（打开扩展；会先自动执行 bootstrap）
 make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 
 # 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
 ./tcc/tcc -B tcc -std=c6 -run hello.c
 ```
+
+`make build` / `make selftest` / `make test-all` 都会先跑 `bootstrap`：`tcc/`
+缺失时克隆上游，`patches/` 有增删、改名或内容修改时把 `tcc/` 回到基线重新应用
+补丁，已经是最新则直接跳过。`tcc/` 是生成物；同步需要重建它时，如果里面有
+未提交的手改，bootstrap 会报错而不是静默覆盖——请把手改做成 `patches/` 里的
+补丁，或者用 `make distclean` 丢弃。
 
 如果网络需要代理，按环境要求导出即可（`git` 会读取）：
 
@@ -850,6 +857,7 @@ make test-all      # selftest + tests2
 ```
 
 > 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
+> 三个目标都会先跑 `bootstrap`，把 `tcc/` 同步到 `patches/` 的当前内容。
 
 ## 实现说明
 
