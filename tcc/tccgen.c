@@ -5281,7 +5281,29 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
             if (typespec_found)
                 goto the_end;
             s = sym_find(tok);
-            if (!s || !(s->type.t & VT_TYPEDEF))
+            if (!s) {
+#ifdef C6_EXT
+                Sym *tag;
+                /* c6: a visible struct/union/enum tag is a type name even
+                   without the keyword.  Only when the ordinary namespace
+                   does not own the name: 'struct stat' next to 'stat()'
+                   keeps C's meaning, so 'stat(...)' stays a call. */
+                if (tcc_state->c6_ext && (tag = struct_find(tok)) != NULL) {
+                    n = tok, next();
+                    if (tok == ':' && ignore_label) {
+                        /* ignore if it's a label */
+                        unget_tok(n);
+                        goto the_end;
+                    }
+                    /* same as 'struct/union/enum TAG' */
+                    type1.t = tag->type.t;
+                    type1.ref = tag;
+                    goto basic_type2;
+                }
+#endif
+                goto the_end;
+            }
+            if (!(s->type.t & VT_TYPEDEF))
                 goto the_end;
 
             n = tok, next();
