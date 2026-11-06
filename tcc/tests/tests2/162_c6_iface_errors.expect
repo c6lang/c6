@@ -1,17 +1,17 @@
 [test_missing_method]
-162_c6_iface_errors.c:8: error: impl of 'Shape' does not define method 'dump'
+162_c6_iface_errors.c:10: error: 'Circle' does not implement interface 'Shape': missing method 'dump'
 
 [test_wrong_param_count]
 162_c6_iface_errors.c:15: error: method 'area' of 'Shape' has the wrong number of parameters
 
 [test_wrong_return_type]
-162_c6_iface_errors.c:22: error: method 'area' of 'Shape' has an incompatible return type
+162_c6_iface_errors.c:20: error: method 'area' of 'Shape' has an incompatible return type
 
 [test_incompatible_param]
-162_c6_iface_errors.c:29: error: method 'scale' of 'Shape' has an incompatible parameter
+162_c6_iface_errors.c:25: error: method 'scale' of 'Shape' has an incompatible parameter
 
-[test_unknown_interface]
-162_c6_iface_errors.c:32: error: unknown interface 'Nope'
+[test_duplicate_method]
+162_c6_iface_errors.c:28: error: duplicate method 'area' for 'Circle'
 
-[test_duplicate_impl]
-162_c6_iface_errors.c:40: error: duplicate impl of 'Shape' for 'Circle'
+[test_method_after_use]
+162_c6_iface_errors.c:34: error: 'Circle' does not implement interface 'Shape': missing method 'area'

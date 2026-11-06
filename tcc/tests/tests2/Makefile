@@ -98,6 +98,8 @@ ifneq (,$(C6_OK))
  168_c6_pkg_dot_tu.test: GEN = $(GEN-TCC)
  171_c6_method_tu.test: FLAGS += $(subst 171,171+,$1)
  171_c6_method_tu.test: GEN = $(GEN-TCC)
+ 174_c6_iface_tu.test: FLAGS += $(subst 174,174+,$1)
+ 174_c6_iface_tu.test: GEN = $(GEN-TCC)
  # 172 mixes an extension unit with a unit built for plain C
  172_c6_plain_interop.test: NORUN = true
  172_c6_plain_interop.test: GEN = $(GEN-TCC)

@@ -1,4 +1,6 @@
-/* c6 extension: interface / impl (fat pointer + vtable) */
+/* c6 extension: interfaces (fat pointer + vtable).
+   A struct implements an interface by having the methods: there is no
+   'impl' declaration any more, the vtable is generated on demand. */
 #include <stdio.h>
 
 interface Shape {
@@ -12,24 +14,24 @@ interface Printable {
 
 struct Circle { int r; };
 struct Rect { int w, h; };
+typedef struct Circle Circle;
+typedef struct Rect Rect;
 
-impl Shape for Circle {
+/* same method names for different types: the package keeps them apart */
+package circle {
     int area(Circle *self) { return 3 * self->r * self->r; }
     const char *name(Circle *self) { return "circle"; }
-}
-
-impl Shape for Rect {
-    int area(Rect *self) { return self->w * self->h; }
-    const char *name(Rect *self) { return "rect"; }
-}
-
-impl Printable for Circle {
     void print(Circle *self) { printf("Circle(%d)", self->r); }
 }
 
-impl Printable for Rect {
+package rect {
+    int area(Rect *self) { return self->w * self->h; }
+    const char *name(Rect *self) { return "rect"; }
     void print(Rect *self) { printf("Rect(%dx%d)", self->w, self->h); }
 }
+
+import circle;
+import rect;
 
 /* implicit conversion of a struct value to the interface value */
 static int describe(Shape s)
@@ -50,6 +52,15 @@ static void dump(Printable p)
     printf(" ");
 }
 
+/* a conversion inside a 'static inline' body: the body is compiled at the
+   very end of the unit, so its vtable must still be generated */
+static inline int inline_area(Circle c)
+{
+    Shape s = {0};
+    s = c;
+    return s.area();
+}
+
 int main(void)
 {
     Circle c = {0};
@@ -64,7 +75,6 @@ int main(void)
 
     s = c;
     show(s);
-
     s = r;
     show(s);
     printf("\n");
@@ -84,5 +94,6 @@ int main(void)
     printf("\n");
 
     printf("sizeof=%d\n", (int)sizeof(Shape));
+    printf("inline=%d\n", inline_area(c));
     return 0;
 }

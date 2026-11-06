@@ -446,7 +446,6 @@
      DEF(TOK_C6_PACKAGE,   "package")
      DEF(TOK_C6_IMPORT,    "import")
      DEF(TOK_C6_INTERFACE, "interface")
-     DEF(TOK_C6_IMPL,      "impl")
      DEF(TOK_C6_DEFER,     "defer")
      DEF(TOK_C6_ERRDEFER,  "errdefer")
      DEF(TOK_C6_ERR,       "err")

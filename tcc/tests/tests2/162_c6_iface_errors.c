@@ -1,44 +1,40 @@
-/* c6 extension: diagnostics for malformed 'impl' blocks */
+/* c6 extension: diagnostics for structured interfaces.
+   A struct implements an interface by having the methods; the check
+   happens at the first conversion, so every branch below converts. */
+struct Circle { int r; };
+
 #if defined test_missing_method
 interface Shape { int area(); void dump(int n); }
-struct Circle { int r; };
-impl Shape for Circle {
-    int area(Circle *self) { return self->r; }
-}
-int main(void) { return 0; }
+int area(struct Circle *self) { return self->r; }
+static int use(Shape s) { return s.area(); }
+int main(void) { struct Circle c = {1}; return use(c); }
 #elif defined test_wrong_param_count
 interface Shape { int area(); }
-struct Circle { int r; };
-impl Shape for Circle {
-    int area(Circle *self, int extra) { return self->r + extra; }
-}
-int main(void) { return 0; }
+int area(struct Circle *self, int extra) { return self->r + extra; }
+static int use(Shape s) { return s.area(); }
+int main(void) { struct Circle c = {1}; return use(c); }
 #elif defined test_wrong_return_type
 interface Shape { int area(); }
-struct Circle { int r; };
-impl Shape for Circle {
-    char *area(Circle *self) { return 0; }
-}
-int main(void) { return 0; }
+char *area(struct Circle *self) { return 0; }
+static int use(Shape s) { return s.area(); }
+int main(void) { struct Circle c = {1}; return use(c); }
 #elif defined test_incompatible_param
 interface Shape { int scale(int n); }
-struct Circle { int r; };
-impl Shape for Circle {
-    int scale(Circle *self, char *n) { return self->r + (n != 0); }
-}
+int scale(struct Circle *self, char *n) { return self->r + (n != 0); }
+static int use(Shape s) { return s.scale(2); }
+int main(void) { struct Circle c = {1}; return use(c); }
+#elif defined test_duplicate_method
+package a { int area(struct Circle *self) { return self->r; } }
+package b { int area(struct Circle *self) { return self->r + 1; } }
 int main(void) { return 0; }
-#elif defined test_unknown_interface
-struct Circle { int r; };
-impl Nope for Circle {
-    int area(Circle *self) { return self->r; }
-}
-int main(void) { return 0; }
-#elif defined test_duplicate_impl
+#elif defined test_method_after_use
 interface Shape { int area(); }
-struct Circle { int r; };
-impl Shape for Circle { int area(Circle *self) { return 1; } }
-impl Shape for Circle { int area(Circle *self) { return 2; } }
-int main(void) { return 0; }
+static int use(Shape s) { return s.area(); }
+/* the conversion below cannot see a method that is declared only later */
+int main(void) { struct Circle c = {1}; return use(c); }
+int area(struct Circle *self) { return self->r; }
 #else
-int main(void) { return 0; }
+interface Shape { int area(); }
+int area(struct Circle *self) { return self->r; }
+int main(void) { struct Circle c = {1}; Shape s = {0}; s = c; return s.area(); }
 #endif

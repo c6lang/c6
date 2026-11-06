@@ -167,6 +167,16 @@ typedef struct C6Method {
 } C6Method;
 static C6Method *c6_methods;
 static int c6_nb_methods;
+/* an interface converted from a struct type: one vtable object per pair */
+typedef struct C6AutoImpl {
+    struct C6Iface *iface;
+    int type_tag;
+    int vt_tok;      /* token of the emitted vtable object */
+    Sym *vt_sym;     /* its forward symbol */
+    int vt_emitted;  /* the object definition has been generated */
+} C6AutoImpl;
+static C6AutoImpl **c6_auto_impls;
+static int c6_nb_auto_impls;
 /* non-zero while vtop holds the result of a call to a 'T!error' function */
 static int c6_value_fallible;
 /* symbol of the function being compiled (needed by 'try' to check that the
@@ -196,7 +206,8 @@ static void c6_test_parse(void);
 static void c6_package_parse(void);
 static void c6_import_parse(void);
 static void c6_interface_parse(void);
-static void c6_impl_parse(void);
+static int c6_emit_auto_impls(void);
+static void c6_tu_reset(void);
 static int c6_iface_convert(CType *dt);
 typedef struct C6Iface C6Iface_t;
 static C6Iface *c6_iface_of_type(CType *type);
@@ -525,6 +536,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     c6_value_fallible = 0;
     c6_last_stmt_leaves = 0;
     c6_decl_fallible = 0;
+    c6_tu_reset();
 #endif
     debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
     global_expr = 0;
@@ -540,7 +552,18 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
     next();
     decl(VT_CONST);
+#ifdef C6_EXT
+    /* interfaces converted in this unit get their vtable object here, but a
+       'static inline' body is only compiled now, and such a body may contain
+       a conversion itself: alternate until nothing new turns up */
+    for (;;) {
+        gen_inline_functions(s1);
+        if (!c6_emit_auto_impls())
+            break;
+    }
+#else
     gen_inline_functions(s1);
+#endif
     check_vstack();
     /* end of translation unit info */
 #if TCC_EH_FRAME
@@ -7781,31 +7804,6 @@ static int c6_iface_has_method(C6Iface *ifc, int m)
     return 0;
 }
 
-static C6Impl *c6_impl_find(C6Iface *ifc, int type_tag)
-{
-    int i;
-    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
-        C6Impl *imp = tcc_state->c6_impls[i];
-        if (imp->iface == ifc && imp->type_tag == type_tag)
-            return imp;
-    }
-    return NULL;
-}
-
-/* resolve TYPE (a typedef name or a 'struct' tag) to its struct tag token */
-static int c6_struct_tag(int type_tok)
-{
-    Sym *st = struct_find(type_tok);
-    if (!st) {
-        Sym *ts = sym_find(type_tok);
-        if (ts && (ts->type.t & VT_BTYPE) == VT_STRUCT && ts->type.ref)
-            st = ts->type.ref;
-    }
-    if (!st || !(st->v & SYM_STRUCT))
-        return 0;
-    return st->v & ~SYM_STRUCT;
-}
-
 /* Parse TS (a synthetic token string ending in TOK_EOF) as file scope
    declarations.  The current token is left untouched and warnings are
    suppressed, since the generated declarations are compiler-internal. */
@@ -7936,200 +7934,6 @@ static void c6_interface_parse(void)
     tok_str_free(body);
 }
 
-/* Verify that 'impl IFACE for TYPE' defines every method with a
-   compatible signature.  'pkg' is the pseudo package holding them. */
-static void c6_check_impl(C6Iface *ifc, const char *pkg)
-{
-    Sym *vt = struct_find(ifc->vt_tag);
-    CType vtt;
-    int i;
-
-    if (!vt)
-        return;
-    /* the tag symbol does not carry the struct type itself */
-    vtt.t = VT_STRUCT;
-    vtt.ref = vt;
-    for (i = 0; i < ifc->nb_methods; i++) {
-        int m = ifc->methods[i];
-        const char *mname = get_tok_str(m, NULL);
-        Sym *f, *g, *fp, *gp, *fr, *gr;
-        CType *fptr, *gfun;
-        int ofs;
-
-        f = find_field(&vtt, m, &ofs);
-        if (!f || (f->type.t & VT_BTYPE) != VT_PTR)
-            continue;
-        fptr = pointed_type(&f->type);      /* RET (*)(void *, ...) */
-        if ((fptr->t & VT_BTYPE) != VT_FUNC || !fptr->ref)
-            continue;
-        g = sym_find(c6_mangle_tok(pkg, m));
-        if (!g)
-            tcc_error("impl of '%s' does not define method '%s'",
-                      ifc->name, mname);
-        if ((g->type.t & VT_BTYPE) != VT_FUNC || !g->type.ref)
-            tcc_error("method '%s' of '%s' must be a function", mname,
-                      ifc->name);
-        gfun = &g->type;                    /* RET (*)(...) */
-        fr = fptr->ref;
-        gr = gfun->ref;
-        if (!is_compatible_types(&fr->type, &gr->type))
-            tcc_error("method '%s' of '%s' has an incompatible return type",
-                      mname, ifc->name);
-        /* the first parameter of both is the 'self' pointer */
-        fp = fr->next;
-        gp = gr->next;
-        if (fp)
-            fp = fp->next;
-        if (gp)
-            gp = gp->next;
-        while (fp && gp) {
-            if (!is_compatible_types(&fp->type, &gp->type))
-                tcc_error("method '%s' of '%s' has an incompatible "
-                          "parameter", mname, ifc->name);
-            fp = fp->next;
-            gp = gp->next;
-        }
-        if (fp || gp)
-            tcc_error("method '%s' of '%s' has the wrong number of "
-                      "parameters", mname, ifc->name);
-    }
-}
-
-static void c6_impl_parse(void)
-{
-    C6Iface *ifc;
-    C6Impl *imp;
-    TokenString *ts;
-    char *saved_pkg, *pkgname;
-    char buf[256];
-    int iface_tok, type_tok, type_tag, i;
-
-    next();                          /* skip 'impl' */
-    if (tok < TOK_UIDENT)
-        expect("interface name");
-    iface_tok = tok;
-    next();
-    if (tok != TOK_FOR)
-        expect("for");
-    next();
-    if (tok == TOK_STRUCT)
-        next();
-    if (tok < TOK_UIDENT)
-        expect("type name");
-    type_tok = tok;
-    next();
-
-    ifc = c6_iface_find(iface_tok);
-    if (!ifc)
-        tcc_error("unknown interface '%s'", get_tok_str(iface_tok, NULL));
-    type_tag = c6_struct_tag(type_tok);
-    if (!type_tag)
-        tcc_error("'%s' is not a struct or union type",
-                  get_tok_str(type_tok, NULL));
-    /* a declaration-only impl may be followed by the real definition */
-    for (i = 0; i < tcc_state->c6_nb_impls; i++) {
-        C6Impl *o = tcc_state->c6_impls[i];
-        if (o->iface == ifc && o->type_tag == type_tag) {
-            if (!o->is_decl)
-                tcc_error("duplicate impl of '%s' for '%s'", ifc->name,
-                          get_tok_str(type_tok, NULL));
-            memmove(&tcc_state->c6_impls[i], &tcc_state->c6_impls[i + 1],
-                    (tcc_state->c6_nb_impls - i - 1) * sizeof(C6Impl *));
-            tcc_state->c6_nb_impls--;
-            tcc_free(o);
-            break;
-        }
-    }
-
-    /* Make the type name usable as a type inside the impl body, so that
-       'void draw(Circle *self)' works for 'impl Drawable for Circle'. */
-    ts = tok_str_alloc();
-    tok_str_add(ts, TOK_TYPEDEF);
-    tok_str_add(ts, TOK_STRUCT);
-    tok_str_add(ts, type_tag);
-    tok_str_add(ts, type_tok);
-    tok_str_add(ts, ';');
-    tok_str_add(ts, TOK_EOF);
-    c6_decl_tokens(ts);
-
-    if (tok == ';') {
-        /* 'impl IFACE for TYPE;' only declares that the impl exists (it is
-           defined in another translation unit): reference its vtable. */
-        next();
-        imp = tcc_mallocz(sizeof *imp);
-        imp->iface = ifc;
-        imp->type_tag = type_tag;
-        snprintf(buf, sizeof buf, "__tcc_vt_%s_%s",
-                 get_tok_str(type_tag, NULL), ifc->name);
-        imp->vt_tok = tok_alloc_const(buf);
-        imp->is_decl = 1;
-        ts = tok_str_alloc();
-        tok_str_add(ts, TOK_EXTERN);
-        tok_str_add(ts, TOK_CONST1);
-        tok_str_add(ts, TOK_STRUCT);
-        tok_str_add(ts, ifc->vt_tag);
-        tok_str_add(ts, imp->vt_tok);
-        tok_str_add(ts, ';');
-        tok_str_add(ts, TOK_EOF);
-        c6_decl_tokens(ts);
-        dynarray_add(&tcc_state->c6_impls,
-                     &tcc_state->c6_nb_impls, imp);
-        return;
-    }
-
-    /* The method definitions are ordinary functions.  Parse them inside a
-       pseudo package so that their names do not collide between impls. */
-    snprintf(buf, sizeof buf, "__tcc_impl_%s_%s",
-             get_tok_str(type_tag, NULL), ifc->name);
-    pkgname = tcc_strdup(buf);
-    saved_pkg = tcc_state->c6_package;
-    tcc_state->c6_package = pkgname;
-    skip('{');
-    while (tok != '}' && tok != TOK_EOF)
-        decl(VT_CONST);
-    skip('}');
-    tcc_state->c6_package = saved_pkg;
-    c6_check_impl(ifc, pkgname);
-
-    /* Emit the vtable object:
-       'const struct NAME_vt __tcc_vt_TYPE_NAME = { (void(*)(void))m, ... };' */
-    imp = tcc_mallocz(sizeof *imp);
-    imp->iface = ifc;
-    imp->type_tag = type_tag;
-    snprintf(buf, sizeof buf, "__tcc_vt_%s_%s",
-             get_tok_str(type_tag, NULL), ifc->name);
-    imp->vt_tok = tok_alloc_const(buf);
-
-    ts = tok_str_alloc();
-    tok_str_add(ts, TOK_CONST1);
-    tok_str_add(ts, TOK_STRUCT);
-    tok_str_add(ts, ifc->vt_tag);
-    tok_str_add(ts, imp->vt_tok);
-    tok_str_add(ts, '=');
-    tok_str_add(ts, '{');
-    for (i = 0; i < ifc->nb_methods; i++) {
-        if (i)
-            tok_str_add(ts, ',');
-        tok_str_add(ts, '(');
-        tok_str_add(ts, TOK_VOID);
-        tok_str_add(ts, '(');
-        tok_str_add(ts, '*');
-        tok_str_add(ts, ')');
-        tok_str_add(ts, '(');
-        tok_str_add(ts, TOK_VOID);
-        tok_str_add(ts, ')');
-        tok_str_add(ts, ')');
-        tok_str_add(ts, c6_mangle_tok(pkgname, ifc->methods[i]));
-    }
-    tok_str_add(ts, '}');
-    tok_str_add(ts, ';');
-    tok_str_add(ts, TOK_EOF);
-    c6_decl_tokens(ts);
-
-    dynarray_add(&tcc_state->c6_impls,
-                 &tcc_state->c6_nb_impls, imp);
-}
-
 /* rewrite 'iface.meth (args...)' into a vtable call passing the hidden
    'self' pointer as the first argument; leaves the function pointer on
    the stack and arms 'c6_self_pending' for the call code */
@@ -8184,30 +7988,239 @@ static void c6_iface_call_prep(C6Iface *ifc, int mname)
     c6_self_pending = 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* structured interfaces: a struct implements an interface when it has  */
+/* every method the interface declares.  There is no 'impl' syntax any  */
+/* more: the conformance check happens at the first conversion, and the  */
+/* vtable is an ordinary static object emitted at the end of the unit.  */
+
+static C6AutoImpl *c6_auto_impl_find(C6Iface *ifc, int tag)
+{
+    int i;
+
+    for (i = 0; i < c6_nb_auto_impls; i++)
+        if (c6_auto_impls[i]->iface == ifc
+            && c6_auto_impls[i]->type_tag == tag)
+            return c6_auto_impls[i];
+    return NULL;
+}
+
+static C6Method *c6_method_of(int tag, int name)
+{
+    C6Method *m;
+
+    for (m = c6_methods; m; m = m->next)
+        if (m->type_tag == tag && m->name == name)
+            return m;
+    return NULL;
+}
+
+/* compare one vtable field 'RET (*)(void *, ...)' with the method type */
+static void c6_check_method(C6Iface *ifc, int m, Sym *meth)
+{
+    Sym *vt = struct_find(ifc->vt_tag);
+    CType vtt;
+    Sym *f, *fp, *gp, *fr, *gr;
+    CType *fptr;
+    const char *mname = get_tok_str(m, NULL);
+    int ofs;
+
+    if (!vt)
+        return;
+    vtt.t = VT_STRUCT;
+    vtt.ref = vt;
+    f = find_field(&vtt, m, &ofs);
+    if (!f || (f->type.t & VT_BTYPE) != VT_PTR)
+        return;
+    fptr = pointed_type(&f->type);
+    if ((fptr->t & VT_BTYPE) != VT_FUNC || !fptr->ref)
+        return;
+    if ((meth->type.t & VT_BTYPE) != VT_FUNC || !meth->type.ref)
+        tcc_error("method '%s' of '%s' must be a function", mname, ifc->name);
+    fr = fptr->ref;
+    gr = meth->type.ref;
+    if (!is_compatible_types(&fr->type, &gr->type))
+        tcc_error("method '%s' of '%s' has an incompatible return type",
+                  mname, ifc->name);
+    /* both parameter lists start with the receiver */
+    fp = fr->next;
+    gp = gr->next;
+    if (fp)
+        fp = fp->next;
+    if (gp)
+        gp = gp->next;
+    while (fp && gp) {
+        if (!is_compatible_types(&fp->type, &gp->type))
+            tcc_error("method '%s' of '%s' has an incompatible parameter",
+                      mname, ifc->name);
+        fp = fp->next;
+        gp = gp->next;
+    }
+    if (fp || gp)
+        tcc_error("method '%s' of '%s' has the wrong number of parameters",
+                  mname, ifc->name);
+}
+
+/* register (once) that TYPE implements IFACE and create its vtable symbol */
+static C6AutoImpl *c6_auto_impl_ensure(C6Iface *ifc, int tag)
+{
+    C6AutoImpl *a;
+    C6Method *meth;
+    CType vtt;
+    AttributeDef ad;
+    Sym *vt;
+    char buf[256];
+    int i;
+
+    a = c6_auto_impl_find(ifc, tag);
+    if (a)
+        return a;
+    for (i = 0; i < ifc->nb_methods; i++) {
+        int m = ifc->methods[i];
+        meth = c6_method_of(tag, m);
+        if (!meth)
+            tcc_error("'%s' does not implement interface '%s': "
+                      "missing method '%s'", c6_tag_name(tag), ifc->name,
+                      get_tok_str(m, NULL));
+        c6_check_method(ifc, m, sym_find_raw(meth->sym_tok));
+    }
+    vt = struct_find(ifc->vt_tag);
+    if (!vt)
+        return NULL;
+    if (tag >= SYM_FIRST_ANOM)
+        snprintf(buf, sizeof buf, "__tcc_vt_anon%d_%s",
+                 tag - SYM_FIRST_ANOM, ifc->name);
+    else
+        snprintf(buf, sizeof buf, "__tcc_vt_%s_%s", get_tok_str(tag, NULL),
+                 ifc->name);
+    a = tcc_mallocz(sizeof *a);
+    a->iface = ifc;
+    a->type_tag = tag;
+    a->vt_tok = tok_alloc_const(buf);
+    /* a forward reference (extern, so it is no definition yet), defined by
+       c6_emit_auto_impls() at the end of the unit */
+    vtt.t = VT_STRUCT | VT_STATIC | VT_CONSTANT | VT_EXTERN;
+    vtt.ref = vt;
+    memset(&ad, 0, sizeof ad);
+    a->vt_sym = external_sym(a->vt_tok, &vtt, 0, &ad);
+    dynarray_add(&c6_auto_impls, &c6_nb_auto_impls, a);
+    return a;
+}
+
+/* emit 'static const struct IFACE_vt __tcc_vt_TYPE_IFACE = { m... };' for
+   every conversion that was used in this unit; returns how many were emitted */
+static int c6_emit_auto_impls(void)
+{
+    C6AutoImpl *a;
+    C6Iface *ifc;
+    TokenString *ts;
+    char *saved_pkg;
+    int i, j, n = 0;
+
+    if (!c6_nb_auto_impls)
+        return 0;
+    /* the object name is fixed: a file level 'package NAME;' must not
+       mangle it a second time */
+    saved_pkg = tcc_state->c6_package;
+    tcc_state->c6_package = NULL;
+    for (i = 0; i < c6_nb_auto_impls; i++) {
+        a = c6_auto_impls[i];
+        if (a->vt_emitted)
+            continue;
+        a->vt_emitted = 1;
+        n++;
+        ifc = a->iface;
+        ts = tok_str_alloc();
+        tok_str_add(ts, TOK_STATIC);
+        tok_str_add(ts, TOK_CONST1);
+        tok_str_add(ts, TOK_STRUCT);
+        tok_str_add(ts, ifc->vt_tag);
+        tok_str_add(ts, a->vt_tok);
+        tok_str_add(ts, '=');
+        tok_str_add(ts, '{');
+        for (j = 0; j < ifc->nb_methods; j++) {
+            if (j)
+                tok_str_add(ts, ',');
+            tok_str_add(ts, '(');
+            tok_str_add(ts, TOK_VOID);
+            tok_str_add(ts, '(');
+            tok_str_add(ts, '*');
+            tok_str_add(ts, ')');
+            tok_str_add(ts, '(');
+            tok_str_add(ts, TOK_VOID);
+            tok_str_add(ts, ')');
+            tok_str_add(ts, ')');
+            tok_str_add(ts, c6_method_of(a->type_tag,
+                                             ifc->methods[j])->sym_tok);
+        }
+        tok_str_add(ts, '}');
+        tok_str_add(ts, ';');
+        tok_str_add(ts, TOK_EOF);
+        c6_decl_tokens(ts);
+    }
+    tcc_state->c6_package = saved_pkg;
+    return n;
+}
+
+/* drop everything that must not survive into the next translation unit.
+   The scanner restarts its token table for every unit, and the state below
+   holds tokens and descriptors that would otherwise dangle or leak into the
+   next unit's lookup (imports, interfaces, methods, vtables).  The 'test'
+   entries are deliberately kept: '-test' collects them across units. */
+static void c6_tu_reset(void)
+{
+    C6Method *m, *next;
+    int i;
+
+    dynarray_reset(&c6_auto_impls, &c6_nb_auto_impls);
+    for (m = c6_methods; m; m = next) {
+        next = m->next;
+        tcc_free(m);
+    }
+    c6_methods = NULL;
+    c6_nb_methods = 0;
+    for (i = 0; i < tcc_state->c6_nb_ifaces; i++) {
+        C6Iface *ifc = tcc_state->c6_ifaces[i];
+        if (!ifc)
+            continue;
+        tcc_free(ifc->name);
+        tcc_free(ifc->methods);
+        /* the descriptor itself goes with the array */
+    }
+    dynarray_reset(&tcc_state->c6_ifaces, &tcc_state->c6_nb_ifaces);
+    dynarray_reset(&tcc_state->c6_imports, &tcc_state->c6_nb_imports);
+    tcc_free(tcc_state->c6_package);
+    tcc_state->c6_package = NULL;
+    c6_self_pending = 0;
+}
+
 /* Implicit conversion of a struct value to an interface value, e.g.
    'render(circle)' or 'Drawable d = circle;'.  Returns 0 when no
    conversion applies. */
 static int c6_iface_convert(CType *dt)
 {
     C6Iface *ifc;
-    C6Impl *imp;
+    C6AutoImpl *a;
     Sym *vs;
     int size, align, loc2;
 
-    if (!tcc_state->c6_ext || tcc_state->c6_nb_impls == 0)
+    if (!tcc_state->c6_ext || !tcc_state->c6_nb_ifaces)
         return 0;
     if ((vtop->type.t & VT_BTYPE) != VT_STRUCT || !vtop->type.ref)
         return 0;
     ifc = c6_iface_of_type(dt);
     if (!ifc)
         return 0;
-    imp = c6_impl_find(ifc, vtop->type.ref->v & ~SYM_STRUCT);
-    if (!imp)
+    /* an interface value stays an interface value: plain copy */
+    if (c6_iface_of_type(&vtop->type))
         return 0;
-    vs = sym_find(imp->vt_tok);
-    if (!vs)
-        tcc_error("impl of interface '%s' used before its definition",
-                  ifc->name);
+    /* a file scope initializer has no runtime code to build the value */
+    if (nocode_wanted)
+        return 0;
+    a = c6_auto_impl_ensure(ifc, vtop->type.ref->v & ~SYM_STRUCT);
+    if (!a)
+        return 0;
+    vs = a->vt_sym;
 
     size = type_size(dt, &align);
     loc2 = (loc - size) & -align;
@@ -8230,6 +8243,7 @@ static int c6_iface_convert(CType *dt)
     vset(dt, VT_LOCAL | VT_LVAL, loc2);
     return 1;
 }
+
 
 static int c6_ext_on(void)
 {
@@ -10682,10 +10696,6 @@ static int decl(int l)
             }
             if (tok == TOK_C6_INTERFACE) {
                 c6_interface_parse();
-                continue;
-            }
-            if (tok == TOK_C6_IMPL) {
-                c6_impl_parse();
                 continue;
             }
         }

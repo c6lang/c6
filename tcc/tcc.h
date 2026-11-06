@@ -753,13 +753,6 @@ typedef struct C6Iface {
     int *methods;    /* method name tokens, in declaration order */
 } C6Iface;
 
-/* one 'impl IFACE for TYPE { ... }' block */
-typedef struct C6Impl {
-    C6Iface *iface;
-    int type_tag;    /* struct tag of the implemented type */
-    int vt_tok;      /* token of the emitted vtable object */
-    int is_decl;     /* only declared here, defined in another TU */
-} C6Impl;
 #endif
 
 struct TCCState {
@@ -835,8 +828,6 @@ struct TCCState {
     /* 'interface' / 'impl' declarations */
     struct C6Iface **c6_ifaces;
     int c6_nb_ifaces;
-    struct C6Impl **c6_impls;
-    int c6_nb_impls;
 #endif
 
     unsigned char dflag; /* -dX value */
