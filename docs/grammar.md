@@ -438,6 +438,48 @@ int   __tcc_th_start(void *(*fn)(void *), void *arg);   (* 起线程，0 = 成�
 void  __c6_th_join_all(void);              (* 等本线程 go 出去的线程 *)
 ```
 
+### 3.7 tag 名直接作类型名（省略 `struct` / `union` / `enum`）
+
+```
+type-specifier         = "struct" , identifier
+                       | "union"  , identifier
+                       | "enum"   , identifier
+                       | identifier ;          (* c6：可见的 tag 名 *)
+```
+
+tag 本身就是类型名，`struct` / `union` / `enum` 关键字可以省略（约束 C41）：
+
+```
+    struct Vec { int x, y; };
+    struct Node { int v; Node *next; };   (* 定义体内就能省 *)
+    union Word { int i; float f; };
+    enum Color { RED = 1, GREEN = 2 };
+
+    Vec v = { 1, 2 };             (* 变量定义 *)
+    Vec *p = &v;                  (* 语句开头的 'Vec *p' 是声明 *)
+    Vec vec_add(Vec a, Vec b);    (* 形参、返回值 *)
+    struct Outer { Vec v; };      (* 结构体成员 *)
+    int n = sizeof(Vec);          (* sizeof / alignof *)
+    Vec *q = (Vec *)0;            (* 强转 *)
+    Vec w = (Vec){ 3, 4 };        (* 复合字面量 *)
+    Vec arr[2] = { {1,2}, {3,4} };
+    Vec[:] vs = arr;              (* 切片元素 *)
+    const Vec *cp = &v;           (* 限定符 *)
+    typedef Vec VecAlias;         (* typedef 的目标 *)
+    int vec_len(Vec *self);       (* 第一个形参是指针 => Vec 的方法 *)
+```
+
+* **普通命名空间优先**：同名变量、函数、枚举常量、typedef 在当前作用域可见时，
+  按老 C 语义解析，裸 tag 不生效——需要类型就写 `struct`。典型例子是
+  `<sys/stat.h>` 的 `struct stat` 与函数 `stat()`：`struct stat st;` 与
+  `stat(path, &st)` 都照旧，`stat st;` 不行。
+* 只接受**已经可见**的 tag，不会隐式前置声明：`S *p;` 在 `S` 没有声明时
+  仍然报 `'S' undeclared`。
+* 语句开头遇 `:` 时仍按标签解析（`TAG:` 是标签，不是类型）。
+* `TAG` 只是 tag 时，语句开头的 `TAG(...)` 按声明解析（与 C 里 typedef 名
+  的规则一致）；被函数遮蔽时按调用解析。
+* 只在 `-std=c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
+
 ---
 
 ## 4. 语句
@@ -632,6 +674,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C38 | `go` 的操作数必须是**普通函数**的调用：不能是 `async` 函数（用 `co`）、不能是函数指针、参数类型必须能写进参数块（数组/VLA/函数指针形参不行） | `the operand of 'go' must be a call of a plain function`；`'go' requires a plain function: 'f' is 'async' (use 'co')`；`'go' does not support this signature: 'f'` |
 | C39 | `go` 不支持变参函数（参数块要按声明的形参布局） | `'go' does not support variadic functions: 'f'` |
 | C40 | `go` 不支持 `!error` 函数（错误没人接） | `'go' does not support fallible functions: 'f'` |
+| C41 | 裸 tag 只有在该 tag 可见、且同名**普通符号**（变量/函数/枚举常量/typedef）不在作用域内时才当作类型名；只接受已声明的 tag，不隐式前置声明；语句开头的 `TAG:` 仍是标签 | —（遮蔽/未声明时按普通 C 解析：`';' expected`、`'X' undeclared`、`initialization of incomplete type`） |
 
 ---
 
@@ -1061,6 +1104,10 @@ int main(void)
 | `f() catch e;`（无处理块） | 语法错误 |
 | `catch e { … }` 单独出现 | 约束 C7 |
 | `int x;` / `static int x;` / `int a[3];`（不带初始化器的定义） | 约束 C19，VLA 除外 |
+| `Vec { int x, y; };`（定义处省略 `struct`） | 仍要写 `struct`：裸 `TAG { … }` 分不清 struct/union，也容易和初始化器混淆 |
+| `stat st;`（tag 名被函数/变量遮蔽） | 约束 C41：按普通 C 解析，需要类型时写 `struct stat` |
+| `S *p;` 而 `S` 未声明 | 约束 C41：不会隐式前置声明 tag，报 `'S' undeclared` |
+| `int x = Vec;`（tag 当值用） | tag 只在类型位置生效：`'Vec' undeclared` |
 | `math.add(1, 2)` 而此前没有 `import math;` | 约束 C14 |
 | `impl Shape for Circle { … }` | `impl` 不再是关键字，按普通声明解析而报错；改用「结构体拥有方法」实现接口 |
 | `v.f()`（值是结构体而不是指针） | 按普通成员访问报 `field not found: f`；方法调用只支持 `->` |
@@ -1122,6 +1169,7 @@ int main(void)
 | `catch` | `c6_catch_parse`（`expr_catch()` 层，位于 `expr_cond()` 之下） | `tcc/tccgen.c` |
 | `#macro` / `__local` | `parse_c6_macro` / `c6_hygiene_body` | `tcc/tccpp.c` |
 | 变量初始化 | `c6_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
+| 裸 tag 类型名 | `parse_btype()` 的 `default` 分支：`sym_find()` 未命中时试 `struct_find()`，命中则走 `basic_type2`（与 `struct TAG` 同一条路径）；`ignore_label` 时 `TAG:` 退回标签 | `tcc/tccgen.c` |
 | `T[:]` 类型 | `parse_btype()` 的 `case '['`、`c6_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
 | 切片下标 / 区间 | `c6_slice_subscript`（`unary()` 的 `[` 分支）、`c6_slice_spill` | `tcc/tccgen.c` |
 | 数组 → 切片 | `c6_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
