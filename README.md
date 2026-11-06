@@ -505,6 +505,8 @@ int main(void)
   调用完全一样；
 - `c6_io` 只有 `await c6_io(fd, ev)` 一种写法；`ev` 是
   `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
+- `c6_io` 的 `fd` 必须在 `[0, 1024)` 内；越界的任务按失败回收，
+  `__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败；
 - 运行时是单线程的固定池（64 个任务、每个 4 KiB 帧、每个 64 条 defer
   记录），`__c6_co_wait` 和 `__c6_co_run` 都用 `select()` 等 fd，
   `__c6_co_run` 对顶层任务做轮转。libtcc1 不依赖 libc。

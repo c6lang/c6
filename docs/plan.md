@@ -611,6 +611,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   / `c6_go_wait_fd()`）才会让出，没有让出点就等价于直接调用。现在报
   `'go' on a non-async function needs stackful coroutines (not implemented
   yet)`；
+- `c6_io` 的 fd 超出 `[0, 1024)` 时任务按失败回收（`__c6_co_wait` 返回
+  `-1`，`__c6_co_run` 计一次失败），不会永远 park 在 select 里；
 - 调度是**协作式**的：没有抢占，不 hook libc，阻塞的 `read`/`printf` 不会
   自动变成让出点；`__c6_co_run()` 对顶层任务做轮转，一次 `select()`
   等所有 park 住的 fd；

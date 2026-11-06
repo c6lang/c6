@@ -1,4 +1,4 @@
-From 26a9c87ddd1e9be3762690e4b297fc747282e034 Mon Sep 17 00:00:00 2001
+From 62b0ebdf5a5b127e5a6fcf3039133894c0531f14 Mon Sep 17 00:00:00 2001
 From: c6 <c6@localhost>
 Date: Sat, 7 Nov 2026 02:29:55 +0800
 Subject: [PATCH] c6: 'go' and 'task' keywords for top-level coroutines
@@ -19,18 +19,19 @@ returning the sentinel to the scheduler.
 
 The scheduler grows a top-level ready list with round-robin stepping and one
 select() for all parked leaves: __tcc_co_spawn / tcc_co_pump / __c6_co_run.
-A leaf whose fd is not ready stays parked instead of waking with rev 0, and
-the resume point after a suspension is emitted with code generation on again
-(it was silently suppressing the awaited value).
+A leaf whose fd is not ready stays parked instead of waking with rev 0; a
+leaf whose fd select() cannot wait for at all fails the task instead of
+parking it forever; and the resume point after a suspension is emitted with
+code generation on again (it was silently suppressing the awaited value).
 ---
- lib/libtcc1.c | 245 ++++++++++++++++++++++++++++++++++++++++++++------
- tccgen.c      | 187 +++++++++++++++++++++++++++++++++++++-
+ lib/libtcc1.c | 255 ++++++++++++++++++++++++++++++++++++++++++++------
+ tccgen.c      | 187 +++++++++++++++++++++++++++++++++++-
  tccpp.c       |   7 +-
  tcctok.h      |   2 +
- 4 files changed, 410 insertions(+), 31 deletions(-)
+ 4 files changed, 420 insertions(+), 31 deletions(-)
 
 diff --git a/lib/libtcc1.c b/lib/libtcc1.c
-index 45f6195..8ceae0c 100644
+index 45f6195..ec0378c 100644
 --- a/lib/libtcc1.c
 +++ b/lib/libtcc1.c
 @@ -858,9 +858,11 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
@@ -69,7 +70,7 @@ index 45f6195..8ceae0c 100644
  extern int select(int, void *, void *, void *, void *);
  
  static void tcc_co_trap(void)
-@@ -1096,42 +1105,220 @@ static int tcc_co_select(int fd, int ev)
+@@ -1096,42 +1105,230 @@ static int tcc_co_select(int fd, int ev)
      return rev;
  }
  
@@ -179,6 +180,16 @@ index 45f6195..8ceae0c 100644
 +                    nio++;
 +                    if (fd > maxfd)
 +                        maxfd = fd;
++                } else {
++                    /* c6_io() with an fd select() cannot wait for: fail the
++                       task and release it, like __c6_co_wait() returning -1.
++                       Leaving it in the list would park it forever. */
++                    *pp = (TccCoTask *)t->snext;
++                    t->snext = 0;
++                    if (errs)
++                        (*errs)++;
++                    __c6_co_destroy(t);
++                    continue;
 +                }
 +            } else if (k != C6_CO_KIND_SKIP) {
 +                ran = 1;
@@ -315,7 +326,7 @@ index 45f6195..8ceae0c 100644
  }
  
  /* Release a task and everything it owns.  A still-suspended body is dropped
-@@ -1139,7 +1326,6 @@ int __c6_co_wait(void *self)
+@@ -1139,7 +1336,6 @@ int __c6_co_wait(void *self)
  void __c6_co_destroy(void *self)
  {
      TccCoTask *t = (TccCoTask *)self;
@@ -323,7 +334,7 @@ index 45f6195..8ceae0c 100644
  
      if (!t)
          return;
-@@ -1147,6 +1333,7 @@ void __c6_co_destroy(void *self)
+@@ -1147,6 +1343,7 @@ void __c6_co_destroy(void *self)
          __c6_co_destroy(t->child);
      t->child = 0;
      t->parent = 0;
