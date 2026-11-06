@@ -42,8 +42,8 @@ static void lg(const char *s)
 
 /* ---- 被测函数 ----
  *
- * 用 err() 的函数必须声明成 'T!error'；它们的调用方必须用 try 或 catch
- * 消费错误，否则编译报错。 */
+ * 用 err(id, msg) 的函数必须声明成 'T!error'；它们的调用方必须用 try 或
+ * catch 消费错误，否则编译报错。err 执行后立即返回，没有 err() 重抛形式。 */
 
 /* 直接失败：err 之后语句不执行 */
 static int!error fail_direct(void)

@@ -147,7 +147,7 @@ __thread struct {
 
 ### 3.3 `err(id, msg)` 生成（修复 G5）
 
-`err()` 处**就地展开清理序列**，不跳转间接出口：
+`err(id, msg)` 处**就地展开清理序列**，不跳转间接出口：
 
 ```c
 __tcc_err.id = id;
@@ -198,7 +198,7 @@ int handle(int n) {
 - 判断“操作数确实是调用”用的是代码生成期的标志 `superc_value_fallible`：
   函数调用处置位，任何把它组合掉的操作（`gen_op` / `gen_cast` / `vstore` /
   `indir` / `gaddrof` / `inc` / 后缀运算）都会清零；
-- `catch` 处理块用 `superc_last_stmt_leaves` 检查是否以 `return` / `err()` /
+- `catch` 处理块用 `superc_last_stmt_leaves` 检查是否以 `return` / `err(id, msg)` /
   `goto` / `break` / `continue` 离开，否则编译报错，避免静默落回成功路径；
 - `test` 块合成的函数也带 `func_fallible`，因此 test 块里可以直接 `try`；
 - `--run` 下错误槽接口是普通全局变量（无 TLS），与 `err` 的限制一致。
@@ -317,7 +317,7 @@ for (int i = 0; i < s->test_count; i++) {
 
 ### 5.3 与 `err` / `defer` 的交互
 
-test 函数内 `err()` 就地展开清理后返回哨兵 `1`；`__tcc_err` 携带 id/msg 供 runner 报告。`defer` 正常执行。`return;` 视为 pass；`return expr;` 首版禁止。
+test 函数内 `err(id, msg)` 就地展开清理后返回哨兵 `1`；`__tcc_err` 携带 id/msg 供 runner 报告。`defer` 正常执行。`return;` 视为 pass；`return expr;` 首版禁止。
 
 ### 5.4 生成独立 runner（`-o` 模式）
 
@@ -424,7 +424,7 @@ int main(void) { return add(1, 2); }
 **通过，可进入实施。** 本版修复了上一版中 10 项阻塞/高风险缺口：
 
 - `defer` 从“静态 active 槽”改为**运行时记录链表 + 就地生成清理块 + `ScopeTracker`**，解决了条件/循环/多次注册和 `goto` 跨作用域问题，与 TCC 顺序代码生成模型一致，并借鉴了 slimcc 已验证的 VLA 跟踪复用路径；
-- `err()` 放弃“统一出口跳转”，改为**就地展开清理序列 + 哨兵返回**，消除了对不存在机制的假设；
+- `err(id, msg)` 放弃“统一出口跳转”，改为**就地展开清理序列 + 哨兵返回**，消除了对不存在机制的假设；
 - `interface` 的可见性规则强制 **`impl` 先于使用**，调用点只查找 `ImplDesc`，符合单趟约束；
 - 扩展开关改为**编译期条件编译**，零运行时开销；
 - `test` 的 `-test` 模式与 `-run` 互斥，runner 直接遍历测试表，不依赖用户 `main` 钩子。

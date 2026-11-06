@@ -4,8 +4,8 @@
  *   make build
  *   ./tcc/tcc -B tcc -std=tcc-ext -run examples/err_demo.c
  *
- * 用 err() 的函数必须声明成 'T!error'，调用方必须用 try 或 catch 消费错误；
- * catch 的处理块必须自己离开（return / err() / goto）。
+ * 用 err(id, msg) 的函数必须声明成 'T!error'，调用方必须用 try 或 catch 消费
+ * 错误；catch 的处理块必须自己离开（return / err(id, msg) / goto）。
  */
 #include <stdio.h>
 
