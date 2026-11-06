@@ -7512,6 +7512,65 @@ static void c6_interface_parse(void)
     tok_str_free(body);
 }
 
+/* Verify that 'impl IFACE for TYPE' defines every method with a
+   compatible signature.  'pkg' is the pseudo package holding them. */
+static void c6_check_impl(C6Iface *ifc, const char *pkg)
+{
+    Sym *vt = struct_find(ifc->vt_tag);
+    CType vtt;
+    int i;
+
+    if (!vt)
+        return;
+    /* the tag symbol does not carry the struct type itself */
+    vtt.t = VT_STRUCT;
+    vtt.ref = vt;
+    for (i = 0; i < ifc->nb_methods; i++) {
+        int m = ifc->methods[i];
+        const char *mname = get_tok_str(m, NULL);
+        Sym *f, *g, *fp, *gp, *fr, *gr;
+        CType *fptr, *gfun;
+        int ofs;
+
+        f = find_field(&vtt, m, &ofs);
+        if (!f || (f->type.t & VT_BTYPE) != VT_PTR)
+            continue;
+        fptr = pointed_type(&f->type);      /* RET (*)(void *, ...) */
+        if ((fptr->t & VT_BTYPE) != VT_FUNC || !fptr->ref)
+            continue;
+        g = sym_find(c6_mangle_tok(pkg, m));
+        if (!g)
+            tcc_error("impl of '%s' does not define method '%s'",
+                      ifc->name, mname);
+        if ((g->type.t & VT_BTYPE) != VT_FUNC || !g->type.ref)
+            tcc_error("method '%s' of '%s' must be a function", mname,
+                      ifc->name);
+        gfun = &g->type;                    /* RET (*)(...) */
+        fr = fptr->ref;
+        gr = gfun->ref;
+        if (!is_compatible_types(&fr->type, &gr->type))
+            tcc_error("method '%s' of '%s' has an incompatible return type",
+                      mname, ifc->name);
+        /* the first parameter of both is the 'self' pointer */
+        fp = fr->next;
+        gp = gr->next;
+        if (fp)
+            fp = fp->next;
+        if (gp)
+            gp = gp->next;
+        while (fp && gp) {
+            if (!is_compatible_types(&fp->type, &gp->type))
+                tcc_error("method '%s' of '%s' has an incompatible "
+                          "parameter", mname, ifc->name);
+            fp = fp->next;
+            gp = gp->next;
+        }
+        if (fp || gp)
+            tcc_error("method '%s' of '%s' has the wrong number of "
+                      "parameters", mname, ifc->name);
+    }
+}
+
 static void c6_impl_parse(void)
 {
     C6Iface *ifc;
@@ -7606,6 +7665,7 @@ static void c6_impl_parse(void)
         decl(VT_CONST);
     skip('}');
     tcc_state->c6_package = saved_pkg;
+    c6_check_impl(ifc, pkgname);
 
     /* Emit the vtable object:
        'const struct NAME_vt __tcc_vt_TYPE_NAME = { (void(*)(void))m, ... };' */

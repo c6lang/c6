@@ -86,6 +86,7 @@ C6_OK := $(shell echo | $(TCC_LOCAL) -std=c6 -dD -E - 2>/dev/null | grep -q __C6
 ifneq (,$(C6_OK))
  $(C6_TESTS): FLAGS += -std=c6
  158_c6_test.test: FLAGS += -test
+ 162_c6_iface_errors.test: FLAGS += -dt
 else
  SKIP += $(C6_TESTS)
 endif
