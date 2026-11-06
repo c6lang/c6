@@ -1,6 +1,6 @@
-From 261f9fc7ff7c77ddc0e95513e0b9d64edf9ba5f2 Mon Sep 17 00:00:00 2001
+From 8158b7b24cbd8d91f51fb65f93b9f8a4459c65c5 Mon Sep 17 00:00:00 2001
 From: c6 <c6@localhost>
-Date: Sat, 7 Nov 2026 06:19:57 +0800
+Date: Sat, 7 Nov 2026 06:44:44 +0800
 Subject: [PATCH] c6: tuples '(T1, T2, ...)' for returning several values
 
 A tuple is a fixed-layout value type written as a parenthesized type
@@ -53,12 +53,31 @@ represent a '-1' sentinel.  float/double still cannot be annotated.
 'n' consecutive '_' placeholders reuse the foreach convention (no
 symbol, no store), which is why the two features agree on what a bare
 '_' means.
+
+Review fixes folded in:
+
+  - a destructuring statement is a statement, so it may also be the
+    unbraced body of if/while/do/for/switch, follow a label, live in a
+    statement expression or be the body of 'defer'.  Those single
+    statements never reach decl(), which is where the form was
+    recognized, so block() classifies the group as well and hands the
+    statement to decl();
+  - the assignment form ('(a, b) = f();') parses its element assignments
+    inside c6_tuple_destructure() instead of leaving the pushed back
+    tokens to the caller: an unbraced body pops its scope as soon as the
+    statement is done, and the hidden temporary would be gone by the time
+    the caller read them.  The declaration form keeps the pushback, its
+    statements start with a type and the calling decl() consumes them
+    before returning;
+  - an array element type is rejected: arrays are not assignable, so an
+    element of type 'int[2]' accepted a decayed pointer as its
+    initializer instead of holding the array.
 ---
- tccgen.c | 865 +++++++++++++++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 834 insertions(+), 31 deletions(-)
+ tccgen.c | 899 +++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 868 insertions(+), 31 deletions(-)
 
 diff --git a/tccgen.c b/tccgen.c
-index cce627c..40d41a8 100644
+index cce627c..84de7e7 100644
 --- a/tccgen.c
 +++ b/tccgen.c
 @@ -204,6 +204,57 @@ static C6Slice *c6_slice_of_type(CType *type)
@@ -436,7 +455,7 @@ index cce627c..40d41a8 100644
              if (s->f.func_noreturn) {
                  if (debug_modes)
  	            tcc_tcov_block_end(tcc_state, -1);
-@@ -8486,6 +8740,109 @@ static C6Slice *c6_slice_get(CType *elem)
+@@ -8486,6 +8740,112 @@ static C6Slice *c6_slice_get(CType *elem)
      return sl;
  }
  
@@ -469,6 +488,9 @@ index cce627c..40d41a8 100644
 +            tcc_error("'tuple' element cannot be a function type");
 +        if (el[i].t & VT_VLA)
 +            tcc_error("'tuple' element cannot be a variable length array");
++        if (el[i].t & VT_ARRAY)
++            tcc_error("'tuple' element cannot be an array type "
++                      "(use a pointer, a slice 'T[:]' or a struct)");
 +        size = type_size(&el[i], &align);
 +        if (size < 0) {
 +            type_to_str(buf, sizeof buf, &el[i], NULL);
@@ -546,7 +568,7 @@ index cce627c..40d41a8 100644
  /* Spill the slice or complete array value on vtop into a local
     '{ void *data; size_t len; }' pair and pop it.  Returns the offset of the
     pair, so that the runtime helpers can read both words from it (this is
-@@ -8652,6 +9009,345 @@ static void c6_slice_subscript(void)
+@@ -8652,6 +9012,361 @@ static void c6_slice_subscript(void)
      }
  }
  
@@ -881,18 +903,34 @@ index cce627c..40d41a8 100644
 +       the pushed back statements */
 +    tok_str_add_tok(out);
 +    tok_str_add(out, 0);
-+    for (i = 0; i < n; i++)
-+        tok_str_free(elems[i]);
-+    tcc_free(elems), tcc_free(names), tcc_free(disc), tcc_free(etypes);
 +    /* let the ordinary declaration / assignment code do the rest */
 +    begin_macro(out, 1);
 +    next();
++    if (!decl_form) {
++        /* 'target = tmp.__c6_tN;' is an ordinary assignment, so parse the
++           pushed back statements right here.  An unbraced if/while/for body
++           pops its scope as soon as the statement is done, and the hidden
++           temporary would be gone by the time the caller got around to
++           reading the pushed back tokens.  The declaration form does not
++           need this: its statements start with a type, so the decl() that
++           called us consumes them in its own loop before returning. */
++        for (i = 0; i < n; i++) {
++            if (disc[i])
++                continue;
++            expr_eq();                  /* the value of the assignment */
++            vpop();
++            skip(';');
++        }
++    }
++    for (i = 0; i < n; i++)
++        tok_str_free(elems[i]);
++    tcc_free(elems), tcc_free(names), tcc_free(disc), tcc_free(etypes);
 +}
 +
  /* Implicit conversion of a complete array to a slice value, e.g.
     'int[:] s = a;', 'f(a)' or 'return a;'.  Returns 0 when no conversion
     applies. */
-@@ -8770,6 +9466,17 @@ static void c6_tu_reset(void)
+@@ -8770,6 +9485,17 @@ static void c6_tu_reset(void)
          tcc_free(sl);
      }
      c6_slices = NULL;
@@ -910,7 +948,7 @@ index cce627c..40d41a8 100644
  }
  
  /* Implicit conversion of a struct value to an interface value, e.g.
-@@ -8969,6 +9676,21 @@ static void c6_errdefer_parse(void)
+@@ -8969,6 +9695,21 @@ static void c6_errdefer_parse(void)
  /* Emit the error-path exit of the current function: build the sentinel
     value of the declared return type, run this frame's errdefer/defer in
     reverse order and return the sentinel.  Used by 'err()' and by 'try'. */
@@ -932,7 +970,7 @@ index cce627c..40d41a8 100644
  static void c6_emit_propagate(void)
  {
      int b, ret_off = 0, ret_saved = 0;
-@@ -8987,15 +9709,19 @@ static void c6_emit_propagate(void)
+@@ -8987,15 +9728,19 @@ static void c6_emit_propagate(void)
          if (size < 0)
              tcc_error("cannot propagate an error from a function with "
                        "an incomplete return type");
@@ -958,7 +996,29 @@ index cce627c..40d41a8 100644
      }
      if (defer_state.has_sites)
          c6_defer_begin(2, 0);
-@@ -9575,7 +10301,12 @@ again:
+@@ -9469,6 +10214,21 @@ again:
+     t = tok;
+ #ifdef C6_EXT
+     c6_last_stmt_leaves = 0;
++    /* '(int q, int r) = f();' and '(a, b) = f();' are statements, so they
++       may also be the unbraced body of if/while/for/switch or follow a
++       label.  Those single statements do not go through decl(), which is
++       where the form is otherwise recognized, so classify it here as well
++       (c6_tuple_lead_kind() replays and restores the tokens by itself). */
++    if (tcc_state->c6_ext && t == '(') {
++        int kind = c6_tuple_lead_kind();
++        if (kind == C6_TK_PATTERN || kind == C6_TK_ASSIGN) {
++            /* let decl() run the statement: it pushes the element
++               assignments back as tokens and parses them right away, while
++               the hidden temporary is still in scope */
++            decl(VT_LOCAL);
++            goto c6_stmt_done;
++        }
++    }
+ #endif
+     /* If the token carries a value, next() might destroy it. Only with
+        invalid code such as f(){"123"4;} */
+@@ -9575,7 +10335,12 @@ again:
  #endif
          b = (func_vt.t & VT_BTYPE) != VT_VOID;
          if (tok != ';') {
@@ -972,7 +1032,7 @@ index cce627c..40d41a8 100644
  #ifdef C6_EXT
              c6_fallible_use();  /* 'return f();' would drop the error */
  #endif
-@@ -11212,6 +11943,24 @@ static int c6_async_type_tokens(TokenString *ts, CType *type)
+@@ -11212,6 +11977,24 @@ static int c6_async_type_tokens(TokenString *ts, CType *type)
          return 1;
      case VT_STRUCT:
      case VT_UNION:
@@ -997,7 +1057,7 @@ index cce627c..40d41a8 100644
          if (!type->ref)
              return 0;
          tok_str_add(ts, (t & VT_UNION) == VT_UNION ? TOK_UNION : TOK_STRUCT);
-@@ -11397,6 +12146,24 @@ static void c6_async_suspend(int kind)
+@@ -11397,6 +12180,24 @@ static void c6_async_suspend(int kind)
  }
  
  /* 'return [expr];' inside an async body */
@@ -1022,7 +1082,7 @@ index cce627c..40d41a8 100644
  static void c6_async_return(void)
  {
      CType vt = c6_async_ftype.ref->type;
-@@ -11410,7 +12177,7 @@ static void c6_async_return(void)
+@@ -11410,7 +12211,7 @@ static void c6_async_return(void)
              vpop();
          } else {
              c6_async_push_field(c6_async_name, "val", 0);
@@ -1031,7 +1091,7 @@ index cce627c..40d41a8 100644
              c6_fallible_use();
              gen_assign_cast(&vt);
              vstore();
-@@ -11430,11 +12197,24 @@ static void c6_async_propagate(void)
+@@ -11430,11 +12231,24 @@ static void c6_async_propagate(void)
      CType vt = c6_async_ftype.ref->type;
  
      if ((vt.t & VT_BTYPE) != VT_VOID) {
@@ -1061,7 +1121,7 @@ index cce627c..40d41a8 100644
      }
      if (defer_state.has_sites)
          c6_defer_begin(2, 0);
-@@ -12605,10 +13385,18 @@ static void c6_apply_fallible(CType *type)
+@@ -12605,10 +13419,18 @@ static void c6_apply_fallible(CType *type)
      if ((ft->t & VT_BTYPE) != VT_FUNC || !ft->ref)
          tcc_error("'!error' requires a function declarator");
      bt = ft->ref->type.t & VT_BTYPE;
@@ -1082,7 +1142,7 @@ index cce627c..40d41a8 100644
      ft->ref->f.func_fallible = 1;
  }
  #endif
-@@ -12675,6 +13463,21 @@ static int decl(int l)
+@@ -12675,6 +13497,21 @@ static int decl(int l)
                  tcc_error("'foreach' can only be used inside a function");
              unget_tok(c6_name);
          }

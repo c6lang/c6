@@ -16,6 +16,7 @@ struct Fwd;                             /* 不完整类型 */
 // EXPECT test_incomplete_element: error: 'tuple' requires a complete element type, not 'struct Fwd'
 // EXPECT test_local_element: error: the element type of a tuple must be declared at file scope, but 'struct Local' is local
 // EXPECT test_error_element: error: 'error' can only be a return type, not a tuple element
+// EXPECT test_array_element: error: 'tuple' element cannot be an array type
 // EXPECT test_index_not_constant: error: constant expression expected
 // EXPECT test_index_out_of_range: error: tuple index 2 is out of range (0..1)
 // EXPECT test_arity_mismatch: error: the tuple has 2 elements but the pattern has 3
@@ -41,6 +42,13 @@ int main(void)
 {
     struct Local { int a; };
     (int, struct Local) t;
+    return 0;
+}
+#elif defined test_array_element
+int main(void)
+{
+    int a[2] = {1, 2};
+    (int[2], int) t = {a, 1};
     return 0;
 }
 #elif defined test_error_element
