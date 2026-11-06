@@ -566,8 +566,9 @@ range                  = conditional-expression , ":" , conditional-expression ;
 - `break`、`continue`、`defer`、`errdefer`、`await`、`goto` 与写在 `for`
   体里完全一致（循环体是普通复合语句，`break` 只跳出一层）；
 - 循环体**必须**是复合语句（花括号不能省），绑定的作用域就是这条语句；
-- 元素类型必须是可赋值的完整对象类型：元素是数组时先 `typedef` 起名
-  （`typedef int Row[3]; foreach |i, r| rows { … }`）；
+- 元素类型必须是**可赋值**的完整对象类型。元素本身是数组时（`int[2][3]`、
+  `Row[:]`）无法按值复制——绑定会是一个数组，而数组在 C 里不可赋值——
+  报约束 C49，改用下标区间：`foreach |i| 0:(int)rows.len { … rows[i] … }`；
 - VLA、不完整数组、指针、整数、没有暴露切片的其它结构体都不可迭代
   （见第 10 节）。
 
@@ -1006,7 +1007,7 @@ int main(void)
 }
 ```
 
-**R14 — `async T f(P…) { body }`**
+**R15 — `async T f(P…) { body }`**
 
 ```
 int __c6_body_f(void *task);
@@ -1022,7 +1023,7 @@ const struct __c6_desc __c6_desc_f = { sizeof(struct f_task), alignof, 64, __c6_
 `struct f_task` 由 `c6_async_declare()` 用合成 token 在文件作用域声明，
 所以同一个 `async` 声明在定义方和调用方得到同一个布局。
 
-**R15 — `await`**
+**R16 — `await`**
 
 ```
     x = await f(a)          ⇒  task = __c6_co_new(&__c6_desc_f);
@@ -1051,10 +1052,10 @@ defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再�
 `DONE` / `IO` / `CHILD`，为 `CHILD` 时先往子任务里钻，为 `IO` 时用
 `select()` 等 fd 就绪并把掩码放进 `wait_rev`。
 
-**R16 — `co f(a);` / `task t = f(a);`**
+**R17 — `co f(a);` / `task t = f(a);`**
 
 ```
-    co f(a)                 ⇒  h = __c6_co_new(&__c6_desc_f);   (* 同 R14 的调用 *)
+    co f(a)                 ⇒  h = __c6_co_new(&__c6_desc_f);   (* 同 R15 的调用 *)
                                h->p0 = a;
                                __tcc_co_spawn(h);
                                (* 返回时 h 可能已经跑完并被回收 *)
@@ -1267,6 +1268,7 @@ int main(void)
 | `foreach \|i, v\| 5 { }`（整数） | 约束 C47：整数要先写成区间 `0:5` |
 | `foreach \|i, v\| s { }`（`s` 是没暴露切片的 `struct`） | 约束 C47：用类型暴露的切片成员，例如 `foreach \|i, v\| s.items` |
 | `foreach \|i, v\| vla { }` | 约束 C47：VLA 的长度运行期才知道 |
+| `foreach \|i, v\| a { }` 而 `a` 的元素是数组（`int a[2][3]`、`Row[:]`） | 约束 C49：元素是数组时不能按值复制，改用下标区间 `foreach \|i\| 0:(int)rows.len { … rows[i] … }` |
 | `foreach \|_, _\| a { }` | 约束 C46：两个绑定都丢弃没有意义 |
 | `foreach \|i\| a { }` / `foreach \|i, v\| 0:n { }` | 约束 C44/C45：绑定数量由可迭代对象决定 |
 | `interface iterator { bool has(); void *next(); }` + `for a \|i, v\| { }` | v1 不做运行期迭代协议：`void *next()` 会擦掉元素类型（每轮都要装箱/分配），而方法名不按接收者改名，`has`/`len`/`at` 会和用户函数撞名。可迭代对象限定为数组、切片和区间，其它类型请暴露一个切片成员 |
