@@ -742,6 +742,14 @@ int __tcc_err_flag_get(void)
     return tcc_err_flag;
 }
 
+/* Same value, but stored through OUT: generated code can call this without
+   having to materialize the return value of a helper (helpers are treated
+   as void-typed everywhere in the code generator). */
+void __tcc_err_flag_peek(int *out)
+{
+    *out = tcc_err_flag;
+}
+
 int __tcc_err_id_get(void)
 {
     return tcc_err_id;
@@ -764,5 +772,35 @@ void __tcc_err_clear(void)
     tcc_err_flag = 0;
     tcc_err_id = 0;
     tcc_err_msg = 0;
+}
+
+/* c6 'error' value: layout must match the 'error' typedef emitted by
+   tcc_predefs(), i.e. 'struct __tcc_error { int id; const char *msg; }'. */
+typedef struct TccErrorValue {
+    int id;
+    const char *msg;
+} TccErrorValue;
+
+/* Snapshot the error slot into OUT (may be NULL to just clear it) and then
+   clear the slot: this is what 'catch' does before running its body, so the
+   error never leaks to the enclosing function. */
+void __tcc_error_take(void *out)
+{
+    if (out) {
+        TccErrorValue *e = (TccErrorValue *)out;
+        e->id = tcc_err_id;
+        e->msg = tcc_err_msg;
+    }
+    __tcc_err_clear();
+}
+
+/* Safety net emitted at the end of every 'catch' body: the body must leave
+   the handler by itself (return / err() / goto), so reaching the end is a
+   path the compiler could not prove unreachable.  libtcc1 is freestanding
+   (no libc), so trap with a deliberate null store instead of abort(). */
+void __tcc_catch_fallthrough(void)
+{
+    volatile int *p = (volatile int *)0;
+    *p = 0;
 }
 

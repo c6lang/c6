@@ -1,0 +1,32 @@
+[test_try_in_plain_fn]
+164_c6_try_errors.c:7: error: 'try' requires the enclosing function to return 'T!error'
+
+[test_try_not_fallible]
+164_c6_try_errors.c:10: error: 'try' requires a call to a function returning 'T!error'
+
+[test_try_not_a_call]
+164_c6_try_errors.c:13: error: 'try' requires a call to a function returning 'T!error'
+
+[test_try_assignment]
+164_c6_try_errors.c:16: error: 'try' requires a call to a function returning 'T!error'
+
+[test_catch_not_fallible]
+164_c6_try_errors.c:19: error: 'catch' requires a call to a function returning 'T!error'
+
+[test_catch_falls_through]
+164_c6_try_errors.c:22: error: 'catch' body must end with 'return', 'err()' or 'goto'
+
+[test_bare_catch]
+164_c6_try_errors.c:25: error: 'catch' has no operand
+
+[test_fallible_not_a_function]
+164_c6_try_errors.c:28: error: '!error' requires a function declarator
+
+[test_fallible_struct_return]
+164_c6_try_errors.c:31: error: '!error' requires a return type representable by -1
+
+[test_try_in_defer]
+164_c6_try_errors.c:34: error: 'try' is not allowed in a defer body
+
+[test_catch_in_defer]
+164_c6_try_errors.c:37: error: 'catch' is not allowed in a defer body

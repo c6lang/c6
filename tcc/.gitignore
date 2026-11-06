@@ -68,3 +68,6 @@ tests/vla_test
 tests/hello
 tests/tests2/fred.txt
 libtcc.dylib
+
+# c6: build-mode marker written by the wrapper Makefile
+.c6-mode

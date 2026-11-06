@@ -35,8 +35,8 @@ test "strings and loops" {
         err(4, "bad sum");
 }
 
-/* a helper used by a test; a failing helper propagates via the sentinel */
-static int helper(int x)
+/* a helper used by a test; a failing helper propagates via 'try' */
+static int!error helper(int x)
 {
     if (x < 0)
         err(5, "negative");
@@ -44,13 +44,14 @@ static int helper(int x)
 }
 
 test "helpers propagate errors" {
-    if (helper(3) != 6)
+    if ((try helper(3)) != 6)
         err(6, "helper(3) != 6");
-    if (helper(-1) != -1)
-        err(7, "no sentinel from helper");
-    if (__tcc_err_id_get() != 5)
-        err(8, "wrong error id");
-    __tcc_err_clear();      /* handled here: the test itself passes */
+    helper(-1) catch e {
+        if (e.id != 5)
+            err(7, "wrong error id");
+        return 0;           /* handled here: the test itself passes */
+    };
+    err(8, "helper did not fail");
 }
 
 int main(void)

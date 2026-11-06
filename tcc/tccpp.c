@@ -523,6 +523,20 @@ ST_FUNC int tok_alloc_const(const char *str)
     return tok_alloc(str, strlen(str))->tok;
 }
 
+/* Consume one token number without interning a new name.  Used when a
+   keyword name is already interned under a different id (e.g. the x86
+   'test' mnemonic): without this the following keywords would all be
+   shifted with respect to their enum values. */
+static void tok_skip_id(void)
+{
+    int i = tok_ident - TOK_IDENT;
+    if (i >= 0 && (i % TOK_ALLOC_INCR) == 0)
+        table_ident = tcc_realloc(table_ident,
+                                  (i + TOK_ALLOC_INCR) * sizeof(TokenSym *));
+    table_ident[i] = NULL;
+    tok_ident++;
+}
+
 #ifdef C6_EXT
 /* Drop the last interned token again: used to keep the c6 keywords
    ordinary identifiers unless -std=c6 is active. */
@@ -3835,6 +3849,18 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
         "#include <tccdefs.h>\n" /* load at runtime */
 #endif
         , -1);
+#ifdef C6_EXT
+      /* c6: 'error' is the value type produced by err(id, msg).  It is
+         only declared in the extension mode and never for -E, so that the
+         preprocessor output does not depend on it. */
+      if (s1->c6_ext && s1->output_type != TCC_OUTPUT_PREPROCESS)
+        cstr_cat(cs,
+          "#ifndef __TCC_ERROR_DEFINED\n"
+          "#define __TCC_ERROR_DEFINED 1\n"
+          "typedef struct __tcc_error { int id; const char *msg; } error;\n"
+          "#endif\n"
+          , -1);
+#endif
     }
     cstr_printf(cs, "#define __BASE_FILE__ \"%s\"\n", file->filename);
 }
@@ -3926,6 +3952,7 @@ ST_FUNC void tccpp_new(TCCState *s)
     tok_ident = TOK_IDENT;
     p = tcc_keywords;
     while (*p) {
+        int before = tok_ident;
         r = p;
         for(;;) {
             c = *r++;
@@ -3933,6 +3960,8 @@ ST_FUNC void tccpp_new(TCCState *s)
                 break;
         }
         tok_alloc(p, r - p - 1);
+        if (tok_ident == before)
+            tok_skip_id();  /* duplicate name: keep ids aligned with the enum */
         p = r;
     }
 
@@ -3943,7 +3972,7 @@ ST_FUNC void tccpp_new(TCCState *s)
            'test' may already be interned as an asm keyword, in which
            case the range ends before TOK_C6_TEST. */
         int t;
-        for (t = TOK_C6_PACKAGE; t < TOK_C6_TEST && t < tok_ident; t++)
+        for (t = TOK_C6_PACKAGE; t <= TOK_C6_CATCH && t < tok_ident; t++)
             tok_unintern(t);
         if (TOK_C6_PACKAGE < tok_ident)
             tok_ident = TOK_C6_PACKAGE;

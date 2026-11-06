@@ -155,13 +155,28 @@ static int c6_implicit_ret0;
 static int c6_iface_self_pending;
 static int c6_iface_self_loc;
 static CType c6_iface_self_type;  /* generated 'test' function: return 0 */
+/* non-zero while vtop holds the result of a call to a 'T!error' function */
+static int c6_value_fallible;
+/* symbol of the function being compiled (needed by 'try' to check that the
+   enclosing function may propagate errors) */
+static Sym *c6_func_sym;
+/* set by block() when the statement just parsed leaves the block */
+static int c6_last_stmt_leaves;
+/* set by type_decl() when it consumed a '!error' suffix that sits between
+   the pointer stars and the declarator name ('int *!error f(void)') */
+static int c6_decl_fallible;
 
+static void c6_fallible_use(void);
+static int c6_parse_fallible_suffix(void);
 static void c6_defer_func_init(void);
 static void c6_defer_func_end(void);
 static void c6_defer_begin(int mode, int depth);
 static void c6_defer_parse(int kind);
 static void c6_err_parse(void);
 static void c6_errdefer_parse(void);
+static void c6_emit_propagate(void);
+static void c6_try_parse(void);
+static void c6_catch_parse(void);
 static void c6_test_parse(void);
 static void c6_package_parse(void);
 static void c6_import_parse(void);
@@ -479,6 +494,17 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     func_ind = -1;
     anon_sym = SYM_FIRST_ANOM;
     nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
+#ifdef C6_EXT
+    /* the state below outlives a translation unit: after an error the
+       parser is abandoned mid-recursion, so start each unit from scratch */
+    defer_state.body_depth = 0;
+    defer_state.enabled = 0;
+    defer_state.has_sites = 0;
+    c6_func_sym = NULL;
+    c6_value_fallible = 0;
+    c6_last_stmt_leaves = 0;
+    c6_decl_fallible = 0;
+#endif
     debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
     global_expr = 0;
 
@@ -1163,6 +1189,9 @@ static int gvtst(int inv, int t)
 {
     int op, x, u;
 
+#ifdef C6_EXT
+    c6_fallible_use();  /* 'if (f())' would drop the error */
+#endif
     gvtst_set(inv, t);
     t = vtop->jtrue, u = vtop->jfalse;
     if (inv)
@@ -1294,6 +1323,10 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
       fa->func_ctor = 1;
     if (fa1->func_dtor)
       fa->func_dtor = 1;
+#ifdef C6_EXT
+    if (fa1->func_fallible)
+      fa->func_fallible = 1;
+#endif
 }
 
 /* Merge attributes.  */
@@ -1672,6 +1705,9 @@ static void move_reg(int r, int s, int t)
 /* get address of vtop (vtop MUST BE an lvalue) */
 ST_FUNC void gaddrof(void)
 {
+#ifdef C6_EXT
+    c6_value_fallible = 0;      /* gaddrof only applies to lvalues */
+#endif
     vtop->r &= ~VT_LVAL;
     /* tricky: if saved lvalue, then we can go back to lvalue */
     if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
@@ -3137,6 +3173,9 @@ ST_FUNC void gen_op(int op)
     int t1, t2, bt1, bt2, t;
     CType type1, combtype;
     int op_class = op;
+#ifdef C6_EXT
+    c6_fallible_use();          /* 'f() + x' loses the error */
+#endif
 
     if (op == TOK_SHR || op == TOK_SAR || op == TOK_SHL)
         op_class = SHIFT_OP;
@@ -3347,6 +3386,9 @@ static void gen_cast_s(int t)
 /* cast 'vtop' to 'type'. Casting to bitfields is forbidden. */
 static void gen_cast(CType *type)
 {
+#ifdef C6_EXT
+    c6_fallible_use();          /* a cast would drop the error */
+#endif
     int sbt, dbt, sf, df, c;
     int dbt_bt, sbt_bt, ds, ss, bits, trunc;
 
@@ -3806,6 +3848,9 @@ static void gen_assign_cast(CType *dt)
 ST_FUNC void vstore(void)
 {
     int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
+#ifdef C6_EXT
+    c6_fallible_use();          /* 'x = f()' would drop the error */
+#endif
 
     ft = vtop[-1].type.t;
 #ifdef C6_EXT
@@ -3982,6 +4027,9 @@ ST_FUNC void vstore(void)
 /* post defines POST/PRE add. c is the token ++ or -- */
 ST_FUNC void inc(int post, int c)
 {
+#ifdef C6_EXT
+    c6_fallible_use();
+#endif
     test_lvalue();
     vdup(); /* save lvalue */
     if (post) {
@@ -5431,6 +5479,12 @@ static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 	    ret = pointed_type(type);
     }
 
+#ifdef C6_EXT
+    /* 'int *!error f(void)': the annotation may also sit between the
+       pointer stars and the declarator name */
+    if (tcc_state->c6_ext && c6_parse_fallible_suffix())
+        c6_decl_fallible = 1;
+#endif
     if (tok == '(') {
 	/* This is possibly a parameter type list for abstract declarators
 	   ('int ()'), use post_type for testing this.  */
@@ -5465,6 +5519,9 @@ static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 /* indirection with full error checking and bound check */
 ST_FUNC void indir(void)
 {
+#ifdef C6_EXT
+    c6_fallible_use();          /* '*f()' would drop the error */
+#endif
     if ((vtop->type.t & VT_BTYPE) != VT_PTR) {
         if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
             return;
@@ -6266,6 +6323,12 @@ special_math_val:
 	n = 0x7f800000;
 	goto special_math_val;
 
+#ifdef C6_EXT
+    case TOK_C6_TRY:
+        c6_try_parse();
+        break;
+#endif
+
     default:
     tok_identifier:
         if (tok < TOK_UIDENT)
@@ -6315,9 +6378,15 @@ special_math_val:
     /* post operations */
     while (1) {
         if (tok == TOK_INC || tok == TOK_DEC) {
+#ifdef C6_EXT
+            c6_fallible_use();
+#endif
             inc(1, tok);
             next();
         } else if (tok == '.' || tok == TOK_ARROW) {
+#ifdef C6_EXT
+            c6_fallible_use();  /* 'f().x' would drop the error */
+#endif
             int qualifiers, cumofs;
             /* field */ 
             if (tok == TOK_ARROW) 
@@ -6366,6 +6435,9 @@ special_math_val:
             gen_op('+');
             indir();
             skip(']');
+#ifdef C6_EXT
+            c6_value_fallible = 0;
+#endif
         } else if (tok == '(') {
             SValue ret;
             Sym *sa;
@@ -6488,6 +6560,12 @@ special_math_val:
             next();
             vcheck_cmp(); /* the generators don't like VT_CMP on vtop */
             gfunc_call(nb_args);
+#ifdef C6_EXT
+            /* remember whether this value is the result of a call to a
+               function declared with the 'T!error' suffix ('try'/'catch'
+               consume this flag) */
+            c6_value_fallible = s->f.func_fallible;
+#endif
 
             if (ret_nregs < 0) {
                 vsetc(&ret.type, ret.r, &ret.c);
@@ -6777,13 +6855,25 @@ static int is_cond_bool(SValue *sv)
     return 0;
 }
 
+/* c6: 'f() catch e { ... }' binds tighter than '?:' and '=' but looser
+   than '||', so 'x = f() catch e {...}' initializes 'x' with the value of
+   the whole catch expression (only on the success path). */
+static void expr_catch(void)
+{
+    expr_lor();
+#ifdef C6_EXT
+    if (tok == TOK_C6_CATCH && tcc_state->c6_ext)
+        c6_catch_parse();
+#endif
+}
+
 static void expr_cond(void)
 {
     int tt, u, r1, r2, rc, t1, t2, islv, c, g;
     SValue sv;
     CType type;
 
-    expr_lor();
+    expr_catch();
     if (tok == '?') {
         next();
 	c = condition_3way();
@@ -7950,32 +8040,19 @@ static void c6_errdefer_parse(void)
     c6_defer_parse(1);
 }
 
-/* parse "err(ID, MSG)" or "err()": record the error, run the error-path
-   cleanups (errdefer and defer) of the whole function frame and return the
-   sentinel value so that callers can propagate. */
-static void c6_err_parse(void)
+/* Emit the error-path exit of the current function: build the sentinel
+   value of the declared return type, run this frame's errdefer/defer in
+   reverse order and return the sentinel.  Used by 'err()' and by 'try'. */
+static void c6_emit_propagate(void)
 {
     int b, ret_off = 0, ret_saved = 0;
-
-    if (defer_state.body_depth > 0)
-        tcc_error("'err' is not allowed in a defer body");
-
-    skip('(');
-    if (tok != ')') {
-        /* __tcc_err_set(id, msg) */
-        vpush_helper_func(tok_alloc_const("__tcc_err_set"));
-        expr_eq();
-        skip(',');
-        expr_eq();
-        skip(')');
-        gfunc_call(2);
-    } else {
-        next();  /* keep the error slot: this is a re-raise */
-    }
 
     b = (func_vt.t & VT_BTYPE) != VT_VOID;
     if (b) {
         int align, size = type_size(&func_vt, &align);
+        if (size < 0)
+            tcc_error("cannot propagate an error from a function with "
+                      "an incomplete return type");
         vpushi(TCC_ERR_SENTINEL);
         vtop->type = func_vt;   /* '(TYPE)-1', no conversion warning */
         loc = (loc - size) & -align;
@@ -7992,10 +8069,36 @@ static void c6_err_parse(void)
         vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
     if (b)
         gfunc_return(&func_vt);
-    skip(';');
     rsym = gjmp(rsym);
     CODE_OFF();
 }
+
+/* parse "err(ID, MSG)": record the error, run the error-path cleanups
+   (errdefer and defer) of the whole function frame and return.  'err'
+   always returns immediately, so there is no re-raise form: callers that
+   want to forward an error use 'try' instead. */
+static void c6_err_parse(void)
+{
+    if (defer_state.body_depth > 0)
+        tcc_error("'err' is not allowed in a defer body");
+    if (!c6_func_sym || !c6_func_sym->type.ref->f.func_fallible)
+        tcc_error("'err' requires the enclosing function to return 'T!error'");
+
+    skip('(');
+    if (tok == ')')
+        tcc_error("'err' requires an error id and a message");
+    /* __tcc_err_set(id, msg) */
+    vpush_helper_func(tok_alloc_const("__tcc_err_set"));
+    expr_eq();
+    skip(',');
+    expr_eq();
+    skip(')');
+    gfunc_call(2);
+
+    c6_emit_propagate();
+    skip(';');
+}
+
 
 /* parse 'test "description" { ... }' at file scope: synthesize
    'static int __tcc_test_N(void) { ... }' and remember the description
@@ -8037,6 +8140,8 @@ static void c6_test_parse(void)
     fs = sym_push(SYM_FIELD, &int_type, 0, 0);
     fs->f.func_call = FUNC_CDECL;
     fs->f.func_type = FUNC_NEW;
+    /* a test block may use 'try' to fail: its result is the error slot */
+    fs->f.func_fallible = 1;
     ft.t = VT_FUNC;
     ft.ref = fs;
     sym = external_sym(v, &ft, 0, &ad);
@@ -8165,6 +8270,187 @@ static void prev_scope(struct scope *o, int is_expr)
     --local_scope;
 }
 
+#ifdef C6_EXT
+/* ------------------------------------------------------------------------- */
+/* c6 'try' / 'catch'                                                    */
+/*                                                                           */
+/* 'try f()'             : if the error slot is set after the call, run this  */
+/*                         frame's errdefer/defer in reverse order and return */
+/*                         the sentinel of the enclosing function.            */
+/* 'f() catch e { ... }' : if the error slot is set, snapshot it into 'e' and */
+/*                         clear the slot, then run the handler body.         */
+/* Both forms require the operand to be a call to a 'T!error' function;       */
+/* 'try' additionally requires the enclosing function to be 'T!error'.        */
+
+/* emit "__tcc_err_flag_get() != 0" and return a jump that is taken when the
+   error slot is empty, i.e. the success path of 'try' / 'catch' */
+static int c6_err_flag_jump(void)
+{
+    int slot = (loc - (int)sizeof(int)) & -(int)PTR_SIZE;
+
+    loc = slot;
+    vpush_helper_func(tok_alloc_const("__tcc_err_flag_peek"));
+    vset(&int_type, VT_LOCAL | VT_LVAL, slot);
+    gaddrof();
+    mk_pointer(&vtop->type);
+    gfunc_call(1);
+    vset(&int_type, VT_LOCAL | VT_LVAL, slot);
+    vpushi(0);
+    gen_op(TOK_NE);
+    return gvtst(1, 0);
+}
+
+/* A value of a 'T!error' function may only be consumed by 'try' or by
+   'catch'.  Any other use (operator, cast, assignment, discarded result)
+   would drop the error silently, so it is rejected here. */
+static void c6_fallible_use(void)
+{
+    if (c6_value_fallible) {
+        c6_value_fallible = 0;
+        tcc_error("the result of a 'T!error' function must be used with "
+                  "'try' or 'catch'");
+    }
+}
+
+/* push a void value: the expression statement parser always pops one */
+static void c6_push_void(void)
+{
+    vpushi(0);
+    vtop->type.t = VT_VOID;
+}
+
+/* Take the already-evaluated operand off the value stack, remembering its
+   value for the success path (registers are flushed so that the cleanup
+   calls emitted below cannot clobber it). */
+static int c6_save_operand(const char *kw, SValue *sv)
+{
+    int has_value;
+
+    if (!c6_value_fallible)
+        tcc_error("'%s' requires a call to a function returning 'T!error'",
+                  kw);
+    c6_value_fallible = 0;
+    has_value = (vtop->type.t & VT_BTYPE) != VT_VOID;
+    if (has_value) {
+        save_regs(0);
+        *sv = *vtop;
+        vtop--;
+    } else {
+        vpop();
+    }
+    return has_value;
+}
+
+/* 'try f()': the operand is parsed here (prefix position in unary()). */
+static void c6_try_parse(void)
+{
+    SValue sv;
+    int has_value, skip;
+
+    if (!c6_ext_on())
+        tcc_error("'try' requires -std=c6");
+    if (defer_state.body_depth > 0)
+        tcc_error("'try' is not allowed in a defer body");
+    if (!c6_func_sym || !c6_func_sym->type.ref->f.func_fallible)
+        tcc_error("'try' requires the enclosing function to return 'T!error'");
+    next();                             /* skip 'try' */
+    c6_value_fallible = 0;
+    /* 'try' starts from a clean slot: only errors raised by the operand
+       itself can be propagated, and the slot is empty afterwards */
+    save_regs(0);
+    vpush_helper_func(tok_alloc_const("__tcc_err_clear"));
+    gfunc_call(0);
+    unary();                            /* the called function */
+    has_value = c6_save_operand("try", &sv);
+    skip = c6_err_flag_jump();      /* taken when no error is pending */
+    c6_emit_propagate();            /* failure path: clean up + return */
+    gsym(skip);
+    if (has_value)
+        vpushv(&sv);
+    else
+        c6_push_void();
+}
+
+/* 'f() catch [e] { ... }': the operand has already been parsed by
+   expr_catch(), so only the handler is compiled here. */
+static void c6_catch_parse(void)
+{
+    SValue sv;
+    struct scope o;
+    Sym *ev;
+    int has_value, succ, saved_nocode;
+
+    if (!c6_ext_on())
+        tcc_error("'catch' requires -std=c6");
+    if (defer_state.body_depth > 0)
+        tcc_error("'catch' is not allowed in a defer body");
+    has_value = c6_save_operand("catch", &sv);
+    succ = c6_err_flag_jump();      /* taken when no error is pending */
+    next();                             /* skip 'catch' */
+
+    new_scope(&o);
+    ev = NULL;
+    if (tok != '{') {
+        int name = 0, paren = 0;
+        if (tok == '(') {
+            paren = 1;
+            next();
+            if (tok != ')')
+                name = tok;
+        } else {
+            name = tok;
+        }
+        if (name) {
+            /* declare 'struct __tcc_error NAME;' in the handler scope */
+            Sym *tags = struct_find(tok_alloc_const("__tcc_error"));
+            CType et;
+            int align, size;
+            if (!tags || !(tags->v & SYM_STRUCT))
+                tcc_error("internal error: 'struct __tcc_error' is missing");
+            et.t = VT_STRUCT;
+            et.ref = tags;
+            size = type_size(&et, &align);
+            loc = (loc - size) & -align;
+            ev = sym_push(name, &et, VT_LOCAL | VT_LVAL, loc);
+            next();
+        }
+        if (paren)
+            skip(')');
+    }
+
+    /* snapshot the error into 'e' and clear the slot: 'catch' always consumes
+       the error, so it never leaks into the enclosing function */
+    vpush_helper_func(tok_alloc_const("__tcc_error_take"));
+    if (ev) {
+        vset(&ev->type, VT_LOCAL | VT_LVAL, ev->c);
+        gaddrof();
+    } else {
+        vpushi(0);
+    }
+    gfunc_call(1);
+
+    saved_nocode = nocode_wanted;
+    block(STMT_COMPOUND);
+    /* the handler must leave on its own and continue past its end with the
+       success path.  When the compiler cannot prove that the body always
+       leaves, emit a trap rather than silently resuming the success path. */
+    if (!(nocode_wanted & CODE_OFF_BIT) && !(saved_nocode & CODE_OFF_BIT)) {
+        if (!c6_last_stmt_leaves)
+            tcc_error("'catch' body must end with 'return', 'err()' or 'goto'");
+        vpush_helper_func(tok_alloc_const("__tcc_catch_fallthrough"));
+        gfunc_call(0);
+    }
+    nocode_wanted = saved_nocode;
+    prev_scope(&o, 0);
+
+    gsym(succ);
+    if (has_value)
+        vpushv(&sv);
+    else
+        c6_push_void();
+}
+#endif
+
 /* leave a scope via break/continue(/goto) */
 static void leave_scope(struct scope *o)
 {
@@ -8242,6 +8528,9 @@ static void block(int flags)
 
 again:
     t = tok;
+#ifdef C6_EXT
+    c6_last_stmt_leaves = 0;
+#endif
     /* If the token carries a value, next() might destroy it. Only with
        invalid code such as f(){"123"4;} */
     if (TOK_HAS_VALUE(t))
@@ -8317,6 +8606,7 @@ again:
 
     } else if (t == TOK_RETURN) {
 #ifdef C6_EXT
+        c6_last_stmt_leaves = 1;
         if (defer_state.body_depth > 0)
             tcc_error("'return' is not allowed in a defer body");
         ret_off = 0;
@@ -8325,6 +8615,9 @@ again:
         b = (func_vt.t & VT_BTYPE) != VT_VOID;
         if (tok != ';') {
             gexpr();
+#ifdef C6_EXT
+            c6_fallible_use();  /* 'return f();' would drop the error */
+#endif
             if (b) {
                 gen_assign_cast(&func_vt);
             } else {
@@ -8374,6 +8667,7 @@ again:
 
     } else if (t == TOK_BREAK) {
 #ifdef C6_EXT
+        c6_last_stmt_leaves = 1;
         if (defer_state.body_depth > 0)
             tcc_error("'break' is not allowed in a defer body");
 #endif
@@ -8389,6 +8683,7 @@ again:
 
     } else if (t == TOK_CONTINUE) {
 #ifdef C6_EXT
+        c6_last_stmt_leaves = 1;
         if (defer_state.body_depth > 0)
             tcc_error("'continue' is not allowed in a defer body");
 #endif
@@ -8415,8 +8710,22 @@ again:
     } else if (t == TOK_C6_ERR) {
         if (!c6_ext_on())
             tcc_error("'err' requires -std=c6");
-        else
+        else {
+            c6_last_stmt_leaves = 1;
             c6_err_parse();
+        }
+
+    } else if (t == TOK_C6_TRY) {
+        /* 'try f();' is an ordinary expression statement */
+        if (!c6_ext_on())
+            tcc_error("'try' requires -std=c6");
+        unget_tok(t);
+        goto expr;
+
+    } else if (t == TOK_C6_CATCH) {
+        if (!c6_ext_on())
+            tcc_error("'catch' requires -std=c6");
+        tcc_error("'catch' has no operand");
 #endif
 
     } else if (t == TOK_FOR) {
@@ -8543,6 +8852,7 @@ again:
 
     } else if (t == TOK_GOTO) {
 #ifdef C6_EXT
+        c6_last_stmt_leaves = 1;
         if (defer_state.body_depth > 0)
             tcc_error("'goto' is not allowed in a defer body");
 #endif
@@ -8641,8 +8951,14 @@ again:
                 if (flags & STMT_EXPR) {
                     vpop();
                     gexpr();
+#ifdef C6_EXT
+                    c6_fallible_use();  /* 'f();' would drop the error */
+#endif
                 } else {
                     gexpr();
+#ifdef C6_EXT
+                    c6_fallible_use();
+#endif
                     vpop();
                 }
                 skip(';');
@@ -9751,6 +10067,11 @@ static void gen_function(Sym *sym)
     func_vt = sym->type.ref->type;
     func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
     func_old = sym->type.ref->f.func_type == FUNC_OLD;
+#ifdef C6_EXT
+    c6_func_sym = sym;
+    c6_value_fallible = 0;
+    c6_last_stmt_leaves = 0;
+#endif
 
     /* NOTE: we patch the symbol size later */
     put_extern_sym(sym, cur_text_section, ind, 0);
@@ -9916,6 +10237,40 @@ static void pe_check_linkage(CType *type, AttributeDef *ad)
 }
 #endif
 
+#ifdef C6_EXT
+/* Consume the c6 '!error' suffix when present: 'int!error f(void)' and
+   'int f(void)!error' mean the same, namely that f propagates errors. */
+static int c6_parse_fallible_suffix(void)
+{
+    if (tok != '!')
+        return 0;
+    next();
+    if (tok < TOK_UIDENT || strcmp(get_tok_str(tok, NULL), "error") != 0)
+        expect("'error'");
+    next();
+    return 1;
+}
+
+/* Turn the '!error' annotation of TYPE into a property of the function. */
+static void c6_apply_fallible(CType *type)
+{
+    CType *ft = type;
+    int bt;
+
+    if ((ft->t & VT_BTYPE) == VT_PTR && ft->ref
+        && (ft->ref->type.t & VT_BTYPE) == VT_FUNC)
+        ft = &ft->ref->type;
+    if ((ft->t & VT_BTYPE) != VT_FUNC || !ft->ref)
+        tcc_error("'!error' requires a function declarator");
+    bt = ft->ref->type.t & VT_BTYPE;
+    if (!(bt == VT_VOID || bt == VT_PTR || bt == VT_BOOL
+          || (bt >= VT_BYTE && bt <= VT_LLONG)
+          || IS_ENUM(ft->ref->type.t)))
+        tcc_error("'!error' requires a return type representable by -1");
+    ft->ref->f.func_fallible = 1;
+}
+#endif
+
 /* 'l' is VT_LOCAL or VT_CONST to define default storage type
    or VT_CMP if parsing old style parameter list
    or VT_JMP if parsing c99 for decl: for (int i = 0, ...) */
@@ -9926,11 +10281,15 @@ static int decl(int l)
     Sym *sym, *sa;
     AttributeDef ad, adbase;
     ElfSym *esym;
+#ifdef C6_EXT
+    int fallible;
+#endif
 
     while (1) {
 
         oldint = 0;
 #ifdef C6_EXT
+        fallible = 0;
         if (l == VT_CONST && tcc_state->c6_ext) {
             if (c6_is_test_kw(tok)) {
                 c6_test_parse();
@@ -9989,6 +10348,11 @@ static int decl(int l)
                 break;
             }
         }
+#ifdef C6_EXT
+        /* 'T!error ...' : the annotation comes before the declarator */
+        if (tcc_state->c6_ext && c6_parse_fallible_suffix())
+            fallible = 1;
+#endif
 
         if (tok == ';') {
             if ((btype.t & VT_BTYPE) == VT_STRUCT
@@ -10007,8 +10371,20 @@ static int decl(int l)
         while (1) { /* iterate thru each declaration */
             type = btype;
 	    ad = adbase;
+#ifdef C6_EXT
+            c6_decl_fallible = 0;
+#endif
             type_decl(&type, &ad, &v, l == VT_CMP ? TYPE_DIRECT | TYPE_PARAM : TYPE_DIRECT);
             /*ptype("decl", &type, v);*/
+#ifdef C6_EXT
+            /* 'T f(...)!error' : the same annotation after the declarator */
+            if (tcc_state->c6_ext && c6_parse_fallible_suffix())
+                fallible = 1;
+            if (c6_decl_fallible)
+                fallible = 1, c6_decl_fallible = 0;
+            if (fallible)
+                c6_apply_fallible(&type);
+#endif
 #ifdef C6_EXT
             /* symbols declared inside a package are name-mangled; the
                program entry point always keeps its name */
@@ -10067,6 +10443,15 @@ static int decl(int l)
 
                 /* apply post-declaraton attributes */
                 merge_funcattr(&type.ref->f, &ad.f);
+#ifdef C6_EXT
+                /* a prototype marked '!error' also marks the definition */
+                if (tcc_state->c6_ext) {
+                    Sym *ps = sym_find(v);
+                    if (ps && (ps->type.t & VT_BTYPE) == VT_FUNC
+                        && ps->type.ref->f.func_fallible)
+                        type.ref->f.func_fallible = 1;
+                }
+#endif
                 /* put function symbol */
                 type.t &= ~VT_EXTERN;
                 sym = external_sym(v, &type, 0, &ad);

@@ -520,7 +520,8 @@ struct FuncAttr {
     func_dtor   : 1, /* attribute((destructor)) */
     func_args   : 8, /* PE __stdcall args */
     func_alwinl : 1, /* always_inline */
-    xxxx        : 15;
+    func_fallible : 1, /* c6: declared with the 'T!error' suffix */
+    xxxx        : 14;
 };
 
 /* symbol management */

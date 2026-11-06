@@ -451,4 +451,6 @@
      DEF(TOK_C6_ERRDEFER,  "errdefer")
      DEF(TOK_C6_ERR,       "err")
      DEF(TOK_C6_TEST,      "test")
+     DEF(TOK_C6_TRY,       "try")
+     DEF(TOK_C6_CATCH,     "catch")
 #endif

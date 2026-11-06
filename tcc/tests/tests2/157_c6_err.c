@@ -1,4 +1,4 @@
-/* c6 extension: errdefer + err */
+/* c6 extension: errdefer + err + try */
 #include <stdio.h>
 #include <string.h>
 
@@ -12,6 +12,11 @@ void __tcc_err_clear(void);
 static char buf[256];
 static int blen;
 
+/* the last error observed by a 'catch' handler (the slot itself is cleared
+   by 'catch', so the values have to be copied out) */
+static int last_id;
+static const char *last_msg;
+
 static void log_reset(void) { blen = 0; buf[0] = '\0'; }
 static void log_add(const char *s)
 {
@@ -21,9 +26,15 @@ static void log_add(const char *s)
 }
 static void log_print(const char *tag) { printf("%s: %s\n", tag, buf); }
 
+static void note(int id, const char *msg)
+{
+    last_id = id;
+    last_msg = msg;
+}
+
 /* errdefer is skipped on the normal path and runs in reverse on the
    error path; plain defer always runs */
-static int e1(int fail)
+static int!error e1(int fail)
 {
     defer log_add("1");
     errdefer log_add("2");
@@ -34,7 +45,7 @@ static int e1(int fail)
     return 0;
 }
 
-static int inner(int fail)
+static int!error inner(int fail)
 {
     defer log_add("A");
     errdefer log_add("B");
@@ -43,19 +54,19 @@ static int inner(int fail)
     return 0;
 }
 
-/* propagation through two frames with the sentinel */
-static int outer(int fail)
+/* propagation through two frames: 'try' hands the error back after running
+   the local cleanups, the statement form drops the value */
+static int!error outer(int fail)
 {
     defer log_add("C");
     errdefer log_add("D");
-    if (inner(fail) == SENT)
-        err();              /* re-raise after the local cleanups */
+    try inner(fail);
     log_add("E");
     return 0;
 }
 
 /* err inside a loop leaves the whole frame */
-static void loop_err(int fail)
+static void!error loop_err(int fail)
 {
     int i;
     for (i = 0; i < 3; i++) {
@@ -67,7 +78,7 @@ static void loop_err(int fail)
     log_add("z");
 }
 
-static int *ptr_err(int fail)
+static int!error *ptr_err(int fail)
 {
     defer log_add("p");
     if (fail)
@@ -75,47 +86,84 @@ static int *ptr_err(int fail)
     return 0;
 }
 
+/* callers that only want "value or sentinel" catch and report SENT */
+static int run_e1(int fail)
+{
+    int v = e1(fail) catch e {
+        note(e.id, e.msg);
+        return SENT;
+    };
+    return v;
+}
+
+static int run_outer(int fail)
+{
+    int v = outer(fail) catch e {
+        note(e.id, e.msg);
+        return SENT;
+    };
+    return v;
+}
+
+static int run_loop(int fail)
+{
+    loop_err(fail) catch e {
+        note(e.id, e.msg);
+        return SENT;
+    };
+    return 0;
+}
+
+static int *run_ptr(int fail)
+{
+    int *v = ptr_err(fail) catch e {
+        note(e.id, e.msg);
+        return (int *)(long)SENT;
+    };
+    return v;
+}
+
 int main(void)
 {
     log_reset();
-    printf("e1-normal=%d ", e1(0));
+    printf("e1-normal=%d ", run_e1(0));
     log_print("e1-normal");
     printf("flag=%d\n", __tcc_err_flag_get());
 
     __tcc_err_clear();
     log_reset();
-    printf("e1-error=%d ", e1(1));
+    printf("e1-error=%d ", run_e1(1));
     log_print("e1-error");
-    printf("id=%d msg=%s\n", __tcc_err_id_get(), __tcc_err_msg_get());
+    printf("id=%d msg=%s\n", last_id, last_msg);
 
     __tcc_err_clear();
     log_reset();
-    printf("outer-error=%d ", outer(1));
+    printf("outer-error=%d ", run_outer(1));
     log_print("outer-error");
-    printf("id=%d msg=%s\n", __tcc_err_id_get(), __tcc_err_msg_get());
+    printf("id=%d msg=%s\n", last_id, last_msg);
 
     __tcc_err_clear();
     log_reset();
-    printf("outer-normal=%d ", outer(0));
+    printf("outer-normal=%d ", run_outer(0));
     log_print("outer-normal");
     printf("flag=%d\n", __tcc_err_flag_get());
 
     __tcc_err_clear();
     log_reset();
-    loop_err(1);
+    run_loop(1);
     log_print("loop-error");
-    printf("id=%d\n", __tcc_err_id_get());
+    printf("id=%d\n", last_id);
 
     __tcc_err_clear();
     log_reset();
-    loop_err(0);
+    run_loop(0);
     log_print("loop-normal");
 
     __tcc_err_clear();
     log_reset();
-    printf("ptr=%d ", ptr_err(1) == (int *)(long)SENT);
+    printf("ptr=%d ", run_ptr(1) == (int *)(long)SENT);
     log_print("ptr");
-    printf("id=%d msg=%s\n", __tcc_err_id_get(), __tcc_err_msg_get());
+    printf("id=%d msg=%s\n", last_id, last_msg);
 
     __tcc_err_clear();
     printf("final-flag=%d\n", __tcc_err_flag_get());
