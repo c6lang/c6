@@ -1,7 +1,7 @@
 From eae7039913fb8680c27f94388228376835ee3a69 Mon Sep 17 00:00:00 2001
 From: superc-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 18:31:42 +0800
-Subject: [PATCH 5/7] superc: harden try/catch (per-call slot clear, binding
+Subject: [PATCH 5/10] superc: harden try/catch (per-call slot clear, binding
  check)
 
 Review findings:

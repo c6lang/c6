@@ -1,7 +1,7 @@
 From 89a1fa191535cb2dd5808ae025e21ba6e62ad81e Mon Sep 17 00:00:00 2001
 From: superc-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 19:13:39 +0800
-Subject: [PATCH 7/7] superc: every variable definition must be initialized
+Subject: [PATCH 7/10] superc: every variable definition must be initialized
 
 VLA is the only exception (C forbids initializing a variable length array).
 'extern' declarations, parameters, struct/union members, typedefs and alias
