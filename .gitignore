@@ -1,5 +1,5 @@
-# tcc/ 是 bootstrap.sh 生成的上游工作树，不纳入本仓库
-/tcc/
+# tcc/ 是本仓库的源码：上游 TinyCC 基线 + 每个 c6 补丁一个提交。
+# 它的构建产物由 tcc/.gitignore 忽略。
 
 # 环境/工具产生的临时文件
 /.marker-test

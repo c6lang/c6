@@ -1,6 +1,6 @@
 # c6 —— 带语言扩展的 TinyCC
 #
-#   make bootstrap   生成/同步 tcc/ 工作树（克隆上游 + 应用 patches/）
+#   make bootstrap   准备构建（tcc/ 源码已在仓库里；缺 config.mak 时跑 configure）
 #   make build       以扩展模式构建（EXTRA-DEFS=-DC6_EXT）
 #   make build-plain 以上游模式构建（不定义 C6_EXT）
 #   make selftest    跑 tests/ 下所有 c6 自测（test 块 + 编译期诊断）
@@ -8,7 +8,7 @@
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量
 #   make clean       清理 tcc/ 的构建产物
-#   make distclean   连 tcc/ 工作树一起删除
+#   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
 #
 # C6_EXT 是编译期开关，切换模式时会自动先清理旧产物。
 
@@ -24,16 +24,16 @@ MODE     := $(TCC_DIR)/.c6-mode
 
 all: build
 
-# 幂等：tcc/ 缺失时克隆，已存在时同步到 patches/ 的当前内容（补丁增删/
-# 改名/修改都会触发重建），已是最新时直接返回。
+# tcc/ 是本仓库的源码（上游基线 + 一个 c6 补丁一个提交），不再克隆和打补丁；
+# bootstrap 只负责首次 configure，已经配置好就直接返回。
 bootstrap:
 	@./scripts/bootstrap.sh
 
 check-tcc:
-	@test -d $(TCC_DIR)/.git || { echo "缺少 $(TCC_DIR)/，先执行 'make bootstrap'"; exit 1; }
+	@test -f $(TCC_DIR)/tccpp.c || { echo "缺少 $(TCC_DIR)/ 源码，检出可能不完整"; exit 1; }
 
 # 记录当前构建模式，模式变化时清理，避免复用错误配置的目标文件。
-# bootstrap 先跑：补丁集变化时先把 tcc/ 同步好，再决定要不要清理。
+# bootstrap 先跑：首次构建前把 tcc/ 配置好，再决定要不要清理。
 mode-ext: bootstrap
 	@if [ "$$(cat $(MODE) 2>/dev/null)" != "ext" ]; then \
 	    echo "c6: 切换到扩展模式（清理旧产物）"; \
@@ -72,7 +72,7 @@ clean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true
 
 distclean:
-	rm -rf $(TCC_DIR)
+	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) distclean || true
 
 help:
 	@sed -n '2,15p' Makefile
