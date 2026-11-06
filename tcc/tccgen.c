@@ -282,6 +282,7 @@ typedef struct C6SpPending {
 } C6SpPending;
 static C6SpPending *c6_sp_pending;
 static void c6_task_decl(void);
+static void c6_foreach_parse(void);
 static void c6_task_check_handle(CType *t, const char *what);
 static void c6_task_defer_destroy(int slot);
 static void c6_async_propagate(void);
@@ -9689,6 +9690,16 @@ again:
         if (!c6_ext_on())
             tcc_error("'catch' requires -std=c6");
         tcc_error("'catch' has no operand");
+
+    } else if (t == TOK_C6_FOREACH) {
+        if (!c6_ext_on())
+            tcc_error("'foreach' requires -std=c6");
+        if (tok != '|') {
+            /* not a statement: 'foreach' is used as a plain name here */
+            unget_tok(t);
+            goto expr;
+        }
+        c6_foreach_parse();
 #endif
 
     } else if (t == TOK_FOR) {
@@ -11835,6 +11846,202 @@ static void c6_task_decl(void)
 }
 
 /* ---------------------------------------------------------------------- */
+/* 'foreach |i, v| iterable { ... }'                                       */
+/*                                                                         */
+/* The iterable is evaluated once.  A complete array or a slice becomes    */
+/* the '{ elem *data; size_t len; }' frame pair that the slice runtime     */
+/* already uses, a range 'lo:hi' becomes two integer slots.  The binders    */
+/* are ordinary locals -- the index counts and the value is a fresh copy    */
+/* of the element -- so 'break', 'continue', 'defer' and 'await' behave     */
+/* exactly as they do inside a 'for'.  A user type is iterated through a    */
+/* slice it exposes ('foreach |i, v| obj.items'): there is no runtime       */
+/* protocol and no call into a library.                                    */
+
+/* what the usual arithmetic conversions give for two integer operands:
+   the wider type, unsigned when both are as wide and either is unsigned,
+   and never narrower than 'int' (default promotions) */
+static CType c6_common_int_type(CType *a, CType *b)
+{
+    CType r;
+    int al, bl, sa, sb;
+
+    sa = type_size(a, &al);
+    sb = type_size(b, &bl);
+    r = sb > sa ? *b : *a;
+    if (sa == sb && ((a->t | b->t) & VT_UNSIGNED))
+        r.t |= VT_UNSIGNED;
+    if (type_size(&r, &al) < (int)sizeof(int))
+        r.t = VT_INT;
+    return r;
+}
+
+static int c6_is_int_type(CType *t)
+{
+    if (is_float(t->t))
+        return 0;
+    return is_integer_btype(t->t & VT_BTYPE);
+}
+
+/* 'foreach' keeps the 'for' semantics: the binders live in their own scope
+   and 'lblock' collects the break/continue jumps of the body. */
+static void c6_foreach_parse(void)
+{
+    C6Slice *sl;
+    CType t, elem, ept, ctr;
+    struct scope o;
+    char buf[256];
+    int n1, n2, nb, is_range;
+    int i_off, v_off, pair, hi_off, size, align;
+    int a, b, c, d;
+
+    n1 = n2 = nb = i_off = v_off = pair = hi_off = 0;
+    is_range = 0;
+
+    next();                             /* '|' */
+    for (;;) {
+        int name;
+        if (tok < TOK_UIDENT)
+            tcc_error("'foreach' expects a binding name");
+        if (nb == 2)
+            tcc_error("'foreach' takes at most two bindings");
+        name = 0;
+        if (strcmp(get_tok_str(tok, NULL), "_"))
+            name = tok;
+        if (nb++ == 0)
+            n1 = name;
+        else
+            n2 = name;
+        next();
+        if (tok != ',')
+            break;
+        next();
+    }
+    skip('|');
+
+    new_scope(&o);
+
+    expr_cond();
+    if (tok == ':') {
+        is_range = 1;
+        next();
+        expr_cond();
+        if (nb != 1)
+            tcc_error("a range yields only an index: write 'foreach |i| lo:hi'");
+        if (!c6_is_int_type(&vtop[-1].type) || !c6_is_int_type(&vtop->type))
+            tcc_error("range bounds must be integers");
+        ctr = c6_common_int_type(&vtop[-1].type, &vtop->type);
+        size = type_size(&ctr, &align);
+        /* the upper bound goes to a hidden slot ... */
+        loc = (loc - size) & -align;
+        hi_off = loc;
+        vset(&ctr, VT_LOCAL | VT_LVAL, hi_off);
+        vswap();
+        vstore();
+        vpop();
+        /* ... and the binder is the counter, so it starts at the lower
+           bound (the store converts it to the common type) */
+        loc = (loc - size) & -align;
+        i_off = loc;
+        if (n1)
+            sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
+        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
+        vswap();
+        vstore();
+        vpop();
+    } else {
+        t = vtop->type;
+        if (nb != 2)
+            tcc_error("an array or slice yields an index and a value: "
+                      "write 'foreach |i, v| a'");
+        if (t.t & VT_VLA)
+            tcc_error("cannot iterate over a variable length array");
+        if (t.t & VT_ARRAY) {
+            if (!t.ref || t.ref->c < 0)
+                tcc_error("cannot iterate over an array of unknown length");
+            elem = *pointed_type(&t);
+            elem.t &= ~VT_QUAL;
+            pair = c6_slice_spill(NULL);
+        } else if ((sl = c6_slice_of_type(&t)) != NULL) {
+            elem = sl->elem;
+            pair = c6_slice_spill(sl);
+        } else {
+            type_to_str(buf, sizeof buf, &t, NULL);
+            if ((t.t & VT_BTYPE) == VT_PTR)
+                tcc_error("cannot iterate over '%s' (use a slice parameter "
+                          "'T[:]', or '(T[:]){p, n}')", buf);
+            if (c6_is_int_type(&t))
+                tcc_error("cannot iterate over '%s' (write a range: "
+                          "'foreach |i| lo:hi')", buf);
+            tcc_error("cannot iterate over '%s' (expose a slice member, "
+                      "e.g. 'T[:] items')", buf);
+        }
+        if (!n1 && !n2)
+            tcc_error("'foreach' discards both binders");
+        if (elem.t & VT_ARRAY) {
+            type_to_str(buf, sizeof buf, &elem, NULL);
+            tcc_error("'foreach' cannot copy an element of type '%s'", buf);
+        }
+        size = type_size(&elem, &align);
+        if (size < 0) {
+            type_to_str(buf, sizeof buf, &elem, NULL);
+            tcc_error("cannot iterate over incomplete element type '%s'", buf);
+        }
+        ctr = c6_size_type();
+        /* hidden slots first, then the two binders */
+        loc = (loc - size) & -align;
+        v_off = loc;
+        loc = (loc - PTR_SIZE) & -PTR_SIZE;
+        i_off = loc;
+        if (n1)
+            sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
+        if (n2)
+            sym_push(n2, &elem, VT_LOCAL | VT_LVAL, v_off);
+        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);       /* i = 0 */
+        vpushi(0);
+        vstore();
+        vpop();
+    }
+
+    c = gind();
+    vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
+    vset(&ctr, VT_LOCAL | VT_LVAL, is_range ? hi_off : pair + PTR_SIZE);
+    gen_op(TOK_LT);
+    a = gvtst(1, 0);
+
+    /* the value binder is loaded from the pair on every iteration */
+    if (n2) {
+        ept = elem;
+        mk_pointer(&ept);
+        vset(&elem, VT_LOCAL | VT_LVAL, v_off);     /* destination */
+        vset(&ept, VT_LOCAL | VT_LVAL, pair);       /* data */
+        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);      /* index */
+        gen_op('+');
+        indir();
+        vstore();
+        vpop();
+    }
+    if (tok != '{')
+        expect("'{'");                              /* the body is a block */
+    b = 0;                      /* no 'continue' jumps yet */
+    lblock(&a, &b);
+
+    /* 'continue' lands on the increment */
+    d = gind();
+    gsym_addr(b, d);
+    vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
+    vpushi(1);
+    gen_op('+');
+    vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
+    vswap();
+    vstore();
+    vpop();
+    gjmp_addr(c);
+    gsym(a);
+
+    prev_scope(&o, 0);
+}
+
+/* ---------------------------------------------------------------------- */
 /* soft keywords                                                           */
 /*                                                                         */
 /* 'co', 'go' and 'task' are keywords only at the start of a statement      */
@@ -12458,6 +12665,15 @@ static int decl(int l)
                 }
                 unget_tok(c6_name);
             }
+        }
+        /* 'foreach |i, v| a { ... }' is a statement: at file scope it is
+           always a mistake, not a declaration with an implicit int */
+        if (tcc_state->c6_ext && l == VT_CONST && tok == TOK_C6_FOREACH) {
+            int c6_name = tok;
+            next();
+            if (tok == '|')
+                tcc_error("'foreach' can only be used inside a function");
+            unget_tok(c6_name);
         }
 #endif
         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {

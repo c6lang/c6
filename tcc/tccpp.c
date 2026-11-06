@@ -4014,7 +4014,7 @@ ST_FUNC void tccpp_new(TCCState *s)
            'test' may already be interned as an asm keyword, in which
            case the range ends before TOK_C6_TEST. */
         int t;
-        for (t = TOK_C6_PACKAGE; t <= TOK_C6_AWAIT && t < tok_ident; t++)
+        for (t = TOK_C6_PACKAGE; t <= TOK_C6_FOREACH && t < tok_ident; t++)
             tok_unintern(t);
         if (TOK_C6_PACKAGE < tok_ident)
             tok_ident = TOK_C6_PACKAGE;

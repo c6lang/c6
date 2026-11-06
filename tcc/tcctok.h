@@ -454,4 +454,5 @@
      DEF(TOK_C6_CATCH,     "catch")
      DEF(TOK_C6_ASYNC,     "async")
      DEF(TOK_C6_AWAIT,     "await")
+     DEF(TOK_C6_FOREACH,   "foreach")
 #endif
