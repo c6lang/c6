@@ -13,7 +13,7 @@ int main(void) { return bad(); }
 static int!error bad(int n) { try n; return 0; }
 int main(void) { return bad(1); }
 #elif defined test_try_assignment
-static int!error bad(void) { int v; try v = 1; return v; }
+static int!error bad(void) { int v = 0; try v = 1; return v; }
 int main(void) { return bad(); }
 #elif defined test_catch_not_fallible
 static int bad(void) { int v = ok_int() catch e { return -1; }; return v; }
@@ -28,7 +28,7 @@ int main(void) { return bad(); }
 static int!error x = 1;
 int main(void) { return x; }
 #elif defined test_fallible_struct_return
-static struct S!error bad_ret(void) { struct S s; return s; }
+static struct S!error bad_ret(void) { struct S s = {0}; return s; }
 int main(void) { return bad_ret().a; }
 #elif defined test_try_in_defer
 static int!error bad(void) { defer { try fails(0); } return 0; }

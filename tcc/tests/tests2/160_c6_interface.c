@@ -52,9 +52,9 @@ static void dump(Printable p)
 
 int main(void)
 {
-    Circle c;
-    Rect r;
-    Shape s;
+    Circle c = {0};
+    Rect r = {0};
+    Shape s = {0};
 
     c.r = 5;
     r.w = 4;

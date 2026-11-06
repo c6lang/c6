@@ -27,7 +27,7 @@
 
 int main(void)
 {
-    int a = 3, b = 9, m;
+    int a = 3, b = 9, m = 0;
 
     swap(a, b);
     printf("swap: %d %d\n", a, b);

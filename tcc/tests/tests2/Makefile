@@ -88,6 +88,7 @@ ifneq (,$(C6_OK))
  158_c6_test.test: FLAGS += -test
  162_c6_iface_errors.test: FLAGS += -dt
  164_c6_try_errors.test: FLAGS += -dt
+ 165_c6_init.test: FLAGS += -dt
 else
  SKIP += $(C6_TESTS)
 endif

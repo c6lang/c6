@@ -7,8 +7,8 @@ int __tcc_err_id_get(void);
 const char *__tcc_err_msg_get(void);
 void __tcc_err_clear(void);
 
-static char buf[256];
-static int blen;
+static char buf[256] = {0};
+static int blen = 0;
 
 static void log_reset(void) { blen = 0; buf[0] = '\0'; }
 static void log_add(const char *s)
@@ -126,7 +126,7 @@ static int use_void(int n)
 /* 6) 'try' inside a loop: one failing iteration aborts the whole function */
 static int!error loop(int n)
 {
-    int i, sum = 0;
+    int i = 0, sum = 0;
     for (i = 0; i < n; i++) {
         if (i == 3)
             err(300, "loop");
@@ -161,7 +161,7 @@ static int call_nested(int n)
 
 int main(void)
 {
-    int a, b, c;
+    int a = 0, b = 0, c = 0;
 
     log_reset();
     a = call_propagates(2);

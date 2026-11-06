@@ -9,13 +9,13 @@ void __tcc_err_clear(void);
 
 #define SENT (-1)
 
-static char buf[256];
-static int blen;
+static char buf[256] = {0};
+static int blen = 0;
 
 /* the last error observed by a 'catch' handler (the slot itself is cleared
    by 'catch', so the values have to be copied out) */
-static int last_id;
-static const char *last_msg;
+static int last_id = 0;
+static const char *last_msg = 0;
 
 static void log_reset(void) { blen = 0; buf[0] = '\0'; }
 static void log_add(const char *s)
@@ -68,7 +68,7 @@ static int!error outer(int fail)
 /* err inside a loop leaves the whole frame */
 static void!error loop_err(int fail)
 {
-    int i;
+    int i = 0;
     for (i = 0; i < 3; i++) {
         defer log_add("d");
         if (fail && i == 1)

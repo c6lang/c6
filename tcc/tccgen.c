@@ -169,6 +169,8 @@ static int c6_decl_fallible;
 static void c6_fallible_use(void);
 static int c6_parse_fallible_suffix(void);
 static void c6_check_error_param(CType *type);
+static void c6_check_var_initialized(CType *type, int has_init, int v,
+                                         AttributeDef *ad);
 static void c6_defer_func_init(void);
 static void c6_defer_func_end(void);
 static void c6_defer_begin(int mode, int depth);
@@ -10291,6 +10293,27 @@ static void c6_check_error_param(CType *type)
         tcc_error("'error' can only be a return type, not a parameter");
 }
 
+/* Every variable definition must come with an initializer.  Declarations
+   ('extern' objects, function prototypes, typedefs), parameters, struct
+   members and alias objects are not definitions and are exempt; so are VLAs,
+   because C forbids initializing a variable length array.  The check runs
+   before TCC turns a tentative global definition into an 'extern' one, and
+   before a 'package' mangles the name, so the diagnostic shows the name as
+   written. */
+static void c6_check_var_initialized(CType *type, int has_init, int v,
+                                         AttributeDef *ad)
+{
+    if (!tcc_state->c6_ext || has_init)
+        return;
+    if (type->t & (VT_EXTERN | VT_TYPEDEF | VT_VLA))
+        return;
+    if ((type->t & VT_BTYPE) == VT_FUNC)
+        return;
+    if (ad->alias_target)
+        return;
+    tcc_error("variable '%s' must be initialized", get_tok_str(v, NULL));
+}
+
 /* Turn the '!error' annotation of TYPE into a property of the function. */
 static void c6_apply_fallible(CType *type)
 {
@@ -10322,7 +10345,7 @@ static int decl(int l)
     AttributeDef ad, adbase;
     ElfSym *esym;
 #ifdef C6_EXT
-    int fallible;
+    int fallible, decl_name;
 #endif
 
     while (1) {
@@ -10429,6 +10452,9 @@ static int decl(int l)
                 c6_apply_fallible(&type);
 #endif
 #ifdef C6_EXT
+            /* keep the name as written: a 'package' mangles it below, but
+               diagnostics must talk about the identifier the user wrote */
+            decl_name = v;
             /* symbols declared inside a package are name-mangled; the
                program entry point always keeps its name */
             if (l == VT_CONST && tcc_state->c6_package
@@ -10584,6 +10610,10 @@ static int decl(int l)
 
                     if (tok == '=')
                         has_init = 1;
+#ifdef C6_EXT
+                    c6_check_var_initialized(&type, has_init, decl_name,
+                                                 &ad);
+#endif
 
                     if (((type.t & VT_EXTERN) && (!has_init || l != VT_CONST))
 		        || (type.t & VT_BTYPE) == VT_FUNC

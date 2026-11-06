@@ -1,8 +1,8 @@
 /* c6 extension: defer */
 #include <stdio.h>
 
-static char log_buf[512];
-static int log_pos;
+static char log_buf[512] = {0};
+static int log_pos = 0;
 
 static void log_reset(void) { log_pos = 0; log_buf[0] = '\0'; }
 static void log_add(const char *s)
@@ -11,7 +11,7 @@ static void log_add(const char *s)
     while (s[n])
         n++;
     if (log_pos + n < (int)sizeof(log_buf)) {
-        int i;
+        int i = 0;
         for (i = 0; i < n; i++)
             log_buf[log_pos++] = s[i];
         log_buf[log_pos] = '\0';
@@ -35,7 +35,7 @@ static void t_basic(void)
 /* 2: defer runs when the block is left by break/continue */
 static void t_loop(void)
 {
-    int i;
+    int i = 0;
     log_reset();
     for (i = 0; i < 3; i++) {
         defer log_add("d");
@@ -87,7 +87,7 @@ static int rec(int n)
 
 static void t_rec(void)
 {
-    int r;
+    int r = 0;
     log_reset();
     r = rec(3);
     printf("rec: %d %d\n", r, (int)(log_pos / 1));

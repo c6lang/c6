@@ -1,0 +1,30 @@
+[test_local_int]
+165_c6_init.c:6: error: variable 'x' must be initialized
+
+[test_local_multi]
+165_c6_init.c:9: error: variable 'y' must be initialized
+
+[test_local_array]
+165_c6_init.c:12: error: variable 'a' must be initialized
+
+[test_local_struct]
+165_c6_init.c:15: error: variable 's' must be initialized
+
+[test_local_pointer]
+165_c6_init.c:18: error: variable 'p' must be initialized
+
+[test_global_int]
+165_c6_init.c:21: error: variable 'g' must be initialized
+
+[test_static_global]
+165_c6_init.c:24: error: variable 'sg' must be initialized
+
+[test_static_local]
+165_c6_init.c:27: error: variable 'sl' must be initialized
+
+[test_for_init]
+165_c6_init.c:30: error: variable 'k' must be initialized
+
+[test_ok]
+
+[test_vla_ok]

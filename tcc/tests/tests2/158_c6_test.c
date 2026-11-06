@@ -27,7 +27,7 @@ test "errdefer is skipped on the normal path" {
 }
 
 test "strings and loops" {
-    int i, sum = 0;
+    int i = 0, sum = 0;
     const char *s = "abcd";
     for (i = 0; s[i]; i++)
         sum += s[i];
