@@ -19,6 +19,7 @@ int S(void);                /* 普通命名空间里的 S：裸 'S' 不再表示
 // EXPECT tag_as_value: error: 'V' undeclared
 // EXPECT tag_out_of_scope: error: 'Local' undeclared
 // EXPECT incomplete_tag: error: initialization of incomplete type
+// EXPECT local_tag_slice: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
 
 #if defined shadowed_by_function
 int main(void)
@@ -69,6 +70,14 @@ int main(void)
 {
     Fwd f = { 0 };
     return 0;
+}
+#elif defined local_tag_slice
+int main(void)
+{
+    struct Local { int a; };
+    Local arr[2] = { { 1 }, { 2 } };
+    Local[:] s = arr;           /* 裸 tag 也要满足 C23：元素类型必须在文件作用域 */
+    return s.len == 2 ? 0 : 1;
 }
 #else
 /* 不带 -D 时的正常路径：裸 tag 照常用 */

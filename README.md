@@ -320,7 +320,8 @@ int main(void)
   `interface` 名字本来就是这么生成的，行为不变；
 - 只接受**已经可见**的 tag，不会隐式前置声明：`S *p;` 在 `S` 没声明时仍是 `'S' undeclared`；
 - 语句开头的 `TAG:` 仍是标签；`TAG` 只是 tag 时 `TAG(...)` 按声明解析（与 C 里 typedef 名
-  的规则一致），被函数遮蔽时按调用解析；
+  的规则一致），被函数遮蔽时按调用解析。同一条规则也意味着 K&R 定义里「形参名恰好与
+  文件作用域 tag 同名」会按原型解析（`int f(S) int *S; {…}`），写 `struct S` 即可；
 - 只在 `-std=c6` 的翻译单元里生效，`struct Vec v;` 永远可用。
 
 完整可运行示例见 [examples/typename_demo.c](examples/typename_demo.c)：
@@ -649,6 +650,7 @@ tests/
 ├── thread.c          go（OS 线程）
 ├── typename.c        裸 tag 类型名（省略 struct / union / enum）
 ├── tu/               跨翻译单元的第二个 .c（同名的主文件会一起编译）
+├── exit/             退出码（`// EXIT <n>` 声明期望的进程退出码）
 └── errors/           编译期诊断（每个片段一个 -D 开关）
 ```
 
@@ -673,7 +675,7 @@ tests/run-tests.sh --list           # 列出会跑的文件
 ok   err: 18 test(s), 0 failure(s)
 ok   errors/slice: 12 个诊断片段
 ...
-run-tests: 21 通过, 0 失败
+run-tests: 23 通过, 0 失败
 ```
 
 `-test` 模式下 `main` 可有可无（运行器不调用它）。
