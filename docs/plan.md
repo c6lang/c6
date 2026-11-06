@@ -499,6 +499,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_c6_macro` / `c6_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
+| 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task)` 编译，`c6_async_func_begin` 算帧基址并分发、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把帧/defer 记录/错误槽 park 出去；运行期 `libtcc1.c` 的 `__c6_co_new` / `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（固定池 + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
 
 测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：c6 的
 测试一律用 c6 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
@@ -506,6 +507,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 
 | 位置 | 内容 |
 |---|---|
+| `tests/async.c` | `async`/`await` 的返回值、挂起后局部变量、嵌套/循环里的 `await`、`defer` 跨挂起、`await c6_io`、任务槽回收 |
 | `tests/defer.c` | defer 的时机、顺序、`break`/`continue`/`goto`/`return`、递归 |
 | `tests/err.c` | `err` / `errdefer` 与清理顺序、错误槽 |
 | `tests/try.c` | `try` / `catch`，含 `goto` 离开、嵌套传播、`void!error` |
@@ -572,3 +574,26 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   与 `catch` 落空时的处理保持一致；
 - 元素本身是数组时先用 `typedef`（`typedef int Row[3]; Row[:] rows;`）——数组
   声明符只能写在名字上，C 本身如此。
+- `async` 是**无栈**协程：函数体始终跑在调用方的栈上，`await` 处只保存
+  已经用到的帧（`[base - size, base)`）、defer 记录和错误槽，`return` 回
+  驱动方；恢复时原样拷回并跳到恢复点。因此没有独立栈、没有
+  `setjmp`/`ucontext`，也没有上下文切换开销，但**不能**在 `await` 之后
+  依赖别的协程帧还活着；
+- 帧快照按 `-loc` 取“到目前为止用到的部分”，每次挂起都会更新
+  `frame_size`；恢复只拷回最后一次挂起时记下的字节数，所以偏移必须
+  在恢复后保持有效——TCC 的帧槽就是 `rbp + off`，天然满足；
+- 运行时是单线程固定池：64 个任务、每任务 4 KiB 帧、1 KiB 任务结构、
+  256 条 parked defer 记录。`-run` 下没有 TLS，和既有的 defer/err 运行时
+  一致；超出容量是运行时陷阱而不是诊断；
+- 挂起点上已压在求值栈里的中间值必须落在**变量**里（帧槽会随帧一起
+  恢复）。实践中调用点本来就会把活寄存器先落到帧槽，所以
+  `plain() + await f()` 也能用；静态判断不出来时报约束 C33；
+- `async` 的签名必须是能从声明写回任务结构的类型：标量、枚举、指针、
+  `T[:]`、文件作用域 struct/union。数组（会退化成指针）、VLA、函数指针
+  参数都会报 `'async' does not support this signature`；
+- `__c6_co_destroy` 目前只回收任务槽（连同未完成的子任务一起），不会
+  执行任务里还挂着的 `defer`；需要清理的协程请让它跑到完成；
+- `await` 不能出现在 `defer`/`errdefer` 体、`sizeof` 等不求值上下文，
+  也不能在非 `async` 函数里用；`c6_io` 只有 `await c6_io(fd, ev)` 一
+  种写法。
+

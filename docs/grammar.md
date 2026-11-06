@@ -254,6 +254,69 @@ C 里 `[` 紧跟类型说明符是语法错误（数组声明符在名字之后�
 先检查 `i < len`；`s[lo:hi]` 先检查 `lo <= hi <= len`。越界是运行时
 陷阱，不做静态诊断。约束见 C22–C28。
 
+### 3.4 async 函数（无栈协程）
+
+```
+async-function-declaration = "async" , declaration-specifiers ,
+                             declarator , ";" ;
+async-function-definition  = "async" , declaration-specifiers ,
+                             declarator , compound-statement ;
+```
+
+`async` 是一个**声明说明符**（写法与 `static` / `inline` 同级），把被声明
+的函数标记为无栈协程：调用它不执行函数体，只创建一个**任务**；函数体
+由 `await` 驱动着一段一段往前跑。
+
+```
+    async int add(int a, int b) { return a + b; }
+
+    async int worker(void)
+    {
+        int got = 0;
+        got = await add(20, 22);        (* 挂起，等 add 跑完再继续 *)
+        return got;
+    }
+
+    int main(void)
+    {
+        struct worker_task *t = worker();   (* 只是建任务 *)
+        int rc = __c6_co_wait(t);           (* 把它跑到完成 *)
+        printf("%d\n", t->val);
+        __c6_co_destroy(t);
+        return rc;
+    }
+```
+
+调用一个 `async` 函数得到的是 `struct NAME_task *`（**任务句柄**），不是
+声明的返回类型。这个结构由声明本身推导出来，因此各翻译单元一致：
+
+```
+    struct NAME_task {
+        struct __c6_task head;      (* 运行时私有头部，偏移 0 *)
+        T                val;       (* 声明的返回值（void 时不存在） *)
+        P0               p0;        (* 第 0 个形参 *)
+        …
+    };
+```
+
+`struct __c6_task` 的布局由 `libtcc1` 拥有，生成代码只通过 `__c6_co_*`
+访问器碰它；`t->val` 和 `t->pN` 是普通的公开成员。
+
+运行时接口（`-std=c6` 时由 `__TCC_ASYNC_DEFINED` 预置声明）：
+
+```
+void *__c6_co_new(const struct __c6_desc *d);
+int   __c6_co_wait(void *task);        (* 驱动到完成，0 = 正常结束 *)
+void  __c6_co_destroy(void *task);     (* 释放任务槽（含未完成的子任务） *)
+int   __c6_co_state(void *task);
+int   __c6_co_kind(void *task);
+int   c6_io(int fd, int ev);           (* 只能写成 await c6_io(fd, ev) *)
+#define C6_CO_EV_READ  1
+#define C6_CO_EV_WRITE 2
+```
+
+约束见 C29–C33。
+
 ---
 
 ## 4. 语句
@@ -292,7 +355,12 @@ try-statement          = "try" , try-operand , ";" ;
 ```
 primary-expression     = …
                        | qualified-identifier
-                       | try-expression ;
+                       | try-expression
+                       | await-expression ;
+
+await-expression       = "await" , unary-expression ;
+                         (* 操作数最终必须落到一次 async 函数调用或
+                            c6_io(fd, ev) 上，见 C30 *)
 
 qualified-identifier   = identifier , "." , identifier ,
                          { "." , identifier } ;
@@ -419,6 +487,11 @@ parameter-list    = identifier , { "," , identifier } ;
 | C26 | 区间没有容量形式（第三个 `:`） | `slice bounds have no capacity` |
 | C27 | 静态初始化器（文件作用域或 `static` 局部）没有运行时代码，数组不能隐式转切片 | `a slice cannot be initialized from an array in a static initializer; use '{ data, len }'` |
 | C28 | 切片的元素限定符按忽略处理（`const int[:]` 与 `int[:]` 是同一类型） | — |
+| C29 | `async` 只能用于文件作用域的函数定义（不能嵌套、不能 `inline`、不能是 `main`），且签名必须是可写回的类型：标量、指针、`T[:]`、文件作用域的 struct/union，不能有数组、VLA 或函数指针参数 | `'async' functions must have file scope`；`'async' functions cannot be nested`；`'async' cannot be combined with 'inline'`；`'main' cannot be async`；`'async' does not support this signature: '…'` |
+| C30 | `await` 只能出现在 `async` 函数体内，操作数必须是一次 `async` 调用或 `c6_io(fd, ev)` | `'await' is only allowed inside an 'async' function`；`'await' requires a call to an 'async' function` |
+| C31 | `await` 不能出现在 `defer` / `errdefer` 体或 `sizeof` 等不求值上下文里 | `'await' is not allowed in a 'defer' body`；`'await' is not allowed in an unevaluated context` |
+| C32 | `c6_io` 只有 `await c6_io(fd, ev)` 一种写法 | `'c6_io' can only be used as 'await c6_io(fd, ev)'` |
+| C33 | 挂起点上已经压在求值栈里的中间值必须落在变量里（帧槽会随帧一起恢复，寄存器不会） | `the value pending across 'await' must live in a variable: store it in a local first` |
 
 ---
 
@@ -666,6 +739,51 @@ int main(void)
 }
 ```
 
+**R14 — `async T f(P…) { body }`**
+
+```
+int __c6_body_f(void *task);
+const struct __c6_desc __c6_desc_f = { sizeof(struct f_task), alignof, 64, __c6_body_f };
+```
+
+函数体按 `int __c6_body_f(void *task)` 编译。序言先算帧基址
+`base = &marker - off(marker)`，再看 `__c6_co_state(task)`：非 0 就把保存
+的帧拷回 `base - size` 并跳到恢复分发器，为 0 就正常往下执行。声明的形参
+在此时被声明成普通局部变量，并从 `task->pN` 拷进来（只有首次进入会走这条
+路径）。
+
+`struct f_task` 由 `c6_async_declare()` 用合成 token 在文件作用域声明，
+所以同一个 `async` 声明在定义方和调用方得到同一个布局。
+
+**R15 — `await`**
+
+```
+    x = await f(a)          ⇒  task = __c6_co_new(&__c6_desc_f);
+                               task->p0 = a;
+                               if (__c6_co_await(task, self))
+                                   __c6_co_suspend(self, KIND_CHILD, N, base, size, defer_base);
+                                   return KIND_CHILD;     (* 回到驱动方 *)
+                               N:  x = task->val;          (* 恢复后从这里继续 *)
+
+    await c6_io(fd, ev)     ⇒  __c6_co_set_io(self, fd, ev);
+                               __c6_co_suspend(self, KIND_IO, N, base, size, defer_base);
+                               return KIND_IO;
+                               N:  __c6_co_rev(self);      (* 就绪掩码 *)
+
+    return e;               ⇒  self->val = e;
+                               <执行 defer 链>
+                               __c6_co_finish(self, KIND_DONE);
+                               return KIND_DONE;
+```
+
+挂起时把 `[base - size, base)` 之间的原生帧、`[defer_base, defer_sp)` 的
+defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再跳到该号恢复点。
+因此**局部变量、defer 记录、错误状态在挂起前后完全不变**。
+
+驱动方 `__c6_co_wait(task)` 反复进入 `__c6_body_f`：每次拿到的 `kind` 是
+`DONE` / `IO` / `CHILD`，为 `CHILD` 时先往子任务里钻，为 `IO` 时用
+`select()` 等 fd 就绪并把掩码放进 `wait_rev`。
+
 ---
 
 切片配合数组、函数与结构体：
@@ -707,6 +825,64 @@ int main(void)
 
 跨翻译单元：两边各自写 `int[:]`，布局固定，直接按值传递/返回即可。
 
+### 9.1 async / await：一次 HTTP 请求
+
+```c
+/* 传输层：每个原语自己决定"等什么 fd" */
+async int connect_to(int wfd)
+{
+    int rev = 0;
+    rev = await c6_io(wfd, C6_CO_EV_WRITE);
+    if (rev <= 0)
+        return -1;
+    return wfd;
+}
+
+async int send_all(int wfd, const char *data, int len)
+{
+    int off = 0;
+    int n = 0;
+    while (off < len) {
+        await c6_io(wfd, C6_CO_EV_WRITE);
+        n = write(wfd, data + off, len - off);
+        if (n <= 0)
+            return -1;
+        off += n;
+    }
+    return off;
+}
+
+/* 业务层：三个 await 顺着写，读起来和同步代码一样 */
+async int http_get(int wfd, int rfd, const char *req, char *buf, int cap)
+{
+    int fd = 0;
+    int sent = 0;
+    int status = 0;
+
+    fd = await connect_to(wfd);
+    if (fd < 0)
+        return -1;
+    sent = await send_all(fd, req, (int)strlen(req));
+    if (sent < 0)
+        return -2;
+    status = await recv_status(rfd, buf, cap);
+    return status;
+}
+
+int main(void)
+{
+    struct http_get_task *t = http_get(up_w, down_r, "GET / HTTP/1.1\r\n\r\n",
+                                       buf, sizeof buf);
+    int rc = __c6_co_wait(t);       /* 驱动到完成：0 = 正常结束 */
+    printf("status=%d\n", t->val);
+    __c6_co_destroy(t);
+    return rc;
+}
+```
+
+完整可运行的版本见 `examples/async_demo.c`（用 `pipe()` 代替 socket，
+离线就能跑）；自测见 `tests/async.c`。
+
 ## 10. 未支持的写法
 
 以下写法**不是**本规范的一部分，编译器会报错：
@@ -740,7 +916,12 @@ int main(void)
 | `int[:] g = arr;` / `static int[:] g = arr;` | 约束 C27，写 `{ arr, N }` |
 | VLA / 不完整数组转切片 | 约束 C24 |
 | `append` / `cap` / 动态扩容 / 深拷贝 | 不属于切片语义（视图，不拥有元素） |
-
+| `int x; x += await f();` 这类把中间值留在寄存器里的写法 | 一般可用（调用点会先把活寄存器落到帧槽），静态判断不出来时报约束 C33 |
+| `await` 写在 `defer` 体 / `sizeof` 里 | 约束 C31 |
+| `c6_io(fd, ev)` 不加 `await` | 约束 C32 |
+| 函数指针 / 数组 / VLA 作为 `async` 函数的形参或返回值 | 约束 C29：任务结构要能从声明写回，这几类写不回去 |
+| `async` 嵌套定义、`async inline`、`async int main` | 约束 C29 |
+| 用 `setjmp`/`ucontext`/独立栈实现的有栈协程 | 不在本扩展范围：`async` 体始终跑在调用方的栈上 |
 ---
 
 ## 11. 实现位置
@@ -764,7 +945,12 @@ int main(void)
 | 切片下标 / 区间 | `c6_slice_subscript`（`unary()` 的 `[` 分支）、`c6_slice_spill` | `tcc/tccgen.c` |
 | 数组 → 切片 | `c6_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
 | 切片运行期 | `__tcc_slice_index` / `__tcc_slice_sub` | `tcc/lib/libtcc1.c` |
-
+| `async` 声明 | `c6_async_declare`（合成 `struct NAME_task` 的 token）、`FuncAttr.func_async`、`parse_btype()` 的 `TOK_C6_ASYNC` | `tcc/tccgen.c`、`tcc/tcc.h` |
+| `async` 定义 | `c6_async_definition` / `c6_async_func_begin` / `c6_async_params_copy` / `c6_async_func_end`（恢复分发器）、`c6_async_finish` | `tcc/tccgen.c` |
+| 调用改写 | `c6_async_call`（`unary()` 的 `tok_identifier` 分支）+ `c6_async_push_desc` | `tcc/tccgen.c` |
+| `await` | `c6_await_parse`（`unary()` 前缀分支）、`c6_async_suspend`、`c6_async_await_task`、`c6_async_await_io` | `tcc/tccgen.c` |
+| 协程运行期 | `__c6_co_new` / `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy` | `tcc/lib/libtcc1.c` |
+| 预置声明 | `tcc_predefs()` 的 `__TCC_ASYNC_DEFINED` 段 | `tcc/tccpp.c` |
 关键字表：`tcc/tcctok.h` 末尾的 `TOK_C6_*` 追加项。改动词法器时
 注意它们必须留在文件的**最后**，否则会破坏 i386 内联汇编的
 `TOK_ASM_first/last/alllast` 区间。
