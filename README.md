@@ -30,12 +30,11 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 .
 ├── docs/plan.md      设计与实施方案（含实现状态）
 ├── docs/grammar.md   扩展语法的 BNF/EBNF 规范
-├── patches/          c6 扩展补丁（相对上游固定基线）
-├── scripts/          bootstrap.sh：生成并搭建 TCC 工作树
+├── scripts/          bootstrap.sh：首次构建前跑 ./configure
 ├── tests/            c6 全部自测：*.c 是 test 块，errors/ 是编译期诊断
 ├── examples/         可运行示例（每个特性一个 *_demo.c）
 ├── Makefile          便捷入口（bootstrap / build / selftest / test / clean）
-└── tcc/              TCC 源码树（由 bootstrap.sh 生成，不纳入本仓库）
+└── tcc/              TCC 源码树：上游基线 + 一个 c6 补丁一个提交
 ```
 
 ## 快速开始
@@ -43,8 +42,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 依赖：`git`、`make`、C 编译器（gcc/clang）、`binutils`。
 
 ```sh
-# 1. 拉取上游 TCC，检出固定基线并应用 c6 补丁
-#    （tcc/ 已存在时改为同步到 patches/ 的当前内容）
+# 1. 配置（只有第一次需要；tcc/ 源码就在仓库里，不用联网拉取）
 ./scripts/bootstrap.sh          # 等价于 make bootstrap
 
 # 2. 构建（打开扩展；会先自动执行 bootstrap）
@@ -55,28 +53,12 @@ make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 ```
 
 `make build` / `make selftest` / `make test-all` 都会先跑 `bootstrap`：`tcc/`
-缺失时克隆上游，`patches/` 有增删、改名或内容修改时把 `tcc/` 回到基线重新应用
-补丁，已经是最新则直接跳过。`tcc/` 是生成物；同步需要重建它时，如果里面有
-未提交的手改，bootstrap 会报错而不是静默覆盖——请把手改做成 `patches/` 里的
-补丁，或者用 `make distclean` 丢弃。
+已经配置过（有 `config.mak`）就直接跳过，没有才跑一次 `./configure`。
 
-补丁按纯 diff 应用，不重放补丁里的提交（作者、日期、提交说明都不带进来），
-一个补丁在 `tcc/` 里落成一个提交：提交说明取补丁标题，正文里 `patch:` 一行
-记补丁文件名。所以 `patches/` 永远是唯一真相，`tcc/` 的提交历史随时可以重建。
-
-如果网络需要代理，按环境要求导出即可（`git` 会读取）：
-
-```sh
-export http_proxy=http://localhost:2334
-export https_proxy=http://localhost:2334
-export all_proxy=http://localhost:2334
-```
-
-离线环境可以用 `C6_TCC_URL` 指向本地 TCC 克隆：
-
-```sh
-C6_TCC_URL=/path/to/tinycc ./scripts/bootstrap.sh
-```
+`tcc/` 是普通源码：上游 TinyCC 的基线提交 2d3eea2 先整体导入，之后每个 c6 补丁
+一个提交（提交说明就是补丁标题）。要改 TCC 就直接改 `tcc/` 里的文件、按普通提交
+提交——没有“重新同步工作树”这回事，手改不会被覆盖。`make distclean` 清理构建
+产物和 configure 结果，不会删源码。
 
 ## 使用
 
@@ -861,7 +843,7 @@ make test-all      # selftest + tests2
 ```
 
 > 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
-> 三个目标都会先跑 `bootstrap`，把 `tcc/` 同步到 `patches/` 的当前内容。
+> 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。
 
 ## 实现说明
 
@@ -890,5 +872,5 @@ make test-all      # selftest + tests2
 
 ## 上游与许可
 
-TCC 源码及本仓库的补丁均遵循 **LGPL-2.1**（见 `tcc/COPYING`）。
+TCC 源码及本仓库对它的修改均遵循 **LGPL-2.1**（见 `tcc/COPYING`）。
 上游基线固定在 `2d3eea2`（`origin/mob`）。
