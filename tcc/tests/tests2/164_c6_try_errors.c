@@ -33,6 +33,15 @@ int main(void) { return bad_ret().a; }
 #elif defined test_try_in_defer
 static int!error bad(void) { defer { try fails(0); } return 0; }
 int main(void) { return bad(); }
+#elif defined test_error_parameter
+static void take(error e) { }
+int main(void) { return 0; }
+#elif defined test_error_out_parameter
+static void take(error *e) { }
+int main(void) { return 0; }
+#elif defined test_error_parameter_knr
+static void take(e) error e; { }
+int main(void) { return 0; }
 #elif defined test_catch_in_defer
 static int!error bad(void) { defer { int v = fails(0) catch e { return -1; }; } return 0; }
 int main(void) { return bad(); }

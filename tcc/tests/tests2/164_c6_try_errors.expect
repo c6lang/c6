@@ -28,5 +28,14 @@
 [test_try_in_defer]
 164_c6_try_errors.c:34: error: 'try' is not allowed in a defer body
 
+[test_error_parameter]
+164_c6_try_errors.c:37: error: 'error' can only be a return type, not a parameter
+
+[test_error_out_parameter]
+164_c6_try_errors.c:40: error: 'error' can only be a return type, not a parameter
+
+[test_error_parameter_knr]
+164_c6_try_errors.c:43: error: 'error' can only be a return type, not a parameter
+
 [test_catch_in_defer]
-164_c6_try_errors.c:37: error: 'catch' is not allowed in a defer body
+164_c6_try_errors.c:46: error: 'catch' is not allowed in a defer body

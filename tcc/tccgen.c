@@ -168,6 +168,7 @@ static int c6_decl_fallible;
 
 static void c6_fallible_use(void);
 static int c6_parse_fallible_suffix(void);
+static void c6_check_error_param(CType *type);
 static void c6_defer_func_init(void);
 static void c6_defer_func_end(void);
 static void c6_defer_begin(int mode, int depth);
@@ -5250,6 +5251,9 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
                     type_decl(&pt, &ad1, &n, TYPE_DIRECT | TYPE_ABSTRACT | TYPE_PARAM);
                     if ((pt.t & VT_BTYPE) == VT_VOID)
                         tcc_error("parameter declared as void");
+#ifdef C6_EXT
+                    c6_check_error_param(&pt);
+#endif
                     if (n == 0 || (td & TYPE_PARAM))
                         n |= SYM_FIELD;
                 } else {
@@ -10268,6 +10272,25 @@ static int c6_parse_fallible_suffix(void)
     return 1;
 }
 
+/* 'error' only ever leaves a function: it is the payload of the 'T!error'
+   return channel and is never passed as an argument.  Reject it in parameter
+   lists ('error*' and 'error[]' included, they would be out-parameters). */
+static void c6_check_error_param(CType *type)
+{
+    CType *t = type;
+    Sym *tag;
+
+    if (!tcc_state->c6_ext)
+        return;
+    if ((t->t & VT_BTYPE) == VT_PTR && t->ref)
+        t = pointed_type(t);
+    if ((t->t & VT_BTYPE) != VT_STRUCT || !t->ref)
+        return;
+    tag = struct_find(tok_alloc_const("__tcc_error"));
+    if (tag && t->ref == tag)
+        tcc_error("'error' can only be a return type, not a parameter");
+}
+
 /* Turn the '!error' annotation of TYPE into a property of the function. */
 static void c6_apply_fallible(CType *type)
 {
@@ -10394,6 +10417,9 @@ static int decl(int l)
             type_decl(&type, &ad, &v, l == VT_CMP ? TYPE_DIRECT | TYPE_PARAM : TYPE_DIRECT);
             /*ptype("decl", &type, v);*/
 #ifdef C6_EXT
+            /* an old-style parameter declaration list ('void f(e) error e;') */
+            if (l == VT_CMP)
+                c6_check_error_param(&type);
             /* 'T f(...)!error' : the same annotation after the declarator */
             if (tcc_state->c6_ext && c6_parse_fallible_suffix())
                 fallible = 1;
