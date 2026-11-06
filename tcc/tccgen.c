@@ -264,6 +264,11 @@ static void c6_async_func_end(void);
 static void c6_await_parse(void);
 static void c6_async_return(void);
 static void c6_async_await_io(Sym *s);
+static void c6_go_stmt(void);
+static void c6_task_decl(void);
+static void c6_task_check_handle(CType *t, const char *what);
+static void c6_task_defer_destroy(int slot);
+static void c6_async_propagate(void);
 static int c6_async_cur;      /* non-zero while generating an async body */
 static int c6_await_pending;  /* set by 'await', cleared by the call hook */
 /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
@@ -7806,6 +7811,9 @@ static void c6_method_register(int name, int sym_tok, CType *type)
     tag = c6_ptr_tag(&type->ref->next->type);
     if (!tag)
         return;
+    if (type->ref->f.func_async)
+        tcc_error("'async' functions cannot be methods: '%s'",
+                  get_tok_str(name, NULL));
     for (m = c6_methods; m; m = m->next) {
         if (m->type_tag == tag && m->name == name) {
             if (m->sym_tok == sym_tok)
@@ -8917,6 +8925,14 @@ static void c6_errdefer_parse(void)
 static void c6_emit_propagate(void)
 {
     int b, ret_off = 0, ret_saved = 0;
+#ifdef C6_EXT
+    if (c6_async_cur) {
+        /* an async body ends the task with KIND_ERR instead of returning the
+           sentinel to a caller that is the scheduler */
+        c6_async_propagate();
+        return;
+    }
+#endif
 
     b = (func_vt.t & VT_BTYPE) != VT_VOID;
     if (b) {
@@ -9583,6 +9599,14 @@ again:
         skip(';');
 
 #ifdef C6_EXT
+    } else if (t == TOK_C6_GO || t == TOK_C6_TASK) {
+        if (!c6_ext_on())
+            tcc_error("'%s' requires -std=c6", get_tok_str(t, NULL));
+        else if (t == TOK_C6_GO)
+            c6_go_stmt();
+        else
+            c6_task_decl();
+
     } else if (t == TOK_C6_DEFER) {
         if (!c6_ext_on())
             tcc_error("'defer' requires -std=c6");
@@ -10987,6 +11011,7 @@ static int c6_async_fr_off;           /* slot of the 'void *task' parameter */
 #define C6_CO_KIND_DONE  0
 #define C6_CO_KIND_IO    1
 #define C6_CO_KIND_CHILD 2
+#define C6_CO_KIND_ERR   3
 
 /* '__c6_body_<name>', '__c6_desc_<name>' and '<name>_task' */
 static int c6_async_tok(const char *prefix, int name, const char *suffix)
@@ -11269,7 +11294,8 @@ static void c6_async_suspend(int kind)
     vtop = vstack + vsp;
 
     label = c6_new_label("co_resume");
-    c6_def_label(label);                /* CODE_ON() at the resume point */
+    c6_def_label(label);
+    CODE_ON();                          /* the resumed code is real code */
     site = tcc_mallocz(sizeof *site);
     site->state = state;
     site->label = label;
@@ -11301,6 +11327,25 @@ static void c6_async_return(void)
     if (defer_state.enabled && (defer_state.has_sites || defer_state.disp_jmps))
         c6_defer_begin(1, 0);
     c6_async_finish(C6_CO_KIND_DONE);
+}
+
+/* 'err()' or a propagated 'try' inside an async body: park the sentinel as
+   the task value, run the deferred cleanups and end the body with KIND_ERR so
+   that the driver reports the failure and not a value. */
+static void c6_async_propagate(void)
+{
+    CType vt = c6_async_ftype.ref->type;
+
+    if ((vt.t & VT_BTYPE) != VT_VOID) {
+        c6_async_push_field(c6_async_name, "val", 0);
+        vpushi(TCC_ERR_SENTINEL);
+        vtop->type = vt;            /* '(TYPE)-1', no conversion warning */
+        vstore();
+        vpop();
+    }
+    if (defer_state.has_sites)
+        c6_defer_begin(2, 0);
+    c6_async_finish(C6_CO_KIND_ERR);
 }
 
 /* 'await c6_io(fd, ev)': the only leaf suspension primitive */
@@ -11545,6 +11590,8 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     body_sym = sym_find(body);
     if (!body_sym)
         tcc_error("internal: cannot declare '%s'", get_tok_str(body, NULL));
+    if (ftype->ref->f.func_fallible)
+        body_sym->type.ref->f.func_fallible = 1;
 
     c6_async_cur = 1;
     c6_async_name = name;
@@ -11579,6 +11626,130 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     tok_str_add(ts, ';');
     tok_str_add(ts, TOK_EOF);
     c6_decl_tokens(ts);
+}
+
+/* ---- 'go f();' and 'task t = f();' ---------------------------------- */
+
+/* Reject anything that is not the handle of an async call.  A handle is a
+   pointer to one of the generated 'struct NAME_task' structures, which always
+   begin with 'struct __c6_task head'. */
+static void c6_task_check_handle(CType *t, const char *what)
+{
+    CType *inner;
+    Sym *head, *rt;
+
+    if ((t->t & VT_BTYPE) != VT_PTR || !t->ref)
+        tcc_error("%s", what);
+    inner = pointed_type(t);
+    if ((inner->t & VT_BTYPE) != VT_STRUCT || !inner->ref)
+        tcc_error("%s", what);
+    head = c6_find_field_quiet(inner, tok_alloc_const("head") | SYM_FIELD);
+    rt = struct_find(tok_alloc_const("__c6_task"));
+    if (!head || !rt || (head->type.t & VT_BTYPE) != VT_STRUCT
+        || head->type.ref != rt)
+        tcc_error("%s", what);
+}
+
+/* Register 'defer { __c6_co_destroy(slot); }' so the handle is released when
+   the enclosing scope exits, on every path that already runs defer bodies.
+   Same registration as c6_defer_parse(), with the cleanup body emitted here
+   instead of being parsed from a statement. */
+static void c6_task_defer_destroy(int slot)
+{
+    int skip, id;
+    Sym *l;
+
+    if (!defer_state.enabled || nocode_wanted)
+        return;
+    defer_state.body_depth++;
+    id = ++defer_state.next_site;
+    l = c6_new_label("dcl");
+    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
+    vpushi(id);
+    vpushi(local_scope);
+    vpushi(0);                          /* kind: defer */
+    gfunc_call(3);
+    skip = gjmp(0);
+    c6_def_label(l);
+    CODE_ON();
+    c6_add_site(id, l);
+    defer_state.has_sites = 1;
+    c6_rt_begin("__c6_co_destroy");
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
+    c6_rt_end("__c6_co_destroy", 1);
+    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
+    gsym(skip);
+    defer_state.body_depth--;
+}
+
+/* 'go f(args);' : start a top-level coroutine.  It is not a child of the
+   current task and belongs to no scope, so nothing but completion releases
+   it; see __tcc_co_spawn() in libtcc1. */
+static void c6_go_stmt(void)
+{
+    CType ht;
+    int slot;
+
+    if (tok >= TOK_UIDENT) {
+        Sym *s = sym_find(tok);
+        if (s && (s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref
+            && !s->type.ref->f.func_async)
+            tcc_error("'go' on a non-async function needs stackful "
+                      "coroutines (not implemented yet)");
+    }
+    expr_eq();
+    c6_fallible_use();
+    ht = vtop->type;
+    c6_task_check_handle(&ht,
+        "the operand of 'go' must be the handle of an 'async' call");
+    /* park the handle in a frame slot so the call can push its symbol below */
+    loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    slot = loc;
+    vset(&ht, VT_LOCAL | VT_LVAL, slot);
+    vswap();
+    vstore();
+    vpop();
+    c6_rt_begin("__tcc_co_spawn");
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
+    c6_rt_end("__tcc_co_spawn", 1);
+    skip(';');
+}
+
+/* 'task NAME = f(args), ... ;' : declare the handle and release it when the
+   enclosing scope exits.  The type comes from the initializer, which makes
+   the declaration independent of how the callee happens to be spelled. */
+static void c6_task_decl(void)
+{
+    for (;;) {
+        CType ht;
+        Sym *ls;
+        int v, align, size, slot;
+
+        if (tok < TOK_UIDENT)
+            expect("variable name");
+        v = tok;
+        next();
+        skip('=');
+        expr_eq();
+        c6_fallible_use();
+        ht = vtop->type;
+        c6_task_check_handle(&ht,
+            "the initializer of a 'task' variable must be a call of an "
+            "'async' function");
+        size = type_size(&ht, &align);
+        loc = (loc - size) & -align;
+        slot = loc;
+        ls = sym_push(v, &ht, VT_LOCAL | VT_LVAL, slot);
+        vset(&ht, VT_LOCAL | VT_LVAL, ls->c);
+        vswap();
+        vstore();
+        vpop();
+        c6_task_defer_destroy(slot);
+        if (tok != ',')
+            break;
+        next();                         /* ',' */
+    }
+    skip(';');
 }
 #endif /* C6_EXT */
 
@@ -11898,6 +12069,20 @@ static int decl(int l)
                 c6_interface_parse();
                 continue;
             }
+        }
+        if (tcc_state->c6_ext
+            && (tok == TOK_C6_TASK || tok == TOK_C6_GO)) {
+            if (l != VT_LOCAL)
+                tcc_error("'%s' can only be used inside a function",
+                          get_tok_str(tok, NULL));
+            if (tok == TOK_C6_TASK) {
+                next();                 /* 'task' */
+                c6_task_decl();
+            } else {
+                next();                 /* 'go' */
+                c6_go_stmt();
+            }
+            continue;
         }
 #endif
         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {

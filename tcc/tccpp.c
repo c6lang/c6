@@ -3873,6 +3873,9 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "    void *desc, *frame, *defer_arena, *parent, *child;\n"
           "    const char *err_msg;\n"
           "    int frame_size, __pad1;\n"
+          "    void *snext;               /* top-level ready list */\n"
+          "    int busy;                  /* being stepped right now */\n"
+          "    int waiting;               /* parked on wait_fd */\n"
           "};\n"
           "struct __c6_desc { unsigned size, align; int defer_max;\n"
           "                   int (*entry)(void *); };\n"
@@ -3888,6 +3891,8 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "int __c6_co_rev(void *self);\n"
           "int __c6_co_wait(void *self);\n"
           "void __c6_co_destroy(void *self);\n"
+          "void __tcc_co_spawn(void *task);\n"
+          "int __c6_co_run(void);\n"
           "int c6_io(int fd, int ev);\n"
           "#define C6_CO_EV_READ  1\n"
           "#define C6_CO_EV_WRITE 2\n"
@@ -4005,7 +4010,7 @@ ST_FUNC void tccpp_new(TCCState *s)
            'test' may already be interned as an asm keyword, in which
            case the range ends before TOK_C6_TEST. */
         int t;
-        for (t = TOK_C6_PACKAGE; t <= TOK_C6_AWAIT && t < tok_ident; t++)
+        for (t = TOK_C6_PACKAGE; t <= TOK_C6_GO && t < tok_ident; t++)
             tok_unintern(t);
         if (TOK_C6_PACKAGE < tok_ident)
             tok_ident = TOK_C6_PACKAGE;

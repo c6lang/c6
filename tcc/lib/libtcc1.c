@@ -858,9 +858,11 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 /* An 'async' function is compiled to 'int __c6_body_NAME(void *task)'.  The */
 /* body runs on the caller's stack; every suspension ("await" that has to    */
 /* wait) copies the used part of the native frame into the task and returns  */
-/* to whoever drives the task (__c6_co_wait).  Resuming re-enters the body,  */
-/* copies the saved frame back to the same offsets and jumps to the recorded */
-/* resume point.  Task objects live in this file so that 'struct __c6_task'  */
+/* to whoever drives the task.  Resuming re-enters the body, copies the      */
+/* saved frame back to the same offsets and jumps to the recorded resume      */
+/* point.  'go f();' makes a coroutine top-level: it is put on the ready list */
+/* below and stepped by tcc_co_pump(), which is the scheduler.  Task objects   */
+/* live in this file so that 'struct __c6_task'                              */
 /* has exactly the layout that tcc_predefs() declares to compiled programs;  */
 /* generated code only ever touches it through the __c6_co_* accessors.      */
 
@@ -886,6 +888,9 @@ typedef struct TccCoTask {
     void *desc, *frame, *defer_arena, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
+    void *snext;                /* next task on the top-level ready list */
+    int busy;                   /* currently being stepped (re-entrancy) */
+    int waiting;                /* parked on wait_fd, waiting for select() */
 } TccCoTask;
 
 typedef struct TccCoDesc {
@@ -902,6 +907,10 @@ static long long tcc_co_task_mem[C6_CO_MAX][C6_CO_TASK_MAX / 8];
 static char tcc_co_frames[C6_CO_MAX][C6_CO_FRAME_MAX];
 static TccDeferRec tcc_co_parked[C6_CO_MAX][C6_CO_DEFER_MAX];
 static char tcc_co_live[C6_CO_MAX];
+
+/* Top-level coroutines started with 'go': they belong to no scope and to no
+   parent, so the scheduler below owns them from creation to completion. */
+static void *tcc_co_runlist;
 
 extern int select(int, void *, void *, void *, void *);
 
@@ -1096,42 +1105,230 @@ static int tcc_co_select(int fd, int ev)
     return rev;
 }
 
-/* Drive the task tree rooted at SELF until it finishes: 0 = done, -1 = the
-   root raised an error (the error slot of the root still holds it). */
-int __c6_co_wait(void *self)
+/* 'go' wants "run until you have to wait" and nothing more specific */
+#define C6_CO_KIND_SKIP   4
+
+void __c6_co_destroy(void *self);
+
+static TccCoTask *tcc_co_leaf(TccCoTask *t)
 {
-    TccCoTask *root = (TccCoTask *)self;
+    while (t->child && ((TccCoTask *)t->child)->state != C6_CO_STATE_DONE)
+        t = (TccCoTask *)t->child;
+    return t;
+}
+
+static void tcc_co_link(TccCoTask **head, TccCoTask *t)
+{
+    t->snext = *head;
+    *head = t;
+}
+
+static void tcc_co_unlink(TccCoTask **head, TccCoTask *t)
+{
+    while (*head) {
+        if (*head == t) {
+            *head = (TccCoTask *)t->snext;
+            t->snext = 0;
+            return;
+        }
+        head = (TccCoTask **)&(*head)->snext;
+    }
+}
+
+/* Run one step of the leaf of T: call its body until it suspends or ends.
+   Never blocks.  Returns the kind the body reported, or C6_CO_KIND_SKIP when
+   there is nothing to do right now (re-entered, or parked on its fd and the
+   caller has not waited for it yet). */
+static int tcc_co_step_once(TccCoTask *t)
+{
+    TccCoTask *leaf = tcc_co_leaf(t);
+    TccCoDesc *d;
+    int k;
+
+    if (leaf->state == C6_CO_STATE_DONE)
+        return C6_CO_KIND_DONE;
+    if (leaf->busy)
+        return C6_CO_KIND_SKIP;         /* re-entered from a nested pump */
+    if (leaf->waiting)
+        return C6_CO_KIND_IO;           /* still parked on wait_fd */
+    d = (TccCoDesc *)leaf->desc;
+    leaf->busy++;
+    k = d->entry(leaf);
+    leaf->busy--;
+    switch (k) {
+    case C6_CO_KIND_DONE:
+    case C6_CO_KIND_ERR:
+        leaf->state = C6_CO_STATE_DONE;
+        leaf->kind = k;
+        break;
+    case C6_CO_KIND_IO:
+        leaf->waiting = 1;              /* the pump has to select() for it */
+        break;
+    case C6_CO_KIND_CHILD:
+        break;
+    default:
+        tcc_co_trap();
+    }
+    return k;
+}
+
+/* One round over the top-level ready list: step every task once, then wait for
+   whatever is parked on a descriptor and hand each one its readiness mask.
+   Finished tasks are released here; ERRS, when not NULL, collects how many of
+   them ended with 'err'.  Returns 0, or -1 when select() failed. */
+static int tcc_co_pump(int *errs)
+{
+    unsigned long r[16], w[16], e[16];
+    int fds[C6_CO_MAX], evs[C6_CO_MAX];
+    TccCoTask *leafs[C6_CO_MAX];
+    TccCoTask *t, **pp;
 
     for (;;) {
-        TccCoTask *t = root;
-        TccCoDesc *d;
-        int k;
+        int nio = 0, maxfd = -1, ran = 0, i;
 
-        while (t->child && ((TccCoTask *)t->child)->state != C6_CO_STATE_DONE)
-            t = (TccCoTask *)t->child;
-        if (t == root && t->state == C6_CO_STATE_DONE)
-            return t->kind == C6_CO_KIND_ERR ? -1 : 0;
-        d = (TccCoDesc *)t->desc;
-        k = d->entry(t);
-        switch (k) {
-        case C6_CO_KIND_DONE:
-        case C6_CO_KIND_ERR:
-            t->state = C6_CO_STATE_DONE;
-            t->kind = k;
-            break;
-        case C6_CO_KIND_IO: {
-            int rev = tcc_co_select(t->wait_fd, t->wait_ev);
-            if (rev < 0)
-                return -1;
-            t->wait_rev = rev;
-            break;
+        pp = (TccCoTask **)&tcc_co_runlist;
+        while ((t = *pp) != 0) {
+            int k;
+
+            if (t->state == C6_CO_STATE_DONE) {
+                *pp = (TccCoTask *)t->snext;
+                t->snext = 0;
+                if (errs && t->kind == C6_CO_KIND_ERR)
+                    (*errs)++;
+                __c6_co_destroy(t);
+                continue;
+            }
+            k = tcc_co_step_once(t);
+            if (k == C6_CO_KIND_IO && nio < C6_CO_MAX) {
+                TccCoTask *leaf = tcc_co_leaf(t);
+                int fd = leaf->wait_fd;
+                if (fd >= 0 && fd < 1024) {
+                    fds[nio] = fd;
+                    evs[nio] = leaf->wait_ev;
+                    leafs[nio] = leaf;
+                    nio++;
+                    if (fd > maxfd)
+                        maxfd = fd;
+                } else {
+                    /* c6_io() with an fd select() cannot wait for: fail the
+                       task and release it, like __c6_co_wait() returning -1.
+                       Leaving it in the list would park it forever. */
+                    *pp = (TccCoTask *)t->snext;
+                    t->snext = 0;
+                    if (errs)
+                        (*errs)++;
+                    __c6_co_destroy(t);
+                    continue;
+                }
+            } else if (k != C6_CO_KIND_SKIP) {
+                ran = 1;
+            }
+            pp = (TccCoTask **)&t->snext;
         }
-        case C6_CO_KIND_CHILD:
-            break;
-        default:
-            tcc_co_trap();
+        if (!nio) {
+            if (!ran)
+                return 0;               /* nothing left to do */
+            continue;                   /* someone made progress: go again */
+        }
+        for (i = 0; i < 16; i++)
+            r[i] = w[i] = e[i] = 0;
+        for (i = 0; i < nio; i++) {
+            if (evs[i] & 1)
+                r[fds[i] >> 6] |= 1UL << (fds[i] & 63);
+            if (evs[i] & 2)
+                w[fds[i] >> 6] |= 1UL << (fds[i] & 63);
+        }
+        if (select(maxfd + 1, r, w, e, (void *)0) <= 0)
+            return -1;
+        for (i = 0; i < nio; i++) {
+            int rev = 0;
+            if (r[fds[i] >> 6] & (1UL << (fds[i] & 63)))
+                rev |= 1;
+            if (w[fds[i] >> 6] & (1UL << (fds[i] & 63)))
+                rev |= 2;
+            if (!rev)
+                continue;           /* not this one yet: keep it parked */
+            leafs[i]->wait_rev = rev;
+            leafs[i]->waiting = 0;
         }
     }
+}
+
+/* Failures of tasks that finished inside the 'go' statement itself: they are
+   already gone by the time anyone can call __c6_co_run(), so the count has to
+   be remembered here. */
+static int tcc_co_eager_errs;
+
+/* 'go f();' : make T a top-level coroutine and run it up to its first real
+   suspension (or to completion), then return to the 'go' statement.  A task
+   that is already finished has no observer and no handle, so it is released
+   right here -- otherwise a loop of non-suspending 'go' calls would fill the
+   task pool. */
+void __tcc_co_spawn(void *task)
+{
+    TccCoTask *t = (TccCoTask *)task;
+
+    if (!t)
+        return;
+    t->parent = 0;
+    tcc_co_link((TccCoTask **)&tcc_co_runlist, t);
+    /* Run it until it has to wait for a descriptor: awaiting a child is not
+       waiting, so keep descending.  A task that is finished by the time the
+       'go' statement returns has no handle and no observer, so it is released
+       here -- otherwise a loop of short 'go' calls would fill the pool. */
+    for (;;) {
+        int k = tcc_co_step_once(t);
+        if (k == C6_CO_KIND_IO || k == C6_CO_KIND_SKIP)
+            break;                      /* the pump waits for the fd */
+        if (t->state == C6_CO_STATE_DONE) {
+            tcc_co_unlink((TccCoTask **)&tcc_co_runlist, t);
+            if (t->kind == C6_CO_KIND_ERR)
+                tcc_co_eager_errs++;
+            __c6_co_destroy(t);
+            break;
+        }
+        /* KIND_CHILD: step the awaited child next */
+    }
+}
+
+/* Drain the top-level ready list; returns how many tasks ended with 'err'. */
+int __c6_co_run(void)
+{
+    int errs = tcc_co_eager_errs;
+
+    tcc_co_eager_errs = 0;
+    if (tcc_co_pump(&errs) < 0)
+        return -1;
+    return errs;
+}
+
+/* Drive the task tree rooted at SELF until it finishes, letting the top-level
+   coroutines make progress in between: 0 = done, -1 = error. */
+int __c6_co_wait(void *self)
+{
+    int ignored;
+
+    if (!self)
+        return -1;
+    for (;;) {
+        TccCoTask *root = (TccCoTask *)self;
+        int k;
+
+        if (root->state == C6_CO_STATE_DONE)
+            break;
+        k = tcc_co_step_once(root);
+        if (k == C6_CO_KIND_IO) {
+            TccCoTask *leaf = tcc_co_leaf(root);
+            int rev = tcc_co_select(leaf->wait_fd, leaf->wait_ev);
+            if (rev < 0)
+                return -1;
+            leaf->wait_rev = rev;
+            leaf->waiting = 0;
+        }
+        if (tcc_co_pump(&ignored) < 0)
+            return -1;
+    }
+    return ((TccCoTask *)self)->kind == C6_CO_KIND_ERR ? -1 : 0;
 }
 
 /* Release a task and everything it owns.  A still-suspended body is dropped
@@ -1139,7 +1336,6 @@ int __c6_co_wait(void *self)
 void __c6_co_destroy(void *self)
 {
     TccCoTask *t = (TccCoTask *)self;
-    int idx;
 
     if (!t)
         return;
@@ -1147,6 +1343,7 @@ void __c6_co_destroy(void *self)
         __c6_co_destroy(t->child);
     t->child = 0;
     t->parent = 0;
+    tcc_co_unlink((TccCoTask **)&tcc_co_runlist, t);
     tcc_co_live[tcc_co_index(t)] = 0;
 }
 
