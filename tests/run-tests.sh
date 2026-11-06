@@ -18,6 +18,9 @@
 #   tests/exit/*.c    退出码；`// EXIT <n>` 注释声明期望的进程退出码，编译成
 #                     可执行文件后运行，比对退出码（main 的返回值必须穿过
 #                     c6 的清理链）。
+#   tests/abi/*.c     ABI 兼容；每个文件用 -std=c6 编译，同名的 _plain.c 用
+#                     纯 C（不带 -std=c6）编译，两个目标文件链接后运行，
+#                     比对 `// EXIT <n>` 声明的退出码。
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -63,6 +66,10 @@ if [ "${1:-}" = "--list" ]; then
     done
     for f in "$ROOT"/tests/exit/*.c; do
         [ -e "$f" ] && echo "exit/$(basename "$f" .c)"
+    done
+    for f in "$ROOT"/tests/abi/*.c; do
+        case $f in *_plain.c) continue ;; esac
+        [ -e "$f" ] && echo "abi/$(basename "$f" .c)"
     done
     exit 0
 fi
@@ -157,6 +164,50 @@ for src in "$ROOT"/tests/exit/*.c; do
         continue
     fi
     "$TMP/exit.bin" >/dev/null 2>"$TMP/err"
+    got=$?
+    if [ "$got" = "$want" ]; then
+        note_pass "$name: 退出码 $got"
+    else
+        fail "$name" "退出码 $got，期望 $want"
+    fi
+done
+
+# ---- 4. ABI 兼容：c6 翻译单元 + 纯 C 翻译单元分开编译再链接 ----
+for src in "$ROOT"/tests/abi/*.c; do
+    [ -e "$src" ] || continue
+    case $src in *_plain.c) continue ;; esac
+    name="abi/$(basename "$src" .c)"
+    is_wanted "$name" || continue
+    plain="${src%.c}_plain.c"
+    want=$(sed -n 's,^// *EXIT *\([0-9][0-9]*\)$,\1,p' "$src" | head -n 1)
+    if [ -z "$want" ]; then
+        fail "$name" "缺少 '// EXIT <n>' 注释"
+        continue
+    fi
+    if ! $TCC $BASE $TCCFLAGS -c "$src" -o "$TMP/abi-c6.o" 2>"$TMP/err" >/dev/null; then
+        fail "$name" "c6 侧编译失败:$(cat "$TMP/err")"
+        continue
+    fi
+    if [ -e "$plain" ]; then
+        # 纯 C 侧：故意不带 -std=c6
+        if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -c "$plain" -o "$TMP/abi-plain.o" \
+                2>"$TMP/err" >/dev/null; then
+            fail "$name" "纯 C 侧编译失败:$(cat "$TMP/err")"
+            continue
+        fi
+        if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$TMP/abi.bin" \
+                "$TMP/abi-c6.o" "$TMP/abi-plain.o" 2>"$TMP/err" >/dev/null; then
+            fail "$name" "链接失败:$(cat "$TMP/err")"
+            continue
+        fi
+    else
+        if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$TMP/abi.bin" "$TMP/abi-c6.o" \
+                2>"$TMP/err" >/dev/null; then
+            fail "$name" "链接失败:$(cat "$TMP/err")"
+            continue
+        fi
+    fi
+    "$TMP/abi.bin" >/dev/null 2>"$TMP/err"
     got=$?
     if [ "$got" = "$want" ]; then
         note_pass "$name: 退出码 $got"

@@ -16,7 +16,7 @@ struct S { int a; };
 // EXPECT test_catch_falls_through: error: 'catch' body must end with 'return', 'err()' or 'goto'
 // EXPECT test_bare_catch: error: 'catch' has no operand
 // EXPECT test_fallible_not_a_function: error: '!error' requires a function declarator
-// EXPECT test_fallible_struct_return: error: '!error' requires a return type representable by -1
+// EXPECT test_fallible_float_return: error: '!error' does not support a 'double' return type
 // EXPECT test_try_in_defer: error: 'try' is not allowed in a defer body
 // EXPECT test_error_parameter: error: 'error' can only be a return type, not a parameter
 // EXPECT test_error_out_parameter: error: 'error' can only be a return type, not a parameter
@@ -47,9 +47,9 @@ int main(void) { return bad(); }
 #elif defined test_fallible_not_a_function
 static int!error x = 1;
 int main(void) { return x; }
-#elif defined test_fallible_struct_return
-static struct S!error bad_ret(void) { struct S s = {0}; return s; }
-int main(void) { return bad_ret().a; }
+#elif defined test_fallible_float_return
+static double!error bad_ret(void);
+int main(void) { return 0; }
 #elif defined test_try_in_defer
 static int!error bad(void) { defer { try fails(0); } return 0; }
 int main(void) { return bad(); }

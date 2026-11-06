@@ -1,0 +1,20 @@
+/* tests/tuple.c 的第二个翻译单元：元组的 ABI 不依赖翻译单元。
+ *
+ * 另一个 TU 里声明的 '(int, int)' 与本 TU 完全相同：元素顺序、对齐、
+ * 传参和返回方式都一致。
+ */
+
+(int, int) tu_pair_make(int a)
+{
+    return {a, a * 2};
+}
+
+int tu_pair_sum((int, int) t)
+{
+    return t[0] + t[1];
+}
+
+int tu_pair_first((int, int) t)
+{
+    return t[0];
+}
