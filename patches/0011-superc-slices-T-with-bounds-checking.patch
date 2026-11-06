@@ -1,0 +1,1072 @@
+From 3ab4df277b5aa922b379156ddb350073f3024175 Mon Sep 17 00:00:00 2001
+From: superc <superc@localhost>
+Date: Fri, 6 Nov 2026 22:00:50 +0800
+Subject: [PATCH 11/11] superc: slices 'T[:]' with bounds checking
+
+Add a slice view type 'T[:]': two machine words '{ T *const data; const
+size_t len; }' with a fixed layout (data at 0, len at PTR_SIZE) that
+libtcc1 and every translation unit agree on, so a slice can be passed
+to and returned from another unit by just writing 'T[:]' on both
+sides.  The internal struct is built by hand rather than through
+struct_layout(), so #pragma pack cannot change the ABI.
+
+'T[:]' is read where a type specifier is expected.  A '[' directly
+after a type specifier is not valid C (array declarators come after
+the name), so only '[:]' is claimed: 'int a[3]', 'int a[] = {..}',
+'void f(int[])' and 'typedef int T[]' keep their meaning, and
+'int[3] x;' stays the syntax error it always was.
+
+Arrays convert to slices implicitly in run time contexts (assignment,
+initializer, argument, return, explicit cast), an array decay giving
+'{ &a[0], N }'.  A static initializer has no code to run, so it must
+spell the fields out: 'int[:] g = { a, N };'.  's[i]' checks 'i < len'
+and 's[lo:hi]' checks 'lo <= hi <= len' before touching memory; a
+violation traps the same way an unproven 'catch' body does, since
+libtcc1 is freestanding and has no diagnostics channel.  '.data' is
+the unchecked escape hatch (C pointers), '.len' the length.
+
+Slices are views: no ownership, no cap, no append, no copying.  The
+element type must be a complete object type whose struct/union/enum
+tag is at file scope (a tag declared inside a function dies with the
+block, the slice type lives until the end of the unit); top level
+qualifiers on the element are dropped -- the slice header itself is
+const, which is what prevents rebinding it.
+
+Tests: 175 covers arrays, ranges, struct/array/char elements, function
+parameters and results, struct members, typdefs, compound literals,
+size and alignment; 176 checks the diagnostics; 177 passes and
+returns slices across two units.  tests2 156/156 with TCC_EXT,
+134/134 without.
+---
+ lib/libtcc1.c                               |  47 ++
+ tccgen.c                                    | 508 +++++++++++++++++++-
+ tests/tests2/175_superc_slice.c             | 119 +++++
+ tests/tests2/175_superc_slice.expect        |  16 +
+ tests/tests2/176_superc_slice_errors.c      |  82 ++++
+ tests/tests2/176_superc_slice_errors.expect |  35 ++
+ tests/tests2/177+_superc_slice_tu.c         |  18 +
+ tests/tests2/177_superc_slice_tu.c          |  23 +
+ tests/tests2/177_superc_slice_tu.expect     |   3 +
+ tests/tests2/Makefile                       |   3 +
+ 10 files changed, 847 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tests2/175_superc_slice.c
+ create mode 100644 tests/tests2/175_superc_slice.expect
+ create mode 100644 tests/tests2/176_superc_slice_errors.c
+ create mode 100644 tests/tests2/176_superc_slice_errors.expect
+ create mode 100644 tests/tests2/177+_superc_slice_tu.c
+ create mode 100644 tests/tests2/177_superc_slice_tu.c
+ create mode 100644 tests/tests2/177_superc_slice_tu.expect
+
+diff --git a/lib/libtcc1.c b/lib/libtcc1.c
+index 86925edd..1e9164c5 100644
+--- a/lib/libtcc1.c
++++ b/lib/libtcc1.c
+@@ -804,3 +804,50 @@ void __tcc_catch_fallthrough(void)
+     *p = 0;
+ }
+ 
++
++/* ------------------------------------------------------------------------- */
++/* superc extension runtime: slices 'T[:]'                                   */
++/*                                                                           */
++/* A slice value is '{ void *data; size_t len; }' with the two words          */
++/* adjacent, so the compiler only hands over a pointer to such a pair and    */
++/* the helpers never depend on the element type: everything is byte          */
++/* arithmetic.  A bounds violation is part of the language, so it must stop  */
++/* the program: libtcc1 is freestanding (no libc), hence the same deliberate */
++/* null store that __tcc_catch_fallthrough() uses.                          */
++
++typedef __SIZE_TYPE__ TccSliceSize;
++
++#define TCC_SLICE_LEN(slice) \
++    (*(const TccSliceSize *)((const char *)(slice) + sizeof(void *)))
++
++static void tcc_slice_trap(void)
++{
++    volatile int *p = (volatile int *)0;
++    *p = 0;
++}
++
++/* Write the address of element IDX of SLICE through OUT. */
++void __tcc_slice_index(void **out, const void *slice,
++                       TccSliceSize idx, TccSliceSize elem_size)
++{
++    const char *base = *(const char * const *)slice;
++    TccSliceSize len = TCC_SLICE_LEN(slice);
++
++    if (idx >= len)
++        tcc_slice_trap();
++    *out = (void *)(base + idx * elem_size);
++}
++
++/* Write the [LO, HI) sub-slice of SLICE through OUT, which must address two
++   adjacent machine words (a fresh slice value). */
++void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
++                     TccSliceSize hi, TccSliceSize elem_size)
++{
++    const char *base = *(const char * const *)slice;
++    TccSliceSize len = TCC_SLICE_LEN(slice);
++
++    if (lo > hi || hi > len)
++        tcc_slice_trap();
++    *(void **)out = (void *)(base + lo * elem_size);
++    *(TccSliceSize *)((char *)out + sizeof(void *)) = hi - lo;
++}
+diff --git a/tccgen.c b/tccgen.c
+index 05bc38d2..0597a767 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -177,6 +177,33 @@ typedef struct SupercAutoImpl {
+ } SupercAutoImpl;
+ static SupercAutoImpl **superc_auto_impls;
+ static int superc_nb_auto_impls;
++/* 'T[:]' slice views: one internal struct per (unqualified) element type,
++   'struct { T *const data; const size_t len; }'.  The layout is fixed (data
++   at 0, len at PTR_SIZE) and is the ABI shared with libtcc1 and with other
++   translation units, so the object is built here instead of going through
++   struct_layout() (which #pragma pack could alter).  Slice tags live on the
++   global stack: a type built inside a function must survive the block. */
++typedef struct SupercSlice {
++    CType elem;          /* element type, top level qualifiers dropped */
++    CType elem_ptr;      /* 'elem *' */
++    Sym *tag;            /* the internal struct tag */
++    int elem_size;       /* sizeof(elem) */
++    struct SupercSlice *next;
++} SupercSlice;
++static SupercSlice *superc_slices;
++/* the descriptor of TYPE when TYPE is a slice, NULL otherwise */
++static SupercSlice *superc_slice_of_type(CType *type)
++{
++    SupercSlice *sl;
++    if (!tcc_state->superc_ext)
++        return NULL;
++    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
++        return NULL;
++    for (sl = superc_slices; sl; sl = sl->next)
++        if (sl->tag == type->ref)
++            return sl;
++    return NULL;
++}
+ /* non-zero while vtop holds the result of a call to a 'T!error' function */
+ static int superc_value_fallible;
+ /* symbol of the function being compiled (needed by 'try' to check that the
+@@ -220,6 +247,10 @@ static void superc_method_register(int name, int sym_tok, CType *type);
+ static SupercMethod *superc_method_lookup(CType *type, int name);
+ static int superc_has_field(CType *type, int v);
+ static void superc_method_call_prep(SupercMethod *m);
++static CType superc_slice_ctype(SupercSlice *sl);
++static SupercSlice *superc_slice_get(CType *elem);
++static void superc_slice_subscript(void);
++static int superc_slice_convert(CType *dt);
+ static void gen_function(Sym *sym);
+ /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
+    already interned as TOK_ASM_test, so accept both spellings. */
+@@ -2898,6 +2929,18 @@ static void type_to_str(char *buf, int buf_size,
+         pstrcat(buf, buf_size, tstr);
+         break;
+     case VT_STRUCT:
++#ifdef TCC_EXT
++        /* a slice prints as 'elem[:]', so that diagnostics talk about the
++           type the user wrote instead of the internal struct tag */
++        {
++            SupercSlice *sl = superc_slice_of_type(type);
++            if (sl) {
++                type_to_str(buf, buf_size, &sl->elem, NULL);
++                pstrcat(buf, buf_size, "[:]");
++                break;
++            }
++        }
++#endif
+         tstr = "struct ";
+         if (IS_UNION(t))
+             tstr = "union ";
+@@ -3881,6 +3924,8 @@ static void verify_assign_cast(CType *dt)
+ static void gen_assign_cast(CType *dt)
+ {
+ #ifdef TCC_EXT
++    if (superc_slice_convert(dt))
++        return;
+     if (superc_iface_convert(dt))
+         return;
+ #endif
+@@ -3898,7 +3943,9 @@ ST_FUNC void vstore(void)
+ 
+     ft = vtop[-1].type.t;
+ #ifdef TCC_EXT
+-    superc_iface_convert(&vtop[-1].type);
++    /* an array assigned to a slice becomes a view of the array */
++    if (!superc_slice_convert(&vtop[-1].type))
++        superc_iface_convert(&vtop[-1].type);
+     ft = vtop[-1].type.t;
+ #endif
+     sbt = vtop->type.t & VT_BTYPE;
+@@ -5046,6 +5093,32 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
+             struct_decl(&type1, VT_UNION);
+             goto basic_type2;
+ 
++        case '[':
++#ifdef TCC_EXT
++            /* 'T[:]' - a slice type.  A '[' directly after a type specifier
++               is not valid C (array declarators come after the declarator
++               name), so only '[:]' is claimed here; anything else, e.g.
++               'int [3] a;', is handed back to the original code. */
++            if (tcc_state->superc_ext && typespec_found) {
++                CType elem, st;
++                int storage;
++                next();                 /* skip '[' */
++                if (tok == ':') {
++                    next();             /* skip ':' */
++                    skip(']');
++                    elem.t = t & ~VT_STORAGE;
++                    elem.ref = type->ref;
++                    storage = t & VT_STORAGE;
++                    st = superc_slice_ctype(superc_slice_get(&elem));
++                    t = st.t | storage;
++                    type->ref = st.ref;
++                    break;
++                }
++                unget_tok('[');         /* not a slice: restore and stop */
++            }
++#endif
++            goto the_end;
++
+             /* type modifiers */
+         case TOK__Atomic:
+             next();
+@@ -5967,7 +6040,9 @@ ST_FUNC void unary(void)
+             } else {
+                 unary();
+ #ifdef TCC_EXT
+-                /* '(Shape)circle' converts explicitly */
++                /* '(int[:])a' and '(Shape)circle' convert explicitly */
++                if (superc_slice_convert(&type))
++                    break;
+                 if (superc_iface_convert(&type))
+                     break;
+ #endif
+@@ -6579,11 +6654,21 @@ special_math_val:
+             }
+             next();
+         } else if (tok == '[') {
+-            next();
+-            gexpr();
+-            gen_op('+');
+-            indir();
+-            skip(']');
++#ifdef TCC_EXT
++            /* a slice subscript and a range are bounds checked and may
++               produce a value, so they need their own parser; an array or
++               pointer subscript with no ':' keeps the original code */
++            if (tcc_state->superc_ext) {
++                superc_slice_subscript();
++            } else
++#endif
++            {
++                next();
++                gexpr();
++                gen_op('+');
++                indir();
++                skip(']');
++            }
+ #ifdef TCC_EXT
+             superc_value_fallible = 0;
+ #endif
+@@ -8162,6 +8247,389 @@ static int superc_emit_auto_impls(void)
+     return n;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* slices 'T[:]'                                                       */
++/*                                                                     */
++/* A slice is a two word view of a run of elements:                   */
++/*                                                                     */
++/*     struct { T *const data; const size_t len; }                    */
++/*                                                                     */
++/* The compiler builds that struct by hand (fixed layout, no packing)  */
++/* and the runtime helpers in libtcc1.c take the very same shape, so a */
++/* slice can be passed to and returned from another translation unit   */
++/* without any extra declaration.                                      */
++
++/* a size_t value: exactly the type 'sizeof' produces */
++static CType superc_size_type(void)
++{
++    CType t;
++    t.t = VT_SIZE_T;
++    t.ref = NULL;
++    return t;
++}
++
++/* the value type of slice SL */
++static CType superc_slice_ctype(SupercSlice *sl)
++{
++    CType t;
++    t.t = VT_STRUCT;
++    t.ref = sl->tag;
++    return t;
++}
++
++/* like mk_pointer() but the pointer symbol always goes to the global stack:
++   a slice type is shared by the whole translation unit, so it must not point
++   at a symbol that is popped when the enclosing block ends */
++static void superc_global_pointer(CType *type)
++{
++    Sym *s = sym_push2(&global_stack, SYM_FIELD, 0, -1);
++    s->type = *type;
++    type->t = VT_PTR | (type->t & VT_STORAGE);
++    type->ref = s;
++}
++
++/* is the tag of TYPE (through one level of pointer) reachable from file
++   scope?  A tag declared inside a function is popped with its block while
++   the slice type lives until the end of the unit. */
++static int superc_tag_is_global(CType *type)
++{
++    Sym *s;
++    while ((type->t & VT_BTYPE) == VT_PTR && type->ref)
++        type = pointed_type(type);
++    if ((type->t & VT_BTYPE) != VT_STRUCT && !IS_ENUM(type->t))
++        return 1;
++    for (s = global_stack; s; s = s->prev)
++        if (s == type->ref)
++            return 1;
++    return 0;
++}
++
++static int superc_is_error_type(CType *type)
++{
++    Sym *tag;
++    while (((type->t & VT_BTYPE) == VT_PTR || (type->t & VT_ARRAY))
++           && type->ref)
++        type = pointed_type(type);
++    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
++        return 0;
++    tag = struct_find(tok_alloc_const("__tcc_error"));
++    return tag && type->ref == tag;
++}
++
++/* Build (or find) the slice type whose elements are ELEM. */
++static SupercSlice *superc_slice_get(CType *elem)
++{
++    SupercSlice *sl;
++    CType el = *elem;
++    int size, align;
++
++    el.t &= ~VT_STORAGE;
++    if ((el.t & VT_BTYPE) == VT_VOID)
++        tcc_error("'[:]' cannot have a 'void' element type");
++    if ((el.t & VT_BTYPE) == VT_FUNC)
++        tcc_error("'[:]' cannot have a function element type");
++    if (el.t & VT_VLA)
++        tcc_error("'[:]' cannot have a variable length array element");
++    /* the documented rule: top level qualifiers of the element are dropped,
++       the slice itself controls writability through 'data' being const */
++    el.t &= ~VT_QUAL;
++    size = type_size(&el, &align);
++    if (size < 0) {
++        char buf[256];
++        type_to_str(buf, sizeof buf, &el, NULL);
++        tcc_error("'[:]' requires a complete element type, not '%s'", buf);
++    }
++    if (superc_is_error_type(&el))
++        tcc_error("'error' can only be a return type, not a slice element");
++    if (!superc_tag_is_global(&el)) {
++        char buf[256];
++        type_to_str(buf, sizeof buf, &el, NULL);
++        tcc_error("the element type of '[:]' must be declared at file "
++                  "scope, but '%s' is local", buf);
++    }
++
++    for (sl = superc_slices; sl; sl = sl->next)
++        if (is_compatible_types(&sl->elem, &el))
++            return sl;
++
++    sl = tcc_mallocz(sizeof *sl);
++    sl->elem = el;
++    sl->elem_ptr = el;
++    superc_global_pointer(&sl->elem_ptr);
++    sl->elem_size = size;
++    /* 'struct { elem *const data; const size_t len; }' */
++    sl->tag = sym_push2(&global_stack, anon_sym++ | SYM_STRUCT, 0,
++                        2 * PTR_SIZE);
++    sl->tag->type.t = VT_STRUCT;
++    sl->tag->type.ref = NULL;
++    sl->tag->c = 2 * PTR_SIZE;   /* size */
++    sl->tag->r = PTR_SIZE;       /* alignment */
++    /* fields in declaration order: struct field chains use 'next', which is
++       not the link sym_push2 builds, so it is wired up explicitly */
++    {
++        CType lt = superc_size_type(), dt = sl->elem_ptr;
++        Sym *scratch = NULL, *data_f, *len_f;
++        lt.t |= VT_CONSTANT;
++        dt.t |= VT_CONSTANT;
++        data_f = sym_push2(&scratch, tok_alloc_const("data") | SYM_FIELD,
++                           0, 0);
++        data_f->type = dt;
++        data_f->c = 0;
++        data_f->r = 0;
++        len_f = sym_push2(&scratch, tok_alloc_const("len") | SYM_FIELD,
++                          0, PTR_SIZE);
++        len_f->type = lt;
++        len_f->c = PTR_SIZE;
++        len_f->r = 0;
++        data_f->next = len_f;
++        len_f->next = NULL;
++        sl->tag->next = data_f;
++    }
++    sl->next = superc_slices;
++    superc_slices = sl;
++    return sl;
++}
++
++/* Spill the slice or complete array value on vtop into a local
++   '{ void *data; size_t len; }' pair and pop it.  Returns the offset of the
++   pair, so that the runtime helpers can read both words from it (this is
++   also the only way to keep the base value while the bounds are evaluated:
++   local slots survive the calls that a bound expression may generate). */
++static int superc_slice_spill(SupercSlice *sl)
++{
++    CType sz = superc_size_type();
++    int off = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
++
++    loc = off;
++    if (sl) {
++        CType st = superc_slice_ctype(sl);
++        /* the struct layout is exactly the runtime pair */
++        vset(&st, VT_LOCAL | VT_LVAL, off);
++        vswap();
++        vstore();
++        vpop();
++    } else {
++        CType ept = *pointed_type(&vtop->type);
++        int n = vtop->type.ref->c;
++        mk_pointer(&ept);
++        vtop->type = ept;
++        gaddrof();                       /* 'elem *' pointing at the first */
++        vset(&ept, VT_LOCAL | VT_LVAL, off);
++        vswap();
++        vstore();
++        vpop();
++        vpushs(n);
++        vset(&sz, VT_LOCAL | VT_LVAL, off + PTR_SIZE);
++        vswap();
++        vstore();
++        vpop();
++    }
++    return off;
++}
++
++/* f(.., a, b, ..): push the pointer to local slot OFF as an argument */
++static void superc_slice_push_addr(int off)
++{
++    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, off);
++    gaddrof();
++}
++
++/* complain about a range applied to something that is neither a slice nor a
++   complete array */
++static void superc_slice_base_error(CType *base)
++{
++    if (base->t & VT_VLA)
++        tcc_error("cannot slice a variable length array");
++    if (base->t & VT_ARRAY)
++        tcc_error("cannot slice an array of unknown length");
++    if ((base->t & VT_BTYPE) == VT_PTR)
++        tcc_error("cannot slice a pointer; use '(T[:]){p, n}'");
++    tcc_error("cannot slice this expression");
++}
++
++/* Parse the postfix '[' of an expression, with the token already at '['.
++   Consumes '[' ... ']' and leaves the addressed element lvalue (or, for a
++   range, the resulting slice value) on the value stack.  A plain subscript
++   of an array or of a pointer keeps the original code generation. */
++static void superc_slice_subscript(void)
++{
++    SupercSlice *sl, *rsl;
++    CType sz = superc_size_type(), base, array_elem;
++    int have_first = 0, have_array_elem = 0, first_off = 0, pair, res;
++
++    next();                              /* '[' */
++    base = vtop->type;
++    sl = superc_slice_of_type(&base);
++    if ((base.t & VT_ARRAY) && !(base.t & VT_VLA)
++        && base.ref && base.ref->c >= 0) {
++        /* remember the element type: the base ends up below the bounds once
++           the first expression has been parsed */
++        array_elem = *pointed_type(&base);
++        have_array_elem = 1;
++    }
++    if (tok == ':' && !sl && !have_array_elem)
++        superc_slice_base_error(&base);
++
++    if (tok != ':') {
++        gexpr();                         /* index or low bound */
++        have_first = 1;
++    }
++    if (tok != ':') {
++        if (!sl) {
++            /* plain C subscript: byte for byte the original path */
++            gen_op('+');
++            indir();
++            skip(']');
++            return;
++        }
++        /* bounds checked slice index */
++        first_off = (loc - PTR_SIZE) & -PTR_SIZE;
++        loc = first_off;
++        vset(&sz, VT_LOCAL | VT_LVAL, first_off);
++        vswap();
++        vstore();                        /* also converts to size_t */
++        vpop();
++        skip(']');
++        pair = superc_slice_spill(sl);
++        res = (loc - PTR_SIZE) & -PTR_SIZE;
++        loc = res;
++        /* __tcc_slice_index(&ptr, &pair, idx, elem_size) */
++        vpush_helper_func(tok_alloc_const("__tcc_slice_index"));
++        superc_slice_push_addr(res);
++        superc_slice_push_addr(pair);
++        vset(&sz, VT_LOCAL | VT_LVAL, first_off);
++        vpushs(sl->elem_size);
++        gfunc_call(4);
++        vset(&sl->elem_ptr, VT_LOCAL | VT_LVAL, res);
++        indir();
++        return;
++    }
++
++    /* a range: keep the bounds in scratch slots, so that the base value is
++       back on top of the stack when it is spilled below */
++    if (!sl && !have_array_elem)
++        superc_slice_base_error(&base);
++    rsl = sl;
++    if (!rsl)
++        rsl = superc_slice_get(&array_elem);   /* the array decays */
++    {
++        CType rt = superc_slice_ctype(rsl);
++        int lo_off, hi_off = 0, have_hi = 0;
++
++        lo_off = (loc - PTR_SIZE) & -PTR_SIZE;
++        loc = lo_off;
++        if (!have_first)
++            vpushi(0);                   /* lo defaults to 0 */
++        vset(&sz, VT_LOCAL | VT_LVAL, lo_off);
++        vswap();
++        vstore();
++        vpop();
++        next();                          /* ':' */
++        if (tok != ']') {
++            gexpr();                     /* high bound */
++            hi_off = (loc - PTR_SIZE) & -PTR_SIZE;
++            loc = hi_off;
++            vset(&sz, VT_LOCAL | VT_LVAL, hi_off);
++            vswap();
++            vstore();
++            vpop();
++            have_hi = 1;
++        }
++        if (tok == ':')
++            tcc_error("slice bounds have no capacity");
++        skip(']');
++        pair = superc_slice_spill(sl);
++        res = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
++        loc = res;
++        /* __tcc_slice_sub(&out, &pair, lo, hi, elem_size) */
++        vpush_helper_func(tok_alloc_const("__tcc_slice_sub"));
++        superc_slice_push_addr(res);
++        superc_slice_push_addr(pair);
++        vset(&sz, VT_LOCAL | VT_LVAL, lo_off);
++        if (have_hi)
++            vset(&sz, VT_LOCAL | VT_LVAL, hi_off);
++        else
++            vset(&sz, VT_LOCAL | VT_LVAL, pair + PTR_SIZE);  /* hi = len */
++        vpushs(rsl->elem_size);
++        gfunc_call(5);
++        vset(&rt, VT_LOCAL | VT_LVAL, res);
++    }
++}
++
++/* Implicit conversion of a complete array to a slice value, e.g.
++   'int[:] s = a;', 'f(a)' or 'return a;'.  Returns 0 when no conversion
++   applies. */
++static int superc_slice_convert(CType *dt)
++{
++    SupercSlice *sl;
++    CType *se;
++    char b1[256], b2[256];
++
++    if (!tcc_state->superc_ext)
++        return 0;
++    sl = superc_slice_of_type(dt);
++    if (!sl)
++        return 0;
++    {
++        /* a slice stays a slice: plain struct copy, but only of its own
++           element type */
++        SupercSlice *src = superc_slice_of_type(&vtop->type);
++        if (src) {
++            if (src != sl) {
++                type_to_str(b1, sizeof b1, &vtop->type, NULL);
++                type_to_str(b2, sizeof b2, dt, NULL);
++                tcc_error("cannot convert '%s' to '%s'", b1, b2);
++            }
++            return 0;
++        }
++    }
++    if (vtop->type.t & VT_VLA)
++        tcc_error("cannot slice a variable length array");
++    if ((vtop->type.t & VT_ARRAY) && vtop->type.ref->c < 0)
++        tcc_error("cannot slice an array of unknown length");
++    if (vtop->type.t & VT_ARRAY) {
++        se = pointed_type(&vtop->type);
++        if (!is_compatible_unqualified_types(se, &sl->elem)) {
++            type_to_str(b1, sizeof b1, se, NULL);
++            type_to_str(b2, sizeof b2, &sl->elem, NULL);
++            tcc_error("cannot make a slice of '%s' from an array of '%s'",
++                      b2, b1);
++        }
++        if (nocode_wanted & NOEVAL_WANTED) {
++            /* 'sizeof((T[:])a)' / 'typeof': only the type matters and the
++               value is discarded, so no code has to be generated */
++            vtop->type = superc_slice_ctype(sl);
++            return 1;
++        }
++        if (nocode_wanted & DATA_ONLY_WANTED)
++            tcc_error("a slice cannot be initialized from an array in a "
++                      "static initializer; use '{ data, len }'");
++        {
++            CType ept = sl->elem_ptr, st = superc_slice_ctype(sl);
++            CType sz = superc_size_type();
++            int n = vtop->type.ref->c;
++            int off = (loc - 2 * PTR_SIZE) & -PTR_SIZE;
++            loc = off;
++            vtop->type = ept;
++            gaddrof();                   /* &a[0] */
++            vset(&ept, VT_LOCAL | VT_LVAL, off);
++            vswap();
++            vstore();
++            vpop();
++            vpushs(n);
++            vset(&sz, VT_LOCAL | VT_LVAL, off + PTR_SIZE);
++            vswap();
++            vstore();
++            vpop();
++            vset(&st, VT_LOCAL | VT_LVAL, off);
++        }
++        return 1;
++    }
++    if ((vtop->type.t & VT_BTYPE) == VT_PTR)
++        tcc_error("cannot make a slice from a pointer; use '(T[:]){p, n}'");
++    return 0;
++}
++
+ /* drop everything that must not survive into the next translation unit.
+    The scanner restarts its token table for every unit, and the state below
+    holds tokens and descriptors that would otherwise dangle or leak into the
+@@ -8192,6 +8660,14 @@ static void superc_tu_reset(void)
+     tcc_free(tcc_state->superc_package);
+     tcc_state->superc_package = NULL;
+     superc_self_pending = 0;
++    /* the slice descriptors hold Sym pointers into the symbol pools that
++       tccgen_finish() has released: they must not be looked at again */
++    while (superc_slices) {
++        SupercSlice *sl = superc_slices;
++        superc_slices = sl->next;
++        tcc_free(sl);
++    }
++    superc_slices = NULL;
+ }
+ 
+ /* Implicit conversion of a struct value to an interface value, e.g.
+@@ -9839,6 +10315,18 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
+     if (debug_modes && !(flags & DIF_SIZE_ONLY) && !p->sec)
+         tcc_debug_line(tcc_state), tcc_tcov_check_line (tcc_state, 1);
+ 
++#ifdef TCC_EXT
++    /* a slice initializer is read as a single value, a string literal
++       included: 'char[:] m = "text";' views the literal */
++    if (!(flags & DIF_HAVE_ELEM) && tok != '{' && superc_slice_of_type(type)) {
++        int ncw_prev = nocode_wanted;
++        if ((flags & DIF_SIZE_ONLY) && !p->sec)
++            ++nocode_wanted;
++        parse_init_elem(!p->sec ? EXPR_ANY : EXPR_CONST);
++        nocode_wanted = ncw_prev;
++        flags |= DIF_HAVE_ELEM;
++    } else
++#endif
+     if (!(flags & DIF_HAVE_ELEM) && tok != '{' &&
+ 	/* In case of strings we have special handling for arrays, so
+ 	   don't consume them as initializer value (which would commit them
+@@ -9999,6 +10487,12 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
+             && is_compatible_unqualified_types(type, &vtop->type)) {
+         goto one_elem;
+ 
++#ifdef TCC_EXT
++    } else if ((flags & DIF_HAVE_ELEM) && superc_slice_convert(type)) {
++        /* 'int[:] s = array;': vtop now holds the slice value */
++        goto one_elem;
++#endif
++
+     } else if ((type->t & VT_BTYPE) == VT_STRUCT) {
+         no_oblock = 1;
+         if ((flags & DIF_FIRST) || tok == '{') {
+diff --git a/tests/tests2/175_superc_slice.c b/tests/tests2/175_superc_slice.c
+new file mode 100644
+index 00000000..11f8a110
+--- /dev/null
++++ b/tests/tests2/175_superc_slice.c
+@@ -0,0 +1,119 @@
++/* superc extension: slices 'T[:]' */
++#include <stdio.h>
++
++struct Pair { int a, b; };
++typedef int Row[3];                 /* an array element type needs a name */
++
++/* a slice is passed by value and may be returned */
++int sum(int[:] s)
++{
++    int i = 0, total = 0;
++    for (i = 0; i < (int)s.len; i++)
++        total += s[i];
++    return total;
++}
++
++int[:] tail(int[:] s)
++{
++    return s[1:];
++}
++
++/* a slice can be a struct member */
++struct Holder { int[:] s; };
++
++int holder_sum(struct Holder *h)
++{
++    return sum(h->s);
++}
++
++package view {
++    int first(int[:] s) { return s.len > 0 ? s[0] : -1; }
++}
++import view;
++
++int main(void)
++{
++    int a[5] = { 10, 20, 30, 40, 50 };
++    int[:] s = a;
++    int i = 0;
++
++    /* array to slice, .len and .data, plain indexing */
++    printf("len=%d s0=%d s4=%d\n", (int)s.len, s[0], s[4]);
++    printf("data=%d\n", s.data == a);
++
++    /* writes go through to the array and vice versa */
++    s[0] = 99;
++    a[1] = 21;
++    printf("a0=%d s1=%d\n", a[0], s[1]);
++
++    /* ranges: [lo:hi], [lo:], [:hi], [:] */
++    {
++        int[:] t = a[1:4];
++        int[:] u = t[1:];
++        int[:] v = s[:2];
++        int[:] w = t[:];
++        printf("t=%d,%d,%d u=%d,%d v=%d w=%d\n",
++               (int)t.len, t[0], t[2], (int)u.len, u[0], (int)v.len, (int)w.len);
++    }
++
++    /* an empty range is legal */
++    printf("empty=%d\n", (int)s[2:2].len);
++
++    /* slices through functions */
++    printf("sum=%d tail=%d,%d\n", sum(s), (int)tail(s).len, tail(s)[0]);
++
++    /* slices in structs and packages */
++    {
++        struct Holder h = { s[2:4] };
++        printf("holder=%d pkg=%d\n", holder_sum(&h), view.first(h.s));
++    }
++
++    /* an array of slices */
++    {
++        int[:] parts[2] = { s[0:2], s[2:4] };
++        printf("parts=%d,%d,%d\n", (int)parts[0].len, parts[0][1], parts[1][0]);
++    }
++
++    /* a pointer to a slice */
++    {
++        int[:] *p = &s;
++        printf("ptr=%d,%d\n", (int)p->len, (*p)[3]);
++    }
++
++    /* element types: struct, char (string literal), array via typedef */
++    {
++        struct Pair pairs[3] = { {1, 2}, {3, 4}, {5, 6} };
++        struct Pair[:] ps = pairs;
++        ps[1].a = 30;
++        printf("pairs=%d,%d,%d\n", ps[1].a, ps[2].b, (int)ps.len);
++    }
++    {
++        char[:] m = "hello";
++        printf("str=%d,%c,%c\n", (int)m.len, m[0], m[4]);
++    }
++    {
++        int grid[2][3] = { {1, 2, 3}, {4, 5, 6} };
++        Row[:] rows = grid;
++        printf("rows=%d,%d,%d\n", (int)rows.len, rows[0][1], rows[1][2]);
++    }
++
++    /* a compound literal builds a slice from a pointer and a length */
++    {
++        int[:] lit = (int[:]){ a + 2, 2 };
++        printf("lit=%d,%d,%d\n", (int)lit.len, lit[0], lit[1]);
++    }
++
++    /* sizeof: the slice is two machine words, an element is a plain object */
++    printf("sizes=%d,%d,%d\n", (int)sizeof(int[:]),
++           (int)sizeof(s[0]), (int)sizeof(s.len));
++
++    /* loops, side effects in the index, re-slicing */
++    for (i = 0; i < (int)s.len; i++)
++        s[i] += 1;
++    printf("bumped=%d,%d\n", a[0], a[4]);
++    {
++        int j = 1;
++        printf("post=%d j=%d\n", s[j++], j);
++    }
++    return 0;
++}
+diff --git a/tests/tests2/175_superc_slice.expect b/tests/tests2/175_superc_slice.expect
+new file mode 100644
+index 00000000..514e5426
+--- /dev/null
++++ b/tests/tests2/175_superc_slice.expect
+@@ -0,0 +1,16 @@
++len=5 s0=10 s4=50
++data=1
++a0=99 s1=21
++t=3,21,40 u=2,30 v=2 w=3
++empty=0
++sum=240 tail=4,21
++holder=70 pkg=30
++parts=2,21,30
++ptr=5,40
++pairs=30,6,3
++str=6,h,o
++rows=2,2,6
++lit=2,30,40
++sizes=16,4,8
++bumped=100,51
++post=22 j=2
+diff --git a/tests/tests2/176_superc_slice_errors.c b/tests/tests2/176_superc_slice_errors.c
+new file mode 100644
+index 00000000..3a176f3c
+--- /dev/null
++++ b/tests/tests2/176_superc_slice_errors.c
+@@ -0,0 +1,82 @@
++/* superc extension: diagnostics for slices 'T[:]' */
++struct S;
++
++#if defined test_void_element
++void f(void[:] s);
++int main(void) { return 0; }
++#elif defined test_incomplete_element
++void f(struct S[:] s);
++int main(void) { return 0; }
++#elif defined test_local_element
++int main(void)
++{
++    struct Local { int a; };
++    struct Local l = { 1 };
++    struct Local[:] s = &l;
++    return 0;
++}
++#elif defined test_error_element
++void f(error[:] s);
++int main(void) { return 0; }
++#elif defined test_element_mismatch
++int main(void)
++{
++    int a[2] = { 1, 2 };
++    char[:] s = a;
++    return 0;
++}
++#elif defined test_pointer_source
++int main(void)
++{
++    int a[2] = { 1, 2 };
++    int *p = a;
++    int[:] s = p;
++    return 0;
++}
++#elif defined test_vla_source
++int main(void)
++{
++    int n = 3;
++    int a[n];
++    int[:] s = a;
++    return 0;
++}
++#elif defined test_pointer_slice
++int main(void)
++{
++    int a[2] = { 1, 2 };
++    int *p = a;
++    return p[0:1] != 0;
++}
++#elif defined test_capacity
++int main(void)
++{
++    int a[2] = { 1, 2 };
++    int[:] s = a;
++    return (int)s[0:1:2].len;
++}
++#elif defined test_file_scope_array
++int a[3] = { 1, 2, 3 };
++int[:] g = a;
++int main(void) { return 0; }
++#elif defined test_uninitialized
++int main(void)
++{
++    int[:] s;
++    return 0;
++}
++#elif defined test_slice_to_int
++int main(void)
++{
++    int a[2] = { 1, 2 };
++    int[:] s = a;
++    return (int)s;
++}
++#else
++int main(void)
++{
++    int a[3] = { 1, 2, 3 };
++    int[:] s = a[1:];
++    return (int)s.len == 2 && s[0] == 2 ? 0 : 1;
++}
++#endif
+diff --git a/tests/tests2/176_superc_slice_errors.expect b/tests/tests2/176_superc_slice_errors.expect
+new file mode 100644
+index 00000000..3db4cd77
+--- /dev/null
++++ b/tests/tests2/176_superc_slice_errors.expect
+@@ -0,0 +1,35 @@
++[test_void_element]
++176_superc_slice_errors.c:5: error: '[:]' cannot have a 'void' element type
++
++[test_incomplete_element]
++176_superc_slice_errors.c:8: error: '[:]' requires a complete element type, not 'struct S'
++
++[test_local_element]
++176_superc_slice_errors.c:15: error: the element type of '[:]' must be declared at file scope, but 'struct Local' is local
++
++[test_error_element]
++176_superc_slice_errors.c:19: error: 'error' can only be a return type, not a slice element
++
++[test_element_mismatch]
++176_superc_slice_errors.c:25: error: cannot make a slice of 'char' from an array of 'int'
++
++[test_pointer_source]
++176_superc_slice_errors.c:33: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
++
++[test_vla_source]
++176_superc_slice_errors.c:41: error: cannot slice a variable length array
++
++[test_pointer_slice]
++176_superc_slice_errors.c:49: error: cannot slice a pointer; use '(T[:]){p, n}'
++
++[test_capacity]
++176_superc_slice_errors.c:56: error: slice bounds have no capacity
++
++[test_file_scope_array]
++176_superc_slice_errors.c:60: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
++
++[test_uninitialized]
++176_superc_slice_errors.c:65: error: variable 's' must be initialized
++
++[test_slice_to_int]
++176_superc_slice_errors.c:73: error: cannot convert 'int[:]' to 'int'
+diff --git a/tests/tests2/177+_superc_slice_tu.c b/tests/tests2/177+_superc_slice_tu.c
+new file mode 100644
+index 00000000..ac9e583f
+--- /dev/null
++++ b/tests/tests2/177+_superc_slice_tu.c
+@@ -0,0 +1,18 @@
++/* superc extension: definitions for 177_superc_slice_tu.c */
++int sum(int[:] s)
++{
++    int i = 0, total = 0;
++    for (i = 0; i < (int)s.len; i++)
++        total += s[i];
++    return total;
++}
++
++int[:] tail(int[:] s)
++{
++    return s[1:];
++}
++
++int first(int[:] s)
++{
++    return s.len > 0 ? s[0] : -1;
++}
+diff --git a/tests/tests2/177_superc_slice_tu.c b/tests/tests2/177_superc_slice_tu.c
+new file mode 100644
+index 00000000..72795dc5
+--- /dev/null
++++ b/tests/tests2/177_superc_slice_tu.c
+@@ -0,0 +1,23 @@
++/* superc extension: a slice API shared by two translation units.
++   Each unit declares 'int[:]' itself; the layout is the same on both
++   sides, so no extra declaration is needed. */
++#include <stdio.h>
++
++/* defined in 177+_superc_slice_tu.c */
++int sum(int[:] s);
++int[:] tail(int[:] s);
++int first(int[:] s);
++
++int main(void)
++{
++    int a[5] = { 1, 2, 3, 4, 5 };
++    int[:] s = a;
++    int[:] t = tail(s);
++
++    printf("sum=%d first=%d\n", sum(s), first(s));
++    printf("tail=%d,%d,%d\n", (int)t.len, t[0], t[t.len - 1]);
++
++    /* a slice made in this unit, consumed by the other one */
++    printf("sum2=%d\n", sum(a[1:3]));
++    return 0;
++}
+diff --git a/tests/tests2/177_superc_slice_tu.expect b/tests/tests2/177_superc_slice_tu.expect
+new file mode 100644
+index 00000000..11f85ee9
+--- /dev/null
++++ b/tests/tests2/177_superc_slice_tu.expect
+@@ -0,0 +1,3 @@
++sum=15 first=1
++tail=4,2,5
++sum2=5
+diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
+index 5c7e39ae..931a1b61 100644
+--- a/tests/tests2/Makefile
++++ b/tests/tests2/Makefile
+@@ -93,6 +93,7 @@ ifneq (,$(SUPERC_OK))
+  165_superc_init.test: FLAGS += -dt
+  167_superc_pkg_dot_errors.test: FLAGS += -dt
+  170_superc_method_errors.test: FLAGS += -dt
++ 176_superc_slice_errors.test: FLAGS += -dt
+  # these compile a second file before '-run'
+  168_superc_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
+  168_superc_pkg_dot_tu.test: GEN = $(GEN-TCC)
+@@ -100,6 +101,8 @@ ifneq (,$(SUPERC_OK))
+  171_superc_method_tu.test: GEN = $(GEN-TCC)
+  174_superc_iface_tu.test: FLAGS += $(subst 174,174+,$1)
+  174_superc_iface_tu.test: GEN = $(GEN-TCC)
++ 177_superc_slice_tu.test: FLAGS += $(subst 177,177+,$1)
++ 177_superc_slice_tu.test: GEN = $(GEN-TCC)
+  # 172 mixes an extension unit with a unit built for plain C
+  172_superc_plain_interop.test: NORUN = true
+  172_superc_plain_interop.test: GEN = $(GEN-TCC)
+-- 
+2.51.0
+

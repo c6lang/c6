@@ -498,11 +498,12 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
 | 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；`superc_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_superc_macro` / `superc_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`superc_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
+| 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `superc_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`superc_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`superc_slice_spill`（把基值落到本地 `{data, len}` 对）、`superc_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
 
-验收测试：`tcc/tests/tests2/156_superc_defer.c` … `174_superc_iface_tu.c`，由
+验收测试：`tcc/tests/tests2/156_superc_defer.c` … `177_superc_slice_tu.c`，由
 `tests/tests2/Makefile` 自动加 `-std=tcc-ext`；未编译 `-DTCC_EXT` 时自动 SKIP
 （以 `__TCC_EXT__` 预定义探测）。`make -C tests/tests2 tests2.all` 两种构建下
-分别为 153 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
+分别为 156 / 134 项全通过（扩展关闭时 superc 专项测试自动 SKIP）。
 
 根目录自测（`tests/test.c`，21 个 test 块）：`make selftest`。
 
@@ -536,4 +537,18 @@ tcc/tcc -std=tcc-ext -B. -test file.c       # 运行 test 块
   所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
   全局/`static` 对象放进 `.data`（不写初始化器时在 `.bss`），因此给大型
   静态缓冲区补初始化器会增大输出文件；
-- `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）。
+- `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）；
+- 切片 `T[:]` 是**视图**：`{元素指针, 长度}` 两个机器字，不拥有元素，也没有
+  `append`/`cap`/动态扩容/深拷贝；`data` 字段是 `T *const`，所以切片头不能被
+  重定向，越界检查以外的指针运算请走 `.data`；
+- 切片元素的顶层 `const`/`volatile` 被忽略（`const int[:]` 与 `int[:]` 同类型），
+  元素是 struct/union/enum 时其 tag 必须在文件作用域声明——函数内的局部 tag
+  会随块退出释放，而切片类型要活到 TU 末尾；
+- 数组→切片只在运行期上下文隐式发生（赋值/初始化/实参/`return`/强转）；
+  静态初始化器（文件作用域或 `static` 局部）没有可执行代码，写
+  `int[:] g = arr;` 会报错，改用 `{ arr, N }`。VLA 与不完整数组不能转切片，
+  指针也不能直接切（用 `(T[:]){p, n}`）；
+- 切片越界是运行时陷阱（SIGSEGV），没有诊断文本：libtcc1 是 freestanding 的，
+  与 `catch` 落空时的处理保持一致；
+- 元素本身是数组时先用 `typedef`（`typedef int Row[3]; Row[:] rows;`）——数组
+  声明符只能写在名字上，C 本身如此。
