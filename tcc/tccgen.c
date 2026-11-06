@@ -191,6 +191,8 @@ static C6Iface *c6_iface_of_type(CType *type);
 static int c6_iface_has_method(C6Iface *ifc, int m);
 static void c6_iface_call_prep(C6Iface *ifc, int mname);
 static Sym *c6_import_lookup(int v);
+static int c6_mangle_tok(const char *pkg, int v);
+static int c6_pkg_imported(const char *name);
 static void gen_function(Sym *sym);
 /* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
    already interned as TOK_ASM_test, so accept both spellings. */
@@ -5808,6 +5810,11 @@ ST_FUNC void unary(void)
     CType type;
     Sym *s;
     AttributeDef ad;
+#ifdef C6_EXT
+    /* how the current identifier was spelled in the source, when it was a
+       'pkg.member' package-qualified access (kept for diagnostics) */
+    int dot_disp = 0;
+#endif
 
     /* generate line number info */
     if (debug_modes)
@@ -6346,8 +6353,79 @@ special_math_val:
         t = tok;
         next();
         s = sym_find(t);
+#ifdef C6_EXT
+        /* 'pkg.member', possibly multi-level: the dotted spelling is a
+           package-qualified access that resolves to 'pkg__member'.  The
+           package part is grown one segment at a time, so 'a.b.f' first
+           tries 'a__b' and only then 'a__b__f': 'pkg.obj.field' therefore
+           still reaches a package global and hands the trailing '.field'
+           back to the normal postfix code.  A qualified access is only
+           accepted for a package imported before this point (or for the
+           package we are currently inside of); a plain visible identifier
+           keeps normal C member-access semantics. */
+        if (!s && tcc_state->c6_ext && tok == '.') {
+            char pfx[160], pkgdisp[200], disp[200];
+            int mt, n, seg;
+
+            n = snprintf(pfx, sizeof pfx, "%s", get_tok_str(t, NULL));
+            if (n >= (int)sizeof pfx)
+                tcc_error("package name too long");
+            snprintf(pkgdisp, sizeof pkgdisp, "%s", pfx);
+            snprintf(disp, sizeof disp, "%s", pfx);
+            for (;;) {
+                next();                 /* skip '.' */
+                if (tok < TOK_UIDENT)
+                    tcc_error("identifier expected after '.'");
+                seg = tok;
+                n = strlen(disp);
+                snprintf(disp + n, sizeof disp - n, ".%s",
+                         get_tok_str(seg, NULL));
+                if (n + 1 >= (int)sizeof disp)
+                    tcc_error("package name too long");
+                mt = c6_mangle_tok(pfx, seg);
+                if (!(s = sym_find_raw(mt))) {
+                    /* no such member: either the segment was part of the
+                       package name after all, or the member is missing */
+                    next();
+                    if (tok == '.') {
+                        /* one more segment follows: grow the package name */
+                        n = strlen(pfx);
+                        if (n + 2 + strlen(get_tok_str(seg, NULL))
+                            >= (int)sizeof pfx)
+                            tcc_error("package name too long");
+                        sprintf(pfx + n, "__%s", get_tok_str(seg, NULL));
+                        n = strlen(pkgdisp);
+                        snprintf(pkgdisp + n, sizeof pkgdisp - n, ".%s",
+                                 get_tok_str(seg, NULL));
+                        if (n + 1 >= (int)sizeof pkgdisp)
+                            tcc_error("package name too long");
+                        continue;
+                    }
+                    /* nothing left to name a member: report it */
+                    if (!c6_pkg_imported(pfx))
+                        tcc_error("'%s' is not an imported package "
+                                  "(use 'import %s;')", pkgdisp, pkgdisp);
+                    dot_disp = tok_alloc_const(disp);
+                    t = mt;
+                    break;
+                }
+                if (!c6_pkg_imported(pfx))
+                    tcc_error("'%s' is not an imported package "
+                              "(use 'import %s;')", pkgdisp, pkgdisp);
+                dot_disp = tok_alloc_const(disp);
+                t = mt;
+                next();                 /* skip the member name */
+                break;
+            }
+        }
+#endif
         if (!s || IS_ASM_SYM(s)) {
             const char *name = get_tok_str(t, NULL);
+#ifdef C6_EXT
+            /* report the spelling used in the source, not the mangled name */
+            if (dot_disp)
+                name = get_tok_str(dot_disp, NULL);
+#endif
             if (tok != '(')
                 tcc_error("'%s' undeclared", name);
             /* for simple function calls, we tolerate undeclared
@@ -7354,12 +7432,54 @@ static void block_cleanup(struct scope *o)
 
 static int c6_mangle_tok(const char *pkg, int v)
 {
-    char buf[192];
+    char buf[512];
     const char *name = get_tok_str(v, NULL);
     if (strlen(pkg) + strlen(name) + 3 > sizeof(buf))
         tcc_error("package symbol name too long");
     sprintf(buf, "%s__%s", pkg, name);
     return tok_alloc_const(buf);
+}
+
+/* Parse 'ident ( "." ident )*' and return the package prefix: the dotted
+   spelling is purely a name separator, so 'acme.util' becomes
+   "acme__util".  Nothing here looks at directories or files. */
+static char *c6_pkg_name(int *ptok)
+{
+    char buf[128];
+    int n;
+
+    if (*ptok < TOK_UIDENT)
+        expect("package name");
+    n = snprintf(buf, sizeof buf, "%s", get_tok_str(*ptok, NULL));
+    if (n >= (int)sizeof buf)
+        tcc_error("package name too long");
+    next();
+    while (*ptok == '.') {
+        next();
+        if (*ptok < TOK_UIDENT)
+            tcc_error("package name expected after '.'");
+        n += snprintf(buf + n, sizeof buf - n, "__%s",
+                      get_tok_str(*ptok, NULL));
+        if (n >= (int)sizeof buf)
+            tcc_error("package name too long");
+        next();
+    }
+    return tcc_strdup(buf);
+}
+
+/* 'pkg.member' is only allowed for a package that was imported, or for the
+   package the code currently sits in */
+static int c6_pkg_imported(const char *name)
+{
+    int i;
+
+    if (tcc_state->c6_package
+        && !strcmp(tcc_state->c6_package, name))
+        return 1;
+    for (i = 0; i < tcc_state->c6_nb_imports; i++)
+        if (!strcmp(tcc_state->c6_imports[i], name))
+            return 1;
+    return 0;
 }
 
 /* resolve V as a member of the current package or of an imported package */
@@ -7386,14 +7506,19 @@ static Sym *c6_import_lookup(int v)
     return NULL;
 }
 
-static char *c6_ident_str(int *ptok)
+/* Compose 'outer' and 'inner' into a single prefix.  Nesting is not a
+   separate namespace layer: 'package a { package b { ... } }' simply
+   prefixes twice, so a symbol declared inside becomes 'a__b__sym'. */
+static char *c6_pkg_compose(const char *outer, char *inner)
 {
-    char *name;
-    if (*ptok < TOK_UIDENT)
-        expect("identifier");
-    name = tcc_strdup(get_tok_str(*ptok, NULL));
-    next();
-    return name;
+    char buf[128];
+    int n;
+
+    n = snprintf(buf, sizeof buf, "%s__%s", outer, inner);
+    tcc_free(inner);
+    if (n >= (int)sizeof buf)
+        tcc_error("package name too long");
+    return tcc_strdup(buf);
 }
 
 static void c6_package_parse(void)
@@ -7401,11 +7526,11 @@ static void c6_package_parse(void)
     char *name, *saved;
 
     next();  /* skip 'package' */
-    name = c6_ident_str(&tok);
+    name = c6_pkg_name(&tok);
+    if (tcc_state->c6_package)
+        name = c6_pkg_compose(tcc_state->c6_package, name);
     if (tok == '{') {
         /* 'package NAME { ... }': the package ends with the block */
-        if (tcc_state->c6_package)
-            tcc_error("nested 'package' is not allowed");
         saved = tcc_state->c6_package;
         tcc_state->c6_package = name;
         next();
@@ -7413,9 +7538,11 @@ static void c6_package_parse(void)
             decl(VT_CONST);
         skip('}');
         tcc_state->c6_package = saved;
+        tcc_free(name);
     } else {
         /* 'package NAME;' names the rest of the file (or until the next
            'package' statement); include system headers before it */
+        tcc_free(tcc_state->c6_package);
         tcc_state->c6_package = name;
         skip(';');
     }
@@ -7424,8 +7551,9 @@ static void c6_package_parse(void)
 static void c6_import_parse(void)
 {
     char *name;
+
     next();  /* skip 'import' */
-    name = c6_ident_str(&tok);
+    name = c6_pkg_name(&tok);
     skip(';');
     dynarray_add(&tcc_state->c6_imports,
                  &tcc_state->c6_nb_imports, name);

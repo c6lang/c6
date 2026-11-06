@@ -1,0 +1,24 @@
+[test_not_imported]
+167_c6_pkg_dot_errors.c:8: error: 'math' is not an imported package (use 'import math;')
+
+[test_not_imported_multi]
+167_c6_pkg_dot_errors.c:11: error: 'acme.util' is not an imported package (use 'import acme.util;')
+
+[test_parent_only_import]
+167_c6_pkg_dot_errors.c:15: error: 'acme.util' is not an imported package (use 'import acme.util;')
+
+[test_unknown_member]
+167_c6_pkg_dot_errors.c:18: error: 'math.nope' undeclared
+
+[test_unknown_member_call]
+167_c6_pkg_dot_errors.c:21: warning: implicit declaration of function 'math.nope'
+tcc: error: unresolved reference to 'math__nope'
+
+[test_missing_member_name]
+167_c6_pkg_dot_errors.c:24: error: identifier expected after '.'
+
+[test_arrow_is_not_package_access]
+167_c6_pkg_dot_errors.c:27: error: 'math' undeclared
+
+[test_import_after_use]
+167_c6_pkg_dot_errors.c:29: error: 'math' is not an imported package (use 'import math;')

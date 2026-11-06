@@ -85,10 +85,26 @@ C6_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_c6_*.c)))
 C6_OK := $(shell echo | $(TCC_LOCAL) -std=c6 -dD -E - 2>/dev/null | grep -q __C6__ && echo yes)
 ifneq (,$(C6_OK))
  $(C6_TESTS): FLAGS += -std=c6
+ # gcc cannot build them, so their .expect files come from tcc itself
+ $(C6_TESTS): GEN = $(GEN-TCC)
  158_c6_test.test: FLAGS += -test
  162_c6_iface_errors.test: FLAGS += -dt
  164_c6_try_errors.test: FLAGS += -dt
  165_c6_init.test: FLAGS += -dt
+ 167_c6_pkg_dot_errors.test: FLAGS += -dt
+ 170_c6_method_errors.test: FLAGS += -dt
+ # these compile a second file before '-run'
+ 168_c6_pkg_dot_tu.test: FLAGS += $(subst 168,168+,$1)
+ 168_c6_pkg_dot_tu.test: GEN = $(GEN-TCC)
+ 171_c6_method_tu.test: FLAGS += $(subst 171,171+,$1)
+ 171_c6_method_tu.test: GEN = $(GEN-TCC)
+ # 172 mixes an extension unit with a unit built for plain C
+ 172_c6_plain_interop.test: NORUN = true
+ 172_c6_plain_interop.test: GEN = $(GEN-TCC)
+ 172_c6_plain_interop.test: T1 = \
+     $(TCC) -std=c6 -c $(SRC)/172_c6_plain_interop.c -o $*-ext.o && \
+     $(TCC) -c $(SRC)/172+_c6_plain_interop.c -o $*-plain.o && \
+     $(TCC) $*-ext.o $*-plain.o -o $*.exe && ./$*.exe
 else
  SKIP += $(C6_TESTS)
 endif
