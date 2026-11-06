@@ -18,6 +18,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
 | `foreach \|i, v\| a { ... }` | 遍历数组、切片与整数区间：绑定表在前，值绑定是元素副本 |
+| `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
 
@@ -198,7 +199,12 @@ int handle(const char *s)
 - `error` 是**只出不进**的类型：可以作为返回值，但不能作为函数参数
   （`error`、`error*`、`error[]` 都不行）——错误只能从返回值出来，
   不走实参、也不走 out 参数；函数体内的 `error e;` 局部变量仍然可用；
-- `!error` 的函数返回类型必须能表示哨兵 `-1`（标量或枚举，不能是结构体）。
+- `!error` 的函数返回类型可以是标量、枚举、指针，也可以是 struct / union / 元组：
+  失败与否只由**错误槽**决定，返回值只承载成功路径的值。标量在失败路径上
+  返回哨兵 `-1`，聚合类型在失败路径上被清零——因为 `T!error` 的返回值只能被
+  `try` / `catch` 消费，那个值永远不可观测，所以清零不会丢信息；
+- `float` / `double` / `long double` 不能作 `!error` 的返回类型（没有可用的
+  哨兵，也不属于聚合类型）。
 
 完整可运行示例见 [examples/try_demo.c](examples/try_demo.c)：
 
@@ -533,6 +539,72 @@ foreach |i, v| obj.items { ... }/* 结构体暴露的切片成员 */
 ./tcc/tcc -B tcc -std=c6 -run examples/foreach_demo.c
 ```
 
+### 元组 `(T1, T2, ...)`
+
+```c
+(int, int) divmod(int a, int b) { return {a / b, a % b}; }  /* 返回多值 */
+(int, double) average(int a, int b) { return {(a + b) / 2, (a + b) / 2.0}; }
+
+(int q, int r) = divmod(17, 5);     /* 解构声明：一次声明多个变量 */
+(a, b) = divmod(100, 7);            /* 解构赋值：目标可以是任意左值 */
+(int high, _) = divmod(100, 7);     /* '_' 丢弃这个元素 */
+
+(int, int) t = {1, 2};
+t[0] = 9;                           /* 元素用常量下标读写 */
+printf("%d\n", t[1]);
+```
+
+速查：
+
+| 写法 | 行为 |
+|---|---|
+| `(T1, T2)` / `(T1, T2, ...)` | 元组类型，至少两个元素；就是一个布局固定的 struct |
+| `(int, int) f(void) { return {q, r}; }` | 返回多值；`return {…}` 也适用于 struct / union |
+| `(T1, T2) v = {a, b};` | 定义元组变量（和 struct 的初始化式一样） |
+| `t[0]` / `t[1]` | 元素访问；下标必须是**整数常量**且在范围内 |
+| `(int q, int r) = f();` | 解构声明：元素类型写全，一次声明多个局部变量 |
+| `(a, b) = f();` | 解构赋值：目标是左值（变量、数组元素、`->`/`.` 成员） |
+| `(int q, _)` / `(_, int r)` / `(q, _)` / `(_, r)` | `_` 丢弃对应元素（不取名、不生成加载） |
+| `(int, int)!error parse(...)` | 元组也可以作 `!error` 的返回类型 |
+| `async (int, int) f(...)` + `(int a, int b) = await f(...);` | `await` 的结果可以直接解构 |
+| `go g((int, int) t)` | 元组按值穿过线程边界（同 struct） |
+
+规则：
+
+- 元素类型必须**完整**、非 `void`、非函数类型、非变长数组，并且**在文件作用域
+  可见**（元组用一个内部 tag，函数里定义的 struct 不行）；`error` 不能当元素；
+- 元组按值传递、按值返回、可以赋给另一个兼容的元组，也可以当参数、返回值、
+  结构体成员、数组元素；元素类型可以不同（`(char *, int)`、`(int, double)`），
+  也可以嵌套（`((int, int), int)`）；
+- 解构只能写成**语句**：`(int q, int r) = f();` 或 `(q, r) = f();`。要么全是
+  “类型 + 名字”，要么全是左值，混着写会当成普通表达式而报错；元素个数必须和
+  元组一致；全是 `_` 是错误（那等于丢掉整个值）；
+- `_` 只在解构模式里有特殊含义，别处仍是普通标识符：`int _ = 5;`、
+  `(int, int) _ = f();` 都照常工作；
+- `(…)` 形式的老 C 写法不受影响：`(void)printf(…)`、`(int)x`、`(T)(x)`、
+  `(struct S){…}`、语句表达式 `({…})`、逗号表达式 `(a, b)` 都还是原来的语义
+  ——只有当括号里是一串“类型[, 类型…]”时才按元组类型解析；
+- `#pragma pack` **不影响**元组：布局在类型构造时按自然对齐算好并缓存，
+  所以同一个元组在任何 TU、任何 pragma 状态下都是同一个 ABI。
+
+元组不引入任何新的 ABI：它就是一个普通 struct，参数和返回值都走已有的
+struct 传递路径，所以和等价的 struct 可以互操作：
+
+```c
+/* a.c （-std=c6） */     (int, int) f(int a, int b) { return {a / b, a % b}; }
+/* b.c （普通 C）   */     struct pair { int q, r; };
+                           struct pair f(int a, int b);
+```
+
+`tests/abi/tuple.c` + `tests/abi/tuple_plain.c` 就是这么验证的：两个 TU 分别
+用元组和 struct 编译，链接后互相调用。
+
+完整可运行示例见 [examples/tuple_demo.c](examples/tuple_demo.c)：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -run examples/tuple_demo.c
+```
+
 ### async / await（无栈协程）
 
 ```c
@@ -698,10 +770,16 @@ tests/
 ├── method.c          结构体方法
 ├── interface.c       结构化接口
 ├── slice.c           切片
+├── tuple.c           元组（与 tu/tuple.c 一起跑）
+├── tuple_error.c     元组 / struct 作 !error 的返回类型
+├── tuple_async.c     元组 + async / await
+├── tuple_thread.c    元组 + go（OS 线程）
 ├── async.c           async / await / co / task
 ├── thread.c          go（OS 线程）
 ├── typename.c        裸 tag 类型名（省略 struct / union / enum）
 ├── tu/               跨翻译单元的第二个 .c（同名的主文件会一起编译）
+├── abi/              ABI 兼容：同一份代码用 -std=c6 和纯 C 各编译一个 TU，
+│                     链接后运行（`// EXIT <n>` 声明期望的退出码）
 ├── exit/             退出码（`// EXIT <n>` 声明期望的进程退出码）
 └── errors/           编译期诊断（每个片段一个 -D 开关）
 ```
@@ -779,6 +857,9 @@ make test-all      # selftest + tests2
   分属两个命名空间，**同名时必须写 `struct`**（`struct stat` + `stat()` 就是例子）。
 - 变量初始化检查在**定义点**做，不做数据流分析；VLA 是唯一豁免
   （标准 C 禁止给变长数组写初始化器）。
+- 元组复用 `VT_STRUCT` 和内部 tag `__c6_tuple_N`，布局在构造类型时按自然对齐
+  算好（不读 `pack_stack_ptr`），因此 `#pragma pack`、成员顺序、对齐都不会改变
+  它的 ABI；元素名 `__c6_t0`…只为实现细节，对外只有 `t[i]`。
 - 切片是普通 `static`/自动对象，没有隐藏状态也没有 GC：越界检查由
   `libtcc1` 的 `__tcc_slice_index` / `__tcc_slice_sub` 完成，元素类型不参与
   ABI，因此两个 TU 只要都写 `T[:]` 就能互通。

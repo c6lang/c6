@@ -460,6 +460,7 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
 | 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
 | 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、局部 tag 的切片、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、`typeof`/`_Generic`/`_Alignof`、接口方法签名、跨 TU |
+| 元组 `(T1, T2)` | 返回值/解构声明/解构赋值/`_`/`t[k]`/参数/成员/数组元素/嵌套/复合字面量/`sizeof`/`async`+`await`/`go`/`!error`/跨 TU/与 struct 的 ABI 互通 | 元素是 `void`/函数/VLA/不完整/局部 tag/`error`、下标非常量或越界、解构个数不符、混写类型与名字、全 `_`、右边不是元组、非左值目标、`return {…}` 用在标量函数、`float!error` | `#pragma pack` 不影响布局、`(a, b)` 逗号表达式与各种强转/复合字面量不被误判、`_` 别处仍是普通标识符、文件作用域的元组对象 |
 
 ### 9.2 工程要求
 
@@ -513,6 +514,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 14 `go` = OS 线程 | ✅ | `c6_go_parse` 只在 `-std=c6` 下生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `go` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（defer 栈 / 错误槽 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS） |
 | 15 裸 tag 类型名（省略 `struct`） | ✅ | `tccgen.c`：`parse_btype()` 的 `default` 分支——`typespec_found` 为 0、`sym_find(tok)` 未命中（普通命名空间优先）时试 `struct_find(tok)`，命中则把 tag 符号的 `type.t` / `ref` 交给 `basic_type2`，与 `struct/union/enum TAG` 走完全同一条路径（所以 `sizeof`、方法注册、`c6_tag_is_global` 的切片元素检查、`type_to_str` 自动一致）；`ignore_label` 时 `TAG:` 仍退回标签（与 typedef 路径同一个 guard）；不隐式前置声明，也不支持定义处省略 `struct`；只在 `-std=c6` 生效 |
 | 16 `foreach` | ✅ | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句，所以 `foreach` 仍可当标识符）；词法是 `tcctok.h` 末尾追加的硬关键字，`-std=c6` 关闭时由 `tccpp.c` 的还原循环改回普通标识符（区间同步扩到 `TOK_C6_FOREACH`）；数组/切片的隐藏槽直接复用 `c6_slice_spill`（`{data, len}` 对，与切片运行期布局相同），区间把上界落进隐藏整数槽、下标绑定当计数器；`i`/`v` 是 `sym_push` 出来的普通局部，循环体走 `lblock`，所以 `break`/`continue`/`defer`/`await` 与 `for` 一致；`size_t` 下标用 `c6_size_type`，区间用 `c6_common_int_type`（C 的通常算术转换子集）；文件作用域的 `foreach \|…\|` 在 `decl()` 里报错 |
+| 17 元组 `(T1, T2, …)` | ✅ | `tccgen.c`：`parse_btype()` 的 `case '('` → `c6_tuple_btype` / `c6_tuple_speculate`（保存/重放 token，区分元组类型与老 C 的括号表达式）、`c6_tuple_get`（校验元素并规范化生成内部 tag `__c6_tuple_N`，布局在构造时按自然对齐算好，不走 `struct_layout`）、`c6_tuple_ctype` / `c6_tuple_of_type` / `c6_tuple_ctype`；`unary()` 的 `case '('` 处理元组强转/复合字面量/`sizeof`/`_Alignof`、`c6_tuple_subscript` 处理 `t[k]`（常量下标）；`decl()` 开头的 `c6_tuple_lead_kind` + `c6_tuple_destructure` 实现解构声明/赋值（`_` 占位符丢弃元素）；`c6_return_value` 支持 `return {…};`；`c6_apply_fallible` 放开 struct/union/元组作 `!error` 返回类型，失败路径用 `c6_zero_local` 清零；`c6_async_type_tokens` 把元组回放成 `(T1, T2)` 而不是内部 tag |
 
 `foreach` 的设计取舍（评审结论）：
 
@@ -529,6 +531,37 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   `:` 已经被吃掉，所以 `lo:hi` 没有歧义；
 - 隐藏槽复用切片运行期布局，因此 `foreach` 不带运行期辅助函数、不改变
   调用约定；`async` 体里照常可用（帧整体保存/恢复）。
+
+元组的设计取舍（评审结论）：
+
+- **不加关键字**：类型写成 `(T1, T2)`，和现有括号语法共用前缀。解析器在
+  `parse_btype()` 的 `case '('` 处做一次**投机 + 回滚**（`c6_tuple_speculate`：
+  `begin_macro` 重放 token，`type_decl(TYPE_ABSTRACT|TYPE_DIRECT)` 走一遍，
+  成功且右括号前没有名字才算元组），失败就原样退回普通括号。因此
+  `(void)printf(…)`、`(int)x`、`(struct S){…}`、`({…})`、`(a, b)` 全部零变化；
+- **不上新 ABI**：元组就是 `VT_STRUCT` + 内部 tag `__c6_tuple_N`，参数和返回值
+  都走已有的 struct 路径（`gfunc_sret` / `classify_x86_64_arg`），`libtcc1.c`
+  一个新符号都没加。`tests/abi/tuple.c` + `tests/abi/tuple_plain.c` 用元组和
+  等价 struct 分别编译两个 TU，链接后互相调用；
+- **布局不受 `#pragma pack` 影响**：`off = (off + align - 1) & -align` 在类型
+  构造时一次算完并缓存，永不读 `pack_stack_ptr`。这样同一个元组在任何 TU、
+  任何 pragma 状态下都是同一个 ABI（切片 `T[:]` 用的是同一条思路）；
+- **类型回放写 `(T1, T2)` 而不是 tag 名**：`async`/`go` 的跳板要把形参类型在
+  另一个合成 token 流里重新声明一遍。回放 tag 名会在当前作用域造出一个
+  `sym_scope = 1` 的新 struct（和元组不兼容）；回放 `(T1, T2)` 则命中
+  `c6_tuple_get` 的规范化缓存，拿回同一个类型；
+- **`!error` 允许聚合返回值**：失败与否只看错误槽（`__tcc_err_flag_peek`），
+  返回值只承载成功路径的值，而 C15 又强制它必须被 `try`/`catch` 消费——失败
+  路径上那个值永远不可观测，所以 struct/union/元组直接清零即可，原来那条
+  “必须能用 `-1` 表示哨兵”的限制只是实现偷懒。`float`/`double` 仍然不行
+  （既不是标量哨兵也不是聚合），报 C58；
+- **`_` 占位符沿用 `foreach` 的约定**：`_` 在解构模式里不建符号、不生成加载，
+  别处仍是普通标识符（`int _ = 5;`、`(int, int) _ = f();` 照常）。全是 `_`
+  报 C60——那等于把整个值丢掉，应该直接写 `f();`；
+- **解构只做语句形式**：`(int q, int r) = f();` / `(q, r) = f();`，不做
+  `:=` 类型推断、不做嵌套解构、不做 `t = {1, 2}` 这类字面量糖（要构造临时值
+  就写 `(int, int){1, 2}`）。实现上把元组溢到隐藏局部 `__c6_tuple_tmpN`，
+  再按普通赋值逐元素展开，所以目标可以是任意左值（变量、数组元素、成员）。
 
 测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：c6 的
 测试一律用 c6 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
@@ -552,6 +585,12 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/errors/typename.c` | 裸 tag 的退回路径：被函数/局部变量/POSIX `stat` 遮蔽、tag 未声明、tag 当值用、tag 出作用域、局部 tag 的切片、不完整类型 |
 | `tests/foreach.c` | 数组/切片/区间三种可迭代对象、值绑定是副本、可迭代值只求值一次、`_` 丢弃、`break`/`continue`/`defer`/嵌套、绑定不泄漏、`size_t` 下标可写、`await` 跨挂起 |
 | `tests/errors/foreach.c` | `foreach` 的全部编译期诊断（绑定数量、指针/整数/结构体/VLA/不完整数组、元素是数组、文件作用域、缺花括号） |
+| `tests/tuple.c` | 元组的值语义、`t[k]`、`sizeof`/`_Alignof`、解构声明/赋值（变量、数组元素、成员）、`_` 占位符、元组当参数/成员/数组元素、嵌套与混合元素、复合字面量、跨 TU（`tests/tu/tuple.c`） |
+| `tests/tuple_error.c` | 元组/struct 作 `!error` 返回类型：成功路径、失败路径、错误槽卫生、连续 `catch` |
+| `tests/tuple_async.c` | 元组的 `async` 返回、`await` + 解构、`_` 丢弃、嵌套 `await` |
+| `tests/tuple_thread.c` | 元组穿过 `go`（按值拷贝）、线程里的元组调用 |
+| `tests/errors/tuple.c` | 元组的全部编译期诊断（元素类型、下标、解构形态、`return {…}`） |
+| `tests/abi/tuple.c` + `tests/abi/tuple_plain.c` | 元组与等价 struct 的 ABI 互通（两个 TU 分别用 `-std=c6` 和纯 C 编译后链接） |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
 | `tests/errors/*.c` | 编译期诊断，见下 |
 
@@ -560,6 +599,11 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 `tests/errors/*.c` 的每个 `// EXPECT <片段>: <诊断>` 注释跑一次
 `-D<片段>`，要求 stderr 含该诊断，并要求不带 `-D` 时该文件能编译运行通过。
 诊断测试因此不需要维护行号。
+
+`tests/abi/*.c` 是 ABI 回归：非 `*_plain.c` 的那个用 `-std=c6` 编译，
+同名 `_plain.c` 用纯 C（不带 `-std=c6`）编译，两个 `.o` 链接后运行，
+比对 `// EXIT <n>` 声明的退出码。这样“元组的 ABI 等于等价 struct”不是
+注释里的承诺，而是每次 `make selftest` 都验一遍的事实。
 
 `make test` / `make test-plain` 仍旧跑上游 `tests/tests2` 全量（134 项），
 两种构建下都全过——c6 不再往 tests2 里加用例。
@@ -576,7 +620,24 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - `error` 只能作为返回值：形参表里的 `error` / `error*` / `error[]` 一律
   报错（`c6_check_error_param`），错误通道只有返回值 + 错误槽，
   不引入隐藏参数，也不改变调用约定；
-- `!error` 的函数返回类型必须能表示哨兵 `-1`，因此结构体返回类型不能标注；
+- `!error` 的函数返回类型可以是标量、枚举、指针、struct、union、元组：标量在
+  失败路径上返回哨兵 `-1`，聚合类型在失败路径上被清零（`c6_zero_local`）。
+  因为 C15 强制返回值必须被 `try`/`catch` 消费，失败路径上的值不可观测，所以
+  清零不丢信息。`float`/`double`/`long double` 仍不能标注（没有哨兵，也不是
+  聚合）；
+- 元组按自然对齐布局，`#pragma pack` 对它**无效**：这是有意的，跨 TU 的 ABI
+  必须与 pragma 状态无关（和切片 `T[:]` 同一条规则）；
+- 元组元素类型必须在**文件作用域**可见（内部 tag 注册在全局作用域），函数里
+  定义的 struct 不能当元素；元素之间可能有 padding，所以不提供 `&t[0]` 式的
+  连续访问，也不能把元组直接当 `T[:]` 的底层数组；
+- 解构只支持**语句**形式，元素个数必须与元组一致；不做嵌套解构、`:=` 类型
+  推断、`t = {1, 2}` 字面量糖、运行期下标 `t[i]`；`_` 只在解构模式里有特殊
+  含义；
+- `await` 一个失败的 `async` 子任务时，子任务的错误槽在恢复父任务帧时会被
+  覆盖，父任务无法用 `catch` 观察子任务的错误：子任务要自己就地处理
+  （`catch`），这是无栈协程“错误槽随帧保存/恢复”的已知限制；
+- `async` 任务的帧上限 4096 字节、任务槽上限 1024 字节：元组返回值也占
+  `val` 区，元素多的元组会更快撞到上限（撞到是运行时陷阱，不是语法错误）；
 - 结构体方法必须在调用点之前声明或定义（单趟编译约束）；只支持 `->`，
   `v.f()` 按普通成员访问处理，同名字段优先于方法；
 - 方法名共享 C 的全局命名空间：同一类型不能有两个同名方法，不同类型要用同名方法
