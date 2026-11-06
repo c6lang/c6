@@ -37,8 +37,8 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 # 2. 构建（打开扩展）
 make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DTCC_EXT
 
-# 3. 运行
-./tcc/tcc -std=tcc-ext -B. -run hello.c
+# 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
+./tcc/tcc -B tcc -std=tcc-ext -run hello.c
 ```
 
 如果网络需要代理，按环境要求导出即可（`git` 会读取）：
@@ -63,6 +63,10 @@ SUPERC_TCC_URL=/path/to/tinycc ./scripts/bootstrap.sh
 ### defer / errdefer / err
 
 ```c
+int __tcc_err_id_get(void);
+const char *__tcc_err_msg_get(void);
+void __tcc_err_clear(void);
+
 int load(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -84,8 +88,8 @@ int main(void)
 {
     int rc = load("data.bin");
     if (rc == -1) {                        /* 哨兵 -1 表示错误 */
-        printf("error %d: %s\n", __tcc_err_get_id(), __tcc_err_get_msg());
-        errclear();
+        printf("error %d: %s\n", __tcc_err_id_get(), __tcc_err_msg_get());
+        __tcc_err_clear();          /* 处理完错误，清空错误槽 */
     }
     return 0;
 }
@@ -103,8 +107,8 @@ test "add works" {
 ```
 
 ```sh
-./tcc/tcc -std=tcc-ext -B. -test tests.c               # 运行全部 test 块
-./tcc/tcc -std=tcc-ext -B. -test -test-filter=add tests.c
+./tcc/tcc -B tcc -std=tcc-ext -test tests.c               # 运行全部 test 块
+./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=add tests.c
 ```
 
 运行器输出 `PASS:` / `FAIL:` 行与 `N test(s), M failure(s)`，全部通过时退出码为 0。

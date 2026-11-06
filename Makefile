@@ -21,8 +21,12 @@ MODE     := $(TCC_DIR)/.superc-mode
 
 all: build
 
-bootstrap: check-tcc
-	@test -d $(TCC_DIR)/.git || ./scripts/bootstrap.sh
+bootstrap:
+	@if [ -d $(TCC_DIR)/.git ]; then \
+	    echo "superc: $(TCC_DIR)/ 已存在，跳过（需要重建请先 make distclean）"; \
+	else \
+	    ./scripts/bootstrap.sh; \
+	fi
 
 check-tcc:
 	@test -d $(TCC_DIR)/.git || { echo "缺少 $(TCC_DIR)/，先执行 'make bootstrap'"; exit 1; }
