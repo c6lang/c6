@@ -149,7 +149,8 @@ function-definition    = declaration-specifiers ,
     void   take(error a[]);         (* 不合法 *)
 ```
 
-函数体内的 `error e;` 局部变量是允许的（`catch` 的处理变量就是这种形式）。
+函数体内的 `error` 局部变量是允许的（`catch` 的处理变量就是这种形式），
+但它同样是变量定义，必须带初始化器：`error e = {0};`（约束 C19）。
 
 `!error` 同样适用于函数指针的声明符：
 
@@ -159,6 +160,37 @@ function-definition    = declaration-specifiers ,
 ```
 
 前置声明带 `!error` 时，后续不带后缀的定义会被自动标记（同一符号）。
+
+### 3.1 变量定义必须初始化
+
+约束 C19 要求**每个变量定义都带初始化器**：
+
+```
+    int g = 0;                      (* 文件作用域的定义也要写 *)
+    static int counter = 0;
+
+    void f(void)
+    {
+        int i = 0;
+        int a[3] = {1, 2, 3};
+        struct S s = {0};
+        static int calls = 0;
+        extern int declared_elsewhere;   (* 合法：声明，不是定义 *)
+        int vla[n];                      (* 合法：VLA 是唯一豁免 *)
+    }
+```
+
+规则在**定义点**检查，不做数据流分析（`int x; x = 1;` 一样报错）。
+下列构造不是“变量定义”，因此不受约束：`extern` 声明、函数形参（含 K&R
+形参声明表）、结构体/联合体成员、`typedef`、函数声明与定义。
+VLA 是唯一例外——标准 C 不允许给变长数组写初始化器，所以只能豁免。
+
+诊断里使用源码中书写的标识符：`package` 内的变量报原名，而不是
+`NAME__x`。
+
+这条约束只作用于开启了 `-std=tcc-ext` 的翻译单元：不带该开关的老代码
+完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
+函数体）都要满足。K&R 老式定义的形参声明表属于形参，不受约束。
 
 ---
 
@@ -261,8 +293,8 @@ parameter-list         = identifier , { "," , identifier } ;
 
 ```
     #macro swap(a, b) {
-        __local t;
-        t = (a); (a) = (b); (b) = t;
+        typeof(a) __local t = (a);
+        (a) = (b); (b) = t;
     }
 ```
 
@@ -292,6 +324,7 @@ parameter-list         = identifier , { "," , identifier } ;
 | C16 | `err` 必须带 `id` 与 `msg` 两个实参（没有重抛形式） | `'err' requires an error id and a message` |
 | C17 | `err` 只能出现在返回 `T!error` 的函数里 | `'err' requires the enclosing function to return 'T!error'` |
 | C18 | `error` 只能作为返回值，不能作为形参（含 `error*` / `error[]`，K&R 形参声明也算） | `'error' can only be a return type, not a parameter` |
+| C19 | 每个变量定义都必须带初始化器（`extern` 声明、形参、成员、`typedef` 除外；VLA 豁免） | `variable 'x' must be initialized` |
 
 ---
 
@@ -432,7 +465,7 @@ int use(int n)
 | `try { … } catch { … }` 块形式 | 语法错误（`try` 只接一次调用） |
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |
 | `catch` 处理块自然落到末尾 | 约束 C6 |
-| `int v; try v;` | 约束 C1/C2 |
+| `int v = 0; try v;` | 约束 C1/C2 |
 | `struct S!error f(void)` | 约束 C9（结构体无法用 `-1` 表示哨兵） |
 | `int!error x;` | 约束 C8 |
 | `try` / `catch` / `err` 写在 `defer` 体内 | 约束 C11 |
@@ -440,6 +473,7 @@ int use(int n)
 | `void f(error e);` / `void f(error *e);` | 约束 C18：错误只从返回值出来 |
 | `f() catch e;`（无处理块） | 语法错误 |
 | `catch e { … }` 单独出现 | 约束 C7 |
+| `int x;` / `static int x;` / `int a[3];`（不带初始化器的定义） | 约束 C19，VLA 除外 |
 
 ---
 
@@ -456,6 +490,7 @@ int use(int n)
 | `try` | `superc_try_parse`（`unary()` 的前缀分支） | `tcc/tccgen.c` |
 | `catch` | `superc_catch_parse`（`expr_catch()` 层，位于 `expr_cond()` 之下） | `tcc/tccgen.c` |
 | `#macro` / `__local` | `parse_superc_macro` / `superc_hygiene_body` | `tcc/tccpp.c` |
+| 变量初始化 | `superc_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
 
 关键字表：`tcc/tcctok.h` 末尾的 `TOK_SUPERC_*` 追加项。改动词法器时
 注意它们必须留在文件的**最后**，否则会破坏 i386 内联汇编的

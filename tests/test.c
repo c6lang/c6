@@ -20,8 +20,8 @@ void __tcc_err_clear(void);
 void __tcc_err_set(int id, const char *msg);
 
 /* ---- 清理顺序记录 ---- */
-static char logbuf[128];
-static int loglen;
+static char logbuf[128] = {0};
+static int loglen = 0;
 
 static void lg_reset(void)
 {
@@ -115,7 +115,7 @@ static int!error *ptr_fail(int bad)
 /* 循环中 err：展开整个函数帧（循环里注册的 defer 也会执行） */
 static void!error loop_fail(void)
 {
-    int i;
+    int i = 0;
     for (i = 0; i < 3; i++) {
         defer lg("d");
         if (i == 1)
