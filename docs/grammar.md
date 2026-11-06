@@ -48,6 +48,9 @@ superc-keyword =
 error-type-name = "error" ;
 ```
 
+切片类型 `T[:]` 不引入关键字：它由已有的 `[`、`:`、`]` 三个记号组成，
+只在「声明说明符之后」这个 C 里本来非法的位置被识别（见 3.3）。
+
 `try`、`catch`、`err`、`defer`、`errdefer`、`package`、`import`、
 `interface` 只会作为关键字出现在下列产生式允许的位置；在其余
 位置（例如声明说明符中）它们仍可被当作标识符使用，这一点与 C 关键字
@@ -209,6 +212,48 @@ VLA 是唯一例外——标准 C 不允许给变长数组写初始化器，所�
 方法**不是**新的函数类型：符号名和调用约定都不变，`vec_sum(p)` 与
 `p->vec_sum()` 等价。约束见 C20。
 
+### 3.3 切片类型 `T[:]`
+
+```
+slice-type-suffix      = "[" , ":" , "]" ;
+```
+
+`slice-type-suffix` 紧跟在**基础类型或 typedef 名之后**，是类型的一部分：
+
+```
+    int[:] s;                       (* 切片的元素是 int *)
+    int[:] *p;                      (* 指向切片的指针 *)
+    int[:] a[3];                    (* 3 个切片的数组 *)
+    typedef int[:] Ints;            (* 类型别名 *)
+    void f(int[:] s);               (* 形参 *)
+    int[:] g(void);                 (* 返回值 *)
+    struct W { int[:] s; };         (* 成员 *)
+    sizeof(int[:])                  (* 2 * sizeof(void *) *)
+    (int[:]){ p, n }                (* 复合字面量：指针 + 长度 *)
+    int[:][:] nest;                 (* 元素本身是切片 *)
+```
+
+C 里 `[` 紧跟类型说明符是语法错误（数组声明符在名字之后），所以
+`T[:]` 不占用任何既有写法：`int a[3]`、`int a[] = {…}`、`void f(int[])`、
+`typedef int T[]` 全部保持原义。`[]` 中间必须**恰好**是 `:`，写成
+`int[3] x;` 依旧是原来的语法错误。
+
+切片值表示为两个机器字：
+
+```
+    struct {
+        T *const data;              (* 第一个元素，偏移 0 *)
+        const size_t len;           (* 元素个数，偏移 PTR_SIZE *)
+    }
+```
+
+布局固定（不受 `#pragma pack` 影响），因此跨翻译单元只要两边都写
+`T[:]` 就能按值传递/返回，不需要额外的头文件声明。
+
+语义（重写规则见第 8 节）：数组在运行期上下文里隐式转成切片；`s[i]`
+先检查 `i < len`；`s[lo:hi]` 先检查 `lo <= hi <= len`。越界是运行时
+陷阱，不做静态诊断。约束见 C22–C28。
+
 ---
 
 ## 4. 语句
@@ -259,7 +304,20 @@ postfix-expression     = …
                          "(" , [ argument-expression-list ] , ")"
                          (* 方法调用：接收者须为指向结构体/联合体的指针，
                             且该类型有同名方法、没有同名字段；见 C20/R8 *)
+                       | postfix-expression , subscript
+                       | postfix-expression , slice-range
                        | postfix-expression , catch-clause ;
+
+subscript              = "[" , expression , "]" ;
+                         (* 基类型是切片时带边界检查并读取 .len；其它类型
+                            保持 ISO C 的指针下标语义，见 R10 *)
+
+slice-range            = "[" , [ expression ] , ":" , [ expression ] , "]" ;
+                         (* 基类型是切片或定长数组；缺省 lo = 0、
+                            缺省 hi = 切片/数组的长度，见 C25/R11 *)
+
+                         (* 只有切片的 subscript 带边界检查：越界在运行时
+                            陷阱。三个 ':' 的容量形式不支持，见 C26 *)
 
 try-expression         = "try" , try-operand ;
 
@@ -354,6 +412,13 @@ parameter-list         = identifier , { "," , identifier } ;
 | C19 | 每个变量定义都必须带初始化器（`extern` 声明、形参、成员、`typedef` 除外；VLA 豁免） | `variable 'x' must be initialized` |
 | C20 | 方法调用要求：接收者是指向结构体/联合体的指针、该类型有同名方法、没有同名字段、方法在调用点之前已声明，且方法后面必须紧跟 `(` | `method 'f' must be called`；`duplicate method 'f' for 'T'`；其它情况按普通成员访问报 `field not found: f` |
 | C21 | 结构体到接口的转换要求接口的每个方法都在**转换点之前**可见且签名兼容 | `'T' does not implement interface 'I': missing method 'm'`；`method 'm' of 'I' has an incompatible return type` / `… parameter` / `… wrong number of parameters` |
+| C22 | `[:]` 的元素必须是完整对象类型（不能是 `void`、函数、不完整类型或 VLA），且不能是 `error` | `'[:]' cannot have a 'void' element type`；`'[:]' requires a complete element type, not 'T'`；`'[:]' cannot have a function element type`；`'[:]' cannot have a variable length array element`；`'error' can only be a return type, not a slice element` |
+| C23 | 切片的 struct/union/enum 元素必须在文件作用域声明（函数内的局部 tag 会随块退出释放） | `the element type of '[:]' must be declared at file scope, but 'T' is local` |
+| C24 | 数组到切片的隐式转换只接受**定长**数组，且元素类型必须一致 | `cannot make a slice of 'E' from an array of 'E2'`；`cannot slice a variable length array`；`cannot slice an array of unknown length` |
+| C25 | 只做区间 `[lo:hi]` 的对象必须是切片或定长数组；指针不行 | `cannot slice a pointer; use '(T[:]){p, n}'` |
+| C26 | 区间没有容量形式（第三个 `:`） | `slice bounds have no capacity` |
+| C27 | 静态初始化器（文件作用域或 `static` 局部）没有运行时代码，数组不能隐式转切片 | `a slice cannot be initialized from an array in a static initializer; use '{ data, len }'` |
+| C28 | 切片的元素限定符按忽略处理（`const int[:]` 与 `int[:]` 是同一类型） | — |
 
 ---
 
@@ -462,6 +527,52 @@ vtable 对象在**翻译单元末尾**按用到的 (类型, 接口) 对生成，
 
 ---
 
+**R10 — 切片下标 `s[i]`**
+
+```
+s[i]                             (* s 的类型是 E[:] *)
+=>
+    size_t tmp = (size_t)i;      (* 负数变成很大的无符号数 *)
+    if (tmp >= s.len) trap();    (* 运行时陷阱，见 R13 *)
+    *(E *)(s.data + tmp * sizeof(E))
+```
+
+基类型不是切片时，`x[i]` 保持 ISO C 语义（`*(x + i)`），不带检查。
+
+**R11 — 区间 `s[lo:hi]`**
+
+```
+s[lo:hi]                         (* s 是 E[:] 或 E[N] *)
+=>
+    E[:] out;
+    if (lo > hi || hi > len) trap();
+    out.data = base + lo * sizeof(E);
+    out.len  = hi - lo;
+    out
+```
+
+`lo` 缺省为 `0`，`hi` 缺省为当前的 `len`（数组取 `N`）。数组基类型的
+`base` 是 `&a[0]`；指针不允许出现在 `[lo:hi]` 的左边（C25）。
+
+**R12 — 数组到切片的隐式转换**
+
+```
+E[:] s = arr;                    (* arr 的类型是 E[N] *)
+=>
+    s.data = &arr[0];
+    s.len  = N;
+```
+
+转换发生在赋值、初始化、函数实参、`return` 与显式强转这些**运行期**
+上下文；静态初始化器（文件作用域或 `static` 局部）没有运行时代码，故不支持（C27），
+用 `{ arr, N }` 逐字段初始化即可。显式强转 `(E[:])arr` 等价。
+
+**R13 — 越界**
+
+越界（`i >= len`、`lo > hi`、`hi > len`）调用运行时陷阱
+`__tcc_slice_*`，它执行一次故意的空指针写。libtcc1 是 freestanding 的
+（没有 libc），因此不产生诊断文本，与 `catch` 落空时一致。
+
 ## 9. 示例
 
 ```c
@@ -557,6 +668,45 @@ int main(void)
 
 ---
 
+切片配合数组、函数与结构体：
+
+```c
+typedef int Row[3];
+struct Pair { int a, b; };          /* 切片元素的结构体要在文件作用域 */
+
+static int sum(int[:] s)
+{
+    int i = 0, total = 0;
+    for (i = 0; i < (int)s.len; i++)
+        total += s[i];
+    return total;
+}
+
+int main(void)
+{
+    int a[5] = {1, 2, 3, 4, 5};
+    int[:] s = a;                   /* 数组 -> 切片 */
+    int[:] mid = s[1:4];            /* 区间，mid.len == 3 */
+    int[:] rest = mid[1:];          /* 对切片再切片 */
+    char[:] text = "hi";            /* 字符串字面量：len 含结尾 NUL */
+
+    int grid[2][3] = {{1, 2, 3}, {4, 5, 6}};
+    Row[:] rows = grid;             /* 元素是数组：先 typedef */
+
+    struct Pair pairs[2] = {{1, 2}, {3, 4}};
+    struct Pair[:] ps = pairs;      /* 元素可以是结构体 */
+    ps[1].a = 30;
+
+    int[:] view = (int[:]){ a + 2, 2 };   /* 指针 + 长度 */
+
+    return sum(s) == 15 && mid[0] == 2 && rest.len == 2 &&
+           text.len == 3 && rows[1][2] == 6 && ps[1].a == 30 &&
+           view[0] == 3 ? 0 : 1;
+}
+```
+
+跨翻译单元：两边各自写 `int[:]`，布局固定，直接按值传递/返回即可。
+
 ## 10. 未支持的写法
 
 以下写法**不是**本规范的一部分，编译器会报错：
@@ -582,6 +732,14 @@ int main(void)
 | 方法在使用点之后才声明 | 约束 C20/C21（TCC 单趟编译） |
 | 文件作用域 `Shape s = circle;` | 结构体到接口的转换没有运行时代码可生成 |
 | `Shape s = circle;` 而 `circle` 的方法声明在转换点之后 | 约束 C21 |
+| `int[]` 当切片用 | 不是切片语法，仍是 C 的数组声明符（`int a[] = {…}`、`void f(int[])`） |
+| `p[1:2]`（指针上的区间） | 约束 C25，请写 `(T[:]){p, n}` 再取区间 |
+| `s[0:2:4]`（容量形式） | 约束 C26：切片没有 cap |
+| `int[3] a;` | 数组声明符仍然只能写在名字上（C 本身如此），元素类型先用 `typedef` |
+| 函数内局部 `struct` 作为切片元素 | 约束 C23 |
+| `int[:] g = arr;` / `static int[:] g = arr;` | 约束 C27，写 `{ arr, N }` |
+| VLA / 不完整数组转切片 | 约束 C24 |
+| `append` / `cap` / 动态扩容 / 深拷贝 | 不属于切片语义（视图，不拥有元素） |
 
 ---
 
@@ -602,6 +760,10 @@ int main(void)
 | `catch` | `superc_catch_parse`（`expr_catch()` 层，位于 `expr_cond()` 之下） | `tcc/tccgen.c` |
 | `#macro` / `__local` | `parse_superc_macro` / `superc_hygiene_body` | `tcc/tccpp.c` |
 | 变量初始化 | `superc_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
+| `T[:]` 类型 | `parse_btype()` 的 `case '['`、`superc_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
+| 切片下标 / 区间 | `superc_slice_subscript`（`unary()` 的 `[` 分支）、`superc_slice_spill` | `tcc/tccgen.c` |
+| 数组 → 切片 | `superc_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
+| 切片运行期 | `__tcc_slice_index` / `__tcc_slice_sub` | `tcc/lib/libtcc1.c` |
 
 关键字表：`tcc/tcctok.h` 末尾的 `TOK_SUPERC_*` 追加项。改动词法器时
 注意它们必须留在文件的**最后**，否则会破坏 i386 内联汇编的
