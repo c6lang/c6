@@ -1,0 +1,1109 @@
+From 261f9fc7ff7c77ddc0e95513e0b9d64edf9ba5f2 Mon Sep 17 00:00:00 2001
+From: c6 <c6@localhost>
+Date: Sat, 7 Nov 2026 06:19:57 +0800
+Subject: [PATCH] c6: tuples '(T1, T2, ...)' for returning several values
+
+A tuple is a fixed-layout value type written as a parenthesized type
+list:
+
+    (int, int) divmod(int a, int b) { return {a / b, a % b}; }
+    (int q, int r) = divmod(17, 5);     -- destructuring declaration
+    (a, b) = divmod(100, 7);            -- destructuring assignment
+    (int high, _) = divmod(100, 7);     -- '_' discards the element
+    (int, int) t = {1, 2};  t[0]        -- constant index access
+
+No new keyword: parse_btype() speculates on '(' by replaying the already
+recorded group as a token stream (c6_tuple_speculate: begin_macro() +
+next() + parse_btype()/type_decl(), nothing diagnosed) and rolls back
+when it is not a type list, so '(void)printf(...)', '(int)x', '(T)(x)',
+'(struct S){...}', '({...})' and the comma expression '(a, b)' keep
+their old meaning.  A tuple is a VT_STRUCT with one internal tag per
+element-type list, so argument passing, return values, sizeof, struct
+members, array elements, typedefs and '!error' all reuse existing paths
+-- not a single new symbol in libtcc1.c.  The equivalent struct is the
+same ABI (tests/abi/tuple.c + tests/abi/tuple_plain.c compile the two
+spellings in two translation units and call each other).
+
+The layout is computed when the type is built ('off = (off + align - 1)
+& -align' over the elements, the tag gets the max alignment) and never
+reads pack_stack_ptr, so '#pragma pack' cannot make two translation
+units disagree about the ABI -- the same rule slices follow.
+
+The internal tag is named ('__c6_tuple_N') and the signature serializer
+spells a tuple back as '(T1, T2)' instead of the tag name: async/go
+trampolines replay a signature into a synthetic token stream, and
+replaying the tag would declare a fresh struct with sym_scope = 1 that
+is not compatible with the tuple.
+
+Destructuring is statement-only.  c6_tuple_lead_kind() replays the group
+and classifies it as expression / type / pattern / assignment, then
+c6_tuple_destructure() spills the value into a hidden local and emits
+one ordinary assignment per element, so targets may be any lvalue
+(variable, array element, '->'/'.' member).  '_' creates no symbol and
+generates no load; it stays an ordinary identifier everywhere else
+('int _ = 5;' and '(int, int) _ = f();' still work), and a pattern that
+discards every element is rejected.
+
+'!error' now accepts struct, union and tuple return types: failure is
+decided by the error slot only, and C15 forces every 'T!error' value to
+be consumed by 'try'/'catch', so the failure-path value is never
+observable and is simply zeroed (memset) instead of being forced to
+represent a '-1' sentinel.  float/double still cannot be annotated.
+
+'n' consecutive '_' placeholders reuse the foreach convention (no
+symbol, no store), which is why the two features agree on what a bare
+'_' means.
+---
+ tccgen.c | 865 +++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 834 insertions(+), 31 deletions(-)
+
+diff --git a/tccgen.c b/tccgen.c
+index cce627c..40d41a8 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -204,6 +204,57 @@ static C6Slice *c6_slice_of_type(CType *type)
+             return sl;
+     return NULL;
+ }
++/* '(T1, T2, ...)' tuples: one internal struct per element-type list, with a
++   fixed natural layout (offsets are computed when the type is built, so
++   '#pragma pack' cannot change it).  The layout is the ABI shared by the
++   whole translation unit and by other translation units, so it must not
++   depend on where the type happens to be written.  The tag is *named*
++   ('__c6_tuple_N'): the async/go signature serializer spells types back into
++   source tokens, so a named tag makes a tuple reusable there with no special
++   case at all.  Tuples live as long as the unit, hence the global stack. */
++typedef struct C6Tuple {
++    int n;                /* element count (>= 2) */
++    CType *elem;          /* element types, top level qualifiers dropped */
++    int *off;             /* element offsets in the internal struct */
++    Sym *tag;             /* the internal struct tag */
++    struct C6Tuple *next;
++} C6Tuple;
++static C6Tuple *c6_tuples;
++/* set when a tuple type specifier consumed the ')' of its own group, so the
++   cast path in unary() knows not to expect a second one */
++static int c6_tuple_ate_paren;
++static int c6_tuple_seq;
++static int c6_tuple_tmp_seq;
++static C6Tuple *c6_tuple_of_type(CType *type);
++static CType c6_tuple_ctype(C6Tuple *tp);
++static C6Tuple *c6_tuple_get(CType *elems, int n);
++static int c6_tuple_btype(CType *type);
++static int c6_tuple_subscript(void);
++static int c6_tuple_lead_kind(void);
++
++/* the tuple whose tag is TYPE's tag, or NULL */
++static C6Tuple *c6_tuple_of_type(CType *type)
++{
++    C6Tuple *tp;
++    if (!tcc_state->c6_ext)
++        return NULL;
++    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
++        return NULL;
++    for (tp = c6_tuples; tp; tp = tp->next)
++        if (tp->tag == type->ref)
++            return tp;
++    return NULL;
++}
++
++/* the value type of tuple TP */
++static CType c6_tuple_ctype(C6Tuple *tp)
++{
++    CType t;
++    t.t = VT_STRUCT;
++    t.ref = tp->tag;
++    return t;
++}
++
+ /* non-zero while vtop holds the result of a call to a 'T!error' function */
+ static int c6_value_fallible;
+ /* symbol of the function being compiled (needed by 'try' to check that the
+@@ -263,6 +314,7 @@ static void c6_async_params_copy(void);
+ static void c6_async_func_end(void);
+ static void c6_await_parse(void);
+ static void c6_async_return(void);
++static void c6_return_value(CType *type);
+ static void c6_async_await_io(Sym *s);
+ static void c6_co_parse(void);
+ static void c6_go_parse(void);
+@@ -2978,6 +3030,23 @@ static void type_to_str(char *buf, int buf_size,
+                 break;
+             }
+         }
++        /* a tuple prints as '(T1, T2)', not as its internal struct tag */
++        {
++            C6Tuple *tp = c6_tuple_of_type(type);
++            if (tp) {
++                char ebuf[256];
++                int i;
++                pstrcat(buf, buf_size, "(");
++                for (i = 0; i < tp->n; i++) {
++                    if (i)
++                        pstrcat(buf, buf_size, ", ");
++                    type_to_str(ebuf, sizeof ebuf, &tp->elem[i], NULL);
++                    pstrcat(buf, buf_size, ebuf);
++                }
++                pstrcat(buf, buf_size, ")");
++                break;
++            }
++        }
+ #endif
+         tstr = "struct ";
+         if (IS_UNION(t))
+@@ -5016,12 +5085,124 @@ static void parse_btype_qualify(CType *type, int qualifiers)
+     type->t |= qualifiers;
+ }
+ 
++#ifdef C6_EXT
++/* Try to read the recorded group TS as '( type-name {, type-name} )'.  TS is
++   replayed as a token stream, so no token of the real input is consumed: the
++   replay ends with TOK_EOF, which keeps 'next()' inside the replay instead of
++   popping back to the file.  Nothing is diagnosed here, a type name that does
++   not fit simply means "not a tuple". */
++static int c6_tuple_speculate(TokenString *ts, CType **pelems, int *pn)
++{
++    CType *elems = NULL, t;
++    AttributeDef ad;
++    int n = 0, max = 0, name, ok = 1, closed = 0;
++    int save_tok = tok;
++    CValue save_val = tokc;
++
++    begin_macro(ts, 1);
++    next();                             /* the '(' of the group */
++    next();                             /* the first element type */
++    for (;;) {
++        memset(&ad, 0, sizeof ad);
++        if (tok == TOK_EOF || !parse_btype(&t, &ad, 0)
++            || (t.t & VT_STORAGE)) {
++            ok = 0;
++            break;
++        }
++        type_decl(&t, &ad, &name, TYPE_ABSTRACT);
++        if (name) {                     /* '(int x, ...)' is a pattern */
++            ok = 0;
++            break;
++        }
++        if (n == max) {
++            max = max ? 2 * max : 4;
++            elems = tcc_realloc(elems, max * sizeof *elems);
++        }
++        elems[n++] = t;
++        if (tok == ',') {
++            next();
++            continue;
++        }
++        closed = tok == ')';
++        break;
++    }
++    end_macro();                        /* back to the real input */
++    tok = save_tok;
++    tokc = save_val;
++    if (ok && closed && n >= 2) {
++        next();                         /* skip the real ')' */
++        *pelems = elems;
++        *pn = n;
++        return 1;
++    }
++    tcc_free(elems);
++    return 0;
++}
++
++/* '( type-name , type-name ... )' in a type position is a tuple type.  The
++   whole parenthesised group is scanned first and only a group holding a top
++   level ',' is tried, so an ordinary cast such as '(void)printf(..)' or
++   '(int)x' never reaches the speculative parser.  A '{' rules the group out:
++   that is a struct or enum body, and defining it twice would be wrong.  When
++   the group is not a tuple its tokens are pushed back, so the caller sees the
++   very same '(' again and parses a parenthesised declarator or an expression
++   exactly as before.  Returns 1 and fills TYPE on success. */
++static int c6_tuple_btype(CType *type)
++{
++    TokenString *back = tok_str_alloc();
++    TokenString *replay = tok_str_alloc();
++    CType *elems = NULL, tup;
++    int n = 0, depth = 0, comma = 0, broken = 0, ok = 0;
++
++    c6_tuple_ate_paren = 0;
++
++    for (;;) {
++        tok_str_add_tok(back);
++        tok_str_add_tok(replay);
++        if (tok == '(' || tok == '[') {
++            depth++;
++        } else if (tok == ']') {
++            if (depth > 1)
++                depth--;
++        } else if (tok == ')') {
++            if (--depth == 0)
++                break;
++        } else if (tok == '{' || tok == '}') {
++            broken = 1;
++        } else if (tok == ',' && depth == 1) {
++            comma = 1;
++        } else if (tok == TOK_EOF) {
++            broken = 1;
++            break;
++        }
++        next();
++    }
++    tok_str_add(back, 0);               /* pops back to the real input */
++    tok_str_add(replay, TOK_EOF);       /* never pops */
++    if (!broken && comma && tok == ')')
++        ok = c6_tuple_speculate(replay, &elems, &n);
++    else
++        tok_str_free(replay);
++    if (ok) {
++        tok_str_free(back);
++        tup = c6_tuple_ctype(c6_tuple_get(elems, n));
++        tcc_free(elems);
++        *type = tup;
++        c6_tuple_ate_paren = 1;
++        return 1;
++    }
++    /* not a tuple: hand the group back to the caller */
++    begin_macro(back, 1);
++    next();                             /* tok is '(' again */
++    return 0;
++}
++#endif
++
+ /* return 0 if no type declaration. otherwise, return the basic type
+    and skip it. 
+  */
+ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
+-{
+-    int t, u, bt, st, type_found, typespec_found, g, n;
++{    int t, u, bt, st, type_found, typespec_found, g, n;
+     Sym *s;
+     CType type1;
+ 
+@@ -5131,6 +5312,26 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
+             struct_decl(&type1, VT_UNION);
+             goto basic_type2;
+ 
++        case '(':
++#ifdef C6_EXT
++            /* '(T1, T2)' - a tuple type.  'c6_tuple_btype' claims the whole
++               parenthesised group only when it really parses as two or more
++               type names, and hands it back otherwise, so an ordinary cast
++               or a parenthesised declarator keeps its meaning. */
++            if (tcc_state->c6_ext && !typespec_found) {
++                CType tup;
++                if (c6_tuple_btype(&tup)) {
++                    /* keep what was written before the tuple: storage
++                       classes ('typedef (int,int) DM;') and qualifiers */
++                    t = tup.t | (t & (VT_STORAGE | VT_QUAL));
++                    type->ref = tup.ref;
++                    typespec_found = 1;
++                    break;
++                }
++            }
++#endif
++            goto the_end;
++
+         case '[':
+ #ifdef C6_EXT
+             /* 'T[:]' - a slice type.  A '[' directly after a type specifier
+@@ -6084,11 +6285,53 @@ ST_FUNC void unary(void)
+     case TOK_SOTYPE:
+     case '(':
+         t = tok;
++#ifdef C6_EXT
++        /* '(T1, T2)' in expression position: a cast type or the type of a
++           compound literal (the declaration forms are handled in decl()) */
++        if (c6_ext_on()) {
++            CType tup;
++            if (c6_tuple_btype(&tup)) {
++                if (t == TOK_SOTYPE) {      /* from sizeof/alignof (...) */
++                    if (tok == ')')
++                        skip(')');
++                    vpush(&tup);
++                    return;
++                }
++                if (tok == '{') {           /* '(int,int){q, r}' */
++                    if (global_expr)
++                        r = VT_CONST;
++                    else
++                        r = VT_LOCAL;
++                    if (!(tup.t & VT_ARRAY))
++                        r |= VT_LVAL;
++                    memset(&ad, 0, sizeof(AttributeDef));
++                    decl_initializer_alloc(&tup, &ad, r, 1, 0, 0);
++                } else {                    /* '(int,int)value' */
++                    unary();
++                    gen_cast(&tup);
++                }
++                break;
++            }
++        }
++#endif
+         next();
++#ifdef C6_EXT
++        c6_tuple_ate_paren = 0;
++#endif
+         /* cast ? */
+         if (parse_btype(&type, &ad, 0)) {
++            int wrap = 0;
+             type_decl(&type, &ad, &n, TYPE_ABSTRACT);
+-            skip(')');
++#ifdef C6_EXT
++            /* a tuple type specifier consumes the ')' of its own group.  When
++               the operand follows directly ('((int,int)x)'), this '()' wraps
++               the whole cast and its ')' comes last. */
++            if (c6_tuple_ate_paren && tok != ')')
++                wrap = 1;
++            c6_tuple_ate_paren = 0;
++#endif
++            if (!wrap)
++                skip(')');
+             /* check ISOC99 compound literal */
+             if (tok == '{') {
+                     /* data is allocated locally by default */
+@@ -6101,19 +6344,26 @@ ST_FUNC void unary(void)
+                     r |= VT_LVAL;
+                 memset(&ad, 0, sizeof(AttributeDef));
+                 decl_initializer_alloc(&type, &ad, r, 1, 0, 0);
++                if (wrap)
++                    skip(')');
+             } else if (t == TOK_SOTYPE) { /* from sizeof/alignof (...) */
++                if (wrap)
++                    skip(')');
+                 vpush(&type);
+                 return;
+             } else {
+                 unary();
+ #ifdef C6_EXT
+                 /* '(int[:])a' and '(Shape)circle' convert explicitly */
+-                if (c6_slice_convert(&type))
+-                    break;
+-                if (c6_iface_convert(&type))
++                if (c6_slice_convert(&type) || c6_iface_convert(&type)) {
++                    if (wrap)
++                        skip(')');
+                     break;
++                }
+ #endif
+                 gen_cast(&type);
++                if (wrap)
++                    skip(')');
+             }
+         } else if (tok == '{') {
+ 	    int saved_nocode_wanted = nocode_wanted;
+@@ -6748,11 +6998,13 @@ special_math_val:
+             next();
+         } else if (tok == '[') {
+ #ifdef C6_EXT
+-            /* a slice subscript and a range are bounds checked and may
+-               produce a value, so they need their own parser; an array or
+-               pointer subscript with no ':' keeps the original code */
++            /* 't[0]' on a tuple, or a slice subscript and a range: those are
++               bounds checked and may produce a value, so they need their own
++               parser; an array or pointer subscript with no ':' keeps the
++               original code */
+             if (tcc_state->c6_ext) {
+-                c6_slice_subscript();
++                if (!c6_tuple_subscript())
++                    c6_slice_subscript();
+             } else
+ #endif
+             {
+@@ -6898,12 +7150,6 @@ special_math_val:
+             next();
+             vcheck_cmp(); /* the generators don't like VT_CMP on vtop */
+             gfunc_call(nb_args);
+-#ifdef C6_EXT
+-            /* remember whether this value is the result of a call to a
+-               function declared with the 'T!error' suffix ('try'/'catch'
+-               consume this flag) */
+-            c6_value_fallible = s->f.func_fallible;
+-#endif
+ 
+             if (ret_nregs < 0) {
+                 vsetc(&ret.type, ret.r, &ret.c);
+@@ -6966,6 +7212,14 @@ special_math_val:
+ #endif
+                 }
+             }
++#ifdef C6_EXT
++            /* remember whether this value is the result of a call to a
++               function declared with the 'T!error' suffix ('try'/'catch'
++               consume this flag).  Set only here, at the end of the call
++               handling: spilling a struct returned in registers stores
++               values internally and must not trip the check. */
++            c6_value_fallible = s->f.func_fallible;
++#endif
+             if (s->f.func_noreturn) {
+                 if (debug_modes)
+ 	            tcc_tcov_block_end(tcc_state, -1);
+@@ -8486,6 +8740,109 @@ static C6Slice *c6_slice_get(CType *elem)
+     return sl;
+ }
+ 
++/* Build (or find) the tuple type whose elements are ELEMS[0..N-1].  The
++   internal struct is laid out here with plain natural alignment (each
++   element aligned to its own alignment, the size rounded up to the largest)
++   instead of going through struct_layout(): '#pragma pack' must not change
++   the type, because this layout is the ABI shared with every other
++   translation unit. */
++static C6Tuple *c6_tuple_get(CType *elems, int n)
++{
++    C6Tuple *tp;
++    CType *el;
++    char buf[256], name[64];
++    int i, j, size, align, off, maxalign;
++
++    if (n < 2)
++        tcc_error("a tuple needs at least two elements");
++    el = tcc_mallocz(sizeof(CType) * n);
++    for (i = 0; i < n; i++) {
++        el[i] = elems[i];
++        el[i].t &= ~VT_STORAGE;
++        /* like a slice, the tuple owns writability: top level qualifiers of
++           an element cannot be honoured by a whole tuple copy, so they are
++           dropped */
++        el[i].t &= ~VT_QUAL;
++        if ((el[i].t & VT_BTYPE) == VT_VOID)
++            tcc_error("'tuple' element cannot be 'void'");
++        if ((el[i].t & VT_BTYPE) == VT_FUNC)
++            tcc_error("'tuple' element cannot be a function type");
++        if (el[i].t & VT_VLA)
++            tcc_error("'tuple' element cannot be a variable length array");
++        size = type_size(&el[i], &align);
++        if (size < 0) {
++            type_to_str(buf, sizeof buf, &el[i], NULL);
++            tcc_error("'tuple' requires a complete element type, not '%s'",
++                      buf);
++        }
++        if (c6_is_error_type(&el[i]))
++            tcc_error("'error' can only be a return type, not a tuple element");
++        if (!c6_tag_is_global(&el[i])) {
++            type_to_str(buf, sizeof buf, &el[i], NULL);
++            tcc_error("the element type of a tuple must be declared at file "
++                      "scope, but '%s' is local", buf);
++        }
++    }
++    for (tp = c6_tuples; tp; tp = tp->next) {
++        if (tp->n != n)
++            continue;
++        for (j = 0; j < n; j++)
++            if (!is_compatible_types(&tp->elem[j], &el[j]))
++                break;
++        if (j == n) {
++            tcc_free(el);
++            return tp;
++        }
++    }
++
++    tp = tcc_mallocz(sizeof *tp);
++    tp->n = n;
++    tp->elem = el;
++    tp->off = tcc_mallocz(sizeof(int) * n);
++    /* a fresh internal tag.  It is a *named* tag on purpose: the async/go
++       signature serializer spells a struct type back as 'struct NAME', so a
++       searchable name makes a tuple usable there with no special case. */
++    for (;;) {
++        snprintf(name, sizeof name, "__c6_tuple_%d", c6_tuple_seq++);
++        if (!struct_find(tok_alloc_const(name)))
++            break;
++    }
++    tp->tag = sym_push2(&global_stack, tok_alloc_const(name) | SYM_STRUCT, 0, 0);
++    tp->tag->type.t = VT_STRUCT;
++    tp->tag->type.ref = NULL;
++    {
++        Sym *scratch = NULL, *prev = NULL, *f;
++        off = 0;
++        maxalign = 1;
++        for (i = 0; i < n; i++) {
++            size = type_size(&tp->elem[i], &align);
++            off = (off + align - 1) & -align;
++            tp->off[i] = off;
++            if (align > maxalign)
++                maxalign = align;
++            snprintf(name, sizeof name, "__c6_t%d", i);
++            f = sym_push2(&scratch, tok_alloc_const(name) | SYM_FIELD, 0, 0);
++            f->type = tp->elem[i];
++            f->c = off;
++            f->r = 0;
++            f->next = NULL;
++            if (prev)
++                prev->next = f;
++            else
++                tp->tag->next = f;
++            prev = f;
++            off += size;
++        }
++        tp->tag->c = (off + maxalign - 1) & -maxalign;
++        tp->tag->r = maxalign;
++    }
++    sym_link(tp->tag, 1);           /* enter it in the tag namespace */
++    tp->tag->sym_scope = 0;         /* ... and keep it out of any block */
++    tp->next = c6_tuples;
++    c6_tuples = tp;
++    return tp;
++}
++
+ /* Spill the slice or complete array value on vtop into a local
+    '{ void *data; size_t len; }' pair and pop it.  Returns the offset of the
+    pair, so that the runtime helpers can read both words from it (this is
+@@ -8652,6 +9009,345 @@ static void c6_slice_subscript(void)
+     }
+ }
+ 
++/* 't[K]' on a tuple: K must be a constant index and the element is picked
++   statically, exactly like a struct member.  Returns 1 when the base was a
++   tuple and the subscript has been consumed, 0 to leave the expression to
++   the ordinary array/pointer subscript. */
++static int c6_tuple_subscript(void)
++{
++    C6Tuple *tp;
++    int idx, qualifiers;
++
++    if (!tcc_state->c6_ext || vtop < vstack)
++        return 0;
++    tp = c6_tuple_of_type(&vtop->type);
++    if (!tp)
++        return 0;
++    next();                             /* '[' */
++    c6_fallible_use();                  /* 'f()[0]' consumes f's result */
++    idx = expr_const();
++    if (idx < 0 || idx >= tp->n)
++        tcc_error("tuple index %d is out of range (0..%d)", idx, tp->n - 1);
++    skip(']');
++    qualifiers = vtop->type.t & VT_QUAL;
++    test_lvalue();
++    /* add the element offset to the address, then become the element */
++    gaddrof();
++    vtop->type = char_pointer_type;
++    vpushi(tp->off[idx]);
++    gen_op('+');
++    vtop->type = tp->elem[idx];
++    if (qualifiers)
++        parse_btype_qualify(&vtop->type, qualifiers);
++    /* an array is never an lvalue */
++    if (!(vtop->type.t & VT_ARRAY)) {
++        vtop->r |= VT_LVAL;
++#ifdef CONFIG_TCC_BCHECK
++        if (tcc_state->do_bounds_check)
++            vtop->r |= VT_MUSTBOUND;
++#endif
++    }
++    return 1;
++}
++
++/* ---------- tuple patterns: '(int q, int r) = f();', '(q, r) = f();' ---- */
++
++#define C6_TK_EXPR    0
++#define C6_TK_TYPE    1
++#define C6_TK_PATTERN 2
++#define C6_TK_ASSIGN  3
++
++/* Append the recorded token stream TS to OUT. */
++static void c6_tok_append(TokenString *out, TokenString *ts)
++{
++    int save_len = ts->len, save_tok = tok;
++    CValue save_val = tokc;
++
++    begin_macro(ts, 0);
++    for (;;) {
++        next();
++        if (tok == TOK_EOF)
++            break;
++        tok_str_add_tok(out);
++    }
++    end_macro();
++    ts->len = save_len;
++    tok = save_tok;
++    tokc = save_val;
++}
++
++/* Non-zero when the recorded element TS is exactly the '_' placeholder. */
++static int c6_tok_is_discard(TokenString *ts)
++{
++    int disc = 0, save_len = ts->len, save_tok = tok;
++    CValue save_val = tokc;
++
++    begin_macro(ts, 0);
++    next();
++    if (tok >= TOK_IDENT && !strcmp(get_tok_str(tok, NULL), "_")) {
++        next();
++        disc = tok == TOK_EOF;
++    }
++    end_macro();
++    ts->len = save_len;
++    tok = save_tok;
++    tokc = save_val;
++    return disc;
++}
++
++/* Record the tokens of one element of a tuple pattern, up to (but not
++   including) the ',' or ')' that ends it, and tell whether it is the '_'
++   placeholder.  In the declaration form the element is also parsed as
++   'type-name [declarator]' (the declarator may be absent or '_'), giving
++   *TYPE and *NAME; *NAME is 0 when the element is a bare '_'.  Returns 0
++   when the element does not fit. */
++static int c6_tuple_elem(TokenString *ts, CType *type, int *name, int decl)
++{
++    AttributeDef ad;
++    int depth = 0, ok = 1, save_len, save_tok;
++    CValue save_val;
++
++    *name = 0;
++    for (;;) {
++        if (tok == TOK_EOF)
++            return 0;
++        if (depth == 0 && (tok == ',' || tok == ')'))
++            break;
++        if (tok == '(' || tok == '[' || tok == '{')
++            depth++;
++        else if (tok == ')' || tok == ']' || tok == '}')
++            depth--;
++        tok_str_add_tok(ts);
++        next();
++    }
++    tok_str_add(ts, TOK_EOF);
++    if (!decl)
++        return 1;
++    save_len = ts->len, save_tok = tok, save_val = tokc;
++    begin_macro(ts, 0);
++    next();
++    memset(&ad, 0, sizeof ad);
++    ok = parse_btype(type, &ad, 0) && !(type->t & VT_STORAGE);
++    if (ok) {
++        /* both flags: take a name when there is one, but never diagnose a
++           missing one here (the replays must stay silent) */
++        type_decl(type, &ad, name, TYPE_ABSTRACT | TYPE_DIRECT);
++        ok = tok == TOK_EOF && *name;   /* a type and a name, all consumed */
++    }
++    end_macro();
++    ts->len = save_len;
++    tok = save_tok;
++    tokc = save_val;
++    if (!ok && c6_tok_is_discard(ts))
++        ok = 1;                         /* a bare '_' is a pattern element */
++    return ok;
++}
++
++/* Classify a statement that starts with '(' at block level.  Only the tokens
++   are looked at: whatever the answer, the stream is left exactly where it
++   was.  '(int,int) t = ..' is an ordinary declaration (C6_TK_TYPE),
++   '(int q, int r) = ..' a destructuring declaration, '(q, r) = ..' a
++   destructuring assignment, everything else is an expression. */
++static int c6_tuple_lead_kind(void)
++{
++    TokenString *back = tok_str_alloc();
++    TokenString *replay = tok_str_alloc();
++    CType t;
++    AttributeDef ad;
++    int depth = 0, comma = 0, broken = 0, after = 0, nall = 0, nnames = 0;
++    int ntypes = 0, nexpr = 0, name, kind;
++
++    for (;;) {
++        tok_str_add_tok(back);
++        tok_str_add_tok(replay);
++        if (tok == '(' || tok == '[') {
++            depth++;
++        } else if (tok == ']') {
++            if (depth > 1)
++                depth--;
++        } else if (tok == ')') {
++            if (--depth == 0)
++                break;
++        } else if (tok == '{' || tok == '}') {
++            broken = 1;
++        } else if (tok == ',' && depth == 1) {
++            comma = 1;
++        } else if (tok == TOK_EOF) {
++            broken = 1;
++            break;
++        }
++        next();
++    }
++    if (!broken) {
++        next();                         /* step over the recorded ')' */
++        after = tok;                    /* ... what follows the group */
++        tok_str_add_tok(back);
++        tok_str_add_tok(replay);
++    }
++    tok_str_add(back, 0);
++    tok_str_add(replay, TOK_EOF);
++    if (broken) {
++        tok_str_free(replay);
++        kind = C6_TK_EXPR;
++    } else {
++        begin_macro(replay, 1);
++        next();                         /* '(' */
++        next();
++        for (;;) {
++            int ek = 0;                 /* 0: not a type, 1: type, 2: type+name, 3: '_' */
++            memset(&ad, 0, sizeof ad);
++            if (tok >= TOK_IDENT && !strcmp(get_tok_str(tok, NULL), "_")) {
++                next();
++                if (tok == ',' || tok == ')')
++                    ek = 3;
++            }
++            if (!ek && parse_btype(&t, &ad, 0) && !(t.t & VT_STORAGE)) {
++                type_decl(&t, &ad, &name, TYPE_ABSTRACT | TYPE_DIRECT);
++                if (tok == ',' || tok == ')')
++                    ek = name ? 2 : 1;
++            }
++            nall++;
++            if (ek == 1 || ek == 2)
++                ntypes++;
++            if (ek >= 2)
++                nnames++;
++            if (!ek)
++                nexpr++;
++            if (tok == ',') {
++                next();
++                continue;
++            }
++            if (tok == ')')
++                break;
++            /* not a type: skip the rest of this element, it is an
++               expression (a destructuring assignment target) */
++            while (tok != TOK_EOF && tok != ',' && tok != ')') {
++                if (tok == '(' || tok == '[' || tok == '{')
++                    depth++;
++                else if (tok == ')' || tok == ']' || tok == '}')
++                    depth--;
++                next();
++            }
++            if (tok == ',') {
++                next();
++                continue;
++            }
++            break;
++        }
++        end_macro();
++        if (nall >= 2 && nexpr == 0 && nnames == 0)
++            kind = C6_TK_TYPE;
++        else if (nall >= 2 && nexpr == 0 && ntypes > 0 && nnames == nall
++                 && after == '=')
++            kind = C6_TK_PATTERN;
++        else if (ntypes == 0 && after == '=' && comma)
++            kind = C6_TK_ASSIGN;
++        else
++            kind = C6_TK_EXPR;
++    }
++    /* hand the tokens back untouched: every caller parses them itself */
++    begin_macro(back, 1);
++    next();
++    return kind;
++}
++
++/* Rewrite '(int q, int _) = f();' into 'int q = tmp.__c6_t0;' and
++   '(q, r) = f();' into 'q = tmp.__c6_t0;' / 'r = tmp.__c6_t1;' statements,
++   after checking that the value is a tuple of the very same arity and
++   spilling it into a hidden temporary.  DECL_FORM selects the declarations
++   of a pattern from the lvalues of a destructuring assignment. */
++static void c6_tuple_destructure(int decl_form)
++{
++    TokenString *out = tok_str_alloc();
++    TokenString **elems = NULL;
++    int *names = NULL, *disc = NULL;
++    CType *etypes = NULL, tt;
++    int n = 0, max = 0, i, ndisc = 0, ttok, off, size, align;
++    char buf[128];
++    C6Tuple *tp;
++
++    next();                             /* '(' */
++    for (;;) {
++        TokenString *ts = tok_str_alloc();
++        CType et;
++        int name = 0, d;
++        memset(&et, 0, sizeof et);
++        if (!c6_tuple_elem(ts, &et, &name, decl_form))
++            tcc_error("a tuple pattern element must be a type and a name");
++        d = c6_tok_is_discard(ts)
++            || (name && !strcmp(get_tok_str(name, NULL), "_"));
++        if (n == max) {
++            max = max ? 2 * max : 4;
++            elems = tcc_realloc(elems, max * sizeof *elems);
++            names = tcc_realloc(names, max * sizeof *names);
++            disc = tcc_realloc(disc, max * sizeof *disc);
++            etypes = tcc_realloc(etypes, max * sizeof *etypes);
++        }
++        elems[n] = ts, names[n] = name, disc[n] = d, etypes[n] = et;
++        n++;
++        if (tok == ',') {
++            next();
++            continue;
++        }
++        break;
++    }
++    skip(')');
++    skip('=');
++    expr_eq();
++    tp = c6_tuple_of_type(&vtop->type);
++    if (!tp)
++        tcc_error("destructuring requires a tuple value");
++    c6_fallible_use();
++    if (tp->n != n)
++        tcc_error("the tuple has %d elements but the pattern has %d",
++                  tp->n, n);
++    for (i = 0; i < n; i++)
++        ndisc += disc[i];
++    if (ndisc == n)
++        tcc_error("'tuple' discards every element");
++    tt = vtop->type;
++    /* hold the value in a hidden temporary; the element statements below
++       read it back field by field */
++    size = type_size(&tt, &align);
++    if (size < 0)
++        tcc_error("destructuring requires a complete tuple type");
++    loc = (loc - size) & -align;
++    off = loc;
++    vset(&tt, VT_LOCAL | VT_LVAL, off);
++    vswap();
++    vstore();
++    vpop();
++    for (;;) {
++        snprintf(buf, sizeof buf, "__c6_tuple_tmp%d", c6_tuple_tmp_seq++);
++        ttok = tok_alloc_const(buf);
++        if (!sym_find(ttok))
++            break;
++    }
++    sym_push(ttok, &tt, VT_LOCAL | VT_LVAL, off);
++    skip(';');
++    for (i = 0; i < n; i++) {
++        if (disc[i])
++            continue;
++        c6_tok_append(out, elems[i]);
++        tok_str_add(out, '=');
++        tok_str_add(out, ttok);
++        tok_str_add(out, '.');
++        snprintf(buf, sizeof buf, "__c6_t%d", i);
++        tok_str_add(out, tok_alloc_const(buf));
++        tok_str_add(out, ';');
++    }
++    /* the token that follows the ';' is already read: it must travel with
++       the pushed back statements */
++    tok_str_add_tok(out);
++    tok_str_add(out, 0);
++    for (i = 0; i < n; i++)
++        tok_str_free(elems[i]);
++    tcc_free(elems), tcc_free(names), tcc_free(disc), tcc_free(etypes);
++    /* let the ordinary declaration / assignment code do the rest */
++    begin_macro(out, 1);
++    next();
++}
++
+ /* Implicit conversion of a complete array to a slice value, e.g.
+    'int[:] s = a;', 'f(a)' or 'return a;'.  Returns 0 when no conversion
+    applies. */
+@@ -8770,6 +9466,17 @@ static void c6_tu_reset(void)
+         tcc_free(sl);
+     }
+     c6_slices = NULL;
++    /* same for the tuple descriptors */
++    while (c6_tuples) {
++        C6Tuple *tp = c6_tuples;
++        c6_tuples = tp->next;
++        tcc_free(tp->elem);
++        tcc_free(tp->off);
++        tcc_free(tp);
++    }
++    c6_tuples = NULL;
++    c6_tuple_seq = 0;
++    c6_tuple_tmp_seq = 0;
+ }
+ 
+ /* Implicit conversion of a struct value to an interface value, e.g.
+@@ -8969,6 +9676,21 @@ static void c6_errdefer_parse(void)
+ /* Emit the error-path exit of the current function: build the sentinel
+    value of the declared return type, run this frame's errdefer/defer in
+    reverse order and return the sentinel.  Used by 'err()' and by 'try'. */
++/* 'memset(local + OFF, 0, SIZE)'.  An aggregate 'T!error' value cannot be
++   '-1', and it does not need to be: the error is reported through the error
++   slot, so the value itself is never observed. */
++static void c6_zero_local(int off, int size)
++{
++    vpush_helper_func(TOK_memset);
++    vseti(VT_LOCAL, off);
++    vpushi(0);
++    vpushs(size);
++#if defined TCC_TARGET_ARM && defined TCC_ARM_EABI
++    vswap();  /* using __aeabi_memset(void*, size_t, int) */
++#endif
++    gfunc_call(3);
++}
++
+ static void c6_emit_propagate(void)
+ {
+     int b, ret_off = 0, ret_saved = 0;
+@@ -8987,15 +9709,19 @@ static void c6_emit_propagate(void)
+         if (size < 0)
+             tcc_error("cannot propagate an error from a function with "
+                       "an incomplete return type");
+-        vpushi(TCC_ERR_SENTINEL);
+-        vtop->type = func_vt;   /* '(TYPE)-1', no conversion warning */
+         loc = (loc - size) & -align;
+         ret_off = loc;
+         ret_saved = 1;
+-        vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
+-        vswap();
+-        vstore();
+-        vpop();
++        if ((func_vt.t & VT_BTYPE) == VT_STRUCT) {
++            c6_zero_local(ret_off, size);
++        } else {
++            vpushi(TCC_ERR_SENTINEL);
++            vtop->type = func_vt;   /* '(TYPE)-1', no conversion warning */
++            vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
++            vswap();
++            vstore();
++            vpop();
++        }
+     }
+     if (defer_state.has_sites)
+         c6_defer_begin(2, 0);
+@@ -9575,7 +10301,12 @@ again:
+ #endif
+         b = (func_vt.t & VT_BTYPE) != VT_VOID;
+         if (tok != ';') {
+-            gexpr();
++#ifdef C6_EXT
++            if (tcc_state->c6_ext)
++                c6_return_value(&func_vt);  /* also 'return {a, b};' */
++            else
++#endif
++                gexpr();
+ #ifdef C6_EXT
+             c6_fallible_use();  /* 'return f();' would drop the error */
+ #endif
+@@ -11212,6 +11943,24 @@ static int c6_async_type_tokens(TokenString *ts, CType *type)
+         return 1;
+     case VT_STRUCT:
+     case VT_UNION:
++        {
++            /* a tuple is written as '(T1, T2)': its tag is an implementation
++               detail, and replaying the tag name would declare a fresh struct
++               tag instead of finding the tuple */
++            C6Tuple *tp = c6_tuple_of_type(type);
++            if (tp) {
++                int i;
++                tok_str_add(ts, '(');
++                for (i = 0; i < tp->n; i++) {
++                    if (i)
++                        tok_str_add(ts, ',');
++                    if (!c6_async_type_tokens(ts, &tp->elem[i]))
++                        return 0;
++                }
++                tok_str_add(ts, ')');
++                return 1;
++            }
++        }
+         if (!type->ref)
+             return 0;
+         tok_str_add(ts, (t & VT_UNION) == VT_UNION ? TOK_UNION : TOK_STRUCT);
+@@ -11397,6 +12146,24 @@ static void c6_async_suspend(int kind)
+ }
+ 
+ /* 'return [expr];' inside an async body */
++/* Parse the value of a 'return' of type TYPE.  Besides an ordinary
++   expression, a braced initializer list is accepted for an aggregate:
++   'return {a, b};' initializes a temporary and returns that. */
++static void c6_return_value(CType *type)
++{
++    AttributeDef ad;
++
++    if (tok != '{') {
++        gexpr();
++        return;
++    }
++    if ((type->t & VT_BTYPE) != VT_STRUCT)
++        tcc_error("'return {…}' requires a struct, union or tuple "
++                  "return type");
++    memset(&ad, 0, sizeof ad);
++    decl_initializer_alloc(type, &ad, VT_LOCAL | VT_LVAL, 1, 0, 0);
++}
++
+ static void c6_async_return(void)
+ {
+     CType vt = c6_async_ftype.ref->type;
+@@ -11410,7 +12177,7 @@ static void c6_async_return(void)
+             vpop();
+         } else {
+             c6_async_push_field(c6_async_name, "val", 0);
+-            gexpr();
++            c6_return_value(&vt);
+             c6_fallible_use();
+             gen_assign_cast(&vt);
+             vstore();
+@@ -11430,11 +12197,24 @@ static void c6_async_propagate(void)
+     CType vt = c6_async_ftype.ref->type;
+ 
+     if ((vt.t & VT_BTYPE) != VT_VOID) {
+-        c6_async_push_field(c6_async_name, "val", 0);
+-        vpushi(TCC_ERR_SENTINEL);
+-        vtop->type = vt;            /* '(TYPE)-1', no conversion warning */
+-        vstore();
+-        vpop();
++        if ((vt.t & VT_BTYPE) == VT_STRUCT) {
++            int align, size = type_size(&vt, &align), off;
++            int saved = c6_value_fallible;
++            c6_async_push_field(c6_async_name, "val", 0);
++            loc = (loc - size) & -align;
++            off = loc;
++            c6_zero_local(off, size);
++            vset(&vt, VT_LOCAL | VT_LVAL, off);
++            c6_value_fallible = saved;
++            vstore();
++            vpop();
++        } else {
++            c6_async_push_field(c6_async_name, "val", 0);
++            vpushi(TCC_ERR_SENTINEL);
++            vtop->type = vt;        /* '(TYPE)-1', no conversion warning */
++            vstore();
++            vpop();
++        }
+     }
+     if (defer_state.has_sites)
+         c6_defer_begin(2, 0);
+@@ -12605,10 +13385,18 @@ static void c6_apply_fallible(CType *type)
+     if ((ft->t & VT_BTYPE) != VT_FUNC || !ft->ref)
+         tcc_error("'!error' requires a function declarator");
+     bt = ft->ref->type.t & VT_BTYPE;
++    /* a scalar carries the '-1' sentinel, an aggregate is zeroed: what a
++       'T!error' function reports is the error slot, never the value, so the
++       error value of an aggregate is never observed.  Only types that cannot
++       be built at all are rejected. */
+     if (!(bt == VT_VOID || bt == VT_PTR || bt == VT_BOOL
+           || (bt >= VT_BYTE && bt <= VT_LLONG)
+-          || IS_ENUM(ft->ref->type.t)))
+-        tcc_error("'!error' requires a return type representable by -1");
++          || bt == VT_STRUCT
++          || IS_ENUM(ft->ref->type.t))) {
++        char ebuf[256];
++        type_to_str(ebuf, sizeof ebuf, &ft->ref->type, NULL);
++        tcc_error("'!error' does not support a '%s' return type", ebuf);
++    }
+     ft->ref->f.func_fallible = 1;
+ }
+ #endif
+@@ -12675,6 +13463,21 @@ static int decl(int l)
+                 tcc_error("'foreach' can only be used inside a function");
+             unget_tok(c6_name);
+         }
++#endif
++#ifdef C6_EXT
++        /* a block statement that starts with a parenthesised group may be
++           the destructuring of a tuple: '(int q, int r) = f();' declares,
++           '(q, r) = f();' assigns.  Anything else ('(void)f();', '(int)x;',
++           '(a, b);') falls through untouched. */
++        if (tcc_state->c6_ext && tok == '(' && l == VT_LOCAL) {
++            int c6_kind = c6_tuple_lead_kind();
++            if (c6_kind == C6_TK_PATTERN || c6_kind == C6_TK_ASSIGN) {
++                c6_tuple_destructure(c6_kind == C6_TK_PATTERN);
++                /* the rewritten element statements are declarations or
++                   assignments: let the ordinary code parse them */
++                continue;
++            }
++        }
+ #endif
+         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {
+             if (l == VT_JMP)
+-- 
+2.51.0
+
