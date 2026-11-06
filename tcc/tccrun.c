@@ -285,7 +285,13 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
     s1->run_main = "_runmain", top_sym = "main";
     if (s1->elf_entryname)
         s1->run_main = top_sym = s1->elf_entryname;
-    tcc_add_support(s1, "runmain.o");
+#ifdef C6_EXT
+    /* with '-test' the runner calls the test functions directly and a
+       user 'main' is optional; runmain.o references 'main', so pull it
+       in only when there is one */
+    if (!s1->c6_test_mode || (addr_t)-1 != get_sym_addr(s1, "main", 0, 1))
+#endif
+        tcc_add_support(s1, "runmain.o");
 
     if (tcc_relocate(s1) < 0)
         return -1;
