@@ -13,6 +13,10 @@
  *
  * 为了让示例离线可跑，传输层用 pipe() 代替 socket，服务端由本文件里的
  * respond() 扮演；换成 socket + connect() 时异步结构完全不变。
+ *
+ * 后半段演示 go / task 两个关键字：
+ *   task t = http_get(...);   句柄留在手上，作用域退出自动 destroy
+ *   go worker(...);           顶层任务，交给 __c6_co_run() 跑完
  */
 #include <stdio.h>
 #include <string.h>
@@ -106,14 +110,36 @@ static void respond(int wfd)
     close(wfd);
 }
 
+/* ---- go / task：两个协程互相唤醒 ---- */
+
+/* 等自己的 fd 就绪，然后往下一个 fd 写一个字节，把下一个协程叫醒。
+   next_wfd < 0 表示"我是最后一个"。 */
+async int stage(int rfd, int next_wfd, int id)
+{
+    char b[2] = {0};
+    int rev = 0;
+
+    printf("  stage%d: 等 fd %d\n", id, rfd);
+    rev = await c6_io(rfd, C6_CO_EV_READ);
+    if (rev > 0) {
+        read(rfd, b, 1);
+        printf("  stage%d: 醒了\n", id);
+    }
+    if (next_wfd >= 0) {
+        write(next_wfd, "x", 1);
+        printf("  stage%d: 写 fd %d，叫醒下一个\n", id, next_wfd);
+    }
+    return rev;
+}
+
 int main(void)
 {
     int up[2] = {0, 0};       /* 客户端 -> 服务端 */
     int down[2] = {0, 0};     /* 服务端 -> 客户端 */
+    int c1[2] = {0, 0};       /* go 演示用的两个管道 */
+    int c2[2] = {0, 0};
     char buf[256] = {0};
-    int status = 0;
     int rc = 0;
-    struct http_get_task *t = NULL;
 
     if (pipe(up) || pipe(down)) {
         printf("pipe() failed\n");
@@ -122,16 +148,32 @@ int main(void)
     respond(down[1]);         /* 服务端先准备好响应 */
     close(down[1]);
 
-    t = http_get(up[1], down[0],
-                 "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-                 buf, sizeof buf);
-    rc = __c6_co_wait(t);     /* 驱动协程直到完成 */
-    status = t->val;
-    __c6_co_destroy(t);
+    /* task：句柄留在手上，走到作用域末尾自动 __c6_co_destroy */
+    {
+        task t = http_get(up[1], down[0],
+                          "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                          buf, sizeof buf);
 
-    printf("wait rc=%d status=%d\n", rc, status);
-    printf("response:\n%s\n", buf);
+        rc = __c6_co_wait(t);     /* 驱动协程直到完成 */
+        printf("wait rc=%d status=%d\n", rc, t->val);
+        printf("response:\n%s\n", buf);
+    }
     close(up[1]);
     close(down[0]);
-    return rc == 0 && status == 200 ? 0 : 1;
+
+    /* go：先起一个会 park 在 c2 上的，再起一个把 c2 叫醒的 */
+    if (pipe(c1) || pipe(c2))
+        return 1;
+    write(c1[1], "x", 1);        /* 只让 c1 先就绪 */
+    printf("go stage2：c2 还没数据，它在 go 语句里 park 住\n");
+    go stage(c2[0], -1, 2);
+    printf("go stage1：c1 已就绪，但 await c6_io 也要等一轮 select\n");
+    go stage(c1[0], c2[1], 1);
+    printf("回到 main：两个 go 都返回了，两个任务都还 park 着\n");
+    printf("__c6_co_run：唤醒 stage1，它写 c2 再唤醒 stage2；errs=%d\n",
+           __c6_co_run());
+    close(c1[1]);
+    close(c2[1]);
+
+    return rc == 0 ? 0 : 1;
 }

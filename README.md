@@ -477,6 +477,9 @@ int main(void)
 | `t->val` / `t->pN` | 结果值 / 第 N 个实参（任务结构由声明推导） |
 | `__c6_co_wait(t)` | 驱动到完成；`0` = 正常结束，`-1` = 子任务以 `err` 结束 |
 | `__c6_co_destroy(t)` | 释放任务槽（含未完成的子任务） |
+| `go f(…)` | 顶层任务：建完立刻跑到第一个必须等待的点，然后返回 |
+| `task t = f(…)` | 建任务并拿句柄；作用域退出时自动 `__c6_co_destroy(t)` |
+| `__c6_co_run()` | 把 `go` 出去的任务都跑完；返回其中以 `err` 结束的个数 |
 
 规则：
 
@@ -491,10 +494,20 @@ int main(void)
   寄存器不会——不过调用点本来就会把活寄存器落到帧槽，所以
   `x + await f()` 也能用；
 - `await` 不能写进 `defer` / `errdefer` 体和 `sizeof` 里；
+- `go f(a);` 和 `task t = f(a);` 的操作数都必须是一次 `async` 调用：
+  `go` 建的是**顶层**任务（不归调用者、不做作用域回收，交给
+  `__c6_co_run()`），`task` 建的任务归作用域管；
+- `go` 是**同步起点**：任务在 `go` 语句处就开始跑，跑到第一个必须等待的
+  点才把控制权交回来。`await c6_io` 总要停一轮（即使 fd 已经就绪，唤醒是
+  下一轮 `select()` 的事）；`await` 子任务不算等待，所以不碰 fd 的
+  `go f();` 会在 `go` 语句里跑完并当场回收槽位。`f` 是普通函数时（未来的
+  有栈协程）同一套约定成立：只有显式让出原语才让出，没有让出点就和直接
+  调用完全一样；
 - `c6_io` 只有 `await c6_io(fd, ev)` 一种写法；`ev` 是
   `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
 - 运行时是单线程的固定池（64 个任务、每个 4 KiB 帧、每个 64 条 defer
-  记录），`__c6_co_wait` 用 `select()` 等 fd。libtcc1 不依赖 libc。
+  记录），`__c6_co_wait` 和 `__c6_co_run` 都用 `select()` 等 fd，
+  `__c6_co_run` 对顶层任务做轮转。libtcc1 不依赖 libc。
 
 完整可运行示例见 [examples/async_demo.c](examples/async_demo.c)
 （一次 HTTP 请求，传输层用 `pipe()` 代替 socket，离线可跑）：

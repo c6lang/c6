@@ -501,13 +501,15 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
 | 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task)` 编译，`c6_async_func_begin` 算帧基址并分发、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把帧/defer 记录/错误槽 park 出去；运行期 `libtcc1.c` 的 `__c6_co_new` / `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（固定池 + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
 
+| 13 `go` / `task` 关键字 | ✅ | `tcctok.h` 里新增 `TOK_C6_TASK` / `TOK_C6_GO`（关键字，不能再当标识符用）；`c6_go_stmt`（`decl()` 与 `block()` 两个入口——单条语句不走 `decl()`）+ `__tcc_co_spawn`；`c6_task_decl` / `c6_task_check_handle`（`struct NAME_task` 的 `head` 必须是 `struct __c6_task`）/ `c6_task_defer_destroy`（复用 `__tcc_defer_push` 注册作用域清理）；运行期 `libtcc1.c` 的顶层就绪链表（`snext`/`busy`/`waiting`）与 `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run`，`__c6_co_wait` 也改成先推进顶层任务；`async` 体里的 `err` 走 `c6_async_propagate`（`KIND_ERR`），并禁止 `async` 方法是方法；预置声明同步加 `__tcc_co_spawn` / `__c6_co_run` |
+
 测试全部放在仓库根的 `tests/` 下，不进入上游的 `tests/tests2/`：c6 的
 测试一律用 c6 自己的 `test` 块写（`tests/tests2` 里的 `.expect` 方案要
 比对 stdout，改一行输出就得重生成期望文件）。
 
 | 位置 | 内容 |
 |---|---|
-| `tests/async.c` | `async`/`await` 的返回值、挂起后局部变量、嵌套/循环里的 `await`、`defer` 跨挂起、`await c6_io`、任务槽回收 |
+| `tests/async.c` | `async`/`await` 的返回值、挂起后局部变量、嵌套/循环里的 `await`、`defer` 跨挂起、`await c6_io`、任务槽回收；`go`/`task` 的句柄、自动回收、首步执行、轮转交替、`go` 在 `async` 体里仍是顶层、`__c6_co_run` 的错误计数 |
 | `tests/defer.c` | defer 的时机、顺序、`break`/`continue`/`goto`/`return`、递归 |
 | `tests/err.c` | `err` / `errdefer` 与清理顺序、错误槽 |
 | `tests/try.c` | `try` / `catch`，含 `goto` 离开、嵌套传播、`void!error` |
@@ -595,5 +597,24 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   执行任务里还挂着的 `defer`；需要清理的协程请让它跑到完成；
 - `await` 不能出现在 `defer`/`errdefer` 体、`sizeof` 等不求值上下文，
   也不能在非 `async` 函数里用；`c6_io` 只有 `await c6_io(fd, ev)` 一
-  种写法。
+  种写法；
+- `go` / `task` 是**真正的关键字**：`int go;`、`int task;`、`go:` 标签都不
+  能再这么写。成员名不受影响（`s.go` 比较的是 token 值），但变量名、
+  参数名、函数名、标签名都会报错——这是破坏性变更，写进 §2 的保留字表；
+- `go` 是**同步起点**：任务在 `go` 语句处就开始跑，跑到第一个必须等待的
+  点才回到下一条语句。`await c6_io` 总要停一轮（唤醒是下一轮 `select()`
+  的事，即使 fd 已经就绪）；`await` 子任务不算等待，所以不碰 fd 的
+  `go f();` 会在 `go` 语句里跑完，并**当场回收**（没人拿得到句柄，也没人
+  观察得到）；只有 park 在 fd 上的任务才留给 `__c6_co_run()`；
+- `go`/`task` 的操作数必须是一次 `async` 调用。普通函数的 `go f();` 留
+  给未来的有栈协程：同一套首步约定下，只有显式让出原语（`c6_go_yield()`
+  / `c6_go_wait_fd()`）才会让出，没有让出点就等价于直接调用。现在报
+  `'go' on a non-async function needs stackful coroutines (not implemented
+  yet)`；
+- 调度是**协作式**的：没有抢占，不 hook libc，阻塞的 `read`/`printf` 不会
+  自动变成让出点；`__c6_co_run()` 对顶层任务做轮转，一次 `select()`
+  等所有 park 住的 fd；
+- 同时存活的协程上限是 64（含 `await` 出来的子任务），超了是运行时陷阱；
+  `go` 出去但已在 `go` 语句里跑完的任务会立刻回收，所以循环里 `go` 短
+  任务不会占满池子。
 
