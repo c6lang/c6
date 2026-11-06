@@ -54,6 +54,6 @@ bootstrap: 完成。下一步：
 
   make build        # 打开扩展构建（EXTRA-DEFS=-DTCC_EXT）
   make test         # 跑 tests2 全量测试
-  ./tcc/tcc -std=tcc-ext -B. -run hello.c
+  ./tcc/tcc -B tcc -std=tcc-ext -run hello.c   # 在仓库根目录运行
 
 EOF
