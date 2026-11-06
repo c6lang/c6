@@ -5578,6 +5578,10 @@ static void expr_type(CType *type, void (*expr_fn)(void))
     *type = vtop->type;
     vpop();
     nocode_wanted--;
+#ifdef C6_EXT
+    /* nothing is called in this context, so a 'T!error' mark is moot */
+    c6_value_fallible = 0;
+#endif
 }
 
 /* parse an expression of the form '(type)' or '(expr)' and return its
@@ -6461,6 +6465,16 @@ special_math_val:
             /* get return type */
             s = vtop->type.ref;
             next();
+#ifdef C6_EXT
+            if (s->f.func_fallible) {
+                /* a 'T!error' call starts from a clean slot: only the error
+                   raised by this very call may be observed afterwards, so a
+                   stale value can never trigger a spurious 'catch' */
+                save_regs(0);
+                vpush_helper_func(tok_alloc_const("__tcc_err_clear"));
+                gfunc_call(0);
+            }
+#endif
             sa = s->next; /* first parameter */
             nb_args = regsize = 0;
 #ifdef C6_EXT
@@ -8305,11 +8319,15 @@ static int c6_err_flag_jump(void)
    would drop the error silently, so it is rejected here. */
 static void c6_fallible_use(void)
 {
-    if (c6_value_fallible) {
-        c6_value_fallible = 0;
-        tcc_error("the result of a 'T!error' function must be used with "
-                  "'try' or 'catch'");
-    }
+    if (!c6_value_fallible)
+        return;
+    c6_value_fallible = 0;
+    /* 'sizeof(f())' / 'typeof(f())' never call f, so there is no error to
+       lose: just drop the mark instead of rejecting the expression */
+    if (NOEVAL_WANTED)
+        return;
+    tcc_error("the result of a 'T!error' function must be used with "
+              "'try' or 'catch'");
 }
 
 /* push a void value: the expression statement parser always pops one */
@@ -8355,12 +8373,8 @@ static void c6_try_parse(void)
         tcc_error("'try' requires the enclosing function to return 'T!error'");
     next();                             /* skip 'try' */
     c6_value_fallible = 0;
-    /* 'try' starts from a clean slot: only errors raised by the operand
-       itself can be propagated, and the slot is empty afterwards */
-    save_regs(0);
-    vpush_helper_func(tok_alloc_const("__tcc_err_clear"));
-    gfunc_call(0);
-    unary();                            /* the called function */
+    unary();                            /* the called function (clears the
+                                           slot itself before the call) */
     has_value = c6_save_operand("try", &sv);
     skip = c6_err_flag_jump();      /* taken when no error is pending */
     c6_emit_propagate();            /* failure path: clean up + return */
@@ -8395,9 +8409,14 @@ static void c6_catch_parse(void)
         if (tok == '(') {
             paren = 1;
             next();
-            if (tok != ')')
+            if (tok != ')') {
+                if (tok < TOK_UIDENT)
+                    expect("error variable");
                 name = tok;
+            }
         } else {
+            if (tok < TOK_UIDENT)
+                expect("'{'");
             name = tok;
         }
         if (name) {
@@ -8950,10 +8969,8 @@ again:
     expr:
                 if (flags & STMT_EXPR) {
                     vpop();
-                    gexpr();
-#ifdef C6_EXT
-                    c6_fallible_use();  /* 'f();' would drop the error */
-#endif
+                    gexpr();   /* the value belongs to the enclosing
+                                  expression, checked there */
                 } else {
                     gexpr();
 #ifdef C6_EXT
