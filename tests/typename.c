@@ -50,6 +50,14 @@ static int file(void) { return 5; }
 /* 标签与 tag 同名：语句开头的 'L:' 仍然是标签 */
 struct L { int v; };
 
+/* 接口的方法签名里也能省 struct */
+interface Adder { int add_to(Vec v); };
+struct Counter { int base; };
+static int add_to(struct Counter *self, Vec v)
+{
+    return self->base + v.x + v.y;
+}
+
 /* ---- 跨翻译单元（tests/tu/typename.c）---- */
 Vec tu_scale(Vec v, int k);
 
@@ -170,11 +178,37 @@ test "限定符与 typedef" {
     if (sizeof(const Vec) != sizeof(Vec))
         err(2, "const 裸 tag 的大小不对");
 
+    Vec const *cq = &v;                 /* 后缀 const：限定符写在 tag 之后 */
+    if (cq->y != 2)
+        err(5, "后缀 const 的裸 tag 指针不对");
+
     VecAlias a = { 9, 10 };
     if (a.x + a.y != 19)
         err(3, "typedef 裸 tag 不对");
     if (sizeof(VecAlias) != sizeof(struct Vec))
         err(4, "typedef 裸 tag 的 sizeof 不对");
+}
+
+test "typeof / _Generic / _Alignof 里的裸 tag" {
+    Vec v = { 4, 5 };
+    typeof(Vec) t = { 6, 7 };
+    if (v.x != 4)
+        err(1, "字面量初始化不对");
+    if (t.x != 6 || t.y != 7)
+        err(2, "typeof(Vec) 不对");
+    if (_Generic(t, Vec: 1, default: 0) != 1)
+        err(3, "_Generic 里的裸 tag 不对");
+    if (_Alignof(Vec) != _Alignof(struct Vec))
+        err(4, "_Alignof(Vec) 不对");
+}
+
+test "接口方法签名里的裸 tag" {
+    struct Counter c = { 10 };
+    Vec v = { 1, 2 };
+    Adder a = { 0 };
+    a = c;                              /* 结构体值 -> 接口值（赋值形式） */
+    if (a.add_to(v) != 13)
+        err(1, "接口方法签名里的裸 tag 不对");
 }
 
 test "遮蔽：同名函数优先，struct 形式照旧" {

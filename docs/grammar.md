@@ -477,7 +477,11 @@ tag 本身就是类型名，`struct` / `union` / `enum` 关键字可以省略（
   仍然报 `'S' undeclared`。
 * 语句开头遇 `:` 时仍按标签解析（`TAG:` 是标签，不是类型）。
 * `TAG` 只是 tag 时，语句开头的 `TAG(...)` 按声明解析（与 C 里 typedef 名
-  的规则一致）；被函数遮蔽时按调用解析。
+  的规则一致）；被函数遮蔽时按调用解析。同一条规则也意味着 K&R 定义里
+  「形参名恰好与文件作用域 tag 同名」会按原型解析：
+  `int f(S) int *S; { … }` 报 `';' expected`，写成 `struct S` 即可。
+* 块作用域的 `TAG;` 只是引用外层 tag，不会像 `struct TAG;` 那样声明一个
+  新的局部不完整 tag：本特性**不做任何隐式前置声明**。
 * 只在 `-std=c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
 
 ---
@@ -674,7 +678,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C38 | `go` 的操作数必须是**普通函数**的调用：不能是 `async` 函数（用 `co`）、不能是函数指针、参数类型必须能写进参数块（数组/VLA/函数指针形参不行） | `the operand of 'go' must be a call of a plain function`；`'go' requires a plain function: 'f' is 'async' (use 'co')`；`'go' does not support this signature: 'f'` |
 | C39 | `go` 不支持变参函数（参数块要按声明的形参布局） | `'go' does not support variadic functions: 'f'` |
 | C40 | `go` 不支持 `!error` 函数（错误没人接） | `'go' does not support fallible functions: 'f'` |
-| C41 | 裸 tag 只有在该 tag 可见、且同名**普通符号**（变量/函数/枚举常量/typedef）不在作用域内时才当作类型名；只接受已声明的 tag，不隐式前置声明；语句开头的 `TAG:` 仍是标签 | —（遮蔽/未声明时按普通 C 解析：`';' expected`、`'X' undeclared`、`initialization of incomplete type`） |
+| C41 | 裸 tag 只有在该 tag 可见、且同名**普通符号**（变量/函数/枚举常量/typedef）不在作用域内时才当作类型名；只接受已声明的 tag，不隐式前置声明；语句开头的 `TAG:` 仍是标签；K&R 定义里形参名与 tag 同名时按原型解析 | —（遮蔽/未声明时按普通 C 解析：`';' expected`、`'X' undeclared`、`initialization of incomplete type`） |
 
 ---
 

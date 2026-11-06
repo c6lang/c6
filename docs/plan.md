@@ -459,7 +459,7 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 | 结构体方法 | `p->f()`、方法调方法、sret、`T!error` 方法 | 不带调用、重复方法、只有 `->` | 跨 TU、与 `impl` 无关的普通函数调用 |
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
 | 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
-| 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、跨 TU |
+| 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、局部 tag 的切片、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、`typeof`/`_Generic`/`_Alignof`、接口方法签名、跨 TU |
 
 ### 9.2 工程要求
 
@@ -531,8 +531,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/method.c` | 结构体方法与 `T!error` 方法 |
 | `tests/interface.c` | 接口、vtable、隐式/显式转换、跨 TU |
 | `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
-| `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
-| `tests/errors/typename.c` | 裸 tag 的退回路径：被函数/局部变量/POSIX `stat` 遮蔽、tag 未声明、tag 当值用、tag 出作用域、不完整类型 |
+| `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`typeof`/`_Generic`/`_Alignof`、接口方法签名、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
+| `tests/errors/typename.c` | 裸 tag 的退回路径：被函数/局部变量/POSIX `stat` 遮蔽、tag 未声明、tag 当值用、tag 出作用域、局部 tag 的切片、不完整类型 |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
 | `tests/errors/*.c` | 编译期诊断，见下 |
 
@@ -652,4 +652,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - 语句开头的 `TAG(...)` 在 `TAG` 只是 tag 时按声明解析（与 C 里 typedef 名
   的规则一致），不再落到「隐式函数声明」；被函数遮蔽时不受影响。`TAG:`
   仍然是标签。
+- 同一条规则带来两个边角：K&R 定义里形参名恰好与文件作用域 tag 同名时
+  （`int f(S) int *S; { … }`），`TAG` 后跟标识符按原型解析而报
+  `';' expected`，写 `struct S` 即可；块作用域的 `TAG;` 只是引用外层 tag，
+  不会像 `struct TAG;` 那样声明一个新的局部不完整 tag。
 
