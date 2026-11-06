@@ -5,6 +5,8 @@
 #   make build-plain 以上游模式构建（不定义 TCC_EXT）
 #   make test        跑 tests2 全量测试（扩展模式）
 #   make test-plain  关闭扩展构建并跑同一套测试
+#   make selftest    跑根目录 test.c 里的 superc test 块
+#   make test-all    selftest + tests2 全量
 #   make clean       清理 tcc/ 的构建产物
 #   make distclean   连 tcc/ 工作树一起删除
 #
@@ -16,8 +18,8 @@ CFLAGS   ?= -g -O0 -Wall -Wno-unused-result
 EXT      := EXTRA-DEFS=-DTCC_EXT
 MODE     := $(TCC_DIR)/.superc-mode
 
-.PHONY: all bootstrap build build-plain test test-plain clean distclean help \
-        check-tcc mode-ext mode-plain
+.PHONY: all bootstrap build build-plain test test-plain test-all selftest \
+        clean distclean help check-tcc mode-ext mode-plain
 
 all: build
 
@@ -58,6 +60,12 @@ test: build
 test-plain: build-plain
 	$(MAKE) -C $(TCC_DIR)/tests/tests2 tests2.all
 
+# 根目录 test.c：用 superc 的 test 块自测 err / errdefer / defer
+selftest: build
+	./$(TCC_DIR)/tcc -B $(TCC_DIR) -std=tcc-ext -test test.c
+
+test-all: selftest test
+
 clean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true
 
@@ -65,4 +73,4 @@ distclean:
 	rm -rf $(TCC_DIR)
 
 help:
-	@sed -n '2,12p' Makefile
+	@sed -n '2,15p' Makefile

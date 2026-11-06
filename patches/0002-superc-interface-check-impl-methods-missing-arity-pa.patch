@@ -1,7 +1,7 @@
 From 97418cf24df18c1b0597317cb48068509d3795a1 Mon Sep 17 00:00:00 2001
 From: superc-agent <agent@localhost>
 Date: Fri, 6 Nov 2026 16:54:18 +0800
-Subject: [PATCH 2/2] superc interface: check impl methods (missing, arity,
+Subject: [PATCH 2/3] superc interface: check impl methods (missing, arity,
  parameter and return types)
 
 superc_check_impl() compares each 'impl' method against the generated

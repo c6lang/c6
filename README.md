@@ -22,7 +22,9 @@ superc 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不�
 ├── docs/plan.md      设计与实施方案（含实现状态）
 ├── patches/          superc 扩展补丁（相对上游固定基线）
 ├── scripts/          bootstrap.sh：生成并搭建 TCC 工作树
-├── Makefile          便捷入口（bootstrap / build / test / clean）
+├── test.c            根目录自测：用 superc 的 test 块覆盖 err/errdefer/defer
+├── examples/         可运行示例（目前是 err_demo.c）
+├── Makefile          便捷入口（bootstrap / build / test / selftest / clean）
 └── tcc/              TCC 源码树（由 bootstrap.sh 生成，不纳入本仓库）
 ```
 
@@ -191,9 +193,31 @@ int main(void)
 
 ## 测试
 
+根目录的 `test.c` 用 superc 的 `test` 块自测 `err` / `errdefer` / `defer` 的语义：
+
+```sh
+make selftest                            # 跑 test.c
+./tcc/tcc -B tcc -std=tcc-ext -test test.c
+./tcc/tcc -B tcc -std=tcc-ext -test -test-filter=errdefer test.c   # 按描述过滤
+```
+
+输出形如：
+
+```
+PASS: err 写入错误码与消息并返回 -1
+PASS: errdefer 只在错误路径执行
+...
+11 test(s), 0 failure(s)
+```
+
+`-test` 模式下 `main` 可有可无（运行器不调用它）。
+
+更完整的回归：
+
 ```sh
 make test          # 扩展模式：tests/tests2 全量（含 156..162 的 superc 专项测试）
 make test-plain    # 关闭 TCC_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
+make test-all      # selftest + tests2
 ```
 
 > 切换模式会先 `make clean` 重建，因为 `TCC_EXT` 是编译期开关。
