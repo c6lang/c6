@@ -1,0 +1,8 @@
+# tcc/ 是 bootstrap.sh 生成的上游工作树，不纳入本仓库
+/tcc/
+
+# 环境/工具产生的临时文件
+/.marker-test
+*.o
+*.a
+*.exe

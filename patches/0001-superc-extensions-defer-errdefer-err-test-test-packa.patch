@@ -1,0 +1,2649 @@
+From 3ed76c0d2c1011926e89eed607dd51f84c5831d0 Mon Sep 17 00:00:00 2001
+From: superc-agent <agent@localhost>
+Date: Fri, 6 Nov 2026 16:52:10 +0800
+Subject: [PATCH 1/2] superc extensions: defer, errdefer/err, test/-test,
+ package/import, interface/impl, #macro with __local hygiene
+
+All superc language extensions from docs/plan.md, gated behind TCC_EXT
+(build with EXTRA-DEFS=-DTCC_EXT, enable per-TU with -std=tcc-ext, which
+also defines __TCC_EXT__). Without the extension all new keywords are
+un-interned again, so a plain build behaves exactly like upstream tcc.
+
+- defer: runtime record stack plus a per-function dispatcher; scope,
+  loop, break/continue/goto and return unwinding in LIFO order, the
+  return value is spilled around the cleanups.
+- errdefer/err: error slot, in-place cleanups and the -1 sentinel;
+  'err();' re-raises an error handled one frame further down.
+- test/-test/-test-filter: file-scope test blocks become static
+  functions, the runner reports PASS/FAIL and the exit code.
+- package/import: symbols are mangled as NAME__sym, imports resolve
+  unqualified names, both single-TU and across translation units.
+- interface/impl: fat pointer {void *self; const VT *vt;} plus a
+  generated vtable object per impl; method calls are rewritten at the
+  call site and struct values convert implicitly or with a cast.
+- #macro/__local: hygienic macros; __local names are renamed with an
+  expansion counter before arguments are substituted.
+
+Tests: tests/tests2/156_superc_defer .. 161_superc_macro, enabled only
+when the compiler was built with -DTCC_EXT. Full tests2 suite passes
+with (140) and without (134) the extension.
+---
+ lib/libtcc1.c                            |  145 +++
+ libtcc.c                                 |   34 +-
+ tcc.h                                    |   47 +
+ tccgen.c                                 | 1095 +++++++++++++++++++++-
+ tccpp.c                                  |  223 ++++-
+ tccrun.c                                 |   56 +-
+ tcctok.h                                 |   12 +
+ tests/tests2/156_superc_defer.c          |  107 +++
+ tests/tests2/156_superc_defer.expect     |    6 +
+ tests/tests2/157_superc_err.c            |  123 +++
+ tests/tests2/157_superc_err.expect       |   14 +
+ tests/tests2/158_superc_test.c           |   61 ++
+ tests/tests2/158_superc_test.expect      |    6 +
+ tests/tests2/159_superc_package.c        |   36 +
+ tests/tests2/159_superc_package.expect   |    5 +
+ tests/tests2/160_superc_interface.c      |   88 ++
+ tests/tests2/160_superc_interface.expect |    6 +
+ tests/tests2/161_superc_macro.c          |   58 ++
+ tests/tests2/161_superc_macro.expect     |    8 +
+ tests/tests2/Makefile                    |   13 +
+ 20 files changed, 2134 insertions(+), 9 deletions(-)
+ create mode 100644 tests/tests2/156_superc_defer.c
+ create mode 100644 tests/tests2/156_superc_defer.expect
+ create mode 100644 tests/tests2/157_superc_err.c
+ create mode 100644 tests/tests2/157_superc_err.expect
+ create mode 100644 tests/tests2/158_superc_test.c
+ create mode 100644 tests/tests2/158_superc_test.expect
+ create mode 100644 tests/tests2/159_superc_package.c
+ create mode 100644 tests/tests2/159_superc_package.expect
+ create mode 100644 tests/tests2/160_superc_interface.c
+ create mode 100644 tests/tests2/160_superc_interface.expect
+ create mode 100644 tests/tests2/161_superc_macro.c
+ create mode 100644 tests/tests2/161_superc_macro.expect
+
+diff --git a/lib/libtcc1.c b/lib/libtcc1.c
+index 878f951..45211ec 100644
+--- a/lib/libtcc1.c
++++ b/lib/libtcc1.c
+@@ -621,3 +621,148 @@ long long __fixxfdi (long double a1)
+     return s ? ret : -ret;
+ }
+ #endif /* !ARM */
++
++/* ------------------------------------------------------------------------- */
++/* superc extension runtime: defer / errdefer / err                          */
++/*                                                                           */
++/* Deferred statements are recorded on a global (v1: single-threaded) stack.  */
++/* Each function stores the stack top at entry ("frame base") in a local slot */
++/* and passes it to every cleanup request, so a cleanup never touches records */
++/* that belong to the caller's frames.  Scope cleanups additionally filter by */
++/* lexical depth, which makes conditional registration and loops work.       */
++
++#define TCC_DEFER_MAX     8192
++#define TCC_DEFER_CTX_MAX 512
++
++#define TCC_DEFER_KIND_DEFER    0
++#define TCC_DEFER_KIND_ERRDEFER 1
++
++#define TCC_DEFER_MODE_SCOPE 0   /* run records of scopes deeper than depth */
++#define TCC_DEFER_MODE_FUNC  1   /* run all records of this function frame */
++#define TCC_DEFER_MODE_ERR   2   /* run only errdefer records, frame wide   */
++
++typedef struct TccDeferRec {
++    int id;      /* cleanup site id (> 0) */
++    int depth;   /* lexical scope depth at registration */
++    int kind;    /* TCC_DEFER_KIND_* */
++} TccDeferRec;
++
++typedef struct TccDeferCtx {
++    int mode;    /* TCC_DEFER_MODE_* */
++    int depth;   /* target scope depth (scope mode) */
++    int resume;  /* resume id (reported as -resume when finished) */
++    int base;    /* frame base: never pop records below this index */
++} TccDeferCtx;
++
++static TccDeferRec tcc_defer_stack[TCC_DEFER_MAX];
++static int tcc_defer_sp;
++static TccDeferCtx tcc_defer_ctx[TCC_DEFER_CTX_MAX];
++static int tcc_defer_csp;
++
++static int tcc_err_flag;
++static int tcc_err_id;
++static const char *tcc_err_msg;
++
++/* Called once at function entry: remember where the frame starts.  The
++   result is stored through OUT because helper functions are void-typed. */
++void __tcc_defer_func_enter(int *out)
++{
++    *out = tcc_defer_sp;
++}
++
++void __tcc_defer_push(int id, int depth, int kind)
++{
++    TccDeferRec *r;
++    if (tcc_defer_sp >= TCC_DEFER_MAX)
++        return;
++    r = &tcc_defer_stack[tcc_defer_sp++];
++    r->id = id;
++    r->depth = depth;
++    r->kind = kind;
++}
++
++void __tcc_defer_begin_scope(int depth, int resume, int base)
++{
++    TccDeferCtx *c;
++    if (tcc_defer_csp >= TCC_DEFER_CTX_MAX)
++        return;
++    c = &tcc_defer_ctx[tcc_defer_csp++];
++    c->mode = TCC_DEFER_MODE_SCOPE;
++    c->depth = depth;
++    c->resume = resume;
++    c->base = base;
++}
++
++void __tcc_defer_begin_func(int mode, int resume, int base)
++{
++    TccDeferCtx *c;
++    if (tcc_defer_csp >= TCC_DEFER_CTX_MAX)
++        return;
++    c = &tcc_defer_ctx[tcc_defer_csp++];
++    c->mode = mode;
++    c->depth = 0;
++    c->resume = resume;
++    c->base = base;
++}
++
++/* Store the next cleanup site id to run (> 0), or -resume when the current
++   cleanup request is finished, through OUT so generated code needs no
++   return-value handling. */
++void __tcc_defer_step(int *out)
++{
++    *out = -1;
++    while (tcc_defer_csp > 0) {
++        TccDeferCtx *c = &tcc_defer_ctx[tcc_defer_csp - 1];
++        while (tcc_defer_sp > c->base) {
++            TccDeferRec *r = &tcc_defer_stack[tcc_defer_sp - 1];
++            if (c->mode == TCC_DEFER_MODE_SCOPE && r->depth <= c->depth)
++                break;              /* belongs to an enclosing scope */
++            tcc_defer_sp--;
++            if (r->kind == TCC_DEFER_KIND_ERRDEFER
++                && c->mode != TCC_DEFER_MODE_ERR)
++                continue;           /* errdefer only runs on the error path */
++            *out = r->id;
++            return;
++        }
++        tcc_defer_csp--;
++        *out = -c->resume;
++        return;
++    }
++}
++
++void __tcc_err_set(int id, const char *msg)
++{
++    tcc_err_flag = 1;
++    tcc_err_id = id;
++    tcc_err_msg = msg;
++}
++
++int __tcc_err_flag_get(void)
++{
++    return tcc_err_flag;
++}
++
++int __tcc_err_id_get(void)
++{
++    return tcc_err_id;
++}
++
++const char *__tcc_err_msg_get(void)
++{
++    return tcc_err_msg;
++}
++
++void __tcc_iface_init(void *self, const void *vt, void *dst)
++{
++    void **d = (void **)dst;
++    d[0] = self;
++    d[1] = (void *)vt;
++}
++
++void __tcc_err_clear(void)
++{
++    tcc_err_flag = 0;
++    tcc_err_id = 0;
++    tcc_err_msg = 0;
++}
++
+diff --git a/libtcc.c b/libtcc.c
+index 44ea25f..e0866b9 100644
+--- a/libtcc.c
++++ b/libtcc.c
+@@ -1586,6 +1586,10 @@ enum {
+     TCC_OPTION_pthread,
+     TCC_OPTION_run,
+     TCC_OPTION_rstdin,
++#ifdef TCC_EXT
++    TCC_OPTION_test,
++    TCC_OPTION_test_filter,
++#endif
+     TCC_OPTION_w,
+     TCC_OPTION_E,
+     TCC_OPTION_M,
+@@ -1653,6 +1657,10 @@ static const TCCOption tcc_options[] = {
+     { "pthread", TCC_OPTION_pthread, 0},
+     { "run", TCC_OPTION_run, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
+     { "rstdin", TCC_OPTION_rstdin, TCC_OPTION_HAS_ARG },
++#ifdef TCC_EXT
++    { "test", TCC_OPTION_test, 0 },
++    { "test-filter", TCC_OPTION_test_filter, TCC_OPTION_HAS_ARG },
++#endif
+     { "rdynamic", TCC_OPTION_rdynamic, 0 },
+     { "r", TCC_OPTION_r, 0 },
+     { "Wl,", TCC_OPTION_Wl, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
+@@ -1972,7 +1980,13 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
+         case TCC_OPTION_c:
+             x = TCC_OUTPUT_OBJ;
+         set_output_type:
+-            if (s->output_type)
++            /* '-test' already selects TCC_OUTPUT_MEMORY, so the usual
++               '-run' afterwards is not worth a warning */
++            if (s->output_type
++#ifdef TCC_EXT
++                && !(s->superc_test_mode && x == TCC_OUTPUT_MEMORY)
++#endif
++                )
+                 tcc_warning("-%s: overriding compiler action already specified", popt->name);
+             s->output_type = x;
+             break;
+@@ -1994,6 +2008,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
+         case TCC_OPTION_std:
+             if (strcmp(optarg, "=c11") == 0 || strcmp(optarg, "=gnu11") == 0)
+                 s->cversion = 201112;
++#ifdef TCC_EXT
++            else if (strcmp(optarg, "=tcc-ext") == 0) {
++                s->superc_ext = 1;
++                s->tcc_ext = 1;
++            }
++#endif
+             break;
+         case TCC_OPTION_shared:
+             x = TCC_OUTPUT_DLL;
+@@ -2035,6 +2055,18 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
+             return tcc_error_noabort("-run is not available in a cross compiler");
+ #endif
+ #ifdef TCC_IS_NATIVE
++#ifdef TCC_EXT
++        case TCC_OPTION_test:
++            /* run the 'test' blocks instead of main() */
++            s->superc_test_mode = 1;
++            x = TCC_OUTPUT_MEMORY;
++            goto set_output_type;
++        case TCC_OPTION_test_filter:
++            if (*optarg == '=')
++                ++optarg;
++            s->superc_test_filter = optarg;
++            break;
++#endif
+         case TCC_OPTION_rstdin:
+             /* custom stdin for run_main */
+             s->run_stdin = optarg;
+diff --git a/tcc.h b/tcc.h
+index 864a4e3..86684e9 100644
+--- a/tcc.h
++++ b/tcc.h
+@@ -558,6 +558,7 @@ typedef struct Sym {
+         struct Sym *cleanup_sym; /* symbol from __attribute__((cleanup())) */
+         struct Sym *cleanup_label; /* label in 'pending_gotos' chain */
+     };
++    int defer_depth; /* superc: lexical depth of a defined label */
+ } Sym;
+ 
+ /* section definition */
+@@ -615,6 +616,9 @@ typedef struct DLLReference {
+ #define MACRO_OBJ      0 /* object like macro */
+ #define MACRO_FUNC     1 /* function like macro */
+ #define MACRO_JOIN     2 /* macro uses ## */
++#ifdef TCC_EXT
++#define MACRO_SUPERC_LOCAL 8 /* '#macro' body: '__local' is renamed per expansion */
++#endif
+ 
+ /* field 'Sym.r' for C labels */
+ #define LABEL_DEFINED  0 /* label is defined */
+@@ -732,6 +736,31 @@ struct sym_attr {
+ #endif
+ };
+ 
++#ifdef TCC_EXT
++/* one 'test "desc" { ... }' block */
++typedef struct SupercTestEntry {
++    char *desc;      /* description text */
++    char *fn_name;   /* name of the generated test function */
++} SupercTestEntry;
++
++/* one 'interface NAME { methods }' declaration */
++typedef struct SupercIface {
++    char *name;      /* interface name, e.g. "Drawable" */
++    int tag;         /* struct tag of the interface value type */
++    int vt_tag;      /* struct tag of the vtable type */
++    int nb_methods;
++    int *methods;    /* method name tokens, in declaration order */
++} SupercIface;
++
++/* one 'impl IFACE for TYPE { ... }' block */
++typedef struct SupercImpl {
++    SupercIface *iface;
++    int type_tag;    /* struct tag of the implemented type */
++    int vt_tok;      /* token of the emitted vtable object */
++    int is_decl;     /* only declared here, defined in another TU */
++} SupercImpl;
++#endif
++
+ struct TCCState {
+     unsigned char verbose; /* if true, display some information during compilation */
+     unsigned char nostdinc; /* if true, no standard headers are added */
+@@ -790,6 +819,24 @@ struct TCCState {
+     unsigned char gnu_ext;
+     /* use TinyCC extensions */
+     unsigned char tcc_ext;
++#ifdef TCC_EXT
++    /* superc language extensions (-std=tcc-ext) */
++    unsigned char superc_ext;
++    unsigned char superc_test_mode; /* -test: run 'test' blocks, not main */
++    const char *superc_test_filter; /* -test-filter=SUBSTR */
++    /* 'test' blocks collected while compiling */
++    struct SupercTestEntry **superc_tests;
++    int superc_test_count;
++    /* 'package NAME { ... }' support */
++    char *superc_package;      /* current package, NULL at top level */
++    char **superc_imports;     /* 'import NAME;' names */
++    int superc_nb_imports;
++    /* 'interface' / 'impl' declarations */
++    struct SupercIface **superc_ifaces;
++    int superc_nb_ifaces;
++    struct SupercImpl **superc_impls;
++    int superc_nb_impls;
++#endif
+ 
+     unsigned char dflag; /* -dX value */
+     unsigned char Pflag; /* -P switch (LINE_MACRO_OUTPUT_FORMAT) */
+diff --git a/tccgen.c b/tccgen.c
+index b00e0a6..9449490 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -116,8 +116,81 @@ static struct scope {
+     struct { Sym *s; int n; } cl;
+     int *bsym, *csym;
+     Sym *lstk, *llstk;
++    int depth; /* lexical scope depth (new_scope only) */
+ } *cur_scope, *loop_scope, *root_scope;
+ 
++#ifdef TCC_EXT
++/* ------------------------------------------------------------------------- */
++/* superc extensions: defer / errdefer state (per function)                  */
++
++typedef struct SupercDeferSite {
++    int id;
++    Sym *label;
++    struct SupercDeferSite *next;
++} SupercDeferSite;
++
++typedef struct SupercDeferResume {
++    int id;
++    Sym *label;
++    struct SupercDeferResume *next;
++} SupercDeferResume;
++
++static struct {
++    int enabled;      /* superc extensions active for current function */
++    int has_sites;    /* at least one defer/errdefer site parsed so far */
++    int body_depth;   /* > 0 while compiling a deferred statement body */
++    int next_site;
++    int next_resume;
++    int sp0_off;      /* local slot holding this frame's defer stack base */
++    int step_off;     /* local slot for __tcc_defer_step() result */
++    int disp_jmps;    /* pending jumps to the function dispatcher */
++    SupercDeferSite *sites;
++    SupercDeferSite **sites_tail;
++    SupercDeferResume *resumes;
++    SupercDeferResume **resumes_tail;
++} defer_state;
++static int superc_label_seq;
++static int superc_implicit_ret0;
++/* pending hidden 'self' argument of an interface method call */
++static int superc_iface_self_pending;
++static int superc_iface_self_loc;
++static CType superc_iface_self_type;  /* generated 'test' function: return 0 */
++
++static void superc_defer_func_init(void);
++static void superc_defer_func_end(void);
++static void superc_defer_begin(int mode, int depth);
++static void superc_defer_parse(int kind);
++static void superc_err_parse(void);
++static void superc_errdefer_parse(void);
++static void superc_test_parse(void);
++static void superc_package_parse(void);
++static void superc_import_parse(void);
++static void superc_interface_parse(void);
++static void superc_impl_parse(void);
++static int superc_iface_convert(CType *dt);
++typedef struct SupercIface SupercIface_t;
++static SupercIface *superc_iface_of_type(CType *type);
++static int superc_iface_has_method(SupercIface *ifc, int m);
++static void superc_iface_call_prep(SupercIface *ifc, int mname);
++static Sym *superc_import_lookup(int v);
++static void gen_function(Sym *sym);
++/* 'test' is an x86 assembler mnemonic: on x86 targets the keyword string is
++   already interned as TOK_ASM_test, so accept both spellings. */
++static int superc_is_test_kw(int t)
++{
++    if (t == TOK_SUPERC_TEST)
++        return 1;
++#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
++    if (t == TOK_ASM_test)
++        return 1;
++#endif
++    return 0;
++}
++static Sym *superc_new_label(const char *tag);
++static void superc_def_label(Sym *s);
++static int superc_ext_on(void);
++#endif
++
+ typedef struct {
+     Section *sec;
+     int local_offset;
+@@ -707,8 +780,8 @@ ST_INLN Sym *struct_find(int v)
+     return table_ident[v]->sym_struct;
+ }
+ 
+-/* find an identifier */
+-ST_INLN Sym *sym_find(int v)
++/* find an identifier, no package fallback */
++static inline Sym *sym_find_raw(int v)
+ {
+     v -= TOK_IDENT;
+     if ((unsigned)v >= (unsigned)(tok_ident - TOK_IDENT))
+@@ -716,6 +789,18 @@ ST_INLN Sym *sym_find(int v)
+     return table_ident[v]->sym_identifier;
+ }
+ 
++/* find an identifier */
++ST_INLN Sym *sym_find(int v)
++{
++    Sym *s = sym_find_raw(v);
++#ifdef TCC_EXT
++    if (!s && tcc_state
++        && (tcc_state->superc_package || tcc_state->superc_nb_imports))
++        s = superc_import_lookup(v);
++#endif
++    return s;
++}
++
+ /* make sym in-/visible to the parser */
+ static inline void sym_link(Sym *s, int yes)
+ {
+@@ -3709,6 +3794,10 @@ static void verify_assign_cast(CType *dt)
+ 
+ static void gen_assign_cast(CType *dt)
+ {
++#ifdef TCC_EXT
++    if (superc_iface_convert(dt))
++        return;
++#endif
+     verify_assign_cast(dt);
+     gen_cast(dt);
+ }
+@@ -3719,6 +3808,10 @@ ST_FUNC void vstore(void)
+     int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
+ 
+     ft = vtop[-1].type.t;
++#ifdef TCC_EXT
++    superc_iface_convert(&vtop[-1].type);
++    ft = vtop[-1].type.t;
++#endif
+     sbt = vtop->type.t & VT_BTYPE;
+     dbt = ft & VT_BTYPE;
+     verify_assign_cast(&vtop[-1].type);
+@@ -5760,6 +5853,11 @@ ST_FUNC void unary(void)
+                 return;
+             } else {
+                 unary();
++#ifdef TCC_EXT
++                /* '(Shape)circle' converts explicitly */
++                if (superc_iface_convert(&type))
++                    break;
++#endif
+                 gen_cast(&type);
+             }
+         } else if (tok == '{') {
+@@ -6228,6 +6326,20 @@ special_math_val:
+             test_lvalue();
+             /* expect pointer on structure */
+             next();
++#ifdef TCC_EXT
++            if (tcc_state->superc_ext && tok >= TOK_UIDENT) {
++                SupercIface *ifc = superc_iface_of_type(&vtop->type);
++                if (ifc) {
++                    int mname = tok;
++                    next();
++                    if (tok == '(' && superc_iface_has_method(ifc, mname)) {
++                        superc_iface_call_prep(ifc, mname);
++                        continue;   /* let the '(' case handle the call */
++                    }
++                    unget_tok(mname);   /* plain field access */
++                }
++            }
++#endif
+ 	    s = find_field(&vtop->type, tok, &cumofs);
+             /* add field offset to pointer */
+             gaddrof();
+@@ -6279,6 +6391,18 @@ special_math_val:
+             next();
+             sa = s->next; /* first parameter */
+             nb_args = regsize = 0;
++#ifdef TCC_EXT
++            if (superc_iface_self_pending) {
++                /* interface method call: the hidden 'self' pointer is the
++                   first argument, its parameter is skipped */
++                superc_iface_self_pending = 0;
++                vset(&superc_iface_self_type, VT_LOCAL | VT_LVAL,
++                     superc_iface_self_loc);
++                nb_args = 1;
++                if (sa)
++                    sa = sa->next;
++            }
++#endif
+             ret.r2 = VT_CONST;
+             /* compute first implicit argument if a structure is returned */
+             if ((s->type.t & VT_BTYPE) == VT_STRUCT) {
+@@ -6928,8 +7052,11 @@ static void check_func_return(void)
+ {
+     if ((func_vt.t & VT_BTYPE) == VT_VOID)
+         return;
+-    if ((!strcmp(funcname, "main") || func_old)
+-        && (func_vt.t & VT_BTYPE) == VT_INT) {
++    if ((!strcmp(funcname, "main") || func_old
++#ifdef TCC_EXT
++         || superc_implicit_ret0
++#endif
++        ) && (func_vt.t & VT_BTYPE) == VT_INT) {
+         /* main returns 0 by default */
+         vpushi(0);
+         gfunc_return(&func_vt);
+@@ -7101,6 +7228,815 @@ static void block_cleanup(struct scope *o)
+     try_call_scope_cleanup(o->cl.s);
+ }
+ 
++#ifdef TCC_EXT
++/* ------------------------------------------------------------------------- */
++/* superc extensions: defer / errdefer code generation                      */
++
++/* value returned by a function that raised an error with 'err(...)' */
++#define TCC_ERR_SENTINEL (-1)
++
++/* ------------------------------------------------------------------------- */
++/* superc extensions: 'package NAME { ... }' and 'import NAME;'             */
++/*                                                                          */
++/* A package is a name-mangling sugar: global symbols declared inside are   */
++/* registered as NAME__symbol.  'import NAME;' makes unqualified lookups    */
++/* fall back to NAME__symbol.  Macro and tag namespaces are not affected.   */
++
++static int superc_mangle_tok(const char *pkg, int v)
++{
++    char buf[192];
++    const char *name = get_tok_str(v, NULL);
++    if (strlen(pkg) + strlen(name) + 3 > sizeof(buf))
++        tcc_error("package symbol name too long");
++    sprintf(buf, "%s__%s", pkg, name);
++    return tok_alloc_const(buf);
++}
++
++/* resolve V as a member of the current package or of an imported package */
++static Sym *superc_import_lookup(int v)
++{
++    TCCState *s1 = tcc_state;
++    int i, t;
++    Sym *s;
++
++    if (!s1->superc_ext || v < TOK_UIDENT)
++        return NULL;
++    if (s1->superc_package) {
++        t = superc_mangle_tok(s1->superc_package, v);
++        s = sym_find_raw(t);
++        if (s)
++            return s;
++    }
++    for (i = 0; i < s1->superc_nb_imports; i++) {
++        t = superc_mangle_tok(s1->superc_imports[i], v);
++        s = sym_find_raw(t);
++        if (s)
++            return s;
++    }
++    return NULL;
++}
++
++static char *superc_ident_str(int *ptok)
++{
++    char *name;
++    if (*ptok < TOK_UIDENT)
++        expect("identifier");
++    name = tcc_strdup(get_tok_str(*ptok, NULL));
++    next();
++    return name;
++}
++
++static void superc_package_parse(void)
++{
++    char *name, *saved;
++
++    next();  /* skip 'package' */
++    name = superc_ident_str(&tok);
++    if (tok == '{') {
++        /* 'package NAME { ... }': the package ends with the block */
++        if (tcc_state->superc_package)
++            tcc_error("nested 'package' is not allowed");
++        saved = tcc_state->superc_package;
++        tcc_state->superc_package = name;
++        next();
++        while (tok != '}' && tok != TOK_EOF)
++            decl(VT_CONST);
++        skip('}');
++        tcc_state->superc_package = saved;
++    } else {
++        /* 'package NAME;' names the rest of the file (or until the next
++           'package' statement); include system headers before it */
++        tcc_state->superc_package = name;
++        skip(';');
++    }
++}
++
++static void superc_import_parse(void)
++{
++    char *name;
++    next();  /* skip 'import' */
++    name = superc_ident_str(&tok);
++    skip(';');
++    dynarray_add(&tcc_state->superc_imports,
++                 &tcc_state->superc_nb_imports, name);
++}
++
++
++/* ------------------------------------------------------------------ */
++/* interface / impl                                                    */
++
++static SupercIface *superc_iface_find(int tag)
++{
++    int i;
++    for (i = 0; i < tcc_state->superc_nb_ifaces; i++)
++        if (tcc_state->superc_ifaces[i]->tag == tag)
++            return tcc_state->superc_ifaces[i];
++    return NULL;
++}
++
++/* if TYPE denotes an interface value type, return its descriptor */
++static SupercIface *superc_iface_of_type(CType *type)
++{
++    Sym *st;
++    if (!tcc_state->superc_ext || tcc_state->superc_nb_ifaces == 0)
++        return NULL;
++    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
++        return NULL;
++    st = type->ref;
++    if (!(st->v & SYM_STRUCT))
++        return NULL;
++    return superc_iface_find(st->v & ~SYM_STRUCT);
++}
++
++static int superc_iface_has_method(SupercIface *ifc, int m)
++{
++    int i;
++    for (i = 0; i < ifc->nb_methods; i++)
++        if (ifc->methods[i] == m)
++            return 1;
++    return 0;
++}
++
++static SupercImpl *superc_impl_find(SupercIface *ifc, int type_tag)
++{
++    int i;
++    for (i = 0; i < tcc_state->superc_nb_impls; i++) {
++        SupercImpl *imp = tcc_state->superc_impls[i];
++        if (imp->iface == ifc && imp->type_tag == type_tag)
++            return imp;
++    }
++    return NULL;
++}
++
++/* resolve TYPE (a typedef name or a 'struct' tag) to its struct tag token */
++static int superc_struct_tag(int type_tok)
++{
++    Sym *st = struct_find(type_tok);
++    if (!st) {
++        Sym *ts = sym_find(type_tok);
++        if (ts && (ts->type.t & VT_BTYPE) == VT_STRUCT && ts->type.ref)
++            st = ts->type.ref;
++    }
++    if (!st || !(st->v & SYM_STRUCT))
++        return 0;
++    return st->v & ~SYM_STRUCT;
++}
++
++/* Parse TS (a synthetic token string ending in TOK_EOF) as file scope
++   declarations.  The current token is left untouched and warnings are
++   suppressed, since the generated declarations are compiler-internal. */
++static void superc_decl_tokens(TokenString *ts)
++{
++    int warn_none = tcc_state->warn_none;
++    int save_tok = tok;
++    CValue save_val = tokc;
++    tcc_state->warn_none = 1;
++    begin_macro(ts, 1);
++    next();
++    decl(VT_CONST);
++    end_macro();
++    tcc_state->warn_none = warn_none;
++    tok = save_tok, tokc = save_val;
++}
++
++static void superc_interface_parse(void)
++{
++    SupercIface *ifc;
++    TokenString *body = NULL, *ts;
++    int name_tok, i, n, *p, is_method;
++    char buf[256];
++
++    next();                          /* skip 'interface' */
++    if (tok < TOK_UIDENT)
++        expect("interface name");
++    if (struct_find(tok))
++        tcc_error("redefinition of 'struct %s'", get_tok_str(tok, NULL));
++    name_tok = tok;
++    next();
++    skip_or_save_block(&body);
++
++    ifc = tcc_mallocz(sizeof *ifc);
++    ifc->name = tcc_strdup(get_tok_str(name_tok, NULL));
++    ifc->tag = name_tok;
++    snprintf(buf, sizeof buf, "%s_vt", ifc->name);
++    ifc->vt_tag = tok_alloc_const(buf);
++
++    /* Build 'struct NAME_vt { RET (*meth)(void *, ...); ... };', that is,
++       turn each method declaration into a function-pointer field whose
++       first parameter is the hidden 'self' pointer. */
++    ts = tok_str_alloc();
++    tok_str_add(ts, TOK_STRUCT);
++    tok_str_add(ts, ifc->vt_tag);
++    tok_str_add(ts, '{');
++    p = body->str;
++    n = body->len;
++    is_method = 0;
++    for (i = 0; i < n; i++) {
++        int t = p[i];
++        if (t == 0 || t == TOK_EOF)
++            break;
++        if (t == '{' || t == '}')
++            continue;
++        if (TOK_HAS_VALUE(t)) {
++            /* only int-valued tokens can appear in method declarations */
++            tok_str_add(ts, t);
++            tok_str_add(ts, p[++i]);
++            continue;
++        }
++        if (t == '(') {
++            tok_str_add(ts, '(');
++            if (is_method) {
++                tok_str_add(ts, TOK_VOID);
++                tok_str_add(ts, '*');
++                if (i + 1 < n && p[i + 1] != ')')
++                    tok_str_add(ts, ',');
++            }
++            is_method = 0;
++            continue;
++        }
++        if (t >= TOK_UIDENT && i + 1 < n && p[i + 1] == '(') {
++            /* method name: '( * name )' */
++            tok_str_add(ts, '(');
++            tok_str_add(ts, '*');
++            tok_str_add(ts, t);
++            tok_str_add(ts, ')');
++            ifc->methods = tcc_realloc(ifc->methods,
++                                       (ifc->nb_methods + 1) * sizeof(int));
++            ifc->methods[ifc->nb_methods++] = t;
++            is_method = 1;
++            continue;
++        }
++        tok_str_add(ts, t);
++    }
++    tok_str_add(ts, '}');
++    tok_str_add(ts, ';');
++    tok_str_add(ts, TOK_EOF);
++    if (ifc->nb_methods == 0)
++        tcc_error("interface '%s' has no methods", ifc->name);
++    superc_decl_tokens(ts);
++
++    /* Build the interface value type:
++       'struct NAME { void *self; const struct NAME_vt *vt; };' */
++    ts = tok_str_alloc();
++    tok_str_add(ts, TOK_STRUCT);
++    tok_str_add(ts, ifc->tag);
++    tok_str_add(ts, '{');
++    tok_str_add(ts, TOK_VOID);
++    tok_str_add(ts, '*');
++    tok_str_add(ts, tok_alloc_const("self"));
++    tok_str_add(ts, ';');
++    tok_str_add(ts, TOK_CONST1);
++    tok_str_add(ts, TOK_STRUCT);
++    tok_str_add(ts, ifc->vt_tag);
++    tok_str_add(ts, '*');
++    tok_str_add(ts, tok_alloc_const("vt"));
++    tok_str_add(ts, ';');
++    tok_str_add(ts, '}');
++    tok_str_add(ts, ';');
++    tok_str_add(ts, TOK_EOF);
++    superc_decl_tokens(ts);
++
++    /* 'typedef struct NAME NAME;' so that the interface name can be
++       used as a type, e.g. 'int describe(Shape s)' */
++    ts = tok_str_alloc();
++    tok_str_add(ts, TOK_TYPEDEF);
++    tok_str_add(ts, TOK_STRUCT);
++    tok_str_add(ts, ifc->tag);
++    tok_str_add(ts, ifc->tag);
++    tok_str_add(ts, ';');
++    tok_str_add(ts, TOK_EOF);
++    superc_decl_tokens(ts);
++
++    dynarray_add(&tcc_state->superc_ifaces,
++                 &tcc_state->superc_nb_ifaces, ifc);
++    tok_str_free(body);
++}
++
++static void superc_impl_parse(void)
++{
++    SupercIface *ifc;
++    SupercImpl *imp;
++    TokenString *ts;
++    char *saved_pkg, *pkgname;
++    char buf[256];
++    int iface_tok, type_tok, type_tag, i;
++
++    next();                          /* skip 'impl' */
++    if (tok < TOK_UIDENT)
++        expect("interface name");
++    iface_tok = tok;
++    next();
++    if (tok != TOK_FOR)
++        expect("for");
++    next();
++    if (tok == TOK_STRUCT)
++        next();
++    if (tok < TOK_UIDENT)
++        expect("type name");
++    type_tok = tok;
++    next();
++
++    ifc = superc_iface_find(iface_tok);
++    if (!ifc)
++        tcc_error("unknown interface '%s'", get_tok_str(iface_tok, NULL));
++    type_tag = superc_struct_tag(type_tok);
++    if (!type_tag)
++        tcc_error("'%s' is not a struct or union type",
++                  get_tok_str(type_tok, NULL));
++    /* a declaration-only impl may be followed by the real definition */
++    for (i = 0; i < tcc_state->superc_nb_impls; i++) {
++        SupercImpl *o = tcc_state->superc_impls[i];
++        if (o->iface == ifc && o->type_tag == type_tag) {
++            if (!o->is_decl)
++                tcc_error("duplicate impl of '%s' for '%s'", ifc->name,
++                          get_tok_str(type_tok, NULL));
++            memmove(&tcc_state->superc_impls[i], &tcc_state->superc_impls[i + 1],
++                    (tcc_state->superc_nb_impls - i - 1) * sizeof(SupercImpl *));
++            tcc_state->superc_nb_impls--;
++            tcc_free(o);
++            break;
++        }
++    }
++
++    /* Make the type name usable as a type inside the impl body, so that
++       'void draw(Circle *self)' works for 'impl Drawable for Circle'. */
++    ts = tok_str_alloc();
++    tok_str_add(ts, TOK_TYPEDEF);
++    tok_str_add(ts, TOK_STRUCT);
++    tok_str_add(ts, type_tag);
++    tok_str_add(ts, type_tok);
++    tok_str_add(ts, ';');
++    tok_str_add(ts, TOK_EOF);
++    superc_decl_tokens(ts);
++
++    if (tok == ';') {
++        /* 'impl IFACE for TYPE;' only declares that the impl exists (it is
++           defined in another translation unit): reference its vtable. */
++        next();
++        imp = tcc_mallocz(sizeof *imp);
++        imp->iface = ifc;
++        imp->type_tag = type_tag;
++        snprintf(buf, sizeof buf, "__tcc_vt_%s_%s",
++                 get_tok_str(type_tag, NULL), ifc->name);
++        imp->vt_tok = tok_alloc_const(buf);
++        imp->is_decl = 1;
++        ts = tok_str_alloc();
++        tok_str_add(ts, TOK_EXTERN);
++        tok_str_add(ts, TOK_CONST1);
++        tok_str_add(ts, TOK_STRUCT);
++        tok_str_add(ts, ifc->vt_tag);
++        tok_str_add(ts, imp->vt_tok);
++        tok_str_add(ts, ';');
++        tok_str_add(ts, TOK_EOF);
++        superc_decl_tokens(ts);
++        dynarray_add(&tcc_state->superc_impls,
++                     &tcc_state->superc_nb_impls, imp);
++        return;
++    }
++
++    /* The method definitions are ordinary functions.  Parse them inside a
++       pseudo package so that their names do not collide between impls. */
++    snprintf(buf, sizeof buf, "__tcc_impl_%s_%s",
++             get_tok_str(type_tag, NULL), ifc->name);
++    pkgname = tcc_strdup(buf);
++    saved_pkg = tcc_state->superc_package;
++    tcc_state->superc_package = pkgname;
++    skip('{');
++    while (tok != '}' && tok != TOK_EOF)
++        decl(VT_CONST);
++    skip('}');
++    tcc_state->superc_package = saved_pkg;
++
++    /* Emit the vtable object:
++       'const struct NAME_vt __tcc_vt_TYPE_NAME = { (void(*)(void))m, ... };' */
++    imp = tcc_mallocz(sizeof *imp);
++    imp->iface = ifc;
++    imp->type_tag = type_tag;
++    snprintf(buf, sizeof buf, "__tcc_vt_%s_%s",
++             get_tok_str(type_tag, NULL), ifc->name);
++    imp->vt_tok = tok_alloc_const(buf);
++
++    ts = tok_str_alloc();
++    tok_str_add(ts, TOK_CONST1);
++    tok_str_add(ts, TOK_STRUCT);
++    tok_str_add(ts, ifc->vt_tag);
++    tok_str_add(ts, imp->vt_tok);
++    tok_str_add(ts, '=');
++    tok_str_add(ts, '{');
++    for (i = 0; i < ifc->nb_methods; i++) {
++        if (i)
++            tok_str_add(ts, ',');
++        tok_str_add(ts, '(');
++        tok_str_add(ts, TOK_VOID);
++        tok_str_add(ts, '(');
++        tok_str_add(ts, '*');
++        tok_str_add(ts, ')');
++        tok_str_add(ts, '(');
++        tok_str_add(ts, TOK_VOID);
++        tok_str_add(ts, ')');
++        tok_str_add(ts, ')');
++        tok_str_add(ts, superc_mangle_tok(pkgname, ifc->methods[i]));
++    }
++    tok_str_add(ts, '}');
++    tok_str_add(ts, ';');
++    tok_str_add(ts, TOK_EOF);
++    superc_decl_tokens(ts);
++
++    dynarray_add(&tcc_state->superc_impls,
++                 &tcc_state->superc_nb_impls, imp);
++}
++
++/* rewrite 'iface.meth (args...)' into a vtable call passing the hidden
++   'self' pointer as the first argument; leaves the function pointer on
++   the stack and arms 'superc_iface_self_pending' for the call code */
++static void superc_iface_call_prep(SupercIface *ifc, int mname)
++{
++    Sym *fself, *fvt, *fmeth;
++    CType t;
++    int off_self, off_vt, off_m;
++
++    fself = find_field(&vtop->type, tok_alloc_const("self"), &off_self);
++    fvt = find_field(&vtop->type, tok_alloc_const("vt"), &off_vt);
++    if (!fself || !fvt)
++        tcc_error("bad interface type");
++
++    gaddrof();                       /* address of the interface value */
++    vtop->type = char_pointer_type;
++
++    /* self (kept in a temporary local slot) */
++    gv_dup();
++    vpushi(off_self);
++    gen_op('+');
++    t = fself->type;
++    mk_pointer(&t);
++    vtop->type = t;
++    indir();                         /* the 'self' pointer value */
++    superc_iface_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
++    loc = superc_iface_self_loc;
++    vset(&fself->type, VT_LOCAL | VT_LVAL, superc_iface_self_loc);
++    vswap();
++    vstore();
++    vpop();
++    superc_iface_self_type = fself->type;
++
++    /* method: d.vt->name */
++    vpushi(off_vt);
++    gen_op('+');
++    t = fvt->type;
++    mk_pointer(&t);
++    vtop->type = t;
++    indir();                         /* d.vt */
++    fmeth = find_field(pointed_type(&vtop->type), mname, &off_m);
++    if (!fmeth)
++        tcc_error("interface '%s' has no method '%s'", ifc->name,
++                  get_tok_str(mname, NULL));
++    vtop->type = char_pointer_type;
++    vpushi(off_m);
++    gen_op('+');
++    t = fmeth->type;
++    mk_pointer(&t);
++    vtop->type = t;
++    indir();                         /* the function pointer */
++    superc_iface_self_pending = 1;
++}
++
++/* Implicit conversion of a struct value to an interface value, e.g.
++   'render(circle)' or 'Drawable d = circle;'.  Returns 0 when no
++   conversion applies. */
++static int superc_iface_convert(CType *dt)
++{
++    SupercIface *ifc;
++    SupercImpl *imp;
++    Sym *vs;
++    int size, align, loc2;
++
++    if (!tcc_state->superc_ext || tcc_state->superc_nb_impls == 0)
++        return 0;
++    if ((vtop->type.t & VT_BTYPE) != VT_STRUCT || !vtop->type.ref)
++        return 0;
++    ifc = superc_iface_of_type(dt);
++    if (!ifc)
++        return 0;
++    imp = superc_impl_find(ifc, vtop->type.ref->v & ~SYM_STRUCT);
++    if (!imp)
++        return 0;
++    vs = sym_find(imp->vt_tok);
++    if (!vs)
++        tcc_error("impl of interface '%s' used before its definition",
++                  ifc->name);
++
++    size = type_size(dt, &align);
++    loc2 = (loc - size) & -align;
++    loc = loc2;
++
++    /* __tcc_iface_init(&src, &vtable, &tmp) */
++    gaddrof();                       /* &source struct */
++    vtop->type = char_pointer_type;
++    vpushsym(&vs->type, vs);
++    vtop->r |= VT_LVAL;
++    gaddrof();                       /* &vtable */
++    vtop->type = char_pointer_type;
++    vset(dt, VT_LOCAL | VT_LVAL, loc2);
++    gaddrof();                       /* &tmp */
++    vtop->type = char_pointer_type;
++    vpush_helper_func(tok_alloc_const("__tcc_iface_init"));
++    vrott(4);
++    gfunc_call(3);
++
++    vset(dt, VT_LOCAL | VT_LVAL, loc2);
++    return 1;
++}
++
++static int superc_ext_on(void)
++{
++    return tcc_state->superc_ext;
++}
++
++static Sym *superc_new_label(const char *tag)
++{
++    char buf[64];
++    int v;
++    snprintf(buf, sizeof(buf), "__tcc_%s_%d", tag, ++superc_label_seq);
++    v = tok_alloc_const(buf);
++    return label_push(&global_label_stack, v, LABEL_FORWARD);
++}
++
++static void superc_def_label(Sym *s)
++{
++    s->r = LABEL_DEFINED;
++    s->jind = gind();
++    s->cleanupstate = cur_scope->cl.s;
++}
++
++static void superc_add_site(int id, Sym *label)
++{
++    SupercDeferSite *s = tcc_malloc(sizeof *s);
++    s->id = id;
++    s->label = label;
++    s->next = NULL;
++    *defer_state.sites_tail = s;
++    defer_state.sites_tail = &s->next;
++}
++
++static void superc_add_resume(int id, Sym *label)
++{
++    SupercDeferResume *r = tcc_malloc(sizeof *r);
++    r->id = id;
++    r->label = label;
++    r->next = NULL;
++    *defer_state.resumes_tail = r;
++    defer_state.resumes_tail = &r->next;
++}
++
++static void superc_free_lists(void)
++{
++    SupercDeferSite *s, *sn;
++    SupercDeferResume *r, *rn;
++    for (s = defer_state.sites; s; s = sn) {
++        sn = s->next;
++        tcc_free(s);
++    }
++    for (r = defer_state.resumes; r; r = rn) {
++        rn = r->next;
++        tcc_free(r);
++    }
++    defer_state.sites = NULL;
++    defer_state.sites_tail = &defer_state.sites;
++    defer_state.resumes = NULL;
++    defer_state.resumes_tail = &defer_state.resumes;
++}
++
++static void superc_defer_func_init(void)
++{
++    int align = PTR_SIZE;
++    defer_state.enabled = 1;
++    defer_state.has_sites = 0;
++    defer_state.body_depth = 0;
++    defer_state.next_site = 0;
++    defer_state.next_resume = 0;
++    defer_state.disp_jmps = 0;
++    superc_free_lists();
++    loc = (loc - (int)sizeof(int)) & -align;
++    defer_state.sp0_off = loc;
++    loc = (loc - (int)sizeof(int)) & -align;
++    defer_state.step_off = loc;
++    /* __tcc_defer_func_enter(&sp0); */
++    vpush_helper_func(tok_alloc_const("__tcc_defer_func_enter"));
++    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
++    gaddrof();
++    mk_pointer(&vtop->type);
++    gfunc_call(1);
++}
++
++/* emit "begin cleanup" (mode 0: scopes above DEPTH, mode 1: whole function) */
++static void superc_defer_begin(int mode, int depth)
++{
++    int rid;
++    Sym *rl;
++    if (!defer_state.enabled || !defer_state.has_sites || nocode_wanted)
++        return;
++    rid = ++defer_state.next_resume;
++    rl = superc_new_label("drs");
++    /* third argument: this frame's defer stack base */
++    if (mode == 0) {
++        vpush_helper_func(tok_alloc_const("__tcc_defer_begin_scope"));
++        vpushi(depth);
++        vpushi(rid);
++    } else {
++        vpush_helper_func(tok_alloc_const("__tcc_defer_begin_func"));
++        vpushi(mode);
++        vpushi(rid);
++    }
++    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
++    gfunc_call(3);
++    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
++    /* resume point: execution continues right after the cleanup run */
++    superc_def_label(rl);
++    superc_add_resume(rid, rl);
++}
++
++/* parse "defer STATEMENT" / "errdefer STATEMENT": register a cleanup site,
++   compile the body into a cleanup block that is skipped over at
++   registration time.  KIND selects defer (0) or errdefer (1). */
++static void superc_defer_parse(int kind)
++{
++    int skip = 0, id;
++    Sym *l = NULL;
++
++    defer_state.body_depth++;
++    if (!nocode_wanted) {
++        id = ++defer_state.next_site;
++        l = superc_new_label("dcl");
++        vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
++        vpushi(id);
++        vpushi(local_scope);
++        vpushi(kind);
++        gfunc_call(3);
++        skip = gjmp(0);
++        superc_def_label(l);
++        superc_add_site(id, l);
++        defer_state.has_sites = 1;
++    }
++    block(STMT_COMPOUND);
++    if (!nocode_wanted) {
++        defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
++        gsym(skip);
++    }
++    defer_state.body_depth--;
++}
++
++static void superc_errdefer_parse(void)
++{
++    superc_defer_parse(1);
++}
++
++/* parse "err(ID, MSG)" or "err()": record the error, run the error-path
++   cleanups (errdefer and defer) of the whole function frame and return the
++   sentinel value so that callers can propagate. */
++static void superc_err_parse(void)
++{
++    int b, ret_off = 0, ret_saved = 0;
++
++    if (defer_state.body_depth > 0)
++        tcc_error("'err' is not allowed in a defer body");
++
++    skip('(');
++    if (tok != ')') {
++        /* __tcc_err_set(id, msg) */
++        vpush_helper_func(tok_alloc_const("__tcc_err_set"));
++        expr_eq();
++        skip(',');
++        expr_eq();
++        skip(')');
++        gfunc_call(2);
++    } else {
++        next();  /* keep the error slot: this is a re-raise */
++    }
++
++    b = (func_vt.t & VT_BTYPE) != VT_VOID;
++    if (b) {
++        int align, size = type_size(&func_vt, &align);
++        vpushi(TCC_ERR_SENTINEL);
++        vtop->type = func_vt;   /* '(TYPE)-1', no conversion warning */
++        loc = (loc - size) & -align;
++        ret_off = loc;
++        ret_saved = 1;
++        vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
++        vswap();
++        vstore();
++        vpop();
++    }
++    if (defer_state.has_sites)
++        superc_defer_begin(2, 0);
++    if (ret_saved)
++        vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
++    if (b)
++        gfunc_return(&func_vt);
++    skip(';');
++    rsym = gjmp(rsym);
++    CODE_OFF();
++}
++
++/* parse 'test "description" { ... }' at file scope: synthesize
++   'static int __tcc_test_N(void) { ... }' and remember the description
++   so that -test can run it. */
++static void superc_test_parse(void)
++{
++    TCCState *s1 = tcc_state;
++    SupercTestEntry *e;
++    CType ft;
++    Sym *fs, *sym;
++    AttributeDef ad;
++    char name[64];
++    int v;
++
++    next();             /* skip the 'test' keyword */
++    if (tok != TOK_STR)
++        expect("string");
++    snprintf(name, sizeof(name), "__tcc_test_%d", s1->superc_test_count);
++    {
++        int n = 0;
++        /* the description token value is the decoded string */
++        const char *d = tokc.str.data;
++        while (d[n])
++            n++;
++        e = tcc_malloc(sizeof *e);
++        e->desc = tcc_malloc(n + 1);
++        memcpy(e->desc, d, n + 1);
++        e->fn_name = tcc_strdup(name);
++    }
++    dynarray_add(&s1->superc_tests, &s1->superc_test_count, e);
++    v = tok_alloc_const(name);
++
++    next();             /* skip the description */
++    if (tok != '{')
++        expect("{");
++
++    /* build the type of "int NAME(void)" */
++    memset(&ad, 0, sizeof ad);
++    fs = sym_push(SYM_FIELD, &int_type, 0, 0);
++    fs->f.func_call = FUNC_CDECL;
++    fs->f.func_type = FUNC_NEW;
++    ft.t = VT_FUNC;
++    ft.ref = fs;
++    sym = external_sym(v, &ft, 0, &ad);
++
++    cur_text_section = text_section;
++    superc_implicit_ret0 = 1;
++    gen_function(sym);
++}
++
++/* emit the per-function cleanup dispatcher */
++static void superc_defer_func_end(void)
++{
++    SupercDeferSite *s;
++    SupercDeferResume *r;
++    int fall;
++
++    if (!defer_state.enabled)
++        return;
++    if (!defer_state.has_sites && !defer_state.resumes) {
++        /* no defer/errdefer in this function: nothing to dispatch */
++        superc_free_lists();
++        defer_state.enabled = 0;
++        return;
++    }
++    CODE_ON();
++    fall = gjmp(0);
++    gsym(defer_state.disp_jmps);
++    defer_state.disp_jmps = 0;
++    /* __tcc_defer_step(&answer); */
++    vpush_helper_func(tok_alloc_const("__tcc_defer_step"));
++    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
++    gaddrof();
++    mk_pointer(&vtop->type);
++    gfunc_call(1);
++    for (s = defer_state.sites; s; s = s->next) {
++        int j;
++        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
++        gv(RC_INT);
++        vpushi(s->id);
++        gen_op(TOK_EQ);
++        j = gvtst(1, 0);
++        gjmp_addr(s->label->jind);
++        gsym(j);
++    }
++    for (r = defer_state.resumes; r; r = r->next) {
++        int j;
++        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
++        gv(RC_INT);
++        vpushi(-r->id);
++        gen_op(TOK_EQ);
++        j = gvtst(1, 0);
++        gjmp_addr(r->label->jind);
++        gsym(j);
++    }
++    gsym(fall);
++    superc_free_lists();
++    defer_state.enabled = 0;
++}
++#endif /* TCC_EXT */
++
+ /* ------------------------------------------------------------------------- */
+ /* VLA */
+ 
+@@ -7135,10 +8071,15 @@ static void new_scope(struct scope *o)
+     o->lstk = local_stack;
+     o->llstk = local_label_stack;
+     ++local_scope;
++    o->depth = local_scope;
+ }
+ 
+ static void prev_scope(struct scope *o, int is_expr)
+ {
++#ifdef TCC_EXT
++    if (defer_state.enabled && !nocode_wanted && o->depth > 0)
++        superc_defer_begin(0, o->depth - 1);
++#endif
+     vla_leave(o->prev);
+ 
+     if (o->cl.s != o->prev->cl.s)
+@@ -7169,6 +8110,14 @@ static void leave_scope(struct scope *o)
+ {
+     if (!o)
+         return;
++#ifdef TCC_EXT
++    if (defer_state.enabled && !nocode_wanted) {
++        if (o == root_scope)
++            superc_defer_begin(1, 0);
++        else
++            superc_defer_begin(0, o->depth);
++    }
++#endif
+     try_call_scope_cleanup(o->cl.s);
+     vla_leave(o);
+ }
+@@ -7225,6 +8174,9 @@ static void gexpr_decl(void)
+ static void block(int flags)
+ {
+     int a, b, c, d, e, t;
++#ifdef TCC_EXT
++    int ret_off, ret_saved;
++#endif
+     struct scope o;
+     Sym *s;
+ 
+@@ -7304,6 +8256,12 @@ again:
+             check_func_return();
+ 
+     } else if (t == TOK_RETURN) {
++#ifdef TCC_EXT
++        if (defer_state.body_depth > 0)
++            tcc_error("'return' is not allowed in a defer body");
++        ret_off = 0;
++        ret_saved = 0;
++#endif
+         b = (func_vt.t & VT_BTYPE) != VT_VOID;
+         if (tok != ';') {
+             gexpr();
+@@ -7320,18 +8278,45 @@ again:
+             tcc_warning("'return' with no value");
+             b = 0;
+         }
++#ifdef TCC_EXT
++        /* protect the return value from cleanup calls */
++        if (b && defer_state.enabled && defer_state.has_sites) {
++            int align, size = type_size(&func_vt, &align);
++            loc = (loc - size) & -align;
++            ret_off = loc;
++            ret_saved = 1;
++            vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
++            vswap();
++            vstore();
++            vpop();
++        }
++#endif
+         leave_scope(root_scope);
++#ifdef TCC_EXT
++        if (ret_saved)
++            vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
++#endif
+         if (b)
+             gfunc_return(&func_vt);
+         skip(';');
+-        /* jump unless last stmt in top-level block */
+-        if (tok != '}' || local_scope != 1)
++        /* jump unless last stmt in top-level block (with defer/errdefer
++           active the jump is required: the function-exit dispatcher must
++           not be reached by falling through) */
++        if (tok != '}' || local_scope != 1
++#ifdef TCC_EXT
++            || defer_state.enabled
++#endif
++            )
+             rsym = gjmp(rsym);
+         if (debug_modes)
+ 	    tcc_tcov_block_end (tcc_state, -1);
+         CODE_OFF();
+ 
+     } else if (t == TOK_BREAK) {
++#ifdef TCC_EXT
++        if (defer_state.body_depth > 0)
++            tcc_error("'break' is not allowed in a defer body");
++#endif
+         /* compute jump */
+         if (!cur_scope->bsym)
+             tcc_error("cannot break");
+@@ -7343,6 +8328,10 @@ again:
+         skip(';');
+ 
+     } else if (t == TOK_CONTINUE) {
++#ifdef TCC_EXT
++        if (defer_state.body_depth > 0)
++            tcc_error("'continue' is not allowed in a defer body");
++#endif
+         /* compute jump */
+         if (!cur_scope->csym)
+             tcc_error("cannot continue");
+@@ -7350,6 +8339,26 @@ again:
+         *cur_scope->csym = gjmp(*cur_scope->csym);
+         skip(';');
+ 
++#ifdef TCC_EXT
++    } else if (t == TOK_SUPERC_DEFER) {
++        if (!superc_ext_on())
++            tcc_error("'defer' requires -std=tcc-ext");
++        else
++            superc_defer_parse(0);
++
++    } else if (t == TOK_SUPERC_ERRDEFER) {
++        if (!superc_ext_on())
++            tcc_error("'errdefer' requires -std=tcc-ext");
++        else
++            superc_errdefer_parse();
++
++    } else if (t == TOK_SUPERC_ERR) {
++        if (!superc_ext_on())
++            tcc_error("'err' requires -std=tcc-ext");
++        else
++            superc_err_parse();
++#endif
++
+     } else if (t == TOK_FOR) {
+         new_scope(&o);
+ 
+@@ -7473,6 +8482,10 @@ again:
+         goto block_after_label;
+ 
+     } else if (t == TOK_GOTO) {
++#ifdef TCC_EXT
++        if (defer_state.body_depth > 0)
++            tcc_error("'goto' is not allowed in a defer body");
++#endif
+         vla_restore(cur_scope->vla.locorig);
+         if (tok == '*' && gnu_ext) {
+             /* computed goto */
+@@ -7532,8 +8545,17 @@ again:
+             } else {
+                 s = label_push(&global_label_stack, t, LABEL_DEFINED);
+             }
++#ifdef TCC_EXT
++            s->defer_depth = local_scope;
++#endif
+             s->jind = gind();
+             s->cleanupstate = cur_scope->cl.s;
++#ifdef TCC_EXT
++            /* every label entry point dispatches deferred calls that belong
++               to scopes being left by the goto */
++            if (defer_state.enabled && !nocode_wanted)
++                superc_defer_begin(0, s->defer_depth);
++#endif
+ 
+     block_after_label:
+             /* Accept attributes after labels (e.g. 'unused') */
+@@ -8692,9 +9714,33 @@ static void gen_function(Sym *sym)
+     nb_temp_local_vars = 0;
+ 
+     gfunc_prolog(sym);
++#ifdef TCC_EXT
++    if (tcc_state->superc_ext)
++        superc_defer_func_init();
++#endif
+     tcc_debug_prolog_epilog(tcc_state, 0);
+     func_vla_arg(sym);
+     block(0);
++#ifdef TCC_EXT
++    if (defer_state.enabled) {
++        /* fall-through function exit also runs the cleanups; the dispatcher
++           itself must be emitted even if the body ended with a jump. */
++        if (!nocode_wanted) {
++            superc_defer_begin(1, 0);
++            if (superc_implicit_ret0) {
++                vpushi(0);
++                gfunc_return(&func_vt);
++            } else {
++                rsym = gjmp(rsym); /* after the cleanups: function epilogue */
++            }
++        }
++        superc_defer_func_end();
++    } else if (superc_implicit_ret0 && !nocode_wanted) {
++        vpushi(0);
++        gfunc_return(&func_vt);
++    }
++    superc_implicit_ret0 = 0;
++#endif
+     gsym(rsym);
+     nocode_wanted = 0;
+     tcc_debug_end_scope(NULL, !func_var);
+@@ -8824,6 +9870,30 @@ static int decl(int l)
+     while (1) {
+ 
+         oldint = 0;
++#ifdef TCC_EXT
++        if (l == VT_CONST && tcc_state->superc_ext) {
++            if (superc_is_test_kw(tok)) {
++                superc_test_parse();
++                continue;
++            }
++            if (tok == TOK_SUPERC_PACKAGE) {
++                superc_package_parse();
++                continue;
++            }
++            if (tok == TOK_SUPERC_IMPORT) {
++                superc_import_parse();
++                continue;
++            }
++            if (tok == TOK_SUPERC_INTERFACE) {
++                superc_interface_parse();
++                continue;
++            }
++            if (tok == TOK_SUPERC_IMPL) {
++                superc_impl_parse();
++                continue;
++            }
++        }
++#endif
+         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {
+             if (l == VT_JMP)
+                 return 0;
+@@ -8849,6 +9919,11 @@ static int decl(int l)
+                 btype.t = VT_INT;
+                 oldint = 1;
+             } else {
++#ifdef TCC_EXT
++                /* end of a 'package NAME { ... }' body */
++                if (tok == '}' && tcc_state->superc_package)
++                    break;
++#endif
+                 if (tok != TOK_EOF)
+                     expect("declaration");
+                 break;
+@@ -8874,6 +9949,14 @@ static int decl(int l)
+ 	    ad = adbase;
+             type_decl(&type, &ad, &v, l == VT_CMP ? TYPE_DIRECT | TYPE_PARAM : TYPE_DIRECT);
+             /*ptype("decl", &type, v);*/
++#ifdef TCC_EXT
++            /* symbols declared inside a package are name-mangled; the
++               program entry point always keeps its name */
++            if (l == VT_CONST && tcc_state->superc_package
++                && v >= TOK_UIDENT
++                && strcmp(get_tok_str(v, NULL), "main") != 0)
++                v = superc_mangle_tok(tcc_state->superc_package, v);
++#endif
+             if ((type.t & VT_BTYPE) == VT_FUNC) {
+                 if ((type.t & VT_STATIC) && (l != VT_CONST))
+                     tcc_error("function without file scope cannot be static");
+diff --git a/tccpp.c b/tccpp.c
+index 214e9cd..a1b98cc 100644
+--- a/tccpp.c
++++ b/tccpp.c
+@@ -523,6 +523,35 @@ ST_FUNC int tok_alloc_const(const char *str)
+     return tok_alloc(str, strlen(str))->tok;
+ }
+ 
++#ifdef TCC_EXT
++/* Drop the last interned token again: used to keep the superc keywords
++   ordinary identifiers unless -std=tcc-ext is active. */
++static void tok_unintern(int v)
++{
++    TokenSym *ts;
++    TokenSym **pts;
++    unsigned int h;
++    int i;
++
++    if (!table_ident || v < TOK_IDENT || v >= tok_ident)
++        return;
++    ts = table_ident[v - TOK_IDENT];
++    if (!ts || ts->tok != v)
++        return;
++    h = TOK_HASH_INIT;
++    for (i = 0; i < ts->len; i++)
++        h = TOK_HASH_FUNC(h, ((unsigned char *)ts->str)[i]);
++    h &= (TOK_HASH_SIZE - 1);
++    pts = &hash_ident[h];
++    while (*pts && *pts != ts)
++        pts = &(*pts)->hash_next;
++    if (*pts)
++        *pts = ts->hash_next;
++    tal_free(&toksym_alloc, ts);
++    table_ident[v - TOK_IDENT] = NULL;
++}
++#endif
++
+ 
+ /* XXX: buffer overflow */
+ /* XXX: float tokens */
+@@ -1579,7 +1608,7 @@ ST_FUNC void parse_define(void)
+     tok_str_new(&str);
+     t0 = 0;
+     while (tok != TOK_LINEFEED && tok != TOK_EOF) {
+-        if (is_space(tok)) {
++        if (is_space(tok) || tok == TOK_LINEFEED) {
+             str.need_spc |= 1;
+         } else {
+             if (TOK_TWOSHARPS == tok) {
+@@ -1788,6 +1817,162 @@ ST_FUNC void tccpp_putfile(const char *filename)
+     tcc_debug_newfile(tcc_state);
+ }
+ 
++#ifdef TCC_EXT
++/* rename the identifiers marked with '__local' in a '#macro' body.
++   The whole body is processed before macro arguments are substituted,
++   so that hygiene does not leak into caller-supplied tokens. */
++static int superc_local_name(int v, int id)
++{
++    char buf[512];
++    snprintf(buf, sizeof buf, "%s__h%d", get_tok_str(v, NULL), id);
++    return tok_alloc(buf, strlen(buf))->tok;
++}
++
++static int *superc_hygiene_body(const int *body)
++{
++    static int seq;
++    TokenString out;
++    CValue cval;
++    const int *p;
++    int hl, id, t, i, prev, nb = 0, *locals = NULL;
++
++    hl = tok_alloc("__local", 7)->tok;
++    id = ++seq;
++    p = body;
++    prev = 0;
++    for (;;) {
++        TOK_GET(&t, &p, &cval);
++        if (t == 0)
++            break;
++        if (t == hl) {
++            do {
++                TOK_GET(&t, &p, &cval);
++            } while (t && (is_space(t) || t == TOK_LINEFEED));
++            if (t < TOK_IDENT || TOK_HAS_VALUE(t))
++                tcc_error("'__local' must be followed by an identifier");
++            if (prev == '#' || prev == TOK_PPJOIN || prev == TOK_TWOSHARPS)
++                tcc_error("cannot apply '#' or '##' to a '__local' name");
++            locals = tcc_realloc(locals, (nb + 1) * sizeof(int));
++            locals[nb++] = t;
++            prev = t;
++            continue;
++        }
++        if (!is_space(t) && t != TOK_LINEFEED)
++            prev = t;
++    }
++    tok_str_new(&out);
++    p = body;
++    prev = 0;
++    for (;;) {
++        TOK_GET(&t, &p, &cval);
++        if (t == 0)
++            break;
++        if (t == hl) {
++            do {
++                TOK_GET(&t, &p, &cval);
++            } while (t && (is_space(t) || t == TOK_LINEFEED));
++            tok_str_add2(&out, superc_local_name(t, id), &cval);
++            continue;
++        }
++        if (t >= TOK_IDENT) {
++            for (i = 0; i < nb; i++)
++                if (locals[i] == t) {
++                    t = superc_local_name(t, id);
++                    break;
++                }
++        }
++        tok_str_add2(&out, t, &cval);
++    }
++    tok_str_add(&out, 0);
++    tcc_free(locals);
++    return out.str;
++}
++
++/* parse '#macro NAME(params) { body }' */
++static void parse_superc_macro(void)
++{
++    Sym *s, *first, **ps;
++    int v, t, t0, level;
++    int saved_parse_flags = parse_flags;
++    TokenString str;
++
++    next_nomacro();
++    v = tok;
++    if (v < TOK_IDENT || v == TOK_DEFINED)
++        tcc_error("invalid macro name '%s'", get_tok_str(tok, &tokc));
++    first = NULL;
++    t = MACRO_FUNC;
++    parse_flags = ((parse_flags & ~PARSE_FLAG_ASM_FILE) | PARSE_FLAG_SPACES);
++    next_nomacro();
++    parse_flags &= ~PARSE_FLAG_SPACES;
++    if (tok == '(') {
++        int dotid = set_idnum('.', 0);
++        next_nomacro();
++        ps = &first;
++        if (tok != ')') for (;;) {
++            int varg = tok;
++            next_nomacro();
++            if (varg < TOK_IDENT)
++        bad_list:
++                tcc_error("bad macro parameter list");
++            s = sym_push2(&define_stack, varg | SYM_FIELD, 0, 0);
++            *ps = s;
++            ps = &s->next;
++            if (tok == ')')
++                break;
++            if (tok != ',')
++                goto bad_list;
++            next_nomacro();
++        }
++        parse_flags |= PARSE_FLAG_SPACES;
++        next_nomacro();
++        set_idnum('.', dotid);
++    }
++    while (is_space(tok))
++        next_nomacro();
++    if (tok != '{')
++        tcc_error("'{' expected in '#macro' definition");
++    parse_flags |= PARSE_FLAG_ACCEPT_STRAYS | PARSE_FLAG_SPACES;
++    tok_str_new(&str);
++    t0 = 0;
++    level = 1;
++    next_nomacro();
++    while (level > 0) {
++        if (tok == TOK_EOF)
++            tcc_error("unexpected end of file in '#macro' definition");
++        if (tok == '{') {
++            level++;
++        } else if (tok == '}') {
++            level--;
++            if (level == 0)
++                break;
++        }
++        if (is_space(tok) || tok == TOK_LINEFEED) {
++            str.need_spc |= 1;
++        } else {
++            if (TOK_TWOSHARPS == tok) {
++                if (0 == t0)
++                    goto bad_twosharp;
++                tok = TOK_PPJOIN;
++                t |= MACRO_JOIN;
++            }
++            tok_str_add2_spc(&str, tok, &tokc);
++            t0 = tok;
++        }
++        next_nomacro();
++    }
++    parse_flags = saved_parse_flags;
++    tok_str_add(&str, 0);
++    if (t0 == TOK_PPJOIN)
++bad_twosharp:
++        tcc_error("'##' cannot appear at either end of macro");
++    t |= MACRO_SUPERC_LOCAL;
++    define_push(v, t, str.str, first);
++    next_nomacro();          /* consume '}' */
++}
++
++#endif /* TCC_EXT */
++
+ /* is_bof is true if first non space token at beginning of file */
+ ST_FUNC void preprocess(int is_bof)
+ {
+@@ -1967,6 +2152,15 @@ ST_FUNC void preprocess(int is_bof)
+     case TOK_LINEFEED:
+         goto the_end;
+     default:
++#ifdef TCC_EXT
++        if (tok >= TOK_IDENT && tok < tok_ident
++            && !strcmp(get_tok_str(tok, NULL), "macro")) {
++            if (!s1->superc_ext)
++                tcc_error("'#macro' requires -std=tcc-ext");
++            parse_superc_macro();
++            break;
++        }
++#endif
+         /* ignore gas line comment in an 'S' file. */
+         if (saved_parse_flags & PARSE_FLAG_ASM_FILE)
+             goto ignore;
+@@ -3248,6 +3442,11 @@ static int macro_subst_tok(
+         int *jstr;
+         Sym *sa;
+         int ret;
++#ifdef TCC_EXT
++        int *hbody = NULL;
++        if (s->type.t & MACRO_SUPERC_LOCAL)
++            mstr = hbody = superc_hygiene_body(mstr);
++#endif
+ 
+         if (s->type.t & MACRO_FUNC) {
+             int saved_parse_flags = parse_flags;
+@@ -3358,6 +3557,10 @@ static int macro_subst_tok(
+             tok_str_free_str(jstr);
+         if (mstr != s->d)
+             tok_str_free_str(mstr);
++#ifdef TCC_EXT
++        if (hbody && mstr != hbody)
++            tok_str_free_str(hbody);
++#endif
+         return ret;
+ 
+     } else {
+@@ -3585,6 +3788,10 @@ static void putdefs(CString *cs, const char *p)
+ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
+ {
+     cstr_printf(cs, "#define __TINYC__ 9%.2s\n", &TCC_VERSION[4]);
++#ifdef TCC_EXT
++    if (s1->superc_ext)
++        putdef(cs, "__TCC_EXT__");
++#endif
+     putdefs(cs, target_machine_defs);
+     putdefs(cs, target_os_defs);
+ 
+@@ -3729,6 +3936,20 @@ ST_FUNC void tccpp_new(TCCState *s)
+         p = r;
+     }
+ 
++#ifdef TCC_EXT
++    if (!s->superc_ext) {
++        /* The superc keywords are interned last; make them plain
++           identifiers when the extension is not enabled.  Note that
++           'test' may already be interned as an asm keyword, in which
++           case the range ends before TOK_SUPERC_TEST. */
++        int t;
++        for (t = TOK_SUPERC_PACKAGE; t < TOK_SUPERC_TEST && t < tok_ident; t++)
++            tok_unintern(t);
++        if (TOK_SUPERC_PACKAGE < tok_ident)
++            tok_ident = TOK_SUPERC_PACKAGE;
++    }
++#endif
++
+     /* we add dummy defines for some special macros to speed up tests
+        and to have working defined() */
+     define_push(TOK___LINE__, MACRO_OBJ, NULL, NULL);
+diff --git a/tccrun.c b/tccrun.c
+index 1003ea5..ccf684d 100644
+--- a/tccrun.c
++++ b/tccrun.c
+@@ -212,6 +212,46 @@ ST_FUNC void tcc_run_free(TCCState *s1)
+ #define RT_EXIT_ZERO 0xE0E00E0E /* passed from longjmp instead of '0' */
+ 
+ /* launch the compiled program with the given arguments */
++#ifdef TCC_EXT
++/* run all compiled 'test' blocks (the -test option) */
++static int tcc_run_tests(TCCState *s1)
++{
++    int i, nrun = 0, nfail = 0;
++    const char *(*err_msg)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_msg_get");
++    void (*err_clear)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_clear");
++
++    for (i = 0; i < s1->superc_test_count; i++) {
++        SupercTestEntry *e = s1->superc_tests[i];
++        int (*fn)(void) = (void*)tcc_get_symbol(s1, e->fn_name);
++        int r;
++        if (!fn)
++            continue;
++        if (s1->superc_test_filter
++            && !strstr(e->desc, s1->superc_test_filter))
++            continue;
++        ++nrun;
++        if (err_clear)
++            err_clear();
++        fflush(stdout);
++        fflush(stderr);
++        r = fn();
++        if (r) {
++            ++nfail;
++            fprintf(stderr, "FAIL: %s", e->desc);
++            if (err_msg && err_msg())
++                fprintf(stderr, ": %s", err_msg());
++            fprintf(stderr, "\n");
++        } else {
++            printf("PASS: %s\n", e->desc);
++        }
++        fflush(stdout);
++    }
++    printf("%d test(s), %d failure(s)\n", nrun, nfail);
++    fflush(stdout);
++    return nfail ? 1 : 0;
++}
++#endif
++
+ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
+ {
+     int (*prog_main)(int, char **, char **), ret;
+@@ -228,8 +268,17 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
+     char **envp = environ;
+ #endif
+ 
++#ifdef TCC_EXT
++    if (s1->superc_test_mode && s1->superc_test_count == 0
++        && s1->nb_errors == 0)
++        return 0;
++#endif
+     /* tcc -dt -run ... nothing to do if no main() */
+-    if ((s1->dflag & 16) && (addr_t)-1 == get_sym_addr(s1, "main", 0, 1))
++    if ((s1->dflag & 16) && (addr_t)-1 == get_sym_addr(s1, "main", 0, 1)
++#ifdef TCC_EXT
++        && !s1->superc_test_mode
++#endif
++        )
+         return 0;
+ 
+     tcc_add_symbol(s1, "__rt_exit", rt_exit);
+@@ -241,6 +290,11 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
+     if (tcc_relocate(s1) < 0)
+         return -1;
+ 
++#ifdef TCC_EXT
++    if (s1->superc_test_mode)
++        return tcc_run_tests(s1);
++#endif
++
+     prog_main = (void*)get_sym_addr(s1, s1->run_main, 1, 1);
+     if ((addr_t)-1 == (addr_t)prog_main)
+         return -1;
+diff --git a/tcctok.h b/tcctok.h
+index d8e7b44..caa23e9 100644
+--- a/tcctok.h
++++ b/tcctok.h
+@@ -440,3 +440,15 @@
+ #if defined TCC_TARGET_RISCV64
+ #include "riscv64-tok.h"
+ #endif
++
++#ifdef TCC_EXT
++     /* superc language extensions (active with -std=tcc-ext) */
++     DEF(TOK_SUPERC_PACKAGE,   "package")
++     DEF(TOK_SUPERC_IMPORT,    "import")
++     DEF(TOK_SUPERC_INTERFACE, "interface")
++     DEF(TOK_SUPERC_IMPL,      "impl")
++     DEF(TOK_SUPERC_DEFER,     "defer")
++     DEF(TOK_SUPERC_ERRDEFER,  "errdefer")
++     DEF(TOK_SUPERC_ERR,       "err")
++     DEF(TOK_SUPERC_TEST,      "test")
++#endif
+diff --git a/tests/tests2/156_superc_defer.c b/tests/tests2/156_superc_defer.c
+new file mode 100644
+index 0000000..b270286
+--- /dev/null
++++ b/tests/tests2/156_superc_defer.c
+@@ -0,0 +1,107 @@
++/* superc extension: defer */
++#include <stdio.h>
++
++static char log_buf[512];
++static int log_pos;
++
++static void log_reset(void) { log_pos = 0; log_buf[0] = '\0'; }
++static void log_add(const char *s)
++{
++    int n = 0;
++    while (s[n])
++        n++;
++    if (log_pos + n < (int)sizeof(log_buf)) {
++        int i;
++        for (i = 0; i < n; i++)
++            log_buf[log_pos++] = s[i];
++        log_buf[log_pos] = '\0';
++    }
++}
++static void log_print(const char *tag) { printf("%s: %s\n", tag, log_buf); }
++
++/* 1: basic LIFO order in a block */
++static void t_basic(void)
++{
++    log_reset();
++    {
++        defer log_add("a");
++        defer log_add("b");
++        defer log_add("c");
++        log_add("body");
++    }
++    log_print("basic");
++}
++
++/* 2: defer runs when the block is left by break/continue */
++static void t_loop(void)
++{
++    int i;
++    log_reset();
++    for (i = 0; i < 3; i++) {
++        defer log_add("d");
++        if (i == 1)
++            continue;
++        log_add("i");
++        if (i == 2)
++            break;
++    }
++    log_print("loop");
++}
++
++/* 3: defer runs on return, and the return value is preserved */
++static int t_return(int x)
++{
++    log_reset();
++    defer log_add("one");
++    if (x > 0) {
++        defer log_add("two");
++        return x * 2;
++    }
++    defer log_add("three");
++    return -1;
++}
++
++/* 4: goto out of a block runs the defers of the scopes being left */
++static void t_goto(void)
++{
++    log_reset();
++    {
++        defer log_add("outer");
++        {
++            defer log_add("inner");
++            goto out;
++        }
++    }
++out:
++    log_print("goto");
++}
++
++/* 5: recursion keeps each frame's defers separate */
++static int rec(int n)
++{
++    defer log_add("r");
++    if (n <= 0)
++        return 0;
++    return n + rec(n - 1);
++}
++
++static void t_rec(void)
++{
++    int r;
++    log_reset();
++    r = rec(3);
++    printf("rec: %d %d\n", r, (int)(log_pos / 1));
++}
++
++int main(void)
++{
++    t_basic();
++    t_loop();
++    printf("ret1: %d ", t_return(5));
++    log_print("ret1log");
++    printf("ret2: %d ", t_return(-5));
++    log_print("ret2log");
++    t_goto();
++    t_rec();
++    return 0;
++}
+diff --git a/tests/tests2/156_superc_defer.expect b/tests/tests2/156_superc_defer.expect
+new file mode 100644
+index 0000000..5282be6
+--- /dev/null
++++ b/tests/tests2/156_superc_defer.expect
+@@ -0,0 +1,6 @@
++basic: bodycba
++loop: iddid
++ret1: 10 ret1log: twoone
++ret2: -1 ret2log: threeone
++goto: innerouter
++rec: 6 4
+diff --git a/tests/tests2/157_superc_err.c b/tests/tests2/157_superc_err.c
+new file mode 100644
+index 0000000..2522e83
+--- /dev/null
++++ b/tests/tests2/157_superc_err.c
+@@ -0,0 +1,123 @@
++/* superc extension: errdefer + err */
++#include <stdio.h>
++#include <string.h>
++
++int __tcc_err_flag_get(void);
++int __tcc_err_id_get(void);
++const char *__tcc_err_msg_get(void);
++void __tcc_err_clear(void);
++
++#define SENT (-1)
++
++static char buf[256];
++static int blen;
++
++static void log_reset(void) { blen = 0; buf[0] = '\0'; }
++static void log_add(const char *s)
++{
++    while (*s && blen < (int)sizeof(buf) - 2)
++        buf[blen++] = *s++;
++    buf[blen] = '\0';
++}
++static void log_print(const char *tag) { printf("%s: %s\n", tag, buf); }
++
++/* errdefer is skipped on the normal path and runs in reverse on the
++   error path; plain defer always runs */
++static int e1(int fail)
++{
++    defer log_add("1");
++    errdefer log_add("2");
++    errdefer log_add("3");
++    if (fail)
++        err(7, "boom");
++    log_add("4");
++    return 0;
++}
++
++static int inner(int fail)
++{
++    defer log_add("A");
++    errdefer log_add("B");
++    if (fail)
++        err(9, "inner");
++    return 0;
++}
++
++/* propagation through two frames with the sentinel */
++static int outer(int fail)
++{
++    defer log_add("C");
++    errdefer log_add("D");
++    if (inner(fail) == SENT)
++        err();              /* re-raise after the local cleanups */
++    log_add("E");
++    return 0;
++}
++
++/* err inside a loop leaves the whole frame */
++static void loop_err(int fail)
++{
++    int i;
++    for (i = 0; i < 3; i++) {
++        defer log_add("d");
++        if (fail && i == 1)
++            err(12, "loop");
++        log_add("i");
++    }
++    log_add("z");
++}
++
++static int *ptr_err(int fail)
++{
++    defer log_add("p");
++    if (fail)
++        err(11, "ptr");
++    return 0;
++}
++
++int main(void)
++{
++    log_reset();
++    printf("e1-normal=%d ", e1(0));
++    log_print("e1-normal");
++    printf("flag=%d\n", __tcc_err_flag_get());
++
++    __tcc_err_clear();
++    log_reset();
++    printf("e1-error=%d ", e1(1));
++    log_print("e1-error");
++    printf("id=%d msg=%s\n", __tcc_err_id_get(), __tcc_err_msg_get());
++
++    __tcc_err_clear();
++    log_reset();
++    printf("outer-error=%d ", outer(1));
++    log_print("outer-error");
++    printf("id=%d msg=%s\n", __tcc_err_id_get(), __tcc_err_msg_get());
++
++    __tcc_err_clear();
++    log_reset();
++    printf("outer-normal=%d ", outer(0));
++    log_print("outer-normal");
++    printf("flag=%d\n", __tcc_err_flag_get());
++
++    __tcc_err_clear();
++    log_reset();
++    loop_err(1);
++    log_print("loop-error");
++    printf("id=%d\n", __tcc_err_id_get());
++
++    __tcc_err_clear();
++    log_reset();
++    loop_err(0);
++    log_print("loop-normal");
++
++    __tcc_err_clear();
++    log_reset();
++    printf("ptr=%d ", ptr_err(1) == (int *)(long)SENT);
++    log_print("ptr");
++    printf("id=%d msg=%s\n", __tcc_err_id_get(), __tcc_err_msg_get());
++
++    __tcc_err_clear();
++    printf("final-flag=%d\n", __tcc_err_flag_get());
++    return 0;
++}
+diff --git a/tests/tests2/157_superc_err.expect b/tests/tests2/157_superc_err.expect
+new file mode 100644
+index 0000000..a555c95
+--- /dev/null
++++ b/tests/tests2/157_superc_err.expect
+@@ -0,0 +1,14 @@
++e1-normal=0 e1-normal: 41
++flag=0
++e1-error=-1 e1-error: 321
++id=7 msg=boom
++outer-error=-1 outer-error: BADC
++id=9 msg=inner
++outer-normal=0 outer-normal: AEC
++flag=0
++loop-error: idd
++id=12
++loop-normal: idididz
++ptr=1 ptr: p
++id=11 msg=ptr
++final-flag=0
+diff --git a/tests/tests2/158_superc_test.c b/tests/tests2/158_superc_test.c
+new file mode 100644
+index 0000000..ad3cc03
+--- /dev/null
++++ b/tests/tests2/158_superc_test.c
+@@ -0,0 +1,61 @@
++/* superc extension: 'test "desc" { ... }' blocks and -test mode */
++#include <stdio.h>
++
++int __tcc_err_flag_get(void);
++int __tcc_err_id_get(void);
++void __tcc_err_clear(void);
++
++test "arithmetic works" {
++    if (1 + 1 != 2)
++        err(1, "1 + 1 != 2");
++}
++
++test "defer runs inside a test block" {
++    int n = 0;
++    {
++        defer n++;
++        n += 2;
++    }
++    if (n != 3)
++        err(2, "defer did not run");
++}
++
++test "errdefer is skipped on the normal path" {
++    errdefer printf("not reached\n");
++    if (0)
++        err(3, "never");
++}
++
++test "strings and loops" {
++    int i, sum = 0;
++    const char *s = "abcd";
++    for (i = 0; s[i]; i++)
++        sum += s[i];
++    if (sum != 'a' + 'b' + 'c' + 'd')
++        err(4, "bad sum");
++}
++
++/* a helper used by a test; a failing helper propagates via the sentinel */
++static int helper(int x)
++{
++    if (x < 0)
++        err(5, "negative");
++    return x * 2;
++}
++
++test "helpers propagate errors" {
++    if (helper(3) != 6)
++        err(6, "helper(3) != 6");
++    if (helper(-1) != -1)
++        err(7, "no sentinel from helper");
++    if (__tcc_err_id_get() != 5)
++        err(8, "wrong error id");
++    __tcc_err_clear();      /* handled here: the test itself passes */
++}
++
++int main(void)
++{
++    /* -test mode never calls main */
++    printf("main should not run\n");
++    return 0;
++}
+diff --git a/tests/tests2/158_superc_test.expect b/tests/tests2/158_superc_test.expect
+new file mode 100644
+index 0000000..5fc4185
+--- /dev/null
++++ b/tests/tests2/158_superc_test.expect
+@@ -0,0 +1,6 @@
++PASS: arithmetic works
++PASS: defer runs inside a test block
++PASS: errdefer is skipped on the normal path
++PASS: strings and loops
++PASS: helpers propagate errors
++5 test(s), 0 failure(s)
+diff --git a/tests/tests2/159_superc_package.c b/tests/tests2/159_superc_package.c
+new file mode 100644
+index 0000000..a1c6d5d
+--- /dev/null
++++ b/tests/tests2/159_superc_package.c
+@@ -0,0 +1,36 @@
++/* superc extension: package / import */
++#include <stdio.h>
++
++package math {
++    int add(int a, int b) { return a + b; }
++    int twice(int a) { return add(a, a); }
++    int hidden_helper(int a) { return a + 1; }
++}
++
++package text {
++    int len(const char *s)
++    {
++        int n = 0;
++        while (s[n])
++            n++;
++        return n;
++    }
++}
++
++import math;
++import text;
++
++int main(void)
++{
++    /* imported names resolve to the mangled symbols */
++    printf("add=%d\n", add(2, 3));
++    printf("twice=%d\n", twice(21));
++    printf("len=%d\n", len("hello"));
++
++    /* the mangled names are ordinary global symbols */
++    printf("mangled=%d %d\n", math__add(10, 20), text__len("abc"));
++
++    /* a package can see its own members without qualification */
++    printf("helper=%d\n", math__hidden_helper(41));
++    return 0;
++}
+diff --git a/tests/tests2/159_superc_package.expect b/tests/tests2/159_superc_package.expect
+new file mode 100644
+index 0000000..63e3428
+--- /dev/null
++++ b/tests/tests2/159_superc_package.expect
+@@ -0,0 +1,5 @@
++add=5
++twice=42
++len=5
++mangled=30 3
++helper=42
+diff --git a/tests/tests2/160_superc_interface.c b/tests/tests2/160_superc_interface.c
+new file mode 100644
+index 0000000..5c95819
+--- /dev/null
++++ b/tests/tests2/160_superc_interface.c
+@@ -0,0 +1,88 @@
++/* superc extension: interface / impl (fat pointer + vtable) */
++#include <stdio.h>
++
++interface Shape {
++    int area();
++    const char *name();
++}
++
++interface Printable {
++    void print();
++}
++
++struct Circle { int r; };
++struct Rect { int w, h; };
++
++impl Shape for Circle {
++    int area(Circle *self) { return 3 * self->r * self->r; }
++    const char *name(Circle *self) { return "circle"; }
++}
++
++impl Shape for Rect {
++    int area(Rect *self) { return self->w * self->h; }
++    const char *name(Rect *self) { return "rect"; }
++}
++
++impl Printable for Circle {
++    void print(Circle *self) { printf("Circle(%d)", self->r); }
++}
++
++impl Printable for Rect {
++    void print(Rect *self) { printf("Rect(%dx%d)", self->w, self->h); }
++}
++
++/* implicit conversion of a struct value to the interface value */
++static int describe(Shape s)
++{
++    printf("%s:%d ", s.name(), s.area());
++    return s.area();
++}
++
++/* an interface value as an ordinary struct local */
++static void show(Shape s)
++{
++    printf("[%s]", s.name());
++}
++
++static void dump(Printable p)
++{
++    p.print();
++    printf(" ");
++}
++
++int main(void)
++{
++    Circle c;
++    Rect r;
++    Shape s;
++
++    c.r = 5;
++    r.w = 4;
++    r.h = 6;
++
++    printf("total=%d\n", describe(c) + describe(r));
++
++    s = c;
++    show(s);
++
++    s = r;
++    show(s);
++    printf("\n");
++
++    dump(c);
++    dump(r);
++    printf("\n");
++
++    /* a copy of an interface value still points at the same object */
++    s = c;
++    show(s);
++    show(s);
++    printf("\n");
++
++    /* explicit cast syntax also works */
++    show((Shape)c);
++    printf("\n");
++
++    printf("sizeof=%d\n", (int)sizeof(Shape));
++    return 0;
++}
+diff --git a/tests/tests2/160_superc_interface.expect b/tests/tests2/160_superc_interface.expect
+new file mode 100644
+index 0000000..80f15a4
+--- /dev/null
++++ b/tests/tests2/160_superc_interface.expect
+@@ -0,0 +1,6 @@
++circle:75 rect:24 total=99
++[circle][rect]
++Circle(5) Rect(4x6) 
++[circle][circle]
++[circle]
++sizeof=16
+diff --git a/tests/tests2/161_superc_macro.c b/tests/tests2/161_superc_macro.c
+new file mode 100644
+index 0000000..391242b
+--- /dev/null
++++ b/tests/tests2/161_superc_macro.c
+@@ -0,0 +1,58 @@
++/* superc extension: '#macro' with hygienic '__local' names */
++#include <stdio.h>
++
++#macro swap(a, b) {
++    typeof(a) __local tmp = (a);
++    (a) = (b);
++    (b) = tmp;
++}
++
++#macro maxv(x, y, out) {
++    typeof(x) __local m = (x);
++    if ((y) > m)
++        m = (y);
++    (out) = m;
++}
++
++#macro twice(stmt) {
++    stmt;
++    stmt;
++}
++
++#macro outer(a, b) {
++    typeof(a) __local t = (a);
++    swap(t, b);
++    (a) = t;
++}
++
++int main(void)
++{
++    int a = 3, b = 9, m;
++
++    swap(a, b);
++    printf("swap: %d %d\n", a, b);
++
++    maxv(a, b, m);
++    printf("maxv: %d\n", m);
++
++    outer(a, b);
++    printf("outer: %d %d\n", a, b);
++
++    twice(printf("twice\n"));
++
++    /* a user variable with the same name must not be captured */
++    {
++        int tmp = 42;
++        swap(tmp, a);
++        printf("user: tmp=%d a=%d\n", tmp, a);
++    }
++
++    /* two expansions in one scope must not clash */
++    swap(a, b);
++    swap(a, b);
++    printf("twice-swap: %d %d\n", a, b);
++
++    /* no leftover identifiers */
++    printf("names: %d\n", (int)sizeof(a));
++    return 0;
++}
+diff --git a/tests/tests2/161_superc_macro.expect b/tests/tests2/161_superc_macro.expect
+new file mode 100644
+index 0000000..aa2e0b7
+--- /dev/null
++++ b/tests/tests2/161_superc_macro.expect
+@@ -0,0 +1,8 @@
++swap: 9 3
++maxv: 9
++outer: 3 9
++twice
++twice
++user: tmp=3 a=42
++twice-swap: 42 9
++names: 4
+diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
+index 83933e6..27640f5 100644
+--- a/tests/tests2/Makefile
++++ b/tests/tests2/Makefile
+@@ -77,6 +77,19 @@ ifneq (-$(ARCH)-$(CONFIG_WIN32)-,-arm64-yes-)
+  SKIP += 145_winarm64_interlocked.test
+ endif
+ 
++# superc language extension tests: they need a TCC_EXT build and are
++# always run with '-std=tcc-ext' (gcc cannot compile them, so the
++# .expect files are committed)
++SUPERC_TESTS = $(patsubst %.c,%.test,$(sort $(notdir $(wildcard $(SRC)/1??_superc_*.c))))
++# the compiler itself decides whether the extensions are compiled in
++SUPERC_OK := $(shell echo | $(TCC_LOCAL) -std=tcc-ext -dD -E - 2>/dev/null | grep -q __TCC_EXT__ && echo yes)
++ifneq (,$(SUPERC_OK))
++ $(SUPERC_TESTS): FLAGS += -std=tcc-ext
++ 158_superc_test.test: FLAGS += -test
++else
++ SKIP += $(SUPERC_TESTS)
++endif
++
+ # Some tests might need arguments
+ ARGS =
+ 31_args.test : ARGS = arg1 arg2 arg3 arg4 arg5

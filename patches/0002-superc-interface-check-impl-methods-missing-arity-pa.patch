@@ -1,0 +1,185 @@
+From 97418cf24df18c1b0597317cb48068509d3795a1 Mon Sep 17 00:00:00 2001
+From: superc-agent <agent@localhost>
+Date: Fri, 6 Nov 2026 16:54:18 +0800
+Subject: [PATCH 2/2] superc interface: check impl methods (missing, arity,
+ parameter and return types)
+
+superc_check_impl() compares each 'impl' method against the generated
+vtable field: a missing method, a wrong parameter count, an incompatible
+parameter type and an incompatible return type are now compile errors
+instead of silently producing a broken vtable.
+
+tests/tests2/162_superc_iface_errors.c covers all of them (-dt); the
+tests2 suite passes with (141) and without (134) -DTCC_EXT.
+---
+ tccgen.c                                    | 60 +++++++++++++++++++++
+ tests/tests2/162_superc_iface_errors.c      | 44 +++++++++++++++
+ tests/tests2/162_superc_iface_errors.expect | 17 ++++++
+ tests/tests2/Makefile                       |  1 +
+ 4 files changed, 122 insertions(+)
+ create mode 100644 tests/tests2/162_superc_iface_errors.c
+ create mode 100644 tests/tests2/162_superc_iface_errors.expect
+
+diff --git a/tccgen.c b/tccgen.c
+index 9449490..cb52e43 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -7512,6 +7512,65 @@ static void superc_interface_parse(void)
+     tok_str_free(body);
+ }
+ 
++/* Verify that 'impl IFACE for TYPE' defines every method with a
++   compatible signature.  'pkg' is the pseudo package holding them. */
++static void superc_check_impl(SupercIface *ifc, const char *pkg)
++{
++    Sym *vt = struct_find(ifc->vt_tag);
++    CType vtt;
++    int i;
++
++    if (!vt)
++        return;
++    /* the tag symbol does not carry the struct type itself */
++    vtt.t = VT_STRUCT;
++    vtt.ref = vt;
++    for (i = 0; i < ifc->nb_methods; i++) {
++        int m = ifc->methods[i];
++        const char *mname = get_tok_str(m, NULL);
++        Sym *f, *g, *fp, *gp, *fr, *gr;
++        CType *fptr, *gfun;
++        int ofs;
++
++        f = find_field(&vtt, m, &ofs);
++        if (!f || (f->type.t & VT_BTYPE) != VT_PTR)
++            continue;
++        fptr = pointed_type(&f->type);      /* RET (*)(void *, ...) */
++        if ((fptr->t & VT_BTYPE) != VT_FUNC || !fptr->ref)
++            continue;
++        g = sym_find(superc_mangle_tok(pkg, m));
++        if (!g)
++            tcc_error("impl of '%s' does not define method '%s'",
++                      ifc->name, mname);
++        if ((g->type.t & VT_BTYPE) != VT_FUNC || !g->type.ref)
++            tcc_error("method '%s' of '%s' must be a function", mname,
++                      ifc->name);
++        gfun = &g->type;                    /* RET (*)(...) */
++        fr = fptr->ref;
++        gr = gfun->ref;
++        if (!is_compatible_types(&fr->type, &gr->type))
++            tcc_error("method '%s' of '%s' has an incompatible return type",
++                      mname, ifc->name);
++        /* the first parameter of both is the 'self' pointer */
++        fp = fr->next;
++        gp = gr->next;
++        if (fp)
++            fp = fp->next;
++        if (gp)
++            gp = gp->next;
++        while (fp && gp) {
++            if (!is_compatible_types(&fp->type, &gp->type))
++                tcc_error("method '%s' of '%s' has an incompatible "
++                          "parameter", mname, ifc->name);
++            fp = fp->next;
++            gp = gp->next;
++        }
++        if (fp || gp)
++            tcc_error("method '%s' of '%s' has the wrong number of "
++                      "parameters", mname, ifc->name);
++    }
++}
++
+ static void superc_impl_parse(void)
+ {
+     SupercIface *ifc;
+@@ -7606,6 +7665,7 @@ static void superc_impl_parse(void)
+         decl(VT_CONST);
+     skip('}');
+     tcc_state->superc_package = saved_pkg;
++    superc_check_impl(ifc, pkgname);
+ 
+     /* Emit the vtable object:
+        'const struct NAME_vt __tcc_vt_TYPE_NAME = { (void(*)(void))m, ... };' */
+diff --git a/tests/tests2/162_superc_iface_errors.c b/tests/tests2/162_superc_iface_errors.c
+new file mode 100644
+index 0000000..1bcaae0
+--- /dev/null
++++ b/tests/tests2/162_superc_iface_errors.c
+@@ -0,0 +1,44 @@
++/* superc extension: diagnostics for malformed 'impl' blocks */
++#if defined test_missing_method
++interface Shape { int area(); void dump(int n); }
++struct Circle { int r; };
++impl Shape for Circle {
++    int area(Circle *self) { return self->r; }
++}
++int main(void) { return 0; }
++#elif defined test_wrong_param_count
++interface Shape { int area(); }
++struct Circle { int r; };
++impl Shape for Circle {
++    int area(Circle *self, int extra) { return self->r + extra; }
++}
++int main(void) { return 0; }
++#elif defined test_wrong_return_type
++interface Shape { int area(); }
++struct Circle { int r; };
++impl Shape for Circle {
++    char *area(Circle *self) { return 0; }
++}
++int main(void) { return 0; }
++#elif defined test_incompatible_param
++interface Shape { int scale(int n); }
++struct Circle { int r; };
++impl Shape for Circle {
++    int scale(Circle *self, char *n) { return self->r + (n != 0); }
++}
++int main(void) { return 0; }
++#elif defined test_unknown_interface
++struct Circle { int r; };
++impl Nope for Circle {
++    int area(Circle *self) { return self->r; }
++}
++int main(void) { return 0; }
++#elif defined test_duplicate_impl
++interface Shape { int area(); }
++struct Circle { int r; };
++impl Shape for Circle { int area(Circle *self) { return 1; } }
++impl Shape for Circle { int area(Circle *self) { return 2; } }
++int main(void) { return 0; }
++#else
++int main(void) { return 0; }
++#endif
+diff --git a/tests/tests2/162_superc_iface_errors.expect b/tests/tests2/162_superc_iface_errors.expect
+new file mode 100644
+index 0000000..1dc9596
+--- /dev/null
++++ b/tests/tests2/162_superc_iface_errors.expect
+@@ -0,0 +1,17 @@
++[test_missing_method]
++162_superc_iface_errors.c:8: error: impl of 'Shape' does not define method 'dump'
++
++[test_wrong_param_count]
++162_superc_iface_errors.c:15: error: method 'area' of 'Shape' has the wrong number of parameters
++
++[test_wrong_return_type]
++162_superc_iface_errors.c:22: error: method 'area' of 'Shape' has an incompatible return type
++
++[test_incompatible_param]
++162_superc_iface_errors.c:29: error: method 'scale' of 'Shape' has an incompatible parameter
++
++[test_unknown_interface]
++162_superc_iface_errors.c:32: error: unknown interface 'Nope'
++
++[test_duplicate_impl]
++162_superc_iface_errors.c:40: error: duplicate impl of 'Shape' for 'Circle'
+diff --git a/tests/tests2/Makefile b/tests/tests2/Makefile
+index 27640f5..3beee5c 100644
+--- a/tests/tests2/Makefile
++++ b/tests/tests2/Makefile
+@@ -86,6 +86,7 @@ SUPERC_OK := $(shell echo | $(TCC_LOCAL) -std=tcc-ext -dD -E - 2>/dev/null | gre
+ ifneq (,$(SUPERC_OK))
+  $(SUPERC_TESTS): FLAGS += -std=tcc-ext
+  158_superc_test.test: FLAGS += -test
++ 162_superc_iface_errors.test: FLAGS += -dt
+ else
+  SKIP += $(SUPERC_TESTS)
+ endif
