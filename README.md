@@ -95,7 +95,37 @@ int main(void)
 }
 ```
 
-`err();`（不带参数）用于在调用方处理后**重抛**错误。
+完整可运行示例见 [examples/err_demo.c](examples/err_demo.c)：
+
+```sh
+./tcc/tcc -B tcc -std=tcc-ext -run examples/err_demo.c
+```
+
+`err` 速查：
+
+| 写法 | 行为 |
+|---|---|
+| `err(code, msg)` | 写入错误槽（`flag=1`），逆序执行本帧的 `errdefer` 与 `defer`，返回哨兵 `-1`（按函数返回类型转换） |
+| `err()` | **重抛**：保留已有 `id`/`msg`，继续展开清理并返回哨兵 |
+| `defer stmt;` | 任何离开作用域的路径都执行（正常 `return`、`break`、`continue`、`goto`） |
+| `errdefer stmt;` | 仅在错误路径（本帧执行了 `err`）执行，正常返回时跳过 |
+
+配套的运行时接口（`libtcc1` 提供，直接在源码里声明即可）：
+
+| 函数 | 用途 |
+|---|---|
+| `int __tcc_err_flag_get(void)` | 错误槽是否被设置 |
+| `int __tcc_err_id_get(void)` | `err` 传入的错误码 |
+| `const char *__tcc_err_msg_get(void)` | `err` 传入的消息指针 |
+| `void __tcc_err_clear(void)` | 清空错误槽（调用方处理完错误后必须清） |
+
+约定与限制：
+
+- `err` 不自动传播：调用方必须自己检查哨兵 `-1`，否则错误会被忽略；
+- 处理掉错误后要 `__tcc_err_clear()`；若只是转发，调用 `err();` 原样重抛；
+- `err` 会离开**整个函数帧**（循环/嵌套块里的 `defer` 都会执行），无法只退出内层块；
+- `err` 不能出现在 `defer`/`errdefer` 体内（会编译报错）；
+- 返回类型为 `void` 的函数里 `err` 直接返回，不产生哨兵值。
 
 ### test 块
 
