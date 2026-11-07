@@ -158,11 +158,13 @@ extern long double strtold (const char *__nptr, char **__endptr);
 /* #define TCC_TARGET_ARM64  *//* ARMv8 code generator */
 /* #define TCC_TARGET_C67    *//* TMS320C67xx code generator */
 /* #define TCC_TARGET_RISCV64 *//* risc-v code generator */
+/* #define TCC_TARGET_C99    *//* portable C99 code generator */
 
 /* default target is I386 */
 #if !defined(TCC_TARGET_I386) && !defined(TCC_TARGET_ARM) && \
     !defined(TCC_TARGET_ARM64) && !defined(TCC_TARGET_C67) && \
-    !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_RISCV64)
+    !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_RISCV64) && \
+    !defined(TCC_TARGET_C99)
 # if defined __x86_64__
 #  define TCC_TARGET_X86_64
 # elif defined __arm__
@@ -383,6 +385,9 @@ extern long double strtold (const char *__nptr, char **__endptr);
 # include "coff.h"
 # include "c67-gen.c"
 # include "c67-link.c"
+#elif defined TCC_TARGET_C99
+# include "c99-gen.c"
+# include "c99-link.c"
 #elif defined(TCC_TARGET_RISCV64)
 # include "riscv64-gen.c"
 # include "riscv64-link.c"
@@ -1769,6 +1774,13 @@ ST_FUNC void gen_cvt_sxtw(void);
 ST_FUNC void gen_cvt_csti(int t);
 ST_FUNC void gen_increment_tcov (SValue *sv);
 ST_FUNC void gen_clear_cache(void);
+#endif
+
+/* ------------ c99-gen.c ------------ */
+#ifdef TCC_TARGET_C99
+ST_FUNC void gen_opl(int op);
+ST_FUNC void gen_cvt_sxtw(void);
+ST_FUNC int c99_output_file(TCCState *s1, const char *filename);
 #endif
 
 /* ------------ c67-gen.c ------------ */
