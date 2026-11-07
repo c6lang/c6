@@ -7,6 +7,7 @@
 #   make test        跑 tests2 上游全量测试（扩展模式）
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量
+#   make c99         构建 C99 输出后端 tcc/c99-tcc（产出可移植 C 源码）
 #   make clean       清理 tcc/ 的构建产物
 #   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
 #
@@ -20,7 +21,7 @@ EXT      := EXTRA-DEFS=-DC6_EXT
 MODE     := $(TCC_DIR)/.c6-mode
 
 .PHONY: all bootstrap build build-plain test test-plain test-all selftest \
-        clean distclean help check-tcc mode-ext mode-plain
+        clean distclean help check-tcc mode-ext mode-plain c99
 
 all: build
 
@@ -68,6 +69,10 @@ selftest: build
 
 test-all: selftest test
 
+# C99 输出后端：单源构建的 tcc/c99-tcc（自带 -DC6_EXT），只产出 C 源码。
+c99: bootstrap
+	$(MAKE) -C $(TCC_DIR) c99-tcc
+
 clean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true
 
@@ -75,4 +80,4 @@ distclean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) distclean || true
 
 help:
-	@sed -n '2,15p' Makefile
+	@sed -n '2,16p' Makefile

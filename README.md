@@ -881,7 +881,7 @@ TCC 源码及本仓库对它的修改均遵循 **LGPL-2.1**（见 `tcc/COPYING`�
 front-end (including every c6 extension, enabled with `-DC6_EXT`) but writes
 **portable C99 source** instead of machine code.
 
-    make -C tcc c99-tcc                     # builds tcc/c99-tcc
+    make c99                                # builds tcc/c99-tcc (configures tcc/ if needed)
     tcc/c99-tcc -c99 -B. -o out.c prog.c    # prog.c -> out.c
     cc -o prog out.c && ./prog              # compile the result with any C compiler
 
