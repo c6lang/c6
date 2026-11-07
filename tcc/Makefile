@@ -542,7 +542,7 @@ endif # ($(INCLUDED),no)
 # The C99 back-end is a native-only tool: it is built as a single-source
 # binary and needs no libtcc1.a (it emits C, it does not link).
 ifeq ($(INCLUDED),no)
-c99-tcc$(EXESUF): $(CORE_FILES) c99-gen.c c99-link.c
+c99-tcc$(EXESUF): $(CORE_FILES) c99-gen.c c99-link.c $(TCCDEFS_H)
 	$(CC) -DONE_SOURCE=1 -DTCC_TARGET_C99 -DC6_EXT -I. -O2 -o $@ tcc.c -lm -ldl
 
 .PHONY: c99
