@@ -118,6 +118,7 @@ DEF-arm64-OpenBSD  = $(DEF-arm64) -DTARGETOS_OpenBSD
 DEF-arm64-win32    = $(DEF-arm64) -DTCC_TARGET_PE
 DEF-riscv64        = -DTCC_TARGET_RISCV64
 DEF-c67            = -DTCC_TARGET_C67 -w # disable warnigs
+DEF-c99            = -DTCC_TARGET_C99
 DEF-x86_64-FreeBSD = $(DEF-x86_64) -DTARGETOS_FreeBSD
 DEF-x86_64-NetBSD  = $(DEF-x86_64) -DTARGETOS_NetBSD
 DEF-x86_64-OpenBSD = $(DEF-x86_64) -DTARGETOS_OpenBSD
@@ -217,6 +218,7 @@ arm64-osx_FILES = $(arm64_FILES) tccmacho.c
 arm64-win32_FILES = $(arm64_FILES) tccpe.c
 c67_FILES = $(CORE_FILES) c67-gen.c c67-link.c tcccoff.c
 riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c riscv64-asm.c
+c99_FILES = $(CORE_FILES) c99-gen.c c99-link.c
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
@@ -535,3 +537,14 @@ help:
 
 # --------------------------------------------------------------------------
 endif # ($(INCLUDED),no)
+
+# --------------------------------------------------------------------------
+# The C99 back-end is a native-only tool: it is built as a single-source
+# binary and needs no libtcc1.a (it emits C, it does not link).
+ifeq ($(INCLUDED),no)
+c99-tcc$(EXESUF): $(CORE_FILES) c99-gen.c c99-link.c
+	$(CC) -DONE_SOURCE=1 -DTCC_TARGET_C99 -DC6_EXT -I. -O2 -o $@ tcc.c -lm -ldl
+
+.PHONY: c99
+c99: c99-tcc$(EXESUF)
+endif

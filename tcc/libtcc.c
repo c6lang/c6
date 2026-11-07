@@ -44,7 +44,9 @@
 #elif defined(TCC_TARGET_C67)
 #include "c67-gen.c"
 #include "c67-link.c"
-#include "tcccoff.c"
+#elif defined(TCC_TARGET_C99)
+#include "c99-gen.c"
+#include "c99-link.c"
 #elif defined(TCC_TARGET_X86_64)
 #include "x86_64-gen.c"
 #include "x86_64-link.c"
@@ -984,7 +986,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
     /* add sections */
     tccelf_new(s);
 
-    if (output_type == TCC_OUTPUT_OBJ) {
+    if (output_type == TCC_OUTPUT_OBJ || output_type == TCC_OUTPUT_C99) {
         /* always elf for objects */
         s->output_format = TCC_OUTPUT_FORMAT_ELF;
         return 0;
@@ -1560,6 +1562,7 @@ enum {
     TCC_OPTION_b,
     TCC_OPTION_g,
     TCC_OPTION_c,
+    TCC_OPTION_c99,
     TCC_OPTION_dumpmachine,
     TCC_OPTION_dumpversion,
     TCC_OPTION_d,
@@ -1646,6 +1649,7 @@ static const TCCOption tcc_options[] = {
     { "undefined", TCC_OPTION_undefined, TCC_OPTION_HAS_ARG },
 #endif
     { "c", TCC_OPTION_c, 0 },
+    { "c99", TCC_OPTION_c99, 0 },
     { "dumpmachine", TCC_OPTION_dumpmachine, 0},
     { "dumpversion", TCC_OPTION_dumpversion, 0},
     { "d", TCC_OPTION_d, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
@@ -1977,6 +1981,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
 #endif
             }
             break;
+        case TCC_OPTION_c99:
+            x = TCC_OUTPUT_C99;
+            goto set_output_type;
         case TCC_OPTION_c:
             x = TCC_OUTPUT_OBJ;
         set_output_type:

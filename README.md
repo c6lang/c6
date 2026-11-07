@@ -874,3 +874,30 @@ make test-all      # selftest + tests2
 
 TCC 源码及本仓库对它的修改均遵循 **LGPL-2.1**（见 `tcc/COPYING`）。
 上游基线固定在 `2d3eea2`（`origin/mob`）。
+
+## C99 output back-end (`-c99`)
+
+`tcc/c99-gen.c` is a new code-generator back-end: it reuses the complete
+front-end (including every c6 extension, enabled with `-DC6_EXT`) but writes
+**portable C99 source** instead of machine code.
+
+    make -C tcc c99-tcc                     # builds tcc/c99-tcc
+    tcc/c99-tcc -c99 -B. -o out.c prog.c    # prog.c -> out.c
+    cc -o prog out.c && ./prog              # compile the result with any C compiler
+
+The generated file only needs `memcpy`/`memmove`/`memset` from `<string.h>`:
+the vstack registers become a `union` array `__c99_r[8]`, the stack frame is
+the byte array `__c99_frm.f` addressed by tcc's own local offsets, comparisons
+are materialised into `__c99_cnd`, and data sections are emitted as byte arrays
+that `__c99_init()` patches from the relocation table at start-up.
+
+Working today: integers, floats, pointers, arrays and string literals; locals
+and globals; `if`/`while`/`for`/`do`/`switch`; recursion and direct calls;
+static functions; `?:`, bit operations, shifts and all type casts.
+
+Not supported yet (each gives a clear error instead of miscompiling): structs
+and unions, functions returning a struct, indirect calls (function pointers),
+defining variadic functions, computed goto, VLAs, and the c6 runtime helpers
+(`__tcc_defer_*`, `__tcc_err_*`, slices, `async`, `go`, ...), because those are
+implemented with pthreads and raw memory in `libtcc1.c` and cannot be expressed
+in portable C99.
