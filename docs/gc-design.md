@@ -414,19 +414,22 @@ struct Node { @Node next; weak @Node prev; };  /* ✓ 双向链 */
    `for(;;){ gen_inline_functions(); if (!c6_emit_auto_impls()) break; }` 的
    fixpoint 循环里，保证 `static inline` 体里出现的 `new` 也被覆盖）。
    诊断为错误，带完整路径与 `file:line`。
-2. **跨 TU（未实现，见 §17）**：计划是每个 TU 把边写进段 `.c6.gcgraph`
-   （`{from_hash, to_hash, kind}`，用 tag 名的字符串哈希），tcc 自己就是链接器，
-   在 `tcc_output_file()` / `-run` 的内存链接阶段合并后跑一次 DFS。P6 只做了
-   单 TU：跨 TU 的环目前**漏报**。
+2. **跨 TU（已实现，仅本机后端）**：每个 TU 把边和类型名写进两个段 ——
+   `.c6.gcgraph`（`{unsigned from, to}`，8 字节一条）与 `.c6.gcname`
+   （`{unsigned hash, unsigned pad, char name[40]}`，48 字节一条，记录大小取
+   8 的倍数，这样合并时不会因为对齐在段中间插入空洞）。身份是**类型名的
+   FNV-1a 哈希**，每个 TU 各自算，所以不依赖任何跨 TU 的编号。
+   tcc 自己就是链接器：`tcc_output_file()`（输出可执行/`.o`）与
+   `tcc_relocate()`（`-run`）在链接之后各调一次 `c6_gc_graph_check()`
+   （`tcc/tccelf.c`，段不存在就直接返回，普通 C 程序零成本）。
 3. **不完整类型**：TU 内 `@B` 而 `B` 只有前向声明时，该边只记录不判定；
    由链接期给出结论（若定义始终没出现，链接期报“环/未定义”）。
 
 诊断示例（错误，不是告警）：
 
 ```
-error: reference cycle: struct A -> B -> A
-       field 'b' at a.c:12, field 'a' at b.c:3
-       break it with 'weak' (a back-reference) or 'own' (an exclusively owned chain)
+error: reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own' (type 'A' at a.c:3)
+error: reference cycle across translation units: A -> B -> A; break it with 'weak' or 'own'
 ```
 
 **落地（P6）**：单 TU 的 DFS 在 `c6_gc_flush_descs()` 里跑（`tcc/tccgen.c`），
@@ -750,8 +753,11 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
   生成到 `c99_runtime[]`）；
 - 描述符是静态数据（`static __c99_unused unsigned char ...`），析构是普通函数，
   不需要新机制；
-- 跨 TU 的链接期环检查在 `-c99` 路径上**没有**（外部链接器不做），
-  只做单 TU 检查 —— 文档写明。
+- 跨 TU 的链接期环检查在 `-c99` 路径上**没有**（外部链接器不做，而且 c99 后端
+  只输出 C 源码、没有段的概念），只做单 TU 检查 —— 文档写明。`-c99` 输出走的是
+  `c99_output_file()`，`.c6.gcgraph` 那套数据段在那里根本不会生成，所以检查
+  什么也看不到；用例用 `// NATIVE-ONLY <片段>` 标注，`run-tests.sh` 在 c99 后端
+  跳过该片段（`tests/errors/gc_cycle_cross_tu.c` 就是这么标的）。
 
 ---
 
@@ -769,9 +775,8 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 
 见 [gc-todo.md](gc-todo.md) 的 D1–D6。此外 P6 之后仍开着三件：
 
-1. **链接期跨 TU 环检测**（§8.2 第 2 条）没做：`@B` 定义在另一个 TU 时，
-   单 TU 只记录边、不给结论，所以「A 在 TU1、B 在 TU2、互相强引用」会漏报。
-   要补的话就是 `.c6.gcgraph` 段 + 链接期 DFS；
+1. **链接期跨 TU 环检测只在原生后端**（§8.2 第 2 条、§15）：`-c99` 输出 C
+   源码，没有段也没有链接期，跨 TU 环在那边仍然看不到；
 2. **只报第一条环**：`tcc_error_noabort` 列全部的写法没做，第一个环就终止；
 3. **`struct Node c6_graph` 豁免**（§8.4 / D2）没做：共享边的通用图目前只能
    写成 `own` 树或 `weak` 边。

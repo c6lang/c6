@@ -3220,9 +3220,155 @@ static int elf_output_obj(TCCState *s1, const char *filename)
     return ret;
 }
 
+#ifdef C6_EXT
+/* ---- cross-TU reference cycle check --------------------------------- */
+/* Each unit appends its strong edges and its type names to .c6.gcgraph /
+   .c6.gcname; the sections are merged while the units are linked, so a cycle
+   that only closes across translation units is visible here (design §8.2).
+   Identity is the FNV-1a hash of the type name, which every unit computes the
+   same way.  Only reachable from the linker, so the cost is one pass over a
+   handful of records. */
+typedef struct C6GraphEdge {
+    unsigned from, to;
+} C6GraphEdge;
+
+#define C6_GC_NAME_MAX 40           /* 48-byte record, 8-aligned */
+typedef struct C6GraphName {
+    unsigned hash;
+    unsigned pad;
+    char name[C6_GC_NAME_MAX];
+} C6GraphName;
+
+static Section *c6_graph_find(TCCState *s1, const char *name)
+{
+    int i;
+
+    for (i = 1; i < s1->nb_sections; i++)
+        if (!strcmp(name, s1->sections[i]->name))
+            return s1->sections[i];
+    return NULL;
+}
+
+static const char *c6_graph_name(C6GraphName *names, int n, unsigned hash)
+{
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (names[i].hash == hash)
+            return names[i].name;
+    return "?";
+}
+
+/* 1 when a cycle was found and reported */
+static int c6_graph_dfs(TCCState *s1, unsigned node, int depth,
+                        C6GraphEdge *e, int ne, unsigned *path,
+                        unsigned *nodes, int *state, int nn,
+                        C6GraphName *names, int nnames)
+{
+    int i, idx = -1;
+
+    for (i = 0; i < nn; i++)
+        if (nodes[i] == node) {
+            idx = i;
+            break;
+        }
+    if (idx < 0)
+        return 0;                   /* a type nothing else points at */
+    if (state[idx] == 2)
+        return 0;
+    if (state[idx] == 1) {
+        /* back edge: print the loop that closes here */
+        char buf[512];
+        int len = 0, from = 0;
+
+        for (i = 0; i < depth; i++)
+            if (path[i] == node) {
+                from = i;
+                break;
+            }
+        buf[0] = 0;
+        for (i = from; i < depth; i++) {
+            len += snprintf(buf + len, sizeof buf - len, "%s -> ",
+                            c6_graph_name(names, nnames, path[i]));
+            if (len >= (int)sizeof buf - 8)
+                break;
+        }
+        snprintf(buf + len, sizeof buf - len, "%s",
+                 c6_graph_name(names, nnames, node));
+        tcc_error_noabort("reference cycle across translation units: %s; "
+                          "break it with 'weak' or 'own'", buf);
+        s1->nb_errors++;
+        return 1;
+    }
+    state[idx] = 1;
+    path[depth] = node;
+    for (i = 0; i < ne; i++) {
+        if (e[i].from != node)
+            continue;
+        if (c6_graph_dfs(s1, e[i].to, depth + 1, e, ne, path, nodes, state,
+                         nn, names, nnames))
+            return 1;
+    }
+    state[idx] = 2;
+    return 0;
+}
+
+ST_FUNC void c6_gc_graph_check(TCCState *s1)
+{
+    Section *es = c6_graph_find(s1, ".c6.gcgraph");
+    Section *ns = c6_graph_find(s1, ".c6.gcname");
+    C6GraphEdge *e;
+    C6GraphName *names;
+    unsigned *nodes, *path;
+    int *state;
+    int ne, nnames, nn = 0, i, j;
+
+    if (!es || es->data_offset < sizeof(C6GraphEdge))
+        return;                     /* nothing recorded: not a c6 program */
+    e = (C6GraphEdge *)es->data;
+    ne = (int)(es->data_offset / sizeof(C6GraphEdge));
+    names = ns ? (C6GraphName *)ns->data : NULL;
+    nnames = ns ? (int)(ns->data_offset / sizeof(C6GraphName)) : 0;
+
+    nodes = tcc_mallocz((2 * ne + 1) * sizeof *nodes);
+    for (i = 0; i < ne; i++) {
+        int found;
+
+        found = 0;
+        for (j = 0; j < nn; j++)
+            if (nodes[j] == e[i].from) {
+                found = 1;
+                break;
+            }
+        if (!found)
+            nodes[nn++] = e[i].from;
+        found = 0;
+        for (j = 0; j < nn; j++)
+            if (nodes[j] == e[i].to) {
+                found = 1;
+                break;
+            }
+        if (!found)
+            nodes[nn++] = e[i].to;
+    }
+    state = tcc_mallocz(nn * sizeof *state);
+    path = tcc_mallocz((nn + 1) * sizeof *path);
+    for (i = 0; i < nn; i++)
+        if (c6_graph_dfs(s1, nodes[i], 0, e, ne, path, nodes, state, nn,
+                         names, nnames))
+            break;                  /* tcc_error() does not return */
+    tcc_free(path);
+    tcc_free(state);
+    tcc_free(nodes);
+}
+#endif
+
 LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 {
     s->nb_errors = 0;
+#ifdef C6_EXT
+    c6_gc_graph_check(s);           /* cross-TU reference cycles */
+#endif
     if (s->test_coverage)
         tcc_tcov_add_file(s, filename);
 #ifdef TCC_TARGET_C99

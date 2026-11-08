@@ -1736,6 +1736,10 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
 ST_FUNC void section_realloc(Section *sec, unsigned long new_size);
 ST_FUNC size_t section_add(Section *sec, addr_t size, int align);
 ST_FUNC void *section_ptr_add(Section *sec, addr_t size);
+#ifdef C6_EXT
+/* the reference-cycle type graph written by every unit (design §8.2) */
+ST_FUNC void c6_gc_graph_check(TCCState *s1);
+#endif
 ST_FUNC Section *find_section(TCCState *s1, const char *name);
 ST_FUNC void free_section(Section *s);
 ST_FUNC Section *new_symtab(TCCState *s1, const char *symtab_name, int sh_type, int sh_flags, const char *strtab_name, const char *hash_name, int hash_sh_flags);

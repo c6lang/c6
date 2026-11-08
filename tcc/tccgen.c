@@ -14816,6 +14816,89 @@ static void c6_gc_cycle_report(int from, int depth)
     }
 }
 
+/* ---- the type graph, for the link-time check ------------------------- */
+/* Each unit writes its strong edges and its type names into two sections.
+   Same-named sections merge when the units are linked, so a cycle that closes
+   across units becomes visible (design §8.2).  Identity is the FNV-1a hash of
+   the type name, which every unit computes the same way. */
+
+#define C6_GC_NAME_MAX 40   /* the record is 48 bytes: keep it 8-aligned so the
+                               unit's contribution stays aligned when merged */
+
+static unsigned c6_gc_tag_hash(int tag)
+{
+    const char *p = get_tok_str(tag, NULL);
+    unsigned h = 2166136261u;
+
+    for (; p && *p; p++)
+        h = (h ^ (unsigned char)*p) * 16777619u;
+    return h ? h : 1;
+}
+
+static Section *c6_gc_section(const char *name)
+{
+    Section *sec = NULL;
+    int i;
+
+    for (i = 1; i < tcc_state->nb_sections; i++)
+        if (!strcmp(name, tcc_state->sections[i]->name)) {
+            sec = tcc_state->sections[i];
+            break;
+        }
+    if (!sec)
+        sec = new_section(tcc_state, name, SHT_PROGBITS, 0);
+    return sec;
+}
+
+static void c6_gc_emit_graph(void)
+{
+    struct C6Name { unsigned hash; unsigned pad; char name[C6_GC_NAME_MAX]; };
+    int i, k, nedge = 0, nname = 0;
+    Section *ge, *gn;
+    unsigned *ep;
+    struct C6Name *np;
+    struct C6Name *names;
+    int n = 0;
+
+    for (i = 0; i < tcc_state->c6_nb_gc_types; i++) {
+        C6GcType *gt = tcc_state->c6_gc_types[i];
+        if (!gt || !gt->nfields)
+            continue;
+        nname++;
+        for (k = 0; k < gt->nfields; k++)
+            if (gt->fields[k].to_tag)
+                nedge++;
+    }
+    if (!nname)
+        return;
+    names = tcc_mallocz(nname * (int)sizeof *names);
+    gn = c6_gc_section(".c6.gcname");
+    np = section_ptr_add(gn, nname * (int)sizeof *names);
+    ge = c6_gc_section(".c6.gcgraph");
+    ep = section_ptr_add(ge, nedge * 2 * (int)sizeof(unsigned));
+    for (i = 0; i < tcc_state->c6_nb_gc_types; i++) {
+        C6GcType *gt = tcc_state->c6_gc_types[i];
+        unsigned hash;
+
+        if (!gt || !gt->nfields)
+            continue;
+        hash = c6_gc_tag_hash(gt->tag);
+        names[n].hash = hash;
+        names[n].pad = 0;
+        snprintf(names[n].name, C6_GC_NAME_MAX, "%s",
+                 get_tok_str(gt->tag, NULL));
+        n++;
+        for (k = 0; k < gt->nfields; k++) {
+            if (!gt->fields[k].to_tag)
+                continue;
+            *ep++ = hash;
+            *ep++ = c6_gc_tag_hash(gt->fields[k].to_tag);
+        }
+    }
+    memcpy(np, names, nname * sizeof *names);
+    tcc_free(names);
+}
+
 static void c6_gc_cycle_check(void)
 {
     int i;
@@ -14834,6 +14917,7 @@ static void c6_gc_flush_descs(void)
     int i;
 
     c6_gc_cycle_check();
+    c6_gc_emit_graph();
     for (i = 0; i < tcc_state->c6_nb_gc_types; i++) {
         C6GcType *gt = tcc_state->c6_gc_types[i];
         if (gt && (gt->declared || gt->nfields || gt->drop_tok))
