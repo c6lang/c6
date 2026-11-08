@@ -878,12 +878,17 @@ TCC 源码及本仓库对它的修改均遵循 **LGPL-2.1**（见 `tcc/COPYING`�
 ## C99 output back-end (`-c99`)
 
 `tcc/c99-gen.c` is a new code-generator back-end: it reuses the complete
-front-end (including every c6 extension, enabled with `-DC6_EXT`) but writes
-**portable C99 source** instead of machine code.
+front-end and writes **portable C99 source** instead of machine code.
 
-    make c99                                # builds tcc/c99-tcc (configures tcc/ if needed)
-    tcc/c99-tcc -c99 -B. -o out.c prog.c    # prog.c -> out.c
-    cc -o prog out.c && ./prog              # compile the result with any C compiler
+    make c99                                 # builds tcc/c99-tcc (configures tcc/ if needed)
+    tcc/c99-tcc -c99 -B tcc -o out.c prog.c  # prog.c -> out.c
+    cc -std=c99 -o prog out.c && ./prog      # compile the result with any C compiler
+
+`-c99` selects the output back-end; it is not a language-standard flag, and
+the language being compiled stays C.  `-B tcc` is required so that the tool
+finds tcc's own `include/` (on Debian-style hosts the multiarch directory is
+not in tcc's search path, so system headers additionally need e.g.
+`-I/usr/include/x86_64-linux-gnu`).
 
 The generated file only needs `memcpy`/`memmove`/`memset` from `<string.h>`:
 the vstack registers become a `union` array `__c99_r[8]`, the stack frame is
@@ -891,13 +896,20 @@ the byte array `__c99_frm.f` addressed by tcc's own local offsets, comparisons
 are materialised into `__c99_cnd`, and data sections are emitted as byte arrays
 that `__c99_init()` patches from the relocation table at start-up.
 
-Working today: integers, floats, pointers, arrays and string literals; locals
-and globals; `if`/`while`/`for`/`do`/`switch`; recursion and direct calls;
-static functions; `?:`, bit operations, shifts and all type casts.
+Working today: plain C programs — integers, floats, pointers, arrays and
+string literals; locals and globals; `if`/`while`/`for`/`do`/`switch`;
+recursion and direct calls; static functions; `?:`, bit operations, shifts
+and all type casts.
+
+c6 programs are **not** supported yet.  The front-end can parse c6 syntax
+(`-std=c6`), but every function compiled that way calls the defer runtime at
+its entry (`__tcc_defer_func_enter`), and `foreach`/`defer`/`try`/`catch` call
+more `__tcc_defer_*` / `__tcc_err_*` helpers; those live in `libtcc1` (raw
+stack, pthreads) and cannot be expressed in portable C99.  Even
+`int main(void){return 0;}` compiled with `-std=c6` is rejected with
+"helper function '__tcc_defer_func_enter' cannot be expressed in portable C99".
+Making c6 work here first needs a portable C runtime for defer/error/slice.
 
 Not supported yet (each gives a clear error instead of miscompiling): structs
 and unions, functions returning a struct, indirect calls (function pointers),
-defining variadic functions, computed goto, VLAs, and the c6 runtime helpers
-(`__tcc_defer_*`, `__tcc_err_*`, slices, `async`, `go`, ...), because those are
-implemented with pthreads and raw memory in `libtcc1.c` and cannot be expressed
-in portable C99.
+defining variadic functions, computed goto, and VLAs.
