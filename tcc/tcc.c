@@ -264,6 +264,13 @@ static char *default_outputfile(TCCState *s, const char *first_file)
         name = "a";
     strcpy(buf, name);
     ext = tcc_fileextension(buf);
+#ifdef TCC_TARGET_C99
+    /* same convention as a.out, but the result is C source; never derive the
+       name from the input, that would overwrite the source itself */
+    if (s->output_type == TCC_OUTPUT_C99)
+        strcpy(buf, "a.c");
+    else
+#endif
 #ifdef TCC_TARGET_PE
     if (s->output_type == TCC_OUTPUT_DLL)
         strcpy(ext, ".dll");
@@ -338,6 +345,12 @@ redo:
         }
         if (s->nb_files == 0) {
             tcc_error_noabort("no input files");
+#ifdef TCC_TARGET_C99
+        } else if (s->output_type && s->output_type != TCC_OUTPUT_C99
+                   && s->output_type != TCC_OUTPUT_PREPROCESS) {
+            /* no machine code, no linker: say so instead of pretending */
+            tcc_error_noabort("the c99 back-end only produces C source, use -c99");
+#endif
         } else if (s->output_type == TCC_OUTPUT_PREPROCESS) {
             if (s->outfile && 0!=strcmp("-",s->outfile)) {
                 ppfp = tcc_fopen(s->outfile, "wb");
@@ -358,7 +371,12 @@ redo:
 
     set_environment(s);
     if (s->output_type == 0)
+#ifdef TCC_TARGET_C99
+        /* the only thing this build can generate is C source */
+        s->output_type = TCC_OUTPUT_C99;
+#else
         s->output_type = TCC_OUTPUT_EXE;
+#endif
     ret = tcc_set_output_type(s, s->output_type);
     if (ppfp)
         s->ppfp = ppfp;

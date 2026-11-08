@@ -761,6 +761,12 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 （会自动配置 `tcc/`；直接 `make -C tcc c99-tcc` 也行，但要求 `tcc/`
 已用当前 `configure` 配置过），
 使用 `c99-tcc -c99 -o out.c prog.c`，产物用系统 C 编译器编译即可。
+`c99-tcc` 只有这一个代码生成器，所以不给动作时默认就是 `-c99`
+（输出名默认 `a.c`）；`-c`、`-shared` 这类要求机器码/链接的动作在编译前
+就直接报错，不会写出空的目标文件。`c99-link.c` 里的兜底报错发生在
+`tcc_output_file()` 里，即 `tcc_compile()` 已经离开全局状态之后，所以
+报错前要先 `tcc_enter_state()`，否则 `error1()` 会解引用空的 `tcc_state`
+而崩溃。
 
 寄存器 -> `__c99_r[8]` 联合体数组；栈帧 -> `__c99_frm.f` 字节数组（用 tcc
 自己的局部变量偏移寻址，因此不需要给局部变量取名字）；比较 -> `__c99_cnd`；

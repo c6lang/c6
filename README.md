@@ -885,10 +885,14 @@ front-end and writes **portable C99 source** instead of machine code.
     cc -std=c99 -o prog out.c && ./prog      # compile the result with any C compiler
 
 `-c99` selects the output back-end; it is not a language-standard flag, and
-the language being compiled stays C.  `-B tcc` is required so that the tool
-finds tcc's own `include/`.  The multiarch system include directory is added
-from `CONFIG_TRIPLET` in `config.h`; if your host's triplet is not detected,
-add `-I/usr/include/$(cc -print-multiarch)` by hand.
+the language being compiled stays C.  In the `c99-tcc` build it is also the
+default action, because that build has no machine-code generator: a plain
+`tcc/c99-tcc -B tcc -o out.c prog.c` already writes C source (default file
+name `a.c`), while asking it for an object file or an executable (`-c`,
+`-shared`) is an error instead of empty output.  `-B tcc` is required so that
+the tool finds tcc's own `include/`.  The multiarch system include directory
+is added from `CONFIG_TRIPLET` in `config.h`; if your host's triplet is not
+detected, add `-I/usr/include/$(cc -print-multiarch)` by hand.
 
 The generated file only needs `memcpy`/`memmove`/`memset` from `<string.h>`:
 the vstack registers become a `union` array `__c99_r[8]`, the stack frame is
