@@ -756,8 +756,10 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   给某个 TU 开启扩展后，该 TU 内所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
   全局/`static` 对象放进 `.data`（不写初始化器时在 `.bss`），因此给大型
   静态缓冲区补初始化器会增大输出文件；
-- TCC 自己的源码也按这条规则写：`make c6selfcheck` 用 `-std=c6` 编译
-  `tcc/tcc.c`（原生目标文件 + C99 后端产物）并把编出来的编译器连起来跑。
+- TCC 自己的源码也按这条规则写：`make c6selfcheck` 用 `-std=c6 -DC6_EXT`
+  编译 `tcc/tcc.c`（原生目标文件 + C99 后端产物；带 `C6_EXT` 才会连
+  `#ifdef C6_EXT` 的扩展实现一起检查）并把编出来的编译器连起来跑，两步
+  编译都不许有诊断输出。
   为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type` 等）从
   "头文件里的暂定定义"改成"头文件 `extern` 声明 + 各自 `.c` 里带初始化器
   定义一次"（`ST_DATA` 的 `ONE_SOURCE` 分支也跟着去掉了 `static`）；

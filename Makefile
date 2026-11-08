@@ -31,6 +31,9 @@ SELFHOST_C99 := $(SELFHOST)/c99
 # 自举时编译 tcc 自己用的定义：ONE_SOURCE 把整个编译器塞进一个编译单元，
 # C6_EXT 打开 c6 扩展（与 make build 的 EXTRA-DEFS 一致）
 SELFHOST_DEFS := -DONE_SOURCE=1 -DC6_EXT
+# c6selfcheck 也要带 C6_EXT：源码里 #ifdef C6_EXT 的那一半（扩展的实现）
+# 只有在打开扩展时才会被编到，不带它这项检查就只能覆盖编译器的一半。
+SELFCHECK_DEFS := -DC6_EXT
 SELFHOST_LIBS := -lm -ldl -lpthread
 HOSTCC   ?= gcc
 
@@ -98,18 +101,25 @@ c99test: build
 # c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿
 # -std=c6 编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99
 # 后端的翻译路径）；编出来的编译器还要能跑。
+# 编译时带 -DC6_EXT（和 make build 一致）：不带它，#ifdef C6_EXT 里的
+# 扩展实现根本不会进语法检查，规则就只能管到编译器的一半。
 # 翻译出来的 C 还要交给宿主编译器编译一遍：c6 模式下输出文件自带运行时
 # 前导（里面 include 了宿主的头文件），声明块里的原型必须不能和它们冲突。
-# 生成 C 这一步不许有任何诊断输出：编译器自己的源码编出警告，说明前端
-# 或后端在正常代码上判断错了（例如死代码里的跳转标签让 "函数可能没有
-# 返回值" 的检查误报），这类警告只能当错误处理。
+# 两步都不许有诊断输出：编译器自己的源码编出警告，说明前端或后端在正常
+# 代码上判断错了（例如死代码里的跳转标签让 "函数可能没有返回值" 的检查
+# 误报），这类输出只能当错误处理。
 c6selfcheck: build
 	@mkdir -p $(SELFHOST_C6)
-	$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/selfcheck.o
-	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c 2>&1`; \
+	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 $(SELFCHECK_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/selfcheck.o 2>&1`; \
 	if [ -n "$$out" ]; then \
 	    printf '%s\n' "$$out" >&2; \
-	    echo "c6selfcheck: 用 tcc 生成 C 时不应有警告（上面这些就是）" >&2; \
+	    echo "c6selfcheck: 用 tcc 编译自身时不应有任何诊断输出（上面这些就是）" >&2; \
+	    exit 1; \
+	fi
+	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 $(SELFCHECK_DEFS) -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c 2>&1`; \
+	if [ -n "$$out" ]; then \
+	    printf '%s\n' "$$out" >&2; \
+	    echo "c6selfcheck: 用 tcc 生成 C 时不应有任何诊断输出（上面这些就是）" >&2; \
 	    exit 1; \
 	fi
 	$(HOSTCC) -std=c99 -c -o $(SELFHOST_C6)/selfcheck-c99.o $(SELFHOST_C6)/selfcheck.c

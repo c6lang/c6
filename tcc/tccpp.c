@@ -542,10 +542,10 @@ static void tok_skip_id(void)
    ordinary identifiers unless -std=c6 is active. */
 static void tok_unintern(int v)
 {
-    TokenSym *ts;
-    TokenSym **pts;
-    unsigned int h;
-    int i;
+    TokenSym *ts = 0;
+    TokenSym **pts = 0;
+    unsigned int h = 0;
+    int i = 0;
 
     if (!table_ident || v < TOK_IDENT || v >= tok_ident)
         return;
@@ -1870,18 +1870,18 @@ ST_FUNC void tccpp_putfile(const char *filename)
    so that hygiene does not leak into caller-supplied tokens. */
 static int c6_local_name(int v, int id)
 {
-    char buf[512];
+    char buf[512] = {0};
     snprintf(buf, sizeof buf, "%s__h%d", get_tok_str(v, NULL), id);
     return tok_alloc(buf, strlen(buf))->tok;
 }
 
 static int *c6_hygiene_body(const int *body)
 {
-    static int seq;
-    TokenString out;
-    CValue cval;
-    const int *p;
-    int hl, id, t, i, prev, nb = 0, *locals = NULL;
+    static int seq = 0;
+    TokenString out = {0};
+    CValue cval = {0};
+    const int *p = 0;
+    int hl = 0, id = 0, t = 0, i = 0, prev = 0, nb = 0, *locals = NULL;
 
     hl = tok_alloc("__local", 7)->tok;
     id = ++seq;
@@ -1938,10 +1938,10 @@ static int *c6_hygiene_body(const int *body)
 /* parse '#macro NAME(params) { body }' */
 static void parse_c6_macro(void)
 {
-    Sym *s, *first, **ps;
-    int v, t, t0, level;
+    Sym *s = 0, *first = 0, **ps = 0;
+    int v = 0, t = 0, t0 = 0, level = 0;
     int saved_parse_flags = parse_flags;
-    TokenString str;
+    TokenString str = {0};
 
     next_nomacro();
     v = tok;
@@ -4046,7 +4046,7 @@ ST_FUNC void tccpp_new(TCCState *s)
            identifiers when the extension is not enabled.  Note that
            'test' may already be interned as an asm keyword, in which
            case the range ends before TOK_C6_TEST. */
-        int t;
+        int t = 0;
         for (t = TOK_C6_PACKAGE; t <= TOK_C6_FOREACH && t < tok_ident; t++)
             tok_unintern(t);
         if (TOK_C6_PACKAGE < tok_ident)

@@ -216,7 +216,7 @@ ST_FUNC void tcc_run_free(TCCState *s1)
 /* run all compiled 'test' blocks (the -test option) */
 static int tcc_run_tests(TCCState *s1)
 {
-    int i, nrun = 0, nfail = 0;
+    int i = 0, nrun = 0, nfail = 0;
     const char *(*err_msg)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_msg_get");
     void (*err_clear)(void) = (void*)tcc_get_symbol(s1, "__tcc_err_clear");
     void (*th_join)(void) = (void*)tcc_get_symbol(s1, "__c6_th_join_all");
@@ -224,7 +224,7 @@ static int tcc_run_tests(TCCState *s1)
     for (i = 0; i < s1->c6_test_count; i++) {
         C6TestEntry *e = s1->c6_tests[i];
         int (*fn)(void) = (void*)tcc_get_symbol(s1, e->fn_name);
-        int r;
+        int r = 0;
         if (!fn)
             continue;
         if (s1->c6_test_filter
