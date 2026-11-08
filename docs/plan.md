@@ -859,6 +859,12 @@ GCC/Clang 下运行时符号是 weak 的，多个 TU 共用同一份状态，没
 编译器退化为每个 TU 一份。`tests/*.c`、`tests/exit/*.c`、
 `tests/abi/tuple.c` 和 `examples/*.c` 均已通过。
 
+端到端回归放在 `tests/c99/*.c`：运行器先用 `c99-tcc -c99` 生成 C 源码，
+再用 `gcc -std=c99 -pedantic -Wall -Wextra -Werror` 编译并运行，比对
+`// EXIT` 退出码和可选的 `// OUTPUT` 输出。`make c99test` 只跑这一组，
+`make selftest` 会先构建 `c99-tcc` 再连带跑（`tests/c99/c99test.c` 用一份
+源码覆盖普通 C 和 c6 的全部特性）。
+
 限制（均显式报错，不会静默错编译）：变参函数**定义**、computed goto、
 VLA；非 POSIX 主机上运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
 ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-64 寄存器返回，
