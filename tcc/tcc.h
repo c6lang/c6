@@ -1615,7 +1615,9 @@ ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsign
 ST_FUNC int classify_x86_64_va_arg(CType *ty);
 #endif
 #ifdef CONFIG_TCC_BCHECK
+#ifndef TCC_TARGET_C99 /* the C99 backend has no bounds-checking prolog */
 ST_FUNC void gbound_args(int nb_args);
+#endif
 ST_DATA int func_bound_add_epilog;
 #endif
 ST_FUNC Sym *gfunc_set_param(Sym *s, int c, int byref);
@@ -1737,7 +1739,7 @@ ST_FUNC void gen_cvt_ftoi(int t);
 ST_FUNC void gen_cvt_itof(int t);
 ST_FUNC void gen_cvt_ftof(int t);
 ST_FUNC void ggoto(void);
-#ifndef TCC_TARGET_C67
+#if !defined(TCC_TARGET_C67) && !defined(TCC_TARGET_C99)
 ST_FUNC void o(unsigned int c);
 #endif
 ST_FUNC void gen_vla_sp_save(int addr);
