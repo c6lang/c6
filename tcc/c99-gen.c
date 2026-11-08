@@ -120,10 +120,42 @@ typedef struct C99Decl { char *name, *text; struct C99Decl *next; } C99Decl;
    translation units can link against it */
 typedef struct C99GSym {
     const char *name;
+    const char *cname;           /* unique C identifier in the output */
     int shndx;
-    int is_static;
+    int is_static;               /* emitted as a static C object */
+    int by_name;                 /* referenced by name, so it must be emitted */
     long long value, size;
 } C99GSym;
+
+static C99GSym *c99_gsym_at(int shndx, unsigned long off);
+
+/* names that generated code uses directly ('&name') instead of going through
+   a section array; only those static objects need a C declaration */
+static const char **c99_nrefs;
+static int c99_nrefs_count, c99_nrefs_size;
+
+static void c99_note_name(const char *name)
+{
+    int i;
+    for (i = 0; i < c99_nrefs_count; i++)
+        if (!strcmp(c99_nrefs[i], name))
+            return;
+    if (c99_nrefs_count >= c99_nrefs_size) {
+        c99_nrefs_size = c99_nrefs_size ? c99_nrefs_size * 2 : 32;
+        c99_nrefs = tcc_realloc(c99_nrefs,
+                                c99_nrefs_size * sizeof *c99_nrefs);
+    }
+    c99_nrefs[c99_nrefs_count++] = tcc_strdup(name);
+}
+
+static int c99_name_used(const char *name)
+{
+    int i;
+    for (i = 0; i < c99_nrefs_count; i++)
+        if (!strcmp(c99_nrefs[i], name))
+            return 1;
+    return 0;
+}
 
 static C99Mark *c99_marks; static int c99_nmarks, c99_marks_size;
 static C99Lbl  *c99_lbls;  static int c99_nlbls,  c99_lbls_size;
@@ -516,6 +548,8 @@ static void c99_addr(char *buf, int size, SValue *sv)
                     c99_decl_extern(nm, 1);
                 snprintf(sbuf, sizeof sbuf, "%s", nm);
             } else if (c99_global_data(esym) && *nm) {
+                /* a real C global: other TUs (and __c99_init()) use the
+                   same object, never a private section-array copy */
                 c99_mark_section(esym->st_shndx);
                 snprintf(sbuf, sizeof sbuf, "((char *)&%s)", nm);
             } else if (esym && esym->st_shndx != SHN_UNDEF
@@ -529,6 +563,8 @@ static void c99_addr(char *buf, int size, SValue *sv)
                    tcc likewise emits no relocation at all */
                 snprintf(sbuf, sizeof sbuf, "((void *)0)");
             } else {
+                if (sv->sym->v < SYM_FIRST_ANOM)
+                    c99_note_name(nm);
                 if (sv->sym->v < SYM_FIRST_ANOM
                     && !(sv->sym->type.t & VT_STATIC))
                     c99_decl_extern(nm, 0);
@@ -788,10 +824,10 @@ ST_FUNC void load(int r, SValue *sv)
         c99_addr(a, sizeof a, sv);
         switch (bt) {
         case VT_BOOL:    c99_printf("__c99_r[%d].i = *(unsigned char *)%s ? 1 : 0;\n", r, a); break;
-        case VT_BYTE:    c99_printf("__c99_r[%d].i = *(%s char *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
-        case VT_SHORT:   c99_printf("__c99_r[%d].i = *(%s short *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
-        case VT_INT:     c99_printf("__c99_r[%d].i = *(%s int *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
-        case VT_LLONG:   c99_printf("__c99_r[%d].i = *(%s long long *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
+        case VT_BYTE:    c99_printf("__c99_r[%d].i = (long long)(unsigned int)*(%s char *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
+        case VT_SHORT:   c99_printf("__c99_r[%d].i = (long long)(unsigned int)*(%s short *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
+        case VT_INT:     c99_printf("__c99_r[%d].i = (long long)(unsigned int)*(%s int *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
+        case VT_LLONG:   c99_printf("__c99_r[%d].i = *(long long *)%s;\n", r, a); break;
         case VT_PTR:
         case VT_FUNC:    c99_printf("__c99_r[%d].p = *(void **)%s;\n", r, a); break;
         case VT_FLOAT:   c99_printf("__c99_r[%d].f = *(float *)%s;\n", r, a); break;
@@ -818,8 +854,11 @@ ST_FUNC void load(int r, SValue *sv)
             c99_printf("__c99_r[%d].d = %#.17g;\n", r, (double)sv->c.d);
         } else if (bt == VT_LDOUBLE) {
             c99_printf("__c99_r[%d].ld = %#.21LgL;\n", r, sv->c.ld);
-        } else {
+        } else if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC) {
             c99_printf("__c99_r[%d].i = (long long)%lldLL;\n", r, (long long)sv->c.i);
+        } else {
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)%lldLL;\n",
+                       r, (long long)sv->c.i);
         }
         break;
     case VT_LOCAL:
@@ -930,8 +969,9 @@ ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int 
     return 1;
 }
 
-/* tccgen uses this to sign-extend a 32 bit value in a 64 bit register; the
-   C backend keeps every integer in a 'long long' so nothing is needed */
+/* tccgen uses this to sign-extend a 32 bit value in a 64 bit register.  The
+   back-end keeps every 32-bit value in a 'long long' zero-extended (like a
+   physical 32-bit x86 register), so the cast to 'int' is the extension. */
 ST_FUNC void gen_cvt_sxtw(void)
 {
     int r = gv(RC_INT);
@@ -940,25 +980,44 @@ ST_FUNC void gen_cvt_sxtw(void)
 
 ST_FUNC void gen_cvt_itof(int t)
 {
+    int sbt = vtop->type.t & (VT_BTYPE | VT_UNSIGNED);
     int r = gv(RC_INT);
-    if ((t & VT_BTYPE) == VT_FLOAT)
-        c99_printf("__c99_r[%d].f = (float)__c99_r[%d].i;\n", r, r);
-    else if ((t & VT_BTYPE) == VT_DOUBLE)
-        c99_printf("__c99_r[%d].d = (double)__c99_r[%d].i;\n", r, r);
+    const char *e;
+    char buf[64];
+
+    if ((sbt & VT_BTYPE) == VT_LLONG || (sbt & VT_BTYPE) == VT_PTR
+        || (sbt & VT_BTYPE) == VT_FUNC)
+        e = (sbt & VT_UNSIGNED) ? "__c99_r[%d].u" : "__c99_r[%d].i";
+    else if (sbt & VT_UNSIGNED)
+        e = "(unsigned int)__c99_r[%d].i";
     else
-        c99_printf("__c99_r[%d].ld = (long double)__c99_r[%d].i;\n", r, r);
+        e = "(int)__c99_r[%d].i";
+    snprintf(buf, sizeof buf, "%s", e);
+    if ((t & VT_BTYPE) == VT_FLOAT)
+        c99_printf("__c99_r[%d].f = (float)", r),
+        c99_printf(buf, r), c99_printf(";\n");
+    else if ((t & VT_BTYPE) == VT_DOUBLE)
+        c99_printf("__c99_r[%d].d = (double)", r),
+        c99_printf(buf, r), c99_printf(";\n");
+    else
+        c99_printf("__c99_r[%d].ld = (long double)", r),
+        c99_printf(buf, r), c99_printf(";\n");
 }
 
 ST_FUNC void gen_cvt_ftoi(int t)
 {
     int r = gv(RC_FLOAT);
     int from = vtop->type.t & VT_BTYPE;
+    int dbt = t & (VT_BTYPE | VT_UNSIGNED);
     const char *m = from == VT_FLOAT ? "f" : from == VT_DOUBLE ? "d" : "ld";
 
-    if (t & VT_UNSIGNED)
-        c99_printf("__c99_r[%d].i = (long long)(unsigned long long)__c99_r[%d].%s;\n", r, r, m);
+    if ((dbt & VT_BTYPE) == VT_LLONG || (dbt & VT_BTYPE) == VT_PTR
+        || (dbt & VT_BTYPE) == VT_FUNC)
+        c99_printf("__c99_r[%d].i = (long long)(%s long long)__c99_r[%d].%s;\n",
+                   r, (dbt & VT_UNSIGNED) ? "unsigned" : "", r, m);
     else
-        c99_printf("__c99_r[%d].i = (long long)__c99_r[%d].%s;\n", r, r, m);
+        c99_printf("__c99_r[%d].i = (long long)(unsigned int)(%s)__c99_r[%d].%s;\n",
+                   r, (dbt & VT_UNSIGNED) ? "unsigned int" : "int", r, m);
 }
 
 ST_FUNC void gen_cvt_ftof(int t)
@@ -1010,34 +1069,89 @@ ST_FUNC void gen_opi(int op)
         return;
     }
     switch (op) {
-    case '+': c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i + (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr); break;
-    case '-': c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i - (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr); break;
-    case '*': c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i * (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr); break;
-    case '&': c99_printf("__c99_r[%d].i = __c99_r[%d].i & __c99_r[%d].i;\n", rd, rd, rr); break;
-    case '|': c99_printf("__c99_r[%d].i = __c99_r[%d].i | __c99_r[%d].i;\n", rd, rd, rr); break;
-    case '^': c99_printf("__c99_r[%d].i = __c99_r[%d].i ^ __c99_r[%d].i;\n", rd, rd, rr); break;
-    case '/': c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i / (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr); break;
-    case '%': c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i %% (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr); break;
-    case TOK_PDIV: c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i / (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr); break;
-    case TOK_UDIV: c99_printf("__c99_r[%d].i = (long long)((unsigned long long)__c99_r[%d].i / (unsigned long long)__c99_r[%d].i);\n", rd, rd, rr); break;
-    case TOK_UMOD: c99_printf("__c99_r[%d].i = (long long)((unsigned long long)__c99_r[%d].i %% (unsigned long long)__c99_r[%d].i);\n", rd, rd, rr); break;
+    case '+':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i + (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((int)__c99_r[%d].i + (int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case '-':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i - (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((int)__c99_r[%d].i - (int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case '*':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i * (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((int)__c99_r[%d].i * (int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case '&':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = __c99_r[%d].i & __c99_r[%d].i;\n", rd, rd, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)(__c99_r[%d].i & __c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case '|':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = __c99_r[%d].i | __c99_r[%d].i;\n", rd, rd, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)(__c99_r[%d].i | __c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case '^':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = __c99_r[%d].i ^ __c99_r[%d].i;\n", rd, rd, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)(__c99_r[%d].i ^ __c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case '/':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i / (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((int)__c99_r[%d].i / (int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case '%':
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i %% (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((int)__c99_r[%d].i %% (int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case TOK_PDIV:
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (%s)__c99_r[%d].i / (%s)__c99_r[%d].i;\n", rd, ty, rd, ty, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((int)__c99_r[%d].i / (int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case TOK_UDIV:
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (long long)((unsigned long long)__c99_r[%d].i / (unsigned long long)__c99_r[%d].i);\n", rd, rd, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((unsigned int)__c99_r[%d].i / (unsigned int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
+    case TOK_UMOD:
+        if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
+            c99_printf("__c99_r[%d].i = (long long)((unsigned long long)__c99_r[%d].i %% (unsigned long long)__c99_r[%d].i);\n", rd, rd, rr);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((unsigned int)__c99_r[%d].i %% (unsigned int)__c99_r[%d].i);\n", rd, rd, rr);
+        break;
     case TOK_SHL:
         if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
             c99_printf("__c99_r[%d].i = (long long)((unsigned long long)__c99_r[%d].i << ((int)__c99_r[%d].i & 63));\n", rd, rd, rr);
         else
-            c99_printf("__c99_r[%d].i = (long long)((unsigned int)__c99_r[%d].i << ((int)__c99_r[%d].i & 31));\n", rd, rd, rr);
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((unsigned int)__c99_r[%d].i << ((int)__c99_r[%d].i & 31));\n", rd, rd, rr);
         break;
     case TOK_SAR:
         if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
             c99_printf("__c99_r[%d].i = __c99_r[%d].i >> ((int)__c99_r[%d].i & 63);\n", rd, rd, rr);
         else
-            c99_printf("__c99_r[%d].i = (long long)((int)__c99_r[%d].i >> ((int)__c99_r[%d].i & 31));\n", rd, rd, rr);
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((int)__c99_r[%d].i >> ((int)__c99_r[%d].i & 31));\n", rd, rd, rr);
         break;
     case TOK_SHR:
         if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
             c99_printf("__c99_r[%d].i = (long long)((unsigned long long)__c99_r[%d].i >> ((int)__c99_r[%d].i & 63));\n", rd, rd, rr);
         else
-            c99_printf("__c99_r[%d].i = (long long)((unsigned int)__c99_r[%d].i >> ((int)__c99_r[%d].i & 31));\n", rd, rd, rr);
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)((unsigned int)__c99_r[%d].i >> ((int)__c99_r[%d].i & 31));\n", rd, rd, rr);
         break;
     default:
         tcc_error("c99 output: unsupported integer operation %d", op);
@@ -1417,18 +1531,24 @@ ST_FUNC void gfunc_call(int nb_args)
     else if (ret_struct || (ret->t & VT_BTYPE) == VT_VOID)
         c99_printf("%s;\n", sig);
     else if (is_helper && !have_proto)
-        c99_printf("%s%s;\n", int_ret ? "__c99_r[0].i = " : "", sig);
+        c99_printf("%s%s;\n",
+                   int_ret ? "__c99_r[0].i = (long long)(unsigned int)" : "",
+                   sig);
     else if (is_helper && int_ret)
-        c99_printf("__c99_r[0].i = %s;\n", sig);
+        c99_printf("__c99_r[0].i = (long long)(unsigned int)%s;\n", sig);
     else {
-        if ((ret->t & VT_BTYPE) == VT_PTR)
+        int rbt = ret->t & VT_BTYPE;
+        if (rbt == VT_PTR)
             snprintf(tbuf, sizeof tbuf, "void *");
-        else if ((ret->t & VT_BTYPE) == VT_FUNC)
-            c99_type(tbuf, sizeof tbuf, ret);
         else
             c99_type(tbuf, sizeof tbuf, ret);
-        c99_printf("__c99_r[%d].%s = (%s)%s;\n", c99_ret_reg(ret->t),
-                   c99_regmem(ret->t), tbuf, sig);
+        if (rbt == VT_LLONG || rbt == VT_PTR || rbt == VT_FUNC
+            || rbt == VT_FLOAT || rbt == VT_DOUBLE || rbt == VT_LDOUBLE)
+            c99_printf("__c99_r[%d].%s = (%s)%s;\n", c99_ret_reg(ret->t),
+                       c99_regmem(ret->t), tbuf, sig);
+        else
+            c99_printf("__c99_r[%d].i = (long long)(unsigned int)(%s)%s;\n",
+                       c99_ret_reg(ret->t), tbuf, sig);
     }
     vtop -= nb_args + 1;
 }
@@ -1642,12 +1762,39 @@ static void c99_collect_globals(TCCState *s1)
                                     c99_gsyms_size * sizeof *c99_gsyms);
         }
         c99_gsyms[c99_ngsyms].name = name;
+        c99_gsyms[c99_ngsyms].cname = tcc_strdup(name);
         c99_gsyms[c99_ngsyms].shndx = e->st_shndx;
         c99_gsyms[c99_ngsyms].is_static =
             ELFW(ST_BIND)(e->st_info) != STB_GLOBAL;
         c99_gsyms[c99_ngsyms].value = e->st_value;
         c99_gsyms[c99_ngsyms].size = size;
         c99_ngsyms++;
+    }
+
+    for (i = 0; i < c99_ngsyms; i++)
+        c99_gsyms[i].by_name = !c99_gsyms[i].is_static
+                               || c99_name_used(c99_gsyms[i].name);
+
+    /* Two function-local statics may share a source name; C would reject two
+       objects with the same identifier, so give every duplicate a private
+       name.  Code that has an Elf symbol addresses those through the section
+       array, and __c99_init() uses cname for its patches. */
+    {
+        int j;
+        for (i = 0; i < c99_ngsyms; i++) {
+            C99GSym *g = &c99_gsyms[i];
+            if (!g->is_static)
+                continue;
+            for (j = 0; j < c99_ngsyms; j++)
+                if (j != i && c99_gsyms[j].is_static
+                    && !strcmp(c99_gsyms[j].name, g->name))
+                    break;
+            if (j < c99_ngsyms) {
+                char buf[64];
+                snprintf(buf, sizeof buf, "__c99_g%d", i);
+                g->cname = tcc_strdup(buf);
+            }
+        }
     }
 }
 
@@ -1733,11 +1880,14 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
        the tcc symbol; accesses go through a byte pointer at offset 0. */
     for (i = 0; i < c99_ngsyms; i++) {
         C99GSym *g = &c99_gsyms[i];
-        Section *s = s1->sections[g->shndx];
+        Section *s;
+        if (g->is_static && !g->by_name)
+            continue;
+        s = s1->sections[g->shndx];
         unsigned long k, end;
         if (s->data_offset < (unsigned long)g->value) {
             fprintf(f, "%sunion { unsigned char b[1]; long double _a; } %s;\n",
-                    g->is_static ? "static __c99_unused " : "", g->name);
+                    g->is_static ? "static __c99_unused " : "", g->cname);
             continue;
         }
         end = (unsigned long)g->value + (unsigned long)g->size;
@@ -1745,7 +1895,7 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
             end = s->data_offset;
         fprintf(f, "%sunion { unsigned char b[%lld]; long double _a; } %s = { {",
                 g->is_static ? "static __c99_unused " : "",
-                g->size, g->name);
+                g->size, g->cname);
         for (k = (unsigned long)g->value; k < end; k++)
             fprintf(f, "%s%d", k > (unsigned long)g->value ? "," : "",
                     s->data[k]);
@@ -1817,13 +1967,13 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
             } else if (ts && (ts->sh_flags & SHF_EXECINSTR)) {
                 snprintf(target, sizeof target,
                          "__c99_pf((void (*)(void))%s)", tname);
-            } else if (tg) {
+            } else if (tg && (!tg->is_static || tg->by_name)) {
                 if (r->r_addend)
                     snprintf(target, sizeof target,
-                             "(void *)((char *)&%s + %lld)", tg->name,
+                             "(void *)((char *)&%s + %lld)", tg->cname,
                              (long long)r->r_addend);
                 else
-                    snprintf(target, sizeof target, "(void *)&%s", tg->name);
+                    snprintf(target, sizeof target, "(void *)&%s", tg->cname);
             } else if (ts && c99_data_section(ts)) {
                 snprintf(target, sizeof target,
                          "(void *)((char *)__c99_d%d + %lld)",
@@ -1835,9 +1985,9 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
             /* the section image and the named object are both used: code
                before a static symbol got its Elf entry addresses it by name,
                everything else through the section array */
-            if (dg)
+            if (dg && (!dg->is_static || dg->by_name))
                 fprintf(f, "  *(void **)((char *)&%s + %lld) = %s;\n",
-                        dg->name, (long long)r->r_offset - dg->value, target);
+                        dg->cname, (long long)r->r_offset - dg->value, target);
             fprintf(f, "  *(void **)(__c99_d%d + %lu) = %s;\n",
                     s->sh_num, (unsigned long)r->r_offset, target);
         }
