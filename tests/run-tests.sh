@@ -387,6 +387,13 @@ for src in "$ROOT"/tests/c99/*.c; do
         fail "$name" "生成 C 失败:$(cat "$TMP/err")"
         continue
     fi
+    # 生成 C 这一步不许有诊断输出：合法源码上出现警告，说明前端或后端
+    # 把正常代码判断错了（例如死代码里的跳转标签让"函数可能没有返回值"
+    # 的检查误报），而生成的 C 之后还要过 gcc -Werror，不能带着噪声走。
+    if [ -s "$TMP/err" ]; then
+        fail "$name" "生成 C 时有诊断输出:$(cat "$TMP/err")"
+        continue
+    fi
     if ! $C99CC $C99FLAGS -o "$TMP/c99-$base.bin" "$csrc" \
             2>"$TMP/err" >/dev/null; then
         fail "$name" "$C99CC 编译生成的 C 失败:$(cat "$TMP/err")"

@@ -12,9 +12,10 @@
  *
  * 这里刻意混用普通 C 与 c6 特性，覆盖 README 里 C99 后端承诺的范围：
  * 整数/浮点/指针/数组/字符串、控制流、函数指针与递归、结构体按值返回、
- * defer/errdefer/err/try/catch、切片/foreach、元组、方法/接口/裸 tag、
- * async/await 与 go 的运行时。
+ * 变参函数定义（va_list）、defer/errdefer/err/try/catch、切片/foreach、
+ * 元组、方法/接口/裸 tag、async/await 与 go 的运行时。
  */
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -57,6 +58,46 @@ static int point_sum(struct Point p) { return p.x + p.y; }
 static long big_sum(struct Big v) { return v.a + v.b + v.c; }
 
 static int (*g_op)(int, int) = add;
+
+/* 变参函数定义：C99 后端要把 va_list 落在与 SysV 一致的位置上。
+ * c6 模式要求变量定义带初始化器，所以 va_list 也写了 '= {0}'；va_start
+ * 会整个覆盖它，这个初值只是为了通过检查。 */
+static int sum_ints(int n, ...)
+{
+    va_list ap = {0};
+    int total = 0;
+    int i = 0;
+
+    va_start(ap, n);
+    for (i = 0; i < n; i++)
+        total += va_arg(ap, int);
+    va_end(ap);
+    return total;
+}
+
+static double sum_doubles(int n, double first, ...)
+{
+    va_list ap = {0};
+    double total = first;
+    int i = 0;
+
+    va_start(ap, first);
+    for (i = 1; i < n; i++)
+        total += va_arg(ap, double);
+    va_end(ap);
+    return total;
+}
+
+static int vformat(char *buf, size_t size, const char *fmt, ...)
+{
+    va_list ap = {0};
+    int n = 0;
+
+    va_start(ap, fmt);
+    n = vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    return n;
+}
 
 /* ---- c6 的辅助函数 ---- */
 
@@ -301,6 +342,60 @@ again:
         goto again;
     if (sum != 3)
         err(6, "goto 不对");
+}
+
+test "64 位移位与无符号提升" {
+    unsigned long long one = 1;
+    int i = -1;
+    unsigned int u = 0xFFFFFFFFu;
+    unsigned long long ul = (unsigned long long)u << 32;
+
+    if ((one << 32) != 4294967296ULL)
+        err(1, "1ULL << 32 不对");
+    if (((unsigned long long)i << 32) != 0xFFFFFFFF00000000ULL)
+        err(2, "符号扩展之后的 64 位移位不对");
+    if (ul != 0xFFFFFFFF00000000ULL)
+        err(3, "unsigned int 提升到 64 位后移位不对");
+    if ((one << 63) != 0x8000000000000000ULL)
+        err(4, "1ULL << 63 不对");
+    if (((unsigned long long)i >> 32) != 0xFFFFFFFFULL)
+        err(5, "64 位逻辑右移不对");
+    if ((0x10ULL << 4) != 0x100ULL || (0x100ULL >> 4) != 0x10ULL)
+        err(6, "小的 64 位移位不对");
+}
+
+test "变参函数定义" {
+    char buf[64] = {0};
+
+    if (sum_ints(0) != 0)
+        err(1, "没有变参时不对");
+    if (sum_ints(3, 1, 2, 3) != 6)
+        err(2, "三个整型变参不对");
+    if (sum_ints(10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) != 55)
+        err(3, "溢出到栈上的整型变参不对");
+    if (sum_doubles(3, 1.5, 2.25, 3.25) != 7.0)
+        err(4, "浮点变参不对");
+    if (sum_doubles(10, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+        != 10.0)
+        err(5, "溢出到栈上的浮点变参不对");
+    if (vformat(buf, sizeof buf, "%s-%d", "x", 42) != 4
+        || strcmp(buf, "x-42") != 0)
+        err(6, "把 va_list 交给 vsnprintf 不对");
+}
+
+test "无符号 64 位转浮点" {
+    unsigned long long u = 0xFFFFFFFFFFFFFFFFULL;
+    unsigned long long h = 0x8000000000000000ULL;
+    long double ld = (long double)u;
+    double d = (double)h;
+    float f = (float)h;
+
+    if (!(ld > 1.8e19L) || !(ld < 1.9e19L))
+        err(1, "unsigned long long -> long double 不对");
+    if (d != 9223372036854775808.0)
+        err(2, "unsigned long long -> double 不对");
+    if (f != 9223372036854775808.0f)
+        err(3, "unsigned long long -> float 不对");
 }
 
 test "函数指针、递归与间接调用" {

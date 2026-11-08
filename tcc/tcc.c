@@ -230,7 +230,7 @@ static const char version[] =
 
 static void print_dirs(const char *msg, char **paths, int nb_paths)
 {
-    int i;
+    int i = 0;
     printf("%s:\n%s", msg, nb_paths ? "" : "  -\n");
     for(i = 0; i < nb_paths; i++)
         printf("  %s\n", paths[i]);
@@ -251,7 +251,7 @@ static void print_search_dirs(TCCState *s)
 
 static void set_environment(TCCState *s)
 {
-    char * path;
+    char * path = 0;
 
     path = getenv("C_INCLUDE_PATH");
     if(path != NULL) {
@@ -269,8 +269,8 @@ static void set_environment(TCCState *s)
 
 static char *default_outputfile(TCCState *s, const char *first_file)
 {
-    char buf[1024];
-    char *ext;
+    char buf[1024] = {0};
+    char *ext = 0;
     const char *name = "a";
 
     if (first_file && strcmp(first_file, "-"))
@@ -306,7 +306,7 @@ static unsigned getclock_ms(void)
 #ifdef _WIN32
     return GetTickCount();
 #else
-    struct timeval tv;
+    struct timeval tv = {0};
     gettimeofday(&tv, NULL);
     return tv.tv_sec*1000 + (tv.tv_usec+500)/1000;
 #endif
@@ -417,13 +417,13 @@ extern int c99_main(int argc, char **argv);
 
 int main(int argc, char **argv)
 {
-    TCCState *s, *s1;
-    int ret, opt, n = 0, t = 0, done;
+    TCCState *s = 0, *s1 = 0;
+    int ret = 0, opt = 0, n = 0, t = 0, done = 0;
 #ifdef TCC_TARGET_C99
     int out_dir = 0;
 #endif
     unsigned start_time = 0, end_time = 0;
-    const char *first_file;
+    const char *first_file = 0;
     int argc0 = argc;
     char **argv0 = argv;
     FILE *ppfp = NULL;
@@ -464,7 +464,7 @@ redo:
             print_search_dirs(s);
         }
         if (opt) {
-            if (opt < 0) err:
+            if (opt < 0) fail:
                 ret = 1;
             tcc_delete(s);
             return ret;
@@ -514,7 +514,7 @@ redo:
             tcc_error_noabort("cannot compile multiple files with -c to one output file; use -o <dir>");
 #endif
         if (s->nb_errors)
-            goto err;
+            goto fail;
         if (s->do_bench)
             start_time = getclock_ms();
     }

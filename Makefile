@@ -9,7 +9,10 @@
 #   make test-all    selftest + tests2 全量
 #   make c99         C99 输出后端已内置在 tcc/tcc（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
-#   make clean       清理 tcc/ 的构建产物
+#   make c6selfcheck tcc 自己的源码用 -std=c6 编译（初始化规则 + C99 后端）
+#   make selfhost    用 c6 模式的 tcc 自举自己（stage1 -> stage2，比对目标文件）
+#   make c99selfhost 用 C99 后端自举自己（生成 C -> gcc -> stage2 -> stage3）
+#   make clean       清理 tcc/ 的构建产物和自举产物
 #   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
 #
 # C6_EXT 是编译期开关，切换模式时会自动先清理旧产物。
@@ -21,8 +24,22 @@ CFLAGS   ?= -g -O0 -Wall -Wno-unused-result
 EXT      := EXTRA-DEFS=-DC6_EXT
 MODE     := $(TCC_DIR)/.c6-mode
 
+# 自举产物都放在这里：每条自举路线一个子目录，互不覆盖
+SELFHOST     := build/selfhost
+SELFHOST_C6  := $(SELFHOST)/c6
+SELFHOST_C99 := $(SELFHOST)/c99
+# 自举时编译 tcc 自己用的定义：ONE_SOURCE 把整个编译器塞进一个编译单元，
+# C6_EXT 打开 c6 扩展（与 make build 的 EXTRA-DEFS 一致）
+SELFHOST_DEFS := -DONE_SOURCE=1 -DC6_EXT
+# c6selfcheck 也要带 C6_EXT：源码里 #ifdef C6_EXT 的那一半（扩展的实现）
+# 只有在打开扩展时才会被编到，不带它这项检查就只能覆盖编译器的一半。
+SELFCHECK_DEFS := -DC6_EXT
+SELFHOST_LIBS := -lm -ldl -lpthread
+HOSTCC   ?= gcc
+
 .PHONY: all bootstrap build build-plain test test-plain test-all selftest \
-        clean distclean help check-tcc mode-ext mode-plain c99 c99test
+        clean distclean help check-tcc mode-ext mode-plain c99 c99test \
+        c6selfcheck selfhost c99selfhost
 
 all: build
 
@@ -69,7 +86,7 @@ test-plain: build-plain
 selftest: build
 	./$(SELFTEST)
 
-test-all: selftest test
+test-all: selftest test c6selfcheck
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -81,7 +98,75 @@ c99: build
 c99test: build
 	BACKEND=c99 ./$(SELFTEST)
 
+# c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿
+# -std=c6 编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99
+# 后端的翻译路径）；编出来的编译器还要能跑。
+# 编译时带 -DC6_EXT（和 make build 一致）：不带它，#ifdef C6_EXT 里的
+# 扩展实现根本不会进语法检查，规则就只能管到编译器的一半。
+# 翻译出来的 C 还要交给宿主编译器编译一遍：c6 模式下输出文件自带运行时
+# 前导（里面 include 了宿主的头文件），声明块里的原型必须不能和它们冲突。
+# 两步都不许有诊断输出：编译器自己的源码编出警告，说明前端或后端在正常
+# 代码上判断错了（例如死代码里的跳转标签让 "函数可能没有返回值" 的检查
+# 误报），这类输出只能当错误处理。
+c6selfcheck: build
+	@mkdir -p $(SELFHOST_C6)
+	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 $(SELFCHECK_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/selfcheck.o 2>&1`; \
+	if [ -n "$$out" ]; then \
+	    printf '%s\n' "$$out" >&2; \
+	    echo "c6selfcheck: 用 tcc 编译自身时不应有任何诊断输出（上面这些就是）" >&2; \
+	    exit 1; \
+	fi
+	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 $(SELFCHECK_DEFS) -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c 2>&1`; \
+	if [ -n "$$out" ]; then \
+	    printf '%s\n' "$$out" >&2; \
+	    echo "c6selfcheck: 用 tcc 生成 C 时不应有任何诊断输出（上面这些就是）" >&2; \
+	    exit 1; \
+	fi
+	$(HOSTCC) -std=c99 -c -o $(SELFHOST_C6)/selfcheck-c99.o $(SELFHOST_C6)/selfcheck.c
+	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C6)/selfcheck $(SELFHOST_C6)/selfcheck.o $(SELFHOST_LIBS)
+	$(SELFHOST_C6)/selfcheck -v
+
+# 自举（c6 模式）：tcc 用它自己的后端编译自己的源码，再用编出来的编译器
+# 重编一遍。两次的目标文件必须逐字节相同（bootstrap fixpoint），最后用
+# stage2 编一个程序跑通，确认它不只是"能启动"。
+selfhost: build
+	@mkdir -p $(SELFHOST_C6)
+	@echo "c6 自举 1/4：$(TCC_DIR)/tcc 编译自己的源码"
+	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/stage1.o
+	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C6)/tcc-stage1 $(SELFHOST_C6)/stage1.o $(SELFHOST_LIBS)
+	@echo "c6 自举 2/4：stage1 重新编译同一份源码"
+	$(SELFHOST_C6)/tcc-stage1 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/stage2.o
+	@echo "c6 自举 3/4：比较两次的目标文件"
+	@cmp $(SELFHOST_C6)/stage1.o $(SELFHOST_C6)/stage2.o && echo "  两次编译逐字节相同"
+	$(SELFHOST_C6)/tcc-stage1 -B $(TCC_DIR) -o $(SELFHOST_C6)/tcc-stage2 $(SELFHOST_C6)/stage2.o $(SELFHOST_LIBS)
+	@echo "c6 自举 4/4：stage2 编一个程序并运行"
+	@printf '%s\n' '#include <stdio.h>' 'int main(void)' '{' '    printf("hello from the c6 self-hosted tcc\n");' '    return 0;' '}' > $(SELFHOST_C6)/hello.c
+	$(SELFHOST_C6)/tcc-stage2 -B $(TCC_DIR) $(SELFHOST_C6)/hello.c -o $(SELFHOST_C6)/hello
+	@$(SELFHOST_C6)/hello
+	@echo "c6 自举完成：$(SELFHOST_C6)/tcc-stage2"
+
+# 自举（C99 后端）：tcc 先把 tcc.c 翻成 C99 源码，宿主 gcc 把它编成 stage2
+# 编译器；stage2 是正常的 x86-64 tcc，用它自己再编一次 tcc.c 得到 stage3，
+# stage3 再编一次必须得到同样的目标文件（fixpoint）。
+c99selfhost: build
+	@mkdir -p $(SELFHOST_C99)
+	@echo "c99 自举 1/4：tcc 的 C99 后端把 tcc.c 翻成 C"
+	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c99 -o $(SELFHOST_C99)/tcc-c99.c $(TCC_DIR)/tcc.c
+	@echo "c99 自举 2/4：宿主 $(HOSTCC) 编译生成的 C，得到 stage2 编译器"
+	$(HOSTCC) -std=c99 -O0 -w -o $(SELFHOST_C99)/tcc-stage2 $(SELFHOST_C99)/tcc-c99.c $(SELFHOST_LIBS)
+	@echo "c99 自举 3/4：stage2 编译 tcc.c 得到 stage3"
+	$(SELFHOST_C99)/tcc-stage2 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C99)/stage3.o
+	$(SELFHOST_C99)/tcc-stage2 -B $(TCC_DIR) -o $(SELFHOST_C99)/tcc-stage3 $(SELFHOST_C99)/stage3.o $(SELFHOST_LIBS)
+	@echo "c99 自举 4/4：stage3 再编一次并比较目标文件"
+	$(SELFHOST_C99)/tcc-stage3 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C99)/stage4.o
+	@cmp $(SELFHOST_C99)/stage3.o $(SELFHOST_C99)/stage4.o && echo "  两次编译逐字节相同"
+	@printf '%s\n' '#include <stdio.h>' 'int main(void)' '{' '    printf("hello from the c99 self-hosted tcc\n");' '    return 0;' '}' > $(SELFHOST_C99)/hello.c
+	$(SELFHOST_C99)/tcc-stage3 -B $(TCC_DIR) $(SELFHOST_C99)/hello.c -o $(SELFHOST_C99)/hello
+	@$(SELFHOST_C99)/hello
+	@echo "c99 自举完成：$(SELFHOST_C99)/tcc-stage3"
+
 clean:
+	rm -rf $(SELFHOST)
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true
 
 distclean:

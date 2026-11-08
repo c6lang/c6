@@ -11,8 +11,9 @@
  *    - vstack registers become members of a union array __c99_r[NB_REGS]
  *    - stack slots (the frame tcc allocates by decrementing 'loc') become
  *      offsets into a byte array __c99_frm.f, so locals need no names
- *    - comparisons are materialised into __c99_cnd right away (C has no
- *      CPU flags); VT_CMP / VT_JMP / VT_JMPI keep their usual meaning
+ *    - comparisons are materialised into the __c99_cnd[] array right away
+ *      (C has no CPU flags), one entry per comparison pair; VT_CMP / VT_JMP /
+ *      VT_JMPI keep their usual meaning
  *    - the symbol table is not relocatable at run time: data sections are
  *      emitted as byte arrays and __c99_init() patches the pointer slots
  *      from the relocation records
@@ -109,13 +110,45 @@ static void buf_puts(C99Buf *b, const char *s)
 
 static C99Buf c99_fn, c99_prog;      /* current function, finished ones */
 static int c99_next_label = 1;
-static int c99_last_cmp;             /* comparison token behind __c99_cnd */
+
+/* Which labels the current function actually jumps to.  A jump inside code
+   that is never emitted (nocode_wanted) disappears while the label it aimed
+   at still has to be placed, and C has no way to say "unused label"; the
+   epilogue therefore references the leftover labels from a dead jump. */
+static int *c99_lab_used; static int c99_lab_used_size;
+static int c99_lab_gen = 1;
+
+/* A comparison is materialised as one 'int' per comparison *pair*: the even
+   token of the pair (TOK_ULT/TOK_UGE, TOK_EQ/TOK_NE, TOK_ULE/TOK_UGT,
+   TOK_LT/TOK_GE, TOK_LE/TOK_GT) picks the variable, and the odd one is its
+   negation.  One variable for all comparisons would not do: when both arms of
+   a '?:' are conditions, the front-end keeps the first arm's comparison
+   pending while it generates the second one and then tests the first one
+   (the is_cond_bool case in expr_cond()), so both values have to stay
+   readable. */
+static int c99_cnd_slot(int op)
+{
+    return (op & ~1) & 0x0f;
+}
+
+static const char *c99_cnd_not(int op)
+{
+    return (op & 1) ? "!" : "";
+}
 
 typedef struct C99Mark { int pos, off; } C99Mark;
 typedef struct C99Lbl  { int pos, label; } C99Lbl;
 typedef struct C99Jump { int label; struct C99Jump *next; } C99Jump;
 typedef struct C99Pl   { C99Jump *head, *tail; } C99Pl;
-typedef struct C99Decl { char *name, *text; struct C99Decl *next; } C99Decl;
+/* a declaration emitted before the generated functions: 'name' is the linker
+   symbol, 'text' the C declaration the generator produced for it, 'alias' the
+   private identifier an imported symbol is declared under, and 'defined'
+   says whether this translation unit defines it after all */
+typedef struct C99Decl {
+    char *name, *text, *alias;
+    int defined;
+    struct C99Decl *next;
+} C99Decl;
 /* a global object that is emitted under its tcc name, so that other
    translation units can link against it */
 typedef struct C99GSym {
@@ -204,12 +237,21 @@ static int c99_ind(void)
     return c99_prog.len + c99_fn.len;
 }
 
-static void c99_printf(const char *fmt, ...)
+/* returns 0 when the statement was dropped as dead code */
+static int c99_printf(const char *fmt, ...)
 {
     va_list ap;
     char buf[2048];
     C99Mark *m;
     int n;
+
+    /* no statement for code that will not be part of the program (a dead
+       branch, sizeof(), #if ...).  The native back-ends drop it in their
+       byte emitter; here it has to be dropped explicitly, otherwise dead
+       statements land in the middle of live ones - and they are generated
+       with a register allocator that does not bother to keep values apart. */
+    if (nocode_wanted)
+        return 0;
 
     va_start(ap, fmt);
     n = vsnprintf(buf, sizeof buf, fmt, ap);
@@ -226,11 +268,31 @@ static void c99_printf(const char *fmt, ...)
     m->off = c99_fn.len;
     buf_add(&c99_fn, buf, n);
     ind = c99_ind();
+    return 1;
 }
 
 static int c99_new_label(void)
 {
     return c99_next_label++;
+}
+
+static void c99_use_label(int label)
+{
+    if (label >= c99_lab_used_size) {
+        int n = c99_lab_used_size ? c99_lab_used_size : 64;
+        while (n <= label)
+            n *= 2;
+        c99_lab_used = tcc_realloc(c99_lab_used, n * sizeof *c99_lab_used);
+        memset(c99_lab_used + c99_lab_used_size, 0,
+               (n - c99_lab_used_size) * sizeof *c99_lab_used);
+        c99_lab_used_size = n;
+    }
+    c99_lab_used[label] = c99_lab_gen;
+}
+
+static int c99_label_used(int label)
+{
+    return label < c99_lab_used_size && c99_lab_used[label] == c99_lab_gen;
 }
 
 /* --- patch lists: a handle is an index into c99_pls, 0 means "empty" ----- */
@@ -275,15 +337,29 @@ static void c99_pl_push(C99Pl *pl, int label)
     pl->tail = j;
 }
 
-/* concatenate the lists a and b into a fresh one */
+static int c99_pl_has_jumps(int pl)
+{
+    return pl > 0 && pl <= c99_npls && c99_pls[pl - 1] && c99_pls[pl - 1]->head;
+}
+
+/* concatenate the lists a and b into a fresh one.  Empty stays 0: the
+   front-end reads a non-zero return value as "there is a pending jump",
+   and gsym()/gjmp_append() turn the code back on for it - an empty list
+   would make the code after a dead branch live again */
 static int c99_pl_concat(int a, int b)
 {
-    C99Pl *dst = c99_pl_new();
+    C99Pl *dst;
     C99Jump *j;
-    if (a > 0 && a <= c99_npls && c99_pls[a - 1])
+    if (!c99_pl_has_jumps(a) && !c99_pl_has_jumps(b)) {
+        c99_pl_free(a);
+        c99_pl_free(b);
+        return 0;
+    }
+    dst = c99_pl_new();
+    if (c99_pl_has_jumps(a))
         for (j = c99_pls[a - 1]->head; j; j = j->next)
             c99_pl_push(dst, j->label);
-    if (b > 0 && b <= c99_npls && c99_pls[b - 1])
+    if (c99_pl_has_jumps(b))
         for (j = c99_pls[b - 1]->head; j; j = j->next)
             c99_pl_push(dst, j->label);
     c99_pl_free(a);
@@ -521,12 +597,20 @@ static int c99_global_data(ElfSym *e)
 static void c99_add_decl(const char *name, const char *text);
 static int c99_small_sret(CType *ret, CType *rt, int *align, int *regsize);
 
+/* names the generated file header declares or defines itself (see
+   c99_output_file): no prototype may be emitted for these */
+static int c99_header_name(const char *name)
+{
+    return !strcmp(name, "memcpy") || !strcmp(name, "memmove")
+        || !strcmp(name, "memset") || !strcmp(name, "__va_arg");
+}
+
 /* a symbol defined in another translation unit */
 static void c99_decl_extern(const char *name, int func)
 {
     char text[1024];
 
-    if (!name || !*name)
+    if (!name || !*name || c99_header_name(name))
         return;
     if (func)
         snprintf(text, sizeof text, "extern int %s();", name);
@@ -562,9 +646,14 @@ static void c99_addr(char *buf, int size, SValue *sv)
                 snprintf(sbuf, sizeof sbuf, "((char *)&%s)", nm);
             } else if (esym && esym->st_shndx != SHN_UNDEF
                        && esym->st_shndx != SHN_ABS) {
-                c99_mark_section(esym->st_shndx);
-                snprintf(sbuf, sizeof sbuf, "((char *)__c99_d%d + %lld)",
-                         esym->st_shndx, (long long)esym->st_value);
+                /* Not the address itself: a symbol does not have to be where
+                   it is now.  'extern const char *p;' in a header, the
+                   definition much later, allocates the object when it is
+                   declared and moves it again for the initialiser, so this
+                   is left as a placeholder that c99_resolve_syms() fills in
+                   with the address the symbol has when the file is written. */
+                snprintf(sbuf, sizeof sbuf, "((char *)@S%d@)",
+                         (int)sv->sym->c);
             } else if (sv->sym->v >= SYM_FIRST_ANOM) {
                 /* an anonymous symbol whose data was never emitted: it can
                    only be referenced from dead code (nocode_wanted), where
@@ -633,7 +722,8 @@ static void c99_valexpr(char *buf, int size, SValue *sv)
         }
         break;
     case VT_CMP:
-        snprintf(buf, size, "__c99_cnd");
+        snprintf(buf, size, "(%s__c99_cnd[%d])", c99_cnd_not(sv->cmp_op),
+                 c99_cnd_slot(sv->cmp_op));
         break;
     case VT_LOCAL:
     case VT_LLOCAL:
@@ -712,24 +802,32 @@ static int c99_is_runtime_name(const char *name)
     return 0;
 }
 
-static void c99_add_decl(const char *name, const char *text)
+static C99Decl *c99_decl_find(const char *name)
 {
     C99Decl *d;
 
-    for (d = c99_decls; d; d = d->next) {
-        if (!strcmp(d->name, name)) {
-            /* an earlier 'extern int f()' (a symbol referenced before its
-               definition appeared) gives way to the real prototype */
-            int old_knr = strstr(d->text, "()") != NULL;
-            int new_knr = strstr(text, "()") != NULL;
-            int old_extern = !strncmp(d->text, "extern ", 7);
-            int new_static = !strncmp(text, "static ", 7);
-            if ((old_knr && !new_knr) || (old_extern && new_static)) {
-                tcc_free(d->text);
-                d->text = tcc_strdup(text);
-            }
-            return;
+    for (d = c99_decls; d; d = d->next)
+        if (!strcmp(d->name, name))
+            return d;
+    return NULL;
+}
+
+static void c99_add_decl(const char *name, const char *text)
+{
+    C99Decl *d = c99_decl_find(name);
+
+    if (d) {
+        /* an earlier 'extern int f()' (a symbol referenced before its
+           definition appeared) gives way to the real prototype */
+        int old_knr = strstr(d->text, "()") != NULL;
+        int new_knr = strstr(text, "()") != NULL;
+        int old_extern = !strncmp(d->text, "extern ", 7);
+        int new_static = !strncmp(text, "static ", 7);
+        if ((old_knr && !new_knr) || (old_extern && new_static)) {
+            tcc_free(d->text);
+            d->text = tcc_strdup(text);
         }
+        return;
     }
     d = tcc_mallocz(sizeof *d);
     d->name = tcc_strdup(name);
@@ -761,8 +859,7 @@ static void c99_register_decl(Sym *fsym, CType *ftype)
         return;
     name = c99_test_name(name);
     /* these are declared with their real prototypes in the file header */
-    if (!strcmp(name, "memcpy") || !strcmp(name, "memmove")
-        || !strcmp(name, "memset"))
+    if (c99_header_name(name))
         return;
     if (c99_is_runtime_name(name)) {
         /* Defined (weakly, so that all TUs share one copy) in the runtime
@@ -881,7 +978,11 @@ ST_FUNC void load(int r, SValue *sv)
         } else if (bt == VT_LDOUBLE) {
             c99_printf("__c99_r[%d].ld = %#.21LgL;\n", r, sv->c.ld);
         } else if (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC) {
-            c99_printf("__c99_r[%d].i = (long long)%lldLL;\n", r, (long long)sv->c.i);
+            /* the value goes out as an unsigned constant and is cast back:
+               'long long' has no literal for LLONG_MIN ('-9223372036854775808'
+               is the negation of a constant that does not fit) */
+            c99_printf("__c99_r[%d].i = (long long)%lluULL;\n", r,
+                       (unsigned long long)sv->c.i);
         } else {
             c99_printf("__c99_r[%d].i = (long long)(unsigned int)%lldLL;\n",
                        r, (long long)sv->c.i);
@@ -893,7 +994,8 @@ ST_FUNC void load(int r, SValue *sv)
         c99_printf("__c99_r[%d].p = (void *)%s;\n", r, a);
         break;
     case VT_CMP:
-        c99_printf("__c99_r[%d].i = __c99_cnd;\n", r);
+        c99_printf("__c99_r[%d].i = %s__c99_cnd[%d];\n", r,
+                   c99_cnd_not(sv->cmp_op), c99_cnd_slot(sv->cmp_op));
         break;
     case VT_JMP:
     case VT_JMPI: {
@@ -903,7 +1005,8 @@ ST_FUNC void load(int r, SValue *sv)
         int t = v & 1;
         int after = c99_new_label();
         c99_printf("__c99_r[%d].i = %d;\n", r, t);
-        c99_printf("goto L%d;\n", after);
+        if (c99_printf("goto L%d;\n", after))
+            c99_use_label(after);
         c99_resolve(sv->c.i, c99_ind());
         c99_printf("__c99_r[%d].i = %d;\n", r, t ^ 1);
         c99_resolve(c99_pl_one(after), c99_ind());
@@ -1025,6 +1128,10 @@ ST_FUNC void gen_cvt_itof(int t)
     else if ((t & VT_BTYPE) == VT_DOUBLE)
         c99_printf("__c99_r[%d].d = (double)", r),
         c99_printf(buf, r), c99_printf(";\n");
+    else if (!strcmp(buf, "__c99_r[%d].u"))
+        /* gcc does not inline 'unsigned long long' -> 'long double' at -O0
+           and then calls __floatundixf, which x86-64 libgcc does not have */
+        c99_printf("__c99_r[%d].ld = __c99_ull2ld(__c99_r[%d].u);\n", r, r);
     else
         c99_printf("__c99_r[%d].ld = (long double)", r),
         c99_printf(buf, r), c99_printf(";\n");
@@ -1072,8 +1179,12 @@ static const char *c99_cmpsign(int op)
 
 ST_FUNC void gen_opi(int op)
 {
-    int rr, rd, bt = vtop->type.t & VT_BTYPE;
-    int uns = (vtop->type.t & VT_UNSIGNED) != 0;
+    /* the width of the operation is the one of the left operand, as in the
+       native back-ends: a shift keeps its left type while the count is
+       converted to 'int', so ((unsigned long long)x << 32) must not become
+       a 32 bit shift */
+    int rr, rd, bt = vtop[-1].type.t & VT_BTYPE;
+    int uns = (vtop[-1].type.t & VT_UNSIGNED) != 0;
     const char *ty = (bt == VT_LLONG || bt == VT_PTR || bt == VT_FUNC)
                      ? (uns ? "unsigned long long" : "long long")
                      : (uns ? "unsigned int" : "int");
@@ -1087,9 +1198,9 @@ ST_FUNC void gen_opi(int op)
         const char *cty = (op == TOK_ULT || op == TOK_UGE
                            || op == TOK_ULE || op == TOK_UGT)
                           ? "unsigned long long" : ty;
-        c99_printf("__c99_cnd = (%s)__c99_r[%d].i %s (%s)__c99_r[%d].i;\n",
-                   cty, rd, cmp, cty, rr);
-        c99_last_cmp = op;
+        c99_printf(op & 1 ? "__c99_cnd[%d] = !((%s)__c99_r[%d].i %s (%s)__c99_r[%d].i);\n"
+                          : "__c99_cnd[%d] = (%s)__c99_r[%d].i %s (%s)__c99_r[%d].i;\n",
+                   c99_cnd_slot(op), cty, rd, cmp, cty, rr);
         vtop--;
         vset_VT_CMP(op);
         return;
@@ -1204,9 +1315,9 @@ ST_FUNC void gen_opf(int op)
     rd = vtop[-1].r & VT_VALMASK;
 
     if (cmp) {
-        c99_printf("__c99_cnd = __c99_r[%d].%s %s __c99_r[%d].%s;\n",
-                   rd, m, cmp, rr, m);
-        c99_last_cmp = op;
+        c99_printf(op & 1 ? "__c99_cnd[%d] = !(__c99_r[%d].%s %s __c99_r[%d].%s);\n"
+                          : "__c99_cnd[%d] = __c99_r[%d].%s %s __c99_r[%d].%s;\n",
+                   c99_cnd_slot(op), rd, m, cmp, rr, m);
         vtop--;
         vset_VT_CMP(op);
         return;
@@ -1227,29 +1338,42 @@ ST_FUNC void gen_opf(int op)
 
 ST_FUNC int gjmp(int t)
 {
-    int label = c99_new_label();
-    c99_printf("goto L%d;\n", label);
+    int label;
+    /* code that is not emitted produces no jump and no label either: the
+       native back-ends drop the instruction in their byte emitter, and
+       dropping the label with it keeps a dead branch from turning the
+       code after it live again (which is what the front-end reads from
+       this return value) */
+    if (nocode_wanted)
+        return t;
+    label = c99_new_label();
+    if (c99_printf("goto L%d;\n", label))
+        c99_use_label(label);
     return c99_pl_concat(t, c99_pl_one(label));
 }
 
 ST_FUNC void gjmp_addr(int a)
 {
-    int label = c99_new_label();
-    c99_printf("goto L%d;\n", label);
+    int label;
+    if (nocode_wanted)
+        return;
+    label = c99_new_label();
+    if (c99_printf("goto L%d;\n", label))
+        c99_use_label(label);
     c99_resolve(c99_pl_one(label), a);
 }
 
 ST_FUNC int gjmp_cond(int op, int t)
 {
-    int label = c99_new_label();
-    const char *cond;
-    if (op == c99_last_cmp)
-        cond = "__c99_cnd";
-    else if (op == (c99_last_cmp ^ 1))
-        cond = "!__c99_cnd";
-    else
-        tcc_error("c99 output: condition does not match the last comparison");
-    c99_printf("if (%s) goto L%d;\n", cond, label);
+    int label;
+    if (nocode_wanted)
+        return t;
+    label = c99_new_label();
+    /* every comparison pair has its own variable, so any condition the
+       front-end still holds can be tested, even after another comparison */
+    if (c99_printf("if (%s__c99_cnd[%d]) goto L%d;\n", c99_cnd_not(op),
+                   c99_cnd_slot(op), label))
+        c99_use_label(label);
     return c99_pl_concat(t, c99_pl_one(label));
 }
 
@@ -1287,6 +1411,74 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
 }
 
 /* ====================================================================== */
+/* variadic functions                                                      */
+/*                                                                         */
+/* On x86-64 the front-end expands 'va_start(ap, last)' into a copy of a 24 */
+/* byte va_list from 'frame_address(0) - 24' (include/tccdefs.h) and        */
+/* 'va_arg(ap, t)' into a call of __va_arg() plus the argument class of t.  */
+/* The generated C therefore only has to                                    */
+/*   - declare the function with '...', so the host compiler passes the     */
+/*     extra arguments the way the caller expects,                          */
+/*   - put a real va_list into the 24 bytes the macro reads,                */
+/*   - provide __va_arg(), which walks that va_list.                        */
+/* The layout is the SysV one (also what GCC's __builtin_va_list is), so    */
+/* the helper is the same one lib/va_list.c implements for native code.      */
+
+enum { c99_va_none = -1, c99_va_gen_reg, c99_va_float_reg, c99_va_stack };
+
+/* the class of TY, merged member by member like x86_64-gen.c does: an
+   integer member wins over an SSE member, memory and x87 poison everything */
+static int c99_va_inner(CType *ty)
+{
+    Sym *f;
+    int mode;
+
+    switch (ty->t & VT_BTYPE) {
+    case VT_VOID:
+        return c99_va_none;
+    case VT_INT: case VT_BYTE: case VT_SHORT: case VT_LLONG:
+    case VT_BOOL: case VT_PTR: case VT_FUNC:
+        return c99_va_gen_reg;
+    case VT_FLOAT: case VT_DOUBLE:
+        return c99_va_float_reg;
+    case VT_LDOUBLE:
+        return c99_va_stack;
+    case VT_STRUCT:
+        mode = c99_va_none;
+        for (f = ty->ref->next; f; f = f->next) {
+            int m = c99_va_inner(&f->type);
+            if (mode == m || m == c99_va_none)
+                ;
+            else if (mode == c99_va_none)
+                mode = m;
+            else if (mode == c99_va_stack || m == c99_va_stack)
+                mode = c99_va_stack;
+            else
+                mode = c99_va_gen_reg;
+        }
+        return mode;
+    }
+    return c99_va_stack;
+}
+
+ST_FUNC int classify_x86_64_va_arg(CType *ty)
+{
+    int size, align, cls;
+
+    if (ty->t & (VT_BITFIELD | VT_ARRAY))
+        return c99_va_gen_reg;
+    size = type_size(ty, &align);
+    if (size > 16)
+        return c99_va_stack;
+    cls = c99_va_inner(ty);
+    if (cls == c99_va_float_reg)
+        return c99_va_float_reg;
+    if (cls == c99_va_gen_reg)
+        return c99_va_gen_reg;
+    return c99_va_stack;                /* none, x87 or memory */
+}
+
+/* ====================================================================== */
 /* functions                                                               */
 
 ST_FUNC void gfunc_prolog(Sym *func_sym)
@@ -1296,17 +1488,22 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     Sym *s;
     char tbuf[C99_TB], pbuf[C99_TB], sig[2048];
     int idx, off, size, align, n, np;
+    int nparams, is_vararg = ftype->ref->f.func_type == FUNC_ELLIPSIS;
     const char *name = get_tok_str(func_sym->v, NULL);
     const char *emit_name;
-
-    if (ftype->ref->f.func_type == FUNC_ELLIPSIS)
-        tcc_error("c99 output: defining variadic functions is not supported");
 
     /* a function may be called (or have its address taken) before its body
        appears, e.g. the __c6_sp_* trampolines the 'go' statement emits after
        main: declare it up front so the generated C sees a prototype */
     c99_register_decl(func_sym, ftype);
     emit_name = c99_test_name(name);
+    /* the unit defines this one after all, so it is not an external symbol
+       the declaration block has to import (see c99_is_import_decl) */
+    {
+        C99Decl *d = c99_decl_find(emit_name);
+        if (d)
+            d->defined = 1;
+    }
     int is_main = name && !strcmp(name, "main");
     int is_static = c99_is_static_fn(func_sym, name);
     int ret_struct = (ret->t & VT_BTYPE) == VT_STRUCT;
@@ -1322,8 +1519,16 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     c99_fn.len = 0;
     c99_nmarks = 0;
     c99_nlbls = 0;
+    c99_lab_gen++;
     loc = 0;
     func_vc = 0;
+
+    /* A variadic function keeps the 24 bytes at the top of the frame for its
+       va_list, exactly where 'frame_address(0) - 24' points: the front-end's
+       va_start() macro copies it out of there, and the prologue below fills
+       it with the host compiler's own va_list. */
+    if (is_vararg)
+        loc -= 24;
 
     /* If the function returns a struct, the caller passes a hidden pointer
        to the result storage as the first argument; keep it in a local slot so
@@ -1370,7 +1575,8 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
                " long double ld; void *p; } __c99_r[%d];\n", NB_REGS);
     c99_printf("union { long double _a; void *_p; unsigned char f[@FRM@]; }"
                " __c99_frm;\n");
-    c99_printf("int __c99_cnd = 0;\n(void)__c99_r; (void)__c99_frm; (void)__c99_cnd;\n");
+    c99_printf("int __c99_cnd[16] = {0};\n"
+               "(void)__c99_r; (void)__c99_frm; (void)__c99_cnd;\n");
 
     if (hidden_sret)
         c99_printf("memcpy(__c99_frm.f + @FRM@ + (%d), &__c99_ret, %d);\n",
@@ -1390,6 +1596,17 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
         c99_printf("memcpy(__c99_frm.f + @FRM@ + (%d), &__c99_a%d, %d);\n",
                    off, idx, size);
     }
+    nparams = idx;
+
+    /* Fill the va_list slot from the host compiler's own variadic support.
+       '__builtin_va_list' and '__builtin_va_start' exist both as GCC/clang
+       builtins and as the tccdefs.h macros, so the generated C also works
+       when tcc is the one that compiles it. */
+    if (is_vararg && nparams > 0)
+        c99_printf("{ __builtin_va_list __c99_va0;"
+                   " __builtin_va_start(__c99_va0, __c99_a%d);"
+                   " memcpy(__c99_frm.f + @FRM@ + (%d), __c99_va0, %d); }\n",
+                   nparams - 1, -24, 24);
 
     if (is_main && !(tcc_state && tcc_state->c6_test_mode))
         c99_printf("__c99_init();\n");
@@ -1472,7 +1689,10 @@ ST_FUNC void gfunc_call(int nb_args)
     Sym *fsym = callee->type.ref;
     Sym *ps;
     CType *ret;
-    char argbuf[8192], vbuf[C99_TB], tbuf[C99_TB], sig[C99_TB];
+    char argbuf[8192], vbuf[C99_TB], tbuf[C99_TB];
+    /* large enough for the indirect form:
+       "((tbuf)__c99_fp(vbuf))(argbuf)" */
+    char sig[sizeof argbuf + 2 * C99_TB + 32];
     int i, n = 0, is_helper = 0, is_indirect, ret_struct, have_proto, int_ret;
     int small_sret = 0;
     const char *cname = NULL;
@@ -1594,7 +1814,7 @@ ST_FUNC void gfunc_epilog(void)
     int frame = (-loc + (MAX_ALIGN - 1)) & -MAX_ALIGN;
     C99Buf out;
     int i, j, k;
-    char tmp[256], frm[32];
+    char tmp[C99_TB + 64], frm[32];
 
     memset(&out, 0, sizeof out);
     /* labels are resolved in jump order, not in code order */
@@ -1614,6 +1834,13 @@ ST_FUNC void gfunc_epilog(void)
             break;
         buf_add(&out, c99_fn.data + off, next - off);
     }
+    for (i = 0; i < c99_nlbls; i++)
+        if (!c99_label_used(c99_lbls[i].label)) {
+            /* the jump to it was dead code and never written */
+            snprintf(tmp, sizeof tmp, "if (0) goto L%d;\n",
+                     c99_lbls[i].label);
+            buf_puts(&out, tmp);
+        }
 
     if ((func_vt.t & VT_BTYPE) == VT_STRUCT) {
         CType srt;
@@ -1672,7 +1899,9 @@ ST_FUNC void c99_reset(void)
     memset(&c99_fn, 0, sizeof c99_fn);
     memset(&c99_prog, 0, sizeof c99_prog);
     c99_next_label = 1;
-    c99_last_cmp = 0;
+    tcc_free(c99_lab_used);
+    c99_lab_used = NULL;
+    c99_lab_used_size = 0;
     for (i = 0; i < c99_nrefs_count; i++)
         tcc_free((void *)c99_nrefs[i]);
     c99_nrefs_count = 0;
@@ -1683,6 +1912,7 @@ ST_FUNC void c99_reset(void)
         dn = d->next;
         tcc_free(d->name);
         tcc_free(d->text);
+        tcc_free(d->alias);
         tcc_free(d);
     }
     c99_decls = NULL;
@@ -1699,14 +1929,17 @@ ST_FUNC void c99_reset(void)
 /* ====================================================================== */
 /* writing the file                                                        */
 
-/* allocated, non-executable section with contents: emitted as __c99_dN */
+/* allocated, non-executable section with contents: emitted as __c99_dN.
+   .bss counts as well: it has no image in an object file, but the generated
+   C still needs a definition for the uninitialised globals that live in it,
+   otherwise every reference is an undeclared identifier. */
 static int c99_data_section(Section *s)
 {
     if (!s || s->sh_num == 0 || s->data_offset == 0)
         return 0;
     if (!(s->sh_flags & SHF_ALLOC) || (s->sh_flags & SHF_EXECINSTR))
         return 0;
-    if (s->sh_type != SHT_PROGBITS)
+    if (s->sh_type != SHT_PROGBITS && s->sh_type != SHT_NOBITS)
         return 0;
     if (!strcmp(s->name, ".init_array") || !strcmp(s->name, ".fini_array"))
         return 0;
@@ -1806,8 +2039,7 @@ static void c99_collect_globals(TCCState *s1)
         if (!c99_is_c_ident(name))
             continue;
         if (e->st_shndx == SHN_UNDEF) {
-            if (!strcmp(name, "memcpy") || !strcmp(name, "memmove")
-                || !strcmp(name, "memset"))
+            if (c99_header_name(name))
                 continue;       /* declared with a prototype in the header */
             if (ELFW(ST_TYPE)(e->st_info) == STT_FUNC) {
                 snprintf(text, sizeof text, "extern int %s();", name);
@@ -1882,6 +2114,144 @@ static void c99_collect_globals(TCCState *s1)
     }
 }
 
+/* Fill in the '@S<n>@' placeholders the generator leaves for objects that
+   are addressed through a section array (see c99_addr).  The address is only
+   final here: a tentative declaration allocates the object where it stands,
+   and a later definition of the same name may move it somewhere else. */
+static void c99_resolve_syms(TCCState *s1)
+{
+    C99Buf out;
+    int k;
+
+    memset(&out, 0, sizeof out);
+    for (k = 0; k < c99_prog.len; ) {
+        if (c99_prog.data[k] == '@' && k + 1 < c99_prog.len
+            && c99_prog.data[k + 1] == 'S') {
+            int j = k + 2, idx = 0, n = 0;
+            while (j < c99_prog.len && c99_prog.data[j] >= '0'
+                   && c99_prog.data[j] <= '9') {
+                idx = idx * 10 + c99_prog.data[j++] - '0';
+                n++;
+            }
+            if (n && j < c99_prog.len && c99_prog.data[j] == '@') {
+                char tmp[C99_TB];
+                ElfSym *e = (ElfSym *)s1->symtab->data + idx;
+                C99GSym *g = e->st_shndx != SHN_UNDEF
+                    ? c99_gsym_at(e->st_shndx, e->st_value) : NULL;
+                if (g && g->by_name) {
+                    snprintf(tmp, sizeof tmp, "&%s", g->cname);
+                } else if (e->st_shndx != SHN_UNDEF && e->st_shndx != SHN_ABS) {
+                    c99_mark_section(e->st_shndx);
+                    snprintf(tmp, sizeof tmp, "__c99_d%d + %lld",
+                             (int)e->st_shndx, (long long)e->st_value);
+                } else {
+                    const char *nm = (char *)s1->symtab->link->data + e->st_name;
+                    c99_note_name(nm);
+                    snprintf(tmp, sizeof tmp, "&%s", nm);
+                }
+                buf_puts(&out, tmp);
+                k = j + 1;
+                continue;
+            }
+        }
+        buf_add(&out, c99_prog.data + k, 1);
+        k++;
+    }
+    tcc_free(c99_prog.data);
+    c99_prog = out;
+}
+
+/* A symbol the generated unit only refers to.  The declaration block has to
+   invent a prototype for it from the compiler's own type model, and that
+   prototype regularly disagrees with the host header declaring the same
+   name: tcc has a single 64 bit integer type for 'long' and 'long long', and
+   every struct it sees is an opaque byte block.  A by-name declaration would
+   then be a "conflicting types" error as soon as the runtime prelude at the
+   end of the file includes <stdlib.h> or <pthread.h>.
+
+   Such a symbol is declared under a private identifier and bound to the real
+   linker name with an asm label, so the two declarations never meet; the
+   source name is #defined to that identifier for the generated code and the
+   #define is dropped again before the prelude, which therefore keeps the
+   host's own declarations (including the attributes GCC gives its built-ins).
+   Functions the unit defines itself are not imports and keep their names. */
+static int c99_is_import_decl(const C99Decl *d)
+{
+    int n;
+
+    if (!c99_rt_used || d->defined || !c99_is_c_ident(d->name))
+        return 0;
+    if (!strncmp(d->text, "static ", 7)
+        || !strncmp(d->text, "__c99_rt_linkage ", 17))
+        return 0;
+    if (!strncmp(d->text, "extern unsigned char ", 21)
+        && c99_gsym_defined(d->name))
+        return 0;
+    n = strlen(d->text);
+    return n > 1 && d->text[n - 1] == ';';
+}
+
+/* Emit the declarations of the imported symbols: once per symbol under a
+   private name bound to the linker symbol with an asm label, and, for a
+   compiler without asm labels, as the plain declaration the generator
+   produced (nothing renames the source names there, so only one form may be
+   visible).  The private names are numbered in declaration order. */
+static void c99_print_imports(FILE *f)
+{
+    C99Decl *d;
+    int n = 0, any = 0;
+
+    for (d = c99_decls; d && !any; d = d->next)
+        any = c99_is_import_decl(d);
+    if (!any)
+        return;
+    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)\n");
+    for (d = c99_decls; d; d = d->next) {
+        int len;
+        char buf[64];
+        if (!c99_is_import_decl(d))
+            continue;
+        snprintf(buf, sizeof buf, "__c99_ext_%d", n++);
+        d->alias = tcc_strdup(buf);
+        len = strlen(d->text);
+        fprintf(f, "#define %s %s\n", d->name, d->alias);
+        fprintf(f, "%.*s __asm__(\"%s\")%s\n", len - 1, d->text, d->name,
+                d->text + len - 1);
+    }
+    fprintf(f, "#endif\n"
+               "#if !defined(__GNUC__) && !defined(__clang__)\n");
+    for (d = c99_decls; d; d = d->next)
+        if (c99_is_import_decl(d))
+            fprintf(f, "%s\n", d->text);
+    fprintf(f, "#endif\n");
+}
+
+/* the identifier the generated C has to use for the linker symbol 'name' */
+static const char *c99_sym_ref(const char *name)
+{
+    C99Decl *d = c99_decl_find(name);
+
+    return d && d->alias ? d->alias : name;
+}
+
+/* the generated code is done with the imported names: hand them back to the
+   headers the runtime prelude includes */
+static void c99_undef_imports(FILE *f)
+{
+    C99Decl *d;
+    int any = 0;
+
+    for (d = c99_decls; d && !any; d = d->next)
+        any = c99_is_import_decl(d);
+    if (!any)
+        return;
+    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)\n");
+    for (d = c99_decls; d; d = d->next)
+        if (c99_is_import_decl(d))
+            fprintf(f, "#undef %s\n", d->name);
+    fprintf(f, "#endif\n");
+}
+
 ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
 {
     FILE *f;
@@ -1936,9 +2306,58 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
                "static __c99_unused void (*__c99_fp(void *__c99_ptr))(void)\n"
                "{ union __c99_pf_u __c99_u; __c99_u.p = __c99_ptr;"
                " return __c99_u.f; }\n");
+    /* an exact conversion for the one case a C compiler may turn into a
+       libgcc call (see gen_cvt_itof) */
+    fprintf(f, "static __c99_unused long double __c99_ull2ld(unsigned long long __u)\n"
+               "{\n"
+               "    if (__u < 9223372036854775808ULL)\n"
+               "        return (long double)(long long)__u;\n"
+               "    return (long double)(long long)(__u - 9223372036854775808ULL)\n"
+               "           + 9223372036854775808.0L;\n"
+               "}\n");
     fprintf(f, "extern void *memmove(void *, const void *, __c99_size_t);\n");
     fprintf(f, "extern void *memcpy(void *, const void *, __c99_size_t);\n");
     fprintf(f, "extern void *memset(void *, int, __c99_size_t);\n");
+    /* The front-end expands 'va_arg(ap, t)' into a call of this helper with
+       the SysV argument class, size and alignment of t (see
+       classify_x86_64_va_arg).  It walks the va_list a variadic prologue
+       stored in the frame; the fields are the SysV ones, which is also what
+       GCC's own __builtin_va_list looks like.  GCC's <stdarg.h> is not
+       needed, so this stays a plain function. */
+    fprintf(f,
+        "static __c99_unused void *__va_arg(void *__c99_ap, int __c99_class,\n"
+        "                                   int __c99_size, int __c99_align)\n"
+        "{\n"
+        "    unsigned char *__c99_vl = (unsigned char *)__c99_ap;\n"
+        "    unsigned int __c99_gp = *(unsigned int *)(__c99_vl + 0);\n"
+        "    unsigned int __c99_fp = *(unsigned int *)(__c99_vl + 4);\n"
+        "    char *__c99_ov = *(char **)(__c99_vl + 8);\n"
+        "    char *__c99_rs = *(char **)(__c99_vl + 16);\n"
+        "    __c99_size = (__c99_size + 7) & -8;\n"
+        "    __c99_align = (__c99_align + 7) & -8;\n"
+        "    if (__c99_class == 0 && __c99_gp + __c99_size <= 48) {\n"
+        "        __c99_gp += __c99_size;\n"
+        "        *(unsigned int *)(__c99_vl + 0) = __c99_gp;\n"
+        "        return __c99_rs + __c99_gp - __c99_size;\n"
+        "    }\n"
+        "    if (__c99_class == 1 && __c99_fp < 128 + 48) {\n"
+        "        __c99_fp += 16;\n"
+        "        *(unsigned int *)(__c99_vl + 4) = __c99_fp;\n"
+        "        if (__c99_size == 8)\n"
+        "            return __c99_rs + __c99_fp - 16;\n"
+        "        if (__c99_fp < 128 + 48) {\n"
+        "            memcpy(__c99_rs + __c99_fp - 8, __c99_rs + __c99_fp, 8);\n"
+        "            __c99_fp += 16;\n"
+        "            *(unsigned int *)(__c99_vl + 4) = __c99_fp;\n"
+        "            return __c99_rs + __c99_fp - 32;\n"
+        "        }\n"
+        "    }\n"
+        "    __c99_ov += __c99_size;\n"
+        "    __c99_ov = (char *)(((__c99_size_t)__c99_ov + __c99_align - 1)\n"
+        "                        & -(__c99_size_t)__c99_align);\n"
+        "    *(char **)(__c99_vl + 8) = __c99_ov;\n"
+        "    return __c99_ov - __c99_size;\n"
+        "}\n");
     /* structs and unions are opaque byte blocks of exactly their tcc size */
     for (i = 0; i < c99_nstructs; i++)
         fprintf(f, "typedef struct { unsigned char b[%d]; } __c99_s%d;\n",
@@ -1946,13 +2365,30 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
                 c99_structs[i].id);
 
     c99_collect_globals(s1);
+    c99_resolve_syms(s1);
     c99_mark_reloc_sections(s1);
+#ifdef C6_EXT
+    /* a method is emitted under '<tag>_<name>' and the unit itself defines
+       the plain name as a weak alias (see below): that is not an import */
+    for (i = 0; i < s1->c6_nb_method_aliases; i++) {
+        C99Decl *d = c99_decl_find(s1->c6_method_aliases[i]->plain);
+        if (d)
+            d->defined = 1;
+    }
+#endif
 
     for (i = 0; i < s1->nb_sections; i++) {
         Section *s = s1->sections[i];
         unsigned long k;
         if (!c99_data_section(s) || !c99_section_used(s->sh_num))
             continue;
+        if (s->sh_type == SHT_NOBITS) {
+            /* .bss: no image, all zero, and small enough to leave to the
+               initialiser of the output compiler's own .bss */
+            fprintf(f, "static __c99_unused unsigned char __c99_d%d[%lu] = {0};\n",
+                    s->sh_num, s->data_offset);
+            continue;
+        }
         fprintf(f, "static __c99_unused unsigned char __c99_d%d[%lu] = {",
                 s->sh_num, s->data_offset);
         for (k = 0; k < s->data_offset; k++)
@@ -1999,12 +2435,15 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
         fprintf(f, "} };\n");
     }
 
+    c99_print_imports(f);
     for (d = c99_decls; d; d = d->next) {
         /* a name first seen through another unit's declaration is not an
            external object once the defining unit's object is emitted here */
         if (!strncmp(d->text, "extern unsigned char ", 21)
             && c99_gsym_defined(d->name))
             continue;
+        if (c99_is_import_decl(d))
+            continue;           /* emitted by c99_print_imports */
         fprintf(f, "%s\n", d->text);
     }
 #ifdef C6_EXT
@@ -2041,6 +2480,9 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
     }
     if (c99_prog.len)
         fwrite(c99_prog.data, 1, c99_prog.len, f);
+    /* every reference to an imported name has been emitted by now: let the
+       headers the runtime prelude includes declare those names themselves */
+    c99_undef_imports(f);
     if (c99_rt_used)
         fwrite(c99_runtime, 1, sizeof c99_runtime - 1, f);
     if (emit_test_main) {
@@ -2055,7 +2497,6 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
                    "  printf(\"%%d test(s), %%d failure(s)\\n\", %d, __c99_fail);\n"
                    "  return __c99_fail ? 1 : 0;\n}\n", s1->c6_test_count);
     }
-
     if (!need_init) {
         fclose(f);
         return 0;
@@ -2082,15 +2523,19 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
             char target[1024];
 
             if (esym->st_shndx == SHN_UNDEF) {
+                /* an imported symbol lives under its private declaration
+                   name here: the #define that maps the source name to it was
+                   dropped before the runtime prelude (see c99_is_import_decl) */
+                const char *ref = c99_sym_ref(tname);
                 if (ELFW(ST_TYPE)(esym->st_info) == STT_FUNC)
                     snprintf(target, sizeof target,
-                             "__c99_pf((void (*)(void))%s)", tname);
+                             "__c99_pf((void (*)(void))%s)", ref);
                 else if (r->r_addend)
                     snprintf(target, sizeof target,
-                             "(void *)((char *)&%s + %lld)", tname,
+                             "(void *)((char *)&%s + %lld)", ref,
                              (long long)r->r_addend);
                 else
-                    snprintf(target, sizeof target, "(void *)&%s", tname);
+                    snprintf(target, sizeof target, "(void *)&%s", ref);
             } else if (ts && (ts->sh_flags & SHF_EXECINSTR)) {
                 snprintf(target, sizeof target,
                          "__c99_pf((void (*)(void))%s)", tname);

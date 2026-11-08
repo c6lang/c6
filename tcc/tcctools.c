@@ -69,19 +69,19 @@ ST_FUNC int tcc_tool_ar(int argc, char **argv)
     ArHdr arhdr = arhdr_init;
     ArHdr arhdro = arhdr_init;
 
-    FILE *fi, *fh = NULL, *fo = NULL;
+    FILE *fi = 0, *fh = NULL, *fo = NULL;
     const char *created_file = NULL; // must delete on error
-    ElfW(Ehdr) *ehdr;
-    ElfW(Shdr) *shdr;
-    ElfW(Sym) *sym;
-    int i, fsize, i_lib, i_obj;
-    char *buf, *shstr, *symtab, *strtab;
+    ElfW(Ehdr) *ehdr = 0;
+    ElfW(Shdr) *shdr = 0;
+    ElfW(Sym) *sym = 0;
+    int i = 0, fsize = 0, i_lib = 0, i_obj = 0;
+    char *buf = 0, *shstr = 0, *symtab = 0, *strtab = 0;
     int symtabsize = 0;//, strtabsize = 0;
     char *anames = NULL;
     int *afpos = NULL;
-    int istrlen, strpos = 0, fpos = 0, funccnt = 0, funcmax, hofs;
-    char tfile[260], stmp[20];
-    char *file, *name;
+    int istrlen = 0, strpos = 0, fpos = 0, funccnt = 0, funcmax = 0, hofs = 0;
+    char tfile[260] = {0}, stmp[20] = {0};
+    char *file = 0, *name = 0;
     int ret = 2;
     const char *ops_conflict = "habdiopN";  // unsupported but destructive if ignored.
     int extract = 0;
@@ -131,7 +131,7 @@ no_ar:
             goto finish;
 	}
 	while (fread(&arhdr, 1, sizeof(arhdr), fh) == sizeof(arhdr)) {
-	    char *p, *e;
+	    char *p = 0, *e = 0;
 
 	    if (memcmp(arhdr.ar_fmag, ARFMAG, 2))
 		goto no_ar;
@@ -548,7 +548,7 @@ static int execvp_win32(const char *prog, char **argv)
 
 ST_FUNC int tcc_tool_cross(char **argv, int target)
 {
-    char program[4096];
+    char program[4096] = {0};
     char *a0 = argv[0];
     int prefix = tcc_basename(a0) - a0;
 
@@ -585,7 +585,7 @@ const int _dowildcard = 1;
 
 static char *escape_target_dep(const char *s) {
     char *res = tcc_malloc(strlen(s) * 2 + 1);
-    int j;
+    int j = 0;
     for (j = 0; *s; s++, j++) {
         if (is_space(*s)) {
             res[j++] = '\\';
@@ -598,10 +598,10 @@ static char *escape_target_dep(const char *s) {
 
 ST_FUNC int gen_makedeps(TCCState *s1, const char *target, const char *filename)
 {
-    FILE *depout;
-    char buf[1024];
-    char **escaped_targets;
-    int i, k, num_targets;
+    FILE *depout = 0;
+    char buf[1024] = {0};
+    char **escaped_targets = 0;
+    int i = 0, k = 0, num_targets = 0;
 
     if (!filename) {
         /* compute filename automatically: dir/file.o -> dir/file.d */

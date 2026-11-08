@@ -449,7 +449,7 @@ ST_FUNC void tcc_debug_new(TCCState *s1)
 #endif
 
     if (s1->dwarf) {
-	int i;
+	int i = 0;
 	/* The sections below are just to make reloctions with
 	   R_DATA_32DW work correctly. See tccelf.c */
 	static const char *const debug[] = {
@@ -505,9 +505,9 @@ ST_FUNC void tcc_debug_new(TCCState *s1)
 static int put_stabs(TCCState *s1, const char *str, int type, int other, int desc,
                       unsigned long value)
 {
-    Stab_Sym *sym;
+    Stab_Sym *sym = 0;
 
-    unsigned offset;
+    unsigned offset = 0;
     if (type == N_SLINE
         && (offset = stab_section->data_offset)
         && (sym = (Stab_Sym*)(stab_section->data + offset) - 1)
@@ -572,7 +572,7 @@ static void dwarf_reloc(Section *s, int sym, int rel)
 
 static void free_str(struct dwarf_str_hash **str)
 {
-    int i;
+    int i = 0;
 
     for (i = 0; i < N_STR_HASH; i++) {
        while (str[i]) {
@@ -596,9 +596,9 @@ static unsigned str_hash(const char *s)
 static void dwarf_string(Section *s, Section *dw, int sym, const char *str)
 {
     TCCState *s1 = s->s1;
-    int len, hash = str_hash(str) % N_STR_HASH;
-    char *ptr;
-    struct dwarf_str_hash *new_hash;
+    int len = 0, hash = str_hash(str) % N_STR_HASH;
+    char *ptr = 0;
+    struct dwarf_str_hash *new_hash = 0;
     struct dwarf_str_hash **dw_hash =
 	dw == dwarf_str_section ? dwarf_str : dwarf_line_str;
 
@@ -665,8 +665,8 @@ static void dwarf_line_op(TCCState *s1, unsigned char op)
 
 static void dwarf_file(TCCState *s1)
 {
-    int i, j;
-    char *filename;
+    int i = 0, j = 0;
+    char *filename = 0;
     int index_offset = s1->dwarf < 5;
 
     if (!strcmp(file->filename, "<command line>")) {
@@ -744,7 +744,7 @@ static int dwarf_sleb128_size (long long value)
     int size =  0;
     long long end = value >> 63;
     unsigned char last = end & 0x40;
-    unsigned char byte;
+    unsigned char byte = 0;
 
     do {
         byte = value & 0x7f;
@@ -766,7 +766,7 @@ static void dwarf_uleb128 (Section *s, unsigned long long value)
 
 static void dwarf_sleb128 (Section *s, long long value)
 {
-    int more;
+    int more = 0;
     long long end = value >> 63;
     unsigned char last = end & 0x40;
 
@@ -791,7 +791,7 @@ static void dwarf_uleb128_op (TCCState *s1, unsigned long long value)
 
 static void dwarf_sleb128_op (TCCState *s1, long long value)
 {
-    int more;
+    int more = 0;
     long long end = value >> 63;
     unsigned char last = end & 0x40;
 
@@ -879,8 +879,8 @@ ST_FUNC void tcc_eh_frame_start(TCCState *s1)
 
 static void tcc_debug_frame_end(TCCState *s1, int size)
 {
-    int eh_section_sym;
-    unsigned long fde_start;
+    int eh_section_sym = 0;
+    unsigned long fde_start = 0;
 
     if (!eh_frame_section)
 	return;
@@ -899,6 +899,8 @@ static void tcc_debug_frame_end(TCCState *s1, int size)
     dwarf_reloc(eh_frame_section, eh_section_sym, R_AARCH64_PREL32);
 #elif defined TCC_TARGET_RISCV64
     dwarf_reloc(eh_frame_section, eh_section_sym, R_RISCV_32_PCREL);
+#else
+    (void)eh_section_sym; // no PC-relative relocation for this target
 #endif
     dwarf_data4(eh_frame_section, func_ind); // PC Begin
     dwarf_data4(eh_frame_section, size); // PC Range
@@ -1019,9 +1021,9 @@ static int sort_eh_table(const void *a, const void *b)
 
 ST_FUNC void tcc_eh_frame_hdr(TCCState *s1, int final)
 {
-    int count = 0, offset;
-    unsigned long count_offset, tab_offset;
-    unsigned char *ln, *end;
+    int count = 0, offset = 0;
+    unsigned long count_offset = 0, tab_offset = 0;
+    unsigned char *ln = 0, *end = 0;
     unsigned int last_cie_offset = 0xffffffff;
 
     if (!eh_frame_section || !eh_frame_section->data_offset)
@@ -1051,8 +1053,8 @@ ST_FUNC void tcc_eh_frame_hdr(TCCState *s1, int final)
     end = eh_frame_section->data + eh_frame_section->data_offset;
     while (ln < end) {
 	unsigned char *fde = ln, *rd = ln;
-	unsigned int cie_offset, version, length = dwarf_read_4(rd, end);
-	unsigned int pc_offset, fde_offset;
+	unsigned int cie_offset = 0, version = 0, length = dwarf_read_4(rd, end);
+	unsigned int pc_offset = 0, fde_offset = 0;
 
 	if (length == 0)
 	    goto next;
@@ -1101,9 +1103,9 @@ next:
 /* start of translation unit info */
 ST_FUNC void tcc_debug_start(TCCState *s1)
 {
-    int i;
-    char buf[512];
-    char *filename;
+    int i = 0;
+    char buf[512] = {0};
+    char *filename = 0;
 
     /* we might currently #include the <command-line> */
     filename = file->prev ? file->prev->filename : file->filename;
@@ -1138,9 +1140,9 @@ ST_FUNC void tcc_debug_start(TCCState *s1)
 #endif
 
         if (s1->dwarf) {
-            int start_abbrev;
-            unsigned char *ptr;
-	    char *undo;
+            int start_abbrev = 0;
+            unsigned char *ptr = 0;
+	    char *undo = 0;
 
             /* dwarf_abbrev */
             start_abbrev = dwarf_abbrev_section->data_offset;
@@ -1301,9 +1303,9 @@ ST_FUNC void tcc_debug_end(TCCState *s1)
         tcc_debug_funcend(s1, 0); /* free stuff in case of errors */
 
     if (s1->dwarf) {
-	int i;
-	int start_aranges;
-	unsigned char *ptr;
+	int i = 0;
+	int start_aranges = 0;
+	unsigned char *ptr = 0;
 	int text_size = text_section->data_offset;
 
 	/* dwarf_info */
@@ -1364,7 +1366,7 @@ ST_FUNC void tcc_debug_end(TCCState *s1)
 	    }
 	}
 	else {
-	    int len;
+	    int len = 0;
 
 	    for (i = 0; i < dwarf_line.dir_size; i++) {
 	        len = strlen(dwarf_line.dir_table[i]) + 1;
@@ -1471,7 +1473,7 @@ ST_FUNC void tcc_debug_eincl(TCCState *s1)
 /* generate line number info */
 ST_FUNC void tcc_debug_line(TCCState *s1)
 {
-    BufferedFile *f;
+    BufferedFile *f = 0;
 
     if (!s1->do_debug)
         return;
@@ -1538,7 +1540,7 @@ ST_FUNC void tcc_debug_line(TCCState *s1)
 static void tcc_debug_stabs (TCCState *s1, const char *str, int type, unsigned long value,
                              Section *sec, int sym_index, int info)
 {
-    struct debug_sym *s;
+    struct debug_sym *s = 0;
 
     if (debug_info) {
         debug_info->sym =
@@ -1564,7 +1566,7 @@ static void tcc_debug_stabs (TCCState *s1, const char *str, int type, unsigned l
 static void fix_debug_forw_hash(TCCState *s1, int global, int start)
 {
     if (s1->dwarf) {
-        int i, j, n_hash = global
+        int i = 0, j = 0, n_hash = global
 		    ? n_debug_forw_hash_global : n_debug_forw_hash_local;
 	struct _debug_forw_hash *hash = global
 	  ? debug_forw_hash_global : debug_forw_hash_local;
@@ -1641,10 +1643,10 @@ static int check_global(Sym *t)
 
 static int tcc_debug_find(TCCState *s1, Sym *t, int dwarf)
 {
-    int i , g = check_global(t);
-    int n_hash, *n_forw_hash;
-    struct _debug_hash *hash;
-    struct _debug_forw_hash **forw_hash;
+    int i = 0 , g = check_global(t);
+    int n_hash = 0, *n_forw_hash = 0;
+    struct _debug_hash *hash = 0;
+    struct _debug_forw_hash **forw_hash = 0;
 
     if ((t->type.t & VT_BTYPE) == VT_STRUCT && t->c == -1) {
         forw_hash = g ? &debug_forw_hash_global : &debug_forw_hash_local;
@@ -1673,9 +1675,9 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s);
 static void tcc_debug_check_forw(TCCState *s1, Sym *t, int debug_type)
 {
     if ((t->type.t & VT_BTYPE) == VT_STRUCT && t->type.ref->c == -1) {
-        int i, j, g = check_global(t);
-        int n_forw_hash;
-        struct _debug_forw_hash **forw_hash;
+        int i = 0, j = 0, g = check_global(t);
+        int n_forw_hash = 0;
+        struct _debug_forw_hash **forw_hash = 0;
 
 	for (i = g; i <= 1; i++) {
             forw_hash = i ? &debug_forw_hash_global : &debug_forw_hash_local;
@@ -1704,9 +1706,9 @@ ST_FUNC void tcc_debug_fix_forw(TCCState *s1, CType *t)
         return;
     }
     if ((t->t & VT_BTYPE) == VT_STRUCT && t->ref->c != -1) {
-        int i, j, debug_type, g = check_global(t->ref);
-        int *n_forw_hash;
-        struct _debug_forw_hash **forw_hash;
+        int i = 0, j = 0, debug_type = 0, g = check_global(t->ref);
+        int *n_forw_hash = 0;
+        struct _debug_forw_hash **forw_hash = 0;
         forw_hash = g ? &debug_forw_hash_global : &debug_forw_hash_local;
         n_forw_hash = g ? &n_debug_forw_hash_global : &n_debug_forw_hash_local;
 	for (i = 0; i < *n_forw_hash; i++)
@@ -1731,8 +1733,8 @@ ST_FUNC void tcc_debug_fix_forw(TCCState *s1, CType *t)
 static int tcc_debug_add(TCCState *s1, Sym *t, int dwarf)
 {
     int offset = dwarf ? dwarf_info_section->data_offset : ++debug_next_type;
-    int *n_hash, g = check_global(t);
-    struct _debug_hash **hash;
+    int *n_hash = 0, g = check_global(t);
+    struct _debug_hash **hash = 0;
 
     hash = g ? &debug_hash_global : &debug_hash_local;
     n_hash = g ? &n_debug_hash_global : &n_debug_hash_local;
@@ -1797,11 +1799,11 @@ static int remove_type_info(int type)
 
 static void tcc_get_debug_info(TCCState *s1, Sym *s, CString *result)
 {
-    int type;
+    int type = 0;
     int n = 0;
     int debug_type = -1;
     Sym *t = s;
-    CString str;
+    CString str = {0};
 
     for (;;) {
         type = remove_type_info (t->type.t);
@@ -1822,7 +1824,7 @@ static void tcc_get_debug_info(TCCState *s1, Sym *s, CString *result)
                          t->c);
 
             while (t->next) {
-                int pos, size, align;
+                int pos = 0, size = 0, align = 0;
                 t = t->next;
 		if (STRUCT_NODEBUG(t))
 		    continue;
@@ -1911,12 +1913,12 @@ static void stabs_struct_complete(TCCState *s1, CType *t)
 
 static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
 {
-    int type;
+    int type = 0;
     int debug_type = -1;
-    Sym *e, *t = s;
-    int i;
+    Sym *e = 0, *t = s;
+    int i = 0;
     int last_pos = -1;
-    int retval;
+    int retval = 0;
 
     if (new_file)
         put_new_file(s1);
@@ -1931,7 +1933,7 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
         t = t->type.ref;
 	debug_type = tcc_debug_find(s1, t, 1);
 	if (debug_type == -1) {
-	    int pos_sib = 0, i, *pos_type;
+	    int pos_sib = 0, i = 0, *pos_type = 0;
 
 	    debug_type = tcc_debug_add(s1, t, 1);
 	    e = t;
@@ -2007,7 +2009,7 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
         t = t->type.ref;
 	debug_type = tcc_debug_find(s1, t, 1);
 	if (debug_type == -1) {
-	    int pos_sib, pos_type;
+	    int pos_sib = 0, pos_type = 0;
 	    Sym sym = {0}; sym.type.t = VT_INT | (type & VT_UNSIGNED);
 
 	    pos_type = tcc_get_dwarf_info(s1, &sym);
@@ -2052,7 +2054,7 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
             return 0;
 	debug_type = dwarf_info.base_type_used[i - 1];
 	if (debug_type == 0) {
-	    char name[100];
+	    char name[100] = {0};
 
 	    debug_type = dwarf_info_section->data_offset;
 	    dwarf_data1(dwarf_info_section, DWARF_ABBREV_BASE_TYPE);
@@ -2085,7 +2087,7 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
 	    dwarf_data4(dwarf_info_section, 0);
 	}
         else if (type == (VT_PTR | VT_ARRAY)) {
-	    int sib_pos, sub_type;
+	    int sib_pos = 0, sub_type = 0;
 #if LONG_SIZE == 4
 	    Sym sym = {0}; sym.type.t = VT_LONG | VT_INT | VT_UNSIGNED;
 #else
@@ -2122,8 +2124,8 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
 		      dwarf_info_section->data_offset - dwarf_info.start);
 	}
         else if (type == VT_FUNC) {
-	    int sib_pos = 0, *pos_type;
-	    Sym *f;
+	    int sib_pos = 0, *pos_type = 0;
+	    Sym *f = 0;
 
 	    i = dwarf_info_section->data_offset;
 	    debug_type = tcc_get_dwarf_info(s1, t->type.ref);
@@ -2192,7 +2194,7 @@ static void tcc_debug_finish (TCCState *s1, struct _debug_info *cur)
 {
     while (cur) {
         struct _debug_info *next = cur->next;
-        int i;
+        int i = 0;
 
         if (s1->dwarf) {
 
@@ -2275,8 +2277,8 @@ static void tcc_debug_finish (TCCState *s1, struct _debug_info *cur)
 
 ST_FUNC void tcc_add_debug_info(TCCState *s1, Sym *s, Sym *e)
 {
-    CString debug_str;
-    int param;
+    CString debug_str = {0};
+    int param = 0;
 
     if (!(s1->do_debug & 2))
         return;
@@ -2307,8 +2309,8 @@ ST_FUNC void tcc_add_debug_info(TCCState *s1, Sym *s, Sym *e)
 /* put function symbol */
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym)
 {
-    CString debug_str;
-    BufferedFile *f;
+    CString debug_str = {0};
+    BufferedFile *f = 0;
 
     if (!s1->do_debug)
         return;
@@ -2324,7 +2326,7 @@ ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym)
         dwarf_info.func = sym;
         dwarf_info.line = file->line_num;
 	if (s1->do_backtrace) {
-	    int i, len;
+	    int i = 0, len = 0;
 
 	    dwarf_line_op(s1, 0); // extended
 	    dwarf_uleb128_op(s1, strlen(funcname) + 2);
@@ -2359,7 +2361,7 @@ ST_FUNC void tcc_debug_prolog_epilog(TCCState *s1, int value)
 ST_FUNC void tcc_debug_funcend(TCCState *s1, int size)
 {
     /* lldb does not like function end and next function start at same pc */
-    int min_instr_len;
+    int min_instr_len = 0;
 
 #if TCC_EH_FRAME
     tcc_debug_frame_end(s1, size);
@@ -2431,7 +2433,7 @@ ST_FUNC void tcc_debug_extern_sym(TCCState *s1, Sym *sym, int sh_num, int sym_bi
     if (sym_type == STT_FUNC || sym->v >= SYM_FIRST_ANOM)
         return;
     if (s1->dwarf) {
-        int debug_type;
+        int debug_type = 0;
 
         debug_type = tcc_get_dwarf_info(s1, sym);
 	dwarf_data1(dwarf_info_section,
@@ -2459,7 +2461,7 @@ ST_FUNC void tcc_debug_extern_sym(TCCState *s1, Sym *sym, int sh_num, int sym_bi
     {
         Section *s = sh_num == SHN_COMMON ? common_section
 					  : s1->sections[sh_num];
-        CString str;
+        CString str = {0};
 
         cstr_new (&str);
         cstr_printf (&str, "%s:%c",
@@ -2483,7 +2485,7 @@ ST_FUNC void tcc_debug_typedef(TCCState *s1, Sym *sym)
         return;
 
     if (s1->dwarf) {
-	int debug_type;
+	int debug_type = 0;
 
         debug_type = tcc_get_dwarf_info(s1, sym);
 	if (debug_type != -1) {
@@ -2497,7 +2499,7 @@ ST_FUNC void tcc_debug_typedef(TCCState *s1, Sym *sym)
     }
     else
     {
-        CString str;
+        CString str = {0};
         cstr_new (&str);
         cstr_printf (&str, "%s:t", get_tok_str(sym->v, NULL));
         tcc_get_debug_info(s1, sym, &str);
@@ -2513,8 +2515,8 @@ ST_FUNC void tcc_tcov_block_end(TCCState *s1, int line);
 
 ST_FUNC void tcc_tcov_block_begin(TCCState *s1)
 {
-    SValue sv;
-    void *ptr;
+    SValue sv = {0};
+    void *ptr = 0;
     unsigned long last_offset = tcov_data.offset;
 
     tcc_tcov_block_end (tcc_state, 0);
@@ -2524,8 +2526,8 @@ ST_FUNC void tcc_tcov_block_begin(TCCState *s1)
     if (tcov_data.last_file_name == 0 ||
 	strcmp ((const char *)(tcov_section->data + tcov_data.last_file_name),
 		file->true_filename) != 0) {
-	char wd[1024];
-	CString cstr;
+	char wd[1024] = {0};
+	CString cstr = {0};
 
 	if (tcov_data.last_func_name)
 	    section_ptr_add(tcov_section, 1);
@@ -2552,7 +2554,7 @@ ST_FUNC void tcc_tcov_block_begin(TCCState *s1)
     if (tcov_data.last_func_name == 0 ||
 	strcmp ((const char *)(tcov_section->data + tcov_data.last_func_name),
 		funcname) != 0) {
-	size_t len;
+	size_t len = 0;
 
 	if (tcov_data.last_func_name)
 	    section_ptr_add(tcov_section, 1);

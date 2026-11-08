@@ -617,6 +617,12 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   `begin_macro` 重放 token，`type_decl(TYPE_ABSTRACT|TYPE_DIRECT)` 走一遍，
   成功且右括号前没有名字才算元组），失败就原样退回普通括号。因此
   `(void)printf(…)`、`(int)x`、`(struct S){…}`、`({…})`、`(a, b)` 全部零变化；
+- **整组扫描要把 `sizeof(type)` 的 `(` 当成开括号**：`sizeof` / `_Alignof`
+  后面跟 `(` 时，`unary()` 拿到的是 `TOK_SOTYPE`（`'('` 的别名）。扫描器只数
+  真括号的话，匹配的 `)` 会把深度减到 -1，组永远不闭合，一路吞到 `TOK_EOF`；
+  这时回放的 token 已经跨过文件尾，行号来自 token 串里的行标记、文件名却来自
+  弹出后的包含者，诊断会报成“源文件:头文件里的行号”。`tests/errors/loc.c`
+  守这条；
 - **不上新 ABI**：元组就是 `VT_STRUCT` + 内部 tag `__c6_tuple_N`，参数和返回值
   都走已有的 struct 路径（`gfunc_sret` / `classify_x86_64_arg`），`libtcc1.c`
   一个新符号都没加。`tests/abi/tuple.c` + `tests/abi/tuple_plain.c` 用元组和
@@ -668,6 +674,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/tuple_async.c` | 元组的 `async` 返回、`await` + 解构、`_` 丢弃、嵌套 `await` |
 | `tests/tuple_thread.c` | 元组穿过 `go`（按值拷贝）、线程里的元组调用 |
 | `tests/errors/tuple.c` | 元组的全部编译期诊断（元素类型、下标、解构形态、`return {…}`） |
+| `tests/errors/loc.c` | 诊断位置：`sizeof(type)` / `_Alignof(type)` 整组回滚之后，头文件里的声明仍然报在头文件自己的那一行 |
 | `tests/abi/tuple.c` + `tests/abi/tuple_plain.c` | 元组与等价 struct 的 ABI 互通（两个 TU 分别用 `-std=c6` 和纯 C 编译后链接） |
 | `tests/abi/method.c` + `tests/abi/method_plain.c` | 方法改名的 ABI 互通：纯 C 一侧按原名调用 c6 方法（弱别名）、c6 一侧普通调用纯 C 函数 |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
@@ -723,6 +730,13 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - `((int,int){1,2}[0])` 这种“复合字面量外面再套一层括号、下标写在括号里”的
   写法报 `')' expected (got '[')`：下标写在括号外（`((int,int){1,2})[0]`）或
   去掉外层括号即可；
+- 元组/模式猜测会在失败时把扫过的 token 用 `begin_macro()` 塞回输入流，
+  而猜测期间调用的 `parse_btype()`/`decl()` 自己也可能再塞一层回放；原来
+  收尾的 `end_macro()` 会弹错栈顶，漏在外面的那层回放把 token 再发一遍
+  （`((a) < b);` 这种“语句以括号组开头”的写法因此报
+  `expression expected before '<'`）。现在这些点统一走 `tccpp.c` 的
+  `macro_unwind_above()` / `end_macro_under()` / `macro_rewind()`：先把
+  猜测期间压上去的回放全部弹掉，再回到自己的那一层；
 - 结构体方法必须在调用点之前声明或定义（单趟编译约束）；只支持 `->`，
   `v.f()` 按普通成员访问处理，同名字段优先于方法；
 - 方法符号是 `<结构体>_<方法>`，源码名是弱别名：同一个类型仍然只能有一个
@@ -749,6 +763,17 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   给某个 TU 开启扩展后，该 TU 内所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
   全局/`static` 对象放进 `.data`（不写初始化器时在 `.bss`），因此给大型
   静态缓冲区补初始化器会增大输出文件；
+- TCC 自己的源码也按这条规则写：`make c6selfcheck` 用 `-std=c6 -DC6_EXT`
+  编译 `tcc/tcc.c`（原生目标文件 + C99 后端产物；带 `C6_EXT` 才会连
+  `#ifdef C6_EXT` 的扩展实现一起检查）并把编出来的编译器连起来跑，两步
+  编译都不许有诊断输出。
+  为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type` 等）从
+  "头文件里的暂定定义"改成"头文件 `extern` 声明 + 各自 `.c` 里带初始化器
+  定义一次"（`ST_DATA` 的 `ONE_SOURCE` 分支也跟着去掉了 `static`）；
+  c6 的关键字（`err`、`test`、`import` 等）在 tcc 源码里原来的标识符用法
+  改成了别的名字；`x86_64-gen.c` 的 `gfunc_prolog` 定义补了 `ST_FUNC`，
+  否则原型（`static`）和定义（`extern`）是两个符号，c6 的方法登记会报
+  `duplicate method`；
 - `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）；
 - 切片 `T[:]` 是**视图**：`{元素指针, 长度}` 两个机器字，不拥有元素，也没有
   `append`/`cap`/动态扩容/深拷贝；`data` 字段是 `T *const`，所以切片头不能被
@@ -869,6 +894,16 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 自己的局部变量偏移寻址，因此不需要给局部变量取名字）；比较 -> `__c99_cnd`；
 数据段 -> 字节数组 + `__c99_init()` 按重定位表打补丁。
 
+只被引用、不在本 TU 定义的外部符号（libc 函数，以及别的 TU 的函数/对象）
+单独声明在 `__c99_ext_<n>` 下，再用 `__asm__` 标签绑回真正的链接符号，生成
+代码通过 `#define` 用源名字引用它，这份 `#define` 在前导之前 `#undef` 掉。
+原因是声明块里的原型只能来自 tcc 的类型模型（`long` 和 `long long` 是同一个
+64 位整型，结构体一律是字节块），和 c6 运行时前导里 `#include` 的宿主头文件
+（`<stdlib.h>`、`<pthread.h>`）对不上；换名字后两边永远不碰面，`gcc 1.c`
+（不加 `-w`、不加任何额外开关）就能直接编译。本 TU 自己定义的函数（含
+`<tag>_<name>` 方法别名）不算导入，仍按原名声明。`make c6selfcheck` 会把
+c6 模式翻译出来的 `selfcheck.c` 交给宿主编译器编译一遍，钉住这条。
+
 结构体/联合体、返回结构体的函数、间接调用都已经支持。c6 的运行时
 （defer/errdefer、err/try/catch、切片、协程、线程、`c6_io`）用一份可移植
 C99 + POSIX（pthread/select）的实现重写在 `tcc/c99-rt.inc`，构建时转成
@@ -886,8 +921,28 @@ native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 
 才不同的诊断用 `// EXPECT-C99` 声明）。`make selftest` 用同一个 `tcc/tcc`
 跑同一套用例（`tests/c99/c99test.c` 用一份源码覆盖普通 C 和 c6 的全部特性）。
 
-限制（均显式报错，不会静默错编译）：变参函数**定义**、computed goto、
-VLA；非 POSIX 主机上运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
+变参函数**定义**也支持：`tccdefs.h` 在 `__c99__` 下给出与 SysV x86-64
+一致的 `__builtin_va_list`（`gp_offset`/`fp_offset`/`overflow_arg_area`/
+`reg_save_area`），`__builtin_va_start`/`__builtin_va_arg` 复用
+`x86_64-gen.c` 的 `classify_x86_64_va_arg`，而 C 后端把形参块 memcpy 进
+`__c99_frm.f` 之后，再从 `frame_address(0) - 24` 那个位置把宿主编译器的
+`va_list` 复制进变参函数的栈帧顶部——这正是 `__builtin_va_start` 会去读的
+位置，所以生成代码里的 `va_arg` 与宿主 `vsnprintf` 之类拿到的 `va_list`
+是同一份。整型/浮点变参、超过 6+8 个参数溢出到栈上的情形、
+`tests/c99/c99test.c` 里的“把 va_list 转手给宿主函数”都已覆盖。
+
+自举（`make selfhost` / `make c99selfhost`）：前者是 c6 后端编译自己
+（`tcc/tcc` -> stage1 -> stage2，两次目标文件 `cmp` 相同），后者是 C 输出
+路线（`tcc -c99` 出 C -> 宿主 gcc 编出 stage2 -> stage2 编出 stage3，stage3
+再编一次目标文件与 stage2 的逐字节相同）。两条路线最后都让新编译器编一个
+小程序并运行，因此“生成的后端能跑”是被回归卡住的，不是靠人工抽查。这两条
+路线的存在也顺手钉死了几个只有在自举规模下才暴露的 bug：`nocode_wanted`
+的语句不能混进活代码、LLONG_MIN 没有 C 字面量、`.bss` 段必须出现在输出里、
+符号地址不能在生成时定死（tentative 声明之后定义还会搬位置）、移位的宽度
+取**左**操作数的类型（`(unsigned long long)x << 32` 不能被截成 32 位移位）。
+
+限制（均显式报错，不会静默错编译）：computed goto、VLA；非 POSIX 主机上
+运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
 ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-64 寄存器返回，
 可以与普通 C 互操作；其它结构体返回用隐藏指针（c6 TU 之间一致，大于
 16 字节时也与原生 ABI 一致，9--16 字节与普通 C 混用不支持）。

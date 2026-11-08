@@ -453,6 +453,19 @@ int a[n];                 ->  不用改（VLA 豁免）
   （文件里真的存一份零），而不带初始化器的全局对象在 `.bss`。所以给
   大缓冲区补初始化器会让可执行文件变大；迁移大型静态表时要留意这一点。
 
+TCC 自己的源码也遵守这条规则（`make c6selfcheck` 会检查），因此拿
+`-std=c6` 编 tcc 自己不会撞上这条诊断；带 `-DC6_EXT` 也一样，`#ifdef
+C6_EXT` 里的扩展实现同样补了初始化器：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -DC6_EXT -c tcc/tcc.c -o tcc.o   # 原生目标文件
+./tcc/tcc -B tcc -std=c6 -DC6_EXT -o tcc.c.c tcc/tcc.c    # C99 后端的输出
+```
+
+为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type`……）改成了
+"头文件里 `extern` 声明 + 各自 `.c` 文件里带初始化器定义一次"，全局量
+不再依赖"暂定定义"这种不带初始化器的写法。
+
 ### interface
 
 ```c
@@ -974,8 +987,25 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 ```sh
 make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
-make test-all      # selftest + tests2
+make c6selfcheck   # 用 -std=c6 编译 tcc 自己的源码，编出可运行的编译器
+make test-all      # selftest + tests2 + c6selfcheck
 ```
+
+自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：
+
+```sh
+make selfhost      # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
+make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
+```
+
+两条路线都会把两次编译得到的目标文件 `cmp` 一遍（bootstrap fixpoint），
+再用最终的 stage2/stage3 编译并运行一个小程序：只有目标文件逐字节相同、
+编出来的编译器真能编程序，自举才算通过。
+
+`make c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
+的源码也要满足它，所以整份源码都用 `-std=c6 -DC6_EXT` 编译一遍（原生目标
+文件 + C99 后端产物；带 `C6_EXT` 才会把扩展实现那半边也纳入检查），再把
+编出来的编译器连起来跑 `-v`。两步编译都不许有诊断输出，出现警告即失败。
 
 > 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
 > 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。
@@ -1070,7 +1100,19 @@ that `__c99_init()` patches from the relocation table at start-up.
 Plain C programs work: integers, floats, pointers, arrays and string literals;
 locals and globals; `if`/`while`/`for`/`do`/`switch`; recursion and direct and
 indirect calls; static functions; `?:`, bit operations, shifts and all type
-casts; structs, unions and functions returning structs.
+casts; structs, unions and functions returning structs; variadic function
+definitions (`va_start`/`va_arg`/`va_end`, and passing the `va_list` on to a
+host function such as `vsnprintf`), with the x86-64 SysV `va_list` layout.
+
+Symbols the unit only imports (libc calls, and functions or objects of another
+translation unit) are declared once, under a private `__c99_ext_N` name bound
+to the real linker symbol with an `__asm__` label; the generated code reaches
+them through a `#define` of the source name, which is dropped again before the
+runtime prelude.  The declaration block can then keep the compiler's own idea
+of a prototype -- tcc has one 64 bit integer type for `long` and `long long`,
+and every struct it sees is an opaque byte block -- without colliding with the
+host's declarations when the prelude includes `<stdlib.h>` and `<pthread.h>`.
+A plain `cc out.c` (no `-w`, no extra include flags) is enough.
 
 c6 programs work too.  A c6 translation unit (`-std=c6`) carries a portable C
 implementation of the defer/error/slice/coroutine/thread runtime, appended to
@@ -1101,7 +1143,25 @@ that is consistent between c6 translation units, and for structs larger than
 16 bytes it also matches the native ABI, but mixing 9--16 byte struct returns
 with plain C is not supported.
 
-Not supported (each gives a clear error instead of miscompiling): defining
-variadic functions, computed goto, and variable length arrays.  On non-POSIX
-hosts the generated runtime still compiles, but `async`/`go`/`c6_io` need a
-platform port.
+Not supported (each gives a clear error instead of miscompiling): computed
+goto and variable length arrays.  On non-POSIX hosts the generated runtime
+still compiles, but `async`/`go`/`c6_io` need a platform port.
+
+### Self-hosting through the C back-end
+
+`make c99selfhost` is the end-to-end proof that the generated C is a working
+compiler, not just working code:
+
+    tcc/tcc -B tcc -DONE_SOURCE=1 -DC6_EXT -c99 -o build/selfhost/c99/tcc-c99.c tcc/tcc.c
+    cc -std=c99 -o build/selfhost/c99/tcc-stage2 build/selfhost/c99/tcc-c99.c -lm -ldl -lpthread
+    build/selfhost/c99/tcc-stage2 -B tcc -DONE_SOURCE=1 -DC6_EXT -c tcc/tcc.c -o stage3.o
+    build/selfhost/c99/tcc-stage2 -B tcc -o tcc-stage3 stage3.o -lm -ldl -lpthread
+    build/selfhost/c99/tcc-stage3 -B tcc -DONE_SOURCE=1 -DC6_EXT -c tcc/tcc.c -o stage4.o
+    cmp stage3.o stage4.o                    # bootstrap fixpoint
+
+`stage2` is the whole compiler (its own x86-64 back-end, linker and driver)
+built by the host C compiler from tcc's C output; `stage3` is built by
+`stage2` from the original sources, and the objects `stage2` and `stage3`
+produce are byte identical.  `make selfhost` does the same round trip without
+the C detour (`tcc` -> `stage1` -> `stage2`, objects compared) and is the
+quick check that the c6 back-end still compiles its own sources.

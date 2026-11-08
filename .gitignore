@@ -6,3 +6,6 @@
 *.o
 *.a
 *.exe
+
+# 自举产物（make selfhost / make c99selfhost）
+/build/
