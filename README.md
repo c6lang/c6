@@ -290,6 +290,8 @@ int main(void)
   `f(p, a)` 这种普通调用、手写 C、纯 C 翻译单元都照旧能链接；
 - 不同类型用同名方法**不需要** `package`（`Circle_area` 与 `Rect_area` 各自独立）；
   弱别名只指向本 TU 里第一个取到该名字的方法，真有歧义时写 `p->area()`；
+- 普通名已经被别的函数占着时（同名普通函数，或 `getpid` 这类 libc 头里的声明）
+  就不再发别名：`p->getpid()` 照旧可用，普通调用 `getpid()` 仍然是原来的函数；
 - 不改名的情形：`static` / `inline` 函数、`__` 开头的名字（编译器和 libtcc1 专用）、
   系统头文件里的声明（`p->fflush()`、`p->gettimeofday()` 这类 libc 成员照旧可用）、
   匿名结构体的方法，以及在 `package` 里声明的方法（包名已经区隔，符号是 `pkg__name`）；

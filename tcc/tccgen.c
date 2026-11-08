@@ -8193,6 +8193,11 @@ static void c6_method_alias(int name, Sym *msym)
         return;
     if ((ps->type.t & VT_BTYPE) != VT_FUNC)
         return;
+    /* the plain name may already be a *different* function, typically one
+       declared by a system header ('int getpid(struct F *)' must not turn
+       'getpid()' into the method): only alias our own plain declaration */
+    if (!is_compatible_types(&ps->type, &msym->type))
+        return;
     es = elfsym(msym);
     if (!es || es->st_shndx == SHN_UNDEF)
         return;
