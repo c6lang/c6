@@ -261,6 +261,52 @@ int main(void)
 反过来，手写的老 C 代码只要声明 `int math__add(int, int);` 就能直接调用包的导出，
 扩展 TU 也能直接调用普通的 C 函数。
 
+### module / import 加载
+
+`package` 只给一段代码加前缀；`module` 给**整个文件**加前缀，并且 `import`
+会去找模块文件、加载它的声明：
+
+```c
+/* math.c */
+module math;
+
+struct Point { int x, y; };
+typedef struct Point Point;
+int add(int a, int b) { return a + b; }
+int area(Point *p) { return p->x * p->y; }
+
+/* main.c */
+import math;
+
+int main(void)
+{
+    Point p = { 3, 4 };
+    return add(1, 2) == 3 && area(&p) == 12 ? 0 : 1;
+}
+```
+
+- `module NAME;` 必须是文件的第一个声明；它把文件作用域的声明改成
+  `NAME__sym`（点号 `module geo.circle;` 的前缀是 `geo__circle__`），块作用域、
+  `static`、`test`、`__` 开头的名字和 `#include` 的普通 C 文件不受影响；
+- 方法照旧按接收者取名：`int area(Point *p)` 导出 `math__Point_area`；模块文件
+  **不**为方法发原名弱别名，C 侧只看到前缀符号；
+- 类型也能写全限定名：`math.Point p = { 3, 4 };` 解析到 `math__Point`
+  （模块里的 typedef 或 struct/union/enum tag 都行；多级 `tu.module.Point`
+  同理；package 里的 tag 不加前缀，所以 package 限定类型要写 typedef）；
+  只有当前 module/package 或 `import` 过的名字可以这样写；
+- 模块里不能定义 `main`；
+- `import NAME;` 先登记名字，再按「当前文件目录 → `-I` 路径 → 当前目录」查找
+  `NAME.c`（点号形式 `a/b.c`），找到就把声明读进来：函数只取原型、跳过函数体，
+  全局变量只取 `extern`、跳过初始化器；找不到文件时只登记名字（旧行为）；
+  循环 import 报 `circular import of module 'x'`；
+- 导入只带**声明**，代码仍在模块自己的目标文件里：链接时把 `math.o`（或库）放上
+  命令行；
+- `-emit-header FILE`（配合 `-c -std=c6`）可把模块导出写成普通 C 头文件：
+  `tcc -B tcc -std=c6 -c -emit-header math.h math.c`。头文件里是
+  `struct math__Point`、`math__add`、`math__Point_area` 这些真正的 C 名；
+  切片和元组会生成 `math__slice_N` / `math__tuple_N` typedef。纯 C 一侧
+  `#include "math.h"` 就能调用，不需要 `-std=c6`，也不需要知道模块的存在。
+
 ### 结构体方法
 
 ```c

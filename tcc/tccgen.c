@@ -286,12 +286,22 @@ static void c6_import_parse(void);
 static void c6_interface_parse(void);
 static int c6_emit_auto_impls(void);
 static void c6_tu_reset(void);
+/* 'module NAME;' namespace prefixing and 'import NAME;' declaration loading */
+static int c6_mod_name(int v);
+static void c6_module_parse(void);
+static void c6_module_import(const char *name);
+static void c6_skip_decl_tail(void);
+static void c6_header_record(int kind, int name, CType *type, Sym *sym);
+static void c6_emit_header(TCCState *s1);
+static int c6_importing;       /* replaying an imported module's declarations */
+static char *c6_expected_module; /* module name the file being parsed must declare */
 static int c6_iface_convert(CType *dt);
 typedef struct C6Iface C6Iface_t;
 static C6Iface *c6_iface_of_type(CType *type);
 static int c6_iface_has_method(C6Iface *ifc, int m);
 static void c6_iface_call_prep(C6Iface *ifc, int mname);
 static Sym *c6_import_lookup(int v);
+static Sym *c6_import_tag_lookup(int v);
 static int c6_mangle_tok(const char *pkg, int v);
 static int c6_pkg_imported(const char *name);
 static void c6_method_register(int name, int sym_tok, CType *type);
@@ -685,6 +695,10 @@ ST_FUNC int tccgen_compile(TCCState *s1)
 #else
     gen_inline_functions(s1);
 #endif
+#ifdef C6_EXT
+    if (s1->c6_emit_header)
+        c6_emit_header(s1);
+#endif
     check_vstack();
     /* end of translation unit info */
 #if TCC_EH_FRAME
@@ -962,8 +976,8 @@ ST_FUNC Sym *sym_find2(Sym *s, int v)
     return NULL;
 }
 
-/* structure lookup */
-ST_INLN Sym *struct_find(int v)
+/* structure lookup, no module fallback */
+static inline Sym *struct_find_raw(int v)
 {
     v -= TOK_IDENT;
     if ((unsigned)v >= (unsigned)(tok_ident - TOK_IDENT))
@@ -971,7 +985,32 @@ ST_INLN Sym *struct_find(int v)
     return table_ident[v]->sym_struct;
 }
 
-/* find an identifier, no package fallback */
+/* structure lookup.  In a module file a tag declared at file scope lives
+   under the module prefix ('math__Point'), so an unprefixed reference must
+   look there; a block scope tag still wins, as in C. */
+ST_INLN Sym *struct_find(int v)
+{
+    Sym *s = struct_find_raw(v);
+#ifdef C6_EXT
+    if (tcc_state && tcc_state->c6_ext && (!s || s->sym_scope == 0)) {
+        Sym *m;
+        if (file && file->c6_module) {
+            int t = c6_mod_name(v);
+            if (t != v) {
+                m = struct_find_raw(t);
+                if (m)
+                    return m;
+            }
+        }
+        m = c6_import_tag_lookup(v);
+        if (m)
+            return m;
+    }
+#endif
+    return s;
+}
+
+/* find an identifier, no package/module fallback */
 static inline Sym *sym_find_raw(int v)
 {
     v -= TOK_IDENT;
@@ -980,14 +1019,27 @@ static inline Sym *sym_find_raw(int v)
     return table_ident[v]->sym_identifier;
 }
 
-/* find an identifier */
+/* find an identifier.  A block scope binding always wins; in a module a
+   file scope name is looked up under the module prefix before a plain C
+   global of the same spelling, and imported packages come last. */
 ST_INLN Sym *sym_find(int v)
 {
     Sym *s = sym_find_raw(v);
 #ifdef C6_EXT
-    if (!s && tcc_state
-        && (tcc_state->c6_package || tcc_state->c6_nb_imports))
-        s = c6_import_lookup(v);
+    if (tcc_state) {
+        if (s && s->sym_scope != 0)
+            return s;
+        if (tcc_state->c6_ext && file && file->c6_module) {
+            int t = c6_mod_name(v);
+            if (t != v) {
+                Sym *m = sym_find_raw(t);
+                if (m)
+                    return m;
+            }
+        }
+        if (!s && (tcc_state->c6_package || tcc_state->c6_nb_imports))
+            s = c6_import_lookup(v);
+    }
 #endif
     return s;
 }
@@ -4816,6 +4868,9 @@ static void struct_decl(CType *type, int u)
 {
     int v, c, size, align, flexible;
     int bit_size, bsize, bt, ut;
+#ifdef C6_EXT
+    int c6_is_def;
+#endif
     Sym *s, *ss, **ps;
     AttributeDef ad, ad1;
     CType type1, btype;
@@ -4827,6 +4882,15 @@ static void struct_decl(CType *type, int u)
     v = 0;
     if (tok >= TOK_IDENT) /* struct/enum tag */
         v = tok, next();
+
+#ifdef C6_EXT
+    c6_is_def = (tok == '{' || tok == ';');
+    /* a tag declared at file scope in a module is registered under the
+       module prefix; references keep the source spelling and struct_find()
+       falls back to the prefixed tag (then to a plain C tag) */
+    if (v && file->c6_module && local_scope == 0 && c6_is_def)
+        v = c6_mod_name(v);
+#endif
 
     bt = ut = 0;
     if (u == VT_ENUM) {
@@ -4841,8 +4905,15 @@ static void struct_decl(CType *type, int u)
     }
 
     if (v) {
-        /* struct already defined ? return it */
+        /* struct already defined ? return it.  A tag defined in a block
+           must be looked up raw, otherwise the module tag of the same
+           spelling would be treated as already defined. */
+#ifdef C6_EXT
+        s = (local_scope != 0 && c6_is_def) ? struct_find_raw(v)
+                                            : struct_find(v);
+#else
         s = struct_find(v);
+#endif
         if (s && (s->sym_scope == local_scope || (tok != '{' && tok != ';'))) {
             if (u == s->type.t)
                 goto do_decl;
@@ -4887,6 +4958,11 @@ do_decl:
                 v = tok;
                 if (v < TOK_UIDENT)
                     expect("identifier");
+#ifdef C6_EXT
+                /* enumerators of a file scope enum are exported names */
+                if (file->c6_module && local_scope == 0)
+                    v = c6_mod_name(v);
+#endif
                 next();
                 if (tok == '=') {
                     next();
@@ -5064,6 +5140,14 @@ do_decl:
         if (debug_modes)
             tcc_debug_fix_forw(tcc_state, type);
     }
+#ifdef C6_EXT
+    /* collect the exported tags of a module for -emit-header (an incomplete
+       struct is recorded too: the header emits a forward declaration) */
+    if (file->c6_module && local_scope == 0 && v
+        && (s->v & ~SYM_STRUCT) < SYM_FIRST_ANOM && s->c != -2)
+        c6_header_record(u == VT_ENUM ? C6_HD_ENUM : C6_HD_STRUCT,
+                         s->v & ~SYM_STRUCT, type, s);
+#endif
 }
 
 static void sym_to_attr(AttributeDef *ad, Sym *s)
@@ -5195,6 +5279,109 @@ static int c6_tuple_btype(CType *type)
     begin_macro(back, 1);
     next();                             /* tok is '(' again */
     return 0;
+}
+#endif
+
+#ifdef C6_EXT
+/* does FIRST name the leading segment of a package/module (current or
+   imported)?  Used to keep 'a.b' expressions from looking like a type. */
+static int c6_pkg_prefix_known(const char *first)
+{
+    int n = strlen(first), i;
+    const char *s;
+
+    if (!tcc_state || !tcc_state->c6_ext)
+        return 0;
+#define C6_PREFIX_MATCH(s) \
+    (!strncmp((s), first, n) \
+     && ((s)[n] == 0 || (s)[n] == '.' \
+         || ((s)[n] == '_' && (s)[n + 1] == '_')))
+    if (tcc_state->c6_package && C6_PREFIX_MATCH(tcc_state->c6_package))
+        return 1;
+    if (file && file->c6_module && C6_PREFIX_MATCH(file->c6_module))
+        return 1;
+    for (i = 0; i < tcc_state->c6_nb_imports; i++) {
+        s = tcc_state->c6_imports[i];
+        if (C6_PREFIX_MATCH(s))
+            return 1;
+    }
+#undef C6_PREFIX_MATCH
+    return 0;
+}
+
+/* 'pkg.Type' (also 'a.b.Type'): a type name qualified by the current
+   package/module or by an imported one.  Returns the typedef or tag symbol
+   and sets *is_tag; tok is left after the name.  Returns NULL (and puts the
+   first token back) when the input is not a qualified type name. */
+static Sym *c6_qualified_type(int *is_tag)
+{
+    TokenString *back;
+    char pfx[160], pkgdisp[200];
+    int first = tok, seg, mt, n;
+    Sym *s;
+
+    *is_tag = 0;
+    if (sym_find(first))        /* a visible name keeps its C meaning */
+        return NULL;
+    n = snprintf(pfx, sizeof pfx, "%s", get_tok_str(first, NULL));
+    if (n >= (int)sizeof pfx)
+        tcc_error("package name too long");
+    if (!c6_pkg_prefix_known(pfx))
+        return NULL;
+    back = tok_str_alloc();
+    tok_str_add_tok(back);      /* the first segment */
+    snprintf(pkgdisp, sizeof pkgdisp, "%s", pfx);
+    next();
+    while (tok == '.') {
+        tok_str_add_tok(back);  /* '.' */
+        next();
+        if (tok < TOK_UIDENT)
+            goto fail;          /* not a qualified name after all */
+        seg = tok;
+        tok_str_add_tok(back);
+        mt = c6_mangle_tok(pfx, seg);
+        s = sym_find_raw(mt);
+        if (s && (s->type.t & VT_TYPEDEF)) {
+            if (!c6_pkg_imported(pfx))
+                tcc_error("'%s' is not an imported package "
+                          "(use 'import %s;')", pkgdisp, pkgdisp);
+            next();
+            tok_str_free(back);
+            return s;
+        }
+        s = struct_find_raw(mt);
+        if (s) {
+            if (!c6_pkg_imported(pfx))
+                tcc_error("'%s' is not an imported package "
+                          "(use 'import %s;')", pkgdisp, pkgdisp);
+            next();
+            tok_str_free(back);
+            *is_tag = 1;
+            return s;
+        }
+        next();                 /* the segment was not a type */
+        if (tok != '.')
+            goto fail;
+        n = strlen(pfx);
+        if (n + 2 + strlen(get_tok_str(seg, NULL)) >= (int)sizeof pfx)
+            tcc_error("package name too long");
+        snprintf(pfx + n, sizeof pfx - n, "__%s",
+                 get_tok_str(seg, NULL));
+        n = strlen(pkgdisp);
+        if (n + 1 + strlen(get_tok_str(seg, NULL))
+            >= (int)sizeof pkgdisp)
+            tcc_error("package name too long");
+        snprintf(pkgdisp + n, sizeof pkgdisp - n, ".%s",
+                 get_tok_str(seg, NULL));
+    }
+fail:
+    /* not a type: hand the same tokens back to the caller.  The token
+       after the last segment was already read, so replay it too. */
+    tok_str_add_tok(back);
+    tok_str_add(back, 0);
+    begin_macro(back, 1);
+    next();
+    return NULL;
 }
 #endif
 
@@ -5482,6 +5669,34 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
         default:
             if (typespec_found)
                 goto the_end;
+#ifdef C6_EXT
+            /* 'pkg.Type' / 'module.Type' */
+            if (tcc_state->c6_ext && tok >= TOK_UIDENT) {
+                int qtag;
+                Sym *qs = c6_qualified_type(&qtag);
+                if (qs) {
+                    if (qtag) {
+                        type1.t = qs->type.t;
+                        type1.ref = qs;
+                        goto basic_type2;
+                    }
+                    /* same as the typedef branch below */
+                    t &= ~(VT_BTYPE|VT_LONG);
+                    u = t & ~VT_QUAL, t ^= u;
+                    type->t = (qs->type.t & ~VT_TYPEDEF) | u;
+                    type->ref = qs->type.ref;
+                    if (t)
+                        parse_btype_qualify(type, t);
+                    t = type->t;
+                    if (t & VT_ARRAY)
+                        t |= VT_BT_ARRAY;
+                    sym_to_attr(ad, qs);
+                    typespec_found = 1;
+                    st = bt = -2;
+                    break;
+                }
+            }
+#endif
             s = sym_find(tok);
             if (!s) {
 #ifdef C6_EXT
@@ -7961,6 +8176,646 @@ static char *c6_pkg_name(int *ptok)
     return tcc_strdup(buf);
 }
 
+/* ------------------------------------------------------------------ */
+/* modules: 'module NAME;' and 'import NAME;'                          */
+/*                                                                     */
+/* A module is a translation unit whose file scope names are registered */
+/* under 'NAME__'.  The source keeps writing the short name; the        */
+/* compiler prefixes declarations, and lookups try the module prefix    */
+/* first, then a plain C name.  The emitted symbols are ordinary C      */
+/* identifiers, so plain C code can call a module without knowing that  */
+/* modules exist.                                                       */
+
+/* prefix a file scope name with the current module, if any.  A name that
+   already carries the prefix is left alone (a shared header may spell the
+   C name explicitly), and compiler internal names are never touched. */
+static int c6_mod_name(int v)
+{
+    char buf[512];
+    const char *name;
+    size_t plen;
+
+    if (!tcc_state || !tcc_state->c6_ext || !file || !file->c6_module)
+        return v;
+    if (v < TOK_UIDENT)
+        return v;
+    name = get_tok_str(v, NULL);
+    plen = strlen(file->c6_module);
+    if (!strncmp(name, file->c6_module, plen))
+        return v;
+    if (name[0] == '_' && name[1] == '_')
+        return v;
+    if (plen + strlen(name) + 1 > sizeof buf)
+        tcc_error("module symbol name too long");
+    sprintf(buf, "%s%s", file->c6_module, name);
+    return tok_alloc_const(buf);
+}
+
+/* 'module NAME;' at file scope.  The dotted spelling works like packages:
+   'module geo.circle;' prefixes names with 'geo__circle__'. */
+static void c6_module_parse(void)
+{
+    char *name;
+
+    next();  /* skip 'module' */
+    name = c6_pkg_name(&tok);
+    skip(';');
+    if (file->c6_decl_seen)
+        tcc_error("'module' must be the first declaration in the file");
+    if (file->c6_module)
+        tcc_error("module '%s' already declared in this file", name);
+    if (c6_expected_module && strcmp(c6_expected_module, name))
+        tcc_error("module file declares '%s', expected '%s'",
+                  name, c6_expected_module);
+    file->c6_module = tcc_malloc(strlen(name) + 3);
+    sprintf(file->c6_module, "%s__", name);
+    tcc_free(name);
+}
+
+/* 'geo__circle' -> 'geo/circle' (the dotted file spelling) */
+static void c6_module_dotted(const char *name, char *out, int outsz)
+{
+    int n = 0;
+
+    while (*name && n < outsz - 1) {
+        if (name[0] == '_' && name[1] == '_') {
+            out[n++] = '/';
+            name += 2;
+        } else {
+            out[n++] = *name++;
+        }
+    }
+    out[n] = 0;
+}
+
+static int c6_module_try(TCCState *s1, const char *dir, const char *name,
+                         const char *dotted)
+{
+    char buf[1024];
+    int n;
+
+    n = snprintf(buf, sizeof buf, "%s%s%s.c", dir, dir[0] ? "/" : "", name);
+    if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0)
+        return 0;
+    if (strcmp(dotted, name)) {
+        n = snprintf(buf, sizeof buf, "%s%s%s.c", dir,
+                     dir[0] ? "/" : "", dotted);
+        if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0)
+            return 0;
+    }
+    return -1;
+}
+
+/* find and open 'NAME.c'.  Search order: the directory of the file that
+   contains the 'import', the -I paths, then the current directory. */
+static int c6_module_open(TCCState *s1, const char *name)
+{
+    char dotted[512];
+    const char *dir;
+    int i;
+
+    c6_module_dotted(name, dotted, sizeof dotted);
+
+    if (file && file->filename[0] && strcmp(file->filename, "<string>")) {
+        const char *p = strrchr(file->filename, '/');
+        if (p) {
+            char buf[1024];
+            int dlen = p - file->filename;
+            snprintf(buf, sizeof buf, "%.*s", dlen, file->filename);
+            if (c6_module_try(s1, buf, name, dotted) == 0)
+                return 0;
+        }
+    }
+    for (i = 0; i < s1->nb_include_paths; i++) {
+        dir = s1->include_paths[i];
+        if (c6_module_try(s1, dir, name, dotted) == 0)
+            return 0;
+    }
+    return c6_module_try(s1, "", name, dotted);
+}
+
+/* Replay the declarations of the module NAME into the current translation
+   unit.  Function bodies, initializers and file local objects are skipped:
+   'import' supplies declarations, the module's own object supplies code.
+   A missing file keeps the old 'import' behaviour (names only), so code
+   that used 'import pkg;' as a namespace declaration still compiles. */
+static void c6_module_import(const char *name)
+{
+    TCCState *s1 = tcc_state;
+    char *saved_pkg, *saved_expected;
+    int i, saved_tok, saved_scope, saved_nocode, saved_flags;
+    CValue saved_val;
+    const char *saved_func;
+
+    if (!s1->c6_ext || !name || !name[0])
+        return;
+    for (i = 0; i < s1->c6_nb_loaded_modules; i++)
+        if (!strcmp(s1->c6_loaded_modules[i], name))
+            return;
+    for (i = 0; i < s1->c6_nb_loading_modules; i++)
+        if (!strcmp(s1->c6_loading_modules[i], name))
+            tcc_error("circular import of module '%s'", name);
+    if (c6_module_open(s1, name) < 0)
+        return;
+
+    dynarray_add(&s1->c6_loading_modules, &s1->c6_nb_loading_modules,
+                 tcc_strdup(name));
+    saved_tok = tok;
+    saved_val = tokc;
+    saved_flags = parse_flags;
+    saved_pkg = s1->c6_package;
+    saved_expected = c6_expected_module;
+    saved_scope = local_scope;
+    saved_nocode = nocode_wanted;
+    saved_func = funcname;
+
+    s1->c6_package = NULL;
+    local_scope = 0;
+    nocode_wanted = DATA_ONLY_WANTED;
+    funcname = "";
+    c6_expected_module = (char *)name;
+    c6_importing++;
+
+    next();
+    decl(VT_CONST);
+    if (!file->c6_module)
+        tcc_error("'%s' does not declare 'module %s;'",
+                  file->filename, name);
+    tcc_close();
+
+    c6_importing--;
+    c6_expected_module = saved_expected;
+    funcname = saved_func;
+    nocode_wanted = saved_nocode;
+    local_scope = saved_scope;
+    s1->c6_package = saved_pkg;
+    parse_flags = saved_flags;
+    tok = saved_tok;
+    tokc = saved_val;
+
+    tcc_free(s1->c6_loading_modules[s1->c6_nb_loading_modules - 1]);
+    s1->c6_nb_loading_modules--;
+    dynarray_add(&s1->c6_loaded_modules, &s1->c6_nb_loaded_modules,
+                 tcc_strdup(name));
+}
+
+/* consume an initializer (or the rest of a declarator) and stop at the
+   ';' or ',' that ends it at brace/parenthesis depth 0 */
+static void c6_skip_decl_tail(void)
+{
+    int depth = 0;
+
+    while (tok != TOK_EOF) {
+        if (tok == '{' || tok == '(' || tok == '[') {
+            depth++;
+        } else if (tok == '}' || tok == ')' || tok == ']') {
+            if (depth)
+                depth--;
+            else
+                break;
+        } else if (depth == 0 && (tok == ';' || tok == ',')) {
+            break;
+        }
+        next();
+    }
+}
+
+/* remember one exported declaration of a module for '-emit-header' */
+static void c6_header_record(int kind, int name, CType *type, Sym *sym)
+{
+    TCCState *s1 = tcc_state;
+    C6HeaderDecl *d;
+    int i;
+
+    if (!s1->c6_emit_header || c6_importing)
+        return;
+    if (!file || !file->c6_module || name < TOK_UIDENT)
+        return;
+    if (type && (type->t & VT_STATIC))
+        return;                 /* file local object */
+    for (i = 0; i < s1->c6_nb_header_decls; i++) {
+        d = s1->c6_header_decls[i];
+        if (d->kind == kind && d->name == name) {
+            if (type)
+                d->type = *type;
+            if (sym)
+                d->sym = sym;
+            return;
+        }
+    }
+    d = tcc_mallocz(sizeof *d);
+    d->kind = kind;
+    d->name = name;
+    if (type)
+        d->type = *type;
+    d->sym = sym;
+    dynarray_add(&s1->c6_header_decls, &s1->c6_nb_header_decls, d);
+}
+
+/* ------------------------------------------------------------------ */
+/* '-emit-header': a plain C header for one module                     */
+/*                                                                     */
+/* The emitter works from the declarations recorded while the module's  */
+/* own TU was compiled, so the header describes exactly the symbols the */
+/* object file exports.  Typedefs are expanded to their underlying      */
+/* types; slices and tuples get a generated typedef name, because C has */
+/* no other way to spell their layout.                                  */
+
+typedef struct C6HdrExtra {
+    char name[192];
+    CType type;
+    int tuple;
+    struct C6HdrExtra *next;
+} C6HdrExtra;
+
+static C6HdrExtra *c6_hdr_extras;
+
+static void c6_hdr_type(char *buf, int size, CType *type, const char *varstr);
+
+/* the C name of a declared struct/union/enum tag, or a typedef that names
+   an anonymous one */
+static const char *c6_hdr_tag_name(CType *type)
+{
+    Sym *s = type->ref;
+    int i;
+
+    if (s && (s->v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+        return get_tok_str(s->v & ~SYM_STRUCT, NULL);
+    for (i = 0; i < tcc_state->c6_nb_header_decls; i++) {
+        C6HeaderDecl *d = tcc_state->c6_header_decls[i];
+        if (d->kind == C6_HD_TYPEDEF && d->type.ref == s)
+            return get_tok_str(d->name, NULL);
+    }
+    tcc_error("cannot write a C header for an anonymous struct type; "
+              "give it a typedef first");
+    return NULL;
+}
+
+/* remember the generated typedef for a slice/tuple type */
+static void c6_hdr_extra(CType *type, int tuple, char *out, int outsz)
+{
+    C6HdrExtra *e, **pe;
+    int id = 0;
+
+    for (e = c6_hdr_extras; e; e = e->next) {
+        if (e->tuple == tuple && is_compatible_types(&e->type, type)) {
+            pstrcpy(out, outsz, e->name);
+            return;
+        }
+        id++;
+    }
+    e = tcc_mallocz(sizeof *e);
+    e->type = *type;
+    e->tuple = tuple;
+    snprintf(e->name, sizeof e->name, "%s%s_%d",
+             (file && file->c6_module) ? file->c6_module : "__c6_",
+             tuple ? "tuple" : "slice", id);
+    for (pe = &c6_hdr_extras; *pe; pe = &(*pe)->next)
+        ;
+    *pe = e;
+    pstrcpy(out, outsz, e->name);
+}
+
+static void c6_hdr_type(char *buf, int size, CType *type, const char *varstr)
+{
+    int bt = type->t & VT_BTYPE, t = type->t;
+    char buf1[2048], tmp[1024], name[192];
+    Sym *s;
+
+    buf[0] = 0;
+    if (bt == VT_STRUCT) {
+        C6Slice *sl = c6_slice_of_type(type);
+        C6Tuple *tp = c6_tuple_of_type(type);
+        if (sl) {
+            c6_hdr_type(tmp, sizeof tmp, &sl->elem, NULL);
+            c6_hdr_extra(type, 0, name, sizeof name);
+            pstrcat(buf, size, name);
+            goto add_var;
+        }
+        if (tp) {
+            int i;
+            for (i = 0; i < tp->n; i++)
+                c6_hdr_type(tmp, sizeof tmp, &tp->elem[i], NULL);
+            c6_hdr_extra(type, 1, name, sizeof name);
+            pstrcat(buf, size, name);
+            goto add_var;
+        }
+    }
+    if (bt == VT_PTR) {
+        s = type->ref;
+        if (t & (VT_ARRAY | VT_VLA)) {
+            const char *v = varstr ? varstr : "";
+            char tail[32];
+            if (!s || s->c < 0 || (t & VT_VLA))
+                pstrcpy(tail, sizeof tail, "[]");
+            else
+                snprintf(tail, sizeof tail, "[%d]", s->c);
+            if (*v == '*')
+                snprintf(buf1, sizeof buf1, "(%s)%s", v, tail);
+            else
+                snprintf(buf1, sizeof buf1, "%s%s", v, tail);
+            c6_hdr_type(buf, size, &s->type, buf1);
+        } else {
+            snprintf(buf1, sizeof buf1, "*%s%s",
+                     (t & VT_CONSTANT) ? "const " : "",
+                     varstr ? varstr : "");
+            c6_hdr_type(buf, size, &s->type, buf1);
+        }
+        return;
+    }
+    if (bt == VT_FUNC) {
+        char params[2048];
+        Sym *sa;
+        params[0] = 0;
+        for (sa = type->ref->next; sa; sa = sa->next) {
+            c6_hdr_type(tmp, sizeof tmp, &sa->type, NULL);
+            pstrcat(params, sizeof params, tmp);
+            if (sa->next)
+                pstrcat(params, sizeof params, ", ");
+        }
+        if (type->ref->f.func_type == FUNC_ELLIPSIS)
+            pstrcat(params, sizeof params, ", ...");
+        if (!params[0])
+            pstrcat(params, sizeof params, "void");
+        if (varstr && *varstr == '*')
+            snprintf(buf1, sizeof buf1, "(%s)(%s)", varstr, params);
+        else
+            snprintf(buf1, sizeof buf1, "%s(%s)", varstr ? varstr : "",
+                     params);
+        c6_hdr_type(buf, size, &type->ref->type, buf1);
+        return;
+    }
+    if (t & VT_CONSTANT)
+        pstrcat(buf, size, "const ");
+    if (t & VT_VOLATILE)
+        pstrcat(buf, size, "volatile ");
+    if ((t & VT_DEFSIGN) && bt == VT_BYTE)
+        pstrcat(buf, size, "signed ");
+    if ((t & VT_UNSIGNED) && (bt == VT_SHORT || bt == VT_INT || bt == VT_LLONG)
+        && !IS_ENUM(t))
+        pstrcat(buf, size, "unsigned ");
+    switch (bt) {
+    case VT_VOID:
+        pstrcat(buf, size, "void");
+        break;
+    case VT_BOOL:
+        pstrcat(buf, size, "_Bool");
+        break;
+    case VT_BYTE:
+        pstrcat(buf, size, "char");
+        break;
+    case VT_SHORT:
+        pstrcat(buf, size, "short");
+        break;
+    case VT_INT:
+        if (IS_ENUM(t)) {
+            /* an anonymous enum is only nameable through its typedef */
+            if (type->ref
+                && (type->ref->v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+                pstrcat(buf, size, "enum ");
+            pstrcat(buf, size, c6_hdr_tag_name(type));
+        } else if (t & VT_LONG) {
+            pstrcat(buf, size, "long");
+        } else {
+            pstrcat(buf, size, "int");
+        }
+        break;
+    case VT_LLONG:
+        pstrcat(buf, size, (t & VT_LONG) ? "long" : "long long");
+        break;
+    case VT_FLOAT:
+        pstrcat(buf, size, "float");
+        break;
+    case VT_DOUBLE:
+        pstrcat(buf, size, "double");
+        break;
+    case VT_LDOUBLE:
+        pstrcat(buf, size, "long double");
+        break;
+    case VT_STRUCT:
+        if (!type->ref
+            || (type->ref->v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+            pstrcat(buf, size, IS_UNION(t) ? "union " : "struct ");
+        /* else: an anonymous tag is spelled by its typedef name */
+        pstrcat(buf, size, c6_hdr_tag_name(type));
+        break;
+    default:
+        type_to_str(buf, size, type, varstr);
+        return;
+    }
+add_var:
+    if (varstr) {
+        pstrcat(buf, size, " ");
+        pstrcat(buf, size, varstr);
+    }
+}
+
+/* write one struct/union body (fields, bit-fields, nested anonymous members) */
+static void c6_hdr_struct_body(FILE *f, Sym *s)
+{
+    Sym *fs;
+    char buf[2048], name[128];
+    int anon = 0;
+
+    for (fs = s->next; fs; fs = fs->next) {
+        int v = fs->v & ~SYM_FIELD;
+
+        if ((fs->type.t & VT_BTYPE) == VT_STRUCT && fs->type.ref
+            && (fs->type.ref->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM) {
+            /* C11 anonymous member: keep it unnamed, so field access in the
+               module ('s.u') keeps working in plain C */
+            fprintf(f, "    %s {\n",
+                    IS_UNION(fs->type.t) ? "union" : "struct");
+            c6_hdr_struct_body(f, fs->type.ref);
+            fprintf(f, "    };\n");
+            continue;
+        }
+        if (v >= SYM_FIRST_ANOM)
+            snprintf(name, sizeof name, "__anon%d", anon++);
+        else
+            pstrcpy(name, sizeof name, get_tok_str(v, NULL));
+        c6_hdr_type(buf, sizeof buf, &fs->type, name);
+        fprintf(f, "    %s", buf);
+        if (fs->type.t & VT_BITFIELD)
+            fprintf(f, " : %d", BIT_SIZE(fs->type.t));
+        fprintf(f, ";\n");
+    }
+}
+
+static void c6_hdr_collect_struct(Sym *s)
+{
+    char buf[2048];
+    Sym *fs;
+
+    for (fs = s->next; fs; fs = fs->next) {
+        if ((fs->type.t & VT_BTYPE) == VT_STRUCT && fs->type.ref
+            && (fs->type.ref->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM)
+            c6_hdr_collect_struct(fs->type.ref);
+        else
+            c6_hdr_type(buf, sizeof buf, &fs->type, NULL);
+    }
+}
+
+static void c6_hdr_collect_decl(C6HeaderDecl *d)
+{
+    char buf[2048];
+
+    if (d->kind == C6_HD_STRUCT) {
+        c6_hdr_collect_struct(d->sym);
+    } else if (d->kind == C6_HD_TYPEDEF) {
+        if ((d->type.t & VT_BTYPE) == VT_STRUCT && d->type.ref
+            && (d->type.ref->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM)
+            c6_hdr_collect_struct(d->type.ref);
+        else
+            c6_hdr_type(buf, sizeof buf, &d->type, NULL);
+    } else if (d->kind == C6_HD_FUNC || d->kind == C6_HD_VAR) {
+        c6_hdr_type(buf, sizeof buf, &d->type, NULL);
+    }
+}
+
+static void c6_hdr_print_typedef(FILE *f, C6HeaderDecl *d)
+{
+    char buf[2048];
+    const char *name = get_tok_str(d->name, NULL);
+
+    if ((d->type.t & VT_BTYPE) == VT_STRUCT && d->type.ref
+        && (d->type.ref->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM) {
+        fprintf(f, "typedef %s {\n",
+                IS_UNION(d->type.t) ? "union" : "struct");
+        c6_hdr_struct_body(f, d->type.ref);
+        fprintf(f, "} %s;\n", name);
+        return;
+    }
+    c6_hdr_type(buf, sizeof buf, &d->type, name);
+    fprintf(f, "typedef %s;\n", buf);
+}
+
+static void c6_emit_header(TCCState *s1)
+{
+    FILE *f;
+    C6HeaderDecl *d;
+    C6HdrExtra *e;
+    const char *mod;
+    char guard[256], plain[192];
+    int i, j, n, first;
+
+    if (!file || !file->c6_module) {
+        tcc_error("-emit-header requires a 'module NAME;' declaration");
+        return;
+    }
+    mod = file->c6_module;              /* 'math__' */
+    n = snprintf(plain, sizeof plain, "%s", mod);
+    if (n > 2)
+        plain[n - 2] = 0;
+    snprintf(guard, sizeof guard, "C6_%s_H", plain);
+    for (i = 0; guard[i]; i++) {
+        if (!((guard[i] >= 'A' && guard[i] <= 'Z')
+              || (guard[i] >= 'a' && guard[i] <= 'z')
+              || (guard[i] >= '0' && guard[i] <= '9')))
+            guard[i] = '_';
+    }
+
+    /* drop any slice/tuple typedefs left by an earlier header */
+    while (c6_hdr_extras) {
+        e = c6_hdr_extras;
+        c6_hdr_extras = e->next;
+        tcc_free(e);
+    }
+
+    /* a first pass fills c6_hdr_extras (slice/tuple typedefs) */
+    for (i = 0; i < s1->c6_nb_header_decls; i++)
+        c6_hdr_collect_decl(s1->c6_header_decls[i]);
+
+    f = fopen(s1->c6_emit_header, "w");
+    if (!f)
+        tcc_error("could not open '%s' for writing", s1->c6_emit_header);
+
+    fprintf(f, "/* generated by tcc -std=c6 -emit-header from module '%s' */\n",
+            plain);
+    fprintf(f, "#ifndef %s\n#define %s\n\n", guard, guard);
+    fprintf(f, "#include <stddef.h>\n#include <stdint.h>\n\n");
+
+    /* forward declarations make pointer uses order independent */
+    for (i = 0; i < s1->c6_nb_header_decls; i++) {
+        d = s1->c6_header_decls[i];
+        if (d->kind == C6_HD_STRUCT)
+            fprintf(f, "%s %s;\n",
+                    IS_UNION(d->sym->type.t) ? "union" : "struct",
+                    get_tok_str(d->name, NULL));
+    }
+
+    /* generated slice/tuple layouts */
+    for (e = c6_hdr_extras; e; e = e->next) {
+        char buf[2048];
+        if (e->tuple) {
+            C6Tuple *tp = c6_tuple_of_type(&e->type);
+            char fname[32];
+            fprintf(f, "typedef struct {\n");
+            for (j = 0; j < tp->n; j++) {
+                snprintf(fname, sizeof fname, "f%d", j);
+                c6_hdr_type(buf, sizeof buf, &tp->elem[j], fname);
+                fprintf(f, "    %s;\n", buf);
+            }
+            fprintf(f, "} %s;\n", e->name);
+        } else {
+            C6Slice *sl = c6_slice_of_type(&e->type);
+            c6_hdr_type(buf, sizeof buf, &sl->elem, "*data");
+            fprintf(f, "typedef struct {\n    %s;\n    size_t len;\n} %s;\n",
+                    buf, e->name);
+        }
+    }
+    if (c6_hdr_extras)
+        fputc('\n', f);
+
+    /* struct/union/enum definitions, in source order */
+    for (i = 0; i < s1->c6_nb_header_decls; i++) {
+        d = s1->c6_header_decls[i];
+        if (d->kind == C6_HD_STRUCT && d->sym->c >= 0) {
+            fprintf(f, "%s %s {\n",
+                    IS_UNION(d->sym->type.t) ? "union" : "struct",
+                    get_tok_str(d->name, NULL));
+            c6_hdr_struct_body(f, d->sym);
+            fprintf(f, "};\n\n");
+        } else if (d->kind == C6_HD_ENUM) {
+            Sym *ss;
+            fprintf(f, "enum %s {\n", get_tok_str(d->name, NULL));
+            for (ss = d->sym->next; ss; ss = ss->next)
+                fprintf(f, "    %s = %lld%s\n", get_tok_str(ss->v, NULL),
+                        ss->enum_val, ss->next ? "," : "");
+            fprintf(f, "};\n\n");
+        }
+    }
+
+    /* typedefs, functions and variables */
+    first = 1;
+    for (i = 0; i < s1->c6_nb_header_decls; i++) {
+        d = s1->c6_header_decls[i];
+        if (d->kind == C6_HD_TYPEDEF) {
+            c6_hdr_print_typedef(f, d);
+            first = 0;
+        }
+    }
+    if (!first)
+        fputc('\n', f);
+    for (i = 0; i < s1->c6_nb_header_decls; i++) {
+        char buf[2048];
+        d = s1->c6_header_decls[i];
+        if (d->kind != C6_HD_FUNC && d->kind != C6_HD_VAR)
+            continue;
+        c6_hdr_type(buf, sizeof buf, &d->type, get_tok_str(d->name, NULL));
+        if (!(d->type.t & VT_EXTERN))
+            fprintf(f, "extern ");
+        fprintf(f, "%s;\n", buf);
+    }
+    fprintf(f, "\n#endif /* %s */\n", guard);
+    fclose(f);
+    while (c6_hdr_extras) {
+        e = c6_hdr_extras;
+        c6_hdr_extras = e->next;
+        tcc_free(e);
+    }
+}
+
 /* 'pkg.member' is only allowed for a package that was imported, or for the
    package the code currently sits in */
 static int c6_pkg_imported(const char *name)
@@ -7970,13 +8825,20 @@ static int c6_pkg_imported(const char *name)
     if (tcc_state->c6_package
         && !strcmp(tcc_state->c6_package, name))
         return 1;
+    if (file && file->c6_module) {
+        size_t n = strlen(file->c6_module);
+        if (n > 2 && strlen(name) == n - 2
+            && !strncmp(name, file->c6_module, n - 2))
+            return 1;
+    }
     for (i = 0; i < tcc_state->c6_nb_imports; i++)
         if (!strcmp(tcc_state->c6_imports[i], name))
             return 1;
     return 0;
 }
 
-/* resolve V as a member of the current package or of an imported package */
+/* resolve V as a member of the current module, the current package or of an
+   imported package */
 static Sym *c6_import_lookup(int v)
 {
     TCCState *s1 = tcc_state;
@@ -7985,8 +8847,15 @@ static Sym *c6_import_lookup(int v)
 
     if (!s1->c6_ext || v < TOK_UIDENT)
         return NULL;
+    if (file && file->c6_module) {
+        t = c6_mod_name(v);
+        s = sym_find_raw(t);
+        if (s)
+            return s;
+    }
     if (s1->c6_package) {
         t = c6_mangle_tok(s1->c6_package, v);
+        t = c6_mod_name(t);
         s = sym_find_raw(t);
         if (s)
             return s;
@@ -7994,6 +8863,24 @@ static Sym *c6_import_lookup(int v)
     for (i = 0; i < s1->c6_nb_imports; i++) {
         t = c6_mangle_tok(s1->c6_imports[i], v);
         s = sym_find_raw(t);
+        if (s)
+            return s;
+    }
+    return NULL;
+}
+
+/* the tag ('struct'/'union'/'enum') counterpart of c6_import_lookup */
+static Sym *c6_import_tag_lookup(int v)
+{
+    TCCState *s1 = tcc_state;
+    int i, t;
+    Sym *s;
+
+    if (!s1->c6_ext || v < TOK_UIDENT || !s1->c6_nb_imports)
+        return NULL;
+    for (i = 0; i < s1->c6_nb_imports; i++) {
+        t = c6_mangle_tok(s1->c6_imports[i], v);
+        s = struct_find_raw(t);
         if (s)
             return s;
     }
@@ -8050,7 +8937,12 @@ static void c6_import_parse(void)
     name = c6_pkg_name(&tok);
     skip(';');
     dynarray_add(&tcc_state->c6_imports,
-                 &tcc_state->c6_nb_imports, name);
+                 &tcc_state->c6_nb_imports, tcc_strdup(name));
+    /* if '<name>.c' exists next to this file (or in a -I directory), its
+       declarations are replayed into this unit; otherwise this stays a
+       pure namespace import */
+    c6_module_import(name);
+    tcc_free(name);
 }
 
 
@@ -8170,13 +9062,14 @@ static void c6_method_plain_decl(int name, CType *type, AttributeDef *ad)
 {
     CType t = *type;
     AttributeDef a = *ad;
+    int alias = c6_mod_name(name);
 
-    if (!tcc_state->c6_ext || sym_find_raw(name))
+    if (!tcc_state->c6_ext || sym_find_raw(alias))
         return;                 /* already declared under the plain name */
     t.t = (t.t | VT_EXTERN) & ~(VT_STATIC | VT_INLINE);
     a.asm_label = 0;
     a.alias_target = 0;
-    c6_external_sym_raw(name, &t, 0, &a);
+    c6_external_sym_raw(alias, &t, 0, &a);
 }
 
 /* emit the source name as an alias of the mangled method symbol, so that
@@ -8186,7 +9079,8 @@ static void c6_method_plain_decl(int name, CType *type, AttributeDef *ad)
    name, if any, has to win. */
 static void c6_method_alias(int name, Sym *msym)
 {
-    Sym *ps = sym_find_raw(name);
+    int alias = c6_mod_name(name);
+    Sym *ps = sym_find_raw(alias);
     ElfSym *es;
 
     if (!tcc_state->c6_ext || !ps || ps == msym)
@@ -8390,7 +9284,7 @@ static void c6_interface_parse(void)
     next();                          /* skip 'interface' */
     if (tok < TOK_UIDENT)
         expect("interface name");
-    if (struct_find(tok))
+    if (struct_find_raw(c6_mod_name(tok)))
         tcc_error("redefinition of 'struct %s'", get_tok_str(tok, NULL));
     name_tok = tok;
     next();
@@ -8398,8 +9292,10 @@ static void c6_interface_parse(void)
 
     ifc = tcc_mallocz(sizeof *ifc);
     ifc->name = tcc_strdup(get_tok_str(name_tok, NULL));
-    ifc->tag = name_tok;
-    snprintf(buf, sizeof buf, "%s_vt", ifc->name);
+    /* the value struct and the vtable are module-prefixed like any other
+       file scope type; 'name' stays the source spelling for diagnostics */
+    ifc->tag = c6_mod_name(name_tok);
+    snprintf(buf, sizeof buf, "%s_vt", get_tok_str(ifc->tag, NULL));
     ifc->vt_tag = tok_alloc_const(buf);
 
     /* Build 'struct NAME_vt { RET (*meth)(void *, ...); ... };', that is,
@@ -9598,6 +10494,14 @@ static void c6_tu_reset(void)
     }
     dynarray_reset(&tcc_state->c6_ifaces, &tcc_state->c6_nb_ifaces);
     dynarray_reset(&tcc_state->c6_imports, &tcc_state->c6_nb_imports);
+    dynarray_reset(&tcc_state->c6_loaded_modules,
+                   &tcc_state->c6_nb_loaded_modules);
+    dynarray_reset(&tcc_state->c6_loading_modules,
+                   &tcc_state->c6_nb_loading_modules);
+    dynarray_reset(&tcc_state->c6_header_decls,
+                   &tcc_state->c6_nb_header_decls);
+    c6_importing = 0;
+    c6_expected_module = NULL;
     tcc_free(tcc_state->c6_package);
     tcc_state->c6_package = NULL;
     c6_self_pending = 0;
@@ -9916,6 +10820,14 @@ static void c6_test_parse(void)
     char name[64];
     int v;
 
+    if (c6_importing) {
+        /* tests belong to the module's own translation unit */
+        next();
+        if (tok == TOK_STR)
+            next();
+        skip_or_save_block(NULL);
+        return;
+    }
     next();             /* skip the 'test' keyword */
     if (tok != TOK_STR)
         expect("string");
@@ -11527,6 +12439,9 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
 #ifdef C6_EXT
     } else if ((flags & DIF_HAVE_ELEM) && c6_slice_convert(type)) {
         /* 'int[:] s = array;': vtop now holds the slice value */
+        goto one_elem;
+    } else if ((flags & DIF_HAVE_ELEM) && c6_iface_convert(type)) {
+        /* 'Shape s = circle;': vtop now holds the interface value */
         goto one_elem;
 #endif
 
@@ -13603,6 +14518,20 @@ static int decl(int l)
                 c6_interface_parse();
                 continue;
             }
+            /* 'module NAME;' is a soft keyword: a visible identifier named
+               'module' keeps its ordinary C meaning */
+            if (tok >= TOK_UIDENT
+                && !strcmp(get_tok_str(tok, NULL), "module")
+                && !sym_find_raw(tok)) {
+                int c6_kw = tok;
+                next();
+                if (tok >= TOK_UIDENT || tok == '.') {
+                    unget_tok(c6_kw);
+                    c6_module_parse();
+                    continue;
+                }
+                unget_tok(c6_kw);
+            }
         }
         /* 'co', 'go' and 'task' are soft keywords: at file scope they stay
            plain identifiers, so 'go f();' only fails when the declaration
@@ -13644,6 +14573,12 @@ static int decl(int l)
                 continue;
             }
         }
+#endif
+#ifdef C6_EXT
+        /* remember that this file already had a declaration: 'module' is
+           only meaningful before the first one */
+        if (l == VT_CONST)
+            file->c6_decl_seen = 1;
 #endif
         if (!parse_btype(&btype, &adbase, l == VT_LOCAL)) {
             if (l == VT_JMP)
@@ -13724,12 +14659,23 @@ static int decl(int l)
             /* keep the name as written: a 'package' mangles it below, but
                diagnostics must talk about the identifier the user wrote */
             decl_name = v;
+#ifdef C6_EXT
+            /* a module owns the program entry point of its own TU, not of
+               the importer: 'main' is not an exportable module name */
+            if (l == VT_CONST && file->c6_module && decl_name >= TOK_UIDENT
+                && !strcmp(get_tok_str(decl_name, NULL), "main"))
+                tcc_error("'main' cannot be declared in a module");
+#endif
             /* symbols declared inside a package are name-mangled; the
                program entry point always keeps its name */
             if (l == VT_CONST && tcc_state->c6_package
                 && v >= TOK_UIDENT
                 && strcmp(get_tok_str(v, NULL), "main") != 0)
                 v = c6_mangle_tok(tcc_state->c6_package, v);
+            /* ... and a module prefixes the result once more, so that
+               'package p { int f() }' in module m becomes 'm__p__f' */
+            if (l == VT_CONST && file->c6_module && v >= TOK_UIDENT)
+                v = c6_mod_name(v);
 #endif
             if ((type.t & VT_BTYPE) == VT_FUNC) {
                 if ((type.t & VT_STATIC) && (l != VT_CONST))
@@ -13810,10 +14756,26 @@ static int decl(int l)
 #ifdef C6_EXT
                 /* a method is emitted as '<Type>_<name>' so that different
                    structures can share a method name (c6_method_symbol) */
-                if (!tcc_state->c6_package)
+                if (!tcc_state->c6_package || file->c6_module)
                     method_tok = c6_method_symbol(decl_name, &type);
                 if (method_tok)
                     v = method_tok;
+                /* importing a module: register the prototype, skip the body
+                   (the module's own object contains the code) */
+                if (c6_importing) {
+                    if (type.t & VT_STATIC) {
+                        skip_or_save_block(NULL);
+                        break;
+                    }
+                    type.t |= VT_EXTERN;
+                    external_sym(v, &type, 0, &ad);
+                    c6_method_register(decl_name, v, &type);
+                    if (method_tok)
+                        c6_method_plain_decl(decl_name, &type, &ad);
+                    c6_header_record(C6_HD_FUNC, v, &type, NULL);
+                    skip_or_save_block(NULL);
+                    break;
+                }
 #endif
                 sym = external_sym(v, &type, 0, &ad);
 #ifdef C6_EXT
@@ -13822,6 +14784,7 @@ static int decl(int l)
                 /* the source name stays declared for plain 'f(p)' calls */
                 if (method_tok)
                     c6_method_plain_decl(decl_name, &type, &ad);
+                c6_header_record(C6_HD_FUNC, v, &type, NULL);
 #endif
 
                 /* reject abstract declarators in function definition
@@ -13904,6 +14867,10 @@ static int decl(int l)
                     sym->a = ad.a;
                     if ((type.t & VT_BTYPE) == VT_FUNC)
                       merge_funcattr(&sym->type.ref->f, &ad.f);
+#ifdef C6_EXT
+                    if (l == VT_CONST)
+                        c6_header_record(C6_HD_TYPEDEF, v, &type, NULL);
+#endif
                     if (debug_modes)
                         tcc_debug_typedef (tcc_state, sym);
 		} else if ((type.t & VT_BTYPE) == VT_VOID
@@ -13923,6 +14890,25 @@ static int decl(int l)
                     if (tok == '=')
                         has_init = 1;
 #ifdef C6_EXT
+                    if (c6_importing && l == VT_CONST) {
+                        if (type.t & VT_STATIC) {
+                            /* file local: nothing to import */
+                            c6_skip_decl_tail();
+                            if (tok == ',') {
+                                next();
+                                continue;
+                            }
+                            skip(';');
+                            break;
+                        }
+                        /* a definition becomes a declaration here; its data
+                           belongs to the module's own object file */
+                        type.t |= VT_EXTERN;
+                        if (has_init) {
+                            has_init = 0;
+                            c6_skip_decl_tail();
+                        }
+                    }
                     c6_check_var_initialized(&type, has_init, decl_name,
                                                  &ad);
 #endif
@@ -13937,7 +14923,7 @@ static int decl(int l)
                         /* external variable or function */
                         type.t |= VT_EXTERN;
 #ifdef C6_EXT
-                        if (!tcc_state->c6_package)
+                        if (!tcc_state->c6_package || file->c6_module)
                             method_tok = c6_method_symbol(decl_name, &type);
                         if (method_tok)
                             v = method_tok;
@@ -13950,6 +14936,10 @@ static int decl(int l)
                             c6_method_register(decl_name, v, &type);
                         if (method_tok)
                             c6_method_plain_decl(decl_name, &type, &ad);
+                        if (l == VT_CONST)
+                            c6_header_record((type.t & VT_BTYPE) == VT_FUNC
+                                             ? C6_HD_FUNC : C6_HD_VAR,
+                                             v, &type, NULL);
 #endif
                     } else {
                         if (l == VT_CONST || (type.t & VT_STATIC))
@@ -13963,6 +14953,10 @@ static int decl(int l)
                             /* uninitialized global variables may be overridden */
                             type.t |= VT_EXTERN;
                         decl_initializer_alloc(&type, &ad, r, has_init, v, l);
+#ifdef C6_EXT
+                        if (l == VT_CONST)
+                            c6_header_record(C6_HD_VAR, v, &type, NULL);
+#endif
                     }
 
                     if (ad.alias_target && l == VT_CONST) {

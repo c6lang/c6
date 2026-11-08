@@ -1,0 +1,56 @@
+/* c6 自测：module / import（模块的声明由 import 加载）
+ *
+ * 第二个翻译单元 tests/tu/module.c 是模块 tu.module 的实现；
+ * import 会找到并解析它（按 'tu/module.c' 的路径），只取声明，
+ * 代码仍然由那个翻译单元自己的对象文件提供。
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/module.c tests/tu/module.c
+ */
+import tu.module;
+
+test "import 加载模块的声明，短名可以直接调用" {
+    if (add(2, 3) != 5)
+        err(1, "add");
+    if (twice(21) != 42)
+        err(2, "twice");
+}
+
+test "模块的结构体、枚举和全局变量按前缀导出" {
+    Point p = { 3, 4 };
+    if (p.x != 3 || p.y != 4)
+        err(3, "Point");
+    if (area(&p) != 12)
+        err(4, "area");
+    if (RED != 0 || GREEN != 1)
+        err(5, "Color");
+    if (counter != 7)
+        err(6, "counter");
+    counter = 9;
+    if (bump() != 10)
+        err(7, "bump");
+    if (counter != 10)
+        err(8, "counter after bump");
+}
+
+test "import 之后仍可以写全限定名" {
+    Point q = { 2, 5 };
+    if (tu.module.add(1, 4) != 5)
+        err(9, "qualified add");
+    if (tu.module.area(&q) != 10)
+        err(10, "qualified area");
+}
+
+test "模块类型可以写全限定名" {
+    tu.module.Point p = { 4, 6 };
+    tu.module.Point *q = &p;
+    if (tu.module.area(q) != 24)
+        err(12, "qualified type");
+}
+
+test "interface 也从模块导入" {
+    Point p = { 6, 7 };
+    Shape s = p;
+    if (s.area() != 42)
+        err(11, "interface area");
+}

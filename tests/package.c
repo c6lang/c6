@@ -6,6 +6,20 @@
 #include <stdio.h>
 #include <string.h>
 
+/* package 的 typedef 有前缀，所以限定类型名可以写 pt.P；
+   package 里的 struct tag 仍是普通 C tag，没有 pt__P。 */
+package pt {
+    struct P { int x; };
+    typedef struct P P;
+}
+import pt;
+
+test "package 类型可以写全限定名" {
+    pt.P p = { 5 };
+    if (p.x != 5)
+        err(1, "pt.P 不对");
+}
+
 package math {
     int counter = 0;
     int add(int a, int b) { return a + b; }
