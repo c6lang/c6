@@ -1202,7 +1202,10 @@ ST_FUNC void relocate_sections(TCCState *s1)
 
     for (i = 1; i < s1->nb_sections; ++i) {
         sr = s1->sections[i];
-        if (sr->sh_type != SHT_RELX)
+        /* !sh_info: not a relocation section (e.g. the R_X86_64_IRELATIVE
+           table a static link emits for the C library, see
+           tcc_static_iplt_create()) */
+        if (sr->sh_type != SHT_RELX || !sr->sh_info)
             continue;
         s = s1->sections[sr->sh_info];
 #ifndef TCC_TARGET_MACHO
@@ -1506,8 +1509,12 @@ redo:
             }
 #endif
 #ifdef TCC_TARGET_X86_64
+            /* An IFUNC (glibc's memcpy, strlen, ...) must keep going through
+               the PLT: the body at its address is the resolver, which only
+               yields the real implementation when the runtime calls it. */
             if ((type == R_X86_64_PLT32 || type == R_X86_64_PC32) &&
 		sym->st_shndx != SHN_UNDEF &&
+                ELFW(ST_TYPE)(sym->st_info) != STT_GNU_IFUNC &&
                 (ELFW(ST_VISIBILITY)(sym->st_other) != STV_DEFAULT ||
 		 ELFW(ST_BIND)(sym->st_info) == STB_LOCAL ||
 		 s1->output_type & TCC_OUTPUT_EXE)) {
@@ -1877,6 +1884,21 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
             tcc_add_support(s1, TCC_LIBTCC1);
             tcc_add_library(s1, "c");
         }
+#if defined TCC_TARGET_UNIX && !defined TCC_TARGET_MACHO
+        if (s1->static_link) {
+            /* Static libc (glibc) is built against the compiler runtime: its
+               libc.a refers to the quad-precision soft-float helpers
+               (__multf3, __addtf3, __unordtf2, __letf2, ...) and to the
+               unwinder (__gcc_personality_v0, _Unwind_*).  gcc's driver adds
+               libgcc.a and libgcc_eh.a behind libc for -static; do the same.
+               Missing archives are not an error: they are only needed here,
+               and other libcs (musl, uClibc) do without them. */
+            if (CONFIG_TCC_LIBGCC[0])
+                tcc_add_library_path(s1, CONFIG_TCC_LIBGCC);
+            tcc_add_dll(s1, "libgcc.a", AFF_TYPE_LIB);
+            tcc_add_dll(s1, "libgcc_eh.a", AFF_TYPE_LIB);
+        }
+#endif
 #ifndef TCC_TARGET_MACHO
         if (s1->output_type != TCC_OUTPUT_MEMORY)
             tccelf_add_crtend(s1);
@@ -1933,6 +1955,18 @@ static void tcc_add_linker_symbols(TCCState *s1)
 #if TARGETOS_OpenBSD
     set_global_sym(s1, "__executable_start", NULL, ELF_START_ADDR);
 #endif
+    /* glibc's static startup finds the program headers by reading the ELF
+       header at __ehdr_start; the GNU linker defines that symbol as the load
+       address of the header.  Do the same for static executables, but only
+       when something (normally libc.a) refers to it, so that ordinary links
+       and user-provided definitions stay untouched. */
+    if (s1->static_link && (s1->output_type & TCC_OUTPUT_EXE)) {
+        int sym_index = find_elf_sym(symtab_section, "__ehdr_start");
+        ElfW(Sym) *esym = (ElfW(Sym) *)symtab_section->data + sym_index;
+        if (sym_index && esym->st_shndx == SHN_UNDEF)
+            set_global_sym(s1, "__ehdr_start", NULL,
+                s1->has_text_addr ? s1->text_addr : ELF_START_ADDR);
+    }
 
 #ifdef TCC_TARGET_RISCV64
     /* XXX should be .sdata+0x800, not .data+0x800 */
@@ -2036,6 +2070,62 @@ ST_FUNC void fill_got(TCCState *s1)
         }
     }
 }
+
+#ifdef TCC_TARGET_X86_64
+/* Static links and IFUNCs (glibc's memcpy, strlen, ...): there is no dynamic
+   linker to run the resolver, so the resolver addresses are handed to the C
+   library startup instead.  glibc's __libc_start_main walks the table between
+   __rela_iplt_start and __rela_iplt_end and replaces every slot with the
+   implementation the resolver picks for this CPU - the same table ld builds
+   for a static executable out of R_X86_64_IRELATIVE relocations.  Slots are
+   taken from the GOT relocations, where a PLT call leaves R_JMP_SLOT. */
+static void tcc_static_iplt_create(TCCState *s1)
+{
+    Section *sec = 0;
+    ElfW_Rel *rel = 0;
+    int n = 0;
+
+    if (!s1->got || !s1->got->reloc)
+        return;
+    for_each_elem(s1->got->reloc, 0, rel, ElfW_Rel) {
+        ElfW(Sym) *sym = &((ElfW(Sym) *)symtab_section->data)
+                         [ELFW(R_SYM)(rel->r_info)];
+        if (ELFW(R_TYPE)(rel->r_info) == R_JMP_SLOT
+            && ELFW(ST_TYPE)(sym->st_info) == STT_GNU_IFUNC)
+            ++n;
+    }
+    if (!n)
+        return;
+    sec = new_section(s1, ".rela.plt", SHT_RELA, SHF_ALLOC);
+    sec->sh_addralign = PTR_SIZE;
+    sec->sh_entsize = sizeof(ElfW_Rel);
+    section_ptr_add(sec, n * sizeof(ElfW_Rel));
+    set_global_sym(s1, "__rela_iplt_start", sec, 0);
+    set_global_sym(s1, "__rela_iplt_end", sec, n * sizeof(ElfW_Rel));
+}
+
+/* Fill the table once the section addresses are known. */
+static void tcc_static_iplt_fill(TCCState *s1)
+{
+    Section *sec = have_section(s1, ".rela.plt");
+    ElfW_Rel *rel = 0, *irel = 0;
+
+    if (!sec || !s1->got || !s1->got->reloc)
+        return;
+    irel = (ElfW_Rel *)sec->data;
+    for_each_elem(s1->got->reloc, 0, rel, ElfW_Rel) {
+        ElfW(Sym) *sym = &((ElfW(Sym) *)symtab_section->data)
+                         [ELFW(R_SYM)(rel->r_info)];
+        if (ELFW(R_TYPE)(rel->r_info) != R_JMP_SLOT
+            || ELFW(ST_TYPE)(sym->st_info) != STT_GNU_IFUNC)
+            continue;
+        irel->r_offset = s1->got->sh_addr + rel->r_offset;
+        irel->r_info = ELFW(R_INFO)(0, R_X86_64_IRELATIVE);
+        irel->r_addend = sym->st_value;
+        ++irel;
+    }
+}
+#endif
 
 /* See put_got_entry for a description.  This is the second stage
    where GOT references to local defined symbols are rewritten.  */
@@ -3086,6 +3176,10 @@ static int elf_output_file(TCCState *s1, const char *filename)
 	    dyninf.gnu_hash = create_gnu_hash(s1);
         } else {
             build_got_entries(s1, 0);
+#ifdef TCC_TARGET_X86_64
+            if (file_type == TCC_OUTPUT_EXE && s1->static_link)
+                tcc_static_iplt_create(s1);
+#endif
         }
 	version_add (s1);
 
@@ -3159,9 +3253,17 @@ static int elf_output_file(TCCState *s1, const char *filename)
             fill_dynamic(s1, &dyninf);
 	}
         /* Perform relocation to GOT or PLT entries */
-        if (file_type == TCC_OUTPUT_EXE && s1->static_link)
+        if (file_type == TCC_OUTPUT_EXE && s1->static_link) {
+#ifdef TCC_TARGET_X86_64
+            /* PLT stubs jump through the GOT; point them at their (still
+               empty) slots - nothing in a static link does it otherwise */
+            relocate_plt(s1);
+#endif
             fill_got(s1);
-        else if (s1->got)
+#ifdef TCC_TARGET_X86_64
+            tcc_static_iplt_fill(s1);
+#endif
+        } else if (s1->got)
             fill_local_got_entries(s1);
 
     if (dyninf.gnu_hash)

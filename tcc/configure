@@ -38,6 +38,7 @@ DLLSUF=".so"
 tcc_sysincludepaths=""
 tcc_libpaths=""
 tcc_crtprefix=""
+tcc_libgcc=""
 tcc_elfinterp=""
 triplet=
 confvars=
@@ -726,6 +727,20 @@ print_str CONFIG_OS_RELEASE "$os_release"
 print_str CONFIG_SYSROOT "$sysroot" x
 test "$tccdir_auto" = "yes" || print_str CONFIG_TCCDIR "$tccdir" x
 print_num CONFIG_TCC_PREDEFS "$predefs"
+
+# Static links need the compiler's own runtime (libgcc.a/libgcc_eh.a): glibc's
+# libc.a refers to the quad-precision soft-float helpers and to the unwinder,
+# which gcc's driver takes from there.  Remember where this compiler keeps
+# them; tcc_add_runtime() adds "-lgcc -lgcc_eh" for -static (see tccelf.c).
+# Cross builds must not pick up the build compiler's runtime: it belongs to
+# another target, and $cc may not even be able to print its name.
+if test "$mingw32" = "no" && test -z "$build_cross"; then
+  _libgcc="$($cc -print-libgcc-file-name 2>/dev/null)"
+  if test -f "$_libgcc"; then
+    default tcc_libgcc "${_libgcc%/*}"
+  fi
+fi
+print_str CONFIG_TCC_LIBGCC "$tcc_libgcc"
 
 diff $TMPH config.h >/dev/null 2>&1
 if test $? -ne 0 ; then

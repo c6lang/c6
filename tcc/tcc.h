@@ -300,6 +300,12 @@ extern long double strtold (const char *__nptr, char **__endptr);
 # endif
 #endif
 
+/* directory holding the compiler runtime (libgcc.a, libgcc_eh.a); -static
+   links add it as gcc's driver does.  Empty when configure found none. */
+#ifndef CONFIG_TCC_LIBGCC
+# define CONFIG_TCC_LIBGCC ""
+#endif
+
 /* name of ELF interpreter */
 #ifndef CONFIG_TCC_ELFINTERP
 # if defined __GNU__

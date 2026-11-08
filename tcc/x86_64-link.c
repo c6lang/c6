@@ -175,7 +175,10 @@ ST_FUNC void relocate_plt(TCCState *s1)
         }
     }
 
-    if (s1->plt->reloc) {
+    /* A static link has no ld.so to resolve a slot lazily: the slots already
+       hold the symbol address (relocate_sections() writes them from the
+       R_X86_64_JUMP_SLOT relocations of the GOT), so leave them alone. */
+    if (s1->plt->reloc && !s1->static_link) {
         ElfW_Rel *rel = 0;
         int x = s1->plt->sh_addr + 16 + 6;
         p = s1->got->data;
@@ -296,8 +299,14 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
         case R_X86_64_GOTPCREL:
         case R_X86_64_GOTPCRELX:
         case R_X86_64_REX_GOTPCRELX:
+            /* G + GOT + A - P.  The addend is normally -4 (the distance from
+               the relocated field to the end of the instruction), but gcc
+               also uses other values when the instruction has trailing bytes,
+               e.g. "cmpq $0, sym@GOTPCREL(%rip)" (A = -5).  Read it from the
+               relocation instead of assuming -4, as the GOTPC* cases do. */
             add32le(ptr, s1->got->sh_addr - addr +
-                         get_sym_attr(s1, sym_index, 0)->got_offset - 4);
+                         get_sym_attr(s1, sym_index, 0)->got_offset +
+                         rel->r_addend);
             break;
         case R_X86_64_GOTPC32:
             add32le(ptr, s1->got->sh_addr - addr + rel->r_addend);
@@ -306,7 +315,30 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
             add64le(ptr, s1->got->sh_addr - addr + rel->r_addend);
             break;
         case R_X86_64_GOTTPOFF:
-            add32le(ptr, val - s1->got->sh_addr);
+            if (s1->static_link && s1->tls_end) {
+                /* TLS through the GOT ("initial exec").  A static link knows
+                   the offset from the thread pointer, so load the offset as
+                   an immediate instead: the same relaxation the GNU linker
+                   does for -static, and it keeps the instruction length:
+                       mov sym@GOTTPOFF(%rip),%reg  ->  mov $tpoff,%reg
+                       add sym@GOTTPOFF(%rip),%reg  ->  add $tpoff,%reg    */
+                ElfW(Sym) *sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
+                uint8_t rex = ptr[-3], op = ptr[-2], modrm = ptr[-1];
+                int32_t tpoff = (int32_t)(sym->st_value - s1->tls_end);
+                int reg = ((modrm >> 3) & 7) | (rex & 0x04 ? 8 : 0);
+
+                if ((rex & 0xf8) != 0x48 || (modrm & 0xc7) != 0x05
+                    || (op != 0x8b && op != 0x03))
+                    tcc_error_noabort("unexpected R_X86_64_GOTTPOFF pattern");
+                /* the register becomes the r/m operand of the immediate
+                   form, so its high bit moves from REX.R to REX.B */
+                ptr[-3] = 0x48 | (reg & 8 ? 0x01 : 0);
+                ptr[-2] = op == 0x8b ? 0xc7 : 0x81;
+                ptr[-1] = 0xc0 | (reg & 7);
+                write32le(ptr, tpoff);
+            } else {
+                add32le(ptr, val - s1->got->sh_addr);
+            }
             break;
         case R_X86_64_GOT32:
             /* we load the got offset */
