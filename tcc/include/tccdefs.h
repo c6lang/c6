@@ -186,7 +186,7 @@
     #define __uint128_t struct __uint128__
 
     /* __builtin_va_list */
-#if defined __x86_64__
+#if defined __x86_64__ || defined __c99__
 #if !defined _WIN32
     /* GCC compatible definition of va_list. */
     /* This should be in sync with the declaration in our lib/va_list.c */
