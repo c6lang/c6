@@ -18,7 +18,7 @@
  *      from the relocation records
  *
  *  Build:  make c99                     (仓库根目录，自动配置；tcc/c99-tcc)
- *  Use:    c99-tcc -c99 -B. -o out.c in.c
+ *  Use:    c99-tcc -c99 -B. -o out.c in.c   ('-c99' 是这个构建的默认动作)
  */
 
 #ifdef TARGET_DEFS_ONLY
