@@ -886,9 +886,9 @@ front-end and writes **portable C99 source** instead of machine code.
 
 `-c99` selects the output back-end; it is not a language-standard flag, and
 the language being compiled stays C.  `-B tcc` is required so that the tool
-finds tcc's own `include/` (on Debian-style hosts the multiarch directory is
-not in tcc's search path, so system headers additionally need e.g.
-`-I/usr/include/x86_64-linux-gnu`).
+finds tcc's own `include/`.  The multiarch system include directory is added
+from `CONFIG_TRIPLET` in `config.h`; if your host's triplet is not detected,
+add `-I/usr/include/$(cc -print-multiarch)` by hand.
 
 The generated file only needs `memcpy`/`memmove`/`memset` from `<string.h>`:
 the vstack registers become a `union` array `__c99_r[8]`, the stack frame is

@@ -715,10 +715,14 @@ print_str CONFIG_TCC_LIBPATHS "$tcc_libpaths"
 print_str CONFIG_TCC_CRTPREFIX "$tcc_crtprefix"
 print_str CONFIG_TCC_ELFINTERP "$tcc_elfinterp"
 print_str CONFIG_TCC_SWITCHES "$tcc_switches"
-print_str CONFIG_TRIPLET "$triplet"
-print_str CONFIG_OS_RELEASE "$os_release"
 echo "#endif" >> $TMPH && echo >> $TMPH
 
+# These describe the host, not the selected target: every back-end (including
+# TCC_TARGET_C99, which is built with -DTCC_TARGET_C99 and therefore skips the
+# default-target block above) needs them.  CONFIG_TRIPLET in particular feeds
+# ALSO_TRIPLET() in tcc.h, which adds the multiarch include directory.
+print_str CONFIG_TRIPLET "$triplet"
+print_str CONFIG_OS_RELEASE "$os_release"
 print_str CONFIG_SYSROOT "$sysroot" x
 test "$tccdir_auto" = "yes" || print_str CONFIG_TCCDIR "$tccdir" x
 print_num CONFIG_TCC_PREDEFS "$predefs"
