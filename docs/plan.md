@@ -766,7 +766,16 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 自己的局部变量偏移寻址，因此不需要给局部变量取名字）；比较 -> `__c99_cnd`；
 数据段 -> 字节数组 + `__c99_init()` 按重定位表打补丁。
 
-限制（均显式报错，不会静默错编译）：结构体/联合体、返回结构体的函数、
-间接调用、变参函数定义、computed goto、VLA，以及依赖 `libtcc1.c` 中
-pthread/系统调用的 c6 运行时特性（`defer`/`errdefer`、`try`/`catch`、
-切片、`async`/`await`、`go`）。
+结构体/联合体、返回结构体的函数、间接调用都已经支持。c6 的运行时
+（defer/errdefer、err/try/catch、切片、协程、线程、`c6_io`）用一份可移植
+C99 + POSIX（pthread/select）的实现重写在 `tcc/c99-rt.inc`，构建时转成
+字符串常量嵌入 `c99-gen.c`，每个 c6 输出文件自带这份运行时；在
+GCC/Clang 下运行时符号是 weak 的，多个 TU 共用同一份状态，没有 weak 的
+编译器退化为每个 TU 一份。`tests/*.c`、`tests/exit/*.c`、
+`tests/abi/tuple.c` 和 `examples/*.c` 均已通过。
+
+限制（均显式报错，不会静默错编译）：变参函数**定义**、computed goto、
+VLA；非 POSIX 主机上运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
+ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-64 寄存器返回，
+可以与普通 C 互操作；其它结构体返回用隐藏指针（c6 TU 之间一致，大于
+16 字节时也与原生 ABI 一致，9--16 字节与普通 C 混用不支持）。
