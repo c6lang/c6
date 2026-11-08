@@ -1,0 +1,124 @@
+/* c6 自测：字段释放、嵌套、数组（引用计数 GC，阶段 P2）
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/gc_field.c
+ *
+ * P2 让“对象里的托管引用”也有人管：类型描述符记下每个字段的偏移/种类/
+ * 数组长度，运行时在对象死亡时按它逐字段释放。还可以 'new T[n]'。
+ */
+#include <stdio.h>
+
+struct Node { int v; @Node next; };
+
+/* 一个结构体里放各种种类的托管字段 */
+struct Holder {
+    @Node a;
+    @Node arr[3];
+    weak @Node w;
+    own @Node o;
+};
+
+/* 嵌套：按值包含另一个含托管字段的结构体 */
+struct Inner { @Node n; int pad; };
+struct Outer { struct Inner in; int x; @Node b; };
+
+/* 值的链：用来看长链释放不爆栈 */
+struct Cell { @Node next; int v; };
+
+test "字段在对象死亡时逐个释放" {
+    @Node keep = new Node;
+    {
+        @Holder h = new Holder;
+        h->a = new Node;
+        h->arr[0] = new Node;
+        h->arr[2] = new Node;
+        h->w = keep;
+        h->o = new Node;
+        if (__c6_gc_live() != 6)
+            err(1, "活对象数不对");
+        if (__c6_gc_refcount(h->a) != 1)
+            err(2, "字段引用的计数不是 1");
+        if (__c6_gc_refcount(keep) != 1)
+            err(3, "弱字段不该加计数");
+    }
+    if (__c6_gc_live() != 1)
+        err(4, "Holder 的字段没有全部释放");
+    if (__c6_gc_refcount(keep) != 1)
+        err(5, "弱字段的目标被影响了");
+    keep = NULL;
+    if (__c6_gc_live() != 0)
+        err(6, "还有对象活着");
+}
+
+test "嵌套结构体的字段也释放" {
+    {
+        @Outer o = new Outer;
+        o->in.n = new Node;
+        o->b = new Node;
+        if (__c6_gc_live() != 3)
+            err(1, "活对象数不对");
+        if (__c6_gc_refcount(o->in.n) != 1)
+            err(2, "内层字段的计数不是 1");
+    }
+    if (__c6_gc_live() != 0)
+        err(3, "嵌套字段没有释放");
+}
+
+test "'new T[n]' 的每个元素都按描述符释放" {
+    @Node arr = new Node[4];
+    if (__c6_gc_live() != 1)
+        err(1, "数组没有分配出来");
+    arr[0].next = new Node;
+    arr[1].next = new Node;
+    arr[3].v = 7;
+    if (arr[3].v != 7)
+        err(2, "数组元素写不进去");
+    if (__c6_gc_live() != 3)
+        err(3, "数组元素里的引用没有算进去");
+    arr = NULL;
+    if (__c6_gc_live() != 0)
+        err(4, "数组元素里的引用没有释放");
+}
+
+test "长链：迭代释放，不递归爆栈" {
+    @Node head = new Node;
+    struct Node *cur = head;    /* 借用：迭代不该多持有一份引用 */
+    int i = 0;
+    for (i = 0; i < 20000; i++) {
+        cur->next = new Node;
+        cur = cur->next;
+    }
+    if (__c6_gc_live() != 20001)
+        err(1, "链没有建起来");
+    head = NULL;
+    __c6_gc_drain_budget(1 << 24);      /* 把队列一次跑完 */
+    if (__c6_gc_live() != 0)
+        err(2, "长链没有释放干净");
+}
+
+test "自赋值与互换不影响字段" {
+    @Holder a = new Holder;
+    @Holder b = new Holder;
+    a->a = new Node;
+    b->a = new Node;
+    a = a;
+    if (__c6_gc_live() != 4)
+        err(1, "自赋值改变了活对象数");
+    a = NULL;
+    if (__c6_gc_live() != 2)
+        err(2, "a 的字段没有释放");
+    b = NULL;
+    if (__c6_gc_live() != 0)
+        err(3, "b 的字段没有释放");
+}
+
+test "元素里带引用时数组长度决定释放次数" {
+    @Cell cells = new Cell[3];
+    cells[0].next = new Node;
+    cells[2].next = new Node;
+    if (__c6_gc_live() != 3)
+        err(1, "活对象数不对");
+    cells = NULL;
+    if (__c6_gc_live() != 0)
+        err(2, "数组元素的字段没有释放");
+}

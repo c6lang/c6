@@ -1013,6 +1013,11 @@ C99_RT_UNUSED __c99_rt_linkage int c6_io(int fd, int ev)
 #define C99_GC_OWN        8
 #define C99_GC_INIT       16
 
+#define C99_GCK_STRONG 1
+#define C99_GCK_WEAK   2
+#define C99_GCK_OWN    3
+#define C99_GCK_EMBED  4
+
 #define C99_GC_META_COUNT 0xffffffffffUL
 #define C99_GC_META_FLAGS(meta) ((int)((meta) >> 40))
 
@@ -1069,12 +1074,64 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_gc_inc(C99GcHdr *h)
         h->rc++;
 }
 
+/* defined below: the field release runs inside the free path */
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_drop(C99GcHdr *h);
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_destroy(C99GcHdr *h);
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_weak_unlink(void **slot, void *p);
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_release_slot(void **slot, int kind)
+{
+    void *p = *slot;
+
+    if (!p)
+        return;
+    if (kind == C99_GCK_WEAK) {
+        __c99_gc_weak_unlink(slot, p);
+        *slot = 0;
+        return;
+    }
+    *slot = 0;
+    if (kind == C99_GCK_OWN)
+        __c99_gc_destroy(__c99_gc_hdr(p));
+    else
+        __c99_gc_drop(__c99_gc_hdr(p));
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_release_block(char *base,
+                                                           const struct __c6_gc_desc *d)
+{
+    unsigned k;
+
+    if (!d)
+        return;
+    for (k = 0; k < d->nfields; k++) {
+        const C99GcField *f = &d->fields[k];
+        unsigned i;
+
+        for (i = 0; i < f->count; i++) {
+            char *p = base + f->off + (size_t)i * f->stride;
+            if (f->kind == C99_GCK_EMBED)
+                __c99_gc_release_block(p, f->sub);
+            else
+                __c99_gc_release_slot((void **)p, (int)f->kind);
+        }
+    }
+}
+
 C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_one(C99GcHdr *h)
 {
     const struct __c6_gc_desc *d = h->desc;
 
-    if (d && d->drop)
-        d->drop(h + 1);
+    if (d) {
+        if (d->drop)
+            d->drop(h + 1);
+        if (d->nfields) {
+            unsigned long n = h->meta & C99_GC_META_COUNT, i;
+            for (i = 0; i < n; i++)
+                __c99_gc_release_block((char *)(h + 1)
+                                       + i * (size_t)d->size, d);
+        }
+    }
     if (__c99_gc_live_count)
         __c99_gc_live_count--;
     free(h);

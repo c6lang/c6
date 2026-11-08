@@ -817,6 +817,9 @@ typedef struct C6HeaderDecl {
 /* c6 managed references (reference-counting GC) ------------------------- */
 
 /* field kinds, must match 'struct __c6_gc_field.kind' in the runtime */
+/* flags in C6GcType */
+#define C6_GCD_HAS_WEAK 1
+
 #define C6_GCK_STRONG 1   /* '@T'   : counted reference */
 #define C6_GCK_WEAK   2   /* 'weak @T': slot is cleared when the target dies */
 #define C6_GCK_OWN    3   /* 'own @T': exclusive, released with the owner */
@@ -836,6 +839,8 @@ typedef struct C6GcType {
     int tag;                  /* struct tag token */
     int nfields;
     C6GcField *fields;
+    int size, align;          /* of one element */
+    int desc_tok;             /* the descriptor symbol emitted for it */
     char *src_file;           /* for cycle diagnostics */
     int src_line;
     int atomic;               /* holds 'shared' references */

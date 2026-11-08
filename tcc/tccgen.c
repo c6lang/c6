@@ -337,6 +337,9 @@ static int c6_type_gq(CType *type);
 static void c6_gc_plain(CType *type);
 /* nonzero while the initializer of a managed object is written */
 static int c6_gc_init_store;
+/* nonzero while the compiler stores a managed value for its own bookkeeping
+   (return slot, argument slot): those stores must not be rewritten */
+static int c6_gc_no_hook;
 static int c6_gc_store_hook(void);
 static int c6_gc_new_lead(void);
 static void c6_gc_new_expr(void);
@@ -346,6 +349,9 @@ static void c6_gc_site(int off, CType *type);
 static void c6_gc_arg_mark(void);
 static void c6_gc_arg_temp(void);
 static void c6_gc_arg_release(int has_value);
+static void c6_gc_collect(CType *type, int is_union);
+static C6GcType *c6_gc_type_find(int tag);
+static void c6_gc_value_check(CType *type, const char *what);
 #define C6_KW_NONE 0
 #define C6_KW_CO   1
 #define C6_KW_GO   2
@@ -4152,6 +4158,9 @@ ST_FUNC void vstore(void)
     c6_fallible_use();          /* 'x = f()' would drop the error */
     if (c6_gc_store_hook())     /* 'managed lvalue = value' */
         return;
+    if (tcc_state->c6_ext && !c6_gc_no_hook
+        && (vtop[-1].type.t & VT_BTYPE) == VT_STRUCT)
+        c6_gc_value_check(&vtop[-1].type, "an assignment");
 #endif
 
     ft = vtop[-1].type.t;
@@ -5190,6 +5199,10 @@ do_decl:
 	    check_fields(type, 1);
 	    check_fields(type, 0);
             struct_layout(type, &ad);
+#ifdef C6_EXT
+            if (u == VT_STRUCT || u == VT_UNION)
+                c6_gc_collect(type, u == VT_UNION);  /* managed fields */
+#endif
         }
         if (debug_modes)
             tcc_debug_fix_forw(tcc_state, type);
@@ -6257,6 +6270,9 @@ static void gfunc_param_typed(Sym *func, Sym *arg)
     } else if (arg == NULL) {
         tcc_error("too many arguments to function");
     } else {
+#ifdef C6_EXT
+        c6_gc_value_check(&arg->type, "a parameter");
+#endif
         type = arg->type;
         type.t &= ~VT_CONSTANT; /* need to do that to avoid false warning */
         gen_assign_cast(&type);
@@ -11547,10 +11563,12 @@ again:
             /* a plain word: the reference handed to the caller was counted
                by c6_gc_return_hook() already */
             c6_gc_plain(&rt);
+            c6_gc_no_hook = 1;
             vset(&rt, VT_LOCAL | VT_LVAL, ret_off);
             vswap();
             vstore();
             vpop();
+            c6_gc_no_hook = 0;
         }
 #endif
         leave_scope(root_scope);
@@ -14147,6 +14165,246 @@ static void c6_gc_site(int off, CType *type)
     gsym(skip);
 }
 
+/* ---------------------------------------------------------------------- */
+/* managed field metadata                                                 */
+/*                                                                         */
+/* A struct that holds managed references needs a description of where     */
+/* they are, so that the runtime can release them when the object dies.    */
+/* The description is one static record per struct, emitted as ordinary    */
+/* source at the point where the struct is defined - the fields and their  */
+/* offsets are known there, and a 'new T' anywhere later in the unit just  */
+/* passes its address, so there is no ordering problem and no fixpoint.    */
+/*                                                                         */
+/* Field kinds are the runtime's 'struct __c6_gc_field.kind':              */
+/*   STRONG '@T', WEAK 'weak @T', OWN 'own @T', EMBED a struct by value.   */
+
+static C6GcType *c6_gc_type_find(int tag)
+{
+    int i;
+
+    if (!tcc_state->c6_ext || tag <= 0)
+        return NULL;
+    for (i = 0; i < tcc_state->c6_nb_gc_types; i++)
+        if (tcc_state->c6_gc_types[i] && tcc_state->c6_gc_types[i]->tag == tag)
+            return tcc_state->c6_gc_types[i];
+    return NULL;
+}
+
+/* the element type of TYPE after peeling every array level, plus the number
+   of elements and the stride between two of them.  0 when TYPE cannot be
+   walked (flexible array member, variable length array, not an object). */
+static int c6_gc_elem(CType *type, CType *elem, int *count, int *stride)
+{
+    CType e = *type;
+    int n = 1, align = 0, size;
+
+    while ((e.t & VT_ARRAY) && e.ref) {
+        if (e.ref->c <= 0)
+            return 0;
+        n *= e.ref->c;
+        e = e.ref->type;
+    }
+    if (e.t & (VT_ARRAY | VT_VLA))
+        return 0;
+    size = type_size(&e, &align);
+    if (size <= 0)
+        return 0;
+    *elem = e;
+    *count = n;
+    *stride = size;
+    return 1;
+}
+
+/* 'static struct __c6_gc_desc __c6_gc_dN' plus its field table, as source.
+   The name carries the per-unit counter: a global one would collide between
+   translation units that both include the header. */
+static int c6_gc_emit_desc(C6GcType *gt)
+{
+    char name[64];
+    TokenString *ts;
+    int arr, desc, i;
+
+    snprintf(name, sizeof name, "__c6_gc_f%d", ++tcc_state->c6_gc_seq);
+    arr = tok_alloc_const(name);
+    snprintf(name, sizeof name, "__c6_gc_d%d", tcc_state->c6_gc_seq);
+    desc = tok_alloc_const(name);
+
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_STATIC);
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, tok_alloc_const("__c6_gc_field"));
+    tok_str_add(ts, arr);
+    tok_str_add(ts, '[');
+    tok_str_add(ts, ']');
+    tok_str_add(ts, '=');
+    tok_str_add(ts, '{');
+    for (i = 0; i < gt->nfields; i++) {
+        C6GcField *f = &gt->fields[i];
+        tok_str_add(ts, '{');
+        c6_async_add_int(ts, f->off);
+        tok_str_add(ts, ',');
+        c6_async_add_int(ts, f->kind);
+        tok_str_add(ts, ',');
+        c6_async_add_int(ts, f->count);
+        tok_str_add(ts, ',');
+        c6_async_add_int(ts, f->stride);
+        tok_str_add(ts, ',');
+        if (f->kind == C6_GCK_EMBED) {
+            C6GcType *sub = c6_gc_type_find(f->sub_tag);
+            if (!sub)
+                tcc_error("internal: no descriptor for the embedded struct");
+            tok_str_add(ts, '&');
+            tok_str_add(ts, sub->desc_tok);
+        } else {
+            c6_async_add_int(ts, 0);
+        }
+        tok_str_add(ts, '}');
+        tok_str_add(ts, ',');
+    }
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_STATIC);
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, tok_alloc_const("__c6_gc_desc"));
+    tok_str_add(ts, desc);
+    tok_str_add(ts, '=');
+    tok_str_add(ts, '{');
+    c6_async_add_int(ts, gt->size);
+    tok_str_add(ts, ',');
+    c6_async_add_int(ts, gt->align);
+    tok_str_add(ts, ',');
+    c6_async_add_int(ts, gt->nfields);
+    tok_str_add(ts, ',');
+    c6_async_add_int(ts, gt->has_weak ? C6_GCD_HAS_WEAK : 0);
+    tok_str_add(ts, ',');
+    c6_async_add_int(ts, 0);            /* drop() */
+    tok_str_add(ts, ',');
+    tok_str_add(ts, arr);
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+    return desc;
+}
+
+/* called where a struct definition is complete: record where its managed
+   references live and emit the descriptor */
+static void c6_gc_collect(CType *type, int is_union)
+{
+    Sym *s, *f;
+    C6GcType *gt;
+    C6GcField *fields = NULL;
+    int n = 0, cap = 0, tag, has_weak = 0;
+
+    if (!tcc_state->c6_ext || !type->ref)
+        return;
+    if ((type->t & VT_BTYPE) != VT_STRUCT && (type->t & VT_BTYPE) != VT_UNION)
+        return;
+    s = type->ref;
+    tag = s->v & ~SYM_STRUCT;
+    if (s->c < 0 || !s->next || c6_gc_type_find(tag))
+        return;                     /* incomplete, empty or already known */
+    for (f = s->next; f; f = f->next) {
+        CType elem;
+        int count = 0, stride = 0, kind = 0, sub = 0, gq;
+
+        if (f->type.t & VT_BITFIELD)
+            continue;
+        if (!c6_gc_elem(&f->type, &elem, &count, &stride)) {
+            /* a flexible array member hides how many elements there are */
+            if ((f->type.t & VT_ARRAY) && f->type.ref
+                && (c6_type_gq(&f->type.ref->type) & C6_GQ_MANAGED)) {
+                char b[160];
+                type_to_str(b, sizeof b, type, NULL);
+                tcc_error("'%s' has a flexible array of managed references: "
+                          "allocate it with 'new T[n]' instead", b);
+            }
+            continue;
+        }
+        gq = c6_type_gq(&elem);
+        if (gq & C6_GQ_MANAGED) {
+            if (gq & C6_GQ_WEAK)
+                kind = C6_GCK_WEAK, has_weak = 1;
+            else if (gq & C6_GQ_OWN)
+                kind = C6_GCK_OWN;
+            else
+                kind = C6_GCK_STRONG;
+        } else if ((elem.t & VT_BTYPE) == VT_STRUCT && elem.ref) {
+            C6GcType *sub_gt = c6_gc_type_find(elem.ref->v & ~SYM_STRUCT);
+            if (sub_gt) {
+                kind = C6_GCK_EMBED;
+                sub = sub_gt->tag;
+            }
+        }
+        if (!kind)
+            continue;
+        if (is_union) {
+            char b[160];
+            type_to_str(b, sizeof b, type, NULL);
+            tcc_error("'%s' is a union with a managed field: which member is "
+                      "alive cannot be known, use a struct", b);
+        }
+        if (n >= cap) {
+            cap = cap ? cap * 2 : 8;
+            fields = tcc_realloc(fields, cap * (int)sizeof *fields);
+        }
+        fields[n].off = f->c;
+        fields[n].kind = kind;
+        fields[n].count = count;
+        fields[n].stride = stride;
+        fields[n].sub_tag = sub;
+        n++;
+    }
+    if (!n) {
+        tcc_free(fields);
+        return;                     /* nothing managed: no descriptor at all */
+    }
+    if (local_scope != 0) {
+        char b[160];
+        type_to_str(b, sizeof b, type, NULL);
+        tcc_error("'%s' holds managed references and is defined in a block: "
+                  "define it at file scope", b);
+    }
+    gt = tcc_mallocz(sizeof *gt);
+    gt->tag = tag;
+    gt->nfields = n;
+    gt->fields = fields;
+    gt->size = s->c;
+    gt->align = s->r;
+    gt->has_weak = has_weak;
+    gt->src_file = tcc_strdup(file->filename);
+    gt->src_line = file->line_num;
+    dynarray_add(&tcc_state->c6_gc_types, &tcc_state->c6_nb_gc_types, gt);
+    gt->desc_tok = c6_gc_emit_desc(gt);
+}
+
+/* A struct that holds managed references cannot be copied: the copy would
+   duplicate the references and nothing would release them.  Such a struct
+   only lives in the heap, made by 'new'. */
+static void c6_gc_value_check(CType *type, const char *what)
+{
+    CType elem;
+    int count, stride;
+
+    if (!tcc_state->c6_ext)
+        return;
+    if (!c6_gc_elem(type, &elem, &count, &stride))
+        return;
+    if ((elem.t & VT_BTYPE) != VT_STRUCT || !elem.ref)
+        return;
+    if (c6_gc_type_find(elem.ref->v & ~SYM_STRUCT)) {
+        char buf[160];
+        type_to_str(buf, sizeof buf, &elem, NULL);
+        tcc_error("'%s' holds managed references: %s is not possible. "
+                  "Allocate it with 'new' and hold it in '@%s'",
+                  buf, what, buf);
+    }
+}
+
 /* true while a store into a managed slot is being handled */
 /* Rewrite 'slot = value' when SLOT is a managed reference.  The runtime has
    to increment the new value before it drops the old one, so a value that is
@@ -14158,11 +14416,21 @@ static int c6_gc_store_hook(void)
     const char *name;
     int mode, own, is_null;
 
-    if (!tcc_state->c6_ext)
+    if (!tcc_state->c6_ext || c6_gc_no_hook)
         return 0;
     dt = &vtop[-1].type;
-    if (!c6_is_managed(dt))
+    if (!c6_is_managed(dt)) {
+        /* a brand new reference has no other owner: storing it in a plain
+           pointer would leak the object (a borrowed one is a plain escape,
+           which the design allows) */
+        if (vtop->gc_state == C6_GC_FRESH) {
+            char b[160];
+            type_to_str(b, sizeof b, dt, NULL);
+            tcc_error("a new reference cannot be stored in '%s': it is not "
+                      "a managed reference (declare it as '@T')", b);
+        }
         return 0;
+    }
 
     is_null = (vtop->r & VT_VALMASK) == VT_CONST
         && !(vtop->r & (VT_LVAL | VT_SYM)) && vtop->c.i == 0;
@@ -14286,7 +14554,21 @@ static void c6_gc_new_expr(void)
     } else {
         vpushs(1);
     }
-    vpushs(0);                          /* the type descriptor (fields) */
+    {
+        /* the type descriptor: where the managed fields are, or a null
+           pointer when the type holds none */
+        C6GcType *gt = (type.t & VT_BTYPE) == VT_STRUCT && type.ref
+            ? c6_gc_type_find(type.ref->v & ~SYM_STRUCT) : NULL;
+        Sym *ds = gt ? sym_find(gt->desc_tok) : NULL;
+        if (ds) {
+            vpushsym(&ds->type, ds);
+            vtop->r |= VT_LVAL;         /* the descriptor as an lvalue ... */
+            gaddrof();                  /* ... and its address */
+            vtop->type = char_pointer_type;
+        } else {
+            vpushs(0);
+        }
+    }
     vpushs(flags);
     c6_rt_end("__c6_gc_new", 4);
     mk_pointer(&type);
@@ -14370,10 +14652,12 @@ static void c6_gc_arg_release(int has_value)
         size = type_size(&rt, &align);
         loc = (loc - size) & -align;
         off = loc;
+        c6_gc_no_hook = 1;
         vset(&vt, VT_LOCAL | VT_LVAL, off);
         vswap();
         vstore();
         vpop();
+        c6_gc_no_hook = 0;
     }
     for (i = c6_nb_gc_temps - 1; i >= mark; i--) {
         c6_gc_voidptr(&pt);
@@ -14399,8 +14683,18 @@ static void c6_gc_return_hook(void)
     CType rt = func_vt;
     SValue v;
 
-    if (!tcc_state->c6_ext || !c6_is_managed(&rt))
+    if (!tcc_state->c6_ext)
         return;
+    c6_gc_value_check(&rt, "a returned value");
+    if (!c6_is_managed(&rt)) {
+        if (vtop->gc_state == C6_GC_FRESH) {
+            char b[160];
+            type_to_str(b, sizeof b, &rt, NULL);
+            tcc_error("a new reference cannot be returned as '%s': the "
+                      "caller has no way to release it (return '@T')", b);
+        }
+        return;
+    }
     if (vtop->gc_state == C6_GC_FRESH)
         return;
     v = *vtop;
@@ -15504,6 +15798,8 @@ static int decl(int l)
                             type.t |= VT_EXTERN;
                         decl_initializer_alloc(&type, &ad, r, has_init, v, l);
 #ifdef C6_EXT
+                        if (tcc_state->c6_ext)
+                            c6_gc_value_check(&type, "a declared object");
                         if (l == VT_LOCAL && tcc_state->c6_ext
                             && !(type.t & (VT_STATIC | VT_ARRAY))
                             && c6_is_managed(&type)) {

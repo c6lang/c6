@@ -1060,6 +1060,12 @@ void __tcc_catch_fallthrough(void)
 #define C6_GC_INIT       16
 
 #define C6_GC_META_COUNT 0xffffffffffUL   /* low 40 bits: element count */
+
+/* field kinds, must match C6_GCK_* in tcc/tcc.h */
+#define C6_GCK_STRONG 1
+#define C6_GCK_WEAK   2
+#define C6_GCK_OWN    3
+#define C6_GCK_EMBED  4
 #define C6_GC_META_FLAGS(meta) ((int)((meta) >> 40))
 
 #define C6_GC_DRAIN_BUDGET 256  /* objects freed per release before returning */
@@ -1135,12 +1141,68 @@ static void c6_gc_inc(C6GcHdr *h)
 
 /* free one object: the fields first (the descriptor walk lives in the
    type-descriptor stage), then the payload */
+/* defined below: the field release runs inside the free path */
+static void c6_gc_drop(C6GcHdr *h);
+static void c6_gc_destroy(C6GcHdr *h);
+static void c6_gc_weak_unlink(void **slot, void *p);
+
+/* release one managed slot of a dying object */
+static void c6_gc_release_slot(void **slot, int kind)
+{
+    void *p = *slot;
+
+    if (!p)
+        return;
+    if (kind == C6_GCK_WEAK) {
+        /* the weak slot disappears with its owner: unregister it, the
+           target may well outlive it */
+        c6_gc_weak_unlink(slot, p);
+        *slot = 0;
+        return;
+    }
+    *slot = 0;
+    if (kind == C6_GCK_OWN)
+        c6_gc_destroy(c6_gc_hdr(p));
+    else
+        c6_gc_drop(c6_gc_hdr(p));
+}
+
+/* release every managed reference a block of elements holds.  Struct
+   nesting recurses (bounded by the type), arrays iterate. */
+static void c6_gc_release_block(char *base, const C6GcDesc *d)
+{
+    unsigned k;
+
+    if (!d)
+        return;
+    for (k = 0; k < d->nfields; k++) {
+        const C6GcField *f = &d->fields[k];
+        unsigned i;
+
+        for (i = 0; i < f->count; i++) {
+            char *p = base + f->off + (unsigned long)i * f->stride;
+            if (f->kind == C6_GCK_EMBED)
+                c6_gc_release_block(p, f->sub);
+            else
+                c6_gc_release_slot((void **)p, (int)f->kind);
+        }
+    }
+}
+
 static void c6_gc_free_one(C6GcHdr *h)
 {
     const C6GcDesc *d = h->desc;
 
-    if (d && d->drop)
-        d->drop(h + 1);
+    if (d) {
+        if (d->drop)
+            d->drop(h + 1);
+        if (d->nfields) {
+            unsigned long n = c6_gc_count(h), i;
+            for (i = 0; i < n; i++)
+                c6_gc_release_block((char *)(h + 1)
+                                    + i * (unsigned long)d->size, d);
+        }
+    }
     if (c6_gc_live_count)
         c6_gc_live_count--;
     free(h);

@@ -142,19 +142,29 @@ struct __c6_gc_desc {
 };
 ```
 
-命名 `<pkg>__c6_gc_d_<tag>`，与 `interface` 的 vtable 对象（`c6_emit_auto_impls()`，
-`tcc/tccgen.c:9575`）完全相同的发射方式：`TokenString` 拼声明 + `c6_decl_tokens()`
-（`tcc/tccgen.c:9271`）。发射顺序按“嵌入字段优先”拓扑排序。
+**落地方式（P2）**：命名 `__c6_gc_f<N>` / `__c6_gc_d<N>`，`N` 是每 TU 自增的
+计数器，两个对象都是 `static`。发射用 `TokenString` 拼声明 + `c6_decl_tokens()`
+（与 `interface` 的 vtable 同一手法，`c6_emit_auto_impls()`）。
 
-跨 TU 语义与 vtable 一致：先 `external_sym(..., VT_EXTERN)`（同 `tccgen.c:9565`），
-定义由定义该类型的 TU 发出。
+- **就地发射**：`struct_decl()` 一收完字段（`struct_layout()` 之后）就发描述符。
+  按值嵌入的结构体必须先完整定义才能当字段，被嵌入者的描述符一定已经发过，
+  所以**不需要拓扑排序**。
+- **每 TU 一份**：`static` 让同一头文件被多个 TU 包含时不撞名；描述符只被本 TU
+  的分配点（`new T`）和对象头（`hdr->desc`）用到，不需要跨 TU 协商定义。
+- 代价：同一类型在 N 个 TU 里各有一份描述符（每个字段 20 字节），换来的是
+  没有链接期的定义协商、也没有“谁来发”的规则。
 
 ### 3.3 描述符的收集点
 
-- `struct_decl()`（`tcc/tccgen.c:4867`）结束处收集字段；
+- `struct_decl()`（`tcc/tccgen.c`，`struct_layout()` 之后）调 `c6_gc_collect()`：
+  逐字段用 `c6_gc_elem()` 剥掉数组层（记下元素数与跨距），按限定符定
+  `kind`（STRONG/WEAK/OWN），嵌入结构体则定 EMBED 并记下子 tag；
 - union 含托管字段 → 报错（union 的活跃成员不可静态判定）；
-- 柔性数组成员 → 报错（`new T[n]` 才是数组的写法）；
-- 含托管字段的结构体禁止按值拷贝/按值传参/按值返回/进 tuple（§5）。
+- 柔性数组成员是托管引用 → 报错（`new T[n]` 才是数组的写法）；
+- 含托管字段的结构体在**块内**定义 → 报错（描述符是文件作用域的静态数据）；
+- 含托管字段的结构体禁止按值拷贝/按值传参/按值返回（§5）。
+
+没有托管字段的结构体**不发描述符**（`new T` 的第三个实参就是 0）。
 
 ### 3.4 `own` 的语义
 
@@ -270,6 +280,15 @@ void  __c6_gc_shutdown(void);                         /* atexit：释放全局�
 按值规则：含托管字段的结构体不能按值拷贝、按值传参、按值返回、进 tuple、
 存进 slice；`memcpy`/`memmove` 实参指向这类类型时（`TOK_memcpy` 是独立记号，
 `tcc/tcctok.h:224`）报错；`memset` 警告（会漏引用，不是 UAF）。
+
+**落地方式（P2）**：一张表 `c6_gc_value_check()`，四个检查点 ——
+`decl()` 里声明对象、`vstore()` 里 `VT_STRUCT` 赋值、`gfunc_param_typed()`
+里每个实参、`c6_gc_return_hook()` 里返回值。检查本身是“剥掉数组层后
+是不是含托管字段的结构体”，命中就报 E-GC5。tuple/slice/`memcpy` 三个点
+留给 P8 的统一审计。
+
+同一个函数还负责“新引用存进非托管槽”这个泄漏点（E-GC6d）：`struct T *p =
+new T;` 的 FRESH 值没有第二个所有者，存进普通指针就再也没人释放。
 
 ---
 
@@ -600,8 +619,11 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | E-GC2 | `weak` 出现在 async 函数 | error | `'weak' cannot be declared in an async function ...` |
 | E-GC3 | 保存借出的托管指针 | error | `storing a borrowed reference keeps it alive without counting` |
 | E-GC4 | FRESH 未消费 / 重复消费 | error | `a fresh reference must be stored exactly once` |
-| E-GC5 | 含托管字段的结构体按值拷贝/传参/返回 | error | `type '%s' holds managed references and cannot be copied by value` |
-| E-GC6 | union 含托管字段 | error | `a union cannot hold managed references` |
+| E-GC5 | 含托管字段的结构体按值声明/赋值/传参/返回 | error | `'%s' holds managed references: %s is not possible. Allocate it with 'new' and hold it in '@%s'`（`%s` = `a declared object`/`an assignment`/`a parameter`/`a returned value`） |
+| E-GC6 | union 含托管字段 | error | `'%s' is a union with a managed field: which member is alive cannot be known, use a struct` |
+| E-GC6b | 含托管字段的结构体在块内定义 | error | `'%s' holds managed references and is defined in a block: define it at file scope` |
+| E-GC6c | 柔性数组元素是托管引用 | error | `'%s' has a flexible array of managed references: allocate it with 'new T[n]' instead` |
+| E-GC6d | 新引用存进非托管槽 | error | `a new reference cannot be stored in '%s': it is not a managed reference (declare it as '@T')` |
 | E-GC7 | `memcpy`/`memmove` 作用于含引用的对象 | error | `... breaks reference counting; use a typed copy or 'own'` |
 | E-GC8 | 显式调用析构 `p->drop()` | error | `the destructor runs automatically when the last reference is released` |
 | E-GC9 | 析构里 `err`/`try`/`await`/`go` | error | `a destructor cannot fail or suspend` |

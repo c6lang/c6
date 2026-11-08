@@ -50,13 +50,14 @@ test "声明、NULL 初始化与比较" {
 }
 
 test "空值可以作形参、返回值与成员" {
-    Holder h = { NULL, NULL };
+    /* 含托管字段的结构体只能放在堆上（P2 的按值规则） */
+    @Holder h = new Holder;
 
     if (peek(NULL) != -1)
         err(1, "'@T' 作形参（空值）不对");
     if (give(NULL) != NULL)
         err(2, "'@T' 作返回值（空值）不对");
-    if (h.n != NULL || h.back != NULL)
+    if (h->n != NULL || h->back != NULL)
         err(3, "含托管字段的结构体零初始化不对");
     if (g_weak != NULL || g_shared != NULL || g_own != NULL)
         err(4, "文件作用域的托管引用没有零初始化");
