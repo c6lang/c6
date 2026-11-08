@@ -497,6 +497,7 @@ typedef struct C99CoTask {
     void *desc, *frame, *defer_arena, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
+    void *frame_addr;
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
     int waiting;                /* parked on wait_fd, waiting for select() */
@@ -629,6 +630,9 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int st
     if (size < 0 || size > C6_CO_FRAME_MAX)
         __c99_co_trap();
     t->frame_size = size;
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    t->frame_addr = base - size;
+#endif
     __c99_co_copy(co->frames[idx], base - size, size);
     t->frame = co->frames[idx];
     t->state = state;
@@ -667,6 +671,10 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_restore(void *self, char *base)
     int idx = __c99_co_index(co, t);
     int i, n = t->defer_cap;
 
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    if (t->frame_addr && t->frame_addr != base - t->frame_size)
+        __c99_co_trap();
+#endif
     __c99_co_copy(base - t->frame_size, co->frames[idx], t->frame_size);
     for (i = 0; i < n; i++)
         __c99_dstack(th)[t->defer_base + i] = co->parked[idx][i];
@@ -1024,6 +1032,7 @@ C99_RT_UNUSED __c99_rt_linkage int c6_io(int fd, int ev)
 #define C99_GC_DRAIN_BUDGET 256
 
 #define C99_GC_A_ACQ_REL 4
+#define C99_GC_A_ACQUIRE 2
 
 typedef struct C99GcWeak {
     void **slot;
@@ -1336,17 +1345,35 @@ C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_drop(void *p)
     return 0;
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_gc_weak_upgrade(void **dst,
-                                                          void **weak_slot)
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_weak_store(void **dst,
+                                                          void **weak_slot,
+                                                          int mode)
 {
     void *p = *weak_slot;
+    C99GcHdr *h;
 
     if (p) {
-        __c99_gc_inc(__c99_gc_hdr(p));
-        *dst = p;
-    } else {
-        *dst = 0;
+        h = __c99_gc_hdr(p);
+        if (__c99_gc_is_atomic(h)) {
+            unsigned long expected, desired;
+            for (;;) {
+                expected = h->rc;
+                if (expected & C99_GC_DEAD)
+                    break;
+                desired = expected + 1;
+                if (__atomic_compare_exchange(&h->rc, &expected, &desired, 0,
+                                              C99_GC_A_ACQ_REL,
+                                              C99_GC_A_ACQUIRE))
+                    goto owned;
+            }
+        } else if (!(h->rc & C99_GC_DEAD)) {
+            h->rc++;
+            goto owned;
+        }
+        p = 0;                      /* died while we looked at it */
     }
+owned:
+    return __c6_gc_store(dst, p, (mode & ~C99_GC_WEAK) | C99_GC_FRESH);
 }
 
 C99_RT_UNUSED __c99_rt_linkage unsigned long long __c6_gc_live(void)

@@ -1429,18 +1429,38 @@ void *__c6_gc_incref(void *p)
     return p;
 }
 
-/* read the weak slot WEAK_SLOT into DST, incrementing the count when the
-   object is still alive (the empty value otherwise) */
-void __c6_gc_weak_upgrade(void **dst, void **weak_slot)
+/* 'dst = weak_slot' for a counted DST: the object is only taken when it is
+   still alive.  Bumping the count and checking DEAD must be one step,
+   otherwise an upgrade could resurrect an object that is already on the free
+   queue ('weak' is exactly what a dying object has to invalidate). */
+void *__c6_gc_weak_store(void **dst, void **weak_slot, int mode)
 {
     void *p = *weak_slot;
+    C6GcHdr *h;
 
     if (p) {
-        c6_gc_inc(c6_gc_hdr(p));
-        *dst = p;
-    } else {
-        *dst = 0;
+        h = c6_gc_hdr(p);
+        if (c6_gc_is_atomic(h)) {
+            unsigned long expected, desired;
+            for (;;) {
+                expected = h->rc;
+                if (expected & C6_GC_DEAD)
+                    break;
+                desired = expected + 1;
+                if (__atomic_compare_exchange(&h->rc, &expected, &desired, 0,
+                                              C6_GC_A_ACQ_REL,
+                                              C6_GC_A_ACQUIRE))
+                    goto owned;
+            }
+        } else if (!(h->rc & C6_GC_DEAD)) {
+            h->rc++;
+            goto owned;
+        }
+        p = 0;                      /* died while we looked at it */
     }
+owned:
+    /* the reference we hold (or the empty value) replaces the old content */
+    return __c6_gc_store(dst, p, (mode & ~C6_GC_WEAK) | C6_GC_FRESH);
 }
 
 unsigned long long __c6_gc_live(void)
@@ -1553,6 +1573,7 @@ typedef struct TccCoTask {
     void *desc, *frame, *defer_arena, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
+    void *frame_addr;           /* where the frame was parked */
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
     int waiting;                /* parked on wait_fd, waiting for select() */
@@ -1686,6 +1707,9 @@ void __c6_co_suspend(void *self, int kind, int state,
     if (size < 0 || size > C6_CO_FRAME_MAX)
         tcc_co_trap();
     t->frame_size = size;
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    t->frame_addr = base - size;
+#endif
     tcc_co_copy(co->frames[idx], base - size, size);
     t->frame = co->frames[idx];
     t->state = state;
@@ -1724,6 +1748,23 @@ void __c6_co_restore(void *self, char *base)
     int idx = tcc_co_index(co, t);
     int i, n = t->defer_cap;
 
+    /* The saved frame holds absolute addresses (locals taken by '&', the
+       defer records' pointer to the frame), so it may only be put back
+       exactly where it came from.  A different address means the task was
+       resumed at another stack depth (or on another thread): the frame would
+       be written over whatever lives there, silently corrupting that
+       function's locals.  Fail loudly instead. */
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    /* A saved native frame holds absolute addresses (a local taken by '&',
+       a cleanup record pointing at the frame), so it may only be put back
+       where it came from; anywhere else it overwrites whatever lives there.
+       Measured: a 'co' body started inside one function and resumed from
+       __c6_co_run() *does* land elsewhere, so this cannot simply trap - the
+       fix is a per-task stack (P7).  Build the runtime with this defined to
+       look for a suspend point that moves a frame. */
+    if (t->frame_addr && t->frame_addr != base - t->frame_size)
+        tcc_co_trap();
+#endif
     tcc_co_copy(base - t->frame_size, co->frames[idx], t->frame_size);
     for (i = 0; i < n; i++)
         tcc_th_dstack(th)[t->defer_base + i] = co->parked[idx][i];

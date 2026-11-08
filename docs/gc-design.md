@@ -197,7 +197,7 @@ void *__c6_gc_own_store(void **slot, void *nv, int mode); /* own 字段/局部 *
 void  __c6_gc_release(void **slot, int mode);         /* 作用域退出：置 NULL 并释放 */
 void *__c6_gc_incref(void *p);                        /* 借出/转移时补一次计数 */
 void *__c6_gc_drop(void *p);                          /* 丢掉裸值，返回 NULL */
-void  __c6_gc_weak_upgrade(void **dst, void **weak_slot);
+void *__c6_gc_weak_store(void **dst, void **weak_slot, int mode); /* 升级 */
 unsigned long long __c6_gc_live(void);                /* 活对象数（测试用） */
 unsigned long long __c6_gc_refcount(void *p);         /* 测试用 */
 void  __c6_gc_drain_budget(int n);
@@ -421,8 +421,11 @@ error: reference cycle: struct A -> B -> A
 对策：
 
 1. **`weak` 局部禁止出现在 `async` 函数里（硬错误）** —— 见 §9.2；
-2. `__c6_co_restore()` 增加地址校验：`if (t->frame_addr && t->frame_addr != base) trap`，
-   把静默损坏变成响亮失败（同时验证这条假设在真实驱动路径下是否成立）；
+2. `__c6_co_restore()` 记录停放地址（`TccCoTask.frame_addr`），并提供一个
+   **可选**的地址校验（`-DC6_CO_CHECK_FRAME_ADDR`）：`frame_addr != base` 就 trap。
+   打开它跑现有用例立刻崩在「co 立刻跑到第一个 await 点」——`co` 在函数里起、
+   由 `main` 的 `__c6_co_run()` 轮转恢复，两次 `base` 不同。也就是说**帧今天
+   确实会被搬动**，所以不能默认 trap（会把能跑的用例打死），只能作为排查开关；
 3. 文档明确：`async` 体内不要保存帧内局部的地址跨过 `await`
    （Rust 用借用检查器解决，C 没有这个能力）；
 4. 长期方案（P7 之后再评估）：把帧放进任务、body 直接在池帧上跑

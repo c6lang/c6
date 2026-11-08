@@ -337,6 +337,9 @@ static int c6_type_gq(CType *type);
 static void c6_gc_plain(CType *type);
 /* nonzero while the initializer of a managed object is written */
 static int c6_gc_init_store;
+/* nonzero inside the body of an 'async' function: the native frame is moved
+   into the task, so a weak slot would point at the wrong stack */
+static int c6_async_in_body;
 /* nonzero while the compiler stores a managed value for its own bookkeeping
    (return slot, argument slot): those stores must not be rewritten */
 static int c6_gc_no_hook;
@@ -6227,6 +6230,16 @@ ST_FUNC void indir(void)
 {
 #ifdef C6_EXT
     c6_fallible_use();          /* '*f()' would drop the error */
+#endif
+#ifdef C6_EXT
+    if (tcc_state->c6_ext && (c6_type_gq(&vtop->type) & C6_GQ_WEAK)) {
+        /* the object may die between the load and the use: a weak reference
+           has to be upgraded to a counted one first */
+        char b[160];
+        type_to_str(b, sizeof b, &vtop->type, NULL);
+        tcc_error("cannot use a '%s' directly: upgrade it first "
+                  "('@T q = w;')", b);
+    }
 #endif
     if ((vtop->type.t & VT_BTYPE) != VT_PTR) {
         if ((vtop->type.t & VT_BTYPE) == VT_FUNC)
@@ -13570,10 +13583,22 @@ static void c6_async_call(Sym *s)
 static void c6_async_func_begin(void)
 {
     Sym *arg = sym_find(tok_alloc_const("__c6_arg"));
+    Sym *p;
     int j, skip;
 
     if (!arg)
         tcc_error("internal: async body has no frame argument");
+    /* the whole native frame of an async function is copied into the task and
+       restored at a possibly different address, so a weak slot (which is a
+       pointer to the slot itself) cannot be supported here */
+    c6_async_in_body = 1;
+    if (c6_type_gq(pointed_type(&c6_async_ftype)) & C6_GQ_WEAK)
+        tcc_error("a 'weak' reference cannot be returned by an async "
+                  "function: its frame is moved to the task");
+    for (p = c6_async_params(&c6_async_ftype); p; p = p->next)
+        if (c6_type_gq(&p->type) & C6_GQ_WEAK)
+            tcc_error("a 'weak' reference cannot be a parameter of an async "
+                      "function: its frame is moved to the task");
     c6_async_fr_off = arg->c;
     loc = (loc - PTR_SIZE) & -PTR_SIZE;
     c6_async_base_off = loc;
@@ -13626,6 +13651,7 @@ static void c6_async_func_end(void)
     C6AsyncSite *s;
     int st_off;
 
+    c6_async_in_body = 0;
     CODE_ON();
     if (c6_async_dispatch)
         gsym(c6_async_dispatch);
@@ -14143,6 +14169,9 @@ static void c6_gc_site(int off, CType *type)
 
     if (!defer_state.enabled || nocode_wanted || off >= 0)
         return;                     /* parameters are borrowed */
+    if ((c6_type_gq(type) & C6_GQ_WEAK) && c6_async_in_body)
+        tcc_error("a 'weak' reference cannot be declared in an async "
+                  "function: its frame is moved to the task");
     id = ++defer_state.next_site;
     l = c6_new_label("gcr");
     vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
@@ -14444,18 +14473,37 @@ static int c6_gc_store_hook(void)
                   "the empty value", b1, b2);
     }
     mode = c6_gc_mode(dt);
-    if ((c6_type_gq(&vtop->type) & C6_GQ_WEAK) && !(mode & C6_GCM_WEAK)) {
-        char b1[160], b2[160];
-        type_to_str(b1, sizeof b1, &vtop->type, NULL);
-        type_to_str(b2, sizeof b2, dt, NULL);
-        tcc_error("cannot assign a '%s' to '%s': a weak reference only "
-                  "observes, it must be upgraded to a counted one first",
-                  b1, b2);
-    }
     if (vtop->gc_state == C6_GC_FRESH)
         mode |= C6_GCM_FRESH;
     if (c6_gc_init_store)
         mode |= C6_GCM_INIT;
+    if ((c6_type_gq(&vtop->type) & C6_GQ_WEAK) && !(mode & C6_GCM_WEAK)) {
+        /* 'q = w' is the upgrade: an atomic try-incref out of the weak slot,
+           which replaces (and releases) the old content of DST */
+        if (!(vtop->r & VT_LVAL)) {
+            char b1[160], b2[160];
+            type_to_str(b1, sizeof b1, &vtop->type, NULL);
+            type_to_str(b2, sizeof b2, dt, NULL);
+            tcc_error("a '%s' can only be upgraded out of a slot, not from "
+                      "this expression (assign it to a 'weak @T' first)",
+                      b1, b2);
+        }
+        dst = vtop[-1];
+        val = *vtop;
+        vpop();
+        vpop();
+        c6_rt_begin("__c6_gc_weak_store");
+        vpushv(&dst);
+        gaddrof();                  /* the destination slot */
+        vpushv(&val);
+        gaddrof();                  /* the weak slot to read */
+        vpushi(mode);
+        c6_rt_end("__c6_gc_weak_store", 3);
+        vt = *dt;
+        vtop->type = vt;
+        vtop->gc_state = C6_GC_BORROW;
+        return 1;
+    }
     own = (mode & C6_GCM_OWN) != 0;
     if (own && !(mode & C6_GCM_FRESH) && !is_null) {
         char b[160];
@@ -14686,6 +14734,12 @@ static void c6_gc_return_hook(void)
     if (!tcc_state->c6_ext)
         return;
     c6_gc_value_check(&rt, "a returned value");
+    if (c6_type_gq(&rt) & C6_GQ_WEAK) {
+        /* a weak reference is a slot address: handing it back by value would
+           lose the registration and leak the count the caller gets */
+        tcc_error("a weak reference cannot be returned: upgrade it first "
+                  "('@T q = w;')");
+    }
     if (!c6_is_managed(&rt)) {
         if (vtop->gc_state == C6_GC_FRESH) {
             char b[160];

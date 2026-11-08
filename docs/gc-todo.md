@@ -28,7 +28,7 @@
 | P0 ✅ | 类型/限定符/描述符脚手架 | — | `parse_btype` 与 `@` 的冲突 |
 | P1 ✅ | `new` + 存储 + 内联释放 + `p = NULL` | P0 | 作用域退出点的完整性（goto/err） |
 | P2 ✅ | 描述符、字段释放、数组 `new T[n]` | P1 | 拓扑排序其实不需要 |
-| P3 | `weak`（含禁 async） | P2 | 弱槽失效顺序、restore 校验 |
+| P3 ✅ | `weak`（含禁 async） | P2 | 帧搬动只能探测，不能 trap |
 | P4 | 析构 `drop` 方法 | P3 | 重入、跨线程调用 |
 | P5 | `shared` + 跨帧/跨线程转移 | P2 | `go` 实参块与任务 slot 的 +1/−1 |
 | P6 | 静态环检测（硬错误）+ 链接期 | P2/P3 | `own` 语义、跨 TU 段 |
@@ -164,7 +164,7 @@
 
 ---
 
-## P3 `weak`
+## P3 `weak` ✅
 
 改动点：
 
@@ -186,6 +186,34 @@
 - `tests/errors/weak_deref.c`：直接解引用报错。
 
 验收：同 P1。
+
+### 落地状态（与计划的差异）
+
+- **不要全局锁**：升级路径没有用「弱槽注册表 + 全局自旋锁」，而是对**目标对象的
+  计数**做一次原子 CAS（`expected = rc; if (rc & DEAD) 放弃; CAS(rc, rc+1)`），
+  失败就得到空值。这样 `weak` 的热路径（读）与 `shared` 一样是单对象原子操作，
+  没有锁、没有跨线程争用；非原子对象走普通 `rc++`。设计 §11.3 的结论仍然成立。
+  顺带解决「升级复活一个正在死亡的对象」：`DEAD` 位在清空弱槽**之前**置上，
+  CAS 看到它就放弃。
+- **升级即一次存储**：`@T q = w;` 编成
+  `__c6_gc_weak_store(&q, &w, mode)`（一次调用完成 try-incref + 替换旧值 +
+  释放旧值）。原因：分两步（先 incref 到临时，再 store）需要一个帧槽，而
+  初始化表达式那条路径上没有可用的临时槽。
+- 计划里的 `__c6_gc_weak_upgrade(dst, slot)` 改名为 `__c6_gc_weak_store`，
+  返回新值，`tccpp.c` 预定义、`libtcc1.c`、`c99-rt.inc`、`c99-gen.c` 四处的
+  名字一起改。
+- 弱槽链表本身仍是**不设防**的（同线程内使用没有问题）：`shared` + 跨线程的
+  弱失效要等 P5 的并发用例，届时链表操作要么加 per-object 锁、要么走无锁插入。
+- `frame_addr` 校验做成**可选开关**（`-DC6_CO_CHECK_FRAME_ADDR`），因为实测
+  现有 `co` 用例就会在不同地址恢复（见设计 §9.1）——它把静默损坏变成响亮失败，
+  但只有排查时才打开。
+
+- 顺带堵掉的两个洞：`return w;`（弱引用按值返回会丢注册、并把调用者拿到的那
+  一次计数漏掉）→ 硬错误；`async` 函数的 `weak` 返回类型同理。
+
+**结果**：`tests/weak.c` 6 个 `test` 块全过（原生 + C99 后端），
+`tests/errors/async_weak.c` 3 条诊断全中，`tests/errors/gc.c` 12 条，
+`make selftest` 43/43、`BACKEND=c99 tests/run-tests.sh` 44/44、`make test-plain` 绿。
 
 ---
 
