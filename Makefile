@@ -98,10 +98,13 @@ c99test: build
 # c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿
 # -std=c6 编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99
 # 后端的翻译路径）；编出来的编译器还要能跑。
+# 翻译出来的 C 还要交给宿主编译器编译一遍：c6 模式下输出文件自带运行时
+# 前导（里面 include 了宿主的头文件），声明块里的原型必须不能和它们冲突。
 c6selfcheck: build
 	@mkdir -p $(SELFHOST_C6)
 	$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/selfcheck.o
 	$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c
+	$(HOSTCC) -std=c99 -c -o $(SELFHOST_C6)/selfcheck-c99.o $(SELFHOST_C6)/selfcheck.c
 	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C6)/selfcheck $(SELFHOST_C6)/selfcheck.o $(SELFHOST_LIBS)
 	$(SELFHOST_C6)/selfcheck -v
 
