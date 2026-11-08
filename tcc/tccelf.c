@@ -3298,6 +3298,15 @@ static int c6_graph_dfs(TCCState *s1, unsigned node, int depth,
         tcc_error_noabort("reference cycle across translation units: %s; "
                           "break it with 'weak' or 'own'", buf);
         s1->nb_errors++;
+        /* close the loop off so the same cycle is not reported again from
+           another entry point; the walk continues for the rest */
+        for (i = 0; i < depth; i++) {
+            int k;
+
+            for (k = 0; k < nn; k++)
+                if (nodes[k] == path[i] && state[k] == 1)
+                    state[k] = 2;
+        }
         return 1;
     }
     state[idx] = 1;
@@ -3305,11 +3314,11 @@ static int c6_graph_dfs(TCCState *s1, unsigned node, int depth,
     for (i = 0; i < ne; i++) {
         if (e[i].from != node)
             continue;
-        if (c6_graph_dfs(s1, e[i].to, depth + 1, e, ne, path, nodes, state,
-                         nn, names, nnames))
-            return 1;
+        c6_graph_dfs(s1, e[i].to, depth + 1, e, ne, path, nodes, state, nn,
+                     names, nnames);
     }
-    state[idx] = 2;
+    if (state[idx] == 1)
+        state[idx] = 2;
     return 0;
 }
 
@@ -3354,9 +3363,9 @@ ST_FUNC void c6_gc_graph_check(TCCState *s1)
     state = tcc_mallocz(nn * sizeof *state);
     path = tcc_mallocz((nn + 1) * sizeof *path);
     for (i = 0; i < nn; i++)
-        if (c6_graph_dfs(s1, nodes[i], 0, e, ne, path, nodes, state, nn,
-                         names, nnames))
-            break;                  /* tcc_error() does not return */
+        if (state[i] != 2)
+            c6_graph_dfs(s1, nodes[i], 0, e, ne, path, nodes, state, nn,
+                         names, nnames);
     tcc_free(path);
     tcc_free(state);
     tcc_free(nodes);

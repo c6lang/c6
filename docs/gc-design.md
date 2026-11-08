@@ -433,8 +433,9 @@ error: reference cycle across translation units: A -> B -> A; break it with 'wea
 ```
 
 **落地（P6）**：单 TU 的 DFS 在 `c6_gc_flush_descs()` 里跑（`tcc/tccgen.c`），
-`mark` 三色（0 未访问 / 1 在栈上 / 2 完成），命中回边就用 `tcc_error` 报出
-一条环并终止 —— 只报第一条（`tcc_error_noabort` 列全部的写法没做，见 §17）。
+`mark` 三色（0 未访问 / 1 在栈上 / 2 完成），命中回边用 `tcc_error_noabort`
+报出来，然后把环上的节点标成完成再继续走 —— 所以**互不相交的环会一次列全**，
+最后再用 `tcc_error` 汇总终止（链接期那一侧同样处理）。
 实际文案带字段名与类型的定义位置：
 
 ```
@@ -777,6 +778,5 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 
 1. **链接期跨 TU 环检测只在原生后端**（§8.2 第 2 条、§15）：`-c99` 输出 C
    源码，没有段也没有链接期，跨 TU 环在那边仍然看不到；
-2. **只报第一条环**：`tcc_error_noabort` 列全部的写法没做，第一个环就终止；
-3. **`struct Node c6_graph` 豁免**（§8.4 / D2）没做：共享边的通用图目前只能
-   写成 `own` 树或 `weak` 边。
+2. **`struct Node c6_graph` 豁免**（§8.4 / D2）没做：共享边的通用图目前只能
+   写成 `own` 树或 `weak` 边 —— 这是语言取舍，真要做得连运行期环回收一起想。

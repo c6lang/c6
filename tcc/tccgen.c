@@ -14755,8 +14755,16 @@ static int c6_gc_cycle_dfs(C6GcType *gt, int depth)
     if (gt->mark == 2)
         return 0;
     if (gt->mark == 1) {
-        /* back edge: the path from GT to itself */
+        /* back edge: the path from GT to itself.  Report it, then mark every
+           node on the loop done so the same cycle is not reported again from
+           another entry point -- the compiler lists every disjoint cycle in
+           one go and stops at the end */
+        int i;
+
         c6_gc_cycle_report(gt->tag, depth);
+        for (i = 0; i < depth; i++)
+            if (c6_gc_cycle_path[i] && c6_gc_cycle_path[i]->mark == 1)
+                c6_gc_cycle_path[i]->mark = 2;
         return 1;
     }
     if (depth >= C6_GC_PATH_MAX) {
@@ -14776,12 +14784,14 @@ static int c6_gc_cycle_dfs(C6GcType *gt, int depth)
         if (!to || !to->nfields)
             continue;
         c6_gc_cycle_via[depth] = f->name_tok;
-        if (c6_gc_cycle_dfs(to, depth + 1))
-            return 1;
+        c6_gc_cycle_dfs(to, depth + 1);
     }
-    gt->mark = 2;
+    if (gt->mark == 1)
+        gt->mark = 2;
     return 0;
 }
+
+static int c6_gc_cycles;          /* how many were reported so far */
 
 /* 'reference cycle: A -> B -> A; break it with 'weak' or 'own'' */
 static void c6_gc_cycle_report(int from, int depth)
@@ -14810,9 +14820,11 @@ static void c6_gc_cycle_report(int from, int depth)
     {
         C6GcType *gt = c6_gc_cycle_path[start];
 
-        tcc_error("reference cycle: %s; break it with 'weak' or 'own' "
-                  "(type '%s' at %s:%d)", buf, get_tok_str(gt->tag, NULL),
-                  gt->src_file ? gt->src_file : "?", gt->src_line);
+        tcc_error_noabort("reference cycle: %s; break it with 'weak' or "
+                          "'own' (type '%s' at %s:%d)", buf,
+                          get_tok_str(gt->tag, NULL),
+                          gt->src_file ? gt->src_file : "?", gt->src_line);
+        c6_gc_cycles++;
     }
 }
 
@@ -14908,6 +14920,9 @@ static void c6_gc_cycle_check(void)
         if (gt && gt->nfields && gt->mark != 2)
             c6_gc_cycle_dfs(gt, 0);
     }
+    if (c6_gc_cycles)
+        tcc_error("%d reference cycle(s): counting cannot free them", 
+                  c6_gc_cycles);
 }
 
 /* emit the descriptors of the unit: once the parser has seen every struct,
