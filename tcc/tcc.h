@@ -1605,7 +1605,8 @@ ST_FUNC int expr_const(void);
 #if defined CONFIG_TCC_BCHECK || defined TCC_TARGET_C67
 ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsigned long size);
 #endif
-#if defined TCC_TARGET_X86_64 && !defined TCC_TARGET_PE
+#if defined TCC_TARGET_X86_64 && !defined TCC_TARGET_PE \
+    || defined TCC_TARGET_C99
 ST_FUNC int classify_x86_64_va_arg(CType *ty);
 #endif
 #ifdef CONFIG_TCC_BCHECK

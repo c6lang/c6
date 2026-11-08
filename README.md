@@ -902,6 +902,17 @@ make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭
 make test-all      # selftest + tests2
 ```
 
+自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：
+
+```sh
+make selfhost      # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
+make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
+```
+
+两条路线都会把两次编译得到的目标文件 `cmp` 一遍（bootstrap fixpoint），
+再用最终的 stage2/stage3 编译并运行一个小程序：只有目标文件逐字节相同、
+编出来的编译器真能编程序，自举才算通过。
+
 > 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
 > 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。
 
@@ -994,7 +1005,9 @@ that `__c99_init()` patches from the relocation table at start-up.
 Plain C programs work: integers, floats, pointers, arrays and string literals;
 locals and globals; `if`/`while`/`for`/`do`/`switch`; recursion and direct and
 indirect calls; static functions; `?:`, bit operations, shifts and all type
-casts; structs, unions and functions returning structs.
+casts; structs, unions and functions returning structs; variadic function
+definitions (`va_start`/`va_arg`/`va_end`, and passing the `va_list` on to a
+host function such as `vsnprintf`), with the x86-64 SysV `va_list` layout.
 
 c6 programs work too.  A c6 translation unit (`-std=c6`) carries a portable C
 implementation of the defer/error/slice/coroutine/thread runtime, appended to
@@ -1025,7 +1038,25 @@ that is consistent between c6 translation units, and for structs larger than
 16 bytes it also matches the native ABI, but mixing 9--16 byte struct returns
 with plain C is not supported.
 
-Not supported (each gives a clear error instead of miscompiling): defining
-variadic functions, computed goto, and variable length arrays.  On non-POSIX
-hosts the generated runtime still compiles, but `async`/`go`/`c6_io` need a
-platform port.
+Not supported (each gives a clear error instead of miscompiling): computed
+goto and variable length arrays.  On non-POSIX hosts the generated runtime
+still compiles, but `async`/`go`/`c6_io` need a platform port.
+
+### Self-hosting through the C back-end
+
+`make c99selfhost` is the end-to-end proof that the generated C is a working
+compiler, not just working code:
+
+    tcc/tcc -B tcc -DONE_SOURCE=1 -DC6_EXT -c99 -o build/selfhost/c99/tcc-c99.c tcc/tcc.c
+    cc -std=c99 -o build/selfhost/c99/tcc-stage2 build/selfhost/c99/tcc-c99.c -lm -ldl -lpthread
+    build/selfhost/c99/tcc-stage2 -B tcc -DONE_SOURCE=1 -DC6_EXT -c tcc/tcc.c -o stage3.o
+    build/selfhost/c99/tcc-stage2 -B tcc -o tcc-stage3 stage3.o -lm -ldl -lpthread
+    build/selfhost/c99/tcc-stage3 -B tcc -DONE_SOURCE=1 -DC6_EXT -c tcc/tcc.c -o stage4.o
+    cmp stage3.o stage4.o                    # bootstrap fixpoint
+
+`stage2` is the whole compiler (its own x86-64 back-end, linker and driver)
+built by the host C compiler from tcc's C output; `stage3` is built by
+`stage2` from the original sources, and the objects `stage2` and `stage3`
+produce are byte identical.  `make selfhost` does the same round trip without
+the C detour (`tcc` -> `stage1` -> `stage2`, objects compared) and is the
+quick check that the c6 back-end still compiles its own sources.

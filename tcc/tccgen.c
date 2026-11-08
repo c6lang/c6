@@ -3555,7 +3555,11 @@ op_err:
         gv(RC_TYPE(vtop->type.t));
 }
 
-#if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 || defined TCC_TARGET_ARM
+/* Targets whose gen_cvt_itof handles 'unsigned long long' directly need no
+   helper call.  The C99 back-end is one of them: it emits a plain C cast,
+   while __floatundixf does not even exist in x86-64 libgcc. */
+#if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 \
+    || defined TCC_TARGET_ARM || defined TCC_TARGET_C99
 #define gen_cvt_itof1 gen_cvt_itof
 #else
 /* generic itof for unsigned long long case */
@@ -6787,7 +6791,7 @@ ST_FUNC void unary(void)
 	vstore();
         break;
 #endif
-#ifdef TCC_TARGET_X86_64
+#if defined TCC_TARGET_X86_64 || defined TCC_TARGET_C99
 #ifdef TCC_TARGET_PE
     case TOK_builtin_va_start:
 	parse_builtin_params(0, "ee");
@@ -6802,6 +6806,9 @@ ST_FUNC void unary(void)
 	vstore();
         break;
 #else
+    /* The x86-64 va_arg is a macro over __va_arg(), and this builtin supplies
+       its argument class.  The C99 back-end targets the same ABI, so it needs
+       the same classification. */
     case TOK_builtin_va_arg_types:
 	parse_builtin_params(0, "t");
 	vpushi(classify_x86_64_va_arg(&vtop->type));

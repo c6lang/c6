@@ -22,6 +22,8 @@ const char *platform_macros[] = {
     "__NetBSD__",           "TARGETOS_NetBSD",
     "__linux__",            "TARGETOS_Linux",
     "__ANDROID__",          "TARGETOS_ANDROID",
+    /* not a host macro: the C99 back-end targets the same ABI as x86-64 */
+    "__c99__",              "TCC_TARGET_C99",
 
     "__SIZEOF_POINTER__",   "PTR_SIZE",
     "__SIZEOF_LONG__",      "LONG_SIZE",
