@@ -410,6 +410,12 @@ int area(struct Rect *r)   { return r->w * r->h; }       /* Rect_area */
 弱别名只指向本 TU 里第一个取到该名字的方法，真有歧义时链接器挑一个（手写的
 强定义优先），所以同时用到两个同名方法时应写 `p->f()`。
 
+别名只在普通名确实属于这个方法时才发。普通名已经被别的函数占着（同名的普通
+函数定义，或 libc 头里的声明如 `getpid`）时只输出 `<T>_f`：`p->getpid()` 照旧
+可用，`getpid()` 仍然是原来的函数——`c6_method_alias` 用
+`is_compatible_types()` 比对两份函数类型，避免把 `getpid()` 的调用点改指到
+方法上。
+
 不改名的情形：`static` / `inline` 函数（函数体在 TU 末尾或本文件内生成，
 挂不上别名）、`__` 开头的名字（编译器和 libtcc1 自己用的）、系统头文件里的
 声明（`p->fflush()`、`p->gettimeofday()` 必须仍然调 libc），以及匿名结构体的
@@ -599,7 +605,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/test-block.c` | `test` 块、`-test`、`-test-filter` |
 | `tests/macro.c` | `#macro` 与卫生的 `__local` |
 | `tests/package.c` | `package` / `import` / `pkg.member`、多级包名、跨 TU |
-| `tests/method.c` | 结构体方法、不同类型的同名方法、libc 方法（`p->fflush()`）与 `T!error` 方法 |
+| `tests/method.c` | 结构体方法、不同类型的同名方法、libc 方法（`p->fflush()`）、与方法或 libc 同名的普通函数不被顶掉，以及 `T!error` 方法 |
 | `tests/interface.c` | 接口、vtable、隐式/显式转换、跨 TU |
 | `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
 | `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`typeof`/`_Generic`/`_Alignof`、接口方法签名、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
@@ -673,6 +679,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   本 TU 里第一个取到该名字的方法，有歧义时写 `p->area()`。`static` / `inline`、
   `__` 开头的名字、系统头文件里的声明、匿名结构体的方法和 `package` 内的
   方法保留原名，因此两个 `static` 或匿名结构体的同名方法仍然要靠包/改名区分；
+  普通名已经被别的函数占用（同名普通函数、libc 声明）时不发别名，这样的方法
+  只能写 `p->f()` 调用；
 - 纯 C 翻译单元里定义的方法没有改名符号，c6 一侧只能用 `f(p)` 调用它，
   写 `p->f()` 会在链接时缺 `T_f`；
 - `interface` 的一致性检查发生在第一次结构体→接口转换点，因此方法也要在转换点

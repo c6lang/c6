@@ -5,6 +5,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 void __tcc_err_clear(void);
 
@@ -40,6 +41,17 @@ struct Circle { int r; };
 struct Rect { int w, h; };
 int area(struct Circle *c) { return 3 * c->r * c->r; }
 int area(struct Rect *r) { return r->w * r->h; }
+
+/* 与方法同名的普通函数不受影响：方法叫 Box_plain_area，普通名 plain_area
+   已经属于这个普通函数，不会被方法抢走 */
+int plain_area(void) { return 7; }
+struct Box { int w, h; };
+int plain_area(struct Box *b) { return b->w * b->h; }
+
+/* 与 libc 里的声明同名的方法（unistd.h 只声明、没定义）：源码名 getpid
+   属于 libc，不能被方法抢走，普通调用必须还是 libc 的 getpid */
+struct Pid { int v; };
+int getpid(struct Pid *p) { (void)p; return 4242; }
 
 /* 方法里的 __func__ 显示源码里写的名字，不是 mangled 符号 */
 const char *vec_name(struct Vec *v) { (void)v; return __func__; }
@@ -85,6 +97,22 @@ test "不同结构体可以用同名方法（不需要 package）" {
         err(1, "Circle 的 area 不对");
     if ((&r)->area() != 6)
         err(2, "Rect 的 area 不对");
+}
+
+test "和方法同名的普通函数不会被方法顶掉" {
+    struct Box b = { 3, 4 };
+    if (plain_area() != 7)
+        err(1, "普通调用 plain_area() 被方法抢走了");
+    if ((&b)->plain_area() != 12)
+        err(2, "方法调用 (&b)->plain_area() 不对");
+}
+
+test "和 libc 声明同名的方法不抢 libc 的名字" {
+    struct Pid p = { 0 };
+    if ((&p)->getpid() != 4242)
+        err(1, "方法 getpid 不对");
+    if (getpid() == 4242)
+        err(2, "普通调用 getpid() 被方法抢走了");
 }
 
 test "同名方法按接收者区分，可以跨翻译单元" {
