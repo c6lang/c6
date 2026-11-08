@@ -836,22 +836,27 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 ### 11.9 C99 输出后端（`-c99`）
 
 新增 `tcc/c99-gen.c` + `tcc/c99-link.c`：复用全部前端（含 c6 语法），
-把代码生成到 C99 文本而不是机器码。构建用仓库根目录的 `make c99`
-（会自动配置 `tcc/`；直接 `make -C tcc c99-tcc` 也行，但要求 `tcc/`
-已用当前 `configure` 配置过），
-使用 `c99-tcc -o out.c prog.c`，产物用系统 C 编译器编译即可。
-`c99-tcc` 只有这一个代码生成器，所以不给动作时默认就产出 C 源码
-（输出名默认 `a.c`），`-c99` 可以省略；`-c` 表示“每个翻译单元一个输出
-文件”，`-test` 直接生成带测试入口的 C 源码。`-o` 指向已存在的目录（或
-以路径分隔符结尾）时按 TU 生成 `<dir>/<输入名>.c`：
-`c99-tcc -c -o out/ a.c b.c` 得到 `out/a.c`、`out/b.c`。输出名会覆盖输入
-文件时直接报错，`-shared`/`-r`/`-run` 这类要求机器码/链接/执行的动作在
-编译前也直接报错，不会写出空的目标文件。驱动为每个 TU 重放一次自己时，
+把代码生成到 C99 文本而不是机器码。它不再是独立编译器，而是并进普通的
+`tcc/tcc`：`tcc/Makefile` 把 `tcc.c` 以 `-DTCC_TARGET_C99` 单源再编一份
+`tcc-c99.o`，再用
+`objcopy --redefine-sym main=c99_main --keep-global-symbol=c99_main`
+把其余全局符号本地化，然后链进 `tcc`；`tcc.c` 的 `wants_c99_output()` 在
+解析命令行前决定是否转给 `c99_main()`：`-c99` 显式选择，或者 `-o` 以 `.c`
+结尾 / 指向已存在目录（或以路径分隔符结尾）时自动选择；`-E`、`-shared`、
+`-r`、`-run` 仍走原生路径。C 输出模式下 `-c` 表示“每个翻译单元一个 .c”，
+`-test` 生成带测试入口的 C 源码；`-o <dir>` 按 TU 生成
+`<dir>/<输入名>.c`，例如 `tcc -c -o out/ a.c b.c` 得到 `out/a.c`、
+`out/b.c`。输出名会覆盖输入文件时直接报错，`-shared`/`-r`/`-run` 在 C 模式
+下也直接报错，不会写出空的目标文件。驱动为每个 TU 重放一次自己时，
 `c99-gen.c` 的静态生成器状态在 `tcc_new()` 里由 `c99_reset()` 清空，
 否则第二个 TU 会继承上一个 TU 的函数体和声明。`c99-link.c` 里的兜底报错
 发生在 `tcc_output_file()` 里，即 `tcc_compile()` 已经离开全局状态之后，
 所以报错前要先 `tcc_enter_state()`，否则 `error1()` 会解引用空的
 `tcc_state` 而崩溃。
+
+（两个编译器各自持有静态状态，不能只按 `TCC_TARGET_*` 在运行时切换：
+`tccgen.c` 的寄存器组、返回寄存器、参数求值顺序等都在编译期由 target 宏
+决定，所以嵌入的是同一份源码按两个 target 编出的两份代码。）
 
 寄存器 -> `__c99_r[8]` 联合体数组；栈帧 -> `__c99_frm.f` 字节数组（用 tcc
 自己的局部变量偏移寻址，因此不需要给局部变量取名字）；比较 -> `__c99_cnd`；
@@ -867,12 +872,12 @@ GCC/Clang 下运行时符号是 weak 的，多个 TU 共用同一份状态，没
 
 端到端回归直接复用 selftest 的整套用例：`BACKEND=c99 ./tests/run-tests.sh`
 （即 `make c99test`）把 `tests/*.c`、`tests/errors/*.c`、`tests/exit/*.c`、
-`tests/abi/*.c` 和 `tests/c99/*.c` 都先用 `c99-tcc` 生成 C 源码，再用
+`tests/abi/*.c` 和 `tests/c99/*.c` 都先用同一个 `tcc/tcc`（`-o ...c`）生成
+C 源码，再用
 `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread` 编译并运行，断言与
 native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 C 输出后端
-才不同的诊断用 `// EXPECT-C99` 声明）。`make selftest` 先构建 `c99-tcc`，
-再用 native 编译器跑同一套用例（`tests/c99/c99test.c` 用一份源码覆盖普通 C
-和 c6 的全部特性）。
+才不同的诊断用 `// EXPECT-C99` 声明）。`make selftest` 用同一个 `tcc/tcc`
+跑同一套用例（`tests/c99/c99test.c` 用一份源码覆盖普通 C 和 c6 的全部特性）。
 
 限制（均显式报错，不会静默错编译）：变参函数**定义**、computed goto、
 VLA；非 POSIX 主机上运行时可编译，但 `async`/`go`/`c6_io` 需要移植。

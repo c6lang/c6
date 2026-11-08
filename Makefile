@@ -7,7 +7,7 @@
 #   make test        跑 tests2 上游全量测试（扩展模式）
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量
-#   make c99         构建 C99 输出后端 tcc/c99-tcc（产出可移植 C 源码）
+#   make c99         C99 输出后端已内置在 tcc/tcc（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
 #   make clean       清理 tcc/ 的构建产物
 #   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
@@ -67,18 +67,18 @@ test-plain: build-plain
 #   tests/errors/*.c   编译期诊断，见 tests/run-tests.sh
 #   tests/c99/*.c      C99 输出后端：先生成 C 源码，再用 gcc 编译运行
 selftest: build
-	$(MAKE) c99
 	./$(SELFTEST)
 
 test-all: selftest test
 
-# C99 输出后端：单源构建的 tcc/c99-tcc（自带 -DC6_EXT），只产出 C 源码。
-c99: bootstrap
-	$(MAKE) -C $(TCC_DIR) c99-tcc
+# C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
+# -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
+c99: build
+	@echo "c99: C99 输出已内置在 $(TCC_DIR)/tcc，无需单独构建"
 
 # C99 输出后端的端到端测试：与 selftest 相同的测试用例，但每个源文件先
-# 由 c99-tcc 生成 C 源码，再由系统 gcc 编译运行。
-c99test: c99
+# 由同一个 tcc 生成 C 源码，再由系统 gcc 编译运行。
+c99test: build
 	BACKEND=c99 ./$(SELFTEST)
 
 clean:

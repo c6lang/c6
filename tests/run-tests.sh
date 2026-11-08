@@ -9,10 +9,10 @@
 # 环境变量：
 #   TCC       编译器路径（默认 <仓库>/tcc/tcc）
 #   TCCFLAGS  追加给编译器的参数
-#   BACKEND   native（默认）用 tcc/tcc 直接编译运行；c99 先用
-#             tcc/c99-tcc 生成 C 源码（-c99 可省略），再用系统 C 编译器编译运行。
+#   BACKEND   native（默认）用 tcc/tcc 直接编译运行；c99 让同一个 tcc
+#             用 -o *.c / -o <目录> 生成 C 源码，再用系统 C 编译器编译运行。
 #             两种模式跑完全相同的测试文件和断言。
-#   C99TCC    C99 后端编译器（默认 <仓库>/tcc/c99-tcc）
+#   C99TCC    产出 C 源码的编译器（默认 <仓库>/tcc/tcc）
 #   C99CC     编译生成代码的系统 C 编译器（默认 gcc）
 #
 # 测试分组：
@@ -28,7 +28,7 @@
 #   tests/abi/*.c     ABI 兼容；每个文件用 -std=c6 编译，同名的 _plain.c 用
 #                     纯 C（不带 -std=c6）编译，两个目标文件链接后运行，
 #                     比对 `// EXIT <n>` 声明的退出码。
-#   tests/c99/*.c     C99 输出后端；每个文件先用 tcc/c99-tcc 生成 C
+#   tests/c99/*.c     C99 输出后端；每个文件先用 tcc/tcc 生成 C
 #                     源码，再用 gcc -std=c99 编译并运行，比对
 #                     `// EXIT <n>`（默认 0）；带 `// OUTPUT <文本>` 时
 #                     还要求 stdout 含该文本。
@@ -39,7 +39,7 @@ TCC=${TCC:-$ROOT/tcc/tcc}
 TCCFLAGS=${TCCFLAGS:-}
 BASE="-B $ROOT/tcc -std=c6"
 BACKEND=${BACKEND:-native}
-C99TCC=${C99TCC:-$ROOT/tcc/c99-tcc}
+C99TCC=${C99TCC:-$ROOT/tcc/tcc}
 C99CC=${C99CC:-gcc}
 C99FLAGS="-std=c99 -pedantic -Wall -Wextra -Werror -pthread"
 
@@ -58,7 +58,7 @@ if [ "$BACKEND" = native ] && [ ! -x "$TCC" ]; then
 fi
 if [ "$BACKEND" = c99 ]; then
     if [ ! -x "$C99TCC" ]; then
-        echo "run-tests: 找不到 $C99TCC，先执行 'make c99'" >&2
+        echo "run-tests: 找不到 $C99TCC，先执行 'make build'" >&2
         exit 1
     fi
     if ! command -v "$C99CC" >/dev/null 2>&1; then
@@ -90,7 +90,7 @@ note_pass() {
 }
 
 # 用当前后端把源文件编成可执行文件，成功返回 0。
-# c99 模式一次调用可以带多个源文件：c99-tcc 把它们合成为一个 C 文件，
+# c99 模式一次调用可以带多个源文件：tcc 把它们合成为一个 C 文件，
 # 这样多翻译单元的程序仍然只有一个合成的 main / 一份测试入口。
 build_exe() { # <可执行文件> <源文件>...
     exe=$1
@@ -349,7 +349,7 @@ for src in "$ROOT"/tests/c99/*.c; do
     is_wanted "$name" || continue
 
     if [ ! -x "$C99TCC" ]; then
-        fail "$name" "找不到 $C99TCC（先执行 make c99）"
+        fail "$name" "找不到 $C99TCC（先执行 make build）"
         continue
     fi
     if ! command -v "$C99CC" >/dev/null 2>&1; then
@@ -364,7 +364,7 @@ for src in "$ROOT"/tests/c99/*.c; do
     csrc="$TMP/c99-$base.c"
     if ! $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS -o "$csrc" "$src" \
             2>"$TMP/err" >/dev/null; then
-        fail "$name" "c99-tcc 生成 C 失败:$(cat "$TMP/err")"
+        fail "$name" "生成 C 失败:$(cat "$TMP/err")"
         continue
     fi
     if ! $C99CC $C99FLAGS -o "$TMP/c99-$base.bin" "$csrc" \
@@ -400,14 +400,14 @@ EOF
     if ! $C99TCC -B "$ROOT/tcc" -o "$d/out" "$d/main.c" "$d/part.c" \
             2>"$TMP/err" >/dev/null; then
         ok=no
-        detail="c99-tcc -o <dir> 失败:$(cat "$TMP/err")"
+        detail="tcc -o <dir> 失败:$(cat "$TMP/err")"
     elif [ ! -f "$d/out/main.c" ] || [ ! -f "$d/out/part.c" ]; then
         ok=no
         detail="-o <dir> 没有为每个 TU 生成 .c"
     elif ! $C99TCC -B "$ROOT/tcc" -c -o "$d/out" "$d/main.c" "$d/part.c" \
             2>"$TMP/err" >/dev/null; then
         ok=no
-        detail="c99-tcc -c -o <dir> 失败:$(cat "$TMP/err")"
+        detail="tcc -c -o <dir> 失败:$(cat "$TMP/err")"
     elif ! $C99CC $C99FLAGS -o "$d/bin" "$d/out/main.c" "$d/out/part.c" \
             2>"$TMP/err" >/dev/null; then
         ok=no

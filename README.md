@@ -938,22 +938,25 @@ make test-all      # selftest + tests2
 TCC 源码及本仓库对它的修改均遵循 **LGPL-2.1**（见 `tcc/COPYING`）。
 上游基线固定在 `2d3eea2`（`origin/mob`）。
 
-## C99 output back-end (`-c99`)
+## C99 output back-end (`-c99`, `-o *.c`, `-o <dir>`)
 
-`tcc/c99-gen.c` is a new code-generator back-end: it reuses the complete
-front-end and writes **portable C99 source** instead of machine code.
+`tcc/c99-gen.c` is a second code-generator back-end: it reuses the complete
+front-end and writes **portable C99 source** instead of machine code.  It is
+built into the normal `tcc/tcc` binary; there is no separate compiler.
 
-    make c99                                 # builds tcc/c99-tcc (configures tcc/ if needed)
-    tcc/c99-tcc -B tcc -o out.c prog.c       # prog.c -> out.c
+    make build                               # one tcc, both back-ends
+    tcc/tcc -B tcc -o out.c prog.c           # prog.c -> out.c (.c suffix selects C)
+    tcc/tcc -B tcc -c99 -o out.c prog.c      # same, explicit
     cc -std=c99 -o prog out.c && ./prog      # compile the result with any C compiler
 
-    tcc/c99-tcc -B tcc -c -o out/ a.c b.c    # out/a.c, out/b.c (one .c per TU)
+    tcc/tcc -B tcc -c -o out/ a.c b.c        # out/a.c, out/b.c (one .c per TU)
 
-    make c99test                             # same cases as selftest, via the C99 back-end
+    make c99test                             # same cases as selftest, via the C back-end
 
 `make c99test` runs the same corpus as `make selftest`: every `tests/*.c`,
 `tests/errors/*.c`, `tests/exit/*.c`, `tests/abi/*.c` and `tests/c99/*.c`
-case goes through `tcc/c99-tcc` to C source, then through
+case goes through the same `tcc/tcc` (asked for C source with `-o ...c`) and
+then through
 `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread`, with the same
 exit-code, output and diagnostic assertions.  Diagnostics that only differ
 because they are produced by the C-output back-end are declared with
@@ -964,20 +967,23 @@ because they are produced by the C-output back-end are declared with
 listed below in one program.
 
 `-c99` selects the output back-end; it is not a language-standard flag, and
-the language being compiled stays C.  The `c99-tcc` build has no machine-code
-generator, so C source is the default action and `-c99` never has to be
-spelled out (it stays accepted for existing scripts).  A plain
-`tcc/c99-tcc -B tcc -o out.c prog.c` already writes C source (default file
-name `a.c`); `-c` means "one generated C file per translation unit", and
-`-test` writes the generated test-runner file.  `-o` may name an existing
-directory (or end with `/`): every input translation unit then gets its own
-`<dir>/<input>.c`, so `-c -o out/ a.c b.c` produces `out/a.c` and `out/b.c`
-without any `-c99`.  Asking for a machine-code/link action (`-shared`, `-r`
-or `-run`) is still an error instead of empty output, and an output file that
-would overwrite one of its own inputs is refused.  `-B tcc` is required so
-that the tool finds tcc's own `include/`.  The multiarch system include
-directory is added from `CONFIG_TRIPLET` in `config.h`; if your host's
+the language being compiled stays C.  The native binary contains both
+generators: the C one is selected by `-c99`, or automatically when `-o` names
+a `.c` file or an existing directory (or a path ending in `/`).  So
+`tcc/tcc -B tcc -o out.c prog.c` writes C source; with `-c99` and no `-o`
+the output defaults to `a.c`.  `-c` means "one generated C file per
+translation unit", and `-test` together with a `.c` output writes the
+generated test-runner file.  `-o <dir>` gives every input translation unit its
+own `<dir>/<input>.c`, so `-c -o out/ a.c b.c` produces `out/a.c` and
+`out/b.c` without any `-c99`.  Preprocessing (`-E`) and linking actions
+(`-shared`, `-r`, `-run`) keep their native meaning; asking the C back-end for
+a machine-code/link action is an error instead of empty output, and an output
+file that would overwrite one of its own inputs is refused.  `-B tcc` is
+required so that the tool finds tcc's own `include/`.  The multiarch system
+include directory is added from `CONFIG_TRIPLET` in `config.h`; if your host's
 triplet is not detected, add `-I/usr/include/$(cc -print-multiarch)` by hand.
+`make build` needs `objcopy` (binutils; `llvm-objcopy` works too) to localize
+the embedded compiler's symbols.
 
 The generated file only needs `memcpy`/`memmove`/`memset` from `<string.h>`:
 the vstack registers become a `union` array `__c99_r[8]`, the stack frame is
@@ -1001,7 +1007,7 @@ TU.  Features covered by `tests/*.c` include `defer`/`errdefer`, `err`,
 `try`/`catch`, slices, `foreach`, tuples, methods/interfaces, `typename`,
 `async`/`await`, `co`, `go` and `test` blocks:
 
-    tcc/c99-tcc -std=c6 -B tcc -o out.c prog.c
+    tcc/tcc -std=c6 -B tcc -o out.c prog.c
     cc -std=c99 -pedantic -Wall -Wextra -Werror -o prog out.c
     ./prog
 

@@ -20,6 +20,8 @@ LIBTCC = libtcc.a
 LIBTCC1 = libtcc1.a
 LINK_LIBTCC =
 LIBS =
+# used to hide the embedded C99 compiler's symbols from the native one
+OBJCOPY ?= $(or $(shell command -v objcopy 2>/dev/null),$(shell command -v llvm-objcopy 2>/dev/null))
 CFLAGS += $(CPPFLAGS)
 VPATH = $(TOPSRC)
 -LTCC = $(TOP)/$(LIBTCC)
@@ -240,6 +242,8 @@ $(CROSS_TARGET)-tcc.o : DEFINES += -DONE_SOURCE=0
 endif
 # native tcc always made from tcc.o and libtcc.[so|a]
 tcc.o : DEFINES += -DONE_SOURCE=0
+# the native tcc also carries the embedded C99 output back-end
+tcc.o : DEFINES += -DCONFIG_EMBED_C99
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -269,7 +273,7 @@ $(X)tcc.o : tcctools.c
 $(X)tcc.o : DEFINES += $(DEF_GITHASH)
 
 # Host Tiny C Compiler
-tcc$(EXESUF): tcc.o $(LIBTCC)
+tcc$(EXESUF): tcc.o $(LIBTCC) tcc-c99-p.o
 	$S$(CC) -o $@ $^ $(addsuffix ,$(LIBS) $(LDFLAGS) $(LINK_LIBTCC))
 
 # Cross Tiny C Compilers
@@ -539,12 +543,15 @@ help:
 endif # ($(INCLUDED),no)
 
 # --------------------------------------------------------------------------
-# The C99 back-end is a native-only tool: it is built as a single-source
-# binary and needs no libtcc1.a (it emits C, it does not link).
+# The C99 output back-end is part of the native tcc: the same binary emits
+# machine code normally and C source for -c99 / -o FILE.c / -o DIRECTORY.
+# c99-gen.c is a complete second code generator, so it is compiled as its own
+# single-source object; only its entry point stays global and the native
+# driver dispatches to it before parsing the command line.
 ifeq ($(INCLUDED),no)
 # c99-rt_.h turns the runtime source into C string literals, so that c99-gen.c
-# can append it to the generated file (the compiler is one self-contained
-# binary and carries no data directory of its own).
+# can append it to every generated file (the compiler carries no data
+# directory of its own).
 c99-rt_.h: c99-rt.inc
 	awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "    \"%s\\n\"\n", $$0 }' $< > $@
 
@@ -552,14 +559,27 @@ c99-rt_.h: c99-rt.inc
 # config.h from before TCC_TARGET_C99 existed silently selects the native
 # back-end instead, which fails deep inside tcc.h with unrelated errors;
 # point at the real cause.
-c99-tcc$(EXESUF): $(CORE_FILES) c99-gen.c c99-link.c c99-rt_.h $(TCCDEFS_H)
+tcc-c99.o: $(CORE_FILES) c99-gen.c c99-link.c c99-rt_.h $(TCCDEFS_H)
 	@if ! grep -q TCC_TARGET_C99 config.h 2>/dev/null; then \
 	    echo "c99: config.h 不认识 TCC_TARGET_C99（配置由旧版 configure 生成）" >&2; \
-	    echo "c99: 请先运行 ./configure，或在仓库根目录运行 make c99" >&2; \
+	    echo "c99: 请先运行 ./configure" >&2; \
 	    exit 1; \
 	fi
-	$(CC) -DONE_SOURCE=1 -DTCC_TARGET_C99 -DC6_EXT -I. -O2 -o $@ tcc.c -lm -ldl
+	$(CC) -o $@ -DONE_SOURCE=1 -DTCC_TARGET_C99 -DC6_EXT $(DEFINES) $(CFLAGS) -c tcc.c
 
-.PHONY: c99
-c99: c99-tcc$(EXESUF)
+# The embedded compiler exports its own libtcc API and helper names.  Rename
+# its main() and localize every other global symbol: the two compilers then
+# share one binary and each keeps its own state.
+tcc-c99-p.o: tcc-c99.o
+	@test -n "$(OBJCOPY)" || { \
+	    echo "c99: 找不到 objcopy/llvm-objcopy，无法把 C99 后端并进 tcc" >&2; \
+	    exit 1; }
+	cp $< $@
+	$(OBJCOPY) --redefine-sym main=c99_main --keep-global-symbol=c99_main $@
+
+# Compatibility: there is no separate C99 compiler any more.  Without this
+# explicit rule the generic cross-compiler pattern would build one from the
+# c99 target definition.
+c99-tcc$(EXESUF): tcc$(EXESUF)
+	@:
 endif
