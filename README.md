@@ -454,11 +454,12 @@ int a[n];                 ->  不用改（VLA 豁免）
   大缓冲区补初始化器会让可执行文件变大；迁移大型静态表时要留意这一点。
 
 TCC 自己的源码也遵守这条规则（`make c6selfcheck` 会检查），因此拿
-`-std=c6` 编 tcc 自己不会撞上这条诊断：
+`-std=c6` 编 tcc 自己不会撞上这条诊断；带 `-DC6_EXT` 也一样，`#ifdef
+C6_EXT` 里的扩展实现同样补了初始化器：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -c tcc/tcc.c -o tcc.o     # 原生目标文件
-./tcc/tcc -B tcc -std=c6 -o tcc.c.c tcc/tcc.c      # C99 后端的输出
+./tcc/tcc -B tcc -std=c6 -DC6_EXT -c tcc/tcc.c -o tcc.o   # 原生目标文件
+./tcc/tcc -B tcc -std=c6 -DC6_EXT -o tcc.c.c tcc/tcc.c    # C99 后端的输出
 ```
 
 为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type`……）改成了
@@ -927,8 +928,9 @@ make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2
 编出来的编译器真能编程序，自举才算通过。
 
 `make c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
-的源码也要满足它，所以整份源码都用 `-std=c6` 编译一遍（原生目标文件 +
-C99 后端产物），再把编出来的编译器连起来跑 `-v`。
+的源码也要满足它，所以整份源码都用 `-std=c6 -DC6_EXT` 编译一遍（原生目标
+文件 + C99 后端产物；带 `C6_EXT` 才会把扩展实现那半边也纳入检查），再把
+编出来的编译器连起来跑 `-v`。两步编译都不许有诊断输出，出现警告即失败。
 
 > 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
 > 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。
