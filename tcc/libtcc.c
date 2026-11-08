@@ -918,6 +918,12 @@ LIBTCCAPI TCCState *tcc_new(void)
 #ifdef CONFIG_TCC_SWITCHES /* predefined options */
     tcc_set_options(s, CONFIG_TCC_SWITCHES);
 #endif
+#ifdef TCC_TARGET_C99
+    /* the C99 generator keeps its state in file-static variables: a new
+       state starts a new translation unit (the driver replays itself once
+       per input file for -c / -o <dir>) */
+    c99_reset();
+#endif
     return s;
 }
 
@@ -1993,15 +1999,26 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             x = TCC_OUTPUT_C99;
             goto set_output_type;
         case TCC_OPTION_c:
+#ifdef TCC_TARGET_C99
+            /* this build can only emit C source: -c means "one output file
+               per translation unit", not "one object file" */
+            s->c99_compile_only = 1;
+            x = TCC_OUTPUT_C99;
+#else
             x = TCC_OUTPUT_OBJ;
+#endif
         set_output_type:
-            /* '-test' already selects TCC_OUTPUT_MEMORY, so the usual
-               '-run' afterwards is not worth a warning; the C99 back-end
-               overrides it with '-c99' to write a generated test runner */
+            /* '-test' already selects the test runner (the C99 back-end
+               then selects its C output), so a following '-c99' is not
+               worth a warning; likewise '-c' is the same action as '-c99'
+               in the C99-only build */
             if (s->output_type
 #ifdef C6_EXT
                 && !(s->c6_test_mode
                      && (x == TCC_OUTPUT_MEMORY || x == TCC_OUTPUT_C99))
+#endif
+#ifdef TCC_TARGET_C99
+                && x != s->output_type
 #endif
                 )
                 tcc_warning("-%s: overriding compiler action already specified", popt->name);
@@ -2079,10 +2096,15 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
 #endif
 #ifdef C6_EXT
         case TCC_OPTION_test:
-            /* run the 'test' blocks instead of main(); the C99 back-end
-               turns this into a generated test runner */
+            /* run the 'test' blocks instead of main().  The native build
+               does that by executing the program; the C99 back-end writes a
+               C file with a generated test runner instead. */
             s->c6_test_mode = 1;
+#ifdef TCC_TARGET_C99
+            x = TCC_OUTPUT_C99;
+#else
             x = TCC_OUTPUT_MEMORY;
+#endif
             goto set_output_type;
         case TCC_OPTION_test_filter:
             if (*optarg == '=')

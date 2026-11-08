@@ -5,12 +5,12 @@
  *   make c99test
  * 或分步手工跑：
  *   ./tcc/tcc -B tcc -std=c6 -test tests/c99/c99test.c
- *   ./tcc/c99-tcc -c99 -std=c6 -B tcc -o /tmp/c99test.c tests/c99/c99test.c
+ *   ./tcc/c99-tcc -std=c6 -B tcc -o /tmp/c99test.c tests/c99/c99test.c
  *   gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread \
  *       -o /tmp/c99test /tmp/c99test.c
  *   /tmp/c99test
  *
- * 这里刻意混用普通 C 与 c6 特性，覆盖 README 里 -c99 承诺的范围：
+ * 这里刻意混用普通 C 与 c6 特性，覆盖 README 里 C99 后端承诺的范围：
  * 整数/浮点/指针/数组/字符串、控制流、函数指针与递归、结构体按值返回、
  * defer/errdefer/err/try/catch、切片/foreach、元组、方法/接口/裸 tag、
  * async/await 与 go 的运行时。
