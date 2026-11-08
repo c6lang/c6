@@ -240,7 +240,8 @@ interface Drawable {
 
 struct Circle { int r; };
 
-/* 这两个函数就是实现：不改名、不改调用约定 */
+/* 这两个函数就是实现：调用约定不变，符号是 Circle_draw / Circle_area
+   （源码名额外发一个弱别名，见 6.4） */
 void draw(Circle *self) { /* ... */ }
 int  area(Circle *self) { return 3 * self->r * self->r; }
 
@@ -393,11 +394,31 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 
 ### 6.4 结构体方法
 
-`ret f(struct T *self, ...)` 在文件作用域注册为 `T` 的方法，符号名不变；
-`p->f(a)` 被改写成 `f(p, a)`（接收者先存临时槽，返回结构体时排在 sret 缓冲之后）。
-字段优先，方法须先于调用点声明，`duplicate method` 检查按 (类型, 源码名) 做，
-因此同名方法服务不同类型时要放进不同包。方法表与包 mangle 正交：包内定义的方法
-仍然用源码里写的名字注册，所以 `import` 后可直接 `p->f()`。
+`ret f(struct T *self, ...)` 在文件作用域注册为 `T` 的方法，符号名是
+`<T>_f`；`p->f(a)` 被改写成 `T_f(p, a)`（接收者先存临时槽，返回结构体时排在
+sret 缓冲之后）。源码里写的 `f` 另外输出成一个**弱别名**，所以普通调用
+`f(p, a)`、手写 C 和纯 C 翻译单元照旧能链接，而不同结构体可以用同名方法而
+不必放进不同包：
+
+```c
+struct Circle { int r; };
+struct Rect { int w, h; };
+int area(struct Circle *c) { return 3 * c->r * c->r; }   /* Circle_area */
+int area(struct Rect *r)   { return r->w * r->h; }       /* Rect_area */
+```
+
+弱别名只指向本 TU 里第一个取到该名字的方法，真有歧义时链接器挑一个（手写的
+强定义优先），所以同时用到两个同名方法时应写 `p->f()`。
+
+不改名的情形：`static` / `inline` 函数（函数体在 TU 末尾或本文件内生成，
+挂不上别名）、`__` 开头的名字（编译器和 libtcc1 自己用的）、系统头文件里的
+声明（`p->fflush()`、`p->gettimeofday()` 必须仍然调 libc），以及匿名结构体的
+方法（匿名 tag 的编号是每个 TU 各一份）。包内声明的方法保持 `pkg__name`，
+包已经起了区分作用，`import` 后照样 `p->f()`。
+
+字段优先，方法须先于调用点声明，`duplicate method` 检查按 (类型, 源码名) 做
+（一个类型仍然只能有一个同名方法）。方法表与包 mangle 正交：包内定义的方法
+仍然用源码里写的名字注册。
 
 
 ## 7. 卫生宏：`#macro` + `__local`（修复 G8）
@@ -456,7 +477,7 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 | `test` | PASS/FAIL 报告、过滤 | 空 test 报 PASS、`err` 报 FAIL | 与用户 `main` 共存 |
 | `interface` | 结构体自动实现、多接口、调用/赋值/强转 | 缺方法/签名不符/方法晚于转换点 | 同一类型跨 TU、每 TU 一份 vtable |
 | 包管理 | 单文件导入、`pkg.member`、多级包 | 未导入使用、未知成员 | 跨 TU 链接、与老 C 代码互操作 |
-| 结构体方法 | `p->f()`、方法调方法、sret、`T!error` 方法 | 不带调用、重复方法、只有 `->` | 跨 TU、与 `impl` 无关的普通函数调用 |
+| 结构体方法 | `p->f()`、方法调方法、sret、`T!error` 方法、不同类型的同名方法（不靠包）、系统头里的 libc 方法 | 不带调用、重复方法、只有 `->` | 纯 C 定义的方法被 `->` 调用、普通调用名有歧义时的弱别名 |
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
 | 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
 | 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、局部 tag 的切片、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、`typeof`/`_Generic`/`_Alignof`、接口方法签名、跨 TU |
@@ -502,9 +523,9 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 2b `T!error` / `try` / `catch` | ✅ | `c6_parse_fallible_suffix` / `c6_apply_fallible`（`FuncAttr.func_fallible`）、`c6_try_parse`（`unary()` 前缀分支）、`c6_catch_parse`（`expr_catch()` 层）、`c6_emit_propagate`（与 `err` 共用清理+哨兵路径）、`__tcc_error_take` / `__tcc_err_flag_peek` |
 | 3 `test` / `-test` / `-test-filter` | ✅ | `c6_test_parse`、`tccrun.c:tcc_run_tests`、`libtcc.c` 选项 |
 | 4 `package`/`import`/`pkg.member` | ✅ | `c6_package_parse` / `c6_import_parse`、`c6_pkg_name` / `c6_pkg_compose` / `c6_pkg_imported`、`c6_mangle_tok`（`NAME__sym`）、`unary()` 里的逐段点号解析与 `sym_find_raw` |
-| 4b 结构体方法 | ✅ | `decl()` 里 `c6_method_register`、`c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`、`unary()` 的 `->` 分支、`c6_self_*` 隐藏接收者（sret 之后） |
+| 4b 结构体方法 | ✅ | `decl()` 里 `c6_method_register`、`c6_method_symbol`（符号名 `<Tag>_<name>`，`static`/`inline`/`__` 开头/系统头/匿名 tag/包内方法不改名）、`c6_method_plain_decl` + `c6_method_alias`（源码名发布成弱别名，定义处用 `put_extern_sym2` 打上同一地址）、`c6_method_source_name`（`__func__` 显示源码名）、`c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`、`unary()` 的 `->` 分支、`c6_self_*` 隐藏接收者（sret 之后）；`BufferedFile.sys_header`（`tccpp.c` 按 include 路径标记系统头） |
 | 5 `interface` | ✅ | `c6_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`c6_auto_impl_ensure` / `c6_check_method`（惰性校验）、`c6_emit_auto_impls`（TU 末尾生成 `static` vtable）、`c6_iface_call_prep`（调用点改写）、`c6_iface_convert`（隐式/显式转换） |
-| 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；`c6_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
+| 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；方法符号按接收者取名，所以同名方法跨 TU 也不需要包；`c6_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_c6_macro` / `c6_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
@@ -521,10 +542,10 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - **绑定在前**（`foreach |i, v| a`）而不是 Go 风格的 `for a |i, v|`：`for`
   必须保持纯 C，而 `|` 本来是按位或的记号；把绑定表放在可迭代对象前面，
   表达式中间就不必再猜“这个 `|` 是绑定表的开始还是按位或”；
-- **不做运行期迭代协议**（P1）：方法名不按接收者改名，`len`/`at`/`has`
-  会和用户函数撞名（同名方法只能靠 `package` 分开），而 `void *next()`
-  会擦掉元素类型，每轮都得装箱/分配。可迭代对象限定为数组、切片、区间，
-  其它类型走“暴露切片成员”，语义完全静态；
+- **不做运行期迭代协议**（P1）：方法符号虽然已经按接收者改名（§6.4），
+  `has`/`len`/`at` 不再和用户函数撞名，但 `void *next()` 会擦掉元素类型，
+  每轮都得装箱/分配；可迭代对象限定为数组、切片和区间，其它类型走
+  “暴露切片成员”，语义完全静态；
 - **`lo:hi` 而不是 `0..n`**（P14）：`0..3` 在词法阶段是两个浮点常量
   （`0.`、`.3`），为它改词法会波及现有代码；`:` 在表达式里本来只出现在
   三目运算符里，而可迭代对象按 `conditional-expression` 解析，三目的
@@ -578,7 +599,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/test-block.c` | `test` 块、`-test`、`-test-filter` |
 | `tests/macro.c` | `#macro` 与卫生的 `__local` |
 | `tests/package.c` | `package` / `import` / `pkg.member`、多级包名、跨 TU |
-| `tests/method.c` | 结构体方法与 `T!error` 方法 |
+| `tests/method.c` | 结构体方法、不同类型的同名方法、libc 方法（`p->fflush()`）与 `T!error` 方法 |
 | `tests/interface.c` | 接口、vtable、隐式/显式转换、跨 TU |
 | `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
 | `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`typeof`/`_Generic`/`_Alignof`、接口方法签名、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
@@ -591,6 +612,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/tuple_thread.c` | 元组穿过 `go`（按值拷贝）、线程里的元组调用 |
 | `tests/errors/tuple.c` | 元组的全部编译期诊断（元素类型、下标、解构形态、`return {…}`） |
 | `tests/abi/tuple.c` + `tests/abi/tuple_plain.c` | 元组与等价 struct 的 ABI 互通（两个 TU 分别用 `-std=c6` 和纯 C 编译后链接） |
+| `tests/abi/method.c` + `tests/abi/method_plain.c` | 方法改名的 ABI 互通：纯 C 一侧按原名调用 c6 方法（弱别名）、c6 一侧普通调用纯 C 函数 |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
 | `tests/errors/*.c` | 编译期诊断，见下 |
 
@@ -646,8 +668,13 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   去掉外层括号即可；
 - 结构体方法必须在调用点之前声明或定义（单趟编译约束）；只支持 `->`，
   `v.f()` 按普通成员访问处理，同名字段优先于方法；
-- 方法名共享 C 的全局命名空间：同一类型不能有两个同名方法，不同类型要用同名方法
-  时必须放进不同 `package`；
+- 方法符号是 `<结构体>_<方法>`，源码名是弱别名：同一个类型仍然只能有一个
+  同名方法，不同类型的同名方法可以直接共存；`area(p)` 这种普通调用只指向
+  本 TU 里第一个取到该名字的方法，有歧义时写 `p->area()`。`static` / `inline`、
+  `__` 开头的名字、系统头文件里的声明、匿名结构体的方法和 `package` 内的
+  方法保留原名，因此两个 `static` 或匿名结构体的同名方法仍然要靠包/改名区分；
+- 纯 C 翻译单元里定义的方法没有改名符号，c6 一侧只能用 `f(p)` 调用它，
+  写 `p->f()` 会在链接时缺 `T_f`；
 - `interface` 的一致性检查发生在第一次结构体→接口转换点，因此方法也要在转换点
   之前可见；文件作用域的接口初始化器不支持（没有运行时代码可生成），接口→接口
   是普通拷贝；

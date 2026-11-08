@@ -1443,8 +1443,14 @@ static int parse_include(TCCState *s1, int do_next, int test)
                    (int)(s1->include_stack_ptr - s1->include_stack), "", buf);
             return 1;
         }
-        if (tcc_open(s1, buf) >= 0)
+        if (tcc_open(s1, buf) >= 0) {
+#ifdef C6_EXT
+            /* c6: methods declared in a system header keep their plain C
+               symbol (so that 'p->fflush()' and friends still link) */
+            file->sys_header = (i >= 2 && i - 2 >= s1->nb_include_paths);
+#endif
             break;
+        }
     }
 
     if (test) {

@@ -8087,6 +8087,125 @@ static const char *c6_tag_name(int tag)
     return get_tok_str(tag, NULL);
 }
 
+/* '<tag>_<name>': the C symbol a method is emitted under, so that two
+   structures can use the same method name without separate packages.
+   Returns 0 when the declaration is not a method, or when it must keep its
+   plain C name:
+     - 'static' / 'inline' functions: their body is emitted later (or stays
+       file local), so no plain alias can be attached to it;
+     - names starting with '__': those belong to the compiler / libtcc1;
+     - declarations made while a system header is being parsed: 'p->fflush()'
+       has to keep calling libc's fflush;
+     - methods of anonymous structs: their tag number is per translation
+       unit, so it cannot name a symbol shared between TUs. */
+static int c6_method_symbol(int name, CType *type)
+{
+    int tag;
+    const char *tn, *mn;
+    char buf[160];
+
+    if (!tcc_state || !tcc_state->c6_ext || !type->ref)
+        return 0;
+#ifdef TCC_TARGET_C99
+    /* the C output backend cannot express the plain-name alias */
+    return 0;
+#endif
+    if ((type->t & VT_BTYPE) != VT_FUNC)
+        return 0;
+    if (type->t & (VT_STATIC | VT_INLINE))
+        return 0;
+    if (type->ref->f.func_type == FUNC_OLD || type->ref->f.func_async)
+        return 0;
+    if (!type->ref->next)
+        return 0;
+    tag = c6_ptr_tag(&type->ref->next->type);
+    if (!tag || tag >= SYM_FIRST_ANOM)
+        return 0;
+    if (file->sys_header)
+        return 0;
+    mn = get_tok_str(name, NULL);
+    if (mn[0] == '_' && mn[1] == '_')
+        return 0;
+    tn = get_tok_str(tag, NULL);
+    if (strlen(tn) + strlen(mn) + 2 > sizeof buf)
+        return 0;
+    snprintf(buf, sizeof buf, "%s_%s", tn, mn);
+    return tok_alloc_const(buf);
+}
+
+/* the name a method was written with in the source, for '__func__' */
+static const char *c6_method_source_name(int sym_tok)
+{
+    C6Method *m;
+
+    if (!tcc_state || !tcc_state->c6_ext)
+        return NULL;
+    for (m = c6_methods; m; m = m->next)
+        if (m->sym_tok == sym_tok)
+            return get_tok_str(m->name, NULL);
+    return NULL;
+}
+
+/* external_sym() without the 'import' fallback: the plain name of a method
+   must not be resolved to an imported 'pkg__name' */
+static Sym *c6_external_sym_raw(int v, CType *type, int r, AttributeDef *ad)
+{
+    Sym *s = sym_find_raw(v);
+
+    if (!s) {
+        s = global_identifier_push(v, type->t, 0);
+        s->r |= r;
+        s->a = ad->a;
+        s->asm_label = ad->asm_label;
+        s->type.ref = type->ref;
+    } else {
+        patch_storage(s, ad, type);
+    }
+    return s;
+}
+
+/* keep plain 'f(p)' working: declare the source name too.  The definition
+   turns it into an alias of the mangled symbol, see c6_method_alias() */
+static void c6_method_plain_decl(int name, CType *type, AttributeDef *ad)
+{
+    CType t = *type;
+    AttributeDef a = *ad;
+
+    if (!tcc_state->c6_ext || sym_find_raw(name))
+        return;                 /* already declared under the plain name */
+    t.t = (t.t | VT_EXTERN) & ~(VT_STATIC | VT_INLINE);
+    a.asm_label = 0;
+    a.alias_target = 0;
+    c6_external_sym_raw(name, &t, 0, &a);
+}
+
+/* emit the source name as an alias of the mangled method symbol, so that
+   plain calls, hand written C and non-c6 TUs keep linking against it.
+   The alias is weak: when two structures really do share a method name the
+   plain name cannot denote both, and a real (strong) C definition of that
+   name, if any, has to win. */
+static void c6_method_alias(int name, Sym *msym)
+{
+    Sym *ps = sym_find_raw(name);
+    ElfSym *es;
+
+    if (!tcc_state->c6_ext || !ps || ps == msym)
+        return;
+    if ((ps->type.t & VT_BTYPE) != VT_FUNC)
+        return;
+    es = elfsym(msym);
+    if (!es || es->st_shndx == SHN_UNDEF)
+        return;
+    /* the plain name may already denote another method of this TU: keep the
+       first one, so that plain calls stay stable */
+    if (ps->c && elfsym(ps)->st_shndx != SHN_UNDEF)
+        return;
+    ps->a.weak = 1;
+    /* put_extern_sym2() also patches an elfsym that a forward 'f(p)' call
+       created earlier */
+    put_extern_sym2(ps, es->st_shndx, es->st_value, es->st_size, 1);
+}
+
 /* register 'ret NAME(struct T *self, ...)'; NAME is the spelling used in
    the source, SYM_TOK the (possibly package-mangled) symbol */
 static void c6_method_register(int name, int sym_tok, CType *type)
@@ -13154,7 +13273,14 @@ static void gen_function(Sym *sym)
 	gen_fill_nops(newoff - ind);
     }
 
+#ifdef C6_EXT
+    /* '__func__' shows the name as written, not the mangled method symbol */
+    funcname = c6_method_source_name(sym->v);
+    if (!funcname)
+        funcname = get_tok_str(sym->v, NULL);
+#else
     funcname = get_tok_str(sym->v, NULL);
+#endif
     func_ind = ind;
     func_vt = sym->type.ref->type;
     func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
@@ -13446,7 +13572,7 @@ static int decl(int l)
     AttributeDef ad, adbase;
     ElfSym *esym;
 #ifdef C6_EXT
-    int fallible, decl_name;
+    int fallible, decl_name, method_tok;
 #endif
 
     while (1) {
@@ -13454,6 +13580,7 @@ static int decl(int l)
         oldint = 0;
 #ifdef C6_EXT
         fallible = 0;
+        method_tok = 0;
         if (l == VT_CONST && tcc_state->c6_ext) {
             if (c6_is_test_kw(tok)) {
                 c6_test_parse();
@@ -13675,10 +13802,21 @@ static int decl(int l)
 #endif
                 /* put function symbol */
                 type.t &= ~VT_EXTERN;
+#ifdef C6_EXT
+                /* a method is emitted as '<Type>_<name>' so that different
+                   structures can share a method name (c6_method_symbol) */
+                if (!tcc_state->c6_package)
+                    method_tok = c6_method_symbol(decl_name, &type);
+                if (method_tok)
+                    v = method_tok;
+#endif
                 sym = external_sym(v, &type, 0, &ad);
 #ifdef C6_EXT
                 /* 'ret f(struct T *self, ...)' becomes callable as p->f() */
                 c6_method_register(decl_name, v, &type);
+                /* the source name stays declared for plain 'f(p)' calls */
+                if (method_tok)
+                    c6_method_plain_decl(decl_name, &type, &ad);
 #endif
 
                 /* reject abstract declarators in function definition
@@ -13720,6 +13858,11 @@ static int decl(int l)
                     }
 #endif
                     gen_function(sym);
+#ifdef C6_EXT
+                    /* the source name stays available as an alias */
+                    if (method_tok)
+                        c6_method_alias(decl_name, sym);
+#endif
                 }
                 break;
             } else {
@@ -13788,11 +13931,20 @@ static int decl(int l)
                         ) {
                         /* external variable or function */
                         type.t |= VT_EXTERN;
+#ifdef C6_EXT
+                        if (!tcc_state->c6_package)
+                            method_tok = c6_method_symbol(decl_name, &type);
+                        if (method_tok)
+                            v = method_tok;
+#endif
                         sym = external_sym(v, &type, r, &ad);
 #ifdef C6_EXT
-                        /* a prototype is enough to call it as p->f() */
+                        /* a prototype is enough to call it as p->f(); the
+                           source name stays declared for plain 'f(p)' calls */
                         if ((type.t & VT_BTYPE) == VT_FUNC && l == VT_CONST)
                             c6_method_register(decl_name, v, &type);
+                        if (method_tok)
+                            c6_method_plain_decl(decl_name, &type, &ad);
 #endif
                     } else {
                         if (l == VT_CONST || (type.t & VT_STATIC))

@@ -653,6 +653,7 @@ typedef struct BufferedFile {
     int ifndef_macro_saved; /* saved ifndef_macro */
     int *ifdef_stack_ptr; /* ifdef_stack value at the start of the file */
     int include_next_index; /* next search path */
+    int sys_header;         /* c6: found in a system include path */
     int prev_tok_flags; /* saved tok_flags */
     char filename[1024];    /* filename */
     char *true_filename; /* filename not modified by # line directive */

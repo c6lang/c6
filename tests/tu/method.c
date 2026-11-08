@@ -9,3 +9,8 @@ int vec_sum(struct Vec *v);
 
 int vec_scale(struct Vec *v, int k) { return v->vec_sum() * k; }
 int tu_scale(struct Vec *v, int k) { return v->vec_scale(k); }
+
+/* 另一个 depth：和 tests/method.c 里的 depth(struct Vec *) 同名，
+   符号分别是 Depth_depth / Vec_depth */
+struct Depth { int d; };
+int depth(struct Depth *p) { return p->d * 4; }

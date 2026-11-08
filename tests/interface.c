@@ -39,6 +39,22 @@ package rect {
 import circle;
 import rect;
 
+/* 同名方法不需要包：符号分别是 Square_area / Tri_area，和包里的
+   circle__area / rect__area 一起实现各自的接口 */
+interface Area { int area(); }
+
+struct Square { int a; };
+struct Tri { int b, h; };
+typedef struct Square Square;
+typedef struct Tri Tri;
+int area(struct Square *s) { return s->a * s->a; }
+int area(struct Tri *t) { return t->b * t->h / 2; }
+
+static int area_of(Area a)
+{
+    return a.area();
+}
+
 /* 结构体值隐式转成接口值 */
 static int describe(Shape s)
 {
@@ -138,6 +154,19 @@ test "同一个接口可以由多个结构体实现" {
     s = r;
     if (s.area() != 24)
         err(2, "同一个接口变量改指向 rect 后不对");
+}
+
+test "同名方法不靠包也能各自实现同一个接口" {
+    Square sq = { 3 };
+    Tri tr = { 4, 5 };
+    if (area_of(sq) != 9)
+        err(1, "Square 的 area 不对");
+    if (area_of(tr) != 10)
+        err(2, "Tri 的 area 不对");
+    if ((&sq)->area() != 9)
+        err(3, "Square 的 p->area() 不对");
+    if ((&tr)->area() != 10)
+        err(4, "Tri 的 p->area() 不对");
 }
 
 test "接口跨翻译单元：另一个 TU 转换同一个结构体" {
