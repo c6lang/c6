@@ -381,6 +381,22 @@
 
 ## P7 async/go 集成与预算化 drain
 
+状态：**未开工**（P6 之后停在这里，P8 的 README/语法文档也还没写）。
+
+P7 第一版尝试过 `__c6_co_abort()` + 派发器里的 ABORT 分支，撤了，原因是编译器
+一侧的落点不对，记在这里免得下次再踩：
+
+- `c6_async_func_end()` 生成的恢复派发器在**函数作用域已经关闭之后**跑，
+  那时 `defer_state.enabled`/`has_sites` 已经复位，`c6_defer_begin(2, 0)`
+  是空操作 —— 生成的代码里只有 `__c6_co_finish(task, ABORT)`，清理体没进去，
+  于是“回卷”只标了 DONE，帧里的引用照样漏；
+- 强行把 `defer_state.enabled` 掰回 1 也不行：`c6_defer_func_end()` 已经把
+  那张“按记录派发”的跳转表 patch 完了，事后再发 `defer_begin` 的跳转会悬空；
+- 所以 ABORT 的清理必须发在 defer 仍然活着的区域里（比如每个 `await` 恢复点
+  之前，或者 `leave_scope` 结尾的钩子），再由派发器跳到那个标签；运行时那半
+  （`C6_CO_KIND_ABORT` = 5、`__c6_co_abort()`、`__c6_co_destroy()` 先回卷）
+  的写法在 `docs/gc-design.md` §9.3 里是现成的。
+
 改动点：
 
 - `C6_CO_KIND_ABORT` + `__c6_co_abort()`；`__c6_co_destroy()` 先回卷（设计 §9.3）；
