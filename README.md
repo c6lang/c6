@@ -453,6 +453,18 @@ int a[n];                 ->  不用改（VLA 豁免）
   （文件里真的存一份零），而不带初始化器的全局对象在 `.bss`。所以给
   大缓冲区补初始化器会让可执行文件变大；迁移大型静态表时要留意这一点。
 
+TCC 自己的源码也遵守这条规则（`make c6selfcheck` 会检查），因此拿
+`-std=c6` 编 tcc 自己不会撞上这条诊断：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -c tcc/tcc.c -o tcc.o     # 原生目标文件
+./tcc/tcc -B tcc -std=c6 -o tcc.c.c tcc/tcc.c      # C99 后端的输出
+```
+
+为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type`……）改成了
+"头文件里 `extern` 声明 + 各自 `.c` 文件里带初始化器定义一次"，全局量
+不再依赖"暂定定义"这种不带初始化器的写法。
+
 ### interface
 
 ```c
@@ -899,7 +911,8 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 ```sh
 make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
-make test-all      # selftest + tests2
+make c6selfcheck   # 用 -std=c6 编译 tcc 自己的源码，编出可运行的编译器
+make test-all      # selftest + tests2 + c6selfcheck
 ```
 
 自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：
@@ -912,6 +925,10 @@ make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2
 两条路线都会把两次编译得到的目标文件 `cmp` 一遍（bootstrap fixpoint），
 再用最终的 stage2/stage3 编译并运行一个小程序：只有目标文件逐字节相同、
 编出来的编译器真能编程序，自举才算通过。
+
+`make c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
+的源码也要满足它，所以整份源码都用 `-std=c6` 编译一遍（原生目标文件 +
+C99 后端产物），再把编出来的编译器连起来跑 `-v`。
 
 > 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
 > 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。

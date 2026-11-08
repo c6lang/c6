@@ -350,12 +350,14 @@ extern long double strtold (const char *__nptr, char **__endptr);
 #if ONE_SOURCE
 #define ST_INLN static inline
 #define ST_FUNC static
-#define ST_DATA static
 #else
 #define ST_INLN
 #define ST_FUNC
-#define ST_DATA extern
 #endif
+/* The globals declared below are defined once, in their xxx.c file, in the
+   ONE_SOURCE build as well.  A 'static int x;' would be a tentative
+   definition without initializer, which the c6 extension rejects. */
+#define ST_DATA extern
 
 #ifdef TCC_PROFILE /* profile all functions */
 # define static
@@ -1667,7 +1669,7 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte);
 ST_FUNC void add_array(TCCState *s1, const char *sec, int c);
 
 ST_FUNC struct sym_attr *get_sym_attr(TCCState *s1, int index, int alloc);
-ST_FUNC addr_t get_sym_addr(TCCState *s, const char *name, int err, int forc);
+ST_FUNC addr_t get_sym_addr(TCCState *s, const char *name, int report, int forc);
 ST_FUNC void list_elf_symbols(TCCState *s, void *ctx,
     void (*symbol_cb)(void *ctx, const char *name, const void *val));
 ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec, addr_t offs);
@@ -1976,7 +1978,7 @@ dwarf_read_uleb128(unsigned char **ln, unsigned char *end)
 {
     unsigned char *cp = *ln;
     uint64_t retval = 0;
-    int i;
+    int i = 0;
     for (i = 0; i < DWARF_MAX_128; i++) {
 	uint64_t byte = dwarf_read_1(cp, end);
         retval |= (byte & 0x7f) << (i * 7);
@@ -1991,7 +1993,7 @@ dwarf_read_sleb128(unsigned char **ln, unsigned char *end)
 {
     unsigned char *cp = *ln;
     int64_t retval = 0;
-    int i;
+    int i = 0;
     for (i = 0; i < DWARF_MAX_128; i++) {
 	uint64_t byte = dwarf_read_1(cp, end);
         retval |= (byte & 0x7f) << (i * 7);
@@ -2063,7 +2065,7 @@ static inline void post_sem(TCCSem *p) {
     sem_post(&p->sem);
 }
 #endif
-#define TCC_SEM(s) TCCSem s
+#define TCC_SEM(s) TCCSem s = {0}
 #define WAIT_SEM wait_sem
 #define POST_SEM post_sem
 #else
@@ -2074,11 +2076,7 @@ static inline void post_sem(TCCSem *p) {
 
 /********************************************************/
 #undef ST_DATA
-#if ONE_SOURCE
-#define ST_DATA static
-#else
 #define ST_DATA
-#endif
 /********************************************************/
 
 #define text_section        TCC_STATE_VAR(text_section)

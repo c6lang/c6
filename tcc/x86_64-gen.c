@@ -155,13 +155,13 @@ ST_DATA const int reg_classes[NB_REGS] = {
     /* st0 */ RC_ST0
 };
 
-static unsigned long func_sub_sp_offset;
-static int func_ret_sub;
+static unsigned long func_sub_sp_offset = 0;
+static int func_ret_sub = 0;
 
 #if defined(CONFIG_TCC_BCHECK)
-static addr_t func_bound_offset;
-static unsigned long func_bound_ind;
-ST_DATA int func_bound_add_epilog;
+static addr_t func_bound_offset = 0;
+static unsigned long func_bound_ind = 0;
+ST_DATA int func_bound_add_epilog = 0;
 #endif
 
 #ifdef TCC_TARGET_PE
@@ -171,7 +171,7 @@ static int func_scratch, func_alloca;
 /* XXX: make it faster ? */
 ST_FUNC void g(int c)
 {
-    int ind1;
+    int ind1 = 0;
     if (nocode_wanted)
         return;
     ind1 = ind + 1;
@@ -250,7 +250,7 @@ static int is64_type(int t)
 /* instruction + 4 bytes data. Return the address of the data */
 static int oad(int c, int s)
 {
-    int t;
+    int t = 0;
     if (nocode_wanted)
         return s;
     o(c);
@@ -373,8 +373,8 @@ static void gen_modrm32(int opcode, int op_reg, int r, Sym *sym, int c)
 /* load 'r' from value 'sv' */
 void load(int r, SValue *sv)
 {
-    int v, t, ft, fc, fr;
-    SValue v1;
+    int v = 0, t = 0, ft = 0, fc = 0, fr = 0;
+    SValue v1 = {0};
 
     fr = sv->r;
     ft = sv->type.t & ~(VT_DEFSIGN|VT_QUAL);
@@ -402,7 +402,7 @@ void load(int r, SValue *sv)
 
     v = fr & VT_VALMASK;
     if (fr & VT_LVAL) {
-        int b, ll;
+        int b = 0, ll = 0;
         if (v == VT_LLOCAL) {
             v1.type.t = VT_PTR;
             v1.r = VT_LOCAL | VT_LVAL;
@@ -434,7 +434,7 @@ void load(int r, SValue *sv)
 	   XXX maybe move to generic operand handling, but should
 	   occur only with asm, so tccasm.c might also be a better place */
 	if ((ft & VT_BTYPE) == VT_STRUCT) {
-	    int align;
+	    int align = 0;
 	    switch (type_size(&sv->type, &align)) {
 		case 1: ft = VT_BYTE; break;
 		case 2: ft = VT_SHORT; break;
@@ -576,7 +576,7 @@ void load(int r, SValue *sv)
 /* store register 'r' in lvalue 'v' */
 void store(int r, SValue *v)
 {
-    int fr, bt, fc;
+    int fr = 0, bt = 0, fc = 0;
     /* store the REX prefix in this variable when PIC is enabled */
     int opc = 0, ll = 0;
 
@@ -623,7 +623,7 @@ void store(int r, SValue *v)
 /* 'is_jmp' is '1' if it is a jump */
 static void gcall_or_jmp(int is_jmp)
 {
-    int r;
+    int r = 0;
     if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST &&
 	((vtop->r & VT_SYM) && (vtop->c.i-4) == (int)(vtop->c.i-4))) {
         /* constant symbolic case -> simple relocation */
@@ -667,9 +667,9 @@ static void gen_bounds_prolog(void)
 
 static void gen_bounds_epilog(void)
 {
-    addr_t saved_ind;
-    addr_t *bounds_ptr;
-    Sym *sym_data;
+    addr_t saved_ind = 0;
+    addr_t *bounds_ptr = 0;
+    Sym *sym_data = 0;
     int offset_modified = func_bound_offset != lbounds_section->data_offset;
 
     if (!offset_modified && !func_bound_add_epilog)
@@ -917,7 +917,7 @@ void gfunc_call(int nb_args)
 #define FUNC_PROLOG_SIZE 11
 
 /* generate function prolog of type 't' */
-void gfunc_prolog(Sym *func_sym)
+ST_FUNC void gfunc_prolog(Sym *func_sym)
 {
     CType *func_type = &func_sym->type;
     int addr, reg_param_index, bt, size;
@@ -1073,8 +1073,8 @@ static X86_64_Mode classify_x86_64_merge(X86_64_Mode a, X86_64_Mode b)
 
 static X86_64_Mode classify_x86_64_inner(CType *ty)
 {
-    X86_64_Mode mode;
-    Sym *f;
+    X86_64_Mode mode = 0;
+    Sym *f = 0;
     
     switch (ty->t & VT_BTYPE) {
     case VT_VOID: return x86_64_mode_none;
@@ -1108,8 +1108,8 @@ static X86_64_Mode classify_x86_64_inner(CType *ty)
 
 static X86_64_Mode classify_x86_64_arg(CType *ty, CType *ret, int *psize, int *palign, int *reg_count)
 {
-    X86_64_Mode mode;
-    int size, align, ret_t = 0;
+    X86_64_Mode mode = 0;
+    int size = 0, align = 0, ret_t = 0;
     
     if (ty->t & (VT_BITFIELD|VT_ARRAY)) {
         *psize = 8;
@@ -1180,7 +1180,7 @@ ST_FUNC int classify_x86_64_va_arg(CType *ty)
     enum __va_arg_type {
         __va_gen_reg, __va_float_reg, __va_stack
     };
-    int size, align, reg_count;
+    int size = 0, align = 0, reg_count = 0;
     X86_64_Mode mode = classify_x86_64_arg(ty, NULL, &size, &align, &reg_count);
     switch (mode) {
     default: return __va_stack;
@@ -1193,7 +1193,7 @@ ST_FUNC int classify_x86_64_va_arg(CType *ty)
    returning via struct pointer. */
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int *regsize)
 {
-    int size, align, reg_count;
+    int size = 0, align = 0, reg_count = 0;
     if (classify_x86_64_arg(vt, ret, &size, &align, &reg_count) == x86_64_mode_memory)
         return 0;
     *ret_align = 1; // Never have to re-align return values for x86-64
@@ -1219,12 +1219,12 @@ static int arg_prepare_reg(int idx) {
    parameters and the function address. */
 void gfunc_call(int nb_args)
 {
-    X86_64_Mode mode;
-    CType type;
-    int size, align, r, args_size, stack_adjust, i, reg_count, k;
+    X86_64_Mode mode = 0;
+    CType type = {0};
+    int size = 0, align = 0, r = 0, args_size = 0, stack_adjust = 0, i = 0, reg_count = 0, k = 0;
     int nb_reg_args = 0;
     int nb_sse_args = 0;
-    int sse_reg, gen_reg;
+    int sse_reg = 0, gen_reg = 0;
     char *onstack = tcc_malloc((nb_args + 1) * sizeof (char));
 
 #ifdef CONFIG_TCC_BCHECK
@@ -1381,7 +1381,7 @@ void gfunc_call(int nb_args)
         } else if (mode == x86_64_mode_integer) {
             /* simple type */
             /* XXX: implicit cast ? */
-            int d;
+            int d = 0;
             gen_reg -= reg_count;
             r = gv(RC_INT);
             d = arg_prepare_reg(gen_reg);
@@ -1422,14 +1422,14 @@ static void push_arg_reg(int i) {
 }
 
 /* generate function prolog of type 't' */
-void gfunc_prolog(Sym *func_sym)
+ST_FUNC void gfunc_prolog(Sym *func_sym)
 {
     CType *func_type = &func_sym->type;
-    X86_64_Mode mode, ret_mode;
-    int i, addr, align, size, reg_count;
-    int param_addr = 0, reg_param_index, sse_param_index;
-    Sym *sym;
-    CType *type;
+    X86_64_Mode mode = 0, ret_mode = 0;
+    int i = 0, addr = 0, align = 0, size = 0, reg_count = 0;
+    int param_addr = 0, reg_param_index = 0, sse_param_index = 0;
+    Sym *sym = 0;
+    CType *type = 0;
 
     sym = func_type->ref;
     addr = PTR_SIZE * 2;
@@ -1440,7 +1440,7 @@ void gfunc_prolog(Sym *func_sym)
     ret_mode = classify_x86_64_arg(&func_vt, NULL, &size, &align, &reg_count);
 
     if (func_var) {
-        int seen_reg_num, seen_sse_num, seen_stack_size;
+        int seen_reg_num = 0, seen_sse_num = 0, seen_stack_size = 0;
         seen_reg_num = ret_mode == x86_64_mode_memory;
         seen_sse_num = 0;
         /* frame pointer and return address */
@@ -1576,7 +1576,7 @@ void gfunc_prolog(Sym *func_sym)
 /* generate function epilog */
 void gfunc_epilog(void)
 {
-    int v, saved_ind;
+    int v = 0, saved_ind = 0;
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)
@@ -1617,7 +1617,7 @@ int gjmp(int t)
 /* generate a jump to a fixed address */
 void gjmp_addr(int a)
 {
-    int r;
+    int r = 0;
     r = a - ind - 2;
     if (r == (signed char)r) {
         g(0xeb);
@@ -1629,10 +1629,10 @@ void gjmp_addr(int a)
 
 ST_FUNC int gjmp_append(int n, int t)
 {
-    void *p;
+    void *p = 0;
     /* insert vtop->c jump list in t */
     if (n) {
-        uint32_t n1 = n, n2;
+        uint32_t n1 = n, n2 = 0;
         while ((n2 = read32le(p = cur_text_section->data + n1)))
             n1 = n2;
         write32le(p, t);
@@ -1670,8 +1670,8 @@ ST_FUNC int gjmp_cond(int op, int t)
 /* generate an integer binary operation */
 void gen_opi(int op)
 {
-    int r, fr, opc, c;
-    int ll, uu, cc;
+    int r = 0, fr = 0, opc = 0, c = 0;
+    int ll = 0, uu = 0, cc = 0;
 
     ll = is64_type(vtop[-1].type.t);
     uu = (vtop[-1].type.t & VT_UNSIGNED) != 0;
@@ -1803,7 +1803,7 @@ void gen_opl(int op)
 /* XXX: need to use ST1 too */
 void gen_opf(int op)
 {
-    int a, ft, fc, swapped, r, opc;
+    int a = 0, ft = 0, fc = 0, swapped = 0, r = 0, opc = 0;
     int bt = vtop->type.t & VT_BTYPE;
     int float_type = bt == VT_LDOUBLE ? RC_ST0 : RC_FLOAT;
 
@@ -1912,7 +1912,7 @@ void gen_opf(int op)
             r = vtop->r;
             fc = vtop->c.i;
             if ((r & VT_VALMASK) == VT_LLOCAL) {
-                SValue v1;
+                SValue v1 = {0};
                 r = get_reg(RC_INT);
                 v1.type.t = VT_PTR;
                 v1.r = VT_LOCAL | VT_LVAL;
@@ -1975,7 +1975,7 @@ void gen_opf(int op)
             
             /* if saved lvalue, then we must reload it */
             if ((vtop->r & VT_VALMASK) == VT_LLOCAL) {
-                SValue v1;
+                SValue v1 = {0};
                 r = get_reg(RC_INT);
                 v1.type.t = VT_PTR;
                 v1.r = VT_LOCAL | VT_LVAL;
@@ -2054,7 +2054,7 @@ void gen_cvt_itof(int t)
 /* convert from one floating point type to another */
 void gen_cvt_ftof(int t)
 {
-    int ft, bt, tbt;
+    int ft = 0, bt = 0, tbt = 0;
 
     ft = vtop->type.t;
     bt = ft & VT_BTYPE;
@@ -2093,7 +2093,7 @@ void gen_cvt_ftof(int t)
             vtop->r = TREG_ST0;
         }
     } else {
-        int r;
+        int r = 0;
         gv(RC_ST0);
         r = get_reg(RC_FLOAT);
         if (tbt == VT_DOUBLE) {
@@ -2117,7 +2117,7 @@ void gen_cvt_ftof(int t)
 /* convert fp to int 't' type */
 void gen_cvt_ftoi(int t)
 {
-    int ft, bt, size, r;
+    int ft = 0, bt = 0, size = 0, r = 0;
     ft = vtop->type.t;
     bt = ft & VT_BTYPE;
     if (bt == VT_LDOUBLE) {
@@ -2162,7 +2162,7 @@ ST_FUNC void gen_cvt_sxtw(void)
 /* char/short to int conversion */
 ST_FUNC void gen_cvt_csti(int t)
 {
-    int r, sz, xl, ll;
+    int r = 0, sz = 0, xl = 0, ll = 0;
     r = gv(RC_INT);
     sz = !(t & VT_UNSIGNED);
     xl = (t & VT_BTYPE) == VT_SHORT;
@@ -2225,7 +2225,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
         gfunc_call(1);
     }
     else {
-        int r;
+        int r = 0;
         r = gv(RC_INT); /* allocation size */
         /* sub r,%rsp */
         o(0x2b48);

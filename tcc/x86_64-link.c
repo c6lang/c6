@@ -114,9 +114,9 @@ ST_FUNC int gotplt_entry_type (int reloc_type)
 ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_attr *attr)
 {
     Section *plt = s1->plt;
-    uint8_t *p;
-    int modrm;
-    unsigned plt_offset, relofs;
+    uint8_t *p = 0;
+    int modrm = 0;
+    unsigned plt_offset = 0, relofs = 0;
 
     modrm = 0x25;
 
@@ -156,7 +156,7 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_
    address for PLT and GOT are known (see fill_program_header) */
 ST_FUNC void relocate_plt(TCCState *s1)
 {
-    uint8_t *p, *p_end;
+    uint8_t *p = 0, *p_end = 0;
 
     if (!s1->plt)
       return;
@@ -176,7 +176,7 @@ ST_FUNC void relocate_plt(TCCState *s1)
     }
 
     if (s1->plt->reloc) {
-        ElfW_Rel *rel;
+        ElfW_Rel *rel = 0;
         int x = s1->plt->sh_addr + 16 + 6;
         p = s1->got->data;
         for_each_elem(s1->plt->reloc, 0, rel, ElfW_Rel) {
@@ -190,7 +190,7 @@ ST_FUNC void relocate_plt(TCCState *s1)
 
 ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t addr, addr_t val)
 {
-    int sym_index, esym_index;
+    int sym_index = 0, esym_index = 0;
 
     sym_index = ELFW(R_SYM)(rel->r_info);
 
@@ -253,7 +253,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
 
         plt32pc32:
         {
-            long long diff;
+            long long diff = 0;
             diff = (long long)val - addr;
             if (diff < -2147483648LL || diff > 2147483647LL) {
 #ifdef TCC_TARGET_PE
@@ -333,9 +333,9 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
                     0x48, 0x8d, 0x80, 0x00, 0x00, 0x00, 0x00 };
 
                 if (memcmp (ptr-4, expect, sizeof(expect)) == 0) {
-                    ElfW(Sym) *sym;
-                    Section *sec;
-                    int32_t x;
+                    ElfW(Sym) *sym = 0;
+                    Section *sec = 0;
+                    int32_t x = 0;
 
                     memcpy(ptr-4, replace, sizeof(replace));
                     rel[1].r_info = ELFW(R_INFO)(0, R_X86_64_NONE);
@@ -374,7 +374,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
         case R_X86_64_DTPOFF64:
         case R_X86_64_TPOFF64:
             {
-                int32_t x;
+                int32_t x = 0;
                 if (s1->tls_end) {
                     x = val - s1->tls_end;
                 } else {

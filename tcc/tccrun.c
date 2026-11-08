@@ -54,8 +54,8 @@ typedef struct rt_context
 } rt_context;
 
 /* linked list of rt_contexts */
-static rt_context *g_rc;
-static int signal_set;
+static rt_context *g_rc = 0;
+static int signal_set = 0;
 static void set_exception_handler(void);
 #endif /* def CONFIG_TCC_BACKTRACE */
 
@@ -63,7 +63,7 @@ typedef struct rt_frame {
     addr_t ip, fp, sp;
 } rt_frame;
 
-static TCCState *g_s1;
+static TCCState *g_s1 = 0;
 /* semaphore to protect it */
 TCC_SEM(static rt_sem);
 static void rt_wait_sem(void) { WAIT_SEM(&rt_sem); }
@@ -115,7 +115,7 @@ static void win64_del_function_table(void *);
 
 static int rt_mem(TCCState *s1, int size)
 {
-    void *ptr;
+    void *ptr = 0;
     int ptr_diff = 0;
 #ifdef CONFIG_SELINUX
     /* Using mmap instead of malloc */
@@ -153,7 +153,7 @@ static int rt_mem(TCCState *s1, int size)
 
 LIBTCCAPI int tcc_relocate(TCCState *s1)
 {
-    int size, ret, ptr_diff;
+    int size = 0, ret = 0, ptr_diff = 0;
 
     if (s1->run_ptr)
         exit(tcc_error_noabort("'tcc_relocate()' twice is no longer supported"));
@@ -175,9 +175,9 @@ LIBTCCAPI int tcc_relocate(TCCState *s1)
 
 ST_FUNC void tcc_run_free(TCCState *s1)
 {
-    unsigned size;
-    void *ptr;
-    int i;
+    unsigned size = 0;
+    void *ptr = 0;
+    int i = 0;
 
     /* free any loaded DLLs */
     for ( i = 0; i < s1->nb_loaded_dlls; i++) {
@@ -259,9 +259,9 @@ static int tcc_run_tests(TCCState *s1)
 
 LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
 {
-    int (*prog_main)(int, char **, char **), ret;
-    const char *top_sym;
-    jmp_buf main_jb;
+    int (*prog_main)(int, char **, char **) = 0, ret = 0;
+    const char *top_sym = 0;
+    jmp_buf main_jb = {0};
 
 #if defined(__APPLE__)
     extern char ***_NSGetEnviron(void);
@@ -341,7 +341,7 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
 static void cleanup_symbols(TCCState *s1)
 {
     Section *s = s1->symtab;
-    int sym_index, end_sym = s->data_offset / sizeof (ElfSym);
+    int sym_index = 0, end_sym = s->data_offset / sizeof (ElfSym);
     /* reset symtab */
     s->data_offset = s->link->data_offset = s->hash->data_offset = 0;
     init_symtab(s);
@@ -360,7 +360,7 @@ static void cleanup_symbols(TCCState *s1)
 static void cleanup_sections(TCCState *s1)
 {
     struct { Section **secs; int nb_secs; } *p = (void*)&s1->sections;
-    int i, f = 2;
+    int i = 0, f = 2;
     do {
         for (i = --f; i < p->nb_secs; i++) {
             Section *s = p->secs[i];
@@ -394,10 +394,10 @@ static void cleanup_sections(TCCState *s1)
    otherwise copy code into buffer passed by the caller */
 static int tcc_relocate_ex(TCCState *s1, void *ptr, unsigned ptr_diff)
 {
-    Section *s;
-    unsigned offset, length, align, i, k, f;
-    unsigned n, copy;
-    addr_t mem, addr;
+    Section *s = 0;
+    unsigned offset = 0, length = 0, align = 0, i = 0, k = 0, f = 0;
+    unsigned n = 0, copy = 0;
+    addr_t mem = 0, addr = 0;
 
     if (NULL == ptr) {
         s1->nb_errors = 0;
@@ -597,7 +597,7 @@ static void win64_del_function_table(void *p)
 static void bt_link(TCCState *s1)
 {
 #ifdef CONFIG_TCC_BACKTRACE
-    rt_context *rc;
+    rt_context *rc = 0;
     if (!s1->do_backtrace)
         return;
     rc = tcc_get_symbol(s1, "__rt_info");
@@ -610,7 +610,7 @@ static void bt_link(TCCState *s1)
         rc->prog_base &= 0xffffffff00000000ULL;
 #ifdef CONFIG_TCC_BCHECK
     if (s1->do_bounds_check) {
-        void *p;
+        void *p = 0;
         if ((p = tcc_get_symbol(s1, "__bound_init")))
             ((void(*)(void*,int))p)(rc->bounds_start, 1);
     }
@@ -632,7 +632,7 @@ static void st_link(TCCState *s1)
 /* remove 'el' from 'list' */
 static void ptr_unlink(void *list, void *e, unsigned next)
 {
-    void **pp, **nn, *p;
+    void **pp = 0, **nn = 0, *p = 0;
     for (pp = list; !!(p = *pp); pp = nn) {
         nn = (void*)((char*)p + next); /* nn = &p->next; */
         if (p == e) {
@@ -671,9 +671,9 @@ LIBTCCAPI void tcc_set_backtrace_func(TCCState *s1, void *data, TCCBtFunc *func)
 
 static TCCState *rt_find_state(rt_frame *f)
 {
-    TCCState *s;
-    int level;
-    addr_t pc;
+    TCCState *s = 0;
+    int level = 0;
+    addr_t pc = 0;
 
     s = g_s1;
     if (NULL == s || NULL == s->next) {
@@ -694,7 +694,7 @@ static TCCState *rt_find_state(rt_frame *f)
 
 static void rt_exit(rt_frame *f, int code)
 {
-    TCCState *s;
+    TCCState *s = 0;
     rt_wait_sem();
     s = rt_find_state(f);
     rt_post_sem();
@@ -732,8 +732,8 @@ static int rt_vprintf(const char *fmt, va_list ap)
 
 static int rt_printf(const char *fmt, ...)
 {
-    va_list ap;
-    int r;
+    va_list ap = {0};
+    int r = 0;
     va_start(ap, fmt);
     r = rt_vprintf(fmt, ap);
     va_end(ap);
@@ -742,7 +742,7 @@ static int rt_printf(const char *fmt, ...)
 
 static char *rt_elfsym(rt_context *rc, addr_t wanted_pc, addr_t *func_addr)
 {
-    ElfW(Sym) *esym;
+    ElfW(Sym) *esym = 0;
     for (esym = rc->esym_start + 1; esym < rc->esym_end; ++esym) {
         int type = ELFW(ST_TYPE)(esym->st_info);
         if ((type == STT_FUNC || type == STT_GNU_IFUNC)
@@ -767,12 +767,12 @@ typedef struct bt_info
    the stabs debug information */
 static addr_t rt_printline (rt_context *rc, addr_t wanted_pc, bt_info *bi)
 {
-    char func_name[128];
-    addr_t func_addr, last_pc, pc;
-    const char *incl_files[INCLUDE_STACK_SIZE];
-    int incl_index, last_incl_index, len, last_line_num, i;
-    const char *str, *p;
-    Stab_Sym *sym;
+    char func_name[128] = {0};
+    addr_t func_addr = 0, last_pc = 0, pc = 0;
+    const char *incl_files[INCLUDE_STACK_SIZE] = {0};
+    int incl_index = 0, last_incl_index = 0, len = 0, last_line_num = 0, i = 0;
+    const char *str = 0, *p = 0;
+    Stab_Sym *sym = 0;
 
     func_name[0] = '\0';
     func_addr = 0;
@@ -887,43 +887,43 @@ found:
 
 static addr_t rt_printline_dwarf (rt_context *rc, addr_t wanted_pc, bt_info *bi)
 {
-    unsigned char *ln;
-    unsigned char *cp;
-    unsigned char *end;
-    unsigned char *opcode_length;
-    unsigned long long size;
-    unsigned int length;
-    unsigned char version;
-    unsigned int min_insn_length;
-    unsigned int max_ops_per_insn;
-    int line_base;
-    unsigned int line_range;
-    unsigned int opcode_base;
-    unsigned int opindex;
-    unsigned int col;
-    unsigned int i;
-    unsigned int j;
-    unsigned int len;
-    unsigned long long value;
+    unsigned char *ln = 0;
+    unsigned char *cp = 0;
+    unsigned char *end = 0;
+    unsigned char *opcode_length = 0;
+    unsigned long long size = 0;
+    unsigned int length = 0;
+    unsigned char version = 0;
+    unsigned int min_insn_length = 0;
+    unsigned int max_ops_per_insn = 0;
+    int line_base = 0;
+    unsigned int line_range = 0;
+    unsigned int opcode_base = 0;
+    unsigned int opindex = 0;
+    unsigned int col = 0;
+    unsigned int i = 0;
+    unsigned int j = 0;
+    unsigned int len = 0;
+    unsigned long long value = 0;
     struct {
 	unsigned int type;
 	unsigned int form;
-    } entry_format[256];
-    unsigned int dir_size;
+    } entry_format[256] = {0};
+    unsigned int dir_size = 0;
 #if 0
     char *dirs[DIR_TABLE_SIZE];
 #endif
-    unsigned int filename_size;
+    unsigned int filename_size = 0;
     struct /*dwarf_filename_struct*/ {
         unsigned int dir_entry;
         char *name;
-    } filename_table[FILE_TABLE_SIZE];
-    addr_t last_pc;
-    addr_t pc;
-    addr_t func_addr;
-    int line;
-    char *filename;
-    char *function;
+    } filename_table[FILE_TABLE_SIZE] = {0};
+    addr_t last_pc = 0;
+    addr_t pc = 0;
+    addr_t func_addr = 0;
+    int line = 0;
+    char *filename = 0;
+    char *function = 0;
 
     filename = NULL;
     function = NULL;
@@ -1174,13 +1174,13 @@ static
 #endif
 int _tcc_backtrace(rt_frame *f, const char *fmt, va_list ap)
 {
-    rt_context *rc, *rc2;
-    addr_t pc;
-    char skip[40], msg[200];
-    int i, level, ret, n, one;
-    const char *a, *b;
-    bt_info bi;
-    addr_t (*getinfo)(rt_context*, addr_t, bt_info*);
+    rt_context *rc = 0, *rc2 = 0;
+    addr_t pc = 0;
+    char skip[40] = {0}, msg[200] = {0};
+    int i = 0, level = 0, ret = 0, n = 0, one = 0;
+    const char *a = 0, *b = 0;
+    bt_info bi = {0};
+    addr_t (*getinfo)(rt_context*, addr_t, bt_info*) = 0;
 
     skip[0] = 0;
     /* If fmt is like "^file.c^..." then skip calls from 'file.c' */
@@ -1268,7 +1268,7 @@ int _tcc_backtrace(rt_frame *f, const char *fmt, va_list ap)
 /* emit a run time error at position 'pc' */
 static int rt_error(rt_frame *f, const char *fmt, ...)
 {
-    va_list ap; char msg[200]; int ret;
+    va_list ap = {0}; char msg[200] = {0}; int ret = 0;
     va_start(ap, fmt);
     snprintf(msg, sizeof msg, "RUNTIME ERROR: %s", fmt);
     ret = _tcc_backtrace(f, msg, ap);
@@ -1385,7 +1385,7 @@ static void rt_getcontext(ucontext_t *uc, rt_frame *rc)
 /* signal handler for fatal errors */
 static void sig_error(int signum, siginfo_t *siginf, void *puc)
 {
-    rt_frame f;
+    rt_frame f = {0};
     rt_getcontext(puc, &f);
 
     switch(signum) {
@@ -1415,7 +1415,7 @@ static void sig_error(int signum, siginfo_t *siginf, void *puc)
         break;
     }
     {
-        sigset_t s;
+        sigset_t s = {0};
         sigemptyset(&s);
         sigaddset(&s, signum);
         sigprocmask(SIG_UNBLOCK, &s, NULL);
@@ -1430,7 +1430,7 @@ static void sig_error(int signum, siginfo_t *siginf, void *puc)
 /* Generate a stack backtrace when a CPU exception occurs. */
 static void set_exception_handler(void)
 {
-    struct sigaction sigact;
+    struct sigaction sigact = {0};
     /* install TCC signal handlers to print debug info on fatal
        runtime errors */
     sigemptyset (&sigact.sa_mask);

@@ -9,6 +9,7 @@
 #   make test-all    selftest + tests2 全量
 #   make c99         C99 输出后端已内置在 tcc/tcc（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
+#   make c6selfcheck tcc 自己的源码用 -std=c6 编译（初始化规则 + C99 后端）
 #   make selfhost    用 c6 模式的 tcc 自举自己（stage1 -> stage2，比对目标文件）
 #   make c99selfhost 用 C99 后端自举自己（生成 C -> gcc -> stage2 -> stage3）
 #   make clean       清理 tcc/ 的构建产物和自举产物
@@ -35,7 +36,7 @@ HOSTCC   ?= gcc
 
 .PHONY: all bootstrap build build-plain test test-plain test-all selftest \
         clean distclean help check-tcc mode-ext mode-plain c99 c99test \
-        selfhost c99selfhost
+        c6selfcheck selfhost c99selfhost
 
 all: build
 
@@ -82,7 +83,7 @@ test-plain: build-plain
 selftest: build
 	./$(SELFTEST)
 
-test-all: selftest test
+test-all: selftest test c6selfcheck
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -93,6 +94,16 @@ c99: build
 # 由同一个 tcc 生成 C 源码，再由系统 gcc 编译运行。
 c99test: build
 	BACKEND=c99 ./$(SELFTEST)
+
+# c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿
+# -std=c6 编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99
+# 后端的翻译路径）；编出来的编译器还要能跑。
+c6selfcheck: build
+	@mkdir -p $(SELFHOST_C6)
+	$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/selfcheck.o
+	$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c
+	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C6)/selfcheck $(SELFHOST_C6)/selfcheck.o $(SELFHOST_LIBS)
+	$(SELFHOST_C6)/selfcheck -v
 
 # 自举（c6 模式）：tcc 用它自己的后端编译自己的源码，再用编出来的编译器
 # 重编一遍。两次的目标文件必须逐字节相同（bootstrap fixpoint），最后用

@@ -2032,7 +2032,7 @@ ST_FUNC void bind_rebase_import(TCCState *s1, struct macho *mo)
     struct dyld_chained_fixups_header *header;
     struct dyld_chained_starts_in_image *image;
     struct dyld_chained_starts_in_segment *segment;
-    struct dyld_chained_import *import;
+    struct dyld_chained_import *imp;
 
     tcc_qsort(mo->bind_rebase, mo->n_bind_rebase, sizeof(struct bind_rebase),
 	      bind_rebase_cmp, s1);
@@ -2152,19 +2152,19 @@ ST_FUNC void bind_rebase_import(TCCState *s1, struct macho *mo)
     }
     // add imports
     header->imports_offset = data - mo->chained_fixups->data;
-    import = (struct dyld_chained_import *) data;
+    imp = (struct dyld_chained_import *) data;
     data += mo->n_bind * sizeof (struct dyld_chained_import);
     header->symbols_offset = data - mo->chained_fixups->data;
     data++;
     for (i = 0, bind_index = 0; i < mo->n_bind_rebase; i++) {
 	if (mo->bind_rebase[i].bind) {
-	    import[bind_index].lib_ordinal =
+	    imp[bind_index].lib_ordinal =
 		BIND_SPECIAL_DYLIB_FLAT_LOOKUP & 0xffu;
-	    import[bind_index].name_offset =
+	    imp[bind_index].name_offset =
 		(data - mo->chained_fixups->data) - header->symbols_offset;
 	    sym_index = ELFW(R_SYM)(mo->bind_rebase[i].rel.r_info);
 	    sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
-	    import[bind_index].weak_import =
+	    imp[bind_index].weak_import =
 		ELFW(ST_BIND)(sym->st_info) == STB_WEAK;
 	    name = (char *) symtab_section->link->data + sym->st_name;
             strcpy((char *) data, name);
