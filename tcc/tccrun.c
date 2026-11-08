@@ -157,6 +157,9 @@ LIBTCCAPI int tcc_relocate(TCCState *s1)
 
     if (s1->run_ptr)
         exit(tcc_error_noabort("'tcc_relocate()' twice is no longer supported"));
+#ifdef C6_EXT
+    c6_gc_graph_check(s1);          /* cross-TU reference cycles */
+#endif
 #ifdef CONFIG_TCC_BACKTRACE
     if (s1->do_backtrace)
         tcc_add_symbol(s1, "_tcc_backtrace", _tcc_backtrace); /* for bt-log.c */

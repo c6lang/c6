@@ -662,12 +662,17 @@ typedef struct TccDeferCtx {
 
 typedef struct TccCoPool TccCoPool;   /* completed with the async runtime */
 typedef struct TccThRec TccThRec;     /* threads started by this thread */
+typedef struct C6GcHdr C6GcHdr;       /* completed with the gc runtime */
 
 typedef struct TccThCtx {
     TccDeferRec *dstack;  int dsp, stack_cap;
     TccDeferCtx *dctx;    int dcsp, ctx_cap;
     int err_flag, err_id;
     const char *err_msg;
+    C6GcHdr *gc_pending;  /* objects whose count reached zero */
+    C6GcHdr *gc_pending_tail;
+    int gc_pending_n;
+    int gc_draining;      /* a drain loop is already running on this thread */
     TccCoPool *co;
     TccThRec *th_list;    /* children, joined when the thread exits */
     int th_freed;
@@ -717,6 +722,7 @@ static void *tcc_th_alloc(unsigned long size)
 }
 
 static void tcc_th_co_free(TccCoPool *co);
+static void tcc_th_gc_free_all(TccThCtx *th);
 
 /* Join every thread this thread started.  A 'go' statement has no place
    where it could be joined, so the starter reaps its threads when it exits;
@@ -740,6 +746,7 @@ static void tcc_th_free(TccThCtx *th)
     if (!th || th->th_freed)
         return;
     th->th_freed = 1;
+    tcc_th_gc_free_all(th);
     tcc_th_join_children(th);
     if (th->dstack)
         free(th->dstack);
@@ -1025,6 +1032,535 @@ void __tcc_catch_fallthrough(void)
     *p = 0;
 }
 
+/* ------------------------------------------------------------------------- */
+/* c6 extension runtime: reference counted managed references '@T'           */
+/*                                                                           */
+/* Every object made by 'new T' carries a 32 byte header: the reference       */
+/* count, the element count together with the object flags, the type          */
+/* descriptor and either the list of weak references pointing at it or the    */
+/* link in the per-thread free queue.  The queue exists because the last      */
+/* release of a long chain would otherwise need one C stack frame per link:   */
+/* dropping a reference only queues the object, and the queue is drained in   */
+/* batches from the outermost release (or from a budgeted explicit drain).    */
+/*                                                                           */
+/* The count of an object made by 'new shared T' is atomic, so references    */
+/* may be handed to another thread; an object with a plain count must stay    */
+/* on the thread that made it.  Weak slots are always cleared synchronously   */
+/* when the object dies, before it is put on the queue, so a weak reference   */
+/* never observes freed memory.                                             */
+
+#define C6_GC_HDR_SIZE   32     /* header in front of the payload */
+#define C6_GC_DEAD       (1UL << 63)  /* 'rc': the object is being freed */
+/* store modes and object flags; the numbers must match tcc.h and the
+   '#define's tcc_predefs() emits for compiled programs */
+#define C6_GC_FRESH      1
+#define C6_GC_ATOMIC     2      /* also the object flag: the count is atomic */
+#define C6_GC_WEAK       4
+#define C6_GC_OWN        8
+#define C6_GC_INIT       16
+
+#define C6_GC_META_COUNT 0xffffffffffUL   /* low 40 bits: element count */
+
+/* field kinds, must match C6_GCK_* in tcc/tcc.h */
+#define C6_GCK_STRONG 1
+#define C6_GCK_WEAK   2
+#define C6_GCK_OWN    3
+#define C6_GCK_EMBED  4
+#define C6_GC_META_FLAGS(meta) ((int)((meta) >> 40))
+
+#define C6_GC_DRAIN_BUDGET 256  /* objects freed per release before returning */
+
+/* memory orders, the same numbers stdatomic.h uses */
+#define C6_GC_A_RELAXED 0
+#define C6_GC_A_ACQUIRE 2
+#define C6_GC_A_RELEASE 3
+#define C6_GC_A_ACQ_REL 4
+
+typedef struct C6GcWeak {
+    void **slot;                /* the weak slot to clear */
+    struct C6GcWeak *next;
+} C6GcWeak;
+
+/* the compiler's 'struct __c6_gc_field' / 'struct __c6_gc_desc'; declared
+   here again because libtcc1 does not see tcc_predefs() */
+typedef struct C6GcDesc C6GcDesc;
+typedef struct C6GcField C6GcField;
+
+struct C6GcField {
+    unsigned off, kind, count, stride;
+    const C6GcDesc *sub;
+};
+
+struct C6GcDesc {
+    unsigned size, align, nfields, flags;
+    void (*drop)(void *);
+    const C6GcField *fields;
+};
+
+struct C6GcHdr {
+    unsigned long rc;           /* reference count, C6_GC_DEAD when dying */
+    unsigned long meta;         /* element count, flags in the high bits */
+    const C6GcDesc *desc;
+    union {
+        C6GcWeak *weak;         /* live object: weak references to it */
+        C6GcHdr *next;          /* dying object: the free queue link */
+    } u;
+};
+
+/* living objects; a debug counter, not synchronised (only a test reads it) */
+static unsigned long c6_gc_live_count;
+
+static void c6_gc_trap(void)
+{
+    volatile int *p = (volatile int *)0;
+    *p = 0;
+}
+
+static C6GcHdr *c6_gc_hdr(void *p)
+{
+    return (C6GcHdr *)p - 1;
+}
+
+static int c6_gc_is_atomic(C6GcHdr *h)
+{
+    return (C6_GC_META_FLAGS(h->meta) & C6_GC_ATOMIC) != 0;
+}
+
+static unsigned long c6_gc_count(C6GcHdr *h)
+{
+    return h->meta & C6_GC_META_COUNT;
+}
+
+static void c6_gc_inc(C6GcHdr *h)
+{
+    if (c6_gc_is_atomic(h))
+        __atomic_fetch_add(&h->rc, 1UL, C6_GC_A_ACQ_REL);
+    else
+        h->rc++;
+}
+
+/* free one object: the fields first (the descriptor walk lives in the
+   type-descriptor stage), then the payload */
+/* defined below: the field release runs inside the free path */
+static void c6_gc_drop(C6GcHdr *h);
+static void c6_gc_destroy(C6GcHdr *h);
+static void c6_gc_weak_unlink(void **slot, void *p);
+
+/* release one managed slot of a dying object */
+static void c6_gc_release_slot(void **slot, int kind)
+{
+    void *p = *slot;
+
+    if (!p)
+        return;
+    if (kind == C6_GCK_WEAK) {
+        /* the weak slot disappears with its owner: unregister it, the
+           target may well outlive it */
+        c6_gc_weak_unlink(slot, p);
+        *slot = 0;
+        return;
+    }
+    *slot = 0;
+    if (kind == C6_GCK_OWN)
+        c6_gc_destroy(c6_gc_hdr(p));
+    else
+        c6_gc_drop(c6_gc_hdr(p));
+}
+
+/* release every managed reference a block of elements holds.  Struct
+   nesting recurses (bounded by the type), arrays iterate. */
+static void c6_gc_release_block(char *base, const C6GcDesc *d)
+{
+    unsigned k;
+
+    if (!d)
+        return;
+    for (k = 0; k < d->nfields; k++) {
+        const C6GcField *f = &d->fields[k];
+        unsigned i;
+
+        for (i = 0; i < f->count; i++) {
+            char *p = base + f->off + (unsigned long)i * f->stride;
+            if (f->kind == C6_GCK_EMBED)
+                c6_gc_release_block(p, f->sub);
+            else
+                c6_gc_release_slot((void **)p, (int)f->kind);
+        }
+    }
+}
+
+static void c6_gc_free_one(C6GcHdr *h)
+{
+    const C6GcDesc *d = h->desc;
+
+    if (d) {
+        /* one element at a time: a 'new T[n]' runs the destructor n times,
+           like C++ does */
+        unsigned long n = c6_gc_count(h), i;
+        for (i = 0; i < n; i++) {
+            char *base = (char *)(h + 1) + i * (unsigned long)d->size;
+            if (d->drop)
+                d->drop(base);
+            if (d->nfields)
+                c6_gc_release_block(base, d);
+        }
+    }
+    if (c6_gc_live_count)
+        c6_gc_live_count--;
+    free(h);
+}
+
+/* Run the free queue of TH for at most BUDGET objects.  Called from the
+   outermost drop, from an explicit drain, and when a thread dies. */
+static void c6_gc_drain(TccThCtx *th, int budget)
+{
+    int n = 0;
+
+    if (th->gc_draining)
+        return;                 /* the running loop picks the new entry up */
+    th->gc_draining = 1;
+    while (th->gc_pending && n < budget) {
+        C6GcHdr *h = th->gc_pending;
+        th->gc_pending = h->u.next;
+        if (!th->gc_pending)
+            th->gc_pending_tail = 0;
+        th->gc_pending_n--;
+        n++;
+        c6_gc_free_one(h);
+    }
+    th->gc_draining = 0;
+}
+
+static void tcc_th_gc_free_all(TccThCtx *th)
+{
+    while (th->gc_pending) {
+        C6GcHdr *h = th->gc_pending;
+        th->gc_pending = h->u.next;
+        th->gc_pending_n--;
+        c6_gc_free_one(h);
+    }
+    th->gc_pending_tail = 0;
+}
+
+/* the last reference is gone: clear the weak slots while the object can
+   still be read, then queue it */
+static void c6_gc_die(C6GcHdr *h)
+{
+    TccThCtx *th;
+    C6GcWeak *w;
+
+    h->rc = C6_GC_DEAD;
+    w = h->u.weak;
+    h->u.weak = 0;
+    while (w) {
+        C6GcWeak *next = w->next;
+        *w->slot = 0;
+        free(w);
+        w = next;
+    }
+    th = tcc_th();
+    h->u.next = 0;
+    if (th->gc_pending_tail)
+        th->gc_pending_tail->u.next = h;
+    else
+        th->gc_pending = h;
+    th->gc_pending_tail = h;
+    th->gc_pending_n++;
+    /* free right away unless this thread is already inside a drain (a chain
+       is then freed by the loop that is running) */
+    c6_gc_drain(th, C6_GC_DRAIN_BUDGET);
+}
+
+/* drop one reference */
+static void c6_gc_drop(C6GcHdr *h)
+{
+    if (c6_gc_is_atomic(h)) {
+        unsigned long old = __atomic_fetch_sub(&h->rc, 1UL, C6_GC_A_ACQ_REL);
+        if (old != 1)
+            return;
+    } else {
+        if (--h->rc != 0)
+            return;
+    }
+    c6_gc_die(h);
+}
+
+/* 'own @T' is exclusive ('own' and 'shared' exclude each other), so the last
+   reference is the only one and a plain store is enough */
+static void c6_gc_destroy(C6GcHdr *h)
+{
+    if (h->rc & C6_GC_DEAD)
+        return;
+    h->rc = 1;
+    c6_gc_die(h);
+}
+
+static void c6_gc_weak_unlink(void **slot, void *p)
+{
+    C6GcWeak **pp;
+
+    for (pp = &c6_gc_hdr(p)->u.weak; *pp; pp = &(*pp)->next) {
+        C6GcWeak *w = *pp;
+        if (w->slot == slot) {
+            *pp = w->next;
+            free(w);
+            return;
+        }
+    }
+}
+
+static void c6_gc_weak_add(void **slot, void *p)
+{
+    C6GcHdr *h = c6_gc_hdr(p);
+    C6GcWeak *w = (C6GcWeak *)tcc_th_alloc(sizeof *w);
+
+    w->slot = slot;
+    w->next = h->u.weak;
+    h->u.weak = w;
+}
+
+/* 'new T' / 'new T[n]': SIZE is sizeof(T), COUNT the number of elements.
+   The payload is zeroed, the count starts at one (a fresh reference). */
+void *__c6_gc_new(unsigned long size, unsigned long count,
+                  const struct __c6_gc_desc *desc, int flags)
+{
+    unsigned long total;
+    C6GcHdr *h;
+
+    if (size == 0)
+        size = 1;
+    if (count == 0)
+        count = 1;
+    if (count > ((unsigned long)-1 - C6_GC_HDR_SIZE) / size)
+        c6_gc_trap();           /* the size computation would wrap */
+    total = size * count;
+    h = (C6GcHdr *)calloc(1, C6_GC_HDR_SIZE + total);
+    if (!h)
+        c6_gc_trap();
+    h->rc = 1;
+    h->meta = count & C6_GC_META_COUNT;
+    if (flags & C6_GC_ATOMIC)
+        h->meta |= (unsigned long)C6_GC_ATOMIC << 40;
+    h->desc = (const C6GcDesc *)desc;
+    c6_gc_live_count++;
+    return h + 1;
+}
+
+/* Store NV into the managed slot SLOT and return it.  MODE says what kind of
+   slot it is (C6_GC_WEAK / C6_GC_OWN / C6_GC_ATOMIC) and whether NV is a
+   fresh reference that must not be counted again (C6_GC_FRESH). */
+void *__c6_gc_store(void **slot, void *nv, int mode)
+{
+    /* INIT: the slot has never been written, so there is no old value (and
+       reading it would read indeterminate stack or heap garbage).  The slot
+       itself must still be written: this call may be the only store. */
+    int init = (mode & C6_GC_INIT) != 0;
+    void *old = init ? 0 : *slot;
+
+    if (mode & C6_GC_WEAK) {
+        /* a weak slot observes but does not own */
+        if (!init && old == nv)
+            return nv;
+        if (old)
+            c6_gc_weak_unlink(slot, old);
+        *slot = nv;
+        if (nv)
+            c6_gc_weak_add(slot, nv);
+        return nv;
+    }
+    if (!init && old == nv)
+        return nv;
+    if (nv && !(mode & C6_GC_FRESH))
+        c6_gc_inc(c6_gc_hdr(nv));
+    *slot = nv;
+    if (old) {
+        if (mode & C6_GC_OWN)
+            c6_gc_destroy(c6_gc_hdr(old));
+        else
+            c6_gc_drop(c6_gc_hdr(old));
+    }
+    return nv;
+}
+
+/* 'own @T': exclusive, the old value is destroyed, the new one is not
+   counted (the slot is the only owner) */
+void *__c6_gc_own_store(void **slot, void *nv, int mode)
+{
+    int init = (mode & C6_GC_INIT) != 0;
+    void *old = init ? 0 : *slot;
+
+    if (!init && old == nv)
+        return nv;
+    *slot = nv;
+    if (old)
+        c6_gc_destroy(c6_gc_hdr(old));
+    return nv;
+}
+
+/* release the reference in SLOT (and store the empty value) */
+void __c6_gc_release(void **slot, int mode)
+{
+    void *p = *slot;
+
+    if (!p)
+        return;
+    *slot = 0;
+    if (mode & C6_GC_WEAK)
+        c6_gc_weak_unlink(slot, p);
+    else if (mode & C6_GC_OWN)
+        c6_gc_destroy(c6_gc_hdr(p));
+    else
+        c6_gc_drop(c6_gc_hdr(p));
+}
+
+/* 'move(p)': take the reference out of SLOT and hand it over.  Nothing is
+   released -- the value keeps the one reference it had -- and the slot is
+   emptied so its scope exit finds nothing to release. */
+void *__c6_gc_move(void **slot)
+{
+    void *p = *slot;
+
+    *slot = 0;
+    return p;
+}
+
+/* drop one reference to a bare pointer: what a discarded 'new T' needs.
+   Returns the empty pointer so that the generated code has a value to pop. */
+void *__c6_gc_drop(void *p)
+{
+    if (p)
+        c6_gc_drop(c6_gc_hdr(p));
+    return 0;
+}
+
+/* take one more reference; used when a managed value is handed to the
+   caller ('return p') or out of a weak slot */
+void *__c6_gc_incref(void *p)
+{
+    if (p)
+        c6_gc_inc(c6_gc_hdr(p));
+    return p;
+}
+
+/* 'dst = weak_slot' for a counted DST: the object is only taken when it is
+   still alive.  Bumping the count and checking DEAD must be one step,
+   otherwise an upgrade could resurrect an object that is already on the free
+   queue ('weak' is exactly what a dying object has to invalidate). */
+void *__c6_gc_weak_store(void **dst, void **weak_slot, int mode)
+{
+    void *p = *weak_slot;
+    C6GcHdr *h;
+
+    if (p) {
+        h = c6_gc_hdr(p);
+        if (c6_gc_is_atomic(h)) {
+            unsigned long expected, desired;
+            for (;;) {
+                expected = h->rc;
+                if (expected & C6_GC_DEAD)
+                    break;
+                desired = expected + 1;
+                if (__atomic_compare_exchange(&h->rc, &expected, &desired, 0,
+                                              C6_GC_A_ACQ_REL,
+                                              C6_GC_A_ACQUIRE))
+                    goto owned;
+            }
+        } else if (!(h->rc & C6_GC_DEAD)) {
+            h->rc++;
+            goto owned;
+        }
+        p = 0;                      /* died while we looked at it */
+    }
+owned:
+    /* the reference we hold (or the empty value) replaces the old content */
+    return __c6_gc_store(dst, p, (mode & ~C6_GC_WEAK) | C6_GC_FRESH);
+}
+
+unsigned long long __c6_gc_live(void)
+{
+    return (unsigned long long)c6_gc_live_count;
+}
+
+unsigned long long __c6_gc_refcount(void *p)
+{
+    if (!p)
+        return 0;
+    return (unsigned long long)(c6_gc_hdr(p)->rc & ~C6_GC_DEAD);
+}
+
+void __c6_gc_drain_budget(int n)
+{
+    TccThCtx *th = tcc_th();
+
+    if (n <= 0)
+        n = C6_GC_DRAIN_BUDGET;
+    c6_gc_drain(th, n);
+}
+
+/* ------------------------------------------------------------------------- */
+/* managed globals: they live as long as the program, so they are released at
+   exit instead of at the end of a scope.  The compiler emits one constructor
+   per unit that hands over the address of every managed global (and of every
+   'static' managed local), together with the shape of the slot block.       */
+
+typedef struct C6GcRoot {
+    void *block;
+    int kind;
+    unsigned long count, stride;
+} C6GcRoot;
+
+static C6GcRoot *c6_gc_roots;
+static int c6_nb_gc_roots, c6_cap_gc_roots;
+static int c6_gc_shut_down;
+
+void __c6_gc_shutdown(void);
+extern void *realloc(void *, unsigned long);
+
+void __c6_gc_root(void *block, int kind, unsigned long count,
+                  unsigned long stride)
+{
+    if (!block || !count)
+        return;
+    if (c6_nb_gc_roots == c6_cap_gc_roots) {
+        int cap = c6_cap_gc_roots ? c6_cap_gc_roots * 2 : 16;
+        C6GcRoot *nr = (C6GcRoot *)realloc(c6_gc_roots,
+                       (unsigned long)cap * sizeof *nr);
+        if (!nr)
+            return;                 /* out of memory: leak instead of crash */
+        c6_gc_roots = nr;
+        c6_cap_gc_roots = cap;
+    }
+    c6_gc_roots[c6_nb_gc_roots].block = block;
+    c6_gc_roots[c6_nb_gc_roots].kind = kind;
+    c6_gc_roots[c6_nb_gc_roots].count = count;
+    c6_gc_roots[c6_nb_gc_roots].stride = stride;
+    c6_nb_gc_roots++;
+}
+
+/* release the managed globals, the last one declared first */
+static void c6_gc_release_roots(void)
+{
+    while (c6_nb_gc_roots > 0) {
+        C6GcRoot *r = &c6_gc_roots[--c6_nb_gc_roots];
+        unsigned long i;
+
+        for (i = 0; i < r->count; i++)
+            c6_gc_release_slot((void **)((char *)r->block + i * r->stride),
+                               r->kind);
+    }
+}
+
+/* runs from a destructor the compiler emits, so the managed globals of a
+   program are released once, at exit */
+void __c6_gc_shutdown(void)
+{
+    if (c6_gc_shut_down)
+        return;
+    c6_gc_shut_down = 1;
+    c6_gc_release_roots();
+    tcc_th_gc_free_all(tcc_th());
+}
+
 
 /* ------------------------------------------------------------------------- */
 /* c6 extension runtime: slices 'T[:]'                                   */
@@ -1096,6 +1632,7 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 #define C6_CO_KIND_IO     1
 #define C6_CO_KIND_CHILD  2
 #define C6_CO_KIND_ERR    3
+#define C6_CO_KIND_ABORT  5   /* the task is being destroyed: run cleanups */
 
 #define C6_CO_STATE_NEW   0
 #define C6_CO_STATE_DONE  (-1)
@@ -1109,6 +1646,7 @@ typedef struct TccCoTask {
     void *desc, *frame, *defer_arena, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
+    void *frame_addr;           /* where the frame was parked */
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
     int waiting;                /* parked on wait_fd, waiting for select() */
@@ -1118,6 +1656,7 @@ typedef struct TccCoDesc {
     unsigned size, align;
     int defer_max;
     int (*entry)(void *);
+    void (*release)(void *);    /* give back what the task slot owns */
 } TccCoDesc;
 
 /* One slot per task, big enough for 'struct NAME_task' (the header plus the
@@ -1242,6 +1781,9 @@ void __c6_co_suspend(void *self, int kind, int state,
     if (size < 0 || size > C6_CO_FRAME_MAX)
         tcc_co_trap();
     t->frame_size = size;
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    t->frame_addr = base - size;
+#endif
     tcc_co_copy(co->frames[idx], base - size, size);
     t->frame = co->frames[idx];
     t->state = state;
@@ -1280,6 +1822,23 @@ void __c6_co_restore(void *self, char *base)
     int idx = tcc_co_index(co, t);
     int i, n = t->defer_cap;
 
+    /* The saved frame holds absolute addresses (locals taken by '&', the
+       defer records' pointer to the frame), so it may only be put back
+       exactly where it came from.  A different address means the task was
+       resumed at another stack depth (or on another thread): the frame would
+       be written over whatever lives there, silently corrupting that
+       function's locals.  Fail loudly instead. */
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    /* A saved native frame holds absolute addresses (a local taken by '&',
+       a cleanup record pointing at the frame), so it may only be put back
+       where it came from; anywhere else it overwrites whatever lives there.
+       Measured: a 'co' body started inside one function and resumed from
+       __c6_co_run() *does* land elsewhere, so this cannot simply trap - the
+       fix is a per-task stack (P7).  Build the runtime with this defined to
+       look for a suspend point that moves a frame. */
+    if (t->frame_addr && t->frame_addr != base - t->frame_size)
+        tcc_co_trap();
+#endif
     tcc_co_copy(base - t->frame_size, co->frames[idx], t->frame_size);
     for (i = 0; i < n; i++)
         tcc_th_dstack(th)[t->defer_base + i] = co->parked[idx][i];
@@ -1404,6 +1963,7 @@ static int tcc_co_step_once(TccCoTask *t)
     switch (k) {
     case C6_CO_KIND_DONE:
     case C6_CO_KIND_ERR:
+    case C6_CO_KIND_ABORT:
         leaf->state = C6_CO_STATE_DONE;
         leaf->kind = k;
         break;
@@ -1577,6 +2137,23 @@ int __c6_co_wait(void *self)
 
 /* Release a task and everything it owns.  A still-suspended body is dropped
    without running its remaining 'defer' statements. */
+void __c6_co_abort(void *self)
+{
+    TccCoTask *t = (TccCoTask *)self;
+
+    if (!t || t->state == C6_CO_STATE_DONE)
+        return;
+    /* the child owns the frame that is parked: roll it back first */
+    if (t->child)
+        __c6_co_abort(t->child);
+    t->child = 0;
+    if (t->state == C6_CO_STATE_NEW)
+        return;                     /* never started: nothing was allocated */
+    t->kind = C6_CO_KIND_ABORT;
+    t->waiting = 0;                 /* leave any parked descriptor wait */
+    tcc_co_step_once(t);            /* restore the frame, run the cleanups */
+}
+
 void __c6_co_destroy(void *self)
 {
     TccCoPool *co = tcc_th_co(tcc_th());
@@ -1584,10 +2161,16 @@ void __c6_co_destroy(void *self)
 
     if (!t)
         return;
+    if (t->state != C6_CO_STATE_DONE)
+        __c6_co_abort(t);           /* it still owns references: give back */
     if (t->child)
         __c6_co_destroy(t->child);
     t->child = 0;
     t->parent = 0;
+    /* the task owned one reference per managed parameter (and the return
+       value): give them back before the slot is reused */
+    if (t->desc && ((TccCoDesc *)t->desc)->release)
+        ((TccCoDesc *)t->desc)->release(t);
     tcc_co_unlink((TccCoTask **)&co->runlist, t);
     co->live[tcc_co_index(co, t)] = 0;
 }

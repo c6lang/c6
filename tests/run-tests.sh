@@ -181,9 +181,17 @@ for src in "$ROOT"/tests/errors/*.c; do
     name="errors/$(basename "$src" .c)"
     is_wanted "$name" || continue
 
+    # 同名的一半放在 tests/tu/ 时可以带第二个翻译单元一起编译（跨 TU 的
+    # 环检测这类诊断要两个单元才看得见）
+    extra=
+    tu_src="$ROOT/tests/tu/$(basename "$src")"
+    [ -e "$tu_src" ] && extra="$tu_src"
+
     # 期望表：片段名 <TAB> 诊断文本
     sed -n 's,^// *EXPECT *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect"
     sed -n 's,^// *EXPECT-C99 *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect-c99"
+    # 只适用于本机后端的片段（C99 后端没有链接期检查之类）
+    sed -n 's,^// *NATIVE-ONLY *\([A-Za-z0-9_]*\).*$,\1,p' "$src" > "$TMP/native-only"
     frags=$(cut -f1 "$TMP/expect" | awk '!seen[$0]++')
 
     ok=yes
@@ -191,6 +199,10 @@ for src in "$ROOT"/tests/errors/*.c; do
 
     # 2a. 每个片段都必须报出声明的全部诊断
     for frag in $frags; do
+        if [ "$BACKEND" = c99 ] \
+           && grep -qx "$frag" "$TMP/native-only"; then
+            continue                # 这个片段只在本机后端成立
+        fi
         if [ "$BACKEND" = c99 ] \
            && awk -F'\t' -v f="$frag" '$1 == f { found = 1 } END { exit !found }' \
                   "$TMP/expect-c99"; then
@@ -201,7 +213,7 @@ for src in "$ROOT"/tests/errors/*.c; do
 
         if [ "$BACKEND" = c99 ]; then
             if $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
-                    -D"$frag" -o "$TMP/diag.c" "$src" \
+                    -D"$frag" -o "$TMP/diag.c" "$src" $extra \
                     2>"$TMP/err" >/dev/null; then
                 # 生成成功不等于有错：没有机器码链接步骤的未解析引用，
                 # 要由系统 C 编译器在链接时才会报出来
@@ -211,6 +223,14 @@ for src in "$ROOT"/tests/errors/*.c; do
                     detail="$detail
 -D$frag: 没有报错"
                 fi
+            fi
+        elif [ -n "$extra" ]; then
+            # 有两个单元时必须走真正的编译+链接（-run 只接一个源文件）
+            if build_exe "$TMP/diag.bin" "$src" $extra \
+                    -D"$frag" 2>"$TMP/err" >/dev/null; then
+                ok=no
+                detail="$detail
+-D$frag: 没有报错"
             fi
         else
             if $TCC $BASE $TCCFLAGS -D"$frag" -run "$src" \
@@ -234,7 +254,7 @@ $(cat "$TMP/missing")"
     done
 
     # 2b. 不带 -D 时必须能编译并运行通过
-    if ! out=$(build_exe "$TMP/errors.bin" "$src" 2>"$TMP/err" && "$TMP/errors.bin" 2>>"$TMP/err"); then
+    if ! out=$(build_exe "$TMP/errors.bin" "$src" $extra 2>"$TMP/err" && "$TMP/errors.bin" 2>>"$TMP/err"); then
         ok=no
         detail="$detail
 正常路径编译或运行失败:$(cat "$TMP/err")$out"

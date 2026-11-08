@@ -822,6 +822,66 @@ int main(void)
 ./tcc/tcc -B tcc -std=c6 -run examples/thread_demo.c
 ```
 
+### 托管引用（引用计数 GC）
+
+`@T` 是**托管引用**（指向 `T` 的裸指针，多了一个 `@`）：对象的生命由引用
+计数决定，最后一个引用消失时释放。没有标记清扫、没有 STW —— 计数就在对象头
+里，加减都是普通的内存写，只有 `shared` 才走原子指令。
+
+```c
+struct Node { int v; own @Node next; };
+
+void f(void)
+{
+    @Node a = new Node;      /* 计数 1，作用域退出时自动释放 */
+    @Node b = new Node;
+    a->v = 1;
+    b->v = 2;
+    a->next = move(b);       /* 独占链：b 的槽交出去，链由 a 带着走 */
+    a = NULL;                /* 想提前放手就赋空，不需要 reset() */
+}                            /* a 的链在这里整条释放 */
+```
+
+| 写法 | 含义 |
+|---|---|
+| `@T p` | 强引用，计数，可以有多个 |
+| `shared @T p` | 强引用，计数是**原子**的，可以跨线程；对象要用 `new shared T` 建 |
+| `weak @T p` | 弱引用，不计数；解引用前必须先升级（`@T q = p;`） |
+| `own @T p` | 独占，不计数；持有者死亡时整条链递归释放；只能接 `new` 或 `move()` |
+
+规则：
+
+- 托管引用只能存进托管槽（局部、字段、元素、全局都算）；`T *p = managed;`
+  只允许**立即使用**，保存会被拒（借出的指针没有计数，保存下来就是 UAF），
+  新引用存进裸指针同样报错；
+- 含托管字段的结构体不能按值拷贝/传参/返回（`memcpy` 也是），只能 `new`；
+- 形参是**借用**：被调者不计数、不释放，也不能改写（要留住就拷进自有局部
+  `@T m = n;`）；`async`/`go` 的边界只能传 `shared @T`；
+- **环是编译错误**。类型图上出现自环或互环直接报错，出路只有两个：把反向
+  边改成 `weak`，或者把子链改成 `own`。这也顺带把「父→子强、子→父弱」和
+  「树用 own」逼成了默认写法；
+- 析构函数写成方法 `void drop(struct T *self)`：最后一个引用消失时跑一次，
+  在字段释放**之前**，不能失败、不能挂起、不能手动调用。
+
+```c
+struct File { int fd; };
+void drop(struct File *self) { close(self->fd); }
+```
+
+`async`/`go` 的任务**自己持有**一份参数和返回值（进任务 +1、任务销毁 −1），
+所以「创建者先放手、任务后跑完」是安全的；没跑完就被销毁的任务会回卷
+（跑 `errdefer`/`defer`/释放），不会漏引用。
+
+代价与尺寸（x86_64，热缓存，跨 TU 不内联）：`@T` 的一次加/减约 2.2 ns，
+`shared @T` 约 8.4 ns（原子指令 + helper 调用）；每个对象 32 字节头；
+作用域退出时释放是**内联**的，约 2.5 ns/引用。对照同机 `std::shared_ptr`
+的 6.3 ns/操作：单线程 `@T` 更快，`shared @T` 同量级。
+
+和 C++ 智能指针的差别：`@T` 就是裸指针（8 字节、能过 C ABI，`shared_ptr`
+是 16 字节加一个控制块）；拷贝被编译器限制在托管槽之间（`shared_ptr` 随手
+可拷）；环不会静默泄漏 —— 编译期就报错；另外 `p = NULL` 就是 `reset()`，
+不额外引入成员函数。详细的设计与取舍见 [docs/gc-design.md](docs/gc-design.md)。
+
 ### #macro / __local
 
 ```c
@@ -854,6 +914,13 @@ tests/
 ├── tuple_thread.c    元组 + go（OS 线程）
 ├── async.c           async / await / co / task
 ├── thread.c          go（OS 线程）
+├── gc.c              托管引用：分配、存储、作用域释放、数组
+├── gc_field.c        字段释放、嵌套结构体、长链迭代释放
+├── gc_type.c         shared / weak / own 的类型语义
+├── gc_drop.c         析构方法 drop（含数组元素与 go 线程）
+├── gc_thread.c       shared 跨线程：实参块持有、交接、并发加减
+├── gc_async.c        async 任务的参数/返回值持有 + 销毁挂起任务时回卷
+├── gc_own.c          own 独占链/子树 + move()
 ├── typename.c        裸 tag 类型名（省略 struct / union / enum）
 ├── tu/               跨翻译单元的第二个 .c（同名的主文件会一起编译）
 ├── abi/              ABI 兼容：同一份代码用 -std=c6 和纯 C 各编译一个 TU，
@@ -907,6 +974,14 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 运行器为每个 `EXPECT` 片段跑一次 `-D<片段>`，检查 stderr 含声明的文本，
 再检查不带 `-D` 时该文件能编译并运行通过。
 
+两条额外的约定：
+
+- `tests/tu/<同名>.c` 存在时会作为**第二个翻译单元**一起编译（跨 TU 的环
+  检测这类诊断要两个单元才看得见；`-run` 只接一个源文件，所以这种情况下
+  运行器改用编译 + 链接）；
+- `// NATIVE-ONLY <片段>` 标记该片段只在本机后端成立，`BACKEND=c99` 时跳过
+  （例如跨 TU 环检查 —— C99 后端只输出 C 源码，没有链接期）。
+
 ### 完整回归
 
 ```sh
@@ -959,7 +1034,8 @@ make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2
 - 元组复用 `VT_STRUCT` 和内部 tag `__c6_tuple_N`，布局在构造类型时按自然对齐
   算好（不读 `pack_stack_ptr`），因此 `#pragma pack`、成员顺序、对齐都不会改变
   它的 ABI；元素名 `__c6_t0`…只为实现细节，对外只有 `t[i]`。
-- 切片是普通 `static`/自动对象，没有隐藏状态也没有 GC：越界检查由
+- 切片是普通 `static`/自动对象，没有隐藏状态也没有 GC（托管引用 `@T` 是
+  另一回事，它的计数在对象头里）：越界检查由
   `libtcc1` 的 `__tcc_slice_index` / `__tcc_slice_sub` 完成，元素类型不参与
   ABI，因此两个 TU 只要都写 `T[:]` 就能互通。
 

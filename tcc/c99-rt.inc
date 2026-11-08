@@ -60,12 +60,17 @@ typedef struct C99DeferCtx {
 
 typedef struct C99CoPool C99CoPool;   /* completed with the async runtime */
 typedef struct C99ThRec C99ThRec;     /* threads started by this thread */
+typedef struct C99GcHdr C99GcHdr;     /* completed with the gc runtime */
 
 typedef struct C99ThCtx {
     C99DeferRec *dstack;  int dsp, stack_cap;
     C99DeferCtx *dctx;    int dcsp, ctx_cap;
     int err_flag, err_id;
     const char *err_msg;
+    C99GcHdr *gc_pending; /* objects whose count reached zero */
+    C99GcHdr *gc_pending_tail;
+    int gc_pending_n;
+    int gc_draining;      /* a drain loop is already running on this thread */
     C99CoPool *co;
     C99ThRec *th_list;    /* children, joined when the thread exits */
     int th_freed;
@@ -98,6 +103,7 @@ C99_RT_UNUSED __c99_rt_linkage void *__c99_alloc(unsigned long size)
 }
 
 C99_RT_UNUSED __c99_rt_linkage void __c99_co_free(C99CoPool *co);
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_all(C99ThCtx *th);
 
 /* Join every thread this thread started.  A 'go' statement has no place
    where it could be joined, so the starter reaps its threads when it exits;
@@ -121,6 +127,7 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_th_free(C99ThCtx *th)
     if (!th || th->th_freed)
         return;
     th->th_freed = 1;
+    __c99_gc_free_all(th);
     __c99_join_children(th);
     if (th->dstack)
         free(th->dstack);
@@ -477,6 +484,7 @@ C99_RT_UNUSED __c99_rt_linkage void __tcc_slice_sub(void *out, const void *slice
 #define C6_CO_KIND_IO     1
 #define C6_CO_KIND_CHILD  2
 #define C6_CO_KIND_ERR    3
+#define C6_CO_KIND_ABORT  5   /* the task is being destroyed: run cleanups */
 
 #define C6_CO_STATE_NEW   0
 #define C6_CO_STATE_DONE  (-1)
@@ -490,6 +498,7 @@ typedef struct C99CoTask {
     void *desc, *frame, *defer_arena, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
+    void *frame_addr;
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
     int waiting;                /* parked on wait_fd, waiting for select() */
@@ -499,6 +508,7 @@ typedef struct C99CoDesc {
     unsigned size, align;
     int defer_max;
     int (*entry)(void *);
+    void (*release)(void *);    /* give back what the task slot owns */
 } C99CoDesc;
 
 /* One slot per task, big enough for 'struct NAME_task' (the header plus the
@@ -622,6 +632,9 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int st
     if (size < 0 || size > C6_CO_FRAME_MAX)
         __c99_co_trap();
     t->frame_size = size;
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    t->frame_addr = base - size;
+#endif
     __c99_co_copy(co->frames[idx], base - size, size);
     t->frame = co->frames[idx];
     t->state = state;
@@ -660,6 +673,10 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_restore(void *self, char *base)
     int idx = __c99_co_index(co, t);
     int i, n = t->defer_cap;
 
+#ifdef C6_CO_CHECK_FRAME_ADDR
+    if (t->frame_addr && t->frame_addr != base - t->frame_size)
+        __c99_co_trap();
+#endif
     __c99_co_copy(base - t->frame_size, co->frames[idx], t->frame_size);
     for (i = 0; i < n; i++)
         __c99_dstack(th)[t->defer_base + i] = co->parked[idx][i];
@@ -786,6 +803,7 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
     switch (k) {
     case C6_CO_KIND_DONE:
     case C6_CO_KIND_ERR:
+    case C6_CO_KIND_ABORT:
         leaf->state = C6_CO_STATE_DONE;
         leaf->kind = k;
         break;
@@ -965,6 +983,22 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_wait(void *self)
 
 /* Release a task and everything it owns.  A still-suspended body is dropped
    without running its remaining 'defer' statements. */
+C99_RT_UNUSED __c99_rt_linkage void __c6_co_abort(void *self)
+{
+    C99CoTask *t = (C99CoTask *)self;
+
+    if (!t || t->state == C6_CO_STATE_DONE)
+        return;
+    if (t->child)
+        __c6_co_abort(t->child);
+    t->child = 0;
+    if (t->state == C6_CO_STATE_NEW)
+        return;
+    t->kind = C6_CO_KIND_ABORT;
+    t->waiting = 0;
+    __c99_co_step_once(t);
+}
+
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_destroy(void *self)
 {
     C99CoPool *co = __c99_th_co(__c99_th());
@@ -972,10 +1006,16 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_destroy(void *self)
 
     if (!t)
         return;
+    if (t->state != C6_CO_STATE_DONE)
+        __c6_co_abort(t);           /* it still owns references: give back */
     if (t->child)
         __c6_co_destroy(t->child);
     t->child = 0;
     t->parent = 0;
+    /* the task owned one reference per managed parameter (and the return
+       value): give them back before the slot is reused */
+    if (t->desc && ((C99CoDesc *)t->desc)->release)
+        ((C99CoDesc *)t->desc)->release(t);
     __c99_co_unlink((C99CoTask **)&co->runlist, t);
     co->live[__c99_co_index(co, t)] = 0;
 }
@@ -988,3 +1028,462 @@ C99_RT_UNUSED __c99_rt_linkage int c6_io(int fd, int ev)
     (void)ev;
     return -1;
 }
+
+/* c6 extension runtime: reference counted managed references '@T'           */
+/*                                                                           */
+/* Every object made by 'new T' carries a 32 byte header: the reference      */
+/* count, the element count together with the object flags, the type          */
+/* descriptor and either the list of weak references pointing at it or the    */
+/* link in the per-thread free queue.  Dropping a reference only queues the   */
+/* object; the queue is drained in batches, so freeing a long chain does not  */
+/* need one C stack frame per link.                                          */
+
+#define C99_GC_HDR_SIZE   32
+#define C99_GC_DEAD       (1UL << 63)
+#define C99_GC_FRESH      1
+#define C99_GC_ATOMIC     2
+#define C99_GC_WEAK       4
+#define C99_GC_OWN        8
+#define C99_GC_INIT       16
+
+#define C99_GCK_STRONG 1
+#define C99_GCK_WEAK   2
+#define C99_GCK_OWN    3
+#define C99_GCK_EMBED  4
+
+#define C99_GC_META_COUNT 0xffffffffffUL
+#define C99_GC_META_FLAGS(meta) ((int)((meta) >> 40))
+
+#define C99_GC_DRAIN_BUDGET 256
+
+#define C99_GC_A_ACQ_REL 4
+#define C99_GC_A_ACQUIRE 2
+
+typedef struct C99GcWeak {
+    void **slot;
+    struct C99GcWeak *next;
+} C99GcWeak;
+
+/* the descriptor the compiler's type metadata uses */
+struct __c6_gc_desc;
+
+typedef struct C99GcField {
+    unsigned off, kind, count, stride;
+    const struct __c6_gc_desc *sub;
+} C99GcField;
+
+struct __c6_gc_desc {
+    unsigned size, align, nfields, flags;
+    void (*drop)(void *);
+    const C99GcField *fields;
+};
+
+struct C99GcHdr {
+    unsigned long rc;
+    unsigned long meta;
+    const struct __c6_gc_desc *desc;
+    union {
+        C99GcWeak *weak;
+        C99GcHdr *next;
+    } u;
+};
+
+C99_RT_UNUSED __c99_rt_linkage unsigned long __c99_gc_live_count;
+
+C99_RT_UNUSED __c99_rt_linkage C99GcHdr *__c99_gc_hdr(void *p)
+{
+    return (C99GcHdr *)p - 1;
+}
+
+C99_RT_UNUSED __c99_rt_linkage int __c99_gc_is_atomic(C99GcHdr *h)
+{
+    return (C99_GC_META_FLAGS(h->meta) & C99_GC_ATOMIC) != 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_inc(C99GcHdr *h)
+{
+    if (__c99_gc_is_atomic(h))
+        __atomic_fetch_add(&h->rc, 1UL, C99_GC_A_ACQ_REL);
+    else
+        h->rc++;
+}
+
+/* defined below: the field release runs inside the free path */
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_drop(C99GcHdr *h);
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_destroy(C99GcHdr *h);
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_weak_unlink(void **slot, void *p);
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_release_slot(void **slot, int kind)
+{
+    void *p = *slot;
+
+    if (!p)
+        return;
+    if (kind == C99_GCK_WEAK) {
+        __c99_gc_weak_unlink(slot, p);
+        *slot = 0;
+        return;
+    }
+    *slot = 0;
+    if (kind == C99_GCK_OWN)
+        __c99_gc_destroy(__c99_gc_hdr(p));
+    else
+        __c99_gc_drop(__c99_gc_hdr(p));
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_release_block(char *base,
+                                                           const struct __c6_gc_desc *d)
+{
+    unsigned k;
+
+    if (!d)
+        return;
+    for (k = 0; k < d->nfields; k++) {
+        const C99GcField *f = &d->fields[k];
+        unsigned i;
+
+        for (i = 0; i < f->count; i++) {
+            char *p = base + f->off + (size_t)i * f->stride;
+            if (f->kind == C99_GCK_EMBED)
+                __c99_gc_release_block(p, f->sub);
+            else
+                __c99_gc_release_slot((void **)p, (int)f->kind);
+        }
+    }
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_one(C99GcHdr *h)
+{
+    const struct __c6_gc_desc *d = h->desc;
+
+    if (d) {
+        unsigned long n = h->meta & C99_GC_META_COUNT, i;
+        for (i = 0; i < n; i++) {
+            char *base = (char *)(h + 1) + i * (size_t)d->size;
+            if (d->drop)
+                d->drop(base);
+            if (d->nfields)
+                __c99_gc_release_block(base, d);
+        }
+    }
+    if (__c99_gc_live_count)
+        __c99_gc_live_count--;
+    free(h);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_drain(C99ThCtx *th, int budget)
+{
+    int n = 0;
+
+    if (th->gc_draining)
+        return;
+    th->gc_draining = 1;
+    while (th->gc_pending && n < budget) {
+        C99GcHdr *h = th->gc_pending;
+        th->gc_pending = h->u.next;
+        if (!th->gc_pending)
+            th->gc_pending_tail = 0;
+        th->gc_pending_n--;
+        n++;
+        __c99_gc_free_one(h);
+    }
+    th->gc_draining = 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_all(C99ThCtx *th)
+{
+    while (th->gc_pending) {
+        C99GcHdr *h = th->gc_pending;
+        th->gc_pending = h->u.next;
+        th->gc_pending_n--;
+        __c99_gc_free_one(h);
+    }
+    th->gc_pending_tail = 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_die(C99GcHdr *h)
+{
+    C99ThCtx *th;
+    C99GcWeak *w;
+
+    h->rc = C99_GC_DEAD;
+    w = h->u.weak;
+    h->u.weak = 0;
+    while (w) {
+        C99GcWeak *next = w->next;
+        *w->slot = 0;
+        free(w);
+        w = next;
+    }
+    th = __c99_th();
+    h->u.next = 0;
+    if (th->gc_pending_tail)
+        th->gc_pending_tail->u.next = h;
+    else
+        th->gc_pending = h;
+    th->gc_pending_tail = h;
+    th->gc_pending_n++;
+    __c99_gc_drain(th, C99_GC_DRAIN_BUDGET);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_drop(C99GcHdr *h)
+{
+    unsigned long old;
+
+    if (__c99_gc_is_atomic(h)) {
+        old = __atomic_fetch_sub(&h->rc, 1UL, C99_GC_A_ACQ_REL);
+        if (old != 1)
+            return;
+    } else {
+        if (--h->rc != 0)
+            return;
+    }
+    __c99_gc_die(h);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_destroy(C99GcHdr *h)
+{
+    if (h->rc & C99_GC_DEAD)
+        return;
+    h->rc = 1;
+    __c99_gc_die(h);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_weak_unlink(void **slot, void *p)
+{
+    C99GcWeak **pp;
+
+    for (pp = &__c99_gc_hdr(p)->u.weak; *pp; pp = &(*pp)->next) {
+        C99GcWeak *w = *pp;
+        if (w->slot == slot) {
+            *pp = w->next;
+            free(w);
+            return;
+        }
+    }
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_weak_add(void **slot, void *p)
+{
+    C99GcHdr *h = __c99_gc_hdr(p);
+    C99GcWeak *w = (C99GcWeak *)__c99_alloc(sizeof *w);
+
+    w->slot = slot;
+    w->next = h->u.weak;
+    h->u.weak = w;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_new(unsigned long size,
+                                                 unsigned long count,
+                                                 const void *desc, int flags)
+{
+    unsigned long total;
+    C99GcHdr *h;
+
+    if (size == 0)
+        size = 1;
+    if (count == 0)
+        count = 1;
+    if (count > ((unsigned long)-1 - C99_GC_HDR_SIZE) / size)
+        __c99_trap();
+    total = size * count;
+    h = (C99GcHdr *)__c99_alloc(C99_GC_HDR_SIZE + total);
+    h->rc = 1;
+    h->meta = count & C99_GC_META_COUNT;
+    if (flags & C99_GC_ATOMIC)
+        h->meta |= (unsigned long)C99_GC_ATOMIC << 40;
+    h->desc = (const struct __c6_gc_desc *)desc;
+    __c99_gc_live_count++;
+    return h + 1;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_store(void **slot, void *nv,
+                                                   int mode)
+{
+    int init = (mode & C99_GC_INIT) != 0;
+    void *old = init ? 0 : *slot;
+
+    if (mode & C99_GC_WEAK) {
+        if (!init && old == nv)
+            return nv;
+        if (old)
+            __c99_gc_weak_unlink(slot, old);
+        *slot = nv;
+        if (nv)
+            __c99_gc_weak_add(slot, nv);
+        return nv;
+    }
+    if (!init && old == nv)
+        return nv;
+    if (nv && !(mode & C99_GC_FRESH))
+        __c99_gc_inc(__c99_gc_hdr(nv));
+    *slot = nv;
+    if (old) {
+        if (mode & C99_GC_OWN)
+            __c99_gc_destroy(__c99_gc_hdr(old));
+        else
+            __c99_gc_drop(__c99_gc_hdr(old));
+    }
+    return nv;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_own_store(void **slot, void *nv,
+                                                       int mode)
+{
+    int init = (mode & C99_GC_INIT) != 0;
+    void *old = init ? 0 : *slot;
+
+    if (!init && old == nv)
+        return nv;
+    *slot = nv;
+    if (old)
+        __c99_gc_destroy(__c99_gc_hdr(old));
+    return nv;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_release(void **slot, int mode)
+{
+    void *p = *slot;
+
+    if (!p)
+        return;
+    *slot = 0;
+    if (mode & C99_GC_WEAK)
+        __c99_gc_weak_unlink(slot, p);
+    else if (mode & C99_GC_OWN)
+        __c99_gc_destroy(__c99_gc_hdr(p));
+    else
+        __c99_gc_drop(__c99_gc_hdr(p));
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_move(void **slot)
+{
+    void *p = *slot;
+
+    *slot = 0;
+    return p;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_incref(void *p)
+{
+    if (p)
+        __c99_gc_inc(__c99_gc_hdr(p));
+    return p;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_drop(void *p)
+{
+    if (p)
+        __c99_gc_drop(__c99_gc_hdr(p));
+    return 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_weak_store(void **dst,
+                                                          void **weak_slot,
+                                                          int mode)
+{
+    void *p = *weak_slot;
+    C99GcHdr *h;
+
+    if (p) {
+        h = __c99_gc_hdr(p);
+        if (__c99_gc_is_atomic(h)) {
+            unsigned long expected, desired;
+            for (;;) {
+                expected = h->rc;
+                if (expected & C99_GC_DEAD)
+                    break;
+                desired = expected + 1;
+                if (__atomic_compare_exchange(&h->rc, &expected, &desired, 0,
+                                              C99_GC_A_ACQ_REL,
+                                              C99_GC_A_ACQUIRE))
+                    goto owned;
+            }
+        } else if (!(h->rc & C99_GC_DEAD)) {
+            h->rc++;
+            goto owned;
+        }
+        p = 0;                      /* died while we looked at it */
+    }
+owned:
+    return __c6_gc_store(dst, p, (mode & ~C99_GC_WEAK) | C99_GC_FRESH);
+}
+
+C99_RT_UNUSED __c99_rt_linkage unsigned long long __c6_gc_live(void)
+{
+    return (unsigned long long)__c99_gc_live_count;
+}
+
+C99_RT_UNUSED __c99_rt_linkage unsigned long long __c6_gc_refcount(void *p)
+{
+    if (!p)
+        return 0;
+    return (unsigned long long)(__c99_gc_hdr(p)->rc & ~C99_GC_DEAD);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_drain_budget(int n)
+{
+    C99ThCtx *th = __c99_th();
+
+    if (n <= 0)
+        n = C99_GC_DRAIN_BUDGET;
+    __c99_gc_drain(th, n);
+}
+
+/* managed globals: released at exit, see libtcc1.c */
+typedef struct C99GcRoot {
+    void *block;
+    int kind;
+    unsigned long count, stride;
+} C99GcRoot;
+
+static C99GcRoot *__c99_gc_roots;
+static int __c99_nb_gc_roots, __c99_cap_gc_roots;
+static int __c99_gc_shut_down;
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_release_slot(void **slot,
+                                                           int kind);
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_root(void *block, int kind,
+                                                 unsigned long count,
+                                                 unsigned long stride)
+{
+    if (!block || !count)
+        return;
+    if (__c99_nb_gc_roots == __c99_cap_gc_roots) {
+        int cap = __c99_cap_gc_roots ? __c99_cap_gc_roots * 2 : 16;
+        C99GcRoot *nr = (C99GcRoot *)realloc(__c99_gc_roots,
+                       (unsigned long)cap * sizeof *nr);
+        if (!nr)
+            return;
+        __c99_gc_roots = nr;
+        __c99_cap_gc_roots = cap;
+    }
+    __c99_gc_roots[__c99_nb_gc_roots].block = block;
+    __c99_gc_roots[__c99_nb_gc_roots].kind = kind;
+    __c99_gc_roots[__c99_nb_gc_roots].count = count;
+    __c99_gc_roots[__c99_nb_gc_roots].stride = stride;
+    __c99_nb_gc_roots++;
+}
+
+static void __c99_gc_release_roots(void)
+{
+    while (__c99_nb_gc_roots > 0) {
+        C99GcRoot *r = &__c99_gc_roots[--__c99_nb_gc_roots];
+        unsigned long i;
+
+        for (i = 0; i < r->count; i++)
+            __c99_gc_release_slot((void **)((char *)r->block + i * r->stride),
+                                  r->kind);
+    }
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_shutdown(void)
+{
+    if (__c99_gc_shut_down)
+        return;
+    __c99_gc_shut_down = 1;
+    __c99_gc_release_roots();
+    __c99_gc_free_all(__c99_th());
+}
+

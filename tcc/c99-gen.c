@@ -784,6 +784,12 @@ static const char * const c99_runtime_names[] = {
     "__c6_co_finish", "__c6_co_state", "__c6_co_kind", "__c6_co_set_io",
     "__c6_co_rev", "__c6_co_wait", "__c6_co_destroy", "__c6_co_run",
     "__c6_th_join_all", "c6_io",
+    "__c6_gc_new", "__c6_gc_store", "__c6_gc_own_store", "__c6_gc_release",
+    "__c6_gc_incref",
+    "__c6_gc_move", "__c6_gc_drop", "__c6_gc_weak_store",
+    "__c6_gc_live", "__c6_gc_refcount", "__c6_gc_drain_budget",
+    "__c6_gc_shutdown",
+    "__c6_gc_root",
 };
 
 static int c99_is_runtime_name(const char *name)
