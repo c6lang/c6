@@ -28,7 +28,7 @@
 #endif
 #include "tcctools.c"
 
-#ifdef TCC_TARGET_C99
+#if defined(TCC_TARGET_C99) || defined(CONFIG_EMBED_C99)
 # ifndef _WIN32
 #  include <sys/stat.h>
 # endif
@@ -46,6 +46,9 @@ static const char help[] =
 #else
     "  -c           compile only - generate an object file\n"
     "  -o outfile   set output filename\n"
+#endif
+#ifdef CONFIG_EMBED_C99
+    "  -c99         generate portable C source (also -o out.c / -o dir)\n"
 #endif
     "  -run         run compiled source\n"
     "  -fflag       set or reset (with 'no-' prefix) 'flag' (see tcc -hh)\n"
@@ -309,7 +312,7 @@ static unsigned getclock_ms(void)
 #endif
 }
 
-#ifdef TCC_TARGET_C99
+#if defined(TCC_TARGET_C99) || defined(CONFIG_EMBED_C99)
 /* -o may name a directory: each translation unit then gets its own
    generated C file, named after its input file. */
 static int is_dir_path(const char *path)
@@ -329,7 +332,9 @@ static int has_trailing_dirsep(const char *path)
     int n = strlen(path);
     return n > 0 && IS_DIRSEP(path[n - 1]);
 }
+#endif
 
+#ifdef TCC_TARGET_C99
 static int same_file(const char *a, const char *b)
 {
     if (!strcmp(a, b))
@@ -368,6 +373,48 @@ static char *c99_output_in_dir(const char *dir, const char *infile)
 }
 #endif /* TCC_TARGET_C99 */
 
+#ifdef CONFIG_EMBED_C99
+/* The native tcc carries the C99 output back-end as a second, embedded
+   compiler (see tcc/Makefile).  This decides when that one should run:
+   -c99 asks explicitly; otherwise a .c output file, or an output directory,
+   is what the C back-end can produce.  Preprocessing and linking options
+   keep their native meaning. */
+static int has_c99_suffix(const char *path)
+{
+    int n = strlen(path);
+    return n >= 2 && path[n - 2] == '.' && path[n - 1] == 'c';
+}
+
+static int wants_c99_output(int argc, char **argv)
+{
+    const char *out = NULL;
+    int i;
+
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "-c99"))
+            return 1;
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        /* preprocessing, dependency output and linking are native jobs */
+        if (!strcmp(a, "-E") || !strcmp(a, "-shared")
+            || !strncmp(a, "-r", 2) || !strncmp(a, "-M", 2))
+            return 0;
+        if (!strcmp(a, "-o")) {
+            if (i + 1 < argc)
+                out = argv[++i];
+        } else if (!strncmp(a, "-o", 2) && a[2]) {
+            out = a + 2;
+        }
+    }
+    if (!out)
+        return 0;
+    return has_c99_suffix(out) || is_dir_path(out)
+        || has_trailing_dirsep(out);
+}
+
+extern int c99_main(int argc, char **argv);
+#endif /* CONFIG_EMBED_C99 */
+
 int main(int argc, char **argv)
 {
     TCCState *s, *s1;
@@ -380,6 +427,11 @@ int main(int argc, char **argv)
     int argc0 = argc;
     char **argv0 = argv;
     FILE *ppfp = NULL;
+
+#ifdef CONFIG_EMBED_C99
+    if (wants_c99_output(argc, argv))
+        return c99_main(argc, argv);
+#endif
 
 redo:
     argc = argc0, argv = argv0;

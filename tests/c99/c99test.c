@@ -5,7 +5,7 @@
  *   make c99test
  * 或分步手工跑：
  *   ./tcc/tcc -B tcc -std=c6 -test tests/c99/c99test.c
- *   ./tcc/c99-tcc -std=c6 -B tcc -o /tmp/c99test.c tests/c99/c99test.c
+ *   ./tcc/tcc -std=c6 -B tcc -o /tmp/c99test.c tests/c99/c99test.c
  *   gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread \
  *       -o /tmp/c99test /tmp/c99test.c
  *   /tmp/c99test
