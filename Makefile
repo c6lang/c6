@@ -100,10 +100,18 @@ c99test: build
 # 后端的翻译路径）；编出来的编译器还要能跑。
 # 翻译出来的 C 还要交给宿主编译器编译一遍：c6 模式下输出文件自带运行时
 # 前导（里面 include 了宿主的头文件），声明块里的原型必须不能和它们冲突。
+# 生成 C 这一步不许有任何诊断输出：编译器自己的源码编出警告，说明前端
+# 或后端在正常代码上判断错了（例如死代码里的跳转标签让 "函数可能没有
+# 返回值" 的检查误报），这类警告只能当错误处理。
 c6selfcheck: build
 	@mkdir -p $(SELFHOST_C6)
 	$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/selfcheck.o
-	$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c
+	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c 2>&1`; \
+	if [ -n "$$out" ]; then \
+	    printf '%s\n' "$$out" >&2; \
+	    echo "c6selfcheck: 用 tcc 生成 C 时不应有警告（上面这些就是）" >&2; \
+	    exit 1; \
+	fi
 	$(HOSTCC) -std=c99 -c -o $(SELFHOST_C6)/selfcheck-c99.o $(SELFHOST_C6)/selfcheck.c
 	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C6)/selfcheck $(SELFHOST_C6)/selfcheck.o $(SELFHOST_LIBS)
 	$(SELFHOST_C6)/selfcheck -v

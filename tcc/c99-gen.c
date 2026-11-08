@@ -337,15 +337,29 @@ static void c99_pl_push(C99Pl *pl, int label)
     pl->tail = j;
 }
 
-/* concatenate the lists a and b into a fresh one */
+static int c99_pl_has_jumps(int pl)
+{
+    return pl > 0 && pl <= c99_npls && c99_pls[pl - 1] && c99_pls[pl - 1]->head;
+}
+
+/* concatenate the lists a and b into a fresh one.  Empty stays 0: the
+   front-end reads a non-zero return value as "there is a pending jump",
+   and gsym()/gjmp_append() turn the code back on for it - an empty list
+   would make the code after a dead branch live again */
 static int c99_pl_concat(int a, int b)
 {
-    C99Pl *dst = c99_pl_new();
+    C99Pl *dst;
     C99Jump *j;
-    if (a > 0 && a <= c99_npls && c99_pls[a - 1])
+    if (!c99_pl_has_jumps(a) && !c99_pl_has_jumps(b)) {
+        c99_pl_free(a);
+        c99_pl_free(b);
+        return 0;
+    }
+    dst = c99_pl_new();
+    if (c99_pl_has_jumps(a))
         for (j = c99_pls[a - 1]->head; j; j = j->next)
             c99_pl_push(dst, j->label);
-    if (b > 0 && b <= c99_npls && c99_pls[b - 1])
+    if (c99_pl_has_jumps(b))
         for (j = c99_pls[b - 1]->head; j; j = j->next)
             c99_pl_push(dst, j->label);
     c99_pl_free(a);
@@ -1318,7 +1332,15 @@ ST_FUNC void gen_opf(int op)
 
 ST_FUNC int gjmp(int t)
 {
-    int label = c99_new_label();
+    int label;
+    /* code that is not emitted produces no jump and no label either: the
+       native back-ends drop the instruction in their byte emitter, and
+       dropping the label with it keeps a dead branch from turning the
+       code after it live again (which is what the front-end reads from
+       this return value) */
+    if (nocode_wanted)
+        return t;
+    label = c99_new_label();
     if (c99_printf("goto L%d;\n", label))
         c99_use_label(label);
     return c99_pl_concat(t, c99_pl_one(label));
@@ -1326,7 +1348,10 @@ ST_FUNC int gjmp(int t)
 
 ST_FUNC void gjmp_addr(int a)
 {
-    int label = c99_new_label();
+    int label;
+    if (nocode_wanted)
+        return;
+    label = c99_new_label();
     if (c99_printf("goto L%d;\n", label))
         c99_use_label(label);
     c99_resolve(c99_pl_one(label), a);
@@ -1334,7 +1359,10 @@ ST_FUNC void gjmp_addr(int a)
 
 ST_FUNC int gjmp_cond(int op, int t)
 {
-    int label = c99_new_label();
+    int label;
+    if (nocode_wanted)
+        return t;
+    label = c99_new_label();
     /* every comparison pair has its own variable, so any condition the
        front-end still holds can be tested, even after another comparison */
     if (c99_printf("if (%s__c99_cnd[%d]) goto L%d;\n", c99_cnd_not(op),
