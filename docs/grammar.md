@@ -245,8 +245,38 @@ VLA 是唯一例外——标准 C 不允许给变长数组写初始化器，所�
     void f(struct Vec *p) { p->vec_sum(); }   (* 等价于 vec_sum(p) *)
 ```
 
-方法**不是**新的函数类型：符号名和调用约定都不变，`vec_sum(p)` 与
-`p->vec_sum()` 等价。约束见 C20。
+方法**不是**新的函数类型：调用约定不变，`vec_sum(p)` 与 `p->vec_sum()` 等价，
+接收者就是第一个实参。区别只在**符号名**：方法以 `<结构体>_<方法>` 的名字输出
+（上面的 `vec_sum` 是 `Vec_vec_sum`），源码里写的名字另外输出成一个**弱别名**，
+因此：
+
+```
+    struct Circle { int r; };
+    struct Rect { int w, h; };
+
+    int area(struct Circle *c) { return 3 * c->r * c->r; }  (* Circle_area *)
+    int area(struct Rect *r)   { return r->w * r->h; }      (* Rect_area *)
+
+    void f(struct Circle *c, struct Rect *r)
+    {
+        c->area();          (* Circle_area(c) *)
+        r->area();          (* Rect_area(r) *)
+        area(c);            (* 弱别名 area：本 TU 里第一个叫 area 的方法 *)
+    }
+```
+
+- 不同类型可以用同名方法，不必放进不同 `package`；
+- `area(p)` 这种普通调用仍然可用，指向本翻译单元里**第一个**取到该名字的方法；
+  真正有歧义时它只是个弱别名，链接时会被手写的强定义覆盖。纯 C 的翻译单元
+  按原名链接不受影响；
+- 下列情况不改名，方法符号就是源码里的名字：`static` / `inline` 函数、
+  以 `__` 开头的名字（编译器和 libtcc1 专用）、来自系统头文件的声明
+  （`p->fflush()` 仍然调 libc 的 `fflush`）、匿名结构体的方法（匿名 tag
+  的编号是每个 TU 各一份），以及在 `package` 里声明的方法（包名已经把它
+  和别的包分开，符号是 `pkg__name`）。
+
+约束见 C20。
+
 
 ### 3.3 切片类型 `T[:]`
 
@@ -897,11 +927,13 @@ pkg.member                       (* 'pkg' 已 import，或就是当前包 *)
 ```
 p->f(args)                       (* T 有方法 f，且没有同名字段 *)
 =>
-    f(p, args)                   (* 同一次调用，符号名与调用约定都不变 *)
+    T_f(p, args)                 (* 符号按接收者取名，调用约定不变 *)
 ```
 
 接收者先求值并存入一个临时槽，再作为第一个实参压栈：若方法返回结构体，
-隐藏的 `self` 排在 sret 缓冲之后。
+隐藏的 `self` 排在 sret 缓冲之后。`T_f` 就是方法定义处输出的符号
+（见 3.2；`static`/`inline`、`__` 开头、系统头文件里的声明和
+`package` 内的方法保留原名）。
 
 **R9 — 结构体到接口的隐式转换**
 
@@ -1062,7 +1094,8 @@ struct Rect { int w, h; };
 typedef struct Circle Circle;
 typedef struct Rect Rect;
 
-/* 方法名共享 C 的全局命名空间：不同类型要用同名方法，就放进不同包 */
+/* 方法符号按接收者取名（Circle_area / Rect_area），同名方法不再需要包；
+   这里演示包、方法与接口一起用 */
 package geo.circle {
     int area(Circle *self) { return 3 * self->r * self->r; }
 }
@@ -1371,6 +1404,8 @@ int main(void)
 | `v.f()`（值是结构体而不是指针） | 按普通成员访问报 `field not found: f`；方法调用只支持 `->` |
 | `p->f`（方法不带调用） | 约束 C20：`method 'f' must be called` |
 | 方法在使用点之后才声明 | 约束 C20/C21（TCC 单趟编译） |
+| `area(p)` 而 `area` 服务两个结构体 | 普通调用名是弱别名，只指向本 TU 里第一个取到该名字的方法；要明确调用写 `p->area()` |
+| 用纯 C 定义的方法被 `p->f()` 调用 | 链接错误 `unresolved reference to 'T_f'`：`->` 只认 c6 编译出的方法符号，改用 `f(p)` |
 | 文件作用域 `Shape s = circle;` | 结构体到接口的转换没有运行时代码可生成 |
 | `Shape s = circle;` 而 `circle` 的方法声明在转换点之后 | 约束 C21 |
 | `int[]` 当切片用 | 不是切片语法，仍是 C 的数组声明符（`int a[] = {…}`、`void f(int[])`） |
@@ -1440,7 +1475,7 @@ int main(void)
 |---|---|---|
 | `package` / `import` | `c6_package_parse` / `c6_import_parse` / `c6_pkg_name` / `c6_pkg_compose` / `c6_pkg_imported`，`unary()` 里的点号解析 | `tcc/tccgen.c` |
 | `pkg.member` | `unary()` 的 `tok_identifier` 分支（逐段增长前缀 + `sym_find_raw`） | `tcc/tccgen.c` |
-| 结构体方法 | `c6_method_register`（在 `decl()` 里注册）/ `c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`，`unary()` 的 `->` 分支 | `tcc/tccgen.c` |
+| 结构体方法 | `c6_method_register`（在 `decl()` 里注册）/ `c6_method_symbol`（`<Tag>_<name>` 符号名）/ `c6_method_plain_decl` + `c6_method_alias`（源码名弱别名）/ `c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`，`unary()` 的 `->` 分支 | `tcc/tccgen.c` |
 | `interface` | `c6_interface_parse`、`c6_auto_impl_ensure` / `c6_check_method` / `c6_emit_auto_impls` / `c6_iface_convert` | `tcc/tccgen.c` |
 | 每 TU 状态复位 | `c6_tu_reset`（在 `tccgen_compile` 开头调用） | `tcc/tccgen.c` |
 | `test` | `c6_test_parse`、`tcc_run_tests` | `tcc/tccgen.c`、`tcc/tccrun.c` |

@@ -13,7 +13,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `go f(...)` | OS 线程（`pthread_create`），语句立刻返回、真并发 |
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
 | `package` / `import` | 包与名字修饰（`pkg__sym`），`pkg.member` 访问导出符号，支持多级包名 |
-| 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用 |
+| 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用（符号是 `T_f`，不同类型可同名，`f(p)` 仍可用） |
 | 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]`；被普通符号遮蔽时仍写 `struct` |
 | `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
@@ -269,23 +269,35 @@ struct Vec { int x, y; };
 int vec_sum(struct Vec *self) { return self->x + self->y; }
 int vec_twice(struct Vec *self) { return self->vec_sum() * 2; }
 
+/* 不同类型可以同名：符号分别是 Circle_area / Rect_area */
+struct Circle { int r; };
+struct Rect { int w, h; };
+int area(struct Circle *c) { return 3 * c->r * c->r; }
+int area(struct Rect *r) { return r->w * r->h; }
+
 int main(void)
 {
     struct Vec v = {3, 4};
-    return (&v)->vec_twice();     /* 等价于 vec_twice(&v) */
+    struct Rect r = {2, 3};
+    return (&v)->vec_twice() + (&r)->area();   /* 等价于 vec_twice(&v) + Rect_area(&r) */
 }
 ```
 
 - 文件作用域的函数声明/定义，只要**第一个参数是指向结构体（或联合体）的指针**，
-  就注册为该类型的方法；调用 `p->f(a)` 被改写为 `f(p, a)`；
-- 方法就是普通函数：**不改名、不改调用约定**（`fflush(FILE *)`、`gettimeofday(struct timeval *)`
-  这类 libc 函数照旧可用），因此也能继续用 `f(p, a)` 调用；
-- 只支持 `->`（`p->f()`）；`v.f()` 仍是普通成员访问，`v->f`（不带调用）会报
+  就注册为该类型的方法；调用 `p->f(a)` 被改写为 `T_f(p, a)`；
+- 方法就是普通函数：**调用约定不变**，接收者就是第一个实参；符号名是
+  `<结构体>_<方法>`，源码里写的名字另外发一个**弱别名**，所以
+  `f(p, a)` 这种普通调用、手写 C、纯 C 翻译单元都照旧能链接；
+- 不同类型用同名方法**不需要** `package`（`Circle_area` 与 `Rect_area` 各自独立）；
+  弱别名只指向本 TU 里第一个取到该名字的方法，真有歧义时写 `p->area()`；
+- 不改名的情形：`static` / `inline` 函数、`__` 开头的名字（编译器和 libtcc1 专用）、
+  系统头文件里的声明（`p->fflush()`、`p->gettimeofday()` 这类 libc 成员照旧可用）、
+  匿名结构体的方法，以及在 `package` 里声明的方法（包名已经区隔，符号是 `pkg__name`）；
+- 只支持 `->`（`p->f()`）；`v.f()` 仍是普通成员访问，`p->f`（不带调用）会报
   `method 'f' must be called`；
 - 结构体同名字段优先于方法；方法须在**使用点之前**可见（TCC 单趟编译）；
-- 方法名共享 C 的全局命名空间，不同类型想要同名方法就放进不同 `package`
-  （例：`package circle { int area(Circle *self) ... }` 与 `package rect { int area(Rect *self) ... }`
-  可以共存，各自 `p->area()`）；
+- `package` 里的方法名不受影响：`package circle { int area(Circle *self) ... }` 与
+  `package rect { int area(Rect *self) ... }` 仍然可以共存，各自 `p->area()`；
 - 返回结构体的方法也支持（隐藏的 `self` 排在 sret 缓冲之后）；
 - `T!error` 方法照常工作：`int!error f(struct T *self)` 可用 `try p->f()` / `p->f() catch e { ... }`。
 
@@ -772,7 +784,7 @@ tests/
 ├── test-block.c      test 块与 -test 模式本身
 ├── macro.c           #macro 与 __local 名字卫生
 ├── package.c         package / import / pkg.member
-├── method.c          结构体方法
+├── method.c          结构体方法（含不同类型的同名方法与 libc 方法）
 ├── interface.c       结构化接口
 ├── slice.c           切片
 ├── tuple.c           元组（与 tu/tuple.c 一起跑）
@@ -856,7 +868,10 @@ make test-all      # selftest + tests2
   第一次转换点，因此方法也要在转换点之前可见。
 - 跨 TU：头文件里用 `package NAME { ... }` 声明 API；接口的方法声明放头文件里，
   vtable 由每个 TU 按需自行生成。
-- 方法名共享 C 的全局命名空间；同名方法服务不同类型时用 `package` 隔离。
+- 方法符号是 `<结构体>_<方法>`，源码里写的名字另外发一个弱别名，所以
+  `f(p)` 这种普通调用照旧可用，不同类型也可以有同名方法；`static` / `inline`、
+  `__` 开头的名字、系统头文件里的声明、匿名结构体的方法，以及在 `package` 里
+  声明的方法保留原名。
 - 裸 tag 类型名在 `parse_btype()` 里解析：普通命名空间命中（变量/函数/枚举常量/typedef）
   就按老 C 语义走，否则再看 tag 命名空间；解析结果与写 `struct TAG` 完全同一个
   `CType`，所以 `sizeof`、方法注册、切片元素检查都自动一致。因为 tag 与普通符号

@@ -34,6 +34,21 @@ int node_depth(struct Node *n);
 struct Node { int d; };
 int node_depth(struct Node *n) { return n->d; }
 
+/* 不同的结构体可以用同名方法：符号分别是 Circle_area / Rect_area，
+   不需要 package */
+struct Circle { int r; };
+struct Rect { int w, h; };
+int area(struct Circle *c) { return 3 * c->r * c->r; }
+int area(struct Rect *r) { return r->w * r->h; }
+
+/* 方法里的 __func__ 显示源码里写的名字，不是 mangled 符号 */
+const char *vec_name(struct Vec *v) { (void)v; return __func__; }
+
+/* 同名方法的另一半在 tests/tu/method.c */
+struct Depth { int d; };
+int depth(struct Depth *p);
+int depth(struct Vec *v) { return v->x - v->y; }
+
 /* 包里定义的方法用裸名字照样找得到 */
 package shape {
     int scaled(struct Vec *v, int k) { return vec_sum(v) * k; }
@@ -61,6 +76,44 @@ static int probe(struct Vec *v)
         return -e.id;
     };
     return x;
+}
+
+test "不同结构体可以用同名方法（不需要 package）" {
+    struct Circle c = { 2 };
+    struct Rect r = { 2, 3 };
+    if ((&c)->area() != 12)
+        err(1, "Circle 的 area 不对");
+    if ((&r)->area() != 6)
+        err(2, "Rect 的 area 不对");
+}
+
+test "同名方法按接收者区分，可以跨翻译单元" {
+    struct Vec v = { 5, 2 };
+    struct Depth d = { 3 };
+    if ((&v)->depth() != 3)
+        err(1, "本 TU 的 depth 不对");
+    if ((&d)->depth() != 12)
+        err(2, "另一个 TU 的 depth 不对");
+}
+
+test "普通调用形式在方法被改名后仍然可用" {
+    struct Vec v = { 3, 4 };
+    struct Circle c = { 2 };
+    if (vec_sum(&v) != 7)
+        err(1, "普通调用 vec_sum 不对");
+    if (area(&c) != 12)          /* 弱别名指向本 TU 的第一个 area */
+        err(2, "普通调用 area 不对");
+}
+
+test "方法里的 __func__ 是源码名" {
+    struct Vec v = { 1, 2 };
+    if (strcmp((&v)->vec_name(), "vec_name") != 0)
+        err(1, "__func__ 不是源码名");
+}
+
+test "系统头里声明的 libc 函数仍然是方法" {
+    FILE *f = stdout;
+    f->fflush();                 /* 不改名，仍然调 libc 的 fflush */
 }
 
 /* ---- 跨翻译单元（tests/tu/method.c）---- */
