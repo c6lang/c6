@@ -654,6 +654,10 @@ typedef struct BufferedFile {
     int *ifdef_stack_ptr; /* ifdef_stack value at the start of the file */
     int include_next_index; /* next search path */
     int sys_header;         /* c6: found in a system include path */
+#ifdef C6_EXT
+    char *c6_module;        /* c6: module prefix ('math__') or NULL */
+    int c6_decl_seen;       /* c6: a file scope declaration was parsed */
+#endif
     int prev_tok_flags; /* saved tok_flags */
     char filename[1024];    /* filename */
     char *true_filename; /* filename not modified by # line directive */
@@ -760,6 +764,20 @@ typedef struct C6Iface {
     int *methods;    /* method name tokens, in declaration order */
 } C6Iface;
 
+/* one declaration of a c6 module, collected for '-emit-header' */
+typedef struct C6HeaderDecl {
+    int kind;        /* C6_HD_* */
+    int name;        /* emitted name token (already module-prefixed) */
+    CType type;      /* functions, variables, typedefs */
+    Sym *sym;        /* struct/union/enum definition */
+} C6HeaderDecl;
+
+#define C6_HD_STRUCT  1
+#define C6_HD_ENUM    2
+#define C6_HD_TYPEDEF 3
+#define C6_HD_FUNC    4
+#define C6_HD_VAR     5
+
 #endif
 
 struct TCCState {
@@ -835,6 +853,15 @@ struct TCCState {
     /* 'interface' / 'impl' declarations */
     struct C6Iface **c6_ifaces;
     int c6_nb_ifaces;
+    /* 'module NAME;' support */
+    char **c6_loaded_modules;   /* modules already replayed in this unit */
+    int c6_nb_loaded_modules;
+    char **c6_loading_modules;  /* modules on the import stack (cycle check) */
+    int c6_nb_loading_modules;
+    /* '-emit-header FILE': declarations collected from the module */
+    struct C6HeaderDecl **c6_header_decls;
+    int c6_nb_header_decls;
+    char *c6_emit_header;
 #endif
 
     unsigned char dflag; /* -dX value */

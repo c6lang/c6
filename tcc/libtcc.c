@@ -771,6 +771,9 @@ ST_FUNC void tcc_close(void)
     }
     if (bf->true_filename != bf->filename)
         tcc_free(bf->true_filename);
+#ifdef C6_EXT
+    tcc_free(bf->c6_module);
+#endif
     file = bf->prev;
     tok_flags = bf->prev_tok_flags;
     tcc_free(bf);
@@ -941,6 +944,9 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
     tcc_free(s1->mapfile);
     tcc_free(s1->outfile);
     tcc_free(s1->deps_outfile);
+#ifdef C6_EXT
+    tcc_free(s1->c6_emit_header);
+#endif
 #if defined TCC_TARGET_MACHO
     tcc_free(s1->install_name);
 #endif
@@ -1592,6 +1598,7 @@ enum {
 #ifdef C6_EXT
     TCC_OPTION_test,
     TCC_OPTION_test_filter,
+    TCC_OPTION_emit_header,
 #endif
     TCC_OPTION_w,
     TCC_OPTION_E,
@@ -1664,6 +1671,7 @@ static const TCCOption tcc_options[] = {
 #ifdef C6_EXT
     { "test", TCC_OPTION_test, 0 },
     { "test-filter", TCC_OPTION_test_filter, TCC_OPTION_HAS_ARG },
+    { "emit-header", TCC_OPTION_emit_header, TCC_OPTION_HAS_ARG },
 #endif
     { "rdynamic", TCC_OPTION_rdynamic, 0 },
     { "r", TCC_OPTION_r, 0 },
@@ -2072,6 +2080,11 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             if (*optarg == '=')
                 ++optarg;
             s->c6_test_filter = optarg;
+            break;
+        case TCC_OPTION_emit_header:
+            if (*optarg == '=')
+                ++optarg;
+            tcc_set_str(&s->c6_emit_header, optarg);
             break;
 #endif
         case TCC_OPTION_rstdin:

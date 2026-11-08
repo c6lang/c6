@@ -44,7 +44,8 @@ c6-keyword =
     | "foreach" ;
 
 (* 软关键字：只在语句开头、且后面紧跟一个标识符时才是关键字 *)
-c6-soft-keyword = "co" | "go" | "task" ;
+c6-soft-keyword = "co" | "go" | "task"
+                | "module" ;   (* 只在一个文件的第一个声明之前 *)
 
 (* 扩展内建的错误值类型，由编译器预置的 typedef 提供，等价于
    typedef struct __tcc_error { int id; const char *msg; } error;
@@ -99,11 +100,18 @@ task t = f(a);       /* 同理 -> 句柄 */
 ```
 translation-unit       = { top-level-declaration } , EOF ;
 
-top-level-declaration  = package-declaration
+top-level-declaration  = module-declaration
+                       | package-declaration
                        | import-declaration
                        | interface-declaration
                        | test-declaration
                        | declaration ;
+
+(* ---- module ---- *)
+
+module-declaration     = "module" , package-name , ";" ;
+                         (* 必须是文件的第一个声明；'package-name' 的点号
+                            形式与 package 一样组合前缀，见 2.1 *)
 
 (* ---- package / import ---- *)
 
@@ -120,7 +128,9 @@ package-item           = package-declaration
                        | declaration ;
 
 import-declaration     = "import" , package-name , ";" ;
-                         (* 打开 'pkg.member' 写法，必须出现在使用点之前 *)
+                         (* 打开 'pkg.member' 写法，必须出现在使用点之前；
+                            若找到对应的 'NAME.c'（点号形式为 'a/b.c'），
+                            还会加载它的声明，见 2.1 *)
 
 (* ---- interface ---- *)
 
@@ -844,6 +854,11 @@ parameter-list    = identifier , { "," , identifier } ;
 | C58 | 元素下标必须是整数常量且在 `[0, n)` 内 | `constant expression expected`；`tuple index 2 is out of range (0..1)` |
 | C59 | `return { … };` 只能出现在返回类型为 struct / union / 元组的函数里 | `'return {…}' requires a struct, union or tuple return type` |
 | C60 | 解构不能把所有元素都丢弃 | `'tuple' discards every element` |
+| C61 | `module NAME;` 只能出现在文件的第一个声明之前，一个文件只能有一个 | `'module' must be the first declaration in the file`；`module 'm' already declared in this file` |
+| C62 | 模块里不能定义 `main` | `'main' cannot be declared in a module` |
+| C63 | `import` 打开的文件必须声明同名模块（点号形式按组合后的前缀比较） | `module file declares 'a__b', expected 'a__c'` |
+| C64 | 模块不能直接或间接 import 自己 | `circular import of module 'x'` |
+| C65 | `-emit-header` 只能用于声明了 `module` 的翻译单元；匿名 struct/union 必须已有 typedef 才能写出 | `-emit-header requires a 'module NAME;' declaration`；`cannot write a C header for an anonymous struct type; give it a typedef first` |
 
 ---
 
@@ -1026,6 +1041,44 @@ foreach |i| lo:hi { body }
 `c6_slice_spill` 用的 `{data, len}` 对，所以 `foreach |i, v| f()`（`f`
 返回切片）与 `foreach |i, v| obj.items` 走同一条路径。`_` 绑定时对应的
 加载/存储整段不生成。
+
+**R15 — 模块前缀 `module NAME;`**
+
+```
+module math;                     (* 文件的第一条声明 *)
+int add(int a, int b) { … }      (* => int math__add(int a, int b) *)
+struct Point { … };              (* => struct math__Point *)
+int area(Point *p) { … }         (* 方法 => int math__Point_area(Point *p) *)
+
+/* 别的文件，import 之后 */
+import math;
+math.Point p;                    (* 类型 => math__Point *)
+```
+
+只有模块文件**文件作用域**的声明加 `NAME__` 前缀；块作用域、`static`、
+`test` 块、`__` 开头的名字和 `#include` 进来的普通 C 文件都不加。点号形式
+`module geo.circle;` 的前缀是 `geo__circle__`。模块文件不输出方法的
+原名弱别名，所以 C 侧看到的只有前缀符号。
+
+类型位置也接受全限定名：`math.Point p;` 解析到 `math__Point` 的 typedef
+或 struct/union/enum tag（多级点号 `a.b.Point` 同理）。module 文件里的 tag
+带前缀；package 里的 tag 仍是普通 C tag，所以 package 限定类型要写 typedef。
+只有当前 module/package 或 `import` 过的名字能这样写；限定名不是类型时（例如
+`pkg.func(...)` 这样的表达式语句）解析器会把 token 原样还回去，仍按普通
+表达式处理。
+
+`import NAME;` 仍然先登记名字（打开 `NAME.member` 写法）；此外按
+「当前文件所在目录 → `-I` 路径 → 当前目录」查找 `NAME.c`（点号形式查找
+`a/b.c`），找到就把它的声明读进来：函数只登记原型、跳过函数体，全局变量
+只登记 `extern`、跳过初始化器，`static` 对象和 `test` 块跳过。找不到文件
+时保持旧行为（只登记名字），所以把 `import` 当命名空间声明的旧代码不受
+影响。导入的声明和模块自己的对象文件是两件事：链接时仍要把模块的目标
+文件（或包含它的库）放上命令行。
+
+`-emit-header FILE`（`-std=c6` 下）在编译模块时把导出的结构体、枚举、
+typedef、函数和全局变量写成普通 C 头文件，符号名就是带前缀的 C 名。
+切片 `T[:]` 和元组 `(T1, T2)` 会生成 `NAME__slice_N` / `NAME__tuple_N`
+的 `typedef`；纯 C 侧包含这个头文件即可调用，不需要知道 `module` 的存在。
 
 ## 9. 示例
 

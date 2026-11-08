@@ -390,7 +390,8 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 没有包清单：跨 TU 就是同名 mangle 的普通 C 符号。头文件里用
 `package NAME { ... }` 写出声明（`extern` 也行），实现在另一个 TU 的同一个包里；
 老 C 代码想调用包导出，手写 `int math__add(int, int);` 即可，反之扩展 TU 也能直接
-调用普通 C 函数。`import` 只影响源码里的 `.` 写法，不产生也不引入任何文件/目录语义。
+调用普通 C 函数。`import` 至少打开源码里的 `.` 写法；从 6.5 起，如果能找到同名
+模块文件，还会加载它的声明（找不到时仍是纯命名空间，不引入文件语义）。
 
 ### 6.4 结构体方法
 
@@ -425,6 +426,48 @@ int area(struct Rect *r)   { return r->w * r->h; }       /* Rect_area */
 字段优先，方法须先于调用点声明，`duplicate method` 检查按 (类型, 源码名) 做
 （一个类型仍然只能有一个同名方法）。方法表与包 mangle 正交：包内定义的方法
 仍然用源码里写的名字注册。
+
+### 6.5 模块：`module` + 声明加载
+
+`package` 作用于一段代码，符号在源码里仍要写限定名；`module` 作用于**整个
+文件**，源码继续写短名：
+
+```c
+/* math.c */
+module math;
+struct Point { int x, y; };
+typedef struct Point Point;
+int add(int a, int b) { return a + b; }
+int area(Point *p) { return p->x * p->y; }     /* math__Point_area */
+
+/* main.c */
+import math;
+int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
+```
+
+1. `module NAME;` 是文件的第一条声明（软关键字：文件里已有同名普通标识符时
+   按 C 语义处理），设置 `BufferedFile.c6_module = "NAME__"`；
+2. 文件作用域的声明经 `c6_mod_name` 加前缀：普通名字 `NAME__sym`，方法
+   `<NAME__Tag>_<meth>`；块作用域、`static`、`test`、`__` 开头和 `#include`
+   的普通 C 文件不改名；模块文件不发方法的原名弱别名，所以 C 侧只看到前缀名。
+   类型位置也接受 `NAME.Type`（多级点号同理）：`parse_btype` 先做一次可回退
+   的扫描（`c6_qualified_type`，先 `sym_find` typedef 再 `struct_find` tag），
+   解析到 `NAME__Type`（module 的 tag 有前缀；package 的 tag 仍是普通 C tag，
+   所以 package 限定类型要写 typedef）；不是类型时把 token 原样还回，所以
+   `pkg.func(...)` 这类表达式语句仍走普通表达式解析；
+3. `import NAME;` 在原有“登记命名空间”之外，按当前文件目录 → `-I` →
+   当前目录查找 `NAME.c`（点号形式 `a/b.c`），找到就用 `decl(VT_CONST)`
+   重放声明：函数只登记原型（`skip_or_save_block` 跳过函数体），全局变量只
+   登记 `extern`（`c6_skip_decl_tail` 跳过初始化器），`static` 对象和 `test`
+   块跳过；文件必须声明 `module NAME;`，循环 import 报错，找不到文件时保持
+   旧的命名空间行为；
+4. `-emit-header FILE` 在模块 TU 末尾把记录下来的导出（`C6HeaderDecl` 数组）
+   写成普通 C 头文件：结构体/枚举/typedef/函数/全局变量，切片和元组生成
+   `NAME__slice_N` / `NAME__tuple_N` typedef，C 侧包含头文件即可调用。
+
+跨 TU 仍然是普通 C 符号；`#include` 的普通头文件按 C 规则编译，只有模块文件
+自己的文件作用域声明加前缀。这是“零运行时、零新链接器特性”的方案：符号表里
+没有模块元数据。
 
 
 ## 7. 卫生宏：`#macro` + `__local`（修复 G8）
@@ -542,6 +585,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 15 裸 tag 类型名（省略 `struct`） | ✅ | `tccgen.c`：`parse_btype()` 的 `default` 分支——`typespec_found` 为 0、`sym_find(tok)` 未命中（普通命名空间优先）时试 `struct_find(tok)`，命中则把 tag 符号的 `type.t` / `ref` 交给 `basic_type2`，与 `struct/union/enum TAG` 走完全同一条路径（所以 `sizeof`、方法注册、`c6_tag_is_global` 的切片元素检查、`type_to_str` 自动一致）；`ignore_label` 时 `TAG:` 仍退回标签（与 typedef 路径同一个 guard）；不隐式前置声明，也不支持定义处省略 `struct`；只在 `-std=c6` 生效 |
 | 16 `foreach` | ✅ | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句，所以 `foreach` 仍可当标识符）；词法是 `tcctok.h` 末尾追加的硬关键字，`-std=c6` 关闭时由 `tccpp.c` 的还原循环改回普通标识符（区间同步扩到 `TOK_C6_FOREACH`）；数组/切片的隐藏槽直接复用 `c6_slice_spill`（`{data, len}` 对，与切片运行期布局相同），区间把上界落进隐藏整数槽、下标绑定当计数器；`i`/`v` 是 `sym_push` 出来的普通局部，循环体走 `lblock`，所以 `break`/`continue`/`defer`/`await` 与 `for` 一致；`size_t` 下标用 `c6_size_type`，区间用 `c6_common_int_type`（C 的通常算术转换子集）；文件作用域的 `foreach \|…\|` 在 `decl()` 里报错 |
 | 17 元组 `(T1, T2, …)` | ✅ | `tccgen.c`：`parse_btype()` 的 `case '('` → `c6_tuple_btype` / `c6_tuple_speculate`（保存/重放 token，区分元组类型与老 C 的括号表达式）、`c6_tuple_get`（校验元素并规范化生成内部 tag `__c6_tuple_N`，布局在构造时按自然对齐算好，不走 `struct_layout`）、`c6_tuple_ctype` / `c6_tuple_of_type` / `c6_tuple_ctype`；`unary()` 的 `case '('` 处理元组强转/复合字面量/`sizeof`/`_Alignof`、`c6_tuple_subscript` 处理 `t[k]`（常量下标）；`decl()` 开头的 `c6_tuple_lead_kind` + `c6_tuple_destructure` 实现解构声明/赋值（`_` 占位符丢弃元素）；`c6_return_value` 支持 `return {…};`；`c6_apply_fallible` 放开 struct/union/元组作 `!error` 返回类型，失败路径用 `c6_zero_local` 清零；`c6_async_type_tokens` 把元组回放成 `(T1, T2)` 而不是内部 tag；解构语句在 `block()` 里也认一次（无花括号的 if/while/for/switch 单条语句体、语句表达式、`defer` 单条语句体不走 `decl()`），赋值形式在 `c6_tuple_destructure()` 里就地解析（作用域弹出后隐藏临时变量就没了） |
+| 18 `module` + `import` 加载 | ✅ | `tccgen.c`：`BufferedFile.c6_module` / `c6_decl_seen`，`decl()` 文件作用域的 `module NAME;` 软关键字 → `c6_module_parse`（点号前缀、必须首条声明、一个文件一个、`main` 禁止）；`c6_mod_name()` 给文件作用域声明加 `NAME__`（块作用域/`static`/`test`/`__` 开头/普通 `#include` 不加），方法经 `c6_method_symbol` 自然变成 `<NAME__Tag>_<meth>`；`sym_find` / `struct_find` 先试模块前缀再试普通 C 名，`c6_import_lookup` / `c6_import_tag_lookup` 兜底 imports；`parse_btype` 的 `c6_qualified_type` 支持 `NAME.Type`（先 speculative 扫描 typedef/tag，失败原样回退）；`c6_module_import` 按当前文件目录 → `-I` → 当前目录找 `NAME.c`（点号 `a/b.c`），用 `decl(VT_CONST)` 重放：函数原型 + `skip_or_save_block`、全局 `extern` + `c6_skip_decl_tail`、跳过 `static`/`test`，循环 import 报错，找不到文件保持旧的命名空间行为；`-emit-header` 用 `C6HeaderDecl` 记录导出，`c6_hdr_type` / `c6_hdr_struct_body` / `c6_emit_header` 写出普通 C 头文件（切片/元组生成 `NAME__slice_N` / `NAME__tuple_N` typedef） |
 
 `foreach` 的设计取舍（评审结论）：
 
