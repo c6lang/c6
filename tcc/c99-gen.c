@@ -140,7 +140,15 @@ typedef struct C99Mark { int pos, off; } C99Mark;
 typedef struct C99Lbl  { int pos, label; } C99Lbl;
 typedef struct C99Jump { int label; struct C99Jump *next; } C99Jump;
 typedef struct C99Pl   { C99Jump *head, *tail; } C99Pl;
-typedef struct C99Decl { char *name, *text; struct C99Decl *next; } C99Decl;
+/* a declaration emitted before the generated functions: 'name' is the linker
+   symbol, 'text' the C declaration the generator produced for it, 'alias' the
+   private identifier an imported symbol is declared under, and 'defined'
+   says whether this translation unit defines it after all */
+typedef struct C99Decl {
+    char *name, *text, *alias;
+    int defined;
+    struct C99Decl *next;
+} C99Decl;
 /* a global object that is emitted under its tcc name, so that other
    translation units can link against it */
 typedef struct C99GSym {
@@ -774,24 +782,32 @@ static int c99_is_runtime_name(const char *name)
     return 0;
 }
 
-static void c99_add_decl(const char *name, const char *text)
+static C99Decl *c99_decl_find(const char *name)
 {
     C99Decl *d;
 
-    for (d = c99_decls; d; d = d->next) {
-        if (!strcmp(d->name, name)) {
-            /* an earlier 'extern int f()' (a symbol referenced before its
-               definition appeared) gives way to the real prototype */
-            int old_knr = strstr(d->text, "()") != NULL;
-            int new_knr = strstr(text, "()") != NULL;
-            int old_extern = !strncmp(d->text, "extern ", 7);
-            int new_static = !strncmp(text, "static ", 7);
-            if ((old_knr && !new_knr) || (old_extern && new_static)) {
-                tcc_free(d->text);
-                d->text = tcc_strdup(text);
-            }
-            return;
+    for (d = c99_decls; d; d = d->next)
+        if (!strcmp(d->name, name))
+            return d;
+    return NULL;
+}
+
+static void c99_add_decl(const char *name, const char *text)
+{
+    C99Decl *d = c99_decl_find(name);
+
+    if (d) {
+        /* an earlier 'extern int f()' (a symbol referenced before its
+           definition appeared) gives way to the real prototype */
+        int old_knr = strstr(d->text, "()") != NULL;
+        int new_knr = strstr(text, "()") != NULL;
+        int old_extern = !strncmp(d->text, "extern ", 7);
+        int new_static = !strncmp(text, "static ", 7);
+        if ((old_knr && !new_knr) || (old_extern && new_static)) {
+            tcc_free(d->text);
+            d->text = tcc_strdup(text);
         }
+        return;
     }
     d = tcc_mallocz(sizeof *d);
     d->name = tcc_strdup(name);
@@ -1447,6 +1463,13 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
        main: declare it up front so the generated C sees a prototype */
     c99_register_decl(func_sym, ftype);
     emit_name = c99_test_name(name);
+    /* the unit defines this one after all, so it is not an external symbol
+       the declaration block has to import (see c99_is_import_decl) */
+    {
+        C99Decl *d = c99_decl_find(emit_name);
+        if (d)
+            d->defined = 1;
+    }
     int is_main = name && !strcmp(name, "main");
     int is_static = c99_is_static_fn(func_sym, name);
     int ret_struct = (ret->t & VT_BTYPE) == VT_STRUCT;
@@ -1852,6 +1875,7 @@ ST_FUNC void c99_reset(void)
         dn = d->next;
         tcc_free(d->name);
         tcc_free(d->text);
+        tcc_free(d->alias);
         tcc_free(d);
     }
     c99_decls = NULL;
@@ -2100,6 +2124,97 @@ static void c99_resolve_syms(TCCState *s1)
     c99_prog = out;
 }
 
+/* A symbol the generated unit only refers to.  The declaration block has to
+   invent a prototype for it from the compiler's own type model, and that
+   prototype regularly disagrees with the host header declaring the same
+   name: tcc has a single 64 bit integer type for 'long' and 'long long', and
+   every struct it sees is an opaque byte block.  A by-name declaration would
+   then be a "conflicting types" error as soon as the runtime prelude at the
+   end of the file includes <stdlib.h> or <pthread.h>.
+
+   Such a symbol is declared under a private identifier and bound to the real
+   linker name with an asm label, so the two declarations never meet; the
+   source name is #defined to that identifier for the generated code and the
+   #define is dropped again before the prelude, which therefore keeps the
+   host's own declarations (including the attributes GCC gives its built-ins).
+   Functions the unit defines itself are not imports and keep their names. */
+static int c99_is_import_decl(const C99Decl *d)
+{
+    int n;
+
+    if (!c99_rt_used || d->defined || !c99_is_c_ident(d->name))
+        return 0;
+    if (!strncmp(d->text, "static ", 7)
+        || !strncmp(d->text, "__c99_rt_linkage ", 17))
+        return 0;
+    if (!strncmp(d->text, "extern unsigned char ", 21)
+        && c99_gsym_defined(d->name))
+        return 0;
+    n = strlen(d->text);
+    return n > 1 && d->text[n - 1] == ';';
+}
+
+/* Emit the declarations of the imported symbols: once per symbol under a
+   private name bound to the linker symbol with an asm label, and, for a
+   compiler without asm labels, as the plain declaration the generator
+   produced (nothing renames the source names there, so only one form may be
+   visible).  The private names are numbered in declaration order. */
+static void c99_print_imports(FILE *f)
+{
+    C99Decl *d;
+    int n = 0, any = 0;
+
+    for (d = c99_decls; d && !any; d = d->next)
+        any = c99_is_import_decl(d);
+    if (!any)
+        return;
+    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)\n");
+    for (d = c99_decls; d; d = d->next) {
+        int len;
+        char buf[64];
+        if (!c99_is_import_decl(d))
+            continue;
+        snprintf(buf, sizeof buf, "__c99_ext_%d", n++);
+        d->alias = tcc_strdup(buf);
+        len = strlen(d->text);
+        fprintf(f, "#define %s %s\n", d->name, d->alias);
+        fprintf(f, "%.*s __asm__(\"%s\")%s\n", len - 1, d->text, d->name,
+                d->text + len - 1);
+    }
+    fprintf(f, "#endif\n"
+               "#if !defined(__GNUC__) && !defined(__clang__)\n");
+    for (d = c99_decls; d; d = d->next)
+        if (c99_is_import_decl(d))
+            fprintf(f, "%s\n", d->text);
+    fprintf(f, "#endif\n");
+}
+
+/* the identifier the generated C has to use for the linker symbol 'name' */
+static const char *c99_sym_ref(const char *name)
+{
+    C99Decl *d = c99_decl_find(name);
+
+    return d && d->alias ? d->alias : name;
+}
+
+/* the generated code is done with the imported names: hand them back to the
+   headers the runtime prelude includes */
+static void c99_undef_imports(FILE *f)
+{
+    C99Decl *d;
+    int any = 0;
+
+    for (d = c99_decls; d && !any; d = d->next)
+        any = c99_is_import_decl(d);
+    if (!any)
+        return;
+    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)\n");
+    for (d = c99_decls; d; d = d->next)
+        if (c99_is_import_decl(d))
+            fprintf(f, "#undef %s\n", d->name);
+    fprintf(f, "#endif\n");
+}
+
 ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
 {
     FILE *f;
@@ -2215,6 +2330,15 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
     c99_collect_globals(s1);
     c99_resolve_syms(s1);
     c99_mark_reloc_sections(s1);
+#ifdef C6_EXT
+    /* a method is emitted under '<tag>_<name>' and the unit itself defines
+       the plain name as a weak alias (see below): that is not an import */
+    for (i = 0; i < s1->c6_nb_method_aliases; i++) {
+        C99Decl *d = c99_decl_find(s1->c6_method_aliases[i]->plain);
+        if (d)
+            d->defined = 1;
+    }
+#endif
 
     for (i = 0; i < s1->nb_sections; i++) {
         Section *s = s1->sections[i];
@@ -2274,12 +2398,15 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
         fprintf(f, "} };\n");
     }
 
+    c99_print_imports(f);
     for (d = c99_decls; d; d = d->next) {
         /* a name first seen through another unit's declaration is not an
            external object once the defining unit's object is emitted here */
         if (!strncmp(d->text, "extern unsigned char ", 21)
             && c99_gsym_defined(d->name))
             continue;
+        if (c99_is_import_decl(d))
+            continue;           /* emitted by c99_print_imports */
         fprintf(f, "%s\n", d->text);
     }
 #ifdef C6_EXT
@@ -2316,6 +2443,9 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
     }
     if (c99_prog.len)
         fwrite(c99_prog.data, 1, c99_prog.len, f);
+    /* every reference to an imported name has been emitted by now: let the
+       headers the runtime prelude includes declare those names themselves */
+    c99_undef_imports(f);
     if (c99_rt_used)
         fwrite(c99_runtime, 1, sizeof c99_runtime - 1, f);
     if (emit_test_main) {
@@ -2330,7 +2460,6 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
                    "  printf(\"%%d test(s), %%d failure(s)\\n\", %d, __c99_fail);\n"
                    "  return __c99_fail ? 1 : 0;\n}\n", s1->c6_test_count);
     }
-
     if (!need_init) {
         fclose(f);
         return 0;
@@ -2357,15 +2486,19 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
             char target[1024];
 
             if (esym->st_shndx == SHN_UNDEF) {
+                /* an imported symbol lives under its private declaration
+                   name here: the #define that maps the source name to it was
+                   dropped before the runtime prelude (see c99_is_import_decl) */
+                const char *ref = c99_sym_ref(tname);
                 if (ELFW(ST_TYPE)(esym->st_info) == STT_FUNC)
                     snprintf(target, sizeof target,
-                             "__c99_pf((void (*)(void))%s)", tname);
+                             "__c99_pf((void (*)(void))%s)", ref);
                 else if (r->r_addend)
                     snprintf(target, sizeof target,
-                             "(void *)((char *)&%s + %lld)", tname,
+                             "(void *)((char *)&%s + %lld)", ref,
                              (long long)r->r_addend);
                 else
-                    snprintf(target, sizeof target, "(void *)&%s", tname);
+                    snprintf(target, sizeof target, "(void *)&%s", ref);
             } else if (ts && (ts->sh_flags & SHF_EXECINSTR)) {
                 snprintf(target, sizeof target,
                          "__c99_pf((void (*)(void))%s)", tname);

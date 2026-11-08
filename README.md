@@ -1026,6 +1026,16 @@ casts; structs, unions and functions returning structs; variadic function
 definitions (`va_start`/`va_arg`/`va_end`, and passing the `va_list` on to a
 host function such as `vsnprintf`), with the x86-64 SysV `va_list` layout.
 
+Symbols the unit only imports (libc calls, and functions or objects of another
+translation unit) are declared once, under a private `__c99_ext_N` name bound
+to the real linker symbol with an `__asm__` label; the generated code reaches
+them through a `#define` of the source name, which is dropped again before the
+runtime prelude.  The declaration block can then keep the compiler's own idea
+of a prototype -- tcc has one 64 bit integer type for `long` and `long long`,
+and every struct it sees is an opaque byte block -- without colliding with the
+host's declarations when the prelude includes `<stdlib.h>` and `<pthread.h>`.
+A plain `cc out.c` (no `-w`, no extra include flags) is enough.
+
 c6 programs work too.  A c6 translation unit (`-std=c6`) carries a portable C
 implementation of the defer/error/slice/coroutine/thread runtime, appended to
 its own output file.  It is ordinary C99 plus POSIX (`pthread` and `select`
