@@ -409,6 +409,19 @@ typedef struct C99Struct {
 static C99Struct *c99_structs;
 static int c99_nstructs, c99_structs_size;
 
+/* an incomplete struct has no size, so generated C sees it as 'void *' */
+static int c99_struct_complete(Sym *ref)
+{
+    CType t = {0};
+    int align = 0;
+
+    if (!ref)
+        return 0;
+    t.t = VT_STRUCT;
+    t.ref = ref;
+    return type_size(&t, &align) >= 0;
+}
+
 static int c99_struct_id(Sym *ref)
 {
     CType t;
@@ -516,6 +529,12 @@ static void c99_type(char *buf, int size, CType *type)
             return;
         }
         if ((pt->t & VT_BTYPE) == VT_STRUCT) {
+            /* an opaque handle ('struct __c6_thread'): no field is ever
+               reached through it, so the generated C needs no layout */
+            if (!c99_struct_complete(pt->ref)) {
+                snprintf(buf, size, "void *");
+                return;
+            }
             snprintf(buf, size, "__c99_s%d *", c99_struct_id(pt->ref));
             return;
         }
@@ -790,6 +809,10 @@ static const char * const c99_runtime_names[] = {
     "__c6_gc_live", "__c6_gc_refcount", "__c6_gc_drain_budget",
     "__c6_gc_shutdown",
     "__c6_gc_root",
+    /* thread handles and handle methods (task / thread) */
+    "__tcc_th_spawn", "__c6_th_release", "__c6_thread_join",
+    "__c6_thread_done", "__c6_thread_value",
+    "__c6_task_wait", "__c6_task_done", "__c6_task_kind",
 };
 
 static int c99_is_runtime_name(const char *name)

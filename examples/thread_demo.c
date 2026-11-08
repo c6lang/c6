@@ -66,6 +66,12 @@ static int consumer(int rfd, int want)
     return 0;
 }
 
+/* ---- 4. 要等某一个线程：留住句柄 ---- */
+
+/* 'go f(a);' 是起了就不管；'thread h = go f(a);' 同时拿到这次调用的记录：
+   h->join() 等它结束（重复调用幂等），h->done() 不阻塞，h->value() 取
+   被调函数的返回值。线程本身仍旧由启动它的线程回收，句柄只多持有一份。 */
+
 int main(void)
 {
     struct pair p = { 3, 4 };
@@ -84,6 +90,13 @@ int main(void)
     go consumer(fds[0], 12);
 
     printf("main: go 之后立刻继续（上面三行输出可能还没出现）\n");
+
+    /* 只等其中一个：句柄方式的等待 */
+    thread h = go download(7, 1);
+    printf("main: 只等 worker 7\n");
+    h->join();
+    printf("main: worker 7 的值 = %d\n", (int)h->value());
+
     sleep(2);
     printf("main: 全部完成\n");
     return 0;

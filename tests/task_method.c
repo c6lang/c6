@@ -1,0 +1,138 @@
+/* c6 自测：任务句柄的方法 t->wait() / t->done() / t->kind()
+ *
+ * 任务句柄原来只有一组过程式入口（__c6_co_wait(t) 之类），现在同样是
+ * 方法：
+ *
+ *   task t = f(x);    创建任务（t 在作用域退出时自动销毁）
+ *   t->wait();        驱动事件循环直到它结束：0 = 完成，-1 = 失败
+ *   t->done();        1 = 已经结束，不驱动、不阻塞
+ *   t->kind();        C6_CO_KIND_DONE / C6_CO_KIND_ERR
+ *   t->val            返回值（字段，照旧）
+ *
+ * 't->wait()' 会顺带推进别的顶层任务，它和线程句柄的 'h->join()' 不是
+ * 一回事：后者只等那一个 OS 线程。
+ *
+ * 运行（仓库根目录）：
+ *   make selftest
+ * 或单个文件：
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/task_method.c
+ */
+#include <stdio.h>
+#include <string.h>
+
+/* ---- 被测的 async 函数 ---- */
+
+async int inner(int k)
+{
+    return k + 1;
+}
+
+/* 中间隔一次 await：任务真的会挂起，再被驱动 */
+async int twice(int k)
+{
+    int a = 0;
+
+    a = await inner(k);
+    return a * 2;
+}
+
+async int!error boom(int k)
+{
+    if (k < 0)
+        err(7, "负数是错的");
+    return k;
+}
+
+/* ---- 1. wait / done / kind / val ---- */
+
+test "t->wait() 驱动到结束，done/kind/val 一致" {
+    task t = twice(5);
+
+    if (t->done())
+        err(1, "还没驱动就说完成了");
+    if (t->wait() != 0)
+        err(2, "wait 返回非 0");
+    if (!t->done())
+        err(3, "wait 之后 done() 应为 1");
+    if (t->kind() != C6_CO_KIND_DONE)
+        err(4, "kind 应为 DONE");
+    if (t->val != 12)
+        err(5, "返回值不对");
+}
+
+test "wait 幂等：结束之后再 wait 立刻返回 0" {
+    task t = twice(1);
+
+    if (t->wait() != 0)
+        err(10, "第一次 wait 失败");
+    if (t->wait() != 0)
+        err(11, "第二次 wait 应当也是 0");
+    if (t->wait() != 0)
+        err(12, "第三次 wait 应当也是 0");
+    if (t->val != 4)
+        err(13, "返回值不对");
+}
+
+test "done() 不驱动：挂起的任务仍然是 0" {
+    task t = twice(3);
+
+    if (t->done())
+        err(20, "还没驱动就说完成了");
+    if (t->kind() != C6_CO_KIND_DONE && t->done())
+        err(21, "done 与 kind 不一致");
+    if (t->wait() != 0 || !t->done())
+        err(22, "驱动之后应当完成");
+    if (t->val != 8)
+        err(23, "返回值不对");
+}
+
+/* ---- 2. 失败的任务 ---- */
+
+test "失败的任务：wait 返回 -1，kind 报 ERR" {
+    task t = boom(-1);
+
+    if (t->wait() != -1)
+        err(30, "失败的任务 wait 应返回 -1");
+    if (t->kind() != C6_CO_KIND_ERR)
+        err(31, "kind 应为 ERR");
+    if (!t->done())
+        err(32, "失败也算结束");
+}
+
+test "成功的任务与失败的任务相邻，互不影响" {
+    task a = boom(7);
+    task b = boom(-7);
+    task c = twice(2);
+
+    if (a->wait() != 0 || a->val != 7)
+        err(40, "第一个任务不对");
+    if (b->wait() != -1 || b->kind() != C6_CO_KIND_ERR)
+        err(41, "第二个任务应当失败");
+    if (c->wait() != 0 || c->val != 6)
+        err(42, "第三个任务不对");
+}
+
+/* ---- 3. 句柄可以被放弃，作用域收尾照旧 ---- */
+
+test "t = NULL 提前放弃，块尾不重复销毁" {
+    {
+        task t = twice(4);
+
+        if (t->wait() != 0)
+            err(50, "wait 失败");
+        if (t->val != 10)
+            err(51, "返回值不对");
+        t = NULL;               /* 提前放手：块尾的销毁是空操作 */
+    }
+    {
+        task t = twice(6);      /* 不 wait 就出块：销毁时回卷，不泄漏 */
+
+        (void)t;
+    }
+    {
+        task t = twice(8);
+
+        if (t->wait() != 0 || t->val != 18)
+            err(52, "销毁过的任务影响到了新任务");
+    }
+}

@@ -309,6 +309,7 @@ static void c6_gc_drop_register(int name, int sym_tok, CType *type, int tag);
 static int c6_gc_is_drop(int sym_tok);
 static int c6_gc_drop_callee(Sym *s);
 static C6Method *c6_method_lookup(CType *type, int name);
+static int c6_task_head_ptr(CType *type, CType *out);
 static int c6_has_field(CType *type, int v);
 static void c6_method_call_prep(C6Method *m);
 static CType c6_slice_ctype(C6Slice *sl);
@@ -331,6 +332,9 @@ static void c6_return_value(CType *type);
 static void c6_async_await_io(Sym *s);
 static void c6_co_parse(void);
 static void c6_go_parse(void);
+static void c6_sp_parse(int want_handle);
+static void c6_thread_decl(void);
+static void c6_thread_defer_release(int slot);
 static void c6_sp_flush(void);
 static int c6_soft_kw(int t);
 static int c6_soft_kw_shadowed(int t);
@@ -373,6 +377,7 @@ static void c6_gc_value_check(CType *type, const char *what);
 #define C6_KW_CO   1
 #define C6_KW_GO   2
 #define C6_KW_TASK 3
+#define C6_KW_THREAD 4
 /* trampolines that still have to be emitted (one per spawned function) */
 typedef struct C6SpPending {
     struct C6SpPending *next;
@@ -7318,9 +7323,24 @@ special_math_val:
             if (arrow && tok >= TOK_UIDENT) {
                 /* 'p->f(...)' is a method call when F is a registered method
                    of the type P points at; a real field of that name keeps
-                   plain C semantics */
-                C6Method *m = c6_method_lookup(&vtop->type, tok);
-                if (m && !c6_has_field(&vtop->type, tok)) {
+                   plain C semantics.  A task handle is a pointer to
+                   'struct NAME_task', which starts with a 'struct __c6_task
+                   head', so the lookup falls back to the type of that first
+                   field: 't->wait()' is the built-in task method. */
+                C6Method *m = 0;
+
+                if (!c6_has_field(&vtop->type, tok)) {
+                    m = c6_method_lookup(&vtop->type, tok);
+                    if (!m) {
+                        CType head = {0};
+                        if (c6_task_head_ptr(&vtop->type, &head)) {
+                            m = c6_method_lookup(&head, tok);
+                            if (m)
+                                vtop->type = head;  /* head is at offset 0 */
+                        }
+                    }
+                }
+                if (m) {
                     int mname = tok;
                     next();
                     if (tok != '(')
@@ -9264,6 +9284,16 @@ static void c6_method_plain_decl(int name, CType *type, AttributeDef *ad)
 
     if (!tcc_state->c6_ext || sym_find_raw(alias))
         return;                 /* already declared under the plain name */
+    /* a built-in handle type ('struct __c6_task', 'struct __c6_thread') needs
+       no plain alias, and names like 'wait' or 'done' are libc's */
+    if (type->ref && type->ref->next) {
+        int tag = c6_ptr_tag(&type->ref->next->type);
+        if (tag) {
+            const char *tn = get_tok_str(tag, NULL);
+            if (tn[0] == '_' && tn[1] == '_')
+                return;
+        }
+    }
     t.t = (t.t | VT_EXTERN) & ~(VT_STATIC | VT_INLINE);
     a.asm_label = 0;
     a.alias_target = 0;
@@ -9478,6 +9508,30 @@ static int c6_has_field(CType *type, int v)
     if (!c6_ptr_tag(type))
         return 0;
     return c6_find_field_quiet(pointed_type(type), v | SYM_FIELD) != 0;
+}
+
+/* 'struct __c6_task *' when TYPE points at a struct whose first field is the
+   task header, 0 otherwise.  The generated task structs are
+   'struct NAME_task { struct __c6_task head; T val; ... }', so the header is
+   at offset 0 and the pointer can be used as is. */
+static int c6_task_head_ptr(CType *type, CType *out)
+{
+    CType *inner = 0;
+    Sym *head = 0, *rt = 0;
+
+    if ((type->t & VT_BTYPE) != VT_PTR || !type->ref)
+        return 0;
+    inner = pointed_type(type);
+    if ((inner->t & VT_BTYPE) != VT_STRUCT || !inner->ref)
+        return 0;
+    head = c6_find_field_quiet(inner, tok_alloc_const("head") | SYM_FIELD);
+    rt = struct_find(tok_alloc_const("__c6_task"));
+    if (!head || !rt || (head->type.t & VT_BTYPE) != VT_STRUCT
+        || head->type.ref != rt)
+        return 0;
+    *out = head->type;
+    mk_pointer(out);
+    return 1;
 }
 
 /* leave the receiver in a temporary slot and push the method symbol, so
@@ -11588,6 +11642,12 @@ again:
                     tcc_error("a destructor cannot suspend: it runs while "
                               "the object is being released");
                 c6_go_parse();
+                break;
+            case C6_KW_THREAD:
+                if (c6_gc_in_drop)
+                    tcc_error("a destructor cannot suspend: it runs while "
+                              "the object is being released");
+                c6_thread_decl();
                 break;
             default:         c6_task_decl();  break;
             }
@@ -15578,7 +15638,10 @@ static int c6_soft_kw(int t)
     switch (*s) {
     case 'c': if (!strcmp(s, "co"))   return C6_KW_CO;   break;
     case 'g': if (!strcmp(s, "go"))   return C6_KW_GO;   break;
-    case 't': if (!strcmp(s, "task")) return C6_KW_TASK; break;
+    case 't':
+        if (!strcmp(s, "task"))   return C6_KW_TASK;
+        if (!strcmp(s, "thread")) return C6_KW_THREAD;
+        break;
     }
     return C6_KW_NONE;
 }
@@ -15695,8 +15758,16 @@ static void c6_sp_emit(C6SpPending *sp)
     TokenString *ts = 0;
     Sym *p = 0;
     char *save_pkg = 0;
+    CType rt = {0};
     int arg = tok_alloc_const("__c6_arg");
-    int i = 0, ofs = 0;
+    int ret = tok_alloc_const("__c6_ret");
+    int i = 0, ofs = 0, scalar = 0;
+
+    /* a scalar result travels back through the thread record, so that a
+       handle can hand it out again ('h->value()') */
+    rt = sp->ftype.ref->type;
+    scalar = (rt.t & VT_BTYPE) == VT_PTR
+             || is_integer_btype(rt.t & VT_BTYPE);
 
     ts = tok_str_alloc();
     tok_str_add(ts, TOK_STATIC);
@@ -15709,6 +15780,25 @@ static void c6_sp_emit(C6SpPending *sp)
     tok_str_add(ts, arg);
     tok_str_add(ts, ')');
     tok_str_add(ts, '{');
+    if (scalar) {
+        /* void *__c6_ret = 0; __c6_ret = (void *)(long long)NAME(args); */
+        tok_str_add(ts, TOK_VOID);
+        tok_str_add(ts, '*');
+        tok_str_add(ts, ret);
+        tok_str_add(ts, '=');
+        c6_async_add_int(ts, 0);
+        tok_str_add(ts, ';');
+        tok_str_add(ts, ret);
+        tok_str_add(ts, '=');
+        tok_str_add(ts, '(');
+        tok_str_add(ts, TOK_VOID);
+        tok_str_add(ts, '*');
+        tok_str_add(ts, ')');
+        tok_str_add(ts, '(');
+        tok_str_add(ts, TOK_LONG);
+        tok_str_add(ts, TOK_LONG);
+        tok_str_add(ts, ')');
+    }
     tok_str_add(ts, sp->name);
     tok_str_add(ts, '(');
     for (i = 0, p = c6_async_params(&sp->ftype); p; p = p->next, i++) {
@@ -15774,7 +15864,10 @@ static void c6_sp_emit(C6SpPending *sp)
         ofs += sz;
     }
     tok_str_add(ts, TOK_RETURN);
-    c6_async_add_int(ts, 0);
+    if (scalar)
+        tok_str_add(ts, ret);
+    else
+        c6_async_add_int(ts, 0);
     tok_str_add(ts, ';');
     tok_str_add(ts, '}');
     tok_str_add(ts, TOK_EOF);
@@ -15793,9 +15886,11 @@ static void c6_sp_flush(void)
         c6_sp_emit(p);
 }
 
-/* 'go f(args);' : evaluate the arguments, hand them and the trampoline to
-   the runtime and return at once. */
-static void c6_go_parse(void)
+/* 'go f(args)' : evaluate the arguments into a heap block and hand them and
+   the trampoline to the runtime.  With WANT_HANDLE the spawned thread's
+   handle stays on the stack ('thread h = go f(x);'); otherwise it is dropped
+   ('go f(x);'). */
+static void c6_sp_parse(int want_handle)
 {
     Sym *fs = sym_find(tok);
     CType ft = {0}, fnt = {0};
@@ -15884,8 +15979,8 @@ static void c6_go_parse(void)
         ofs += sz;
     }
     skip(')');
-    /* __tcc_th_start(&__c6_sp_NAME, __c6_p); */
-    c6_rt_begin("__tcc_th_start");
+    /* __tcc_th_start / __tcc_th_spawn(&__c6_sp_NAME, __c6_p); */
+    c6_rt_begin(want_handle ? "__tcc_th_spawn" : "__tcc_th_start");
     fnt = c6_sp_fn_type();
     vpushsym(&fnt, tramp_sym);
     mk_pointer(&vtop->type);
@@ -15893,9 +15988,85 @@ static void c6_go_parse(void)
         vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
     else
         vpushi(0);
-    c6_rt_end("__tcc_th_start", 2);
+    c6_rt_end(want_handle ? "__tcc_th_spawn" : "__tcc_th_start", 2);
+    if (!want_handle) {
+        vpop();
+        skip(';');
+    }
+}
+
+/* 'go f(args);' : start the thread and keep no handle. */
+static void c6_go_parse(void)
+{
+    c6_sp_parse(0);
+}
+
+/* 'thread h = go f(args);' : the handle keeps the thread's record alive, so
+   'h->join()' can wait for it and 'h->done()' can ask without waiting.  The
+   thread itself is still reaped by the thread that started it. */
+static void c6_thread_decl(void)
+{
+    CType ht = {0};
+    Sym *ls = 0, *rt = 0;
+    int v = 0, align = 0, size = 0, slot = 0;
+
+    if (tok < TOK_UIDENT)
+        expect("variable name");
+    v = tok;
+    next();
+    skip('=');
+    if (c6_soft_kw(tok) != C6_KW_GO || c6_soft_kw_shadowed(tok))
+        tcc_error("the initializer of a 'thread' variable must be "
+                  "'go f(...)'");
+    next();                             /* 'go' */
+    c6_sp_parse(1);                     /* the handle is on the stack */
+    rt = struct_find(tok_alloc_const("__c6_thread"));
+    if (!rt)
+        tcc_error("internal: 'struct __c6_thread' is not declared");
+    ht.t = VT_STRUCT;                   /* 'struct __c6_thread' */
+    ht.ref = rt;
+    mk_pointer(&ht);                    /* 'struct __c6_thread *' */
+    vtop->type = ht;                    /* the spawn returns 'void *' */
+    size = type_size(&ht, &align);
+    loc = (loc - size) & -align;
+    slot = loc;
+    ls = sym_push(v, &ht, VT_LOCAL | VT_LVAL, slot);
+    vset(&ht, VT_LOCAL | VT_LVAL, ls->c);
+    vswap();
+    vstore();
     vpop();
+    c6_thread_defer_release(slot);
     skip(';');
+}
+
+/* the handle's scope-exit cleanup, registered like a 'defer': 'return',
+   'break', 'goto' and 'err' all give the handle back */
+static void c6_thread_defer_release(int slot)
+{
+    int skip = 0, id = 0;
+    Sym *l = 0;
+
+    if (!defer_state.enabled || nocode_wanted)
+        return;
+    defer_state.body_depth++;
+    id = ++defer_state.next_site;
+    l = c6_new_label("dcl");
+    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
+    vpushi(id);
+    vpushi(local_scope);
+    vpushi(0);                          /* kind: defer */
+    gfunc_call(3);
+    skip = gjmp(0);
+    c6_def_label(l);
+    CODE_ON();
+    c6_add_site(id, l);
+    defer_state.has_sites = 1;
+    c6_rt_begin("__c6_th_release");
+    vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
+    c6_rt_end("__c6_th_release", 1);
+    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
+    gsym(skip);
+    defer_state.body_depth--;
 }
 #endif /* C6_EXT */
 

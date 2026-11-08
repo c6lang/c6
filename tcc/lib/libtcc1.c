@@ -691,12 +691,19 @@ extern void *pthread_getspecific(pthread_key_t);
 extern int pthread_setspecific(pthread_key_t, const void *);
 extern int pthread_create(pthread_t *, const void *, void *(*)(void *), void *);
 extern int pthread_join(pthread_t, void **);
+extern pthread_t pthread_self(void);
+extern int pthread_equal(pthread_t, pthread_t);
 #endif
 
 extern void *calloc(unsigned long, unsigned long);
 extern void free(void *);
 
-/* a thread started by 'go', always joined by the thread that started it */
+/* A thread started by 'go'.  It is always joined by the thread that started
+   it, and it may also be handed out as a handle ('thread h = go f(x);'), so
+   the record is reference counted: the starter's child list owns one
+   reference, the handle owns another.  'state' keeps 'pthread_join' from
+   running twice on the same thread, 'done' lets a handle ask without
+   blocking, and 'ret' carries a scalar result back. */
 struct TccThRec {
     TccThRec *next;
 #ifndef TCC_TARGET_PE
@@ -704,7 +711,17 @@ struct TccThRec {
 #else
     void *handle;
 #endif
+    volatile int state;   /* 0: running, 1: joined */
+    volatile int done;    /* 1 once the entry function returned */
+    volatile int refs;    /* child list 1 + handle 1 */
+    void *ret;            /* the entry function's value, for value() */
 };
+
+static void tcc_th_rec_unref(TccThRec *r)
+{
+    if (r && --r->refs <= 0)
+        free(r);
+}
 
 static void tcc_th_trap(void)
 {
@@ -734,10 +751,13 @@ static void tcc_th_join_children(TccThCtx *th)
 
     while ((r = th->th_list) != 0) {
         th->th_list = r->next;
+        if (!r->state) {            /* a handle may have joined it already */
 #ifndef TCC_TARGET_PE
-        pthread_join(r->tid, (void **)0);
+            pthread_join(r->tid, (void **)0);
 #endif
-        free(r);
+            r->state = 1;
+        }
+        tcc_th_rec_unref(r);        /* the child list's own reference */
     }
 }
 
@@ -801,9 +821,10 @@ void *__tcc_sp_args(unsigned long size)
 typedef struct TccThStart {
     void *(*fn)(void *);
     void *arg;
+    TccThRec *rec;              /* told when the entry function returns */
 } TccThStart;
 
-/* Thread entry: unpack the call, release the block, drop the result. */
+/* Thread entry: unpack the call, release the block, record the result. */
 static void *tcc_th_tramp(void *p)
 {
     TccThStart st = *(TccThStart *)p;
@@ -812,39 +833,97 @@ static void *tcc_th_tramp(void *p)
     free(p);
     ret = st.fn(st.arg);
     free(st.arg);
+    st.rec->ret = ret;
+    st.rec->done = 1;
     return ret;
 }
 
-/* __tcc_th_start(&trampoline, block): run the trampoline on a new thread.
-   The block belongs to the thread from here on, and the thread is joined by
-   the thread that started it.  Returns 0 when the thread was started. */
-int __tcc_th_start(void *(*fn)(void *), void *arg)
+/* __tcc_th_spawn(&trampoline, block): run the trampoline on a new thread and
+   return the handle ('thread h = go f(x);').  The record starts with two
+   references: one for this thread's child list, one for the caller.  Returns
+   0 when the thread could not be started. */
+void *__tcc_th_spawn(void *(*fn)(void *), void *arg)
 {
 #ifdef TCC_TARGET_PE
     (void)fn;
     (void)arg;
     tcc_th_trap();              /* the PE port has no thread support yet */
-    return -1;
+    return 0;
 #else
     TccThCtx *th = tcc_th();
     TccThRec *r;
     TccThStart *st;
-    pthread_t tid;
 
+    r = (TccThRec *)tcc_th_alloc(sizeof *r);
     st = (TccThStart *)tcc_th_alloc(sizeof *st);
     st->fn = fn;
     st->arg = arg;
-    if (pthread_create(&tid, (const void *)0, tcc_th_tramp, st) != 0) {
+    st->rec = r;
+    r->refs = 2;
+    if (pthread_create(&r->tid, (const void *)0, tcc_th_tramp, st) != 0) {
         free(st);
         free(arg);
-        return -1;
+        free(r);
+        return 0;
     }
-    r = (TccThRec *)tcc_th_alloc(sizeof *r);
-    r->tid = tid;
     r->next = th->th_list;
     th->th_list = r;
+    return r;
+#endif
+}
+
+void __c6_th_release(TccThRec *r);
+
+/* __tcc_th_start(&trampoline, block): the 'go' statement, which keeps no
+   handle.  Returns 0 when the thread was started. */
+int __tcc_th_start(void *(*fn)(void *), void *arg)
+{
+    TccThRec *r = (TccThRec *)__tcc_th_spawn(fn, arg);
+
+    if (!r)
+        return -1;
+    __c6_th_release(r);         /* the caller keeps no handle */
+    return 0;
+}
+
+/* h->join(): wait for this thread.  Idempotent, and a thread that waits for
+   itself returns -1 instead of deadlocking. */
+int __c6_thread_join(TccThRec *r)
+{
+    if (!r)
+        return -1;
+#ifdef TCC_TARGET_PE
+    return -1;
+#else
+    if (pthread_equal(r->tid, pthread_self()))
+        return -1;
+    if (!r->state) {
+        if (pthread_join(r->tid, (void **)0) != 0)
+            return -1;
+        r->state = 1;
+    }
     return 0;
 #endif
+}
+
+/* h->done(): 1 once the thread's entry function returned, without waiting. */
+int __c6_thread_done(TccThRec *r)
+{
+    return r ? r->done : 0;
+}
+
+/* h->value(): the entry function's result, as a 'long long'.  The compiler
+   only allows it when the spawned function returns an integer or a pointer. */
+long long __c6_thread_value(TccThRec *r)
+{
+    return r ? (long long)r->ret : 0;
+}
+
+/* the handle's scope-exit cleanup: the thread itself is reaped by the thread
+   that started it, this only gives back the handle's reference */
+void __c6_th_release(TccThRec *r)
+{
+    tcc_th_rec_unref(r);
 }
 
 /* Wait for the threads this thread started.  A 'go' statement has no place
@@ -1867,6 +1946,27 @@ int __c6_co_state(void *self)
 int __c6_co_kind(void *self)
 {
     return ((TccCoTask *)self)->kind;
+}
+
+/* task handles are methods too ('t->wait()'): the emitted symbols are
+   '<tag>_<name>' (c6_method_symbol), so these wrappers carry those names */
+int __c6_co_state(void *self);
+int __c6_co_kind(void *self);
+int __c6_co_wait(void *self);
+
+int __c6_task_wait(void *self)
+{
+    return __c6_co_wait(self);
+}
+
+int __c6_task_done(void *self)
+{
+    return __c6_co_state(self) == C6_CO_STATE_DONE;
+}
+
+int __c6_task_kind(void *self)
+{
+    return __c6_co_kind(self);
 }
 
 void __c6_co_set_io(void *self, int fd, int ev)

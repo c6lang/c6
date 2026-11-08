@@ -479,13 +479,47 @@ go-statement = "go" , expression , ";" ;
   `__thread`：`-run` 不支持 TLS），所以线程里可以照常写 `defer`、`err`、
   `async`/`await`，也可以再 `go`。
 
+需要等某一个线程时用**句柄**（约束 C78）：
+
+```
+thread-declaration = "thread" , identifier , "=" , "go" , call , ";" ;
+```
+
+```c
+thread h = go download(1);   (* 启动，这次调用的记录留在句柄里 *)
+h->join();                   (* 阻塞到它结束；重复调用幂等，返回 0 *)
+h->done();                   (* 1 = 已经结束，不阻塞 *)
+h->value();                  (* 被调函数的返回值：整数或指针，否则别用 *)
+```
+
+句柄是启动者私有的：它只多持有一份线程记录（引用计数），线程仍然由启动者
+回收，句柄作用域退出时把自己的那份还回去 —— 没 `join` 也不漏。线程自己
+`join` 自己返回 `-1`，不会挂死。
+
 运行时接口（`-std=c6` 时预置声明）：
 
 ```
 void *__tcc_sp_args(unsigned long size);   (* 参数块 *)
 int   __tcc_th_start(void *(*fn)(void *), void *arg);   (* 起线程，0 = 成功 *)
+void *__tcc_th_spawn(void *(*fn)(void *), void *arg);   (* 起线程并返回句柄 *)
+void  __c6_th_release(struct __c6_thread *h);           (* 句柄放手 *)
+int   __c6_thread_join(struct __c6_thread *h);          (* h->join()  *)
+int   __c6_thread_done(struct __c6_thread *h);          (* h->done()  *)
+long long __c6_thread_value(struct __c6_thread *h);     (* h->value() *)
 void  __c6_th_join_all(void);              (* 等本线程 go 出去的线程 *)
 ```
+
+任务的句柄同样是方法（`struct NAME_task` 的第一个字段是 `struct __c6_task
+head`，方法查找会回退到它的类型）：
+
+```
+task t = fetch(url);   t->wait();    (* 驱动事件循环直到它结束，0 / -1 *)
+                       t->done();    (* 1 = 结束，不驱动、不阻塞 *)
+                       t->kind();    (* C6_CO_KIND_DONE / C6_CO_KIND_ERR *)
+```
+
+`t->wait()` 会顺带推进**别的**顶层任务（它是 `__c6_co_wait`），而
+`h->join()` 只等那一个 OS 线程：两个名字不通用。
 
 ### 3.7 tag 名直接作类型名（省略 `struct` / `union` / `enum`）
 
@@ -871,6 +905,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C75 | `memcpy`/`memmove` 不能作用于含托管字段的对象；`memset` 会漏引用（告警） | `... breaks reference counting; use a typed copy or 'own'` |
 | C76 | 析构 `drop` 不能手动调用、不能失败/挂起、必须返回 `void`、每个类型至多一个 | `a destructor cannot be called: ...`；`a destructor cannot fail: ...`；`a destructor cannot suspend: ...`；`'%s' already has a destructor` |
 | C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
+| C78 | `thread` 句柄的初始化式必须是 `go` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'go f(...)'` |
 
 ---
 
@@ -1103,6 +1138,9 @@ typedef、函数和全局变量写成普通 C 头文件，符号名就是带前�
 | 出作用域 / `return` / `break` / `goto` | 内联 `__c6_gc_release(&p, mode)`（注册在 defer 记录里，所以每条路径都跑到） |
 | 对象计数归零 | 调描述符的 `drop`（若登记过），再按字段表逐个释放字段（数组逐元素、嵌入结构体递归），最后 `free` |
 | `go f(p)` / `task t = f(p)` | 实参块 / 任务前缀的那次拷贝 +1，块释放 / `__c6_co_destroy` 时 −1 |
+| `thread h = go f(x);` | `h = __tcc_th_spawn(&__c6_sp_f, block)`，作用域登记 `__c6_th_release(h)`（走 defer 记录，每条退出路径都还） |
+| `h->join()` / `h->done()` / `h->value()` | `__c6_thread_join(h)` / `__c6_thread_done(h)` / `__c6_thread_value(h)` |
+| `t->wait()` / `t->done()` / `t->kind()` | `__c6_co_wait(t)` / `__c6_co_state(t) == -1` / `__c6_co_kind(t)`（接收者上转到 `struct __c6_task *`） |
 
 编译器不插入任何运行期调度：没有标记清扫线程，也没有安全点。
 
@@ -1525,6 +1563,9 @@ int main(void)
 | 抢占式调度、把阻塞的 libc 调用（`read`/`printf`/…）自动变成让出点 | 不在本扩展范围：`co`/`__c6_co_run` 只推进协程，不 hook libc |
 | PE 目标上的 `go` | 还没有 PE 线程支持，运行时 trap |
 | 取消 / 强杀一个 `go` 出去的线程 | 不提供：线程总是被启动它的线程 join |
+| `co` 的句柄 | 不提供：`co` 把任务交给顶层就绪链表，任务一结束就被销毁（否则一串短 `co` 会占满池子），句柄会悬空。要句柄用 `task t = f(a); t->wait();` |
+| `thread h = f(a);`（不是 `go`） | 约束 C78：句柄只能来自 `go` |
+| 等待线程时取非整数/指针的返回值 | `h->value()` 只有整数和指针能往返；结构体、浮点用 `shared @T` 或参数块带回 |
 | `for a \|i, v\| { }` / `for 0..n` | `for` 保持纯 C；迭代请用 `foreach` |
 | `foreach a { }`（不写绑定表） | 语法错误：绑定表必须紧跟 `foreach` |
 | `foreach (a) \|i, v\| { }`（括号形式） | 不支持：`foreach` 后面直接跟绑定表 |
@@ -1570,7 +1611,10 @@ int main(void)
 | `defer` / `errdefer` | `c6_defer_parse`、`c6_defer_begin`、`c6_defer_func_end` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
 | `err` | `c6_err_parse` / `c6_emit_propagate` | `tcc/tccgen.c` |
 | `co` | `c6_co_parse`、`__tcc_co_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
-| `go` | `c6_go_parse` / `c6_sp_emit` / `c6_sp_flush`、`__tcc_sp_args` / `__tcc_th_start` / `__c6_th_join_all` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `thread` | `c6_thread_decl`、`__tcc_th_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `go` | `c6_go_parse` / `c6_sp_parse` / `c6_sp_emit` / `c6_sp_flush`、`__tcc_sp_args` / `__tcc_th_start` / `__c6_th_join_all` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `thread` 句柄 | `c6_thread_decl` / `c6_thread_defer_release`、`__tcc_th_spawn` / `__c6_th_release` / `__c6_thread_*` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c`、`tcc/c99-rt.inc` |
+| 句柄方法 | `c6_method_lookup` + `c6_task_head_ptr`（`t->wait()`）、预置方法声明（`h->join()`） | `tcc/tccgen.c`、`tcc/tccpp.c` |
 | 软关键字 | `c6_soft_kw` / `c6_soft_kw_shadowed`（`block()` 与 `decl()` 两个入口） | `tcc/tccgen.c` |
 | 每线程状态 | `tcc_th()` / `tcc_th_join_children`（`pthread_key`） | `tcc/lib/libtcc1.c` |
 | `task` | `c6_task_decl` / `c6_task_check_handle` / `c6_task_defer_destroy` | `tcc/tccgen.c` |

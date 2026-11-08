@@ -3932,9 +3932,25 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "int __tcc_th_start(void *(*fn)(void *), void *arg);\n"
           "void __c6_th_join_all(void);\n"
           "int __c6_co_run(void);\n"
+          /* handle methods: 't->wait()' on a task, 'h->join()' on a thread.
+             A task struct is 'struct NAME_task { struct __c6_task head; ... }',
+             so the method lookup falls back to the type of the first field;
+             the emitted symbols are '<tag>_<name>' (c6_method_symbol). */
+          "int wait(struct __c6_task *self);\n"
+          "int done(struct __c6_task *self);\n"
+          "int kind(struct __c6_task *self);\n"
+          "struct __c6_thread;\n"
+          "void *__tcc_th_spawn(void *(*fn)(void *), void *arg);\n"
+          "void __c6_th_release(struct __c6_thread *self);\n"
+          "int join(struct __c6_thread *self);\n"
+          "int done(struct __c6_thread *self);\n"
+          "long long value(struct __c6_thread *self);\n"
           "int c6_io(int fd, int ev);\n"
           "#define C6_CO_EV_READ  1\n"
           "#define C6_CO_EV_WRITE 2\n"
+          /* what 't->kind()' reports once a task is finished */
+          "#define C6_CO_KIND_DONE 0\n"
+          "#define C6_CO_KIND_ERR  3\n"
           "#endif\n"
           /* reference-counting GC (docs/gc-design.md): the per-type
              descriptors the compiler emits and the runtime entry points that

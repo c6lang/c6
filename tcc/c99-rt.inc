@@ -77,7 +77,10 @@ typedef struct C99ThCtx {
 } C99ThCtx;
 
 
-/* a thread started by 'go', always joined by the thread that started it */
+/* A thread started by 'go'.  It is always joined by the thread that started
+   it, and it may also be handed out as a handle ('thread h = go f(x);'), so
+   the record is reference counted: the starter's child list owns one
+   reference, the handle owns another. */
 struct C99ThRec {
     C99ThRec *next;
 #if C99_RT_POSIX
@@ -85,7 +88,17 @@ struct C99ThRec {
 #else
     void *handle;
 #endif
+    volatile int state;   /* 0: running, 1: joined */
+    volatile int done;    /* 1 once the entry function returned */
+    volatile int refs;    /* child list 1 + handle 1 */
+    void *ret;            /* the entry function's value, for value() */
 };
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_th_rec_unref(C99ThRec *r)
+{
+    if (r && --r->refs <= 0)
+        free(r);
+}
 
 C99_RT_UNUSED __c99_rt_linkage void __c99_trap(void)
 {
@@ -115,10 +128,13 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_join_children(C99ThCtx *th)
 
     while ((r = th->th_list) != 0) {
         th->th_list = r->next;
+        if (!r->state) {            /* a handle may have joined it already */
 #if C99_RT_POSIX
-        pthread_join(r->tid, (void **)0);
+            pthread_join(r->tid, (void **)0);
 #endif
-        free(r);
+            r->state = 1;
+        }
+        __c99_th_rec_unref(r);      /* the child list's own reference */
     }
 }
 
@@ -182,9 +198,10 @@ C99_RT_UNUSED __c99_rt_linkage void *__tcc_sp_args(unsigned long size)
 typedef struct C99ThStart {
     void *(*fn)(void *);
     void *arg;
+    C99ThRec *rec;             /* told when the entry function returns */
 } C99ThStart;
 
-/* Thread entry: unpack the call, release the block, drop the result. */
+/* Thread entry: unpack the call, release the block, record the result. */
 C99_RT_UNUSED __c99_rt_linkage void *__c99_th_tramp(void *p)
 {
     C99ThStart st = *(C99ThStart *)p;
@@ -193,39 +210,96 @@ C99_RT_UNUSED __c99_rt_linkage void *__c99_th_tramp(void *p)
     free(p);
     ret = st.fn(st.arg);
     free(st.arg);
+    st.rec->ret = ret;
+    st.rec->done = 1;
     return ret;
 }
 
-/* __tcc_th_start(&trampoline, block): run the trampoline on a new thread.
-   The block belongs to the thread from here on, and the thread is joined by
-   the thread that started it.  Returns 0 when the thread was started. */
-C99_RT_UNUSED __c99_rt_linkage int __tcc_th_start(void *(*fn)(void *), void *arg)
+/* __tcc_th_spawn(&trampoline, block): run the trampoline on a new thread and
+   return the handle ('thread h = go f(x);').  Two references: one for this
+   thread's child list, one for the caller.  Returns 0 on failure. */
+C99_RT_UNUSED __c99_rt_linkage void *__tcc_th_spawn(void *(*fn)(void *),
+                                                   void *arg)
 {
 #if !C99_RT_POSIX
     (void)fn;
     (void)arg;
     __c99_trap();              /* the PE port has no thread support yet */
-    return -1;
+    return 0;
 #else
     C99ThCtx *th = __c99_th();
     C99ThRec *r;
     C99ThStart *st;
-    pthread_t tid;
 
+    r = (C99ThRec *)__c99_alloc(sizeof *r);
     st = (C99ThStart *)__c99_alloc(sizeof *st);
     st->fn = fn;
     st->arg = arg;
-    if (pthread_create(&tid, (const void *)0, __c99_th_tramp, st) != 0) {
+    st->rec = r;
+    r->refs = 2;
+    if (pthread_create(&r->tid, (const void *)0, __c99_th_tramp, st) != 0) {
         free(st);
         free(arg);
-        return -1;
+        free(r);
+        return 0;
     }
-    r = (C99ThRec *)__c99_alloc(sizeof *r);
-    r->tid = tid;
     r->next = th->th_list;
     th->th_list = r;
+    return r;
+#endif
+}
+
+/* the handle's scope-exit cleanup: the thread itself is reaped by the thread
+   that started it, this only gives back the handle's reference */
+C99_RT_UNUSED __c99_rt_linkage void __c6_th_release(C99ThRec *r)
+{
+    __c99_th_rec_unref(r);
+}
+
+/* __tcc_th_start(&trampoline, block): the 'go' statement, which keeps no
+   handle.  Returns 0 when the thread was started. */
+C99_RT_UNUSED __c99_rt_linkage int __tcc_th_start(void *(*fn)(void *),
+                                                  void *arg)
+{
+    C99ThRec *r = (C99ThRec *)__tcc_th_spawn(fn, arg);
+
+    if (!r)
+        return -1;
+    __c6_th_release(r);         /* the caller keeps no handle */
+    return 0;
+}
+
+/* h->join(): wait for this thread.  Idempotent, and a thread that waits for
+   itself returns -1 instead of deadlocking. */
+C99_RT_UNUSED __c99_rt_linkage int __c6_thread_join(C99ThRec *r)
+{
+    if (!r)
+        return -1;
+#if !C99_RT_POSIX
+    return -1;
+#else
+    if (pthread_equal(r->tid, pthread_self()))
+        return -1;
+    if (!r->state) {
+        if (pthread_join(r->tid, (void **)0) != 0)
+            return -1;
+        r->state = 1;
+    }
     return 0;
 #endif
+}
+
+/* h->done(): 1 once the thread's entry function returned, without waiting. */
+C99_RT_UNUSED __c99_rt_linkage int __c6_thread_done(C99ThRec *r)
+{
+    return r ? r->done : 0;
+}
+
+/* h->value(): the entry function's result.  The compiler only allows it when
+   the spawned function returns an integer or a pointer. */
+C99_RT_UNUSED __c99_rt_linkage long long __c6_thread_value(C99ThRec *r)
+{
+    return r ? (long long)r->ret : 0;
 }
 
 /* Wait for the threads this thread started.  A 'go' statement has no place
@@ -705,6 +779,29 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_state(void *self)
 C99_RT_UNUSED __c99_rt_linkage int __c6_co_kind(void *self)
 {
     return ((C99CoTask *)self)->kind;
+}
+
+/* task handles are methods too ('t->wait()'): the emitted symbols are
+   '<tag>_<name>' (c6_method_symbol), so these wrappers carry those names.
+   The coroutine accessors are defined further down (implicit declarations are
+   errors in C99), so they come first. */
+C99_RT_UNUSED __c99_rt_linkage int __c6_co_state(void *self);
+C99_RT_UNUSED __c99_rt_linkage int __c6_co_kind(void *self);
+C99_RT_UNUSED __c99_rt_linkage int __c6_co_wait(void *self);
+
+C99_RT_UNUSED __c99_rt_linkage int __c6_task_wait(void *self)
+{
+    return __c6_co_wait(self);
+}
+
+C99_RT_UNUSED __c99_rt_linkage int __c6_task_done(void *self)
+{
+    return __c6_co_state(self) == C6_CO_STATE_DONE;
+}
+
+C99_RT_UNUSED __c99_rt_linkage int __c6_task_kind(void *self)
+{
+    return __c6_co_kind(self);
 }
 
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_set_io(void *self, int fd, int ev)
