@@ -872,6 +872,15 @@ void drop(struct File *self) { close(self->fd); }
 所以「创建者先放手、任务后跑完」是安全的；没跑完就被销毁的任务会回卷
 （跑 `errdefer`/`defer`/释放），不会漏引用。
 
+完整可运行示例见 [examples/gc_demo.c](examples/gc_demo.c)：作用域释放与
+`p = NULL`、`new T[n]` 的逐元素析构、`own` 子树配 `weak` 父指针、`move()`、
+`shared` 跨线程与 `go`、`async` 任务持有参数和返回值，最后用
+`__c6_gc_live()` 自证「全程没有泄漏」（`rc=0` 才算过）：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -run examples/gc_demo.c
+```
+
 代价与尺寸（x86_64，热缓存，跨 TU 不内联）：`@T` 的一次加/减约 2.2 ns，
 `shared @T` 约 8.4 ns（原子指令 + helper 调用）；每个对象 32 字节头；
 作用域退出时释放是**内联**的，约 2.5 ns/引用。对照同机 `std::shared_ptr`
