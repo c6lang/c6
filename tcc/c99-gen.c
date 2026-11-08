@@ -114,6 +114,41 @@ static C99Mark *c99_marks; static int c99_nmarks, c99_marks_size;
 static C99Lbl  *c99_lbls;  static int c99_nlbls,  c99_lbls_size;
 static C99Pl  **c99_pls;   static int c99_npls,   c99_pls_size;
 static C99Decl *c99_decls;
+static unsigned char *c99_used; static int c99_used_size;
+static int c99_have_main;            /* __c99_init() is only called from main */
+
+/* Data sections are emitted as byte arrays, but only the ones the generated
+   code or __c99_init() actually refers to: an unreferenced array would make
+   every user of -Wall see a dead 'static' object. */
+static void c99_mark_section(int shndx)
+{
+    int n;
+
+    if (shndx <= 0)
+        return;
+    if (shndx >= c99_used_size) {
+        n = c99_used_size ? c99_used_size : 64;
+        while (n <= shndx)
+            n *= 2;
+        c99_used = tcc_realloc(c99_used, n);
+        memset(c99_used + c99_used_size, 0, n - c99_used_size);
+        c99_used_size = n;
+    }
+    c99_used[shndx] = 1;
+}
+
+static int c99_section_used(int shndx)
+{
+    return shndx > 0 && shndx < c99_used_size && c99_used[shndx];
+}
+
+/* A function whose symbol the front-end made STB_LOCAL was declared
+   'static' in the source; everything else keeps external linkage. */
+static int c99_is_static_fn(Sym *fsym, const char *name)
+{
+    return name && strcmp(name, "main") != 0 && fsym->c
+        && ELFW(ST_BIND)(elfsym(fsym)->st_info) == STB_LOCAL;
+}
 
 static int c99_ind(void)
 {
@@ -251,7 +286,7 @@ static void c99_type(char *buf, int size, CType *type)
     switch (bt) {
     case VT_VOID:    snprintf(buf, size, "void"); return;
     case VT_BOOL:    snprintf(buf, size, "_Bool"); return;
-    case VT_BYTE:    snprintf(buf, size, "%schar", (t & VT_UNSIGNED) ? "unsigned " : "signed "); return;
+    case VT_BYTE:    snprintf(buf, size, "%s", (t & VT_UNSIGNED) ? "unsigned char" : "char"); return;
     case VT_SHORT:   snprintf(buf, size, "%sshort", (t & VT_UNSIGNED) ? "unsigned " : "signed "); return;
     case VT_INT:     snprintf(buf, size, "%sint", (t & VT_UNSIGNED) ? "unsigned " : ""); return;
     case VT_LLONG:   snprintf(buf, size, "%slong long", (t & VT_UNSIGNED) ? "unsigned " : ""); return;
@@ -319,9 +354,11 @@ static void c99_addr(char *buf, int size, SValue *sv)
                 ElfSym *esym = elfsym(sv->sym);
                 if (esym->st_shndx == SHN_UNDEF)
                     snprintf(sbuf, sizeof sbuf, "((char *)&%s)", nm);
-                else
+                else {
+                    c99_mark_section(esym->st_shndx);
                     snprintf(sbuf, sizeof sbuf, "((char *)__c99_d%d + %lld)",
                              esym->st_shndx, (long long)esym->st_value);
+                }
             }
             if (sv->c.i)
                 snprintf(buf, size, "(%s + %d)", sbuf, (int)sv->c.i);
@@ -380,6 +417,16 @@ static void c99_valexpr(char *buf, int size, SValue *sv)
     case VT_CMP:
         snprintf(buf, size, "__c99_cnd");
         break;
+    case VT_LOCAL:
+    case VT_LLOCAL:
+        /* address of a stack slot, e.g. the 'memset' the front-end emits
+           to zero a local initialiser, or '&local' */
+        c99_addr(a, sizeof a, sv);
+        if (bt == VT_PTR || bt == VT_FUNC)
+            snprintf(buf, size, "(void *)%s", a);
+        else
+            snprintf(buf, size, "%s", a);
+        break;
     default:
         if (v < VT_CONST) {
             switch (bt) {
@@ -403,10 +450,9 @@ static void c99_valexpr(char *buf, int size, SValue *sv)
 /* ====================================================================== */
 /* prototypes for the functions used by the generated code                 */
 
-static void c99_register_decl(Sym *fsym)
+static void c99_register_decl(Sym *fsym, CType *ftype)
 {
     C99Decl *d;
-    CType *ftype = &fsym->type;
     CType *ret = &ftype->ref->type;
     Sym *s = ftype->ref->next;
     char text[2048], tbuf[C99_TB];
@@ -418,6 +464,10 @@ static void c99_register_decl(Sym *fsym)
     if (!strncmp(name, "__tcc_", 6) || !strncmp(name, "__c6_", 5))
         tcc_error("c99 output: the c6 runtime helper '%s' cannot be expressed "
                   "in portable C99", name);
+    /* these are declared with their real prototypes in the file header */
+    if (!strcmp(name, "memcpy") || !strcmp(name, "memmove")
+        || !strcmp(name, "memset"))
+        return;
     for (d = c99_decls; d; d = d->next)
         if (!strcmp(d->name, name))
             return;
@@ -425,8 +475,7 @@ static void c99_register_decl(Sym *fsym)
     if ((ret->t & VT_BTYPE) == VT_STRUCT)
         tcc_error("c99 output: functions returning a struct are not supported yet");
 
-    is_static = strcmp(name, "main") != 0 && fsym->c
-        && elfsym(fsym)->st_shndx == cur_text_section->sh_num;
+    is_static = c99_is_static_fn(fsym, name);
     if (is_static)
         n += snprintf(text + n, sizeof text - n, "static ");
     c99_type(tbuf, sizeof tbuf, ret);
@@ -517,10 +566,16 @@ ST_FUNC void load(int r, SValue *sv)
         break;
     case VT_JMP:
     case VT_JMPI: {
+        /* materialise a pending conditional jump as 0/1: the first value
+           must jump over the second one (like the x86 'mov/jmp/gsym/mov'
+           sequence), otherwise it falls through into t ^ 1 */
         int t = v & 1;
+        int after = c99_new_label();
         c99_printf("__c99_r[%d].i = %d;\n", r, t);
+        c99_printf("goto L%d;\n", after);
         c99_resolve(sv->c.i, c99_ind());
         c99_printf("__c99_r[%d].i = %d;\n", r, t ^ 1);
+        c99_resolve(c99_pl_one(after), c99_ind());
         break;
     }
     default:
@@ -779,6 +834,10 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     int idx, off, size, align;
     const char *name = get_tok_str(func_sym->v, NULL);
     int is_main = name && !strcmp(name, "main");
+    int is_static = c99_is_static_fn(func_sym, name);
+
+    if (is_main)
+        c99_have_main = 1;
 
     c99_fn.len = 0;
     c99_nmarks = 0;
@@ -790,7 +849,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
         tcc_error("c99 output: functions returning a struct are not supported yet");
 
     c99_type(tbuf, sizeof tbuf, ret);
-    c99_printf("%s%s %s(", is_main ? "" : "static ", tbuf, name);
+    c99_printf("%s%s %s(", is_static ? "static " : "", tbuf, name);
     idx = 0;
     for (s = ftype->ref->next; s; s = s->next, idx++) {
         CType p = s->type;
@@ -836,13 +895,25 @@ ST_FUNC void gfunc_call(int nb_args)
     Sym *fsym = callee->type.ref;
     CType *ret;
     char argbuf[4096], vbuf[C99_TB], tbuf[C99_TB];
-    int i, n = 0;
+    int i, n = 0, is_helper;
+    const char *cname;
 
     if (!fsym || (callee->type.t & VT_BTYPE) != VT_FUNC)
         tcc_error("c99 output: only direct calls of declared functions work");
     if (!(callee->r & VT_SYM) || (callee->r & VT_VALMASK) != VT_CONST)
         tcc_error("c99 output: indirect calls are not supported");
     ret = &fsym->type;
+
+    /* The front-end itself emits calls to a handful of runtime helpers
+       (memset for local initialisers, ...).  They carry no C prototype
+       (their symbol type has no ref), and only the memory ones are
+       available in portable C99. */
+    is_helper = callee->sym->type.ref == NULL;
+    cname = get_tok_str(callee->sym->v, NULL);
+    if (is_helper && strcmp(cname, "memcpy") && strcmp(cname, "memmove")
+        && strcmp(cname, "memset"))
+        tcc_error("c99 output: the helper function '%s' cannot be expressed "
+                  "in portable C99", cname);
 
     save_regs(nb_args);
 
@@ -853,10 +924,12 @@ ST_FUNC void gfunc_call(int nb_args)
         n += snprintf(argbuf + n, sizeof argbuf - n, "%s%s", i ? ", " : "", vbuf);
     }
 
-    c99_register_decl(callee->sym);
+    c99_register_decl(callee->sym, &callee->type);
     snprintf(vbuf, sizeof vbuf, "%s(%s)", get_tok_str(callee->sym->v, NULL), argbuf);
 
-    if ((ret->t & VT_BTYPE) == VT_VOID) {
+    if (is_helper)
+        c99_printf("%s;\n", vbuf);      /* result of helpers is never used */
+    else if ((ret->t & VT_BTYPE) == VT_VOID) {
         c99_printf("%s;\n", vbuf);
     } else {
         c99_type(tbuf, sizeof tbuf, ret);
@@ -930,6 +1003,46 @@ ST_FUNC void gfunc_epilog(void)
 /* ====================================================================== */
 /* writing the file                                                        */
 
+/* allocated, non-executable section with contents: emitted as __c99_dN */
+static int c99_data_section(Section *s)
+{
+    if (!s || s->sh_num == 0 || s->data_offset == 0)
+        return 0;
+    if (!(s->sh_flags & SHF_ALLOC) || (s->sh_flags & SHF_EXECINSTR))
+        return 0;
+    if (s->sh_type != SHT_PROGBITS)
+        return 0;
+    if (!strcmp(s->name, ".init_array") || !strcmp(s->name, ".fini_array"))
+        return 0;
+    return 1;
+}
+
+/* Mark the sections that __c99_init() writes to (and the sections whose
+   addresses it stores), so that they are emitted even when the generated
+   code itself never mentions them. */
+static void c99_mark_reloc_sections(TCCState *s1)
+{
+    int i;
+    unsigned long k;
+
+    if (!c99_have_main)
+        return;             /* nothing would ever call __c99_init() */
+    for (i = 0; i < s1->nb_sections; i++) {
+        Section *s = s1->sections[i];
+        Section *rel = s ? s->reloc : NULL;
+        if (!c99_data_section(s) || !rel || !rel->data_offset)
+            continue;
+        c99_mark_section(s->sh_num);
+        for (k = 0; k + sizeof(ElfW_Rel) <= rel->data_offset; k += sizeof(ElfW_Rel)) {
+            ElfW_Rel *r = (ElfW_Rel *)(rel->data + k);
+            ElfSym *esym = (ElfSym *)(s1->symtab->data
+                                      + ELFW(R_SYM)(r->r_info) * sizeof(ElfSym));
+            if (esym->st_shndx != SHN_UNDEF)
+                c99_mark_section(esym->st_shndx);
+        }
+    }
+}
+
 ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
 {
     FILE *f;
@@ -942,21 +1055,27 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
         return -1;
     }
     fprintf(f, "/* generated by the tcc c99 back-end -- do not edit */\n");
+    /* Implicitly declared functions are emitted without a prototype, the
+       only declaration the back-end can produce for a K&R-style call.
+       GCC and Clang warn when such a name is also a built-in (printf,
+       puts, ...), although the declaration itself is valid C: silence
+       that false positive for the generated file only. */
+    fprintf(f, "#if defined(__clang__)\n"
+               "# pragma clang diagnostic ignored \"-Wincompatible-library-redeclaration\"\n"
+               "#elif defined(__GNUC__) && __GNUC__ >= 5\n"
+               "# pragma GCC diagnostic ignored \"-Wbuiltin-declaration-mismatch\"\n"
+               "#endif\n");
     fprintf(f, "typedef unsigned long __c99_size_t;\n");
     fprintf(f, "extern void *memmove(void *, const void *, __c99_size_t);\n");
     fprintf(f, "extern void *memcpy(void *, const void *, __c99_size_t);\n");
     fprintf(f, "extern void *memset(void *, int, __c99_size_t);\n");
 
+    c99_mark_reloc_sections(s1);
+
     for (i = 0; i < s1->nb_sections; i++) {
         Section *s = s1->sections[i];
         unsigned long k;
-        if (!s || s->sh_num == 0 || s->data_offset == 0)
-            continue;
-        if (!(s->sh_flags & SHF_ALLOC) || (s->sh_flags & SHF_EXECINSTR))
-            continue;
-        if (s->sh_type != SHT_PROGBITS)
-            continue;
-        if (!strcmp(s->name, ".init_array") || !strcmp(s->name, ".fini_array"))
+        if (!c99_data_section(s) || !c99_section_used(s->sh_num))
             continue;
         fprintf(f, "static unsigned char __c99_d%d[%lu] = {",
                 s->sh_num, s->data_offset);
@@ -967,29 +1086,34 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
 
     for (d = c99_decls; d; d = d->next)
         fprintf(f, "%s\n", d->text);
-    fprintf(f, "static int __c99_inited;\n");
-    fprintf(f, "static void __c99_init(void);\n");
+    if (c99_have_main) {
+        fprintf(f, "static int __c99_inited;\n");
+        fprintf(f, "static void __c99_init(void);\n");
+    }
     if (c99_prog.len)
         fwrite(c99_prog.data, 1, c99_prog.len, f);
 
+    if (!c99_have_main) {
+        /* nothing calls __c99_init() in a translation unit without main */
+        fclose(f);
+        return 0;
+    }
     fprintf(f, "static void __c99_init(void)\n{\n"
                "  if (__c99_inited) return;\n  __c99_inited = 1;\n");
     for (i = 0; i < s1->nb_sections; i++) {
         Section *s = s1->sections[i];
         Section *rel = s ? s->reloc : NULL;
         unsigned long k;
-        if (!s || !(s->sh_flags & SHF_ALLOC) || (s->sh_flags & SHF_EXECINSTR))
-            continue;
-        if (!rel || !rel->data_offset)
+        if (!c99_data_section(s) || !rel || !rel->data_offset)
             continue;
         for (k = 0; k + sizeof(ElfW_Rel) <= rel->data_offset; k += sizeof(ElfW_Rel)) {
             ElfW_Rel *r = (ElfW_Rel *)(rel->data + k);
-            ElfSym *esym = (ElfSym *)(symtab_section->data
+            ElfSym *esym = (ElfSym *)(s1->symtab->data
                                       + ELFW(R_SYM)(r->r_info) * sizeof(ElfSym));
             if (esym->st_shndx == SHN_UNDEF)
                 fprintf(f, "  *(void **)(__c99_d%d + %lu) = (void *)((char *)&%s + %lld);\n",
                         s->sh_num, (unsigned long)r->r_offset,
-                        (char *)symtab_section->link->data + esym->st_name,
+                        (char *)s1->symtab->link->data + esym->st_name,
                         (long long)r->r_addend);
             else
                 fprintf(f, "  *(void **)(__c99_d%d + %lu) = (void *)((char *)__c99_d%d + %lld);\n",
