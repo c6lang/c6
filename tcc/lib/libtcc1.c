@@ -1194,13 +1194,15 @@ static void c6_gc_free_one(C6GcHdr *h)
     const C6GcDesc *d = h->desc;
 
     if (d) {
-        if (d->drop)
-            d->drop(h + 1);
-        if (d->nfields) {
-            unsigned long n = c6_gc_count(h), i;
-            for (i = 0; i < n; i++)
-                c6_gc_release_block((char *)(h + 1)
-                                    + i * (unsigned long)d->size, d);
+        /* one element at a time: a 'new T[n]' runs the destructor n times,
+           like C++ does */
+        unsigned long n = c6_gc_count(h), i;
+        for (i = 0; i < n; i++) {
+            char *base = (char *)(h + 1) + i * (unsigned long)d->size;
+            if (d->drop)
+                d->drop(base);
+            if (d->nfields)
+                c6_gc_release_block(base, d);
         }
     }
     if (c6_gc_live_count)
@@ -1484,8 +1486,67 @@ void __c6_gc_drain_budget(int n)
     c6_gc_drain(th, n);
 }
 
+/* ------------------------------------------------------------------------- */
+/* managed globals: they live as long as the program, so they are released at
+   exit instead of at the end of a scope.  The compiler emits one constructor
+   per unit that hands over the address of every managed global (and of every
+   'static' managed local), together with the shape of the slot block.       */
+
+typedef struct C6GcRoot {
+    void *block;
+    int kind;
+    unsigned long count, stride;
+} C6GcRoot;
+
+static C6GcRoot *c6_gc_roots;
+static int c6_nb_gc_roots, c6_cap_gc_roots;
+static int c6_gc_shut_down;
+
+void __c6_gc_shutdown(void);
+extern void *realloc(void *, unsigned long);
+
+void __c6_gc_root(void *block, int kind, unsigned long count,
+                  unsigned long stride)
+{
+    if (!block || !count)
+        return;
+    if (c6_nb_gc_roots == c6_cap_gc_roots) {
+        int cap = c6_cap_gc_roots ? c6_cap_gc_roots * 2 : 16;
+        C6GcRoot *nr = (C6GcRoot *)realloc(c6_gc_roots,
+                       (unsigned long)cap * sizeof *nr);
+        if (!nr)
+            return;                 /* out of memory: leak instead of crash */
+        c6_gc_roots = nr;
+        c6_cap_gc_roots = cap;
+    }
+    c6_gc_roots[c6_nb_gc_roots].block = block;
+    c6_gc_roots[c6_nb_gc_roots].kind = kind;
+    c6_gc_roots[c6_nb_gc_roots].count = count;
+    c6_gc_roots[c6_nb_gc_roots].stride = stride;
+    c6_nb_gc_roots++;
+}
+
+/* release the managed globals, the last one declared first */
+static void c6_gc_release_roots(void)
+{
+    while (c6_nb_gc_roots > 0) {
+        C6GcRoot *r = &c6_gc_roots[--c6_nb_gc_roots];
+        unsigned long i;
+
+        for (i = 0; i < r->count; i++)
+            c6_gc_release_slot((void **)((char *)r->block + i * r->stride),
+                               r->kind);
+    }
+}
+
+/* runs from a destructor the compiler emits, so the managed globals of a
+   program are released once, at exit */
 void __c6_gc_shutdown(void)
 {
+    if (c6_gc_shut_down)
+        return;
+    c6_gc_shut_down = 1;
+    c6_gc_release_roots();
     tcc_th_gc_free_all(tcc_th());
 }
 

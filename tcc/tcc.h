@@ -826,6 +826,14 @@ typedef struct C6HeaderDecl {
 #define C6_GCK_EMBED  4   /* a by-value struct that holds managed references */
 
 /* one managed field of a struct */
+/* one managed object with static storage: registered from a constructor and
+   released at exit, see __c6_gc_root() in libtcc1.c */
+typedef struct C6GcRoot {
+    int tok;                        /* the symbol holding the slot */
+    int kind;                        /* C6_GCK_STRONG / _WEAK / _OWN */
+    unsigned long count, stride;     /* an array of COUNT slots */
+} C6GcRoot;
+
 typedef struct C6GcField {
     int off;          /* offset inside the payload */
     int kind;         /* C6_GCK_* */
@@ -841,6 +849,8 @@ typedef struct C6GcType {
     C6GcField *fields;
     int size, align;          /* of one element */
     int desc_tok;             /* the descriptor symbol emitted for it */
+    int declared;             /* the tentative declaration is emitted */
+    int drop_tok;             /* the 'drop' method, 0 when there is none */
     char *src_file;           /* for cycle diagnostics */
     int src_line;
     int atomic;               /* holds 'shared' references */
@@ -950,6 +960,8 @@ struct TCCState {
        strong edges between them (see docs/gc-design.md) */
     struct C6GcType **c6_gc_types;
     int c6_nb_gc_types;
+    C6GcRoot **c6_gc_roots;
+    int c6_nb_gc_roots;
     struct C6GcEdge *c6_gc_edges;
     int c6_nb_gc_edges, c6_gc_edges_cap;
     int c6_gc_seq;           /* descriptor counter, for generated names */

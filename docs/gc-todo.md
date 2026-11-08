@@ -29,7 +29,7 @@
 | P1 ✅ | `new` + 存储 + 内联释放 + `p = NULL` | P0 | 作用域退出点的完整性（goto/err） |
 | P2 ✅ | 描述符、字段释放、数组 `new T[n]` | P1 | 拓扑排序其实不需要 |
 | P3 ✅ | `weak`（含禁 async） | P2 | 帧搬动只能探测，不能 trap |
-| P4 | 析构 `drop` 方法 | P3 | 重入、跨线程调用 |
+| P4 ✅ | 析构 `drop` 方法 | P3 | 全局根不能用 `atexit` |
 | P5 | `shared` + 跨帧/跨线程转移 | P2 | `go` 实参块与任务 slot 的 +1/−1 |
 | P6 | 静态环检测（硬错误）+ 链接期 | P2/P3 | `own` 语义、跨 TU 段 |
 | P7 | async/go 集成与预算化 drain | P1/P5 | `__c6_co_abort` 回卷 |
@@ -217,7 +217,12 @@
 
 ---
 
-## P4 析构 `drop` 方法
+## P4 ✅ 析构 `drop` 方法
+
+结果：`drop` 在最后一次释放时跑一次（`tests/gc_drop.c` 6 个块），字段还在；
+数组逐元素跑；`go` 线程里也跑；全局根在退出时释放（`tests/exit/drop_exit.c`）；
+8 条诊断（`tests/errors/drop_bad.c`）。验收：`make selftest` 46 通过、
+`BACKEND=c99 tests/run-tests.sh` 47 通过、`make test-plain` 绿。
 
 改动点：
 
@@ -233,6 +238,31 @@
 析构顺序（析构 → 字段释放）；析构里释放另一个对象（重入）；析构在 `go` 线程跑；
 析构没有为环运行（配合 P6 的 `c6_graph` 文档）；
 `tests/errors/drop_bad.c`：返回值/参数个数/重复定义/`err` 内用/显式调用。
+
+落地状态（与计划的差异）：
+
+- **全局根没用 `atexit`**：tcc 的 `atexit` 牵出 `__dso_handle`（`-run` 还有
+  自己的 `atexit`）。改成每个含托管全局的 TU 发一对
+  `__attribute__((constructor))` / `((destructor))`：构造时
+  `__c6_gc_root(&g, kind, count, stride)` 登记，析构时
+  `__c6_gc_shutdown()`（幂等）释放。`tests/exit/drop_exit.c` 用真实可执行
+  文件验收（`-test` 模式不进 `runmain`，构造/析构不跑）。
+- **描述符末尾发射**：`drop` 可能定义在结构体之后，所以描述符统一在 TU
+  末尾发（`c6_gc_flush_descs()`），名字带文件名哈希
+  `__c6_gc_d<fnv>_<n>`；`new T` 处只发 `extern` 声明。`&__c6_gc_dN` 的
+  地址由链接期解析，跨 TU 各一份、不重名。
+- **原型就够**：登记的钩在 `c6_method_register()` 里，所以头文件里的
+  `void drop(struct Res *self);` 足以让别的 TU 的 `new Res` 拿到析构
+  （已用两 TU 的例子验证）。
+- **数组逐元素**：`new T[n]` 的析构跑 n 次，顺序是「元素析构 → 该元素
+  字段释放」，逐元素循环（原来是一次析构 + 全部字段）。
+- **`(void(*)(void *))` 的写法**和 vtable 一致；描述符按 `kind` 走
+  `c6_gc_release_slot`，所以 `weak`/`own` 全局槽也能登记。
+- 重复析构：同一 TU 里写两遍会先被 tcc 的 `redefinition of 'T_drop'`
+  挡住，`'%s' already has a destructor` 只在两个不同符号时才会出现。
+- 析构里 `try` 也挡住了（`expr catch` 和 `try { }` 两个入口）；
+  `err()` 本来就要 `!error`，被 `'drop' cannot fail` 先挡。
+- 没做的：`weak` 字段的析构时机（P3 已处理）、环（P6）。
 
 验收：同 P1。
 

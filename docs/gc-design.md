@@ -201,7 +201,9 @@ void *__c6_gc_weak_store(void **dst, void **weak_slot, int mode); /* 升级 */
 unsigned long long __c6_gc_live(void);                /* 活对象数（测试用） */
 unsigned long long __c6_gc_refcount(void *p);         /* 测试用 */
 void  __c6_gc_drain_budget(int n);
-void  __c6_gc_shutdown(void);                         /* atexit：释放全局根 */
+void  __c6_gc_root(void *block, int kind, unsigned long count,
+                   unsigned long stride);             /* 登记一个托管全局槽 */
+void  __c6_gc_shutdown(void);                         /* 退出时释放全局根 */
 ```
 
 存储类返回它的 `nv`，这样生成的代码手里始终有一个值可以 `vpop()`。
@@ -329,10 +331,39 @@ void drop(struct File *self) { close(self->fd); }   /* ← 名字叫 drop 的方
 - 析构体内**禁止**：`err`/`try`/`await`/`go`（正在释放，失败无处传播）；
 - 析构体**不能复活**自己：`self` 是 borrow，存进任何托管槽都是 §5 的溯源错误，
   这条规则自动生效；
-- 析构方法**不能显式调用**（`p->drop()` → 错误）；提前释放用 `p = NULL`；
+- 析构方法**不能显式调用**（`p->drop()` / `drop(p)` → 错误）；提前释放用 `p = NULL`；
 - 析构指针放在描述符里 → 跨 `interface` 也是正确的析构（等价虚析构，但不需要 vtable）；
 - 析构可能在**任意线程**执行（最后释放它的那个线程），文档必须写明；
-- 全局 `@T g` 在进程退出时由 `__c6_gc_shutdown()`（`atexit`）释放一次 → 析构会跑。
+- 全局 `@T g` 在进程退出时释放一次 → 析构会跑（见下面“落地方式”）。
+
+### 7.1 落地方式（与上面计划的差异）
+
+1. **析构指针在描述符里**：`struct __c6_gc_desc` 的第 5 个字段是
+   `void (*drop)(void *)`，编译器把 `drop` 的符号写成 `(void (*)(void *))Res_drop`
+   ——和 vtable 对象同一套写法。描述符本身在**翻译单元末尾**发射
+   （`c6_gc_flush_descs()`），所以 `drop` 定义在结构体后面也不要紧；
+   描述符的名字带**文件名哈希**（`__c6_gc_d<fnv>_<n>`），跨 TU 各算一份、
+   不会重名，`new T` 处只发一个 `extern` 声明把地址留给定义。
+2. **识别时机**：`c6_method_register()` 里做，所以**原型**就够了 ——
+   头文件里声明 `void drop(struct Res *self);`，别的 TU 里 `new Res`
+   同样能拿到析构（已用两 TU 的例子验证）。
+3. **数组**：`new T[n]` 的析构跑 **n 次**（每个元素一次，和 C++ 一样），
+   顺序是「元素析构 → 该元素的字段释放」，逐元素循环。
+4. **全局根不用 `atexit`**：tcc 的 `atexit` 会牵出 `__dso_handle`，
+   而 `-run` 又是自己的 `atexit`。改成编译器为每个含托管全局的 TU 发一对
+   `__attribute__((constructor))` / `__attribute__((destructor))` 函数：
+   构造时 `__c6_gc_root(&g, kind, count, stride)` 把槽登记进运行时的表，
+   析构时调用 `__c6_gc_shutdown()`（幂等）释放。`-run`、可执行文件、
+   c99 后端三条路都验证过（`tests/exit/drop_exit.c`）。
+5. **静态检查**：`int drop(...)` → `'drop' must return void: ...`；
+   `void!error drop(...)` → `'drop' cannot fail ('!error'): ...`；
+   体内 `try`/`catch`/`go` → 各自报错（`err()` 本来就要求 `!error`，
+   所以顺带被第一条挡住）；显式调用 → `a destructor cannot be called: ...`。
+   每个类型只能有一个析构；同一 TU 里写两遍会先被“重复定义”挡住。
+6. **不能复活自己**：`self` 是 `struct T *`（借用），`@T q = self;` 落在
+   §5 的溯源规则上自动报错，不需要额外的检查。
+7. **`-test` 模式不跑构造/析构**（`tcc_run_tests()` 不进 `runmain`），
+   所以全局根的验收放在 `tests/exit/` 里用真实可执行文件跑。
 
 对比 C++：`drop` 是**所有权触发**，不是作用域触发。作用域触发的清理仍然用 `defer`。
 两者分工明确：`defer` = RAII（作用域），`drop` = Rust `Drop`（最后引用）。
@@ -515,7 +546,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 的 `COMMON_O`），所以 `-run`、静态链接、C99 后端都能解析。
 
 - 计数之外的全局结构只有两个：弱槽注册表（冷路径，全局自旋锁）与全局根链表
-  （`atexit` 用，一次性）；引用计数热路径上**没有锁**；
+  （登记全局根的一次性初始化用）；引用计数热路径上**没有锁**；
 - `-std=c6` 下 `parse_btype` 里 `__atomic_*` 已经可用（`parse_atomic`，
   `tcc/tccgen.c:6265` 附近，经 helper 调用）；libtcc1.c 里需要自己
   `#define __ATOMIC_ACQ_REL 4`（tcc 不预定义，`lib/stdatomic.c` 也是这么做的）。
@@ -628,8 +659,11 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | E-GC6c | 柔性数组元素是托管引用 | error | `'%s' has a flexible array of managed references: allocate it with 'new T[n]' instead` |
 | E-GC6d | 新引用存进非托管槽 | error | `a new reference cannot be stored in '%s': it is not a managed reference (declare it as '@T')` |
 | E-GC7 | `memcpy`/`memmove` 作用于含引用的对象 | error | `... breaks reference counting; use a typed copy or 'own'` |
-| E-GC8 | 显式调用析构 `p->drop()` | error | `the destructor runs automatically when the last reference is released` |
-| E-GC9 | 析构里 `err`/`try`/`await`/`go` | error | `a destructor cannot fail or suspend` |
+| E-GC8 | 显式调用析构 `p->drop()` / `drop(p)` | error | `a destructor cannot be called: it runs when the last reference is released (use 'p = NULL')` |
+| E-GC9 | 析构里 `err`/`try`/`await`/`go` | error | `a destructor cannot fail: ...` / `a destructor cannot suspend: ...` |
+| E-GC9b | 析构返回值不是 `void` | error | `'drop' must return void: it runs while the object is being released, where a value has nowhere to go` |
+| E-GC9c | 析构声明成 `!error` | error | `'drop' cannot fail ('!error'): it runs while the object is being released, where an error has nowhere to go` |
+| E-GC9d | 一个类型两个析构 | error | `'%s' already has a destructor`（同一 TU 内通常先报 `redefinition of 'T_drop'`） |
 | E-GC10 | `plain @T` 跨线程 | error | `passing a reference to 'go' requires 'shared'` |
 | E-GC11 | `memset` 含引用对象 | warning | 清零会漏引用 |
 | E-GC12 | 借出给未标注裸指针形参 | warning `-Wgc-borrow` | 可 `-Werror` |

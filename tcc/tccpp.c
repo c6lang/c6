@@ -3940,6 +3940,8 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "unsigned long long __c6_gc_refcount(void *p);\n"
           "void __c6_gc_drain_budget(int n);\n"
           "void __c6_gc_shutdown(void);\n"
+          "void __c6_gc_root(void *block, int kind, unsigned long count, "
+          "unsigned long stride);\n"
           "#define C6_GC_FRESH   1\n"
           "#define C6_GC_ATOMIC  2\n"
           "#define C6_GC_WEAK    4\n"

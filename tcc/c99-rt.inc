@@ -1132,13 +1132,13 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_one(C99GcHdr *h)
     const struct __c6_gc_desc *d = h->desc;
 
     if (d) {
-        if (d->drop)
-            d->drop(h + 1);
-        if (d->nfields) {
-            unsigned long n = h->meta & C99_GC_META_COUNT, i;
-            for (i = 0; i < n; i++)
-                __c99_gc_release_block((char *)(h + 1)
-                                       + i * (size_t)d->size, d);
+        unsigned long n = h->meta & C99_GC_META_COUNT, i;
+        for (i = 0; i < n; i++) {
+            char *base = (char *)(h + 1) + i * (size_t)d->size;
+            if (d->drop)
+                d->drop(base);
+            if (d->nfields)
+                __c99_gc_release_block(base, d);
         }
     }
     if (__c99_gc_live_count)
@@ -1397,8 +1397,60 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_gc_drain_budget(int n)
     __c99_gc_drain(th, n);
 }
 
+/* managed globals: released at exit, see libtcc1.c */
+typedef struct C99GcRoot {
+    void *block;
+    int kind;
+    unsigned long count, stride;
+} C99GcRoot;
+
+static C99GcRoot *__c99_gc_roots;
+static int __c99_nb_gc_roots, __c99_cap_gc_roots;
+static int __c99_gc_shut_down;
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_release_slot(void **slot,
+                                                           int kind);
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_root(void *block, int kind,
+                                                 unsigned long count,
+                                                 unsigned long stride)
+{
+    if (!block || !count)
+        return;
+    if (__c99_nb_gc_roots == __c99_cap_gc_roots) {
+        int cap = __c99_cap_gc_roots ? __c99_cap_gc_roots * 2 : 16;
+        C99GcRoot *nr = (C99GcRoot *)realloc(__c99_gc_roots,
+                       (unsigned long)cap * sizeof *nr);
+        if (!nr)
+            return;
+        __c99_gc_roots = nr;
+        __c99_cap_gc_roots = cap;
+    }
+    __c99_gc_roots[__c99_nb_gc_roots].block = block;
+    __c99_gc_roots[__c99_nb_gc_roots].kind = kind;
+    __c99_gc_roots[__c99_nb_gc_roots].count = count;
+    __c99_gc_roots[__c99_nb_gc_roots].stride = stride;
+    __c99_nb_gc_roots++;
+}
+
+static void __c99_gc_release_roots(void)
+{
+    while (__c99_nb_gc_roots > 0) {
+        C99GcRoot *r = &__c99_gc_roots[--__c99_nb_gc_roots];
+        unsigned long i;
+
+        for (i = 0; i < r->count; i++)
+            __c99_gc_release_slot((void **)((char *)r->block + i * r->stride),
+                                  r->kind);
+    }
+}
+
 C99_RT_UNUSED __c99_rt_linkage void __c6_gc_shutdown(void)
 {
+    if (__c99_gc_shut_down)
+        return;
+    __c99_gc_shut_down = 1;
+    __c99_gc_release_roots();
     __c99_gc_free_all(__c99_th());
 }
 

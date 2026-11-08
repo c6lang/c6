@@ -698,6 +698,7 @@ static const char * const c99_runtime_names[] = {
     "__c6_gc_incref", "__c6_gc_drop", "__c6_gc_weak_store",
     "__c6_gc_live", "__c6_gc_refcount", "__c6_gc_drain_budget",
     "__c6_gc_shutdown",
+    "__c6_gc_root",
 };
 
 static int c99_is_runtime_name(const char *name)
