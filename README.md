@@ -947,13 +947,19 @@ front-end and writes **portable C99 source** instead of machine code.
     tcc/c99-tcc -c99 -B tcc -o out.c prog.c  # prog.c -> out.c
     cc -std=c99 -o prog out.c && ./prog      # compile the result with any C compiler
 
-    make c99test                             # tests/c99/*.c -> C source -> gcc -> run
+    make c99test                             # same cases as selftest, via the C99 back-end
 
-`make c99test` is the end-to-end regression for this back-end, and it is part
-of `make selftest`: each `tests/c99/*.c` is compiled by `tcc/c99-tcc` into C,
-then built with `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread` and
-run.  `C99CC=clang make c99test` uses another host compiler.  `tests/c99/c99test.c`
-exercises plain C and all the c6 features listed below in one program.
+`make c99test` runs the same corpus as `make selftest`: every `tests/*.c`,
+`tests/errors/*.c`, `tests/exit/*.c`, `tests/abi/*.c` and `tests/c99/*.c`
+case goes through `tcc/c99-tcc` to C source, then through
+`gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread`, with the same
+exit-code, output and diagnostic assertions.  Diagnostics that only differ
+because they are produced by the C-output back-end are declared with
+`// EXPECT-C99` in the `tests/errors/*.c` file; everything else is shared.
+`C99CC=clang make c99test` uses another host compiler, and
+`BACKEND=c99 tests/run-tests.sh` runs the same thing directly.
+`tests/c99/c99test.c` additionally exercises plain C and all the c6 features
+listed below in one program.
 
 `-c99` selects the output back-end; it is not a language-standard flag, and
 the language being compiled stays C.  In the `c99-tcc` build it is also the
@@ -993,7 +999,10 @@ TU.  Features covered by `tests/*.c` include `defer`/`errdefer`, `err`,
 
 A generated file with `test` blocks but no `main` gets a synthesized `main`
 that runs them; a file with relocations but no `main` gets an
-`__attribute__((constructor))` initializer instead.
+`__attribute__((constructor))` initializer instead.  With `-test` the
+synthesized runner replaces a user `main` (renamed to `__c99_orig_main`),
+mirroring the native `-test` runner; `make c99test` drives the test-block
+files that way.
 
 Structs of at most eight bytes containing only integer/pointer fields use the
 x86-64 register-return ABI, so they interoperate with plain C (`tests/abi/`).

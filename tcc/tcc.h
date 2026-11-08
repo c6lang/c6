@@ -755,6 +755,13 @@ typedef struct C6TestEntry {
     char *fn_name;   /* name of the generated test function */
 } C6TestEntry;
 
+/* a method's plain source name, emitted as a weak alias of the
+   '<tag>_<name>' symbol by the C99 output backend (GNU alias attribute) */
+typedef struct C6MethodAlias {
+    char *plain;     /* source name, possibly package-mangled */
+    char *target;    /* '<tag>_<name>' */
+} C6MethodAlias;
+
 /* one 'interface NAME { methods }' declaration */
 typedef struct C6Iface {
     char *name;      /* interface name, e.g. "Drawable" */
@@ -846,6 +853,9 @@ struct TCCState {
     /* 'test' blocks collected while compiling */
     struct C6TestEntry **c6_tests;
     int c6_test_count;
+    /* methods whose plain source name needs a weak alias in C99 output */
+    struct C6MethodAlias **c6_method_aliases;
+    int c6_nb_method_aliases;
     /* 'package NAME { ... }' support */
     char *c6_package;      /* current package, NULL at top level */
     char **c6_imports;     /* 'import NAME;' names */

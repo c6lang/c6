@@ -16,6 +16,7 @@ extern int unknown[];
 // EXPECT test_int: error: cannot iterate over 'int' (write a range: 'foreach |i| lo:hi')
 // EXPECT test_struct: error: cannot iterate over 'struct S' (expose a slice member, e.g. 'T[:] items')
 // EXPECT test_vla: error: cannot iterate over a variable length array
+// EXPECT-C99 test_vla: error: c99 output: variable length arrays are not supported
 // EXPECT test_unknown_length: error: cannot iterate over an array of unknown length
 // EXPECT test_float_range: error: range bounds must be integers
 // EXPECT test_no_block: error: '{' expected

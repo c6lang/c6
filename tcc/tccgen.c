@@ -8998,10 +8998,6 @@ static int c6_method_symbol(int name, CType *type)
 
     if (!tcc_state || !tcc_state->c6_ext || !type->ref)
         return 0;
-#ifdef TCC_TARGET_C99
-    /* the C output backend cannot express the plain-name alias */
-    return 0;
-#endif
     if ((type->t & VT_BTYPE) != VT_FUNC)
         return 0;
     if (type->t & (VT_STATIC | VT_INLINE))
@@ -9103,6 +9099,18 @@ static void c6_method_alias(int name, Sym *msym)
     /* put_extern_sym2() also patches an elfsym that a forward 'f(p)' call
        created earlier */
     put_extern_sym2(ps, es->st_shndx, es->st_value, es->st_size, 1);
+#ifdef TCC_TARGET_C99
+    /* C has no two definitions for one name: the C99 back-end emits the
+       alias with __attribute__((alias)) instead.  Tokens belong to this
+       translation unit, so record copies of the names. */
+    {
+        C6MethodAlias *a = tcc_mallocz(sizeof *a);
+        a->plain = tcc_strdup(get_tok_str(alias, NULL));
+        a->target = tcc_strdup(get_tok_str(msym->v, NULL));
+        dynarray_add(&tcc_state->c6_method_aliases,
+                     &tcc_state->c6_nb_method_aliases, a);
+    }
+#endif
 }
 
 /* register 'ret NAME(struct T *self, ...)'; NAME is the spelling used in
