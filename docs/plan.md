@@ -757,7 +757,9 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 ### 11.9 C99 输出后端（`-c99`）
 
 新增 `tcc/c99-gen.c` + `tcc/c99-link.c`：复用全部前端（含 c6 语法），
-把代码生成到 C99 文本而不是机器码。构建 `make -C tcc c99-tcc`，
+把代码生成到 C99 文本而不是机器码。构建用仓库根目录的 `make c99`
+（会自动配置 `tcc/`；直接 `make -C tcc c99-tcc` 也行，但要求 `tcc/`
+已用当前 `configure` 配置过），
 使用 `c99-tcc -c99 -o out.c prog.c`，产物用系统 C 编译器编译即可。
 
 寄存器 -> `__c99_r[8]` 联合体数组；栈帧 -> `__c99_frm.f` 字节数组（用 tcc
