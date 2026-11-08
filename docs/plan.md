@@ -886,8 +886,28 @@ native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 
 才不同的诊断用 `// EXPECT-C99` 声明）。`make selftest` 用同一个 `tcc/tcc`
 跑同一套用例（`tests/c99/c99test.c` 用一份源码覆盖普通 C 和 c6 的全部特性）。
 
-限制（均显式报错，不会静默错编译）：变参函数**定义**、computed goto、
-VLA；非 POSIX 主机上运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
+变参函数**定义**也支持：`tccdefs.h` 在 `__c99__` 下给出与 SysV x86-64
+一致的 `__builtin_va_list`（`gp_offset`/`fp_offset`/`overflow_arg_area`/
+`reg_save_area`），`__builtin_va_start`/`__builtin_va_arg` 复用
+`x86_64-gen.c` 的 `classify_x86_64_va_arg`，而 C 后端把形参块 memcpy 进
+`__c99_frm.f` 之后，再从 `frame_address(0) - 24` 那个位置把宿主编译器的
+`va_list` 复制进变参函数的栈帧顶部——这正是 `__builtin_va_start` 会去读的
+位置，所以生成代码里的 `va_arg` 与宿主 `vsnprintf` 之类拿到的 `va_list`
+是同一份。整型/浮点变参、超过 6+8 个参数溢出到栈上的情形、
+`tests/c99/c99test.c` 里的“把 va_list 转手给宿主函数”都已覆盖。
+
+自举（`make selfhost` / `make c99selfhost`）：前者是 c6 后端编译自己
+（`tcc/tcc` -> stage1 -> stage2，两次目标文件 `cmp` 相同），后者是 C 输出
+路线（`tcc -c99` 出 C -> 宿主 gcc 编出 stage2 -> stage2 编出 stage3，stage3
+再编一次目标文件与 stage2 的逐字节相同）。两条路线最后都让新编译器编一个
+小程序并运行，因此“生成的后端能跑”是被回归卡住的，不是靠人工抽查。这两条
+路线的存在也顺手钉死了几个只有在自举规模下才暴露的 bug：`nocode_wanted`
+的语句不能混进活代码、LLONG_MIN 没有 C 字面量、`.bss` 段必须出现在输出里、
+符号地址不能在生成时定死（tentative 声明之后定义还会搬位置）、移位的宽度
+取**左**操作数的类型（`(unsigned long long)x << 32` 不能被截成 32 位移位）。
+
+限制（均显式报错，不会静默错编译）：computed goto、VLA；非 POSIX 主机上
+运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
 ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-64 寄存器返回，
 可以与普通 C 互操作；其它结构体返回用隐藏指针（c6 TU 之间一致，大于
 16 字节时也与原生 ABI 一致，9--16 字节与普通 C 混用不支持）。
