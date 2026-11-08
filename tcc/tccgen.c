@@ -336,6 +336,7 @@ static int c6_soft_kw(int t);
 static int c6_soft_kw_shadowed(int t);
 static int c6_gc_qual(int t);
 static int c6_is_managed(CType *type);
+static int c6_gc_mode(CType *type);
 static int c6_type_gq(CType *type);
 static void c6_gc_plain(CType *type);
 /* nonzero while the initializer of a managed object is written */
@@ -1276,6 +1277,7 @@ static void vsetc(CType *type, int r, CValue *vc)
        'new' marks its result, and only until the value is consumed */
     vtop->gc_state = C6_GC_BORROW;
     vtop->gc_src = 0;
+    vtop->gc_atomic = 0;
 #endif
 }
 
@@ -13308,6 +13310,21 @@ static int c6_async_type_tokens(TokenString *ts, CType *type)
         tok_str_add(ts, TOK_LONG);
         break;
     case VT_PTR:
+        {
+            /* a managed reference is spelled with its qualifier, so that the
+               generated 'struct NAME_task' fields are managed too: the task
+               owns them (the call site and the body both go through the
+               store hook) and 'release' gives them back */
+            int gq = c6_type_gq(type);
+
+            if (gq & C6_GQ_QUAL) {
+                tok_str_add(ts, tok_alloc_const(gq & C6_GQ_SHARED ? "shared"
+                                                : gq & C6_GQ_OWN ? "own"
+                                                : "weak"));
+                tok_str_add(ts, '@');
+                return c6_async_type_tokens(ts, &type->ref->type);
+            }
+        }
         if (!c6_async_type_tokens(ts, &type->ref->type))
             return 0;
         tok_str_add(ts, '*');
@@ -13353,6 +13370,19 @@ static void c6_async_declare(CType *ftype, int name)
     Sym *p;
     char buf[32];
     int tag, i;
+
+    /* E-GC10: what a task carries crosses to whoever awaits it, so it must
+       be 'shared' (only a 'shared' count is atomic) */
+    if (c6_is_managed(&ftype->ref->type)
+        && !(c6_type_gq(&ftype->ref->type) & (C6_GQ_SHARED | C6_GQ_WEAK)))
+        tcc_error("an 'async' return value that carries a reference requires "
+                  "'shared': '%s' returns a per-thread count",
+                  get_tok_str(name, NULL));
+    for (p = c6_async_params(ftype); p; p = p->next)
+        if (c6_is_managed(&p->type)
+            && !(c6_type_gq(&p->type) & (C6_GQ_SHARED | C6_GQ_WEAK)))
+            tcc_error("passing a reference to 'async' requires 'shared': "
+                      "'%s' is counted per thread", get_tok_str(name, NULL));
 
     tag = c6_async_tok("", name, "_task");
     if (struct_find(tag))
@@ -13583,7 +13613,9 @@ static void c6_async_propagate(void)
             c6_async_push_field(c6_async_name, "val", 0);
             vpushi(TCC_ERR_SENTINEL);
             vtop->type = vt;        /* '(TYPE)-1', no conversion warning */
+            c6_gc_no_hook = 1;      /* the sentinel is not a reference */
             vstore();
+            c6_gc_no_hook = 0;
             vpop();
         }
     }
@@ -13674,6 +13706,10 @@ static void c6_async_call(Sym *s)
             skip(',');
         snprintf(buf, sizeof buf, "p%d", i);
         c6_async_push_field(s->v, buf, task_off);
+        if (c6_is_managed(&p->type))
+            /* the task outlives this expression, so its slot owns a
+               reference (the descriptor's 'release' gives it back) */
+            vtop->type = p->type;
         expr_eq();
         c6_fallible_use();
         gen_assign_cast(&p->type);
@@ -13750,6 +13786,19 @@ static void c6_async_params_copy(void)
         loc = (loc - size) & -align;
         ls = sym_push(p->v & ~SYM_FIELD, &pt, VT_LOCAL | VT_LVAL, loc);
         c6_async_push_field(c6_async_name, buf, 0);
+        if (c6_is_managed(&pt)) {
+            /* a parameter is a borrow: the task slot owns the reference and
+               the descriptor's 'release' gives it back, so the local neither
+               counts nor is released, and assigning to it is an error */
+            c6_gc_no_hook = 1;
+            vset(&pt, VT_LOCAL | VT_LVAL, ls->c);
+            vswap();
+            vstore();
+            vpop();
+            c6_gc_no_hook = 0;
+            ls->type.gq |= C6_GQ_BORROW;
+            continue;
+        }
         vset(&pt, VT_LOCAL | VT_LVAL, ls->c);
         vswap();
         vstore();
@@ -13820,6 +13869,84 @@ static void c6_await_parse(void)
     c6_await_pending = save;
 }
 
+/* '__c6_gc_release((void **)((char *)T + OFS), MODE);' */
+static void c6_async_add_release(TokenString *ts, int arg, int ofs, int mode)
+{
+    tok_str_add(ts, tok_alloc_const("__c6_gc_release"));
+    tok_str_add(ts, '(');
+    tok_str_add(ts, '(');
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, '*');
+    tok_str_add(ts, ')');
+    tok_str_add(ts, '(');
+    tok_str_add(ts, '(');
+    tok_str_add(ts, TOK_CHAR);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, ')');
+    tok_str_add(ts, arg);
+    tok_str_add(ts, '+');
+    c6_async_add_int(ts, ofs);
+    tok_str_add(ts, ')');
+    tok_str_add(ts, ',');
+    c6_async_add_int(ts, mode);
+    tok_str_add(ts, ')');
+    tok_str_add(ts, ';');
+}
+
+/* 'static void __c6_rel_NAME(void *__c6_t) { ... }' -- the references the task
+   slot owns, given back when the task is destroyed.  Returns 0 (and emits
+   nothing) when the task owns none. */
+static int c6_async_release_fn(int name, CType *ftype)
+{
+    int arg = tok_alloc_const("__c6_t");
+    CType st = c6_async_task_ctype(name);
+    int fn, any = 0, i, ofs;
+    Sym *p, *f;
+    TokenString *ts;
+    char buf[32];
+
+    if (c6_is_managed(&ftype->ref->type))
+        any = 1;
+    for (i = 0, p = c6_async_params(ftype); p; p = p->next, i++)
+        if (c6_is_managed(&p->type))
+            any = 1;
+    if (!any)
+        return 0;
+
+    fn = c6_async_tok("__c6_rel_", name, "");
+    ts = tok_str_alloc();
+    tok_str_add(ts, TOK_STATIC);
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, fn);
+    tok_str_add(ts, '(');
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, arg);
+    tok_str_add(ts, ')');
+    tok_str_add(ts, '{');
+    /* the return value (only for a task that dies unread) */
+    if (c6_is_managed(&ftype->ref->type)) {
+        ofs = 0;
+        f = find_field(&st, tok_alloc_const("val"), &ofs);
+        if (f)
+            c6_async_add_release(ts, arg, ofs, c6_gc_mode(&ftype->ref->type));
+    }
+    for (i = 0, p = c6_async_params(ftype); p; p = p->next, i++) {
+        if (!c6_is_managed(&p->type))
+            continue;
+        snprintf(buf, sizeof buf, "p%d", i);
+        ofs = 0;
+        f = find_field(&st, tok_alloc_const(buf), &ofs);
+        if (f)
+            c6_async_add_release(ts, arg, ofs, c6_gc_mode(&p->type));
+    }
+    tok_str_add(ts, '}');
+    tok_str_add(ts, TOK_EOF);
+    c6_decl_tokens(ts);
+    return fn;
+}
+
 /* 'async' function definition: declare the task type, compile the body under
    its own name, then emit the descriptor the runtime creates tasks from. */
 static void c6_async_definition(Sym *sym, CType *ftype)
@@ -13828,7 +13955,7 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     int body = c6_async_tok("__c6_body_", name, "");
     TokenString *ts;
     Sym *body_sym;
-    int align, size;
+    int align, size, rel;
 
     c6_async_declare(ftype, name);
 
@@ -13865,6 +13992,7 @@ static void c6_async_definition(Sym *sym, CType *ftype)
         CType taskt = c6_async_task_ctype(name);
         size = type_size(&taskt, &align);
     }
+    rel = c6_async_release_fn(name, ftype);
     ts = tok_str_alloc();
     tok_str_add(ts, TOK_CONST1);
     tok_str_add(ts, TOK_STRUCT);
@@ -13879,6 +14007,11 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     c6_async_add_int(ts, 64);   /* defer records parked per task */
     tok_str_add(ts, ',');
     tok_str_add(ts, body);
+    tok_str_add(ts, ',');
+    if (rel)
+        tok_str_add(ts, rel);   /* gives back the references the task owns */
+    else
+        c6_async_add_int(ts, 0);
     tok_str_add(ts, '}');
     tok_str_add(ts, ';');
     tok_str_add(ts, TOK_EOF);
@@ -14798,6 +14931,15 @@ static int c6_gc_store_hook(void)
         return 0;
     }
 
+    if ((dt->gq & C6_GQ_BORROW) && !c6_gc_init_store) {
+        /* parameters (and 'async' parameters) borrow the caller's or the
+           task's reference: overwriting the slot would release something
+           this frame does not own */
+        char b[160];
+        type_to_str(b, sizeof b, dt, NULL);
+        tcc_error("'%s' is a borrow: it owns nothing, so it cannot be "
+                  "reassigned (copy it into an owned local first)", b);
+    }
     is_null = (vtop->r & VT_VALMASK) == VT_CONST
         && !(vtop->r & (VT_LVAL | VT_SYM)) && vtop->c.i == 0;
     if (vtop->gc_state != C6_GC_FRESH && !c6_is_managed(&vtop->type)
@@ -14840,6 +14982,13 @@ static int c6_gc_store_hook(void)
         vtop->type = vt;
         vtop->gc_state = C6_GC_BORROW;
         return 1;
+    }
+    if ((mode & C6_GCM_ATOMIC) && vtop->gc_state == C6_GC_FRESH
+        && !vtop->gc_atomic) {
+        /* the count lives in the object, so a 'shared' reference to an
+           object whose count is not atomic would race */
+        tcc_error("a 'shared' slot needs an object with an atomic count: "
+                  "create it with 'new shared T', not 'new T'");
     }
     own = (mode & C6_GCM_OWN) != 0;
     if (own && !(mode & C6_GCM_FRESH) && !is_null) {
@@ -14960,6 +15109,7 @@ static void c6_gc_new_expr(void)
     type.ref->type.gq = type.gq;
     vtop->type = type;
     vtop->gc_state = C6_GC_FRESH;
+    vtop->gc_atomic = (flags & C6_GCM_ATOMIC) != 0;
 }
 
 /* Frame slots that hold fresh call arguments until the call has returned.
@@ -15292,6 +15442,39 @@ static void c6_sp_emit(C6SpPending *sp)
     }
     tok_str_add(ts, ')');
     tok_str_add(ts, ';');
+    /* the argument block owned one reference per managed parameter: give it
+       back before the block is freed, or the object would outlive its users */
+    for (i = 0, p = c6_async_params(&sp->ftype), ofs = 0; p; p = p->next, i++) {
+        CType pt = p->type;
+        int a2, sz;
+
+        convert_parameter_type(&pt);
+        sz = type_size(&pt, &a2);
+        ofs = (ofs + a2 - 1) & -a2;
+        if (c6_is_managed(&pt)) {
+            tok_str_add(ts, tok_alloc_const("__c6_gc_release"));
+            tok_str_add(ts, '(');
+            tok_str_add(ts, '(');
+            tok_str_add(ts, TOK_VOID);
+            tok_str_add(ts, '*');
+            tok_str_add(ts, '*');
+            tok_str_add(ts, ')');
+            tok_str_add(ts, '(');
+            tok_str_add(ts, '(');
+            tok_str_add(ts, TOK_CHAR);
+            tok_str_add(ts, '*');
+            tok_str_add(ts, ')');
+            tok_str_add(ts, arg);
+            tok_str_add(ts, '+');
+            c6_async_add_int(ts, ofs);
+            tok_str_add(ts, ')');
+            tok_str_add(ts, ',');
+            c6_async_add_int(ts, c6_gc_mode(&pt));
+            tok_str_add(ts, ')');
+            tok_str_add(ts, ';');
+        }
+        ofs += sz;
+    }
     tok_str_add(ts, TOK_RETURN);
     c6_async_add_int(ts, 0);
     tok_str_add(ts, ';');
@@ -15338,10 +15521,15 @@ static void c6_go_parse(void)
     if (!c6_sp_ok(&ft))
         tcc_error("'go' does not support this signature: '%s'",
                   get_tok_str(name, NULL));
-    for (p = c6_async_params(&ft); p; p = p->next)
+    for (p = c6_async_params(&ft); p; p = p->next) {
         if (!c6_sp_type_ok(&p->type))
             tcc_error("'go' does not support this signature: '%s'",
                       get_tok_str(name, NULL));
+        if (c6_is_managed(&p->type)
+            && !(c6_type_gq(&p->type) & C6_GQ_SHARED))
+            tcc_error("passing a reference to 'go' requires 'shared': '%s' "
+                      "is counted per thread", get_tok_str(name, NULL));
+    }
 
     /* a forward reference to the trampoline, which c6_sp_flush() defines at
        the end of this unit */
@@ -15462,7 +15650,18 @@ static void gen_function(Sym *sym)
     /* push parameters */
     local_scope = 1;
     sym_push_params(sym->type.ref);
-
+#ifdef C6_EXT
+    if (tcc_state->c6_ext) {
+        /* a managed parameter borrows the caller's reference: it owns
+           nothing, is never released and cannot be reassigned */
+        Sym *ps;
+        for (ps = local_stack; ps && (ps->r & VT_LOCAL); ps = ps->prev) {
+            if ((ps->r & VT_VALMASK) == VT_LOCAL && ps->c >= 0
+                && c6_is_managed(&ps->type))
+                ps->type.gq |= C6_GQ_BORROW;
+        }
+    }
+#endif
     local_scope = 0;
     rsym = 0;
     nb_temp_local_vars = 0;

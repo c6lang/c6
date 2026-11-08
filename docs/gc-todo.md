@@ -30,7 +30,7 @@
 | P2 ✅ | 描述符、字段释放、数组 `new T[n]` | P1 | 拓扑排序其实不需要 |
 | P3 ✅ | `weak`（含禁 async） | P2 | 帧搬动只能探测，不能 trap |
 | P4 ✅ | 析构 `drop` 方法 | P3 | 全局根不能用 `atexit` |
-| P5 | `shared` + 跨帧/跨线程转移 | P2 | `go` 实参块与任务 slot 的 +1/−1 |
+| P5 ✅ | `shared` + 跨帧/跨线程转移 | P2 | 任务 slot 的归还点在 `__c6_co_destroy` |
 | P6 | 静态环检测（硬错误）+ 链接期 | P2/P3 | `own` 语义、跨 TU 段 |
 | P7 | async/go 集成与预算化 drain | P1/P5 | `__c6_co_abort` 回卷 |
 | P8 | 文档与全量回归 | 全部 | — |
@@ -268,20 +268,66 @@
 
 ---
 
-## P5 `shared` 与跨帧/跨线程转移
+## P5 ✅ `shared` 与跨帧/跨线程转移
+
+结果：`go` 的实参块和一个 `async` 任务各持有一份引用，两处都在**用完之后**
+−1，所以「创建者先放手、线程/任务后跑完」是安全的；`shared @T` 的加减在
+对象头里带原子标志，两个线程同时加减不丢更新（`tests/gc_thread.c` 4 个块，
+连跑 10 次稳定）；任务还持有托管返回值（`tests/gc_async.c` 5 个块）；
+6 条诊断（`tests/errors/gc_borrow.c`）。验收：`make selftest` 49 通过、
+`BACKEND=c99 tests/run-tests.sh` 50 通过、`make test-plain` 绿。
 
 改动点：
 
 - `shared @T` 的存储/释放走 `__atomic_fetch_add`/`__atomic_sub_fetch`（`ACQ_REL`）；
   libtcc1.c 里自行 `#define __ATOMIC_ACQ_REL 4`（tcc 不预定义）；
-- `go f(args)`：实参块里的托管引用 +1 进块、块释放时 −1
-  （`__tcc_sp_args`/trampoline，`lib/libtcc1.c:789`/`800`）；
-- `async`：参数进 `struct NAME_task` 时 +1，任务 slot 回收时 −1；
-- 静态检查：`plain @T` 进 `go`/`async` → 错误（E-GC10）；
+- `go f(args)`：实参块里的托管引用 +1 进块、trampoline 返回前 −1
+  （`c6_sp_emit()`，`__tcc_sp_args`，`lib/libtcc1.c:796`）；
+- `async`：参数进 `struct NAME_task` 时 +1，任务被 `__c6_co_destroy()` 回收
+  时 −1 —— 不在 body 里还，body 可能永远跑不完；
+- 静态检查：`plain @T`/`own @T` 进 `go`/`async` → 错误（E-GC10）；
 - 取消旧设计里“`go`/`async` 边界不能带托管引用”的限制。
 
-测试（`tests/gc_thread.c`）：4 线程 × 25 万次引用转移，结束时 `live()` 归零；
-`go` 传 `shared @T` 参数；`await` 传参；`-run` 下不依赖 libatomic。
+落地状态（与计划的差异）：
+
+- **任务 slot 的归还点**：`struct __c6_desc` 增加第 5 个成员
+  `void (*release)(void *)`，编译器为每个带引用的 async 函数发一个
+  `static void __c6_rel_NAME(void *)`，逐字段
+  `__c6_gc_release(&t->pN / &t->val, mode)`；`__c6_co_destroy()` 在作废槽
+  之前调用它。这样「body 正常结束」「body 被 abort」「任务从未被 step」
+  三条路径都只在一个地方归还（比在每个 return 点发 −1 简单，也不会漏）。
+- **形参是借用（新发现的既有 UAF）**：`void f(@Node n) { n = NULL; }` 会把
+  调用者的引用减掉，静默释放一个还活着的对象（`live()` 归零但指针仍可用 ——
+  今天就会写坏内存）。现在托管形参的槽打 `C6_GQ_BORROW` 标记（只存在
+  `CType.gq` 缓存，不上 pointee；`vsetc()` 全清，形参由 `gen_function()` 在
+  `sym_push_params()` 之后逐个数、body 的 async 形参在
+  `c6_async_params_copy()` 里打），`vstore()` 的钩子见到就报 E-GC14。
+- **`new shared T`（新发现的丢失更新）**：原子与否在对象头里
+  （`h->meta & C6_GC_ATOMIC`），因为同一个对象可能同时被 `@T` 局部和
+  `shared @T` 槽指着。`shared @T p = new T;` 拿到的是非原子对象，两个线程
+  各 −1 只掉一次 —— 所以编译期拒掉（E-GC15），`new` 的结果用
+  `SValue.gc_atomic` 记着。
+- **任务结构体的字段带限定符**：`c6_async_type_tokens()` 对托管指针会发
+  `shared @T`，所以 `t->pN`/`t->val` 是托管槽，调用点、body 的 `return`、
+  awaiter 的读取都走同一个 store 钩子；`c6_async_propagate()` 写
+  `TCC_ERR_SENTINEL` 时用 `c6_gc_no_hook`（哨兵不是引用）。
+- **E-GC10 的检查点在声明处**（`c6_async_declare()`），形参和返回值一起查，
+  一次报出；`weak` 先由 §9.2 的检查报（判定顺序：先 `weak` 再 `shared`，
+  否则错误文案会被抢）。
+- 测试没用「4 线程 × 25 万次」的压测：改成 4 个确定性用例（计数在每一步
+  都对得上），压测只能发现「有时不对」，而且失败时看不出是哪一步。
+
+测试（`tests/gc_thread.c`、`tests/gc_async.c`）：
+
+- `go` 的实参块持有一份（线程里读到的计数 = 2）；启动者放手后对象仍活着；
+  跨线程交接（存进 `shared` 全局，计数 = 2）；两个线程同时对同一对象加减，
+  两次 +1 都算上（5）、退出后回到 1 —— 这条在 `new T`（非原子）时会稳定
+  失败，正是 E-GC15 的实测依据；
+- 任务前缀持有一份；创建者放手后任务仍活着；形参借用 + 拷进自有局部才 +1；
+  托管返回值由 `val` 槽持有（`return n` 与 `return new shared T` 两条路径）；
+  非托管参数不受影响；
+- `tests/errors/gc_borrow.c`：借用形参赋值（普通/async 各一条）、`go` 传
+  `plain @T`、`async` 形参/返回值非 `shared`、`shared` 槽装 `new T`。
 
 验收：同 P1 + 原生与 C99 两种后端都要过。
 

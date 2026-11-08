@@ -83,7 +83,7 @@ weak shared @T  跨线程的弱引用（弱槽失效也必须是原子/加锁的
 
 | 操作 \ 类型 | `@T` | `shared @T` | `weak @T` | `own @T` |
 |---|---|---|---|---|
-| `new T` / `new T[n]` 的结果 | FRESH | FRESH | ✗ | FRESH |
+| `new T` / `new T[n]` 的结果 | FRESH | 要写 `new shared T`（E-GC15） | ✗ | FRESH |
 | `p = NULL`（释放） | ✓ | ✓（原子） | ✓（解注册） | ✓（释放整条链） |
 | 同类型赋值 | +1/−1 | 原子 +1/−1 | 重注册 | 转移（旧链释放） |
 | 存进 `@T` 字段 | ✓ | ✗（字段必须是 `shared`） | ✓ | ✓（字段必须是 `own`） |
@@ -278,6 +278,13 @@ void  __c6_gc_shutdown(void);                         /* 退出时释放全局�
 - 实现：`SValue` 上加 `gc_src` 溯源位，经强转/算术传播，在所有存储点检查；
 - 传给裸指针形参 → 警告 `-Wgc-borrow`（默认开，可 `-Werror`）；
   形参声明 `__attribute__((c6_borrow))` 时降级为静默（表示“被调者不会保存”）。
+
+**形参是借用（P5 定稿）**：托管形参的槽由调用者（`go`/`async` 时由实参块或
+任务前缀）拥有，被调者不计数、不释放。因此形参槽打上 `C6_GQ_BORROW`
+（只存在 `CType.gq` 缓存里，绝不上 pointee），`vstore()` 的钩子见到它就报
+E-GC14 —— 否则 `void f(@Node n) { n = NULL; }` 会把调用者的引用减掉，
+静默释放一个还活着的对象（`tests/errors/gc_borrow.c`）。要改写就先拷进
+自有局部：`@Node m = n;`（+1，退出时 −1）。
 
 按值规则：含托管字段的结构体不能按值拷贝、按值传参、按值返回、进 tuple、
 存进 slice；`memcpy`/`memmove` 实参指向这类类型时（`TOK_memcpy` 是独立记号，
@@ -533,11 +540,34 @@ body 一侧：`c6_async_func_end()`（`tcc/tccgen.c:13472`）的恢复派发器�
 - `await f(args)` / `task t = f(args)`：参数被拷进 `struct NAME_task` 前缀
   （`c6_async_call`，`tcc/tccgen.c` 内），+1 进任务；任务 slot 归还
   （`__c6_co_destroy`/池回收）时 −1；
-- 约束：跨线程只能传 `shared @T`（`plain @T` 编译错误），载荷本身仍由用户同步。
+- 约束：跨帧/跨线程只能传 `shared @T`（`plain @T` 编译错误），载荷本身仍由
+  用户同步。
+
+**落地方式（P5）**：
+
+1. `go`：实参块的槽类型直接用声明类型（带限定符），`vstore()` 钩子 +1；
+   `c6_sp_emit()` 生成的 trampoline 在 `return 0` 之前对每个托管形参发
+   `__c6_gc_release((void **)((char *)__c6_arg + ofs), mode)`，−1；
+2. `async`：`c6_async_call()` 把任务前缀槽的类型换成声明类型（+1）；
+   任务 slot 的归还点不在 body 里（body 可能永远跑不完），而在
+   `__c6_co_destroy()`：`struct __c6_desc` 增加第 5 个成员
+   `void (*release)(void *)`，编译器为每个 async 函数发射
+   `static void __c6_rel_NAME(void *t)`，逐字段
+   `__c6_gc_release(&t->pN/val, mode)`；为 0 时不发（任务不带引用）；
+3. body 一侧：`c6_async_params_copy()` 用 `c6_gc_no_hook` 把前缀槽拷进帧内
+   局部（不 +1、不注册释放点），并给局部打 `C6_GQ_BORROW` —— 形参是借用；
+4. 检查点在**声明处**（`c6_async_declare()`），一次报出，覆盖形参与返回值；
+   `weak` 由 §9.2 单独报（判定顺序：先 `weak` 再 `shared`）。
 
 ---
 
 ## 10. 线程与原子计数
+
+**原子与否是对象自己的属性**（`h->meta` 里的 `C6_GC_ATOMIC`），不是槽的：
+同一个对象可能同时被 `@T` 局部和 `shared @T` 槽指着，加减必须一致，所以由
+`new shared T` 在分配时决定，之后每个加减都按头里的标志走。由此得出
+E-GC15：`shared @T p = new T;` 会拿到一个计数非原子的对象，跨线程加减会
+丢更新（P5 里实测：两个线程各 −1，计数只掉一次），编译期直接拒掉。
 
 `shared @T` 的计数用 `__atomic_fetch_add` / `__atomic_sub_fetch`（`ACQ_REL`）。
 **工具链不需要额外库**：`lib/atomic.S`（GCC libatomic 提取版，覆盖 i386/x86_64/
@@ -664,10 +694,12 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | E-GC9b | 析构返回值不是 `void` | error | `'drop' must return void: it runs while the object is being released, where a value has nowhere to go` |
 | E-GC9c | 析构声明成 `!error` | error | `'drop' cannot fail ('!error'): it runs while the object is being released, where an error has nowhere to go` |
 | E-GC9d | 一个类型两个析构 | error | `'%s' already has a destructor`（同一 TU 内通常先报 `redefinition of 'T_drop'`） |
-| E-GC10 | `plain @T` 跨线程 | error | `passing a reference to 'go' requires 'shared'` |
+| E-GC10 | `@T` 跨线程/跨帧 | error | `passing a reference to 'go' requires 'shared'` / `passing a reference to 'async' requires 'shared'` |
 | E-GC11 | `memset` 含引用对象 | warning | 清零会漏引用 |
 | E-GC12 | 借出给未标注裸指针形参 | warning `-Wgc-borrow` | 可 `-Werror` |
 | E-GC13 | `own` 值被共享 | error | `an 'own' field takes ownership: assign a fresh value or 'move(...)'` |
+| E-GC14 | 给借用的引用赋值 | error | `'%s' is a borrow: it owns nothing, so it cannot be reassigned (copy it into an owned local first)` |
+| E-GC15 | `shared @T p = new T` | error | `a 'shared' slot needs an object with an atomic count: create it with 'new shared T', not 'new T'` |
 
 ---
 

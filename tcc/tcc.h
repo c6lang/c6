@@ -478,6 +478,9 @@ typedef struct CType {
 #define C6_GQ_OWN     0x02  /* 'own @T': exclusive ownership, no count */
 #define C6_GQ_SHARED  0x04  /* 'shared @T': atomic count, may cross threads */
 #define C6_GQ_QUAL    (C6_GQ_WEAK | C6_GQ_OWN | C6_GQ_SHARED)
+/* compiler-only mark on a *slot* (never on a pointee): this reference is a
+   borrow, so it owns nothing and must not be reassigned */
+#define C6_GQ_BORROW  0x40
 
 /* c6: ownership state of a managed reference carried by an SValue */
 #define C6_GC_BORROW 0  /* borrowed: usable, never released by us */
@@ -518,6 +521,7 @@ typedef struct SValue {
        derived from a managed reference (used to reject storing a borrow) */
     unsigned char gc_state;
     unsigned char gc_src;
+    unsigned char gc_atomic;     /* a 'new shared T' value: already atomic */
     union {
       struct { int jtrue, jfalse; }; /* forward jmps */
       CValue c;         /* constant, if VT_CONST */

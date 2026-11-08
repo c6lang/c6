@@ -1644,6 +1644,7 @@ typedef struct TccCoDesc {
     unsigned size, align;
     int defer_max;
     int (*entry)(void *);
+    void (*release)(void *);    /* give back what the task slot owns */
 } TccCoDesc;
 
 /* One slot per task, big enough for 'struct NAME_task' (the header plus the
@@ -2134,6 +2135,10 @@ void __c6_co_destroy(void *self)
         __c6_co_destroy(t->child);
     t->child = 0;
     t->parent = 0;
+    /* the task owned one reference per managed parameter (and the return
+       value): give them back before the slot is reused */
+    if (t->desc && ((TccCoDesc *)t->desc)->release)
+        ((TccCoDesc *)t->desc)->release(t);
     tcc_co_unlink((TccCoTask **)&co->runlist, t);
     co->live[tcc_co_index(co, t)] = 0;
 }
