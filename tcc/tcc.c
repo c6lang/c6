@@ -28,13 +28,25 @@
 #endif
 #include "tcctools.c"
 
+#ifdef TCC_TARGET_C99
+# ifndef _WIN32
+#  include <sys/stat.h>
+# endif
+#endif
+
 static const char help[] =
     "Tiny C Compiler "TCC_VERSION" - Copyright (C) 2001-2006 Fabrice Bellard\n"
     "Usage: tcc [options...] [-o outfile] [-c] infile(s)...\n"
     "       tcc [options...] -run infile (or --) [arguments...]\n"
     "General options:\n"
+#ifdef TCC_TARGET_C99
+    "  -c           one generated C file per input file (with -o dir)\n"
+    "  -o outfile   set output file, or directory for one .c per input\n"
+    "  -c99         generate portable C source (default in this build)\n"
+#else
     "  -c           compile only - generate an object file\n"
     "  -o outfile   set output filename\n"
+#endif
     "  -run         run compiled source\n"
     "  -fflag       set or reset (with 'no-' prefix) 'flag' (see tcc -hh)\n"
     "  -Wwarning    set or reset (with 'no-' prefix) 'warning' (see tcc -hh)\n"
@@ -297,10 +309,72 @@ static unsigned getclock_ms(void)
 #endif
 }
 
+#ifdef TCC_TARGET_C99
+/* -o may name a directory: each translation unit then gets its own
+   generated C file, named after its input file. */
+static int is_dir_path(const char *path)
+{
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES
+        && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static int has_trailing_dirsep(const char *path)
+{
+    int n = strlen(path);
+    return n > 0 && IS_DIRSEP(path[n - 1]);
+}
+
+static int same_file(const char *a, const char *b)
+{
+    if (!strcmp(a, b))
+        return 1;
+#ifndef _WIN32
+    {
+        struct stat sa, sb;
+        if (stat(a, &sa) == 0 && stat(b, &sb) == 0
+            && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino)
+            return 1;
+    }
+#endif
+    return 0;
+}
+
+/* "<dir>/<input basename with a .c extension>" */
+static char *c99_output_in_dir(const char *dir, const char *infile)
+{
+    const char *base = tcc_basename(infile);
+    int dlen = strlen(dir);
+    int blen = strlen(base);
+    int sep = dlen > 0 && !IS_DIRSEP(dir[dlen - 1]);
+    char *path = tcc_malloc(dlen + sep + blen + 3);
+    char *ext;
+
+    memcpy(path, dir, dlen);
+    if (sep)
+        path[dlen++] = '/';
+    memcpy(path + dlen, base, blen + 1);
+    ext = tcc_fileextension(path);
+    if (*ext)
+        strcpy(ext, ".c");
+    else
+        strcpy(path + dlen + blen, ".c");
+    return path;
+}
+#endif /* TCC_TARGET_C99 */
+
 int main(int argc, char **argv)
 {
     TCCState *s, *s1;
     int ret, opt, n = 0, t = 0, done;
+#ifdef TCC_TARGET_C99
+    int out_dir = 0;
+#endif
     unsigned start_time = 0, end_time = 0;
     const char *first_file;
     int argc0 = argc;
@@ -349,7 +423,7 @@ redo:
         } else if (s->output_type && s->output_type != TCC_OUTPUT_C99
                    && s->output_type != TCC_OUTPUT_PREPROCESS) {
             /* no machine code, no linker: say so instead of pretending */
-            tcc_error_noabort("the c99 back-end only produces C source, use -c99");
+            tcc_error_noabort("the c99 back-end only produces C source; use -o out.c");
 #endif
         } else if (s->output_type == TCC_OUTPUT_PREPROCESS) {
             if (s->outfile && 0!=strcmp("-",s->outfile)) {
@@ -363,6 +437,30 @@ redo:
             else if (s->nb_files > 1 && s->outfile)
                 tcc_error_noabort("cannot specify output file with -c many files");
         }
+#ifdef TCC_TARGET_C99
+        /* -o may name a directory (or end with a separator) to ask for one
+           generated C file per translation unit.  The output type is still
+           0 when no action was given, and that means C source here. */
+        if (!s->nb_errors && s->outfile
+            && (s->output_type == 0 || s->output_type == TCC_OUTPUT_C99)) {
+            if (has_trailing_dirsep(s->outfile)) {
+                if (!is_dir_path(s->outfile))
+                    tcc_error_noabort("output directory '%s' does not exist",
+                                      s->outfile);
+                else
+                    out_dir = 1;
+            } else if (is_dir_path(s->outfile)) {
+                out_dir = 1;
+            }
+            if (out_dir && s->nb_libraries)
+                tcc_error_noabort("cannot specify libraries with an output directory");
+        }
+        if (!s->nb_errors && s->c99_compile_only && s->nb_libraries)
+            tcc_error_noabort("cannot specify libraries with -c");
+        if (!s->nb_errors && s->c99_compile_only && !out_dir
+            && s->nb_files > 1)
+            tcc_error_noabort("cannot compile multiple files with -c to one output file; use -o <dir>");
+#endif
         if (s->nb_errors)
             goto err;
         if (s->do_bench)
@@ -409,6 +507,10 @@ redo:
             break;
         if (s->output_type == TCC_OUTPUT_OBJ && !s->option_r)
             break;
+#ifdef TCC_TARGET_C99
+        if (out_dir)
+            break;
+#endif
     }
 
     if (s->do_bench)
@@ -424,10 +526,38 @@ redo:
             ret = tcc_run(s, argc, argv);
 #endif
         } else {
+#ifdef TCC_TARGET_C99
+            int clash = -1;
+#endif
             if (!s->outfile)
                 s->outfile = default_outputfile(s, first_file);
-            if (!s->just_deps)
-                ret = tcc_output_file(s, s->outfile);
+#ifdef TCC_TARGET_C99
+            else if (out_dir) {
+                char *path = c99_output_in_dir(s->outfile, first_file);
+                tcc_free(s->outfile);
+                s->outfile = path;
+            }
+            {
+                int i;
+                for (i = 0; i < s->nb_files; i++)
+                    if (!(s->files[i]->type & AFF_TYPE_LIB)
+                        && same_file(s->outfile, s->files[i]->name)) {
+                        clash = i;
+                        break;
+                    }
+            }
+#endif
+            if (!s->just_deps) {
+#ifdef TCC_TARGET_C99
+                if (clash >= 0) {
+                    fprintf(stderr, "tcc: error: output file '%s' would "
+                            "overwrite input file '%s'\n",
+                            s->outfile, s->files[clash]->name);
+                    ret = 1;
+                } else
+#endif
+                    ret = tcc_output_file(s, s->outfile);
+            }
             if (!ret && s->gen_deps)
                 gen_makedeps(s, s->outfile, s->deps_outfile);
         }

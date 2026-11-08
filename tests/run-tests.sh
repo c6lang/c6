@@ -10,7 +10,7 @@
 #   TCC       编译器路径（默认 <仓库>/tcc/tcc）
 #   TCCFLAGS  追加给编译器的参数
 #   BACKEND   native（默认）用 tcc/tcc 直接编译运行；c99 先用
-#             tcc/c99-tcc -c99 生成 C 源码，再用系统 C 编译器编译运行。
+#             tcc/c99-tcc 生成 C 源码（-c99 可省略），再用系统 C 编译器编译运行。
 #             两种模式跑完全相同的测试文件和断言。
 #   C99TCC    C99 后端编译器（默认 <仓库>/tcc/c99-tcc）
 #   C99CC     编译生成代码的系统 C 编译器（默认 gcc）
@@ -28,7 +28,7 @@
 #   tests/abi/*.c     ABI 兼容；每个文件用 -std=c6 编译，同名的 _plain.c 用
 #                     纯 C（不带 -std=c6）编译，两个目标文件链接后运行，
 #                     比对 `// EXIT <n>` 声明的退出码。
-#   tests/c99/*.c     C99 输出后端；每个文件先用 tcc/c99-tcc -c99 生成 C
+#   tests/c99/*.c     C99 输出后端；每个文件先用 tcc/c99-tcc 生成 C
 #                     源码，再用 gcc -std=c99 编译并运行，比对
 #                     `// EXIT <n>`（默认 0）；带 `// OUTPUT <文本>` 时
 #                     还要求 stdout 含该文本。
@@ -96,7 +96,7 @@ build_exe() { # <可执行文件> <源文件>...
     exe=$1
     shift
     if [ "$BACKEND" = c99 ]; then
-        $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+        $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c"
     else
@@ -110,8 +110,8 @@ build_test_exe() { # <可执行文件> <源文件>...
     exe=$1
     shift
     if [ "$BACKEND" = c99 ]; then
-        # -test 先选运行模式，-c99 再把输出切回 C 源码
-        $C99TCC -test -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+        # c99 后端里 -test 直接生成带测试入口的 C 源码
+        $C99TCC -test -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c" || return 1
         "$exe"
@@ -200,7 +200,7 @@ for src in "$ROOT"/tests/errors/*.c; do
         fi
 
         if [ "$BACKEND" = c99 ]; then
-            if $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+            if $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
                     -D"$frag" -o "$TMP/diag.c" "$src" \
                     2>"$TMP/err" >/dev/null; then
                 # 生成成功不等于有错：没有机器码链接步骤的未解析引用，
@@ -283,7 +283,7 @@ for src in "$ROOT"/tests/abi/*.c; do
         continue
     fi
     if [ "$BACKEND" = c99 ]; then
-        if ! $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+        if ! $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
                 -o "$TMP/abi-c6.c" "$src" 2>"$TMP/err" >/dev/null; then
             fail "$name" "c6 侧生成 C 失败:$(cat "$TMP/err")"
             continue
@@ -362,7 +362,7 @@ for src in "$ROOT"/tests/c99/*.c; do
     wantout=$(sed -n 's,^// *OUTPUT *\(.*\)$,\1,p' "$src" | head -n 1)
 
     csrc="$TMP/c99-$base.c"
-    if ! $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS -o "$csrc" "$src" \
+    if ! $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS -o "$csrc" "$src" \
             2>"$TMP/err" >/dev/null; then
         fail "$name" "c99-tcc 生成 C 失败:$(cat "$TMP/err")"
         continue
@@ -383,6 +383,47 @@ for src in "$ROOT"/tests/c99/*.c; do
         note_pass "$name: 退出码 $got"
     fi
 done
+
+# ---- 6. c99 后端命令行：不写 -c99，用 -o <dir> 按 TU 生成 .c ----
+if [ "$BACKEND" = c99 ] && is_wanted "c99/cli"; then
+    name="c99/cli"
+    d="$TMP/c99-cli"
+    mkdir -p "$d/out"
+    cat > "$d/main.c" <<'EOF'
+int part(void);
+int main(void) { return part(); }
+EOF
+    cat > "$d/part.c" <<'EOF'
+int part(void) { return 7; }
+EOF
+    ok=yes
+    if ! $C99TCC -B "$ROOT/tcc" -o "$d/out" "$d/main.c" "$d/part.c" \
+            2>"$TMP/err" >/dev/null; then
+        ok=no
+        detail="c99-tcc -o <dir> 失败:$(cat "$TMP/err")"
+    elif [ ! -f "$d/out/main.c" ] || [ ! -f "$d/out/part.c" ]; then
+        ok=no
+        detail="-o <dir> 没有为每个 TU 生成 .c"
+    elif ! $C99TCC -B "$ROOT/tcc" -c -o "$d/out" "$d/main.c" "$d/part.c" \
+            2>"$TMP/err" >/dev/null; then
+        ok=no
+        detail="c99-tcc -c -o <dir> 失败:$(cat "$TMP/err")"
+    elif ! $C99CC $C99FLAGS -o "$d/bin" "$d/out/main.c" "$d/out/part.c" \
+            2>"$TMP/err" >/dev/null; then
+        ok=no
+        detail="$C99CC 编译生成的 C 失败:$(cat "$TMP/err")"
+    else
+        "$d/bin" >/dev/null 2>"$TMP/err"
+        got=$?
+        if [ "$got" = 7 ]; then
+            note_pass "$name: 每个 TU 一个 .c，退出码 7"
+        else
+            ok=no
+            detail="退出码 $got，期望 7"
+        fi
+    fi
+    [ "$ok" = yes ] || fail "$name" "$detail"
+fi
 
 echo
 echo "run-tests: $npass 通过, $nfail 失败"

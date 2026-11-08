@@ -825,6 +825,9 @@ struct TCCState {
     unsigned char warn_num; /* temp var for tcc_warning_c() */
 
     unsigned char option_r; /* option -r */
+#ifdef TCC_TARGET_C99
+    unsigned char c99_compile_only; /* -c: one generated C file per TU */
+#endif
     unsigned char do_bench; /* option -bench */
     unsigned char just_deps; /* option -M  */
     unsigned char gen_deps; /* option -MD  */
@@ -1818,6 +1821,7 @@ ST_FUNC void gen_clear_cache(void);
 #ifdef TCC_TARGET_C99
 ST_FUNC void gen_opl(int op);
 ST_FUNC void gen_cvt_sxtw(void);
+ST_FUNC void c99_reset(void);
 ST_FUNC int c99_output_file(TCCState *s1, const char *filename);
 #endif
 

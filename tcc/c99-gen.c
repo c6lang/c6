@@ -18,7 +18,7 @@
  *      from the relocation records
  *
  *  Build:  make c99                     (仓库根目录，自动配置；tcc/c99-tcc)
- *  Use:    c99-tcc -c99 -B. -o out.c in.c   ('-c99' 是这个构建的默认动作)
+ *  Use:    c99-tcc -B. -o out.c in.c    ('-c99' 可省略，这个构建只产出 C)
  */
 
 #ifdef TARGET_DEFS_ONLY
@@ -1648,6 +1648,46 @@ ST_FUNC void gfunc_epilog(void)
     c99_nmarks = 0;
     c99_nlbls = 0;
     ind = c99_ind();
+}
+
+/* Start a new translation unit.  The generator keeps its buffers in
+   file-static variables (not in TCCState) because one process used to
+   compile exactly one file; the driver may however replay itself for the
+   next input (-c, or one generated C file per TU with -o <dir>), so a new
+   state must not inherit the previous file's declarations, symbols or
+   emitted function bodies. */
+ST_FUNC void c99_reset(void)
+{
+    C99Decl *d, *dn;
+    int i;
+
+    tcc_free(c99_fn.data);
+    tcc_free(c99_prog.data);
+    memset(&c99_fn, 0, sizeof c99_fn);
+    memset(&c99_prog, 0, sizeof c99_prog);
+    c99_next_label = 1;
+    c99_last_cmp = 0;
+    for (i = 0; i < c99_nrefs_count; i++)
+        tcc_free((void *)c99_nrefs[i]);
+    c99_nrefs_count = 0;
+    c99_nmarks = 0;
+    c99_nlbls = 0;
+    c99_npls = 0;
+    for (d = c99_decls; d; d = dn) {
+        dn = d->next;
+        tcc_free(d->name);
+        tcc_free(d->text);
+        tcc_free(d);
+    }
+    c99_decls = NULL;
+    for (i = 0; i < c99_ngsyms; i++)
+        tcc_free((void *)c99_gsyms[i].cname);
+    c99_ngsyms = 0;
+    if (c99_used)
+        memset(c99_used, 0, c99_used_size);
+    c99_have_main = 0;
+    c99_rt_used = 0;
+    c99_nstructs = 0;
 }
 
 /* ====================================================================== */
