@@ -5243,7 +5243,13 @@ static int c6_tuple_btype(CType *type)
     for (;;) {
         tok_str_add_tok(back);
         tok_str_add_tok(replay);
-        if (tok == '(' || tok == '[') {
+        /* TOK_SOTYPE is the '(' of 'sizeof(type)' / 'alignof(type)'.  It has
+           to open the group like a real '(' does: without that the matching
+           ')' drops the depth below zero, the scan runs on to TOK_EOF and
+           the tokens replayed at the end are then attributed to whatever
+           file the include chain popped back to (the enclosing file, with
+           the line numbers of the included one). */
+        if (tok == '(' || tok == '[' || tok == TOK_SOTYPE) {
             depth++;
         } else if (tok == ']') {
             if (depth > 1)

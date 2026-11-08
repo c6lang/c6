@@ -610,6 +610,12 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   `begin_macro` 重放 token，`type_decl(TYPE_ABSTRACT|TYPE_DIRECT)` 走一遍，
   成功且右括号前没有名字才算元组），失败就原样退回普通括号。因此
   `(void)printf(…)`、`(int)x`、`(struct S){…}`、`({…})`、`(a, b)` 全部零变化；
+- **整组扫描要把 `sizeof(type)` 的 `(` 当成开括号**：`sizeof` / `_Alignof`
+  后面跟 `(` 时，`unary()` 拿到的是 `TOK_SOTYPE`（`'('` 的别名）。扫描器只数
+  真括号的话，匹配的 `)` 会把深度减到 -1，组永远不闭合，一路吞到 `TOK_EOF`；
+  这时回放的 token 已经跨过文件尾，行号来自 token 串里的行标记、文件名却来自
+  弹出后的包含者，诊断会报成“源文件:头文件里的行号”。`tests/errors/loc.c`
+  守这条；
 - **不上新 ABI**：元组就是 `VT_STRUCT` + 内部 tag `__c6_tuple_N`，参数和返回值
   都走已有的 struct 路径（`gfunc_sret` / `classify_x86_64_arg`），`libtcc1.c`
   一个新符号都没加。`tests/abi/tuple.c` + `tests/abi/tuple_plain.c` 用元组和
@@ -661,6 +667,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/tuple_async.c` | 元组的 `async` 返回、`await` + 解构、`_` 丢弃、嵌套 `await` |
 | `tests/tuple_thread.c` | 元组穿过 `go`（按值拷贝）、线程里的元组调用 |
 | `tests/errors/tuple.c` | 元组的全部编译期诊断（元素类型、下标、解构形态、`return {…}`） |
+| `tests/errors/loc.c` | 诊断位置：`sizeof(type)` / `_Alignof(type)` 整组回滚之后，头文件里的声明仍然报在头文件自己的那一行 |
 | `tests/abi/tuple.c` + `tests/abi/tuple_plain.c` | 元组与等价 struct 的 ABI 互通（两个 TU 分别用 `-std=c6` 和纯 C 编译后链接） |
 | `tests/abi/method.c` + `tests/abi/method_plain.c` | 方法改名的 ABI 互通：纯 C 一侧按原名调用 c6 方法（弱别名）、c6 一侧普通调用纯 C 函数 |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
