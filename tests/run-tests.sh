@@ -21,6 +21,10 @@
 #   tests/abi/*.c     ABI 兼容；每个文件用 -std=c6 编译，同名的 _plain.c 用
 #                     纯 C（不带 -std=c6）编译，两个目标文件链接后运行，
 #                     比对 `// EXIT <n>` 声明的退出码。
+#   tests/c99/*.c     C99 输出后端；每个文件先用 tcc/c99-tcc -c99 生成 C
+#                     源码，再用 gcc -std=c99 编译并运行，比对
+#                     `// EXIT <n>`（默认 0）；带 `// OUTPUT <文本>` 时
+#                     还要求 stdout 含该文本。
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -70,6 +74,9 @@ if [ "${1:-}" = "--list" ]; then
     for f in "$ROOT"/tests/abi/*.c; do
         case $f in *_plain.c) continue ;; esac
         [ -e "$f" ] && echo "abi/$(basename "$f" .c)"
+    done
+    for f in "$ROOT"/tests/c99/*.c; do
+        [ -e "$f" ] && echo "c99/$(basename "$f" .c)"
     done
     exit 0
 fi
@@ -213,6 +220,51 @@ for src in "$ROOT"/tests/abi/*.c; do
         note_pass "$name: 退出码 $got"
     else
         fail "$name" "退出码 $got，期望 $want"
+    fi
+done
+
+# ---- 5. C99 输出后端：生成 C 源码，系统 C 编译器编译后运行 ----
+C99TCC=${C99TCC:-$ROOT/tcc/c99-tcc}
+C99CC=${C99CC:-gcc}
+for src in "$ROOT"/tests/c99/*.c; do
+    [ -e "$src" ] || continue
+    base=$(basename "$src" .c)
+    name="c99/$base"
+    is_wanted "$name" || continue
+
+    if [ ! -x "$C99TCC" ]; then
+        fail "$name" "找不到 $C99TCC（先执行 make c99）"
+        continue
+    fi
+    if ! command -v "$C99CC" >/dev/null 2>&1; then
+        fail "$name" "找不到系统 C 编译器 $C99CC"
+        continue
+    fi
+
+    want=$(sed -n 's,^// *EXIT *\([0-9][0-9]*\)$,\1,p' "$src" | head -n 1)
+    [ -n "$want" ] || want=0
+    wantout=$(sed -n 's,^// *OUTPUT *\(.*\)$,\1,p' "$src" | head -n 1)
+
+    csrc="$TMP/c99-$base.c"
+    if ! $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS -o "$csrc" "$src" \
+            2>"$TMP/err" >/dev/null; then
+        fail "$name" "c99-tcc 生成 C 失败:$(cat "$TMP/err")"
+        continue
+    fi
+    if ! $C99CC -std=c99 -pedantic -Wall -Wextra -Werror -pthread \
+            -o "$TMP/c99-$base.bin" "$csrc" 2>"$TMP/err" >/dev/null; then
+        fail "$name" "$C99CC 编译生成的 C 失败:$(cat "$TMP/err")"
+        continue
+    fi
+
+    out=$("$TMP/c99-$base.bin" 2>"$TMP/err")
+    got=$?
+    if [ "$got" != "$want" ]; then
+        fail "$name" "退出码 $got，期望 $want" "$(cat "$TMP/err")"
+    elif [ -n "$wantout" ] && ! printf '%s\n' "$out" | grep -qF -- "$wantout"; then
+        fail "$name" "输出里没有 '$wantout'" "$out"
+    else
+        note_pass "$name: 退出码 $got"
     fi
 done
 

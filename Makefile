@@ -8,6 +8,7 @@
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量
 #   make c99         构建 C99 输出后端 tcc/c99-tcc（产出可移植 C 源码）
+#   make c99test     跑 tests/c99/：c99-tcc 生成 C 源码，再用 gcc 编译运行
 #   make clean       清理 tcc/ 的构建产物
 #   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
 #
@@ -21,7 +22,7 @@ EXT      := EXTRA-DEFS=-DC6_EXT
 MODE     := $(TCC_DIR)/.c6-mode
 
 .PHONY: all bootstrap build build-plain test test-plain test-all selftest \
-        clean distclean help check-tcc mode-ext mode-plain c99
+        clean distclean help check-tcc mode-ext mode-plain c99 c99test
 
 all: build
 
@@ -64,7 +65,9 @@ test-plain: build-plain
 # tests/：c6 的全部测试
 #   tests/*.c          用 -test 跑里面的 test 块（同名 tests/tu/*.c 作为第二 TU）
 #   tests/errors/*.c   编译期诊断，见 tests/run-tests.sh
+#   tests/c99/*.c      C99 输出后端：先生成 C 源码，再用 gcc 编译运行
 selftest: build
+	$(MAKE) c99
 	./$(SELFTEST)
 
 test-all: selftest test
@@ -72,6 +75,12 @@ test-all: selftest test
 # C99 输出后端：单源构建的 tcc/c99-tcc（自带 -DC6_EXT），只产出 C 源码。
 c99: bootstrap
 	$(MAKE) -C $(TCC_DIR) c99-tcc
+
+# C99 输出后端的端到端测试：c99-tcc 生成 C 源码，系统 gcc 编译后运行。
+# 先 build 再 c99：切换构建模式会 make clean，连 c99-tcc 一起删掉。
+c99test: build
+	$(MAKE) c99
+	./$(SELFTEST) c99
 
 clean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true

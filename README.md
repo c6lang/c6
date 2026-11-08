@@ -947,6 +947,14 @@ front-end and writes **portable C99 source** instead of machine code.
     tcc/c99-tcc -c99 -B tcc -o out.c prog.c  # prog.c -> out.c
     cc -std=c99 -o prog out.c && ./prog      # compile the result with any C compiler
 
+    make c99test                             # tests/c99/*.c -> C source -> gcc -> run
+
+`make c99test` is the end-to-end regression for this back-end, and it is part
+of `make selftest`: each `tests/c99/*.c` is compiled by `tcc/c99-tcc` into C,
+then built with `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread` and
+run.  `C99CC=clang make c99test` uses another host compiler.  `tests/c99/c99test.c`
+exercises plain C and all the c6 features listed below in one program.
+
 `-c99` selects the output back-end; it is not a language-standard flag, and
 the language being compiled stays C.  In the `c99-tcc` build it is also the
 default action, because that build has no machine-code generator: a plain
