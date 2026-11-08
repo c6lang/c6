@@ -8,7 +8,7 @@
  */
 #include <stdio.h>
 
-struct Node { int v; @Node next; };
+struct Node { int v; own @Node next; };
 
 /* 一个结构体里放各种种类的托管字段 */
 struct Holder {

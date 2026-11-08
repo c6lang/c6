@@ -1336,6 +1336,14 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_gc_release(void **slot, int mode)
         __c99_gc_drop(__c99_gc_hdr(p));
 }
 
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_move(void **slot)
+{
+    void *p = *slot;
+
+    *slot = 0;
+    return p;
+}
+
 C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_incref(void *p)
 {
     if (p)

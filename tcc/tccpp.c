@@ -3934,6 +3934,7 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "void *__c6_gc_store(void **slot, void *nv, int mode);\n"
           "void *__c6_gc_own_store(void **slot, void *nv, int mode);\n"
           "void __c6_gc_release(void **slot, int mode);\n"
+          "void *__c6_gc_move(void **slot);\n"
           "void *__c6_gc_incref(void *p);\n"
           "void *__c6_gc_drop(void *p);\n"
           "void *__c6_gc_weak_store(void **dst, void **weak_slot, int mode);\n"

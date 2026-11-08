@@ -1413,6 +1413,17 @@ void __c6_gc_release(void **slot, int mode)
         c6_gc_drop(c6_gc_hdr(p));
 }
 
+/* 'move(p)': take the reference out of SLOT and hand it over.  Nothing is
+   released -- the value keeps the one reference it had -- and the slot is
+   emptied so its scope exit finds nothing to release. */
+void *__c6_gc_move(void **slot)
+{
+    void *p = *slot;
+
+    *slot = 0;
+    return p;
+}
+
 /* drop one reference to a bare pointer: what a discarded 'new T' needs.
    Returns the empty pointer so that the generated code has a value to pop. */
 void *__c6_gc_drop(void *p)

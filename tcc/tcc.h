@@ -843,7 +843,9 @@ typedef struct C6GcField {
     int kind;         /* C6_GCK_* */
     int count;        /* array length, 1 for a scalar */
     int stride;       /* element stride */
-    int sub_tag;      /* struct tag for C6_GCK_EMBED / pointed-to struct */
+    int sub_tag;      /* struct tag for C6_GCK_EMBED */
+    int to_tag;       /* struct tag this field points at (cycle graph) */
+    int name_tok;     /* the field's name, for the cycle diagnostic */
 } C6GcField;
 
 /* one struct type known to the GC */

@@ -353,6 +353,8 @@ static int c6_gc_no_hook;
 static int c6_gc_store_hook(void);
 static int c6_gc_new_lead(void);
 static void c6_gc_new_expr(void);
+static int c6_gc_move_lead(void);
+static void c6_gc_move_expr(void);
 static void c6_gc_return_hook(void);
 static void c6_gc_discard_hook(void);
 static void c6_gc_site(int off, CType *type);
@@ -6557,6 +6559,10 @@ ST_FUNC void unary(void)
 #ifdef C6_EXT
     if (c6_gc_new_lead()) {     /* 'new T' / 'new T[n]' */
         c6_gc_new_expr();
+        return;
+    }
+    if (c6_gc_move_lead()) {    /* 'move(p)' */
+        c6_gc_move_expr();
         return;
     }
 #endif
@@ -14712,12 +14718,105 @@ static void c6_gc_emit_desc(C6GcType *gt)
     c6_decl_tokens(ts);
 }
 
+/* ---- static cycle detection ---------------------------------------- */
+/* A strong reference graph with a cycle can never be freed by counting: the
+   objects keep each other alive.  It is rejected at compile time, with the
+   path that closes the loop, and the escape hatches are 'weak' (does not
+   keep the target alive) and 'own' (exclusive, freed down the chain). */
+
+#define C6_GC_PATH_MAX 32
+static C6GcType *c6_gc_cycle_path[C6_GC_PATH_MAX];
+static int c6_gc_cycle_via[C6_GC_PATH_MAX];   /* the field used to get there */
+
+static void c6_gc_cycle_report(int from, int depth);
+
+/* 0 = no cycle found, 1 = a cycle was reported (compilation stops there) */
+static int c6_gc_cycle_dfs(C6GcType *gt, int depth)
+{
+    int i;
+
+    if (gt->mark == 2)
+        return 0;
+    if (gt->mark == 1) {
+        /* back edge: the path from GT to itself */
+        c6_gc_cycle_report(gt->tag, depth);
+        return 1;
+    }
+    if (depth >= C6_GC_PATH_MAX) {
+        /* a chain longer than the buffer: report it as a whole */
+        c6_gc_cycle_report(gt->tag, depth);
+        return 1;
+    }
+    gt->mark = 1;
+    c6_gc_cycle_path[depth] = gt;
+    for (i = 0; i < gt->nfields; i++) {
+        C6GcField *f = &gt->fields[i];
+        C6GcType *to;
+
+        if (!f->to_tag)
+            continue;               /* 'weak' and 'own' are not edges */
+        to = c6_gc_type_find(f->to_tag);
+        if (!to || !to->nfields)
+            continue;
+        c6_gc_cycle_via[depth] = f->name_tok;
+        if (c6_gc_cycle_dfs(to, depth + 1))
+            return 1;
+    }
+    gt->mark = 2;
+    return 0;
+}
+
+/* 'reference cycle: A -> B -> A; break it with 'weak' or 'own'' */
+static void c6_gc_cycle_report(int from, int depth)
+{
+    char buf[512];
+    int i, start = 0, len = 0;
+
+    if (depth > C6_GC_PATH_MAX)
+        depth = C6_GC_PATH_MAX;
+    /* print from the first occurrence of the type that closes the loop */
+    for (i = 0; i < depth; i++)
+        if (c6_gc_cycle_path[i]->tag == from) {
+            start = i;
+            break;
+        }
+    buf[0] = 0;
+    for (i = start; i < depth; i++) {
+        len += snprintf(buf + len, sizeof buf - len, "%s -%s-> ",
+                        get_tok_str(c6_gc_cycle_path[i]->tag, NULL),
+                        c6_gc_cycle_via[i]
+                            ? get_tok_str(c6_gc_cycle_via[i], NULL) : "?");
+        if (len >= (int)sizeof buf - 8)
+            break;
+    }
+    snprintf(buf + len, sizeof buf - len, "%s", get_tok_str(from, NULL));
+    {
+        C6GcType *gt = c6_gc_cycle_path[start];
+
+        tcc_error("reference cycle: %s; break it with 'weak' or 'own' "
+                  "(type '%s' at %s:%d)", buf, get_tok_str(gt->tag, NULL),
+                  gt->src_file ? gt->src_file : "?", gt->src_line);
+    }
+}
+
+static void c6_gc_cycle_check(void)
+{
+    int i;
+
+    for (i = 0; i < tcc_state->c6_nb_gc_types; i++) {
+        C6GcType *gt = tcc_state->c6_gc_types[i];
+        if (gt && gt->nfields && gt->mark != 2)
+            c6_gc_cycle_dfs(gt, 0);
+    }
+}
+
 /* emit the descriptors of the unit: once the parser has seen every struct,
    every 'drop' method and every 'static inline' body */
 static void c6_gc_flush_descs(void)
 {
     int i;
 
+    c6_gc_cycle_check();
     for (i = 0; i < tcc_state->c6_nb_gc_types; i++) {
         C6GcType *gt = tcc_state->c6_gc_types[i];
         if (gt && (gt->declared || gt->nfields || gt->drop_tok))
@@ -14842,6 +14941,19 @@ static void c6_gc_collect(CType *type, int is_union)
         fields[n].count = count;
         fields[n].stride = stride;
         fields[n].sub_tag = sub;
+        /* the graph edge: a strong reference points at its pointee, an
+           embedded struct is part of this object (weak/own own neither) */
+        fields[n].name_tok = f->v & ~SYM_FIELD;
+        if (kind == C6_GCK_EMBED) {
+            fields[n].to_tag = sub;
+        } else if (kind == C6_GCK_STRONG
+                   && (elem.t & VT_BTYPE) == VT_PTR && elem.ref
+                   && (elem.ref->type.t & VT_BTYPE) == VT_STRUCT
+                   && elem.ref->type.ref)
+            /* the pointee's struct tag */
+            fields[n].to_tag = elem.ref->type.ref->v & ~SYM_STRUCT;
+        else
+            fields[n].to_tag = 0;
         n++;
     }
     if (!n) {
@@ -15110,6 +15222,54 @@ static void c6_gc_new_expr(void)
     vtop->type = type;
     vtop->gc_state = C6_GC_FRESH;
     vtop->gc_atomic = (flags & C6_GCM_ATOMIC) != 0;
+}
+
+/* is the current token a 'move' call? */
+static int c6_gc_move_lead(void)
+{
+    int save, r = 0;
+
+    if (!tcc_state->c6_ext || tok < TOK_IDENT)
+        return 0;
+    if (c6_soft_kw_shadowed(tok) || strcmp(get_tok_str(tok, NULL), "move"))
+        return 0;
+    save = tok;
+    next();
+    if (tok == '(')
+        r = 1;
+    unget_tok(save);
+    return r;
+}
+
+/* 'move(p)': hand over the reference held in the slot P (design §3.4).  The
+   slot is emptied without a release, so the value keeps exactly the one
+   reference it had and the scope exit has nothing left to do.  This is what
+   makes 'own' usable: an owned chain is built from 'new' or from 'move'. */
+static void c6_gc_move_expr(void)
+{
+    SValue slot;
+    CType st;
+
+    next();                             /* 'move' */
+    skip('(');
+    unary();
+    if (!c6_is_managed(&vtop->type) || !(vtop->r & VT_LVAL)) {
+        char b[160];
+        type_to_str(b, sizeof b, &vtop->type, NULL);
+        tcc_error("'move' needs a managed reference held in a slot, not "
+                  "a '%s'", b);
+    }
+    st = vtop->type;
+    slot = *vtop;
+    vpop();
+    c6_rt_begin("__c6_gc_move");
+    vpushv(&slot);
+    gaddrof();                          /* the address of the slot */
+    c6_rt_end("__c6_gc_move", 1);
+    vtop->type = st;
+    vtop->gc_state = C6_GC_FRESH;       /* the one reference moved with it */
+    vtop->gc_atomic = (c6_type_gq(&st) & C6_GQ_SHARED) != 0;
+    skip(')');
 }
 
 /* Frame slots that hold fresh call arguments until the call has returned.

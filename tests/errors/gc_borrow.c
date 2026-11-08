@@ -9,6 +9,8 @@
  *   - 'go' 起的是另一个线程，跨线程只能传 'shared @T'（E-GC10）；
  *   - 'async' 的引用参数/返回值会被拷进任务，同样必须 'shared'（E-GC10）。
  */
+#include <unistd.h>
+
 struct Node { int v; };
 
 // EXPECT borrow_param: error: '@struct Node' is a borrow: it owns nothing, so it cannot be reassigned
@@ -107,8 +109,10 @@ int main(void)
     go worker(q);
     {
         int i = 0;
-        for (i = 0; i < 20000 && __c6_gc_refcount(q) > 1; i++)
-            ;
+        while (i < 20000 && __c6_gc_refcount(q) > 1) {
+            usleep(1000);
+            i++;
+        }
         if (__c6_gc_refcount(q) != 1)
             return 3;
     }

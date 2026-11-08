@@ -31,7 +31,7 @@
 | P3 ✅ | `weak`（含禁 async） | P2 | 帧搬动只能探测，不能 trap |
 | P4 ✅ | 析构 `drop` 方法 | P3 | 全局根不能用 `atexit` |
 | P5 ✅ | `shared` + 跨帧/跨线程转移 | P2 | 任务 slot 的归还点在 `__c6_co_destroy` |
-| P6 | 静态环检测（硬错误）+ 链接期 | P2/P3 | `own` 语义、跨 TU 段 |
+| P6 ✅ | 静态环检测（硬错误） | P2/P3 | 链接期跨 TU 检查没做 |
 | P7 | async/go 集成与预算化 drain | P1/P5 | `__c6_co_abort` 回卷 |
 | P8 | 文档与全量回归 | 全部 | — |
 
@@ -333,26 +333,47 @@
 
 ---
 
-## P6 静态环检测（硬错误）
+## P6 ✅ 静态环检测（硬错误）
+
+结果：类型图上有环就在编译期报错，带字段名和类型的定义位置
+（`tests/errors/gc_cycle.c` 4 条：自环/互环/数组/按值嵌入）；`weak` 边和
+`own` 边不算边，所以「父→子强、子→父弱」和无环互递归都照过。`own` 的
+独占链/子树可以建起来并逐个释放（`tests/gc_own.c` 4 个块），`move(p)` 是
+新增的内建表达式。验收：`make selftest` 51 通过、
+`BACKEND=c99 tests/run-tests.sh` 52 通过、`make test-plain` 绿。
 
 改动点：
 
-- `own @T`：独占字段/局部的存储与递归释放；`own` 值共享报错（E-GC13）；
-- 类型图：节点 = 结构体，边 = STRONG 字段（含数组、EMBED）；
-  `weak`/`own` 不建边；
-- 单 TU 检查：`c6_gc_flush()` 里 DFS，带 `file:line` 路径；
-  `tcc_error_noabort()` 列全部环后终止；
-- 嵌入字段优先的拓扑序（描述符发射顺序）；
-- 链接期检查：每 TU 发 `.c6.gcgraph` 段（`{from_hash,to_hash,kind}`，
-  tag 名哈希），`tcc_output_file()` 与 `-run` 的内存链接阶段合并后跑 DFS；
-- 文档：`-c99` 路径只有单 TU 检查。
+- 类型图：节点 = 结构体，边 = 强引用字段（含 `@B f[N]` 数组、按值嵌入的
+  结构体）；`weak`/`own` 不建边（`c6_gc_collect()` 记 `C6GcField.to_tag`）；
+- 检查点：TU 末尾 `c6_gc_flush_descs()` 里三色 DFS（`mark` 0/1/2），命中回边
+  报 E-GC1 并终止；
+- `move(p)`：`__c6_gc_move(&p)` 返回指针、把槽清零、**不**释放，结果标 FRESH；
+  这是 `own` 链/子树「先建后接」的唯一写法；
+- `own` 的存储规则照旧：只收 FRESH 或空值（E-GC13），共享就报错。
+
+落地状态（与计划的差异）：
+
+- **跨 TU 的链接期检查没做**（`.c6.gcgraph` 段 + 链接期 DFS）：单 TU 只看得到
+  本单元定义完整的结构体，`@B` 只有前向声明时这条边不给结论。所以“A 在 TU1、
+  B 在 TU2、互相强引用”目前漏报 —— 记在 §17 和 P8 的待办里；
+- **只报第一条环**：`tcc_error_noabort()` 列全部的写法没做；
+- **`own` 值不能从别的槽直接接**（只能 `new` 或 `move`）：`parent->next = kid`
+  会被拒。这是对的（`own` 不计数，直接接会让两个所有者指向同一对象），
+  但意味着**必须**有 `move`，所以 `move` 从“计划里的语法糖”变成 P6 的必做项；
+- **`tests/gc_field.c` 的 `struct Node` 改成 `own @Node next`**：环检测一上，
+  原来的 `@Node next` 自环就编译不过了 —— 那个测试本来就是建一条链，
+  改成独占链语义不变（迭代释放的断言仍然过）；
+- **嵌入环要前向声明**：`struct Wrap { struct Emb e; };` 与
+  `struct Emb { @Wrap w; };` 互相引用时必须先 `struct Wrap;`，否则解析就失败
+  （和 C 一样，不是环检测的问题）。
 
 测试：
 
-- `tests/errors/gc_cycle_mutual.c`、`gc_cycle_self.c`、`gc_cycle_array.c`、
-  `gc_cycle_embed.c`、`gc_cycle_cross_tu.c`（第二个 TU 用 `tests/tu/` 约定）；
-- `tests/gc_own.c`：`own` 链/树的建与释放（`live()` 归零）、`own` 共享报错；
-- 正例：`weak` 父指针、`own` 双向链、DAG（无环的互递归类型）不报错。
+- `tests/errors/gc_cycle.c`：自环、互环、数组自环、按值嵌入环；
+- `tests/gc_own.c`：`new` 直接接链、`move` 接子树、`move` 后源槽不再释放、
+  析构在独占链上逐个跑；
+- 正例：`weak` 反向引用（要先升级才能解引用）、`own` 子树、无环互递归。
 
 验收：同 P1。
 

@@ -171,6 +171,12 @@ struct __c6_gc_desc {
 `own @T` 是**独占**所有权，不维护计数：
 
 - 赋值 `f = new T` 或 `f = move(other)` 时，先释放 `f` 原来的整条链，再接管新值；
+
+**落地（P6）**：`move(p)` 是内建的表达式，读作「把 `p` 槽里的那一份交出来」：
+生成 `__c6_gc_move(&p)`（返回指针并把槽清零、**不**释放），结果标记成 FRESH，
+所以能存进 `own @T` 或任何托管槽；`p` 的槽变空，作用域退出时无事可做。
+它同时对 `@T` 局部有效（等价于「把计数转走」），这是「先建子树、再接到父节点」
+的唯一写法 —— 直接写 `parent->next = kid;` 会被拒（`own` 只收 FRESH，E-GC13）。
 - 持有者死亡时递归释放 `own` 字段（迭代实现，不用递归栈）；
 - `own` 边**不进入引用计数的类型图**（它不产生计数环），因此不参与 §8 的环检测；
 - `own` 值不能共享：赋值源必须是 FRESH 或显式 `move()`，否则报错。
@@ -404,14 +410,14 @@ struct Node { @Node next; weak @Node prev; };  /* ✓ 双向链 */
 
 ### 8.2 检查点
 
-1. **单 TU**：TU 末尾（`c6_gc_flush()`，挂在 `tcc/tccgen.c:658` 起的
+1. **单 TU（已实现）**：TU 末尾（`c6_gc_flush()`，挂在 `tcc/tccgen.c:658` 起的
    `for(;;){ gen_inline_functions(); if (!c6_emit_auto_impls()) break; }` 的
    fixpoint 循环里，保证 `static inline` 体里出现的 `new` 也被覆盖）。
    诊断为错误，带完整路径与 `file:line`。
-2. **跨 TU**：每个 TU 把边写进段 `.c6.gcgraph`（记录 `{from_hash, to_hash, kind}`，
-   用 mangled tag 名的字符串哈希），tcc 自己就是链接器，在
-   `tcc_output_file()` / `-run` 的内存链接阶段合并后跑一次 DFS。
-   这条堵住“A 在 TU1、B 在 TU2”的漏报。
+2. **跨 TU（未实现，见 §17）**：计划是每个 TU 把边写进段 `.c6.gcgraph`
+   （`{from_hash, to_hash, kind}`，用 tag 名的字符串哈希），tcc 自己就是链接器，
+   在 `tcc_output_file()` / `-run` 的内存链接阶段合并后跑一次 DFS。P6 只做了
+   单 TU：跨 TU 的环目前**漏报**。
 3. **不完整类型**：TU 内 `@B` 而 `B` 只有前向声明时，该边只记录不判定；
    由链接期给出结论（若定义始终没出现，链接期报“环/未定义”）。
 
@@ -423,7 +429,19 @@ error: reference cycle: struct A -> B -> A
        break it with 'weak' (a back-reference) or 'own' (an exclusively owned chain)
 ```
 
-多环报告：用 `tcc_error_noabort()`（`tcc/tcc.h:1336`）把发现的环全部列出，再终止。
+**落地（P6）**：单 TU 的 DFS 在 `c6_gc_flush_descs()` 里跑（`tcc/tccgen.c`），
+`mark` 三色（0 未访问 / 1 在栈上 / 2 完成），命中回边就用 `tcc_error` 报出
+一条环并终止 —— 只报第一条（`tcc_error_noabort` 列全部的写法没做，见 §17）。
+实际文案带字段名与类型的定义位置：
+
+```
+error: reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own'
+       (type 'A' at a.c:3)
+```
+
+字段名与类型名都来自 `C6GcField.name_tok` / `.to_tag`（边在
+`c6_gc_collect()` 里记录，`to_tag` 只在目标结构体完整时才解析，所以前向
+声明的边不会误报）。
 
 ### 8.3 误报面
 
@@ -679,7 +697,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 
 | 编号 | 场景 | 级别 | 文案要点 |
 |---|---|---|---|
-| E-GC1 | 环（≥2 节点或自环） | error | `reference cycle: A -> B -> A; break it with 'weak' or 'own'` |
+| E-GC1 | 环（≥2 节点或自环） | error | `reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own' (type 'A' at a.c:3)` |
 | E-GC2 | `weak` 出现在 async 函数 | error | `'weak' cannot be declared in an async function ...` |
 | E-GC3 | 保存借出的托管指针 | error | `storing a borrowed reference keeps it alive without counting` |
 | E-GC4 | FRESH 未消费 / 重复消费 | error | `a fresh reference must be stored exactly once` |
@@ -700,6 +718,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | E-GC13 | `own` 值被共享 | error | `an 'own' field takes ownership: assign a fresh value or 'move(...)'` |
 | E-GC14 | 给借用的引用赋值 | error | `'%s' is a borrow: it owns nothing, so it cannot be reassigned (copy it into an owned local first)` |
 | E-GC15 | `shared @T p = new T` | error | `a 'shared' slot needs an object with an atomic count: create it with 'new shared T', not 'new T'` |
+| E-GC16 | `move(x)` 作用在非托管/非槽上 | error | `'move' needs a managed reference held in a slot, not a '%s'` |
 
 ---
 
@@ -728,4 +747,11 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 
 ## 17. 未决问题
 
-见 [gc-todo.md](gc-todo.md) 的 D1–D6。
+见 [gc-todo.md](gc-todo.md) 的 D1–D6。此外 P6 之后仍开着三件：
+
+1. **链接期跨 TU 环检测**（§8.2 第 2 条）没做：`@B` 定义在另一个 TU 时，
+   单 TU 只记录边、不给结论，所以「A 在 TU1、B 在 TU2、互相强引用」会漏报。
+   要补的话就是 `.c6.gcgraph` 段 + 链接期 DFS；
+2. **只报第一条环**：`tcc_error_noabort` 列全部的写法没做，第一个环就终止；
+3. **`struct Node c6_graph` 豁免**（§8.4 / D2）没做：共享边的通用图目前只能
+   写成 `own` 树或 `weak` 边。
