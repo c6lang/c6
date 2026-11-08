@@ -4,17 +4,24 @@
 #   tests/run-tests.sh                 跑全部
 #   tests/run-tests.sh defer err       只跑这几个（按文件名，可写 errors/xxx）
 #   tests/run-tests.sh --list          列出会跑的文件
+#   BACKEND=c99 tests/run-tests.sh     同一批用例改走 C99 输出后端
 #
 # 环境变量：
 #   TCC       编译器路径（默认 <仓库>/tcc/tcc）
 #   TCCFLAGS  追加给编译器的参数
+#   BACKEND   native（默认）用 tcc/tcc 直接编译运行；c99 先用
+#             tcc/c99-tcc -c99 生成 C 源码，再用系统 C 编译器编译运行。
+#             两种模式跑完全相同的测试文件和断言。
+#   C99TCC    C99 后端编译器（默认 <仓库>/tcc/c99-tcc）
+#   C99CC     编译生成代码的系统 C 编译器（默认 gcc）
 #
-# 两类测试：
+# 测试分组：
 #   tests/*.c         用 -test 跑里面的 test 块；若存在同名的 tests/tu/<name>.c，
 #                     会一起编译，作为第二个翻译单元。
 #   tests/errors/*.c  编译期诊断；每个 `// EXPECT <片段>: <诊断>` 注释对应一次
 #                     -D<片段> 编译，要求 stderr 含该诊断；不带 -D 时该文件
-#                     必须能编译并运行通过。
+#                     必须能编译并运行通过。c99 模式下优先使用
+#                     `// EXPECT-C99 <片段>: <诊断>`，没有时才回退到 EXPECT。
 #   tests/exit/*.c    退出码；`// EXIT <n>` 注释声明期望的进程退出码，编译成
 #                     可执行文件后运行，比对退出码（main 的返回值必须穿过
 #                     c6 的清理链）。
@@ -31,10 +38,33 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TCC=${TCC:-$ROOT/tcc/tcc}
 TCCFLAGS=${TCCFLAGS:-}
 BASE="-B $ROOT/tcc -std=c6"
+BACKEND=${BACKEND:-native}
+C99TCC=${C99TCC:-$ROOT/tcc/c99-tcc}
+C99CC=${C99CC:-gcc}
+C99FLAGS="-std=c99 -pedantic -Wall -Wextra -Werror -pthread"
 
-if [ ! -x "$TCC" ]; then
+case $BACKEND in
+native) ;;
+c99) ;;
+*)
+    echo "run-tests: 未知的 BACKEND='$BACKEND'（native 或 c99）" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$BACKEND" = native ] && [ ! -x "$TCC" ]; then
     echo "run-tests: 找不到 $TCC，先执行 'make build'" >&2
     exit 1
+fi
+if [ "$BACKEND" = c99 ]; then
+    if [ ! -x "$C99TCC" ]; then
+        echo "run-tests: 找不到 $C99TCC，先执行 'make c99'" >&2
+        exit 1
+    fi
+    if ! command -v "$C99CC" >/dev/null 2>&1; then
+        echo "run-tests: 找不到系统 C 编译器 $C99CC" >&2
+        exit 1
+    fi
 fi
 
 TMP=${TMPDIR:-/tmp}/c6-tests.$$
@@ -57,6 +87,37 @@ fail() {
 note_pass() {
     npass=$((npass + 1))
     echo "ok   $1"
+}
+
+# 用当前后端把源文件编成可执行文件，成功返回 0。
+# c99 模式一次调用可以带多个源文件：c99-tcc 把它们合成为一个 C 文件，
+# 这样多翻译单元的程序仍然只有一个合成的 main / 一份测试入口。
+build_exe() { # <可执行文件> <源文件>...
+    exe=$1
+    shift
+    if [ "$BACKEND" = c99 ]; then
+        $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+            -o "$exe.c" "$@" || return 1
+        $C99CC $C99FLAGS -o "$exe" "$exe.c"
+    else
+        $TCC $BASE $TCCFLAGS -o "$exe" "$@"
+    fi
+}
+
+# 用 -test 模式编译并运行 test 块（源文件里的 main 不执行）。
+# 两种后端都把测试报告打到 stdout，返回测试进程的退出码。
+build_test_exe() { # <可执行文件> <源文件>...
+    exe=$1
+    shift
+    if [ "$BACKEND" = c99 ]; then
+        # -test 先选运行模式，-c99 再把输出切回 C 源码
+        $C99TCC -test -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+            -o "$exe.c" "$@" || return 1
+        $C99CC $C99FLAGS -o "$exe" "$exe.c" || return 1
+        "$exe"
+    else
+        $TCC $BASE $TCCFLAGS -test "$@"
+    fi
 }
 
 # 用户点名要跑的测试（去掉 .c 后缀的纯名字），空表示全跑
@@ -98,13 +159,19 @@ is_wanted() {
 for src in "$ROOT"/tests/*.c; do
     name=$(basename "$src" .c)
     is_wanted "$name" || continue
-    args="$TCC $BASE $TCCFLAGS -test $src"
     tu="$ROOT/tests/tu/$name.c"
-    [ -e "$tu" ] && args="$args $tu"
-    if out=$($args 2>"$TMP/err") && echo "$out" | tail -n 1 | grep -q ', 0 failure(s)$'; then
+    out=
+    if [ -e "$tu" ]; then
+        set -- "$src" "$tu"
+    else
+        set -- "$src"
+    fi
+    if out=$(build_test_exe "$TMP/tests.bin" "$@" 2>"$TMP/err") \
+       && echo "$out" | tail -n 1 | grep -q ', 0 failure(s)$'; then
         note_pass "$name: $(echo "$out" | tail -n 1)"
     else
-        fail "$name" "$(cat "$TMP/err")" "$(echo "$out" | grep -E '^(FAIL|[0-9]+ test)')"
+        fail "$name" "$(cat "$TMP/err")" \
+             "$(echo "$out" | grep -E '^(FAIL|[0-9]+ test)')"
     fi
 done
 
@@ -116,6 +183,7 @@ for src in "$ROOT"/tests/errors/*.c; do
 
     # 期望表：片段名 <TAB> 诊断文本
     sed -n 's,^// *EXPECT *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect"
+    sed -n 's,^// *EXPECT-C99 *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect-c99"
     frags=$(cut -f1 "$TMP/expect" | awk '!seen[$0]++')
 
     ok=yes
@@ -123,14 +191,37 @@ for src in "$ROOT"/tests/errors/*.c; do
 
     # 2a. 每个片段都必须报出声明的全部诊断
     for frag in $frags; do
-        if $TCC $BASE $TCCFLAGS -D"$frag" -run "$src" \
-                2>"$TMP/err" >/dev/null; then
-            ok=no
-            detail="$detail
+        if [ "$BACKEND" = c99 ] \
+           && awk -F'\t' -v f="$frag" '$1 == f { found = 1 } END { exit !found }' \
+                  "$TMP/expect-c99"; then
+            expect_file="$TMP/expect-c99"
+        else
+            expect_file="$TMP/expect"
+        fi
+
+        if [ "$BACKEND" = c99 ]; then
+            if $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+                    -D"$frag" -o "$TMP/diag.c" "$src" \
+                    2>"$TMP/err" >/dev/null; then
+                # 生成成功不等于有错：没有机器码链接步骤的未解析引用，
+                # 要由系统 C 编译器在链接时才会报出来
+                if $C99CC $C99FLAGS -o "$TMP/diag.bin" "$TMP/diag.c" \
+                        2>>"$TMP/err" >/dev/null; then
+                    ok=no
+                    detail="$detail
 -D$frag: 没有报错"
+                fi
+            fi
+        else
+            if $TCC $BASE $TCCFLAGS -D"$frag" -run "$src" \
+                    2>"$TMP/err" >/dev/null; then
+                ok=no
+                detail="$detail
+-D$frag: 没有报错"
+            fi
         fi
         awk -F'\t' -v f="$frag" '$1 == f { print substr($0, length($1) + 2) }' \
-            "$TMP/expect" |
+            "$expect_file" |
         while IFS= read -r w; do
             [ -z "$w" ] && continue
             grep -qF -- "$w" "$TMP/err" || printf '%s\n' "-D$frag: 缺少诊断: $w"
@@ -143,7 +234,7 @@ $(cat "$TMP/missing")"
     done
 
     # 2b. 不带 -D 时必须能编译并运行通过
-    if ! out=$($TCC $BASE $TCCFLAGS -run "$src" 2>"$TMP/err"); then
+    if ! out=$(build_exe "$TMP/errors.bin" "$src" 2>"$TMP/err" && "$TMP/errors.bin" 2>>"$TMP/err"); then
         ok=no
         detail="$detail
 正常路径编译或运行失败:$(cat "$TMP/err")$out"
@@ -166,7 +257,7 @@ for src in "$ROOT"/tests/exit/*.c; do
         fail "$name" "缺少 '// EXIT <n>' 注释"
         continue
     fi
-    if ! $TCC $BASE $TCCFLAGS -o "$TMP/exit.bin" "$src" 2>"$TMP/err" >/dev/null; then
+    if ! build_exe "$TMP/exit.bin" "$src" 2>"$TMP/err" >/dev/null; then
         fail "$name" "$(cat "$TMP/err")"
         continue
     fi
@@ -191,27 +282,54 @@ for src in "$ROOT"/tests/abi/*.c; do
         fail "$name" "缺少 '// EXIT <n>' 注释"
         continue
     fi
-    if ! $TCC $BASE $TCCFLAGS -c "$src" -o "$TMP/abi-c6.o" 2>"$TMP/err" >/dev/null; then
-        fail "$name" "c6 侧编译失败:$(cat "$TMP/err")"
-        continue
-    fi
-    if [ -e "$plain" ]; then
-        # 纯 C 侧：故意不带 -std=c6
-        if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -c "$plain" -o "$TMP/abi-plain.o" \
-                2>"$TMP/err" >/dev/null; then
-            fail "$name" "纯 C 侧编译失败:$(cat "$TMP/err")"
+    if [ "$BACKEND" = c99 ]; then
+        if ! $C99TCC -c99 -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+                -o "$TMP/abi-c6.c" "$src" 2>"$TMP/err" >/dev/null; then
+            fail "$name" "c6 侧生成 C 失败:$(cat "$TMP/err")"
             continue
         fi
-        if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$TMP/abi.bin" \
-                "$TMP/abi-c6.o" "$TMP/abi-plain.o" 2>"$TMP/err" >/dev/null; then
-            fail "$name" "链接失败:$(cat "$TMP/err")"
-            continue
+        if [ -e "$plain" ]; then
+            # 纯 C 侧：故意不带 -std=c6
+            if ! $C99CC $C99FLAGS -c -o "$TMP/abi-plain.o" "$plain" \
+                    2>"$TMP/err" >/dev/null; then
+                fail "$name" "纯 C 侧编译失败:$(cat "$TMP/err")"
+                continue
+            fi
+            if ! $C99CC $C99FLAGS -o "$TMP/abi.bin" \
+                    "$TMP/abi-c6.c" "$TMP/abi-plain.o" 2>"$TMP/err" >/dev/null; then
+                fail "$name" "链接失败:$(cat "$TMP/err")"
+                continue
+            fi
+        else
+            if ! $C99CC $C99FLAGS -o "$TMP/abi.bin" "$TMP/abi-c6.c" \
+                    2>"$TMP/err" >/dev/null; then
+                fail "$name" "链接失败:$(cat "$TMP/err")"
+                continue
+            fi
         fi
     else
-        if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$TMP/abi.bin" "$TMP/abi-c6.o" \
-                2>"$TMP/err" >/dev/null; then
-            fail "$name" "链接失败:$(cat "$TMP/err")"
+        if ! $TCC $BASE $TCCFLAGS -c "$src" -o "$TMP/abi-c6.o" 2>"$TMP/err" >/dev/null; then
+            fail "$name" "c6 侧编译失败:$(cat "$TMP/err")"
             continue
+        fi
+        if [ -e "$plain" ]; then
+            # 纯 C 侧：故意不带 -std=c6
+            if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -c "$plain" -o "$TMP/abi-plain.o" \
+                    2>"$TMP/err" >/dev/null; then
+                fail "$name" "纯 C 侧编译失败:$(cat "$TMP/err")"
+                continue
+            fi
+            if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$TMP/abi.bin" \
+                    "$TMP/abi-c6.o" "$TMP/abi-plain.o" 2>"$TMP/err" >/dev/null; then
+                fail "$name" "链接失败:$(cat "$TMP/err")"
+                continue
+            fi
+        else
+            if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$TMP/abi.bin" "$TMP/abi-c6.o" \
+                    2>"$TMP/err" >/dev/null; then
+                fail "$name" "链接失败:$(cat "$TMP/err")"
+                continue
+            fi
         fi
     fi
     "$TMP/abi.bin" >/dev/null 2>"$TMP/err"
@@ -224,8 +342,6 @@ for src in "$ROOT"/tests/abi/*.c; do
 done
 
 # ---- 5. C99 输出后端：生成 C 源码，系统 C 编译器编译后运行 ----
-C99TCC=${C99TCC:-$ROOT/tcc/c99-tcc}
-C99CC=${C99CC:-gcc}
 for src in "$ROOT"/tests/c99/*.c; do
     [ -e "$src" ] || continue
     base=$(basename "$src" .c)
@@ -251,8 +367,8 @@ for src in "$ROOT"/tests/c99/*.c; do
         fail "$name" "c99-tcc 生成 C 失败:$(cat "$TMP/err")"
         continue
     fi
-    if ! $C99CC -std=c99 -pedantic -Wall -Wextra -Werror -pthread \
-            -o "$TMP/c99-$base.bin" "$csrc" 2>"$TMP/err" >/dev/null; then
+    if ! $C99CC $C99FLAGS -o "$TMP/c99-$base.bin" "$csrc" \
+            2>"$TMP/err" >/dev/null; then
         fail "$name" "$C99CC 编译生成的 C 失败:$(cat "$TMP/err")"
         continue
     fi

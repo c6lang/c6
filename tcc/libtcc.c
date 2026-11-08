@@ -1996,10 +1996,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             x = TCC_OUTPUT_OBJ;
         set_output_type:
             /* '-test' already selects TCC_OUTPUT_MEMORY, so the usual
-               '-run' afterwards is not worth a warning */
+               '-run' afterwards is not worth a warning; the C99 back-end
+               overrides it with '-c99' to write a generated test runner */
             if (s->output_type
 #ifdef C6_EXT
-                && !(s->c6_test_mode && x == TCC_OUTPUT_MEMORY)
+                && !(s->c6_test_mode
+                     && (x == TCC_OUTPUT_MEMORY || x == TCC_OUTPUT_C99))
 #endif
                 )
                 tcc_warning("-%s: overriding compiler action already specified", popt->name);
@@ -2070,9 +2072,15 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             return tcc_error_noabort("-run is not available in a cross compiler");
 #endif
 #ifdef TCC_IS_NATIVE
+        case TCC_OPTION_rstdin:
+            /* custom stdin for run_main */
+            s->run_stdin = optarg;
+            break;
+#endif
 #ifdef C6_EXT
         case TCC_OPTION_test:
-            /* run the 'test' blocks instead of main() */
+            /* run the 'test' blocks instead of main(); the C99 back-end
+               turns this into a generated test runner */
             s->c6_test_mode = 1;
             x = TCC_OUTPUT_MEMORY;
             goto set_output_type;
@@ -2085,11 +2093,6 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             if (*optarg == '=')
                 ++optarg;
             tcc_set_str(&s->c6_emit_header, optarg);
-            break;
-#endif
-        case TCC_OPTION_rstdin:
-            /* custom stdin for run_main */
-            s->run_stdin = optarg;
             break;
 #endif
         case TCC_OPTION_v:

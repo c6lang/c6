@@ -8,6 +8,7 @@
 // EXPECT test_go_outside: error: 'go' can only be used inside a function
 // EXPECT test_go_async: error: 'go' requires a plain function: 'a' is 'async'
 // EXPECT test_go_variadic: error: 'go' does not support variadic functions: 'vf'
+// EXPECT-C99 test_go_variadic: error: c99 output: defining variadic functions is not supported
 // EXPECT test_go_fallible: error: 'go' does not support fallible functions: 'ff'
 // EXPECT test_go_value: error: the operand of 'go' must be a call of a plain function
 // EXPECT test_go_funcptr: error: the operand of 'go' must be a call of a plain function

@@ -348,6 +348,14 @@ static int c99_struct_id(Sym *ref)
     size = type_size(&t, &align);
     if (size < 0)
         tcc_error("c99 output: incomplete struct/union type");
+    /* The generated C sees every struct/union as an opaque byte block, so
+       two of the same size are the same C type.  Sharing the id (instead of
+       keying only on the per-TU tag) keeps the same struct declared in two
+       translation units of one program compatible: separate tag numbers
+       from different units would otherwise produce conflicting C types. */
+    for (i = 0; i < c99_nstructs; i++)
+        if (c99_structs[i].size == size)
+            return c99_structs[i].id;
     if (c99_nstructs >= c99_structs_size) {
         c99_structs_size = c99_structs_size ? c99_structs_size * 2 : 16;
         c99_structs = tcc_realloc(c99_structs,
@@ -724,6 +732,17 @@ static void c99_add_decl(const char *name, const char *text)
     c99_decls = d;
 }
 
+/* with -test the native runner ignores main() and calls the 'test' blocks
+   instead; the C file does the same by renaming the user main and emitting
+   the test runner as the real entry point */
+static const char *c99_test_name(const char *name)
+{
+    if (tcc_state && tcc_state->c6_test_mode
+        && name && !strcmp(name, "main"))
+        return "__c99_orig_main";
+    return name;
+}
+
 static void c99_register_decl(Sym *fsym, CType *ftype)
 {
     CType *ret;
@@ -734,6 +753,7 @@ static void c99_register_decl(Sym *fsym, CType *ftype)
 
     if (!name || !*name)
         return;
+    name = c99_test_name(name);
     /* these are declared with their real prototypes in the file header */
     if (!strcmp(name, "memcpy") || !strcmp(name, "memmove")
         || !strcmp(name, "memset"))
@@ -1271,6 +1291,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     char tbuf[C99_TB], pbuf[C99_TB], sig[2048];
     int idx, off, size, align, n, np;
     const char *name = get_tok_str(func_sym->v, NULL);
+    const char *emit_name;
 
     if (ftype->ref->f.func_type == FUNC_ELLIPSIS)
         tcc_error("c99 output: defining variadic functions is not supported");
@@ -1279,6 +1300,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
        appears, e.g. the __c6_sp_* trampolines the 'go' statement emits after
        main: declare it up front so the generated C sees a prototype */
     c99_register_decl(func_sym, ftype);
+    emit_name = c99_test_name(name);
     int is_main = name && !strcmp(name, "main");
     int is_static = c99_is_static_fn(func_sym, name);
     int ret_struct = (ret->t & VT_BTYPE) == VT_STRUCT;
@@ -1288,7 +1310,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
         && c99_small_sret(ret, &sret_rt, &sret_align, &sret_regsize);
     int hidden_sret = ret_struct && !small_sret;
 
-    if (is_main)
+    if (is_main && !(tcc_state && tcc_state->c6_test_mode))
         c99_have_main = 1;
 
     c99_fn.len = 0;
@@ -1307,16 +1329,18 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 
     n = 0;
     if (is_static)
-        n += snprintf(sig + n, sizeof sig - n, "static ");
+        /* a test source may define a static helper that only one #ifdef
+           branch uses; the generated C must stay -Wall -Wextra clean */
+        n += snprintf(sig + n, sizeof sig - n, "static __c99_unused ");
     if (hidden_sret) {
-        n += snprintf(sig + n, sizeof sig - n, "void %s(void *__c99_ret", name);
+        n += snprintf(sig + n, sizeof sig - n, "void %s(void *__c99_ret", emit_name);
         np = 1;
     } else {
         if (small_sret)
             c99_type(tbuf, sizeof tbuf, &sret_rt);
         else
             c99_type(tbuf, sizeof tbuf, ret);
-        n += snprintf(sig + n, sizeof sig - n, "%s %s(", tbuf, name);
+        n += snprintf(sig + n, sizeof sig - n, "%s %s(", tbuf, emit_name);
         np = 0;
     }
     idx = 0;
@@ -1361,7 +1385,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
                    off, idx, size);
     }
 
-    if (is_main)
+    if (is_main && !(tcc_state && tcc_state->c6_test_mode))
         c99_printf("__c99_init();\n");
 }
 
@@ -1694,6 +1718,17 @@ static C99GSym *c99_gsym_at(int shndx, unsigned long off)
     return NULL;
 }
 
+/* is NAME defined by a global object emitted in this output file? */
+static int c99_gsym_defined(const char *name)
+{
+    int i;
+
+    for (i = 0; i < c99_ngsyms; i++)
+        if (!c99_gsyms[i].is_static && !strcmp(c99_gsyms[i].name, name))
+            return 1;
+    return 0;
+}
+
 /* tcc names anonymous data "L.3" and the like; those cannot be C identifiers */
 static int c99_is_c_ident(const char *s)
 {
@@ -1778,12 +1813,15 @@ static void c99_collect_globals(TCCState *s1)
     /* Two function-local statics may share a source name; C would reject two
        objects with the same identifier, so give every duplicate a private
        name.  Code that has an Elf symbol addresses those through the section
-       array, and __c99_init() uses cname for its patches. */
+       array, and __c99_init() uses cname for its patches.  A static object
+       that the generated code addresses by name (a vtable emitted at the end
+       of a unit, e.g.) must keep that name: the same vtable generated by two
+       units has the same contents, so merge the copies instead. */
     {
         int j;
         for (i = 0; i < c99_ngsyms; i++) {
             C99GSym *g = &c99_gsyms[i];
-            if (!g->is_static)
+            if (!g->is_static || g->by_name)
                 continue;
             for (j = 0; j < c99_ngsyms; j++)
                 if (j != i && c99_gsyms[j].is_static
@@ -1811,8 +1849,9 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
     }
     /* a file whose only entry points are 'test' blocks: emit a main that
        runs them, so the translated file is a complete program like the
-       native -test runner */
-    if (!c99_have_main && s1->c6_test_count > 0) {
+       native -test runner.  With -test the real main was renamed above and
+       the test runner replaces it even when the source defines one. */
+    if (s1->c6_test_mode || (!c99_have_main && s1->c6_test_count > 0)) {
         c99_have_main = 1;
         emit_test_main = 1;
         c99_rt_used = 1;
@@ -1883,6 +1922,18 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
         Section *s;
         if (g->is_static && !g->by_name)
             continue;
+        if (g->is_static) {
+            /* merged copies with the same name (see c99_collect_globals):
+               the C file can hold only one definition */
+            int j, dup = 0;
+            for (j = 0; j < i; j++)
+                if (c99_gsyms[j].is_static
+                    && c99_gsyms[j].size == g->size
+                    && !strcmp(c99_gsyms[j].cname, g->cname))
+                    dup = 1;
+            if (dup)
+                continue;
+        }
         s = s1->sections[g->shndx];
         unsigned long k, end;
         if (s->data_offset < (unsigned long)g->value) {
@@ -1902,8 +1953,34 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
         fprintf(f, "} };\n");
     }
 
-    for (d = c99_decls; d; d = d->next)
+    for (d = c99_decls; d; d = d->next) {
+        /* a name first seen through another unit's declaration is not an
+           external object once the defining unit's object is emitted here */
+        if (!strncmp(d->text, "extern unsigned char ", 21)
+            && c99_gsym_defined(d->name))
+            continue;
         fprintf(f, "%s\n", d->text);
+    }
+#ifdef C6_EXT
+    /* Methods are emitted under '<tag>_<name>'; the plain source name is a
+       weak alias, the way the native back-end's ELF symbols express it.
+       One C file can carry only one definition per name, so keep the first
+       alias (native code links the duplicates as weak symbols and keeps the
+       first one too). */
+    for (i = 0; i < s1->c6_nb_method_aliases; i++) {
+        C6MethodAlias *a = s1->c6_method_aliases[i];
+        int j, dup = 0;
+        for (j = 0; j < i; j++)
+            if (!strcmp(s1->c6_method_aliases[j]->plain, a->plain))
+                dup = 1;
+        if (dup)
+            continue;
+        fprintf(f, "#if defined(__GNUC__) || defined(__clang__)\n"
+                   "extern __typeof(%s) %s "
+                   "__attribute__((weak, alias(\"%s\")));\n"
+                   "#endif\n", a->target, a->plain, a->target);
+    }
+#endif
     if (need_init) {
         fprintf(f, "static int __c99_inited;\n");
         if (!c99_have_main) {
@@ -1921,12 +1998,16 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
     if (c99_rt_used)
         fwrite(c99_runtime, 1, sizeof c99_runtime - 1, f);
     if (emit_test_main) {
-        fprintf(f, "int main(void)\n{\n  int __c99_fail = 0;\n"
+        /* same report line as the native -test runner, so that the test
+           drivers can check both back-ends the same way */
+        fprintf(f, "extern int printf(const char *, ...);\n"
+                   "int main(void)\n{\n  int __c99_fail = 0;\n"
                    "  __c99_init();\n");
         for (i = 0; i < s1->c6_test_count; i++)
             fprintf(f, "  if (__tcc_test_%d()) __c99_fail = 1;\n", i);
         fprintf(f, "  __c6_th_join_all();\n"
-                   "  return __c99_fail ? 1 : 0;\n}\n");
+                   "  printf(\"%%d test(s), %%d failure(s)\\n\", %d, __c99_fail);\n"
+                   "  return __c99_fail ? 1 : 0;\n}\n", s1->c6_test_count);
     }
 
     if (!need_init) {

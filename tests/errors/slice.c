@@ -13,6 +13,7 @@ struct S;
 // EXPECT test_element_mismatch: error: cannot make a slice of 'char' from an array of 'int'
 // EXPECT test_pointer_source: error: cannot make a slice from a pointer; use '(T[:]){p, n}'
 // EXPECT test_vla_source: error: cannot slice a variable length array
+// EXPECT-C99 test_vla_source: error: c99 output: variable length arrays are not supported
 // EXPECT test_pointer_slice: error: cannot slice a pointer; use '(T[:]){p, n}'
 // EXPECT test_capacity: error: slice bounds have no capacity
 // EXPECT test_file_scope_array: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'

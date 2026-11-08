@@ -15,6 +15,8 @@ package math {
 // EXPECT test_unknown_member: error: 'math.nope' undeclared
 // EXPECT test_unknown_member_call: warning: implicit declaration of function 'math.nope'
 // EXPECT test_unknown_member_call: error: unresolved reference to 'math__nope'
+// EXPECT-C99 test_unknown_member_call: warning: implicit declaration of function 'math.nope'
+// EXPECT-C99 test_unknown_member_call: math__nope
 // EXPECT test_missing_member_name: error: identifier expected after '.'
 // EXPECT test_arrow_is_not_package_access: error: 'math' undeclared
 // EXPECT test_import_after_use: error: 'math' is not an imported package (use 'import math;')

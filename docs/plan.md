@@ -859,11 +859,14 @@ GCC/Clang 下运行时符号是 weak 的，多个 TU 共用同一份状态，没
 编译器退化为每个 TU 一份。`tests/*.c`、`tests/exit/*.c`、
 `tests/abi/tuple.c` 和 `examples/*.c` 均已通过。
 
-端到端回归放在 `tests/c99/*.c`：运行器先用 `c99-tcc -c99` 生成 C 源码，
-再用 `gcc -std=c99 -pedantic -Wall -Wextra -Werror` 编译并运行，比对
-`// EXIT` 退出码和可选的 `// OUTPUT` 输出。`make c99test` 只跑这一组，
-`make selftest` 会先构建 `c99-tcc` 再连带跑（`tests/c99/c99test.c` 用一份
-源码覆盖普通 C 和 c6 的全部特性）。
+端到端回归直接复用 selftest 的整套用例：`BACKEND=c99 ./tests/run-tests.sh`
+（即 `make c99test`）把 `tests/*.c`、`tests/errors/*.c`、`tests/exit/*.c`、
+`tests/abi/*.c` 和 `tests/c99/*.c` 都先用 `c99-tcc -c99` 生成 C 源码，再用
+`gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread` 编译并运行，断言与
+native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 C 输出后端
+才不同的诊断用 `// EXPECT-C99` 声明）。`make selftest` 先构建 `c99-tcc`，
+再用 native 编译器跑同一套用例（`tests/c99/c99test.c` 用一份源码覆盖普通 C
+和 c6 的全部特性）。
 
 限制（均显式报错，不会静默错编译）：变参函数**定义**、computed goto、
 VLA；非 POSIX 主机上运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
