@@ -2012,6 +2012,7 @@ static void gbound(void)
 
 /* we need to call __bound_ptr_add before we start to load function
    args into registers */
+#ifndef TCC_TARGET_C99
 ST_FUNC void gbound_args(int nb_args)
 {
     int i = 0, v = 0;
@@ -2047,6 +2048,7 @@ ST_FUNC void gbound_args(int nb_args)
 #endif
     }
 }
+#endif /* !TCC_TARGET_C99 */
 
 /* Add bounds for local symbols from S to E (via ->prev) */
 static void add_local_bounds(Sym *s, Sym *e)
@@ -8550,11 +8552,18 @@ static void c6_hdr_type(char *buf, int size, CType *type, const char *varstr)
             pstrcat(params, sizeof params, ", ...");
         if (!params[0])
             pstrcat(params, sizeof params, "void");
-        if (varstr && *varstr == '*')
-            snprintf(buf1, sizeof buf1, "(%s)(%s)", varstr, params);
-        else
-            snprintf(buf1, sizeof buf1, "%s(%s)", varstr ? varstr : "",
-                     params);
+        /* build the declarator piece by piece: pstrcat truncates safely,
+           while snprintf here would be reported as possibly truncating */
+        if (varstr && *varstr == '*') {
+            pstrcpy(buf1, sizeof buf1, "(");
+            pstrcat(buf1, sizeof buf1, varstr);
+            pstrcat(buf1, sizeof buf1, ")");
+        } else {
+            pstrcpy(buf1, sizeof buf1, varstr ? varstr : "");
+        }
+        pstrcat(buf1, sizeof buf1, "(");
+        pstrcat(buf1, sizeof buf1, params);
+        pstrcat(buf1, sizeof buf1, ")");
         c6_hdr_type(buf, size, &type->ref->type, buf1);
         return;
     }

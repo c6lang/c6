@@ -1655,7 +1655,10 @@ ST_FUNC void gfunc_call(int nb_args)
     Sym *fsym = callee->type.ref;
     Sym *ps;
     CType *ret;
-    char argbuf[8192], vbuf[C99_TB], tbuf[C99_TB], sig[C99_TB];
+    char argbuf[8192], vbuf[C99_TB], tbuf[C99_TB];
+    /* large enough for the indirect form:
+       "((tbuf)__c99_fp(vbuf))(argbuf)" */
+    char sig[sizeof argbuf + 2 * C99_TB + 32];
     int i, n = 0, is_helper = 0, is_indirect, ret_struct, have_proto, int_ret;
     int small_sret = 0;
     const char *cname = NULL;
@@ -1777,7 +1780,7 @@ ST_FUNC void gfunc_epilog(void)
     int frame = (-loc + (MAX_ALIGN - 1)) & -MAX_ALIGN;
     C99Buf out;
     int i, j, k;
-    char tmp[256], frm[32];
+    char tmp[C99_TB + 64], frm[32];
 
     memset(&out, 0, sizeof out);
     /* labels are resolved in jump order, not in code order */
