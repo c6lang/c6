@@ -484,6 +484,14 @@ typedef struct CType {
 #define C6_GC_FRESH  1  /* 'new ...': owned, must be consumed exactly once */
 #define C6_GC_OWNED  2  /* read out of a managed slot: a borrow until stored */
 
+/* c6: runtime store mode bits, mirrored by the '#define's tcc_predefs()
+   emits for compiled programs (docs/gc-design.md) */
+#define C6_GCM_FRESH  1  /* the value is a fresh reference: do not count it */
+#define C6_GCM_ATOMIC 2  /* the slot belongs to a 'shared @T' object */
+#define C6_GCM_WEAK   4  /* the slot is a 'weak @T' reference */
+#define C6_GCM_OWN    8  /* the slot is an 'own @T' reference */
+#define C6_GCM_INIT  16  /* the slot is uninitialized: do not read it */
+
 /* long double words on host(!) platform */
 #define LDOUBLE_WORDS ((sizeof(long double)+3)/4)
 

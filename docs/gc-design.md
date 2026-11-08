@@ -53,6 +53,32 @@ weak shared @T  跨线程的弱引用（弱槽失效也必须是原子/加锁的
 限定符是**软关键字**：按 `c6_soft_kw()`（`tcc/tccgen.c:13914`）的方式识别，
 被同名 typedef 遮蔽时退回普通标识符，和 `co`/`go`/`task` 一致。
 
+### 2.0 限定符存在哪里（P1 定稿，重要）
+
+`CType` 只有 1 个字节的余量（`unsigned char gq`），而 `CType` 在 tcc 里
+**到处按值复制**，还有大量 `CType t; t.t = ...;` 从不初始化 `gq` 的构造点。
+如果“是不是托管引用”只由 `gq` 一位决定，那么任何没被初始化的字节都可能
+凭空造出一个 `@T`：P1 实现期间它就真的让 `char[:]` 的 `data` 字段看起来
+像 `own shared @char`，并让整个 `slice` 测试段错。
+
+所以托管性质有**两份**，只有一份可信：
+
+| 位置 | 内容 | 谁写 | 可信 |
+|---|---|---|---|
+| `CType.gq` | 限定符（方便复制/打印的副本） | `parse_btype()` 的 `@` 分支 | ✗ 仅用作缓存 |
+| `type->ref->type.gq`（被指符号） | `C6_GQ_MANAGED \| 限定符` | 仅 `parse_btype()` / `new` | ✓ **唯一依据** |
+
+- `mk_pointer()` 与 `c6_global_pointer()` 建一个被指符号时，把它的
+  `type.gq` 显式清 0 —— 于是“普通指针”的被指符号永远不带托管位，
+  `sym_push()` 也只把**校验过的**副本（`c6_type_gq()`）写进符号。
+- 判定统一走 `c6_type_gq()` / `c6_is_managed()`：`(t & VT_BTYPE) == VT_PTR
+  && t->ref && (t->ref->type.gq & C6_GQ_MANAGED)`，垃圾字节无法伪造。
+- 想把一个托管类型“当成裸指针”处理（编译器内部的返回槽、临时槽、释放槽），
+  用 `c6_gc_plain()`：它 `mk_pointer()` 出一个全新的、标记为 0 的被指符号。
+  **不要再写 `t.gq = 0`** —— 那样副本清了、可信副本还在，`vstore()` 的钩子
+  照样会把它当托管槽（P1 踩过：`return p;` 的返回槽被当成普通赋值，
+  于是拿未初始化的旧值去 decref，堆当场烂掉）。
+
 ### 2.1 语义矩阵
 
 | 操作 \ 类型 | `@T` | `shared @T` | `weak @T` | `own @T` |
@@ -155,18 +181,35 @@ struct DNode { int v; own @Node next; weak @DNode prev; };  /* 双向链 */
 
 ```c
 void *__c6_gc_new(unsigned long size, unsigned long count,
-                  const struct __c6_gc_desc *d);      /* 清零；失败 trap */
-void  __c6_gc_store(void **slot, void *nv, int mode); /* 强/原子/弱存储 */
-void  __c6_gc_own_store(void **slot, void *nv);       /* own 字段/局部 */
+                  const struct __c6_gc_desc *d, int flags); /* 清零；失败 trap */
+void *__c6_gc_store(void **slot, void *nv, int mode); /* 强/原子/弱存储 */
+void *__c6_gc_own_store(void **slot, void *nv, int mode); /* own 字段/局部 */
 void  __c6_gc_release(void **slot, int mode);         /* 作用域退出：置 NULL 并释放 */
+void *__c6_gc_incref(void *p);                        /* 借出/转移时补一次计数 */
+void *__c6_gc_drop(void *p);                          /* 丢掉裸值，返回 NULL */
 void  __c6_gc_weak_upgrade(void **dst, void **weak_slot);
-unsigned long __c6_gc_live(void);                     /* 活对象数（测试用） */
-unsigned long __c6_gc_refcount(void *p);              /* 测试用 */
+unsigned long long __c6_gc_live(void);                /* 活对象数（测试用） */
+unsigned long long __c6_gc_refcount(void *p);         /* 测试用 */
 void  __c6_gc_drain_budget(int n);
 void  __c6_gc_shutdown(void);                         /* atexit：释放全局根 */
 ```
 
-`mode` 位：`C6_GC_FRESH=1`（接管，不 incref）、`C6_GC_ATOMIC=2`、`C6_GC_WEAK=4`。
+存储类返回它的 `nv`，这样生成的代码手里始终有一个值可以 `vpop()`。
+
+`mode` 位：
+
+| 位 | 值 | 含义 |
+|---|---|---|
+| `C6_GC_FRESH` | 1 | 值是刚造出来的：接管，不再 incref |
+| `C6_GC_ATOMIC` | 2 | 计数走原子操作（`shared`） |
+| `C6_GC_WEAK` | 4 | 目标是弱槽：注册/解注册，不计数 |
+| `C6_GC_OWN` | 8 | 目标是 `own`：旧值直接销毁，不 decref |
+| `C6_GC_INIT` | 16 | 槽**从未写过**：旧值视为空，不许读它 |
+
+`C6_GC_INIT` 是 P1 补上的：局部量和 `new` 出来的对象都带着未初始化的槽，
+读出来的旧指针去 decref 等于随机改堆。初始化表达式（`init_putv`）和
+`own` 的存储都带这一位；`own` 的存储是**唯一一次**写槽（它替换了普通
+`vstore()`），所以它的 `old == nv` 短路也必须被 `INIT` 关掉。
 
 ### 4.2 硬性不变量
 
@@ -183,7 +226,10 @@ void  __c6_gc_shutdown(void);                         /* atexit：释放全局�
 6. **弱槽注册**：每个目标对象一条链表；注册/注销/失效走一把全局自旋锁（冷路径），
    不在引用计数热路径上。
 7. **待释放队列**：**每线程**一份，谁最后 decref 谁消费 → 没有跨线程队列，没有全局锁。
-8. **预算**：队列每次最多消费 `budget`（默认 256）个对象，剩余留给下一次
+8. **不读未初始化的槽**：`store`/`own_store` 只在没有 `C6_GC_INIT` 时才读
+   `*slot` 当旧值；带了 `INIT` 就当作空槽，而且**必须**真的写槽（`own` 的
+   存储是唯一一次写，短路返回会把槽留成垃圾）。
+9. **预算**：队列每次最多消费 `budget`（默认 256）个对象，剩余留给下一次
    `__c6_gc_drain_budget()` / 作用域退出 / `new` / 协程调度步进，把级联延迟切成小片。
 
 ### 4.3 没有 STW

@@ -25,8 +25,8 @@
 
 | 阶段 | 内容 | 依赖 | 主要风险 |
 |---|---|---|---|
-| P0 | 类型/限定符/描述符脚手架 | — | `parse_btype` 与 `@` 的冲突 |
-| P1 | `new` + 存储 + 内联释放 + `p = NULL` | P0 | 作用域退出点的完整性（goto/err） |
+| P0 ✅ | 类型/限定符/描述符脚手架 | — | `parse_btype` 与 `@` 的冲突 |
+| P1 ✅ | `new` + 存储 + 内联释放 + `p = NULL` | P0 | 作用域退出点的完整性（goto/err） |
 | P2 | 描述符、字段释放、数组 `new T[n]` | P1 | TU 末尾发射与 inline 体的 fixpoint |
 | P3 | `weak`（含禁 async） | P2 | 弱槽失效顺序、restore 校验 |
 | P4 | 析构 `drop` 方法 | P3 | 重入、跨线程调用 |
@@ -62,7 +62,26 @@
 
 ---
 
-## P1 分配、存储、释放
+## P1 分配、存储、释放 ✅
+
+**落地状态（与计划的差异）**
+
+- `CType.gq` 只是缓存，托管性质的可信副本放在**被指符号**上，判定走
+  `c6_type_gq()`；编译器内部要把托管类型当裸指针用时用 `c6_gc_plain()`。
+  理由与踩坑见设计 §2.0。
+- 增加运行时 `mode` 位 `C6_GC_OWN=8`、`C6_GC_INIT=16`（见设计 §4.1/§4.2.8）。
+- 作用域释放**复用了已有的 defer 记录机**（`__tcc_defer_push` + 记录体里
+  调 `__c6_gc_release`），因此 `return`/`break`/`continue`/`goto`/`err`
+  和块退出用的是同一套调度，一处都不用改；代价是托管局部量会占一条记录
+  （每条 16 字节，块退出即回收）。
+- 实参里的 FRESH 值先搬进独立帧槽再传值，调用返回后统一释放；这次释放是
+  一次调用，所以返回值先存槽、释放完再取回（`c6_gc_arg_release(has_value)`）。
+- `c6_gc_return_hook()` 只负责 incref（把一份引用交给调用者）；返回槽的
+  存储必须走 `c6_gc_plain()`，否则会拿未初始化的旧值去 decref。
+- `__c6_gc_live` / `__c6_gc_refcount` 返回 `unsigned long long`（tcc 把
+  `unsigned long` 归一成 `VT_LLONG`，C99 后端打印原型时必须一致）。
+- 已知推迟项：`async` 体里的托管局部量在帧搬动/回卷时的转移（P7），
+  `defer` 记录 8192 条静默丢弃（H3，P7 一起修）。
 
 改动点：
 
@@ -94,6 +113,10 @@
 - 未消费 FRESH / 重复消费的编译错误。
 
 验收：三条命令全绿；`tests/c99/gc.c` 额外覆盖 C99 后端。
+
+**结果**：`tests/gc.c` 10 个 `test` 块全过（原生 + C99 后端），
+`tests/errors/gc.c` 4 条诊断全中，`make selftest` 40/40、
+`BACKEND=c99 tests/run-tests.sh` 41/41、`make test-plain` 绿。
 
 ---
 

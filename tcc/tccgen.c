@@ -332,6 +332,20 @@ static void c6_sp_flush(void);
 static int c6_soft_kw(int t);
 static int c6_soft_kw_shadowed(int t);
 static int c6_gc_qual(int t);
+static int c6_is_managed(CType *type);
+static int c6_type_gq(CType *type);
+static void c6_gc_plain(CType *type);
+/* nonzero while the initializer of a managed object is written */
+static int c6_gc_init_store;
+static int c6_gc_store_hook(void);
+static int c6_gc_new_lead(void);
+static void c6_gc_new_expr(void);
+static void c6_gc_return_hook(void);
+static void c6_gc_discard_hook(void);
+static void c6_gc_site(int off, CType *type);
+static void c6_gc_arg_mark(void);
+static void c6_gc_arg_temp(void);
+static void c6_gc_arg_release(int has_value);
 #define C6_KW_NONE 0
 #define C6_KW_CO   1
 #define C6_KW_GO   2
@@ -1080,6 +1094,15 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
         ps = &global_stack;
     s = sym_push2(ps, v, type->t, c);
     s->type.ref = type->ref;
+#ifdef C6_EXT
+#ifdef C6_EXT
+    /* only a validated copy: a byte nobody initialised must not leak into a
+       symbol's type and look like '@T' */
+    s->type.gq = c6_type_gq(type);
+#else
+    s->type.gq = type->gq;      /* '@T': the managed reference qualifier */
+#endif
+#endif
     s->r = r;
     /* don't record fields or anonymous symbols */
     if ((v & ~SYM_STRUCT) < SYM_FIRST_ANOM) {
@@ -1225,6 +1248,12 @@ static void vsetc(CType *type, int r, CValue *vc)
     vtop->r2 = VT_CONST;
     vtop->c = *vc;
     vtop->sym = NULL;
+#ifdef C6_EXT
+    /* a value that is pushed here is not a fresh managed reference: only
+       'new' marks its result, and only until the value is consumed */
+    vtop->gc_state = C6_GC_BORROW;
+    vtop->gc_src = 0;
+#endif
 }
 
 ST_FUNC void vswap(void)
@@ -3147,13 +3176,13 @@ static void type_to_str(char *buf, int buf_size,
         }
 #ifdef C6_EXT
         /* a managed reference prints as '@T' rather than '*' */
-        if (type->gq & C6_GQ_MANAGED) {
-            int l;
-            if (type->gq & C6_GQ_WEAK)
+        if (c6_type_gq(type) & C6_GQ_MANAGED) {
+            int l, gq = c6_type_gq(type);
+            if (gq & C6_GQ_WEAK)
                 pstrcat(buf, buf_size, "weak ");
-            if (type->gq & C6_GQ_OWN)
+            if (gq & C6_GQ_OWN)
                 pstrcat(buf, buf_size, "own ");
-            if (type->gq & C6_GQ_SHARED)
+            if (gq & C6_GQ_SHARED)
                 pstrcat(buf, buf_size, "shared ");
             pstrcat(buf, buf_size, "@");
             l = strlen(buf);
@@ -3991,7 +4020,11 @@ ST_FUNC void mk_pointer(CType *type)
     s = sym_push(SYM_FIELD, type, 0, -1);
     type->t = VT_PTR | (type->t & VT_STORAGE);
     type->ref = s;
-    type->gq = 0;   /* a pointer to a managed reference is a plain pointer */
+    /* A fresh pointer is never a managed reference; and the pointee symbol
+       carries the trusted copy of the GC qualifier (0 = plain pointer), so
+       that a byte nobody initialised can never look like '@T'. */
+    type->gq = 0;
+    s->type.gq = 0;
 }
 
 /* return true if type1 and type2 are exactly the same (including
@@ -4117,6 +4150,8 @@ ST_FUNC void vstore(void)
     int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
 #ifdef C6_EXT
     c6_fallible_use();          /* 'x = f()' would drop the error */
+    if (c6_gc_store_hook())     /* 'managed lvalue = value' */
+        return;
 #endif
 
     ft = vtop[-1].type.t;
@@ -5795,6 +5830,7 @@ the_end:
         type->t = t;
         mk_pointer(type);
         type->gq = C6_GQ_MANAGED | gc_qual;
+        type->ref->type.gq = type->gq;  /* the trusted copy */
         t = type->t;
         if ((type->ref->type.t & VT_BTYPE) == VT_VOID)
             tcc_error("'@' needs an object type, not 'void'");
@@ -6473,6 +6509,12 @@ ST_FUNC void unary(void)
     /* XXX: GCC 2.95.3 does not generate a table although it should be
        better here */
  tok_next:
+#ifdef C6_EXT
+    if (c6_gc_new_lead()) {     /* 'new T' / 'new T[n]' */
+        c6_gc_new_expr();
+        return;
+    }
+#endif
     switch(tok) {
     case TOK_EXTENSION:
         next();
@@ -7380,6 +7422,9 @@ special_math_val:
             }
 
             p = NULL;
+#ifdef C6_EXT
+            c6_gc_arg_mark();   /* fresh arguments are released after the call */
+#endif
             if (tok != ')') {
                 r = tcc_state->reverse_funcargs;
                 for(;;) {
@@ -7388,6 +7433,9 @@ special_math_val:
                         p2->prev = p, p = p2;
                     } else {
                         expr_eq();
+#ifdef C6_EXT
+                        c6_gc_arg_temp();
+#endif
                         gfunc_param_typed(s, sa);
                     }
                     nb_args++;
@@ -7410,6 +7458,9 @@ special_math_val:
                     p2 = p->prev;
                     begin_macro(p, 1), next();
                     expr_eq();
+#ifdef C6_EXT
+                    c6_gc_arg_temp();
+#endif
                     gfunc_param_typed(s, sa);
                     end_macro();
                 }
@@ -7488,6 +7539,14 @@ special_math_val:
                handling: spilling a struct returned in registers stores
                values internally and must not trip the check. */
             c6_value_fallible = s->f.func_fallible;
+            {
+                int c6_has_val = (ret.type.t & VT_BTYPE) != VT_VOID;
+                /* a call of a function that returns a managed reference
+                   hands the caller one reference ('return p' counted it) */
+                if (c6_has_val && c6_is_managed(&vtop->type))
+                    vtop->gc_state = C6_GC_FRESH;
+                c6_gc_arg_release(c6_has_val);
+            }
 #endif
             if (s->f.func_noreturn) {
                 if (debug_modes)
@@ -7869,6 +7928,12 @@ static void expr_eq(void)
         if (t == '=') {
             expr_eq();
         } else {
+#ifdef C6_EXT
+            if (c6_is_managed(&vtop->type))
+                tcc_error("'%s' is not supported for a managed reference: "
+                          "it cannot do pointer arithmetic",
+                          get_tok_str(t, NULL));
+#endif
             vdup();
             expr_eq();
             gen_op(TOK_ASSIGN_OP(t));
@@ -9716,8 +9781,10 @@ static void c6_global_pointer(CType *type)
 {
     Sym *s = sym_push2(&global_stack, SYM_FIELD, 0, -1);
     s->type = *type;
+    s->type.gq = 0;         /* the pointee marker: a plain pointer */
     type->t = VT_PTR | (type->t & VT_STORAGE);
     type->ref = s;
+    type->gq = 0;
 }
 
 /* is the tag of TYPE (through one level of pointer) reachable from file
@@ -11455,6 +11522,9 @@ again:
 #endif
             if (b) {
                 gen_assign_cast(&func_vt);
+#ifdef C6_EXT
+                c6_gc_return_hook();    /* hand one reference to the caller */
+#endif
             } else {
                 if (vtop->type.t != VT_VOID)
                     tcc_warning("void function returns a value");
@@ -11469,11 +11539,15 @@ again:
 #ifdef C6_EXT
         /* protect the return value from cleanup calls */
         if (b && defer_state.enabled && defer_state.has_sites) {
+            CType rt = func_vt;
             int align, size = type_size(&func_vt, &align);
             loc = (loc - size) & -align;
             ret_off = loc;
             ret_saved = 1;
-            vset(&func_vt, VT_LOCAL | VT_LVAL, ret_off);
+            /* a plain word: the reference handed to the caller was counted
+               by c6_gc_return_hook() already */
+            c6_gc_plain(&rt);
+            vset(&rt, VT_LOCAL | VT_LVAL, ret_off);
             vswap();
             vstore();
             vpop();
@@ -11804,6 +11878,7 @@ again:
                     gexpr();
 #ifdef C6_EXT
                     c6_fallible_use();
+                    c6_gc_discard_hook();
 #endif
                     vpop();
                 }
@@ -12315,7 +12390,14 @@ static void init_putv(init_params *p, CType *type, unsigned long c)
     } else {
         vset(&dtype, VT_LOCAL|VT_LVAL, c);
         vswap();
+#ifdef C6_EXT
+        /* an initializer writes a slot that holds no value yet */
+        c6_gc_init_store = 1;
+#endif
         vstore();
+#ifdef C6_EXT
+        c6_gc_init_store = 0;
+#endif
         vpop();
     }
 }
@@ -13968,6 +14050,384 @@ static void c6_foreach_parse(void)
 }
 
 /* ---------------------------------------------------------------------- */
+/* reference counted managed references '@T'                               */
+/*                                                                         */
+/* A managed local is released like a 'defer': the declaration registers a  */
+/* cleanup site whose body is '__c6_gc_release(&local, mode)'.  Going        */
+/* through the existing cleanup machinery covers every way out of a scope   */
+/* (end of block, return, break, continue, goto and the 'err()' path) and,   */
+/* because the body recomputes the address from the frame pointer, it also   */
+/* stays correct when an 'async' body moves its own frame.                  */
+/*                                                                         */
+/* Everything a store or a release does is decided here and executed by the  */
+/* runtime (lib/libtcc1.c): the code generator only tells it which kind of   */
+/* slot it is ('weak @T' / 'own @T' / 'shared @T') and whether the value is  */
+/* a fresh reference ('new T').                                            */
+
+/* the GC qualifier of a managed reference type, 0 for anything else.  The
+   trusted copy lives in the pointee symbol (see mk_pointer), so a CType whose
+   'gq' byte was never initialised cannot be mistaken for a managed one. */
+static int c6_type_gq(CType *type)
+{
+    if ((type->t & VT_BTYPE) != VT_PTR || !type->ref)
+        return 0;
+    return type->ref->type.gq & (C6_GQ_MANAGED | C6_GQ_QUAL);
+}
+
+static int c6_is_managed(CType *type)
+{
+    return (c6_type_gq(type) & C6_GQ_MANAGED) != 0;
+}
+
+/* the same pointer type, but not a managed reference: a plain word.  Used
+   wherever the compiler itself handles the raw slot of a managed object. */
+static void c6_gc_plain(CType *type)
+{
+    CType inner;
+
+    if (!c6_is_managed(type))
+        return;
+    inner = *pointed_type(type);
+    mk_pointer(&inner);
+    *type = inner;
+}
+
+/* the runtime mode of a managed type: what kind of slot it is */
+static int c6_gc_mode(CType *t)
+{
+    int m = 0, gq = c6_type_gq(t);
+
+    if (gq & C6_GQ_WEAK)
+        m |= C6_GCM_WEAK;
+    if (gq & C6_GQ_OWN)
+        m |= C6_GCM_OWN;
+    if (gq & C6_GQ_SHARED)
+        m |= C6_GCM_ATOMIC;
+    return m;
+}
+
+/* 'void *', for the slot arguments of the runtime helpers */
+static void c6_gc_voidptr(CType *t)
+{
+    t->t = VT_VOID;
+    t->ref = NULL;
+    t->gq = 0;
+    mk_pointer(t);
+}
+
+/* register the cleanup site that releases the managed local at frame
+   offset OFF */
+static void c6_gc_site(int off, CType *type)
+{
+    CType vt;
+    int skip, id, mode = c6_gc_mode(type);
+    Sym *l;
+
+    if (!defer_state.enabled || nocode_wanted || off >= 0)
+        return;                     /* parameters are borrowed */
+    id = ++defer_state.next_site;
+    l = c6_new_label("gcr");
+    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
+    vpushi(id);
+    vpushi(local_scope);
+    vpushi(0);                      /* kind: defer, it runs on every exit */
+    gfunc_call(3);
+    skip = gjmp(0);                 /* registration time jumps over the body */
+    c6_def_label(l);
+    c6_add_site(id, l);
+    defer_state.has_sites = 1;
+    c6_rt_begin("__c6_gc_release");
+    vt = *type;
+    c6_gc_plain(&vt);               /* the slot itself, as a plain pointer */
+    vset(&vt, VT_LOCAL | VT_LVAL, off);
+    gaddrof();
+    vpushi(mode);
+    c6_rt_end("__c6_gc_release", 2);
+    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
+    gsym(skip);
+}
+
+/* true while a store into a managed slot is being handled */
+/* Rewrite 'slot = value' when SLOT is a managed reference.  The runtime has
+   to increment the new value before it drops the old one, so a value that is
+   the last reference to itself stays alive while it is being stored. */
+static int c6_gc_store_hook(void)
+{
+    CType *dt, vt;
+    SValue dst, val;
+    const char *name;
+    int mode, own, is_null;
+
+    if (!tcc_state->c6_ext)
+        return 0;
+    dt = &vtop[-1].type;
+    if (!c6_is_managed(dt))
+        return 0;
+
+    is_null = (vtop->r & VT_VALMASK) == VT_CONST
+        && !(vtop->r & (VT_LVAL | VT_SYM)) && vtop->c.i == 0;
+    if (vtop->gc_state != C6_GC_FRESH && !c6_is_managed(&vtop->type)
+        && !is_null) {
+        char b1[160], b2[160];
+        type_to_str(b1, sizeof b1, &vtop->type, NULL);
+        type_to_str(b2, sizeof b2, dt, NULL);
+        tcc_error("cannot assign a '%s' to '%s': a managed reference is "
+                  "only made by 'new', by another managed reference or by "
+                  "the empty value", b1, b2);
+    }
+    mode = c6_gc_mode(dt);
+    if ((c6_type_gq(&vtop->type) & C6_GQ_WEAK) && !(mode & C6_GCM_WEAK)) {
+        char b1[160], b2[160];
+        type_to_str(b1, sizeof b1, &vtop->type, NULL);
+        type_to_str(b2, sizeof b2, dt, NULL);
+        tcc_error("cannot assign a '%s' to '%s': a weak reference only "
+                  "observes, it must be upgraded to a counted one first",
+                  b1, b2);
+    }
+    if (vtop->gc_state == C6_GC_FRESH)
+        mode |= C6_GCM_FRESH;
+    if (c6_gc_init_store)
+        mode |= C6_GCM_INIT;
+    own = (mode & C6_GCM_OWN) != 0;
+    if (own && !(mode & C6_GCM_FRESH) && !is_null) {
+        char b[160];
+        type_to_str(b, sizeof b, dt, NULL);
+        tcc_error("'%s' takes ownership: only a fresh reference ('new') or "
+                  "the empty value can be stored in it", b);
+    }
+    dst = vtop[-1];
+    val = *vtop;
+    vpop();
+    vpop();
+    name = own ? "__c6_gc_own_store" : "__c6_gc_store";
+    c6_rt_begin(name);
+    vpushv(&dst);
+    gaddrof();                      /* the address of the slot */
+    vpushv(&val);
+    vpushi(mode);
+    c6_rt_end(name, 3);
+    vt = *dt;
+    vtop->type = vt;                /* the value of the assignment */
+    vtop->gc_state = C6_GC_BORROW;
+    return 1;
+}
+
+/* can TOKEN start a type?  Used to tell 'new T' from a variable named
+   'new'. */
+static int c6_gc_type_lead(int t)
+{
+    Sym *s;
+
+    switch (t) {
+    case '@': case TOK_STRUCT: case TOK_UNION: case TOK_ENUM:
+    case TOK_VOID: case TOK_CHAR: case TOK_SHORT: case TOK_INT:
+    case TOK_LONG: case TOK_FLOAT: case TOK_DOUBLE: case TOK_BOOL:
+    case TOK_SIGNED1: case TOK_SIGNED2: case TOK_SIGNED3: case TOK_UNSIGNED:
+    case TOK_CONST1: case TOK_CONST2: case TOK_CONST3:
+    case TOK_VOLATILE1: case TOK_VOLATILE2: case TOK_VOLATILE3:
+    case TOK_RESTRICT1: case TOK_RESTRICT2: case TOK_RESTRICT3:
+    case TOK__Atomic:
+        return 1;
+    }
+    if (t < TOK_IDENT)
+        return 0;
+    s = sym_find(t);
+    if (s && (s->type.t & VT_TYPEDEF))
+        return 1;
+    if (struct_find(t))
+        return 1;
+    return c6_gc_qual(t) != 0;      /* 'new shared T' */
+}
+
+/* is the current token a 'new' that starts an allocation? */
+static int c6_gc_new_lead(void)
+{
+    int t, save;
+
+    if (!tcc_state->c6_ext || tok < TOK_IDENT)
+        return 0;
+    if (c6_soft_kw_shadowed(tok) || strcmp(get_tok_str(tok, NULL), "new"))
+        return 0;
+    save = tok;
+    next();
+    t = tok;
+    unget_tok(save);
+    return c6_gc_type_lead(t);
+}
+
+/* 'new T', 'new T[n]', 'new shared T': a fresh reference to a zeroed
+   object (or to COUNT zeroed elements) */
+static void c6_gc_new_expr(void)
+{
+    CType type;
+    AttributeDef ad;
+    int flags = 0, align, size;
+
+    next();                             /* 'new' */
+    if (tok >= TOK_IDENT && !c6_soft_kw_shadowed(tok)
+        && c6_gc_qual(tok) == C6_GQ_SHARED) {
+        flags |= C6_GCM_ATOMIC;
+        next();
+    }
+    parse_btype(&type, &ad, 0);
+    type.t &= ~VT_QUAL;
+    if ((type.t & VT_BTYPE) == VT_VOID)
+        tcc_error("'new' needs an object type, not 'void'");
+    if (type.t & VT_ARRAY)
+        tcc_error("'new' takes the element type: write 'new T[n]'");
+    align = 0;
+    size = type_size(&type, &align);
+    c6_rt_begin("__c6_gc_new");
+    vpushs(size);                       /* the size of one element */
+    if (tok == '[') {
+        next();
+        expr_eq();                      /* the element count */
+        skip(']');
+    } else {
+        vpushs(1);
+    }
+    vpushs(0);                          /* the type descriptor (fields) */
+    vpushs(flags);
+    c6_rt_end("__c6_gc_new", 4);
+    mk_pointer(&type);
+    type.gq = C6_GQ_MANAGED;
+    type.ref->type.gq = type.gq;
+    vtop->type = type;
+    vtop->gc_state = C6_GC_FRESH;
+}
+
+/* Frame slots that hold fresh call arguments until the call has returned.
+   The values must outlive the call but nothing owns them afterwards, so
+   each one is moved out of the argument list into its own slot and the
+   slots are released once the call is done. */
+static int *c6_gc_temps;            /* frame offsets */
+static int c6_nb_gc_temps, c6_gc_temps_cap;
+static int *c6_gc_marks;            /* saved lengths, one per call */
+static int c6_nb_gc_marks, c6_gc_marks_cap;
+
+static void c6_gc_arg_mark(void)
+{
+    if (!tcc_state->c6_ext)
+        return;
+    if (c6_nb_gc_marks >= c6_gc_marks_cap) {
+        c6_gc_marks_cap = c6_gc_marks_cap ? c6_gc_marks_cap * 2 : 16;
+        c6_gc_marks = tcc_realloc(c6_gc_marks,
+                                  c6_gc_marks_cap * (int)sizeof(int));
+    }
+    c6_gc_marks[c6_nb_gc_marks++] = c6_nb_gc_temps;
+}
+
+/* move a fresh argument into a slot, keeping a borrowed pointer on the
+   stack as the argument itself */
+static void c6_gc_arg_temp(void)
+{
+    CType pt, rt;
+    SValue v;
+    int off;
+
+    if (!tcc_state->c6_ext || vtop->gc_state != C6_GC_FRESH)
+        return;
+    loc = (loc - (int)sizeof(void *)) & -(int)PTR_SIZE;
+    off = loc;
+    v = *vtop;
+    vpop();
+    c6_gc_voidptr(&pt);
+    c6_rt_begin("__c6_gc_store");
+    vset(&pt, VT_LOCAL | VT_LVAL, off);
+    gaddrof();
+    vpushv(&v);
+    vpushi(C6_GCM_FRESH | C6_GCM_INIT);    /* a brand new frame slot */
+    c6_rt_end("__c6_gc_store", 3);
+    rt = v.type;
+    vtop->type = rt;
+    vtop->gc_state = C6_GC_BORROW;
+    if (c6_nb_gc_temps >= c6_gc_temps_cap) {
+        c6_gc_temps_cap = c6_gc_temps_cap ? c6_gc_temps_cap * 2 : 16;
+        c6_gc_temps = tcc_realloc(c6_gc_temps,
+                                  c6_gc_temps_cap * (int)sizeof(int));
+    }
+    c6_gc_temps[c6_nb_gc_temps++] = off;
+}
+
+/* the call has returned: release the fresh arguments of this call.  The
+   release is a call, so the result of the call being compiled (if it has
+   one) is parked in a frame slot while it runs. */
+static void c6_gc_arg_release(int has_value)
+{
+    CType pt, vt, rt;
+    int i, mark, off = 0, align = 0, size = 0;
+
+    if (!tcc_state->c6_ext || c6_nb_gc_marks <= 0)
+        return;
+    mark = c6_gc_marks[--c6_nb_gc_marks];
+    if (c6_nb_gc_temps <= mark)
+        return;
+    rt.t = VT_INT;
+    if (has_value) {
+        rt = vtop->type;
+        vt = rt;
+        c6_gc_plain(&vt);           /* a plain word, no counting */
+        size = type_size(&rt, &align);
+        loc = (loc - size) & -align;
+        off = loc;
+        vset(&vt, VT_LOCAL | VT_LVAL, off);
+        vswap();
+        vstore();
+        vpop();
+    }
+    for (i = c6_nb_gc_temps - 1; i >= mark; i--) {
+        c6_gc_voidptr(&pt);
+        c6_rt_begin("__c6_gc_release");
+        vset(&pt, VT_LOCAL | VT_LVAL, c6_gc_temps[i]);
+        gaddrof();
+        vpushi(0);
+        c6_rt_end("__c6_gc_release", 2);
+    }
+    c6_nb_gc_temps = mark;
+    if (has_value) {
+        vset(&vt, VT_LOCAL | VT_LVAL, off);
+        if (c6_is_managed(&rt))
+            vtop->gc_state = C6_GC_FRESH;
+    }
+}
+
+/* 'return VALUE' of a managed type hands one reference to the caller.  A
+   fresh value already is that reference; anything else is counted here,
+   because the local that holds it is released on the way out. */
+static void c6_gc_return_hook(void)
+{
+    CType rt = func_vt;
+    SValue v;
+
+    if (!tcc_state->c6_ext || !c6_is_managed(&rt))
+        return;
+    if (vtop->gc_state == C6_GC_FRESH)
+        return;
+    v = *vtop;
+    vpop();
+    c6_rt_begin("__c6_gc_incref");
+    vpushv(&v);
+    c6_rt_end("__c6_gc_incref", 1);
+    vtop->type = rt;
+    vtop->gc_state = C6_GC_FRESH;
+}
+
+/* a discarded fresh reference ('new T{};') is released right here: the value
+   is not in a slot, so the runtime drops it directly */
+static void c6_gc_discard_hook(void)
+{
+    SValue v;
+
+    if (!tcc_state->c6_ext || vtop->gc_state != C6_GC_FRESH)
+        return;
+    v = *vtop;
+    vpop();
+    c6_rt_begin("__c6_gc_drop");
+    vpushv(&v);
+    c6_rt_end("__c6_gc_drop", 1);
+}
+
+/* ---------------------------------------------------------------------- */
 /* soft keywords                                                           */
 /*                                                                         */
 /* 'co', 'go' and 'task' are keywords only at the start of a statement      */
@@ -15044,6 +15504,15 @@ static int decl(int l)
                             type.t |= VT_EXTERN;
                         decl_initializer_alloc(&type, &ad, r, has_init, v, l);
 #ifdef C6_EXT
+                        if (l == VT_LOCAL && tcc_state->c6_ext
+                            && !(type.t & (VT_STATIC | VT_ARRAY))
+                            && c6_is_managed(&type)) {
+                            /* released like a 'defer': the site runs at the
+                               end of the scope or on return/break/err */
+                            Sym *gs = sym_find(v);
+                            if (gs && (gs->r & VT_LOCAL))
+                                c6_gc_site(gs->c, &type);
+                        }
                         if (l == VT_CONST)
                             c6_header_record(C6_HD_VAR, v, &type, NULL);
 #endif

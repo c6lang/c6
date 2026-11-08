@@ -60,12 +60,17 @@ typedef struct C99DeferCtx {
 
 typedef struct C99CoPool C99CoPool;   /* completed with the async runtime */
 typedef struct C99ThRec C99ThRec;     /* threads started by this thread */
+typedef struct C99GcHdr C99GcHdr;     /* completed with the gc runtime */
 
 typedef struct C99ThCtx {
     C99DeferRec *dstack;  int dsp, stack_cap;
     C99DeferCtx *dctx;    int dcsp, ctx_cap;
     int err_flag, err_id;
     const char *err_msg;
+    C99GcHdr *gc_pending; /* objects whose count reached zero */
+    C99GcHdr *gc_pending_tail;
+    int gc_pending_n;
+    int gc_draining;      /* a drain loop is already running on this thread */
     C99CoPool *co;
     C99ThRec *th_list;    /* children, joined when the thread exits */
     int th_freed;
@@ -98,6 +103,7 @@ C99_RT_UNUSED __c99_rt_linkage void *__c99_alloc(unsigned long size)
 }
 
 C99_RT_UNUSED __c99_rt_linkage void __c99_co_free(C99CoPool *co);
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_all(C99ThCtx *th);
 
 /* Join every thread this thread started.  A 'go' statement has no place
    where it could be joined, so the starter reaps its threads when it exits;
@@ -121,6 +127,7 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_th_free(C99ThCtx *th)
     if (!th || th->th_freed)
         return;
     th->th_freed = 1;
+    __c99_gc_free_all(th);
     __c99_join_children(th);
     if (th->dstack)
         free(th->dstack);
@@ -988,3 +995,326 @@ C99_RT_UNUSED __c99_rt_linkage int c6_io(int fd, int ev)
     (void)ev;
     return -1;
 }
+
+/* c6 extension runtime: reference counted managed references '@T'           */
+/*                                                                           */
+/* Every object made by 'new T' carries a 32 byte header: the reference      */
+/* count, the element count together with the object flags, the type          */
+/* descriptor and either the list of weak references pointing at it or the    */
+/* link in the per-thread free queue.  Dropping a reference only queues the   */
+/* object; the queue is drained in batches, so freeing a long chain does not  */
+/* need one C stack frame per link.                                          */
+
+#define C99_GC_HDR_SIZE   32
+#define C99_GC_DEAD       (1UL << 63)
+#define C99_GC_FRESH      1
+#define C99_GC_ATOMIC     2
+#define C99_GC_WEAK       4
+#define C99_GC_OWN        8
+#define C99_GC_INIT       16
+
+#define C99_GC_META_COUNT 0xffffffffffUL
+#define C99_GC_META_FLAGS(meta) ((int)((meta) >> 40))
+
+#define C99_GC_DRAIN_BUDGET 256
+
+#define C99_GC_A_ACQ_REL 4
+
+typedef struct C99GcWeak {
+    void **slot;
+    struct C99GcWeak *next;
+} C99GcWeak;
+
+/* the descriptor the compiler's type metadata uses */
+struct __c6_gc_desc;
+
+typedef struct C99GcField {
+    unsigned off, kind, count, stride;
+    const struct __c6_gc_desc *sub;
+} C99GcField;
+
+struct __c6_gc_desc {
+    unsigned size, align, nfields, flags;
+    void (*drop)(void *);
+    const C99GcField *fields;
+};
+
+struct C99GcHdr {
+    unsigned long rc;
+    unsigned long meta;
+    const struct __c6_gc_desc *desc;
+    union {
+        C99GcWeak *weak;
+        C99GcHdr *next;
+    } u;
+};
+
+C99_RT_UNUSED __c99_rt_linkage unsigned long __c99_gc_live_count;
+
+C99_RT_UNUSED __c99_rt_linkage C99GcHdr *__c99_gc_hdr(void *p)
+{
+    return (C99GcHdr *)p - 1;
+}
+
+C99_RT_UNUSED __c99_rt_linkage int __c99_gc_is_atomic(C99GcHdr *h)
+{
+    return (C99_GC_META_FLAGS(h->meta) & C99_GC_ATOMIC) != 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_inc(C99GcHdr *h)
+{
+    if (__c99_gc_is_atomic(h))
+        __atomic_fetch_add(&h->rc, 1UL, C99_GC_A_ACQ_REL);
+    else
+        h->rc++;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_one(C99GcHdr *h)
+{
+    const struct __c6_gc_desc *d = h->desc;
+
+    if (d && d->drop)
+        d->drop(h + 1);
+    if (__c99_gc_live_count)
+        __c99_gc_live_count--;
+    free(h);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_drain(C99ThCtx *th, int budget)
+{
+    int n = 0;
+
+    if (th->gc_draining)
+        return;
+    th->gc_draining = 1;
+    while (th->gc_pending && n < budget) {
+        C99GcHdr *h = th->gc_pending;
+        th->gc_pending = h->u.next;
+        if (!th->gc_pending)
+            th->gc_pending_tail = 0;
+        th->gc_pending_n--;
+        n++;
+        __c99_gc_free_one(h);
+    }
+    th->gc_draining = 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_all(C99ThCtx *th)
+{
+    while (th->gc_pending) {
+        C99GcHdr *h = th->gc_pending;
+        th->gc_pending = h->u.next;
+        th->gc_pending_n--;
+        __c99_gc_free_one(h);
+    }
+    th->gc_pending_tail = 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_die(C99GcHdr *h)
+{
+    C99ThCtx *th;
+    C99GcWeak *w;
+
+    h->rc = C99_GC_DEAD;
+    w = h->u.weak;
+    h->u.weak = 0;
+    while (w) {
+        C99GcWeak *next = w->next;
+        *w->slot = 0;
+        free(w);
+        w = next;
+    }
+    th = __c99_th();
+    h->u.next = 0;
+    if (th->gc_pending_tail)
+        th->gc_pending_tail->u.next = h;
+    else
+        th->gc_pending = h;
+    th->gc_pending_tail = h;
+    th->gc_pending_n++;
+    __c99_gc_drain(th, C99_GC_DRAIN_BUDGET);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_drop(C99GcHdr *h)
+{
+    unsigned long old;
+
+    if (__c99_gc_is_atomic(h)) {
+        old = __atomic_fetch_sub(&h->rc, 1UL, C99_GC_A_ACQ_REL);
+        if (old != 1)
+            return;
+    } else {
+        if (--h->rc != 0)
+            return;
+    }
+    __c99_gc_die(h);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_destroy(C99GcHdr *h)
+{
+    if (h->rc & C99_GC_DEAD)
+        return;
+    h->rc = 1;
+    __c99_gc_die(h);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_weak_unlink(void **slot, void *p)
+{
+    C99GcWeak **pp;
+
+    for (pp = &__c99_gc_hdr(p)->u.weak; *pp; pp = &(*pp)->next) {
+        C99GcWeak *w = *pp;
+        if (w->slot == slot) {
+            *pp = w->next;
+            free(w);
+            return;
+        }
+    }
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_gc_weak_add(void **slot, void *p)
+{
+    C99GcHdr *h = __c99_gc_hdr(p);
+    C99GcWeak *w = (C99GcWeak *)__c99_alloc(sizeof *w);
+
+    w->slot = slot;
+    w->next = h->u.weak;
+    h->u.weak = w;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_new(unsigned long size,
+                                                 unsigned long count,
+                                                 const void *desc, int flags)
+{
+    unsigned long total;
+    C99GcHdr *h;
+
+    if (size == 0)
+        size = 1;
+    if (count == 0)
+        count = 1;
+    if (count > ((unsigned long)-1 - C99_GC_HDR_SIZE) / size)
+        __c99_trap();
+    total = size * count;
+    h = (C99GcHdr *)__c99_alloc(C99_GC_HDR_SIZE + total);
+    h->rc = 1;
+    h->meta = count & C99_GC_META_COUNT;
+    if (flags & C99_GC_ATOMIC)
+        h->meta |= (unsigned long)C99_GC_ATOMIC << 40;
+    h->desc = (const struct __c6_gc_desc *)desc;
+    __c99_gc_live_count++;
+    return h + 1;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_store(void **slot, void *nv,
+                                                   int mode)
+{
+    int init = (mode & C99_GC_INIT) != 0;
+    void *old = init ? 0 : *slot;
+
+    if (mode & C99_GC_WEAK) {
+        if (!init && old == nv)
+            return nv;
+        if (old)
+            __c99_gc_weak_unlink(slot, old);
+        *slot = nv;
+        if (nv)
+            __c99_gc_weak_add(slot, nv);
+        return nv;
+    }
+    if (!init && old == nv)
+        return nv;
+    if (nv && !(mode & C99_GC_FRESH))
+        __c99_gc_inc(__c99_gc_hdr(nv));
+    *slot = nv;
+    if (old) {
+        if (mode & C99_GC_OWN)
+            __c99_gc_destroy(__c99_gc_hdr(old));
+        else
+            __c99_gc_drop(__c99_gc_hdr(old));
+    }
+    return nv;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_own_store(void **slot, void *nv,
+                                                       int mode)
+{
+    int init = (mode & C99_GC_INIT) != 0;
+    void *old = init ? 0 : *slot;
+
+    if (!init && old == nv)
+        return nv;
+    *slot = nv;
+    if (old)
+        __c99_gc_destroy(__c99_gc_hdr(old));
+    return nv;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_release(void **slot, int mode)
+{
+    void *p = *slot;
+
+    if (!p)
+        return;
+    *slot = 0;
+    if (mode & C99_GC_WEAK)
+        __c99_gc_weak_unlink(slot, p);
+    else if (mode & C99_GC_OWN)
+        __c99_gc_destroy(__c99_gc_hdr(p));
+    else
+        __c99_gc_drop(__c99_gc_hdr(p));
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_incref(void *p)
+{
+    if (p)
+        __c99_gc_inc(__c99_gc_hdr(p));
+    return p;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_drop(void *p)
+{
+    if (p)
+        __c99_gc_drop(__c99_gc_hdr(p));
+    return 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_weak_upgrade(void **dst,
+                                                          void **weak_slot)
+{
+    void *p = *weak_slot;
+
+    if (p) {
+        __c99_gc_inc(__c99_gc_hdr(p));
+        *dst = p;
+    } else {
+        *dst = 0;
+    }
+}
+
+C99_RT_UNUSED __c99_rt_linkage unsigned long long __c6_gc_live(void)
+{
+    return (unsigned long long)__c99_gc_live_count;
+}
+
+C99_RT_UNUSED __c99_rt_linkage unsigned long long __c6_gc_refcount(void *p)
+{
+    if (!p)
+        return 0;
+    return (unsigned long long)(__c99_gc_hdr(p)->rc & ~C99_GC_DEAD);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_drain_budget(int n)
+{
+    C99ThCtx *th = __c99_th();
+
+    if (n <= 0)
+        n = C99_GC_DRAIN_BUDGET;
+    __c99_gc_drain(th, n);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_gc_shutdown(void)
+{
+    __c99_gc_free_all(__c99_th());
+}
+
