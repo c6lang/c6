@@ -259,7 +259,7 @@ static const uint16_t op0_codes[] = {
 
 static inline int get_reg_shift(TCCState *s1)
 {
-    int shift, v;
+    int shift = 0, v = 0;
     v = asm_int_expr(s1);
     switch(v) {
     case 1:
@@ -288,7 +288,7 @@ static int asm_parse_numeric_reg(int t, unsigned int *type)
     int reg = -1;
     if (t >= TOK_IDENT && t < tok_ident) {
 	const char *s = table_ident[t - TOK_IDENT]->str;
-	char c;
+	char c = 0;
 	*type = OP_REG64;
 	if (*s == 'c') {
 	    s++;
@@ -353,9 +353,9 @@ static int asm_parse_reg(unsigned int *type)
 
 static void parse_operand(TCCState *s1, Operand *op)
 {
-    ExprValue e;
-    int reg, indir;
-    const char *p;
+    ExprValue e = {0};
+    int reg = 0, indir = 0;
+    const char *p = 0;
 
     indir = 0;
     if (tok == '*') {
@@ -523,7 +523,7 @@ static void gen_disp32(ExprValue *pe)
 /* generate the modrm operand */
 static inline int asm_modrm(int reg, Operand *op)
 {
-    int mod, reg1, reg2, sib_reg1;
+    int mod = 0, reg1 = 0, reg2 = 0, sib_reg1 = 0;
 
     if (op->type & (OP_REG | OP_MMX | OP_SSE)) {
         g(0xc0 + (reg << 3) + op->reg);
@@ -589,7 +589,7 @@ static void asm_rex(int width64, Operand *ops, int nb_ops, int *op_type,
 {
   unsigned char rex = width64 ? 0x48 : 0;
   int saw_high_8bit = 0;
-  int i;
+  int i = 0;
   if (rmi == -1) {
       /* No mod/rm byte, but we might have a register op nevertheless
          (we will add it to the opcode later).  */
@@ -644,15 +644,15 @@ static void asm_rex(int width64, Operand *ops, int nb_ops, int *op_type,
 
 static void maybe_print_stats (void)
 {
-    static int already;
+    static int already = 0;
 
     if (0 && !already)
     /* print stats about opcodes */
     {
-        const struct ASMInstr *pa;
-        int freq[4];
-        int op_vals[500];
-        int nb_op_vals, i, j;
+        const struct ASMInstr *pa = 0;
+        int freq[4] = {0};
+        int op_vals[500] = {0};
+        int nb_op_vals = 0, i = 0, j = 0;
 
 	already = 1;
         nb_op_vals = 0;
@@ -684,16 +684,16 @@ static void maybe_print_stats (void)
 
 ST_FUNC void asm_opcode(TCCState *s1, int opcode)
 {
-    const ASMInstr *pa;
-    int i, modrm_index, modreg_index, reg, v, op1, seg_prefix, pc, p;
-    int nb_ops, s;
-    Operand ops[MAX_OPERANDS], *pop;
-    int op_type[3]; /* decoded op type */
-    int alltypes;   /* OR of all operand types */
-    int autosize;
-    int p66;
+    const ASMInstr *pa = 0;
+    int i = 0, modrm_index = 0, modreg_index = 0, reg = 0, v = 0, op1 = 0, seg_prefix = 0, pc = 0, p = 0;
+    int nb_ops = 0, s = 0;
+    Operand ops[MAX_OPERANDS] = {0}, *pop = 0;
+    int op_type[3] = {0}; /* decoded op type */
+    int alltypes = 0;   /* OR of all operand types */
+    int autosize = 0;
+    int p66 = 0;
 #ifdef TCC_TARGET_X86_64
-    int rex64;
+    int rex64 = 0;
 #endif
 
     maybe_print_stats();
@@ -802,7 +802,7 @@ again:
         /* now decode and check each operand */
 	alltypes = 0;
         for(i = 0; i < nb_ops; i++) {
-            int op1, op2;
+            int op1 = 0, op2 = 0;
             op1 = pa->op_type[i];
             op2 = op1 & 0x1f;
             switch(op2) {
@@ -843,7 +843,7 @@ again:
     }
     if (pa->sym == 0) {
         if (opcode >= TOK_ASM_first && opcode <= TOK_ASM_last) {
-            int b;
+            int b = 0;
             b = op0_codes[opcode - TOK_ASM_first];
             if (b & 0xff00)
                 g(b >> 8);
@@ -1057,8 +1057,8 @@ again:
     if (pa->instr_type & OPC_B)
         v += s >= 1;
     if (nb_ops == 1 && pa->op_type[0] == OPT_DISP8) {
-	ElfSym *esym;
-        int jmp_disp;
+	ElfSym *esym = 0;
+        int jmp_disp = 0;
 
         /* see if we can really generate the jump with a byte offset */
 	esym = elfsym(ops[0].e.sym);
@@ -1171,7 +1171,7 @@ again:
    numbered constraints) */
 static inline int constraint_priority(const char *str)
 {
-    int priority, c, pr;
+    int priority = 0, c = 0, pr = 0;
 
     /* we take the lowest priority */
     priority = 0;
@@ -1230,8 +1230,8 @@ static const char *skip_constraint_modifiers(const char *p)
    type, otherwise return -1. With GCC the % is optional, too. */
 ST_FUNC int asm_parse_regvar (int t)
 {
-    const char *s;
-    Operand op;
+    const char *s = 0;
+    Operand op = {0};
     if (t < TOK_IDENT || (t & SYM_FIELD))
         return -1;
     s = table_ident[t - TOK_IDENT]->str;
@@ -1259,11 +1259,11 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
                                     const uint8_t *clobber_regs,
                                     int *pout_reg)
 {
-    ASMOperand *op;
-    int sorted_op[MAX_ASM_OPERANDS];
-    int i, j, k, p1, p2, tmp, reg, c, reg_mask;
-    const char *str;
-    uint8_t regs_allocated[NB_ASM_REGS];
+    ASMOperand *op = 0;
+    int sorted_op[MAX_ASM_OPERANDS] = {0};
+    int i = 0, j = 0, k = 0, p1 = 0, p2 = 0, tmp = 0, reg = 0, c = 0, reg_mask = 0;
+    const char *str = 0;
+    uint8_t regs_allocated[NB_ASM_REGS] = {0};
 
     /* init fields */
     for(i=0;i<nb_operands;i++) {
@@ -1509,7 +1509,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands,
 ST_FUNC void subst_asm_operand(CString *add_str,
                               SValue *sv, int modifier)
 {
-    int r, reg, size, val;
+    int r = 0, reg = 0, size = 0, val = 0;
 
     r = sv->r;
     if ((r & VT_VALMASK) == VT_CONST) {
@@ -1622,9 +1622,9 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
                          uint8_t *clobber_regs,
                          int out_reg)
 {
-    uint8_t regs_allocated[NB_ASM_REGS];
-    ASMOperand *op;
-    int i, reg;
+    uint8_t regs_allocated[NB_ASM_REGS] = {0};
+    ASMOperand *op = 0;
+    int i = 0, reg = 0;
 
     /* Strictly speaking %Xbp and %Xsp should be included in the
        call-preserved registers, but currently it doesn't matter.  */
@@ -1664,7 +1664,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
                     op->is_memory) {
                     /* memory reference case (for both input and
                        output cases) */
-                    SValue sv;
+                    SValue sv = {0};
                     sv = *op->vt;
                     sv.r = (sv.r & ~VT_VALMASK) | VT_LOCAL | VT_LVAL;
                     sv.type.t = VT_PTR;
@@ -1673,7 +1673,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
                     /* load value in register */
                     load(op->reg, op->vt);
                     if (op->is_llong) {
-                        SValue sv;
+                        SValue sv = {0};
                         sv = *op->vt;
                         sv.c.i += 4;
                         load(TREG_XDX, &sv);
@@ -1688,7 +1688,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
             if (op->reg >= 0) {
                 if ((op->vt->r & VT_VALMASK) == VT_LLOCAL) {
                     if (!op->is_memory) {
-                        SValue sv;
+                        SValue sv = {0};
                         sv = *op->vt;
                         sv.r = (sv.r & ~VT_VALMASK) | VT_LOCAL;
 			sv.type.t = VT_PTR;
@@ -1701,7 +1701,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
                 } else {
                     store(op->reg, op->vt);
                     if (op->is_llong) {
-                        SValue sv;
+                        SValue sv = {0};
                         sv = *op->vt;
                         sv.c.i += 4;
                         store(TREG_XDX, &sv);
@@ -1723,9 +1723,9 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands,
 
 ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str)
 {
-    int reg;
+    int reg = 0;
 #ifdef TCC_TARGET_X86_64
-    unsigned int type;
+    unsigned int type = 0;
 #endif
 
     if (!strcmp(str, "memory") ||

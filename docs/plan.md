@@ -723,6 +723,13 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - `((int,int){1,2}[0])` 这种“复合字面量外面再套一层括号、下标写在括号里”的
   写法报 `')' expected (got '[')`：下标写在括号外（`((int,int){1,2})[0]`）或
   去掉外层括号即可；
+- 元组/模式猜测会在失败时把扫过的 token 用 `begin_macro()` 塞回输入流，
+  而猜测期间调用的 `parse_btype()`/`decl()` 自己也可能再塞一层回放；原来
+  收尾的 `end_macro()` 会弹错栈顶，漏在外面的那层回放把 token 再发一遍
+  （`((a) < b);` 这种“语句以括号组开头”的写法因此报
+  `expression expected before '<'`）。现在这些点统一走 `tccpp.c` 的
+  `macro_unwind_above()` / `end_macro_under()` / `macro_rewind()`：先把
+  猜测期间压上去的回放全部弹掉，再回到自己的那一层；
 - 结构体方法必须在调用点之前声明或定义（单趟编译约束）；只支持 `->`，
   `v.f()` 按普通成员访问处理，同名字段优先于方法；
 - 方法符号是 `<结构体>_<方法>`，源码名是弱别名：同一个类型仍然只能有一个
@@ -749,6 +756,15 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   给某个 TU 开启扩展后，该 TU 内所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的
   全局/`static` 对象放进 `.data`（不写初始化器时在 `.bss`），因此给大型
   静态缓冲区补初始化器会增大输出文件；
+- TCC 自己的源码也按这条规则写：`make c6selfcheck` 用 `-std=c6` 编译
+  `tcc/tcc.c`（原生目标文件 + C99 后端产物）并把编出来的编译器连起来跑。
+  为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type` 等）从
+  "头文件里的暂定定义"改成"头文件 `extern` 声明 + 各自 `.c` 里带初始化器
+  定义一次"（`ST_DATA` 的 `ONE_SOURCE` 分支也跟着去掉了 `static`）；
+  c6 的关键字（`err`、`test`、`import` 等）在 tcc 源码里原来的标识符用法
+  改成了别的名字；`x86_64-gen.c` 的 `gfunc_prolog` 定义补了 `ST_FUNC`，
+  否则原型（`static`）和定义（`extern`）是两个符号，c6 的方法登记会报
+  `duplicate method`；
 - `-test` 与 `-run` 同时出现时 `-run` 不告警（两者都选择内存执行）；
 - 切片 `T[:]` 是**视图**：`{元素指针, 长度}` 两个机器字，不拥有元素，也没有
   `append`/`cap`/动态扩容/深拷贝；`data` 字段是 `T *const`，所以切片头不能被
