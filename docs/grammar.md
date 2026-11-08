@@ -859,6 +859,18 @@ parameter-list    = identifier , { "," , identifier } ;
 | C63 | `import` 打开的文件必须声明同名模块（点号形式按组合后的前缀比较） | `module file declares 'a__b', expected 'a__c'` |
 | C64 | 模块不能直接或间接 import 自己 | `circular import of module 'x'` |
 | C65 | `-emit-header` 只能用于声明了 `module` 的翻译单元；匿名 struct/union 必须已有 typedef 才能写出 | `-emit-header requires a 'module NAME;' declaration`；`cannot write a C header for an anonymous struct type; give it a typedef first` |
+| C66 | 强引用类型图里不能有环（含自环、数组、按值嵌入） | `reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own' (type 'A' at a.c:3)` |
+| C67 | `weak` 不能出现在 `async` 函数里（帧会搬动） | `a 'weak' reference cannot be declared in an async function: its frame is moved to the task` |
+| C68 | 含托管字段的结构体不能按值拷贝/传参/返回 | `'%s' holds managed references: %s is not possible. Allocate it with 'new' and hold it in '@%s'` |
+| C69 | 托管引用只能存进托管槽；借出的指针不能保存 | `a new reference cannot be stored in '%s': it is not a managed reference`；`storing a borrowed reference keeps it alive without counting` |
+| C70 | 形参是借用，不能改写 | `'%s' is a borrow: it owns nothing, so it cannot be reassigned (copy it into an owned local first)` |
+| C71 | `own @T` 只接受 `new` 的结果、`move()` 或空值 | `'%s' takes ownership: only a fresh reference ('new') or the empty value can be stored in it` |
+| C72 | `shared @T` 槽要求对象用 `new shared T` 建（计数在对象头里） | `a 'shared' slot needs an object with an atomic count: create it with 'new shared T', not 'new T'` |
+| C73 | `@T`/`own @T` 不能跨线程或跨帧（`go`/`async` 只收 `shared @T`） | `passing a reference to 'go' requires 'shared'`；`passing a reference to 'async' requires 'shared'` |
+| C74 | `union` 不能含托管字段；含托管字段的结构体必须在文件作用域定义、不能有托管柔性数组 | `'%s' is a union with a managed field: ...`；`... is defined in a block: define it at file scope`；`... has a flexible array of managed references` |
+| C75 | `memcpy`/`memmove` 不能作用于含托管字段的对象；`memset` 会漏引用（告警） | `... breaks reference counting; use a typed copy or 'own'` |
+| C76 | 析构 `drop` 不能手动调用、不能失败/挂起、必须返回 `void`、每个类型至多一个 | `a destructor cannot be called: ...`；`a destructor cannot fail: ...`；`a destructor cannot suspend: ...`；`'%s' already has a destructor` |
+| C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
 
 ---
 
@@ -1079,6 +1091,20 @@ math.Point p;                    (* 类型 => math__Point *)
 typedef、函数和全局变量写成普通 C 头文件，符号名就是带前缀的 C 名。
 切片 `T[:]` 和元组 `(T1, T2)` 会生成 `NAME__slice_N` / `NAME__tuple_N`
 的 `typedef`；纯 C 侧包含这个头文件即可调用，不需要知道 `module` 的存在。
+
+### 8.1 托管引用的重写
+
+| 源码 | 生成 |
+|---|---|
+| `@T p = new T;` | `__c6_gc_new(size, 1, &desc, 0)` 的结果经 `__c6_gc_store(&p, v, INIT)` 落进槽（不额外 +1） |
+| `p = q;`（`q` 是托管引用） | `__c6_gc_store(&p, q, mode)`：先给 `q` +1，再释放 `p` 的旧值、写槽 |
+| `p = NULL;` | 同一次 `__c6_gc_store`：旧值 −1、槽清零（这就是提前放手） |
+| `own @T p = new T;` / `= move(q);` | `__c6_gc_own_store` / `__c6_gc_move(&q)`：旧链整条释放，新值不计数 |
+| 出作用域 / `return` / `break` / `goto` | 内联 `__c6_gc_release(&p, mode)`（注册在 defer 记录里，所以每条路径都跑到） |
+| 对象计数归零 | 调描述符的 `drop`（若登记过），再按字段表逐个释放字段（数组逐元素、嵌入结构体递归），最后 `free` |
+| `go f(p)` / `task t = f(p)` | 实参块 / 任务前缀的那次拷贝 +1，块释放 / `__c6_co_destroy` 时 −1 |
+
+编译器不插入任何运行期调度：没有标记清扫线程，也没有安全点。
 
 ## 9. 示例
 
@@ -1436,6 +1462,13 @@ int main(void)
 
 以下写法**不是**本规范的一部分，编译器会报错：
 
+| `p->drop()` / `drop(p)` 手动调析构 | 约束 C76（对象只由引用决定生死） |
+| `reset()` 成员 | 不提供：提前放手就是 `p = NULL` |
+| `@T`/`own @T` 进 `go`/`async` | 约束 C73 |
+| `weak @T` 在 `async` 函数里 | 约束 C67 |
+| 通用图（`struct Node { @Node edges[4]; }`） | 约束 C66：环一律报错，只能写成 `own` 树或 `weak` 边 |
+| 运行期环回收（cycle collector） | 不做：环在编译期就挡住了 |
+| 自定义删除器 | V1 不做（析构只有 `drop` 方法一种） |
 | 写法 | 结果 |
 |---|---|
 | `try { … } catch { … }` 块形式 | 语法错误（`try` 只接一次调用） |
@@ -1558,6 +1591,17 @@ int main(void)
 | `!error` 的聚合返回值 | `c6_apply_fallible`（白名单加 `VT_STRUCT` / `VT_UNION`）、`c6_zero_local`、`c6_emit_propagate` / `c6_async_propagate`（失败路径清零） | `tcc/tccgen.c` |
 | 切片下标 / 区间 | `c6_slice_subscript`（`unary()` 的 `[` 分支）、`c6_slice_spill` | `tcc/tccgen.c` |
 | 数组 → 切片 | `c6_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
+| `@T` / `shared @T` / `weak @T` / `own @T` 限定符 | `parse_btype()` 的 `@` 前缀 + `c6_gc_qual()`（软关键字 `weak`/`own`/`shared`）、`CType.gq` 缓存 + pointee 上的可信副本、`c6_type_gq` / `c6_is_managed` / `c6_gc_plain` / `c6_gc_mode` | `tcc/tccgen.c`、`tcc/tcc.h` |
+| `new T` / `new T[n]` / `new shared T` | `c6_gc_new_expr()`（`unary()` 的 `c6_gc_new_lead()` 分支）→ `__c6_gc_new(size, count, desc, flags)` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| 托管槽的存/取 | `c6_gc_store_hook()`（`vstore()` 里）→ `__c6_gc_store` / `__c6_gc_own_store` / `__c6_gc_weak_store` | 同上 |
+| 作用域退出 / `return` / `break` / 跳转 | `c6_gc_site()`（复用 defer 记录）+ `__c6_gc_release(slot, mode)` | 同上 |
+| `p = NULL` 提前放手 | 同一次 `__c6_gc_store` 调用（旧值释放、槽清零） | 同上 |
+| `move(p)` | `c6_gc_move_expr()`（`unary()` 的 `c6_gc_move_lead()` 分支）→ `__c6_gc_move(slot)` | 同上 |
+| 描述符（字段表 + 析构指针） | `c6_gc_collect()` / `c6_gc_flush_descs()`（TU 末尾发射，名字带文件名哈希） | `tcc/tccgen.c` |
+| 环检测 | `c6_gc_cycle_check()` / `c6_gc_cycle_dfs()`（`c6_gc_flush_descs()` 里） | `tcc/tccgen.c` |
+| 析构 `drop` | `c6_gc_drop_register()`（`c6_method_register()` 里）、`c6_gc_is_drop()` / `c6_gc_drop_callee()`（禁止显式调用）、描述符的 `drop` 指针 | 同上 |
+| 全局根 | `c6_gc_root_add()`（`decl()` 里）+ TU 末尾的 `__attribute__((constructor))` / `((destructor))` 对 | 同上 |
+| 运行期全部 | `__c6_gc_new` / `__c6_gc_store` / `__c6_gc_release` / `__c6_gc_drop` / `__c6_gc_move` / `__c6_gc_incref` / `__c6_gc_weak_store` / `__c6_gc_drain_budget` / `__c6_gc_shutdown`，以及 `async`/`go` 的任务槽归还（`__c6_rel_NAME`）| `tcc/lib/libtcc1.c`、`tcc/c99-rt.inc` |
 | `foreach` | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句）、`c6_common_int_type` / `c6_is_int_type`；数组/切片的隐藏槽复用 `c6_slice_spill`，循环体走 `lblock`；文件作用域诊断在 `decl()` | `tcc/tccgen.c` |
 | 切片运行期 | `__tcc_slice_index` / `__tcc_slice_sub` | `tcc/lib/libtcc1.c` |
 | `async` 声明 | `c6_async_declare`（合成 `struct NAME_task` 的 token）、`FuncAttr.func_async`、`parse_btype()` 的 `TOK_C6_ASYNC` | `tcc/tccgen.c`、`tcc/tcc.h` |

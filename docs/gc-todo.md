@@ -423,15 +423,25 @@
 
 ---
 
-## P8 文档与全量回归
+## P8 ✅ 文档与全量回归
 
-- `README.md`：新增“托管引用（引用计数 GC）”一节（类型语义、`p = NULL`、`drop`、
-  `weak`/`own`/`shared`、环检测报错、async 限制、与 C++ 智能指针对照、性能数字）；
-  更新 `:932` 那句“没有隐藏状态也没有 GC”；
-- `docs/grammar.md`：§7 静态约束（E-GC1..E-GC13）、§8 重写规则（存储/释放/
-  `new` 降级）、§10 不支持形式、§11 实现位置；
-- `docs/plan.md`：§11 实施状态表补阶段行；
-- 回归：`make test-all`、`BACKEND=c99 tests/run-tests.sh`、`make test-plain`。
+结果：
+
+- `README.md`：新增「托管引用（引用计数 GC）」一节（四种限定符的语义表、
+  `p = NULL`、`move`、`drop`、环是编译错误、async/go 的限制、性能数字、
+  与 C++ 智能指针的对照），并把「切片没有隐藏状态也没有 GC」那句改清楚
+  （切片不是 GC 对象，托管引用是另一回事）；测试目录清单补上 7 个 gc 用例；
+- `docs/grammar.md`：§7 静态约束补 C66–C77（环、借用、`own`/`shared` 的
+  存储规则、跨帧/跨线程、`union`/块内定义/柔性数组、`memcpy`、析构、
+  `move`）；新增 §8.1「托管引用的重写」（源码 → 生成代码对照表）；
+  §10 未支持的写法补 7 条（显式调析构、`reset()`、跨边界传 `@T`、
+  async 里的 `weak`、通用图、运行期环回收、自定义删除器）；§11 实现位置
+  补 13 行；
+- `docs/plan.md`：§11 实施状态表补 19–25 行（P0/P1、P2、P3、P4、P5、P6、P7）；
+- `docs/gc-design.md` / `docs/gc-todo.md`：每个阶段的“落地状态（与计划的差异）”。
+
+全量回归（本阶段最后一次）：`make test-all`（selftest 51 + tests2 全绿）、
+`BACKEND=c99 tests/run-tests.sh` 52 通过、`make test-plain` 绿。
 
 ---
 
