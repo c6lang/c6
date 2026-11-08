@@ -3907,6 +3907,41 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "#define C6_CO_EV_READ  1\n"
           "#define C6_CO_EV_WRITE 2\n"
           "#endif\n"
+          /* reference-counting GC (docs/gc-design.md): the per-type
+             descriptors the compiler emits and the runtime entry points that
+             every generated store and release goes through */
+          "#ifndef __TCC_GC_DEFINED\n"
+          "#define __TCC_GC_DEFINED 1\n"
+          /* 'NULL' is the empty value of a managed reference and the
+             canonical way to release one ('p = NULL'), so c6 code must not
+             depend on including a header first */
+          "#ifndef NULL\n"
+          "#define NULL ((void*)0)\n"
+          "#endif\n"
+          "struct __c6_gc_field {\n"
+          "    unsigned off, kind, count, stride;\n"
+          "    const struct __c6_gc_desc *sub;\n"
+          "};\n"
+          "struct __c6_gc_desc {\n"
+          "    unsigned size, align, nfields, flags;\n"
+          "    void (*drop)(void *);\n"
+          "    const struct __c6_gc_field *fields;\n"
+          "};\n"
+          "void *__c6_gc_new(unsigned long size, unsigned long count,\n"
+          "                  const struct __c6_gc_desc *d);\n"
+          "void __c6_gc_store(void **slot, void *nv, int mode);\n"
+          "void __c6_gc_own_store(void **slot, void *nv);\n"
+          "void __c6_gc_release(void **slot, int mode);\n"
+          "void __c6_gc_weak_upgrade(void **dst, void **weak_slot);\n"
+          "unsigned long __c6_gc_live(void);\n"
+          "unsigned long __c6_gc_refcount(void *p);\n"
+          "void __c6_gc_drain_budget(int n);\n"
+          "void __c6_gc_shutdown(void);\n"
+          "#define C6_GC_FRESH   1\n"
+          "#define C6_GC_ATOMIC  2\n"
+          "#define C6_GC_WEAK    4\n"
+          "#define C6_GC_OWN     8\n"
+          "#endif\n"
           , -1);
 #endif
     }

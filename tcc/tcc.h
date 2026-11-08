@@ -465,7 +465,24 @@ typedef struct CString {
 typedef struct CType {
     int t;
     struct Sym *ref;
+    /* c6: qualifiers of a managed reference ('@T').  A managed pointer is
+       VT_PTR plus C6_GQ_MANAGED in this byte; the pointee lives in 'ref' as
+       for every other pointer, so '@T' has exactly the ABI of 'T *'.
+       Zero for all ordinary C types. */
+    unsigned char gq;
 } CType;
+
+/* bits of CType.gq (c6 managed references) */
+#define C6_GQ_MANAGED 0x08  /* '@': reference counted */
+#define C6_GQ_WEAK    0x01  /* 'weak @T': does not keep the target alive */
+#define C6_GQ_OWN     0x02  /* 'own @T': exclusive ownership, no count */
+#define C6_GQ_SHARED  0x04  /* 'shared @T': atomic count, may cross threads */
+#define C6_GQ_QUAL    (C6_GQ_WEAK | C6_GQ_OWN | C6_GQ_SHARED)
+
+/* c6: ownership state of a managed reference carried by an SValue */
+#define C6_GC_BORROW 0  /* borrowed: usable, never released by us */
+#define C6_GC_FRESH  1  /* 'new ...': owned, must be consumed exactly once */
+#define C6_GC_OWNED  2  /* read out of a managed slot: a borrow until stored */
 
 /* long double words on host(!) platform */
 #define LDOUBLE_WORDS ((sizeof(long double)+3)/4)
@@ -489,6 +506,10 @@ typedef struct SValue {
     unsigned short r;      /* register + flags */
     unsigned short r2;     /* second register, used for 'long long'
                               type. If not used, set to VT_CONST */
+    /* c6 managed references: ownership of this value, and whether it was
+       derived from a managed reference (used to reject storing a borrow) */
+    unsigned char gc_state;
+    unsigned char gc_src;
     union {
       struct { int jtrue, jfalse; }; /* forward jmps */
       CValue c;         /* constant, if VT_CONST */
@@ -785,6 +806,43 @@ typedef struct C6HeaderDecl {
 #define C6_HD_FUNC    4
 #define C6_HD_VAR     5
 
+/* c6 managed references (reference-counting GC) ------------------------- */
+
+/* field kinds, must match 'struct __c6_gc_field.kind' in the runtime */
+#define C6_GCK_STRONG 1   /* '@T'   : counted reference */
+#define C6_GCK_WEAK   2   /* 'weak @T': slot is cleared when the target dies */
+#define C6_GCK_OWN    3   /* 'own @T': exclusive, released with the owner */
+#define C6_GCK_EMBED  4   /* a by-value struct that holds managed references */
+
+/* one managed field of a struct */
+typedef struct C6GcField {
+    int off;          /* offset inside the payload */
+    int kind;         /* C6_GCK_* */
+    int count;        /* array length, 1 for a scalar */
+    int stride;       /* element stride */
+    int sub_tag;      /* struct tag for C6_GCK_EMBED / pointed-to struct */
+} C6GcField;
+
+/* one struct type known to the GC */
+typedef struct C6GcType {
+    int tag;                  /* struct tag token */
+    int nfields;
+    C6GcField *fields;
+    char *src_file;           /* for cycle diagnostics */
+    int src_line;
+    int atomic;               /* holds 'shared' references */
+    int has_weak;
+    int emitted;              /* descriptor emitted at the end of the unit */
+    int mark;                 /* cycle-check DFS state (0 = unseen) */
+} C6GcType;
+
+/* one 'A has a strong field of type B' record, used by the cycle check */
+typedef struct C6GcEdge {
+    int from_tag, to_tag;
+    int field_tok;            /* field name, for the diagnostic */
+    int cross_tu;             /* target defined in another unit (link time) */
+} C6GcEdge;
+
 #endif
 
 struct TCCState {
@@ -875,6 +933,14 @@ struct TCCState {
     struct C6HeaderDecl **c6_header_decls;
     int c6_nb_header_decls;
     char *c6_emit_header;
+    /* reference-counting GC: struct types with managed fields, and the
+       strong edges between them (see docs/gc-design.md) */
+    struct C6GcType **c6_gc_types;
+    int c6_nb_gc_types;
+    struct C6GcEdge *c6_gc_edges;
+    int c6_nb_gc_edges, c6_gc_edges_cap;
+    int c6_gc_seq;           /* descriptor counter, for generated names */
+    int c6_gc_nested;        /* >0 while compiling an async body */
 #endif
 
     unsigned char dflag; /* -dX value */

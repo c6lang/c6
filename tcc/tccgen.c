@@ -331,6 +331,7 @@ static void c6_go_parse(void);
 static void c6_sp_flush(void);
 static int c6_soft_kw(int t);
 static int c6_soft_kw_shadowed(int t);
+static int c6_gc_qual(int t);
 #define C6_KW_NONE 0
 #define C6_KW_CO   1
 #define C6_KW_GO   2
@@ -3144,6 +3145,23 @@ static void type_to_str(char *buf, int buf_size,
             type_to_str(buf, buf_size, &s->type, buf1);
             goto no_var;
         }
+#ifdef C6_EXT
+        /* a managed reference prints as '@T' rather than '*' */
+        if (type->gq & C6_GQ_MANAGED) {
+            int l;
+            if (type->gq & C6_GQ_WEAK)
+                pstrcat(buf, buf_size, "weak ");
+            if (type->gq & C6_GQ_OWN)
+                pstrcat(buf, buf_size, "own ");
+            if (type->gq & C6_GQ_SHARED)
+                pstrcat(buf, buf_size, "shared ");
+            pstrcat(buf, buf_size, "@");
+            l = strlen(buf);
+            pstrcpy(buf1, sizeof(buf1), varstr ? varstr : "");
+            type_to_str(buf + l, buf_size - l, &s->type, varstr ? buf1 : NULL);
+            goto no_var;
+        }
+#endif
         pstrcpy(buf1, sizeof(buf1), "*");
         if (t & VT_RESTRICT)
             pstrcat(buf1, sizeof(buf1), "restrict ");
@@ -3973,6 +3991,7 @@ ST_FUNC void mk_pointer(CType *type)
     s = sym_push(SYM_FIELD, type, 0, -1);
     type->t = VT_PTR | (type->t & VT_STORAGE);
     type->ref = s;
+    type->gq = 0;   /* a pointer to a managed reference is a plain pointer */
 }
 
 /* return true if type1 and type2 are exactly the same (including
@@ -5392,6 +5411,9 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
 {    int t, u, bt, st, type_found, typespec_found, g, n;
     Sym *s;
     CType type1;
+#ifdef C6_EXT
+    int gc_qual = 0, gc_managed = 0;
+#endif
 
     memset(ad, 0, sizeof(AttributeDef));
     type_found = 0;
@@ -5399,8 +5421,26 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
     t = VT_INT;
     bt = st = -1;
     type->ref = NULL;
+    type->gq = 0;
 
     while(1) {
+#ifdef C6_EXT
+        /* a managed reference: '@' is a prefix on the base type
+           ('@Node head;'), its qualifiers come first ('weak @Node p;') */
+        if (tcc_state->c6_ext) {
+            if (tok == '@') {
+                gc_managed = 1;
+                next();
+                continue;
+            }
+            g = c6_gc_qual(tok);
+            if (g && !c6_soft_kw_shadowed(tok)) {
+                gc_qual |= g;
+                next();
+                continue;
+            }
+        }
+#endif
         switch(tok) {
         case TOK_EXTENSION:
             /* currently, we really ignore extension */
@@ -5748,6 +5788,20 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
         type_found = 1;
     }
 the_end:
+#ifdef C6_EXT
+    if (gc_managed) {
+        /* '@T' is a pointer to T with the managed qualifier attached: the
+           layout, the ABI and every pointer operation stay those of 'T *' */
+        type->t = t;
+        mk_pointer(type);
+        type->gq = C6_GQ_MANAGED | gc_qual;
+        t = type->t;
+        if ((type->ref->type.t & VT_BTYPE) == VT_VOID)
+            tcc_error("'@' needs an object type, not 'void'");
+    } else if (gc_qual) {
+        tcc_error("'weak', 'own' and 'shared' are only valid in front of '@'");
+    }
+#endif
     if (tcc_state->char_is_unsigned) {
         if ((t & (VT_DEFSIGN|VT_BTYPE)) == VT_BYTE)
             t |= VT_UNSIGNED;
@@ -10508,6 +10562,17 @@ static void c6_tu_reset(void)
                    &tcc_state->c6_nb_loading_modules);
     dynarray_reset(&tcc_state->c6_header_decls,
                    &tcc_state->c6_nb_header_decls);
+    for (i = 0; i < tcc_state->c6_nb_gc_types; i++) {
+        C6GcType *gt = tcc_state->c6_gc_types[i];
+        if (!gt)
+            continue;
+        tcc_free(gt->fields);
+        tcc_free(gt->src_file);
+    }
+    dynarray_reset(&tcc_state->c6_gc_types, &tcc_state->c6_nb_gc_types);
+    tcc_free(tcc_state->c6_gc_edges);
+    tcc_state->c6_gc_edges = NULL;
+    tcc_state->c6_nb_gc_edges = tcc_state->c6_gc_edges_cap = 0;
     c6_importing = 0;
     c6_expected_module = NULL;
     tcc_free(tcc_state->c6_package);
@@ -13934,6 +13999,23 @@ static int c6_soft_kw_shadowed(int t)
 
     return s && (s->r & VT_TYPEDEF);
 }
+
+/* 'weak' / 'own' / 'shared' in front of '@', as a CType.gq bit */
+static int c6_gc_qual(int t)
+{
+    const char *s;
+
+    if (t < TOK_IDENT)
+        return 0;
+    s = get_tok_str(t, NULL);
+    switch (*s) {
+    case 'o': if (!strcmp(s, "own"))    return C6_GQ_OWN;    break;
+    case 's': if (!strcmp(s, "shared")) return C6_GQ_SHARED; break;
+    case 'w': if (!strcmp(s, "weak"))   return C6_GQ_WEAK;   break;
+    }
+    return 0;
+}
+
 
 /* ---------------------------------------------------------------------- */
 /* 'go f(a);' : run f on an OS thread                                      */
