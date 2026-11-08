@@ -1632,6 +1632,7 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 #define C6_CO_KIND_IO     1
 #define C6_CO_KIND_CHILD  2
 #define C6_CO_KIND_ERR    3
+#define C6_CO_KIND_ABORT  5   /* the task is being destroyed: run cleanups */
 
 #define C6_CO_STATE_NEW   0
 #define C6_CO_STATE_DONE  (-1)
@@ -1962,6 +1963,7 @@ static int tcc_co_step_once(TccCoTask *t)
     switch (k) {
     case C6_CO_KIND_DONE:
     case C6_CO_KIND_ERR:
+    case C6_CO_KIND_ABORT:
         leaf->state = C6_CO_STATE_DONE;
         leaf->kind = k;
         break;
@@ -2135,6 +2137,23 @@ int __c6_co_wait(void *self)
 
 /* Release a task and everything it owns.  A still-suspended body is dropped
    without running its remaining 'defer' statements. */
+void __c6_co_abort(void *self)
+{
+    TccCoTask *t = (TccCoTask *)self;
+
+    if (!t || t->state == C6_CO_STATE_DONE)
+        return;
+    /* the child owns the frame that is parked: roll it back first */
+    if (t->child)
+        __c6_co_abort(t->child);
+    t->child = 0;
+    if (t->state == C6_CO_STATE_NEW)
+        return;                     /* never started: nothing was allocated */
+    t->kind = C6_CO_KIND_ABORT;
+    t->waiting = 0;                 /* leave any parked descriptor wait */
+    tcc_co_step_once(t);            /* restore the frame, run the cleanups */
+}
+
 void __c6_co_destroy(void *self)
 {
     TccCoPool *co = tcc_th_co(tcc_th());
@@ -2142,6 +2161,8 @@ void __c6_co_destroy(void *self)
 
     if (!t)
         return;
+    if (t->state != C6_CO_STATE_DONE)
+        __c6_co_abort(t);           /* it still owns references: give back */
     if (t->child)
         __c6_co_destroy(t->child);
     t->child = 0;

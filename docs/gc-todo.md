@@ -32,7 +32,7 @@
 | P4 ✅ | 析构 `drop` 方法 | P3 | 全局根不能用 `atexit` |
 | P5 ✅ | `shared` + 跨帧/跨线程转移 | P2 | 任务 slot 的归还点在 `__c6_co_destroy` |
 | P6 ✅ | 静态环检测（硬错误） | P2/P3 | 链接期跨 TU 检查没做 |
-| P7 | async/go 集成与预算化 drain | P1/P5 | `__c6_co_abort` 回卷 |
+| P7 ✅ | async/go 集成与预算化 drain | P1/P5 | 回卷检查点放在 `await` 恢复点 |
 | P8 | 文档与全量回归 | 全部 | — |
 
 ---
@@ -379,37 +379,45 @@
 
 ---
 
-## P7 async/go 集成与预算化 drain
+## P7 ✅ async/go 集成与预算化 drain
 
-状态：**未开工**（P6 之后停在这里，P8 的 README/语法文档也还没写）。
-
-P7 第一版尝试过 `__c6_co_abort()` + 派发器里的 ABORT 分支，撤了，原因是编译器
-一侧的落点不对，记在这里免得下次再踩：
-
-- `c6_async_func_end()` 生成的恢复派发器在**函数作用域已经关闭之后**跑，
-  那时 `defer_state.enabled`/`has_sites` 已经复位，`c6_defer_begin(2, 0)`
-  是空操作 —— 生成的代码里只有 `__c6_co_finish(task, ABORT)`，清理体没进去，
-  于是“回卷”只标了 DONE，帧里的引用照样漏；
-- 强行把 `defer_state.enabled` 掰回 1 也不行：`c6_defer_func_end()` 已经把
-  那张“按记录派发”的跳转表 patch 完了，事后再发 `defer_begin` 的跳转会悬空；
-- 所以 ABORT 的清理必须发在 defer 仍然活着的区域里（比如每个 `await` 恢复点
-  之前，或者 `leave_scope` 结尾的钩子），再由派发器跳到那个标签；运行时那半
-  （`C6_CO_KIND_ABORT` = 5、`__c6_co_abort()`、`__c6_co_destroy()` 先回卷）
-  的写法在 `docs/gc-design.md` §9.3 里是现成的。
+结果：没跑完就被销毁的任务会**回卷** —— 恢复帧、跑 `errdefer` + `defer` +
+托管引用的内联释放，再以 `C6_CO_KIND_ABORT` 结束，所以挂起的任务不会漏掉它
+帧里的引用（`tests/gc_async.c` 的两个新块：`销毁挂起的任务会回卷`、
+`回卷会跑 defer 与 errdefer`）。验收：`make selftest` 51 通过、
+`BACKEND=c99 tests/run-tests.sh` 52 通过、`make test-plain` 绿。
 
 改动点：
 
-- `C6_CO_KIND_ABORT` + `__c6_co_abort()`；`__c6_co_destroy()` 先回卷（设计 §9.3）；
-- body 恢复派发器加 ABORT 分支（强制跑清理）；
-- 预算：队列消费在 `new`、作用域退出、协程调度步进处各消费一批；
-- 协程调度器每步之后 `__c6_gc_drain_budget()`（让协作式任务池不被级联卡住）。
+- `C6_CO_KIND_ABORT`（= 5）+ `__c6_co_abort(self)`：置 kind、清 `waiting`、
+  `tcc_co_step_once()` 恢复并跑清理；`__c6_co_destroy()` 在作废槽之前调用它；
+  `tcc_co_step_once()` 的 switch 接受 ABORT；
+- 编译器：`c6_async_suspend()` 在**每个 `await` 的恢复点**（`c6_def_label()`
+  之后）发 `if (__c6_co_kind(task) == 5) { <defer_begin(2,0)> finish(5) }`；
+- `__c6_co_abort()` 对「从未启动」的任务直接返回（还没分配任何东西），对
+  子任务递归回卷；
+- 预算：不需要新机制 —— `c6_gc_drop()` 里每次释放最多处理
+  `C6_GC_DRAIN_BUDGET`（256）个，级联自然摊平；`__c6_gc_drain_budget(n)`
+  留着手工跑完（`tests/gc_field.c` 的长链用例在用）。
 
-测试：
+落地状态（与计划的差异）：
 
-- `tests/async.c` 增：未 `await` 完就 `__c6_co_destroy` 的任务释放全部引用；
-- `tests/gc_async.c`：`errdefer` 在 ABORT 回卷里执行；大数据在 async 体里分配释放；
-- 1M 节点链一次性释放的延迟测试（放到 `examples/` 或 `tests/exit/`，
-  断言不超时而不是断言具体毫秒）。
+- **检查点从“末尾恢复派发器”挪到了“每个 `await` 的恢复点”**：第一版按计划
+  放在 `c6_async_func_end()`，结果 `defer_state.enabled` 那时已经复位，
+  `c6_defer_begin()` 是空操作 —— 生成的代码里只有 `__c6_co_finish(task, 5)`，
+  清理体没进去，帧里的引用照样漏；把 `enabled` 掰回 1 也不行，
+  `c6_defer_func_end()` 已经把跳转表 patch 完，事后补发会悬空。
+  恢复点还在 body 中间，defer 机制活着、跳转表还没定稿，所以能正常发。
+  代价是每个 `await` 多一次 `__c6_co_kind()` 调用；
+- **1M 节点链的延迟测试没写**：断言“不超时”的测试在不同机器上不稳，
+  改成靠 `tests/gc_field.c` 的 20000 长链 + 显式 drain 覆盖正确性；
+- **C99 后端要同步**：`tcc/c99-rt.inc` 里同样要有 `C6_CO_KIND_ABORT`、
+  `__c6_co_abort()`、`__c99_co_step_once()` 的 ABORT 分支和
+  `__c6_co_destroy()` 的回卷调用 —— 少一处，`BACKEND=c99` 就会有用例失败
+  （这次就是这么发现的）。
+
+测试：`tests/gc_async.c` 新增两个块（帧里的引用还回来、`defer`/`errdefer`
+各跑一次）。
 
 验收：同 P1。
 

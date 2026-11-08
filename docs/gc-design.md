@@ -545,10 +545,30 @@ void __c6_co_destroy(void *self)
 }
 ```
 
-body 一侧：`c6_async_func_end()`（`tcc/tccgen.c:13472`）的恢复派发器在
-`__c6_co_kind(task) == C6_CO_KIND_ABORT` 时强制置错误标志、跳到 defer/err 派发器
-（无条件跑 `errdefer`+`defer`+内联释放），再 `c6_async_finish(C6_CO_KIND_ABORT)`。
+**落地（P7）**：检查点不放在末尾的恢复派发器里，而放在**每个 `await` 的恢复点**
+（`c6_async_suspend()` 里 `c6_def_label()` 之后）：
+
+```c
+if (__c6_co_kind(task) == C6_CO_KIND_ABORT) {
+    /* 跑 errdefer + defer + 内联释放 */
+    __c6_co_finish(task, C6_CO_KIND_ABORT);
+    return C6_CO_KIND_ABORT;
+}
+```
+
+原因：末尾派发器是在函数作用域关闭**之后**生成的，那时 `defer_state.enabled`
+已经复位，`c6_defer_begin()` 是空操作（第一版就栽在这里：只发出 `finish`，
+清理体没进去，帧里的引用照样漏）；而且 `c6_defer_func_end()` 已经把按记录
+派发的跳转表 patch 完了，事后补发会悬空。恢复点在 body 中间，defer 机制还活着，
+跳转表也还没定稿。代价是每个 `await` 多一次 `__c6_co_kind()` 调用。
+
 一步就能跑完，因为清理体里禁止 `await`（`tcc/tccgen.c:13508` 已有该检查）。
+
+**预算（§11.4）**：已经是「每次释放最多 256 个」（`c6_gc_drain(th,
+C6_GC_DRAIN_BUDGET)` 在 `c6_gc_drop()` 里，`lib/libtcc1.c:1271`），
+级联释放跨多次释放摊平，不需要编译器在 `new`/作用域退出处再插调用；
+`__c6_gc_drain_budget(n)` 仍导出给想手工跑完队列的代码（`tests/gc_field.c`
+的长链用例用它）。
 
 ### 9.4 所有权的跨帧/跨线程转移
 

@@ -159,6 +159,63 @@ test "托管返回值由任务的 val 槽持有" {
     }
 }
 
+/* ---- 4b. 没跑完的任务被销毁：帧里的引用要还回来 ---- */
+async int t4b_body(int k)
+{
+    @Node n = new Node;
+
+    n->v = k;
+    await c6_io(-1, 1);                /* fd 非法：任务停在这里，永不就绪 */
+    return n->v;
+}
+
+test "销毁挂起的任务会回卷（帧里的引用不漏）" {
+    unsigned long base = __c6_gc_live();
+    struct t4b_body_task *t = t4b_body(65);
+
+    if (__c6_co_wait(t) != -1)         /* fd 非法 → 挂起，wait 返回 -1 */
+        err(50, "任务应当挂起");
+    if (__c6_gc_live() != base + 1)
+        err(51, "挂起的任务应当持有它帧里的对象");
+    __c6_co_destroy(t);                /* 回卷：恢复帧、跑清理、放掉 n */
+    if (__c6_gc_live() != base)
+        err(52, "销毁挂起的任务后帧里的引用应当还回来");
+}
+
+/* ---- 4c. 回卷会跑 defer 与 errdefer ---- */
+static int ab_defer_runs = 0;
+static int ab_errdefer_runs = 0;
+
+async int t4c_body(int k)
+{
+    @Node n = new Node;
+
+    errdefer { ab_errdefer_runs++; }
+    defer { ab_defer_runs++; }
+    n->v = k;
+    await c6_io(-1, 1);
+    return n->v;
+}
+
+test "回卷会跑 defer 与 errdefer" {
+    unsigned long base = __c6_gc_live();
+    struct t4c_body_task *t = t4c_body(66);
+
+    ab_defer_runs = 0;
+    ab_errdefer_runs = 0;
+    if (__c6_co_wait(t) != -1)
+        err(60, "任务应当挂起");
+    if (ab_defer_runs != 0 || ab_errdefer_runs != 0)
+        err(61, "还没销毁就跑清理了");
+    __c6_co_destroy(t);
+    if (ab_defer_runs != 1)
+        err(62, "defer 没有在回卷里跑一次");
+    if (ab_errdefer_runs != 1)
+        err(63, "errdefer 没有在回卷里跑一次");
+    if (__c6_gc_live() != base)
+        err(64, "回卷后帧里的引用应当还回来");
+}
+
 /* ---- 5. 普通（非托管）参数照旧 ---- */
 async int t5_body(int a, int b)
 {

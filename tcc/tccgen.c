@@ -13545,6 +13545,23 @@ static void c6_async_suspend(int kind)
     label = c6_new_label("co_resume");
     c6_def_label(label);
     CODE_ON();                          /* the resumed code is real code */
+    /* The task is being destroyed before it finished ('__c6_co_destroy'):
+       do not continue the body, run every cleanup instead, so the references
+       it still owns are given back (design §9.3).  This has to be emitted
+       here, at the resume point: the deferred records live in the task and
+       only here is 'defer_state' still able to emit their dispatcher. */
+    {
+        int j;
+        c6_rt_begin("__c6_co_kind");
+        c6_async_push_task();
+        c6_rt_end("__c6_co_kind", 1);
+        vpushi(5);                  /* C6_CO_KIND_ABORT */
+        gen_op(TOK_EQ);
+        j = gvtst(1, 0);            /* skip the abort path when it is not */
+        c6_defer_begin(2, 0);       /* errdefer + defer + inline releases */
+        c6_async_finish(5);         /* C6_CO_KIND_ABORT */
+        gsym(j);
+    }
     site = tcc_mallocz(sizeof *site);
     site->state = state;
     site->label = label;

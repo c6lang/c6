@@ -484,6 +484,7 @@ C99_RT_UNUSED __c99_rt_linkage void __tcc_slice_sub(void *out, const void *slice
 #define C6_CO_KIND_IO     1
 #define C6_CO_KIND_CHILD  2
 #define C6_CO_KIND_ERR    3
+#define C6_CO_KIND_ABORT  5   /* the task is being destroyed: run cleanups */
 
 #define C6_CO_STATE_NEW   0
 #define C6_CO_STATE_DONE  (-1)
@@ -802,6 +803,7 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
     switch (k) {
     case C6_CO_KIND_DONE:
     case C6_CO_KIND_ERR:
+    case C6_CO_KIND_ABORT:
         leaf->state = C6_CO_STATE_DONE;
         leaf->kind = k;
         break;
@@ -981,6 +983,22 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_wait(void *self)
 
 /* Release a task and everything it owns.  A still-suspended body is dropped
    without running its remaining 'defer' statements. */
+C99_RT_UNUSED __c99_rt_linkage void __c6_co_abort(void *self)
+{
+    C99CoTask *t = (C99CoTask *)self;
+
+    if (!t || t->state == C6_CO_STATE_DONE)
+        return;
+    if (t->child)
+        __c6_co_abort(t->child);
+    t->child = 0;
+    if (t->state == C6_CO_STATE_NEW)
+        return;
+    t->kind = C6_CO_KIND_ABORT;
+    t->waiting = 0;
+    __c99_co_step_once(t);
+}
+
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_destroy(void *self)
 {
     C99CoPool *co = __c99_th_co(__c99_th());
@@ -988,6 +1006,8 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_destroy(void *self)
 
     if (!t)
         return;
+    if (t->state != C6_CO_STATE_DONE)
+        __c6_co_abort(t);           /* it still owns references: give back */
     if (t->child)
         __c6_co_destroy(t->child);
     t->child = 0;
