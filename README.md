@@ -896,20 +896,38 @@ the byte array `__c99_frm.f` addressed by tcc's own local offsets, comparisons
 are materialised into `__c99_cnd`, and data sections are emitted as byte arrays
 that `__c99_init()` patches from the relocation table at start-up.
 
-Working today: plain C programs — integers, floats, pointers, arrays and
-string literals; locals and globals; `if`/`while`/`for`/`do`/`switch`;
-recursion and direct calls; static functions; `?:`, bit operations, shifts
-and all type casts.
+Plain C programs work: integers, floats, pointers, arrays and string literals;
+locals and globals; `if`/`while`/`for`/`do`/`switch`; recursion and direct and
+indirect calls; static functions; `?:`, bit operations, shifts and all type
+casts; structs, unions and functions returning structs.
 
-c6 programs are **not** supported yet.  The front-end can parse c6 syntax
-(`-std=c6`), but every function compiled that way calls the defer runtime at
-its entry (`__tcc_defer_func_enter`), and `foreach`/`defer`/`try`/`catch` call
-more `__tcc_defer_*` / `__tcc_err_*` helpers; those live in `libtcc1` (raw
-stack, pthreads) and cannot be expressed in portable C99.  Even
-`int main(void){return 0;}` compiled with `-std=c6` is rejected with
-"helper function '__tcc_defer_func_enter' cannot be expressed in portable C99".
-Making c6 work here first needs a portable C runtime for defer/error/slice.
+c6 programs work too.  A c6 translation unit (`-std=c6`) carries a portable C
+implementation of the defer/error/slice/coroutine/thread runtime, appended to
+its own output file.  It is ordinary C99 plus POSIX (`pthread` and `select`
+for `async`/`await`, `go` and `c6_io`); no `libtcc1` is needed.  The runtime
+symbols have weak linkage on GCC/Clang so that all generated translation units
+of one program share a single runtime (errors, coroutines and joins cross TU
+boundaries); compilers without weak symbols fall back to one private copy per
+TU.  Features covered by `tests/*.c` include `defer`/`errdefer`, `err`,
+`try`/`catch`, slices, `foreach`, tuples, methods/interfaces, `typename`,
+`async`/`await`, `co`, `go` and `test` blocks:
 
-Not supported yet (each gives a clear error instead of miscompiling): structs
-and unions, functions returning a struct, indirect calls (function pointers),
-defining variadic functions, computed goto, and VLAs.
+    tcc/c99-tcc -c99 -std=c6 -B tcc -o out.c prog.c
+    cc -std=c99 -pedantic -Wall -Wextra -Werror -o prog out.c
+    ./prog
+
+A generated file with `test` blocks but no `main` gets a synthesized `main`
+that runs them; a file with relocations but no `main` gets an
+`__attribute__((constructor))` initializer instead.
+
+Structs of at most eight bytes containing only integer/pointer fields use the
+x86-64 register-return ABI, so they interoperate with plain C (`tests/abi/`).
+Other struct returns use a hidden result pointer chosen by this back-end:
+that is consistent between c6 translation units, and for structs larger than
+16 bytes it also matches the native ABI, but mixing 9--16 byte struct returns
+with plain C is not supported.
+
+Not supported (each gives a clear error instead of miscompiling): defining
+variadic functions, computed goto, and variable length arrays.  On non-POSIX
+hosts the generated runtime still compiles, but `async`/`go`/`c6_io` need a
+platform port.
