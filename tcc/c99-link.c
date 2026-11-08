@@ -30,6 +30,18 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+/* Unlike the code generator, these entry points are called from
+   tcc_output_file(), i.e. after tcc_compile() has already left the global
+   state.  error1() works on tcc_state, so it has to be entered again before
+   raising the error; otherwise it would dereference a NULL TCCState and the
+   compiler would crash instead of printing the diagnostic.  There is nothing
+   to recover here, so the error is fatal. */
+static void c99_no_link(TCCState *s1, const char *fmt)
+{
+    tcc_enter_state(s1);
+    tcc_error("%s", fmt);
+}
+
 ST_FUNC int code_reloc(int reloc_type)
 {
     (void)reloc_type;
@@ -45,22 +57,21 @@ ST_FUNC int gotplt_entry_type(int reloc_type)
 ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset,
                                   struct sym_attr *attr)
 {
-    (void)s1; (void)got_offset; (void)attr;
-    tcc_error("c99 output: no dynamic linking");
+    (void)got_offset; (void)attr;
+    c99_no_link(s1, "c99 output: no dynamic linking");
     return 0;
 }
 
 ST_FUNC void relocate_plt(TCCState *s1)
 {
-    (void)s1;
-    tcc_error("c99 output: no dynamic linking");
+    c99_no_link(s1, "c99 output: no dynamic linking");
 }
 
 ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type,
                       unsigned char *ptr, addr_t addr, addr_t val)
 {
-    (void)s1; (void)rel; (void)type; (void)ptr; (void)addr; (void)val;
-    tcc_error("c99 output: no machine code relocation");
+    (void)rel; (void)type; (void)ptr; (void)addr; (void)val;
+    c99_no_link(s1, "c99 output: no machine code relocation");
 }
 
 #endif /* !TARGET_DEFS_ONLY */
