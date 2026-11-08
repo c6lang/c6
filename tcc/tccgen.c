@@ -5214,7 +5214,7 @@ static int c6_tuple_speculate(TokenString *ts, CType **pelems, int *pn)
         closed = tok == ')';
         break;
     }
-    end_macro();                        /* back to the real input */
+    end_macro_under(ts);                /* back to the real input */
     tok = save_tok;
     tokc = save_val;
     if (ok && closed && n >= 2) {
@@ -6980,7 +6980,7 @@ ST_FUNC void unary(void)
 	expr_eq();
 	if (tok != TOK_EOF)
 	    expect(",");
-	end_macro();
+	end_macro_under(str);
         next();
 	break;
     }
@@ -7370,7 +7370,7 @@ special_math_val:
                     begin_macro(p, 1), next();
                     expr_eq();
                     gfunc_param_typed(s, sa);
-                    end_macro();
+                    end_macro_under(p);
                 }
                 vrev(n);
             }
@@ -9290,7 +9290,7 @@ static void c6_decl_tokens(TokenString *ts)
     begin_macro(ts, 1);
     next();
     decl(VT_CONST);
-    end_macro();
+    end_macro_under(ts);
     tcc_state->warn_none = warn_none;
     tok = save_tok, tokc = save_val;
 }
@@ -10178,7 +10178,7 @@ static int c6_tuple_elem(TokenString *ts, CType *type, int *name, int decl)
         type_decl(type, &ad, name, TYPE_ABSTRACT | TYPE_DIRECT);
         ok = tok == TOK_EOF && *name;   /* a type and a name, all consumed */
     }
-    end_macro();
+    end_macro_under(ts);
     ts->len = save_len;
     tok = save_tok;
     tokc = save_val;
@@ -10278,7 +10278,7 @@ static int c6_tuple_lead_kind(void)
             }
             break;
         }
-        end_macro();
+        end_macro_under(replay);
         if (nall >= 2 && nexpr == 0 && nnames == 0)
             kind = C6_TK_TYPE;
         else if (nall >= 2 && nexpr == 0 && ntypes > 0 && nnames == nall
@@ -12610,7 +12610,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
         next();
         decl_initializer(&p, type, 0, DIF_FIRST | DIF_SIZE_ONLY);
         /* prepare second initializer parsing */
-        macro_ptr = init_str->str;
+        macro_rewind(init_str);
         next();
 
         /* if still unknown size, error */

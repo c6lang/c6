@@ -1093,6 +1093,33 @@ ST_FUNC void tok_str_add(TokenString *s, int t)
     s->len = len;
 }
 
+/* Drop every replay a parser pushed on top of STR, STR itself stays.  A parse
+   running inside a replay may hand a non-tuple group back by pushing a replay
+   of its own (c6_tuple_btype does), so the plain end_macro() would pop the
+   wrong entry and leave the enclosing replay on the stack, from where its
+   tokens are delivered a second time. */
+ST_FUNC void macro_unwind_above(TokenString *str)
+{
+    while (macro_stack && macro_stack != str)
+        end_macro();
+}
+
+/* Undo begin_macro(STR, ..) even when the parse inside the replay left
+   replays of its own behind. */
+ST_FUNC void end_macro_under(TokenString *str)
+{
+    macro_unwind_above(str);
+    if (macro_stack)
+        end_macro();
+}
+
+/* Rewind the replay STR to its first token, dropping what was pushed on top. */
+ST_FUNC void macro_rewind(TokenString *str)
+{
+    macro_unwind_above(str);
+    macro_ptr = str->str;
+}
+
 ST_FUNC void begin_macro(TokenString *str, int alloc)
 {
     str->alloc = alloc;
