@@ -1,0 +1,94 @@
+/* c6 'foreach |v| it { ... }' 迭代器协议示例
+ *
+ *   ./tcc/tcc -B tcc -std=c6 -run examples/foreach_iter_demo.c
+ *
+ * 可迭代对象只要提供 has()/next()：
+ *   int has(T *self);   非零：还有元素
+ *   E   next(T *self);  下一个元素（绑定是它的副本）
+ *
+ * 结构体/联合体的值、指向它们的指针、接口值都可以迭代：
+ *   - 值形态把状态复制到隐藏槽，循环不推进原对象；
+ *   - 指针/接口形态直接操作原对象，next() 的修改可见。
+ * 元素类型就是 next() 的声明返回类型，静态确定，不做装箱。
+ */
+#include <stdio.h>
+#include <string.h>
+
+/* ---- 值形态：倒数 ---- */
+
+struct Countdown { int n; };
+
+int has(struct Countdown *s)
+{
+    return s->n > 0;
+}
+
+int next(struct Countdown *s)
+{
+    return s->n--;
+}
+
+/* ---- 元素是结构体 ---- */
+
+struct Pair { int a, b; };
+struct Pairs { int i; };
+
+int has(struct Pairs *s)
+{
+    return s->i < 3;
+}
+
+struct Pair next(struct Pairs *s)
+{
+    struct Pair p = {0};
+    p.a = s->i;
+    p.b = s->i * 10;
+    s->i++;
+    return p;
+}
+
+/* ---- 接口值：vtable 分派 ---- */
+
+interface IntIter {
+    int has();
+    int next();
+}
+
+int sum(IntIter it)
+{
+    int total = 0;
+    foreach |v| it {
+        total += v;
+    }
+    return total;
+}
+
+int main(void)
+{
+    /* 值形态：循环结束后 c.n 仍然是 3 */
+    struct Countdown c = {3};
+    printf("countdown:");
+    foreach |v| c {
+        printf(" %d", v);
+    }
+    printf("  (c.n = %d)\n", c.n);
+
+    /* 指针形态：c 被真正倒完 */
+    struct Countdown d = {3};
+    printf("by pointer:");
+    foreach |v| &d {
+        printf(" %d", v);
+    }
+    printf("  (d.n = %d)\n", d.n);
+
+    /* 元素是结构体：绑定是 next() 返回值的副本 */
+    struct Pairs ps = {0};
+    foreach |p| ps {
+        printf("pair {%d, %d}\n", p.a, p.b);
+    }
+
+    /* 接口值：Countdown 的方法集合满足 IntIter，vtable 分派 */
+    struct Countdown e = {4};
+    printf("sum(e) = %d, e.n = %d\n", sum(e), e.n);
+    return 0;
+}

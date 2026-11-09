@@ -165,6 +165,16 @@ wrapped:
     err(6, "跳板没有报错");
 }
 
+test "static 局部：只允许 NULL 初始化，运行时再赋值" {
+    static closure int() sf = NULL;
+    int n = 6;
+    sf = int() { return n; };
+    int r = sf();
+    sf = NULL;
+    if (r != 6)
+        err(1, "static 局部闭包不对");
+}
+
 test "defer 与闭包捕获" {
     int n = 1;
     closure int() f = int() { defer n = n + 2; return n; };

@@ -800,7 +800,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 |---|---|---|---|
 | H1 | `__c6_co_destroy` 不回卷未完成任务 | `lib/libtcc1.c:1580` | `__c6_co_abort`（§9.3） |
 | H2 | async 帧搬动 → 帧内绝对地址失效 | `lib/libtcc1.c` 的 `__c6_co_suspend`/`restore` | 已修：帧住进任务（§9.1，A3）；只有 c67 走拷贝模型，那里保留 `weak` 禁令（§9.2）与地址校验 |
-| H3 | defer 栈满 8192 静默丢记录 | 原 `lib/libtcc1.c` 的 defer 记录栈 | 已消灭：记录栈整个删掉，清理状态搬进函数帧（§6、[grammar.md](grammar.md) 8.2），上限变成编译期报错（C95/C96） |
+| H3 | defer 栈满 8192 静默丢记录 | 原 `lib/libtcc1.c` 的 defer 记录栈 | 已消灭：记录栈整个删掉，清理状态搬进函数帧（§6、[grammar.md](grammar.md) 8.2），上限变成编译期报错（C101/C102） |
 
 ---
 

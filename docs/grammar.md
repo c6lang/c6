@@ -761,21 +761,37 @@ pattern-element        = type-specifier , declarator      (* 解构声明 *)
 标签之后、语句表达式 `({ … })` 里，以及 `defer` / `errdefer` 的单条语句体里
 （`defer (a, b) = f();`）。
 
-`foreach` 的三种可迭代对象与绑定数量一一对应：
+`foreach` 的可迭代对象与绑定数量一一对应：
 
 | 可迭代对象 | 绑定 | 下标类型 | 值绑定 |
 |---|---|---|---|
 | 完整数组 `E[N]`（含字符串字面量） | `\|i, v\|` | `size_t` | 元素的一份副本 |
 | 切片 `E[:]` | `\|i, v\|` | `size_t` | 元素的一份副本 |
 | 整数区间 `lo:hi` | `\|i\|` | 两个界的公共整数类型（至少 `int`） | 无 |
+| 迭代器 `T` / `T *` / 接口值 | `\|v\|` | 无 | `next()` 返回值的副本 |
 
 语义要点：
 
 - 可迭代对象**只求值一次**：数组/切片落到一个隐藏的
   `{ E *data; size_t len }` 帧槽（与切片的运行期布局相同，所以
-  `foreach |i, v| obj.items` 直接可用），区间的上界落到一个隐藏的整数槽；
+  `foreach |i, v| obj.items` 直接可用），区间的上界落到一个隐藏的整数槽，
+  迭代器落到一个按它自身类型分配的隐藏槽；
 - 数组每轮重新按 `data[i]` 取元素（数组可能在循环体里被改），切片用求值
   那一刻的 `{data, len}` 快照；
+- 迭代器是**结构化协议**：类型提供 `int has(T *self)` 与 `E next(T *self)`，
+  名字固定、不看接口叫什么。`T`（struct/union 值）直接调用，`T *` 直接
+  调用，接口值通过 vtable 分派；两个方法只能有 receiver 一个形参，并且
+  在 `foreach` 之前可见；
+- `has()` 返回整数（含 `_Bool`/`enum`），非零才调用 `next()`；`E` 是
+  `next()` 的声明返回类型，必须是完整、可赋值的对象类型（不能是 `void`、
+  数组或函数；`void *` 因元素类型被擦除而拒绝）；
+- 迭代器只有值绑定：`foreach |v| it` 或 `foreach |_| it`（后者仍调用
+  `next()` 推进）。“值形态”把迭代器状态复制进隐藏槽，循环不推进原对象；
+  `T *` 与接口值直接操作原对象（`next()` 的修改可见）；
+- 迭代器和元素可以是托管引用 `@T`：隐藏槽按声明的托管局部量处理
+  （先清零，再在 `foreach` 作用域结束时 `__c6_gc_release`），`@T` 形参
+  按借用拷贝，不额外加计数；含托管字段的 `struct` 仍不能按值绑定
+  （沿用 GC 的限制）；
 - 值绑定是**副本**：写它不改变容器。下标绑定就是循环变量，写它会改变
   后续迭代（与 `for (i = 0; i < n; i++)` 完全一样）；
 - `lo >= hi` 是零次迭代，两个界各只求值一次；
@@ -785,8 +801,9 @@ pattern-element        = type-specifier , declarator      (* 解构声明 *)
 - 元素类型必须是**可赋值**的完整对象类型。元素本身是数组时（`int[2][3]`、
   `Row[:]`）无法按值复制——绑定会是一个数组，而数组在 C 里不可赋值——
   报约束 C49，改用下标区间：`foreach |i| 0:(int)rows.len { … rows[i] … }`；
-- VLA、不完整数组、指针、整数、没有暴露切片的其它结构体都不可迭代
-  （见第 10 节）。
+- VLA、不完整数组、整数，以及既没有暴露切片、也没有 `has()`/`next()`
+  协议的指针/结构体都不可迭代（见第 10 节）。迭代器的值绑定是
+  `next()` 返回值的副本，`foreach |_| it` 合法但每一步仍调用 `next()`。
 
 ---
 
@@ -1012,7 +1029,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C44 | 数组/切片要两个绑定 | `an array or slice yields an index and a value: write 'foreach \|i, v\| a'` |
 | C45 | 区间只要一个绑定 | `a range yields only an index: write 'foreach \|i\| lo:hi'` |
 | C46 | 两个绑定不能都丢弃 | `'foreach' discards both binders` |
-| C47 | 可迭代对象只能是完整数组、切片或整数区间 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi')`；`cannot iterate over 'T' (expose a slice member, e.g. 'T[:] items')` |
+| C47 | 可迭代对象只能是完整数组、切片、整数区间，或提供 `has()`/`next()` 的迭代器 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi')`；`cannot iterate over 'T' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')` |
 | C48 | 区间两个界必须是整数 | `range bounds must be integers` |
 | C49 | 元素类型必须可赋值且完整 | `'foreach' cannot copy an element of type 'T'`；`cannot iterate over incomplete element type 'T'` |
 | C50 | 循环体必须是复合语句 | `'{' expected` |
@@ -1055,8 +1072,12 @@ parameter-list    = identifier , { "," , identifier } ;
 | C87 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
 | C88 | 插值里不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上）；`;` 只能出现一次（引入格式说明），语句表达式里的 `;` 同样被拒绝 | `'try' is not allowed in an interpolation: ...`；`f-string: ';' is only allowed once, to start the format spec ('{expr;spec}')` |
 | C89 | 格式说明要与插值的静态类型相容，`conv` 必须是已知的，宽度/精度不超过 1023，`;` 后面不能为空 | `f-string: unknown conversion 'z' in a format spec`；`f-string: a 'const char *' value takes no 'x' format spec`；`f-string: format width 2000 is too large`；`f-string: empty format spec in '{expr;spec}'` |
-| C95 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
-| C96 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发） | `'defer' bodies nested too deeply` |
+| C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver`；`iterator method 'next' cannot return a borrowed managed reference 'T'` |
+| C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it'` |
+| C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
+| C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发） | `'defer' bodies nested too deeply` |
+
+（C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包，尚未实现。）
 
 ---
 
@@ -1232,13 +1253,30 @@ foreach |i| lo:hi { body }
 =>
     T hi_tmp = (T)hi;                      (* T = 两个界的公共整数类型 *)
     for (i = (T)lo; i < hi_tmp; i++) { body }
+
+foreach |v| it { body }                    (* it 的类型提供 has(T *)/next(T *) *)
+=>
+    /* 三选一：下面三种形态按 it 的类型选一条 */
+    T tmp = it;                            (* 值形态：状态复制到隐藏帧槽 *)
+    while (has(&tmp)) {
+        v = next(&tmp);                    (* 副本；'_' 时丢弃但仍调用 next() *)
+        body                               (* continue 回到 has() 判断 *)
+    }
+    T *tmp = it;                           (* 指针形态：直接操作原对象 *)
+    while (has(tmp)) { v = next(tmp); body }
+    I tmp = it;                            (* 接口形态：vtable 分派 *)
+    while (tmp.vt->has(tmp.self)) {
+        v = tmp.vt->next(tmp.self); body
+    }
 ```
 
-生成的代码就是上面那段 `for`（同一套 `lblock` / `gvtst` / `gjmp_addr`），
-没有运行期辅助函数、没有虚调用、没有迭代器对象：数组/切片的隐藏槽就是
+生成的代码就是上面那段 `for` / `while`（同一套 `lblock` / `gvtst` /
+`gjmp_addr`）。数组/切片/区间没有运行期辅助函数：数组/切片的隐藏槽就是
 `c6_slice_spill` 用的 `{data, len}` 对，所以 `foreach |i, v| f()`（`f`
-返回切片）与 `foreach |i, v| obj.items` 走同一条路径。`_` 绑定时对应的
-加载/存储整段不生成。
+返回切片）与 `foreach |i, v| obj.items` 走同一条路径。迭代器形式只生成
+普通的方法调用（具体类型直接调用，接口值经 vtable），没有装箱、没有新的
+运行期入口；`_` 绑定时对应的加载/存储整段不生成，但 `next()` 调用仍然
+保留（它负责推进状态）。
 
 **R15 — 模块前缀 `module NAME;`**
 
@@ -1337,7 +1375,7 @@ disp:                                       (* 每个函数一个，逆序扫 si
   作用域时位被清掉，重新进入就重新注册。
 - 全部是本帧的局部变量，所以 ISR、`go` 起来的线程、协程（`async` 的帧就在
   任务里）、递归的每一帧都各跑各的，不需要任何线程级状态。
-- 上限：一个函数最多 128 个清理点（C95），清理体最多嵌套 8 层（C96）。
+- 上限：一个函数最多 128 个清理点（C101），清理体最多嵌套 8 层（C102）。
 - 帧开销：位图 4 × `int` 在**每个** c6 函数帧里都有并在序言清零（单趟编译器
   在序言处还不知道后面会不会出现清理点）；派发状态 2 × `int` 和派发器本身
   只在函数里真有清理点时才有，清理体每嵌套一层再加 2 × `int`。
@@ -1686,12 +1724,16 @@ int main(void)
 
 ```c
 struct Pair { int a, b; };
+struct Countdown { int n; };
+int has(struct Countdown *s) { return s->n > 0; }
+int next(struct Countdown *s) { return s->n--; }
 
 int main(void)
 {
     int a[5] = {1, 2, 3, 4, 5};
     int[:] s = a[1:4];                      /* 2 3 4 */
     struct Pair pairs[2] = {{1, 2}, {3, 4}};
+    struct Countdown countdown = {3};
     int total = 0;
 
     foreach |i, v| a {                      /* 数组：下标 + 元素副本 */
@@ -1709,7 +1751,10 @@ int main(void)
     foreach |i, p| pairs {                  /* 元素是结构体时也是副本 */
         p.b = 0;                            /* 不改 pairs */
     }
-    return total == 42 ? 0 : 1;             /* 15 + 9 + 3 + 15 */
+    foreach |v| countdown {                 /* 迭代器：int has(T *); E next(T *) */
+        total += v;                         /* v 是 next() 返回值的副本 */
+    }
+    return total == 48 ? 0 : 1;             /* 15 + 9 + 3 + 15 + 6 */
 }
 ```
 
@@ -1855,7 +1900,12 @@ int main(void)
 | `foreach \|i, v\| a { }` 而 `a` 的元素是数组（`int a[2][3]`、`Row[:]`） | 约束 C49：元素是数组时不能按值复制，改用下标区间 `foreach \|i\| 0:(int)rows.len { … rows[i] … }` |
 | `foreach \|_, _\| a { }` | 约束 C46：两个绑定都丢弃没有意义 |
 | `foreach \|i\| a { }` / `foreach \|i, v\| 0:n { }` | 约束 C44/C45：绑定数量由可迭代对象决定 |
-| `interface iterator { bool has(); void *next(); }` + `for a \|i, v\| { }` | v1 不做运行期迭代协议：`void *next()` 会擦掉元素类型（每轮都要装箱/分配），而方法名不按接收者改名，`has`/`len`/`at` 会和用户函数撞名。可迭代对象限定为数组、切片和区间，其它类型请暴露一个切片成员 |
+| `foreach \|i, v\| it { }`（迭代器） | 约束 C100：迭代器只有一个值绑定，要下标自己维护计数器 |
+| `foreach \|v\| it { }` 而 `it` 的类型只有 `has()` 没有 `next()`（或有同名字段遮蔽） | 约束 C47：按“没有迭代器协议”处理；补上 `E next(T *self)` |
+| `void *next(T *self)` | 约束 C99：元素类型会被擦除；改成具体的 `E` 或 `E *` |
+| `has()` 返回非整数 / `next()` 返回数组、`void`、不完整类型 | 约束 C99/C49 |
+| `has()`/`next()` 带多余形参 | 约束 C99：两个方法只接收 receiver |
+| 泛型 `Iterator<T>` / `for a \|v\| { }` | 不支持：语言没有类型参数；迭代请用 `foreach` |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
 | `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
 | `t = {1, 2}` / `f({1, 2})`（元组字面量糖） | 不支持：显式写复合字面量 `(int, int){1, 2}` |
@@ -1943,7 +1993,7 @@ int main(void)
 | 析构 `drop` | `c6_gc_drop_register()`（`c6_method_register()` 里）、`c6_gc_is_drop()` / `c6_gc_drop_callee()`（禁止显式调用）、描述符的 `drop` 指针 | 同上 |
 | 全局根 | `c6_gc_root_add()`（`decl()` 里）+ TU 末尾的 `__attribute__((constructor))` / `((destructor))` 对 | 同上 |
 | 运行期全部 | `__c6_gc_new` / `__c6_gc_store` / `__c6_gc_release` / `__c6_gc_drop` / `__c6_gc_move` / `__c6_gc_incref` / `__c6_gc_weak_store` / `__c6_gc_drain_budget` / `__c6_gc_shutdown`，以及 `async`/`go` 的任务槽归还（`__c6_rel_NAME`）| `tcc/lib/libtcc1.c`、`tcc/c99-rt.inc` |
-| `foreach` | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句）、`c6_common_int_type` / `c6_is_int_type`；数组/切片的隐藏槽复用 `c6_slice_spill`，循环体走 `lblock`；文件作用域诊断在 `decl()` | `tcc/tccgen.c` |
+| `foreach` | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句）、`c6_common_int_type` / `c6_is_int_type`、`c6_iter_proto_of` / `c6_iter_setup` / `c6_iter_call`（迭代器协议：结构化识别、静态调用或 vtable 分派）；数组/切片的隐藏槽复用 `c6_slice_spill`，循环体走 `lblock`；文件作用域诊断在 `decl()` | `tcc/tccgen.c` |
 | 切片运行期 | `__tcc_slice_index` / `__tcc_slice_sub` | `tcc/lib/libtcc1.c` |
 | `async` 声明 | `c6_async_declare`（合成 `struct NAME_task` 的 token）、`FuncAttr.func_async`、`parse_btype()` 的 `TOK_C6_ASYNC` | `tcc/tccgen.c`、`tcc/tcc.h` |
 | `async` 定义 | `c6_async_definition` / `c6_async_func_begin` / `c6_async_params_copy` / `c6_async_func_end`（恢复分发器）、`c6_async_finish` | `tcc/tccgen.c` |

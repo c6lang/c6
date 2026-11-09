@@ -5,6 +5,7 @@
 #   examples/boot/build.sh                    # 跑 examples/boot/main.c
 #   examples/boot/build.sh 源文件...          # 换个 payload（fstest-bare-tests 这么做）
 #   NO_KVM=1 examples/boot/build.sh           # 强制用 TCG（纯软件模拟）
+#   SMP=2 examples/boot/build.sh 源文件...    # 多核（-smp 2，并 -DC6_SMP_CPUS=2）
 #
 # 产物：
 #   build/payload.elf / .bin   c6 程序（tcc 链接在 0x400000）
@@ -25,6 +26,15 @@ if [ $# -gt 0 ]; then
     payload_src="$*"
 fi
 
+echo "== 1b. 汇编 AP 跳板（多核用，as --32）"
+as --32 -o "$build/ap.o" examples/boot/ap.S
+ld -m elf_i386 -Ttext 0x8000 --oformat binary -o "$build/ap.bin" "$build/ap.o"
+# 包成 ELF 目标文件：符号是 _binary_ap_bin_{start,end}，sched.plain.c 里引用
+(cd "$build" && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
+    ap.bin ap_blob.o)
+APOBJ="$build/ap_blob.o"
+echo "   AP 跳板: $(stat -c %s "$build/ap.bin") 字节（加载到 0x8000）"
+
 echo "== 1. 编译 payload（c6 程序 + libtcc1）"
 # 每个源文件单独编成 .o 再链接：一次性把多个 TU 交给 tcc 会走到编译器的一个
 # 老 bug（c6_gc_new_lead 里对 NULL 标签名 strcmp，带 new/GC 的 TU 撞上就崩），
@@ -41,14 +51,14 @@ if [ -n "$ONE_TU" ]; then
         *.plain.c)
             obj="$build/payload_$n.o"
             n=$((n + 1))
-            ./tcc/tcc -B tcc -c -o "$obj" "$src"
+            ./tcc/tcc -B tcc $EXTRA_CFLAGS -c -o "$obj" "$src"
             plainobj="$plainobj $obj"
             ;;
         *) c6src="$c6src $src" ;;
         esac
     done
     ./tcc/tcc -B tcc -std=c6 -static -nostdlib -o "$build/payload.elf" \
-        $c6src $plainobj tcc/libtcc1.a
+        $c6src $plainobj tcc/libtcc1.a "$APOBJ"
     n=-1
 fi
 for src in $payload_src; do
@@ -60,11 +70,12 @@ for src in $payload_src; do
     *.plain.c) flags="" ;;
     *)         flags="-std=c6" ;;
     esac
-    ./tcc/tcc -B tcc $flags -c -o "$obj" "$src"
+    ./tcc/tcc -B tcc $flags $EXTRA_CFLAGS -c -o "$obj" "$src"
     objs="$objs $obj"
 done
 [ "$n" -lt 0 ] || \
-    ./tcc/tcc -B tcc -static -nostdlib -o "$build/payload.elf" $objs tcc/libtcc1.a
+    ./tcc/tcc -B tcc -static -nostdlib -o "$build/payload.elf" $objs \
+        tcc/libtcc1.a "$APOBJ"
 info=$(python3 examples/boot/flat.py "$build/payload.elf" "$build/payload.bin" 0x400000)
 # shellcheck disable=SC2086
 set -- $info
@@ -103,14 +114,14 @@ if [ -z "$NO_KVM" ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     kvm="-enable-kvm"
 fi
 set +e
-qemu-system-x86_64 $kvm \
+qemu-system-x86_64 $kvm -smp "${SMP:-1}" \
     -drive "file=$build/bare.img,format=raw,if=ide" -boot c -m 64 \
     -display none -debugcon stdio -device isa-debug-exit -no-reboot
 rc=$?
 set -e
 
 if [ $rc -eq 1 ]; then
-    echo "fstest-bare: ok（裸机启动，全部断言通过；$([ -n "$kvm" ] && echo KVM || echo TCG)）"
+    echo "fstest-bare: ok（裸机启动，全部断言通过；$([ -n "$kvm" ] && echo KVM || echo TCG)；$([ "${SMP:-1}" -gt 1 ] && echo "${SMP:-1} 核" || echo 单核)）"
 else
     echo "fstest-bare: FAILED（qemu 退出码 $rc；1 才是通过）" >&2
     exit 1
