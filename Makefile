@@ -155,8 +155,20 @@ fstest-bare-go: build
 	./examples/boot/build.sh examples/boot/go_bare.c examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
+fstest-bare-smp: build
+	@command -v qemu-system-x86_64 >/dev/null || { \
+	     echo "fstest-bare-smp: 没有 qemu-system-x86_64，跳过"; exit 0; }
+	@command -v as >/dev/null || { \
+	     echo "fstest-bare-smp: 没有 binutils，跳过"; exit 0; }
+	@SMP=2 EXTRA_CFLAGS=-DC6_SMP_CPUS=2 ./examples/boot/build.sh \
+	    examples/boot/smp_bare.c examples/boot/sched.plain.c \
+	    examples/boot/shim.plain.c examples/boot/io.c
+	@SMP=1 EXTRA_CFLAGS=-DC6_SMP_CPUS=1 ./examples/boot/build.sh \
+	    examples/boot/smp_bare.c examples/boot/sched.plain.c \
+	    examples/boot/shim.plain.c examples/boot/io.c
+
 test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
-	  fstest-bare fstest-bare-tests fstest-bare-go
+	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-smp
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
