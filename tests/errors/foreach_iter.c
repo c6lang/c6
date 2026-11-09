@@ -52,9 +52,15 @@ struct Inc next(struct NextInc *s);
 interface OnlyHasI { int has(); }
 interface VoidPtrI { int has(); void *next(); }
 
+struct HNode { int v; };
+struct Holder { @HNode n; };
+struct HIt { int i; };
+int has(struct HIt *s) { return s->i < 1; }
+struct Holder next(struct HIt *s);
+
 // EXPECT test_two_binders: error: an iterator yields only a value: write 'foreach |v| it'
-// EXPECT test_only_has: error: cannot iterate over 'struct OnlyHas' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(); E next();')
-// EXPECT test_shadow: error: cannot iterate over 'struct Shadow' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(); E next();')
+// EXPECT test_only_has: error: cannot iterate over 'struct OnlyHas' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
+// EXPECT test_shadow: error: cannot iterate over 'struct Shadow' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_has_void: error: iterator method 'has' must return an integer type (got 'void')
 // EXPECT test_has_struct: error: iterator method 'has' must return an integer type (got 'struct HasStruct')
 // EXPECT test_has_extra: error: iterator method 'has' must take only the receiver
@@ -64,6 +70,7 @@ interface VoidPtrI { int has(); void *next(); }
 // EXPECT test_next_array: error: 'foreach' cannot copy an element of type 'int [2]'
 // EXPECT test_next_incomplete: error: cannot iterate over incomplete element type 'struct Inc'
 // EXPECT test_interface_voidptr: error: iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)
+// EXPECT test_managed_struct: error: 'struct Holder' holds managed references: a foreach binding is not possible. Allocate it with 'new' and hold it in '@struct Holder'
 // EXPECT test_pointer_to_array: error: cannot iterate over 'struct Good (*)[2]' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
 // EXPECT test_file_scope: error: 'foreach' can only be used inside a function
 
@@ -180,6 +187,15 @@ int main(void)
 {
     struct NextVoidPtr x = {2};
     return sum(x);
+}
+#elif defined test_managed_struct
+int main(void)
+{
+    struct HIt it = {0};
+    foreach |v| it {
+        return v.n->v;
+    }
+    return 0;
 }
 #elif defined test_pointer_to_array
 int main(void)

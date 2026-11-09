@@ -14,7 +14,7 @@ extern int unknown[];
 // EXPECT test_no_name: error: 'foreach' expects a binding name
 // EXPECT test_pointer: error: cannot iterate over 'int *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
 // EXPECT test_int: error: cannot iterate over 'int' (write a range: 'foreach |i| lo:hi')
-// EXPECT test_struct: error: cannot iterate over 'struct S' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(); E next();')
+// EXPECT test_struct: error: cannot iterate over 'struct S' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_struct_pointer: error: cannot iterate over 'struct S *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
 // EXPECT test_vla: error: cannot iterate over a variable length array
 // EXPECT-C99 test_vla: error: c99 output: variable length arrays are not supported

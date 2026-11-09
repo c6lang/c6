@@ -17276,6 +17276,18 @@ static int c6_iter_func_info(CType *ft, CType *ret, int *np)
     return 1;
 }
 
+/* A managed parameter is a borrow: its slot must not be treated as an owned
+   reference.  The foreach hidden slot can copy the pointer without taking a
+   reference because the original parameter stays alive for the whole loop. */
+static int c6_iter_borrowed(CType *t)
+{
+    if (t->gq & C6_GQ_BORROW)
+        return 1;
+    if (t->ref && (t->ref->type.gq & C6_GQ_BORROW))
+        return 1;
+    return 0;
+}
+
 static void c6_iter_check_has(CType *ret, int np)
 {
     char buf[256] = {0};
@@ -17319,6 +17331,12 @@ static void c6_iter_check_next(C6Iter *it, CType *ret, int np)
         type_to_str(buf, sizeof buf, &e, NULL);
         tcc_error("'foreach' cannot copy an element of type '%s'", buf);
     }
+    if (c6_iter_borrowed(&e)) {
+        type_to_str(buf, sizeof buf, &e, NULL);
+        tcc_error("iterator method 'next' cannot return a borrowed managed "
+                  "reference '%s'", buf);
+    }
+    c6_gc_value_check(&e, "a foreach binding");
     size = type_size(&e, &align);
     if (size < 0) {
         type_to_str(buf, sizeof buf, &e, NULL);
@@ -17389,7 +17407,8 @@ static int c6_iter_proto_of(CType *t, C6Iter *it)
         tag = pt.ref->v & ~SYM_STRUCT;
         pt.t &= ~VT_QUAL;
         mk_pointer(&pt);
-        it->obj = pt;
+        /* it->obj keeps the expression's pointer type (including its GC
+           qualifier, if any); it->self is the plain receiver pointer. */
         it->self = pt;
         it->is_ptr = 1;
     } else if ((t->t & VT_BTYPE) == VT_STRUCT
@@ -17575,7 +17594,7 @@ static void c6_foreach_parse(void)
     char buf[256] = {0};
     int n1 = 0, n2 = 0, nb = 0, is_range = 0, is_iter = 0;
     int i_off = 0, v_off = 0, pair = 0, hi_off = 0, size = 0, align = 0;
-    int obj_off = 0;
+    int obj_off = 0, managed_elem = 0;
     int a = 0, b = 0, c = 0, d = 0;
     C6MoveSnap mv_base = {0}, mv_body = {0};
     int body_ok = 0;
@@ -17643,10 +17662,20 @@ static void c6_foreach_parse(void)
                 tcc_error("an iterator yields only a value: "
                           "write 'foreach |v| it'");
             elem = it.elem;
+            c6_gc_value_check(&it.obj, "an iterable");
+            /* A borrowed managed parameter needs no reference of its own;
+               copy just the pointer into the hidden slot.  An owned managed
+               slot is initialized and released like a declared local. */
+            if (c6_iter_borrowed(&it.obj))
+                c6_gc_plain(&it.obj);
             /* the iterable is evaluated once and kept in a hidden slot */
             size = type_size(&it.obj, &align);
             loc = (loc - size) & -align;
             obj_off = loc;
+            if (c6_is_managed(&it.obj)) {
+                c6_zero_local(obj_off, size);
+                c6_gc_site(obj_off, &it.obj);
+            }
             vset(&it.obj, VT_LOCAL | VT_LVAL, obj_off);
             vswap();
             vstore();
@@ -17657,6 +17686,11 @@ static void c6_foreach_parse(void)
             v_off = loc;
             if (n1)
                 sym_push(n1, &elem, VT_LOCAL | VT_LVAL, v_off);
+            if (c6_is_managed(&elem)) {
+                c6_zero_local(v_off, size);
+                c6_gc_site(v_off, &elem);
+                managed_elem = 1;
+            }
             c6_iter_setup(&it);
         } else {
             if (t.t & VT_VLA)
@@ -17687,7 +17721,7 @@ static void c6_foreach_parse(void)
                               "'foreach |i| lo:hi')", buf);
                 tcc_error("cannot iterate over '%s' (no 'has'/'next' iterator: "
                           "expose a slice member 'T[:] items', or define "
-                          "'int has(); E next();')", buf);
+                          "'int has(T *); E next(T *);')", buf);
             }
             if (!n1 && !n2)
                 tcc_error("'foreach' discards both binders");
@@ -17695,6 +17729,8 @@ static void c6_foreach_parse(void)
                 type_to_str(buf, sizeof buf, &elem, NULL);
                 tcc_error("'foreach' cannot copy an element of type '%s'", buf);
             }
+            if (n2)
+                c6_gc_value_check(&elem, "a foreach binding");
             size = type_size(&elem, &align);
             if (size < 0) {
                 type_to_str(buf, sizeof buf, &elem, NULL);
@@ -17708,8 +17744,13 @@ static void c6_foreach_parse(void)
             i_off = loc;
             if (n1)
                 sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
-            if (n2)
+            if (n2) {
                 sym_push(n2, &elem, VT_LOCAL | VT_LVAL, v_off);
+                if (c6_is_managed(&elem)) {
+                    c6_zero_local(v_off, size);
+                    c6_gc_site(v_off, &elem);
+                }
+            }
             vset(&ctr, VT_LOCAL | VT_LVAL, i_off);       /* i = 0 */
             vpushi(0);
             vstore();
@@ -17733,7 +17774,7 @@ static void c6_foreach_parse(void)
     /* the value binder is loaded on every iteration */
     if (is_iter) {
         c6_iter_call(&it, obj_off, 1);  /* next() */
-        if (n1) {
+        if (n1 || managed_elem) {
             vset(&elem, VT_LOCAL | VT_LVAL, v_off);     /* destination */
             vswap();
             vstore();
