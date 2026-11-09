@@ -19,6 +19,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
 | `foreach \|i, v\| a { ... }` | 遍历数组、切片与整数区间：绑定表在前，值绑定是元素副本 |
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
+| 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；体里只看得见参数和文件作用域 |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
 
@@ -681,6 +682,69 @@ struct 传递路径，所以和等价的 struct 可以互操作：
 
 ```sh
 ./tcc/tcc -B tcc -std=c6 -run examples/tuple_demo.c
+```
+
+### 函数字面量 `void(int x) { ... }`
+
+```c
+void (*say)(int) = void(int x) { printf("%d\n", x); };  /* 显式声明 */
+say(1);
+
+void(int x) { printf("%d\n", x); }(2);                   /* 就地调用 */
+
+f = int(int x) { return x * offset; };                   /* 推断声明 */
+f(3);
+
+qsort(v, n, sizeof v[0], int(const void *a, const void *b) {   /* 交给 C */
+    int x = *(const int *)a, y = *(const int *)b;
+    return x < y ? -1 : x > y;
+});
+```
+
+速查：
+
+| 写法 | 行为 |
+|---|---|
+| `void(int x) { … }` / `int(int a, int b) { … }` | 字面量：一个表达式，值就是那个函数（退化成函数指针） |
+| `void (*f)(int) = void(int x) { … };` | 用已有的函数指针类型接住 |
+| `f = void(int x) { … };` | 推断声明：类型从字面量推出（`void (*)(int)`），等价于在 `f` 前写上那个类型 |
+| `int(int x) { … }(3)` | 就地调用 |
+| `int() { … }` | 无参（`()` 视作无参原型） |
+| `int!error (int a, int b) { … }` | 可失败的字面量，配 `try` / `catch` 用 |
+| `int (int n, ...) { … }` | 变参 |
+| `struct P(int v) { … }` / `int[:](int[:] s) { … }` | 返回类型随便写，切片、元组、`@T` 都行 |
+| `static int (*t[2])(int) = { { int(int v) { … } }, … };` | 文件作用域 / `static` 初始化器里也行 |
+
+规则：
+
+- **值就是函数指针**：不分配对象、不做引用计数、运行期不携带任何额外信息。
+  所以它能存进任何同型函数指针、进函数指针表、当实参、当返回值、交给纯 C
+  保存和回调——C ABI 一点没变（`tests/abi/fn_lit.c`）。每个字面量各是一个
+  函数：`a == b` 为假；
+- **体里只看得见它自己的参数和文件作用域**。字面量的体是稍后编译的（和
+  `static inline` 一样在翻译单元末尾发射），写在外层的局部变量、形参、块
+  作用域的 `typedef` / tag 没法带进去，引用它们是编译期错误：
+
+  ```c
+  int x = 1;
+  int (*f)(void) = int() { return x; };      /* 错误：捕获了 x */
+  int (*g)(int)  = int(int n) { return n + offset; };  /* 可以：n 和文件作用域 */
+  ```
+
+  需要外层的值时把它作为参数传进来。捕获式闭包是下一版的设计，
+  见 [docs/closure-design.md](docs/closure-design.md)；
+- 字面量**没有名字**，也不能带存储类或 `async`：`void named(void) { … }`
+  报 `a function literal has no name`，`static void() { … }` 报
+  `a function literal cannot have a storage class`；
+- 内部名字是 `__c6_fn_<序号>`（`static`），所以 `module` 不改写它、
+  `-emit-header` 不导出它，符号表里只是本地的 `t`；
+- 和 c6 的其它特性是正交的：体里可以 `defer` / `err` / `new` / 再写字面量，
+  `static inline` 函数体和异步函数体里也能写字面量。
+
+完整可运行示例见 [examples/fn_lit_demo.c](examples/fn_lit_demo.c)：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -run examples/fn_lit_demo.c
 ```
 
 ### async / await（无栈协程）

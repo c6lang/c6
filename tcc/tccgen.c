@@ -455,6 +455,95 @@ static void cast_error(CType *st, CType *dt);
 static void end_switch(void);
 static void do_Static_assert(void);
 
+#ifdef C6_EXT
+/* ------------------------------------------------------------------------- */
+/* Function literals: 'RET (params) { body }' in an expression              */
+/*                                                                          */
+/* A literal becomes an ordinary 'static' function of the unit, but it is    */
+/* not emitted where it is written: the body is saved as tokens and compiled */
+/* at the end of the translation unit, exactly like a 'static inline' body   */
+/* (the code generator cannot run while an enclosing function is being       */
+/* written).  Its value is a plain function pointer -- no object, no         */
+/* reference counting, no runtime -- so it can be stored, compared and       */
+/* handed to C.  The body therefore sees only its parameters and the file    */
+/* scope: a name that was a local or a parameter where the literal stood is  */
+/* a capture, and a capture is an error.                                    */
+typedef struct C6Lit {
+    struct C6Lit *next;
+    Sym *sym;           /* the 'static' function the literal becomes */
+    int name;           /* its synthesized name, '__c6_fn_N' */
+    int *params;        /* parameter name tokens (0: the parameter is unnamed) */
+    int nparams;
+    int *caps;          /* block scope names visible where the literal stood */
+    int ncaps;
+    CType ftype;        /* the type as written, e.g. 'void(int)' */
+    TokenString *body;  /* '{' ... '}' */
+} C6Lit;
+
+static C6Lit *c6_lit_head = 0, *c6_lit_tail = 0;
+/* the literal whose body is currently being compiled: a name that resolves
+   outside that body is a capture */
+static C6Lit *c6_lit_replay = 0;
+static int c6_lit_count = 0;
+static int c6_lit_flush(void);
+static int c6_lit_lead(TokenString *pre);
+static void c6_lit_parse(void);
+static int c6_lit_decl_lead(void);
+static void c6_lit_infer_decl(void);
+static void c6_apply_fallible(CType *type);
+
+/* A name that resolves inside the literal's own body is fine; everything else
+   that was a block scope name where the literal was written is a capture that
+   a plain function pointer cannot carry.  Called from every place that turns
+   an identifier into a symbol (value, typedef, tag). */
+static void c6_lit_cap_check(int v, Sym *s)
+{
+    C6Lit *lit = c6_lit_replay;
+    int i = 0;
+
+    if (!lit || !lit->ncaps || (s && s->sym_scope != 0))
+        return;
+    v &= ~(SYM_STRUCT | SYM_FIELD);
+    for (i = 0; i < lit->ncaps; i++) {
+        if (lit->caps[i] != v)
+            continue;
+        tcc_error("a function literal cannot capture '%s': without captures "
+                  "it is a plain function pointer, so its body sees only its "
+                  "parameters and the file scope (pass the value in as a "
+                  "parameter)", get_tok_str(v, NULL));
+    }
+}
+
+/* Could a type start here?  A cheap filter: the expensive replay in
+   c6_lit_lead() has to run on every expression, and most of them start with
+   something that can never be a return type. */
+static int c6_lit_type_start(int t)
+{
+    Sym *s = 0;
+
+    switch (t) {
+    case TOK_VOID: case TOK_BOOL: case TOK_CHAR: case TOK_SHORT:
+    case TOK_INT: case TOK_LONG: case TOK_FLOAT: case TOK_DOUBLE:
+    case TOK_SIGNED1: case TOK_SIGNED2: case TOK_SIGNED3: case TOK_UNSIGNED:
+    case TOK_CONST1: case TOK_CONST2: case TOK_CONST3:
+    case TOK_VOLATILE1: case TOK_VOLATILE2: case TOK_VOLATILE3:
+    case TOK_RESTRICT1: case TOK_RESTRICT2: case TOK_RESTRICT3:
+    case TOK_STRUCT: case TOK_UNION: case TOK_ENUM:
+    case TOK_STATIC: case TOK_EXTERN: case TOK_TYPEDEF:
+    case TOK_C6_ASYNC:
+    case '@':
+        return 1;
+    }
+    if (t < TOK_IDENT)
+        return 0;
+    /* a typedef, or a visible tag used as a type ('void(S *p) { ... }') */
+    s = sym_find(t);
+    if (s && (s->type.t & VT_TYPEDEF))
+        return 1;
+    return struct_find(t) != NULL;
+}
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Automagical code suppression */
 
@@ -732,7 +821,9 @@ ST_FUNC int tccgen_compile(TCCState *s1)
        a conversion itself: alternate until nothing new turns up */
     for (;;) {
         gen_inline_functions(s1);
-        if (!c6_emit_auto_impls())
+        /* a deferred body ('static inline', a function literal) may hold
+           another literal, so alternate until nothing new turns up */
+        if (!c6_lit_flush() && !c6_emit_auto_impls())
             break;
     }
     /* the type descriptors last: a 'drop' method may be declared after the
@@ -4975,8 +5066,16 @@ static void struct_decl(CType *type, int u)
     parse_attribute(&ad);
 
     v = 0;
-    if (tok >= TOK_IDENT) /* struct/enum tag */
+    if (tok >= TOK_IDENT) {  /* struct/enum tag */
+        int tagtok = tok;
         v = tok, next();
+#ifdef C6_EXT
+        /* a tag that is only visible through a block scope cannot travel
+           into a function literal: replaying it would declare a new tag */
+        if (tok != '{')
+            c6_lit_cap_check(tagtok, struct_find(tagtok));
+#endif
+    }
 
 #ifdef C6_EXT
     c6_is_def = (tok == '{' || tok == ';');
@@ -5832,6 +5931,7 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
                    does not own the name: 'struct stat' next to 'stat()'
                    keeps C's meaning, so 'stat(...)' stays a call. */
                 if (tcc_state->c6_ext && (tag = struct_find(tok)) != NULL) {
+                    c6_lit_cap_check(tok, tag);   /* a block scope tag */
                     n = tok, next();
                     if (tok == ':' && ignore_label) {
                         /* ignore if it's a label */
@@ -5848,6 +5948,9 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
             }
             if (!(s->type.t & VT_TYPEDEF))
                 goto the_end;
+#ifdef C6_EXT
+            c6_lit_cap_check(tok, s);   /* a block scope typedef */
+#endif
 
             n = tok, next();
             if (tok == ':' && ignore_label) {
@@ -6553,6 +6656,242 @@ static void parse_atomic(int atok)
     }
 }
 
+#ifdef C6_EXT
+/* Does a function literal start at the current token?  Only the tokens are
+   looked at, and they are handed back untouched (every caller parses them
+   itself): the header is replayed as 'type_decl(TYPE_ABSTRACT)', the body is
+   not part of the question.  PRE holds tokens that have already been read and
+   must be given back in front of the header ('NAME =' of the declaration
+   form); the caller must not use it afterwards. */
+static int c6_lit_lead(TokenString *pre)
+{
+    TokenString *back = 0, *replay = 0;
+    CType ftype = {0};
+    AttributeDef ad = {0};
+    CValue save_val = {0};
+    int depth = 0, v = 0, ok = 0, save_len = 0, save_tok = 0;
+    int save_fallible = 0, save_warn = 0, start = 0, is_body = 0, is_fn = 0;
+    int last = 0, lit_named = 0;
+
+    start = c6_ext_on() && c6_lit_type_start(tok);
+    if (!pre && !start)
+        return 0;
+    back = pre ? pre : tok_str_alloc();
+    replay = tok_str_alloc();
+    if (start) {
+        for (;;) {
+            if (tok == TOK_EOF)
+                break;
+            /* '= ; , :' cannot appear in a signature: most declarations stop
+               right here, which is what keeps this probe cheap */
+            if (depth == 0 && (tok == '{' || tok == ';' || tok == ','
+                               || tok == ':' || tok == '=' || tok == ')'
+                               || tok == ']' || tok == '}'))
+                break;
+            if (tok == '(' || tok == '[')
+                depth++;
+            else if (tok == ')' || tok == ']')
+                depth--;
+            tok_str_add_tok(back);
+            tok_str_add_tok(replay);
+            last = tok;
+            next();
+        }
+        /* the token that ended the scan has been read: hand it back as well,
+           so that the caller finds the stream where it left it */
+        if (tok != TOK_EOF)
+            tok_str_add_tok(back);
+        /* a signature always ends with ')' before the body: anything else
+           ('struct S { ... }', 'int a[] = { ... }') is not a literal and is
+           not worth a replay */
+        if (last != ')')
+            start = 0;
+        tok_str_add(replay, TOK_EOF);
+    }
+    is_body = start && depth == 0 && tok == '{';
+    tok_str_add(back, 0);
+    if (start) {
+        /* the replay must stay silent: the real parse follows at once */
+        save_len = replay->len, save_tok = tok, save_val = tokc;
+        save_fallible = c6_decl_fallible;
+        save_warn = tcc_state->warn_none;
+        tcc_state->warn_none = 1;
+        begin_macro(replay, 0);
+        next();
+        memset(&ad, 0, sizeof ad);
+        if (parse_btype(&ftype, &ad, 0)) {
+            c6_decl_fallible = 0;
+            if (c6_parse_fallible_suffix())
+                c6_decl_fallible = 1;
+            type_decl(&ftype, &ad, &v, TYPE_DIRECT | TYPE_ABSTRACT);
+            lit_named = v;
+            is_fn = (ftype.t & VT_BTYPE) == VT_FUNC && ftype.ref
+                    && tok == TOK_EOF;
+        }
+        end_macro_under(replay);
+        replay->len = save_len;
+        tok = save_tok, tokc = save_val;
+        c6_decl_fallible = save_fallible;
+        tcc_state->warn_none = save_warn;
+    }
+    tok_str_free(replay);
+    begin_macro(back, 1);
+    next();
+    ok = is_fn && is_body && lit_named == 0;
+    /* a function signature followed by a body is a literal, so the two ways of
+       getting it wrong deserve their own words */
+    if (is_fn && is_body && lit_named)
+        tcc_error("a function literal has no name: '%s'", get_tok_str(lit_named, NULL));
+    if (is_fn && !is_body)
+        tcc_error("'{' expected: the body of the function literal");
+    return ok;
+}
+
+/* 'RET (parameters) { body }' in an expression: the header is parsed here, the
+   body is saved and compiled at the end of the unit, and the value is the
+   function itself (it decays to a pointer like any function designator). */
+static void c6_lit_parse(void)
+{
+    CType ftype = {0}, vtype = {0};
+    AttributeDef ad = {0};
+    C6Lit *lit = 0;
+    Sym *s = 0, *p = 0, *snap = 0;
+    char buf[48] = {0};
+    int v = 0, i = 0, n = 0;
+
+    memset(&ad, 0, sizeof ad);
+    if (!parse_btype(&ftype, &ad, 0))
+        tcc_error("function literal: a return type is expected");
+    if (ftype.t & VT_STORAGE)
+        tcc_error("a function literal cannot have a storage class");
+    c6_decl_fallible = 0;
+    if (c6_parse_fallible_suffix())
+        c6_decl_fallible = 1;
+    type_decl(&ftype, &ad, &v, TYPE_DIRECT | TYPE_ABSTRACT);
+    if (v)
+        tcc_error("a function literal has no name: '%s'",
+                  get_tok_str(v, NULL));
+    if ((ftype.t & VT_BTYPE) != VT_FUNC || !ftype.ref)
+        tcc_error("a function literal needs a full signature: "
+                  "'RET (parameters) { body }'");
+    if (ftype.ref->f.func_async)
+        tcc_error("a function literal cannot be 'async'");
+    if (ftype.ref->f.func_type == FUNC_OLD) {
+        if (ftype.ref->next)
+            tcc_error("a function literal needs a typed parameter list");
+        ftype.ref->f.func_type = FUNC_NEW;   /* 'void()' takes no parameters */
+    }
+    if (c6_decl_fallible) {
+        c6_apply_fallible(&ftype);
+        c6_decl_fallible = 0;
+    }
+    if (tok != '{')
+        tcc_error("'{' expected: the body of the function literal");
+    vtype = ftype;
+
+    lit = tcc_mallocz(sizeof *lit);
+    /* the name is internal: it starts with '__', so 'package'/'module' have
+       nothing to mangle, and 'static' keeps it out of '-emit-header' */
+    snprintf(buf, sizeof buf, "__c6_fn_%d", ++c6_lit_count);
+    lit->name = tok_alloc_const(buf);
+    lit->ftype = ftype;
+    for (p = ftype.ref->next; p; p = p->next)
+        n++;
+    lit->nparams = n;
+    if (n)
+        lit->params = tcc_malloc(n * sizeof *lit->params);
+    for (i = 0, p = ftype.ref->next; p; p = p->next, i++)
+        lit->params[i] = p->v & ~SYM_FIELD;
+
+    /* the names the body must not see: by the time it is compiled they are
+       gone from the symbol table, so a capture would silently become an
+       'undeclared' -- remember them now and diagnose it at the reference */
+    for (snap = local_stack; snap; snap = snap->prev) {
+        int nv = snap->v & ~(SYM_FIELD | SYM_STRUCT);
+        int j = 0;
+        if (snap->sym_scope == 0 || nv < TOK_IDENT || nv >= SYM_FIRST_ANOM)
+            continue;
+        for (j = 0; j < lit->ncaps; j++)
+            if (lit->caps[j] == nv)
+                break;
+        if (j < lit->ncaps)
+            continue;
+        lit->caps = tcc_realloc(lit->caps,
+                                (lit->ncaps + 1) * sizeof *lit->caps);
+        lit->caps[lit->ncaps++] = nv;
+    }
+
+    ftype.t |= VT_STATIC | VT_EXTERN;   /* internal linkage from the start */
+    lit->sym = s = external_sym(lit->name, &ftype, 0, &ad);
+    skip_or_save_block(&lit->body);
+
+    if (c6_lit_tail)
+        c6_lit_tail->next = lit;
+    else
+        c6_lit_head = lit;
+    c6_lit_tail = lit;
+
+    vpushsym(&vtype, s);
+}
+
+/* 'NAME = RET (parameters) { body };' : the literal's type is the variable's
+   type, so the declaration needs no annotation.  Only a name that is not
+   declared anywhere can start it -- 'a = f;' on an existing 'a' stays an
+   ordinary assignment. */
+static int c6_lit_decl_lead(void)
+{
+    TokenString *back = 0;
+    int ok = 0;
+
+    if (!c6_ext_on() || tok < TOK_UIDENT)
+        return 0;
+    if (sym_find(tok))                  /* declared: an assignment, not a decl */
+        return 0;
+    back = tok_str_alloc();
+    tok_str_add_tok(back);              /* the name */
+    next();
+    if (tok != '=') {                   /* an expression after all */
+        /* give back what was read, so that the caller finds the stream
+           exactly where it left it */
+        tok_str_add_tok(back);
+        tok_str_add(back, 0);
+        begin_macro(back, 1);
+        next();
+        return 0;
+    }
+    tok_str_add_tok(back);              /* and the '=' */
+    next();
+    /* c6_lit_lead() hands the prefix and the header back as one stream */
+    ok = c6_lit_lead(back);
+    return ok;
+}
+
+static void c6_lit_infer_decl(void)
+{
+    CType vt = {0};
+    Sym *ls = 0;
+    int v = 0, align = 0, size = 0, slot = 0;
+
+    if (tok < TOK_UIDENT)
+        expect("variable name");
+    v = tok;
+    next();
+    skip('=');
+    c6_lit_parse();                      /* pushes the function value */
+    vt = vtop->type;
+    mk_pointer(&vt);                     /* a value is a function pointer */
+    size = type_size(&vt, &align);
+    loc = (loc - size) & -align;
+    slot = loc;
+    ls = sym_push(v, &vt, VT_LOCAL | VT_LVAL, slot);
+    vset(&vt, VT_LOCAL | VT_LVAL, ls->c);
+    vswap();
+    vstore();
+    vpop();
+    skip(';');
+}
+#endif
+
 ST_FUNC void unary(void)
 {
     int n = 0, t = 0, align = 0, size = 0, r = 0;
@@ -6581,6 +6920,12 @@ ST_FUNC void unary(void)
     if (c6_gc_move_lead()) {    /* 'move(p)' */
         c6_gc_move_expr();
         return;
+    }
+    if (c6_lit_lead(0)) {       /* 'RET (params) { ... }' */
+        c6_lit_parse();
+        /* the value is a function designator: the postfix operators (a call,
+           '->ref()', an index) still apply to it */
+        goto c6_lit_value;
     }
 #endif
     switch(tok) {
@@ -6696,6 +7041,13 @@ ST_FUNC void unary(void)
         next();
 #ifdef C6_EXT
         c6_tuple_ate_paren = 0;
+        /* '(RET (parameters) { body })': a parenthesized literal, not a cast
+           of a compound literal (the two start alike) */
+        if (c6_lit_lead(0)) {
+            c6_lit_parse();
+            skip(')');
+            goto c6_lit_value;
+        }
 #endif
         /* cast ? */
         if (parse_btype(&type, &ad, 0)) {
@@ -7173,6 +7525,7 @@ special_math_val:
         next();
         s = sym_find(t);
 #ifdef C6_EXT
+        c6_lit_cap_check(t, s);     /* a block scope name is a capture */
         /* 'pkg.member', possibly multi-level: the dotted spelling is a
            package-qualified access that resolves to 'pkg__member'.  The
            package part is grown one segment at a time, so 'a.b.f' first
@@ -7305,6 +7658,9 @@ special_math_val:
         break;
     }
     
+#ifdef C6_EXT
+ c6_lit_value:                  /* a function literal was just parsed */
+#endif
     /* post operations */
     while (1) {
         if (tok == TOK_INC || tok == TOK_DEC) {
@@ -10824,6 +11180,19 @@ static void c6_tu_reset(void)
         c6_sp_pending = p->next;
         tcc_free(p);
     }
+    /* function literals that were never compiled (an error aborted the
+       unit): their bodies go with the token strings */
+    while (c6_lit_head) {
+        C6Lit *lit = c6_lit_head;
+        c6_lit_head = lit->next;
+        tok_str_free(lit->body);
+        tcc_free(lit->params);
+        tcc_free(lit->caps);
+        tcc_free(lit);
+    }
+    c6_lit_tail = 0;
+    c6_lit_replay = 0;
+    c6_lit_count = 0;
 
     dynarray_reset(&c6_auto_impls, &c6_nb_auto_impls);
     for (m = c6_methods; m; m = next) {
@@ -11708,6 +12077,18 @@ again:
         }
 
         while (tok != '}') {
+#ifdef C6_EXT
+            /* a statement that begins with a literal is an expression, not a
+               declaration ('void(int x) { ... }(4);'): the probe hands the
+               tokens back and the statement is parsed as an expression.  A
+               statement that begins with a storage class (or 'async') is a
+               declaration: a literal can never start with one */
+            if (tok != TOK_STATIC && tok != TOK_EXTERN && tok != TOK_TYPEDEF
+                && tok != TOK_C6_ASYNC && c6_lit_lead(0)) {
+                block(flags | STMT_COMPOUND);
+                continue;
+            }
+#endif
 	    decl(VT_LOCAL);
             if (tok != '}') {
                 block(flags | STMT_COMPOUND);
@@ -12102,6 +12483,17 @@ again:
             /* expression case */
             if (t != ';') {
                 unget_tok(t);
+#ifdef C6_EXT
+                /* 'NAME = RET (parameters) { body };' declares NAME with the
+                   type of the literal, so the declaration needs no
+                   annotation.  Only a name that is declared nowhere starts
+                   this form: an existing function pointer keeps taking plain
+                   assignments. */
+                if (c6_lit_decl_lead()) {
+                    c6_lit_infer_decl();
+                    goto c6_stmt_done;
+                }
+#endif
     expr:
                 if (flags & STMT_EXPR) {
                     vpop();
@@ -16261,6 +16653,45 @@ static void free_inline_functions(TCCState *s)
     }
     dynarray_reset(&s->inline_fns, &s->nb_inline_fns);
 }
+
+#ifdef C6_EXT
+/* Compile the saved body of one function literal.  The symbol is already
+   declared, so the body alone is enough: 'gen_function' pushes the parameters
+   from the stored signature and the tokens name them again.  Same path as a
+   deferred 'static inline' body. */
+static void c6_lit_emit(C6Lit *lit)
+{
+    C6Lit *save = c6_lit_replay;
+
+    c6_lit_replay = lit;
+    cur_text_section = text_section;
+    begin_macro(lit->body, 1);
+    next();
+    gen_function(lit->sym);
+    end_macro();
+    c6_lit_replay = save;
+}
+
+/* Compile every literal that is still waiting.  A body may contain another
+   literal, which is queued while this loop runs, so it drains the queue. */
+static int c6_lit_flush(void)
+{
+    int n = 0;
+
+    while (c6_lit_head) {
+        C6Lit *lit = c6_lit_head;
+        c6_lit_head = lit->next;
+        if (!c6_lit_head)
+            c6_lit_tail = 0;
+        c6_lit_emit(lit);
+        tcc_free(lit->params);
+        tcc_free(lit->caps);
+        tcc_free(lit);
+        n++;
+    }
+    return n;
+}
+#endif
 
 static void do_Static_assert(void)
 {

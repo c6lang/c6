@@ -1,0 +1,308 @@
+/* c6 自测：函数字面量 'RET (参数) { 体 }'
+ *
+ * 字面量是一个表达式，它的值就是那个函数：
+ *
+ *   void(int) ...
+ *   void (*f)(int) = void(int x) { printf("%d\n", x); };   // 显式声明
+ *   f(1);                    // 调用
+ *   void(int x) { ... }(2);  // 就地调用
+ *   g = void(int x) { ... }; // 推断声明：g 的类型来自字面量
+ *
+ * 值就是一个普通的函数指针：不分配对象、不计数、能存进任何函数指针、
+ * 能直接交给 C。
+ *
+ * 体是"稍后编译"的（和 static inline 一样，在翻译单元末尾发射），所以
+ * 体里只看得见：
+ *
+ *   - 它自己的参数
+ *   - 文件作用域的名字（全局、函数、typedef、struct/union/enum tag）
+ *
+ * 写在外层的局部变量和形参都不可见，引用它们是编译期错误（见
+ * tests/errors/fn_lit.c），需要那些值时把它们作为参数传进来。
+ *
+ * 运行（仓库根目录）：
+ *   make selftest
+ * 或单个文件：
+ *   ./tcc/tcc -B tcc -std=c6 -test tests/fn_lit.c
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---- 文件作用域的东西：体里可以直接用 ---- */
+
+static int calls = 0;
+
+static int twice(int v)
+{
+    calls++;
+    return v * 2;
+}
+
+static int base = 100;
+
+typedef int MyInt;
+
+struct Point { int x, y; };
+
+/* 文件作用域的字面量：体只看文件作用域，所以在哪儿写都一样 */
+static int (*file_scope)(int) = int(int v) { return v + base; };
+int (*file_scope_pub)(int) = int(int v) { return v * 2; };
+
+/* ---- 1. 最基本的三种写法 ---- */
+
+test "显式声明、就地调用、推断声明" {
+    void (*say)(int) = void(int x) { calls = calls + 1; base = base + x; };
+
+    calls = 0;
+    base = 100;
+    say(3);
+    if (calls != 1 || base != 103)
+        err(1, "显式声明的字面量没有跑");
+    void(int x) { base = base + x; }(4);
+    if (base != 107)
+        err(2, "就地调用的字面量没有跑");
+    f = void(int x) { base = base + x; };
+    f(5);
+    if (base != 112)
+        err(3, "推断声明没有跑");
+    if (f(6), base != 118)
+        err(4, "推断声明的变量不是函数指针");
+}
+
+test "返回值、多个参数、无参数" {
+    int (*add)(int, int) = int(int a, int b) { return a + b; };
+    int (*zero)(void) = int() { return 7; };
+    void (*nothing)(void) = void() { };
+
+    if (add(2, 3) != 5)
+        err(1, "两个参数的结果不对");
+    if (zero() != 7)
+        err(2, "'int()' 的无参形式不对");
+    nothing();
+    if (sizeof(zero) != sizeof(void (*)(void)))
+        err(3, "字面量的值不是函数指针大小");
+}
+
+/* ---- 2. 体里能看见什么 ---- */
+
+test "体里看得见文件作用域的函数和全局变量" {
+    int (*f)(int) = int(int v) { return twice(v) + base; };
+
+    calls = 0;
+    base = 10;
+    if (f(3) != 16)
+        err(1, "体里调用文件作用域函数的结果不对");
+    if (calls != 1)
+        err(2, "体里没有真的调到那个函数");
+}
+
+test "体里看得见文件作用域的 typedef 和 tag" {
+    MyInt (*f)(int) = MyInt(int v) {
+        struct Point p = { v, v + 1 };
+        return p.x + p.y;
+    };
+
+    if (f(2) != 5)
+        err(1, "体里的 typedef/tag 用法不对");
+}
+
+/* ---- 3. 返回值可以是任何能被一路带回来的类型 ---- */
+
+test "返回结构体、切片和托管引用" {
+    struct Point p = struct Point(int v) {
+        struct Point q = { v, v * 2 };
+
+        return q;
+    }(3);
+
+    if (p.x != 3 || p.y != 6)
+        err(1, "结构体返回值不对");
+    int[:] (*first)(int[:]) = int[:](int[:] s) { return s[0:2]; };
+    int buf[4] = { 1, 2, 3, 4 };
+    int[:] head = first((int[:]){ buf, 4 });
+    if (head[0] != 1 || head[1] != 2)
+        err(2, "切片返回值不对");
+    @int (*mkbox)(int) = @int(int v) {
+        @int p = new int;
+
+        *p = v;
+        return p;
+    };
+    @int b = mkbox(9);
+    if (*b != 9)
+        err(3, "托管引用返回值不对");
+}
+
+/* ---- 4. 和 c6 其它特性一起用 ---- */
+
+test "变参字面量" {
+    int (*sum)(int, ...) = int(int n, ...) {
+        va_list ap = {0};
+        int i = 0, total = 0;
+
+        va_start(ap, n);
+        for (i = 0; i < n; i++)
+            total += va_arg(ap, int);
+        va_end(ap);
+        return total;
+    };
+
+    if (sum(3, 4, 5, 6) != 15)
+        err(1, "变参字面量不对");
+}
+
+test "可失败字面量：err 与 catch" {
+    int (*divi)(int, int)!error = int!error (int a, int b) {
+        if (!b)
+            err(9, "division by zero");
+        return a / b;
+    };
+    int good = divi(8, 2) catch e {
+        err(91, "可失败字面量的正常路径不该失败");
+        return 0;
+    };
+
+    if (good != 4)
+        err(1, "可失败字面量的正常路径不对");
+    divi(1, 0) catch e {
+        if (e.id != 9)
+            err(2, "可失败字面量的错误码不对");
+        if (!e.msg || strcmp(e.msg, "division by zero"))
+            err(3, "可失败字面量的消息不对");
+        return 0;
+    };
+    err(4, "可失败字面量没有报错");
+}
+
+test "体里可以用 defer" {
+    int (*f)(void) = int() {
+        int v = 1;
+
+        defer v = v * 10;
+        v = v + 1;
+        return v;
+    };
+
+    if (f() != 2)
+        err(1, "defer 体的字面量结果不对");
+}
+
+test "字面量里再写字面量" {
+    int (*outer)(int) = int(int x) {
+        int (*inner)(int) = int(int y) { return y - 1; };
+        return inner(x) * 10;
+    };
+
+    if (outer(6) != 50)
+        err(1, "嵌套字面量不对");
+}
+
+static inline int inline_user(int k)
+{
+    int (*f)(int) = int(int v) { return v * 3; };
+    return f(2) + k;
+}
+
+test "static inline 体里的字面量" {
+    if (inline_user(1) != 7)
+        err(1, "static inline 体里的字面量没有被编译");
+}
+
+/* ---- 5. 当值用：函数指针能去哪儿，它就能去哪儿 ---- */
+
+static int apply(int (*f)(int), int v)
+{
+    return f(v);
+}
+
+static struct Handler {
+    void (*cb)(int);
+    int seen;
+} handler = { 0, 0 };
+
+struct Ops {
+    int (*op)(int, int);
+};
+
+test "作为实参、存进结构体、放进数组" {
+    if (apply(int(int v) { return v * 4; }, 3) != 12)
+        err(1, "字面量作实参不对");
+    handler.cb = void(int v) { handler.seen = v; };
+    handler.cb(21);
+    if (handler.seen != 21)
+        err(2, "字面量存进结构体后调用不对");
+    struct Ops ops = { { int(int a, int b) { return a - b; } } };
+    if (ops.op(9, 4) != 5)
+        err(3, "字面量作结构体成员初值不对");
+    int (*table[3])(int) = {
+        { int(int v) { return v + 1; } },
+        { int(int v) { return v + 2; } },
+        { int(int v) { return v + 3; } },
+    };
+    if (table[0](0) != 1 || table[1](0) != 2 || table[2](0) != 3)
+        err(4, "字面量数组不对");
+}
+
+test "赋给已有的函数指针" {
+    int (*f)(int) = twice;
+    int (*g)(int) = 0;
+
+    g = f;
+    f = int(int v) { return v + 1000; };
+    if (f(1) != 1001 || g(3) != 6)
+        err(1, "给已有函数指针赋值不对");
+}
+
+test "交给 C 库：qsort" {
+    int v[6] = { 4, 1, 5, 3, 2, 6 };
+    int i = 0;
+
+    qsort(v, 6, sizeof v[0], int(const void *a, const void *b) {
+        int x = *(const int *)a, y = *(const int *)b;
+        return x < y ? -1 : x > y;
+    });
+    for (i = 1; i < 6; i++)
+        if (v[i - 1] > v[i])
+            err(1, "qsort 没有排好");
+}
+
+test "文件作用域和 static 初始化的字面量" {
+    static int (*local_static)(void) = int() { return 42; };
+
+    base = 10;
+    if (file_scope(1) != 11)
+        err(1, "文件作用域的字面量不对");
+    if (file_scope_pub(3) != 6)
+        err(2, "公开的文件作用域字面量不对");
+    if (local_static() != 42)
+        err(3, "static 局部变量初始化的字面量不对");
+}
+
+/* ---- 6. 两个不同位置的同形字面量是两个函数 ---- */
+
+test "每个字面量各有自己的函数" {
+    int (*a)(int) = int(int v) { return v; };
+    int (*b)(int) = int(int v) { return v; };
+
+    if (a == b)
+        err(1, "两个字面量被当成了同一个函数");
+    if (a(1) != 1 || b(2) != 2)
+        err(2, "两个同形字面量调用结果不对");
+}
+
+/* ---- 7. 显式声明与推断声明是同一个类型 ---- */
+
+test "推断声明得到的变量就是普通函数指针" {
+    void (*f)(int) = void(int x) { base = base + x; };
+
+    base = 0;
+    g = void(int x) { base = base + x * 2; };
+    g(4);
+    if (base != 8)
+        err(1, "推断声明的变量调用不对");
+    g = f;                              /* 和普通函数指针互相赋值 */
+    g(1);
+    if (base != 9)
+        err(2, "推断声明的变量收不住显式声明");
+}
