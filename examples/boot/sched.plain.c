@@ -21,10 +21,14 @@
  */
 
 #define MAXTASK 32
+#define MAXCORE 4
+#define APSTACKSZ (32 * 1024)
 #define STACKSZ (64 * 1024)
 #define KEYSLOTS 8
 #define TICK_HZ 100
+#ifndef ISTACKSZ
 #define ISTACKSZ 8192
+#endif
 
 /* 被打断的现场。字段顺序 = 中断入口压栈顺序（最后压的在最低地址），
    所以整块 160 字节可以直接搬进搬出。 */
@@ -33,6 +37,10 @@ struct Frame {
     unsigned long long r8, r9, r10, r11, r12, r13, r14, r15;
     unsigned long long rip, cs, fl, rsp, ss;
 };
+
+#define T_READY 0
+#define T_RUNNING 1
+#define T_DONE 2
 
 struct Task {
     struct Frame f;                     /* 现场 */
@@ -43,6 +51,9 @@ struct Task {
     void *ret;
     volatile int done;                  /* fn 已经返回 */
     volatile int dead;                  /* 别再调度它了 */
+    volatile int state;                 /* T_READY / T_RUNNING / T_DONE */
+    int core;                           /* 最后一次跑在哪个核 */
+    int ap_only;                        /* 只交给 AP 跑（有多核时）*/
     int tid;
     void *keys[KEYSLOTS];
 };
@@ -54,6 +65,9 @@ static struct Task main_task;
 static volatile unsigned long switch_count = 0;
 static int next_key = 0;
 static int main_started = 0;
+static volatile int sched_lock = 0;
+static volatile int ap_ready[MAXCORE];
+static unsigned char ap_stack_mem[MAXCORE][APSTACKSZ];
 
 /* 中断栈：中断一进来就换到这块，任务栈上不留任何东西。 */
 static unsigned char istack[ISTACKSZ];
@@ -69,7 +83,7 @@ void *calloc(unsigned long n, unsigned long sz);
 /* ---- 几条汇编小工具（tcc 的约束支持有限，干脆写成全局 asm） ---- */
 
 void sched_outb(int port, int val);
-void sched_inb(int port);
+int sched_inb(int port);
 void sched_cli(void);
 void sched_sti(void);
 void sched_idle(void);                  /* sti; hlt */
@@ -108,7 +122,9 @@ __asm__(
     "sched_xchg:\n"
     "  movl %esi, %eax\n"
     "  xchgl %eax, (%rdi)\n"
-    "  ret\n");
+    "  ret\n"
+    ".globl sched_read_cr3\n"
+    "sched_read_cr3:\n  movq %cr3, %rax\n  ret\n");
 
 /* ---- 中断门 ---- */
 
@@ -160,6 +176,8 @@ static void trap_handler(void)
 
 struct Frame *sched_switch(struct Frame *f);
 static void task_entry(void);
+int sched_cpu_count(void);
+void ap_main(unsigned long apic_id);
 
 /* 中断里调用：把现场存进当前任务，挑下一个，返回它的现场。 */
 struct Frame *sched_switch(struct Frame *f)
@@ -168,11 +186,15 @@ struct Frame *sched_switch(struct Frame *f)
     int i = 0, n = 0, start = 0;
 
     sched_outb(0x20, 0x20);             /* EOI */
+    while (sched_xchg((int *)&sched_lock, 1))
+        ;                               /* 任务表可能正被某个 AP 翻着 */
     if (cur) {
         cur->f = *f;
         cur->sp = (unsigned long long)(unsigned long)f;
     }
     switch_count++;
+    if (cur && cur->state == T_RUNNING)
+        cur->state = T_READY;
     n = ntasks;
     for (i = 0; i < n; i++)
         if (tasks[i] == cur) {
@@ -181,14 +203,21 @@ struct Frame *sched_switch(struct Frame *f)
         }
     for (i = 1; i <= n; i++) {
         struct Task *c = tasks[(start + i) % n];
-        if (!c->dead) {
-            t = c;
-            break;
-        }
+        /* 正在别的核上跑的任务不能抢：否则它会同时在两个核上执行 */
+        /* 正在别的核上跑的任务不能抢：否则它会同时在两个核上执行 */
+        if (c->dead || c->state == T_RUNNING)
+            continue;
+        /* 有多核时，标了 ap_only 的活留给 AP */
+        if (c->ap_only && sched_cpu_count() > 1)
+            continue;
+        t = c;
+        break;
     }
     if (!t)
         t = cur;
     cur = t;
+    cur->state = T_RUNNING;
+    sched_xchg((int *)&sched_lock, 0);
     return &cur->f;
 }
 
@@ -207,11 +236,6 @@ struct Task *sched_self(void)
     return cur;
 }
 
-int sched_core(void)
-{
-    return 0;                           /* 单核版本 */
-}
-
 static void task_entry(void)
 {
     struct Task *t = cur;
@@ -219,6 +243,7 @@ static void task_entry(void)
     t->ret = (void *)(long)t->fn(t->arg);
     t->done = 1;
     t->dead = 1;
+    t->state = T_DONE;
     for (;;)
         sched_yield();                  /* 自己让出去，之后不会再被选中 */
 }
@@ -310,6 +335,9 @@ void sched_init(void)
     main_task.tid = 0;
     main_task.done = 0;
     main_task.dead = 0;
+    main_task.state = T_RUNNING;
+    main_task.ap_only = 0;
+    main_task.core = 0;
     main_task.fn = 0;
     main_task.sp = 0;
     for (i = 0; i < KEYSLOTS; i++)
@@ -324,6 +352,161 @@ void sched_init(void)
     pic_init();
     pit_init();
     sched_sti();
+}
+
+
+/* ---- 多核：把 AP 拉起来，让它从任务表里捡活干 ------------------------ */
+
+#define LAPIC_BASE 0xFEE00000UL
+
+static unsigned int lapic_rd(int off)
+{
+    return *(volatile unsigned int *)(LAPIC_BASE + (unsigned long)off);
+}
+
+static void lapic_wr(int off, unsigned int v)
+{
+    *(volatile unsigned int *)(LAPIC_BASE + (unsigned long)off) = v;
+}
+
+int sched_core(void)
+{
+    return (int)((lapic_rd(0x20) >> 24) & (MAXCORE - 1));
+}
+
+static void lapic_deliver_wait(void)
+{
+    int i = 0;
+
+    while ((lapic_rd(0x300) & (1u << 12)) && i < 1000000)
+        i++;
+}
+
+/* 延时：PIT 通道 2 的单次触发（通道 0 还在给调度器打拍子，别动它）。 */
+static void delay_10ms(void)
+{
+    unsigned int div = 11932u;
+    int i = 0;
+
+
+    sched_outb(0x61, (sched_inb(0x61) & 0xFD) | 1);   /* 开 gate2、关扬声器 */
+    sched_outb(0x43, 0xB2);                            /* 通道 2、方式 1 */
+    sched_outb(0x42, (int)(div & 0xFF));
+    sched_outb(0x42, (int)((div >> 8) & 0xFF));
+    while (!(sched_inb(0x61) & 0x20) && i < 10000000)
+        i++;
+}
+
+static void lapic_send_init(int id)
+{
+    lapic_wr(0x310, (unsigned int)id << 24);
+    lapic_wr(0x300, 0x000C4500);        /* INIT，assert */
+    lapic_deliver_wait();
+}
+
+static void lapic_send_sipi(int id, int vec)
+{
+    lapic_wr(0x310, (unsigned int)id << 24);
+    lapic_wr(0x300, 0x000C4600u | (unsigned int)(vec & 0xFF));
+    lapic_deliver_wait();
+}
+
+/* 跳板由 build.sh 用 objcopy -I binary 包成目标文件链进来。 */
+extern const unsigned char _binary_ap_bin_start[];
+extern const unsigned char _binary_ap_bin_end[];
+
+static unsigned long long ap_stacks[16];
+
+int sched_cpu_count(void)
+{
+    int i = 0, n = 1;
+
+    for (i = 0; i < MAXCORE; i++)
+        if (ap_ready[i])
+            n++;
+    return n;
+}
+
+/* 三个约定好的低内存邮箱（ap.S 里按绝对地址读）：
+ *   0x7000 u32 cr3 / 0x7008 u64 ap_entry / 0x7010 u64 ap_stacks[16]
+ */
+int smp_start_aps(int ncpu)
+{
+    int bsp = sched_core();
+    int id = 0, i = 0;
+    unsigned long n = (unsigned long)(_binary_ap_bin_end - _binary_ap_bin_start);
+
+    sched_cli();                        /* 启动 AP 期间先别让时钟插进来 */
+    for (i = 0; i < 16; i++) {
+        unsigned long long top = (unsigned long long)(unsigned long)
+            (ap_stack_mem[i & (MAXCORE - 1)] + APSTACKSZ);
+        ap_stacks[i] = top & ~15ULL;
+    }
+    memcpy((void *)0x8000, _binary_ap_bin_start, n);
+    *(volatile unsigned int *)0x7000 = (unsigned int)sched_read_cr3();
+    *(volatile unsigned long long *)0x7008 =
+        (unsigned long long)(unsigned long)ap_main;
+    *(volatile unsigned long long *)0x7010 =
+        (unsigned long long)(unsigned long)ap_stacks;
+    if (ncpu > MAXCORE)
+        ncpu = MAXCORE;
+    for (id = 0; id < ncpu; id++) {
+        if (id == 0 || id == bsp)
+            continue;
+        lapic_send_init(id);
+        delay_10ms();
+        lapic_send_sipi(id, 0x08);      /* 0x08 → 0x8000 */
+        delay_10ms();
+        lapic_send_sipi(id, 0x08);
+        delay_10ms();
+    }
+    for (i = 0; i < 200; i++) {
+        if (sched_cpu_count() >= ncpu)
+            break;
+        delay_10ms();
+    }
+    sched_sti();
+    return sched_cpu_count();
+}
+
+/* AP 从跳板跳到这里。它不装 IDT、不开时钟，就是一直从任务表里捡活干：
+ * 捡到一个就直接把函数调起来跑完（那套编出来的 iretq 现场是给引导核用的）。 */
+void ap_main(unsigned long apic_id)
+{
+    int core = (int)(apic_id & (MAXCORE - 1));
+
+    if (core == 0)
+        return;                         /* 不该走到这：引导核已经起来了 */
+    ap_ready[core] = 1;
+    for (;;) {
+        struct Task *t = 0;
+        int i = 0, n = 0;
+
+        sched_cli();
+        while (sched_xchg((int *)&sched_lock, 1))
+            ;
+        n = ntasks;
+        for (i = 0; i < n; i++) {
+            struct Task *c = tasks[i];
+            /* 引导核自己的上下文不能搬到别的核上跑 */
+            if (c && c != &main_task && !c->dead && c->state == T_READY) {
+                c->state = T_RUNNING;
+                c->core = core;
+                t = c;
+                break;
+            }
+        }
+        sched_xchg((int *)&sched_lock, 0);
+        /* AP 上不装 IDT，所以这里绝不 sched_sti()：开了中断就是三重故障 */
+        if (!t) {
+            sched_pause();
+            continue;
+        }
+        t->ret = (void *)(long)t->fn(t->arg);
+        t->done = 1;
+        t->dead = 1;
+        t->state = T_DONE;
+    }
 }
 
 /* ---- 那 8 个入口 ---- */
@@ -351,6 +534,9 @@ int pthread_create(unsigned long *th, const void *attr,
     t->ret = 0;
     t->done = 0;
     t->dead = 0;
+    t->state = T_READY;
+    t->core = -1;
+    t->ap_only = (sched_cpu_count() > 1);
     t->tid = ntasks;
     for (i = 0; i < KEYSLOTS; i++)
         t->keys[i] = 0;
@@ -367,7 +553,9 @@ int pthread_create(unsigned long *th, const void *attr,
     t->f.ss = 0x10;                     /* 数据段 */
     t->sp = 0;
 
+    sched_cli();                        /* 别让中断或别的核看见半成品 */
     tasks[ntasks++] = t;
+    sched_sti();
     if (th)
         *th = (unsigned long)t;
     return 0;

@@ -1373,13 +1373,32 @@ go: 空转 4446664 次（上限 200000000）、时钟切换 5 次、go_flag=1
 go: 是并发 —— 两个任务在同一个 CPU 上被时钟抢占着交错推进
 ```
 
-多核（SMP）这一轮只铺到地基：[examples/boot/ap.S](examples/boot/ap.S) 是
-AP 的 16 位实模式跳板（`as --32`，和引导扇区一样按固定地址链，222 字节），
-`build.sh` 把它包成目标文件链进 payload，并支持 `SMP=2 examples/boot/build.sh
-...` 直接传给 qemu 的 `-smp`；`boot.S` 也把 LAPIC 那页（`0xFEE00000`，属性
-`PCD|PWT`，不能走 cache）映射好了。per-CPU 调度器还没打通：TCC 下 2/10 次会
-在第一次时钟中断附近三重故障，AP 起来之后现场恢复也不稳，所以没有加
-`make fstest-bare-smp`，细节和已确认的坑写在 [docs/plan.md](docs/plan.md) 里。
+#### 多核：两个核同时在跑
+
+`make fstest-bare-smp` 起两个核（`-smp 2`）跑
+[examples/boot/smp_bare.c](examples/boot/smp_bare.c)，再用 `SMP=1` 跑一遍做
+负对照。AP 是 `examples/boot/ap.S` 那个 16 位实模式跳板拉起来的（`as --32`
++ `ld -Ttext 0x8000`，222 字节，`build.sh` 用 `objcopy -I binary` 链进
+payload），引导核先往 `0x7000/0x7008/0x7010` 写好 cr3、入口、每个 APIC ID 的
+栈顶，再对每个 AP 走 INIT → SIPI 0x08 → SIPI 0x08。每个任务"自己在哪个核"
+是从 LAPIC 的 ID 寄存器读的，不是猜的。
+
+证据是这么来的：A 把**本核中断关掉**再空转两百万圈 —— 这段时间里引导核绝无
+可能切到别的任务，可 B 的计数器还在涨，那就只可能是另一个核在跑它。
+
+```
+smp: 在线核数 2，A 跑在核 0
+smp: B 跑在核 1（它自己从 LAPIC 读的）
+smp: A 关中断空转期间 B 的计数器涨了 1219694
+smp: 真并行 —— 两个任务同时跑在两个核上
+```
+
+`SMP=1` 时同一个程序打印"B 在核 0、涨了 0、只有交错没有并行"。分工上，引导
+核继续用 8254 + 8259A 的时钟抢占调度（和单核那条路一模一样），AP 不装 IDT、
+不开中断，只是从带自旋锁的任务表里捡 `T_READY` 的活干；状态机保证同一个任务
+不会被两个核同时选中。两个硬伤级的坑：启动 AP 的整段必须 `cli`（时钟插进
+`delay_10ms` 那种短函数里，`iretq` 恢复现场偶尔会落进栈地址），AP 上也绝不
+能 `sti`（它没装 IDT）。细节在 [docs/plan.md](docs/plan.md)。
 
 空转次数**远小于上限**就是证据：只有时钟中断真在任意指令边界把 CPU 抢走，
 另一个任务才有机会跑起来把 `go_flag` 立起来。要是 `go` 只是在同一个栈上顺序
