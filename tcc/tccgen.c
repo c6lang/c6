@@ -11054,6 +11054,14 @@ static void c6_emit_header(TCCState *s1)
     /* a first pass fills c6_hdr_extras (slice/tuple typedefs) */
     for (i = 0; i < s1->c6_nb_header_decls; i++)
         c6_hdr_collect_decl(s1->c6_header_decls[i]);
+    /* closure layouts: their code signature may itself need a slice/tuple
+       typedef, so walk them before the file is opened */
+    {
+        C6Closure *cl = 0;
+        char tmp[2048] = {0};
+        for (cl = c6_closures; cl; cl = cl->next)
+            c6_hdr_type(tmp, sizeof tmp, &cl->code_type, "(*__c6_code)");
+    }
 
     f = fopen(s1->c6_emit_header, "w");
     if (!f)
@@ -11071,6 +11079,15 @@ static void c6_emit_header(TCCState *s1)
             fprintf(f, "%s %s;\n",
                     IS_UNION(d->sym->type.t) ? "union" : "struct",
                     get_tok_str(d->name, NULL));
+    }
+
+    {
+        C6Closure *cl = 0;
+        for (cl = c6_closures; cl; cl = cl->next)
+            fprintf(f, "struct %s;\n",
+                    get_tok_str(cl->tag_sym->v & ~SYM_STRUCT, NULL));
+        if (c6_closures)
+            fputc('\n', f);
     }
 
     /* generated slice/tuple layouts */
@@ -11095,6 +11112,19 @@ static void c6_emit_header(TCCState *s1)
     }
     if (c6_hdr_extras)
         fputc('\n', f);
+
+    /* closure object layouts (code pointer, then the environment) */
+    {
+        C6Closure *cl = 0;
+        for (cl = c6_closures; cl; cl = cl->next) {
+            char buf[2048] = {0};
+            fprintf(f, "struct %s {\n",
+                    get_tok_str(cl->tag_sym->v & ~SYM_STRUCT, NULL));
+            c6_hdr_type(buf, sizeof buf, &cl->code_type, "(*__c6_code)");
+            fprintf(f, "    %s;\n", buf);
+            fprintf(f, "    void *__c6_env;\n};\n\n");
+        }
+    }
 
     /* struct/union/enum definitions, in source order */
     for (i = 0; i < s1->c6_nb_header_decls; i++) {
@@ -12927,6 +12957,12 @@ static void c6_tu_reset(void)
 {
     C6Method *m = 0, *next = 0;
     int i = 0;
+
+    /* -emit-header runs after the unit: it still needs the closure layouts
+       and the hidden type symbols, so the pools are released by the process
+       instead (one module translation unit per invocation) */
+    if (tcc_state && tcc_state->c6_emit_header)
+        return;
 
     while (c6_sp_pending) {
         C6SpPending *p = c6_sp_pending;
