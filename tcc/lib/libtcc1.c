@@ -1748,44 +1748,191 @@ static void c6_fmt_put(C6FmtBuf *b, const char *s, unsigned long len)
     p[b->len] = 0;
 }
 
-static void c6_fmt_dec(C6FmtBuf *b, unsigned long long v)
-{
-    char tmp[24];
-    int n = 0;
+/* ---- the format spec of one piece ('{expr;spec}') --------------------- *
+   The compiler parses the spec into these bits and arms it with
+   __c6_fmt_spec(); the next piece consumes it.  Keep in sync with
+   tcc/tccgen.c and tcc/c99-rt.inc. */
 
-    if (!v) {
-        c6_fmt_put(b, "0", 1);
-        return;
+#define C6_SPEC_WIDTH_SHIFT  0
+#define C6_SPEC_WIDTH_MASK   0x3ff
+#define C6_SPEC_PREC_SHIFT   10
+#define C6_SPEC_PREC_MASK    0x3ff
+#define C6_SPEC_CONV_SHIFT   20
+#define C6_SPEC_CONV_MASK    0xf
+#define C6_SPEC_LEFT         (1 << 24)
+#define C6_SPEC_ZERO         (1 << 25)
+#define C6_SPEC_PLUS         (1 << 26)
+#define C6_SPEC_HASH         (1 << 27)
+#define C6_SPEC_PREC_SET     (1 << 28)
+
+#define C6_CONV_NONE 0
+#define C6_CONV_D    1
+#define C6_CONV_U    2
+#define C6_CONV_XL   3
+#define C6_CONV_XU   4
+#define C6_CONV_O    5
+#define C6_CONV_B    6
+#define C6_CONV_C    7
+#define C6_CONV_S    8
+#define C6_CONV_P    9
+
+/* emit N copies of CH */
+static void c6_fmt_fill(C6FmtBuf *b, int ch, unsigned long n)
+{
+    char t[32];
+    int i = 0;
+    unsigned long k = 0;
+
+    for (i = 0; i < (int)sizeof t; i++)
+        t[i] = (char)ch;
+    while (n) {
+        k = n < (unsigned long)sizeof t ? n : (unsigned long)sizeof t;
+        c6_fmt_put(b, t, k);
+        n -= k;
     }
-    while (v) {
-        tmp[n++] = (char)('0' + (int)(v % 10));
-        v /= 10;
-    }
-    c6_fmt_room(b, (unsigned long)n);
-    while (n > 0)
-        c6_fmt_text(b)[b->len++] = tmp[--n];
-    c6_fmt_text(b)[b->len] = 0;
 }
 
-static void c6_fmt_hex(C6FmtBuf *b, unsigned long long v)
+/* text with the spec: width pads, '-' aligns left, '.precision' cuts */
+static void c6_fmt_str_spec(C6FmtBuf *b, const char *s, unsigned long n,
+                            int sp)
 {
-    char tmp[24];
-    int n = 0, d = 0;
+    int left = 0, zero = 0;
+    unsigned long w = 0, pad = 0, p = 0;
 
-    c6_fmt_put(b, "0x", 2);
+    if (sp & C6_SPEC_PREC_SET) {
+        p = (unsigned long)((sp >> C6_SPEC_PREC_SHIFT) & C6_SPEC_PREC_MASK);
+        if (n > p)
+            n = p;
+    }
+    w = (unsigned long)((sp >> C6_SPEC_WIDTH_SHIFT) & C6_SPEC_WIDTH_MASK);
+    left = (sp & C6_SPEC_LEFT) != 0;
+    zero = (sp & C6_SPEC_ZERO) != 0 && !left;
+    if (w > n)
+        pad = w - n;
+    if (pad && !left)
+        c6_fmt_fill(b, zero ? '0' : ' ', pad);
+    c6_fmt_put(b, s, n);
+    if (pad && left)
+        c6_fmt_fill(b, ' ', pad);
+}
+
+/* an integer: V is the magnitude, NEG its sign.  The spec picks the base,
+   the prefix, the sign, the padding zeroes and the width; 'u'/'x'/'X'/'o'/
+   'b' print the value as unsigned (see __c6_fmt_i). */
+static void c6_fmt_num(C6FmtBuf *b, unsigned long long v, int neg,
+                       int base, int upper, int hex_prefix, int sp)
+{
+    char d[72];
+    char pfx[3] = {0};
+    char sign = 0;
+    const char *tab = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    int nd = 0, conv = 0, prec = 0, prec_set = 0;
+    int left = 0, zero = 0, plus = 0, hash = 0;
+    unsigned long width = 0, total = 0, pad = 0, zeros = 0, np = 0;
+
+    conv = (sp >> C6_SPEC_CONV_SHIFT) & C6_SPEC_CONV_MASK;
+    switch (conv) {
+    case C6_CONV_D:
+    case C6_CONV_U:
+        base = 10;
+        break;
+    case C6_CONV_XL:
+        base = 16;
+        upper = 0;
+        tab = "0123456789abcdef";
+        hex_prefix = 0;
+        break;
+    case C6_CONV_XU:
+        base = 16;
+        upper = 1;
+        tab = "0123456789ABCDEF";
+        hex_prefix = 0;
+        break;
+    case C6_CONV_O:
+        base = 8;
+        hex_prefix = 0;
+        break;
+    case C6_CONV_B:
+        base = 2;
+        hex_prefix = 0;
+        break;
+    case C6_CONV_P:
+        base = 16;
+        hex_prefix = 1;
+        break;
+    default:
+        break;
+    }
+    left = (sp & C6_SPEC_LEFT) != 0;
+    zero = (sp & C6_SPEC_ZERO) != 0 && !left;
+    plus = (sp & C6_SPEC_PLUS) != 0;
+    hash = (sp & C6_SPEC_HASH) != 0;
+    if (sp & C6_SPEC_PREC_SET) {
+        prec = (sp >> C6_SPEC_PREC_SHIFT) & C6_SPEC_PREC_MASK;
+        prec_set = 1;
+    }
+    width = (unsigned long)((sp >> C6_SPEC_WIDTH_SHIFT) & C6_SPEC_WIDTH_MASK);
+
+    if (neg)
+        sign = '-';
+    else if (plus && base == 10)
+        sign = '+';
+    if (!v)
+        hash = 0;                       /* '%#x' of 0 prints '0' */
+    /* the 'p' prefix stays: a null pointer is '0x0' */
+    if (hex_prefix && base == 16) {
+        pfx[0] = '0';
+        pfx[1] = upper ? 'X' : 'x';
+    } else if (hash) {
+        if (base == 16) {
+            pfx[0] = '0';
+            pfx[1] = upper ? 'X' : 'x';
+        } else if (base == 8) {
+            pfx[0] = '0';
+        } else if (base == 2) {
+            pfx[0] = '0';
+            pfx[1] = 'b';
+        }
+    }
+    np = pfx[0] ? (unsigned long)(pfx[1] ? 2 : 1) : 0;
     if (!v) {
-        c6_fmt_put(b, "0", 1);
-        return;
+        d[nd++] = '0';
+    } else {
+        while (v) {
+            d[nd++] = tab[(int)(v % (unsigned long long)base)];
+            v /= (unsigned long long)base;
+        }
     }
-    while (v) {
-        d = (int)(v & 15);
-        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
-        v >>= 4;
+    if (prec_set && (unsigned long)nd < (unsigned long)prec)
+        zeros = (unsigned long)prec - (unsigned long)nd;
+    total = (unsigned long)nd + zeros + np + (sign ? 1 : 0);
+    if (width > total)
+        pad = width - total;
+    if (pad && zero) {
+        zeros += pad;
+        pad = 0;
     }
-    c6_fmt_room(b, (unsigned long)n);
-    while (n > 0)
-        c6_fmt_text(b)[b->len++] = tmp[--n];
-    c6_fmt_text(b)[b->len] = 0;
+    if (pad && !left)
+        c6_fmt_fill(b, ' ', pad);
+    if (sign)
+        c6_fmt_put(b, &sign, 1);
+    if (np)
+        c6_fmt_put(b, pfx, np);
+    if (zeros)
+        c6_fmt_fill(b, '0', zeros);
+    while (nd > 0)
+        c6_fmt_put(b, &d[--nd], 1);
+    if (pad && left)
+        c6_fmt_fill(b, ' ', pad);
+}
+
+/* does the spec ask for a numeric conversion? */
+static int c6_fmt_num_conv(int sp)
+{
+    int conv = (sp >> C6_SPEC_CONV_SHIFT) & C6_SPEC_CONV_MASK;
+
+    return conv == C6_CONV_D || conv == C6_CONV_U || conv == C6_CONV_XL
+        || conv == C6_CONV_XU || conv == C6_CONV_O || conv == C6_CONV_B;
 }
 
 /* the builder of nesting depth D, created the first time it is needed */
@@ -1854,12 +2001,12 @@ void __c6_fmt_l(const char *s, unsigned long n)
 /* a piece with a known length; N == -1 means S is NUL terminated.  A null
    string is shown as "(null)", so a missing value is visible instead of
    crashing. */
-void __c6_fmt_s(const char *s, unsigned long n)
+void __c6_fmt_s(const char *s, unsigned long n, int spec)
 {
     C6FmtBuf *b = 0;
 
     if (!s) {
-        c6_fmt_put(c6_fmt_cur(), "(null)", 6);
+        c6_fmt_str_spec(c6_fmt_cur(), "(null)", 6, spec);
         return;
     }
     b = c6_fmt_cur();
@@ -1867,27 +2014,29 @@ void __c6_fmt_s(const char *s, unsigned long n)
         for (n = 0; s[n]; ++n)
             ;
     }
-    c6_fmt_put(b, s, n);
+    c6_fmt_str_spec(b, s, n, spec);
 }
 
 /* a plain C string: the compiler cannot know its length */
-void __c6_fmt_ch(int c)
+void __c6_fmt_ch(int c, int spec)
 {
     C6FmtBuf *b = c6_fmt_cur();
     unsigned char ch = (unsigned char)c;
 
-    if (!b)
+    if (c6_fmt_num_conv(spec)) {        /* '{c;x}' prints the number */
+        c6_fmt_num(b, (unsigned long long)ch, 0, 10, 0, 0, spec);
         return;
-    c6_fmt_put(b, (const char *)&ch, 1);
+    }
+    c6_fmt_str_spec(b, (const char *)&ch, 1, spec);
 }
 
-void __c6_fmt_c(const char *s)
+void __c6_fmt_c(const char *s, int spec)
 {
-    __c6_fmt_s(s, (unsigned long)-1);
+    __c6_fmt_s(s, (unsigned long)-1, spec);
 }
 
 /* a slice: the compiler hands over a pointer to the '{ data, len }' pair */
-void __c6_fmt_sl(const void *pair)
+void __c6_fmt_sl(const void *pair, int spec)
 {
     const unsigned long *w = (const unsigned long *)pair;
     unsigned long n = 0;
@@ -1899,34 +2048,46 @@ void __c6_fmt_sl(const void *pair)
        printing it would cut the text short */
     if (n && ((const char *)w[0])[n - 1] == 0)
         --n;
-    __c6_fmt_s((const char *)w[0], n);
+    __c6_fmt_s((const char *)w[0], n, spec);
 }
 
-void __c6_fmt_i(long long v)
+void __c6_fmt_i(long long v, int spec)
 {
     C6FmtBuf *b = c6_fmt_cur();
+    int conv = (spec >> C6_SPEC_CONV_SHIFT) & C6_SPEC_CONV_MASK;
 
-    if (v < 0) {
-        c6_fmt_put(b, "-", 1);
-        c6_fmt_dec(b, 0ULL - (unsigned long long)v);
+    /* 'u', 'x', 'X', 'o', 'b' show the value as unsigned, like printf */
+    if (conv == C6_CONV_U || conv == C6_CONV_XL || conv == C6_CONV_XU
+        || conv == C6_CONV_O || conv == C6_CONV_B) {
+        c6_fmt_num(b, (unsigned long long)v, 0, 10, 0, 0, spec);
+    } else if (v < 0) {
+        c6_fmt_num(b, 0ULL - (unsigned long long)v, 1, 10, 0, 0, spec);
     } else {
-        c6_fmt_dec(b, (unsigned long long)v);
+        c6_fmt_num(b, (unsigned long long)v, 0, 10, 0, 0, spec);
     }
 }
 
-void __c6_fmt_u(unsigned long long v)
+void __c6_fmt_u(unsigned long long v, int spec)
 {
-    c6_fmt_dec(c6_fmt_cur(), v);
+    c6_fmt_num(c6_fmt_cur(), v, 0, 10, 0, 0, spec);
 }
 
-void __c6_fmt_p(const void *p)
+void __c6_fmt_p(const void *p, int spec)
 {
-    c6_fmt_hex(c6_fmt_cur(), (unsigned long long)(unsigned long)p);
+    /* '0x...' by default; '{p;x}' drops the prefix, '{p;#x}' keeps it */
+    c6_fmt_num(c6_fmt_cur(), (unsigned long long)(unsigned long)p, 0, 16,
+               0, 1, spec);
 }
 
-void __c6_fmt_b(int v)
+void __c6_fmt_b(int v, int spec)
 {
-    c6_fmt_put(c6_fmt_cur(), v ? "true" : "false", v ? 4 : 5);
+    C6FmtBuf *b = c6_fmt_cur();
+
+    if (c6_fmt_num_conv(spec)) {        /* '{ok;d}' prints 0 or 1 */
+        c6_fmt_num(b, v ? 1ULL : 0ULL, 0, 10, 0, 0, spec);
+        return;
+    }
+    c6_fmt_str_spec(b, v ? "true" : "false", v ? 4 : 5, spec);
 }
 
 /* FLAGS: C6_GC_FRESH to hand back a managed object, C6_GC_ATOMIC when it is

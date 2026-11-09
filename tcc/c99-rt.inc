@@ -1735,46 +1735,192 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_put(C99FmtBuf *b,
     p[b->len] = 0;
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_dec(C99FmtBuf *b,
-                                                  unsigned long long v)
-{
-    char tmp[24];
-    int n = 0;
+/* ---- the format spec of one piece ('{expr;spec}') --------------------- *
+   Same bits as tcc/tccgen.c and tcc/lib/libtcc1.c. */
 
-    if (!v) {
-        __c99_fmt_put(b, "0", 1);
-        return;
+#define C99_SPEC_WIDTH_SHIFT  0
+#define C99_SPEC_WIDTH_MASK   0x3ff
+#define C99_SPEC_PREC_SHIFT   10
+#define C99_SPEC_PREC_MASK    0x3ff
+#define C99_SPEC_CONV_SHIFT   20
+#define C99_SPEC_CONV_MASK    0xf
+#define C99_SPEC_LEFT         (1 << 24)
+#define C99_SPEC_ZERO         (1 << 25)
+#define C99_SPEC_PLUS         (1 << 26)
+#define C99_SPEC_HASH         (1 << 27)
+#define C99_SPEC_PREC_SET     (1 << 28)
+
+#define C99_CONV_NONE 0
+#define C99_CONV_D    1
+#define C99_CONV_U    2
+#define C99_CONV_XL   3
+#define C99_CONV_XU   4
+#define C99_CONV_O    5
+#define C99_CONV_B    6
+#define C99_CONV_C    7
+#define C99_CONV_S    8
+#define C99_CONV_P    9
+
+/* emit N copies of CH */
+C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_fill(C99FmtBuf *b, int ch,
+                                                   unsigned long n)
+{
+    char t[32];
+    int i = 0;
+    unsigned long k = 0;
+
+    for (i = 0; i < (int)sizeof t; i++)
+        t[i] = (char)ch;
+    while (n) {
+        k = n < (unsigned long)sizeof t ? n : (unsigned long)sizeof t;
+        __c99_fmt_put(b, t, k);
+        n -= k;
     }
-    while (v) {
-        tmp[n++] = (char)('0' + (int)(v % 10));
-        v /= 10;
-    }
-    __c99_fmt_room(b, (unsigned long)n);
-    while (n > 0)
-        __c99_fmt_text(b)[b->len++] = tmp[--n];
-    __c99_fmt_text(b)[b->len] = 0;
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_hex(C99FmtBuf *b,
-                                                  unsigned long long v)
+/* text with the spec: width pads, '-' aligns left, '.precision' cuts */
+C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_str_spec(C99FmtBuf *b,
+                                                       const char *s,
+                                                       unsigned long n,
+                                                       int sp)
 {
-    char tmp[24];
-    int n = 0, d = 0;
+    int left = 0, zero = 0;
+    unsigned long w = 0, pad = 0, p = 0;
 
-    __c99_fmt_put(b, "0x", 2);
+    if (sp & C99_SPEC_PREC_SET) {
+        p = (unsigned long)((sp >> C99_SPEC_PREC_SHIFT) & C99_SPEC_PREC_MASK);
+        if (n > p)
+            n = p;
+    }
+    w = (unsigned long)((sp >> C99_SPEC_WIDTH_SHIFT) & C99_SPEC_WIDTH_MASK);
+    left = (sp & C99_SPEC_LEFT) != 0;
+    zero = (sp & C99_SPEC_ZERO) != 0 && !left;
+    if (w > n)
+        pad = w - n;
+    if (pad && !left)
+        __c99_fmt_fill(b, zero ? '0' : ' ', pad);
+    __c99_fmt_put(b, s, n);
+    if (pad && left)
+        __c99_fmt_fill(b, ' ', pad);
+}
+
+/* an integer: V is the magnitude, NEG its sign */
+C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_num(C99FmtBuf *b,
+                                                  unsigned long long v,
+                                                  int neg, int base,
+                                                  int upper, int hex_prefix,
+                                                  int sp)
+{
+    char d[72];
+    char pfx[3] = {0};
+    char sign = 0;
+    const char *tab = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    int nd = 0, conv = 0, prec = 0, prec_set = 0;
+    int left = 0, zero = 0, plus = 0, hash = 0;
+    unsigned long width = 0, total = 0, pad = 0, zeros = 0, np = 0;
+
+    conv = (sp >> C99_SPEC_CONV_SHIFT) & C99_SPEC_CONV_MASK;
+    switch (conv) {
+    case C99_CONV_D:
+    case C99_CONV_U:
+        base = 10;
+        break;
+    case C99_CONV_XL:
+        base = 16;
+        upper = 0;
+        tab = "0123456789abcdef";
+        hex_prefix = 0;
+        break;
+    case C99_CONV_XU:
+        base = 16;
+        upper = 1;
+        tab = "0123456789ABCDEF";
+        hex_prefix = 0;
+        break;
+    case C99_CONV_O:
+        base = 8;
+        hex_prefix = 0;
+        break;
+    case C99_CONV_B:
+        base = 2;
+        hex_prefix = 0;
+        break;
+    case C99_CONV_P:
+        base = 16;
+        hex_prefix = 1;
+        break;
+    default:
+        break;
+    }
+    left = (sp & C99_SPEC_LEFT) != 0;
+    zero = (sp & C99_SPEC_ZERO) != 0 && !left;
+    plus = (sp & C99_SPEC_PLUS) != 0;
+    hash = (sp & C99_SPEC_HASH) != 0;
+    if (sp & C99_SPEC_PREC_SET) {
+        prec = (sp >> C99_SPEC_PREC_SHIFT) & C99_SPEC_PREC_MASK;
+        prec_set = 1;
+    }
+    width = (unsigned long)((sp >> C99_SPEC_WIDTH_SHIFT) & C99_SPEC_WIDTH_MASK);
+
+    if (neg)
+        sign = '-';
+    else if (plus && base == 10)
+        sign = '+';
+    if (!v)
+        hash = 0;
+    if (hex_prefix && base == 16) {
+        pfx[0] = '0';
+        pfx[1] = upper ? 'X' : 'x';
+    } else if (hash) {
+        if (base == 16) {
+            pfx[0] = '0';
+            pfx[1] = upper ? 'X' : 'x';
+        } else if (base == 8) {
+            pfx[0] = '0';
+        } else if (base == 2) {
+            pfx[0] = '0';
+            pfx[1] = 'b';
+        }
+    }
+    np = pfx[0] ? (unsigned long)(pfx[1] ? 2 : 1) : 0;
     if (!v) {
-        __c99_fmt_put(b, "0", 1);
-        return;
+        d[nd++] = '0';
+    } else {
+        while (v) {
+            d[nd++] = tab[(int)(v % (unsigned long long)base)];
+            v /= (unsigned long long)base;
+        }
     }
-    while (v) {
-        d = (int)(v & 15);
-        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
-        v >>= 4;
+    if (prec_set && (unsigned long)nd < (unsigned long)prec)
+        zeros = (unsigned long)prec - (unsigned long)nd;
+    total = (unsigned long)nd + zeros + np + (sign ? 1 : 0);
+    if (width > total)
+        pad = width - total;
+    if (pad && zero) {
+        zeros += pad;
+        pad = 0;
     }
-    __c99_fmt_room(b, (unsigned long)n);
-    while (n > 0)
-        __c99_fmt_text(b)[b->len++] = tmp[--n];
-    __c99_fmt_text(b)[b->len] = 0;
+    if (pad && !left)
+        __c99_fmt_fill(b, ' ', pad);
+    if (sign)
+        __c99_fmt_put(b, &sign, 1);
+    if (np)
+        __c99_fmt_put(b, pfx, np);
+    if (zeros)
+        __c99_fmt_fill(b, '0', zeros);
+    while (nd > 0)
+        __c99_fmt_put(b, &d[--nd], 1);
+    if (pad && left)
+        __c99_fmt_fill(b, ' ', pad);
+}
+
+/* does the spec ask for a numeric conversion? */
+C99_RT_UNUSED __c99_rt_linkage int __c99_fmt_num_conv(int sp)
+{
+    int conv = (sp >> C99_SPEC_CONV_SHIFT) & C99_SPEC_CONV_MASK;
+
+    return conv == C99_CONV_D || conv == C99_CONV_U || conv == C99_CONV_XL
+        || conv == C99_CONV_XU || conv == C99_CONV_O || conv == C99_CONV_B;
 }
 
 /* the builder of nesting depth D, created the first time it is needed */
@@ -1837,12 +1983,13 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_l(const char *s, unsigned long n)
         __c99_fmt_put(__c99_fmt_cur(), s, n);
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_s(const char *s, unsigned long n)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_s(const char *s,
+                                                unsigned long n, int spec)
 {
     C99FmtBuf *b = 0;
 
     if (!s) {
-        __c99_fmt_put(__c99_fmt_cur(), "(null)", 6);
+        __c99_fmt_str_spec(__c99_fmt_cur(), "(null)", 6, spec);
         return;
     }
     b = __c99_fmt_cur();
@@ -1850,25 +1997,27 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_s(const char *s, unsigned long n)
         for (n = 0; s[n]; ++n)
             ;
     }
-    __c99_fmt_put(b, s, n);
+    __c99_fmt_str_spec(b, s, n, spec);
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_ch(int c)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_ch(int c, int spec)
 {
     C99FmtBuf *b = __c99_fmt_cur();
     unsigned char ch = (unsigned char)c;
 
-    if (!b)
+    if (__c99_fmt_num_conv(spec)) {     /* '{c;x}' prints the number */
+        __c99_fmt_num(b, (unsigned long long)ch, 0, 10, 0, 0, spec);
         return;
-    __c99_fmt_put(b, (const char *)&ch, 1);
+    }
+    __c99_fmt_str_spec(b, (const char *)&ch, 1, spec);
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_c(const char *s)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_c(const char *s, int spec)
 {
-    __c6_fmt_s(s, (unsigned long)-1);
+    __c6_fmt_s(s, (unsigned long)-1, spec);
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_sl(const void *pair)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_sl(const void *pair, int spec)
 {
     const unsigned long *w = (const unsigned long *)pair;
     unsigned long n = 0;
@@ -1878,34 +2027,46 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_sl(const void *pair)
     n = (unsigned long)w[1];
     if (n && ((const char *)w[0])[n - 1] == 0)
         --n;
-    __c6_fmt_s((const char *)w[0], n);
+    __c6_fmt_s((const char *)w[0], n, spec);
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_i(long long v)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_i(long long v, int spec)
 {
     C99FmtBuf *b = __c99_fmt_cur();
+    int conv = (spec >> C99_SPEC_CONV_SHIFT) & C99_SPEC_CONV_MASK;
 
-    if (v < 0) {
-        __c99_fmt_put(b, "-", 1);
-        __c99_fmt_dec(b, 0ULL - (unsigned long long)v);
+    /* 'u', 'x', 'X', 'o', 'b' show the value as unsigned, like printf */
+    if (conv == C99_CONV_U || conv == C99_CONV_XL || conv == C99_CONV_XU
+        || conv == C99_CONV_O || conv == C99_CONV_B) {
+        __c99_fmt_num(b, (unsigned long long)v, 0, 10, 0, 0, spec);
+    } else if (v < 0) {
+        __c99_fmt_num(b, 0ULL - (unsigned long long)v, 1, 10, 0, 0, spec);
     } else {
-        __c99_fmt_dec(b, (unsigned long long)v);
+        __c99_fmt_num(b, (unsigned long long)v, 0, 10, 0, 0, spec);
     }
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_u(unsigned long long v)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_u(unsigned long long v, int spec)
 {
-    __c99_fmt_dec(__c99_fmt_cur(), v);
+    __c99_fmt_num(__c99_fmt_cur(), v, 0, 10, 0, 0, spec);
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_p(const void *p)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_p(const void *p, int spec)
 {
-    __c99_fmt_hex(__c99_fmt_cur(), (unsigned long long)(unsigned long)p);
+    /* '0x...' by default; '{p;x}' drops the prefix, '{p;#x}' keeps it */
+    __c99_fmt_num(__c99_fmt_cur(), (unsigned long long)(unsigned long)p, 0,
+                  16, 0, 1, spec);
 }
 
-C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_b(int v)
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_b(int v, int spec)
 {
-    __c99_fmt_put(__c99_fmt_cur(), v ? "true" : "false", v ? 4 : 5);
+    C99FmtBuf *b = __c99_fmt_cur();
+
+    if (__c99_fmt_num_conv(spec)) {     /* '{ok;d}' prints 0 or 1 */
+        __c99_fmt_num(b, v ? 1ULL : 0ULL, 0, 10, 0, 0, spec);
+        return;
+    }
+    __c99_fmt_str_spec(b, v ? "true" : "false", v ? 4 : 5, spec);
 }
 
 C99_RT_UNUSED __c99_rt_linkage void *__c6_fmt_end(int flags)

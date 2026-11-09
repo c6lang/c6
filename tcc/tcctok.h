@@ -465,4 +465,5 @@
      DEF(TOK_C6_FSTR_EXPR,     "<f-string-expr>")
      DEF(TOK_C6_FSTR_EXPR_END, "<f-string-expr-end>")
      DEF(TOK_C6_FSTR_END,      "<f-string-end>")
+     DEF(TOK_C6_FSTR_SPEC,     "<f-string-spec>")
 #endif
