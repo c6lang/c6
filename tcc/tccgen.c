@@ -149,7 +149,7 @@ static struct scope {
    frame lives in the task) and in a plain nested call.  See docs/grammar.md
    (R6, D1-D6) and docs/gc-design.md §9.1. */
 #define C6_DEFER_WORDS  4               /* 4 * 32 = 128 sites per function */
-#define C6_DEFER_LEVELS 8               /* nested cleanup dispatches */
+#define C6_DEFER_LEVELS 8               /* cleanup bodies may nest this deep */
 typedef struct C6DeferSite {
     int id;
     int depth;          /* scope depth the site belongs to (0: whole frame) */
@@ -173,12 +173,12 @@ static struct {
     int nsites;
     int arm_off[C6_DEFER_WORDS];    /* armed bitmap, one 'int' frame local each */
     int dtgt_off;     /* depth filter of the request being served */
-    int dallow_off;   /* non-zero: errdefer sites run too (error path) */
     int dres_off;     /* resume id of the request being served */
-    int disp_ready;   /* the three locals above have been allocated */
-    int dtgt_save[C6_DEFER_LEVELS]; /* enclosing request, saved per level */
-    int dallow_save[C6_DEFER_LEVELS];
-    int dres_save[C6_DEFER_LEVELS];
+    int disp_ready;   /* the two locals above have been allocated */
+    /* the enclosing request, saved while a nested one runs ('0' is not a
+       valid frame offset, so an untouched slot means "not allocated yet") */
+    int dtgt_save[C6_DEFER_LEVELS + 1];
+    int dres_save[C6_DEFER_LEVELS + 1];
     int disp_jmps;    /* pending jumps to the function dispatcher */
     C6DeferSite **sites;            /* by id: sites[0] is site 1 */
     C6DeferResume *resumes;
@@ -13424,7 +13424,7 @@ static void c6_defer_func_init(void)
     defer_state.next_resume = 0;
     defer_state.disp_jmps = 0;
     defer_state.disp_ready = 0;
-    for (i = 0; i < C6_DEFER_LEVELS; i++) {
+    for (i = 0; i <= C6_DEFER_LEVELS; i++) {
         defer_state.dtgt_save[i] = 0;
         defer_state.dres_save[i] = 0;
     }
@@ -13458,7 +13458,7 @@ static void c6_defer_begin(int mode, int depth)
     if (!defer_state.enabled || !defer_state.has_sites || nocode_wanted)
         return;
     lvl = defer_state.body_depth;
-    if (lvl >= C6_DEFER_LEVELS)
+    if (lvl > C6_DEFER_LEVELS)
         tcc_error("'defer' bodies nested too deeply");
     c6_defer_disp_alloc();
     rid = ++defer_state.next_resume;
