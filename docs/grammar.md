@@ -906,6 +906,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C76 | 析构 `drop` 不能手动调用、不能失败/挂起、必须返回 `void`、每个类型至多一个 | `a destructor cannot be called: ...`；`a destructor cannot fail: ...`；`a destructor cannot suspend: ...`；`'%s' already has a destructor` |
 | C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
 | C78 | `thread` 句柄的初始化式必须是 `go` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'go f(...)'` |
+| C79 | `move(p)` 之后、重新赋值之前不能再用 `p`（读/比较/解引用/传参/再 `move`） | `'%s' was moved: assign a new reference before using it` |
 
 ---
 
@@ -1641,6 +1642,7 @@ int main(void)
 | 作用域退出 / `return` / `break` / 跳转 | `c6_gc_site()`（复用 defer 记录）+ `__c6_gc_release(slot, mode)` | 同上 |
 | `p = NULL` 提前放手 | 同一次 `__c6_gc_store` 调用（旧值释放、槽清零） | 同上 |
 | `move(p)` | `c6_gc_move_expr()`（`unary()` 的 `c6_gc_move_lead()` 分支）→ `__c6_gc_move(slot)` | 同上 |
+| `move(p)` 之后、重新赋值之前用 `p` | 编译期诊断 E-GC17（不生成代码）：标记在 `Sym.gc_moved`，`unary()` 的标识符分支调 `c6_gc_moved_use()`；赋值清标记在 `c6_gc_store_hook()`；分支合并 `c6_move_snap` / `c6_move_restore` / `c6_move_merge` / `c6_move_branch_end`（`block()` 的 `if`/`while`/`for`/`switch`、`c6_foreach_parse`），`defer`/`errdefer` 体与 `catch` 体各用一次快照隔离（`c6_defer_parse()` / `c6_catch_parse()`） | 同上 |
 | 描述符（字段表 + 析构指针） | `c6_gc_collect()` / `c6_gc_flush_descs()`（TU 末尾发射，名字带文件名哈希） | `tcc/tccgen.c` |
 | 环检测 | `c6_gc_cycle_check()` / `c6_gc_cycle_dfs()`（`c6_gc_flush_descs()` 里） | `tcc/tccgen.c` |
 | 析构 `drop` | `c6_gc_drop_register()`（`c6_method_register()` 里）、`c6_gc_is_drop()` / `c6_gc_drop_callee()`（禁止显式调用）、描述符的 `drop` 指针 | 同上 |
