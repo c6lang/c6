@@ -10,6 +10,7 @@ struct Node { int v; };
 
 static int bump(int x) { return x + 1; }
 static int call_closure(closure int(int) f, int x) { return f(x); }
+int closure_tu_call(closure int(int) f, int x);
 
 static closure int(int) make_adder(int n)
 {
@@ -110,6 +111,14 @@ test "函数指针转闭包：形参、返回值、实参" {
     g = NULL;
     if (a != 5 || b != 10)
         err(1, "函数指针转闭包不对");
+}
+
+test "跨翻译单元：同签名闭包按值传递" {
+    closure int(int) f = make_adder(7);
+    int r = closure_tu_call(f, 5);
+    f = NULL;
+    if (r != 12)
+        err(1, "跨 TU 闭包调用不对");
 }
 
 test "defer 与闭包捕获" {

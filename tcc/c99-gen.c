@@ -624,6 +624,7 @@ static int c99_global_data(ElfSym *e)
 }
 
 static void c99_add_decl(const char *name, const char *text);
+static int c99_is_c_ident(const char *s);
 static int c99_small_sret(CType *ret, CType *rt, int *align, int *regsize);
 
 /* names the generated file header declares or defines itself (see
@@ -639,7 +640,7 @@ static void c99_decl_extern(const char *name, int func)
 {
     char text[1024];
 
-    if (!name || !*name || c99_header_name(name))
+    if (!name || !*name || !c99_is_c_ident(name) || c99_header_name(name))
         return;
     if (func)
         snprintf(text, sizeof text, "extern int %s();", name);

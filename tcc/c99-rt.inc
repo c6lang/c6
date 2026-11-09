@@ -1238,6 +1238,7 @@ C99_RT_UNUSED __c99_rt_linkage int c6_io(int fd, int ev)
 #define C99_GCK_WEAK   2
 #define C99_GCK_OWN    3
 #define C99_GCK_EMBED  4
+#define C99_GCK_EDGE   5
 
 #define C99_GC_META_COUNT 0xffffffffffUL
 #define C99_GC_META_FLAGS(meta) ((int)((meta) >> 40))
@@ -1330,6 +1331,8 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_gc_release_block(char *base,
         const C99GcField *f = &d->fields[k];
         unsigned i;
 
+        if (f->kind == C99_GCK_EDGE)
+            continue;
         for (i = 0; i < f->count; i++) {
             char *p = base + f->off + (size_t)i * f->stride;
             if (f->kind == C99_GCK_EMBED)
