@@ -1146,6 +1146,28 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 crt，入口是 `_start`，输出和退出都自己发 syscall，里面跑了整数/浮点插值、
 格式说明、`@f".."`、`defer`、`err`+`catch` 和 `@T`，8 条断言全过。
 
+要 `go` / `thread` 就再实现一层线程接口 —— 运行时只用这 8 个入口，都是
+weak 的，程序给了就切回“每线程一块状态”：
+
+| 入口 | 干什么 |
+|---|---|
+| `pthread_once` / `pthread_key_create` / `pthread_getspecific` / `pthread_setspecific` | 每线程一块状态（defer 栈、错误槽、插值构造器、协程池）。`key_create` 的析构函数务必在线程退出时调用，否则每个线程漏约 100 KB |
+| `pthread_create` / `pthread_join` | `go` 的启动与回收 |
+| `pthread_self` / `pthread_equal` | `thread h = go f(...)` 用它判断“自己 join 自己” |
+
+三个坑：
+
+- **这一层必须用普通 C 或汇编编译，不能带 `-std=c6`**：每个 c6 函数开头都有
+  `__tcc_defer_func_enter()`，它要 `tcc_th()`，而 `tcc_th()` 正要去调
+  `pthread_once` / `pthread_key_create` —— 用 c6 写就是 bootstrap 里递归自己，
+  栈一冲就段错误；
+- 一旦真的多线程，`calloc` / `free` 必须是线程安全的：`libtcc1` 里那个静态
+  arena 只在单线程下安全，这时请由程序提供 `calloc` / `free`；
+- 线程里用 `async` / `c6_io` 还需要 `select`。
+
+例子：[examples/freestanding_go.c](examples/freestanding_go.c) 配单线程桩
+[examples/freestanding_pthread.c](examples/freestanding_pthread.c)，`make fstest-go`。
+
 C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
 `<pthread.h>`）。
 

@@ -92,7 +92,15 @@ fstest: build
 	    examples/freestanding_fstr.c tcc/libtcc1.a
 	./build/freestanding_fstr
 
-test-all: selftest test c6selfcheck fstest
+# freestanding + 程序自己实现的 pthread 层：go / thread
+fstest-go: build
+	./tcc/tcc -B tcc -c -o build/freestanding_pthread.o \
+	    examples/freestanding_pthread.c
+	./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_go \
+	    examples/freestanding_go.c build/freestanding_pthread.o tcc/libtcc1.a
+	./build/freestanding_go
+
+test-all: selftest test c6selfcheck fstest fstest-go
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
