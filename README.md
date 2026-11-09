@@ -1316,7 +1316,7 @@ bare tests: 26 通过, 0 失败（跳过: gc_drop gc_thread method thread thread
 
 | 测试 | 缺什么 |
 |---|---|
-| `thread` / `thread_handle` / `gc_thread` / `gc_drop` / `tuple_thread` | `go` 要 `pthread_create`，裸机上就是 `clone`/`futex`，得先有内核 |
+| `thread` / `thread_handle` / `gc_thread` / `gc_drop` / `tuple_thread` | `go` 本身现在能跑了（见上面那节），但这几个用的是 `h->join()` / `h->value()`，那条路要走 `libtcc1` 的每线程块（`calloc`/`free` + pthread 键），裸机上还不稳 —— 任务收尾之后会三重故障，没修完 |
 | `method` | 要 `FILE` 的真实内存布局（`stdout->fflush()`），那是 libc 的内部结构 |
 
 三个只有真跑一遍才会知道的坑：
@@ -1333,6 +1333,52 @@ bare tests: 26 通过, 0 失败（跳过: gc_drop gc_thread method thread thread
 
 C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
 `<pthread.h>`）。
+
+#### 裸机上的 go 是真并发：自己写一个抢占式调度器
+
+`go` 在别的地方落到 `pthread_create` 上。裸机上没有内核，所以 `make
+fstest-bare-go` 干脆自己写那一层：
+[examples/boot/sched.plain.c](examples/boot/sched.plain.c) 就是最小内核 ——
+8259A 重映射到 `0x20`、8254 每 10ms 一次时钟、中断进来换到调度器自己的栈、
+把现场摆成一块 160 字节的 `struct Frame`，换任务就是换块 Frame。新任务的
+帧是**编出来的**：寄存器全 0，加上 `rip/cs/rflags/rsp/ss` 五件套，第一次被
+调度时 `iretq` 直接落进 `task_entry`，跑的是它自己那块 64KB 栈。
+
+对 `libtcc1` 来说只是那 8 个符号（`pthread_create/join/once/key_create/
+getspecific/setspecific/self/equal`），别的都不问。
+
+怎么证明"真并发"？[examples/boot/go_bare.c](examples/boot/go_bare.c) 里两个
+任务**都没有让出语句**，而且互相等：空转的那个先置 `started`，然后死等
+`go_flag`；另一个先等 `started`，再把 `go_flag` 立起来。
+
+```
+go: 空转 4446664 次（上限 200000000）、时钟切换 5 次、go_flag=1
+go: 是并发 —— 两个任务在同一个 CPU 上被时钟抢占着交错推进
+```
+
+空转次数**远小于上限**就是证据：只有时钟中断真在任意指令边界把 CPU 抢走，
+另一个任务才有机会跑起来把 `go_flag` 立起来。要是 `go` 只是在同一个栈上顺序
+调用，先跑的那个得把 2 亿次整个跑完，另一个才轮得到。
+
+单核上是真并发（交错推进），不是并行。要并行得多核，而多核要 AP 跳板
+（16 位实模式代码，`tcc` 不支持 `.code16`，得另走 binutils），这部分还没做。
+
+`go` 的**句柄**（`h->join()` / `h->value()`）在裸机上还没打通：句柄那条路
+要 `libtcc1` 的每线程块走 `calloc`/`free` 和 pthread 键，实测任务收尾之后会
+三重故障（`thread`/`thread_handle` 两个测试还是跳过）。所以 `go_bare.c` 用
+全局变量握手，不用句柄 —— 调度这一层本身是好的，`pthread_join` 用普通的
+函数体任务测过（`pthread_create` + `join` + 返回值都对）。
+
+两个只有真跑一遍才会知道的坑，写在文件头了：
+
+- **长模式下的 `iretq` 总是弹 `rip/cs/rflags/rsp/ss` 五个 qword**，不是只在
+  特权级变化时才弹。而同一特权级的中断 CPU 只压了前三个 —— 帧得自己补齐，
+  否则弹出来的 `rsp` 是垃圾；
+- **`boot.S` 里 `0x18` 才是 64 位代码段**（`0x08` 是 32 位的）。中断门的
+  selector 写成 `0x08`，第一次时钟中断就 `#GP(0x08)`，而且看起来像"什么都没
+  发生"（三重故障、qemu 退出码 0）；
+- 顺带修了个潜伏的：引导器原来把栈放在 `0x80000`，那个地址其实**落在 payload
+  的 `.bss` 里面**，变量一多（这次是中断栈和堆）就会踩到栈 —— 现在挪到 16MB。
 
 ## 测试
 
