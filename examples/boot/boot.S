@@ -140,7 +140,9 @@ lm_entry:
         movw %ax, %ds
         movw %ax, %es
         movw %ax, %ss
-        movq $0x80000, %rsp
+        /* 栈放在 16MB 上：payload 的 .bss 从 0x40xxxx 起会一路长到 8MB 多，
+           0x80000 这种低地址其实**落在 .bss 里面**，变量一多就会踩到栈。 */
+        movq $0x01000000, %rsp
         xorq %rbp, %rbp
         /* 把 payload 从 0x10000 拷到 0x400000 */
         movq $0x10000, %rsi

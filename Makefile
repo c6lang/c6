@@ -145,8 +145,18 @@ fstest-bare-tests: build
 	     echo "fstest-bare-tests: 没有 binutils，跳过"; exit 0; }
 	./examples/boot/runtests.sh
 
+# 裸机上的 go：自己写的抢占式调度器（8259A + 8254 + 中断里的上下文切换），
+# 两个没有让出语句的任务靠时钟抢占交错推进（examples/boot/{sched.plain.c,go_bare.c}）
+fstest-bare-go: build
+	@command -v qemu-system-x86_64 >/dev/null || { \
+	     echo "fstest-bare-go: 没有 qemu-system-x86_64，跳过"; exit 0; }
+	@command -v as >/dev/null || { \
+	     echo "fstest-bare-go: 没有 binutils，跳过"; exit 0; }
+	./examples/boot/build.sh examples/boot/go_bare.c examples/boot/sched.plain.c \
+	    examples/boot/shim.plain.c examples/boot/io.c
+
 test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
-	  fstest-bare fstest-bare-tests
+	  fstest-bare fstest-bare-tests fstest-bare-go
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。

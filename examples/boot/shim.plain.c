@@ -506,6 +506,30 @@ struct ShimHdr {
 
 static char shim_heap[SHIM_HEAP_SIZE] __attribute__((aligned(SHIM_ALIGN)));
 static struct ShimHdr *shim_head = 0;
+static int shim_heap_lock = 0;
+
+/* 调度器一起来就会有别的任务同时进来要内存：一把原子自旋锁（单核上靠
+   时钟中断保证持有者还会被调度回来，所以自旋一定会前进）。 */
+int shim_xchg(int *p, int v);
+
+__asm__(
+    ".text\n"
+    ".globl shim_xchg\n"
+    "shim_xchg:\n"
+    "  movl %esi, %eax\n"
+    "  xchgl %eax, (%rdi)\n"
+    "  ret\n");
+
+static void shim_lock(void)
+{
+    while (shim_xchg(&shim_heap_lock, 1) != 0)
+        ;
+}
+
+static void shim_unlock(void)
+{
+    shim_heap_lock = 0;
+}
 
 static unsigned long shim_round(unsigned long n)
 {
@@ -527,6 +551,7 @@ void *calloc(size_t n, size_t sz)
     unsigned long want = 0, need = 0;
     struct ShimHdr *h = 0;
 
+    shim_lock();
     shim_heap_init();
     want = (unsigned long)n * (unsigned long)sz;
     if (!want)
@@ -546,8 +571,10 @@ void *calloc(size_t n, size_t sz)
         h->used = 1;
         memset((char *)h + sizeof(struct ShimHdr), 0,
                h->size - sizeof(struct ShimHdr));
+        shim_unlock();
         return (char *)h + sizeof(struct ShimHdr);
     }
+    shim_unlock();
     return 0;
 }
 
@@ -557,6 +584,7 @@ void free(void *p)
 
     if (!p)
         return;
+    shim_lock();
     h = (struct ShimHdr *)(void *)((char *)p - sizeof(struct ShimHdr));
     h->used = 0;
     while (h->next && !h->next->used) {     /* 往后合并 */
@@ -569,6 +597,7 @@ void free(void *p)
             b->next = h->next;
             break;
         }
+    shim_unlock();
 }
 
 void *realloc(void *p, size_t n)
