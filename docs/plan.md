@@ -978,3 +978,20 @@ native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 
 ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-64 寄存器返回，
 可以与普通 C 互操作；其它结构体返回用隐藏指针（c6 TU 之间一致，大于
 16 字节时也与原生 ABI 一致，9--16 字节与普通 C 混用不支持）。
+
+## 裸机验证（fstest-bare）
+
+freestanding 那一套（`libtcc1` 的外部依赖全是 weak，缺 `calloc`/`mem*`/
+`pthread_*`/`select` 时运行时自己顶上）到「没有内核」这一步只差一个引导器。
+`examples/boot/` 里就是：512 字节 BIOS 引导扇区（`boot.S`，实模式 INT 13h
+读盘 → A20/GDT → 32 位保护模式 → 0x90000 建页表、开 PAE/LME → 长模式 →
+把 payload 拷到 0x400000、清 `.bss` → `call _start`）、`flat.py`（按 `PT_LOAD`
+摊平 payload；`objcopy -O binary` 以最低**节**地址为基准，会让镜像整体错位
+0x498 字节）、`main.c`（c6 程序本体，输出就是两条 `outb`）。
+
+`make fstest-bare` 在 `qemu-system-x86_64` 上空机器启动（有 `/dev/kvm` 就
+KVM，否则 TCG），断言全过时 payload 往 0x501 写 0，qemu 退出码 1；失败时
+打印 `bare metal: FAILED`、退出码非 1。踩过的坑：长模式下不开 `CR4.OSFXSR`
+的话 payload 第一条 `movq %xmm0` 就 `#UD`；引导扇区必须正好 512 字节且以
+`0x55AA` 结尾；读盘每块 ≤ 16 扇区以免撞 64KB 段边界。tcc 的汇编器不认
+`.code16`/`.code32`，所以只有引导扇区这几十行走 binutils 的 `as`。

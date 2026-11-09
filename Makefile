@@ -125,7 +125,19 @@ fstest-qemu: build
 	     echo "fstest-qemu: noos FAILED（status $$st）"; exit 1; \
 	 fi
 
-test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu
+# 裸机：BIOS 引导扇区（examples/boot/boot.S，512 字节，自己切长模式）
+# 把 c6 程序从磁盘读进来跑，没有内核、没有 BIOS 之外的任何东西。
+# 需要 binutils 的 as/ld/objcopy（引导扇区那几十行 16 位汇编，tcc 不认
+# .code16/.code32，没法自己编）和 qemu-system-x86_64。
+fstest-bare: build
+	@command -v qemu-system-x86_64 >/dev/null || { \
+	     echo "fstest-bare: 没有 qemu-system-x86_64，跳过"; exit 0; }
+	@command -v as >/dev/null || { \
+	     echo "fstest-bare: 没有 binutils，跳过"; exit 0; }
+	./examples/boot/build.sh
+
+test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
+	  fstest-bare
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
