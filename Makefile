@@ -88,7 +88,7 @@ selftest: build
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
-	./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_fstr \
+	./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_fstr \
 	    examples/freestanding_fstr.c tcc/libtcc1.a
 	./build/freestanding_fstr
 
@@ -96,7 +96,7 @@ fstest: build
 fstest-go: build
 	./tcc/tcc -B tcc -c -o build/freestanding_pthread.o \
 	    examples/freestanding_pthread.c
-	./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_go \
+	./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_go \
 	    examples/freestanding_go.c build/freestanding_pthread.o tcc/libtcc1.a
 	./build/freestanding_go
 

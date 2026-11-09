@@ -1137,7 +1137,7 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 也就是单线程的 freestanding 程序直接可用，程序这边什么都不用提供：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_fstr \
+./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_fstr \
     examples/freestanding_fstr.c tcc/libtcc1.a   # 或 make fstest
 ./build/freestanding_fstr
 ```
@@ -1177,6 +1177,10 @@ join 这里有个坑值得记下来：「还活着」的标志不能直接靠 `C
 的那个 tid —— 它是子线程**开始跑**的时候才写的，父线程可能先看到 0，于是 join
 提前返回、把子线程马上要用的栈 `munmap` 掉，子线程一上来就段错误。这份实现的做
 法是父线程在 clone 之前先把该字写成 -1，只让内核在子线程真正退出时清零。
+
+`-static` 不是必须的，但少了它 ELF 里会留一个 `PT_INTERP`（内核会先跑
+`ld.so`）；加上之后这两个产物既没有 `DT_NEEDED` 也没有 `PT_INTERP`，是一个
+纯粹的静态 ELF —— 换到别处跑时只要有人能加载它就行。
 
 C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
 `<pthread.h>`）。

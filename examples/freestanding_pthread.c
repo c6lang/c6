@@ -5,7 +5,7 @@
  *
  *   ./tcc/tcc -B tcc -c -o build/freestanding_pthread.o \
  *       examples/freestanding_pthread.c
- *   ./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_go \
+ *   ./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_go \
  *       examples/freestanding_go.c build/freestanding_pthread.o tcc/libtcc1.a
  *
  * 运行时只要 8 个入口（都是 weak 引用）：pthread_once / pthread_key_create /

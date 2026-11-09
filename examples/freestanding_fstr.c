@@ -2,7 +2,7 @@
  *
  *   make fstest
  *   # 等价于：
- *   ./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_fstr \
+ *   ./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_fstr \
  *       examples/freestanding_fstr.c tcc/libtcc1.a
  *   ./build/freestanding_fstr
  *
