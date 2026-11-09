@@ -1420,11 +1420,16 @@ void gfunc_prolog(Sym *func_sym)
 
   if (c6_stable_frame) {
     /* An async body: r0 is the task, r1 the top of the frame the task owns.
-       fp/lr are pushed the ordinary way, so the epilog's 'pop {fp,sp,pc}'
-       returns directly; fp then points at the task's frame instead of the
-       stack, so the locals live in the task and a suspension copies and moves
-       nothing.  Nothing else is put on the stack. */
-    o(0xE92D5800); /* push {fp, ip, lr} */
+       fp/lr are saved on the stack the ordinary way, but fp then points at the
+       task's frame instead of the stack, so the locals live in the task and a
+       suspension copies and moves nothing.
+
+       Note that the ordinary epilog ('ldm fp, {fp,sp,pc}') restores from *fp*,
+       which does not work here: this epilog therefore reads the save block
+       relative to sp, which never moves in the body.  Four registers are
+       pushed rather than three to keep sp 8-byte aligned (AAPCS) at the calls
+       the body makes; the caller's r0 goes into the padding slot. */
+    o(0xE92D5801); /* push {r0, fp, ip, lr} */
     o(0xE1A0B001); /* mov fp, r1 */
     o(0xE50B0008); /* str r0, [fp, #-8] -- the task */
     func_vc = 0;
@@ -1540,9 +1545,15 @@ void gfunc_epilog(void)
   int diff;
 
   if (c6_stable_frame) {
-    /* the frame is the task's; only fp and lr have to go back */
+    /* The frame is the task's, so all that has to go back is fp, lr and sp.
+       sp still points at the save block the prolog pushed; read from there
+       (the ordinary epilog uses fp, which no longer addresses the stack) and
+       drop it before the return. */
     c6_frame_size_set((-loc + 3) & -4);
-    o(0xE89BA800); /* pop {fp, sp, pc} */
+    o(0xE59DB004); /* ldr fp, [sp, #4]  ; the caller's fp */
+    o(0xE59DC00C); /* ldr ip, [sp, #12] ; the return address */
+    o(0xE28DD010); /* add sp, sp, #16   ; drop the save block */
+    o(0xE1A0F00C); /* mov pc, ip */
     return;
   }
 
