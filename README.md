@@ -17,7 +17,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]`；被普通符号遮蔽时仍写 `struct` |
 | `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
-| `foreach \|i, v\| a { ... }` | 遍历数组、切片与整数区间：绑定表在前，值绑定是元素副本 |
+| `foreach \|i, v\| a { ... }` | 遍历数组、切片、整数区间，以及实现 `has()`/`next()` 协议的迭代器：绑定表在前，值绑定是元素副本 |
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
 | 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；体里只看得见参数和文件作用域。捕获式闭包（`closure RET (P…)`，V2）已有完整设计，尚未实现，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
@@ -567,6 +567,7 @@ foreach |i, v| s { ... }        /* 切片：同上，长度是求值那一刻的
 foreach |i| 0:5 { ... }         /* 区间 [0, 5)：只要一个绑定 */
 foreach |_, v| a { ... }        /* '_' 丢弃这个绑定 */
 foreach |i, v| obj.items { ... }/* 结构体暴露的切片成员 */
+foreach |v| it { ... }          /* 迭代器：it 的类型提供 has()/next() */
 ```
 
 速查：
@@ -578,20 +579,31 @@ foreach |i, v| obj.items { ... }/* 结构体暴露的切片成员 */
 | `foreach \|i\| lo:hi` | 半开区间 `[lo, hi)`；下标是两界的公共整数类型，`lo >= hi` 零次 |
 | `foreach \|_, v\| …` / `foreach \|i, _\| …` | 丢弃下标 / 丢弃值（丢弃的绑定连加载都不生成） |
 | `foreach \|_\| 0:n { … }` | “重复 n 次”的写法 |
+| `foreach \|v\| it` | 迭代器：`it` 是 `T`、`T *` 或接口值，类型提供 `int has()` + `E next()`；`v` 是 `next()` 返回值的副本 |
 | 值绑定 `v` | 副本：写它不改容器 |
 | 下标绑定 `i` | 就是循环变量：写它改变后续迭代（同 `for`） |
 | `break` / `continue` / `defer` / `await` | 与写在 `for` 体里完全一致 |
 
 规则：
 
-- 可迭代对象只有三种：**完整数组**（含字符串字面量）、**切片 `T[:]`**、
-  **整数区间 `lo:hi`**。指针、整数、VLA、不完整数组、没有暴露切片的
-  结构体都报错，并给出改法提示；
+- 可迭代对象有四种：**完整数组**（含字符串字面量）、**切片 `T[:]`**、
+  **整数区间 `lo:hi`**，以及**迭代器协议**（`has()`/`next()`）。其它
+  指针、整数、VLA、不完整数组、没有暴露切片的结构体都报错，并给出
+  改法提示；
+- 迭代器协议是**结构化**的：不看接口叫什么名字，只看两个方法的签名。
+  `has()` 返回整数（非零继续），`next()` 返回元素 `E`（完整、可赋值，
+  非数组/函数/`void`）；两个方法只接收 receiver，并且在 `foreach`
+  之前可见。`T`（struct/union 值）走直接调用，`T *` 和接口值也可以；
+  接口值通过 vtable 分派；
 - 只求值一次：数组/切片落到隐藏的 `{元素指针, 长度}` 帧槽（与切片的
-  运行期布局相同），区间上界落到隐藏整数槽，因此循环体里改容器不影响
-  迭代次数；
+  运行期布局相同），区间上界落到隐藏整数槽，迭代器落到它自己的隐藏槽，
+  因此循环体里改容器不影响迭代次数；
+- 迭代器**只绑定一个值**：`foreach |v| it`（`|_|` 合法，仍调用
+  `next()` 推进）。值形态把迭代器状态复制到隐藏槽（循环不推进原
+  对象），`T *` / 接口形态直接操作原对象（`next()` 的修改可见）；
 - 循环体**必须**是花括号块，绑定的作用域就是这条语句；绑定表写作
-  `|名字, 名字|`，`_` 表示丢弃；数组/切片要两个绑定、区间要一个；
+  `|名字, 名字|`，`_` 表示丢弃；数组/切片要两个绑定、区间和迭代器
+  要一个；
 - 元素本身是数组时（`int[2][3]`、`Row[:]`）不能遍历：值绑定会是一个
   数组，而数组在 C 里不可赋值；改用下标区间
   `foreach |i| 0:(int)rows.len { … rows[i] … }`；
@@ -599,12 +611,17 @@ foreach |i, v| obj.items { ... }/* 结构体暴露的切片成员 */
   一起保存/恢复），也可以在 `defer` 体、嵌套循环里用；
 - `foreach` 仍然可以当普通标识符：`int foreach = 1;`、`foreach(x);`、
   `p->foreach`、`goto foreach;` 都照常工作——只有语句开头、且下一个记号
-  是 `|` 时才按语句解析。
+  是 `|` 时才按语句解析；
+- 迭代器的 `next()` 返回数组、`void`、`void *`（元素类型会被擦除）或
+  不完整类型都报错；`foreach |i, v| it` 也报错（迭代器没有下标绑定）。
+  要下标自己维护计数器，要“advance 原对象”就写 `foreach |v| &it`。
 
-完整可运行示例见 [examples/foreach_demo.c](examples/foreach_demo.c)：
+完整可运行示例见 [examples/foreach_demo.c](examples/foreach_demo.c) 与
+[examples/foreach_iter_demo.c](examples/foreach_iter_demo.c)：
 
 ```sh
 ./tcc/tcc -B tcc -std=c6 -run examples/foreach_demo.c
+./tcc/tcc -B tcc -std=c6 -run examples/foreach_iter_demo.c
 ```
 
 ### 元组 `(T1, T2, ...)`
