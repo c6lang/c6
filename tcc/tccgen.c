@@ -1055,17 +1055,17 @@ static void sym_push_params(Sym *ref);
 static int c6_lit_scanning = 0;
 static Sym *c6_lit_env_sym = NULL;
 
-static void c6_lit_function_pointer_error(void);
-static void c6_lit_function_pointer_error(void)
+static void c6_lit_function_pointer_error_to(CType *dt);
+static void c6_lit_function_pointer_error_to(CType *dt)
 {
     C6Lit *lit = NULL;
     int i = 0;
     if (!vtop->c6_lit_src)
         return;
     lit = vtop->c6_lit_src;
-    if ((vtop[-1].type.t & VT_BTYPE) != VT_PTR
-        || !vtop[-1].type.ref
-        || (vtop[-1].type.ref->type.t & VT_BTYPE) != VT_FUNC)
+    if ((dt->t & VT_BTYPE) != VT_PTR
+        || !dt->ref
+        || (dt->ref->type.t & VT_BTYPE) != VT_FUNC)
         return;
     for (i = 0; i < lit->ncaps; i++)
         if (lit->caps[i].kind == C6_CAP_VALUE) {
@@ -1079,6 +1079,11 @@ static void c6_lit_function_pointer_error(void)
                       get_tok_str(lit->caps[i].tok, NULL),
                       get_tok_str(lit->caps[i].tok, NULL));
         }
+}
+
+static void c6_lit_function_pointer_error(void)
+{
+    c6_lit_function_pointer_error_to(&vtop[-1].type);
 }
 
 /* A name that resolves inside the literal's own body is fine; everything else
@@ -1717,6 +1722,8 @@ static void c6_closure_to_pointer_error(CType *dt)
         return;
     if (c6_closure_of_type(dt))
         return;
+    if (vtop->c6_lit_src)
+        c6_lit_function_pointer_error_to(dt);
     bt = dt->t & VT_BTYPE;
     if (bt == VT_PTR && dt->ref && (dt->ref->type.t & VT_BTYPE) == VT_FUNC)
         tcc_error("a closure cannot become a plain function pointer: it "
