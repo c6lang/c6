@@ -14,9 +14,8 @@
  *   - 任务数不再受固定池大小限制（第 4 组），
  *   - defer 体在恢复之后写的还是同一批局部（第 5 组）。
  */
-#include <stdio.h>
-
-/* 只用到这几个 libc 函数（不给 libtcc1 添依赖） */
+/* 只用到这几个 libc 函数（不给 libtcc1 添依赖，也不 include 头文件，
+   这样交叉目标至少能编译这个文件） */
 int pipe(int *fds);
 int read(int fd, void *buf, int len);
 int write(int fd, const void *buf, int len);
@@ -28,14 +27,14 @@ async void addr_body(int fd)
 {
     int x = 1;
     int *p = &x;
-    long before = (long)&x;
+    int *before = &x;
     int rev = 0;
 
     *p = 2;
     rev = await c6_io(fd, 2);          /* 可写：立即就绪 */
     (void)rev;
     /* 挂起之前取的地址在恢复之后必须仍然指向同一个 x */
-    g_addr_ok = ((long)&x == before) && (*p == 2) && (p == &x);
+    g_addr_ok = (&x == before) && (*p == 2) && (p == &x);
     x = 3;
     g_addr_ok = g_addr_ok && (*p == 3);
 }

@@ -946,7 +946,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C64 | 模块不能直接或间接 import 自己 | `circular import of module 'x'` |
 | C65 | `-emit-header` 只能用于声明了 `module` 的翻译单元；匿名 struct/union 必须已有 typedef 才能写出 | `-emit-header requires a 'module NAME;' declaration`；`cannot write a C header for an anonymous struct type; give it a typedef first` |
 | C66 | 强引用类型图里不能有环（含自环、数组、按值嵌入） | `reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own' (type 'A' at a.c:3)` |
-| C67 | `weak` 不能出现在 `async` 函数里（帧会搬动） | `a 'weak' reference cannot be declared in an async function: its frame is moved to the task` |
+| C67 | 只有"帧拷贝"后端（c67）上 `weak` 才不能出现在 `async` 函数里；`-b` 不能与 `async` 同用 | `a 'weak' reference cannot be declared in an async function: its frame is moved to the task`；`'-b' cannot be combined with 'async'` |
 | C68 | 含托管字段的结构体不能按值拷贝/传参/返回 | `'%s' holds managed references: %s is not possible. Allocate it with 'new' and hold it in '@%s'` |
 | C69 | 托管引用只能存进托管槽；借出的指针不能保存 | `a new reference cannot be stored in '%s': it is not a managed reference`；`storing a borrowed reference keeps it alive without counting` |
 | C70 | 形参是借用，不能改写 | `'%s' is a borrow: it owns nothing, so it cannot be reassigned (copy it into an owned local first)` |
@@ -1298,15 +1298,20 @@ int main(void)
 **R15 — `async T f(P…) { body }`**
 
 ```
-int __c6_body_f(void *task);
-const struct __c6_desc __c6_desc_f = { sizeof(struct f_task), alignof, 64, __c6_body_f };
+int __c6_body_f(void *__c6_arg, void *__c6_frm);
+const struct __c6_desc __c6_desc_f =
+    { sizeof(struct f_task), alignof, 64, __c6_body_f, __c6_rel_f, frame_size };
 ```
 
-函数体按 `int __c6_body_f(void *task)` 编译。序言先算帧基址
-`base = &marker - off(marker)`，再看 `__c6_co_state(task)`：非 0 就把保存
-的帧拷回 `base - size` 并跳到恢复分发器，为 0 就正常往下执行。声明的形参
-在此时被声明成普通局部变量，并从 `task->pN` 拷进来（只有首次进入会走这条
-路径）。
+函数体按 `int __c6_body_f(void *task, void *frame)` 编译。`frame` 是运行期
+给出的帧顶：任务块一次分配出 `struct f_task` + parked defer 记录 + 帧，后端
+把帧寄存器（x86 `rbp`、arm64 `x29`、riscv64 `s0`、arm `fp`、C99 后端的
+`__c99_frmp`）直接指向那块内存，`task` 存在帧的第一个槽里。序言再看
+`__c6_co_state(task)`：非 0 就调用 `__c6_co_restore(task, base)`（帧已住在
+任务里时它只恢复 defer 栈和错误槽）并跳到恢复分发器，为 0 就正常往下执行。
+声明的形参在此时被声明成普通局部变量，并从 `task->pN` 拷进来（只有首次进入
+会走这条路径）。描述符第 5 个成员是 `-c9x` 出来的释放函数，第 6 个是后端
+回填的帧大小：0 表示"帧不能住在任务里"（c67），退回拷贝模型。
 
 `struct f_task` 由 `c6_async_declare()` 用合成 token 在文件作用域声明，
 所以同一个 `async` 声明在定义方和调用方得到同一个布局。
@@ -1332,9 +1337,15 @@ const struct __c6_desc __c6_desc_f = { sizeof(struct f_task), alignof, 64, __c6_
                                return KIND_DONE;
 ```
 
-挂起时把 `[base - size, base)` 之间的原生帧、`[defer_base, defer_sp)` 的
-defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再跳到该号恢复点。
-因此**局部变量、defer 记录、错误状态在挂起前后完全不变**。
+挂起时把 `[defer_base, defer_sp)` 的 defer 记录和错误槽存进任务，然后
+body 直接 `return` 回到驱动方；恢复时把它们取回来，再跳到该号恢复点。
+帧本身不用动（它就在任务的那块内存里，地址在任务的一生里不变），所以
+**局部变量、defer 记录、错误状态在挂起前后完全不变**，`&local` 跨过
+`await` 也仍然有效，帧没有 4 KiB 上限。
+
+后端若回答"帧不能住在任务里"（目前只有 c67），则退回拷贝模型：每次挂起把
+`[base - size, base)` 的原生帧拷进任务（上限 4 KiB），恢复时拷回。那里帧内
+的绝对地址不可跨 `await` 使用，`weak` 局部也被禁止（约束 C67）。
 
 驱动方 `__c6_co_wait(task)` 反复进入 `__c6_body_f`：每次拿到的 `kind` 是
 `DONE` / `IO` / `CHILD`，为 `CHILD` 时先往子任务里钻，为 `IO` 时用
@@ -1579,7 +1590,7 @@ int main(void)
 | `p->drop()` / `drop(p)` 手动调析构 | 约束 C76（对象只由引用决定生死） |
 | `reset()` 成员 | 不提供：提前放手就是 `p = NULL` |
 | `@T`/`own @T` 进 `go`/`async` | 约束 C73 |
-| `weak @T` 在 `async` 函数里 | 约束 C67 |
+| `weak @T` 在 `async` 函数里 | 允许（帧住在任务里）；只有 c67 这类帧拷贝后端报约束 C67 |
 | 通用图（`struct Node { @Node edges[4]; }`） | 约束 C66：环一律报错，只能写成 `own` 树或 `weak` 边 |
 | 运行期环回收（cycle collector） | 不做：环在编译期就挡住了 |
 | 自定义删除器 | V1 不做（析构只有 `drop` 方法一种） |
@@ -1636,12 +1647,11 @@ int main(void)
 | `go f();` 而 `f` 只有块作用域声明 | 约束 C38：需要文件作用域声明才能生成跳板 |
 | `task t;`（不带初始化器） | 约束 C36：句柄类型从初始化器推出 |
 | `async` 函数当方法用（`p->f()`） | 约束 C37 |
-| 同时存活超过 64 个协程 | 固定池（`C6_CO_MAX`）：超了会 trap，不是语法错误 |
 | `await c6_io(fd, ev)` 的 `fd` 不在 `[0, 1024)` | 任务按失败回收：`__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败（不会永远 park） |
 | 抢占式调度、把阻塞的 libc 调用（`read`/`printf`/…）自动变成让出点 | 不在本扩展范围：`co`/`__c6_co_run` 只推进协程，不 hook libc |
 | PE 目标上的 `go` | 还没有 PE 线程支持，运行时 trap |
 | 取消 / 强杀一个 `go` 出去的线程 | 不提供：线程总是被启动它的线程 join |
-| `co` 的句柄 | 不提供：`co` 把任务交给顶层就绪链表，任务一结束就被销毁（否则一串短 `co` 会占满池子），句柄会悬空。要句柄用 `task t = f(a); t->wait();` |
+| `co` 的句柄 | 不提供：`co` 把任务交给顶层就绪链表，任务一结束就被销毁，句柄会悬空。要句柄用 `task t = f(a); t->wait();` |
 | `thread h = f(a);`（不是 `go`） | 约束 C78：句柄只能来自 `go` |
 | 等待线程时取非整数/指针的返回值 | `h->value()` 只有整数和指针能往返；结构体、浮点用 `shared @T` 或参数块带回 |
 | `for a \|i, v\| { }` / `for 0..n` | `for` 保持纯 C；迭代请用 `foreach` |

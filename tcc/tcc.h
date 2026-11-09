@@ -2007,6 +2007,12 @@ ST_FUNC int pe_setsubsy(TCCState *s1, const char *arg);
 #if defined(TCC_TARGET_X86_64) || defined(TCC_TARGET_ARM64)
 ST_FUNC void pe_add_unwind_data(unsigned start, unsigned end, unsigned stack);
 #endif
+#if defined(TCC_TARGET_X86_64) || defined(TCC_TARGET_ARM64)
+/* the prolog shape of a c6 async body: fp/lr pushed the ordinary way, the
+   frame register pointing at the task's frame instead of the stack */
+ST_FUNC void pe_add_unwind_data_frame(unsigned start, unsigned end,
+                                      unsigned stack);
+#endif
 PUB_FUNC int tcc_get_dllexports(const char *filename, char **pp);
 /* symbol properties stored in Elf32_Sym->st_other */
 # define ST_PE_EXPORT 0x10

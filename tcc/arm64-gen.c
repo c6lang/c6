@@ -60,6 +60,16 @@ ST_DATA const char * const target_machine_defs =
     "__AARCH64EL__\0"
     ;
 
+#ifdef C6_EXT
+/* c6: an async body keeps its frame in the task (gfunc_prolog/epilog below
+   point x29 at it), so a suspension neither copies nor moves anything and a
+   '&local' taken before an 'await' is still valid after it */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 1;
+}
+#endif
+
 ST_DATA const int reg_classes[NB_REGS] = {
   RC_INT | RC_R(0),
   RC_INT | RC_R(1),
@@ -1244,6 +1254,33 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     int variadic = func_sym->type.ref->f.func_type == FUNC_ELLIPSIS;
     int var_nb_arg = variadic ? n_func_args(&func_sym->type) : 0;
 
+    if (c6_stable_frame) {
+        /* An async body: x0 is the task, x1 the top of the frame the task
+           owns.  fp/lr go to the stack the ordinary way (so an unwinder can
+           walk through the body), but x29 then points at the task's frame
+           instead of the stack: the locals live in the task, and suspending
+           copies and moves nothing.  The task pointer keeps the first slot of
+           that frame, which is enough to reach the descriptors. */
+        arm64_func_start_offset = ind;
+        o(0xa9bf7bfd);  // stp x29,x30,[sp,#-16]!
+        o(0x9100003d);  // mov x29,x1        ; the frame
+        o(0xf81f83a0);  // stur x0,[x29,#-8] ; the task
+        func_vc = 0;
+        loc = -8;
+        arm64_func_sub_sp_offset = 0;
+        arm64_func_va_list_stack = 0;
+        arm64_func_va_list_gr_offs = 0;
+        arm64_func_va_list_vr_offs = 0;
+        sym = func_type->ref->next;
+        if (sym) {
+            gfunc_set_param(sym, -8, 0);
+            sym = sym->next;
+            if (sym)
+                gfunc_set_param(sym, 0, 0); /* already in x29 */
+        }
+        return;
+    }
+
     func_vc = 144; // offset of where x8 is stored
 
     for (sym = func_type->ref; sym; sym = sym->next)
@@ -1581,6 +1618,17 @@ ST_FUNC void gfunc_return(CType *func_type)
 
 ST_FUNC void gfunc_epilog(void)
 {
+    if (c6_stable_frame) {
+        /* the frame is the task's; only fp/lr have to go back */
+        c6_frame_size_set((-loc + 15) & -16);
+        o(0xa8c17bfd); // ldp x29,x30,[sp],#16
+        o(0xd65f03c0); // ret
+#ifdef TCC_TARGET_PE
+        pe_add_unwind_data_frame(arm64_func_start_offset, ind, 16);
+#endif
+        return;
+    }
+
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)
         gen_bounds_epilog();

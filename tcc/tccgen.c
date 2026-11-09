@@ -14652,6 +14652,10 @@ static void c6_async_definition(Sym *sym, CType *ftype)
        cleared again right after the body, because the release function the
        descriptor mentions is an ordinary function. */
     stable = c6_backend_frame_in_task() ? 1 : 0;
+#ifdef CONFIG_TCC_BCHECK
+    if (stable && tcc_state->do_bounds_check)
+        tcc_error("'-b' cannot be combined with 'async'");
+#endif
     c6_stable_frame = stable;
     c6_stable_frame_size = 0;
 

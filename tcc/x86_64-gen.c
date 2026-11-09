@@ -944,6 +944,25 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     func_sub_sp_offset = ind;
     reg_param_index = 0;
 
+    if (c6_stable_frame) {
+        /* an async body: the two arguments are the task (%rcx) and the top of
+           the frame the task owns (%rdx).  The epilog's prolog patch puts the
+           second one into %rbp, so the locals live in the task and nothing is
+           read or written above %rbp (the caller's shadow space and stack
+           arguments stay the caller's).  %rsp is only lowered by the outgoing
+           argument area, see gfunc_epilog(). */
+        sym = func_type->ref->next;
+        if (sym) {
+            loc = (loc - PTR_SIZE) & -PTR_SIZE;
+            gen_modrm64(0x89, arg_regs[0], VT_LOCAL, NULL, loc);
+            gfunc_set_param(sym, loc, 0);
+            sym = sym->next;
+            if (sym)
+                gfunc_set_param(sym, 0, 0);   /* already in %rbp */
+        }
+        return;
+    }
+
     sym = func_type->ref;
 
     /* if the function returns a structure, then add an
@@ -1001,6 +1020,51 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 void gfunc_epilog(void)
 {
     int v, start;
+
+    if (c6_stable_frame) {
+        /* The locals are in the task, so the frame is theirs alone; %rsp is
+           only lowered for the outgoing-argument area gfunc_call() addresses
+           relative to it ('[rsp + arg*8]', and the struct-by-value copies
+           above that).  That area is not part of the frame: a suspension
+           happens between statements, when no argument is in flight. */
+        v = (func_scratch + 15) & -16;
+        if (v >= 4096)
+            tcc_error("an 'async' body cannot pass more than 4 KiB of "
+                      "arguments by value");
+        c6_frame_size_set((-loc + 15) & -16);
+
+#ifdef CONFIG_TCC_BCHECK
+        if (tcc_state->do_bounds_check)
+            gen_bounds_epilog();
+#endif
+
+        if (v) {
+            o(0xc48148);    /* add rsp, outgoing area */
+            gen_le32(v);
+        }
+        o(0x5d); /* pop %rbp */
+        if (func_ret_sub == 0) {
+            o(0xc3); /* ret */
+        } else {
+            o(0xc2); /* ret n */
+            g(func_ret_sub);
+            g(func_ret_sub >> 8);
+        }
+
+        start = func_sub_sp_offset - FUNC_PROLOG_SIZE;
+        cur_text_section->data_offset = ind;
+        pe_add_unwind_data_frame(start, ind, v);
+
+        ind = start;
+        o(0xd5894855);  /* push %rbp, mov %rdx, %rbp */
+        if (v) {
+            o(0xec8148);  /* sub rsp, outgoing area */
+            gen_le32(v);
+        }
+        gen_fill_nops(FUNC_PROLOG_SIZE - 4 - (v ? 7 : 0));
+        ind = cur_text_section->data_offset;
+        return;
+    }
 
     /* align local size to word & save local variables */
     func_scratch = (func_scratch + 15) & -16;
