@@ -217,7 +217,10 @@ test "形参在帧里活过挂起" {
 }
 
 /* ---- 7. 挂起的任务被销毁：回卷跑 defer、归还引用 ---- */
+/* 回卷按错误路径派发（`__c6_co_kind(task) == ABORT` 时发的是 mode 2），所以
+   `errdefer` 也会跑：被销毁的任务没有"正常结束"这回事。 */
 static int g_abort_clean = 0;
+static int g_abort_errdef = 0;
 
 async int abandoned(int fd)
 {
@@ -229,6 +232,7 @@ async int abandoned(int fd)
     defer {
         g_abort_clean += n->v + pad[2040];   /* 14 = 9 + 5 */
     }
+    errdefer g_abort_errdef += 1;
     await c6_io(fd, 1);              /* 读端没有数据：挂在这里 */
     return n->v + pad[2040];
 }
@@ -241,6 +245,7 @@ test "挂起的任务被销毁时回卷" {
         err(60, "pipe 失败");
     live0 = (int)__c6_gc_live();
     g_abort_clean = 0;
+    g_abort_errdef = 0;
     {
         task t = abandoned(fds[0]);
 
@@ -251,11 +256,15 @@ test "挂起的任务被销毁时回卷" {
             err(62, "挂起的任务不该报 done");
         if (g_abort_clean != 0)
             err(63, "defer 在挂起时不该运行");
+        if (g_abort_errdef != 0)
+            err(67, "errdefer 在挂起时不该运行");
         if ((int)__c6_gc_live() <= live0)
             err(64, "任务持有的引用没有计数");
     }                                /* 作用域退出 -> __c6_co_destroy -> 回卷 */
     if (g_abort_clean != 14)
         err(65, "回卷没有跑 defer，或帧里的局部量不对");
+    if (g_abort_errdef != 1)
+        err(68, "回卷按错误路径派发，errdefer 也应该跑一次");
     if ((int)__c6_gc_live() != live0)
         err(66, "回卷没有把托管引用还回来");
 }
