@@ -18,24 +18,6 @@ struct Pair {
 void boot_putc(int ch);
 void boot_exit(int code);
 
-/* 两个“平台”动作：qemu 的 0xE9 调试口和 isa-debug-exit。
-   就这么两条 outb，别的什么都没有。 */
-__asm__(
-    ".text\n"
-    ".globl boot_putc\n"
-    "boot_putc:\n"
-    "  movl %edi, %eax\n"
-    "  movl $0xE9, %edx\n"
-    "  outb %al, %dx\n"
-    "  ret\n"
-    ".globl boot_exit\n"
-    "boot_exit:\n"
-    "  movl %edi, %eax\n"
-    "  movl $0x501, %edx\n"
-    "  outb %al, %dx\n"
-    "1: hlt\n"
-    "  jmp 1b\n");
-
 static void puts_(const char *s)
 {
     while (*s)

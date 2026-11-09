@@ -1291,6 +1291,46 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
   `.code16` / `.code32`），这让这个例子比别处多一个构建依赖 —— 语言特性本身
   不依赖它。
 
+#### 把 tests/ 也搬上裸机
+
+`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**26 个测试
+文件、251 个 test 块，0 失败**，每个文件一个镜像，一共 12 秒。
+
+```
+ok   async: 20 test(s), 0 failure(s)
+ok   fstr: 15 test(s), 0 failure(s)
+ok   try: 18 test(s), 0 failure(s)
+...
+bare tests: 26 通过, 0 失败（跳过: gc_drop gc_thread method thread thread_handle tuple_thread）
+```
+
+要补的不是运行时，而是**测试自己用的 libc**：
+[examples/boot/shim.plain.c](examples/boot/shim.plain.c) 里是一层替身 ——
+`printf`（整数/字符串，没有浮点）、`strcmp`/`strncmp`/`strlen`/`strstr`/
+`memcmp`、`qsort`（插入排序）、`getpid`/`usleep`/`stat` 的桩子、**内存里的
+管道和 `select`**（`await c6_io` 就靠它），外加一个 4MB 静态堆的首次适配
+分配器。这层替身不是运行时要求的（`libtcc1` 的依赖全是 weak），是测试文件本身
+按 POSIX 写的。
+
+跳过的 6 个是真的缺东西，不是能补的：
+
+| 测试 | 缺什么 |
+|---|---|
+| `thread` / `thread_handle` / `gc_thread` / `gc_drop` / `tuple_thread` | `go` 要 `pthread_create`，裸机上就是 `clone`/`futex`，得先有内核 |
+| `method` | 要 `FILE` 的真实内存布局（`stdout->fflush()`），那是 libc 的内部结构 |
+
+三个只有真跑一遍才会知道的坑：
+
+- **默认 256KB 的 arena 跑不了一整套**。裸机上没有 `calloc` 时运行时用
+  `libtcc1` 自带的 bump 分配器，只增不减，跑到 `async` 那 200 个 task 的循环
+  就没了。给上 `calloc`/`free`/`realloc`（替身里那个首次适配）立刻就好 ——
+  这本来就是 README 里写的那两条路之一；
+- **`select` 得自己实现**，而且 fd 0/1/2 要当"永远就绪"（真的 fd 1 也是），
+  否则 `await c6_io(1, WRITE)` 会一直返回"不可写"；
+- **一行命令里塞多个 TU 会撞上编译器一个老 bug**：带 `new`/GC 的 TU 和非首
+  TU 一起编时，`c6_gc_new_lead` 会对 NULL 标签名做 `strcmp` 然后崩。拆成
+  `-c` + 链接就绕开了（`build.sh` 现在就是这么做的），bug 本身没修。
+
 C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
 `<pthread.h>`）。
 

@@ -136,8 +136,17 @@ fstest-bare: build
 	     echo "fstest-bare: 没有 binutils，跳过"; exit 0; }
 	./examples/boot/build.sh
 
+# 把 tests/*.c 里的 test 块搬上裸机：每个文件配一层 libc 替身 + 自动生成的
+# 入口，跑在同一个 512 字节引导器上（见 examples/boot/runtests.sh）
+fstest-bare-tests: build
+	@command -v qemu-system-x86_64 >/dev/null || { \
+	     echo "fstest-bare-tests: 没有 qemu-system-x86_64，跳过"; exit 0; }
+	@command -v as >/dev/null || { \
+	     echo "fstest-bare-tests: 没有 binutils，跳过"; exit 0; }
+	./examples/boot/runtests.sh
+
 test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
-	  fstest-bare
+	  fstest-bare fstest-bare-tests
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
