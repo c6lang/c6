@@ -21,42 +21,17 @@
 # define __c99_rt_linkage static
 #endif
 
-/* c6 extension runtime: defer / errdefer / err                          */
+/* c6 extension runtime: err                                              */
 /*                                                                           */
-/* Deferred statements are recorded on a per-thread stack.  Each function     */
-/* stores the stack top at entry ("frame base") in a local slot and passes it */
-/* to every cleanup request, so a cleanup never touches records that belong   */
-/* to the caller's frames.  Scope cleanups additionally filter by lexical     */
-/* depth, which makes conditional registration and loops work.               */
+/* Deferred statements need no runtime at all: a cleanup site is static, and  */
+/* whether it is armed lives in the frame of the call that registered it (see */
+/* docs/grammar.md, R6/D1-D6).  What is left here is the error slot.          */
 /*                                                                           */
-/* Every OS thread owns its defer stack, error slot and coroutine pool, so a  */
-/* thread that runs c6 code cannot corrupt the state of another one.  The     */
-/* per-thread block is found through a pthread key: '-run' rejects TLS        */
-/* sections, so '__thread' cannot be used.  A thread allocates its block      */
-/* lazily, the first time it touches the c6 runtime.                         */
-
-#define C99_DEFER_MAX     8192
-#define C99_DEFER_CTX_MAX 512
-
-#define C99_DEFER_KIND_DEFER    0
-#define C99_DEFER_KIND_ERRDEFER 1
-
-#define C99_DEFER_MODE_SCOPE 0   /* run records of scopes deeper than depth */
-#define C99_DEFER_MODE_FUNC  1   /* run all records of this function frame */
-#define C99_DEFER_MODE_ERR   2   /* run only errdefer records, frame wide   */
-
-typedef struct C99DeferRec {
-    int id;      /* cleanup site id (> 0) */
-    int depth;   /* lexical scope depth at registration */
-    int kind;    /* C99_DEFER_KIND_* */
-} C99DeferRec;
-
-typedef struct C99DeferCtx {
-    int mode;    /* C99_DEFER_MODE_* */
-    int depth;   /* target scope depth (scope mode) */
-    int resume;  /* resume id (reported as -resume when finished) */
-    int base;    /* frame base: never pop records below this index */
-} C99DeferCtx;
+/* Every OS thread owns its error slot and coroutine pool, so a thread that   */
+/* runs c6 code cannot corrupt the state of another one.  The per-thread      */
+/* block is found through a pthread key: '-run' rejects TLS sections, so      */
+/* '__thread' cannot be used.  A thread allocates its block lazily, the first */
+/* time it touches the c6 runtime.                                           */
 
 typedef struct C99CoPool C99CoPool;   /* completed with the async runtime */
 typedef struct C99ThRec C99ThRec;     /* threads started by this thread */
@@ -65,8 +40,6 @@ typedef struct C99GcHdr C99GcHdr;     /* completed with the gc runtime */
 struct C99FmtBuf;           /* the f-string builder, defined further down */
 
 typedef struct C99ThCtx {
-    C99DeferRec *dstack;  int dsp, stack_cap;
-    C99DeferCtx *dctx;    int dcsp, ctx_cap;
     int err_flag, err_id;
     const char *err_msg;
     /* the message of a non-literal 'err(...)': copied, because the caller's
@@ -154,10 +127,6 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_th_free(C99ThCtx *th)
     th->th_freed = 1;
     __c99_gc_free_all(th);
     __c99_join_children(th);
-    if (th->dstack)
-        free(th->dstack);
-    if (th->dctx)
-        free(th->dctx);
     if (th->co)
         __c99_co_free(th->co);
     __c99_fmt_free_all(th);
@@ -322,100 +291,9 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_th_join_all(void)
     __c99_join_children(__c99_th());
 }
 
-C99_RT_UNUSED __c99_rt_linkage C99DeferRec *__c99_dstack(C99ThCtx *th)
-{
-    if (!th->dstack) {
-        th->dstack = (C99DeferRec *)__c99_alloc(C99_DEFER_MAX
-                                                * sizeof(C99DeferRec));
-        th->stack_cap = C99_DEFER_MAX;
-    }
-    return th->dstack;
-}
-
-C99_RT_UNUSED __c99_rt_linkage C99DeferCtx *__c99_dctx(C99ThCtx *th)
-{
-    if (!th->dctx) {
-        th->dctx = (C99DeferCtx *)__c99_alloc(C99_DEFER_CTX_MAX
-                                              * sizeof(C99DeferCtx));
-        th->ctx_cap = C99_DEFER_CTX_MAX;
-    }
-    return th->dctx;
-}
-
-/* Called once at function entry: remember where the frame starts.  The
-   result is stored through OUT because helper functions are void-typed. */
-C99_RT_UNUSED __c99_rt_linkage void __tcc_defer_func_enter(int *out)
-{
-    *out = __c99_th()->dsp;
-}
-
-C99_RT_UNUSED __c99_rt_linkage void __tcc_defer_push(int id, int depth, int kind)
-{
-    C99ThCtx *th = __c99_th();
-    C99DeferRec *r;
-
-    if (th->dsp >= C99_DEFER_MAX)
-        return;
-    r = &__c99_dstack(th)[th->dsp++];
-    r->id = id;
-    r->depth = depth;
-    r->kind = kind;
-}
-
-C99_RT_UNUSED __c99_rt_linkage void __tcc_defer_begin_scope(int depth, int resume, int base)
-{
-    C99ThCtx *th = __c99_th();
-    C99DeferCtx *c;
-
-    if (th->dcsp >= C99_DEFER_CTX_MAX)
-        return;
-    c = &__c99_dctx(th)[th->dcsp++];
-    c->mode = C99_DEFER_MODE_SCOPE;
-    c->depth = depth;
-    c->resume = resume;
-    c->base = base;
-}
-
-C99_RT_UNUSED __c99_rt_linkage void __tcc_defer_begin_func(int mode, int resume, int base)
-{
-    C99ThCtx *th = __c99_th();
-    C99DeferCtx *c;
-
-    if (th->dcsp >= C99_DEFER_CTX_MAX)
-        return;
-    c = &__c99_dctx(th)[th->dcsp++];
-    c->mode = mode;
-    c->depth = 0;
-    c->resume = resume;
-    c->base = base;
-}
-
-/* Store the next cleanup site id to run (> 0), or -resume when the current
-   cleanup request is finished, through OUT so generated code needs no
-   return-value handling. */
-C99_RT_UNUSED __c99_rt_linkage void __tcc_defer_step(int *out)
-{
-    C99ThCtx *th = __c99_th();
-
-    *out = -1;
-    while (th->dcsp > 0) {
-        C99DeferCtx *c = &__c99_dctx(th)[th->dcsp - 1];
-        while (th->dsp > c->base) {
-            C99DeferRec *r = &__c99_dstack(th)[th->dsp - 1];
-            if (c->mode == C99_DEFER_MODE_SCOPE && r->depth <= c->depth)
-                break;              /* belongs to an enclosing scope */
-            th->dsp--;
-            if (r->kind == C99_DEFER_KIND_ERRDEFER
-                && c->mode != C99_DEFER_MODE_ERR)
-                continue;           /* errdefer only runs on the error path */
-            *out = r->id;
-            return;
-        }
-        th->dcsp--;
-        *out = -c->resume;
-        return;
-    }
-}
+/* Deferred statements need no runtime support: the site table is built by
+   the compiler and the armed bits live in the frame (tccgen.c,
+   c6_defer_func_init()). */
 
 C99_RT_UNUSED __c99_rt_linkage void __tcc_err_set(int id, const char *msg)
 {
@@ -574,9 +452,10 @@ C99_RT_UNUSED __c99_rt_linkage void __tcc_slice_sub(void *out, const void *slice
 /*                                                                           */
 /* An 'async' function is compiled to                                        */
 /* 'int __c6_body_NAME(void *task, void *frame)'.  A task owns one block: the */
-/* 'struct NAME_task' header, the parked 'defer' records and - when the back  */
-/* end supports it (c6_backend_frame_in_task()) - the native frame of the     */
-/* body.  The body's frame pointer is set to the top of that block, so every  */
+/* 'struct NAME_task' header and - when the back end supports it             */
+/* (c6_backend_frame_in_task()) - the native frame of the body, which also    */
+/* holds the state of its deferred cleanups.  The body's frame pointer is set */
+/* to the top of that block, so every                                         */
 /* local keeps its offset, a suspension is nothing but a return to the driver */
 /* and a local's address stays what it was for the whole life of the task.    */
 /*                                                                           */
@@ -607,10 +486,9 @@ C99_RT_UNUSED __c99_rt_linkage void __tcc_slice_sub(void *out, const void *slice
 /* lays out exactly like the predef in tccpp.c:tcc_predefs() */
 typedef struct C99CoTask {
     int state, kind;
-    int defer_max, defer_base, defer_cap, defer_csp;
     int wait_fd, wait_ev, wait_rev;
     int err_flag, err_id, __pad0;
-    void *desc, *frame, *defer_arena, *parent, *child;
+    void *desc, *frame, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
     void *frame_addr;
@@ -621,17 +499,17 @@ typedef struct C99CoTask {
 
 typedef struct C99CoDesc {
     unsigned size, align;       /* 'struct NAME_task': header + declared fields */
-    int defer_max;              /* parked defer records */
     int (*entry)(void *, void *);       /* (task, top of the frame) */
     void (*release)(void *);    /* give back what the task slot owns */
     unsigned frame_size;        /* 0: the frame is parked on every suspension */
 } C99CoDesc;
 
 /* One block per task, allocated when the task is created:
-     [C99CoTask][struct NAME_task fields][defer records][frame]
+     [C99CoTask][struct NAME_task fields][frame]
    'frame' is the top of the frame region, which is what the body's frame
    pointer points at; a local lives at 'frame - offset'.  'frame_size' in the
-   descriptor, not the pool, is what bounds it. */
+   descriptor, not the pool, is what bounds it.  The cleanups of the body need
+   no room here: their state is in that frame. */
 struct C99CoPool {
     /* Top-level coroutines started with 'co': they belong to no scope and no
        parent, so the scheduler below owns them from creation to completion. */
@@ -690,24 +568,21 @@ C99_RT_UNUSED __c99_rt_linkage unsigned long __c99_co_align(unsigned long n)
    creating a task is one allocation and freeing it is one free. */
 C99_RT_UNUSED __c99_rt_linkage void *__c6_co_new(const C99CoDesc *d)
 {
-    unsigned long prefix = d->size, defers, frames, total;
+    unsigned long prefix = d->size, frames, total;
     char *p, *q;
     C99CoTask *t;
 
     if (prefix < sizeof(C99CoTask))
         prefix = sizeof(C99CoTask);
-    defers = (unsigned long)d->defer_max * sizeof(C99DeferRec);
     frames = __c99_co_align(d->frame_size);
-    total = prefix + defers + 16 + frames + 16;
+    total = prefix + 16 + frames + 16;
     p = (char *)__c99_alloc(total);
     t = (C99CoTask *)(void *)p;
     t->desc = (void *)d;
     t->state = C6_CO_STATE_NEW;
     t->kind = C6_CO_KIND_DONE;
-    t->defer_max = d->defer_max > 0 ? d->defer_max : 0;
     q = p + prefix;
-    t->defer_arena = t->defer_max ? (void *)q : (void *)0;
-    q = (char *)(((unsigned long)(q + defers) + 15) & ~(unsigned long)15);
+    q = (char *)(((unsigned long)q + 15) & ~(unsigned long)15);
     if (frames)
         /* the body runs with its frame pointer here: no copy, no move */
         t->frame = (void *)(q + frames);
@@ -726,17 +601,16 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_await(void *child, void *self)
     return c->state == C6_CO_STATE_DONE ? 0 : 1;
 }
 
-/* Park the defer records of this frame and the error slot, then record where
-   the body has to resume.  The native frame is only parked here when the back
-   end did not put it in the task in the first place. */
+/* Park the error slot and record where the body has to resume.  The native
+   frame is only parked here when the back end did not put it in the task in
+   the first place; the deferred cleanups of the body always live in that
+   frame, so they need no parking at all. */
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int state,
-                     char *base, int size, int defer_base)
+                     char *base, int size)
 {
     C99ThCtx *th = __c99_th();
     C99CoTask *t = (C99CoTask *)self;
     const C99CoDesc *d = (const C99CoDesc *)t->desc;
-    C99DeferRec *parked = (C99DeferRec *)t->defer_arena;
-    int i, n;
 
     if (!d->frame_size) {
         /* this back end moves the frame: keep the used part of it */
@@ -750,20 +624,6 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int st
     t->state = state;
     t->kind = kind;
 
-    t->defer_base = defer_base;
-    n = th->dsp - defer_base;
-    if (n < 0)
-        n = 0;
-    if (n > t->defer_max)
-        n = t->defer_max;
-    for (i = 0; i < n; i++)
-        parked[i] = __c99_dstack(th)[defer_base + i];
-    t->defer_cap = n;
-    t->defer_csp = th->dcsp;
-    if (th->dsp > defer_base)
-        th->dsp = defer_base;
-    th->dcsp = 0;
-
     t->err_flag = th->err_flag;
     t->err_id = th->err_id;
     t->err_msg = th->err_msg;
@@ -772,23 +632,17 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int st
     th->err_msg = 0;
 }
 
-/* Re-establish the task's defer and error state (the generated prologue calls
-   this before it jumps to the resume point) and, for a back end that parks
-   the native frame, put that frame back where it belongs. */
+/* Re-establish the task's error slot (the generated prologue calls this
+   before it jumps to the resume point) and, for a back end that parks the
+   native frame, put that frame back where it belongs. */
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_restore(void *self, char *base)
 {
     C99ThCtx *th = __c99_th();
     C99CoTask *t = (C99CoTask *)self;
     const C99CoDesc *d = (const C99CoDesc *)t->desc;
-    C99DeferRec *parked = (C99DeferRec *)t->defer_arena;
-    int i, n = t->defer_cap;
 
     if (!d->frame_size)
         __c99_co_copy(base - t->frame_size, t->frame, t->frame_size);
-    for (i = 0; i < n; i++)
-        __c99_dstack(th)[t->defer_base + i] = parked[i];
-    th->dsp = t->defer_base + n;
-    th->dcsp = t->defer_csp;
     th->err_flag = t->err_flag;
     th->err_id = t->err_id;
     th->err_msg = t->err_msg;
@@ -938,8 +792,6 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
 {
     C99CoTask *leaf = __c99_co_leaf(t);
     C99CoDesc *d;
-    C99ThCtx *th = __c99_th();
-    int dsp = th->dsp, dcsp = th->dcsp;
     int k;
 
     if (leaf->state == C6_CO_STATE_DONE)
@@ -954,15 +806,6 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
        task ignores it, one that parks its native frame gets a harmless value */
     k = d->entry(leaf, leaf->frame);
     leaf->busy--;
-    /* A body keeps its 'defer' records in the task: suspending parks them and
-       saves the thread's stack pointers there (__c6_co_suspend), and resuming
-       puts them back (__c6_co_restore).  What the body left behind belongs to
-       the task, not to whoever called it -- if the task is left parked, the
-       caller's own 'defer' and task cleanups would otherwise see a reset
-       context stack and silently skip themselves (the thread pointers are a
-       stack discipline), so save and restore them around the call. */
-    th->dsp = dsp;
-    th->dcsp = dcsp;
     switch (k) {
     case C6_CO_KIND_DONE:
     case C6_CO_KIND_ERR:
@@ -1166,8 +1009,9 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_wait(void *self)
     return ((C99CoTask *)self)->kind == C6_CO_KIND_ERR ? -1 : 0;
 }
 
-/* Release a task and everything it owns.  A still-suspended body is dropped
-   without running its remaining 'defer' statements. */
+/* Release a task and everything it owns.  A still-suspended body is resumed
+   once with kind ABORT so that it runs its remaining cleanup sites (the armed
+   bits and the dispatcher live in the task's frame). */
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_abort(void *self)
 {
     C99CoTask *t = (C99CoTask *)self;

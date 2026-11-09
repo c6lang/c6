@@ -623,42 +623,17 @@ long long __fixxfdi (long double a1)
 #endif /* !ARM */
 
 /* ------------------------------------------------------------------------- */
-/* c6 extension runtime: defer / errdefer / err                          */
+/* c6 extension runtime: err                                              */
 /*                                                                           */
-/* Deferred statements are recorded on a per-thread stack.  Each function     */
-/* stores the stack top at entry ("frame base") in a local slot and passes it */
-/* to every cleanup request, so a cleanup never touches records that belong   */
-/* to the caller's frames.  Scope cleanups additionally filter by lexical     */
-/* depth, which makes conditional registration and loops work.               */
+/* Deferred statements need no runtime at all: a cleanup site is static, and  */
+/* whether it is armed lives in the frame of the call that registered it (see */
+/* docs/grammar.md, R6/D1-D6).  What is left here is the error slot.          */
 /*                                                                           */
-/* Every OS thread owns its defer stack, error slot and coroutine pool, so a  */
-/* thread that runs c6 code cannot corrupt the state of another one.  The     */
-/* per-thread block is found through a pthread key: '-run' rejects TLS        */
-/* sections, so '__thread' cannot be used.  A thread allocates its block      */
-/* lazily, the first time it touches the c6 runtime.                         */
-
-#define TCC_DEFER_MAX     8192
-#define TCC_DEFER_CTX_MAX 512
-
-#define TCC_DEFER_KIND_DEFER    0
-#define TCC_DEFER_KIND_ERRDEFER 1
-
-#define TCC_DEFER_MODE_SCOPE 0   /* run records of scopes deeper than depth */
-#define TCC_DEFER_MODE_FUNC  1   /* run all records of this function frame */
-#define TCC_DEFER_MODE_ERR   2   /* run only errdefer records, frame wide   */
-
-typedef struct TccDeferRec {
-    int id;      /* cleanup site id (> 0) */
-    int depth;   /* lexical scope depth at registration */
-    int kind;    /* TCC_DEFER_KIND_* */
-} TccDeferRec;
-
-typedef struct TccDeferCtx {
-    int mode;    /* TCC_DEFER_MODE_* */
-    int depth;   /* target scope depth (scope mode) */
-    int resume;  /* resume id (reported as -resume when finished) */
-    int base;    /* frame base: never pop records below this index */
-} TccDeferCtx;
+/* Every OS thread owns its error slot and coroutine pool, so a thread that   */
+/* runs c6 code cannot corrupt the state of another one.  The per-thread      */
+/* block is found through a pthread key: '-run' rejects TLS sections, so      */
+/* '__thread' cannot be used.  A thread allocates its block lazily, the first */
+/* time it touches the c6 runtime.                                           */
 
 typedef struct TccCoPool TccCoPool;   /* completed with the async runtime */
 typedef struct TccThRec TccThRec;     /* threads started by this thread */
@@ -667,8 +642,6 @@ typedef struct C6GcHdr C6GcHdr;       /* completed with the gc runtime */
 struct C6FmtBuf;             /* the f-string builder, defined further down */
 
 typedef struct TccThCtx {
-    TccDeferRec *dstack;  int dsp, stack_cap;
-    TccDeferCtx *dctx;    int dcsp, ctx_cap;
     int err_flag, err_id;
     const char *err_msg;
     /* the message of a non-literal 'err(...)': the pointer the caller passed
@@ -695,7 +668,7 @@ typedef unsigned long pthread_t;
 typedef unsigned int pthread_key_t;
 typedef int pthread_once_t;
 /* The runtime needs threads for 'go'/'thread' and to key one block of state
-   (defer stack, error slot, f-string builders) per thread.  A freestanding
+   (error slot, f-string builders, coroutine pool) per thread.  A freestanding
    program -- one linked without libc -- has no pthreads, so every entry
    point is a *weak* reference: it becomes 0 there, and the runtime then
    keeps a single static block and refuses to start threads instead of
@@ -759,12 +732,13 @@ __attribute__((weak)) void *memmove(void *d, const void *s, unsigned long n)
 }
 
 /* ---- allocator ----------------------------------------------------- *
-   The runtime needs memory for the f-string builders, the defer stack, the
-   error slot, the coroutine pool and the managed objects.  Normally that is
+   The runtime needs memory for the f-string builders, the error slot, the
+   coroutine pool and the managed objects.  Normally that is
    the C library's calloc/free/realloc.  A freestanding program (one linked
    without libc) has none of them, so the three references are weak and a
-   static arena in .bss takes over when they are 0 -- then f"..", defer, err
-   and @T keep working with nothing provided by the program.  C6_HEAP_SIZE
+   static arena in .bss takes over when they are 0 -- then f"..", err and @T
+   keep working with nothing provided by the program ('defer' needs no runtime
+   memory at all: its state lives in the frame).  C6_HEAP_SIZE
    can be raised at build time (-DC6_HEAP_SIZE=...) and a program that links
    its own calloc/free simply gets used instead (the arena stays unused). */
 
@@ -894,10 +868,6 @@ static void tcc_th_free(TccThCtx *th)
     th->th_freed = 1;
     tcc_th_gc_free_all(th);
     tcc_th_join_children(th);
-    if (th->dstack)
-        c6_free(th->dstack);
-    if (th->dctx)
-        c6_free(th->dctx);
     if (th->co)
         tcc_th_co_free(th->co);
     tcc_fmt_free_all(th);
@@ -1081,100 +1051,9 @@ void __c6_th_join_all(void)
     tcc_th_join_children(tcc_th());
 }
 
-static TccDeferRec *tcc_th_dstack(TccThCtx *th)
-{
-    if (!th->dstack) {
-        th->dstack = (TccDeferRec *)tcc_th_alloc(TCC_DEFER_MAX
-                                                * sizeof(TccDeferRec));
-        th->stack_cap = TCC_DEFER_MAX;
-    }
-    return th->dstack;
-}
-
-static TccDeferCtx *tcc_th_dctx(TccThCtx *th)
-{
-    if (!th->dctx) {
-        th->dctx = (TccDeferCtx *)tcc_th_alloc(TCC_DEFER_CTX_MAX
-                                              * sizeof(TccDeferCtx));
-        th->ctx_cap = TCC_DEFER_CTX_MAX;
-    }
-    return th->dctx;
-}
-
-/* Called once at function entry: remember where the frame starts.  The
-   result is stored through OUT because helper functions are void-typed. */
-void __tcc_defer_func_enter(int *out)
-{
-    *out = tcc_th()->dsp;
-}
-
-void __tcc_defer_push(int id, int depth, int kind)
-{
-    TccThCtx *th = tcc_th();
-    TccDeferRec *r;
-
-    if (th->dsp >= TCC_DEFER_MAX)
-        return;
-    r = &tcc_th_dstack(th)[th->dsp++];
-    r->id = id;
-    r->depth = depth;
-    r->kind = kind;
-}
-
-void __tcc_defer_begin_scope(int depth, int resume, int base)
-{
-    TccThCtx *th = tcc_th();
-    TccDeferCtx *c;
-
-    if (th->dcsp >= TCC_DEFER_CTX_MAX)
-        return;
-    c = &tcc_th_dctx(th)[th->dcsp++];
-    c->mode = TCC_DEFER_MODE_SCOPE;
-    c->depth = depth;
-    c->resume = resume;
-    c->base = base;
-}
-
-void __tcc_defer_begin_func(int mode, int resume, int base)
-{
-    TccThCtx *th = tcc_th();
-    TccDeferCtx *c;
-
-    if (th->dcsp >= TCC_DEFER_CTX_MAX)
-        return;
-    c = &tcc_th_dctx(th)[th->dcsp++];
-    c->mode = mode;
-    c->depth = 0;
-    c->resume = resume;
-    c->base = base;
-}
-
-/* Store the next cleanup site id to run (> 0), or -resume when the current
-   cleanup request is finished, through OUT so generated code needs no
-   return-value handling. */
-void __tcc_defer_step(int *out)
-{
-    TccThCtx *th = tcc_th();
-
-    *out = -1;
-    while (th->dcsp > 0) {
-        TccDeferCtx *c = &tcc_th_dctx(th)[th->dcsp - 1];
-        while (th->dsp > c->base) {
-            TccDeferRec *r = &tcc_th_dstack(th)[th->dsp - 1];
-            if (c->mode == TCC_DEFER_MODE_SCOPE && r->depth <= c->depth)
-                break;              /* belongs to an enclosing scope */
-            th->dsp--;
-            if (r->kind == TCC_DEFER_KIND_ERRDEFER
-                && c->mode != TCC_DEFER_MODE_ERR)
-                continue;           /* errdefer only runs on the error path */
-            *out = r->id;
-            return;
-        }
-        th->dcsp--;
-        *out = -c->resume;
-        return;
-    }
-}
+/* Deferred statements need no runtime support: the site table is built by
+   the compiler and the armed bits live in the frame.  See c6_defer_func_init()
+   in tccgen.c. */
 
 void __tcc_err_set(int id, const char *msg)
 {
@@ -2648,9 +2527,10 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 /*                                                                           */
 /* An 'async' function is compiled to                                        */
 /* 'int __c6_body_NAME(void *task, void *frame)'.  A task owns one block: the */
-/* 'struct NAME_task' header, the parked 'defer' records and - when the back  */
-/* end supports it (c6_backend_frame_in_task()) - the native frame of the     */
-/* body.  The body's frame pointer is set to the top of that block, so every  */
+/* 'struct NAME_task' header and - when the back end supports it             */
+/* (c6_backend_frame_in_task()) - the native frame of the body, which also    */
+/* holds the state of its deferred cleanups.  The body's frame pointer is set */
+/* to the top of that block, so every                                         */
 /* local keeps its offset, a suspension is nothing but a return to the driver */
 /* and a local's address stays what it was for the whole life of the task.    */
 /*                                                                           */
@@ -2681,10 +2561,9 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 /* lays out exactly like the predef in tccpp.c:tcc_predefs() */
 typedef struct TccCoTask {
     int state, kind;
-    int defer_max, defer_base, defer_cap, defer_csp;
     int wait_fd, wait_ev, wait_rev;
     int err_flag, err_id, __pad0;
-    void *desc, *frame, *defer_arena, *parent, *child;
+    void *desc, *frame, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
     void *frame_addr;
@@ -2695,17 +2574,17 @@ typedef struct TccCoTask {
 
 typedef struct TccCoDesc {
     unsigned size, align;       /* 'struct NAME_task': header + declared fields */
-    int defer_max;              /* parked defer records */
     int (*entry)(void *, void *);       /* (task, top of the frame) */
     void (*release)(void *);    /* give back what the task slot owns */
     unsigned frame_size;        /* 0: the frame is parked on every suspension */
 } TccCoDesc;
 
 /* One block per task, allocated when the task is created:
-     [TccCoTask][struct NAME_task fields][defer records][frame]
+     [TccCoTask][struct NAME_task fields][frame]
    'frame' is the top of the frame region, which is what the body's frame
    pointer points at; a local lives at 'frame - offset'.  'frame_size' in the
-   descriptor, not the pool, is what bounds it. */
+   descriptor, not the pool, is what bounds it.  The cleanups of the body need
+   no room here: their state is in that frame (docs/gc-design.md §9.1). */
 struct TccCoPool {
     /* Top-level coroutines started with 'co': they belong to no scope and no
        parent, so the scheduler below owns them from creation to completion. */
@@ -2769,24 +2648,21 @@ static unsigned long tcc_co_align(unsigned long n)
    creating a task is one allocation and freeing it is one free. */
 void *__c6_co_new(const TccCoDesc *d)
 {
-    unsigned long prefix = d->size, defers, frames, total;
+    unsigned long prefix = d->size, frames, total;
     char *p, *q;
     TccCoTask *t;
 
     if (prefix < sizeof(TccCoTask))
         prefix = sizeof(TccCoTask);
-    defers = (unsigned long)d->defer_max * sizeof(TccDeferRec);
     frames = tcc_co_align(d->frame_size);
-    total = prefix + defers + 16 + frames + 16;
+    total = prefix + 16 + frames + 16;
     p = (char *)tcc_th_alloc(total);
     t = (TccCoTask *)(void *)p;
     t->desc = (void *)d;
     t->state = C6_CO_STATE_NEW;
     t->kind = C6_CO_KIND_DONE;
-    t->defer_max = d->defer_max > 0 ? d->defer_max : 0;
     q = p + prefix;
-    t->defer_arena = t->defer_max ? (void *)q : (void *)0;
-    q = (char *)(((unsigned long)(q + defers) + 15) & ~(unsigned long)15);
+    q = (char *)(((unsigned long)q + 15) & ~(unsigned long)15);
     if (frames)
         /* the body runs with its frame pointer here: no copy, no move */
         t->frame = (void *)(q + frames);
@@ -2805,17 +2681,15 @@ int __c6_co_await(void *child, void *self)
     return c->state == C6_CO_STATE_DONE ? 0 : 1;
 }
 
-/* Park the defer records of this frame and the error slot, then record where
-   the body has to resume.  The native frame is only parked here when the back
-   end did not put it in the task in the first place. */
-void __c6_co_suspend(void *self, int kind, int state,
-                     char *base, int size, int defer_base)
+/* Park the error slot and record where the body has to resume.  The native
+   frame is only parked here when the back end did not put it in the task in
+   the first place; the deferred cleanups of the body always live in that
+   frame, so they need no parking at all. */
+void __c6_co_suspend(void *self, int kind, int state, char *base, int size)
 {
     TccThCtx *th = tcc_th();
     TccCoTask *t = (TccCoTask *)self;
     const TccCoDesc *d = (const TccCoDesc *)t->desc;
-    TccDeferRec *parked = (TccDeferRec *)t->defer_arena;
-    int i, n;
 
     if (!d->frame_size) {
         /* this back end moves the frame: keep the used part of it */
@@ -2829,20 +2703,6 @@ void __c6_co_suspend(void *self, int kind, int state,
     t->state = state;
     t->kind = kind;
 
-    t->defer_base = defer_base;
-    n = th->dsp - defer_base;
-    if (n < 0)
-        n = 0;
-    if (n > t->defer_max)
-        n = t->defer_max;
-    for (i = 0; i < n; i++)
-        parked[i] = tcc_th_dstack(th)[defer_base + i];
-    t->defer_cap = n;
-    t->defer_csp = th->dcsp;
-    if (th->dsp > defer_base)
-        th->dsp = defer_base;
-    th->dcsp = 0;
-
     t->err_flag = th->err_flag;
     t->err_id = th->err_id;
     t->err_msg = th->err_msg;
@@ -2851,23 +2711,17 @@ void __c6_co_suspend(void *self, int kind, int state,
     th->err_msg = 0;
 }
 
-/* Re-establish the task's defer and error state (the generated prologue calls
-   this before it jumps to the resume point) and, for a back end that parks
-   the native frame, put that frame back where it belongs. */
+/* Re-establish the task's error slot (the generated prologue calls this
+   before it jumps to the resume point) and, for a back end that parks the
+   native frame, put that frame back where it belongs. */
 void __c6_co_restore(void *self, char *base)
 {
     TccThCtx *th = tcc_th();
     TccCoTask *t = (TccCoTask *)self;
     const TccCoDesc *d = (const TccCoDesc *)t->desc;
-    TccDeferRec *parked = (TccDeferRec *)t->defer_arena;
-    int i, n = t->defer_cap;
 
     if (!d->frame_size)
         tcc_co_copy(base - t->frame_size, t->frame, t->frame_size);
-    for (i = 0; i < n; i++)
-        tcc_th_dstack(th)[t->defer_base + i] = parked[i];
-    th->dsp = t->defer_base + n;
-    th->dcsp = t->defer_csp;
     th->err_flag = t->err_flag;
     th->err_id = t->err_id;
     th->err_msg = t->err_msg;
@@ -3015,8 +2869,6 @@ static int tcc_co_step_once(TccCoTask *t)
 {
     TccCoTask *leaf = tcc_co_leaf(t);
     TccCoDesc *d;
-    TccThCtx *th = tcc_th();
-    int dsp = th->dsp, dcsp = th->dcsp;
     int k;
 
     if (leaf->state == C6_CO_STATE_DONE)
@@ -3031,15 +2883,6 @@ static int tcc_co_step_once(TccCoTask *t)
        task ignores it, one that parks its native frame gets a harmless value */
     k = d->entry(leaf, leaf->frame);
     leaf->busy--;
-    /* A body keeps its 'defer' records in the task: suspending parks them and
-       saves the thread's stack pointers there (__c6_co_suspend), and resuming
-       puts them back (__c6_co_restore).  What the body left behind belongs to
-       the task, not to whoever called it -- if the task is left parked, the
-       caller's own 'defer' and task cleanups would otherwise see a reset
-       context stack and silently skip themselves (the thread pointers are a
-       stack discipline), so save and restore them around the call. */
-    th->dsp = dsp;
-    th->dcsp = dcsp;
     switch (k) {
     case C6_CO_KIND_DONE:
     case C6_CO_KIND_ERR:
@@ -3237,8 +3080,9 @@ int __c6_co_wait(void *self)
     return ((TccCoTask *)self)->kind == C6_CO_KIND_ERR ? -1 : 0;
 }
 
-/* Release a task and everything it owns.  A still-suspended body is dropped
-   without running its remaining 'defer' statements. */
+/* Release a task and everything it owns.  A still-suspended body is resumed
+   once with kind ABORT so that it runs its remaining cleanup sites (the armed
+   bits and the dispatcher live in the task's frame). */
 void __c6_co_abort(void *self)
 {
     TccCoTask *t = (TccCoTask *)self;
