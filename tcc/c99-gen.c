@@ -1689,10 +1689,19 @@ static void c99_call_cast(char *buf, int size, CType *ftype)
     Sym *fs = ftype->ref;
     CType *ret = &fs->type;
     char rb[C99_TB], ps[C99_TB], rest[C99_TB];
+    CType srt;
+    int sal, srs;
     int ret_struct = (ret->t & VT_BTYPE) == VT_STRUCT;
+    int small_sret = ret_struct && c99_small_sret(ret, &srt, &sal, &srs);
     int n = 0;
 
-    if (ret_struct) {
+    if (small_sret) {
+        /* a small integer-class struct comes back in a register: no hidden
+           pointer, and the call has to be cast to that very type, exactly
+           like the direct call (gfunc_call()/gfunc_prolog() agree) */
+        c99_type(rb, sizeof rb, &srt);
+        c99_params(ps, sizeof ps, fs);
+    } else if (ret_struct) {
         snprintf(rb, sizeof rb, "void");
         n += snprintf(ps, sizeof ps, "void *");
         if (fs->next) {
