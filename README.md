@@ -352,7 +352,8 @@ int main(void)
 
 ### 省略 struct / union / enum
 
-tag 本身就是类型名，不用再写 `struct`（`union` / `enum` 同样）：
+tag 本身就是类型名，不用再写 `struct`（`union` / `enum` 同样）。`new` 后面
+也写标签本身：`new Pair` 可以，`new struct Pair` 目前会编过但运行时崩，别写。
 
 ```c
 struct Vec { int x, y; };
@@ -1207,6 +1208,32 @@ join 这里有个坑值得记下来：「还活着」的标志不能直接靠 `C
 `-static` 不是必须的，但少了它 ELF 里会留一个 `PT_INTERP`（内核会先跑
 `ld.so`）；加上之后这两个产物既没有 `DT_NEEDED` 也没有 `PT_INTERP`，是一个
 纯粹的静态 ELF —— 换到别处跑时只要有人能加载它就行。
+
+#### 连操作系统都没有的时候
+
+`freestanding` 在 C 标准里指的是「不要求有 C 库」——启动、结束、输出由实现
+自己定；它**允许**没有操作系统，但不等于必须裸机。上面两个例子就还是站在内核
+的 syscall 上（`write` / `exit` / `mmap` / `clone` / `futex`）。
+
+真裸机上要提供的只有「程序自己想做的事」，运行时这边可以一个外部符号都没有
+（`nm -u libtcc1.o` 里只剩 weak 的 `calloc` / `free` / `realloc` / `select` /
+`pthread_*`）：
+
+| 平时由谁提供 | 裸机上 |
+|---|---|
+| `calloc` / `free` / `realloc` | 不给也行：`libtcc1` 里的静态 arena 顶上（`.bss`，`-DC6_HEAP_SIZE=` 可调）；要自己的分配器就写一个 bump |
+| `memcpy` / `memset` / `memmove` | `libtcc1` 自带的 weak 版本，什么都不用做 |
+| `pthread_*` | 不给也行：单线程、一个静态状态块，`go` / `thread` 报启动失败；要并发就把板子上的线程 API 包成那 8 个名字 |
+| `select` | 只有 `async` / `c6_io` 用；不用 async 就永远碰不到 |
+| 输出、退出、复位 | 程序自己的事：把 `write` 换成 UART/MMIO 写、`exit` 换成 `while (1)`，入口符号交给链接脚本和向量表 |
+
+[examples/freestanding_noos.c](examples/freestanding_noos.c)（`make fstest-noos`）
+就是这么一份：里面**一个 syscall 都没有**，插值、格式说明、`defer`、`err` +
+`catch`、`@T` 全在内存里做完，最后用 `ud2`（全过，退出码 132）或往 0 地址写
+（某个断言失败）报信 —— 这两个「报信」在裸机上就是你的异常向量。
+
+注意：编译器自己还是得在别的地方跑（宿主上的 `tcc` 产出静态 ELF，再交给引导
+程序/烧写工具）；`tcc -run` 那套 JIT 与裸机无关。
 
 C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
 `<pthread.h>`）。

@@ -100,7 +100,18 @@ fstest-go: build
 	    examples/freestanding_go.c build/freestanding_pthread.o tcc/libtcc1.a
 	./build/freestanding_go
 
-test-all: selftest test c6selfcheck fstest fstest-go
+# 完全没有操作系统：程序里一个 syscall 都没有，靠 ud2 / 踩空报结果
+fstest-noos: build
+	./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_noos \
+	    examples/freestanding_noos.c tcc/libtcc1.a
+	@./build/freestanding_noos 2>/dev/null; st=$$?; \
+	 if [ $$st -eq 132 ]; then \
+	     echo "fstest-noos: ok（全部断言通过，最后 ud2 陷阱）"; \
+	 else \
+	     echo "fstest-noos: FAILED（status $$st，失败位掩码见程序）"; exit 1; \
+	 fi
+
+test-all: selftest test c6selfcheck fstest fstest-go fstest-noos
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
