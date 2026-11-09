@@ -5,7 +5,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 
 | 扩展 | 作用 |
 |---|---|
-| `defer { ... }` | 作用域/函数退出时逆序执行清理代码 |
+| `defer { ... }` | 作用域/函数退出时逆序执行清理代码（注册状态在函数帧里，不需要 TLS） |
 | `errdefer { ... }` | 仅在错误路径上执行的 `defer` |
 | `err(code, "msg")` | 设置错误槽、就地展开清理并直接返回 |
 | `func() T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 |
@@ -112,7 +112,7 @@ int main(void)
 | 写法 | 行为 |
 |---|---|
 | `err(code, msg)` | 写入错误槽（`flag=1`），逆序执行本帧的 `errdefer` 与 `defer`，然后**直接返回**（返回值是哨兵 `-1`） |
-| `defer stmt;` | 任何离开作用域的路径都执行（正常 `return`、`break`、`continue`、`goto`） |
+| `defer stmt;` | 任何离开作用域的路径都执行（正常 `return`、`break`、`continue`、`goto`、`err`） |
 | `errdefer stmt;` | 仅在错误路径（本帧执行了 `err`）执行，正常返回时跳过 |
 
 配套的运行时接口（`libtcc1` 提供，直接在源码里声明即可）：
@@ -133,6 +133,34 @@ int main(void)
 - `err` 会离开**整个函数帧**（循环/嵌套块里的 `defer` 都会执行），无法只退出内层块；
 - `err` 不能出现在 `defer`/`errdefer` 体内（会编译报错）；
 - 返回类型为 `void` 的函数里 `err` 直接返回，不产生哨兵值。
+
+### `defer` 的运行期状态住在函数帧里
+
+一个清理点（cleanup site）是**编译期的常量**：编号、所在作用域的深度、
+是 `defer` 还是 `errdefer`、清理体的标签。运行期只有两样东西会变，而它们
+都是**本帧的局部变量**：
+
+- 哪些清理点已经注册——帧里的一块位图，函数入口清零；
+- 正在服务哪个清理请求——两个 `int`（目标作用域深度 + 恢复点号），只在
+  派发清理的时候写。
+
+于是：
+
+- **不需要任何线程级 / TLS 状态**：ISR 里、`go` 起来的线程里、协程
+  （`async`）里、递归的每一帧都按同一套规则跑，互不干扰；
+- 递归深度没有上限（旧实现的每线程记录栈上限 8192 条，超过就悄悄丢）；
+- 同一个作用域实例里同一个清理点**最多跑一次**（位是幂等的），所以
+  `goto` 回到块入口再经过一遍 `defer` 语句不会重复注册；
+- 循环体里的 `defer` 是“每次迭代一个作用域实例”，所以每轮各跑一次；
+- 向后跳转的 `goto`（标签已经定义）由 `goto` 语句自己发起清理请求，深度
+  就是那个标签的作用域深度；向前跳转的 `goto` 落在标签处派发，不多花代码；
+- 编译期上限：一个函数最多 **128 个清理点**（超了报错，叫你把函数拆小），
+  清理体最多嵌套 **8 层**。
+- 帧开销：`-std=c6` 下每个函数帧固定多 4 × `int`（位图，序言里清零——单趟
+  编译器没法在序言处知道后面会不会出现清理点）；有清理点的函数再加 2 ×
+  `int` 的派发状态，清理体每嵌套一层再加 2 × `int`。派发器本身也只在有清理
+  点时才生成。旧实现在每个函数开头调一次 `__tcc_defer_func_enter()`（一次
+  调用 + `tcc_th()`），现在换成 4 条清零 store。
 
 ### `T!error` / `try` / `catch`
 
@@ -820,11 +848,12 @@ int main(void)
 }
 ```
 
-`async` 和无栈协程的区别在于**没有自己的栈**：函数体仍然跑在调用方的
-栈上，`await` 处把已经用到的帧、defer 记录和错误槽存进任务，然后
-`return` 回驱动方；恢复时把帧原样拷回同样的偏移，再跳到那个恢复点。
-所以局部变量、`defer`、`err` 状态在挂起前后完全不变，也不需要上下文
-切换。
+`async` 和无栈协程的区别在于**没有自己的栈**：任务块一次分配出
+`struct f_task` 加函数帧，函数体直接在这块内存上跑，`await` 只把错误槽
+存进任务就 `return` 回驱动方；恢复时把错误槽放回去，再跳到那个恢复点。
+帧不搬也不拷，所以局部变量和 `defer` 的注册状态（都在帧里）在挂起前后
+完全不变，也不需要上下文切换。（`-c67` 目标还没有 frame-in-task 后端，
+它仍然把帧拷进任务块，但 `defer` 状态跟着帧一起走，语义一样。）
 
 速查：
 
@@ -867,7 +896,7 @@ int main(void)
   `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
 - `c6_io` 的 `fd` 必须在 `[0, 1024)` 内；越界的任务按失败回收，
   `__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败；
-- 每个任务一块内存：`struct NAME_task` + parked defer 记录 + 原生帧，按需
+- 每个任务一块内存：`struct NAME_task` + 原生帧（帧里带着自己的清理状态），按需
   `malloc`（没有固定池、没有 4 KiB 帧上限、没有任务数上限）。后端把帧寄存器
   直接指向这块内存，所以挂起**不拷贝**任何东西，`&local` 跨过 `await` 仍然
   有效；`weak` 局部/形参/返回值因此在 `async` 里也合法。`__c6_co_wait` 和
@@ -943,9 +972,10 @@ int n = (int)h->value();  /* 线程函数的返回值（整数或指针） */
   `join()` 幂等，`h->done()` 不阻塞，`h->value()` 取被调函数的返回值，
   整数或指针）。句柄是**启动者私有**的，不要跨线程传；作用域退出时自动
   归还，没 `join` 也不漏 —— 线程本身仍旧由启动者回收；
-- 每个线程有自己的 defer 栈、错误槽和协程池（`pthread_key`，不是
-  `__thread`，`-run` 不支持 TLS），所以线程里照常写 `defer`、`err`、
-  `async`/`await`、甚至再 `go`；
+- 每个线程有自己的错误槽、插值构造器和协程池（`pthread_key`，不是
+  `__thread`，`-run` 不支持 TLS）。`defer` 不需要它们：清理状态在函数帧里，
+  线程里、ISR 里照常写；`err` / `f".."` / `async` 才要那块每线程状态，
+  线程里也一样能写，还能再 `go`；
 - 运行时只用 `pthread_create` / `pthread_join` / `pthread_key_*`；
   glibc 2.34 起这些都在 libc 里，老系统需要 `-lpthread`；
 - 这些符号是 **weak** 的：链接里没有 pthread 时（无 libc 的 freestanding
@@ -1172,7 +1202,7 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 
 ### 无 libc（freestanding）
 
-`libtcc1` 里的运行时（插值构造器、`defer`、`err`/`catch`、托管引用、协程池）
+`libtcc1` 里的运行时（插值构造器、`err`/`catch`、托管引用、协程池）
 本来要 `calloc` / `free` / `realloc` / `memset` / `memcpy` / `memmove` /
 `pthread_*` / `select`。这些引用现在全是 **weak** 的，所以没有 libc 也能链接：
 
@@ -1200,16 +1230,17 @@ weak 的，程序给了就切回“每线程一块状态”：
 
 | 入口 | 干什么 |
 |---|---|
-| `pthread_once` / `pthread_key_create` / `pthread_getspecific` / `pthread_setspecific` | 每线程一块状态（defer 栈、错误槽、插值构造器、协程池）。`key_create` 的析构函数务必在线程退出时调用，否则每个线程漏约 100 KB |
+| `pthread_once` / `pthread_key_create` / `pthread_getspecific` / `pthread_setspecific` | 每线程一块状态（错误槽、插值构造器、协程池）。只有用到 `err` / `try` / `catch`、`f".."` 或协程的函数才去取它，纯 `defer` 的代码不碰。`key_create` 的析构函数务必在线程退出时调用，否则每个线程漏约 100 KB |
 | `pthread_create` / `pthread_join` | `go` 的启动与回收 |
 | `pthread_self` / `pthread_equal` | `thread h = go f(...)` 用它判断“自己 join 自己” |
 
 三个坑：
 
-- **这一层必须用普通 C 或汇编编译，不能带 `-std=c6`**：每个 c6 函数开头都有
-  `__tcc_defer_func_enter()`，它要 `tcc_th()`，而 `tcc_th()` 正要去调
-  `pthread_once` / `pthread_key_create` —— 用 c6 写就是 bootstrap 里递归自己，
-  栈一冲就段错误；
+- **这一层必须用普通 C 或汇编编译，不能带 `-std=c6`**：用了 `err` /
+  `try` / `catch`、`f".."` 或协程的 c6 函数会去取 `tcc_th()`，而 `tcc_th()`
+  正要去调 `pthread_once` / `pthread_key_create` —— 用 c6 写就是 bootstrap 里
+  递归自己，栈一冲就段错误。纯 `defer` 的函数现在不碰 `tcc_th()`（状态在
+  帧里），但这一层还是照旧用普通 C 写更稳妥；
 - 一旦真的多线程，`calloc` / `free` 必须是线程安全的：`libtcc1` 里那个静态
   arena 只在单线程下安全，这时请由程序提供 `calloc` / `free`；
 - 线程里用 `async` / `c6_io` 还需要 `select`。
@@ -1553,9 +1584,10 @@ make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2
 
 - 设计文档：[docs/plan.md](docs/plan.md)（第 11 节为各阶段实现状态与限制）。
 - 语法规范：[docs/grammar.md](docs/grammar.md)（EBNF 增量语法、静态约束与重写规则）。
-- 运行时状态（defer 记录栈、错误槽、协程池、子线程链表）是**每线程**一份，
+- 运行时状态（错误槽、插值构造器、协程池、子线程链表）是**每线程**一份，
   通过 `pthread_key` 查找而不是 `__thread`：`tcc -run` 不支持 TLS。`go`
-  出去的线程拿到自己的一份，所以线程里可以照常写 `defer`/`err`/`co`。
+  出去的线程拿到自己的一份，所以线程里可以照常写 `err`/`co`。`defer` 的
+  清理状态不在其中——它在函数帧里，所以线程里、ISR 里都一样。
 - 方法必须在调用点之前声明或定义（TCC 单趟编译的固有限制）；接口一致性检查发生在
   第一次转换点，因此方法也要在转换点之前可见。
 - 跨 TU：头文件里用 `package NAME { ... }` 声明 API；接口的方法声明放头文件里，

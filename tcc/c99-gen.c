@@ -812,8 +812,6 @@ static int c99_rt_int_ret(const char *name)
    declaration of their own.  Only exact matches: the front-end also
    synthesizes __c6_sp_* / __c6_desc_* symbols that are ordinary user code */
 static const char * const c99_runtime_names[] = {
-    "__tcc_defer_func_enter", "__tcc_defer_push", "__tcc_defer_begin_scope",
-    "__tcc_defer_begin_func", "__tcc_defer_step",
     "__tcc_err_clear", "__tcc_err_set", "__tcc_err_set_copy",
     "__tcc_err_flag_peek",
     "__tcc_err_flag_get", "__tcc_err_id_get", "__tcc_err_msg_get",

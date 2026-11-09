@@ -12,7 +12,8 @@
  *   - 局部数组不再受 4 KiB 上限约束（第 2 组），
  *   - 'weak'（指向槽本身的指针）在 async 里可以使用（第 3 组），
  *   - 任务数不再受固定池大小限制（第 4 组），
- *   - defer 体在恢复之后写的还是同一批局部（第 5 组）。
+ *   - defer 体在恢复之后写的还是同一批局部（第 5 组），
+ *   - 块作用域的 defer 在恢复之后退出块时照样执行（第 8 组）。
  */
 /* 只用到这几个 libc 函数（不给 libtcc1 添依赖，也不 include 头文件，
    这样交叉目标至少能编译这个文件） */
@@ -257,4 +258,41 @@ test "挂起的任务被销毁时回卷" {
         err(65, "回卷没有跑 defer，或帧里的局部量不对");
     if ((int)__c6_gc_live() != live0)
         err(66, "回卷没有把托管引用还回来");
+}
+
+/* ---- 8. 块作用域的 defer 跨过 await ---- */
+/* 注册发生在挂起之前，块的退出发生在恢复之后：位图在任务帧里，所以这次
+   清理请求一样能找到它。 */
+static int g_scope_log = 0;
+
+async int scope_body(int fd)
+{
+    int x = 1;
+
+    {
+        defer {
+            g_scope_log = g_scope_log * 10 + x;   /* 读块退出时的 x */
+        }
+        x = 2;
+        await c6_io(fd, 2);            /* 挂起期间这个位留在任务的帧里 */
+        x = 3;
+    }                                  /* 恢复之后才退出这个块 */
+    return x + 100;
+}
+
+test "块作用域的 defer 越过 await" {
+    int fds[2] = {-1, -1};
+    struct scope_body_task *t = NULL;
+
+    if (pipe(fds) != 0)
+        err(70, "pipe 失败");
+    g_scope_log = 0;
+    t = scope_body(fds[1]);
+    if (__c6_co_wait(t) != 0)
+        err(71, "__c6_co_wait 失败");
+    if (t->val != 103)
+        err(72, "返回值不对");
+    if (g_scope_log != 3)
+        err(73, "恢复之后块退出没有跑 defer，或读到的局部量不对");
+    __c6_co_destroy(t);
 }

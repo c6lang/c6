@@ -138,14 +138,28 @@ static struct scope {
 /* ------------------------------------------------------------------------- */
 /* c6 extensions: defer / errdefer state (per function)                  */
 
+/* A cleanup site ('defer'/'errdefer' statement, or one of the synthetic sites
+   the compiler adds for a managed local, a thread handle and the end-of-main
+   thread join) is a *static* property of the function: its id, the scope
+   depth it belongs to, its kind and the label of the body the dispatcher
+   jumps to.  Everything that changes while the function runs -- which site is
+   still armed, which cleanup request is being served -- lives in the *frame*
+   of that very invocation.  A cleanup therefore needs no per-thread
+   bookkeeping at all: it runs the same in an ISR, in a resumed coroutine (the
+   frame lives in the task) and in a plain nested call.  See docs/grammar.md
+   (R6, D1-D6) and docs/gc-design.md §9.1. */
+#define C6_DEFER_WORDS  4               /* 4 * 32 = 128 sites per function */
+#define C6_DEFER_LEVELS 8               /* nested cleanup dispatches */
 typedef struct C6DeferSite {
     int id;
+    int depth;          /* scope depth the site belongs to (0: whole frame) */
+    int kind;           /* 0: defer, 1: errdefer */
     Sym *label;
-    struct C6DeferSite *next;
 } C6DeferSite;
 
 typedef struct C6DeferResume {
     int id;
+    int level;          /* nesting level of the request (see c6_defer_begin) */
     Sym *label;
     struct C6DeferResume *next;
 } C6DeferResume;
@@ -156,11 +170,17 @@ static struct {
     int body_depth;   /* > 0 while compiling a deferred statement body */
     int next_site;
     int next_resume;
-    int sp0_off;      /* local slot holding this frame's defer stack base */
-    int step_off;     /* local slot for __tcc_defer_step() result */
+    int nsites;
+    int arm_off[C6_DEFER_WORDS];    /* armed bitmap, one 'int' frame local each */
+    int dtgt_off;     /* depth filter of the request being served */
+    int dallow_off;   /* non-zero: errdefer sites run too (error path) */
+    int dres_off;     /* resume id of the request being served */
+    int disp_ready;   /* the three locals above have been allocated */
+    int dtgt_save[C6_DEFER_LEVELS]; /* enclosing request, saved per level */
+    int dallow_save[C6_DEFER_LEVELS];
+    int dres_save[C6_DEFER_LEVELS];
     int disp_jmps;    /* pending jumps to the function dispatcher */
-    C6DeferSite *sites;
-    C6DeferSite **sites_tail;
+    C6DeferSite **sites;            /* by id: sites[0] is site 1 */
     C6DeferResume *resumes;
     C6DeferResume **resumes_tail;
 } defer_state = {0};
@@ -13279,20 +13299,41 @@ static void c6_def_label(Sym *s)
     s->cleanupstate = cur_scope->cl.s;
 }
 
-static void c6_add_site(int id, Sym *label)
+/* Take SIZE bytes of frame space, aligned to ALIGN.  'loc' is the frame high
+   water mark of the whole function (prev_scope() does not roll it back), so a
+   slot taken here stays private to this invocation for as long as it lives:
+   across blocks, across a coroutine suspend (the frame is in the task) and,
+   for a recursive function, separately in every frame. */
+static int c6_local_alloc(int size, int align)
+{
+    loc = (loc - size) & -align;
+    return loc;
+}
+
+/* store the value on top of the stack into the 'int' frame local at OFF */
+static void c6_store_int(int off)
+{
+    vset(&int_type, VT_LOCAL | VT_LVAL, off);
+    vswap();
+    vstore();
+    vpop();
+}
+
+static void c6_add_site(int id, int depth, int kind, Sym *label)
 {
     C6DeferSite *s = tcc_malloc(sizeof *s);
     s->id = id;
+    s->depth = depth;
+    s->kind = kind;
     s->label = label;
-    s->next = NULL;
-    *defer_state.sites_tail = s;
-    defer_state.sites_tail = &s->next;
+    dynarray_add(&defer_state.sites, &defer_state.nsites, s);
 }
 
-static void c6_add_resume(int id, Sym *label)
+static void c6_add_resume(int id, int level, Sym *label)
 {
     C6DeferResume *r = tcc_malloc(sizeof *r);
     r->id = id;
+    r->level = level;
     r->label = label;
     r->next = NULL;
     *defer_state.resumes_tail = r;
@@ -13301,69 +13342,146 @@ static void c6_add_resume(int id, Sym *label)
 
 static void c6_free_lists(void)
 {
-    C6DeferSite *s = 0, *sn = 0;
     C6DeferResume *r = 0, *rn = 0;
-    for (s = defer_state.sites; s; s = sn) {
-        sn = s->next;
-        tcc_free(s);
-    }
+    dynarray_reset(&defer_state.sites, &defer_state.nsites);
     for (r = defer_state.resumes; r; r = rn) {
         rn = r->next;
         tcc_free(r);
     }
-    defer_state.sites = NULL;
-    defer_state.sites_tail = &defer_state.sites;
     defer_state.resumes = NULL;
     defer_state.resumes_tail = &defer_state.resumes;
 }
 
+/* the sites of a function are numbered 1..N and each one owns one bit of the
+   armed bitmap, so the count has a compile time bound */
+static int c6_defer_new_site(void)
+{
+    if (++defer_state.next_site > C6_DEFER_WORDS * 32)
+        tcc_error("a function cannot have more than %d cleanup sites: "
+                  "split it into smaller functions", C6_DEFER_WORDS * 32);
+    return defer_state.next_site;
+}
+
+/* the two locals the dispatcher reads: the depth filter of the request being
+   served and its resume id */
+static void c6_defer_disp_alloc(void)
+{
+    if (defer_state.disp_ready)
+        return;
+    defer_state.dtgt_off = c6_local_alloc(sizeof(int), 4);
+    defer_state.dres_off = c6_local_alloc(sizeof(int), 4);
+    defer_state.disp_ready = 1;
+}
+
+/* the state of the enclosing request, kept while a nested one runs */
+static void c6_defer_level_alloc(int lvl)
+{
+    if (defer_state.dtgt_save[lvl])
+        return;
+    defer_state.dtgt_save[lvl] = c6_local_alloc(sizeof(int), 4);
+    defer_state.dres_save[lvl] = c6_local_alloc(sizeof(int), 4);
+}
+
+/* 'armed[id/32] |= bit(id)': the site now waits for its scope to end */
+static void c6_defer_arm(int id)
+{
+    int w = (id - 1) / 32;
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.arm_off[w]);
+    vpushi((int)(1u << ((id - 1) % 32)));
+    gen_op('|');
+    c6_store_int(defer_state.arm_off[w]);
+}
+
+/* 'armed[id/32] &= ~bit(id)': the site has been dealt with */
+static void c6_defer_disarm(int id)
+{
+    int w = (id - 1) / 32;
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.arm_off[w]);
+    vpushi((int)~(1u << ((id - 1) % 32)));
+    gen_op('&');
+    c6_store_int(defer_state.arm_off[w]);
+}
+
+/* extend the jump chain T with a jump taken when site ID is not armed */
+static int c6_defer_test(int id, int t)
+{
+    int w = (id - 1) / 32;
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.arm_off[w]);
+    vpushi((int)(1u << ((id - 1) % 32)));
+    gen_op('&');
+    vpushi(0);
+    gen_op(TOK_NE);
+    return gvtst(1, t);
+}
+
 static void c6_defer_func_init(void)
 {
-    int align = PTR_SIZE;
+    int i = 0;
     defer_state.enabled = 1;
     defer_state.has_sites = 0;
     defer_state.body_depth = 0;
     defer_state.next_site = 0;
     defer_state.next_resume = 0;
     defer_state.disp_jmps = 0;
+    defer_state.disp_ready = 0;
+    for (i = 0; i < C6_DEFER_LEVELS; i++) {
+        defer_state.dtgt_save[i] = 0;
+        defer_state.dres_save[i] = 0;
+    }
     c6_free_lists();
-    loc = (loc - (int)sizeof(int)) & -align;
-    defer_state.sp0_off = loc;
-    loc = (loc - (int)sizeof(int)) & -align;
-    defer_state.step_off = loc;
-    /* __tcc_defer_func_enter(&sp0); */
-    vpush_helper_func(tok_alloc_const("__tcc_defer_func_enter"));
-    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
-    gaddrof();
-    mk_pointer(&vtop->type);
-    gfunc_call(1);
+    /* The armed bits are part of this frame: they start clear, they belong to
+       this invocation only, and no runtime has to be told about them.  An ISR
+       that interrupts the function cannot see them, a coroutine that is
+       resumed finds its own (the frame is in the task), and a recursive call
+       has its own.  A single pass compiler cannot know at the prologue whether
+       a cleanup site will show up later, so these four words (and the stores
+       that clear them) are the fixed entry cost of every c6 function -- still
+       far cheaper than the runtime call the per-thread record stack needed. */
+    for (i = 0; i < C6_DEFER_WORDS; i++) {
+        defer_state.arm_off[i] = c6_local_alloc(sizeof(int), 4);
+        vpushi(0);
+        c6_store_int(defer_state.arm_off[i]);
+    }
 }
 
-/* emit "begin cleanup" (mode 0: scopes above DEPTH, mode 1: whole function) */
+/* Start a cleanup request.  MODE 0 serves the sites of the scopes above DEPTH,
+   mode 1 every site of the frame (normal exit), mode 2 every site of the
+   frame including the 'errdefer' ones (error exit).  The request is served by
+   the function wide dispatcher emitted in c6_defer_func_end(); everything it
+   needs is written into this frame, so a nested request -- a scope exit
+   inside a cleanup body -- only saves and restores the enclosing one. */
 static void c6_defer_begin(int mode, int depth)
 {
-    int rid = 0;
+    int rid = 0, lvl = 0;
     Sym *rl = 0;
+
     if (!defer_state.enabled || !defer_state.has_sites || nocode_wanted)
         return;
+    lvl = defer_state.body_depth;
+    if (lvl >= C6_DEFER_LEVELS)
+        tcc_error("'defer' bodies nested too deeply");
+    c6_defer_disp_alloc();
     rid = ++defer_state.next_resume;
     rl = c6_new_label("drs");
-    /* third argument: this frame's defer stack base */
-    if (mode == 0) {
-        vpush_helper_func(tok_alloc_const("__tcc_defer_begin_scope"));
-        vpushi(depth);
-        vpushi(rid);
-    } else {
-        vpush_helper_func(tok_alloc_const("__tcc_defer_begin_func"));
-        vpushi(mode);
-        vpushi(rid);
+    if (lvl > 0) {
+        /* a cleanup body is reached from the shared dispatcher and may start
+           requests of its own: keep the enclosing one for the return */
+        c6_defer_level_alloc(lvl);
+        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dtgt_off);
+        c6_store_int(defer_state.dtgt_save[lvl]);
+        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dres_off);
+        c6_store_int(defer_state.dres_save[lvl]);
     }
-    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
-    gfunc_call(3);
+    /* the filter is '< site depth'; a negative one passes every depth and,
+       as -2, also lets the 'errdefer' sites run */
+    vpushi(mode == 0 ? depth : -mode);
+    c6_store_int(defer_state.dtgt_off);
+    vpushi(rid);
+    c6_store_int(defer_state.dres_off);
     defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
     /* resume point: execution continues right after the cleanup run */
     c6_def_label(rl);
-    c6_add_resume(rid, rl);
+    c6_add_resume(rid, lvl, rl);
 }
 
 /* parse "defer STATEMENT" / "errdefer STATEMENT": register a cleanup site,
@@ -13377,16 +13495,12 @@ static void c6_defer_parse(int kind)
 
     defer_state.body_depth++;
     if (!nocode_wanted) {
-        id = ++defer_state.next_site;
+        id = c6_defer_new_site();
         l = c6_new_label("dcl");
-        vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
-        vpushi(id);
-        vpushi(local_scope);
-        vpushi(kind);
-        gfunc_call(3);
+        c6_defer_arm(id);           /* this scope now owns one cleanup */
         skip = gjmp(0);
         c6_def_label(l);
-        c6_add_site(id, l);
+        c6_add_site(id, local_scope, kind, l);
         defer_state.has_sites = 1;
     }
     /* the body is only reached at scope exit, long after the statements that
@@ -13556,12 +13670,22 @@ static void c6_test_parse(void)
     gen_function(sym);
 }
 
-/* emit the per-function cleanup dispatcher */
+/* Emit the cleanup dispatcher of this function.  It is reached from every
+   exit path that has cleanups to run, and from every cleanup body that
+   finishes; the work to do is described by this frame:
+
+     dtgt  the depth filter of the request: a site runs when 'dtgt < depth',
+           a negative filter therefore passes every site of the frame
+     dres  the resume id of the request, i.e. where to go when it is done
+
+   A request is served site by site, highest site id first.  Inside one scope
+   instance the sites are registered in source order, so this is exactly the
+   'last registered runs first' order the old defer stack gave.  No site can
+   run twice: its bit is cleared before its body is entered. */
 static void c6_defer_func_end(void)
 {
-    C6DeferSite *s = 0;
     C6DeferResume *r = 0;
-    int fall = 0;
+    int fall = 0, i = 0;
 
     if (!defer_state.enabled)
         return;
@@ -13571,33 +13695,48 @@ static void c6_defer_func_end(void)
         defer_state.enabled = 0;
         return;
     }
+    c6_defer_disp_alloc();
     CODE_ON();
     fall = gjmp(0);
     gsym(defer_state.disp_jmps);
     defer_state.disp_jmps = 0;
-    /* __tcc_defer_step(&answer); */
-    vpush_helper_func(tok_alloc_const("__tcc_defer_step"));
-    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
-    gaddrof();
-    mk_pointer(&vtop->type);
-    gfunc_call(1);
-    for (s = defer_state.sites; s; s = s->next) {
-        int j = 0;
-        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
-        gv(RC_INT);
-        vpushi(s->id);
-        gen_op(TOK_EQ);
-        j = gvtst(1, 0);
+    for (i = defer_state.nsites - 1; i >= 0; i--) {
+        C6DeferSite *s = defer_state.sites[i];
+        int skip = 0;
+        skip = c6_defer_test(s->id, skip);
+        /* the request only serves sites deeper than its filter */
+        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dtgt_off);
+        vpushi(s->depth);
+        gen_op(TOK_LT);
+        skip = gvtst(1, skip);
+        /* the site is dealt with either way: run it, or drop it (an
+           'errdefer' whose scope is left on the normal path) */
+        c6_defer_disarm(s->id);
+        if (s->kind) {
+            vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dtgt_off);
+            vpushi(-2);
+            gen_op(TOK_EQ);
+            skip = gvtst(1, skip);
+        }
         gjmp_addr(s->label->jind);
-        gsym(j);
+        gsym(skip);
     }
+    /* nothing left for this request: give the enclosing one its state back
+       and continue right after the point that asked for the cleanups */
     for (r = defer_state.resumes; r; r = r->next) {
         int j = 0;
-        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.step_off);
-        gv(RC_INT);
-        vpushi(-r->id);
+        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dres_off);
+        vpushi(r->id);
         gen_op(TOK_EQ);
         j = gvtst(1, 0);
+        if (r->level > 0) {
+            vset(&int_type, VT_LOCAL | VT_LVAL,
+                 defer_state.dtgt_save[r->level]);
+            c6_store_int(defer_state.dtgt_off);
+            vset(&int_type, VT_LOCAL | VT_LVAL,
+                 defer_state.dres_save[r->level]);
+            c6_store_int(defer_state.dres_off);
+        }
         gjmp_addr(r->label->jind);
         gsym(j);
     }
@@ -14493,6 +14632,15 @@ again:
 		s->jnext = gjmp(s->jnext);
 	    } else {
 		try_call_cleanup_goto(s->cleanupstate);
+#ifdef C6_EXT
+                /* a backward 'goto' (the label is already defined) leaves
+                   every scope between here and that label: run their
+                   cleanups before jumping.  A forward 'goto' needs nothing
+                   here: its jump lands on the label, which dispatches on
+                   its own with the depth it was defined at. */
+                if (defer_state.enabled && !nocode_wanted)
+                    c6_defer_begin(0, s->defer_depth);
+#endif
 		gjmp_addr(s->jind);
 	    }
 	    next();
@@ -16230,16 +16378,12 @@ static void c6_defer_rt_call(const char *name)
 
     if (!defer_state.enabled || nocode_wanted)
         return;
-    id = ++defer_state.next_site;
+    id = c6_defer_new_site();
     l = c6_new_label("dcl");
-    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
-    vpushi(id);
-    vpushi(0);                  /* scope 0: only the function-exit run */
-    vpushi(0);                  /* defer, not errdefer */
-    gfunc_call(3);
+    c6_defer_arm(id);
     skip = gjmp(0);
     c6_def_label(l);
-    c6_add_site(id, l);
+    c6_add_site(id, 0, 0, l);   /* scope 0: only the function-exit run */
     defer_state.has_sites = 1;
     c6_rt_begin(name);
     c6_rt_end(name, 0);
@@ -16523,15 +16667,16 @@ static void c6_async_suspend(int kind)
                       "variable: store it in a local first");
     }
 
-    /* __c6_co_suspend(task, kind, state, base, size, defer_base) */
+    /* __c6_co_suspend(task, kind, state, base, size).  The cleanup state of
+       the body lives in its frame, and the frame lives in the task, so there
+       is nothing to park: see docs/gc-design.md §9.1. */
     c6_rt_begin("__c6_co_suspend");
     c6_async_push_task();
     vpushi(kind);
     vpushi(state);
     c6_async_push_base();
     vpushi(size);
-    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.sp0_off);
-    c6_rt_end("__c6_co_suspend", 6);
+    c6_rt_end("__c6_co_suspend", 5);
     vpushi(kind);
     gfunc_return(&int_type);
     rsym = gjmp(rsym);
@@ -17031,7 +17176,7 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     c6_stable_frame = 0;
     fsiz = c6_stable_frame_size;
 
-    /* 'const struct __c6_desc __c6_desc_NAME = { size, align, max, body };' */
+    /* 'const struct __c6_desc __c6_desc_NAME = { size, align, body, ... };' */
     {
         CType taskt = c6_async_task_ctype(name);
         size = type_size(&taskt, &align);
@@ -17047,8 +17192,6 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     c6_async_add_int(ts, size);
     tok_str_add(ts, ',');
     c6_async_add_int(ts, align);
-    tok_str_add(ts, ',');
-    c6_async_add_int(ts, 64);   /* defer records parked per task */
     tok_str_add(ts, ',');
     tok_str_add(ts, body);
     tok_str_add(ts, ',');
@@ -17100,17 +17243,13 @@ static void c6_task_defer_destroy(int slot)
     if (!defer_state.enabled || nocode_wanted)
         return;
     defer_state.body_depth++;
-    id = ++defer_state.next_site;
+    id = c6_defer_new_site();
     l = c6_new_label("dcl");
-    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
-    vpushi(id);
-    vpushi(local_scope);
-    vpushi(0);                          /* kind: defer */
-    gfunc_call(3);
+    c6_defer_arm(id);
     skip = gjmp(0);
     c6_def_label(l);
     CODE_ON();
-    c6_add_site(id, l);
+    c6_add_site(id, local_scope, 0, l);
     defer_state.has_sites = 1;
     c6_rt_begin("__c6_co_destroy");
     vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
@@ -18086,16 +18225,12 @@ static void c6_gc_site(int off, CType *type)
         && !c6_stable_frame)
         tcc_error("a 'weak' reference cannot be declared in an async "
                   "function: its frame is moved to the task");
-    id = ++defer_state.next_site;
+    id = c6_defer_new_site();
     l = c6_new_label("gcr");
-    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
-    vpushi(id);
-    vpushi(local_scope);
-    vpushi(0);                      /* kind: defer, it runs on every exit */
-    gfunc_call(3);
+    c6_defer_arm(id);
     skip = gjmp(0);                 /* registration time jumps over the body */
     c6_def_label(l);
-    c6_add_site(id, l);
+    c6_add_site(id, local_scope, 0, l);
     defer_state.has_sites = 1;
     c6_rt_begin("__c6_gc_release");
     vt = *type;
@@ -19606,17 +19741,13 @@ static void c6_thread_defer_release(int slot)
     if (!defer_state.enabled || nocode_wanted)
         return;
     defer_state.body_depth++;
-    id = ++defer_state.next_site;
+    id = c6_defer_new_site();
     l = c6_new_label("dcl");
-    vpush_helper_func(tok_alloc_const("__tcc_defer_push"));
-    vpushi(id);
-    vpushi(local_scope);
-    vpushi(0);                          /* kind: defer */
-    gfunc_call(3);
+    c6_defer_arm(id);
     skip = gjmp(0);
     c6_def_label(l);
     CODE_ON();
-    c6_add_site(id, l);
+    c6_add_site(id, local_scope, 0, l);
     defer_state.has_sites = 1;
     c6_rt_begin("__c6_th_release");
     vset(&char_pointer_type, VT_LOCAL | VT_LVAL, slot);
