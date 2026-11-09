@@ -1215,9 +1215,39 @@ static void c6_lit_scan_note(int tok, Sym *s, int uneval)
                   "instead)", get_tok_str(v, NULL));
     if ((s->type.t & VT_BTYPE) == VT_STRUCT && s->type.ref) {
         C6GcType *gt = c6_gc_type_find(s->type.ref->v & ~SYM_STRUCT);
+        C6Tuple *tp = c6_tuple_of_type(&s->type);
+        int i = 0;
         if (gt && gt->drop_tok)
-            tcc_error("a closure cannot capture '%s': it has a 'drop' "
-                      "destructor and copying it would release it twice",
+            tcc_error("a closure cannot capture '%s': the type has a 'drop' "
+                      "destructor, so a copy would be destroyed twice (capture "
+                      "a '@T' owner instead)", get_tok_str(v, NULL));
+        if (tp) {
+            for (i = 0; i < tp->n; i++)
+                if (c6_is_managed(&tp->elem[i]))
+                    tcc_error("a closure cannot capture '%s': it is a tuple "
+                              "with a managed element, so a by-value copy "
+                              "would duplicate the reference (copy it into a "
+                              "'@struct')", get_tok_str(v, NULL));
+        }
+        {
+            Sym *f = s->type.ref->next, *last = 0;
+            for (; f; f = f->next)
+                last = f;
+            if (last && (last->type.t & VT_ARRAY) && last->type.ref
+                && last->type.ref->c <= 0)
+                tcc_error("a closure cannot capture '%s': it has a flexible "
+                          "array member, so a by-value copy would drop the "
+                          "flexible part", get_tok_str(v, NULL));
+        }
+    }
+    if ((s->type.t & VT_BTYPE) == VT_PTR && s->type.ref) {
+        Sym *t = s->type.ref->type.ref;
+        const char *n = t ? get_tok_str(t->v & ~SYM_STRUCT, NULL) : NULL;
+        CType head = {0};
+        if ((n && (!strcmp(n, "__c6_thread") || !strcmp(n, "__c6_task")))
+            || c6_task_head_ptr(&s->type, &head))
+            tcc_error("a closure cannot capture '%s': a thread/task handle "
+                      "owns a resource and cannot be copied by value",
                       get_tok_str(v, NULL));
     }
     c6_lit_cap_add(lit, v, &s->type, uneval ? C6_CAP_ZERO : C6_CAP_VALUE);
@@ -4991,6 +5021,12 @@ ST_FUNC void gen_op(int op)
     int op_class = op;
 #ifdef C6_EXT
     c6_fallible_use();          /* 'f() + x' loses the error */
+    if (op != TOK_EQ && op != TOK_NE) {
+        if (c6_closure_of_type(&vtop->type))
+            c6_closure_opaque(&vtop->type);
+        if (c6_closure_of_type(&vtop[-1].type))
+            c6_closure_opaque(&vtop[-1].type);
+    }
 #endif
 
     if (op == TOK_SHR || op == TOK_SAR || op == TOK_SHL)
