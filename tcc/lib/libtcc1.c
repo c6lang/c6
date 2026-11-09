@@ -664,11 +664,20 @@ typedef struct TccCoPool TccCoPool;   /* completed with the async runtime */
 typedef struct TccThRec TccThRec;     /* threads started by this thread */
 typedef struct C6GcHdr C6GcHdr;       /* completed with the gc runtime */
 
+struct C6FmtBuf;             /* the f-string builder, defined further down */
+
 typedef struct TccThCtx {
     TccDeferRec *dstack;  int dsp, stack_cap;
     TccDeferCtx *dctx;    int dcsp, ctx_cap;
     int err_flag, err_id;
     const char *err_msg;
+    /* the message of a non-literal 'err(...)': the pointer the caller passed
+       belongs to its own frame, which is gone when the handler runs, so the
+       text is copied here and stays readable until the next 'err' on this
+       thread (an 'error' value is a snapshot, not an owner) */
+    char err_buf[512];
+    /* f-string builders, one per nesting depth (see __c6_fmt_beg()) */
+    struct C6FmtBuf **fmt_slot;  int fmt_nslot, fmt_depth;
     C6GcHdr *gc_pending;  /* objects whose count reached zero */
     C6GcHdr *gc_pending_tail;
     int gc_pending_n;
@@ -1038,6 +1047,31 @@ void __tcc_err_set(int id, const char *msg)
     th->err_flag = 1;
     th->err_id = id;
     th->err_msg = msg;
+}
+
+/* 'err(id, msg)' with a MSG that lives in the caller's frame: keep a copy.
+   Truncated to the buffer, which is short on purpose -- a diagnostic is not
+   a data channel, and the alternative (a dangling pointer) is worse. */
+void __tcc_err_set_copy(int id, const char *msg)
+{
+    TccThCtx *th = tcc_th();
+    char *d = th->err_buf;
+    unsigned long i = 0;
+
+    th->err_flag = 1;
+    th->err_id = id;
+    if (!msg) {
+        th->err_msg = 0;
+        return;
+    }
+    if (msg >= d && msg < d + sizeof th->err_buf) {
+        th->err_msg = msg;          /* already ours: 'err(id, e.msg)' */
+        return;
+    }
+    for (i = 0; i + 1 < sizeof th->err_buf && msg[i]; i++)
+        d[i] = msg[i];
+    d[i] = 0;
+    th->err_msg = d;
 }
 
 int __tcc_err_flag_get(void)
@@ -1638,6 +1672,310 @@ void __c6_gc_shutdown(void)
     c6_gc_shut_down = 1;
     c6_gc_release_roots();
     tcc_th_gc_free_all(tcc_th());
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* c6 extension runtime: f"..{expr}.."                                        */
+/*                                                                            */
+/* One f-string becomes a sequence of calls, emitted in this order:           */
+/*     __c6_fmt_beg()                                                        */
+/*     __c6_fmt_l()/__c6_fmt_s()/__c6_fmt_c()/__c6_fmt_sl()/__c6_fmt_i()/... */
+/*     __c6_fmt_end(flags)                                                   */
+/* The builder is not passed around: every thread keeps one slot per nesting   */
+/* depth, and the calls work on the innermost open slot.  That makes a        */
+/* nested f-string, a recursive call and a comma expression all behave the    */
+/* same without the compiler having to hide a temporary anywhere.             */
+/*                                                                            */
+/* __c6_fmt_end() either returns the text in place -- a borrowed view, valid  */
+/* until the same depth is used again -- or copies it into a managed object.  */
+/* The object records the character count in its header, so the compiler can  */
+/* hand any '@char' from here to __c6_str_len().  There is no libc, so the    */
+/* numbers are formatted by hand.                                            */
+
+#define C6_FMT_SCRATCH 256
+
+typedef struct C6FmtBuf {
+    unsigned long len, cap;
+    char *heap;                     /* NULL: the text lives in 'buf' */
+    char *out;                      /* the text of the last result of this depth */
+    unsigned long outcap;
+    char buf[C6_FMT_SCRATCH];
+} C6FmtBuf;
+
+static char *c6_fmt_text(C6FmtBuf *b)
+{
+    return b->heap ? b->heap : b->buf;
+}
+
+/* make room for LEN more characters and the terminating '\0' */
+static void c6_fmt_room(C6FmtBuf *b, unsigned long len)
+{
+    unsigned long cap = b->cap ? b->cap : C6_FMT_SCRATCH, i = 0;
+    char *np = 0, *old = 0;
+
+    if (b->len + len + 1 <= cap)
+        return;
+    while (cap < b->len + len + 1)
+        cap *= 2;
+    np = (char *)calloc(1, cap);
+    if (!np)
+        c6_gc_trap();
+    old = c6_fmt_text(b);
+    for (i = 0; i < b->len; i++)
+        np[i] = old[i];
+    if (b->heap)
+        free(b->heap);
+    b->heap = np;
+    b->cap = cap;
+}
+
+static void c6_fmt_put(C6FmtBuf *b, const char *s, unsigned long len)
+{
+    unsigned long i = 0;
+    char *p = 0;
+
+    if (!len)
+        return;
+    c6_fmt_room(b, len);
+    p = c6_fmt_text(b);
+    for (i = 0; i < len; i++)
+        p[b->len + i] = s[i];
+    b->len += len;
+    p[b->len] = 0;
+}
+
+static void c6_fmt_dec(C6FmtBuf *b, unsigned long long v)
+{
+    char tmp[24];
+    int n = 0;
+
+    if (!v) {
+        c6_fmt_put(b, "0", 1);
+        return;
+    }
+    while (v) {
+        tmp[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    }
+    c6_fmt_room(b, (unsigned long)n);
+    while (n > 0)
+        c6_fmt_text(b)[b->len++] = tmp[--n];
+    c6_fmt_text(b)[b->len] = 0;
+}
+
+static void c6_fmt_hex(C6FmtBuf *b, unsigned long long v)
+{
+    char tmp[24];
+    int n = 0, d = 0;
+
+    c6_fmt_put(b, "0x", 2);
+    if (!v) {
+        c6_fmt_put(b, "0", 1);
+        return;
+    }
+    while (v) {
+        d = (int)(v & 15);
+        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        v >>= 4;
+    }
+    c6_fmt_room(b, (unsigned long)n);
+    while (n > 0)
+        c6_fmt_text(b)[b->len++] = tmp[--n];
+    c6_fmt_text(b)[b->len] = 0;
+}
+
+/* the builder of nesting depth D, created the first time it is needed */
+static C6FmtBuf *c6_fmt_slot(int d)
+{
+    TccThCtx *th = tcc_th();
+    C6FmtBuf *b = 0;
+    struct C6FmtBuf **ns = 0;
+    int i = 0, n = 0;
+
+    if (d < 0)
+        c6_gc_trap();               /* internal error: unbalanced calls */
+    if (d >= th->fmt_nslot) {
+        n = th->fmt_nslot ? th->fmt_nslot : 4;
+        while (n <= d)
+            n *= 2;
+        ns = (struct C6FmtBuf **)calloc(1, (unsigned long)n * sizeof *ns);
+        if (!ns)
+            c6_gc_trap();
+        for (i = 0; i < th->fmt_nslot; i++)
+            ns[i] = th->fmt_slot[i];
+        if (th->fmt_slot)
+            free(th->fmt_slot);
+        th->fmt_slot = ns;
+        th->fmt_nslot = n;
+    }
+    b = th->fmt_slot[d];
+    if (!b) {
+        b = (C6FmtBuf *)calloc(1, sizeof *b);
+        if (!b)
+            c6_gc_trap();
+        b->cap = C6_FMT_SCRATCH;
+        th->fmt_slot[d] = b;
+    }
+    return b;
+}
+
+/* the innermost open builder; a call without __c6_fmt_beg() is a bug in the
+   compiler, so it must not silently produce a wrong string */
+static C6FmtBuf *c6_fmt_cur(void)
+{
+    TccThCtx *th = tcc_th();
+
+    if (th->fmt_depth <= 0)
+        c6_gc_trap();
+    return c6_fmt_slot(th->fmt_depth - 1);
+}
+
+void __c6_fmt_beg(void)
+{
+    TccThCtx *th = tcc_th();
+    C6FmtBuf *b = c6_fmt_slot(th->fmt_depth);
+
+    b->len = 0;
+    c6_fmt_text(b)[0] = 0;
+    th->fmt_depth++;
+}
+
+/* a literal piece: exactly N characters, they may contain any byte */
+void __c6_fmt_l(const char *s, unsigned long n)
+{
+    if (s)
+        c6_fmt_put(c6_fmt_cur(), s, n);
+}
+
+/* a piece with a known length; N == -1 means S is NUL terminated.  A null
+   string is shown as "(null)", so a missing value is visible instead of
+   crashing. */
+void __c6_fmt_s(const char *s, unsigned long n)
+{
+    C6FmtBuf *b = 0;
+
+    if (!s) {
+        c6_fmt_put(c6_fmt_cur(), "(null)", 6);
+        return;
+    }
+    b = c6_fmt_cur();
+    if (n == (unsigned long)-1) {
+        for (n = 0; s[n]; ++n)
+            ;
+    }
+    c6_fmt_put(b, s, n);
+}
+
+/* a plain C string: the compiler cannot know its length */
+void __c6_fmt_ch(int c)
+{
+    C6FmtBuf *b = c6_fmt_cur();
+    unsigned char ch = (unsigned char)c;
+
+    if (!b)
+        return;
+    c6_fmt_put(b, (const char *)&ch, 1);
+}
+
+void __c6_fmt_c(const char *s)
+{
+    __c6_fmt_s(s, (unsigned long)-1);
+}
+
+/* a slice: the compiler hands over a pointer to the '{ data, len }' pair */
+void __c6_fmt_sl(const void *pair)
+{
+    const unsigned long *w = (const unsigned long *)pair;
+    unsigned long n = 0;
+
+    if (!pair)
+        return;
+    n = (unsigned long)w[1];
+    /* a 'char[:]' made from a string literal counts the terminating '\0';
+       printing it would cut the text short */
+    if (n && ((const char *)w[0])[n - 1] == 0)
+        --n;
+    __c6_fmt_s((const char *)w[0], n);
+}
+
+void __c6_fmt_i(long long v)
+{
+    C6FmtBuf *b = c6_fmt_cur();
+
+    if (v < 0) {
+        c6_fmt_put(b, "-", 1);
+        c6_fmt_dec(b, 0ULL - (unsigned long long)v);
+    } else {
+        c6_fmt_dec(b, (unsigned long long)v);
+    }
+}
+
+void __c6_fmt_u(unsigned long long v)
+{
+    c6_fmt_dec(c6_fmt_cur(), v);
+}
+
+void __c6_fmt_p(const void *p)
+{
+    c6_fmt_hex(c6_fmt_cur(), (unsigned long long)(unsigned long)p);
+}
+
+void __c6_fmt_b(int v)
+{
+    c6_fmt_put(c6_fmt_cur(), v ? "true" : "false", v ? 4 : 5);
+}
+
+/* FLAGS: C6_GC_FRESH to hand back a managed object, C6_GC_ATOMIC when it is
+   going to be shared between threads.  Without C6_GC_FRESH the result is the
+   borrowed text of this depth's slot. */
+void *__c6_fmt_end(int flags)
+{
+    TccThCtx *th = tcc_th();
+    C6FmtBuf *b = c6_fmt_cur();
+    char *r = 0, *p = 0;
+    unsigned long n = 0, i = 0;
+
+    n = b->len;
+    p = c6_fmt_text(b);
+    th->fmt_depth--;
+    if (!(flags & C6_GC_FRESH)) {
+        /* the borrowed text goes to its own buffer: a caller may still hold
+           the previous result while the next one is being built */
+        if (b->outcap < n + 1) {
+            unsigned long cap = n + 1 + C6_FMT_SCRATCH;
+            char *np = (char *)calloc(1, cap);
+            if (!np)
+                c6_gc_trap();
+            if (b->out)
+                free(b->out);
+            b->out = np;
+            b->outcap = cap;
+        }
+        for (i = 0; i <= n; i++)
+            b->out[i] = p[i];
+        return b->out;
+    }
+    r = (char *)__c6_gc_new(1, n + 1, 0, flags & C6_GC_ATOMIC);
+    for (i = 0; i <= n; i++)
+        r[i] = p[i];
+    return r;
+}
+
+/* The character count of a managed character buffer, as 'new char[n]' and
+   f".." both record it; 0 for the empty reference. */
+unsigned long long __c6_str_len(const void *p)
+{
+    unsigned long n = 0;
+
+    if (!p)
+        return 0;
+    n = (unsigned long)(c6_gc_hdr((void *)p)->meta & C6_GC_META_COUNT);
+    /* the length of the text, not of the buffer: a string made by '@f".."'
+       counts the terminating '\0' */
+    if (n && ((const char *)p)[n - 1] == 0)
+        --n;
+    return n;
 }
 
 

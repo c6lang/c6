@@ -813,9 +813,15 @@ static int c99_rt_int_ret(const char *name)
 static const char * const c99_runtime_names[] = {
     "__tcc_defer_func_enter", "__tcc_defer_push", "__tcc_defer_begin_scope",
     "__tcc_defer_begin_func", "__tcc_defer_step",
-    "__tcc_err_clear", "__tcc_err_set", "__tcc_err_flag_peek",
+    "__tcc_err_clear", "__tcc_err_set", "__tcc_err_set_copy",
+    "__tcc_err_flag_peek",
     "__tcc_err_flag_get", "__tcc_err_id_get", "__tcc_err_msg_get",
     "__tcc_error_take", "__tcc_catch_fallthrough",
+    /* f"..{expr}.." builder */
+    "__c6_fmt_beg", "__c6_fmt_l", "__c6_fmt_s", "__c6_fmt_c", "__c6_fmt_ch",
+    "__c6_fmt_sl",
+    "__c6_fmt_i", "__c6_fmt_u", "__c6_fmt_p", "__c6_fmt_b", "__c6_fmt_end",
+    "__c6_str_len",
     "__tcc_slice_index", "__tcc_slice_sub", "__tcc_iface_init",
     "__tcc_co_spawn", "__tcc_sp_args", "__tcc_th_start",
     "__c6_co_new", "__c6_co_await", "__c6_co_suspend", "__c6_co_restore",
