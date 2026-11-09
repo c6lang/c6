@@ -567,7 +567,7 @@ foreach |i, v| s { ... }        /* 切片：同上，长度是求值那一刻的
 foreach |i| 0:5 { ... }         /* 区间 [0, 5)：只要一个绑定 */
 foreach |_, v| a { ... }        /* '_' 丢弃这个绑定 */
 foreach |i, v| obj.items { ... }/* 结构体暴露的切片成员 */
-foreach |v| it { ... }          /* 迭代器：it 的类型提供 has()/next() */
+foreach |v| it { ... }          /* 迭代器：it 的类型提供 has(T *)/next(T *) */
 ```
 
 速查：
@@ -579,7 +579,7 @@ foreach |v| it { ... }          /* 迭代器：it 的类型提供 has()/next() *
 | `foreach \|i\| lo:hi` | 半开区间 `[lo, hi)`；下标是两界的公共整数类型，`lo >= hi` 零次 |
 | `foreach \|_, v\| …` / `foreach \|i, _\| …` | 丢弃下标 / 丢弃值（丢弃的绑定连加载都不生成） |
 | `foreach \|_\| 0:n { … }` | “重复 n 次”的写法 |
-| `foreach \|v\| it` | 迭代器：`it` 是 `T`、`T *` 或接口值，类型提供 `int has()` + `E next()`；`v` 是 `next()` 返回值的副本 |
+| `foreach \|v\| it` | 迭代器：`it` 是 `T`、`T *` 或接口值，类型提供 `int has(T *)` + `E next(T *)`；`v` 是 `next()` 返回值的副本 |
 | 值绑定 `v` | 副本：写它不改容器 |
 | 下标绑定 `i` | 就是循环变量：写它改变后续迭代（同 `for`） |
 | `break` / `continue` / `defer` / `await` | 与写在 `for` 体里完全一致 |
@@ -614,7 +614,12 @@ foreach |v| it { ... }          /* 迭代器：it 的类型提供 has()/next() *
   是 `|` 时才按语句解析；
 - 迭代器的 `next()` 返回数组、`void`、`void *`（元素类型会被擦除）或
   不完整类型都报错；`foreach |i, v| it` 也报错（迭代器没有下标绑定）。
-  要下标自己维护计数器，要“advance 原对象”就写 `foreach |v| &it`。
+  要下标自己维护计数器；值形态的 `T` 想“advance 原对象”就写
+  `foreach |v| &it`，`T *` 和接口值本来就直接操作原对象；
+- 托管引用 `@T` 可以作迭代器或元素：隐藏槽按声明的托管局部量初始化，
+  并在 `foreach` 作用域结束时释放，`@T` 参数则按借用拷贝；`struct`
+  里含 `@T`/`weak @T`/`own @T` 字段时仍不能按值绑定（沿用 GC 的
+  “用 `new` 分配、用 `@T` 持有”的限制）。
 
 完整可运行示例见 [examples/foreach_demo.c](examples/foreach_demo.c) 与
 [examples/foreach_iter_demo.c](examples/foreach_iter_demo.c)：

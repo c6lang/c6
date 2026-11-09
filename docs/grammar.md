@@ -786,6 +786,10 @@ pattern-element        = type-specifier , declarator      (* 解构声明 *)
 - 迭代器只有值绑定：`foreach |v| it` 或 `foreach |_| it`（后者仍调用
   `next()` 推进）。“值形态”把迭代器状态复制进隐藏槽，循环不推进原对象；
   `T *` 与接口值直接操作原对象（`next()` 的修改可见）；
+- 迭代器和元素可以是托管引用 `@T`：隐藏槽按声明的托管局部量处理
+  （先清零，再在 `foreach` 作用域结束时 `__c6_gc_release`），`@T` 形参
+  按借用拷贝，不额外加计数；含托管字段的 `struct` 仍不能按值绑定
+  （沿用 GC 的限制）；
 - 值绑定是**副本**：写它不改变容器。下标绑定就是循环变量，写它会改变
   后续迭代（与 `for (i = 0; i < n; i++)` 完全一样）；
 - `lo >= hi` 是零次迭代，两个界各只求值一次；
@@ -1023,7 +1027,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C44 | 数组/切片要两个绑定 | `an array or slice yields an index and a value: write 'foreach \|i, v\| a'` |
 | C45 | 区间只要一个绑定 | `a range yields only an index: write 'foreach \|i\| lo:hi'` |
 | C46 | 两个绑定不能都丢弃 | `'foreach' discards both binders` |
-| C47 | 可迭代对象只能是完整数组、切片、整数区间，或提供 `has()`/`next()` 的迭代器 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi')`；`cannot iterate over 'T' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(); E next();')` |
+| C47 | 可迭代对象只能是完整数组、切片、整数区间，或提供 `has()`/`next()` 的迭代器 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi')`；`cannot iterate over 'T' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')` |
 | C48 | 区间两个界必须是整数 | `range bounds must be integers` |
 | C49 | 元素类型必须可赋值且完整 | `'foreach' cannot copy an element of type 'T'`；`cannot iterate over incomplete element type 'T'` |
 | C50 | 循环体必须是复合语句 | `'{' expected` |
@@ -1066,7 +1070,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C87 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
 | C88 | 插值里不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上）；`;` 只能出现一次（引入格式说明），语句表达式里的 `;` 同样被拒绝 | `'try' is not allowed in an interpolation: ...`；`f-string: ';' is only allowed once, to start the format spec ('{expr;spec}')` |
 | C89 | 格式说明要与插值的静态类型相容，`conv` 必须是已知的，宽度/精度不超过 1023，`;` 后面不能为空 | `f-string: unknown conversion 'z' in a format spec`；`f-string: a 'const char *' value takes no 'x' format spec`；`f-string: format width 2000 is too large`；`f-string: empty format spec in '{expr;spec}'` |
-| C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver` |
+| C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver`；`iterator method 'next' cannot return a borrowed managed reference 'T'` |
 | C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it'` |
 
 （C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包，尚未实现。）
@@ -1246,12 +1250,19 @@ foreach |i| lo:hi { body }
     T hi_tmp = (T)hi;                      (* T = 两个界的公共整数类型 *)
     for (i = (T)lo; i < hi_tmp; i++) { body }
 
-foreach |v| it { body }                    (* it 的类型提供 has()/next() *)
+foreach |v| it { body }                    (* it 的类型提供 has(T *)/next(T *) *)
 =>
-    It tmp = it;                           (* 只求值一次，落在隐藏帧槽 *)
-    while (has(&tmp)) {                    (* 接口值：tmp.vt->has(tmp.self) *)
+    /* 三选一：下面三种形态按 it 的类型选一条 */
+    T tmp = it;                            (* 值形态：状态复制到隐藏帧槽 *)
+    while (has(&tmp)) {
         v = next(&tmp);                    (* 副本；'_' 时丢弃但仍调用 next() *)
         body                               (* continue 回到 has() 判断 *)
+    }
+    T *tmp = it;                           (* 指针形态：直接操作原对象 *)
+    while (has(tmp)) { v = next(tmp); body }
+    I tmp = it;                            (* 接口形态：vtable 分派 *)
+    while (tmp.vt->has(tmp.self)) {
+        v = tmp.vt->next(tmp.self); body
     }
 ```
 
