@@ -342,7 +342,9 @@ void qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void 
 
 /* ---- 内存里的管道：pipe/read/write/select ---- */
 
-#define SHIM_PIPES 8
+/* 每个 `pipe(fds)` 占一对 fd（0/1、2/3、…），没有 close 可以回收，所以这个
+   数字就是一次进程里能开的管道总数：async 的每个用例各开一对，留够余量。 */
+#define SHIM_PIPES 16
 #define SHIM_CAP 64
 
 struct ShimPipe {
