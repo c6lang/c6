@@ -1354,21 +1354,38 @@ goto after;  S: …;  after:
 `goto`、以及函数末尾的兜底）：
 
 ```
-    dtgt = <depth>;  dres = ++rid;  goto disp;   rs: …   (* 恢复点 *)
-disp:                                       (* 每个函数一个，逆序扫 site *)
-    for (site : sites, id 从大到小)
+    if (narmed == 0) goto rs;               (* 什么都没注册：这个请求没事可做 *)
+    dtgt = <filter>;  dres = ++rid;  goto entry[filter];   rs: …   (* 恢复点 *)
+
+entry[key]:   (* 每个 filter 一个入口：第一个可能匹配的 site 的位置 *)
+    <该 filter 的请求直接落到这里，不经过下面的开关>
+
+disp:         (* 清理体跑完回到这里 *)
+    if (narmed == 0) goto comp;
+    switch (dtgt) { case key: goto entry[key]; … }   (* 只有几个比较 *)
+
+    for (site : sites, id 从大到小)          (* 每个 site 一条，共享一条链 *)
         if (arm[site] && dtgt < site.depth && (site.kind == 0 || dtgt == -2)) {
-            arm[site] &= ~bit;              (* 无论跑不跑都清掉这一位 *)
-            goto site.label;                (* 清理体结尾跳回 disp *)
+            arm[site] &= ~bit;  narmed--;    (* 无论跑不跑都清掉这一位 *)
+            goto site.label;                (* 清理体结尾回到 disp *)
         }
-    for (r : resumes)                       (* 这一轮做完了：恢复外层状态 *)
-        if (dres == r.id) { dtgt = dtgt_save[r.lv]; dres = dres_save[r.lv];
-                            goto r.rs; }
+
+comp:                                       (* 这一轮做完了 *)
+    <对 resumes 的 id 二分：找到 dres 那一条，恢复外层 dtgt/dres，跳到它的恢复点>
 ```
 
 - 深度过滤的编码：mode 0 存 `<depth>`（只跑比它更深的作用域），mode 1 存
   `-1`（整个函数帧），mode 2（错误路径）存 `-2`（整个函数帧，并且放行
   `errdefer`）。负值不可能是合法深度，所以一个 `int` 就够。
+- `narmed`（本帧还有几个 site 处于已注册状态）是热路径上的第一道闸：什么都没
+  注册的请求（最常见的"块退出但没有 defer 要跑"）一条比较就走人；清理体跑完
+  回到 `disp` 时它通常是 0，于是直接进 `comp`，不再扫一遍链。
+- 每个 filter 的**入口**由编译期算出：这条链从"该 filter 第一个可能匹配的
+  site"开始，所以一个作用域退出只看它正在离开的那几个 site，与函数里总共有
+  多少清理点无关（实测：1 个 site 的函数和 41 个 site 的函数，退出一个带
+  清理点的块都是 ~10 ns/次）。
+- `resumes` 按 id 升序，所以"哪个请求结束了"用二分找（128 个 site 也只有
+  7 次比较）。
 - `id` 从大到小 = 注册的逆序 = LIFO：同一作用域实例里后注册的先跑，
   跨作用域时深的先跑（它的 `id` 也更大）。
 - 位是幂等的：同一个作用域实例里同一个 site 注册两次也只跑一次；离开
@@ -1379,9 +1396,11 @@ disp:                                       (* 每个函数一个，逆序扫 si
   那次派发会把 `errdefer` 也跑掉：被销毁的任务没有"正常结束"这回事。
 - 上限：一个函数最多 128 个清理点（C101，第 129 个报错），清理体最多嵌套
   8 层（C102，第 9 层报错）。
-- 帧开销：位图 4 × `int` 在**每个** c6 函数帧里都有并在序言清零（单趟编译器
-  在序言处还不知道后面会不会出现清理点）；派发状态 2 × `int` 和派发器本身
-  只在函数里真有清理点时才有，清理体每嵌套一层再加 2 × `int`。
+
+- 帧开销：位图 4 × `int` 加 `narmed` 1 × `int` 在**每个** c6 函数帧里都有并
+  在序言清零（单趟编译器在序言处还不知道后面会不会出现清理点）；派发状态
+  2 × `int` 和派发器本身只在函数里真有清理点时才有，清理体每嵌套一层再加
+  2 × `int`。
 
 ## 9. 示例
 

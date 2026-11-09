@@ -164,6 +164,16 @@ typedef struct C6DeferResume {
     struct C6DeferResume *next;
 } C6DeferResume;
 
+/* A dispatch entry point.  Every request carries a filter (the scope depth it
+   serves, or "whole frame"), and the sites that can match it are known at
+   compile time, so the requests of one filter jump straight to the first site
+   that can possibly match them: a scope exit never walks the sites of scopes
+   it is not leaving. */
+typedef struct C6DeferDisp {
+    int key;            /* '<depth', or -1 / -2 for the whole frame */
+    int jmps;           /* pending jumps that land on this filter's entry */
+} C6DeferDisp;
+
 static struct {
     int enabled;      /* c6 extensions active for current function */
     int has_sites;    /* at least one defer/errdefer site parsed so far */
@@ -172,9 +182,12 @@ static struct {
     int next_resume;
     int nsites;
     int arm_off[C6_DEFER_WORDS];    /* armed bitmap, one 'int' frame local each */
-    int dtgt_off;     /* depth filter of the request being served */
+    int narmed_off;   /* how many sites are armed right now */
+    int dtgt_off;     /* filter of the request being served */
     int dres_off;     /* resume id of the request being served */
     int disp_ready;   /* the two locals above have been allocated */
+    C6DeferDisp **disps;            /* one entry point per distinct filter */
+    int ndisps;
     /* the enclosing request, saved while a nested one runs ('0' is not a
        valid frame offset, so an untouched slot means "not allocated yet") */
     int dtgt_save[C6_DEFER_LEVELS + 1];
@@ -13344,6 +13357,7 @@ static void c6_free_lists(void)
 {
     C6DeferResume *r = 0, *rn = 0;
     dynarray_reset(&defer_state.sites, &defer_state.nsites);
+    dynarray_reset(&defer_state.disps, &defer_state.ndisps);
     for (r = defer_state.resumes; r; r = rn) {
         rn = r->next;
         tcc_free(r);
@@ -13382,24 +13396,63 @@ static void c6_defer_level_alloc(int lvl)
     defer_state.dres_save[lvl] = c6_local_alloc(sizeof(int), 4);
 }
 
-/* 'armed[id/32] |= bit(id)': the site now waits for its scope to end */
+/* 'armed[id/32] |= bit(id)': the site now waits for its scope to end.  A
+   registration that actually sets the bit also bumps the armed count, which is
+   what lets a request stop after one test when nothing is armed. */
 static void c6_defer_arm(int id)
 {
-    int w = (id - 1) / 32;
+    int w = (id - 1) / 32, b = (int)(1u << ((id - 1) % 32));
+    int fresh = 0, done = 0;
+
     vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.arm_off[w]);
-    vpushi((int)(1u << ((id - 1) % 32)));
+    vpushi(b);
+    gen_op('&');
+    vpushi(0);
+    gen_op(TOK_EQ);
+    fresh = gvtst(0, 0);        /* taken while the bit is still clear */
+    done = gjmp(0);
+    gsym(fresh);
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.narmed_off);
+    vpushi(1);
+    gen_op('+');
+    c6_store_int(defer_state.narmed_off);
+    gsym(done);
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.arm_off[w]);
+    vpushi(b);
     gen_op('|');
     c6_store_int(defer_state.arm_off[w]);
 }
 
-/* 'armed[id/32] &= ~bit(id)': the site has been dealt with */
+/* 'armed[id/32] &= ~bit(id)': the site has been dealt with.  Only the
+   dispatcher gets here, and only after it saw the bit set. */
 static void c6_defer_disarm(int id)
 {
     int w = (id - 1) / 32;
+
     vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.arm_off[w]);
     vpushi((int)~(1u << ((id - 1) % 32)));
     gen_op('&');
     c6_store_int(defer_state.arm_off[w]);
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.narmed_off);
+    vpushi(1);
+    gen_op('-');
+    c6_store_int(defer_state.narmed_off);
+}
+
+/* the entry point of the filter KEY (created on first use) */
+static int c6_defer_disp_for(int key)
+{
+    int i = 0;
+    C6DeferDisp *d = NULL;
+
+    for (i = 0; i < defer_state.ndisps; i++)
+        if (defer_state.disps[i]->key == key)
+            return i;
+    d = tcc_malloc(sizeof *d);
+    d->key = key;
+    d->jmps = 0;
+    dynarray_add(&defer_state.disps, &defer_state.ndisps, d);
+    return defer_state.ndisps - 1;
 }
 
 /* extend the jump chain T with a jump taken when site ID is not armed */
@@ -13442,6 +13495,9 @@ static void c6_defer_func_init(void)
         vpushi(0);
         c6_store_int(defer_state.arm_off[i]);
     }
+    defer_state.narmed_off = c6_local_alloc(sizeof(int), 4);
+    vpushi(0);
+    c6_store_int(defer_state.narmed_off);
 }
 
 /* Start a cleanup request.  MODE 0 serves the sites of the scopes above DEPTH,
@@ -13452,7 +13508,7 @@ static void c6_defer_func_init(void)
    inside a cleanup body -- only saves and restores the enclosing one. */
 static void c6_defer_begin(int mode, int depth)
 {
-    int rid = 0, lvl = 0;
+    int rid = 0, lvl = 0, key = 0, di = 0, armed = 0, idle = 0;
     Sym *rl = 0;
 
     if (!defer_state.enabled || !defer_state.has_sites || nocode_wanted)
@@ -13463,6 +13519,15 @@ static void c6_defer_begin(int mode, int depth)
     c6_defer_disp_alloc();
     rid = ++defer_state.next_resume;
     rl = c6_new_label("drs");
+    /* nothing is armed, so this request has no work at all.  The test comes
+       first: a request that skips must not touch the state of the request
+       that is still in flight around it. */
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.narmed_off);
+    vpushi(0);
+    gen_op(TOK_NE);
+    armed = gvtst(0, 0);        /* taken while something is armed */
+    idle = gjmp(0);             /* otherwise straight to the resume point */
+    gsym(armed);
     if (lvl > 0) {
         /* a cleanup body is reached from the shared dispatcher and may start
            requests of its own: keep the enclosing one for the return */
@@ -13474,13 +13539,18 @@ static void c6_defer_begin(int mode, int depth)
     }
     /* the filter is '< site depth'; a negative one passes every depth and,
        as -2, also lets the 'errdefer' sites run */
-    vpushi(mode == 0 ? depth : -mode);
+    key = mode == 0 ? depth : -mode;
+    vpushi(key);
     c6_store_int(defer_state.dtgt_off);
     vpushi(rid);
     c6_store_int(defer_state.dres_off);
-    defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
+    /* land on the first site that can match this filter, not on the top of
+       the chain: a scope exit only walks the sites it is leaving */
+    di = c6_defer_disp_for(key);
+    defer_state.disps[di]->jmps = gjmp(defer_state.disps[di]->jmps);
     /* resume point: execution continues right after the cleanup run */
     c6_def_label(rl);
+    gsym(idle);
     c6_add_resume(rid, lvl, rl);
 }
 
@@ -13682,10 +13752,55 @@ static void c6_test_parse(void)
    instance the sites are registered in source order, so this is exactly the
    'last registered runs first' order the old defer stack gave.  No site can
    run twice: its bit is cleared before its body is entered. */
+/* the highest site id that can possibly match the filter KEY: the requests of
+   that filter enter the chain there, so nothing above it is even looked at */
+static int c6_defer_entry_id(int key)
+{
+    int i = 0;
+
+    for (i = defer_state.nsites - 1; i >= 0; i--)
+        if (key < 0 || defer_state.sites[i]->depth > key)
+            return defer_state.sites[i]->id;
+    return 0;
+}
+
+/* The request that just finished is identified by its resume id.  The table is
+   sorted (ids are handed out in source order), so a binary search finds the
+   entry: give the enclosing request its state back and continue at the resume
+   point of this one. */
+static void c6_defer_comp(C6DeferResume **arr, int lo, int hi)
+{
+    int mid = 0, j = 0;
+    C6DeferResume *r = NULL;
+
+    if (lo >= hi) {
+        r = arr[lo];
+        if (r->level > 0) {
+            vset(&int_type, VT_LOCAL | VT_LVAL,
+                 defer_state.dtgt_save[r->level]);
+            c6_store_int(defer_state.dtgt_off);
+            vset(&int_type, VT_LOCAL | VT_LVAL,
+                 defer_state.dres_save[r->level]);
+            c6_store_int(defer_state.dres_off);
+        }
+        gjmp_addr(r->label->jind);
+        return;
+    }
+    mid = (lo + hi) / 2;
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dres_off);
+    vpushi(arr[mid]->id);
+    gen_op(TOK_LE);
+    j = gvtst(0, 0);            /* taken when this request is in the left half */
+    c6_defer_comp(arr, mid + 1, hi);
+    gsym(j);
+    c6_defer_comp(arr, lo, mid);
+}
+
 static void c6_defer_func_end(void)
 {
     C6DeferResume *r = 0;
-    int fall = 0, i = 0;
+    C6DeferResume **arr = NULL;
+    int fall = 0, i = 0, d = 0, done = 0, n = 0;
 
     if (!defer_state.enabled)
         return;
@@ -13698,11 +13813,38 @@ static void c6_defer_func_end(void)
     c6_defer_disp_alloc();
     CODE_ON();
     fall = gjmp(0);
+    /* a cleanup body that has run comes back here: when nothing is armed any
+       more this request is finished, so the common case stops in one test */
     gsym(defer_state.disp_jmps);
     defer_state.disp_jmps = 0;
+    vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.narmed_off);
+    vpushi(0);
+    gen_op(TOK_EQ);
+    done = gvtst(0, 0);
+    /* otherwise continue with the entry point of the filter this request
+       carries (the jump target is patched below, at that site's test) */
+    for (d = 0; d < defer_state.ndisps; d++) {
+        int j = 0;
+        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dtgt_off);
+        vpushi(defer_state.disps[d]->key);
+        gen_op(TOK_EQ);
+        j = gvtst(1, 0);
+        defer_state.disps[d]->jmps = gjmp(defer_state.disps[d]->jmps);
+        gsym(j);
+    }
+    done = gjmp(done);          /* no filter matched: finish the request */
+    /* the chain: every site once, from the highest id down */
     for (i = defer_state.nsites - 1; i >= 0; i--) {
         C6DeferSite *s = defer_state.sites[i];
         int skip = 0;
+        /* the requests of every filter whose first possible site is this one
+           land here */
+        for (d = 0; d < defer_state.ndisps; d++)
+            if (defer_state.disps[d]->jmps
+                && c6_defer_entry_id(defer_state.disps[d]->key) == s->id) {
+                gsym(defer_state.disps[d]->jmps);
+                defer_state.disps[d]->jmps = 0;
+            }
         skip = c6_defer_test(s->id, skip);
         /* the request only serves sites deeper than its filter */
         vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dtgt_off);
@@ -13723,22 +13865,22 @@ static void c6_defer_func_end(void)
     }
     /* nothing left for this request: give the enclosing one its state back
        and continue right after the point that asked for the cleanups */
-    for (r = defer_state.resumes; r; r = r->next) {
-        int j = 0;
-        vset(&int_type, VT_LOCAL | VT_LVAL, defer_state.dres_off);
-        vpushi(r->id);
-        gen_op(TOK_EQ);
-        j = gvtst(1, 0);
-        if (r->level > 0) {
-            vset(&int_type, VT_LOCAL | VT_LVAL,
-                 defer_state.dtgt_save[r->level]);
-            c6_store_int(defer_state.dtgt_off);
-            vset(&int_type, VT_LOCAL | VT_LVAL,
-                 defer_state.dres_save[r->level]);
-            c6_store_int(defer_state.dres_off);
+    gsym(done);
+    for (d = 0; d < defer_state.ndisps; d++) {
+        /* a filter whose sites cannot match anything lands here directly */
+        if (defer_state.disps[d]->jmps) {
+            gsym(defer_state.disps[d]->jmps);
+            defer_state.disps[d]->jmps = 0;
         }
-        gjmp_addr(r->label->jind);
-        gsym(j);
+    }
+    for (r = defer_state.resumes; r; r = r->next)
+        n++;
+    if (n > 0) {
+        arr = tcc_malloc(sizeof *arr * n);
+        for (i = 0, r = defer_state.resumes; r; r = r->next)
+            arr[i++] = r;
+        c6_defer_comp(arr, 0, n - 1);
+        tcc_free(arr);
     }
     gsym(fall);
     c6_free_lists();
