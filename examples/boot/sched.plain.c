@@ -10,9 +10,13 @@
  *   - 轮转调度，任务结束把自己的 dead 置上，下一轮就不再被选中。
  *
  * 实测踩到的坑记在这儿：长模式下的 iretq **总是**弹 rip/cs/rflags/rsp/ss
- * 五个 qword（不是只在特权级变化时才弹），而 CPU 在同一特权级中断时只压
- * 前三个 —— 所以帧必须自己补齐；另外 boot.S 里 0x18 才是 64 位代码段，
- * 中断门的 selector 写 0x08 会在第一次时钟中断就 #GP(0x08)。
+ * 五个 qword，而中断进来时 CPU 压了几个，是分机器的：这台（KVM，同一特权
+ * 级）压五个，且被打断的 rsp 就记在 [入口 rsp + 24] 那格 —— 所以要读它，
+ * 不要自己算"入口 rsp + 24"。算错的后果极其隐蔽：被打断的函数带着偏低
+ * 16 字节的 rsp 继续跑，rbp 寻址的代码全都自己修回来了，只有 ret 弹到栈上
+ * 才炸成 `#UD at 0xffff..`，看着像随机的三重故障（`fstest-bare-smp` 之前
+ * 几跑一偶发就是这个）。另外 boot.S 里 0x18 才是 64 位代码段，中断门的
+ * selector 写 0x08 会在第一次时钟中断就 #GP(0x08)。
  *
  * 单核上是真并发（交错推进），不是并行；并行要多核，见 smp.plain.c。
  *
@@ -251,8 +255,13 @@ static void task_entry(void)
 /* 定时器中断入口。
  *
  * 一件事要说清楚：长模式下的 iretq **总是**弹 rip/cs/rflags/rsp/ss 五个
- * qword，但同一特权级的中断 CPU 只压了前三个。所以这里立刻换到中断栈，
- * 把五个 qword 补齐摆好，再压 15 个通用寄存器 —— 摆出来的布局正好等于
+ * qword，而中断进来时 CPU 压了几个是分机器的。实测这台机器（KVM，同一
+ * 特权级）：压五个，而且被打断的 rsp 就明明白白记在 [入口 rsp + 24] 里
+ * ——所以**不要自己算**"入口 rsp + 24"，直接读这一格。自己算的下场是偏低
+ * 16 字节：被打断的函数带着错的 rsp 继续跑，rbp 寻址的代码全都自己修回来
+ * 了，只有 ret 弹到栈上才炸成 `#UD at 0xffff..`，看着像随机三重故障
+ * （`fstest-bare-smp` 之前几跑一偶发就是这个）。只压 rip/cs/rflags 三个的
+ * 实现也留着兜底。摆好五个 qword 再压 15 个通用寄存器 —— 布局正好等于
  * struct Frame，于是"保存现场"和"恢复现场"都只是搬 160 字节。 */
 __asm__(
     ".text\n"
@@ -260,11 +269,15 @@ __asm__(
     "sched_irq0:\n"
     "  movq %rax, sched_sc_rax(%rip)\n"
     "  movq %rcx, sched_sc_rcx(%rip)\n"
-    "  movq %rsp, sched_sc_old(%rip)\n"      /* 被打断处的栈：里面是 CPU 的三个 qword */
+    "  movq %rsp, sched_sc_old(%rip)\n"      /* 被打断处的栈：里面是 CPU 压的中断帧 */
     "  movq istack_top(%rip), %rsp\n"        /* 换到中断栈，任务栈从此不再碰 */
     "  movq sched_sc_old(%rip), %rax\n"
+    "  leaq 24(%rax), %rcx\n"                /* 兜底：CPU 只压了 rip/cs/rflags 才用它 */
+    "  cmpq $0x10, 32(%rax)\n"               /* CPU 把 ss 也压了吗？（0x10 是我们的数据段） */
+    "  jne sched_irq0_have_rsp\n"
+    "  movq 24(%rax), %rcx\n"                /* 压了：被打断的 rsp 就记在这一格里 */
+    "sched_irq0_have_rsp:\n"
     "  pushq $0x10\n"                        /* ss */
-    "  leaq 24(%rax), %rcx\n"
     "  pushq %rcx\n"                         /* rsp（= 被打断时的 rsp） */
     "  movq 16(%rax), %rcx\n"
     "  pushq %rcx\n"                         /* rflags */
