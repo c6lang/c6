@@ -1011,3 +1011,27 @@ test 块、0 失败，每个文件一个镜像（`examples/boot/runtests.sh`）�
 （要 libc 的 FILE 布局）。踩到的三件事：默认 256KB 的 bump arena 不够（给
 calloc/free/realloc 就好）；`select` 要把 0/1/2 当永远就绪；多个 TU 一次
 编译会撞上 `c6_gc_new_lead` 的 NULL 标签名 strcmp（拆成 -c + 链接绕开）。
+
+"go 在裸机里是真并发吗" —— 现在能回答"是"，代价是自己写了个最小内核。
+`examples/boot/sched.plain.c`：8259A 重映射到 `0x20`、8254 每 10ms 一次、
+中断进来先换到调度器自己的栈（`istack`），把现场摆成一块 160 字节的
+`struct Frame`（15 个通用寄存器 + `rip/cs/rflags/rsp/ss`），换任务 = 换块
+Frame；新任务的帧是编出来的，第一次被调度时 `iretq` 直接落进 `task_entry`。
+对 `libtcc1` 暴露的就那 8 个 `pthread_*` 弱符号。`make fstest-bare-go` 里
+两个**没有让出语句**的任务互相等 flag，空转 400 万次（上限 2 亿）就看到对方
+立起来的 flag —— 顺序执行得把 2 亿次跑完，所以这是真的被时钟抢占交错了。
+
+三个只有真跑才知道的：长模式下 `iretq` **总是**弹五个 qword（同一特权级的
+中断 CPU 只压三个，得自己补齐，否则 `rsp` 出来是垃圾）；`boot.S` 里 `0x18`
+才是 64 位代码段（中断门 selector 写 `0x08` 第一次时钟中断就 `#GP(0x08)`，
+表现成三重故障、qemu 退出码 0，像"什么都没发生"）；引导器原来的栈
+`0x80000` 其实落在 payload 的 `.bss` 里面，变量一多就踩栈（这次踩到的是
+中断栈和堆），已挪到 16MB。
+
+还差的：**SMP**。真并行要把 AP 拉起来（INIT-SIPI-SIPI + 落在 0x8000 的
+16 位实模式跳板），而 tcc 的汇编器不认 `.code16`，跳板得再走一个 binutils
+目标（`examples/boot/ap.S`，`as --32`，和 `boot.S` 一样按固定地址链），
+再配 per-CPU 的 `cur`/中断栈/自旋锁和全局 run queue。另外 `go` 的**句柄**
+（`h->join()`/`h->value()`）在裸机上还没打通：要走 `libtcc1` 的每线程块
+（`calloc`/`free` + pthread 键），实测任务收尾后三重故障 —— 调度这层本身
+没问题，`pthread_create` + `pthread_join` + 返回值用普通函数体任务测过。
