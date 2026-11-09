@@ -14,7 +14,11 @@
 // EXPECT global_managed: error: an f-string is not a constant expression
 // EXPECT borrow_to_managed: error: cannot assign a 'char *' to '@char'
 // EXPECT managed_to_plain: error: a new reference cannot be stored in 'const char *'
-// EXPECT semicolon: error: f-string: ';' is not allowed in an interpolation
+// EXPECT nested_semicolon: error: f-string: ';' is only allowed once, to start the format spec
+// EXPECT bad_conv: error: f-string: unknown conversion 'z' in a format spec
+// EXPECT conv_type: error: f-string: a 'const char *' value takes no 'x' format spec
+// EXPECT width_big: error: f-string: format width 2000 is too large
+// EXPECT empty_spec: error: f-string: empty format spec in '{expr;spec}'
 // EXPECT try_in_fstr: error: 'try' is not allowed in an interpolation
 // EXPECT macro_param: error: 'n' undeclared
 
@@ -86,11 +90,40 @@ int main(void)
     const char *p = @f"x{n}";
     return p[0];
 }
-#elif defined semicolon
+#elif defined nested_semicolon
 int main(void)
 {
     int n = 1;
-    const char *p = f"{n;d}";           /* ';' 不是分隔符，也不许出现在这里 */
+    /* 语句表达式里的 ';' 会截断表达式：只允许一次 ';'，用来引入格式说明 */
+    const char *p = f"{(n; n)}";
+    return p[0];
+}
+#elif defined bad_conv
+int main(void)
+{
+    int n = 1;
+    const char *p = f"{n;z}";
+    return p[0];
+}
+#elif defined conv_type
+int main(void)
+{
+    const char *s = "x";
+    const char *p = f"{s;x}";           /* 文本不能按整数格式化 */
+    return p[0];
+}
+#elif defined width_big
+int main(void)
+{
+    int n = 1;
+    const char *p = f"{n;2000d}";
+    return p[0];
+}
+#elif defined empty_spec
+int main(void)
+{
+    int n = 1;
+    const char *p = f"{n;}";
     return p[0];
 }
 #elif defined try_in_fstr

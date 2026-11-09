@@ -1385,7 +1385,8 @@ struct filespec {
    a reader that skips the value desynchronises the stream (then a '#define'
    body or a macro argument holding 'f".."' produces garbage) */
 #define TOK_HAS_VALUE(t) \
-    ((t >= TOK_CCHAR && t <= TOK_LINENUM) || t == TOK_C6_FSTR)
+    ((t >= TOK_CCHAR && t <= TOK_LINENUM) || t == TOK_C6_FSTR \
+     || t == TOK_C6_FSTR_SPEC)
 #else
 #define TOK_HAS_VALUE(t) (t >= TOK_CCHAR && t <= TOK_LINENUM)
 #endif

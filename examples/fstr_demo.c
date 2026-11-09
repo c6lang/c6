@@ -42,6 +42,11 @@ int main(void)
     /* 指针：空指针是 (null)/0x0，其它是地址 */
     printf("3: %s %d\n", f"null={q}", q == NULL);
     printf("4: %s\n", f"&p.x={ &p.x }");
+    /* 格式说明：[flags][width][.precision][conv]，写在 ';' 后面
+       （同一行里写多个 f".." 会共用一块借用缓冲，所以一次打一个） */
+    printf("4b: %s\n", f"{n;08x}");
+    printf("4c: |%s|\n", f"{n;-6}");
+    printf("4d: %s\n", f"{text;.3}");
     /* 花括号、转义 */
     printf("5: %s\n", f"{{}} literal, tab:\there \"quoted\"");
     /* 任意表达式，只求值一次 */

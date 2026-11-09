@@ -13957,7 +13957,139 @@ static void c6_fstr_lit(void)
 
 /* one '..{expr}..' part: VTOP holds the value, and this picks the runtime
    call that prints it */
-static void c6_fstr_piece(void)
+/* ---- the format spec of one interpolation ('{expr;spec}') ------------- *
+   The spec is a small printf-like description of *how* to print the value
+   that the static type already selected.  The compiler parses it once, at
+   compile time, into these bits and hands them to __c6_fmt_spec(); the
+   runtime then applies them to the next piece only.  Keep the numbers in
+   sync with libtcc1.c and c99-rt.inc.  Width and precision are 10 bits each,
+   so a spec fits in an int. */
+
+#define C6_SPEC_WIDTH_SHIFT  0
+#define C6_SPEC_WIDTH_MASK   0x3ff
+#define C6_SPEC_PREC_SHIFT   10
+#define C6_SPEC_PREC_MASK    0x3ff
+#define C6_SPEC_CONV_SHIFT   20
+#define C6_SPEC_CONV_MASK    0xf
+#define C6_SPEC_LEFT         (1 << 24)
+#define C6_SPEC_ZERO         (1 << 25)
+#define C6_SPEC_PLUS         (1 << 26)
+#define C6_SPEC_HASH         (1 << 27)
+#define C6_SPEC_PREC_SET     (1 << 28)
+
+#define C6_CONV_NONE 0
+#define C6_CONV_D    1
+#define C6_CONV_U    2
+#define C6_CONV_XL   3
+#define C6_CONV_XU   4
+#define C6_CONV_O    5
+#define C6_CONV_B    6
+#define C6_CONV_C    7
+#define C6_CONV_S    8
+#define C6_CONV_P    9
+
+/* parse the text of a spec; SAVE (made by the caller) gets a copy for
+   diagnostics, since tokc is gone after the next next() */
+static int c6_fstr_spec_parse(const char *text, int len)
+{
+    int i = 0, bits = 0, v = 0;
+
+    for (; i < len; i++) {
+        int c = text[i];
+        if (c == '-')
+            bits |= C6_SPEC_LEFT;
+        else if (c == '0')
+            bits |= C6_SPEC_ZERO;
+        else if (c == '+')
+            bits |= C6_SPEC_PLUS;
+        else if (c == '#')
+            bits |= C6_SPEC_HASH;
+        else if (c == ' ')
+            continue;                   /* ' ' is accepted and ignored */
+        else
+            break;
+    }
+    /* printf reads a leading '0' as the flag, so '08' is zero-pad width 8 */
+    for (v = 0; i < len && text[i] >= '0' && text[i] <= '9'; i++)
+        v = v * 10 + (text[i] - '0');
+    if (v > C6_SPEC_WIDTH_MASK)
+        tcc_error("f-string: format width %d is too large", v);
+    bits |= (v & C6_SPEC_WIDTH_MASK) << C6_SPEC_WIDTH_SHIFT;
+    if (i < len && text[i] == '.') {
+        ++i;
+        for (v = 0; i < len && text[i] >= '0' && text[i] <= '9'; i++)
+            v = v * 10 + (text[i] - '0');
+        if (v > C6_SPEC_PREC_MASK)
+            tcc_error("f-string: format precision %d is too large", v);
+        bits |= (v & C6_SPEC_PREC_MASK) << C6_SPEC_PREC_SHIFT;
+        bits |= C6_SPEC_PREC_SET;
+    }
+    if (i < len) {
+        switch (text[i]) {
+        case 'd': case 'i': bits |= C6_CONV_D << C6_SPEC_CONV_SHIFT; break;
+        case 'u': bits |= C6_CONV_U << C6_SPEC_CONV_SHIFT; break;
+        case 'x': bits |= C6_CONV_XL << C6_SPEC_CONV_SHIFT; break;
+        case 'X': bits |= C6_CONV_XU << C6_SPEC_CONV_SHIFT; break;
+        case 'o': bits |= C6_CONV_O << C6_SPEC_CONV_SHIFT; break;
+        case 'b': bits |= C6_CONV_B << C6_SPEC_CONV_SHIFT; break;
+        case 'c': bits |= C6_CONV_C << C6_SPEC_CONV_SHIFT; break;
+        case 's': bits |= C6_CONV_S << C6_SPEC_CONV_SHIFT; break;
+        case 'p': bits |= C6_CONV_P << C6_SPEC_CONV_SHIFT; break;
+        default:
+            tcc_error("f-string: unknown conversion '%c' in a format spec",
+                      text[i]);
+        }
+        ++i;
+    }
+    if (i != len)
+        tcc_error("f-string: trailing '%c' in a format spec", text[i]);
+    return bits;
+}
+
+/* the conversion a spec asks for (C6_CONV_NONE when it has none) */
+static int c6_fstr_spec_conv(int bits)
+{
+    return (bits >> C6_SPEC_CONV_SHIFT) & C6_SPEC_CONV_MASK;
+}
+
+/* which conversions a value of this static type can take */
+static void c6_fstr_spec_check(int bits, CType *t, int kind)
+{
+    int conv = c6_fstr_spec_conv(bits);
+    int ok = 1;
+
+    if (!bits)
+        return;
+    switch (kind) {
+    case 0:                             /* integer / enum / bool */
+    case 1:                             /* char */
+        ok = conv == C6_CONV_NONE || conv == C6_CONV_D || conv == C6_CONV_U
+            || conv == C6_CONV_XL || conv == C6_CONV_XU
+            || conv == C6_CONV_O || conv == C6_CONV_B
+            || conv == C6_CONV_C || conv == C6_CONV_S;
+        break;
+    case 2:                             /* text */
+        ok = conv == C6_CONV_NONE || conv == C6_CONV_S;
+        break;
+    case 3:                             /* other pointer */
+        ok = conv == C6_CONV_NONE || conv == C6_CONV_P
+            || conv == C6_CONV_XL || conv == C6_CONV_XU;
+        break;
+    default:
+        break;
+    }
+    if (!ok) {
+        char b[160] = {0};
+        type_to_str(b, sizeof b, t, NULL);
+        tcc_error("f-string: a '%s' value takes no '%c' format spec", b,
+                  conv == C6_CONV_S ? 's' : conv == C6_CONV_C ? 'c'
+                  : conv == C6_CONV_P ? 'p' : conv == C6_CONV_D ? 'd'
+                  : conv == C6_CONV_U ? 'u' : conv == C6_CONV_XL ? 'x'
+                  : conv == C6_CONV_XU ? 'X' : conv == C6_CONV_O ? 'o' : 'b');
+    }
+}
+
+static void c6_fstr_piece(int spec)
 {
     CType *t = &vtop->type, elem = {0};
     SValue sv = {0};
@@ -13966,12 +14098,14 @@ static void c6_fstr_piece(void)
     if (bt == VT_BOOL) {
         CType c = {0};
         c.t = VT_INT;
+        c6_fstr_spec_check(spec, t, 0);
         gen_cast(&c);
         sv = *vtop;
         vpop();
         c6_rt_begin("__c6_fmt_b");
         vpushv(&sv);
-        c6_rt_end("__c6_fmt_b", 1);
+        vpushi(spec);
+        c6_rt_end("__c6_fmt_b", 2);
         return;
     }
     if (bt == VT_BYTE) {
@@ -13979,24 +14113,28 @@ static void c6_fstr_piece(void)
            the numeric value */
         CType c = {0};
         c.t = VT_INT;
+        c6_fstr_spec_check(spec, t, 1);
         gen_cast(&c);
         sv = *vtop;
         vpop();
         c6_rt_begin("__c6_fmt_ch");
         vpushv(&sv);
-        c6_rt_end("__c6_fmt_ch", 1);
+        vpushi(spec);
+        c6_rt_end("__c6_fmt_ch", 2);
         return;
     }
     if (bt == VT_SHORT || bt == VT_INT || bt == VT_LLONG || IS_ENUM(t->t)) {
         CType c = {0};
         uns = (t->t & VT_UNSIGNED) != 0;
         c.t = uns ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+        c6_fstr_spec_check(spec, t, 0);
         gen_cast(&c);
         sv = *vtop;
         vpop();
         c6_rt_begin(uns ? "__c6_fmt_u" : "__c6_fmt_i");
         vpushv(&sv);
-        c6_rt_end(uns ? "__c6_fmt_u" : "__c6_fmt_i", 1);
+        vpushi(spec);
+        c6_rt_end(uns ? "__c6_fmt_u" : "__c6_fmt_i", 2);
         return;
     }
     if (bt == VT_ARRAY && pointed_type(t)
@@ -14008,6 +14146,7 @@ static void c6_fstr_piece(void)
         elem = *pointed_type(t);
         managed = c6_is_managed(t);
         if ((elem.t & VT_BTYPE) == VT_BYTE) {
+            c6_fstr_spec_check(spec, t, 2);
             sv = *vtop;
             vpop();
             if (managed) {
@@ -14018,19 +14157,23 @@ static void c6_fstr_piece(void)
                 c6_rt_begin("__c6_str_len");
                 vpushv(&sv);
                 c6_rt_end("__c6_str_len", 1);
-                c6_rt_end("__c6_fmt_s", 2);
+                vpushi(spec);
+                c6_rt_end("__c6_fmt_s", 3);
             } else {
                 c6_rt_begin("__c6_fmt_c");
                 vpushv(&sv);
-                c6_rt_end("__c6_fmt_c", 1);
+                vpushi(spec);
+                c6_rt_end("__c6_fmt_c", 2);
             }
             return;
         }
+        c6_fstr_spec_check(spec, t, 3);
         sv = *vtop;                     /* any other pointer: the address */
         vpop();
         c6_rt_begin("__c6_fmt_p");
         vpushv(&sv);
-        c6_rt_end("__c6_fmt_p", 1);
+        vpushi(spec);
+        c6_rt_end("__c6_fmt_p", 2);
         return;
     }
     if (bt == VT_STRUCT && c6_slice_of_type(t)) {
@@ -14044,10 +14187,12 @@ static void c6_fstr_piece(void)
             tcc_error("cannot interpolate '%s': only a character slice "
                       "holds text", b);
         }
+        c6_fstr_spec_check(spec, t, 2);
         off = c6_slice_spill(sl);
         c6_rt_begin("__c6_fmt_sl");
         c6_slice_push_addr(off);
-        c6_rt_end("__c6_fmt_sl", 1);
+        vpushi(spec);
+        c6_rt_end("__c6_fmt_sl", 2);
         return;
     }
     {
@@ -14073,14 +14218,19 @@ static void c6_fstr_expr(int managed)
     next();                             /* past TOK_C6_FSTR_BEG */
     for (;;) {
         if (tok == TOK_C6_FSTR_EXPR) {
+            int spec = 0;
             next();
             ++c6_fstr_inexpr;
             gexpr();
             --c6_fstr_inexpr;
+            if (tok == TOK_C6_FSTR_SPEC) {
+                spec = c6_fstr_spec_parse(tokc.str.data, tokc.str.size - 1);
+                next();
+            }
             if (tok != TOK_C6_FSTR_EXPR_END)
                 expect("'}'");
             next();
-            c6_fstr_piece();
+            c6_fstr_piece(spec);
         } else if (tok == TOK_STR) {
             c6_fstr_lit();
         } else {

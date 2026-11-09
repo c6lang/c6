@@ -1156,6 +1156,7 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
     case TOK_STR:
     case TOK_LSTR:
     case TOK_C6_FSTR:
+    case TOK_C6_FSTR_SPEC:
         {
             /* Insert the string into the int array. */
             size_t nb_words =
@@ -1244,6 +1245,7 @@ static inline void tok_get(int *t, const int **pp, CValue *cv)
     case TOK_PPNUM:
     case TOK_PPSTR:
     case TOK_C6_FSTR:
+    case TOK_C6_FSTR_SPEC:
         cv->str.size = *p++;
         cv->str.data = (char*)p;
         p += (cv->str.size + sizeof(int) - 1) / sizeof(int);
@@ -2538,8 +2540,8 @@ static void fstr_lex(TokenString *ts, CString *expr)
 static void parse_fstr_string(const char *p, int len)
 {
     TokenString *ts = tok_str_alloc();
-    CString lit = {0}, expr = {0};
-    int i = 0, c = 0;
+    CString lit = {0}, expr = {0}, spec = {0};
+    int i = 0, c = 0, has_spec = 0;
 
     cstr_new(&lit);
     tok_str_add(ts, TOK_C6_FSTR_BEG);
@@ -2559,9 +2561,11 @@ static void parse_fstr_string(const char *p, int len)
             cstr_ccat(&lit, c);
             continue;
         }
-        /* an expression: '{' .. '}' , balanced over (), [] and {} */
+        /* an expression: '{' .. '}' , balanced over (), [] and {}; an
+           un-nested ';' starts the format spec, which runs to the '}' */
         fstr_add_lit(ts, &lit);
         cstr_new(&expr);
+        cstr_new(&spec);
         {
             int depth = 0, instr = 0, done = 0;
             for (++i; i < len - 1; i++) {
@@ -2593,11 +2597,17 @@ static void parse_fstr_string(const char *p, int len)
                     }
                     continue;
                 }
+                if (c == ';' && depth == 0) {
+                    /* '{expr;spec}': the format spec follows */
+                    has_spec = 1;
+                    break;
+                }
                 if (c == ';') {
                     /* fstr_lex() ends the buffer with a ';' sentinel, so a
-                       ';' in the text would silently cut the expression */
-                    tcc_error("f-string: ';' is not allowed in an "
-                              "interpolation");
+                       nested ';' (a statement expression) would silently cut
+                       the expression */
+                    tcc_error("f-string: ';' is only allowed once, to start "
+                              "the format spec ('{expr;spec}')");
                 }
                 if (c == '{' || c == '(' || c == '[') {
                     ++depth;
@@ -2614,16 +2624,36 @@ static void parse_fstr_string(const char *p, int len)
                 }
                 cstr_ccat(&expr, c);
             }
+            if (has_spec) {
+                for (++i; i < len - 1; i++) {
+                    c = (unsigned char)p[i];
+                    if (c == '}') {
+                        done = 1;       /* the for() below eats the '}' */
+                        break;
+                    }
+                    cstr_ccat(&spec, c);
+                }
+            }
             if (!done)
                 tcc_error("f-string: missing '}' in \"%s\"", p + 1);
         }
         if (!expr.size)
             tcc_error("f-string: '{}' needs an expression");
+        if (has_spec && !spec.size)
+            tcc_error("f-string: empty format spec in '{expr;spec}'");
         fstr_unquote(&expr);
         tok_str_add(ts, TOK_C6_FSTR_EXPR);
         fstr_lex(ts, &expr);
+        if (has_spec) {
+            CValue cval = {0};
+            cstr_ccat(&spec, '\0');
+            cval.str.size = spec.size;
+            cval.str.data = spec.data;
+            tok_str_add2(ts, TOK_C6_FSTR_SPEC, &cval);
+        }
         tok_str_add(ts, TOK_C6_FSTR_EXPR_END);
         cstr_free(&expr);
+        cstr_free(&spec);
     }
     fstr_add_lit(ts, &lit);
     tok_str_add(ts, TOK_C6_FSTR_END);
@@ -4215,14 +4245,14 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "#define __TCC_FSTR_DEFINED 1\n"
           "void __c6_fmt_beg(void);\n"
           "void __c6_fmt_l(const char *s, unsigned long n);\n"
-          "void __c6_fmt_s(const char *s, unsigned long n);\n"
-          "void __c6_fmt_c(const char *s);\n"
-          "void __c6_fmt_ch(int c);\n"
-          "void __c6_fmt_sl(const void *pair);\n"
-          "void __c6_fmt_i(long long v);\n"
-          "void __c6_fmt_u(unsigned long long v);\n"
-          "void __c6_fmt_p(const void *p);\n"
-          "void __c6_fmt_b(int v);\n"
+          "void __c6_fmt_s(const char *s, unsigned long n, int spec);\n"
+          "void __c6_fmt_c(const char *s, int spec);\n"
+          "void __c6_fmt_ch(int c, int spec);\n"
+          "void __c6_fmt_sl(const void *pair, int spec);\n"
+          "void __c6_fmt_i(long long v, int spec);\n"
+          "void __c6_fmt_u(unsigned long long v, int spec);\n"
+          "void __c6_fmt_p(const void *p, int spec);\n"
+          "void __c6_fmt_b(int v, int spec);\n"
           "void *__c6_fmt_end(int flags);\n"
           "unsigned long long __c6_str_len(const void *p);\n"
           "#endif\n"

@@ -858,6 +858,22 @@ unary-expression，随后由约束 C2 要求该表达式的**根**必须是一�
 
 ```
     f"n={n} {{done}}"      (* 文本 "n="，插值 n，文本 " {done}" *)
+    f"n={n;08x}"           (* 插值 n，格式说明 08x *)
+```
+
+每个插值可以带一个格式说明：
+
+```
+format-spec            = [ flags ] [ width ] [ "." precision ] [ conv ] ;
+flags                  = { "-" | "0" | "+" | "#" } ;
+width                  = digit , { digit } ;      (* <= 1023 *)
+precision              = digit , { digit } ;      (* <= 1023 *)
+conv                   = "d" | "i" | "u" | "x" | "X" | "o" | "b"
+                       | "c" | "s" | "p" ;
+```
+
+```
+    f"[{s;10}]"      f"[{s;-10.3}]"      f"{n;08x}"      f"{ok;6}"
 ```
 
 * `{` 与 `}` 之间是一个**表达式**（`}` 必须配对，见 C86）；`{{` / `}}` 输出
@@ -872,8 +888,20 @@ unary-expression，随后由约束 C2 要求该表达式的**根**必须是一�
   比较是 `int`，得到 `0`/`1`，`_Bool` 才得到 `false`/`true`；
 * `f".."` 的类型是 `const char *`，`@f".."` 的类型是 `@char`（托管引用，
   见 8.1）；两者都不是常量表达式（C85）；
-* 插值里不能有 `;`，也不能用 `try`（C88）；宏形参在插值里不展开（表达式
-  是宏展开之后才过预处理的），宏体、宏实参和 `#x` 字符串化都正常；
+* 插值里不能用 `try`（C88）；`;` 只能出现一次，用来引入格式说明，语句
+  表达式里的 `;` 因此也会被拒绝（C88）；宏形参在插值里不展开（表达式是宏
+  展开之后才过预处理的），宏体、宏实参和 `#x` 字符串化都正常；
+* 格式说明的语义：
+  - flags：`-` 左对齐、`0` 补零、`+` 正整数也带符号、`#` 加进制前缀
+    （`0x`/`0`/`0b`，值为 0 时不加，`p` 的 `0x` 不受影响）；
+  - width：最少列数，不够用空格（`0` 时用零）补齐；`-` 时补在右边；
+  - `.precision`：整数是最少位数（前面补零），文本是最大字节数；
+  - conv：不写就按静态类型（见上表）；写了就按它——`u`/`x`/`X`/`o`/`b` 把
+    值当**无符号**解释（`f"{-5;x}"` 是 `fffffffffffffffb`），`d`/`i` 保留
+    符号，`c` 取低字节当字符，`s` 把值当文本，`p` 当指针（默认带 `0x`）；
+  - 能用的 conv 由静态类型决定（C89）：整数/`enum`/`_Bool`/`char` 接受
+    `d i u x X o b c s`（`_Bool` 用 `s` 时是 `true`/`false`），文本只接受
+    `s`，指针只接受 `p x X`；
 * `f".."` 的结果是**借用**：同一个嵌套深度只有一块结果缓冲，同一个完整表达式
   里的两个 `f".."` 会互相覆盖；要同时活着就写 `@f".."`。
 
@@ -998,7 +1026,8 @@ parameter-list    = identifier , { "," , identifier } ;
 | C85 | `f".."` / `@f".."` 不是常量表达式，不能出现在文件作用域或 `static` 局部的初始化式里 | `an f-string is not a constant expression` |
 | C86 | f-string 里的 `{` 必须有配对的 `}`，且 `{}` 里要有一个表达式 | `f-string: missing '}' in ".."`；`f-string: '{}' needs an expression` |
 | C87 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
-| C88 | 插值里不能出现 `;`（表达式只到 `;` 为止），也不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上） | `f-string: ';' is not allowed in an interpolation`；`'try' is not allowed in an interpolation: ...` |
+| C88 | 插值里不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上）；`;` 只能出现一次（引入格式说明），语句表达式里的 `;` 同样被拒绝 | `'try' is not allowed in an interpolation: ...`；`f-string: ';' is only allowed once, to start the format spec ('{expr;spec}')` |
+| C89 | 格式说明要与插值的静态类型相容，`conv` 必须是已知的，宽度/精度不超过 1023，`;` 后面不能为空 | `f-string: unknown conversion 'z' in a format spec`；`f-string: a 'const char *' value takes no 'x' format spec`；`f-string: format width 2000 is too large`；`f-string: empty format spec in '{expr;spec}'` |
 
 ---
 
@@ -1496,7 +1525,9 @@ body 直接 `return` 回到驱动方；恢复时把它们取回来，再跳到�
 =>
     __c6_fmt_beg();                              (* 压一个构造器到本线程的栈上 *)
     __c6_fmt_l("a", 1);                          (* 文本片段：立即拷进缓冲 *)
-    __c6_fmt_i((long long)(n));                  (* 插值：按类型选一个 __c6_fmt_* *)
+    __c6_fmt_i((long long)(n), 0);               (* 插值：按类型选一个 __c6_fmt_* *)
+                                                 (* 第二个实参是格式说明的位编码，
+                                                    没有说明时是 0 *)
     __c6_fmt_l("b", 1);
     __c6_fmt_end(0)                              (* 借用：文本在本深度的缓冲里 *)
 
@@ -1510,14 +1541,18 @@ body 直接 `return` 回到驱动方；恢复时把它们取回来，再跳到�
 
 | 插值的类型 | 生成的调用 |
 |---|---|
-| `char` / `signed char` / `unsigned char` | `__c6_fmt_ch((int)x)` |
-| `short` / `int` / `long long` / `enum`（有符号） | `__c6_fmt_i((long long)x)` |
-| 同上但无符号 | `__c6_fmt_u((unsigned long long)x)` |
-| `_Bool` | `__c6_fmt_b((int)x)` |
-| `const char *`（含 `char[N]`、`char[:]`） | `__c6_fmt_s(p, n)` |
-| 托管 `@char` | `__c6_fmt_s(p, __c6_str_len(p))` |
-| 其它指针 | `__c6_fmt_p((const void *)x)` |
-| 字符切片 | `__c6_fmt_sl(&x)` |
+| `char` / `signed char` / `unsigned char` | `__c6_fmt_ch((int)x, spec)` |
+| `short` / `int` / `long long` / `enum`（有符号） | `__c6_fmt_i((long long)x, spec)` |
+| 同上但无符号 | `__c6_fmt_u((unsigned long long)x, spec)` |
+| `_Bool` | `__c6_fmt_b((int)x, spec)` |
+| `const char *`（含 `char[N]`） | `__c6_fmt_c(p, spec)` |
+| 托管 `@char` | `__c6_fmt_s(p, __c6_str_len(p), spec)` |
+| 其它指针 | `__c6_fmt_p((const void *)x, spec)` |
+| 字符切片 | `__c6_fmt_sl(&x, spec)` |
+
+`spec` 是格式说明的位编码（宽度 10 位、精度 10 位、conv 4 位、flags 5 位），
+由编译器在编译期解析好；没有写说明时是 0，运行时的默认行为就是上一节
+「按静态类型输出」那一套。
 
 构造器**不带指针参数**：`__c6_fmt_beg()` 从每线程的槽数组里按嵌套深度
 取一个（深度在编译期就是已知的调用配对），所以嵌套、递归、循环互不干扰。
@@ -1757,11 +1792,12 @@ int main(void)
 | `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
 | `f"{x}"` 而 `x` 是浮点、结构体、函数（`f"{printf}"`）、非字符切片 | 约束 C84：没有格式化语法，先自己格式化再插进来；函数**指针**变量按普通指针输出地址 |
-| `f"{n;d}"` / `f"{(try g())}"` | 约束 C88：`;` 不是分隔符，插值里也不能传播错误 |
+| `f"{(try g())}"` / `f"{(a;b)}"` | 约束 C88：插值里不能传播错误，`;` 只能用来引入格式说明 |
+| `f"{n;z}"` / `f"{s;x}"` / `f"{n;2000d}"` / `f"{n;}"` | 约束 C89：格式说明要合法且与类型相容 |
 | `#define M(n) f"x{n}"` 里的 `{n}` | 宏形参在插值里不展开：先落成变量，或不用宏 |
 | 同一表达式里两个 `f".."` 同时使用 | 借用缓冲按嵌套深度只有一块，后一个覆盖前一个；要同时活着写 `@f".."` |
 | `f"{c}"` 想得到字符 `c` 的数值 | 插 `char` 输出的是字符本身，数值写 `{(int)c}` |
-| 宽度 / 精度 / 命名参数（`{x:>8}`、`{x:.2f}`、`{x=}`） | 不提供：`{` 与 `}` 之间只是一个表达式 |
+| `:` 形式的格式说明（`{x:>8}`、`{x:.2f}`、`{x=}`） | 不提供：`:` 在 C 里是三元运算符的一部分，格式说明用 `;` 引入（见 5.1） |
 | 文件作用域或 `static` 局部初始化式里的 `f".."` / `@f".."` | 约束 C85：不是常量表达式 |
 | `f "{x}"`（`f` 与引号之间有空白） | 词法上不是 f-string：那是标识符 `f` 后面跟一个字符串字面量 |
 | 把 `f".."` 的结果存下来长期使用（不带 `@`） | 借用：下一次同深度的 `f".."` 会覆盖它；要留住写 `@f".."` |
