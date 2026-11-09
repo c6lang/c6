@@ -963,6 +963,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
 | C82 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
 | C83 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
+| C84 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
 
 ---
 
@@ -1635,6 +1636,7 @@ int main(void)
 | `await` 写在 `defer` 体 / `sizeof` 里 | 约束 C31 |
 | `c6_io(fd, ev)` 不加 `await` | 约束 C32 |
 | 函数指针 / 数组 / VLA 作为 `async` 函数的形参或返回值 | 约束 C29：任务结构要能从声明写回，这几类写不回去 |
+| `async` 体里的 VLA 局部量 / `alloca` | 约束 C84：栈上分配的空间在挂起之后不归这个 body（恢复时栈指针回到序言的位置） |
 | `async` 嵌套定义、`async inline`、`async int main` | 约束 C29 |
 | 用 `setjmp`/`ucontext`/独立栈实现的有栈协程 | 不在本扩展范围：`async` 体始终跑在调用方的栈上 |
 | `co f();`（`f` 是普通函数） | 约束 C35：普通函数用 `go` |
