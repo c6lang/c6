@@ -375,6 +375,10 @@ static void c6_gc_new_expr(void);
 static int c6_gc_move_lead(void);
 static void c6_gc_move_expr(void);
 static void c6_fstr_expr(int managed);
+/* non-zero while an interpolation of an f-string is being parsed: a top-level
+   'return' there (which is what 'try' does) would leave the runtime builder
+   open, so it is rejected (see c6_try_parse) */
+static int c6_fstr_inexpr = 0;
 static void c6_gc_return_hook(void);
 static void c6_gc_discard_hook(void);
 static void c6_gc_site(int off, CType *type);
@@ -11861,6 +11865,10 @@ static void c6_try_parse(void)
         tcc_error("'try' requires -std=c6");
     if (defer_state.body_depth > 0)
         tcc_error("'try' is not allowed in a defer body");
+    if (c6_fstr_inexpr)
+        tcc_error("'try' is not allowed in an interpolation: the error path "
+                  "returns from the function and would leave the f-string "
+                  "builder open (use a temporary: 'int v = try f();')");
     if (!c6_func_sym || !c6_func_sym->type.ref->f.func_fallible)
         tcc_error("'try' requires the enclosing function to return 'T!error'");
     next();                             /* skip 'try' */
@@ -14066,7 +14074,9 @@ static void c6_fstr_expr(int managed)
     for (;;) {
         if (tok == TOK_C6_FSTR_EXPR) {
             next();
+            ++c6_fstr_inexpr;
             gexpr();
+            --c6_fstr_inexpr;
             if (tok != TOK_C6_FSTR_EXPR_END)
                 expect("'}'");
             next();

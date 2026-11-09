@@ -14,6 +14,9 @@
 // EXPECT global_managed: error: an f-string is not a constant expression
 // EXPECT borrow_to_managed: error: cannot assign a 'char *' to '@char'
 // EXPECT managed_to_plain: error: a new reference cannot be stored in 'const char *'
+// EXPECT semicolon: error: f-string: ';' is not allowed in an interpolation
+// EXPECT try_in_fstr: error: 'try' is not allowed in an interpolation
+// EXPECT macro_param: error: 'n' undeclared
 
 #if defined empty_braces
 int main(void)
@@ -81,6 +84,37 @@ int main(void)
 {
     int n = 1;
     const char *p = @f"x{n}";
+    return p[0];
+}
+#elif defined semicolon
+int main(void)
+{
+    int n = 1;
+    const char *p = f"{n;d}";           /* ';' 不是分隔符，也不许出现在这里 */
+    return p[0];
+}
+#elif defined try_in_fstr
+int!error boom(int n)
+{
+    err(1, "boom");
+    return n;
+}
+static int!error test(void)
+{
+    /* 插值里 try：错误路径会从函数返回，构造器就留在栈上了 */
+    return (int)f"{(try boom(1))}";
+}
+int main(void)
+{
+    int v = test() catch e { return 0; };
+    return v;
+}
+#elif defined macro_param
+#define MACRO_PARAM(n) f"n{n}"
+int main(void)
+{
+    /* 宏形参在 f".." 的插值里不展开（表达式是后来才过预处理的） */
+    const char *p = MACRO_PARAM(1);
     return p[0];
 }
 #else

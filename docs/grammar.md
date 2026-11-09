@@ -871,7 +871,11 @@ unary-expression，随后由约束 C2 要求该表达式的**根**必须是一�
   插它得到 `65`（要字符就用 `char` 变量或写 `{(char)'A'}`）；`n > 0` 这类
   比较是 `int`，得到 `0`/`1`，`_Bool` 才得到 `false`/`true`；
 * `f".."` 的类型是 `const char *`，`@f".."` 的类型是 `@char`（托管引用，
-  见 8.1）；两者都不是常量表达式（C85）。
+  见 8.1）；两者都不是常量表达式（C85）；
+* 插值里不能有 `;`，也不能用 `try`（C88）；宏形参在插值里不展开（表达式
+  是宏展开之后才过预处理的），宏体、宏实参和 `#x` 字符串化都正常；
+* `f".."` 的结果是**借用**：同一个嵌套深度只有一块结果缓冲，同一个完整表达式
+  里的两个 `f".."` 会互相覆盖；要同时活着就写 `@f".."`。
 
 ---
 
@@ -994,6 +998,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C85 | `f".."` / `@f".."` 不是常量表达式，不能出现在文件作用域或 `static` 局部的初始化式里 | `an f-string is not a constant expression` |
 | C86 | f-string 里的 `{` 必须有配对的 `}`，且 `{}` 里要有一个表达式 | `f-string: missing '}' in ".."`；`f-string: '{}' needs an expression` |
 | C87 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
+| C88 | 插值里不能出现 `;`（表达式只到 `;` 为止），也不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上） | `f-string: ';' is not allowed in an interpolation`；`'try' is not allowed in an interpolation: ...` |
 
 ---
 
@@ -1751,7 +1756,10 @@ int main(void)
 | 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | 声明能过，但结构体→接口的转换点会报 `'{' expected (got ';')`——接口方法目前只支持标量签名，这是元组之前就有的缺口（与约束 C51–C60 无关） |
 | `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
-| `f"{x}"` 而 `x` 是浮点、结构体、函数指针、非字符切片 | 约束 C84：没有格式化语法，先自己格式化再插进来 |
+| `f"{x}"` 而 `x` 是浮点、结构体、函数（`f"{printf}"`）、非字符切片 | 约束 C84：没有格式化语法，先自己格式化再插进来；函数**指针**变量按普通指针输出地址 |
+| `f"{n;d}"` / `f"{(try g())}"` | 约束 C88：`;` 不是分隔符，插值里也不能传播错误 |
+| `#define M(n) f"x{n}"` 里的 `{n}` | 宏形参在插值里不展开：先落成变量，或不用宏 |
+| 同一表达式里两个 `f".."` 同时使用 | 借用缓冲按嵌套深度只有一块，后一个覆盖前一个；要同时活着写 `@f".."` |
 | `f"{c}"` 想得到字符 `c` 的数值 | 插 `char` 输出的是字符本身，数值写 `{(int)c}` |
 | 宽度 / 精度 / 命名参数（`{x:>8}`、`{x:.2f}`、`{x=}`） | 不提供：`{` 与 `}` 之间只是一个表达式 |
 | 文件作用域或 `static` 局部初始化式里的 `f".."` / `@f".."` | 约束 C85：不是常量表达式 |

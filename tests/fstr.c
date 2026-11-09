@@ -207,6 +207,25 @@ test "err(f\"..\") 的消息会被复制下来" {
         err(3, "err(f\"\") 的消息不对，或者已经被覆盖");
 }
 
+/* 宏里的 f".."：宏体、宏实参、字符串化都要能带着原始文本走 */
+#define FSTR_LIT f"macro"
+#define FSTR_NOP() f"zero"
+#define FSTR_ARG(x) (x)
+#define FSTR_STR(x) #x
+
+test "宏里的 f\"..\"" {
+    int n = 7;
+
+    if (!eq(FSTR_LIT, "macro"))
+        err(1, "对象式宏体里的 f\"..\" 不对");
+    if (!eq(FSTR_NOP(), "zero"))
+        err(2, "函数式宏体里的 f\"..\" 不对");
+    if (!eq(FSTR_ARG(f"a{n}"), "a7"))
+        err(3, "f\"..\" 当宏实参不对");
+    if (0 != strcmp(FSTR_STR(f"a{n}"), "f\"a{n}\""))
+        err(4, "字符串化 f\"..\" 不对");
+}
+
 test "跨翻译单元" {
     if (2 != tu_text_len(f"{7}{8}"))
         err(1, "把 f\"\" 的结果传给另一个 TU 不对");

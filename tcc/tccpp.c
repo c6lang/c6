@@ -2512,6 +2512,13 @@ static void fstr_lex(TokenString *ts, CString *expr)
                                    the buffer, so tcc_close() is ours */
     cstr_ccat(&buf, '\0');
     tcc_open_bf(tcc_state, "<f-string>", buf.size);
+    /* the expression came from the real source: keep its name and line so
+       that a diagnostic (and '__FILE__' / '__LINE__') points there and not
+       at this synthetic buffer */
+    if (file->prev) {
+        pstrcpy(file->filename, sizeof file->filename, file->prev->filename);
+        file->line_num = file->prev->line_num;
+    }
     memcpy(file->buffer, buf.data, buf.size);
     macro_stack = NULL;         /* read the buffer, not an enclosing expansion */
     macro_ptr = NULL;
@@ -2585,6 +2592,12 @@ static void parse_fstr_string(const char *p, int len)
                             break;
                     }
                     continue;
+                }
+                if (c == ';') {
+                    /* fstr_lex() ends the buffer with a ';' sentinel, so a
+                       ';' in the text would silently cut the expression */
+                    tcc_error("f-string: ';' is not allowed in an "
+                              "interpolation");
                 }
                 if (c == '{' || c == '(' || c == '[') {
                     ++depth;
@@ -3513,7 +3526,11 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
                     tok_str_add2(&str, t2, &cval);
                 }
             } else {
-                tok_str_add(&str, t);
+                /* keep the value: an f-string is a token above TOK_IDENT
+                   that carries its raw text, and dropping it here would
+                   desynchronise the stream ('tok_str_add2' writes only the
+                   token for a token without a value) */
+                tok_str_add2(&str, t, &cval);
             }
         } else {
             tok_str_add2(&str, t, &cval);

@@ -770,6 +770,8 @@ static void tcc_th_join_children(TccThCtx *th)
     }
 }
 
+static void tcc_fmt_free_all(TccThCtx *th);
+
 static void tcc_th_free(TccThCtx *th)
 {
     if (!th || th->th_freed)
@@ -783,6 +785,7 @@ static void tcc_th_free(TccThCtx *th)
         free(th->dctx);
     if (th->co)
         tcc_th_co_free(th->co);
+    tcc_fmt_free_all(th);
     free(th);
 }
 
@@ -1978,6 +1981,30 @@ unsigned long long __c6_str_len(const void *p)
     return n;
 }
 
+
+/* Give back the f-string builders of a thread that is going away.  They are
+   kept for the life of the thread -- one per nesting depth, reused -- so this
+   is the only place they are freed. */
+static void tcc_fmt_free_all(TccThCtx *th)
+{
+    int i = 0;
+
+    for (i = 0; i < th->fmt_nslot; i++) {
+        C6FmtBuf *b = th->fmt_slot[i];
+        if (!b)
+            continue;
+        if (b->heap)
+            free(b->heap);
+        if (b->out)
+            free(b->out);
+        free(b);
+    }
+    if (th->fmt_slot)
+        free(th->fmt_slot);
+    th->fmt_slot = 0;
+    th->fmt_nslot = 0;
+    th->fmt_depth = 0;
+}
 
 /* ------------------------------------------------------------------------- */
 /* c6 extension runtime: slices 'T[:]'                                   */

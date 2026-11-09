@@ -1380,7 +1380,15 @@ struct filespec {
 #define TOK_PPSTR   0xce /* preprocessor string */
 #define TOK_LINENUM 0xcf /* line number info */
 
+#ifdef C6_EXT
+/* an f-string carries its raw text in a TokenString, like a string literal:
+   a reader that skips the value desynchronises the stream (then a '#define'
+   body or a macro argument holding 'f".."' produces garbage) */
+#define TOK_HAS_VALUE(t) \
+    ((t >= TOK_CCHAR && t <= TOK_LINENUM) || t == TOK_C6_FSTR)
+#else
 #define TOK_HAS_VALUE(t) (t >= TOK_CCHAR && t <= TOK_LINENUM)
+#endif
 
 #define TOK_EOF       (-1)  /* end of file */
 #define TOK_LINEFEED  10    /* line feed */
