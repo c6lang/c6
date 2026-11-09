@@ -13802,6 +13802,18 @@ static int c6_async_dispatch = 0;         /* jump chain to the resume dispatcher
 static int c6_async_base_off = 0;         /* slot holding the frame base marker */
 static int c6_async_fr_off = 0;           /* slot of the 'void *task' parameter */
 
+/* The back end's answer to 'can the body run with its frame inside the task?'
+   is asked once per async definition and kept in 'c6_stable_frame' while that
+   body is compiled; the descriptor then carries the frame size the back end
+   reports from its epilog (c6_frame_size_set()). */
+ST_DATA int c6_stable_frame = 0;
+ST_DATA int c6_stable_frame_size = 0;
+
+ST_FUNC void c6_frame_size_set(int size)
+{
+    c6_stable_frame_size = size;
+}
+
 #define C6_CO_KIND_DONE  0
 #define C6_CO_KIND_IO    1
 #define C6_CO_KIND_CHILD 2
@@ -14378,17 +14390,20 @@ static void c6_async_func_begin(void)
 
     if (!arg)
         tcc_error("internal: async body has no frame argument");
-    /* the whole native frame of an async function is copied into the task and
-       restored at a possibly different address, so a weak slot (which is a
-       pointer to the slot itself) cannot be supported here */
+    /* A back end that parks the native frame of the body copies it to a
+       possibly different address, so a weak slot (which is a pointer to the
+       slot itself) cannot be supported there.  With the frame living in the
+       task ('c6_stable_frame') the slot never moves and 'weak' is fine. */
     c6_async_in_body = 1;
-    if (c6_type_gq(pointed_type(&c6_async_ftype)) & C6_GQ_WEAK)
-        tcc_error("a 'weak' reference cannot be returned by an async "
-                  "function: its frame is moved to the task");
-    for (p = c6_async_params(&c6_async_ftype); p; p = p->next)
-        if (c6_type_gq(&p->type) & C6_GQ_WEAK)
-            tcc_error("a 'weak' reference cannot be a parameter of an async "
+    if (!c6_stable_frame) {
+        if (c6_type_gq(pointed_type(&c6_async_ftype)) & C6_GQ_WEAK)
+            tcc_error("a 'weak' reference cannot be returned by an async "
                       "function: its frame is moved to the task");
+        for (p = c6_async_params(&c6_async_ftype); p; p = p->next)
+            if (c6_type_gq(&p->type) & C6_GQ_WEAK)
+                tcc_error("a 'weak' reference cannot be a parameter of an "
+                          "async function: its frame is moved to the task");
+    }
     c6_async_fr_off = arg->c;
     loc = (loc - PTR_SIZE) & -PTR_SIZE;
     c6_async_base_off = loc;
@@ -14597,11 +14612,13 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     int body = c6_async_tok("__c6_body_", name, "");
     TokenString *ts = 0;
     Sym *body_sym = 0;
-    int align = 0, size = 0, rel = 0;
+    int align = 0, size = 0, rel = 0, stable = 0, fsiz = 0;
 
     c6_async_declare(ftype, name);
 
-    /* 'int __c6_body_NAME(void *__c6_arg);' */
+    /* 'int __c6_body_NAME(void *__c6_arg, void *__c6_frm);' -- the second
+       argument is the top of the frame the body must run on; a back end
+       without frame-in-task support ignores it and uses the native stack */
     ts = tok_str_alloc();
     tok_str_add(ts, TOK_INT);
     tok_str_add(ts, body);
@@ -14609,6 +14626,10 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     tok_str_add(ts, TOK_VOID);
     tok_str_add(ts, '*');
     tok_str_add(ts, tok_alloc_const("__c6_arg"));
+    tok_str_add(ts, ',');
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, tok_alloc_const("__c6_frm"));
     tok_str_add(ts, ')');
     tok_str_add(ts, ';');
     tok_str_add(ts, TOK_EOF);
@@ -14626,8 +14647,18 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     c6_async_nstates = 0;
     c6_async_dispatch = 0;
 
+    /* ask the back end before the body is generated: the prolog it emits
+       depends on the answer, and so does everything gated on 'weak'.  It is
+       cleared again right after the body, because the release function the
+       descriptor mentions is an ordinary function. */
+    stable = c6_backend_frame_in_task() ? 1 : 0;
+    c6_stable_frame = stable;
+    c6_stable_frame_size = 0;
+
     cur_text_section = text_section;
     gen_function(body_sym);
+    c6_stable_frame = 0;
+    fsiz = c6_stable_frame_size;
 
     /* 'const struct __c6_desc __c6_desc_NAME = { size, align, max, body };' */
     {
@@ -14654,6 +14685,10 @@ static void c6_async_definition(Sym *sym, CType *ftype)
         tok_str_add(ts, rel);   /* gives back the references the task owns */
     else
         c6_async_add_int(ts, 0);
+    tok_str_add(ts, ',');
+    /* the frame the task has to own: 0 means the back end parks the native
+       frame on every suspension instead (c6_backend_frame_in_task() == 0) */
+    c6_async_add_int(ts, stable ? (fsiz > 0 ? fsiz : 16) : 0);
     tok_str_add(ts, '}');
     tok_str_add(ts, ';');
     tok_str_add(ts, TOK_EOF);
@@ -15245,7 +15280,8 @@ static void c6_gc_site(int off, CType *type)
 
     if (!defer_state.enabled || nocode_wanted || off >= 0)
         return;                     /* parameters are borrowed */
-    if ((c6_type_gq(type) & C6_GQ_WEAK) && c6_async_in_body)
+    if ((c6_type_gq(type) & C6_GQ_WEAK) && c6_async_in_body
+        && !c6_stable_frame)
         tcc_error("a 'weak' reference cannot be declared in an async "
                   "function: its frame is moved to the task");
     id = ++defer_state.next_site;

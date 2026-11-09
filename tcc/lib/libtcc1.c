@@ -1691,30 +1691,37 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 /* ------------------------------------------------------------------------- */
 /* c6 extension runtime: async / await (stackless coroutines)                */
 /*                                                                           */
-/* An 'async' function is compiled to 'int __c6_body_NAME(void *task)'.  The */
-/* body runs on the caller's stack; every suspension ("await" that has to    */
-/* wait) copies the used part of the native frame into the task and returns  */
-/* to whoever drives the task.  Resuming re-enters the body, copies the      */
-/* saved frame back to the same offsets and jumps to the recorded resume      */
-/* point.  'co f();' makes a coroutine top-level: it is put on the ready list */
-/* below and stepped by tcc_co_pump(), which is the scheduler.  Task objects   */
-/* live in this file so that 'struct __c6_task'                              */
-/* has exactly the layout that tcc_predefs() declares to compiled programs;  */
-/* generated code only ever touches it through the __c6_co_* accessors.      */
-
-#define C6_CO_MAX        64     /* concurrent tasks (frames + slots) */
-#define C6_CO_FRAME_MAX  4096   /* largest native frame an async body may use */
-#define C6_CO_TASK_MAX   1024   /* largest 'struct NAME_task' */
-#define C6_CO_DEFER_MAX  256    /* parked defer records per task */
+/* An 'async' function is compiled to                                        */
+/* 'int __c6_body_NAME(void *task, void *frame)'.  A task owns one block: the */
+/* 'struct NAME_task' header, the parked 'defer' records and - when the back  */
+/* end supports it (c6_backend_frame_in_task()) - the native frame of the     */
+/* body.  The body's frame pointer is set to the top of that block, so every  */
+/* local keeps its offset, a suspension is nothing but a return to the driver */
+/* and a local's address stays what it was for the whole life of the task.    */
+/*                                                                           */
+/* A back end without that support leaves 'frame_size' 0 in the descriptor:   */
+/* there the used part of the native frame is copied into the task at every   */
+/* suspension and copied back at every resume ('__c6_co_suspend' below), so a */
+/* '&local' held across an 'await' is only valid again at the same address.   */
+/*                                                                           */
+/* 'co f();' makes a coroutine top-level: it is put on the ready list below   */
+/* and stepped by tcc_co_pump(), which is the scheduler.  Task objects live   */
+/* in this file so that 'struct __c6_task' has exactly the layout that        */
+/* tcc_predefs() declares to compiled programs; generated code only ever      */
+/* touches it through the __c6_co_* accessors.                                */
 
 #define C6_CO_KIND_DONE   0
 #define C6_CO_KIND_IO     1
 #define C6_CO_KIND_CHILD  2
 #define C6_CO_KIND_ERR    3
+#define C6_CO_KIND_SKIP   4   /* internal: nothing to do right now */
 #define C6_CO_KIND_ABORT  5   /* the task is being destroyed: run cleanups */
 
 #define C6_CO_STATE_NEW   0
 #define C6_CO_STATE_DONE  (-1)
+
+/* Largest native frame a back end without frame-in-task support can park. */
+#define C6_CO_COPY_FRAME  4096
 
 /* lays out exactly like the predef in tccpp.c:tcc_predefs() */
 typedef struct TccCoTask {
@@ -1725,28 +1732,26 @@ typedef struct TccCoTask {
     void *desc, *frame, *defer_arena, *parent, *child;
     const char *err_msg;
     int frame_size, __pad1;
-    void *frame_addr;           /* where the frame was parked */
+    void *frame_addr;
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
     int waiting;                /* parked on wait_fd, waiting for select() */
 } TccCoTask;
 
 typedef struct TccCoDesc {
-    unsigned size, align;
-    int defer_max;
-    int (*entry)(void *);
+    unsigned size, align;       /* 'struct NAME_task': header + declared fields */
+    int defer_max;              /* parked defer records */
+    int (*entry)(void *, void *);       /* (task, top of the frame) */
     void (*release)(void *);    /* give back what the task slot owns */
+    unsigned frame_size;        /* 0: the frame is parked on every suspension */
 } TccCoDesc;
 
-/* One slot per task, big enough for 'struct NAME_task' (the header plus the
-   declared return value and parameters).  'long long' keeps every slot
-   8-byte aligned.  The whole pool is per thread and allocated on first use:
-   most threads never create a task and should not pay for the 512 KiB. */
+/* One block per task, allocated when the task is created:
+     [TccCoTask][struct NAME_task fields][defer records][frame]
+   'frame' is the top of the frame region, which is what the body's frame
+   pointer points at; a local lives at 'frame - offset'.  'frame_size' in the
+   descriptor, not the pool, is what bounds it. */
 struct TccCoPool {
-    long long task_mem[C6_CO_MAX][C6_CO_TASK_MAX / 8];
-    char frames[C6_CO_MAX][C6_CO_FRAME_MAX];
-    TccDeferRec parked[C6_CO_MAX][C6_CO_DEFER_MAX];
-    char live[C6_CO_MAX];
     /* Top-level coroutines started with 'co': they belong to no scope and no
        parent, so the scheduler below owns them from creation to completion. */
     void *runlist;
@@ -1754,12 +1759,18 @@ struct TccCoPool {
        are gone by the time anyone can call __c6_co_run(), so the count has to
        be remembered here. */
     int eager_errs;
+    /* Work area of one tcc_co_pump() round, grown as tasks are added. */
+    int cap;
+    int *fds;
+    int *evs;
+    TccCoTask **leafs;
 };
-
-#define C6_CO_TASK(co, i) ((TccCoTask *)(void *)(co)->task_mem[i])
 
 static void tcc_th_co_free(TccCoPool *co)
 {
+    free(co->fds);
+    free(co->evs);
+    free(co->leafs);
     free(co);
 }
 
@@ -1786,51 +1797,40 @@ static void tcc_co_copy(void *dst, const void *src, int n)
         *d++ = *s++;
 }
 
-static int tcc_co_index(TccCoPool *co, TccCoTask *t)
+/* 'n' rounded up so that the next 16-byte boundary is inside it */
+static unsigned long tcc_co_align(unsigned long n)
 {
-    long off = (long)((char *)t - (char *)(void *)co->task_mem);
-    int i;
-
-    if (off < 0 || off >= (long)C6_CO_MAX * C6_CO_TASK_MAX
-        || off % C6_CO_TASK_MAX)
-        tcc_co_trap();
-    i = (int)(off / C6_CO_TASK_MAX);
-    if (!co->live[i])
-        tcc_co_trap();
-    return i;
+    return (n + 15) & ~(unsigned long)15;
 }
 
 /* Allocate a task.  The returned pointer is both the 'void *task' handle and
    the address of its 'struct __c6_task head', which is field 0 of the
-   generated 'struct NAME_task', so the frame prefix needs no fixups. */
+   generated 'struct NAME_task', so the frame prefix needs no fixups.  The
+   frame (when the descriptor carries one) is part of the same block, so
+   creating a task is one allocation and freeing it is one free. */
 void *__c6_co_new(const TccCoDesc *d)
 {
-    TccThCtx *th = tcc_th();
-    TccCoPool *co = tcc_th_co(th);
-    int i;
+    unsigned long prefix = d->size, defers, frames, total;
+    char *p, *q;
     TccCoTask *t;
 
-    for (i = 0; i < C6_CO_MAX; i++)
-        if (!co->live[i])
-            break;
-    if (i >= C6_CO_MAX)
-        tcc_co_trap();          /* too many live tasks */
-    if (d->size > C6_CO_TASK_MAX)
-        tcc_co_trap();          /* frame prefix larger than the pool */
-    co->live[i] = 1;
-    t = C6_CO_TASK(co, i);
-    {
-        char *p = (char *)t;
-        int n = (int)d->size;
-        while (n-- > 0)
-            *p++ = 0;
-    }
+    if (prefix < sizeof(TccCoTask))
+        prefix = sizeof(TccCoTask);
+    defers = (unsigned long)d->defer_max * sizeof(TccDeferRec);
+    frames = tcc_co_align(d->frame_size);
+    total = prefix + defers + 16 + frames + 16;
+    p = (char *)tcc_th_alloc(total);
+    t = (TccCoTask *)(void *)p;
+    t->desc = (void *)d;
     t->state = C6_CO_STATE_NEW;
     t->kind = C6_CO_KIND_DONE;
-    t->desc = (void *)d;
-    t->defer_max = d->defer_max;
-    if (t->defer_max > C6_CO_DEFER_MAX)
-        t->defer_max = C6_CO_DEFER_MAX;
+    t->defer_max = d->defer_max > 0 ? d->defer_max : 0;
+    q = p + prefix;
+    t->defer_arena = t->defer_max ? (void *)q : (void *)0;
+    q = (char *)(((unsigned long)(q + defers) + 15) & ~(unsigned long)15);
+    if (frames)
+        /* the body runs with its frame pointer here: no copy, no move */
+        t->frame = (void *)(q + frames);
     return t;
 }
 
@@ -1846,25 +1846,27 @@ int __c6_co_await(void *child, void *self)
     return c->state == C6_CO_STATE_DONE ? 0 : 1;
 }
 
-/* Park the native frame, the defer records of this frame and the error slot,
-   then record where the body has to resume. */
+/* Park the defer records of this frame and the error slot, then record where
+   the body has to resume.  The native frame is only parked here when the back
+   end did not put it in the task in the first place. */
 void __c6_co_suspend(void *self, int kind, int state,
                      char *base, int size, int defer_base)
 {
     TccThCtx *th = tcc_th();
-    TccCoPool *co = tcc_th_co(th);
     TccCoTask *t = (TccCoTask *)self;
-    int idx = tcc_co_index(co, t);
+    const TccCoDesc *d = (const TccCoDesc *)t->desc;
+    TccDeferRec *parked = (TccDeferRec *)t->defer_arena;
     int i, n;
 
-    if (size < 0 || size > C6_CO_FRAME_MAX)
-        tcc_co_trap();
-    t->frame_size = size;
-#ifdef C6_CO_CHECK_FRAME_ADDR
-    t->frame_addr = base - size;
-#endif
-    tcc_co_copy(co->frames[idx], base - size, size);
-    t->frame = co->frames[idx];
+    if (!d->frame_size) {
+        /* this back end moves the frame: keep the used part of it */
+        if (size < 0 || size > C6_CO_COPY_FRAME)
+            tcc_co_trap();
+        if (!t->frame)
+            t->frame = (void *)tcc_th_alloc(C6_CO_COPY_FRAME);
+        tcc_co_copy(t->frame, base - size, size);
+        t->frame_size = size;
+    }
     t->state = state;
     t->kind = kind;
 
@@ -1875,7 +1877,7 @@ void __c6_co_suspend(void *self, int kind, int state,
     if (n > t->defer_max)
         n = t->defer_max;
     for (i = 0; i < n; i++)
-        co->parked[idx][i] = tcc_th_dstack(th)[defer_base + i];
+        parked[i] = tcc_th_dstack(th)[defer_base + i];
     t->defer_cap = n;
     t->defer_csp = th->dcsp;
     if (th->dsp > defer_base)
@@ -1890,37 +1892,21 @@ void __c6_co_suspend(void *self, int kind, int state,
     th->err_msg = 0;
 }
 
-/* Put the parked native frame back where it belongs and re-establish the
-   task's defer and error state (the generated prologue calls this before it
-   jumps to the resume point). */
+/* Re-establish the task's defer and error state (the generated prologue calls
+   this before it jumps to the resume point) and, for a back end that parks
+   the native frame, put that frame back where it belongs. */
 void __c6_co_restore(void *self, char *base)
 {
     TccThCtx *th = tcc_th();
-    TccCoPool *co = tcc_th_co(th);
     TccCoTask *t = (TccCoTask *)self;
-    int idx = tcc_co_index(co, t);
+    const TccCoDesc *d = (const TccCoDesc *)t->desc;
+    TccDeferRec *parked = (TccDeferRec *)t->defer_arena;
     int i, n = t->defer_cap;
 
-    /* The saved frame holds absolute addresses (locals taken by '&', the
-       defer records' pointer to the frame), so it may only be put back
-       exactly where it came from.  A different address means the task was
-       resumed at another stack depth (or on another thread): the frame would
-       be written over whatever lives there, silently corrupting that
-       function's locals.  Fail loudly instead. */
-#ifdef C6_CO_CHECK_FRAME_ADDR
-    /* A saved native frame holds absolute addresses (a local taken by '&',
-       a cleanup record pointing at the frame), so it may only be put back
-       where it came from; anywhere else it overwrites whatever lives there.
-       Measured: a 'co' body started inside one function and resumed from
-       __c6_co_run() *does* land elsewhere, so this cannot simply trap - the
-       fix is a per-task stack (P7).  Build the runtime with this defined to
-       look for a suspend point that moves a frame. */
-    if (t->frame_addr && t->frame_addr != base - t->frame_size)
-        tcc_co_trap();
-#endif
-    tcc_co_copy(base - t->frame_size, co->frames[idx], t->frame_size);
+    if (!d->frame_size)
+        tcc_co_copy(base - t->frame_size, t->frame, t->frame_size);
     for (i = 0; i < n; i++)
-        tcc_th_dstack(th)[t->defer_base + i] = co->parked[idx][i];
+        tcc_th_dstack(th)[t->defer_base + i] = parked[i];
     th->dsp = t->defer_base + n;
     th->dcsp = t->defer_csp;
     th->err_flag = t->err_flag;
@@ -2010,9 +1996,6 @@ static int tcc_co_select(int fd, int ev)
     return rev;
 }
 
-/* 'go' wants "run until you have to wait" and nothing more specific */
-#define C6_CO_KIND_SKIP   4
-
 void __c6_co_destroy(void *self);
 
 static TccCoTask *tcc_co_leaf(TccCoTask *t)
@@ -2058,7 +2041,9 @@ static int tcc_co_step_once(TccCoTask *t)
         return C6_CO_KIND_IO;           /* still parked on wait_fd */
     d = (TccCoDesc *)leaf->desc;
     leaf->busy++;
-    k = d->entry(leaf);
+    /* the frame top is passed in every time: a body whose frame lives in the
+       task ignores it, one that parks its native frame gets a harmless value */
+    k = d->entry(leaf, leaf->frame);
     leaf->busy--;
     switch (k) {
     case C6_CO_KIND_DONE:
@@ -2078,6 +2063,23 @@ static int tcc_co_step_once(TccCoTask *t)
     return k;
 }
 
+/* Make room for N ready entries in the pump's work area. */
+static void tcc_co_room(TccCoPool *co, int n)
+{
+    if (n <= co->cap)
+        return;
+    if (!co->cap)
+        co->cap = 8;
+    while (co->cap < n)
+        co->cap *= 2;
+    co->fds = (int *)realloc(co->fds, co->cap * sizeof *co->fds);
+    co->evs = (int *)realloc(co->evs, co->cap * sizeof *co->evs);
+    co->leafs = (TccCoTask **)realloc(co->leafs,
+                                      co->cap * sizeof *co->leafs);
+    if (!co->fds || !co->evs || !co->leafs)
+        tcc_co_trap();
+}
+
 /* One round over the top-level ready list: step every task once, then wait for
    whatever is parked on a descriptor and hand each one its readiness mask.
    Finished tasks are released here; ERRS, when not NULL, collects how many of
@@ -2086,12 +2088,15 @@ static int tcc_co_pump(int *errs)
 {
     TccCoPool *co = tcc_th_co(tcc_th());
     unsigned long r[16], w[16], e[16];
-    int fds[C6_CO_MAX], evs[C6_CO_MAX];
-    TccCoTask *leafs[C6_CO_MAX];
     TccCoTask *t, **pp;
+    int i, n = 0;
+
+    for (t = (TccCoTask *)co->runlist; t; t = (TccCoTask *)t->snext)
+        n++;
+    tcc_co_room(co, n + 1);
 
     for (;;) {
-        int nio = 0, maxfd = -1, ran = 0, i;
+        int nio = 0, maxfd = -1, ran = 0;
 
         pp = (TccCoTask **)&co->runlist;
         while ((t = *pp) != 0) {
@@ -2106,13 +2111,15 @@ static int tcc_co_pump(int *errs)
                 continue;
             }
             k = tcc_co_step_once(t);
-            if (k == C6_CO_KIND_IO && nio < C6_CO_MAX) {
+            if (k == C6_CO_KIND_IO) {
                 TccCoTask *leaf = tcc_co_leaf(t);
                 int fd = leaf->wait_fd;
                 if (fd >= 0 && fd < 1024) {
-                    fds[nio] = fd;
-                    evs[nio] = leaf->wait_ev;
-                    leafs[nio] = leaf;
+                    if (nio >= co->cap)
+                        tcc_co_room(co, nio + 1);
+                    co->fds[nio] = fd;
+                    co->evs[nio] = leaf->wait_ev;
+                    co->leafs[nio] = leaf;
                     nio++;
                     if (fd > maxfd)
                         maxfd = fd;
@@ -2140,23 +2147,23 @@ static int tcc_co_pump(int *errs)
         for (i = 0; i < 16; i++)
             r[i] = w[i] = e[i] = 0;
         for (i = 0; i < nio; i++) {
-            if (evs[i] & 1)
-                r[fds[i] >> 6] |= 1UL << (fds[i] & 63);
-            if (evs[i] & 2)
-                w[fds[i] >> 6] |= 1UL << (fds[i] & 63);
+            if (co->evs[i] & 1)
+                r[co->fds[i] >> 6] |= 1UL << (co->fds[i] & 63);
+            if (co->evs[i] & 2)
+                w[co->fds[i] >> 6] |= 1UL << (co->fds[i] & 63);
         }
         if (select(maxfd + 1, r, w, e, (void *)0) <= 0)
             return -1;
         for (i = 0; i < nio; i++) {
             int rev = 0;
-            if (r[fds[i] >> 6] & (1UL << (fds[i] & 63)))
+            if (r[co->fds[i] >> 6] & (1UL << (co->fds[i] & 63)))
                 rev |= 1;
-            if (w[fds[i] >> 6] & (1UL << (fds[i] & 63)))
+            if (w[co->fds[i] >> 6] & (1UL << (co->fds[i] & 63)))
                 rev |= 2;
             if (!rev)
                 continue;           /* not this one yet: keep it parked */
-            leafs[i]->wait_rev = rev;
-            leafs[i]->waiting = 0;
+            co->leafs[i]->wait_rev = rev;
+            co->leafs[i]->waiting = 0;
         }
     }
 }
@@ -2164,8 +2171,8 @@ static int tcc_co_pump(int *errs)
 /* 'co f();' : make T a top-level coroutine and run it up to its first real
    suspension (or to completion), then return to the 'co' statement.  A task
    that is already finished has no observer and no handle, so it is released
-   right here -- otherwise a loop of non-suspending 'co' calls would fill the
-   task pool. */
+   right here -- otherwise a loop of non-suspending 'co' calls would grow the
+   task list without bound. */
 void __tcc_co_spawn(void *task)
 {
     TccCoPool *co = tcc_th_co(tcc_th());
@@ -2178,7 +2185,7 @@ void __tcc_co_spawn(void *task)
     /* Run it until it has to wait for a descriptor: awaiting a child is not
        waiting, so keep descending.  A task that is finished by the time the
        'co' statement returns has no handle and no observer, so it is released
-       here -- otherwise a loop of short 'co' calls would fill the pool. */
+       here -- otherwise a loop of short 'co' calls would grow the list. */
     for (;;) {
         int k = tcc_co_step_once(t);
         if (k == C6_CO_KIND_IO || k == C6_CO_KIND_SKIP)
@@ -2251,7 +2258,7 @@ void __c6_co_abort(void *self)
         return;                     /* never started: nothing was allocated */
     t->kind = C6_CO_KIND_ABORT;
     t->waiting = 0;                 /* leave any parked descriptor wait */
-    tcc_co_step_once(t);            /* restore the frame, run the cleanups */
+    tcc_co_step_once(t);            /* resume it, run the cleanups */
 }
 
 void __c6_co_destroy(void *self)
@@ -2268,11 +2275,13 @@ void __c6_co_destroy(void *self)
     t->child = 0;
     t->parent = 0;
     /* the task owned one reference per managed parameter (and the return
-       value): give them back before the slot is reused */
+       value): give them back before the block is released */
     if (t->desc && ((TccCoDesc *)t->desc)->release)
         ((TccCoDesc *)t->desc)->release(t);
     tcc_co_unlink((TccCoTask **)&co->runlist, t);
-    co->live[tcc_co_index(co, t)] = 0;
+    if (!((TccCoDesc *)t->desc)->frame_size)
+        free(t->frame);             /* the parked native frame, if any */
+    free(t);
 }
 
 /* 'await c6_io(fd, ev)' is rewritten by the compiler and never calls this;

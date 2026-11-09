@@ -81,6 +81,16 @@ static const char c99_runtime[] =
 #include "c99-rt_.h"
     ;
 
+#ifdef C6_EXT
+/* c6: this back end hands the body the frame its task owns, so an 'async'
+   function needs no frame of its own and a suspension copies nothing (the
+   emitted C addresses every local from that frame, see c99_frmexpr()) */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 1;
+}
+#endif
+
 /* ====================================================================== */
 /* growable text buffers                                                   */
 
@@ -638,15 +648,24 @@ static void c99_decl_extern(const char *name, int func)
     c99_add_decl(name, text);
 }
 
+/* The byte array the locals are addressed from.  An ordinary function declares
+   it (see gfunc_prolog); an async body whose frame lives in the task is handed
+   it by its caller instead, which is what makes a suspension free and an
+   '&local' valid for the whole life of the task. */
+static const char *c99_frmexpr(void)
+{
+    return c6_stable_frame ? "__c99_frmp" : "__c99_frm.f + @FRM@";
+}
+
 static void c99_addr(char *buf, int size, SValue *sv)
 {
     int v = sv->r & VT_VALMASK;
 
     if (v == VT_LOCAL) {
-        snprintf(buf, size, "(__c99_frm.f + @FRM@ + (%d))", (int)sv->c.i);
+        snprintf(buf, size, "(%s + (%d))", c99_frmexpr(), (int)sv->c.i);
     } else if (v == VT_LLOCAL) {
-        snprintf(buf, size, "(*(void **)(__c99_frm.f + @FRM@ + (%d)))",
-                 (int)sv->c.i);
+        snprintf(buf, size, "(*(void **)(%s + (%d)))",
+                 c99_frmexpr(), (int)sv->c.i);
     } else if (v == VT_CONST) {
         if (sv->r & VT_SYM) {
             char sbuf[C99_TB];
@@ -1596,14 +1615,21 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     c99_printf("%s", sig);
     c99_printf("union { long long i; unsigned long long u; double d; float f;"
                " long double ld; void *p; } __c99_r[%d];\n", NB_REGS);
-    c99_printf("union { long double _a; void *_p; unsigned char f[@FRM@]; }"
-               " __c99_frm;\n");
+    if (c6_stable_frame)
+        /* an async body: the caller owns the frame, so point at it instead of
+           reserving one here (the second parameter is that frame's top) */
+        c99_printf("unsigned char *__c99_frmp = (unsigned char *)__c99_a1;\n");
+    else
+        c99_printf("union { long double _a; void *_p; unsigned char f[@FRM@]; }"
+                   " __c99_frm;\n");
     c99_printf("int __c99_cnd[16] = {0};\n"
-               "(void)__c99_r; (void)__c99_frm; (void)__c99_cnd;\n");
+               "(void)__c99_r; (void)__c99_cnd;\n");
+    if (!c6_stable_frame)
+        c99_printf("(void)__c99_frm;\n");
 
     if (hidden_sret)
-        c99_printf("memcpy(__c99_frm.f + @FRM@ + (%d), &__c99_ret, %d);\n",
-                   func_vc, PTR_SIZE);
+        c99_printf("memcpy(%s + (%d), &__c99_ret, %d);\n",
+                   c99_frmexpr(), func_vc, PTR_SIZE);
 
     idx = 0;
     for (s = ftype->ref->next; s; s = s->next, idx++) {
@@ -1616,8 +1642,8 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
         loc = (loc - size) & -align;
         off = loc;
         gfunc_set_param(s, off, 0);
-        c99_printf("memcpy(__c99_frm.f + @FRM@ + (%d), &__c99_a%d, %d);\n",
-                   off, idx, size);
+        c99_printf("memcpy(%s + (%d), &__c99_a%d, %d);\n",
+                   c99_frmexpr(), off, idx, size);
     }
     nparams = idx;
 
@@ -1628,8 +1654,8 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     if (is_vararg && nparams > 0)
         c99_printf("{ __builtin_va_list __c99_va0;"
                    " __builtin_va_start(__c99_va0, __c99_a%d);"
-                   " memcpy(__c99_frm.f + @FRM@ + (%d), __c99_va0, %d); }\n",
-                   nparams - 1, -24, 24);
+                   " memcpy(%s + (%d), __c99_va0, %d); }\n",
+                   nparams - 1, c99_frmexpr(), -24, 24);
 
     if (is_main && !(tcc_state && tcc_state->c6_test_mode))
         c99_printf("__c99_init();\n");
@@ -1897,6 +1923,10 @@ ST_FUNC void gfunc_epilog(void)
 
     if (frame < 1)
         frame = 1;
+    /* an async body declares no frame of its own, so the descriptor has to
+       know how many bytes of the task it needs */
+    if (c6_stable_frame)
+        c6_frame_size_set(frame);
     snprintf(frm, sizeof frm, "%d", frame);
     for (k = 0; k < out.len; ) {
         if (out.data[k] == '@' && !strncmp(out.data + k, "@FRM@", 5)) {

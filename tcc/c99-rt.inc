@@ -538,30 +538,37 @@ C99_RT_UNUSED __c99_rt_linkage void __tcc_slice_sub(void *out, const void *slice
 /* ------------------------------------------------------------------------- */
 /* c6 extension runtime: async / await (stackless coroutines)                */
 /*                                                                           */
-/* An 'async' function is compiled to 'int __c6_body_NAME(void *task)'.  The */
-/* body runs on the caller's stack; every suspension ("await" that has to    */
-/* wait) copies the used part of the native frame into the task and returns  */
-/* to whoever drives the task.  Resuming re-enters the body, copies the      */
-/* saved frame back to the same offsets and jumps to the recorded resume      */
-/* point.  'co f();' makes a coroutine top-level: it is put on the ready list */
-/* below and stepped by __c99_co_pump(), which is the scheduler.  Task objects   */
-/* live in this file so that 'struct __c6_task'                              */
-/* has exactly the layout that tcc_predefs() declares to compiled programs;  */
-/* generated code only ever touches it through the __c6_co_* accessors.      */
-
-#define C6_CO_MAX        64     /* concurrent tasks (frames + slots) */
-#define C6_CO_FRAME_MAX  4096   /* largest native frame an async body may use */
-#define C6_CO_TASK_MAX   1024   /* largest 'struct NAME_task' */
-#define C6_CO_DEFER_MAX  256    /* parked defer records per task */
+/* An 'async' function is compiled to                                        */
+/* 'int __c6_body_NAME(void *task, void *frame)'.  A task owns one block: the */
+/* 'struct NAME_task' header, the parked 'defer' records and - when the back  */
+/* end supports it (c6_backend_frame_in_task()) - the native frame of the     */
+/* body.  The body's frame pointer is set to the top of that block, so every  */
+/* local keeps its offset, a suspension is nothing but a return to the driver */
+/* and a local's address stays what it was for the whole life of the task.    */
+/*                                                                           */
+/* A back end without that support leaves 'frame_size' 0 in the descriptor:   */
+/* there the used part of the native frame is copied into the task at every   */
+/* suspension and copied back at every resume ('__c6_co_suspend' below), so a */
+/* '&local' held across an 'await' is only valid again at the same address.   */
+/*                                                                           */
+/* 'co f();' makes a coroutine top-level: it is put on the ready list below   */
+/* and stepped by __c99_co_pump(), which is the scheduler.  Task objects live   */
+/* in this file so that 'struct __c6_task' has exactly the layout that        */
+/* tcc_predefs() declares to compiled programs; generated code only ever      */
+/* touches it through the __c6_co_* accessors.                                */
 
 #define C6_CO_KIND_DONE   0
 #define C6_CO_KIND_IO     1
 #define C6_CO_KIND_CHILD  2
 #define C6_CO_KIND_ERR    3
+#define C6_CO_KIND_SKIP   4   /* internal: nothing to do right now */
 #define C6_CO_KIND_ABORT  5   /* the task is being destroyed: run cleanups */
 
 #define C6_CO_STATE_NEW   0
 #define C6_CO_STATE_DONE  (-1)
+
+/* Largest native frame a back end without frame-in-task support can park. */
+#define C6_CO_COPY_FRAME  4096
 
 /* lays out exactly like the predef in tccpp.c:tcc_predefs() */
 typedef struct C99CoTask {
@@ -579,21 +586,19 @@ typedef struct C99CoTask {
 } C99CoTask;
 
 typedef struct C99CoDesc {
-    unsigned size, align;
-    int defer_max;
-    int (*entry)(void *);
+    unsigned size, align;       /* 'struct NAME_task': header + declared fields */
+    int defer_max;              /* parked defer records */
+    int (*entry)(void *, void *);       /* (task, top of the frame) */
     void (*release)(void *);    /* give back what the task slot owns */
+    unsigned frame_size;        /* 0: the frame is parked on every suspension */
 } C99CoDesc;
 
-/* One slot per task, big enough for 'struct NAME_task' (the header plus the
-   declared return value and parameters).  'long long' keeps every slot
-   8-byte aligned.  The whole pool is per thread and allocated on first use:
-   most threads never create a task and should not pay for the 512 KiB. */
+/* One block per task, allocated when the task is created:
+     [C99CoTask][struct NAME_task fields][defer records][frame]
+   'frame' is the top of the frame region, which is what the body's frame
+   pointer points at; a local lives at 'frame - offset'.  'frame_size' in the
+   descriptor, not the pool, is what bounds it. */
 struct C99CoPool {
-    long long task_mem[C6_CO_MAX][C6_CO_TASK_MAX / 8];
-    char frames[C6_CO_MAX][C6_CO_FRAME_MAX];
-    C99DeferRec parked[C6_CO_MAX][C6_CO_DEFER_MAX];
-    char live[C6_CO_MAX];
     /* Top-level coroutines started with 'co': they belong to no scope and no
        parent, so the scheduler below owns them from creation to completion. */
     void *runlist;
@@ -601,12 +606,18 @@ struct C99CoPool {
        are gone by the time anyone can call __c6_co_run(), so the count has to
        be remembered here. */
     int eager_errs;
+    /* Work area of one __c99_co_pump() round, grown as tasks are added. */
+    int cap;
+    int *fds;
+    int *evs;
+    C99CoTask **leafs;
 };
-
-#define C6_CO_TASK(co, i) ((C99CoTask *)(void *)(co)->task_mem[i])
 
 C99_RT_UNUSED __c99_rt_linkage void __c99_co_free(C99CoPool *co)
 {
+    free(co->fds);
+    free(co->evs);
+    free(co->leafs);
     free(co);
 }
 
@@ -632,51 +643,40 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_co_copy(void *dst, const void *src, in
         *d++ = *s++;
 }
 
-C99_RT_UNUSED __c99_rt_linkage int __c99_co_index(C99CoPool *co, C99CoTask *t)
+/* 'n' rounded up so that the next 16-byte boundary is inside it */
+C99_RT_UNUSED __c99_rt_linkage unsigned long __c99_co_align(unsigned long n)
 {
-    long off = (long)((char *)t - (char *)(void *)co->task_mem);
-    int i;
-
-    if (off < 0 || off >= (long)C6_CO_MAX * C6_CO_TASK_MAX
-        || off % C6_CO_TASK_MAX)
-        __c99_co_trap();
-    i = (int)(off / C6_CO_TASK_MAX);
-    if (!co->live[i])
-        __c99_co_trap();
-    return i;
+    return (n + 15) & ~(unsigned long)15;
 }
 
 /* Allocate a task.  The returned pointer is both the 'void *task' handle and
    the address of its 'struct __c6_task head', which is field 0 of the
-   generated 'struct NAME_task', so the frame prefix needs no fixups. */
+   generated 'struct NAME_task', so the frame prefix needs no fixups.  The
+   frame (when the descriptor carries one) is part of the same block, so
+   creating a task is one allocation and freeing it is one free. */
 C99_RT_UNUSED __c99_rt_linkage void *__c6_co_new(const C99CoDesc *d)
 {
-    C99ThCtx *th = __c99_th();
-    C99CoPool *co = __c99_th_co(th);
-    int i;
+    unsigned long prefix = d->size, defers, frames, total;
+    char *p, *q;
     C99CoTask *t;
 
-    for (i = 0; i < C6_CO_MAX; i++)
-        if (!co->live[i])
-            break;
-    if (i >= C6_CO_MAX)
-        __c99_co_trap();          /* too many live tasks */
-    if (d->size > C6_CO_TASK_MAX)
-        __c99_co_trap();          /* frame prefix larger than the pool */
-    co->live[i] = 1;
-    t = C6_CO_TASK(co, i);
-    {
-        char *p = (char *)t;
-        int n = (int)d->size;
-        while (n-- > 0)
-            *p++ = 0;
-    }
+    if (prefix < sizeof(C99CoTask))
+        prefix = sizeof(C99CoTask);
+    defers = (unsigned long)d->defer_max * sizeof(C99DeferRec);
+    frames = __c99_co_align(d->frame_size);
+    total = prefix + defers + 16 + frames + 16;
+    p = (char *)__c99_alloc(total);
+    t = (C99CoTask *)(void *)p;
+    t->desc = (void *)d;
     t->state = C6_CO_STATE_NEW;
     t->kind = C6_CO_KIND_DONE;
-    t->desc = (void *)d;
-    t->defer_max = d->defer_max;
-    if (t->defer_max > C6_CO_DEFER_MAX)
-        t->defer_max = C6_CO_DEFER_MAX;
+    t->defer_max = d->defer_max > 0 ? d->defer_max : 0;
+    q = p + prefix;
+    t->defer_arena = t->defer_max ? (void *)q : (void *)0;
+    q = (char *)(((unsigned long)(q + defers) + 15) & ~(unsigned long)15);
+    if (frames)
+        /* the body runs with its frame pointer here: no copy, no move */
+        t->frame = (void *)(q + frames);
     return t;
 }
 
@@ -692,25 +692,27 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_await(void *child, void *self)
     return c->state == C6_CO_STATE_DONE ? 0 : 1;
 }
 
-/* Park the native frame, the defer records of this frame and the error slot,
-   then record where the body has to resume. */
+/* Park the defer records of this frame and the error slot, then record where
+   the body has to resume.  The native frame is only parked here when the back
+   end did not put it in the task in the first place. */
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int state,
                      char *base, int size, int defer_base)
 {
     C99ThCtx *th = __c99_th();
-    C99CoPool *co = __c99_th_co(th);
     C99CoTask *t = (C99CoTask *)self;
-    int idx = __c99_co_index(co, t);
+    const C99CoDesc *d = (const C99CoDesc *)t->desc;
+    C99DeferRec *parked = (C99DeferRec *)t->defer_arena;
     int i, n;
 
-    if (size < 0 || size > C6_CO_FRAME_MAX)
-        __c99_co_trap();
-    t->frame_size = size;
-#ifdef C6_CO_CHECK_FRAME_ADDR
-    t->frame_addr = base - size;
-#endif
-    __c99_co_copy(co->frames[idx], base - size, size);
-    t->frame = co->frames[idx];
+    if (!d->frame_size) {
+        /* this back end moves the frame: keep the used part of it */
+        if (size < 0 || size > C6_CO_COPY_FRAME)
+            __c99_co_trap();
+        if (!t->frame)
+            t->frame = (void *)__c99_alloc(C6_CO_COPY_FRAME);
+        __c99_co_copy(t->frame, base - size, size);
+        t->frame_size = size;
+    }
     t->state = state;
     t->kind = kind;
 
@@ -721,7 +723,7 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int st
     if (n > t->defer_max)
         n = t->defer_max;
     for (i = 0; i < n; i++)
-        co->parked[idx][i] = __c99_dstack(th)[defer_base + i];
+        parked[i] = __c99_dstack(th)[defer_base + i];
     t->defer_cap = n;
     t->defer_csp = th->dcsp;
     if (th->dsp > defer_base)
@@ -736,24 +738,21 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_suspend(void *self, int kind, int st
     th->err_msg = 0;
 }
 
-/* Put the parked native frame back where it belongs and re-establish the
-   task's defer and error state (the generated prologue calls this before it
-   jumps to the resume point). */
+/* Re-establish the task's defer and error state (the generated prologue calls
+   this before it jumps to the resume point) and, for a back end that parks
+   the native frame, put that frame back where it belongs. */
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_restore(void *self, char *base)
 {
     C99ThCtx *th = __c99_th();
-    C99CoPool *co = __c99_th_co(th);
     C99CoTask *t = (C99CoTask *)self;
-    int idx = __c99_co_index(co, t);
+    const C99CoDesc *d = (const C99CoDesc *)t->desc;
+    C99DeferRec *parked = (C99DeferRec *)t->defer_arena;
     int i, n = t->defer_cap;
 
-#ifdef C6_CO_CHECK_FRAME_ADDR
-    if (t->frame_addr && t->frame_addr != base - t->frame_size)
-        __c99_co_trap();
-#endif
-    __c99_co_copy(base - t->frame_size, co->frames[idx], t->frame_size);
+    if (!d->frame_size)
+        __c99_co_copy(base - t->frame_size, t->frame, t->frame_size);
     for (i = 0; i < n; i++)
-        __c99_dstack(th)[t->defer_base + i] = co->parked[idx][i];
+        __c99_dstack(th)[t->defer_base + i] = parked[i];
     th->dsp = t->defer_base + n;
     th->dcsp = t->defer_csp;
     th->err_flag = t->err_flag;
@@ -782,9 +781,7 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_kind(void *self)
 }
 
 /* task handles are methods too ('t->wait()'): the emitted symbols are
-   '<tag>_<name>' (c6_method_symbol), so these wrappers carry those names.
-   The coroutine accessors are defined further down (implicit declarations are
-   errors in C99), so they come first. */
+   '<tag>_<name>' (c6_method_symbol), so these wrappers carry those names */
 C99_RT_UNUSED __c99_rt_linkage int __c6_co_state(void *self);
 C99_RT_UNUSED __c99_rt_linkage int __c6_co_kind(void *self);
 C99_RT_UNUSED __c99_rt_linkage int __c6_co_wait(void *self);
@@ -817,7 +814,9 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_rev(void *self)
     return ((C99CoTask *)self)->wait_rev;
 }
 
-/* Wait for FD to become ready for EV (1 = readable, 2 = writable). */
+/* Wait for FD to become ready for EV (1 = readable, 2 = writable).  libtcc1
+   carries no headers, so 'select' is declared by hand and the descriptor set
+   is a plain word array; fds must be below 1024 (FD_SETSIZE). */
 C99_RT_UNUSED __c99_rt_linkage int __c99_co_select(int fd, int ev)
 {
 #if C99_RT_POSIX
@@ -846,9 +845,6 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_select(int fd, int ev)
     return -1;
 #endif
 }
-
-/* 'go' wants "run until you have to wait" and nothing more specific */
-#define C6_CO_KIND_SKIP   4
 
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_destroy(void *self);
 
@@ -895,7 +891,9 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
         return C6_CO_KIND_IO;           /* still parked on wait_fd */
     d = (C99CoDesc *)leaf->desc;
     leaf->busy++;
-    k = d->entry(leaf);
+    /* the frame top is passed in every time: a body whose frame lives in the
+       task ignores it, one that parks its native frame gets a harmless value */
+    k = d->entry(leaf, leaf->frame);
     leaf->busy--;
     switch (k) {
     case C6_CO_KIND_DONE:
@@ -915,6 +913,23 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
     return k;
 }
 
+/* Make room for N ready entries in the pump's work area. */
+C99_RT_UNUSED __c99_rt_linkage void __c99_co_room(C99CoPool *co, int n)
+{
+    if (n <= co->cap)
+        return;
+    if (!co->cap)
+        co->cap = 8;
+    while (co->cap < n)
+        co->cap *= 2;
+    co->fds = (int *)realloc(co->fds, co->cap * sizeof *co->fds);
+    co->evs = (int *)realloc(co->evs, co->cap * sizeof *co->evs);
+    co->leafs = (C99CoTask **)realloc(co->leafs,
+                                      co->cap * sizeof *co->leafs);
+    if (!co->fds || !co->evs || !co->leafs)
+        __c99_co_trap();
+}
+
 /* One round over the top-level ready list: step every task once, then wait for
    whatever is parked on a descriptor and hand each one its readiness mask.
    Finished tasks are released here; ERRS, when not NULL, collects how many of
@@ -922,12 +937,15 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
 C99_RT_UNUSED __c99_rt_linkage int __c99_co_pump(int *errs)
 {
     C99CoPool *co = __c99_th_co(__c99_th());
-    int fds[C6_CO_MAX], evs[C6_CO_MAX];
-    C99CoTask *leafs[C6_CO_MAX];
     C99CoTask *t, **pp;
+    int i, n = 0;
+
+    for (t = (C99CoTask *)co->runlist; t; t = (C99CoTask *)t->snext)
+        n++;
+    __c99_co_room(co, n + 1);
 
     for (;;) {
-        int nio = 0, maxfd = -1, ran = 0, i;
+        int nio = 0, maxfd = -1, ran = 0;
 
         pp = (C99CoTask **)&co->runlist;
         while ((t = *pp) != 0) {
@@ -942,13 +960,15 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_pump(int *errs)
                 continue;
             }
             k = __c99_co_step_once(t);
-            if (k == C6_CO_KIND_IO && nio < C6_CO_MAX) {
+            if (k == C6_CO_KIND_IO) {
                 C99CoTask *leaf = __c99_co_leaf(t);
                 int fd = leaf->wait_fd;
                 if (fd >= 0 && fd < 1024) {
-                    fds[nio] = fd;
-                    evs[nio] = leaf->wait_ev;
-                    leafs[nio] = leaf;
+                    if (nio >= co->cap)
+                        __c99_co_room(co, nio + 1);
+                    co->fds[nio] = fd;
+                    co->evs[nio] = leaf->wait_ev;
+                    co->leafs[nio] = leaf;
                     nio++;
                     if (fd > maxfd)
                         maxfd = fd;
@@ -978,23 +998,23 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_pump(int *errs)
             fd_set r, w, e;
             FD_ZERO(&r); FD_ZERO(&w); FD_ZERO(&e);
             for (i = 0; i < nio; i++) {
-                if (evs[i] & 1)
-                    FD_SET(fds[i], &r);
-                if (evs[i] & 2)
-                    FD_SET(fds[i], &w);
+                if (co->evs[i] & 1)
+                    FD_SET(co->fds[i], &r);
+                if (co->evs[i] & 2)
+                    FD_SET(co->fds[i], &w);
             }
             if (select(maxfd + 1, &r, &w, &e, (struct timeval *)0) <= 0)
                 return -1;
             for (i = 0; i < nio; i++) {
                 int rev = 0;
-                if (FD_ISSET(fds[i], &r))
+                if (FD_ISSET(co->fds[i], &r))
                     rev |= 1;
-                if (FD_ISSET(fds[i], &w))
+                if (FD_ISSET(co->fds[i], &w))
                     rev |= 2;
                 if (!rev)
                     continue;       /* not this one yet: keep it parked */
-                leafs[i]->wait_rev = rev;
-                leafs[i]->waiting = 0;
+                co->leafs[i]->wait_rev = rev;
+                co->leafs[i]->waiting = 0;
             }
         }
 #else
@@ -1007,8 +1027,8 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_pump(int *errs)
 /* 'co f();' : make T a top-level coroutine and run it up to its first real
    suspension (or to completion), then return to the 'co' statement.  A task
    that is already finished has no observer and no handle, so it is released
-   right here -- otherwise a loop of non-suspending 'co' calls would fill the
-   task pool. */
+   right here -- otherwise a loop of non-suspending 'co' calls would grow the
+   task list without bound. */
 C99_RT_UNUSED __c99_rt_linkage void __tcc_co_spawn(void *task)
 {
     C99CoPool *co = __c99_th_co(__c99_th());
@@ -1021,7 +1041,7 @@ C99_RT_UNUSED __c99_rt_linkage void __tcc_co_spawn(void *task)
     /* Run it until it has to wait for a descriptor: awaiting a child is not
        waiting, so keep descending.  A task that is finished by the time the
        'co' statement returns has no handle and no observer, so it is released
-       here -- otherwise a loop of short 'co' calls would fill the pool. */
+       here -- otherwise a loop of short 'co' calls would grow the list. */
     for (;;) {
         int k = __c99_co_step_once(t);
         if (k == C6_CO_KIND_IO || k == C6_CO_KIND_SKIP)
@@ -1086,14 +1106,15 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_abort(void *self)
 
     if (!t || t->state == C6_CO_STATE_DONE)
         return;
+    /* the child owns the frame that is parked: roll it back first */
     if (t->child)
         __c6_co_abort(t->child);
     t->child = 0;
     if (t->state == C6_CO_STATE_NEW)
-        return;
+        return;                     /* never started: nothing was allocated */
     t->kind = C6_CO_KIND_ABORT;
-    t->waiting = 0;
-    __c99_co_step_once(t);
+    t->waiting = 0;                 /* leave any parked descriptor wait */
+    __c99_co_step_once(t);            /* resume it, run the cleanups */
 }
 
 C99_RT_UNUSED __c99_rt_linkage void __c6_co_destroy(void *self)
@@ -1110,11 +1131,13 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_co_destroy(void *self)
     t->child = 0;
     t->parent = 0;
     /* the task owned one reference per managed parameter (and the return
-       value): give them back before the slot is reused */
+       value): give them back before the block is released */
     if (t->desc && ((C99CoDesc *)t->desc)->release)
         ((C99CoDesc *)t->desc)->release(t);
     __c99_co_unlink((C99CoTask **)&co->runlist, t);
-    co->live[__c99_co_index(co, t)] = 0;
+    if (!((C99CoDesc *)t->desc)->frame_size)
+        free(t->frame);             /* the parked native frame, if any */
+    free(t);
 }
 
 /* 'await c6_io(fd, ev)' is rewritten by the compiler and never calls this;

@@ -124,6 +124,16 @@ ST_DATA const char * const target_machine_defs =
     "__amd64__\0"
     ;
 
+#ifdef C6_EXT
+/* c6: an async body keeps its frame in the task (gfunc_prolog/epilog below
+   point %rbp at it), so a suspension neither copies nor moves anything and a
+   '&local' taken before an 'await' is still valid after it */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 1;
+}
+#endif
+
 ST_DATA const int reg_classes[NB_REGS] = {
     /* eax */ RC_INT | RC_RAX,
     /* ecx */ RC_INT | RC_RCX,
@@ -1582,7 +1592,17 @@ void gfunc_epilog(void)
     if (tcc_state->do_bounds_check)
         gen_bounds_epilog();
 #endif
-    o(0xc9); /* leave */
+    /* align local size to word & save local variables */
+    v = (-loc + 15) & -16;
+    if (c6_stable_frame) {
+        /* the locals are not on the stack at all: %rbp points into the task
+           and %rsp was only moved by the 'push %rbp' below, so 'leave'
+           (mov %rsp,%rbp; pop %rbp) would set %rsp to the task frame */
+        o(0x5d); /* pop %rbp */
+        c6_frame_size_set(v);
+    } else {
+        o(0xc9); /* leave */
+    }
     if (func_ret_sub == 0) {
         o(0xc3); /* ret */
     } else {
@@ -1590,13 +1610,19 @@ void gfunc_epilog(void)
         g(func_ret_sub);
         g(func_ret_sub >> 8);
     }
-    /* align local size to word & save local variables */
-    v = (-loc + 15) & -16;
     saved_ind = ind;
     ind = func_sub_sp_offset - FUNC_PROLOG_SIZE;
-    o(0xe5894855);  /* push %rbp, mov %rsp, %rbp */
-    o(0xec8148);  /* sub rsp, stacksize */
-    gen_le32(v);
+    if (c6_stable_frame) {
+        /* 'push %rbp; mov %rsi, %rbp': the frame top comes from the second
+           argument, and nothing is subtracted from %rsp, so the body runs
+           directly on the frame the task owns */
+        o(0xf5894855);  /* push %rbp, mov %rsi, %rbp */
+        gen_fill_nops(FUNC_PROLOG_SIZE - 4);
+    } else {
+        o(0xe5894855);  /* push %rbp, mov %rsp, %rbp */
+        o(0xec8148);  /* sub rsp, stacksize */
+        gen_le32(v);
+    }
     ind = saved_ind;
 }
 
