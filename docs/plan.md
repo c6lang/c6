@@ -530,6 +530,7 @@ int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
 | 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
 | 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、局部 tag 的切片、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、`typeof`/`_Generic`/`_Alignof`、接口方法签名、跨 TU |
+| 函数字面量 | 显式声明/就地调用/推断声明/作实参/结构体成员/数组初值/文件作用域与 `static` 初始化器/变参/`!error`+`catch`/`defer` 体/嵌套字面量/`static inline` 体里/`qsort`/C 回调（`abi/`）/C99 后端 | 捕获局部变量、捕获形参、捕获块作用域 typedef 与 tag、遮蔽文件作用域全局、无名字、带存储类、`async`、缺函数体（C80–C83） | 每处字面量各是一个函数、同一字面量赋给两个变量、和纯 C 函数指针互相赋值、`-emit-header` 不导出、`module` 不改名 |
 | 元组 `(T1, T2)` | 返回值/解构声明/解构赋值/`_`/`t[k]`/参数/成员/数组元素/嵌套/复合字面量/`sizeof`/`async`+`await`/`go`/`!error`/跨 TU/与 struct 的 ABI 互通/单条语句体与语句表达式里的解构 | 元素是 `void`/函数/VLA/数组/不完整/局部 tag/`error`、下标非常量或越界、解构个数不符、混写类型与名字、全 `_`、右边不是元组、非左值目标、`return {…}` 用在标量函数、`float!error` | `#pragma pack` 不影响布局、`(a, b)` 逗号表达式与各种强转/复合字面量不被误判、`_` 别处仍是普通标识符、文件作用域的元组对象 |
 
 ### 9.2 工程要求
@@ -594,6 +595,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 24 静态环检测 P6 | ✅ | `c6_gc_collect()` 记 `C6GcField.to_tag`（强引用边、含数组与按值嵌入；`weak`/`own` 不是边），`c6_gc_flush_descs()` 里三色 DFS（`C6GcType.mark`）报 E-GC1；`move(p)` → `__c6_gc_move`（`own` 链“先建后接”的唯一写法）；`move(p)` 之后的空槽再用报 E-GC17（`Sym.gc_moved` + `if`/`while`/`for`/`switch`/`foreach` 的状态合并、`defer` 体隔离，`tests/errors/gc_move.c` 8 条） |
 | 25 任务回卷 P7 | ✅ | 运行期 `C6_CO_KIND_ABORT` / `__c6_co_abort` / `__c6_co_destroy` 先回卷；编译器在**每个 `await` 的恢复点**发 `if (__c6_co_kind(task) == ABORT) { defer_begin(2,0); finish(ABORT); }`（放末尾派发器里的话 `defer_state` 已复位，清理体发不出来） |
 | 26 线程与任务句柄 | ✅ | `thread h = go f(x);`（`c6_thread_decl` + `c6_thread_defer_release`，运行期 `TccThRec` 引用计数：链表 + 句柄）、`h->join()`/`h->done()`/`h->value()`；任务句柄方法 `t->wait()`/`t->done()`/`t->kind()`（预置方法 + `c6_task_head_ptr` 首字段上转）；`c99-rt.inc` 同步镜像、`tests/thread_handle.c`、`tests/task_method.c` |
+| 27 函数字面量 `RET (参数) { 体 }` | ✅ | `C6Lit` 队列 + `c6_lit_lead()`（扫描签名 → token 重放判定「函数 + `{`」）、`c6_lit_parse()`（`external_sym` 建 `static __c6_fn_<n>`、`skip_or_save_block` 存体）、`c6_lit_decl_lead()` / `c6_lit_infer_decl()`（`f = …;` 推断声明）、`c6_lit_flush()`（TU 末尾与 `gen_inline_functions()` 同循环 `gen_function()`）、`c6_lit_cap_check()`（捕获诊断 C80，挂在值/typedef/tag 三条符号解析路径）；设计见 [closure-design.md](closure-design.md)、语法见 [grammar.md §3.9](grammar.md)；`tests/fn_lit.c` / `tests/errors/fn_lit.c` / `tests/abi/fn_lit.c`+`_plain.c` / `examples/fn_lit_demo.c` |
 
 `foreach` 的设计取舍（评审结论）：
 
@@ -865,6 +867,27 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - 隐藏槽只对“求值一次”负责：数组每轮重新按 `data[i]` 取元素（数组本身
   可能被改），切片用求值时的 `{data, len}` 快照；值绑定是副本，写下标
   绑定等于改循环变量（与 `for` 一致）。
+
+函数字面量的设计取舍（评审结论）：
+
+- **值就是函数指针，不是"可调用对象"**：无捕获的字面量编译成一个
+  `static` 函数，表达式本身退化成函数指示符。因此调用约定、C ABI、
+  `-emit-header`、`module` 名字改写全都不用动，`qsort(..., int(const void*,
+  const void*) { … })` 直接可用。捕获版会变成胖指针（两个机器字），那是
+  V2 的事，见 [closure-design.md](closure-design.md)；
+- **不做隐式捕获、也不做"捕获了就按引用用"**：记在栈帧里的局部变量在字面量
+  被调用时可能早就没了（存进结构体、交给 C 保存之后），按引用捕获等于造一个
+  必然悬空的窗口。V1 一律报 C80，把值作为参数传进来；V2 按值捕获进
+  `@struct` env；
+- **名字只用序号**（`__c6_fn_<n>`，绝不把类型拼进标识符）：类型可能很长
+  （`struct P(int, int[:])`），拼进符号名会撑爆标识符长度、也没人看得懂；
+  `static` + `__` 前缀又让它自动躲开 `-emit-header` 与 `module` 改名；
+- **探测用 token 重放而不是新关键字**：字面量的头（`void(int x)`）和 C 的
+  声明符完全同形，`unary()` 与 `block()` 的语句入口各做一次
+  "扫签名 + 重放 `type_decl`" 的投机判定，失败就把 token 原样还回去。所以
+  `void (*f)(int) = void(int x) { … };`（声明）和 `void(int x) { … }(1);`
+  （语句/表达式）都靠同一套规则判出来，不引入任何保留字，`int x = 5;`
+  这类普通声明只在第一个 `=` 处停一下扫描。
 
 ### 11.9 C99 输出后端（`-c99`）
 

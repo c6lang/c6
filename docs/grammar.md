@@ -616,6 +616,57 @@ tuple-element-access   = postfix-expression , "[" , integer-constant , "]" ;
   解析——只有当括号里是一串“类型 [, 类型…]”且右括号前没有名字时才按元组
   类型解析（解析器做投机 + 回滚）。
 
+### 3.9 函数字面量 `RET (参数) { 体 }`
+
+```
+function-literal       = type-specifier , [ "!error" ] ,
+                         "(" , [ parameter-type-list ] , ")" ,
+                         compound-statement ;
+                         (* 值 = 函数指示符，退化成函数指针 *)
+
+inferred-declaration   = identifier , "=" , function-literal , ";" ;
+                         (* 类型从字面量推出：int(int x){…} 推出 int (*)(int) *)
+```
+
+函数字面量是一个**表达式**，它的值就是那个函数，和写一个函数名一样：
+不分配对象、不做引用计数、运行期不携带任何额外信息（约束 C80–C83）。
+
+```c
+    void (*say)(int) = void(int x) { printf("%d\n", x); };
+    say(1);
+
+    void(int x) { printf("%d\n", x); }(2);      (* 就地调用 *)
+
+    f = int(int x) { return x * 2; };            (* 推断声明 *)
+    if (f(3) != 6) err(1, "…");
+
+    static int (*table[2])(int) = {
+        { int(int v) { return v + 1; } },
+        { int(int v) { return v + 2; } },
+    };
+    qsort(v, n, sizeof v[0], int(const void *a, const void *b) {
+        return *(const int *)a < *(const int *)b ? -1 : *(const int *)a > *(const int *)b;
+    });
+```
+
+* 返回类型、参数表和函数定义完全相同：`!error`、变参、`T[:]`、元组、
+  `@T`、struct 返回值都可以。字面量**没有名字**（C81），也不能带存储类
+  或 `async`（C83）；
+* 体是**稍后编译**的：和 `static inline` 一样，函数在翻译单元末尾发射，
+  内部名字是 `__c6_fn_<序号>`（`static`），所以 `module` 不改写它，
+  `-emit-header` 也不导出它。每个字面量各是一个独立的函数；
+* 因此体里只看得见**它自己的参数**和**文件作用域**的名字。写在外层的局部
+  变量、形参、块作用域的 `typedef` 和 tag 在体里不可见：引用它们是编译期
+  错误（C80），而不是悄悄读到一个已经返回的栈槽。需要那些值时把它们作为
+  参数传进来。V1 不实现捕获——捕获式闭包的设计见
+  `docs/closure-design.md`；
+* 能写在任何可以写表达式的地方：文件作用域和 `static` 局部变量的初始化
+  器、实参、返回值、结构体成员初值、数组初值、`static inline` 函数体里，
+  以及另一个字面量的体里；
+* 值就是普通的函数指针：C ABI 不变，可以存进任何同型函数指针、放进函数
+  指针表、交给纯 C 保存和回调（`tests/abi/fn_lit.c`），也可以直接传给
+  `qsort` 这类标准库函数。
+
 ---
 
 ## 4. 语句
@@ -725,7 +776,8 @@ pattern-element        = type-specifier , declarator      (* 解构声明 *)
 primary-expression     = …
                        | qualified-identifier
                        | try-expression
-                       | await-expression ;
+                       | await-expression
+                       | function-literal ;          (* 见 3.9 *)
 
 await-expression       = "await" , unary-expression ;
                          (* 操作数最终必须落到一次 async 函数调用或
@@ -907,6 +959,10 @@ parameter-list    = identifier , { "," , identifier } ;
 | C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
 | C78 | `thread` 句柄的初始化式必须是 `go` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'go f(...)'` |
 | C79 | `move(p)` 之后、重新赋值之前不能再用 `p`（读/比较/解引用/传参/再 `move`） | `'%s' was moved: assign a new reference before using it` |
+| C80 | 函数字面量的体里只能引用它自己的参数和文件作用域的名字，不能引用外层局部变量、形参、块作用域 `typedef`/tag（V1 没有捕获） | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
+| C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
+| C82 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
+| C83 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
 
 ---
 
@@ -1367,6 +1423,25 @@ defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再�
 而 C15 又强制 `T!error` 的返回值必须被 `try` / `catch` 消费，因此失败路径上
 那个全零的值永远不可观测。标量返回类型仍用哨兵 `-1`（C9）。
 
+**R23 — 函数字面量**
+
+```
+    int(int x) { return x + 1; }                       (* 写在表达式位置 *)
+=>
+    static int __c6_fn_1(int x);                       (* 翻译单元末尾发射 *)
+    …                                                  (* 表达式本身：__c6_fn_1 *)
+```
+
+字面量在**原地**只留下函数指示符（和写 `f` 一样退化成 `int (*)(int)`），
+体被存起来，在翻译单元末尾用 `gen_function()` 单独编译——与 `static inline`
+函数走同一条路。所以：
+
+* 字面量不产生任何运行期数据（`sizeof` 一个函数指针仍是 8），也不参与
+  引用计数：域里存的是裸函数地址；
+* 体里出现的外层块作用域名字无法携带，编译期就报 C80；
+* `static` 让它在 `-emit-header` 与 `module` 前缀改写之外，名字里的序号
+  只有调试信息看得到。
+
 ---
 
 切片配合数组、函数与结构体：
@@ -1510,6 +1585,8 @@ int main(void)
 | 自定义删除器 | V1 不做（析构只有 `drop` 方法一种） |
 | 写法 | 结果 |
 |---|---|
+| 捕获式闭包：`int x = 1; f = int() { return x; };` | 约束 C80：V1 的字面量是裸函数指针，体里只看得见参数和文件作用域；捕获版设计见 `docs/closure-design.md` |
+| `task t = void() { … };` 之类包装 | 不需要：字面量本身就是函数指针，直接 `go f(x)` / 直接传 |
 | `try { … } catch { … }` 块形式 | 语法错误（`try` 只接一次调用） |
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |
 | `catch` 处理块自然落到末尾 | 约束 C6 |
@@ -1634,6 +1711,7 @@ int main(void)
 | `return { … };` | `c6_return_value`（普通函数与 `async` 函数共用） | `tcc/tccgen.c` |
 | 元组的类型回放 | `c6_async_type_tokens` 对元组输出 `(T1, T2)`（不复用内部 tag 名，否则跳板里会声明出一个作用域不同的新 struct） | `tcc/tccgen.c` |
 | `!error` 的聚合返回值 | `c6_apply_fallible`（白名单加 `VT_STRUCT` / `VT_UNION`）、`c6_zero_local`、`c6_emit_propagate` / `c6_async_propagate`（失败路径清零） | `tcc/tccgen.c` |
+| 函数字面量 `RET (参数) { 体 }` | `C6Lit` 队列 + `c6_lit_lead()`（读前缀 → 扫描签名 → token 重放判定「函数 + `{`」）、`c6_lit_parse()`（建 `static` 符号、`skip_or_save_block` 存体）、`c6_lit_decl_lead()` / `c6_lit_infer_decl()`（`f = …;` 推断声明）、`c6_lit_flush()`（TU 末尾 `gen_function()`）、`c6_lit_cap_check()`（捕获诊断，挂在值/typedef/tag 三条符号解析路径上）；`unary()` 的 `tok_next`、`case '('` 与 `block()` 的语句入口各一处钩子 | `tcc/tccgen.c` |
 | 切片下标 / 区间 | `c6_slice_subscript`（`unary()` 的 `[` 分支）、`c6_slice_spill` | `tcc/tccgen.c` |
 | 数组 → 切片 | `c6_slice_convert`（`vstore` / `gen_assign_cast` / 强转 / `decl_initializer`） | `tcc/tccgen.c` |
 | `@T` / `shared @T` / `weak @T` / `own @T` 限定符 | `parse_btype()` 的 `@` 前缀 + `c6_gc_qual()`（软关键字 `weak`/`own`/`shared`）、`CType.gq` 缓存 + pointee 上的可信副本、`c6_type_gq` / `c6_is_managed` / `c6_gc_plain` / `c6_gc_mode` | `tcc/tccgen.c`、`tcc/tcc.h` |
