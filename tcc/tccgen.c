@@ -488,6 +488,52 @@ static C6Closure *c6_closure_of_type(CType *type)
     return NULL;
 }
 
+/* Why a signature cannot be written at file scope: 0 = fine, 1 = anonymous
+   tag, 2 = tag declared in a block. */
+static int c6_type_sig_problem(CType *type)
+{
+    int bt = type->t & VT_BTYPE;
+
+    if (type->t & VT_VLA)
+        return 2;
+    if (bt == VT_PTR) {
+        Sym *s = type->ref;
+        if (!s)
+            return 0;
+        if (type->t & VT_ARRAY)
+            return c6_type_sig_problem(&s->type);
+        return c6_type_sig_problem(&s->type);
+    }
+    if (bt == VT_FUNC) {
+        Sym *f = type->ref, *p = 0;
+        int r = 0;
+        if (!f)
+            return 0;
+        r = c6_type_sig_problem(&f->type);
+        if (r)
+            return r;
+        for (p = f->next; p; p = p->next) {
+            CType pt = p->type;
+            convert_parameter_type(&pt);
+            r = c6_type_sig_problem(&pt);
+            if (r)
+                return r;
+        }
+        return 0;
+    }
+    if (bt == VT_STRUCT || IS_ENUM(type->t)) {
+        Sym *s = type->ref;
+        if (!s)
+            return 0;
+        if (s->sym_scope != 0)
+            return 2;
+        if ((s->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM)
+            return 1;
+        return 0;
+    }
+    return 0;
+}
+
 /* Build (or find) the closure type for a function type.  The caller must
    have forced c6_sym_global and local_scope = 0 while parsing the signature,
    so 'ftype' and every pointer/parameter symbol it refers to are global. */
@@ -517,9 +563,13 @@ static CType c6_closure_get(CType *ftype)
                       "'closure RET (parameters)'");
         f->f.func_type = FUNC_NEW;      /* '()' takes no parameters */
     }
-    if (!c6_type_global_ex(&ft, 1))
-        tcc_error("a closure signature cannot use a type declared in a block "
-                  "or an anonymous 'struct'/'union'/'enum' (give it a tag)");
+    if (!c6_type_global_ex(&ft, 1)) {
+        int why = c6_type_sig_problem(&ft);
+        if (why == 1)
+            tcc_error("a closure signature cannot use an anonymous "
+                      "'struct'/'union'/'enum': give it a tag");
+        tcc_error("a closure signature cannot use a type declared in a block");
+    }
 
     /* the parsed signature lives in the enclosing block; copy it so that the
        parameter chain survives until the literal body is compiled */
@@ -986,6 +1036,8 @@ static C6Lit *c6_lit_head = 0, *c6_lit_tail = 0;
 /* the literal whose body is currently being compiled: a name that resolves
    outside that body is a capture */
 static C6Lit *c6_lit_replay = 0;
+/* the variable a declaration initializer is being written to (0 outside) */
+static int c6_lit_dst_tok = 0;
 static int c6_lit_count = 0;
 static int c6_lit_flush(void);
 static int c6_lit_lead(TokenString *pre);
@@ -1160,6 +1212,13 @@ static void c6_lit_scan_note(int tok, Sym *s, int uneval)
         tcc_error("a closure cannot capture '%s': it holds managed references "
                   "and cannot be copied by value (capture the '@T' owner "
                   "instead)", get_tok_str(v, NULL));
+    if ((s->type.t & VT_BTYPE) == VT_STRUCT && s->type.ref) {
+        C6GcType *gt = c6_gc_type_find(s->type.ref->v & ~SYM_STRUCT);
+        if (gt && gt->drop_tok)
+            tcc_error("a closure cannot capture '%s': it has a 'drop' "
+                      "destructor and copying it would release it twice",
+                      get_tok_str(v, NULL));
+    }
     c6_lit_cap_add(lit, v, &s->type, uneval ? C6_CAP_ZERO : C6_CAP_VALUE);
 }
 
@@ -1377,6 +1436,25 @@ static CType c6_closure_code_type(CType *ftype)
 
 /* Build and queue 'static RET __c6_tramp_HASH(void *__c6_env, P a0, ...)
    { return ((RET (*)(P...))((void **)__c6_env)[0])(a0, ...); }'. */
+/* the env field stores a plain function pointer: the trampoline reports a
+   failure through the shared error slot, so its own result is never fallible */
+static CType c6_closure_plain_ftype(CType *ft)
+{
+    CType r = *ft;
+    Sym *f = ft->ref, *nf = NULL;
+
+    if (!f)
+        return r;
+    nf = c6_sym_alloc(SYM_FIELD, 0, 0);
+    nf->type = f->type;
+    nf->a = f->a;
+    nf->f = f->f;
+    nf->f.func_fallible = 0;
+    nf->next = f->next;
+    r.ref = nf;
+    return r;
+}
+
 static Sym *c6_closure_tramp(C6Closure *cl)
 {
     CType tt = {0}, rt = {0};
@@ -1412,6 +1490,8 @@ static Sym *c6_closure_tramp(C6Closure *cl)
     nf->type = f->type;
     nf->a = f->a;
     nf->f = f->f;
+    nf->f.func_fallible = 0;        /* the trampoline reports through the
+                                       shared error slot, not its result */
     nf->f.func_args = f->f.func_args + 1;
     ep = c6_sym_alloc(envtok, 0, 0);
     {
@@ -1450,7 +1530,8 @@ static Sym *c6_closure_tramp(C6Closure *cl)
     snprintf(buf, sizeof buf, "__c6_env_%016llx", cl->hash);
     {
         int etag = tok_alloc_const(buf);
-        CType fp = c6_global_ptr(&cl->ftype);
+        CType plain = c6_closure_plain_ftype(&cl->ftype);
+        CType fp = c6_global_ptr(&plain);
         Sym *tag = sym_push2(&global_stack, etag | SYM_STRUCT, VT_STRUCT, PTR_SIZE);
         Sym *field = c6_sym_alloc(tok_alloc_const("__c6_fn") | SYM_FIELD, 0, 0);
         tag->c = PTR_SIZE;
@@ -1574,16 +1655,17 @@ static void c6_closure_self_capture(void)
 {
     C6Lit *lit = vtop->c6_lit_src;
     Sym *dst = vtop[-1].sym;
+    int dst_tok = dst ? (dst->v & ~(SYM_STRUCT | SYM_FIELD)) : c6_lit_dst_tok;
     int i = 0;
 
-    if (!lit || !dst)
+    if (!lit || !dst_tok)
         return;
     for (i = 0; i < lit->ncaps; i++)
         if (lit->caps[i].kind == C6_CAP_VALUE
-            && lit->caps[i].tok == (dst->v & ~(SYM_STRUCT | SYM_FIELD)))
+            && lit->caps[i].tok == dst_tok)
             tcc_error("'%s' is captured by the closure being assigned to it: "
                       "the closure would see the old value (use a named "
-                      "function for recursion)", get_tok_str(dst->v, NULL));
+                      "function for recursion)", get_tok_str(dst_tok, NULL));
 }
 
 static void c6_closure_opaque(CType *t)
@@ -8398,6 +8480,13 @@ static void c6_lit_parse(void)
         }
     }
     if (lit->capturing) {
+        int why = c6_type_sig_problem(&ftype);
+        if (why == 1)
+            tcc_error("a function literal signature cannot use an anonymous "
+                      "'struct'/'union'/'enum': give it a tag");
+        if (why == 2)
+            tcc_error("a function literal signature cannot use a type "
+                      "declared in a block");
         c6_lit_env_get(lit);
         c6_lit_make_closure(lit);
         lit->code_type.t |= VT_STATIC | VT_EXTERN;
@@ -8690,6 +8779,12 @@ ST_FUNC void unary(void)
                         skip(')');
                     break;
                 }
+                if (c6_closure_wrap_to(&type)) {
+                    if (wrap)
+                        skip(')');
+                    break;
+                }
+                c6_closure_to_pointer_error(&type);
 #endif
                 gen_cast(&type);
                 if (wrap)
@@ -15351,8 +15446,12 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
         cur_scope->vla.loc = addr;
         cur_scope->vla.num++;
     } else if (has_init) {
+        int save_dst = c6_lit_dst_tok;
         p.sec = sec;
+        if (c6_closure_of_type(type))
+            c6_lit_dst_tok = v;
         decl_initializer(&p, type, addr, DIF_FIRST);
+        c6_lit_dst_tok = save_dst;
         /* patch flexible array member size back to -1, */
         /* for possible subsequent similar declarations */
         if (flexible_array)
@@ -16077,13 +16176,19 @@ static void c6_async_declare(CType *ftype, int name)
 
     /* E-GC10: what a task carries crosses to whoever awaits it, so it must
        be 'shared' (only a 'shared' count is atomic) */
+    if (c6_closure_of_type(&ftype->ref->type))
+        tcc_error("a closure cannot cross a thread or a task: V2 closures are "
+                  "confined to the thread that creates them");
     if (c6_is_managed(&ftype->ref->type)
         && !(c6_type_gq(&ftype->ref->type) & (C6_GQ_SHARED | C6_GQ_WEAK)))
         tcc_error("an 'async' return value that carries a reference requires "
                   "'shared': '%s' returns a per-thread count",
                   get_tok_str(name, NULL));
     for (p = c6_async_params(ftype); p; p = p->next)
-        if (c6_is_managed(&p->type)
+        if (c6_closure_of_type(&p->type))
+            tcc_error("a closure cannot cross a thread or a task: V2 closures "
+                      "are confined to the thread that creates them");
+        else if (c6_is_managed(&p->type)
             && !(c6_type_gq(&p->type) & (C6_GQ_SHARED | C6_GQ_WEAK)))
             tcc_error("passing a reference to 'async' requires 'shared': "
                       "'%s' is counted per thread", get_tok_str(name, NULL));
@@ -18521,7 +18626,7 @@ static int c6_sp_ok(CType *ft)
 {
     if ((ft->t & VT_BTYPE) != VT_FUNC || !ft->ref)
         return 0;
-    if (ft->ref->f.func_async || ft->ref->f.func_fallible)
+    if (ft->ref->f.func_async)
         return 0;
     if (ft->ref->f.func_type == FUNC_OLD
         || ft->ref->f.func_type == FUNC_ELLIPSIS)
@@ -18737,6 +18842,9 @@ static void c6_sp_parse(int want_handle)
         tcc_error("'go' does not support this signature: '%s'",
                   get_tok_str(name, NULL));
     for (p = c6_async_params(&ft); p; p = p->next) {
+        if (c6_closure_of_type(&p->type))
+            tcc_error("a closure cannot cross a thread or a task: V2 closures "
+                      "are confined to the thread that creates them");
         if (!c6_sp_type_ok(&p->type))
             tcc_error("'go' does not support this signature: '%s'",
                       get_tok_str(name, NULL));

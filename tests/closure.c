@@ -121,6 +121,41 @@ test "跨翻译单元：同签名闭包按值传递" {
         err(1, "跨 TU 闭包调用不对");
 }
 
+test "可失败闭包：捕获式与跳板" {
+    int base = 10;
+    closure int!error(int) f = int!error (int x) {
+        if (x < 0)
+            err(7, "negative");
+        return x + base;
+    };
+    int v = f(1) catch e { return 1; };
+    if (v != 11)
+        err(1, "捕获式可失败闭包");
+    f(-1) catch e {
+        if (e.id != 7)
+            err(2, "错误码不对");
+        f = NULL;
+        goto wrapped;
+    };
+    err(3, "没有报错");
+wrapped:
+    closure int!error(int) g = int!error (int x) {
+        if (x < 0)
+            err(8, "negative");
+        return x;
+    };
+    int w = g(2) catch e { return 4; };
+    if (w != 2)
+        err(4, "跳板可失败闭包");
+    g(-1) catch e {
+        if (e.id != 8)
+            err(5, "跳板错误码不对");
+        g = NULL;
+        return 0;
+    };
+    err(6, "跳板没有报错");
+}
+
 test "defer 与闭包捕获" {
     int n = 1;
     closure int() f = int() { defer n = n + 2; return n; };
