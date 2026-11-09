@@ -694,18 +694,132 @@ typedef struct TccThCtx {
 typedef unsigned long pthread_t;
 typedef unsigned int pthread_key_t;
 typedef int pthread_once_t;
-extern int pthread_once(pthread_once_t *, void (*)(void));
-extern int pthread_key_create(pthread_key_t *, void (*)(void *));
-extern void *pthread_getspecific(pthread_key_t);
-extern int pthread_setspecific(pthread_key_t, const void *);
-extern int pthread_create(pthread_t *, const void *, void *(*)(void *), void *);
-extern int pthread_join(pthread_t, void **);
-extern pthread_t pthread_self(void);
-extern int pthread_equal(pthread_t, pthread_t);
+/* The runtime needs threads for 'go'/'thread' and to key one block of state
+   (defer stack, error slot, f-string builders) per thread.  A freestanding
+   program -- one linked without libc -- has no pthreads, so every entry
+   point is a *weak* reference: it becomes 0 there, and the runtime then
+   keeps a single static block and refuses to start threads instead of
+   failing to link.  See 'examples/freestanding_fstr.c'. */
+extern int pthread_once(pthread_once_t *, void (*)(void))
+    __attribute__((weak));
+extern int pthread_key_create(pthread_key_t *, void (*)(void *))
+    __attribute__((weak));
+extern void *pthread_getspecific(pthread_key_t) __attribute__((weak));
+extern int pthread_setspecific(pthread_key_t, const void *)
+    __attribute__((weak));
+extern int pthread_create(pthread_t *, const void *, void *(*)(void *), void *)
+    __attribute__((weak));
+extern int pthread_join(pthread_t, void **) __attribute__((weak));
+extern pthread_t pthread_self(void) __attribute__((weak));
+extern int pthread_equal(pthread_t, pthread_t) __attribute__((weak));
 #endif
 
-extern void *calloc(unsigned long, unsigned long);
-extern void free(void *);
+/* ---- memory ------------------------------------------------------- *
+   Generated code calls these for struct copies and zeroing.  They normally
+   come from libc; a freestanding program has none, so the plain byte loops
+   below are weak definitions that a real libc replaces at link time. */
+
+__attribute__((weak)) void *memset(void *d, int c, unsigned long n)
+{
+    char *p = (char *)d;
+    unsigned long i = 0;
+
+    for (i = 0; i < n; i++)
+        p[i] = (char)c;
+    return d;
+}
+
+__attribute__((weak)) void *memcpy(void *d, const void *s, unsigned long n)
+{
+    char *p = (char *)d;
+    const char *q = (const char *)s;
+    unsigned long i = 0;
+
+    for (i = 0; i < n; i++)
+        p[i] = q[i];
+    return d;
+}
+
+__attribute__((weak)) void *memmove(void *d, const void *s, unsigned long n)
+{
+    char *p = (char *)d;
+    const char *q = (const char *)s;
+    unsigned long i = 0;
+
+    if (p == q || !n)
+        return d;
+    if (p < q || p >= q + n) {
+        for (i = 0; i < n; i++)
+            p[i] = q[i];
+    } else {
+        for (i = n; i > 0; i--)
+            p[i - 1] = q[i - 1];
+    }
+    return d;
+}
+
+/* ---- allocator ----------------------------------------------------- *
+   The runtime needs memory for the f-string builders, the defer stack, the
+   error slot, the coroutine pool and the managed objects.  Normally that is
+   the C library's calloc/free/realloc.  A freestanding program (one linked
+   without libc) has none of them, so the three references are weak and a
+   static arena in .bss takes over when they are 0 -- then f"..", defer, err
+   and @T keep working with nothing provided by the program.  C6_HEAP_SIZE
+   can be raised at build time (-DC6_HEAP_SIZE=...) and a program that links
+   its own calloc/free simply gets used instead (the arena stays unused). */
+
+#ifndef C6_HEAP_SIZE
+#define C6_HEAP_SIZE (256 * 1024)
+#endif
+
+extern void *calloc(unsigned long, unsigned long) __attribute__((weak));
+extern void free(void *) __attribute__((weak));
+extern void *realloc(void *, unsigned long) __attribute__((weak));
+
+#define C6_HEAP_HDR 16
+static char c6_heap[C6_HEAP_SIZE];      /* .bss: costs nothing in the file */
+static unsigned long c6_heap_used;
+
+static void *c6_alloc(unsigned long size)
+{
+    unsigned long need = 0, start = 0;
+
+    if (calloc)
+        return calloc(1, size);
+    need = (size + C6_HEAP_HDR + 15UL) & ~15UL;
+    if (c6_heap_used + need > C6_HEAP_SIZE)
+        return 0;
+    start = c6_heap_used;
+    c6_heap_used += need;
+    *(unsigned long *)&c6_heap[start] = size;
+    return &c6_heap[start + C6_HEAP_HDR];
+}
+
+static void c6_free(void *p)
+{
+    if (free)
+        free(p);                        /* the arena never gives back */
+}
+
+static void *c6_realloc(void *p, unsigned long size)
+{
+    unsigned long old = 0, i = 0;
+    char *np = 0, *op = (char *)p;
+
+    if (realloc)
+        return realloc(p, size);
+    if (!p)
+        return c6_alloc(size);
+    old = *(unsigned long *)(op - C6_HEAP_HDR);
+    if (size <= old)
+        return p;
+    np = (char *)c6_alloc(size);
+    if (!np)
+        return 0;
+    for (i = 0; i < old; i++)
+        np[i] = op[i];
+    return np;
+}
 
 /* A thread started by 'go'.  It is always joined by the thread that started
    it, and it may also be handed out as a handle ('thread h = go f(x);'), so
@@ -729,7 +843,7 @@ struct TccThRec {
 static void tcc_th_rec_unref(TccThRec *r)
 {
     if (r && --r->refs <= 0)
-        free(r);
+        c6_free(r);
 }
 
 static void tcc_th_trap(void)
@@ -740,7 +854,7 @@ static void tcc_th_trap(void)
 
 static void *tcc_th_alloc(unsigned long size)
 {
-    void *p = calloc(1, size);
+    void *p = c6_alloc(size);
 
     if (!p)
         tcc_th_trap();
@@ -762,7 +876,8 @@ static void tcc_th_join_children(TccThCtx *th)
         th->th_list = r->next;
         if (!r->state) {            /* a handle may have joined it already */
 #ifndef TCC_TARGET_PE
-            pthread_join(r->tid, (void **)0);
+            if (pthread_join)       /* absent in a freestanding link */
+                pthread_join(r->tid, (void **)0);
 #endif
             r->state = 1;
         }
@@ -780,13 +895,13 @@ static void tcc_th_free(TccThCtx *th)
     tcc_th_gc_free_all(th);
     tcc_th_join_children(th);
     if (th->dstack)
-        free(th->dstack);
+        c6_free(th->dstack);
     if (th->dctx)
-        free(th->dctx);
+        c6_free(th->dctx);
     if (th->co)
         tcc_th_co_free(th->co);
     tcc_fmt_free_all(th);
-    free(th);
+    c6_free(th);
 }
 
 #ifdef TCC_TARGET_PE
@@ -806,11 +921,23 @@ static void tcc_th_key_init(void)
         tcc_th_trap();
 }
 
+/* 1 when the program was linked with pthreads: the block of state is then
+   keyed per thread.  0 in a freestanding link (no libc): one static block,
+   so 'go' and 'thread' report failure instead of starting a thread. */
+static int tcc_th_multi(void)
+{
+    return pthread_once && pthread_key_create && pthread_getspecific
+        && pthread_setspecific;
+}
+
 /* The per-thread block of the calling thread, allocated on first use. */
 static TccThCtx *tcc_th(void)
 {
+    static TccThCtx single;
     TccThCtx *th;
 
+    if (!tcc_th_multi())
+        return &single;
     if (pthread_once(&tcc_th_once, tcc_th_key_init) != 0)
         tcc_th_trap();
     th = (TccThCtx *)pthread_getspecific(tcc_th_key);
@@ -842,9 +969,9 @@ static void *tcc_th_tramp(void *p)
     TccThStart st = *(TccThStart *)p;
     void *ret;
 
-    free(p);
+    c6_free(p);
     ret = st.fn(st.arg);
-    free(st.arg);
+    c6_free(st.arg);
     st.rec->ret = ret;
     st.rec->done = 1;
     return ret;
@@ -866,6 +993,10 @@ void *__tcc_th_spawn(void *(*fn)(void *), void *arg)
     TccThRec *r;
     TccThStart *st;
 
+    if (!pthread_create) {          /* freestanding: no threads at all */
+        c6_free(arg);
+        return 0;
+    }
     r = (TccThRec *)tcc_th_alloc(sizeof *r);
     st = (TccThStart *)tcc_th_alloc(sizeof *st);
     st->fn = fn;
@@ -873,9 +1004,9 @@ void *__tcc_th_spawn(void *(*fn)(void *), void *arg)
     st->rec = r;
     r->refs = 2;
     if (pthread_create(&r->tid, (const void *)0, tcc_th_tramp, st) != 0) {
-        free(st);
-        free(arg);
-        free(r);
+        c6_free(st);
+        c6_free(arg);
+        c6_free(r);
         return 0;
     }
     r->next = th->th_list;
@@ -907,6 +1038,8 @@ int __c6_thread_join(TccThRec *r)
 #ifdef TCC_TARGET_PE
     return -1;
 #else
+    if (!pthread_equal || !pthread_self || !pthread_join)
+        return -1;                  /* freestanding: no threads */
     if (pthread_equal(r->tid, pthread_self()))
         return -1;
     if (!r->state) {
@@ -1323,7 +1456,7 @@ static void c6_gc_free_one(C6GcHdr *h)
     }
     if (c6_gc_live_count)
         c6_gc_live_count--;
-    free(h);
+    c6_free(h);
 }
 
 /* Run the free queue of TH for at most BUDGET objects.  Called from the
@@ -1371,7 +1504,7 @@ static void c6_gc_die(C6GcHdr *h)
     while (w) {
         C6GcWeak *next = w->next;
         *w->slot = 0;
-        free(w);
+        c6_free(w);
         w = next;
     }
     th = tcc_th();
@@ -1419,7 +1552,7 @@ static void c6_gc_weak_unlink(void **slot, void *p)
         C6GcWeak *w = *pp;
         if (w->slot == slot) {
             *pp = w->next;
-            free(w);
+            c6_free(w);
             return;
         }
     }
@@ -1450,7 +1583,7 @@ void *__c6_gc_new(unsigned long size, unsigned long count,
     if (count > ((unsigned long)-1 - C6_GC_HDR_SIZE) / size)
         c6_gc_trap();           /* the size computation would wrap */
     total = size * count;
-    h = (C6GcHdr *)calloc(1, C6_GC_HDR_SIZE + total);
+    h = (C6GcHdr *)c6_alloc(C6_GC_HDR_SIZE + total);
     if (!h)
         c6_gc_trap();
     h->rc = 1;
@@ -1630,7 +1763,6 @@ static int c6_nb_gc_roots, c6_cap_gc_roots;
 static int c6_gc_shut_down;
 
 void __c6_gc_shutdown(void);
-extern void *realloc(void *, unsigned long);
 
 void __c6_gc_root(void *block, int kind, unsigned long count,
                   unsigned long stride)
@@ -1639,7 +1771,7 @@ void __c6_gc_root(void *block, int kind, unsigned long count,
         return;
     if (c6_nb_gc_roots == c6_cap_gc_roots) {
         int cap = c6_cap_gc_roots ? c6_cap_gc_roots * 2 : 16;
-        C6GcRoot *nr = (C6GcRoot *)realloc(c6_gc_roots,
+        C6GcRoot *nr = (C6GcRoot *)c6_realloc(c6_gc_roots,
                        (unsigned long)cap * sizeof *nr);
         if (!nr)
             return;                 /* out of memory: leak instead of crash */
@@ -1721,14 +1853,14 @@ static void c6_fmt_room(C6FmtBuf *b, unsigned long len)
         return;
     while (cap < b->len + len + 1)
         cap *= 2;
-    np = (char *)calloc(1, cap);
+    np = (char *)c6_alloc(cap);
     if (!np)
         c6_gc_trap();
     old = c6_fmt_text(b);
     for (i = 0; i < b->len; i++)
         np[i] = old[i];
     if (b->heap)
-        free(b->heap);
+        c6_free(b->heap);
     b->heap = np;
     b->cap = cap;
 }
@@ -1764,6 +1896,7 @@ static void c6_fmt_put(C6FmtBuf *b, const char *s, unsigned long len)
 #define C6_SPEC_PLUS         (1 << 26)
 #define C6_SPEC_HASH         (1 << 27)
 #define C6_SPEC_PREC_SET     (1 << 28)
+#define C6_SPEC_UPPER        (1 << 29)
 
 #define C6_CONV_NONE 0
 #define C6_CONV_D    1
@@ -1949,19 +2082,19 @@ static C6FmtBuf *c6_fmt_slot(int d)
         n = th->fmt_nslot ? th->fmt_nslot : 4;
         while (n <= d)
             n *= 2;
-        ns = (struct C6FmtBuf **)calloc(1, (unsigned long)n * sizeof *ns);
+        ns = (struct C6FmtBuf **)c6_alloc((unsigned long)n * sizeof *ns);
         if (!ns)
             c6_gc_trap();
         for (i = 0; i < th->fmt_nslot; i++)
             ns[i] = th->fmt_slot[i];
         if (th->fmt_slot)
-            free(th->fmt_slot);
+            c6_free(th->fmt_slot);
         th->fmt_slot = ns;
         th->fmt_nslot = n;
     }
     b = th->fmt_slot[d];
     if (!b) {
-        b = (C6FmtBuf *)calloc(1, sizeof *b);
+        b = (C6FmtBuf *)c6_alloc(sizeof *b);
         if (!b)
             c6_gc_trap();
         b->cap = C6_FMT_SCRATCH;
@@ -2090,6 +2223,286 @@ void __c6_fmt_b(int v, int spec)
     c6_fmt_str_spec(b, v ? "true" : "false", v ? 4 : 5, spec);
 }
 
+/* ---- floating point --------------------------------------------------- *
+   A 'double' is formatted here: libtcc1 has no libc, and the C99 prelude
+   must produce the same text.  The digits come from repeated decimal
+   scaling, which is exact for the common range; a value that needs all 17
+   significant digits may differ in the last one from a host printf.
+   'f' is fixed notation, 'e' scientific, 'g' the shorter of the two with
+   trailing zeros dropped (the default).  |v| >= 1e19 is printed in
+   scientific notation even for 'f'. */
+
+#define C6_CONV_F 10
+#define C6_CONV_E 11
+#define C6_CONV_G 12
+
+/* scale F by ten and return the digit */
+static int c6_dbl_digit(double *f)
+{
+    int d = 0;
+
+    *f *= 10.0;
+    d = (int)*f;
+    if (d > 9)
+        d = 9;
+    if (d < 0)
+        d = 0;
+    *f -= (double)d;
+    return d;
+}
+
+/* the integer digits (most significant first) of V and P rounded fraction
+   digits into IP/FP; returns the number of integer digits */
+static int c6_dbl_fixed(double v, char *ip, char *fp, int p)
+{
+    unsigned long long u = (unsigned long long)v;
+    double f = v - (double)u;
+    char t[24];
+    int i = 0, n = 0, d = 0;
+
+    if (!u) {
+        t[n++] = '0';
+    } else {
+        while (u) {
+            t[n++] = (char)('0' + (int)(u % 10ULL));
+            u /= 10ULL;
+        }
+    }
+    for (i = 0; i < n; i++)
+        ip[i] = t[n - 1 - i];
+    for (i = 0; i < p; i++)
+        fp[i] = (char)('0' + c6_dbl_digit(&f));
+    d = c6_dbl_digit(&f);               /* rounding digit */
+    if (d >= 5) {
+        i = p - 1;
+        while (i >= 0) {
+            if (fp[i] != '9') {
+                ++fp[i];
+                break;
+            }
+            fp[i] = '0';
+            --i;
+        }
+        if (i < 0) {
+            i = n - 1;
+            while (i >= 0) {
+                if (ip[i] != '9') {
+                    ++ip[i];
+                    break;
+                }
+                ip[i] = '0';
+                --i;
+            }
+            if (i < 0) {                /* 99.. -> 100.. */
+                for (i = n; i > 0; i--)
+                    ip[i] = ip[i - 1];
+                ip[0] = '1';
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+/* floor(log10(v)) for v > 0 */
+static int c6_dbl_exp10(double v)
+{
+    int e = 0;
+
+    if (!(v > 0.0))                     /* zero or nan: no exponent */
+        return 0;
+    if (v >= 10.0) {
+        while (v >= 10.0) {
+            v /= 10.0;
+            ++e;
+        }
+    } else {
+        while (v < 1.0) {
+            v *= 10.0;
+            --e;
+        }
+    }
+    return e;
+}
+
+/* fixed notation into OUT (at least P + 32 bytes), returns the length */
+static int c6_dbl_str_fixed(char *out, double v, int p)
+{
+    char ip[24], fp[64];
+    int n = c6_dbl_fixed(v, ip, fp, p), len = 0, i = 0;
+
+    for (i = 0; i < n; i++)
+        out[len++] = ip[i];
+    if (p > 0) {
+        out[len++] = '.';
+        for (i = 0; i < p; i++)
+            out[len++] = fp[i];
+    }
+    return len;
+}
+
+/* scientific notation into OUT (at least P + 40 bytes) */
+static int c6_dbl_str_sci(char *out, double v, int p, int upper)
+{
+    char ip[24], fp[64];
+    int e = 0, n = 0, len = 0, i = 0;
+    double m = v;
+    char *dig = upper ? "0123456789ABCDEF" : "0123456789";
+
+    (void)dig;
+    e = c6_dbl_exp10(v);
+    if (e > 0) {
+        for (i = 0; i < e; i++)
+            m /= 10.0;
+    } else {
+        for (i = 0; i < -e; i++)
+            m *= 10.0;
+    }
+    n = c6_dbl_fixed(m, ip, fp, p);
+    if (n > 1) {                        /* 9.99.. rounded up to 10.0 */
+        ++e;
+        ip[0] = '1';
+        n = 1;
+        for (i = 0; i < p; i++)
+            fp[i] = '0';
+    }
+    out[len++] = ip[0];
+    if (p > 0) {
+        out[len++] = '.';
+        for (i = 0; i < p; i++)
+            out[len++] = fp[i];
+    }
+    out[len++] = (char)(upper ? 'E' : 'e');
+    if (e < 0) {
+        out[len++] = '-';
+        e = -e;
+    } else {
+        out[len++] = '+';
+    }
+    if (e >= 100) {
+        out[len++] = (char)('0' + e / 100);
+        out[len++] = (char)('0' + (e / 10) % 10);
+        out[len++] = (char)('0' + e % 10);
+    } else {
+        out[len++] = (char)('0' + (e / 10) % 10);
+        out[len++] = (char)('0' + e % 10);
+    }
+    return len;
+}
+
+/* drop the trailing zeros (and a trailing '.') of OUT unless HASH */
+static int c6_dbl_strip(char *out, int len, int hash)
+{
+    int i = len;
+
+    if (hash)
+        return len;
+    for (i = 0; i < len; i++)
+        if (out[i] == 'e' || out[i] == 'E')
+            break;
+    if (i <= 0)                         /* nothing before the exponent */
+        return len;
+    {
+        int epos = i, j = i - 1;
+        while (j > 0 && out[j] == '0')
+            --j;
+        if (out[j] == '.')
+            --j;
+        if (j + 1 == epos)
+            return len;
+        for (i = epos; i < len; i++)
+            out[j + 1 + (i - epos)] = out[i];
+        return len - (epos - (j + 1));
+    }
+}
+
+void __c6_fmt_f(double v, int spec)
+{
+    C6FmtBuf *b = c6_fmt_cur();
+    char out[192];
+    int len = 0, i = 0, conv = 0, upper = 0, p = 0, prec_set = 0;
+    int neg = 0, left = 0, zero = 0, plus = 0, hash = 0, many = 0;
+    unsigned long width = 0, pad = 0;
+    char sign = 0;
+
+    conv = (spec >> C6_SPEC_CONV_SHIFT) & C6_SPEC_CONV_MASK;
+    if (conv == C6_CONV_NONE)
+        conv = C6_CONV_G;               /* default: the shorter of both */
+    upper = (spec & C6_SPEC_UPPER) != 0;
+    prec_set = (spec & C6_SPEC_PREC_SET) != 0;
+    p = prec_set ? (int)((spec >> C6_SPEC_PREC_SHIFT) & C6_SPEC_PREC_MASK) : 6;
+    left = (spec & C6_SPEC_LEFT) != 0;
+    zero = (spec & C6_SPEC_ZERO) != 0 && !left;
+    plus = (spec & C6_SPEC_PLUS) != 0;
+    hash = (spec & C6_SPEC_HASH) != 0;
+    width = (unsigned long)((spec >> C6_SPEC_WIDTH_SHIFT) & C6_SPEC_WIDTH_MASK);
+
+    neg = v < 0.0 || (v == 0.0 && 1.0 / v < 0.0);
+    if (neg)
+        v = -v;
+    if (v > 1.7976931348623157e308) {
+        len = 3;
+        out[0] = (char)(upper ? 'I' : 'i');
+        out[1] = (char)(upper ? 'N' : 'n');
+        out[2] = (char)(upper ? 'F' : 'f');
+    } else if (v != v) {
+        len = 3;
+        neg = 0;
+        out[0] = (char)(upper ? 'N' : 'n');
+        out[1] = (char)(upper ? 'A' : 'a');
+        out[2] = (char)(upper ? 'N' : 'n');
+    } else {
+        int e = c6_dbl_exp10(v);
+        int sig = p > 0 ? p : 1;        /* '%g' significant digits */
+        if (conv == C6_CONV_E || (conv == C6_CONV_G
+                                  && (e < -4 || e >= sig))
+            || (conv == C6_CONV_F && v >= 1e19)) {
+            if (p > 30)
+                p = 30;
+            if (conv == C6_CONV_G && p > 0)
+                p = sig - 1;            /* 'g': significant digits */
+            len = c6_dbl_str_sci(out, v, p, upper);
+            if (conv == C6_CONV_G)
+                len = c6_dbl_strip(out, len, hash);
+        } else {
+            if (conv == C6_CONV_G)
+                p = sig - 1 - e;        /* 'g': digits after the point */
+            many = 0;
+            if (p > 30) {
+                many = p - 30;
+                p = 30;
+            }
+            len = c6_dbl_str_fixed(out, v, p);
+            if (many > 0) {             /* keep the requested width */
+                for (i = 0; i < many; i++)
+                    out[len++] = '0';
+            }
+            if (conv == C6_CONV_G)
+                len = c6_dbl_strip(out, len, hash);
+        }
+    }
+    if (neg)
+        sign = '-';
+    else if (plus)
+        sign = '+';
+    if ((unsigned long)len + (sign ? 1 : 0) < width)
+        pad = width - (unsigned long)len - (sign ? 1 : 0);
+    if (pad && zero) {
+        if (sign)
+            c6_fmt_put(b, &sign, 1);
+        c6_fmt_fill(b, '0', pad);
+        c6_fmt_put(b, out, (unsigned long)len);
+        return;
+    }
+    if (pad && !left)
+        c6_fmt_fill(b, ' ', pad);
+    if (sign)
+        c6_fmt_put(b, &sign, 1);
+    c6_fmt_put(b, out, (unsigned long)len);
+    if (pad && left)
+        c6_fmt_fill(b, ' ', pad);
+}
+
 /* FLAGS: C6_GC_FRESH to hand back a managed object, C6_GC_ATOMIC when it is
    going to be shared between threads.  Without C6_GC_FRESH the result is the
    borrowed text of this depth's slot. */
@@ -2108,11 +2521,11 @@ void *__c6_fmt_end(int flags)
            the previous result while the next one is being built */
         if (b->outcap < n + 1) {
             unsigned long cap = n + 1 + C6_FMT_SCRATCH;
-            char *np = (char *)calloc(1, cap);
+            char *np = (char *)c6_alloc(cap);
             if (!np)
                 c6_gc_trap();
             if (b->out)
-                free(b->out);
+                c6_free(b->out);
             b->out = np;
             b->outcap = cap;
         }
@@ -2155,13 +2568,13 @@ static void tcc_fmt_free_all(TccThCtx *th)
         if (!b)
             continue;
         if (b->heap)
-            free(b->heap);
+            c6_free(b->heap);
         if (b->out)
-            free(b->out);
-        free(b);
+            c6_free(b->out);
+        c6_free(b);
     }
     if (th->fmt_slot)
-        free(th->fmt_slot);
+        c6_free(th->fmt_slot);
     th->fmt_slot = 0;
     th->fmt_nslot = 0;
     th->fmt_depth = 0;
@@ -2294,10 +2707,10 @@ struct TccCoPool {
 
 static void tcc_th_co_free(TccCoPool *co)
 {
-    free(co->fds);
-    free(co->evs);
-    free(co->leafs);
-    free(co);
+    c6_free(co->fds);
+    c6_free(co->evs);
+    c6_free(co->leafs);
+    c6_free(co);
 }
 
 static TccCoPool *tcc_th_co(TccThCtx *th)
@@ -2307,7 +2720,11 @@ static TccCoPool *tcc_th_co(TccThCtx *th)
     return th->co;
 }
 
-extern int select(int, void *, void *, void *, void *);
+/* Only the coroutine pump needs select(); a freestanding program has no
+   file descriptors to wait for, so the reference is weak and the pump
+   reports failure instead of failing to link. */
+extern int select(int, void *, void *, void *, void *)
+    __attribute__((weak));
 
 static void tcc_co_trap(void)
 {
@@ -2533,6 +2950,8 @@ static int tcc_co_select(int fd, int ev)
         r[fd >> 6] |= 1UL << (fd & 63);
     if (ev & 2)
         w[fd >> 6] |= 1UL << (fd & 63);
+    if (!select)
+        return -1;                  /* freestanding: nothing to wait for */
     res = select(fd + 1, r, w, e, (void *)0);
     if (res <= 0)
         return res;
@@ -2632,9 +3051,9 @@ static void tcc_co_room(TccCoPool *co, int n)
         co->cap = 8;
     while (co->cap < n)
         co->cap *= 2;
-    co->fds = (int *)realloc(co->fds, co->cap * sizeof *co->fds);
-    co->evs = (int *)realloc(co->evs, co->cap * sizeof *co->evs);
-    co->leafs = (TccCoTask **)realloc(co->leafs,
+    co->fds = (int *)c6_realloc(co->fds, co->cap * sizeof *co->fds);
+    co->evs = (int *)c6_realloc(co->evs, co->cap * sizeof *co->evs);
+    co->leafs = (TccCoTask **)c6_realloc(co->leafs,
                                       co->cap * sizeof *co->leafs);
     if (!co->fds || !co->evs || !co->leafs)
         tcc_co_trap();
@@ -2712,7 +3131,7 @@ static int tcc_co_pump(int *errs)
             if (co->evs[i] & 2)
                 w[co->fds[i] >> 6] |= 1UL << (co->fds[i] & 63);
         }
-        if (select(maxfd + 1, r, w, e, (void *)0) <= 0)
+        if (!select || select(maxfd + 1, r, w, e, (void *)0) <= 0)
             return -1;
         for (i = 0; i < nio; i++) {
             int rev = 0;
@@ -2840,8 +3259,8 @@ void __c6_co_destroy(void *self)
         ((TccCoDesc *)t->desc)->release(t);
     tcc_co_unlink((TccCoTask **)&co->runlist, t);
     if (!((TccCoDesc *)t->desc)->frame_size)
-        free(t->frame);             /* the parked native frame, if any */
-    free(t);
+        c6_free(t->frame);             /* the parked native frame, if any */
+    c6_free(t);
 }
 
 /* 'await c6_io(fd, ev)' is rewritten by the compiler and never calls this;

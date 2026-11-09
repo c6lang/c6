@@ -6,7 +6,7 @@
  */
 // EXPECT empty_braces: error: f-string: '{}' needs an expression
 // EXPECT unterminated: error: f-string: missing '}'
-// EXPECT double_value: error: cannot interpolate a value of type 'double'
+// EXPECT fn_value: error: cannot interpolate a value of type
 // EXPECT struct_value: error: cannot interpolate a value of type 'struct S'
 // EXPECT int_slice: error: cannot interpolate 'int[:]': only a character slice holds text
 // EXPECT void_value: error: cannot interpolate a value of type 'void'
@@ -16,6 +16,8 @@
 // EXPECT managed_to_plain: error: a new reference cannot be stored in 'const char *'
 // EXPECT nested_semicolon: error: f-string: ';' is only allowed once, to start the format spec
 // EXPECT bad_conv: error: f-string: unknown conversion 'z' in a format spec
+// EXPECT float_bad_conv: error: f-string: a 'double' value takes no 'x' format spec
+// EXPECT int_float_conv: error: f-string: a 'int' value takes no 'f' format spec
 // EXPECT conv_type: error: f-string: a 'const char *' value takes no 'x' format spec
 // EXPECT width_big: error: f-string: format width 2000 is too large
 // EXPECT empty_spec: error: f-string: empty format spec in '{expr;spec}'
@@ -35,10 +37,15 @@ int main(void)
     const char *p = f"a{n";
     return p[0];
 }
-#elif defined double_value
+#elif defined fn_value
+int helper(int x)
+{
+    return x;
+}
 int main(void)
 {
-    const char *p = f"{1.5}";
+    /* 函数本身不是值；函数指针才是（按地址输出） */
+    const char *p = f"{helper}";
     return p[0];
 }
 #elif defined struct_value
@@ -103,6 +110,20 @@ int main(void)
 {
     int n = 1;
     const char *p = f"{n;z}";
+    return p[0];
+}
+#elif defined float_bad_conv
+int main(void)
+{
+    double x = 1.5;
+    const char *p = f"{x;x}";           /* 浮点只收 f e g */
+    return p[0];
+}
+#elif defined int_float_conv
+int main(void)
+{
+    int n = 1;
+    const char *p = f"{n;f}";           /* 整数没有 f */
     return p[0];
 }
 #elif defined conv_type

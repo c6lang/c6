@@ -47,6 +47,9 @@ int main(void)
     printf("4b: %s\n", f"{n;08x}");
     printf("4c: |%s|\n", f"{n;-6}");
     printf("4d: %s\n", f"{text;.3}");
+    printf("4e: %s\n", f"{3.14159265;.3f}");
+    printf("4f: %s\n", f"{1234567.875;e}");
+    printf("4g: %s\n", f"{0.000123456;g}");
     /* 花括号、转义 */
     printf("5: %s\n", f"{{}} literal, tab:\there \"quoted\"");
     /* 任意表达式，只求值一次 */

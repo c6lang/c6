@@ -4255,6 +4255,7 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "void __c6_fmt_u(unsigned long long v, int spec);\n"
           "void __c6_fmt_p(const void *p, int spec);\n"
           "void __c6_fmt_b(int v, int spec);\n"
+          "void __c6_fmt_f(double v, int spec);\n"
           "void *__c6_fmt_end(int flags);\n"
           "unsigned long long __c6_str_len(const void *p);\n"
           "#endif\n"

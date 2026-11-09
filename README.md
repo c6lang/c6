@@ -925,6 +925,8 @@ int n = (int)h->value();  /* 线程函数的返回值（整数或指针） */
   `async`/`await`、甚至再 `go`；
 - 运行时只用 `pthread_create` / `pthread_join` / `pthread_key_*`；
   glibc 2.34 起这些都在 libc 里，老系统需要 `-lpthread`；
+- 这些符号是 **weak** 的：链接里没有 pthread 时（无 libc 的 freestanding
+  程序）运行时退化成单线程，`go` / `thread` 报告启动失败，而不是链接报错；
 - PE 目标还没有线程支持，`go` 在那边会触发 trap。
 
 完整可运行示例见 [examples/thread_demo.c](examples/thread_demo.c)：
@@ -1038,6 +1040,7 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 | width | 十进制 | 最少占几列（不够用空格补，带 `0` 时用零补） |
 | `.precision` | 十进制 | 整数：最少位数；文本：最多几个字节 |
 | conv | `d` `i` `u` `x` `X` `o` `b` `c` `s` `p` | 十进制 / 无符号 / 十六进制 / 八进制 / 二进制 / 按字符 / 按文本 / 按指针 |
+| conv（浮点） | `f` `F` `e` `E` `g` `G` | 定点 / 科学计数法 / 两者里较短的那种（默认） |
 
 规则：
 
@@ -1049,6 +1052,14 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
   编译错误；指针只接受 `p`/`x`/`X`；浮点、结构体仍然不能插值（C84）；
 - 宽度和精度的上限都是 1023，超了报错；`;` 只能出现一次（语句表达式里的
   `;` 会被当成格式说明的分隔符，所以直接报错）；
+- 浮点：不写 conv 时等价于 `%g`（6 位有效数字，去掉结尾的零），`f` 定点
+  （默认 6 位小数）、`e` 科学计数法、`g` 较短的那种；`.precision` 对 `f`/`e`
+  是小数位数、对 `g` 是有效数字位数；`u`/`x`/`o`/`b` 这些整数 conv 用在浮点上
+  是编译错误；
+- 浮点的十进制数字是运行时自己算的（libtcc1 里没有 libc，C99 后端用的是同一
+  段代码），常见范围是精确的；需要全部 17 位有效数字时最后一位可能和宿主
+  `printf` 不同，舍入是「四舍五入」而不是 `printf` 的「四舍六入五成双」；
+  `|v| >= 1e19` 按科学计数法输出；
 - `@f".."` 里的格式说明一样管用（拼好之后再打包成托管对象）。
 
 | 插值的类型 | 输出 |
@@ -1058,7 +1069,8 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 | `_Bool` | `true` / `false` |
 | `const char *`、`char[N]`、`char[:]`、`@char` | 文本（空指针输出 `(null)`） |
 | 其他指针 | `0x...`（空指针 `0x0`） |
-| 其他类型（`float`/`double`、结构体、函数指针、非字符切片…） | 编译错误 C84 |
+| `float` / `double` / `long double` | `%g` 那样：`1.5`、`3.14159`（`long double` 按 `double` 打） |
+| 其他类型（结构体、函数本身、非字符切片…） | 编译错误 C84 |
 
 规则：
 
@@ -1134,6 +1146,70 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
     (b) = tmp;
 }
 ```
+
+### 无 libc（freestanding）
+
+`libtcc1` 里的运行时（插值构造器、`defer`、`err`/`catch`、托管引用、协程池）
+本来要 `calloc` / `free` / `realloc` / `memset` / `memcpy` / `memmove` /
+`pthread_*` / `select`。这些引用现在全是 **weak** 的，所以没有 libc 也能链接：
+
+| 需要的东西 | 没有 libc 时 |
+|---|---|
+| `calloc` / `free` / `realloc` | 用 `libtcc1` 里的静态 arena（`.bss`，默认 256 KB，编译 libtcc1 时 `-DC6_HEAP_SIZE=...` 可调）；程序自己定义 `calloc` 就用程序的那份 |
+| `memset` / `memcpy` / `memmove` | `libtcc1` 自带字节循环版，真 libc 的强定义会在链接时覆盖它们 |
+| `pthread_*` | 退化成单线程（一个静态的状态块）；`go` / `thread` 报告启动失败 |
+| `select` | 只有 `async` / `c6_io` 用到；没有就报“等待失败”，其它照常 |
+
+也就是单线程的 freestanding 程序直接可用，程序这边什么都不用提供：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_fstr \
+    examples/freestanding_fstr.c tcc/libtcc1.a   # 或 make fstest
+./build/freestanding_fstr
+```
+
+[examples/freestanding_fstr.c](examples/freestanding_fstr.c) 没有 `main`、没有
+crt，入口是 `_start`，输出和退出都自己发 syscall，里面跑了整数/浮点插值、
+格式说明、`@f".."`、`defer`、`err`+`catch` 和 `@T`，8 条断言全过。
+
+要 `go` / `thread` 就再实现一层线程接口 —— 运行时只用这 8 个入口，都是
+weak 的，程序给了就切回“每线程一块状态”：
+
+| 入口 | 干什么 |
+|---|---|
+| `pthread_once` / `pthread_key_create` / `pthread_getspecific` / `pthread_setspecific` | 每线程一块状态（defer 栈、错误槽、插值构造器、协程池）。`key_create` 的析构函数务必在线程退出时调用，否则每个线程漏约 100 KB |
+| `pthread_create` / `pthread_join` | `go` 的启动与回收 |
+| `pthread_self` / `pthread_equal` | `thread h = go f(...)` 用它判断“自己 join 自己” |
+
+三个坑：
+
+- **这一层必须用普通 C 或汇编编译，不能带 `-std=c6`**：每个 c6 函数开头都有
+  `__tcc_defer_func_enter()`，它要 `tcc_th()`，而 `tcc_th()` 正要去调
+  `pthread_once` / `pthread_key_create` —— 用 c6 写就是 bootstrap 里递归自己，
+  栈一冲就段错误；
+- 一旦真的多线程，`calloc` / `free` 必须是线程安全的：`libtcc1` 里那个静态
+  arena 只在单线程下安全，这时请由程序提供 `calloc` / `free`；
+- 线程里用 `async` / `c6_io` 还需要 `select`。
+
+例子：[examples/freestanding_pthread.c](examples/freestanding_pthread.c) 就是一份
+可以直接抄的实现 —— x86-64 Linux 上 `clone` + `futex`，不碰 libc：线程指针放
+`%fs:0`（`arch_prctl`），栈和控制块用 `mmap`，线程退出用 `SYS_exit`，join 用
+`CLONE_CHILD_CLEARTID` 加 futex；它还顺带给了一份线程安全的 `calloc`/`free`
+（每次 `mmap`，不用锁）。[examples/freestanding_go.c](examples/freestanding_go.c)
+用它跑两个真线程（一个等另一个置位，只有真并发才会通过），`make fstest-go`
+编译并运行，200 次连跑没有失败。
+
+join 这里有个坑值得记下来：「还活着」的标志不能直接靠 `CLONE_CHILD_SETTID` 写
+的那个 tid —— 它是子线程**开始跑**的时候才写的，父线程可能先看到 0，于是 join
+提前返回、把子线程马上要用的栈 `munmap` 掉，子线程一上来就段错误。这份实现的做
+法是父线程在 clone 之前先把该字写成 -1，只让内核在子线程真正退出时清零。
+
+`-static` 不是必须的，但少了它 ELF 里会留一个 `PT_INTERP`（内核会先跑
+`ld.so`）；加上之后这两个产物既没有 `DT_NEEDED` 也没有 `PT_INTERP`，是一个
+纯粹的静态 ELF —— 换到别处跑时只要有人能加载它就行。
+
+C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
+`<pthread.h>`）。
 
 ## 测试
 

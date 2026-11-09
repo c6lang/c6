@@ -1749,6 +1749,7 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_put(C99FmtBuf *b,
 #define C99_SPEC_PLUS         (1 << 26)
 #define C99_SPEC_HASH         (1 << 27)
 #define C99_SPEC_PREC_SET     (1 << 28)
+#define C99_SPEC_UPPER        (1 << 29)
 
 #define C99_CONV_NONE 0
 #define C99_CONV_D    1
@@ -2067,6 +2068,286 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_b(int v, int spec)
         return;
     }
     __c99_fmt_str_spec(b, v ? "true" : "false", v ? 4 : 5, spec);
+}
+
+/* ---- floating point --------------------------------------------------- *
+   A 'double' is formatted here exactly the way libtcc1 does it, so both
+   back ends print the same text.  The digits come from repeated decimal
+   scaling, which is exact for the common range; a value that needs all 17
+   significant digits may differ in the last one from a host printf.
+   'f' is fixed notation, 'e' scientific, 'g' the shorter of the two with
+   trailing zeros dropped (the default).  |v| >= 1e19 is printed in
+   scientific notation even for 'f'. */
+
+#define C99_CONV_F 10
+#define C99_CONV_E 11
+#define C99_CONV_G 12
+
+/* scale F by ten and return the digit */
+C99_RT_UNUSED __c99_rt_linkage int __c99_dbl_digit(double *f)
+{
+    int d = 0;
+
+    *f *= 10.0;
+    d = (int)*f;
+    if (d > 9)
+        d = 9;
+    if (d < 0)
+        d = 0;
+    *f -= (double)d;
+    return d;
+}
+
+/* the integer digits (most significant first) of V and P rounded fraction
+   digits into IP/FP; returns the number of integer digits */
+C99_RT_UNUSED __c99_rt_linkage int __c99_dbl_fixed(double v, char *ip, char *fp, int p)
+{
+    unsigned long long u = (unsigned long long)v;
+    double f = v - (double)u;
+    char t[24];
+    int i = 0, n = 0, d = 0;
+
+    if (!u) {
+        t[n++] = '0';
+    } else {
+        while (u) {
+            t[n++] = (char)('0' + (int)(u % 10ULL));
+            u /= 10ULL;
+        }
+    }
+    for (i = 0; i < n; i++)
+        ip[i] = t[n - 1 - i];
+    for (i = 0; i < p; i++)
+        fp[i] = (char)('0' + __c99_dbl_digit(&f));
+    d = __c99_dbl_digit(&f);               /* rounding digit */
+    if (d >= 5) {
+        i = p - 1;
+        while (i >= 0) {
+            if (fp[i] != '9') {
+                ++fp[i];
+                break;
+            }
+            fp[i] = '0';
+            --i;
+        }
+        if (i < 0) {
+            i = n - 1;
+            while (i >= 0) {
+                if (ip[i] != '9') {
+                    ++ip[i];
+                    break;
+                }
+                ip[i] = '0';
+                --i;
+            }
+            if (i < 0) {                /* 99.. -> 100.. */
+                for (i = n; i > 0; i--)
+                    ip[i] = ip[i - 1];
+                ip[0] = '1';
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+/* floor(log10(v)) for v > 0 */
+C99_RT_UNUSED __c99_rt_linkage int __c99_dbl_exp10(double v)
+{
+    int e = 0;
+
+    if (!(v > 0.0))                     /* zero or nan: no exponent */
+        return 0;
+    if (v >= 10.0) {
+        while (v >= 10.0) {
+            v /= 10.0;
+            ++e;
+        }
+    } else {
+        while (v < 1.0) {
+            v *= 10.0;
+            --e;
+        }
+    }
+    return e;
+}
+
+/* fixed notation into OUT (at least P + 32 bytes), returns the length */
+C99_RT_UNUSED __c99_rt_linkage int __c99_dbl_str_fixed(char *out, double v, int p)
+{
+    char ip[24], fp[64];
+    int n = __c99_dbl_fixed(v, ip, fp, p), len = 0, i = 0;
+
+    for (i = 0; i < n; i++)
+        out[len++] = ip[i];
+    if (p > 0) {
+        out[len++] = '.';
+        for (i = 0; i < p; i++)
+            out[len++] = fp[i];
+    }
+    return len;
+}
+
+/* scientific notation into OUT (at least P + 40 bytes) */
+C99_RT_UNUSED __c99_rt_linkage int __c99_dbl_str_sci(char *out, double v, int p, int upper)
+{
+    char ip[24], fp[64];
+    int e = 0, n = 0, len = 0, i = 0;
+    double m = v;
+    char *dig = upper ? "0123456789ABCDEF" : "0123456789";
+
+    (void)dig;
+    e = __c99_dbl_exp10(v);
+    if (e > 0) {
+        for (i = 0; i < e; i++)
+            m /= 10.0;
+    } else {
+        for (i = 0; i < -e; i++)
+            m *= 10.0;
+    }
+    n = __c99_dbl_fixed(m, ip, fp, p);
+    if (n > 1) {                        /* 9.99.. rounded up to 10.0 */
+        ++e;
+        ip[0] = '1';
+        n = 1;
+        for (i = 0; i < p; i++)
+            fp[i] = '0';
+    }
+    out[len++] = ip[0];
+    if (p > 0) {
+        out[len++] = '.';
+        for (i = 0; i < p; i++)
+            out[len++] = fp[i];
+    }
+    out[len++] = (char)(upper ? 'E' : 'e');
+    if (e < 0) {
+        out[len++] = '-';
+        e = -e;
+    } else {
+        out[len++] = '+';
+    }
+    if (e >= 100) {
+        out[len++] = (char)('0' + e / 100);
+        out[len++] = (char)('0' + (e / 10) % 10);
+        out[len++] = (char)('0' + e % 10);
+    } else {
+        out[len++] = (char)('0' + (e / 10) % 10);
+        out[len++] = (char)('0' + e % 10);
+    }
+    return len;
+}
+
+/* drop the trailing zeros (and a trailing '.') of OUT unless HASH */
+C99_RT_UNUSED __c99_rt_linkage int __c99_dbl_strip(char *out, int len, int hash)
+{
+    int i = len;
+
+    if (hash)
+        return len;
+    for (i = 0; i < len; i++)
+        if (out[i] == 'e' || out[i] == 'E')
+            break;
+    if (i <= 0)                         /* nothing before the exponent */
+        return len;
+    {
+        int epos = i, j = i - 1;
+        while (j > 0 && out[j] == '0')
+            --j;
+        if (out[j] == '.')
+            --j;
+        if (j + 1 == epos)
+            return len;
+        for (i = epos; i < len; i++)
+            out[j + 1 + (i - epos)] = out[i];
+        return len - (epos - (j + 1));
+    }
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_f(double v, int spec)
+{
+    C99FmtBuf *b = __c99_fmt_cur();
+    char out[192];
+    int len = 0, i = 0, conv = 0, upper = 0, p = 0, prec_set = 0;
+    int neg = 0, left = 0, zero = 0, plus = 0, hash = 0, many = 0;
+    unsigned long width = 0, pad = 0;
+    char sign = 0;
+
+    conv = (spec >> C99_SPEC_CONV_SHIFT) & C99_SPEC_CONV_MASK;
+    if (conv == C99_CONV_NONE)
+        conv = C99_CONV_G;               /* default: the shorter of both */
+    upper = (spec & C99_SPEC_UPPER) != 0;
+    prec_set = (spec & C99_SPEC_PREC_SET) != 0;
+    p = prec_set ? (int)((spec >> C99_SPEC_PREC_SHIFT) & C99_SPEC_PREC_MASK) : 6;
+    left = (spec & C99_SPEC_LEFT) != 0;
+    zero = (spec & C99_SPEC_ZERO) != 0 && !left;
+    plus = (spec & C99_SPEC_PLUS) != 0;
+    hash = (spec & C99_SPEC_HASH) != 0;
+    width = (unsigned long)((spec >> C99_SPEC_WIDTH_SHIFT) & C99_SPEC_WIDTH_MASK);
+
+    neg = v < 0.0 || (v == 0.0 && 1.0 / v < 0.0);
+    if (neg)
+        v = -v;
+    if (v > 1.7976931348623157e308) {
+        len = 3;
+        out[0] = (char)(upper ? 'I' : 'i');
+        out[1] = (char)(upper ? 'N' : 'n');
+        out[2] = (char)(upper ? 'F' : 'f');
+    } else if (v != v) {
+        len = 3;
+        neg = 0;
+        out[0] = (char)(upper ? 'N' : 'n');
+        out[1] = (char)(upper ? 'A' : 'a');
+        out[2] = (char)(upper ? 'N' : 'n');
+    } else {
+        int e = __c99_dbl_exp10(v);
+        int sig = p > 0 ? p : 1;        /* '%g' significant digits */
+        if (conv == C99_CONV_E || (conv == C99_CONV_G
+                                  && (e < -4 || e >= sig))
+            || (conv == C99_CONV_F && v >= 1e19)) {
+            if (p > 30)
+                p = 30;
+            if (conv == C99_CONV_G && p > 0)
+                p = sig - 1;            /* 'g': significant digits */
+            len = __c99_dbl_str_sci(out, v, p, upper);
+            if (conv == C99_CONV_G)
+                len = __c99_dbl_strip(out, len, hash);
+        } else {
+            if (conv == C99_CONV_G)
+                p = sig - 1 - e;        /* 'g': digits after the point */
+            many = 0;
+            if (p > 30) {
+                many = p - 30;
+                p = 30;
+            }
+            len = __c99_dbl_str_fixed(out, v, p);
+            if (many > 0) {             /* keep the requested width */
+                for (i = 0; i < many; i++)
+                    out[len++] = '0';
+            }
+            if (conv == C99_CONV_G)
+                len = __c99_dbl_strip(out, len, hash);
+        }
+    }
+    if (neg)
+        sign = '-';
+    else if (plus)
+        sign = '+';
+    if ((unsigned long)len + (sign ? 1 : 0) < width)
+        pad = width - (unsigned long)len - (sign ? 1 : 0);
+    if (pad && zero) {
+        if (sign)
+            __c99_fmt_put(b, &sign, 1);
+        __c99_fmt_fill(b, '0', pad);
+        __c99_fmt_put(b, out, (unsigned long)len);
+        return;
+    }
+    if (pad && !left)
+        __c99_fmt_fill(b, ' ', pad);
+    if (sign)
+        __c99_fmt_put(b, &sign, 1);
+    __c99_fmt_put(b, out, (unsigned long)len);
+    if (pad && left)
+        __c99_fmt_fill(b, ' ', pad);
 }
 
 C99_RT_UNUSED __c99_rt_linkage void *__c6_fmt_end(int flags)
