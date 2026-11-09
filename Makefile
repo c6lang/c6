@@ -111,7 +111,21 @@ fstest-noos: build
 	     echo "fstest-noos: FAILED（status $$st，失败位掩码见程序）"; exit 1; \
 	 fi
 
-test-all: selftest test c6selfcheck fstest fstest-go fstest-noos
+# 再用 qemu 的用户态模拟器跑一遍：不用本机的加载器，也不用 libc
+# （qemu-x86_64 自己实现 syscall；装了 qemu-user 才有这个命令）
+fstest-qemu: build
+	@command -v qemu-x86_64 >/dev/null || { \
+	     echo "fstest-qemu: 没有 qemu-x86_64，跳过"; exit 0; }
+	qemu-x86_64 ./build/freestanding_fstr
+	qemu-x86_64 ./build/freestanding_go
+	@qemu-x86_64 ./build/freestanding_noos >/dev/null 2>&1; st=$$?; \
+	 if [ $$st -eq 132 ]; then \
+	     echo "fstest-qemu: noos ok（ud2 陷阱）"; \
+	 else \
+	     echo "fstest-qemu: noos FAILED（status $$st）"; exit 1; \
+	 fi
+
+test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。

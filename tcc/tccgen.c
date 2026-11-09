@@ -283,6 +283,9 @@ static void type_to_str(char *buf, int buf_size, CType *type,
                         const char *varstr);
 static void convert_parameter_type(CType *pt);
 static void struct_layout(CType *type, AttributeDef *ad);
+static void c6_gc_collect(CType *type, int is_union);
+static int c6_gc_desc_for(CType *type);
+static int c6_type_gq(CType *type);
 static void c6_rt_begin(const char *name);
 static void c6_rt_end(const char *name, int nargs);
 static Sym *c6_env_base_tag(void);
@@ -551,6 +554,12 @@ static CType c6_closure_get(CType *ftype)
     cf->next = ef;
     ef->next = NULL;
     tag->next = cf;
+    {
+        CType ctv = {0};
+        ctv.t = VT_STRUCT;
+        ctv.ref = tag;
+        c6_gc_collect(&ctv, 0);       /* local_scope is 0 here */
+    }
 
     cl = tcc_mallocz(sizeof *cl);
     cl->tag = tok;
@@ -573,6 +582,82 @@ static CType c6_closure_get(CType *ftype)
     c6_sym_global = save_global;
     local_scope = save_scope;
     return out;
+}
+
+/* Deep-copy TYPE so that every pointer/array/function symbol it mentions
+   lives on the global stack.  A captured local's CType may refer to a
+   pointer type Sym that is popped when the enclosing function ends; the
+   closure body is compiled much later. */
+static CType c6_type_global_copy(CType *type)
+{
+    CType r = {0};
+    int bt = type->t & VT_BTYPE;
+
+    if (type->t & VT_VLA)
+        tcc_error("a closure cannot capture a variable length array type");
+    if (bt == VT_PTR) {
+        if (type->t & VT_ARRAY) {
+            CType elem = type->ref ? c6_type_global_copy(&type->ref->type) : (CType){0};
+            Sym *s = sym_push2(&global_stack, SYM_FIELD, 0,
+                               type->ref ? type->ref->c : 0);
+            s->type = elem;
+            s->type.gq = c6_type_gq(&elem);
+            r = *type;
+            r.ref = s;
+            return r;
+        }
+        {
+            CType elem = type->ref ? c6_type_global_copy(&type->ref->type) : (CType){0};
+            int gq = c6_type_gq(type);
+            r = c6_global_ptr(&elem);
+            r.t = (type->t & (VT_QUAL | VT_STORAGE)) | VT_PTR;
+            r.gq = gq;
+            r.ref->type.gq = gq;
+            return r;
+        }
+    }
+    if (bt == VT_FUNC) {
+        Sym *f = type->ref, *nf = NULL, *np = NULL, **tail = NULL;
+        int first = 1;
+        if (!f)
+            return *type;
+        nf = sym_push2(&global_stack, SYM_FIELD, 0, 0);
+        nf->type = c6_type_global_copy(&f->type);
+        nf->a = f->a;
+        nf->f = f->f;
+        tail = &nf->next;
+        for (np = f->next; np; np = np->next) {
+            Sym *cp = sym_push2(&global_stack, np->v, 0, np->c);
+            cp->type = c6_type_global_copy(&np->type);
+            cp->r = np->r;
+            cp->a = np->a;
+            *tail = cp;
+            tail = &cp->next;
+            first = 0;
+        }
+        (void)first;
+        *tail = NULL;
+        r = *type;
+        r.ref = nf;
+        return r;
+    }
+    if (bt == VT_STRUCT) {
+        if (c6_closure_of_type(type)) {
+            C6Closure *cl = c6_closure_of_type(type);
+            return c6_closure_get(&cl->ftype);
+        }
+        if (c6_slice_of_type(type) || c6_tuple_of_type(type))
+            return *type;           /* their tags are already global */
+        if (!type->ref || type->ref->sym_scope != 0)
+            tcc_error("a closure cannot capture a block-scope tag");
+        return *type;
+    }
+    if (IS_ENUM(type->t)) {
+        if (!type->ref || type->ref->sym_scope != 0)
+            tcc_error("a closure cannot capture a block-scope enum");
+        return *type;
+    }
+    return *type;
 }
 
 /* the tuple whose tag is TYPE's tag, or NULL */
@@ -953,9 +1038,10 @@ static C6Cap *c6_lit_cap_add(C6Lit *lit, int tok, CType *type, int kind)
     cap = &lit->caps[lit->ncaps++];
     memset(cap, 0, sizeof *cap);
     cap->tok = tok;
-    cap->type = *type;
+    cap->type = c6_type_global_copy(type);
     cap->type.t &= ~VT_STORAGE;
     cap->type.gq &= ~C6_GQ_BORROW;
+    cap->type.ref->type.gq &= ~C6_GQ_BORROW;
     cap->kind = kind;
     return cap;
 }
@@ -1133,6 +1219,12 @@ static CType c6_lit_env_get(C6Lit *lit)
     ct.t = VT_STRUCT;
     ct.ref = tag;
     struct_layout(&ct, &ad);
+    {
+        int save_scope = local_scope;
+        local_scope = 0;
+        c6_gc_collect(&ct, 0);
+        local_scope = save_scope;
+    }
 
     for (i = 0, f = tag->next; i < lit->ncaps && f; i++) {
         C6Cap *cap = &lit->caps[i];
@@ -1154,6 +1246,56 @@ static void c6_lit_make_closure(C6Lit *lit)
     if (!cl)
         tcc_error("internal error: closure type was not registered");
     lit->code_type = cl->code_type;
+}
+
+/* Replay a nested literal body during capture analysis.  Its own parameters
+   and locals are pushed (so they shadow outer names), but it is neither
+   queued nor published, and the enclosing literal's scan base stays in
+   effect: a free name in the nested body is a capture of the outer literal. */
+static void c6_lit_scan_nested(CType *ftype, TokenString *body)
+{
+    Sym *save_stack = local_stack, *dummy = NULL, *fake = NULL;
+    int save_scope = local_scope, save_tok = tok;
+    CValue save_val = tokc;
+    int *save_body = body->str;
+    int save_nocode = nocode_wanted, save_vla = func_var;
+    CType save_vt = func_vt;
+    Sym *save_func = c6_func_sym;
+    SValue *save_vtop = vtop;
+    int save_loc = loc, save_rsym = rsym, save_ntemp = nb_temp_local_vars;
+    struct scope *save_cur = cur_scope;
+
+    local_scope = 1;
+    nocode_wanted = 1;
+    dummy = sym_push2(&local_stack, SYM_FIELD, 0, 0);
+    (void)dummy;
+    fake = sym_push2(&local_stack, SYM_FIELD, 0, 0);
+    fake->type = *ftype;
+    fake->r = VT_CONST | VT_SYM;
+    c6_func_sym = fake;
+    func_vt = ftype->ref->type;
+    func_var = ftype->ref->f.func_type == FUNC_ELLIPSIS;
+    sym_push_params(ftype->ref);
+
+    begin_macro(body, 2);
+    next();
+    block(0);
+    end_macro();
+    body->str = save_body;
+    tok = save_tok;
+    tokc = save_val;
+
+    vtop = save_vtop;
+    sym_pop(&local_stack, save_stack, 0);
+    local_scope = save_scope;
+    loc = save_loc;
+    rsym = save_rsym;
+    nb_temp_local_vars = save_ntemp;
+    func_vt = save_vt;
+    func_var = save_vla;
+    c6_func_sym = save_func;
+    nocode_wanted = save_nocode;
+    cur_scope = save_cur;
 }
 
 /* Could a type start here?  A cheap filter: the expensive replay in
@@ -7510,12 +7652,22 @@ static CType c6_env_ptr_type(void)
     return p;
 }
 
-static void c6_lit_new(int size, CType *type)
+static void c6_lit_new(int size, CType *objtype, CType *type)
 {
+    int dtok = c6_gc_desc_for(objtype);
+    Sym *ds = dtok ? sym_find(dtok) : NULL;
+
     c6_rt_begin("__c6_gc_new");
     vpushs(size);
     vpushs(1);
-    vpushs(0);
+    if (ds) {
+        vpushsym(&ds->type, ds);
+        vtop->r |= VT_LVAL;
+        gaddrof();
+        vtop->type = char_pointer_type;
+    } else {
+        vpushs(0);
+    }
     vpushs(0);
     c6_rt_end("__c6_gc_new", 4);
     vtop->type = *type;
@@ -7572,7 +7724,7 @@ static void c6_lit_emit_value(C6Lit *lit)
     codep = c6_global_ptr(&cl->code_type);
 
     size = type_size(&lit->env_type, &align);
-    c6_lit_new(size, &envp);
+    c6_lit_new(size, &lit->env_type, &envp);
     env_slot = (loc - PTR_SIZE) & -PTR_SIZE;
     loc = env_slot;
     vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
@@ -7600,7 +7752,7 @@ static void c6_lit_emit_value(C6Lit *lit)
         vpop();
     }
 
-    c6_lit_new(2 * PTR_SIZE, &clp);
+    c6_lit_new(2 * PTR_SIZE, &ct, &clp);
     cl_slot = (loc - PTR_SIZE) & -PTR_SIZE;
     loc = cl_slot;
     vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
@@ -7677,6 +7829,20 @@ static void c6_lit_parse(void)
     }
     if (tok != '{')
         tcc_error("'{' expected: the body of the function literal");
+#ifdef C6_EXT
+    if (c6_lit_scanning) {
+        TokenString *body = NULL;
+        Sym *fake = NULL;
+        skip_or_save_block(&body);
+        c6_lit_scan_nested(&ftype, body);
+        tok_str_free(body);
+        fake = sym_push2(&local_stack, SYM_FIELD, 0, 0);
+        fake->type = ftype;
+        fake->r = VT_CONST | VT_SYM;
+        vpushsym(&fake->type, fake);
+        return;
+    }
+#endif
     vtype = ftype;
 
     lit = tcc_mallocz(sizeof *lit);
