@@ -8,6 +8,9 @@
 struct Point { int x, y; };
 struct Node { int v; };
 
+static int bump(int x) { return x + 1; }
+static int call_closure(closure int(int) f, int x) { return f(x); }
+
 static closure int(int) make_adder(int n)
 {
     return int(int x) { return x + n; };
@@ -96,6 +99,17 @@ test "遮蔽：体局部遮蔽外层捕获" {
     f = NULL;
     if (r != 7 || n != 1)
         err(1, "遮蔽不对");
+}
+
+test "函数指针转闭包：形参、返回值、实参" {
+    closure int(int) f = bump;
+    closure int(int) g = bump;
+    int a = f(4);
+    int b = call_closure(g, 9);
+    f = NULL;
+    g = NULL;
+    if (a != 5 || b != 10)
+        err(1, "函数指针转闭包不对");
 }
 
 test "defer 与闭包捕获" {

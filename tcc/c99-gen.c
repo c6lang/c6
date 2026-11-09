@@ -829,6 +829,7 @@ static const char * const c99_runtime_names[] = {
     "__c6_co_rev", "__c6_co_wait", "__c6_co_start", "__c6_co_destroy",
     "__c6_co_run",
     "__c6_th_join_all", "c6_io",
+    "__c6_closure_code", "__c6_closure_env",
     "__c6_gc_new", "__c6_gc_store", "__c6_gc_own_store", "__c6_gc_release",
     "__c6_gc_incref",
     "__c6_gc_move", "__c6_gc_drop", "__c6_gc_weak_store",

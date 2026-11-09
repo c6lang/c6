@@ -1461,6 +1461,16 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_gc_weak_add(void **slot, void *p)
     h->u.weak = w;
 }
 
+C99_RT_UNUSED __c99_rt_linkage void *__c6_closure_code(void *cl)
+{
+    return cl ? ((void **)cl)[0] : 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_closure_env(void *cl)
+{
+    return cl ? ((void **)cl)[1] : 0;
+}
+
 C99_RT_UNUSED __c99_rt_linkage void *__c6_gc_new(unsigned long size,
                                                  unsigned long count,
                                                  const void *desc, int flags)

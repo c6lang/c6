@@ -265,8 +265,17 @@ typedef struct C6Closure {
     CType code_type;            /* RET (void *, P...) */
     char *sig_text;             /* normalized signature, collision check */
     int variadic, fallible;
+    Sym *tramp_sym;
+    Sym *env_tag;               /* struct __c6_env_HASH { RET (*fn)(P...); } */
 } C6Closure;
 static C6Closure *c6_closures = 0;
+
+typedef struct C6Tramp {
+    struct C6Tramp *next;
+    Sym *sym;
+    TokenString *ts;
+} C6Tramp;
+static C6Tramp *c6_tramps = 0;
 static Sym *c6_env_base_sym = NULL;
 static C6Closure *c6_closure_of_type(CType *type);
 static void c6_closure_sig_text(char *buf, int size, CType *ftype);
@@ -305,6 +314,16 @@ static void c6_rt_begin(const char *name);
 static void c6_rt_end(const char *name, int nargs);
 static Sym *c6_env_base_tag(void);
 static CType c6_type_global_copy(CType *type);
+static void c6_decl_tokens(TokenString *ts);
+static Sym *external_sym(int v, CType *type, int r, AttributeDef *ad);
+static Sym *c6_async_params(CType *ft);
+static void sym_link(Sym *s, int yes);
+static int c6_async_type_tokens(TokenString *ts, CType *type);
+static int c6_sp_ok(CType *ft);
+static int c6_sp_type_ok(CType *t);
+static CType c6_env_ptr_type(void);
+static void c6_lit_new(int size, CType *objtype, CType *type);
+static void c6_lit_env_field(int off, CType *type);
 
 /* make 'T *' with the pointer's type symbol on the global stack.  The
    compiler may be inside a function (a closure type can be written in a
@@ -996,10 +1015,14 @@ static void c6_lit_function_pointer_error(void)
         return;
     for (i = 0; i < lit->ncaps; i++)
         if (lit->caps[i].kind == C6_CAP_VALUE) {
-            tcc_error("a function literal cannot capture '%s': without "
+            tcc_error("this literal captures '%s', so its value is a closure, "
+                      "not a function pointer: use 'closure RET (parameters)' "
+                      "as the type, or pass the value in as a parameter\n"
+                      "error: a function literal cannot capture '%s': without "
                       "captures it is a plain function pointer, so its body "
                       "sees only its parameters and the file scope (pass the "
                       "value in as a parameter)",
+                      get_tok_str(lit->caps[i].tok, NULL),
                       get_tok_str(lit->caps[i].tok, NULL));
         }
 }
@@ -1349,6 +1372,364 @@ static CType c6_closure_code_type(CType *ftype)
     code = ft;
     code.ref = nf;
     return code;
+}
+
+
+/* Build and queue 'static RET __c6_tramp_HASH(void *__c6_env, P a0, ...)
+   { return ((RET (*)(P...))((void **)__c6_env)[0])(a0, ...); }'. */
+static Sym *c6_closure_tramp(C6Closure *cl)
+{
+    CType tt = {0}, rt = {0};
+    Sym *f = NULL, *nf = NULL, *ep = NULL, *prev = NULL, *p = NULL;
+    Sym *sym = NULL;
+    TokenString *ts = NULL;
+    AttributeDef ad = {0};
+    char buf[80] = {0};
+    char aname[16] = {0};
+    int name = 0, envtok = tok_alloc_const("__c6_env");
+    int etok = 0;
+    int i = 0, is_void = 0;
+    C6Tramp *t = NULL;
+
+    if (cl->tramp_sym)
+        return cl->tramp_sym;
+    if (!c6_sp_ok(&cl->ftype))
+        tcc_error("a variadic function pointer cannot be wrapped into a "
+                  "closure: a trampoline cannot forward an unknown argument "
+                  "list (make it a capturing literal instead)");
+    rt = cl->ftype.ref->type;
+    is_void = (rt.t & VT_BTYPE) == VT_VOID;
+    if (!is_void && !c6_sp_type_ok(&rt))
+        tcc_error("a closure cannot be made from this function pointer: its "
+                  "return type cannot be written as a type");
+    for (p = c6_async_params(&cl->ftype); p; p = p->next)
+        if (!c6_sp_type_ok(&p->type))
+            tcc_error("a closure cannot be made from this function pointer: "
+                      "a parameter type cannot be written as a type");
+
+    f = cl->ftype.ref;
+    nf = c6_sym_alloc(SYM_FIELD, 0, 0);
+    nf->type = f->type;
+    nf->a = f->a;
+    nf->f = f->f;
+    nf->f.func_args = f->f.func_args + 1;
+    ep = c6_sym_alloc(envtok, 0, 0);
+    {
+        CType vp = {0}, envp = {0};
+        vp.t = VT_VOID;
+        envp = c6_global_ptr(&vp);
+        ep->type = envp;
+        ep->r = VT_LOCAL | VT_LVAL;
+    }
+    ep->next = NULL;
+    ep->prev = nf;
+    nf->next = ep;
+    prev = ep;
+    for (p = c6_async_params(&cl->ftype); p; p = p->next) {
+        Sym *cp = NULL;
+        snprintf(aname, sizeof aname, "__c6_a%d", i++);
+        cp = c6_sym_alloc(tok_alloc_const(aname), 0, p->c);
+        cp->type = p->type;
+        cp->r = p->r;
+        cp->a = p->a;
+        cp->prev = prev;
+        cp->next = NULL;
+        prev->next = cp;
+        prev = cp;
+    }
+    tt = cl->ftype;
+    tt.ref = nf;
+    tt.t |= VT_STATIC | VT_EXTERN;
+    snprintf(buf, sizeof buf, "__c6_tramp_%016llx", cl->hash);
+    name = tok_alloc_const(buf);
+    memset(&ad, 0, sizeof ad);
+    sym = external_sym(name, &tt, 0, &ad);
+    cl->tramp_sym = sym;
+
+    /* struct __c6_env_HASH { RET (*__c6_fn)(P...); }; */
+    snprintf(buf, sizeof buf, "__c6_env_%016llx", cl->hash);
+    {
+        int etag = tok_alloc_const(buf);
+        CType fp = c6_global_ptr(&cl->ftype);
+        Sym *tag = sym_push2(&global_stack, etag | SYM_STRUCT, VT_STRUCT, PTR_SIZE);
+        Sym *field = c6_sym_alloc(tok_alloc_const("__c6_fn") | SYM_FIELD, 0, 0);
+        tag->c = PTR_SIZE;
+        tag->a.aligned = 4;     /* 1 << (4 - 1) == 8 */
+        tag->type.t = VT_STRUCT;
+        tag->type.ref = tag;
+        field->type = fp;
+        tag->next = field;
+        sym_link(tag, 1);
+        cl->env_tag = tag;
+    }
+
+    etok = tok_alloc_const(buf);
+    ts = tok_str_alloc();
+#ifdef TCC_TARGET_C99
+    /* the C99 backend prints the generated function, so the environment
+       struct has to be declared in the emitted source too */
+    tok_str_add(ts, TOK_STRUCT);
+    tok_str_add(ts, etok);
+    tok_str_add(ts, '{');
+    if (is_void)
+        tok_str_add(ts, TOK_VOID);
+    else if (!c6_async_type_tokens(ts, &rt))
+        tcc_error("internal: cannot write the closure return type");
+    tok_str_add(ts, '(');
+    tok_str_add(ts, '*');
+    tok_str_add(ts, tok_alloc_const("__c6_fn") | 0);
+    tok_str_add(ts, ')');
+    tok_str_add(ts, '(');
+    if (!c6_async_params(&cl->ftype)) {
+        tok_str_add(ts, TOK_VOID);
+    } else {
+        int first = 1;
+        for (p = c6_async_params(&cl->ftype); p; p = p->next) {
+            if (!first)
+                tok_str_add(ts, ',');
+            first = 0;
+            if (!c6_async_type_tokens(ts, &p->type))
+                tcc_error("internal: cannot write a closure parameter type");
+        }
+    }
+    tok_str_add(ts, ')');
+    tok_str_add(ts, ';');
+    tok_str_add(ts, '}');
+    tok_str_add(ts, ';');
+#endif
+    tok_str_add(ts, TOK_STATIC);
+    if (is_void) {
+        tok_str_add(ts, TOK_VOID);
+    } else if (!c6_async_type_tokens(ts, &rt)) {
+        tcc_error("internal: cannot write the closure return type");
+    }
+    tok_str_add(ts, name);
+    tok_str_add(ts, '(');
+    tok_str_add(ts, TOK_VOID);
+    tok_str_add(ts, '*');
+    tok_str_add(ts, envtok);
+    for (p = c6_async_params(&cl->ftype), i = 0; p; p = p->next, i++) {
+        tok_str_add(ts, ',');
+        if (!c6_async_type_tokens(ts, &p->type))
+            tcc_error("internal: cannot write a closure parameter type");
+        snprintf(aname, sizeof aname, "__c6_a%d", i);
+        tok_str_add(ts, tok_alloc_const(aname));
+    }
+    tok_str_add(ts, ')');
+    tok_str_add(ts, '{');
+    {
+        int e = tok_alloc_const("__c6_e");
+        /* struct __c6_env_HASH *__c6_e = (struct __c6_env_HASH *)__c6_env; */
+        tok_str_add(ts, TOK_STRUCT);
+        tok_str_add(ts, etok);
+        tok_str_add(ts, '*');
+        tok_str_add(ts, e);
+        tok_str_add(ts, '=');
+        tok_str_add(ts, '(');
+        tok_str_add(ts, TOK_STRUCT);
+        tok_str_add(ts, etok);
+        tok_str_add(ts, '*');
+        tok_str_add(ts, ')');
+        tok_str_add(ts, envtok);
+        tok_str_add(ts, ';');
+        if (!is_void)
+            tok_str_add(ts, TOK_RETURN);
+        tok_str_add(ts, e);
+        tok_str_add(ts, TOK_ARROW);
+        tok_str_add(ts, tok_alloc_const("__c6_fn"));
+        tok_str_add(ts, '(');
+        for (p = c6_async_params(&cl->ftype), i = 0; p; p = p->next, i++) {
+            if (i)
+                tok_str_add(ts, ',');
+            snprintf(aname, sizeof aname, "__c6_a%d", i);
+            tok_str_add(ts, tok_alloc_const(aname));
+        }
+        tok_str_add(ts, ')');
+        tok_str_add(ts, ';');
+    }
+    tok_str_add(ts, '}');
+    tok_str_add(ts, TOK_EOF);
+
+    t = tcc_mallocz(sizeof *t);
+    t->sym = sym;
+    t->ts = ts;
+    t->next = c6_tramps;
+    c6_tramps = t;
+    return sym;
+}
+
+static void c6_tramp_flush(void)
+{
+    while (c6_tramps) {
+        C6Tramp *t = c6_tramps;
+        c6_tramps = t->next;
+        c6_decl_tokens(t->ts);
+        tcc_free(t);
+    }
+}
+
+/* Turn a plain function pointer into a closure: allocate a one-word env
+   holding the pointer and a closure whose code is a generated trampoline. */
+static void c6_closure_self_capture(void)
+{
+    C6Lit *lit = vtop->c6_lit_src;
+    Sym *dst = vtop[-1].sym;
+    int i = 0;
+
+    if (!lit || !dst)
+        return;
+    for (i = 0; i < lit->ncaps; i++)
+        if (lit->caps[i].kind == C6_CAP_VALUE
+            && lit->caps[i].tok == (dst->v & ~(SYM_STRUCT | SYM_FIELD)))
+            tcc_error("'%s' is captured by the closure being assigned to it: "
+                      "the closure would see the old value (use a named "
+                      "function for recursion)", get_tok_str(dst->v, NULL));
+}
+
+static void c6_closure_opaque(CType *t)
+{
+    if (!c6_closure_of_type(t))
+        return;
+    tcc_error("'%s' is a closure: it can only be called, compared with NULL, "
+              "copied, moved or released",
+              vtop->sym ? get_tok_str(vtop->sym->v, NULL) : "value");
+}
+
+static void c6_closure_to_pointer_error(CType *dt)
+{
+    CType st = vtop->type;
+    int bt = 0;
+
+    if (!c6_closure_of_type(&st))
+        return;
+    if (c6_closure_of_type(dt))
+        return;
+    bt = dt->t & VT_BTYPE;
+    if (bt == VT_PTR && dt->ref && (dt->ref->type.t & VT_BTYPE) == VT_FUNC)
+        tcc_error("a closure cannot become a plain function pointer: it "
+                  "carries an environment (call it, or keep it as 'closure "
+                  "RET (parameters)')");
+    if (bt == VT_PTR)
+    {
+        char buf[128] = {0};
+        type_to_str(buf, sizeof buf, dt, NULL);
+        tcc_error("a closure cannot be converted to '%s': closures are opaque",
+                  buf);
+    }
+}
+
+static int c6_closure_wrap_to(CType *dt)
+{
+    C6Closure *cl = NULL;
+    CType st = {0}, envp = {0}, ct = {0}, clp = {0}, codep = {0};
+    CType envf = {0};
+    Sym *tr = NULL;
+    int src_slot = 0, env_slot = 0, cl_slot = 0, save_hook = 0;
+
+    if (!c6_closure_of_type(dt)) {
+        return 0;
+    }
+    st = vtop->type;
+    if (c6_closure_of_type(&st))
+        return 0;
+    if ((st.t & VT_BTYPE) == VT_FUNC) {
+        CType fn = st;
+        mk_pointer(&fn);
+        st = fn;
+        vtop->type = st;
+    }
+    if ((st.t & VT_BTYPE) != VT_PTR || !st.ref
+        || (st.ref->type.t & VT_BTYPE) != VT_FUNC)
+        return 0;
+    if (!st.ref->type.ref)
+        return 0;
+    cl = c6_closure_of_type(dt);
+    tr = c6_closure_tramp(cl);
+
+    /* park the source pointer: allocation calls clobber the value stack */
+    src_slot = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = src_slot;
+    vset(&st, VT_LOCAL | VT_LVAL, src_slot);
+    vswap();
+    vstore();
+    vpop();
+
+    envp = c6_env_ptr_type();
+    if (!cl->env_tag)
+        c6_closure_tramp(cl);
+    {
+        CType env_struct = {0};
+        env_struct.t = VT_STRUCT;
+        env_struct.ref = cl->env_tag;
+        c6_lit_new(PTR_SIZE, &env_struct, &envp);
+    }
+    env_slot = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = env_slot;
+    vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
+    vswap();
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
+    gv(RC_INT);
+    {
+        CType fp = cl->env_tag->next->type;
+        c6_lit_env_field(0, &fp);
+    }
+    vset(&st, VT_LOCAL | VT_LVAL, src_slot);
+    gv(RC_INT);
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    ct.t = VT_STRUCT;
+    ct.ref = cl->tag_sym;
+    clp = c6_global_ptr(&ct);
+    clp.gq = C6_GQ_MANAGED;
+    clp.ref->type.gq = C6_GQ_MANAGED;
+    c6_lit_new(2 * PTR_SIZE, &ct, &clp);
+    cl_slot = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = cl_slot;
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    vswap();
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    codep = c6_global_ptr(&cl->code_type);
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    c6_lit_env_field(0, &codep);
+    vpushsym(&cl->code_type, tr);
+    vstore();
+    vpop();
+
+    envf = c6_env_ptr_type();
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    c6_lit_env_field(PTR_SIZE, &envf);
+    vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
+    gv(RC_INT);
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    vtop->type = *dt;
+    vtop->gc_state = C6_GC_FRESH;
+    vtop->gc_atomic = 0;
+    vtop->c6_lit_src = NULL;
+    return 1;
 }
 
 static void c6_lit_make_closure(C6Lit *lit)
@@ -5198,6 +5579,9 @@ static void verify_assign_cast(CType *dt)
 static void gen_assign_cast(CType *dt)
 {
 #ifdef C6_EXT
+    c6_closure_to_pointer_error(dt);
+    if (c6_closure_wrap_to(dt))
+        return;
     if (c6_slice_convert(dt))
         return;
     if (c6_iface_convert(dt))
@@ -5214,6 +5598,9 @@ ST_FUNC void vstore(void)
 #ifdef C6_EXT
     c6_fallible_use();          /* 'x = f()' would drop the error */
     c6_lit_function_pointer_error();
+    c6_closure_self_capture();
+    c6_closure_to_pointer_error(&vtop[-1].type);
+    c6_closure_wrap_to(&vtop[-1].type);
     if (c6_gc_store_hook())     /* 'managed lvalue = value' */
         return;
     if (tcc_state->c6_ext && !c6_gc_no_hook
@@ -7921,7 +8308,7 @@ static void c6_lit_parse(void)
     CType ftype = {0}, vtype = {0};
     AttributeDef ad = {0};
     C6Lit *lit = 0;
-    Sym *s = 0, *p = 0, *snap = 0;
+    Sym *s = 0, *p = 0;
     char buf[48] = {0};
     int v = 0, i = 0, n = 0;
 
@@ -8339,6 +8726,9 @@ ST_FUNC void unary(void)
     case '*':
         next();
         unary();
+#ifdef C6_EXT
+        c6_closure_opaque(&vtop->type);
+#endif
         indir();
         break;
     case '&':
@@ -8954,10 +9344,16 @@ special_math_val:
                     continue;           /* let the '(' case do the call */
                 }
             }
+#ifdef C6_EXT
+            c6_closure_opaque(&vtop->type);
+#endif
             if (arrow)
                 indir();
 #else
             /* field */
+#ifdef C6_EXT
+            c6_closure_opaque(&vtop->type);
+#endif
             if (tok == TOK_ARROW)
                 indir();
             next();
@@ -9002,6 +9398,7 @@ special_math_val:
             next();
         } else if (tok == '[') {
 #ifdef C6_EXT
+            c6_closure_opaque(&vtop->type);
             /* 't[0]' on a tuple, or a slice subscript and a range: those are
                bounds checked and may produce a value, so they need their own
                parser; an array or pointer subscript with no ':' keeps the
@@ -14694,6 +15091,16 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 #endif
     init_params p = {0};
 
+#ifdef C6_EXT
+    if (tcc_state->c6_ext && has_init && scope != VT_LOCAL
+        && c6_closure_of_type(type)) {
+        /* a closure is an allocated object, not a constant */
+        if (!((tok == TOK_CINT || tok == TOK_CUINT) && tokc.i == 0)
+            && tok != '(')
+            tcc_error("a closure is not a constant expression: initialize it "
+                      "at run time ('NULL' is fine at file scope)");
+    }
+#endif
     if (scope == VT_CONST) {
         /* see if a global symbol was already defined */
         sym = sym_find(v);
@@ -18802,6 +19209,10 @@ static int c6_lit_flush(void)
         tcc_free(lit->params);
         tcc_free(lit->caps);
         tcc_free(lit);
+        n++;
+    }
+    if (c6_tramps) {
+        c6_tramp_flush();
         n++;
     }
     return n;
