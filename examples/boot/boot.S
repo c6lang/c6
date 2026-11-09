@@ -94,10 +94,11 @@ pm_entry:
         /* 页表：PML4[0] -> PDPT，PDPT[0] -> PD，PD = 512 个 2MB 页 */
         movl $0x90000, %edi             /* PML4 */
         xorl %eax, %eax
-        movl $(3 * 4096 / 4), %ecx
+        movl $(4 * 4096 / 4), %ecx
         rep stosl
         movl $0x91003, 0x90000          /* PML4[0] = PDPT | 3 */
         movl $0x92003, 0x91000          /* PDPT[0] = PD   | 3 */
+        movl $0x93003, 0x91018          /* PDPT[3] = 高 PD | 3（3~4GB）*/
         movl $0x92000, %ebx
         xorl %ecx, %ecx
 1:      movl %ecx, %eax
@@ -107,6 +108,9 @@ pm_entry:
         incl %ecx
         cmpl $512, %ecx
         jb 1b
+        /* LAPIC 在 0xFEE00000（3~4GB 那一段），单独映射一页 2MB：
+           PDPT[3] 指的那个 PD 里第 (0xFEE00000>>21)&0x1FF = 0x1F7 项 */
+        movl $0xFEE00093, 0x93FB8
         /* 开 SSE：长模式下 c6 的浮点/结构拷贝会用 xmm，CR4.OSFXSR 不开就 #UD */
         movl %cr0, %eax
         andl $0xFFFFFFF3, %eax          /* 清 EM(2) 和 TS(3) */
@@ -155,6 +159,7 @@ lm_entry:
         movl $payload_bss, %ecx
         xorl %eax, %eax
         rep stosb
+        cli                             /* 交给 payload 时中断一定是关的 */
         movq $payload_entry, %rax
         call *%rax
 2:      hlt

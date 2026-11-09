@@ -1028,10 +1028,28 @@ Frame；新任务的帧是编出来的，第一次被调度时 `iretq` 直接落
 `0x80000` 其实落在 payload 的 `.bss` 里面，变量一多就踩栈（这次踩到的是
 中断栈和堆），已挪到 16MB。
 
-还差的：**SMP**。真并行要把 AP 拉起来（INIT-SIPI-SIPI + 落在 0x8000 的
-16 位实模式跳板），而 tcc 的汇编器不认 `.code16`，跳板得再走一个 binutils
-目标（`examples/boot/ap.S`，`as --32`，和 `boot.S` 一样按固定地址链），
-再配 per-CPU 的 `cur`/中断栈/自旋锁和全局 run queue。另外 `go` 的**句柄**
+**SMP：地基铺好了，调度器那层还差一口气。** 已经落地并且验证过能启动的：
+
+- `examples/boot/ap.S` 是 AP 的 16 位实模式跳板（tcc 的汇编器不认 `.code16`，
+  所以它和 `boot.S` 一样走 binutils：`as --32` + `ld -Ttext 0x8000`，222 字节）。
+  加电 → `lgdt` → 保护模式 → 打开 PAE/长模式 → 读 `0xFEE00020` 拿自己的
+  APIC ID → 从 `0x7010` 那排栈顶里挑一个 → `call` 进 `0x7008` 里的入口。
+  三个约定好的低内存邮箱：`0x7000` cr3、`0x7008` 入口、`0x7010` 栈顶数组。
+- `build.sh` 把 `ap.bin` 用 `objcopy -I binary` 包成一个目标文件链进 payload，
+  并支持 `SMP=N examples/boot/build.sh ...` 传给 qemu 的 `-smp`。
+- `boot.S` 补了两件真并行必需的事：把 LAPIC 页（`0xFEE00000`）映射进页表
+  （`PDPT[3]` + 高段 PD 的最后一项，属性 `0x93` = PCD|PWT|present，LAPIC 不能
+  走 cache），以及交给 payload 之前 `cli`（BIOS 的 8254 还在按 18.2Hz 敲 IRQ0）。
+
+还没通的是调度器那层：把 `sched.plain.c` 改成 per-CPU（每个核自己的
+`cur`/中断栈/IDT）之后，单核路径在 KVM 下连跑 10 次全过，但 TCG 下 2/10 次
+在第一次时钟中断附近直接三重故障（`#GP(0x42)` → `#DF`），AP 唤起之后更是
+稳定地在第二次时钟中断后把现场恢复成垃圾（`iretq` 落进栈上的 `0xffff51`，
+`#UD`）。已知的两个真坑记在这儿：LAPIC 一定得先映射再碰（否则第一次访问
+`0xFEE00000` 就 `#GP`），以及一旦把 LAPIC 的 SVR 打开、8259A 的中断就必须
+靠 `LINT0=ExtINT` 转进来 —— 而 8254 还在敲 IRQ0，不屏蔽 8259A 就会往 IDT 上
+丢一串莫名其妙的向量。所以这一轮只提交了上面这些"地基 + 踩坑记录"，
+`make fstest-bare-smp` 暂时没有。另外 `go` 的**句柄**
 （`h->join()`/`h->value()`）在裸机上还没打通：要走 `libtcc1` 的每线程块
 （`calloc`/`free` + pthread 键），实测任务收尾后三重故障 —— 调度这层本身
 没问题，`pthread_create` + `pthread_join` + 返回值用普通函数体任务测过。

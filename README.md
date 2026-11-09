@@ -1356,6 +1356,14 @@ go: 空转 4446664 次（上限 200000000）、时钟切换 5 次、go_flag=1
 go: 是并发 —— 两个任务在同一个 CPU 上被时钟抢占着交错推进
 ```
 
+多核（SMP）这一轮只铺到地基：[examples/boot/ap.S](examples/boot/ap.S) 是
+AP 的 16 位实模式跳板（`as --32`，和引导扇区一样按固定地址链，222 字节），
+`build.sh` 把它包成目标文件链进 payload，并支持 `SMP=2 examples/boot/build.sh
+...` 直接传给 qemu 的 `-smp`；`boot.S` 也把 LAPIC 那页（`0xFEE00000`，属性
+`PCD|PWT`，不能走 cache）映射好了。per-CPU 调度器还没打通：TCC 下 2/10 次会
+在第一次时钟中断附近三重故障，AP 起来之后现场恢复也不稳，所以没有加
+`make fstest-bare-smp`，细节和已确认的坑写在 [docs/plan.md](docs/plan.md) 里。
+
 空转次数**远小于上限**就是证据：只有时钟中断真在任意指令边界把 CPU 抢走，
 另一个任务才有机会跑起来把 `go_flag` 立起来。要是 `go` 只是在同一个栈上顺序
 调用，先跑的那个得把 2 亿次整个跑完，另一个才轮得到。
