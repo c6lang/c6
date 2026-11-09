@@ -694,18 +694,132 @@ typedef struct TccThCtx {
 typedef unsigned long pthread_t;
 typedef unsigned int pthread_key_t;
 typedef int pthread_once_t;
-extern int pthread_once(pthread_once_t *, void (*)(void));
-extern int pthread_key_create(pthread_key_t *, void (*)(void *));
-extern void *pthread_getspecific(pthread_key_t);
-extern int pthread_setspecific(pthread_key_t, const void *);
-extern int pthread_create(pthread_t *, const void *, void *(*)(void *), void *);
-extern int pthread_join(pthread_t, void **);
-extern pthread_t pthread_self(void);
-extern int pthread_equal(pthread_t, pthread_t);
+/* The runtime needs threads for 'go'/'thread' and to key one block of state
+   (defer stack, error slot, f-string builders) per thread.  A freestanding
+   program -- one linked without libc -- has no pthreads, so every entry
+   point is a *weak* reference: it becomes 0 there, and the runtime then
+   keeps a single static block and refuses to start threads instead of
+   failing to link.  See 'examples/freestanding_fstr.c'. */
+extern int pthread_once(pthread_once_t *, void (*)(void))
+    __attribute__((weak));
+extern int pthread_key_create(pthread_key_t *, void (*)(void *))
+    __attribute__((weak));
+extern void *pthread_getspecific(pthread_key_t) __attribute__((weak));
+extern int pthread_setspecific(pthread_key_t, const void *)
+    __attribute__((weak));
+extern int pthread_create(pthread_t *, const void *, void *(*)(void *), void *)
+    __attribute__((weak));
+extern int pthread_join(pthread_t, void **) __attribute__((weak));
+extern pthread_t pthread_self(void) __attribute__((weak));
+extern int pthread_equal(pthread_t, pthread_t) __attribute__((weak));
 #endif
 
-extern void *calloc(unsigned long, unsigned long);
-extern void free(void *);
+/* ---- memory ------------------------------------------------------- *
+   Generated code calls these for struct copies and zeroing.  They normally
+   come from libc; a freestanding program has none, so the plain byte loops
+   below are weak definitions that a real libc replaces at link time. */
+
+__attribute__((weak)) void *memset(void *d, int c, unsigned long n)
+{
+    char *p = (char *)d;
+    unsigned long i = 0;
+
+    for (i = 0; i < n; i++)
+        p[i] = (char)c;
+    return d;
+}
+
+__attribute__((weak)) void *memcpy(void *d, const void *s, unsigned long n)
+{
+    char *p = (char *)d;
+    const char *q = (const char *)s;
+    unsigned long i = 0;
+
+    for (i = 0; i < n; i++)
+        p[i] = q[i];
+    return d;
+}
+
+__attribute__((weak)) void *memmove(void *d, const void *s, unsigned long n)
+{
+    char *p = (char *)d;
+    const char *q = (const char *)s;
+    unsigned long i = 0;
+
+    if (p == q || !n)
+        return d;
+    if (p < q || p >= q + n) {
+        for (i = 0; i < n; i++)
+            p[i] = q[i];
+    } else {
+        for (i = n; i > 0; i--)
+            p[i - 1] = q[i - 1];
+    }
+    return d;
+}
+
+/* ---- allocator ----------------------------------------------------- *
+   The runtime needs memory for the f-string builders, the defer stack, the
+   error slot, the coroutine pool and the managed objects.  Normally that is
+   the C library's calloc/free/realloc.  A freestanding program (one linked
+   without libc) has none of them, so the three references are weak and a
+   static arena in .bss takes over when they are 0 -- then f"..", defer, err
+   and @T keep working with nothing provided by the program.  C6_HEAP_SIZE
+   can be raised at build time (-DC6_HEAP_SIZE=...) and a program that links
+   its own calloc/free simply gets used instead (the arena stays unused). */
+
+#ifndef C6_HEAP_SIZE
+#define C6_HEAP_SIZE (256 * 1024)
+#endif
+
+extern void *calloc(unsigned long, unsigned long) __attribute__((weak));
+extern void free(void *) __attribute__((weak));
+extern void *realloc(void *, unsigned long) __attribute__((weak));
+
+#define C6_HEAP_HDR 16
+static char c6_heap[C6_HEAP_SIZE];      /* .bss: costs nothing in the file */
+static unsigned long c6_heap_used;
+
+static void *c6_alloc(unsigned long size)
+{
+    unsigned long need = 0, start = 0;
+
+    if (calloc)
+        return calloc(1, size);
+    need = (size + C6_HEAP_HDR + 15UL) & ~15UL;
+    if (c6_heap_used + need > C6_HEAP_SIZE)
+        return 0;
+    start = c6_heap_used;
+    c6_heap_used += need;
+    *(unsigned long *)&c6_heap[start] = size;
+    return &c6_heap[start + C6_HEAP_HDR];
+}
+
+static void c6_free(void *p)
+{
+    if (free)
+        free(p);                        /* the arena never gives back */
+}
+
+static void *c6_realloc(void *p, unsigned long size)
+{
+    unsigned long old = 0, i = 0;
+    char *np = 0, *op = (char *)p;
+
+    if (realloc)
+        return realloc(p, size);
+    if (!p)
+        return c6_alloc(size);
+    old = *(unsigned long *)(op - C6_HEAP_HDR);
+    if (size <= old)
+        return p;
+    np = (char *)c6_alloc(size);
+    if (!np)
+        return 0;
+    for (i = 0; i < old; i++)
+        np[i] = op[i];
+    return np;
+}
 
 /* A thread started by 'go'.  It is always joined by the thread that started
    it, and it may also be handed out as a handle ('thread h = go f(x);'), so
@@ -729,7 +843,7 @@ struct TccThRec {
 static void tcc_th_rec_unref(TccThRec *r)
 {
     if (r && --r->refs <= 0)
-        free(r);
+        c6_free(r);
 }
 
 static void tcc_th_trap(void)
@@ -740,7 +854,7 @@ static void tcc_th_trap(void)
 
 static void *tcc_th_alloc(unsigned long size)
 {
-    void *p = calloc(1, size);
+    void *p = c6_alloc(size);
 
     if (!p)
         tcc_th_trap();
@@ -762,7 +876,8 @@ static void tcc_th_join_children(TccThCtx *th)
         th->th_list = r->next;
         if (!r->state) {            /* a handle may have joined it already */
 #ifndef TCC_TARGET_PE
-            pthread_join(r->tid, (void **)0);
+            if (pthread_join)       /* absent in a freestanding link */
+                pthread_join(r->tid, (void **)0);
 #endif
             r->state = 1;
         }
@@ -780,13 +895,13 @@ static void tcc_th_free(TccThCtx *th)
     tcc_th_gc_free_all(th);
     tcc_th_join_children(th);
     if (th->dstack)
-        free(th->dstack);
+        c6_free(th->dstack);
     if (th->dctx)
-        free(th->dctx);
+        c6_free(th->dctx);
     if (th->co)
         tcc_th_co_free(th->co);
     tcc_fmt_free_all(th);
-    free(th);
+    c6_free(th);
 }
 
 #ifdef TCC_TARGET_PE
@@ -806,11 +921,23 @@ static void tcc_th_key_init(void)
         tcc_th_trap();
 }
 
+/* 1 when the program was linked with pthreads: the block of state is then
+   keyed per thread.  0 in a freestanding link (no libc): one static block,
+   so 'go' and 'thread' report failure instead of starting a thread. */
+static int tcc_th_multi(void)
+{
+    return pthread_once && pthread_key_create && pthread_getspecific
+        && pthread_setspecific;
+}
+
 /* The per-thread block of the calling thread, allocated on first use. */
 static TccThCtx *tcc_th(void)
 {
+    static TccThCtx single;
     TccThCtx *th;
 
+    if (!tcc_th_multi())
+        return &single;
     if (pthread_once(&tcc_th_once, tcc_th_key_init) != 0)
         tcc_th_trap();
     th = (TccThCtx *)pthread_getspecific(tcc_th_key);
@@ -842,9 +969,9 @@ static void *tcc_th_tramp(void *p)
     TccThStart st = *(TccThStart *)p;
     void *ret;
 
-    free(p);
+    c6_free(p);
     ret = st.fn(st.arg);
-    free(st.arg);
+    c6_free(st.arg);
     st.rec->ret = ret;
     st.rec->done = 1;
     return ret;
@@ -866,6 +993,10 @@ void *__tcc_th_spawn(void *(*fn)(void *), void *arg)
     TccThRec *r;
     TccThStart *st;
 
+    if (!pthread_create) {          /* freestanding: no threads at all */
+        c6_free(arg);
+        return 0;
+    }
     r = (TccThRec *)tcc_th_alloc(sizeof *r);
     st = (TccThStart *)tcc_th_alloc(sizeof *st);
     st->fn = fn;
@@ -873,9 +1004,9 @@ void *__tcc_th_spawn(void *(*fn)(void *), void *arg)
     st->rec = r;
     r->refs = 2;
     if (pthread_create(&r->tid, (const void *)0, tcc_th_tramp, st) != 0) {
-        free(st);
-        free(arg);
-        free(r);
+        c6_free(st);
+        c6_free(arg);
+        c6_free(r);
         return 0;
     }
     r->next = th->th_list;
@@ -907,6 +1038,8 @@ int __c6_thread_join(TccThRec *r)
 #ifdef TCC_TARGET_PE
     return -1;
 #else
+    if (!pthread_equal || !pthread_self || !pthread_join)
+        return -1;                  /* freestanding: no threads */
     if (pthread_equal(r->tid, pthread_self()))
         return -1;
     if (!r->state) {
@@ -1323,7 +1456,7 @@ static void c6_gc_free_one(C6GcHdr *h)
     }
     if (c6_gc_live_count)
         c6_gc_live_count--;
-    free(h);
+    c6_free(h);
 }
 
 /* Run the free queue of TH for at most BUDGET objects.  Called from the
@@ -1371,7 +1504,7 @@ static void c6_gc_die(C6GcHdr *h)
     while (w) {
         C6GcWeak *next = w->next;
         *w->slot = 0;
-        free(w);
+        c6_free(w);
         w = next;
     }
     th = tcc_th();
@@ -1419,7 +1552,7 @@ static void c6_gc_weak_unlink(void **slot, void *p)
         C6GcWeak *w = *pp;
         if (w->slot == slot) {
             *pp = w->next;
-            free(w);
+            c6_free(w);
             return;
         }
     }
@@ -1450,7 +1583,7 @@ void *__c6_gc_new(unsigned long size, unsigned long count,
     if (count > ((unsigned long)-1 - C6_GC_HDR_SIZE) / size)
         c6_gc_trap();           /* the size computation would wrap */
     total = size * count;
-    h = (C6GcHdr *)calloc(1, C6_GC_HDR_SIZE + total);
+    h = (C6GcHdr *)c6_alloc(C6_GC_HDR_SIZE + total);
     if (!h)
         c6_gc_trap();
     h->rc = 1;
@@ -1630,7 +1763,6 @@ static int c6_nb_gc_roots, c6_cap_gc_roots;
 static int c6_gc_shut_down;
 
 void __c6_gc_shutdown(void);
-extern void *realloc(void *, unsigned long);
 
 void __c6_gc_root(void *block, int kind, unsigned long count,
                   unsigned long stride)
@@ -1639,7 +1771,7 @@ void __c6_gc_root(void *block, int kind, unsigned long count,
         return;
     if (c6_nb_gc_roots == c6_cap_gc_roots) {
         int cap = c6_cap_gc_roots ? c6_cap_gc_roots * 2 : 16;
-        C6GcRoot *nr = (C6GcRoot *)realloc(c6_gc_roots,
+        C6GcRoot *nr = (C6GcRoot *)c6_realloc(c6_gc_roots,
                        (unsigned long)cap * sizeof *nr);
         if (!nr)
             return;                 /* out of memory: leak instead of crash */
@@ -1721,14 +1853,14 @@ static void c6_fmt_room(C6FmtBuf *b, unsigned long len)
         return;
     while (cap < b->len + len + 1)
         cap *= 2;
-    np = (char *)calloc(1, cap);
+    np = (char *)c6_alloc(cap);
     if (!np)
         c6_gc_trap();
     old = c6_fmt_text(b);
     for (i = 0; i < b->len; i++)
         np[i] = old[i];
     if (b->heap)
-        free(b->heap);
+        c6_free(b->heap);
     b->heap = np;
     b->cap = cap;
 }
@@ -1950,19 +2082,19 @@ static C6FmtBuf *c6_fmt_slot(int d)
         n = th->fmt_nslot ? th->fmt_nslot : 4;
         while (n <= d)
             n *= 2;
-        ns = (struct C6FmtBuf **)calloc(1, (unsigned long)n * sizeof *ns);
+        ns = (struct C6FmtBuf **)c6_alloc((unsigned long)n * sizeof *ns);
         if (!ns)
             c6_gc_trap();
         for (i = 0; i < th->fmt_nslot; i++)
             ns[i] = th->fmt_slot[i];
         if (th->fmt_slot)
-            free(th->fmt_slot);
+            c6_free(th->fmt_slot);
         th->fmt_slot = ns;
         th->fmt_nslot = n;
     }
     b = th->fmt_slot[d];
     if (!b) {
-        b = (C6FmtBuf *)calloc(1, sizeof *b);
+        b = (C6FmtBuf *)c6_alloc(sizeof *b);
         if (!b)
             c6_gc_trap();
         b->cap = C6_FMT_SCRATCH;
@@ -2389,11 +2521,11 @@ void *__c6_fmt_end(int flags)
            the previous result while the next one is being built */
         if (b->outcap < n + 1) {
             unsigned long cap = n + 1 + C6_FMT_SCRATCH;
-            char *np = (char *)calloc(1, cap);
+            char *np = (char *)c6_alloc(cap);
             if (!np)
                 c6_gc_trap();
             if (b->out)
-                free(b->out);
+                c6_free(b->out);
             b->out = np;
             b->outcap = cap;
         }
@@ -2436,13 +2568,13 @@ static void tcc_fmt_free_all(TccThCtx *th)
         if (!b)
             continue;
         if (b->heap)
-            free(b->heap);
+            c6_free(b->heap);
         if (b->out)
-            free(b->out);
-        free(b);
+            c6_free(b->out);
+        c6_free(b);
     }
     if (th->fmt_slot)
-        free(th->fmt_slot);
+        c6_free(th->fmt_slot);
     th->fmt_slot = 0;
     th->fmt_nslot = 0;
     th->fmt_depth = 0;
@@ -2575,10 +2707,10 @@ struct TccCoPool {
 
 static void tcc_th_co_free(TccCoPool *co)
 {
-    free(co->fds);
-    free(co->evs);
-    free(co->leafs);
-    free(co);
+    c6_free(co->fds);
+    c6_free(co->evs);
+    c6_free(co->leafs);
+    c6_free(co);
 }
 
 static TccCoPool *tcc_th_co(TccThCtx *th)
@@ -2588,7 +2720,11 @@ static TccCoPool *tcc_th_co(TccThCtx *th)
     return th->co;
 }
 
-extern int select(int, void *, void *, void *, void *);
+/* Only the coroutine pump needs select(); a freestanding program has no
+   file descriptors to wait for, so the reference is weak and the pump
+   reports failure instead of failing to link. */
+extern int select(int, void *, void *, void *, void *)
+    __attribute__((weak));
 
 static void tcc_co_trap(void)
 {
@@ -2814,6 +2950,8 @@ static int tcc_co_select(int fd, int ev)
         r[fd >> 6] |= 1UL << (fd & 63);
     if (ev & 2)
         w[fd >> 6] |= 1UL << (fd & 63);
+    if (!select)
+        return -1;                  /* freestanding: nothing to wait for */
     res = select(fd + 1, r, w, e, (void *)0);
     if (res <= 0)
         return res;
@@ -2913,9 +3051,9 @@ static void tcc_co_room(TccCoPool *co, int n)
         co->cap = 8;
     while (co->cap < n)
         co->cap *= 2;
-    co->fds = (int *)realloc(co->fds, co->cap * sizeof *co->fds);
-    co->evs = (int *)realloc(co->evs, co->cap * sizeof *co->evs);
-    co->leafs = (TccCoTask **)realloc(co->leafs,
+    co->fds = (int *)c6_realloc(co->fds, co->cap * sizeof *co->fds);
+    co->evs = (int *)c6_realloc(co->evs, co->cap * sizeof *co->evs);
+    co->leafs = (TccCoTask **)c6_realloc(co->leafs,
                                       co->cap * sizeof *co->leafs);
     if (!co->fds || !co->evs || !co->leafs)
         tcc_co_trap();
@@ -2993,7 +3131,7 @@ static int tcc_co_pump(int *errs)
             if (co->evs[i] & 2)
                 w[co->fds[i] >> 6] |= 1UL << (co->fds[i] & 63);
         }
-        if (select(maxfd + 1, r, w, e, (void *)0) <= 0)
+        if (!select || select(maxfd + 1, r, w, e, (void *)0) <= 0)
             return -1;
         for (i = 0; i < nio; i++) {
             int rev = 0;
@@ -3121,8 +3259,8 @@ void __c6_co_destroy(void *self)
         ((TccCoDesc *)t->desc)->release(t);
     tcc_co_unlink((TccCoTask **)&co->runlist, t);
     if (!((TccCoDesc *)t->desc)->frame_size)
-        free(t->frame);             /* the parked native frame, if any */
-    free(t);
+        c6_free(t->frame);             /* the parked native frame, if any */
+    c6_free(t);
 }
 
 /* 'await c6_io(fd, ev)' is rewritten by the compiler and never calls this;

@@ -86,7 +86,13 @@ test-plain: build-plain
 selftest: build
 	./$(SELFTEST)
 
-test-all: selftest test c6selfcheck
+# 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
+fstest: build
+	./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_fstr \
+	    examples/freestanding_fstr.c tcc/libtcc1.a
+	./build/freestanding_fstr
+
+test-all: selftest test c6selfcheck fstest
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。

@@ -899,6 +899,8 @@ int n = (int)h->value();  /* 线程函数的返回值（整数或指针） */
   `async`/`await`、甚至再 `go`；
 - 运行时只用 `pthread_create` / `pthread_join` / `pthread_key_*`；
   glibc 2.34 起这些都在 libc 里，老系统需要 `-lpthread`；
+- 这些符号是 **weak** 的：链接里没有 pthread 时（无 libc 的 freestanding
+  程序）运行时退化成单线程，`go` / `thread` 报告启动失败，而不是链接报错；
 - PE 目标还没有线程支持，`go` 在那边会触发 trap。
 
 完整可运行示例见 [examples/thread_demo.c](examples/thread_demo.c)：
@@ -1118,6 +1120,34 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
     (b) = tmp;
 }
 ```
+
+### 无 libc（freestanding）
+
+`libtcc1` 里的运行时（插值构造器、`defer`、`err`/`catch`、托管引用、协程池）
+本来要 `calloc` / `free` / `realloc` / `memset` / `memcpy` / `memmove` /
+`pthread_*` / `select`。这些引用现在全是 **weak** 的，所以没有 libc 也能链接：
+
+| 需要的东西 | 没有 libc 时 |
+|---|---|
+| `calloc` / `free` / `realloc` | 用 `libtcc1` 里的静态 arena（`.bss`，默认 256 KB，编译 libtcc1 时 `-DC6_HEAP_SIZE=...` 可调）；程序自己定义 `calloc` 就用程序的那份 |
+| `memset` / `memcpy` / `memmove` | `libtcc1` 自带字节循环版，真 libc 的强定义会在链接时覆盖它们 |
+| `pthread_*` | 退化成单线程（一个静态的状态块）；`go` / `thread` 报告启动失败 |
+| `select` | 只有 `async` / `c6_io` 用到；没有就报“等待失败”，其它照常 |
+
+也就是单线程的 freestanding 程序直接可用，程序这边什么都不用提供：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -nostdlib -o build/freestanding_fstr \
+    examples/freestanding_fstr.c tcc/libtcc1.a   # 或 make fstest
+./build/freestanding_fstr
+```
+
+[examples/freestanding_fstr.c](examples/freestanding_fstr.c) 没有 `main`、没有
+crt，入口是 `_start`，输出和退出都自己发 syscall，里面跑了整数/浮点插值、
+格式说明、`@f".."`、`defer`、`err`+`catch` 和 `@T`，8 条断言全过。
+
+C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
+`<pthread.h>`）。
 
 ## 测试
 
