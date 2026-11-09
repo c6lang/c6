@@ -1075,7 +1075,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver`；`iterator method 'next' cannot return a borrowed managed reference 'T'` |
 | C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it'` |
 | C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
-| C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发） | `'defer' bodies nested too deeply` |
+| C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发），第 9 层报错 | `'defer' bodies nested too deeply` |
 
 （C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包，尚未实现。）
 
@@ -1375,7 +1375,10 @@ disp:                                       (* 每个函数一个，逆序扫 si
   作用域时位被清掉，重新进入就重新注册。
 - 全部是本帧的局部变量，所以 ISR、`go` 起来的线程、协程（`async` 的帧就在
   任务里）、递归的每一帧都各跑各的，不需要任何线程级状态。
-- 上限：一个函数最多 128 个清理点（C101），清理体最多嵌套 8 层（C102）。
+- 挂起的任务被销毁（`__c6_co_destroy` / 回卷）时发的是 mode 2 的请求，所以
+  那次派发会把 `errdefer` 也跑掉：被销毁的任务没有"正常结束"这回事。
+- 上限：一个函数最多 128 个清理点（C101，第 129 个报错），清理体最多嵌套
+  8 层（C102，第 9 层报错）。
 - 帧开销：位图 4 × `int` 在**每个** c6 函数帧里都有并在序言清零（单趟编译器
   在序言处还不知道后面会不会出现清理点）；派发状态 2 × `int` 和派发器本身
   只在函数里真有清理点时才有，清理体每嵌套一层再加 2 × `int`。
