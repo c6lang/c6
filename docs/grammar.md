@@ -475,9 +475,10 @@ go-statement = "go" , expression , ";" ;
 * 线程由**启动它的线程**回收：`main` 结束时编译器插入
   `__c6_th_join_all()`，别的线程在退出时回收自己的子线程。需要中途等待
   可以直接调用它。
-* 每个线程有自己的 defer 栈、错误槽和协程池（`pthread_key`，不是
-  `__thread`：`-run` 不支持 TLS），所以线程里可以照常写 `defer`、`err`、
-  `async`/`await`，也可以再 `go`。
+* 每个线程有自己的错误槽、插值构造器和协程池（`pthread_key`，不是
+  `__thread`：`-run` 不支持 TLS）。`defer` 不在这块状态里：清理状态就在
+  函数帧里（见 8.2），所以线程里、ISR 里照常写；`err` / `f".."` / `async`
+  才去取那块每线程状态，线程里也一样能用，还能再 `go`。
 
 需要等某一个线程时用**句柄**（约束 C78）：
 
@@ -708,7 +709,8 @@ statement              = labeled-statement
 
 defer-statement        = "defer" , statement ;
                          (* 注册时跳过；离开作用域或返回/重抛时按注册的
-                            逆序执行 *)
+                            逆序执行。注册 = 置本帧位图里的一位（幂等），
+                            展开见 8.2 *)
 
 errdefer-statement     = "errdefer" , statement ;
                          (* 只在错误路径上执行，行为同 defer *)
@@ -1053,6 +1055,8 @@ parameter-list    = identifier , { "," , identifier } ;
 | C87 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
 | C88 | 插值里不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上）；`;` 只能出现一次（引入格式说明），语句表达式里的 `;` 同样被拒绝 | `'try' is not allowed in an interpolation: ...`；`f-string: ';' is only allowed once, to start the format spec ('{expr;spec}')` |
 | C89 | 格式说明要与插值的静态类型相容，`conv` 必须是已知的，宽度/精度不超过 1023，`;` 后面不能为空 | `f-string: unknown conversion 'z' in a format spec`；`f-string: a 'const char *' value takes no 'x' format spec`；`f-string: format width 2000 is too large`；`f-string: empty format spec in '{expr;spec}'` |
+| C95 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
+| C96 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发） | `'defer' bodies nested too deeply` |
 
 ---
 
@@ -1282,14 +1286,61 @@ typedef、函数和全局变量写成普通 C 头文件，符号名就是带前�
 | `p = q;`（`q` 是托管引用） | `__c6_gc_store(&p, q, mode)`：先给 `q` +1，再释放 `p` 的旧值、写槽 |
 | `p = NULL;` | 同一次 `__c6_gc_store`：旧值 −1、槽清零（这就是提前放手） |
 | `own @T p = new T;` / `= move(q);` | `__c6_gc_own_store` / `__c6_gc_move(&q)`：旧链整条释放，新值不计数 |
-| 出作用域 / `return` / `break` / `goto` | 内联 `__c6_gc_release(&p, mode)`（注册在 defer 记录里，所以每条路径都跑到） |
+| 出作用域 / `return` / `break` / `goto` | 内联 `__c6_gc_release(&p, mode)`（注册成一个清理点，所以每条路径都跑到，见 8.2） |
 | 对象计数归零 | 调描述符的 `drop`（若登记过），再按字段表逐个释放字段（数组逐元素、嵌入结构体递归），最后 `free` |
 | `go f(p)` / `task t = f(p)` | 实参块 / 任务前缀的那次拷贝 +1，块释放 / `__c6_co_destroy` 时 −1 |
-| `thread h = go f(x);` | `h = __tcc_th_spawn(&__c6_sp_f, block)`，作用域登记 `__c6_th_release(h)`（走 defer 记录，每条退出路径都还） |
+| `thread h = go f(x);` | `h = __tcc_th_spawn(&__c6_sp_f, block)`，作用域登记 `__c6_th_release(h)`（走清理点，每条退出路径都还） |
 | `h->join()` / `h->done()` / `h->value()` | `__c6_thread_join(h)` / `__c6_thread_done(h)` / `__c6_thread_value(h)` |
 | `t->wait()` / `t->start()` / `t->done()` / `t->kind()` | `__c6_co_wait(t)` / `__c6_co_start(t)` / `__c6_co_state(t) == -1` / `__c6_co_kind(t)`（接收者上转到 `struct __c6_task *`） |
 
 编译器不插入任何运行期调度：没有标记清扫线程，也没有安全点。
+
+### 8.2 `defer` / `errdefer` 的展开
+
+清理点（cleanup site）是**编译期常量**：编号 `id`、所在作用域的深度
+`depth`、`kind`（`defer` / `errdefer`）、清理体的标签。运行期状态全部在
+函数帧里，没有线程级（TLS / `pthread_key`）状态：
+
+```
+(* 函数序言；只有函数里有清理点时才分配 *)
+int arm[C6_DEFER_WORDS] = {0};      (* 已注册的清理点：一位一个 site *)
+int dtgt, dres;                     (* 正在服务的请求：深度过滤 + 恢复点号 *)
+int dtgt_save[8], dres_save[8];     (* 清理体里再发起请求时保存外层 *)
+
+(* 'defer S;' / 'errdefer S;'：注册只置位，然后跳过清理体 *)
+arm[id >> 5] |= 1 << (id & 31);
+goto after;  S: …;  after:
+```
+
+派发（离开作用域、`return`、`err` / `try` 的传播、`break` / `continue`、
+`goto`、以及函数末尾的兜底）：
+
+```
+    dtgt = <depth>;  dres = ++rid;  goto disp;   rs: …   (* 恢复点 *)
+disp:                                       (* 每个函数一个，逆序扫 site *)
+    for (site : sites, id 从大到小)
+        if (arm[site] && dtgt < site.depth && (site.kind == 0 || dtgt == -2)) {
+            arm[site] &= ~bit;              (* 无论跑不跑都清掉这一位 *)
+            goto site.label;                (* 清理体结尾跳回 disp *)
+        }
+    for (r : resumes)                       (* 这一轮做完了：恢复外层状态 *)
+        if (dres == r.id) { dtgt = dtgt_save[r.lv]; dres = dres_save[r.lv];
+                            goto r.rs; }
+```
+
+- 深度过滤的编码：mode 0 存 `<depth>`（只跑比它更深的作用域），mode 1 存
+  `-1`（整个函数帧），mode 2（错误路径）存 `-2`（整个函数帧，并且放行
+  `errdefer`）。负值不可能是合法深度，所以一个 `int` 就够。
+- `id` 从大到小 = 注册的逆序 = LIFO：同一作用域实例里后注册的先跑，
+  跨作用域时深的先跑（它的 `id` 也更大）。
+- 位是幂等的：同一个作用域实例里同一个 site 注册两次也只跑一次；离开
+  作用域时位被清掉，重新进入就重新注册。
+- 全部是本帧的局部变量，所以 ISR、`go` 起来的线程、协程（`async` 的帧就在
+  任务里）、递归的每一帧都各跑各的，不需要任何线程级状态。
+- 上限：一个函数最多 128 个清理点（C95），清理体最多嵌套 8 层（C96）。
+- 帧开销：位图 4 × `int` 在**每个** c6 函数帧里都有并在序言清零（单趟编译器
+  在序言处还不知道后面会不会出现清理点）；派发状态 2 × `int` 和派发器本身
+  只在函数里真有清理点时才有，清理体每嵌套一层再加 2 × `int`。
 
 ## 9. 示例
 
@@ -1390,18 +1441,18 @@ int main(void)
 ```
 int __c6_body_f(void *__c6_arg, void *__c6_frm);
 const struct __c6_desc __c6_desc_f =
-    { sizeof(struct f_task), alignof, 64, __c6_body_f, __c6_rel_f, frame_size };
+    { sizeof(struct f_task), alignof, __c6_body_f, __c6_rel_f, frame_size };
 ```
 
 函数体按 `int __c6_body_f(void *task, void *frame)` 编译。`frame` 是运行期
-给出的帧顶：任务块一次分配出 `struct f_task` + parked defer 记录 + 帧，后端
+给出的帧顶：任务块一次分配出 `struct f_task` + 帧（帧里带着自己的清理状态），后端
 把帧寄存器（x86 `rbp`、arm64 `x29`、riscv64 `s0`、arm `fp`、C99 后端的
 `__c99_frmp`）直接指向那块内存，`task` 存在帧的第一个槽里。序言再看
 `__c6_co_state(task)`：非 0 就调用 `__c6_co_restore(task, base)`（帧已住在
-任务里时它只恢复 defer 栈和错误槽）并跳到恢复分发器，为 0 就正常往下执行。
+任务里时它只把错误槽放回去）并跳到恢复分发器，为 0 就正常往下执行。
 声明的形参在此时被声明成普通局部变量，并从 `task->pN` 拷进来（只有首次进入
-会走这条路径）。描述符第 5 个成员是 `-c9x` 出来的释放函数，第 6 个是后端
-回填的帧大小：0 表示"帧不能住在任务里"（c67），退回拷贝模型。
+会走这条路径）。描述符第 3 个成员是 body，第 4 个是 `-c9x` 出来的释放函数，
+第 5 个是后端回填的帧大小：0 表示"帧不能住在任务里"（c67），退回拷贝模型。
 
 `struct f_task` 由 `c6_async_declare()` 用合成 token 在文件作用域声明，
 所以同一个 `async` 声明在定义方和调用方得到同一个布局。
@@ -1412,26 +1463,25 @@ const struct __c6_desc __c6_desc_f =
     x = await f(a)          ⇒  task = __c6_co_new(&__c6_desc_f);
                                task->p0 = a;
                                if (__c6_co_await(task, self))
-                                   __c6_co_suspend(self, KIND_CHILD, N, base, size, defer_base);
+                                   __c6_co_suspend(self, KIND_CHILD, N, base, size);
                                    return KIND_CHILD;     (* 回到驱动方 *)
                                N:  x = task->val;          (* 恢复后从这里继续 *)
 
     await c6_io(fd, ev)     ⇒  __c6_co_set_io(self, fd, ev);
-                               __c6_co_suspend(self, KIND_IO, N, base, size, defer_base);
+                               __c6_co_suspend(self, KIND_IO, N, base, size);
                                return KIND_IO;
                                N:  __c6_co_rev(self);      (* 就绪掩码 *)
 
     return e;               ⇒  self->val = e;
-                               <执行 defer 链>
+                               <派发本帧的清理点，见 8.2>
                                __c6_co_finish(self, KIND_DONE);
                                return KIND_DONE;
 ```
 
-挂起时把 `[defer_base, defer_sp)` 的 defer 记录和错误槽存进任务，然后
-body 直接 `return` 回到驱动方；恢复时把它们取回来，再跳到该号恢复点。
-帧本身不用动（它就在任务的那块内存里，地址在任务的一生里不变），所以
-**局部变量、defer 记录、错误状态在挂起前后完全不变**，`&local` 跨过
-`await` 也仍然有效，帧没有 4 KiB 上限。
+挂起时只把错误槽存进任务，然后 body 直接 `return` 回到驱动方；恢复时把它
+取回来，再跳到该号恢复点。帧本身不用动（它就在任务的那块内存里，地址在
+任务的一生里不变），所以**局部变量、清理点的注册状态、错误状态在挂起前后
+完全不变**，`&local` 跨过 `await` 也仍然有效，帧没有 4 KiB 上限。
 
 后端若回答"帧不能住在任务里"（目前只有 c67），则退回拷贝模型：每次挂起把
 `[base - size, base)` 的原生帧拷进任务（上限 4 KiB），恢复时拷回。那里帧内
@@ -1457,8 +1507,9 @@ body 直接 `return` 回到驱动方；恢复时把它们取回来，再跳到�
 
 `__tcc_co_spawn()` 置 `parent = 0`、把任务挂到顶层就绪链表，然后反复步进
 直到它在 fd 上 park 或结束；结束的任务当场 `__c6_co_destroy`，以 `err`
-结束的只把计数留给下一次 `__c6_co_run()`。`task` 的清理登记复用
-`__tcc_defer_push`，因此和手写 `defer { __c6_co_destroy(t); }` 等价。
+结束的只把计数留给下一次 `__c6_co_run()`。`task` 的清理
+登记就是一个编译器合成的清理点（同 8.2），因此和手写
+`defer { __c6_co_destroy(t); }` 等价。
 
 **R18 — 元组类型与元素访问**
 
@@ -1847,7 +1898,7 @@ int main(void)
 | `interface` | `c6_interface_parse`、`c6_auto_impl_ensure` / `c6_check_method` / `c6_emit_auto_impls` / `c6_iface_convert` | `tcc/tccgen.c` |
 | 每 TU 状态复位 | `c6_tu_reset`（在 `tccgen_compile` 开头调用） | `tcc/tccgen.c` |
 | `test` | `c6_test_parse`、`tcc_run_tests` | `tcc/tccgen.c`、`tcc/tccrun.c` |
-| `defer` / `errdefer` | `c6_defer_parse`、`c6_defer_begin`、`c6_defer_func_end` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `defer` / `errdefer` | `c6_defer_parse`、`c6_defer_begin`、`c6_defer_func_end`（运行期状态在函数帧里，见 8.2；`libtcc1` 里没有 defer 运行时） | `tcc/tccgen.c` |
 | `err` | `c6_err_parse` / `c6_emit_propagate` | `tcc/tccgen.c` |
 | `co` | `c6_co_parse`、`__tcc_co_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
 | `thread` | `c6_thread_decl`、`__tcc_th_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
@@ -1883,7 +1934,7 @@ int main(void)
 | `@T` / `shared @T` / `weak @T` / `own @T` 限定符 | `parse_btype()` 的 `@` 前缀 + `c6_gc_qual()`（软关键字 `weak`/`own`/`shared`）、`CType.gq` 缓存 + pointee 上的可信副本、`c6_type_gq` / `c6_is_managed` / `c6_gc_plain` / `c6_gc_mode` | `tcc/tccgen.c`、`tcc/tcc.h` |
 | `new T` / `new T[n]` / `new shared T` | `c6_gc_new_expr()`（`unary()` 的 `c6_gc_new_lead()` 分支）→ `__c6_gc_new(size, count, desc, flags)` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
 | 托管槽的存/取 | `c6_gc_store_hook()`（`vstore()` 里）→ `__c6_gc_store` / `__c6_gc_own_store` / `__c6_gc_weak_store` | 同上 |
-| 作用域退出 / `return` / `break` / 跳转 | `c6_gc_site()`（复用 defer 记录）+ `__c6_gc_release(slot, mode)` | 同上 |
+| 作用域退出 / `return` / `break` / 跳转 | `c6_gc_site()`（合成一个清理点）+ `__c6_gc_release(slot, mode)` | 同上 |
 | `p = NULL` 提前放手 | 同一次 `__c6_gc_store` 调用（旧值释放、槽清零） | 同上 |
 | `move(p)` | `c6_gc_move_expr()`（`unary()` 的 `c6_gc_move_lead()` 分支）→ `__c6_gc_move(slot)` | 同上 |
 | `move(p)` 之后、重新赋值之前用 `p` | 编译期诊断 E-GC17（不生成代码）：标记在 `Sym.gc_moved`，`unary()` 的标识符分支调 `c6_gc_moved_use()`；赋值清标记在 `c6_gc_store_hook()`；分支合并 `c6_move_snap` / `c6_move_restore` / `c6_move_merge` / `c6_move_branch_end`（`block()` 的 `if`/`while`/`for`/`switch`、`c6_foreach_parse`），`defer`/`errdefer` 体与 `catch` 体各用一次快照隔离（`c6_defer_parse()` / `c6_catch_parse()`） | 同上 |
