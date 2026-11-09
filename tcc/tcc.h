@@ -607,6 +607,7 @@ typedef struct Sym {
         struct Sym *cleanup_label; /* label in 'pending_gotos' chain */
     };
     int defer_depth; /* c6: lexical depth of a defined label */
+    int gc_moved; /* c6: a managed slot handed away by 'move', not yet reassigned */
 } Sym;
 
 /* section definition */

@@ -169,7 +169,12 @@ int main(void)
         r->parent = root;
         root->left = move(l);     /* own 只收 new 或 move()；交出后 l 是空槽 */
         root->right = move(r);
-        check(l == NULL && r == NULL, "move() 之后源槽为空");
+        /* 交出之后源槽不能读也不能传（编译期 E-GC17），
+           要重新赋值才能再用 */
+        l = new Node;
+        l->v = 4;
+        check(l->v == 4, "重新赋值之后源槽可以再用");
+        l = NULL;
         check(root->left->v == 2 && root->right->v == 3, "子树接上了");
 
         {
