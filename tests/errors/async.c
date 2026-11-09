@@ -21,6 +21,8 @@
 // EXPECT test_task_init: error: the initializer of a 'task' variable must be a call of an 'async' function
 // EXPECT test_task_no_init: error: '=' expected
 // EXPECT test_async_method: error: 'async' functions cannot be methods
+// EXPECT test_vla_local: error: a variable length array cannot be declared in an 'async' function
+// EXPECT test_alloca_call: error: 'alloca' cannot be used in an 'async' function
 
 #if defined test_outside
 /* await 只能出现在 async 函数里 */
@@ -197,6 +199,31 @@ struct conn
 async int read_from(struct conn *c)
 {
     return c->fd;
+}
+int main(void)
+{
+    return 0;
+}
+#elif defined test_vla_local
+/* 变长数组分配在栈上：挂起之后那段栈已经不归这个 body 了 */
+async int f(int n)
+{
+    char buf[n + 1];
+    buf[0] = 1;
+    return buf[0];
+}
+int main(void)
+{
+    return 0;
+}
+#elif defined test_alloca_call
+/* alloca 同理：恢复时栈指针回到序言的位置 */
+void *alloca(unsigned long size);
+async int f(int n)
+{
+    char *p = (char *)alloca(n + 1);
+    p[0] = 1;
+    return p[0];
 }
 int main(void)
 {

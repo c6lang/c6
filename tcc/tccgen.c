@@ -7963,6 +7963,14 @@ special_math_val:
 
             next();
             vcheck_cmp(); /* the generators don't like VT_CMP on vtop */
+#ifdef C6_EXT
+            /* same reason as a VLA: alloca() lowers the stack pointer, and a
+               resumed body runs with the prolog's stack pointer again */
+            if (c6_async_in_body && (vtop[-nb_args].r & VT_SYM)
+                && vtop[-nb_args].sym->v == TOK_alloca)
+                tcc_error("'alloca' cannot be used in an 'async' function: "
+                          "it would not survive a suspension");
+#endif
             gfunc_call(nb_args);
 
             if (ret_nregs < 0) {
@@ -13677,6 +13685,15 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 
         if (has_init)
             tcc_error("variable length array cannot be initialized");
+#ifdef C6_EXT
+        /* An async body resumes with the stack pointer back where the prolog
+           left it, so the memory a VLA (or alloca) handed out belongs to
+           whatever runs next, and the back ends whose epilog pops from the
+           stack would pop from there.  Neither can survive a suspension. */
+        if (c6_async_in_body)
+            tcc_error("a variable length array cannot be declared in an "
+                      "'async' function: it would not survive a suspension");
+#endif
 
         if (NODATA_WANTED)
             goto no_alloc;
