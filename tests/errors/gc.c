@@ -9,7 +9,7 @@ struct Other { int v; };
 struct Holder { @Node n; };
 static void take(struct Holder h) { (void)h; }
 
-// EXPECT adopt_pointer: error: cannot assign a 'struct Node *' to '@struct Node': a managed reference is only made by 'new', by another managed reference or by the empty value
+// EXPECT adopt_pointer: error: cannot assign a 'struct Node *' to '@struct Node': a managed reference is only made by 'new', by another managed reference, by '@f".."' or by the empty value
 // EXPECT own_from_borrow: error: 'own @struct Node' takes ownership: only a fresh reference ('new') or the empty value can be stored in it
 // EXPECT compound_assign: error: '+=' is not supported for a managed reference
 // EXPECT weak_deref: error: cannot use a 'weak @struct Node' directly: upgrade it first ('@T q = w;')

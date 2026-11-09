@@ -374,6 +374,7 @@ static int c6_gc_new_lead(void);
 static void c6_gc_new_expr(void);
 static int c6_gc_move_lead(void);
 static void c6_gc_move_expr(void);
+static void c6_fstr_expr(int managed);
 static void c6_gc_return_hook(void);
 static void c6_gc_discard_hook(void);
 static void c6_gc_site(int off, CType *type);
@@ -7032,6 +7033,20 @@ ST_FUNC void unary(void)
         ad.section = rodata_section;
         decl_initializer_alloc(&type, &ad, VT_CONST, 2, 0, 0);
         break;
+#ifdef C6_EXT
+    case TOK_C6_FSTR_BEG:
+        c6_fstr_expr(0);                /* f"..": the borrowed text */
+        break;
+    case '@':
+        /* '@f".."': one managed object instead of the borrowed text */
+        if (!c6_ext_on())
+            goto tok_identifier;
+        next();
+        if (tok != TOK_C6_FSTR_BEG)
+            tcc_error("'@' needs an f-string here");
+        c6_fstr_expr(1);
+        break;
+#endif
     case TOK_SOTYPE:
     case '(':
         t = tok;
@@ -11560,8 +11575,10 @@ static void c6_err_parse(void)
     skip('(');
     if (tok == ')')
         tcc_error("'err' requires an error id and a message");
-    /* __tcc_err_set(id, msg) */
-    vpush_helper_func(tok_alloc_const("__tcc_err_set"));
+    /* __tcc_err_set_copy(id, msg): the runtime keeps a copy, because MSG is
+       usually a slice of this frame (an f-string, a local buffer, a
+       parameter) and the frame is gone when the handler reads it */
+    vpush_helper_func(tok_alloc_const("__tcc_err_set_copy"));
     expr_eq();
     skip(',');
     expr_eq();
@@ -13858,6 +13875,209 @@ static void c6_rt_end(const char *name, int nargs)
     }
 }
 
+#ifdef C6_EXT
+/* ---- f"..{expr}..": lowering ------------------------------------------ *
+   The lexer leaves the parts of one f-string in the token stream, in the
+   order they are written:
+       TOK_C6_FSTR_BEG  TOK_STR ','  (TOK_C6_FSTR_EXPR <tokens>
+                                      TOK_C6_FSTR_EXPR_END)*  TOK_C6_FSTR_END
+   Every part becomes one runtime call, emitted as it is parsed: side effects
+   run left to right and no temporary is needed, because the runtime keeps
+   one builder per thread and nesting depth (__c6_fmt_beg()).  The last call
+   hands back either the borrowed text of that depth -- 'f".."' is a
+   'char *' -- or one managed object ('@f".."'). */
+
+/* one literal piece of an f-string, as a named static object: a backend
+   resolves a named object by name, while an anonymous section symbol would
+   have to be tracked by ELF index across translation units.  The ',' that
+   follows the TOK_STR in the stream is skipped here. */
+static void c6_fstr_lit(void)
+{
+    static int lit_num = 0;
+    CType st = {0}, pt = {0};
+    AttributeDef ad = {0};
+    Sym *sym = 0;
+    char name[64] = {0};
+    int len = tokc.str.size - 1, v = 0, off = 0;
+
+    snprintf(name, sizeof name, "__c6_fstr_%d", ++lit_num);
+    v = tok_alloc_const(name);
+    st.t = char_type.t;
+    mk_pointer(&st);
+    st.t |= VT_ARRAY | VT_STATIC;
+    ad.section = rodata_section;
+    decl_initializer_alloc(&st, &ad, VT_CONST, 2, v, 0);
+    sym = sym_find(v);
+    if (!sym)
+        tcc_error("internal: the text of an f-string is missing");
+    /* the address of the text goes to a stack slot of its own: the call
+       below then takes a plain value, not a symbol, as its first argument */
+    vpushsym(&st, sym);
+    gaddrof();
+    pt.t = char_type.t;
+    mk_pointer(&pt);
+    loc -= PTR_SIZE;
+    off = loc;
+    vset(&pt, VT_LOCAL | VT_LVAL, off);
+    vswap();
+    vstore();
+    vpop();
+    c6_rt_begin("__c6_fmt_l");
+    vset(&pt, VT_LOCAL | VT_LVAL, off);
+    vpushi(len);
+    c6_rt_end("__c6_fmt_l", 2);
+    if (tok == ',')
+        next();
+}
+
+/* one '..{expr}..' part: VTOP holds the value, and this picks the runtime
+   call that prints it */
+static void c6_fstr_piece(void)
+{
+    CType *t = &vtop->type, elem = {0};
+    SValue sv = {0};
+    int bt = t->t & VT_BTYPE, managed = 0, uns = 0;
+
+    if (bt == VT_BOOL) {
+        CType c = {0};
+        c.t = VT_INT;
+        gen_cast(&c);
+        sv = *vtop;
+        vpop();
+        c6_rt_begin("__c6_fmt_b");
+        vpushv(&sv);
+        c6_rt_end("__c6_fmt_b", 1);
+        return;
+    }
+    if (bt == VT_BYTE) {
+        /* a 'char' is a character, not a small number: use '(int)c' for
+           the numeric value */
+        CType c = {0};
+        c.t = VT_INT;
+        gen_cast(&c);
+        sv = *vtop;
+        vpop();
+        c6_rt_begin("__c6_fmt_ch");
+        vpushv(&sv);
+        c6_rt_end("__c6_fmt_ch", 1);
+        return;
+    }
+    if (bt == VT_SHORT || bt == VT_INT || bt == VT_LLONG || IS_ENUM(t->t)) {
+        CType c = {0};
+        uns = (t->t & VT_UNSIGNED) != 0;
+        c.t = uns ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+        gen_cast(&c);
+        sv = *vtop;
+        vpop();
+        c6_rt_begin(uns ? "__c6_fmt_u" : "__c6_fmt_i");
+        vpushv(&sv);
+        c6_rt_end(uns ? "__c6_fmt_u" : "__c6_fmt_i", 1);
+        return;
+    }
+    if (bt == VT_ARRAY && pointed_type(t)
+        && (pointed_type(t)->t & VT_BTYPE) == VT_BYTE) {
+        mk_pointer(t);                  /* a 'char[]' decays to a C string */
+        bt = VT_PTR;
+    }
+    if (bt == VT_PTR) {
+        elem = *pointed_type(t);
+        managed = c6_is_managed(t);
+        if ((elem.t & VT_BTYPE) == VT_BYTE) {
+            sv = *vtop;
+            vpop();
+            if (managed) {
+                /* a managed character buffer knows its length: the text and
+                   its address first, then the length on top of them */
+                c6_rt_begin("__c6_fmt_s");
+                vpushv(&sv);
+                c6_rt_begin("__c6_str_len");
+                vpushv(&sv);
+                c6_rt_end("__c6_str_len", 1);
+                c6_rt_end("__c6_fmt_s", 2);
+            } else {
+                c6_rt_begin("__c6_fmt_c");
+                vpushv(&sv);
+                c6_rt_end("__c6_fmt_c", 1);
+            }
+            return;
+        }
+        sv = *vtop;                     /* any other pointer: the address */
+        vpop();
+        c6_rt_begin("__c6_fmt_p");
+        vpushv(&sv);
+        c6_rt_end("__c6_fmt_p", 1);
+        return;
+    }
+    if (bt == VT_STRUCT && c6_slice_of_type(t)) {
+        /* a character slice is text: the runtime reads the '{data, len}'
+           pair by address */
+        C6Slice *sl = c6_slice_of_type(t);
+        int off = 0;
+        if ((sl->elem.t & VT_BTYPE) != VT_BYTE) {
+            char b[160] = {0};
+            type_to_str(b, sizeof b, t, NULL);
+            tcc_error("cannot interpolate '%s': only a character slice "
+                      "holds text", b);
+        }
+        off = c6_slice_spill(sl);
+        c6_rt_begin("__c6_fmt_sl");
+        c6_slice_push_addr(off);
+        c6_rt_end("__c6_fmt_sl", 1);
+        return;
+    }
+    {
+        char b[160] = {0};
+        type_to_str(b, sizeof b, t, NULL);
+        tcc_error("cannot interpolate a value of type '%s'", b);
+    }
+}
+
+/* lower one f-string.  MANAGED: '@f".."', so the result is one managed
+   object; its count is atomic, so it can go into a 'shared @char' as well. */
+static void c6_fstr_expr(int managed)
+{
+    CType rt = {0};
+    int flags = 0;
+
+    if (CONST_WANTED && !NOEVAL_WANTED)
+        tcc_error("an f-string is not a constant expression");
+    if (managed)
+        flags = C6_GCM_FRESH | C6_GCM_ATOMIC;
+    c6_rt_begin("__c6_fmt_beg");
+    c6_rt_end("__c6_fmt_beg", 0);
+    next();                             /* past TOK_C6_FSTR_BEG */
+    for (;;) {
+        if (tok == TOK_C6_FSTR_EXPR) {
+            next();
+            gexpr();
+            if (tok != TOK_C6_FSTR_EXPR_END)
+                expect("'}'");
+            next();
+            c6_fstr_piece();
+        } else if (tok == TOK_STR) {
+            c6_fstr_lit();
+        } else {
+            break;
+        }
+    }
+    if (tok != TOK_C6_FSTR_END)
+        expect("end of the f-string");
+    next();
+    c6_rt_begin("__c6_fmt_end");
+    vpushi(flags);
+    c6_rt_end("__c6_fmt_end", 1);
+    rt.t = char_type.t;
+    mk_pointer(&rt);
+    if (managed) {
+        rt.gq = C6_GQ_MANAGED;
+        rt.ref->type.gq = rt.gq;
+        vtop->gc_state = C6_GC_FRESH;
+        vtop->gc_atomic = 1;
+    }
+    vtop->type = rt;
+}
+#endif
+
 /* Register a cleanup site whose body is one runtime call.  It runs on every
    exit of the function, and -- being a cleanup -- it runs before the return
    value is put back into the return registers, so a call emitted here cannot
@@ -15997,8 +16217,8 @@ static int c6_gc_store_hook(void)
         type_to_str(b1, sizeof b1, &vtop->type, NULL);
         type_to_str(b2, sizeof b2, dt, NULL);
         tcc_error("cannot assign a '%s' to '%s': a managed reference is "
-                  "only made by 'new', by another managed reference or by "
-                  "the empty value", b1, b2);
+                  "only made by 'new', by another managed reference, by "
+                  "'@f\"..\"' or by the empty value", b1, b2);
     }
     mode = c6_gc_mode(dt);
     if (vtop->gc_state == C6_GC_FRESH)
