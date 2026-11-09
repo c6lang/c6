@@ -1,0 +1,63 @@
+/* C99 输出后端：通过函数指针调用返回结构体的函数。
+ *
+ * 后端在 `gfunc_call()` 里按 `gfunc_sret()` 区分两种返回方式：
+ *   - 小结构体（≤ 8 字节、整数类）：直接装在返回寄存器里，函数实际返回
+ *     `long long`，没有隐藏参数；
+ *   - 大结构体：多一个隐藏的首参数（返回槽地址），函数返回 `void`。
+ * 间接调用要把被调值的地址转成函数指针类型再调用，而这个强制类型过去
+ * 只按“返回类型是结构体”就加隐藏指针，于是小结构体的间接调用少传一个
+ * 实参、返回类型也成了 `void`（gcc 报 `makes pointer from integer` 或
+ * `too few arguments`，`-Werror` 下直接失败）。修好之后两条路径都必须与
+ * 直接调用一致。
+ *
+ * 运行（仓库根目录）：
+ *   make c99test
+ */
+
+// EXIT 0
+// OUTPUT small: 3 4
+// OUTPUT big: 4 5 6 7
+
+#include <stdio.h>
+
+struct P { int x, y; };                     /* 8 字节：寄存器返回 */
+struct Big { int a, b, c, d; };             /* 16 字节：隐藏返回槽 */
+
+static struct P small(int v)
+{
+    struct P p = { v, v + 1 };
+
+    return p;
+}
+
+static struct Big big(int v)
+{
+    struct Big b = { v, v + 1, v + 2, v + 3 };
+
+    return b;
+}
+
+/* 文件作用域的指针：编译期就带类型 */
+static struct Big (*big_global)(int) = big;
+
+int main(void)
+{
+    struct P (*fp)(int) = small;            /* 小结构体：寄存器返回 */
+    struct Big (*bp)(int) = big;            /* 大结构体：隐藏返回槽 */
+    struct P p = fp(3);
+    struct Big b = bp(4);
+    struct Big c = big_global(5);
+
+    printf("small: %d %d\n", p.x, p.y);
+    printf("big: %d %d %d %d\n", b.a, b.b, b.c, b.d);
+    if (p.x != 3 || p.y != 4)
+        return 1;
+    if (b.a != 4 || b.b != 5 || b.c != 6 || b.d != 7)
+        return 2;
+    if (c.a != 5 || c.d != 8)
+        return 3;
+    bp(6);                                  /* 返回值丢弃 */
+    if (fp(7).y != 8)                       /* 直接取成员的间接调用 */
+        return 4;
+    return 0;
+}
