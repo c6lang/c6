@@ -22,8 +22,10 @@
 - 运行期环回收（只有 `c6_graph` 豁免类型才可能需要，见 §8.4，留 P3 之后）。
 - 自定义分配器 / 自定义删除器（`drop` 不是删除器：内存永远由运行时 `free`）。
 - 值语义的托管结构体（含托管字段的结构体**不能**按值拷贝）。
-- 捕获式闭包：函数字面量 V1 只做无捕获的裸函数指针，机制兼容（env 就是一个
-  托管对象），捕获分析是独立工作量，见 [closure-design.md](closure-design.md)。
+- 捕获式闭包：函数字面量 V1 只做无捕获的裸函数指针。V2 的捕获式闭包设计已
+  定稿（`closure` 是托管引用，env 是一个 `@struct`，环检测走签名级保守边），
+  但尚未实现；见 [closure-design.md](closure-design.md) 与
+  [closure-todo.md](closure-todo.md)。
 
 ---
 
