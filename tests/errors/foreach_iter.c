@@ -1,0 +1,233 @@
+/* c6 编译期诊断：'foreach |v| it { ... }' 迭代器协议
+ *
+ * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
+ * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
+ * 不带任何 -D 时是本文件的“正常路径”，必须编译通过并运行成功。
+ */
+struct Good { int n; };
+int has(struct Good *s) { return s->n > 0; }
+int next(struct Good *s) { return s->n--; }
+
+struct OnlyHas { int n; };
+int has(struct OnlyHas *s) { return s->n > 0; }
+
+struct Shadow { int has; int n; };
+int has(struct Shadow *s) { return s->n > 0; }
+int next(struct Shadow *s) { return s->n--; }
+
+struct HasVoid { int n; };
+void has(struct HasVoid *s) { (void)s; }
+int next(struct HasVoid *s) { return s->n--; }
+
+struct HasStruct { int n; };
+struct HasStruct has(struct HasStruct *s) { return *s; }
+int next(struct HasStruct *s) { return s->n--; }
+
+struct HasExtra { int n; };
+int has(struct HasExtra *s, int x) { return s->n > x; }
+int next(struct HasExtra *s) { return s->n--; }
+
+struct NextVoid { int n; };
+int has(struct NextVoid *s) { return s->n > 0; }
+void next(struct NextVoid *s) { (void)s; }
+
+struct NextVoidPtr { int n; };
+int has(struct NextVoidPtr *s) { return s->n > 0; }
+void *next(struct NextVoidPtr *s) { return s; }
+
+struct NextExtra { int n; };
+int has(struct NextExtra *s) { return s->n > 0; }
+int next(struct NextExtra *s, int x) { return s->n-- + x; }
+
+typedef int Arr2[2];
+struct NextArr { int n; };
+int has(struct NextArr *s) { return s->n > 0; }
+Arr2 next(struct NextArr *s);
+
+struct Inc;
+struct NextInc { int n; };
+int has(struct NextInc *s) { return s->n > 0; }
+struct Inc next(struct NextInc *s);
+
+interface OnlyHasI { int has(); }
+interface VoidPtrI { int has(); void *next(); }
+
+// EXPECT test_two_binders: error: an iterator yields only a value: write 'foreach |v| it'
+// EXPECT test_only_has: error: cannot iterate over 'struct OnlyHas' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(); E next();')
+// EXPECT test_shadow: error: cannot iterate over 'struct Shadow' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(); E next();')
+// EXPECT test_has_void: error: iterator method 'has' must return an integer type (got 'void')
+// EXPECT test_has_struct: error: iterator method 'has' must return an integer type (got 'struct HasStruct')
+// EXPECT test_has_extra: error: iterator method 'has' must take only the receiver
+// EXPECT test_next_void: error: iterator method 'next' must return a value (got 'void')
+// EXPECT test_next_voidptr: error: iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)
+// EXPECT test_next_extra: error: iterator method 'next' must take only the receiver
+// EXPECT test_next_array: error: 'foreach' cannot copy an element of type 'int [2]'
+// EXPECT test_next_incomplete: error: cannot iterate over incomplete element type 'struct Inc'
+// EXPECT test_interface_voidptr: error: iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)
+// EXPECT test_pointer_to_array: error: cannot iterate over 'struct Good (*)[2]' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
+// EXPECT test_file_scope: error: 'foreach' can only be used inside a function
+
+#if defined test_two_binders
+int main(void)
+{
+    struct Good g = {2};
+    foreach |i, v| g {
+        g.n = i + v;
+    }
+    return g.n;
+}
+#elif defined test_only_has
+int main(void)
+{
+    struct OnlyHas x = {2};
+    foreach |v| x {
+        x.n = v;
+    }
+    return x.n;
+}
+#elif defined test_shadow
+int main(void)
+{
+    struct Shadow x = {0};
+    x.n = 2;
+    foreach |v| x {
+        x.has = v;
+    }
+    return x.has;
+}
+#elif defined test_has_void
+int main(void)
+{
+    struct HasVoid x = {2};
+    foreach |v| x {
+        x.n = v;
+    }
+    return x.n;
+}
+#elif defined test_has_struct
+int main(void)
+{
+    struct HasStruct x = {2};
+    foreach |v| x {
+        x.n = v;
+    }
+    return x.n;
+}
+#elif defined test_has_extra
+int main(void)
+{
+    struct HasExtra x = {2};
+    foreach |v| x {
+        x.n = v;
+    }
+    return x.n;
+}
+#elif defined test_next_void
+int main(void)
+{
+    struct NextVoid x = {2};
+    foreach |v| x {
+        x.n = 1;
+    }
+    return x.n;
+}
+#elif defined test_next_voidptr
+int main(void)
+{
+    struct NextVoidPtr x = {2};
+    foreach |v| x {
+        x.n = 1;
+    }
+    return x.n;
+}
+#elif defined test_next_extra
+int main(void)
+{
+    struct NextExtra x = {2};
+    foreach |v| x {
+        x.n = v;
+    }
+    return x.n;
+}
+#elif defined test_next_array
+int main(void)
+{
+    struct NextArr x = {2};
+    foreach |v| x {
+        x.n = 1;
+    }
+    return x.n;
+}
+#elif defined test_next_incomplete
+int main(void)
+{
+    struct NextInc x = {2};
+    foreach |v| x {
+        x.n = 1;
+    }
+    return x.n;
+}
+#elif defined test_interface_voidptr
+static int sum(VoidPtrI it)
+{
+    int total = 0;
+    foreach |v| it {
+        total += 1;
+    }
+    return total;
+}
+int main(void)
+{
+    struct NextVoidPtr x = {2};
+    return sum(x);
+}
+#elif defined test_pointer_to_array
+int main(void)
+{
+    struct Good ga[2] = {{1}, {2}};
+    struct Good (*gp)[2] = &ga;
+    foreach |v| gp {
+        return v.n;
+    }
+    return 0;
+}
+#elif defined test_file_scope
+struct Good g = {2};
+foreach |v| g {
+    g.n = v;
+}
+#else
+/* 正常路径：值形态、指针形态、接口值各走一遍 */
+interface IntIter { int has(); int next(); }
+
+static int sum_iter(IntIter it)
+{
+    int total = 0;
+    foreach |v| it {
+        total += v;
+    }
+    return total;
+}
+
+int main(void)
+{
+    struct Good g = {3};
+    int total = 0;
+    foreach |v| g {
+        total += v;
+    }
+    if (total != 6)
+        return 1;
+    foreach |v| &g {
+        total += v;
+    }
+    if (total != 12 || g.n != 0)
+        return 2;
+    {
+        struct Good h = {2};
+        if (sum_iter(h) != 3 || h.n != 0)
+            return 3;
+    }
+    return 0;
+}
+#endif
