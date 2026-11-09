@@ -874,7 +874,8 @@ flags                  = { "-" | "0" | "+" | "#" } ;
 width                  = digit , { digit } ;      (* <= 1023 *)
 precision              = digit , { digit } ;      (* <= 1023 *)
 conv                   = "d" | "i" | "u" | "x" | "X" | "o" | "b"
-                       | "c" | "s" | "p" ;
+                       | "c" | "s" | "p"
+                       | "f" | "F" | "e" | "E" | "g" | "G" ;
 ```
 
 ```
@@ -906,7 +907,13 @@ conv                   = "d" | "i" | "u" | "x" | "X" | "o" | "b"
     符号，`c` 取低字节当字符，`s` 把值当文本，`p` 当指针（默认带 `0x`）；
   - 能用的 conv 由静态类型决定（C89）：整数/`enum`/`_Bool`/`char` 接受
     `d i u x X o b c s`（`_Bool` 用 `s` 时是 `true`/`false`），文本只接受
-    `s`，指针只接受 `p x X`；
+    `s`，指针只接受 `p x X`，浮点只接受 `f F e E g G`；
+  - 浮点：默认是 `g`；`f` 定点（默认 6 位小数）、`e` 科学计数法
+    （`1.234568e+06`）、`g` 取两者里较短的那种并去掉结尾的零；
+    `.precision` 对 `f`/`e` 是小数位数、对 `g` 是有效数字位数；数字由运行时
+    自己算（libtcc1 没有 libc），常见范围精确，需要全部 17 位有效数字时最后
+    一位可能不同；舍入是四舍五入（不是 printf 的四舍六入五成双）；
+    `|v| >= 1e19` 用科学计数法；`long double` 按 `double` 打印；
 * `f".."` 的结果是**借用**：同一个嵌套深度只有一块结果缓冲，同一个完整表达式
   里的两个 `f".."` 会互相覆盖；要同时活着就写 `@f".."`。
 
@@ -1027,7 +1034,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
 | C82 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
 | C83 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
-| C84 | f-string 的插值只接受整数、`enum`、`_Bool`、`char`、指针、字符切片和托管 `@char`；切片必须是字符切片 | `cannot interpolate a value of type 'double'`；`cannot interpolate 'int[:]': only a character slice holds text` |
+| C84 | f-string 的插值只接受整数、`enum`、`_Bool`、`char`、浮点、指针、字符切片和托管 `@char`；切片必须是字符切片 | `cannot interpolate a value of type 'struct S'`；`cannot interpolate 'int[:]': only a character slice holds text` |
 | C85 | `f".."` / `@f".."` 不是常量表达式，不能出现在文件作用域或 `static` 局部的初始化式里 | `an f-string is not a constant expression` |
 | C86 | f-string 里的 `{` 必须有配对的 `}`，且 `{}` 里要有一个表达式 | `f-string: missing '}' in ".."`；`f-string: '{}' needs an expression` |
 | C87 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
@@ -1554,6 +1561,7 @@ body 直接 `return` 回到驱动方；恢复时把它们取回来，再跳到�
 | 托管 `@char` | `__c6_fmt_s(p, __c6_str_len(p), spec)` |
 | 其它指针 | `__c6_fmt_p((const void *)x, spec)` |
 | 字符切片 | `__c6_fmt_sl(&x, spec)` |
+| `float` / `double` / `long double` | `__c6_fmt_f((double)x, spec)` |
 
 `spec` 是格式说明的位编码（宽度 10 位、精度 10 位、conv 4 位、flags 5 位），
 由编译器在编译期解析好；没有写说明时是 0，运行时的默认行为就是上一节
@@ -1796,7 +1804,9 @@ int main(void)
 | 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | 声明能过，但结构体→接口的转换点会报 `'{' expected (got ';')`——接口方法目前只支持标量签名，这是元组之前就有的缺口（与约束 C51–C60 无关） |
 | `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
-| `f"{x}"` 而 `x` 是浮点、结构体、函数（`f"{printf}"`）、非字符切片 | 约束 C84：没有格式化语法，先自己格式化再插进来；函数**指针**变量按普通指针输出地址 |
+| `f"{x}"` 而 `x` 是结构体、函数本身（`f"{main}"`）、非字符切片 | 约束 C84：结构体和函数不能插值；函数**指针**变量按普通指针输出地址 |
+| `f"{x;x}"` 而 `x` 是浮点 / `f"{n;f}"` 而 `n` 是整数 | 约束 C89：浮点只收 `f F e E g G`，整数没有 `f` |
+| 希望浮点输出与 `printf` 逐位一致 | 运行时自己算数字：常见范围精确，17 位有效数字的最后一位、以及「五成双」的舍入可能与 libc 不同；`\|v\| >= 1e19` 用科学计数法 |
 | `f"{(try g())}"` / `f"{(a;b)}"` | 约束 C88：插值里不能传播错误，`;` 只能用来引入格式说明 |
 | `f"{n;z}"` / `f"{s;x}"` / `f"{n;2000d}"` / `f"{n;}"` | 约束 C89：格式说明要合法且与类型相容 |
 | `#define M(n) f"x{n}"` 里的 `{n}` | 宏形参在插值里不展开：先落成变量，或不用宏 |

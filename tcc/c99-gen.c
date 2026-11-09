@@ -820,7 +820,7 @@ static const char * const c99_runtime_names[] = {
     /* f"..{expr}.." builder */
     "__c6_fmt_beg", "__c6_fmt_l", "__c6_fmt_s", "__c6_fmt_c", "__c6_fmt_ch",
     "__c6_fmt_sl",
-    "__c6_fmt_i", "__c6_fmt_u", "__c6_fmt_p", "__c6_fmt_b", "__c6_fmt_end",
+    "__c6_fmt_i", "__c6_fmt_u", "__c6_fmt_p", "__c6_fmt_b", "__c6_fmt_f", "__c6_fmt_end",
     "__c6_str_len",
     "__tcc_slice_index", "__tcc_slice_sub", "__tcc_iface_init",
     "__tcc_co_spawn", "__tcc_sp_args", "__tcc_th_start",

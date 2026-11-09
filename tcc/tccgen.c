@@ -13987,6 +13987,10 @@ static void c6_fstr_lit(void)
 #define C6_CONV_C    7
 #define C6_CONV_S    8
 #define C6_CONV_P    9
+#define C6_CONV_F    10
+#define C6_CONV_E    11
+#define C6_CONV_G    12
+#define C6_SPEC_UPPER (1 << 29)         /* 'F' 'E' 'G' */
 
 /* parse the text of a spec; SAVE (made by the caller) gets a copy for
    diagnostics, since tokc is gone after the next next() */
@@ -14035,6 +14039,18 @@ static int c6_fstr_spec_parse(const char *text, int len)
         case 'c': bits |= C6_CONV_C << C6_SPEC_CONV_SHIFT; break;
         case 's': bits |= C6_CONV_S << C6_SPEC_CONV_SHIFT; break;
         case 'p': bits |= C6_CONV_P << C6_SPEC_CONV_SHIFT; break;
+        case 'f': bits |= C6_CONV_F << C6_SPEC_CONV_SHIFT; break;
+        case 'F':
+            bits |= (C6_CONV_F << C6_SPEC_CONV_SHIFT) | C6_SPEC_UPPER;
+            break;
+        case 'e': bits |= C6_CONV_E << C6_SPEC_CONV_SHIFT; break;
+        case 'E':
+            bits |= (C6_CONV_E << C6_SPEC_CONV_SHIFT) | C6_SPEC_UPPER;
+            break;
+        case 'g': bits |= C6_CONV_G << C6_SPEC_CONV_SHIFT; break;
+        case 'G':
+            bits |= (C6_CONV_G << C6_SPEC_CONV_SHIFT) | C6_SPEC_UPPER;
+            break;
         default:
             tcc_error("f-string: unknown conversion '%c' in a format spec",
                       text[i]);
@@ -14075,6 +14091,10 @@ static void c6_fstr_spec_check(int bits, CType *t, int kind)
         ok = conv == C6_CONV_NONE || conv == C6_CONV_P
             || conv == C6_CONV_XL || conv == C6_CONV_XU;
         break;
+    case 4:                             /* float / double */
+        ok = conv == C6_CONV_NONE || conv == C6_CONV_F
+            || conv == C6_CONV_E || conv == C6_CONV_G;
+        break;
     default:
         break;
     }
@@ -14085,7 +14105,9 @@ static void c6_fstr_spec_check(int bits, CType *t, int kind)
                   conv == C6_CONV_S ? 's' : conv == C6_CONV_C ? 'c'
                   : conv == C6_CONV_P ? 'p' : conv == C6_CONV_D ? 'd'
                   : conv == C6_CONV_U ? 'u' : conv == C6_CONV_XL ? 'x'
-                  : conv == C6_CONV_XU ? 'X' : conv == C6_CONV_O ? 'o' : 'b');
+                  : conv == C6_CONV_XU ? 'X' : conv == C6_CONV_O ? 'o'
+                  : conv == C6_CONV_B ? 'b' : conv == C6_CONV_F ? 'f'
+                  : conv == C6_CONV_E ? 'e' : 'g');
     }
 }
 
@@ -14135,6 +14157,21 @@ static void c6_fstr_piece(int spec)
         vpushv(&sv);
         vpushi(spec);
         c6_rt_end(uns ? "__c6_fmt_u" : "__c6_fmt_i", 2);
+        return;
+    }
+    if (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE) {
+        /* a floating point value: the runtime formats the digits, the spec
+           picks 'f' (fixed), 'e' (scientific) or 'g' (shortest) */
+        CType c = {0};
+        c.t = VT_DOUBLE;
+        c6_fstr_spec_check(spec, t, 4);
+        gen_cast(&c);
+        sv = *vtop;
+        vpop();
+        c6_rt_begin("__c6_fmt_f");
+        vpushv(&sv);
+        vpushi(spec);
+        c6_rt_end("__c6_fmt_f", 2);
         return;
     }
     if (bt == VT_ARRAY && pointed_type(t)
