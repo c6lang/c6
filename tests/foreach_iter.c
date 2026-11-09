@@ -131,6 +131,71 @@ int next(struct Ticks *s)
     return s->n--;
 }
 
+/* ---- union：和 struct 同一条协议路径 ---- */
+
+union UCount { int n; };
+
+int has(union UCount *s)
+{
+    return s->n > 0;
+}
+
+int next(union UCount *s)
+{
+    return s->n--;
+}
+
+/* ---- 跨 TU：方法定义放在 tests/tu/foreach_iter.c ---- */
+
+struct CrossIt { int n; };
+int has(struct CrossIt *s);
+int next(struct CrossIt *s);
+
+/* ---- 托管引用：隐藏槽要像声明的局部量一样初始化并释放 ---- */
+
+struct MNode { int v; };
+struct MIt { int i; };
+
+int has(struct MIt *s)
+{
+    return s->i < 2;
+}
+
+@MNode next(struct MIt *s)
+{
+    @MNode p = new MNode;
+    p->v = s->i++;
+    return p;
+}
+
+struct MCount { int n; };
+
+int has(struct MCount *s)
+{
+    return s->n > 0;
+}
+
+int next(struct MCount *s)
+{
+    return s->n--;
+}
+
+static int sum_borrow(@MCount p)
+{
+    int total = 0;
+    foreach |v| p {
+        total += v;
+    }
+    return total;
+}
+
+@MCount make_mcount(int n)
+{
+    @MCount p = new MCount;
+    p->n = n;
+    return p;
+}
+
 /* ---- await 跨挂起 ---- */
 
 async int add(int a, int b)
@@ -238,6 +303,95 @@ test "'_' 绑定仍然推进迭代器" {
     }
     if (n != 3 || t.n != 3)
         err(1, "'_' 没有按副本语义迭代三次");
+}
+
+test "托管元素：值绑定与 '_' 都不泄漏" {
+    struct MIt it = {0};
+    int total = 0;
+    foreach |v| it {
+        total += v->v;
+    }
+    if (total != 1)
+        err(1, "托管元素的值不对");
+    if (__c6_gc_live() != 0)
+        err(2, "值绑定泄漏了托管对象");
+    it.i = 0;
+    foreach |_| it {
+    }
+    if (__c6_gc_live() != 0)
+        err(3, "'_' 绑定泄漏了 next() 的返回值");
+}
+
+test "托管迭代器：own 与 borrow 的隐藏槽" {
+    @MCount p = new MCount;
+    int total = 0;
+    p->n = 3;
+    foreach |v| p {
+        total += v;
+    }
+    if (total != 6 || p->n != 0)
+        err(1, "own 迭代器不对");
+    p->n = 3;
+    if (sum_borrow(p) != 6 || p->n != 0)
+        err(2, "borrow 迭代器不对");
+    p = 0;
+    if (__c6_gc_live() != 0)
+        err(3, "托管迭代器隐藏槽泄漏了");
+}
+
+test "托管临时迭代器：隐藏槽接管所有权" {
+    int total = 0;
+    foreach |v| make_mcount(2) {
+        total += v;
+    }
+    if (total != 3)
+        err(1, "临时迭代器的值不对");
+    if (__c6_gc_live() != 0)
+        err(2, "临时迭代器的隐藏槽泄漏了");
+}
+
+test "数组的托管元素绑定也不泄漏" {
+    @MNode a[2] = {0};
+    int total = 0;
+    a[0] = new MNode;
+    a[1] = new MNode;
+    a[0]->v = 0;
+    a[1]->v = 1;
+    foreach |i, v| a {
+        total += v->v + (int)i;
+    }
+    if (total != 2)
+        err(1, "托管数组元素的值不对");
+    a[0] = 0;
+    a[1] = 0;
+    if (__c6_gc_live() != 0)
+        err(2, "数组的托管元素绑定泄漏了");
+}
+
+test "union 迭代器：值形态与指针形态" {
+    union UCount u = {3};
+    int total = 0;
+    foreach |v| u {
+        total += v;
+    }
+    if (total != 6 || u.n != 3)
+        err(1, "union 值形态不对");
+    total = 0;
+    foreach |v| &u {
+        total += v;
+    }
+    if (total != 6 || u.n != 0)
+        err(2, "union 指针形态不对");
+}
+
+test "跨 TU 的 has()/next() 原型" {
+    struct CrossIt c = {3};
+    int total = 0;
+    foreach |v| &c {
+        total += v;
+    }
+    if (total != 6 || c.n != 0)
+        err(1, "跨 TU 方法调用不对");
 }
 
 test "可迭代值只求值一次" {
