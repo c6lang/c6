@@ -291,7 +291,7 @@ static int c6_sym_seq = 0;
 /* Function-type symbols copied for a closure must survive the block they
    came from, but they must NOT enter global_stack: their 'prev' links are
    the parameter chain, and sym_pop(global_stack) would loop forever. */
-static Sym *c6_type_syms;
+static Sym *c6_type_syms = NULL;
 static Sym *c6_sym_alloc(int v, int t, int c)
 {
     Sym *s = tcc_mallocz(sizeof *s);
@@ -1052,7 +1052,7 @@ static void c6_lit_env_push(void);
 static int c6_closure_call_prep(void);
 static void block(int flags);
 static void sym_push_params(Sym *ref);
-static int c6_lit_scanning;
+static int c6_lit_scanning = 0;
 static Sym *c6_lit_env_sym = NULL;
 
 static void c6_lit_function_pointer_error(void);
@@ -1117,7 +1117,6 @@ static void c6_lit_cap_check(int v, Sym *s)
 }
 
 /* --- capture scan ------------------------------------------------------- */
-static int c6_lit_scanning = 0;
 static C6Lit *c6_lit_scan_lit = NULL;
 static int c6_lit_scan_base = 0;
 static int c6_scan_uneval = 0;
@@ -8561,11 +8560,25 @@ static void c6_lit_infer_decl(void)
     skip('=');
     c6_lit_parse();                      /* pushes the function value */
     vt = vtop->type;
-    mk_pointer(&vt);                     /* a value is a function pointer */
+    if (!c6_closure_of_type(&vt))
+        mk_pointer(&vt);                 /* a V1 value is a function pointer */
     size = type_size(&vt, &align);
     loc = (loc - size) & -align;
     slot = loc;
     ls = sym_push(v, &vt, VT_LOCAL | VT_LVAL, slot);
+#ifdef C6_EXT
+    if (c6_closure_of_type(&vt)) {
+        int save_hook = c6_gc_no_hook;
+        /* the new slot starts as NULL: the store below must not release the
+           garbage a fresh stack slot happens to contain */
+        c6_gc_no_hook = 1;
+        vset(&vt, VT_LOCAL | VT_LVAL, ls->c);
+        vpushi(0);
+        vstore();
+        vpop();
+        c6_gc_no_hook = save_hook;
+    }
+#endif
     vset(&vt, VT_LOCAL | VT_LVAL, ls->c);
     vswap();
     vstore();

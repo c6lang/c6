@@ -29,6 +29,15 @@ test "closure 类型：大小、typedef、零值" {
     (void)g;
 }
 
+test "推断声明：捕获字面量得到闭包变量" {
+    int n = 4;
+    f = int() { return n; };
+    int r = f();
+    f = NULL;
+    if (r != 4)
+        err(1, "推断的闭包变量不对");
+}
+
 test "标量捕获：快照、可写副本、多次调用保留状态" {
     int n = 1, m = 10;
     closure int() f = int() { n = n + 1; m = m + 2; return n + m; };
