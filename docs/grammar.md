@@ -514,9 +514,14 @@ head`，方法查找会回退到它的类型）：
 
 ```
 task t = fetch(url);   t->wait();    (* 驱动事件循环直到它结束，0 / -1 *)
+                       t->start();   (* 只跑到第一个挂起点（或跑完），不等 *)
                        t->done();    (* 1 = 结束，不驱动、不阻塞 *)
                        t->kind();    (* C6_CO_KIND_DONE / C6_CO_KIND_ERR *)
 ```
+
+`task t = f(...)` **只创建任务**，body 要等 `t->wait()` / `t->start()`（或别人
+`await` 它）才会跑；`t->start()` 是把一个任务推进到挂起态、然后让它挂着的唯一
+办法（作用域结束时 `__c6_co_destroy` 会把它回卷：跑 `defer`、归还引用）。
 
 `t->wait()` 会顺带推进**别的**顶层任务（它是 `__c6_co_wait`），而
 `h->join()` 只等那一个 OS 线程：两个名字不通用。
@@ -1233,7 +1238,7 @@ typedef、函数和全局变量写成普通 C 头文件，符号名就是带前�
 | `go f(p)` / `task t = f(p)` | 实参块 / 任务前缀的那次拷贝 +1，块释放 / `__c6_co_destroy` 时 −1 |
 | `thread h = go f(x);` | `h = __tcc_th_spawn(&__c6_sp_f, block)`，作用域登记 `__c6_th_release(h)`（走 defer 记录，每条退出路径都还） |
 | `h->join()` / `h->done()` / `h->value()` | `__c6_thread_join(h)` / `__c6_thread_done(h)` / `__c6_thread_value(h)` |
-| `t->wait()` / `t->done()` / `t->kind()` | `__c6_co_wait(t)` / `__c6_co_state(t) == -1` / `__c6_co_kind(t)`（接收者上转到 `struct __c6_task *`） |
+| `t->wait()` / `t->start()` / `t->done()` / `t->kind()` | `__c6_co_wait(t)` / `__c6_co_start(t)` / `__c6_co_state(t) == -1` / `__c6_co_kind(t)`（接收者上转到 `struct __c6_task *`） |
 
 编译器不插入任何运行期调度：没有标记清扫线程，也没有安全点。
 

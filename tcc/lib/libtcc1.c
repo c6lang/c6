@@ -2305,9 +2305,32 @@ int __c6_co_state(void *self);
 int __c6_co_kind(void *self);
 int __c6_co_wait(void *self);
 
+static int tcc_co_step_once(TccCoTask *t);
+
 int __c6_task_wait(void *self)
 {
     return __c6_co_wait(self);
+}
+
+/* 't->start()': step the body up to its first suspension (or to completion)
+   without waiting for anything.  'task t = f(...)' only creates the task, so
+   this is how a caller observes a *suspended* task -- and, when its scope ends
+   first, how '__c6_co_destroy' gets to roll one back. */
+int __c6_co_start(void *self)
+{
+    TccCoTask *t = (TccCoTask *)self;
+
+    if (!t)
+        return C6_CO_KIND_DONE;
+    if (t->state == C6_CO_STATE_DONE)
+        return t->kind;
+    t->waiting = 0;             /* let it run even if it was parked */
+    return tcc_co_step_once(t);
+}
+
+int __c6_task_start(void *self)
+{
+    return __c6_co_start(self);
 }
 
 int __c6_task_done(void *self)
@@ -2396,6 +2419,8 @@ static int tcc_co_step_once(TccCoTask *t)
 {
     TccCoTask *leaf = tcc_co_leaf(t);
     TccCoDesc *d;
+    TccThCtx *th = tcc_th();
+    int dsp = th->dsp, dcsp = th->dcsp;
     int k;
 
     if (leaf->state == C6_CO_STATE_DONE)
@@ -2410,6 +2435,15 @@ static int tcc_co_step_once(TccCoTask *t)
        task ignores it, one that parks its native frame gets a harmless value */
     k = d->entry(leaf, leaf->frame);
     leaf->busy--;
+    /* A body keeps its 'defer' records in the task: suspending parks them and
+       saves the thread's stack pointers there (__c6_co_suspend), and resuming
+       puts them back (__c6_co_restore).  What the body left behind belongs to
+       the task, not to whoever called it -- if the task is left parked, the
+       caller's own 'defer' and task cleanups would otherwise see a reset
+       context stack and silently skip themselves (the thread pointers are a
+       stack discipline), so save and restore them around the call. */
+    th->dsp = dsp;
+    th->dcsp = dcsp;
     switch (k) {
     case C6_CO_KIND_DONE:
     case C6_CO_KIND_ERR:

@@ -826,7 +826,8 @@ static const char * const c99_runtime_names[] = {
     "__tcc_co_spawn", "__tcc_sp_args", "__tcc_th_start",
     "__c6_co_new", "__c6_co_await", "__c6_co_suspend", "__c6_co_restore",
     "__c6_co_finish", "__c6_co_state", "__c6_co_kind", "__c6_co_set_io",
-    "__c6_co_rev", "__c6_co_wait", "__c6_co_destroy", "__c6_co_run",
+    "__c6_co_rev", "__c6_co_wait", "__c6_co_start", "__c6_co_destroy",
+    "__c6_co_run",
     "__c6_th_join_all", "c6_io",
     "__c6_gc_new", "__c6_gc_store", "__c6_gc_own_store", "__c6_gc_release",
     "__c6_gc_incref",
@@ -837,7 +838,7 @@ static const char * const c99_runtime_names[] = {
     /* thread handles and handle methods (task / thread) */
     "__tcc_th_spawn", "__c6_th_release", "__c6_thread_join",
     "__c6_thread_done", "__c6_thread_value",
-    "__c6_task_wait", "__c6_task_done", "__c6_task_kind",
+    "__c6_task_wait", "__c6_task_start", "__c6_task_done", "__c6_task_kind",
 };
 
 static int c99_is_runtime_name(const char *name)

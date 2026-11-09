@@ -580,6 +580,20 @@ if (__c6_co_kind(task) == C6_CO_KIND_ABORT) {
 
 一步就能跑完，因为清理体里禁止 `await`（`tcc/tccgen.c:13508` 已有该检查）。
 
+**怎么走到这条路（P7 之后的补充）**：`task t = f(...)` 只创建任务，body 在
+`t->wait()` / `t->start()` 之前根本没跑过，所以"回卷一个挂起的任务"要靠
+`t->start()`：它把 body 推进到第一个挂起点就返回，句柄还活着；作用域结束时
+`__c6_co_destroy()` 看到 `state != DONE` → `__c6_co_abort()` → body 从挂起点
+恢复一次，走上面那段清理派发器 → `finish(ABORT)`。`tests/async_frame.c` 的
+"挂起的任务被销毁时回卷"就是这条路径（defer 跑了、托管引用计数回到基线）。
+
+做这条路径时还顺带修了一个既有 bug：**挂起会把线程的 defer 栈指针与
+context 栈指针交出去**（`__c6_co_suspend` 把它们存进任务、并把线程值截断/
+清零），如果任务就挂在那儿不恢复，调用者的 `defer` 和 `task` 清理会看到
+"空的 context 栈"而被**静默跳过**。修法是把这对指针当成调用者保存的栈纪律：
+`tcc_co_step_once()` 在进入 body 前保存 `dsp`/`dcsp`、返回后恢复（`dsp` 在
+挂起后被截断到 body 的基址，正好等于调用者的值；`dcsp` 则必须由调用者收回）。
+
 **预算（§11.4）**：已经是「每次释放最多 256 个」（`c6_gc_drain(th,
 C6_GC_DRAIN_BUDGET)` 在 `c6_gc_drop()` 里，`lib/libtcc1.c:1271`），
 级联释放跨多次释放摊平，不需要编译器在 `new`/作用域退出处再插调用；

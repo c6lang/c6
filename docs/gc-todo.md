@@ -80,8 +80,12 @@
   存储必须走 `c6_gc_plain()`，否则会拿未初始化的旧值去 decref。
 - `__c6_gc_live` / `__c6_gc_refcount` 返回 `unsigned long long`（tcc 把
   `unsigned long` 归一成 `VT_LLONG`，C99 后端打印原型时必须一致）。
-- 已知推迟项：`async` 体里的托管局部量在回卷时的转移（P7），
-  `defer` 记录 8192 条静默丢弃（H3，P7 一起修）。
+- 已落地（P7）：`async` 体里的托管局部量在回卷时的转移 —— `task` 句柄新增
+  `t->start()`（`__c6_co_start`）把 body 推进到挂起点，作用域结束时
+  `__c6_co_destroy` 回卷，defer 与托管局部量都按 §9.3 的派发器处理
+  （`tests/async_frame.c` 覆盖）；同时修掉"挂起时把线程 defer 栈指针交给
+  任务、调用者的清理被静默跳过"的既有 bug。
+- 仍未做：`defer` 记录 8192 条静默丢弃（H3，P7 一起修）。
 
 改动点：
 

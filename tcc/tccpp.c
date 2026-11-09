@@ -4139,6 +4139,7 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "void __c6_co_set_io(void *self, int fd, int ev);\n"
           "int __c6_co_rev(void *self);\n"
           "int __c6_co_wait(void *self);\n"
+          "int __c6_co_start(void *self);\n"
           "void __c6_co_destroy(void *self);\n"
           "void __tcc_co_spawn(void *task);\n"
           /* 'go' : the argument block of one call, and the thread starter */
@@ -4151,6 +4152,7 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
              so the method lookup falls back to the type of the first field;
              the emitted symbols are '<tag>_<name>' (c6_method_symbol). */
           "int wait(struct __c6_task *self);\n"
+          "int start(struct __c6_task *self);\n"
           "int done(struct __c6_task *self);\n"
           "int kind(struct __c6_task *self);\n"
           "struct __c6_thread;\n"

@@ -214,3 +214,47 @@ test "形参在帧里活过挂起" {
         err(52, "形参挂起后丢了");
     __c6_co_destroy(t);
 }
+
+/* ---- 7. 挂起的任务被销毁：回卷跑 defer、归还引用 ---- */
+static int g_abort_clean = 0;
+
+async int abandoned(int fd)
+{
+    char pad[2048] = {0};
+    @Node n = new Node;
+
+    n->v = 9;
+    pad[2040] = 5;
+    defer {
+        g_abort_clean += n->v + pad[2040];   /* 14 = 9 + 5 */
+    }
+    await c6_io(fd, 1);              /* 读端没有数据：挂在这里 */
+    return n->v + pad[2040];
+}
+
+test "挂起的任务被销毁时回卷" {
+    int fds[2] = {-1, -1};
+    int live0 = 0;
+
+    if (pipe(fds) != 0)
+        err(60, "pipe 失败");
+    live0 = (int)__c6_gc_live();
+    g_abort_clean = 0;
+    {
+        task t = abandoned(fds[0]);
+
+        /* task t = f(...) 只创建任务；start() 才把它跑到第一个挂起点 */
+        if (t->start() == C6_CO_KIND_DONE)
+            err(61, "任务应当挂在 fd 上，而不是已经结束");
+        if (t->done())
+            err(62, "挂起的任务不该报 done");
+        if (g_abort_clean != 0)
+            err(63, "defer 在挂起时不该运行");
+        if ((int)__c6_gc_live() <= live0)
+            err(64, "任务持有的引用没有计数");
+    }                                /* 作用域退出 -> __c6_co_destroy -> 回卷 */
+    if (g_abort_clean != 14)
+        err(65, "回卷没有跑 defer，或帧里的局部量不对");
+    if ((int)__c6_gc_live() != live0)
+        err(66, "回卷没有把托管引用还回来");
+}
