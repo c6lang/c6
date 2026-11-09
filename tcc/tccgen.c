@@ -279,6 +279,21 @@ static int c6_sym_global = 0;
    analysis compares it with the sequence at the literal's body start. */
 static int c6_sym_seq = 0;
 
+/* Function-type symbols copied for a closure must survive the block they
+   came from, but they must NOT enter global_stack: their 'prev' links are
+   the parameter chain, and sym_pop(global_stack) would loop forever. */
+static Sym *c6_type_syms;
+static Sym *c6_sym_alloc(int v, int t, int c)
+{
+    Sym *s = tcc_mallocz(sizeof *s);
+    s->v = v;
+    s->type.t = t;
+    s->c = c;
+    s->prev_tok = c6_type_syms;
+    c6_type_syms = s;
+    return s;
+}
+
 static void type_to_str(char *buf, int buf_size, CType *type,
                         const char *varstr);
 static void convert_parameter_type(CType *pt);
@@ -289,6 +304,7 @@ static int c6_type_gq(CType *type);
 static void c6_rt_begin(const char *name);
 static void c6_rt_end(const char *name, int nargs);
 static Sym *c6_env_base_tag(void);
+static CType c6_type_global_copy(CType *type);
 
 /* make 'T *' with the pointer's type symbol on the global stack.  The
    compiler may be inside a function (a closure type can be written in a
@@ -486,6 +502,10 @@ static CType c6_closure_get(CType *ftype)
         tcc_error("a closure signature cannot use a type declared in a block "
                   "or an anonymous 'struct'/'union'/'enum' (give it a tag)");
 
+    /* the parsed signature lives in the enclosing block; copy it so that the
+       parameter chain survives until the literal body is compiled */
+    ft = c6_type_global_copy(&ft);
+    f = ft.ref;
     c6_closure_sig_text(sig, sizeof sig, &ft);
     h = c6_fnv1a(sig);
     for (cl = c6_closures; cl; cl = cl->next) {
@@ -519,7 +539,7 @@ static CType c6_closure_get(CType *ftype)
     tag->r = PTR_SIZE;
 
     /* code = RET (*)(void *, P...) */
-    nf = sym_push2(&global_stack, SYM_FIELD, 0, 0);
+    nf = c6_sym_alloc(SYM_FIELD, 0, 0);
     nf->type = f->type;
     nf->a = f->a;
     nf->f = f->f;
@@ -527,10 +547,13 @@ static CType c6_closure_get(CType *ftype)
     vp.t = VT_VOID;
     vp.ref = NULL;
     env_ptr = c6_global_ptr(&vp);
-    ep = sym_push2(&global_stack, tok_alloc_const("__c6_env"), 0, 0);
+    ep = c6_sym_alloc(tok_alloc_const("__c6_env"), 0, 0);
     ep->type = env_ptr;
     ep->r = VT_LOCAL | VT_LVAL;
     ep->next = f->next;
+    ep->prev = nf;
+    if (f->next)
+        f->next->prev = ep;
     nf->next = ep;
     code = ft;
     code.ref = nf;
@@ -621,19 +644,24 @@ static CType c6_type_global_copy(CType *type)
         int first = 1;
         if (!f)
             return *type;
-        nf = sym_push2(&global_stack, SYM_FIELD, 0, 0);
+        nf = c6_sym_alloc(SYM_FIELD, 0, 0);
         nf->type = c6_type_global_copy(&f->type);
         nf->a = f->a;
         nf->f = f->f;
         tail = &nf->next;
-        for (np = f->next; np; np = np->next) {
-            Sym *cp = sym_push2(&global_stack, np->v, 0, np->c);
-            cp->type = c6_type_global_copy(&np->type);
-            cp->r = np->r;
-            cp->a = np->a;
-            *tail = cp;
-            tail = &cp->next;
-            first = 0;
+        {
+            Sym *prev = nf;
+            for (np = f->next; np; np = np->next) {
+                Sym *cp = c6_sym_alloc(np->v, 0, np->c);
+                cp->type = c6_type_global_copy(&np->type);
+                cp->r = np->r;
+                cp->a = np->a;
+                cp->prev = prev;
+                prev = cp;
+                *tail = cp;
+                tail = &cp->next;
+                first = 0;
+            }
         }
         (void)first;
         *tail = NULL;
@@ -1294,6 +1322,35 @@ static void c6_lit_add_edges(C6Lit *lit)
     }
 }
 
+/* The per-literal code signature: like the shared closure type's code_type,
+   but it keeps the parameter names written in this literal, since the body
+   resolves them through sym_push_params(). */
+static CType c6_closure_code_type(CType *ftype)
+{
+    CType ft = c6_type_global_copy(ftype), code = {0}, envp = {0}, vp = {0};
+    Sym *f = ft.ref, *nf = NULL, *ep = NULL;
+
+    nf = sym_push2(&global_stack, SYM_FIELD, 0, 0);
+    nf->type = f->type;
+    nf->a = f->a;
+    nf->f = f->f;
+    nf->f.func_args = f->f.func_args + 1;
+    vp.t = VT_VOID;
+    vp.ref = NULL;
+    envp = c6_global_ptr(&vp);
+    ep = c6_sym_alloc(tok_alloc_const("__c6_env"), 0, 0);
+    ep->type = envp;
+    ep->r = VT_LOCAL | VT_LVAL;
+    ep->next = f->next;
+    ep->prev = nf;
+    if (f->next)
+        f->next->prev = ep;
+    nf->next = ep;
+    code = ft;
+    code.ref = nf;
+    return code;
+}
+
 static void c6_lit_make_closure(C6Lit *lit)
 {
     C6Closure *cl = NULL;
@@ -1302,7 +1359,7 @@ static void c6_lit_make_closure(C6Lit *lit)
     cl = c6_closure_of_type(&lit->closure_type);
     if (!cl)
         tcc_error("internal error: closure type was not registered");
-    lit->code_type = cl->code_type;
+    lit->code_type = c6_closure_code_type(&lit->ftype);
     c6_lit_add_edges(lit);
 }
 
@@ -1587,6 +1644,7 @@ static inline void psyms(const char *msg, Sym *s, Sym *last)
         printf("      %8x  %08x %08x %08x %08x %s\n",
             s->sym_scope, s->v, s->c, s->r, s->type.t, get_tok_str(s->v, 0));
         s = s->prev;
+        }
     }
 }
 
@@ -12464,6 +12522,11 @@ static void c6_tu_reset(void)
     c6_closures = NULL;
     c6_env_base_sym = NULL;
     c6_sym_seq = 0;
+    while (c6_type_syms) {
+        Sym *s = c6_type_syms;
+        c6_type_syms = s->prev_tok;
+        tcc_free(s);
+    }
 }
 
 /* Implicit conversion of a struct value to an interface value, e.g.
@@ -14957,7 +15020,11 @@ static void sym_push_params(Sym *ref)
     Sym *s = ref;
     while (s->next)
         s = s->next;
-    while (s != ref) {
+    {
+        int guard = 10000;
+        while (s != ref) {
+            if (--guard < 0)
+                tcc_error("internal: parameter chain cycle");
         if ((s->v & ~SYM_STRUCT) < SYM_FIRST_ANOM) {
             Sym *p = sym_copy(s, &local_stack);
 #ifdef C6_EXT
@@ -14965,6 +15032,7 @@ static void sym_push_params(Sym *ref)
 #endif
         }
         s = s->prev;
+        }
     }
 }
 
