@@ -1315,6 +1315,7 @@ void __tcc_catch_fallthrough(void)
 #define C6_GCK_WEAK   2
 #define C6_GCK_OWN    3
 #define C6_GCK_EMBED  4
+#define C6_GCK_EDGE   5
 #define C6_GC_META_FLAGS(meta) ((int)((meta) >> 40))
 
 #define C6_GC_DRAIN_BUDGET 256  /* objects freed per release before returning */
@@ -1428,6 +1429,8 @@ static void c6_gc_release_block(char *base, const C6GcDesc *d)
         const C6GcField *f = &d->fields[k];
         unsigned i;
 
+        if (f->kind == C6_GCK_EDGE)
+            continue;               /* cycle graph only */
         for (i = 0; i < f->count; i++) {
             char *p = base + f->off + (unsigned long)i * f->stride;
             if (f->kind == C6_GCK_EMBED)

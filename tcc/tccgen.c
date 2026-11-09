@@ -1038,10 +1038,15 @@ static C6Cap *c6_lit_cap_add(C6Lit *lit, int tok, CType *type, int kind)
     cap = &lit->caps[lit->ncaps++];
     memset(cap, 0, sizeof *cap);
     cap->tok = tok;
-    cap->type = c6_type_global_copy(type);
-    cap->type.t &= ~VT_STORAGE;
-    cap->type.gq &= ~C6_GQ_BORROW;
-    cap->type.ref->type.gq &= ~C6_GQ_BORROW;
+    if (kind == C6_CAP_TYPE) {
+        cap->type = *type;
+    } else {
+        cap->type = c6_type_global_copy(type);
+        cap->type.t &= ~VT_STORAGE;
+        cap->type.gq &= ~C6_GQ_BORROW;
+        if (cap->type.ref)
+            cap->type.ref->type.gq &= ~C6_GQ_BORROW;
+    }
     cap->kind = kind;
     return cap;
 }
@@ -1080,6 +1085,9 @@ static void c6_lit_scan_note(int tok, Sym *s, int uneval)
     if (s->type.t & VT_STATIC)
         tcc_error("a closure cannot capture the block-scope 'static' '%s': "
                   "move it to file scope", get_tok_str(v, NULL));
+    if (s->type.t & VT_VLA)
+        tcc_error("a closure cannot capture the variable length array '%s': "
+                  "its size is only known at run time", get_tok_str(v, NULL));
     if (s->type.t & VT_ARRAY) {
         if (uneval) {
             c6_lit_cap_add(lit, v, &s->type, C6_CAP_ZERO);
@@ -1088,9 +1096,6 @@ static void c6_lit_scan_note(int tok, Sym *s, int uneval)
         tcc_error("a closure cannot capture the array '%s': pass a slice "
                   "'T[:]' or a pointer instead", get_tok_str(v, NULL));
     }
-    if (s->type.t & VT_VLA)
-        tcc_error("a closure cannot capture the variable length array '%s': "
-                  "its size is only known at run time", get_tok_str(v, NULL));
     if (!c6_type_global_ex(&s->type, 0))
         tcc_error("a closure cannot capture '%s': its type is declared in a "
                   "block (move the type to file scope)", get_tok_str(v, NULL));
@@ -1237,6 +1242,58 @@ static CType c6_lit_env_get(C6Lit *lit)
     return ct;
 }
 
+static int c6_cap_managed_tag(CType *type)
+{
+    C6Closure *cl = NULL;
+
+    if (!c6_is_managed(type))
+        return 0;
+    cl = c6_closure_of_type(type);
+    if (cl)
+        return cl->tag_sym->v & ~SYM_STRUCT;
+    if (type->ref && (type->ref->type.t & VT_BTYPE) == VT_STRUCT
+        && type->ref->type.ref)
+        return type->ref->type.ref->v & ~SYM_STRUCT;
+    return 0;
+}
+
+/* Conservative signature-level cycle edges: closure_<SIG> -> captured T.
+   They are stored as graph-only fields; the runtime skips C6_GCK_EDGE. */
+static void c6_lit_add_edges(C6Lit *lit)
+{
+    C6Closure *cl = c6_closure_of_type(&lit->closure_type);
+    C6GcType *gt = NULL;
+    int i = 0, j = 0;
+
+    if (!cl)
+        return;
+    gt = c6_gc_type_find(cl->tag_sym->v & ~SYM_STRUCT);
+    if (!gt || gt->emitted)
+        return;
+    for (i = 0; i < lit->ncaps; i++) {
+        C6Cap *cap = &lit->caps[i];
+        int tag = 0, dup = 0;
+        if (cap->kind != C6_CAP_VALUE)
+            continue;
+        tag = c6_cap_managed_tag(&cap->type);
+        if (!tag)
+            continue;
+        for (j = 0; j < gt->nfields; j++)
+            if (gt->fields[j].kind == C6_GCK_EDGE
+                && gt->fields[j].to_tag == tag)
+                dup = 1;
+        if (dup)
+            continue;
+        gt->fields = tcc_realloc(gt->fields,
+                                 (gt->nfields + 1) * (int)sizeof *gt->fields);
+        memset(&gt->fields[gt->nfields], 0, sizeof *gt->fields);
+        gt->fields[gt->nfields].kind = C6_GCK_EDGE;
+        gt->fields[gt->nfields].to_tag = tag;
+        gt->fields[gt->nfields].name_tok = cap->tok;
+        gt->nfields++;
+    }
+}
+
 static void c6_lit_make_closure(C6Lit *lit)
 {
     C6Closure *cl = NULL;
@@ -1246,6 +1303,7 @@ static void c6_lit_make_closure(C6Lit *lit)
     if (!cl)
         tcc_error("internal error: closure type was not registered");
     lit->code_type = cl->code_type;
+    c6_lit_add_edges(lit);
 }
 
 /* Replay a nested literal body during capture analysis.  Its own parameters
@@ -6697,7 +6755,13 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
         case TOK_TYPEOF2:
         case TOK_TYPEOF3:
             next();
+#ifdef C6_EXT
+            c6_scan_uneval++;
             parse_expr_type(&type1);
+            c6_scan_uneval--;
+#else
+            parse_expr_type(&type1);
+#endif
             /* remove all storage modifiers except typedef */
             type1.t &= ~(VT_STORAGE&~VT_TYPEDEF);
             if (type1.ref) {
@@ -7744,9 +7808,11 @@ static void c6_lit_emit_value(C6Lit *lit)
         if (!src)
             tcc_error("capture analysis missed '%s'",
                       get_tok_str(cap->tok, NULL));
+        CType et = cap->type;
+        et.t &= ~(VT_CONSTANT | VT_VOLATILE | VT_RESTRICT);
         vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
         gv(RC_INT);
-        c6_lit_env_field(cap->off, &cap->type);
+        c6_lit_env_field(cap->off, &et);
         c6_lit_push_source(src);
         vstore();
         vpop();
@@ -7876,6 +7942,15 @@ static void c6_lit_parse(void)
                       "sees only its parameters and the file scope (pass the "
                       "value in as a parameter)",
                       get_tok_str(lit->caps[0].tok, NULL));
+        if (lit->capturing) {
+            for (j = 0; j < lit->ncaps; j++) {
+                if (lit->caps[j].kind == C6_CAP_TYPE
+                    && !c6_type_global_ex(&lit->caps[j].type, 0))
+                    tcc_error("a closure cannot capture the type '%s': types "
+                              "are not values (move the typedef or tag to file "
+                              "scope)", get_tok_str(lit->caps[j].tok, NULL));
+            }
+        }
     }
     if (lit->capturing) {
         c6_lit_env_get(lit);
@@ -7893,9 +7968,9 @@ static void c6_lit_parse(void)
         c6_lit_head = lit;
     c6_lit_tail = lit;
 
-    if (lit->capturing)
+    if (lit->capturing) {
         c6_lit_emit_value(lit);
-    else
+    } else
         vpushsym(&vtype, s);
 }
 
@@ -8256,7 +8331,13 @@ ST_FUNC void unary(void)
         next();
         if (tok == '(')
             tok = TOK_SOTYPE;
+#ifdef C6_EXT
+        c6_scan_uneval++;
         expr_type(&type, unary);
+        c6_scan_uneval--;
+#else
+        expr_type(&type, unary);
+#endif
         if (t == TOK_SIZEOF) {
             vpush_type_size(&type, &align);
             gen_cast_s(VT_SIZE_T);
@@ -18549,11 +18630,18 @@ static void c6_lit_push_captures(C6Lit *lit)
         C6Cap *cap = &lit->caps[i];
         CType t = cap->type;
         Sym *s = NULL;
-        if (cap->kind == C6_CAP_TYPE)
-            t.t |= VT_TYPEDEF;
-        else
+        int tok = cap->tok;
+        if (cap->kind == C6_CAP_TYPE) {
+            if (t.t & VT_TYPEDEF) {
+                t.t |= VT_TYPEDEF;
+            } else {
+                /* a tag alias: 'struct TAG' in the body must find it */
+                tok |= SYM_STRUCT;
+            }
+        } else {
             t.t &= ~VT_TYPEDEF;
-        s = sym_push(cap->tok, &t, VT_CONST,
+        }
+        s = sym_push(tok, &t, VT_CONST,
                      cap->kind == C6_CAP_VALUE ? cap->off : 0);
         s->c6_cap_kind = cap->kind;
     }

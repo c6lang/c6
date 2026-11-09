@@ -842,6 +842,7 @@ typedef struct C6HeaderDecl {
 #define C6_GCK_WEAK   2   /* 'weak @T': slot is cleared when the target dies */
 #define C6_GCK_OWN    3   /* 'own @T': exclusive, released with the owner */
 #define C6_GCK_EMBED  4   /* a by-value struct that holds managed references */
+#define C6_GCK_EDGE   5   /* graph-only edge; the runtime ignores it */
 
 /* one managed field of a struct */
 /* one managed object with static storage: registered from a constructor and
