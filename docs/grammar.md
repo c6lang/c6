@@ -672,6 +672,19 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
   指针表、交给纯 C 保存和回调（`tests/abi/fn_lit.c`），也可以直接传给
   `qsort` 这类标准库函数。
 
+**V2 设计预览（未实现）**：捕获式闭包引入类型构造
+
+```
+closure-type           = "closure" , type-specifier , [ "!error" ] ,
+                         "(" , [ parameter-type-list ] , ")" ;
+```
+
+它的值是一个机器字的**托管引用**（隐藏对象 `{code, env}`），体里的自由名字
+按值捕获进一个 `@struct` 环境；无捕获的字面量仍然完全按 V1 退化成裸函数
+指针。`closure` 是软关键字，只在类型位置生效。捕获规则、转换表、诊断
+C90–C98 与实施阶段见 [closure-design.md](closure-design.md) 和
+[closure-todo.md](closure-todo.md)；在 V2 落地前，编译器仍按 V1 报 C80。
+
 ---
 
 ## 4. 语句
@@ -1023,7 +1036,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
 | C78 | `thread` 句柄的初始化式必须是 `go` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'go f(...)'` |
 | C79 | `move(p)` 之后、重新赋值之前不能再用 `p`（读/比较/解引用/传参/再 `move`） | `'%s' was moved: assign a new reference before using it` |
-| C80 | 函数字面量的体里只能引用它自己的参数和文件作用域的名字，不能引用外层局部变量、形参、块作用域 `typedef`/tag（V1 没有捕获） | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
+| C80 | 函数字面量的体里只能引用它自己的参数和文件作用域的名字，不能引用外层局部变量、形参、块作用域 `typedef`/tag（V1 没有捕获；V2 的捕获式闭包设计见 [closure-design.md](closure-design.md)，未实现，V2 下这条拆成 C93/C94） | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
 | C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
 | C82 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
 | C83 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
@@ -1523,6 +1536,11 @@ body 直接 `return` 回到驱动方；恢复时把它们取回来，再跳到�
 * `static` 让它在 `-emit-header` 与 `module` 前缀改写之外，名字里的序号
   只有调试信息看得到。
 
+V2 不改这条重写规则的无捕获部分：捕获集合为空时，表达式仍然只留下函数
+指示符。捕获集合非空时，原地多发射一个 env 和一个隐藏的 `{code, env}` 闭包
+对象，表达式的值是这个对象的一个 `@` 引用；函数符号本身多一个隐藏的
+`void *__c6_env` 首参。详见 [closure-design.md](closure-design.md) §6。
+
 **R24 — `f".."` / `@f".."`**
 
 ```
@@ -1707,7 +1725,7 @@ int main(void)
 | 自定义删除器 | V1 不做（析构只有 `drop` 方法一种） |
 | 写法 | 结果 |
 |---|---|
-| 捕获式闭包：`int x = 1; f = int() { return x; };` | 约束 C80：V1 的字面量是裸函数指针，体里只看得见参数和文件作用域；捕获版设计见 `docs/closure-design.md` |
+| 捕获式闭包：`int x = 1; f = int() { return x; };` | 当前（V1）报约束 C80：字面量是裸函数指针，体里只看得见参数和文件作用域。V2 设计为按值捕获进 env，类型写成 `closure int()`（见 [closure-design.md](closure-design.md)，未实现） |
 | `task t = void() { … };` 之类包装 | 不需要：字面量本身就是函数指针，直接 `go f(x)` / 直接传 |
 | `try { … } catch { … }` 块形式 | 语法错误（`try` 只接一次调用） |
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |

@@ -19,7 +19,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
 | `foreach \|i, v\| a { ... }` | 遍历数组、切片与整数区间：绑定表在前，值绑定是元素副本 |
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
-| 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；体里只看得见参数和文件作用域 |
+| 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；体里只看得见参数和文件作用域。捕获式闭包（`closure RET (P…)`，V2）已有完整设计，尚未实现，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
 
@@ -731,8 +731,7 @@ qsort(v, n, sizeof v[0], int(const void *a, const void *b) {   /* 交给 C */
   int (*g)(int)  = int(int n) { return n + offset; };  /* 可以：n 和文件作用域 */
   ```
 
-  需要外层的值时把它作为参数传进来。捕获式闭包是下一版的设计，
-  见 [docs/closure-design.md](docs/closure-design.md)；
+  需要外层的值时把它作为参数传进来，或者写成捕获式闭包（V2，见下）；
 - 字面量**没有名字**，也不能带存储类或 `async`：`void named(void) { … }`
   报 `a function literal has no name`，`static void() { … }` 报
   `a function literal cannot have a storage class`；
@@ -741,11 +740,38 @@ qsort(v, n, sizeof v[0], int(const void *a, const void *b) {   /* 交给 C */
 - 和 c6 的其它特性是正交的：体里可以 `defer` / `err` / `new` / 再写字面量，
   `static inline` 函数体和异步函数体里也能写字面量。
 
-完整可运行示例见 [examples/fn_lit_demo.c](examples/fn_lit_demo.c)：
+V1 的完整可运行示例见 [examples/fn_lit_demo.c](examples/fn_lit_demo.c)：
 
 ```sh
 ./tcc/tcc -B tcc -std=c6 -run examples/fn_lit_demo.c
 ```
+
+#### 捕获式闭包 `closure`（V2，设计定稿，未实现）
+
+> 当前编译器还没有实现这一节，`-std=c6` 仍按 V1 拒绝捕获。设计全文见
+> [docs/closure-design.md](docs/closure-design.md)，分阶段实施清单见
+> [docs/closure-todo.md](docs/closure-todo.md)。
+
+```c
+closure int(int) make_adder(int n)
+{
+    return int(int x) { return x + n; };   /* n 按值拷贝进 env */
+}
+
+int main(void)
+{
+    closure int(int) add5 = make_adder(5);
+    return add5(1) != 6;
+}
+```
+
+- 类型写成 `closure RET (参数…)`，`sizeof` 是一个机器字；值是 `@` 托管引用，
+  隐藏对象里放 `{code, env}`；
+- 体里自由出现的块作用域名字按值拷进 env（在字面量求值时快照）；体里改的
+  是副本，外层变量不受影响；
+- 无捕获的字面量仍是裸函数指针（V1 行为）；需要放进 `closure` 槽时自动包装
+  成闭包；闭包不能变回函数指针；
+- 闭包不能跨线程/任务，也不能 `shared`/`weak`/`own`；诊断 C90–C98。
 
 ### async / await（无栈协程）
 
