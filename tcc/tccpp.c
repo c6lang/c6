@@ -55,6 +55,9 @@ static void tok_print(const int *str, const char *msg, ...);
 static void next_nomacro(void);
 static void parse_number(const char *p);
 static void parse_string(const char *p, int len);
+#ifdef C6_EXT
+static void parse_fstr_string(const char *p, int len);
+#endif
 
 static struct TinyAlloc *toksym_alloc = 0;
 static struct TinyAlloc *tokstr_alloc = 0;
@@ -537,34 +540,6 @@ static void tok_skip_id(void)
     tok_ident++;
 }
 
-#ifdef C6_EXT
-/* Drop the last interned token again: used to keep the c6 keywords
-   ordinary identifiers unless -std=c6 is active. */
-static void tok_unintern(int v)
-{
-    TokenSym *ts = 0;
-    TokenSym **pts = 0;
-    unsigned int h = 0;
-    int i = 0;
-
-    if (!table_ident || v < TOK_IDENT || v >= tok_ident)
-        return;
-    ts = table_ident[v - TOK_IDENT];
-    if (!ts || ts->tok != v)
-        return;
-    h = TOK_HASH_INIT;
-    for (i = 0; i < ts->len; i++)
-        h = TOK_HASH_FUNC(h, ((unsigned char *)ts->str)[i]);
-    h &= (TOK_HASH_SIZE - 1);
-    pts = &hash_ident[h];
-    while (*pts && *pts != ts)
-        pts = &(*pts)->hash_next;
-    if (*pts)
-        *pts = ts->hash_next;
-    tal_free(&toksym_alloc, ts);
-    table_ident[v - TOK_IDENT] = NULL;
-}
-#endif
 
 
 /* XXX: buffer overflow */
@@ -595,6 +570,12 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
         cstr_ccat(&cstr_buf, '\'');
         cstr_ccat(&cstr_buf, '\0');
         break;
+    case TOK_C6_FSTR:
+        /* spelled back the way it was written: 'f"' body '"' */
+        cstr_ccat(&cstr_buf, 'f');
+        if (cv && cv->str.data && cv->str.size > 0)
+            cstr_cat(&cstr_buf, cv->str.data, cv->str.size);
+        return (char*)cstr_buf.data;
     case TOK_PPNUM:
     case TOK_PPSTR:
         return (char*)cv->str.data;
@@ -1174,6 +1155,7 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
     case TOK_PPSTR:
     case TOK_STR:
     case TOK_LSTR:
+    case TOK_C6_FSTR:
         {
             /* Insert the string into the int array. */
             size_t nb_words =
@@ -1261,6 +1243,7 @@ static inline void tok_get(int *t, const int **pp, CValue *cv)
     case TOK_LSTR:
     case TOK_PPNUM:
     case TOK_PPSTR:
+    case TOK_C6_FSTR:
         cv->str.size = *p++;
         cv->str.data = (char*)p;
         p += (cv->str.size + sizeof(int) - 1) / sizeof(int);
@@ -2453,6 +2436,191 @@ static void parse_string(const char *s, int len)
     }
 }
 
+#ifdef C6_EXT
+/* ---- f"..{expr}.." interpolation -------------------------------------- */
+/* The lexer keeps the body of an f-string raw, the way a TOK_PPSTR is kept.
+   Here it is split into literal and expression parts and turned into an
+   ordinary token stream, which the parser then reads without knowing it
+   came from a single token:
+
+       TOK_C6_FSTR_BEG
+         TOK_STR "literal"                     (escape-decoded, in order)
+         TOK_C6_FSTR_EXPR <expression tokens> TOK_C6_FSTR_EXPR_END
+         ...
+       TOK_C6_FSTR_END
+
+   The expression text is run through the real preprocessor over a buffer,
+   so macros are expanded and a nested string or character literal is lexed
+   by the ordinary rules.  Exactly two escapes belong to the f-string
+   quoting and are removed here: '\"' is a double quote (it opens or closes
+   a nested literal) and '\\' is a backslash.  Every other escape is left
+   for the C lexer, which is what makes '\n' inside a nested literal work
+   and keeps '\n' outside one an error, as in C. */
+
+/* the literal chunk LIT, escape-decoded, appended as a TOK_STR */
+static void fstr_add_lit(TokenString *ts, CString *lit)
+{
+    CString d = {0}, raw = {0};
+    CValue cval = {0};
+
+    if (!lit->size)
+        return;                             /* nothing between two '{' */
+    cstr_new(&raw);
+    cstr_cat(&raw, lit->data, lit->size);
+    cstr_ccat(&raw, '\0');
+    cstr_new(&d);
+    parse_escape_string(&d, (const uint8_t *)raw.data, 0);   /* '\0' added */
+    cval.str.size = d.size;
+    cval.str.data = d.data;
+    tok_str_add2(ts, TOK_STR, &cval);
+    /* the parts of the stream are comma separated: the ',' also tells the
+       string-literal path in tccgen that the literal is a part of an
+       expression, not the start of an initializer list */
+    tok_str_add(ts, ',');
+    cstr_free(&raw);
+    cstr_free(&d);
+    cstr_reset(lit);
+}
+
+/* remove the two escapes that protect the f-string quoting */
+static void fstr_unquote(CString *s)
+{
+    CString o = {0};
+    int i = 0;
+
+    cstr_new(&o);
+    for (i = 0; i < s->size; i++) {
+        if (s->data[i] == '\\' && i + 1 < s->size
+            && (s->data[i + 1] == '"' || s->data[i + 1] == '\\'))
+            ++i;
+        cstr_ccat(&o, s->data[i]);
+    }
+    cstr_free(s);
+    *s = o;
+}
+
+/* lex one expression chunk into TS with the ordinary preprocessor */
+static void fstr_lex(TokenString *ts, CString *expr)
+{
+    TokenString *save_stack = macro_stack;
+    const int *save_ptr = macro_ptr;
+    CString buf = {0};
+
+    cstr_new(&buf);
+    cstr_cat(&buf, expr->data, expr->size);
+    cstr_ccat(&buf, ';');       /* sentinel: lexing never reaches the end of
+                                   the buffer, so tcc_close() is ours */
+    cstr_ccat(&buf, '\0');
+    tcc_open_bf(tcc_state, "<f-string>", buf.size);
+    memcpy(file->buffer, buf.data, buf.size);
+    macro_stack = NULL;         /* read the buffer, not an enclosing expansion */
+    macro_ptr = NULL;
+    for (;;) {
+        next();
+        if (tok == ';' || tok == TOK_EOF)
+            break;
+        tok_str_add2(ts, tok, &tokc);
+    }
+    tcc_close();
+    macro_stack = save_stack;
+    macro_ptr = save_ptr;
+    cstr_free(&buf);
+}
+
+/* body of an f-string: P points at the opening quote, LEN counts both quotes */
+static void parse_fstr_string(const char *p, int len)
+{
+    TokenString *ts = tok_str_alloc();
+    CString lit = {0}, expr = {0};
+    int i = 0, c = 0;
+
+    cstr_new(&lit);
+    tok_str_add(ts, TOK_C6_FSTR_BEG);
+    for (i = 1; i < len - 1; i++) {
+        c = (unsigned char)p[i];
+        if (c == '{' && i + 1 < len - 1 && p[i + 1] == '{') {
+            cstr_ccat(&lit, '{');           /* '{{' is a literal '{' */
+            ++i;
+            continue;
+        }
+        if (c == '}' && i + 1 < len - 1 && p[i + 1] == '}') {
+            cstr_ccat(&lit, '}');           /* '}}' is a literal '}' */
+            ++i;
+            continue;
+        }
+        if (c != '{') {
+            cstr_ccat(&lit, c);
+            continue;
+        }
+        /* an expression: '{' .. '}' , balanced over (), [] and {} */
+        fstr_add_lit(ts, &lit);
+        cstr_new(&expr);
+        {
+            int depth = 0, instr = 0, done = 0;
+            for (++i; i < len - 1; i++) {
+                c = (unsigned char)p[i];
+                if (c == '\\' && i + 1 < len - 1) {
+                    int c2 = p[i + 1];
+                    cstr_ccat(&expr, c);
+                    cstr_ccat(&expr, c2);
+                    ++i;
+                    if (c2 == '"')          /* opens or closes a nested '"' */
+                        instr = !instr;
+                    continue;
+                }
+                if (instr) {                /* inside a nested string literal */
+                    cstr_ccat(&expr, c);
+                    continue;
+                }
+                if (c == '\'') {            /* character literal: verbatim */
+                    cstr_ccat(&expr, c);
+                    for (++i; i < len - 1; i++) {
+                        c = (unsigned char)p[i];
+                        cstr_ccat(&expr, c);
+                        if (c == '\\' && i + 1 < len - 1) {
+                            cstr_ccat(&expr, p[++i]);
+                            continue;
+                        }
+                        if (c == '\'')
+                            break;
+                    }
+                    continue;
+                }
+                if (c == '{' || c == '(' || c == '[') {
+                    ++depth;
+                } else if (c == ')' || c == ']') {
+                    if (depth > 0)
+                        --depth;
+                } else if (c == '}') {
+                    if (depth > 0) {
+                        --depth;
+                    } else {
+                        done = 1;           /* the for() below eats the '}' */
+                        break;
+                    }
+                }
+                cstr_ccat(&expr, c);
+            }
+            if (!done)
+                tcc_error("f-string: missing '}' in \"%s\"", p + 1);
+        }
+        if (!expr.size)
+            tcc_error("f-string: '{}' needs an expression");
+        fstr_unquote(&expr);
+        tok_str_add(ts, TOK_C6_FSTR_EXPR);
+        fstr_lex(ts, &expr);
+        tok_str_add(ts, TOK_C6_FSTR_EXPR_END);
+        cstr_free(&expr);
+    }
+    fstr_add_lit(ts, &lit);
+    tok_str_add(ts, TOK_C6_FSTR_END);
+    tok_str_add(ts, 0);             /* end of the stream */
+    cstr_free(&lit);
+    begin_macro(ts, 1);             /* the parser owns it from here */
+}
+#endif
+
+
 /* we use 128 bit (64/112 needed) numbers */
 #define BN_SIZE 4
 
@@ -2782,7 +2950,7 @@ static void parse_number(const char *p)
 /* return next token without macro substitution */
 static void next_nomacro(void)
 {
-    int t = 0, c = 0, is_long = 0, len = 0;
+    int t = 0, c = 0, is_long = 0, is_fstr = 0, len = 0;
     TokenSym *ts = 0;
     uint8_t *p = 0, *p1 = 0;
     unsigned int h = 0;
@@ -2895,7 +3063,8 @@ maybe_newline:
             goto parse_simple;
 
     case 'a': case 'b': case 'c': case 'd':
-    case 'e': case 'f': case 'g': case 'h':
+    /* 'f' is taken out of the fast group: 'f"' starts an interpolation */
+    case 'e': case 'g': case 'h':
     case 'i': case 'j': case 'k': case 'l':
     case 'm': case 'n': case 'o': case 'p':
     case 'q': case 'r': case 's': case 't':
@@ -2958,6 +3127,20 @@ maybe_newline:
             }
             *--p = c = 'L';
         }
+        goto parse_ident_fast;
+
+    case 'f':
+#ifdef C6_EXT
+        /* f"..." : an interpolated string.  Only the quoting is decided
+           here; the body is kept raw (like TOK_PPSTR) and split into
+           literal and expression parts by parse_fstr_string(). */
+        if (p[1] == '"' && tcc_state->c6_ext) {
+            PEEKC(c, p);
+            is_long = 0;
+            is_fstr = 1;
+            goto str_const;
+        }
+#endif
         goto parse_ident_fast;
 
     case '0': case '1': case '2': case '3':
@@ -3027,7 +3210,7 @@ maybe_newline:
         cstr_ccat(&tokcstr, '\0');
         tokc.str.size = tokcstr.size;
         tokc.str.data = tokcstr.data;
-        tok = TOK_PPSTR;
+        tok = is_fstr ? TOK_C6_FSTR : TOK_PPSTR;
         break;
 
     case '<':
@@ -3750,7 +3933,10 @@ redo:
 
     next_nomacro();
     t = tok;
-    if (t >= TOK_IDENT && (parse_flags & PARSE_FLAG_PREPROCESS)) {
+    /* an f-string is a literal, not a name to look up: it must reach the
+       conversion below even though its token number is in the id range */
+    if (t >= TOK_IDENT && t != TOK_C6_FSTR
+        && (parse_flags & PARSE_FLAG_PREPROCESS)) {
         /* if reading from file, try to substitute macros */
         Sym *s = define_find(t);
         if (s) {
@@ -3771,6 +3957,16 @@ convert:
     } else if (t == TOK_PPSTR) {
         if (parse_flags & PARSE_FLAG_TOK_STR)
             parse_string(tokc.str.data, tokc.str.size - 1);
+#ifdef C6_EXT
+    } else if (t == TOK_C6_FSTR) {
+        if (parse_flags & PARSE_FLAG_TOK_STR) {
+            /* replace the one token by its normalised chunk stream, then
+               load its first token (tok_str_alloc holds it from here) */
+            parse_fstr_string(tokc.str.data, tokc.str.size - 1);
+            next();
+            return;
+        }
+#endif
     }
 }
 
@@ -3993,6 +4189,32 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "#define C6_GC_OWN     8\n"
           "#define C6_GC_INIT   16\n"
           "#endif\n"
+          /* f"..{expr}..": the compiler lowers an interpolation into a
+             builder: one runtime call per part, then one object.  The
+             value kinds the compiler can pass are int/bool/pointer and a
+             char range; everything else has to be formatted by hand. */
+          "#ifndef __TCC_FSTR_DEFINED\n"
+          "#define __TCC_FSTR_DEFINED 1\n"
+          "void __c6_fmt_beg(void);\n"
+          "void __c6_fmt_l(const char *s, unsigned long n);\n"
+          "void __c6_fmt_s(const char *s, unsigned long n);\n"
+          "void __c6_fmt_c(const char *s);\n"
+          "void __c6_fmt_ch(int c);\n"
+          "void __c6_fmt_sl(const void *pair);\n"
+          "void __c6_fmt_i(long long v);\n"
+          "void __c6_fmt_u(unsigned long long v);\n"
+          "void __c6_fmt_p(const void *p);\n"
+          "void __c6_fmt_b(int v);\n"
+          "void *__c6_fmt_end(int flags);\n"
+          "unsigned long long __c6_str_len(const void *p);\n"
+          "#endif\n"
+          /* 'err' keeps the message: the pointer a caller passes is usually
+             a slice of its own frame, which is gone by the time the handler
+             runs, so the runtime takes a copy of a non-literal one */
+          "#ifndef __TCC_ERRSET_DEFINED\n"
+          "#define __TCC_ERRSET_DEFINED 1\n"
+          "void __tcc_err_set_copy(int id, const char *msg);\n"
+          "#endif\n"
           , -1);
 #endif
     }
@@ -4100,17 +4322,14 @@ ST_FUNC void tccpp_new(TCCState *s)
     }
 
 #ifdef C6_EXT
-    if (!s->c6_ext) {
-        /* The c6 keywords are interned last; make them plain
-           identifiers when the extension is not enabled.  Note that
-           'test' may already be interned as an asm keyword, in which
-           case the range ends before TOK_C6_TEST. */
-        int t = 0;
-        for (t = TOK_C6_PACKAGE; t <= TOK_C6_FOREACH && t < tok_ident; t++)
-            tok_unintern(t);
-        if (TOK_C6_PACKAGE < tok_ident)
-            tok_ident = TOK_C6_PACKAGE;
-    }
+    /* The c6 keywords are interned last and are kept interned even when
+       the extension is not enabled: their token numbers are >= TOK_UIDENT,
+       so without -std=c6 they simply behave like ordinary identifiers
+       (everything the c6 parser does with them is gated on c6_ext).
+       tok_ident is deliberately *not* rolled back down to TOK_C6_PACKAGE:
+       a token number below tok_ident must never look like one of the
+       TOK_C6_* constants, or an ordinary identifier would be mistaken
+       for e.g. TOK_C6_FSTR by the lexer and the token stream code. */
 #endif
 
     /* we add dummy defines for some special macros to speed up tests

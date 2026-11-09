@@ -457,4 +457,12 @@
      DEF(TOK_C6_ASYNC,     "async")
      DEF(TOK_C6_AWAIT,     "await")
      DEF(TOK_C6_FOREACH,   "foreach")
+     /* f"..{expr}.." interpolation: the raw token, and the normalised
+        stream the parser reads (TOK_STR literal chunks around
+        TOK_C6_FSTR_EXPR .. TOK_C6_FSTR_EXPR_END groups) */
+     DEF(TOK_C6_FSTR,          "<f-string>")
+     DEF(TOK_C6_FSTR_BEG,      "<f-string-beg>")
+     DEF(TOK_C6_FSTR_EXPR,     "<f-string-expr>")
+     DEF(TOK_C6_FSTR_EXPR_END, "<f-string-expr-end>")
+     DEF(TOK_C6_FSTR_END,      "<f-string-end>")
 #endif

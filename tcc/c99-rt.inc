@@ -62,11 +62,18 @@ typedef struct C99CoPool C99CoPool;   /* completed with the async runtime */
 typedef struct C99ThRec C99ThRec;     /* threads started by this thread */
 typedef struct C99GcHdr C99GcHdr;     /* completed with the gc runtime */
 
+struct C99FmtBuf;           /* the f-string builder, defined further down */
+
 typedef struct C99ThCtx {
     C99DeferRec *dstack;  int dsp, stack_cap;
     C99DeferCtx *dctx;    int dcsp, ctx_cap;
     int err_flag, err_id;
     const char *err_msg;
+    /* the message of a non-literal 'err(...)': copied, because the caller's
+       frame is gone when the handler runs (same rule as libtcc1) */
+    char err_buf[512];
+    /* f-string builders, one per nesting depth (see __c6_fmt_beg()) */
+    struct C99FmtBuf **fmt_slot;  int fmt_nslot, fmt_depth;
     C99GcHdr *gc_pending; /* objects whose count reached zero */
     C99GcHdr *gc_pending_tail;
     int gc_pending_n;
@@ -414,6 +421,30 @@ C99_RT_UNUSED __c99_rt_linkage void __tcc_err_set(int id, const char *msg)
     th->err_flag = 1;
     th->err_id = id;
     th->err_msg = msg;
+}
+
+/* 'err(id, msg)' with a MSG that lives in the caller's frame: keep a copy */
+C99_RT_UNUSED __c99_rt_linkage void __tcc_err_set_copy(int id,
+                                                      const char *msg)
+{
+    C99ThCtx *th = __c99_th();
+    char *d = th->err_buf;
+    unsigned long i = 0;
+
+    th->err_flag = 1;
+    th->err_id = id;
+    if (!msg) {
+        th->err_msg = 0;
+        return;
+    }
+    if (msg >= d && msg < d + sizeof th->err_buf) {
+        th->err_msg = msg;          /* already ours: 'err(id, e.msg)' */
+        return;
+    }
+    for (i = 0; i + 1 < sizeof th->err_buf && msg[i]; i++)
+        d[i] = msg[i];
+    d[i] = 0;
+    th->err_msg = d;
 }
 
 C99_RT_UNUSED __c99_rt_linkage int __tcc_err_flag_get(void)
@@ -1582,5 +1613,281 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_gc_shutdown(void)
     __c99_gc_shut_down = 1;
     __c99_gc_release_roots();
     __c99_gc_free_all(__c99_th());
+}
+
+/* ------------------------------------------------------------------------
+   c6 extension runtime: f"..{expr}.."
+   The same builder stack as libtcc1, so both back-ends print the same bytes:
+   __c6_fmt_beg() once, one __c6_fmt_*() call per part, __c6_fmt_end() last.
+   ------------------------------------------------------------------------ */
+
+#define C99_FMT_SCRATCH 256
+
+typedef struct C99FmtBuf {
+    unsigned long len, cap;
+    char *heap;
+    char *out;                  /* the text of the last result of this depth */
+    unsigned long outcap;
+    char buf[C99_FMT_SCRATCH];
+} C99FmtBuf;
+
+C99_RT_UNUSED __c99_rt_linkage char *__c99_fmt_text(C99FmtBuf *b)
+{
+    return b->heap ? b->heap : b->buf;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_room(C99FmtBuf *b,
+                                                   unsigned long len)
+{
+    unsigned long cap = b->cap ? b->cap : C99_FMT_SCRATCH, i = 0;
+    char *np = 0, *old = 0;
+
+    if (b->len + len + 1 <= cap)
+        return;
+    while (cap < b->len + len + 1)
+        cap *= 2;
+    np = (char *)malloc(cap);
+    if (!np)
+        __c99_trap();
+    old = __c99_fmt_text(b);
+    for (i = 0; i < b->len; i++)
+        np[i] = old[i];
+    if (b->heap)
+        free(b->heap);
+    b->heap = np;
+    b->cap = cap;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_put(C99FmtBuf *b,
+                                                  const char *s,
+                                                  unsigned long len)
+{
+    unsigned long i = 0;
+    char *p = 0;
+
+    if (!len)
+        return;
+    __c99_fmt_room(b, len);
+    p = __c99_fmt_text(b);
+    for (i = 0; i < len; i++)
+        p[b->len + i] = s[i];
+    b->len += len;
+    p[b->len] = 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_dec(C99FmtBuf *b,
+                                                  unsigned long long v)
+{
+    char tmp[24];
+    int n = 0;
+
+    if (!v) {
+        __c99_fmt_put(b, "0", 1);
+        return;
+    }
+    while (v) {
+        tmp[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    }
+    __c99_fmt_room(b, (unsigned long)n);
+    while (n > 0)
+        __c99_fmt_text(b)[b->len++] = tmp[--n];
+    __c99_fmt_text(b)[b->len] = 0;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c99_fmt_hex(C99FmtBuf *b,
+                                                  unsigned long long v)
+{
+    char tmp[24];
+    int n = 0, d = 0;
+
+    __c99_fmt_put(b, "0x", 2);
+    if (!v) {
+        __c99_fmt_put(b, "0", 1);
+        return;
+    }
+    while (v) {
+        d = (int)(v & 15);
+        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        v >>= 4;
+    }
+    __c99_fmt_room(b, (unsigned long)n);
+    while (n > 0)
+        __c99_fmt_text(b)[b->len++] = tmp[--n];
+    __c99_fmt_text(b)[b->len] = 0;
+}
+
+/* the builder of nesting depth D, created the first time it is needed */
+C99_RT_UNUSED __c99_rt_linkage C99FmtBuf *__c99_fmt_slot(int d)
+{
+    C99ThCtx *th = __c99_th();
+    C99FmtBuf *b = 0;
+    struct C99FmtBuf **ns = 0;
+    int i = 0, n = 0;
+
+    if (d < 0)
+        __c99_trap();
+    if (d >= th->fmt_nslot) {
+        n = th->fmt_nslot ? th->fmt_nslot : 4;
+        while (n <= d)
+            n *= 2;
+        ns = (struct C99FmtBuf **)calloc(1, (unsigned long)n * sizeof *ns);
+        if (!ns)
+            __c99_trap();
+        for (i = 0; i < th->fmt_nslot; i++)
+            ns[i] = th->fmt_slot[i];
+        if (th->fmt_slot)
+            free(th->fmt_slot);
+        th->fmt_slot = ns;
+        th->fmt_nslot = n;
+    }
+    b = th->fmt_slot[d];
+    if (!b) {
+        b = (C99FmtBuf *)calloc(1, sizeof *b);
+        if (!b)
+            __c99_trap();
+        b->cap = C99_FMT_SCRATCH;
+        th->fmt_slot[d] = b;
+    }
+    return b;
+}
+
+C99_RT_UNUSED __c99_rt_linkage C99FmtBuf *__c99_fmt_cur(void)
+{
+    C99ThCtx *th = __c99_th();
+
+    if (th->fmt_depth <= 0)
+        __c99_trap();
+    return __c99_fmt_slot(th->fmt_depth - 1);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_beg(void)
+{
+    C99ThCtx *th = __c99_th();
+    C99FmtBuf *b = __c99_fmt_slot(th->fmt_depth);
+
+    b->len = 0;
+    __c99_fmt_text(b)[0] = 0;
+    th->fmt_depth++;
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_l(const char *s, unsigned long n)
+{
+    if (s)
+        __c99_fmt_put(__c99_fmt_cur(), s, n);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_s(const char *s, unsigned long n)
+{
+    C99FmtBuf *b = 0;
+
+    if (!s) {
+        __c99_fmt_put(__c99_fmt_cur(), "(null)", 6);
+        return;
+    }
+    b = __c99_fmt_cur();
+    if (n == (unsigned long)-1) {
+        for (n = 0; s[n]; ++n)
+            ;
+    }
+    __c99_fmt_put(b, s, n);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_ch(int c)
+{
+    C99FmtBuf *b = __c99_fmt_cur();
+    unsigned char ch = (unsigned char)c;
+
+    if (!b)
+        return;
+    __c99_fmt_put(b, (const char *)&ch, 1);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_c(const char *s)
+{
+    __c6_fmt_s(s, (unsigned long)-1);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_sl(const void *pair)
+{
+    const unsigned long *w = (const unsigned long *)pair;
+    unsigned long n = 0;
+
+    if (!pair)
+        return;
+    n = (unsigned long)w[1];
+    if (n && ((const char *)w[0])[n - 1] == 0)
+        --n;
+    __c6_fmt_s((const char *)w[0], n);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_i(long long v)
+{
+    C99FmtBuf *b = __c99_fmt_cur();
+
+    if (v < 0) {
+        __c99_fmt_put(b, "-", 1);
+        __c99_fmt_dec(b, 0ULL - (unsigned long long)v);
+    } else {
+        __c99_fmt_dec(b, (unsigned long long)v);
+    }
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_u(unsigned long long v)
+{
+    __c99_fmt_dec(__c99_fmt_cur(), v);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_p(const void *p)
+{
+    __c99_fmt_hex(__c99_fmt_cur(), (unsigned long long)(unsigned long)p);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void __c6_fmt_b(int v)
+{
+    __c99_fmt_put(__c99_fmt_cur(), v ? "true" : "false", v ? 4 : 5);
+}
+
+C99_RT_UNUSED __c99_rt_linkage void *__c6_fmt_end(int flags)
+{
+    C99ThCtx *th = __c99_th();
+    C99FmtBuf *b = __c99_fmt_cur();
+    char *r = 0, *p = 0;
+    unsigned long n = 0, i = 0;
+
+    n = b->len;
+    p = __c99_fmt_text(b);
+    th->fmt_depth--;
+    if (!(flags & C99_GC_FRESH)) {
+        if (b->outcap < n + 1) {
+            unsigned long cap = n + 1 + C99_FMT_SCRATCH;
+            char *np = (char *)calloc(1, cap);
+            if (!np)
+                __c99_trap();
+            if (b->out)
+                free(b->out);
+            b->out = np;
+            b->outcap = cap;
+        }
+        for (i = 0; i <= n; i++)
+            b->out[i] = p[i];
+        return b->out;
+    }
+    r = (char *)__c6_gc_new(1, n + 1, 0, flags & C99_GC_ATOMIC);
+    for (i = 0; i <= n; i++)
+        r[i] = p[i];
+    return r;
+}
+
+C99_RT_UNUSED __c99_rt_linkage unsigned long long __c6_str_len(const void *p)
+{
+    unsigned long n = 0;
+
+    if (!p)
+        return 0;
+    n = (unsigned long)(__c99_gc_hdr((void *)p)->meta & C99_GC_META_COUNT);
+    if (n && ((const char *)p)[n - 1] == 0)
+        --n;
+    return n;
 }
 

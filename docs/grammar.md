@@ -777,7 +777,12 @@ primary-expression     = …
                        | qualified-identifier
                        | try-expression
                        | await-expression
+                       | f-string ;                  (* 见 5.1 *)
                        | function-literal ;          (* 见 3.9 *)
+
+f-string               = "f" , string-literal ;      (* const char *，借用的文本 *)
+                       | "@" , "f" , string-literal ;
+                         (* @char：把拼好的文本做成托管对象；见 C84/C85/R24 *)
 
 await-expression       = "await" , unary-expression ;
                          (* 操作数最终必须落到一次 async 函数调用或
@@ -845,6 +850,28 @@ unary-expression，随后由约束 C2 要求该表达式的**根**必须是一�
 `try` 与 `catch` 可以组合，先 `try` 后 `catch` 没有意义（`try` 已经把
 错误传出去了），规范不禁止书写，但 `catch` 的操作数必须是**调用**而不是
 `try` 表达式。
+
+### 5.1 字符串插值 `f".."`
+
+`f` 与后面的字符串字面量之间不能有空白。字面量的体被切成「文本片段」与
+「插值」交替的序列：
+
+```
+    f"n={n} {{done}}"      (* 文本 "n="，插值 n，文本 " {done}" *)
+```
+
+* `{` 与 `}` 之间是一个**表达式**（`}` 必须配对，见 C86）；`{{` / `}}` 输出
+  字面的花括号，单个 `}` 是普通字符；
+* 表达式里出现的引号要写成 `\"`，因为整个 f-string 仍是一个字符串字面量；
+  其余转义（`\n`、`\t`、`\x41`、`\101`、`\\`）与普通字符串一致；
+* 各段从左到右求值，每段只求值一次；
+* 插值的类型必须是可格式化的（整数、`enum`、`_Bool`、`char`、指针、字符
+  切片、托管 `@char`），见 C84；
+* 按**静态类型**输出：`char` 是字符，字符常量 `'A'` 按 C 的规则是 `int`，
+  插它得到 `65`（要字符就用 `char` 变量或写 `{(char)'A'}`）；`n > 0` 这类
+  比较是 `int`，得到 `0`/`1`，`_Bool` 才得到 `false`/`true`；
+* `f".."` 的类型是 `const char *`，`@f".."` 的类型是 `@char`（托管引用，
+  见 8.1）；两者都不是常量表达式（C85）。
 
 ---
 
@@ -963,6 +990,9 @@ parameter-list    = identifier , { "," , identifier } ;
 | C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
 | C82 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
 | C83 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
+| C84 | f-string 的插值只接受整数、`enum`、`_Bool`、`char`、指针、字符切片和托管 `@char`；切片必须是字符切片 | `cannot interpolate a value of type 'double'`；`cannot interpolate 'int[:]': only a character slice holds text` |
+| C85 | `f".."` / `@f".."` 不是常量表达式，不能出现在文件作用域或 `static` 局部的初始化式里 | `an f-string is not a constant expression` |
+| C86 | f-string 里的 `{` 必须有配对的 `}`，且 `{}` 里要有一个表达式 | `f-string: missing '}' in ".."`；`f-string: '{}' needs an expression` |
 
 ---
 
@@ -1442,6 +1472,41 @@ defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再�
 * `static` 让它在 `-emit-header` 与 `module` 前缀改写之外，名字里的序号
   只有调试信息看得到。
 
+**R24 — `f".."` / `@f".."`**
+
+```
+    f"a{n}b"                                     (* const char * *)
+=>
+    __c6_fmt_beg();                              (* 压一个构造器到本线程的栈上 *)
+    __c6_fmt_l("a", 1);                          (* 文本片段：立即拷进缓冲 *)
+    __c6_fmt_i((long long)(n));                  (* 插值：按类型选一个 __c6_fmt_* *)
+    __c6_fmt_l("b", 1);
+    __c6_fmt_end(0)                              (* 借用：文本在本深度的缓冲里 *)
+
+    @f"a{n}b"                                    (* @char *)
+=>
+    … 同上 …
+    __c6_fmt_end(1)                              (* 拷成托管对象，计数 1 *)
+```
+
+每一段按**静态类型**选调用：
+
+| 插值的类型 | 生成的调用 |
+|---|---|
+| `char` / `signed char` / `unsigned char` | `__c6_fmt_ch((int)x)` |
+| `short` / `int` / `long long` / `enum`（有符号） | `__c6_fmt_i((long long)x)` |
+| 同上但无符号 | `__c6_fmt_u((unsigned long long)x)` |
+| `_Bool` | `__c6_fmt_b((int)x)` |
+| `const char *`（含 `char[N]`、`char[:]`） | `__c6_fmt_s(p, n)` |
+| 托管 `@char` | `__c6_fmt_s(p, __c6_str_len(p))` |
+| 其它指针 | `__c6_fmt_p((const void *)x)` |
+| 字符切片 | `__c6_fmt_sl(&x)` |
+
+构造器**不带指针参数**：`__c6_fmt_beg()` 从每线程的槽数组里按嵌套深度
+取一个（深度在编译期就是已知的调用配对），所以嵌套、递归、循环互不干扰。
+`__c6_fmt_end(0)` 返回该槽的缓冲（下一次同深度的 `f".."` 会覆盖它，见
+C84 的借用说明）；`__c6_fmt_end(1)` 把文本拷成一个 `@char` 对象并返回它。
+
 ---
 
 切片配合数组、函数与结构体：
@@ -1674,6 +1739,13 @@ int main(void)
 | 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | 声明能过，但结构体→接口的转换点会报 `'{' expected (got ';')`——接口方法目前只支持标量签名，这是元组之前就有的缺口（与约束 C51–C60 无关） |
 | `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
+| `f"{x}"` 而 `x` 是浮点、结构体、函数指针、非字符切片 | 约束 C84：没有格式化语法，先自己格式化再插进来 |
+| `f"{c}"` 想得到字符 `c` 的数值 | 插 `char` 输出的是字符本身，数值写 `{(int)c}` |
+| 宽度 / 精度 / 命名参数（`{x:>8}`、`{x:.2f}`、`{x=}`） | 不提供：`{` 与 `}` 之间只是一个表达式 |
+| 文件作用域或 `static` 局部初始化式里的 `f".."` / `@f".."` | 约束 C85：不是常量表达式 |
+| `f "{x}"`（`f` 与引号之间有空白） | 词法上不是 f-string：那是标识符 `f` 后面跟一个字符串字面量 |
+| 把 `f".."` 的结果存下来长期使用（不带 `@`） | 借用：下一次同深度的 `f".."` 会覆盖它；要留住写 `@f".."` |
+
 ---
 
 ## 11. 实现位置
@@ -1698,6 +1770,11 @@ int main(void)
 | `task` | `c6_task_decl` / `c6_task_check_handle` / `c6_task_defer_destroy` | `tcc/tccgen.c` |
 | 顶层调度（64 槽就绪链表 + 一次 `select()`） | `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run` | `tcc/lib/libtcc1.c` |
 | `!error` | `c6_parse_fallible_suffix` / `c6_apply_fallible`，`FuncAttr.func_fallible` | `tcc/tccgen.c`、`tcc/tcc.h` |
+| `f".."` 切分 | `parse_fstr_string` / `fstr_lex` / `fstr_add_lit` / `fstr_unquote`，`TOK_C6_FSTR` → `TOK_C6_FSTR_BEG` … `TOK_C6_FSTR_END` | `tcc/tccpp.c`、`tcc/tcctok.h` |
+| `f".."` 下降 | `c6_fstr_expr` / `c6_fstr_lit` / `c6_fstr_piece`（`unary()` 里的 `TOK_C6_FSTR_BEG` 与 `'@'`） | `tcc/tccgen.c` |
+| `@f".."` 的托管结果 | `C6_GC_FRESH` + `C6_GC_ATOMIC` 的 `__c6_fmt_end` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| f-string 运行时 | `__c6_fmt_beg` / `__c6_fmt_l` / `__c6_fmt_s` / `__c6_fmt_c` / `__c6_fmt_ch` / `__c6_fmt_sl` / `__c6_fmt_i` / `__c6_fmt_u` / `__c6_fmt_p` / `__c6_fmt_b` / `__c6_fmt_end` / `__c6_str_len` | `tcc/lib/libtcc1.c` |
+| f-string 的 C 后端 | 同一组 `__c6_fmt_*` 的 C 实现、`c99_runtime_names[]` 里的声明 | `tcc/c99-rt.inc`、`tcc/c99-gen.c`、`tcc/tccpp.c` |
 | `try` | `c6_try_parse`（`unary()` 的前缀分支） | `tcc/tccgen.c` |
 | `catch` | `c6_catch_parse`（`expr_catch()` 层，位于 `expr_cond()` 之下） | `tcc/tccgen.c` |
 | `#macro` / `__local` | `parse_c6_macro` / `c6_hygiene_body` | `tcc/tccpp.c` |

@@ -976,6 +976,71 @@ void drop(struct File *self) { close(self->fd); }
 可拷）；环不会静默泄漏 —— 编译期就报错；另外 `p = NULL` 就是 `reset()`，
 不额外引入成员函数。详细的设计与取舍见 [docs/gc-design.md](docs/gc-design.md)。
 
+### 字符串插值 `f"..{expr}.."`
+
+```c
+int n = 42;
+const char *s = "abc";
+char[:] m = "hello";
+
+const char *a = f"n={n}";              /* "n=42"，类型是 const char * */
+const char *b = f"[{s}] [{m}]";        /* "[abc] [hello]"，切片不带结尾的 0 */
+const char *c = f"{{}} {n}";           /* "{} 42"：{{ }} 是字面花括号 */
+const char *d = f"{(n > 0) ? \"pos\" : \"neg\"}";  /* 表达式里的引号要写 \" */
+@char keep = @f"saved {n}";            /* 托管版本：结果是一个 @char 对象 */
+printf("%s %s\n", f"{n}", keep);        /* 也可以直接当实参用掉 */
+```
+
+`f".."` 只是把字面文本和插值拼起来：没有格式化语法、没有宽度/精度、没有
+命名参数——要控制格式就先自己格式化好再插进去。`@` 是唯一的修饰，表示
+"把结果做成托管对象"。
+
+| 插值的类型 | 输出 |
+|---|---|
+| `char` / `signed char` / `unsigned char` | 字符本身；要数值写 `{(int)c}`。字符常量 `'A'` 在 C 里是 `int`，所以插它得到 `65` |
+| `short` / `int` / `long long`（含有无符号）、`enum` | 十进制 |
+| `_Bool` | `true` / `false` |
+| `const char *`、`char[N]`、`char[:]`、`@char` | 文本（空指针输出 `(null)`） |
+| 其他指针 | `0x...`（空指针 `0x0`） |
+| 其他类型（`float`/`double`、结构体、函数指针、非字符切片…） | 编译错误 C84 |
+
+规则：
+
+- `f".."` 的结果是**借用**：文本放在当前嵌套深度的临时缓冲里，一直有效到
+  "同一个深度的下一次 `f".."` 求值"为止。留住它就写 `@f".."`（托管，生命
+  周期跟着引用走），否则当场用掉（`printf`、`strlen`、传参）；
+- `@f".."` 的结果是 `@char`：计数为 1 的普通托管对象，可以存进 `@char`、
+  `shared @char`（计数是原子的）、`own @char`，也可以当普通 `const char *`
+  读；长度由对象头记录，`__c6_str_len(p)` 直接可用；
+- 插值是任意表达式，各段从左到右求值且只求值一次：
+  `f"{i++}{i}"` 是 `"01"`；
+- `{{` / `}}` 输出字面的 `{` / `}`；单个 `}` 是普通字符；`{` 必须有配对的
+  `}`（缺了报 C86）。表达式里的引号要转义成 `\"`，因为 f".." 本身是一个
+  字符串字面量；
+- 嵌套直接写：`f"a{f\"b{n}c\"}d"`（内层引号加 `\`），每深一层多一个 `\`；
+  嵌套的每一层有自己的缓冲，互不覆盖；
+- 转义与普通字符串一致：`\n`、`\t`、`\"`、`\\`、`\x41`、`\101` 都可用，
+  并且只有 `{{`/`}}` 是花括号的转义（普通字符串里没有这一条）；
+- `f".."` 不是常量表达式：不能出现在文件作用域或 `static` 局部的初始化式里
+  （C85）；`@f".."` 也一样（它要分配对象）；
+- 只有 `-std=c6` 下 `f"` 才被认成 f-string：其他模式下 `f"x"` 仍是"标识符
+  f 跟着一个字符串字面量"，语法与原来完全一样。
+
+实现方式是编译期把 `f".."` 拆成「字面片段 / 插值」交替的 token 流，再逐段
+发运行时构造器调用（`__c6_fmt_beg` → `__c6_fmt_l`/`__c6_fmt_i`/… →
+`__c6_fmt_end`）。构造器栈按嵌套深度分槽、每线程一份，所以嵌套、递归和循环
+都不会互相踩；C99 后端把同一串调用原样翻成 C（`tcc/c99-rt.inc` 里有一份
+等价的 C 实现），两个后端行为一致。
+
+完整可运行示例见 [examples/fstr_demo.c](examples/fstr_demo.c)：
+
+```sh
+./tcc/tcc -B tcc -std=c6 -run examples/fstr_demo.c
+```
+
+回归用例见 [tests/fstr.c](tests/fstr.c)（`make selftest` 里跑），编译期诊断见
+[tests/errors/fstr.c](tests/errors/fstr.c)。
+
 ### #macro / __local
 
 ```c
@@ -1217,7 +1282,8 @@ of one program share a single runtime (errors, coroutines and joins cross TU
 boundaries); compilers without weak symbols fall back to one private copy per
 TU.  Features covered by `tests/*.c` include `defer`/`errdefer`, `err`,
 `try`/`catch`, slices, `foreach`, tuples, methods/interfaces, `typename`,
-`async`/`await`, `co`, `go` and `test` blocks:
+`async`/`await`, `co`, `go`, string interpolation (`f".."` / `@f".."`; the
+runtime prelude carries the same `__c6_fmt_*` builder) and `test` blocks:
 
     tcc/tcc -std=c6 -B tcc -o out.c prog.c
     cc -std=c99 -pedantic -Wall -Wextra -Werror -o prog out.c
