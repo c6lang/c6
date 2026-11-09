@@ -247,6 +247,334 @@ static int c6_tuple_btype(CType *type);
 static int c6_tuple_subscript(void);
 static int c6_tuple_lead_kind(void);
 
+/* c6 capture kinds: 0 means "not a capture alias" */
+#define C6_CAP_VALUE 1
+#define C6_CAP_TYPE  2
+#define C6_CAP_ZERO  3
+
+/* One 'closure RET (P...)' type.  The tag is the hidden
+   'struct __c6_closure_<hash>' holding { code, env }; all types with the same
+   normalized signature share it.  The descriptors live as long as the
+   translation unit (like slices/tuples). */
+typedef struct C6Closure {
+    struct C6Closure *next;
+    int tag;                    /* the hidden struct tag token */
+    Sym *tag_sym;               /* its Sym (never looked up by name) */
+    unsigned long long hash;
+    CType ftype;                /* signature as written: RET (P...) */
+    CType code_type;            /* RET (void *, P...) */
+    char *sig_text;             /* normalized signature, collision check */
+    int variadic, fallible;
+} C6Closure;
+static C6Closure *c6_closures = 0;
+static Sym *c6_env_base_sym = NULL;
+static C6Closure *c6_closure_of_type(CType *type);
+static void c6_closure_sig_text(char *buf, int size, CType *ftype);
+static void c6_closure_btype(CType *type);
+/* non-zero while a type is being built for a closure signature: every Sym
+   must live on the global stack, even when the declaration is written inside
+   a function */
+static int c6_sym_global = 0;
+/* c6: monotonic symbol sequence, assigned in sym_push2().  Literal capture
+   analysis compares it with the sequence at the literal's body start. */
+static int c6_sym_seq = 0;
+
+static void type_to_str(char *buf, int buf_size, CType *type,
+                        const char *varstr);
+static void convert_parameter_type(CType *pt);
+static void struct_layout(CType *type, AttributeDef *ad);
+static void c6_rt_begin(const char *name);
+static void c6_rt_end(const char *name, int nargs);
+static Sym *c6_env_base_tag(void);
+
+/* make 'T *' with the pointer's type symbol on the global stack.  The
+   compiler may be inside a function (a closure type can be written in a
+   block), but the hidden type must survive the block. */
+static CType c6_global_ptr(CType *t)
+{
+    CType p = {0};
+    Sym *s = sym_push2(&global_stack, SYM_FIELD, 0, -1);
+    s->type = *t;
+    s->type.gq = 0;
+    p.t = VT_PTR;
+    p.ref = s;
+    p.gq = 0;
+    return p;
+}
+
+/* Is TYPE expressible at file scope (no block-scope tag, no VLA)?  With
+   REJECT_ANON, anonymous tags are rejected too (a closure signature must
+   name its types so that two translation units agree on the hash). */
+static int c6_type_global_ex(CType *type, int reject_anon)
+{
+    int bt = type->t & VT_BTYPE;
+
+    if (type->t & VT_VLA)
+        return 0;
+    if (c6_closure_of_type(type))
+        return 1;                    /* named by its signature hash */
+    if (bt == VT_STRUCT) {
+        C6Slice *sl = c6_slice_of_type(type);
+        if (sl)
+            return c6_type_global_ex(&sl->elem, reject_anon);
+        {
+            C6Tuple *tp = c6_tuple_of_type(type);
+            int i = 0;
+            if (tp) {
+                for (i = 0; i < tp->n; i++)
+                    if (!c6_type_global_ex(&tp->elem[i], reject_anon))
+                        return 0;
+                return 1;
+            }
+        }
+    }
+    if (bt == VT_PTR) {
+        Sym *s = type->ref;
+        if (type->t & VT_ARRAY) {
+            if (!s)
+                return 0;
+            return c6_type_global_ex(&s->type, reject_anon);
+        }
+        if (!s)
+            return 1;                 /* void * */
+        return c6_type_global_ex(&s->type, reject_anon);
+    }
+    if (bt == VT_FUNC) {
+        Sym *f = type->ref, *p = 0;
+        CType rt = {0}, pt = {0};
+        if (!f)
+            return 0;
+        rt = f->type;
+        if (!c6_type_global_ex(&rt, reject_anon))
+            return 0;
+        for (p = f->next; p; p = p->next) {
+            pt = p->type;
+            convert_parameter_type(&pt);
+            if (!c6_type_global_ex(&pt, reject_anon))
+                return 0;
+        }
+        return 1;
+    }
+    if (bt == VT_STRUCT || IS_ENUM(type->t)) {
+        Sym *s = type->ref;
+        if (!s || s->sym_scope != 0)
+            return 0;
+        if (reject_anon && (s->v & ~SYM_STRUCT) >= SYM_FIRST_ANOM)
+            return 0;
+        return 1;
+    }
+    return 1;
+}
+
+static unsigned long long c6_fnv1a(const char *s)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* 'RET (P...)' in a stable textual form.  Parameter top-level qualifiers and
+   array/function spellings are normalized exactly like the C function type
+   compatibility rules. */
+static void c6_closure_sig_text(char *buf, int size, CType *ftype)
+{
+    Sym *f = ftype->ref, *p = 0;
+    char tmp[512] = {0};
+    CType rt = {0}, pt = {0};
+    int n = 0;
+
+    buf[0] = '\0';
+    if (!f) {
+        pstrcat(buf, size, "<invalid>");
+        return;
+    }
+    rt = f->type;
+    rt.t &= ~VT_QUAL;
+    type_to_str(tmp, sizeof tmp, &rt, NULL);
+    pstrcat(buf, size, tmp);
+    if (f->f.func_fallible)
+        pstrcat(buf, size, "!error");
+    pstrcat(buf, size, "(");
+    for (p = f->next; p; p = p->next) {
+        pt = p->type;
+        convert_parameter_type(&pt);
+        pt.t &= ~VT_QUAL;
+        type_to_str(tmp, sizeof tmp, &pt, NULL);
+        if (n++)
+            pstrcat(buf, size, ", ");
+        pstrcat(buf, size, tmp);
+    }
+    if (f->f.func_type == FUNC_ELLIPSIS) {
+        if (n++)
+            pstrcat(buf, size, ", ");
+        pstrcat(buf, size, "...");
+    }
+    pstrcat(buf, size, ")");
+    if (f->f.func_call) {
+        snprintf(tmp, sizeof tmp, "#cc%d", f->f.func_call);
+        pstrcat(buf, size, tmp);
+    }
+}
+
+/* the hidden empty struct that gives '@' a pointee for the environment */
+static Sym *c6_env_base_tag(void)
+{
+    if (!c6_env_base_sym) {
+        int tok = tok_alloc_const("__c6_env_base") | SYM_STRUCT;
+        c6_env_base_sym = sym_push2(&global_stack, tok, VT_STRUCT, 0);
+        c6_env_base_sym->type.t = VT_STRUCT;
+        c6_env_base_sym->type.ref = NULL;
+        c6_env_base_sym->type.gq = C6_GQ_MANAGED;
+        c6_env_base_sym->c = 1;
+        c6_env_base_sym->r = 1;
+    }
+    return c6_env_base_sym;
+}
+
+static C6Closure *c6_closure_of_type(CType *type)
+{
+    Sym *tag = NULL;
+    C6Closure *cl = NULL;
+
+    if (!tcc_state->c6_ext || (type->t & VT_BTYPE) != VT_PTR || !type->ref)
+        return NULL;
+    tag = type->ref->type.ref;
+    if (!tag || !tag->a.c6_closure)
+        return NULL;
+    for (cl = c6_closures; cl; cl = cl->next)
+        if (cl->tag_sym == tag)
+            return cl;
+    return NULL;
+}
+
+/* Build (or find) the closure type for a function type.  The caller must
+   have forced c6_sym_global and local_scope = 0 while parsing the signature,
+   so 'ftype' and every pointer/parameter symbol it refers to are global. */
+static CType c6_closure_get(CType *ftype)
+{
+    CType ft = {0}, code = {0}, code_ptr = {0}, env = {0}, env_ptr = {0};
+    CType ct = {0}, out = {0}, vp = {0};
+    Sym *f = NULL, *nf = NULL, *ep = NULL, *tag = NULL;
+    Sym *cf = NULL, *ef = NULL, *scratch = NULL;
+    C6Closure *cl = NULL;
+    char sig[4096] = {0};
+    char name[64] = {0};
+    unsigned long long h = 0;
+    int save_global = 0, save_scope = 0, tok = 0;
+
+    if ((ftype->t & VT_BTYPE) != VT_FUNC || !ftype->ref)
+        tcc_error("a 'closure' type needs a full signature: "
+                  "'closure RET (parameters)'");
+    ft = *ftype;
+    ft.t &= ~(VT_STORAGE | VT_QUAL);
+    f = ft.ref;
+    if (f->f.func_async)
+        tcc_error("a 'closure' type cannot wrap an 'async' function");
+    if (f->f.func_type == FUNC_OLD) {
+        if (f->next)
+            tcc_error("a 'closure' type needs a full signature: "
+                      "'closure RET (parameters)'");
+        f->f.func_type = FUNC_NEW;      /* '()' takes no parameters */
+    }
+    if (!c6_type_global_ex(&ft, 1))
+        tcc_error("a closure signature cannot use a type declared in a block "
+                  "or an anonymous 'struct'/'union'/'enum' (give it a tag)");
+
+    c6_closure_sig_text(sig, sizeof sig, &ft);
+    h = c6_fnv1a(sig);
+    for (cl = c6_closures; cl; cl = cl->next) {
+        if (cl->hash != h)
+            continue;
+        if (strcmp(cl->sig_text, sig) != 0)
+            tcc_error("internal error: closure signature hash collision");
+        ct.t = VT_STRUCT;
+        ct.ref = cl->tag_sym;
+        out = c6_global_ptr(&ct);
+        out.gq = C6_GQ_MANAGED;
+        out.ref->type.gq = C6_GQ_MANAGED;
+        return out;
+    }
+
+    save_global = c6_sym_global;
+    save_scope = local_scope;
+    c6_sym_global = 1;
+    local_scope = 0;
+
+    tag = c6_env_base_tag();
+    (void)tag;
+    snprintf(name, sizeof name, "__c6_closure_%016llx", h);
+    tok = tok_alloc_const(name) | SYM_STRUCT;
+    tag = sym_push2(&global_stack, tok, VT_STRUCT, 0);
+    tag->type.t = VT_STRUCT;
+    tag->type.ref = NULL;
+    tag->type.gq = C6_GQ_MANAGED;
+    tag->a.c6_closure = 1;
+    tag->c = 2 * PTR_SIZE;
+    tag->r = PTR_SIZE;
+
+    /* code = RET (*)(void *, P...) */
+    nf = sym_push2(&global_stack, SYM_FIELD, 0, 0);
+    nf->type = f->type;
+    nf->a = f->a;
+    nf->f = f->f;
+    nf->f.func_args = f->f.func_args + 1;
+    vp.t = VT_VOID;
+    vp.ref = NULL;
+    env_ptr = c6_global_ptr(&vp);
+    ep = sym_push2(&global_stack, tok_alloc_const("__c6_env"), 0, 0);
+    ep->type = env_ptr;
+    ep->r = VT_LOCAL | VT_LVAL;
+    ep->next = f->next;
+    nf->next = ep;
+    code = ft;
+    code.ref = nf;
+    code_ptr = c6_global_ptr(&code);
+
+    /* env = @__c6_env_base * */
+    env.t = VT_STRUCT;
+    env.ref = c6_env_base_tag();
+    env_ptr = c6_global_ptr(&env);
+    env_ptr.gq = C6_GQ_MANAGED;
+    env_ptr.ref->type.gq = C6_GQ_MANAGED;
+
+    cf = sym_push2(&scratch, tok_alloc_const("__c6_code") | SYM_FIELD, 0, 0);
+    cf->type = code_ptr;
+    cf->c = 0;
+    cf->r = 0;
+    ef = sym_push2(&scratch, tok_alloc_const("__c6_env") | SYM_FIELD, 0, 0);
+    ef->type = env_ptr;
+    ef->c = PTR_SIZE;
+    ef->r = 0;
+    cf->next = ef;
+    ef->next = NULL;
+    tag->next = cf;
+
+    cl = tcc_mallocz(sizeof *cl);
+    cl->tag = tok;
+    cl->tag_sym = tag;
+    cl->hash = h;
+    cl->ftype = ft;
+    cl->code_type = code;
+    cl->sig_text = tcc_strdup(sig);
+    cl->variadic = f->f.func_type == FUNC_ELLIPSIS;
+    cl->fallible = f->f.func_fallible;
+    cl->next = c6_closures;
+    c6_closures = cl;
+
+    ct.t = VT_STRUCT;
+    ct.ref = tag;
+    out = c6_global_ptr(&ct);
+    out.gq = C6_GQ_MANAGED;
+    out.ref->type.gq = C6_GQ_MANAGED;
+
+    c6_sym_global = save_global;
+    local_scope = save_scope;
+    return out;
+}
+
 /* the tuple whose tag is TYPE's tag, or NULL */
 static C6Tuple *c6_tuple_of_type(CType *type)
 {
@@ -499,15 +827,26 @@ static void do_Static_assert(void);
 /* handed to C.  The body therefore sees only its parameters and the file    */
 /* scope: a name that was a local or a parameter where the literal stood is  */
 /* a capture, and a capture is an error.                                    */
+typedef struct C6Cap {
+    int tok;            /* source name (already stripped of SYM_*) */
+    CType type;         /* captured type (borrow bit cleared) */
+    int off;            /* env field offset (0 for TYPE/ZERO) */
+    unsigned char kind; /* C6_CAP_VALUE / C6_CAP_TYPE / C6_CAP_ZERO */
+} C6Cap;
+
 typedef struct C6Lit {
     struct C6Lit *next;
     Sym *sym;           /* the 'static' function the literal becomes */
     int name;           /* its synthesized name, '__c6_fn_N' */
     int *params;        /* parameter name tokens (0: the parameter is unnamed) */
     int nparams;
-    int *caps;          /* block scope names visible where the literal stood */
+    C6Cap *caps;        /* names visible where the literal stood */
     int ncaps;
+    int capturing;      /* at least one C6_CAP_VALUE */
     CType ftype;        /* the type as written, e.g. 'void(int)' */
+    CType code_type;    /* RET (void *, P...) when capturing */
+    CType env_type;     /* hidden @struct __c6_env_N */
+    CType closure_type; /* @struct __c6_closure_<hash> */
     TokenString *body;  /* '{' ... '}' */
 } C6Lit;
 
@@ -522,6 +861,35 @@ static void c6_lit_parse(void);
 static int c6_lit_decl_lead(void);
 static void c6_lit_infer_decl(void);
 static void c6_apply_fallible(CType *type);
+static void c6_lit_push_captures(C6Lit *lit);
+static void c6_lit_env_push(void);
+static int c6_closure_call_prep(void);
+static void block(int flags);
+static void sym_push_params(Sym *ref);
+static int c6_lit_scanning;
+static Sym *c6_lit_env_sym = NULL;
+
+static void c6_lit_function_pointer_error(void);
+static void c6_lit_function_pointer_error(void)
+{
+    C6Lit *lit = NULL;
+    int i = 0;
+    if (!vtop->c6_lit_src)
+        return;
+    lit = vtop->c6_lit_src;
+    if ((vtop[-1].type.t & VT_BTYPE) != VT_PTR
+        || !vtop[-1].type.ref
+        || (vtop[-1].type.ref->type.t & VT_BTYPE) != VT_FUNC)
+        return;
+    for (i = 0; i < lit->ncaps; i++)
+        if (lit->caps[i].kind == C6_CAP_VALUE) {
+            tcc_error("a function literal cannot capture '%s': without "
+                      "captures it is a plain function pointer, so its body "
+                      "sees only its parameters and the file scope (pass the "
+                      "value in as a parameter)",
+                      get_tok_str(lit->caps[i].tok, NULL));
+        }
+}
 
 /* A name that resolves inside the literal's own body is fine; everything else
    that was a block scope name where the literal was written is a capture that
@@ -532,17 +900,260 @@ static void c6_lit_cap_check(int v, Sym *s)
     C6Lit *lit = c6_lit_replay;
     int i = 0;
 
-    if (!lit || !lit->ncaps || (s && s->sym_scope != 0))
+    if (!lit || c6_lit_scanning || !lit->ncaps)
+        return;
+    if (lit->capturing)
+        return;                     /* V2 aliases handle captured names */
+    if (s && s->c6_cap_kind) {
+        /* a TYPE/ZERO alias of a plain function-pointer literal: V1 still
+           rejects the reference, the alias must not hide it */
+        tcc_error("a function literal cannot capture '%s': without captures "
+                  "it is a plain function pointer, so its body sees only its "
+                  "parameters and the file scope (pass the value in as a "
+                  "parameter)", get_tok_str(v & ~(SYM_STRUCT | SYM_FIELD),
+                                             NULL));
+    }
+    if (s && s->sym_scope != 0)
         return;
     v &= ~(SYM_STRUCT | SYM_FIELD);
     for (i = 0; i < lit->ncaps; i++) {
-        if (lit->caps[i] != v)
+        if (lit->caps[i].tok != v)
             continue;
         tcc_error("a function literal cannot capture '%s': without captures "
                   "it is a plain function pointer, so its body sees only its "
                   "parameters and the file scope (pass the value in as a "
                   "parameter)", get_tok_str(v, NULL));
     }
+}
+
+/* --- capture scan ------------------------------------------------------- */
+static int c6_lit_scanning = 0;
+static C6Lit *c6_lit_scan_lit = NULL;
+static int c6_lit_scan_base = 0;
+static int c6_scan_uneval = 0;
+
+static C6Cap *c6_lit_cap_find(C6Lit *lit, int tok)
+{
+    int i = 0;
+    for (i = 0; i < lit->ncaps; i++)
+        if (lit->caps[i].tok == tok)
+            return &lit->caps[i];
+    return NULL;
+}
+
+static C6Cap *c6_lit_cap_add(C6Lit *lit, int tok, CType *type, int kind)
+{
+    C6Cap *cap = c6_lit_cap_find(lit, tok);
+    if (cap) {
+        if (cap->kind == C6_CAP_ZERO && kind == C6_CAP_VALUE)
+            cap->kind = C6_CAP_VALUE;
+        return cap;
+    }
+    lit->caps = tcc_realloc(lit->caps, (lit->ncaps + 1) * sizeof *lit->caps);
+    cap = &lit->caps[lit->ncaps++];
+    memset(cap, 0, sizeof *cap);
+    cap->tok = tok;
+    cap->type = *type;
+    cap->type.t &= ~VT_STORAGE;
+    cap->type.gq &= ~C6_GQ_BORROW;
+    cap->kind = kind;
+    return cap;
+}
+
+static void c6_lit_scan_note(int tok, Sym *s, int uneval)
+{
+    C6Lit *lit = c6_lit_scan_lit;
+    int v = 0;
+
+    if (!c6_lit_scanning || !lit || !s)
+        return;
+    v = tok & ~(SYM_STRUCT | SYM_FIELD);
+    if (s->c6_cap_kind) {
+        c6_lit_cap_add(lit, v, &s->type,
+                       s->c6_cap_kind == C6_CAP_TYPE ? C6_CAP_TYPE :
+                       s->c6_cap_kind == C6_CAP_ZERO ? C6_CAP_ZERO :
+                       C6_CAP_VALUE);
+        return;
+    }
+    if (s->sym_scope == 0)
+        return;
+    if (s->c6_sym_seq >= c6_lit_scan_base)
+        return;
+    if (s->a.c6_receiver)
+        tcc_error("a closure cannot capture the method receiver '%s': it is "
+                  "a borrow and the closure may outlive the call (capture "
+                  "the values you need, or pass it as a parameter)",
+                  get_tok_str(v, NULL));
+    if (IS_ENUM_VAL(s->type.t))
+        tcc_error("a closure cannot capture the constant '%s': move it to "
+                  "file scope", get_tok_str(v, NULL));
+    if ((s->type.t & VT_BTYPE) == VT_FUNC)
+        tcc_error("a closure cannot capture the function '%s' declared in a "
+                  "block: move the declaration to file scope",
+                  get_tok_str(v, NULL));
+    if (s->type.t & VT_STATIC)
+        tcc_error("a closure cannot capture the block-scope 'static' '%s': "
+                  "move it to file scope", get_tok_str(v, NULL));
+    if (s->type.t & VT_ARRAY) {
+        if (uneval) {
+            c6_lit_cap_add(lit, v, &s->type, C6_CAP_ZERO);
+            return;
+        }
+        tcc_error("a closure cannot capture the array '%s': pass a slice "
+                  "'T[:]' or a pointer instead", get_tok_str(v, NULL));
+    }
+    if (s->type.t & VT_VLA)
+        tcc_error("a closure cannot capture the variable length array '%s': "
+                  "its size is only known at run time", get_tok_str(v, NULL));
+    if (!c6_type_global_ex(&s->type, 0))
+        tcc_error("a closure cannot capture '%s': its type is declared in a "
+                  "block (move the type to file scope)", get_tok_str(v, NULL));
+    if (c6_type_gq(&s->type) & C6_GQ_OWN)
+        tcc_error("a closure cannot capture '%s': an 'own' reference cannot "
+                  "be copied", get_tok_str(v, NULL));
+    if (c6_type_gq(&s->type) & C6_GQ_WEAK)
+        tcc_error("a closure cannot capture '%s': upgrade the 'weak' "
+                  "reference to '@T' first", get_tok_str(v, NULL));
+    if ((s->type.t & VT_BTYPE) == VT_STRUCT && c6_is_managed(&s->type))
+        tcc_error("a closure cannot capture '%s': it holds managed references "
+                  "and cannot be copied by value (capture the '@T' owner "
+                  "instead)", get_tok_str(v, NULL));
+    c6_lit_cap_add(lit, v, &s->type, uneval ? C6_CAP_ZERO : C6_CAP_VALUE);
+}
+
+static void c6_lit_scan_note_type(int tok, Sym *s)
+{
+    C6Lit *lit = c6_lit_scan_lit;
+    int v = 0;
+
+    if (!c6_lit_scanning || !lit || !s)
+        return;
+    v = tok & ~(SYM_STRUCT | SYM_FIELD);
+    if (s->c6_cap_kind) {
+        c6_lit_cap_add(lit, v, &s->type, C6_CAP_TYPE);
+        return;
+    }
+    if (s->sym_scope == 0)
+        return;
+    if (s->c6_sym_seq >= c6_lit_scan_base)
+        return;
+    c6_lit_cap_add(lit, v, &s->type, C6_CAP_TYPE);
+}
+
+static void c6_lit_scan(C6Lit *lit)
+{
+    Sym *save_stack = local_stack, *dummy = NULL, *ts = NULL;
+    int save_scope = local_scope, save_base = c6_lit_scan_base;
+    int save_scan = c6_lit_scanning, save_uneval = c6_scan_uneval;
+    int save_vla = func_var, save_nocode = nocode_wanted;
+    int save_fallible = c6_value_fallible;
+    CType save_vt = func_vt;
+    Sym *save_func = c6_func_sym;
+    SValue *save_vtop = vtop;
+    int save_loc = loc, save_rsym = rsym, save_ntemp = nb_temp_local_vars;
+    struct scope *save_cur = cur_scope;
+    int save_tok = tok;
+    CValue save_val = tokc;
+    int *save_body = lit->body->str;
+
+    c6_lit_scanning = 1;
+    c6_lit_scan_lit = lit;
+    c6_lit_scan_base = ++c6_sym_seq;
+    c6_scan_uneval = 0;
+    nocode_wanted = 1;
+    local_scope = 1;
+    dummy = sym_push2(&local_stack, SYM_FIELD, 0, 0);
+    (void)dummy;
+    ts = sym_push2(&local_stack, lit->name, 0, 0);
+    ts->type = lit->ftype;
+    ts->r = VT_CONST | VT_SYM;
+    c6_func_sym = ts;
+    func_vt = lit->ftype.ref->type;
+    func_var = lit->ftype.ref->f.func_type == FUNC_ELLIPSIS;
+    c6_value_fallible = 0;
+    sym_push_params(lit->ftype.ref);
+
+    begin_macro(lit->body, 2);
+    next();
+    block(0);
+    end_macro();
+    lit->body->str = save_body;
+    tok = save_tok;
+    tokc = save_val;
+
+    vtop = save_vtop;
+    sym_pop(&local_stack, save_stack, 0);
+    local_scope = save_scope;
+    loc = save_loc;
+    rsym = save_rsym;
+    nb_temp_local_vars = save_ntemp;
+    func_vt = save_vt;
+    func_var = save_vla;
+    c6_func_sym = save_func;
+    c6_value_fallible = save_fallible;
+    nocode_wanted = save_nocode;
+    cur_scope = save_cur;
+    c6_lit_scanning = save_scan;
+    c6_lit_scan_lit = NULL;
+    c6_lit_scan_base = save_base;
+    c6_scan_uneval = save_uneval;
+}
+
+static int c6_env_count = 0;
+
+static CType c6_lit_env_get(C6Lit *lit)
+{
+    CType ct = {0};
+    AttributeDef ad = {0};
+    Sym *tag = NULL, *first = NULL, **pp = &first, *f = NULL;
+    char name[64] = {0};
+    int i = 0, idx = 0;
+
+    snprintf(name, sizeof name, "__c6_env_%d", ++c6_env_count);
+    tag = sym_push2(&global_stack, tok_alloc_const(name) | SYM_STRUCT, 0, 0);
+    tag->type.t = VT_STRUCT;
+    tag->type.ref = NULL;
+
+    for (i = 0; i < lit->ncaps; i++) {
+        C6Cap *cap = &lit->caps[i];
+        if (cap->kind != C6_CAP_VALUE)
+            continue;
+        snprintf(name, sizeof name, "__c6_c%d", idx++);
+        f = sym_push2(&global_stack, tok_alloc_const(name) | SYM_FIELD, 0, 0);
+        f->type = cap->type;
+        f->type.t &= ~(VT_CONSTANT | VT_VOLATILE | VT_RESTRICT);
+        f->type.t &= ~VT_STORAGE;
+        f->c = 0;
+        f->r = 0;
+        *pp = f;
+        pp = &f->next;
+        f->next = NULL;
+    }
+    tag->next = first;
+    ct.t = VT_STRUCT;
+    ct.ref = tag;
+    struct_layout(&ct, &ad);
+
+    for (i = 0, f = tag->next; i < lit->ncaps && f; i++) {
+        C6Cap *cap = &lit->caps[i];
+        if (cap->kind != C6_CAP_VALUE)
+            continue;
+        cap->off = f->c;
+        f = f->next;
+    }
+    lit->env_type = ct;
+    return ct;
+}
+
+static void c6_lit_make_closure(C6Lit *lit)
+{
+    C6Closure *cl = NULL;
+
+    lit->closure_type = c6_closure_get(&lit->ftype);
+    cl = c6_closure_of_type(&lit->closure_type);
+    if (!cl)
+        tcc_error("internal error: closure type was not registered");
+    lit->code_type = cl->code_type;
 }
 
 /* Could a type start here?  A cheap filter: the expensive replay in
@@ -552,6 +1163,11 @@ static int c6_lit_type_start(int t)
 {
     Sym *s = 0;
 
+#ifdef C6_EXT
+    if (tcc_state->c6_ext && t >= TOK_IDENT && !sym_find(t)
+        && !strcmp(get_tok_str(t, NULL), "closure"))
+        return 1;
+#endif
     switch (t) {
     case TOK_VOID: case TOK_BOOL: case TOK_CHAR: case TOK_SHORT:
     case TOK_INT: case TOK_LONG: case TOK_FLOAT: case TOK_DOUBLE:
@@ -1126,6 +1742,9 @@ ST_FUNC Sym *sym_push2(Sym **ps, int v, int t, int c)
     s->v = v;
     s->type.t = t;
     s->c = c;
+#ifdef C6_EXT
+    s->c6_sym_seq = ++c6_sym_seq;
+#endif
     /* add in stack */
     s->prev = *ps;
     *ps = s;
@@ -1241,10 +1860,17 @@ static inline int sym_scope_ex(Sym *s)
 ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
 {
     Sym *s = 0, **ps = 0;
+#ifdef C6_EXT
+    if (local_stack && !c6_sym_global)
+        ps = &local_stack;
+    else
+        ps = &global_stack;
+#else
     if (local_stack)
         ps = &local_stack;
     else
         ps = &global_stack;
+#endif
     s = sym_push2(ps, v, type->t, c);
     s->type.ref = type->ref;
 #ifdef C6_EXT
@@ -1261,7 +1887,11 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
     if ((v & ~SYM_STRUCT) < SYM_FIRST_ANOM) {
         /* record symbol in token array */
         sym_link(s, 1);
-        if (s->prev_tok && sym_scope_ex(s->prev_tok) == local_scope)
+        if (s->prev_tok && sym_scope_ex(s->prev_tok) == local_scope
+#ifdef C6_EXT
+            && !s->prev_tok->c6_cap_kind
+#endif
+            )
             tcc_error("redeclaration of '%s'", get_tok_str(s->v, NULL));
     }
     return s;
@@ -1407,6 +2037,7 @@ static void vsetc(CType *type, int r, CValue *vc)
     vtop->gc_state = C6_GC_BORROW;
     vtop->gc_src = 0;
     vtop->gc_atomic = 0;
+    vtop->c6_lit_src = NULL;
 #endif
 }
 
@@ -3321,6 +3952,20 @@ static void type_to_str(char *buf, int buf_size,
         type_to_str(buf, buf_size, &s->type, buf1);
         goto no_var;
     case VT_PTR:
+#ifdef C6_EXT
+        /* a closure value prints as 'closure RET (P...)', not as a pointer to
+           the hidden implementation struct */
+        {
+            C6Closure *cl = c6_closure_of_type(type);
+            if (cl) {
+                char cbuf[4096] = {0};
+                c6_closure_sig_text(cbuf, sizeof cbuf, &cl->ftype);
+                pstrcat(buf, buf_size, "closure ");
+                pstrcat(buf, buf_size, cbuf);
+                break;
+            }
+        }
+#endif
         s = type->ref;
         if (t & (VT_ARRAY|VT_VLA)) {
             if (varstr && '*' == *varstr)
@@ -4310,6 +4955,7 @@ ST_FUNC void vstore(void)
     int sbt = 0, dbt = 0, ft = 0, r = 0, size = 0, align = 0, bit_size = 0, bit_pos = 0, delayed_cast = 0;
 #ifdef C6_EXT
     c6_fallible_use();          /* 'x = f()' would drop the error */
+    c6_lit_function_pointer_error();
     if (c6_gc_store_hook())     /* 'managed lvalue = value' */
         return;
     if (tcc_state->c6_ext && !c6_gc_no_hook
@@ -5103,8 +5749,11 @@ static void struct_decl(CType *type, int u)
 #ifdef C6_EXT
         /* a tag that is only visible through a block scope cannot travel
            into a function literal: replaying it would declare a new tag */
-        if (tok != '{')
-            c6_lit_cap_check(tagtok, struct_find(tagtok));
+        if (tok != '{') {
+            Sym *tag = struct_find(tagtok);
+            c6_lit_scan_note_type(tagtok, tag);
+            c6_lit_cap_check(tagtok, tag);
+        }
 #endif
     }
 
@@ -5953,6 +6602,37 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
                 }
             }
 #endif
+#ifdef C6_EXT
+            /* 'closure RET (P...)' is a type only when the name is not
+               shadowed by an ordinary symbol (variable/typedef/function).
+               A tag named 'closure' does not shadow it: tags are a separate
+               namespace. */
+            if (tcc_state->c6_ext && !typespec_found && tok >= TOK_IDENT
+                && !sym_find(tok)
+                && !strcmp(get_tok_str(tok, NULL), "closure")) {
+                CType ct = {0};
+                if (gc_managed)
+                    tcc_error("'@' cannot be applied to a closure type: a "
+                              "closure is already a managed reference");
+                if (gc_qual)
+                    tcc_error("a closure cannot be 'shared', 'weak' or "
+                              "'own': V2 closures are confined to the thread "
+                              "that creates them");
+                next();
+                c6_closure_btype(&ct);
+                t &= ~(VT_BTYPE|VT_LONG);
+                u = t & ~VT_QUAL, t ^= u;
+                type->t = ct.t | u;
+                type->ref = ct.ref;
+                type->gq = ct.gq;
+                if (t)
+                    parse_btype_qualify(type, t);
+                t = type->t;
+                typespec_found = 1;
+                st = bt = -2;
+                break;
+            }
+#endif
             s = sym_find(tok);
             if (!s) {
 #ifdef C6_EXT
@@ -5962,6 +6642,7 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
                    does not own the name: 'struct stat' next to 'stat()'
                    keeps C's meaning, so 'stat(...)' stays a call. */
                 if (tcc_state->c6_ext && (tag = struct_find(tok)) != NULL) {
+                    c6_lit_scan_note_type(tok, tag);
                     c6_lit_cap_check(tok, tag);   /* a block scope tag */
                     n = tok, next();
                     if (tok == ':' && ignore_label) {
@@ -5980,6 +6661,7 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
             if (!(s->type.t & VT_TYPEDEF))
                 goto the_end;
 #ifdef C6_EXT
+            c6_lit_scan_note_type(tok, s);
             c6_lit_cap_check(tok, s);   /* a block scope typedef */
 #endif
 
@@ -6097,7 +6779,7 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
 
         /* we push a anonymous symbol which will contain the function prototype */
         /* it also serves as a boundary for the function parameter scope */
-        ps = local_stack ? &local_stack : &global_stack;
+        ps = (local_stack && !c6_sym_global) ? &local_stack : &global_stack;
         ++local_scope;
         sr = sym_push2(ps, SYM_FIELD, 0, 0);
 
@@ -6392,6 +7074,45 @@ static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     parse_attribute(ad);
     type->t |= storage;
     return ret;
+}
+
+/* 'closure RET (P...)' in type position.  The token was already consumed by
+   the caller (parse_btype).  The signature is parsed with all new Syms on the
+   global stack: the hidden type must survive the block. */
+static void c6_closure_btype(CType *type)
+{
+    CType ret = {0};
+    AttributeDef ad = {0};
+    int v = 0, save_global = 0, save_scope = 0;
+
+    save_global = c6_sym_global;
+    save_scope = local_scope;
+    c6_sym_global = 1;
+    local_scope = 0;
+
+    if (!parse_btype(&ret, &ad, 0))
+        tcc_error("a 'closure' type needs a full signature: "
+                  "'closure RET (parameters)'");
+    if (ret.t & VT_STORAGE)
+        tcc_error("a 'closure' return type cannot have a storage class");
+    c6_decl_fallible = 0;
+    if (c6_parse_fallible_suffix())
+        c6_decl_fallible = 1;
+    type_decl(&ret, &ad, &v, TYPE_DIRECT | TYPE_ABSTRACT);
+    if (v)
+        tcc_error("a 'closure' type needs a full signature: "
+                  "'closure RET (parameters)'");
+    if (c6_decl_fallible) {
+        c6_apply_fallible(&ret);
+        c6_decl_fallible = 0;
+    }
+    if ((ret.t & VT_BTYPE) != VT_FUNC || !ret.ref)
+        tcc_error("a 'closure' type needs a full signature: "
+                  "'closure RET (parameters)'");
+
+    *type = c6_closure_get(&ret);
+    c6_sym_global = save_global;
+    local_scope = save_scope;
 }
 
 /* indirection with full error checking and bound check */
@@ -6778,6 +7499,144 @@ static int c6_lit_lead(TokenString *pre)
     return ok;
 }
 
+static CType c6_env_ptr_type(void)
+{
+    CType eb = {0}, p = {0};
+    eb.t = VT_STRUCT;
+    eb.ref = c6_env_base_tag();
+    p = c6_global_ptr(&eb);
+    p.gq = C6_GQ_MANAGED;
+    p.ref->type.gq = C6_GQ_MANAGED;
+    return p;
+}
+
+static void c6_lit_new(int size, CType *type)
+{
+    c6_rt_begin("__c6_gc_new");
+    vpushs(size);
+    vpushs(1);
+    vpushs(0);
+    vpushs(0);
+    c6_rt_end("__c6_gc_new", 4);
+    vtop->type = *type;
+    vtop->gc_state = C6_GC_FRESH;
+    vtop->gc_atomic = 0;
+}
+
+static void c6_lit_env_field(int off, CType *type)
+{
+    CType pt = {0};
+
+    vtop->type = char_pointer_type;
+    if (off) {
+        vpushi(off);
+        gen_op('+');
+    }
+    pt = c6_global_ptr(type);
+    vtop->type = pt;
+    indir();
+    vtop->type = *type;
+}
+
+static void c6_lit_push_source(Sym *src)
+{
+    int r = src->r;
+
+    if ((r & VT_VALMASK) < VT_CONST)
+        r = (r & ~VT_VALMASK) | VT_LOCAL;
+    vset(&src->type, r, src->c);
+    vtop->sym = src;
+    if (r & VT_SYM)
+        vtop->c.i = 0;
+    if (IS_ENUM_VAL(src->type.t))
+        vtop->c.i = src->enum_val;
+}
+
+static void c6_lit_emit_value(C6Lit *lit)
+{
+    CType envp = {0}, clp = {0}, ct = {0}, envf = {0}, codep = {0};
+    C6Closure *cl = NULL;
+    int i = 0, env_slot = 0, cl_slot = 0, save_hook = 0;
+    int size = 0, align = 0;
+
+    cl = c6_closure_of_type(&lit->closure_type);
+    if (!cl)
+        tcc_error("internal error: closure type was not registered");
+    envp = c6_env_ptr_type();
+    ct.t = VT_STRUCT;
+    ct.ref = cl->tag_sym;
+    clp = c6_global_ptr(&ct);
+    clp.gq = C6_GQ_MANAGED;
+    clp.ref->type.gq = C6_GQ_MANAGED;
+    envf = c6_env_ptr_type();
+    codep = c6_global_ptr(&cl->code_type);
+
+    size = type_size(&lit->env_type, &align);
+    c6_lit_new(size, &envp);
+    env_slot = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = env_slot;
+    vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
+    vswap();
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    for (i = 0; i < lit->ncaps; i++) {
+        C6Cap *cap = &lit->caps[i];
+        Sym *src = NULL;
+        if (cap->kind != C6_CAP_VALUE)
+            continue;
+        src = sym_find(cap->tok);
+        if (!src)
+            tcc_error("capture analysis missed '%s'",
+                      get_tok_str(cap->tok, NULL));
+        vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
+        gv(RC_INT);
+        c6_lit_env_field(cap->off, &cap->type);
+        c6_lit_push_source(src);
+        vstore();
+        vpop();
+    }
+
+    c6_lit_new(2 * PTR_SIZE, &clp);
+    cl_slot = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = cl_slot;
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    vswap();
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    c6_lit_env_field(0, &codep);
+    vpushsym(&cl->code_type, lit->sym);
+    vstore();
+    vpop();
+
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    c6_lit_env_field(PTR_SIZE, &envf);
+    vset(&envp, VT_LOCAL | VT_LVAL, env_slot);
+    gv(RC_INT);
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    vset(&clp, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    vtop->type = lit->closure_type;
+    vtop->gc_state = C6_GC_FRESH;
+    vtop->gc_atomic = 0;
+    vtop->c6_lit_src = lit;
+}
+
 /* 'RET (parameters) { body }' in an expression: the header is parsed here, the
    body is saved and compiled at the end of the unit, and the value is the
    function itself (it decays to a pointer like any function designator). */
@@ -6834,27 +7693,33 @@ static void c6_lit_parse(void)
     for (i = 0, p = ftype.ref->next; p; p = p->next, i++)
         lit->params[i] = p->v & ~SYM_FIELD;
 
-    /* the names the body must not see: by the time it is compiled they are
-       gone from the symbol table, so a capture would silently become an
-       'undeclared' -- remember them now and diagnose it at the reference */
-    for (snap = local_stack; snap; snap = snap->prev) {
-        int nv = snap->v & ~(SYM_FIELD | SYM_STRUCT);
-        int j = 0;
-        if (snap->sym_scope == 0 || nv < TOK_IDENT || nv >= SYM_FIRST_ANOM)
-            continue;
-        for (j = 0; j < lit->ncaps; j++)
-            if (lit->caps[j] == nv)
-                break;
-        if (j < lit->ncaps)
-            continue;
-        lit->caps = tcc_realloc(lit->caps,
-                                (lit->ncaps + 1) * sizeof *lit->caps);
-        lit->caps[lit->ncaps++] = nv;
-    }
-
-    ftype.t |= VT_STATIC | VT_EXTERN;   /* internal linkage from the start */
-    lit->sym = s = external_sym(lit->name, &ftype, 0, &ad);
     skip_or_save_block(&lit->body);
+
+    c6_lit_scan(lit);
+    {
+        int j = 0;
+        for (j = 0; j < lit->ncaps; j++)
+            if (lit->caps[j].kind == C6_CAP_VALUE)
+                lit->capturing = 1;
+        /* V1 compatibility: a literal that is still a plain function pointer
+           cannot carry even a type-only capture.  V2 closures (with at least
+           one value) handle TYPE/ZERO aliases in the body. */
+        if (!lit->capturing && lit->ncaps)
+            tcc_error("a function literal cannot capture '%s': without "
+                      "captures it is a plain function pointer, so its body "
+                      "sees only its parameters and the file scope (pass the "
+                      "value in as a parameter)",
+                      get_tok_str(lit->caps[0].tok, NULL));
+    }
+    if (lit->capturing) {
+        c6_lit_env_get(lit);
+        c6_lit_make_closure(lit);
+        lit->code_type.t |= VT_STATIC | VT_EXTERN;
+        lit->sym = s = external_sym(lit->name, &lit->code_type, 0, &ad);
+    } else {
+        ftype.t |= VT_STATIC | VT_EXTERN;
+        lit->sym = s = external_sym(lit->name, &ftype, 0, &ad);
+    }
 
     if (c6_lit_tail)
         c6_lit_tail->next = lit;
@@ -6862,7 +7727,10 @@ static void c6_lit_parse(void)
         c6_lit_head = lit;
     c6_lit_tail = lit;
 
-    vpushsym(&vtype, s);
+    if (lit->capturing)
+        c6_lit_emit_value(lit);
+    else
+        vpushsym(&vtype, s);
 }
 
 /* 'NAME = RET (parameters) { body };' : the literal's type is the variable's
@@ -7570,7 +8438,32 @@ special_math_val:
         next();
         s = sym_find(t);
 #ifdef C6_EXT
+        c6_lit_scan_note(t, s, c6_scan_uneval);
         c6_lit_cap_check(t, s);     /* a block scope name is a capture */
+        if (s && s->c6_cap_kind) {
+            if (s->c6_cap_kind == C6_CAP_TYPE) {
+                /* a type alias: parse_btype() owns it */
+            } else if (c6_lit_scanning) {
+                vset(&s->type, VT_CONST | VT_LVAL, 0);
+                vtop->sym = NULL;
+                break;
+            } else if (s->c6_cap_kind == C6_CAP_ZERO) {
+                vset(&s->type, VT_CONST | VT_LVAL, 0);
+                vtop->sym = NULL;
+                break;
+            } else {
+                CType pt = {0};
+                c6_lit_env_push();
+                vtop->type = char_pointer_type;
+                vpushi(s->c);
+                gen_op('+');
+                pt = c6_global_ptr(&s->type);
+                vtop->type = pt;
+                indir();
+                vtop->type = s->type;
+                break;
+            }
+        }
         /* 'pkg.member', possibly multi-level: the dotted spelling is a
            package-qualified access that resolves to 'pkg__member'.  The
            package part is grown one segment at a time, so 'a.b.f' first
@@ -7829,6 +8722,9 @@ special_math_val:
             int nb_args = 0, ret_nregs = 0, ret_align = 0, regsize = 0, variadic = 0;
             TokenString *p = 0, *p2 = 0;
 
+#ifdef C6_EXT
+            c6_closure_call_prep();
+#endif
             /* function call  */
             if ((vtop->type.t & VT_BTYPE) != VT_FUNC) {
                 /* pointer test (no array accepted) */
@@ -9642,6 +10538,8 @@ static int c6_method_symbol(int name, CType *type)
         return 0;
     if (!type->ref->next)
         return 0;
+    if (c6_closure_of_type(&type->ref->next->type))
+        return 0;                   /* a closure is not a method receiver */
     tag = c6_ptr_tag(&type->ref->next->type);
     if (!tag || tag >= SYM_FIRST_ANOM)
         return 0;
@@ -11310,6 +12208,15 @@ static void c6_tu_reset(void)
     c6_tuples = NULL;
     c6_tuple_seq = 0;
     c6_tuple_tmp_seq = 0;
+    while (c6_closures) {
+        C6Closure *cl = c6_closures;
+        c6_closures = cl->next;
+        tcc_free(cl->sig_text);
+        tcc_free(cl);
+    }
+    c6_closures = NULL;
+    c6_env_base_sym = NULL;
+    c6_sym_seq = 0;
 }
 
 /* Implicit conversion of a struct value to an interface value, e.g.
@@ -13804,8 +14711,12 @@ static void sym_push_params(Sym *ref)
     while (s->next)
         s = s->next;
     while (s != ref) {
-        if ((s->v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
-            sym_copy(s, &local_stack);
+        if ((s->v & ~SYM_STRUCT) < SYM_FIRST_ANOM) {
+            Sym *p = sym_copy(s, &local_stack);
+#ifdef C6_EXT
+            p->c6_sym_seq = ++c6_sym_seq;
+#endif
+        }
         s = s->prev;
     }
 }
@@ -16516,6 +17427,11 @@ static int c6_gc_type_lead(int t)
     }
     if (t < TOK_IDENT)
         return 0;
+#ifdef C6_EXT
+    if (tcc_state->c6_ext && !sym_find(t)
+        && !strcmp(get_tok_str(t, NULL), "closure"))
+        return 1;
+#endif
     s = sym_find(t);
     if (s && (s->type.t & VT_TYPEDEF))
         return 1;
@@ -16556,6 +17472,11 @@ static void c6_gc_new_expr(void)
     }
     parse_btype(&type, &ad, 0);
     type.t &= ~VT_QUAL;
+#ifdef C6_EXT
+    if (c6_closure_of_type(&type))
+        tcc_error("a closure cannot be created with 'new': use a function "
+                  "literal or a function pointer");
+#endif
     if ((type.t & VT_BTYPE) == VT_VOID)
         tcc_error("'new' needs an object type, not 'void'");
     if (type.t & VT_ARRAY)
@@ -17297,7 +18218,15 @@ static void gen_function(Sym *sym)
     sym_push2(&local_stack, SYM_FIELD, 0, 0);
     /* push parameters */
     local_scope = 1;
+#ifdef C6_EXT
+    if (c6_lit_replay && c6_lit_replay->ncaps)
+        c6_lit_push_captures(c6_lit_replay);
+#endif
     sym_push_params(sym->type.ref);
+#ifdef C6_EXT
+    if (c6_lit_replay && c6_lit_replay->capturing)
+        c6_lit_env_sym = sym_find(tok_alloc_const("__c6_env"));
+#endif
 #ifdef C6_EXT
     if (tcc_state->c6_ext) {
         /* a managed parameter borrows the caller's reference: it owns
@@ -17446,17 +18375,94 @@ static void free_inline_functions(TCCState *s)
    declared, so the body alone is enough: 'gen_function' pushes the parameters
    from the stored signature and the tokens name them again.  Same path as a
    deferred 'static inline' body. */
+static void c6_lit_push_captures(C6Lit *lit)
+{
+    int i = 0;
+
+    for (i = 0; i < lit->ncaps; i++) {
+        C6Cap *cap = &lit->caps[i];
+        CType t = cap->type;
+        Sym *s = NULL;
+        if (cap->kind == C6_CAP_TYPE)
+            t.t |= VT_TYPEDEF;
+        else
+            t.t &= ~VT_TYPEDEF;
+        s = sym_push(cap->tok, &t, VT_CONST,
+                     cap->kind == C6_CAP_VALUE ? cap->off : 0);
+        s->c6_cap_kind = cap->kind;
+    }
+}
+
+static void c6_lit_env_push(void)
+{
+    if (!c6_lit_env_sym)
+        tcc_error("internal error: the closure environment is missing");
+    vset(&c6_lit_env_sym->type, c6_lit_env_sym->r, c6_lit_env_sym->c);
+    vtop->sym = NULL;
+}
+
+static int c6_closure_call_prep(void)
+{
+    C6Closure *cl = c6_closure_of_type(&vtop->type);
+    CType envp = {0}, codep = {0}, ctype = {0};
+    int cl_slot = 0, save_hook = 0;
+    if (!cl)
+        return 0;
+    ctype = vtop->type;
+    envp = c6_env_ptr_type();
+    codep = c6_global_ptr(&cl->code_type);
+    if (vtop->r & VT_LVAL)
+        gv(RC_INT);
+
+    cl_slot = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = cl_slot;
+    vset(&ctype, VT_LOCAL | VT_LVAL, cl_slot);
+    vswap();
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    c6_rt_begin("__c6_closure_env");
+    vset(&ctype, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    c6_rt_end("__c6_closure_env", 1);
+    vtop->type = envp;
+    c6_self_loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    loc = c6_self_loc;
+    c6_self_type = envp;
+    vset(&envp, VT_LOCAL | VT_LVAL, c6_self_loc);
+    vswap();
+    save_hook = c6_gc_no_hook;
+    c6_gc_no_hook = 1;
+    vstore();
+    c6_gc_no_hook = save_hook;
+    vpop();
+
+    c6_rt_begin("__c6_closure_code");
+    vset(&ctype, VT_LOCAL | VT_LVAL, cl_slot);
+    gv(RC_INT);
+    c6_rt_end("__c6_closure_code", 1);
+    vtop->type = codep;
+    c6_self_pending = 1;
+    return 1;
+}
+
 static void c6_lit_emit(C6Lit *lit)
 {
     C6Lit *save = c6_lit_replay;
+    Sym *save_env = c6_lit_env_sym;
 
     c6_lit_replay = lit;
+    c6_lit_env_sym = NULL;
     cur_text_section = text_section;
     begin_macro(lit->body, 1);
     next();
     gen_function(lit->sym);
     end_macro();
     c6_lit_replay = save;
+    c6_lit_env_sym = save_env;
 }
 
 /* Compile every literal that is still waiting.  A body may contain another

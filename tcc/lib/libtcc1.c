@@ -1568,6 +1568,19 @@ static void c6_gc_weak_add(void **slot, void *p)
     h->u.weak = w;
 }
 
+/* c6 closures: the hidden object is { code, env } (two machine words).
+   These two accessors keep the front end from open-coding the field offset
+   on a value that the code generator may have spilled. */
+void *__c6_closure_code(void *cl)
+{
+    return cl ? ((void **)cl)[0] : 0;
+}
+
+void *__c6_closure_env(void *cl)
+{
+    return cl ? ((void **)cl)[1] : 0;
+}
+
 /* 'new T' / 'new T[n]': SIZE is sizeof(T), COUNT the number of elements.
    The payload is zeroed, the count starts at one (a fresh reference). */
 void *__c6_gc_new(unsigned long size, unsigned long count,

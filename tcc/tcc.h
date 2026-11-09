@@ -530,6 +530,7 @@ typedef struct SValue {
     unsigned char gc_state;
     unsigned char gc_src;
     unsigned char gc_atomic;     /* a 'new shared T' value: already atomic */
+    void *c6_lit_src;            /* c6: literal that produced this closure */
     union {
       struct { int jtrue, jfalse; }; /* forward jmps */
       CValue c;         /* constant, if VT_CONST */
@@ -553,7 +554,8 @@ struct SymAttr {
     dllimport   : 1,
     addrtaken   : 1,
     nodebug     : 1,
-    xxxx        : 2; /* not used */
+    c6_closure  : 1, /* c6: the tag of a 'closure RET (P...)' type */
+    c6_receiver : 1; /* c6: a method receiver/self parameter */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -608,6 +610,9 @@ typedef struct Sym {
     };
     int defer_depth; /* c6: lexical depth of a defined label */
     int gc_moved; /* c6: a managed slot handed away by 'move', not yet reassigned */
+    int c6_sym_seq; /* c6: creation order, for literal capture analysis */
+    unsigned char c6_cap_kind; /* c6: nonzero for a capture alias */
+    /* 0 = ordinary symbol, C6_CAP_VALUE/TYPE/ZERO for a literal body alias */
 } Sym;
 
 /* section definition */
