@@ -1165,8 +1165,18 @@ weak 的，程序给了就切回“每线程一块状态”：
   arena 只在单线程下安全，这时请由程序提供 `calloc` / `free`；
 - 线程里用 `async` / `c6_io` 还需要 `select`。
 
-例子：[examples/freestanding_go.c](examples/freestanding_go.c) 配单线程桩
-[examples/freestanding_pthread.c](examples/freestanding_pthread.c)，`make fstest-go`。
+例子：[examples/freestanding_pthread.c](examples/freestanding_pthread.c) 就是一份
+可以直接抄的实现 —— x86-64 Linux 上 `clone` + `futex`，不碰 libc：线程指针放
+`%fs:0`（`arch_prctl`），栈和控制块用 `mmap`，线程退出用 `SYS_exit`，join 用
+`CLONE_CHILD_CLEARTID` 加 futex；它还顺带给了一份线程安全的 `calloc`/`free`
+（每次 `mmap`，不用锁）。[examples/freestanding_go.c](examples/freestanding_go.c)
+用它跑两个真线程（一个等另一个置位，只有真并发才会通过），`make fstest-go`
+编译并运行，200 次连跑没有失败。
+
+join 这里有个坑值得记下来：「还活着」的标志不能直接靠 `CLONE_CHILD_SETTID` 写
+的那个 tid —— 它是子线程**开始跑**的时候才写的，父线程可能先看到 0，于是 join
+提前返回、把子线程马上要用的栈 `munmap` 掉，子线程一上来就段错误。这份实现的做
+法是父线程在 clone 之前先把该字写成 -1，只让内核在子线程真正退出时清零。
 
 C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
 `<pthread.h>`）。
