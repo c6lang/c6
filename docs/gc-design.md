@@ -182,6 +182,23 @@ struct __c6_gc_desc {
 - `own` 边**不进入引用计数的类型图**（它不产生计数环），因此不参与 §8 的环检测；
 - `own` 值不能共享：赋值源必须是 FRESH 或显式 `move()`，否则报错。
 
+**编译期检查（E-GC17）**：槽既然空了，在重新赋值之前再用它就是编译错误 ——
+读值、比较、解引用成员、传参、`return`、再 `move` 都算；赋值（含 `p = NULL`）
+解除。检查只在编译期成立，不生成任何代码，C99 后端同样生效。
+
+- 只跟踪**本函数的自动托管槽**：全局（要整程序知识）、字段与数组元素（写入口
+  在编译器的视野之外）、`weak` 槽（它不是计数引用）都不跟踪；`&p` 取过地址的
+  槽也不跟踪（指针可能从别处写回来，跟踪会漏报/误报）；
+- 控制流按「可能已交出」合并：`if`/`else`、`while`/`for`/`do`、`switch`
+  （`break`、轮空、落空各算一条路）、`foreach` 都取各条路出口状态的并集，
+  因此只有「每条路都重新赋值」才算安全；走不到的出口（`return`/`break`/
+  `continue`/`goto` 之后）不参与合并；
+- `defer`/`errdefer` 体（以及 `catch` 体）单独分析：它们在作用域退出或错误
+  路径上才跑，`defer { move(p); }` 不影响后面的直线代码；
+- `sizeof(p)`/`typeof(p)` 不读值，照过；不生成代码的死代码不检查；
+- 赋值目标是裸标识符才算「重新赋值」：`(p) = x` 这种把目标括起来的写法仍按
+  「使用」报错（很少见，写成 `p = x` 即可）。
+
 这给了“链表/树”一个无需 `weak` 的合法写法：
 
 ```c
@@ -744,6 +761,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | E-GC14 | 给借用的引用赋值 | error | `'%s' is a borrow: it owns nothing, so it cannot be reassigned (copy it into an owned local first)` |
 | E-GC15 | `shared @T p = new T` | error | `a 'shared' slot needs an object with an atomic count: create it with 'new shared T', not 'new T'` |
 | E-GC16 | `move(x)` 作用在非托管/非槽上 | error | `'move' needs a managed reference held in a slot, not a '%s'` |
+| E-GC17 | `move(p)` 之后、重新赋值之前使用 `p`（读/比较/解引用/传参/再 `move`） | error | `'%s' was moved: assign a new reference before using it` |
 
 ---
 

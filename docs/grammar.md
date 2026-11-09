@@ -629,7 +629,7 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
 ```
 
 函数字面量是一个**表达式**，它的值就是那个函数，和写一个函数名一样：
-不分配对象、不做引用计数、运行期不携带任何额外信息（约束 C79–C82）。
+不分配对象、不做引用计数、运行期不携带任何额外信息（约束 C80–C83）。
 
 ```c
     void (*say)(int) = void(int x) { printf("%d\n", x); };
@@ -650,14 +650,14 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
 ```
 
 * 返回类型、参数表和函数定义完全相同：`!error`、变参、`T[:]`、元组、
-  `@T`、struct 返回值都可以。字面量**没有名字**（C80），也不能带存储类
-  或 `async`（C82）；
+  `@T`、struct 返回值都可以。字面量**没有名字**（C81），也不能带存储类
+  或 `async`（C83）；
 * 体是**稍后编译**的：和 `static inline` 一样，函数在翻译单元末尾发射，
   内部名字是 `__c6_fn_<序号>`（`static`），所以 `module` 不改写它，
   `-emit-header` 也不导出它。每个字面量各是一个独立的函数；
 * 因此体里只看得见**它自己的参数**和**文件作用域**的名字。写在外层的局部
   变量、形参、块作用域的 `typedef` 和 tag 在体里不可见：引用它们是编译期
-  错误（C79），而不是悄悄读到一个已经返回的栈槽。需要那些值时把它们作为
+  错误（C80），而不是悄悄读到一个已经返回的栈槽。需要那些值时把它们作为
   参数传进来。V1 不实现捕获——捕获式闭包的设计见
   `docs/closure-design.md`；
 * 能写在任何可以写表达式的地方：文件作用域和 `static` 局部变量的初始化
@@ -958,10 +958,11 @@ parameter-list    = identifier , { "," , identifier } ;
 | C76 | 析构 `drop` 不能手动调用、不能失败/挂起、必须返回 `void`、每个类型至多一个 | `a destructor cannot be called: ...`；`a destructor cannot fail: ...`；`a destructor cannot suspend: ...`；`'%s' already has a destructor` |
 | C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
 | C78 | `thread` 句柄的初始化式必须是 `go` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'go f(...)'` |
-| C79 | 函数字面量的体里只能引用它自己的参数和文件作用域的名字，不能引用外层局部变量、形参、块作用域 `typedef`/tag（V1 没有捕获） | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
-| C80 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
-| C81 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
-| C82 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
+| C79 | `move(p)` 之后、重新赋值之前不能再用 `p`（读/比较/解引用/传参/再 `move`） | `'%s' was moved: assign a new reference before using it` |
+| C80 | 函数字面量的体里只能引用它自己的参数和文件作用域的名字，不能引用外层局部变量、形参、块作用域 `typedef`/tag（V1 没有捕获） | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
+| C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
+| C82 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
+| C83 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
 
 ---
 
@@ -1437,7 +1438,7 @@ defer 记录、以及错误槽一起存进任务；恢复时原样拷回，再�
 
 * 字面量不产生任何运行期数据（`sizeof` 一个函数指针仍是 8），也不参与
   引用计数：域里存的是裸函数地址；
-* 体里出现的外层块作用域名字无法携带，编译期就报 C79；
+* 体里出现的外层块作用域名字无法携带，编译期就报 C80；
 * `static` 让它在 `-emit-header` 与 `module` 前缀改写之外，名字里的序号
   只有调试信息看得到。
 
@@ -1584,7 +1585,7 @@ int main(void)
 | 自定义删除器 | V1 不做（析构只有 `drop` 方法一种） |
 | 写法 | 结果 |
 |---|---|
-| 捕获式闭包：`int x = 1; f = int() { return x; };` | 约束 C79：V1 的字面量是裸函数指针，体里只看得见参数和文件作用域；捕获版设计见 `docs/closure-design.md` |
+| 捕获式闭包：`int x = 1; f = int() { return x; };` | 约束 C80：V1 的字面量是裸函数指针，体里只看得见参数和文件作用域；捕获版设计见 `docs/closure-design.md` |
 | `task t = void() { … };` 之类包装 | 不需要：字面量本身就是函数指针，直接 `go f(x)` / 直接传 |
 | `try { … } catch { … }` 块形式 | 语法错误（`try` 只接一次调用） |
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |
@@ -1719,6 +1720,7 @@ int main(void)
 | 作用域退出 / `return` / `break` / 跳转 | `c6_gc_site()`（复用 defer 记录）+ `__c6_gc_release(slot, mode)` | 同上 |
 | `p = NULL` 提前放手 | 同一次 `__c6_gc_store` 调用（旧值释放、槽清零） | 同上 |
 | `move(p)` | `c6_gc_move_expr()`（`unary()` 的 `c6_gc_move_lead()` 分支）→ `__c6_gc_move(slot)` | 同上 |
+| `move(p)` 之后、重新赋值之前用 `p` | 编译期诊断 E-GC17（不生成代码）：标记在 `Sym.gc_moved`，`unary()` 的标识符分支调 `c6_gc_moved_use()`；赋值清标记在 `c6_gc_store_hook()`；分支合并 `c6_move_snap` / `c6_move_restore` / `c6_move_merge` / `c6_move_branch_end`（`block()` 的 `if`/`while`/`for`/`switch`、`c6_foreach_parse`），`defer`/`errdefer` 体与 `catch` 体各用一次快照隔离（`c6_defer_parse()` / `c6_catch_parse()`） | 同上 |
 | 描述符（字段表 + 析构指针） | `c6_gc_collect()` / `c6_gc_flush_descs()`（TU 末尾发射，名字带文件名哈希） | `tcc/tccgen.c` |
 | 环检测 | `c6_gc_cycle_check()` / `c6_gc_cycle_dfs()`（`c6_gc_flush_descs()` 里） | `tcc/tccgen.c` |
 | 析构 `drop` | `c6_gc_drop_register()`（`c6_method_register()` 里）、`c6_gc_is_drop()` / `c6_gc_drop_callee()`（禁止显式调用）、描述符的 `drop` 指针 | 同上 |

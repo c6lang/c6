@@ -88,6 +88,17 @@ static CString initstr = {0};
 #define VT_PTRDIFF_T (VT_LONG | VT_LLONG)
 #endif
 
+/* c6: one point in the 'move' analysis.  For every managed slot the check
+   follows at that point it records whether the slot may have been handed
+   away by 'move' and not assigned again.  Parallel arrays keep the
+   save/restore/merge of a branch cheap for the usual function, which has
+   only a handful of managed locals. */
+typedef struct C6MoveSnap {
+    int n;
+    Sym **s;
+    unsigned char *m;
+} C6MoveSnap;
+
 static struct switch_t {
     struct case_t {
         int64_t v1, v2;
@@ -99,6 +110,10 @@ static struct switch_t {
     struct scope *scope;
     struct switch_t *prev;
     SValue sv;
+#ifdef C6_EXT
+    /* c6: move-state on entry and where the paths leaving the switch meet */
+    C6MoveSnap mv_in, mv_out;
+#endif
 } *cur_switch = 0; /* current switch */
 
 #define MAX_TEMP_LOCAL_VARIABLE_NUMBER 8
@@ -373,6 +388,17 @@ static void c6_gc_flush_descs(void);
 static int c6_gc_desc_for(CType *type);
 static C6GcType *c6_gc_type_find(int tag);
 static void c6_gc_value_check(CType *type, const char *what);
+/* the 'move' analysis: a managed slot handed away by 'move' must be
+   assigned again before it can be used (E-GC17) */
+static int c6_gc_tracked(Sym *s);
+static Sym *c6_gc_slot_sym(SValue *v);
+static void c6_gc_moved_use(Sym *s);
+static void c6_move_snap(C6MoveSnap *sn);
+static void c6_move_restore(C6MoveSnap *sn);
+static void c6_move_merge(C6MoveSnap *sn);
+static void c6_move_copy(C6MoveSnap *dst, C6MoveSnap *src);
+static void c6_move_snap_free(C6MoveSnap *sn);
+static void c6_move_branch_end(C6MoveSnap *out);
 #define C6_KW_NONE 0
 #define C6_KW_CO   1
 #define C6_KW_GO   2
@@ -7619,6 +7645,11 @@ special_math_val:
 	   Will be used by at least the x86 inline asm parser for
 	   regvars.  */
 	vtop->sym = s;
+#ifdef C6_EXT
+        /* a managed slot handed away by 'move' must be assigned again
+           before it is read (E-GC17); 'a = ...' is exempt */
+        c6_gc_moved_use(s);
+#endif
 
         if (r & VT_SYM) {
             vtop->c.i = 0;
@@ -11420,6 +11451,7 @@ static void c6_defer_parse(int kind)
 {
     int skip = 0, id = 0;
     Sym *l = NULL;
+    C6MoveSnap mv = {0};
 
     defer_state.body_depth++;
     if (!nocode_wanted) {
@@ -11435,7 +11467,13 @@ static void c6_defer_parse(int kind)
         c6_add_site(id, l);
         defer_state.has_sites = 1;
     }
+    /* the body is only reached at scope exit, long after the statements that
+       follow the 'defer': analyze it on its own state and do not let its
+       moves leak back into the enclosing straight-line code */
+    c6_move_snap(&mv);
     block(STMT_COMPOUND);
+    c6_move_restore(&mv);
+    c6_move_snap_free(&mv);
     if (!nocode_wanted) {
         defer_state.disp_jmps = gjmp(defer_state.disp_jmps);
         gsym(skip);
@@ -11878,7 +11916,16 @@ static void c6_catch_parse(void)
     gfunc_call(1);
 
     saved_nocode = nocode_wanted;
-    block(STMT_COMPOUND);
+    /* the handler leaves on its own (return/err/goto): the statements after
+       the 'catch' are reached on the success path only, so a 'move' inside
+       the handler must not mark a slot as moved for them */
+    {
+        C6MoveSnap mv = {0};
+        c6_move_snap(&mv);
+        block(STMT_COMPOUND);
+        c6_move_restore(&mv);
+        c6_move_snap_free(&mv);
+    }
     /* the handler must leave on its own and continue past its end with the
        success path.  When the compiler cannot prove that the body always
        leaves, emit a trap rather than silently resuming the success path. */
@@ -12028,35 +12075,85 @@ again:
         tcc_tcov_check_line (tcc_state, 0), tcc_tcov_block_begin (tcc_state);
 
     if (t == TOK_IF) {
+#ifdef C6_EXT
+        C6MoveSnap mv_base = {0}, mv_then = {0};
+        int then_ok = 0;
+#endif
         new_scope_s(&o);
         skip('(');
         gexpr_decl();
         a = gvtst(1, 0);
         skip(')');
+#ifdef C6_EXT
+        c6_move_snap(&mv_base);         /* state after the condition */
+#endif
         block(0);
+#ifdef C6_EXT
+        then_ok = !nocode_wanted;       /* does the then branch reach the join? */
+        if (then_ok)
+            c6_move_snap(&mv_then);
+#endif
         if (tok == TOK_ELSE) {
             d = gjmp(0);
             gsym(a);
             next();
+#ifdef C6_EXT
+            c6_move_restore(&mv_base);
+#endif
             block(0);
+#ifdef C6_EXT
+            if (then_ok && !nocode_wanted) {
+                c6_move_merge(&mv_then);  /* else state |= then state */
+            } else if (then_ok) {
+                c6_move_restore(&mv_then); /* only the then branch gets here */
+            }
+#endif
             gsym(d); /* patch else jmp */
         } else {
             gsym(a);
+#ifdef C6_EXT
+            c6_move_restore(&mv_base);
+            if (then_ok)
+                c6_move_merge(&mv_then); /* not taken | then */
+#endif
         }
+#ifdef C6_EXT
+        c6_move_snap_free(&mv_base);
+        c6_move_snap_free(&mv_then);
+#endif
         prev_scope_s(&o);
 
     } else if (t == TOK_WHILE) {
+#ifdef C6_EXT
+        C6MoveSnap mv_base = {0}, mv_body = {0};
+        int body_ok = 0;
+#endif
         new_scope_s(&o);
         d = gind();
         skip('(');
         gexpr();
         a = gvtst(1, 0);
         skip(')');
+#ifdef C6_EXT
+        c6_move_snap(&mv_base);         /* state on entry to the body */
+#endif
         b = 0;
         lblock(&a, &b);
+#ifdef C6_EXT
+        body_ok = !nocode_wanted;
+        if (body_ok)
+            c6_move_snap(&mv_body);
+#endif
         gjmp_addr(d);
         gsym_addr(b, d);
         gsym(a);
+#ifdef C6_EXT
+        c6_move_restore(&mv_base);      /* the body may not have run ... */
+        if (body_ok)
+            c6_move_merge(&mv_body);    /* ... or it ran: possibly moved */
+        c6_move_snap_free(&mv_base);
+        c6_move_snap_free(&mv_body);
+#endif
         prev_scope_s(&o);
 
     } else if (t == '{') {
@@ -12200,9 +12297,14 @@ again:
         /* compute jump */
         if (!cur_scope->bsym)
             tcc_error("cannot break");
-        if (cur_switch && cur_scope->bsym == cur_switch->bsym)
+        if (cur_switch && cur_scope->bsym == cur_switch->bsym) {
+#ifdef C6_EXT
+            /* this path leaves the switch: fold the move-state into the
+               state the break label will be reached with */
+            c6_move_branch_end(&cur_switch->mv_out);
+#endif
             leave_scope(cur_switch->scope);
-        else
+        } else
             leave_scope(loop_scope);
         *cur_scope->bsym = gjmp(*cur_scope->bsym);
         skip(';');
@@ -12265,6 +12367,10 @@ again:
 #endif
 
     } else if (t == TOK_FOR) {
+#ifdef C6_EXT
+        C6MoveSnap mv_base = {0}, mv_body = {0};
+        int body_ok = 0;
+#endif
         new_scope(&o);
 
         skip('(');
@@ -12284,6 +12390,9 @@ again:
             a = gvtst(1, 0);
         }
         skip(';');
+#ifdef C6_EXT
+        c6_move_snap(&mv_base);         /* state on entry to the body */
+#endif
         if (tok != ')') {
             e = gjmp(0);
             d = gind();
@@ -12294,9 +12403,21 @@ again:
         }
         skip(')');
         lblock(&a, &b);
+#ifdef C6_EXT
+        body_ok = !nocode_wanted;
+        if (body_ok)
+            c6_move_snap(&mv_body);
+#endif
         gjmp_addr(d);
         gsym_addr(b, d);
         gsym(a);
+#ifdef C6_EXT
+        c6_move_restore(&mv_base);      /* the body may not have run ... */
+        if (body_ok)
+            c6_move_merge(&mv_body);    /* ... or it ran: possibly moved */
+        c6_move_snap_free(&mv_base);
+        c6_move_snap_free(&mv_body);
+#endif
         prev_scope(&o, 0);
 
     } else if (t == TOK_DO) {
@@ -12332,12 +12453,26 @@ again:
             tcc_error("switch value not an integer");
         skip(')');
         sw->sv = *vtop--; /* save switch value */
+#ifdef C6_EXT
+        c6_move_snap(&sw->mv_in);       /* state after the switch value */
+        c6_move_copy(&sw->mv_out, &sw->mv_in);
+#endif
         a = 0;
         b = gjmp(0); /* jump to first case */
         lblock(&a, NULL);
+#ifdef C6_EXT
+        c6_move_branch_end(&sw->mv_out); /* falling out of the last case */
+#endif
         a = gjmp(a); /* add implicit break */
         /* case lookup */
         gsym(b);
+#ifdef C6_EXT
+        /* the state where a path leaves the switch; free the snapshots
+           before the switch scope (and its symbols) goes away */
+        c6_move_restore(&sw->mv_out);
+        c6_move_snap_free(&sw->mv_in);
+        c6_move_snap_free(&sw->mv_out);
+#endif
         prev_scope_s(&o);
         if (sw->nocode_wanted)
             goto skip_switch;
@@ -12371,6 +12506,12 @@ again:
                 tcc_warning("empty case range");
         }
         /* case and default are unreachable from a switch under nocode_wanted */
+#ifdef C6_EXT
+        /* the previous case may fall into this one, but control can also
+           arrive straight from the switch value: take both */
+        c6_move_branch_end(&cur_switch->mv_out);
+        c6_move_restore(&cur_switch->mv_in);
+#endif
         if (!cur_switch->nocode_wanted)
             cr->ind = gind();
         cr->line = file->line_num;
@@ -12382,6 +12523,10 @@ again:
             expect("switch");
         if (cur_switch->def_sym)
             tcc_error("too many 'default'");
+#ifdef C6_EXT
+        c6_move_branch_end(&cur_switch->mv_out);
+        c6_move_restore(&cur_switch->mv_in);
+#endif
         cur_switch->def_sym = cur_switch->nocode_wanted ? -1 : gind();
         skip(':');
         goto block_after_label;
@@ -14687,6 +14832,8 @@ static void c6_foreach_parse(void)
     int n1 = 0, n2 = 0, nb = 0, is_range = 0;
     int i_off = 0, v_off = 0, pair = 0, hi_off = 0, size = 0, align = 0;
     int a = 0, b = 0, c = 0, d = 0;
+    C6MoveSnap mv_base = {0}, mv_body = {0};
+    int body_ok = 0;
 
     n1 = n2 = nb = i_off = v_off = pair = hi_off = 0;
     is_range = 0;
@@ -14796,6 +14943,7 @@ static void c6_foreach_parse(void)
         vpop();
     }
 
+    c6_move_snap(&mv_base);             /* state on entry to the body */
     c = gind();
     vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
     vset(&ctr, VT_LOCAL | VT_LVAL, is_range ? hi_off : pair + PTR_SIZE);
@@ -14818,6 +14966,9 @@ static void c6_foreach_parse(void)
         expect("'{'");                              /* the body is a block */
     b = 0;                      /* no 'continue' jumps yet */
     lblock(&a, &b);
+    body_ok = !nocode_wanted;
+    if (body_ok)
+        c6_move_snap(&mv_body);
 
     /* 'continue' lands on the increment */
     d = gind();
@@ -14831,6 +14982,11 @@ static void c6_foreach_parse(void)
     vpop();
     gjmp_addr(c);
     gsym(a);
+    c6_move_restore(&mv_base);          /* the body may not have run ... */
+    if (body_ok)
+        c6_move_merge(&mv_body);        /* ... or it ran: possibly moved */
+    c6_move_snap_free(&mv_base);
+    c6_move_snap_free(&mv_body);
 
     prev_scope(&o, 0);
 }
@@ -14863,6 +15019,150 @@ static int c6_type_gq(CType *type)
 static int c6_is_managed(CType *type)
 {
     return (c6_type_gq(type) & C6_GQ_MANAGED) != 0;
+}
+
+/* --- the 'move' analysis (E-GC17) ------------------------------------- */
+
+/* Can the slot of S be followed?  Only an automatic slot of the current
+   function can: a global would need whole-program knowledge, a field or an
+   array element needs the shape of the path that reaches it, a 'weak' handle
+   is not a counted reference, and once the address of a slot is taken the
+   slot can be written behind the compiler's back.  Those cases are simply not
+   diagnosed. */
+static int c6_gc_tracked(Sym *s)
+{
+    if (!tcc_state->c6_ext || !s)
+        return 0;
+    if (!c6_is_managed(&s->type))
+        return 0;
+    if (c6_type_gq(&s->type) & C6_GQ_WEAK)
+        return 0;
+    if ((s->r & (VT_VALMASK | VT_SYM)) != VT_LOCAL)
+        return 0;
+    if (s->a.addrtaken)
+        return 0;
+    return 1;
+}
+
+/* The symbol of the slot itself, when V names it directly: 'a' yes,
+   'a->f', 'a[i]' and '*p' no.  The storage kind and the offset tell them
+   apart; vtop->sym is only a backpointer. */
+static Sym *c6_gc_slot_sym(SValue *v)
+{
+    Sym *s = v->sym;
+
+    if (!s || !c6_gc_tracked(s))
+        return NULL;
+    if ((v->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != (VT_LOCAL | VT_LVAL))
+        return NULL;
+    if (v->c.i != s->c)
+        return NULL;
+    return s;
+}
+
+/* S is being evaluated as an identifier.  If it is a slot whose reference was
+   handed to 'move' and it has not been assigned again since, that is E-GC17.
+   's = value' is not a use: the slot is being assigned again.  'sizeof',
+   'typeof' and dead code are parsed with nocode_wanted set and do not read
+   the value. */
+static void c6_gc_moved_use(Sym *s)
+{
+    if (!tcc_state->c6_ext || !s || !s->gc_moved)
+        return;
+    if (!c6_gc_tracked(s))
+        return;
+    if (nocode_wanted)
+        return;
+    if (tok == '=' || TOK_ASSIGN(tok))
+        return;
+    tcc_error("'%s' was moved: assign a new reference before using it",
+              get_tok_str(s->v, NULL));
+}
+
+/* save the state of every followed slot */
+static void c6_move_snap(C6MoveSnap *sn)
+{
+    Sym *s = 0;
+    int n = 0;
+
+    sn->n = 0;
+    sn->s = NULL;
+    sn->m = NULL;
+    if (!tcc_state->c6_ext)
+        return;
+    for (s = local_stack; s; s = s->prev)
+        if (c6_gc_tracked(s))
+            n++;
+    if (!n)
+        return;
+    sn->s = tcc_malloc(n * sizeof *sn->s);
+    sn->m = tcc_malloc(n * sizeof *sn->m);
+    n = 0;
+    for (s = local_stack; s; s = s->prev) {
+        if (!c6_gc_tracked(s))
+            continue;
+        sn->s[n] = s;
+        sn->m[n] = s->gc_moved != 0;
+        n++;
+    }
+    sn->n = n;
+}
+
+static void c6_move_snap_free(C6MoveSnap *sn)
+{
+    tcc_free(sn->s);
+    tcc_free(sn->m);
+    sn->s = NULL;
+    sn->m = NULL;
+    sn->n = 0;
+}
+
+/* put the saved state back */
+static void c6_move_restore(C6MoveSnap *sn)
+{
+    int i = 0;
+
+    for (i = 0; i < sn->n; i++)
+        sn->s[i]->gc_moved = sn->m[i];
+}
+
+/* current state |= saved state */
+static void c6_move_merge(C6MoveSnap *sn)
+{
+    int i = 0;
+
+    for (i = 0; i < sn->n; i++)
+        if (sn->m[i])
+            sn->s[i]->gc_moved = 1;
+}
+
+/* copy the set of followed slots, with no path recorded in it yet: the
+   starting point for collecting the states where several paths meet */
+static void c6_move_copy(C6MoveSnap *dst, C6MoveSnap *src)
+{
+    int i = 0;
+
+    dst->n = src->n;
+    dst->s = src->n ? tcc_malloc(src->n * sizeof *dst->s) : NULL;
+    dst->m = src->n ? tcc_malloc(src->n * sizeof *dst->m) : NULL;
+    for (i = 0; i < src->n; i++) {
+        dst->s[i] = src->s[i];
+        dst->m[i] = 0;
+    }
+}
+
+/* fold the state at the end of a branch into OUT.  A branch that ends where
+   the join cannot be reached (a 'return', 'break', 'continue' or 'goto' has
+   set nocode_wanted) contributes nothing: its slots never get there. */
+static void c6_move_branch_end(C6MoveSnap *out)
+{
+    int i = 0;
+
+    if (nocode_wanted)
+        return;
+    for (i = 0; i < out->n; i++)
+        if (out->s[i]->gc_moved)
+            out->m[i] = 1;
 }
 
 /* the same pointer type, but not a managed reference: a plain word.  Used
@@ -15642,6 +15942,13 @@ static int c6_gc_store_hook(void)
         tcc_error("'%s' is a borrow: it owns nothing, so it cannot be "
                   "reassigned (copy it into an owned local first)", b);
     }
+    /* an assignment makes the slot usable again, even when it stores the
+       empty value: 'a = NULL' is the documented way to say "no reference" */
+    {
+        Sym *dst_sym = c6_gc_slot_sym(&vtop[-1]);
+        if (dst_sym)
+            dst_sym->gc_moved = 0;
+    }
     is_null = (vtop->r & VT_VALMASK) == VT_CONST
         && !(vtop->r & (VT_LVAL | VT_SYM)) && vtop->c.i == 0;
     if (vtop->gc_state != C6_GC_FRESH && !c6_is_managed(&vtop->type)
@@ -15848,6 +16155,12 @@ static void c6_gc_move_expr(void)
         type_to_str(b, sizeof b, &vtop->type, NULL);
         tcc_error("'move' needs a managed reference held in a slot, not "
                   "a '%s'", b);
+    }
+    /* the slot is empty now: using it before an assignment is E-GC17 */
+    if (!nocode_wanted) {
+        Sym *mv = c6_gc_slot_sym(vtop);
+        if (mv)
+            mv->gc_moved = 1;
     }
     st = vtop->type;
     slot = *vtop;

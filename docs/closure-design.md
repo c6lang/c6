@@ -4,7 +4,7 @@
 V2（捕获式闭包）只给出设计，尚未实现——V1 的语法、命名与 ABI 都是它的
 子集，所以 V2 落地时 V1 的代码一行不用改。
 
-相关：[grammar.md §3.9](grammar.md)（语法与约束 C79–C82）、
+相关：[grammar.md §3.9](grammar.md)（语法与约束 C80–C83）、
 [gc-design.md](gc-design.md)（托管引用，V2 的 env 用它）、
 `tests/fn_lit.c` / `tests/errors/fn_lit.c` / `tests/abi/fn_lit.c`。
 
@@ -44,7 +44,7 @@ int (*f)(int) = int(int n) { return n + offset; };   /* 可以 */
 
 ```c
 int x = 1;
-int (*f)(void) = int() { return x; };     /* 错误 C79：捕获了 x */
+int (*f)(void) = int() { return x; };     /* 错误 C80：捕获了 x */
 ```
 
 **为什么对捕获报错而不是"就按引用用"**：字面量的体在函数返回之后才可能被
@@ -55,7 +55,7 @@ int (*f)(void) = int() { return x; };     /* 错误 C79：捕获了 x */
 
 实现上，捕获检测是"否定表"：`C6Lit.caps` 在解析字面量头时收集当前块作用域
 里的所有名字（`local_stack` 中 `sym_scope != 0` 的标识符），体编译期间任何
-一次符号解析（值、`typedef`、tag 三条路径）命中表内名字就报 C79——不需要
+一次符号解析（值、`typedef`、tag 三条路径）命中表内名字就报 C80——不需要
 做自由变量分析，也不会漏。
 
 ## 3. V2：捕获式闭包（设计，未实现）
@@ -88,7 +88,7 @@ int() { return x; }   @struct __c6_closure_1 {                    code: 8B
 的原因：无捕获的字面量永远是裸指针，捕获的字面量永远是胖指针，两者的区别
 在类型上，不会在运行期"看起来一样但行为不同"。
 
-由此 V2 需要补的三条约束（编号留空，实现时接着 C82 往后排）：
+由此 V2 需要补的三条约束（编号留空，实现时接着 C83 往后排）：
 
 - 捕获式闭包不能作为 C 函数指针传递（`qsort` 的比较函数必须无捕获）——
   报错信息里给出改法：把参数显式传进去；
@@ -100,7 +100,7 @@ int() { return x; }   @struct __c6_closure_1 {                    code: 8B
 
 | 位置 | V1 现在 | V2 增量 |
 |---|---|---|
-| `c6_lit_cap_check()` | 命中即报 C79 | 命中就把该名字记进 `C6Lit.captures`，不再报错 |
+| `c6_lit_cap_check()` | 命中即报 C80 | 命中就把该名字记进 `C6Lit.captures`，不再报错 |
 | `c6_lit_parse()` | `static` 函数 + 函数指示符 | 再建 `__c6_env_N` 的 `@struct` 类型、`new` 一个 env、把捕获变量 `vstore` 进 env 字段，值类型换成胖指针 |
 | `c6_lit_emit()` | `gen_function(lit->sym)` | 给函数体加一个隐藏的首参数（env 指针），体里捕获名的解析指向 `env->field` |
 | 调用点 | 无需改动 | `vstore` / 参数传递时把胖指针拆成 `code` + `env`（或在 type 上加 `VT_CLOSURE`，让 `gfunc_call` 自己拆） |
@@ -110,7 +110,7 @@ int() { return x; }   @struct __c6_closure_1 {                    code: 8B
 
 - 捕获可变引用（`int() { x++; }` 改外面的 `x`）：要捕获就需要"格子"语义，
   和现在的栈变量模型冲突；
-- 捕获 `this`（方法里写字面量）：方法体里 `this` 是形参，按 V1 报 C79；
+- 捕获 `this`（方法里写字面量）：方法体里 `this` 是形参，按 V1 报 C80；
   V2 里它同样是一个"借用形参"，能否捕获取决于 borrow 逃逸分析（C70）；
 - 语法上的捕获列表（`[x, &y]`）：`[` 在 c6 里已经是下标/切片，不引入新记号；
   V2 的捕获是由体里的自由名字**隐式**决定的（全部按值）；
@@ -126,4 +126,4 @@ int() { return x; }   @struct __c6_closure_1 {                    code: 8B
 | `static inline` | 体里可以写字面量：两者都是 TU 末尾发射，`c6_lit_flush()` 在 `gen_inline_functions()` 的同一个循环里跑 |
 | `module` / `-emit-header` | `__c6_fn_N` 以 `__` 开头且 `static`，不改写、不导出 |
 | C99 后端 | 字面量就是普通 `static` 函数，`-o *.c` 输出的是可读的 C（`make c99test` 覆盖） |
-| `test` | `tests/fn_lit.c` 用 test 块覆盖正常用法，`tests/errors/fn_lit.c` 覆盖 C79–C82 |
+| `test` | `tests/fn_lit.c` 用 test 块覆盖正常用法，`tests/errors/fn_lit.c` 覆盖 C80–C83 |

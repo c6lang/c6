@@ -56,8 +56,13 @@ test "own 树：递归释放" {
         r->v = 3;
         root->left = move(l);           /* 交出：l 变空 */
         root->right = move(r);
-        if (l != NULL || r != NULL)
-            err(10, "move 之后源槽应当为空");
+        /* 交出之后源槽不可再读（E-GC17，tests/errors/gc_move.c 覆盖），
+           要重新赋值才能再用 */
+        l = new Tree;
+        l->v = 4;
+        if (l->v != 4)
+            err(10, "重新赋值之后应当可以再用");
+        l = NULL;
         if (root->left->v != 2 || root->right->v != 3)
             err(11, "子树没接上");
         if (__c6_gc_live() != base + 3)
@@ -76,7 +81,7 @@ test "move 之后源槽不再释放" {
         a->v = 1;
         b->v = 2;
         b->next = move(a);              /* a 的那一份交给 b 的 own 槽 */
-        a = NULL;                       /* 已经是空槽，什么也不做 */
+        a = NULL;                       /* 重新赋值（已经是空槽，什么也不做） */
         if (b->next->v != 1)
             err(20, "move 的值不对");
         if (__c6_gc_live() != base + 2)

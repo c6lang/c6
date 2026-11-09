@@ -350,6 +350,13 @@
   报 E-GC1 并终止；
 - `move(p)`：`__c6_gc_move(&p)` 返回指针、把槽清零、**不**释放，结果标 FRESH；
   这是 `own` 链/子树「先建后接」的唯一写法；
+- `move(p)` 之后的空槽再用是编译错误（E-GC17）：`Sym.gc_moved` 在
+  `c6_gc_move_expr()` 里置位、在 `c6_gc_store_hook()` 里清位，标识符压栈时由
+  `c6_gc_moved_use()` 报错；分支各出口的状态用 `C6MoveSnap`（并行数组，
+  `c6_move_snap` / `c6_move_restore` / `c6_move_merge` / `c6_move_branch_end`）
+  在 `if`/`while`/`for`/`switch`/`foreach` 的汇合点取并集，`defer`/`errdefer`
+  体在 `c6_defer_parse()` 里单独快照、`catch` 体在 `c6_catch_parse()` 里同理
+  （它们分别在作用域退出、错误路径上才跑）；
 - `own` 的存储规则照旧：只收 FRESH 或空值（E-GC13），共享就报错。
 
 落地状态（与计划的差异）：
@@ -379,7 +386,10 @@
 测试：
 
 - `tests/errors/gc_cycle.c`：自环、互环、数组自环、按值嵌入环；
-- `tests/gc_own.c`：`new` 直接接链、`move` 接子树、`move` 后源槽不再释放、
+- `tests/errors/gc_move.c`：`move` 之后读/比较/传参/再 `move`/`return`，以及
+  `if`/`while`/`switch` 只有一条路重新赋值（8 条），外加正常路径（重新赋值、
+  `sizeof`、`defer` 体里的 move）；
+- `tests/gc_own.c`：`new` 直接接链、`move` 接子树、`move` 后重新赋值再用、
   析构在独占链上逐个跑；
 - 正例：`weak` 反向引用（要先升级才能解引用）、`own` 子树、无环互递归。
 
@@ -474,6 +484,7 @@
 | 描述符发射与 `static inline` 体的 fixpoint 顺序 | 描述符缺失 → 运行期空指针 | 挂在现有 fixpoint 循环里（:658）；TI 式回归（inline 里 `new`） |
 | async 帧搬动（既有缺陷） | 静默写坏别的栈 | 禁 async 内 `weak` + restore 地址校验 trap + 文档 |
 | `own` 环（`b.next = a` 式构造） | 释放时死循环/越界 | `own` 赋值只接受 FRESH/`move()`；文档写明 |
+| `move` 之后的使用漏报（全局槽、字段、`&p` 取过地址的槽不跟踪） | 运行期解引用空槽 | 只承诺跟踪本函数的自动托管槽（设计 §3.4 写明边界）；`tests/errors/gc_move.c` 覆盖读/比较/传参/再 `move`/分支合并 |
 | C99 后端漏符号 | C99 测试链接失败 | 每阶段检查 `c99_runtime_names[]` |
 | `-std=c6` 之外的行为变化 | 破坏普通 C 回归 | `make test-plain` 作为每阶段门槛 |
 | 跨 TU 环在 `-c99` 上看不到 | 漏报 | 设计 §15 写明；用例 `// NATIVE-ONLY` 标注 |
