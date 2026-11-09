@@ -995,3 +995,9 @@ KVM，否则 TCG），断言全过时 payload 往 0x501 写 0，qemu 退出码 1
 的话 payload 第一条 `movq %xmm0` 就 `#UD`；引导扇区必须正好 512 字节且以
 `0x55AA` 结尾；读盘每块 ≤ 16 扇区以免撞 64KB 段边界。tcc 的汇编器不认
 `.code16`/`.code32`，所以只有引导扇区这几十行走 binutils 的 `as`。
+
+协程（`co` / `async` / `await` / `task`）同样能在裸机上跑：运行时状态部在
+`libtcc1` 的协程池里，调度器 `tcc_co_pump()` 只在有任务停在 fd 上时才用到
+`select`；`await c6_io(...)` 是唯一需要外部实现的入口，缺 `select` 时
+`__c6_co_run()` 返回 -1（不会链接失败）。`examples/boot/main.c` 的裸机用例
+覆盖了交错的两个顶层 `co`、循环里的 `await`、失败任务计数和 `c6_io` 的失败路径。

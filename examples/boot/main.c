@@ -52,6 +52,50 @@ static int eq(const char *a, const char *b)
     return 1;
 }
 
+/* ---- 协程：async / await / co ----------------------------------------
+   状态全在内存里，调度器就是 libtcc1 里的 tcc_co_pump()，不碰 select，
+   所以没有内核也照样能跑。 */
+static int co_total = 0;
+static int co_hits = 0;
+
+async int add_one(int n)
+{
+    return n + 1;
+}
+
+async int counter(int n)                /* 循环里反复 await */
+{
+    int i = 0, t = 0;
+
+    for (i = 0; i < n; i++)
+        t += await add_one(i);          /* 1 + 2 + ... + n */
+    return t;
+}
+
+async int chain(int n)                  /* 嵌套 await，结果写全局 */
+{
+    int a = 0;
+
+    a = await counter(n);
+
+    co_hits++;
+    co_total += a;
+    return a;
+}
+
+async int waiter(void)                  /* 碰 c6_io：裸机上没有 select */
+{
+    int rev = 0;
+
+    rev = await c6_io(1, C6_CO_EV_WRITE);
+    return rev;
+}
+
+async int!error boom(void)
+{
+    err(7, "co boom");
+}
+
 int!error half(int n)
 {
     if (n < 0)
@@ -94,6 +138,21 @@ void _start(void)
     caught:
         bad |= got == 9 ? 0 : 64;
         (void)v;
+    }
+    {
+        int errs = 0;
+
+        co chain(2);                    /* 两个顶层协程：3 和 6 */
+        co chain(3);
+        errs = __c6_co_run();           /* 驱动到全部完成 */
+        bad |= errs == 0 ? 0 : 128;
+        bad |= co_total == 9 ? 0 : 256;         /* 3 + 6 */
+        bad |= co_hits == 2 ? 0 : 512;
+        co boom();                              /* err 的协程要被计数 */
+        bad |= __c6_co_run() == 1 ? 0 : 1024;
+        co waiter();
+        bad |= __c6_co_run() == -1 ? 0 : 2048;  /* 没有 select：pump 报失败 */
+        puts_(f"co: total={co_total} hits={co_hits}\n");
     }
     return;                                        /* 让上面的 defer 收尾 */
 }

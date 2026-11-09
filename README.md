@@ -1269,6 +1269,13 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 「输出」是两条 `outb`（0xE9 调试口、0x501 退出），写在 payload 自己的全局
 `__asm__` 里 —— 换块板子只要改这两条指令。
 
+协程在这里一样能用：`co` / `async` / `await` / `task` / `__c6_co_run()` 的状态全在
+内存里，调度器就是 `libtcc1` 里的 `tcc_co_pump()`，**一个 syscall 都不发**。
+`examples/boot/main.c` 里跑了两个交错的顶层 `co`（各自循环里反复 `await`、结果写
+回全局），外加一条失败任务的计数。唯一需要外部实现的是 `await c6_io(...)`：它靠
+`select` 等 fd，裸机上没有，`__c6_co_run()` 就按设计返回 -1（这个也断言了）；
+`go` / `thread` 要的是另一层，见上面那张 pthread 入口表。
+
 几个只有真裸机才会碰到的坑：
 
 - **SSE 要自己开**。c6 的浮点/结构拷贝会用 `xmm`，长模式下 `CR4.OSFXSR` 不开
