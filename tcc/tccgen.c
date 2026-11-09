@@ -17227,16 +17227,355 @@ static int c6_is_int_type(CType *t)
     return is_integer_btype(t->t & VT_BTYPE);
 }
 
+/* ------------------------------------------------------------------ */
+/* 'foreach' over an iterator protocol                                 */
+/*                                                                     */
+/* The iterable's type provides two methods:                           */
+/*                                                                     */
+/*     int has(T *self);      nonzero: there is another element        */
+/*     E   next(T *self);     the next element (a copy is bound)       */
+/*                                                                     */
+/* A struct/union value, a pointer to one, or an interface value whose  */
+/* vtable declares both methods all qualify.  The element type is the  */
+/* static return type of 'next', so nothing is boxed or erased; a       */
+/* concrete type is called directly and an interface value goes        */
+/* through its vtable.  This is deliberately not a 'void *next()'      */
+/* protocol: that would erase the element type.                        */
+typedef struct C6Iter {
+    int iface;        /* dispatch through an interface vtable */
+    int is_ptr;       /* concrete: the iterable expression is 'T *' */
+    CType obj;        /* type stored in the hidden slot */
+    CType self;       /* type of the receiver passed to the methods */
+    CType elem;       /* element type: the return type of 'next' */
+    C6Method *mhas;   /* concrete methods */
+    C6Method *mnext;
+    C6Iface *ifc;     /* interface descriptor */
+    Sym *fhas;        /* interface: the vtable fields */
+    Sym *fnext;
+    CType self_type;  /* interface: type of the 'self' field */
+    CType vt_type;    /* interface: type of the 'vt' field */
+    int off_self, off_vt, off_has, off_next;
+    /* hidden locals used to replay the call through the normal parser:
+       '__c6_it_has_N(__c6_it_self_N)' and the same for 'next' */
+    int fn_has_off, fn_next_off, self_off;
+    int fn_has_tok, fn_next_tok, self_tok;
+} C6Iter;
+
+/* return type and parameter count of a function type */
+static int c6_iter_func_info(CType *ft, CType *ret, int *np)
+{
+    Sym *p = 0;
+    int n = 0;
+
+    if ((ft->t & VT_BTYPE) != VT_FUNC || !ft->ref)
+        return 0;
+    *ret = ft->ref->type;
+    for (p = ft->ref->next; p; p = p->next)
+        n++;
+    *np = n;
+    return 1;
+}
+
+static void c6_iter_check_has(CType *ret, int np)
+{
+    char buf[256] = {0};
+
+    if (np != 1)
+        tcc_error("iterator method 'has' must take only the receiver");
+    if (!c6_is_int_type(ret)) {
+        type_to_str(buf, sizeof buf, ret, NULL);
+        tcc_error("iterator method 'has' must return an integer type "
+                  "(got '%s')", buf);
+    }
+}
+
+static void c6_iter_check_next(C6Iter *it, CType *ret, int np)
+{
+    CType e = {0};
+    char buf[256] = {0};
+    int size = 0, align = 0;
+
+    if (np != 1)
+        tcc_error("iterator method 'next' must take only the receiver");
+    e = *ret;
+    e.t &= ~VT_QUAL;
+    if ((e.t & VT_BTYPE) == VT_VOID) {
+        type_to_str(buf, sizeof buf, &e, NULL);
+        tcc_error("iterator method 'next' must return a value (got '%s')", buf);
+    }
+    if ((e.t & VT_BTYPE) == VT_FUNC) {
+        type_to_str(buf, sizeof buf, &e, NULL);
+        tcc_error("iterator method 'next' must return an object type "
+                  "(got '%s')", buf);
+    }
+    if ((e.t & VT_BTYPE) == VT_PTR
+        && (pointed_type(&e)->t & VT_BTYPE) == VT_VOID) {
+        type_to_str(buf, sizeof buf, &e, NULL);
+        tcc_error("iterator method 'next' cannot return '%s': the element "
+                  "type would be erased (return 'E' or 'E *' with a "
+                  "concrete E)", buf);
+    }
+    if (e.t & VT_ARRAY) {
+        type_to_str(buf, sizeof buf, &e, NULL);
+        tcc_error("'foreach' cannot copy an element of type '%s'", buf);
+    }
+    size = type_size(&e, &align);
+    if (size < 0) {
+        type_to_str(buf, sizeof buf, &e, NULL);
+        tcc_error("cannot iterate over incomplete element type '%s'", buf);
+    }
+    it->elem = e;
+}
+
+/* Fill IT when T provides the has()/next() protocol.  Returns 0 when the
+   type is not an iterator at all (the caller then produces the plain
+   cannot-iterate diagnostic). */
+static int c6_iter_proto_of(CType *t, C6Iter *it)
+{
+    CType pt = {0}, ft = {0}, ret = {0};
+    C6Iface *ifc = 0;
+    C6Method *mh = 0, *mn = 0;
+    Sym *fs = 0, *vt = 0, *fself = 0, *fvt = 0, *fh = 0, *fn = 0;
+    CType vtt = {0};
+    int tag = 0, np = 0;
+    int has = tok_alloc_const("has");
+    int next = tok_alloc_const("next");
+
+    memset(it, 0, sizeof *it);
+    it->obj = *t;
+    it->obj.t &= ~VT_QUAL;
+
+    ifc = c6_iface_of_type(t);
+    if (ifc) {
+        if (!c6_iface_has_method(ifc, has)
+            || !c6_iface_has_method(ifc, next))
+            return 0;
+        vt = struct_find(ifc->vt_tag);
+        if (!vt)
+            return 0;
+        vtt.t = VT_STRUCT;
+        vtt.ref = vt;
+        fh = find_field(&vtt, has, &it->off_has);
+        fn = find_field(&vtt, next, &it->off_next);
+        fself = find_field(t, tok_alloc_const("self"), &it->off_self);
+        fvt = find_field(t, tok_alloc_const("vt"), &it->off_vt);
+        if (!fh || !fn || !fself || !fvt)
+            return 0;
+        ft = *pointed_type(&fh->type);
+        if (!c6_iter_func_info(&ft, &ret, &np))
+            return 0;
+        c6_iter_check_has(&ret, np);
+        ft = *pointed_type(&fn->type);
+        if (!c6_iter_func_info(&ft, &ret, &np))
+            return 0;
+        c6_iter_check_next(it, &ret, np);
+        it->iface = 1;
+        it->ifc = ifc;
+        it->fhas = fh;
+        it->fnext = fn;
+        it->self_type = fself->type;
+        it->vt_type = fvt->type;
+        return 1;
+    }
+
+    if ((t->t & VT_BTYPE) == VT_PTR && !(t->t & VT_ARRAY)) {
+        pt = *pointed_type(t);
+        if ((pt.t & VT_BTYPE) != VT_STRUCT || (pt.t & VT_ARRAY) || !pt.ref)
+            return 0;
+        /* a real field of that name shadows the method, as in 'p->m()' */
+        if (c6_find_field_quiet(&pt, has | SYM_FIELD)
+            || c6_find_field_quiet(&pt, next | SYM_FIELD))
+            return 0;
+        tag = pt.ref->v & ~SYM_STRUCT;
+        pt.t &= ~VT_QUAL;
+        mk_pointer(&pt);
+        it->obj = pt;
+        it->self = pt;
+        it->is_ptr = 1;
+    } else if ((t->t & VT_BTYPE) == VT_STRUCT
+               && !(t->t & VT_ARRAY) && t->ref) {
+        if (c6_find_field_quiet(t, has | SYM_FIELD)
+            || c6_find_field_quiet(t, next | SYM_FIELD))
+            return 0;
+        tag = t->ref->v & ~SYM_STRUCT;
+        it->self = it->obj;
+        mk_pointer(&it->self);
+    } else {
+        return 0;
+    }
+
+    mh = c6_method_of(tag, has);
+    mn = c6_method_of(tag, next);
+    if (!mh || !mn)
+        return 0;
+    fs = sym_find_raw(mh->sym_tok);
+    if (!fs || !c6_iter_func_info(&fs->type, &ret, &np))
+        return 0;
+    c6_iter_check_has(&ret, np);
+    fs = sym_find_raw(mn->sym_tok);
+    if (!fs || !c6_iter_func_info(&fs->type, &ret, &np))
+        return 0;
+    c6_iter_check_next(it, &ret, np);
+    it->mhas = mh;
+    it->mnext = mn;
+    return 1;
+}
+
+static int c6_iter_seq = 0;
+
+/* hidden locals holding 'fn' and 'self' for the replayed calls */
+static void c6_iter_setup(C6Iter *it)
+{
+    CType ft = {0}, st = {0};
+    char buf[64] = {0};
+    int size = 0, align = 0, seq = 0;
+
+    seq = ++c6_iter_seq;
+    if (it->iface) {
+        ft = it->fhas->type;
+        st = it->self_type;
+    } else {
+        ft = sym_find_raw(it->mhas->sym_tok)->type;
+        mk_pointer(&ft);
+        st = it->self;
+    }
+    size = type_size(&ft, &align);
+    loc = (loc - size) & -align;
+    it->fn_has_off = loc;
+    snprintf(buf, sizeof buf, "__c6_it_has_%d", seq);
+    it->fn_has_tok = tok_alloc_const(buf);
+    sym_push(it->fn_has_tok, &ft, VT_LOCAL | VT_LVAL, it->fn_has_off);
+
+    if (it->iface) {
+        ft = it->fnext->type;
+    } else {
+        ft = sym_find_raw(it->mnext->sym_tok)->type;
+        mk_pointer(&ft);
+    }
+    size = type_size(&ft, &align);
+    loc = (loc - size) & -align;
+    it->fn_next_off = loc;
+    snprintf(buf, sizeof buf, "__c6_it_next_%d", seq);
+    it->fn_next_tok = tok_alloc_const(buf);
+    sym_push(it->fn_next_tok, &ft, VT_LOCAL | VT_LVAL, it->fn_next_off);
+
+    size = type_size(&st, &align);
+    loc = (loc - size) & -align;
+    it->self_off = loc;
+    snprintf(buf, sizeof buf, "__c6_it_self_%d", seq);
+    it->self_tok = tok_alloc_const(buf);
+    sym_push(it->self_tok, &st, VT_LOCAL | VT_LVAL, it->self_off);
+}
+
+/* Call 'has()' (which == 0) or 'next()' (which == 1) on the hidden
+   iterable slot at OBJ_OFF; the return value is left on the stack.
+   The call itself is replayed through the ordinary expression parser
+   ('fn(self)') so that the return value, structure returns and the
+   small-type promotions behave exactly like a written call. */
+static void c6_iter_call(C6Iter *it, int obj_off, int which)
+{
+    CType t = {0}, fpt = {0}, self_t = {0};
+    Sym *fs = 0;
+    TokenString *ts = 0;
+    int r = 0, foff = 0, ftok = 0;
+    int save_tok = 0;
+    CValue save_val = {0};
+
+    save_tok = tok;
+    save_val = tokc;
+    foff = which ? it->fn_next_off : it->fn_has_off;
+    ftok = which ? it->fn_next_tok : it->fn_has_tok;
+    self_t = it->iface ? it->self_type : it->self;
+
+    if (it->iface) {
+        Sym *f = which ? it->fnext : it->fhas;
+        int moff = which ? it->off_next : it->off_has;
+
+        fpt = f->type;
+        /* tmp.vt->meth */
+        vset(&it->obj, VT_LOCAL | VT_LVAL, obj_off);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi(it->off_vt);
+        gen_op('+');
+        t = it->vt_type;
+        mk_pointer(&t);
+        vtop->type = t;
+        indir();                        /* the vtable pointer */
+        vtop->type = char_pointer_type;
+        vpushi(moff);
+        gen_op('+');
+        t = f->type;
+        mk_pointer(&t);
+        vtop->type = t;
+        indir();                        /* the method pointer */
+    } else {
+        fs = sym_find_raw(which ? it->mnext->sym_tok : it->mhas->sym_tok);
+        if (!fs)
+            tcc_error("iterator method is not a function");
+        fpt = fs->type;
+        mk_pointer(&fpt);
+        r = fs->r;
+        if ((r & VT_VALMASK) < VT_CONST)
+            r = (r & ~VT_VALMASK) | VT_LOCAL;
+        vset(&fs->type, r, fs->c);
+        vtop->sym = fs;
+        if (r & VT_SYM)
+            vtop->c.i = 0;
+    }
+    vset(&fpt, VT_LOCAL | VT_LVAL, foff);   /* fn = the method pointer */
+    vswap();
+    vstore();
+    vpop();
+
+    if (it->iface) {
+        vset(&it->obj, VT_LOCAL | VT_LVAL, obj_off);
+        gaddrof();
+        vtop->type = char_pointer_type;
+        vpushi(it->off_self);
+        gen_op('+');
+        t = it->self_type;
+        mk_pointer(&t);
+        vtop->type = t;
+        indir();                        /* tmp.self */
+    } else if (it->is_ptr) {
+        vset(&it->self, VT_LOCAL | VT_LVAL, obj_off);
+    } else {
+        vset(&it->obj, VT_LOCAL | VT_LVAL, obj_off);
+        gaddrof();
+        vtop->type = it->self;
+    }
+    vset(&self_t, VT_LOCAL | VT_LVAL, it->self_off);    /* self = receiver */
+    vswap();
+    vstore();
+    vpop();
+
+    ts = tok_str_alloc();
+    tok_str_add(ts, ftok);
+    tok_str_add(ts, '(');
+    tok_str_add(ts, it->self_tok);
+    tok_str_add(ts, ')');
+    tok_str_add(ts, TOK_EOF);
+    begin_macro(ts, 1);
+    next();
+    gexpr();
+    end_macro_under(ts);
+    tok = save_tok;
+    tokc = save_val;
+}
+
 /* 'foreach' keeps the 'for' semantics: the binders live in their own scope
    and 'lblock' collects the break/continue jumps of the body. */
 static void c6_foreach_parse(void)
 {
     C6Slice *sl = 0;
     CType t = {0}, elem = {0}, ept = {0}, ctr = {0};
+    C6Iter it = {0};
     struct scope o = {0};
     char buf[256] = {0};
-    int n1 = 0, n2 = 0, nb = 0, is_range = 0;
+    int n1 = 0, n2 = 0, nb = 0, is_range = 0, is_iter = 0;
     int i_off = 0, v_off = 0, pair = 0, hi_off = 0, size = 0, align = 0;
+    int obj_off = 0;
     int a = 0, b = 0, c = 0, d = 0;
     C6MoveSnap mv_base = {0}, mv_body = {0};
     int body_ok = 0;
@@ -17297,67 +17636,112 @@ static void c6_foreach_parse(void)
         vpop();
     } else {
         t = vtop->type;
-        if (nb != 2)
-            tcc_error("an array or slice yields an index and a value: "
-                      "write 'foreach |i, v| a'");
-        if (t.t & VT_VLA)
-            tcc_error("cannot iterate over a variable length array");
-        if (t.t & VT_ARRAY) {
-            if (!t.ref || t.ref->c < 0)
-                tcc_error("cannot iterate over an array of unknown length");
-            elem = *pointed_type(&t);
-            elem.t &= ~VT_QUAL;
-            pair = c6_slice_spill(NULL);
-        } else if ((sl = c6_slice_of_type(&t)) != NULL) {
-            elem = sl->elem;
-            pair = c6_slice_spill(sl);
+        if (c6_iter_proto_of(&t, &it)) {
+            /* an iterator binds the value only: there is no index */
+            is_iter = 1;
+            if (nb != 1)
+                tcc_error("an iterator yields only a value: "
+                          "write 'foreach |v| it'");
+            elem = it.elem;
+            /* the iterable is evaluated once and kept in a hidden slot */
+            size = type_size(&it.obj, &align);
+            loc = (loc - size) & -align;
+            obj_off = loc;
+            vset(&it.obj, VT_LOCAL | VT_LVAL, obj_off);
+            vswap();
+            vstore();
+            vpop();
+            /* the value binder is written from 'next()' each round */
+            size = type_size(&elem, &align);
+            loc = (loc - size) & -align;
+            v_off = loc;
+            if (n1)
+                sym_push(n1, &elem, VT_LOCAL | VT_LVAL, v_off);
+            c6_iter_setup(&it);
         } else {
-            type_to_str(buf, sizeof buf, &t, NULL);
-            if ((t.t & VT_BTYPE) == VT_PTR)
-                tcc_error("cannot iterate over '%s' (use a slice parameter "
-                          "'T[:]', or '(T[:]){p, n}')", buf);
-            if (c6_is_int_type(&t))
-                tcc_error("cannot iterate over '%s' (write a range: "
-                          "'foreach |i| lo:hi')", buf);
-            tcc_error("cannot iterate over '%s' (expose a slice member, "
-                      "e.g. 'T[:] items')", buf);
+            if (t.t & VT_VLA)
+                tcc_error("cannot iterate over a variable length array");
+            if (t.t & VT_ARRAY) {
+                if (!t.ref || t.ref->c < 0)
+                    tcc_error("cannot iterate over an array of unknown length");
+                if (nb != 2)
+                    tcc_error("an array or slice yields an index and a value: "
+                              "write 'foreach |i, v| a'");
+                elem = *pointed_type(&t);
+                elem.t &= ~VT_QUAL;
+                pair = c6_slice_spill(NULL);
+            } else if ((sl = c6_slice_of_type(&t)) != NULL) {
+                if (nb != 2)
+                    tcc_error("an array or slice yields an index and a value: "
+                              "write 'foreach |i, v| a'");
+                elem = sl->elem;
+                pair = c6_slice_spill(sl);
+            } else {
+                type_to_str(buf, sizeof buf, &t, NULL);
+                if ((t.t & VT_BTYPE) == VT_PTR)
+                    tcc_error("cannot iterate over '%s' (no 'has'/'next' "
+                              "iterator: use a slice parameter 'T[:]', or "
+                              "'(T[:]){p, n}')", buf);
+                if (c6_is_int_type(&t))
+                    tcc_error("cannot iterate over '%s' (write a range: "
+                              "'foreach |i| lo:hi')", buf);
+                tcc_error("cannot iterate over '%s' (no 'has'/'next' iterator: "
+                          "expose a slice member 'T[:] items', or define "
+                          "'int has(); E next();')", buf);
+            }
+            if (!n1 && !n2)
+                tcc_error("'foreach' discards both binders");
+            if (elem.t & VT_ARRAY) {
+                type_to_str(buf, sizeof buf, &elem, NULL);
+                tcc_error("'foreach' cannot copy an element of type '%s'", buf);
+            }
+            size = type_size(&elem, &align);
+            if (size < 0) {
+                type_to_str(buf, sizeof buf, &elem, NULL);
+                tcc_error("cannot iterate over incomplete element type '%s'", buf);
+            }
+            ctr = c6_size_type();
+            /* hidden slots first, then the two binders */
+            loc = (loc - size) & -align;
+            v_off = loc;
+            loc = (loc - PTR_SIZE) & -PTR_SIZE;
+            i_off = loc;
+            if (n1)
+                sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
+            if (n2)
+                sym_push(n2, &elem, VT_LOCAL | VT_LVAL, v_off);
+            vset(&ctr, VT_LOCAL | VT_LVAL, i_off);       /* i = 0 */
+            vpushi(0);
+            vstore();
+            vpop();
         }
-        if (!n1 && !n2)
-            tcc_error("'foreach' discards both binders");
-        if (elem.t & VT_ARRAY) {
-            type_to_str(buf, sizeof buf, &elem, NULL);
-            tcc_error("'foreach' cannot copy an element of type '%s'", buf);
-        }
-        size = type_size(&elem, &align);
-        if (size < 0) {
-            type_to_str(buf, sizeof buf, &elem, NULL);
-            tcc_error("cannot iterate over incomplete element type '%s'", buf);
-        }
-        ctr = c6_size_type();
-        /* hidden slots first, then the two binders */
-        loc = (loc - size) & -align;
-        v_off = loc;
-        loc = (loc - PTR_SIZE) & -PTR_SIZE;
-        i_off = loc;
-        if (n1)
-            sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
-        if (n2)
-            sym_push(n2, &elem, VT_LOCAL | VT_LVAL, v_off);
-        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);       /* i = 0 */
-        vpushi(0);
-        vstore();
-        vpop();
     }
 
     c6_move_snap(&mv_base);             /* state on entry to the body */
     c = gind();
-    vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
-    vset(&ctr, VT_LOCAL | VT_LVAL, is_range ? hi_off : pair + PTR_SIZE);
-    gen_op(TOK_LT);
+    if (is_iter) {
+        c6_iter_call(&it, obj_off, 0);  /* has() */
+        vpushi(0);
+        gen_op(TOK_NE);
+    } else {
+        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
+        vset(&ctr, VT_LOCAL | VT_LVAL, is_range ? hi_off : pair + PTR_SIZE);
+        gen_op(TOK_LT);
+    }
     a = gvtst(1, 0);
 
-    /* the value binder is loaded from the pair on every iteration */
-    if (n2) {
+    /* the value binder is loaded on every iteration */
+    if (is_iter) {
+        c6_iter_call(&it, obj_off, 1);  /* next() */
+        if (n1) {
+            vset(&elem, VT_LOCAL | VT_LVAL, v_off);     /* destination */
+            vswap();
+            vstore();
+            vpop();
+        } else {
+            vpop();                     /* '_' also advances the iterator */
+        }
+    } else if (n2) {
         ept = elem;
         mk_pointer(&ept);
         vset(&elem, VT_LOCAL | VT_LVAL, v_off);     /* destination */
@@ -17376,17 +17760,23 @@ static void c6_foreach_parse(void)
     if (body_ok)
         c6_move_snap(&mv_body);
 
-    /* 'continue' lands on the increment */
-    d = gind();
-    gsym_addr(b, d);
-    vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
-    vpushi(1);
-    gen_op('+');
-    vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
-    vswap();
-    vstore();
-    vpop();
-    gjmp_addr(c);
+    if (is_iter) {
+        /* 'continue' goes back to the has() test */
+        gsym_addr(b, c);
+        gjmp_addr(c);
+    } else {
+        /* 'continue' lands on the increment */
+        d = gind();
+        gsym_addr(b, d);
+        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
+        vpushi(1);
+        gen_op('+');
+        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
+        vswap();
+        vstore();
+        vpop();
+        gjmp_addr(c);
+    }
     gsym(a);
     c6_move_restore(&mv_base);          /* the body may not have run ... */
     if (body_ok)
