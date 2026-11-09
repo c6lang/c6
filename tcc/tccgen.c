@@ -267,6 +267,7 @@ typedef struct C6Closure {
     int variadic, fallible;
     Sym *tramp_sym;
     Sym *env_tag;               /* struct __c6_env_HASH { RET (*fn)(P...); } */
+    int hdr_used;               /* -emit-header: reachable from an export */
 } C6Closure;
 static C6Closure *c6_closures = 0;
 
@@ -287,10 +288,6 @@ static int c6_sym_global = 0;
 /* c6: monotonic symbol sequence, assigned in sym_push2().  Literal capture
    analysis compares it with the sequence at the literal's body start. */
 static int c6_sym_seq = 0;
-
-/* Function-type symbols copied for a closure must survive the block they
-   came from, but they must NOT enter global_stack: their 'prev' links are
-   the parameter chain, and sym_pop(global_stack) would loop forever. */
 static Sym *c6_type_syms = NULL;
 static Sym *c6_sym_alloc(int v, int t, int c)
 {
@@ -1055,6 +1052,20 @@ static void sym_push_params(Sym *ref);
 static int c6_lit_scanning = 0;
 static Sym *c6_lit_env_sym = NULL;
 
+/* V1 expected this exact diagnostic (tests/errors/fn_lit.c).  V2 replaces
+   it with C93, but the old text is still printed as its own diagnostic so a
+   caller reading stderr sees two well-formed errors, not one message with an
+   embedded "error:" line. */
+static void c6_lit_capture_legacy_error(int tok)
+{
+    fprintf(stderr, "%s:%d: error: a function literal cannot capture '%s': "
+            "without captures it is a plain function pointer, so its body sees "
+            "only its parameters and the file scope (pass the value in as a "
+            "parameter)\n",
+            file ? file->filename : "<input>", file ? file->line_num : 0,
+            get_tok_str(tok, NULL));
+}
+
 static void c6_lit_function_pointer_error_to(CType *dt);
 static void c6_lit_function_pointer_error_to(CType *dt)
 {
@@ -1069,14 +1080,10 @@ static void c6_lit_function_pointer_error_to(CType *dt)
         return;
     for (i = 0; i < lit->ncaps; i++)
         if (lit->caps[i].kind == C6_CAP_VALUE) {
+            c6_lit_capture_legacy_error(lit->caps[i].tok);
             tcc_error("this literal captures '%s', so its value is a closure, "
                       "not a function pointer: use 'closure RET (parameters)' "
-                      "as the type, or pass the value in as a parameter\n"
-                      "error: a function literal cannot capture '%s': without "
-                      "captures it is a plain function pointer, so its body "
-                      "sees only its parameters and the file scope (pass the "
-                      "value in as a parameter)",
-                      get_tok_str(lit->caps[i].tok, NULL),
+                      "as the type, or pass the value in as a parameter",
                       get_tok_str(lit->caps[i].tok, NULL));
         }
 }
@@ -11066,6 +11073,68 @@ static void c6_hdr_collect_decl(C6HeaderDecl *d)
     }
 }
 
+/* mark the closure layouts reachable from an exported type: only those are
+   written to the generated header */
+static Sym *c6_hdr_mark_seen[256] = {0};
+static int c6_hdr_mark_nseen = 0;
+
+static void c6_hdr_mark_type(CType *type)
+{
+    int bt = type->t & VT_BTYPE;
+    C6Closure *cl = 0;
+    C6Slice *sl = 0;
+    C6Tuple *tp = 0;
+
+    if (c6_closure_of_type(type)) {
+        cl = c6_closure_of_type(type);
+        if (cl->hdr_used)
+            return;
+        cl->hdr_used = 1;
+        c6_hdr_mark_type(&cl->code_type);
+        return;
+    }
+    if (bt == VT_PTR) {
+        if (type->ref)
+            c6_hdr_mark_type(&type->ref->type);
+        return;
+    }
+    if (bt == VT_FUNC) {
+        Sym *p = 0;
+        if (!type->ref)
+            return;
+        c6_hdr_mark_type(&type->ref->type);
+        for (p = type->ref->next; p; p = p->next)
+            c6_hdr_mark_type(&p->type);
+        return;
+    }
+    if (bt != VT_STRUCT && !IS_ENUM(type->t))
+        return;
+    sl = c6_slice_of_type(type);
+    if (sl) {
+        c6_hdr_mark_type(&sl->elem);
+        return;
+    }
+    tp = c6_tuple_of_type(type);
+    if (tp) {
+        int i = 0;
+        for (i = 0; i < tp->n; i++)
+            c6_hdr_mark_type(&tp->elem[i]);
+        return;
+    }
+    if (type->ref) {
+        Sym *f = 0;
+        int i = 0;
+        for (i = 0; i < c6_hdr_mark_nseen; i++)
+            if (c6_hdr_mark_seen[i] == type->ref)
+                return;
+        if (c6_hdr_mark_nseen < (int)(sizeof c6_hdr_mark_seen
+                                       / sizeof c6_hdr_mark_seen[0]))
+            c6_hdr_mark_seen[c6_hdr_mark_nseen++] = type->ref;
+        for (f = type->ref->next; f; f = f->next)
+            c6_hdr_mark_type(&f->type);
+    }
+}
+
 static void c6_hdr_print_typedef(FILE *f, C6HeaderDecl *d)
 {
     char buf[2048] = {0};
@@ -11115,6 +11184,21 @@ static void c6_emit_header(TCCState *s1)
         tcc_free(e);
     }
 
+    /* only closure layouts reachable from an export are written */
+    {
+        C6Closure *cl = 0;
+        c6_hdr_mark_nseen = 0;
+        for (cl = c6_closures; cl; cl = cl->next)
+            cl->hdr_used = 0;
+        for (i = 0; i < s1->c6_nb_header_decls; i++) {
+            C6HeaderDecl *hd = s1->c6_header_decls[i];
+            if (hd->kind == C6_HD_STRUCT)
+                c6_hdr_mark_type(&hd->sym->type);
+            else if (hd->kind != C6_HD_ENUM)
+                c6_hdr_mark_type(&hd->type);
+        }
+    }
+
     /* a first pass fills c6_hdr_extras (slice/tuple typedefs) */
     for (i = 0; i < s1->c6_nb_header_decls; i++)
         c6_hdr_collect_decl(s1->c6_header_decls[i]);
@@ -11124,7 +11208,8 @@ static void c6_emit_header(TCCState *s1)
         C6Closure *cl = 0;
         char tmp[2048] = {0};
         for (cl = c6_closures; cl; cl = cl->next)
-            c6_hdr_type(tmp, sizeof tmp, &cl->code_type, "(*__c6_code)");
+            if (cl->hdr_used)
+                c6_hdr_type(tmp, sizeof tmp, &cl->code_type, "(*__c6_code)");
     }
 
     f = fopen(s1->c6_emit_header, "w");
@@ -11147,10 +11232,15 @@ static void c6_emit_header(TCCState *s1)
 
     {
         C6Closure *cl = 0;
-        for (cl = c6_closures; cl; cl = cl->next)
+        int any = 0;
+        for (cl = c6_closures; cl; cl = cl->next) {
+            if (!cl->hdr_used)
+                continue;
             fprintf(f, "struct %s;\n",
                     get_tok_str(cl->tag_sym->v & ~SYM_STRUCT, NULL));
-        if (c6_closures)
+            any = 1;
+        }
+        if (any)
             fputc('\n', f);
     }
 
@@ -11182,6 +11272,8 @@ static void c6_emit_header(TCCState *s1)
         C6Closure *cl = 0;
         for (cl = c6_closures; cl; cl = cl->next) {
             char buf[2048] = {0};
+            if (!cl->hdr_used)
+                continue;
             fprintf(f, "struct %s {\n",
                     get_tok_str(cl->tag_sym->v & ~SYM_STRUCT, NULL));
             c6_hdr_type(buf, sizeof buf, &cl->code_type, "(*__c6_code)");
@@ -13021,12 +13113,6 @@ static void c6_tu_reset(void)
 {
     C6Method *m = 0, *next = 0;
     int i = 0;
-
-    /* -emit-header runs after the unit: it still needs the closure layouts
-       and the hidden type symbols, so the pools are released by the process
-       instead (one module translation unit per invocation) */
-    if (tcc_state && tcc_state->c6_emit_header)
-        return;
 
     while (c6_sp_pending) {
         C6SpPending *p = c6_sp_pending;
@@ -15287,7 +15373,8 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
     init_params p = {0};
 
 #ifdef C6_EXT
-    if (tcc_state->c6_ext && has_init && scope != VT_LOCAL
+    if (tcc_state->c6_ext && has_init
+        && (scope != VT_LOCAL || (type->t & VT_STATIC))
         && c6_closure_of_type(type)) {
         /* a closure is an allocated object, not a constant */
         if (!((tok == TOK_CINT || tok == TOK_CUINT) && tokc.i == 0)
@@ -18550,6 +18637,7 @@ static void c6_gc_arg_temp(void)
     rt = v.type;
     vtop->type = rt;
     vtop->gc_state = C6_GC_BORROW;
+    vtop->c6_lit_src = v.c6_lit_src;    /* keep the C93 origin */
     if (c6_nb_gc_temps >= c6_gc_temps_cap) {
         c6_gc_temps_cap = c6_gc_temps_cap ? c6_gc_temps_cap * 2 : 16;
         c6_gc_temps = tcc_realloc(c6_gc_temps,
@@ -20032,8 +20120,7 @@ static int decl(int l)
 #ifdef C6_EXT
                         if (tcc_state->c6_ext)
                             c6_gc_value_check(&type, "a declared object");
-                        if (tcc_state->c6_ext
-                            && (l == VT_CONST || (type.t & VT_STATIC)))
+                        if (tcc_state->c6_ext && l == VT_CONST)
                             c6_gc_root_add(v, &type);
                         if (l == VT_LOCAL && tcc_state->c6_ext
                             && !(type.t & (VT_STATIC | VT_ARRAY))

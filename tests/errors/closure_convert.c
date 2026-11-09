@@ -3,6 +3,7 @@
 // EXPECT test_to_fnptr: error: a closure cannot become a plain function pointer: it carries an environment (call it, or keep it as 'closure RET (parameters)')
 // EXPECT test_variadic: error: a variadic function pointer cannot be wrapped into a closure: a trampoline cannot forward an unknown argument list (make it a capturing literal instead)
 // EXPECT test_static: error: a closure is not a constant expression: initialize it at run time ('NULL' is fine at file scope)
+// EXPECT test_static_local: error: a closure is not a constant expression: initialize it at run time ('NULL' is fine at file scope)
 
 #if defined test_to_fnptr
 int main(void)
@@ -24,6 +25,13 @@ int main(void)
 int n = 1;
 closure int() f = int() { return n; };
 int main(void) { return f(); }
+#elif defined test_static_local
+int inc(int x) { return x + 1; }
+int main(void)
+{
+    static closure int(int) f = inc;
+    return f(1) != 2;
+}
 #else
 int inc(int x) { return x + 1; }
 int main(void)
