@@ -157,6 +157,16 @@ ST_DATA const char * const target_machine_defs =
 #endif
     ;
 
+#ifdef C6_EXT
+/* c6: an async body keeps its frame in the task (gfunc_prolog/epilog below
+   point fp at it), so a suspension neither copies nor moves anything and a
+   '&local' taken before an 'await' is still valid after it */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 1;
+}
+#endif
+
 ST_DATA const int reg_classes[NB_REGS] = {
     /* r0 */ RC_INT | RC_R0,
     /* r1 */ RC_INT | RC_R1,
@@ -1408,6 +1418,28 @@ void gfunc_prolog(Sym *func_sym)
 
   sym = func_type->ref;
 
+  if (c6_stable_frame) {
+    /* An async body: r0 is the task, r1 the top of the frame the task owns.
+       fp/lr are pushed the ordinary way, so the epilog's 'pop {fp,sp,pc}'
+       returns directly; fp then points at the task's frame instead of the
+       stack, so the locals live in the task and a suspension copies and moves
+       nothing.  Nothing else is put on the stack. */
+    o(0xE92D5800); /* push {fp, ip, lr} */
+    o(0xE1A0B001); /* mov fp, r1 */
+    o(0xE50B0008); /* str r0, [fp, #-8] -- the task */
+    func_vc = 0;
+    loc = -8;
+    leaffunc = 0;
+    sym = func_type->ref->next;
+    if (sym) {
+      gfunc_set_param(sym, -8, 0);
+      sym = sym->next;
+      if (sym)
+        gfunc_set_param(sym, 0, 0); /* already in fp */
+    }
+    return;
+  }
+
   n = nf = 0;
   if ((func_vt.t & VT_BTYPE) == VT_STRUCT &&
       !gfunc_sret(&func_vt, func_var, &ret_type, &align, &rs))
@@ -1506,6 +1538,13 @@ void gfunc_epilog(void)
 {
   uint32_t x;
   int diff;
+
+  if (c6_stable_frame) {
+    /* the frame is the task's; only fp and lr have to go back */
+    c6_frame_size_set((-loc + 3) & -4);
+    o(0xE89BA800); /* pop {fp, sp, pc} */
+    return;
+  }
 
 #ifdef CONFIG_TCC_BCHECK
   if (tcc_state->do_bounds_check)

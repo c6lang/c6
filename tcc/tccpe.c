@@ -2004,6 +2004,78 @@ ST_FUNC void pe_add_unwind_data(unsigned start, unsigned end, unsigned stack)
         put_elf_reloc(symtab_section, pd, o, R_XXX_RELATIVE, s1->uw_sym);
 }
 
+/* Unwind info for the prolog of a c6 async body:
+       push %rbp; mov %rdx, %rbp; [sub rsp, n]
+   with the matching epilog
+       [add rsp, n;] pop %rbp; ret
+   Unlike the shared record above there is no frame register (the frame
+   pointer does not describe the stack: it points into the task) and the stack
+   allocation varies per function.  Describing both means an exception can be
+   dispatched through a suspended-capable body: the unwinder pops %rbp from
+   the stack and adds the allocation back, exactly like the epilog does. */
+ST_FUNC void pe_add_unwind_data_frame(unsigned start, unsigned end,
+                                      unsigned stack)
+{
+    TCCState *s1 = tcc_state;
+    Section *pd, *s;
+    unsigned o, n, d, count, extra = 0, prolog;
+    unsigned char *p;
+    struct /* _RUNTIME_FUNCTION */ {
+        DWORD BeginAddress;
+        DWORD EndAddress;
+        DWORD UnwindData;
+    } *r;
+
+    prolog = stack ? 11 : 4;        /* the nops after it are padding */
+    if (!stack)
+        count = 1;
+    else if (stack / 8 - 1 > 15) {
+        count = 2;
+        extra = 2;                  /* UWOP_ALLOC_LARGE carries a 16 bit size */
+    } else {
+        count = 2;
+    }
+
+    s = text_section;
+    section_ptr_add(s, -s->data_offset & 3);
+    d = s->data_offset;
+    p = section_ptr_add(s, 4 + count * 2 + extra);
+    *p++ = 0x01;                    /* version 1, no flags */
+    *p++ = (unsigned char)prolog;
+    *p++ = (unsigned char)count;
+    *p++ = 0x00;                    /* no frame register */
+    if (stack) {
+        *p++ = 0x0b;                /* the instruction ends at byte 11 */
+        if (extra) {
+            *p++ = 0x01;            /* UWOP_ALLOC_LARGE, size / 8 follows */
+            *p++ = (unsigned char)((stack / 8) & 0xff);
+            *p++ = (unsigned char)((stack / 8) >> 8);
+        } else {
+            /* UWOP_ALLOC_SMALL: (n / 8 - 1) scaled, 1..16 */
+            *p++ = (unsigned char)(((stack / 8 - 1) << 4) | 2);
+        }
+    }
+    *p++ = 0x01;                    /* the instruction ends at byte 1 */
+    *p++ = 0x50;                    /* UWOP_PUSH_NONVOL, %rbp */
+
+    pd = s1->uw_pdata;
+    if (!pd) {
+        pd = find_section(s1, ".pdata");
+        pd->sh_addralign = 4;
+        s1->uw_pdata = pd;
+    }
+    if (0 == s1->uw_sym)
+        s1->uw_sym = put_elf_sym(symtab_section, 0, 0, 0, 0,
+                                 text_section->sh_num, ".uw_base");
+    o = pd->data_offset;
+    r = section_ptr_add(pd, sizeof *r);
+    r->BeginAddress = start;
+    r->EndAddress = end;
+    r->UnwindData = d;
+    for (n = o + sizeof *r; o < n; o += sizeof(DWORD))
+        put_elf_reloc(symtab_section, pd, o, R_XXX_RELATIVE, s1->uw_sym);
+}
+
 #elif defined(TCC_TARGET_ARM64)
 /* ARM64 unwind codes:
    save_fplr_x: 10iiiiii  - stp x29,lr,[sp,#-(i+1)*8]!
@@ -2071,6 +2143,51 @@ ST_FUNC void pe_add_unwind_data(unsigned start, unsigned end, unsigned stack)
     *q++ = 0xE4; /* end */
     while ((unsigned)(q - (xd->data + d + 4)) < code_bytes)
         *q++ = 0xE3; /* nop padding */
+
+    o = pd->data_offset;
+    p = section_ptr_add(pd, sizeof *p);
+    p->BeginAddress = start;
+    p->UnwindData = d;
+    put_elf_reloc(symtab_section, pd, o, R_XXX_RELATIVE, s1->uw_sym);
+    put_elf_reloc(symtab_section, pd, o + 4, R_XXX_RELATIVE, s1->uw_xsym);
+}
+/* The prolog of a c6 async body: fp/lr are pushed the ordinary way, but x29
+   then points at a frame in the task rather than at the stack, so there is no
+   set_fp code - the unwinder takes fp/lr from the stack and leaves sp alone. */
+ST_FUNC void pe_add_unwind_data_frame(unsigned start, unsigned end,
+                                      unsigned stack)
+{
+    TCCState *s1 = tcc_state;
+    Section *pd, *xd;
+    unsigned o, d, code_bytes, func_len;
+    unsigned char *q;
+    uint32_t header;
+    struct /* _RUNTIME_FUNCTION */ {
+        DWORD BeginAddress;
+        DWORD UnwindData;
+    } *p;
+
+    xd = pe_add_unwind_info(s1);
+    pd = s1->uw_pdata;
+
+    func_len = (end - start) >> 2;
+    code_bytes = (2 + 3) & ~3;      /* save_fplr_x, end, nop padding */
+
+    section_ptr_add(xd, -xd->data_offset & 3);
+    d = xd->data_offset;
+    q = section_ptr_add(xd, 4 + code_bytes);
+
+    header = (func_len & 0x3ffff)
+        | 1 << 21                   /* one epilog */
+        | 0 << 22
+        | (code_bytes >> 2) << 27
+        ;
+    write32le(q, header);
+    q += 4;
+    *q++ = 0x80 | ((stack / 8) - 1); /* save_fplr_x: stp x29,lr,[sp,#-stack]! */
+    *q++ = 0xE4;                     /* end */
+    while ((unsigned)(q - (xd->data + d + 4)) < code_bytes)
+        *q++ = 0xE3;                 /* nop padding */
 
     o = pd->data_offset;
     p = section_ptr_add(pd, sizeof *p);

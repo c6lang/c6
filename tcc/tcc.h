@@ -1639,6 +1639,21 @@ ST_DATA int nocode_wanted; /* true if no code generation wanted for an expressio
 ST_DATA int global_expr;  /* true if compound literals must be allocated globally (used during initializers parsing */
 ST_DATA CType func_vt; /* current function return type (used by return instruction) */
 ST_DATA int func_var; /* true if current function is variadic */
+#ifdef C6_EXT
+/* c6 async bodies: when the back end can run a body with its frame inside the
+   task (c6_backend_frame_in_task()), the frame never moves, so nothing is
+   copied on a suspension and a 'weak' slot keeps its address.  The back end
+   reports the frame size it reserved from its epilog (c6_frame_size_set()). */
+ST_DATA int c6_stable_frame;      /* the body being compiled uses one */
+ST_DATA int c6_stable_frame_size; /* its frame size in bytes, 0 until known */
+#else
+/* an ordinary build has no c6 at all: the back ends still spell the tests out,
+   so that a function's prolog and epilog are one piece of source */
+#define c6_stable_frame            0
+#define c6_stable_frame_size       0
+#define c6_backend_frame_in_task() 0
+#define c6_frame_size_set(n)       ((void)0)
+#endif
 ST_DATA int func_vc; /* stack address for implicit struct return storage */
 ST_DATA int func_ind; /* function start address */
 ST_DATA const char *funcname;
@@ -1836,6 +1851,14 @@ ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *align, int *reg
 ST_FUNC void gfunc_call(int nb_args);
 ST_FUNC void gfunc_prolog(Sym *func_sym);
 ST_FUNC void gfunc_epilog(void);
+#ifdef C6_EXT
+/* 1 when this back end can run an async body with its locals inside the task
+   (see docs/gc-design.md, "frame in task"): gfunc_prolog() then points the
+   frame register at the frame passed by the runtime instead of at %rsp, and
+   gfunc_epilog() reports the frame size to the front end. */
+ST_FUNC int c6_backend_frame_in_task(void);
+ST_FUNC void c6_frame_size_set(int size);
+#endif
 ST_FUNC void gen_fill_nops(int);
 ST_FUNC int gjmp(int t);
 ST_FUNC void gjmp_addr(int a);
@@ -1983,6 +2006,12 @@ ST_FUNC int pe_setsubsy(TCCState *s1, const char *arg);
 #endif
 #if defined(TCC_TARGET_X86_64) || defined(TCC_TARGET_ARM64)
 ST_FUNC void pe_add_unwind_data(unsigned start, unsigned end, unsigned stack);
+#endif
+#if defined(TCC_TARGET_X86_64) || defined(TCC_TARGET_ARM64)
+/* the prolog shape of a c6 async body: fp/lr pushed the ordinary way, the
+   frame register pointing at the task's frame instead of the stack */
+ST_FUNC void pe_add_unwind_data_frame(unsigned start, unsigned end,
+                                      unsigned stack);
 #endif
 PUB_FUNC int tcc_get_dllexports(const char *filename, char **pp);
 /* symbol properties stored in Elf32_Sym->st_other */

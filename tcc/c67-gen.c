@@ -120,6 +120,16 @@ ST_DATA const char * const target_machine_defs =
     "__C67__\0"
     ;
 
+#ifdef C6_EXT
+/* c6: the c67 back end has no frame that a task could own, so an async body
+   keeps the copying model: its native frame is copied into the task on every
+   suspension (see __c6_co_suspend in libtcc1.c). */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 0;
+}
+#endif
+
 ST_DATA const int reg_classes[NB_REGS] = {
     /* eax */ RC_INT | RC_FLOAT | RC_EAX,
     // only allow even regs for floats (allow for doubles)

@@ -124,6 +124,16 @@ ST_DATA const char * const target_machine_defs =
     "__amd64__\0"
     ;
 
+#ifdef C6_EXT
+/* c6: an async body keeps its frame in the task (gfunc_prolog/epilog below
+   point %rbp at it), so a suspension neither copies nor moves anything and a
+   '&local' taken before an 'await' is still valid after it */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 1;
+}
+#endif
+
 ST_DATA const int reg_classes[NB_REGS] = {
     /* eax */ RC_INT | RC_RAX,
     /* ecx */ RC_INT | RC_RCX,
@@ -934,6 +944,25 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     func_sub_sp_offset = ind;
     reg_param_index = 0;
 
+    if (c6_stable_frame) {
+        /* an async body: the two arguments are the task (%rcx) and the top of
+           the frame the task owns (%rdx).  The epilog's prolog patch puts the
+           second one into %rbp, so the locals live in the task and nothing is
+           read or written above %rbp (the caller's shadow space and stack
+           arguments stay the caller's).  %rsp is only lowered by the outgoing
+           argument area, see gfunc_epilog(). */
+        sym = func_type->ref->next;
+        if (sym) {
+            loc = (loc - PTR_SIZE) & -PTR_SIZE;
+            gen_modrm64(0x89, arg_regs[0], VT_LOCAL, NULL, loc);
+            gfunc_set_param(sym, loc, 0);
+            sym = sym->next;
+            if (sym)
+                gfunc_set_param(sym, 0, 0);   /* already in %rbp */
+        }
+        return;
+    }
+
     sym = func_type->ref;
 
     /* if the function returns a structure, then add an
@@ -991,6 +1020,51 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 void gfunc_epilog(void)
 {
     int v, start;
+
+    if (c6_stable_frame) {
+        /* The locals are in the task, so the frame is theirs alone; %rsp is
+           only lowered for the outgoing-argument area gfunc_call() addresses
+           relative to it ('[rsp + arg*8]', and the struct-by-value copies
+           above that).  That area is not part of the frame: a suspension
+           happens between statements, when no argument is in flight. */
+        v = (func_scratch + 15) & -16;
+        if (v >= 4096)
+            tcc_error("an 'async' body cannot pass more than 4 KiB of "
+                      "arguments by value");
+        c6_frame_size_set((-loc + 15) & -16);
+
+#ifdef CONFIG_TCC_BCHECK
+        if (tcc_state->do_bounds_check)
+            gen_bounds_epilog();
+#endif
+
+        if (v) {
+            o(0xc48148);    /* add rsp, outgoing area */
+            gen_le32(v);
+        }
+        o(0x5d); /* pop %rbp */
+        if (func_ret_sub == 0) {
+            o(0xc3); /* ret */
+        } else {
+            o(0xc2); /* ret n */
+            g(func_ret_sub);
+            g(func_ret_sub >> 8);
+        }
+
+        start = func_sub_sp_offset - FUNC_PROLOG_SIZE;
+        cur_text_section->data_offset = ind;
+        pe_add_unwind_data_frame(start, ind, v);
+
+        ind = start;
+        o(0xd5894855);  /* push %rbp, mov %rdx, %rbp */
+        if (v) {
+            o(0xec8148);  /* sub rsp, outgoing area */
+            gen_le32(v);
+        }
+        gen_fill_nops(FUNC_PROLOG_SIZE - 4 - (v ? 7 : 0));
+        ind = cur_text_section->data_offset;
+        return;
+    }
 
     /* align local size to word & save local variables */
     func_scratch = (func_scratch + 15) & -16;
@@ -1582,7 +1656,17 @@ void gfunc_epilog(void)
     if (tcc_state->do_bounds_check)
         gen_bounds_epilog();
 #endif
-    o(0xc9); /* leave */
+    /* align local size to word & save local variables */
+    v = (-loc + 15) & -16;
+    if (c6_stable_frame) {
+        /* the locals are not on the stack at all: %rbp points into the task
+           and %rsp was only moved by the 'push %rbp' below, so 'leave'
+           (mov %rsp,%rbp; pop %rbp) would set %rsp to the task frame */
+        o(0x5d); /* pop %rbp */
+        c6_frame_size_set(v);
+    } else {
+        o(0xc9); /* leave */
+    }
     if (func_ret_sub == 0) {
         o(0xc3); /* ret */
     } else {
@@ -1590,13 +1674,19 @@ void gfunc_epilog(void)
         g(func_ret_sub);
         g(func_ret_sub >> 8);
     }
-    /* align local size to word & save local variables */
-    v = (-loc + 15) & -16;
     saved_ind = ind;
     ind = func_sub_sp_offset - FUNC_PROLOG_SIZE;
-    o(0xe5894855);  /* push %rbp, mov %rsp, %rbp */
-    o(0xec8148);  /* sub rsp, stacksize */
-    gen_le32(v);
+    if (c6_stable_frame) {
+        /* 'push %rbp; mov %rsi, %rbp': the frame top comes from the second
+           argument, and nothing is subtracted from %rsp, so the body runs
+           directly on the frame the task owns */
+        o(0xf5894855);  /* push %rbp, mov %rsi, %rbp */
+        gen_fill_nops(FUNC_PROLOG_SIZE - 4);
+    } else {
+        o(0xe5894855);  /* push %rbp, mov %rsp, %rbp */
+        o(0xec8148);  /* sub rsp, stacksize */
+        gen_le32(v);
+    }
     ind = saved_ind;
 }
 

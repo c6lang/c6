@@ -95,6 +95,16 @@ ST_DATA const char * const target_machine_defs =
 # define USE_EBX 0 /* define to 1 to have EBX as 4th register */
 #endif
 
+#ifdef C6_EXT
+/* c6: an async body keeps its frame in the task (gfunc_prolog/epilog below
+   point %ebp at it), so a suspension neither copies nor moves anything and a
+   '&local' taken before an 'await' is still valid after it */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 1;
+}
+#endif
+
 ST_DATA const int reg_classes[NB_REGS] = {
     /* eax */ RC_INT | RC_EAX,
     /* ecx */ RC_INT | RC_ECX,
@@ -682,6 +692,41 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     }
     param_index = 0;
 
+    if (c6_stable_frame) {
+        /* An async body.  On the stack it has two arguments: the task and the
+           top of the frame the task owns.  %ebp becomes that frame top, so the
+           locals live in the task and nothing else is needed: a suspension
+           does not copy or move anything.  %esp is left where 'push %ebp'
+           put it, which makes 'pop %ebp; ret' the whole epilog.  The task
+           pointer (needed to reach the descriptors and the defer arena) is
+           kept in the first slot of the frame.  The prolog is complete here;
+           unlike the ordinary one it has no stack size to patch. */
+        static const unsigned char prolog[] = {
+            0x55,               /* push %ebp */
+            0x89, 0xe5,         /* mov %esp, %ebp */
+            0x8b, 0x55, 0x0c,   /* mov 12(%ebp), %edx   ; frame top */
+            0x8b, 0x45, 0x08,   /* mov 8(%ebp), %eax    ; task */
+            0x89, 0xd5,         /* mov %edx, %ebp */
+            0x89, 0x45, 0xfc    /* mov %eax, -4(%ebp)   ; the frame's first slot */
+        };
+        int i;
+        for (i = 0; i < (int)sizeof prolog; i++)
+            g(prolog[i]);
+#if USE_EBX
+        o(0x53); /* push %ebx, popped by the epilog */
+#endif
+        loc = -PTR_SIZE;
+        sym = func_type->ref->next;
+        if (sym) {
+            gfunc_set_param(sym, -PTR_SIZE, 0);
+            sym = sym->next;
+            if (sym)
+                gfunc_set_param(sym, 0, 0); /* already in %ebp */
+        }
+        func_ret_sub = 0;
+        return;
+    }
+
     ind += FUNC_PROLOG_SIZE;
     func_sub_sp_offset = ind;
     /* if the function returns a structure, then add an
@@ -741,6 +786,23 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 ST_FUNC void gfunc_epilog(void)
 {
     addr_t v, saved_ind;
+
+    if (c6_stable_frame) {
+        /* the frame is the task's; only '%ebp' has to go back to the caller */
+        c6_frame_size_set((-loc + 3) & -4);
+#if USE_EBX
+        o(0x5b); /* pop %ebx */
+#endif
+        o(0x5d); /* pop %ebp */
+        if (func_ret_sub == 0) {
+            o(0xc3); /* ret */
+        } else {
+            o(0xc2); /* ret n */
+            g(func_ret_sub);
+            g(func_ret_sub >> 8);
+        }
+        return;
+    }
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)

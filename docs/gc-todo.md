@@ -28,7 +28,7 @@
 | P0 ✅ | 类型/限定符/描述符脚手架 | — | `parse_btype` 与 `@` 的冲突 |
 | P1 ✅ | `new` + 存储 + 内联释放 + `p = NULL` | P0 | 作用域退出点的完整性（goto/err） |
 | P2 ✅ | 描述符、字段释放、数组 `new T[n]` | P1 | 拓扑排序其实不需要 |
-| P3 ✅ | `weak`（含禁 async） | P2 | 帧搬动只能探测，不能 trap |
+| P3 ✅ | `weak`（`async` 里的禁令后来随 A3 取消） | P2 | 帧搬动只能探测，不能 trap |
 | P4 ✅ | 析构 `drop` 方法 | P3 | 全局根不能用 `atexit` |
 | P5 ✅ | `shared` + 跨帧/跨线程转移 | P2 | 任务 slot 的归还点在 `__c6_co_destroy` |
 | P6 ✅ | 静态环检测（单 TU + 链接期） | P2/P3 | 跨 TU 只在原生后端 |
@@ -80,7 +80,7 @@
   存储必须走 `c6_gc_plain()`，否则会拿未初始化的旧值去 decref。
 - `__c6_gc_live` / `__c6_gc_refcount` 返回 `unsigned long long`（tcc 把
   `unsigned long` 归一成 `VT_LLONG`，C99 后端打印原型时必须一致）。
-- 已知推迟项：`async` 体里的托管局部量在帧搬动/回卷时的转移（P7），
+- 已知推迟项：`async` 体里的托管局部量在回卷时的转移（P7），
   `defer` 记录 8192 条静默丢弃（H3，P7 一起修）。
 
 改动点：
@@ -182,7 +182,8 @@
 
 - `tests/weak.c`：升级成功/失败、目标死亡后槽变 NULL、弱字段与弱全局、
   多线程下的弱失效（P5 之后再加并发用例）；
-- `tests/errors/async_weak.c`：`async` 体内 `weak` 局部 / `weak` 形参两条 `EXPECT`；
+- `tests/async_frame.c`：帧住在任务里之后 `weak` 局部 / 形参 / 返回值在 `async`
+  里都能用（原来那两条 `EXPECT` 随 A3 一起删掉了）；
 - `tests/errors/weak_deref.c`：直接解引用报错。
 
 验收：同 P1。
@@ -205,14 +206,14 @@
 - 弱槽链表本身仍是**不设防**的（同线程内使用没有问题）：`shared` + 跨线程的
   弱失效要等 P5 的并发用例，届时链表操作要么加 per-object 锁、要么走无锁插入。
 - `frame_addr` 校验做成**可选开关**（`-DC6_CO_CHECK_FRAME_ADDR`），因为实测
-  现有 `co` 用例就会在不同地址恢复（见设计 §9.1）——它把静默损坏变成响亮失败，
-  但只有排查时才打开。
+  老模型下现有 `co` 用例就会在不同地址恢复（见设计 §9.1）——它把静默损坏变成
+  响亮失败，但只有排查时才打开。A3（帧住在任务里）之后这条路径只剩 c67 会用。
 
 - 顺带堵掉的两个洞：`return w;`（弱引用按值返回会丢注册、并把调用者拿到的那
   一次计数漏掉）→ 硬错误；`async` 函数的 `weak` 返回类型同理。
 
 **结果**：`tests/weak.c` 6 个 `test` 块全过（原生 + C99 后端），
-`tests/errors/async_weak.c` 3 条诊断全中，`tests/errors/gc.c` 12 条，
+`tests/errors/gc.c` 12 条，
 `make selftest` 43/43、`BACKEND=c99 tests/run-tests.sh` 44/44、`make test-plain` 绿。
 
 ---
@@ -482,7 +483,7 @@
 |---|---|---|
 | 作用域退出点漏发射（`goto` 跨层、`err` 传播、`switch` 落空） | 漏释放/双重释放 | P1 的测试矩阵覆盖每种跳转；`-test` 里用 `live()` 断言归零 |
 | 描述符发射与 `static inline` 体的 fixpoint 顺序 | 描述符缺失 → 运行期空指针 | 挂在现有 fixpoint 循环里（:658）；TI 式回归（inline 里 `new`） |
-| async 帧搬动（既有缺陷） | 静默写坏别的栈 | 禁 async 内 `weak` + restore 地址校验 trap + 文档 |
+| async 帧搬动（既有缺陷） | 静默写坏别的栈 | 已修：帧住进任务（A3，五个后端 + C99）；c67 仍用拷贝模型，保留 `weak` 禁令与地址校验 |
 | `own` 环（`b.next = a` 式构造） | 释放时死循环/越界 | `own` 赋值只接受 FRESH/`move()`；文档写明 |
 | `move` 之后的使用漏报（全局槽、字段、`&p` 取过地址的槽不跟踪） | 运行期解引用空槽 | 只承诺跟踪本函数的自动托管槽（设计 §3.4 写明边界）；`tests/errors/gc_move.c` 覆盖读/比较/传参/再 `move`/分支合并 |
 | C99 后端漏符号 | C99 测试链接失败 | 每阶段检查 `c99_runtime_names[]` |

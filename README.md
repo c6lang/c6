@@ -818,10 +818,13 @@ int main(void)
   `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
 - `c6_io` 的 `fd` 必须在 `[0, 1024)` 内；越界的任务按失败回收，
   `__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败；
-- 运行时池是**每线程**一个固定池（64 个任务、每个 4 KiB 帧、每个 64 条
-  defer 记录），`__c6_co_wait` 和 `__c6_co_run` 都用 `select()` 等 fd，
-  `__c6_co_run` 对顶层任务做轮转。协程本身是协作式、单线程的；要真并发
-  用 `go`。
+- 每个任务一块内存：`struct NAME_task` + parked defer 记录 + 原生帧，按需
+  `malloc`（没有固定池、没有 4 KiB 帧上限、没有任务数上限）。后端把帧寄存器
+  直接指向这块内存，所以挂起**不拷贝**任何东西，`&local` 跨过 `await` 仍然
+  有效；`weak` 局部/形参/返回值因此在 `async` 里也合法。`__c6_co_wait` 和
+  `__c6_co_run` 都用 `select()` 等 fd，`__c6_co_run` 对顶层任务做轮转。
+  协程本身是协作式、单线程的；要真并发用 `go`。`-b`（边界检查）不能与
+  `async` 同用。
 
 完整可运行示例见 [examples/async_demo.c](examples/async_demo.c)
 （一次 HTTP 请求，传输层用 `pipe()` 代替 socket，离线可跑）：

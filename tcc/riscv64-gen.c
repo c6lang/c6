@@ -55,6 +55,16 @@ ST_DATA const char * const target_machine_defs =
     "__riscv_float_abi_double\0"
     ;
 
+#ifdef C6_EXT
+/* c6: an async body keeps its frame in the task (gfunc_prolog/epilog below
+   point s0 at it), so a suspension neither copies nor moves anything and a
+   '&local' taken before an 'await' is still valid after it */
+ST_FUNC int c6_backend_frame_in_task(void)
+{
+    return 1;
+}
+#endif
+
 #define XLEN 8
 
 #define TREG_RA 17
@@ -813,6 +823,29 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     Sym *sym;
     CType *type;
 
+    if (c6_stable_frame) {
+        /* An async body: a0 is the task, a1 the top of the frame the task
+           owns.  ra and the caller's s0 go into that frame as well, so the
+           stack is not touched at all: s0 becomes the frame base and the
+           locals (and the task pointer) live in the task.  Suspending then
+           copies and moves nothing. */
+        ES(0x23, 3, 11, 8, -16);   // sd s0, -16(a1)
+        ES(0x23, 3, 11, 1, -8);    // sd ra, -8(a1)
+        EI(0x13, 0, 8, 11, 0);     // addi s0, a1, 0
+        ES(0x23, 3, 8, 10, -24);   // sd a0, -24(s0) -- the task
+        loc = -24;
+        num_va_regs = 0;
+        func_va_list_ofs = 0;
+        sym = func_type->ref->next;
+        if (sym) {
+            gfunc_set_param(sym, -24, 0);
+            sym = sym->next;
+            if (sym)
+                gfunc_set_param(sym, 0, 0); /* already in s0 */
+        }
+        return;
+    }
+
     sym = func_type->ref;
     loc = -16; // for ra and s0
     func_sub_sp_offset = ind;
@@ -921,6 +954,15 @@ ST_FUNC void arch_transfer_ret_regs(int aftercall)
 ST_FUNC void gfunc_epilog(void)
 {
     int v, saved_ind, d, large_ofs_ind;
+
+    if (c6_stable_frame) {
+        /* the frame is the task's; only ra and s0 have to go back */
+        c6_frame_size_set((-loc + 15) & -16);
+        EI(0x03, 3, 1, 8, -8);     // ld ra, -8(s0)
+        EI(0x03, 3, 8, 8, -16);    // ld s0, -16(s0)
+        EI(0x67, 0, 0, 1, 0);      // ret
+        return;
+    }
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)

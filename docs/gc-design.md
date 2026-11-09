@@ -482,65 +482,59 @@ error: reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own'
 
 ## 9. `async` / `go` 集成
 
-### 9.1 帧搬动（今天已存在的限制）
+### 9.1 帧住在任务里（P7/A3，已实现）
 
-无栈协程的帧在调用者栈上：挂起时把 `[fp-size, fp)` 拷进 `co->frames[idx]`
-（`__c6_co_suspend`，`lib/libtcc1.c:1233`），body 直接 `return`（见
-`c6_async_suspend()`，`tcc/tccgen.c:13196` 末尾的 `gfunc_return`）；
-恢复时把字节拷回 **本次调用的** `fp-size` 处（`__c6_co_restore`，`lib/libtcc1.c:1275`）。
+`async` body 的帧不再在调用者的栈上：`__c6_co_new()` 一次 `tcc_th_alloc` 出
+`struct NAME_task` + parked defer 记录 + 帧，运行期把帧顶作为第二个参数交给
+body（`int __c6_body_f(void *task, void *frame)`），后端把帧寄存器直接指向它
+（x86_64/i386 `rbp`、arm64 `x29`、riscv64 `s0`、arm `fp`、C99 后端
+`__c99_frmp`）。于是：
 
-帧内**偏移**稳定（编译器对自己的局部变量全部用 `fp` 相对寻址，恢复后重算），
-但帧的**绝对地址不保证相同**：驱动深度由 `d->entry(leaf)`（`lib/libtcc1.c:1402`，
-`tcc_co_step_once()` 起于 `:1388`）的调用路径决定，父协程嵌套、`co` 起始、`__c6_co_run()` 轮转、`await` 链的长度都会改变它。
-因此：任何**存进帧里的绝对地址**（`&local` 跨过 `await`、运行时注册的弱槽）
-在恢复后都可能指向别的函数正在使用的栈 —— 写它不会崩溃也不会报错，
-只会静默写坏别人的局部变量。这个缺陷**今天就存在**，与 GC 无关。
+- 挂起**不拷贝任何东西**：`__c6_co_suspend` 只在 `desc->frame_size == 0` 时
+  才走老的 memcpy 路径；
+- 帧的**绝对地址**在任务的一生里不变，`&local` 跨过 `await` 依旧有效
+  （`tests/async_frame.c` 用 `co` + `__c6_co_run()` 恢复来断言——那正是老模型
+  会搬帧的组合）；
+- 帧没有 4 KiB 上限，任务也没有固定池上限（每个任务一块，结束即释放）。
 
-对策：
+后端用 `c6_backend_frame_in_task()` 回答能不能做到，收尾时用
+`c6_frame_size_set()` 把帧大小回填进描述符的第 6 个成员。目前回答 1 的有：
+x86_64（ELF/PE/mach-o，PE 另有专门的 `.pdata`/`.xdata` 记录）、i386
+（ELF/PE）、arm64（ELF/PE/mach-o）、arm（EABI/VFP/FPA/WinCE）、riscv64、
+C99 输出后端。
 
-1. **`weak` 局部禁止出现在 `async` 函数里（硬错误）** —— 见 §9.2；
-2. `__c6_co_restore()` 记录停放地址（`TccCoTask.frame_addr`），并提供一个
-   **可选**的地址校验（`-DC6_CO_CHECK_FRAME_ADDR`）：`frame_addr != base` 就 trap。
-   打开它跑现有用例立刻崩在「co 立刻跑到第一个 await 点」——`co` 在函数里起、
-   由 `main` 的 `__c6_co_run()` 轮转恢复，两次 `base` 不同。也就是说**帧今天
-   确实会被搬动**，所以不能默认 trap（会把能跑的用例打死），只能作为排查开关；
-3. 文档明确：`async` 体内不要保存帧内局部的地址跨过 `await`
-   （Rust 用借用检查器解决，C 没有这个能力）；
-4. 长期方案（P7 之后再评估）：把帧放进任务、body 直接在池帧上跑
-   （`VT_LOCAL` 相对任务基址），地址稳定且省掉每次 `await` 的 memcpy，
-   代价是 x86 与 C99 两套 codegen 的本地寻址改造。
+仍然存在的限制：
 
-### 9.2 禁止 `async` 函数使用 `weak`
+1. **c67** 回答 0，退回拷贝模型：那里帧仍会被搬动，帧内绝对地址（`&local`、
+   弱槽）在恢复后可能指向别的栈，`frame_addr` + `-DC6_CO_CHECK_FRAME_ADDR`
+   的地址校验也只为它保留；
+2. `-b`（边界检查）与 `async` 互斥：`'-b' cannot be combined with 'async'`；
 
-规则：`async` 函数体内（含其参数、返回值）不得出现 `weak`：
+### 9.2 `weak` 与 `async`（已放开）
+
+帧住在任务里之后，弱槽（它是指向槽本身的指针）在整个任务期间地址不变，
+所以 `weak` 局部、`weak` 形参、`weak` 返回值都可以出现在 `async` 函数里
+（`tests/async_frame.c` 覆盖这三种）。
 
 ```c
-async int bad(void)
+async int f(int fd, weak @Node param)   /* ✓ 形参 */
 {
-    weak @Node w = ...;   /* error: 'weak' cannot live in an async frame ... */
+    weak @Node w = ...;                 /* ✓ 局部 */
     ...
 }
+async weak @Node g(void);               /* ✓ 返回值 */
 ```
 
-允许的写法（覆盖全部真实用法）：
-
-```c
-struct Reg { weak @Handler h; };   /* 弱引用放在堆对象里 —— 对象不搬动 */
-weak @Handler g_h;                 /* 全局                              */
-int normal_fn(void) { weak @T w; } /* 普通函数（含 go 的线程函数）帧不搬动 */
-```
-
-参数与返回值一起禁：`async` 的形参在 body 里被复制成帧内局部
-（`c6_async_params_copy()`，`tcc/tccgen.c:13446`），注册的必然是局部槽，同样不安全。
-
-检查点：局部变量声明处（`decl()` 的对象分支），条件 `c6_async_cur != 0 && 类型含
-VT_GCWEAK`。错误文案：
+约束 C67 只在**帧拷贝**后端（c67）上仍然成立：那里挂起会把原生帧搬到别的
+地址，注册在帧里的弱槽立刻悬空。错误文案（仅那些后端）：
 
 ```
-error: 'weak' cannot be declared in an async function: the coroutine frame is
-       relocated on every resume, so a registered weak slot would point into a
-       stale stack; keep the weak reference in a heap object
+error: 'a 'weak' reference cannot be declared in an async function: its frame
+       is moved to the task'
 ```
+
+检查点：`c6_async_func_begin()`（形参/返回值，条件 `!c6_stable_frame`）与
+`c6_gc_site()`（局部声明，同样的条件）。
 
 ### 9.3 未完成任务必须回卷（`__c6_co_destroy`）
 
@@ -786,7 +780,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | 编号 | 缺陷 | 位置 | 处理 |
 |---|---|---|---|
 | H1 | `__c6_co_destroy` 不回卷未完成任务 | `lib/libtcc1.c:1580` | `__c6_co_abort`（§9.3） |
-| H2 | async 帧搬动 → 帧内绝对地址失效 | `lib/libtcc1.c:1233`/`1275` | 禁 `weak`（§9.2）+ restore 校验（§9.1）+ 文档 |
+| H2 | async 帧搬动 → 帧内绝对地址失效 | `lib/libtcc1.c` 的 `__c6_co_suspend`/`restore` | 已修：帧住进任务（§9.1，A3）；只有 c67 走拷贝模型，那里保留 `weak` 禁令（§9.2）与地址校验 |
 | H3 | defer 栈满 8192 静默丢记录 | `lib/libtcc1.c:885` | 改成可增长 + 引用释放不走该机制（§6） |
 
 ---
