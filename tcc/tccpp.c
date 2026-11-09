@@ -570,12 +570,14 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
         cstr_ccat(&cstr_buf, '\'');
         cstr_ccat(&cstr_buf, '\0');
         break;
+#ifdef C6_EXT
     case TOK_C6_FSTR:
         /* spelled back the way it was written: 'f"' body '"' */
         cstr_ccat(&cstr_buf, 'f');
         if (cv && cv->str.data && cv->str.size > 0)
             cstr_cat(&cstr_buf, cv->str.data, cv->str.size);
         return (char*)cstr_buf.data;
+#endif
     case TOK_PPNUM:
     case TOK_PPSTR:
         return (char*)cv->str.data;
@@ -1155,8 +1157,10 @@ static void tok_str_add2(TokenString *s, int t, CValue *cv)
     case TOK_PPSTR:
     case TOK_STR:
     case TOK_LSTR:
+#ifdef C6_EXT
     case TOK_C6_FSTR:
     case TOK_C6_FSTR_SPEC:
+#endif
         {
             /* Insert the string into the int array. */
             size_t nb_words =
@@ -1244,8 +1248,10 @@ static inline void tok_get(int *t, const int **pp, CValue *cv)
     case TOK_LSTR:
     case TOK_PPNUM:
     case TOK_PPSTR:
+#ifdef C6_EXT
     case TOK_C6_FSTR:
     case TOK_C6_FSTR_SPEC:
+#endif
         cv->str.size = *p++;
         cv->str.data = (char*)p;
         p += (cv->str.size + sizeof(int) - 1) / sizeof(int);
@@ -3253,7 +3259,11 @@ maybe_newline:
         cstr_ccat(&tokcstr, '\0');
         tokc.str.size = tokcstr.size;
         tokc.str.data = tokcstr.data;
+#ifdef C6_EXT
         tok = is_fstr ? TOK_C6_FSTR : TOK_PPSTR;
+#else
+        tok = TOK_PPSTR;
+#endif
         break;
 
     case '<':
@@ -3982,7 +3992,10 @@ redo:
     t = tok;
     /* an f-string is a literal, not a name to look up: it must reach the
        conversion below even though its token number is in the id range */
-    if (t >= TOK_IDENT && t != TOK_C6_FSTR
+    if (t >= TOK_IDENT
+#ifdef C6_EXT
+        && t != TOK_C6_FSTR
+#endif
         && (parse_flags & PARSE_FLAG_PREPROCESS)) {
         /* if reading from file, try to substitute macros */
         Sym *s = define_find(t);

@@ -1036,8 +1036,10 @@ static C6Lit *c6_lit_head = 0, *c6_lit_tail = 0;
 /* the literal whose body is currently being compiled: a name that resolves
    outside that body is a capture */
 static C6Lit *c6_lit_replay = 0;
+#ifdef C6_EXT
 /* the variable a declaration initializer is being written to (0 outside) */
 static int c6_lit_dst_tok = 0;
+#endif
 static int c6_lit_count = 0;
 static int c6_lit_flush(void);
 static int c6_lit_lead(TokenString *pre);
@@ -1463,7 +1465,7 @@ static Sym *c6_closure_tramp(C6Closure *cl)
     TokenString *ts = NULL;
     AttributeDef ad = {0};
     char buf[80] = {0};
-    char aname[16] = {0};
+    char aname[32] = {0};
     int name = 0, envtok = tok_alloc_const("__c6_env");
     int etok = 0;
     int i = 0, is_void = 0;
@@ -7512,7 +7514,11 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
 
         /* we push a anonymous symbol which will contain the function prototype */
         /* it also serves as a boundary for the function parameter scope */
+#ifdef C6_EXT
         ps = (local_stack && !c6_sym_global) ? &local_stack : &global_stack;
+#else
+        ps = local_stack ? &local_stack : &global_stack;
+#endif
         ++local_scope;
         sr = sym_push2(ps, SYM_FIELD, 0, 0);
 
@@ -7812,6 +7818,7 @@ static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
 /* 'closure RET (P...)' in type position.  The token was already consumed by
    the caller (parse_btype).  The signature is parsed with all new Syms on the
    global stack: the hidden type must survive the block. */
+#ifdef C6_EXT
 static void c6_closure_btype(CType *type)
 {
     CType ret = {0};
@@ -7847,6 +7854,7 @@ static void c6_closure_btype(CType *type)
     c6_sym_global = save_global;
     local_scope = save_scope;
 }
+#endif
 
 /* indirection with full error checking and bound check */
 ST_FUNC void indir(void)
@@ -15482,12 +15490,18 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
         cur_scope->vla.loc = addr;
         cur_scope->vla.num++;
     } else if (has_init) {
+#ifdef C6_EXT
         int save_dst = c6_lit_dst_tok;
+#endif
         p.sec = sec;
+#ifdef C6_EXT
         if (c6_closure_of_type(type))
             c6_lit_dst_tok = v;
+#endif
         decl_initializer(&p, type, addr, DIF_FIRST);
+#ifdef C6_EXT
         c6_lit_dst_tok = save_dst;
+#endif
         /* patch flexible array member size back to -1, */
         /* for possible subsequent similar declarations */
         if (flexible_array)
@@ -15571,6 +15585,8 @@ static void sym_push_params(Sym *ref)
             Sym *p = sym_copy(s, &local_stack);
 #ifdef C6_EXT
             p->c6_sym_seq = ++c6_sym_seq;
+#else
+            (void)p;
 #endif
         }
         s = s->prev;
