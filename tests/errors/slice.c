@@ -19,6 +19,7 @@ struct S;
 // EXPECT test_file_scope_array: error: a slice cannot be initialized from an array in a static initializer; use '{ data, len }'
 // EXPECT test_uninitialized: error: variable 's' must be initialized
 // EXPECT test_slice_to_int: error: cannot convert 'int[:]' to 'int'
+// EXPECT test_unknown_length: error: cannot slice an array of unknown length
 
 #if defined test_void_element
 void f(void[:] s);
@@ -90,6 +91,13 @@ int main(void)
     int a[2] = { 1, 2 };
     int[:] s = a;
     return (int)s;
+}
+#elif defined test_unknown_length
+extern int ext[];
+int[:] g = ext;                    /* 长度只有运行期才知道，切片的 len 写不出来 */
+int main(void)
+{
+    return 0;
 }
 #else
 int main(void)

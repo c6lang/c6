@@ -22,6 +22,9 @@ struct S { int a; };
 // EXPECT test_error_out_parameter: error: 'error' can only be a return type, not a parameter
 // EXPECT test_error_parameter_knr: error: 'error' can only be a return type, not a parameter
 // EXPECT test_catch_in_defer: error: 'catch' is not allowed in a defer body
+// EXPECT test_incomplete_return: error: cannot propagate an error from a function with an incomplete return type
+// EXPECT test_result_unused: error: the result of a 'T!error' function must be used with 'try' or 'catch'
+// EXPECT test_err_no_args: error: 'err' requires an error id and a message
 
 #if defined test_try_in_plain_fn
 static int plain(void) { try fails(0); return 0; }
@@ -64,6 +67,16 @@ static void take(e) error e; { }
 int main(void) { return 0; }
 #elif defined test_catch_in_defer
 static int!error bad(void) { defer { int v = fails(0) catch e { return -1; }; } return 0; }
+int main(void) { return bad(); }
+#elif defined test_incomplete_return
+struct Never;
+static struct Never!error bad(void) { err(1, "x"); }
+int main(void) { return 0; }
+#elif defined test_result_unused
+static int!error value(void) { return 1; }
+int main(void) { value(); return 0; }
+#elif defined test_err_no_args
+static int!error bad(void) { err(); }
 int main(void) { return bad(); }
 #else
 static int!error check(void)

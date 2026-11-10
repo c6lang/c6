@@ -23,7 +23,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 源文件后缀 `.c6` | `.c6` 文件自动开启扩展（等价于 `-std=c6`），`.c` 文件仍按命令行开关走；`import` 优先找 `NAME.c6`，再回退 `NAME.c` |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（`static` 变量与 VLA 除外） |
-| 泛型（阶段 1 已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。见 [docs/generics-design.md](docs/generics-design.md) |
+| 泛型（已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。见 [docs/generics-design.md](docs/generics-design.md) |
 
 扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
 源文件后缀 `.c6` 是一个例外：它对该翻译单元等价于 `-std=c6`（每个文件独立判断，
@@ -1596,9 +1596,9 @@ tests/run-tests.sh --list           # 列出会跑的文件
 
 ```
 ok   err: 18 test(s), 0 failure(s)
-ok   errors/slice: 12 个诊断片段
+ok   errors/slice: 13 个诊断片段
 ...
-run-tests: 92 通过, 0 失败
+run-tests: 96 通过, 0 失败
 ```
 
 `-test` 模式下 `main` 可有可无（运行器不调用它）。
@@ -1636,7 +1636,8 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make c6selfcheck   # 用 -std=c6 编译 tcc 自己的源码，编出可运行的编译器
-make test-all      # selftest + tests2 + c6selfcheck
+make test-all      # selftest + tests2 + c6selfcheck + freestanding/裸机
+make check-all     # test-all + C99 后端两套用例 + 三条自举路线（发布前跑这条）
 ```
 
 自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：

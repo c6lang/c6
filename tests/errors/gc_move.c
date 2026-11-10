@@ -28,6 +28,7 @@ static void take(@Node n)
 // EXPECT branch: error: 'a' was moved: assign a new reference before using it
 // EXPECT loop: error: 'a' was moved: assign a new reference before using it
 // EXPECT switch_case: error: 'a' was moved: assign a new reference before using it
+// EXPECT not_managed: error: 'move' needs a managed reference held in a slot, not a 'int'
 
 #if defined deref
 int main(void)
@@ -105,6 +106,13 @@ int main(void)
     default: break;                /* 这条路留着空槽 */
     }
     return a->v;
+}
+#elif defined not_managed
+int main(void)
+{
+    int x = 1;
+    move(x);                       /* 普通局部量没有引用可交 */
+    return 0;
 }
 #else
 /* 正常路径：交出、重新赋值、sizeof、defer 都必须通过 */

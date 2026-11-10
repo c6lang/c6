@@ -1,6 +1,8 @@
 # c6 泛型设计（`@` 应用 / `|…|` 绑定）
 
-状态：**阶段 1 已落地**，`-std=c6` 下可用。能写的：`struct Vect@T {…}`
+状态：**阶段 1–3 已全部落地**（模板/实例、`|…|` 函数与 typedef 模板、值形参、
+体内成员函数 V3、模块前缀与实例名冲突检查、`-Wgeneric-depth`），`-std=c6` 下可用。
+能写的：`struct Vect@T {…}`
 / `struct Map@(K, V) {…}` 模板声明，`Vect@int` / `Map@(char[:], int)` 应用，
 嵌套（`Vect@Vect@int`）与自引用，`typedef` 别名，实例上的方法，切片后缀
 （`Vect@int[:]`）；函数/typedef 模板用前缀 `|T|` 绑定
