@@ -93,6 +93,18 @@ struct VecBox@T {
 
 /* 体内方法的符号名和 '|T|' 方法一致：'<实例标签>_<方法名>'。实例先把
    别名造出来，下面就能按拼出来的名字声明同一个函数 */
+/* 方法体里第一次实例化别的模板：内层实例的符号、方法签名都在这时才建 */
+struct Leaf@T {
+    T v;
+    int get(void) { return v; }
+};
+struct Tree@T {
+    T v;
+    int sum(int k) {
+        Leaf@int leaf = {k};
+        return (&leaf)->get() + v;
+    }
+};
 /* 体内方法的形参表：'(void)'、'()' 只剩接收者，'void *p' 要留住那个 void */
 struct Sig@T {
     T v;
@@ -371,6 +383,14 @@ test "体内方法的符号和 '|T|' 方法一样" {
 /* 第二个翻译单元（tests/tu/generic.c）也声明并实例化模板 */
 int tu_gen_sum(void);
 
+test "体内方法里第一次实例化另一个模板" {
+    Tree@int t = {7};
+
+    if ((&t)->sum(3) != 10)
+        err(1, "方法体里新建的实例算错了");
+    if ((&t)->sum(4) != 11)
+        err(2, "第二次调用不对");
+}
 test "多翻译单元：泛型表按 TU 复位" {
     if (tu_gen_sum() != 12)
         err(1, "第二个 TU 里的实例算错了");
