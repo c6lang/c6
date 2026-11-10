@@ -368,6 +368,13 @@ test "体内方法的符号和 '|T|' 方法一样" {
     if ((&s)->cap() != 4)
         err(3, "两种调用写法结果应当一样");
 }
+/* 第二个翻译单元（tests/tu/generic.c）也声明并实例化模板 */
+int tu_gen_sum(void);
+
+test "多翻译单元：泛型表按 TU 复位" {
+    if (tu_gen_sum() != 12)
+        err(1, "第二个 TU 里的实例算错了");
+}
 test "体内方法的形参表：void、空表、const" {
     Sig@int s = {7};
     int k = 0;
