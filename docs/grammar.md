@@ -5,10 +5,10 @@
 `declaration`、`statement`、`expression` 等未定义非终结符一律指 ISO C
 （C11 / N1570）中的同名产生式。
 
-扩展只在编译期定义了 `C6_EXT` 且命令行给了 `-std=c6`（或源文件后缀是
-`.c6`，它对单个翻译单元等价于 `-std=c6`）时生效；此时
-预处理器额外定义宏 `__C6__`。未开启时，下列新关键字全部退化为普通
-标识符，本文档描述的产生式一条都不适用。
+扩展只在编译期定义了 `C6_EXT` 且**源文件后缀是 `.c6`** 时生效（后缀是唯一
+的开关，命令行没有 `-std=c6`）；此时
+预处理器额外定义宏 `__C6__`。未开启时（所有 `.c` 文件），下列新关键字全部
+退化为普通标识符，本文档描述的产生式一条都不适用。
 
 ---
 
@@ -249,8 +249,7 @@ function-definition    = declaration-specifiers ,
 诊断里使用源码中书写的标识符：`package` 内的变量报原名，而不是
 `NAME__x`。
 
-这条约束只作用于开启了 `-std=c6` 的翻译单元：不带该开关的老代码
-完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
+这条约束只作用于 `.c6` 的翻译单元：`.c` 文件的老代码完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
 函数体）都要满足。K&R 老式定义的形参声明表属于形参，不受约束。
 
 ### 3.2 结构体方法
@@ -391,7 +390,7 @@ async-function-definition  = "async" , declaration-specifiers ,
 `struct __c6_task` 的布局由 `libtcc1` 拥有，生成代码只通过 `__c6_co_*`
 访问器碰它；`t->val` 和 `t->pN` 是普通的公开成员。
 
-运行时接口（`-std=c6` 时由 `__TCC_ASYNC_DEFINED` 预置声明）：
+运行时接口（c6 的翻译单元里由 `__TCC_ASYNC_DEFINED` 预置声明）：
 
 ```
 void *__c6_co_new(const struct __c6_desc *d);
@@ -508,7 +507,7 @@ h->value();                    (* 被调函数的返回值：整数或指针，�
 回收，句柄作用域退出时把自己的那份还回去 —— 没 `join` 也不漏。线程自己
 `join` 自己返回 `-1`，不会挂死。
 
-运行时接口（`-std=c6` 时预置声明）：
+运行时接口（`.c6` 的翻译单元里预置声明）：
 
 ```
 void *__tcc_sp_args(unsigned long size);   (* 参数块 *)
@@ -582,7 +581,7 @@ tag 本身就是类型名，`struct` / `union` / `enum` 关键字可以省略（
   `int f(S) int *S; { … }` 报 `';' expected`，写成 `struct S` 即可。
 * 块作用域的 `TAG;` 只是引用外层 tag，不会像 `struct TAG;` 那样声明一个
   新的局部不完整 tag：本特性**不做任何隐式前置声明**。
-* 只在 `-std=c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
+* 只在 `.c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
 
 ### 3.8 枚举成员写成 `Color.RED`
 
@@ -622,7 +621,7 @@ c6 允许把成员写成 `<tag>.<成员>`，让每个枚举自带一层空间：
   `for` 的条件，`switch` 的 `case`，数组长度、位域宽度都能用；枚举里没有
   这个名字时按 C120 报错。
 * 枚举必须已经定义并可见（与裸名同一条规则），不做任何隐式前置声明。
-* 只在 `-std=c6` 的翻译单元里生效；纯 C 的翻译单元里没有裸 tag 名，
+* 只在 `.c6` 的翻译单元里生效；纯 C 的翻译单元里没有裸 tag 名，
   `Color.RED` 报 `'Color' undeclared`（写成 `(Color)RED` 也只是强转）。
 
 ### 3.9 元组类型 `(T1, T2, ...)`
@@ -722,7 +721,7 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
   器、实参、返回值、结构体成员初值、数组初值、`static inline` 函数体里，
   以及另一个字面量的体里；
 * 值就是普通的函数指针：C ABI 不变，可以存进任何同型函数指针、放进函数
-  指针表、交给纯 C 保存和回调（`tests/abi/fn_lit.c`），也可以直接传给
+  指针表、交给纯 C 保存和回调（`tests/abi/fn_lit.c6`），也可以直接传给
   `qsort` 这类标准库函数。
 
 **V2 捕获式闭包（已落地）**：捕获式闭包引入类型构造
@@ -1483,7 +1482,7 @@ math.Point p;                    (* 类型 => math__Point *)
 影响。导入的声明和模块自己的对象文件是两件事：链接时仍要把模块的目标
 文件（或包含它的库）放上命令行。
 
-`-emit-header FILE`（`-std=c6` 下）在编译模块时把导出的结构体、枚举、
+`-emit-header FILE`（模块是 `.c6` 文件时）在编译模块时把导出的结构体、枚举、
 typedef、函数和全局变量写成普通 C 头文件，符号名就是带前缀的 C 名。
 切片 `T[:]` 和元组 `(T1, T2)` 会生成 `NAME__slice_N` / `NAME__tuple_N`
 的 `typedef`；纯 C 侧包含这个头文件即可调用，不需要知道 `module` 的存在。
@@ -2007,8 +2006,8 @@ int main(void)
 }
 ```
 
-完整可运行的版本见 `examples/async_demo.c`（用 `pipe()` 代替 socket，
-离线就能跑）；自测见 `tests/async.c`。
+完整可运行的版本见 `examples/async_demo.c6`（用 `pipe()` 代替 socket，
+离线就能跑）；自测见 `tests/async.c6`。
 
 ## 10. 未支持的写法
 
@@ -2102,7 +2101,7 @@ int main(void)
 | `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
 | 泛型 `Vect@int` / `struct Vect@T` | 已落地：见 §3.11 与 [generics-design.md](generics-design.md)；实例名带模块前缀、`-emit-header` 可导出；容器迭代仍建议 `foreach` |
 | 体内成员函数 `struct Vect@T { T at(int i) { … } }` | 已落地：隐式 `self`、方法可先用后定义、符号仍是 `Vect_int_at`，见 §3.11 |
-| 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c` |
+| 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c6` |
 | 泛型值形参 `Buf@(T, 4)` / `struct Buf@(T, int N)` | 已落地：实参是常量表达式，体内当常量用（可作数组长度），见 §3.11 |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
 | `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
@@ -2118,7 +2117,7 @@ int main(void)
 | `(int, int) t; &t[0]` / 把元组直接当 `T[:]` 的底层数组 | 不支持：元素之间可能有 padding，不保证连续 |
 | `(int[2], int)`（数组作元素） | 约束 C51：数组不可赋值，请用指针、切片 `T[:]` 或包一层 struct |
 | `((int,int){1,2}[0])`（复合字面量外面再套一层括号、下标写在括号里） | 报 `')' expected (got '[')`：写成 `(int,int){1,2}[0]` 或 `((int,int){1,2})[0]` |
-| 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | **支持**（`tests/iface_agg.c`）；唯一的限制是类型要在 interface 声明之前可见 |
+| 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | **支持**（`tests/iface_agg.c6`）；唯一的限制是类型要在 interface 声明之前可见 |
 | 在 `interface` 签名里第一次提到 `struct P`、之后才定义它 | 接口的方法列表按函数原型重放，那里的 tag 属于原型作用域（C11 6.2.1p7），和文件作用域的 `struct P` 不是同一个类型：把 `struct P;` 写在 `interface` 之前（诊断会提示 prototype-scope tag） |
 | `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |

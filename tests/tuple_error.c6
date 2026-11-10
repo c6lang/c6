@@ -1,0 +1,134 @@
+/* c6 自测：元组 / struct 作 '!error' 的返回类型
+ *
+ * 'T!error' 的返回值只表示“成功时的值”，失败通过错误槽传递，所以聚合
+ * 类型也能作返回类型：标量用 -1 当哨兵，聚合类型在失败路径上被清零，
+ * 而那个值永远不可观测。
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -test tests/tuple_error.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+/* libtcc1 提供的错误槽接口 */
+int __tcc_err_flag_get(void);
+
+struct Point { int x, y; };
+
+(int, int)!error parse(const char *s)
+{
+    if (!s)
+        err(7, "null input");
+    return {(int)s[0], 1};
+}
+
+struct Point!error point(int ok)
+{
+    if (!ok)
+        err(8, "no point");
+    return {3, 4};
+}
+
+/* ---- 包一层，把错误码变成返回值：catch 体必须以 return/err/goto 结尾 ---- */
+
+static int!error tuple_values(void)
+{
+    (int a, int b) = try parse("Q");
+
+    if (a != 'Q' || b != 1)
+        return 1;
+    return 0;
+}
+
+static int tuple_values_code(void)
+{
+    int r = tuple_values() catch e {
+        return e.id;
+    };
+
+    return r;
+}
+
+static int!error struct_values(void)
+{
+    struct Point p = try point(1);
+
+    if (p.x != 3 || p.y != 4)
+        return 2;
+    return 0;
+}
+
+static int struct_values_code(void)
+{
+    int r = struct_values() catch e {
+        return e.id;
+    };
+
+    return r;
+}
+
+static int!error propagate(const char *s)
+{
+    (int a, int b) = try parse(s);
+
+    if (a == 0 || b == 0)
+        return 3;
+    return 0;
+}
+
+static int propagate_code(const char *s)
+{
+    int r = propagate(s) catch e {
+        return e.id;
+    };
+
+    return r;
+}
+
+static int!error element_values(void)
+{
+    (int a, int b) = try parse("Z");
+
+    if (a != 'Z' || b != 1)
+        return 1;
+    if (__tcc_err_flag_get() != 0)
+        return 2;                   /* 成功之后错误槽必须已经清空 */
+    return 0;
+}
+
+static int element_values_code(void)
+{
+    int r = element_values() catch e {
+        return e.id;
+    };
+
+    return r;
+}
+
+/* ---- 测试块 ---- */
+
+test "元组可以作 '!error' 的返回类型" {
+    if (tuple_values_code() != 0)
+        err(1, "正常路径不该失败");
+    if (propagate_code(0) != 7)
+        err(2, "没有拿到错误码 7");
+}
+
+test "struct 可以作 '!error' 的返回类型" {
+    if (struct_values_code() != 0)
+        err(1, "正常路径不该失败");
+}
+
+test "失败路径不污染下一次调用" {
+    if (propagate_code(0) != 7)
+        err(1, "第一次失败不对");
+    if (propagate_code("A") != 0)
+        err(2, "失败之后的正常调用不对");
+    if (tuple_values_code() != 0)
+        err(3, "错误槽没有清干净");
+}
+
+test "元组返回值里的元素与错误槽互不干扰" {
+    if (element_values_code() != 0)
+        err(1, "元素或错误槽不对");
+}

@@ -1,4 +1,4 @@
-/* tests/abi/method.c 的纯 C 一侧（不带 -std=c6 编译）。 */
+/* tests/abi/method.c6 的纯 C 一侧（纯 C：`.c` 后缀，扩展不生效）。 */
 
 struct PRect { int w, h; };
 struct CRect { int w, h; };

@@ -7,7 +7,7 @@
 
 相关：[grammar.md §3.10](grammar.md)（V1 语法与 C80–C83）、
 [gc-design.md](gc-design.md)（`@T` 的计数、描述符、环检测与跨线程规则）、
-`tests/fn_lit.c` / `tests/errors/fn_lit.c` / `tests/abi/fn_lit.c`。
+`tests/fn_lit.c6` / `tests/errors/fn_lit.c6` / `tests/abi/fn_lit.c6`。
 
 ---
 
@@ -952,7 +952,7 @@ env 在静态图里是「擦除」的，不能直接建 `closure → env_N → �
 * 描述符是普通的静态数据（现有 GC 描述符发射路径），C 里就是结构体常量；
 * 跳板是普通函数；调用点是普通调用，首参 `void *`；
 * 变参、struct 返回、`!error` 都由前端处理成普通 C 调用；
-* `tests/c99/closure.c` 用 `gcc -std=c99 -pedantic -Wall -Wextra -Werror`
+* `tests/c99/closure.c6` 用 `gcc -std=c99 -pedantic -Wall -Wextra -Werror`
   编译生成代码，钉住「输出没有依赖 tcc 的扩展语法」。
 
 ### 8.3 `-emit-header`、`module`、`import`、跨 TU
@@ -982,7 +982,7 @@ struct __c6_closure_<hash> *make(int n);        /* closure int(int) */
 
 ### 8.4 `test`、`-run`、调试
 
-* `tests/*.c` 的 test 块里可以定义/调用闭包；`c6_lit_flush()` 在 TU 末尾与
+* `tests/*.c6` 的 test 块里可以定义/调用闭包；`c6_lit_flush()` 在 TU 末尾与
   `gen_inline_functions()` 同一循环里排空队列，所以 test 体、`static inline`
   体里排队的闭包也会被编译；
 * `-run`/JIT 使用同一套静态数据与描述符，无需特殊处理；
@@ -1131,7 +1131,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 
 实现完成后至少要有下面这些用例（文件名按现有约定）：
 
-**正常路径（`tests/closure.c`，test 块）**
+**正常路径（`tests/closure.c6`，test 块）**
 
 1. 捕获标量、参数、`const`；快照语义（外层改值不影响闭包）；
 2. 体里改副本，多次调用看到状态；外层变量不变；
@@ -1156,7 +1156,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 18. `shared @T` 捕获（原子 +1）；`drop` 结构体/柔性数组/含 `@T` 元组/
     thread/task 句柄捕获报 C94。
 
-**诊断（`tests/errors/closure*.c`）**
+**诊断（`tests/errors/closure*.c6`）**
 
 19. C90：`closure` 缺完整签名；匿名类型签名；块作用域 tag 签名（`closure`
     类型和普通字面量签名都测）；`@closure`；
@@ -1172,15 +1172,15 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 
 **ABI / 跨 TU / 头文件**
 
-29. `tests/abi/closure.c` + `_plain.c`：c6 TU 创建闭包、纯 C TU 只按
+29. `tests/abi/closure.c6` + `_plain.c`：c6 TU 创建闭包、纯 C TU 只按
     `struct __c6_closure_h *` 传递/保存（不调用）；退出码一致；
-30. `tests/tu/closure.c`：闭包类型作函数参数/返回值跨 TU；
+30. `tests/tu/closure.c6`：闭包类型作函数参数/返回值跨 TU；
 31. `-emit-header`：闭包结构体、typedef、struct 返回、切片参数按顺序写出，
     结构体被 `#pragma pack` 钉住，生成的 C 头能被 `gcc` 单独编译。
 
 **C99 后端**
 
-32. `tests/c99/closure.c`：捕获、包装、跳板、`!error`、struct 返回、
+32. `tests/c99/closure.c6`：捕获、包装、跳板、`!error`、struct 返回、
     变参字面量、`__c6_gc_live()` 归零；`gcc -std=c99 -pedantic -Wall
     -Wextra -Werror` 零告警。
 
@@ -1189,7 +1189,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 33. `make test-plain`（关掉 `C6_EXT`）：闭包代码全部在 `#ifdef C6_EXT` 内；
 34. `make selftest`、`BACKEND=c99 tests/run-tests.sh`、`make selfhost`、
     `make c99selfhost` 全绿；
-35. 现有 `tests/fn_lit.c`、`tests/errors/fn_lit.c`、`tests/abi/fn_lit*`
+35. 现有 `tests/fn_lit.c6`、`tests/errors/fn_lit.c6`、`tests/abi/fn_lit*`
     一行不改仍通过（V1 兼容是硬约束）。
 
 ---

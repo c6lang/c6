@@ -2,8 +2,9 @@
 # 构建「裸机」镜像并启动：BIOS 引导扇区 + 我们自己写的引导器 + c6 程序。
 # 没有内核、没有 libc、没有 syscall。用法：
 #
-#   examples/boot/build.sh                    # 跑 examples/boot/main.c
+#   examples/boot/build.sh                    # 跑 examples/boot/main.c6
 #   examples/boot/build.sh 源文件...          # 换个 payload（fstest-bare-tests 这么做）
+#                                             # （语言看后缀：.c6 是 c6，.c/.plain.c 是普通 C）
 #   NO_KVM=1 examples/boot/build.sh           # 强制用 TCG（纯软件模拟）
 #   SMP=2 examples/boot/build.sh 源文件...    # 多核（-smp 2，并 -DC6_SMP_CPUS=2）
 #
@@ -21,7 +22,7 @@ cd "$root"
 build=build
 mkdir -p "$build"
 
-payload_src="examples/boot/main.c examples/boot/io.c"
+payload_src="examples/boot/main.c6 examples/boot/io.c"
 if [ $# -gt 0 ]; then
     payload_src="$*"
 fi
@@ -57,7 +58,7 @@ if [ -n "$ONE_TU" ]; then
         *) c6src="$c6src $src" ;;
         esac
     done
-    ./tcc/tcc -B tcc -std=c6 -static -nostdlib -o "$build/payload.elf" \
+    ./tcc/tcc -B tcc -static -nostdlib -o "$build/payload.elf" \
         $c6src $plainobj tcc/libtcc1.a "$APOBJ"
     n=-1
 fi
@@ -65,12 +66,9 @@ for src in $payload_src; do
     [ "$n" -lt 0 ] && break
     obj="$build/payload_$n.o"
     n=$((n + 1))
-    # .plain.c 按普通 C 编：要 .bss，也不要 c6 的"每个变量都要初始化器"的规矩
-    case "$src" in
-    *.plain.c) flags="" ;;
-    *)         flags="-std=c6" ;;
-    esac
-    ./tcc/tcc -B tcc $flags $EXTRA_CFLAGS -c -o "$obj" "$src"
+    # 语言由后缀决定：.c6 自己开启扩展，.c / .plain.c 是普通 C（要 .bss，
+    # 也不受 c6 的"每个变量都要初始化器"的规矩约束），所以这里没有开关。
+    ./tcc/tcc -B tcc $EXTRA_CFLAGS -c -o "$obj" "$src"
     objs="$objs $obj"
 done
 [ "$n" -lt 0 ] || \

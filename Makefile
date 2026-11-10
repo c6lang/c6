@@ -10,8 +10,8 @@
 #   make c99         C99 输出后端已内置在 tcc/tcc（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
 #   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
-#   make c6selfcheck tcc 自己的源码用 -std=c6 编译（初始化规则 + C99 后端）
-#   make selfhost    用 c6 模式的 tcc 自举自己（stage1 -> stage2，比对目标文件）
+#   make c6selfcheck tcc 自己的源码拷成 .c6 后用 c6 规则编译（初始化规则 + C99 后端）
+#   make selfhost    用 tcc 自举自己（stage1 -> stage2，比对目标文件）
 #   make c99selfhost 用 C99 后端自举自己（生成 C -> gcc -> stage2 -> stage3）
 #   make c99selfhost-tcc 同上，但生成 C 之后由 tcc 自己编译（整条链不需要 gcc）
 #   make clean       清理 tcc/ 的构建产物和自举产物
@@ -83,31 +83,32 @@ test-plain: build-plain
 	$(MAKE) -C $(TCC_DIR)/tests/tests2 tests2.all
 
 # tests/：c6 的全部测试
-#   tests/*.c          用 -test 跑里面的 test 块（同名 tests/tu/*.c 作为第二 TU）
-#   tests/c6ext/*.c6   扩展名自测：不传 -std=c6，靠 .c6 后缀开启扩展
-#   tests/errors/*.c   编译期诊断，见 tests/run-tests.sh
-#   tests/c99/*.c      C99 输出后端：先生成 C 源码，再用 gcc 编译运行
+#   tests/*.c6         用 -test 跑里面的 test 块（同名 tests/tu/*.c6 作为第二 TU）
+#   tests/c6ext/*.c6   后缀自测：不加任何开关，靠 .c6 后缀开启扩展
+#   tests/errors/*.c6  编译期诊断，见 tests/run-tests.sh
+#   tests/c99/*.c6     C99 输出后端：先生成 C 源码，再用 gcc 编译运行
+# c6 代码只能写在 .c6 文件里：后缀是唯一的开关，命令行没有 -std=c6。
 selftest: build
 	./$(SELFTEST)
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
-	./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_fstr \
-	    examples/freestanding_fstr.c tcc/libtcc1.a
+	./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_fstr \
+	    examples/freestanding_fstr.c6 tcc/libtcc1.a
 	./build/freestanding_fstr
 
 # freestanding + 程序自己实现的 pthread 层：spawn / thread
 fstest-go: build
 	./tcc/tcc -B tcc -c -o build/freestanding_pthread.o \
 	    examples/freestanding_pthread.c
-	./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_go \
-	    examples/freestanding_go.c build/freestanding_pthread.o tcc/libtcc1.a
+	./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_go \
+	    examples/freestanding_go.c6 build/freestanding_pthread.o tcc/libtcc1.a
 	./build/freestanding_go
 
 # 完全没有操作系统：程序里一个 syscall 都没有，靠 ud2 / 踩空报结果
 fstest-noos: build
-	./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_noos \
-	    examples/freestanding_noos.c tcc/libtcc1.a
+	./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_noos \
+	    examples/freestanding_noos.c6 tcc/libtcc1.a
 	@./build/freestanding_noos 2>/dev/null; st=$$?; \
 	 if [ $$st -eq 132 ]; then \
 	     echo "fstest-noos: ok（全部断言通过，最后 ud2 陷阱）"; \
@@ -140,7 +141,7 @@ fstest-bare: build
 	     echo "fstest-bare: 没有 binutils，跳过"; exit 0; }
 	./examples/boot/build.sh
 
-# 把 tests/*.c 里的 test 块搬上裸机：每个文件配一层 libc 替身 + 自动生成的
+# 把 tests/*.c6 里的 test 块搬上裸机：每个文件配一层 libc 替身 + 自动生成的
 # 入口，跑在同一个 512 字节引导器上（见 examples/boot/runtests.sh）
 fstest-bare-tests: build
 	@command -v qemu-system-x86_64 >/dev/null || { \
@@ -156,7 +157,7 @@ fstest-bare-go: build
 	     echo "fstest-bare-go: 没有 qemu-system-x86_64，跳过"; exit 0; }
 	@command -v as >/dev/null || { \
 	     echo "fstest-bare-go: 没有 binutils，跳过"; exit 0; }
-	./examples/boot/build.sh examples/boot/go_bare.c examples/boot/sched.plain.c \
+	./examples/boot/build.sh examples/boot/go_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
 fstest-bare-smp: build
@@ -165,10 +166,10 @@ fstest-bare-smp: build
 	@command -v as >/dev/null || { \
 	     echo "fstest-bare-smp: 没有 binutils，跳过"; exit 0; }
 	@SMP=2 EXTRA_CFLAGS=-DC6_SMP_CPUS=2 ./examples/boot/build.sh \
-	    examples/boot/smp_bare.c examples/boot/sched.plain.c \
+	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 	@SMP=1 EXTRA_CFLAGS=-DC6_SMP_CPUS=1 ./examples/boot/build.sh \
-	    examples/boot/smp_bare.c examples/boot/sched.plain.c \
+	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
 test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
@@ -191,9 +192,12 @@ c99tcc-test: build
 	BACKEND=c99 C99CC=$(CURDIR)/$(TCC_DIR)/tcc \
 	    C99FLAGS="-B $(CURDIR)/$(TCC_DIR) -std=c99 -w" ./$(SELFTEST)
 
-# c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿
-# -std=c6 编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99
-# 后端的翻译路径）；编出来的编译器还要能跑。
+# c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿 c6
+# 规则编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99 后端的
+# 翻译路径）；编出来的编译器还要能跑。
+# c6 只认 .c6 后缀，而 tcc 的源码必须保持 .c（上游 C），所以这里把 tcc.c
+# 拷成 build/ 下的 .c6 再编：TU 的语言由顶层文件的后缀决定，#include 进来
+# 的 .c/.h 跟着同一份规则走，检查范围和以前用 -std=c6 时完全一样。
 # 编译时带 -DC6_EXT（和 make build 一致）：不带它，#ifdef C6_EXT 里的
 # 扩展实现根本不会进语法检查，规则就只能管到编译器的一半。
 # 翻译出来的 C 还要交给宿主编译器编译一遍：c6 模式下输出文件自带运行时
@@ -203,13 +207,14 @@ c99tcc-test: build
 # 误报），这类输出只能当错误处理。
 c6selfcheck: build
 	@mkdir -p $(SELFHOST_C6)
-	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 $(SELFCHECK_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/selfcheck.o 2>&1`; \
+	@cp $(TCC_DIR)/tcc.c $(SELFHOST_C6)/selfcheck.c6
+	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -I $(TCC_DIR) $(SELFCHECK_DEFS) -c $(SELFHOST_C6)/selfcheck.c6 -o $(SELFHOST_C6)/selfcheck.o 2>&1`; \
 	if [ -n "$$out" ]; then \
 	    printf '%s\n' "$$out" >&2; \
 	    echo "c6selfcheck: 用 tcc 编译自身时不应有任何诊断输出（上面这些就是）" >&2; \
 	    exit 1; \
 	fi
-	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -std=c6 $(SELFCHECK_DEFS) -o $(SELFHOST_C6)/selfcheck.c $(TCC_DIR)/tcc.c 2>&1`; \
+	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -I $(TCC_DIR) $(SELFCHECK_DEFS) -o $(SELFHOST_C6)/selfcheck.c $(SELFHOST_C6)/selfcheck.c6 2>&1`; \
 	if [ -n "$$out" ]; then \
 	    printf '%s\n' "$$out" >&2; \
 	    echo "c6selfcheck: 用 tcc 生成 C 时不应有任何诊断输出（上面这些就是）" >&2; \

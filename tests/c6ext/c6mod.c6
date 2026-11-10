@@ -1,4 +1,4 @@
-/* c6 自测：import 加载 '.c6' 模块（不带 -std=c6）
+/* c6 自测：import 加载 '.c6' 模块（纯 C：`.c` 后缀，扩展不生效）
  *
  * 第二个翻译单元 tests/tu/c6mod.c6 同时是模块 tu.c6mod 的实现和
  * import 的声明来源。运行器会带上 '-I tests'，所以点号路径

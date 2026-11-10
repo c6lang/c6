@@ -22,13 +22,13 @@
   make c99test
   ```
 
-- 新测试位置按现有约定：`tests/*.c`（`test "…" {}`）、
-  `tests/errors/*.c`（`// EXPECT <片段>: error: <文本>`）、
-  `tests/exit/*.c`（`// EXIT n`）、`tests/abi/*.c` + `_plain.c`、
-  `tests/c99/*.c`、`tests/tu/<name>.c`。
+- 新测试位置按现有约定：`tests/*.c6`（`test "…" {}`）、
+  `tests/errors/*.c6`（`// EXPECT <片段>: error: <文本>`）、
+  `tests/exit/*.c6`（`// EXIT n`）、`tests/abi/*.c6` + `_plain.c`、
+  `tests/c99/*.c6`、`tests/tu/<name>.c`。
 - 提交：一个阶段一个提交，标题 `closure: Pn <一句话>`，正文写验收命令与结果。
 - 全程红线：**V1 的语法、类型、ABI、C80–C83 不变**。现有
-  `tests/fn_lit.c`、`tests/errors/fn_lit.c`、`tests/abi/fn_lit*` 一行不改。
+  `tests/fn_lit.c6`、`tests/errors/fn_lit.c6`、`tests/abi/fn_lit*` 一行不改。
 
 ---
 
@@ -118,9 +118,9 @@
 
 测试：
 
-- `tests/typename.c`：`closure int(int)`、`closure void(int[:], int)`、
+- `tests/typename.c6`：`closure int(int)`、`closure void(int[:], int)`、
   `closure int!error(int)`、`closure int(int) *`、数组/typedef 的类型字符串。
-- `tests/closure.c` 先放：`closure int(int) f = NULL; if (f) …;`、
+- `tests/closure.c6` 先放：`closure int(int) f = NULL; if (f) …;`、
   `sizeof(closure int(int)) == sizeof(void *)`、struct 字段/数组、typedef。
 - `tests/errors/closure_type.c`：C90 的缺签名、匿名 tag、块作用域 tag、
   `@closure`；C96 的 `shared`/`weak`/`own closure`；C97 的 `new closure …`。
@@ -251,17 +251,17 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
 
 测试：
 
-- `tests/closure.c`：
+- `tests/closure.c6`：
   - 捕获标量/参数/`const`；快照语义；外层改值不影响闭包；
   - 体里改副本，多次调用看到状态；
   - 闭包返回/实参/结构体字段/数组；赋值 +1、`NULL` 释放；
   - 非捕获字面量仍是裸函数指针；`sizeof(closure)`、`f == NULL`；
   - 遮蔽：体内局部、`for` 初始化、嵌套字面量参数、`sizeof(捕获名)`；
   - `__c6_gc_live()` 在闭包释放后归零（标量捕获版）。
-- `tests/errors/closure_capture.c`：C93（捕获字面量赋给函数指针）、
+- `tests/errors/closure_capture.c6`：C93（捕获字面量赋给函数指针）、
   C94 的数组/VLA/类型/`static`/枚举常量、类型含块内 tag 的局部结构体、C98 自捕获。
-- `tests/errors/closure_opaque.c`：C97。
-- `tests/tu/closure.c`：跨 TU 只传不建（P4 再补包装）。
+- `tests/errors/closure_opaque.c6`：C97。
+- `tests/tu/closure.c6`：跨 TU 只传不建（P4 再补包装）。
 
 验收：`make build && make selftest && make test-plain`。
 
@@ -306,14 +306,14 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
 
 测试：
 
-- `tests/closure.c`：
+- `tests/closure.c6`：
   - 返回闭包后 `@T` 捕获让对象存活；`f = NULL` 后 `live()` 归零；
   - 捕获闭包（嵌套引用）的 +1；
   - `struct Holder { closure int() f; }` 放进 `new Holder`，释放后归零；
-  - `move(f)`、全局 `closure S g = NULL`（`tests/exit/closure_global.c`）。
-- `tests/errors/closure_cycle.c`：C66 环。
-- `tests/errors/closure_capture.c`：`own`/`weak`/含托管结构体/接收者。
-- `tests/gc.c` 不动；`tests/closure.c` 里用 `__c6_gc_live()` 做卫生检查。
+  - `move(f)`、全局 `closure S g = NULL`（`tests/exit/closure_global.c6`）。
+- `tests/errors/closure_cycle.c6`：C66 环。
+- `tests/errors/closure_capture.c6`：`own`/`weak`/含托管结构体/接收者。
+- `tests/gc.c6` 不动；`tests/closure.c6` 里用 `__c6_gc_live()` 做卫生检查。
 
 验收：`make build && make selftest && make test-plain`。
 
@@ -357,7 +357,7 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
 
 测试：
 
-- `tests/closure.c`：
+- `tests/closure.c6`：
   - 嵌套字面量：内层捕获外层捕获名、外层局部、内层参数遮蔽；
   - `sizeof(捕获名)`、`typeof(捕获名)`；
   - 体内 `defer`/`err`/`try`/`catch`；
@@ -427,17 +427,17 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
 
 测试：
 
-- `tests/closure.c`：函数指针变量 → 闭包、非捕获字面量 → 闭包、
+- `tests/closure.c6`：函数指针变量 → 闭包、非捕获字面量 → 闭包、
   `(closure S)fp`、包装后的闭包返回/传参、`live()` 归零。
-- `tests/errors/closure_convert.c`：C91、C92、C95。
-- `tests/abi/closure.c` + `tests/abi/closure_plain.c`：纯 C 侧只按
+- `tests/errors/closure_convert.c6`：C91、C92、C95。
+- `tests/abi/closure.c6` + `tests/abi/closure_plain.c`：纯 C 侧只按
   `struct __c6_closure_h *` 保存/传递，不调用；退出码一致。
-- `tests/tu/closure.c`：闭包作参数/返回值跨 TU。
+- `tests/tu/closure.c6`：闭包作参数/返回值跨 TU。
 - `-emit-header` 用例：生成的 C 头用 `gcc -c` 单独编译（可放在
   `tests/tu/` 的脚本里，或复用现有 header 测试手法）。
-- `tests/c99/closure.c`：捕获、包装、跳板、`!error`、struct 返回、
+- `tests/c99/closure.c6`：捕获、包装、跳板、`!error`、struct 返回、
   `__c6_gc_live()`；`gcc -std=c99 -pedantic -Wall -Wextra -Werror`。
-- `tests/exit/closure_global.c`：全局闭包根在退出时释放。
+- `tests/exit/closure_global.c6`：全局闭包根在退出时释放。
 
 验收：P1–P3 的命令 + `BACKEND=c99 tests/run-tests.sh` + `make c99test`。
 
@@ -456,14 +456,14 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
 已完成：
 
 - 设计 §9 的 C90–C98 在 `tccgen.c` 里逐条实现，`tests/errors/` 每个分条都有
-  `// EXPECT`：`closure_signature.c`（C90）、`closure_convert.c`（C91/C92/C95）、
-  `closure_capture.c`（C93）、`closure_capture_type.c`（C94）、
-  `closure_cross.c`（C96）、`closure_opaque.c`（C97/C98）、
-  `closure_cycle.c`（C66）。
-- 补上 P4 缺的两组用例：`tests/abi/closure.c` + `_plain.c`（纯 C 一侧只按
-  `{code, env}` 布局保存/检查，不调用）、`tests/c99/closure.c`（捕获、跳板、
+  `// EXPECT`：`closure_signature.c6`（C90）、`closure_convert.c6`（C91/C92/C95）、
+  `closure_capture.c6`（C93）、`closure_capture_type.c6`（C94）、
+  `closure_cross.c6`（C96）、`closure_opaque.c6`（C97/C98）、
+  `closure_cycle.c6`（C66）。
+- 补上 P4 缺的两组用例：`tests/abi/closure.c6` + `_plain.c`（纯 C 一侧只按
+  `{code, env}` 布局保存/检查，不调用）、`tests/c99/closure.c6`（捕获、跳板、
   变参、struct 返回、`!error`、托管捕获、`__c6_gc_live()` 归零，生成 C 过
-  `gcc -std=c99 -pedantic -Wall -Wextra -Werror`）；`tests/closure.c` 另加变参
+  `gcc -std=c99 -pedantic -Wall -Wextra -Werror`）；`tests/closure.c6` 另加变参
   捕获与 struct 返回两组 test 块。
 - `grammar.md`：§3.10 改成「V2 捕获式闭包（已落地）」，保留 `closure`
   产生式并补小例子；约束表补 C90–C98 的行；C80 改成 V2 下的语义（按值捕获
@@ -492,5 +492,5 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
   把 `struct_decl()` 里两个普通 `int` 局部量挪到守卫外面，现在 `make
   build-plain` 与 `make test-plain` 都是干净的（零告警）。）
 
-- 自查：V1 的 `tests/fn_lit.c`、`tests/errors/fn_lit.c`、`tests/abi/fn_lit*`
+- 自查：V1 的 `tests/fn_lit.c6`、`tests/errors/fn_lit.c6`、`tests/abi/fn_lit*`
   一行不改，仍然照旧通过。

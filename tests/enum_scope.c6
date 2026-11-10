@@ -1,0 +1,99 @@
+/* c6 自测：枚举成员带上 enum 自己的 tag（'Color.RED'）
+ *
+ * C 的枚举成员落在普通标识符的命名空间里，于是
+ *     enum Color { RED };  enum Fruit { RED };     是重定义。
+ * c6 让成员可以写成 '<tag>.<成员>'：常量同时注册成 'Color.RED' 这个名字，
+ * 两个枚举因此可以共用一个成员名。不带限定的裸名照旧可用，只有当两个枚举
+ * 都想要同一个裸名时它才会被“毒化”，此后必须写限定名。
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -test tests/enum_scope.c6
+ * 或直接：
+ *   make selftest
+ */
+
+enum Color { Color.RED = 1, Color.GREEN = 2, Color.BLUE };
+enum Fruit { Fruit.RED = 10, Fruit.APPLE = 20 };
+
+test "限定名读出的就是成员的值" {
+    if (Color.RED != 1 || Color.GREEN != 2 || Color.BLUE != 3)
+        err(1, "Color 的限定名取值不对");
+    if (Fruit.RED != 10 || Fruit.APPLE != 20)
+        err(2, "Fruit 的限定名取值不对");
+}
+
+test "两个枚举可以共用成员名 'RED'" {
+    if (Color.RED == Fruit.RED)
+        err(1, "两个 RED 混成了一个");
+    if (Color.RED + Fruit.RED != 11)
+        err(2, "两个 RED 相加不对");
+}
+
+test "没被抢占的裸名照旧可用" {
+    if (APPLE != 20)
+        err(1, "裸名 APPLE 不可用");
+    if (GREEN != 2)
+        err(2, "裸名 GREEN 不可用");
+    if (BLUE != 3)
+        err(3, "隐式取值的裸名 BLUE 不可用");
+}
+
+test "限定名是常量表达式" {
+    int a[Color.BLUE] = { 0 };
+    unsigned int bits = (1u << Color.GREEN) | (1u << Color.RED);
+    if (sizeof a / sizeof a[0] != 3)
+        err(1, "数组长度不是常量表达式");
+    if (bits != 6)
+        err(2, "位移不对");
+    /* C99/原生后端都把枚举常量当 int 常量表达式 */
+    if (Color.BLUE - 1 != 2)
+        err(3, "常量折叠不对");
+}
+
+test "switch 的分支可以用限定名" {
+    enum Color c = Color.GREEN;
+    int hit = 0;
+    switch (c) {
+    case Color.RED:
+        err(1, "走错了分支");
+        break;
+    case Color.GREEN:
+        hit = 1;
+        break;
+    default:
+        err(2, "没有命中");
+        break;
+    }
+    if (!hit)
+        err(3, "分支没有执行");
+}
+
+test "条件里用限定名不会被当成声明" {
+    int seen = 0, i = 0;
+    if (Color.RED == 1)
+        seen |= 1;
+    while (Color.GREEN == 2 && !(seen & 2))
+        seen |= 2;
+    for (i = 0; Color.BLUE == 3 && i < 1; i++)
+        seen |= 4;
+    if (seen != 7 || i != 1)
+        err(1, "条件里的限定名不对");
+}
+
+test "块作用域的枚举也能限定" {
+    enum Light { Light.ON = 7, Light.OFF = 8 };
+    if (Light.ON != 7 || Light.OFF != 8)
+        err(1, "块作用域限定名不对");
+    if (ON != 7)
+        err(2, "块作用域裸名不可用");
+}
+
+test "限定名和普通枚举变量一起用" {
+    enum Color c = Color.RED;
+    enum Color *p = &c;
+    if (*p != Color.RED)
+        err(1, "取地址后值不对");
+    c = Color.BLUE;
+    if (c != 3)
+        err(2, "赋值后值不对");
+}

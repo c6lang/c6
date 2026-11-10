@@ -1,5 +1,5 @@
 #!/bin/sh
-# 把 tests/*.c 里的 test 块拿到**裸机**上跑：每个测试文件配一张自动生成的
+# 把 tests/*.c6 里的 test 块拿到**裸机**上跑：每个测试文件配一张自动生成的
 # 入口（harness.py）、一层 libc 替身（shim.c）和两个 outb（io.c），由
 # boot.S 那个 512 字节引导器拉起来，qemu-system-x86_64 当空机器。
 #
@@ -12,7 +12,7 @@
 #   method                                                 libc 的 FILE 布局
 #
 # 整个文件跳太重的话，可以只跳一个 test 块：在块上一行写 `// BARE-SKIP`
-# （harness.py 认这个标记，块号不变），例如 tests/generic_fn.c 里起线程那块。
+# （harness.py 认这个标记，块号不变），例如 tests/generic_fn.c6 里起线程那块。
 set -e
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -27,8 +27,8 @@ failed=""
 skipped=""
 block_skipped=""
 
-for src in tests/*.c; do
-    name=$(basename "$src" .c)
+for src in tests/*.c6; do
+    name=$(basename "$src" .c6)
     case "$skip" in
     *" $name "*) skipped="$skipped $name"; continue ;;
     esac
@@ -36,8 +36,8 @@ for src in tests/*.c; do
     tu=""
     hsrcs="$src"
     one=""
-    if [ -e "tests/tu/$name.c" ]; then
-        tu="tests/tu/$name.c"
+    if [ -e "tests/tu/$name.c6" ]; then
+        tu="tests/tu/$name.c6"
         # tu 里也有 test 块时，两边的编号是"整次编译连续"的，只能一口气编
         if grep -q '^test ' "$tu" 2>/dev/null; then
             one=1

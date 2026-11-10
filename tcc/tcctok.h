@@ -444,7 +444,7 @@
 #endif
 
 #ifdef C6_EXT
-     /* c6 language extensions (active with -std=c6) */
+     /* c6 language extensions (active in '.c6' source files) */
      DEF(TOK_C6_PACKAGE,   "package")
      DEF(TOK_C6_IMPORT,    "import")
      DEF(TOK_C6_INTERFACE, "interface")

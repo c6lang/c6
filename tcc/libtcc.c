@@ -1231,9 +1231,9 @@ static int guess_filetype(const char *filename)
 }
 
 #ifdef C6_EXT
-/* A '.c6' source file turns the extensions on for its own translation unit,
-   exactly like '-std=c6' does for the whole run.  The extension is checked
-   independently of the file-type flags so that -x c keeps working. */
+/* The file suffix is the only switch: a '.c6' source file turns the extensions
+   on for its own translation unit, a '.c' file never gets them.  The suffix is
+   checked independently of the file-type flags so that -x c keeps working. */
 static int is_c6_source(const char *filename)
 {
     return !PATHCMP(tcc_fileextension(filename), ".c6");
@@ -2067,10 +2067,15 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             if (strcmp(optarg, "=c11") == 0 || strcmp(optarg, "=gnu11") == 0)
                 s->cversion = 201112;
 #ifdef C6_EXT
-            else if (strcmp(optarg, "=c6") == 0) {
-                s->c6_ext = 1;
-                s->tcc_ext = 1;
-            }
+            /* The c6 language belongs to the source file, not to the command
+               line: only a '.c6' file turns the extensions on (see
+               tcc_add_file_internal()).  A switch would silently change what
+               every plain C file in the same run means, so it is refused
+               instead of being ignored. */
+            else if (strcmp(optarg, "=c6") == 0)
+                return tcc_error_noabort(
+                    "-std=c6 is gone: rename the source file to '*.c6' "
+                    "to enable the c6 extensions");
 #endif
             break;
         case TCC_OPTION_shared:

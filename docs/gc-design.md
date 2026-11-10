@@ -14,7 +14,7 @@
    用 `weak`（反向引用）或 `own`（独占链）表达，否则编译不过。
 3. 跨帧（`async`/`spawn`）和跨线程的所有权转移；原子计数由一个限定符显式选择。
 4. 析构钩子 `drop` 方法（等价 C++ 析构函数 / Rust `Drop`）。
-5. 不改变 `-std=c6` 之外的任何行为；C99 后端（`-c99`）同样可用。
+5. 不改变 c6 之外的任何行为；C99 后端（`-c99`）同样可用。
 
 非目标（V1 明确不做）：
 
@@ -309,7 +309,7 @@ void  __c6_gc_shutdown(void);                         /* 退出时释放全局�
 任务前缀）拥有，被调者不计数、不释放。因此形参槽打上 `C6_GQ_BORROW`
 （只存在 `CType.gq` 缓存里，绝不上 pointee），`vstore()` 的钩子见到它就报
 E-GC14 —— 否则 `void f(@Node n) { n = NULL; }` 会把调用者的引用减掉，
-静默释放一个还活着的对象（`tests/errors/gc_borrow.c`）。要改写就先拷进
+静默释放一个还活着的对象（`tests/errors/gc_borrow.c6`）。要改写就先拷进
 自有局部：`@Node m = n;`（+1，退出时 −1）。
 
 按值规则：含托管字段的结构体不能按值拷贝、按值传参、按值返回、进 tuple、
@@ -391,7 +391,7 @@ void drop(struct File *self) { close(self->fd); }   /* ← 名字叫 drop 的方
    `__attribute__((constructor))` / `__attribute__((destructor))` 函数：
    构造时 `__c6_gc_root(&g, kind, count, stride)` 把槽登记进运行时的表，
    析构时调用 `__c6_gc_shutdown()`（幂等）释放。`-run`、可执行文件、
-   c99 后端三条路都验证过（`tests/exit/drop_exit.c`）。
+   c99 后端三条路都验证过（`tests/exit/drop_exit.c6`）。
 5. **静态检查**：`int drop(...)` → `'drop' must return void: ...`；
    `void!error drop(...)` → `'drop' cannot fail ('!error'): ...`；
    体内 `try`/`catch`/`spawn` → 各自报错（`err()` 本来就要求 `!error`，
@@ -499,7 +499,7 @@ body（`int __c6_body_f(void *task, void *frame)`），后端把帧寄存器直�
 - 挂起**不拷贝任何东西**：`__c6_co_suspend` 只在 `desc->frame_size == 0` 时
   才走老的 memcpy 路径；
 - 帧的**绝对地址**在任务的一生里不变，`&local` 跨过 `await` 依旧有效
-  （`tests/async_frame.c` 用 `co` + `__c6_co_run()` 恢复来断言——那正是老模型
+  （`tests/async_frame.c6` 用 `co` + `__c6_co_run()` 恢复来断言——那正是老模型
   会搬帧的组合）；
 - 帧没有 4 KiB 上限，任务也没有固定池上限（每个任务一块，结束即释放）。
 
@@ -520,7 +520,7 @@ C99 输出后端。
 
 帧住在任务里之后，弱槽（它是指向槽本身的指针）在整个任务期间地址不变，
 所以 `weak` 局部、`weak` 形参、`weak` 返回值都可以出现在 `async` 函数里
-（`tests/async_frame.c` 覆盖这三种）。
+（`tests/async_frame.c6` 覆盖这三种）。
 
 ```c
 async int f(int fd, weak @Node param)   /* ✓ 形参 */
@@ -590,7 +590,7 @@ if (__c6_co_kind(task) == C6_CO_KIND_ABORT) {
 `t->wait()` / `t->start()` 之前根本没跑过，所以"回卷一个挂起的任务"要靠
 `t->start()`：它把 body 推进到第一个挂起点就返回，句柄还活着；作用域结束时
 `__c6_co_destroy()` 看到 `state != DONE` → `__c6_co_abort()` → body 从挂起点
-恢复一次，走上面那段清理派发器 → `finish(ABORT)`。`tests/async_frame.c` 的
+恢复一次，走上面那段清理派发器 → `finish(ABORT)`。`tests/async_frame.c6` 的
 "挂起的任务被销毁时回卷"就是这条路径（defer 跑了、托管引用计数回到基线）。
 
 这条路径原来还有一个坑：挂起时会把线程的 **defer 栈指针**和 context 栈指针
@@ -602,7 +602,7 @@ context 栈"而被**静默跳过**。现在 `defer` 的状态住在函数帧里�
 **预算（§11.4）**：已经是「每次释放最多 256 个」（`c6_gc_drain(th,
 C6_GC_DRAIN_BUDGET)` 在 `c6_gc_drop()` 里，`lib/libtcc1.c:1271`），
 级联释放跨多次释放摊平，不需要编译器在 `new`/作用域退出处再插调用；
-`__c6_gc_drain_budget(n)` 仍导出给想手工跑完队列的代码（`tests/gc_field.c`
+`__c6_gc_drain_budget(n)` 仍导出给想手工跑完队列的代码（`tests/gc_field.c6`
 的长链用例用它）。
 
 ### 9.4 所有权的跨帧/跨线程转移
@@ -650,7 +650,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 
 - 计数之外的全局结构只有两个：弱槽注册表（冷路径，全局自旋锁）与全局根链表
   （登记全局根的一次性初始化用）；引用计数热路径上**没有锁**；
-- `-std=c6` 下 `parse_btype` 里 `__atomic_*` 已经可用（`parse_atomic`，
+- c6 的翻译单元里 `parse_btype` 的 `__atomic_*` 已经可用（`parse_atomic`，
   `tcc/tccgen.c:6265` 附近，经 helper 调用）；libtcc1.c 里需要自己
   `#define __ATOMIC_ACQ_REL 4`（tcc 不预定义，`lib/stdatomic.c` 也是这么做的）。
 
@@ -790,7 +790,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
   只输出 C 源码、没有段的概念），只做单 TU 检查 —— 文档写明。`-c99` 输出走的是
   `c99_output_file()`，`.c6.gcgraph` 那套数据段在那里根本不会生成，所以检查
   什么也看不到；用例用 `// NATIVE-ONLY <片段>` 标注，`run-tests.sh` 在 c99 后端
-  跳过该片段（`tests/errors/gc_cycle_cross_tu.c` 就是这么标的）。
+  跳过该片段（`tests/errors/gc_cycle_cross_tu.c6` 就是这么标的）。
 
 ---
 
@@ -815,6 +815,6 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
    写成 `own` 树或 `weak` 边 —— 这是语言取舍，真要做得连运行期环回收一起想。
 
 返回托管引用时“每调用一次就多一个计数”的旧问题（本节原来的第 3 条）已经
-不存在：`c6_gc_return_hook()` 在返回点把一份引用交给调用者，`tests/gc.c` 的
-`return 把引用交给调用者` 与 `tests/gc_return.c`（新建对象 / 借字段 / 形参
+不存在：`c6_gc_return_hook()` 在返回点把一份引用交给调用者，`tests/gc.c6` 的
+`return 把引用交给调用者` 与 `tests/gc_return.c6`（新建对象 / 借字段 / 形参
 原样返回 / 循环多次调用）逐条断言计数会回到基线。
