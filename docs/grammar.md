@@ -730,6 +730,17 @@ Vect_int` 即可互通。
 `-emit-header` 因此直接写出 `struct m2__Vect_int` 和实例函数原型，跨 TU 一致。
 用户手写同名 tag → `the instance name 'Vect_int' is already in use`。
 
+**`-Wgeneric-depth`**（风格告警，默认关、`-Wall` 开）：源码里写出来的应用链
+深于 2 层时提示起别名，`Vect@Vect@Vect@int` 报一次，`Vect@Vect@int` 不报，
+同一个实例只报一次；模板体里「`A` 里嵌 `B`、`B` 里嵌 `Vect`」按写的 1 层算，
+这种嵌套是正常用法，不告警。`-Werror` 下升级成错误，`-Wno-generic-depth`
+关掉：
+
+```
+typedef Vect@int IntVect;      /* 起个别名，正文里就不写链 */
+typedef Vect@IntVec Grid;
+```
+
 **未落地**：体内成员函数（`struct Vect@T { T at(int i) { … } }`，§8.5）。
 裸模板名是 C103 诊断，不是类型。
 

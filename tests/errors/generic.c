@@ -3,7 +3,9 @@
  * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
  * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
  * 不带任何 -D 时是本文件的“正常路径”，必须编译通过。
+ * `// FLAGS` 行给本文件加上只管告警的开关：深度告警是风格提示，默认关闭。
  */
+// FLAGS -Wgeneric-depth
 struct Vect@T { T x, y; };
 struct Fwd@T;
 struct Bad@T { Bad@(T *) p; };
@@ -29,6 +31,7 @@ struct Bad@T { Bad@(T *) p; };
 // EXPECT test_unbound_param: error: 'T' undeclared (a type parameter is only visible inside its template)
 // EXPECT test_fn_bare_name: error: 'id' is generic: write 'id@...'
 // EXPECT test_value_binder_name: error: a value parameter is written '<type> NAME'
+// EXPECT test_chain_depth: warning: generic instantiation nested 3 deep
 
 #if defined test_bare_name
 int main(void)
@@ -133,6 +136,18 @@ int main(void) { return id(3); }
 #elif defined test_value_binder_name
 |int| void f(void);
 int main(void) { return 0; }
+#elif defined test_chain_depth
+/* 'Vect@Vect@Vect@int' 写起来太深：-Wgeneric-depth 提示起个别名（§7）。
+   这个片段同时带一个真错误，因为诊断组要求该片段编译失败。 */
+typedef Vect@int IntVect;
+int main(void)
+{
+    Vect@Vect@int two = {{1, 2}, {3, 4}};
+    Vect@Vect@Vect@int deep = {{{1, 2}, {3, 4}}, {{5, 6}, {7, 8}}};
+    IntVect alias = {9, 10};
+
+    return two.x.x + deep.x.y.y + alias.x + missing_name;
+}
 #else
 int main(void)
 {
