@@ -1,0 +1,39 @@
+/* ABI：闭包在纯 C 一侧只是一个 `{ code, env }` 结构体的指针。
+ *
+ * 纯 C 翻译单元（`closure_plain.c`）看不见 `closure` 这个类型，它按自己的
+ * 结构体定义保存和检查指针——两个 TU 只共享「一个机器字的指针」这条 ABI，
+ * 不需要符号改名、不需要描述符可见。纯 C 一侧**不调用**闭包：调用要读
+ * `__c6_code` 并按 c6 的调用约定传 env（那属于闭包自己的事）。
+ *
+ * 编译（仓库根目录）：
+ *   make selftest
+ */
+closure int(int) c6_make(int n);
+long plain_hold(closure int(int) f);
+int plain_seen(void);
+
+static closure int(int) make_adder(int n)
+{
+    return int(int x) { return x + n; };
+}
+
+// EXIT 0
+int main(void)
+{
+    closure int(int) f = make_adder(5);
+
+    /* 纯 C 一侧看到的就是两个指针：sizeof 一致，字段都非空 */
+    if (plain_hold(f) != (long)(sizeof(void *) * 2))
+        return 1;
+    if (plain_seen() != 1)
+        return 2;
+
+    /* 存过之后闭包照样能调用：纯 C 没有动过它的引用计数 */
+    if (f(1) != 6)
+        return 3;
+
+    f = NULL;
+    if (__c6_gc_live() != 0)
+        return 4;
+    return 0;
+}

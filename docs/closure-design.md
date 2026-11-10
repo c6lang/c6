@@ -1,9 +1,9 @@
 # c6 函数字面量与闭包设计
 
 状态：**V1 已实现**（无捕获的字面量 = 裸函数指针）。
-**V2（捕获式闭包）设计定稿，尚未实现**：本文是 V2 的完整规格；实施清单见
-[closure-todo.md](closure-todo.md)。在 V2 落地之前，`-std=c6` 的行为仍完全按
-V1 —— 捕获局部变量报 C80，`closure` 也不是类型。
+**V2（捕获式闭包）已实现**：本文是 V2 的规格（与 `tcc/tccgen.c`、`c99-gen.c`
+同步）；实施清单与用例对照见 [closure-todo.md](closure-todo.md)，语法与约束
+编号见 [grammar.md §3.10](grammar.md)。
 
 相关：[grammar.md §3.10](grammar.md)（V1 语法与 C80–C83）、
 [gc-design.md](gc-design.md)（`@T` 的计数、描述符、环检测与跨线程规则）、
@@ -993,8 +993,8 @@ struct __c6_closure_<hash> *make(int n);        /* closure int(int) */
 
 ## 9. 诊断（C90–C98）
 
-编号接在 f-string 的 C89 之后。**这些诊断只在 V2 实现后生效**；V1 仍然只报
-C80–C83。
+编号接在 f-string 的 C89 之后。**这些诊断随 V2 一起生效**；V1 的字面量仍按
+C80–C83 报（其中 C80 在 V2 下只剩「没有按值捕获、却引用了块作用域名字」）。
 
 | 编号 | 条件 | 消息 |
 |---|---|---|

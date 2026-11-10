@@ -4,6 +4,7 @@
  *   ./tcc/tcc -B tcc -std=c6 -test tests/closure.c
  */
 #include <stdio.h>
+#include <stdarg.h>
 
 struct Point { int x, y; };
 struct Node { int v; };
@@ -173,6 +174,35 @@ test "static 局部：只允许 NULL 初始化，运行时再赋值" {
     sf = NULL;
     if (r != 6)
         err(1, "static 局部闭包不对");
+}
+
+test "变参捕获字面量：env 才是第一个显式实参" {
+    int base = 100;
+    closure int(int, ...) f = int(int n, ...) {
+        va_list ap = {0};
+        va_start(ap, n);
+        int x = va_arg(ap, int);
+        va_end(ap);
+        return n + x + base;
+    };
+    int r = f(1, 2);
+    f = NULL;
+    if (r != 103)
+        err(1, "变参闭包不对");
+}
+
+test "struct 返回的闭包：sret 之后才是 env" {
+    int base = 10;
+    closure struct Point(int) f = struct Point(int a) {
+        struct Point p = {0};
+        p.x = a + base;
+        p.y = a * 2;
+        return p;
+    };
+    struct Point p = f(4);
+    f = NULL;
+    if (p.x != 14 || p.y != 8)
+        err(1, "struct 返回的闭包不对");
 }
 
 test "defer 与闭包捕获" {
