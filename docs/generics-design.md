@@ -1,0 +1,450 @@
+# c6 泛型设计（`@` 应用 / `|…|` 绑定）
+
+状态：**设计定稿，尚未实现**。落地前 `-std=c6` 把泛型列在
+[grammar.md §10](grammar.md)「未支持的写法」里，编译器报 `'Vect' undeclared`
+一类普通 C 诊断。
+
+相关：[grammar.md](grammar.md)（§3.2 方法、§3.3 切片 `T[:]`、§3.7 裸 tag 类型名 C41、
+§3.8 元组、§7 静态约束、§11 实现位置）、[closure-design.md](closure-design.md)
+（V2 闭包，`|…|` 记号的另一个用处）、[gc-design.md](gc-design.md)（`@T` 的计数与环检测）。
+
+---
+
+## 0. 决策速览
+
+| 编号 | 决策 | 理由（详见 §1、§2） |
+|---|---|---|
+| D1 | 类型应用写作 `Name@arg`，**后缀、无闭合括号** | `Vect@Vect@int` 线性展开，永远不出现 `>>>` / `]]]` 的视觉坍塌；`>` 在表达式里是合法运算符，`@` 在类型名之后不是 |
+| D2 | tag 定义的形参挂名：`struct Vect@T { … }` | 形参与实参同形（Rust/Go/C#/Swift 的主流直觉）；此处名字先于体，形参可见 |
+| D3 | 名字出现在**体或返回类型之后**的声明（函数、typedef）用前缀 `\|T\|` | 由 A3「参数必须先于使用」推导，不是风格选择：C 的返回类型在名字左边，挂名形式永远看不到 `T` |
+| D4 | `@` 与既有托管引用 `@T` 共存 | 前缀 `@`（类型位置起点）= 托管引用；后缀 `@`（类型名之后）= 类型应用；位置不同，零歧义 |
+| D5 | 单参数省略括号，多参数必须括号；声明点与使用点**同一条括号规则** | `struct Map@(K, V)` / `Map@(char[:], int)`；无例外的第二条规则 |
+| D6 | 单态化：一个实例 = 一个独立 struct tag + 一批 `<mangled>_<method>` 函数；模板本体永不完整 | 实例走 C 的 ABI，五个后端 + c99 后端 + `-emit-header` 零改动 |
+| D7 | 值形参写成 C 参数表形状 `int N`，内部按**枚举常量**绑定 | `N` 天然可进常量表达式（数组长度、切片长度），复用现成机制 |
+| D8 | 实例名 mangle 成 `Vect_int`，与既有 `<Tag>_<name>` 方法名同族 | 跨 TU 稳定、可读；`-emit-header` 能直接写 `struct Vect_int` |
+| D9 | V1 不做类型参数推导：自由函数显式 `vat@int(v, 0)`；**方法调用由接收者定类型**（`v->vat(0)`，唯一省略 `@` 的地方） | 推导只保留「接收者已经写死了 T」这一种形态，不需要重载/推导引擎 |
+| D10 | 实例化点必须在模板**定义之后**；模板体内禁止自实例化 | 与 C「先声明后用」同构；自实例化是唯一的自噬递归源，直接关掉 |
+| D11 | 不做特化、偏特化、SFINAE、模板模板参数、`typename`、依赖名、约束语法 | 鸭子协议 + 实例化点报错已经够用；每加一条都是诊断质量与单趟可行性的负担 |
+| D12 | 每个 TU 实例上限 1024，实例化嵌套上限 64 | 单趟编译器不能靠磁盘缓存兜底，必须有硬闸 |
+| D13 | token 重放保留原文件/行号 | 诊断指向模板源码，附 `requested from` 链 |
+| D14 | `static` 局部在实例里**每实例一份** | 单态化的直接结果，写进规范避免 C++ 那样的 ODR 争论 |
+
+---
+
+## 1. 语言形式
+
+### 1.0 为什么不是 `<…>`
+
+|candidate|`Vect<int>`|`Vect[int]`|`Vect(int)`|`Vect of int`|`Vect@int`|
+|---|---|---|---|---|---|
+|需要成对闭合符（嵌套堆积）|是（`>>>`，C++03 还得写 `> >`）|是（`]]]`）|是（`)))`）|否（右结合无闭合）|**否**|
+|与 C 表达式歧义|`Vec < int > x;` 是合法表达式链，需要 C++ 式声明/表达式消歧|下标/数组|调用/声明符|无|**无**（`@` 不是二元运算符）|
+|像数组 / 像调用|—|像数组（用户第一反应）|像调用、像函数类型|不像|**不像**|
+|多参数逗号归属|括号内|括号内|括号内|需要额外终结符|括号内|
+|是否新记号|是（与 `<` 冲突）|复用下标|复用调用|软关键字 `of`|复用 `@`（已有前缀义）|
+
+三条硬理由否掉 `<>`：
+
+1. 词法：`>>` 的最大匹配让 `Vect<Vect<int>>` 需要改词法器或要求空格，`a<b>=c` 之类
+   写法永远有例外；
+2. 语法：`<` 在表达式里是合法运算符，`Vec < int > x;` 在 C 里本来能过，加泛型就要
+   引入「能按声明解析就当声明」的回看规则——TCC 是单趟、无 AST，回看无处安放；
+3. 人因：闭合尖括号是 C++ 可读性事故的固定来源（嵌套、错误信息、`typename` 消歧）。
+
+`@` 是唯一同时满足「像英文 `at`」「不是 C 运算符」「已有用户直觉（`Vec@int` 读作
+`Vec at int`）」的记号。
+
+### 1.1 使用点
+
+```
+template-application   = template-name , "@" ,
+                         ( type-argument
+                         | "(" , argument-list , ")" ) ;
+type-argument          = type-specifier | constant-expression ;
+argument-list          = type-argument , { "," , type-argument } ;
+```
+
+```c
+Vect@int            vi = {0};      /* 单参数：不写括号 */
+Map@(char[:], int)  m = {0};       /* 多参数：必须括号 */
+Buf@(int, 4)        four = {0};    /* 值参数：按位置对应，常量表达式 */
+Vect@Vect@int       grid = {0};    /* 右结合：Vect@(Vect@int)，链上没有闭合符 */
+Vect@int[:]         view = {0};    /* 后缀作用于整个类型：(Vect@int)[:] */
+Vect@(int*)         ptrs = NULL;   /* 带 '*' 的实参：括号分组 */
+@Vect@int           root = new Vect@int;   /* 托管引用指向 Vect@int（前缀 @ 吃整条后缀链） */
+Vect@(@Node)        nodes = {0};   /* 元素是托管引用 */
+```
+
+规则：
+
+* **R1（位置）** `@` 前面是**模板名** → 类型应用；`@` 出现在类型位置的起点（或
+  `weak`/`own`/`shared` 之后）→ 托管引用。`@f"…"` 是第三种，只跟字符串。
+  `@Vect@int` 因此无歧义：前缀要求后面是类型名/类型关键字，`Vect@int` 正好是。
+* **R2（元数）** 模板声明了几个形参就吃几个实参；单实参可省括号，多实参必须
+  括号（`Map@char[:], int` 报 C106）。
+* **R3（后缀归属）** 实参只吃一个说明符；`*`、`[:]`、`[N]`、`!error`、参数表属于
+  **外层**类型。要有后缀的实参就在括号里写：`Vect@(int*)`。
+  于是最常用的 `Vect@int[:]` 读作「`Vect@int` 的切片」，不需要额外括号。
+* **R4（结合）** 链右结合，`Vect@Map@char@int` 由各模板的元数唯一确定分组。
+
+### 1.2 声明点
+
+```
+generic-parameter-list = "|" , [ generic-parameter , { "," , generic-parameter } ] , "|" ;
+generic-parameter      = type-specifier , identifier          (* 值形参："int N" *)
+                       | identifier ;                          (* 类型形参："T" *)
+
+template-parameters    = "@" , ( generic-parameter
+                               | "(" , generic-parameter , { "," , generic-parameter } , ")" ) ;
+generic-struct         = ( "struct" | "union" ) , identifier , template-parameters ,
+                         ( "{" , { member-declaration } , "}" | ";" ) ;
+generic-declaration    = generic-parameter-list , declaration ;
+```
+
+```c
+struct Vect@T        { T *data; int len; };          /* tag 定义：挂名（名字先于体） */
+struct Map@(K, V)    { Vect@K keys; Vect@V vals; };
+struct Buf@(T, int N) { T data[N]; int len; };       /* 值形参写成 C 参数表形状 */
+union  Val@T         { T v; int i; };
+struct Node@T;                                       /* 模板前向声明；不能实例化 */
+
+|T| T  vat(Vect@T *self, int i);                     /* 函数模板：返回类型里有 T */
+|T| T!error vget(Vect@T *self, int i);               /* 与 !error 后缀自然组合 */
+|T| typedef Vect@T MyVec;                            /* 泛型别名 */
+|T| typedef struct { T v; } Box;                     /* 匿名泛型 typedef */
+```
+
+### 1.3 形式规则：一条原则，零例外
+
+**A3：形参表必须出现在该声明中第一次使用形参之前。**
+
+|c 声明|形参出现在|形式|写法|
+|---|---|---|---|
+|`struct` / `union` 定义与前向声明|名字之后|挂名|`struct Vect@T { … }`|
+|函数声明与定义|返回类型之后|前缀|`\|T\| T vat(Vect@T *self, int i)`|
+|`typedef` 别名|目标类型之后|前缀|`\|T\| typedef Vect@T MyVec;`|
+|`typedef` 匿名结构|体之后|前缀|`\|T\| typedef struct { T v; } Box;`|
+
+每种声明**只有一种拼法**（不提供 `|T| struct Vect { … }` 这种等价写法），
+所以不需要记忆偏好，只需要记 A3。挂名形式之所以只给 tag：tag 名是唯一
+「出现在自己体之前」的名字。
+
+### 1.4 `@` 的两个方向
+
+|写法|含义|判据|
+|---|---|---|
+|`@Node h;`|托管引用指向 `Node`|`@` 在类型位置起点|
+|`weak @Node p;`|弱引用|`weak`/`own`/`shared` 之后|
+|`@Vect@int p;`|托管引用指向 `Vect@int`|前缀吃整条后缀链|
+|`struct Vect@T`|模板定义（形参）|`@` 紧跟 tag 名|
+|`Vect@int`|类型应用（实参）|`@` 紧跟类型名|
+|`at@int(v, 0)`|函数模板的显式实例化|`@` 紧跟函数名|
+
+### 1.5 括号规则（声明点 = 使用点）
+
+* 1 个参数：不写括号（`Vect@int`、`struct Vect@T`）。
+* ≥2 个参数：必须括号（`Map@(K, V)`、`Map@(char[:], int)`）。
+* 单个参数但带后缀/前缀（`*`、`[:]`、`@`）：用括号分组（`Vect@(int*)`、
+  `Vect@(@Node)`）——否则按 R3，后缀属于外层。
+
+---
+
+## 2. 语义
+
+### 2.1 单态化与命名
+
+模板不是类型，实例才是类型（C41 的裸 tag 名规则对实例同样成立）：
+
+```c
+Vect@int  a;                    /* 声明了 struct Vect_int 并完成布局 */
+Vect@int *p = &a;               /* 同一 TU 里重复使用同一个实例 */
+Vect@char b;                    /* 另一个完全不相干的类型：不能与 a 互赋（C109） */
+```
+
+mangle（跨 TU 稳定、`-emit-header` 可写、与既有 `<Tag>_<name>` 方法名同族）：
+
+|写得|mangle|方法|
+|---|---|---|
+|`Vect@int`|`Vect_int`|`Vect_int_at`|
+|`Vect@Vect@int`|`Vect_Vect_int`|`Vect_Vect_int_at`|
+|`Map@(char[:], int)`|`Map_slice_char_int`|`Map_slice_char_int_at`|
+|`Buf@(int, 4)`|`Buf_int_4`|`Buf_int_4_at`|
+|`Vect@(int*)`|`Vect_int_p`|`Vect_int_p_at`|
+|`Vect@(int[:])`|`Vect_slice_int`|—|
+|`Vect@((int, int))`|`Vect_tuple_int_int`|—|
+|`Vect@(@Node)`|`Vect_m_Node`|—|
+
+实参的 mangle 拼法：标量用拼写、指针加 `_p`、切片前缀 `slice_`、元组前缀
+`tuple_`、托管引用前缀 `m_`（与普通指针区分，`@Node` 和 `Node *` 不会撞名）。
+
+实例名属于**保留的 ABI 名**：用户手写同名 struct/函数 → 冲突诊断（见 §8 未决项）。
+
+### 2.2 模板本体是一个永不完整的类型
+
+`struct Vect@T` 同时定义了一个**名义类型** `struct Vect`，它永远不完整，
+只用于模板体内的自引用：
+
+```c
+struct Node@T {
+    T *val;
+    Node@T *next;       /* 模板自身：incomplete，只允许指针（C108） */
+};
+```
+
+* 体内写 `Node@(T*)`、`Node@int` → C107（模板体内禁止实例化自己）。
+* 体内 `sizeof(Node@T)` → incomplete（与 C 的 incomplete struct 一致）。
+* 模板体内的 `T` 是**普通 typedef 名**（实现上就是这么绑的），所以
+  `T *`、`T[:]`、`(T, int)`、`@T`、`T!error` 全部照常成立。
+* 定义结束后 `T` 不可见（C105）；`struct Node@T;` 之后不能实例化（C108）。
+
+### 2.3 值形参与常量
+
+```c
+struct Buf@(T, int N) { T data[N]; int len; };
+
+Buf@(int, 4)   b4  = {0};   /* struct Buf_int_4 */
+Buf@(char, 12) b12 = {0};   /* struct Buf_char_12 */
+```
+
+`N` 在体内按**枚举常量**绑定：可进数组长度、`T[:]` 长度、`case`、
+位域宽度，任何常量表达式；不是变量，不能取地址、不能赋值（C110）。
+
+### 2.4 方法
+
+方法仍然只是「第一个形参指向结构体的文件作用域函数」（§3.2 不变），
+泛型只是把接收者换成模板形参：
+
+```c
+struct Vect@T { T *data; int len; };
+
+|T| T vat(Vect@T *self, int i) { return self->data[i]; }
+
+void f(Vect@int *v) {
+    int x = v->vat(0);       /* 接收者 = Vect@int → 实例化出 Vect_int_at */
+    int y = vat@int(v, 0);   /* 等价的显式写法 */
+}
+```
+
+* 调用点的 `@` 省略规则只针对**方法调用**：接收者的类型已经把 `T` 写死了，
+  形状上再写一遍是噪音（D9）。
+* 自由函数没有接收者，必须显式 `at@int(v, 0)`；这也是 `go`/`async`/函数指针
+  拿泛型函数的唯一写法（`go vat@int(v, 0)`）。
+* 模板本体 `struct Vect` 上不注册任何方法：`Vect *p = NULL; p->vat(0);` 报 C103。
+
+### 2.5 与既有特性的交互
+
+|特性|行为|
+|---|---|
+|切片 `T[:]`|`Vect@int[:]` 是 `Vect@int` 的切片视图；没有额外语法、没有新 ABI|
+|切片嵌套|`int[:][:]` 已经覆盖「数组的数组」；这类需求不要用泛型（§7 风格规则）|
+|元组|`\|T\| (T, int) find(Vect@T*, T)`；实例化后是普通元组类型|
+|`!error`|`\|T\| T!error vget(Vect@T*, int i)`；失败路径复用 §8 的传播规则|
+|接口 `interface`|每个实例独立实现自己的 vtable（`c6_auto_impl_ensure` 按实例 tag 建表）；**不需要** `I<T>` 形态|
+|`foreach` 迭代器协议|`E next(T *self)` 里的 `E` 在实例化后是具体类型，C99「元素类型被擦除」自然不触发|
+|`@T` 托管引用/GC|实例是独立 struct → 每实例一份描述符、一次环检；`struct Node@T { @Node@T next; }` 是静态环 → C66，和普通结构体一致|
+|`go` / `async` / `task`|拿到的必须是具体函数：`go vat@int(v, 0)`；`\|T\|` 模板本身不能出现在 `go` 的操作数位置（C38 不变）|
+|`defer` / `errdefer`|实例化体里照常展开，清理点数上限 C101 逐实例计算|
+|`flexible array`|`struct Vect@T { int len; T data[]; };` 合法（尾元素类型是形参）|
+|`-emit-header`|只输出实例：`struct Vect_int { int *data; int len; };` + `int Vect_int_at(struct Vect_int *, int);`|
+|c99 后端|解析期已单态化 → 后端只看到普通 struct/函数，`tcc/c99-gen.c` 零改动|
+
+---
+
+## 3. 静态约束（C103–C116）
+
+|约束|内容|诊断|
+|---|---|---|
+|C103|模板名不能单独作类型|`'Vect' is generic: write 'Vect@int'`|
+|C104|实参个数必须与形参个数一致|`'Map' needs 2 arguments (got 1)`；`'Vect' takes no value argument`|
+|C105|形参只在模板体/声明内可见；用到形参的位置必须晚于形参表（A3）|`'T' undeclared (a type parameter is only visible inside its template)`；`type parameter 'T' is used before it is declared: write '\|T\| T vat(Vect@T *, int)'`|
+|C106|多参数必须加括号|`a template with more than one parameter needs parentheses: 'Map@(char[:], int)'`|
+|C107|模板体内禁止自实例化|`cannot instantiate 'Vect' inside its own definition: write 'Vect@T'`|
+|C108|模板不完整（前向声明/未定义）时不能实例化，体内自引用只能取指针|`instantiation of undefined template 'Vect'`；`'Vect@T' is incomplete: only a pointer to it is allowed here`|
+|C109|不同实例是不同类型，无隐式互转|`incompatible types for assignment: 'Vect_int' and 'Vect_char'`|
+|C110|值形参不可赋值/取地址；实参必须是常量表达式且能装进形参类型|`'N' is a compile-time constant of a generic template`；`a value argument must be a constant expression`；`value argument 300 does not fit in 'unsigned char'`|
+|C111|每 TU 实例上限 1024|`too many generic instantiations in one translation unit (max 1024)`|
+|C112|实例化嵌套上限 64|`generic instantiation nested too deeply (max 64)`|
+|C113|`enum` 不能有类型参数|`enums cannot have type parameters`|
+|C114|实例一律写裸名，不加 `struct`|`write 'Vect@int', not 'struct Vect@int'`|
+|C115|形参不能与模板同名|`a type parameter cannot have the same name as its template`|
+|C116|实例化要求模板定义在实例化点之前可见|`'Vect' is instantiated before its definition (forward declarations cannot be instantiated)`|
+
+---
+
+## 4. 边界用例
+
+|写法|结果|
+|---|---|
+|`struct Vect@T { T *data; int len; };`|模板定义|
+|`Vect@int v = {0};`|实例（布局在首次出现处完成；重复出现复用）|
+|`Vect@Vect@int g = {0};`|嵌套实例，mangle `Vect_Vect_int`|
+|`Map@(char[:], int) m = {0};`|多参数实例|
+|`Buf@(int, 4) b = {0};`|值参数实例|
+|`Vect@int[:] view = {0};`|`(Vect@int)[:]`，切片|
+|`Vect@(int*) p = NULL;`|实参带 `*`，括号分组|
+|`@Vect@int root = new Vect@int;`|托管引用指向实例|
+|`Vect@int a = {0}; Vect@char b = {0}; a = b;`|C109，不同类型|
+|`Vect v;`|C103|
+|`struct Vect@int v;`|C114|
+|`Map@char[:], int m;`|C106（逗号归属不明）|
+|`struct Vect@T; Vect@int v;`|C108|
+|`struct Vect@T { Vect@(T*) *p; };`|C107|
+|`struct Vect@T { Vect@int q; };`|C107（体内自实例化，即便实参是具体类型）|
+|`\|T\| T vat(Vect@T *self, int i);`|函数模板|
+|`T vat@T(Vect@T *self, int i);`|C105（`@T` 出现在返回类型里的 `T` 之后）→ 改成 `\|T\|` 前缀|
+|`\|T\| typedef struct { T v; } Box;`|匿名泛型 typedef（`Box_int`）|
+|`\|T\| typedef Vect@T MyVec;`|泛型别名|
+|`enum E@T { A, B };`|C113|
+|`\|T\| void push(Vect@T *self, T x);`|函数模板（形参只出现在参数表里）|
+|`go vat(v, 0);`|C38 的既有诊断 + 提示 `go vat@int(v, 0)`|
+|`sizeof(Vect@T)` 在体内|C108（incomplete）|
+|`Vect@int` 在 `-emit-header` 输出里|`struct Vect_int { … };`，泛型信息不跨 TU|
+
+---
+
+## 5. 实现
+
+### 5.1 挂载点
+
+|语法|位置|
+|---|---|
+|模板定义 `struct X@params`|`struct_decl()`（`tcc/tccgen.c:6541`）：读完 tag（`v = tok, next();`，约 6561）后判 `tok == '@'`，解析形参 → `local_scope++` + 形参入符号栈 → 体照常走 `c6_is_def` 分支 → `local_scope--` 并弹栈|
+|模板前向声明|同上，`tok` 为 `';'` 时不解析体|
+|使用点 `X@args`|`parse_btype()` 的 `default`（标识符）分支：`sym_find()` 未命中、`struct_find()` 未命中之后（§11 记录的 tag 回退旁边）加第三查 `c6_generic_find()`；命中要求 `tok == '@'`。**必须就地消费**：`@` 的前缀托管分支在 `parse_btype()` 的 while 顶部（`tcc/tccgen.c:7104`），晚一步就会被当成托管引用|
+|函数/typedef 模板 `\|T\|`|文件作用域 `decl()` 入口判 `tok == '\|'`（`\|` 不能起一个声明或表达式语句；`foreach \|…\|` 的分派在 `block()`，不冲突）；与 struct 共用「压形参作用域」的同一段代码|
+|形参绑定|类型形参 = `SYM_TYPEDEF`（`struct_decl` 前压栈）；值形参 = 枚举常量式 `Sym`（`VT_CONST` + `c.i`），因此 `N` 自动可进 `expr_const`|
+|实例化体|`skip_or_save_block(&body)` 捕获 token（`tcc/tccgen.c:1022` 声明、`c6_lit_parse()` 8519/8545 与 `c6_tuple_speculate()` 是先例），实例化时重放|
+|实例表|`C6Generic`（模板：名字/形参种类/tag/体 token）+ `C6Instance`（mangle 名 → tag），`c6_tu_reset` 复位|
+|方法注册|实例 tag 走既有 `c6_method_register()` / `c6_method_lookup()`；泛型方法在实例化后按实例 tag 注册|
+|`-emit-header`|`c6_hdr_extra()`（`tcc/tccgen.c:10880`）同一套路，名字用 mangle 而不是序号|
+|诊断链|实例化栈记录 `requested at file:line`，`tcc_error` 前置 `in 'Vect@int'`|
+
+### 5.2 实例化流程
+
+1. `parse_btype()` 见到模板名 + `@` → 解析实参（按形参种类：类型实参走 `parse_btype`
+   的抽象声明符路径，值实参走 `expr_const`）。
+2. mangle → 查实例表；命中直接复用。
+3. 未命中：在实例表登记（先解决递归自引用：把 tag 先建成 incomplete，
+   这样 `Vect@Vect@int` 的内层实例在布局前就有符号）。
+4. `local_scope++`，把形参按 `T → CType` / `N → 常量` 压符号栈。
+5. 若模板本体已定义：重放捕获的体 token，走正常的成员/函数解析 → 布局 → 注册方法。
+6. `local_scope--`，弹栈；返回实例 `CType`。
+7. 全程在实例化栈上记一条，退出时弹出；栈深 > 64 报 C112，实例数 > 1024 报 C111。
+
+### 5.3 关键不变量
+
+* **不新增类型系统**：实例是真 struct，形参是普通 typedef/常量符号 → 现有
+  布局、方法、接口、切片、元组、GC 描述符、后端全部按原路径工作。
+* **不新增词法**：`@`、`|` 已经是简单记号；`|` 只在 `tccpp.c` 的 `parse_simple`
+  里出现（`@` 的 ARM 汇编注释特例只在 `PARSE_FLAG_ASM_FILE` 下生效，不影响 C 源）。
+* **零回看**：所有判定都是「`tok` + 至多一个 token」（唯一的多 token 扫描是捕获
+  模板体，用的是既有的平衡括号扫描 `skip_or_save_block`）。
+* **不改后端**：没有任何泛型相关代码进入 `*-gen.c` / `c99-gen.c`。
+
+### 5.4 风险清单
+
+|风险|处置|
+|---|---|
+|重放期间的文件/行号归属|token 自带原来的 file/line（`c6_tuple_speculate` 已经踩过这个坑），诊断因此指向模板源码|
+|体里含 `#include`/宏|宏在捕获前已展开；模板体不允许跨 `#include` 边界（诊断要求把模板定义写在一个文件里）|
+|`static` 局部|每实例一份（D14），`-emit-header` 不导出|
+|实例名与用户符号撞车|保留名 + 冲突诊断；`-emit-header` 里以实例名出现，链接期可发现|
+|`-run` 模式|无影响：单态化发生在解析期，`tcc_run` 只看到普通函数|
+|实例爆炸|C111/C112 双闸；`-Wgeneric-depth` 只是风格告警（见 §7）|
+
+---
+
+## 6. 和 C++ 模板的差别（为什么不会长成第二个 C++）
+
+* 没有特化/偏特化 → 没有「选了哪个模板」的推理；
+* 没有 SFINAE、没有重载解析 → 实参类型不匹配就是一条诊断，不会「换个重载试试」；
+* 没有推导（唯一例外是方法接收者）→ 每个实例名都能在源码里指出来；
+* 没有 `::` → 没有依赖名，因此不需要 `typename`/`template` 消歧关键字；
+* 没有 `>>` 词法问题 → `Vect@Vect@int` 直接写；
+* 实例必须在定义之后 → 与 C「先声明后用」一致，不会出现「TU 末尾才编译、报错找不到出处」；
+* 诊断最多两层：`in 'Vect@int' (requested at f.c:12)`。
+
+---
+
+## 7. 风格规则（配合 `-Wgeneric-depth`）
+
+1. 显式类型实参 ≥2 层时起别名，正文只写别名：
+
+   ```c
+   typedef Vect@int     IntVec;
+   typedef Vect@IntVec  Grid;          /* 不要到处写 Vect@Vect@int */
+   typedef Map@(char[:], IntVec) NameMap;
+   ```
+
+2. 「数组的数组」用切片，不进泛型：`int[:][:]` 比 `Vect@(Vect@int)` 便宜且免分配。
+3. 形状固定的缓冲用值形参：`Buf@(char, 256)` 比 `Vect@(Vect@char)` 清楚。
+4. 别名用语义名（`IntVec`、`NameMap`），不要用机械拼接的名字（`VecInt`），
+   后者和 mangle 名长得一样，读代码时容易当成 ABI 名。
+
+---
+
+## 8. 未决问题
+
+1. **实例名保留策略**：是「用户不得定义 `Vect_int`」还是「冲突时加哈希尾缀」。
+   倾向前者（可读、`-emit-header` 稳定），实现时在 `decl()` 里查实例表即可。
+2. **`-Wgeneric-depth` 的阈值与是否进 `make test`**：建议默认关闭，`-Wall` 打开，
+   深度 > 2 告警。
+3. **模板实例的 `drop` 方法**：`|T| void drop(Vect@T *self)` 每实例一份，GC 描述符
+   按实例指针填；与 `gc-design.md` 的环检测配合需要在实例化后重跑一次环检。
+4. **`module`/`package` 前缀**：模板名与实例 mangle 名都要带包前缀（`pkg__Vect_int`），
+   冒号点号形式的解析复用 `c6_pkg_name` / `c6_mangle_tok`。
+5. **体内成员函数（V3）**：允许在模板体内直接写方法定义：
+
+   ```c
+   struct Vect@T {
+       T *data; int len;
+       T at(int i) { return data[i]; }   /* V3：体内成员，`|T|` 前缀随之消失 */
+   };
+   ```
+
+   它是 `|T|` 前缀形式的严格超集，落地后泛型函数的声明点就收敛成一种，
+   且 ABI 与现在的 `<Tag>_<name>` 完全一致。V1 不做。
+6. **V2 闭包与 `|…|`**：[closure-design.md](closure-design.md) D4 明确不引入捕获
+   列表（捕获是隐式的），所以 `|…|` 只属于类型/值绑定，没有第二种用途。若将来要
+   加捕获列表，必须换记号（例如 `(…)` 或 `capture(…)`），这条要写进 closure 文档。
+
+---
+
+## 9. 实施顺序与验收
+
+**阶段 1（V1 核心，可独立落地）**
+
+1. `C6Generic` / `C6Instance` 表 + `c6_tu_reset` 复位；
+2. `struct_decl()` 的 `@` 形参解析 + 形参符号栈（类型形参）；
+3. `parse_btype()` 的模板名第三查 + `@` 实参解析 + mangle；
+4. `skip_or_save_block` 捕获 + 重放实例化；
+5. 函数/typedef 模板的 `|…|` 前缀（方法要用它，必须先进来）；
+6. 约束 C103–C109、C114–C116；
+7. 方法：实例 tag 注册（复用 `c6_method_register`）+ 接收者定类型调用。
+
+**阶段 2（补齐）**
+
+8. 值形参（枚举常量绑定）+ C110；
+9. 模板前向声明 + C108；
+10. 实例上限 C111/C112；`-emit-header` 输出实例。
+
+**阶段 3（收敛）**
+
+11. 体内成员函数（§8.5），随后废弃 `|…|` 在函数上的写法（保留一个版本的告警期）；
+12. `-Wgeneric-depth`。
+
+**测试**
+
+|文件|内容|
+|---|---|
+|`tests/generic/basic.c`|`Vect@T` + `Vect@int` + 方法 + `v->at(0)`|
+|`tests/generic/nest.c`|`Vect@Vect@int`、`Map@(char[:], int)`、别名|
+|`tests/generic/value.c`|`Buf@(T, int N)`、`N` 进数组长度/切片长度/`case`|
+|`tests/generic/suffix.c`|`Vect@(int*)`、`Vect@int[:]`、`@Vect@int`、`\|T\| T!error`|
+|`tests/generic/method.c`|方法注册、接收者定类型、`go vat@int(v, 0)`|
+|`tests/abi/generic.c`|两个 TU 共用 `Vect@int`（mangle 一致性）|
+|`tests/errors/generic.c`|C103–C116 逐条负例（含 `T vat@T(...)` 的 C105 提示）|
+|`tests/c99/generic.c`|c99 后端输出可编译|
+
+验收：`make test`、`make c99test`、`make selfhost`、`make c99selfhost` 全绿；
+新增用例进 `tests/run-tests.sh` 的既有分组。
