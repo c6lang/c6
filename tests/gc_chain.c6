@@ -1,0 +1,188 @@
+/* c6 自测：长的强引用链不是环（环检测不得误报）
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -test tests/gc_chain.c6
+ *
+ * 环检测的 DFS 路径原来是 32 个槽的定长数组，走到第 33 个类型就把一条
+ * 结构上完全无环的链当成“引用环”报错（诊断里没有重复节点，正是它误判的
+ * 证据）。现在路径按需动态增长，长度只受类型数限制，这里是 40 层：既验证
+ * 编译期不误报，也验证运行期整链能释放干净。
+ */
+
+struct A1;
+struct A2;
+struct A3;
+struct A4;
+struct A5;
+struct A6;
+struct A7;
+struct A8;
+struct A9;
+struct A10;
+struct A11;
+struct A12;
+struct A13;
+struct A14;
+struct A15;
+struct A16;
+struct A17;
+struct A18;
+struct A19;
+struct A20;
+struct A21;
+struct A22;
+struct A23;
+struct A24;
+struct A25;
+struct A26;
+struct A27;
+struct A28;
+struct A29;
+struct A30;
+struct A31;
+struct A32;
+struct A33;
+struct A34;
+struct A35;
+struct A36;
+struct A37;
+struct A38;
+struct A39;
+
+struct A0 { @A1 next; };
+struct A1 { @A2 next; };
+struct A2 { @A3 next; };
+struct A3 { @A4 next; };
+struct A4 { @A5 next; };
+struct A5 { @A6 next; };
+struct A6 { @A7 next; };
+struct A7 { @A8 next; };
+struct A8 { @A9 next; };
+struct A9 { @A10 next; };
+struct A10 { @A11 next; };
+struct A11 { @A12 next; };
+struct A12 { @A13 next; };
+struct A13 { @A14 next; };
+struct A14 { @A15 next; };
+struct A15 { @A16 next; };
+struct A16 { @A17 next; };
+struct A17 { @A18 next; };
+struct A18 { @A19 next; };
+struct A19 { @A20 next; };
+struct A20 { @A21 next; };
+struct A21 { @A22 next; };
+struct A22 { @A23 next; };
+struct A23 { @A24 next; };
+struct A24 { @A25 next; };
+struct A25 { @A26 next; };
+struct A26 { @A27 next; };
+struct A27 { @A28 next; };
+struct A28 { @A29 next; };
+struct A29 { @A30 next; };
+struct A30 { @A31 next; };
+struct A31 { @A32 next; };
+struct A32 { @A33 next; };
+struct A33 { @A34 next; };
+struct A34 { @A35 next; };
+struct A35 { @A36 next; };
+struct A36 { @A37 next; };
+struct A37 { @A38 next; };
+struct A38 { @A39 next; };
+struct A39 { int v; };
+
+test "40 层强引用链：编得过、也释放得掉"
+{
+    {
+        @A0 a0 = new A0;
+        @A1 a1 = new A1;
+        @A2 a2 = new A2;
+        @A3 a3 = new A3;
+        @A4 a4 = new A4;
+        @A5 a5 = new A5;
+        @A6 a6 = new A6;
+        @A7 a7 = new A7;
+        @A8 a8 = new A8;
+        @A9 a9 = new A9;
+        @A10 a10 = new A10;
+        @A11 a11 = new A11;
+        @A12 a12 = new A12;
+        @A13 a13 = new A13;
+        @A14 a14 = new A14;
+        @A15 a15 = new A15;
+        @A16 a16 = new A16;
+        @A17 a17 = new A17;
+        @A18 a18 = new A18;
+        @A19 a19 = new A19;
+        @A20 a20 = new A20;
+        @A21 a21 = new A21;
+        @A22 a22 = new A22;
+        @A23 a23 = new A23;
+        @A24 a24 = new A24;
+        @A25 a25 = new A25;
+        @A26 a26 = new A26;
+        @A27 a27 = new A27;
+        @A28 a28 = new A28;
+        @A29 a29 = new A29;
+        @A30 a30 = new A30;
+        @A31 a31 = new A31;
+        @A32 a32 = new A32;
+        @A33 a33 = new A33;
+        @A34 a34 = new A34;
+        @A35 a35 = new A35;
+        @A36 a36 = new A36;
+        @A37 a37 = new A37;
+        @A38 a38 = new A38;
+        @A39 a39 = new A39;
+
+        a0->next = a1;
+        a1->next = a2;
+        a2->next = a3;
+        a3->next = a4;
+        a4->next = a5;
+        a5->next = a6;
+        a6->next = a7;
+        a7->next = a8;
+        a8->next = a9;
+        a9->next = a10;
+        a10->next = a11;
+        a11->next = a12;
+        a12->next = a13;
+        a13->next = a14;
+        a14->next = a15;
+        a15->next = a16;
+        a16->next = a17;
+        a17->next = a18;
+        a18->next = a19;
+        a19->next = a20;
+        a20->next = a21;
+        a21->next = a22;
+        a22->next = a23;
+        a23->next = a24;
+        a24->next = a25;
+        a25->next = a26;
+        a26->next = a27;
+        a27->next = a28;
+        a28->next = a29;
+        a29->next = a30;
+        a30->next = a31;
+        a31->next = a32;
+        a32->next = a33;
+        a33->next = a34;
+        a34->next = a35;
+        a35->next = a36;
+        a36->next = a37;
+        a37->next = a38;
+        a38->next = a39;
+
+        a39->v = 7;
+        /* 沿链解引用几层：长链是普通结构，走到哪层都不该出事 */
+        if (a0->next->next->next->next->next != a5 || a39->v != 7)
+            err(1, "链上的值不对");
+        /* 40 个对象都活着：链是结构，不是环 */
+        if (__c6_gc_live() != 40)
+            err(1, "活对象数不是 40");
+    }
+    /* 局部量逆序退栈，头节点最后一个放手，整条链才级联释放 */
+    if (__c6_gc_live() != 0)
+        err(2, "长链没有释放干净");
+}

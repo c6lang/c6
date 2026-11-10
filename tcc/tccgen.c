@@ -20707,91 +20707,135 @@ static void c6_gc_emit_desc(C6GcType *gt)
    path that closes the loop, and the escape hatches are 'weak' (does not
    keep the target alive) and 'own' (exclusive, freed down the chain). */
 
-#define C6_GC_PATH_MAX 32
-static C6GcType *c6_gc_cycle_path[C6_GC_PATH_MAX] = {0};
-static int c6_gc_cycle_via[C6_GC_PATH_MAX] = {0}; /* the field used to get there */
+/* The walk is iterative and its path grows on demand.  A fixed-size path
+   buffer turns a long *acyclic* chain ('A0 -> A1 -> ... -> A40') into a
+   bogus "reference cycle" once the chain is deeper than the buffer, so the
+   only bound here is the number of types itself. */
 
-static void c6_gc_cycle_report(int from, int depth);
+typedef struct C6GcWalk {
+    C6GcType *gt;                 /* the node being expanded */
+    int next;                     /* the field to look at next */
+    int via;                      /* the field used to enter it */
+} C6GcWalk;
 
-/* 0 = no cycle found, 1 = a cycle was reported (compilation stops there) */
-static int c6_gc_cycle_dfs(C6GcType *gt, int depth)
+static C6GcWalk *c6_gc_walk = NULL;   /* the current path (the DFS stack) */
+static int c6_gc_walk_n = 0;
+static int c6_gc_walk_cap = 0;
+static int c6_gc_cycles = 0;          /* how many were reported so far */
+
+static void c6_gc_walk_push(C6GcType *gt, int via)
 {
-    int i = 0;
-
-    if (gt->mark == 2)
-        return 0;
-    if (gt->mark == 1) {
-        /* back edge: the path from GT to itself.  Report it, then mark every
-           node on the loop done so the same cycle is not reported again from
-           another entry point -- the compiler lists every disjoint cycle in
-           one go and stops at the end */
-        int i = 0;
-
-        c6_gc_cycle_report(gt->tag, depth);
-        for (i = 0; i < depth; i++)
-            if (c6_gc_cycle_path[i] && c6_gc_cycle_path[i]->mark == 1)
-                c6_gc_cycle_path[i]->mark = 2;
-        return 1;
+    if (c6_gc_walk_n >= c6_gc_walk_cap) {
+        c6_gc_walk_cap = c6_gc_walk_cap ? c6_gc_walk_cap * 2 : 32;
+        c6_gc_walk = tcc_realloc(c6_gc_walk,
+                                 c6_gc_walk_cap * (int)sizeof *c6_gc_walk);
     }
-    if (depth >= C6_GC_PATH_MAX) {
-        /* a chain longer than the buffer: report it as a whole */
-        c6_gc_cycle_report(gt->tag, depth);
-        return 1;
+    c6_gc_walk[c6_gc_walk_n].gt = gt;
+    c6_gc_walk[c6_gc_walk_n].next = 0;
+    c6_gc_walk[c6_gc_walk_n].via = via;
+    c6_gc_walk_n++;
+}
+
+/* A growable string: the cycle path has no length bound, so neither does the
+   message that prints it (a fixed buffer would cut a long loop in half). */
+typedef struct C6GcBuf {
+    char *p;
+    int len, cap;
+} C6GcBuf;
+
+static void c6_gc_buf_puts(C6GcBuf *b, const char *s)
+{
+    int n = (int)strlen(s);
+
+    if (b->len + n + 1 > b->cap) {
+        int cap = b->cap ? b->cap : 128;
+
+        while (b->len + n + 1 > cap)
+            cap *= 2;
+        b->p = tcc_realloc(b->p, cap);
+        b->cap = cap;
     }
-    gt->mark = 1;
-    c6_gc_cycle_path[depth] = gt;
-    for (i = 0; i < gt->nfields; i++) {
-        C6GcField *f = &gt->fields[i];
+    memcpy(b->p + b->len, s, n + 1);
+    b->len += n;
+}
+
+/* 'reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own''.
+   CLOSE is the index in the current path of the node the loop returns to,
+   CLOSE_VIA the field that closes it. */
+static void c6_gc_cycle_report(int close, int close_via)
+{
+    C6GcBuf b = {0};
+    int i = 0, depth = c6_gc_walk_n;
+    C6GcType *gt = c6_gc_walk[close].gt;
+    char *path = 0;
+
+    for (i = close; i < depth; i++) {
+        int via = i + 1 < depth ? c6_gc_walk[i + 1].via : close_via;
+
+        c6_gc_buf_puts(&b, get_tok_str(c6_gc_walk[i].gt->tag, NULL));
+        c6_gc_buf_puts(&b, " -");
+        c6_gc_buf_puts(&b, via ? get_tok_str(via, NULL) : "?");
+        c6_gc_buf_puts(&b, "-> ");
+    }
+    c6_gc_buf_puts(&b, get_tok_str(gt->tag, NULL));
+    path = b.p;
+    tcc_error_noabort("reference cycle: %s; break it with 'weak' or "
+                      "'own' (type '%s' at %s:%d)", path,
+                      get_tok_str(gt->tag, NULL),
+                      gt->src_file ? gt->src_file : "?", gt->src_line);
+    c6_gc_cycles++;
+    tcc_free(path);
+}
+
+/* walk the strong-reference graph from ROOT.  A back edge to a node that is
+   still on the path is a cycle: report it, then mark every node on the loop
+   done so the same cycle is not reported again from another entry point --
+   the compiler lists every disjoint cycle in one go and stops at the end. */
+static void c6_gc_cycle_walk(C6GcType *root)
+{
+    if (root->mark == 2)
+        return;
+    c6_gc_walk_n = 0;
+    root->mark = 1;
+    c6_gc_walk_push(root, 0);
+    while (c6_gc_walk_n > 0) {
+        C6GcWalk *w = &c6_gc_walk[c6_gc_walk_n - 1];
         C6GcType *to = 0;
+        C6GcField *f = 0;
+        int i = 0, close = -1;
 
+        if (w->next >= w->gt->nfields) {
+            if (w->gt->mark == 1)
+                w->gt->mark = 2;
+            c6_gc_walk_n--;
+            continue;
+        }
+        f = &w->gt->fields[w->next++];
         if (!f->to_tag)
             continue;               /* 'weak' and 'own' are not edges */
         to = c6_gc_type_find(f->to_tag);
         if (!to || !to->nfields)
             continue;
-        c6_gc_cycle_via[depth] = f->name_tok;
-        c6_gc_cycle_dfs(to, depth + 1);
-    }
-    if (gt->mark == 1)
-        gt->mark = 2;
-    return 0;
-}
-
-static int c6_gc_cycles = 0;          /* how many were reported so far */
-
-/* 'reference cycle: A -> B -> A; break it with 'weak' or 'own'' */
-static void c6_gc_cycle_report(int from, int depth)
-{
-    char buf[512] = {0};
-    int i = 0, start = 0, len = 0;
-
-    if (depth > C6_GC_PATH_MAX)
-        depth = C6_GC_PATH_MAX;
-    /* print from the first occurrence of the type that closes the loop */
-    for (i = 0; i < depth; i++)
-        if (c6_gc_cycle_path[i]->tag == from) {
-            start = i;
-            break;
+        if (to->mark == 2)
+            continue;
+        if (to->mark == 1) {
+            /* a back edge: the target is still on the path */
+            for (i = 0; i < c6_gc_walk_n; i++)
+                if (c6_gc_walk[i].gt == to) {
+                    close = i;
+                    break;
+                }
+            if (close < 0)              /* cannot happen: mark 1 means stacked */
+                continue;
+            c6_gc_cycle_report(close, f->name_tok);
+            for (i = close; i < c6_gc_walk_n; i++)
+                c6_gc_walk[i].gt->mark = 2;
+            continue;
         }
-    buf[0] = 0;
-    for (i = start; i < depth; i++) {
-        len += snprintf(buf + len, sizeof buf - len, "%s -%s-> ",
-                        get_tok_str(c6_gc_cycle_path[i]->tag, NULL),
-                        c6_gc_cycle_via[i]
-                            ? get_tok_str(c6_gc_cycle_via[i], NULL) : "?");
-        if (len >= (int)sizeof buf - 8)
-            break;
+        to->mark = 1;
+        c6_gc_walk_push(to, f->name_tok);
     }
-    snprintf(buf + len, sizeof buf - len, "%s", get_tok_str(from, NULL));
-    {
-        C6GcType *gt = c6_gc_cycle_path[start];
-
-        tcc_error_noabort("reference cycle: %s; break it with 'weak' or "
-                          "'own' (type '%s' at %s:%d)", buf,
-                          get_tok_str(gt->tag, NULL),
-                          gt->src_file ? gt->src_file : "?", gt->src_line);
-        c6_gc_cycles++;
-    }
+    c6_gc_walk_n = 0;
 }
 
 /* ---- the type graph, for the link-time check ------------------------- */
@@ -20884,8 +20928,11 @@ static void c6_gc_cycle_check(void)
     for (i = 0; i < tcc_state->c6_nb_gc_types; i++) {
         C6GcType *gt = tcc_state->c6_gc_types[i];
         if (gt && gt->nfields && gt->mark != 2)
-            c6_gc_cycle_dfs(gt, 0);
+            c6_gc_cycle_walk(gt);
     }
+    tcc_free(c6_gc_walk);
+    c6_gc_walk = NULL;
+    c6_gc_walk_n = c6_gc_walk_cap = 0;
     if (c6_gc_cycles)
         tcc_error("%d reference cycle(s): counting cannot free them", 
                   c6_gc_cycles);
