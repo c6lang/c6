@@ -641,6 +641,7 @@ static int c99_global_data(ElfSym *e)
 static void c99_add_decl(const char *name, const char *text);
 static int c99_is_c_ident(const char *s);
 static int c99_small_sret(CType *ret, CType *rt, int *align, int *regsize);
+static int c99_direct_sret(CType *ret);
 
 /* The va_list walker the generated file header defines (see c99_output_file).
    The front-end expands va_arg() into a call of tcc's own built-in helper
@@ -1022,6 +1023,11 @@ static void c99_register_decl(Sym *fsym, CType *ftype)
         if (c99_small_sret(ret, &srt, &sal, &srs)) {
             c99_type(tbuf, sizeof tbuf, &srt);
             n += snprintf(text + n, sizeof text - n, "%s %s(", tbuf, name);
+        } else if (c99_direct_sret(ret)) {
+            /* 9..16 byte integer-class struct: returned by value, so the
+               declaration matches a plain C prototype for the same struct */
+            c99_type(tbuf, sizeof tbuf, ret);
+            n += snprintf(text + n, sizeof text - n, "%s %s(", tbuf, name);
         } else {
             /* large struct returns use a hidden first pointer parameter */
             n += snprintf(text + n, sizeof text - n,
@@ -1199,6 +1205,26 @@ static int c99_small_sret(CType *ret, CType *rt, int *align, int *regsize)
 {
     return (ret->t & VT_BTYPE) == VT_STRUCT
         && gfunc_sret(ret, 0, rt, align, regsize) > 0;
+}
+
+/* SysV returns a struct of at most 16 bytes in registers when every eightbyte
+   is INTEGER class; a struct of 9..16 such bytes therefore comes back in
+   rax:rdx, just like two integers.  The generated C can express that return
+   directly: the host compiler applies the very same rule, so no hidden result
+   pointer is needed and the function stays callable from plain C.
+
+   Structs with a floating-point member are excluded: the generated C struct
+   is a byte blob (a struct of type is opaque here), which the host compiler
+   would classify as INTEGER and return in rax:rdx while the native backend
+   returns it in xmm0/xmm1.  Those keep the hidden-pointer convention. */
+static int c99_direct_sret(CType *ret)
+{
+    int size, align;
+
+    if ((ret->t & VT_BTYPE) != VT_STRUCT)
+        return 0;
+    size = type_size(ret, &align);
+    return size > 8 && size <= 16 && c99_struct_int_class(ret);
 }
 
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int *regsize)
@@ -1601,6 +1627,14 @@ ST_FUNC int classify_x86_64_va_arg(CType *ty)
 /* ====================================================================== */
 /* functions                                                               */
 
+/* the struct return of the function currently being emitted, when it comes
+   back in registers (see c99_direct_sret()): the value lives in the frame at
+   c99_direct_sret_off and the epilogue returns it by value, so that the host
+   compiler emits the SysV register moves for us */
+static int c99_direct_sret_cur;
+static int c99_direct_sret_off;
+static int c99_direct_sret_id;
+
 ST_FUNC void gfunc_prolog(Sym *func_sym)
 {
     CType *ftype = &func_sym->type;
@@ -1631,7 +1665,8 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     int sret_align, sret_regsize;
     int small_sret = ret_struct
         && c99_small_sret(ret, &sret_rt, &sret_align, &sret_regsize);
-    int hidden_sret = ret_struct && !small_sret;
+    int direct_sret = ret_struct && !small_sret && c99_direct_sret(ret);
+    int hidden_sret = ret_struct && !small_sret && !direct_sret;
 
     if (is_main && !(tcc_state && tcc_state->c6_test_mode))
         c99_have_main = 1;
@@ -1642,6 +1677,9 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     c99_lab_gen++;
     loc = 0;
     func_vc = 0;
+    c99_direct_sret_cur = direct_sret;
+    c99_direct_sret_off = 0;
+    c99_direct_sret_id = 0;
 
     /* A variadic function keeps the 24 bytes at the top of the frame for its
        va_list, exactly where 'frame_address(0) - 24' points: the front-end's
@@ -1652,10 +1690,21 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 
     /* If the function returns a struct, the caller passes a hidden pointer
        to the result storage as the first argument; keep it in a local slot so
-       that the front-end's return sequence can store through it. */
-    if (hidden_sret) {
+       that the front-end's return sequence can store through it.  The
+       register-return case has no such argument: the buffer is a frame slot
+       of this function and the slot is pointed at it instead. */
+    if (hidden_sret || direct_sret) {
         loc = (loc - PTR_SIZE) & -PTR_SIZE;
         func_vc = loc;
+    }
+    if (direct_sret) {
+        int ret_size = type_size(ret, &align);
+
+        if (align > MAX_ALIGN)
+            align = MAX_ALIGN;
+        loc = (loc - ret_size) & -align;
+        c99_direct_sret_off = loc;
+        c99_direct_sret_id = c99_struct_id(ret->ref);
     }
 
     n = 0;
@@ -1707,6 +1756,11 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 
     if (hidden_sret)
         c99_printf("memcpy(%s + (%d), &__c99_ret, %d);\n",
+                   c99_frmexpr(), func_vc, PTR_SIZE);
+    else if (direct_sret)
+        c99_printf("{ void *__c99_retp = (void *)(%s + (%d));"
+                   " memcpy(%s + (%d), &__c99_retp, %d); }\n",
+                   c99_frmexpr(), c99_direct_sret_off,
                    c99_frmexpr(), func_vc, PTR_SIZE);
 
     idx = 0;
@@ -1811,6 +1865,7 @@ static void c99_call_cast(char *buf, int size, CType *ftype)
     int sal, srs;
     int ret_struct = (ret->t & VT_BTYPE) == VT_STRUCT;
     int small_sret = ret_struct && c99_small_sret(ret, &srt, &sal, &srs);
+    int direct_sret = ret_struct && !small_sret && c99_direct_sret(ret);
     int n = 0;
 
     if (small_sret) {
@@ -1818,6 +1873,11 @@ static void c99_call_cast(char *buf, int size, CType *ftype)
            pointer, and the call has to be cast to that very type, exactly
            like the direct call (gfunc_call()/gfunc_prolog() agree) */
         c99_type(rb, sizeof rb, &srt);
+        c99_params(ps, sizeof ps, fs);
+    } else if (direct_sret) {
+        /* 9..16 byte integer-class struct: the generated C returns it by
+           value, so the cast keeps the struct type and no hidden pointer */
+        c99_type(rb, sizeof rb, ret);
         c99_params(ps, sizeof ps, fs);
     } else if (ret_struct) {
         snprintf(rb, sizeof rb, "void");
@@ -1839,12 +1899,12 @@ ST_FUNC void gfunc_call(int nb_args)
     Sym *fsym = callee->type.ref;
     Sym *ps;
     CType *ret;
-    char argbuf[8192], vbuf[C99_TB], tbuf[C99_TB];
+    char argbuf[8192], vbuf[C99_TB], tbuf[C99_TB], retbuf[C99_TB];
     /* large enough for the indirect form:
        "((tbuf)__c99_fp(vbuf))(argbuf)" */
     char sig[sizeof argbuf + 2 * C99_TB + 32];
-    int i, n = 0, is_helper = 0, is_indirect, ret_struct, have_proto, int_ret;
-    int small_sret = 0;
+    int i, n = 0, na = 0, is_helper = 0, is_indirect, ret_struct, have_proto, int_ret;
+    int small_sret = 0, direct_sret = 0;
     const char *cname = NULL;
     CType void_p, small_sret_type;
 
@@ -1882,19 +1942,22 @@ ST_FUNC void gfunc_call(int nb_args)
         int sal, srs;
         small_sret = (ret->t & VT_BTYPE) == VT_STRUCT
             && c99_small_sret(ret, &small_sret_type, &sal, &srs);
-        ret_struct = (ret->t & VT_BTYPE) == VT_STRUCT && !small_sret;
+        direct_sret = (ret->t & VT_BTYPE) == VT_STRUCT && !small_sret
+            && c99_direct_sret(ret);
+        ret_struct = (ret->t & VT_BTYPE) == VT_STRUCT && !small_sret
+            && !direct_sret;
     }
     int_ret = is_helper && cname && c99_rt_int_ret(cname);
 
     save_regs(nb_args);
 
     /* the front-end pushes the hidden struct-return buffer as argument 0 */
-    argbuf[0] = 0;
+    argbuf[0] = retbuf[0] = 0;
     ps = fsym->next;
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[-nb_args + 1 + i];
         CType *pt = NULL;
-        if (!ret_struct || i > 0) {
+        if (!(ret_struct || direct_sret) || i > 0) {
             if (ps)
                 pt = &ps->type;
             if (ps)
@@ -1903,9 +1966,16 @@ ST_FUNC void gfunc_call(int nb_args)
             void_p.t = VT_PTR;
             void_p.ref = NULL;
             pt = &void_p;
+            if (direct_sret) {
+                /* register-returned struct: the buffer is not a parameter of
+                   the generated C call, it is the assignment target */
+                c99_arg(retbuf, sizeof retbuf, sv, pt);
+                continue;
+            }
         }
         c99_arg(vbuf, sizeof vbuf, sv, pt);
-        n += snprintf(argbuf + n, sizeof argbuf - n, "%s%s", i ? ", " : "", vbuf);
+        n += snprintf(argbuf + n, sizeof argbuf - n, "%s%s",
+                      na++ ? ", " : "", vbuf);
     }
 
     if (is_indirect) {
@@ -1928,6 +1998,12 @@ ST_FUNC void gfunc_call(int nb_args)
 
     if (small_sret)
         c99_printf("__c99_r[0].i = (long long)%s;\n", sig);
+    else if (direct_sret)
+        /* the callee returns the struct in registers; the caller's buffer is
+           filled here, exactly where the front-end's hidden-pointer call
+           would have stored it */
+        c99_printf("*(__c99_s%d *)(%s) = %s;\n",
+                   c99_struct_id(ret->ref), retbuf, sig);
     else if (ret_struct || (ret->t & VT_BTYPE) == VT_VOID)
         c99_printf("%s;\n", sig);
     else if (is_helper && !have_proto)
@@ -2000,6 +2076,12 @@ ST_FUNC void gfunc_epilog(void)
             c99_type(st, sizeof st, &srt);
             snprintf(tmp, sizeof tmp, "return (%s)__c99_r[%d].%s;\n",
                      st, c99_ret_reg(srt.t), c99_regmem(srt.t));
+            buf_puts(&out, tmp);
+        } else if (c99_direct_sret_cur) {
+            /* the front-end stored the value into the frame buffer; hand it
+               back by value so the host compiler moves it into rax:rdx */
+            snprintf(tmp, sizeof tmp, "return *(__c99_s%d *)(%s + (%d));\n",
+                     c99_direct_sret_id, c99_frmexpr(), c99_direct_sret_off);
             buf_puts(&out, tmp);
         } else {
             buf_puts(&out, "return;\n");

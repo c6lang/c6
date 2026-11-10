@@ -1774,9 +1774,13 @@ files that way.
 
 Structs of at most eight bytes containing only integer/pointer fields use the
 x86-64 register-return ABI, so they interoperate with plain C (`tests/abi/`).
-Other struct returns use a hidden result pointer chosen by this back-end:
-that is consistent between c6 translation units, and for structs larger than
-16 bytes it also matches the native ABI, but mixing 9--16 byte struct returns
+Structs of 9--16 bytes whose fields are all integers/pointers do too: the
+generated C returns them by value, so the host compiler puts them in
+`rax:rdx`, exactly like the native backend (`tests/abi/sret12.c`). Structs
+with a floating-point field, and structs larger than 16 bytes, use a hidden
+result pointer chosen by this back-end: that is consistent between c6
+translation units, and for structs larger than 16 bytes it also matches the
+native ABI, but mixing a 9--16 byte struct that contains `float`/`double`
 with plain C is not supported.
 
 Not supported (each gives a clear error instead of miscompiling): computed

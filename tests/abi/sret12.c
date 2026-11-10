@@ -1,0 +1,69 @@
+/* 9--16 字节 struct 返回值（纯整数成员）的 ABI 兼容性（c6 侧）
+ *
+ * SysV 规定：每个 eightbyte 都是 INTEGER class 的 struct，只要不超过 16
+ * 字节就按寄存器返回（rax:rdx）。原生后端一直这么做；C99 输出后端原来把
+ * 9--16 字节的 struct 也走隐藏返回指针，于是和纯 C 混用时会踩坏栈。
+ *
+ * tests/run-tests.sh 把本文件用 -std=c6 编译，把同目录的 sret12_plain.c 用
+ * 纯 C 编译（不带 -std=c6），再链接起来运行；两种后端都要按同一个退出码
+ * 通过。
+ */
+// EXIT 0
+
+struct S9  { char a[9]; };
+struct S12 { int a, b, c; };
+struct S16 { int a, b, c, d; };
+
+/* 定义在纯 C 的翻译单元里 */
+struct S9  plain_mk9(int x);
+struct S12 plain_mk12(int x);
+struct S16 plain_mk16(int x);
+extern struct S12 (*plain_fp12)(int);
+
+/* 定义在本翻译单元，纯 C 侧按同样的 struct 调用 */
+struct S9 c6_mk9(int x)
+{
+    struct S9 s = {{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'}};
+    int i = 0;
+
+    for (i = 0; i < 9; i++)
+        s.a[i] = (char)(x + i);
+    return s;
+}
+
+struct S12 c6_mk12(int x)
+{
+    return (struct S12){x, x + 1, x + 2};
+}
+
+struct S16 c6_mk16(int x)
+{
+    return (struct S16){x, x + 1, x + 2, x + 3};
+}
+
+/* 纯 C 侧调用的检查入口：返回 0 表示全部通过 */
+int c6_check(void)
+{
+    struct S9 a = plain_mk9(3);
+    struct S12 b = plain_mk12(1);
+    struct S16 c = plain_mk16(2);
+
+    if (b.a != 1 || b.b != 2 || b.c != 3)
+        return 1;
+    if (c.a != 2 || c.b != 3 || c.c != 4 || c.d != 5)
+        return 2;
+    {
+        int i = 0;
+        for (i = 0; i < 9; i++)
+            if (a.a[i] != 3 + i)
+                return 3;
+    }
+    /* 间接调用：函数指针的返回类型也是 struct */
+    {
+        struct S12 d = plain_fp12(4);
+
+        if (d.a != 4 || d.b != 5 || d.c != 6)
+            return 4;
+    }
+    return 0;
+}
