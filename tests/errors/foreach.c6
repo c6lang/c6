@@ -1,17 +1,16 @@
-/* c6 编译期诊断：'foreach |i, v| a { ... }'
+/* c6 编译期诊断：'foreach ((size_t i, int v) = a) { ... }'
  *
  * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
  * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
  * 不带任何 -D 时是本文件的“正常路径”，必须编译通过并运行成功。
  */
+#include <stddef.h>
+
 struct S;
 extern int unknown[];
 
-// EXPECT test_one_binder: error: an array or slice yields an index and a value: write 'foreach ((size_t i, T v) = a) { ... }'
 // EXPECT test_two_binders_range: error: a range yields only an index: write 'foreach (size_t i = lo:hi) { ... }'
 // EXPECT test_both_discard: error: 'foreach' discards both binders
-// EXPECT test_three_binders: error: 'foreach' takes at most two bindings
-// EXPECT test_no_name: error: 'foreach' expects a binding name
 // EXPECT test_pointer: error: cannot iterate over 'int *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
 // EXPECT test_int: error: cannot iterate over 'int' (write a range: 'foreach (size_t i = lo:hi) { ... }')
 // EXPECT test_struct: error: cannot iterate over 'struct S' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
@@ -22,23 +21,14 @@ extern int unknown[];
 // EXPECT test_float_range: error: range bounds must be integers
 // EXPECT test_no_block: error: '{' expected
 // EXPECT test_no_block_range: error: '{' expected
-// EXPECT test_array_element: error: 'foreach' cannot copy an element of type 'int [2]'
+// EXPECT test_array_element: error: a 'foreach' binding cannot be an array
 // EXPECT test_file_scope: error: 'foreach' can only be used inside a function
 
-#if defined test_one_binder
-int main(void)
-{
-    int a[2] = { 1, 2 };
-    foreach |i| a {
-        a[0] = i;
-    }
-    return a[0];
-}
-#elif defined test_two_binders_range
+#if defined test_two_binders_range
 int main(void)
 {
     int total = 0;
-    foreach |i, v| 0:2 {
+    foreach ((size_t i, int v) = 0:2) {
         total += i + v;
     }
     return total;
@@ -47,25 +37,7 @@ int main(void)
 int main(void)
 {
     int a[2] = { 1, 2 };
-    foreach |_, _| a {
-        a[0] = 0;
-    }
-    return a[0];
-}
-#elif defined test_three_binders
-int main(void)
-{
-    int a[2] = { 1, 2 };
-    foreach |i, v, w| a {
-        a[0] = i + v + w;
-    }
-    return a[0];
-}
-#elif defined test_no_name
-int main(void)
-{
-    int a[2] = { 1, 2 };
-    foreach | | a {
+    foreach ((size_t _, int _) = a) {
         a[0] = 0;
     }
     return a[0];
@@ -75,7 +47,7 @@ int main(void)
 {
     int a[2] = { 1, 2 };
     int *p = a;
-    foreach |i, v| p {
+    foreach ((size_t i, int v) = p) {
         a[0] = i + v;
     }
     return a[0];
@@ -84,7 +56,7 @@ int main(void)
 int main(void)
 {
     int n = 2;
-    foreach |i, v| n {
+    foreach ((size_t i, int v) = n) {
         n += i + v;
     }
     return n;
@@ -93,7 +65,7 @@ int main(void)
 int main(void)
 {
     struct S *ps = 0;
-    foreach |i, v| *ps {
+    foreach ((size_t i, int v) = *ps) {
         ps = (struct S *)(long)(i + v);
     }
     return ps != 0;
@@ -102,7 +74,7 @@ int main(void)
 int main(void)
 {
     struct S *ps = 0;
-    foreach |i, v| ps {
+    foreach ((size_t i, int v) = ps) {
         ps = (struct S *)(long)(i + v);
     }
     return ps != 0;
@@ -112,7 +84,7 @@ int main()
 {
     int n = 2;
     int a[n];
-    foreach |i, v| a {
+    foreach ((size_t i, int v) = a) {
         a[0] = i + v;
     }
     return a[0];
@@ -120,7 +92,7 @@ int main()
 #elif defined test_unknown_length
 int main(void)
 {
-    foreach |i, v| unknown {
+    foreach ((size_t i, int v) = unknown) {
         return i + v;
     }
     return 0;
@@ -128,7 +100,7 @@ int main(void)
 #elif defined test_float_range
 int main(void)
 {
-    foreach |i| 0.0:2.0 {
+    foreach (int i = 0.0:2.0) {
         return i;
     }
     return 0;
@@ -137,16 +109,16 @@ int main(void)
 int main(void)
 {
     int a[2] = { 1, 2 };
-    foreach |i, v| a
+    foreach ((size_t i, int v) = a)
         a[0] = i + v;
     return a[0];
 }
 #elif defined test_no_block_range
 int main(void)
 {
-    /* 区间分支也要走同一条 '{' 检查（C50）：绑定表只有 1 个、没有元素类型，
+    /* 区间分支也要走同一条 '{' 检查（C50）：单绑定头走的是区间路径，
        所以它和数组/切片形态是两条独立的解析路径。 */
-    foreach |i| 0:2
+    foreach (int i = 0:2)
         return i;
     return 0;
 }
@@ -154,14 +126,14 @@ int main(void)
 int main(void)
 {
     int a[2][2] = { { 1, 2 }, { 3, 4 } };
-    foreach |i, v| a {
+    foreach ((size_t i, int v[2]) = a) {
         a[0][0] = i + v[0];
     }
     return a[0][0];
 }
 #elif defined test_file_scope
 int a[2] = { 1, 2 };
-foreach |i, v| a {
+foreach ((size_t i, int v) = a) {
     a[0] = i + v;
 }
 #else
@@ -171,7 +143,7 @@ struct P { int x, y; };
 static int sum(int[:] s)
 {
     int total = 0;
-    foreach |i, v| s {
+    foreach ((size_t i, int v) = s) {
         total += (int)i + v;
     }
     return total;
@@ -183,13 +155,13 @@ int main(void)
     struct P ps[2] = { { 1, 2 }, { 3, 4 } };
     int total = 0;
 
-    foreach |i, v| a {
+    foreach ((size_t i, int v) = a) {
         total += v;
     }
-    foreach |i| 1:3 {
+    foreach (int i = 1:3) {
         total += i;
     }
-    foreach |i, p| ps {
+    foreach ((size_t i, struct P p) = ps) {
         total += (int)i + p.y;
     }
     if (total != 6 + 1 + 2 + 0 + 2 + 1 + 4)

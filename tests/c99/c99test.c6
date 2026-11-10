@@ -484,7 +484,7 @@ test "切片与 foreach" {
     if (a[1] != 20)
         err(2, "通过切片写入没有落到数组");
 
-    foreach |i, v| a {
+    foreach ((size_t i, int v) = a) {
         if ((int)i != count)
             err(3, "foreach 下标不连续");
         total += v;
@@ -494,14 +494,14 @@ test "切片与 foreach" {
         err(4, "数组 foreach 不对");
 
     total = 0;
-    foreach |i| 0:4 {
+    foreach (int i = 0:4) {
         total += (int)i;
     }
     if (total != 6)
         err(5, "区间 foreach 不对");
 
     total = 0;
-    foreach |_, v| s {
+    foreach ((size_t _, int v) = s) {
         total += v;
     }
     if (total != 27)

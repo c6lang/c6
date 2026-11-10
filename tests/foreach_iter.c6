@@ -1,4 +1,4 @@
-/* c6 自测：'foreach |v| it { ... }' 迭代器协议
+/* c6 自测：'foreach (T v = it) { ... }' 迭代器协议
  *
  * 可迭代对象是“提供了 has()/next() 的东西”：
  *   - 结构体/联合体的值               （状态复制到隐藏槽）
@@ -84,7 +84,7 @@ int next(struct Steps *s)
 static int sum_iter(IntIter it)
 {
     int total = 0;
-    foreach |v| it {
+    foreach (int v = it) {
         total += v;
     }
     return total;
@@ -183,7 +183,7 @@ int next(struct MCount *s)
 static int sum_borrow(@MCount p)
 {
     int total = 0;
-    foreach |v| p {
+    foreach (int v = p) {
         total += v;
     }
     return total;
@@ -208,7 +208,7 @@ async int sum_await(int n)
     struct Countdown c = {0};
     int total = 0;
     c.n = n;
-    foreach |v| c {
+    foreach (int v = c) {
         total += await add(v, 0);
     }
     return total;
@@ -219,7 +219,7 @@ async int sum_await(int n)
 test "值形态：从 n 倒数到 1，原对象保持副本语义" {
     struct Countdown c = {3};
     int total = 0, n = 0;
-    foreach |v| c {
+    foreach (int v = c) {
         if (v != 3 - n)
             err(1, "迭代值不对");
         total += v;
@@ -234,7 +234,7 @@ test "值形态：从 n 倒数到 1，原对象保持副本语义" {
 test "数组的元素类型本身是迭代器时，仍按数组迭代" {
     struct Countdown cs[2] = {{1}, {2}};
     int total = 0;
-    foreach |i, v| cs {
+    foreach ((size_t i, struct Countdown v) = cs) {
         total += v.n * (int)(i + 1);
     }
     if (total != 5)
@@ -244,7 +244,7 @@ test "数组的元素类型本身是迭代器时，仍按数组迭代" {
 test "指针形态：迭代器状态就在原对象里" {
     struct Countdown c = {3};
     int total = 0;
-    foreach |v| &c {
+    foreach (int v = &c) {
         total += v;
     }
     if (total != 6)
@@ -267,7 +267,7 @@ test "接口值：vtable 分派，self 指向原对象" {
 test "元素是结构体：绑定是 next() 返回值的副本" {
     struct Pairs ps = {0};
     int n = 0;
-    foreach |p| ps {
+    foreach (struct Pair p = ps) {
         if (p.a != n || p.b != n + 1)
             err(1, "结构体元素的值不对");
         p.a = 99;
@@ -286,7 +286,7 @@ test "元素是指针：绑定就是 next() 的返回值" {
     ws.p = w;
     ws.i = 0;
     ws.n = 3;
-    foreach |s| ws {
+    foreach (char *s = ws) {
         if (strcmp(s, w[n]) != 0)
             err(1, "指针元素不对");
         n++;
@@ -298,7 +298,7 @@ test "元素是指针：绑定就是 next() 的返回值" {
 test "'_' 绑定仍然推进迭代器" {
     struct Ticks t = {3};
     int n = 0;
-    foreach |_| t {
+    foreach (int _ = t) {
         n++;
     }
     if (n != 3 || t.n != 3)
@@ -308,7 +308,7 @@ test "'_' 绑定仍然推进迭代器" {
 test "托管元素：值绑定与 '_' 都不泄漏" {
     struct MIt it = {0};
     int total = 0;
-    foreach |v| it {
+    foreach (@MNode v = it) {
         total += v->v;
     }
     if (total != 1)
@@ -316,7 +316,7 @@ test "托管元素：值绑定与 '_' 都不泄漏" {
     if (__c6_gc_live() != 0)
         err(2, "值绑定泄漏了托管对象");
     it.i = 0;
-    foreach |_| it {
+    foreach (@MNode _ = it) {
     }
     if (__c6_gc_live() != 0)
         err(3, "'_' 绑定泄漏了 next() 的返回值");
@@ -326,7 +326,7 @@ test "托管迭代器：own 与 borrow 的隐藏槽" {
     @MCount p = new MCount;
     int total = 0;
     p->n = 3;
-    foreach |v| p {
+    foreach (int v = p) {
         total += v;
     }
     if (total != 6 || p->n != 0)
@@ -341,7 +341,7 @@ test "托管迭代器：own 与 borrow 的隐藏槽" {
 
 test "托管临时迭代器：隐藏槽接管所有权" {
     int total = 0;
-    foreach |v| make_mcount(2) {
+    foreach (int v = make_mcount(2)) {
         total += v;
     }
     if (total != 3)
@@ -357,7 +357,7 @@ test "数组的托管元素绑定也不泄漏" {
     a[1] = new MNode;
     a[0]->v = 0;
     a[1]->v = 1;
-    foreach |i, v| a {
+    foreach ((size_t i, @MNode v) = a) {
         total += v->v + (int)i;
     }
     if (total != 2)
@@ -371,13 +371,13 @@ test "数组的托管元素绑定也不泄漏" {
 test "union 迭代器：值形态与指针形态" {
     union UCount u = {3};
     int total = 0;
-    foreach |v| u {
+    foreach (int v = u) {
         total += v;
     }
     if (total != 6 || u.n != 3)
         err(1, "union 值形态不对");
     total = 0;
-    foreach |v| &u {
+    foreach (int v = &u) {
         total += v;
     }
     if (total != 6 || u.n != 0)
@@ -387,7 +387,7 @@ test "union 迭代器：值形态与指针形态" {
 test "跨 TU 的 has()/next() 原型" {
     struct CrossIt c = {3};
     int total = 0;
-    foreach |v| &c {
+    foreach (int v = &c) {
         total += v;
     }
     if (total != 6 || c.n != 0)
@@ -397,7 +397,7 @@ test "跨 TU 的 has()/next() 原型" {
 test "可迭代值只求值一次" {
     int total = 0;
     calls = 0;
-    foreach |v| make(2) {
+    foreach (int v = make(2)) {
         total += v;
     }
     if (calls != 1)
@@ -409,7 +409,7 @@ test "可迭代值只求值一次" {
 test "has() 首次为假：零次迭代" {
     struct Countdown c = {0};
     int n = 0;
-    foreach |v| c {
+    foreach (int v = c) {
         n += v;
     }
     if (n != 0)
@@ -419,7 +419,7 @@ test "has() 首次为假：零次迭代" {
 test "无限迭代器 + break" {
     struct Naturals nat = {0};
     int total = 0;
-    foreach |v| &nat {
+    foreach (int v = &nat) {
         total += v;
         if (v >= 5)
             break;
@@ -433,7 +433,7 @@ test "无限迭代器 + break" {
 test "continue 回到 has() 判断" {
     struct Countdown c = {5};
     int total = 0;
-    foreach |v| c {
+    foreach (int v = c) {
         if (v & 1)
             continue;
         total += v;
@@ -445,7 +445,7 @@ test "continue 回到 has() 判断" {
 test "defer 与 for 一致" {
     struct Countdown c = {3};
     int count = 0;
-    foreach |v| c {
+    foreach (int v = c) {
         (void)v;
         defer count++;
     }
@@ -456,7 +456,7 @@ test "defer 与 for 一致" {
 test "绑定不泄漏到外层" {
     int v = 7;
     struct Countdown c = {1};
-    foreach |v| c {
+    foreach (int v = c) {
         if (v != 1)
             err(1, "绑定值不对");
     }
@@ -467,10 +467,10 @@ test "绑定不泄漏到外层" {
 test "嵌套：迭代器里套迭代器" {
     struct Countdown outer = {2};
     int total = 0;
-    foreach |x| outer {
+    foreach (int x = outer) {
         struct Countdown inner = {0};
         inner.n = x;
-        foreach |y| inner {
+        foreach (int y = inner) {
             total += y;
         }
     }

@@ -1,9 +1,11 @@
-/* c6 编译期诊断：'foreach |v| it { ... }' 迭代器协议
+/* c6 编译期诊断：'foreach (T v = it) { ... }' 迭代器协议
  *
  * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
  * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
  * 不带任何 -D 时是本文件的“正常路径”，必须编译通过并运行成功。
  */
+#include <stddef.h>
+
 struct Good { int n; };
 int has(struct Good *s) { return s->n > 0; }
 int next(struct Good *s) { return s->n--; }
@@ -79,7 +81,7 @@ struct Holder next(struct HIt *s);
 int main(void)
 {
     struct Good g = {2};
-    foreach |i, v| g {
+    foreach ((size_t i, int v) = g) {
         g.n = i + v;
     }
     return g.n;
@@ -88,7 +90,7 @@ int main(void)
 int main(void)
 {
     struct OnlyHas x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = v;
     }
     return x.n;
@@ -98,7 +100,7 @@ int main(void)
 {
     struct Shadow x = {0};
     x.n = 2;
-    foreach |v| x {
+    foreach (int v = x) {
         x.has = v;
     }
     return x.has;
@@ -107,7 +109,7 @@ int main(void)
 int main(void)
 {
     struct HasVoid x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = v;
     }
     return x.n;
@@ -116,7 +118,7 @@ int main(void)
 int main(void)
 {
     struct HasStruct x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = v;
     }
     return x.n;
@@ -125,7 +127,7 @@ int main(void)
 int main(void)
 {
     struct HasExtra x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = v;
     }
     return x.n;
@@ -134,7 +136,7 @@ int main(void)
 int main(void)
 {
     struct NextVoid x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = 1;
     }
     return x.n;
@@ -143,7 +145,7 @@ int main(void)
 int main(void)
 {
     struct NextVoidPtr x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = 1;
     }
     return x.n;
@@ -152,7 +154,7 @@ int main(void)
 int main(void)
 {
     struct NextExtra x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = v;
     }
     return x.n;
@@ -161,7 +163,7 @@ int main(void)
 int main(void)
 {
     struct NextArr x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = 1;
     }
     return x.n;
@@ -170,7 +172,7 @@ int main(void)
 int main(void)
 {
     struct NextInc x = {2};
-    foreach |v| x {
+    foreach (int v = x) {
         x.n = 1;
     }
     return x.n;
@@ -179,7 +181,7 @@ int main(void)
 static int sum(VoidPtrI it)
 {
     int total = 0;
-    foreach |v| it {
+    foreach (void *v = it) {
         total += 1;
     }
     return total;
@@ -193,7 +195,7 @@ int main(void)
 int main(void)
 {
     struct HIt it = {0};
-    foreach |v| it {
+    foreach (struct Holder v = it) {
         return v.n->v;
     }
     return 0;
@@ -203,23 +205,23 @@ int main(void)
 {
     struct Good ga[2] = {{1}, {2}};
     struct Good (*gp)[2] = &ga;
-    foreach |v| gp {
+    foreach (int v = gp) {
         return v.n;
     }
     return 0;
 }
 #elif defined test_file_scope
 struct Good g = {2};
-foreach |v| g {
+foreach (int v = g) {
     g.n = v;
 }
 #elif defined test_no_block
 int main(void)
 {
-    /* 迭代器分支同样要过 C50：循环体必须是块，'foreach |v| it' 只是绑定表
+    /* 迭代器分支同样要过 C50：循环体必须是块，'foreach (int v = g)' 只是头
        加可迭代对象，写全要带 '{ ... }'。 */
     struct Good g = {2};
-    foreach |v| g
+    foreach (int v = g)
         return v;
     return 0;
 }
@@ -230,7 +232,7 @@ interface IntIter { int has(); int next(); }
 static int sum_iter(IntIter it)
 {
     int total = 0;
-    foreach |v| it {
+    foreach (int v = it) {
         total += v;
     }
     return total;
@@ -240,12 +242,12 @@ int main(void)
 {
     struct Good g = {3};
     int total = 0;
-    foreach |v| g {
+    foreach (int v = g) {
         total += v;
     }
     if (total != 6)
         return 1;
-    foreach |v| &g {
+    foreach (int v = &g) {
         total += v;
     }
     if (total != 12 || g.n != 0)

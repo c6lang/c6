@@ -470,7 +470,7 @@
 `BACKEND=c99 tests/run-tests.sh` 52 通过、`make test-plain` 绿。
 
 > 上面各阶段验收记录里的数字是**当时的用例数**，随用例增加而增长；当前全量入口是
-> `make check-all`，selftest 与 C99 后端各 99 通过（417 个 test 块、289 条编译期诊断）。
+> `make check-all`，selftest 与 C99 后端各 100 通过（418 个 test 块、287 条编译期诊断）。
 
 ---
 

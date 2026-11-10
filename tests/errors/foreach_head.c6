@@ -9,6 +9,7 @@ struct It { int i, n; };
 static int has(struct It *s) { return s->i < s->n; }
 static int next(struct It *s) { return s->i++; }
 
+// EXPECT test_old_syntax: error: 'foreach' needs a parenthesised head now
 // EXPECT test_no_type: error: a type name expected in the head of 'foreach'
 // EXPECT test_no_name: error: identifier expected
 // EXPECT test_void_binding: error: a 'foreach' binding cannot be 'void'
@@ -19,7 +20,17 @@ static int next(struct It *s) { return s->i++; }
 // EXPECT test_ownership: error: a 'foreach' binding cannot change ownership
 // EXPECT test_file_scope: error: 'foreach' can only be used inside a function
 
-#if defined test_no_type
+#if defined test_old_syntax
+int main(void)
+{
+    int a[2] = { 1, 2 };
+    foreach |i| 0:2 {
+        (void)i;
+    }
+    (void)a;
+    return 0;
+}
+#elif defined test_no_type
 int main(void)
 {
     int a[2] = { 1, 2 };

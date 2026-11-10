@@ -5,8 +5,7 @@
  *     foreach ((T i, T v) = a)           (* 下标 + 值 *)
  *
  * 头里的类型就是绑定在循环体里的类型；循环状态（计数器、切片对、迭代器）
- * 住在隐藏槽里，所以给绑定赋值不会改变迭代。旧的 'foreach |i, v| a' 与
- * 这三种完全等价，仍然是合法写法。
+ * 住在隐藏槽里，所以给绑定赋值不会改变迭代。
  *
  * 运行（仓库根目录）：
  *   ./tcc/tcc -B tcc -test tests/foreach_head.c6
@@ -127,10 +126,10 @@ test "'_' 丢弃绑定" {
         err(1, "丢弃下标后求和不对");
 }
 
-test "旧写法 |i, v| 与新写法等价" {
+test "同一双绑定头写两遍结果一致" {
     int a[2] = { 3, 4 };
     int old_sum = 0, new_sum = 0;
-    foreach |i, v| a {
+    foreach ((size_t i, int v) = a) {
         old_sum += (int)i * 10 + v;
     }
     foreach ((size_t i, int v) = a) {

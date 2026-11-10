@@ -16667,7 +16667,10 @@ again:
     } else if (t == TOK_C6_FOREACH) {
         if (!c6_ext_on())
             tcc_error("'foreach' requires a .c6 source file");
-        if (tok != '|' && !(tok == '(' && !sym_find(t))) {
+        if (tok == '|' && !sym_find(t))
+            tcc_error("'foreach' needs a parenthesised head now: "
+                      "write 'foreach ((size_t i, T v) = a) { ... }'");
+        if (!(tok == '(' && !sym_find(t))) {
             /* not a statement: 'foreach' is used as a plain name here */
             unget_tok(t);
             goto expr;
@@ -19547,7 +19550,7 @@ static void c6_task_decl(void)
 }
 
 /* ---------------------------------------------------------------------- */
-/* 'foreach |i, v| iterable { ... }'                                       */
+/* 'foreach (T v = a) { ... }'                                             */
 /*                                                                         */
 /* The iterable is evaluated once.  A complete array or a slice becomes    */
 /* the '{ elem *data; size_t len; }' frame pair that the slice runtime     */
@@ -19555,7 +19558,7 @@ static void c6_task_decl(void)
 /* are ordinary locals -- the index counts and the value is a fresh copy    */
 /* of the element -- so 'break', 'continue', 'defer' and 'await' behave     */
 /* exactly as they do inside a 'for'.  A user type is iterated through a    */
-/* slice it exposes ('foreach |i, v| obj.items'): there is no runtime       */
+/* slice it exposes ('foreach (T v = obj.items)'): there is no runtime      */
 /* protocol and no call into a library.                                    */
 
 /* what the usual arithmetic conversions give for two integer operands:
@@ -19980,62 +19983,33 @@ static void c6_foreach_parse(void)
     int a = 0, b = 0, c = 0, d = 0;
     C6MoveSnap mv_base = {0}, mv_body = {0};
     int body_ok = 0;
-    int new_head = 0, have_it = 0, have_iv = 0, one_tok = 0, di_off = 0;
+    int have_it = 0, have_iv = 0, one_tok = 0, di_off = 0;
     CType dit = {0}, dvt = {0}, one_type = {0}, vslot = {0};
 
     n1 = n2 = nb = i_off = v_off = pair = hi_off = 0;
     is_range = 0;
 
-    if (tok == '(') {                   /* 'foreach (T v = a)' */
-
-        /* 'foreach (T v = a)', 'foreach (size_t i = lo:hi)' and the pair
-           form 'foreach ((size_t i, T v) = a)'.  The declared type is what
-           the binding has in the body; the loop state itself lives in the
-           hidden slots below, so assigning to a binding never disturbs the
-           iteration.  Which role the single binding gets (index or value)
-           is decided by the iterable: a range yields an index, an array, a
-           slice and an iterator yield a value. */
-        new_head = 1;
-        next();                         /* '(' */
-        if (tok == '(') {
-            next();
-            n1 = c6_foreach_binder(&dit);
-            have_it = 1;
-            skip(',');
-            n2 = c6_foreach_binder(&dvt);
-            have_iv = 1;
-            nb = 2;
-            skip(')');
-        } else {
-            one_tok = c6_foreach_binder(&one_type);
-            nb = 1;
-        }
-        skip('=');
-    } else if (tok == '|') {
+    /* 'foreach (T v = a)', 'foreach (size_t i = lo:hi)' and the pair form
+       'foreach ((size_t i, T v) = a)'.  The declared type is what the binding
+       has in the body; the loop state itself lives in the hidden slots below,
+       so assigning to a binding never disturbs the iteration.  Which role the
+       single binding gets (index or value) is decided by the iterable: a range
+       yields an index, an array, a slice and an iterator yield a value. */
+    next();                             /* '(' */
+    if (tok == '(') {
         next();
-        for (;;) {
-            int name = 0;
-            if (tok < TOK_UIDENT)
-                tcc_error("'foreach' expects a binding name");
-            if (nb == 2)
-                tcc_error("'foreach' takes at most two bindings");
-            name = 0;
-            if (strcmp(get_tok_str(tok, NULL), "_"))
-                name = tok;
-            if (nb++ == 0)
-                n1 = name;
-            else
-                n2 = name;
-            next();
-            if (tok != ',')
-                break;
-            next();
-        }
-        skip('|');
+        n1 = c6_foreach_binder(&dit);
+        have_it = 1;
+        skip(',');
+        n2 = c6_foreach_binder(&dvt);
+        have_iv = 1;
+        nb = 2;
+        skip(')');
     } else {
-        tcc_error("'foreach' expects '|binding|' or a parenthesised head: "
-                  "write 'foreach (T v = a) { ... }'");
+        one_tok = c6_foreach_binder(&one_type);
+        nb = 1;
     }
+    skip('=');
 
     new_scope(&o);
 
@@ -20045,20 +20019,16 @@ static void c6_foreach_parse(void)
         next();
         expr_cond();
     }
-    if (new_head)
-        skip(')');
+    skip(')');
     if (is_range) {
-        if (new_head && have_iv)
+        if (have_iv)
             tcc_error("a range yields only an index: "
                       "write 'foreach (size_t i = lo:hi) { ... }'");
-        if (new_head && nb == 1) {
+        if (nb == 1) {
             n1 = one_tok;
             dit = one_type;
             have_it = 1;
         }
-        if (!new_head && nb != 1)
-            tcc_error("a range yields only an index: "
-                      "write 'foreach (size_t i = lo:hi) { ... }'");
         if (have_it && !c6_is_int_type(&dit)) {
             type_to_str(buf, sizeof buf, &dit, NULL);
             tcc_error("the index of a 'foreach' must have an integer type, "
@@ -20102,11 +20072,9 @@ static void c6_foreach_parse(void)
             if (nb != 1)
                 tcc_error("an iterator yields only a value: "
                           "write 'foreach (T v = it) { ... }'");
-            if (new_head) {
-                n1 = one_tok;
-                dvt = one_type;
-                have_iv = 1;
-            }
+            n1 = one_tok;
+            dvt = one_type;
+            have_iv = 1;
             elem = it.elem;
             c6_gc_value_check(&it.obj, "an iterable");
             /* A borrowed managed parameter needs no reference of its own;
@@ -20149,16 +20117,10 @@ static void c6_foreach_parse(void)
             if (t.t & VT_ARRAY) {
                 if (!t.ref || t.ref->c < 0)
                     tcc_error("cannot iterate over an array of unknown length");
-                if (!new_head && nb != 2)
-                    tcc_error("an array or slice yields an index and a value: "
-                              "write 'foreach ((size_t i, T v) = a) { ... }'");
                 elem = *pointed_type(&t);
                 elem.t &= ~VT_QUAL;
                 pair = c6_slice_spill(NULL);
             } else if ((sl = c6_slice_of_type(&t)) != NULL) {
-                if (!new_head && nb != 2)
-                    tcc_error("an array or slice yields an index and a value: "
-                              "write 'foreach ((size_t i, T v) = a) { ... }'");
                 elem = sl->elem;
                 pair = c6_slice_spill(sl);
             } else {
@@ -20174,7 +20136,7 @@ static void c6_foreach_parse(void)
                           "expose a slice member 'T[:] items', or define "
                           "'int has(T *); E next(T *);')", buf);
             }
-            if (new_head && nb == 1) {
+            if (nb == 1) {
                 /* one declared binding: it is the element value, the index
                    stays hidden (discard it explicitly with '(_, T v)') */
                 n2 = one_tok;
@@ -22744,12 +22706,12 @@ static void c6_apply_fallible(CType *type)
                 unget_tok(c6_name);
             }
         }
-        /* 'foreach |i, v| a { ... }' is a statement: at file scope it is
+        /* 'foreach (T v = a) { ... }' is a statement: at file scope it is
            always a mistake, not a declaration with an implicit int */
         if (tcc_state->c6_ext && l == VT_CONST && tok == TOK_C6_FOREACH) {
             int c6_name = tok;
             next();
-            if (tok == '|' || tok == '(')
+            if (tok == '(')
                 tcc_error("'foreach' can only be used inside a function");
             unget_tok(c6_name);
         }

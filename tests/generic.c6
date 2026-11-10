@@ -256,7 +256,7 @@ test "切片的元素可以是实例" {
     Vect@int[:] s = arr;
     int sum = 0;
 
-    foreach |i, e| s {
+    foreach (Vect@int e = s) {
         sum += e.data[0];
     }
     if (sum != 3)

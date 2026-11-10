@@ -587,7 +587,7 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 | 13 `co` / `task` 软关键字 | ✅ | `co`/`spawn`/`task` 不进 `tcctok.h`：词法阶段仍是标识符，`block()` 里 `tok >= TOK_IDENT` 且 `c6_soft_kw(t)` 命中、名字没有被 `VT_TYPEDEF` 占用时按关键字分派（`c6_soft_kw_shadowed`），所以 `int spawn = 1;`、`spawn(x);`、`typedef int co;`、`spawn:` 都还成立；`c6_co_parse`（`decl()` 与 `block()` 两个入口——单条语句不走 `decl()`）+ `__tcc_co_spawn`；`c6_task_decl` / `c6_task_check_handle`（`struct NAME_task` 的 `head` 必须是 `struct __c6_task`）/ `c6_task_defer_destroy`（合成一个作用域清理点，同手写 `defer`）；运行期 `libtcc1.c` 的顶层就绪链表（`snext`/`busy`/`waiting`）与 `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run`，`__c6_co_wait` 也改成先推进顶层任务；`async` 体里的 `err` 走 `c6_async_propagate`（`KIND_ERR`），并禁止 `async` 方法是方法；预置声明同步加 `__tcc_co_spawn` / `__c6_co_run` |
 | 14 `spawn` = OS 线程 | ✅ | `c6_spawn_parse` 只在 `.c6` 的翻译单元里生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `spawn` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（错误槽 / 插值构造器 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS）；`defer` 不在其中，它的状态在函数帧里 |
 | 15 裸 tag 类型名（省略 `struct`） | ✅ | `tccgen.c`：`parse_btype()` 的 `default` 分支——`typespec_found` 为 0、`sym_find(tok)` 未命中（普通命名空间优先）时试 `struct_find(tok)`，命中则把 tag 符号的 `type.t` / `ref` 交给 `basic_type2`，与 `struct/union/enum TAG` 走完全同一条路径（所以 `sizeof`、方法注册、`c6_tag_is_global` 的切片元素检查、`type_to_str` 自动一致）；`ignore_label` 时 `TAG:` 仍退回标签（与 typedef 路径同一个 guard）；不隐式前置声明，也不支持定义处省略 `struct`；只在 `.c6` 生效 |
-| 16 `foreach` | ✅ | `c6_foreach_parse` + `c6_foreach_binder`（`block()` 的 `TOK_C6_FOREACH` 分支；既不是 `\|`、也不是“`(` 且 `foreach` 不是已知标识符”时 `unget_tok` 退回表达式语句，所以 `foreach` 仍可当标识符）；词法是 `tcctok.h` 末尾追加的硬关键字，未开启时（`.c` 文件）由 `tccpp.c` 的还原循环改回普通标识符（区间同步扩到 `TOK_C6_FOREACH`）；数组/切片的隐藏槽直接复用 `c6_slice_spill`（`{data, len}` 对，与切片运行期布局相同），区间把上界落进隐藏整数槽、下标绑定当计数器；`i`/`v` 是 `sym_push` 出来的普通局部，循环体走 `lblock`，所以 `break`/`continue`/`defer`/`await` 与 `for` 一致；`size_t` 下标用 `c6_size_type`，区间用 `c6_common_int_type`（C 的通常算术转换子集）；文件作用域的 `foreach` 在 `decl()` 里报错；头有两种写法：声明式 `foreach (T v = a)` / `foreach ((T i, T v) = a)` / `foreach (T i = lo:hi)`（`c6_foreach_binder` 借 `parse_btype` + `type_decl` 解析，绑定类型就是体里的类型，循环状态仍住隐藏槽，所以下标也是每轮的副本），以及旧的绑定表 `foreach \|i, v\| a`；迭代器协议（`has()`/`next()`，含结构体值/指针/接口值）见里程碑 30 |
+| 16 `foreach` | ✅ | `c6_foreach_parse` + `c6_foreach_binder`（`block()` 的 `TOK_C6_FOREACH` 分支；下一个记号不是 `(`（或 `foreach` 是作用域里已知的标识符）时 `unget_tok` 退回表达式语句，所以 `foreach` 仍可当标识符）；词法是 `tcctok.h` 末尾追加的硬关键字，未开启时（`.c` 文件）由 `tccpp.c` 的还原循环改回普通标识符（区间同步扩到 `TOK_C6_FOREACH`）；数组/切片的隐藏槽直接复用 `c6_slice_spill`（`{data, len}` 对，与切片运行期布局相同），区间把上界落进隐藏整数槽、下标绑定当计数器；`i`/`v` 是 `sym_push` 出来的普通局部，循环体走 `lblock`，所以 `break`/`continue`/`defer`/`await` 与 `for` 一致；`size_t` 下标用 `c6_size_type`，区间用 `c6_common_int_type`（C 的通常算术转换子集）；文件作用域的 `foreach` 在 `decl()` 里报错；头有两种写法：声明式 `foreach (T v = a)` / `foreach ((T i, T v) = a)` / `foreach (T i = lo:hi)`（`c6_foreach_binder` 借 `parse_btype` + `type_decl` 解析，绑定类型就是体里的类型，循环状态仍住隐藏槽，所以下标也是每轮的副本）；旧的绑定表 `foreach \|i, v\| a` 已删除，语句分支只认 `(`，命中 `\|` 时给出迁移提示（C121）；迭代器协议（`has()`/`next()`，含结构体值/指针/接口值）见里程碑 30 |
 | 17 元组 `(T1, T2, …)` | ✅ | `tccgen.c`：`parse_btype()` 的 `case '('` → `c6_tuple_btype` / `c6_tuple_speculate`（保存/重放 token，区分元组类型与老 C 的括号表达式）、`c6_tuple_get`（校验元素并规范化生成内部 tag `__c6_tuple_N`，布局在构造时按自然对齐算好，不走 `struct_layout`）、`c6_tuple_ctype` / `c6_tuple_of_type` / `c6_tuple_ctype`；`unary()` 的 `case '('` 处理元组强转/复合字面量/`sizeof`/`_Alignof`、`c6_tuple_subscript` 处理 `t[k]`（常量下标）；`decl()` 开头的 `c6_tuple_lead_kind` + `c6_tuple_destructure` 实现解构声明/赋值（`_` 占位符丢弃元素）；`c6_return_value` 支持 `return {…};`；`c6_apply_fallible` 放开 struct/union/元组作 `!error` 返回类型，失败路径用 `c6_zero_local` 清零；`c6_async_type_tokens` 把元组回放成 `(T1, T2)` 而不是内部 tag；解构语句在 `block()` 里也认一次（无花括号的 if/while/for/switch 单条语句体、语句表达式、`defer` 单条语句体不走 `decl()`），赋值形式在 `c6_tuple_destructure()` 里就地解析（作用域弹出后隐藏临时变量就没了） |
 | 18 `module` + `import` 加载 | ✅ | `tccgen.c`：`BufferedFile.c6_module` / `c6_decl_seen`，`decl()` 文件作用域的 `module NAME;` 软关键字 → `c6_module_parse`（点号前缀、必须首条声明、一个文件一个、`main` 禁止）；`c6_mod_name()` 给文件作用域声明加 `NAME__`（块作用域/`static`/`test`/`__` 开头/普通 `#include` 不加），方法经 `c6_method_symbol` 自然变成 `<NAME__Tag>_<meth>`；`sym_find` / `struct_find` 先试模块前缀再试普通 C 名，`c6_import_lookup` / `c6_import_tag_lookup` 兜底 imports；`parse_btype` 的 `c6_qualified_type` 支持 `NAME.Type`（先 speculative 扫描 typedef/tag，失败原样回退）；`c6_module_import` 按当前文件目录 → `-I` → 当前目录依次找 `NAME.c6`、`NAME.c`（点号 `a/b.c6`、`a/b.c`，`.c6` 优先），用 `decl(VT_CONST)` 重放：函数原型 + `skip_or_save_block`、全局 `extern` + `c6_skip_decl_tail`、跳过 `static`/`test`，循环 import 报错，找不到文件保持旧的命名空间行为；`-emit-header` 用 `C6HeaderDecl` 记录导出，`c6_hdr_type` / `c6_hdr_struct_body` / `c6_emit_header` 写出普通 C 头文件（切片/元组生成 `NAME__slice_N` / `NAME__tuple_N` typedef） |
 | 19 托管引用 P0/P1（限定符、分配、存储、释放） | ✅ | `tcc.h`：`CType.gq` + `C6_GQ_*` + `C6_GCM_*`；`tccgen.c`：`parse_btype()` 的 `@` 前缀、`c6_gc_new_expr`、`c6_gc_store_hook`（`vstore()` 里）、`c6_gc_site`（合成一个清理点）、`c6_gc_plain` / `c6_gc_mode` / `c6_type_gq`；运行期 `libtcc1.c` 的 `__c6_gc_new` / `__c6_gc_store` / `__c6_gc_release` / `__c6_gc_drop`；`CType.gq` 只当缓存、可信副本在 pointee 上（设计 §2.0） |
@@ -610,10 +610,9 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 
 `foreach` 的设计取舍（评审结论）：
 
-- **绑定在前**（`foreach (T v = a)` / `((T i, T v) = a)`，旧的
-  `foreach |i, v| a` 等价保留）而不是 Go 风格的 `for a (i, v)`：`for` 必须
-  保持纯 C，而 `|` 本来是按位或的记号；把绑定放在可迭代对象前面，表达式
-  中间就不必再猜“这个 `|` 是绑定表的开始还是按位或”；
+- **头在可迭代对象前面**（`foreach (T v = a)` / `((T i, T v) = a)`）而不是
+  Go 风格的 `for a (i, v)`：`for` 必须保持纯 C；把绑定放在可迭代对象前面，
+  表达式里就不必再猜括号后面那串是绑定还是可迭代对象的一部分；
 - **迭代器是结构化协议，不做装箱**：只要类型提供 `int has(T *)` 与
   `E next(T *)` 就能迭代，元素类型直接取 `next()` 的声明返回类型，所以
   完全静态、没有运行期辅助函数；`void *next()` 会把元素类型擦掉，明确
@@ -628,8 +627,7 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
   只有带括号、且 `foreach` 不是作用域里已知的标识符时才按语句解析，
   `int foreach = 1;` / `foreach(x);` 照旧是普通表达式；
 - **下标默认只是副本**：循环状态（计数器、切片对、迭代器）全在隐藏槽，
-  声明式头的下标每轮拷一份，写它不影响迭代；旧绑定表 `|i|` 沿用“下标就是
-  循环变量”的老语义；
+  下标每轮拷一份，写它不影响迭代；
 - 隐藏槽复用切片运行期布局，因此 `foreach` 不带运行期辅助函数、不改变
   调用约定；`async` 体里照常可用（帧整体保存/恢复）。
 
@@ -902,9 +900,9 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 - `foreach` 的可迭代对象有四种：完整数组、切片 `T[:]`、整数区间
   `lo:hi`（半开），以及结构化的迭代器协议 `has()`/`next()`（`T` 值、
   `T *`、接口值都可以）。其它类型请暴露一个切片成员，再
-  `foreach |i, v| obj.items`，或补上 `int has(T *); E next(T *);`；
-- 绑定表是 binder-first（`|i, v|` 在可迭代对象前面），循环体必须带
-  花括号：省掉绑定、省掉花括号、两个绑定都写 `_` 都会报错而不是猜；
+  `foreach ((size_t i, T v) = obj.items)`，或补上 `int has(T *); E next(T *);`；
+- 头在可迭代对象前面（`foreach (T v = a)`），绑定必须在头里声明类型：
+  循环体必须带花括号；省掉花括号、两个绑定都写 `_` 都会报错而不是猜；
   点号区间 `0..count` 不做（词法上是两个浮点常量），统一写 `0:count`；
 - 隐藏槽只对“求值一次”负责：数组每轮重新按 `data[i]` 取元素（数组本身
   可能被改），切片用求值时的 `{data, len}` 快照；值绑定是副本，写下标
