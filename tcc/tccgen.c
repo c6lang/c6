@@ -6632,6 +6632,7 @@ static int in_range(long long n, int t)
     return n >= -(long long)m - 1 && n <= (long long)m;
 }
 
+#ifdef C6_EXT
 /* ------------------------------------------------------------------ */
 /* generics: 'struct Vect@T { ... };' and 'Vect@int'                   */
 /*                                                                     */
@@ -8195,6 +8196,7 @@ static void c6_gen_declare(int name, int is_union)
     g->next = c6_gens, c6_gens = g;
     c6_gen_scan_methods(g);
 }
+#endif /* C6_EXT: generics */
 
 #ifdef C6_EXT
 /* Bare enumerator spellings claimed by more than one enum in the same scope.
@@ -8235,9 +8237,9 @@ static void struct_decl(CType *type, int u)
     int v = 0, c = 0, size = 0, align = 0, flexible = 0;
     int bit_size = 0, bsize = 0, bt = 0, ut = 0;
 #ifdef C6_EXT
-    int c6_is_def = 0;
-    int c6_meth_end = 0;       /* the member just parsed was a function */
+    int c6_is_def = 0;         /* a body (not a declaration) was parsed */
 #endif
+    int c6_meth_end = 0;       /* the member just parsed was a function */
     Sym *s = 0, *ss = 0, **ps = 0;
     AttributeDef ad = {0}, ad1 = {0};
     CType type1 = {0}, btype = {0};
@@ -8248,7 +8250,9 @@ static void struct_decl(CType *type, int u)
 
     v = 0;
     if (tok >= TOK_IDENT) {  /* struct/enum tag */
+#ifdef C6_EXT
         int tagtok = tok;
+#endif
         v = tok, next();
 #ifdef C6_EXT
         /* a tag that is only visible through a block scope cannot travel
@@ -8349,8 +8353,10 @@ do_decl:
             if (bt)
                 t.t = bt|VT_STATIC|VT_ENUM_VAL;
             for(;;) {
+#ifdef C6_EXT
                 int qname = 0;              /* 'Color.RED' (dotted spelling) */
                 char qbuf[256] = {0};
+#endif
                 v = tok;
                 if (v < TOK_UIDENT)
                     expect("identifier");
@@ -8525,11 +8531,13 @@ do_decl:
 			        tcc_error("field '%s' has incomplete type",
                                       get_tok_str(v, NULL));
                         }
+#ifdef C6_EXT
                         if ((type1.t & VT_BTYPE) == VT_FUNC
                             && v && c6_gen_inst_cur)
                             tcc_error("a member function needs a body: write "
                                       "'%s(...) { ... }' in the template",
                                       get_tok_str(v, NULL));
+#endif
                         if ((type1.t & VT_BTYPE) == VT_FUNC ||
 			    (type1.t & VT_BTYPE) == VT_VOID ||
                             (type1.t & VT_STORAGE))
