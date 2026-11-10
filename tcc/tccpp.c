@@ -2194,7 +2194,7 @@ ST_FUNC void preprocess(int is_bof)
         if (tok >= TOK_IDENT && tok < tok_ident
             && !strcmp(get_tok_str(tok, NULL), "macro")) {
             if (!s1->c6_ext)
-                tcc_error("'#macro' requires -std=c6");
+                tcc_error("'#macro' requires a .c6 source file");
             parse_c6_macro();
             break;
         }
@@ -4392,7 +4392,7 @@ ST_FUNC void tccpp_new(TCCState *s)
 #ifdef C6_EXT
     /* The c6 keywords are interned last and are kept interned even when
        the extension is not enabled: their token numbers are >= TOK_UIDENT,
-       so without -std=c6 they simply behave like ordinary identifiers
+       so outside a '.c6' file they simply behave like ordinary identifiers
        (everything the c6 parser does with them is gated on c6_ext).
        tok_ident is deliberately *not* rolled back down to TOK_C6_PACKAGE:
        a token number below tok_ident must never look like one of the

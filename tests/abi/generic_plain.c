@@ -1,6 +1,6 @@
 /* 泛型的 ABI 兼容性（纯 C 侧）
  *
- * 本翻译单元故意不加 -std=c6：'Vect@int' 的实例就是 'struct Vect_int'，
+ * 本翻译单元故意是纯 C（`.c` 后缀）：'Vect@int' 的实例就是 'struct Vect_int'，
  * 'Pair@(int, int)' 就是 'struct Pair_int_int'，方法 'vect_sum' 的符号就是
  * 'Vect_int_vect_sum'。这里全部用普通 C 写，验证实例名、字段布局、方法符号
  * 和调用约定都是跨 TU 稳定的约定。

@@ -953,7 +953,7 @@ struct TCCState {
     /* use TinyCC extensions */
     unsigned char tcc_ext;
 #ifdef C6_EXT
-    /* c6 language extensions (-std=c6) */
+    /* c6 language extensions (a '.c6' source file, per translation unit) */
     unsigned char c6_ext;
     unsigned char c6_test_mode; /* -test: run 'test' blocks, not main */
     const char *c6_test_filter; /* -test-filter=SUBSTR */

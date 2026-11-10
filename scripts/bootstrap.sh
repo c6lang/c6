@@ -40,6 +40,6 @@ bootstrap: 完成。下一步：
   make build        # 打开扩展构建（EXTRA-DEFS=-DC6_EXT）
   make selftest     # 跑 tests/ 下的 c6 自测
   make test         # 跑上游 tests2 全量测试
-  ./tcc/tcc -B tcc -std=c6 -run hello.c   # 在仓库根目录运行
+  ./tcc/tcc -B tcc -run hello.c6  # c6 代码放进 .c6 文件，后缀就是开关
 
 EOF

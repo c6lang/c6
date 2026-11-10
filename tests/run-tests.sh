@@ -18,25 +18,26 @@
 #             tcc 时用它去掉 gcc 专有的开关，例如 "-B <仓库>/tcc -std=c99 -w"
 #             （见 make c99tcc-test）
 #
-# 测试分组：
-#   tests/*.c         用 -test 跑里面的 test 块；若存在同名的 tests/tu/<name>.c，
+# 测试分组（所有 c6 代码都在 .c6 文件里：后缀是唯一的开关，命令行没有
+# -std=c6 这个选项）：
+#   tests/*.c6        用 -test 跑里面的 test 块；若存在同名的 tests/tu/<name>.c6，
 #                     会一起编译，作为第二个翻译单元。
-#   tests/c6ext/*.c6  扩展名自测：故意不传 -std=c6，靠 .c6 后缀开启扩展；
+#   tests/c6ext/*.c6  后缀自测：同一个编译器、不加任何开关，'.c6' 自己开启扩展；
 #                     同名 tests/tu/<name>.c6 作为第二个 TU，构建时带
 #                     '-I tests'，让 'import tu.xxx' 的点号路径能找到模块。
-#   tests/errors/*.c  编译期诊断；每个 `// EXPECT <片段>: <诊断>` 注释对应一次
+#   tests/errors/*.c6 编译期诊断；每个 `// EXPECT <片段>: <诊断>` 注释对应一次
 #                     -D<片段> 编译，要求 stderr 含该诊断；不带 -D 时该文件
 #                     必须能编译并运行通过。c99 模式下优先使用
 #                     `// EXPECT-C99 <片段>: <诊断>`，没有时才回退到 EXPECT。
 #                     `// FLAGS ...` 行给出只属于这个文件的编译参数（例如
 #                     '-Wgeneric-depth' 这类只管告警的开关）。
-#   tests/exit/*.c    退出码；`// EXIT <n>` 注释声明期望的进程退出码，编译成
+#   tests/exit/*.c6   退出码；`// EXIT <n>` 注释声明期望的进程退出码，编译成
 #                     可执行文件后运行，比对退出码（main 的返回值必须穿过
 #                     c6 的清理链）。
-#   tests/abi/*.c     ABI 兼容；每个文件用 -std=c6 编译，同名的 _plain.c 用
-#                     纯 C（不带 -std=c6）编译，两个目标文件链接后运行，
+#   tests/abi/*.c6    ABI 兼容；每个文件按 c6 编译（.c6 后缀），同名的
+#                     _plain.c 是纯 C 文件（.c 后缀），两个目标文件链接后运行，
 #                     比对 `// EXIT <n>` 声明的退出码。
-#   tests/c99/*.c     C99 输出后端；每个文件先用 tcc/tcc 生成 C
+#   tests/c99/*.c6    C99 输出后端；每个文件先用 tcc/tcc 生成 C
 #                     源码，再用 gcc -std=c99 编译并运行，比对
 #                     `// EXIT <n>`（默认 0）；带 `// OUTPUT <文本>` 时
 #                     还要求 stdout 含该文本。
@@ -45,7 +46,7 @@ set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TCC=${TCC:-$ROOT/tcc/tcc}
 TCCFLAGS=${TCCFLAGS:-}
-BASE="-B $ROOT/tcc -std=c6"
+BASE="-B $ROOT/tcc -I $ROOT/tests"
 BACKEND=${BACKEND:-native}
 C99TCC=${C99TCC:-$ROOT/tcc/tcc}
 C99CC=${C99CC:-gcc}
@@ -104,7 +105,7 @@ build_exe() { # <可执行文件> <源文件>...
     exe=$1
     shift
     if [ "$BACKEND" = c99 ]; then
-        $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+        $C99TCC -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c"
     else
@@ -119,7 +120,7 @@ build_test_exe() { # <可执行文件> <源文件>...
     shift
     if [ "$BACKEND" = c99 ]; then
         # c99 后端里 -test 直接生成带测试入口的 C 源码
-        $C99TCC -test -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+        $C99TCC -test -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c" || return 1
         "$exe"
@@ -128,42 +129,26 @@ build_test_exe() { # <可执行文件> <源文件>...
     fi
 }
 
-# tests/c6ext/*.c6 专用：故意不传 -std=c6（后缀必须自己开启扩展）。
-# '-I tests' 是给 import 的点号路径用的（'tu/c6mod.c6' 位于 tests/ 下）。
-build_test_exe_c6() { # <可执行文件> <源文件>...
-    exe=$1
-    shift
-    if [ "$BACKEND" = c99 ]; then
-        $C99TCC -test -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
-            -o "$exe.c" "$@" || return 1
-        $C99CC $C99FLAGS -o "$exe" "$exe.c" || return 1
-        "$exe"
-    else
-        $TCC -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS -test "$@"
-    fi
-}
-
 # 用户点名要跑的测试（去掉 .c/.c6 后缀的纯名字），空表示全跑
 wanted=
 if [ "${1:-}" = "--list" ]; then
-    for f in "$ROOT"/tests/*.c; do
-        echo "$(basename "$f" .c)"
+    for f in "$ROOT"/tests/*.c6; do
+        echo "$(basename "$f" .c6)"
     done
     for f in "$ROOT"/tests/c6ext/*.c6; do
         [ -e "$f" ] && echo "c6ext/$(basename "$f" .c6)"
     done
-    for f in "$ROOT"/tests/errors/*.c; do
-        [ -e "$f" ] && echo "errors/$(basename "$f" .c)"
+    for f in "$ROOT"/tests/errors/*.c6; do
+        [ -e "$f" ] && echo "errors/$(basename "$f" .c6)"
     done
-    for f in "$ROOT"/tests/exit/*.c; do
-        [ -e "$f" ] && echo "exit/$(basename "$f" .c)"
+    for f in "$ROOT"/tests/exit/*.c6; do
+        [ -e "$f" ] && echo "exit/$(basename "$f" .c6)"
     done
-    for f in "$ROOT"/tests/abi/*.c; do
-        case $f in *_plain.c) continue ;; esac
-        [ -e "$f" ] && echo "abi/$(basename "$f" .c)"
+    for f in "$ROOT"/tests/abi/*.c6; do
+        [ -e "$f" ] && echo "abi/$(basename "$f" .c6)"
     done
-    for f in "$ROOT"/tests/c99/*.c; do
-        [ -e "$f" ] && echo "c99/$(basename "$f" .c)"
+    for f in "$ROOT"/tests/c99/*.c6; do
+        [ -e "$f" ] && echo "c99/$(basename "$f" .c6)"
     done
     exit 0
 fi
@@ -181,11 +166,11 @@ is_wanted() {
     return 1
 }
 
-# ---- 1. test 块 ----
-for src in "$ROOT"/tests/*.c; do
-    name=$(basename "$src" .c)
+# ---- 1. test 块：c6 代码都在 .c6 文件里，后缀自己开启扩展 ----
+for src in "$ROOT"/tests/*.c6; do
+    name=$(basename "$src" .c6)
     is_wanted "$name" || continue
-    tu="$ROOT/tests/tu/$name.c"
+    tu="$ROOT/tests/tu/$name.c6"
     out=
     if [ -e "$tu" ]; then
         set -- "$src" "$tu"
@@ -201,7 +186,7 @@ for src in "$ROOT"/tests/*.c; do
     fi
 done
 
-# ---- 1b. .c6 后缀：不传 -std=c6，靠扩展名开启 c6 ----
+# ---- 1b. 后缀自测：不加任何开关，'.c6' 自己开启 c6 ----
 for src in "$ROOT"/tests/c6ext/*.c6; do
     [ -e "$src" ] || continue
     name="c6ext/$(basename "$src" .c6)"
@@ -213,7 +198,7 @@ for src in "$ROOT"/tests/c6ext/*.c6; do
     else
         set -- "$src"
     fi
-    if out=$(build_test_exe_c6 "$TMP/c6ext.bin" "$@" 2>"$TMP/err") \
+    if out=$(build_test_exe "$TMP/c6ext.bin" "$@" 2>"$TMP/err") \
        && echo "$out" | tail -n 1 | grep -q ', 0 failure(s)$'; then
         note_pass "$name: $(echo "$out" | tail -n 1)"
     else
@@ -244,10 +229,57 @@ EOF
     fi
 fi
 
+# ---- 1d. 后缀是唯一开关：.c 里写 c6 语法要报错，-std=c6 也要报错 ----
+if [ "$BACKEND" = native ] && is_wanted "c6ext/rule"; then
+    ok=yes
+    detail=
+
+    # c6 语法放在 .c 里：编译失败，且诊断指向后缀
+    printf '%s\n' 'int main(void)' '{' '    defer { }' '    return 0;' '}' \
+        > "$TMP/plain.c"
+    if $TCC -B "$ROOT/tcc" $TCCFLAGS -run "$TMP/plain.c" \
+            >/dev/null 2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+.c 里的 defer 竟然编过了"
+    elif ! grep -qF "requires a .c6 source file" "$TMP/err"; then
+        ok=no
+        detail="$detail
+.c 里的 defer 没有报 'requires a .c6 source file':$(cat "$TMP/err")"
+    fi
+
+    # 同一段代码放进 .c6 就通过
+    cp "$TMP/plain.c" "$TMP/plain.c6"
+    if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -run "$TMP/plain.c6" \
+            >/dev/null 2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+.c6 里的 defer 编不过:$(cat "$TMP/err")"
+    fi
+
+    # -std=c6 已经取消：报错并让用户改后缀，而不是静默忽略
+    if $TCC -B "$ROOT/tcc" $TCCFLAGS -std=c6 -run "$TMP/plain.c6" \
+            >/dev/null 2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+-std=c6 竟然被接受了"
+    elif ! grep -qF ".c6" "$TMP/err"; then
+        ok=no
+        detail="$detail
+-std=c6 的报错没有提到 .c6:$(cat "$TMP/err")"
+    fi
+
+    if [ $ok = yes ]; then
+        note_pass "c6ext/rule: .c 不开启扩展、-std=c6 报错"
+    else
+        fail "c6ext/rule" "$detail"
+    fi
+fi
+
 # ---- 2. 编译期诊断 ----
-for src in "$ROOT"/tests/errors/*.c; do
+for src in "$ROOT"/tests/errors/*.c6; do
     [ -e "$src" ] || continue
-    name="errors/$(basename "$src" .c)"
+    name="errors/$(basename "$src" .c6)"
     is_wanted "$name" || continue
 
     # 同名的一半放在 tests/tu/ 时可以带第二个翻译单元一起编译（跨 TU 的
@@ -284,7 +316,7 @@ for src in "$ROOT"/tests/errors/*.c; do
         fi
 
         if [ "$BACKEND" = c99 ]; then
-            if $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS $eflags \
+            if $C99TCC -B "$ROOT/tcc" $TCCFLAGS $eflags \
                     -D"$frag" -o "$TMP/diag.c" "$src" $extra \
                     2>"$TMP/err" >/dev/null; then
                 # 生成成功不等于有错：没有机器码链接步骤的未解析引用，
@@ -340,9 +372,9 @@ $(cat "$TMP/missing")"
 done
 
 # ---- 3. 退出码 ----
-for src in "$ROOT"/tests/exit/*.c; do
+for src in "$ROOT"/tests/exit/*.c6; do
     [ -e "$src" ] || continue
-    name="exit/$(basename "$src" .c)"
+    name="exit/$(basename "$src" .c6)"
     is_wanted "$name" || continue
     want=$(sed -n 's,^// *EXIT *\([0-9][0-9]*\)$,\1,p' "$src" | head -n 1)
     if [ -z "$want" ]; then
@@ -362,26 +394,25 @@ for src in "$ROOT"/tests/exit/*.c; do
     fi
 done
 
-# ---- 4. ABI 兼容：c6 翻译单元 + 纯 C 翻译单元分开编译再链接 ----
-for src in "$ROOT"/tests/abi/*.c; do
+# ---- 4. ABI 兼容：c6 翻译单元（.c6）+ 纯 C 翻译单元（_plain.c）分开编译再链接 ----
+for src in "$ROOT"/tests/abi/*.c6; do
     [ -e "$src" ] || continue
-    case $src in *_plain.c) continue ;; esac
-    name="abi/$(basename "$src" .c)"
+    name="abi/$(basename "$src" .c6)"
     is_wanted "$name" || continue
-    plain="${src%.c}_plain.c"
+    plain="${src%.c6}_plain.c"
     want=$(sed -n 's,^// *EXIT *\([0-9][0-9]*\)$,\1,p' "$src" | head -n 1)
     if [ -z "$want" ]; then
         fail "$name" "缺少 '// EXIT <n>' 注释"
         continue
     fi
     if [ "$BACKEND" = c99 ]; then
-        if ! $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+        if ! $C99TCC -B "$ROOT/tcc" $TCCFLAGS \
                 -o "$TMP/abi-c6.c" "$src" 2>"$TMP/err" >/dev/null; then
             fail "$name" "c6 侧生成 C 失败:$(cat "$TMP/err")"
             continue
         fi
         if [ -e "$plain" ]; then
-            # 纯 C 侧：故意不带 -std=c6
+            # 纯 C 侧：.c 文件，扩展天然不生效
             if ! $C99CC $C99FLAGS -c -o "$TMP/abi-plain.o" "$plain" \
                     2>"$TMP/err" >/dev/null; then
                 fail "$name" "纯 C 侧编译失败:$(cat "$TMP/err")"
@@ -405,7 +436,7 @@ for src in "$ROOT"/tests/abi/*.c; do
             continue
         fi
         if [ -e "$plain" ]; then
-            # 纯 C 侧：故意不带 -std=c6
+            # 纯 C 侧：.c 文件，扩展天然不生效
             if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -c "$plain" -o "$TMP/abi-plain.o" \
                     2>"$TMP/err" >/dev/null; then
                 fail "$name" "纯 C 侧编译失败:$(cat "$TMP/err")"
@@ -434,9 +465,9 @@ for src in "$ROOT"/tests/abi/*.c; do
 done
 
 # ---- 5. C99 输出后端：生成 C 源码，系统 C 编译器编译后运行 ----
-for src in "$ROOT"/tests/c99/*.c; do
+for src in "$ROOT"/tests/c99/*.c6; do
     [ -e "$src" ] || continue
-    base=$(basename "$src" .c)
+    base=$(basename "$src" .c6)
     name="c99/$base"
     is_wanted "$name" || continue
 
@@ -454,7 +485,7 @@ for src in "$ROOT"/tests/c99/*.c; do
     wantout=$(sed -n 's,^// *OUTPUT *\(.*\)$,\1,p' "$src" | head -n 1)
 
     csrc="$TMP/c99-$base.c"
-    if ! $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS -o "$csrc" "$src" \
+    if ! $C99TCC -B "$ROOT/tcc" $TCCFLAGS -o "$csrc" "$src" \
             2>"$TMP/err" >/dev/null; then
         fail "$name" "生成 C 失败:$(cat "$TMP/err")"
         continue

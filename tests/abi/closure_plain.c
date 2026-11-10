@@ -1,4 +1,4 @@
-/* tests/abi/closure.c 的纯 C 一侧（不带 -std=c6 编译）。
+/* tests/abi/closure.c6 的纯 C 一侧（纯 C：`.c` 后缀，扩展不生效）。
  *
  * 闭包在这一侧是不透明的：只有一个指针，和一个按 ABI 猜出来的
  * `{ code, env }` 布局。这里只保存、只检查字段非空，不调用。

@@ -1,4 +1,4 @@
-/* tests/abi/module.c 的纯 C 一侧（不带 -std=c6 编译）。 */
+/* tests/abi/module.c6 的纯 C 一侧（纯 C：`.c` 后缀，扩展不生效）。 */
 
 struct math__Point { int x, y; };
 int math__add(int a, int b);

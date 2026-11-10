@@ -1,0 +1,159 @@
+/* 无 libc（freestanding）下的 c6 运行时与字符串插值
+ *
+ *   make fstest
+ *   # 等价于：
+ *   ./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_fstr \
+ *       examples/freestanding_fstr.c6 tcc/libtcc1.a
+ *   ./build/freestanding_fstr
+ *
+ * 这个程序不链接 libc，也不用 crt：入口是 _start，输出和退出都自己发
+ * syscall，内存由下面的 bump allocator 提供。能用的是：
+ *
+ *   - f".." / @f".."：整数、字符、_Bool、指针、字符切片、托管缓冲、浮点；
+ *   - 格式说明 {expr;spec}；
+ *   - defer / errdefer、err + catch、托管引用（@T）的分配与释放。
+ *
+ * 程序这边什么都不用提供。运行时里所有“外面才有”的东西都是 weak 的：
+ *
+ *   calloc / free / realloc   有 libc 就用 libc 的分配器；没有就用
+ *                             libtcc1 里的静态 arena（.bss，默认 256 KB，
+ *                             可用 -DC6_HEAP_SIZE=... 调整）；
+ *   memset / memcpy / memmove libtcc1 自带字节循环版本，真 libc 的强定义
+ *                             会在链接时覆盖它们；
+ *   pthread_*                 没有就退化成单线程（一个静态的状态块），
+ *                             go / thread 报告启动失败而不是链接报错；
+ *   select                    只有 async / c6_io 用到，没有就报“等待失败”。
+ *
+ * 也就是说单线程的 freestanding 程序直接可用；要 go / thread 才需要真正的
+ * pthread 实现，要 async I/O 才需要 select。
+ *
+ * C99 输出后端不在这个范围：它生成的 C 依赖宿主 libc（stdlib + pthread）。
+ */
+struct Box {
+    int v;
+};
+
+/* ---- 输出与退出：直接发 syscall（x86-64） ---------------------------- */
+
+static void fs_write(const char *s, unsigned long n)
+{
+    __asm__ __volatile__("syscall"
+                         :
+                         : "a"((long)1), "D"((long)1), "S"(s), "d"(n)
+                         : "rcx", "r11", "memory");
+}
+
+static void fs_puts(const char *s)
+{
+    unsigned long n = 0;
+
+    while (s[n])
+        ++n;
+    fs_write(s, n);
+}
+
+static void fs_put_int(long long v)
+{
+    char b[24] = {0};
+    int i = 24;
+    unsigned long long u = v < 0 ? 0ULL - (unsigned long long)v
+                                 : (unsigned long long)v;
+
+    do {
+        b[--i] = (char)('0' + (int)(u % 10));
+        u /= 10;
+    } while (u);
+    if (v < 0)
+        b[--i] = '-';
+    fs_write(b + i, (unsigned long)(24 - i));
+}
+
+static void fs_exit(int code)
+{
+    __asm__ __volatile__("syscall" : : "a"((long)60), "D"((long)code));
+    for (;;)
+        ;
+}
+
+/* ---- 小工具 ---------------------------------------------------------- */
+
+static int eq(const char *a, const char *b)
+{
+    unsigned long i = 0;
+
+    for (i = 0; a[i] || b[i]; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+static int check(int cond, int id)
+{
+    if (cond)
+        return 0;
+    fs_puts("FAIL #");
+    fs_put_int(id);
+    fs_puts("\n");
+    return id;
+}
+
+/* ---- 被验证的东西 ---------------------------------------------------- */
+
+int!error parse(int n)
+{
+    if (n < 0)
+        err(7, f"negative: {n}");
+    return n * 2;
+}
+
+static int run(void)
+{
+    int n = 42, bad = 0;
+    double pi = 3.14159265;
+    _Bool flag = 1;
+    char[:] text = "slice";
+    @char msg = @f"managed {n}";
+
+    /* 整数、格式说明、浮点：文本由运行时自己拼，没有经过 libc */
+    fs_puts(f"n={n} hex={n;08x} pi={pi;.3f}\n");
+    fs_puts(f"{text} / {msg} / {flag}\n");
+    bad |= check(eq(f"{n;5}", "   42"), 1);
+    bad |= check(eq(f"{pi;.2e}", "3.14e+00"), 2);
+    bad |= check(__c6_str_len(msg) == 10, 3);
+
+    /* defer / err / catch 也在同一套运行时上 */
+    {
+        int v = parse(3) catch e { return check(0, 4); };   /* 这里不出错 */
+        bad |= check(v == 6, 5);
+    }
+    {
+        int v = 0, got = 0;
+
+        v = parse(-1) catch e { got = e.id; goto caught; };
+        bad |= check(0, 7);             /* 出错时走不到这里 */
+    caught:
+        bad |= check(got == 7, 6);
+        (void)v;
+    }
+    defer {
+        fs_puts("defer ran\n");
+    }
+    /* 托管对象：分配、写、随作用域释放 */
+    {
+        @Box b = new Box;
+        b->v = n + 1;
+        bad |= check(b->v == 43, 8);
+    }
+    return bad;
+}
+
+void _start(void)
+{
+    int rc = run();
+
+    if (rc)
+        fs_puts("freestanding: FAILED\n");
+    else
+        fs_puts("freestanding: ok\n");
+    fs_exit(rc);
+}

@@ -1,0 +1,9 @@
+/* tests/foreach_iter.c6 的第二个翻译单元：跨 TU 的迭代器方法实现。
+ *
+ * 调用点只看见 struct CrossIt 的声明和 has()/next() 原型；方法符号由
+ * c6_method_symbol() 统一成 CrossIt_has / CrossIt_next。
+ */
+struct CrossIt { int n; };
+
+int has(struct CrossIt *s) { return s->n > 0; }
+int next(struct CrossIt *s) { return s->n--; }
