@@ -506,8 +506,9 @@ void f(Vect@int *v) {
 |`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，体内方法同一符号（`Vect_int_isum` 由纯 C 侧直接调），值形参实例 = `struct Buf_int_4`|
 |`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致（含体内方法：输出里就是普通 `Cnt_int_last()`）|
 
-后续要拆的（对应上面 ⬜ 的条目）：`tests/generic/nest.c`、`suffix.c`——现在
-这些形态都并进 `tests/generic.c` 与 `tests/generic_fn.c` 了。
+原计划单独拆文件的 `tests/generic/nest.c`、`suffix.c` 没有单独立文件：这些
+形态都并进 `tests/generic.c` 与 `tests/generic_fn.c` 了，阶段 1–3 的 12 项
+全部 ✅，没有遗留条目。
 
 跨 TU 按值传实例要注意 c99 后端：它把 8 字节的 struct 打包成一个整型寄存器
 传（和 SysV 一致），更大的 struct 用隐藏返回指针（和系统 ABI 不符）——这是与
