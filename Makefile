@@ -84,6 +84,7 @@ test-plain: build-plain
 
 # tests/：c6 的全部测试
 #   tests/*.c          用 -test 跑里面的 test 块（同名 tests/tu/*.c 作为第二 TU）
+#   tests/c6ext/*.c6   扩展名自测：不传 -std=c6，靠 .c6 后缀开启扩展
 #   tests/errors/*.c   编译期诊断，见 tests/run-tests.sh
 #   tests/c99/*.c      C99 输出后端：先生成 C 源码，再用 gcc 编译运行
 selftest: build

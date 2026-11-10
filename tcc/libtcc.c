@@ -1217,6 +1217,7 @@ static int guess_filetype(const char *filename)
             else if (!strcmp(ext, "s"))
                 filetype = AFF_TYPE_ASM;
             else if (!PATHCMP(ext, "c")
+                     || !PATHCMP(ext, "c6")
                      || !PATHCMP(ext, "h")
                      || !PATHCMP(ext, "i"))
                 filetype = AFF_TYPE_C;
@@ -1228,6 +1229,16 @@ static int guess_filetype(const char *filename)
     }
     return filetype;
 }
+
+#ifdef C6_EXT
+/* A '.c6' source file turns the extensions on for its own translation unit,
+   exactly like '-std=c6' does for the whole run.  The extension is checked
+   independently of the file-type flags so that -x c keeps working. */
+static int is_c6_source(const char *filename)
+{
+    return !PATHCMP(tcc_fileextension(filename), ".c6");
+}
+#endif
 
 ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 {
@@ -1259,7 +1270,19 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
         return tcc_add_binary(s1, flags, filename, fd);
 
     dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(filename));
+#ifdef C6_EXT
+    {
+        int saved_c6_ext = s1->c6_ext;
+        int ret = 0;
+        if ((flags & AFF_TYPE_MASK) == AFF_TYPE_C && is_c6_source(filename))
+            s1->c6_ext = 1;
+        ret = tcc_compile(s1, flags, filename, fd);
+        s1->c6_ext = saved_c6_ext;
+        return ret;
+    }
+#else
     return tcc_compile(s1, flags, filename, fd);
+#endif
 }
 
 LIBTCCAPI int tcc_add_file(TCCState *s, const char *filename)

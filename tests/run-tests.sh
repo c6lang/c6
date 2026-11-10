@@ -21,6 +21,9 @@
 # 测试分组：
 #   tests/*.c         用 -test 跑里面的 test 块；若存在同名的 tests/tu/<name>.c，
 #                     会一起编译，作为第二个翻译单元。
+#   tests/c6ext/*.c6  扩展名自测：故意不传 -std=c6，靠 .c6 后缀开启扩展；
+#                     同名 tests/tu/<name>.c6 作为第二个 TU，构建时带
+#                     '-I tests'，让 'import tu.xxx' 的点号路径能找到模块。
 #   tests/errors/*.c  编译期诊断；每个 `// EXPECT <片段>: <诊断>` 注释对应一次
 #                     -D<片段> 编译，要求 stderr 含该诊断；不带 -D 时该文件
 #                     必须能编译并运行通过。c99 模式下优先使用
@@ -125,11 +128,29 @@ build_test_exe() { # <可执行文件> <源文件>...
     fi
 }
 
-# 用户点名要跑的测试（去掉 .c 后缀的纯名字），空表示全跑
+# tests/c6ext/*.c6 专用：故意不传 -std=c6（后缀必须自己开启扩展）。
+# '-I tests' 是给 import 的点号路径用的（'tu/c6mod.c6' 位于 tests/ 下）。
+build_test_exe_c6() { # <可执行文件> <源文件>...
+    exe=$1
+    shift
+    if [ "$BACKEND" = c99 ]; then
+        $C99TCC -test -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
+            -o "$exe.c" "$@" || return 1
+        $C99CC $C99FLAGS -o "$exe" "$exe.c" || return 1
+        "$exe"
+    else
+        $TCC -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS -test "$@"
+    fi
+}
+
+# 用户点名要跑的测试（去掉 .c/.c6 后缀的纯名字），空表示全跑
 wanted=
 if [ "${1:-}" = "--list" ]; then
     for f in "$ROOT"/tests/*.c; do
         echo "$(basename "$f" .c)"
+    done
+    for f in "$ROOT"/tests/c6ext/*.c6; do
+        [ -e "$f" ] && echo "c6ext/$(basename "$f" .c6)"
     done
     for f in "$ROOT"/tests/errors/*.c; do
         [ -e "$f" ] && echo "errors/$(basename "$f" .c)"
@@ -147,7 +168,7 @@ if [ "${1:-}" = "--list" ]; then
     exit 0
 fi
 for a in "$@"; do
-    wanted="$wanted $(echo "$a" | sed 's,\.c$,,; s,^\./,,; s,^tests/,,')"
+    wanted="$wanted $(echo "$a" | sed 's,\.c6$,,; s,\.c$,,; s,^\./,,; s,^tests/,,')"
 done
 
 is_wanted() {
@@ -179,6 +200,49 @@ for src in "$ROOT"/tests/*.c; do
              "$(echo "$out" | grep -E '^(FAIL|[0-9]+ test)')"
     fi
 done
+
+# ---- 1b. .c6 后缀：不传 -std=c6，靠扩展名开启 c6 ----
+for src in "$ROOT"/tests/c6ext/*.c6; do
+    [ -e "$src" ] || continue
+    name="c6ext/$(basename "$src" .c6)"
+    is_wanted "$name" || continue
+    tu="$ROOT/tests/tu/$(basename "$src" .c6).c6"
+    out=
+    if [ -e "$tu" ]; then
+        set -- "$src" "$tu"
+    else
+        set -- "$src"
+    fi
+    if out=$(build_test_exe_c6 "$TMP/c6ext.bin" "$@" 2>"$TMP/err") \
+       && echo "$out" | tail -n 1 | grep -q ', 0 failure(s)$'; then
+        note_pass "$name: $(echo "$out" | tail -n 1)"
+    else
+        fail "$name" "$(cat "$TMP/err")" \
+             "$(echo "$out" | grep -E '^(FAIL|[0-9]+ test)')"
+    fi
+done
+
+# ---- 1c. -run：.c6 后缀同样开启 c6（用户最常见的用法，仅本机后端） ----
+if [ "$BACKEND" = native ] && is_wanted "c6ext/run"; then
+    cat > "$TMP/run.c6" <<'EOF'
+int main(void)
+{
+    int a[3] = { 1, 2, 3 };
+    int[:] s = a;
+    if (s[1] != 2)
+        return 1;
+    return 7;
+}
+EOF
+    $TCC -B "$ROOT/tcc" $TCCFLAGS -run "$TMP/run.c6" \
+        >/dev/null 2>"$TMP/err"
+    got=$?
+    if [ "$got" = 7 ]; then
+        note_pass "c6ext/run: -run 退出码 7"
+    else
+        fail "c6ext/run" "退出码 $got，期望 7" "$(cat "$TMP/err")"
+    fi
+fi
 
 # ---- 2. 编译期诊断 ----
 for src in "$ROOT"/tests/errors/*.c; do
