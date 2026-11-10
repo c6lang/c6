@@ -58,7 +58,7 @@ struct HIt { int i; };
 int has(struct HIt *s) { return s->i < 1; }
 struct Holder next(struct HIt *s);
 
-// EXPECT test_two_binders: error: an iterator yields only a value: write 'foreach |v| it'
+// EXPECT test_two_binders: error: an iterator yields only a value: write 'foreach |v| it { ... }'
 // EXPECT test_only_has: error: cannot iterate over 'struct OnlyHas' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_shadow: error: cannot iterate over 'struct Shadow' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_has_void: error: iterator method 'has' must return an integer type (got 'void')
@@ -73,6 +73,7 @@ struct Holder next(struct HIt *s);
 // EXPECT test_managed_struct: error: 'struct Holder' holds managed references: a foreach binding is not possible. Allocate it with 'new' and hold it in '@struct Holder'
 // EXPECT test_pointer_to_array: error: cannot iterate over 'struct Good (*)[2]' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
 // EXPECT test_file_scope: error: 'foreach' can only be used inside a function
+// EXPECT test_no_block: error: '{' expected
 
 #if defined test_two_binders
 int main(void)
@@ -211,6 +212,16 @@ int main(void)
 struct Good g = {2};
 foreach |v| g {
     g.n = v;
+}
+#elif defined test_no_block
+int main(void)
+{
+    /* 迭代器分支同样要过 C50：循环体必须是块，'foreach |v| it' 只是绑定表
+       加可迭代对象，写全要带 '{ ... }'。 */
+    struct Good g = {2};
+    foreach |v| g
+        return v;
+    return 0;
 }
 #else
 /* 正常路径：值形态、指针形态、接口值各走一遍 */

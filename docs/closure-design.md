@@ -5,7 +5,7 @@
 [closure-todo.md](closure-todo.md)。在 V2 落地之前，`-std=c6` 的行为仍完全按
 V1 —— 捕获局部变量报 C80，`closure` 也不是类型。
 
-相关：[grammar.md §3.9](grammar.md)（V1 语法与 C80–C83）、
+相关：[grammar.md §3.10](grammar.md)（V1 语法与 C80–C83）、
 [gc-design.md](gc-design.md)（`@T` 的计数、描述符、环检测与跨线程规则）、
 `tests/fn_lit.c` / `tests/errors/fn_lit.c` / `tests/abi/fn_lit.c`。
 

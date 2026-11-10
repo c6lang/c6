@@ -573,7 +573,48 @@ tag 本身就是类型名，`struct` / `union` / `enum` 关键字可以省略（
   新的局部不完整 tag：本特性**不做任何隐式前置声明**。
 * 只在 `-std=c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
 
-### 3.8 元组类型 `(T1, T2, ...)`
+### 3.8 枚举成员写成 `Color.RED`
+
+```
+enumerator             = [ tag , "." ] , identifier ,
+                         [ "=" , constant-expression ] ;
+qualified-identifier   = identifier , "." , identifier ;   (* 枚举成员 *)
+```
+
+C 的枚举成员落在**普通标识符命名空间**里，所以两个枚举不能有同名成员：
+
+```c
+    enum Color { RED = 1 };        (* 同时引入标识符 RED *)
+    enum Fruit { RED = 2 };        (* 错：redeclaration of 'RED' *)
+```
+
+c6 允许把成员写成 `<tag>.<成员>`，让每个枚举自带一层空间：
+
+```c
+    enum Color { Color.RED = 1, Color.GREEN = 2, Color.BLUE };
+    enum Fruit { Fruit.RED = 10, Fruit.APPLE = 20 };
+
+    Color.RED                (* 1 *)
+    Fruit.RED                (* 10：两个 RED 各有各的值 *)
+    BLUE                     (* 3：没被抢占的裸名照旧可用 *)
+    int a[Color.BLUE];       (* 常量表达式里也能用 *)
+    switch (c) { case Color.GREEN: … }
+
+    int show(enum Color c) { return c == Color.RED; }
+```
+
+* 限定符必须是**这个枚举自己的 tag**（约束 C117）；匿名枚举没有 tag，成员
+  不能限定（C118）。成员仍照旧注册成裸名，老代码 `RED` 不用改。
+* 两个枚举都要同一个裸名时，裸名会被**毒化**（C119）：此后 `RED` 报错，
+  必须写 `Color.RED` / `Fruit.RED`——它指谁不再取决于书写顺序。
+* `Tag.名字` 是**表达式**，即使 `Tag` 同时也是类型名（§3.7）：`if`、`while`、
+  `for` 的条件，`switch` 的 `case`，数组长度、位域宽度都能用；枚举里没有
+  这个名字时按 C120 报错。
+* 枚举必须已经定义并可见（与裸名同一条规则），不做任何隐式前置声明。
+* 只在 `-std=c6` 的翻译单元里生效；纯 C 的翻译单元里没有裸 tag 名，
+  `Color.RED` 报 `'Color' undeclared`（写成 `(Color)RED` 也只是强转）。
+
+### 3.9 元组类型 `(T1, T2, ...)`
 
 ```
 type-specifier         = "(" , type-name , "," , type-name ,
@@ -622,7 +663,7 @@ tuple-element-access   = postfix-expression , "[" , integer-constant , "]" ;
   解析——只有当括号里是一串“类型 [, 类型…]”且右括号前没有名字时才按元组
   类型解析（解析器做投机 + 回滚）。
 
-### 3.9 函数字面量 `RET (参数) { 体 }`
+### 3.10 函数字面量 `RET (参数) { 体 }`
 
 ```
 function-literal       = type-specifier , [ "!error" ] ,
@@ -686,7 +727,7 @@ closure-type           = "closure" , type-specifier , [ "!error" ] ,
 C90–C98 与实施阶段见 [closure-design.md](closure-design.md) 和
 [closure-todo.md](closure-todo.md)；在 V2 落地前，编译器仍按 V1 报 C80。
 
-### 3.10 泛型（已落地）
+### 3.11 泛型（已落地）
 
 类型应用是 `@` 后缀：`Vect@int`、`Map@(char[:], int)`、`Buf@(int, 4)`。
 形参表在 tag 定义处挂名（名字先于体），在函数/typedef 处用 `|…|` 前缀
@@ -862,7 +903,7 @@ pattern-element        = type-specifier , declarator      (* 解构声明 *)
 - `has()` 返回整数（含 `_Bool`/`enum`），非零才调用 `next()`；`E` 是
   `next()` 的声明返回类型，必须是完整、可赋值的对象类型（不能是 `void`、
   数组或函数；`void *` 因元素类型被擦除而拒绝）；
-- 迭代器只有值绑定：`foreach |v| it` 或 `foreach |_| it`（后者仍调用
+- 迭代器只有值绑定：`foreach |v| it { … }` 或 `foreach |_| it { … }`（后者仍调用
   `next()` 推进）。“值形态”把迭代器状态复制进隐藏槽，循环不推进原对象；
   `T *` 与接口值直接操作原对象（`next()` 的修改可见）；
 - 迭代器和元素可以是托管引用 `@T`：隐藏槽按声明的托管局部量处理
@@ -892,7 +933,7 @@ primary-expression     = …
                        | try-expression
                        | await-expression
                        | f-string ;                  (* 见 5.1 *)
-                       | function-literal ;          (* 见 3.9 *)
+                       | function-literal ;          (* 见 3.10 *)
 
 f-string               = "f" , string-literal ;      (* const char *，借用的文本 *)
                        | "@" , "f" , string-literal ;
@@ -905,7 +946,9 @@ await-expression       = "await" , unary-expression ;
 qualified-identifier   = identifier , "." , identifier ,
                          { "." , identifier } ;
                          (* 'pkg.member'：第一段必须是已 import 的包名，
-                            否则按普通 C 的成员访问解析；见 C14/R7 *)
+                            否则按普通 C 的成员访问解析；见 C14/R7。
+                            'Tag.MEMBER'（两段，`Tag` 是可见的 enum tag）
+                            是枚举成员常量，见 3.8 与 C117–C120 *)
 
 postfix-expression     = …
                        | postfix-expression , "->" , identifier ,
@@ -1103,13 +1146,13 @@ parameter-list    = identifier , { "," , identifier } ;
 | C41 | 裸 tag 只有在该 tag 可见、且同名**普通符号**（变量/函数/枚举常量/typedef）不在作用域内时才当作类型名；只接受已声明的 tag，不隐式前置声明；语句开头的 `TAG:` 仍是标签；K&R 定义里形参名与 tag 同名时按原型解析 | —（遮蔽/未声明时按普通 C 解析：`';' expected`、`'X' undeclared`、`initialization of incomplete type`） |
 | C42 | `foreach` 只能出现在函数体内 | `'foreach' can only be used inside a function` |
 | C43 | 绑定表是 1 或 2 个标识符（`_` 表示丢弃） | `'foreach' expects a binding name`；`'foreach' takes at most two bindings` |
-| C44 | 数组/切片要两个绑定 | `an array or slice yields an index and a value: write 'foreach \|i, v\| a'` |
-| C45 | 区间只要一个绑定 | `a range yields only an index: write 'foreach \|i\| lo:hi'` |
+| C44 | 数组/切片要两个绑定 | `an array or slice yields an index and a value: write 'foreach \|i, v\| a { ... }'` |
+| C45 | 区间只要一个绑定 | `a range yields only an index: write 'foreach \|i\| lo:hi { ... }'` |
 | C46 | 两个绑定不能都丢弃 | `'foreach' discards both binders` |
-| C47 | 可迭代对象只能是完整数组、切片、整数区间，或提供 `has()`/`next()` 的迭代器 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi')`；`cannot iterate over 'T' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')` |
+| C47 | 可迭代对象只能是完整数组、切片、整数区间，或提供 `has()`/`next()` 的迭代器 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi { ... }')`；`cannot iterate over 'T' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')` |
 | C48 | 区间两个界必须是整数 | `range bounds must be integers` |
 | C49 | 元素类型必须可赋值且完整 | `'foreach' cannot copy an element of type 'T'`；`cannot iterate over incomplete element type 'T'` |
-| C50 | 循环体必须是复合语句 | `'{' expected` |
+| C50 | 循环体必须是复合语句（数组/切片、区间、迭代器三种形态共用这一处检查；C44/C45/C100 的提示里那个 `{ ... }` 就是这条要求） | `'{' expected` |
 | C51 | 元组元素类型必须完整、非 `void`、非函数类型、非变长数组、非数组 | `'tuple' element cannot be 'void'`；`'tuple' element cannot be a function type`；`'tuple' element cannot be a variable length array`；`'tuple' element cannot be an array type (use a pointer, a slice 'T[:]' or a struct)`；`'tuple' requires a complete element type, not 'T'` |
 | C52 | 元素类型的 tag 必须在文件作用域 | `the element type of a tuple must be declared at file scope, but 'T' is local` |
 | C53 | `error` 不能作元组元素 | `'error' can only be a return type, not a tuple element` |
@@ -1150,7 +1193,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C88 | 插值里不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上）；`;` 只能出现一次（引入格式说明），语句表达式里的 `;` 同样被拒绝 | `'try' is not allowed in an interpolation: ...`；`f-string: ';' is only allowed once, to start the format spec ('{expr;spec}')` |
 | C89 | 格式说明要与插值的静态类型相容，`conv` 必须是已知的，宽度/精度不超过 1023，`;` 后面不能为空 | `f-string: unknown conversion 'z' in a format spec`；`f-string: a 'const char *' value takes no 'x' format spec`；`f-string: format width 2000 is too large`；`f-string: empty format spec in '{expr;spec}'` |
 | C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver`；`iterator method 'next' cannot return a borrowed managed reference 'T'` |
-| C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it'` |
+| C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it { ... }'` |
 | C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
 | C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发），第 9 层报错 | `'defer' bodies nested too deeply` |
 | C103 | 裸模板名不是类型：模板名只能出现在 `@` 实参表前面 | `'%s' is generic: write '%s@%s'` |
@@ -1165,8 +1208,13 @@ parameter-list    = identifier , { "," , identifier } ;
 | C114 | 实例名前面不能写 `struct`：`struct Vect@int v;` 不是实例 | `an instance drops 'struct': write '%s@...'` |
 | C115 | 模板不能重定义，参数表也不能改；`struct`/`union` 不能混用；形参不能重名，也不能与模板同名 | `redefinition of template '%s'`；`redefinition of template '%s' with a different parameter list`；`redefinition of template '%s' as a different kind`；`duplicate type parameter '%s'`；`a type parameter cannot have the same name as its template` |
 | C116 | 形参最多 16 个（括号里或单个） | `too many type parameters`；`too many type arguments` |
+| C117 | 枚举成员的限定符必须是这个枚举自己的 tag | `enumerator qualifier 'Other' must be the enum's own tag 'Color'` |
+| C118 | 匿名枚举的成员不能限定 | `the enumerator of an anonymous enum cannot be qualified` |
+| C119 | 两个枚举都要同一个裸成员名时，裸名不再可用，必须写限定名 | `'RED' is the member of more than one enum: write '<enum>.RED'` |
+| C120 | `Tag.成员` 里 `Tag` 必须是可见的枚举，成员必须存在 | `'Fruit' has no member 'APPLE'`；`'Nope' is neither an enum nor an imported package (use 'import Nope;')` |
 
 （C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包。
+枚举成员限定的 C117–C120 见 §3.8。
 泛型的 C103–C116 已全部落地：C106 与 C104 共用一条消息（多参数必须加括号），
 C109 由普通类型检查给出（`cannot convert 'struct Vect_char' to 'struct Vect_int'`），
 见 [generics-design.md](generics-design.md) §9。C90–C98 的闭包仍未实现。）
@@ -2005,7 +2053,7 @@ int main(void)
 | `for a \|i, v\| { }` / `for 0..n` | `for` 保持纯 C；迭代请用 `foreach` |
 | `foreach a { }`（不写绑定表） | 语法错误：绑定表必须紧跟 `foreach` |
 | `foreach (a) \|i, v\| { }`（括号形式） | 不支持：`foreach` 后面直接跟绑定表 |
-| `foreach \|i, v\| a v = 1;`（没有花括号） | 约束 C50 |
+| `foreach \|i, v\| a v = 1;`（没有花括号） | 约束 C50（三种形态都一样：数组/切片、区间 `\|i\| lo:hi`、迭代器 `\|v\| it`） |
 | 文件作用域的 `foreach \|i, v\| a { }` | 约束 C42 |
 | `foreach \|i, v\| p { }`（`p` 是指针） | 约束 C47：先写 `(T[:]){p, n}` |
 | `foreach \|i, v\| 5 { }`（整数） | 约束 C47：整数要先写成区间 `0:5` |
@@ -2020,10 +2068,10 @@ int main(void)
 | `has()` 返回非整数 / `next()` 返回数组、`void`、不完整类型 | 约束 C99/C49 |
 | `has()`/`next()` 带多余形参 | 约束 C99：两个方法只接收 receiver |
 | `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
-| 泛型 `Vect@int` / `struct Vect@T` | 已落地：见 §3.10 与 [generics-design.md](generics-design.md)；实例名带模块前缀、`-emit-header` 可导出；容器迭代仍建议 `foreach` |
-| 体内成员函数 `struct Vect@T { T at(int i) { … } }` | 已落地：隐式 `self`、方法可先用后定义、符号仍是 `Vect_int_at`，见 §3.10 |
+| 泛型 `Vect@int` / `struct Vect@T` | 已落地：见 §3.11 与 [generics-design.md](generics-design.md)；实例名带模块前缀、`-emit-header` 可导出；容器迭代仍建议 `foreach` |
+| 体内成员函数 `struct Vect@T { T at(int i) { … } }` | 已落地：隐式 `self`、方法可先用后定义、符号仍是 `Vect_int_at`，见 §3.11 |
 | 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c` |
-| 泛型值形参 `Buf@(T, 4)` / `struct Buf@(T, int N)` | 已落地：实参是常量表达式，体内当常量用（可作数组长度），见 §3.10 |
+| 泛型值形参 `Buf@(T, 4)` / `struct Buf@(T, int N)` | 已落地：实参是常量表达式，体内当常量用（可作数组长度），见 §3.11 |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
 | `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
 | `t = {1, 2}` / `f({1, 2})`（元组字面量糖） | 不支持：显式写复合字面量 `(int, int){1, 2}` |
@@ -2088,6 +2136,7 @@ int main(void)
 | `#macro` / `__local` | `parse_c6_macro` / `c6_hygiene_body` | `tcc/tccpp.c` |
 | 变量初始化 | `c6_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
 | 裸 tag 类型名 | `parse_btype()` 的 `default` 分支：`sym_find()` 未命中时试 `struct_find()`，命中则走 `basic_type2`（与 `struct TAG` 同一条路径）；`ignore_label` 时 `TAG:` 退回标签 | `tcc/tccgen.c` |
+| 枚举成员 `Color.RED` | `struct_decl()` 的枚举循环（`<tag>.<成员>` 额外注册一个带点的常量名；裸名被别的枚举占用时记进 `c6_enum_poison`，裸用处报 C119）、`unary()` 的 `tok_identifier` 点号分支（先按带点名字查枚举常量，再按包名 mangle）、`decl()` 在条件位置的向前窥探（`Tag.` 一定不是声明，交回 `gexpr()`） | `tcc/tccgen.c` |
 | `T[:]` 类型 | `parse_btype()` 的 `case '['`、`c6_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
 | `(T1, T2)` 元组类型 | `parse_btype()` 的 `case '('`（`c6_ext` 且还没有 `typespec_found` 时）：`c6_tuple_btype` 扫平衡括号、`c6_tuple_speculate` 重放 token 试一遍 `type_decl(TYPE_ABSTRACT\|TYPE_DIRECT)`，成功才认；`c6_tuple_get` 校验元素并规范化出内部 tag `__c6_tuple_N`；`c6_tuple_of_type` / `c6_tuple_ctype` 查询 | `tcc/tccgen.c` |
 | `t[k]` 元素访问 | `c6_tuple_subscript`（`unary()` 的 `[` 后置分支，先于切片下标） | `tcc/tccgen.c` |
