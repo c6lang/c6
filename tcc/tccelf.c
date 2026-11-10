@@ -3361,67 +3361,126 @@ static const char *c6_graph_name(C6GraphName *names, int n, unsigned hash)
     return "?";
 }
 
-/* 1 when a cycle was found and reported */
-static int c6_graph_dfs(TCCState *s1, unsigned node, int depth,
-                        C6GraphEdge *e, int ne, unsigned *path,
-                        unsigned *nodes, int *state, int nn,
-                        C6GraphName *names, int nnames)
+/* A growable string: the cycle path has no length bound, so neither does the
+   message that prints it.  A fixed buffer would cut a long loop in half. */
+typedef struct C6GraphBuf {
+    char *p;
+    int len, cap;
+} C6GraphBuf;
+
+static void c6_graph_buf_puts(C6GraphBuf *b, const char *s)
 {
-    int i = 0, idx = -1;
+    int n = (int)strlen(s);
+
+    if (b->len + n + 1 > b->cap) {
+        int cap = b->cap ? b->cap : 128;
+
+        while (b->len + n + 1 > cap)
+            cap *= 2;
+        b->p = tcc_realloc(b->p, cap);
+        b->cap = cap;
+    }
+    memcpy(b->p + b->len, s, n + 1);
+    b->len += n;
+}
+
+static int c6_graph_node_idx(unsigned *nodes, int nn, unsigned node)
+{
+    int i = 0;
 
     for (i = 0; i < nn; i++)
-        if (nodes[i] == node) {
-            idx = i;
-            break;
-        }
-    if (idx < 0)
-        return 0;                   /* a type nothing else points at */
-    if (state[idx] == 2)
-        return 0;
-    if (state[idx] == 1) {
-        /* back edge: print the loop that closes here */
-        char buf[512] = {0};
-        int len = 0, from = 0;
+        if (nodes[i] == node)
+            return i;
+    return -1;
+}
 
-        for (i = 0; i < depth; i++)
-            if (path[i] == node) {
-                from = i;
-                break;
-            }
-        buf[0] = 0;
-        for (i = from; i < depth; i++) {
-            len += snprintf(buf + len, sizeof buf - len, "%s -> ",
-                            c6_graph_name(names, nnames, path[i]));
-            if (len >= (int)sizeof buf - 8)
-                break;
-        }
-        snprintf(buf + len, sizeof buf - len, "%s",
-                 c6_graph_name(names, nnames, node));
-        tcc_error_noabort("reference cycle across translation units: %s; "
-                          "break it with 'weak' or 'own'", buf);
-        s1->nb_errors++;
-        /* close the loop off so the same cycle is not reported again from
-           another entry point; the walk continues for the rest */
-        for (i = 0; i < depth; i++) {
-            int k = 0;
+/* the walk's path: a node and the edge it is expanding */
+typedef struct C6GraphWalk {
+    int idx;                        /* index in nodes[] */
+    int next;                       /* next edge to look at */
+} C6GraphWalk;
 
-            for (k = 0; k < nn; k++)
-                if (nodes[k] == path[i] && state[k] == 1)
-                    state[k] = 2;
-        }
-        return 1;
+/* 'reference cycle across translation units: A -> B -> A' */
+static void c6_graph_report(TCCState *s1, int from, int sp, int close,
+                            unsigned *nodes, C6GraphWalk *stk,
+                            C6GraphName *names, int nnames)
+{
+    C6GraphBuf b = {0};
+    char *path = 0;
+    int i = 0;
+
+    for (i = from; i < sp; i++) {
+        c6_graph_buf_puts(&b, c6_graph_name(names, nnames, nodes[stk[i].idx]));
+        c6_graph_buf_puts(&b, " -> ");
     }
-    state[idx] = 1;
-    path[depth] = node;
-    for (i = 0; i < ne; i++) {
-        if (e[i].from != node)
+    c6_graph_buf_puts(&b, c6_graph_name(names, nnames, nodes[close]));
+    path = b.p;
+    tcc_error_noabort("reference cycle across translation units: %s; "
+                      "break it with 'weak' or 'own'", path);
+    s1->nb_errors++;
+    tcc_free(path);
+}
+
+/* walk the merged graph from ROOT.  A back edge to a node that is still on
+   the path is a cycle: report it, then mark the loop done so the same cycle
+   is not reported again from another entry point.  The walk is iterative and
+   its path grows with the graph, so a long acyclic chain is not bounded by
+   any constant (and cannot overflow the compiler's stack). */
+static void c6_graph_walk(TCCState *s1, int root, C6GraphEdge *e, int ne,
+                          unsigned *nodes, int *state, int nn,
+                          C6GraphName *names, int nnames)
+{
+    C6GraphWalk *stk = 0;
+    int sp = 0, cap = 0;
+
+    if (root < 0 || nn <= 0 || state[root] == 2)
+        return;
+    cap = 16;
+    stk = tcc_mallocz(cap * (int)sizeof *stk);
+    stk[0].idx = root;
+    sp = 1;
+    state[root] = 1;
+    while (sp > 0) {
+        C6GraphWalk *w = &stk[sp - 1];
+        unsigned node = nodes[w->idx];
+        int toidx = -1, i = 0, from = -1;
+
+        while (w->next < ne && e[w->next].from != node)
+            w->next++;
+        if (w->next >= ne) {
+            if (state[w->idx] == 1)
+                state[w->idx] = 2;
+            sp--;
             continue;
-        c6_graph_dfs(s1, e[i].to, depth + 1, e, ne, path, nodes, state, nn,
-                     names, nnames);
+        }
+        toidx = c6_graph_node_idx(nodes, nn, e[w->next].to);
+        w->next++;
+        if (toidx < 0 || state[toidx] == 2)
+            continue;
+        if (state[toidx] == 1) {
+            /* a back edge: the target is still on the path */
+            for (i = 0; i < sp; i++)
+                if (stk[i].idx == toidx) {
+                    from = i;
+                    break;
+                }
+            if (from < 0)               /* cannot happen: 1 means stacked */
+                continue;
+            c6_graph_report(s1, from, sp, toidx, nodes, stk, names, nnames);
+            for (i = from; i < sp; i++)
+                state[stk[i].idx] = 2;
+            continue;
+        }
+        if (sp >= cap) {
+            cap *= 2;
+            stk = tcc_realloc(stk, cap * (int)sizeof *stk);
+        }
+        state[toidx] = 1;
+        stk[sp].idx = toidx;
+        stk[sp].next = 0;
+        sp++;
     }
-    if (state[idx] == 1)
-        state[idx] = 2;
-    return 0;
+    tcc_free(stk);
 }
 
 ST_FUNC void c6_gc_graph_check(TCCState *s1)
@@ -3430,7 +3489,7 @@ ST_FUNC void c6_gc_graph_check(TCCState *s1)
     Section *ns = c6_graph_find(s1, ".c6.gcname");
     C6GraphEdge *e = 0;
     C6GraphName *names = 0;
-    unsigned *nodes = 0, *path = 0;
+    unsigned *nodes = 0;
     int *state = 0;
     int ne = 0, nnames = 0, nn = 0, i = 0, j = 0;
 
@@ -3463,12 +3522,9 @@ ST_FUNC void c6_gc_graph_check(TCCState *s1)
             nodes[nn++] = e[i].to;
     }
     state = tcc_mallocz(nn * sizeof *state);
-    path = tcc_mallocz((nn + 1) * sizeof *path);
     for (i = 0; i < nn; i++)
         if (state[i] != 2)
-            c6_graph_dfs(s1, nodes[i], 0, e, ne, path, nodes, state, nn,
-                         names, nnames);
-    tcc_free(path);
+            c6_graph_walk(s1, i, e, ne, nodes, state, nn, names, nnames);
     tcc_free(state);
     tcc_free(nodes);
 }
