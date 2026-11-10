@@ -1657,10 +1657,11 @@ ST_DATA int global_expr;  /* true if compound literals must be allocated globall
 ST_DATA CType func_vt; /* current function return type (used by return instruction) */
 ST_DATA int func_var; /* true if current function is variadic */
 #ifdef C6_EXT
-/* c6 async bodies: when the back end can run a body with its frame inside the
-   task (c6_backend_frame_in_task()), the frame never moves, so nothing is
-   copied on a suspension and a 'weak' slot keeps its address.  The back end
-   reports the frame size it reserved from its epilog (c6_frame_size_set()). */
+/* c6 async bodies: the frame of a body lives in its task, so it never moves
+   and nothing is copied on a suspension.  A back end that cannot hand its
+   frame register that memory (c6_backend_frame_in_task() == 0) cannot compile
+   an async function at all.  The back end reports the frame size it reserved
+   from its epilog (c6_frame_size_set()). */
 ST_DATA int c6_stable_frame;      /* the body being compiled uses one */
 ST_DATA int c6_stable_frame_size; /* its frame size in bytes, 0 until known */
 #else

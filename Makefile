@@ -6,7 +6,8 @@
 #   make selftest    跑 tests/ 下所有 c6 自测（test 块 + 编译期诊断）
 #   make test        跑 tests2 上游全量测试（扩展模式）
 #   make test-plain  关闭扩展构建并跑同一套上游测试
-#   make test-all    selftest + tests2 全量
+#   make test-all    selftest + tests2 全量 + c6selfcheck + freestanding/裸机
+#   make check-all   test-all + C99 后端用例 + 三条自举路线（发布前跑这一条）
 #   make c99         C99 输出后端已内置在 tcc/tcc（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
 #   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
@@ -40,8 +41,8 @@ SELFCHECK_DEFS := -DC6_EXT
 SELFHOST_LIBS := -lm -ldl -lpthread
 HOSTCC   ?= gcc
 
-.PHONY: all bootstrap build build-plain test test-plain test-all selftest \
-        clean distclean help check-tcc mode-ext mode-plain c99 c99test \
+.PHONY: all bootstrap build build-plain test test-plain test-all check-all \
+        selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc
 
 all: build
@@ -174,6 +175,11 @@ fstest-bare-smp: build
 
 test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-smp
+
+# 完整验收：test-all 之外还有 C99 后端的两套用例（96 组各跑一遍）和三条
+# 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
+# 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
+check-all: test-all c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。

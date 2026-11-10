@@ -34,6 +34,8 @@ struct Bad@T { Bad@(T *) p; };
 // EXPECT test_chain_depth: warning: generic instantiation nested 3 deep
 // EXPECT test_meth_in_struct: error: a function cannot be defined inside a struct: write 'f' outside it
 // EXPECT test_meth_no_body: error: a member function needs a body: write 'at(...) { ... }' in the template
+// EXPECT test_too_many_params: error: too many type parameters
+// EXPECT test_nested_too_deep: error: generic instantiation nested too deeply (max 64)
 
 #if defined test_bare_name
 int main(void)
@@ -156,6 +158,15 @@ int main(void) { return 0; }
 #elif defined test_meth_no_body
 struct Vec@T { T *d; T at(int i); };
 int main(void) { Vec@int v = {0}; return v.d ? 0 : 1; }
+#elif defined test_too_many_params
+/* 形参最多 16 个（括号里或单个） */
+struct Wide@(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q) { A a; };
+int main(void) { return 0; }
+#elif defined test_nested_too_deep
+/* 实例化嵌套最多 64 层：66 个 'Nest@' 就超了 */
+struct Nest@T { T x; };
+Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@Nest@int g;
+int main(void) { return 0; }
 #else
 int main(void)
 {

@@ -2527,17 +2527,11 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 /*                                                                           */
 /* An 'async' function is compiled to                                        */
 /* 'int __c6_body_NAME(void *task, void *frame)'.  A task owns one block: the */
-/* 'struct NAME_task' header and - when the back end supports it             */
-/* (c6_backend_frame_in_task()) - the native frame of the body, which also    */
+/* 'struct NAME_task' header and the native frame of the body, which also     */
 /* holds the state of its deferred cleanups.  The body's frame pointer is set */
 /* to the top of that block, so every                                         */
 /* local keeps its offset, a suspension is nothing but a return to the driver */
 /* and a local's address stays what it was for the whole life of the task.    */
-/*                                                                           */
-/* A back end without that support leaves 'frame_size' 0 in the descriptor:   */
-/* there the used part of the native frame is copied into the task at every   */
-/* suspension and copied back at every resume ('__c6_co_suspend' below), so a */
-/* '&local' held across an 'await' is only valid again at the same address.   */
 /*                                                                           */
 /* 'co f();' makes a coroutine top-level: it is put on the ready list below   */
 /* and stepped by tcc_co_pump(), which is the scheduler.  Task objects live   */
@@ -2555,9 +2549,6 @@ void __tcc_slice_sub(void *out, const void *slice, TccSliceSize lo,
 #define C6_CO_STATE_NEW   0
 #define C6_CO_STATE_DONE  (-1)
 
-/* Largest native frame a back end without frame-in-task support can park. */
-#define C6_CO_COPY_FRAME  4096
-
 /* lays out exactly like the predef in tccpp.c:tcc_predefs() */
 typedef struct TccCoTask {
     int state, kind;
@@ -2565,8 +2556,6 @@ typedef struct TccCoTask {
     int err_flag, err_id, __pad0;
     void *desc, *frame, *parent, *child;
     const char *err_msg;
-    int frame_size, __pad1;
-    void *frame_addr;
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
     int waiting;                /* parked on wait_fd, waiting for select() */
@@ -2576,7 +2565,7 @@ typedef struct TccCoDesc {
     unsigned size, align;       /* 'struct NAME_task': header + declared fields */
     int (*entry)(void *, void *);       /* (task, top of the frame) */
     void (*release)(void *);    /* give back what the task slot owns */
-    unsigned frame_size;        /* 0: the frame is parked on every suspension */
+    unsigned frame_size;        /* the frame the task block owns, after 'size' */
 } TccCoDesc;
 
 /* One block per task, allocated when the task is created:
@@ -2627,14 +2616,6 @@ static void tcc_co_trap(void)
     *p = 0;
 }
 
-static void tcc_co_copy(void *dst, const void *src, int n)
-{
-    char *d = (char *)dst;
-    const char *s = (const char *)src;
-    while (n-- > 0)
-        *d++ = *s++;
-}
-
 /* 'n' rounded up so that the next 16-byte boundary is inside it */
 static unsigned long tcc_co_align(unsigned long n)
 {
@@ -2663,9 +2644,8 @@ void *__c6_co_new(const TccCoDesc *d)
     t->kind = C6_CO_KIND_DONE;
     q = p + prefix;
     q = (char *)(((unsigned long)q + 15) & ~(unsigned long)15);
-    if (frames)
-        /* the body runs with its frame pointer here: no copy, no move */
-        t->frame = (void *)(q + frames);
+    /* the body runs with its frame pointer here: no copy, no move */
+    t->frame = (void *)(q + frames);
     return t;
 }
 
@@ -2681,25 +2661,14 @@ int __c6_co_await(void *child, void *self)
     return c->state == C6_CO_STATE_DONE ? 0 : 1;
 }
 
-/* Park the error slot and record where the body has to resume.  The native
-   frame is only parked here when the back end did not put it in the task in
-   the first place; the deferred cleanups of the body always live in that
-   frame, so they need no parking at all. */
-void __c6_co_suspend(void *self, int kind, int state, char *base, int size)
+/* Park the error slot and record where the body has to resume.  The frame of
+   the body lives in the task, and the deferred cleanups live in that frame, so
+   there is nothing to park. */
+void __c6_co_suspend(void *self, int kind, int state)
 {
     TccThCtx *th = tcc_th();
     TccCoTask *t = (TccCoTask *)self;
-    const TccCoDesc *d = (const TccCoDesc *)t->desc;
 
-    if (!d->frame_size) {
-        /* this back end moves the frame: keep the used part of it */
-        if (size < 0 || size > C6_CO_COPY_FRAME)
-            tcc_co_trap();
-        if (!t->frame)
-            t->frame = (void *)tcc_th_alloc(C6_CO_COPY_FRAME);
-        tcc_co_copy(t->frame, base - size, size);
-        t->frame_size = size;
-    }
     t->state = state;
     t->kind = kind;
 
@@ -2711,17 +2680,13 @@ void __c6_co_suspend(void *self, int kind, int state, char *base, int size)
     th->err_msg = 0;
 }
 
-/* Re-establish the task's error slot (the generated prologue calls this
-   before it jumps to the resume point) and, for a back end that parks the
-   native frame, put that frame back where it belongs. */
-void __c6_co_restore(void *self, char *base)
+/* Re-establish the task's error slot: the generated prologue calls this
+   before it jumps to the resume point. */
+void __c6_co_restore(void *self)
 {
     TccThCtx *th = tcc_th();
     TccCoTask *t = (TccCoTask *)self;
-    const TccCoDesc *d = (const TccCoDesc *)t->desc;
 
-    if (!d->frame_size)
-        tcc_co_copy(base - t->frame_size, t->frame, t->frame_size);
     th->err_flag = t->err_flag;
     th->err_id = t->err_id;
     th->err_msg = t->err_msg;
@@ -3118,8 +3083,6 @@ void __c6_co_destroy(void *self)
     if (t->desc && ((TccCoDesc *)t->desc)->release)
         ((TccCoDesc *)t->desc)->release(t);
     tcc_co_unlink((TccCoTask **)&co->runlist, t);
-    if (!((TccCoDesc *)t->desc)->frame_size)
-        c6_free(t->frame);             /* the parked native frame, if any */
     c6_free(t);
 }
 

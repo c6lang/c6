@@ -23,6 +23,7 @@
 // EXPECT test_async_method: error: 'async' functions cannot be methods
 // EXPECT test_vla_local: error: a variable length array cannot be declared in an 'async' function
 // EXPECT test_alloca_call: error: 'alloca' cannot be used in an 'async' function
+// EXPECT test_await_unevaluated: error: 'await' is not allowed in an unevaluated context
 
 #if defined test_outside
 /* await 只能出现在 async 函数里 */
@@ -224,6 +225,20 @@ async int f(int n)
     char *p = (char *)alloca(n + 1);
     p[0] = 1;
     return p[0];
+}
+int main(void)
+{
+    return 0;
+}
+#elif defined test_await_unevaluated
+/* sizeof 的操作数不求值，挂起点不能出现在里面 */
+async int add(int a, int b)
+{
+    return a + b;
+}
+async int f(void)
+{
+    return (int)sizeof(await add(1, 2));
 }
 int main(void)
 {

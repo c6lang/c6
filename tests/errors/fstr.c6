@@ -20,6 +20,7 @@
 // EXPECT int_float_conv: error: f-string: a 'int' value takes no 'f' format spec
 // EXPECT conv_type: error: f-string: a 'const char *' value takes no 'x' format spec
 // EXPECT width_big: error: f-string: format width 2000 is too large
+// EXPECT precision_big: error: f-string: format precision 2000 is too large
 // EXPECT empty_spec: error: f-string: empty format spec in '{expr;spec}'
 // EXPECT try_in_fstr: error: 'try' is not allowed in an interpolation
 // EXPECT macro_param: error: 'n' undeclared
@@ -138,6 +139,13 @@ int main(void)
 {
     int n = 1;
     const char *p = f"{n;2000d}";
+    return p[0];
+}
+#elif defined precision_big
+int main(void)
+{
+    int n = 1;
+    const char *p = f"{n;.2000f}";      /* 精度和宽度各占 10 位 */
     return p[0];
 }
 #elif defined empty_spec

@@ -121,9 +121,9 @@ ST_DATA const char * const target_machine_defs =
     ;
 
 #ifdef C6_EXT
-/* c6: the c67 back end has no frame that a task could own, so an async body
-   keeps the copying model: its native frame is copied into the task on every
-   suspension (see __c6_co_suspend in libtcc1.c). */
+/* c6: an async body has to run on a frame its task owns, and this back end
+   cannot hand its frame register that memory, so 'async' is rejected at
+   compile time here (see c6_async_definition in tccgen.c). */
 ST_FUNC int c6_backend_frame_in_task(void)
 {
     return 0;
