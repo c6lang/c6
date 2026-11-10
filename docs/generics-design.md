@@ -510,7 +510,7 @@ void f(Vect@int *v) {
 |---|---|
 |`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/值形参/函数体内定义模板/体内成员函数（隐式 `self`、先用后定义、mangled 符号互调、模板里嵌实例、方法体里第一次实例化别的模板、托管实例上的方法不掉计数、形参表 `(void)`/`()`/`void *p`），26 个 `test` 块|
 |`tests/tu/generic.c`|`tests/generic.c` 的第二个翻译单元：两个 TU 各自声明并实例化同一批模板，盯「泛型表按 TU 复位」（§5.4 那条多 TU 缺陷）|
-|`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块|
+|`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块（起线程那块标了 `// BARE-SKIP`：裸机没有 pthread，`examples/boot/runtests.sh` 跑剩下 8 块）|
 |`tests/errors/generic.c`|C103–C116 的负例：裸模板名、实参个数、实参类型、重复/撞名形参、值形参、`\|…\|` 用法、实例名占用、实例互赋、非模板结构体里写方法、模板体里只写方法原型，加 `-Wgeneric-depth` 的深度告警，24 个片段|
 |`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，体内方法同一符号（`Vect_int_isum` 由纯 C 侧直接调），值形参实例 = `struct Buf_int_4`|
 |`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致（含体内方法：输出里就是普通 `Cnt_int_last()`）|

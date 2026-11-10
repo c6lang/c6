@@ -163,6 +163,10 @@ test "切片可以作形参" {
     if (nel@char(csl) != 2)
         err(2, "char 切片实参不对");
 }
+/* 裸机上没有 pthread：`go` 起不了线程，`h->join()` 走 libtcc1 的每线程块，
+ * 任务收尾会三重故障（见 README「把 tests/ 也搬上裸机」），所以这一块不进
+ * 裸机那张表，同一个文件里其它块照跑。 */
+// BARE-SKIP
 test "实例是普通函数：可以起线程" {
     int d[3] = {4, 5, 6};
     Vect@int v = {d, 3};
