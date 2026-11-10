@@ -19,7 +19,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
 | `foreach \|i, v\| a { ... }` | 遍历数组、切片、整数区间，以及实现 `has()`/`next()` 协议的迭代器：绑定表在前，值绑定是元素副本 |
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
-| 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；体里只看得见参数和文件作用域。捕获式闭包（`closure RET (P…)`，V2）已有完整设计，尚未实现，见 [docs/closure-design.md](docs/closure-design.md) |
+| 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；捕获式闭包 `closure RET (P…)` 把外层块作用域名字按值捕获进隐藏的 env，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（`static` 变量与 VLA 除外） |
 | 泛型（阶段 1 已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。见 [docs/generics-design.md](docs/generics-design.md) |
@@ -842,11 +842,10 @@ V1 的完整可运行示例见 [examples/fn_lit_demo.c](examples/fn_lit_demo.c)�
 ./tcc/tcc -B tcc -std=c6 -run examples/fn_lit_demo.c
 ```
 
-#### 捕获式闭包 `closure`（V2，设计定稿，未实现）
+#### 捕获式闭包 `closure`（V2）
 
-> 当前编译器还没有实现这一节，`-std=c6` 仍按 V1 拒绝捕获。设计全文见
-> [docs/closure-design.md](docs/closure-design.md)，分阶段实施清单见
-> [docs/closure-todo.md](docs/closure-todo.md)。
+> 设计全文见 [docs/closure-design.md](docs/closure-design.md)，验收清单与
+> 用例对照见 [docs/closure-todo.md](docs/closure-todo.md)。
 
 ```c
 closure int(int) make_adder(int n)

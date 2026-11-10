@@ -1,8 +1,8 @@
 # c6 捕获式闭包（V2）实施 todo
 
-设计见 [closure-design.md](closure-design.md)。本文是执行清单：阶段、改动点、
-测试、验收命令。**设计已定稿，代码尚未开始**；每个阶段独立可编译、可回归、
-可提交。
+设计见 [closure-design.md](closure-design.md)。本文是当初的执行清单：阶段、
+改动点、测试、验收命令。**P0–P5 已全部落地**（一个阶段一个提交，标题
+`closure: Pn …`），下面保留作验收对照。
 
 约定：
 
@@ -34,14 +34,14 @@
 
 ## 阶段总览
 
-| 阶段 | 内容 | 依赖 | 主要风险 |
-|---|---|---|---|
-| P0 | `closure` 类型（无字面量） | — | `parse_btype` 软关键字、签名哈希稳定性 |
-| P1 | 捕获扫描 + env + 标量捕获 + 调用改写 | P0 | 扫描 pass 的副作用隔离 |
-| P2 | 托管捕获、描述符、释放、环边 | P1 | env/闭包描述符的字段偏移 |
-| P3 | 嵌套字面量、TYPE 捕获、全部控制流/签名特性 | P1/P2 | 嵌套扫描的 base 语义 |
-| P4 | 函数指针包装、跳板、头文件、跨 TU、C99 | P1 | 变参限制、C99 声明顺序 |
-| P5 | 诊断补齐、文档、全量回归/自举 | 全部 | 旧用例零回归 |
+| 阶段 | 内容 | 依赖 | 主要风险 | 状态 |
+|---|---|---|---|---|
+| P0 | `closure` 类型（无字面量） | — | `parse_btype` 软关键字、签名哈希稳定性 | ✅ |
+| P1 | 捕获扫描 + env + 标量捕获 + 调用改写 | P0 | 扫描 pass 的副作用隔离 | ✅ |
+| P2 | 托管捕获、描述符、释放、环边 | P1 | env/闭包描述符的字段偏移 | ✅ |
+| P3 | 嵌套字面量、TYPE 捕获、全部控制流/签名特性 | P1/P2 | 嵌套扫描的 base 语义 | ✅ |
+| P4 | 函数指针包装、跳板、头文件、跨 TU、C99 | P1 | 变参限制、C99 声明顺序 | ✅ |
+| P5 | 诊断补齐、文档、全量回归/自举 | 全部 | 旧用例零回归 | ✅ |
 
 ---
 
@@ -453,16 +453,27 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
 
 ## P5 诊断补齐、文档、全量回归/自举
 
-- 对照设计 §9 把 C90–C98 的消息逐条实现，`tests/errors/` 每条至少一个
-  `// EXPECT`。
-- `grammar.md`：§3.10 加「V2 设计预览（未实现）」，列出 `closure` 产生式、
-  转换表、C90–C98 指针；正文仍以 V1 为准。
-- `plan.md`：阶段表加一行「29 捕获式闭包（V2）」，状态「设计定稿，未实现」；
-  「函数字面量的设计取舍」里把「捕获版是胖指针」改成「托管引用 + 隐藏 env」。
-- `README.md`：函数字面量一节加 V2 说明和一个小例子（标注未实现）。
-- `gc-design.md`：非目标里「捕获式闭包」改成「V2 设计已定稿，见
-  closure-design.md，尚未实现」。
-- 全量验收：
+已完成：
+
+- 设计 §9 的 C90–C98 在 `tccgen.c` 里逐条实现，`tests/errors/` 每个分条都有
+  `// EXPECT`：`closure_signature.c`（C90）、`closure_convert.c`（C91/C92/C95）、
+  `closure_capture.c`（C93）、`closure_capture_type.c`（C94）、
+  `closure_cross.c`（C96）、`closure_opaque.c`（C97/C98）、
+  `closure_cycle.c`（C66）。
+- 补上 P4 缺的两组用例：`tests/abi/closure.c` + `_plain.c`（纯 C 一侧只按
+  `{code, env}` 布局保存/检查，不调用）、`tests/c99/closure.c`（捕获、跳板、
+  变参、struct 返回、`!error`、托管捕获、`__c6_gc_live()` 归零，生成 C 过
+  `gcc -std=c99 -pedantic -Wall -Wextra -Werror`）；`tests/closure.c` 另加变参
+  捕获与 struct 返回两组 test 块。
+- `grammar.md`：§3.10 改成「V2 捕获式闭包（已落地）」，保留 `closure`
+  产生式并补小例子；约束表补 C90–C98 的行；C80 改成 V2 下的语义（按值捕获
+  进闭包，塞进普通函数指针报 C93，捕获不了报 C94）。
+- `plan.md`：阶段表第 29 行改成 ✅（实现位置摘要）；「函数字面量的设计取舍」
+  里是「托管引用 + 隐藏 env」。
+- `README.md`：函数字面量一节写实现说明和例子（不再标未实现）。
+- `gc-design.md`：非目标里改成「V2 已实现，见 closure-design.md」。
+- 全量验收（`make build` / `make selftest` / `BACKEND=c99 tests/run-tests.sh` /
+  `make c99test` / `make selfhost` / `make c99selfhost` 全绿）：
 
   ```sh
   make build
@@ -474,5 +485,9 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
   make c99selfhost
   ```
 
+  （`make test-plain` 依赖 `build-plain`，它后来在 `main` 上单独坏了：关掉
+  `C6_EXT` 编 `tccgen.c` 报 `unknown type name 'C6Sticky'`，与闭包无关，
+  修好之后这条再补回来。）
+
 - 自查：V1 的 `tests/fn_lit.c`、`tests/errors/fn_lit.c`、`tests/abi/fn_lit*`
-  完全不改；`make test-plain` 零差异。
+  一行不改，仍然照旧通过。

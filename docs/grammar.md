@@ -705,11 +705,11 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
 * 体是**稍后编译**的：和 `static inline` 一样，函数在翻译单元末尾发射，
   内部名字是 `__c6_fn_<序号>`（`static`），所以 `module` 不改写它，
   `-emit-header` 也不导出它。每个字面量各是一个独立的函数；
-* 因此体里只看得见**它自己的参数**和**文件作用域**的名字。写在外层的局部
-  变量、形参、块作用域的 `typedef` 和 tag 在体里不可见：引用它们是编译期
-  错误（C80），而不是悄悄读到一个已经返回的栈槽。需要那些值时把它们作为
-  参数传进来。V1 不实现捕获——捕获式闭包的设计见
-  `docs/closure-design.md`；
+* 没有按值捕获时，体里只看得见**它自己的参数**和**文件作用域**的名字：只
+  在 `sizeof`/`typeof` 里引用了外层局部、形参、块作用域的 `typedef`/tag 会报
+  C80（裸函数指针带不了环境，也不能悄悄读一个已经返回的栈槽）。需要外层的
+  值时把它作为参数传进来，或者把类型写成 `closure RET (P…)` 让字面量按值
+  捕获（V2，见本节末尾）；
 * 能写在任何可以写表达式的地方：文件作用域和 `static` 局部变量的初始化
   器、实参、返回值、结构体成员初值、数组初值、`static inline` 函数体里，
   以及另一个字面量的体里；
@@ -717,18 +717,28 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
   指针表、交给纯 C 保存和回调（`tests/abi/fn_lit.c`），也可以直接传给
   `qsort` 这类标准库函数。
 
-**V2 设计预览（未实现）**：捕获式闭包引入类型构造
+**V2 捕获式闭包（已落地）**：捕获式闭包引入类型构造
 
 ```
 closure-type           = "closure" , type-specifier , [ "!error" ] ,
                          "(" , [ parameter-type-list ] , ")" ;
 ```
 
-它的值是一个机器字的**托管引用**（隐藏对象 `{code, env}`），体里的自由名字
-按值捕获进一个 `@struct` 环境；无捕获的字面量仍然完全按 V1 退化成裸函数
-指针。`closure` 是软关键字，只在类型位置生效。捕获规则、转换表、诊断
-C90–C98 与实施阶段见 [closure-design.md](closure-design.md) 和
-[closure-todo.md](closure-todo.md)；在 V2 落地前，编译器仍按 V1 报 C80。
+它的值是一个机器字的**托管引用**（隐藏对象 `{code, env}`），体里自由出现的
+块作用域名字按值捕获进一个 `@struct` 环境；无捕获的字面量仍然完全按 V1
+退化成裸函数指针。`closure` 是软关键字，只在类型位置生效：
+
+```c
+closure int(int) make_adder(int n)
+{
+    return int(int x) { return x + n; };   /* n 按值进 env */
+}
+```
+
+捕获规则、转换表与分条消息见 [closure-design.md](closure-design.md)，验收
+清单见 [closure-todo.md](closure-todo.md)；诊断编号 C90–C98 见下文约束表
+（V1 的 C80 在 V2 下拆成 C93/C94：捕获了值的字面量只是一个闭包，要普通
+函数指针就报 C93，捕获不能拷贝的东西报 C94）。
 
 ### 3.11 泛型（已落地）
 
@@ -1185,7 +1195,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
 | C78 | `thread` 句柄的初始化式必须是 `go` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'go f(...)'` |
 | C79 | `move(p)` 之后、重新赋值之前不能再用 `p`（读/比较/解引用/传参/再 `move`） | `'%s' was moved: assign a new reference before using it` |
-| C80 | 函数字面量的体里只能引用它自己的参数和文件作用域的名字，不能引用外层局部变量、形参、块作用域 `typedef`/tag（V1 没有捕获；V2 的捕获式闭包设计见 [closure-design.md](closure-design.md)，未实现，V2 下这条拆成 C93/C94） | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
+| C80 | 字面量里引用了外层块作用域的名字，但它**没有按值捕获**（只在 `sizeof`/`typeof` 这类不求值的位置用到，或只是类型别名），于是它仍然退化成裸函数指针——裸函数指针带不了环境。有按值捕获时它就是一个闭包：放进 `closure RET (P…)` 槽（或推断声明）即可；要把它当普通函数指针用报 C93，捕获的东西不能按值拷贝报 C94 | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
 | C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
 | C82 | 函数字面量必须有完整的返回类型、参数表和函数体 | `a function literal needs a full signature: 'RET (parameters) { body }'`；`'{' expected: the body of the function literal`；`a function literal needs a typed parameter list` |
 | C83 | 函数字面量不能带存储类，不能是 `async` | `a function literal cannot have a storage class`；`a function literal cannot be 'async'` |
@@ -1195,6 +1205,15 @@ parameter-list    = identifier , { "," , identifier } ;
 | C87 | `async` 函数体里不能声明变长数组、不能调 `alloca`（栈上的空间挂起之后不归这个 body） | `a variable length array cannot be declared in an 'async' function: it would not survive a suspension`；`'alloca' cannot be used in an 'async' function: it would not survive a suspension` |
 | C88 | 插值里不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上）；`;` 只能出现一次（引入格式说明），语句表达式里的 `;` 同样被拒绝 | `'try' is not allowed in an interpolation: ...`；`f-string: ';' is only allowed once, to start the format spec ('{expr;spec}')` |
 | C89 | 格式说明要与插值的静态类型相容，`conv` 必须是已知的，宽度/精度不超过 1023，`;` 后面不能为空 | `f-string: unknown conversion 'z' in a format spec`；`f-string: a 'const char *' value takes no 'x' format spec`；`f-string: format width 2000 is too large`；`f-string: empty format spec in '{expr;spec}'` |
+| C90 | `closure` 后必须是**完整**函数签名；签名里不能出现匿名 `struct`/`union`/`enum`、块作用域里声明的类型或 `async` 函数；闭包本身已经是托管引用，不能再套 `@` | `a 'closure' type needs a full signature: 'closure RET (parameters)'`；`a closure signature cannot use an anonymous 'struct'/'union'/'enum': give it a tag`；`a closure signature cannot use a type declared in a block`；`a 'closure' type cannot wrap an 'async' function`；`'@' cannot be applied to a closure type: a closure is already a managed reference` |
+| C91 | 闭包不能变成普通函数指针，也不能变成 `void *` 等普通指针：它是 `{code, env}` 的不透明托管对象 | `a closure cannot become a plain function pointer: it carries an environment (call it, or keep it as 'closure RET (parameters)')`；`a closure cannot be converted to '%s': closures are opaque` |
+| C92 | 变参函数指针（或变参的非捕获字面量）不能包装成闭包：跳板转发不了未知的实参表；要变参就写成捕获式字面量 | `a variadic function pointer cannot be wrapped into a closure: a trampoline cannot forward an unknown argument list (make it a capturing literal instead)` |
+| C93 | 有按值捕获的字面量出现在需要普通函数指针的位置（实参、返回值、函数指针变量），它已经是一个闭包；V1 的 C80 文本会在它之前照旧打印一遍 | `this literal captures '%s', so its value is a closure, not a function pointer: use 'closure RET (parameters)' as the type, or pass the value in as a parameter` |
+| C94 | 捕获了不能按值拷贝的名字/类型：`own`/`weak` 引用、块作用域 `static`/函数/枚举常量/类型/tag/枚举、数组、VLA、方法接收者、含 `drop` 或托管字段的结构体、含托管元素的元组、柔性数组、thread/task 句柄 | `a closure cannot capture '%s': an 'own' reference cannot be copied`；`a closure cannot capture '%s': upgrade the 'weak' reference to '@T' first`；`a closure cannot capture the block-scope 'static' '%s': move it to file scope`；`a closure cannot capture the function '%s' declared in a block: move the declaration to file scope`；`a closure cannot capture the constant '%s': move it to file scope`；`a closure cannot capture the array '%s': pass a slice 'T[:]' or a pointer instead`；`a closure cannot capture the variable length array '%s': its size is only known at run time`；`a closure cannot capture '%s': its type is declared in a block (move the type to file scope)`；`a closure cannot capture the method receiver '%s': ...`；`a closure cannot capture '%s': the type has a 'drop' destructor, ...`；`a closure cannot capture '%s': it holds managed references ...`；`a closure cannot capture '%s': a thread/task handle owns a resource ...`（分条消息全文见 [closure-design.md](closure-design.md) §9） |
+| C95 | 文件作用域或 `static` 局部的初始化式里不能放非空闭包（要分配）；`NULL` 可以，运行时再赋值 | `a closure is not a constant expression: initialize it at run time ('NULL' is fine at file scope)` |
+| C96 | 闭包不能带 `shared`/`weak`/`own`，也不能跨线程或任务（`go`/`async`/`thread` 的载荷、`async` 的参数与返回值） | `a closure cannot be 'shared', 'weak' or 'own': V2 closures are confined to the thread that creates them`；`a closure cannot cross a thread or a task: V2 closures are confined to the thread that creates them` |
+| C97 | 对闭包做不透明操作：`->`、`*`、下标、算术、`new`、`offsetof`（只能调用、和 `NULL` 比较、拷贝、`move`、置空释放） | `'%s' is a closure: it can only be called, compared with NULL, copied, moved or released`；`a closure cannot be created with 'new': use a function literal or a function pointer` |
+| C98 | 直接赋给自己的字面量捕获了目标槽自己（闭包会看到旧值；递归要写成具名函数） | `'%s' is captured by the closure being assigned to it: the closure would see the old value (use a named function for recursion)` |
 | C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver`；`iterator method 'next' cannot return a borrowed managed reference 'T'` |
 | C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it { ... }'` |
 | C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
@@ -1216,11 +1235,13 @@ parameter-list    = identifier , { "," , identifier } ;
 | C119 | 两个枚举都要同一个裸成员名时，裸名不再可用，必须写限定名 | `'RED' is the member of more than one enum: write '<enum>.RED'` |
 | C120 | `Tag.成员` 里 `Tag` 必须是可见的枚举，成员必须存在 | `'Fruit' has no member 'APPLE'`；`'Nope' is neither an enum nor an imported package (use 'import Nope;')` |
 
-（C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包。
+（闭包的 C90–C98 见 [closure-design.md](closure-design.md) §9，消息与
+`tccgen.c` 同步落地；C80 在 V2 下只剩「没有按值捕获、却引用了块作用域名字」
+这一种情况。
 枚举成员限定的 C117–C120 见 §3.8。
 泛型的 C103–C116 已全部落地：C106 与 C104 共用一条消息（多参数必须加括号），
 C109 由普通类型检查给出（`cannot convert 'struct Vect_char' to 'struct Vect_int'`），
-见 [generics-design.md](generics-design.md) §9。C90–C98 的闭包仍未实现。）
+见 [generics-design.md](generics-design.md) §9。）
 
 ---
 
@@ -1994,7 +2015,7 @@ int main(void)
 | 自定义删除器 | V1 不做（析构只有 `drop` 方法一种） |
 | 写法 | 结果 |
 |---|---|
-| 捕获式闭包：`int x = 1; f = int() { return x; };` | 当前（V1）报约束 C80：字面量是裸函数指针，体里只看得见参数和文件作用域。V2 设计为按值捕获进 env，类型写成 `closure int()`（见 [closure-design.md](closure-design.md)，未实现） |
+| 捕获式闭包：`closure int() f = int() { int x = 1; return x; };` | 按值捕获进隐藏 env（V2 已落地），类型写成 `closure int()`；无捕获的字面量仍是裸函数指针，捕获了值却塞进普通函数指针报 C93（见 [closure-design.md](closure-design.md)） |
 | `task t = void() { … };` 之类包装 | 不需要：字面量本身就是函数指针，直接 `go f(x)` / 直接传 |
 | `try { … } catch { … }` 块形式 | 语法错误（`try` 只接一次调用） |
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |

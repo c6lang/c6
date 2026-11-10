@@ -1,6 +1,7 @@
 /* c6 闭包转换诊断：C91/C92/C95 */
 
 // EXPECT test_to_fnptr: error: a closure cannot become a plain function pointer: it carries an environment (call it, or keep it as 'closure RET (parameters)')
+// EXPECT test_to_voidptr: error: a closure cannot be converted to 'void *': closures are opaque
 // EXPECT test_variadic: error: a variadic function pointer cannot be wrapped into a closure: a trampoline cannot forward an unknown argument list (make it a capturing literal instead)
 // EXPECT test_static: error: a closure is not a constant expression: initialize it at run time ('NULL' is fine at file scope)
 // EXPECT test_static_local: error: a closure is not a constant expression: initialize it at run time ('NULL' is fine at file scope)
@@ -12,6 +13,14 @@ int main(void)
     closure int() f = int() { return n; };
     int (*p)(void) = f;
     return p();
+}
+#elif defined test_to_voidptr
+int main(void)
+{
+    int n = 1;
+    closure int() f = int() { return n; };
+    void *p = f;
+    return p != 0;
 }
 #elif defined test_variadic
 int vsum(int n, ...) { return n; }
