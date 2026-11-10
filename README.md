@@ -768,9 +768,10 @@ struct 传递路径，所以和等价的 struct 可以互操作：
 
 已知的边角（都不影响上面的用法）：
 
-- 元组类型可以写进 `interface` 的方法声明，但接口转换点目前只支持标量签名
-  （`Splitter sp = h;` 会报 `'{' expected`）——这是元组之前就有的缺口，struct
-  返回值一样会撞上；
+- 接口的方法签名支持 struct / 元组作参数和返回值（`tests/iface_agg.c`），
+  只要类型在 `interface` 声明之前已经可见：`struct P;` 要写在 interface
+  前面，否则那个 tag 只是原型作用域里的另一个类型（诊断会提示
+  prototype-scope tag）；
 - 复合字面量外面再套一层括号时，下标要写在括号**外**：
   `((int, int){1, 2})[0]` 可以，`((int, int){1, 2}[0])` 会报 `')' expected`。
 
@@ -1390,8 +1391,8 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 #### 把 tests/ 也搬上裸机
 
-`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**32 个测试
-文件、341 个 test 块，0 失败**，每个文件一个镜像，一共 13 秒。
+`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**34 个测试
+文件、全部 test 块，0 失败**，每个文件一个镜像，一共十几秒。
 
 ```
 ok   async: 20 test(s), 0 failure(s)
@@ -1400,7 +1401,7 @@ ok   fstr: 15 test(s), 0 failure(s)
 ok   generic_fn: 8 test(s), 0 failure(s)（块级跳过 1）
 ok   try: 18 test(s), 0 failure(s)
 ...
-bare tests: 32 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）（块级跳过: generic_fn:1）
+bare tests: 34 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）（块级跳过: generic_fn:1）
 ```
 
 要补的不是运行时，而是**测试自己用的 libc**：
@@ -1523,20 +1524,38 @@ c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 tests/
 ├── run-tests.sh      运行器（make selftest 调它）
 ├── defer.c           defer 的时机、顺序与作用域
+├── defer_scope.c     defer 与块作用域、goto 跨作用域的清理
+├── defer_reent.c     递归/重入时的 defer 链
+├── defer_thread.c    线程里的 defer（裸机跑不了，boot/runtests.sh 跳过）
 ├── err.c             err / errdefer / 清理顺序
 ├── try.c             try / catch
 ├── test-block.c      test 块与 -test 模式本身
 ├── macro.c           #macro 与 __local 名字卫生
 ├── package.c         package / import / pkg.member
+├── module.c          module / import 加载与 -emit-header
 ├── method.c          结构体方法（含不同类型的同名方法与 libc 方法）
 ├── interface.c       结构化接口
+├── iface_agg.c       接口方法签名里的 struct / 元组
 ├── slice.c           切片
 ├── tuple.c           元组（与 tu/tuple.c 一起跑）
 ├── tuple_error.c     元组 / struct 作 !error 的返回类型
 ├── tuple_async.c     元组 + async / await
 ├── tuple_thread.c    元组 + go（OS 线程）
+├── typename.c        裸 tag 类型名（省略 struct / union / enum）
+├── enum_scope.c      枚举成员的限定名 Color.RED
+├── foreach.c         foreach：数组 / 切片 / 区间
+├── foreach_iter.c    foreach：has()/next() 迭代器协议
+├── fstr.c            字符串插值 f".." / @f".."
+├── fn_lit.c          函数字面量
+├── closure.c         捕获式闭包（V2）
+├── generic.c         泛型：模板、实例、体内方法、值形参
+├── generic_fn.c      |T| 函数 / typedef 模板
 ├── async.c           async / await / co / task
+├── async_frame.c     帧住在任务里：&local 跨 await、weak 形参
 ├── thread.c          go（OS 线程）
+├── thread_handle.c   线程句柄 h->join()/done()/value()
+├── task_method.c     任务句柄 t->wait()/done()/kind()
+├── weak.c            weak 引用
 ├── gc.c              托管引用：分配、存储、作用域释放、数组
 ├── gc_field.c        字段释放、嵌套结构体、长链迭代释放
 ├── gc_type.c         shared / weak / own 的类型语义
@@ -1544,7 +1563,7 @@ tests/
 ├── gc_thread.c       shared 跨线程：实参块持有、交接、并发加减
 ├── gc_async.c        async 任务的参数/返回值持有 + 销毁挂起任务时回卷
 ├── gc_own.c          own 独占链/子树 + move()
-├── typename.c        裸 tag 类型名（省略 struct / union / enum）
+├── gc_return.c       返回托管引用的计数归属（新建/借字段/形参/循环）
 ├── tu/               跨翻译单元的第二个 .c（同名的主文件会一起编译）
 ├── abi/              ABI 兼容：同一份代码用 -std=c6 和纯 C 各编译一个 TU，
 │                     链接后运行（`// EXIT <n>` 声明期望的退出码）
@@ -1573,7 +1592,7 @@ tests/run-tests.sh --list           # 列出会跑的文件
 ok   err: 18 test(s), 0 failure(s)
 ok   errors/slice: 12 个诊断片段
 ...
-run-tests: 23 通过, 0 失败
+run-tests: 92 通过, 0 失败
 ```
 
 `-test` 模式下 `main` 可有可无（运行器不调用它）。

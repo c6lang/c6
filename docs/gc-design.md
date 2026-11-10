@@ -807,14 +807,14 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 
 ## 17. 未决问题
 
-见 [gc-todo.md](gc-todo.md) 的 D1–D6。此外 P6 之后仍开着三件：
+见 [gc-todo.md](gc-todo.md) 的 D1–D6。此外 P6 之后仍开着两件：
 
 1. **链接期跨 TU 环检测只在原生后端**（§8.2 第 2 条、§15）：`-c99` 输出 C
    源码，没有段也没有链接期，跨 TU 环在那边仍然看不到；
 2. **`struct Node c6_graph` 豁免**（§8.4 / D2）没做：共享边的通用图目前只能
-   写成 `own` 树或 `weak` 边 —— 这是语言取舍，真要做得连运行期环回收一起想；
-3. **返回托管引用会漏一个计数**：`@Ref f(void) { return new Ref; }`、
-   `@Ref g(struct S *self) { return self->r; }`、`@Ref h(@Ref p) { return p; }`
-   每调一次调用方的计数就 +1（`tests/` 里没有断言这件事，所以没暴露）。
-   与泛型无关（纯 C6 的普通函数、普通方法都一样），修它要动返回值 ABI 的
-   所有权约定，和单态化无关，留作独立议题。
+   写成 `own` 树或 `weak` 边 —— 这是语言取舍，真要做得连运行期环回收一起想。
+
+返回托管引用时“每调用一次就多一个计数”的旧问题（本节原来的第 3 条）已经
+不存在：`c6_gc_return_hook()` 在返回点把一份引用交给调用者，`tests/gc.c` 的
+`return 把引用交给调用者` 与 `tests/gc_return.c`（新建对象 / 借字段 / 形参
+原样返回 / 循环多次调用）逐条断言计数会回到基线。
