@@ -1183,7 +1183,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C64 | 模块不能直接或间接 import 自己 | `circular import of module 'x'` |
 | C65 | `-emit-header` 只能用于声明了 `module` 的翻译单元；匿名 struct/union 必须已有 typedef 才能写出 | `-emit-header requires a 'module NAME;' declaration`；`cannot write a C header for an anonymous struct type; give it a typedef first` |
 | C66 | 强引用类型图里不能有环（含自环、数组、按值嵌入） | `reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own' (type 'A' at a.c:3)` |
-| C67 | 只有"帧拷贝"后端（c67）上 `weak` 才不能出现在 `async` 函数里；`-b` 不能与 `async` 同用 | `a 'weak' reference cannot be declared in an async function: its frame is moved to the task`；`'-b' cannot be combined with 'async'` |
+| C67 | `-b`（边界检查）不能与 `async` 同用；不能把帧交给 body 的目标（c67）编译期拒绝 `async` | `'-b' cannot be combined with 'async'`；`'async' is not supported on this target` |
 | C68 | 含托管字段的结构体不能按值拷贝/传参/返回 | `'%s' holds managed references: %s is not possible. Allocate it with 'new' and hold it in '@%s'` |
 | C69 | 托管引用只能存进托管槽；借出的指针不能保存 | `a new reference cannot be stored in '%s': it is not a managed reference`；`storing a borrowed reference keeps it alive without counting` |
 | C70 | 形参是借用，不能改写 | `'%s' is a borrow: it owns nothing, so it cannot be reassigned (copy it into an owned local first)` |
@@ -1673,11 +1673,13 @@ const struct __c6_desc __c6_desc_f =
 给出的帧顶：任务块一次分配出 `struct f_task` + 帧（帧里带着自己的清理状态），后端
 把帧寄存器（x86 `rbp`、arm64 `x29`、riscv64 `s0`、arm `fp`、C99 后端的
 `__c99_frmp`）直接指向那块内存，`task` 存在帧的第一个槽里。序言再看
-`__c6_co_state(task)`：非 0 就调用 `__c6_co_restore(task, base)`（帧已住在
-任务里时它只把错误槽放回去）并跳到恢复分发器，为 0 就正常往下执行。
+`__c6_co_state(task)`：非 0 就调用 `__c6_co_restore(task)`（把错误槽放回去）
+并跳到恢复分发器，为 0 就正常往下执行。
 声明的形参在此时被声明成普通局部变量，并从 `task->pN` 拷进来（只有首次进入
 会走这条路径）。描述符第 3 个成员是 body，第 4 个是 `-c9x` 出来的释放函数，
-第 5 个是后端回填的帧大小：0 表示"帧不能住在任务里"（c67），退回拷贝模型。
+第 5 个是后端回填的帧大小（至少 16）：后端起手用
+`c6_backend_frame_in_task()` 回答能不能把帧交给 body，回答不能的目标（c67）
+在编译期拒绝 `async`。
 
 `struct f_task` 由 `c6_async_declare()` 用合成 token 在文件作用域声明，
 所以同一个 `async` 声明在定义方和调用方得到同一个布局。
@@ -1688,12 +1690,12 @@ const struct __c6_desc __c6_desc_f =
     x = await f(a)          ⇒  task = __c6_co_new(&__c6_desc_f);
                                task->p0 = a;
                                if (__c6_co_await(task, self))
-                                   __c6_co_suspend(self, KIND_CHILD, N, base, size);
+                                   __c6_co_suspend(self, KIND_CHILD, N);
                                    return KIND_CHILD;     (* 回到驱动方 *)
                                N:  x = task->val;          (* 恢复后从这里继续 *)
 
     await c6_io(fd, ev)     ⇒  __c6_co_set_io(self, fd, ev);
-                               __c6_co_suspend(self, KIND_IO, N, base, size);
+                               __c6_co_suspend(self, KIND_IO, N);
                                return KIND_IO;
                                N:  __c6_co_rev(self);      (* 就绪掩码 *)
 
@@ -1708,9 +1710,9 @@ const struct __c6_desc __c6_desc_f =
 任务的一生里不变），所以**局部变量、清理点的注册状态、错误状态在挂起前后
 完全不变**，`&local` 跨过 `await` 也仍然有效，帧没有 4 KiB 上限。
 
-后端若回答"帧不能住在任务里"（目前只有 c67），则退回拷贝模型：每次挂起把
-`[base - size, base)` 的原生帧拷进任务（上限 4 KiB），恢复时拷回。那里帧内
-的绝对地址不可跨 `await` 使用，`weak` 局部也被禁止（约束 C67）。
+后端若回答"帧不能住在任务里"（目前只有 c67），`async` 在编译期就被拒绝
+（`'async' is not supported on this target`）：帧搬动的那套模型（挂起拷
+`[base - size, base)`、4 KiB 上限、禁 `weak`）已经删除，不留半套语义。
 
 驱动方 `__c6_co_wait(task)` 反复进入 `__c6_body_f`：每次拿到的 `kind` 是
 `DONE` / `IO` / `CHILD`，为 `CHILD` 时先往子任务里钻，为 `IO` 时用
@@ -2010,7 +2012,7 @@ int main(void)
 | `p->drop()` / `drop(p)` 手动调析构 | 约束 C76（对象只由引用决定生死） |
 | `reset()` 成员 | 不提供：提前放手就是 `p = NULL` |
 | `@T`/`own @T` 进 `go`/`async` | 约束 C73 |
-| `weak @T` 在 `async` 函数里 | 允许（帧住在任务里）；只有 c67 这类帧拷贝后端报约束 C67 |
+| `weak @T` 在 `async` 函数里 | 允许（帧住在任务里，槽的地址一生不变） |
 | 通用图（`struct Node { @Node edges[4]; }`） | 约束 C66：环一律报错，只能写成 `own` 树或 `weak` 边 |
 | 运行期环回收（cycle collector） | 不做：环在编译期就挡住了 |
 | 自定义删除器 | V1 不做（析构只有 `drop` 方法一种） |

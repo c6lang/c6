@@ -18153,13 +18153,13 @@ static CType c6_async_ftype = {0};          /* its declared function type */
 static C6AsyncSite *c6_async_sites = 0;
 static int c6_async_nstates = 0;
 static int c6_async_dispatch = 0;         /* jump chain to the resume dispatcher */
-static int c6_async_base_off = 0;         /* slot holding the frame base marker */
 static int c6_async_fr_off = 0;           /* slot of the 'void *task' parameter */
 
-/* The back end's answer to 'can the body run with its frame inside the task?'
-   is asked once per async definition and kept in 'c6_stable_frame' while that
-   body is compiled; the descriptor then carries the frame size the back end
-   reports from its epilog (c6_frame_size_set()). */
+/* Set while the body of an async function is compiled: the back end then runs
+   it on the frame its task owns instead of the native stack, and reports the
+   size of that frame from its epilog (c6_frame_size_set()); the descriptor
+   carries that size.  A back end that cannot do this cannot host an async
+   function at all -- see c6_backend_frame_in_task(). */
 ST_DATA int c6_stable_frame = 0;
 ST_DATA int c6_stable_frame_size = 0;
 
@@ -18812,14 +18812,6 @@ static void c6_async_push_task(void)
     vset(&char_pointer_type, VT_LOCAL | VT_LVAL, c6_async_fr_off);
 }
 
-/* push the frame base (rbp), recovered from the marker's own address */
-static void c6_async_push_base(void)
-{
-    vset(&char_pointer_type, VT_LOCAL, c6_async_base_off);
-    vpushi(-c6_async_base_off);
-    gen_op('+');
-}
-
 /* the task structure of async function NAME */
 static CType c6_async_task_ctype(int name)
 {
@@ -18887,7 +18879,6 @@ static void c6_async_finish(int kind)
    freshly defined resume label when the task is stepped again. */
 static void c6_async_suspend(int kind)
 {
-    int size = -loc;
     int state = ++c6_async_nstates;
     int vsp = vtop - vstack;
     C6AsyncSite *site = 0;
@@ -18904,16 +18895,14 @@ static void c6_async_suspend(int kind)
                       "variable: store it in a local first");
     }
 
-    /* __c6_co_suspend(task, kind, state, base, size).  The cleanup state of
-       the body lives in its frame, and the frame lives in the task, so there
-       is nothing to park: see docs/gc-design.md §9.1. */
+    /* __c6_co_suspend(task, kind, state).  The cleanup state of the body
+       lives in its frame, and the frame lives in the task, so there is nothing
+       to park: see docs/gc-design.md §9.1. */
     c6_rt_begin("__c6_co_suspend");
     c6_async_push_task();
     vpushi(kind);
     vpushi(state);
-    c6_async_push_base();
-    vpushi(size);
-    c6_rt_end("__c6_co_suspend", 5);
+    c6_rt_end("__c6_co_suspend", 3);
     vpushi(kind);
     gfunc_return(&int_type);
     rsym = gjmp(rsym);
@@ -19134,30 +19123,17 @@ static void c6_async_call(Sym *s)
 static void c6_async_func_begin(void)
 {
     Sym *arg = sym_find(tok_alloc_const("__c6_arg"));
-    Sym *p = 0;
     int j = 0, skip = 0;
 
     if (!arg)
         tcc_error("internal: async body has no frame argument");
-    /* A back end that parks the native frame of the body copies it to a
-       possibly different address, so a weak slot (which is a pointer to the
-       slot itself) cannot be supported there.  With the frame living in the
-       task ('c6_stable_frame') the slot never moves and 'weak' is fine. */
+    /* the frame lives in the task for the whole life of the task, so a 'weak'
+       slot (a pointer to the slot itself) never moves and is allowed here, as
+       a parameter, a local or a return value */
     c6_async_in_body = 1;
-    if (!c6_stable_frame) {
-        if (c6_type_gq(pointed_type(&c6_async_ftype)) & C6_GQ_WEAK)
-            tcc_error("a 'weak' reference cannot be returned by an async "
-                      "function: its frame is moved to the task");
-        for (p = c6_async_params(&c6_async_ftype); p; p = p->next)
-            if (c6_type_gq(&p->type) & C6_GQ_WEAK)
-                tcc_error("a 'weak' reference cannot be a parameter of an "
-                          "async function: its frame is moved to the task");
-    }
     c6_async_fr_off = arg->c;
-    loc = (loc - PTR_SIZE) & -PTR_SIZE;
-    c6_async_base_off = loc;
 
-    /* if (__c6_co_state(task)) { __c6_co_restore(task, base); goto dispatch; } */
+    /* if (__c6_co_state(task)) { __c6_co_restore(task); goto dispatch; } */
     c6_rt_begin("__c6_co_state");
     c6_async_push_task();
     c6_rt_end("__c6_co_state", 1);
@@ -19167,8 +19143,7 @@ static void c6_async_func_begin(void)
     gsym(j);
     c6_rt_begin("__c6_co_restore");
     c6_async_push_task();
-    c6_async_push_base();
-    c6_rt_end("__c6_co_restore", 2);
+    c6_rt_end("__c6_co_restore", 1);
     c6_async_dispatch = gjmp(c6_async_dispatch);
     gsym(skip);
 }
@@ -19361,7 +19336,7 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     int body = c6_async_tok("__c6_body_", name, "");
     TokenString *ts = 0;
     Sym *body_sym = 0;
-    int align = 0, size = 0, rel = 0, stable = 0, fsiz = 0;
+    int align = 0, size = 0, rel = 0, fsiz = 0;
 
     c6_async_declare(ftype, name);
 
@@ -19396,16 +19371,17 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     c6_async_nstates = 0;
     c6_async_dispatch = 0;
 
-    /* ask the back end before the body is generated: the prolog it emits
-       depends on the answer, and so does everything gated on 'weak'.  It is
-       cleared again right after the body, because the release function the
-       descriptor mentions is an ordinary function. */
-    stable = c6_backend_frame_in_task() ? 1 : 0;
+    /* A body runs on the frame its task owns, which the back end has to hand
+       to it: one that cannot do that cannot compile an async function at all.
+       The flag is cleared again right after the body, because the release
+       function the descriptor mentions is an ordinary function. */
+    if (!c6_backend_frame_in_task())
+        tcc_error("'async' is not supported on this target");
 #ifdef CONFIG_TCC_BCHECK
-    if (stable && tcc_state->do_bounds_check)
+    if (tcc_state->do_bounds_check)
         tcc_error("'-b' cannot be combined with 'async'");
 #endif
-    c6_stable_frame = stable;
+    c6_stable_frame = 1;
     c6_stable_frame_size = 0;
 
     cur_text_section = text_section;
@@ -19437,9 +19413,8 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     else
         c6_async_add_int(ts, 0);
     tok_str_add(ts, ',');
-    /* the frame the task has to own: 0 means the back end parks the native
-       frame on every suspension instead (c6_backend_frame_in_task() == 0) */
-    c6_async_add_int(ts, stable ? (fsiz > 0 ? fsiz : 16) : 0);
+    /* the frame the task owns: the size the back end reported from its epilog */
+    c6_async_add_int(ts, fsiz > 0 ? fsiz : 16);
     tok_str_add(ts, '}');
     tok_str_add(ts, ';');
     tok_str_add(ts, TOK_EOF);
@@ -20464,10 +20439,6 @@ static void c6_gc_site(int off, CType *type)
 
     if (!defer_state.enabled || nocode_wanted || off >= 0)
         return;                     /* parameters are borrowed */
-    if ((c6_type_gq(type) & C6_GQ_WEAK) && c6_async_in_body
-        && !c6_stable_frame)
-        tcc_error("a 'weak' reference cannot be declared in an async "
-                  "function: its frame is moved to the task");
     id = c6_defer_new_site();
     l = c6_new_label("gcr");
     c6_defer_arm(id);

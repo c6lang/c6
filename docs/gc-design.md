@@ -496,24 +496,25 @@ body（`int __c6_body_f(void *task, void *frame)`），后端把帧寄存器直�
 （x86_64/i386 `rbp`、arm64 `x29`、riscv64 `s0`、arm `fp`、C99 后端
 `__c99_frmp`）。于是：
 
-- 挂起**不拷贝任何东西**：`__c6_co_suspend` 只在 `desc->frame_size == 0` 时
-  才走老的 memcpy 路径；
+- 挂起**不拷贝任何东西**：`__c6_co_suspend` 只把错误槽存进任务——帧就在任务
+  里，没有可搬的东西；
 - 帧的**绝对地址**在任务的一生里不变，`&local` 跨过 `await` 依旧有效
   （`tests/async_frame.c` 用 `co` + `__c6_co_run()` 恢复来断言——那正是老模型
   会搬帧的组合）；
 - 帧没有 4 KiB 上限，任务也没有固定池上限（每个任务一块，结束即释放）。
 
-后端用 `c6_backend_frame_in_task()` 回答能不能做到，收尾时用
-`c6_frame_size_set()` 把帧大小回填进描述符的第 6 个成员。目前回答 1 的有：
+后端用 `c6_backend_frame_in_task()` 起手回答能不能做到，做不到的直接在编译期
+拒绝 `async`；收尾时用 `c6_frame_size_set()` 把帧大小回填进描述符的第 6 个
+成员。回答 1 的有：
 x86_64（ELF/PE/mach-o，PE 另有专门的 `.pdata`/`.xdata` 记录）、i386
 （ELF/PE）、arm64（ELF/PE/mach-o）、arm（EABI/VFP/FPA/WinCE）、riscv64、
 C99 输出后端。
 
 仍然存在的限制：
 
-1. **c67** 回答 0，退回拷贝模型：那里帧仍会被搬动，帧内绝对地址（`&local`、
-   弱槽）在恢复后可能指向别的栈，`frame_addr` + `-DC6_CO_CHECK_FRAME_ADDR`
-   的地址校验也只为它保留；
+1. **c67** 回答 0：它没法把帧寄存器指向任务内存，所以这个目标上 `async` 是
+   编译期错误（`'async' is not supported on this target`）——不放行"帧会被搬
+   动"的半套语义，拷贝模型（`C6_CO_COPY_FRAME`、`frame_addr` 校验）已删除；
 2. `-b`（边界检查）与 `async` 互斥：`'-b' cannot be combined with 'async'`；
 
 ### 9.2 `weak` 与 `async`（已放开）
@@ -531,16 +532,10 @@ async int f(int fd, weak @Node param)   /* ✓ 形参 */
 async weak @Node g(void);               /* ✓ 返回值 */
 ```
 
-约束 C67 只在**帧拷贝**后端（c67）上仍然成立：那里挂起会把原生帧搬到别的
-地址，注册在帧里的弱槽立刻悬空。错误文案（仅那些后端）：
-
-```
-error: 'a 'weak' reference cannot be declared in an async function: its frame
-       is moved to the task'
-```
-
-检查点：`c6_async_func_begin()`（形参/返回值，条件 `!c6_stable_frame`）与
-`c6_gc_site()`（局部声明，同样的条件）。
+于是 `weak` 形参、局部、返回值在 `async` 里都合法：帧在任务的一生里地址不变，
+注册在帧里的弱槽不会悬空。曾经的"帧会被搬到别处"禁令只对帧拷贝后端有意义，
+那套后端（c67）现在编译期就拒绝 `async`，禁令与它的检查点
+（`c6_async_func_begin()` / `c6_gc_site()` 里的 `!c6_stable_frame`）一并删除。
 
 ### 9.3 未完成任务必须回卷（`__c6_co_destroy`）
 
@@ -799,7 +794,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | 编号 | 缺陷 | 位置 | 处理 |
 |---|---|---|---|
 | H1 | `__c6_co_destroy` 不回卷未完成任务 | `lib/libtcc1.c:1580` | `__c6_co_abort`（§9.3） |
-| H2 | async 帧搬动 → 帧内绝对地址失效 | `lib/libtcc1.c` 的 `__c6_co_suspend`/`restore` | 已修：帧住进任务（§9.1，A3）；只有 c67 走拷贝模型，那里保留 `weak` 禁令（§9.2）与地址校验 |
+| H2 | async 帧搬动 → 帧内绝对地址失效 | `lib/libtcc1.c` 的 `__c6_co_suspend`/`restore` | 已修：帧住进任务（§9.1，A3，五个后端 + C99）；拷贝模型与 `weak` 禁令已删除，c67 上 `async` 编译期报错 |
 | H4 | 方法调用的接收者被拷进临时槽时走了普通托管赋值：临时槽没初始化却先读旧值去释放（栈垃圾 → 崩），而且给接收者白加一个永不释放的引用 | `tcc/tccgen.c` 的 `c6_method_call_prep()` | 已修：接收者那份拷贝是借用，按 `C6_GCM_INIT \| C6_GCM_FRESH` 存（不计数、不读旧值） |
 | H3 | defer 栈满 8192 静默丢记录 | 原 `lib/libtcc1.c` 的 defer 记录栈 | 已消灭：记录栈整个删掉，清理状态搬进函数帧（§6、[grammar.md](grammar.md) 8.2），上限变成编译期报错（C101/C102） |
 

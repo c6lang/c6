@@ -902,8 +902,9 @@ int main(void)
 `struct f_task` 加函数帧，函数体直接在这块内存上跑，`await` 只把错误槽
 存进任务就 `return` 回驱动方；恢复时把错误槽放回去，再跳到那个恢复点。
 帧不搬也不拷，所以局部变量和 `defer` 的注册状态（都在帧里）在挂起前后
-完全不变，也不需要上下文切换。（`-c67` 目标还没有 frame-in-task 后端，
-它仍然把帧拷进任务块，但 `defer` 状态跟着帧一起走，语义一样。）
+完全不变，也不需要上下文切换。（把帧交给 body 需要后端配合：`c67` 目标做不到，
+它上面 `async` 是编译期错误；六个有 frame-in-task 支持的目标——x86_64、i386、
+arm、arm64、riscv64 与 C99 输出后端——都走"帧住在任务里"。）
 
 速查：
 
@@ -925,6 +926,8 @@ int main(void)
   作用域**，不能嵌套、不能 `async inline`、不能是 `main`；
 - 签名必须是能从声明写回任务结构的类型：标量、枚举、指针、`T[:]`、
   文件作用域的 struct/union。数组、VLA、函数指针参数都会报错；
+- 帧住进任务需要后端把帧寄存器指向任务内存；做不到的目标（`c67`）在编译期
+  直接拒绝 `async`（`'async' is not supported on this target`）；
 - 三种写法都可用：`await f();`、`a = await f();`、`await f(), a = await g();`
   也可以写在参数里（`f(a, await g())`）和条件里
   （`while (await c6_io(fd, C6_CO_EV_READ) > 0)`）；

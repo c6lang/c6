@@ -582,7 +582,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_c6_macro` / `c6_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/`static`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
-| 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task, void *frame)` 编译，`c6_async_func_begin` 算帧基址并分发、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把错误槽 park 出去（帧住在任务里，不用搬，清理状态跟着帧走）；运行期 `libtcc1.c` 的 `__c6_co_new`（一次分配任务结构 + 帧）/ `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（按需 malloc + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
+| 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task, void *frame)` 编译，`c6_async_func_begin` 生成恢复分发序言（非 0 状态就 `__c6_co_restore` + 跳恢复点）、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把错误槽 park 出去（帧住在任务里，不用搬，清理状态跟着帧走）；运行期 `libtcc1.c` 的 `__c6_co_new`（一次分配任务结构 + 帧）/ `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（按需 malloc + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
 
 | 13 `co` / `task` 软关键字 | ✅ | `co`/`go`/`task` 不进 `tcctok.h`：词法阶段仍是标识符，`block()` 里 `tok >= TOK_IDENT` 且 `c6_soft_kw(t)` 命中、名字没有被 `VT_TYPEDEF` 占用时按关键字分派（`c6_soft_kw_shadowed`），所以 `int go = 1;`、`go(x);`、`typedef int co;`、`go:` 都还成立；`c6_co_parse`（`decl()` 与 `block()` 两个入口——单条语句不走 `decl()`）+ `__tcc_co_spawn`；`c6_task_decl` / `c6_task_check_handle`（`struct NAME_task` 的 `head` 必须是 `struct __c6_task`）/ `c6_task_defer_destroy`（合成一个作用域清理点，同手写 `defer`）；运行期 `libtcc1.c` 的顶层就绪链表（`snext`/`busy`/`waiting`）与 `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run`，`__c6_co_wait` 也改成先推进顶层任务；`async` 体里的 `err` 走 `c6_async_propagate`（`KIND_ERR`），并禁止 `async` 方法是方法；预置声明同步加 `__tcc_co_spawn` / `__c6_co_run` |
 | 14 `go` = OS 线程 | ✅ | `c6_go_parse` 只在 `-std=c6` 下生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `go` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（错误槽 / 插值构造器 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS）；`defer` 不在其中，它的状态在函数帧里 |
@@ -823,9 +823,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   输出，与 `catch` 落空时的处理保持一致；
 - 元素本身是数组时先用 `typedef`（`typedef int Row[3]; Row[:] rows;`）——数组
   声明符只能写在名字上，C 本身如此。
-- `async` 是**无栈**协程：函数体始终跑在调用方的栈上，`await` 处只保存
-  错误槽（帧住在任务里时）或帧（`[base - size, base)`，帧拷贝后端），
-  `return` 回驱动方；恢复时原样取回并跳到恢复点。清理点的注册状态在函数
+- `async` 是**无栈**协程：函数体跑在任务自己那块内存上，`await` 处只把错误
+  槽存进任务，`return` 回驱动方；恢复时原样取回并跳到恢复点。清理点的注册状态在函数
   帧里，跟着帧走，所以不需要额外保存。因此没有独立栈、没有
   `setjmp`/`ucontext`，也没有上下文切换开销，但**不能**在 `await` 之后
   依赖别的协程帧还活着；
@@ -833,8 +832,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   一次 `malloc` 出 `struct NAME_task` + 帧（不再有 64 个任务的固定池，也不再
   挂起时 memcpy），帧寄存器直接指向那块内存，所以 `&local` 跨 `await` 有效；
 - 每线程状态（就绪链表 / 错误槽 / 插值构造器）走 `pthread_key`（不是
-  `__thread`：`-run` 不支持 TLS）；只有 c67 这类回答"帧不能住在任务里"的后端
-  才退回拷贝模型（4 KiB 上限 + 禁 `weak`），`-b` 与 `async` 互斥；
+  `__thread`：`-run` 不支持 TLS）；c67 这类无法把帧交给 body 的后端在编译期
+  拒绝 `async`（拷贝模型已删除），`-b` 与 `async` 互斥；
 - 挂起点上已压在求值栈里的中间值必须落在**变量**里（帧槽会随帧一起
   恢复）。实践中调用点本来就会把活寄存器先落到帧槽，所以
   `plain() + await f()` 也能用；静态判断不出来时报约束 C33；
