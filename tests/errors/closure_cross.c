@@ -12,7 +12,7 @@ int main(void)
 {
     int n = 1;
     closure int() c = int() { return n; };
-    go work(c);
+    spawn work(c);
     c = NULL;
     return 0;
 }

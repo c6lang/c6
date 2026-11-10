@@ -1647,7 +1647,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     const char *emit_name;
 
     /* a function may be called (or have its address taken) before its body
-       appears, e.g. the __c6_sp_* trampolines the 'go' statement emits after
+       appears, e.g. the __c6_sp_* trampolines the 'spawn' statement emits after
        main: declare it up front so the generated C sees a prototype */
     c99_register_decl(func_sym, ftype);
     emit_name = c99_test_name(name);

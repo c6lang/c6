@@ -82,7 +82,7 @@ static void work(void)
 void drop(struct File *self)
 {
     (void)self;
-    go work();
+    spawn work();
 }
 int main(void)
 {

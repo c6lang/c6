@@ -1,5 +1,5 @@
 /* 裸机上的抢占式调度器 + 那 8 个 pthread 入口 —— 这就是"内核那一层"的
- * 最小版本，有了它 go / thread 在裸机上就是**真并发**：
+ * 最小版本，有了它 spawn / thread 在裸机上就是**真并发**：
  *
  *   - 8259A 重映射到 0x20..0x2F，8254 PIT 通道 0 每 10ms 中断一次；
  *   - 中断进来立刻换到调度器自己的中断栈，把被打断的现场（15 个通用寄存器
@@ -21,7 +21,7 @@
  * 单核上是真并发（交错推进），不是并行；并行要多核，见 smp.plain.c。
  *
  * 接口就 8 个：pthread_create / join / once / key_create / getspecific /
- * setspecific / self / equal。libtcc1 的 go 只认这几个符号，别的都不问。
+ * setspecific / self / equal。libtcc1 的 spawn 只认这几个符号，别的都不问。
  */
 
 #define MAXTASK 32

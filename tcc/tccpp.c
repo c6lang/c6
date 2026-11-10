@@ -4187,7 +4187,7 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "int __c6_co_start(void *self);\n"
           "void __c6_co_destroy(void *self);\n"
           "void __tcc_co_spawn(void *task);\n"
-          /* 'go' : the argument block of one call, and the thread starter */
+          /* 'spawn' : the argument block of one call, and the thread starter */
           "void *__tcc_sp_args(unsigned long size);\n"
           "int __tcc_th_start(void *(*fn)(void *), void *arg);\n"
           "void __c6_th_join_all(void);\n"

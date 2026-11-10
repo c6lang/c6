@@ -101,7 +101,7 @@ def main():
             printf("PASS: %s\\n", __c6_test_tbl[i].desc);
         }
     }
-    /* go 起的线程必须先收干净，运行时代码才会被释放 */
+    /* spawn 起的线程必须先收干净，运行时代码才会被释放 */
     __c6_th_join_all();
     printf("%d test(s), %d failure(s)\\n", n, nfail);
     boot_exit(nfail ? 1 : 0);

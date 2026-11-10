@@ -1,9 +1,9 @@
-/* freestanding 下的 go / thread：程序自己实现 pthread（真线程）
+/* freestanding 下的 spawn / thread：程序自己实现 pthread（真线程）
  *
- *   make fstest-go
+ *   make fstest-spawn
  *
  * examples/freestanding_pthread.c 用 clone + futex 实现那 8 个入口（普通 C，
- * 不是 c6），这里只写 c6：go、thread 句柄、h->join()、h->value()，以及在线程
+ * 不是 c6），这里只写 c6：spawn、thread 句柄、h->join()、h->value()，以及在线程
  * 里用字符串插值（每个线程有自己的 defer 栈、错误槽和插值构造器）。
  *
  * 下面 spinner / setter 的配合只有真并发才能成立：spinner 要等到 setter 置位
@@ -55,8 +55,8 @@ static int setter(int n)
 void _start(void)
 {
     int rc = 0;
-    thread a = go spinner(1);
-    thread b = go setter(2);
+    thread a = spawn spinner(1);
+    thread b = spawn setter(2);
 
     if (!a || !b) {
         rc = 4;                         /* 链接里没有 pthread 层时走这里 */
@@ -66,6 +66,6 @@ void _start(void)
         rc |= a->value() == 1 ? 0 : 1;  /* 只有真并发才拿得到 1 */
         rc |= b->value() == 20 ? 0 : 2;
     }
-    puts_(rc ? "go: FAILED\n" : "go: ok\n");
+    puts_(rc ? "spawn: FAILED\n" : "spawn: ok\n");
     x(rc);
 }

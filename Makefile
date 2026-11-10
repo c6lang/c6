@@ -96,7 +96,7 @@ fstest: build
 	    examples/freestanding_fstr.c tcc/libtcc1.a
 	./build/freestanding_fstr
 
-# freestanding + 程序自己实现的 pthread 层：go / thread
+# freestanding + 程序自己实现的 pthread 层：spawn / thread
 fstest-go: build
 	./tcc/tcc -B tcc -c -o build/freestanding_pthread.o \
 	    examples/freestanding_pthread.c

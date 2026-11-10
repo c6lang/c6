@@ -1,4 +1,4 @@
-/* 裸机 + 多核：`go` 出来的任务在另一个核上跑，两个核真的同时在推进。
+/* 裸机 + 多核：`spawn` 出来的任务在另一个核上跑，两个核真的同时在推进。
  *
  * 举证的办法（不是"看着像"）：
  *   - 每个任务自己报"我在哪个核"——核号是从 LAPIC 的 ID 寄存器读的；
@@ -64,7 +64,7 @@ void _start(void)
     a_core = sched_core();
     say2("smp: 在线核数 %d，A 跑在核 %d\n", ncpu, a_core);
 
-    go worker_b(2);                      /* 有多核时这活会落到 AP 上 */
+    spawn worker_b(2);                   /* 有多核时这活会落到 AP 上 */
 
     while (!b_in && a_prog < CAP)        /* 等 B 报到 */
         a_prog++;
