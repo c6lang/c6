@@ -32,6 +32,8 @@ struct Bad@T { Bad@(T *) p; };
 // EXPECT test_fn_bare_name: error: 'id' is generic: write 'id@...'
 // EXPECT test_value_binder_name: error: a value parameter is written '<type> NAME'
 // EXPECT test_chain_depth: warning: generic instantiation nested 3 deep
+// EXPECT test_meth_in_struct: error: a function cannot be defined inside a struct: write 'f' outside it
+// EXPECT test_meth_no_body: error: a member function needs a body: write 'at(...) { ... }' in the template
 
 #if defined test_bare_name
 int main(void)
@@ -148,6 +150,12 @@ int main(void)
 
     return two.x.x + deep.x.y.y + alias.x + missing_name;
 }
+#elif defined test_meth_in_struct
+struct Plain { int a; int f(void) { return a; } };
+int main(void) { return 0; }
+#elif defined test_meth_no_body
+struct Vec@T { T *d; T at(int i); };
+int main(void) { Vec@int v = {0}; return v.d ? 0 : 1; }
 #else
 int main(void)
 {

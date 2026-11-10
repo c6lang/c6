@@ -800,6 +800,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 |---|---|---|---|
 | H1 | `__c6_co_destroy` 不回卷未完成任务 | `lib/libtcc1.c:1580` | `__c6_co_abort`（§9.3） |
 | H2 | async 帧搬动 → 帧内绝对地址失效 | `lib/libtcc1.c` 的 `__c6_co_suspend`/`restore` | 已修：帧住进任务（§9.1，A3）；只有 c67 走拷贝模型，那里保留 `weak` 禁令（§9.2）与地址校验 |
+| H4 | 方法调用的接收者被拷进临时槽时走了普通托管赋值：临时槽没初始化却先读旧值去释放（栈垃圾 → 崩），而且给接收者白加一个永不释放的引用 | `tcc/tccgen.c` 的 `c6_method_call_prep()` | 已修：接收者那份拷贝是借用，按 `C6_GCM_INIT \| C6_GCM_FRESH` 存（不计数、不读旧值） |
 | H3 | defer 栈满 8192 静默丢记录 | 原 `lib/libtcc1.c` 的 defer 记录栈 | 已消灭：记录栈整个删掉，清理状态搬进函数帧（§6、[grammar.md](grammar.md) 8.2），上限变成编译期报错（C101/C102） |
 
 ---
@@ -811,4 +812,9 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 1. **链接期跨 TU 环检测只在原生后端**（§8.2 第 2 条、§15）：`-c99` 输出 C
    源码，没有段也没有链接期，跨 TU 环在那边仍然看不到；
 2. **`struct Node c6_graph` 豁免**（§8.4 / D2）没做：共享边的通用图目前只能
-   写成 `own` 树或 `weak` 边 —— 这是语言取舍，真要做得连运行期环回收一起想。
+   写成 `own` 树或 `weak` 边 —— 这是语言取舍，真要做得连运行期环回收一起想；
+3. **返回托管引用会漏一个计数**：`@Ref f(void) { return new Ref; }`、
+   `@Ref g(struct S *self) { return self->r; }`、`@Ref h(@Ref p) { return p; }`
+   每调一次调用方的计数就 +1（`tests/` 里没有断言这件事，所以没暴露）。
+   与泛型无关（纯 C6 的普通函数、普通方法都一样），修它要动返回值 ABI 的
+   所有权约定，和单态化无关，留作独立议题。

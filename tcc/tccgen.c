@@ -867,12 +867,19 @@ static Sym *c6_import_tag_lookup(int v);
 static int c6_mangle_tok(const char *pkg, int v);
 static int c6_pkg_imported(const char *name);
 static void c6_method_register(int name, int sym_tok, CType *type);
+static Sym *c6_gen_meth_sym(int sym_tok);
+static void c6_gen_sig_flush(void);
+static void c6_gen_sig_dropped(Sym *s, int v);
+static void c6_sticky_add(Sym *s);
 static void c6_gc_drop_register(int name, int sym_tok, CType *type, int tag);
 static int c6_gc_is_drop(int sym_tok);
 static int c6_gc_drop_callee(Sym *s);
 static C6Method *c6_method_lookup(CType *type, int name);
 static int c6_task_head_ptr(CType *type, CType *out);
 static int c6_has_field(CType *type, int v);
+static int c6_gen_self_member(int name);
+static int c6_gen_self_method(int name);
+static int c6_gen_self_name(int name);
 static void c6_method_call_prep(C6Method *m);
 static CType c6_slice_ctype(C6Slice *sl);
 static C6Slice *c6_slice_get(CType *elem);
@@ -2722,6 +2729,71 @@ ST_FUNC Sym *global_identifier_push(int v, int t, int c)
     return s;
 }
 
+#ifdef C6_EXT
+/* An instance of a template -- its tag and the symbols of its member
+   functions -- is a file scope entity, but it may first be written inside a
+   block or a parameter list, whose scope is popped as soon as that
+   declaration ends.  Such a symbol is remembered here ('sticky') and put back
+   on the global stack when a temporary scope tries to drop it. */
+typedef struct C6Sticky {
+    struct C6Sticky *next;
+    Sym *sym;
+    int dropped;
+} C6Sticky;
+static C6Sticky *c6_stickies;
+
+static void c6_sticky_add(Sym *s)
+{
+    C6Sticky *e = 0;
+
+    if (!s)
+        return;
+    for (e = c6_stickies; e; e = e->next)
+        if (e->sym == s)
+            return;
+    e = tcc_mallocz(sizeof *e);
+    e->sym = s;
+    e->next = c6_stickies;
+    c6_stickies = e;
+}
+
+/* Is S a sticky symbol, i.e. one that survives the scope being popped?  Its
+   name stays in the token table and its memory stays valid; with KEEP == 0 it
+   also leaves the stack, so it is put back there afterwards ('dropped'). */
+static int c6_sticky_dropped(Sym *s, int keep)
+{
+    C6Sticky *e = 0;
+
+    for (e = c6_stickies; e; e = e->next)
+        if (e->sym == s) {
+            if (!keep)
+                e->dropped = 1;
+            return 1;
+        }
+    return 0;
+}
+
+/* put the symbols that a pop took away back where a call can find them */
+static void c6_sticky_restore(void)
+{
+    C6Sticky *e = 0;
+
+    for (e = c6_stickies; e; e = e->next) {
+        Sym *s = e->sym;
+
+        if (!e->dropped)
+            continue;
+        e->dropped = 0;
+        s->prev = NULL;
+        s->next = global_stack;
+        if (global_stack)
+            global_stack->prev = s;
+        global_stack = s;
+        s->sym_scope = 0;
+    }
+}
+#endif
+
 /* pop symbols until top reaches 'b'.  If KEEP is non-zero don't really
    pop them yet from the list, but do remove them from the token array.  */
 ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
@@ -2733,6 +2805,13 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
     while(s != b) {
         ss = s->prev;
         v = s->v;
+#ifdef C6_EXT
+        c6_gen_sig_dropped(s, v);
+        if (c6_sticky_dropped(s, keep)) {   /* an instance's tag or method */
+            s = ss;
+            continue;
+        }
+#endif
         /* remove symbol in token array */
         if ((v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
             sym_link(s, 0);
@@ -2742,6 +2821,9 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
     }
     if (!keep)
 	*ptop = b;
+#ifdef C6_EXT
+    c6_sticky_restore();
+#endif
 }
 
 /* label lookup */
@@ -6557,6 +6639,13 @@ static int in_range(long long n, int t)
 /* The parameter list must precede every use of a parameter, which is   */
 /* why a template whose name comes after its body or its return type    */
 /* ('|T| T vat(Vect@T *v)') needs the '|...|' prefix.                   */
+/* a member function written inside a template body (§8.5) */
+typedef struct C6GenMeth {
+    struct C6GenMeth *next;
+    int name;               /* the method's name, as written */
+    TokenString *tokens;    /* the member: 'T at(int i) { ... }' */
+} C6GenMeth;
+
 typedef struct C6Gen {
     struct C6Gen *next;
     int name;               /* template name, as written */
@@ -6566,6 +6655,7 @@ typedef struct C6Gen {
     CType *ptype;           /* declared type of a value parameter */
     TokenString *body;      /* '{' ... '}' tokens; NULL: only declared */
     Sym *nominal;           /* hidden incomplete tag of the template itself */
+    C6GenMeth *meths;       /* member functions written in the body */
     int is_union;
     int instantiating;      /* 1 while its body is being replayed */
 } C6Gen;
@@ -6585,6 +6675,10 @@ static C6Gen *c6_gens = 0;
 static C6GenInst *c6_gen_insts = 0;
 static int c6_nb_gen_insts = 0;
 static int c6_gen_depth = 0;
+/* the instance whose body is being replayed, and the tag of the instance
+   whose member function body is being written (for 'self->field') */
+static C6GenInst *c6_gen_inst_cur = 0;
+static int c6_gen_self_tag = 0;
 /* how many 'Name@arg' arguments are being parsed right now: the length of a
    written chain like 'Vect@Vect@int', guarded like the replayed depth */
 static int c6_gen_arg_depth = 0;
@@ -6635,6 +6729,19 @@ typedef struct C6GenPend {  /* a body waiting for the end of the unit */
     Sym *sym;
     TokenString *body;
 } C6GenPend;
+
+typedef struct C6GenMethQ {  /* a member function waiting for the end of the
+                                unit: the signature is declared again there,
+                                because a template applied inside a parameter
+                                list or a block loses its symbols with that
+                                temporary scope */
+    struct C6GenMethQ *next;
+    C6GenInst *inst;
+    TokenString *proto;
+    TokenString *body;
+    int sym_tok;                /* the mangled name '<instance>_<method>' */
+    int needs_sig;              /* the signature went with a temporary scope */
+} C6GenMethQ;
 
 typedef struct C6GenAppl {  /* an applied template, once */
     struct C6GenAppl *next;
@@ -6723,6 +6830,7 @@ static long c6_gen_value_arg(CType *ptype)
 
 static C6GenFn *c6_gen_fns = 0;
 static C6GenPend *c6_gen_pend = 0, *c6_gen_pend_tail = 0;
+static C6GenMethQ *c6_gen_methq = 0, *c6_gen_methq_tail = 0;
 static C6GenAppl *c6_gen_appls = 0;
 /* set by decl() while a template signature is replayed: it is the only way
    to learn the symbol a method template got ('Vect_int_vat') */
@@ -6738,6 +6846,9 @@ static Sym *c6_gen_last_sym = 0;
 #define C6_GEN_MAX_PARAM 16
 
 static void c6_gen_fn_drop(C6GenFn *fn);
+static void c6_gen_scan_methods(C6Gen *g);
+static TokenString *c6_gen_meth_decl(C6GenMeth *m, C6GenInst *inst,
+                                     int is_union, TokenString **pbody);
 
 static void c6_gen_reset(void)
 {
@@ -6785,6 +6896,28 @@ static void c6_gen_reset(void)
         c6_gen_appls = a->next;
         tcc_free(a->key);
         tcc_free(a);
+    }
+    {
+        C6Sticky *e = c6_stickies;
+        while (e) {
+            C6Sticky *next = e->next;
+            tcc_free(e);
+            e = next;
+        }
+        c6_stickies = NULL;
+    }
+    {
+        C6GenMethQ *q = c6_gen_methq;
+        while (q) {
+            C6GenMethQ *next = q->next;
+            if (q->body)
+                tok_str_free(q->body);
+            if (q->proto)
+                tok_str_free(q->proto);
+            tcc_free(q);
+            q = next;
+        }
+        c6_gen_methq = c6_gen_methq_tail = 0;
     }
     c6_gen_pend_tail = 0;
     c6_gen_record_sym = 0;
@@ -6961,6 +7094,7 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
     C6GenPs ps = c6_gen_ps(g);
     char name[4096] = {0};
     int i = 0, mtag = 0, save_global = 0, save_scope = 0;
+    C6GenInst *save_inst = 0;
 
     if (nargs != g->nparams) {
         char sig[512] = {0};
@@ -7041,6 +7175,7 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
     it.ref = NULL;
     tag = sym_push(inst->tag | SYM_STRUCT, &it, 0, -1);
     tag->r = 0;
+    c6_sticky_add(tag);     /* the layout outlives the scope it was made in */
     inst->type.t = it.t;
     inst->type.ref = tag;
 
@@ -7052,6 +7187,8 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
         tcc_error("generic instantiation nested too deeply (max %d)",
                   C6_GEN_MAX_DEPTH);
     g->instantiating = 1;
+    save_inst = c6_gen_inst_cur;
+    c6_gen_inst_cur = inst;         /* struct_decl() is replaying us */
     {
         TokenString *ts = tok_str_alloc();
         tok_str_add(ts, g->is_union ? TOK_UNION : TOK_STRUCT);
@@ -7063,8 +7200,53 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
         tok_str_add(ts, TOK_EOF);
         c6_decl_tokens(ts);
     }
+    c6_gen_inst_cur = save_inst;
     g->instantiating = 0;
     c6_gen_depth--;
+
+    /* the body's member functions become functions of this instance; the
+       parameters are still bound, so 'T' in their signatures still means
+       the argument (the struct is complete now, so a body may use it) */
+    if (g->meths) {
+        C6GenMeth *meth = 0;
+        int save_self = c6_gen_self_tag, save_rec = c6_gen_record_sym;
+        /* the instance is a file scope declaration even when the template
+           is applied inside a block: no block scope copy may be made */
+        Sym *save_lstk = local_stack;
+
+        save_inst = c6_gen_inst_cur;
+        c6_gen_inst_cur = 0;
+        local_stack = NULL;
+        for (meth = g->meths; meth; meth = meth->next) {
+            TokenString *body = 0;
+            TokenString *proto = c6_gen_meth_decl(meth, inst, g->is_union,
+                                                  &body);
+            C6GenMethQ *q = 0;
+
+            c6_gen_self_tag = inst->tag;
+            c6_gen_record_sym = 1;
+            c6_decl_tokens(proto);      /* the signature, so a call works */
+            c6_gen_record_sym = save_rec;
+            if (!c6_gen_last_sym)
+                tcc_error("cannot instantiate '%s'",
+                          get_tok_str(meth->name, NULL));
+            q = tcc_mallocz(sizeof *q);
+            q->inst = inst;
+            q->body = body;
+            q->proto = proto;
+            q->sym_tok = c6_gen_last_sym->v;
+            c6_sticky_add(c6_gen_last_sym);   /* survives the scope it is in */
+            c6_gen_last_sym = NULL;
+            if (c6_gen_methq_tail)
+                c6_gen_methq_tail->next = q;
+            else
+                c6_gen_methq = q;
+            c6_gen_methq_tail = q;
+            c6_gen_self_tag = save_self;
+        }
+        local_stack = save_lstk;
+        c6_gen_inst_cur = save_inst;
+    }
 
     c6_gen_unbind(bound, nargs);
     c6_sym_global = save_global;
@@ -7217,6 +7399,171 @@ static TokenString *c6_gen_tok_copy(TokenString *src)
     for (i = 0; i < src->len; i++)
         tok_str_add(ts, src->str[i]);
     return ts;
+}
+
+/* ------------------------------------------------------------------ */
+/* generics: member functions written inside a template body (§8.5)    */
+/*                                                                     */
+/*     struct Vect@T {                                                 */
+/*         T *data; int len;                                           */
+/*         T at(int i);                                                */
+/*         T get(int i) { return data[i]; }                            */
+/*     };                                                              */
+/*                                                                     */
+/* The body is saved as tokens like any other template body, so the    */
+/* functions in it are picked out of a copy once, at declaration time,  */
+/* and written out per instance as ordinary functions:                 */
+/*                                                                     */
+/*     T get(struct Vect_int *self, int i) { return data[i]; }          */
+/*                                                                     */
+/* decl() names that 'Vect_int_get' and registers it as a method, so   */
+/* 'v->get(0)' works exactly as with the '|T|' form, ABI included.     */
+/* Inside such a body a name that is a field of the instance and is    */
+/* otherwise undeclared means 'self->name' (c6_gen_self_member).       */
+
+/* the next token of a replayed copy, with the line markers dropped */
+static int c6_gen_next_code(void)
+{
+    for (;;) {
+        next();
+        if (tok != TOK_LINENUM && tok != TOK_LINEFEED)
+            return tok;
+    }
+}
+
+/* pick the member functions out of a template body, once */
+static void c6_gen_scan_methods(C6Gen *g)
+{
+    TokenString *copy = 0, *cur = 0;
+    int save_tok = tok, save_warn = tcc_state->warn_none;
+    CValue save_val = tokc;
+    int depth = 1, last_ident = 0, cand = 0, parens = 0, is_meth = 0;
+    C6GenMeth *m = 0, **pm = 0;
+
+    if (!g->body)
+        return;
+    copy = c6_gen_tok_copy(g->body);
+    cur = tok_str_alloc();
+    tcc_state->warn_none = 1;           /* the scan itself says nothing */
+    begin_macro(copy, 1);
+    next();                             /* the body's '{' */
+    for (;;) {
+        next();
+        if (tok == TOK_EOF)
+            break;
+        if (tok == TOK_LINENUM || tok == TOK_LINEFEED) {
+            tok_str_add_tok(cur);
+            continue;
+        }
+        if (depth == 1 && tok == '}')
+            break;                      /* the body ends */
+        if (depth == 1 && tok == ';') {  /* a field declaration ends */
+            tok_str_add_tok(cur);
+            tok_str_free(cur);
+            cur = tok_str_alloc();
+            last_ident = cand = parens = is_meth = 0;
+            continue;
+        }
+        tok_str_add_tok(cur);
+        if (tok == '{') {
+            if (depth == 1 && parens && cand)
+                is_meth = 1;            /* 'NAME(...) {': a definition */
+            depth++;
+        } else if (tok == '}') {
+            depth--;
+            if (depth == 1 && is_meth) {
+                /* the member function ended: keep the whole member */
+                m = tcc_mallocz(sizeof *m);
+                m->name = cand;
+                m->tokens = cur;
+                for (pm = &g->meths; *pm; pm = &(*pm)->next)
+                    ;
+                *pm = m;
+                cur = tok_str_alloc();
+                last_ident = cand = parens = is_meth = 0;
+            }
+        } else if (tok == '(' && depth == 1) {
+            cand = last_ident;
+            parens = 0;
+        } else if (tok == ')' && depth == 1) {
+            parens = 1;
+        } else if (tok >= TOK_UIDENT) {
+            last_ident = tok;
+            parens = 0;
+        }
+    }
+    tok_str_free(cur);
+    end_macro_under(copy);
+    tcc_state->warn_none = save_warn;
+    tok = save_tok, tokc = save_val;
+}
+
+/* the member function as a plain function of the instance: the receiver
+   becomes the first parameter.  *PBODY gets the '{ ... }' part, which is
+   written at the end of the unit like a function template's body. */
+static TokenString *c6_gen_meth_decl(C6GenMeth *m, C6GenInst *inst,
+                                     int is_union, TokenString **pbody)
+{
+    TokenString *copy = 0, *proto = 0, *body = 0;
+    int save_tok = tok, save_warn = tcc_state->warn_none;
+    CValue save_val = tokc;
+    int inserted = 0, closed = 0, in_body = 0, empty = 0, after = 0;
+    int self = tok_alloc_const("self");
+
+    *pbody = NULL;
+    tcc_state->warn_none = 1;
+    proto = tok_str_alloc();
+    body = tok_str_alloc();
+    copy = c6_gen_tok_copy(m->tokens);
+    tok_str_add(copy, TOK_EOF);         /* keep the replay inside the copy */
+    begin_macro(copy, 1);
+    for (;;) {
+        if (c6_gen_next_code() == TOK_EOF)
+            break;
+        if (in_body) {
+            tok_str_add_tok(body);
+            continue;
+        }
+        if (closed && tok == '{') {     /* the body starts here */
+            in_body = 1;
+            tok_str_add_tok(body);
+            continue;
+        }
+        tok_str_add_tok(proto);
+        if (tok == '(' && !inserted) {
+            tok_str_add(proto, is_union ? TOK_UNION : TOK_STRUCT);
+            tok_str_add(proto, inst->tag);
+            tok_str_add(proto, '*');
+            tok_str_add(proto, self);
+            inserted = 1;
+            /* '(void)' loses the 'void', an empty list stays empty */
+            after = c6_gen_next_code();
+            if (after == ')' || after == TOK_EOF) {
+                empty = 1;
+            } else if (after == TOK_VOID) {
+                after = c6_gen_next_code();
+                if (after == ')' || after == TOK_EOF)
+                    empty = 1, after = ')';
+            }
+            if (!empty)
+                tok_str_add(proto, ',');
+            if (after == TOK_EOF)
+                break;
+            tok_str_add_tok(proto);
+            if (tok == ')')
+                closed = 1;
+        } else if (tok == ')' && inserted) {
+            closed = 1;
+        }
+    }
+    end_macro_under(copy);
+    tok_str_add(proto, ';');
+    tok_str_add(proto, TOK_EOF);
+    tok_str_add(body, TOK_EOF);
+    *pbody = body;
+    tcc_state->warn_none = save_warn;
+    tok = save_tok, tokc = save_val;
+    return proto;
 }
 
 /* the saved declaration with the declared name patched to NAME */
@@ -7677,6 +8024,41 @@ static int c6_gen_flush(void)
         tcc_free(p);
         n++;
     }
+    while (c6_gen_methq) {
+        C6GenMethQ *q = c6_gen_methq;
+        C6GenPs ps = c6_gen_ps(q->inst->gen);
+        Sym **bound = 0;
+        int save_self = c6_gen_self_tag, save_global = c6_sym_global;
+        int save_scope = local_scope, save_rec = c6_gen_record_sym;
+
+        c6_gen_methq = q->next;
+        if (!c6_gen_methq)
+            c6_gen_methq_tail = 0;
+        bound = c6_gen_bind(&ps, q->inst->args, q->inst->vals,
+                            q->inst->nargs);
+        c6_sym_global = save_global;
+        local_scope = save_scope;
+        cur_text_section = text_section;
+        c6_gen_self_tag = q->inst->tag;
+        /* the signature may have gone with a temporary scope: declare it
+           again here, where the unit's file scope is being finished */
+        c6_gen_record_sym = 1;
+        c6_decl_tokens(q->proto);
+        c6_gen_record_sym = save_rec;
+        if (c6_gen_last_sym) {
+            begin_macro(q->body, 1);
+            next();
+            gen_function(c6_gen_last_sym);
+            end_macro();
+            c6_gen_last_sym = NULL;
+        }
+        c6_gen_self_tag = save_self;
+        c6_gen_unbind(bound, q->inst->nargs);
+        c6_sym_global = save_global;
+        local_scope = save_scope;
+        tcc_free(q);
+        n++;
+    }
     return n;
 }
 
@@ -7747,8 +8129,11 @@ static void c6_gen_declare(int name, int is_union)
     c6_gen_param_check(name, ptok, nparams);
     if (tok == '{')
         skip_or_save_block(&body);
-    else if (tok != ';')
+    else if (tok != ';') {
+        if (g)      /* 'struct V@T *p;' -- an existing template being used */
+            tcc_error(c6_gen_drop_struct, get_tok_str(name, NULL));
         expect("'{'");
+    }
 
     if (g) {
         if (g->is_union != is_union)
@@ -7771,6 +8156,7 @@ static void c6_gen_declare(int name, int is_union)
                 g->ptype[i] = ptype[i];
             }
             g->body = body;
+            c6_gen_scan_methods(g);
         }
         tcc_free(ptok);
         tcc_free(pkind);
@@ -7788,6 +8174,7 @@ static void c6_gen_declare(int name, int is_union)
     g->body = body;
     g->is_union = is_union;
     g->next = c6_gens, c6_gens = g;
+    c6_gen_scan_methods(g);
 }
 
 /* enum/struct/union declaration. u is VT_ENUM/VT_STRUCT/VT_UNION */
@@ -7797,6 +8184,7 @@ static void struct_decl(CType *type, int u)
     int bit_size = 0, bsize = 0, bt = 0, ut = 0;
 #ifdef C6_EXT
     int c6_is_def = 0;
+    int c6_meth_end = 0;       /* the member just parsed was a function */
 #endif
     Sym *s = 0, *ss = 0, **ps = 0;
     AttributeDef ad = {0}, ad1 = {0};
@@ -7996,6 +8384,24 @@ do_decl:
                     if (tok != ':') {
 			if (tok != ';')
                             type_decl(&type1, &ad1, &v, TYPE_DIRECT);
+#ifdef C6_EXT
+                        /* 'T get(int i) { ... }' in a template body (§8.5):
+                           the function was captured at declaration time, the
+                           layout only has to skip its body */
+                        if (v && tok == '{'
+                            && (type1.t & VT_BTYPE) == VT_FUNC) {
+                            if (!c6_gen_inst_cur)
+                                tcc_error("a function cannot be defined "
+                                          "inside a struct: write '%s' "
+                                          "outside it",
+                                          get_tok_str(v, NULL));
+                            c6_meth_end = 1;
+                            skip_or_save_block(NULL);
+                            if (tok == ';')
+                                next();
+                            break;      /* next member */
+                        }
+#endif
                         if (v == 0) {
                     	    if ((type1.t & VT_BTYPE) != VT_STRUCT)
                         	expect("identifier");
@@ -8014,6 +8420,11 @@ do_decl:
 			        tcc_error("field '%s' has incomplete type",
                                       get_tok_str(v, NULL));
                         }
+                        if ((type1.t & VT_BTYPE) == VT_FUNC
+                            && v && c6_gen_inst_cur)
+                            tcc_error("a member function needs a body: write "
+                                      "'%s(...) { ... }' in the template",
+                                      get_tok_str(v, NULL));
                         if ((type1.t & VT_BTYPE) == VT_FUNC ||
 			    (type1.t & VT_BTYPE) == VT_VOID ||
                             (type1.t & VT_STORAGE))
@@ -8080,7 +8491,10 @@ do_decl:
                         break;
                     skip(',');
                 }
-                skip(';');
+                if (c6_meth_end)
+                    c6_meth_end = 0;    /* a body, not a declaration */
+                else
+                    skip(';');
             }
             skip('}');
 	    parse_attribute(&ad);
@@ -10613,6 +11027,13 @@ special_math_val:
             tcc_error("expression expected before '%s'", get_tok_str(tok, &tokc));
         t = tok;
         next();
+#ifdef C6_EXT
+        /* a member function written in a template body calls its own methods
+           by name: 'get(i)' means 'self->get(i)' (§8.5) */
+        if (tcc_state->c6_ext && tok == '(' && !c6_lit_scanning
+            && c6_gen_self_method(t))
+            break;
+#endif
         s = sym_find(t);
 #ifdef C6_EXT
         c6_lit_scan_note(t, s, c6_scan_uneval);
@@ -10641,6 +11062,11 @@ special_math_val:
                 break;
             }
         }
+        /* a member function written in a template body reaches its own fields
+           by name, 'self->name' (§8.5); a real local or global of that name
+           has already won above */
+        if (!s && tcc_state->c6_ext && c6_gen_self_member(t))
+            break;
         /* 'pkg.member', possibly multi-level: the dotted spelling is a
            package-qualified access that resolves to 'pkg__member'.  The
            package part is grown one segment at a time, so 'a.b.f' first
@@ -13091,6 +13517,111 @@ static void c6_method_register(int name, int sym_tok, CType *type)
     c6_nb_methods++;
 }
 
+/* 'name(...)' inside a member function written in a template body (§8.5):
+   the instance's own method, i.e. 'self->name(...)' */
+static int c6_gen_self_method(int name)
+{
+    Sym *self = 0, *loc = 0;
+    C6Method *m = 0;
+    int r = 0;
+
+    if (!c6_gen_self_tag)
+        return 0;
+    /* a real local of that name keeps its plain C meaning */
+    loc = sym_find(name);
+    if (loc && (loc->r & VT_VALMASK) != VT_CONST)
+        return 0;
+    self = sym_find(tok_alloc_const("self"));
+    if (!self || (self->type.t & VT_BTYPE) != VT_PTR)
+        return 0;
+    m = c6_method_lookup(&self->type, name);
+    if (!m)
+        return 0;
+    r = self->r;
+    if ((r & VT_VALMASK) < VT_CONST)
+        r = (r & ~VT_VALMASK) | VT_LOCAL;
+    vset(&self->type, r, self->c);
+    vtop->sym = self;
+    c6_method_call_prep(m);
+    return 1;
+}
+
+/* A template applied inside a parameter list (or any temporary scope) has its
+   members declared in that scope, which is gone as soon as the declaration
+   ends.  Such a signature is remembered here and written again at the next
+   declaration, which is a place where it stays. */
+static void c6_gen_sig_dropped(Sym *s, int v)
+{
+    C6GenMethQ *q = 0;
+
+    if (!c6_gen_methq || !s || (v & SYM_STRUCT))
+        return;
+    if ((s->type.t & VT_BTYPE) != VT_FUNC)
+        return;
+    for (q = c6_gen_methq; q; q = q->next)
+        if (q->sym_tok == v) {
+            q->needs_sig = 1;
+            return;
+        }
+}
+
+/* write the signatures of the instances whose declaration went with a
+   temporary scope.  Called where a declaration starts, and at the end. */
+static void c6_gen_sig_flush(void)
+{
+    static int in_flush = 0;
+    C6GenMethQ *q = 0;
+
+    if (in_flush || !c6_gen_methq)
+        return;
+    in_flush = 1;
+    for (q = c6_gen_methq; q; q = q->next) {
+        C6GenPs ps = c6_gen_ps(q->inst->gen);
+        Sym **bound = 0;
+        int save_self = c6_gen_self_tag, save_global = c6_sym_global;
+        int save_scope = local_scope, save_rec = c6_gen_record_sym;
+        Sym *save_lstk = local_stack;
+
+        if (!q->needs_sig || !q->proto)
+            continue;
+        if (sym_find_raw(q->sym_tok)) {   /* it stayed after all */
+            q->needs_sig = 0;
+            continue;
+        }
+        bound = c6_gen_bind(&ps, q->inst->args, q->inst->vals,
+                            q->inst->nargs);
+        c6_sym_global = 1;
+        local_scope = 0;
+        local_stack = NULL;
+        c6_gen_self_tag = q->inst->tag;
+        c6_gen_record_sym = 1;
+        c6_decl_tokens(q->proto);
+        c6_gen_record_sym = save_rec;
+        if (c6_gen_last_sym && c6_gen_last_sym->v == q->sym_tok) {
+            c6_sticky_add(c6_gen_last_sym);
+            q->needs_sig = 0;
+        }
+        c6_gen_last_sym = NULL;
+        c6_gen_self_tag = save_self;
+        c6_gen_unbind(bound, q->inst->nargs);
+        local_stack = save_lstk;
+        c6_sym_global = save_global;
+        local_scope = save_scope;
+    }
+    in_flush = 0;
+}
+
+/* the symbol of an instance method */
+static Sym *c6_gen_meth_sym(int sym_tok)
+{
+    Sym *s = sym_find_raw(sym_tok);
+
+    if (s)
+        return s;
+    c6_gen_sig_flush();
+    return sym_find_raw(sym_tok);
+}
+
 /* is there a method NAME taking a pointer to the type TYPE points at? */
 static C6Method *c6_method_lookup(CType *type, int name)
 {
@@ -13138,6 +13669,55 @@ static int c6_has_field(CType *type, int v)
     return c6_find_field_quiet(pointed_type(type), v | SYM_FIELD) != 0;
 }
 
+/* is NAME a field or a method of the instance whose body is being written?
+   A plain answer, without touching the parser: 'len = 3;' in a member function
+   must not be probed as 'NAME = <function literal>' */
+static int c6_gen_self_name(int name)
+{
+    Sym *self = 0;
+
+    if (!c6_gen_self_tag)
+        return 0;
+    self = sym_find(tok_alloc_const("self"));
+    if (!self || (self->type.t & VT_BTYPE) != VT_PTR)
+        return 0;
+    if (c6_has_field(&self->type, name))
+        return 1;
+    return c6_method_lookup(&self->type, name) != 0;
+}
+
+/* 'name' inside a member function written in a template body (§8.5): a field
+   of the instance stands for 'self->name', which is what makes the body read
+   like a method rather than a function taking a receiver */
+static int c6_gen_self_member(int name)
+{
+    Sym *self = 0, *field = 0;
+    int cumofs = 0, r = 0;
+
+    if (!c6_gen_self_tag)
+        return 0;
+    self = sym_find(tok_alloc_const("self"));
+    if (!self || (self->type.t & VT_BTYPE) != VT_PTR)
+        return 0;
+    if (!c6_has_field(&self->type, name))
+        return 0;                       /* not a field: let it be reported */
+    r = self->r;
+    if ((r & VT_VALMASK) < VT_CONST)
+        r = (r & ~VT_VALMASK) | VT_LOCAL;
+    vset(&self->type, r, self->c);
+    vtop->sym = self;
+    indir();                            /* the struct the pointer points at */
+    field = find_field(&vtop->type, name, &cumofs);
+    gaddrof();
+    vtop->type = char_pointer_type;
+    vpushi(cumofs);
+    gen_op('+');
+    vtop->type = field->type;
+    if (!(vtop->type.t & VT_ARRAY))
+        vtop->r |= VT_LVAL;
+    return 1;                           /* unary() already consumed the name */
+}
+
 /* 'struct __c6_task *' when TYPE points at a struct whose first field is the
    task header, 0 otherwise.  The generated task structs are
    'struct NAME_task { struct __c6_task head; T val; ... }', so the header is
@@ -13167,7 +13747,7 @@ static int c6_task_head_ptr(CType *type, CType *out)
    receiver as the first argument */
 static void c6_method_call_prep(C6Method *m)
 {
-    Sym *fs = sym_find_raw(m->sym_tok);
+    Sym *fs = c6_gen_meth_sym(m->sym_tok);
     int r = 0;
 
     if (c6_gc_is_drop(m->sym_tok))
@@ -13182,7 +13762,18 @@ static void c6_method_call_prep(C6Method *m)
     c6_self_type = vtop->type;
     vset(&c6_self_type, VT_LOCAL | VT_LVAL, c6_self_loc);
     vswap();
-    vstore();
+    /* the receiver only lives in this temp for the call: the copy must not
+       count (a borrow) and it must not read the temp it lands in */
+    {
+        int save_init = c6_gc_init_store;
+
+        if (c6_is_managed(&c6_self_type)) {
+            c6_gc_init_store = 1;
+            vtop->gc_state = C6_GC_FRESH;
+        }
+        vstore();
+        c6_gc_init_store = save_init;
+    }
     vpop();
     r = fs->r;
     if ((r & VT_VALMASK) < VT_CONST)
@@ -16155,7 +16746,7 @@ again:
                    annotation.  Only a name that is declared nowhere starts
                    this form: an existing function pointer keeps taking plain
                    assignments. */
-                if (c6_lit_decl_lead()) {
+                if (!c6_gen_self_name(t) && c6_lit_decl_lead()) {
                     c6_lit_infer_decl();
                     goto c6_stmt_done;
                 }
@@ -20470,6 +21061,8 @@ static int c6_gc_type_lead(int t)
         return 1;
     if (struct_find(t))
         return 1;
+    if (tcc_state->c6_ext && c6_gen_find(t))
+        return 1;                   /* 'new Vect@int' */
     return c6_gc_qual(t) != 0;      /* 'new shared T' */
 }
 
@@ -21674,14 +22267,18 @@ static void c6_apply_fallible(CType *type)
 
 /* 'l' is VT_LOCAL or VT_CONST to define default storage type
    or VT_CMP if parsing old style parameter list
-   or VT_JMP if parsing c99 for decl: for (int i = 0, ...) */
-static int decl(int l)
+   or VT_JMP if parsing c99 for decl: for (int i = 0, ...) */static int decl(int l)
 {
     int v = 0, has_init = 0, r = 0, oldint = 0;
     CType type = {0}, btype = {0};
     Sym *sym = 0, *sa = 0;
     AttributeDef ad = {0}, adbase = {0};
     ElfSym *esym = 0;
+#ifdef C6_EXT
+    /* a template applied inside a parameter list loses the signatures of its
+       members with that scope: write them here, where a declaration starts */
+    c6_gen_sig_flush();
+#endif
 #ifdef C6_EXT
     int fallible = 0, decl_name = 0, method_tok = 0;
 #endif

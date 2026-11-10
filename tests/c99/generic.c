@@ -10,6 +10,7 @@
 // OUTPUT 6 30
 // OUTPUT 4
 // OUTPUT 8
+// OUTPUT 14
 
 #include <stdio.h>
 
@@ -26,6 +27,14 @@ int vect_sum(Vect@int *v)
 
 struct Pair@(A, B) { A a; B b; };
 
+/* 体内成员函数：方法直接写在模板体里，字段按名字用，符号是 '<实例>_<方法>' */
+struct Cnt@T {
+    T *data;
+    int len;
+    int last(void) { return (int)data[len - 1]; }
+    int bump(void) { len = len + 1; return len; }
+};
+
 /* 值形参：实例名带上它的拼写，'Buf@(int, 4)' 就是 'struct Buf_int_4' */
 struct Buf@(T, int N) { T data[N]; int len; };
 
@@ -41,5 +50,10 @@ int main(void)
     printf("%d %d\n", (&v)->vect_sum(), (int)(lv.data[0] + lv.data[1]));
     printf("%d\n", (int)sizeof(Vect@long) / (int)sizeof(p.a));
     printf("%d\n", b.data[3] + b.len);
+    {
+        Cnt@int c = {d, 3};
+
+        printf("%d\n", (&c)->last() + (&c)->bump());
+    }
     return 0;
 }

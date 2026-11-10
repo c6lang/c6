@@ -48,6 +48,63 @@ struct Arr@(int N) { int d[N]; };
 /* 值形参当位域宽度 */
 struct Flags@(T, int B) { T on : B; T off : B; };
 
+/* 体内成员函数（V3）：方法直接写在模板体里，接收者就是隐式的 'self'，
+   所以字段按名字读写，方法按名字调用——和普通 C++ 风格的方法一个读法 */
+struct Vec2@T {
+    T x, y;
+    T sum2(void) { return x + y; }
+    void scale(T k) { x = x * k; y = y * k; }
+    T dot(Vec2@T *o) { return x * o->x + y * o->y; }
+    T dbl(void) { return sum2() * 2; }   /* 调用同模板里的另一个方法 */
+};
+
+/* 体内方法也能用值形参，也能先用后定义 */
+struct Stack@(T, int N) {
+    T data[N];
+    int len;
+    int cap(void) { return N; }
+    int room(void) { return cap() - len; }   /* cap 先写，room 后用 */
+    int push(T v) {
+        if (len >= N)
+            return 0;
+        data[len] = v;
+        len = len + 1;
+        return 1;
+    }
+    T pop(void) {
+        len = len - 1;
+        return data[len];
+    }
+};
+
+/* 先写的方法调用后写的方法：实例化时先发全部原型，函数体留到单元末尾 */
+struct Chain@T {
+    T v;
+    T doubled(void) { return step() * 2; }
+    T step(void) { return v; }
+};
+
+/* 模板里再嵌实例：隐式成员就是那个实例自己 */
+struct VecBox@T {
+    Vect@T v;
+    int count(void) { return v.len; }
+    T first(void) { return v.data[0]; }
+};
+
+/* 体内方法的符号名和 '|T|' 方法一致：'<实例标签>_<方法名>'。实例先把
+   别名造出来，下面就能按拼出来的名字声明同一个函数 */
+/* 托管引用 + 体内方法：接收者是 '@Holder@int'，方法把托管字段当普通字段用 */
+struct Ref { int v; };
+struct Keeper@T {
+    @Ref r;
+    void keep(@Ref p) { r = p; }
+    @Ref held(void) { return r; }
+    int rc_after(void) { return __c6_gc_refcount(r); }
+};
+typedef Stack@(int, 4) IntStack4;
+int Stack_int_4_cap(struct Stack_int_4 *);
+int Stack_int_4_room(struct Stack_int_4 *);
+
 /* 函数模板也可以只有值形参，用在常量表达式里 */
 |int N| int total(int *d)
 {
@@ -259,6 +316,74 @@ test "值形参在方法模板里" {
         err(1, "值形参的方法模板不对");
     if (btotal@(int, 4)(&b) != 10)
         err(2, "显式写法和接收者写法应当一样");
+}
+
+test "体内方法：字段和参数直接读写" {
+    Vec2@int a = {3, 4};
+    Vec2@int b = {10, 20};
+    Vec2@int *p = &a;
+
+    if (p->sum2() != 7)
+        err(1, "体内方法读字段不对");
+    p->scale(2);
+    if (a.x != 6 || a.y != 8)
+        err(2, "体内方法写字段不对");
+    if (p->dot(&b) != 6 * 10 + 8 * 20)
+        err(3, "体内方法收别人的实例不对");
+    if (p->dbl() != 28)
+        err(4, "体内方法调用别的方法不对");
+    if ((&a)->sum2() != 14)
+        err(5, "结构体值上调用体内方法不对");
+}
+test "体内方法用值形参、先写的方法调用后写的" {
+    Stack@(int, 4) s = {{0}, 0};
+    Stack@(int, 4) *sp = &s;
+    Chain@int c = {21};
+    Chain@int *cp = &c;
+
+    if (sp->cap() != 4 || sp->room() != 4)
+        err(1, "值形参在体内方法里不对");
+    if (!sp->push(11) || !sp->push(22) || s.len != 2)
+        err(2, "push 不对");
+    if (sp->room() != 2 || sp->pop() != 22 || s.len != 1)
+        err(3, "pop 不对");
+    if (cp->doubled() != 42)
+        err(4, "调用后定义的方法不对");
+}
+test "体内方法的符号和 '|T|' 方法一样" {
+    IntStack4 s = {{1, 2, 3, 4}, 4};
+
+    if (Stack_int_4_cap(&s) != 4)
+        err(1, "实例标签_方法名 不是普通符号");
+    if (Stack_int_4_room(&s) != 0)
+        err(2, "直接调用体内方法不对");
+    if ((&s)->cap() != 4)
+        err(3, "两种调用写法结果应当一样");
+}
+test "托管实例上的方法不碰引用计数" {
+    /* 接收者只是被拷进一个临时槽里，那份拷贝是借用：不该加计数，
+       也不该去释放临时槽里的旧内容 */
+    @Keeper@int h = new Keeper@int;
+    int i = 0;
+
+    h->keep(new Ref);
+    if (h->rc_after() != 1)
+        err(1, "托管字段自己的计数不是 1");
+    for (i = 0; i < 4; i++)
+        if (h->rc_after() != 1)
+            err(2, "每调一次方法就漏一个引用");
+    if (h->held() == NULL)
+        err(3, "托管字段读不出来");
+}
+test "体内方法里的实例再实例" {
+    int d[3] = {5, 6, 7};
+    Vect@int inner = {d, 3};
+    VecBox@int b = {inner};
+    VecBox@int *bp = &b;
+    if (bp->count() != 3)
+        err(1, "实例成员不对");
+    if (bp->first() != 5)
+        err(2, "实例成员的数组不对");
 }
 
 int main(void)

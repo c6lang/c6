@@ -686,7 +686,7 @@ closure-type           = "closure" , type-specifier , [ "!error" ] ,
 C90–C98 与实施阶段见 [closure-design.md](closure-design.md) 和
 [closure-todo.md](closure-todo.md)；在 V2 落地前，编译器仍按 V1 报 C80。
 
-### 3.10 泛型（阶段 1 已落地）
+### 3.10 泛型（已落地）
 
 类型应用是 `@` 后缀：`Vect@int`、`Map@(char[:], int)`、`Buf@(int, 4)`。
 形参表在 tag 定义处挂名（名字先于体），在函数/typedef 处用 `|…|` 前缀
@@ -696,6 +696,12 @@ C90–C98 与实施阶段见 [closure-design.md](closure-design.md) 和
 struct Vect@T        { T *data; int len; };
 struct Map@(K, V)    { Vect@K keys; Vect@V vals; };
 struct Buf@(T, int N) { T data[N]; int len; };      /* 值形参 */
+struct Stack@(T, int N) {                            /* 体内成员函数 */
+    T data[N]; int len;
+    int cap(void) { return N; }
+    int push(T v) { if (len >= N) return 0; data[len] = v; len = len + 1; return 1; }
+    T pop(void) { len = len - 1; return data[len]; }
+};
 |T| T vat(Vect@T *self, int i);
 |T| typedef struct { T v; } Box;
 
@@ -704,6 +710,8 @@ Vect@int *p = &a;
 Buf@(int, 4) b = {0};           /* 值实参进 mangle：struct Buf_int_4 */
 Vect@Vect@int grid = {0};       /* 右结合，链上没有闭合符 */
 int x = p->vat(0);              /* 接收者定类型：Vect_int_vat */
+Stack@(int, 4) s = {0};
+int ok = (&s)->push(7);         /* 体内方法：Stack_int_4_push */
 ```
 
 `@` 与托管引用共存：前缀 `@`（类型位置起点）是托管引用，后缀 `@`（类型名
@@ -741,7 +749,15 @@ typedef Vect@int IntVect;      /* 起个别名，正文里就不写链 */
 typedef Vect@IntVec Grid;
 ```
 
-**未落地**：体内成员函数（`struct Vect@T { T at(int i) { … } }`，§8.5）。
+**体内成员函数**直接写在模板体里，接收者是隐式的 `self`：字段按名字读写
+（`data[len]` 就是 `self->data[len]`），同一个模板里的方法按名字调用，先写的
+方法可以调用后面才写的方法（原型先发、函数体留到单元末尾）；`!error`
+方法、值形参 `N`、模板里再嵌实例照常可用。符号与 `|…|` 写法完全相同
+（`Vect_int_at`），所以两种写法（以及纯 C 侧直接写 `Vect_int_at(p, i)`）
+可以混用。模板体里只写原型（`T at(int i);`）是错误：模板体只解析一次，
+体没有别处可补；非模板的结构体里写方法定义同样是错误（写出来就行
+`int S_f(struct S *self) { … }`）。
+
 裸模板名是 C103 诊断，不是类型。
 
 完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
@@ -2003,7 +2019,8 @@ int main(void)
 | `has()` 返回非整数 / `next()` 返回数组、`void`、不完整类型 | 约束 C99/C49 |
 | `has()`/`next()` 带多余形参 | 约束 C99：两个方法只接收 receiver |
 | `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
-| 泛型 `Vect@int` / `struct Vect@T` | 已落地（阶段 1）：见 §3.10 与 [generics-design.md](generics-design.md)；实例名带模块前缀、`-emit-header` 可导出；容器迭代仍建议 `foreach` |
+| 泛型 `Vect@int` / `struct Vect@T` | 已落地：见 §3.10 与 [generics-design.md](generics-design.md)；实例名带模块前缀、`-emit-header` 可导出；容器迭代仍建议 `foreach` |
+| 体内成员函数 `struct Vect@T { T at(int i) { … } }` | 已落地：隐式 `self`、方法可先用后定义、符号仍是 `Vect_int_at`，见 §3.10 |
 | 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c` |
 | 泛型值形参 `Buf@(T, 4)` / `struct Buf@(T, int N)` | 已落地：实参是常量表达式，体内当常量用（可作数组长度），见 §3.10 |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
