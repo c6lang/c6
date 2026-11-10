@@ -1,0 +1,97 @@
+/* c6 编译期诊断：枚举成员的限定名
+ *
+ * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
+ * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
+ * 不带任何 -D 时是本文件的“正常路径”，必须编译通过并运行成功。
+ */
+
+// EXPECT test_ambiguous_bare: error: 'RED' is the member of more than one enum: write '<enum>.RED'
+// EXPECT test_wrong_qualifier: error: enumerator qualifier 'Other' must be the enum's own tag 'Color'
+// EXPECT test_anonymous: error: the enumerator of an anonymous enum cannot be qualified
+// EXPECT test_no_member: error: 'Fruit' has no member 'APPLE'
+// EXPECT test_unknown_tag: error: 'Nope' is neither an enum nor an imported package (use 'import Nope;')
+// EXPECT test_no_name: error: enumerator name expected after '.'
+// EXPECT test_legacy_duplicate: error: redeclaration of 'RED'
+// EXPECT test_qualifier_only: error: enumerator name expected after '.'
+
+#if defined test_ambiguous_bare
+/* 两个枚举都要裸名 'RED'：裸名被毒化，必须写限定名 */
+enum Color { Color.RED = 1 };
+enum Fruit { Fruit.RED = 10 };
+
+int main(void)
+{
+    return RED;
+}
+#elif defined test_wrong_qualifier
+/* 限定名只能用自己的 tag */
+enum Other { X = 1 };
+enum Color { Other.RED = 2 };
+
+int main(void)
+{
+    return X;
+}
+#elif defined test_anonymous
+/* 匿名枚举没有 tag，成员无从限定 */
+enum { ANON.A = 1 };
+
+int main(void)
+{
+    return 0;
+}
+#elif defined test_no_member
+/* tag 有，成员不存在 */
+enum Fruit { Fruit.RED = 10 };
+
+int main(void)
+{
+    return Fruit.APPLE;
+}
+#elif defined test_unknown_tag
+/* 既不是枚举也不是包 */
+int main(void)
+{
+    return Nope.X;
+}
+#elif defined test_no_name
+/* 只写了限定符 */
+enum Color { Color. = 1 };
+
+int main(void)
+{
+    return 0;
+}
+#elif defined test_qualifier_only
+/* 限定符后面直接跟结束 */
+enum Color { Color. };
+
+int main(void)
+{
+    return 0;
+}
+#elif defined test_legacy_duplicate
+/* 都不带限定符时，仍然是 C 的重定义 */
+enum Color { RED = 1 };
+enum Fruit { RED = 2 };
+
+int main(void)
+{
+    return RED;
+}
+#else
+/* 正常路径：限定名和裸名一起用 */
+enum Color { Color.RED = 1, Color.GREEN = 2 };
+enum Fruit { Fruit.RED = 10, Fruit.APPLE = 20 };
+
+int main(void)
+{
+    if (Color.RED != 1 || Color.GREEN != 2)
+        return 1;
+    if (Fruit.RED != 10 || Fruit.APPLE != 20)
+        return 2;
+    if (APPLE != 20)
+        return 3;
+    return 0;
+}
+#endif

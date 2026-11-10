@@ -7,13 +7,13 @@
 struct S;
 extern int unknown[];
 
-// EXPECT test_one_binder: error: an array or slice yields an index and a value: write 'foreach |i, v| a'
-// EXPECT test_two_binders_range: error: a range yields only an index: write 'foreach |i| lo:hi'
+// EXPECT test_one_binder: error: an array or slice yields an index and a value: write 'foreach |i, v| a { ... }'
+// EXPECT test_two_binders_range: error: a range yields only an index: write 'foreach |i| lo:hi { ... }'
 // EXPECT test_both_discard: error: 'foreach' discards both binders
 // EXPECT test_three_binders: error: 'foreach' takes at most two bindings
 // EXPECT test_no_name: error: 'foreach' expects a binding name
 // EXPECT test_pointer: error: cannot iterate over 'int *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
-// EXPECT test_int: error: cannot iterate over 'int' (write a range: 'foreach |i| lo:hi')
+// EXPECT test_int: error: cannot iterate over 'int' (write a range: 'foreach |i| lo:hi { ... }')
 // EXPECT test_struct: error: cannot iterate over 'struct S' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_struct_pointer: error: cannot iterate over 'struct S *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
 // EXPECT test_vla: error: cannot iterate over a variable length array
@@ -21,6 +21,7 @@ extern int unknown[];
 // EXPECT test_unknown_length: error: cannot iterate over an array of unknown length
 // EXPECT test_float_range: error: range bounds must be integers
 // EXPECT test_no_block: error: '{' expected
+// EXPECT test_no_block_range: error: '{' expected
 // EXPECT test_array_element: error: 'foreach' cannot copy an element of type 'int [2]'
 // EXPECT test_file_scope: error: 'foreach' can only be used inside a function
 
@@ -139,6 +140,15 @@ int main(void)
     foreach |i, v| a
         a[0] = i + v;
     return a[0];
+}
+#elif defined test_no_block_range
+int main(void)
+{
+    /* 区间分支也要走同一条 '{' 检查（C50）：绑定表只有 1 个、没有元素类型，
+       所以它和数组/切片形态是两条独立的解析路径。 */
+    foreach |i| 0:2
+        return i;
+    return 0;
 }
 #elif defined test_array_element
 int main(void)

@@ -421,6 +421,39 @@ int main(void)
   文件作用域 tag 同名」会按原型解析（`int f(S) int *S; {…}`），写 `struct S` 即可；
 - 只在 `-std=c6` 的翻译单元里生效，`struct Vec v;` 永远可用。
 
+#### 枚举成员写成 `Color.RED`
+
+C 的枚举成员进的是普通标识符命名空间，两个枚举不能有同名成员；c6 让成员可以带上
+枚举自己的 tag，于是每个枚举自带一层空间：
+
+```c
+enum Color { Color.RED = 1, Color.GREEN = 2 };
+enum Fruit { Fruit.RED = 10, Fruit.APPLE = 20 };
+
+int main(void)
+{
+    int n = Color.RED + Fruit.RED;      /* 11：两个 RED 各有各的值 */
+    int m = GREEN + APPLE;              /* 22：没被抢占的裸名照旧可用 */
+    int a[Color.GREEN] = { 0 };         /* 常量表达式 */
+    if (n != 11 || m != 22 || sizeof a / sizeof a[0] != 2)
+        return 1;
+    switch (n) {
+    case Color.GREEN: return 2;         /* case 里也能用 */
+    case 11: return 0;
+    }
+    return 3;
+}
+```
+
+- 限定符必须是这个枚举自己的 tag（C117），匿名枚举的成员不能限定（C118）；
+- 两个枚举都要同一个裸名时，裸名被毒化（C119）：此后裸名报错，必须写
+  `Color.RED` / `Fruit.RED`——它指谁不再取决于书写顺序；
+- `Tag.成员` 是表达式，`if`/`while`/`for` 条件、`case`、数组长度里都能用，
+  枚举里没有这个名字时报 C120。
+
+细节见 [docs/grammar.md](docs/grammar.md) §3.8，用例见
+[tests/enum_scope.c](tests/enum_scope.c) 与 [tests/errors/enum_scope.c](tests/errors/enum_scope.c)。
+
 完整可运行示例见 [examples/typename_demo.c](examples/typename_demo.c)：
 
 ```sh
@@ -633,7 +666,7 @@ foreach |v| it { ... }          /* 迭代器：it 的类型提供 has(T *)/next(
 - 只求值一次：数组/切片落到隐藏的 `{元素指针, 长度}` 帧槽（与切片的
   运行期布局相同），区间上界落到隐藏整数槽，迭代器落到它自己的隐藏槽，
   因此循环体里改容器不影响迭代次数；
-- 迭代器**只绑定一个值**：`foreach |v| it`（`|_|` 合法，仍调用
+- 迭代器**只绑定一个值**：`foreach |v| it { … }`（`|_|` 合法，仍调用
   `next()` 推进）。值形态把迭代器状态复制到隐藏槽（循环不推进原
   对象），`T *` / 接口形态直接操作原对象（`next()` 的修改可见）；
 - 循环体**必须**是花括号块，绑定的作用域就是这条语句；绑定表写作
@@ -1353,15 +1386,16 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 #### 把 tests/ 也搬上裸机
 
-`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**26 个测试
-文件、251 个 test 块，0 失败**，每个文件一个镜像，一共 12 秒。
+`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**30 个测试
+文件、302 个 test 块，0 失败**，每个文件一个镜像，一共 14 秒。
 
 ```
 ok   async: 20 test(s), 0 failure(s)
+ok   enum_scope: 8 test(s), 0 failure(s)
 ok   fstr: 15 test(s), 0 failure(s)
 ok   try: 18 test(s), 0 failure(s)
 ...
-bare tests: 26 通过, 0 失败（跳过: gc_drop gc_thread method thread thread_handle tuple_thread）
+bare tests: 30 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）
 ```
 
 要补的不是运行时，而是**测试自己用的 libc**：
@@ -1607,6 +1641,12 @@ make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2
   就按老 C 语义走，否则再看 tag 命名空间；解析结果与写 `struct TAG` 完全同一个
   `CType`，所以 `sizeof`、方法注册、切片元素检查都自动一致。因为 tag 与普通符号
   分属两个命名空间，**同名时必须写 `struct`**（`struct stat` + `stat()` 就是例子）。
+- 枚举成员的限定名 `Color.RED` 走的是同一套点号解析：声明侧在 `struct_decl()`
+  里把成员**另外**注册成带点的常量名，并记住哪些裸名被两个枚举抢过（此后裸名
+  报错）；引用侧在 `unary()` 已有的 `pkg.member` 分支里先按带点名字查、查不到
+  再按包名 mangle。因为 `Color` 同时也是类型名，`decl()` 在条件位置向前看一个
+  记号：`Tag.` 一定不是声明，整条交给表达式解析（否则 `if (Color.RED)` 会被
+  当成声明）。
 - 变量初始化检查在**定义点**做，不做数据流分析；VLA 是唯一豁免
   （标准 C 禁止给变长数组写初始化器）。
 - 元组复用 `VT_STRUCT` 和内部 tag `__c6_tuple_N`，布局在构造类型时按自然对齐
