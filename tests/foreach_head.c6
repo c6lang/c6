@@ -1,0 +1,148 @@
+/* c6 自测：'foreach ( … )' 的三种头写法
+ *
+ *     foreach (T v = a)                  (* 只要元素值，v 是副本 *)
+ *     foreach (T i = lo:hi)              (* 只要下标，半开区间 *)
+ *     foreach ((T i, T v) = a)           (* 下标 + 值 *)
+ *
+ * 头里的类型就是绑定在循环体里的类型；循环状态（计数器、切片对、迭代器）
+ * 住在隐藏槽里，所以给绑定赋值不会改变迭代。旧的 'foreach |i, v| a' 与
+ * 这三种完全等价，仍然是合法写法。
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -test tests/foreach_head.c6
+ * 或直接：
+ *   make selftest
+ */
+#include <stdio.h>
+#include <stddef.h>
+
+struct It { int i, n; };
+
+static int has(struct It *s) { return s->i < s->n; }
+static int next(struct It *s) { return s->i++; }
+
+test "值绑定：(T v = a) 是元素的副本" {
+    int a[3] = { 10, 20, 30 };
+    int sum = 0, n = 0;
+    foreach (int v = a) {
+        sum += v;
+        v = 99;                     /* 写绑定不写回数组 */
+        n++;
+    }
+    if (sum != 60 || n != 3)
+        err(1, "值绑定不对");
+    if (a[0] != 10 || a[1] != 20 || a[2] != 30)
+        err(2, "写绑定改到了数组");
+}
+
+test "值绑定：切片与迭代器同样适用" {
+    int a[4] = { 1, 2, 3, 4 };
+    int[:] s = a;
+    int total = 0;
+    foreach (int v = s) {
+        total += v;
+    }
+    if (total != 10)
+        err(1, "切片值绑定不对");
+
+    struct It it = { 0, 3 };
+    int seen = 0;
+    foreach (int v = it) {           /* 值形态：复制迭代器状态 */
+        seen = seen * 10 + v;
+    }
+    if (seen != 12)
+        err(2, "迭代器值绑定不对");
+    if (it.i != 0)
+        err(3, "值形态不该推进原迭代器");
+}
+
+test "区间：(T i = lo:hi) 是半开区间" {
+    int sum = 0;
+    foreach (int i = 0:4) {
+        sum += i;
+    }
+    if (sum != 6)
+        err(1, "区间 0:4 不对");
+
+    const char *neg = 0;
+    int n = 0;
+    foreach (long i = -2:2) {
+        neg = (i < 0) ? "有负数" : neg;
+        n++;
+    }
+    if (n != 4 || !neg)
+        err(2, "负数区间不对");
+}
+
+test "双绑定：((T i, T v) = a) 的下标与值一致" {
+    int a[3] = { 7, 8, 9 };
+    int idx = 0, sum = 0;
+    foreach ((size_t i, int v) = a) {
+        if ((int)i != idx)
+            err(1, "下标不连续");
+        sum += v;
+        idx++;
+    }
+    if (idx != 3 || sum != 24)
+        err(2, "双绑定不对");
+}
+
+test "绑定类型可以与元素类型不同（按赋值的规则转换）" {
+    char s[3] = { 'a', 'b', 'c' };
+    int sum = 0;
+    foreach (long v = s) {           /* char -> long */
+        sum += (int)v;
+    }
+    if (sum != ('a' + 'b' + 'c'))
+        err(1, "窄化/拓宽转换不对");
+}
+
+test "写绑定不改变迭代次数" {
+    int n = 0;
+    foreach (size_t i = 0:3) {
+        i = 99;                      /* 绑定是副本，计数器在隐藏槽里 */
+        n++;
+    }
+    if (n != 3)
+        err(1, "写绑定影响了迭代");
+
+    int a[2] = { 1, 2 };
+    int m = 0;
+    foreach ((size_t i, int v) = a) {
+        i = 99;
+        v = 42;
+        m++;
+    }
+    if (m != 2)
+        err(2, "写双绑定影响了迭代");
+}
+
+test "'_' 丢弃绑定" {
+    int a[2] = { 5, 6 };
+    int sum = 0;
+    foreach ((size_t _, int v) = a) {
+        sum += v;
+    }
+    if (sum != 11)
+        err(1, "丢弃下标后求和不对");
+}
+
+test "旧写法 |i, v| 与新写法等价" {
+    int a[2] = { 3, 4 };
+    int old_sum = 0, new_sum = 0;
+    foreach |i, v| a {
+        old_sum += (int)i * 10 + v;
+    }
+    foreach ((size_t i, int v) = a) {
+        new_sum += (int)i * 10 + v;
+    }
+    if (old_sum != new_sum || new_sum != 17)
+        err(1, "两种写法结果不同");
+}
+
+test "'foreach' 仍然是软关键字" {
+    /* 没有 '|' 也没有可解析的头时退回普通表达式 */
+    int foreach = 3;
+    if (foreach != 3)
+        err(1, "软关键字遮蔽失败");
+}

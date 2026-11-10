@@ -1,0 +1,119 @@
+/* c6 编译期诊断：'foreach ( … )' 头的三种写法
+ *
+ * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
+ * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
+ * 不带任何 -D 时是本文件的“正常路径”，必须编译通过并运行成功。
+ */
+struct It { int i, n; };
+
+static int has(struct It *s) { return s->i < s->n; }
+static int next(struct It *s) { return s->i++; }
+
+// EXPECT test_no_type: error: a type name expected in the head of 'foreach'
+// EXPECT test_no_name: error: identifier expected
+// EXPECT test_void_binding: error: a 'foreach' binding cannot be 'void'
+// EXPECT test_array_binding: error: a 'foreach' binding cannot be an array
+// EXPECT test_index_not_int: error: the index of a 'foreach' must have an integer type, not 'double'
+// EXPECT test_pair_range: error: a range yields only an index
+// EXPECT test_pair_iterator: error: an iterator yields only a value
+// EXPECT test_ownership: error: a 'foreach' binding cannot change ownership
+// EXPECT test_file_scope: error: 'foreach' can only be used inside a function
+
+#if defined test_no_type
+int main(void)
+{
+    int a[2] = { 1, 2 };
+    foreach (v = a) {
+        (void)v;
+    }
+    return 0;
+}
+#elif defined test_no_name
+int main(void)
+{
+    int a[2] = { 1, 2 };
+    foreach (int = a) {
+        (void)0;
+    }
+    return 0;
+}
+#elif defined test_void_binding
+int main(void)
+{
+    int a[2] = { 1, 2 };
+    foreach (void v = a) {
+        (void)v;
+    }
+    return 0;
+}
+#elif defined test_array_binding
+int main(void)
+{
+    int a[2][2] = { { 1, 2 }, { 3, 4 } };
+    foreach (int row[2] = a) {
+        (void)row;
+    }
+    return 0;
+}
+#elif defined test_index_not_int
+int main(void)
+{
+    foreach (double d = 0:2) {
+        (void)d;
+    }
+    return 0;
+}
+#elif defined test_pair_range
+int main(void)
+{
+    foreach ((unsigned long i, int v) = 0:2) {
+        (void)i;
+        (void)v;
+    }
+    return 0;
+}
+#elif defined test_pair_iterator
+int main(void)
+{
+    struct It it = { 0, 2 };
+    foreach ((unsigned long i, int v) = it) {
+        (void)i;
+        (void)v;
+    }
+    return 0;
+}
+#elif defined test_ownership
+int main(void)
+{
+    int a[2] = { 1, 2 };
+    /* 元素不是托管引用，绑定却声明成 '@int'：这会凭空造出一个引用 */
+    foreach (@int v = a) {
+        (void)v;
+    }
+    return 0;
+}
+#elif defined test_file_scope
+foreach (int v = 0:2) {
+    (void)v;
+}
+#else
+/* 正常路径：三种头写法各走一遍 */
+int main(void)
+{
+    int a[3] = { 10, 20, 30 };
+    int sum = 0;
+
+    foreach (int v = a) {
+        sum += v;
+    }
+    foreach (int i = 0:3) {
+        sum += i;
+    }
+    foreach ((unsigned long i, int v) = a) {
+        sum += (int)i + v;
+    }
+    if (sum != (60 + 3 + 63))
+        return 1;
+    return 0;
+}
+#endif

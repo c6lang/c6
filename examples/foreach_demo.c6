@@ -1,19 +1,21 @@
-/* c6 'foreach |i, v| a { ... }' 示例
+/* c6 'foreach (T v = a) { ... }' 示例
  *
  *   ./tcc/tcc -B tcc -run examples/foreach_demo.c6
  *
- * 可迭代对象只有三种：完整数组、切片 'T[:]'、整数区间 'lo:hi'（半开）。
- * 下标绑定就是循环变量（size_t），值绑定是元素的一份副本。
+ * 可迭代对象有三种：完整数组、切片 'T[:]'、整数区间 'lo:hi'（半开）。
+ * 头里声明绑定：'(T v = a)' 只要值，'((T i, T v) = a)' 下标 + 值，
+ * '(T i = lo:hi)' 只要下标。循环状态在隐藏槽里，绑定都是每轮的副本，
+ * 所以写绑定不影响迭代。旧的绑定表 '|i, v| a' 与此完全等价。
  */
 #include <stdio.h>
+#include <stddef.h>
 
 struct Pair { int a, b; };
 
 static int sum(int[:] s)
 {
     int total = 0;
-    foreach |i, v| s {
-        (void)i;
+    foreach (int v = s) {
         total += v;
     }
     return total;
@@ -21,7 +23,7 @@ static int sum(int[:] s)
 
 static void show_pairs(struct Pair[:] ps)
 {
-    foreach |i, p| ps {
+    foreach ((size_t i, struct Pair p) = ps) {
         printf("ps[%d] = {%d, %d}\n", (int)i, p.a, p.b);
     }
 }
@@ -33,7 +35,7 @@ int main(void)
     int total = 0;
 
     /* 数组：下标 + 元素副本 */
-    foreach |i, v| a {
+    foreach ((size_t i, int v) = a) {
         printf("a[%d] = %d\n", (int)i, v);
     }
 
@@ -41,26 +43,24 @@ int main(void)
     printf("sum(a[1:4]) = %d\n", sum(a[1:4]));
 
     /* 区间 [0, n)：只有一个绑定 */
-    foreach |i| 0:3 {
+    foreach (int i = 0:3) {
         printf("range %d\n", i);
     }
 
     /* '_' 丢弃绑定：重复两次 */
-    foreach |_| 0:2 {
+    foreach (int _ = 0:2) {
         printf("again\n");
     }
 
     /* 元素是结构体时也是副本：写 p 不改 pairs */
     show_pairs(pairs);
-    foreach |i, p| pairs {
-        (void)i;
+    foreach ((size_t _, struct Pair p) = pairs) {
         p.a = 0;
     }
     show_pairs(pairs);
 
     /* 值绑定可写，不影响容器 */
-    foreach |i, v| a {
-        (void)i;
+    foreach (int v = a) {
         v *= 2;
         total += v;
     }

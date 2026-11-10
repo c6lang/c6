@@ -58,7 +58,7 @@ struct HIt { int i; };
 int has(struct HIt *s) { return s->i < 1; }
 struct Holder next(struct HIt *s);
 
-// EXPECT test_two_binders: error: an iterator yields only a value: write 'foreach |v| it { ... }'
+// EXPECT test_two_binders: error: an iterator yields only a value: write 'foreach (T v = it) { ... }'
 // EXPECT test_only_has: error: cannot iterate over 'struct OnlyHas' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_shadow: error: cannot iterate over 'struct Shadow' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_has_void: error: iterator method 'has' must return an integer type (got 'void')

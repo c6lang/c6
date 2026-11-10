@@ -7,13 +7,13 @@
 struct S;
 extern int unknown[];
 
-// EXPECT test_one_binder: error: an array or slice yields an index and a value: write 'foreach |i, v| a { ... }'
-// EXPECT test_two_binders_range: error: a range yields only an index: write 'foreach |i| lo:hi { ... }'
+// EXPECT test_one_binder: error: an array or slice yields an index and a value: write 'foreach ((size_t i, T v) = a) { ... }'
+// EXPECT test_two_binders_range: error: a range yields only an index: write 'foreach (size_t i = lo:hi) { ... }'
 // EXPECT test_both_discard: error: 'foreach' discards both binders
 // EXPECT test_three_binders: error: 'foreach' takes at most two bindings
 // EXPECT test_no_name: error: 'foreach' expects a binding name
 // EXPECT test_pointer: error: cannot iterate over 'int *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
-// EXPECT test_int: error: cannot iterate over 'int' (write a range: 'foreach |i| lo:hi { ... }')
+// EXPECT test_int: error: cannot iterate over 'int' (write a range: 'foreach (size_t i = lo:hi) { ... }')
 // EXPECT test_struct: error: cannot iterate over 'struct S' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')
 // EXPECT test_struct_pointer: error: cannot iterate over 'struct S *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')
 // EXPECT test_vla: error: cannot iterate over a variable length array

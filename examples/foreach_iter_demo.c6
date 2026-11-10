@@ -1,4 +1,4 @@
-/* c6 'foreach |v| it { ... }' 迭代器协议示例
+/* c6 'foreach (T v = it) { ... }' 迭代器协议示例
  *
  *   ./tcc/tcc -B tcc -run examples/foreach_iter_demo.c6
  *
@@ -57,7 +57,7 @@ interface IntIter {
 int sum(IntIter it)
 {
     int total = 0;
-    foreach |v| it {
+    foreach (int v = it) {
         total += v;
     }
     return total;
@@ -68,7 +68,7 @@ int main(void)
     /* 值形态：循环结束后 c.n 仍然是 3 */
     struct Countdown c = {3};
     printf("countdown:");
-    foreach |v| c {
+    foreach (int v = c) {
         printf(" %d", v);
     }
     printf("  (c.n = %d)\n", c.n);
@@ -76,14 +76,14 @@ int main(void)
     /* 指针形态：c 被真正倒完 */
     struct Countdown d = {3};
     printf("by pointer:");
-    foreach |v| &d {
+    foreach (int v = &d) {
         printf(" %d", v);
     }
     printf("  (d.n = %d)\n", d.n);
 
     /* 元素是结构体：绑定是 next() 返回值的副本 */
     struct Pairs ps = {0};
-    foreach |p| ps {
+    foreach (struct Pair p = ps) {
         printf("pair {%d, %d}\n", p.a, p.b);
     }
 

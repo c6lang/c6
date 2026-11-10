@@ -17,7 +17,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]`；被普通符号遮蔽时仍写 `struct` |
 | `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
-| `foreach \|i, v\| a { ... }` | 遍历数组、切片、整数区间，以及实现 `has()`/`next()` 协议的迭代器：绑定表在前，值绑定是元素副本 |
+| `foreach (T v = a) { ... }` | 遍历数组、切片、整数区间，以及实现 `has()`/`next()` 协议的迭代器：头里声明绑定（`(T v = a)` / `((T i, T v) = a)` / `(T i = lo:hi)`），值绑定是元素副本 |
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
 | 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；捕获式闭包 `closure RET (P…)` 把外层块作用域名字按值捕获进隐藏的 env，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
@@ -637,16 +637,19 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 
 跨 TU 时两边各自写 `T[:]` 即可（布局固定），不需要额外声明。
 
-### `foreach |i, v| a { ... }`
+### `foreach (T v = a) { ... }`
 
 ```c
 int a[5] = {10, 20, 30, 40, 50};
 int[:] s = a[1:4];
 
-foreach |i, v| a { ... }        /* 数组：i 是 size_t 下标，v 是元素副本 */
-foreach |i, v| s { ... }        /* 切片：同上，长度是求值那一刻的快照 */
-foreach |i| 0:5 { ... }         /* 区间 [0, 5)：只要一个绑定 */
-foreach |_, v| a { ... }        /* '_' 丢弃这个绑定 */
+foreach (int v = a) { ... }             /* 只要值：v 是元素副本 */
+foreach ((size_t i, int v) = a) { ... } /* 下标 + 值 */
+foreach (size_t i = 0:5) { ... }        /* 区间 [0, 5)：只要下标 */
+foreach ((size_t i, int v) = s) { ... } /* 切片：长度是求值那一刻的快照 */
+foreach ((size_t _, int v) = a) { ... } /* '_' 丢弃这个绑定 */
+
+/* 旧的绑定表写法仍然等价： */
 foreach |i, v| obj.items { ... }/* 结构体暴露的切片成员 */
 foreach |v| it { ... }          /* 迭代器：it 的类型提供 has(T *)/next(T *) */
 ```
@@ -655,14 +658,18 @@ foreach |v| it { ... }          /* 迭代器：it 的类型提供 has(T *)/next(
 
 | 写法 | 行为 |
 |---|---|
-| `foreach \|i, v\| 数组` | 两个绑定：`i` 是 `size_t` 下标，`v` 是元素副本 |
-| `foreach \|i, v\| 切片` | 同上；可迭代值只求值一次（`{data, len}` 快照） |
-| `foreach \|i\| lo:hi` | 半开区间 `[lo, hi)`；下标是两界的公共整数类型，`lo >= hi` 零次 |
-| `foreach \|_, v\| …` / `foreach \|i, _\| …` | 丢弃下标 / 丢弃值（丢弃的绑定连加载都不生成） |
-| `foreach \|_\| 0:n { … }` | “重复 n 次”的写法 |
-| `foreach \|v\| it` | 迭代器：`it` 是 `T`、`T *` 或接口值，类型提供 `int has(T *)` + `E next(T *)`；`v` 是 `next()` 返回值的副本 |
+| `foreach (T v = 数组)` | 只要值：`v` 是元素副本 |
+| `foreach ((T i, T v) = 数组)` | 下标 + 值：`i` 从 0 数到长度减一 |
+| `foreach ((T i, T v) = 切片)` | 同上；可迭代值只求值一次（`{data, len}` 快照） |
+| `foreach (T i = lo:hi)` | 半开区间 `[lo, hi)`；`lo >= hi` 零次，两个界各只求值一次 |
+| `foreach (T _ = …)` / `(_, T v)` | 丢弃这个绑定（丢弃的绑定连加载都不生成） |
+| `foreach (int _ = 0:n) { … }` | “重复 n 次”的写法 |
+| `foreach (T v = it)` | 迭代器：`it` 是 `T`、`T *` 或接口值，类型提供 `int has(T *)` + `E next(T *)`；`v` 是 `next()` 返回值的副本 |
+| `foreach \|i, v\| a` / `\|i\| lo:hi` / `\|v\| it` | 旧的绑定表写法，与前几行一一对应，仍然支持 |
+| 头里的类型 | 就是绑定在体里的类型：可以比元素宽或窄，按赋值规则转换 |
 | 值绑定 `v` | 副本：写它不改容器 |
-| 下标绑定 `i` | 就是循环变量：写它改变后续迭代（同 `for`） |
+| 下标绑定（新写法） | 每轮从计数器拷的一份副本：写它不影响迭代 |
+| 下标绑定（旧写法 `\|i\|`） | 就是循环变量：写它改变后续迭代（同 `for`） |
 | `break` / `continue` / `defer` / `await` | 与写在 `for` 体里完全一致 |
 
 规则：
@@ -679,20 +686,27 @@ foreach |v| it { ... }          /* 迭代器：it 的类型提供 has(T *)/next(
 - 只求值一次：数组/切片落到隐藏的 `{元素指针, 长度}` 帧槽（与切片的
   运行期布局相同），区间上界落到隐藏整数槽，迭代器落到它自己的隐藏槽，
   因此循环体里改容器不影响迭代次数；
-- 迭代器**只绑定一个值**：`foreach |v| it { … }`（`|_|` 合法，仍调用
+- 迭代器**只绑定一个值**：`foreach (T v = it) { … }`（旧写法 `|v|` 等价；
+  `|_|` / `(T _ = it)` 合法，仍调用
   `next()` 推进）。值形态把迭代器状态复制到隐藏槽（循环不推进原
   对象），`T *` / 接口形态直接操作原对象（`next()` 的修改可见）；
-- 循环体**必须**是花括号块，绑定的作用域就是这条语句；绑定表写作
-  `|名字, 名字|`，`_` 表示丢弃；数组/切片要两个绑定、区间和迭代器
-  要一个；
+- 循环体**必须**是花括号块，绑定的作用域就是这条语句。头有两种写法：
+  带括号的声明式 `foreach (T v = a)` / `foreach ((T i, T v) = a)` /
+  `foreach (T i = lo:hi)`（推荐，绑定在头里声明，类型就是体里的类型），
+  以及旧的绑定表 `foreach |i, v| a`；`_` 两种写法都表示丢弃。数组/切片
+  最多两个绑定，区间和迭代器只有一个；
+- 迭代状态（计数器、切片对、迭代器）住在隐藏槽里，所以循环体里改容器、
+  改下标都不影响迭代次数；新写法的下标是每轮拷出来的副本，旧写法
+  `|i|` 的下标就是计数器本身（沿用 `for` 的语义）；
 - 元素本身是数组时（`int[2][3]`、`Row[:]`）不能遍历：值绑定会是一个
   数组，而数组在 C 里不可赋值；改用下标区间
-  `foreach |i| 0:(int)rows.len { … rows[i] … }`；
+  `foreach (size_t i = 0:(int)rows.len) { … rows[i] … }`；
 - 下标/值都是普通局部变量，所以可以在 `async` 函数体里用（隐藏槽随帧
   一起保存/恢复），也可以在 `defer` 体、嵌套循环里用；
 - `foreach` 仍然可以当普通标识符：`int foreach = 1;`、`foreach(x);`、
   `p->foreach`、`goto foreach;` 都照常工作——只有语句开头、且下一个记号
-  是 `|` 时才按语句解析；
+  是 `|`，或者是 `(` 且括号里的内容不是一个已知标识符的调用时，才按语句
+  解析；
 - 迭代器的 `next()` 返回数组、`void`、`void *`（元素类型会被擦除）或
   不完整类型都报错；`foreach |i, v| it` 也报错（迭代器没有下标绑定）。
   要下标自己维护计数器；值形态的 `T` 想“advance 原对象”就写
@@ -1409,7 +1423,7 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 #### 把 tests/ 也搬上裸机
 
-`make fstest-bare-tests` 把 `tests/*.c6` 里的 test 块搬到裸机上跑：**34 个测试
+`make fstest-bare-tests` 把 `tests/*.c6` 里的 test 块搬到裸机上跑：**35 个测试
 文件、全部 test 块，0 失败**，每个文件一个镜像，一共十几秒。
 
 ```
@@ -1419,7 +1433,7 @@ ok   fstr: 15 test(s), 0 failure(s)
 ok   generic_fn: 8 test(s), 0 failure(s)（块级跳过 1）
 ok   try: 18 test(s), 0 failure(s)
 ...
-bare tests: 34 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）（块级跳过: generic_fn:1）
+bare tests: 35 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）（块级跳过: generic_fn:1）
 ```
 
 要补的不是运行时，而是**测试自己用的 libc**：
@@ -1561,7 +1575,8 @@ tests/
 ├── tuple_thread.c6    元组 + spawn（OS 线程）
 ├── typename.c6        裸 tag 类型名（省略 struct / union / enum）
 ├── enum_scope.c6      枚举成员的限定名 Color.RED
-├── foreach.c6         foreach：数组 / 切片 / 区间
+├── foreach.c6         foreach：数组 / 切片 / 区间（旧绑定表写法）
+├── foreach_head.c6    foreach：`(T v = a)` / `((T i, T v) = a)` / `(T i = lo:hi)`
 ├── foreach_iter.c6    foreach：has()/next() 迭代器协议
 ├── fstr.c6            字符串插值 f".." / @f".."
 ├── fn_lit.c6          函数字面量

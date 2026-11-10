@@ -16667,7 +16667,7 @@ again:
     } else if (t == TOK_C6_FOREACH) {
         if (!c6_ext_on())
             tcc_error("'foreach' requires a .c6 source file");
-        if (tok != '|') {
+        if (tok != '|' && !(tok == '(' && !sym_find(t))) {
             /* not a statement: 'foreach' is used as a plain name here */
             unget_tok(t);
             goto expr;
@@ -19939,6 +19939,32 @@ static void c6_iter_call(C6Iter *it, int obj_off, int which)
     tokc = save_val;
 }
 
+/* 'Type name' inside a parenthesised 'foreach' head: returns the binding
+   token (0 for '_') and fills the declared type.  'foreach (T v = a)' and the
+   pair form 'foreach ((T i, T v) = a)' both use it, so the diagnostics are
+   written once. */
+static int c6_foreach_binder(CType *out)
+{
+    AttributeDef ad0 = {0};
+    int name = 0;
+
+    *out = (CType){0};
+    if (!parse_btype(out, &ad0, 1))
+        tcc_error("a type name expected in the head of 'foreach'");
+    type_decl(out, &ad0, &name, TYPE_DIRECT);
+    if (!name || name < TOK_UIDENT)
+        tcc_error("a binding name expected in the head of 'foreach'");
+    if ((out->t & VT_BTYPE) == VT_VOID)
+        tcc_error("a 'foreach' binding cannot be 'void'");
+    if (out->t & VT_ARRAY)
+        tcc_error("a 'foreach' binding cannot be an array");
+    if ((out->t & VT_BTYPE) == VT_FUNC)
+        tcc_error("a 'foreach' binding cannot be a function");
+    if (!strcmp(get_tok_str(name, NULL), "_"))
+        return 0;
+    return name;
+}
+
 /* 'foreach' keeps the 'for' semantics: the binders live in their own scope
    and 'lblock' collects the break/continue jumps of the body. */
 static void c6_foreach_parse(void)
@@ -19954,30 +19980,62 @@ static void c6_foreach_parse(void)
     int a = 0, b = 0, c = 0, d = 0;
     C6MoveSnap mv_base = {0}, mv_body = {0};
     int body_ok = 0;
+    int new_head = 0, have_it = 0, have_iv = 0, one_tok = 0, di_off = 0;
+    CType dit = {0}, dvt = {0}, one_type = {0}, vslot = {0};
 
     n1 = n2 = nb = i_off = v_off = pair = hi_off = 0;
     is_range = 0;
 
-    next();                             /* '|' */
-    for (;;) {
-        int name = 0;
-        if (tok < TOK_UIDENT)
-            tcc_error("'foreach' expects a binding name");
-        if (nb == 2)
-            tcc_error("'foreach' takes at most two bindings");
-        name = 0;
-        if (strcmp(get_tok_str(tok, NULL), "_"))
-            name = tok;
-        if (nb++ == 0)
-            n1 = name;
-        else
-            n2 = name;
+    if (tok == '(') {                   /* 'foreach (T v = a)' */
+
+        /* 'foreach (T v = a)', 'foreach (size_t i = lo:hi)' and the pair
+           form 'foreach ((size_t i, T v) = a)'.  The declared type is what
+           the binding has in the body; the loop state itself lives in the
+           hidden slots below, so assigning to a binding never disturbs the
+           iteration.  Which role the single binding gets (index or value)
+           is decided by the iterable: a range yields an index, an array, a
+           slice and an iterator yield a value. */
+        new_head = 1;
+        next();                         /* '(' */
+        if (tok == '(') {
+            next();
+            n1 = c6_foreach_binder(&dit);
+            have_it = 1;
+            skip(',');
+            n2 = c6_foreach_binder(&dvt);
+            have_iv = 1;
+            nb = 2;
+            skip(')');
+        } else {
+            one_tok = c6_foreach_binder(&one_type);
+            nb = 1;
+        }
+        skip('=');
+    } else if (tok == '|') {
         next();
-        if (tok != ',')
-            break;
-        next();
+        for (;;) {
+            int name = 0;
+            if (tok < TOK_UIDENT)
+                tcc_error("'foreach' expects a binding name");
+            if (nb == 2)
+                tcc_error("'foreach' takes at most two bindings");
+            name = 0;
+            if (strcmp(get_tok_str(tok, NULL), "_"))
+                name = tok;
+            if (nb++ == 0)
+                n1 = name;
+            else
+                n2 = name;
+            next();
+            if (tok != ',')
+                break;
+            next();
+        }
+        skip('|');
+    } else {
+        tcc_error("'foreach' expects '|binding|' or a parenthesised head: "
+                  "write 'foreach (T v = a) { ... }'");
     }
-    skip('|');
 
     new_scope(&o);
 
@@ -19986,9 +20044,26 @@ static void c6_foreach_parse(void)
         is_range = 1;
         next();
         expr_cond();
-        if (nb != 1)
+    }
+    if (new_head)
+        skip(')');
+    if (is_range) {
+        if (new_head && have_iv)
             tcc_error("a range yields only an index: "
-                      "write 'foreach |i| lo:hi { ... }'");
+                      "write 'foreach (size_t i = lo:hi) { ... }'");
+        if (new_head && nb == 1) {
+            n1 = one_tok;
+            dit = one_type;
+            have_it = 1;
+        }
+        if (!new_head && nb != 1)
+            tcc_error("a range yields only an index: "
+                      "write 'foreach (size_t i = lo:hi) { ... }'");
+        if (have_it && !c6_is_int_type(&dit)) {
+            type_to_str(buf, sizeof buf, &dit, NULL);
+            tcc_error("the index of a 'foreach' must have an integer type, "
+                      "not '%s'", buf);
+        }
         if (!c6_is_int_type(&vtop[-1].type) || !c6_is_int_type(&vtop->type))
             tcc_error("range bounds must be integers");
         ctr = c6_common_int_type(&vtop[-1].type, &vtop->type);
@@ -20000,12 +20075,21 @@ static void c6_foreach_parse(void)
         vswap();
         vstore();
         vpop();
-        /* ... and the binder is the counter, so it starts at the lower
-           bound (the store converts it to the common type) */
+        /* ... and the counter lives in its own hidden slot: it is stepped in
+           the common type of the bounds, while a declared binding is a copy
+           of it, taken once per round */
         loc = (loc - size) & -align;
         i_off = loc;
-        if (n1)
+        if (have_it) {
+            int isz = 0, ial = 0;
+            isz = type_size(&dit, &ial);
+            loc = (loc - isz) & -ial;
+            di_off = loc;
+            if (n1)
+                sym_push(n1, &dit, VT_LOCAL | VT_LVAL, di_off);
+        } else if (n1) {
             sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
+        }
         vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
         vswap();
         vstore();
@@ -20017,7 +20101,12 @@ static void c6_foreach_parse(void)
             is_iter = 1;
             if (nb != 1)
                 tcc_error("an iterator yields only a value: "
-                          "write 'foreach |v| it { ... }'");
+                          "write 'foreach (T v = it) { ... }'");
+            if (new_head) {
+                n1 = one_tok;
+                dvt = one_type;
+                have_iv = 1;
+            }
             elem = it.elem;
             c6_gc_value_check(&it.obj, "an iterable");
             /* A borrowed managed parameter needs no reference of its own;
@@ -20038,14 +20127,19 @@ static void c6_foreach_parse(void)
             vstore();
             vpop();
             /* the value binder is written from 'next()' each round */
-            size = type_size(&elem, &align);
+            vslot = (have_iv ? dvt : elem);
+            if (have_iv && (c6_is_managed(&elem) != c6_is_managed(&vslot)))
+                tcc_error("a 'foreach' binding cannot change ownership: "
+                          "'%s' holds a managed reference",
+                          get_tok_str(n1, NULL));
+            size = type_size(&vslot, &align);
             loc = (loc - size) & -align;
             v_off = loc;
             if (n1)
-                sym_push(n1, &elem, VT_LOCAL | VT_LVAL, v_off);
-            if (c6_is_managed(&elem)) {
+                sym_push(n1, &vslot, VT_LOCAL | VT_LVAL, v_off);
+            if (c6_is_managed(&vslot)) {
                 c6_zero_local(v_off, size);
-                c6_gc_site(v_off, &elem);
+                c6_gc_site(v_off, &vslot);
                 managed_elem = 1;
             }
             c6_iter_setup(&it);
@@ -20055,16 +20149,16 @@ static void c6_foreach_parse(void)
             if (t.t & VT_ARRAY) {
                 if (!t.ref || t.ref->c < 0)
                     tcc_error("cannot iterate over an array of unknown length");
-                if (nb != 2)
+                if (!new_head && nb != 2)
                     tcc_error("an array or slice yields an index and a value: "
-                              "write 'foreach |i, v| a { ... }'");
+                              "write 'foreach ((size_t i, T v) = a) { ... }'");
                 elem = *pointed_type(&t);
                 elem.t &= ~VT_QUAL;
                 pair = c6_slice_spill(NULL);
             } else if ((sl = c6_slice_of_type(&t)) != NULL) {
-                if (nb != 2)
+                if (!new_head && nb != 2)
                     tcc_error("an array or slice yields an index and a value: "
-                              "write 'foreach |i, v| a { ... }'");
+                              "write 'foreach ((size_t i, T v) = a) { ... }'");
                 elem = sl->elem;
                 pair = c6_slice_spill(sl);
             } else {
@@ -20075,22 +20169,39 @@ static void c6_foreach_parse(void)
                               "'(T[:]){p, n}')", buf);
                 if (c6_is_int_type(&t))
                     tcc_error("cannot iterate over '%s' (write a range: "
-                              "'foreach |i| lo:hi { ... }')", buf);
+                              "'foreach (size_t i = lo:hi) { ... }')", buf);
                 tcc_error("cannot iterate over '%s' (no 'has'/'next' iterator: "
                           "expose a slice member 'T[:] items', or define "
                           "'int has(T *); E next(T *);')", buf);
             }
+            if (new_head && nb == 1) {
+                /* one declared binding: it is the element value, the index
+                   stays hidden (discard it explicitly with '(_, T v)') */
+                n2 = one_tok;
+                dvt = one_type;
+                have_iv = 1;
+            }
             if (!n1 && !n2)
                 tcc_error("'foreach' discards both binders");
-            if (elem.t & VT_ARRAY) {
-                type_to_str(buf, sizeof buf, &elem, NULL);
+            if (have_it && !c6_is_int_type(&dit)) {
+                type_to_str(buf, sizeof buf, &dit, NULL);
+                tcc_error("the index of a 'foreach' must have an integer "
+                          "type, not '%s'", buf);
+            }
+            vslot = (have_iv ? dvt : elem);
+            if (have_iv && (c6_is_managed(&elem) != c6_is_managed(&vslot)))
+                tcc_error("a 'foreach' binding cannot change ownership: "
+                          "'%s' holds a managed reference",
+                          get_tok_str(n2, NULL));
+            if (vslot.t & VT_ARRAY) {
+                type_to_str(buf, sizeof buf, &vslot, NULL);
                 tcc_error("'foreach' cannot copy an element of type '%s'", buf);
             }
             if (n2)
-                c6_gc_value_check(&elem, "a foreach binding");
-            size = type_size(&elem, &align);
+                c6_gc_value_check(&vslot, "a foreach binding");
+            size = type_size(&vslot, &align);
             if (size < 0) {
-                type_to_str(buf, sizeof buf, &elem, NULL);
+                type_to_str(buf, sizeof buf, &vslot, NULL);
                 tcc_error("cannot iterate over incomplete element type '%s'", buf);
             }
             ctr = c6_size_type();
@@ -20099,13 +20210,22 @@ static void c6_foreach_parse(void)
             v_off = loc;
             loc = (loc - PTR_SIZE) & -PTR_SIZE;
             i_off = loc;
-            if (n1)
-                sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
+            if (n1) {
+                if (have_it) {
+                    int isz = 0, ial = 0;
+                    isz = type_size(&dit, &ial);
+                    loc = (loc - isz) & -ial;
+                    di_off = loc;
+                    sym_push(n1, &dit, VT_LOCAL | VT_LVAL, di_off);
+                } else {
+                    sym_push(n1, &ctr, VT_LOCAL | VT_LVAL, i_off);
+                }
+            }
             if (n2) {
-                sym_push(n2, &elem, VT_LOCAL | VT_LVAL, v_off);
-                if (c6_is_managed(&elem)) {
+                sym_push(n2, &vslot, VT_LOCAL | VT_LVAL, v_off);
+                if (c6_is_managed(&vslot)) {
                     c6_zero_local(v_off, size);
-                    c6_gc_site(v_off, &elem);
+                    c6_gc_site(v_off, &vslot);
                 }
             }
             vset(&ctr, VT_LOCAL | VT_LVAL, i_off);       /* i = 0 */
@@ -20132,7 +20252,7 @@ static void c6_foreach_parse(void)
     if (is_iter) {
         c6_iter_call(&it, obj_off, 1);  /* next() */
         if (n1 || managed_elem) {
-            vset(&elem, VT_LOCAL | VT_LVAL, v_off);     /* destination */
+            vset(&vslot, VT_LOCAL | VT_LVAL, v_off);    /* destination */
             vswap();
             vstore();
             vpop();
@@ -20142,11 +20262,19 @@ static void c6_foreach_parse(void)
     } else if (n2) {
         ept = elem;
         mk_pointer(&ept);
-        vset(&elem, VT_LOCAL | VT_LVAL, v_off);     /* destination */
+        vset(&vslot, VT_LOCAL | VT_LVAL, v_off);    /* destination */
         vset(&ept, VT_LOCAL | VT_LVAL, pair);       /* data */
         vset(&ctr, VT_LOCAL | VT_LVAL, i_off);      /* index */
         gen_op('+');
         indir();
+        vstore();
+        vpop();
+    }
+    /* a declared index binding is a copy of the counter, taken once per
+       round: writing it in the body does not change the iteration */
+    if (di_off) {
+        vset(&dit, VT_LOCAL | VT_LVAL, di_off);
+        vset(&ctr, VT_LOCAL | VT_LVAL, i_off);
         vstore();
         vpop();
     }
@@ -22574,7 +22702,7 @@ static void c6_apply_fallible(CType *type)
         if (tcc_state->c6_ext && l == VT_CONST && tok == TOK_C6_FOREACH) {
             int c6_name = tok;
             next();
-            if (tok == '|')
+            if (tok == '|' || tok == '(')
                 tcc_error("'foreach' can only be used inside a function");
             unget_tok(c6_name);
         }
