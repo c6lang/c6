@@ -9,9 +9,12 @@
 实例 mangle 成 `Vect_int`，所以它就是一个普通 struct、普通函数——方法符号
 `Vect_int_<name>`，实例函数 `Vect_int_vat`，纯 C 的 TU 写 `struct Vect_int`
 即可互通（`tests/abi/generic.c`）。值形参写成 C 参数表形状
-（`struct Buf@(T, int N)`，实参 `Buf@(int, 4)`）并按常量绑定。还没写的：
-`-emit-header` 的实例输出、模块前缀与实例名冲突检查、体内成员函数（§8.5），
-见 §9 的状态列。
+（`struct Buf@(T, int N)`，实参 `Buf@(int, 4)`）并按常量绑定。**体内成员函数**
+（§8.5）也可以写了：`struct Vect@T { T *data; int len; T at(int i) { return
+data[i]; } }` —— 方法体里接收者就是隐式的 `self`，字段和方法按名字用，符号仍是
+`Vect_int_at`，所以 `|T|` 前缀写法、体内写法、纯 C 三者是同一套 ABI。
+`-emit-header` 已经输出实例（`struct pkg__Vect_int` + 方法原型），模块前缀与
+实例名冲突检查也都在（§9 阶段 2）。
 
 相关：[grammar.md](grammar.md)（§3.2 方法、§3.3 切片 `T[:]`、§3.7 裸 tag 类型名 C41、
 §3.8 元组、§7 静态约束、§11 实现位置）、[closure-design.md](closure-design.md)
@@ -230,18 +233,37 @@ Buf@(char, 12) b12 = {0};   /* struct Buf_char_12 */
 ### 2.4 方法
 
 方法仍然只是「第一个形参指向结构体的文件作用域函数」（§3.2 不变），
-泛型只是把接收者换成模板形参：
+泛型只是把接收者换成模板形参。三种写法，实例化后是同一批函数：
 
 ```c
-struct Vect@T { T *data; int len; };
+struct Vect@T {
+    T *data; int len;
+    T at(int i) { return data[i]; }   /* V3：体内写，接收者是隐式的 self */
+};
 
-|T| T vat(Vect@T *self, int i) { return self->data[i]; }
+|T| T vat(Vect@T *self, int i) { return self->data[i]; }  /* 前缀写法，一份覆盖所有实例 */
+|T| T vsum(Vect@T *self);                                  /* 先声明后定义也行 */
 
 void f(Vect@int *v) {
-    int x = v->vat(0);       /* 接收者 = Vect@int → 实例化出 Vect_int_at */
-    int y = vat@int(v, 0);   /* 等价的显式写法 */
+    int x = v->at(0);        /* Vect_int_at：体内方法与 |T| 方法同名同 ABI */
+    int y = v->vat(0);       /* 接收者 = Vect@int → 实例化出 Vect_int_vat */
+    int z = vat@int(v, 0);   /* 等价的显式写法 */
 }
 ```
+
+体内成员函数（§8.5）的规则：
+
+* 方法体里的字段、方法**按名字直接用**：`data[i]` 就是 `self->data[i]`，
+  `at(0)` 就是 `self->at(0)`。局部变量、参数、全局名照常按 C 的作用域规则先查，
+  只有在这个方法实例的字段/方法表里命中才改写成 `self->…`。
+* 方法可以调用同一个模板里**后面才写**的方法：实例化时先发全部原型，函数体
+  统一留到翻译单元末尾（和 `|T|` 模板的函数体同一队列），所以互相调用、递归都行。
+* `!error`、值形参 `N`、模板里再嵌实例照常可用：
+  `T!error peek(int i) { return data[i]; }`、`int cap(void) { return N; }`。
+* 原型（只有名字没有体）在模板体里是错误：报「a member function needs a body」，
+  因为这个体没有第二种写法可以补上（模板体只解析一次）。
+* 非模板的结构体里写方法定义也是错误（`a function cannot be defined inside a
+  struct`）：那是普通 C 结构体，方法按 §3.2 写在文件作用域。
 
 * 调用点的 `@` 省略规则只针对**方法调用**：接收者的类型已经把 `T` 写死了，
   形状上再写一遍是噪音（D9）。
@@ -259,7 +281,7 @@ void f(Vect@int *v) {
 |`!error`|`\|T\| T!error vget(Vect@T*, int i)`；失败路径复用 §8 的传播规则|
 |接口 `interface`|每个实例独立实现自己的 vtable（`c6_auto_impl_ensure` 按实例 tag 建表）；**不需要** `I<T>` 形态|
 |`foreach` 迭代器协议|`E next(T *self)` 里的 `E` 在实例化后是具体类型，C99「元素类型被擦除」自然不触发|
-|`@T` 托管引用/GC|实例是独立 struct → 每实例一份描述符、一次环检；`struct Node@T { @Node@T next; }` 是静态环 → C66，和普通结构体一致|
+|`@T` 托管引用/GC|实例是独立 struct → 每实例一份描述符、一次环检；`struct Node@T { @Node@T next; }` 是静态环 → C66，和普通结构体一致。`@Vect@int` 上是 `new`/`->` 照常（`new Vect@int` 现在也认得出模板名），方法调用时接收者那份拷贝按借用处理（不计数、不读未初始化的临时槽，见 [gc-design.md](gc-design.md) §16 H4）|
 |`go` / `async` / `task`|拿到的必须是具体函数：`go vat@int(v, 0)`；`\|T\|` 模板本身不能出现在 `go` 的操作数位置（C38 不变）|
 |`defer` / `errdefer`|实例化体里照常展开，清理点数上限 C101 逐实例计算|
 |`flexible array`|`struct Vect@T { int len; T data[]; };` 合法（尾元素类型是形参）|
@@ -334,6 +356,10 @@ void f(Vect@int *v) {
 |实例化体|`skip_or_save_block(&body)` 捕获 token（`tcc/tccgen.c:1022` 声明、`c6_lit_parse()` 8519/8545 与 `c6_tuple_speculate()` 是先例），实例化时重放|
 |实例表|`C6Generic`（模板：名字/形参种类/tag/体 token）+ `C6Instance`（mangle 名 → tag），`c6_tu_reset` 复位|
 |方法注册|实例 tag 走既有 `c6_method_register()` / `c6_method_lookup()`；泛型方法在实例化后按实例 tag 注册|
+|体内成员函数|`c6_gen_scan_methods()` 在捕获模板体时切出「`NAME(...) {…}`」成员（`C6GenMeth`：名字 + token）；`struct_decl()` 的成员循环认出函数定义就跳过体（`c6_meth_end`），不再当字段解析|
+|体内方法的原型/体|实例化时 `c6_gen_meth_decl()` 把成员拆成「原型 + 体」：原型插入 `struct <实例> *self` 作首参、在 bind 期间重放（签名里还能写 `T`）；体进 `c6_gen_methq` 队列，`c6_gen_flush()` 在单元末尾重放 `gen_function()`|
+|体内方法的隐式 self|`unary()` 的标识符分支：字段命中 → `self->field`（`c6_gen_self_member()`），方法命中且后面是 `(` → `self->m(...)`（`c6_gen_self_method()`）；名字先按普通作用域查，落空才走这里|
+|实例符号的寿命|实例 tag 和它的方法符号在 `sym_pop()` 里是「粘性」的（`c6_sticky_add()`）：名字留在 token 表、内存不回收，被 `keep == 0` 的弹栈带走时重新挂回全局栈——模板在形参表/块里第一次应用也不会丢|
 |`-emit-header`|`c6_hdr_extra()`（`tcc/tccgen.c:10880`）同一套路，名字用 mangle 而不是序号|
 |诊断链|实例化栈记录 `requested at file:line`，`tcc_error` 前置 `in 'Vect@int'`|
 
@@ -345,7 +371,8 @@ void f(Vect@int *v) {
 3. 未命中：在实例表登记（先解决递归自引用：把 tag 先建成 incomplete，
    这样 `Vect@Vect@int` 的内层实例在布局前就有符号）。
 4. `local_scope++`，把形参按 `T → CType` / `N → 常量` 压符号栈。
-5. 若模板本体已定义：重放捕获的体 token，走正常的成员/函数解析 → 布局 → 注册方法。
+5. 若模板本体已定义：重放捕获的体 token，走正常的成员/函数解析 → 布局 →
+   注册方法；体内成员函数在这里只发原型，体进队列等单元末尾。
 6. `local_scope--`，弹栈；返回实例 `CType`。
 7. 全程在实例化栈上记一条，退出时弹出；栈深 > 64 报 C112，实例数 > 1024 报 C111。
 
@@ -369,6 +396,10 @@ void f(Vect@int *v) {
 |实例名与用户符号撞车|保留名 + 冲突诊断；`-emit-header` 里以实例名出现，链接期可发现|
 |`-run` 模式|无影响：单态化发生在解析期，`tcc_run` 只看到普通函数|
 |实例爆炸|C111/C112 双闸；`-Wgeneric-depth` 只是风格告警（见 §7）|
+|模板在形参表/块里第一次应用|实例 tag 和方法符号标记为粘性，`sym_pop()` 不摘名字、不回收，`keep == 0` 时挂回全局栈；体内方法的原型还会在下一个 `decl()` 处补写一次（`c6_gen_sig_flush()`）|
+|体内方法体与函数体的顺序|一个函数不能在另一个函数里生成：体统一进队列，`c6_gen_flush()` 在单元末尾写；先发全部原型所以互相调用、递归都不受影响|
+|托管实例上的方法调用|接收者 `@Vect@int` 拷进调用临时槽时是借用（`C6_GCM_INIT \| C6_GCM_FRESH`），否则会读未初始化的栈去释放旧值；`tests/generic.c` 与 `tests/gc.c` 各有断言|
+|体内方法体被当成函数字面量声明|`block()` 的 `c6_lit_decl_lead()` 探针会吃掉 `NAME = …`：命中本实例的字段/方法名时不探（`c6_gen_self_name()`），否则 `len = 3;` 会被探针重放坏掉|
 
 ---
 
@@ -426,7 +457,9 @@ void f(Vect@int *v) {
    ```
 
    它是 `|T|` 前缀形式的严格超集，落地后泛型函数的声明点就收敛成一种，
-   且 ABI 与现在的 `<Tag>_<name>` 完全一致。V1 不做。
+   且 ABI 与现在的 `<Tag>_<name>` 完全一致。**已落地**（§9 阶段 3 第 11 项）：
+   字段/方法名隐式指向 `self`、先写的方法能调后写的方法（原型先发、体后写）、
+   `!error` 与值形参照常可用；`|T|` 写法继续保留，两者 ABI 相同。
 6. **V2 闭包与 `|…|`**：[closure-design.md](closure-design.md) D4 明确不引入捕获
    列表（捕获是隐式的），所以 `|…|` 只属于类型/值绑定，没有第二种用途。若将来要
    加捕获列表，必须换记号（例如 `(…)` 或 `capture(…)`），这条要写进 closure 文档。
@@ -460,18 +493,18 @@ void f(Vect@int *v) {
 
 |#|内容|状态|
 |---|---|---|
-|11|体内成员函数（§8.5），随后废弃 `\|…\|` 在函数上的写法（保留一个版本的告警期）|⬜|
+|11|体内成员函数（§8.5）|✅ `struct Vect@T { T *data; int len; T at(int i) { return data[i]; } }`：字段/方法名隐式走 `self`、方法可先用后定义、值形参 `N`、模板里嵌实例、`union` 模板、`!error` 方法都可用；符号仍是 `<实例>_<方法>`（`Vect_int_at`，`tests/abi/generic.c` 用纯 C 直接调），`-emit-header` 照旧输出原型。`\|T\|` 写法**继续保留**（`\|T, int N\|` 一份覆盖所有值形参实例，体内写法做不到），不设废弃告警|
 |12|`-Wgeneric-depth`|✅ 默认关、`-Wall` 开，**源码里写出来的**应用链深于 2 层时提示起别名：`Vect@Vect@Vect@int` 报一次、`Vect@Vect@int` 不报，每个实例只报一次；模板体里「`A` 里嵌 `B`、`B` 里嵌 `Vect`」是正常嵌套，按写的 1 层算。深度直接读实例的实参（实参是实例就带上它自己的深度），所以重放不会虚报|
 
 **测试**（已落地，都在 `tests/run-tests.sh` 的既有分组里）
 
 |文件|内容|
 |---|---|
-|`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/值形参/函数体内定义模板，18 个 `test` 块|
+|`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/值形参/函数体内定义模板/体内成员函数（隐式 `self`、先用后定义、mangled 符号互调、模板里嵌实例、托管实例上的方法不掉计数），23 个 `test` 块|
 |`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块|
-|`tests/errors/generic.c`|C103–C116 的负例：裸模板名、实参个数、实参类型、重复/撞名形参、值形参、`\|…\|` 用法、实例名占用、实例互赋，加 `-Wgeneric-depth` 的深度告警，22 个片段|
-|`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，值形参实例 = `struct Buf_int_4`|
-|`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致|
+|`tests/errors/generic.c`|C103–C116 的负例：裸模板名、实参个数、实参类型、重复/撞名形参、值形参、`\|…\|` 用法、实例名占用、实例互赋、非模板结构体里写方法、模板体里只写方法原型，加 `-Wgeneric-depth` 的深度告警，24 个片段|
+|`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，体内方法同一符号（`Vect_int_isum` 由纯 C 侧直接调），值形参实例 = `struct Buf_int_4`|
+|`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致（含体内方法：输出里就是普通 `Cnt_int_last()`）|
 
 后续要拆的（对应上面 ⬜ 的条目）：`tests/generic/nest.c`、`suffix.c`——现在
 这些形态都并进 `tests/generic.c` 与 `tests/generic_fn.c` 了。

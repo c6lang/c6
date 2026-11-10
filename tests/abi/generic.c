@@ -15,7 +15,18 @@
  */
 // EXIT 0
 
-struct Vect@T { T *data; int len; };
+struct Vect@T {
+    T *data;
+    int len;
+    /* 体内方法：符号同样是 'Vect_int_isum'，纯 C 侧可以直接按名字调 */
+    int isum(void) {
+        int i = 0, s = 0;
+
+        for (i = 0; i < len; i++)
+            s += data[i];
+        return s;
+    }
+};
 struct Pair@(A, B) { A a; B b; };
 struct Buf@(T, int N) { T data[N]; int len; };
 
@@ -73,6 +84,8 @@ int c6_check(void)
         return 1;
     if ((&v)->vect_sum() != 6)
         return 2;
+    if ((&v)->isum() != 6)
+        return 8;
     p = plain_pair(4, 5);
     if (p.a != 4 || p.b != 5)
         return 3;

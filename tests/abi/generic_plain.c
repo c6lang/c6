@@ -11,6 +11,7 @@ struct Buf_int_4 { int data[4]; int len; };
 
 void c6_fill(struct Vect_int *v, int *d, int n);      /* c6 侧用 Vect@int */
 int Vect_int_vect_sum(struct Vect_int *v);            /* c6 侧的方法 */
+int Vect_int_isum(struct Vect_int *v);                /* c6 侧的体内方法 */
 struct Pair_int_int c6_pair(int a, int b);            /* c6 侧用 Pair@(int,int) */
 int c6_check(void);
 void c6_buf_fill(struct Buf_int_4 *b);
@@ -43,6 +44,8 @@ int plain_check(void)
         return 1;
     if (Vect_int_vect_sum(&v) != 9)
         return 2;
+    if (Vect_int_isum(&v) != 9)
+        return 4;
     if (p.a != 7 || p.b != 8)
         return 3;
     return 0;

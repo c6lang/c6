@@ -152,6 +152,29 @@ test "weak @T：对象死了就变空" {
         err(4, "对象没有释放");
 }
 
+/* 方法调用的接收者只是被拷进一个临时槽：那份拷贝是借用，不该加计数，
+   也不该去读临时槽里原有的内容（那是没初始化过的栈） */
+struct Counter { @Node held; int bump; };
+int have(struct Counter *self) { return self->held != NULL ? self->held->v : -1; }
+int tick(struct Counter *self) { self->bump = self->bump + 1; return self->bump; }
+
+test "托管接收者的方法调用不加计数、不读旧值" {
+    @Counter c = new Counter;
+    int i = 0;
+
+    c->held = new Node;
+    c->held->v = 7;
+    if (c->have() != 7)
+        err(1, "方法里读不到托管字段");
+    if (__c6_gc_refcount(c->held) != 1)
+        err(2, "接收者的拷贝多算了引用");
+    for (i = 0; i < 10; i++)
+        if (c->tick() != i + 1)
+            err(3, "字段累加不对");
+    if (__c6_gc_refcount(c->held) != 1)
+        err(4, "调方法漏了引用");
+}
+
 test "循环里声明：每次迭代都释放" {
     @Node keep = new Node;
     int i = 0;
