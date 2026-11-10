@@ -1004,6 +1004,40 @@ ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-6
 的结构体返回用隐藏指针（c6 TU 之间一致，大于 16 字节时也与原生 ABI 一致，
 9--16 字节且含浮点成员时与普通 C 混用不支持）。
 
+### 11.10 模板实例的作用域边界与弱符号（写标准库时修掉的三处）
+
+实例化一个模板会在**调用方**的作用域里做两件事：把方法的签名解析一遍（为了
+拿到符号），把结构体的成员链重新声明一遍（为了 `sizeof` 和字段偏移）。这两
+步都借用了当前作用域，于是留下了三个问题，写 `std/` 时全部撞上并修掉：
+
+1. **方法形参名漏到调用方。** `struct Span@T { T at(int i) { … } }` 实例化后，
+   调用方写 `int i = 0;` 变成 `redeclaration of 'i'`。修法：`struct_decl()`
+   解析成员签名时给一个独立 scope（`local_scope + 1`），解析完
+   `sym_pop(&local_stack, c6_meth_lstk, 1)` 把它从符号链上摘掉（`keep = 1`：
+   只摘链接、不释放，符号还被 token 表引用着）。
+2. **实例的字段名被另一个实例的同名方法抢走。** 同一个 TU 里同时有
+   `struct A@T { int cap; }` 和 `struct B@(N) { int cap() { … } }` 时，A 的实例
+   体里裸写 `cap` 会解析成文件作用域的函数 `cap`（`nm` 里能看到 `U cap`）。
+   修法：`unary()` 解析标识符时，在通用查找之后、使用符号之前判断——如果当前
+   正在生成实例的体内方法（`c6_gen_self_tag`）、查到的符号是个**函数**、而
+   接收者又有同名**字段**，就用字段（`self->cap`）。局部变量与形参照旧优先。
+3. **跨 TU 重复定义。** 一个 TU 只看到声明、另一个 TU 看到定义时，两边都会
+   生成同一份实例体，链接报 `link symbol 'X' defined twice`。修法：
+   `c6_gen_flush()` 发实例体之前把符号标成 `a.weak = 1`（函数队列与方法队列
+   各一处），链接器保留第一份。
+
+回归用例：`tests/generic_scope.c6` + `tests/tu/generic_scope.c6`（5 个断言，
+同时验证跨 TU 实例化）。名字解析次序写进 `docs/grammar.md` 的 C123。
+
+### 11.11 标准库 `std/`
+
+写标准库是这一轮扩展的验收项：`std/types`、`std/err`、`std/vec`、`std/span`、
+`std/map`、`std/str`、`std/fmt`、`std/range` 八个模块（一个文件一个 module，
+模块名就是路径），43 个 `test` 断言（`make stdtest`），加一个集成示例
+`examples/wordcount.c6`（`make std-demo`）。设计、API、写法约定与编译器层面
+的已知限制见 [stdlib.md](stdlib.md)；上面 11.10 的三处修复就是把它写出来时
+暴露的。
+
 ## 裸机验证（fstest-bare）
 
 freestanding 那一套（`libtcc1` 的外部依赖全是 weak，缺 `calloc`/`mem*`/

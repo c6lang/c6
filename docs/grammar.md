@@ -845,6 +845,12 @@ typedef Vect@IntVec Grid;
 体没有别处可补；非模板的结构体里写方法定义同样是错误（写出来就行
 `int S_f(struct S *self) { … }`）。
 
+名字解析的次序（C123）：局部变量与形参 > 实例的字段/方法 > 文件作用域的其他
+符号。也就是说**文件作用域的同名函数不会抢走字段**——同一个翻译单元里可以
+同时有 `struct A@T { int cap; }` 和 `struct B@(N) { int cap() { … } }`，在 A 的
+体内裸写 `cap` 仍然是 `self->cap`。（这两条符号以前会互相污染：实例化
+`B@(8)` 时它方法的原名会留在调用方作用域里，让 `cap` 变成那个函数。）
+
 裸模板名是 C103 诊断，不是类型。
 
 完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
@@ -1275,6 +1281,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C118 | 匿名枚举的成员不能限定 | `the enumerator of an anonymous enum cannot be qualified` |
 | C119 | 两个枚举都要同一个裸成员名时，裸名不再可用，必须写限定名 | `'RED' is the member of more than one enum: write '<enum>.RED'` |
 | C120 | `Tag.成员` 里 `Tag` 必须是可见的枚举，成员必须存在 | `'Fruit' has no member 'APPLE'`；`'Nope' is neither an enum nor an imported module (use 'import Nope;')` |
+| C123 | 体内成员函数里裸名的解析次序：局部/形参 > 实例的字段与方法 > 文件作用域其他符号（文件作用域的同名函数不抢字段）；实例化不得把模板方法的原名或形参名留在调用方作用域里 | —（曾表现为 `redeclaration of 'i'` / 把字段当成函数） |
 | C122 | 模块名就是它的路径：`import a.b` 只按 `a/b.c6`（或 `a/b.c`）查找，扁平拼写被拒绝，找不到文件也是错误 | `module 'a.b' must live at 'a/b.c6', not in a flat 'a.b.c6': a module's name is its path`；`cannot find module 'a.b': expected a file at 'a/b.c6' in the search path (a module's name is its path)` |
 | C121 | 声明式头里的绑定：不能是 `void`/数组/函数，不能改变托管所有权，下标必须是整数，头里必须写出类型和名字 | `a 'foreach' binding cannot be 'void'`；`a 'foreach' binding cannot be an array`；`a 'foreach' binding cannot be a function`；`a 'foreach' binding cannot change ownership: 'v' holds a managed reference`；`the index of a 'foreach' must have an integer type, not 'double'`；`a type name expected in the head of 'foreach'`；`'foreach' needs a parenthesised head now: write 'foreach ((size_t i, T v) = a) { ... }'` |
 

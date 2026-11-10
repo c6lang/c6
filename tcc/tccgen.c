@@ -7250,6 +7250,12 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
             q->proto = proto;
             q->sym_tok = c6_gen_last_sym->v;
             c6_sticky_add(c6_gen_last_sym);   /* survives the scope it is in */
+            /* The signature was only declared to learn its symbol. Pop the
+               temporary chain: otherwise the plain method name (and the
+               parameter names) stay linked in the unit that instantiates the
+               template, and a bare 'cap' in another instance's body resolves
+               to this method instead of to its own field. */
+            sym_pop(&local_stack, NULL, 1);
             c6_gen_last_sym = NULL;
             if (c6_gen_methq_tail)
                 c6_gen_methq_tail->next = q;
@@ -8034,6 +8040,12 @@ static int c6_gen_flush(void)
         c6_sym_global = save_global;    /* 'gen_function' scopes its params */
         local_scope = save_scope;
         cur_text_section = text_section;
+        /* A template instance is generated in every unit that instantiates
+           it (one unit may only see the module's declarations, another the
+           bodies), so the emitted function is weak: the linker keeps the
+           first copy instead of reporting 'defined twice'. */
+        if (p->sym)
+            p->sym->a.weak = 1;
         begin_macro(p->body, 1);
         next();
         gen_function(p->sym);
@@ -8068,6 +8080,8 @@ static int c6_gen_flush(void)
         c6_decl_tokens(q->proto);
         c6_gen_record_sym = save_rec;
         if (c6_gen_last_sym) {
+            /* weak for the same reason as the function queue above */
+            c6_gen_last_sym->a.weak = 1;
             begin_macro(q->body, 1);
             next();
             gen_function(c6_gen_last_sym);
@@ -8494,9 +8508,32 @@ do_decl:
                     bit_size = -1;
                     v = 0;
                     type1 = btype;
+#ifdef C6_EXT
+                    /* Parsing a member signature pushes its parameters as
+                       ordinary symbols. While a template body is being
+                       replayed they would land in the live scope (and its
+                       scope number), colliding with the user's own locals
+                       ('redeclaration of i'). Give the signature a scope of
+                       its own and pop it again right after the parse. */
+                    Sym *c6_meth_lstk = local_stack;
+                    int c6_meth_scope = local_scope, c6_sig_scope = 0;
+                    if (c6_gen_inst_cur) {
+                        local_scope = c6_meth_scope + 1;
+                        c6_sig_scope = 1;
+                    }
+#endif
                     if (tok != ':') {
 			if (tok != ';')
                             type_decl(&type1, &ad1, &v, TYPE_DIRECT);
+#ifdef C6_EXT
+                        if (c6_sig_scope) {
+                            local_scope = c6_meth_scope;
+                            /* unlink the signature's names, do not just drop
+                               the stack: a linked name stays visible to every
+                               later body in the unit */
+                            sym_pop(&local_stack, c6_meth_lstk, 1);
+                        }
+#endif
 #ifdef C6_EXT
                         /* 'T get(int i) { ... }' in a template body (§8.5):
                            the function was captured at declaration time, the
@@ -11149,6 +11186,18 @@ special_math_val:
 #endif
         s = sym_find(t);
 #ifdef C6_EXT
+        /* Inside a member function written in a template body a bare field
+           name means 'self->field'. A *function* of the same name must not
+           win: two instances in one unit may well be
+           'struct A@T { int cap; }' and 'struct B@(N) { int cap() { ... } }',
+           and the method of B is a file scope symbol by the time A's body is
+           generated. A real local (or a parameter) still wins. */
+        if (tcc_state->c6_ext && c6_gen_self_tag && s
+            && (s->type.t & VT_BTYPE) == VT_FUNC
+            && c6_gen_self_member(t))
+            break;
+#endif
+#ifdef C6_EXT
         /* a bare enumerator name claimed by two enums in the same scope: the
            value is not obvious from the spelling, so require 'Color.RED' */
         if (s && IS_ENUM_VAL(s->type.t) && c6_enum_poison_has(t))
@@ -11182,8 +11231,8 @@ special_math_val:
             }
         }
         /* a member function written in a template body reaches its own fields
-           by name, 'self->name' (§8.5); a real local or global of that name
-           has already won above */
+           by name, 'self->name' (§8.5); a real local of that name has already
+           won above */
         if (!s && tcc_state->c6_ext && c6_gen_self_member(t))
             break;
         /* 'pkg.member', possibly multi-level: the dotted spelling is a

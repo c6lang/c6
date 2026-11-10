@@ -1,0 +1,75 @@
+/* 模板实例的作用域边界（回归用例）。
+ *
+ * 三条曾经踩过的坑，任何一条复发都会让这个文件编不过或者结果不对：
+ *
+ * 1. 模板体内方法的形参名会漏到实例化点所在的作用域，把调用方的同名
+ *    局部变量挤成 'redeclaration of i'；
+ * 2. 一个实例的字段名会被另一个实例的**同名方法**抢走：实例体里裸写
+ *    'cap' 应该就是 'self->cap'，哪怕文件作用域里有个函数叫 cap；
+ * 3. 两个 TU 都实例化同一个模板时，实例的方法体会被生成两遍，
+ *    链接时报 'defined twice'（现在生成的是弱符号）。
+ */
+import tu.generic_scope;
+
+/* 字段 'cap' 与 Box.cap() 同名：模板体里裸写 cap 必须是字段 */
+struct Cell@T {
+    @T data;
+    int n;
+    int cap;
+
+    int capacity() { return cap; }
+
+    void grow(int by) { cap = cap + by; }
+};
+
+test "字段名不被同名方法抢走" {
+    @Cell@int c = new Cell@int;
+
+    c->grow(7);
+    if (c->capacity() != 7)
+        err(1, "裸写 cap 应该取字段，而不是 Box 的 cap()");
+}
+
+test "方法的形参名不漏到调用方作用域" {
+    int i = 0;
+    Box@(4) b = { { 0 }, 0 };
+
+    (&b)->add('a') catch e { err(2, "add 失败"); };
+    if ((&b)->at(0) != 'a')
+        err(3, "at 不对");
+    i++;
+    if (i != 1)
+        err(4, "'i' 被模板的形参污染了");
+}
+
+test "同一个 TU 里两种模板实例并存" {
+    @Cell@int c = new Cell@int;
+    Box@(8) b = { { 0 }, 0 };
+
+    c->grow(2);
+    (&b)->add('z') catch e { err(5, "add 失败"); };
+    if ((&b)->cap() != 8 || c->capacity() != 2)
+        err(6, "两个实例互相串了");
+}
+
+test "两个 TU 都实例化同一个模板" {
+    Box@(8) b = { { 0 }, 0 };
+
+    if (tu_fill() != 9)             /* cap() 的 8 + 一个字符 */
+        err(7, "第二个 TU 的实例结果不对");
+    (&b)->add('q') catch e { err(8, "add 失败"); };
+    if ((&b)->cap() != 8 || b.n != 1)
+        err(9, "本 TU 的实例结果不对");
+}
+
+test "实例的形参名也不和形参自己打架" {
+    /* 'at(int i)' 的形参在实例体里叫 i，实例化点又在用 i */
+    Box@(4) b = { { 0 }, 0 };
+    int i = 0;
+
+    for (i = 0; i < 2; i++) {
+        (&b)->add((char)('m' + i)) catch e { err(10, "add 失败"); };
+    }
+    if ((&b)->at(0) != 'm' || (&b)->at(1) != 'n')
+        err(11, "追加的字符不对");
+}

@@ -1,0 +1,34 @@
+/* 第二个翻译单元：模板定义在这里。
+ *
+ * generic_scope.c6 会 import 这个模块，于是两个 TU 都会实例化同一个
+ * Box@(8)：实例的方法体必须是弱符号，否则链接时是
+ * 'link symbol ... defined twice'。
+ */
+module tu.generic_scope;
+
+struct Box@(int N) {
+    char data[N];
+    int n;
+
+    /* 故意和 generic_scope.c6 里 Cell 的字段 'cap' 同名：实例体里裸写
+       'cap' 必须解析成自己的字段，而不是这个文件作用域的函数 */
+    int cap() { return N; }
+
+    char at(int i) { return data[i]; }
+
+    int!error add(char c)
+    {
+        if (n + 1 >= N)
+            err(1, "box: full");
+        data[n++] = c;
+        return 0;
+    }
+};
+
+int tu_fill(void)
+{
+    Box@(8) b = { { 0 }, 0 };
+
+    (&b)->add('x') catch e { return e.id; };
+    return (&b)->cap() + b.n;
+}
