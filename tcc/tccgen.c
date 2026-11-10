@@ -14171,6 +14171,47 @@ static C6Method *c6_method_of(int tag, int name)
     return NULL;
 }
 
+/* the aggregate tag behind TYPE, looking through one pointer level */
+static Sym *c6_aggregate_tag(CType *type)
+{
+    if ((type->t & VT_BTYPE) == VT_PTR && type->ref)
+        type = &type->ref->type;
+    if ((type->t & VT_BTYPE) == VT_STRUCT
+        && type->ref && (type->ref->v & SYM_STRUCT)
+        && (type->ref->v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+        return type->ref;
+    return NULL;
+}
+
+/* The interface's method list is replayed as a function prototype, so a tag
+   that is first mentioned there gets prototype scope (C11 6.2.1p7): a later
+   file-scope definition with the same spelling is a different type.  Returns
+   the interface side's tag when the two types differ exactly that way, so the
+   diagnostic can name the fix instead of reporting a bare type mismatch. */
+static Sym *c6_proto_scope_tag(CType *iface_type, CType *meth_type)
+{
+    Sym *a = c6_aggregate_tag(iface_type);
+    Sym *b = c6_aggregate_tag(meth_type);
+
+    if (!a || !b || a == b)
+        return NULL;
+    if ((a->v & ~SYM_STRUCT) != (b->v & ~SYM_STRUCT))
+        return NULL;
+    return a;
+}
+
+/* 'struct P' / 'union P' for a tag symbol */
+static void c6_tag_spelling(char *buf, int size, CType *type)
+{
+    const char *kw = 0;
+
+    if ((type->t & VT_BTYPE) == VT_PTR && type->ref)
+        type = &type->ref->type;
+    kw = IS_UNION(type->t) ? "union" : "struct";
+    snprintf(buf, size, "%s %s", kw,
+             get_tok_str(type->ref->v & ~SYM_STRUCT, NULL));
+}
+
 /* compare one vtable field 'RET (*)(void *, ...)' with the method type */
 static void c6_check_method(C6Iface *ifc, int m, Sym *meth)
 {
@@ -14195,9 +14236,18 @@ static void c6_check_method(C6Iface *ifc, int m, Sym *meth)
         tcc_error("method '%s' of '%s' must be a function", mname, ifc->name);
     fr = fptr->ref;
     gr = meth->type.ref;
-    if (!is_compatible_types(&fr->type, &gr->type))
+    if (!is_compatible_types(&fr->type, &gr->type)) {
+        if (c6_proto_scope_tag(&fr->type, &gr->type)) {
+            char spell[128] = {0};
+            c6_tag_spelling(spell, sizeof spell, &fr->type);
+            tcc_error("method '%s' of '%s' has an incompatible return type: "
+                      "the interface's '%s' is a prototype-scope tag "
+                      "(declare '%s;' before the interface)",
+                      mname, ifc->name, spell, spell);
+        }
         tcc_error("method '%s' of '%s' has an incompatible return type",
                   mname, ifc->name);
+    }
     /* both parameter lists start with the receiver */
     fp = fr->next;
     gp = gr->next;
@@ -14206,9 +14256,18 @@ static void c6_check_method(C6Iface *ifc, int m, Sym *meth)
     if (gp)
         gp = gp->next;
     while (fp && gp) {
-        if (!is_compatible_types(&fp->type, &gp->type))
+        if (!is_compatible_types(&fp->type, &gp->type)) {
+            if (c6_proto_scope_tag(&fp->type, &gp->type)) {
+                char spell[128] = {0};
+                c6_tag_spelling(spell, sizeof spell, &fp->type);
+                tcc_error("method '%s' of '%s' has an incompatible parameter: "
+                          "the interface's '%s' is a prototype-scope tag "
+                          "(declare '%s;' before the interface)",
+                          mname, ifc->name, spell, spell);
+            }
             tcc_error("method '%s' of '%s' has an incompatible parameter",
                       mname, ifc->name);
+        }
         fp = fp->next;
         gp = gp->next;
     }

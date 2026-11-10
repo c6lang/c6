@@ -12,6 +12,7 @@ struct Circle { int r; };
 // EXPECT test_incompatible_param: error: method 'scale' of 'Shape' has an incompatible parameter
 // EXPECT test_duplicate_method: error: duplicate method 'area' for 'Circle'
 // EXPECT test_method_after_use: error: 'Circle' does not implement interface 'Shape': missing method 'area'
+// EXPECT test_proto_scope_tag: error: method 'put' of 'Shape' has an incompatible parameter: the interface's 'struct P' is a prototype-scope tag
 
 #if defined test_missing_method
 interface Shape { int area(); void dump(int n); }
@@ -43,6 +44,21 @@ static int use(Shape s) { return s.area(); }
 /* 转换点看不到之后才声明的方法 */
 int main(void) { struct Circle c = {1}; return use(c); }
 int area(struct Circle *self) { return self->r; }
+#elif defined test_proto_scope_tag
+/* 'struct P' 第一次出现在 interface 的签名里：按 C 的规则那是原型作用域里
+   的 tag，和随后文件作用域的 struct P 不是同一个类型。诊断要说清这一点，
+   而不是笼统地报“参数不兼容”。 */
+interface Shape { void put(struct P p); int area(); }
+struct P { int x, y; };
+void put(struct Circle *self, struct P p) { (void)self; (void)p; }
+int area(struct Circle *self) { return self->r; }
+int main(void)
+{
+    struct Circle c = {1};
+    Shape s = {0};
+    s = c;
+    return s.area() == 1 ? 0 : 1;
+}
 #else
 interface Shape { int area(); }
 int area(struct Circle *self) { return self->r; }

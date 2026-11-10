@@ -673,6 +673,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/package.c` | `package` / `import` / `pkg.member`、多级包名、跨 TU |
 | `tests/method.c` | 结构体方法、不同类型的同名方法、libc 方法（`p->fflush()`）、与方法或 libc 同名的普通函数不被顶掉，以及 `T!error` 方法 |
 | `tests/interface.c` | 接口、vtable、隐式/显式转换、跨 TU |
+| `tests/iface_agg.c` | 接口方法签名里的聚合类型：struct 参数、struct 返回值、12 字节 struct 返回值（寄存器返回）、元组返回值（`tests/errors/iface.c` 的 `test_proto_scope_tag` 守住“tag 必须在接口之前声明”的诊断） |
 | `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
 | `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`typeof`/`_Generic`/`_Alignof`、接口方法签名、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
 | `tests/errors/typename.c` | 裸 tag 的退回路径：被函数/局部变量/POSIX `stat` 遮蔽、tag 未声明、tag 当值用、tag 出作用域、局部 tag 的切片、不完整类型 |
@@ -688,6 +689,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/tuple_error.c` | 元组/struct 作 `!error` 返回类型：成功路径、失败路径、错误槽卫生、连续 `catch` |
 | `tests/tuple_async.c` | 元组的 `async` 返回、`await` + 解构、`_` 丢弃、嵌套 `await` |
 | `tests/tuple_thread.c` | 元组穿过 `go`（按值拷贝）、线程里的元组调用 |
+| `tests/gc_return.c` | 返回托管引用的计数归属：新建对象返回、借字段返回、形参原样返回、循环里多次调用之后计数回到基线（`c6_gc_return_hook()` 的回归） |
 | `tests/errors/tuple.c` | 元组的全部编译期诊断（元素类型、下标、解构形态、`return {…}`） |
 | `tests/errors/loc.c` | 诊断位置：`sizeof(type)` / `_Alignof(type)` 整组回滚之后，头文件里的声明仍然报在头文件自己的那一行 |
 | `tests/abi/tuple.c` + `tests/abi/tuple_plain.c` | 元组与等价 struct 的 ABI 互通（两个 TU 分别用 `-std=c6` 和纯 C 编译后链接） |
@@ -740,9 +742,12 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
   （`catch`），这是无栈协程“错误槽随帧保存/恢复”的已知限制；
 - 元组返回值也占 `struct NAME_task` 的 `val` 区，元素多的元组会让任务块更
   大（不是错误，只是内存）；帧本身住在任务里，没有上限；
-- 元组（和 struct）可以出现在 `interface` 的方法声明里，但结构体→接口的
-  转换点只支持标量签名，聚合返回值会报 `'{' expected (got ';')`：这是接口
-  特性自身的缺口，元组只是又撞上了它；
+- `interface` 的方法签名支持聚合类型：struct/union/元组作参数和返回值都可以
+  （`tests/iface_agg.c`）。唯一要求是类型在**接口声明处**已经可见：`struct P;`
+  这类声明要写在 `interface` 之前。接口的方法列表按 C 的函数原型重放，第一次
+  出现在其中的 tag 属于原型作用域（C11 6.2.1p7），和之后文件作用域的
+  `struct P` 不是同一个类型——这种情况会直接提示
+  `the interface's 'struct P' is a prototype-scope tag (declare 'struct P;' before the interface)`；
 - `((int,int){1,2}[0])` 这种“复合字面量外面再套一层括号、下标写在括号里”的
   写法报 `')' expected (got '[')`：下标写在括号外（`((int,int){1,2})[0]`）或
   去掉外层括号即可；
@@ -1015,7 +1020,7 @@ KVM，否则 TCG），断言全过时 payload 往 0x501 写 0，qemu 退出码 1
 `__c6_co_run()` 返回 -1（不会链接失败）。`examples/boot/main.c` 的裸机用例
 覆盖了交错的两个顶层 `co`、循环里的 `await`、失败任务计数和 `c6_io` 的失败路径。
 
-`make fstest-bare-tests` 把 `tests/*.c` 的 test 块搬上裸机：32 个文件、341 个
+`make fstest-bare-tests` 把 `tests/*.c` 的 test 块搬上裸机：34 个文件、全部
 test 块、0 失败，每个文件一个镜像（`examples/boot/runtests.sh`）。test 块到
 `__tcc_test_<n>` 的对应表只存在编译器状态里，二进制里没有，所以由
 `examples/boot/harness.py` 按源码顺序扫出来生成入口；libc 那层由
