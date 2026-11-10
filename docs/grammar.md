@@ -611,8 +611,8 @@ c6 允许把成员写成 `<tag>.<成员>`，让每个枚举自带一层空间：
   `for` 的条件，`switch` 的 `case`，数组长度、位域宽度都能用；枚举里没有
   这个名字时按 C106 报错。
 * 枚举必须已经定义并可见（与裸名同一条规则），不做任何隐式前置声明。
-* 只在 `-std=c6` 的翻译单元里生效；纯 C 翻译单元里 `Color.RED` 仍然是
-  成员访问（`Color` 必须是左值）。
+* 只在 `-std=c6` 的翻译单元里生效；纯 C 的翻译单元里没有裸 tag 名，
+  `Color.RED` 报 `'Color' undeclared`（写成 `(Color)RED` 也只是强转）。
 
 ### 3.9 元组类型 `(T1, T2, ...)`
 
@@ -2039,6 +2039,7 @@ int main(void)
 | `#macro` / `__local` | `parse_c6_macro` / `c6_hygiene_body` | `tcc/tccpp.c` |
 | 变量初始化 | `c6_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
 | 裸 tag 类型名 | `parse_btype()` 的 `default` 分支：`sym_find()` 未命中时试 `struct_find()`，命中则走 `basic_type2`（与 `struct TAG` 同一条路径）；`ignore_label` 时 `TAG:` 退回标签 | `tcc/tccgen.c` |
+| 枚举成员 `Color.RED` | `struct_decl()` 的枚举循环（`<tag>.<成员>` 额外注册一个带点的常量名；裸名被别的枚举占用时记进 `c6_enum_poison`，裸用处报 C105）、`unary()` 的 `tok_identifier` 点号分支（先按带点名字查枚举常量，再按包名 mangle）、`decl()` 在条件位置的向前窥探（`Tag.` 一定不是声明，交回 `gexpr()`） | `tcc/tccgen.c` |
 | `T[:]` 类型 | `parse_btype()` 的 `case '['`、`c6_slice_get`（按元素类型规范化生成内部 struct） | `tcc/tccgen.c` |
 | `(T1, T2)` 元组类型 | `parse_btype()` 的 `case '('`（`c6_ext` 且还没有 `typespec_found` 时）：`c6_tuple_btype` 扫平衡括号、`c6_tuple_speculate` 重放 token 试一遍 `type_decl(TYPE_ABSTRACT\|TYPE_DIRECT)`，成功才认；`c6_tuple_get` 校验元素并规范化出内部 tag `__c6_tuple_N`；`c6_tuple_of_type` / `c6_tuple_ctype` 查询 | `tcc/tccgen.c` |
 | `t[k]` 元素访问 | `c6_tuple_subscript`（`unary()` 的 `[` 后置分支，先于切片下标） | `tcc/tccgen.c` |

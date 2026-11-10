@@ -676,6 +676,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/slice.c` | `T[:]` 的构造、下标、区间、跨 TU |
 | `tests/typename.c` | 裸 tag 类型名：声明/成员/形参/返回值/方法接收者/切片元素/强转/`sizeof`/复合字面量/typedef/`const`、自引用链表、`typeof`/`_Generic`/`_Alignof`、接口方法签名、`TAG:` 标签、遮蔽（同名函数、同名局部变量、`struct stat` + `stat()`）、跨 TU（`tests/tu/typename.c`） |
 | `tests/errors/typename.c` | 裸 tag 的退回路径：被函数/局部变量/POSIX `stat` 遮蔽、tag 未声明、tag 当值用、tag 出作用域、局部 tag 的切片、不完整类型 |
+| `tests/enum_scope.c` | 枚举成员的限定名 `Color.RED`：两个枚举共用成员名、裸名仍可用、常量表达式（数组长度 / `case` / 位移）、`if`/`while`/`for` 条件里的限定名、块作用域枚举 |
+| `tests/errors/enum_scope.c` | 限定名的编译期诊断：限定符不是自己的 tag（C103）、匿名枚举（C104）、裸名被两个枚举抢占（C105）、成员不存在（C106）、限定符后缺名字、都不带限定时仍是重定义 |
 | `tests/foreach.c` | 数组/切片/区间三种可迭代对象、值绑定是副本、可迭代值只求值一次、`_` 丢弃、`break`/`continue`/`defer`/嵌套、绑定不泄漏、`size_t` 下标可写、`await` 跨挂起 |
 | `tests/foreach_iter.c` | `has()`/`next()` 迭代器：值/指针/接口值三种形态、结构体与指针元素、`_`、可迭代值只求值一次、空迭代器、无限迭代器 + `break`、`continue`、`defer`、绑定不泄漏、嵌套、`await` 跨挂起、union、跨 TU、托管元素/迭代器（含临时迭代器）与数组托管元素不泄漏 |
 | `tests/errors/foreach_iter.c` | 迭代器协议的编译期诊断：方法签名（C99）、多绑定（C100）、只有 `has()`/字段遮蔽（C47）、数组元素、不完整元素、托管结构体元素、文件作用域 |
@@ -1008,13 +1010,14 @@ KVM，否则 TCG），断言全过时 payload 往 0x501 写 0，qemu 退出码 1
 `__c6_co_run()` 返回 -1（不会链接失败）。`examples/boot/main.c` 的裸机用例
 覆盖了交错的两个顶层 `co`、循环里的 `await`、失败任务计数和 `c6_io` 的失败路径。
 
-`make fstest-bare-tests` 把 `tests/*.c` 的 test 块搬上裸机：26 个文件、251 个
+`make fstest-bare-tests` 把 `tests/*.c` 的 test 块搬上裸机：30 个文件、302 个
 test 块、0 失败，每个文件一个镜像（`examples/boot/runtests.sh`）。test 块到
 `__tcc_test_<n>` 的对应表只存在编译器状态里，二进制里没有，所以由
 `examples/boot/harness.py` 按源码顺序扫出来生成入口；libc 那层由
 `examples/boot/shim.plain.c` 提供（printf/字符串/qsort/内存管道/select/桩子
-+ 4MB 首次适配分配器）。跳过的 6 个是 `go`（要 clone/futex）和 `method`
-（要 libc 的 FILE 布局）。踩到的三件事：默认 256KB 的 bump arena 不够（给
++ 4MB 首次适配分配器）。跳过 7 个：`thread`/`thread_handle`/`gc_thread`/
+`gc_drop`/`tuple_thread` 要 `pthread_create`，`defer_thread` 要 `clone`/`futex`，
+`method` 要 libc 的 `FILE` 布局。踩到的三件事：默认 256KB 的 bump arena 不够（给
 calloc/free/realloc 就好）；`select` 要把 0/1/2 当永远就绪；多个 TU 一次
 编译会撞上 `c6_gc_new_lead` 的 NULL 标签名 strcmp（拆成 -c + 链接绕开）。
 

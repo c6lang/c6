@@ -1385,15 +1385,16 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 #### 把 tests/ 也搬上裸机
 
-`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**26 个测试
-文件、251 个 test 块，0 失败**，每个文件一个镜像，一共 12 秒。
+`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**30 个测试
+文件、302 个 test 块，0 失败**，每个文件一个镜像，一共 14 秒。
 
 ```
 ok   async: 20 test(s), 0 failure(s)
+ok   enum_scope: 8 test(s), 0 failure(s)
 ok   fstr: 15 test(s), 0 failure(s)
 ok   try: 18 test(s), 0 failure(s)
 ...
-bare tests: 26 通过, 0 失败（跳过: gc_drop gc_thread method thread thread_handle tuple_thread）
+bare tests: 30 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）
 ```
 
 要补的不是运行时，而是**测试自己用的 libc**：
@@ -1639,6 +1640,12 @@ make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2
   就按老 C 语义走，否则再看 tag 命名空间；解析结果与写 `struct TAG` 完全同一个
   `CType`，所以 `sizeof`、方法注册、切片元素检查都自动一致。因为 tag 与普通符号
   分属两个命名空间，**同名时必须写 `struct`**（`struct stat` + `stat()` 就是例子）。
+- 枚举成员的限定名 `Color.RED` 走的是同一套点号解析：声明侧在 `struct_decl()`
+  里把成员**另外**注册成带点的常量名，并记住哪些裸名被两个枚举抢过（此后裸名
+  报错）；引用侧在 `unary()` 已有的 `pkg.member` 分支里先按带点名字查、查不到
+  再按包名 mangle。因为 `Color` 同时也是类型名，`decl()` 在条件位置向前看一个
+  记号：`Tag.` 一定不是声明，整条交给表达式解析（否则 `if (Color.RED)` 会被
+  当成声明）。
 - 变量初始化检查在**定义点**做，不做数据流分析；VLA 是唯一豁免
   （标准 C 禁止给变长数组写初始化器）。
 - 元组复用 `VT_STRUCT` 和内部 tag `__c6_tuple_N`，布局在构造类型时按自然对齐
