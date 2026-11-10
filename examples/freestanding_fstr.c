@@ -21,10 +21,10 @@
  *   memset / memcpy / memmove libtcc1 自带字节循环版本，真 libc 的强定义
  *                             会在链接时覆盖它们；
  *   pthread_*                 没有就退化成单线程（一个静态的状态块），
- *                             go / thread 报告启动失败而不是链接报错；
+ *                             spawn / thread 报告启动失败而不是链接报错；
  *   select                    只有 async / c6_io 用到，没有就报“等待失败”。
  *
- * 也就是说单线程的 freestanding 程序直接可用；要 go / thread 才需要真正的
+ * 也就是说单线程的 freestanding 程序直接可用；要 spawn / thread 才需要真正的
  * pthread 实现，要 async I/O 才需要 select。
  *
  * C99 输出后端不在这个范围：它生成的 C 依赖宿主 libc（stdlib + pthread）。

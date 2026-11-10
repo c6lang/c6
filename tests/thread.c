@@ -1,6 +1,6 @@
-/* c6 自测：go = OS 线程
+/* c6 自测：spawn = OS 线程
  *
- * 'go f(a);' 把参数求值后复制到堆上的参数块，用 pthread_create 起一个
+ * 'spawn f(a);' 把参数求值后复制到堆上的参数块，用 pthread_create 起一个
  * 线程，线程在跳板里把参数块解开再调用 f；语句本身立刻返回。线程由
  * 启动它的线程回收（main 结束时由编译器插入的 __c6_th_join_all()，
  * 别的线程在退出时），所以这里可以直接调用它来等。
@@ -42,18 +42,18 @@ static int wait_for_gate(int marker)
     return 0;
 }
 
-test "go 立刻返回：线程等 gate 打开后才继续" {
+test "spawn 立刻返回：线程等 gate 打开后才继续" {
     gate = 0;
     seen = 0;
-    go wait_for_gate(7);
-    gate = 1;                       /* 能走到这里就说明 go 没有阻塞 */
+    spawn wait_for_gate(7);
+    gate = 1;                       /* 能走到这里就说明 spawn 没有阻塞 */
     (void)wait_nonzero(&seen);
     if (seen != 7)
         err(1, "线程没有并发跑起来");
     __c6_th_join_all();
 }
 
-/* ---- 2. 参数在 go 处求值并复制 ---- */
+/* ---- 2. 参数在 spawn 处求值并复制 ---- */
 
 static volatile int copied = 0;
 
@@ -63,15 +63,15 @@ static int take_int(int v)
     return 0;
 }
 
-test "参数在 go 处求值，之后改局部不影响线程" {
+test "参数在 spawn 处求值，之后改局部不影响线程" {
     int v = 5;
 
     copied = 0;
-    go take_int(v);
+    spawn take_int(v);
     v = 99;
     __c6_th_join_all();
     if (copied != 5)
-        err(1, "线程看到的不是 go 处的值");
+        err(1, "线程看到的不是 spawn 处的值");
 }
 
 static int calls = 0;
@@ -84,7 +84,7 @@ static int side(void)
 test "参数里的副作用只发生一次" {
     calls = 0;
     copied = 0;
-    go take_int(side());
+    spawn take_int(side());
     __c6_th_join_all();
     if (calls != 1 || copied != 1)
         err(1, "参数表达式求值次数不对");
@@ -109,7 +109,7 @@ test "结构体、指针、整数一起按值传" {
 
     v.a = 1; v.b = 2; v.c = 3; v.d = 4; v.e = 5;
     big_sum = 0;
-    go take_big(v, "abc", 10);
+    spawn take_big(v, "abc", 10);
     v.a = 100;                      /* 线程已经拿到副本 */
     __c6_th_join_all();
     if (big_sum != 1 + 2 + 3 + 4 + 5 + 3 + 10)
@@ -124,9 +124,9 @@ static int no_args(void)
     return 0;
 }
 
-test "无参函数也能 go" {
+test "无参函数也能 spawn" {
     noarg = 0;
-    go no_args();
+    spawn no_args();
     __c6_th_join_all();
     if (noarg != 1)
         err(1, "无参线程没有跑");
@@ -139,9 +139,9 @@ static void void_fn(int v)
     voided = v;
 }
 
-test "返回 void 的函数也能 go" {
+test "返回 void 的函数也能 spawn" {
     voided = 0;
-    go void_fn(3);
+    spawn void_fn(3);
     __c6_th_join_all();
     if (voided != 3)
         err(1, "void 函数的线程没有跑");
@@ -159,7 +159,7 @@ static int thread_defer(int v)
 
 test "线程里的 defer 在线程退出时执行" {
     dflag = 0;
-    go thread_defer(9);
+    spawn thread_defer(9);
     __c6_th_join_all();
     if (dflag != 9)
         err(1, "线程的 defer 没有执行");
@@ -186,8 +186,8 @@ static int fail_in(int id)
 test "两个线程的错误槽互不干扰" {
     ea = 0;
     eb = 0;
-    go fail_in(1);
-    go fail_in(2);
+    spawn fail_in(1);
+    spawn fail_in(2);
     __c6_th_join_all();
     if (ea != 1 || eb != 2)
         err(1, "线程之间的错误槽串了");
@@ -214,13 +214,13 @@ static int thread_co(int v)
 
 test "线程里可以跑 async 协程" {
     co_val = 0;
-    go thread_co(21);
+    spawn thread_co(21);
     __c6_th_join_all();
     if (co_val != 21)
         err(1, "线程里的协程没有跑到");
 }
 
-/* ---- 6. 线程里再 go ---- */
+/* ---- 6. 线程里再 spawn ---- */
 
 static volatile int nested = 0;
 
@@ -232,13 +232,13 @@ static int inner_fn(void)
 
 static int outer_fn(void)
 {
-    go inner_fn();
+    spawn inner_fn();
     return 0;
 }
 
-test "线程里再 go：外层退出时等内层" {
+test "线程里再 spawn：外层退出时等内层" {
     nested = 0;
-    go outer_fn();
+    spawn outer_fn();
     __c6_th_join_all();
     if (nested != 11)
         err(1, "嵌套出去的线程没有被等完");
@@ -254,13 +254,13 @@ static int put_slot(int i)
     return 0;
 }
 
-test "16 个 go 并行跑完" {
+test "16 个 spawn 并行跑完" {
     int i = 0, bad = 0;
 
     for (i = 0; i < 16; i++)
         slots[i] = 0;
     for (i = 0; i < 16; i++)
-        go put_slot(i);
+        spawn put_slot(i);
     __c6_th_join_all();
     for (i = 0; i < 16; i++)
         if (slots[i] != 100 + i)
@@ -271,38 +271,39 @@ test "16 个 go 并行跑完" {
 
 /* ---- 8. 跨翻译单元 ---- */
 
-test "go 可以调用别的翻译单元里的函数" {
-    go tu_add(2, 3);
+test "spawn 可以调用别的翻译单元里的函数" {
+    spawn tu_add(2, 3);
     __c6_th_join_all();
     if (tu_last_sum() != 5)
-        err(1, "跨 TU 的 go 结果不对");
+        err(1, "跨 TU 的 spawn 结果不对");
 }
 
 /* ---- 9. 软关键字：普通位置还是标识符 ---- */
 
-static int go = 1;                  /* 变量名 */
+static int spawn = 1;               /* 变量名 */
 static int task = 2;                /* 变量名 */
 typedef int co;                     /* 类型名 */
 static co co_typed = 3;
+static int go = 4;                  /* 旧关键字名，照常当标识符 */
 
-static int go_plus(int x)           /* 函数名 */
+static int spawn_plus(int x)        /* 函数名 */
 {
     return x + 1;
 }
 
-test "go/co/task 在标识符位置仍然是标识符" {
+test "spawn/co/task 在标识符位置仍然是标识符" {
     int x = 0;
 
-    go = go + 1;                    /* 赋值，不是语句关键字 */
-    x = go;
+    spawn = spawn + 1;              /* 赋值，不是语句关键字 */
+    x = spawn;
     if (x != 2)
-        err(1, "变量 go");
+        err(1, "变量 spawn");
     if (task != 2)
         err(2, "变量 task");
     if (co_typed != 3)
         err(3, "typedef co");
-    if (go_plus(5) != 6)
-        err(4, "函数名里带 go");
+    if (spawn_plus(5) != 6)
+        err(4, "函数名里带 spawn");
     {
         co local = 4;               /* typedef 名做类型 */
         if (local != 4)
@@ -317,19 +318,34 @@ done:
 test "软关键字和真语句按形状区分" {
     int y = 0;
 
-    y = go + 1;                     /* 'go' 后面是 '='：表达式 */
+    y = spawn + 1;                  /* 'spawn' 后面是 '='：表达式 */
     if (y != 3)
-        err(1, "go 做右值");
+        err(1, "spawn 做右值");
     {
-        int go = 40;                /* 局部变量名 */
-        go = go + 2;
-        if (go != 42)
-            err(2, "局部变量 go");
+        int spawn = 40;             /* 局部变量名 */
+        spawn = spawn + 2;
+        if (spawn != 42)
+            err(2, "局部变量 spawn");
     }
     {
         int task = 3;
         task = task * 2;
         if (task != 6)
             err(3, "局部变量 task");
+    }
+}
+
+test "旧关键字名 go 仍然只是标识符" {
+    go = go + 1;                    /* 赋值：后面不是标识符 */
+    if (go != 5)
+        err(1, "变量 go");
+    goto go;                        /* 标号也不受影响 */
+    err(2, "goto go 没跳");
+go:
+    {
+        int go = 40;                /* 局部变量，遮蔽全局的同名变量 */
+        go = go + 2;
+        if (go != 42)
+            err(3, "局部变量 go");
     }
 }

@@ -14,7 +14,7 @@
  * 本文件按五段演示：
  *   1. new / 作用域释放 / p = NULL / 计数 / new T[n] 逐元素析构
  *   2. own 子树 + weak 反向引用（树的标准写法）+ move()
- *   3. shared + go：引用跨线程，主线程先放手对象也还活着
+ *   3. shared + spawn：引用跨线程，主线程先放手对象也还活着
  *   4. async 任务自己持有参数与返回值
  *   5. 收尾：__c6_gc_live() 归零
  *
@@ -188,7 +188,7 @@ int main(void)
     check(nodes_freed == 3, "own 子树逐个释放（析构跑三次）");
     check(__c6_gc_live() == base, "树已经释放");
 
-    /* ---- 3. shared + go：引用跨线程 ---- */
+    /* ---- 3. shared + spawn：引用跨线程 ---- */
     printf("3. shared 跨线程：主线程先放手，对象仍活着\n");
     {
         shared @Counter c = new shared Counter;
@@ -197,8 +197,8 @@ int main(void)
         g_handed = NULL;
         g_a = 0;
         g_b = 0;
-        go bump(1, c);            /* 实参块各持有一份 */
-        go bump(2, c);
+        spawn bump(1, c);         /* 实参块各持有一份 */
+        spawn bump(2, c);
         check(wait_flag(&g_a) && wait_flag(&g_b), "两个线程都跑完了");
         /* 线程退出后实参块归还，只剩主线程与交接过来的两份 */
         check(wait_refcount(c, 2), "线程退出后应剩两份");

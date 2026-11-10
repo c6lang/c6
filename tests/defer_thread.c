@@ -1,7 +1,7 @@
 /* c6 自测：defer 在多线程里不需要任何线程级状态
  *
  * 哪些清理点已注册（帧里的位图）和正在服务的清理请求（两个 int）都是本帧的
- * 局部变量，所以 'go' 起来的线程和主线程可以同时反复进出带 defer 的作用域、
+ * 局部变量，所以 'spawn' 起来的线程和主线程可以同时反复进出带 defer 的作用域、
  * 递归若干层、走错误路径，谁的清理点都跑不到对方的帧里去。这里每个线程把
  * 结果记在自己的计数器里，最后逐个核对。
  *
@@ -64,7 +64,7 @@ static int worker_b(void)
     return 0;
 }
 
-test "go 线程和主线程同时跑带 defer 的代码" {
+test "spawn 线程和主线程同时跑带 defer 的代码" {
     gate = 0;
     done_a = 0;
     done_b = 0;
@@ -72,10 +72,10 @@ test "go 线程和主线程同时跑带 defer 的代码" {
     count_b = 0;
     count_main = 0;
 
-    go worker_a();
-    go worker_b();
+    spawn worker_a();
+    spawn worker_b();
     churn(&count_main, DEPTH);          /* 主线程同时做同样的事 */
-    gate = 1;                           /* 走到这里说明 go 没有阻塞 */
+    gate = 1;                           /* 走到这里说明 spawn 没有阻塞 */
 
     (void)wait_nonzero(&done_a);
     (void)wait_nonzero(&done_b);
@@ -120,7 +120,7 @@ test "线程里的错误路径照样跑清理" {
     err_seen = 0;
     count_err = 0;
 
-    go worker_err();
+    spawn worker_err();
     gate = 1;
 
     (void)wait_nonzero(&done_err);
@@ -132,7 +132,7 @@ test "线程里的错误路径照样跑清理" {
         err(2, "线程里错误路径的清理次数不对（defer 1 次 + errdefer 1 次）");
 }
 
-/* ---- 同一个 'go' 线程里反复进出带着清理点的函数 ---- */
+/* ---- 同一个 'spawn' 线程里反复进出带着清理点的函数 ---- */
 static volatile int done_many = 0;
 static int count_many = 0;
 
@@ -162,7 +162,7 @@ test "一个线程里连续两次调用带清理的函数" {
     done_many = 0;
     count_many = 0;
 
-    go worker_many();
+    spawn worker_many();
     gate = 1;
 
     (void)wait_nonzero(&done_many);

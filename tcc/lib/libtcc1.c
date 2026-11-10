@@ -667,7 +667,7 @@ typedef struct TccThCtx {
 typedef unsigned long pthread_t;
 typedef unsigned int pthread_key_t;
 typedef int pthread_once_t;
-/* The runtime needs threads for 'go'/'thread' and to key one block of state
+/* The runtime needs threads for 'spawn'/'thread' and to key one block of state
    (error slot, f-string builders, coroutine pool) per thread.  A freestanding
    program -- one linked without libc -- has no pthreads, so every entry
    point is a *weak* reference: it becomes 0 there, and the runtime then
@@ -795,8 +795,8 @@ static void *c6_realloc(void *p, unsigned long size)
     return np;
 }
 
-/* A thread started by 'go'.  It is always joined by the thread that started
-   it, and it may also be handed out as a handle ('thread h = go f(x);'), so
+/* A thread started by 'spawn'.  It is always joined by the thread that started
+   it, and it may also be handed out as a handle ('thread h = spawn f(x);'), so
    the record is reference counted: the starter's child list owns one
    reference, the handle owns another.  'state' keeps 'pthread_join' from
    running twice on the same thread, 'done' lets a handle ask without
@@ -838,7 +838,7 @@ static void *tcc_th_alloc(unsigned long size)
 static void tcc_th_co_free(TccCoPool *co);
 static void tcc_th_gc_free_all(TccThCtx *th);
 
-/* Join every thread this thread started.  A 'go' statement has no place
+/* Join every thread this thread started.  A 'spawn' statement has no place
    where it could be joined, so the starter reaps its threads when it exits;
    the main thread does it from exit(), early enough that -run can still tear
    the JIT memory down afterwards. */
@@ -893,7 +893,7 @@ static void tcc_th_key_init(void)
 
 /* 1 when the program was linked with pthreads: the block of state is then
    keyed per thread.  0 in a freestanding link (no libc): one static block,
-   so 'go' and 'thread' report failure instead of starting a thread. */
+   so 'spawn' and 'thread' report failure instead of starting a thread. */
 static int tcc_th_multi(void)
 {
     return pthread_once && pthread_key_create && pthread_getspecific
@@ -920,7 +920,7 @@ static TccThCtx *tcc_th(void)
 }
 #endif
 
-/* The argument block of one 'go f(a);'.  The thread that runs the call
+/* The argument block of one 'spawn f(a);'.  The thread that runs the call
    releases it, so a failed start releases it here. */
 void *__tcc_sp_args(unsigned long size)
 {
@@ -948,7 +948,7 @@ static void *tcc_th_tramp(void *p)
 }
 
 /* __tcc_th_spawn(&trampoline, block): run the trampoline on a new thread and
-   return the handle ('thread h = go f(x);').  The record starts with two
+   return the handle ('thread h = spawn f(x);').  The record starts with two
    references: one for this thread's child list, one for the caller.  Returns
    0 when the thread could not be started. */
 void *__tcc_th_spawn(void *(*fn)(void *), void *arg)
@@ -987,7 +987,7 @@ void *__tcc_th_spawn(void *(*fn)(void *), void *arg)
 
 void __c6_th_release(TccThRec *r);
 
-/* __tcc_th_start(&trampoline, block): the 'go' statement, which keeps no
+/* __tcc_th_start(&trampoline, block): the 'spawn' statement, which keeps no
    handle.  Returns 0 when the thread was started. */
 int __tcc_th_start(void *(*fn)(void *), void *arg)
 {
@@ -1041,7 +1041,7 @@ void __c6_th_release(TccThRec *r)
     tcc_th_rec_unref(r);
 }
 
-/* Wait for the threads this thread started.  A 'go' statement has no place
+/* Wait for the threads this thread started.  A 'spawn' statement has no place
    where it could be joined, so the compiler calls this at the end of main
    and the test runner calls it when the tests are done; a thread that was
    started by another threads is joined when that thread exits.  Doing it from

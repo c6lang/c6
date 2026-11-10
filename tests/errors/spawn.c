@@ -1,41 +1,44 @@
-/* c6 编译期诊断：go（OS 线程）
+/* c6 编译期诊断：spawn（OS 线程）
  *
  * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
  * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
  * 不带任何 -D 时是本文件的"正常路径"，必须编译通过并跑通。
  */
 
-// EXPECT test_go_outside: error: 'go' can only be used inside a function
-// EXPECT test_go_async: error: 'go' requires a plain function: 'a' is 'async'
-// EXPECT test_go_variadic: error: 'go' does not support variadic functions: 'vf'
-// EXPECT test_go_fallible: error: 'go' does not support fallible functions: 'ff'
-// EXPECT test_go_value: error: the operand of 'go' must be a call of a plain function
-// EXPECT test_go_funcptr: error: the operand of 'go' must be a call of a plain function
-// EXPECT test_go_signature: error: 'go' does not support this signature: 'cbf'
+// EXPECT test_spawn_outside: error: 'spawn' can only be used inside a function
+// EXPECT test_spawn_async: error: 'spawn' requires a plain function: 'a' is 'async'
+// EXPECT test_spawn_variadic: error: 'spawn' does not support variadic functions: 'vf'
+// EXPECT test_spawn_fallible: error: 'spawn' does not support fallible functions: 'ff'
+// EXPECT test_spawn_value: error: the operand of 'spawn' must be a call of a plain function
+// EXPECT test_spawn_funcptr: error: the operand of 'spawn' must be a call of a plain function
+// EXPECT test_spawn_signature: error: 'spawn' does not support this signature: 'cbf'
+// EXPECT test_old_go: error: 'go' was renamed to 'spawn'
+// EXPECT test_old_go_handle: error: 'go' was renamed to 'spawn'
+// EXPECT test_old_go_scope: error: 'go' was renamed to 'spawn'
 
-#if defined test_go_outside
-/* go 是语句，只能写在函数里 */
+#if defined test_spawn_outside
+/* spawn 是语句，只能写在函数里 */
 int f(void)
 {
     return 0;
 }
-go f();
+spawn f();
 int main(void)
 {
     return 0;
 }
-#elif defined test_go_async
-/* async 函数用 co，不用 go */
+#elif defined test_spawn_async
+/* async 函数用 co，不用 spawn */
 async int a(void)
 {
     return 0;
 }
 int main(void)
 {
-    go a();
+    spawn a();
     return 0;
 }
-#elif defined test_go_variadic
+#elif defined test_spawn_variadic
 /* 参数个数不定就没法生成参数块 */
 int vf(int x, ...)
 {
@@ -43,10 +46,10 @@ int vf(int x, ...)
 }
 int main(void)
 {
-    go vf(1);
+    spawn vf(1);
     return 0;
 }
-#elif defined test_go_fallible
+#elif defined test_spawn_fallible
 /* 错误要带回到某个地方，线程里没人接 */
 int!error ff(void)
 {
@@ -54,18 +57,18 @@ int!error ff(void)
 }
 int main(void)
 {
-    go ff();
+    spawn ff();
     return 0;
 }
-#elif defined test_go_value
+#elif defined test_spawn_value
 /* 值不是函数调用 */
 int main(void)
 {
     int v = 1;
-    go v;
+    spawn v;
     return 0;
 }
-#elif defined test_go_funcptr
+#elif defined test_spawn_funcptr
 /* 通过函数指针的调用没有可生成的跳板 */
 int plain(void)
 {
@@ -74,10 +77,10 @@ int plain(void)
 int main(void)
 {
     int (*p)(void) = plain;
-    go p();
+    spawn p();
     return 0;
 }
-#elif defined test_go_signature
+#elif defined test_spawn_signature
 /* 参数类型写不回去（函数指针成员没法放进参数块） */
 int one(int x)
 {
@@ -89,14 +92,51 @@ int cbf(int (*cb)(int))
 }
 int main(void)
 {
-    go cbf(one);
+    spawn cbf(one);
+    return 0;
+}
+#elif defined test_old_go
+/* 'go' 不再是关键字：在旧语句形状上给一句迁移提示 */
+int w1(int x)
+{
+    return x;
+}
+int main(void)
+{
+    go w1(1);
+    return 0;
+}
+#elif defined test_old_go_handle
+int w2(int x)
+{
+    return x;
+}
+int main(void)
+{
+    thread h = go w2(1);
+
+    h->join();
+    return 0;
+}
+#elif defined test_old_go_scope
+/* 文件作用域的旧写法同样是改名提示，不是 implicit int */
+int w3(void)
+{
+    return 0;
+}
+go w3();
+int main(void)
+{
     return 0;
 }
 #else
-/* 正常路径：软关键字做普通标识符，同时真的 go 一次 */
-static int go = 1;
+/* 正常路径：软关键字做普通标识符，同时真的 spawn 一次 */
+static int spawn = 1;
 static int task = 2;
 typedef int co;
+
+/* 旧关键字名 'go' 仍然只是普通标识符 */
+static int go = 5;
 
 static int worker(int v)
 {
@@ -107,12 +147,13 @@ int main(void)
 {
     co typed = 3;
 
-    go = go + 1;
+    spawn = spawn + 1;
     task = task + 1;
-    if (typed != 3 || task != 3)
+    go = go + 1;
+    if (typed != 3 || task != 3 || go != 6)
         return 1;
-    go worker(1);
+    spawn worker(1);
     __c6_th_join_all();
-    return go == 2 ? 0 : 2;
+    return spawn == 2 ? 0 : 2;
 }
 #endif

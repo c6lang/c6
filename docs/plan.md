@@ -16,7 +16,7 @@
 | **G7** | 扩展开关通过“运行时关键字映射”实现，但 TCC 的 `tok_alloc` 在词法阶段就将字符串 intern 为 `TokenSym`，后期切换映射不可行 | 中 | 改为**编译期条件编译**：`tcctok.h` 中 `#ifdef C6_EXT` 注册新 token；扩展关闭时这些字符串根本不进入关键字映射，零运行时开销 |
 | **G8** | `#macro` 的 `__local` 重命名通过 `TokenSym` 插入唯一名，但 TCC 的 `TokenSym` 是全局 intern 表，宏展开产生的临时标识符会永久累积 | 中 | 重命名使用**展开计数器后缀**（如 `tmp__h17`），但不在 `TokenSym` 中持久化；展开结束后从 intern 表移除，或接受可控的内存增长（首版可接受，后续优化） |
 | **G9** | 包管理的 `package NAME { ... }` 在 `tccgen.c` 顶层处理，但 TCC 的顶层声明循环 (`decl`) 不天然支持“命名块”语法 | 中 | 将 `package NAME { ... }` 解析为**语法糖**：读取包名后进入特殊声明上下文，对块内每个全局符号在注册时施加 `NAME__` 前缀；块结束后恢复。不引入真正的“顶层块作用域”，只做 mangle |
-| **G10** | `err` 的错误槽“通过隐藏参数传递”在 TCC 的调用约定中无现成支持 | 中 | 使用**每线程错误槽**（`pthread_key` + `pthread_getspecific`，不是 `__thread`：`-run` 不支持 TLS），调用者从槽读取；`go` 出去的线程有自己的槽，跨线程传播需手动复制。隐藏参数作为后续优化 |
+| **G10** | `err` 的错误槽“通过隐藏参数传递”在 TCC 的调用约定中无现成支持 | 中 | 使用**每线程错误槽**（`pthread_key` + `pthread_getspecific`，不是 `__thread`：`-run` 不支持 TLS），调用者从槽读取；`spawn` 出去的线程有自己的槽，跨线程传播需手动复制。隐藏参数作为后续优化 |
 
 
 ## 1. 总体架构与扩展开关
@@ -142,12 +142,12 @@ struct TccThCtx {
     int        err_id;
     const char *err_msg;
     TccCoPool *co;         /* 本线程的协程池 */
-    TccThRec  *th_list;    /* 本线程 go 出去的线程 */
+    TccThRec  *th_list;    /* 本线程 spawn 出去的线程 */
 };
 ```
 
 `tcc_th()` 用 `pthread_getspecific` 取当前线程的 `TccThCtx`，第一次用时
-`pthread_key_create` 建键并分配；`go` 出去的线程继承不到启动方的上下文，
+`pthread_key_create` 建键并分配；`spawn` 出去的线程继承不到启动方的上下文，
 第一次调用 `tcc_th()` 时拿到自己的那一份。
 
 每个函数帧 prologue **不需要**独立错误槽；错误槽是每线程的，但函数在**错误返回点**显式读取并决定传播。递归场景下，每层在调用子函数后检查 `__tcc_err.flag`，需要时复制到本地变量后清除，避免串扰。
@@ -533,14 +533,14 @@ int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
 | 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`for` 声明） | 自动变量、全局缺初始化器报错 | `static` 变量与 VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
 | 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、局部 tag 的切片、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、`typeof`/`_Generic`/`_Alignof`、接口方法签名、跨 TU |
 | 函数字面量 | 显式声明/就地调用/推断声明/作实参/结构体成员/数组初值/文件作用域与 `static` 初始化器/变参/`!error`+`catch`/`defer` 体/嵌套字面量/`static inline` 体里/`qsort`/C 回调（`abi/`）/C99 后端；V2（捕获式闭包）：`closure RET (P…)` 类型、隐式按值捕获、`@` 托管引用、函数指针 → 闭包的跳板、`-emit-header`、跨 TU、C99 后端 | 捕获值装进普通函数指针（C93）、捕获 `own`/`weak`/数组/VLA/块作用域 `static`/`drop` 结构体等（C94）、`shared`/`weak`/`own` 闭包与跨线程任务（C96）、不透明操作（C97）、自捕获（C98）；无名字、带存储类、`async`、缺函数体（C80–C83） | 每处字面量各是一个函数、同一字面量赋给两个变量、和纯 C 函数指针互相赋值、`-emit-header` 不导出、`module` 不改名 |
-| 元组 `(T1, T2)` | 返回值/解构声明/解构赋值/`_`/`t[k]`/参数/成员/数组元素/嵌套/复合字面量/`sizeof`/`async`+`await`/`go`/`!error`/跨 TU/与 struct 的 ABI 互通/单条语句体与语句表达式里的解构 | 元素是 `void`/函数/VLA/数组/不完整/局部 tag/`error`、下标非常量或越界、解构个数不符、混写类型与名字、全 `_`、右边不是元组、非左值目标、`return {…}` 用在标量函数、`float!error` | `#pragma pack` 不影响布局、`(a, b)` 逗号表达式与各种强转/复合字面量不被误判、`_` 别处仍是普通标识符、文件作用域的元组对象 |
+| 元组 `(T1, T2)` | 返回值/解构声明/解构赋值/`_`/`t[k]`/参数/成员/数组元素/嵌套/复合字面量/`sizeof`/`async`+`await`/`spawn`/`!error`/跨 TU/与 struct 的 ABI 互通/单条语句体与语句表达式里的解构 | 元素是 `void`/函数/VLA/数组/不完整/局部 tag/`error`、下标非常量或越界、解构个数不符、混写类型与名字、全 `_`、右边不是元组、非左值目标、`return {…}` 用在标量函数、`float!error` | `#pragma pack` 不影响布局、`(a, b)` 逗号表达式与各种强转/复合字面量不被误判、`_` 别处仍是普通标识符、文件作用域的元组对象 |
 
 ### 9.2 工程要求
 
 - 现有 TCC 测试套件在 `C6_EXT` 开/关两种模式下全回归；
 - 调试信息保留原始源位置（尤其 `defer` 清理块和卫生宏）；
 - `TCCState` 扩展字段保持 ABI 兼容；
-- `__tcc_err` 是每线程槽（`pthread_key`，不是 `__thread`）：`go` 出去的线程有自己的错误槽，跨线程传播要手动复制；
+- `__tcc_err` 是每线程槽（`pthread_key`，不是 `__thread`）：`spawn` 出去的线程有自己的错误槽，跨线程传播要手动复制；
 - 实现前核实 `macro_subst`、`local_label_stack`、`block_cleanup` 等 TCC 内部函数的真实签名与行为；`test` 生成符号加随机前缀避免冲突。
 
 
@@ -584,8 +584,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
 | 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task, void *frame)` 编译，`c6_async_func_begin` 算帧基址并分发、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把错误槽 park 出去（帧住在任务里，不用搬，清理状态跟着帧走）；运行期 `libtcc1.c` 的 `__c6_co_new`（一次分配任务结构 + 帧）/ `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（按需 malloc + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
 
-| 13 `co` / `task` 软关键字 | ✅ | `co`/`go`/`task` 不进 `tcctok.h`：词法阶段仍是标识符，`block()` 里 `tok >= TOK_IDENT` 且 `c6_soft_kw(t)` 命中、名字没有被 `VT_TYPEDEF` 占用时按关键字分派（`c6_soft_kw_shadowed`），所以 `int go = 1;`、`go(x);`、`typedef int co;`、`go:` 都还成立；`c6_co_parse`（`decl()` 与 `block()` 两个入口——单条语句不走 `decl()`）+ `__tcc_co_spawn`；`c6_task_decl` / `c6_task_check_handle`（`struct NAME_task` 的 `head` 必须是 `struct __c6_task`）/ `c6_task_defer_destroy`（合成一个作用域清理点，同手写 `defer`）；运行期 `libtcc1.c` 的顶层就绪链表（`snext`/`busy`/`waiting`）与 `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run`，`__c6_co_wait` 也改成先推进顶层任务；`async` 体里的 `err` 走 `c6_async_propagate`（`KIND_ERR`），并禁止 `async` 方法是方法；预置声明同步加 `__tcc_co_spawn` / `__c6_co_run` |
-| 14 `go` = OS 线程 | ✅ | `c6_go_parse` 只在 `-std=c6` 下生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `go` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（错误槽 / 插值构造器 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS）；`defer` 不在其中，它的状态在函数帧里 |
+| 13 `co` / `task` 软关键字 | ✅ | `co`/`spawn`/`task` 不进 `tcctok.h`：词法阶段仍是标识符，`block()` 里 `tok >= TOK_IDENT` 且 `c6_soft_kw(t)` 命中、名字没有被 `VT_TYPEDEF` 占用时按关键字分派（`c6_soft_kw_shadowed`），所以 `int spawn = 1;`、`spawn(x);`、`typedef int co;`、`spawn:` 都还成立；`c6_co_parse`（`decl()` 与 `block()` 两个入口——单条语句不走 `decl()`）+ `__tcc_co_spawn`；`c6_task_decl` / `c6_task_check_handle`（`struct NAME_task` 的 `head` 必须是 `struct __c6_task`）/ `c6_task_defer_destroy`（合成一个作用域清理点，同手写 `defer`）；运行期 `libtcc1.c` 的顶层就绪链表（`snext`/`busy`/`waiting`）与 `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run`，`__c6_co_wait` 也改成先推进顶层任务；`async` 体里的 `err` 走 `c6_async_propagate`（`KIND_ERR`），并禁止 `async` 方法是方法；预置声明同步加 `__tcc_co_spawn` / `__c6_co_run` |
+| 14 `spawn` = OS 线程 | ✅ | `c6_spawn_parse` 只在 `-std=c6` 下生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `go` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（错误槽 / 插值构造器 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS）；`defer` 不在其中，它的状态在函数帧里 |
 | 15 裸 tag 类型名（省略 `struct`） | ✅ | `tccgen.c`：`parse_btype()` 的 `default` 分支——`typespec_found` 为 0、`sym_find(tok)` 未命中（普通命名空间优先）时试 `struct_find(tok)`，命中则把 tag 符号的 `type.t` / `ref` 交给 `basic_type2`，与 `struct/union/enum TAG` 走完全同一条路径（所以 `sizeof`、方法注册、`c6_tag_is_global` 的切片元素检查、`type_to_str` 自动一致）；`ignore_label` 时 `TAG:` 仍退回标签（与 typedef 路径同一个 guard）；不隐式前置声明，也不支持定义处省略 `struct`；只在 `-std=c6` 生效 |
 | 16 `foreach` | ✅ | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句，所以 `foreach` 仍可当标识符）；词法是 `tcctok.h` 末尾追加的硬关键字，`-std=c6` 关闭时由 `tccpp.c` 的还原循环改回普通标识符（区间同步扩到 `TOK_C6_FOREACH`）；数组/切片的隐藏槽直接复用 `c6_slice_spill`（`{data, len}` 对，与切片运行期布局相同），区间把上界落进隐藏整数槽、下标绑定当计数器；`i`/`v` 是 `sym_push` 出来的普通局部，循环体走 `lblock`，所以 `break`/`continue`/`defer`/`await` 与 `for` 一致；`size_t` 下标用 `c6_size_type`，区间用 `c6_common_int_type`（C 的通常算术转换子集）；文件作用域的 `foreach \|…\|` 在 `decl()` 里报错；迭代器协议（`has()`/`next()`，含结构体值/指针/接口值）见里程碑 30 |
 | 17 元组 `(T1, T2, …)` | ✅ | `tccgen.c`：`parse_btype()` 的 `case '('` → `c6_tuple_btype` / `c6_tuple_speculate`（保存/重放 token，区分元组类型与老 C 的括号表达式）、`c6_tuple_get`（校验元素并规范化生成内部 tag `__c6_tuple_N`，布局在构造时按自然对齐算好，不走 `struct_layout`）、`c6_tuple_ctype` / `c6_tuple_of_type` / `c6_tuple_ctype`；`unary()` 的 `case '('` 处理元组强转/复合字面量/`sizeof`/`_Alignof`、`c6_tuple_subscript` 处理 `t[k]`（常量下标）；`decl()` 开头的 `c6_tuple_lead_kind` + `c6_tuple_destructure` 实现解构声明/赋值（`_` 占位符丢弃元素）；`c6_return_value` 支持 `return {…};`；`c6_apply_fallible` 放开 struct/union/元组作 `!error` 返回类型，失败路径用 `c6_zero_local` 清零；`c6_async_type_tokens` 把元组回放成 `(T1, T2)` 而不是内部 tag；解构语句在 `block()` 里也认一次（无花括号的 if/while/for/switch 单条语句体、语句表达式、`defer` 单条语句体不走 `decl()`），赋值形式在 `c6_tuple_destructure()` 里就地解析（作用域弹出后隐藏临时变量就没了） |
@@ -594,12 +594,12 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 20 描述符与字段释放 P2 | ✅ | `c6_gc_collect()`（struct 定义完成时收集字段表：`C6GcField.off/kind/count/stride`）、`c6_gc_size_of()`/`c6_gc_desc_for()`/`c6_gc_desc_decl()`/`c6_gc_emit_desc()`/`c6_gc_flush_descs()`（TU 末尾发射 `static const struct __c6_gc_desc __c6_gc_d<fnv>_<n>`，跨 TU 不重名）；运行期按描述符逐字段释放（数组逐元素、嵌入递归） |
 | 21 `weak` P3 | ✅ | 弱槽注册表（全局自旋锁，冷路径）+ `__c6_gc_weak_add`/`__c6_gc_weak_unlink`/`__c6_gc_weak_store`（原子 try-incref 升级）；`weak` 不能直接解引用（`vstore`/`unary` 两处检查）；async 里禁 `weak`（`c6_async_in_body`） |
 | 22 析构 `drop` P4 | ✅ | `c6_gc_drop_register()`（`c6_method_register()` 里登记）、`c6_gc_is_drop()` / `c6_gc_drop_callee()`（禁止 `p->drop()` / `drop(p)`）、描述符增加 `drop` 指针、运行期 `c6_gc_free_one()` 先跑析构再放字段；全局根用 TU 末尾的 `__attribute__((constructor))/((destructor))`（不用 `atexit`，否则拖出 `__dso_handle`） |
-| 23 `shared` 与跨帧/跨线程 P5 | ✅ | 原子与否在对象头（`new shared T`），`__c6_gc_inc`/`c6_gc_drop` 按标志走原子指令；`go` 实参块 +1 / trampoline −1（`c6_sp_emit`）、`async` 任务前缀 +1 / `__c6_co_destroy` −1（描述符第 5 个成员 `release` → `__c6_rel_NAME`）；形参是借用（`C6_GQ_BORROW`，E-GC14）；`new shared T` 强制（E-GC15） |
+| 23 `shared` 与跨帧/跨线程 P5 | ✅ | 原子与否在对象头（`new shared T`），`__c6_gc_inc`/`c6_gc_drop` 按标志走原子指令；`spawn` 实参块 +1 / trampoline −1（`c6_sp_emit`）、`async` 任务前缀 +1 / `__c6_co_destroy` −1（描述符第 5 个成员 `release` → `__c6_rel_NAME`）；形参是借用（`C6_GQ_BORROW`，E-GC14）；`new shared T` 强制（E-GC15） |
 | 24 静态环检测 P6 | ✅ | `c6_gc_collect()` 记 `C6GcField.to_tag`（强引用边、含数组与按值嵌入；`weak`/`own` 不是边），`c6_gc_flush_descs()` 里三色 DFS（`C6GcType.mark`）报 E-GC1；`move(p)` → `__c6_gc_move`（`own` 链“先建后接”的唯一写法）；`move(p)` 之后的空槽再用报 E-GC17（`Sym.gc_moved` + `if`/`while`/`for`/`switch`/`foreach` 的状态合并、`defer` 体隔离，`tests/errors/gc_move.c` 8 条） |
 | 25 任务回卷 P7 | ✅ | 运行期 `C6_CO_KIND_ABORT` / `__c6_co_abort` / `__c6_co_destroy` 先回卷；编译器在**每个 `await` 的恢复点**发 `if (__c6_co_kind(task) == ABORT) { defer_begin(2,0); finish(ABORT); }`（放末尾派发器里的话 `defer_state` 已复位，清理体发不出来） |
-| 26 线程与任务句柄 | ✅ | `thread h = go f(x);`（`c6_thread_decl` + `c6_thread_defer_release`，运行期 `TccThRec` 引用计数：链表 + 句柄）、`h->join()`/`h->done()`/`h->value()`；任务句柄方法 `t->wait()`/`t->done()`/`t->kind()`（预置方法 + `c6_task_head_ptr` 首字段上转）；`c99-rt.inc` 同步镜像、`tests/thread_handle.c`、`tests/task_method.c` |
+| 26 线程与任务句柄 | ✅ | `thread h = spawn f(x);`（`c6_thread_decl` + `c6_thread_defer_release`，运行期 `TccThRec` 引用计数：链表 + 句柄）、`h->join()`/`h->done()`/`h->value()`；任务句柄方法 `t->wait()`/`t->done()`/`t->kind()`（预置方法 + `c6_task_head_ptr` 首字段上转）；`c99-rt.inc` 同步镜像、`tests/thread_handle.c`、`tests/task_method.c` |
 | 27 函数字面量 `RET (参数) { 体 }` | ✅ | `C6Lit` 队列 + `c6_lit_lead()`（扫描签名 → token 重放判定「函数 + `{`」）、`c6_lit_parse()`（`external_sym` 建 `static __c6_fn_<n>`、`skip_or_save_block` 存体）、`c6_lit_decl_lead()` / `c6_lit_infer_decl()`（`f = …;` 推断声明）、`c6_lit_flush()`（TU 末尾与 `gen_inline_functions()` 同循环 `gen_function()`）、`c6_lit_cap_check()`（捕获诊断 C80，挂在值/typedef/tag 三条符号解析路径）；设计见 [closure-design.md](closure-design.md)、语法见 [grammar.md §3.10](grammar.md)；`tests/fn_lit.c` / `tests/errors/fn_lit.c` / `tests/abi/fn_lit.c`+`_plain.c` / `examples/fn_lit_demo.c`；V2（捕获式闭包）见第 29 行 |
-| 28 字符串插值 `f".."` / `@f".."` | ✅ | 词法：`tccpp.c` 的 `next()` 把 `f"` 收成 `TOK_C6_FSTR`（保存原始文本），`parse_fstr_string()` 在 `PARSE_FLAG_TOK_STR` 下用 `fstr_lex()` 切成「文本片段 / 插值」并 `begin_macro()` 重放成 `TOK_C6_FSTR_BEG` → (`TOK_STR ','` \| `TOK_C6_FSTR_EXPR` … `TOK_C6_FSTR_EXPR_END`) → `TOK_C6_FSTR_END`（片段后的 `,` 让 `decl_initializer` 走「更大表达式的一部分」分支；`{{`/`}}`/`\"` 由 `fstr_unquote()` 还原）；下降：`tccgen.c` 的 `unary()` 里 `TOK_C6_FSTR_BEG` 与 `'@'` 两个入口 → `c6_fstr_expr(managed)`，逐段 `c6_fstr_lit()` / `c6_fstr_piece()`（按静态类型选 `__c6_fmt_ch/i/u/b/s/sl/p`），字面片段的文本是命名的 `static const char[]`（c99 后端要按名字引用），收口 `__c6_fmt_end(0|1)`；运行期：`lib/libtcc1.c` 的每线程构造器槽（`C6FmtBuf`，按嵌套深度分槽，`__c6_fmt_beg` 压栈、`__c6_fmt_end` 弹栈；借用分支返回本深度的 `out` 缓冲，托管分支拷成 `C6_GC_FRESH\|C6_GC_ATOMIC` 对象）与 `__c6_str_len()`；`c99-rt.inc` / `c99-gen.c` 同步一份 C 实现与声明；格式说明 `{expr;spec}`：词法在 `parse_fstr_string()` 里把插值的第一个未嵌套 `;` 之后切成说明文本（新记号 `TOK_C6_FSTR_SPEC`），`c6_fstr_spec_parse()` 把它编成位（宽度/精度各 10 位 + conv 4 位 + flags），作为 `__c6_fmt_*` 的最后一个实参传给运行时（`__c6_fmt_l` 之外每个 piece 都多一个 `spec` 实参），运行时用 `c6_fmt_num` / `c6_fmt_str_spec` 应用宽度、对齐、补零、精度和进制；浮点（`float`/`double`/`long double`）走 `__c6_fmt_f`，conv 为 `f`/`e`/`g`（默认 `g`），数字由运行时的 `c6_dbl_*` 自己算（`c6_dbl_fixed` 反复乘十取位 + 四舍五入，`c6_dbl_str_sci` 先取十进制指数再做定点；零/nan 不走指数循环），`c99-rt.inc` 里是同一段代码；诊断 C84–C86/C88/C89，重写规则 R24，见 [grammar.md](grammar.md)；运行时的外部依赖（`calloc`/`free`/`realloc`/`mem*`/`pthread_*`/`select`）全部是 weak 引用，没有 libc 时用 `libtcc1` 里的静态 arena（`C6_HEAP_SIZE`，默认 256 KB）和自带 mem* 顶上、线程退化成单线程，见 `examples/freestanding_fstr.c`（`make fstest`）；`go`/`thread` 只要程序自己实现那 8 个 `pthread_*` 入口即可，且这层必须用普通 C 编译（c6 函数的 defer 前导会递归进 `tcc_th()`）；`examples/freestanding_pthread.c` 是一份真实现（x86-64 Linux 的 clone + futex + `%fs:0` 线程指针 + mmap 栈 + 线程安全的 calloc/free，join 靠 `CLONE_CHILD_CLEARTID`，不能靠 `CLONE_CHILD_SETTID`，见文件注释），配 `examples/freestanding_go.c`（`make fstest-go`）；宏体、宏实参和 `#x` 字符串化都带着原始文本走（`tcc.h` 的 `TOK_HAS_VALUE` 要认 `TOK_C6_FSTR`，`macro_arg_subst` 复制记号时必须留着 `CValue`，否则记号流会错位——曾经让编译器段错误）；插值里的 `;` 与 `try` 直接报错（C88：前者会静默截断，后者会让运行时构造器留在栈上） |
+| 28 字符串插值 `f".."` / `@f".."` | ✅ | 词法：`tccpp.c` 的 `next()` 把 `f"` 收成 `TOK_C6_FSTR`（保存原始文本），`parse_fstr_string()` 在 `PARSE_FLAG_TOK_STR` 下用 `fstr_lex()` 切成「文本片段 / 插值」并 `begin_macro()` 重放成 `TOK_C6_FSTR_BEG` → (`TOK_STR ','` \| `TOK_C6_FSTR_EXPR` … `TOK_C6_FSTR_EXPR_END`) → `TOK_C6_FSTR_END`（片段后的 `,` 让 `decl_initializer` 走「更大表达式的一部分」分支；`{{`/`}}`/`\"` 由 `fstr_unquote()` 还原）；下降：`tccgen.c` 的 `unary()` 里 `TOK_C6_FSTR_BEG` 与 `'@'` 两个入口 → `c6_fstr_expr(managed)`，逐段 `c6_fstr_lit()` / `c6_fstr_piece()`（按静态类型选 `__c6_fmt_ch/i/u/b/s/sl/p`），字面片段的文本是命名的 `static const char[]`（c99 后端要按名字引用），收口 `__c6_fmt_end(0|1)`；运行期：`lib/libtcc1.c` 的每线程构造器槽（`C6FmtBuf`，按嵌套深度分槽，`__c6_fmt_beg` 压栈、`__c6_fmt_end` 弹栈；借用分支返回本深度的 `out` 缓冲，托管分支拷成 `C6_GC_FRESH\|C6_GC_ATOMIC` 对象）与 `__c6_str_len()`；`c99-rt.inc` / `c99-gen.c` 同步一份 C 实现与声明；格式说明 `{expr;spec}`：词法在 `parse_fstr_string()` 里把插值的第一个未嵌套 `;` 之后切成说明文本（新记号 `TOK_C6_FSTR_SPEC`），`c6_fstr_spec_parse()` 把它编成位（宽度/精度各 10 位 + conv 4 位 + flags），作为 `__c6_fmt_*` 的最后一个实参传给运行时（`__c6_fmt_l` 之外每个 piece 都多一个 `spec` 实参），运行时用 `c6_fmt_num` / `c6_fmt_str_spec` 应用宽度、对齐、补零、精度和进制；浮点（`float`/`double`/`long double`）走 `__c6_fmt_f`，conv 为 `f`/`e`/`g`（默认 `g`），数字由运行时的 `c6_dbl_*` 自己算（`c6_dbl_fixed` 反复乘十取位 + 四舍五入，`c6_dbl_str_sci` 先取十进制指数再做定点；零/nan 不走指数循环），`c99-rt.inc` 里是同一段代码；诊断 C84–C86/C88/C89，重写规则 R24，见 [grammar.md](grammar.md)；运行时的外部依赖（`calloc`/`free`/`realloc`/`mem*`/`pthread_*`/`select`）全部是 weak 引用，没有 libc 时用 `libtcc1` 里的静态 arena（`C6_HEAP_SIZE`，默认 256 KB）和自带 mem* 顶上、线程退化成单线程，见 `examples/freestanding_fstr.c`（`make fstest`）；`spawn`/`thread` 只要程序自己实现那 8 个 `pthread_*` 入口即可，且这层必须用普通 C 编译（c6 函数的 defer 前导会递归进 `tcc_th()`）；`examples/freestanding_pthread.c` 是一份真实现（x86-64 Linux 的 clone + futex + `%fs:0` 线程指针 + mmap 栈 + 线程安全的 calloc/free，join 靠 `CLONE_CHILD_CLEARTID`，不能靠 `CLONE_CHILD_SETTID`，见文件注释），配 `examples/freestanding_go.c`（`make fstest-go`）；宏体、宏实参和 `#x` 字符串化都带着原始文本走（`tcc.h` 的 `TOK_HAS_VALUE` 要认 `TOK_C6_FSTR`，`macro_arg_subst` 复制记号时必须留着 `CValue`，否则记号流会错位——曾经让编译器段错误）；插值里的 `;` 与 `try` 直接报错（C88：前者会静默截断，后者会让运行时构造器留在栈上） |
 | 29 捕获式闭包（V2） | ✅ | `parse_btype()` 的 `closure` 软关键字 → `c6_closure_btype()` / `c6_closure_get()`（签名规范文本 + 哈希 tag `__c6_closure_<hash>`，匿名类型、块作用域 tag 报 C90）；字面量在 `c6_lit_parse()` 里用 `c6_lit_scan_*` 拿解析器把体扫一遍求捕获集合（`C6_CAP_VALUE`/`TYPE`/`ZERO`），`c6_lit_cap_check()` 挂在值/typedef/tag 三条符号解析路径上决定「按值进 env」还是 C93/C94；env 结构体按捕获顺序生成，体里的捕获名别名成 `((struct __c6_env_<n> *)__c6_env)->…`，`c6_self_pending` 在 sret/`self` 之后插隐藏 env 首参；调用点由 `c6_closure_call_prep()` 改写成 `__c6_code(__c6_env, …)`；函数指针 → 闭包由 `c6_closure_tramp()` 按签名发一个跳板 + 一字的 env；闭包与 env 是普通托管对象（`c6_gc_collect()` 描述符，env 是 STRONG 字段），签名级保守环边接进 C66；`-emit-header` 发 `{code, env}` 结构体与 typedef、`import` 按签名哈希重建类型、C99 后端是普通 C（`c99-gen.c` 发闭包结构体、跳板/描述符都是普通代码）；诊断 C90–C98（V1 的 C80 文本在 C93 之前照旧打印，既有 `tests/errors/fn_lit.c` 一行不改）；用例 `tests/closure.c`、`tests/errors/closure_signature.c`/`closure_convert.c`/`closure_capture.c`/`closure_capture_type.c`/`closure_cross.c`/`closure_opaque.c`/`closure_cycle.c`、`tests/abi/closure.c`+`_plain.c`、`tests/c99/closure.c`、`tests/tu/closure.c`、`tests/exit/closure_global.c`；设计见 [closure-design.md](closure-design.md)、验收清单见 [closure-todo.md](closure-todo.md) |
 | 30 `foreach` 迭代器协议 `has()`/`next()` | ✅ | `tccgen.c`：`c6_iter_proto_of`（结构化识别：接口值 / `T *` / `T` 值；`has`/`next` 方法来自 `c6_method_of`，真实字段遮蔽方法时不算协议）、`c6_iter_check_has` / `c6_iter_check_next`（签名 C99）、`c6_iter_setup`（隐藏 `has`/`next` 函数指针与 receiver 局部槽，按 `__c6_it_<kind>_<n>` 唯一命名）、`c6_iter_call`（把函数指针与 receiver 装进隐藏槽，再经 token 重放进 `gexpr()`，所以结构体返回/整型提升与手写调用完全一致；接口值取 vtable 槽）；`c6_foreach_parse` 新增迭代器分支：值形态把迭代器复制进隐藏槽（不推进原对象），`T *`/接口形态直接操作原对象，`has() != 0` 为循环条件，`next()` 结果写进值绑定（`_` 时 `vpop`，但仍调用；托管元素则落入隐藏槽以便释放），`continue` 回到 `has()` 判断；C47 提示改为 “no 'has'/'next' iterator”；托管引用：迭代器/元素隐藏槽按声明局部量清零并登记 `c6_gc_site`，`@T` 形参按借用拷贝，含托管字段的 struct 元素由 `c6_gc_value_check` 拒绝；`tests/foreach_iter.c`、`tests/errors/foreach_iter.c`、`examples/foreach_iter_demo.c` |
 | 31 `defer` 状态搬进函数帧 | ✅ | 清理点是编译期常量（`C6DeferSite`：id / 作用域深度 / kind / 标签），运行期只剩帧里的两样东西：`arm[C6_DEFER_WORDS]` 位图和 `dtgt`/`dres`（派发过滤 + 恢复点号，清理体每嵌套一层再存一份）；`c6_defer_func_init()` 只在序言里清 4 个 `int` 的位图（不再调用 `__tcc_defer_func_enter`；单趟编译在序言处不知道有没有清理点，所以这 16 字节是每个 c6 函数都付的固定开销），`c6_defer_func_end()` 生成一个逆序扫 site 的派发器，`c6_defer_begin()` 只写两个 `int` 就跳过去——于是没有 TLS/线程键、没有 8192 条记录上限（改成一个函数 128 个清理点、清理体 8 层，超了编译期报错）、ISR/线程/协程/递归同一套规则；`__tcc_defer_*` 五个入口与 `TccDeferRec`/`TccDeferCtx` 从 `libtcc1.c`、`c99-rt.inc`、`c99-gen.c` 的名字表里删掉，协程挂起只剩错误槽三项；向后跳转的 `goto` 在 `stmt()` 里自己发起清理请求（标签处的派发仍保留，向前跳转靠它）；语义见 [grammar.md](grammar.md) 8.2，约束 C101/C102；用例 `tests/defer_scope.c`、`tests/defer_reent.c`、`tests/defer_thread.c`（裸机跑不了，`examples/boot/runtests.sh` 里跳过）、`tests/async_frame.c` 第 8 组 |
@@ -643,7 +643,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - **布局不受 `#pragma pack` 影响**：`off = (off + align - 1) & -align` 在类型
   构造时一次算完并缓存，永不读 `pack_stack_ptr`。这样同一个元组在任何 TU、
   任何 pragma 状态下都是同一个 ABI（切片 `T[:]` 用的是同一条思路）；
-- **类型回放写 `(T1, T2)` 而不是 tag 名**：`async`/`go` 的跳板要把形参类型在
+- **类型回放写 `(T1, T2)` 而不是 tag 名**：`async`/`spawn` 的跳板要把形参类型在
   另一个合成 token 流里重新声明一遍。回放 tag 名会在当前作用域造出一个
   `sym_scope = 1` 的新 struct（和元组不兼容）；回放 `(T1, T2)` 则命中
   `c6_tuple_get` 的规范化缓存，拿回同一个类型；
@@ -667,8 +667,8 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 位置 | 内容 |
 |---|---|
 | `tests/async.c` | `async`/`await` 的返回值、挂起后局部变量、嵌套/循环里的 `await`、`defer` 跨挂起、`await c6_io`、任务槽回收；`co`/`task` 的句柄、自动回收、首步执行、轮转交替、`co` 在 `async` 体里仍是顶层、`__c6_co_run` 的错误计数 |
-| `tests/thread.c` | `go` 起线程、参数按值拷贝、线程里的 defer/错误槽、线程里再 `go`、与主线程并行、`__c6_th_join_all`、软关键字当变量名/label/typedef 用、跨 TU 的 `go`（`tests/tu/thread.c`） |
-| `tests/errors/spawn.c` | `go`/`co` 的错误路径：函数外使用、`go` 一个 `async` 函数、变参、`!error`、函数指针、不支持的签名、`co` 一个普通函数 |
+| `tests/thread.c` | `spawn` 起线程、参数按值拷贝、线程里的 defer/错误槽、线程里再 `spawn`、与主线程并行、`__c6_th_join_all`、软关键字当变量名/label/typedef 用、跨 TU 的 `spawn`（`tests/tu/thread.c`） |
+| `tests/errors/spawn.c` | `spawn`/`co` 的错误路径：函数外使用、`spawn` 一个 `async` 函数、变参、`!error`、函数指针、不支持的签名、`co` 一个普通函数 |
 | `tests/defer.c` | defer 的时机、顺序、`break`/`continue`/`goto`/`return`、递归 |
 | `tests/err.c` | `err` / `errdefer` 与清理顺序、错误槽 |
 | `tests/try.c` | `try` / `catch`，含 `goto` 离开、嵌套传播、`void!error` |
@@ -692,7 +692,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/tuple.c` | 元组的值语义、`t[k]`、`sizeof`/`_Alignof`、解构声明/赋值（变量、数组元素、成员）、`_` 占位符、元组当参数/成员/数组元素、嵌套与混合元素、复合字面量、跨 TU（`tests/tu/tuple.c`） |
 | `tests/tuple_error.c` | 元组/struct 作 `!error` 返回类型：成功路径、失败路径、错误槽卫生、连续 `catch` |
 | `tests/tuple_async.c` | 元组的 `async` 返回、`await` + 解构、`_` 丢弃、嵌套 `await` |
-| `tests/tuple_thread.c` | 元组穿过 `go`（按值拷贝）、线程里的元组调用 |
+| `tests/tuple_thread.c` | 元组穿过 `spawn`（按值拷贝）、线程里的元组调用 |
 | `tests/gc_return.c` | 返回托管引用的计数归属：新建对象返回、借字段返回、形参原样返回、循环里多次调用之后计数回到基线（`c6_gc_return_hook()` 的回归） |
 | `tests/errors/tuple.c` | 元组的全部编译期诊断（元素类型、下标、解构形态、`return {…}`） |
 | `tests/errors/loc.c` | 诊断位置：`sizeof(type)` / `_Alignof(type)` 整组回滚之后，头文件里的声明仍然报在头文件自己的那一行 |
@@ -725,7 +725,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 
 - 运行时状态（错误槽 / 插值构造器 / 协程池 / 线程链表）是**每线程**一份，
   `defer` 的清理状态例外：它在函数帧里（见 [grammar.md](grammar.md) 8.2），
-  通过 `pthread_key`（不是 `__thread`：`-run` 不支持 TLS）取；`go` 出去的
+  通过 `pthread_key`（不是 `__thread`：`-run` 不支持 TLS）取；`spawn` 出去的
   线程有自己的那一份，所以线程里照常写 `defer`/`err`/`co`，但跨线程共享
   数据仍需自己同步；
 - `err` 一旦执行就直接返回，没有重抛形式；转发用 `try`（在返回 `T!error`
@@ -845,26 +845,26 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - `await` 不能出现在 `defer`/`errdefer` 体、`sizeof` 等不求值上下文，
   也不能在非 `async` 函数里用；`c6_io` 只有 `await c6_io(fd, ev)` 一
   种写法；
-- `co` / `go` / `task` 是**软关键字**：词法阶段仍是标识符，只在语句开头
-  且后面紧跟一个标识符时才按关键字处理。所以 `int go = 1;`、`go = 2;`、
-  `x = go;`、`go(x);`、`typedef int co; co v;`、`go:` 标签都照常工作；
-  已经被 `typedef` 成类型名的 `co`/`go`/`task` 一定按声明解析；
+- `co` / `spawn` / `task` 是**软关键字**：词法阶段仍是标识符，只在语句开头
+  且后面紧跟一个标识符时才按关键字处理。所以 `int spawn = 1;`、`spawn = 2;`、
+  `x = spawn;`、`spawn(x);`、`typedef int co; co v;`、`spawn:` 标签都照常工作；
+  已经被 `typedef` 成类型名的 `co`/`spawn`/`task` 一定按声明解析；
 - `co` 是**同步起点**：任务在 `co` 语句处就开始跑，跑到第一个必须等待的
   点才回到下一条语句。`await c6_io` 总要停一轮（唤醒是下一轮 `select()`
   的事，即使 fd 已经就绪）；`await` 子任务不算等待，所以不碰 fd 的
   `co f();` 会在 `co` 语句里跑完，并**当场回收**（没人拿得到句柄，也没人
   观察得到）；只有 park 在 fd 上的任务才留给 `__c6_co_run()`；
-- `co`/`task` 的操作数必须是一次 `async` 调用；`go` 的操作数必须是一次
-  **普通函数**调用（`go` 一个 `async` 函数会提示改用 `co`）。三种写法分工：
-  `co` = 无栈协程、`task` = 拿句柄、`go` = OS 线程；
-- `go f(a);` 的实参在 `go` 语句处求值一次并按值复制到堆上的参数块，之后
+- `co`/`task` 的操作数必须是一次 `async` 调用；`spawn` 的操作数必须是一次
+  **普通函数**调用（`spawn` 一个 `async` 函数会提示改用 `co`）。三种写法分工：
+  `co` = 无栈协程、`task` = 拿句柄、`spawn` = OS 线程；
+- `spawn f(a);` 的实参在 `spawn` 语句处求值一次并按值复制到堆上的参数块，之后
   改局部变量不影响线程；被调函数不能是 `async`、不能变参、不能带
   `!error`、不能走函数指针，形参不能是数组/VLA/函数指针——这几种都报
   约束 C38–C40，而不是悄悄退化成直接调用；
 - 线程总是由**启动它的线程**回收（`main` 结束时编译器插
   `__c6_th_join_all()`，别的线程在退出时回收自己的子线程）；不提供取消，
   也没有分离线程。跨线程共享数据要自己加锁（和 C 一样）；
-- `go` 只支持 ELF 目标；PE 目标上还没有线程支持，运行时会 trap；
+- `spawn` 只支持 ELF 目标；PE 目标上还没有线程支持，运行时会 trap；
 - `c6_io` 的 fd 超出 `[0, 1024)` 时任务按失败回收（`__c6_co_wait` 返回
   `-1`，`__c6_co_run` 计一次失败），不会永远 park 在 select 里；
 - 调度是**协作式**的：没有抢占，不 hook libc，阻塞的 `read`/`printf` 不会
@@ -999,7 +999,7 @@ native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 
 取**左**操作数的类型（`(unsigned long long)x << 32` 不能被截成 32 位移位）。
 
 限制（均显式报错，不会静默错编译）：computed goto、VLA；非 POSIX 主机上
-运行时可编译，但 `async`/`go`/`c6_io` 需要移植。
+运行时可编译，但 `async`/`spawn`/`c6_io` 需要移植。
 ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-64 寄存器返回，
 9--16 字节且成员全是整数/指针的结构体也按寄存器返回（生成 C 直接按值返回，
 宿主编译器会放进 `rax:rdx`，与原生后端一致），两者都可以与普通 C 互操作
@@ -1043,7 +1043,7 @@ test 块、0 失败，每个文件一个镜像（`examples/boot/runtests.sh`）�
 arena 不够（给 calloc/free/realloc 就好）；`select` 要把 0/1/2 当永远就绪；
 多个 TU 一次编译会撞上 `c6_gc_new_lead` 的 NULL 标签名 strcmp（拆成 -c + 链接绕开）。
 
-"go 在裸机里是真并发吗" —— 现在能回答"是"，代价是自己写了个最小内核。
+"spawn 在裸机里是真并发吗" —— 现在能回答"是"，代价是自己写了个最小内核。
 `examples/boot/sched.plain.c`：8259A 重映射到 `0x20`、8254 每 10ms 一次、
 中断进来先换到调度器自己的栈（`istack`），把现场摆成一块 160 字节的
 `struct Frame`（15 个通用寄存器 + `rip/cs/rflags/rsp/ss`），换任务 = 换块
@@ -1108,7 +1108,7 @@ IDT，开中断等于三重故障。另外 `boot.S` 得把 LAPIC 那页（`0xFEE
 于是中断十有八九插在紧跟其后的 `ret` 上，这个偶发才显得那么"随机"。现在
 改成直接读硬件压下的 `rsp`，同一镜像连跑 40 次不再复现。
 
-遗留：`go` 的**句柄**
+遗留：`spawn` 的**句柄**
 （`h->join()`/`h->value()`）在裸机上还没打通：要走 `libtcc1` 的每线程块
 （`calloc`/`free` + pthread 键），实测任务收尾后三重故障 —— 调度这层本身
 没问题，`pthread_create` + `pthread_join` + 返回值用普通函数体任务测过。

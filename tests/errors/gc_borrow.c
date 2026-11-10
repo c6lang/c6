@@ -6,7 +6,7 @@
  * 三条规则：
  *   - 托管形参的槽由调用者（或任务的参数槽）拥有，被调者只是借用：给它赋值
  *     会把别人的引用减掉，直接释放一个还活着的对象（E-GC12）；
- *   - 'go' 起的是另一个线程，跨线程只能传 'shared @T'（E-GC10）；
+ *   - 'spawn' 起的是另一个线程，跨线程只能传 'shared @T'（E-GC10）；
  *   - 'async' 的引用参数/返回值会被拷进任务，同样必须 'shared'（E-GC10）。
  */
 #include <unistd.h>
@@ -15,7 +15,7 @@ struct Node { int v; };
 
 // EXPECT borrow_param: error: '@struct Node' is a borrow: it owns nothing, so it cannot be reassigned
 // EXPECT borrow_async_param: error: 'shared @struct Node' is a borrow: it owns nothing, so it cannot be reassigned
-// EXPECT go_plain: error: passing a reference to 'go' requires 'shared'
+// EXPECT spawn_plain: error: passing a reference to 'spawn' requires 'shared'
 // EXPECT async_plain: error: passing a reference to 'async' requires 'shared'
 // EXPECT async_ret_plain: error: an 'async' return value that carries a reference requires 'shared'
 // EXPECT shared_new_plain: error: a 'shared' slot needs an object with an atomic count
@@ -40,7 +40,7 @@ int main(void)
 {
     return 0;
 }
-#elif defined go_plain
+#elif defined spawn_plain
 void worker(@Node n)
 {
     (void)n;
@@ -48,7 +48,7 @@ void worker(@Node n)
 int main(void)
 {
     @Node p = new Node;
-    go worker(p);                  /* 跨线程要 shared */
+    spawn worker(p);               /* 跨线程要 shared */
     return 0;
 }
 #elif defined async_plain
@@ -106,7 +106,7 @@ int main(void)
             return 2;
         __c6_co_destroy(t);
     }
-    go worker(q);
+    spawn worker(q);
     {
         int i = 0;
         while (i < 20000 && __c6_gc_refcount(q) > 1) {

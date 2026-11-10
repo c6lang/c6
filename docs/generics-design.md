@@ -273,8 +273,8 @@ void f(Vect@int *v) {
 
 * 调用点的 `@` 省略规则只针对**方法调用**：接收者的类型已经把 `T` 写死了，
   形状上再写一遍是噪音（D9）。
-* 自由函数没有接收者，必须显式 `at@int(v, 0)`；这也是 `go`/`async`/函数指针
-  拿泛型函数的唯一写法（`go vat@int(v, 0)`）。
+* 自由函数没有接收者，必须显式 `at@int(v, 0)`；这也是 `spawn`/`async`/函数指针
+  拿泛型函数的唯一写法（`spawn vat@int(v, 0)`）。
 * 模板本体 `struct Vect` 上不注册任何方法：`Vect *p = NULL; p->vat(0);` 报 C103。
 
 ### 2.5 与既有特性的交互
@@ -288,7 +288,7 @@ void f(Vect@int *v) {
 |接口 `interface`|每个实例独立实现自己的 vtable（`c6_auto_impl_ensure` 按实例 tag 建表）；**不需要** `I<T>` 形态|
 |`foreach` 迭代器协议|`E next(T *self)` 里的 `E` 在实例化后是具体类型，C99「元素类型被擦除」自然不触发|
 |`@T` 托管引用/GC|实例是独立 struct → 每实例一份描述符、一次环检；`struct Node@T { @Node@T next; }` 是静态环 → C66，和普通结构体一致。`@Vect@int` 上是 `new`/`->` 照常（`new Vect@int` 现在也认得出模板名），方法调用时接收者那份拷贝按借用处理（不计数、不读未初始化的临时槽，见 [gc-design.md](gc-design.md) §16 H4）|
-|`go` / `async` / `task`|拿到的必须是具体函数：`go vat@int(v, 0)`；`\|T\|` 模板本身不能出现在 `go` 的操作数位置（C38 不变）|
+|`spawn` / `async` / `task`|拿到的必须是具体函数：`spawn vat@int(v, 0)`；`\|T\|` 模板本身不能出现在 `spawn` 的操作数位置（C38 不变）|
 |`defer` / `errdefer`|实例化体里照常展开，清理点数上限 C101 逐实例计算|
 |`flexible array`|`struct Vect@T { int len; T data[]; };` 合法（尾元素类型是形参）|
 |`-emit-header`|只输出实例：`struct Vect_int { int *data; int len; };` + `int Vect_int_at(struct Vect_int *, int);`|
@@ -342,7 +342,7 @@ void f(Vect@int *v) {
 |`\|T\| typedef Vect@T MyVec;`|泛型别名|
 |`enum E@T { A, B };`|C113|
 |`\|T\| void push(Vect@T *self, T x);`|函数模板（形参只出现在参数表里）|
-|`go vat(v, 0);`|C38 的既有诊断 + 提示 `go vat@int(v, 0)`|
+|`spawn vat(v, 0);`|C38 的既有诊断 + 提示 `spawn vat@int(v, 0)`|
 |`sizeof(Vect@T)` 在体内|C108（incomplete）|
 |`Vect@int` 在 `-emit-header` 输出里|`struct Vect_int { … };`，泛型信息不跨 TU|
 
@@ -484,7 +484,7 @@ void f(Vect@int *v) {
 |2|`struct_decl()` 的 `@` 形参解析（类型形参、形参符号栈）|✅|
 |3|`parse_btype()` 的模板名第三查（`sym_find` → `struct_find` → 模板）+ `@` 实参解析 + mangle|✅|
 |4|`skip_or_save_block` 捕获 + 重放实例化（`typedef` 绑形参 + `c6_decl_tokens`）|✅|
-|5|函数/typedef 模板的 `\|…\|` 前缀（方法要用它）|✅ `\|T\| T vat(Vect@T *, int)`、`\|K, V\|`、`\|T\| typedef …`；先声明后定义、`T!error`、`go`/`thread` 都可用|
+|5|函数/typedef 模板的 `\|…\|` 前缀（方法要用它）|✅ `\|T\| T vat(Vect@T *, int)`、`\|K, V\|`、`\|T\| typedef …`；先声明后定义、`T!error`、`spawn`/`thread` 都可用|
 |6|约束 C103–C116|✅ C103–C116 都有诊断 + 用例（C106 与 C104 同一条消息：多参数必须加括号）；C109 由普通类型检查给出（`cannot convert 'struct Vect_char' to 'struct Vect_int'`）|
 |7|方法：实例 tag 注册 + 接收者定类型调用|✅ 两种都行：接收者写具体实例（`int vect_sum(Vect@int *v)`），或 `\|T\|` 一份覆盖所有实例（`p->vat(0)` 按 `p` 的实例定 T）|
 
@@ -510,7 +510,7 @@ void f(Vect@int *v) {
 |---|---|
 |`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/值形参/函数体内定义模板/体内成员函数（隐式 `self`、先用后定义、mangled 符号互调、模板里嵌实例、方法体里第一次实例化别的模板、托管实例上的方法不掉计数、形参表 `(void)`/`()`/`void *p`），26 个 `test` 块|
 |`tests/tu/generic.c`|`tests/generic.c` 的第二个翻译单元：两个 TU 各自声明并实例化同一批模板，盯「泛型表按 TU 复位」（§5.4 那条多 TU 缺陷）|
-|`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块（起线程那块标了 `// BARE-SKIP`：裸机没有 pthread，`examples/boot/runtests.sh` 跑剩下 8 块）|
+|`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`spawn`/`thread`，9 个 `test` 块（起线程那块标了 `// BARE-SKIP`：裸机没有 pthread，`examples/boot/runtests.sh` 跑剩下 8 块）|
 |`tests/errors/generic.c`|C103–C116 的负例：裸模板名、实参个数、实参类型、重复/撞名形参、值形参、`\|…\|` 用法、实例名占用、实例互赋、非模板结构体里写方法、模板体里只写方法原型，加 `-Wgeneric-depth` 的深度告警，24 个片段|
 |`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，体内方法同一符号（`Vect_int_isum` 由纯 C 侧直接调），值形参实例 = `struct Buf_int_4`|
 |`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致（含体内方法：输出里就是普通 `Cnt_int_last()`）|
