@@ -7231,7 +7231,12 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
 
             c6_gen_self_tag = inst->tag;
             c6_gen_record_sym = 1;
+            /* a signature of its own: this instantiation may be nested
+               inside a member function body, whose 'self' (and the other
+               parameters) are on the stack with the same scope number */
+            local_scope = save_scope + 1;
             c6_decl_tokens(proto);      /* the signature, so a call works */
+            local_scope = save_scope;
             c6_gen_record_sym = save_rec;
             if (!c6_gen_last_sym)
                 tcc_error("cannot instantiate '%s'",
