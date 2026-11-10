@@ -7507,7 +7507,7 @@ static TokenString *c6_gen_meth_decl(C6GenMeth *m, C6GenInst *inst,
     TokenString *copy = 0, *proto = 0, *body = 0;
     int save_tok = tok, save_warn = tcc_state->warn_none;
     CValue save_val = tokc;
-    int inserted = 0, closed = 0, in_body = 0, empty = 0, after = 0;
+    int inserted = 0, closed = 0, in_body = 0, after = 0;
     int self = tok_alloc_const("self");
 
     *pbody = NULL;
@@ -7536,22 +7536,30 @@ static TokenString *c6_gen_meth_decl(C6GenMeth *m, C6GenInst *inst,
             tok_str_add(proto, '*');
             tok_str_add(proto, self);
             inserted = 1;
-            /* '(void)' loses the 'void', an empty list stays empty */
+            /* the receiver is the only parameter for '()' and '(void)';
+               'void *p' keeps its 'void' and is a parameter of its own */
             after = c6_gen_next_code();
             if (after == ')' || after == TOK_EOF) {
-                empty = 1;
+                tok_str_add(proto, ')');
+                if (after == TOK_EOF)
+                    break;
+                closed = 1;
             } else if (after == TOK_VOID) {
                 after = c6_gen_next_code();
-                if (after == ')' || after == TOK_EOF)
-                    empty = 1, after = ')';
-            }
-            if (!empty)
+                if (after == ')' || after == TOK_EOF) {
+                    tok_str_add(proto, ')');
+                    if (after == TOK_EOF)
+                        break;
+                    closed = 1;
+                } else {
+                    tok_str_add(proto, ',');
+                    tok_str_add(proto, TOK_VOID);
+                    tok_str_add_tok(proto);     /* the token after 'void' */
+                }
+            } else {
                 tok_str_add(proto, ',');
-            if (after == TOK_EOF)
-                break;
-            tok_str_add_tok(proto);
-            if (tok == ')')
-                closed = 1;
+                tok_str_add_tok(proto);         /* the first parameter */
+            }
         } else if (tok == ')' && inserted) {
             closed = 1;
         }

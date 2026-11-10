@@ -260,6 +260,9 @@ void f(Vect@int *v) {
   统一留到翻译单元末尾（和 `|T|` 模板的函数体同一队列），所以互相调用、递归都行。
 * `!error`、值形参 `N`、模板里再嵌实例照常可用：
   `T!error peek(int i) { return data[i]; }`、`int cap(void) { return N; }`。
+* 形参表按 C 的习惯写：`(void)` 和 `()` 都表示「只有接收者」，
+  `void *p` 这种以 `void` 开头的形参不会被当成 `(void)`（收接收者 + 保住
+  那个 `void`）。`const int a`、多形参、`(void *p, int n)` 都照常。
 * 原型（只有名字没有体）在模板体里是错误：报「a member function needs a body」，
   因为这个体没有第二种写法可以补上（模板体只解析一次）。
 * 非模板的结构体里写方法定义也是错误（`a function cannot be defined inside a
@@ -399,6 +402,7 @@ void f(Vect@int *v) {
 |模板在形参表/块里第一次应用|实例 tag 和方法符号标记为粘性，`sym_pop()` 不摘名字、不回收，`keep == 0` 时挂回全局栈；体内方法的原型还会在下一个 `decl()` 处补写一次（`c6_gen_sig_flush()`）|
 |体内方法体与函数体的顺序|一个函数不能在另一个函数里生成：体统一进队列，`c6_gen_flush()` 在单元末尾写；先发全部原型所以互相调用、递归都不受影响|
 |托管实例上的方法调用|接收者 `@Vect@int` 拷进调用临时槽时是借用（`C6_GCM_INIT \| C6_GCM_FRESH`），否则会读未初始化的栈去释放旧值；`tests/generic.c` 与 `tests/gc.c` 各有断言|
+|方法体里第一次实例化另一个模板|**已知限制**：`int f(int k) { Inner@int in = {k}; return in.get(); }` 现在报 `field not found: get`（早期版本还会先撞 `redeclaration of 'self'` 并崩），因为嵌套实例化的方法原型复用外层方法体正在用的作用域（`c6_gen_instance` 期间强制 `c6_sym_global = 1`、`local_scope = 0`）。绕法：把这个实例的类型写在模板体外面（模板声明处、文件作用域、或先 `typedef Inner@int InnerInt;`）再在方法体里用；`tests/generic.c` 的「体内方法里的实例再实例」就是这种写法。根治要么给嵌套原型单独的作用域，要么让方法注册在函数体解析期间不被 `sym_pop` 摘掉|
 |体内方法体被当成函数字面量声明|`block()` 的 `c6_lit_decl_lead()` 探针会吃掉 `NAME = …`：命中本实例的字段/方法名时不探（`c6_gen_self_name()`），否则 `len = 3;` 会被探针重放坏掉|
 
 ---
