@@ -6537,6 +6537,447 @@ static int in_range(long long n, int t)
     return n >= -(long long)m - 1 && n <= (long long)m;
 }
 
+/* ------------------------------------------------------------------ */
+/* generics: 'struct Vect@T { ... };' and 'Vect@int'                   */
+/*                                                                     */
+/* A template is a name, a parameter list and a body saved as tokens.   */
+/* It is *not* a type: nothing is laid out where it is written.  A use  */
+/* site mangles an instance name ('Vect_int'), binds each parameter as  */
+/* an ordinary typedef and replays the body through the normal struct   */
+/* parser, so layout, methods, interfaces, slices, tuples and every     */
+/* back end keep working on a plain struct.                             */
+/*                                                                     */
+/* The parameter list must precede every use of a parameter, which is   */
+/* why a template whose name comes after its body or its return type    */
+/* ('|T| T vat(Vect@T *v)') needs the '|...|' prefix; that form is not  */
+/* implemented yet, so only the tag-attached form exists.               */
+typedef struct C6Gen {
+    struct C6Gen *next;
+    int name;               /* template name, as written */
+    int nparams;
+    int *ptok;              /* parameter names */
+    TokenString *body;      /* '{' ... '}' tokens; NULL: only declared */
+    Sym *nominal;           /* hidden incomplete tag of the template itself */
+    int is_union;
+    int instantiating;      /* 1 while its body is being replayed */
+} C6Gen;
+
+typedef struct C6GenInst {
+    struct C6GenInst *next;
+    int tag;                /* the mangled tag token, e.g. 'Vect_int' */
+    CType type;             /* 'struct Vect_int' */
+} C6GenInst;
+
+static C6Gen *c6_gens = 0;
+static C6GenInst *c6_gen_insts = 0;
+static int c6_nb_gen_insts = 0;
+static int c6_gen_depth = 0;
+/* 1 while an unparenthesized type argument is parsed: 'Vect@int[:]' is a
+   slice *of* the instance, so the argument must stop before '[' */
+static int c6_gen_arg_only = 0;
+
+#define C6_GEN_MAX_INST  1024
+#define C6_GEN_MAX_DEPTH 64
+#define C6_GEN_MAX_PARAM 16
+
+static void c6_gen_reset(void)
+{
+    C6Gen *g = 0;
+    C6GenInst *i = 0;
+
+    while ((g = c6_gens) != NULL) {
+        c6_gens = g->next;
+        if (g->body)
+            tok_str_free(g->body);
+        tcc_free(g->ptok);
+        tcc_free(g);
+    }
+    while ((i = c6_gen_insts) != NULL) {
+        c6_gen_insts = i->next;
+        tcc_free(i);
+    }
+    c6_nb_gen_insts = 0;
+    c6_gen_depth = 0;
+}
+
+static C6Gen *c6_gen_find(int v)
+{
+    C6Gen *g = 0;
+
+    for (g = c6_gens; g; g = g->next)
+        if (g->name == v)
+            return g;
+    return 0;
+}
+
+/* the identifier-safe spelling of TYPE, used to name an instance */
+static void c6_gen_frag(char *out, int outsz, CType *type)
+{
+    char core[1024] = {0};
+    int bt = type->t & VT_BTYPE;
+    Sym *s = type->ref;
+    C6Slice *sl = c6_slice_of_type(type);
+    C6Tuple *tu = c6_tuple_of_type(type);
+
+    if (c6_is_managed(type)) {
+        /* '@T' is a pointer with the managed qualifier: keep it distinct
+           from a plain 'T *' so that 'Vect@(@Node)' and 'Vect@(Node *)' do
+           not share an instance */
+        char one[512] = {0};
+        c6_gen_frag(one, sizeof one, &s->type);
+        snprintf(core, sizeof core, "m_%s", one);
+    } else if (sl) {
+        char one[512] = {0};
+        c6_gen_frag(one, sizeof one, &sl->elem);
+        snprintf(core, sizeof core, "slice_%s", one);
+    } else if (tu) {
+        int i = 0;
+        pstrcpy(core, sizeof core, "tuple");
+        for (i = 0; i < tu->n; i++) {
+            char one[512] = {0};
+            c6_gen_frag(one, sizeof one, &tu->elem[i]);
+            snprintf(core + strlen(core), sizeof core - strlen(core),
+                     "_%s", one);
+        }
+    } else {
+        switch (bt) {
+        case VT_VOID:
+            pstrcpy(core, sizeof core, "void");
+            break;
+        case VT_BYTE:
+            pstrcpy(core, sizeof core,
+                    (type->t & VT_UNSIGNED) ? "uchar" : "char");
+            break;
+        case VT_BOOL:
+            pstrcpy(core, sizeof core, "bool");
+            break;
+        case VT_SHORT:
+            pstrcpy(core, sizeof core,
+                    (type->t & VT_UNSIGNED) ? "ushort" : "short");
+            break;
+        case VT_INT:
+            if (type->t & VT_LONG)
+                pstrcpy(core, sizeof core,
+                        (type->t & VT_UNSIGNED) ? "ulong" : "long");
+            else
+                pstrcpy(core, sizeof core,
+                        (type->t & VT_UNSIGNED) ? "uint" : "int");
+            break;
+        case VT_LLONG:
+            pstrcpy(core, sizeof core,
+                    (type->t & VT_UNSIGNED) ? "ullong" : "llong");
+            break;
+        case VT_FLOAT:
+            pstrcpy(core, sizeof core, "float");
+            break;
+        case VT_DOUBLE:
+            pstrcpy(core, sizeof core, "double");
+            break;
+        case VT_LDOUBLE:
+            pstrcpy(core, sizeof core, "ldouble");
+            break;
+        case VT_PTR: {
+            char one[512] = {0};
+            c6_gen_frag(one, sizeof one, &s->type);
+            snprintf(core, sizeof core, "%s_p", one);
+            break;
+        }
+        case VT_ARRAY: {
+            char one[512] = {0};
+            c6_gen_frag(one, sizeof one, &s->type);
+            snprintf(core, sizeof core, "%s_a%d", one, s->c);
+            break;
+        }
+        case VT_FUNC:
+            pstrcpy(core, sizeof core, "fn");
+            break;
+        case VT_STRUCT:
+        case VT_UNION:
+            if (s && (s->v & ~SYM_STRUCT) < SYM_FIRST_ANOM)
+                pstrcpy(core, sizeof core,
+                        get_tok_str(s->v & ~SYM_STRUCT, NULL));
+            else
+                pstrcpy(core, sizeof core, "anon");
+            break;
+        default:
+            snprintf(core, sizeof core, "t%d", bt);
+            break;
+        }
+    }
+    if ((type->t & VT_CONSTANT) && !(type->t & VT_ARRAY))
+        snprintf(out, outsz, "c_%s", core);
+    else if ((type->t & VT_VOLATILE) && !(type->t & VT_ARRAY))
+        snprintf(out, outsz, "v_%s", core);
+    else
+        pstrcpy(out, outsz, core);
+}
+
+static void c6_gen_mangle(C6Gen *g, CType *args, int nargs,
+                          char *out, int outsz)
+{
+    char buf[4096] = {0};
+    int i = 0;
+
+    pstrcpy(buf, sizeof buf, get_tok_str(g->name, NULL));
+    for (i = 0; i < nargs; i++) {
+        char one[1024] = {0};
+        c6_gen_frag(one, sizeof one, &args[i]);
+        snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "_%s", one);
+    }
+    pstrcpy(out, outsz, buf);
+}
+
+/* the hidden tag of the template itself: 'struct Vect' for 'Vect@T'.  It is
+   never linked into the tag namespace (a template name is not a type) and
+   stays incomplete: only '&template' shapes reach it. */
+static Sym *c6_gen_nominal(C6Gen *g)
+{
+    if (!g->nominal) {
+        g->nominal = sym_push2(&global_stack, g->name | SYM_STRUCT, 0, -1);
+        g->nominal->type.t = g->is_union ? VT_UNION : VT_STRUCT;
+        g->nominal->type.ref = NULL;
+        g->nominal->r = 0;
+    }
+    return g->nominal;
+}
+
+/* build (or find) the instance 'TEMPLATE@ARGS' and lay it out */
+static CType c6_gen_instance(C6Gen *g, CType *args, int nargs)
+{
+    CType it = {0};
+    C6GenInst *inst = 0;
+    Sym *tag = 0;
+    Sym **bound = 0;
+    char name[4096] = {0};
+    int i = 0, save_global = 0, save_scope = 0;
+
+    if (nargs != g->nparams) {
+        char sig[512] = {0};
+        int off = 0;
+        for (i = 0; i < g->nparams && off < (int)sizeof sig - 8; i++)
+            off += snprintf(sig + off, sizeof sig - off, "%s%s",
+                            i ? ", " : "", get_tok_str(g->ptok[i], NULL));
+        tcc_error("'%s' needs %d type argument%s (got %d): write '%s@%s%s%s'",
+                  get_tok_str(g->name, NULL), g->nparams,
+                  g->nparams == 1 ? "" : "s", nargs,
+                  get_tok_str(g->name, NULL),
+                  g->nparams > 1 ? "(" : "", sig,
+                  g->nparams > 1 ? ")" : "");
+    }
+    c6_gen_mangle(g, args, nargs, name, sizeof name);
+    for (inst = c6_gen_insts; inst; inst = inst->next)
+        if (!strcmp(get_tok_str(inst->tag, NULL), name))
+            return inst->type;      /* includes the in-progress instance */
+    if (!g->body)
+        tcc_error("instantiation of undefined template '%s'",
+                  get_tok_str(g->name, NULL));
+    if (g->instantiating)
+        tcc_error("cannot instantiate '%s' inside its own definition",
+                  get_tok_str(g->name, NULL));
+    if (c6_nb_gen_insts >= C6_GEN_MAX_INST)
+        tcc_error("too many generic instantiations in one translation unit "
+                  "(max %d)", C6_GEN_MAX_INST);
+
+    inst = tcc_mallocz(sizeof *inst);
+    inst->tag = tok_alloc_const(name);
+    inst->next = c6_gen_insts, c6_gen_insts = inst;
+    c6_nb_gen_insts++;
+
+    /* the layout is a file scope type, wherever the use site happens to be */
+    save_global = c6_sym_global;
+    save_scope = local_scope;
+    c6_sym_global = 1;
+    local_scope = 0;
+
+    /* the tag must exist (incomplete) before the body is parsed: a template
+       that mentions itself through its own parameters finds this instance */
+    it.t = g->is_union ? VT_UNION : VT_STRUCT;
+    it.ref = NULL;
+    tag = sym_push(inst->tag | SYM_STRUCT, &it, 0, -1);
+    tag->r = 0;
+    inst->type.t = it.t;
+    inst->type.ref = tag;
+
+    /* a parameter is an ordinary typedef while the body is replayed */
+    bound = tcc_malloc(nargs * sizeof *bound);
+    for (i = 0; i < nargs; i++) {
+        CType pt = args[i];
+        Sym *ps = 0;
+        pt.t &= ~(VT_STORAGE | VT_EXTERN | VT_STATIC);
+        pt.t |= VT_TYPEDEF;
+        ps = sym_push2(&global_stack, g->ptok[i], 0, 0);
+        ps->type = pt;
+        ps->r = 0;
+        sym_link(ps, 1);
+        bound[i] = ps;
+    }
+
+    if (++c6_gen_depth > C6_GEN_MAX_DEPTH)
+        tcc_error("generic instantiation nested too deeply (max %d)",
+                  C6_GEN_MAX_DEPTH);
+    g->instantiating = 1;
+    {
+        TokenString *ts = tok_str_alloc();
+        tok_str_add(ts, g->is_union ? TOK_UNION : TOK_STRUCT);
+        tok_str_add(ts, inst->tag);
+        /* the saved body is a whole token stream, value words included */
+        for (i = 0; i < g->body->len - 1; i++)
+            tok_str_add(ts, g->body->str[i]);
+        tok_str_add(ts, ';');
+        tok_str_add(ts, TOK_EOF);
+        c6_decl_tokens(ts);
+    }
+    g->instantiating = 0;
+    c6_gen_depth--;
+
+    for (i = nargs - 1; i >= 0; i--)
+        sym_link(bound[i], 0);
+    tcc_free(bound);
+    c6_sym_global = save_global;
+    local_scope = save_scope;
+
+    inst->type.ref = tag;           /* struct_decl filled the same Sym in */
+    return inst->type;
+}
+
+/* one type argument: a type specifier on its own, or (inside the
+   parentheses of a multi argument list) a full abstract declarator */
+static CType c6_gen_argument(int grouped)
+{
+    CType a = {0};
+    AttributeDef ad = {0};
+    int v = 0;
+
+    memset(&ad, 0, sizeof ad);
+    if (!grouped)
+        c6_gen_arg_only++;
+    if (!parse_btype(&a, &ad, 0))
+        tcc_error("a type argument is expected");
+    if (grouped) {
+        type_decl(&a, &ad, &v, TYPE_ABSTRACT | TYPE_DIRECT);
+        if (v)
+            tcc_error("a type argument cannot declare '%s'",
+                      get_tok_str(v, NULL));
+    } else {
+        c6_gen_arg_only--;
+    }
+    a.t &= ~(VT_STORAGE | VT_EXTERN | VT_STATIC);
+    return a;
+}
+
+/* 'Name@int' / 'Name@(K, V)': parse the arguments and build the instance */
+static int c6_gen_btype(CType *type)
+{
+    C6Gen *g = 0;
+    CType args[C6_GEN_MAX_PARAM] = {{0}};
+    int nargs = 0, name = tok;
+
+    g = c6_gen_find(name);
+    if (!g)
+        return 0;
+    next();
+    if (tok != '@')
+        tcc_error("'%s' is generic: write '%s@%s'",
+                  get_tok_str(name, NULL), get_tok_str(name, NULL),
+                  g->nparams ? get_tok_str(g->ptok[0], NULL) : "...");
+    next();                             /* skip '@' */
+    if (tok == '(') {
+        next();
+        if (tok != ')')
+            for (;;) {
+                if (nargs >= C6_GEN_MAX_PARAM)
+                    tcc_error("too many type arguments");
+                args[nargs++] = c6_gen_argument(1);
+                if (tok != ',')
+                    break;
+                next();
+            }
+        skip(')');
+    } else {
+        if (nargs >= C6_GEN_MAX_PARAM)
+            tcc_error("too many type arguments");
+        args[nargs++] = c6_gen_argument(0);
+    }
+    *type = c6_gen_instance(g, args, nargs);
+    return 1;
+}
+
+/* 'struct NAME@T;' / 'struct NAME@(K, V) { ... };' -- 'tok' is the '@' */
+/* 'struct Vect@int v;' is the one spelling the design rejects (C114):
+   'struct' cannot be followed by a template argument list */
+static const char *c6_gen_drop_struct =
+    "an instance drops 'struct': write '%s@...' (or, for a value parameter, "
+    "note that value parameters are not implemented yet)";
+
+static void c6_gen_declare(int name, int is_union)
+{
+    C6Gen *g = c6_gen_find(name);
+    int *ptok = 0, nparams = 0, i = 0;
+    TokenString *body = NULL;
+
+    next();                             /* skip '@' */
+    ptok = tcc_malloc(C6_GEN_MAX_PARAM * sizeof *ptok);
+    if (tok == '(') {
+        next();
+        if (tok != ')')
+            for (;;) {
+                if (tok < TOK_UIDENT)   /* 'int N': a value parameter */
+                    tcc_error("value parameters are not implemented yet");
+                if (nparams >= C6_GEN_MAX_PARAM)
+                    tcc_error("too many type parameters");
+                ptok[nparams++] = tok;
+                next();
+                if (tok >= TOK_UIDENT)  /* 'T name': a value parameter */
+                    tcc_error("value parameters are not implemented yet");
+                if (tok != ',')
+                    break;
+                next();
+            }
+        skip(')');
+    } else {
+        if (tok < TOK_UIDENT)
+            tcc_error(c6_gen_drop_struct, get_tok_str(name, NULL));
+        if (nparams >= C6_GEN_MAX_PARAM)
+            tcc_error("too many type parameters");
+        ptok[nparams++] = tok;
+        next();
+        if (tok >= TOK_UIDENT)
+            tcc_error("value parameters are not implemented yet");
+    }
+    if (tok == '{')
+        skip_or_save_block(&body);
+    else if (tok != ';')
+        expect("'{'");
+
+    if (g) {
+        if (g->is_union != is_union)
+            tcc_error("redefinition of template '%s' as a different kind",
+                      get_tok_str(name, NULL));
+        if (g->body && body)
+            tcc_error("redefinition of template '%s'",
+                      get_tok_str(name, NULL));
+        if (g->nparams != nparams)
+            tcc_error("redefinition of template '%s' with a different "
+                      "parameter list", get_tok_str(name, NULL));
+        if (body && !g->body) {
+            for (i = 0; i < nparams; i++)
+                g->ptok[i] = ptok[i];   /* names of the definition win */
+            g->body = body;
+        }
+        tcc_free(ptok);
+        if (body && body != g->body)
+            tok_str_free(body);
+        return;
+    }
+    g = tcc_mallocz(sizeof *g);
+    g->name = name;
+    g->nparams = nparams;
+    g->ptok = ptok;
+    g->body = body;
+    g->is_union = is_union;
+    g->next = c6_gens, c6_gens = g;
+}
+
 /* enum/struct/union declaration. u is VT_ENUM/VT_STRUCT/VT_UNION */
 static void struct_decl(CType *type, int u)
 {
@@ -6567,6 +7008,22 @@ static void struct_decl(CType *type, int u)
         }
 #endif
     }
+
+#ifdef C6_EXT
+    /* 'struct Vect@T { ... }': a template declaration, not a type.  The
+       parameters and the body are recorded; the declaration itself names
+       the hidden, forever incomplete tag of the template. */
+    if (tcc_state->c6_ext && v && tok == '@') {
+        C6Gen *g = 0;
+        if (u == VT_ENUM)
+            tcc_error("enums cannot have type parameters");
+        c6_gen_declare(v, u == VT_UNION);
+        g = c6_gen_find(v);
+        type->t = u;
+        type->ref = c6_gen_nominal(g);
+        return;
+    }
+#endif
 
 #ifdef C6_EXT
     c6_is_def = (tok == '{' || tok == ';');
@@ -7241,7 +7698,7 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
                is not valid C (array declarators come after the declarator
                name), so only '[:]' is claimed here; anything else, e.g.
                'int [3] a;', is handed back to the original code. */
-            if (tcc_state->c6_ext && typespec_found) {
+            if (tcc_state->c6_ext && typespec_found && !c6_gen_arg_only) {
                 CType elem = {0}, st = {0};
                 int storage = 0;
                 next();                 /* skip '[' */
@@ -7471,6 +7928,15 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
                     type1.t = tag->type.t;
                     type1.ref = tag;
                     goto basic_type2;
+                }
+#endif
+#ifdef C6_EXT
+                /* a generic name is a type only with its arguments:
+                   'Vect@int' builds the instance, a bare 'Vect' is the
+                   error C103 asks for */
+                if (tcc_state->c6_ext && c6_gen_find(tok)) {
+                    if (c6_gen_btype(&type1))
+                        goto basic_type2;
                 }
 #endif
                 goto the_end;
@@ -13224,6 +13690,9 @@ static void c6_tu_reset(void)
     c6_tuples = NULL;
     c6_tuple_seq = 0;
     c6_tuple_tmp_seq = 0;
+    /* the generic templates and their instances: the Sym pointers inside
+       die with the symbol pools, so drop the descriptors too */
+    c6_gen_reset();
     while (c6_closures) {
         C6Closure *cl = c6_closures;
         c6_closures = cl->next;

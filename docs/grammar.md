@@ -686,7 +686,7 @@ closure-type           = "closure" , type-specifier , [ "!error" ] ,
 C90–C98 与实施阶段见 [closure-design.md](closure-design.md) 和
 [closure-todo.md](closure-todo.md)；在 V2 落地前，编译器仍按 V1 报 C80。
 
-### 3.10 泛型（设计定稿，未实现）
+### 3.10 泛型（阶段 1 已落地）
 
 类型应用是 `@` 后缀：`Vect@int`、`Map@(char[:], int)`、`Buf@(int, 4)`。
 形参表在 tag 定义处挂名（名字先于体），在函数/typedef 处用 `|…|` 前缀
@@ -708,9 +708,20 @@ int x = p->vat(0);              /* 接收者定类型：Vect_int_at */
 之后）是类型应用，所以 `@Vect@int` 仍是「指向 `Vect@int` 的托管引用」。
 尖括号不是泛型写法：`<` 在表达式里是合法运算符，单趟无 AST 无从消歧。
 
+**已落地**：`struct Vect@T { … }` / `struct Map@(K, V) { … }` 模板声明，
+`Vect@int` / `Map@(char[:], int)` 应用，嵌套（`Vect@Vect@int`）与自引用
+（`Node@T` 里的 `Node@T *next`），`typedef` 别名，实例上的方法与切片后缀
+（`Vect@int[:]` 是「实例的切片」）。实例 mangle 成 `Vect_int`，所以它就是一个
+普通 struct：方法符号 `Vect_int_<name>`，纯 C 的 TU 写出 `struct Vect_int`
+即可互通。
+
+**未落地**：`|…|` 前缀（所以函数模板、以及「一份方法覆盖所有实例」还写不了，
+方法要对具体实例写：`int vect_sum(Vect@int *v)`），值形参
+（`Buf@(T, int N)`，现在报 `value parameters are not implemented yet`），
+`-emit-header` 的实例输出。裸模板名是 C103 诊断，不是类型。
+
 完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
-[generics-design.md](generics-design.md)；落地前编译器对 `Vect@int` 报普通
-C 诊断，`struct Vect@T` 报 `'{' expected` 一类错误。
+[generics-design.md](generics-design.md)。
 
 ---
 
@@ -1102,9 +1113,22 @@ parameter-list    = identifier , { "," , identifier } ;
 | C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it'` |
 | C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
 | C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发），第 9 层报错 | `'defer' bodies nested too deeply` |
+| C103 | 裸模板名不是类型：模板名只能出现在 `@` 实参表前面 | `'%s' is generic: write '%s@%s'` |
+| C104 | 实参个数必须等于形参个数，多形参要用括号 | `'%s' needs %d type argument%s (got %d): write '%s@(A, B)'` |
+| C105 | 实参必须是类型；实参里不能写声明符名字 | `a type argument is expected`；`a type argument cannot declare '%s'` |
+| C107 | 模板体内不能实例化自己（唯一会自噬的递归源） | `cannot instantiate '%s' inside its own definition` |
+| C108 | 实例化点必须在模板定义之后，前向声明的模板不能直接实例化 | `instantiation of undefined template '%s'` |
+| C110 | 值形参（`Buf@(T, int N)`）尚未实现 | `value parameters are not implemented yet` |
+| C111 | 每个 TU 最多 1024 个实例 | `too many generic instantiations in one translation unit (max 1024)` |
+| C112 | 实例化嵌套最多 64 层 | `generic instantiation nested too deeply (max 64)` |
+| C113 | `enum` 不能带形参 | `enums cannot have type parameters` |
+| C114 | 实例名前面不能写 `struct`：`struct Vect@int v;` 不是实例 | `an instance drops 'struct': write '%s@...'` |
+| C115 | 模板不能重定义，参数表也不能改；`struct`/`union` 不能混用 | `redefinition of template '%s'`；`redefinition of template '%s' with a different parameter list`；`redefinition of template '%s' as a different kind` |
+| C116 | 形参最多 16 个（括号里或单个） | `too many type parameters`；`too many type arguments` |
 
 （C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包；
-C103–C116 留给 [generics-design.md](generics-design.md) 的泛型，均尚未实现。）
+C106/C109 以及泛型里与 `\|…\|` 前缀、值形参相关的部分仍未实现，
+见 [generics-design.md](generics-design.md) §9。）
 
 ---
 
@@ -1955,7 +1979,8 @@ int main(void)
 | `has()` 返回非整数 / `next()` 返回数组、`void`、不完整类型 | 约束 C99/C49 |
 | `has()`/`next()` 带多余形参 | 约束 C99：两个方法只接收 receiver |
 | `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
-| 泛型 `Vect@int` / `struct Vect@T` / `\|T\| T vat(Vect@T *)` | 未实现：语法已定稿，见 [generics-design.md](generics-design.md) 与 §3.10；容器迭代请用 `foreach` |
+| 泛型 `Vect@int` / `struct Vect@T` | 已落地（阶段 1）：见 §3.10 与 [generics-design.md](generics-design.md)；容器迭代仍建议 `foreach` |
+| 泛型 `\|T\| T vat(Vect@T *)` / `Buf@(T, 4)`（`\|…\|` 前缀、值形参） | 未实现：见 [generics-design.md](generics-design.md) §9 阶段 1–2 |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
 | `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
 | `t = {1, 2}` / `f({1, 2})`（元组字面量糖） | 不支持：显式写复合字面量 `(int, int){1, 2}` |
