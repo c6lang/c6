@@ -9,9 +9,11 @@
 #   make test-all    selftest + tests2 全量
 #   make c99         C99 输出后端已内置在 tcc/tcc（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
+#   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
 #   make c6selfcheck tcc 自己的源码用 -std=c6 编译（初始化规则 + C99 后端）
 #   make selfhost    用 c6 模式的 tcc 自举自己（stage1 -> stage2，比对目标文件）
 #   make c99selfhost 用 C99 后端自举自己（生成 C -> gcc -> stage2 -> stage3）
+#   make c99selfhost-tcc 同上，但生成 C 之后由 tcc 自己编译（整条链不需要 gcc）
 #   make clean       清理 tcc/ 的构建产物和自举产物
 #   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
 #
@@ -28,6 +30,7 @@ MODE     := $(TCC_DIR)/.c6-mode
 SELFHOST     := build/selfhost
 SELFHOST_C6  := $(SELFHOST)/c6
 SELFHOST_C99 := $(SELFHOST)/c99
+SELFHOST_C99TCC := $(SELFHOST)/c99tcc
 # 自举时编译 tcc 自己用的定义：ONE_SOURCE 把整个编译器塞进一个编译单元，
 # C6_EXT 打开 c6 扩展（与 make build 的 EXTRA-DEFS 一致）
 SELFHOST_DEFS := -DONE_SOURCE=1 -DC6_EXT
@@ -39,7 +42,7 @@ HOSTCC   ?= gcc
 
 .PHONY: all bootstrap build build-plain test test-plain test-all selftest \
         clean distclean help check-tcc mode-ext mode-plain c99 c99test \
-        c6selfcheck selfhost c99selfhost
+        c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc
 
 all: build
 
@@ -180,6 +183,13 @@ c99: build
 c99test: build
 	BACKEND=c99 ./$(SELFTEST)
 
+# 与 c99test 完全同一批用例，只是编译生成代码的宿主编译器换成 tcc 自己：
+# 生成的文件必须能被 tcc 编过（没有 GNU 的 alias 属性，方法名靠生成文件里
+# 的转发函数导出，va_list 助手用私有名字，见 tcc/c99-gen.c）。
+c99tcc-test: build
+	BACKEND=c99 C99CC=$(CURDIR)/$(TCC_DIR)/tcc \
+	    C99FLAGS="-B $(CURDIR)/$(TCC_DIR) -std=c99 -w" ./$(SELFTEST)
+
 # c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿
 # -std=c6 编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99
 # 后端的翻译路径）；编出来的编译器还要能跑。
@@ -247,6 +257,26 @@ c99selfhost: build
 	@$(SELFHOST_C99)/hello
 	@echo "c99 自举完成：$(SELFHOST_C99)/tcc-stage3"
 
+# 自举（C99 后端，宿主也是 tcc）：整条链不碰 gcc —— tcc 把 tcc.c 翻成 C，
+# 再亲手把这份 C 编成 stage2；stage2 重编 tcc.c 得到的目标文件必须和 tcc
+# 自己编出来的逐字节相同（生成的文件只有按 tcc 的 C 方言也能编，才走得通：
+# 没有 GNU 的 alias 属性 / 内建 __va_arg 这些差别都在 c99-gen.c 里绕开了）。
+c99selfhost-tcc: build
+	@mkdir -p $(SELFHOST_C99TCC)
+	@echo "c99+tcc 自举 1/4：tcc 的 C99 后端把 tcc.c 翻成 C"
+	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c99 -o $(SELFHOST_C99TCC)/tcc-c99.c $(TCC_DIR)/tcc.c
+	@echo "c99+tcc 自举 2/4：同一个 tcc 编译生成的 C，得到 stage2 编译器"
+	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C99TCC)/tcc-stage2 $(SELFHOST_C99TCC)/tcc-c99.c $(SELFHOST_LIBS)
+	@echo "c99+tcc 自举 3/4：stage2 编一遍 tcc.c，tcc 自己也编一遍"
+	$(SELFHOST_C99TCC)/tcc-stage2 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C99TCC)/stage3.o
+	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C99TCC)/native.o
+	@echo "c99+tcc 自举 4/4：比较两个目标文件"
+	@cmp $(SELFHOST_C99TCC)/native.o $(SELFHOST_C99TCC)/stage3.o && echo "  逐字节相同"
+	@printf '%s\n' '#include <stdio.h>' 'int main(void)' '{' '    printf("hello from the tcc-hosted c99 self-hosted tcc\n");' '    return 0;' '}' > $(SELFHOST_C99TCC)/hello.c
+	$(SELFHOST_C99TCC)/tcc-stage2 -B $(TCC_DIR) $(SELFHOST_C99TCC)/hello.c -o $(SELFHOST_C99TCC)/hello
+	@$(SELFHOST_C99TCC)/hello
+	@echo "c99+tcc 自举完成：$(SELFHOST_C99TCC)/tcc-stage2"
+
 clean:
 	rm -rf $(SELFHOST)
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true
@@ -255,4 +285,4 @@ distclean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) distclean || true
 
 help:
-	@sed -n '2,16p' Makefile
+	@sed -n '2,18p' Makefile

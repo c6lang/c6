@@ -14,6 +14,9 @@
 #             两种模式跑完全相同的测试文件和断言。
 #   C99TCC    产出 C 源码的编译器（默认 <仓库>/tcc/tcc）
 #   C99CC     编译生成代码的系统 C 编译器（默认 gcc）
+#   C99FLAGS  交给 C99CC 的参数（默认 ISO C99 + 严格告警）；把 C99CC 换成
+#             tcc 时用它去掉 gcc 专有的开关，例如 "-B <仓库>/tcc -std=c99 -w"
+#             （见 make c99tcc-test）
 #
 # 测试分组：
 #   tests/*.c         用 -test 跑里面的 test 块；若存在同名的 tests/tu/<name>.c，
@@ -43,7 +46,7 @@ BASE="-B $ROOT/tcc -std=c6"
 BACKEND=${BACKEND:-native}
 C99TCC=${C99TCC:-$ROOT/tcc/tcc}
 C99CC=${C99CC:-gcc}
-C99FLAGS="-std=c99 -pedantic -Wall -Wextra -Werror -pthread"
+C99FLAGS=${C99FLAGS:-"-std=c99 -pedantic -Wall -Wextra -Werror -pthread"}
 
 case $BACKEND in
 native) ;;
