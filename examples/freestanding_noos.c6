@@ -18,7 +18,7 @@
  *     - 没有 calloc  -> 用 libtcc1 里的静态 arena（.bss，默认 256 KB，
  *                       编译 libtcc1 时 -DC6_HEAP_SIZE=... 可调）；
  *     - 没有 select  -> 只有 async / c6_io 会用到它，别的照常；
- *     - 没有 pthread -> 单线程，一个静态的状态块，go / thread 报启动失败；
+ *     - 没有 pthread -> 单线程，一个静态的状态块，spawn / thread 报启动失败；
  *     - memcpy / memset / memmove 由 libtcc1 自带的 weak 定义顶上。
  *
  * 真裸机上还需要的只有“程序自己要做的事”：把 f".." 的结果送到串口/LCD（那就是

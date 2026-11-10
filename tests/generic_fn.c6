@@ -10,7 +10,7 @@
  * 模板本身既不是函数也不是类型：`vat(0)` 报 C103（要写 `vat@int`，或者让
  * 接收者说出 T：`p->vat(0)` 里 `p` 已经是 `Vect@int`）。实例化会把签名当
  * 普通声明重放一遍（形参绑成普通 typedef），函数体排队到编译单元末尾再当
- * 普通函数编译——所以函数指针、`go`/`thread`、`-emit-header` 看到的都是
+ * 普通函数编译——所以函数指针、`spawn`/`thread`、`-emit-header` 看到的都是
  * 普通函数 `Vect_int_vat`。
  *
  * 运行（仓库根目录）：
@@ -163,15 +163,15 @@ test "切片可以作形参" {
     if (nel@char(csl) != 2)
         err(2, "char 切片实参不对");
 }
-/* 裸机上没有 pthread：`go` 起不了线程，`h->join()` 走 libtcc1 的每线程块，
+/* 裸机上没有 pthread：`spawn` 起不了线程，`h->join()` 走 libtcc1 的每线程块，
  * 任务收尾会三重故障（见 README「把 tests/ 也搬上裸机」），所以这一块不进
  * 裸机那张表，同一个文件里其它块照跑。 */
 // BARE-SKIP
 test "实例是普通函数：可以起线程" {
     int d[3] = {4, 5, 6};
     Vect@int v = {d, 3};
-    thread h = go vsum@int(&v);
-    thread h2 = go vat@int(&v, 2);
+    thread h = spawn vsum@int(&v);
+    thread h2 = spawn vat@int(&v, 2);
 
     if (h->join() != 0)
         err(1, "join 失败");

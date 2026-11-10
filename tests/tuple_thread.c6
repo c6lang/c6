@@ -1,6 +1,6 @@
-/* c6 自测：元组 + go（OS 线程）
+/* c6 自测：元组 + spawn（OS 线程）
  *
- * 'go f(args)' 把实参按值拷到堆上的参数块里；元组和 struct 一样是值类型，
+ * 'spawn f(args)' 把实参按值拷到堆上的参数块里；元组和 struct 一样是值类型，
  * 所以可以作为实参穿过线程边界。线程里也可以照常调用返回元组的函数。
  *
  * 运行（仓库根目录）：
@@ -49,13 +49,13 @@ void th_assign(int n)
 
 /* ---- 测试块 ---- */
 
-test "go 可以把元组按值传给线程" {
+test "spawn 可以把元组按值传给线程" {
     (int, int) t = {5, 6};
 
     got_a = 0;
     got_b = 0;
     got_ok = 0;
-    go th_take(t);
+    spawn th_take(t);
     __c6_th_join_all();
     if (!got_ok)
         err(1, "线程没有跑起来");
@@ -67,7 +67,7 @@ test "线程里调用返回元组的函数" {
     got_a = 0;
     got_b = 0;
     got_ok = 0;
-    go th_call(11);
+    spawn th_call(11);
     __c6_th_join_all();
     if (!got_ok)
         err(1, "线程没有跑起来");
@@ -79,7 +79,7 @@ test "线程里用解构赋值" {
     got_a = 0;
     got_b = 0;
     got_ok = 0;
-    go th_assign(20);
+    spawn th_assign(20);
     __c6_th_join_all();
     if (!got_ok)
         err(1, "线程没有跑起来");
@@ -87,16 +87,16 @@ test "线程里用解构赋值" {
         err(2, "线程里解构赋值的结果不对");
 }
 
-test "go 的实参在 go 语句处求值一次" {
+test "spawn 的实参在 spawn 语句处求值一次" {
     (int, int) t = {1, 2};
 
     got_a = 0;
     got_b = 0;
     got_ok = 0;
-    go th_take(t);
+    spawn th_take(t);
     t[0] = 99;                  /* 之后改局部变量不影响线程 */
     t[1] = 98;
     __c6_th_join_all();
     if (got_a != 1 || got_b != 2)
-        err(1, "元组实参没有在 go 语句处按值复制");
+        err(1, "元组实参没有在 spawn 语句处按值复制");
 }

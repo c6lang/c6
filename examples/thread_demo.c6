@@ -1,18 +1,18 @@
-/* go 用法演示：OS 线程
+/* spawn 用法演示：OS 线程
  *
  * 编译运行（在仓库根目录）：
  *   make build
  *   ./tcc/tcc -B tcc -run examples/thread_demo.c6
  *
- * 'go f(a);' 是一句普通语句：参数在这里求值、复制到堆上的参数块，然后
+ * 'spawn f(a);' 是一句普通语句：参数在这里求值、复制到堆上的参数块，然后
  * pthread_create 起一个线程，语句立刻往下走。线程里跑的是普通函数，所以
  * 阻塞调用（sleep、read、计算）都不会挡住调用方。
  *
  *   async 函数 -> 'co f(a);'   无栈协程，跑到第一个真正要等的地方就返回
- *   普通函数   -> 'go f(a);'   真线程，立刻返回，和调用方并行跑
+ *   普通函数   -> 'spawn f(a);'   真线程，立刻返回，和调用方并行跑
  *
  * 线程由启动它的线程回收：main 结束时编译器会插入 __c6_th_join_all()，
- * 所以在 main 里 go 出去的线程都会在程序退出前跑完（下面的 "全部完成"
+ * 所以在 main 里 spawn 出去的线程都会在程序退出前跑完（下面的 "全部完成"
  * 一行就是靠这一点打印出来的）。
  */
 #include <stdio.h>
@@ -34,7 +34,7 @@ static int download(int id, int ms)
     return id;
 }
 
-/* ---- 2. 参数按值传：线程拿到的是 go 那一刻的副本 ---- */
+/* ---- 2. 参数按值传：线程拿到的是 spawn 那一刻的副本 ---- */
 
 static int show(int a, const char *msg, struct pair p)
 {
@@ -68,7 +68,7 @@ static int consumer(int rfd, int want)
 
 /* ---- 4. 要等某一个线程：留住句柄 ---- */
 
-/* 'go f(a);' 是起了就不管；'thread h = go f(a);' 同时拿到这次调用的记录：
+/* 'spawn f(a);' 是起了就不管；'thread h = spawn f(a);' 同时拿到这次调用的记录：
    h->join() 等它结束（重复调用幂等），h->done() 不阻塞，h->value() 取
    被调函数的返回值。线程本身仍旧由启动它的线程回收，句柄只多持有一份。 */
 
@@ -79,20 +79,20 @@ int main(void)
     int a = 1;
 
     printf("main: 起三个线程\n");
-    go download(1, 1);
-    go download(2, 1);
-    go show(a, "hello", p);
+    spawn download(1, 1);
+    spawn download(2, 1);
+    spawn show(a, "hello", p);
     a = 99;                     /* 线程已经拿到副本，看不到这次修改 */
 
     /* 管道两头各跑一个线程：读的一头阻塞也不影响 main */
     pipe(fds);
-    go producer(fds[1], 3);
-    go consumer(fds[0], 12);
+    spawn producer(fds[1], 3);
+    spawn consumer(fds[0], 12);
 
-    printf("main: go 之后立刻继续（上面三行输出可能还没出现）\n");
+    printf("main: spawn 之后立刻继续（上面三行输出可能还没出现）\n");
 
     /* 只等其中一个：句柄方式的等待 */
-    thread h = go download(7, 1);
+    thread h = spawn download(7, 1);
     printf("main: 只等 worker 7\n");
     h->join();
     printf("main: worker 7 的值 = %d\n", (int)h->value());

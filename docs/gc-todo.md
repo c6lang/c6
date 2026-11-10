@@ -32,7 +32,7 @@
 | P4 ✅ | 析构 `drop` 方法 | P3 | 全局根不能用 `atexit` |
 | P5 ✅ | `shared` + 跨帧/跨线程转移 | P2 | 任务 slot 的归还点在 `__c6_co_destroy` |
 | P6 ✅ | 静态环检测（单 TU + 链接期） | P2/P3 | 跨 TU 只在原生后端 |
-| P7 ✅ | async/go 集成与预算化 drain | P1/P5 | 回卷检查点放在 `await` 恢复点 |
+| P7 ✅ | async/spawn 集成与预算化 drain | P1/P5 | 回卷检查点放在 `await` 恢复点 |
 | P8 | 文档与全量回归 | 全部 | — |
 
 ---
@@ -227,7 +227,7 @@
 ## P4 ✅ 析构 `drop` 方法
 
 结果：`drop` 在最后一次释放时跑一次（`tests/gc_drop.c6` 6 个块），字段还在；
-数组逐元素跑；`go` 线程里也跑；全局根在退出时释放（`tests/exit/drop_exit.c6`）；
+数组逐元素跑；`spawn` 线程里也跑；全局根在退出时释放（`tests/exit/drop_exit.c6`）；
 8 条诊断（`tests/errors/drop_bad.c6`）。验收：`make selftest` 46 通过、
 `BACKEND=c99 tests/run-tests.sh` 47 通过、`make test-plain` 绿。
 
@@ -238,11 +238,11 @@
 - 描述符增加 `drop` 指针，发射时用与 vtable 相同的 `(void(*)(void))Sym`
   手法（参考 `c6_emit_auto_impls()`，:9575）；
 - 运行时 drain 步骤：`if (desc->drop) desc->drop(payload);`（在字段释放之前）；
-- 静态检查：析构体内禁 `err`/`try`/`await`/`go`；禁止显式调用 `p->drop()`；
+- 静态检查：析构体内禁 `err`/`try`/`await`/`spawn`；禁止显式调用 `p->drop()`；
 - 全局根：`@T` 全局登记到一张表，`atexit(__c6_gc_shutdown)` 释放一次。
 
 测试（`tests/gc_drop.c6`）：析构在最后释放时跑一次；析构里能读自己的托管字段；
-析构顺序（析构 → 字段释放）；析构里释放另一个对象（重入）；析构在 `go` 线程跑；
+析构顺序（析构 → 字段释放）；析构里释放另一个对象（重入）；析构在 `spawn` 线程跑；
 析构没有为环运行（配合 P6 的 `c6_graph` 文档）；
 `tests/errors/drop_bad.c6`：返回值/参数个数/重复定义/`err` 内用/显式调用。
 
@@ -277,7 +277,7 @@
 
 ## P5 ✅ `shared` 与跨帧/跨线程转移
 
-结果：`go` 的实参块和一个 `async` 任务各持有一份引用，两处都在**用完之后**
+结果：`spawn` 的实参块和一个 `async` 任务各持有一份引用，两处都在**用完之后**
 −1，所以「创建者先放手、线程/任务后跑完」是安全的；`shared @T` 的加减在
 对象头里带原子标志，两个线程同时加减不丢更新（`tests/gc_thread.c6` 4 个块，
 连跑 10 次稳定）；任务还持有托管返回值（`tests/gc_async.c6` 5 个块）；
@@ -288,12 +288,12 @@
 
 - `shared @T` 的存储/释放走 `__atomic_fetch_add`/`__atomic_sub_fetch`（`ACQ_REL`）；
   libtcc1.c 里自行 `#define __ATOMIC_ACQ_REL 4`（tcc 不预定义）；
-- `go f(args)`：实参块里的托管引用 +1 进块、trampoline 返回前 −1
+- `spawn f(args)`：实参块里的托管引用 +1 进块、trampoline 返回前 −1
   （`c6_sp_emit()`，`__tcc_sp_args`，`lib/libtcc1.c:796`）；
 - `async`：参数进 `struct NAME_task` 时 +1，任务被 `__c6_co_destroy()` 回收
   时 −1 —— 不在 body 里还，body 可能永远跑不完；
-- 静态检查：`plain @T`/`own @T` 进 `go`/`async` → 错误（E-GC10）；
-- 取消旧设计里“`go`/`async` 边界不能带托管引用”的限制。
+- 静态检查：`plain @T`/`own @T` 进 `spawn`/`async` → 错误（E-GC10）；
+- 取消旧设计里“`spawn`/`async` 边界不能带托管引用”的限制。
 
 落地状态（与计划的差异）：
 
@@ -326,14 +326,14 @@
 
 测试（`tests/gc_thread.c6`、`tests/gc_async.c6`）：
 
-- `go` 的实参块持有一份（线程里读到的计数 = 2）；启动者放手后对象仍活着；
+- `spawn` 的实参块持有一份（线程里读到的计数 = 2）；启动者放手后对象仍活着；
   跨线程交接（存进 `shared` 全局，计数 = 2）；两个线程同时对同一对象加减，
   两次 +1 都算上（5）、退出后回到 1 —— 这条在 `new T`（非原子）时会稳定
   失败，正是 E-GC15 的实测依据；
 - 任务前缀持有一份；创建者放手后任务仍活着；形参借用 + 拷进自有局部才 +1；
   托管返回值由 `val` 槽持有（`return n` 与 `return new shared T` 两条路径）；
   非托管参数不受影响；
-- `tests/errors/gc_borrow.c6`：借用形参赋值（普通/async 各一条）、`go` 传
+- `tests/errors/gc_borrow.c6`：借用形参赋值（普通/async 各一条）、`spawn` 传
   `plain @T`、`async` 形参/返回值非 `shared`、`shared` 槽装 `new T`。
 
 验收：同 P1 + 原生与 C99 两种后端都要过。
@@ -404,7 +404,7 @@
 
 ---
 
-## P7 ✅ async/go 集成与预算化 drain
+## P7 ✅ async/spawn 集成与预算化 drain
 
 结果：没跑完就被销毁的任务会**回卷** —— 恢复帧、跑 `errdefer` + `defer` +
 托管引用的内联释放，再以 `C6_CO_KIND_ABORT` 结束，所以挂起的任务不会漏掉它
@@ -453,7 +453,7 @@
 结果：
 
 - `README.md`：新增「托管引用（引用计数 GC）」一节（四种限定符的语义表、
-  `p = NULL`、`move`、`drop`、环是编译错误、async/go 的限制、性能数字、
+  `p = NULL`、`move`、`drop`、环是编译错误、async/spawn 的限制、性能数字、
   与 C++ 智能指针的对照），并把「切片没有隐藏状态也没有 GC」那句改清楚
   （切片不是 GC 对象，托管引用是另一回事）；测试目录清单补上 7 个 gc 用例；
 - `docs/grammar.md`：§7 静态约束补 C66–C77（环、借用、`own`/`shared` 的
@@ -477,7 +477,7 @@
 | D1 | 原子计数的限定符名字 | **`shared`**（描述权限而不是机制；`atomic` 会让人误以为 `p->f` 也是原子的），已按此实现 |
 | D2 | 自环默认报错，通用图怎么办 | **默认报错**（已实现）；`struct Node c6_graph` 豁免**不做**，通用图只能写成 `own` 树 / `weak` 边（设计 §8.4） |
 | D3 | 链接期跨 TU 环检查进 V1 还是 V2 | **进 V1**，已实现（`.c6.gcgraph` + 链接期 DFS，仅原生后端） |
-| D4 | 析构里禁止 `err`/`try`/`await`/`go` | **禁止**，已实现（E-GC9） |
+| D4 | 析构里禁止 `err`/`try`/`await`/`spawn` | **禁止**，已实现（E-GC9） |
 | D5 | 全局 `@T` 在进程退出时是否跑析构 | **跑**，已实现 —— 用 TU 末尾的 `__attribute__((destructor))` 调 `__c6_gc_shutdown()`（不用 `atexit`，tcc 的 `atexit` 会拖出 `__dso_handle`） |
 | D6 | drain 预算默认值 | **256**（`C6_GC_DRAIN_BUDGET`，`lib/libtcc1.c:1071`）；**没有**做 `-gc-drain-budget=N` 命令行开关 —— 预算是运行期常量，要做开关得让编译器把它传给 libtcc1，暂不需要 |
 

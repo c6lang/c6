@@ -1,9 +1,9 @@
-/* c6 自测：线程句柄 'thread h = go f(...);'
+/* c6 自测：线程句柄 'thread h = spawn f(...);'
  *
- * 'go f(x);' 是"起了就不管"：线程由启动它的线程在退出时统一 join。要等
+ * 'spawn f(x);' 是"起了就不管"：线程由启动它的线程在退出时统一 join。要等
  * 某一个线程，就留住它的句柄：
  *
- *   thread h = go work(1);   启动，并拿到这次调用的记录
+ *   thread h = spawn work(1);   启动，并拿到这次调用的记录
  *   h->join();               阻塞到它结束，重复调用幂等
  *   h->done();               1 = 已经结束，不阻塞
  *   h->value();              被调函数的返回值（整数/指针）
@@ -46,9 +46,9 @@ static int slow(int id)
 test "等三个线程里的第二个，返回值可用，其余各自收尾" {
     gate = 0;
     ran[1] = ran[2] = ran[3] = 0;
-    thread h1 = go slow(1);
-    thread h2 = go slow(2);
-    thread h3 = go slow(3);
+    thread h1 = spawn slow(1);
+    thread h2 = spawn slow(2);
+    thread h3 = spawn slow(3);
     gate = 1;                       /* 三个一起开跑 */
     if (h2->join() != 0)
         err(1, "join 失败");
@@ -68,7 +68,7 @@ test "等三个线程里的第二个，返回值可用，其余各自收尾" {
 test "join() 幂等，done()/value() 与结果一致" {
     gate = 1;
     ran[0] = 0;
-    thread h = go slow(0);
+    thread h = spawn slow(0);
     if (wait_nonzero(&ran[0]) == 0)
         err(10, "线程没有跑起来");
     if (h->join() != 0)
@@ -85,7 +85,7 @@ test "join() 幂等，done()/value() 与结果一致" {
 
 test "句柄走了线程还在跑，引用不漏" {
     {
-        thread h = go slow(1);
+        thread h = spawn slow(1);
 
         gate = 1;
         ran[1] = 0;
@@ -95,7 +95,7 @@ test "句柄走了线程还在跑，引用不漏" {
         err(20, "放弃句柄之后线程没有跑完");
 }
 
-/* ---- 3. 线程里再 go 并 join 孙线程 ---- */
+/* ---- 3. 线程里再 spawn 并 join 孙线程 ---- */
 
 static volatile int inner_ran = 0;
 
@@ -107,7 +107,7 @@ static int leaf(int k)
 
 static int spawn_inside(int k)
 {
-    thread g = go leaf(k);
+    thread g = spawn leaf(k);
     long long v = 0;
 
     if (g->join() != 0)
@@ -116,8 +116,8 @@ static int spawn_inside(int k)
     return (int)v;
 }
 
-test "线程内部再 go 并 join 孙线程" {
-    thread h = go spawn_inside(41);
+test "线程内部再 spawn 并 join 孙线程" {
+    thread h = spawn spawn_inside(41);
 
     inner_ran = 0;
     if (h->join() != 0)
@@ -128,17 +128,17 @@ test "线程内部再 go 并 join 孙线程" {
         err(32, "孙线程没有跑");
 }
 
-/* ---- 4. 裸 go 照旧 ---- */
+/* ---- 4. 裸 spawn 照旧 ---- */
 
-test "裸 go 不受影响，join_all 仍然等全部" {
+test "裸 spawn 不受影响，join_all 仍然等全部" {
     int i = 0;
 
     gate = 1;
     for (i = 1; i <= 3; i++)
         ran[i] = 0;
     for (i = 1; i <= 3; i++)
-        go slow(i);
+        spawn slow(i);
     __c6_th_join_all();
     if (ran[1] != 2 || ran[2] != 3 || ran[3] != 4)
-        err(40, "裸 go 的线程没有跑完");
+        err(40, "裸 spawn 的线程没有跑完");
 }

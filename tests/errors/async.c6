@@ -15,7 +15,7 @@
 // EXPECT test_nested: error: 'async' functions must have file scope
 // EXPECT test_co_outside: error: 'co' can only be used inside a function
 // EXPECT test_task_outside: error: 'task' can only be used inside a function
-// EXPECT test_co_non_async: error: 'co' requires an 'async' function: 'plain' is a plain function (use 'go')
+// EXPECT test_co_non_async: error: 'co' requires an 'async' function: 'plain' is a plain function (use 'spawn')
 // EXPECT test_co_value: error: the operand of 'co' must be the handle of an 'async' call
 // EXPECT test_co_call_non_async: error: the operand of 'co' must be the handle of an 'async' call
 // EXPECT test_task_init: error: the initializer of a 'task' variable must be a call of an 'async' function

@@ -7,7 +7,7 @@
 #   NO_KVM=1 make fstest-bare-tests # 纯软件模拟
 #
 # 跳过的几个：它们要的东西裸机上真没有（不是运行时不行，是测试自己要用）
-#   gc_drop gc_thread thread thread_handle tuple_thread    go -> pthread_create
+#   gc_drop gc_thread thread thread_handle tuple_thread    spawn -> pthread_create
 #   defer_thread                                           -> clone/futex
 #   method                                                 libc 的 FILE 布局
 #

@@ -13,7 +13,7 @@
  * 这里刻意混用普通 C 与 c6 特性，覆盖 README 里 C99 后端承诺的范围：
  * 整数/浮点/指针/数组/字符串、控制流、函数指针与递归、结构体按值返回、
  * 变参函数定义（va_list）、defer/errdefer/err/try/catch、切片/foreach、
- * 元组、方法/接口/裸 tag、async/await 与 go 的运行时。
+ * 元组、方法/接口/裸 tag、async/await 与 spawn 的运行时。
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -537,7 +537,7 @@ test "方法、接口与裸 tag 类型名" {
         err(3, "接口方法调用不对");
 }
 
-test "async / await 与 go 的运行时" {
+test "async / await 与 spawn 的运行时" {
     struct async_add_task *t = async_add(20, 22);
 
     if (__c6_co_wait(t) != 0)
@@ -547,10 +547,10 @@ test "async / await 与 go 的运行时" {
     __c6_co_destroy(t);
 
     go_flag = 0;
-    go set_flag(1);
+    spawn set_flag(1);
     __c6_th_join_all();
     if (go_flag != 1)
-        err(3, "go 线程没有跑起来");
+        err(3, "spawn 线程没有跑起来");
 }
 
 test "c99 输出后端端到端标记" {

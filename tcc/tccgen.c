@@ -900,13 +900,14 @@ static void c6_async_return(void);
 static void c6_return_value(CType *type);
 static void c6_async_await_io(Sym *s);
 static void c6_co_parse(void);
-static void c6_go_parse(void);
+static void c6_spawn_parse(void);
 static void c6_sp_parse(int want_handle);
 static void c6_thread_decl(void);
 static void c6_thread_defer_release(int slot);
 static void c6_sp_flush(void);
 static int c6_soft_kw(int t);
 static int c6_soft_kw_shadowed(int t);
+static void c6_kw_renamed(void);
 static int c6_gc_qual(int t);
 static int c6_is_managed(CType *type);
 static int c6_gc_mode(CType *type);
@@ -960,9 +961,10 @@ static void c6_move_snap_free(C6MoveSnap *sn);
 static void c6_move_branch_end(C6MoveSnap *out);
 #define C6_KW_NONE 0
 #define C6_KW_CO   1
-#define C6_KW_GO   2
+#define C6_KW_SPAWN 2
 #define C6_KW_TASK 3
 #define C6_KW_THREAD 4
+#define C6_KW_OLD_GO 5  /* the old spelling: only used to say it was renamed */
 /* trampolines that still have to be emitted (one per spawned function) */
 typedef struct C6SpPending {
     struct C6SpPending *next;
@@ -2274,7 +2276,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     next();
     decl(VT_CONST);
 #ifdef C6_EXT
-    /* trampolines for the functions some 'go' of this unit spawned */
+    /* trampolines for the functions some 'spawn' of this unit spawned */
     c6_sp_flush();
     /* interfaces converted in this unit get their vtable object here, but a
        'static inline' body is only compiled now, and such a body may contain
@@ -16357,11 +16359,14 @@ again:
         if (kw != C6_KW_NONE && !c6_soft_kw_shadowed(t)) {
             switch (kw) {
             case C6_KW_CO:   c6_co_parse();   break;
-            case C6_KW_GO:
+            case C6_KW_SPAWN:
                 if (c6_gc_in_drop)
                     tcc_error("a destructor cannot suspend: it runs while "
                               "the object is being released");
-                c6_go_parse();
+                c6_spawn_parse();
+                break;
+            case C6_KW_OLD_GO:
+                c6_kw_renamed();
                 break;
             case C6_KW_THREAD:
                 if (c6_gc_in_drop)
@@ -19446,7 +19451,7 @@ static void c6_async_definition(Sym *sym, CType *ftype)
     c6_decl_tokens(ts);
 }
 
-/* ---- 'go f();' and 'task t = f();' ---------------------------------- */
+/* ---- 'spawn f();' and 'task t = f();' ------------------------------- */
 
 /* Reject anything that is not the handle of an async call.  A handle is a
    pointer to one of the generated 'struct NAME_task' structures, which always
@@ -19509,7 +19514,7 @@ static void c6_co_parse(void)
         if (s && (s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref
             && !s->type.ref->f.func_async)
             tcc_error("'co' requires an 'async' function: '%s' is a plain "
-                      "function (use 'go')", get_tok_str(tok, NULL));
+                      "function (use 'spawn')", get_tok_str(tok, NULL));
     }
     expr_eq();
     c6_fallible_use();
@@ -21556,11 +21561,14 @@ static void c6_gc_discard_hook(void)
 /* ---------------------------------------------------------------------- */
 /* soft keywords                                                           */
 /*                                                                         */
-/* 'co', 'go' and 'task' are keywords only at the start of a statement      */
-/* inside a function, and only when an identifier follows: 'go f();' starts  */
-/* a thread, while 'go = 1;', 'go(x);', 'typedef int go; go v;' and 'go:'    */
-/* keep using the name.  The statement parser already holds the next token   */
-/* in TOK when it dispatches, so the test is a string compare.              */
+/* 'co', 'spawn' and 'task' are keywords only at the start of a statement */
+/* inside a function, and only when an identifier follows: 'spawn f();'   */
+/* starts a thread, while 'spawn = 1;', 'spawn(x);', 'typedef int spawn;  */
+/* spawn v;' and 'spawn:' keep using the name.  The statement parser      */
+/* already holds the next token in TOK when it dispatches, so the test is */
+/* a string compare.  'go' is no longer the keyword: it keeps its         */
+/* ordinary meaning and only earns a "was renamed" diagnostic in the      */
+/* shape that used to mean a thread.                                      */
 
 static int c6_soft_kw(int t)
 {
@@ -21570,14 +21578,24 @@ static int c6_soft_kw(int t)
         return C6_KW_NONE;
     s = get_tok_str(t, NULL);
     switch (*s) {
-    case 'c': if (!strcmp(s, "co"))   return C6_KW_CO;   break;
-    case 'g': if (!strcmp(s, "go"))   return C6_KW_GO;   break;
+    case 'c': if (!strcmp(s, "co"))    return C6_KW_CO;    break;
+    case 'g': if (!strcmp(s, "go"))    return C6_KW_OLD_GO; break;
+    case 's': if (!strcmp(s, "spawn")) return C6_KW_SPAWN;  break;
     case 't':
         if (!strcmp(s, "task"))   return C6_KW_TASK;
         if (!strcmp(s, "thread")) return C6_KW_THREAD;
         break;
     }
     return C6_KW_NONE;
+}
+
+/* The thread keyword used to be called 'go'.  Anything that still has that
+   shape ('go f(...)', 'thread h = go f(...)', 'go f();' at file scope) gets
+   one sentence instead of a confusing cascade. */
+static void c6_kw_renamed(void)
+{
+    tcc_error("'go' was renamed to 'spawn': write 'spawn f(...)' "
+              "or 'thread h = spawn f(...)'");
 }
 
 /* A typedef of the same name keeps declaring variables: 'co v;' declares a
@@ -21607,10 +21625,10 @@ static int c6_gc_qual(int t)
 
 
 /* ---------------------------------------------------------------------- */
-/* 'go f(a);' : run f on an OS thread                                      */
+/* 'spawn f(a);' : run f on an OS thread                                   */
 /*                                                                         */
-/* The arguments are evaluated at the 'go' statement and copied into a heap */
-/* block; the runtime starts a thread on a trampoline that unpacks the block */
+/* The arguments are evaluated at the 'spawn' statement and copied into a   */
+/* heap block; the runtime starts a thread on a trampoline that unpacks the */
 /* and calls f.  The trampoline is generated at the end of the unit, once per */
 /* spawned function, and is hidden from other units - a header full of       */
 /* prototypes costs nothing at all until something is spawned.               */
@@ -21748,7 +21766,7 @@ static void c6_sp_emit(C6SpPending *sp)
         tok_str_add(ts, '*');
         tok_str_add(ts, '(');
         if (!c6_async_type_tokens(ts, &pt))
-            tcc_error("internal: cannot write the signature of 'go'");
+            tcc_error("internal: cannot write the signature of 'spawn'");
         tok_str_add(ts, '*');
         tok_str_add(ts, ')');
         tok_str_add(ts, '(');
@@ -21820,10 +21838,10 @@ static void c6_sp_flush(void)
         c6_sp_emit(p);
 }
 
-/* 'go f(args)' : evaluate the arguments into a heap block and hand them and
+/* 'spawn f(args)' : evaluate the arguments into a heap block and hand them
    the trampoline to the runtime.  With WANT_HANDLE the spawned thread's
-   handle stays on the stack ('thread h = go f(x);'); otherwise it is dropped
-   ('go f(x);'). */
+   handle stays on the stack ('thread h = spawn f(x);'); otherwise it is
+   dropped ('spawn f(x);'). */
 static void c6_sp_parse(int want_handle)
 {
     Sym *fs = 0;
@@ -21851,31 +21869,31 @@ static void c6_sp_parse(int want_handle)
     if (!fs)
         fs = sym_find(tok);
     if (!fs || (fs->type.t & VT_BTYPE) != VT_FUNC || !fs->type.ref)
-        tcc_error("the operand of 'go' must be a call of a plain function");
+        tcc_error("the operand of 'spawn' must be a call of a plain function");
     name = fs->v;                   /* the symbol's own name, after mangling */
     ft = fs->type;
     if (ft.ref->f.func_async)
-        tcc_error("'go' requires a plain function: '%s' is 'async' (use "
+        tcc_error("'spawn' requires a plain function: '%s' is 'async' (use "
                   "'co')", get_tok_str(name, NULL));
     if (ft.ref->f.func_fallible)
-        tcc_error("'go' does not support fallible functions: '%s'",
+        tcc_error("'spawn' does not support fallible functions: '%s'",
                   get_tok_str(name, NULL));
     if (ft.ref->f.func_type == FUNC_ELLIPSIS)
-        tcc_error("'go' does not support variadic functions: '%s'",
+        tcc_error("'spawn' does not support variadic functions: '%s'",
                   get_tok_str(name, NULL));
     if (!c6_sp_ok(&ft))
-        tcc_error("'go' does not support this signature: '%s'",
+        tcc_error("'spawn' does not support this signature: '%s'",
                   get_tok_str(name, NULL));
     for (p = c6_async_params(&ft); p; p = p->next) {
         if (c6_closure_of_type(&p->type))
             tcc_error("a closure cannot cross a thread or a task: V2 closures "
                       "are confined to the thread that creates them");
         if (!c6_sp_type_ok(&p->type))
-            tcc_error("'go' does not support this signature: '%s'",
+            tcc_error("'spawn' does not support this signature: '%s'",
                       get_tok_str(name, NULL));
         if (c6_is_managed(&p->type)
             && !(c6_type_gq(&p->type) & C6_GQ_SHARED))
-            tcc_error("passing a reference to 'go' requires 'shared': '%s' "
+            tcc_error("passing a reference to 'spawn' requires 'shared': '%s' "
                       "is counted per thread", get_tok_str(name, NULL));
     }
 
@@ -21952,13 +21970,13 @@ static void c6_sp_parse(int want_handle)
     }
 }
 
-/* 'go f(args);' : start the thread and keep no handle. */
-static void c6_go_parse(void)
+/* 'spawn f(args);' : start the thread and keep no handle. */
+static void c6_spawn_parse(void)
 {
     c6_sp_parse(0);
 }
 
-/* 'thread h = go f(args);' : the handle keeps the thread's record alive, so
+/* 'thread h = spawn f(args);' : the handle keeps the thread's record alive, so
    'h->join()' can wait for it and 'h->done()' can ask without waiting.  The
    thread itself is still reaped by the thread that started it. */
 static void c6_thread_decl(void)
@@ -21972,10 +21990,20 @@ static void c6_thread_decl(void)
     v = tok;
     next();
     skip('=');
-    if (c6_soft_kw(tok) != C6_KW_GO || c6_soft_kw_shadowed(tok))
+    /* 'thread h = go f(...)' is the old spelling: only that shape (an
+       identifier follows) gets the rename hint, 'thread h = go;' with a
+       variable called 'go' keeps the plain "must be 'spawn f(...)'" error */
+    if (c6_soft_kw(tok) == C6_KW_OLD_GO && !c6_soft_kw_shadowed(tok)) {
+        int c6_name = tok;
+        next();
+        if (tok >= TOK_IDENT)
+            c6_kw_renamed();
+        unget_tok(c6_name);
+    }
+    if (c6_soft_kw(tok) != C6_KW_SPAWN || c6_soft_kw_shadowed(tok))
         tcc_error("the initializer of a 'thread' variable must be "
-                  "'go f(...)'");
-    next();                             /* 'go' */
+                  "'spawn f(...)'");
+    next();                             /* 'spawn' */
     c6_sp_parse(1);                     /* the handle is on the stack */
     rt = struct_find(tok_alloc_const("__c6_thread"));
     if (!rt)
@@ -22106,7 +22134,7 @@ static void gen_function(Sym *sym)
         c6_defer_func_init();
         if (c6_async_cur)
             c6_async_params_copy();
-        /* 'go' threads have no handler to wait for them, so the thread that
+        /* 'spawn' threads have no handler to wait for them, so the thread that
            started them reaps them when it exits.  For main that is a cleanup
            site: it must run through the same path as 'defer' so the return
            value survives the call (the return value is only reloaded after
@@ -22552,8 +22580,8 @@ static void c6_apply_fallible(CType *type)
                 unget_tok(c6_kw);
             }
         }
-        /* 'co', 'go' and 'task' are soft keywords: at file scope they stay
-           plain identifiers, so 'go f();' only fails when the declaration
+        /* 'co', 'spawn' and 'task' are soft keywords: at file scope they stay
+           plain identifiers, so 'spawn f();' only fails when the declaration
            does.  Say what is wrong instead of reporting an implicit int. */
         if (tcc_state->c6_ext && l == VT_CONST) {
             int c6_kw = c6_soft_kw(tok);
@@ -22562,6 +22590,8 @@ static void c6_apply_fallible(CType *type)
                 next();
                 if (tok >= TOK_IDENT) {
                     unget_tok(c6_name);
+                    if (c6_kw == C6_KW_OLD_GO)
+                        c6_kw_renamed();
                     tcc_error("'%s' can only be used inside a function",
                               get_tok_str(c6_name, NULL));
                 }

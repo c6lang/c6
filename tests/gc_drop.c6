@@ -157,14 +157,14 @@ static int wait_nonzero(volatile int *p)
     return *p;
 }
 
-test "析构在 go 线程里也跑" {
+test "析构在 spawn 线程里也跑" {
     counter_runs = 0;
     counter_seen = 0;
-    go work();
+    spawn work();
     if (!wait_nonzero(&counter_runs))
-        err(1, "go 线程里的析构没有跑");
+        err(1, "spawn 线程里的析构没有跑");
     if (counter_seen != 33)
-        err(2, "go 线程里的析构没拿到内容");
+        err(2, "spawn 线程里的析构没拿到内容");
 }
 
 void work(void) {
