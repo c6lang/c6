@@ -121,6 +121,7 @@ DEF-arm64-win32    = $(DEF-arm64) -DTCC_TARGET_PE
 DEF-riscv64        = -DTCC_TARGET_RISCV64
 DEF-c67            = -DTCC_TARGET_C67 -w # disable warnigs
 DEF-c99            = -DTCC_TARGET_C99
+DEF-llvm           = -DTCC_TARGET_LLVM
 DEF-x86_64-FreeBSD = $(DEF-x86_64) -DTARGETOS_FreeBSD
 DEF-x86_64-NetBSD  = $(DEF-x86_64) -DTARGETOS_NetBSD
 DEF-x86_64-OpenBSD = $(DEF-x86_64) -DTARGETOS_OpenBSD
@@ -221,6 +222,7 @@ arm64-win32_FILES = $(arm64_FILES) tccpe.c
 c67_FILES = $(CORE_FILES) c67-gen.c c67-link.c tcccoff.c
 riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c riscv64-asm.c
 c99_FILES = $(CORE_FILES) c99-gen.c c99-link.c
+llvm_FILES = $(CORE_FILES) llvm-gen.c llvm-link.c
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
@@ -242,8 +244,9 @@ $(CROSS_TARGET)-tcc.o : DEFINES += -DONE_SOURCE=0
 endif
 # native tcc always made from tcc.o and libtcc.[so|a]
 tcc.o : DEFINES += -DONE_SOURCE=0
-# the native tcc also carries the embedded C99 output back-end
+# the native tcc also carries the embedded C99 and LLVM IR output back-ends
 tcc.o : DEFINES += -DCONFIG_EMBED_C99
+tcc.o : DEFINES += -DCONFIG_EMBED_LLVM
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -273,7 +276,7 @@ $(X)tcc.o : tcctools.c
 $(X)tcc.o : DEFINES += $(DEF_GITHASH)
 
 # Host Tiny C Compiler
-tcc$(EXESUF): tcc.o $(LIBTCC) tcc-c99-p.o
+tcc$(EXESUF): tcc.o $(LIBTCC) tcc-c99-p.o tcc-llvm-p.o
 	$S$(CC) -o $@ $^ $(addsuffix ,$(LIBS) $(LDFLAGS) $(LINK_LIBTCC))
 
 # Cross Tiny C Compilers
@@ -581,5 +584,27 @@ tcc-c99-p.o: tcc-c99.o
 # explicit rule the generic cross-compiler pattern would build one from the
 # c99 target definition.
 c99-tcc$(EXESUF): tcc$(EXESUF)
+	@:
+
+# The LLVM IR back-end is embedded the same way: llvm-gen.c is a complete
+# second code generator, so it is compiled as its own single-source object and
+# the native driver hands over when an output file ends in .ll.
+tcc-llvm.o: $(CORE_FILES) llvm-gen.c llvm-link.c $(TCCDEFS_H)
+	@if ! grep -q TCC_TARGET_LLVM config.h 2>/dev/null; then \
+	    echo "llvm: config.h 不认识 TCC_TARGET_LLVM（配置由旧版 configure 生成）" >&2; \
+	    echo "llvm: 请先运行 ./configure" >&2; \
+	    exit 1; \
+	fi
+	$(CC) -o $@ -DONE_SOURCE=1 -DTCC_TARGET_LLVM -DC6_EXT $(DEFINES) $(CFLAGS) -c tcc.c
+
+tcc-llvm-p.o: tcc-llvm.o
+	@test -n "$(OBJCOPY)" || { \
+	    echo "llvm: 找不到 objcopy/llvm-objcopy，无法把 LLVM 后端并进 tcc" >&2; \
+	    exit 1; }
+	cp $< $@
+	$(OBJCOPY) --redefine-sym main=llvm_main --keep-global-symbol=llvm_main $@
+
+# same reason as for c99-tcc: no separate cross compiler for this target
+llvm-tcc$(EXESUF): tcc$(EXESUF)
 	@:
 endif

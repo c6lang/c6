@@ -3723,7 +3723,7 @@ static void gbound(void)
 
 /* we need to call __bound_ptr_add before we start to load function
    args into registers */
-#ifndef TCC_TARGET_C99
+#if !defined TCC_TARGET_C99 && !defined TCC_TARGET_LLVM
 ST_FUNC void gbound_args(int nb_args)
 {
     int i = 0, v = 0;
@@ -5309,7 +5309,8 @@ op_err:
    helper call.  The C99 back-end is one of them: it emits a plain C cast,
    while __floatundixf does not even exist in x86-64 libgcc. */
 #if defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64 \
-    || defined TCC_TARGET_ARM || defined TCC_TARGET_C99
+    || defined TCC_TARGET_ARM || defined TCC_TARGET_C99 \
+    || defined TCC_TARGET_LLVM
 #define gen_cvt_itof1 gen_cvt_itof
 #else
 /* generic itof for unsigned long long case */
@@ -10916,7 +10917,8 @@ ST_FUNC void unary(void)
 	vstore();
         break;
 #endif
-#if defined TCC_TARGET_X86_64 || defined TCC_TARGET_C99
+#if defined TCC_TARGET_X86_64 || defined TCC_TARGET_C99 \
+    || defined TCC_TARGET_LLVM
 #ifdef TCC_TARGET_PE
     case TOK_builtin_va_start:
 	parse_builtin_params(0, "ee");
@@ -13529,10 +13531,11 @@ static void c6_method_alias(int name, Sym *msym)
     /* put_extern_sym2() also patches an elfsym that a forward 'f(p)' call
        created earlier */
     put_extern_sym2(ps, es->st_shndx, es->st_value, es->st_size, 1);
-#ifdef TCC_TARGET_C99
+#if defined TCC_TARGET_C99 || defined TCC_TARGET_LLVM
     /* C has no two definitions for one name: the C99 back-end emits the
-       alias with __attribute__((alias)) instead.  Tokens belong to this
-       translation unit, so record copies of the names. */
+       alias with __attribute__((alias)) instead, the LLVM back-end an LLVM
+       alias.  Tokens belong to this translation unit, so record copies of
+       the names. */
     {
         C6MethodAlias *a = tcc_mallocz(sizeof *a);
         a->plain = tcc_strdup(get_tok_str(alias, NULL));

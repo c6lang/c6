@@ -175,9 +175,10 @@
      /*DEF(TOK_builtin_va_list, "__builtin_va_list")*/
 #if defined TCC_TARGET_PE && defined TCC_TARGET_X86_64
      DEF(TOK_builtin_va_start, "__builtin_va_start")
-#elif defined TCC_TARGET_X86_64 || defined TCC_TARGET_C99
-     /* the C99 back-end follows the x86-64 ABI, where va_arg() needs the
-        argument class of its type */
+#elif defined TCC_TARGET_X86_64 || defined TCC_TARGET_C99 \
+      || defined TCC_TARGET_LLVM
+     /* the C99 and LLVM back-ends follow the x86-64 ABI, where va_arg()
+        needs the argument class of its type */
      DEF(TOK_builtin_va_arg_types, "__builtin_va_arg_types")
 #elif defined TCC_TARGET_ARM64
      DEF(TOK_builtin_va_start, "__builtin_va_start")

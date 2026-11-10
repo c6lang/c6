@@ -47,6 +47,9 @@
 #elif defined(TCC_TARGET_C99)
 #include "c99-gen.c"
 #include "c99-link.c"
+#elif defined(TCC_TARGET_LLVM)
+#include "llvm-gen.c"
+#include "llvm-link.c"
 #elif defined(TCC_TARGET_X86_64)
 #include "x86_64-gen.c"
 #include "x86_64-link.c"
@@ -924,6 +927,10 @@ LIBTCCAPI TCCState *tcc_new(void)
        per input file for -c / -o <dir>) */
     c99_reset();
 #endif
+#ifdef TCC_TARGET_LLVM
+    /* same for the LLVM generator */
+    llvm_reset();
+#endif
     return s;
 }
 
@@ -998,7 +1005,8 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
     /* add sections */
     tccelf_new(s);
 
-    if (output_type == TCC_OUTPUT_OBJ || output_type == TCC_OUTPUT_C99) {
+    if (output_type == TCC_OUTPUT_OBJ || output_type == TCC_OUTPUT_C99
+        || output_type == TCC_OUTPUT_LLVM) {
         /* always elf for objects */
         s->output_format = TCC_OUTPUT_FORMAT_ELF;
         return 0;
@@ -2028,6 +2036,10 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
                per translation unit", not "one object file" */
             s->c99_compile_only = 1;
             x = TCC_OUTPUT_C99;
+#elif defined TCC_TARGET_LLVM
+            /* likewise: -c asks for one .ll file per translation unit */
+            s->llvm_compile_only = 1;
+            x = TCC_OUTPUT_LLVM;
 #else
             x = TCC_OUTPUT_OBJ;
 #endif
@@ -2041,7 +2053,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
                 && !(s->c6_test_mode
                      && (x == TCC_OUTPUT_MEMORY || x == TCC_OUTPUT_C99))
 #endif
-#ifdef TCC_TARGET_C99
+#if defined TCC_TARGET_C99 || defined TCC_TARGET_LLVM
                 && x != s->output_type
 #endif
                 )
@@ -2129,8 +2141,10 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
                does that by executing the program; the C99 back-end writes a
                C file with a generated test runner instead. */
             s->c6_test_mode = 1;
-#ifdef TCC_TARGET_C99
+#if defined TCC_TARGET_C99
             x = TCC_OUTPUT_C99;
+#elif defined TCC_TARGET_LLVM
+            x = TCC_OUTPUT_LLVM;
 #else
             x = TCC_OUTPUT_MEMORY;
 #endif

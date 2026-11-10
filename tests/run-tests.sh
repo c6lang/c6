@@ -5,15 +5,21 @@
 #   tests/run-tests.sh defer err       只跑这几个（按文件名，可写 errors/xxx）
 #   tests/run-tests.sh --list          列出会跑的文件
 #   BACKEND=c99 tests/run-tests.sh     同一批用例改走 C99 输出后端
+#   BACKEND=llvm tests/run-tests.sh    同一批用例改走 LLVM IR 后端
+#                                      （.c6 → .ll，再用 clang 链接 libtcc1.a）
 #
 # 环境变量：
 #   TCC       编译器路径（默认 <仓库>/tcc/tcc）
 #   TCCFLAGS  追加给编译器的参数
 #   BACKEND   native（默认）用 tcc/tcc 直接编译运行；c99 让同一个 tcc
-#             用 -o *.c / -o <目录> 生成 C 源码，再用系统 C 编译器编译运行。
-#             两种模式跑完全相同的测试文件和断言。
+#             用 -o *.c / -o <目录> 生成 C 源码，再用系统 C 编译器编译运行；
+#             llvm 用 -o *.ll 生成 LLVM IR，再用 clang 链接 tcc/libtcc1.a。
+#             三种模式跑完全相同的测试文件和断言（tests/c99 与 -run 相关的
+#             用例除外）。
 #   C99TCC    产出 C 源码的编译器（默认 <仓库>/tcc/tcc）
 #   C99CC     编译生成代码的系统 C 编译器（默认 gcc）
+#   LLVMCC    把 .ll 编成可执行文件的 clang（默认 clang）
+#   LLVMFLAGS 交给 LLVMCC 的参数（默认 -fuse-ld=lld，见 docs/llvm-backend.md）
 #   C99FLAGS  交给 C99CC 的参数（默认 ISO C99 + 严格告警）；把 C99CC 换成
 #             tcc 时用它去掉 gcc 专有的开关，例如 "-B <仓库>/tcc -std=c99 -w"
 #             （见 make c99tcc-test）
@@ -51,12 +57,16 @@ BACKEND=${BACKEND:-native}
 C99TCC=${C99TCC:-$ROOT/tcc/tcc}
 C99CC=${C99CC:-gcc}
 C99FLAGS=${C99FLAGS:-"-std=c99 -pedantic -Wall -Wextra -Werror -pthread"}
+LLVMCC=${LLVMCC:-clang}
+# libtcc1.a 的 .eh_frame 让 GNU ld 报 "overlapping FDEs"，lld 没有这个问题
+LLVMFLAGS=${LLVMFLAGS:-"-fuse-ld=lld"}
 
 case $BACKEND in
 native) ;;
 c99) ;;
+llvm) ;;
 *)
-    echo "run-tests: 未知的 BACKEND='$BACKEND'（native 或 c99）" >&2
+    echo "run-tests: 未知的 BACKEND='$BACKEND'（native、c99 或 llvm）" >&2
     exit 1
     ;;
 esac
@@ -72,6 +82,28 @@ if [ "$BACKEND" = c99 ]; then
     fi
     if ! command -v "$C99CC" >/dev/null 2>&1; then
         echo "run-tests: 找不到系统 C 编译器 $C99CC" >&2
+        exit 1
+    fi
+fi
+if [ "$BACKEND" = llvm ]; then
+    if [ ! -x "$C99TCC" ]; then
+        echo "run-tests: 找不到 $C99TCC，先执行 'make build'" >&2
+        exit 1
+    fi
+    if ! command -v "$LLVMCC" >/dev/null 2>&1        && [ ! -x "/usr/lib/llvm-19/bin/$LLVMCC" ]; then
+        echo "run-tests: 找不到 clang（LLVMCC=$LLVMCC）" >&2
+        exit 1
+    fi
+    case $LLVMCC in
+    /*) ;;
+    *)
+        if [ -x "/usr/lib/llvm-19/bin/$LLVMCC" ]; then
+            LLVMCC=/usr/lib/llvm-19/bin/$LLVMCC
+        fi
+        ;;
+    esac
+    if [ ! -f "$ROOT/tcc/libtcc1.a" ]; then
+        echo "run-tests: 找不到 $ROOT/tcc/libtcc1.a，先执行 'make build'" >&2
         exit 1
     fi
 fi
@@ -108,6 +140,20 @@ build_exe() { # <可执行文件> <源文件>...
         $C99TCC -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c"
+    elif [ "$BACKEND" = llvm ]; then
+        # 和 c99 模式一样：一次调用把命令行上的所有源文件合成一个输出，
+        # 参数里以 - 开头的是编译选项（-D/-W...），其余才是源文件
+        cflags=
+        srcs=
+        for arg in "$@"; do
+            case $arg in
+            -*) cflags="$cflags $arg" ;;
+            *) srcs="$srcs $arg" ;;
+            esac
+        done
+        [ -n "$srcs" ] || return 1
+        $C99TCC $BASE $TCCFLAGS $cflags -o "$exe.ll" $srcs || return 1
+        $LLVMCC $LLVMFLAGS -o "$exe" "$exe.ll" -L "$ROOT/tcc" -ltcc1
     else
         $TCC $BASE $TCCFLAGS -o "$exe" "$@"
     fi
@@ -123,6 +169,21 @@ build_test_exe() { # <可执行文件> <源文件>...
         $C99TCC -test -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c" || return 1
+        "$exe"
+    elif [ "$BACKEND" = llvm ]; then
+        # 所有源文件合成一个 .ll（测试块编号在同一个状态里递增，和
+        # native/c99 一样不会撞名），测试入口由后端生成
+        cflags=
+        srcs=
+        for arg in "$@"; do
+            case $arg in
+            -*) cflags="$cflags $arg" ;;
+            *) srcs="$srcs $arg" ;;
+            esac
+        done
+        [ -n "$srcs" ] || return 1
+        $C99TCC $BASE $TCCFLAGS $cflags -test -o "$exe.ll" $srcs || return 1
+        $LLVMCC $LLVMFLAGS -o "$exe" "$exe.ll" -L "$ROOT/tcc" -ltcc1 || return 1
         "$exe"
     else
         $TCC $BASE $TCCFLAGS -test "$@"
@@ -328,8 +389,9 @@ for src in "$ROOT"/tests/errors/*.c6; do
 -D$frag: 没有报错"
                 fi
             fi
-        elif [ -n "$extra" ]; then
-            # 有两个单元时必须走真正的编译+链接（-run 只接一个源文件）
+        elif [ -n "$extra" ] || [ "$BACKEND" = llvm ]; then
+            # 有两个单元时必须走真正的编译+链接（-run 只接一个源文件）；
+            # LLVM 后端没有 -run，同样只能编译+链接
             if build_exe "$TMP/diag.bin" $eflags "$src" $extra \
                     -D"$frag" 2>"$TMP/err" >/dev/null; then
                 ok=no
@@ -429,6 +491,27 @@ for src in "$ROOT"/tests/abi/*.c6; do
                 fail "$name" "链接失败:$(cat "$TMP/err")"
                 continue
             fi
+        fi
+    elif [ "$BACKEND" = llvm ]; then
+        if ! $C99TCC $BASE $TCCFLAGS -o "$TMP/abi-c6.ll" "$src" \
+                2>"$TMP/err" >/dev/null; then
+            fail "$name" "c6 侧生成 IR 失败:$(cat "$TMP/err")"
+            continue
+        fi
+        objs="$TMP/abi-c6.ll"
+        if [ -e "$plain" ]; then
+            # 纯 C 侧：clang 直接出目标文件，和 IR 一起链接
+            if ! $LLVMCC -c -o "$TMP/abi-plain.o" "$plain" \
+                    2>"$TMP/err" >/dev/null; then
+                fail "$name" "纯 C 侧编译失败:$(cat "$TMP/err")"
+                continue
+            fi
+            objs="$objs $TMP/abi-plain.o"
+        fi
+        if ! $LLVMCC $LLVMFLAGS -o "$TMP/abi.bin" $objs \
+                -L "$ROOT/tcc" -ltcc1 2>"$TMP/err" >/dev/null; then
+            fail "$name" "链接失败:$(cat "$TMP/err")"
+            continue
         fi
     else
         if ! $TCC $BASE $TCCFLAGS -c "$src" -o "$TMP/abi-c6.o" 2>"$TMP/err" >/dev/null; then
