@@ -420,6 +420,39 @@ int main(void)
   文件作用域 tag 同名」会按原型解析（`int f(S) int *S; {…}`），写 `struct S` 即可；
 - 只在 `-std=c6` 的翻译单元里生效，`struct Vec v;` 永远可用。
 
+#### 枚举成员写成 `Color.RED`
+
+C 的枚举成员进的是普通标识符命名空间，两个枚举不能有同名成员；c6 让成员可以带上
+枚举自己的 tag，于是每个枚举自带一层空间：
+
+```c
+enum Color { Color.RED = 1, Color.GREEN = 2 };
+enum Fruit { Fruit.RED = 10, Fruit.APPLE = 20 };
+
+int main(void)
+{
+    int n = Color.RED + Fruit.RED;      /* 11：两个 RED 各有各的值 */
+    int m = GREEN + APPLE;              /* 22：没被抢占的裸名照旧可用 */
+    int a[Color.GREEN] = { 0 };         /* 常量表达式 */
+    if (n != 11 || m != 22 || sizeof a / sizeof a[0] != 2)
+        return 1;
+    switch (n) {
+    case Color.GREEN: return 2;         /* case 里也能用 */
+    case 11: return 0;
+    }
+    return 3;
+}
+```
+
+- 限定符必须是这个枚举自己的 tag（C103），匿名枚举的成员不能限定（C104）；
+- 两个枚举都要同一个裸名时，裸名被毒化（C105）：此后裸名报错，必须写
+  `Color.RED` / `Fruit.RED`——它指谁不再取决于书写顺序；
+- `Tag.成员` 是表达式，`if`/`while`/`for` 条件、`case`、数组长度里都能用，
+  枚举里没有这个名字时报 C106。
+
+细节见 [docs/grammar.md](docs/grammar.md) §3.8，用例见
+[tests/enum_scope.c](tests/enum_scope.c) 与 [tests/errors/enum_scope.c](tests/errors/enum_scope.c)。
+
 完整可运行示例见 [examples/typename_demo.c](examples/typename_demo.c)：
 
 ```sh

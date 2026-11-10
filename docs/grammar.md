@@ -573,7 +573,48 @@ tag 本身就是类型名，`struct` / `union` / `enum` 关键字可以省略（
   新的局部不完整 tag：本特性**不做任何隐式前置声明**。
 * 只在 `-std=c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
 
-### 3.8 元组类型 `(T1, T2, ...)`
+### 3.8 枚举成员写成 `Color.RED`
+
+```
+enumerator             = [ tag , "." ] , identifier ,
+                         [ "=" , constant-expression ] ;
+qualified-identifier   = identifier , "." , identifier ;   (* 枚举成员 *)
+```
+
+C 的枚举成员落在**普通标识符命名空间**里，所以两个枚举不能有同名成员：
+
+```c
+    enum Color { RED = 1 };        (* 同时引入标识符 RED *)
+    enum Fruit { RED = 2 };        (* 错：redeclaration of 'RED' *)
+```
+
+c6 允许把成员写成 `<tag>.<成员>`，让每个枚举自带一层空间：
+
+```c
+    enum Color { Color.RED = 1, Color.GREEN = 2, Color.BLUE };
+    enum Fruit { Fruit.RED = 10, Fruit.APPLE = 20 };
+
+    Color.RED                (* 1 *)
+    Fruit.RED                (* 10：两个 RED 各有各的值 *)
+    BLUE                     (* 3：没被抢占的裸名照旧可用 *)
+    int a[Color.BLUE];       (* 常量表达式里也能用 *)
+    switch (c) { case Color.GREEN: … }
+
+    int show(enum Color c) { return c == Color.RED; }
+```
+
+* 限定符必须是**这个枚举自己的 tag**（约束 C103）；匿名枚举没有 tag，成员
+  不能限定（C104）。成员仍照旧注册成裸名，老代码 `RED` 不用改。
+* 两个枚举都要同一个裸名时，裸名会被**毒化**（C105）：此后 `RED` 报错，
+  必须写 `Color.RED` / `Fruit.RED`——它指谁不再取决于书写顺序。
+* `Tag.名字` 是**表达式**，即使 `Tag` 同时也是类型名（§3.7）：`if`、`while`、
+  `for` 的条件，`switch` 的 `case`，数组长度、位域宽度都能用；枚举里没有
+  这个名字时按 C106 报错。
+* 枚举必须已经定义并可见（与裸名同一条规则），不做任何隐式前置声明。
+* 只在 `-std=c6` 的翻译单元里生效；纯 C 翻译单元里 `Color.RED` 仍然是
+  成员访问（`Color` 必须是左值）。
+
+### 3.9 元组类型 `(T1, T2, ...)`
 
 ```
 type-specifier         = "(" , type-name , "," , type-name ,
@@ -622,7 +663,7 @@ tuple-element-access   = postfix-expression , "[" , integer-constant , "]" ;
   解析——只有当括号里是一串“类型 [, 类型…]”且右括号前没有名字时才按元组
   类型解析（解析器做投机 + 回滚）。
 
-### 3.9 函数字面量 `RET (参数) { 体 }`
+### 3.10 函数字面量 `RET (参数) { 体 }`
 
 ```
 function-literal       = type-specifier , [ "!error" ] ,
@@ -815,7 +856,7 @@ primary-expression     = …
                        | try-expression
                        | await-expression
                        | f-string ;                  (* 见 5.1 *)
-                       | function-literal ;          (* 见 3.9 *)
+                       | function-literal ;          (* 见 3.10 *)
 
 f-string               = "f" , string-literal ;      (* const char *，借用的文本 *)
                        | "@" , "f" , string-literal ;
@@ -828,7 +869,9 @@ await-expression       = "await" , unary-expression ;
 qualified-identifier   = identifier , "." , identifier ,
                          { "." , identifier } ;
                          (* 'pkg.member'：第一段必须是已 import 的包名，
-                            否则按普通 C 的成员访问解析；见 C14/R7 *)
+                            否则按普通 C 的成员访问解析；见 C14/R7。
+                            'Tag.MEMBER'（两段，`Tag` 是可见的 enum tag）
+                            是枚举成员常量，见 3.8 与 C103–C106 *)
 
 postfix-expression     = …
                        | postfix-expression , "->" , identifier ,
@@ -1076,6 +1119,10 @@ parameter-list    = identifier , { "," , identifier } ;
 | C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it { ... }'` |
 | C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
 | C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发），第 9 层报错 | `'defer' bodies nested too deeply` |
+| C103 | 枚举成员的限定符必须是这个枚举自己的 tag | `enumerator qualifier 'Other' must be the enum's own tag 'Color'` |
+| C104 | 匿名枚举的成员不能限定 | `the enumerator of an anonymous enum cannot be qualified` |
+| C105 | 两个枚举都要同一个裸成员名时，裸名不再可用，必须写限定名 | `'RED' is the member of more than one enum: write '<enum>.RED'` |
+| C106 | `Tag.成员` 里 `Tag` 必须是可见的枚举，成员必须存在 | `'Fruit' has no member 'APPLE'`；`'Nope' is neither an enum nor an imported package (use 'import Nope;')` |
 
 （C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包，尚未实现。）
 

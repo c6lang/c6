@@ -6537,6 +6537,39 @@ static int in_range(long long n, int t)
     return n >= -(long long)m - 1 && n <= (long long)m;
 }
 
+#ifdef C6_EXT
+/* Bare enumerator spellings claimed by more than one enum in the same scope.
+   With 'enum Color { Color.RED }' / 'enum Fruit { Fruit.RED }' both members
+   are reachable as 'Color.RED' / 'Fruit.RED', but the bare spelling 'RED'
+   cannot mean both: it is poisoned so that a bare use is an error instead of
+   silently picking the enum that happened to be declared first. */
+static int *c6_enum_poison = NULL;
+static int c6_nb_enum_poison = 0, c6_max_enum_poison = 0;
+
+static void c6_enum_poison_add(int v)
+{
+    int i = 0;
+    for (i = 0; i < c6_nb_enum_poison; i++)
+        if (c6_enum_poison[i] == v)
+            return;
+    if (c6_nb_enum_poison == c6_max_enum_poison) {
+        c6_max_enum_poison = c6_max_enum_poison ? 2 * c6_max_enum_poison : 8;
+        c6_enum_poison = tcc_realloc(c6_enum_poison,
+                                     c6_max_enum_poison * sizeof *c6_enum_poison);
+    }
+    c6_enum_poison[c6_nb_enum_poison++] = v;
+}
+
+static int c6_enum_poison_has(int v)
+{
+    int i = 0;
+    for (i = 0; i < c6_nb_enum_poison; i++)
+        if (c6_enum_poison[i] == v)
+            return 1;
+    return 0;
+}
+#endif
+
 /* enum/struct/union declaration. u is VT_ENUM/VT_STRUCT/VT_UNION */
 static void struct_decl(CType *type, int u)
 {
@@ -6640,15 +6673,44 @@ do_decl:
             if (bt)
                 t.t = bt|VT_STATIC|VT_ENUM_VAL;
             for(;;) {
+                int qname = 0;              /* 'Color.RED' (dotted spelling) */
+                char qbuf[256] = {0};
                 v = tok;
                 if (v < TOK_UIDENT)
                     expect("identifier");
+                next();
 #ifdef C6_EXT
+                /* 'enum Color { Color.RED }': an enumerator may carry the
+                   enum's own tag as a qualifier.  The constant is then also
+                   registered under the dotted spelling, so two enums may share
+                   a member name; the bare spelling is only kept when no other
+                   enum already claimed it, and is poisoned otherwise. */
+                if (tcc_state->c6_ext && tok == '.') {
+                    int qtag = v, tagv = s->v & ~SYM_STRUCT;
+                    if (tagv >= SYM_FIRST_ANOM)
+                        tcc_error("the enumerator of an anonymous enum cannot "
+                                  "be qualified");
+                    if (qtag != tagv && c6_mod_name(qtag) != tagv)
+                        tcc_error("enumerator qualifier '%s' must be the "
+                                  "enum's own tag '%s'",
+                                  get_tok_str(qtag, NULL),
+                                  get_tok_str(tagv, NULL));
+                    next();
+                    if (tok < TOK_UIDENT)
+                        tcc_error("enumerator name expected after '.'");
+                    v = tok;
+                    if (strlen(get_tok_str(qtag, NULL))
+                        + strlen(get_tok_str(v, NULL)) + 2 > sizeof qbuf)
+                        tcc_error("enumerator name too long");
+                    snprintf(qbuf, sizeof qbuf, "%s.%s",
+                             get_tok_str(qtag, NULL), get_tok_str(v, NULL));
+                    qname = tok_alloc_const(qbuf);
+                    next();
+                }
                 /* enumerators of a file scope enum are exported names */
                 if (file->c6_module && local_scope == 0)
                     v = c6_mod_name(v);
 #endif
-                next();
                 if (tok == '=') {
                     next();
 		    ll = expr_const64();
@@ -6656,9 +6718,33 @@ do_decl:
                 if (bt && !in_range(ll, t.t))
 		    tcc_error("enumerator '%s' out of range of its type",
 			get_tok_str(v, NULL));
+#ifdef C6_EXT
+                {
+                    int skip_bare = 0;
+                    if (qname) {
+                        Sym *prev = 0;
+                        ss = sym_push(qname, &t, VT_CONST, 0);
+                        ss->enum_val = ll;
+                        *ps = ss, ps = &ss->next;
+                        prev = sym_find_raw(v);
+                        if (prev && sym_scope_ex(prev) == local_scope
+                            && IS_ENUM_VAL(prev->type.t)
+                            && prev->type.ref != s) {
+                            c6_enum_poison_add(v);
+                            skip_bare = 1;
+                        }
+                    }
+                    if (!skip_bare) {
+                        ss = sym_push(v, &t, VT_CONST, 0);
+                        ss->enum_val = ll;
+                        *ps = ss, ps = &ss->next;
+                    }
+                }
+#else
                 ss = sym_push(v, &t, VT_CONST, 0);
                 ss->enum_val = ll;
                 *ps = ss, ps = &ss->next;
+#endif
                 if (ll < nl)
                     nl = ll;
                 if (ll > pl)
@@ -9332,6 +9418,12 @@ special_math_val:
         next();
         s = sym_find(t);
 #ifdef C6_EXT
+        /* a bare enumerator name claimed by two enums in the same scope: the
+           value is not obvious from the spelling, so require 'Color.RED' */
+        if (s && IS_ENUM_VAL(s->type.t) && c6_enum_poison_has(t))
+            tcc_error("'%s' is the member of more than one enum: "
+                      "write '<enum>.%s'", get_tok_str(t, NULL),
+                      get_tok_str(t, NULL));
         c6_lit_scan_note(t, s, c6_scan_uneval);
         c6_lit_cap_check(t, s);     /* a block scope name is a capture */
         if (s && s->c6_cap_kind) {
@@ -9386,6 +9478,17 @@ special_math_val:
                          get_tok_str(seg, NULL));
                 if (n + 1 >= (int)sizeof disp)
                     tcc_error("package name too long");
+                /* 'Color.RED': an enum member written with its enum's tag.
+                   The constant is registered under the dotted spelling (see
+                   struct_decl), so this never depends on the bare name being
+                   unique.  Tried before the package mangling. */
+                mt = tok_alloc_const(disp);
+                if ((s = sym_find(mt)) != NULL && IS_ENUM_VAL(s->type.t)) {
+                    dot_disp = mt;
+                    t = mt;
+                    next();             /* skip the member name */
+                    break;
+                }
                 mt = c6_mangle_tok(pfx, seg);
                 if (!(s = sym_find_raw(mt))) {
                     /* no such member: either the segment was part of the
@@ -9406,9 +9509,15 @@ special_math_val:
                         continue;
                     }
                     /* nothing left to name a member: report it */
-                    if (!c6_pkg_imported(pfx))
-                        tcc_error("'%s' is not an imported package "
-                                  "(use 'import %s;')", pkgdisp, pkgdisp);
+                    if (!c6_pkg_imported(pfx)) {
+                        Sym *tg = struct_find(tok_alloc_const(pfx));
+                        if (tg && IS_ENUM(tg->type.t))
+                            tcc_error("'%s' has no member '%s'",
+                                      pfx, get_tok_str(seg, NULL));
+                        tcc_error("'%s' is neither an enum nor an imported "
+                                  "package (use 'import %s;')",
+                                  pkgdisp, pkgdisp);
+                    }
                     dot_disp = tok_alloc_const(disp);
                     t = mt;
                     break;
@@ -20372,6 +20481,22 @@ static int decl(int l)
     while (1) {
 
         oldint = 0;
+#ifdef C6_EXT
+        /* 'if (Color.RED)', 'while (Color.RED)': a qualified enumerator is an
+           expression even though 'Color' on its own is a type name in c6.
+           Look one token ahead -- 'Tag.' can never start a declaration -- and
+           hand the condition back to gexpr(). */
+        if (tcc_state->c6_ext && l == VT_JMP && tok >= TOK_UIDENT
+            && struct_find(tok)) {
+            int c6_t0 = tok;
+            next();
+            if (tok == '.') {
+                unget_tok(c6_t0);       /* tok = c6_t0, '.' pushed back */
+                return 0;
+            }
+            unget_tok(c6_t0);
+        }
+#endif
 #ifdef C6_EXT
         fallible = 0;
         method_tok = 0;
