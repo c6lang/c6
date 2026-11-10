@@ -528,7 +528,7 @@ int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
 | 包管理 | 单文件导入、`pkg.member`、多级包 | 未导入使用、未知成员 | 跨 TU 链接、与老 C 代码互操作 |
 | 结构体方法 | `p->f()`、方法调方法、sret、`T!error` 方法、不同类型的同名方法（不靠包）、系统头里的 libc 方法 | 不带调用、重复方法、只有 `->` | 纯 C 定义的方法被 `->` 调用、普通调用名有歧义时的弱别名 |
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
-| 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`static`/`for` 声明） | 自动变量、全局、`static` 局部/全局缺初始化器报错 | VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
+| 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`for` 声明） | 自动变量、全局缺初始化器报错 | `static` 变量与 VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
 | 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、局部 tag 的切片、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、`typeof`/`_Generic`/`_Alignof`、接口方法签名、跨 TU |
 | 函数字面量 | 显式声明/就地调用/推断声明/作实参/结构体成员/数组初值/文件作用域与 `static` 初始化器/变参/`!error`+`catch`/`defer` 体/嵌套字面量/`static inline` 体里/`qsort`/C 回调（`abi/`）/C99 后端；V2（捕获式闭包）设计定稿：`closure RET (P…)`、隐式按值捕获、`@` 托管引用、函数指针包装，未实现 | 捕获局部变量、捕获形参、捕获块作用域 typedef 与 tag、遮蔽文件作用域全局、无名字、带存储类、`async`、缺函数体（C80–C83）；V2 另加 C90–C98（见 [closure-design.md](closure-design.md)） | 每处字面量各是一个函数、同一字面量赋给两个变量、和纯 C 函数指针互相赋值、`-emit-header` 不导出、`module` 不改名 |
 | 元组 `(T1, T2)` | 返回值/解构声明/解构赋值/`_`/`t[k]`/参数/成员/数组元素/嵌套/复合字面量/`sizeof`/`async`+`await`/`go`/`!error`/跨 TU/与 struct 的 ABI 互通/单条语句体与语句表达式里的解构 | 元素是 `void`/函数/VLA/数组/不完整/局部 tag/`error`、下标非常量或越界、解构个数不符、混写类型与名字、全 `_`、右边不是元组、非左值目标、`return {…}` 用在标量函数、`float!error` | `#pragma pack` 不影响布局、`(a, b)` 逗号表达式与各种强转/复合字面量不被误判、`_` 别处仍是普通标识符、文件作用域的元组对象 |
@@ -577,7 +577,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 5 `interface` | ✅ | `c6_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`c6_auto_impl_ensure` / `c6_check_method`（惰性校验）、`c6_emit_auto_impls`（TU 末尾生成 `static` vtable）、`c6_iface_call_prep`（调用点改写）、`c6_iface_convert`（隐式/显式转换） |
 | 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；方法符号按接收者取名，所以同名方法跨 TU 也不需要包；`c6_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_c6_macro` / `c6_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
-| 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/alias 豁免；诊断使用 mangle 前的原始标识符 |
+| 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/`static`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
 | 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task, void *frame)` 编译，`c6_async_func_begin` 算帧基址并分发、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把错误槽 park 出去（帧住在任务里，不用搬，清理状态跟着帧走）；运行期 `libtcc1.c` 的 `__c6_co_new`（一次分配任务结构 + 帧）/ `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（按需 malloc + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
 
@@ -772,8 +772,10 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 - 变量初始化检查在**定义点**做（`c6_check_var_initialized`），不做数据流
   分析，因此 `int x; x = 1;` 也会报错；`extern` 声明、形参、结构体/联合体
   成员、`typedef` 不是定义，不受约束；
-- VLA 是初始化规则的唯一豁免：标准 C 不允许 `int a[n] = …`，所以 VLA 仍可
-  不带初始化器；
+- 初始化规则有两类豁免：`static` 变量（文件作用域或块作用域）——`static`
+  声明本身就是常驻状态的写法，C 保证静态存储期对象清零，写 `= 0` 只是
+  噪声，不带初始化器还让它留在 `.bss` 而不是 `.data`；VLA——标准 C 不允许
+  `int a[n] = …`，所以 VLA 仍可不带初始化器；
 - 这条规则是**按翻译单元**生效的：不加 `-std=c6` 的旧代码零变化
   （plain 构建下 tests2 仍 134 项全过，c6 的自测在 `tests/` 单独跑）；
   给某个 TU 开启扩展后，该 TU 内所有定义都要补初始化器，K&R 形参声明表除外。TCC 会把显式 `= {0}` 的

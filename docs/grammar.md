@@ -213,27 +213,30 @@ function-definition    = declaration-specifiers ,
 
 ### 3.1 变量定义必须初始化
 
-约束 C19 要求**每个变量定义都带初始化器**：
+约束 C19 要求**每个变量定义都带初始化器**，`static` 变量与 VLA 除外：
 
 ```
     int g = 0;                      (* 文件作用域的定义也要写 *)
-    static int counter = 0;
+    static int counter;             (* 合法：static 变量豁免 *)
 
     void f(void)
     {
         int i = 0;
         int a[3] = {1, 2, 3};
         struct S s = {0};
-        static int calls = 0;
+        static int calls;                (* 合法：块作用域的 static 同样豁免 *)
         extern int declared_elsewhere;   (* 合法：声明，不是定义 *)
-        int vla[n];                      (* 合法：VLA 是唯一豁免 *)
+        int vla[n];                      (* 合法：VLA 不允许写初始化器 *)
     }
 ```
 
 规则在**定义点**检查，不做数据流分析（`int x; x = 1;` 一样报错）。
 下列构造不是“变量定义”，因此不受约束：`extern` 声明、函数形参（含 K&R
 形参声明表）、结构体/联合体成员、`typedef`、函数声明与定义。
-VLA 是唯一例外——标准 C 不允许给变长数组写初始化器，所以只能豁免。
+两类豁免：`static` 变量（文件作用域或块作用域）——`static` 声明本身就是
+「这是一份常驻状态」的写法，标准已经保证静态存储期对象零初始化
+（C11 6.7.9p10），写 `= 0` 只是噪声，而且不带初始化器的对象落在 `.bss`、
+不占输出文件；VLA 则是因为标准 C 不允许给变长数组写初始化器。
 
 诊断里使用源码中书写的标识符：`package` 内的变量报原名，而不是
 `NAME__x`。
@@ -1121,7 +1124,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C16 | `err` 必须带 `id` 与 `msg` 两个实参（没有重抛形式） | `'err' requires an error id and a message` |
 | C17 | `err` 只能出现在返回 `T!error` 的函数里 | `'err' requires the enclosing function to return 'T!error'` |
 | C18 | `error` 只能作为返回值，不能作为形参（含 `error*` / `error[]`，K&R 形参声明也算） | `'error' can only be a return type, not a parameter` |
-| C19 | 每个变量定义都必须带初始化器（`extern` 声明、形参、成员、`typedef` 除外；VLA 豁免） | `variable 'x' must be initialized` |
+| C19 | 每个变量定义都必须带初始化器（`extern` 声明、形参、成员、`typedef`、`static` 变量除外；VLA 豁免） | `variable 'x' must be initialized` |
 | C20 | 方法调用要求：接收者是指向结构体/联合体的指针、该类型有同名方法、没有同名字段、方法在调用点之前已声明，且方法后面必须紧跟 `(` | `method 'f' must be called`；`duplicate method 'f' for 'T'`；其它情况按普通成员访问报 `field not found: f` |
 | C21 | 结构体到接口的转换要求接口的每个方法都在**转换点之前**可见且签名兼容 | `'T' does not implement interface 'I': missing method 'm'`；`method 'm' of 'I' has an incompatible return type` / `… parameter` / `… wrong number of parameters` |
 | C22 | `[:]` 的元素必须是完整对象类型（不能是 `void`、函数、不完整类型或 VLA），且不能是 `error` | `'[:]' cannot have a 'void' element type`；`'[:]' requires a complete element type, not 'T'`；`'[:]' cannot have a function element type`；`'[:]' cannot have a variable length array element`；`'error' can only be a return type, not a slice element` |
@@ -2004,7 +2007,7 @@ int main(void)
 | `void f(error e);` / `void f(error *e);` | 约束 C18：错误只从返回值出来 |
 | `f() catch e;`（无处理块） | 语法错误 |
 | `catch e { … }` 单独出现 | 约束 C7 |
-| `int x;` / `static int x;` / `int a[3];`（不带初始化器的定义） | 约束 C19，VLA 除外 |
+| `int x;` / `int a[3];`（不带初始化器的定义） | 约束 C19，`static` 变量与 VLA 除外 |
 | `Vec { int x, y; };`（定义处省略 `struct`） | 仍要写 `struct`：裸 `TAG { … }` 分不清 struct/union，也容易和初始化器混淆 |
 | `stat st;`（tag 名被函数/变量遮蔽） | 约束 C41：按普通 C 解析，需要类型时写 `struct stat` |
 | `S *p;` 而 `S` 未声明 | 约束 C41：不会隐式前置声明 tag，报 `'S' undeclared` |

@@ -361,8 +361,9 @@ extern long double strtold (const char *__nptr, char **__endptr);
 #define ST_FUNC
 #endif
 /* The globals declared below are defined once, in their xxx.c file, in the
-   ONE_SOURCE build as well.  A 'static int x;' would be a tentative
-   definition without initializer, which the c6 extension rejects. */
+   ONE_SOURCE build as well, so they are only declared here: a 'static int x;'
+   in this header would give every translation unit that includes it a
+   separate copy of the state. */
 #define ST_DATA extern
 
 #ifdef TCC_PROFILE /* profile all functions */

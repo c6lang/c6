@@ -6757,7 +6757,7 @@ typedef struct C6GenAppl {  /* an applied template, once */
 
 static C6GenPs c6_gen_ps(C6Gen *g)
 {
-    C6GenPs ps;
+    C6GenPs ps = {0};
 
     ps.nparams = g->nparams;
     ps.ptok = g->ptok;
@@ -6768,7 +6768,7 @@ static C6GenPs c6_gen_ps(C6Gen *g)
 
 static C6GenPs c6_gen_ps_fn(C6GenFn *fn)
 {
-    C6GenPs ps;
+    C6GenPs ps = {0};
 
     ps.nparams = fn->nparams;
     ps.ptok = fn->ptok;
@@ -7897,7 +7897,7 @@ static Sym *c6_gen_fn_apply(int name)
     C6GenFn *fn = c6_gen_fn_find(name);
     CType args[C6_GEN_MAX_PARAM] = {{0}};
     long vals[C6_GEN_MAX_PARAM] = {0};
-    C6GenPs ps;
+    C6GenPs ps = {0};
     int nargs = 0;
 
     if (!fn || fn->kind != C6_GEN_FUNC)
@@ -7916,7 +7916,7 @@ static int c6_gen_typedef_btype(CType *type)
     CType args[C6_GEN_MAX_PARAM] = {{0}};
     long vals[C6_GEN_MAX_PARAM] = {0};
     Sym *sym = 0, **bound = 0;
-    C6GenPs ps;
+    C6GenPs ps = {0};
     char mangle[4096] = {0};
     int nargs = 0, ntok = 0;
     int save_global = 0, save_scope = 0;
@@ -8018,7 +8018,7 @@ static int c6_gen_flush(void)
     while (c6_gen_pend) {
         C6GenPend *p = c6_gen_pend;
         Sym **bound = 0;
-        C6GenPs ps;
+        C6GenPs ps = {0};
         int save_global = c6_sym_global, save_scope = local_scope;
 
         c6_gen_pend = p->next;
@@ -22353,16 +22353,18 @@ static void c6_check_error_param(CType *type)
 /* Every variable definition must come with an initializer.  Declarations
    ('extern' objects, function prototypes, typedefs), parameters, struct
    members and alias objects are not definitions and are exempt; so are VLAs,
-   because C forbids initializing a variable length array.  The check runs
-   before TCC turns a tentative global definition into an 'extern' one, and
-   before a 'package' mangles the name, so the diagnostic shows the name as
-   written. */
+   because C forbids initializing a variable length array, and 'static'
+   objects, which C already zero-initializes -- a 'static' declaration is
+   how one asks for persistent state, and making it spell '= 0' adds
+   nothing but noise.  The check runs before TCC turns a tentative global
+   definition into an 'extern' one, and before a 'package' mangles the name,
+   so the diagnostic shows the name as written. */
 static void c6_check_var_initialized(CType *type, int has_init, int v,
                                          AttributeDef *ad)
 {
     if (!tcc_state->c6_ext || has_init)
         return;
-    if (type->t & (VT_EXTERN | VT_TYPEDEF | VT_VLA))
+    if (type->t & (VT_EXTERN | VT_TYPEDEF | VT_VLA | VT_STATIC))
         return;
     if ((type->t & VT_BTYPE) == VT_FUNC)
         return;
