@@ -20,6 +20,8 @@ struct Bad@T { Bad@(T *) p; };
 // EXPECT test_value_arg_range: error: value argument 40000 does not fit in 'short'
 // EXPECT test_value_param_type: error: a value parameter must be an integer type no wider than 'int'
 // EXPECT test_value_arg_parens: error: 'Arr' takes a value argument here: write 'Arr@(...)'
+// EXPECT test_instance_name_taken: error: the instance name 'Vect_int' is already in use
+// EXPECT test_two_instances: error: cannot convert 'struct Vect_char' to 'struct Vect_int'
 // EXPECT test_bad_kind: error: redefinition of template 'Vect' as a different kind
 // EXPECT test_param_before_use: error: type parameter 'T' is used before it is declared: write '|T| T vat(...)'
 // EXPECT test_same_name: error: a type parameter cannot have the same name as its template
@@ -88,6 +90,21 @@ int main(void)
 #elif defined test_value_param_type
 struct Buf@(T, long long N) { T a[1]; };
 int main(void) { return 0; }
+#elif defined test_instance_name_taken
+struct Vect_int { long x; };
+int main(void)
+{
+    Vect@int v = {0, 0};
+    return v.x;
+}
+#elif defined test_two_instances
+int main(void)
+{
+    Vect@int a = {0, 0};
+    Vect@char b = {0, 0};
+    a = b;
+    return a.x;
+}
 #elif defined test_value_arg_parens
 struct Arr@(int N) { int d[N]; };
 int main(void)

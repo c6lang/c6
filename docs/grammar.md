@@ -725,9 +725,13 @@ Vect_int` 即可互通。
 符号（`Buf@(int, -4)` → `struct Buf_int_m4`）。值实参**一律带括号**：常量
 表达式不会像类型那样自己停下来，`Arr@4(x)` 会被读成 `4(x)`。
 
-**未落地**：`-emit-header` 的实例输出，模块前缀与实例名冲突检查，体内成员
-函数（`struct Vect@T { T at(int i) { … } }`）。裸模板名是 C103 诊断，不是
-类型。
+**实例名是普通 tag**：`module` 下和别的文件作用域名字一样带前缀
+（`module m2;` 里 `Vect@int` 是 `struct m2__Vect_int`，方法 `m2__Vect_int_vat`），
+`-emit-header` 因此直接写出 `struct m2__Vect_int` 和实例函数原型，跨 TU 一致。
+用户手写同名 tag → `the instance name 'Vect_int' is already in use`。
+
+**未落地**：体内成员函数（`struct Vect@T { T at(int i) { … } }`，§8.5）。
+裸模板名是 C103 诊断，不是类型。
 
 完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
 [generics-design.md](generics-design.md)。
@@ -1128,7 +1132,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C107 | 模板体内不能实例化自己（唯一会自噬的递归源） | `cannot instantiate '%s' inside its own definition` |
 | C108 | 实例化点必须在模板定义之后，前向声明的模板不能直接实例化 | `instantiation of undefined template '%s'` |
 | C110 | 值形参的实参必须是常量表达式、能装进形参类型；形参宽度不超过 `int` | `constant expression expected`；`value argument %lld does not fit in '%s'`；`a value parameter must be an integer type no wider than 'int'`；`a value parameter is written '<type> NAME'` |
-| C111 | 每个 TU 最多 1024 个实例 | `too many generic instantiations in one translation unit (max 1024)` |
+| C111 | 每个 TU 最多 1024 个实例；实例名是保留的 ABI 名，不能被手写 tag 占用 | `too many generic instantiations in one translation unit (max 1024)`；`the instance name '%s' is already in use: rename the struct` |
 | C112 | 实例化嵌套最多 64 层 | `generic instantiation nested too deeply (max 64)` |
 | C113 | `enum` 不能带形参 | `enums cannot have type parameters` |
 | C114 | 实例名前面不能写 `struct`：`struct Vect@int v;` 不是实例 | `an instance drops 'struct': write '%s@...'` |
@@ -1988,7 +1992,7 @@ int main(void)
 | `has()` 返回非整数 / `next()` 返回数组、`void`、不完整类型 | 约束 C99/C49 |
 | `has()`/`next()` 带多余形参 | 约束 C99：两个方法只接收 receiver |
 | `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
-| 泛型 `Vect@int` / `struct Vect@T` | 已落地（阶段 1）：见 §3.10 与 [generics-design.md](generics-design.md)；容器迭代仍建议 `foreach` |
+| 泛型 `Vect@int` / `struct Vect@T` | 已落地（阶段 1）：见 §3.10 与 [generics-design.md](generics-design.md)；实例名带模块前缀、`-emit-header` 可导出；容器迭代仍建议 `foreach` |
 | 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c` |
 | 泛型值形参 `Buf@(T, 4)` / `struct Buf@(T, int N)` | 已落地：实参是常量表达式，体内当常量用（可作数组长度），见 §3.10 |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |

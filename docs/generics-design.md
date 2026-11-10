@@ -187,7 +187,7 @@ mangle（跨 TU 稳定、`-emit-header` 可写、与既有 `<Tag>_<name>` 方法
 实参的 mangle 拼法：标量用拼写、指针加 `_p`、切片前缀 `slice_`、元组前缀
 `tuple_`、托管引用前缀 `m_`（与普通指针区分，`@Node` 和 `Node *` 不会撞名）。
 
-实例名属于**保留的 ABI 名**：用户手写同名 struct/函数 → 冲突诊断（见 §8 未决项）。
+实例名属于**保留的 ABI 名**：用户手写同名 struct → `the instance name 'Vect_int' is already in use`（§8.1）。
 
 ### 2.2 模板本体是一个永不完整的类型
 
@@ -441,7 +441,7 @@ void f(Vect@int *v) {
 |3|`parse_btype()` 的模板名第三查（`sym_find` → `struct_find` → 模板）+ `@` 实参解析 + mangle|✅|
 |4|`skip_or_save_block` 捕获 + 重放实例化（`typedef` 绑形参 + `c6_decl_tokens`）|✅|
 |5|函数/typedef 模板的 `\|…\|` 前缀（方法要用它）|✅ `\|T\| T vat(Vect@T *, int)`、`\|K, V\|`、`\|T\| typedef …`；先声明后定义、`T!error`、`go`/`thread` 都可用|
-|6|约束 C103–C116|部分：C103/C104/C105/C107/C108/C110–C116 已有诊断 + 用例；C106/C109 待补|
+|6|约束 C103–C116|✅ C103–C116 都有诊断 + 用例（C106 与 C104 同一条消息：多参数必须加括号）；C109 由普通类型检查给出（`cannot convert 'struct Vect_char' to 'struct Vect_int'`）|
 |7|方法：实例 tag 注册 + 接收者定类型调用|✅ 两种都行：接收者写具体实例（`int vect_sum(Vect@int *v)`），或 `\|T\|` 一份覆盖所有实例（`p->vat(0)` 按 `p` 的实例定 T）|
 
 **阶段 2（补齐）**
@@ -450,8 +450,8 @@ void f(Vect@int *v) {
 |---|---|---|
 |8|值形参（常量绑定）+ C110|✅ `struct Buf@(T, int N)` / `Buf@(int, 4)`，mangle 带实参拼写，`\|T, int N\|` 方法模板可覆盖所有实例（`tests/generic.c`、`tests/abi/generic.c`）|
 |9|模板前向声明 + C108|✅ `struct Fwd@T;` 可用；实例化报 `instantiation of undefined template`|
-|10|实例上限 C111/C112；`-emit-header` 输出实例|C111/C112 ✅（1024 / 64）；`-emit-header` ⬜|
-|11|`module`/`package` 前缀（模板名、实例 mangle 名，§8.4）与实例名冲突检查（§8.1）|⬜ 现在模板是 TU 内的裸名字|
+|10|实例上限 C111/C112；`-emit-header` 输出实例|✅ C111/C112（1024 / 64）；`-emit-header` 用实例名写出 `struct pkg__Vect_int` 与实例函数原型|
+|11|`module`/`package` 前缀（模板名、实例 mangle 名，§8.4）与实例名冲突检查（§8.1）|✅ 实例名与普通名字一样带模块前缀（`m2__Vect_int`、`m2__id_int`、`m2__MyVec_char`），所以符号与 `-emit-header` 输出一致；用户手写同名 tag → `the instance name 'Vect_int' is already in use`|
 
 **阶段 3（收敛）**
 
@@ -466,7 +466,7 @@ void f(Vect@int *v) {
 |---|---|
 |`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/值形参/函数体内定义模板，18 个 `test` 块|
 |`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块|
-|`tests/errors/generic.c`|C103/C104/C105/C107/C108/C110/C113/C114/C115、重复形参、模板名撞名负例，19 个片段|
+|`tests/errors/generic.c`|C103–C116 的负例：裸模板名、实参个数、实参类型、重复/撞名形参、值形参、`\|…\|` 用法、实例名占用、实例互赋，21 个片段|
 |`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，值形参实例 = `struct Buf_int_4`|
 |`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致|
 

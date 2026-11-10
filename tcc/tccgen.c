@@ -6952,7 +6952,7 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
     Sym **bound = 0;
     C6GenPs ps = c6_gen_ps(g);
     char name[4096] = {0};
-    int i = 0, save_global = 0, save_scope = 0;
+    int i = 0, mtag = 0, save_global = 0, save_scope = 0;
 
     if (nargs != g->nparams) {
         char sig[512] = {0};
@@ -6968,8 +6968,11 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
                   g->nparams > 1 ? ")" : "");
     }
     c6_gen_mangle(g, args, vals, nargs, name, sizeof name);
+    /* an instance is an ordinary tag, so a module prefixes it like any other
+       file scope name ('pkg__Vect_int'); the token doubles as the cache key */
+    mtag = c6_mod_name(tok_alloc_const(name));
     for (inst = c6_gen_insts; inst; inst = inst->next)
-        if (!strcmp(get_tok_str(inst->tag, NULL), name))
+        if (inst->tag == mtag)
             return inst->type;      /* includes the in-progress instance */
     if (!g->body)
         tcc_error("instantiation of undefined template '%s'",
@@ -6980,9 +6983,15 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
     if (c6_nb_gen_insts >= C6_GEN_MAX_INST)
         tcc_error("too many generic instantiations in one translation unit "
                   "(max %d)", C6_GEN_MAX_INST);
+    /* an instance name is a reserved ABI name: 'struct Vect_int' written by
+       hand is the same tag, and silently adopting it would let the two
+       disagree about the layout */
+    if (struct_find(mtag))
+        tcc_error("the instance name '%s' is already in use: rename the "
+                  "struct", get_tok_str(mtag, NULL));
 
     inst = tcc_mallocz(sizeof *inst);
-    inst->tag = tok_alloc_const(name);
+    inst->tag = mtag;
     inst->gen = g;
     inst->nargs = nargs;
     inst->args = tcc_malloc(nargs * sizeof *inst->args);
@@ -7435,7 +7444,8 @@ static Sym *c6_gen_fn_instance(C6GenFn *fn, CType *args, long *vals, int nargs)
         /* a method keeps the name it was written with: '<receiver>_<name>'
            already tells the instances apart, and the plain name is what
            'p->name()' looks up.  A free function is renamed to the mangle. */
-        int decl_name = fn->recv ? fn->name : tok_alloc_const(mangle);
+        int decl_name = fn->recv ? fn->name
+                                 : c6_mod_name(tok_alloc_const(mangle));
         TokenString *ts = c6_gen_decl_copy(fn, decl_name);
         /* the instance is a file scope declaration even when the template is
            applied inside a block: no block-scope copy of it may be made, or
@@ -7554,7 +7564,7 @@ static int c6_gen_typedef_btype(CType *type)
     if (++c6_gen_depth > C6_GEN_MAX_DEPTH)
         tcc_error("generic instantiation nested too deeply (max %d)",
                   C6_GEN_MAX_DEPTH);
-    ntok = tok_alloc_const(mangle);
+    ntok = c6_mod_name(tok_alloc_const(mangle));
     {
         TokenString *ts = c6_gen_decl_copy(fn, ntok);
         c6_decl_tokens(ts);
