@@ -785,7 +785,7 @@ pattern-element        = type-specifier , declarator      (* 解构声明 *)
 - `has()` 返回整数（含 `_Bool`/`enum`），非零才调用 `next()`；`E` 是
   `next()` 的声明返回类型，必须是完整、可赋值的对象类型（不能是 `void`、
   数组或函数；`void *` 因元素类型被擦除而拒绝）；
-- 迭代器只有值绑定：`foreach |v| it` 或 `foreach |_| it`（后者仍调用
+- 迭代器只有值绑定：`foreach |v| it { … }` 或 `foreach |_| it { … }`（后者仍调用
   `next()` 推进）。“值形态”把迭代器状态复制进隐藏槽，循环不推进原对象；
   `T *` 与接口值直接操作原对象（`next()` 的修改可见）；
 - 迭代器和元素可以是托管引用 `@T`：隐藏槽按声明的托管局部量处理
@@ -1026,13 +1026,13 @@ parameter-list    = identifier , { "," , identifier } ;
 | C41 | 裸 tag 只有在该 tag 可见、且同名**普通符号**（变量/函数/枚举常量/typedef）不在作用域内时才当作类型名；只接受已声明的 tag，不隐式前置声明；语句开头的 `TAG:` 仍是标签；K&R 定义里形参名与 tag 同名时按原型解析 | —（遮蔽/未声明时按普通 C 解析：`';' expected`、`'X' undeclared`、`initialization of incomplete type`） |
 | C42 | `foreach` 只能出现在函数体内 | `'foreach' can only be used inside a function` |
 | C43 | 绑定表是 1 或 2 个标识符（`_` 表示丢弃） | `'foreach' expects a binding name`；`'foreach' takes at most two bindings` |
-| C44 | 数组/切片要两个绑定 | `an array or slice yields an index and a value: write 'foreach \|i, v\| a'` |
-| C45 | 区间只要一个绑定 | `a range yields only an index: write 'foreach \|i\| lo:hi'` |
+| C44 | 数组/切片要两个绑定 | `an array or slice yields an index and a value: write 'foreach \|i, v\| a { ... }'` |
+| C45 | 区间只要一个绑定 | `a range yields only an index: write 'foreach \|i\| lo:hi { ... }'` |
 | C46 | 两个绑定不能都丢弃 | `'foreach' discards both binders` |
-| C47 | 可迭代对象只能是完整数组、切片、整数区间，或提供 `has()`/`next()` 的迭代器 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi')`；`cannot iterate over 'T' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')` |
+| C47 | 可迭代对象只能是完整数组、切片、整数区间，或提供 `has()`/`next()` 的迭代器 | `cannot iterate over a variable length array`；`cannot iterate over an array of unknown length`；`cannot iterate over 'T *' (no 'has'/'next' iterator: use a slice parameter 'T[:]', or '(T[:]){p, n}')`；`cannot iterate over 'int' (write a range: 'foreach \|i\| lo:hi { ... }')`；`cannot iterate over 'T' (no 'has'/'next' iterator: expose a slice member 'T[:] items', or define 'int has(T *); E next(T *);')` |
 | C48 | 区间两个界必须是整数 | `range bounds must be integers` |
 | C49 | 元素类型必须可赋值且完整 | `'foreach' cannot copy an element of type 'T'`；`cannot iterate over incomplete element type 'T'` |
-| C50 | 循环体必须是复合语句 | `'{' expected` |
+| C50 | 循环体必须是复合语句（数组/切片、区间、迭代器三种形态共用这一处检查；C44/C45/C100 的提示里那个 `{ ... }` 就是这条要求） | `'{' expected` |
 | C51 | 元组元素类型必须完整、非 `void`、非函数类型、非变长数组、非数组 | `'tuple' element cannot be 'void'`；`'tuple' element cannot be a function type`；`'tuple' element cannot be a variable length array`；`'tuple' element cannot be an array type (use a pointer, a slice 'T[:]' or a struct)`；`'tuple' requires a complete element type, not 'T'` |
 | C52 | 元素类型的 tag 必须在文件作用域 | `the element type of a tuple must be declared at file scope, but 'T' is local` |
 | C53 | `error` 不能作元组元素 | `'error' can only be a return type, not a tuple element` |
@@ -1073,7 +1073,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C88 | 插值里不能用 `try`（错误路径会直接返回，运行时的构造器留在栈上）；`;` 只能出现一次（引入格式说明），语句表达式里的 `;` 同样被拒绝 | `'try' is not allowed in an interpolation: ...`；`f-string: ';' is only allowed once, to start the format spec ('{expr;spec}')` |
 | C89 | 格式说明要与插值的静态类型相容，`conv` 必须是已知的，宽度/精度不超过 1023，`;` 后面不能为空 | `f-string: unknown conversion 'z' in a format spec`；`f-string: a 'const char *' value takes no 'x' format spec`；`f-string: format width 2000 is too large`；`f-string: empty format spec in '{expr;spec}'` |
 | C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver`；`iterator method 'next' cannot return a borrowed managed reference 'T'` |
-| C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it'` |
+| C100 | 迭代器只产生一个值绑定 | `an iterator yields only a value: write 'foreach \|v\| it { ... }'` |
 | C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
 | C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发），第 9 层报错 | `'defer' bodies nested too deeply` |
 
@@ -1913,7 +1913,7 @@ int main(void)
 | `for a \|i, v\| { }` / `for 0..n` | `for` 保持纯 C；迭代请用 `foreach` |
 | `foreach a { }`（不写绑定表） | 语法错误：绑定表必须紧跟 `foreach` |
 | `foreach (a) \|i, v\| { }`（括号形式） | 不支持：`foreach` 后面直接跟绑定表 |
-| `foreach \|i, v\| a v = 1;`（没有花括号） | 约束 C50 |
+| `foreach \|i, v\| a v = 1;`（没有花括号） | 约束 C50（三种形态都一样：数组/切片、区间 `\|i\| lo:hi`、迭代器 `\|v\| it`） |
 | 文件作用域的 `foreach \|i, v\| a { }` | 约束 C42 |
 | `foreach \|i, v\| p { }`（`p` 是指针） | 约束 C47：先写 `(T[:]){p, n}` |
 | `foreach \|i, v\| 5 { }`（整数） | 约束 C47：整数要先写成区间 `0:5` |

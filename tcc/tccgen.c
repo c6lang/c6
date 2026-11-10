@@ -17912,7 +17912,8 @@ static void c6_foreach_parse(void)
         next();
         expr_cond();
         if (nb != 1)
-            tcc_error("a range yields only an index: write 'foreach |i| lo:hi'");
+            tcc_error("a range yields only an index: "
+                      "write 'foreach |i| lo:hi { ... }'");
         if (!c6_is_int_type(&vtop[-1].type) || !c6_is_int_type(&vtop->type))
             tcc_error("range bounds must be integers");
         ctr = c6_common_int_type(&vtop[-1].type, &vtop->type);
@@ -17941,7 +17942,7 @@ static void c6_foreach_parse(void)
             is_iter = 1;
             if (nb != 1)
                 tcc_error("an iterator yields only a value: "
-                          "write 'foreach |v| it'");
+                          "write 'foreach |v| it { ... }'");
             elem = it.elem;
             c6_gc_value_check(&it.obj, "an iterable");
             /* A borrowed managed parameter needs no reference of its own;
@@ -17981,14 +17982,14 @@ static void c6_foreach_parse(void)
                     tcc_error("cannot iterate over an array of unknown length");
                 if (nb != 2)
                     tcc_error("an array or slice yields an index and a value: "
-                              "write 'foreach |i, v| a'");
+                              "write 'foreach |i, v| a { ... }'");
                 elem = *pointed_type(&t);
                 elem.t &= ~VT_QUAL;
                 pair = c6_slice_spill(NULL);
             } else if ((sl = c6_slice_of_type(&t)) != NULL) {
                 if (nb != 2)
                     tcc_error("an array or slice yields an index and a value: "
-                              "write 'foreach |i, v| a'");
+                              "write 'foreach |i, v| a { ... }'");
                 elem = sl->elem;
                 pair = c6_slice_spill(sl);
             } else {
@@ -17999,7 +18000,7 @@ static void c6_foreach_parse(void)
                               "'(T[:]){p, n}')", buf);
                 if (c6_is_int_type(&t))
                     tcc_error("cannot iterate over '%s' (write a range: "
-                              "'foreach |i| lo:hi')", buf);
+                              "'foreach |i| lo:hi { ... }')", buf);
                 tcc_error("cannot iterate over '%s' (no 'has'/'next' iterator: "
                           "expose a slice member 'T[:] items', or define "
                           "'int has(T *); E next(T *);')", buf);
@@ -18074,8 +18075,13 @@ static void c6_foreach_parse(void)
         vstore();
         vpop();
     }
+    /* The body is a block (constraint C50).  This is the one and only place
+       that enforces it: it sits after all three iterable kinds (array/slice,
+       range, iterator) have been parsed, so every form goes through it.  If
+       the check is ever moved into a branch, each branch needs its own
+       'no block' case in tests/errors/foreach*.c. */
     if (tok != '{')
-        expect("'{'");                              /* the body is a block */
+        expect("'{'");
     b = 0;                      /* no 'continue' jumps yet */
     lblock(&a, &b);
     body_ok = !nocode_wanted;
