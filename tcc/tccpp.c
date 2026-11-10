@@ -2999,7 +2999,10 @@ static void parse_number(const char *p)
 /* return next token without macro substitution */
 static void next_nomacro(void)
 {
-    int t = 0, c = 0, is_long = 0, is_fstr = 0, len = 0;
+    int t = 0, c = 0, is_long = 0, len = 0;
+#ifdef C6_EXT
+    int is_fstr = 0;
+#endif
     TokenSym *ts = 0;
     uint8_t *p = 0, *p1 = 0;
     unsigned int h = 0;

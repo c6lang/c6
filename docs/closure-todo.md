@@ -485,9 +485,12 @@ env 只放标量/指针/无托管结构体。托管捕获留到 P2，但扫描/�
   make c99selfhost
   ```
 
-  （`make test-plain` 依赖 `build-plain`，它后来在 `main` 上单独坏了：关掉
-  `C6_EXT` 编 `tccgen.c` 报 `unknown type name 'C6Sticky'`，与闭包无关，
-  修好之后这条再补回来。）
+  （`make test-plain` 依赖 `build-plain`。这条在 `main` 上一度单独坏过：关掉
+  `C6_EXT` 编 `tccgen.c` 会报 `unknown type name 'C6Sticky'`（泛型那一大段
+  生成器代码没有 `#ifdef C6_EXT`，还引用了 `c6_sym_global`、`c6_gen_inst_cur`
+  这些只在扩展模式里声明的名字）。已把生成器那一段整体包进 `#ifdef C6_EXT`、
+  把 `struct_decl()` 里两个普通 `int` 局部量挪到守卫外面，现在 `make
+  build-plain` 与 `make test-plain` 都是干净的（零告警）。）
 
 - 自查：V1 的 `tests/fn_lit.c`、`tests/errors/fn_lit.c`、`tests/abi/fn_lit*`
   一行不改，仍然照旧通过。
