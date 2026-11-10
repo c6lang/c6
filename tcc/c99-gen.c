@@ -169,6 +169,20 @@ typedef struct C99GSym {
     int by_name;                 /* referenced by name, so it must be emitted */
     long long value, size;
 } C99GSym;
+/* the definition signature of a function this unit emits, kept for the plain
+   name of a method (see c99_output_file): the method itself is the mangled
+   name '<tag>_<name>', and a compiler without the GNU alias attribute needs
+   a forwarder function to give the source name a symbol of its own */
+typedef struct C99Sig {
+    char *name;                  /* the name the definition is emitted under */
+    char *params;                /* its parameter list, named __c99_aN */
+    char *ret;                   /* its return type ('void' when it has none) */
+    int nparams;                 /* parameters named __c99_aN, i.e. without
+                                    the hidden struct-return pointer */
+    int sret;                    /* the first parameter is that pointer */
+    int variadic;                /* '...' cannot be forwarded */
+    struct C99Sig *next;
+} C99Sig;
 
 static C99GSym *c99_gsym_at(int shndx, unsigned long off);
 
@@ -204,6 +218,7 @@ static C99Mark *c99_marks; static int c99_nmarks, c99_marks_size;
 static C99Lbl  *c99_lbls;  static int c99_nlbls,  c99_lbls_size;
 static C99Pl  **c99_pls;   static int c99_npls,   c99_pls_size;
 static C99Decl *c99_decls;
+static C99Sig  *c99_sigs;
 static C99GSym *c99_gsyms; static int c99_ngsyms, c99_gsyms_size;
 static unsigned char *c99_used; static int c99_used_size;
 static int c99_have_main;            /* __c99_init() is only called from main */
@@ -627,12 +642,21 @@ static void c99_add_decl(const char *name, const char *text);
 static int c99_is_c_ident(const char *s);
 static int c99_small_sret(CType *ret, CType *rt, int *align, int *regsize);
 
+/* The va_list walker the generated file header defines (see c99_output_file).
+   The front-end expands va_arg() into a call of tcc's own built-in helper
+   '__va_arg', so that is the name the generated code would use; but a second
+   tcc compiling the output would then see the header's definition as an
+   incompatible redefinition of the prototype include/tccdefs.h supplies, so
+   the generated file calls it by a private name instead. */
+#define C99_VA_ARG_NAME "__c99_va_arg"
+
 /* names the generated file header declares or defines itself (see
    c99_output_file): no prototype may be emitted for these */
 static int c99_header_name(const char *name)
 {
     return !strcmp(name, "memcpy") || !strcmp(name, "memmove")
-        || !strcmp(name, "memset") || !strcmp(name, "__va_arg");
+        || !strcmp(name, "memset") || !strcmp(name, "__va_arg")
+        || !strcmp(name, C99_VA_ARG_NAME);
 }
 
 /* a symbol defined in another translation unit */
@@ -894,6 +918,53 @@ static const char *c99_test_name(const char *name)
         && name && !strcmp(name, "main"))
         return "__c99_orig_main";
     return name;
+}
+
+/* the identifier a called function is emitted under: the built-in va_arg
+   helper gets the private name the header defines */
+static const char *c99_emit_name(const char *name)
+{
+    if (name && !strcmp(name, "__va_arg"))
+        return C99_VA_ARG_NAME;
+    return name;
+}
+
+/* remember the signature SIG of the function defined under NAME: the plain
+   name of a method is emitted as a forwarder built from it (see
+   c99_output_file).  SIG is "<ret> <name>(<params>)\n{\n", so the parameter
+   list runs from its first to its last parenthesis. */
+static void c99_sig_add(const char *name, const char *sig, const char *ret,
+                        int nparams, int sret, int variadic)
+{
+    C99Sig *s = tcc_mallocz(sizeof *s);
+    const char *p = sig ? strchr(sig, '(') : NULL;
+    const char *q = sig ? strrchr(sig, ')') : NULL;
+
+    s->name = tcc_strdup(name);
+    if (p && q && q > p + 1) {
+        int len = q - p - 1;
+        s->params = tcc_malloc(len + 1);
+        memcpy(s->params, p + 1, len);
+        s->params[len] = 0;
+    } else {
+        s->params = tcc_strdup("void");
+    }
+    s->ret = tcc_strdup(ret);
+    s->nparams = nparams;
+    s->sret = sret;
+    s->variadic = variadic;
+    s->next = c99_sigs;
+    c99_sigs = s;
+}
+
+static C99Sig *c99_sig_find(const char *name)
+{
+    C99Sig *s;
+
+    for (s = c99_sigs; s; s = s->next)
+        if (!strcmp(s->name, name))
+            return s;
+    return NULL;
 }
 
 static void c99_register_decl(Sym *fsym, CType *ftype)
@@ -1469,7 +1540,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
 /*   - declare the function with '...', so the host compiler passes the     */
 /*     extra arguments the way the caller expects,                          */
 /*   - put a real va_list into the 24 bytes the macro reads,                */
-/*   - provide __va_arg(), which walks that va_list.                        */
+/*   - provide the walker (C99_VA_ARG_NAME), which walks that va_list.      */
 /* The layout is the SysV one (also what GCC's __builtin_va_list is), so    */
 /* the helper is the same one lib/va_list.c implements for native code.      */
 
@@ -1654,6 +1725,20 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     }
     nparams = idx;
 
+    /* Keep this definition's signature: when the front-end registers the
+       function as a method, the plain source name is emitted as a forwarder
+       to it (see the method aliases in c99_output_file). */
+    {
+        char rbuf[C99_TB];
+        if (hidden_sret)
+            snprintf(rbuf, sizeof rbuf, "void");
+        else if (small_sret)
+            c99_type(rbuf, sizeof rbuf, &sret_rt);
+        else
+            c99_type(rbuf, sizeof rbuf, ret);
+        c99_sig_add(emit_name, sig, rbuf, nparams, hidden_sret, is_vararg);
+    }
+
     /* Fill the va_list slot from the host compiler's own variadic support.
        '__builtin_va_list' and '__builtin_va_start' exist both as GCC/clang
        builtins and as the tccdefs.h macros, so the generated C also works
@@ -1781,7 +1866,7 @@ ST_FUNC void gfunc_call(int nb_args)
         || (!IS_ASM_FUNC(callee->sym->type.t)
             && (callee->sym->type.t & VT_BTYPE) != VT_FUNC);
     if (!is_indirect) {
-        cname = get_tok_str(callee->sym->v, NULL);
+        cname = c99_emit_name(get_tok_str(callee->sym->v, NULL));
         /* vpush_helper_func() marks its symbol as VT_ASM_FUNC and uses the
            old-style function type; those calls return a value the front-end
            never uses (except for the one int helper below) */
@@ -1961,6 +2046,7 @@ ST_FUNC void gfunc_epilog(void)
 ST_FUNC void c99_reset(void)
 {
     C99Decl *d, *dn;
+    C99Sig *sg, *sgn;
     int i;
 
     tcc_free(c99_fn.data);
@@ -1985,6 +2071,14 @@ ST_FUNC void c99_reset(void)
         tcc_free(d);
     }
     c99_decls = NULL;
+    for (sg = c99_sigs; sg; sg = sgn) {
+        sgn = sg->next;
+        tcc_free(sg->name);
+        tcc_free(sg->params);
+        tcc_free(sg->ret);
+        tcc_free(sg);
+    }
+    c99_sigs = NULL;
     for (i = 0; i < c99_ngsyms; i++)
         tcc_free((void *)c99_gsyms[i].cname);
     c99_ngsyms = 0;
@@ -2274,7 +2368,8 @@ static void c99_print_imports(FILE *f)
         any = c99_is_import_decl(d);
     if (!any)
         return;
-    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)\n");
+    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)"
+               " || defined(__TINYC__)\n");
     for (d = c99_decls; d; d = d->next) {
         int len;
         char buf[64];
@@ -2288,7 +2383,8 @@ static void c99_print_imports(FILE *f)
                 d->text + len - 1);
     }
     fprintf(f, "#endif\n"
-               "#if !defined(__GNUC__) && !defined(__clang__)\n");
+               "#if !defined(__GNUC__) && !defined(__clang__)"
+               " && !defined(__TINYC__)\n");
     for (d = c99_decls; d; d = d->next)
         if (c99_is_import_decl(d))
             fprintf(f, "%s\n", d->text);
@@ -2300,7 +2396,7 @@ static const char *c99_sym_ref(const char *name)
 {
     C99Decl *d = c99_decl_find(name);
 
-    return d && d->alias ? d->alias : name;
+    return d && d->alias ? d->alias : c99_emit_name(name);
 }
 
 /* the generated code is done with the imported names: hand them back to the
@@ -2314,7 +2410,8 @@ static void c99_undef_imports(FILE *f)
         any = c99_is_import_decl(d);
     if (!any)
         return;
-    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)\n");
+    fprintf(f, "#if defined(__GNUC__) || defined(__clang__)"
+               " || defined(__TINYC__)\n");
     for (d = c99_decls; d; d = d->next)
         if (c99_is_import_decl(d))
             fprintf(f, "#undef %s\n", d->name);
@@ -2392,9 +2489,12 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
        classify_x86_64_va_arg).  It walks the va_list a variadic prologue
        stored in the frame; the fields are the SysV ones, which is also what
        GCC's own __builtin_va_list looks like.  GCC's <stdarg.h> is not
-       needed, so this stays a plain function. */
+       needed, so this stays a plain function.  The name is private because
+       tcc itself declares a __va_arg() of its own (include/tccdefs.h), and
+       the generated file has to compile with tcc as well. */
     fprintf(f,
-        "static __c99_unused void *__va_arg(void *__c99_ap, int __c99_class,\n"
+        "static __c99_unused void *" C99_VA_ARG_NAME "(void *__c99_ap,\n"
+        "                                   int __c99_class,\n"
         "                                   int __c99_size, int __c99_align)\n"
         "{\n"
         "    unsigned char *__c99_vl = (unsigned char *)__c99_ap;\n"
@@ -2534,6 +2634,41 @@ ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
                    "__attribute__((weak, alias(\"%s\")));\n"
                    "#endif\n", a->target, a->plain, a->target);
     }
+    /* A compiler without the alias attribute (tcc) gets a forwarder instead,
+       so that the plain name is a symbol of its own: another unit may call
+       it, which is what tests/abi/ relies on.  Only a variadic body cannot be
+       forwarded; there a #define keeps at least the calls inside this unit
+       working. */
+    if (s1->c6_nb_method_aliases)
+        fprintf(f, "#if !defined(__GNUC__) && !defined(__clang__)\n");
+    for (i = 0; i < s1->c6_nb_method_aliases; i++) {
+        C6MethodAlias *a = s1->c6_method_aliases[i];
+        C99Sig *sg;
+        int j, dup = 0, any = 0;
+        for (j = 0; j < i; j++)
+            if (!strcmp(s1->c6_method_aliases[j]->plain, a->plain))
+                dup = 1;
+        if (dup)
+            continue;
+        sg = c99_sig_find(a->target);
+        if (!sg || sg->variadic) {
+            fprintf(f, "# define %s %s\n", a->plain, a->target);
+            continue;
+        }
+        /* an imported name is #defined to its private identifier above */
+        fprintf(f, "# undef %s\n", a->plain);
+        fprintf(f, "%s %s(%s)\n{\n    %s%s(", sg->ret, a->plain, sg->params,
+                !strcmp(sg->ret, "void") ? "" : "return ", a->target);
+        if (sg->sret) {
+            fprintf(f, "__c99_ret");
+            any = 1;
+        }
+        for (j = 0; j < sg->nparams; j++)
+            fprintf(f, "%s__c99_a%d", any++ ? ", " : "", j);
+        fprintf(f, ");\n}\n");
+    }
+    if (s1->c6_nb_method_aliases)
+        fprintf(f, "#endif\n");
 #endif
     if (need_init) {
         fprintf(f, "static int __c99_inited;\n");

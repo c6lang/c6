@@ -1610,11 +1610,12 @@ make test-all      # selftest + tests2 + c6selfcheck
 自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：
 
 ```sh
-make selfhost      # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
-make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
+make selfhost          # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
+make c99selfhost       # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
+make c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条链不需要 gcc）
 ```
 
-两条路线都会把两次编译得到的目标文件 `cmp` 一遍（bootstrap fixpoint），
+三条路线都会把两次编译得到的目标文件 `cmp` 一遍（bootstrap fixpoint），
 再用最终的 stage2/stage3 编译并运行一个小程序：只有目标文件逐字节相同、
 编出来的编译器真能编程序，自举才算通过。
 
@@ -1681,6 +1682,7 @@ built into the normal `tcc/tcc` binary; there is no separate compiler.
     tcc/tcc -B tcc -c -o out/ a.c b.c        # out/a.c, out/b.c (one .c per TU)
 
     make c99test                             # same cases as selftest, via the C back-end
+    make c99tcc-test                         # same, with tcc itself as the host compiler
 
 `make c99test` runs the same corpus as `make selftest`: every `tests/*.c`,
 `tests/errors/*.c`, `tests/exit/*.c`, `tests/abi/*.c` and `tests/c99/*.c`
@@ -1692,6 +1694,9 @@ because they are produced by the C-output back-end are declared with
 `// EXPECT-C99` in the `tests/errors/*.c` file; everything else is shared.
 `C99CC=clang make c99test` uses another host compiler, and
 `BACKEND=c99 tests/run-tests.sh` runs the same thing directly.
+`make c99tcc-test` is the same corpus with `C99CC=tcc/tcc` (`C99FLAGS` drops
+the gcc-only switches), so the generated C has to satisfy tcc too -- see
+"Self-hosting through the C back-end" below for what that costs.
 `tests/c99/c99test.c` additionally exercises plain C and all the c6 features
 listed below in one program.
 
@@ -1789,3 +1794,18 @@ built by the host C compiler from tcc's C output; `stage3` is built by
 produce are byte identical.  `make selfhost` does the same round trip without
 the C detour (`tcc` -> `stage1` -> `stage2`, objects compared) and is the
 quick check that the c6 back-end still compiles its own sources.
+
+`make c99selfhost-tcc` is the same walk with tcc itself as the host C
+compiler: nothing in it needs gcc.  Two things in the generated C exist
+because of it, since tcc is not a GNU C compiler:
+
+  * the `va_list` walker is called `__c99_va_arg`, not `__va_arg`, which
+    tcc declares itself in `include/tccdefs.h`;
+  * a method's plain source name (`c6_area` for `CRect_c6_area`) is exported
+    with GNU's `alias` attribute only under GCC/clang; under tcc the file
+    emits a small forwarder function instead, so other units can still call
+    the plain name.
+
+Imported libc names avoid the host headers by being declared under a private
+identifier and bound to the real linker name with an `__asm__` label; tcc has
+asm labels too, so only the alias attribute needed the extra path.
