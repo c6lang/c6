@@ -686,6 +686,32 @@ closure-type           = "closure" , type-specifier , [ "!error" ] ,
 C90–C98 与实施阶段见 [closure-design.md](closure-design.md) 和
 [closure-todo.md](closure-todo.md)；在 V2 落地前，编译器仍按 V1 报 C80。
 
+### 3.10 泛型（设计定稿，未实现）
+
+类型应用是 `@` 后缀：`Vect@int`、`Map@(char[:], int)`、`Buf@(int, 4)`。
+形参表在 tag 定义处挂名（名字先于体），在函数/typedef 处用 `|…|` 前缀
+（返回类型或体先于名字，而形参必须先于使用）：
+
+```
+struct Vect@T        { T *data; int len; };
+struct Map@(K, V)    { Vect@K keys; Vect@V vals; };
+|T| T vat(Vect@T *self, int i);
+|T| typedef struct { T v; } Box;
+
+Vect@int a = {0};               /* 实例：struct Vect_int */
+Vect@int *p = &a;
+Vect@Vect@int grid = {0};       /* 右结合，链上没有闭合符 */
+int x = p->vat(0);              /* 接收者定类型：Vect_int_at */
+```
+
+`@` 与托管引用共存：前缀 `@`（类型位置起点）是托管引用，后缀 `@`（类型名
+之后）是类型应用，所以 `@Vect@int` 仍是「指向 `Vect@int` 的托管引用」。
+尖括号不是泛型写法：`<` 在表达式里是合法运算符，单趟无 AST 无从消歧。
+
+完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
+[generics-design.md](generics-design.md)；落地前编译器对 `Vect@int` 报普通
+C 诊断，`struct Vect@T` 报 `'{' expected` 一类错误。
+
 ---
 
 ## 4. 语句
@@ -1077,7 +1103,8 @@ parameter-list    = identifier , { "," , identifier } ;
 | C101 | 一个函数最多 128 个清理点（`defer` / `errdefer` / 编译器合成的 site） | `a function cannot have more than 128 cleanup sites: split it into smaller functions` |
 | C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发），第 9 层报错 | `'defer' bodies nested too deeply` |
 
-（C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包，尚未实现。）
+（C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包；
+C103–C116 留给 [generics-design.md](generics-design.md) 的泛型，均尚未实现。）
 
 ---
 
@@ -1927,7 +1954,8 @@ int main(void)
 | `void *next(T *self)` | 约束 C99：元素类型会被擦除；改成具体的 `E` 或 `E *` |
 | `has()` 返回非整数 / `next()` 返回数组、`void`、不完整类型 | 约束 C99/C49 |
 | `has()`/`next()` 带多余形参 | 约束 C99：两个方法只接收 receiver |
-| 泛型 `Iterator<T>` / `for a \|v\| { }` | 不支持：语言没有类型参数；迭代请用 `foreach` |
+| `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
+| 泛型 `Vect@int` / `struct Vect@T` / `\|T\| T vat(Vect@T *)` | 未实现：语法已定稿，见 [generics-design.md](generics-design.md) 与 §3.10；容器迭代请用 `foreach` |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
 | `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
 | `t = {1, 2}` / `f({1, 2})`（元组字面量糖） | 不支持：显式写复合字面量 `(int, int){1, 2}` |
