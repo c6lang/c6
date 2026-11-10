@@ -12539,23 +12539,29 @@ static void c6_module_dotted(const char *name, char *out, int outsz)
 static int c6_module_try(TCCState *s1, const char *dir, const char *name,
                          const char *dotted)
 {
+    static const char *const exts[] = { ".c6", ".c" };
     char buf[1024] = {0};
-    int n = 0;
+    int i = 0, n = 0;
 
-    n = snprintf(buf, sizeof buf, "%s%s%s.c", dir, dir[0] ? "/" : "", name);
-    if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0)
-        return 0;
-    if (strcmp(dotted, name)) {
-        n = snprintf(buf, sizeof buf, "%s%s%s.c", dir,
-                     dir[0] ? "/" : "", dotted);
+    /* A module written in c6 uses the '.c6' suffix; plain-C modules keep
+       working.  The c6 spelling wins when both files exist. */
+    for (i = 0; i < 2; i++) {
+        n = snprintf(buf, sizeof buf, "%s%s%s%s", dir,
+                     dir[0] ? "/" : "", name, exts[i]);
         if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0)
             return 0;
+        if (strcmp(dotted, name)) {
+            n = snprintf(buf, sizeof buf, "%s%s%s%s", dir,
+                         dir[0] ? "/" : "", dotted, exts[i]);
+            if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0)
+                return 0;
+        }
     }
     return -1;
 }
 
-/* find and open 'NAME.c'.  Search order: the directory of the file that
-   contains the 'import', the -I paths, then the current directory. */
+/* find and open 'NAME.c6' or 'NAME.c'.  Search order: the directory of the
+   file that contains the 'import', the -I paths, then the current directory. */
 static int c6_module_open(TCCState *s1, const char *name)
 {
     char dotted[512] = {0};

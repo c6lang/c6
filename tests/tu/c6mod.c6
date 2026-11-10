@@ -1,0 +1,28 @@
+/* tests/c6ext/c6mod.c6 的第二个翻译单元：模块 tu.c6mod 的实现。
+ *
+ * 文件作用域的名字在编译器内部加 'tu__c6mod__' 前缀；源码仍然写短名。
+ * 这个文件同时被 import 打开，只重放声明（函数体、初始化器、test 块
+ * 都跳过），代码由这里的对象文件提供。
+ */
+module tu.c6mod;
+
+struct Point { int x, y; };
+typedef struct Point Point;
+enum Color { RED, GREEN };
+
+int counter = 7;
+
+int add(int a, int b) { return a + b; }
+int twice(int a) { return add(a, a); }
+int area(Point *p) { return p->x * p->y; }
+int bump(void) { return ++counter; }
+
+test "模块内部照样用短名" {
+    Point p = { 2, 2 };
+    if (add(1, 1) != 2)
+        err(1, "internal add");
+    if (area(&p) != 4)
+        err(2, "internal area");
+    if (RED != 0)
+        err(3, "internal enum");
+}

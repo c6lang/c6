@@ -21,10 +21,14 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
 | 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；捕获式闭包 `closure RET (P…)` 把外层块作用域名字按值捕获进隐藏的 env，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
+| 源文件后缀 `.c6` | `.c6` 文件自动开启扩展（等价于 `-std=c6`），`.c` 文件仍按命令行开关走；`import` 优先找 `NAME.c6`，再回退 `NAME.c` |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（`static` 变量与 VLA 除外） |
 | 泛型（阶段 1 已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。见 [docs/generics-design.md](docs/generics-design.md) |
 
 扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
+源文件后缀 `.c6` 是一个例外：它对该翻译单元等价于 `-std=c6`（每个文件独立判断，
+`.c` 文件不会因为同一次编译里出现 `.c6` 而被连带开启），所以 `tcc -run hello.c6`
+不需要再写开关；`import NAME;` 也优先查找 `NAME.c6`，找不到才回退到 `NAME.c`。
 
 ## 目录结构
 
@@ -33,7 +37,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 ├── docs/plan.md      设计与实施方案（含实现状态）
 ├── docs/grammar.md   扩展语法的 BNF/EBNF 规范
 ├── scripts/          bootstrap.sh：首次构建前跑 ./configure
-├── tests/            c6 全部自测：*.c 是 test 块，errors/ 是编译期诊断
+├── tests/            c6 全部自测：*.c 是 test 块，c6ext/*.c6 验证后缀，errors/ 是编译期诊断
 ├── examples/         可运行示例（每个特性一个 *_demo.c）
 ├── Makefile          便捷入口（bootstrap / build / selftest / test / clean）
 └── tcc/              TCC 源码树：上游基线 + 一个 c6 补丁一个提交
@@ -52,6 +56,7 @@ make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 
 # 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
 ./tcc/tcc -B tcc -std=c6 -run hello.c
+./tcc/tcc -B tcc -run hello.c6       # .c6 后缀自动开启扩展，不需要 -std=c6
 ```
 
 `make build` / `make selftest` / `make test-all` 都会先跑 `bootstrap`：`tcc/`
@@ -1564,7 +1569,8 @@ tests/
 ├── gc_async.c        async 任务的参数/返回值持有 + 销毁挂起任务时回卷
 ├── gc_own.c          own 独占链/子树 + move()
 ├── gc_return.c       返回托管引用的计数归属（新建/借字段/形参/循环）
-├── tu/               跨翻译单元的第二个 .c（同名的主文件会一起编译）
+├── c6ext/            .c6 后缀自测：不传 -std=c6，靠扩展名开启扩展
+├── tu/               跨翻译单元的第二个 .c/.c6（同名的主文件会一起编译）
 ├── abi/              ABI 兼容：同一份代码用 -std=c6 和纯 C 各编译一个 TU，
 │                     链接后运行（`// EXIT <n>` 声明期望的退出码）
 ├── exit/             退出码（`// EXIT <n>` 声明期望的进程退出码）
@@ -1711,7 +1717,8 @@ built into the normal `tcc/tcc` binary; there is no separate compiler.
     make c99tcc-test                         # same, with tcc itself as the host compiler
 
 `make c99test` runs the same corpus as `make selftest`: every `tests/*.c`,
-`tests/errors/*.c`, `tests/exit/*.c`, `tests/abi/*.c` and `tests/c99/*.c`
+`tests/c6ext/*.c6`, `tests/errors/*.c`, `tests/exit/*.c`, `tests/abi/*.c` and
+`tests/c99/*.c`
 case goes through the same `tcc/tcc` (asked for C source with `-o ...c`) and
 then through
 `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread`, with the same

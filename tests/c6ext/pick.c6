@@ -1,0 +1,15 @@
+/* c6 自测：import 的查找顺序
+ *
+ * tests/c6ext/pick/ 下同时有 m.c6（PICK = 11）和 m.c（PICK = 22）；
+ * 约定是 .c6 优先。子目录不在 run-tests.sh 的 glob 里，m.c 只被
+ * import 打开，从不单独编译。
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -test tests/c6ext/pick.c6
+ */
+import pick.m;
+
+test "import 优先 .c6" {
+    if (PICK != 11)
+        err(1, "PICK");
+}

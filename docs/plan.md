@@ -45,7 +45,8 @@ DEF(TOK_TEST,      "test")
 #endif
 ```
 
-- 开关：`-std=c6`，默认关闭。
+- 开关：`-std=c6`，默认关闭；源文件后缀 `.c6` 对单个翻译单元等价于
+  `-std=c6`（`tcc/libtcc.c` 的 `guess_filetype()` / `tcc_add_file_internal()`）。
 - 关闭时：`C6_EXT` 不定义，这些字符串保持普通标识符，**零运行时映射开销**。
 - 开启时：`C6_EXT` 定义，token 进入 lexer 关键字映射。
 - `__C6__` 宏同步定义，供源码条件编译。
@@ -456,7 +457,8 @@ int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
    所以 package 限定类型要写 typedef）；不是类型时把 token 原样还回，所以
    `pkg.func(...)` 这类表达式语句仍走普通表达式解析；
 3. `import NAME;` 在原有“登记命名空间”之外，按当前文件目录 → `-I` →
-   当前目录查找 `NAME.c`（点号形式 `a/b.c`），找到就用 `decl(VT_CONST)`
+   当前目录依次查找 `NAME.c6`、`NAME.c`（点号形式 `a/b.c6`、`a/b.c`；
+   两个文件并存时 `.c6` 优先），找到就用 `decl(VT_CONST)`
    重放声明：函数只登记原型（`skip_or_save_block` 跳过函数体），全局变量只
    登记 `extern`（`c6_skip_decl_tail` 跳过初始化器），`static` 对象和 `test`
    块跳过；文件必须声明 `module NAME;`，循环 import 报错，找不到文件时保持
@@ -562,6 +564,7 @@ int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
 ```bash
 cd tcc && make clean && make -j$(nproc) EXTRA-DEFS=-DC6_EXT CFLAGS="-g -O0"
 tcc/tcc -std=c6 -B. -run file.c        # 扩展开启
+tcc/tcc -B. -run file.c6               # .c6 后缀同样开启扩展（每个 TU 独立）
 tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 ```
 
@@ -586,7 +589,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 15 裸 tag 类型名（省略 `struct`） | ✅ | `tccgen.c`：`parse_btype()` 的 `default` 分支——`typespec_found` 为 0、`sym_find(tok)` 未命中（普通命名空间优先）时试 `struct_find(tok)`，命中则把 tag 符号的 `type.t` / `ref` 交给 `basic_type2`，与 `struct/union/enum TAG` 走完全同一条路径（所以 `sizeof`、方法注册、`c6_tag_is_global` 的切片元素检查、`type_to_str` 自动一致）；`ignore_label` 时 `TAG:` 仍退回标签（与 typedef 路径同一个 guard）；不隐式前置声明，也不支持定义处省略 `struct`；只在 `-std=c6` 生效 |
 | 16 `foreach` | ✅ | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句，所以 `foreach` 仍可当标识符）；词法是 `tcctok.h` 末尾追加的硬关键字，`-std=c6` 关闭时由 `tccpp.c` 的还原循环改回普通标识符（区间同步扩到 `TOK_C6_FOREACH`）；数组/切片的隐藏槽直接复用 `c6_slice_spill`（`{data, len}` 对，与切片运行期布局相同），区间把上界落进隐藏整数槽、下标绑定当计数器；`i`/`v` 是 `sym_push` 出来的普通局部，循环体走 `lblock`，所以 `break`/`continue`/`defer`/`await` 与 `for` 一致；`size_t` 下标用 `c6_size_type`，区间用 `c6_common_int_type`（C 的通常算术转换子集）；文件作用域的 `foreach \|…\|` 在 `decl()` 里报错；迭代器协议（`has()`/`next()`，含结构体值/指针/接口值）见里程碑 30 |
 | 17 元组 `(T1, T2, …)` | ✅ | `tccgen.c`：`parse_btype()` 的 `case '('` → `c6_tuple_btype` / `c6_tuple_speculate`（保存/重放 token，区分元组类型与老 C 的括号表达式）、`c6_tuple_get`（校验元素并规范化生成内部 tag `__c6_tuple_N`，布局在构造时按自然对齐算好，不走 `struct_layout`）、`c6_tuple_ctype` / `c6_tuple_of_type` / `c6_tuple_ctype`；`unary()` 的 `case '('` 处理元组强转/复合字面量/`sizeof`/`_Alignof`、`c6_tuple_subscript` 处理 `t[k]`（常量下标）；`decl()` 开头的 `c6_tuple_lead_kind` + `c6_tuple_destructure` 实现解构声明/赋值（`_` 占位符丢弃元素）；`c6_return_value` 支持 `return {…};`；`c6_apply_fallible` 放开 struct/union/元组作 `!error` 返回类型，失败路径用 `c6_zero_local` 清零；`c6_async_type_tokens` 把元组回放成 `(T1, T2)` 而不是内部 tag；解构语句在 `block()` 里也认一次（无花括号的 if/while/for/switch 单条语句体、语句表达式、`defer` 单条语句体不走 `decl()`），赋值形式在 `c6_tuple_destructure()` 里就地解析（作用域弹出后隐藏临时变量就没了） |
-| 18 `module` + `import` 加载 | ✅ | `tccgen.c`：`BufferedFile.c6_module` / `c6_decl_seen`，`decl()` 文件作用域的 `module NAME;` 软关键字 → `c6_module_parse`（点号前缀、必须首条声明、一个文件一个、`main` 禁止）；`c6_mod_name()` 给文件作用域声明加 `NAME__`（块作用域/`static`/`test`/`__` 开头/普通 `#include` 不加），方法经 `c6_method_symbol` 自然变成 `<NAME__Tag>_<meth>`；`sym_find` / `struct_find` 先试模块前缀再试普通 C 名，`c6_import_lookup` / `c6_import_tag_lookup` 兜底 imports；`parse_btype` 的 `c6_qualified_type` 支持 `NAME.Type`（先 speculative 扫描 typedef/tag，失败原样回退）；`c6_module_import` 按当前文件目录 → `-I` → 当前目录找 `NAME.c`（点号 `a/b.c`），用 `decl(VT_CONST)` 重放：函数原型 + `skip_or_save_block`、全局 `extern` + `c6_skip_decl_tail`、跳过 `static`/`test`，循环 import 报错，找不到文件保持旧的命名空间行为；`-emit-header` 用 `C6HeaderDecl` 记录导出，`c6_hdr_type` / `c6_hdr_struct_body` / `c6_emit_header` 写出普通 C 头文件（切片/元组生成 `NAME__slice_N` / `NAME__tuple_N` typedef） |
+| 18 `module` + `import` 加载 | ✅ | `tccgen.c`：`BufferedFile.c6_module` / `c6_decl_seen`，`decl()` 文件作用域的 `module NAME;` 软关键字 → `c6_module_parse`（点号前缀、必须首条声明、一个文件一个、`main` 禁止）；`c6_mod_name()` 给文件作用域声明加 `NAME__`（块作用域/`static`/`test`/`__` 开头/普通 `#include` 不加），方法经 `c6_method_symbol` 自然变成 `<NAME__Tag>_<meth>`；`sym_find` / `struct_find` 先试模块前缀再试普通 C 名，`c6_import_lookup` / `c6_import_tag_lookup` 兜底 imports；`parse_btype` 的 `c6_qualified_type` 支持 `NAME.Type`（先 speculative 扫描 typedef/tag，失败原样回退）；`c6_module_import` 按当前文件目录 → `-I` → 当前目录依次找 `NAME.c6`、`NAME.c`（点号 `a/b.c6`、`a/b.c`，`.c6` 优先），用 `decl(VT_CONST)` 重放：函数原型 + `skip_or_save_block`、全局 `extern` + `c6_skip_decl_tail`、跳过 `static`/`test`，循环 import 报错，找不到文件保持旧的命名空间行为；`-emit-header` 用 `C6HeaderDecl` 记录导出，`c6_hdr_type` / `c6_hdr_struct_body` / `c6_emit_header` 写出普通 C 头文件（切片/元组生成 `NAME__slice_N` / `NAME__tuple_N` typedef） |
 | 19 托管引用 P0/P1（限定符、分配、存储、释放） | ✅ | `tcc.h`：`CType.gq` + `C6_GQ_*` + `C6_GCM_*`；`tccgen.c`：`parse_btype()` 的 `@` 前缀、`c6_gc_new_expr`、`c6_gc_store_hook`（`vstore()` 里）、`c6_gc_site`（合成一个清理点）、`c6_gc_plain` / `c6_gc_mode` / `c6_type_gq`；运行期 `libtcc1.c` 的 `__c6_gc_new` / `__c6_gc_store` / `__c6_gc_release` / `__c6_gc_drop`；`CType.gq` 只当缓存、可信副本在 pointee 上（设计 §2.0） |
 | 20 描述符与字段释放 P2 | ✅ | `c6_gc_collect()`（struct 定义完成时收集字段表：`C6GcField.off/kind/count/stride`）、`c6_gc_size_of()`/`c6_gc_desc_for()`/`c6_gc_desc_decl()`/`c6_gc_emit_desc()`/`c6_gc_flush_descs()`（TU 末尾发射 `static const struct __c6_gc_desc __c6_gc_d<fnv>_<n>`，跨 TU 不重名）；运行期按描述符逐字段释放（数组逐元素、嵌入递归） |
 | 21 `weak` P3 | ✅ | 弱槽注册表（全局自旋锁，冷路径）+ `__c6_gc_weak_add`/`__c6_gc_weak_unlink`/`__c6_gc_weak_store`（原子 try-incref 升级）；`weak` 不能直接解引用（`vstore`/`unary` 两处检查）；async 里禁 `weak`（`c6_async_in_body`） |
@@ -601,6 +604,7 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | 30 `foreach` 迭代器协议 `has()`/`next()` | ✅ | `tccgen.c`：`c6_iter_proto_of`（结构化识别：接口值 / `T *` / `T` 值；`has`/`next` 方法来自 `c6_method_of`，真实字段遮蔽方法时不算协议）、`c6_iter_check_has` / `c6_iter_check_next`（签名 C99）、`c6_iter_setup`（隐藏 `has`/`next` 函数指针与 receiver 局部槽，按 `__c6_it_<kind>_<n>` 唯一命名）、`c6_iter_call`（把函数指针与 receiver 装进隐藏槽，再经 token 重放进 `gexpr()`，所以结构体返回/整型提升与手写调用完全一致；接口值取 vtable 槽）；`c6_foreach_parse` 新增迭代器分支：值形态把迭代器复制进隐藏槽（不推进原对象），`T *`/接口形态直接操作原对象，`has() != 0` 为循环条件，`next()` 结果写进值绑定（`_` 时 `vpop`，但仍调用；托管元素则落入隐藏槽以便释放），`continue` 回到 `has()` 判断；C47 提示改为 “no 'has'/'next' iterator”；托管引用：迭代器/元素隐藏槽按声明局部量清零并登记 `c6_gc_site`，`@T` 形参按借用拷贝，含托管字段的 struct 元素由 `c6_gc_value_check` 拒绝；`tests/foreach_iter.c`、`tests/errors/foreach_iter.c`、`examples/foreach_iter_demo.c` |
 | 31 `defer` 状态搬进函数帧 | ✅ | 清理点是编译期常量（`C6DeferSite`：id / 作用域深度 / kind / 标签），运行期只剩帧里的两样东西：`arm[C6_DEFER_WORDS]` 位图和 `dtgt`/`dres`（派发过滤 + 恢复点号，清理体每嵌套一层再存一份）；`c6_defer_func_init()` 只在序言里清 4 个 `int` 的位图（不再调用 `__tcc_defer_func_enter`；单趟编译在序言处不知道有没有清理点，所以这 16 字节是每个 c6 函数都付的固定开销），`c6_defer_func_end()` 生成一个逆序扫 site 的派发器，`c6_defer_begin()` 只写两个 `int` 就跳过去——于是没有 TLS/线程键、没有 8192 条记录上限（改成一个函数 128 个清理点、清理体 8 层，超了编译期报错）、ISR/线程/协程/递归同一套规则；`__tcc_defer_*` 五个入口与 `TccDeferRec`/`TccDeferCtx` 从 `libtcc1.c`、`c99-rt.inc`、`c99-gen.c` 的名字表里删掉，协程挂起只剩错误槽三项；向后跳转的 `goto` 在 `stmt()` 里自己发起清理请求（标签处的派发仍保留，向前跳转靠它）；语义见 [grammar.md](grammar.md) 8.2，约束 C101/C102；用例 `tests/defer_scope.c`、`tests/defer_reent.c`、`tests/defer_thread.c`（裸机跑不了，`examples/boot/runtests.sh` 里跳过）、`tests/async_frame.c` 第 8 组 |
 | 32 枚举成员的限定名 `Color.RED` | ✅ | `struct_decl()` 的枚举循环接受 `'<tag>.<成员>'`：常量另外注册成带点的 `Color.RED`（`tok_alloc_const`），裸名只在没被别的枚举占用时注册，否则记进 `c6_enum_poison` 并在裸用处报 C119；引用复用 `primary()` 里已有的 `pkg.member` 点号路径——先按带点名字查枚举常量，查不到再按包名 mangle；`decl()` 在条件位置向前看一个记号，`'Tag.'` 直接交回 `gexpr()`，所以 `if (Color.RED)`/`while`/`for` 的条件不会被当声明；诊断 C117–C120，语法见 [grammar.md](grammar.md) §3.8；`tests/enum_scope.c`、`tests/errors/enum_scope.c` |
+| 33 源文件后缀 `.c6` | ✅ | `libtcc.c`：`guess_filetype()` 把 `c6` 归入 `AFF_TYPE_C`；`tcc_add_file_internal()` 在 `(flags & AFF_TYPE_MASK) == AFF_TYPE_C` 且文件名后缀是 `.c6` 时临时置 `s1->c6_ext = 1`，`tcc_compile()` 返回后恢复——每个 TU 独立判断，`.c` 文件不会因为同批出现 `.c6` 而被连带开启，`-std=c6` 的全局默认值不变；native 与内置 C99 后端共用 `libtcc.c`，C99 输出路径同样生效；`tccgen.c` 的 `c6_module_try()` 依次找 `NAME.c6`、`NAME.c`（点号形式同理，`.c6` 优先）；用例 `tests/c6ext/basic.c6`、`tests/c6ext/c6mod.c6` + `tests/tu/c6mod.c6`、`tests/c6ext/pick.c6`（同名 `.c6`/`.c` 并存时选 `.c6`），`tests/run-tests.sh` 新增 1b（`-test`）与 1c（`-run`）两组 |
 
 `foreach` 的设计取舍（评审结论）：
 
@@ -695,10 +699,16 @@ tcc/tcc -std=c6 -B. -test file.c       # 运行 test 块
 | `tests/abi/tuple.c` + `tests/abi/tuple_plain.c` | 元组与等价 struct 的 ABI 互通（两个 TU 分别用 `-std=c6` 和纯 C 编译后链接） |
 | `tests/abi/method.c` + `tests/abi/method_plain.c` | 方法改名的 ABI 互通：纯 C 一侧按原名调用 c6 方法（弱别名）、c6 一侧普通调用纯 C 函数 |
 | `tests/tu/*.c` | 与同名主文件一起编译的第二个翻译单元 |
+| `tests/c6ext/basic.c6` | `.c6` 后缀自测：`defer`、切片、`try`/`catch`，构建时**不传** `-std=c6` |
+| `tests/c6ext/c6mod.c6` + `tests/tu/c6mod.c6` | `import tu.c6mod;` 从 `.c6` 模块加载声明，第二个 TU 提供代码（构建带 `-I tests`） |
+| `tests/c6ext/pick.c6` + `tests/c6ext/pick/m.c6`/`m.c` | import 查找顺序：同名 `.c6` 与 `.c` 并存时选 `.c6`（`PICK == 11`） |
 | `tests/errors/*.c` | 编译期诊断，见下 |
 
 `tests/run-tests.sh`（`make selftest`）先对每个 `tests/*.c` 跑一次
 `-test`，若存在同名 `tests/tu/<name>.c` 就一起编译成两个 TU；再对
+`tests/c6ext/*.c6` 用同样的 `-test` 流程跑一遍，但**不传** `-std=c6`
+（后缀自己开启扩展，构建带 `-I tests` 让 import 找到 `tests/tu/<name>.c6`），
+并用 `-run` 跑一个 `.c6` 冒烟；之后对
 `tests/errors/*.c` 的每个 `// EXPECT <片段>: <诊断>` 注释跑一次
 `-D<片段>`，要求 stderr 含该诊断，并要求不带 `-D` 时该文件能编译运行通过。
 诊断测试因此不需要维护行号。

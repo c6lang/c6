@@ -1,0 +1,5 @@
+/* tests/c6ext/pick.c6 的模块：同目录还有 m.c（PICK = 22），
+ * import 必须优先选这份 .c6。 */
+module pick.m;
+
+enum { PICK = 11 };
