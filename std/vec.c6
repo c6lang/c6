@@ -1,0 +1,199 @@
+/* std/vec：可增长数组 Vect@T。
+ *
+ *     import std.vec;
+ *
+ *     @Vect@int v = new Vect@int;
+ *     v->push(10) catch e { return e.id; };
+ *     foreach (int x = v->iter()) { printf("%d\n", x); }
+ *
+ * 设计要点：
+ * - 元素放在一段托管数组 `@T data` 里（`new T[cap]` 返回的就是 `@T`），所以
+ *   整个向量由 GC 管理，不需要手写释放；
+ * - 因为字段里有托管引用，Vect 不能按值声明，只能 `new` 出来用 `@T` 持有；
+ *   方法的接收者是指针，所以值容器调用要写 `v->count()`；
+ * - 方法名不能与字段同名：字段是 `n` / `cap`，访问器是 `count()` / `capacity()`；
+ * - `push` / `reserve` 会分配，失败时返回 `T!error`，调用方必须 `try` 或
+ *   `catch` 消费结果；
+ * - `at` 要求下标在范围内（越界是调用方的错）；要检查就读 `get(i, &out)`。
+ */
+#include <string.h>
+
+module std.vec;
+import std.types;
+import std.err;
+
+struct Vect@T {
+    @T data;
+    int n;
+    int cap;
+
+    /* 元素个数 */
+    int count() { return n; }
+
+    /* 已分配容量 */
+    int capacity() { return cap; }
+
+    int is_empty() { return n == 0; }
+
+    /* 下标访问：要求 0 <= i < count() */
+    T at(int i) { return data[i]; }
+
+    /* 带检查的读：命中返回 1 并写 *out */
+    int get(int i, T *out)
+    {
+        if (!data || i < 0 || i >= n)
+            return 0;
+        *out = data[i];
+        return 1;
+    }
+
+    void set(int i, T v)
+    {
+        if (data && i >= 0 && i < n)
+            data[i] = v;
+    }
+
+    /* 预留容量；cap 只增不减 */
+    int!error reserve(int want)
+    {
+        int newcap = cap > 0 ? cap : 8;
+        @T nd = data;
+        int i = 0;
+
+        if (want <= cap)
+            return 0;
+        while (newcap < want)
+            newcap *= 2;
+        nd = new T[newcap];
+        if (!nd)
+            err(std.err.NOMEM, "vector: out of memory");
+        for (i = 0; i < n; i++)
+            nd[i] = data[i];
+        data = nd;
+        cap = newcap;
+        return 0;
+    }
+
+    /* 追加一个元素，必要时扩容 */
+    int!error push(T v)
+    {
+        try reserve(n + 1);   /* 原样转发 */
+        data[n] = v;
+        n++;
+        return 0;
+    }
+
+    /* 末尾元素出栈：成功返回 1 并写 *out，空容器返回 0 */
+    int pop(T *out)
+    {
+        if (n == 0)
+            return 0;
+        n--;
+        *out = data[n];
+        return 1;
+    }
+
+    void clear() { n = 0; }
+
+    /* 迭代器：随实例生成，`foreach (T x = v->iter()) { ... }` 直接可用 */
+    Iter@T iter()
+    {
+        Iter@T it = { self, 0 };
+        return it;
+    }
+};
+
+struct Iter@T {
+    Vect@T *vec;
+    int i;
+
+    int has() { return i < vec->n; }
+
+    T next()
+    {
+        T x = vec->data[i];
+        i++;
+        return x;
+    }
+};
+
+/* ---- 自测 ---- */
+
+test "push / at / count / pop" {
+    @Vect@int v = new Vect@int;
+    int out = 0;
+
+    v->push(10) catch e { err(1, "push 失败"); };
+    v->push(20) catch e { err(2, "push 失败"); };
+    if (v->count() != 2)
+        err(3, "count 不对");
+    if (v->at(1) != 20)
+        err(4, "at 不对");
+    if (v->get(1, &out) != 1 || out != 20)
+        err(5, "get 不对");
+    if (v->get(2, &out) != 0)
+        err(6, "get 越界没有返回 0");
+    if (v->pop(&out) != 1 || out != 20 || v->count() != 1)
+        err(7, "pop 不对");
+    if (v->pop(&out) != 1 || out != 10)
+        err(8, "第二次 pop 不对");
+    if (v->pop(&out) != 0)
+        err(9, "空容器 pop 没有返回 0");
+}
+
+test "扩容后元素仍在，容量按 2 倍增长" {
+    @Vect@int v = new Vect@int;
+    int i = 0;
+
+    for (i = 0; i < 100; i++)
+        v->push(i) catch e { err(10, "push 失败"); };
+    if (v->count() != 100)
+        err(11, "count 不是 100");
+    if (v->capacity() < 100)
+        err(12, "容量不够");
+    for (i = 0; i < 100; i++)
+        if (v->at(i) != i)
+            err(13, "扩容后元素顺序不对");
+}
+
+test "foreach 走迭代器" {
+    @Vect@int v = new Vect@int;
+    int sum = 0;
+
+    v->push(1) catch e { err(14, "push 失败"); };
+    v->push(2) catch e { err(15, "push 失败"); };
+    v->push(3) catch e { err(16, "push 失败"); };
+    foreach (int x = v->iter()) {
+        sum += x;
+    }
+    if (sum != 6)
+        err(17, "迭代和不对");
+}
+
+test "clear 只清零长度，容量保留" {
+    @Vect@int v = new Vect@int;
+    int cap0 = 0;
+
+    v->push(1) catch e { err(18, "push 失败"); };
+    cap0 = v->capacity();
+    v->clear();
+    if (v->count() != 0)
+        err(19, "clear 之后 count 不为 0");
+    if (v->capacity() != cap0)
+        err(20, "clear 把容量也丢了");
+    if (v->is_empty() != 1)
+        err(21, "is_empty 不对");
+}
+
+test "元素类型不限于整数" {
+    @Vect@f64 v = new Vect@f64;
+    f64 sum = 0.0;
+
+    v->push(0.5) catch e { err(22, "push 失败"); };
+    v->push(1.25) catch e { err(23, "push 失败"); };
+    foreach (f64 x = v->iter()) {
+        sum += x;
+    }
+    if (sum != 1.75)
+        err(24, "f64 元素的不对");
+}

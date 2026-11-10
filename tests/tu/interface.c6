@@ -9,9 +9,7 @@ interface Size {
 
 struct Sq { int s; };
 
-package sq {
-    int area(struct Sq *self) { return self->s * self->s; }
-}
+int area(struct Sq *self) { return self->s * self->s; }
 
 int area_via_vt(struct Sq *c)
 {

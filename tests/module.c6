@@ -54,3 +54,32 @@ test "interface 也从模块导入" {
     if (s.area() != 42)
         err(11, "interface area");
 }
+
+test "模块成员就是普通的带前缀 C 符号" {
+    if (tu__module__add(10, 20) != 30)
+        err(13, "mangled add");
+    tu__module__counter = 99;           /* 和 'counter' 是同一个对象 */
+    if (counter != 99)
+        err(14, "mangled counter");
+    counter = 7;
+}
+
+test "全限定的模块函数可以取地址" {
+    int (*add_ref)(int, int) = tu.module.add;
+    if (add_ref(20, 22) != 42)
+        err(15, "function pointer");
+}
+
+test "可见的对象优先于模块名" {
+    struct Point tu = { 7, 8 };
+    if (tu.x != 7)
+        err(16, "a visible object shadows the module name");
+}
+
+test "模块里的结构体全局可以逐字段读写" {
+    if (tu.module.origin.x != 3 || tu.module.origin.y != 4)
+        err(17, "qualified struct global");
+    *&tu.module.origin.x = 8;
+    if (tu.module.origin.x != 8)
+        err(18, "write through the qualified global");
+}

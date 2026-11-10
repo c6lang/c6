@@ -865,7 +865,7 @@ static void c6_iface_call_prep(C6Iface *ifc, int mname);
 static Sym *c6_import_lookup(int v);
 static Sym *c6_import_tag_lookup(int v);
 static int c6_mangle_tok(const char *pkg, int v);
-static int c6_pkg_imported(const char *name);
+static int c6_mod_imported(const char *name);
 static void c6_method_register(int name, int sym_tok, CType *type);
 static Sym *c6_gen_meth_sym(int sym_tok);
 static void c6_gen_sig_flush(void);
@@ -2629,7 +2629,7 @@ static inline Sym *sym_find_raw(int v)
 
 /* find an identifier.  A block scope binding always wins; in a module a
    file scope name is looked up under the module prefix before a plain C
-   global of the same spelling, and imported packages come last. */
+   global of the same spelling, and imported modules come last. */
 ST_INLN Sym *sym_find(int v)
 {
     Sym *s = sym_find_raw(v);
@@ -2645,7 +2645,7 @@ ST_INLN Sym *sym_find(int v)
                     return m;
             }
         }
-        if (!s && (tcc_state->c6_package || tcc_state->c6_nb_imports))
+        if (!s && tcc_state->c6_nb_imports)
             s = c6_import_lookup(v);
     }
 #endif
@@ -7250,6 +7250,12 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
             q->proto = proto;
             q->sym_tok = c6_gen_last_sym->v;
             c6_sticky_add(c6_gen_last_sym);   /* survives the scope it is in */
+            /* The signature was only declared to learn its symbol. Pop the
+               temporary chain: otherwise the plain method name (and the
+               parameter names) stay linked in the unit that instantiates the
+               template, and a bare 'cap' in another instance's body resolves
+               to this method instead of to its own field. */
+            sym_pop(&local_stack, NULL, 1);
             c6_gen_last_sym = NULL;
             if (c6_gen_methq_tail)
                 c6_gen_methq_tail->next = q;
@@ -8034,6 +8040,12 @@ static int c6_gen_flush(void)
         c6_sym_global = save_global;    /* 'gen_function' scopes its params */
         local_scope = save_scope;
         cur_text_section = text_section;
+        /* A template instance is generated in every unit that instantiates
+           it (one unit may only see the module's declarations, another the
+           bodies), so the emitted function is weak: the linker keeps the
+           first copy instead of reporting 'defined twice'. */
+        if (p->sym)
+            p->sym->a.weak = 1;
         begin_macro(p->body, 1);
         next();
         gen_function(p->sym);
@@ -8068,6 +8080,8 @@ static int c6_gen_flush(void)
         c6_decl_tokens(q->proto);
         c6_gen_record_sym = save_rec;
         if (c6_gen_last_sym) {
+            /* weak for the same reason as the function queue above */
+            c6_gen_last_sym->a.weak = 1;
             begin_macro(q->body, 1);
             next();
             gen_function(c6_gen_last_sym);
@@ -8494,9 +8508,32 @@ do_decl:
                     bit_size = -1;
                     v = 0;
                     type1 = btype;
+#ifdef C6_EXT
+                    /* Parsing a member signature pushes its parameters as
+                       ordinary symbols. While a template body is being
+                       replayed they would land in the live scope (and its
+                       scope number), colliding with the user's own locals
+                       ('redeclaration of i'). Give the signature a scope of
+                       its own and pop it again right after the parse. */
+                    Sym *c6_meth_lstk = local_stack;
+                    int c6_meth_scope = local_scope, c6_sig_scope = 0;
+                    if (c6_gen_inst_cur) {
+                        local_scope = c6_meth_scope + 1;
+                        c6_sig_scope = 1;
+                    }
+#endif
                     if (tok != ':') {
 			if (tok != ';')
                             type_decl(&type1, &ad1, &v, TYPE_DIRECT);
+#ifdef C6_EXT
+                        if (c6_sig_scope) {
+                            local_scope = c6_meth_scope;
+                            /* unlink the signature's names, do not just drop
+                               the stack: a linked name stays visible to every
+                               later body in the unit */
+                            sym_pop(&local_stack, c6_meth_lstk, 1);
+                        }
+#endif
 #ifdef C6_EXT
                         /* 'T get(int i) { ... }' in a template body (§8.5):
                            the function was captured at declaration time, the
@@ -8789,8 +8826,6 @@ static int c6_pkg_prefix_known(const char *first)
     (!strncmp((s), first, n) \
      && ((s)[n] == 0 || (s)[n] == '.' \
          || ((s)[n] == '_' && (s)[n + 1] == '_')))
-    if (tcc_state->c6_package && C6_PREFIX_MATCH(tcc_state->c6_package))
-        return 1;
     if (file && file->c6_module && C6_PREFIX_MATCH(file->c6_module))
         return 1;
     for (i = 0; i < tcc_state->c6_nb_imports; i++) {
@@ -8818,7 +8853,7 @@ static Sym *c6_qualified_type(int *is_tag)
         return NULL;
     n = snprintf(pfx, sizeof pfx, "%s", get_tok_str(first, NULL));
     if (n >= (int)sizeof pfx)
-        tcc_error("package name too long");
+        tcc_error("module name too long");
     if (!c6_pkg_prefix_known(pfx))
         return NULL;
     back = tok_str_alloc();
@@ -8835,8 +8870,8 @@ static Sym *c6_qualified_type(int *is_tag)
         mt = c6_mangle_tok(pfx, seg);
         s = sym_find_raw(mt);
         if (s && (s->type.t & VT_TYPEDEF)) {
-            if (!c6_pkg_imported(pfx))
-                tcc_error("'%s' is not an imported package "
+            if (!c6_mod_imported(pfx))
+                tcc_error("'%s' is not an imported module "
                           "(use 'import %s;')", pkgdisp, pkgdisp);
             next();
             tok_str_free(back);
@@ -8844,8 +8879,8 @@ static Sym *c6_qualified_type(int *is_tag)
         }
         s = struct_find_raw(mt);
         if (s) {
-            if (!c6_pkg_imported(pfx))
-                tcc_error("'%s' is not an imported package "
+            if (!c6_mod_imported(pfx))
+                tcc_error("'%s' is not an imported module "
                           "(use 'import %s;')", pkgdisp, pkgdisp);
             next();
             tok_str_free(back);
@@ -8857,13 +8892,13 @@ static Sym *c6_qualified_type(int *is_tag)
             goto fail;
         n = strlen(pfx);
         if (n + 2 + strlen(get_tok_str(seg, NULL)) >= (int)sizeof pfx)
-            tcc_error("package name too long");
+            tcc_error("module name too long");
         snprintf(pfx + n, sizeof pfx - n, "__%s",
                  get_tok_str(seg, NULL));
         n = strlen(pkgdisp);
         if (n + 1 + strlen(get_tok_str(seg, NULL))
             >= (int)sizeof pkgdisp)
-            tcc_error("package name too long");
+            tcc_error("module name too long");
         snprintf(pkgdisp + n, sizeof pkgdisp - n, ".%s",
                  get_tok_str(seg, NULL));
     }
@@ -11151,6 +11186,18 @@ special_math_val:
 #endif
         s = sym_find(t);
 #ifdef C6_EXT
+        /* Inside a member function written in a template body a bare field
+           name means 'self->field'. A *function* of the same name must not
+           win: two instances in one unit may well be
+           'struct A@T { int cap; }' and 'struct B@(N) { int cap() { ... } }',
+           and the method of B is a file scope symbol by the time A's body is
+           generated. A real local (or a parameter) still wins. */
+        if (tcc_state->c6_ext && c6_gen_self_tag && s
+            && (s->type.t & VT_BTYPE) == VT_FUNC
+            && c6_gen_self_member(t))
+            break;
+#endif
+#ifdef C6_EXT
         /* a bare enumerator name claimed by two enums in the same scope: the
            value is not obvious from the spelling, so require 'Color.RED' */
         if (s && IS_ENUM_VAL(s->type.t) && c6_enum_poison_has(t))
@@ -11184,8 +11231,8 @@ special_math_val:
             }
         }
         /* a member function written in a template body reaches its own fields
-           by name, 'self->name' (§8.5); a real local or global of that name
-           has already won above */
+           by name, 'self->name' (§8.5); a real local of that name has already
+           won above */
         if (!s && tcc_state->c6_ext && c6_gen_self_member(t))
             break;
         /* 'pkg.member', possibly multi-level: the dotted spelling is a
@@ -11203,7 +11250,7 @@ special_math_val:
 
             n = snprintf(pfx, sizeof pfx, "%s", get_tok_str(t, NULL));
             if (n >= (int)sizeof pfx)
-                tcc_error("package name too long");
+                tcc_error("module name too long");
             snprintf(pkgdisp, sizeof pkgdisp, "%s", pfx);
             snprintf(disp, sizeof disp, "%s", pfx);
             for (;;) {
@@ -11215,7 +11262,7 @@ special_math_val:
                 snprintf(disp + n, sizeof disp - n, ".%s",
                          get_tok_str(seg, NULL));
                 if (n + 1 >= (int)sizeof disp)
-                    tcc_error("package name too long");
+                    tcc_error("module name too long");
                 /* 'Color.RED': an enum member written with its enum's tag.
                    The constant is registered under the dotted spelling (see
                    struct_decl), so this never depends on the bare name being
@@ -11230,38 +11277,38 @@ special_math_val:
                 mt = c6_mangle_tok(pfx, seg);
                 if (!(s = sym_find_raw(mt))) {
                     /* no such member: either the segment was part of the
-                       package name after all, or the member is missing */
+                       module name after all, or the member is missing */
                     next();
                     if (tok == '.') {
-                        /* one more segment follows: grow the package name */
+                        /* one more segment follows: grow the module name */
                         n = strlen(pfx);
                         if (n + 2 + strlen(get_tok_str(seg, NULL))
                             >= (int)sizeof pfx)
-                            tcc_error("package name too long");
+                            tcc_error("module name too long");
                         sprintf(pfx + n, "__%s", get_tok_str(seg, NULL));
                         n = strlen(pkgdisp);
                         snprintf(pkgdisp + n, sizeof pkgdisp - n, ".%s",
                                  get_tok_str(seg, NULL));
                         if (n + 1 >= (int)sizeof pkgdisp)
-                            tcc_error("package name too long");
+                            tcc_error("module name too long");
                         continue;
                     }
                     /* nothing left to name a member: report it */
-                    if (!c6_pkg_imported(pfx)) {
+                    if (!c6_mod_imported(pfx)) {
                         Sym *tg = struct_find(tok_alloc_const(pfx));
                         if (tg && IS_ENUM(tg->type.t))
                             tcc_error("'%s' has no member '%s'",
                                       pfx, get_tok_str(seg, NULL));
                         tcc_error("'%s' is neither an enum nor an imported "
-                                  "package (use 'import %s;')",
+                                  "module (use 'import %s;')",
                                   pkgdisp, pkgdisp);
                     }
                     dot_disp = tok_alloc_const(disp);
                     t = mt;
                     break;
                 }
-                if (!c6_pkg_imported(pfx))
-                    tcc_error("'%s' is not an imported package "
+                if (!c6_mod_imported(pfx))
+                    tcc_error("'%s' is not an imported module "
                               "(use 'import %s;')", pkgdisp, pkgdisp);
                 dot_disp = tok_alloc_const(disp);
                 t = mt;
@@ -12448,19 +12495,19 @@ static char *c6_pkg_name(int *ptok)
     int n = 0;
 
     if (*ptok < TOK_UIDENT)
-        expect("package name");
+        expect("module name");
     n = snprintf(buf, sizeof buf, "%s", get_tok_str(*ptok, NULL));
     if (n >= (int)sizeof buf)
-        tcc_error("package name too long");
+        tcc_error("module name too long");
     next();
     while (*ptok == '.') {
         next();
         if (*ptok < TOK_UIDENT)
-            tcc_error("package name expected after '.'");
+            tcc_error("module name expected after '.'");
         n += snprintf(buf + n, sizeof buf - n, "__%s",
                       get_tok_str(*ptok, NULL));
         if (n >= (int)sizeof buf)
-            tcc_error("package name too long");
+            tcc_error("module name too long");
         next();
     }
     return tcc_strdup(buf);
@@ -12538,8 +12585,16 @@ static void c6_module_dotted(const char *name, char *out, int outsz)
     out[n] = 0;
 }
 
-static int c6_module_try(TCCState *s1, const char *dir, const char *name,
-                         const char *dotted)
+/* Open the graded file of a module: the module name *is* its path, so
+   'a.b' lives at 'a/b.c6' (or 'a/b.c').
+
+   The flat spellings 'a.b.c6' and 'a__b.c6' are *not* accepted -- taking
+   both would let the name and the layout drift apart, which is exactly what
+   the graded association rules out: the qualified name, the symbol prefix
+   and the directory tree are one decision.  A stray flat file is still
+   reported, so a moved module does not look like a missing one. */
+static int c6_module_graded(TCCState *s1, const char *dir,
+                            const char *dotted)
 {
     static const char *const exts[] = { ".c6", ".c" };
     char buf[1024] = {0};
@@ -12549,56 +12604,95 @@ static int c6_module_try(TCCState *s1, const char *dir, const char *name,
        working.  The c6 spelling wins when both files exist. */
     for (i = 0; i < 2; i++) {
         n = snprintf(buf, sizeof buf, "%s%s%s%s", dir,
-                     dir[0] ? "/" : "", name, exts[i]);
+                     dir[0] ? "/" : "", dotted, exts[i]);
         if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0)
             return 0;
-        if (strcmp(dotted, name)) {
-            n = snprintf(buf, sizeof buf, "%s%s%s%s", dir,
-                         dir[0] ? "/" : "", dotted, exts[i]);
-            if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0)
-                return 0;
+    }
+    return -1;
+}
+
+/* Look for the flat spelling STEM (one extension at a time) and, when the
+   file is there, say where the module belongs. */
+static int c6_module_flat(TCCState *s1, const char *dir, const char *stem,
+                          const char *name, const char *dotted)
+{
+    static const char *const exts[] = { ".c6", ".c" };
+    char buf[1024] = {0};
+    int i = 0, n = 0;
+
+    for (i = 0; i < 2; i++) {
+        n = snprintf(buf, sizeof buf, "%s%s%s%s", dir,
+                     dir[0] ? "/" : "", stem, exts[i]);
+        if (n < (int)sizeof buf && tcc_open(s1, buf) >= 0) {
+            tcc_close();
+            tcc_error("module '%s' must live at '%s%s', not in a flat "
+                      "'%s%s': a module's name is its path",
+                      name, dotted, exts[i], stem, exts[i]);
         }
     }
     return -1;
 }
 
-/* find and open 'NAME.c6' or 'NAME.c'.  Search order: the directory of the
+/* One search root.  PASS 0 looks for the graded file; PASS 1 reports a flat
+   one, so that every root is tried for the correct spelling first. */
+static int c6_module_root(TCCState *s1, const char *dir, const char *name,
+                          const char *dotted, int pass)
+{
+    char stem[512] = {0};
+    int i = 0;
+
+    if (!pass)
+        return c6_module_graded(s1, dir, dotted);
+    if (!strcmp(dotted, name))
+        return -1;                  /* a one-segment name has no flats */
+    for (i = 0; dotted[i] && i < (int)sizeof stem - 1; i++)
+        stem[i] = dotted[i] == '/' ? '.' : dotted[i];
+    if (c6_module_flat(s1, dir, stem, name, dotted) == 0)
+        return 0;
+    return c6_module_flat(s1, dir, name, name, dotted);
+}
+
+/* find and open the file of module NAME.  Search order: the directory of the
    file that contains the 'import', the -I paths, then the current directory. */
 static int c6_module_open(TCCState *s1, const char *name)
 {
     char dotted[512] = {0};
     const char *dir = 0;
-    int i = 0;
+    int i = 0, pass = 0;
 
     c6_module_dotted(name, dotted, sizeof dotted);
 
-    if (file && file->filename[0] && strcmp(file->filename, "<string>")) {
-        const char *p = strrchr(file->filename, '/');
-        if (p) {
-            char buf[1024] = {0};
-            int dlen = p - file->filename;
-            snprintf(buf, sizeof buf, "%.*s", dlen, file->filename);
-            if (c6_module_try(s1, buf, name, dotted) == 0)
+    for (pass = 0; pass < 2; pass++) {
+        if (file && file->filename[0] && strcmp(file->filename, "<string>")) {
+            const char *p = strrchr(file->filename, '/');
+            if (p) {
+                char buf[1024] = {0};
+                int dlen = p - file->filename;
+                snprintf(buf, sizeof buf, "%.*s", dlen, file->filename);
+                if (c6_module_root(s1, buf, name, dotted, pass) == 0)
+                    return 0;
+            }
+        }
+        for (i = 0; i < s1->nb_include_paths; i++) {
+            dir = s1->include_paths[i];
+            if (c6_module_root(s1, dir, name, dotted, pass) == 0)
                 return 0;
         }
-    }
-    for (i = 0; i < s1->nb_include_paths; i++) {
-        dir = s1->include_paths[i];
-        if (c6_module_try(s1, dir, name, dotted) == 0)
+        if (c6_module_root(s1, "", name, dotted, pass) == 0)
             return 0;
     }
-    return c6_module_try(s1, "", name, dotted);
+    return -1;
 }
 
 /* Replay the declarations of the module NAME into the current translation
    unit.  Function bodies, initializers and file local objects are skipped:
    'import' supplies declarations, the module's own object supplies code.
-   A missing file keeps the old 'import' behaviour (names only), so code
-   that used 'import pkg;' as a namespace declaration still compiles. */
+   The file must exist: the module name is its path, so a missing file is a
+   broken import, not a way to declare names. */
 static void c6_module_import(const char *name)
 {
     TCCState *s1 = tcc_state;
-    char *saved_pkg = 0, *saved_expected = 0;
+    char *saved_expected = 0;
     int i = 0, saved_tok = 0, saved_scope = 0, saved_nocode = 0, saved_flags = 0;
     CValue saved_val = {0};
     const char *saved_func = 0;
@@ -12611,21 +12705,27 @@ static void c6_module_import(const char *name)
     for (i = 0; i < s1->c6_nb_loading_modules; i++)
         if (!strcmp(s1->c6_loading_modules[i], name))
             tcc_error("circular import of module '%s'", name);
-    if (c6_module_open(s1, name) < 0)
-        return;
+    if (c6_module_open(s1, name) < 0) {
+        char dotted[512] = {0}, disp[512] = {0};
+        int i = 0;
+        c6_module_dotted(name, dotted, sizeof dotted);
+        for (i = 0; dotted[i] && i < (int)sizeof disp - 1; i++)
+            disp[i] = dotted[i] == '/' ? '.' : dotted[i];
+        tcc_error("cannot find module '%s': expected a file at '%s.c6' "
+                  "in the search path (a module's name is its path)",
+                  disp, dotted);
+    }
 
     dynarray_add(&s1->c6_loading_modules, &s1->c6_nb_loading_modules,
                  tcc_strdup(name));
     saved_tok = tok;
     saved_val = tokc;
     saved_flags = parse_flags;
-    saved_pkg = s1->c6_package;
     saved_expected = c6_expected_module;
     saved_scope = local_scope;
     saved_nocode = nocode_wanted;
     saved_func = funcname;
 
-    s1->c6_package = NULL;
     local_scope = 0;
     nocode_wanted = DATA_ONLY_WANTED;
     funcname = "";
@@ -12644,7 +12744,6 @@ static void c6_module_import(const char *name)
     funcname = saved_func;
     nocode_wanted = saved_nocode;
     local_scope = saved_scope;
-    s1->c6_package = saved_pkg;
     parse_flags = saved_flags;
     tok = saved_tok;
     tokc = saved_val;
@@ -13236,13 +13335,10 @@ static void c6_emit_header(TCCState *s1)
 
 /* 'pkg.member' is only allowed for a package that was imported, or for the
    package the code currently sits in */
-static int c6_pkg_imported(const char *name)
+static int c6_mod_imported(const char *name)
 {
     int i = 0;
 
-    if (tcc_state->c6_package
-        && !strcmp(tcc_state->c6_package, name))
-        return 1;
     if (file && file->c6_module) {
         size_t n = strlen(file->c6_module);
         if (n > 2 && strlen(name) == n - 2
@@ -13256,7 +13352,7 @@ static int c6_pkg_imported(const char *name)
 }
 
 /* resolve V as a member of the current module, the current package or of an
-   imported package */
+   imported module */
 static Sym *c6_import_lookup(int v)
 {
     TCCState *s1 = tcc_state;
@@ -13267,13 +13363,6 @@ static Sym *c6_import_lookup(int v)
         return NULL;
     if (file && file->c6_module) {
         t = c6_mod_name(v);
-        s = sym_find_raw(t);
-        if (s)
-            return s;
-    }
-    if (s1->c6_package) {
-        t = c6_mangle_tok(s1->c6_package, v);
-        t = c6_mod_name(t);
         s = sym_find_raw(t);
         if (s)
             return s;
@@ -13305,46 +13394,17 @@ static Sym *c6_import_tag_lookup(int v)
     return NULL;
 }
 
-/* Compose 'outer' and 'inner' into a single prefix.  Nesting is not a
-   separate namespace layer: 'package a { package b { ... } }' simply
-   prefixes twice, so a symbol declared inside becomes 'a__b__sym'. */
-static char *c6_pkg_compose(const char *outer, char *inner)
-{
-    char buf[128] = {0};
-    int n = 0;
-
-    n = snprintf(buf, sizeof buf, "%s__%s", outer, inner);
-    tcc_free(inner);
-    if (n >= (int)sizeof buf)
-        tcc_error("package name too long");
-    return tcc_strdup(buf);
-}
-
+/* 'package' was the second way to name things; it is gone.  A namespace is a
+   file now ('module NAME;' as the first declaration, one per file), so the
+   symbol prefix, the qualified name and the on-disk location all come from
+   that one declaration.  Keeping the keyword lets the old spelling produce a
+   migration hint instead of a puzzling syntax error. */
 static void c6_package_parse(void)
 {
-    char *name = 0, *saved = 0;
-
     next();  /* skip 'package' */
-    name = c6_pkg_name(&tok);
-    if (tcc_state->c6_package)
-        name = c6_pkg_compose(tcc_state->c6_package, name);
-    if (tok == '{') {
-        /* 'package NAME { ... }': the package ends with the block */
-        saved = tcc_state->c6_package;
-        tcc_state->c6_package = name;
-        next();
-        while (tok != '}' && tok != TOK_EOF)
-            decl(VT_CONST);
-        skip('}');
-        tcc_state->c6_package = saved;
-        tcc_free(name);
-    } else {
-        /* 'package NAME;' names the rest of the file (or until the next
-           'package' statement); include system headers before it */
-        tcc_free(tcc_state->c6_package);
-        tcc_state->c6_package = name;
-        skip(';');
-    }
+    tcc_error("'package' was removed: write 'module NAME;' as the first "
+              "declaration of the file (one module per file, and the file "
+              "lives at the path that NAME spells)");
 }
 
 static void c6_import_parse(void)
@@ -14337,15 +14397,10 @@ static int c6_emit_auto_impls(void)
     C6AutoImpl *a = 0;
     C6Iface *ifc = 0;
     TokenString *ts = 0;
-    char *saved_pkg = 0;
     int i = 0, j = 0, n = 0;
 
     if (!c6_nb_auto_impls)
         return 0;
-    /* the object name is fixed: a file level 'package NAME;' must not
-       mangle it a second time */
-    saved_pkg = tcc_state->c6_package;
-    tcc_state->c6_package = NULL;
     for (i = 0; i < c6_nb_auto_impls; i++) {
         a = c6_auto_impls[i];
         if (a->vt_emitted)
@@ -14381,7 +14436,6 @@ static int c6_emit_auto_impls(void)
         tok_str_add(ts, TOK_EOF);
         c6_decl_tokens(ts);
     }
-    tcc_state->c6_package = saved_pkg;
     return n;
 }
 
@@ -15296,8 +15350,6 @@ static void c6_tu_reset(void)
     tcc_state->c6_nb_gc_edges = tcc_state->c6_gc_edges_cap = 0;
     c6_importing = 0;
     c6_expected_module = NULL;
-    tcc_free(tcc_state->c6_package);
-    tcc_state->c6_package = NULL;
     c6_self_pending = 0;
     /* the slice descriptors hold Sym pointers into the symbol pools that
        tccgen_finish() has released: they must not be looked at again */
@@ -21817,7 +21869,6 @@ static void c6_sp_emit(C6SpPending *sp)
 {
     TokenString *ts = 0;
     Sym *p = 0;
-    char *save_pkg = 0;
     CType rt = {0};
     int arg = tok_alloc_const("__c6_arg");
     int ret = tok_alloc_const("__c6_ret");
@@ -21932,10 +21983,7 @@ static void c6_sp_emit(C6SpPending *sp)
     tok_str_add(ts, '}');
     tok_str_add(ts, TOK_EOF);
     /* the callee name was mangled when it was declared: keep it as it is */
-    save_pkg = tcc_state->c6_package;
-    tcc_state->c6_package = NULL;
     c6_decl_tokens(ts);
-    tcc_state->c6_package = save_pkg;
 }
 
 static void c6_sp_flush(void)
@@ -22780,11 +22828,6 @@ static void c6_apply_fallible(CType *type)
                 btype.t = VT_INT;
                 oldint = 1;
             } else {
-#ifdef C6_EXT
-                /* end of a 'package NAME { ... }' body */
-                if (tok == '}' && tcc_state->c6_package)
-                    break;
-#endif
                 if (tok != TOK_EOF)
                     expect("declaration");
                 break;
@@ -22841,12 +22884,6 @@ static void c6_apply_fallible(CType *type)
                 && !strcmp(get_tok_str(decl_name, NULL), "main"))
                 tcc_error("'main' cannot be declared in a module");
 #endif
-            /* symbols declared inside a package are name-mangled; the
-               program entry point always keeps its name */
-            if (l == VT_CONST && tcc_state->c6_package
-                && v >= TOK_UIDENT
-                && strcmp(get_tok_str(v, NULL), "main") != 0)
-                v = c6_mangle_tok(tcc_state->c6_package, v);
             /* ... and a module prefixes the result once more, so that
                'package p { int f() }' in module m becomes 'm__p__f' */
             if (l == VT_CONST && file->c6_module && v >= TOK_UIDENT)
@@ -22931,8 +22968,7 @@ static void c6_apply_fallible(CType *type)
 #ifdef C6_EXT
                 /* a method is emitted as '<Type>_<name>' so that different
                    structures can share a method name (c6_method_symbol) */
-                if (!tcc_state->c6_package || file->c6_module)
-                    method_tok = c6_method_symbol(decl_name, &type);
+                method_tok = c6_method_symbol(decl_name, &type);
                 if (method_tok)
                     v = method_tok;
                 /* importing a module: register the prototype, skip the body
@@ -23100,8 +23136,7 @@ static void c6_apply_fallible(CType *type)
                         /* external variable or function */
                         type.t |= VT_EXTERN;
 #ifdef C6_EXT
-                        if (!tcc_state->c6_package || file->c6_module)
-                            method_tok = c6_method_symbol(decl_name, &type);
+                        method_tok = c6_method_symbol(decl_name, &type);
                         if (method_tok)
                             v = method_tok;
 #endif

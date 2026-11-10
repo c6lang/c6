@@ -1,0 +1,116 @@
+/* wordcount：把标准库的几块拼起来用。
+ *
+ * 这个文件没有 `module`：入口 `main` 只能出现在不属于任何模块的文件里。
+ * 它把 examples/wordcount/text.c6（模块 wordcount.text）和 std/ 里的几个
+ * 模块拼起来。
+ *
+ * 编译（模块正文要单独编进程序，import 只带来声明）：
+ *
+ *     ./tcc/tcc -B tcc -I examples -I . -o build/wordcount \
+ *         examples/wordcount.c6 examples/wordcount/text.c6 \
+ *         std/str.c6 std/types.c6 std/vec.c6 std/span.c6 std/fmt.c6 \
+ *         std/range.c6 std/err.c6
+ *
+ * 模块搜索路径先看当前文件所在目录，再看 -I：`import wordcount.text;`
+ * 因此要找 examples/wordcount/text.c6，所以 examples 在 -I 里。
+ *
+ * 用到的东西：
+ *   std.types   u32 / i32 这些定宽类型
+ *   std.err     Code 错误码与 msg_of()
+ *   std.str     Str 视图：S()、str()、count()、at()
+ *   std.vec     Vect@int：会自己长大的数组（托管引用，new 出来）
+ *   std.span    Span@int：数组上的零拷贝窗口
+ *   std.fmt     Buf@(96)：定长格式化缓冲
+ *   std.range   range()：能被 foreach 吃掉的区间
+ *   wordcount.text：自己写的模块（示例模块边界）
+ */
+#include <stdio.h>
+
+import std.types;
+import std.err;
+import std.str;
+import std.vec;
+import std.span;
+import std.fmt;
+import std.range;
+import wordcount.text;
+
+/* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+char *sample[3] = {
+    "the quick brown fox",
+    "jumps over 42 lazy dogs",
+    "0123456789 and more",
+};
+
+int main(void)
+{
+    @Vect@int per_line = new Vect@int;      /* 每行的单词数 */
+    int counts[3] = { 0, 0, 0 };
+    int words_total = 0, digits_total = 0, longest_seen = 0;
+    u32 chars = 0;
+    Buf@(96) out = { { 0 }, 0 };
+    Buf@(96) *o = &out;
+    int i = 0;
+
+    foreach (int k = range(0, 3)) {
+        Str line = str(sample[k]);
+        Str *p = &line;
+        int w = words(p->s);
+        int d = digits(p->s);
+        int l = longest(p->s);
+
+        per_line->push(w) catch e {
+            printf("push 失败：%s\n", msg_of(std.err.NOMEM));
+            return 1;
+        };
+        words_total += w;
+        digits_total += d;
+        chars += (u32)p->count();
+        if (l > longest_seen)
+            longest_seen = l;
+    }
+
+    if (per_line->count() != 3) {
+        printf("统计失败：%s\n", msg_of(std.err.STATE));
+        return 1;
+    }
+
+    /* Vect 的内容拷进普通数组，再用 Span 开一扇窗来读 */
+    for (i = 0; i < 3; i++)
+        counts[i] = per_line->at(i);
+    {
+        Span@int sp = { counts };
+        Span@int *spp = &sp;
+        int widest = 0;
+
+        foreach (int j = range(0, spp->count())) {
+            int v = spp->at(j);
+
+            if (v > widest)
+                widest = v;
+        }
+        o->write(S("单词最多的行有 ")) catch e { return 2; };
+        o->write_int(widest) catch e { return 2; };
+        o->write(S(" 个单词")) catch e { return 2; };
+    }
+
+    printf("%s\n", o->cstr());
+    printf("单词 %d，数字 %d，字符 %u，最长单词 %d\n",
+           words_total, digits_total, chars, longest_seen);
+    printf("只取前两行：%d / %d 个单词\n",
+           per_line->at(0), per_line->at(1));
+
+    /* 区间也能只看一段：0..9 里的偶数有多少个 */
+    {
+        int evens = 0;
+
+        foreach (int v = range(0, 10)) {
+            if (v % 2 == 0)
+                evens++;
+        }
+        printf("0..9 里有 %d 个偶数\n", evens);
+    }
+    return 0;
+}

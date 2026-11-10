@@ -1,0 +1,182 @@
+/* std/span：切片上的值语义视图 Span@T。
+ *
+ *     import std.span;
+ *
+ *     int a[5] = { 1, 2, 3, 4, 5 };
+ *     Span@int s = { a };              // 数组隐式转切片
+ *     Span@int t = (&s)->sub(1, 3);    // { 2, 3, 4 }
+ *
+ * 和 Vect 的分工：Vect 拥有元素、可增长；Span 只**看**一段已有内存，不分配、
+ * 不拥有，可以按值声明、按值传参（它只包一对 `(指针, 长度)`，没有托管字段）。
+ * 代价是方法的接收者仍然是指针，值容器的调用要写 `(&s)->count()`。
+ *
+ * Span 不延长元素的生命周期：底层内存（数组、`new` 出来的托管数组、字符串
+ * 字面量）必须比 Span 活得久，这一点由调用方保证。
+ */
+#include <string.h>
+
+module std.span;
+import std.types;
+
+struct Span@T {
+    T[:] items;
+
+    /* 元素个数 */
+    int count() { return items.len; }
+
+    int is_empty() { return items.len == 0; }
+
+    /* 下标访问：要求 0 <= i < count() */
+    T at(int i) { return items[i]; }
+
+    /* 带检查的读 */
+    int get(int i, T *out)
+    {
+        if (i < 0 || i >= items.len)
+            return 0;
+        *out = items[i];
+        return 1;
+    }
+
+    void set(int i, T v)
+    {
+        if (i >= 0 && i < items.len)
+            items[i] = v;
+    }
+
+    /* 子视图：越界会被夹到合法范围，不分配 */
+    Span@T sub(int start, int n)
+    {
+        Span@T r = { items };
+
+        if (start < 0)
+            start = 0;
+        if (start > items.len)
+            start = items.len;
+        if (n < 0)
+            n = 0;
+        if (start + n > items.len)
+            n = items.len - start;
+        r.items = (T[:]){ items.data + start, n };
+        return r;
+    }
+
+    /* 去掉前 k 个 / 只留前 k 个：都只调整边界，不分配 */
+    Span@T drop(int k)
+    {
+        Span@T r = { items };
+
+        if (k < 0)
+            k = 0;
+        if (k > items.len)
+            k = items.len;
+        r.items = (T[:]){ items.data + k, items.len - k };
+        return r;
+    }
+
+    Span@T take(int k)
+    {
+        Span@T r = { items };
+
+        if (k < 0)
+            k = 0;
+        if (k > items.len)
+            k = items.len;
+        r.items = (T[:]){ items.data, k };
+        return r;
+    }
+
+    /* 元素指针：给需要裸指针的 C 接口用，空 Span 返回 0 */
+    T *ptr() { return items.len > 0 ? items.data : 0; }
+};
+
+/* 没有工厂函数：Span 是纯值结构体，直接聚合初始化即可
+   （`Span@int s = { a };`，数组隐式转切片）。要显式写切片时用
+   `(int[:]){ a, 5 }`。 */
+
+/* ---- 自测 ---- */
+
+/* 值容器调用方法要走指针：先取地址，后面就都是 p->... */
+test "数组隐式转切片，再包成 Span" {
+    int a[5] = { 10, 20, 30, 40, 50 };
+    Span@int s = { a };
+    Span@int *p = &s;
+    int out = 0;
+
+    if (p->count() != 5)
+        err(1, "count 不是 5");
+    if (p->at(2) != 30)
+        err(2, "at 不对");
+    if (p->get(4, &out) != 1 || out != 50)
+        err(3, "get 不对");
+    if (p->get(5, &out) != 0)
+        err(4, "越界没有返回 0");
+    if (p->ptr() != a)
+        err(5, "ptr 不是数组首地址");
+}
+
+test "Span 按值传递，视图共享同一段内存" {
+    int a[3] = { 1, 2, 3 };
+    Span@int s = { a };
+    Span@int c = s;
+    Span@int *cp = &c;
+
+    cp->set(0, 99);
+    if (a[0] != 99)
+        err(6, "Span 的副本没有指向同一段内存");
+    if ((&s)->count() != 3)
+        err(7, "副本的 count 不对");
+}
+
+test "sub / take / drop 只调整边界" {
+    int a[6] = { 0, 1, 2, 3, 4, 5 };
+    Span@int s = { a };
+    Span@int mid = (&s)->sub(2, 3);
+    Span@int head = (&s)->take(2);
+    Span@int tail = (&s)->drop(4);
+    Span@int *mp = &mid;
+
+    if (mp->count() != 3 || mp->at(0) != 2 || mp->at(2) != 4)
+        err(8, "sub 不对");
+    if ((&head)->count() != 2 || (&head)->at(1) != 1)
+        err(9, "take 不对");
+    if ((&tail)->count() != 2 || (&tail)->at(0) != 4)
+        err(10, "drop 不对");
+    if (mid.items.data != a + 2)
+        err(11, "sub 的指针不对");
+}
+
+test "越界的 sub 被夹住，不会越过原视图" {
+    int a[4] = { 1, 2, 3, 4 };
+    Span@int s = { a };
+    Span@int x = (&s)->sub(3, 100);
+    Span@int y = (&s)->sub(-5, 2);
+    Span@int z = (&s)->sub(100, 1);
+
+    if ((&x)->count() != 1 || (&x)->at(0) != 4)
+        err(12, "右越界没有夹住");
+    if ((&y)->count() != 2)
+        err(13, "负起点没有夹住");
+    if ((&z)->count() != 0 || (&z)->ptr() != 0)
+        err(14, "起点越界应得到空 Span");
+}
+
+test "空 Span 是合法的" {
+    Span@int e = { (int[:]){ 0, 0 } };
+    Span@int *p = &e;
+
+    if (p->count() != 0 || p->is_empty() != 1 || p->ptr() != 0)
+        err(15, "空 Span 的状态不对");
+}
+
+test "foreach 直接走切片" {
+    int a[4] = { 1, 2, 3, 4 };
+    Span@int s = { a };
+    int sum = 0;
+
+    foreach (int x = s.items) {
+        sum += x;
+    }
+    if (sum != 10)
+        err(16, "迭代和不对");
+}

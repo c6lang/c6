@@ -15,6 +15,7 @@ interface Shape {
 }
 
 int counter = 7;
+Point origin = { 3, 4 };
 
 int add(int a, int b) { return a + b; }
 int twice(int a) { return add(a, a); }

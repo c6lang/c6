@@ -38,7 +38,7 @@ identifier    = ( letter | "_" ) , { letter | digit } ;
 
 (* 扩展新增的关键字 *)
 c6-keyword =
-      "package" | "import" | "interface"
+      "import" | "interface"
     | "defer"   | "errdefer" | "err" | "test"
     | "try"     | "catch"
     | "async"   | "await"
@@ -58,10 +58,12 @@ error-type-name = "error" ;
 切片类型 `T[:]` 不引入关键字：它由已有的 `[`、`:`、`]` 三个记号组成，
 只在「声明说明符之后」这个 C 里本来非法的位置被识别（见 3.3）。
 
-`try`、`catch`、`err`、`defer`、`errdefer`、`package`、`import`、
-`interface`、`foreach` 只会作为关键字出现在下列产生式允许的位置；在其余
+`try`、`catch`、`err`、`defer`、`errdefer`、`import`、`interface`、
+`foreach` 只会作为关键字出现在下列产生式允许的位置；在其余
 位置（例如声明说明符中）它们仍可被当作标识符使用，这一点与 C 关键字
-不同，是单趟实现的已知宽松之处。`impl` 自 0010 起不再是关键字。
+不同，是单趟实现的已知宽松之处。`impl` 自 0010 起不再是关键字；
+`package` 在统一成 `module` 后也不再是语法构造，但仍会被识别并报一条
+迁移提示（见 2.1），所以它同样不能当普通标识符用。
 
 `foreach` 还多一条限制：它只在**语句开头**、下一个记号是 `(`、并且
 `foreach` 不是作用域里已知的标识符时才算语句（分派在 `block()` 里做，此时
@@ -108,36 +110,26 @@ task t = f(a);          /* 同理 -> 句柄 */
 translation-unit       = { top-level-declaration } , EOF ;
 
 top-level-declaration  = module-declaration
-                       | package-declaration
                        | import-declaration
                        | interface-declaration
                        | test-declaration
                        | declaration ;
 
-(* ---- module ---- *)
+(* ---- module：唯一的命名空间 ---- *)
 
-module-declaration     = "module" , package-name , ";" ;
-                         (* 必须是文件的第一个声明；'package-name' 的点号
-                            形式与 package 一样组合前缀，见 2.1 *)
+module-declaration     = "module" , module-name , ";" ;
+                         (* 必须是文件的第一个声明；一个文件一个模块，
+                            模块名就是它在磁盘上的路径，见 2.1 *)
 
-(* ---- package / import ---- *)
+module-name            = identifier , { "." , identifier } ;
 
-package-declaration    = "package" , package-name ,
-                         ( "{" , { package-item } , "}" | ";" ) ;
-                         (* 点号形式与嵌套块、文件级形式等价地组合前缀：
-                            'package a.b' 与 'package a { package b { … } }'
-                            都产生前缀 'a__b' *)
+import-declaration     = "import" , module-name , ";" ;
+                         (* 打开 'mod.member' 写法，必须出现在使用点之前；
+                            并按 'a/b.c6'（或 'a/b.c'）的路径加载模块的
+                            声明，见 2.1 *)
 
-package-name           = identifier , { "." , identifier } ;
-
-package-item           = package-declaration
-                       | function-definition
-                       | declaration ;
-
-import-declaration     = "import" , package-name , ";" ;
-                         (* 打开 'pkg.member' 写法，必须出现在使用点之前；
-                            若找到对应的 'NAME.c'（点号形式为 'a/b.c'），
-                            还会加载它的声明，见 2.1 *)
+(* 'package NAME { … }' 与 'package NAME;' 已删除：它们是同一件事的第二套
+   写法，两套前缀规则会各自漂移。旧写法仍被识别，但立刻报迁移提示。 *)
 
 (* ---- interface ---- *)
 
@@ -158,6 +150,41 @@ test-declaration       = "test" , string-literal , compound-statement ;
                          (* 等价于 static int __tcc_test_N(void) ，
                             返回值 0 表示通过；-test 运行，-run 时忽略 *)
 ```
+
+### 2.1 模块名就是它的路径
+
+`module` 是唯一的命名空间，一个文件一个模块：
+
+- `module NAME;` 必须是文件的第一个声明，一个文件只能声明一次；`main`
+  不能声明在模块里。
+- **模块名就是它的路径。** `import a.b;` 只按 `a/b.c6`（或 `a/b.c`）查找，
+  顺序是「当前文件所在目录 → `-I` 路径 → 当前目录」。找到的文件里
+  `module` 声明必须与路径逐段一致，否则
+  `module file declares 'a__zzz', expected 'a__b'`。
+- 扁平的 `a.b.c6` / `a__b.c6` **不接受**：它存在时报
+  `module 'a.b' must live at 'a/b.c6', not in a flat 'a.b.c6': a module's
+  name is its path`。限定名、符号前缀和目录树由此成为同一个决定，不会
+  各自漂移；分级路径先在每个搜索根里找完，扁平文件才用来报错，所以正确
+  摆放的模块不会被旁边的散落文件干扰。
+- 找不到模块文件是错误：`cannot find module 'a.b': expected a file at
+  'a/b.c6' in the search path (a module's name is its path)`。`import` 不再
+  允许「只登记名字」——文件是模块身份的一半。
+- 多级名不需要嵌套块：`a.b` 就是目录 `a/` 下的 `b.c6`，前缀 `a__b__`。
+- 直接编译一个模块文件时**不**检查它放在哪里：路径约束是给消费者用的
+  （`import` 按路径找），所以单元测试把文件放在任意位置单独编译仍然成立。
+
+`package`（块形式 `package X { … }` 与文件级 `package X;`）已经删除。旧代码
+里的 `package` 仍被识别，但立刻报
+
+```
+error: 'package' was removed: write 'module NAME;' as the first declaration
+of the file (one module per file, and the file lives at the path that NAME
+spells)
+```
+
+迁移：把 `package a.b { … }` 的内容挪进 `a/b.c6`，首行写 `module a.b;`。
+`a.b.c6` 这种扁平文件要移动到 `a/b.c6`；`package a { package b { … } }`
+的嵌套改为上面一条路径。
 
 ---
 
@@ -245,7 +272,7 @@ function-definition    = declaration-specifiers ,
 （C11 6.7.9p10），写 `= 0` 只是噪声，而且不带初始化器的对象落在 `.bss`、
 不占输出文件；VLA 则是因为标准 C 不允许给变长数组写初始化器。
 
-诊断里使用源码中书写的标识符：`package` 内的变量报原名，而不是
+诊断里使用源码中书写的标识符：模块内的变量报原名，而不是
 `NAME__x`。
 
 这条约束只作用于 `.c6` 的翻译单元：`.c` 文件的老代码完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
@@ -284,7 +311,7 @@ function-definition    = declaration-specifiers ,
     }
 ```
 
-- 不同类型可以用同名方法，不必放进不同 `package`；
+- 不同类型可以用同名方法，不需要给它们各自的命名空间；
 - `area(p)` 这种普通调用仍然可用，指向本翻译单元里**第一个**取到该名字的方法；
   真正有歧义时它只是个弱别名，链接时会被手写的强定义覆盖。纯 C 的翻译单元
   按原名链接不受影响；
@@ -293,8 +320,8 @@ function-definition    = declaration-specifiers ,
 - 下列情况不改名，方法符号就是源码里的名字：`static` / `inline` 函数、
   以 `__` 开头的名字（编译器和 libtcc1 专用）、来自系统头文件的声明
   （`p->fflush()` 仍然调 libc 的 `fflush`）、匿名结构体的方法（匿名 tag
-  的编号是每个 TU 各一份），以及在 `package` 里声明的方法（包名已经把它
-  和别的包分开，符号是 `pkg__name`）。
+  的编号是每个 TU 各一份）。模块里的方法也不需要保留原名：符号只按接收者
+  取名，模块前缀由 `NAME__` 那一层加上去。
 
 约束见 C20。
 
@@ -818,6 +845,12 @@ typedef Vect@IntVec Grid;
 体没有别处可补；非模板的结构体里写方法定义同样是错误（写出来就行
 `int S_f(struct S *self) { … }`）。
 
+名字解析的次序（C123）：局部变量与形参 > 实例的字段/方法 > 文件作用域的其他
+符号。也就是说**文件作用域的同名函数不会抢走字段**——同一个翻译单元里可以
+同时有 `struct A@T { int cap; }` 和 `struct B@(N) { int cap() { … } }`，在 A 的
+体内裸写 `cap` 仍然是 `self->cap`。（这两条符号以前会互相污染：实例化
+`B@(8)` 时它方法的原名会留在调用方作用域里，让 `cap` 变成那个函数。）
+
 裸模板名是 C103 诊断，不是类型。
 
 完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
@@ -1144,8 +1177,8 @@ parameter-list    = identifier , { "," , identifier } ;
 | C10 | `expr` 中不能直接写裸 `catch` | 同 C7 |
 | C11 | `try` / `catch` / `err` 不得出现在 `defer` / `errdefer` 体内 | `'try' is not allowed in a defer body` 等 |
 | C12 | 返回类型大小未知（不完整类型）的函数不能传播错误 | `cannot propagate an error from a function with an incomplete return type` |
-| C13 | `package` 内的符号被改写为 `NAME__sym`，`main` 除外；嵌套与点号形式组合前缀 | — |
-| C14 | `pkg.member` 只在 `pkg` 已 `import`（或就是当前包）时成立 | `'pkg' is not an imported package (use 'import pkg;')` |
+| C13 | 模块文件里的文件作用域符号被改写为 `NAME__sym`，`main` 除外；点号名逐段拼成 `a__b__` | — |
+| C14 | `mod.member` 只在 `mod` 已 `import`（或就是当前模块）时成立 | `'mod' is neither an enum nor an imported module (use 'import mod;')` |
 | C15 | `T!error` 调用的结果必须被 `try` 或 `catch` 消费（`sizeof` / `typeof` 的操作数不产生调用，不受此限） | `the result of a 'T!error' function must be used with 'try' or 'catch'` |
 | C16 | `err` 必须带 `id` 与 `msg` 两个实参（没有重抛形式） | `'err' requires an error id and a message` |
 | C17 | `err` 只能出现在返回 `T!error` 的函数里 | `'err' requires the enclosing function to return 'T!error'` |
@@ -1247,7 +1280,9 @@ parameter-list    = identifier , { "," , identifier } ;
 | C117 | 枚举成员的限定符必须是这个枚举自己的 tag | `enumerator qualifier 'Other' must be the enum's own tag 'Color'` |
 | C118 | 匿名枚举的成员不能限定 | `the enumerator of an anonymous enum cannot be qualified` |
 | C119 | 两个枚举都要同一个裸成员名时，裸名不再可用，必须写限定名 | `'RED' is the member of more than one enum: write '<enum>.RED'` |
-| C120 | `Tag.成员` 里 `Tag` 必须是可见的枚举，成员必须存在 | `'Fruit' has no member 'APPLE'`；`'Nope' is neither an enum nor an imported package (use 'import Nope;')` |
+| C120 | `Tag.成员` 里 `Tag` 必须是可见的枚举，成员必须存在 | `'Fruit' has no member 'APPLE'`；`'Nope' is neither an enum nor an imported module (use 'import Nope;')` |
+| C123 | 体内成员函数里裸名的解析次序：局部/形参 > 实例的字段与方法 > 文件作用域其他符号（文件作用域的同名函数不抢字段）；实例化不得把模板方法的原名或形参名留在调用方作用域里 | —（曾表现为 `redeclaration of 'i'` / 把字段当成函数） |
+| C122 | 模块名就是它的路径：`import a.b` 只按 `a/b.c6`（或 `a/b.c`）查找，扁平拼写被拒绝，找不到文件也是错误 | `module 'a.b' must live at 'a/b.c6', not in a flat 'a.b.c6': a module's name is its path`；`cannot find module 'a.b': expected a file at 'a/b.c6' in the search path (a module's name is its path)` |
 | C121 | 声明式头里的绑定：不能是 `void`/数组/函数，不能改变托管所有权，下标必须是整数，头里必须写出类型和名字 | `a 'foreach' binding cannot be 'void'`；`a 'foreach' binding cannot be an array`；`a 'foreach' binding cannot be a function`；`a 'foreach' binding cannot change ownership: 'v' holds a managed reference`；`the index of a 'foreach' must have an integer type, not 'double'`；`a type name expected in the head of 'foreach'`；`'foreach' needs a parenthesised head now: write 'foreach ((size_t i, T v) = a) { ... }'` |
 
 （闭包的 C90–C98 见 [closure-design.md](closure-design.md) §9，消息与
@@ -1347,8 +1382,9 @@ p->f(args)                       (* T 有方法 f，且没有同名字段 *)
 
 接收者先求值并存入一个临时槽，再作为第一个实参压栈：若方法返回结构体，
 隐藏的 `self` 排在 sret 缓冲之后。`T_f` 就是方法定义处输出的符号
-（见 3.2；`static`/`inline`、`__` 开头、系统头文件里的声明和
-`package` 内的方法保留原名）。
+（见 3.2；`static`/`inline`、`__` 开头和系统头文件里的声明保留原名）。
+
+（`package` 已经删除，方法不再有「包内保留原名」这一种情况。）
 
 **R9 — 结构体到接口的隐式转换**
 
@@ -1487,17 +1523,16 @@ math.Point p;                    (* 类型 => math__Point *)
 
 类型位置也接受全限定名：`math.Point p;` 解析到 `math__Point` 的 typedef
 或 struct/union/enum tag（多级点号 `a.b.Point` 同理）。module 文件里的 tag
-带前缀；package 里的 tag 仍是普通 C tag，所以 package 限定类型要写 typedef。
-只有当前 module/package 或 `import` 过的名字能这样写；限定名不是类型时（例如
-`pkg.func(...)` 这样的表达式语句）解析器会把 token 原样还回去，仍按普通
+带前缀，`math.Point` 就解析到 `math__Point`。
+只有当前模块或 `import` 过的名字能这样写；限定名不是类型时（例如
+`mod.func(...)` 这样的表达式语句）解析器会把 token 原样还回去，仍按普通
 表达式处理。
 
-`import NAME;` 仍然先登记名字（打开 `NAME.member` 写法）；此外按
-「当前文件所在目录 → `-I` 路径 → 当前目录」查找 `NAME.c`（点号形式查找
-`a/b.c`），找到就把它的声明读进来：函数只登记原型、跳过函数体，全局变量
-只登记 `extern`、跳过初始化器，`static` 对象和 `test` 块跳过。找不到文件
-时保持旧行为（只登记名字），所以把 `import` 当命名空间声明的旧代码不受
-影响。导入的声明和模块自己的对象文件是两件事：链接时仍要把模块的目标
+`import NAME;` 先登记名字（打开 `NAME.member` 写法），再按模块名拼出的
+路径（`a/b.c6` 或 `a/b.c`）在「当前文件所在目录 → `-I` 路径 → 当前目录」
+里查找，找到就把它的声明读进来：函数只登记原型、跳过函数体，全局变量只
+登记 `extern`、跳过初始化器，`static` 对象和 `test` 块跳过。找不到文件是
+错误（C122）。导入的声明和模块自己的对象文件是两件事：链接时仍要把模块的目标
 文件（或包含它的库）放上命令行。
 
 `-emit-header FILE`（模块是 `.c6` 文件时）在编译模块时把导出的结构体、枚举、
@@ -1650,9 +1685,12 @@ int use(int n)
     g() catch e { return 2; };   /* 不会误判为 g 失败 */
 ```
 
-包、方法与接口一起用（多级包 + 自动 vtable）：
+方法、接口与模块一起用（自动 vtable + 按路径导入的模块）：
 
 ```c
+/* geo/shape.c6 */
+module geo.shape;
+
 interface Shape { int area(); }
 
 struct Circle { int r; };
@@ -1660,19 +1698,18 @@ struct Rect { int w, h; };
 typedef struct Circle Circle;
 typedef struct Rect Rect;
 
-/* 方法符号按接收者取名（Circle_area / Rect_area），同名方法不再需要包；
-   这里演示包、方法与接口一起用 */
-package geo.circle {
-    int area(Circle *self) { return 3 * self->r * self->r; }
-}
+/* 方法符号按接收者取名（Circle_area / Rect_area），同名方法不需要命名空间 */
+int area(Circle *self) { return 3 * self->r * self->r; }
+int area(Rect *self)   { return self->w * self->h; }
+int twice(Rect *self)  { return self->area() * 2; }   /* 方法可以调方法 */
 
-package geo.rect {
-    int area(Rect *self) { return self->w * self->h; }
-    int twice(Rect *self) { return self->area() * 2; }   /* 方法可调方法 */
-}
+/* 第一个参数不是结构体指针，所以它不是方法：可以用全限定名精确调用 */
+int total(Shape a, Shape b) { return a.area() + b.area(); }
+```
 
-import geo.circle;
-import geo.rect;
+```c
+/* app.c6：import 按 'geo/shape.c6' 的路径找到它 */
+import geo.shape;
 
 int describe(Shape s) { return s.area(); }   /* 结构体值 -> 接口值 */
 
@@ -1681,7 +1718,7 @@ int main(void)
     Circle c = {2};
     Rect r = {2, 3};
     return describe(c) == 12 && describe(r) == 6 &&
-           (&r)->twice() == 12 && geo.rect.area(&r) == 6 ? 0 : 1;
+           (&r)->twice() == 12 && geo.shape.total(c, r) == 18 ? 0 : 1;
 }
 ```
 
@@ -2163,7 +2200,7 @@ int main(void)
 
 | 语法 | 实现 | 位置 |
 |---|---|---|
-| `package` / `import` | `c6_package_parse` / `c6_import_parse` / `c6_pkg_name` / `c6_pkg_compose` / `c6_pkg_imported`，`unary()` 里的点号解析 | `tcc/tccgen.c` |
+| `module` / `import` | `c6_module_parse` / `c6_module_import` / `c6_pkg_name`（点号名拼成 `a__b`）/ `c6_module_open` + `c6_module_graded` + `c6_module_root`（按路径分级查找）/ `c6_mod_imported`，`unary()` 里的点号解析；`package` 只剩 `c6_package_parse` 的迁移提示 | `tcc/tccgen.c` |
 | `pkg.member` | `unary()` 的 `tok_identifier` 分支（逐段增长前缀 + `sym_find_raw`） | `tcc/tccgen.c` |
 | 结构体方法 | `c6_method_register`（在 `decl()` 里注册）/ `c6_method_symbol`（`<Tag>_<name>` 符号名）/ `c6_method_plain_decl` + `c6_method_alias`（源码名弱别名）/ `c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`，`unary()` 的 `->` 分支 | `tcc/tccgen.c` |
 | `interface` | `c6_interface_parse`、`c6_auto_impl_ensure` / `c6_check_method` / `c6_emit_auto_impls` / `c6_iface_convert` | `tcc/tccgen.c` |

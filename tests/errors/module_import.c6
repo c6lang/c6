@@ -1,0 +1,50 @@
+/* c6 编译期诊断：import / mod.member / 模块名即路径
+ *
+ * 每个片段单独用 -D<片段名> 编译（tests/run-errors.sh 驱动），
+ * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
+ * 不带任何 -D 时是本文件的“正常路径”，必须编译通过。
+ *
+ * 辅助模块在 tests/errors/tu/imp.c6（module tu.imp;）。
+ */
+// EXPECT test_package_removed: error: 'package' was removed
+// EXPECT test_not_imported: error: 'tu.imp' is neither an enum nor an imported module (use 'import tu.imp;')
+// EXPECT test_missing_module: error: cannot find module 'no.such': expected a file at 'no/such.c6'
+// EXPECT test_unknown_member: error: 'tu.imp.nope' undeclared
+// EXPECT test_unknown_member_call: warning: implicit declaration of function 'tu.imp.nope'
+// EXPECT test_unknown_member_call: error: unresolved reference to 'tu__imp__nope'
+// EXPECT-C99 test_unknown_member_call: warning: implicit declaration of function 'tu.imp.nope'
+// EXPECT-C99 test_unknown_member_call: tu__imp__nope
+// EXPECT test_missing_member_name: error: identifier expected after '.'
+// EXPECT test_arrow_is_not_module_access: error: 'tu' is neither an enum nor an imported module (use 'import tu;')
+// EXPECT test_import_after_use: error: 'tu.imp' is neither an enum nor an imported module (use 'import tu.imp;')
+
+#if defined test_package_removed
+package math {
+    int add(int a, int b) { return a + b; }
+}
+int main(void) { return 0; }
+#elif defined test_not_imported
+int main(void) { return tu.imp.add(1, 2); }
+#elif defined test_missing_module
+import no.such;
+int main(void) { return 0; }
+#elif defined test_unknown_member
+import tu.imp;
+int main(void) { return tu.imp.nope; }
+#elif defined test_unknown_member_call
+import tu.imp;
+int main(void) { return tu.imp.nope(1, 2); }
+#elif defined test_missing_member_name
+import tu.imp;
+int main(void) { return tu.imp.; }
+#elif defined test_arrow_is_not_module_access
+import tu.imp;
+int main(void) { return tu.imp->add(1, 2); }
+#elif defined test_import_after_use
+int main(void) { return tu.imp.add(1, 2); }
+import tu.imp;
+#else
+/* 正常路径只编译本单元：诊断驱动用 -run 跑单个翻译单元，模块的实现
+   由 tests/module.c6 那条用例覆盖（那里 import 得到完整的两单元构建） */
+int main(void) { return 0; }
+#endif

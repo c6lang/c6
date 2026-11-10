@@ -963,8 +963,8 @@ struct TCCState {
     /* methods whose plain source name needs a weak alias in C99 output */
     struct C6MethodAlias **c6_method_aliases;
     int c6_nb_method_aliases;
-    /* 'package NAME { ... }' support */
-    char *c6_package;      /* current package, NULL at top level */
+    /* 'module NAME;' is the only namespace: one per file, and the file
+       lives at the path NAME spells (see c6_module_open) */
     char **c6_imports;     /* 'import NAME;' names */
     int c6_nb_imports;
     /* 'interface' / 'impl' declarations */
