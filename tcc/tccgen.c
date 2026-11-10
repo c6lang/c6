@@ -2303,6 +2303,12 @@ ST_FUNC int tccgen_compile(TCCState *s1)
 #endif
     tcc_debug_end(s1);
     tcc_tcov_end(s1);
+#ifdef C6_EXT
+    /* free the per-unit state here, where its token strings are still
+       alive: the next unit reuses the preprocessor's token arena, so a
+       'c6_tu_reset()' at the start of it would free dangling pointers */
+    c6_tu_reset();
+#endif
     return 0;
 }
 
