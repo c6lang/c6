@@ -61,12 +61,9 @@ struct Depth { int d; };
 int depth(struct Depth *p);
 int depth(struct Vec *v) { return v->x - v->y; }
 
-/* 包里定义的方法用裸名字照样找得到 */
-package shape {
-    int scaled(struct Vec *v, int k) { return vec_sum(v) * k; }
-    int vec_area(struct Vec *v) { return v->x * v->y; }
-}
-import shape;
+/* 方法不进命名空间：符号按接收者取名，不同类型同名互不干扰 */
+int scaled(struct Vec *v, int k) { return vec_sum(v) * k; }
+int vec_area(struct Vec *v) { return v->x * v->y; }
 
 /* 'T!error' 方法同样可以走接收者语法 */
 int!error vec_checked(struct Vec *v)
@@ -190,8 +187,8 @@ test "包里定义的方法按裸名字查找" {
         err(1, "包方法 p->scaled 不对");
     if (p->vec_area() != 12)
         err(2, "包方法 p->vec_area 不对");
-    if (shape.vec_area(p) != 12)
-        err(3, "限定调用 shape.vec_area 不对");
+    if (vec_area(p) != 12)
+        err(3, "限定调用 vec_area 不对");
 }
 
 test "impl 现在是普通标识符" {

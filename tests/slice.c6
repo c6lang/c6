@@ -31,10 +31,7 @@ int holder_sum(struct Holder *h)
     return sum(h->s);
 }
 
-package view {
-    int first(int[:] s) { return s.len > 0 ? s[0] : -1; }
-}
-import view;
+int first(int[:] s) { return s.len > 0 ? s[0] : -1; }
 
 /* ---- 跨翻译单元（tests/tu/slice.c6）---- */
 int tu_sum(int[:] s);
@@ -104,7 +101,7 @@ test "切片作为结构体成员" {
     struct Holder h = { s[2:4] };
     if (holder_sum(&h) != 70)
         err(1, "结构体成员切片求和不对");
-    if (view.first(h.s) != 30)
+    if (first(h.s) != 30)
         err(2, "包函数读到的首元素不对");
 }
 

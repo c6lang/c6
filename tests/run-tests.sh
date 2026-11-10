@@ -276,6 +276,84 @@ if [ "$BACKEND" = native ] && is_wanted "c6ext/rule"; then
     fi
 fi
 
+# ---- 1e. 模块名就是它的路径：分级查找，扁平的 'a.b.c6' 不接受 ----
+if [ "$BACKEND" = native ] && is_wanted "c6ext/modpath"; then
+    ok=yes
+    detail=
+    mp="$TMP/mp"
+    rm -rf "$mp"; mkdir -p "$mp/a"
+
+    # 分级布局：module a.b; 放在 a/b.c6，import a.b; 按路径找到它
+    printf 'module a.b;\nint answer(void) { return 42; }\n' > "$mp/a/b.c6"
+    printf 'import a.b;\nint main(void) { return answer(); }\n' > "$mp/main.c6"
+    if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$mp/app" "$mp/main.c6" "$mp/a/b.c6" \
+            2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+分级布局编不过:$(cat "$TMP/err")"
+    else
+        "$mp/app"; got=$?
+        if [ "$got" != 42 ]; then
+            ok=no
+            detail="$detail
+分级布局运行退出码 $got，期望 42"
+        fi
+    fi
+
+    # 只有扁平的 'a.b.c6'：拒绝，并说出它该去哪儿
+    mv "$mp/a/b.c6" "$mp/a.b.c6"
+    if $TCC -B "$ROOT/tcc" $TCCFLAGS -c -o "$mp/x.o" "$mp/main.c6" 2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+扁平布局竟然编过了"
+    elif ! grep -qF "must live at 'a/b.c6'" "$TMP/err"; then
+        ok=no
+        detail="$detail
+扁平布局没有指出应有的路径:$(cat "$TMP/err")"
+    fi
+
+    # 两种布局并存：分级路径胜出，import 解析不报错
+    printf 'module a.b;\nint answer(void) { return 42; }\n' > "$mp/a/b.c6"
+    if ! $TCC -B "$ROOT/tcc" $TCCFLAGS -c -o "$mp/x.o" "$mp/main.c6" 2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+并存时分级路径没有胜出:$(cat "$TMP/err")"
+    fi
+    rm -f "$mp/a.b.c6"
+
+    # 名字和声明不一致：文件在 a/b.c6，却声明成 module a.zzz;
+    printf 'module a.zzz;\nint answer(void) { return 1; }\n' > "$mp/a/b.c6"
+    if $TCC -B "$ROOT/tcc" $TCCFLAGS -o "$mp/app3" "$mp/main.c6" "$mp/a/b.c6" \
+            2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+声明和路径不一致竟然编过了"
+    elif ! grep -qF "module file declares" "$TMP/err"; then
+        ok=no
+        detail="$detail
+不一致没有报 'module file declares':$(cat "$TMP/err")"
+    fi
+    printf 'module a.b;\nint answer(void) { return 42; }\n' > "$mp/a/b.c6"
+
+    # 找不到模块时，诊断要说出它期望的路径
+    printf 'import nope.missing;\nint main(void) { return 0; }\n' > "$mp/miss.c6"
+    if $TCC -B "$ROOT/tcc" $TCCFLAGS -run "$mp/miss.c6" 2>"$TMP/err"; then
+        ok=no
+        detail="$detail
+找不到模块竟然编过了"
+    elif ! grep -qF "expected a file at 'nope/missing.c6'" "$TMP/err"; then
+        ok=no
+        detail="$detail
+找不到模块没有说出期望路径:$(cat "$TMP/err")"
+    fi
+
+    if [ $ok = yes ]; then
+        note_pass "c6ext/modpath: 模块按路径分级、扁平文件被拒绝"
+    else
+        fail "c6ext/modpath" "$detail"
+    fi
+fi
+
 # ---- 2. 编译期诊断 ----
 for src in "$ROOT"/tests/errors/*.c6; do
     [ -e "$src" ] || continue

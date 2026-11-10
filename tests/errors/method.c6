@@ -9,7 +9,7 @@ struct Vec { int x, y; };
 int vec_sum(struct Vec *v) { return v->x + v->y; }
 
 // EXPECT test_method_without_call: error: method 'vec_sum' must be called
-// EXPECT test_duplicate_method: error: duplicate method 'area' for 'Vec'
+// EXPECT test_duplicate_method: error: redefinition of 'Vec_area'
 // EXPECT test_value_receiver_needs_arrow: error: field not found: vec_sum
 // EXPECT test_unknown_member: error: field not found: nope
 
@@ -21,8 +21,8 @@ int main(void)
     return p->vec_sum;
 }
 #elif defined test_duplicate_method
-package a { int area(struct Vec *v) { return v->x; } }
-package b { int area(struct Vec *v) { return v->y; } }
+int area(struct Vec *v) { return v->x; }
+int area(struct Vec *v) { return v->y; }
 int main(void) { return 0; }
 #elif defined test_field_takes_precedence
 struct Holder { int v; int vec_sum; };

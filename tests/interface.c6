@@ -24,20 +24,13 @@ typedef struct Circle Circle;
 typedef struct Rect Rect;
 
 /* 不同接收者可以有同名方法：包把它们分开 */
-package circle {
-    int area(Circle *self) { return 3 * self->r * self->r; }
-    const char *name(Circle *self) { return "circle"; }
-    void print(Circle *self) { printf("Circle(%d)", self->r); }
-}
+int area(Circle *self) { return 3 * self->r * self->r; }
+const char *name(Circle *self) { return "circle"; }
+void print(Circle *self) { printf("Circle(%d)", self->r); }
 
-package rect {
-    int area(Rect *self) { return self->w * self->h; }
-    const char *name(Rect *self) { return "rect"; }
-    void print(Rect *self) { printf("Rect(%dx%d)", self->w, self->h); }
-}
-
-import circle;
-import rect;
+int area(Rect *self) { return self->w * self->h; }
+const char *name(Rect *self) { return "rect"; }
+void print(Rect *self) { printf("Rect(%dx%d)", self->w, self->h); }
 
 /* 同名方法不需要包：符号分别是 Square_area / Tri_area，和包里的
    circle__area / rect__area 一起实现各自的接口 */
@@ -89,9 +82,7 @@ interface Size {
 
 struct Sq { int s; };
 
-package sq {
-    int area(struct Sq *self);      /* 定义在 tests/tu/interface.c6 */
-}
+int area(struct Sq *self);      /* 定义在 tests/tu/interface.c6 */
 
 int area_via_vt(struct Sq *c);
 

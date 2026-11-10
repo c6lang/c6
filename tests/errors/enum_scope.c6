@@ -9,7 +9,7 @@
 // EXPECT test_wrong_qualifier: error: enumerator qualifier 'Other' must be the enum's own tag 'Color'
 // EXPECT test_anonymous: error: the enumerator of an anonymous enum cannot be qualified
 // EXPECT test_no_member: error: 'Fruit' has no member 'APPLE'
-// EXPECT test_unknown_tag: error: 'Nope' is neither an enum nor an imported package (use 'import Nope;')
+// EXPECT test_unknown_tag: error: 'Nope' is neither an enum nor an imported module (use 'import Nope;')
 // EXPECT test_no_name: error: enumerator name expected after '.'
 // EXPECT test_legacy_duplicate: error: redeclaration of 'RED'
 // EXPECT test_qualifier_only: error: enumerator name expected after '.'

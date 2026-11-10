@@ -10,7 +10,7 @@ struct Circle { int r; };
 // EXPECT test_wrong_param_count: error: method 'area' of 'Shape' has the wrong number of parameters
 // EXPECT test_wrong_return_type: error: method 'area' of 'Shape' has an incompatible return type
 // EXPECT test_incompatible_param: error: method 'scale' of 'Shape' has an incompatible parameter
-// EXPECT test_duplicate_method: error: duplicate method 'area' for 'Circle'
+// EXPECT test_duplicate_method: error: redefinition of 'Circle_area'
 // EXPECT test_method_after_use: error: 'Circle' does not implement interface 'Shape': missing method 'area'
 // EXPECT test_proto_scope_tag: error: method 'put' of 'Shape' has an incompatible parameter: the interface's 'struct P' is a prototype-scope tag
 
@@ -35,8 +35,8 @@ int scale(struct Circle *self, char *n) { return self->r + (n != 0); }
 static int use(Shape s) { return s.scale(2); }
 int main(void) { struct Circle c = {1}; return use(c); }
 #elif defined test_duplicate_method
-package a { int area(struct Circle *self) { return self->r; } }
-package b { int area(struct Circle *self) { return self->r + 1; } }
+int area(struct Circle *self) { return self->r; }
+int area(struct Circle *self) { return self->r + 1; }
 int main(void) { return 0; }
 #elif defined test_method_after_use
 interface Shape { int area(); }

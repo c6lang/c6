@@ -1,0 +1,10 @@
+/* tests/errors/module_import.c6 的辅助模块：tu.imp
+ *
+ * 放在 tests/errors/tu/ 下，所以测试驱动（只扫 tests/errors/*.c6）不会把它
+ * 当成一个诊断片段文件；'import tu.imp;' 从 tests/errors/ 出发，按模块名
+ * 拼出的路径 'tu/imp.c6' 就找到它。
+ */
+module tu.imp;
+
+int counter = 0;
+int add(int a, int b) { return a + b; }
