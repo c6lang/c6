@@ -1,4 +1,4 @@
-/* c6 编译期诊断：变量定义必须初始化（VLA 除外）
+/* c6 编译期诊断：变量定义必须初始化（VLA 与 static 变量除外）
  *
  * 每个片段单独用 -D<片段名> 编译（tests/run-errors.sh 驱动），
  * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
@@ -12,8 +12,6 @@ struct S { int a; };
 // EXPECT test_local_struct: error: variable 's' must be initialized
 // EXPECT test_local_pointer: error: variable 'p' must be initialized
 // EXPECT test_global_int: error: variable 'g' must be initialized
-// EXPECT test_static_global: error: variable 'sg' must be initialized
-// EXPECT test_static_local: error: variable 'sl' must be initialized
 // EXPECT test_for_init: error: variable 'k' must be initialized
 
 #if defined test_local_int
@@ -34,12 +32,6 @@ int main(void) { return f(); }
 #elif defined test_global_int
 int g;
 int main(void) { return g; }
-#elif defined test_static_global
-static int sg;
-int main(void) { return sg; }
-#elif defined test_static_local
-static int f(void) { static int sl; return sl; }
-int main(void) { return f(); }
 #elif defined test_for_init
 static int f(void) { int n = 0; for (int k; k < 1; k++) n++; return n; }
 int main(void) { return f(); }
@@ -76,5 +68,17 @@ int main(void)
     return a[0] + n - 4;
 }
 #else
-int main(void) { return 0; }
+/* 正常路径：static 变量不需要初始化器（C 保证静态存储期对象清零），
+   文件作用域和块作用域都必须编译通过，而且拿到的确实是 0。 */
+static int sg;
+static int sl_fn(void) { static int sl; return ++sl; }
+int main(void)
+{
+    sg += 2;
+    if (sg != 2)
+        return 1;
+    if (sl_fn() != 1 || sl_fn() != 2)   /* static 局部记得上一次的值 */
+        return 1;
+    return 0;
+}
 #endif

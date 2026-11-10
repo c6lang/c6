@@ -21,7 +21,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
 | 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；体里只看得见参数和文件作用域。捕获式闭包（`closure RET (P…)`，V2）已有完整设计，尚未实现，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
-| 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
+| 变量初始化检查 | 每个变量定义都必须带初始化器（`static` 变量与 VLA 除外） |
 | 泛型（阶段 1 已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。见 [docs/generics-design.md](docs/generics-design.md) |
 
 扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
@@ -463,11 +463,11 @@ int main(void)
 ### 变量必须初始化
 
 扩展模式下，**每个变量定义都必须带初始化器**，否则编译报错
-（`variable 'x' must be initialized`）：
+（`variable 'x' must be initialized`）。两处例外：`static` 变量和 VLA。
 
 ```c
 int counter = 0;                  /* 文件作用域的定义也要写 */
-static int instances = 0;
+static int instances;             /* static 变量豁免：C 保证它清零 */
 
 int main(void)
 {
@@ -486,10 +486,11 @@ int main(void)
 | 写法 | 行为 |
 |---|---|
 | `int x = 0;` / `int a[3] = {0};` / `struct S s = {0};` | 合法 |
-| `int x;`（自动变量、全局、`static` 局部/全局、`for` 声明） | 报错 |
+| `int x;`（自动变量、全局、`for` 声明） | 报错 |
+| `static int x;`（文件作用域或块作用域） | 合法：静态存储期由 C 清零，`= 0` 只是噪声 |
 | `extern int x;` | 合法（声明，不是定义） |
 | 函数形参、结构体/联合体成员、`typedef` | 合法（不受此规则约束） |
-| `int a[n];`（VLA） | 合法：标准 C 不允许 VLA 带初始化器，故唯一豁免 |
+| `int a[n];`（VLA） | 合法：标准 C 不允许 VLA 带初始化器 |
 
 规则是**定义点检查**，不做数据流分析：`int x; x = 1;` 一样报错。
 诊断使用源码里书写的标识符，`package` 内的变量也报原名而不是 `pkg__x`。
@@ -512,6 +513,7 @@ struct S s;               ->  struct S s = {0};
 int *p;                   ->  int *p = 0;
 int g;                    ->  int g = 0;      /* 全局定义同样要写 */
 for (int k; ...)          ->  for (int k = 0; ...)
+static int n;             ->  不用改（static 豁免）
 int a[n];                 ->  不用改（VLA 豁免）
 ```
 
@@ -520,8 +522,9 @@ int a[n];                 ->  不用改（VLA 豁免）
 - 局部的大数组/大结构体加 `= {0}` 会真的清零（编译成一次 `memset`）；
   如果原来就靠后续 `read`/`memset` 填满，这次清零是新增开销；
 - 在 TCC 里，**显式**写 `= {0}` 的全局/`static` 对象会落到 `.data`
-  （文件里真的存一份零），而不带初始化器的全局对象在 `.bss`。所以给
-  大缓冲区补初始化器会让可执行文件变大；迁移大型静态表时要留意这一点。
+  （文件里真的存一份零），而不带初始化器的对象在 `.bss`，不占文件空间。
+  这也是 `static` 豁免的实际好处：常驻状态照原样写 `static int n;`，
+  不必为了过检查把大缓冲区搬进 `.data`。
 
 TCC 自己的源码也遵守这条规则（`make c6selfcheck` 会检查），因此拿
 `-std=c6` 编 tcc 自己不会撞上这条诊断；带 `-DC6_EXT` 也一样，`#ifdef
@@ -533,8 +536,10 @@ C6_EXT` 里的扩展实现同样补了初始化器：
 ```
 
 为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type`……）改成了
-"头文件里 `extern` 声明 + 各自 `.c` 文件里带初始化器定义一次"，全局量
-不再依赖"暂定定义"这种不带初始化器的写法。
+"头文件里 `extern` 声明 + 各自 `.c` 文件里带初始化器定义一次"：它们没有
+`static`，不能走豁免，只能不依赖"暂定定义"这种不带初始化器的写法。带
+`static` 的编译器内部状态（模板粘性表、各类缓存）则直接写成
+`static T *head;`。
 
 ### interface
 
@@ -1647,8 +1652,8 @@ make c99selfhost   # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2
   再按包名 mangle。因为 `Color` 同时也是类型名，`decl()` 在条件位置向前看一个
   记号：`Tag.` 一定不是声明，整条交给表达式解析（否则 `if (Color.RED)` 会被
   当成声明）。
-- 变量初始化检查在**定义点**做，不做数据流分析；VLA 是唯一豁免
-  （标准 C 禁止给变长数组写初始化器）。
+- 变量初始化检查在**定义点**做，不做数据流分析；`static` 变量与 VLA
+  豁免（前者由 C 保证清零，后者标准 C 禁止写初始化器）。
 - 元组复用 `VT_STRUCT` 和内部 tag `__c6_tuple_N`，布局在构造类型时按自然对齐
   算好（不读 `pack_stack_ptr`），因此 `#pragma pack`、成员顺序、对齐都不会改变
   它的 ABI；元素名 `__c6_t0`…只为实现细节，对外只有 `t[i]`。
