@@ -93,6 +93,14 @@ struct VecBox@T {
 
 /* 体内方法的符号名和 '|T|' 方法一致：'<实例标签>_<方法名>'。实例先把
    别名造出来，下面就能按拼出来的名字声明同一个函数 */
+/* 体内方法的形参表：'(void)'、'()' 只剩接收者，'void *p' 要留住那个 void */
+struct Sig@T {
+    T v;
+    int none(void) { return v; }
+    int noargs() { return v + 1; }
+    int raw(void *p) { return p != 0; }
+    int two(const int a, const int b) { return a + b; }
+};
 /* 托管引用 + 体内方法：接收者是 '@Holder@int'，方法把托管字段当普通字段用 */
 struct Ref { int v; };
 struct Keeper@T {
@@ -359,6 +367,19 @@ test "体内方法的符号和 '|T|' 方法一样" {
         err(2, "直接调用体内方法不对");
     if ((&s)->cap() != 4)
         err(3, "两种调用写法结果应当一样");
+}
+test "体内方法的形参表：void、空表、const" {
+    Sig@int s = {7};
+    int k = 0;
+
+    if ((&s)->none() != 7)
+        err(1, "'(void)' 只剩接收者");
+    if ((&s)->noargs() != 8)
+        err(2, "'()' 只剩接收者");
+    if ((&s)->raw(&k) != 1 || (&s)->raw(0) != 0)
+        err(3, "'void *p' 的 void 被吃掉了");
+    if ((&s)->two(2, 3) != 5)
+        err(4, "'const int' 形参不对");
 }
 test "托管实例上的方法不碰引用计数" {
     /* 接收者只是被拷进一个临时槽里，那份拷贝是借用：不该加计数，
