@@ -1,0 +1,79 @@
+/* c6 元组 '(T1, T2, ...)' 示例
+ *
+ *   ./tcc/tcc -B tcc -run examples/tuple_demo.c6
+ *
+ * 元组是一个值类型：它按值传递、按值返回，布局和等价的 struct 一样，
+ * 元素用常量下标访问。它的用处是让函数自然地返回多个值，不用再发明
+ * out 参数、全局变量或者一堆小 struct。
+ */
+#include <stdio.h>
+
+/* ---- 1. 返回多个值 ---- */
+(int, int) divmod(int a, int b)
+{
+    return {a / b, a % b};          /* 商和余数 */
+}
+
+(int, double) average(int a, int b)
+{
+    return {(a + b) / 2, (a + b) / 2.0};
+}
+
+/* ---- 2. 元组作参数 ---- */
+int sum((int, int) t)
+{
+    return t[0] + t[1];
+}
+
+/* ---- 3. '!error' 也可以返回元组：失败走错误槽，不走返回值 ---- */
+(int, int)!error parse_pair(const char *s)
+{
+    if (!s || !s[0] || !s[1])
+        err(1, "need two characters");
+    return {s[0], s[1]};
+}
+
+static void show_pair(const char *s)
+{
+    int a = 0, b = 0;
+
+    (a, b) = parse_pair(s) catch e {
+        printf("parse_pair(\"%s\") 失败: %s\n", s ? s : "NULL", e.msg);
+        return;
+    };
+    printf("parse_pair(\"%s\") = (%c, %c)\n", s, a, b);
+}
+
+int main(void)
+{
+    (int q, int r) = divmod(17, 5);
+    (int mid, double exact) = average(3, 4);
+    (int, int) t = {4, 5};
+
+    /* 解构声明：一次拿到所有返回值 */
+    printf("divmod(17, 5) = (%d, %d)\n", q, r);
+
+    /* 元素类型可以不同 */
+    printf("average(3, 4) = (%d, %.2f)\n", mid, exact);
+
+    /* 解构赋值：目标可以是任意左值 */
+    (q, r) = divmod(100, 7);
+    printf("divmod(100, 7) = (%d, %d)\n", q, r);
+
+    /* '_' 只取想要的元素 */
+    (int high, _) = divmod(100, 7);         /* 这里 high 是商 */
+    printf("只要商: %d\n", high);
+
+    /* 元组可以按值传递、可以当数组元素、可以存进 struct */
+    printf("sum({4, 5}) = %d\n", sum(t));
+    printf("sizeof((int, int)) = %d\n", (int)sizeof((int, int)));
+
+    /* 复合字面量造一个临时元组 */
+    printf("临时元组: %d\n", ((int, int){7, 8})[1]);
+
+    /* 失败路径 */
+    show_pair("AB");
+    show_pair("A");
+    show_pair(0);
+    return 0;
+}

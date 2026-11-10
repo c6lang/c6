@@ -10,7 +10,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `err(code, "msg")` | 设置错误槽、就地展开清理并直接返回 |
 | `func() T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 |
 | `async` / `await` / `co` / `task` | 无栈协程：`co f();` 顶层跑、`task t = f();` 拿句柄 |
-| `go f(...)` | OS 线程（`pthread_create`），语句立刻返回、真并发 |
+| `spawn f(...)` | OS 线程（`pthread_create`），语句立刻返回、真并发 |
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
 | `package` / `import` | 包与名字修饰（`pkg__sym`），`pkg.member` 访问导出符号，支持多级包名 |
 | 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用（符号是 `T_f`，不同类型可同名，`f(p)` 仍可用） |
@@ -21,14 +21,15 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
 | 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；捕获式闭包 `closure RET (P…)` 把外层块作用域名字按值捕获进隐藏的 env，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
-| 源文件后缀 `.c6` | `.c6` 文件自动开启扩展（等价于 `-std=c6`），`.c` 文件仍按命令行开关走；`import` 优先找 `NAME.c6`，再回退 `NAME.c` |
+| 源文件后缀 `.c6` | **后缀是唯一的开关**：`.c6` 文件开启扩展（并定义 `__C6__`），`.c` 文件永远是普通 C；没有 `-std=c6` 这个选项。`import` 优先找 `NAME.c6`，再回退 `NAME.c` |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（`static` 变量与 VLA 除外） |
-| 泛型（已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。见 [docs/generics-design.md](docs/generics-design.md) |
+| 泛型（已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c6`）。见 [docs/generics-design.md](docs/generics-design.md) |
 
 扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
-源文件后缀 `.c6` 是一个例外：它对该翻译单元等价于 `-std=c6`（每个文件独立判断，
+开启扩展的唯一开关是**源文件后缀 `.c6`**：它只对这一个翻译单元生效（每个文件独立判断，
 `.c` 文件不会因为同一次编译里出现 `.c6` 而被连带开启），所以 `tcc -run hello.c6`
-不需要再写开关；`import NAME;` 也优先查找 `NAME.c6`，找不到才回退到 `NAME.c`。
+不需要任何命令行开关，而 `-std=c6` 已经取消（传了会直接报错）。`import NAME;`
+优先查找 `NAME.c6`，找不到才回退到 `NAME.c`。
 
 ## 目录结构
 
@@ -37,8 +38,8 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 ├── docs/plan.md      设计与实施方案（含实现状态）
 ├── docs/grammar.md   扩展语法的 BNF/EBNF 规范
 ├── scripts/          bootstrap.sh：首次构建前跑 ./configure
-├── tests/            c6 全部自测：*.c 是 test 块，c6ext/*.c6 验证后缀，errors/ 是编译期诊断
-├── examples/         可运行示例（每个特性一个 *_demo.c）
+├── tests/            c6 全部自测：*.c6 是 test 块，c6ext/*.c6 验证后缀，errors/ 是编译期诊断
+├── examples/         可运行示例（每个特性一个 *_demo.c6）
 ├── Makefile          便捷入口（bootstrap / build / selftest / test / clean）
 └── tcc/              TCC 源码树：上游基线 + 一个 c6 补丁一个提交
 ```
@@ -55,8 +56,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 
 # 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
-./tcc/tcc -B tcc -std=c6 -run hello.c
-./tcc/tcc -B tcc -run hello.c6       # .c6 后缀自动开启扩展，不需要 -std=c6
+./tcc/tcc -B tcc -run hello.c6      # c6 代码放在 .c6 文件里，后缀就是开关
 ```
 
 `make build` / `make selftest` / `make test-all` 都会先跑 `bootstrap`：`tcc/`
@@ -69,8 +69,9 @@ make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 
 ## 使用
 
-扩展需要**编译器打开 `C6_EXT`** 并且**每个翻译单元加 `-std=c6`**（该开关同时定义
-`__C6__`，方便写条件编译）。
+扩展需要**编译器打开 `C6_EXT`** 并且**源文件用 `.c6` 后缀**（同时定义
+`__C6__`，方便写条件编译）。`.c` 文件永远是普通 C：c6 代码只能写在 `.c6` 里，
+命令行没有 `-std=c6` 这个开关（传了会报错，提示你改后缀）。
 
 ### defer / errdefer / err
 
@@ -107,10 +108,10 @@ int main(void)
 }
 ```
 
-完整可运行示例见 [examples/err_demo.c](examples/err_demo.c)：
+完整可运行示例见 [examples/err_demo.c6](examples/err_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/err_demo.c
+./tcc/tcc -B tcc -run examples/err_demo.c6
 ```
 
 `err` 速查：
@@ -152,7 +153,7 @@ int main(void)
 
 于是：
 
-- **不需要任何线程级 / TLS 状态**：ISR 里、`go` 起来的线程里、协程
+- **不需要任何线程级 / TLS 状态**：ISR 里、`spawn` 起来的线程里、协程
   （`async`）里、递归的每一帧都按同一套规则跑，互不干扰；
 - 递归深度没有上限（旧实现的每线程记录栈上限 8192 条，超过就悄悄丢）；
 - 同一个作用域实例里同一个清理点**最多跑一次**（位是幂等的），所以
@@ -164,7 +165,7 @@ int main(void)
   就是那个标签的作用域深度；向前跳转的 `goto` 落在标签处派发，不多花代码；
 - 编译期上限：一个函数最多 **128 个清理点**（第 129 个报错，叫你把函数拆
   小），清理体最多嵌套 **8 层**（第 9 层报错）。
-- 帧开销：`-std=c6` 下每个函数帧固定多 4 × `int` 位图 + 1 × `int` 已注册计数
+- 帧开销：c6 的翻译单元（`.c6`）里每个函数帧固定多 4 × `int` 位图 + 1 × `int` 已注册计数
   （序言里清零——单趟编译器没法在序言处知道后面会不会出现清理点）；有清理点
   的函数再加 2 × `int` 的派发状态，清理体每嵌套一层再加 2 × `int`。派发器
   本身也只在有清理点时才生成。旧实现在每个函数开头调一次
@@ -240,10 +241,10 @@ int handle(const char *s)
 - `float` / `double` / `long double` 不能作 `!error` 的返回类型（没有可用的
   哨兵，也不属于聚合类型）。
 
-完整可运行示例见 [examples/try_demo.c](examples/try_demo.c)：
+完整可运行示例见 [examples/try_demo.c6](examples/try_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/try_demo.c
+./tcc/tcc -B tcc -run examples/try_demo.c6
 ```
 
 语法规范（EBNF）见 [docs/grammar.md](docs/grammar.md)。
@@ -258,8 +259,8 @@ test "add works" {
 ```
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -test tests.c               # 运行全部 test 块
-./tcc/tcc -B tcc -std=c6 -test -test-filter=add tests.c
+./tcc/tcc -B tcc -test tests/slice.c6               # 运行全部 test 块
+./tcc/tcc -B tcc -test -test-filter=切片 tests/slice.c6
 ```
 
 运行器输出 `PASS:` / `FAIL:` 行与 `N test(s), M failure(s)`，全部通过时退出码为 0。
@@ -316,7 +317,7 @@ typedef struct Point Point;
 int add(int a, int b) { return a + b; }
 int area(Point *p) { return p->x * p->y; }
 
-/* main.c */
+/* main.c6 */
 import math;
 
 int main(void)
@@ -336,17 +337,18 @@ int main(void)
   同理；package 里的 tag 不加前缀，所以 package 限定类型要写 typedef）；
   只有当前 module/package 或 `import` 过的名字可以这样写；
 - 模块里不能定义 `main`；
-- `import NAME;` 先登记名字，再按「当前文件目录 → `-I` 路径 → 当前目录」查找
-  `NAME.c`（点号形式 `a/b.c`），找到就把声明读进来：函数只取原型、跳过函数体，
+- `import NAME;` 先登记名字，再按「当前文件目录 → `-I` 路径 → 当前目录」依次查找
+  `NAME.c6`、`NAME.c`（点号形式 `a/b.c6`、`a/b.c`，两个文件并存时 `.c6` 优先），
+  找到就把声明读进来：函数只取原型、跳过函数体，
   全局变量只取 `extern`、跳过初始化器；找不到文件时只登记名字（旧行为）；
   循环 import 报 `circular import of module 'x'`；
 - 导入只带**声明**，代码仍在模块自己的目标文件里：链接时把 `math.o`（或库）放上
   命令行；
-- `-emit-header FILE`（配合 `-c -std=c6`）可把模块导出写成普通 C 头文件：
-  `tcc -B tcc -std=c6 -c -emit-header math.h math.c`。头文件里是
+- `-emit-header FILE`（配合 `-c`，模块是 `.c6` 文件）可把模块导出写成普通 C 头文件：
+  `tcc -B tcc -c -emit-header math.h math.c6`。头文件里是
   `struct math__Point`、`math__add`、`math__Point_area` 这些真正的 C 名；
   切片和元组会生成 `math__slice_N` / `math__tuple_N` typedef。纯 C 一侧
-  `#include "math.h"` 就能调用，不需要 `-std=c6`，也不需要知道模块的存在。
+  `#include "math.h"` 就能调用，纯 C（`.c`）侧不需要任何 c6 机制，也不需要知道模块的存在。
 
 ### 结构体方法
 
@@ -424,7 +426,7 @@ int main(void)
 - 语句开头的 `TAG:` 仍是标签；`TAG` 只是 tag 时 `TAG(...)` 按声明解析（与 C 里 typedef 名
   的规则一致），被函数遮蔽时按调用解析。同一条规则也意味着 K&R 定义里「形参名恰好与
   文件作用域 tag 同名」会按原型解析（`int f(S) int *S; {…}`），写 `struct S` 即可；
-- 只在 `-std=c6` 的翻译单元里生效，`struct Vec v;` 永远可用。
+- 只在 c6 的翻译单元（`.c6` 文件）里生效，`struct Vec v;` 永远可用。
 
 #### 枚举成员写成 `Color.RED`
 
@@ -457,12 +459,12 @@ int main(void)
   枚举里没有这个名字时报 C120。
 
 细节见 [docs/grammar.md](docs/grammar.md) §3.8，用例见
-[tests/enum_scope.c](tests/enum_scope.c) 与 [tests/errors/enum_scope.c](tests/errors/enum_scope.c)。
+[tests/enum_scope.c6](tests/enum_scope.c6) 与 [tests/errors/enum_scope.c6](tests/errors/enum_scope.c6)。
 
-完整可运行示例见 [examples/typename_demo.c](examples/typename_demo.c)：
+完整可运行示例见 [examples/typename_demo.c6](examples/typename_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/typename_demo.c
+./tcc/tcc -B tcc -run examples/typename_demo.c6
 ```
 
 ### 变量必须初始化
@@ -502,9 +504,9 @@ int main(void)
 
 旧代码怎么处理：
 
-- **不开启扩展就完全不变**：不带 `-std=c6` 编译的翻译单元与上游 TCC
+- **不开启扩展就完全不变**：`.c` 文件编译出来的翻译单元与上游 TCC
   逐字节一致，老项目（包括 TCC 自己的源码）不需要改任何一行；
-- 扩展是**按翻译单元**开启的：一旦给某个 `.c` 加了 `-std=c6`，这个 TU
+- 扩展是**按翻译单元**开启的：一旦把文件命名成 `.c6`，这个 TU
   里出现的所有定义都要满足规则（包括它包含的头文件里的函数体）；
   系统头文件实测可以正常通过（`stdio.h` / `stdlib.h` / `pthread.h` 等）；
 - K&R 老式定义：**形参声明表不受影响**（它们是形参），函数体里的局部变量
@@ -531,13 +533,14 @@ int a[n];                 ->  不用改（VLA 豁免）
   这也是 `static` 豁免的实际好处：常驻状态照原样写 `static int n;`，
   不必为了过检查把大缓冲区搬进 `.data`。
 
-TCC 自己的源码也遵守这条规则（`make c6selfcheck` 会检查），因此拿
-`-std=c6` 编 tcc 自己不会撞上这条诊断；带 `-DC6_EXT` 也一样，`#ifdef
-C6_EXT` 里的扩展实现同样补了初始化器：
+TCC 自己的源码也遵守这条规则（`make c6selfcheck` 把 `tcc.c` 拷成 `.c6` 后再
+按 c6 规则编译一遍来检查），因此 c6 规则编 tcc 自己不会撞上这条诊断；带
+`-DC6_EXT` 也一样，`#ifdef C6_EXT` 里的扩展实现同样补了初始化器：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -DC6_EXT -c tcc/tcc.c -o tcc.o   # 原生目标文件
-./tcc/tcc -B tcc -std=c6 -DC6_EXT -o tcc.c.c tcc/tcc.c    # C99 后端的输出
+cp tcc/tcc.c build/tcc-c6.c6 && \
+    ./tcc/tcc -B tcc -I tcc -DC6_EXT -c build/tcc-c6.c6 -o tcc.o  # 原生目标文件
+./tcc/tcc -B tcc -I tcc -DC6_EXT -o tcc.c.c build/tcc-c6.c6       # C99 后端的输出
 ```
 
 为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type`……）改成了
@@ -626,10 +629,10 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 - 只是普通 C 语义的补充：`int a[3]`、`int a[] = {…}`、`void f(int[])`、
   `typedef int T[]` 全部保持原样，`int[]` 并**不**是切片写法。
 
-完整可运行示例见 [examples/slice_demo.c](examples/slice_demo.c)：
+完整可运行示例见 [examples/slice_demo.c6](examples/slice_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/slice_demo.c
+./tcc/tcc -B tcc -run examples/slice_demo.c6
 ```
 
 跨 TU 时两边各自写 `T[:]` 即可（布局固定），不需要额外声明。
@@ -699,12 +702,12 @@ foreach |v| it { ... }          /* 迭代器：it 的类型提供 has(T *)/next(
   里含 `@T`/`weak @T`/`own @T` 字段时仍不能按值绑定（沿用 GC 的
   “用 `new` 分配、用 `@T` 持有”的限制）。
 
-完整可运行示例见 [examples/foreach_demo.c](examples/foreach_demo.c) 与
-[examples/foreach_iter_demo.c](examples/foreach_iter_demo.c)：
+完整可运行示例见 [examples/foreach_demo.c6](examples/foreach_demo.c6) 与
+[examples/foreach_iter_demo.c6](examples/foreach_iter_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/foreach_demo.c
-./tcc/tcc -B tcc -std=c6 -run examples/foreach_iter_demo.c
+./tcc/tcc -B tcc -run examples/foreach_demo.c6
+./tcc/tcc -B tcc -run examples/foreach_iter_demo.c6
 ```
 
 ### 元组 `(T1, T2, ...)`
@@ -735,7 +738,7 @@ printf("%d\n", t[1]);
 | `(int q, _)` / `(_, int r)` / `(q, _)` / `(_, r)` | `_` 丢弃对应元素（不取名、不生成加载） |
 | `(int, int)!error parse(...)` | 元组也可以作 `!error` 的返回类型 |
 | `async (int, int) f(...)` + `(int a, int b) = await f(...);` | `await` 的结果可以直接解构 |
-| `go g((int, int) t)` | 元组按值穿过线程边界（同 struct） |
+| `spawn g((int, int) t)` | 元组按值穿过线程边界（同 struct） |
 
 规则：
 
@@ -763,27 +766,27 @@ printf("%d\n", t[1]);
 struct 传递路径，所以和等价的 struct 可以互操作：
 
 ```c
-/* a.c （-std=c6） */     (int, int) f(int a, int b) { return {a / b, a % b}; }
-/* b.c （普通 C）   */     struct pair { int q, r; };
+/* a.c6 （c6）       */     (int, int) f(int a, int b) { return {a / b, a % b}; }
+/* b.c  （普通 C）   */     struct pair { int q, r; };
                            struct pair f(int a, int b);
 ```
 
-`tests/abi/tuple.c` + `tests/abi/tuple_plain.c` 就是这么验证的：两个 TU 分别
+`tests/abi/tuple.c6` + `tests/abi/tuple_plain.c` 就是这么验证的：两个 TU 分别
 用元组和 struct 编译，链接后互相调用。
 
 已知的边角（都不影响上面的用法）：
 
-- 接口的方法签名支持 struct / 元组作参数和返回值（`tests/iface_agg.c`），
+- 接口的方法签名支持 struct / 元组作参数和返回值（`tests/iface_agg.c6`），
   只要类型在 `interface` 声明之前已经可见：`struct P;` 要写在 interface
   前面，否则那个 tag 只是原型作用域里的另一个类型（诊断会提示
   prototype-scope tag）；
 - 复合字面量外面再套一层括号时，下标要写在括号**外**：
   `((int, int){1, 2})[0]` 可以，`((int, int){1, 2}[0])` 会报 `')' expected`。
 
-完整可运行示例见 [examples/tuple_demo.c](examples/tuple_demo.c)：
+完整可运行示例见 [examples/tuple_demo.c6](examples/tuple_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/tuple_demo.c
+./tcc/tcc -B tcc -run examples/tuple_demo.c6
 ```
 
 ### 函数字面量 `void(int x) { ... }`
@@ -821,7 +824,7 @@ qsort(v, n, sizeof v[0], int(const void *a, const void *b) {   /* 交给 C */
 
 - **值就是函数指针**：不分配对象、不做引用计数、运行期不携带任何额外信息。
   所以它能存进任何同型函数指针、进函数指针表、当实参、当返回值、交给纯 C
-  保存和回调——C ABI 一点没变（`tests/abi/fn_lit.c`）。每个字面量各是一个
+  保存和回调——C ABI 一点没变（`tests/abi/fn_lit.c6`）。每个字面量各是一个
   函数：`a == b` 为假；
 - **体里只看得见它自己的参数和文件作用域**。字面量的体是稍后编译的（和
   `static inline` 一样在翻译单元末尾发射），写在外层的局部变量、形参、块
@@ -842,10 +845,10 @@ qsort(v, n, sizeof v[0], int(const void *a, const void *b) {   /* 交给 C */
 - 和 c6 的其它特性是正交的：体里可以 `defer` / `err` / `new` / 再写字面量，
   `static inline` 函数体和异步函数体里也能写字面量。
 
-V1 的完整可运行示例见 [examples/fn_lit_demo.c](examples/fn_lit_demo.c)：
+V1 的完整可运行示例见 [examples/fn_lit_demo.c6](examples/fn_lit_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/fn_lit_demo.c
+./tcc/tcc -B tcc -run examples/fn_lit_demo.c6
 ```
 
 #### 捕获式闭包 `closure`（V2）
@@ -942,9 +945,12 @@ arm、arm64、riscv64 与 C99 输出后端——都走"帧住在任务里"。）
   点才把控制权交回来。`await c6_io` 总要停一轮（即使 fd 已经就绪，唤醒是
   下一轮 `select()` 的事）；`await` 子任务不算等待，所以不碰 fd 的
   `co f();` 会在 `co` 语句里跑完并当场回收槽位；
-- `co`、`go`、`task` 是**软关键字**：只有在语句开头、后面紧跟一个标识符
-  时才是关键字。`int go = 1;`、`go = 2;`、`x = go;`、`go(x);`、
-  `typedef int co; co v;`、`task` 做变量名和 `go:` 标签都照常工作；
+- `co`、`spawn`、`task` 是**软关键字**：只有在语句开头、后面紧跟一个标识符
+  时才是关键字。`int spawn = 1;`、`spawn = 2;`、`x = spawn;`、`spawn(x);`、
+  `typedef int co; co v;`、`task` 做变量名和 `spawn:` 标签都照常工作；
+  起线程的关键字以前写作 `go`（和 Go 的 goroutine 同名，容易误解），
+  现在 `go` 退回普通标识符，旧写法 `go f(a);` 报
+  `'go' was renamed to 'spawn'`；
 - `c6_io` 只有 `await c6_io(fd, ev)` 一种写法；`ev` 是
   `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
 - `c6_io` 的 `fd` 必须在 `[0, 1024)` 内；越界的任务按失败回收，
@@ -954,17 +960,21 @@ arm、arm64、riscv64 与 C99 输出后端——都走"帧住在任务里"。）
   直接指向这块内存，所以挂起**不拷贝**任何东西，`&local` 跨过 `await` 仍然
   有效；`weak` 局部/形参/返回值因此在 `async` 里也合法。`__c6_co_wait` 和
   `__c6_co_run` 都用 `select()` 等 fd，`__c6_co_run` 对顶层任务做轮转。
-  协程本身是协作式、单线程的；要真并发用 `go`。`-b`（边界检查）不能与
+  协程本身是协作式、单线程的；要真并发用 `spawn`。`-b`（边界检查）不能与
   `async` 同用。
 
-完整可运行示例见 [examples/async_demo.c](examples/async_demo.c)
+完整可运行示例见 [examples/async_demo.c6](examples/async_demo.c6)
 （一次 HTTP 请求，传输层用 `pipe()` 代替 socket，离线可跑）：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/async_demo.c
+./tcc/tcc -B tcc -run examples/async_demo.c6
 ```
 
-### go（OS 线程）
+### spawn（OS 线程）
+
+> 旧名 `go`：这个关键字以前拼作 `go`，因为和 Go 的 goroutine 同名（这里是
+> 真 OS 线程）改成了 `spawn`。`go` 仍是普通标识符，`go f(a);` 这种旧形状报
+> `'go' was renamed to 'spawn': write 'spawn f(...)'`。
 
 ```c
 int download(int id)               /* 普通函数，阻塞也没关系 */
@@ -977,27 +987,27 @@ int download(int id)               /* 普通函数，阻塞也没关系 */
 
 int main(void)
 {
-    go download(1);                /* pthread_create，立刻往下走 */
-    go download(2);
+    spawn download(1);              /* pthread_create，立刻往下走 */
+    spawn download(2);
     printf("main 继续跑\n");       /* 上面两行可能还没打印 */
     return 0;                      /* 退出前编译器插入 __c6_th_join_all() */
 }
 ```
 
-`go f(a);` 是一条**语句**，不产生值：
+`spawn f(a);` 是一条**语句**，不产生值：
 
 | 写法 | 对函数的要求 | 引擎 | 返回 | 真并发 | 句柄 |
 |---|---|---|---|---|---|
 | `co f(a);` | 必须是 `async` | 无栈协程（帧拷贝） | 跑到第一个真正要等的地方 | 否 | 无（交给顶层队列） |
 | `task t = f(a);` | 初始化式是 `async` 调用 | 同上 | 同上 | 否 | `t->wait()` |
-| `go f(a);` | 任意普通函数 | `pthread_create` | **立刻** | **是** | 无 |
-| `thread h = go f(a);` | 同上 | 同上 | 立刻 | 是 | `h->join()` |
+| `spawn f(a);` | 任意普通函数 | `pthread_create` | **立刻** | **是** | 无 |
+| `thread h = spawn f(a);` | 同上 | 同上 | 立刻 | 是 | `h->join()` |
 
 句柄的方法是同一套写法，语义按引擎各算各的：
 
 ```c
 task t = fetch(url);      t->wait();   /* 驱动事件循环直到它结束（顺带推进别的任务） */
-thread h = go download(1); h->join();  /* 只等这一个 OS 线程，别的都不动 */
+thread h = spawn download(1); h->join();  /* 只等这一个 OS 线程，别的都不动 */
 
 if (t->done()) ...        /* 结束了没：不驱动、不阻塞 */
 if (t->kind() == C6_CO_KIND_ERR) ...   /* 失败的任务：wait() 也返回 -1 */
@@ -1008,37 +1018,37 @@ int n = (int)h->value();  /* 线程函数的返回值（整数或指针） */
 
 规则：
 
-- 参数在 `go` 语句处**求值一次**，按值复制到堆上的参数块，线程解开参数块
+- 参数在 `spawn` 语句处**求值一次**，按值复制到堆上的参数块，线程解开参数块
   再调用 `f`；之后改局部变量不影响线程。支持标量、枚举、指针、`T[:]`、
   文件作用域的 struct/union；
-- 不能 `go` 一个 `async` 函数（用 `co`，错误信息会提示）、不能 `go`
-  变参函数、不能 `go` 带 `!error` 的函数（错误没人接）、不能通过函数指针
-  `go`；
+- 不能 `spawn` 一个 `async` 函数（用 `co`，错误信息会提示）、不能 `spawn`
+  变参函数、不能 `spawn` 带 `!error` 的函数（错误没人接）、不能通过函数指针
+  `spawn`；
 - 被调函数只要在调用点有个**文件作用域的声明**就行，定义可以在任何一个
   翻译单元；跳板按被调函数生成，每个 TU 各生成一份（`static`），没有被
-  `go` 用到的原型不产生任何代码；
+  `spawn` 用到的原型不产生任何代码；
 - 线程由**启动它的线程**回收：`main` 结束时编译器插入
   `__c6_th_join_all()`，别的线程在退出时回收自己的子线程，所以
   `-run` 也不会在线程还在跑的时候释放 JIT 内存。需要中途等待时可以自己
   调用 `__c6_th_join_all();`；
-- 需要等某一个线程就用句柄：`thread h = go f(a); h->join();`（重复
+- 需要等某一个线程就用句柄：`thread h = spawn f(a); h->join();`（重复
   `join()` 幂等，`h->done()` 不阻塞，`h->value()` 取被调函数的返回值，
   整数或指针）。句柄是**启动者私有**的，不要跨线程传；作用域退出时自动
   归还，没 `join` 也不漏 —— 线程本身仍旧由启动者回收；
 - 每个线程有自己的错误槽、插值构造器和协程池（`pthread_key`，不是
   `__thread`，`-run` 不支持 TLS）。`defer` 不需要它们：清理状态在函数帧里，
   线程里、ISR 里照常写；`err` / `f".."` / `async` 才要那块每线程状态，
-  线程里也一样能写，还能再 `go`；
+  线程里也一样能写，还能再 `spawn`；
 - 运行时只用 `pthread_create` / `pthread_join` / `pthread_key_*`；
   glibc 2.34 起这些都在 libc 里，老系统需要 `-lpthread`；
 - 这些符号是 **weak** 的：链接里没有 pthread 时（无 libc 的 freestanding
-  程序）运行时退化成单线程，`go` / `thread` 报告启动失败，而不是链接报错；
-- PE 目标还没有线程支持，`go` 在那边会触发 trap。
+  程序）运行时退化成单线程，`spawn` / `thread` 报告启动失败，而不是链接报错；
+- PE 目标还没有线程支持，`spawn` 在那边会触发 trap。
 
-完整可运行示例见 [examples/thread_demo.c](examples/thread_demo.c)：
+完整可运行示例见 [examples/thread_demo.c6](examples/thread_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/thread_demo.c
+./tcc/tcc -B tcc -run examples/thread_demo.c6
 ```
 
 ### 托管引用（引用计数 GC）
@@ -1075,7 +1085,7 @@ void f(void)
   新引用存进裸指针同样报错；
 - 含托管字段的结构体不能按值拷贝/传参/返回（`memcpy` 也是），只能 `new`；
 - 形参是**借用**：被调者不计数、不释放，也不能改写（要留住就拷进自有局部
-  `@T m = n;`）；`async`/`go` 的边界只能传 `shared @T`；
+  `@T m = n;`）；`async`/`spawn` 的边界只能传 `shared @T`；
 - `move(p)` 之后 `p` 的槽就空了：在重新赋值之前再读它、比较它、解引用成员、
   传给函数、或者再 `move` 一次，都是**编译错误**（E-GC17）——空值解引用就是
   运行期崩溃。重新赋值（`p = new T` 或 `p = NULL`）之后照常使用；
@@ -1090,17 +1100,17 @@ struct File { int fd; };
 void drop(struct File *self) { close(self->fd); }
 ```
 
-`async`/`go` 的任务**自己持有**一份参数和返回值（进任务 +1、任务销毁 −1），
+`async`/`spawn` 的任务**自己持有**一份参数和返回值（进任务 +1、任务销毁 −1），
 所以「创建者先放手、任务后跑完」是安全的；没跑完就被销毁的任务会回卷
 （跑 `errdefer`/`defer`/释放），不会漏引用。
 
-完整可运行示例见 [examples/gc_demo.c](examples/gc_demo.c)：作用域释放与
+完整可运行示例见 [examples/gc_demo.c6](examples/gc_demo.c6)：作用域释放与
 `p = NULL`、`new T[n]` 的逐元素析构、`own` 子树配 `weak` 父指针、`move()`、
-`shared` 跨线程与 `go`、`async` 任务持有参数和返回值，最后用
+`shared` 跨线程与 `spawn`、`async` 任务持有参数和返回值，最后用
 `__c6_gc_live()` 自证「全程没有泄漏」（`rc=0` 才算过）：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/gc_demo.c
+./tcc/tcc -B tcc -run examples/gc_demo.c6
 ```
 
 代价与尺寸（x86_64，热缓存，跨 TU 不内联）：`@T` 的一次加/减约 2.2 ns，
@@ -1212,7 +1222,7 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
   上限 511 字节，更长的部分被截断；
 - `__FILE__`、`__LINE__`、`__COUNTER__` 在插值里取到的是真实位置；插值里的
   诊断也报在源文件的行上；
-- 只有 `-std=c6` 下 `f"` 才被认成 f-string：其他模式下 `f"x"` 仍是"标识符
+- 只有 c6 的翻译单元（`.c6`）里 `f"` 才被认成 f-string：其他模式下 `f"x"` 仍是"标识符
   f 跟着一个字符串字面量"，语法与原来完全一样；
 - 宏里可以写：宏体、宏实参、`#x` 字符串化都会带着原始文本走：
 
@@ -1234,14 +1244,14 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 都不会互相踩；C99 后端把同一串调用原样翻成 C（`tcc/c99-rt.inc` 里有一份
 等价的 C 实现），两个后端行为一致。
 
-完整可运行示例见 [examples/fstr_demo.c](examples/fstr_demo.c)：
+完整可运行示例见 [examples/fstr_demo.c6](examples/fstr_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -run examples/fstr_demo.c
+./tcc/tcc -B tcc -run examples/fstr_demo.c6
 ```
 
-回归用例见 [tests/fstr.c](tests/fstr.c)（`make selftest` 里跑），编译期诊断见
-[tests/errors/fstr.c](tests/errors/fstr.c)。
+回归用例见 [tests/fstr.c6](tests/fstr.c6)（`make selftest` 里跑），编译期诊断见
+[tests/errors/fstr.c6](tests/errors/fstr.c6)。
 
 ### #macro / __local
 
@@ -1263,33 +1273,33 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 |---|---|
 | `calloc` / `free` / `realloc` | 用 `libtcc1` 里的静态 arena（`.bss`，默认 256 KB，编译 libtcc1 时 `-DC6_HEAP_SIZE=...` 可调）；程序自己定义 `calloc` 就用程序的那份 |
 | `memset` / `memcpy` / `memmove` | `libtcc1` 自带字节循环版，真 libc 的强定义会在链接时覆盖它们 |
-| `pthread_*` | 退化成单线程（一个静态的状态块）；`go` / `thread` 报告启动失败 |
+| `pthread_*` | 退化成单线程（一个静态的状态块）；`spawn` / `thread` 报告启动失败 |
 | `select` | 只有 `async` / `c6_io` 用到；没有就报“等待失败”，其它照常 |
 
 也就是单线程的 freestanding 程序直接可用，程序这边什么都不用提供：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -static -nostdlib -o build/freestanding_fstr \
-    examples/freestanding_fstr.c tcc/libtcc1.a   # 或 make fstest
+./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_fstr \
+    examples/freestanding_fstr.c6 tcc/libtcc1.a   # 或 make fstest
 ./build/freestanding_fstr
 ```
 
-[examples/freestanding_fstr.c](examples/freestanding_fstr.c) 没有 `main`、没有
+[examples/freestanding_fstr.c6](examples/freestanding_fstr.c6) 没有 `main`、没有
 crt，入口是 `_start`，输出和退出都自己发 syscall，里面跑了整数/浮点插值、
 格式说明、`@f".."`、`defer`、`err`+`catch` 和 `@T`，8 条断言全过。
 
-要 `go` / `thread` 就再实现一层线程接口 —— 运行时只用这 8 个入口，都是
+要 `spawn` / `thread` 就再实现一层线程接口 —— 运行时只用这 8 个入口，都是
 weak 的，程序给了就切回“每线程一块状态”：
 
 | 入口 | 干什么 |
 |---|---|
 | `pthread_once` / `pthread_key_create` / `pthread_getspecific` / `pthread_setspecific` | 每线程一块状态（错误槽、插值构造器、协程池）。只有用到 `err` / `try` / `catch`、`f".."` 或协程的函数才去取它，纯 `defer` 的代码不碰。`key_create` 的析构函数务必在线程退出时调用，否则每个线程漏约 100 KB |
-| `pthread_create` / `pthread_join` | `go` 的启动与回收 |
-| `pthread_self` / `pthread_equal` | `thread h = go f(...)` 用它判断“自己 join 自己” |
+| `pthread_create` / `pthread_join` | `spawn` 的启动与回收 |
+| `pthread_self` / `pthread_equal` | `thread h = spawn f(...)` 用它判断“自己 join 自己” |
 
 三个坑：
 
-- **这一层必须用普通 C 或汇编编译，不能带 `-std=c6`**：用了 `err` /
+- **这一层必须用普通 C 或汇编编译（`.c` / `.plain.c`），不能写成 `.c6`**：用了 `err` /
   `try` / `catch`、`f".."` 或协程的 c6 函数会去取 `tcc_th()`，而 `tcc_th()`
   正要去调 `pthread_once` / `pthread_key_create` —— 用 c6 写就是 bootstrap 里
   递归自己，栈一冲就段错误。纯 `defer` 的函数现在不碰 `tcc_th()`（状态在
@@ -1302,7 +1312,7 @@ weak 的，程序给了就切回“每线程一块状态”：
 可以直接抄的实现 —— x86-64 Linux 上 `clone` + `futex`，不碰 libc：线程指针放
 `%fs:0`（`arch_prctl`），栈和控制块用 `mmap`，线程退出用 `SYS_exit`，join 用
 `CLONE_CHILD_CLEARTID` 加 futex；它还顺带给了一份线程安全的 `calloc`/`free`
-（每次 `mmap`，不用锁）。[examples/freestanding_go.c](examples/freestanding_go.c)
+（每次 `mmap`，不用锁）。[examples/freestanding_go.c6](examples/freestanding_go.c6)
 用它跑两个真线程（一个等另一个置位，只有真并发才会通过），`make fstest-go`
 编译并运行，200 次连跑没有失败。
 
@@ -1329,11 +1339,11 @@ join 这里有个坑值得记下来：「还活着」的标志不能直接靠 `C
 |---|---|
 | `calloc` / `free` / `realloc` | 不给也行：`libtcc1` 里的静态 arena 顶上（`.bss`，`-DC6_HEAP_SIZE=` 可调）；要自己的分配器就写一个 bump |
 | `memcpy` / `memset` / `memmove` | `libtcc1` 自带的 weak 版本，什么都不用做 |
-| `pthread_*` | 不给也行：单线程、一个静态状态块，`go` / `thread` 报启动失败；要并发就把板子上的线程 API 包成那 8 个名字 |
+| `pthread_*` | 不给也行：单线程、一个静态状态块，`spawn` / `thread` 报启动失败；要并发就把板子上的线程 API 包成那 8 个名字 |
 | `select` | 只有 `async` / `c6_io` 用；不用 async 就永远碰不到 |
 | 输出、退出、复位 | 程序自己的事：把 `write` 换成 UART/MMIO 写、`exit` 换成 `while (1)`，入口符号交给链接脚本和向量表 |
 
-[examples/freestanding_noos.c](examples/freestanding_noos.c)（`make fstest-noos`）
+[examples/freestanding_noos.c6](examples/freestanding_noos.c6)（`make fstest-noos`）
 就是这么一份：里面**一个 syscall 都没有**，插值、格式说明、`defer`、`err` +
 `catch`、`@T` 全在内存里做完，最后用 `ud2`（全过，退出码 132）或往 0 地址写
 （某个断言失败）报信 —— 这两个「报信」在裸机上就是你的异常向量。
@@ -1369,7 +1379,7 @@ bare metal: ok
 fstest-bare: ok（裸机启动，全部断言通过；KVM）
 ```
 
-`examples/boot/main.c` 里除了插值、格式说明、`defer`、`err`+`catch`、`@T`、`@f".."`
+`examples/boot/main.c6` 里除了插值、格式说明、`defer`、`err`+`catch`、`@T`、`@f".."`
 这些语言特性，还顺手验证了运行时：分配器用 `libtcc1` 自带的静态 arena，`mem*`
 用 weak 版本，**没有一个外部符号**（`pthread` / `select` / `calloc` 全都不给）。
 「输出」是两条 `outb`（0xE9 调试口、0x501 退出），写在 payload 自己的全局
@@ -1377,10 +1387,10 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 协程在这里一样能用：`co` / `async` / `await` / `task` / `__c6_co_run()` 的状态全在
 内存里，调度器就是 `libtcc1` 里的 `tcc_co_pump()`，**一个 syscall 都不发**。
-`examples/boot/main.c` 里跑了两个交错的顶层 `co`（各自循环里反复 `await`、结果写
+`examples/boot/main.c6` 里跑了两个交错的顶层 `co`（各自循环里反复 `await`、结果写
 回全局），外加一条失败任务的计数。唯一需要外部实现的是 `await c6_io(...)`：它靠
 `select` 等 fd，裸机上没有，`__c6_co_run()` 就按设计返回 -1（这个也断言了）；
-`go` / `thread` 要的是另一层，见上面那张 pthread 入口表。
+`spawn` / `thread` 要的是另一层，见上面那张 pthread 入口表。
 
 几个只有真裸机才会碰到的坑：
 
@@ -1399,7 +1409,7 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 #### 把 tests/ 也搬上裸机
 
-`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**34 个测试
+`make fstest-bare-tests` 把 `tests/*.c6` 里的 test 块搬到裸机上跑：**34 个测试
 文件、全部 test 块，0 失败**，每个文件一个镜像，一共十几秒。
 
 ```
@@ -1424,13 +1434,13 @@ bare tests: 34 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method 
 
 | 测试 | 缺什么 |
 |---|---|
-| `thread` / `thread_handle` / `gc_thread` / `gc_drop` / `tuple_thread` | `go` 本身现在能跑了（见上面那节），但这几个用的是 `h->join()` / `h->value()`，那条路要走 `libtcc1` 的每线程块（`calloc`/`free` + pthread 键），裸机上还不稳 —— 任务收尾之后会三重故障，没修完 |
+| `thread` / `thread_handle` / `gc_thread` / `gc_drop` / `tuple_thread` | `spawn` 本身现在能跑了（见上面那节），但这几个用的是 `h->join()` / `h->value()`，那条路要走 `libtcc1` 的每线程块（`calloc`/`free` + pthread 键），裸机上还不稳 —— 任务收尾之后会三重故障，没修完 |
 | `defer_thread` | 要 `clone`/`futex` 那套真正的线程创建 |
 | `method` | 要 `FILE` 的真实内存布局（`stdout->fflush()`），那是 libc 的内部结构 |
 
 整个文件都跳太重时，可以只跳一个 test 块：在块上一行写 `// BARE-SKIP`，
 [examples/boot/harness.py](examples/boot/harness.py) 生成裸机那张表时会把它
-略过（块号不变，同一个文件里剩下的块照跑）。`tests/generic_fn.c` 的
+略过（块号不变，同一个文件里剩下的块照跑）。`tests/generic_fn.c6` 的
 「实例是普通函数：可以起线程」就是这么处理的 —— 它只缺线程，别的 8 个块
 在裸机上照样有意义。
 
@@ -1449,9 +1459,9 @@ bare tests: 34 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method 
 C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<stdlib.h>`、
 `<pthread.h>`）。
 
-#### 裸机上的 go 是真并发：自己写一个抢占式调度器
+#### 裸机上的 spawn 是真并发：自己写一个抢占式调度器
 
-`go` 在别的地方落到 `pthread_create` 上。裸机上没有内核，所以 `make
+`spawn` 在别的地方落到 `pthread_create` 上。裸机上没有内核，所以 `make
 fstest-bare-go` 干脆自己写那一层：
 [examples/boot/sched.plain.c](examples/boot/sched.plain.c) 就是最小内核 ——
 8259A 重映射到 `0x20`、8254 每 10ms 一次时钟、中断进来换到调度器自己的栈、
@@ -1462,19 +1472,19 @@ fstest-bare-go` 干脆自己写那一层：
 对 `libtcc1` 来说只是那 8 个符号（`pthread_create/join/once/key_create/
 getspecific/setspecific/self/equal`），别的都不问。
 
-怎么证明"真并发"？[examples/boot/go_bare.c](examples/boot/go_bare.c) 里两个
+怎么证明"真并发"？[examples/boot/go_bare.c6](examples/boot/go_bare.c6) 里两个
 任务**都没有让出语句**，而且互相等：空转的那个先置 `started`，然后死等
 `go_flag`；另一个先等 `started`，再把 `go_flag` 立起来。
 
 ```
-go: 空转 4446664 次（上限 200000000）、时钟切换 5 次、go_flag=1
-go: 是并发 —— 两个任务在同一个 CPU 上被时钟抢占着交错推进
+spawn: 空转 4446664 次（上限 200000000）、时钟切换 5 次、go_flag=1
+spawn: 是并发 —— 两个任务在同一个 CPU 上被时钟抢占着交错推进
 ```
 
 #### 多核：两个核同时在跑
 
 `make fstest-bare-smp` 起两个核（`-smp 2`）跑
-[examples/boot/smp_bare.c](examples/boot/smp_bare.c)，再用 `SMP=1` 跑一遍做
+[examples/boot/smp_bare.c6](examples/boot/smp_bare.c6)，再用 `SMP=1` 跑一遍做
 负对照。AP 是 `examples/boot/ap.S` 那个 16 位实模式跳板拉起来的（`as --32`
 + `ld -Ttext 0x8000`，222 字节，`build.sh` 用 `objcopy -I binary` 链进
 payload），引导核先往 `0x7000/0x7008/0x7010` 写好 cr3、入口、每个 APIC ID 的
@@ -1499,15 +1509,15 @@ smp: 真并行 —— 两个任务同时跑在两个核上
 能 `sti`（它没装 IDT）。细节在 [docs/plan.md](docs/plan.md)。
 
 空转次数**远小于上限**就是证据：只有时钟中断真在任意指令边界把 CPU 抢走，
-另一个任务才有机会跑起来把 `go_flag` 立起来。要是 `go` 只是在同一个栈上顺序
+另一个任务才有机会跑起来把 `go_flag` 立起来。要是 `spawn` 只是在同一个栈上顺序
 调用，先跑的那个得把 2 亿次整个跑完，另一个才轮得到。
 
 单核上是真并发（交错推进），不是并行。要并行得多核，而多核要 AP 跳板
 （16 位实模式代码，`tcc` 不支持 `.code16`，得另走 binutils），这部分还没做。
 
-`go` 的**句柄**（`h->join()` / `h->value()`）在裸机上还没打通：句柄那条路
+`spawn` 的**句柄**（`h->join()` / `h->value()`）在裸机上还没打通：句柄那条路
 要 `libtcc1` 的每线程块走 `calloc`/`free` 和 pthread 键，实测任务收尾之后会
-三重故障（`thread`/`thread_handle` 两个测试还是跳过）。所以 `go_bare.c` 用
+三重故障（`thread`/`thread_handle` 两个测试还是跳过）。所以 `go_bare.c6` 用
 全局变量握手，不用句柄 —— 调度这一层本身是好的，`pthread_join` 用普通的
 函数体任务测过（`pthread_create` + `join` + 返回值都对）。
 
@@ -1531,50 +1541,50 @@ c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 ```
 tests/
 ├── run-tests.sh      运行器（make selftest 调它）
-├── defer.c           defer 的时机、顺序与作用域
-├── defer_scope.c     defer 与块作用域、goto 跨作用域的清理
-├── defer_reent.c     递归/重入时的 defer 链
-├── defer_thread.c    线程里的 defer（裸机跑不了，boot/runtests.sh 跳过）
-├── err.c             err / errdefer / 清理顺序
-├── try.c             try / catch
-├── test-block.c      test 块与 -test 模式本身
-├── macro.c           #macro 与 __local 名字卫生
-├── package.c         package / import / pkg.member
-├── module.c          module / import 加载与 -emit-header
-├── method.c          结构体方法（含不同类型的同名方法与 libc 方法）
-├── interface.c       结构化接口
-├── iface_agg.c       接口方法签名里的 struct / 元组
-├── slice.c           切片
-├── tuple.c           元组（与 tu/tuple.c 一起跑）
-├── tuple_error.c     元组 / struct 作 !error 的返回类型
-├── tuple_async.c     元组 + async / await
-├── tuple_thread.c    元组 + go（OS 线程）
-├── typename.c        裸 tag 类型名（省略 struct / union / enum）
-├── enum_scope.c      枚举成员的限定名 Color.RED
-├── foreach.c         foreach：数组 / 切片 / 区间
-├── foreach_iter.c    foreach：has()/next() 迭代器协议
-├── fstr.c            字符串插值 f".." / @f".."
-├── fn_lit.c          函数字面量
-├── closure.c         捕获式闭包（V2）
-├── generic.c         泛型：模板、实例、体内方法、值形参
-├── generic_fn.c      |T| 函数 / typedef 模板
-├── async.c           async / await / co / task
-├── async_frame.c     帧住在任务里：&local 跨 await、weak 形参
-├── thread.c          go（OS 线程）
-├── thread_handle.c   线程句柄 h->join()/done()/value()
-├── task_method.c     任务句柄 t->wait()/done()/kind()
-├── weak.c            weak 引用
-├── gc.c              托管引用：分配、存储、作用域释放、数组
-├── gc_field.c        字段释放、嵌套结构体、长链迭代释放
-├── gc_type.c         shared / weak / own 的类型语义
-├── gc_drop.c         析构方法 drop（含数组元素与 go 线程）
-├── gc_thread.c       shared 跨线程：实参块持有、交接、并发加减
-├── gc_async.c        async 任务的参数/返回值持有 + 销毁挂起任务时回卷
-├── gc_own.c          own 独占链/子树 + move()
-├── gc_return.c       返回托管引用的计数归属（新建/借字段/形参/循环）
-├── c6ext/            .c6 后缀自测：不传 -std=c6，靠扩展名开启扩展
-├── tu/               跨翻译单元的第二个 .c/.c6（同名的主文件会一起编译）
-├── abi/              ABI 兼容：同一份代码用 -std=c6 和纯 C 各编译一个 TU，
+├── defer.c6           defer 的时机、顺序与作用域
+├── defer_scope.c6     defer 与块作用域、goto 跨作用域的清理
+├── defer_reent.c6     递归/重入时的 defer 链
+├── defer_thread.c6    线程里的 defer（裸机跑不了，boot/runtests.sh 跳过）
+├── err.c6             err / errdefer / 清理顺序
+├── try.c6             try / catch
+├── test-block.c6      test 块与 -test 模式本身
+├── macro.c6           #macro 与 __local 名字卫生
+├── package.c6         package / import / pkg.member
+├── module.c6          module / import 加载与 -emit-header
+├── method.c6          结构体方法（含不同类型的同名方法与 libc 方法）
+├── interface.c6       结构化接口
+├── iface_agg.c6       接口方法签名里的 struct / 元组
+├── slice.c6           切片
+├── tuple.c6           元组（与 tu/tuple.c 一起跑）
+├── tuple_error.c6     元组 / struct 作 !error 的返回类型
+├── tuple_async.c6     元组 + async / await
+├── tuple_thread.c6    元组 + spawn（OS 线程）
+├── typename.c6        裸 tag 类型名（省略 struct / union / enum）
+├── enum_scope.c6      枚举成员的限定名 Color.RED
+├── foreach.c6         foreach：数组 / 切片 / 区间
+├── foreach_iter.c6    foreach：has()/next() 迭代器协议
+├── fstr.c6            字符串插值 f".." / @f".."
+├── fn_lit.c6          函数字面量
+├── closure.c6         捕获式闭包（V2）
+├── generic.c6         泛型：模板、实例、体内方法、值形参
+├── generic_fn.c6      |T| 函数 / typedef 模板
+├── async.c6           async / await / co / task
+├── async_frame.c6     帧住在任务里：&local 跨 await、weak 形参
+├── thread.c6          spawn（OS 线程）
+├── thread_handle.c6   线程句柄 h->join()/done()/value()
+├── task_method.c6     任务句柄 t->wait()/done()/kind()
+├── weak.c6            weak 引用
+├── gc.c6              托管引用：分配、存储、作用域释放、数组
+├── gc_field.c6        字段释放、嵌套结构体、长链迭代释放
+├── gc_type.c6         shared / weak / own 的类型语义
+├── gc_drop.c6         析构方法 drop（含数组元素与 spawn 线程）
+├── gc_thread.c6       shared 跨线程：实参块持有、交接、并发加减
+├── gc_async.c6        async 任务的参数/返回值持有 + 销毁挂起任务时回卷
+├── gc_own.c6          own 独占链/子树 + move()
+├── gc_return.c6       返回托管引用的计数归属（新建/借字段/形参/循环）
+├── c6ext/            .c6 后缀自测：不加任何开关，靠扩展名开启扩展
+├── tu/               跨翻译单元的第二个 .c6（同名的主文件会一起编译）
+├── abi/              ABI 兼容：`.c6`（c6）和 `_plain.c`（纯 C）各编译一个 TU，
 │                     链接后运行（`// EXIT <n>` 声明期望的退出码）
 ├── exit/             退出码（`// EXIT <n>` 声明期望的进程退出码）
 └── errors/           编译期诊断（每个片段一个 -D 开关）
@@ -1590,9 +1600,9 @@ tests/run-tests.sh --list           # 列出会跑的文件
 单个文件也可以直接跑：
 
 ```sh
-./tcc/tcc -B tcc -std=c6 -test tests/err.c
-./tcc/tcc -B tcc -std=c6 -test tests/slice.c tests/tu/slice.c
-./tcc/tcc -B tcc -std=c6 -test -test-filter=切片 tests/slice.c   # 按描述过滤
+./tcc/tcc -B tcc -test tests/err.c6
+./tcc/tcc -B tcc -test tests/slice.c6 tests/tu/slice.c6
+./tcc/tcc -B tcc -test -test-filter=切片 tests/slice.c6   # 按描述过滤
 ```
 
 输出形如：
@@ -1608,7 +1618,7 @@ run-tests: 96 通过, 0 失败
 
 ### 编译期诊断怎么写
 
-`tests/errors/*.c` 用 `#if defined <片段名>` 把每个报错场景放在一个片段里，
+`tests/errors/*.c6` 用 `#if defined <片段名>` 把每个报错场景放在一个片段里，
 用注释声明该片段必须产生的诊断，不需要维护行号：
 
 ```c
@@ -1627,7 +1637,7 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 
 两条额外的约定：
 
-- `tests/tu/<同名>.c` 存在时会作为**第二个翻译单元**一起编译（跨 TU 的环
+- `tests/tu/<同名>.c6` 存在时会作为**第二个翻译单元**一起编译（跨 TU 的环
   检测这类诊断要两个单元才看得见；`-run` 只接一个源文件，所以这种情况下
   运行器改用编译 + 链接）；
 - `// NATIVE-ONLY <片段>` 标记该片段只在本机后端成立，`BACKEND=c99` 时跳过
@@ -1638,7 +1648,7 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 ```sh
 make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
-make c6selfcheck   # 用 -std=c6 编译 tcc 自己的源码，编出可运行的编译器
+make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
 make test-all      # selftest + tests2 + c6selfcheck + freestanding/裸机
 make check-all     # test-all + C99 后端两套用例 + 三条自举路线（发布前跑这条）
 ```
@@ -1656,9 +1666,10 @@ make c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条�
 编出来的编译器真能编程序，自举才算通过。
 
 `make c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
-的源码也要满足它，所以整份源码都用 `-std=c6 -DC6_EXT` 编译一遍（原生目标
-文件 + C99 后端产物；带 `C6_EXT` 才会把扩展实现那半边也纳入检查），再把
-编出来的编译器连起来跑 `-v`。两步编译都不许有诊断输出，出现警告即失败。
+的源码也要满足它，所以把 `tcc/tcc.c` 拷成 `build/selfhost/c6/selfcheck.c6`
+后用 `-DC6_EXT` 编译一遍（原生目标文件 + C99 后端产物；带 `C6_EXT` 才会把
+扩展实现那半边也纳入检查），再把编出来的编译器连起来跑 `-v`。两步编译都
+不许有诊断输出，出现警告即失败。
 
 > 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
 > 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。
@@ -1668,7 +1679,7 @@ make c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条�
 - 设计文档：[docs/plan.md](docs/plan.md)（第 11 节为各阶段实现状态与限制）。
 - 语法规范：[docs/grammar.md](docs/grammar.md)（EBNF 增量语法、静态约束与重写规则）。
 - 运行时状态（错误槽、插值构造器、协程池、子线程链表）是**每线程**一份，
-  通过 `pthread_key` 查找而不是 `__thread`：`tcc -run` 不支持 TLS。`go`
+  通过 `pthread_key` 查找而不是 `__thread`：`tcc -run` 不支持 TLS。`spawn`
   出去的线程拿到自己的一份，所以线程里可以照常写 `err`/`co`。`defer` 的
   清理状态不在其中——它在函数帧里，所以线程里、ISR 里都一样。
 - 方法必须在调用点之前声明或定义（TCC 单趟编译的固有限制）；接口一致性检查发生在
@@ -1720,21 +1731,21 @@ built into the normal `tcc/tcc` binary; there is no separate compiler.
     make c99test                             # same cases as selftest, via the C back-end
     make c99tcc-test                         # same, with tcc itself as the host compiler
 
-`make c99test` runs the same corpus as `make selftest`: every `tests/*.c`,
-`tests/c6ext/*.c6`, `tests/errors/*.c`, `tests/exit/*.c`, `tests/abi/*.c` and
-`tests/c99/*.c`
+`make c99test` runs the same corpus as `make selftest`: every `tests/*.c6`,
+`tests/c6ext/*.c6`, `tests/errors/*.c6`, `tests/exit/*.c6`, `tests/abi/*.c6` and
+`tests/c99/*.c6`
 case goes through the same `tcc/tcc` (asked for C source with `-o ...c`) and
 then through
 `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread`, with the same
 exit-code, output and diagnostic assertions.  Diagnostics that only differ
 because they are produced by the C-output back-end are declared with
-`// EXPECT-C99` in the `tests/errors/*.c` file; everything else is shared.
+`// EXPECT-C99` in the `tests/errors/*.c6` file; everything else is shared.
 `C99CC=clang make c99test` uses another host compiler, and
 `BACKEND=c99 tests/run-tests.sh` runs the same thing directly.
 `make c99tcc-test` is the same corpus with `C99CC=tcc/tcc` (`C99FLAGS` drops
 the gcc-only switches), so the generated C has to satisfy tcc too -- see
 "Self-hosting through the C back-end" below for what that costs.
-`tests/c99/c99test.c` additionally exercises plain C and all the c6 features
+`tests/c99/c99test.c6` additionally exercises plain C and all the c6 features
 listed below in one program.
 
 `-c99` selects the output back-end; it is not a language-standard flag, and
@@ -1779,19 +1790,19 @@ and every struct it sees is an opaque byte block -- without colliding with the
 host's declarations when the prelude includes `<stdlib.h>` and `<pthread.h>`.
 A plain `cc out.c` (no `-w`, no extra include flags) is enough.
 
-c6 programs work too.  A c6 translation unit (`-std=c6`) carries a portable C
+c6 programs work too.  A c6 translation unit (a `.c6` source file) carries a portable C
 implementation of the defer/error/slice/coroutine/thread runtime, appended to
 its own output file.  It is ordinary C99 plus POSIX (`pthread` and `select`
-for `async`/`await`, `go` and `c6_io`); no `libtcc1` is needed.  The runtime
+for `async`/`await`, `spawn` and `c6_io`); no `libtcc1` is needed.  The runtime
 symbols have weak linkage on GCC/Clang so that all generated translation units
 of one program share a single runtime (errors, coroutines and joins cross TU
 boundaries); compilers without weak symbols fall back to one private copy per
-TU.  Features covered by `tests/*.c` include `defer`/`errdefer`, `err`,
+TU.  Features covered by `tests/*.c6` include `defer`/`errdefer`, `err`,
 `try`/`catch`, slices, `foreach`, tuples, methods/interfaces, `typename`,
-`async`/`await`, `co`, `go`, string interpolation (`f".."` / `@f".."`; the
+`async`/`await`, `co`, `spawn`, string interpolation (`f".."` / `@f".."`; the
 runtime prelude carries the same `__c6_fmt_*` builder) and `test` blocks:
 
-    tcc/tcc -std=c6 -B tcc -o out.c prog.c
+    tcc/tcc -B tcc -o out.c prog.c6
     cc -std=c99 -pedantic -Wall -Wextra -Werror -o prog out.c
     ./prog
 
@@ -1806,7 +1817,7 @@ Structs of at most eight bytes containing only integer/pointer fields use the
 x86-64 register-return ABI, so they interoperate with plain C (`tests/abi/`).
 Structs of 9--16 bytes whose fields are all integers/pointers do too: the
 generated C returns them by value, so the host compiler puts them in
-`rax:rdx`, exactly like the native backend (`tests/abi/sret12.c`). Structs
+`rax:rdx`, exactly like the native backend (`tests/abi/sret12.c6`). Structs
 with a floating-point field, and structs larger than 16 bytes, use a hidden
 result pointer chosen by this back-end: that is consistent between c6
 translation units, and for structs larger than 16 bytes it also matches the
@@ -1815,7 +1826,7 @@ with plain C is not supported.
 
 Not supported (each gives a clear error instead of miscompiling): computed
 goto and variable length arrays.  On non-POSIX hosts the generated runtime
-still compiles, but `async`/`go`/`c6_io` need a platform port.
+still compiles, but `async`/`spawn`/`c6_io` need a platform port.
 
 ### Self-hosting through the C back-end
 

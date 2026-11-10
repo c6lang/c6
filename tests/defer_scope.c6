@@ -1,0 +1,262 @@
+/* c6 自测：defer/errdefer 的状态住在函数帧里（R6 / D1-D6）
+ *
+ * 一个清理点（cleanup site）是编译期的常量：编号、所属作用域深度、kind 和
+ * 清理体的标签。运行期只有两样东西会变，而它们都在*这一帧*里：
+ *   - 该清理点是否已注册（帧里的一个位图，函数入口清零），
+ *   - 当前正在服务哪个清理请求（深度过滤 + resume 号）。
+ * 于是清理不需要任何线程级（TLS/线程键）状态：ISR 里、恢复的协程里、普通
+ * 嵌套调用里跑的规则完全一样，递归帧之间也不会互相看到。
+ *
+ * 这里检查的就是那几条推论：
+ *   1. 清理体里再退出作用域（嵌套派发），两层清理体套在一起
+ *   2. 正常退出作用域的 errdefer 被丢弃，后面的 err 不会再跑它
+ *   3. 错误路径：errdefer 与 defer 一起按注册的逆序跑（跨作用域）
+ *   4. 同一个作用域实例里重复注册同一个清理点只跑一次（D2 幂等）
+ *   5. goto 回到作用域入口会重新注册（位在跑的时候被清掉，D1）
+ *   6. 深递归：每帧独立，没有 8192 条记录的上限
+ *   7. 同一个作用域里超过 32 个清理点（位图跨字）
+ *
+ * 运行（仓库根目录）：
+ *   make selftest
+ * 或单个文件：
+ *   ./tcc/tcc -B tcc -test tests/defer_scope.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+/* ---- 清理顺序记录 ---- */
+static char logbuf[128] = {0};
+static int loglen = 0;
+
+static void lg_reset(void)
+{
+    loglen = 0;
+    logbuf[0] = '\0';
+}
+
+static void lg(const char *s)
+{
+    while (*s && loglen < (int)sizeof(logbuf) - 2)
+        logbuf[loglen++] = *s++;
+    logbuf[loglen] = '\0';
+}
+
+#define LG_IS(s) (0 == strcmp(logbuf, (s)))
+
+/* ---- 1. 清理体里再退出一个作用域：嵌套派发 ---- */
+static void nested_dispatch(void)
+{
+    lg_reset();
+    defer {
+        lg("A");
+        {
+            defer lg("B");             /* 从清理体里发起的清理请求 */
+            lg("b");
+        }
+        lg("C");
+    }
+    lg("m");
+}
+
+test "清理体里退出作用域：嵌套派发" {
+    nested_dispatch();
+    if (!LG_IS("mAbBC"))
+        err(1, "清理体里的作用域没有正确派发");
+}
+
+/* 两层清理体套在一起 */
+static void nested_two_deep(void)
+{
+    lg_reset();
+    defer {                            /* 外层清理体 */
+        lg("1");
+        defer {                        /* 清理体里注册的第二个清理点 */
+            lg("2");
+            {
+                defer lg("3");
+                lg("4");
+            }
+            lg("5");
+        }
+        lg("6");
+    }
+    lg("m");
+}
+
+test "两层清理体里的 defer" {
+    nested_two_deep();
+    if (!LG_IS("m162435"))
+        err(1, "两层清理体的执行顺序不对");
+}
+
+/* ---- 2. 正常退出作用域后 errdefer 被丢弃 ---- */
+static int g_dropped = 0;
+
+static int!error errdef_dropped(void)
+{
+    {
+        errdefer g_dropped += 1;       /* 作用域正常退出：它被丢弃 */
+    }
+    err(7, "boom");                    /* 这里不该再跑上面那个 errdefer */
+    return 0;
+}
+
+test "正常退出作用域的 errdefer 被丢弃" {
+    g_dropped = 0;
+    errdef_dropped() catch e {
+        if (e.id != 7)
+            err(1, "错误码不对");
+        if (g_dropped != 0)
+            err(2, "已经正常退出作用域的 errdefer 又被执行了");
+        return 0;                      /* 进了 catch 就是预期路径 */
+    };
+    err(3, "没有进入错误路径");
+}
+
+/* ---- 3. 错误路径：errdefer + defer，跨作用域逆序 ---- */
+static int!error errdef_order(void)
+{
+    lg_reset();
+    {
+        defer lg("1");
+        {
+            errdefer lg("e");
+            defer lg("2");
+            err(9, "deep");
+        }
+    }
+    return 0;
+}
+
+test "错误路径把 errdefer 和 defer 一起逆序执行" {
+    lg_reset();
+    errdef_order() catch e {
+        if (e.id != 9)
+            err(1, "错误码不对");
+        if (!LG_IS("2e1"))
+            err(2, "错误路径的清理顺序不对");
+        return 0;
+    };
+    err(3, "没有进入错误路径");
+}
+
+/* ---- 4. 同一个作用域实例里重复注册只跑一次 ---- */
+static int g_twice = 0;
+
+static void arm_twice(void)
+{
+    int n = 0;
+
+    g_twice = 0;
+again:
+    defer g_twice += 1;                /* 同一个清理点，同一个作用域实例 */
+    if (++n < 3)
+        goto again;
+}
+
+test "同一个作用域实例里重复注册只跑一次" {
+    arm_twice();
+    if (g_twice != 1)
+        err(1, "同一个作用域实例里同一个清理点跑了不止一次");
+}
+
+/* ---- 5. goto 回到作用域入口：离开时清理，回来时重新注册 ----
+ *
+ * 向后跳转（标签已经定义）的 goto 由 goto 语句自己发起清理请求，深度就是
+ * 那个标签的作用域深度：于是每次跳回标签都会先把正在离开的块跑一遍，位在
+ * 跑的时候被清掉，下一次进块重新注册。 */
+static int g_back = 0;
+
+static void goto_back(void)
+{
+    int i = 0;
+
+    g_back = 0;
+loop:
+    {
+        defer g_back += 1;
+        i++;
+        if (i < 3)
+            goto loop;                 /* 离开这个块，然后再进来一次 */
+    }
+}
+
+test "goto 回到作用域入口会重新注册" {
+    goto_back();
+    if (g_back != 3)
+        err(1, "每次进入作用域都应该重新注册一次清理");
+}
+
+/* ---- 6. 深递归：每帧独立，没有记录条数上限 ---- */
+static int g_rec = 0;
+
+static int deep_rec(int n)
+{
+    defer g_rec += 1;                  /* 每一帧一个清理 */
+    if (n <= 0)
+        return 0;
+    return deep_rec(n - 1) + 1;
+}
+
+test "20000 层递归每帧各跑一次清理" {
+    g_rec = 0;
+    if (deep_rec(20000) != 20000)
+        err(1, "深递归的返回值不对");
+    if (g_rec != 20001)
+        err(2, "深递归的清理次数不对（记录上限或互相覆盖）");
+}
+
+/* ---- 7. 同一个作用域里 40 个清理点（位图跨字）---- */
+static void many_sites(void)
+{
+    lg_reset();
+    {
+        defer lg("<");
+        defer lg("0");
+        defer lg("1");
+        defer lg("2");
+        defer lg("3");
+        defer lg("4");
+        defer lg("5");
+        defer lg("6");
+        defer lg("7");
+        defer lg("8");
+        defer lg("9");
+        defer lg("a");
+        defer lg("b");
+        defer lg("c");
+        defer lg("d");
+        defer lg("e");
+        defer lg("f");
+        defer lg("g");
+        defer lg("h");
+        defer lg("i");
+        defer lg("j");
+        defer lg("k");
+        defer lg("l");
+        defer lg("m");
+        defer lg("n");
+        defer lg("o");
+        defer lg("p");
+        defer lg("q");
+        defer lg("r");
+        defer lg("s");
+        defer lg("t");
+        defer lg("u");
+        defer lg("v");
+        defer lg("w");
+        defer lg("x");
+        defer lg("y");
+        defer lg("z");
+        defer lg("A");
+        defer lg("B");
+        defer lg(">");
+        lg("!");
+    }
+}
+
+test "同一作用域 40 个清理点按逆序执行" {
+    many_sites();
+    if (!LG_IS("!>BAzyxwvutsrqponmlkjihgfedcba9876543210<"))
+        err(1, "40 个清理点没有按逆序执行");
+}

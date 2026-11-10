@@ -57,8 +57,8 @@ typedef struct C99ThCtx {
 } C99ThCtx;
 
 
-/* A thread started by 'go'.  It is always joined by the thread that started
-   it, and it may also be handed out as a handle ('thread h = go f(x);'), so
+/* A thread started by 'spawn'.  It is always joined by the thread that started
+   it, and it may also be handed out as a handle ('thread h = spawn f(x);'), so
    the record is reference counted: the starter's child list owns one
    reference, the handle owns another. */
 struct C99ThRec {
@@ -98,7 +98,7 @@ C99_RT_UNUSED __c99_rt_linkage void *__c99_alloc(unsigned long size)
 C99_RT_UNUSED __c99_rt_linkage void __c99_co_free(C99CoPool *co);
 C99_RT_UNUSED __c99_rt_linkage void __c99_gc_free_all(C99ThCtx *th);
 
-/* Join every thread this thread started.  A 'go' statement has no place
+/* Join every thread this thread started.  A 'spawn' statement has no place
    where it could be joined, so the starter reaps its threads when it exits;
    the main thread does it from exit(), early enough that -run can still tear
    the JIT memory down afterwards. */
@@ -167,7 +167,7 @@ C99_RT_UNUSED __c99_rt_linkage C99ThCtx *__c99_th(void)
 }
 #endif
 
-/* The argument block of one 'go f(a);'.  The thread that runs the call
+/* The argument block of one 'spawn f(a);'.  The thread that runs the call
    releases it, so a failed start releases it here. */
 C99_RT_UNUSED __c99_rt_linkage void *__tcc_sp_args(unsigned long size)
 {
@@ -195,7 +195,7 @@ C99_RT_UNUSED __c99_rt_linkage void *__c99_th_tramp(void *p)
 }
 
 /* __tcc_th_spawn(&trampoline, block): run the trampoline on a new thread and
-   return the handle ('thread h = go f(x);').  Two references: one for this
+   return the handle ('thread h = spawn f(x);').  Two references: one for this
    thread's child list, one for the caller.  Returns 0 on failure. */
 C99_RT_UNUSED __c99_rt_linkage void *__tcc_th_spawn(void *(*fn)(void *),
                                                    void *arg)
@@ -235,7 +235,7 @@ C99_RT_UNUSED __c99_rt_linkage void __c6_th_release(C99ThRec *r)
     __c99_th_rec_unref(r);
 }
 
-/* __tcc_th_start(&trampoline, block): the 'go' statement, which keeps no
+/* __tcc_th_start(&trampoline, block): the 'spawn' statement, which keeps no
    handle.  Returns 0 when the thread was started. */
 C99_RT_UNUSED __c99_rt_linkage int __tcc_th_start(void *(*fn)(void *),
                                                   void *arg)
@@ -281,7 +281,7 @@ C99_RT_UNUSED __c99_rt_linkage long long __c6_thread_value(C99ThRec *r)
     return r ? (long long)r->ret : 0;
 }
 
-/* Wait for the threads this thread started.  A 'go' statement has no place
+/* Wait for the threads this thread started.  A 'spawn' statement has no place
    where it could be joined, so the compiler calls this at the end of main
    and the test runner calls it when the tests are done; a thread that was
    started by another threads is joined when that thread exits.  Doing it from

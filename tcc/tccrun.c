@@ -250,7 +250,7 @@ static int tcc_run_tests(TCCState *s1)
         }
         fflush(stdout);
     }
-    /* the threads a test started by 'go' must be gone before tcc_run()
+    /* the threads a test started by 'spawn' must be gone before tcc_run()
        releases the code they run */
     if (th_join)
         th_join();

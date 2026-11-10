@@ -1,0 +1,93 @@
+/* 完全没有操作系统的样子：c6 运行时一个外部符号都不需要
+ *
+ *   make fstest-noos
+ *
+ * 这个程序里没有一个 syscall：不写文件、不退出、不申请内存。字符串插值、
+ * 格式说明、defer、err + catch、@T、托管缓冲全在内存里做完，结果靠最后
+ * 一个“异常”报出来：
+ *
+ *   全部断言通过 -> ud2（SIGILL，退出码 132）
+ *   有断言失败   -> 往 0 地址写（SIGSEGV，退出码 139，等于失败的位掩码）
+ *
+ * 这两种“报信方式”就是裸机上你的向量表 / 异常处理要接管的地方：换成点灯、
+ * 串口输出一行，或者停在那儿等看门狗，都行。它想说明的是——运行时本身不需要
+ * 操作系统：
+ *
+ *   nm -u libtcc1.o  只剩 calloc / free / realloc / select 和 pthread_*，
+ *   而且全是 weak（等于“可以一个都没有”）：
+ *     - 没有 calloc  -> 用 libtcc1 里的静态 arena（.bss，默认 256 KB，
+ *                       编译 libtcc1 时 -DC6_HEAP_SIZE=... 可调）；
+ *     - 没有 select  -> 只有 async / c6_io 会用到它，别的照常；
+ *     - 没有 pthread -> 单线程，一个静态的状态块，spawn / thread 报启动失败；
+ *     - memcpy / memset / memmove 由 libtcc1 自带的 weak 定义顶上。
+ *
+ * 真裸机上还需要的只有“程序自己要做的事”：把 f".." 的结果送到串口/LCD（那就是
+ * 例子 freestanding_fstr.c 里 fs_write 那一行，换成写 MMIO 寄存器即可），以及
+ * 编译器得在别的地方把这块映像编出来（tcc 在 host 上跑，产出的静态 ELF 交给
+ * 引导程序/烧写工具）。
+ */
+struct Pair {
+    int v;
+};
+
+/* ---- 小工具 ---------------------------------------------------------- */
+
+static int eq(const char *a, const char *b)
+{
+    unsigned long i = 0;
+
+    for (i = 0; a[i] || b[i]; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+int!error half(int n)
+{
+    if (n < 0)
+        err(9, f"negative {n}");
+    return n / 2;
+}
+
+/* ---- 全部在内存里做完 ------------------------------------------------ */
+
+void _start(void)
+{
+    int bad = 0, n = 7, got = 0;
+    double d = 2.5;
+    char[:] s = "abc";
+    @Pair p = new Pair;                 /* 用标签本身，别写 'new struct Pair'
+                                           —— 那条路目前会崩，见 README */
+
+    p->v = n;
+    bad |= eq(f"{n;04x}", "0007") ? 0 : 1;          /* 格式说明 */
+    bad |= eq(f"{d;.1f}", "2.5") ? 0 : 2;           /* 浮点 */
+    bad |= eq(f"{s}", "abc") ? 0 : 4;               /* 字符切片 */
+    bad |= eq(f"{p->v;5}", "    7") ? 0 : 8;        /* 托管对象成员 */
+    bad |= eq(@f"{n}+{s}", "7+abc") ? 0 : 16;       /* 托管缓冲 */
+    {
+        int h = half(10) catch e { bad |= 32; goto half_done; };
+        bad |= h == 5 ? 0 : 32;                     /* 没出错 */
+    half_done:
+        ;
+    }
+
+    {
+        int v = half(-4) catch e { got = e.id; goto caught; };
+        bad |= 64;                                  /* 不该走到这里 */
+    caught:
+        bad |= got == 9 ? 0 : 128;
+        (void)v;
+    }
+
+    defer {                                         /* defer 一样能用 */
+        bad |= 0;
+    }
+
+    /* 唯一的“平台”动作：正常就用 ud2，失败就踩空 */
+    if (bad)
+        *(volatile int *)0 = bad;
+    __asm__ __volatile__("ud2");
+    for (;;)
+        ;
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""给一个 tests/*.c 生成裸机的测试入口。
+"""给一个 tests/*.c6 生成裸机的测试入口。
 
-tests/*.c 里的 `test "描述" { ... }` 会被编译成 `int __tcc_test_<i>(void)`，但
+tests/*.c6 里的 `test "描述" { ... }` 会被编译成 `int __tcc_test_<i>(void)`，但
 "有哪几个、什么顺序、叫什么名字"只存在编译器的状态里（tccrun.c 的 -test 用
 的是那张表），链接出来的二进制里没有。所以这里按源码里的出现顺序把它们扫出来，
 生成一张表和一个 `_start`，行为对着 tccrun 的 harness：
@@ -11,8 +11,8 @@ tests/*.c 里的 `test "描述" { ... }` 会被编译成 `int __tcc_test_<i>(voi
     __tcc_err_msg_get() 失败了拿 err() 的消息
     最后打印 "N test(s), M failure(s)"，用 boot_exit(失败数 ? 1 : 0) 收尾
 
-    harness.py build/harness_fstr.c tests/fstr.c
-    harness.py build/harness_module.c tests/module.c tests/tu/module.c
+    harness.py build/harness_fstr.c tests/fstr.c6
+    harness.py build/harness_module.c tests/module.c6 tests/tu/module.c6
 
 个别 test 块要的东西裸机上真没有（例：线程的 `h->join()` / `h->value()` 走
 libtcc1 的每线程块，收尾会三重故障），这种块只要在 `test` 上一行写
@@ -20,7 +20,7 @@ libtcc1 的每线程块，收尾会三重故障），这种块只要在 `test` �
     // BARE-SKIP
 
 就从裸机的表里去掉：块号不变（还是 `__tcc_test_<n>`，只是没人调它），同一
-个文件里剩下的块照跑 —— 见 tests/generic_fn.c。
+个文件里剩下的块照跑 —— 见 tests/generic_fn.c6。
 """
 import re
 import sys
@@ -101,7 +101,7 @@ def main():
             printf("PASS: %s\\n", __c6_test_tbl[i].desc);
         }
     }
-    /* go 起的线程必须先收干净，运行时代码才会被释放 */
+    /* spawn 起的线程必须先收干净，运行时代码才会被释放 */
     __c6_th_join_all();
     printf("%d test(s), %d failure(s)\\n", n, nfail);
     boot_exit(nfail ? 1 : 0);

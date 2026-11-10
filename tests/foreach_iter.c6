@@ -1,0 +1,488 @@
+/* c6 自测：'foreach |v| it { ... }' 迭代器协议
+ *
+ * 可迭代对象是“提供了 has()/next() 的东西”：
+ *   - 结构体/联合体的值               （状态复制到隐藏槽）
+ *   - 指向结构体/联合体的指针         （状态就在原对象里）
+ *   - 接口值（vtable 里有 has/next）  （self 仍指向原对象）
+ * has() 返回整数（非零继续），next() 返回元素类型；元素类型完全由
+ * next() 的声明返回类型静态确定，不做装箱、不做类型擦除。
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -test tests/foreach_iter.c6
+ * 或直接：
+ *   make selftest
+ */
+#include <stdio.h>
+#include <string.h>
+
+/* ---- 值形态 ---- */
+
+struct Countdown { int n; };
+
+int has(struct Countdown *s)
+{
+    return s->n > 0;
+}
+
+int next(struct Countdown *s)
+{
+    return s->n--;
+}
+
+/* ---- 指针形态：next() 返回 char * ---- */
+
+struct Words { char **p; int i, n; };
+
+int has(struct Words *s)
+{
+    return s->i < s->n;
+}
+
+char *next(struct Words *s)
+{
+    return s->p[s->i++];
+}
+
+/* ---- 元素是结构体 ---- */
+
+struct Pair { int a, b; };
+struct Pairs { int i; };
+
+int has(struct Pairs *s)
+{
+    return s->i < 2;
+}
+
+struct Pair next(struct Pairs *s)
+{
+    struct Pair p = {0};
+    p.a = s->i;
+    p.b = s->i + 1;
+    s->i++;
+    return p;
+}
+
+/* ---- 接口值：vtable 分派 ---- */
+
+interface IntIter {
+    int has();
+    int next();
+}
+
+struct Steps { int n; };
+
+int has(struct Steps *s)
+{
+    return s->n > 0;
+}
+
+int next(struct Steps *s)
+{
+    return s->n--;
+}
+
+static int sum_iter(IntIter it)
+{
+    int total = 0;
+    foreach |v| it {
+        total += v;
+    }
+    return total;
+}
+
+/* ---- 只求值一次 ---- */
+
+static int calls = 0;
+
+static struct Countdown make(int n)
+{
+    struct Countdown c = {0};
+    c.n = n;
+    calls++;
+    return c;
+}
+
+/* ---- 无限迭代器 ---- */
+
+struct Naturals { int n; };
+
+int has(struct Naturals *s)
+{
+    (void)s;
+    return 1;
+}
+
+int next(struct Naturals *s)
+{
+    return ++s->n;
+}
+
+/* ---- 丢弃绑定也要推进 ---- */
+
+struct Ticks { int n; };
+
+int has(struct Ticks *s)
+{
+    return s->n > 0;
+}
+
+int next(struct Ticks *s)
+{
+    return s->n--;
+}
+
+/* ---- union：和 struct 同一条协议路径 ---- */
+
+union UCount { int n; };
+
+int has(union UCount *s)
+{
+    return s->n > 0;
+}
+
+int next(union UCount *s)
+{
+    return s->n--;
+}
+
+/* ---- 跨 TU：方法定义放在 tests/tu/foreach_iter.c6 ---- */
+
+struct CrossIt { int n; };
+int has(struct CrossIt *s);
+int next(struct CrossIt *s);
+
+/* ---- 托管引用：隐藏槽要像声明的局部量一样初始化并释放 ---- */
+
+struct MNode { int v; };
+struct MIt { int i; };
+
+int has(struct MIt *s)
+{
+    return s->i < 2;
+}
+
+@MNode next(struct MIt *s)
+{
+    @MNode p = new MNode;
+    p->v = s->i++;
+    return p;
+}
+
+struct MCount { int n; };
+
+int has(struct MCount *s)
+{
+    return s->n > 0;
+}
+
+int next(struct MCount *s)
+{
+    return s->n--;
+}
+
+static int sum_borrow(@MCount p)
+{
+    int total = 0;
+    foreach |v| p {
+        total += v;
+    }
+    return total;
+}
+
+@MCount make_mcount(int n)
+{
+    @MCount p = new MCount;
+    p->n = n;
+    return p;
+}
+
+/* ---- await 跨挂起 ---- */
+
+async int add(int a, int b)
+{
+    return a + b;
+}
+
+async int sum_await(int n)
+{
+    struct Countdown c = {0};
+    int total = 0;
+    c.n = n;
+    foreach |v| c {
+        total += await add(v, 0);
+    }
+    return total;
+}
+
+/* ---- 测试块 ---- */
+
+test "值形态：从 n 倒数到 1，原对象保持副本语义" {
+    struct Countdown c = {3};
+    int total = 0, n = 0;
+    foreach |v| c {
+        if (v != 3 - n)
+            err(1, "迭代值不对");
+        total += v;
+        n++;
+    }
+    if (n != 3 || total != 6)
+        err(2, "迭代次数/和不对");
+    if (c.n != 3)
+        err(3, "值形态不应推进原对象");
+}
+
+test "数组的元素类型本身是迭代器时，仍按数组迭代" {
+    struct Countdown cs[2] = {{1}, {2}};
+    int total = 0;
+    foreach |i, v| cs {
+        total += v.n * (int)(i + 1);
+    }
+    if (total != 5)
+        err(1, "数组被误判成迭代器");
+}
+
+test "指针形态：迭代器状态就在原对象里" {
+    struct Countdown c = {3};
+    int total = 0;
+    foreach |v| &c {
+        total += v;
+    }
+    if (total != 6)
+        err(1, "求和不对");
+    if (c.n != 0)
+        err(2, "指针形态应推进原对象");
+}
+
+test "接口值：vtable 分派，self 指向原对象" {
+    struct Countdown c = {4};
+    struct Steps s = {2};
+    if (sum_iter(c) != 10)
+        err(1, "Countdown 的接口分派不对");
+    if (sum_iter(s) != 3)
+        err(2, "Steps 的接口分派不对");
+    if (c.n != 0 || s.n != 0)
+        err(3, "接口形态应推进原对象");
+}
+
+test "元素是结构体：绑定是 next() 返回值的副本" {
+    struct Pairs ps = {0};
+    int n = 0;
+    foreach |p| ps {
+        if (p.a != n || p.b != n + 1)
+            err(1, "结构体元素的值不对");
+        p.a = 99;
+        n++;
+    }
+    if (n != 2)
+        err(2, "迭代次数不对");
+    if (ps.i != 0)
+        err(3, "值形态的迭代器状态应是隐藏槽里的副本");
+}
+
+test "元素是指针：绑定就是 next() 的返回值" {
+    char *w[3] = { "aa", "bb", "cc" };
+    struct Words ws = {0};
+    int n = 0;
+    ws.p = w;
+    ws.i = 0;
+    ws.n = 3;
+    foreach |s| ws {
+        if (strcmp(s, w[n]) != 0)
+            err(1, "指针元素不对");
+        n++;
+    }
+    if (n != 3)
+        err(2, "迭代次数不对");
+}
+
+test "'_' 绑定仍然推进迭代器" {
+    struct Ticks t = {3};
+    int n = 0;
+    foreach |_| t {
+        n++;
+    }
+    if (n != 3 || t.n != 3)
+        err(1, "'_' 没有按副本语义迭代三次");
+}
+
+test "托管元素：值绑定与 '_' 都不泄漏" {
+    struct MIt it = {0};
+    int total = 0;
+    foreach |v| it {
+        total += v->v;
+    }
+    if (total != 1)
+        err(1, "托管元素的值不对");
+    if (__c6_gc_live() != 0)
+        err(2, "值绑定泄漏了托管对象");
+    it.i = 0;
+    foreach |_| it {
+    }
+    if (__c6_gc_live() != 0)
+        err(3, "'_' 绑定泄漏了 next() 的返回值");
+}
+
+test "托管迭代器：own 与 borrow 的隐藏槽" {
+    @MCount p = new MCount;
+    int total = 0;
+    p->n = 3;
+    foreach |v| p {
+        total += v;
+    }
+    if (total != 6 || p->n != 0)
+        err(1, "own 迭代器不对");
+    p->n = 3;
+    if (sum_borrow(p) != 6 || p->n != 0)
+        err(2, "borrow 迭代器不对");
+    p = 0;
+    if (__c6_gc_live() != 0)
+        err(3, "托管迭代器隐藏槽泄漏了");
+}
+
+test "托管临时迭代器：隐藏槽接管所有权" {
+    int total = 0;
+    foreach |v| make_mcount(2) {
+        total += v;
+    }
+    if (total != 3)
+        err(1, "临时迭代器的值不对");
+    if (__c6_gc_live() != 0)
+        err(2, "临时迭代器的隐藏槽泄漏了");
+}
+
+test "数组的托管元素绑定也不泄漏" {
+    @MNode a[2] = {0};
+    int total = 0;
+    a[0] = new MNode;
+    a[1] = new MNode;
+    a[0]->v = 0;
+    a[1]->v = 1;
+    foreach |i, v| a {
+        total += v->v + (int)i;
+    }
+    if (total != 2)
+        err(1, "托管数组元素的值不对");
+    a[0] = 0;
+    a[1] = 0;
+    if (__c6_gc_live() != 0)
+        err(2, "数组的托管元素绑定泄漏了");
+}
+
+test "union 迭代器：值形态与指针形态" {
+    union UCount u = {3};
+    int total = 0;
+    foreach |v| u {
+        total += v;
+    }
+    if (total != 6 || u.n != 3)
+        err(1, "union 值形态不对");
+    total = 0;
+    foreach |v| &u {
+        total += v;
+    }
+    if (total != 6 || u.n != 0)
+        err(2, "union 指针形态不对");
+}
+
+test "跨 TU 的 has()/next() 原型" {
+    struct CrossIt c = {3};
+    int total = 0;
+    foreach |v| &c {
+        total += v;
+    }
+    if (total != 6 || c.n != 0)
+        err(1, "跨 TU 方法调用不对");
+}
+
+test "可迭代值只求值一次" {
+    int total = 0;
+    calls = 0;
+    foreach |v| make(2) {
+        total += v;
+    }
+    if (calls != 1)
+        err(1, "可迭代值被求值了不止一次");
+    if (total != 3)
+        err(2, "求和不对");
+}
+
+test "has() 首次为假：零次迭代" {
+    struct Countdown c = {0};
+    int n = 0;
+    foreach |v| c {
+        n += v;
+    }
+    if (n != 0)
+        err(1, "空迭代器不应进入循环体");
+}
+
+test "无限迭代器 + break" {
+    struct Naturals nat = {0};
+    int total = 0;
+    foreach |v| &nat {
+        total += v;
+        if (v >= 5)
+            break;
+    }
+    if (total != 1 + 2 + 3 + 4 + 5)
+        err(1, "break 之前的和不对");
+    if (nat.n != 5)
+        err(2, "指针形态应推进原对象");
+}
+
+test "continue 回到 has() 判断" {
+    struct Countdown c = {5};
+    int total = 0;
+    foreach |v| c {
+        if (v & 1)
+            continue;
+        total += v;
+    }
+    if (total != 4 + 2)
+        err(1, "continue 之后的迭代不对");
+}
+
+test "defer 与 for 一致" {
+    struct Countdown c = {3};
+    int count = 0;
+    foreach |v| c {
+        (void)v;
+        defer count++;
+    }
+    if (count != 3)
+        err(1, "defer 次数不对");
+}
+
+test "绑定不泄漏到外层" {
+    int v = 7;
+    struct Countdown c = {1};
+    foreach |v| c {
+        if (v != 1)
+            err(1, "绑定值不对");
+    }
+    if (v != 7)
+        err(2, "绑定泄漏到了外层");
+}
+
+test "嵌套：迭代器里套迭代器" {
+    struct Countdown outer = {2};
+    int total = 0;
+    foreach |x| outer {
+        struct Countdown inner = {0};
+        inner.n = x;
+        foreach |y| inner {
+            total += y;
+        }
+    }
+    if (total != (2 + 1) + 1)
+        err(1, "嵌套迭代不对");
+}
+
+test "隐藏槽跨 await 挂起仍然有效" {
+    struct sum_await_task *t = sum_await(4);
+    if (__c6_co_wait(t) != 0)
+        err(1, "驱动失败");
+    if (t->val != 10)
+        err(2, "挂起恢复后的求和不对");
+    __c6_co_destroy(t);
+}

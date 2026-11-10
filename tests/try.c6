@@ -1,0 +1,442 @@
+/* c6 自测：try / catch 的错误传播、错误槽与处理块语义
+ *
+ * 全部检查都是对返回值、错误码、错误消息的直接断言，不比较 stdout。
+ *
+ * 运行（仓库根目录）：
+ *   ./tcc/tcc -B tcc -test tests/try.c6
+ * 只跑其中一部分：
+ *   ./tcc/tcc -B tcc -test -test-filter=catch tests/try.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+/* libtcc1 提供的错误槽接口 */
+int __tcc_err_flag_get(void);
+int __tcc_err_id_get(void);
+void __tcc_err_clear(void);
+
+/* ---- 日志缓冲：记录 try/catch 之后的执行痕迹 ---- */
+static char logbuf[128] = {0};
+static int loglen = 0;
+
+static void lg_reset(void)
+{
+    loglen = 0;
+    logbuf[0] = '\0';
+}
+
+static void lg(const char *s)
+{
+    int n = strlen(s);
+    if (loglen + n < (int)sizeof(logbuf) - 1) {
+        memcpy(logbuf + loglen, s, n + 1);
+        loglen += n;
+    }
+}
+
+#define LG_IS(s) (0 == strcmp(logbuf, (s)))
+
+/* ---- 最近一次 catch 捕获到的内容（替代旧测试里 printf 出来的值） ---- */
+static int last_id = 0;
+static char last_msg[64] = {0};
+static int slot_flag = -1;   /* catch 处理块执行时错误槽的 flag */
+static int slot_id = -1;     /* catch 处理块执行时错误槽的 id */
+
+static void note_err(int id, const char *msg)
+{
+    int i = 0;
+
+    last_id = id;
+    if (msg) {
+        while (msg[i] && i < (int)sizeof(last_msg) - 1) {
+            last_msg[i] = msg[i];
+            i++;
+        }
+    }
+    last_msg[i] = '\0';
+}
+
+/* ---- 163_c6_try.c 里的 T!error 辅助函数 ---- */
+
+/* 会失败（T!error）的函数：err() 等价于带错误码的 return */
+static int!error fetch(int n)
+{
+    if (n < 0)
+        err(100, "negative");
+    if (n == 0)
+        err(101, "zero");
+    return n * 10;
+}
+
+/* 标记也可以写在声明符之后；原型上的 !error 同样作用于后面的定义 */
+static int fetch2(int n)!error;
+
+static int fetch2(int n)
+{
+    if (n > 99)
+        err(102, "too big");
+    return n + 1;
+}
+
+/* 没有返回值的 T!error 函数 */
+static void!error check(int n)
+{
+    if (n != 0)
+        err(200, "check failed");
+}
+
+/* 1) 成功路径原样传出返回值，失败路径把错误原样传给调用者 */
+static int!error propagates(int n)
+{
+    int v = (try fetch(n));
+    lg("A");
+    return v + 1;
+}
+
+static int call_propagates(int n)
+{
+    int v = propagates(n) catch e {
+        note_err(e.id, e.msg);
+        return -1;
+    };
+    return v;
+}
+
+/* 2) catch 先快照错误，再清空错误槽 */
+static int catches(int n)
+{
+    int v = fetch(n) catch e {
+        note_err(e.id, e.msg);
+        slot_flag = __tcc_err_flag_get();
+        slot_id = __tcc_err_id_get();
+        return -1000 + e.id;
+    };
+    return v;
+}
+
+/* 3) 处理块可以省略变量，也可以加括号，还可以用 goto 离开 */
+static int catches_plain(int n)
+{
+    int v = fetch(n) catch {
+        slot_flag = __tcc_err_flag_get();
+        return -2;
+    };
+    return v;
+}
+
+static int catches_paren(int n)
+{
+    int v = fetch(n) catch (e) {
+        note_err(e.id, e.msg);
+        return -3;
+    };
+    return v;
+}
+
+static int catches_goto(int n)
+{
+    int v = fetch(n) catch e {
+        note_err(e.id, e.msg);
+        goto failed;
+    };
+    return v;
+failed:
+    return -4;
+}
+
+/* 5) void 函数上的 try / catch */
+static void!error void_try(int n)
+{
+    try check(n);
+    lg("V");
+}
+
+static int use_void(int n)
+{
+    void_try(n) catch e {
+        note_err(e.id, e.msg);
+        return -5;
+    };
+    lg("W");
+    return 0;
+}
+
+/* 6) 循环里的 try：某一次失败就中止整个函数 */
+static int!error loop(int n)
+{
+    int i = 0, sum = 0;
+
+    for (i = 0; i < n; i++) {
+        if (i == 3)
+            err(300, "loop");
+        sum += (try fetch(i + 1));
+    }
+    return sum;
+}
+
+static int call_loop(int n)
+{
+    int v = loop(n) catch e {
+        note_err(e.id, e.msg);
+        return -6;
+    };
+    return v;
+}
+
+/* 7) 嵌套 try：哪个调用先失败，就按原样传出哪个错误 */
+static int!error nested(int n)
+{
+    return (try fetch(n)) + (try fetch2(n));
+}
+
+static int call_nested(int n)
+{
+    int v = nested(n) catch e {
+        note_err(e.id, e.msg);
+        return -7;
+    };
+    return v;
+}
+
+/* ---- 被测函数 ---- */
+
+static int!error tfail(int n)
+{
+    if (n > 0)
+        err(n, "tfail");
+    return n * 100;
+}
+
+static int!error tprop(int n)
+{
+    int v = (try tfail(n));
+    return v + 1;
+}
+
+static int!error tdeep(int n)
+{
+    return (try tprop(n)) + 1000;
+}
+
+static void!error tcheck(int n)
+{
+    if (n)
+        err(n, "tcheck");
+}
+
+static int!error tdefer(int n)
+{
+    defer lg("D");
+    if (n)
+        err(n, "tdefer");
+    return n;
+}
+
+/* ==== 单点语义断言 ==== */
+
+test "try 在成功路径上原样传出返回值" {
+    __tcc_err_clear();
+    lg_reset();
+    if ((try tfail(0)) != 0) err(1, "try 的返回值不对");
+    if ((try tprop(0)) != 1) err(2, "try 没有把返回值传出去");
+    if (__tcc_err_flag_get()) err(3, "成功路径不应置错误标记");
+}
+
+test "try 在失败路径上把错误原样传回调用者" {
+    __tcc_err_clear();
+    tprop(5) catch e {
+        if (e.id != 5) err(1, "错误码没有原样传回");
+        if (strcmp(e.msg, "tfail")) err(2, "错误消息没有原样传回");
+        return 0;
+    };
+    err(3, "没有进入错误路径");
+}
+
+test "try 可以把错误穿过多层调用传回来" {
+    __tcc_err_clear();
+    if ((try tdeep(0)) != 1001) err(1, "正常路径的返回值不对");
+    tdeep(6) catch e {
+        if (e.id != 6) err(2, "多层传播之后错误码不对");
+        return 0;
+    };
+    err(3, "多层调用没有进入错误路径");
+}
+
+test "try 支持无返回值的 T!error 函数" {
+    __tcc_err_clear();
+    try tcheck(0);
+    if (__tcc_err_flag_get()) err(1, "成功路径不应置错误标记");
+    tcheck(4) catch e {
+        if (e.id != 4) err(1, "catch 拿到的 id 不对");
+        return 0;
+    };
+    err(2, "catch 没有被执行");
+}
+
+test "catch 拿到 err(id,msg) 的值并自动清空错误槽" {
+    __tcc_err_clear();
+    tfail(7) catch e {
+        if (e.id != 7) err(1, "catch 拿到的 id 不对");
+        if (strcmp(e.msg, "tfail")) err(2, "catch 拿到的 msg 不对");
+        if (__tcc_err_flag_get()) err(3, "catch 之后错误槽没有清空");
+        if (__tcc_err_id_get()) err(4, "catch 之后错误码没有清空");
+        return 0;
+    };
+    err(5, "catch 没有被执行");
+}
+
+test "catch 可以省略变量，也可以加括号" {
+    __tcc_err_clear();
+    tfail(3) catch {
+        if (__tcc_err_flag_get()) err(1, "catch 之后错误槽没有清空");
+        return 0;
+    };
+    err(2, "不带变量的 catch 没有被执行");
+}
+
+test "catch 可以写成 catch (e) 形式" {
+    __tcc_err_clear();
+    tfail(2) catch (e) {
+        if (e.id != 2) err(1, "catch 拿到的 id 不对");
+        return 0;
+    };
+    err(2, "catch (e) 没有被执行");
+}
+
+test "catch 可以用 goto 离开处理块" {
+    int ok = 0;
+
+    __tcc_err_clear();
+    tfail(9) catch e {
+        if (e.id != 9) err(1, "catch 拿到的 id 不对");
+        goto done;
+    };
+    err(2, "catch 没有被执行");
+done:
+    ok = 1;
+    if (!ok) err(3, "goto 没有跳到标签");
+    __tcc_err_clear();
+}
+
+test "catch 之后错误槽干净，后续 err 不会被旧值干扰" {
+    __tcc_err_clear();
+    tfail(11) catch e {
+        if (e.id != 11) err(1, "catch 拿到的 id 不对");
+        return 0;
+    };
+    err(2, "catch 没有被执行");
+}
+
+test "T!error 函数里的 defer 在错误路径上照样执行" {
+    __tcc_err_clear();
+    lg_reset();
+    try tdefer(0);
+    if (!LG_IS("D")) err(1, "正常路径没有执行 defer");
+    lg_reset();
+    tdefer(8) catch e {
+        if (!LG_IS("D")) err(1, "错误路径没有执行 defer");
+        if (e.id != 8) err(2, "catch 拿到的 id 不对");
+        return 0;
+    };
+    err(3, "catch 没有被执行");
+}
+
+/* ==== 163_c6_try.c：原 .expect 的 29 行逐项覆盖 ==== */
+
+/* 对应 1 ok=21 log=A / propagates(-1) caught 100/negative / 1 err=-1 / 1 flag=0 */
+test "try 传出成功路径的返回值并执行后续语句" {
+    __tcc_err_clear();
+    lg_reset();
+    if (call_propagates(2) != 21) err(1, "成功路径返回值不是 21");
+    if (!LG_IS("A")) err(2, "try 成功后没有继续执行后续语句");
+
+    if (call_propagates(-1) != -1) err(3, "错误路径返回值不是 -1");
+    if (last_id != 100) err(4, "catch 拿到的错误码不是 100");
+    if (strcmp(last_msg, "negative")) err(5, "catch 拿到的错误消息不是 negative");
+    if (__tcc_err_flag_get()) err(6, "catch 之后错误槽没有清空");
+}
+
+/* 对应 2 ok=30 log= / caught 101 zero / slot-in-handler flag=0 id=0 / 2 err=-899 / 2 flag=0 */
+test "catch 快照错误码与消息，处理块内错误槽已清空" {
+    __tcc_err_clear();
+    lg_reset();
+    if (catches(3) != 30) err(1, "成功路径返回值不是 30");
+    if (!LG_IS("")) err(2, "成功路径不应产生日志");
+
+    slot_flag = -1;
+    slot_id = -1;
+    if (catches(0) != -899) err(3, "失败路径返回值不是 -899");
+    if (last_id != 101) err(4, "catch 拿到的错误码不是 101");
+    if (strcmp(last_msg, "zero")) err(5, "catch 拿到的错误消息不是 zero");
+    if (slot_flag != 0) err(6, "处理块里看到的 flag 不是 0");
+    if (slot_id != 0) err(7, "处理块里看到的 id 不是 0");
+    if (__tcc_err_flag_get()) err(8, "catch 之后错误槽没有清空");
+}
+
+/* 对应 plain handler, slot=0 / 3 plain-ok=10 plain-err=-2 /
+ * paren handler 101 / 3 paren-ok=10 plain-err=-3 / 3 goto-ok=10 goto-err=-4 */
+test "catch 可以省略变量、加括号或用 goto 离开" {
+    __tcc_err_clear();
+    if (catches_plain(1) != 10) err(1, "省略变量的成功路径返回值不是 10");
+    slot_flag = -1;
+    if (catches_plain(0) != -2) err(2, "省略变量的错误路径返回值不是 -2");
+    if (slot_flag != 0) err(3, "不带变量的处理块里 flag 不是 0");
+
+    if (catches_paren(1) != 10) err(4, "带括号的成功路径返回值不是 10");
+    if (catches_paren(0) != -3) err(5, "带括号的错误路径返回值不是 -3");
+    if (last_id != 101) err(6, "带括号的处理块没有拿到 id 101");
+
+    if (catches_goto(1) != 10) err(7, "goto 的成功路径返回值不是 10");
+    if (catches_goto(0) != -4) err(8, "goto 的错误路径返回值不是 -4");
+}
+
+/* 对应 5 ok=0 log=VW / void handler 200/check failed / 5 err=-5 */
+test "void!error 函数也能用 try 和 catch" {
+    __tcc_err_clear();
+    lg_reset();
+    if (use_void(0) != 0) err(1, "成功路径返回值不是 0");
+    if (!LG_IS("VW")) err(2, "成功路径没有执行 try 之后的语句");
+    if (use_void(1) != -5) err(3, "错误路径返回值不是 -5");
+    if (last_id != 200) err(4, "catch 拿到的错误码不是 200");
+    if (strcmp(last_msg, "check failed")) err(5, "catch 拿到的错误消息不对");
+}
+
+/* 对应 6 ok=60 log= / loop caught 300 / 6 err=-6 */
+test "循环里的 try 一旦失败就中止整个函数" {
+    __tcc_err_clear();
+    lg_reset();
+    if (call_loop(3) != 60) err(1, "正常路径的累加结果不是 60");
+    if (!LG_IS("")) err(2, "循环里的 try 不应产生日志");
+    if (call_loop(5) != -6) err(3, "错误路径返回值不是 -6");
+    if (last_id != 300) err(4, "catch 拿到的错误码不是 300");
+}
+
+/* 对应 nested caught 101/zero / 7 ok=12 err=-7 / nested caught 102/too big / 7 too-big=-7 */
+test "嵌套 try 传播最先发生的错误" {
+    __tcc_err_clear();
+    if (call_nested(1) != 12) err(1, "成功路径返回值不是 12");
+
+    if (call_nested(0) != -7) err(2, "第一个调用失败时返回值不是 -7");
+    if (last_id != 101) err(3, "fetch(0) 的错误码不是 101");
+    if (strcmp(last_msg, "zero")) err(4, "fetch(0) 的错误消息不是 zero");
+
+    if (call_nested(120) != -7) err(5, "第二个调用失败时返回值不是 -7");
+    if (last_id != 102) err(6, "fetch2(120) 的错误码不是 102");
+    if (strcmp(last_msg, "too big")) err(7, "fetch2(120) 的错误消息不是 too big");
+}
+
+/* 对应 8 proto-ok=31 / 8 small=5 / 8 flag=0 */
+test "声明符后的 !error 标记与原型一致" {
+    __tcc_err_clear();
+    if (call_propagates(3) != 31) err(1, "原型标记后的成功路径返回值不是 31");
+    if ((try fetch2(4)) != 5) err(2, "fetch2(4) 的返回值不是 5");
+    if (__tcc_err_flag_get()) err(3, "成功路径不应置错误标记");
+}
+
+/* 对应 9 flag=0 id=0 / final flag=0 */
+test "错误槽最终保持干净" {
+    if (__tcc_err_flag_get()) err(1, "最终 flag 不是 0");
+    if (__tcc_err_id_get()) err(2, "最终 id 不是 0");
+    __tcc_err_clear();
+    if (__tcc_err_flag_get()) err(3, "clear 之后 flag 不是 0");
+}

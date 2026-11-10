@@ -12,9 +12,9 @@
 1. 托管引用 `@T`：堆对象，引用计数，作用域退出或最后一个引用消失时确定性地释放。
 2. **编译期**识别引用环，并且是**硬错误**（不是告警）：类型图中的环必须由程序员显式
    用 `weak`（反向引用）或 `own`（独占链）表达，否则编译不过。
-3. 跨帧（`async`/`go`）和跨线程的所有权转移；原子计数由一个限定符显式选择。
+3. 跨帧（`async`/`spawn`）和跨线程的所有权转移；原子计数由一个限定符显式选择。
 4. 析构钩子 `drop` 方法（等价 C++ 析构函数 / Rust `Drop`）。
-5. 不改变 `-std=c6` 之外的任何行为；C99 后端（`-c99`）同样可用。
+5. 不改变 c6 之外的任何行为；C99 后端（`-c99`）同样可用。
 
 非目标（V1 明确不做）：
 
@@ -54,7 +54,7 @@ weak shared @T  跨线程的弱引用（弱槽失效也必须是原子/加锁的
 可以和 C 互操作（借出规则见 §5）。
 
 限定符是**软关键字**：按 `c6_soft_kw()`（`tcc/tccgen.c:13914`）的方式识别，
-被同名 typedef 遮蔽时退回普通标识符，和 `co`/`go`/`task` 一致。
+被同名 typedef 遮蔽时退回普通标识符，和 `co`/`spawn`/`task` 一致。
 
 ### 2.0 限定符存在哪里（P1 定稿，重要）
 
@@ -92,7 +92,7 @@ weak shared @T  跨线程的弱引用（弱槽失效也必须是原子/加锁的
 | 存进 `@T` 字段 | ✓ | ✗（字段必须是 `shared`） | ✓ | ✓（字段必须是 `own`） |
 | 传给普通函数形参 | 借出 | ✗（形参需 `shared @T`） | 只读 → 需先升级 | 借出 |
 | `return p` | 转移 | 转移 | ✗ | 转移 |
-| 进 `go` / `async` 帧 | ✗ 编译错误 | ✓（+1 进帧，−1 出帧） | ✗ | ✗ |
+| 进 `spawn` / `async` 帧 | ✗ 编译错误 | ✓（+1 进帧，−1 出帧） | ✗ | ✗ |
 | 解引用 `p->f` | ✓ | ✓ | ✗ 必须先升级 | ✓ |
 | `p == NULL` / `!p` | ✓ | ✓ | ✓ | ✓ |
 | 含它的对象做 `memcpy` | ✗ 报错 | ✗ 报错 | ✗ 报错 | ✗ 报错 |
@@ -305,11 +305,11 @@ void  __c6_gc_shutdown(void);                         /* 退出时释放全局�
 - 传给裸指针形参 → 警告 `-Wgc-borrow`（默认开，可 `-Werror`）；
   形参声明 `__attribute__((c6_borrow))` 时降级为静默（表示“被调者不会保存”）。
 
-**形参是借用（P5 定稿）**：托管形参的槽由调用者（`go`/`async` 时由实参块或
+**形参是借用（P5 定稿）**：托管形参的槽由调用者（`spawn`/`async` 时由实参块或
 任务前缀）拥有，被调者不计数、不释放。因此形参槽打上 `C6_GQ_BORROW`
 （只存在 `CType.gq` 缓存里，绝不上 pointee），`vstore()` 的钩子见到它就报
 E-GC14 —— 否则 `void f(@Node n) { n = NULL; }` 会把调用者的引用减掉，
-静默释放一个还活着的对象（`tests/errors/gc_borrow.c`）。要改写就先拷进
+静默释放一个还活着的对象（`tests/errors/gc_borrow.c6`）。要改写就先拷进
 自有局部：`@Node m = n;`（+1，退出时 −1）。
 
 按值规则：含托管字段的结构体不能按值拷贝、按值传参、按值返回、进 tuple、
@@ -347,7 +347,7 @@ new T;` 的 FRESH 值没有第二个所有者，存进普通指针就再也没�
 "哪些已经注册"是函数帧里的一块位图，"正在服务哪个请求"是两个 `int`
 （语义见 [grammar.md](grammar.md) 8.2）。于是 H3（记录栈满 8192 静默丢）自然
 消失——没有记录栈可满，上限变成一个编译期数字（一个函数 128 个清理点，超了
-直接报错）。这条也顺带让 `defer` 在 ISR、`go` 线程、递归帧里都不需要任何
+直接报错）。这条也顺带让 `defer` 在 ISR、`spawn` 线程、递归帧里都不需要任何
 线程级状态。
 
 ---
@@ -365,7 +365,7 @@ void drop(struct File *self) { close(self->fd); }   /* ← 名字叫 drop 的方
 
 - 调用时机：`rc` 减到 0、弱槽已失效之后，字段释放之前；
 - `self` 是**借用**（不 incref），保证在析构体内有效；
-- 析构体内**禁止**：`err`/`try`/`await`/`go`（正在释放，失败无处传播）；
+- 析构体内**禁止**：`err`/`try`/`await`/`spawn`（正在释放，失败无处传播）；
 - 析构体**不能复活**自己：`self` 是 borrow，存进任何托管槽都是 §5 的溯源错误，
   这条规则自动生效；
 - 析构方法**不能显式调用**（`p->drop()` / `drop(p)` → 错误）；提前释放用 `p = NULL`；
@@ -391,10 +391,10 @@ void drop(struct File *self) { close(self->fd); }   /* ← 名字叫 drop 的方
    `__attribute__((constructor))` / `__attribute__((destructor))` 函数：
    构造时 `__c6_gc_root(&g, kind, count, stride)` 把槽登记进运行时的表，
    析构时调用 `__c6_gc_shutdown()`（幂等）释放。`-run`、可执行文件、
-   c99 后端三条路都验证过（`tests/exit/drop_exit.c`）。
+   c99 后端三条路都验证过（`tests/exit/drop_exit.c6`）。
 5. **静态检查**：`int drop(...)` → `'drop' must return void: ...`；
    `void!error drop(...)` → `'drop' cannot fail ('!error'): ...`；
-   体内 `try`/`catch`/`go` → 各自报错（`err()` 本来就要求 `!error`，
+   体内 `try`/`catch`/`spawn` → 各自报错（`err()` 本来就要求 `!error`，
    所以顺带被第一条挡住）；显式调用 → `a destructor cannot be called: ...`。
    每个类型只能有一个析构；同一 TU 里写两遍会先被“重复定义”挡住。
 6. **不能复活自己**：`self` 是 `struct T *`（借用），`@T q = self;` 落在
@@ -486,7 +486,7 @@ error: reference cycle: A -b-> B -a-> A; break it with 'weak' or 'own'
 
 ---
 
-## 9. `async` / `go` 集成
+## 9. `async` / `spawn` 集成
 
 ### 9.1 帧住在任务里（P7/A3，已实现）
 
@@ -499,7 +499,7 @@ body（`int __c6_body_f(void *task, void *frame)`），后端把帧寄存器直�
 - 挂起**不拷贝任何东西**：`__c6_co_suspend` 只把错误槽存进任务——帧就在任务
   里，没有可搬的东西；
 - 帧的**绝对地址**在任务的一生里不变，`&local` 跨过 `await` 依旧有效
-  （`tests/async_frame.c` 用 `co` + `__c6_co_run()` 恢复来断言——那正是老模型
+  （`tests/async_frame.c6` 用 `co` + `__c6_co_run()` 恢复来断言——那正是老模型
   会搬帧的组合）；
 - 帧没有 4 KiB 上限，任务也没有固定池上限（每个任务一块，结束即释放）。
 
@@ -521,7 +521,7 @@ C99 输出后端。
 
 帧住在任务里之后，弱槽（它是指向槽本身的指针）在整个任务期间地址不变，
 所以 `weak` 局部、`weak` 形参、`weak` 返回值都可以出现在 `async` 函数里
-（`tests/async_frame.c` 覆盖这三种）。
+（`tests/async_frame.c6` 覆盖这三种）。
 
 ```c
 async int f(int fd, weak @Node param)   /* ✓ 形参 */
@@ -585,7 +585,7 @@ if (__c6_co_kind(task) == C6_CO_KIND_ABORT) {
 `t->wait()` / `t->start()` 之前根本没跑过，所以"回卷一个挂起的任务"要靠
 `t->start()`：它把 body 推进到第一个挂起点就返回，句柄还活着；作用域结束时
 `__c6_co_destroy()` 看到 `state != DONE` → `__c6_co_abort()` → body 从挂起点
-恢复一次，走上面那段清理派发器 → `finish(ABORT)`。`tests/async_frame.c` 的
+恢复一次，走上面那段清理派发器 → `finish(ABORT)`。`tests/async_frame.c6` 的
 "挂起的任务被销毁时回卷"就是这条路径（defer 跑了、托管引用计数回到基线）。
 
 这条路径原来还有一个坑：挂起时会把线程的 **defer 栈指针**和 context 栈指针
@@ -597,14 +597,14 @@ context 栈"而被**静默跳过**。现在 `defer` 的状态住在函数帧里�
 **预算（§11.4）**：已经是「每次释放最多 256 个」（`c6_gc_drain(th,
 C6_GC_DRAIN_BUDGET)` 在 `c6_gc_drop()` 里，`lib/libtcc1.c:1271`），
 级联释放跨多次释放摊平，不需要编译器在 `new`/作用域退出处再插调用；
-`__c6_gc_drain_budget(n)` 仍导出给想手工跑完队列的代码（`tests/gc_field.c`
+`__c6_gc_drain_budget(n)` 仍导出给想手工跑完队列的代码（`tests/gc_field.c6`
 的长链用例用它）。
 
 ### 9.4 所有权的跨帧/跨线程转移
 
-- `go f(args)`：实参块由 `__tcc_sp_args(size)` 分配、trampoline 调用后 `free`
+- `spawn f(args)`：实参块由 `__tcc_sp_args(size)` 分配、trampoline 调用后 `free`
   （`lib/libtcc1.c:789`/`800`）。托管实参进入块时 +1，块释放时 −1；
-  取消“`go` 边界不能带托管引用”的旧限制；
+  取消“`spawn` 边界不能带托管引用”的旧限制；
 - `await f(args)` / `task t = f(args)`：参数被拷进 `struct NAME_task` 前缀
   （`c6_async_call`，`tcc/tccgen.c` 内），+1 进任务；任务 slot 归还
   （`__c6_co_destroy`/池回收）时 −1；
@@ -613,7 +613,7 @@ C6_GC_DRAIN_BUDGET)` 在 `c6_gc_drop()` 里，`lib/libtcc1.c:1271`），
 
 **落地方式（P5）**：
 
-1. `go`：实参块的槽类型直接用声明类型（带限定符），`vstore()` 钩子 +1；
+1. `spawn`：实参块的槽类型直接用声明类型（带限定符），`vstore()` 钩子 +1；
    `c6_sp_emit()` 生成的 trampoline 在 `return 0` 之前对每个托管形参发
    `__c6_gc_release((void **)((char *)__c6_arg + ofs), mode)`，−1；
 2. `async`：`c6_async_call()` 把任务前缀槽的类型换成声明类型（+1）；
@@ -645,7 +645,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 
 - 计数之外的全局结构只有两个：弱槽注册表（冷路径，全局自旋锁）与全局根链表
   （登记全局根的一次性初始化用）；引用计数热路径上**没有锁**；
-- `-std=c6` 下 `parse_btype` 里 `__atomic_*` 已经可用（`parse_atomic`，
+- c6 的翻译单元里 `parse_btype` 的 `__atomic_*` 已经可用（`parse_atomic`，
   `tcc/tccgen.c:6265` 附近，经 helper 调用）；libtcc1.c 里需要自己
   `#define __ATOMIC_ACQ_REL 4`（tcc 不预定义，`lib/stdatomic.c` 也是这么做的）。
 
@@ -758,11 +758,11 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | E-GC6d | 新引用存进非托管槽 | error | `a new reference cannot be stored in '%s': it is not a managed reference (declare it as '@T')` |
 | E-GC7 | `memcpy`/`memmove` 作用于含引用的对象 | error | `... breaks reference counting; use a typed copy or 'own'` |
 | E-GC8 | 显式调用析构 `p->drop()` / `drop(p)` | error | `a destructor cannot be called: it runs when the last reference is released (use 'p = NULL')` |
-| E-GC9 | 析构里 `err`/`try`/`await`/`go` | error | `a destructor cannot fail: ...` / `a destructor cannot suspend: ...` |
+| E-GC9 | 析构里 `err`/`try`/`await`/`spawn` | error | `a destructor cannot fail: ...` / `a destructor cannot suspend: ...` |
 | E-GC9b | 析构返回值不是 `void` | error | `'drop' must return void: it runs while the object is being released, where a value has nowhere to go` |
 | E-GC9c | 析构声明成 `!error` | error | `'drop' cannot fail ('!error'): it runs while the object is being released, where an error has nowhere to go` |
 | E-GC9d | 一个类型两个析构 | error | `'%s' already has a destructor`（同一 TU 内通常先报 `redefinition of 'T_drop'`） |
-| E-GC10 | `@T` 跨线程/跨帧 | error | `passing a reference to 'go' requires 'shared'` / `passing a reference to 'async' requires 'shared'` |
+| E-GC10 | `@T` 跨线程/跨帧 | error | `passing a reference to 'spawn' requires 'shared'` / `passing a reference to 'async' requires 'shared'` |
 | E-GC11 | `memset` 含引用对象 | warning | 清零会漏引用 |
 | E-GC12 | 借出给未标注裸指针形参 | warning `-Wgc-borrow` | 可 `-Werror` |
 | E-GC13 | `own` 值被共享 | error | `an 'own' field takes ownership: assign a fresh value or 'move(...)'` |
@@ -785,7 +785,7 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
   只输出 C 源码、没有段的概念），只做单 TU 检查 —— 文档写明。`-c99` 输出走的是
   `c99_output_file()`，`.c6.gcgraph` 那套数据段在那里根本不会生成，所以检查
   什么也看不到；用例用 `// NATIVE-ONLY <片段>` 标注，`run-tests.sh` 在 c99 后端
-  跳过该片段（`tests/errors/gc_cycle_cross_tu.c` 就是这么标的）。
+  跳过该片段（`tests/errors/gc_cycle_cross_tu.c6` 就是这么标的）。
 
 ---
 
@@ -810,6 +810,6 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
    写成 `own` 树或 `weak` 边 —— 这是语言取舍，真要做得连运行期环回收一起想。
 
 返回托管引用时“每调用一次就多一个计数”的旧问题（本节原来的第 3 条）已经
-不存在：`c6_gc_return_hook()` 在返回点把一份引用交给调用者，`tests/gc.c` 的
-`return 把引用交给调用者` 与 `tests/gc_return.c`（新建对象 / 借字段 / 形参
+不存在：`c6_gc_return_hook()` 在返回点把一份引用交给调用者，`tests/gc.c6` 的
+`return 把引用交给调用者` 与 `tests/gc_return.c6`（新建对象 / 借字段 / 形参
 原样返回 / 循环多次调用）逐条断言计数会回到基线。

@@ -7,7 +7,7 @@
 
 相关：[grammar.md §3.10](grammar.md)（V1 语法与 C80–C83）、
 [gc-design.md](gc-design.md)（`@T` 的计数、描述符、环检测与跨线程规则）、
-`tests/fn_lit.c` / `tests/errors/fn_lit.c` / `tests/abi/fn_lit.c`。
+`tests/fn_lit.c6` / `tests/errors/fn_lit.c6` / `tests/abi/fn_lit.c6`。
 
 ---
 
@@ -20,7 +20,7 @@
 | D3 | 闭包对象是隐藏的 `@struct __c6_closure_<sig>`：`{ code, env }`；环境是另一个隐藏的 `@struct __c6_env_<n>` | 签名级规范类型可共享；env 的具体字段只属于某个字面量，分开才能两全 |
 | D4 | 捕获是**隐式、按值、在字面量求值时快照**；不引入捕获列表 | V1 已把 `[` 给了下标/切片；隐式捕获对用户最省事 |
 | D5 | 体里的捕获名是 **env 里的一份副本**，可读可写；写只改副本，不碰外层变量 | 与「按值捕获」自洽；`int() { n++; }` 是闭包自己的状态 |
-| D6 | `closure` 是**软关键字**，只在类型位置生效；`int closure = 1;` 照常 | 与 `co`/`go`/`task`/`module` 一致 |
+| D6 | `closure` 是**软关键字**，只在类型位置生效；`int closure = 1;` 照常 | 与 `co`/`spawn`/`task`/`module` 一致 |
 | D7 | 捕获集合由**扫描 pass** 在字面量处精确求出：用编译器自己的解析器把体解析一遍（不生成代码），按符号序号区分体外的名字 | 在 TU 末尾分析太晚（env 布局在字面量处就要定）；纯 token 扫描分不清遮蔽 |
 | D8 | 调用点把 env 作为**隐藏的第一实参**（sret 缓冲之后），复用方法/接口的 `c6_self_pending` 机制 | 五个后端已经用同一条路验证过 self 参数 |
 | D9 | 函数指针 → 闭包是**隐式转换**，用「按签名一份」的跳板 + 一个只装函数指针的 env | 无捕获字面量仍是裸指针；需要放进闭包时统一包装，变参除外 |
@@ -59,7 +59,7 @@ closure-type = "closure" , type-specifier , [ "!error" ] ,
                "(" , [ parameter-type-list ] , ")" ;
 ```
 
-`closure` 是**软关键字**（和 `co`/`go`/`task` 一样）：只有出现在类型位置、
+`closure` 是**软关键字**（和 `co`/`spawn`/`task` 一样）：只有出现在类型位置、
 且没有被同名变量/typedef 遮蔽时才是关键字。实现上在 `parse_btype` 里按名字
 识别（和 `new` 一样），**不**把它加进 `c6_soft_kw()` 的语句分派——`block()`
 的 `switch` 默认分支是 `c6_task_decl()`，加进去会把语句开头的 `closure …`
@@ -520,7 +520,7 @@ s->c6_sym_seq >= scan_base                → 体内声明的（参数、局部�
 | `defer_state`（`c6_defer_parse`/`c6_defer_begin`） | 只解析 `defer` 后面的语句（名字要进捕获集合），不登记记录、不生成调度 |
 | `errdefer`/`err`/`try`/`catch` | 照常解析语义与体；不生成错误路径代码 |
 | `c6_gc_*`（`c6_gc_site`、`c6_gc_root_add`、`c6_gc_arg_*`、描述符队列） | 不登记、不发描述符；`new` 只做类型检查 |
-| `go`（`c6_sp_pending`） | 只解析实参，不登记跳板 |
+| `spawn`（`c6_sp_pending`） | 只解析实参，不登记跳板 |
 | `co`/`task`/`thread` | 只解析，不生成任务/句柄代码 |
 | 方法/接口注册（`c6_method_register`、`c6_auto_impl_ensure`） | 不登记（体内定义的结构体没有持久方法） |
 | `c6_hdr_*`、`c6_module_*` | 体里不可能出现，防御性短路 |
@@ -903,7 +903,7 @@ env 在静态图里是「擦除」的，不能直接建 `closure → env_N → �
 * `shared`/`weak`/`own` 修饰闭包 → C96。原因：`shared` 需要在**分配点**把
   闭包对象与 env 的计数改成原子；字面量的静态类型在分配点之后才由上下文
   决定，无法回头改对象头。`weak`/`own` 的语义也没设计好；
-* 闭包作为 `go` 实参、`async` 参数/返回值、`co`/`task` 的载荷 → C96
+* 闭包作为 `spawn` 实参、`async` 参数/返回值、`co`/`task` 的载荷 → C96
   的第二条消息（「闭包不能跨线程/任务」），比通用的 C73 更明确（C73 会
   建议用 `shared`，而 V2.0 没有 `shared` 闭包）；
 * 捕获 `shared @T` 是允许的：env 本身单线程，字段指向跨线程对象，释放时按
@@ -952,7 +952,7 @@ env 在静态图里是「擦除」的，不能直接建 `closure → env_N → �
 * 描述符是普通的静态数据（现有 GC 描述符发射路径），C 里就是结构体常量；
 * 跳板是普通函数；调用点是普通调用，首参 `void *`；
 * 变参、struct 返回、`!error` 都由前端处理成普通 C 调用；
-* `tests/c99/closure.c` 用 `gcc -std=c99 -pedantic -Wall -Wextra -Werror`
+* `tests/c99/closure.c6` 用 `gcc -std=c99 -pedantic -Wall -Wextra -Werror`
   编译生成代码，钉住「输出没有依赖 tcc 的扩展语法」。
 
 ### 8.3 `-emit-header`、`module`、`import`、跨 TU
@@ -982,7 +982,7 @@ struct __c6_closure_<hash> *make(int n);        /* closure int(int) */
 
 ### 8.4 `test`、`-run`、调试
 
-* `tests/*.c` 的 test 块里可以定义/调用闭包；`c6_lit_flush()` 在 TU 末尾与
+* `tests/*.c6` 的 test 块里可以定义/调用闭包；`c6_lit_flush()` 在 TU 末尾与
   `gen_inline_functions()` 同一循环里排空队列，所以 test 体、`static inline`
   体里排队的闭包也会被编译；
 * `-run`/JIT 使用同一套静态数据与描述符，无需特殊处理；
@@ -1056,7 +1056,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 | `@T` / `new` / 切片 / 元组 | 捕获 `@T`（含 `shared @T`） +1，`weak`/`own` 不行；切片只拷描述符；含托管字段的结构体不能捕获（C94）；元组不含托管字段时可捕获 |
 | `move` / `own` / `weak` | 闭包变量本身可以 `move`；`move(捕获名)` 不支持（env 字段不是槽），写 `n = NULL`；`own`/`weak` 捕获不支持 |
 | GC 环检测 | 闭包签名节点 + 被捕获类型边（§7.2）；环境不进图 |
-| `go` / `co` / `task` / `thread` | 闭包不能作线程/任务载荷（C96）；`go` 的调用目标仍必须是普通函数（C38），闭包调用不是普通函数调用 |
+| `spawn` / `co` / `task` / `thread` | 闭包不能作线程/任务载荷（C96）；`spawn` 的调用目标仍必须是普通函数（C38），闭包调用不是普通函数调用 |
 | `async` / `await` | 闭包可以在 async 体内创建/捕获；env 在堆上，挂起/恢复不影响；但闭包不能作为 async 的返回值、参数或 `await` 载荷（跨任务，C96） |
 | 方法 / 接口 | 方法可以返回/接收闭包；闭包本身不实现接口；接收者 `self` 不能捕获（C94） |
 | `module` / `import` | 签名哈希跨 TU 稳定；字面量函数/环境/跳板都是 `static` |
@@ -1131,7 +1131,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 
 实现完成后至少要有下面这些用例（文件名按现有约定）：
 
-**正常路径（`tests/closure.c`，test 块）**
+**正常路径（`tests/closure.c6`，test 块）**
 
 1. 捕获标量、参数、`const`；快照语义（外层改值不影响闭包）；
 2. 体里改副本，多次调用看到状态；外层变量不变；
@@ -1156,7 +1156,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 18. `shared @T` 捕获（原子 +1）；`drop` 结构体/柔性数组/含 `@T` 元组/
     thread/task 句柄捕获报 C94。
 
-**诊断（`tests/errors/closure*.c`）**
+**诊断（`tests/errors/closure*.c6`）**
 
 19. C90：`closure` 缺完整签名；匿名类型签名；块作用域 tag 签名（`closure`
     类型和普通字面量签名都测）；`@closure`；
@@ -1165,22 +1165,22 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 22. C93：捕获字面量赋给函数指针；
 23. C94：类型/接收者/`static`/枚举常量/数组/VLA/`own`/`weak`/含托管字段结构体/类型含块内 tag 的值/`drop` 结构体/柔性数组/含 `@T` 元组/thread 句柄；`sizeof(VLA)`；
 24. C95：文件作用域/`static` 局部的非空闭包初始化；
-25. C96：`shared`/`weak`/`own` 闭包；闭包进 `go`/`async`；
+25. C96：`shared`/`weak`/`own` 闭包；闭包进 `spawn`/`async`；
 26. C97：`f->x`、`*f`、`f + 1`、`new closure …`；
 27. C98：自捕获；
 28. C66：`struct Node { closure int() f; }` + 捕获 `@Node` 的环。
 
 **ABI / 跨 TU / 头文件**
 
-29. `tests/abi/closure.c` + `_plain.c`：c6 TU 创建闭包、纯 C TU 只按
+29. `tests/abi/closure.c6` + `_plain.c`：c6 TU 创建闭包、纯 C TU 只按
     `struct __c6_closure_h *` 传递/保存（不调用）；退出码一致；
-30. `tests/tu/closure.c`：闭包类型作函数参数/返回值跨 TU；
+30. `tests/tu/closure.c6`：闭包类型作函数参数/返回值跨 TU；
 31. `-emit-header`：闭包结构体、typedef、struct 返回、切片参数按顺序写出，
     结构体被 `#pragma pack` 钉住，生成的 C 头能被 `gcc` 单独编译。
 
 **C99 后端**
 
-32. `tests/c99/closure.c`：捕获、包装、跳板、`!error`、struct 返回、
+32. `tests/c99/closure.c6`：捕获、包装、跳板、`!error`、struct 返回、
     变参字面量、`__c6_gc_live()` 归零；`gcc -std=c99 -pedantic -Wall
     -Wextra -Werror` 零告警。
 
@@ -1189,7 +1189,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 33. `make test-plain`（关掉 `C6_EXT`）：闭包代码全部在 `#ifdef C6_EXT` 内；
 34. `make selftest`、`BACKEND=c99 tests/run-tests.sh`、`make selfhost`、
     `make c99selfhost` 全绿；
-35. 现有 `tests/fn_lit.c`、`tests/errors/fn_lit.c`、`tests/abi/fn_lit*`
+35. 现有 `tests/fn_lit.c6`、`tests/errors/fn_lit.c6`、`tests/abi/fn_lit*`
     一行不改仍通过（V1 兼容是硬约束）。
 
 ---

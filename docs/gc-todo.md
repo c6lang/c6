@@ -15,8 +15,8 @@
   make test-plain                    # 关掉 C6_EXT 的零影响回归
   ```
 - 新测试的位置与写法按现有约定：
-  `tests/*.c`（`test "desc" {}` 块）、`tests/errors/*.c`（`// EXPECT <frag>: error: <text>`）、
-  `tests/c99/*.c`（`// EXIT` / `// OUTPUT`）。
+  `tests/*.c6`（`test "desc" {}` 块）、`tests/errors/*.c6`（`// EXPECT <frag>: error: <text>`）、
+  `tests/c99/*.c6`（`// EXIT` / `// OUTPUT`）。
 - 提交：一个阶段一个提交，标题 `gc: Pn <一句话>`，正文写验收命令与结果。
 
 ---
@@ -32,7 +32,7 @@
 | P4 ✅ | 析构 `drop` 方法 | P3 | 全局根不能用 `atexit` |
 | P5 ✅ | `shared` + 跨帧/跨线程转移 | P2 | 任务 slot 的归还点在 `__c6_co_destroy` |
 | P6 ✅ | 静态环检测（单 TU + 链接期） | P2/P3 | 跨 TU 只在原生后端 |
-| P7 ✅ | async/go 集成与预算化 drain | P1/P5 | 回卷检查点放在 `await` 恢复点 |
+| P7 ✅ | async/spawn 集成与预算化 drain | P1/P5 | 回卷检查点放在 `await` 恢复点 |
 | P8 | 文档与全量回归 | 全部 | — |
 
 ---
@@ -56,7 +56,7 @@
   `__TCC_GC_DEFINED`）；
 - 非 c6 模式（无 `C6_EXT`）零改动。
 
-测试：`tests/typename.c` 增两条（`@int` / `weak @Node` 的类型字符串打印）。
+测试：`tests/typename.c6` 增两条（`@int` / `weak @Node` 的类型字符串打印）。
 
 验收：`make build && make selftest && make test-plain`。
 
@@ -83,7 +83,7 @@
 - 已落地（P7）：`async` 体里的托管局部量在回卷时的转移 —— `task` 句柄新增
   `t->start()`（`__c6_co_start`）把 body 推进到挂起点，作用域结束时
   `__c6_co_destroy` 回卷，defer 与托管局部量都按 §9.3 的派发器处理
-  （`tests/async_frame.c` 覆盖）；"挂起时把线程 defer 栈指针交给任务、
+  （`tests/async_frame.c6` 覆盖）；"挂起时把线程 defer 栈指针交给任务、
   调用者的清理被静默跳过"这个既有 bug 随着 defer 状态搬进函数帧一起消失
   （挂起只剩错误槽，见 grammar.md 8.2）。
 - 已消灭：`defer` 记录 8192 条静默丢弃（H3）—— 没有记录栈了，上限变成
@@ -108,7 +108,7 @@
   每线程待释放队列 + 预算（默认 256）+ `draining` 重入标志；
 - `tcc/c99-gen.c`：`c99_runtime_names[]`（:685）加全部新符号。
 
-测试（`tests/gc.c`）：
+测试（`tests/gc.c6`）：
 
 - `new` + 作用域退出自动释放（`__c6_gc_live()` 归零）；
 - `p = NULL`、双重 `p = NULL`；
@@ -120,8 +120,8 @@
 
 验收：三条命令全绿；`tests/c99/gc.c` 额外覆盖 C99 后端。
 
-**结果**：`tests/gc.c` 10 个 `test` 块全过（原生 + C99 后端），
-`tests/errors/gc.c` 4 条诊断全中，`make selftest` 40/40、
+**结果**：`tests/gc.c6` 10 个 `test` 块全过（原生 + C99 后端），
+`tests/errors/gc.c6` 4 条诊断全中，`make selftest` 40/40、
 `BACKEND=c99 tests/run-tests.sh` 41/41、`make test-plain` 绿。
 
 ---
@@ -138,7 +138,7 @@
   长链/大数组走迭代避免递归爆栈；
 - 按值规则：含托管字段的结构体禁止拷贝/传参/返回/进 tuple/进 slice（E-GC5）。
 
-测试（`tests/gc_field.c`）：嵌套结构、`@T f[4]` 数组、`new T[n]`，
+测试（`tests/gc_field.c6`）：嵌套结构、`@T f[4]` 数组、`new T[n]`，
 `@T f[n]` 的 `stride`，10 万节点链的释放不爆栈（`live()` 归零）。
 
 验收：同 P1。
@@ -164,8 +164,8 @@
 - 描述符的 `flags` 目前只填 `HAS_WEAK`；`drop` 指针还是 0（P4 接上）。
 - tuple / slice / `memcpy` 的按值规则推迟到 P8 的统一审计里做。
 
-**结果**：`tests/gc_field.c` 6 个 `test` 块全过（原生 + C99 后端），
-`tests/errors/gc.c` 11 条诊断全中，`make selftest` 41/41、
+**结果**：`tests/gc_field.c6` 6 个 `test` 块全过（原生 + C99 后端），
+`tests/errors/gc.c6` 11 条诊断全中，`make selftest` 41/41、
 `BACKEND=c99 tests/run-tests.sh` 42/42、`make test-plain` 绿。
 
 ---
@@ -186,9 +186,9 @@
 
 测试：
 
-- `tests/weak.c`：升级成功/失败、目标死亡后槽变 NULL、弱字段与弱全局、
+- `tests/weak.c6`：升级成功/失败、目标死亡后槽变 NULL、弱字段与弱全局、
   多线程下的弱失效（P5 之后再加并发用例）；
-- `tests/async_frame.c`：帧住在任务里之后 `weak` 局部 / 形参 / 返回值在 `async`
+- `tests/async_frame.c6`：帧住在任务里之后 `weak` 局部 / 形参 / 返回值在 `async`
   里都能用（原来那两条 `EXPECT` 随 A3 一起删掉了）；
 - `tests/errors/weak_deref.c`：直接解引用报错。
 
@@ -219,17 +219,17 @@
 - 顺带堵掉的两个洞：`return w;`（弱引用按值返回会丢注册、并把调用者拿到的那
   一次计数漏掉）→ 硬错误；`async` 函数的 `weak` 返回类型同理。
 
-**结果**：`tests/weak.c` 6 个 `test` 块全过（原生 + C99 后端），
-`tests/errors/gc.c` 12 条，
+**结果**：`tests/weak.c6` 6 个 `test` 块全过（原生 + C99 后端），
+`tests/errors/gc.c6` 12 条，
 `make selftest` 43/43、`BACKEND=c99 tests/run-tests.sh` 44/44、`make test-plain` 绿。
 
 ---
 
 ## P4 ✅ 析构 `drop` 方法
 
-结果：`drop` 在最后一次释放时跑一次（`tests/gc_drop.c` 6 个块），字段还在；
-数组逐元素跑；`go` 线程里也跑；全局根在退出时释放（`tests/exit/drop_exit.c`）；
-8 条诊断（`tests/errors/drop_bad.c`）。验收：`make selftest` 46 通过、
+结果：`drop` 在最后一次释放时跑一次（`tests/gc_drop.c6` 6 个块），字段还在；
+数组逐元素跑；`spawn` 线程里也跑；全局根在退出时释放（`tests/exit/drop_exit.c6`）；
+8 条诊断（`tests/errors/drop_bad.c6`）。验收：`make selftest` 46 通过、
 `BACKEND=c99 tests/run-tests.sh` 47 通过、`make test-plain` 绿。
 
 改动点：
@@ -239,13 +239,13 @@
 - 描述符增加 `drop` 指针，发射时用与 vtable 相同的 `(void(*)(void))Sym`
   手法（参考 `c6_emit_auto_impls()`，:9575）；
 - 运行时 drain 步骤：`if (desc->drop) desc->drop(payload);`（在字段释放之前）；
-- 静态检查：析构体内禁 `err`/`try`/`await`/`go`；禁止显式调用 `p->drop()`；
+- 静态检查：析构体内禁 `err`/`try`/`await`/`spawn`；禁止显式调用 `p->drop()`；
 - 全局根：`@T` 全局登记到一张表，`atexit(__c6_gc_shutdown)` 释放一次。
 
-测试（`tests/gc_drop.c`）：析构在最后释放时跑一次；析构里能读自己的托管字段；
-析构顺序（析构 → 字段释放）；析构里释放另一个对象（重入）；析构在 `go` 线程跑；
+测试（`tests/gc_drop.c6`）：析构在最后释放时跑一次；析构里能读自己的托管字段；
+析构顺序（析构 → 字段释放）；析构里释放另一个对象（重入）；析构在 `spawn` 线程跑；
 析构没有为环运行（配合 P6 的 `c6_graph` 文档）；
-`tests/errors/drop_bad.c`：返回值/参数个数/重复定义/`err` 内用/显式调用。
+`tests/errors/drop_bad.c6`：返回值/参数个数/重复定义/`err` 内用/显式调用。
 
 落地状态（与计划的差异）：
 
@@ -253,7 +253,7 @@
   自己的 `atexit`）。改成每个含托管全局的 TU 发一对
   `__attribute__((constructor))` / `((destructor))`：构造时
   `__c6_gc_root(&g, kind, count, stride)` 登记，析构时
-  `__c6_gc_shutdown()`（幂等）释放。`tests/exit/drop_exit.c` 用真实可执行
+  `__c6_gc_shutdown()`（幂等）释放。`tests/exit/drop_exit.c6` 用真实可执行
   文件验收（`-test` 模式不进 `runmain`，构造/析构不跑）。
 - **描述符末尾发射**：`drop` 可能定义在结构体之后，所以描述符统一在 TU
   末尾发（`c6_gc_flush_descs()`），名字带文件名哈希
@@ -278,23 +278,23 @@
 
 ## P5 ✅ `shared` 与跨帧/跨线程转移
 
-结果：`go` 的实参块和一个 `async` 任务各持有一份引用，两处都在**用完之后**
+结果：`spawn` 的实参块和一个 `async` 任务各持有一份引用，两处都在**用完之后**
 −1，所以「创建者先放手、线程/任务后跑完」是安全的；`shared @T` 的加减在
-对象头里带原子标志，两个线程同时加减不丢更新（`tests/gc_thread.c` 4 个块，
-连跑 10 次稳定）；任务还持有托管返回值（`tests/gc_async.c` 5 个块）；
-6 条诊断（`tests/errors/gc_borrow.c`）。验收：`make selftest` 49 通过、
+对象头里带原子标志，两个线程同时加减不丢更新（`tests/gc_thread.c6` 4 个块，
+连跑 10 次稳定）；任务还持有托管返回值（`tests/gc_async.c6` 5 个块）；
+6 条诊断（`tests/errors/gc_borrow.c6`）。验收：`make selftest` 49 通过、
 `BACKEND=c99 tests/run-tests.sh` 50 通过、`make test-plain` 绿。
 
 改动点：
 
 - `shared @T` 的存储/释放走 `__atomic_fetch_add`/`__atomic_sub_fetch`（`ACQ_REL`）；
   libtcc1.c 里自行 `#define __ATOMIC_ACQ_REL 4`（tcc 不预定义）；
-- `go f(args)`：实参块里的托管引用 +1 进块、trampoline 返回前 −1
+- `spawn f(args)`：实参块里的托管引用 +1 进块、trampoline 返回前 −1
   （`c6_sp_emit()`，`__tcc_sp_args`，`lib/libtcc1.c:796`）；
 - `async`：参数进 `struct NAME_task` 时 +1，任务被 `__c6_co_destroy()` 回收
   时 −1 —— 不在 body 里还，body 可能永远跑不完；
-- 静态检查：`plain @T`/`own @T` 进 `go`/`async` → 错误（E-GC10）；
-- 取消旧设计里“`go`/`async` 边界不能带托管引用”的限制。
+- 静态检查：`plain @T`/`own @T` 进 `spawn`/`async` → 错误（E-GC10）；
+- 取消旧设计里“`spawn`/`async` 边界不能带托管引用”的限制。
 
 落地状态（与计划的差异）：
 
@@ -325,16 +325,16 @@
 - 测试没用「4 线程 × 25 万次」的压测：改成 4 个确定性用例（计数在每一步
   都对得上），压测只能发现「有时不对」，而且失败时看不出是哪一步。
 
-测试（`tests/gc_thread.c`、`tests/gc_async.c`）：
+测试（`tests/gc_thread.c6`、`tests/gc_async.c6`）：
 
-- `go` 的实参块持有一份（线程里读到的计数 = 2）；启动者放手后对象仍活着；
+- `spawn` 的实参块持有一份（线程里读到的计数 = 2）；启动者放手后对象仍活着；
   跨线程交接（存进 `shared` 全局，计数 = 2）；两个线程同时对同一对象加减，
   两次 +1 都算上（5）、退出后回到 1 —— 这条在 `new T`（非原子）时会稳定
   失败，正是 E-GC15 的实测依据；
 - 任务前缀持有一份；创建者放手后任务仍活着；形参借用 + 拷进自有局部才 +1；
   托管返回值由 `val` 槽持有（`return n` 与 `return new shared T` 两条路径）；
   非托管参数不受影响；
-- `tests/errors/gc_borrow.c`：借用形参赋值（普通/async 各一条）、`go` 传
+- `tests/errors/gc_borrow.c6`：借用形参赋值（普通/async 各一条）、`spawn` 传
   `plain @T`、`async` 形参/返回值非 `shared`、`shared` 槽装 `new T`。
 
 验收：同 P1 + 原生与 C99 两种后端都要过。
@@ -344,9 +344,9 @@
 ## P6 ✅ 静态环检测（硬错误）
 
 结果：类型图上有环就在编译期报错，带字段名和类型的定义位置
-（`tests/errors/gc_cycle.c` 4 条：自环/互环/数组/按值嵌入）；`weak` 边和
+（`tests/errors/gc_cycle.c6` 4 条：自环/互环/数组/按值嵌入）；`weak` 边和
 `own` 边不算边，所以「父→子强、子→父弱」和无环互递归都照过。`own` 的
-独占链/子树可以建起来并逐个释放（`tests/gc_own.c` 4 个块），`move(p)` 是
+独占链/子树可以建起来并逐个释放（`tests/gc_own.c6` 4 个块），`move(p)` 是
 新增的内建表达式。验收：`make selftest` 51 通过、
 `BACKEND=c99 tests/run-tests.sh` 52 通过、`make test-plain` 绿。
 
@@ -384,7 +384,7 @@
 - **`own` 值不能从别的槽直接接**（只能 `new` 或 `move`）：`parent->next = kid`
   会被拒。这是对的（`own` 不计数，直接接会让两个所有者指向同一对象），
   但意味着**必须**有 `move`，所以 `move` 从“计划里的语法糖”变成 P6 的必做项；
-- **`tests/gc_field.c` 的 `struct Node` 改成 `own @Node next`**：环检测一上，
+- **`tests/gc_field.c6` 的 `struct Node` 改成 `own @Node next`**：环检测一上，
   原来的 `@Node next` 自环就编译不过了 —— 那个测试本来就是建一条链，
   改成独占链语义不变（迭代释放的断言仍然过）；
 - **嵌入环要前向声明**：`struct Wrap { struct Emb e; };` 与
@@ -393,11 +393,11 @@
 
 测试：
 
-- `tests/errors/gc_cycle.c`：自环、互环、数组自环、按值嵌入环；
-- `tests/errors/gc_move.c`：`move` 之后读/比较/传参/再 `move`/`return`，以及
+- `tests/errors/gc_cycle.c6`：自环、互环、数组自环、按值嵌入环；
+- `tests/errors/gc_move.c6`：`move` 之后读/比较/传参/再 `move`/`return`，以及
   `if`/`while`/`switch` 只有一条路重新赋值（8 条），外加正常路径（重新赋值、
   `sizeof`、`defer` 体里的 move）；
-- `tests/gc_own.c`：`new` 直接接链、`move` 接子树、`move` 后重新赋值再用、
+- `tests/gc_own.c6`：`new` 直接接链、`move` 接子树、`move` 后重新赋值再用、
   析构在独占链上逐个跑；
 - 正例：`weak` 反向引用（要先升级才能解引用）、`own` 子树、无环互递归。
 
@@ -405,11 +405,11 @@
 
 ---
 
-## P7 ✅ async/go 集成与预算化 drain
+## P7 ✅ async/spawn 集成与预算化 drain
 
 结果：没跑完就被销毁的任务会**回卷** —— 恢复帧、跑 `errdefer` + `defer` +
 托管引用的内联释放，再以 `C6_CO_KIND_ABORT` 结束，所以挂起的任务不会漏掉它
-帧里的引用（`tests/gc_async.c` 的两个新块：`销毁挂起的任务会回卷`、
+帧里的引用（`tests/gc_async.c6` 的两个新块：`销毁挂起的任务会回卷`、
 `回卷会跑 defer 与 errdefer`）。验收：`make selftest` 51 通过、
 `BACKEND=c99 tests/run-tests.sh` 52 通过、`make test-plain` 绿。
 
@@ -424,7 +424,7 @@
   子任务递归回卷；
 - 预算：不需要新机制 —— `c6_gc_drop()` 里每次释放最多处理
   `C6_GC_DRAIN_BUDGET`（256）个，级联自然摊平；`__c6_gc_drain_budget(n)`
-  留着手工跑完（`tests/gc_field.c` 的长链用例在用）。
+  留着手工跑完（`tests/gc_field.c6` 的长链用例在用）。
 
 落地状态（与计划的差异）：
 
@@ -436,13 +436,13 @@
   恢复点还在 body 中间，defer 机制活着、跳转表还没定稿，所以能正常发。
   代价是每个 `await` 多一次 `__c6_co_kind()` 调用；
 - **1M 节点链的延迟测试没写**：断言“不超时”的测试在不同机器上不稳，
-  改成靠 `tests/gc_field.c` 的 20000 长链 + 显式 drain 覆盖正确性；
+  改成靠 `tests/gc_field.c6` 的 20000 长链 + 显式 drain 覆盖正确性；
 - **C99 后端要同步**：`tcc/c99-rt.inc` 里同样要有 `C6_CO_KIND_ABORT`、
   `__c6_co_abort()`、`__c99_co_step_once()` 的 ABORT 分支和
   `__c6_co_destroy()` 的回卷调用 —— 少一处，`BACKEND=c99` 就会有用例失败
   （这次就是这么发现的）。
 
-测试：`tests/gc_async.c` 新增两个块（帧里的引用还回来、`defer`/`errdefer`
+测试：`tests/gc_async.c6` 新增两个块（帧里的引用还回来、`defer`/`errdefer`
 各跑一次）。
 
 验收：同 P1。
@@ -454,7 +454,7 @@
 结果：
 
 - `README.md`：新增「托管引用（引用计数 GC）」一节（四种限定符的语义表、
-  `p = NULL`、`move`、`drop`、环是编译错误、async/go 的限制、性能数字、
+  `p = NULL`、`move`、`drop`、环是编译错误、async/spawn 的限制、性能数字、
   与 C++ 智能指针的对照），并把「切片没有隐藏状态也没有 GC」那句改清楚
   （切片不是 GC 对象，托管引用是另一回事）；测试目录清单补上 7 个 gc 用例；
 - `docs/grammar.md`：§7 静态约束补 C66–C77（环、借用、`own`/`shared` 的
@@ -481,7 +481,7 @@
 | D1 | 原子计数的限定符名字 | **`shared`**（描述权限而不是机制；`atomic` 会让人误以为 `p->f` 也是原子的），已按此实现 |
 | D2 | 自环默认报错，通用图怎么办 | **默认报错**（已实现）；`struct Node c6_graph` 豁免**不做**，通用图只能写成 `own` 树 / `weak` 边（设计 §8.4） |
 | D3 | 链接期跨 TU 环检查进 V1 还是 V2 | **进 V1**，已实现（`.c6.gcgraph` + 链接期 DFS，仅原生后端） |
-| D4 | 析构里禁止 `err`/`try`/`await`/`go` | **禁止**，已实现（E-GC9） |
+| D4 | 析构里禁止 `err`/`try`/`await`/`spawn` | **禁止**，已实现（E-GC9） |
 | D5 | 全局 `@T` 在进程退出时是否跑析构 | **跑**，已实现 —— 用 TU 末尾的 `__attribute__((destructor))` 调 `__c6_gc_shutdown()`（不用 `atexit`，tcc 的 `atexit` 会拖出 `__dso_handle`） |
 | D6 | drain 预算默认值 | **256**（`C6_GC_DRAIN_BUDGET`，`lib/libtcc1.c:1071`）；**没有**做 `-gc-drain-budget=N` 命令行开关 —— 预算是运行期常量，要做开关得让编译器把它传给 libtcc1，暂不需要 |
 
@@ -495,9 +495,9 @@
 | 描述符发射与 `static inline` 体的 fixpoint 顺序 | 描述符缺失 → 运行期空指针 | 挂在现有 fixpoint 循环里（:658）；TI 式回归（inline 里 `new`） |
 | async 帧搬动（既有缺陷） | 静默写坏别的栈 | 已修：帧住进任务（A3，五个后端 + C99）；拷贝模型（含 `weak` 禁令与地址校验）已删除，c67 上 `async` 编译期报错 |
 | `own` 环（`b.next = a` 式构造） | 释放时死循环/越界 | `own` 赋值只接受 FRESH/`move()`；文档写明 |
-| `move` 之后的使用漏报（全局槽、字段、`&p` 取过地址的槽不跟踪） | 运行期解引用空槽 | 只承诺跟踪本函数的自动托管槽（设计 §3.4 写明边界）；`tests/errors/gc_move.c` 覆盖读/比较/传参/再 `move`/分支合并 |
+| `move` 之后的使用漏报（全局槽、字段、`&p` 取过地址的槽不跟踪） | 运行期解引用空槽 | 只承诺跟踪本函数的自动托管槽（设计 §3.4 写明边界）；`tests/errors/gc_move.c6` 覆盖读/比较/传参/再 `move`/分支合并 |
 | C99 后端漏符号 | C99 测试链接失败 | 每阶段检查 `c99_runtime_names[]` |
-| `-std=c6` 之外的行为变化 | 破坏普通 C 回归 | `make test-plain` 作为每阶段门槛 |
+| c6 之外的行为变化 | 破坏普通 C 回归 | `make test-plain` 作为每阶段门槛 |
 | 跨 TU 环在 `-c99` 上看不到 | 漏报 | 设计 §15 写明；用例 `// NATIVE-ONLY` 标注 |
 
 ---

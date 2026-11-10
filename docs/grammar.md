@@ -5,10 +5,10 @@
 `declaration`、`statement`、`expression` 等未定义非终结符一律指 ISO C
 （C11 / N1570）中的同名产生式。
 
-扩展只在编译期定义了 `C6_EXT` 且命令行给了 `-std=c6`（或源文件后缀是
-`.c6`，它对单个翻译单元等价于 `-std=c6`）时生效；此时
-预处理器额外定义宏 `__C6__`。未开启时，下列新关键字全部退化为普通
-标识符，本文档描述的产生式一条都不适用。
+扩展只在编译期定义了 `C6_EXT` 且**源文件后缀是 `.c6`** 时生效（后缀是唯一
+的开关，命令行没有 `-std=c6`）；此时
+预处理器额外定义宏 `__C6__`。未开启时（所有 `.c` 文件），下列新关键字全部
+退化为普通标识符，本文档描述的产生式一条都不适用。
 
 ---
 
@@ -45,7 +45,7 @@ c6-keyword =
     | "foreach" ;
 
 (* 软关键字：只在语句开头、且后面紧跟一个标识符时才是关键字 *)
-c6-soft-keyword = "co" | "go" | "task"
+c6-soft-keyword = "co" | "spawn" | "task"
                 | "module" ;   (* 只在一个文件的第一个声明之前 *)
 
 (* 扩展内建的错误值类型，由编译器预置的 typedef 提供，等价于
@@ -73,26 +73,33 @@ error-type-name = "error" ;
 `int async;`、`int await;` 会报错（成员名不受影响：
 `struct S { int async; }; s.async` 仍然合法，因为成员查找比较的是记号值）。
 
-`co`、`go`、`task` 是**软关键字**，词法阶段仍是普通标识符，只在语句开头
+`co`、`spawn`、`task` 是**软关键字**，词法阶段仍是普通标识符，只在语句开头
 且后面紧跟一个标识符时才被当作关键字（判定发生在语句分派处，此时下一个
 记号已经在手）：
 
 ```c
-int go = 1;          /* 变量：'go' 后面是 '=' */
-go = 2;              /* 赋值 */
-x = go;              /* 取值 */
-go(x);               /* 调用名为 go 的函数：后面是 '(' */
-typedef int co;      /* 类型名 */
-co v;                /* 声明：'co' 是 typedef 名，不是 co 语句 */
-task:                /* 标签：后面是 ':' */
-go f(a);             /* 语句：'go' 在语句开头且后面是标识符 -> 线程 */
-co f(a);             /* 同理 -> 顶层协程 */
-task t = f(a);       /* 同理 -> 句柄 */
+int spawn = 1;          /* 变量：'spawn' 后面是 '=' */
+spawn = 2;              /* 赋值 */
+x = spawn;              /* 取值 */
+spawn(x);               /* 调用名为 spawn 的函数：后面是 '(' */
+typedef int co;         /* 类型名 */
+co v;                   /* 声明：'co' 是 typedef 名，不是 co 语句 */
+task:                   /* 标签：后面是 ':' */
+spawn f(a);             /* 语句：'spawn' 在语句开头且后面是标识符 -> 线程 */
+co f(a);                /* 同理 -> 顶层协程 */
+task t = f(a);          /* 同理 -> 句柄 */
 ```
 
-形状相同的两个意思（局部变量 `go` 后面紧跟一个标识符、且这一行又是语句
+形状相同的两个意思（局部变量 `spawn` 后面紧跟一个标识符、且这一行又是语句
 开头）无法区分，此时按关键字处理。`typedef` 名会让软关键字让路：
 `co` 已经被声明成类型名时，`co v;` 一定是声明。
+
+> **旧名 `go`**：起线程的关键字原来拼作 `go`，现在叫 `spawn`（`go` 和 Go
+> 的 goroutine 同名，而这里是真正的 OS 线程，读代码时容易误解）。`go`
+> 退回普通标识符：`int go = 1;`、`go = 2;`、`x = go;`、`go(x);`、`go:`
+> 都照常工作；旧写法 `go f(a);` / `thread h = go f(a);` / 文件作用域的
+> `go f();` 各报一条 `'go' was renamed to 'spawn': write 'spawn f(...)'`
+> （见 §3.6）。
 
 ---
 
@@ -242,8 +249,7 @@ function-definition    = declaration-specifiers ,
 诊断里使用源码中书写的标识符：`package` 内的变量报原名，而不是
 `NAME__x`。
 
-这条约束只作用于开启了 `-std=c6` 的翻译单元：不带该开关的老代码
-完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
+这条约束只作用于 `.c6` 的翻译单元：`.c` 文件的老代码完全不受影响；一旦开启，该 TU 里出现的所有定义（含包含进来的头文件里的
 函数体）都要满足。K&R 老式定义的形参声明表属于形参，不受约束。
 
 ### 3.2 结构体方法
@@ -384,7 +390,7 @@ async-function-definition  = "async" , declaration-specifiers ,
 `struct __c6_task` 的布局由 `libtcc1` 拥有，生成代码只通过 `__c6_co_*`
 访问器碰它；`t->val` 和 `t->pN` 是普通的公开成员。
 
-运行时接口（`-std=c6` 时由 `__TCC_ASYNC_DEFINED` 预置声明）：
+运行时接口（c6 的翻译单元里由 `__TCC_ASYNC_DEFINED` 预置声明）：
 
 ```
 void *__c6_co_new(const struct __c6_desc *d);
@@ -422,7 +428,7 @@ task-declaration = "task" , identifier , "=" , expression ,
   写初始化器），并在**作用域退出时自动 `__c6_co_destroy(t)`**——走的就
   是 `defer` 那套清理路径，所以 `return` / `err` / `break` 出去一样会
   释放。一行可以声明多个（`task a = f(), b = g();`）。
-* 两者的操作数都必须是一次 `async` 调用；普通函数用 `go`（§3.6），
+* 两者的操作数都必须是一次 `async` 调用；普通函数用 `spawn`（§3.6），
   写成 `co` 会明确报错（见 C35）。
 
 **执行顺序**（`co` 唯一的“魔法”）：
@@ -441,22 +447,22 @@ task-declaration = "task" , identifier , "=" , expression ,
 一路跑完，并**当场回收任务槽**（没人能观察到它，句柄也没人拿得到）；park
 在 fd 上的任务才留给 `__c6_co_run()`。
 
-约束见 C34–C37（`go` 的约束是 C38–C40，见 §3.6）；同时存活的协程最多
+约束见 C34–C37（`spawn` 的约束是 C38–C40，见 §3.6）；同时存活的协程最多
 64 个（含 `await` 出来的子任务）。
-`co` 出去的协程和调用方在同一线程上协作式运行；要真并发用 `go`（§3.6）。
+`co` 出去的协程和调用方在同一线程上协作式运行；要真并发用 `spawn`（§3.6）。
 
-### 3.6 go（OS 线程）
-
-```
-go-statement = "go" , expression , ";" ;
-```
-
-`go f(a);` 在真正的 OS 线程（`pthread_create`）上运行普通函数 `f`，语句
-立刻返回：
+### 3.6 spawn（OS 线程）
 
 ```
-    go download(1);             (* 起线程，马上往下走 *)
-    go download(2);             (* 和上一行并行 *)
+spawn-statement = "spawn" , expression , ";" ;
+```
+
+`spawn f(a);` 在真正的 OS 线程（`pthread_create`）上运行普通函数 `f`，语句
+立刻返回（这个名字以前写作 `go`，见 §1 的改名说明）：
+
+```
+    spawn download(1);           (* 起线程，马上往下走 *)
+    spawn download(2);           (* 和上一行并行 *)
     printf("main 继续\n");
 ```
 
@@ -466,42 +472,42 @@ go-statement = "go" , expression , ";" ;
   |---|---|---|---|---|
   | `co f(a);` | 必须是 `async` | 无栈协程（帧拷贝） | 跑到第一个真正要等的地方 | 否 |
   | `task t = f(a);` | 初始化式是 `async` 调用 | 同上（保留句柄） | 同上 | 否 |
-  | `go f(a);` | 任意普通函数 | `pthread_create` | **立刻** | **是** |
+  | `spawn f(a);` | 任意普通函数 | `pthread_create` | **立刻** | **是** |
 
-* 参数在 `go` 语句处**求值一次**，按值复制到堆上的参数块；线程入口
+* 参数在 `spawn` 语句处**求值一次**，按值复制到堆上的参数块；线程入口
   （跳板）解开参数块再调用 `f`。之后改局部变量不影响线程。
 * 能进参数块的类型：标量、枚举、指针、`T[:]`、文件作用域的
   struct/union。数组、VLA、函数指针参数（C38）、变参函数（C39）都不行。
 * 被调函数不能是 `async`（用 `co`），也不能带 `!error`（C40）。
 * 调用点能看到 `f` 的**文件作用域声明**就够了，定义可以在任何 TU。
   跳板按（本 TU，被调函数）生成，是 `static` 函数，在 TU 末尾定义；
-  没有被 `go` 用到的原型不产生任何代码。
+  没有被 `spawn` 用到的原型不产生任何代码。
 * 线程由**启动它的线程**回收：`main` 结束时编译器插入
   `__c6_th_join_all()`，别的线程在退出时回收自己的子线程。需要中途等待
   可以直接调用它。
 * 每个线程有自己的错误槽、插值构造器和协程池（`pthread_key`，不是
   `__thread`：`-run` 不支持 TLS）。`defer` 不在这块状态里：清理状态就在
   函数帧里（见 8.2），所以线程里、ISR 里照常写；`err` / `f".."` / `async`
-  才去取那块每线程状态，线程里也一样能用，还能再 `go`。
+  才去取那块每线程状态，线程里也一样能用，还能再 `spawn`。
 
 需要等某一个线程时用**句柄**（约束 C78）：
 
 ```
-thread-declaration = "thread" , identifier , "=" , "go" , call , ";" ;
+thread-declaration = "thread" , identifier , "=" , "spawn" , call , ";" ;
 ```
 
 ```c
-thread h = go download(1);   (* 启动，这次调用的记录留在句柄里 *)
-h->join();                   (* 阻塞到它结束；重复调用幂等，返回 0 *)
-h->done();                   (* 1 = 已经结束，不阻塞 *)
-h->value();                  (* 被调函数的返回值：整数或指针，否则别用 *)
+thread h = spawn download(1);  (* 启动，这次调用的记录留在句柄里 *)
+h->join();                     (* 阻塞到它结束；重复调用幂等，返回 0 *)
+h->done();                     (* 1 = 已经结束，不阻塞 *)
+h->value();                    (* 被调函数的返回值：整数或指针，否则别用 *)
 ```
 
 句柄是启动者私有的：它只多持有一份线程记录（引用计数），线程仍然由启动者
 回收，句柄作用域退出时把自己的那份还回去 —— 没 `join` 也不漏。线程自己
 `join` 自己返回 `-1`，不会挂死。
 
-运行时接口（`-std=c6` 时预置声明）：
+运行时接口（`.c6` 的翻译单元里预置声明）：
 
 ```
 void *__tcc_sp_args(unsigned long size);   (* 参数块 *)
@@ -511,7 +517,7 @@ void  __c6_th_release(struct __c6_thread *h);           (* 句柄放手 *)
 int   __c6_thread_join(struct __c6_thread *h);          (* h->join()  *)
 int   __c6_thread_done(struct __c6_thread *h);          (* h->done()  *)
 long long __c6_thread_value(struct __c6_thread *h);     (* h->value() *)
-void  __c6_th_join_all(void);              (* 等本线程 go 出去的线程 *)
+void  __c6_th_join_all(void);              (* 等本线程 spawn 出去的线程 *)
 ```
 
 任务的句柄同样是方法（`struct NAME_task` 的第一个字段是 `struct __c6_task
@@ -575,7 +581,7 @@ tag 本身就是类型名，`struct` / `union` / `enum` 关键字可以省略（
   `int f(S) int *S; { … }` 报 `';' expected`，写成 `struct S` 即可。
 * 块作用域的 `TAG;` 只是引用外层 tag，不会像 `struct TAG;` 那样声明一个
   新的局部不完整 tag：本特性**不做任何隐式前置声明**。
-* 只在 `-std=c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
+* 只在 `.c6` 的翻译单元里生效；`struct Vec v;` 永远可用。
 
 ### 3.8 枚举成员写成 `Color.RED`
 
@@ -615,7 +621,7 @@ c6 允许把成员写成 `<tag>.<成员>`，让每个枚举自带一层空间：
   `for` 的条件，`switch` 的 `case`，数组长度、位域宽度都能用；枚举里没有
   这个名字时按 C120 报错。
 * 枚举必须已经定义并可见（与裸名同一条规则），不做任何隐式前置声明。
-* 只在 `-std=c6` 的翻译单元里生效；纯 C 的翻译单元里没有裸 tag 名，
+* 只在 `.c6` 的翻译单元里生效；纯 C 的翻译单元里没有裸 tag 名，
   `Color.RED` 报 `'Color' undeclared`（写成 `(Color)RED` 也只是强转）。
 
 ### 3.9 元组类型 `(T1, T2, ...)`
@@ -715,7 +721,7 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
   器、实参、返回值、结构体成员初值、数组初值、`static inline` 函数体里，
   以及另一个字面量的体里；
 * 值就是普通的函数指针：C ABI 不变，可以存进任何同型函数指针、放进函数
-  指针表、交给纯 C 保存和回调（`tests/abi/fn_lit.c`），也可以直接传给
+  指针表、交给纯 C 保存和回调（`tests/abi/fn_lit.c6`），也可以直接传给
   `qsort` 这类标准库函数。
 
 **V2 捕获式闭包（已落地）**：捕获式闭包引入类型构造
@@ -834,7 +840,7 @@ statement              = labeled-statement
                        | err-statement
                        | try-statement
                        | co-statement
-                       | go-statement
+                       | spawn-statement
                        | task-declaration
                        | foreach-statement
                        | tuple-destructuring ;
@@ -855,7 +861,7 @@ try-statement          = "try" , try-operand , ";" ;
                          (* 见第 5 节；作为语句时返回值被丢弃 *)
 
 co-statement           = "co" , expression , ";" ;
-go-statement           = "go" , expression , ";" ;
+spawn-statement           = "spawn" , expression , ";" ;
                          (* 顶层任务：建完立刻跑到第一个必须等待的点，
                             见 3.5 *)
 
@@ -1150,13 +1156,13 @@ parameter-list    = identifier , { "," , identifier } ;
 | C31 | `await` 不能出现在 `defer` / `errdefer` 体或 `sizeof` 等不求值上下文里 | `'await' is not allowed in a 'defer' body`；`'await' is not allowed in an unevaluated context` |
 | C32 | `c6_io` 只有 `await c6_io(fd, ev)` 一种写法 | `'c6_io' can only be used as 'await c6_io(fd, ev)'` |
 | C33 | 挂起点上已经压在求值栈里的中间值必须落在变量里（帧槽会随帧一起恢复，寄存器不会） | `the value pending across 'await' must live in a variable: store it in a local first` |
-| C34 | `co` / `go` / `task` 只能出现在函数体内 | `'co' can only be used inside a function`；`'go' can only be used inside a function`；`'task' can only be used inside a function` |
-| C35 | `co` 的操作数必须是一次 `async` 调用 | `the operand of 'co' must be the handle of an 'async' call`；`'co' requires an 'async' function: 'f' is a plain function (use 'go')` |
+| C34 | `co` / `spawn` / `task` 只能出现在函数体内 | `'co' can only be used inside a function`；`'spawn' can only be used inside a function`；`'task' can only be used inside a function` |
+| C35 | `co` 的操作数必须是一次 `async` 调用 | `the operand of 'co' must be the handle of an 'async' call`；`'co' requires an 'async' function: 'f' is a plain function (use 'spawn')` |
 | C36 | `task` 的初始化器必须是一次 `async` 调用（类型从初始化器推出，所以不能省） | `the initializer of a 'task' variable must be a call of an 'async' function`；`'=' expected` |
 | C37 | `async` 函数不能是方法（方法调用会被改写成普通调用，指向不存在的函数体） | `'async' functions cannot be methods: '…'` |
-| C38 | `go` 的操作数必须是**普通函数**的调用：不能是 `async` 函数（用 `co`）、不能是函数指针、参数类型必须能写进参数块（数组/VLA/函数指针形参不行） | `the operand of 'go' must be a call of a plain function`；`'go' requires a plain function: 'f' is 'async' (use 'co')`；`'go' does not support this signature: 'f'` |
-| C39 | `go` 不支持变参函数（参数块要按声明的形参布局） | `'go' does not support variadic functions: 'f'` |
-| C40 | `go` 不支持 `!error` 函数（错误没人接） | `'go' does not support fallible functions: 'f'` |
+| C38 | `spawn` 的操作数必须是**普通函数**的调用：不能是 `async` 函数（用 `co`）、不能是函数指针、参数类型必须能写进参数块（数组/VLA/函数指针形参不行） | `the operand of 'spawn' must be a call of a plain function`；`'spawn' requires a plain function: 'f' is 'async' (use 'co')`；`'spawn' does not support this signature: 'f'` |
+| C39 | `spawn` 不支持变参函数（参数块要按声明的形参布局） | `'spawn' does not support variadic functions: 'f'` |
+| C40 | `spawn` 不支持 `!error` 函数（错误没人接） | `'spawn' does not support fallible functions: 'f'` |
 | C41 | 裸 tag 只有在该 tag 可见、且同名**普通符号**（变量/函数/枚举常量/typedef）不在作用域内时才当作类型名；只接受已声明的 tag，不隐式前置声明；语句开头的 `TAG:` 仍是标签；K&R 定义里形参名与 tag 同名时按原型解析 | —（遮蔽/未声明时按普通 C 解析：`';' expected`、`'X' undeclared`、`initialization of incomplete type`） |
 | C42 | `foreach` 只能出现在函数体内 | `'foreach' can only be used inside a function` |
 | C43 | 绑定表是 1 或 2 个标识符（`_` 表示丢弃） | `'foreach' expects a binding name`；`'foreach' takes at most two bindings` |
@@ -1189,12 +1195,12 @@ parameter-list    = identifier , { "," , identifier } ;
 | C70 | 形参是借用，不能改写 | `'%s' is a borrow: it owns nothing, so it cannot be reassigned (copy it into an owned local first)` |
 | C71 | `own @T` 只接受 `new` 的结果、`move()` 或空值 | `'%s' takes ownership: only a fresh reference ('new') or the empty value can be stored in it` |
 | C72 | `shared @T` 槽要求对象用 `new shared T` 建（计数在对象头里） | `a 'shared' slot needs an object with an atomic count: create it with 'new shared T', not 'new T'` |
-| C73 | `@T`/`own @T` 不能跨线程或跨帧（`go`/`async` 只收 `shared @T`） | `passing a reference to 'go' requires 'shared'`；`passing a reference to 'async' requires 'shared'` |
+| C73 | `@T`/`own @T` 不能跨线程或跨帧（`spawn`/`async` 只收 `shared @T`） | `passing a reference to 'spawn' requires 'shared'`；`passing a reference to 'async' requires 'shared'` |
 | C74 | `union` 不能含托管字段；含托管字段的结构体必须在文件作用域定义、不能有托管柔性数组 | `'%s' is a union with a managed field: ...`；`... is defined in a block: define it at file scope`；`... has a flexible array of managed references` |
 | C75 | `memcpy`/`memmove` 不能作用于含托管字段的对象；`memset` 会漏引用（告警） | `... breaks reference counting; use a typed copy or 'own'` |
 | C76 | 析构 `drop` 不能手动调用、不能失败/挂起、必须返回 `void`、每个类型至多一个 | `a destructor cannot be called: ...`；`a destructor cannot fail: ...`；`a destructor cannot suspend: ...`；`'%s' already has a destructor` |
 | C77 | `move(x)` 的操作数必须是槽里的托管引用 | `'move' needs a managed reference held in a slot, not a '%s'` |
-| C78 | `thread` 句柄的初始化式必须是 `go` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'go f(...)'` |
+| C78 | `thread` 句柄的初始化式必须是 `spawn` 调用；句柄不能跨线程传、不能手动 `free` | `the initializer of a 'thread' variable must be 'spawn f(...)'` |
 | C79 | `move(p)` 之后、重新赋值之前不能再用 `p`（读/比较/解引用/传参/再 `move`） | `'%s' was moved: assign a new reference before using it` |
 | C80 | 字面量里引用了外层块作用域的名字，但它**没有按值捕获**（只在 `sizeof`/`typeof` 这类不求值的位置用到，或只是类型别名），于是它仍然退化成裸函数指针——裸函数指针带不了环境。有按值捕获时它就是一个闭包：放进 `closure RET (P…)` 槽（或推断声明）即可；要把它当普通函数指针用报 C93，捕获的东西不能按值拷贝报 C94 | `a function literal cannot capture 'x': without captures it is a plain function pointer, so its body sees only its parameters and the file scope (pass the value in as a parameter)` |
 | C81 | 函数字面量没有名字；名字要写在声明符里 | `a function literal has no name: 'p'` |
@@ -1212,7 +1218,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C93 | 有按值捕获的字面量出现在需要普通函数指针的位置（实参、返回值、函数指针变量），它已经是一个闭包；V1 的 C80 文本会在它之前照旧打印一遍 | `this literal captures '%s', so its value is a closure, not a function pointer: use 'closure RET (parameters)' as the type, or pass the value in as a parameter` |
 | C94 | 捕获了不能按值拷贝的名字/类型：`own`/`weak` 引用、块作用域 `static`/函数/枚举常量/类型/tag/枚举、数组、VLA、方法接收者、含 `drop` 或托管字段的结构体、含托管元素的元组、柔性数组、thread/task 句柄 | `a closure cannot capture '%s': an 'own' reference cannot be copied`；`a closure cannot capture '%s': upgrade the 'weak' reference to '@T' first`；`a closure cannot capture the block-scope 'static' '%s': move it to file scope`；`a closure cannot capture the function '%s' declared in a block: move the declaration to file scope`；`a closure cannot capture the constant '%s': move it to file scope`；`a closure cannot capture the array '%s': pass a slice 'T[:]' or a pointer instead`；`a closure cannot capture the variable length array '%s': its size is only known at run time`；`a closure cannot capture '%s': its type is declared in a block (move the type to file scope)`；`a closure cannot capture the method receiver '%s': ...`；`a closure cannot capture '%s': the type has a 'drop' destructor, ...`；`a closure cannot capture '%s': it holds managed references ...`；`a closure cannot capture '%s': a thread/task handle owns a resource ...`（分条消息全文见 [closure-design.md](closure-design.md) §9） |
 | C95 | 文件作用域或 `static` 局部的初始化式里不能放非空闭包（要分配）；`NULL` 可以，运行时再赋值 | `a closure is not a constant expression: initialize it at run time ('NULL' is fine at file scope)` |
-| C96 | 闭包不能带 `shared`/`weak`/`own`，也不能跨线程或任务（`go`/`async`/`thread` 的载荷、`async` 的参数与返回值） | `a closure cannot be 'shared', 'weak' or 'own': V2 closures are confined to the thread that creates them`；`a closure cannot cross a thread or a task: V2 closures are confined to the thread that creates them` |
+| C96 | 闭包不能带 `shared`/`weak`/`own`，也不能跨线程或任务（`spawn`/`async`/`thread` 的载荷、`async` 的参数与返回值） | `a closure cannot be 'shared', 'weak' or 'own': V2 closures are confined to the thread that creates them`；`a closure cannot cross a thread or a task: V2 closures are confined to the thread that creates them` |
 | C97 | 对闭包做不透明操作：`->`、`*`、下标、算术、`new`、`offsetof`（只能调用、和 `NULL` 比较、拷贝、`move`、置空释放） | `'%s' is a closure: it can only be called, compared with NULL, copied, moved or released`；`a closure cannot be created with 'new': use a function literal or a function pointer` |
 | C98 | 直接赋给自己的字面量捕获了目标槽自己（闭包会看到旧值；递归要写成具名函数） | `'%s' is captured by the closure being assigned to it: the closure would see the old value (use a named function for recursion)` |
 | C99 | 迭代器方法签名：`has()` 返回整数、`next()` 返回完整可赋值对象类型（`void *` 会擦除元素类型）、两个方法只接收 receiver | `iterator method 'has' must return an integer type (got 'T')`；`iterator method 'next' must return a value (got 'void')`；`iterator method 'next' must return an object type (got 'T')`；`iterator method 'next' cannot return 'void *': the element type would be erased (return 'E' or 'E *' with a concrete E)`；`iterator method 'has' must take only the receiver`；`iterator method 'next' must take only the receiver`；`iterator method 'next' cannot return a borrowed managed reference 'T'` |
@@ -1476,7 +1482,7 @@ math.Point p;                    (* 类型 => math__Point *)
 影响。导入的声明和模块自己的对象文件是两件事：链接时仍要把模块的目标
 文件（或包含它的库）放上命令行。
 
-`-emit-header FILE`（`-std=c6` 下）在编译模块时把导出的结构体、枚举、
+`-emit-header FILE`（模块是 `.c6` 文件时）在编译模块时把导出的结构体、枚举、
 typedef、函数和全局变量写成普通 C 头文件，符号名就是带前缀的 C 名。
 切片 `T[:]` 和元组 `(T1, T2)` 会生成 `NAME__slice_N` / `NAME__tuple_N`
 的 `typedef`；纯 C 侧包含这个头文件即可调用，不需要知道 `module` 的存在。
@@ -1491,8 +1497,8 @@ typedef、函数和全局变量写成普通 C 头文件，符号名就是带前�
 | `own @T p = new T;` / `= move(q);` | `__c6_gc_own_store` / `__c6_gc_move(&q)`：旧链整条释放，新值不计数 |
 | 出作用域 / `return` / `break` / `goto` | 内联 `__c6_gc_release(&p, mode)`（注册成一个清理点，所以每条路径都跑到，见 8.2） |
 | 对象计数归零 | 调描述符的 `drop`（若登记过），再按字段表逐个释放字段（数组逐元素、嵌入结构体递归），最后 `free` |
-| `go f(p)` / `task t = f(p)` | 实参块 / 任务前缀的那次拷贝 +1，块释放 / `__c6_co_destroy` 时 −1 |
-| `thread h = go f(x);` | `h = __tcc_th_spawn(&__c6_sp_f, block)`，作用域登记 `__c6_th_release(h)`（走清理点，每条退出路径都还） |
+| `spawn f(p)` / `task t = f(p)` | 实参块 / 任务前缀的那次拷贝 +1，块释放 / `__c6_co_destroy` 时 −1 |
+| `thread h = spawn f(x);` | `h = __tcc_th_spawn(&__c6_sp_f, block)`，作用域登记 `__c6_th_release(h)`（走清理点，每条退出路径都还） |
 | `h->join()` / `h->done()` / `h->value()` | `__c6_thread_join(h)` / `__c6_thread_done(h)` / `__c6_thread_value(h)` |
 | `t->wait()` / `t->start()` / `t->done()` / `t->kind()` | `__c6_co_wait(t)` / `__c6_co_start(t)` / `__c6_co_state(t) == -1` / `__c6_co_kind(t)`（接收者上转到 `struct __c6_task *`） |
 
@@ -1555,7 +1561,7 @@ comp:                                       (* 这一轮做完了 *)
   跨作用域时深的先跑（它的 `id` 也更大）。
 - 位是幂等的：同一个作用域实例里同一个 site 注册两次也只跑一次；离开
   作用域时位被清掉，重新进入就重新注册。
-- 全部是本帧的局部变量，所以 ISR、`go` 起来的线程、协程（`async` 的帧就在
+- 全部是本帧的局部变量，所以 ISR、`spawn` 起来的线程、协程（`async` 的帧就在
   任务里）、递归的每一帧都各跑各的，不需要任何线程级状态。
 - 挂起的任务被销毁（`__c6_co_destroy` / 回卷）时发的是 mode 2 的请求，所以
   那次派发会把 `errdefer` 也跑掉：被销毁的任务没有"正常结束"这回事。
@@ -2002,8 +2008,8 @@ int main(void)
 }
 ```
 
-完整可运行的版本见 `examples/async_demo.c`（用 `pipe()` 代替 socket，
-离线就能跑）；自测见 `tests/async.c`。
+完整可运行的版本见 `examples/async_demo.c6`（用 `pipe()` 代替 socket，
+离线就能跑）；自测见 `tests/async.c6`。
 
 ## 10. 未支持的写法
 
@@ -2011,7 +2017,7 @@ int main(void)
 
 | `p->drop()` / `drop(p)` 手动调析构 | 约束 C76（对象只由引用决定生死） |
 | `reset()` 成员 | 不提供：提前放手就是 `p = NULL` |
-| `@T`/`own @T` 进 `go`/`async` | 约束 C73 |
+| `@T`/`own @T` 进 `spawn`/`async` | 约束 C73 |
 | `weak @T` 在 `async` 函数里 | 允许（帧住在任务里，槽的地址一生不变） |
 | 通用图（`struct Node { @Node edges[4]; }`） | 约束 C66：环一律报错，只能写成 `own` 树或 `weak` 边 |
 | 运行期环回收（cycle collector） | 不做：环在编译期就挡住了 |
@@ -2019,7 +2025,7 @@ int main(void)
 | 写法 | 结果 |
 |---|---|
 | 捕获式闭包：`closure int() f = int() { int x = 1; return x; };` | 按值捕获进隐藏 env（V2 已落地），类型写成 `closure int()`；无捕获的字面量仍是裸函数指针，捕获了值却塞进普通函数指针报 C93（见 [closure-design.md](closure-design.md)） |
-| `task t = void() { … };` 之类包装 | 不需要：字面量本身就是函数指针，直接 `go f(x)` / 直接传 |
+| `task t = void() { … };` 之类包装 | 不需要：字面量本身就是函数指针，直接 `spawn f(x)` / 直接传 |
 | `try { … } catch { … }` 块形式 | 语法错误（`try` 只接一次调用） |
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |
 | `catch` 处理块自然落到末尾 | 约束 C6 |
@@ -2060,22 +2066,22 @@ int main(void)
 | `async` 体里的 VLA 局部量 / `alloca` | 约束 C87：栈上分配的空间在挂起之后不归这个 body（恢复时栈指针回到序言的位置） |
 | `async` 嵌套定义、`async inline`、`async int main` | 约束 C29 |
 | 用 `setjmp`/`ucontext`/独立栈实现的有栈协程 | 不在本扩展范围：`async` 体始终跑在调用方的栈上 |
-| `co f();`（`f` 是普通函数） | 约束 C35：普通函数用 `go` |
-| `co` / `go` / `task` 写在函数外 | 约束 C34 |
-| `go f();`（`f` 是 `async`） | 约束 C38：协程用 `co` |
-| `go p();`（`p` 是函数指针） | 约束 C38：跳板要按被调函数生成 |
-| `go f();` 而 `f` 的形参是数组 / VLA / 函数指针 | 约束 C38：参数块写不回去 |
-| `go vf(1);`（`vf` 是变参函数） | 约束 C39 |
-| `go ff();`（`ff` 带 `!error`） | 约束 C40 |
-| `go f();` 而 `f` 只有块作用域声明 | 约束 C38：需要文件作用域声明才能生成跳板 |
+| `co f();`（`f` 是普通函数） | 约束 C35：普通函数用 `spawn` |
+| `co` / `spawn` / `task` 写在函数外 | 约束 C34 |
+| `spawn f();`（`f` 是 `async`） | 约束 C38：协程用 `co` |
+| `spawn p();`（`p` 是函数指针） | 约束 C38：跳板要按被调函数生成 |
+| `spawn f();` 而 `f` 的形参是数组 / VLA / 函数指针 | 约束 C38：参数块写不回去 |
+| `spawn vf(1);`（`vf` 是变参函数） | 约束 C39 |
+| `spawn ff();`（`ff` 带 `!error`） | 约束 C40 |
+| `spawn f();` 而 `f` 只有块作用域声明 | 约束 C38：需要文件作用域声明才能生成跳板 |
 | `task t;`（不带初始化器） | 约束 C36：句柄类型从初始化器推出 |
 | `async` 函数当方法用（`p->f()`） | 约束 C37 |
 | `await c6_io(fd, ev)` 的 `fd` 不在 `[0, 1024)` | 任务按失败回收：`__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败（不会永远 park） |
 | 抢占式调度、把阻塞的 libc 调用（`read`/`printf`/…）自动变成让出点 | 不在本扩展范围：`co`/`__c6_co_run` 只推进协程，不 hook libc |
-| PE 目标上的 `go` | 还没有 PE 线程支持，运行时 trap |
-| 取消 / 强杀一个 `go` 出去的线程 | 不提供：线程总是被启动它的线程 join |
+| PE 目标上的 `spawn` | 还没有 PE 线程支持，运行时 trap |
+| 取消 / 强杀一个 `spawn` 出去的线程 | 不提供：线程总是被启动它的线程 join |
 | `co` 的句柄 | 不提供：`co` 把任务交给顶层就绪链表，任务一结束就被销毁，句柄会悬空。要句柄用 `task t = f(a); t->wait();` |
-| `thread h = f(a);`（不是 `go`） | 约束 C78：句柄只能来自 `go` |
+| `thread h = f(a);`（不是 `spawn`） | 约束 C78：句柄只能来自 `spawn` |
 | 等待线程时取非整数/指针的返回值 | `h->value()` 只有整数和指针能往返；结构体、浮点用 `shared @T` 或参数块带回 |
 | `for a \|i, v\| { }` / `for 0..n` | `for` 保持纯 C；迭代请用 `foreach` |
 | `foreach a { }`（不写绑定表） | 语法错误：绑定表必须紧跟 `foreach` |
@@ -2097,7 +2103,7 @@ int main(void)
 | `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
 | 泛型 `Vect@int` / `struct Vect@T` | 已落地：见 §3.11 与 [generics-design.md](generics-design.md)；实例名带模块前缀、`-emit-header` 可导出；容器迭代仍建议 `foreach` |
 | 体内成员函数 `struct Vect@T { T at(int i) { … } }` | 已落地：隐式 `self`、方法可先用后定义、符号仍是 `Vect_int_at`，见 §3.11 |
-| 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c` |
+| 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c6` |
 | 泛型值形参 `Buf@(T, 4)` / `struct Buf@(T, int N)` | 已落地：实参是常量表达式，体内当常量用（可作数组长度），见 §3.11 |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
 | `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
@@ -2113,7 +2119,7 @@ int main(void)
 | `(int, int) t; &t[0]` / 把元组直接当 `T[:]` 的底层数组 | 不支持：元素之间可能有 padding，不保证连续 |
 | `(int[2], int)`（数组作元素） | 约束 C51：数组不可赋值，请用指针、切片 `T[:]` 或包一层 struct |
 | `((int,int){1,2}[0])`（复合字面量外面再套一层括号、下标写在括号里） | 报 `')' expected (got '[')`：写成 `(int,int){1,2}[0]` 或 `((int,int){1,2})[0]` |
-| 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | **支持**（`tests/iface_agg.c`）；唯一的限制是类型要在 interface 声明之前可见 |
+| 用元组（或 struct）作 `interface` 方法签名里的参数/返回类型 | **支持**（`tests/iface_agg.c6`）；唯一的限制是类型要在 interface 声明之前可见 |
 | 在 `interface` 签名里第一次提到 `struct P`、之后才定义它 | 接口的方法列表按函数原型重放，那里的 tag 属于原型作用域（C11 6.2.1p7），和文件作用域的 `struct P` 不是同一个类型：把 `struct P;` 写在 `interface` 之前（诊断会提示 prototype-scope tag） |
 | `return {a, b};` 而返回类型是标量或 `void` | 约束 C59 |
 | `0..count`（点号区间） | 词法上 `0..3` 是 `0.` 与 `.3` 两个浮点常量，改词法会波及现有代码；统一写 `0:count` |
@@ -2146,7 +2152,7 @@ int main(void)
 | `err` | `c6_err_parse` / `c6_emit_propagate` | `tcc/tccgen.c` |
 | `co` | `c6_co_parse`、`__tcc_co_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
 | `thread` | `c6_thread_decl`、`__tcc_th_spawn` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
-| `go` | `c6_go_parse` / `c6_sp_parse` / `c6_sp_emit` / `c6_sp_flush`、`__tcc_sp_args` / `__tcc_th_start` / `__c6_th_join_all` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
+| `spawn` | `c6_spawn_parse` / `c6_sp_parse` / `c6_sp_emit` / `c6_sp_flush`、`__tcc_sp_args` / `__tcc_th_start` / `__c6_th_join_all` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c` |
 | `thread` 句柄 | `c6_thread_decl` / `c6_thread_defer_release`、`__tcc_th_spawn` / `__c6_th_release` / `__c6_thread_*` | `tcc/tccgen.c`、`tcc/lib/libtcc1.c`、`tcc/c99-rt.inc` |
 | 句柄方法 | `c6_method_lookup` + `c6_task_head_ptr`（`t->wait()`）、预置方法声明（`h->join()`） | `tcc/tccgen.c`、`tcc/tccpp.c` |
 | 软关键字 | `c6_soft_kw` / `c6_soft_kw_shadowed`（`block()` 与 `decl()` 两个入口） | `tcc/tccgen.c` |
@@ -2187,7 +2193,7 @@ int main(void)
 | 环检测 | `c6_gc_cycle_check()` / `c6_gc_cycle_dfs()`（`c6_gc_flush_descs()` 里） | `tcc/tccgen.c` |
 | 析构 `drop` | `c6_gc_drop_register()`（`c6_method_register()` 里）、`c6_gc_is_drop()` / `c6_gc_drop_callee()`（禁止显式调用）、描述符的 `drop` 指针 | 同上 |
 | 全局根 | `c6_gc_root_add()`（`decl()` 里）+ TU 末尾的 `__attribute__((constructor))` / `((destructor))` 对 | 同上 |
-| 运行期全部 | `__c6_gc_new` / `__c6_gc_store` / `__c6_gc_release` / `__c6_gc_drop` / `__c6_gc_move` / `__c6_gc_incref` / `__c6_gc_weak_store` / `__c6_gc_drain_budget` / `__c6_gc_shutdown`，以及 `async`/`go` 的任务槽归还（`__c6_rel_NAME`）| `tcc/lib/libtcc1.c`、`tcc/c99-rt.inc` |
+| 运行期全部 | `__c6_gc_new` / `__c6_gc_store` / `__c6_gc_release` / `__c6_gc_drop` / `__c6_gc_move` / `__c6_gc_incref` / `__c6_gc_weak_store` / `__c6_gc_drain_budget` / `__c6_gc_shutdown`，以及 `async`/`spawn` 的任务槽归还（`__c6_rel_NAME`）| `tcc/lib/libtcc1.c`、`tcc/c99-rt.inc` |
 | `foreach` | `c6_foreach_parse`（`block()` 的 `TOK_C6_FOREACH` 分支；`tok != '\|'` 时 `unget_tok` 退回表达式语句）、`c6_common_int_type` / `c6_is_int_type`、`c6_iter_proto_of` / `c6_iter_setup` / `c6_iter_call`（迭代器协议：结构化识别、静态调用或 vtable 分派）；数组/切片的隐藏槽复用 `c6_slice_spill`，循环体走 `lblock`；文件作用域诊断在 `decl()` | `tcc/tccgen.c` |
 | 切片运行期 | `__tcc_slice_index` / `__tcc_slice_sub` | `tcc/lib/libtcc1.c` |
 | `async` 声明 | `c6_async_declare`（合成 `struct NAME_task` 的 token）、`FuncAttr.func_async`、`parse_btype()` 的 `TOK_C6_ASYNC` | `tcc/tccgen.c`、`tcc/tcc.h` |
