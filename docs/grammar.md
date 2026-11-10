@@ -1166,9 +1166,10 @@ parameter-list    = identifier , { "," , identifier } ;
 | C115 | 模板不能重定义，参数表也不能改；`struct`/`union` 不能混用；形参不能重名，也不能与模板同名 | `redefinition of template '%s'`；`redefinition of template '%s' with a different parameter list`；`redefinition of template '%s' as a different kind`；`duplicate type parameter '%s'`；`a type parameter cannot have the same name as its template` |
 | C116 | 形参最多 16 个（括号里或单个） | `too many type parameters`；`too many type arguments` |
 
-（C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包；
-C106/C109 以及泛型里与值形参、模块前缀相关的部分仍未实现，
-见 [generics-design.md](generics-design.md) §9。）
+（C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包。
+泛型的 C103–C116 已全部落地：C106 与 C104 共用一条消息（多参数必须加括号），
+C109 由普通类型检查给出（`cannot convert 'struct Vect_char' to 'struct Vect_int'`），
+见 [generics-design.md](generics-design.md) §9。C90–C98 的闭包仍未实现。）
 
 ---
 
