@@ -13,24 +13,56 @@ tests/*.c 里的 `test "描述" { ... }` 会被编译成 `int __tcc_test_<i>(voi
 
     harness.py build/harness_fstr.c tests/fstr.c
     harness.py build/harness_module.c tests/module.c tests/tu/module.c
+
+个别 test 块要的东西裸机上真没有（例：线程的 `h->join()` / `h->value()` 走
+libtcc1 的每线程块，收尾会三重故障），这种块只要在 `test` 上一行写
+
+    // BARE-SKIP
+
+就从裸机的表里去掉：块号不变（还是 `__tcc_test_<n>`，只是没人调它），同一
+个文件里剩下的块照跑 —— 见 tests/generic_fn.c。
 """
 import re
 import sys
 
 TEST_RE = re.compile(r'^[ \t]*test[ \t]+"((?:[^"\\]|\\.)*)"', re.M)
+SKIP_MARK = "BARE-SKIP"
+
+
+def scan(src):
+    """按出现顺序返回 [(描述, 裸机跳过?)]；下标就是 __tcc_test_<n> 的 n。"""
+    lines = open(src, encoding="utf-8").read().split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        m = TEST_RE.match(line)
+        if not m:
+            continue
+        skip = False
+        for back in range(i - 1, -1, -1):       # 往前只看空行和 // 注释
+            s = lines[back].strip()
+            if not s:
+                continue
+            if not s.startswith("//"):
+                break
+            if SKIP_MARK in s:
+                skip = True
+        out.append((m.group(1), skip))
+    return out
 
 
 def main():
     if len(sys.argv) < 3:
         sys.exit("用法: harness.py <生成的 C 文件> <测试源>...")
     dst = sys.argv[1]
-    descs = []
+    blocks = []
     for src in sys.argv[2:]:
-        text = open(src, encoding="utf-8").read()
-        for m in TEST_RE.finditer(text):
-            descs.append(m.group(1))
-    if not descs:
+        blocks += scan(src)
+    if not blocks:
         sys.exit("没有 test 块")
+    descs = [(n, d) for n, (d, skip) in enumerate(blocks) if not skip]
+    nskip = len(blocks) - len(descs)
+    if not descs:
+        sys.exit("所有 test 块都标了 BARE-SKIP")
 
     out = []
     out.append("/* 自动生成（examples/boot/harness.py）：裸机版 -test harness */\n")
@@ -39,12 +71,12 @@ def main():
     out.append("int __tcc_err_clear(void);\n")
     out.append("const char *__tcc_err_msg_get(void);\n")
     out.append("void __c6_th_join_all(void);\n\n")
-    for n in range(len(descs)):
+    for n, d in descs:
         out.append("int __tcc_test_%d(void);\n" % n)
     out.append("\nstruct __c6_test_ent {\n    int (*fn)(void);\n"
                "    const char *desc;\n};\n\n")
     out.append("static struct __c6_test_ent __c6_test_tbl[] = {\n")
-    for n, d in enumerate(descs):
+    for n, d in descs:
         out.append('    { __tcc_test_%d, "%s" },\n' % (n, d))
     out.append("};\n\n")
     out.append("""void _start(void)
@@ -76,7 +108,7 @@ def main():
 }
 """)
     open(dst, "w", encoding="utf-8").write("".join(out))
-    print(len(descs))
+    print("%d %d" % (len(descs), nskip))
 
 
 main()

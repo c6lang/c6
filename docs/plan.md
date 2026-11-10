@@ -1012,16 +1012,18 @@ KVM，否则 TCG），断言全过时 payload 往 0x501 写 0，qemu 退出码 1
 `__c6_co_run()` 返回 -1（不会链接失败）。`examples/boot/main.c` 的裸机用例
 覆盖了交错的两个顶层 `co`、循环里的 `await`、失败任务计数和 `c6_io` 的失败路径。
 
-`make fstest-bare-tests` 把 `tests/*.c` 的 test 块搬上裸机：30 个文件、302 个
+`make fstest-bare-tests` 把 `tests/*.c` 的 test 块搬上裸机：32 个文件、341 个
 test 块、0 失败，每个文件一个镜像（`examples/boot/runtests.sh`）。test 块到
 `__tcc_test_<n>` 的对应表只存在编译器状态里，二进制里没有，所以由
 `examples/boot/harness.py` 按源码顺序扫出来生成入口；libc 那层由
 `examples/boot/shim.plain.c` 提供（printf/字符串/qsort/内存管道/select/桩子
 + 4MB 首次适配分配器）。跳过 7 个：`thread`/`thread_handle`/`gc_thread`/
 `gc_drop`/`tuple_thread` 要 `pthread_create`，`defer_thread` 要 `clone`/`futex`，
-`method` 要 libc 的 `FILE` 布局。踩到的三件事：默认 256KB 的 bump arena 不够（给
-calloc/free/realloc 就好）；`select` 要把 0/1/2 当永远就绪；多个 TU 一次
-编译会撞上 `c6_gc_new_lead` 的 NULL 标签名 strcmp（拆成 -c + 链接绕开）。
+`method` 要 libc 的 `FILE` 布局。整个文件跳太重时只跳一块：块上一行写
+`// BARE-SKIP`，harness 就把它从表里去掉、块号不变（`tests/generic_fn.c`
+里起线程那块，同一个文件剩下 8 块仍跑）。踩到的三件事：默认 256KB 的 bump
+arena 不够（给 calloc/free/realloc 就好）；`select` 要把 0/1/2 当永远就绪；
+多个 TU 一次编译会撞上 `c6_gc_new_lead` 的 NULL 标签名 strcmp（拆成 -c + 链接绕开）。
 
 "go 在裸机里是真并发吗" —— 现在能回答"是"，代价是自己写了个最小内核。
 `examples/boot/sched.plain.c`：8259A 重映射到 `0x20`、8254 每 10ms 一次、

@@ -1390,16 +1390,17 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 #### 把 tests/ 也搬上裸机
 
-`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**30 个测试
-文件、302 个 test 块，0 失败**，每个文件一个镜像，一共 14 秒。
+`make fstest-bare-tests` 把 `tests/*.c` 里的 test 块搬到裸机上跑：**32 个测试
+文件、341 个 test 块，0 失败**，每个文件一个镜像，一共 13 秒。
 
 ```
 ok   async: 20 test(s), 0 failure(s)
 ok   enum_scope: 8 test(s), 0 failure(s)
 ok   fstr: 15 test(s), 0 failure(s)
+ok   generic_fn: 8 test(s), 0 failure(s)（块级跳过 1）
 ok   try: 18 test(s), 0 failure(s)
 ...
-bare tests: 30 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）
+bare tests: 32 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method thread thread_handle tuple_thread）（块级跳过: generic_fn:1）
 ```
 
 要补的不是运行时，而是**测试自己用的 libc**：
@@ -1410,12 +1411,19 @@ bare tests: 30 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method 
 分配器。这层替身不是运行时要求的（`libtcc1` 的依赖全是 weak），是测试文件本身
 按 POSIX 写的。
 
-跳过的 6 个是真的缺东西，不是能补的：
+跳过的 7 个是真的缺东西，不是能补的：
 
 | 测试 | 缺什么 |
 |---|---|
 | `thread` / `thread_handle` / `gc_thread` / `gc_drop` / `tuple_thread` | `go` 本身现在能跑了（见上面那节），但这几个用的是 `h->join()` / `h->value()`，那条路要走 `libtcc1` 的每线程块（`calloc`/`free` + pthread 键），裸机上还不稳 —— 任务收尾之后会三重故障，没修完 |
+| `defer_thread` | 要 `clone`/`futex` 那套真正的线程创建 |
 | `method` | 要 `FILE` 的真实内存布局（`stdout->fflush()`），那是 libc 的内部结构 |
+
+整个文件都跳太重时，可以只跳一个 test 块：在块上一行写 `// BARE-SKIP`，
+[examples/boot/harness.py](examples/boot/harness.py) 生成裸机那张表时会把它
+略过（块号不变，同一个文件里剩下的块照跑）。`tests/generic_fn.c` 的
+「实例是普通函数：可以起线程」就是这么处理的 —— 它只缺线程，别的 8 个块
+在裸机上照样有意义。
 
 三个只有真跑一遍才会知道的坑：
 

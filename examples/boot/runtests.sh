@@ -10,6 +10,9 @@
 #   gc_drop gc_thread thread thread_handle tuple_thread    go -> pthread_create
 #   defer_thread                                           -> clone/futex
 #   method                                                 libc 的 FILE 布局
+#
+# 整个文件跳太重的话，可以只跳一个 test 块：在块上一行写 `// BARE-SKIP`
+# （harness.py 认这个标记，块号不变），例如 tests/generic_fn.c 里起线程那块。
 set -e
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -22,6 +25,7 @@ pass=0
 fail=0
 failed=""
 skipped=""
+block_skipped=""
 
 for src in tests/*.c; do
     name=$(basename "$src" .c)
@@ -41,18 +45,25 @@ for src in tests/*.c; do
         fi
     fi
 
-    if ! python3 examples/boot/harness.py "$build/harness_$name.c" $hsrcs >/dev/null 2>&1; then
+    if ! hinfo=$(python3 examples/boot/harness.py "$build/harness_$name.c" $hsrcs); then
         fail=$((fail + 1))
         failed="$failed $name"
         echo "FAIL $name: 生成 harness 失败"
         continue
+    fi
+    # harness.py 报 "跑几块 跳过几块"：块级跳过只影响这一个文件，写进 ok 行
+    nblock=$(echo "$hinfo" | awk '{print $2}')
+    note=""
+    if [ "${nblock:-0}" -gt 0 ]; then
+        note="（块级跳过 $nblock）"
+        block_skipped="$block_skipped $name:$nblock"
     fi
 
     if out=$(ONE_TU=$one examples/boot/build.sh "$src" $tu examples/boot/shim.plain.c \
              examples/boot/io.c "$build/harness_$name.c" 2>&1); then
         line=$(echo "$out" | grep 'test(s),' | tail -1)
         pass=$((pass + 1))
-        echo "ok   $name: $line"
+        echo "ok   $name: $line$note"
     else
         fail=$((fail + 1))
         failed="$failed $name"
@@ -61,7 +72,7 @@ for src in tests/*.c; do
     fi
 done
 
-echo "bare tests: $pass 通过, $fail 失败（跳过:$skipped）"
+echo "bare tests: $pass 通过, $fail 失败（跳过:$skipped）${block_skipped:+（块级跳过:$block_skipped）}"
 [ "$fail" -eq 0 ] || {
     echo "失败:$failed" >&2
     exit 1
