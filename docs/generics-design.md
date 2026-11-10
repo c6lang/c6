@@ -407,8 +407,11 @@ void f(Vect@int *v) {
    倾向前者（可读、`-emit-header` 稳定），实现时在 `decl()` 里查实例表即可。
    当前实现**没有做这个检查**：手写 `struct Vect_int` 会和 `Vect@int` 的实例撞名
    （谁先谁赢），见 §9 阶段 2 的第 11 条。
-2. **`-Wgeneric-depth` 的阈值与是否进 `make test`**：建议默认关闭，`-Wall` 打开，
-   深度 > 2 告警。
+2. **`-Wgeneric-depth` 的阈值与是否进 `make test`**：已按建议实现——默认关闭，
+   `-Wall` 打开，**写出**的应用链深于 2 层时告警。测试不需要额外开关：
+   `tests/run-tests.sh` 的诊断组支持文件内的 `// FLAGS …` 行，
+   `tests/errors/generic.c` 用 `// FLAGS -Wgeneric-depth` 加一个
+   `test_chain_depth` 片段（告警 + 一个真错误，两样都要出现在 stderr）。
 3. **模板实例的 `drop` 方法**：`|T| void drop(Vect@T *self)` 每实例一份，GC 描述符
    按实例指针填；与 `gc-design.md` 的环检测配合需要在实例化后重跑一次环检。
 4. **`module`/`package` 前缀**：模板名与实例 mangle 名都要带包前缀（`pkg__Vect_int`），
@@ -458,7 +461,7 @@ void f(Vect@int *v) {
 |#|内容|状态|
 |---|---|---|
 |11|体内成员函数（§8.5），随后废弃 `\|…\|` 在函数上的写法（保留一个版本的告警期）|⬜|
-|12|`-Wgeneric-depth`|⬜|
+|12|`-Wgeneric-depth`|✅ 默认关、`-Wall` 开，**源码里写出来的**应用链深于 2 层时提示起别名：`Vect@Vect@Vect@int` 报一次、`Vect@Vect@int` 不报，每个实例只报一次；模板体里「`A` 里嵌 `B`、`B` 里嵌 `Vect`」是正常嵌套，按写的 1 层算。深度直接读实例的实参（实参是实例就带上它自己的深度），所以重放不会虚报|
 
 **测试**（已落地，都在 `tests/run-tests.sh` 的既有分组里）
 
@@ -466,7 +469,7 @@ void f(Vect@int *v) {
 |---|---|
 |`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/值形参/函数体内定义模板，18 个 `test` 块|
 |`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块|
-|`tests/errors/generic.c`|C103–C116 的负例：裸模板名、实参个数、实参类型、重复/撞名形参、值形参、`\|…\|` 用法、实例名占用、实例互赋，21 个片段|
+|`tests/errors/generic.c`|C103–C116 的负例：裸模板名、实参个数、实参类型、重复/撞名形参、值形参、`\|…\|` 用法、实例名占用、实例互赋，加 `-Wgeneric-depth` 的深度告警，22 个片段|
 |`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，值形参实例 = `struct Buf_int_4`|
 |`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致|
 

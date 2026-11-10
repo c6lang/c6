@@ -6578,12 +6578,16 @@ typedef struct C6GenInst {
     CType *args;            /* the arguments, for receiver typed methods */
     long *vals;             /* the value arguments */
     int nargs;
+    int depth;              /* length of the written chain ending at it (§7) */
 } C6GenInst;
 
 static C6Gen *c6_gens = 0;
 static C6GenInst *c6_gen_insts = 0;
 static int c6_nb_gen_insts = 0;
 static int c6_gen_depth = 0;
+/* how many 'Name@arg' arguments are being parsed right now: the length of a
+   written chain like 'Vect@Vect@int', guarded like the replayed depth */
+static int c6_gen_arg_depth = 0;
 /* 1 while an unparenthesized type argument is parsed: 'Vect@int[:]' is a
    slice *of* the instance, so the argument must stop before '[' */
 static int c6_gen_arg_only = 0;
@@ -6728,6 +6732,9 @@ static Sym *c6_gen_last_sym = 0;
 
 #define C6_GEN_MAX_INST  1024
 #define C6_GEN_MAX_DEPTH 64
+/* '-Wgeneric-depth': nesting deeper than this is a style problem, not an
+   error: alias the instance type instead of writing the chain out (§7) */
+#define C6_GEN_WARN_DEPTH 2
 #define C6_GEN_MAX_PARAM 16
 
 static void c6_gen_fn_drop(C6GenFn *fn);
@@ -6784,6 +6791,7 @@ static void c6_gen_reset(void)
     c6_gen_last_sym = NULL;
     c6_nb_gen_insts = 0;
     c6_gen_depth = 0;
+    c6_gen_arg_depth = 0;
 }
 
 static C6Gen *c6_gen_find(int v)
@@ -7001,6 +7009,26 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
     inst->next = c6_gen_insts, c6_gen_insts = inst;
     c6_nb_gen_insts++;
 
+    /* '-Wgeneric-depth': how long the chain written in the source is, i.e.
+       'Vect@Vect@Vect@int' is 3.  It is read off the arguments (an argument
+       that is itself an instance of a template carries its own depth), so a
+       replayed body -- which writes plain names and nests deeply -- counts
+       as the 1 it looks like, and each instance is warned about once. */
+    for (i = 0, inst->depth = 1; i < nargs; i++) {
+        C6GenInst *arg = 0;
+        if ((args[i].t & VT_BTYPE) != VT_STRUCT || !args[i].ref)
+            continue;
+        for (arg = c6_gen_insts; arg; arg = arg->next)
+            if (arg->type.ref == args[i].ref)
+                break;
+        if (arg && arg->depth + 1 > inst->depth)
+            inst->depth = arg->depth + 1;
+    }
+    if (inst->depth > C6_GEN_WARN_DEPTH)
+        tcc_warning_c(warn_generic_depth)(
+            "generic instantiation nested %d deep: alias the instance type",
+            inst->depth);
+
     /* the layout is a file scope type, wherever the use site happens to be */
     save_global = c6_sym_global;
     save_scope = local_scope;
@@ -7057,6 +7085,10 @@ static CType c6_gen_argument(int grouped)
     memset(&ad, 0, sizeof ad);
     if (!grouped)
         c6_gen_arg_only++;
+    /* a long chain like 'Vect@Vect@...@int' is a limit of its own */
+    if (++c6_gen_arg_depth > C6_GEN_MAX_DEPTH)
+        tcc_error("generic instantiation nested too deeply (max %d)",
+                  C6_GEN_MAX_DEPTH);
     if (!parse_btype(&a, &ad, 0)) {
         if (tok >= TOK_UIDENT && !sym_find(tok) && !struct_find(tok))
             tcc_error("'%s' undeclared (a type parameter is only visible "
@@ -7072,6 +7104,7 @@ static CType c6_gen_argument(int grouped)
         c6_gen_arg_only--;
     }
     a.t &= ~(VT_STORAGE | VT_EXTERN | VT_STATIC);
+    c6_gen_arg_depth--;
     return a;
 }
 

@@ -22,6 +22,8 @@
 #                     -D<片段> 编译，要求 stderr 含该诊断；不带 -D 时该文件
 #                     必须能编译并运行通过。c99 模式下优先使用
 #                     `// EXPECT-C99 <片段>: <诊断>`，没有时才回退到 EXPECT。
+#                     `// FLAGS ...` 行给出只属于这个文件的编译参数（例如
+#                     '-Wgeneric-depth' 这类只管告警的开关）。
 #   tests/exit/*.c    退出码；`// EXIT <n>` 注释声明期望的进程退出码，编译成
 #                     可执行文件后运行，比对退出码（main 的返回值必须穿过
 #                     c6 的清理链）。
@@ -187,6 +189,9 @@ for src in "$ROOT"/tests/errors/*.c; do
     tu_src="$ROOT/tests/tu/$(basename "$src")"
     [ -e "$tu_src" ] && extra="$tu_src"
 
+    # 该文件专属的编译参数（只管告警的开关之类）
+    eflags=$(sed -n 's,^// *FLAGS *\(.*\)$,\1,p' "$src")
+
     # 期望表：片段名 <TAB> 诊断文本
     sed -n 's,^// *EXPECT *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect"
     sed -n 's,^// *EXPECT-C99 *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect-c99"
@@ -212,7 +217,7 @@ for src in "$ROOT"/tests/errors/*.c; do
         fi
 
         if [ "$BACKEND" = c99 ]; then
-            if $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS \
+            if $C99TCC -B "$ROOT/tcc" -std=c6 $TCCFLAGS $eflags \
                     -D"$frag" -o "$TMP/diag.c" "$src" $extra \
                     2>"$TMP/err" >/dev/null; then
                 # 生成成功不等于有错：没有机器码链接步骤的未解析引用，
@@ -226,14 +231,14 @@ for src in "$ROOT"/tests/errors/*.c; do
             fi
         elif [ -n "$extra" ]; then
             # 有两个单元时必须走真正的编译+链接（-run 只接一个源文件）
-            if build_exe "$TMP/diag.bin" "$src" $extra \
+            if build_exe "$TMP/diag.bin" $eflags "$src" $extra \
                     -D"$frag" 2>"$TMP/err" >/dev/null; then
                 ok=no
                 detail="$detail
 -D$frag: 没有报错"
             fi
         else
-            if $TCC $BASE $TCCFLAGS -D"$frag" -run "$src" \
+            if $TCC $BASE $TCCFLAGS $eflags -D"$frag" -run "$src" \
                     2>"$TMP/err" >/dev/null; then
                 ok=no
                 detail="$detail
@@ -254,7 +259,7 @@ $(cat "$TMP/missing")"
     done
 
     # 2b. 不带 -D 时必须能编译并运行通过
-    if ! out=$(build_exe "$TMP/errors.bin" "$src" $extra 2>"$TMP/err" && "$TMP/errors.bin" 2>>"$TMP/err"); then
+    if ! out=$(build_exe "$TMP/errors.bin" $eflags "$src" $extra 2>"$TMP/err" && "$TMP/errors.bin" 2>>"$TMP/err"); then
         ok=no
         detail="$detail
 正常路径编译或运行失败:$(cat "$TMP/err")$out"
