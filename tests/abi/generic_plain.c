@@ -7,11 +7,14 @@
  */
 struct Vect_int { int *data; int len; };
 struct Pair_int_int { int a, b; };
+struct Buf_int_4 { int data[4]; int len; };
 
 void c6_fill(struct Vect_int *v, int *d, int n);      /* c6 侧用 Vect@int */
 int Vect_int_vect_sum(struct Vect_int *v);            /* c6 侧的方法 */
 struct Pair_int_int c6_pair(int a, int b);            /* c6 侧用 Pair@(int,int) */
 int c6_check(void);
+void c6_buf_fill(struct Buf_int_4 *b);
+int plain_buf_check(void);
 
 /* 本 TU 用普通 struct 定义，c6 侧按 Vect@int 调用 */
 void plain_fill(struct Vect_int *v, int *d, int n)
@@ -45,6 +48,27 @@ int plain_check(void)
     return 0;
 }
 
+void plain_buf_fill(struct Buf_int_4 *b)
+{
+    int i = 0;
+
+    for (i = 0; i < 4; i++)
+        b->data[i] = (i + 1) * 10;
+    b->len = 4;
+}
+
+int plain_buf_check(void)
+{
+    struct Buf_int_4 b;
+
+    if (sizeof b != 4 * sizeof(int) + sizeof(int))
+        return 1;
+    c6_buf_fill(&b);
+    if (b.len != 4 || b.data[0] != 1 || b.data[3] != 4)
+        return 2;
+    return 0;
+}
+
 int main(void)
 {
     int d[2] = {7, 8};
@@ -60,5 +84,7 @@ int main(void)
         return 3;
     if (c6_check() != 0)
         return 4;
+    if (plain_buf_check() != 0)
+        return 5;
     return 0;
 }

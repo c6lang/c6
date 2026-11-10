@@ -8,8 +8,10 @@
 覆盖所有实例，显式应用 `vat@int(v, 0)` 与接收者写法 `p->vat(0)` 等价。
 实例 mangle 成 `Vect_int`，所以它就是一个普通 struct、普通函数——方法符号
 `Vect_int_<name>`，实例函数 `Vect_int_vat`，纯 C 的 TU 写 `struct Vect_int`
-即可互通（`tests/abi/generic.c`）。还没写的：值形参、`-emit-header` 的实例
-输出、模块前缀与实例名冲突检查、体内成员函数（§8.5），见 §9 的状态列。
+即可互通（`tests/abi/generic.c`）。值形参写成 C 参数表形状
+（`struct Buf@(T, int N)`，实参 `Buf@(int, 4)`）并按常量绑定。还没写的：
+`-emit-header` 的实例输出、模块前缀与实例名冲突检查、体内成员函数（§8.5），
+见 §9 的状态列。
 
 相关：[grammar.md](grammar.md)（§3.2 方法、§3.3 切片 `T[:]`、§3.7 裸 tag 类型名 C41、
 §3.8 元组、§7 静态约束、§11 实现位置）、[closure-design.md](closure-design.md)
@@ -25,9 +27,9 @@
 | D2 | tag 定义的形参挂名：`struct Vect@T { … }` | 形参与实参同形（Rust/Go/C#/Swift 的主流直觉）；此处名字先于体，形参可见 |
 | D3 | 名字出现在**体或返回类型之后**的声明（函数、typedef）用前缀 `\|T\|` | 由 A3「参数必须先于使用」推导，不是风格选择：C 的返回类型在名字左边，挂名形式永远看不到 `T` |
 | D4 | `@` 与既有托管引用 `@T` 共存 | 前缀 `@`（类型位置起点）= 托管引用；后缀 `@`（类型名之后）= 类型应用；位置不同，零歧义 |
-| D5 | 单参数省略括号，多参数必须括号；声明点与使用点**同一条括号规则** | `struct Map@(K, V)` / `Map@(char[:], int)`；无例外的第二条规则 |
+| D5 | 单参数省略括号，多参数必须括号；声明点与使用点**同一条括号规则**；值实参一律带括号 | `struct Map@(K, V)` / `Map@(char[:], int)`；常量表达式不会像类型那样自己停下来，`Arr@(4)` |
 | D6 | 单态化：一个实例 = 一个独立 struct tag + 一批 `<mangled>_<method>` 函数；模板本体永不完整 | 实例走 C 的 ABI，五个后端 + c99 后端 + `-emit-header` 零改动 |
-| D7 | 值形参写成 C 参数表形状 `int N`，内部按**枚举常量**绑定 | `N` 天然可进常量表达式（数组长度、切片长度），复用现成机制 |
+| D7 | 值形参写成 C 参数表形状 `int N`，内部按普通**常量符号**绑定（`VT_CONST`） | `N` 天然可进常量表达式（数组长度、切片长度、`case`、位域），复用现成机制 |
 | D8 | 实例名 mangle 成 `Vect_int`，与既有 `<Tag>_<name>` 方法名同族 | 跨 TU 稳定、可读；`-emit-header` 能直接写 `struct Vect_int` |
 | D9 | V1 不做类型参数推导：自由函数显式 `vat@int(v, 0)`；**方法调用由接收者定类型**（`v->vat(0)`，唯一省略 `@` 的地方） | 推导只保留「接收者已经写死了 T」这一种形态，不需要重载/推导引擎 |
 | D10 | 实例化点必须在模板**定义之后**；模板体内禁止自实例化 | 与 C「先声明后用」同构；自实例化是唯一的自噬递归源，直接关掉 |
@@ -180,6 +182,7 @@ mangle（跨 TU 稳定、`-emit-header` 可写、与既有 `<Tag>_<name>` 方法
 |`Vect@(int[:])`|`Vect_slice_int`|—|
 |`Vect@((int, int))`|`Vect_tuple_int_int`|—|
 |`Vect@(@Node)`|`Vect_m_Node`|—|
+|`Buf@(int, 4)` / `Buf@(int, -4)`|`Buf_int_4` / `Buf_int_m4`|`Buf_int_4_at`|
 
 实参的 mangle 拼法：标量用拼写、指针加 `_p`、切片前缀 `slice_`、元组前缀
 `tuple_`、托管引用前缀 `m_`（与普通指针区分，`@Node` 和 `Node *` 不会撞名）。
@@ -213,8 +216,16 @@ Buf@(int, 4)   b4  = {0};   /* struct Buf_int_4 */
 Buf@(char, 12) b12 = {0};   /* struct Buf_char_12 */
 ```
 
-`N` 在体内按**枚举常量**绑定：可进数组长度、`T[:]` 长度、`case`、
-位域宽度，任何常量表达式；不是变量，不能取地址、不能赋值（C110）。
+`N` 在体内按**普通常量符号**绑定（`VT_CONST`，值放在 `Sym.c`）：可进数组
+长度、`T[:]` 长度、`case`、位域宽度，任何常量表达式；不是变量，不能取地址、
+不能赋值（C110）。因为值就放在 `Sym.c` 这个 `int` 里，形参类型最宽是 `int`
+（`long long N` 在声明处报错）。
+
+值实参进 mangle：`Buf@(int, 4)` → `struct Buf_int_4`。负数的 `-` 不能出现在
+标识符里，所以用 `m` 记符号：`Buf@(int, -4)` → `struct Buf_int_m4`。
+
+值实参**必须带括号**，D5 的「单参数省略括号」只管类型实参：常量表达式不会
+像类型那样自己停下来，`f@4(x)` 会被读成 `4(x)`——所以 `Arr@(4)`、`total@(4)(raw)`。
 
 ### 2.4 方法
 
@@ -268,7 +279,7 @@ void f(Vect@int *v) {
 |C107|模板体内禁止自实例化|`cannot instantiate 'Vect' inside its own definition: write 'Vect@T'`|
 |C108|模板不完整（前向声明/未定义）时不能实例化，体内自引用只能取指针|`instantiation of undefined template 'Vect'`；`'Vect@T' is incomplete: only a pointer to it is allowed here`|
 |C109|不同实例是不同类型，无隐式互转|`incompatible types for assignment: 'Vect_int' and 'Vect_char'`|
-|C110|值形参不可赋值/取地址；实参必须是常量表达式且能装进形参类型|`'N' is a compile-time constant of a generic template`；`a value argument must be a constant expression`；`value argument 300 does not fit in 'unsigned char'`|
+|C110|值实参必须带括号；值形参不可赋值/取地址；实参必须是常量表达式且能装进形参类型；形参宽度不超过 `int`|`constant expression expected`；`value argument 40000 does not fit in 'short'`；`a value parameter must be an integer type no wider than 'int'`；`a value parameter is written '<type> NAME'`|
 |C111|每 TU 实例上限 1024|`too many generic instantiations in one translation unit (max 1024)`|
 |C112|实例化嵌套上限 64|`generic instantiation nested too deeply (max 64)`|
 |C113|`enum` 不能有类型参数|`enums cannot have type parameters`|
@@ -319,7 +330,7 @@ void f(Vect@int *v) {
 |模板前向声明|同上，`tok` 为 `';'` 时不解析体|
 |使用点 `X@args`|`parse_btype()` 的 `default`（标识符）分支：`sym_find()` 未命中、`struct_find()` 未命中之后（§11 记录的 tag 回退旁边）加第三查 `c6_generic_find()`；命中要求 `tok == '@'`。**必须就地消费**：`@` 的前缀托管分支在 `parse_btype()` 的 while 顶部（`tcc/tccgen.c:7104`），晚一步就会被当成托管引用|
 |函数/typedef 模板 `\|T\|`|文件作用域 `decl()` 入口判 `tok == '\|'`（`\|` 不能起一个声明或表达式语句；`foreach \|…\|` 的分派在 `block()`，不冲突）；与 struct 共用「压形参作用域」的同一段代码|
-|形参绑定|类型形参 = `SYM_TYPEDEF`（`struct_decl` 前压栈）；值形参 = 枚举常量式 `Sym`（`VT_CONST` + `c.i`），因此 `N` 自动可进 `expr_const`|
+|形参绑定|类型形参 = `SYM_TYPEDEF`（`struct_decl` 前压栈）；值形参 = 普通常量 `Sym`（`VT_CONST` + `Sym.c`），因此 `N` 自动可进 `expr_const`|
 |实例化体|`skip_or_save_block(&body)` 捕获 token（`tcc/tccgen.c:1022` 声明、`c6_lit_parse()` 8519/8545 与 `c6_tuple_speculate()` 是先例），实例化时重放|
 |实例表|`C6Generic`（模板：名字/形参种类/tag/体 token）+ `C6Instance`（mangle 名 → tag），`c6_tu_reset` 复位|
 |方法注册|实例 tag 走既有 `c6_method_register()` / `c6_method_lookup()`；泛型方法在实例化后按实例 tag 注册|
@@ -437,7 +448,7 @@ void f(Vect@int *v) {
 
 |#|内容|状态|
 |---|---|---|
-|8|值形参（枚举常量绑定）+ C110|⬜（现在报 `value parameters are not implemented yet`）|
+|8|值形参（常量绑定）+ C110|✅ `struct Buf@(T, int N)` / `Buf@(int, 4)`，mangle 带实参拼写，`\|T, int N\|` 方法模板可覆盖所有实例（`tests/generic.c`、`tests/abi/generic.c`）|
 |9|模板前向声明 + C108|✅ `struct Fwd@T;` 可用；实例化报 `instantiation of undefined template`|
 |10|实例上限 C111/C112；`-emit-header` 输出实例|C111/C112 ✅（1024 / 64）；`-emit-header` ⬜|
 |11|`module`/`package` 前缀（模板名、实例 mangle 名，§8.4）与实例名冲突检查（§8.1）|⬜ 现在模板是 TU 内的裸名字|
@@ -453,15 +464,14 @@ void f(Vect@int *v) {
 
 |文件|内容|
 |---|---|
-|`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/函数体内定义模板，14 个 `test` 块|
+|`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/值形参/函数体内定义模板，18 个 `test` 块|
 |`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块|
-|`tests/errors/generic.c`|C103/C104/C105/C107/C108/C110/C113/C114/C115、重复形参、模板名撞名负例，16 个片段|
-|`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`|
+|`tests/errors/generic.c`|C103/C104/C105/C107/C108/C110/C113/C114/C115、重复形参、模板名撞名负例，19 个片段|
+|`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`，值形参实例 = `struct Buf_int_4`|
 |`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致|
 
-后续要拆/要补的（对应上面 ⬜ 的条目）：`tests/generic/nest.c`、`value.c`、
-`suffix.c`——现在这些形态都并进 `tests/generic.c` 与 `tests/generic_fn.c` 了，
-值形参到位后再拆开。
+后续要拆的（对应上面 ⬜ 的条目）：`tests/generic/nest.c`、`suffix.c`——现在
+这些形态都并进 `tests/generic.c` 与 `tests/generic_fn.c` 了。
 
 跨 TU 按值传实例要注意 c99 后端：它把 8 字节的 struct 打包成一个整型寄存器
 传（和 SysV 一致），更大的 struct 用隐藏返回指针（和系统 ABI 不符）——这是与

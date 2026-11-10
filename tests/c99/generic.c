@@ -9,6 +9,7 @@
 // EXIT 0
 // OUTPUT 6 30
 // OUTPUT 4
+// OUTPUT 8
 
 #include <stdio.h>
 
@@ -25,6 +26,9 @@ int vect_sum(Vect@int *v)
 
 struct Pair@(A, B) { A a; B b; };
 
+/* 值形参：实例名带上它的拼写，'Buf@(int, 4)' 就是 'struct Buf_int_4' */
+struct Buf@(T, int N) { T data[N]; int len; };
+
 int main(void)
 {
     int d[3] = {1, 2, 3};
@@ -32,8 +36,10 @@ int main(void)
     Vect@int v = {d, 3};
     Vect@long lv = {ld, 2};
     Pair@(int, char *) p = {7, "x"};
+    Buf@(int, 4) b = {{1, 2, 3, 4}, 4};
 
     printf("%d %d\n", (&v)->vect_sum(), (int)(lv.data[0] + lv.data[1]));
     printf("%d\n", (int)sizeof(Vect@long) / (int)sizeof(p.a));
+    printf("%d\n", b.data[3] + b.len);
     return 0;
 }

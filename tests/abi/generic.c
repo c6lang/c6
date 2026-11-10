@@ -17,6 +17,7 @@
 
 struct Vect@T { T *data; int len; };
 struct Pair@(A, B) { A a; B b; };
+struct Buf@(T, int N) { T data[N]; int len; };
 
 /* 方法：符号名是 Vect_int_vect_sum */
 int vect_sum(Vect@int *v)
@@ -43,10 +44,23 @@ Pair@(int, int) c6_pair(int a, int b)
     return p;
 }
 
+/* 值形参也是 mangle 的一部分：'Buf@(int, 4)' 就是 'struct Buf_int_4'，
+   数组长度 'N' 在布局里已经是一个普通常量 */
+void c6_buf_fill(Buf@(int, 4) *b)
+{
+    int i = 0;
+
+    for (i = 0; i < 4; i++)
+        b->data[i] = i + 1;
+    b->len = 4;
+}
+
 /* 纯 C 侧用普通 struct 定义 */
 void plain_fill(Vect@int *v, int *d, int n);
 Pair@(int, int) plain_pair(int a, int b);
 int plain_check(void);
+void plain_buf_fill(struct Buf_int_4 *b);
+int plain_buf_check(void);
 
 int c6_check(void)
 {
@@ -64,5 +78,17 @@ int c6_check(void)
         return 3;
     if (plain_check() != 0)
         return 4;
+    {
+        Buf@(int, 4) b = {{0}, 0};
+
+        plain_buf_fill(&b);
+        if (b.len != 4 || b.data[3] != 40)
+            return 5;
+        c6_buf_fill(&b);
+        if (b.len != 4 || b.data[3] != 4)
+            return 6;
+    }
+    if (plain_buf_check() != 0)
+        return 7;
     return 0;
 }

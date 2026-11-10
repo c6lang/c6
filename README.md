@@ -22,7 +22,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；体里只看得见参数和文件作用域。捕获式闭包（`closure RET (P…)`，V2）已有完整设计，尚未实现，见 [docs/closure-design.md](docs/closure-design.md) |
 | `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（VLA 除外） |
-| 泛型（阶段 1 已落地，值形参待做） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。值形参 `Buf@(T, 4)` 还没落地。见 [docs/generics-design.md](docs/generics-design.md) |
+| 泛型（阶段 1 已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c`）。见 [docs/generics-design.md](docs/generics-design.md) |
 
 扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
 

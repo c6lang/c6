@@ -27,12 +27,44 @@ struct Holder@T { Vect@T v; T extra; };
 
 struct Empty@T { T only; };
 
+/* 值形参：写成 C 参数表形状，按常量绑定，所以能当数组长度 */
+struct Buf@(T, int N) { T data[N]; int len; };
+
+/* 只有值形参的模板，实例名带上实参的拼写：'Step@(-3)' */
+struct Step@(int N) { int step; };
+
 /* 实例就是普通结构体，方法照常写：接收者写成 Vect@int */
 int vect_sum(Vect@int *v)
 {
     int i = 0, s = 0;
     for (i = 0; i < v->len; i++)
         s += v->data[i];
+    return s;
+}
+
+/* 只有值形参的模板：实例之间只差常量 */
+struct Arr@(int N) { int d[N]; };
+
+/* 值形参当位域宽度 */
+struct Flags@(T, int B) { T on : B; T off : B; };
+
+/* 函数模板也可以只有值形参，用在常量表达式里 */
+|int N| int total(int *d)
+{
+    int i = 0, s = 0;
+
+    for (i = 0; i < N; i++)
+        s += d[i];
+    return s;
+}
+
+/* 形参表里有值形参时，方法模板照样一份覆盖所有实例 */
+|T, int N| int btotal(Buf@(T, N) *self)
+{
+    int i = 0, s = 0;
+
+    for (i = 0; i < self->len; i++)
+        s += (int)self->data[i];
     return s;
 }
 
@@ -186,6 +218,47 @@ test "空的实例也照常工作" {
         err(1, "单字段实例不对");
     if (sizeof(Empty@long) != sizeof(long))
         err(2, "单字段实例应当和字段一样大");
+}
+
+test "值形参当数组长度" {
+    Buf@(int, 4) b = {{1, 2, 3, 4}, 4};
+    Buf@(char, 12) c = {{'x'}, 1};
+
+    if (sizeof(Buf@(int, 4)) != 4 * sizeof(int) + sizeof(int))
+        err(1, "值形参的布局不对");
+    if (sizeof(Buf@(char, 12)) != 12 + sizeof(int))
+        err(2, "另一个值实参应当是另一个实例");
+    if (b.data[3] != 4 || c.data[0] != 'x' || b.len != 4)
+        err(3, "值形参实例的内容不对");
+}
+test "值实参可以是常量表达式（含负数）" {
+    Step@(2 + 1) st = {7};
+    Step@(-3) neg = {-7};
+
+    if (st.step != 7 || neg.step != -7)
+        err(1, "值实参不对");
+    if (sizeof(Step@(2 + 1)) != sizeof(Step@(-3)))
+        err(2, "同一个模板的实例布局应当一样");
+}
+test "只有值形参的模板、位域宽度" {
+    int raw[4] = {1, 2, 3, 4};
+    Arr@(4) a = {{9, 8, 7, 6}};
+    Flags@(unsigned, 3) f = {5, 2};
+
+    if (total@(4)(raw) != 10 || total@(2 + 2)(raw) != 10)
+        err(1, "值形参的函数模板不对");
+    if (sizeof(Arr@(4)) != 4 * sizeof(int) || a.d[3] != 6)
+        err(2, "只有值形参的模板不对");
+    if (f.on != 5 || f.off != 2)
+        err(3, "值形参当位域宽度不对");
+}
+test "值形参在方法模板里" {
+    Buf@(int, 4) b = {{1, 2, 3, 4}, 4};
+
+    if ((&b)->btotal() != 10)
+        err(1, "值形参的方法模板不对");
+    if (btotal@(int, 4)(&b) != 10)
+        err(2, "显式写法和接收者写法应当一样");
 }
 
 int main(void)
