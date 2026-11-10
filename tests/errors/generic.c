@@ -18,6 +18,12 @@ struct Bad@T { Bad@(T *) p; };
 // EXPECT test_drop_struct: error: an instance drops 'struct'
 // EXPECT test_value_param: error: value parameters are not implemented yet
 // EXPECT test_bad_kind: error: redefinition of template 'Vect' as a different kind
+// EXPECT test_param_before_use: error: type parameter 'T' is used before it is declared: write '|T| T vat(...)'
+// EXPECT test_same_name: error: a type parameter cannot have the same name as its template
+// EXPECT test_dup_param: error: duplicate type parameter 'T'
+// EXPECT test_unbound_param: error: 'T' undeclared (a type parameter is only visible inside its template)
+// EXPECT test_fn_bare_name: error: 'id' is generic: write 'id@...'
+// EXPECT test_value_binder: error: value parameters are not implemented yet
 
 #if defined test_bare_name
 int main(void)
@@ -70,6 +76,24 @@ int main(void)
 }
 #elif defined test_bad_kind
 union Vect@T { T x; };
+int main(void) { return 0; }
+#elif defined test_param_before_use
+T vat(Vect@T *self, int i);
+int main(void) { return 0; }
+#elif defined test_same_name
+|Vect| Vect bad(Vect@Vect *v);
+int main(void) { return 0; }
+#elif defined test_dup_param
+|T, T| void dup(T a);
+int main(void) { return 0; }
+#elif defined test_unbound_param
+void f(Vect@T *v) { }
+int main(void) { return 0; }
+#elif defined test_fn_bare_name
+|T| T id(T x) { return x; }
+int main(void) { return id(3); }
+#elif defined test_value_binder
+|int N| void f(void);
 int main(void) { return 0; }
 #else
 int main(void)

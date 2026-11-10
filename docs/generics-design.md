@@ -1,12 +1,15 @@
 # c6 泛型设计（`@` 应用 / `|…|` 绑定）
 
-状态：**阶段 1 已落地（部分）**，`-std=c6` 下可用。能写的：`struct Vect@T {…}`
+状态：**阶段 1 已落地**，`-std=c6` 下可用。能写的：`struct Vect@T {…}`
 / `struct Map@(K, V) {…}` 模板声明，`Vect@int` / `Map@(char[:], int)` 应用，
 嵌套（`Vect@Vect@int`）与自引用，`typedef` 别名，实例上的方法，切片后缀
-（`Vect@int[:]`）；实例 mangle 成 `Vect_int`，所以它就是一个普通 struct——
-方法符号 `Vect_int_<name>`，纯 C 的 TU 写 `struct Vect_int` 即可互通
-（`tests/abi/generic.c`）。还没写的：`|…|` 前缀（函数模板、「一份方法覆盖
-所有实例」）、值形参、`-emit-header` 的实例输出，见 §9 的状态列。
+（`Vect@int[:]`）；函数/typedef 模板用前缀 `|T|` 绑定
+（`|T| T vat(Vect@T *self, int i)`、`|T| typedef Vect@T MyVec`），一份模板
+覆盖所有实例，显式应用 `vat@int(v, 0)` 与接收者写法 `p->vat(0)` 等价。
+实例 mangle 成 `Vect_int`，所以它就是一个普通 struct、普通函数——方法符号
+`Vect_int_<name>`，实例函数 `Vect_int_vat`，纯 C 的 TU 写 `struct Vect_int`
+即可互通（`tests/abi/generic.c`）。还没写的：值形参、`-emit-header` 的实例
+输出、模块前缀与实例名冲突检查、体内成员函数（§8.5），见 §9 的状态列。
 
 相关：[grammar.md](grammar.md)（§3.2 方法、§3.3 切片 `T[:]`、§3.7 裸 tag 类型名 C41、
 §3.8 元组、§7 静态约束、§11 实现位置）、[closure-design.md](closure-design.md)
@@ -260,7 +263,7 @@ void f(Vect@int *v) {
 |---|---|---|
 |C103|模板名不能单独作类型|`'Vect' is generic: write 'Vect@int'`|
 |C104|实参个数必须与形参个数一致|`'Map' needs 2 arguments (got 1)`；`'Vect' takes no value argument`|
-|C105|形参只在模板体/声明内可见；用到形参的位置必须晚于形参表（A3）|`'T' undeclared (a type parameter is only visible inside its template)`；`type parameter 'T' is used before it is declared: write '\|T\| T vat(Vect@T *, int)'`|
+|C105|形参只在模板体/声明内可见；用到形参的位置必须晚于形参表（A3）|`'T' undeclared (a type parameter is only visible inside its template)`；`type parameter 'T' is used before it is declared: write '\|T\| T vat(...)'`|
 |C106|多参数必须加括号|`a template with more than one parameter needs parentheses: 'Map@(char[:], int)'`|
 |C107|模板体内禁止自实例化|`cannot instantiate 'Vect' inside its own definition: write 'Vect@T'`|
 |C108|模板不完整（前向声明/未定义）时不能实例化，体内自引用只能取指针|`instantiation of undefined template 'Vect'`；`'Vect@T' is incomplete: only a pointer to it is allowed here`|
@@ -426,9 +429,9 @@ void f(Vect@int *v) {
 |2|`struct_decl()` 的 `@` 形参解析（类型形参、形参符号栈）|✅|
 |3|`parse_btype()` 的模板名第三查（`sym_find` → `struct_find` → 模板）+ `@` 实参解析 + mangle|✅|
 |4|`skip_or_save_block` 捕获 + 重放实例化（`typedef` 绑形参 + `c6_decl_tokens`）|✅|
-|5|函数/typedef 模板的 `\|…\|` 前缀（方法要用它）|⬜|
+|5|函数/typedef 模板的 `\|…\|` 前缀（方法要用它）|✅ `\|T\| T vat(Vect@T *, int)`、`\|K, V\|`、`\|T\| typedef …`；先声明后定义、`T!error`、`go`/`thread` 都可用|
 |6|约束 C103–C116|部分：C103/C104/C105/C107/C108/C110–C116 已有诊断 + 用例；C106/C109 待补|
-|7|方法：实例 tag 注册 + 接收者定类型调用|✅ 接收者写具体实例（`int vect_sum(Vect@int *v)`）；`\|T\|` 一份覆盖所有实例要等 5|
+|7|方法：实例 tag 注册 + 接收者定类型调用|✅ 两种都行：接收者写具体实例（`int vect_sum(Vect@int *v)`），或 `\|T\|` 一份覆盖所有实例（`p->vat(0)` 按 `p` 的实例定 T）|
 
 **阶段 2（补齐）**
 
@@ -451,13 +454,14 @@ void f(Vect@int *v) {
 |文件|内容|
 |---|---|
 |`tests/generic.c`|模板/实例/嵌套/自引用/别名/方法/切片/元组/函数体内定义模板，14 个 `test` 块|
-|`tests/errors/generic.c`|C103/C104/C107/C108/C110/C113/C114/C115 负例，10 个片段|
+|`tests/generic_fn.c`|`\|T\|` 函数/typedef 模板：一份方法覆盖所有实例、显式应用与接收者写法等价、多形参、先声明后定义、切片形参、`T!error` + `catch`、`go`/`thread`，9 个 `test` 块|
+|`tests/errors/generic.c`|C103/C104/C105/C107/C108/C110/C113/C114/C115、重复形参、模板名撞名负例，16 个片段|
 |`tests/abi/generic.c` + `generic_plain.c`|跨 TU：`Vect@int` = `struct Vect_int`，方法符号 `Vect_int_vect_sum`|
-|`tests/c99/generic.c`|c99 后端输出可编译，行为一致|
+|`tests/c99/generic.c`、`tests/c99/generic_fn.c`|c99 后端输出可编译，行为一致|
 
 后续要拆/要补的（对应上面 ⬜ 的条目）：`tests/generic/nest.c`、`value.c`、
-`suffix.c`、`method.c`（`\|T\|` 与 `vat@int` 版本）——现在这些形态都并进
-`tests/generic.c` 了，值形参和 `\|…\|` 到位后再拆开。
+`suffix.c`——现在这些形态都并进 `tests/generic.c` 与 `tests/generic_fn.c` 了，
+值形参到位后再拆开。
 
 跨 TU 按值传实例要注意 c99 后端：它把 8 字节的 struct 打包成一个整型寄存器
 传（和 SysV 一致），更大的 struct 用隐藏返回指针（和系统 ABI 不符）——这是与

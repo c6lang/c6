@@ -841,6 +841,13 @@ static void c6_import_parse(void);
 static void c6_interface_parse(void);
 static int c6_emit_auto_impls(void);
 static void c6_tu_reset(void);
+/* generics: templates of structs ('struct Vect@T') and of functions and
+   typedefs ('|T| T vat(Vect@T *self, int i)') */
+static void c6_gen_binder(void);
+static Sym *c6_gen_fn_apply(int name);
+static int c6_gen_flush(void);
+static void c6_gen_param_check(int name, int *ptok, int nparams);
+static int c6_ptr_tag(CType *type);
 /* 'module NAME;' namespace prefixing and 'import NAME;' declaration loading */
 static int c6_mod_name(int v);
 static void c6_module_parse(void);
@@ -2269,7 +2276,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
         gen_inline_functions(s1);
         /* a deferred body ('static inline', a function literal) may hold
            another literal, so alternate until nothing new turns up */
-        if (!c6_lit_flush() && !c6_emit_auto_impls())
+        if (!c6_lit_flush() && !c6_emit_auto_impls() && !c6_gen_flush())
             break;
     }
     /* the type descriptors last: a 'drop' method may be declared after the
@@ -6566,6 +6573,9 @@ typedef struct C6GenInst {
     struct C6GenInst *next;
     int tag;                /* the mangled tag token, e.g. 'Vect_int' */
     CType type;             /* 'struct Vect_int' */
+    struct C6Gen *gen;      /* the template it came from */
+    CType *args;            /* the arguments, for receiver typed methods */
+    int nargs;
 } C6GenInst;
 
 static C6Gen *c6_gens = 0;
@@ -6576,14 +6586,58 @@ static int c6_gen_depth = 0;
    slice *of* the instance, so the argument must stop before '[' */
 static int c6_gen_arg_only = 0;
 
+#define C6_GEN_FUNC    0
+#define C6_GEN_TYPEDEF 1
+
+typedef struct C6GenFn {
+    struct C6GenFn *next;
+    int name;               /* the declared name, as written */
+    int kind;               /* C6_GEN_FUNC / C6_GEN_TYPEDEF */
+    int nparams;
+    int *ptok;              /* parameter names */
+    int recv;               /* struct template the receiver mentions, or 0 */
+    int name_at;            /* word index of the name inside 'decl' */
+    TokenString *decl;      /* the declaration, name included, no ';' */
+    TokenString *body;      /* '{' ... '}' of a definition, or NULL */
+} C6GenFn;
+
+typedef struct C6GenPend {  /* a body waiting for the end of the unit */
+    struct C6GenPend *next;
+    C6GenFn *fn;
+    CType *args;
+    int nargs;
+    Sym *sym;
+    TokenString *body;
+} C6GenPend;
+
+typedef struct C6GenAppl {  /* an applied template, once */
+    struct C6GenAppl *next;
+    char *key;
+    Sym *sym;
+} C6GenAppl;
+
+static C6GenFn *c6_gen_fns = 0;
+static C6GenPend *c6_gen_pend = 0, *c6_gen_pend_tail = 0;
+static C6GenAppl *c6_gen_appls = 0;
+/* set by decl() while a template signature is replayed: it is the only way
+   to learn the symbol a method template got ('Vect_int_vat') */
+static int c6_gen_record_sym = 0;
+static Sym *c6_gen_last_sym = 0;
+
+
 #define C6_GEN_MAX_INST  1024
 #define C6_GEN_MAX_DEPTH 64
 #define C6_GEN_MAX_PARAM 16
+
+static void c6_gen_fn_drop(C6GenFn *fn);
 
 static void c6_gen_reset(void)
 {
     C6Gen *g = 0;
     C6GenInst *i = 0;
+    C6GenFn *f = 0;
+    C6GenPend *p = 0;
+    C6GenAppl *a = 0;
 
     while ((g = c6_gens) != NULL) {
         c6_gens = g->next;
@@ -6594,8 +6648,33 @@ static void c6_gen_reset(void)
     }
     while ((i = c6_gen_insts) != NULL) {
         c6_gen_insts = i->next;
+        tcc_free(i->args);
         tcc_free(i);
     }
+    while ((f = c6_gen_fns) != NULL) {
+        c6_gen_fns = f->next;
+        if (f->decl)
+            tok_str_free(f->decl);
+        if (f->body)
+            tok_str_free(f->body);
+        tcc_free(f->ptok);
+        tcc_free(f);
+    }
+    while ((p = c6_gen_pend) != NULL) {
+        c6_gen_pend = p->next;
+        if (p->body)
+            tok_str_free(p->body);
+        tcc_free(p->args);
+        tcc_free(p);
+    }
+    while ((a = c6_gen_appls) != NULL) {
+        c6_gen_appls = a->next;
+        tcc_free(a->key);
+        tcc_free(a);
+    }
+    c6_gen_pend_tail = 0;
+    c6_gen_record_sym = 0;
+    c6_gen_last_sym = NULL;
     c6_nb_gen_insts = 0;
     c6_gen_depth = 0;
 }
@@ -6712,19 +6791,27 @@ static void c6_gen_frag(char *out, int outsz, CType *type)
         pstrcpy(out, outsz, core);
 }
 
-static void c6_gen_mangle(C6Gen *g, CType *args, int nargs,
-                          char *out, int outsz)
+/* '<name>_<arg>_<arg>': the instance name of a template application, and
+   also the symbol suffix of a function template instance */
+static void c6_gen_mangle_name(int name, CType *args, int nargs,
+                               char *out, int outsz)
 {
     char buf[4096] = {0};
     int i = 0;
 
-    pstrcpy(buf, sizeof buf, get_tok_str(g->name, NULL));
+    pstrcpy(buf, sizeof buf, get_tok_str(name, NULL));
     for (i = 0; i < nargs; i++) {
         char one[1024] = {0};
         c6_gen_frag(one, sizeof one, &args[i]);
         snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "_%s", one);
     }
     pstrcpy(out, outsz, buf);
+}
+
+static void c6_gen_mangle(C6Gen *g, CType *args, int nargs,
+                          char *out, int outsz)
+{
+    c6_gen_mangle_name(g->name, args, nargs, out, outsz);
 }
 
 /* the hidden tag of the template itself: 'struct Vect' for 'Vect@T'.  It is
@@ -6780,6 +6867,10 @@ static CType c6_gen_instance(C6Gen *g, CType *args, int nargs)
 
     inst = tcc_mallocz(sizeof *inst);
     inst->tag = tok_alloc_const(name);
+    inst->gen = g;
+    inst->nargs = nargs;
+    inst->args = tcc_malloc(nargs * sizeof *inst->args);
+    memcpy(inst->args, args, nargs * sizeof *args);
     inst->next = c6_gen_insts, c6_gen_insts = inst;
     c6_nb_gen_insts++;
 
@@ -6851,8 +6942,12 @@ static CType c6_gen_argument(int grouped)
     memset(&ad, 0, sizeof ad);
     if (!grouped)
         c6_gen_arg_only++;
-    if (!parse_btype(&a, &ad, 0))
+    if (!parse_btype(&a, &ad, 0)) {
+        if (tok >= TOK_UIDENT && !sym_find(tok) && !struct_find(tok))
+            tcc_error("'%s' undeclared (a type parameter is only visible "
+                      "inside its template)", get_tok_str(tok, NULL));
         tcc_error("a type argument is expected");
+    }
     if (grouped) {
         type_decl(&a, &ad, &v, TYPE_ABSTRACT | TYPE_DIRECT);
         if (v)
@@ -6866,21 +6961,12 @@ static CType c6_gen_argument(int grouped)
 }
 
 /* 'Name@int' / 'Name@(K, V)': parse the arguments and build the instance */
-static int c6_gen_btype(CType *type)
+/* the argument list right after '@': one bare type specifier, or a
+   parenthesized list of abstract declarators (D5) */
+static int c6_gen_args(CType *args)
 {
-    C6Gen *g = 0;
-    CType args[C6_GEN_MAX_PARAM] = {{0}};
-    int nargs = 0, name = tok;
+    int nargs = 0;
 
-    g = c6_gen_find(name);
-    if (!g)
-        return 0;
-    next();
-    if (tok != '@')
-        tcc_error("'%s' is generic: write '%s@%s'",
-                  get_tok_str(name, NULL), get_tok_str(name, NULL),
-                  g->nparams ? get_tok_str(g->ptok[0], NULL) : "...");
-    next();                             /* skip '@' */
     if (tok == '(') {
         next();
         if (tok != ')')
@@ -6898,8 +6984,503 @@ static int c6_gen_btype(CType *type)
             tcc_error("too many type arguments");
         args[nargs++] = c6_gen_argument(0);
     }
+    return nargs;
+}
+
+static int c6_gen_btype(CType *type)
+{
+    C6Gen *g = 0;
+    CType args[C6_GEN_MAX_PARAM] = {{0}};
+    int nargs = 0, name = tok;
+
+    g = c6_gen_find(name);
+    if (!g)
+        return 0;
+    next();
+    if (tok != '@')
+        tcc_error("'%s' is generic: write '%s@%s'",
+                  get_tok_str(name, NULL), get_tok_str(name, NULL),
+                  g->nparams ? get_tok_str(g->ptok[0], NULL) : "...");
+    next();                             /* skip '@' */
+    nargs = c6_gen_args(args);
     *type = c6_gen_instance(g, args, nargs);
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* generics: function and typedef templates ('|T| ...')                */
+/*                                                                     */
+/* A function template's name comes *after* its return type, so the     */
+/* parameters are bound with a '|T|' prefix (A3) and the declaration is */
+/* saved as tokens.  Applying it -- 'vat@int(v, 0)', or a method call   */
+/* whose receiver already wrote T -- replays the *signature*, which is  */
+/* what declares the symbol, and queues the body for the end of the     */
+/* unit: like a 'static inline' or a function literal body, it cannot   */
+/* be written while another function is being written.                  */
+/*                                                                      */
+/* Two details the replay has to get right: an instance is a file scope */
+/* declaration even when it is applied inside a block (no block scope   */
+/* copy of the symbol may be made, or the same function would end up    */
+/* with two symbols), and a method keeps the name it was written with   */
+/* (the instances already differ by receiver, and 'p->name()' looks the */
+/* plain name up), while a free function is renamed to its mangle.      */
+static C6GenFn *c6_gen_fn_find(int v)
+{
+    C6GenFn *fn = 0;
+
+    for (fn = c6_gen_fns; fn; fn = fn->next)
+        if (fn->name == v)
+            return fn;
+    return 0;
+}
+
+static char *c6_gen_strdup(const char *s)
+{
+    char *p = tcc_malloc(strlen(s) + 1);
+
+    strcpy(p, s);
+    return p;
+}
+
+static TokenString *c6_gen_tok_copy(TokenString *src)
+{
+    TokenString *ts = tok_str_alloc();
+    int i = 0;
+
+    for (i = 0; i < src->len; i++)
+        tok_str_add(ts, src->str[i]);
+    return ts;
+}
+
+/* the saved declaration with the declared name patched to NAME */
+static TokenString *c6_gen_decl_copy(C6GenFn *fn, int name)
+{
+    TokenString *ts = tok_str_alloc();
+    int i = 0;
+
+    for (i = 0; i < fn->name_at; i++)
+        tok_str_add(ts, fn->decl->str[i]);
+    tok_str_add(ts, name);
+    for (i = fn->name_at + 1; i < fn->decl->len - 1; i++)
+        tok_str_add(ts, fn->decl->str[i]);
+    tok_str_add(ts, ';');
+    tok_str_add(ts, TOK_EOF);
+    return ts;
+}
+
+/* bind the parameters as ordinary typedefs; the caller owns the chain */
+static Sym **c6_gen_bind(int *ptok, CType *args, int nargs)
+{
+    Sym **bound = tcc_malloc(nargs * sizeof *bound);
+    int i = 0;
+
+    for (i = 0; i < nargs; i++) {
+        CType pt = args[i];
+        Sym *ps = 0;
+
+        pt.t &= ~(VT_STORAGE | VT_EXTERN | VT_STATIC);
+        pt.t |= VT_TYPEDEF;
+        ps = sym_push2(&global_stack, ptok[i], 0, 0);
+        ps->type = pt;
+        ps->r = 0;
+        sym_link(ps, 1);
+        bound[i] = ps;
+    }
+    return bound;
+}
+
+static void c6_gen_unbind(Sym **bound, int nargs)
+{
+    int i = 0;
+
+    for (i = nargs - 1; i >= 0; i--)
+        sym_link(bound[i], 0);
+    tcc_free(bound);
+}
+
+/* '|T| ...' at file scope: 'tok' is the '|' */
+static void c6_gen_binder(void)
+{
+    C6GenFn *fn = 0;
+    int *ptok = 0, nparams = 0, depth = 0, past_recv = 0;
+    int last_ident = 0, last_ident_at = -1, prev_ident = 0, open = 0;
+    int before = 0;                 /* the token before the current one */
+
+    next();                             /* skip '|' */
+    ptok = tcc_malloc(C6_GEN_MAX_PARAM * sizeof *ptok);
+    if (tok == '|')
+        tcc_error("a template declares at least one type parameter");
+    for (;;) {
+        if (tok < TOK_UIDENT)
+            tcc_error("value parameters are not implemented yet");
+        if (nparams >= C6_GEN_MAX_PARAM)
+            tcc_error("too many type parameters");
+        ptok[nparams++] = tok;
+        next();
+        if (tok >= TOK_UIDENT)          /* 'T name': a value parameter */
+            tcc_error("value parameters are not implemented yet");
+        if (tok != ',')
+            break;
+        next();
+    }
+    skip('|');
+
+    fn = tcc_mallocz(sizeof *fn);
+    fn->nparams = nparams;
+    fn->ptok = ptok;
+    fn->decl = tok_str_alloc();
+    fn->kind = tok == TOK_TYPEDEF ? C6_GEN_TYPEDEF : C6_GEN_FUNC;
+    if (fn->kind == C6_GEN_TYPEDEF) {
+        /* 'typedef ... Name;': the name is the last bare identifier at brace
+           level 0, so the fields of an anonymous struct are not candidates */
+        int bdepth = 0;
+        for (;;) {
+            if (tok == ';' && bdepth == 0)
+                break;
+            if (tok == TOK_EOF)
+                tcc_error("unexpected end of file in a template declaration");
+            if (tok == '{')
+                bdepth++;
+            else if (tok == '}' && bdepth > 0)
+                bdepth--;
+            if (tok >= TOK_UIDENT && bdepth == 0) {
+                last_ident = tok;
+                last_ident_at = fn->decl->len;
+            }
+            tok_str_add_tok(fn->decl);
+            next();
+        }
+        next();                         /* skip ';' */
+        tok_str_add(fn->decl, TOK_EOF);
+        if (last_ident_at < 0)
+            tcc_error("cannot find the name a template typedef declares");
+        fn->name = last_ident;
+        fn->name_at = last_ident_at;
+    } else {
+        for (;;) {
+            if (tok == ';') {           /* a prototype */
+                next();
+                break;
+            }
+            if (tok == '{') {           /* a definition */
+                skip_or_save_block(&fn->body);
+                break;
+            }
+            if (tok == TOK_EOF)
+                tcc_error("unexpected end of file in a template declaration");
+            if (tok == ',' && depth == 0)
+                tcc_error("a template declaration declares exactly one name");
+            if (tok == '(') {
+                /* the parameter list follows the declared name: a '(' that
+                   follows something else opens the return type, as in
+                   '|T| (T, int) pair_up(T x)' */
+                if (depth == 0 && !open && before >= TOK_UIDENT) {
+                    open = 1;
+                    if (last_ident_at < 0)
+                        tcc_error("cannot find the name a template declares");
+                    fn->name = last_ident;
+                    fn->name_at = last_ident_at;
+                }
+                depth++;
+                past_recv = 0;
+            } else if (tok == ')') {
+                depth--;
+            } else if (tok == ',' && depth == 1) {
+                past_recv = 1;          /* the receiver is the first parameter */
+            } else if (tok == '@' && depth == 1 && !past_recv && prev_ident
+                       && c6_gen_find(prev_ident)) {
+                fn->recv = prev_ident;
+            }
+            prev_ident = tok >= TOK_UIDENT ? tok : 0;
+            before = tok;
+            if (tok >= TOK_UIDENT && depth == 0) {
+                last_ident = tok;
+                last_ident_at = fn->decl->len;
+            }
+            tok_str_add_tok(fn->decl);
+            next();
+        }
+        tok_str_add(fn->decl, TOK_EOF);
+        if (fn->name_at <= 0)
+            tcc_error("cannot find the name a template declares");
+    }
+    c6_gen_param_check(fn->name, fn->ptok, fn->nparams);
+    {
+        C6GenFn *old = c6_gen_fn_find(fn->name);
+        if (old) {
+            /* a prototype may name a receiver template that is only
+               declared later, so its 'recv' can still be empty */
+            if (old->kind != fn->kind || old->nparams != fn->nparams
+                || (old->recv && fn->recv && old->recv != fn->recv))
+                tcc_error("redefinition of template '%s' as a different "
+                          "declaration", get_tok_str(fn->name, NULL));
+            if (!fn->body) {            /* a prototype after a prototype */
+                c6_gen_fn_drop(fn);
+                return;
+            }
+            if (old->body)
+                tcc_error("redefinition of template '%s'",
+                          get_tok_str(fn->name, NULL));
+            /* the prototype came first: the definition fills it in */
+            old->decl = fn->decl;
+            old->name_at = fn->name_at;
+            old->body = fn->body;
+            old->recv = fn->recv ? fn->recv : old->recv;
+            fn->decl = NULL;
+            fn->body = NULL;            /* the definition keeps both */
+            c6_gen_fn_drop(fn);
+            return;
+        }
+    }
+    fn->next = c6_gen_fns, c6_gen_fns = fn;
+}
+
+/* instantiate a function template: replay the signature, queue the body */
+static Sym *c6_gen_fn_instance(C6GenFn *fn, CType *args, int nargs)
+{
+    C6GenAppl *a = 0;
+    Sym *sym = 0, **bound = 0, *save_lstk = 0;
+    char mangle[4096] = {0}, key[4352] = {0};
+    int save_global = 0, save_scope = 0, save_rec = 0;
+
+    if (nargs != fn->nparams) {
+        char sig[512] = {0};
+        int off = 0, i = 0;
+        for (i = 0; i < fn->nparams && off < (int)sizeof sig - 8; i++)
+            off += snprintf(sig + off, sizeof sig - off, "%s%s",
+                            i ? ", " : "", get_tok_str(fn->ptok[i], NULL));
+        tcc_error("'%s' needs %d type argument%s (got %d): write '%s@%s%s%s'",
+                  get_tok_str(fn->name, NULL), fn->nparams,
+                  fn->nparams == 1 ? "" : "s", nargs,
+                  get_tok_str(fn->name, NULL),
+                  fn->nparams > 1 ? "(" : "", sig,
+                  fn->nparams > 1 ? ")" : "");
+    }
+    c6_gen_mangle_name(fn->name, args, nargs, mangle, sizeof mangle);
+    /* two templates may share a name across struct templates: key the
+       instance by receiver and arguments both */
+    if (fn->recv)
+        snprintf(key, sizeof key, "%s__%s", get_tok_str(fn->recv, NULL),
+                 mangle);
+    else
+        snprintf(key, sizeof key, "%s", mangle);
+    for (a = c6_gen_appls; a; a = a->next)
+        if (!strcmp(a->key, key))
+            return a->sym;
+    if (fn->kind != C6_GEN_FUNC)
+        tcc_error("'%s' is a type, not a function",
+                  get_tok_str(fn->name, NULL));
+    if (c6_nb_gen_insts >= C6_GEN_MAX_INST)
+        tcc_error("too many generic instantiations in one translation unit "
+                  "(max %d)", C6_GEN_MAX_INST);
+
+    save_global = c6_sym_global;
+    save_scope = local_scope;
+    save_rec = c6_gen_record_sym;
+    /* the bound parameters are file scope types, but the declaration is
+       replayed with the scoping of the use site: 'external_sym()' puts the
+       function itself at file scope, and the parameter symbols of the
+       replayed signature stay transient, the way a prototype's do */
+    local_scope = 0;
+    bound = c6_gen_bind(fn->ptok, args, nargs);
+    local_scope = save_scope;
+    if (++c6_gen_depth > C6_GEN_MAX_DEPTH)
+        tcc_error("generic instantiation nested too deeply (max %d)",
+                  C6_GEN_MAX_DEPTH);
+    c6_gen_last_sym = NULL;
+    c6_gen_record_sym = 1;
+    {
+        /* a method keeps the name it was written with: '<receiver>_<name>'
+           already tells the instances apart, and the plain name is what
+           'p->name()' looks up.  A free function is renamed to the mangle. */
+        int decl_name = fn->recv ? fn->name : tok_alloc_const(mangle);
+        TokenString *ts = c6_gen_decl_copy(fn, decl_name);
+        /* the instance is a file scope declaration even when the template is
+           applied inside a block: no block-scope copy of it may be made, or
+           the copy would be a second symbol for the same function */
+        save_lstk = local_stack;
+        local_stack = NULL;
+        c6_decl_tokens(ts);
+        local_stack = save_lstk;
+    }
+    c6_gen_record_sym = save_rec;
+    sym = c6_gen_last_sym;
+    c6_gen_last_sym = NULL;
+    c6_gen_depth--;
+    c6_gen_unbind(bound, nargs);
+    c6_sym_global = save_global;
+    local_scope = save_scope;
+    c6_nb_gen_insts++;
+    if (!sym)
+        tcc_error("cannot instantiate '%s'", get_tok_str(fn->name, NULL));
+
+    a = tcc_mallocz(sizeof *a);
+    a->key = c6_gen_strdup(key);
+    a->sym = sym;
+    a->next = c6_gen_appls, c6_gen_appls = a;
+
+    if (fn->body) {
+        C6GenPend *p = tcc_mallocz(sizeof *p);
+        p->fn = fn;
+        p->nargs = nargs;
+        p->args = tcc_malloc(nargs * sizeof *p->args);
+        memcpy(p->args, args, nargs * sizeof *args);
+        p->sym = sym;
+        p->body = c6_gen_tok_copy(fn->body);
+        if (c6_gen_pend_tail)
+            c6_gen_pend_tail->next = p;
+        else
+            c6_gen_pend = p;
+        c6_gen_pend_tail = p;
+    }
+    return sym;
+}
+
+/* 'f@int' / 'f@(K, V)' in an expression: 'tok' is the '@', the name is
+   NAME.  Returns the symbol of the instance, or NULL if NAME is not a
+   function template. */
+static Sym *c6_gen_fn_apply(int name)
+{
+    C6GenFn *fn = c6_gen_fn_find(name);
+    CType args[C6_GEN_MAX_PARAM] = {{0}};
+    int nargs = 0;
+
+    if (!fn || fn->kind != C6_GEN_FUNC)
+        return NULL;
+    next();                             /* skip '@' */
+    nargs = c6_gen_args(args);
+    return c6_gen_fn_instance(fn, args, nargs);
+}
+
+/* instantiate a typedef template and hand back its type */
+static int c6_gen_typedef_btype(CType *type)
+{
+    C6GenFn *fn = c6_gen_fn_find(tok);
+    C6GenAppl *a = 0;
+    CType args[C6_GEN_MAX_PARAM] = {{0}};
+    Sym *sym = 0, **bound = 0;
+    char mangle[4096] = {0};
+    int nargs = 0, ntok = 0;
+    int save_global = 0, save_scope = 0;
+
+    if (!fn || fn->kind != C6_GEN_TYPEDEF)
+        return 0;
+    next();
+    if (tok != '@')
+        tcc_error("'%s' is generic: write '%s@...'",
+                  get_tok_str(fn->name, NULL), get_tok_str(fn->name, NULL));
+    next();                             /* skip '@' */
+    nargs = c6_gen_args(args);
+    if (nargs != fn->nparams) {
+        char sig[512] = {0};
+        int off = 0, i = 0;
+        for (i = 0; i < fn->nparams && off < (int)sizeof sig - 8; i++)
+            off += snprintf(sig + off, sizeof sig - off, "%s%s",
+                            i ? ", " : "", get_tok_str(fn->ptok[i], NULL));
+        tcc_error("'%s' needs %d type argument%s (got %d): write '%s@%s%s%s'",
+                  get_tok_str(fn->name, NULL), fn->nparams,
+                  fn->nparams == 1 ? "" : "s", nargs,
+                  get_tok_str(fn->name, NULL),
+                  fn->nparams > 1 ? "(" : "", sig,
+                  fn->nparams > 1 ? ")" : "");
+    }
+    c6_gen_mangle_name(fn->name, args, nargs, mangle, sizeof mangle);
+    for (a = c6_gen_appls; a; a = a->next)
+        if (!strcmp(a->key, mangle)) {
+            *type = a->sym->type;
+            type->t &= ~VT_TYPEDEF;
+            return 1;
+        }
+    if (c6_nb_gen_insts >= C6_GEN_MAX_INST)
+        tcc_error("too many generic instantiations in one translation unit "
+                  "(max %d)", C6_GEN_MAX_INST);
+
+    save_global = c6_sym_global;
+    save_scope = local_scope;
+    c6_sym_global = 1;
+    local_scope = 0;
+    bound = c6_gen_bind(fn->ptok, args, nargs);
+    if (++c6_gen_depth > C6_GEN_MAX_DEPTH)
+        tcc_error("generic instantiation nested too deeply (max %d)",
+                  C6_GEN_MAX_DEPTH);
+    ntok = tok_alloc_const(mangle);
+    {
+        TokenString *ts = c6_gen_decl_copy(fn, ntok);
+        c6_decl_tokens(ts);
+    }
+    c6_gen_depth--;
+    c6_gen_unbind(bound, nargs);
+    c6_sym_global = save_global;
+    local_scope = save_scope;
+    c6_nb_gen_insts++;
+    sym = sym_find(ntok);
+    if (!sym || !(sym->type.t & VT_TYPEDEF))
+        tcc_error("cannot instantiate '%s'", get_tok_str(fn->name, NULL));
+    a = tcc_mallocz(sizeof *a);
+    a->key = c6_gen_strdup(mangle);
+    a->sym = sym;
+    a->next = c6_gen_appls, c6_gen_appls = a;
+    *type = sym->type;
+    type->t &= ~VT_TYPEDEF;
+    return 1;
+}
+
+/* 'v->vat(0)' on an instance: the receiver already wrote T, so instantiate
+   the method template that declares that receiver (D9) */
+static int c6_gen_method_resolve(CType *type, int mname)
+{
+    C6GenInst *inst = 0;
+    C6GenFn *fn = 0;
+    int tag = c6_ptr_tag(type);
+
+    if (!tag)
+        return 0;
+    for (inst = c6_gen_insts; inst; inst = inst->next)
+        if (inst->tag == tag)
+            break;
+    if (!inst || !inst->gen)
+        return 0;
+    for (fn = c6_gen_fns; fn; fn = fn->next)
+        if (fn->kind == C6_GEN_FUNC && fn->name == mname && fn->recv
+            && fn->recv == inst->gen->name
+            && fn->nparams == inst->nargs) {
+            c6_gen_fn_instance(fn, inst->args, inst->nargs);
+            return 1;
+        }
+    return 0;
+}
+
+/* compile the bodies queued by function template instantiation */
+static int c6_gen_flush(void)
+{
+    int n = 0;
+
+    while (c6_gen_pend) {
+        C6GenPend *p = c6_gen_pend;
+        Sym **bound = 0;
+        int save_global = c6_sym_global, save_scope = local_scope;
+
+        c6_gen_pend = p->next;
+        if (!c6_gen_pend)
+            c6_gen_pend_tail = 0;
+        c6_sym_global = 1;
+        local_scope = 0;
+        bound = c6_gen_bind(p->fn->ptok, p->args, p->nargs);
+        c6_sym_global = save_global;    /* 'gen_function' scopes its params */
+        local_scope = save_scope;
+        cur_text_section = text_section;
+        begin_macro(p->body, 1);
+        next();
+        gen_function(p->sym);
+        end_macro();
+        c6_gen_unbind(bound, p->nargs);
+        c6_sym_global = save_global;
+        local_scope = save_scope;
+        tcc_free(p->args);
+        tcc_free(p);
+        n++;
+    }
+    return n;
 }
 
 /* 'struct NAME@T;' / 'struct NAME@(K, V) { ... };' -- 'tok' is the '@' */
@@ -6908,6 +7489,32 @@ static int c6_gen_btype(CType *type)
 static const char *c6_gen_drop_struct =
     "an instance drops 'struct': write '%s@...' (or, for a value parameter, "
     "note that value parameters are not implemented yet)";
+
+/* release a template that is not going to be used (a redundant prototype) */
+static void c6_gen_fn_drop(C6GenFn *fn)
+{
+    if (fn->decl)
+        tok_str_free(fn->decl);
+    if (fn->body)
+        tok_str_free(fn->body);
+    tcc_free(fn->ptok);
+    tcc_free(fn);
+}
+
+/* C115 and the duplicate check shared by the two template spellings */
+static void c6_gen_param_check(int name, int *ptok, int nparams)
+{
+    int i = 0, j = 0;
+    for (i = 0; i < nparams; i++) {
+        if (ptok[i] == name || c6_gen_find(ptok[i]))
+            tcc_error("a type parameter cannot have the same name as its "
+                      "template");
+        for (j = 0; j < i; j++)
+            if (ptok[j] == ptok[i])
+                tcc_error("duplicate type parameter '%s'",
+                          get_tok_str(ptok[i], NULL));
+    }
+}
 
 static void c6_gen_declare(int name, int is_union)
 {
@@ -6944,6 +7551,7 @@ static void c6_gen_declare(int name, int is_union)
         if (tok >= TOK_UIDENT)
             tcc_error("value parameters are not implemented yet");
     }
+    c6_gen_param_check(name, ptok, nparams);
     if (tok == '{')
         skip_or_save_block(&body);
     else if (tok != ';')
@@ -7936,6 +8544,11 @@ static int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
                    error C103 asks for */
                 if (tcc_state->c6_ext && c6_gen_find(tok)) {
                     if (c6_gen_btype(&type1))
+                        goto basic_type2;
+                }
+                /* '|T| typedef ... Box;' applied as 'Box@int' */
+                if (tcc_state->c6_ext && c6_gen_fn_find(tok)) {
+                    if (c6_gen_typedef_btype(&type1))
                         goto basic_type2;
                 }
 #endif
@@ -9889,12 +10502,25 @@ special_math_val:
             }
         }
 #endif
+#ifdef C6_EXT
+        /* 'vat@int(v, 0)': a function template is not usable until it is
+           applied, and a method template's plain name may already be
+           declared -- either way the '@' decides */
+        if (tcc_state->c6_ext && tok == '@') {
+            Sym *gen_sym = c6_gen_fn_apply(t);
+            if (gen_sym)
+                s = gen_sym;
+        }
+#endif
         if (!s || IS_ASM_SYM(s)) {
             const char *name = get_tok_str(t, NULL);
 #ifdef C6_EXT
             /* report the spelling used in the source, not the mangled name */
             if (dot_disp)
                 name = get_tok_str(dot_disp, NULL);
+            /* a template is not a function until it is applied (C103) */
+            if (tcc_state->c6_ext && !s && c6_gen_fn_find(t))
+                tcc_error("'%s' is generic: write '%s@...'", name, name);
 #endif
             if (tok != '(')
                 tcc_error("'%s' undeclared", name);
@@ -9998,6 +10624,10 @@ special_math_val:
                                 vtop->type = head;  /* head is at offset 0 */
                         }
                     }
+                    /* 'v->vat(0)' where 'vat' is a '|T|' template: the
+                       receiver already wrote T, so instantiate it (D9) */
+                    if (!m && c6_gen_method_resolve(&vtop->type, tok))
+                        m = c6_method_lookup(&vtop->type, tok);
                 }
                 if (m) {
                     int mname = tok;
@@ -20192,12 +20822,30 @@ static void c6_sp_flush(void)
    ('go f(x);'). */
 static void c6_sp_parse(int want_handle)
 {
-    Sym *fs = sym_find(tok);
+    Sym *fs = 0;
     CType ft = {0}, fnt = {0};
     Sym *tramp_sym = 0, *p = 0;
     AttributeDef ad = {0};
     int name = 0, tramp = 0, slot = 0, i = 0, ofs = 0, size = 0;
+    int applied = 0;
 
+#ifdef C6_EXT
+    /* 'go vat@int(v, 0)': applying a template leaves a plain function */
+    if (tcc_state->c6_ext && c6_gen_fn_find(tok)) {
+        int tc = tok;
+        CValue tcv = tokc;
+        next();
+        if (tok == '@') {
+            fs = c6_gen_fn_apply(tc);
+            applied = 1;
+        } else {
+            unget_tok(tc);
+            tokc = tcv;
+        }
+    }
+#endif
+    if (!fs)
+        fs = sym_find(tok);
     if (!fs || (fs->type.t & VT_BTYPE) != VT_FUNC || !fs->type.ref)
         tcc_error("the operand of 'go' must be a call of a plain function");
     name = fs->v;                   /* the symbol's own name, after mangling */
@@ -20236,7 +20884,9 @@ static void c6_sp_parse(int want_handle)
     tramp_sym = external_sym(tramp, &fnt, 0, &ad);
     c6_sp_remember(name, tramp, &ft);
 
-    next();                             /* the callee name */
+    if (!applied)
+        next();                         /* the callee name; an applied
+                                           template already skipped it */
     skip('(');
     size = 0;
     for (p = c6_async_params(&ft); p; p = p->next) {
@@ -20855,6 +21505,12 @@ static int decl(int l)
                 c6_interface_parse();
                 continue;
             }
+            /* '|T| Ret f(Vect@T *self, int i)': the parameters must precede
+               the name, so a function/typedef template starts with '|' */
+            if (tok == '|') {
+                c6_gen_binder();
+                continue;
+            }
             /* 'module NAME;' is a soft keyword: a visible identifier named
                'module' keeps its ordinary C meaning */
             if (tok >= TOK_UIDENT
@@ -20939,6 +21595,24 @@ static int decl(int l)
             if (tok >= TOK_UIDENT) {
                /* special test for old K&R protos without explicit int
                   type. Only accepted when defining global data */
+#ifdef C6_EXT
+                /* 'T vat(Vect@T *, int)': the identifier is in type
+                   position, so it is a type parameter used before it is
+                   bound -- a template declares its parameters first (A3) */
+                if (tcc_state->c6_ext) {
+                    int tc = tok;
+                    CValue tcv = tokc;
+                    next();
+                    if (tok >= TOK_UIDENT)
+                        tcc_error("type parameter '%s' is used before it is "
+                                  "declared: write '|%s| %s %s(...)'",
+                                  get_tok_str(tc, NULL), get_tok_str(tc, NULL),
+                                  get_tok_str(tc, NULL),
+                                  get_tok_str(tok, NULL));
+                    unget_tok(tc);
+                    tokc = tcv;
+                }
+#endif
                 btype.t = VT_INT;
                 oldint = 1;
             } else {
@@ -21116,6 +21790,8 @@ static int decl(int l)
 #endif
                 sym = external_sym(v, &type, 0, &ad);
 #ifdef C6_EXT
+                if (c6_gen_record_sym)
+                    c6_gen_last_sym = sym;  /* a replayed template signature */
                 /* 'ret f(struct T *self, ...)' becomes callable as p->f() */
                 c6_method_register(decl_name, v, &type);
                 /* the source name stays declared for plain 'f(p)' calls */
@@ -21267,6 +21943,8 @@ static int decl(int l)
 #endif
                         sym = external_sym(v, &type, r, &ad);
 #ifdef C6_EXT
+                        if (c6_gen_record_sym)
+                            c6_gen_last_sym = sym;  /* replayed signature */
                         /* a prototype is enough to call it as p->f(); the
                            source name stays declared for plain 'f(p)' calls */
                         if ((type.t & VT_BTYPE) == VT_FUNC && l == VT_CONST)

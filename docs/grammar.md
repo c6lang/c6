@@ -701,7 +701,7 @@ struct Map@(K, V)    { Vect@K keys; Vect@V vals; };
 Vect@int a = {0};               /* 实例：struct Vect_int */
 Vect@int *p = &a;
 Vect@Vect@int grid = {0};       /* 右结合，链上没有闭合符 */
-int x = p->vat(0);              /* 接收者定类型：Vect_int_at */
+int x = p->vat(0);              /* 接收者定类型：Vect_int_vat */
 ```
 
 `@` 与托管引用共存：前缀 `@`（类型位置起点）是托管引用，后缀 `@`（类型名
@@ -711,14 +711,16 @@ int x = p->vat(0);              /* 接收者定类型：Vect_int_at */
 **已落地**：`struct Vect@T { … }` / `struct Map@(K, V) { … }` 模板声明，
 `Vect@int` / `Map@(char[:], int)` 应用，嵌套（`Vect@Vect@int`）与自引用
 （`Node@T` 里的 `Node@T *next`），`typedef` 别名，实例上的方法与切片后缀
-（`Vect@int[:]` 是「实例的切片」）。实例 mangle 成 `Vect_int`，所以它就是一个
-普通 struct：方法符号 `Vect_int_<name>`，纯 C 的 TU 写出 `struct Vect_int`
-即可互通。
+（`Vect@int[:]` 是「实例的切片」）；函数/typedef 模板用 `|…|` 前缀绑定，
+一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 是同一个函数。实例
+mangle 成 `Vect_int`，所以它就是一个普通 struct、普通函数：方法符号
+`Vect_int_<name>`，实例函数 `Vect_int_vat`，纯 C 的 TU 写出 `struct
+Vect_int` 即可互通。
 
-**未落地**：`|…|` 前缀（所以函数模板、以及「一份方法覆盖所有实例」还写不了，
-方法要对具体实例写：`int vect_sum(Vect@int *v)`），值形参
-（`Buf@(T, int N)`，现在报 `value parameters are not implemented yet`），
-`-emit-header` 的实例输出。裸模板名是 C103 诊断，不是类型。
+**未落地**：值形参（`Buf@(T, int N)`，现在报 `value parameters are not
+implemented yet`），`-emit-header` 的实例输出，模块前缀与实例名冲突检查，
+体内成员函数（`struct Vect@T { T at(int i) { … } }`）。裸模板名是 C103
+诊断，不是类型。
 
 完整语法、mangle/ABI、单态化方案、约束 C103–C116 与实施顺序见
 [generics-design.md](generics-design.md)。
@@ -1115,7 +1117,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C102 | 清理体最多嵌套 8 层（清理体里再退出作用域会形成一层新的派发），第 9 层报错 | `'defer' bodies nested too deeply` |
 | C103 | 裸模板名不是类型：模板名只能出现在 `@` 实参表前面 | `'%s' is generic: write '%s@%s'` |
 | C104 | 实参个数必须等于形参个数，多形参要用括号 | `'%s' needs %d type argument%s (got %d): write '%s@(A, B)'` |
-| C105 | 实参必须是类型；实参里不能写声明符名字 | `a type argument is expected`；`a type argument cannot declare '%s'` |
+| C105 | 实参必须是类型；实参里不能写声明符名字；形参只在模板体内可见，用在使用点之前要写 `\|…\|` 前缀 | `a type argument is expected`；`a type argument cannot declare '%s'`；`'%s' undeclared (a type parameter is only visible inside its template)`；`type parameter '%s' is used before it is declared: write '\|%s\| %s %s(...)'` |
 | C107 | 模板体内不能实例化自己（唯一会自噬的递归源） | `cannot instantiate '%s' inside its own definition` |
 | C108 | 实例化点必须在模板定义之后，前向声明的模板不能直接实例化 | `instantiation of undefined template '%s'` |
 | C110 | 值形参（`Buf@(T, int N)`）尚未实现 | `value parameters are not implemented yet` |
@@ -1123,11 +1125,11 @@ parameter-list    = identifier , { "," , identifier } ;
 | C112 | 实例化嵌套最多 64 层 | `generic instantiation nested too deeply (max 64)` |
 | C113 | `enum` 不能带形参 | `enums cannot have type parameters` |
 | C114 | 实例名前面不能写 `struct`：`struct Vect@int v;` 不是实例 | `an instance drops 'struct': write '%s@...'` |
-| C115 | 模板不能重定义，参数表也不能改；`struct`/`union` 不能混用 | `redefinition of template '%s'`；`redefinition of template '%s' with a different parameter list`；`redefinition of template '%s' as a different kind` |
+| C115 | 模板不能重定义，参数表也不能改；`struct`/`union` 不能混用；形参不能重名，也不能与模板同名 | `redefinition of template '%s'`；`redefinition of template '%s' with a different parameter list`；`redefinition of template '%s' as a different kind`；`duplicate type parameter '%s'`；`a type parameter cannot have the same name as its template` |
 | C116 | 形参最多 16 个（括号里或单个） | `too many type parameters`；`too many type arguments` |
 
 （C90–C98 留给 [closure-design.md](closure-design.md) 的 V2 闭包；
-C106/C109 以及泛型里与 `\|…\|` 前缀、值形参相关的部分仍未实现，
+C106/C109 以及泛型里与值形参、模块前缀相关的部分仍未实现，
 见 [generics-design.md](generics-design.md) §9。）
 
 ---
@@ -1980,7 +1982,8 @@ int main(void)
 | `has()`/`next()` 带多余形参 | 约束 C99：两个方法只接收 receiver |
 | `Vect<int>` / `Iterator<T>`（尖括号） | 不支持：尖括号永远不是泛型写法，类型应用只有 `@` 一种，见 [generics-design.md](generics-design.md) |
 | 泛型 `Vect@int` / `struct Vect@T` | 已落地（阶段 1）：见 §3.10 与 [generics-design.md](generics-design.md)；容器迭代仍建议 `foreach` |
-| 泛型 `\|T\| T vat(Vect@T *)` / `Buf@(T, 4)`（`\|…\|` 前缀、值形参） | 未实现：见 [generics-design.md](generics-design.md) §9 阶段 1–2 |
+| 泛型 `\|T\| T vat(Vect@T *)`、`\|T\| typedef Vect@T MyVec` | 已落地：一份模板覆盖所有实例，`tests/generic_fn.c` |
+| 泛型值形参 `Buf@(T, 4)` | 未实现（报 `value parameters are not implemented yet`）：见 [generics-design.md](generics-design.md) §9 阶段 2 |
 | `(int) t[0]` 里的 `(int)` 当一元组 | 约束 C54：一元括号仍是强转，元组至少两个元素 |
 | `t[i]`（运行期下标）/ `t[-1]` | 约束 C58：下标必须是整数常量且在范围内 |
 | `t = {1, 2}` / `f({1, 2})`（元组字面量糖） | 不支持：显式写复合字面量 `(int, int){1, 2}` |
