@@ -12,7 +12,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `async` / `await` / `co` / `task` | 无栈协程：`co f();` 顶层跑、`task t = f();` 拿句柄 |
 | `spawn f(...)` | OS 线程（`pthread_create`），语句立刻返回、真并发 |
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
-| `package` / `import` | 包与名字修饰（`pkg__sym`），`pkg.member` 访问导出符号，支持多级包名 |
+| `module` / `import` | 命名空间：一个文件一个模块，模块名就是它的路径；`mod__sym` 前缀与 `mod.member` 限定访问 |
 | 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用（符号是 `T_f`，不同类型可同名，`f(p)` 仍可用） |
 | 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]`；被普通符号遮蔽时仍写 `struct` |
 | `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
@@ -265,60 +265,21 @@ test "add works" {
 
 运行器输出 `PASS:` / `FAIL:` 行与 `N test(s), M failure(s)`，全部通过时退出码为 0。
 
-### package / import
+### module / import（模块名就是它的路径）
+
+`module` 是唯一的命名空间：一个文件一个模块，模块名就是它在磁盘上的路径。
 
 ```c
-package math {
-    int add(int a, int b) { return a + b; }
-    int counter = 0;
-}
-
-import math;
-
-int main(void)
-{
-    math.counter = 1;                 /* 包限定访问 */
-    return math.add(1, 2) + math__add(1, 2);   /* 也叫 math__add */
-}
-```
-
-规则：
-
-- `package NAME { ... }` 里的符号被词法修饰成 `NAME__sym`（`main` 除外）；包只是
-  名字前缀，**不引入目录或文件语义**；
-- `import NAME;` 打开 `NAME.member` 这种写法，必须在**使用点之前**出现；包块内部
-  引用自己的成员不需要 import。不 import 而写 `math.add` 会报
-  `'math' is not an imported package (use 'import math;')`；
-- 点号也可以写成多级：`package acme.util { ... }` / `import acme.util;`，
-  前缀是 `acme__util`；嵌套块 `package acme { package util { ... } }` 与
-  `package acme.util;`（文件级）都会组合前缀，结果相同；
-- `pkg.member` 只解析到「包里的符号」这一层：`math.origin.x`、`*&math.origin.x`
-  会把尾部 `.x` 交回普通成员访问，因此包里的全局结构体对象可以照常使用；
-- 局部变量或字段与包同名时**字段优先**（普通 C 成员访问语义不受影响）；
-- 未声明的包成员按普通未声明标识符报错，诊断使用源码里写的 `pkg.member` 而不是
-  修饰后的名字。
-
-跨 TU 时，头文件里用 `package NAME { ... }` 写出声明（或写 `extern`），实现放在
-另一个 TU 的同一个包里即可；两边的符号名都是 `NAME__sym`，链接后就是普通 C 符号。
-反过来，手写的老 C 代码只要声明 `int math__add(int, int);` 就能直接调用包的导出，
-扩展 TU 也能直接调用普通的 C 函数。
-
-### module / import 加载
-
-`package` 只给一段代码加前缀；`module` 给**整个文件**加前缀，并且 `import`
-会去找模块文件、加载它的声明：
-
-```c
-/* math.c */
-module math;
+/* geo/shape.c6 */
+module geo.shape;
 
 struct Point { int x, y; };
 typedef struct Point Point;
 int add(int a, int b) { return a + b; }
 int area(Point *p) { return p->x * p->y; }
 
-/* main.c6 */
-import math;
+/* app.c6：import 按 'geo/shape.c6' 这条路径找到它 */
+import geo.shape;
 
 int main(void)
 {
@@ -327,28 +288,46 @@ int main(void)
 }
 ```
 
-- `module NAME;` 必须是文件的第一个声明；它把文件作用域的声明改成
-  `NAME__sym`（点号 `module geo.circle;` 的前缀是 `geo__circle__`），块作用域、
-  `static`、`test`、`__` 开头的名字和 `#include` 的普通 C 文件不受影响；
-- 方法照旧按接收者取名：`int area(Point *p)` 导出 `math__Point_area`；模块文件
-  **不**为方法发原名弱别名，C 侧只看到前缀符号；
-- 类型也能写全限定名：`math.Point p = { 3, 4 };` 解析到 `math__Point`
-  （模块里的 typedef 或 struct/union/enum tag 都行；多级 `tu.module.Point`
-  同理；package 里的 tag 不加前缀，所以 package 限定类型要写 typedef）；
-  只有当前 module/package 或 `import` 过的名字可以这样写；
-- 模块里不能定义 `main`；
-- `import NAME;` 先登记名字，再按「当前文件目录 → `-I` 路径 → 当前目录」依次查找
-  `NAME.c6`、`NAME.c`（点号形式 `a/b.c6`、`a/b.c`，两个文件并存时 `.c6` 优先），
-  找到就把声明读进来：函数只取原型、跳过函数体，
-  全局变量只取 `extern`、跳过初始化器；找不到文件时只登记名字（旧行为）；
-  循环 import 报 `circular import of module 'x'`；
-- 导入只带**声明**，代码仍在模块自己的目标文件里：链接时把 `math.o`（或库）放上
-  命令行；
-- `-emit-header FILE`（配合 `-c`，模块是 `.c6` 文件）可把模块导出写成普通 C 头文件：
-  `tcc -B tcc -c -emit-header math.h math.c6`。头文件里是
-  `struct math__Point`、`math__add`、`math__Point_area` 这些真正的 C 名；
-  切片和元组会生成 `math__slice_N` / `math__tuple_N` typedef。纯 C 一侧
-  `#include "math.h"` 就能调用，纯 C（`.c`）侧不需要任何 c6 机制，也不需要知道模块的存在。
+规则：
+
+- `module NAME;` 必须是文件的第一个声明，一个文件只能声明一次；`main` 不能声明
+  在模块里；
+- **模块名就是路径**：`import a.b;` 只按 `a/b.c6`（或 `a/b.c`）查找，顺序是
+  「当前文件目录 → `-I` 路径 → 当前目录」；找到的文件必须逐段声明成
+  `module a.b;`，否则报 `module file declares 'a__zzz', expected 'a__b'`；
+- 扁平的 `a.b.c6` / `a__b.c6` **不接受**：它存在时报
+  `module 'a.b' must live at 'a/b.c6', not in a flat 'a.b.c6'`。分级路径先在
+  每个搜索根里找完，扁平文件才用来报错，所以正确摆放的模块不会被旁边的散落
+  文件干扰；
+- 找不到模块文件是错误：`cannot find module 'a.b': expected a file at
+  'a/b.c6' in the search path`；
+- `module NAME;` 把文件作用域的声明改成 `NAME__sym`（点号名 `geo.shape` 的前缀是
+  `geo__shape__`），块作用域、`static`、`test`、`__` 开头的名字和 `#include` 进来
+  的普通 C 文件不受影响；
+- 类型也能写全限定名：`geo.shape.Point p;` 解析到 `geo__shape__Point`（模块里的
+  typedef 或 struct/union/enum tag 都行，多级名字同理）；只有当前模块或 `import`
+  过的名字可以这样写；
+- 方法照旧按接收者取名：`int area(Point *p)` 导出 `geo__shape__Point_area`；模块
+  文件**不**为方法发原名弱别名，C 侧只看到前缀符号；
+- 成员访问与限定名可以混写：`mod.origin.x`、`*&mod.origin.x` 把尾部的 `.x` 交回
+  普通成员访问，所以模块里的全局结构体照常逐字段使用；局部变量或字段与模块同名时
+  字段优先；未声明的成员报 `'mod.nope' undeclared`；
+- `import` 必须出现在使用点之前，循环 import 报 `circular import of module 'x'`；
+- 导入只带**声明**：函数只取原型、跳过函数体，全局变量只取 `extern`、跳过初始化器。
+  代码仍在模块自己的目标文件里，链接时把它（或库）放上命令行；
+- `-emit-header FILE`（配合 `-c`）可把模块导出写成普通 C 头文件：
+  `tcc -B tcc -c -emit-header geo/shape.h geo/shape.c6`。头文件里是
+  `struct geo__shape__Point`、`geo__shape__add`、`geo__shape__Point_area` 这些
+  真正的 C 名；切片和元组会生成 `geo__shape__slice_N` / `geo__shape__tuple_N`
+  typedef。纯 C 一侧 `#include` 就能调用，不需要知道模块的存在；
+- 直接编译一个模块文件时**不**检查它放在哪里：路径约束是给消费者（`import`）用的，
+  单元测试把文件放在任意位置单独编译仍然成立。
+
+`package`（块形式 `package X { ... }` 与文件级 `package X;`）已经删除：它和
+`module` 是同一件事的两套写法，两套前缀规则会漂移。旧代码里的 `package` 仍被
+识别，但立刻报 `'package' was removed: write 'module NAME;' as the first
+declaration of the file`。迁移方式：把 `package a.b { ... }` 的内容挪进
+`a/b.c6`，首行写 `module a.b;`。
 
 ### 结构体方法
 
@@ -377,18 +356,18 @@ int main(void)
 - 方法就是普通函数：**调用约定不变**，接收者就是第一个实参；符号名是
   `<结构体>_<方法>`，源码里写的名字另外发一个**弱别名**，所以
   `f(p, a)` 这种普通调用、手写 C、纯 C 翻译单元都照旧能链接；
-- 不同类型用同名方法**不需要** `package`（`Circle_area` 与 `Rect_area` 各自独立）；
+- 不同类型用同名方法**不需要**命名空间（`Circle_area` 与 `Rect_area` 各自独立）；
   弱别名只指向本 TU 里第一个取到该名字的方法，真有歧义时写 `p->area()`；
 - 普通名已经被别的函数占着时（同名普通函数，或 `getpid` 这类 libc 头里的声明）
   就不再发别名：`p->getpid()` 照旧可用，普通调用 `getpid()` 仍然是原来的函数；
 - 不改名的情形：`static` / `inline` 函数、`__` 开头的名字（编译器和 libtcc1 专用）、
   系统头文件里的声明（`p->fflush()`、`p->gettimeofday()` 这类 libc 成员照旧可用）、
-  匿名结构体的方法，以及在 `package` 里声明的方法（包名已经区隔，符号是 `pkg__name`）；
+  匿名结构体的方法；
 - 只支持 `->`（`p->f()`）；`v.f()` 仍是普通成员访问，`p->f`（不带调用）会报
   `method 'f' must be called`；
 - 结构体同名字段优先于方法；方法须在**使用点之前**可见（TCC 单趟编译）；
-- `package` 里的方法名不受影响：`package circle { int area(Circle *self) ... }` 与
-  `package rect { int area(Rect *self) ... }` 仍然可以共存，各自 `p->area()`；
+- 模块里的方法也按接收者取名，模块前缀加在最外层（`geo__shape__Point_area`），
+  所以同名方法放进不同模块、或干脆不进模块，都能共存；
 - 返回结构体的方法也支持（隐藏的 `self` 排在 sret 缓冲之后）；
 - `T!error` 方法照常工作：`int!error f(struct T *self)` 可用 `try p->f()` / `p->f() catch e { ... }`。
 
@@ -500,7 +479,7 @@ int main(void)
 | `int a[n];`（VLA） | 合法：标准 C 不允许 VLA 带初始化器 |
 
 规则是**定义点检查**，不做数据流分析：`int x; x = 1;` 一样报错。
-诊断使用源码里书写的标识符，`package` 内的变量也报原名而不是 `pkg__x`。
+诊断使用源码里书写的标识符，模块内的变量也报原名而不是 `mod__x`。
 
 旧代码怎么处理：
 
@@ -1558,8 +1537,7 @@ tests/
 ├── try.c6             try / catch
 ├── test-block.c6      test 块与 -test 模式本身
 ├── macro.c6           #macro 与 __local 名字卫生
-├── package.c6         package / import / pkg.member
-├── module.c6          module / import 加载与 -emit-header
+├── module.c6          module / import：限定名、带前缀的 C 符号、-emit-header
 ├── method.c6          结构体方法（含不同类型的同名方法与 libc 方法）
 ├── interface.c6       结构化接口
 ├── iface_agg.c6       接口方法签名里的 struct / 元组
@@ -1603,7 +1581,7 @@ tests/
 ```sh
 make selftest                       # 跑全部
 tests/run-tests.sh                  # 同上
-tests/run-tests.sh slice package    # 只跑这几个
+tests/run-tests.sh slice module     # 只跑这几个
 tests/run-tests.sh --list           # 列出会跑的文件
 ```
 
@@ -1694,12 +1672,11 @@ make c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条�
   清理状态不在其中——它在函数帧里，所以线程里、ISR 里都一样。
 - 方法必须在调用点之前声明或定义（TCC 单趟编译的固有限制）；接口一致性检查发生在
   第一次转换点，因此方法也要在转换点之前可见。
-- 跨 TU：头文件里用 `package NAME { ... }` 声明 API；接口的方法声明放头文件里，
+- 跨 TU：模块就是文件，`import a.b;` 按路径读声明；接口的方法声明放头文件里，
   vtable 由每个 TU 按需自行生成。
 - 方法符号是 `<结构体>_<方法>`，源码里写的名字另外发一个弱别名，所以
   `f(p)` 这种普通调用照旧可用，不同类型也可以有同名方法；`static` / `inline`、
-  `__` 开头的名字、系统头文件里的声明、匿名结构体的方法，以及在 `package` 里
-  声明的方法保留原名。
+  `__` 开头的名字、系统头文件里的声明和匿名结构体的方法保留原名。
 - 裸 tag 类型名在 `parse_btype()` 里解析：普通命名空间命中（变量/函数/枚举常量/typedef）
   就按老 C 语义走，否则再看 tag 命名空间；解析结果与写 `struct TAG` 完全同一个
   `CType`，所以 `sizeof`、方法注册、切片元素检查都自动一致。因为 tag 与普通符号

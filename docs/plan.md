@@ -15,7 +15,7 @@
 | **G6** | `test` 块的 runner 在 `-run` 模式下由 `libtcc.c` 遍历 `TCCState->tests`，但 TCC 的 `-run` 入口是用户 `main`，没有“先跑测试再跑 main”的钩子 | 中 | `-test` 模式下**不调用用户 `main`**，`libtcc.c` 直接遍历测试表；`-test` 与正常 `-run` 互斥，文档明确 |
 | **G7** | 扩展开关通过“运行时关键字映射”实现，但 TCC 的 `tok_alloc` 在词法阶段就将字符串 intern 为 `TokenSym`，后期切换映射不可行 | 中 | 改为**编译期条件编译**：`tcctok.h` 中 `#ifdef C6_EXT` 注册新 token；扩展关闭时这些字符串根本不进入关键字映射，零运行时开销 |
 | **G8** | `#macro` 的 `__local` 重命名通过 `TokenSym` 插入唯一名，但 TCC 的 `TokenSym` 是全局 intern 表，宏展开产生的临时标识符会永久累积 | 中 | 重命名使用**展开计数器后缀**（如 `tmp__h17`），但不在 `TokenSym` 中持久化；展开结束后从 intern 表移除，或接受可控的内存增长（首版可接受，后续优化） |
-| **G9** | 包管理的 `package NAME { ... }` 在 `tccgen.c` 顶层处理，但 TCC 的顶层声明循环 (`decl`) 不天然支持“命名块”语法 | 中 | 将 `package NAME { ... }` 解析为**语法糖**：读取包名后进入特殊声明上下文，对块内每个全局符号在注册时施加 `NAME__` 前缀；块结束后恢复。不引入真正的“顶层块作用域”，只做 mangle |
+| **G9** | 命名空间要在 `tccgen.c` 顶层处理，但 TCC 的顶层声明循环 (`decl`) 不天然支持“命名块”语法 | 中 | 命名空间 = 文件：`module NAME;` 给整个文件的文件作用域符号加前缀，路径就是名字（见第 6 章）。不需要“顶层块作用域”，也不做嵌套 mangle |
 | **G10** | `err` 的错误槽“通过隐藏参数传递”在 TCC 的调用约定中无现成支持 | 中 | 使用**每线程错误槽**（`pthread_key` + `pthread_getspecific`，不是 `__thread`：`-run` 不支持 TLS），调用者从槽读取；`spawn` 出去的线程有自己的槽，跨线程传播需手动复制。隐藏参数作为后续优化 |
 
 
@@ -27,7 +27,7 @@
 |---|---|---|
 | `tcctok.h` | 关键字与 token 编号 | `#ifdef C6_EXT` 注册新 token；关闭时零映射 |
 | `tccpp.c` | 预处理与词法分析 | `#macro` 指令识别、`__local` 重命名、include 路径扩展 |
-| `tccgen.c` | 语法分析与代码生成 | `package/import` mangle 与 `pkg.member`、结构体方法注册、`interface` 转换与 vtable 生成、`defer/errdefer/err` 就地代码生成、`test` 块注册 |
+| `tccgen.c` | 语法分析与代码生成 | `module/import` mangle 与 `mod.member`、结构体方法注册、`interface` 转换与 vtable 生成、`defer/errdefer/err` 就地代码生成、`test` 块注册 |
 | `tcc.h` / `libtcc.c` | 符号表与编译状态 | `TCCState` 扩展字段、`-test` runner、扩展开关 |
 
 ### 1.2 扩展开关（修复 G7）
@@ -35,7 +35,7 @@
 ```c
 /* tcctok.h */
 #ifdef C6_EXT
-DEF(TOK_PACKAGE,   "package")
+DEF(TOK_C6_PACKAGE, "package")   /* 只剩迁移提示 */
 DEF(TOK_IMPORT,    "import")
 DEF(TOK_INTERFACE, "interface")
 DEF(TOK_DEFER,     "defer")
@@ -347,53 +347,75 @@ test 函数内 `err(id, msg)` 就地展开清理后返回哨兵 `1`；`__tcc_err
 仅当用户未定义 `main` 或显式 `--no-main` 时，注入 `__tcc_test_runner` 作为 `main`。
 
 
-## 6. 包管理：mangle 语法糖 + 符号表扩展（修复 G9）
+## 6. 命名空间：一个文件一个模块，模块名就是它的路径（修复 G9）
+
+> 历史：本节最初实现的是 `package`（"mangle 语法糖"）。`package` 与后来加的
+> `module` 是同一件事的两套写法，两套前缀规则会各自漂移，已经删除（只剩一条
+> 迁移诊断）。下面描述统一后的唯一模型。
 
 ### 6.1 语法
 
 ```c
-package math {
-    int add(int a, int b) { return a + b; }
-    int counter = 0;
-}
-import math;
+/* geo/shape.c6 */
+module geo.shape;
 
-int main(void) { return math.add(1, 2) + add(1, 2); }
+struct Point { int x, y; };
+typedef struct Point Point;
+int counter = 0;
+int add(int a, int b) { return a + b; }
+int area(Point *p) { return p->x * p->y; }     /* geo__shape__Point_area */
 ```
-
-包名可以是多级的，且三种写法等价（前缀都是 `math__util`）：
 
 ```c
-package math.util { ... }
-package math { package util { ... } }
-package math.util;                 /* 文件级：命名文件的其余部分 */
-import math.util;
+/* app.c6 */
+import geo.shape;
+
+int main(void)
+{
+    Point p = { 3, 4 };
+    geo.shape.counter = 1;                     /* 限定访问 */
+    return geo.shape.add(1, 2) + add(1, 2) + area(&p);
+}
 ```
+
+模块名可以分级，分级就是目录：`module geo.shape;` 的文件必须在 `geo/shape.c6`。
+一个文件一个模块，块形式、嵌套形式都不再有。
 
 ### 6.2 实现（修复 G9）
 
-`package` 不引入真正的顶层块作用域，而是**mangle 语法糖**：
+1. `module NAME;` 是文件的第一条声明（软关键字：文件里已有同名普通标识符时
+   按 C 语义处理），设置 `BufferedFile.c6_module = "NAME__"`；
+2. 文件作用域的声明经 `c6_mod_name` 加前缀：普通名字 `NAME__sym`，方法
+   `<NAME__Tag>_<meth>`；块作用域、`static`、`test`、`__` 开头和 `#include`
+   的普通 C 文件不改名；模块文件不发方法的原名弱别名，所以 C 侧只看到前缀名；
+3. **路径分级**：`import a.b;` 只按 `a/b.c6`（或 `a/b.c`）查找，顺序是当前
+   文件目录 → `-I` → 当前目录。`c6_module_open` 分两趟走完所有根：先找分级
+   路径（`c6_module_graded`），全都没有才用扁平拼写（`a.b.c6` / `a__b.c6`）
+   报错（`c6_module_flat`），所以正确摆放的模块不会被旁边的散落文件干扰。
+   找到的文件必须逐个声明同名模块（`c6_expected_module`），否则
+   `module file declares 'a__zzz', expected 'a__b'`；
+4. `import NAME;` 打开 `NAME.member` 写法，并用 `decl(VT_CONST)` 重放声明：
+   函数只登记原型（`skip_or_save_block`），全局变量只登记 `extern`
+   （`c6_skip_decl_tail`），`static` 对象和 `test` 块跳过；找不到文件是错误
+   （`cannot find module 'a.b': expected a file at 'a/b.c6'`），循环 import
+   报 `circular import of module 'a.b'`；
+5. `mod.member`（可多级）由 `unary()` 解析：先按普通 C 标识符查找，命中可见
+   对象就保持 C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用
+   `sym_find_raw(mod__seg)` 查找，命中且该模块已 import（或就是当前模块）才
+   接受，剩下的 `.field` 交回普通 postfix 路径；未 import 报
+   `'mod' is neither an enum nor an imported module (use 'import mod;')`；
+6. 类型位置也接受 `mod.Type`：`parse_btype` 先做一次可回退的扫描
+   （`c6_qualified_type`，先 `sym_find` typedef 再 `struct_find` tag），解析到
+   `mod__Type`；不是类型时把 token 原样还回，所以 `mod.func(...)` 这类表达式
+   语句仍走普通表达式解析。
 
-1. 解析 `package NAME`：在 `TCCState` 中设置 `current_package = "NAME"`；点号与嵌套
-   都只是前缀组合（`a.b` → `a__b`，`a { b { } }` → `a__b`）；
-2. 块内每个全局符号注册时，符号名施加前缀 `NAME__`（如 `math__add`），`main` 除外；
-3. `import NAME;`：把包名登记进 `c6_imports`，不作为声明、不打开文件；
-4. 块结束恢复 `current_package = NULL`；`package NAME;` 命名文件其余部分。
-
-`pkg.member`（可多级）由 `unary()` 解析：先按普通 C 标识符查找，命中可见对象则保持
-C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sym_find_raw(pkg__seg)` 查找，
-命中且该包已 import（或就是当前包）才接受，剩下的 `.field` 交回普通 postfix 路径。
-未 import 时报 `'pkg' is not an imported package (use 'import pkg;')`。
-
-首版**不导出宏**；typedef/tag 命名空间按包隔离；`static` 保持文件内可见。
+首版**不导出宏**；`static` 保持文件内可见。
 
 ### 6.3 跨文件
 
-没有包清单：跨 TU 就是同名 mangle 的普通 C 符号。头文件里用
-`package NAME { ... }` 写出声明（`extern` 也行），实现在另一个 TU 的同一个包里；
-老 C 代码想调用包导出，手写 `int math__add(int, int);` 即可，反之扩展 TU 也能直接
-调用普通 C 函数。`import` 至少打开源码里的 `.` 写法；从 6.5 起，如果能找到同名
-模块文件，还会加载它的声明（找不到时仍是纯命名空间，不引入文件语义）。
+没有包清单，也不需要清单：模块名就是路径，`import` 按路径读声明。跨 TU 的符号
+仍然是普通的、带前缀的 C 符号。老 C 代码想调用模块导出，手写
+`int geo__shape__add(int, int);` 即可；反过来扩展 TU 也能直接调用普通 C 函数。
 
 ### 6.4 结构体方法
 
@@ -401,7 +423,7 @@ C 的成员访问语义；未命中且后随 `.` 时逐段增长前缀，用 `sy
 `<T>_f`；`p->f(a)` 被改写成 `T_f(p, a)`（接收者先存临时槽，返回结构体时排在
 sret 缓冲之后）。源码里写的 `f` 另外输出成一个**弱别名**，所以普通调用
 `f(p, a)`、手写 C 和纯 C 翻译单元照旧能链接，而不同结构体可以用同名方法而
-不必放进不同包：
+不必放进不同模块：
 
 ```c
 struct Circle { int r; };
@@ -422,56 +444,19 @@ int area(struct Rect *r)   { return r->w * r->h; }       /* Rect_area */
 不改名的情形：`static` / `inline` 函数（函数体在 TU 末尾或本文件内生成，
 挂不上别名）、`__` 开头的名字（编译器和 libtcc1 自己用的）、系统头文件里的
 声明（`p->fflush()`、`p->gettimeofday()` 必须仍然调 libc），以及匿名结构体的
-方法（匿名 tag 的编号是每个 TU 各一份）。包内声明的方法保持 `pkg__name`，
-包已经起了区分作用，`import` 后照样 `p->f()`。
+方法（匿名 tag 的编号是每个 TU 各一份）。模块里的方法不需要保留原名：符号只按
+接收者取名，模块前缀由 `NAME__` 那一层加在最外面（`geo__shape__Point_area`）。
 
 字段优先，方法须先于调用点声明，`duplicate method` 检查按 (类型, 源码名) 做
-（一个类型仍然只能有一个同名方法）。方法表与包 mangle 正交：包内定义的方法
-仍然用源码里写的名字注册。
+（一个类型仍然只能有一个同名方法；同一个符号的第二次定义由 C 的重定义检查报出，
+消息是 `redefinition of 'Vec_area'`）。
 
-### 6.5 模块：`module` + 声明加载
+### 6.5 导出：`-emit-header`
 
-`package` 作用于一段代码，符号在源码里仍要写限定名；`module` 作用于**整个
-文件**，源码继续写短名：
-
-```c
-/* math.c */
-module math;
-struct Point { int x, y; };
-typedef struct Point Point;
-int add(int a, int b) { return a + b; }
-int area(Point *p) { return p->x * p->y; }     /* math__Point_area */
-
-/* main.c6 */
-import math;
-int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
-```
-
-1. `module NAME;` 是文件的第一条声明（软关键字：文件里已有同名普通标识符时
-   按 C 语义处理），设置 `BufferedFile.c6_module = "NAME__"`；
-2. 文件作用域的声明经 `c6_mod_name` 加前缀：普通名字 `NAME__sym`，方法
-   `<NAME__Tag>_<meth>`；块作用域、`static`、`test`、`__` 开头和 `#include`
-   的普通 C 文件不改名；模块文件不发方法的原名弱别名，所以 C 侧只看到前缀名。
-   类型位置也接受 `NAME.Type`（多级点号同理）：`parse_btype` 先做一次可回退
-   的扫描（`c6_qualified_type`，先 `sym_find` typedef 再 `struct_find` tag），
-   解析到 `NAME__Type`（module 的 tag 有前缀；package 的 tag 仍是普通 C tag，
-   所以 package 限定类型要写 typedef）；不是类型时把 token 原样还回，所以
-   `pkg.func(...)` 这类表达式语句仍走普通表达式解析；
-3. `import NAME;` 在原有“登记命名空间”之外，按当前文件目录 → `-I` →
-   当前目录依次查找 `NAME.c6`、`NAME.c`（点号形式 `a/b.c6`、`a/b.c`；
-   两个文件并存时 `.c6` 优先），找到就用 `decl(VT_CONST)`
-   重放声明：函数只登记原型（`skip_or_save_block` 跳过函数体），全局变量只
-   登记 `extern`（`c6_skip_decl_tail` 跳过初始化器），`static` 对象和 `test`
-   块跳过；文件必须声明 `module NAME;`，循环 import 报错，找不到文件时保持
-   旧的命名空间行为；
-4. `-emit-header FILE` 在模块 TU 末尾把记录下来的导出（`C6HeaderDecl` 数组）
-   写成普通 C 头文件：结构体/枚举/typedef/函数/全局变量，切片和元组生成
-   `NAME__slice_N` / `NAME__tuple_N` typedef，C 侧包含头文件即可调用。
-
-跨 TU 仍然是普通 C 符号；`#include` 的普通头文件按 C 规则编译，只有模块文件
-自己的文件作用域声明加前缀。这是“零运行时、零新链接器特性”的方案：符号表里
-没有模块元数据。
-
+`-emit-header FILE`（配合 `-c`）在模块 TU 末尾把记录下来的导出（`C6HeaderDecl`
+数组）写成普通 C 头文件：结构体/枚举/typedef/函数/全局变量，切片和元组生成
+`NAME__slice_N` / `NAME__tuple_N` typedef，托管字段另外写出 `__c6_gc_field` /
+`__c6_gc_desc` 描述符。C 侧包含头文件即可调用，不需要知道模块的存在。
 
 ## 7. 卫生宏：`#macro` + `__local`（修复 G8）
 
@@ -510,7 +495,7 @@ int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
 | **1** | `defer`：就地生成清理块 + 运行时记录链表 + `ScopeTracker` | 条件/循环/递归/多 defer 逆序正确；`goto` 跨作用域清理；返回值落栈保护 | 0 |
 | **2** | `errdefer + err`：线程局部错误槽 + 就地清理 + 哨兵传播 | 多层传播逐层执行 errdefer；递归不串错误 | 1 |
 | **3** | **`test "desc" {}`**：顶层注册、`-test` 模式、`--test-filter`、与 `err` 集成 | PASS/FAIL 正确；退出码正确；后续特性用 `test` 验收 | 2 |
-| **4** | 包管理单文件：`current_package` mangle、import 重定向 | 符号可见性/冲突正确；不导出宏 | 3 |
+| **4** | 命名空间单文件：`module` mangle、import 按路径加载声明 | 符号可见性/冲突正确；不导出宏 | 3 |
 | **5** | `interface`：胖指针 ABI、结构化实现、vtable 生成 | 方法先于转换点；签名检查；用 `test` 验收 | 3 |
 | **6** | 跨文件包 + 跨 TU interface：包清单、`extern` vtable 声明 | 跨 TU 链接正确 | 4, 5 |
 | **7** | 卫生宏：`#macro` + `__local`、展开计数器重命名 | 正反例通过；用 `test` 验收 | 3 |
@@ -531,7 +516,7 @@ int main(void) { Point p = {3, 4}; return add(1, 2) + area(&p); }
 | 包管理 | 单文件导入、`pkg.member`、多级包 | 未导入使用、未知成员 | 跨 TU 链接、与老 C 代码互操作 |
 | 结构体方法 | `p->f()`、方法调方法、sret、`T!error` 方法、不同类型的同名方法（不靠包）、系统头里的 libc 方法 | 不带调用、重复方法、只有 `->` | 纯 C 定义的方法被 `->` 调用、普通调用名有歧义时的弱别名 |
 | 卫生宏 | `__local` 重命名正确 | `#`/`##` 用于 `__local` 报错 | 递归展开 |
-| 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`for` 声明） | 自动变量、全局缺初始化器报错 | `static` 变量与 VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、`package` 内报原名 |
+| 变量初始化 | 各类定义带初始化器（标量/数组/结构体/`for` 声明） | 自动变量、全局缺初始化器报错 | `static` 变量与 VLA 豁免、`extern` 声明/形参/成员/`typedef` 不受限、模块内报原名 |
 | 裸 tag 类型名 | 声明/形参/返回/成员/强转/`sizeof`/切片元素/方法接收者/typedef | tag 被普通符号（函数/变量/`stat`）遮蔽、tag 未声明、tag 出作用域、局部 tag 的切片、不完整类型 | 语句开头 `TAG:` 标签、`TAG(...)`、`const`/`typedef` 组合、`typeof`/`_Generic`/`_Alignof`、接口方法签名、跨 TU |
 | 函数字面量 | 显式声明/就地调用/推断声明/作实参/结构体成员/数组初值/文件作用域与 `static` 初始化器/变参/`!error`+`catch`/`defer` 体/嵌套字面量/`static inline` 体里/`qsort`/C 回调（`abi/`）/C99 后端；V2（捕获式闭包）：`closure RET (P…)` 类型、隐式按值捕获、`@` 托管引用、函数指针 → 闭包的跳板、`-emit-header`、跨 TU、C99 后端 | 捕获值装进普通函数指针（C93）、捕获 `own`/`weak`/数组/VLA/块作用域 `static`/`drop` 结构体等（C94）、`shared`/`weak`/`own` 闭包与跨线程任务（C96）、不透明操作（C97）、自捕获（C98）；无名字、带存储类、`async`、缺函数体（C80–C83） | 每处字面量各是一个函数、同一字面量赋给两个变量、和纯 C 函数指针互相赋值、`-emit-header` 不导出、`module` 不改名 |
 | 元组 `(T1, T2)` | 返回值/解构声明/解构赋值/`_`/`t[k]`/参数/成员/数组元素/嵌套/复合字面量/`sizeof`/`async`+`await`/`spawn`/`!error`/跨 TU/与 struct 的 ABI 互通/单条语句体与语句表达式里的解构 | 元素是 `void`/函数/VLA/数组/不完整/局部 tag/`error`、下标非常量或越界、解构个数不符、混写类型与名字、全 `_`、右边不是元组、非左值目标、`return {…}` 用在标量函数、`float!error` | `#pragma pack` 不影响布局、`(a, b)` 逗号表达式与各种强转/复合字面量不被误判、`_` 别处仍是普通标识符、文件作用域的元组对象 |
@@ -575,10 +560,10 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 | 2 `errdefer`/`err` | ✅ | `c6_errdefer_parse` / `c6_err_parse`、`__tcc_err_set/get/clear`；`err` 直接返回哨兵 `-1`，转发由 `try` 负责 |
 | 2b `T!error` / `try` / `catch` | ✅ | `c6_parse_fallible_suffix` / `c6_apply_fallible`（`FuncAttr.func_fallible`）、`c6_try_parse`（`unary()` 前缀分支）、`c6_catch_parse`（`expr_catch()` 层）、`c6_emit_propagate`（与 `err` 共用清理+哨兵路径）、`__tcc_error_take` / `__tcc_err_flag_peek` |
 | 3 `test` / `-test` / `-test-filter` | ✅ | `c6_test_parse`、`tccrun.c:tcc_run_tests`、`libtcc.c` 选项 |
-| 4 `package`/`import`/`pkg.member` | ✅ | `c6_package_parse` / `c6_import_parse`、`c6_pkg_name` / `c6_pkg_compose` / `c6_pkg_imported`、`c6_mangle_tok`（`NAME__sym`）、`unary()` 里的逐段点号解析与 `sym_find_raw` |
+| 4 `module`/`import`/`mod.member` | ✅ | `c6_module_parse` / `c6_module_import` / `c6_module_open`（分级路径）/ `c6_pkg_name` / `c6_mod_imported`、`c6_mangle_tok`（`NAME__sym`）、`unary()` 里的逐段点号解析与 `sym_find_raw`；`package` 只剩迁移提示 |
 | 4b 结构体方法 | ✅ | `decl()` 里 `c6_method_register`、`c6_method_symbol`（符号名 `<Tag>_<name>`，`static`/`inline`/`__` 开头/系统头/匿名 tag/包内方法不改名）、`c6_method_plain_decl` + `c6_method_alias`（源码名发布成弱别名，定义处用 `put_extern_sym2` 打上同一地址）、`c6_method_source_name`（`__func__` 显示源码名）、`c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`、`unary()` 的 `->` 分支、`c6_self_*` 隐藏接收者（sret 之后）；`BufferedFile.sys_header`（`tccpp.c` 按 include 路径标记系统头） |
 | 5 `interface` | ✅ | `c6_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`c6_auto_impl_ensure` / `c6_check_method`（惰性校验）、`c6_emit_auto_impls`（TU 末尾生成 `static` vtable）、`c6_iface_call_prep`（调用点改写）、`c6_iface_convert`（隐式/显式转换） |
-| 6 跨 TU | ✅ | 头文件用 `package NAME { ... }` 声明 API；接口与方法声明放头文件，每个 TU 各自生成 vtable；方法符号按接收者取名，所以同名方法跨 TU 也不需要包；`c6_tu_reset` 在每个 TU 开头丢弃上一 TU 的包/接口/方法/待生成 vtable |
+| 6 跨 TU | ✅ | 模块即文件，`import a.b;` 按路径读声明；接口与方法声明放头文件，每个 TU 各自生成 vtable；方法符号按接收者取名，所以同名方法跨 TU 也不需要命名空间；`c6_tu_reset` 在每个 TU 开头丢弃上一 TU 的模块状态/接口/方法/待生成 vtable |
 | 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_c6_macro` / `c6_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/`static`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
@@ -682,7 +667,8 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 | `tests/try.c6` | `try` / `catch`，含 `goto` 离开、嵌套传播、`void!error` |
 | `tests/test-block.c6` | `test` 块、`-test`、`-test-filter` |
 | `tests/macro.c6` | `#macro` 与卫生的 `__local` |
-| `tests/package.c6` | `package` / `import` / `pkg.member`、多级包名、跨 TU |
+| `tests/module.c6` | `module` / `import`：限定名、带前缀的 C 符号、全限定函数取址、跨 TU |
+| `c6ext/modpath`（run-tests.sh） | 模块名即路径：分级查找、扁平拼写被拒绝、两个 TU |
 | `tests/method.c6` | 结构体方法、不同类型的同名方法、libc 方法（`p->fflush()`）、与方法或 libc 同名的普通函数不被顶掉，以及 `T!error` 方法 |
 | `tests/interface.c6` | 接口、vtable、隐式/显式转换、跨 TU |
 | `tests/iface_agg.c6` | 接口方法签名里的聚合类型：struct 参数、struct 返回值、12 字节 struct 返回值（寄存器返回）、元组返回值（`tests/errors/iface.c6` 的 `test_proto_scope_tag` 守住“tag 必须在接口之前声明”的诊断） |
@@ -785,8 +771,8 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 - 方法符号是 `<结构体>_<方法>`，源码名是弱别名：同一个类型仍然只能有一个
   同名方法，不同类型的同名方法可以直接共存；`area(p)` 这种普通调用只指向
   本 TU 里第一个取到该名字的方法，有歧义时写 `p->area()`。`static` / `inline`、
-  `__` 开头的名字、系统头文件里的声明、匿名结构体的方法和 `package` 内的
-  方法保留原名，因此两个 `static` 或匿名结构体的同名方法仍然要靠包/改名区分；
+  `__` 开头的名字、系统头文件里的声明和匿名结构体的
+  方法保留原名，因此两个 `static` 或匿名结构体的同名方法仍然要靠改名区分；
   普通名已经被别的函数占用（同名普通函数、libc 声明）时不发别名，这样的方法
   只能写 `p->f()` 调用；
 - 纯 C 翻译单元里定义的方法没有改名符号，c6 一侧只能用 `f(p)` 调用它，

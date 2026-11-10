@@ -455,7 +455,7 @@ void f(Vect@int *v) {
    `test_chain_depth` 片段（告警 + 一个真错误，两样都要出现在 stderr）。
 3. **模板实例的 `drop` 方法**：`|T| void drop(Vect@T *self)` 每实例一份，GC 描述符
    按实例指针填；与 `gc-design.md` 的环检测配合需要在实例化后重跑一次环检。
-4. **`module`/`package` 前缀**：模板名与实例 mangle 名都要带包前缀（`pkg__Vect_int`），
+4. **`module` 前缀**：模板名与实例 mangle 名都要带模块前缀（`std__vec__Vect_int`），
    冒号点号形式的解析复用 `c6_pkg_name` / `c6_mangle_tok`。
 5. **体内成员函数（V3）**：允许在模板体内直接写方法定义：
 
@@ -497,7 +497,7 @@ void f(Vect@int *v) {
 |8|值形参（常量绑定）+ C110|✅ `struct Buf@(T, int N)` / `Buf@(int, 4)`，mangle 带实参拼写，`\|T, int N\|` 方法模板可覆盖所有实例（`tests/generic.c6`、`tests/abi/generic.c6`）|
 |9|模板前向声明 + C108|✅ `struct Fwd@T;` 可用；实例化报 `instantiation of undefined template`|
 |10|实例上限 C111/C112；`-emit-header` 输出实例|✅ C111/C112（1024 / 64）；`-emit-header` 用实例名写出 `struct pkg__Vect_int` 与实例函数原型|
-|11|`module`/`package` 前缀（模板名、实例 mangle 名，§8.4）与实例名冲突检查（§8.1）|✅ 实例名与普通名字一样带模块前缀（`m2__Vect_int`、`m2__id_int`、`m2__MyVec_char`），所以符号与 `-emit-header` 输出一致；用户手写同名 tag → `the instance name 'Vect_int' is already in use`|
+|11|`module` 前缀（模板名、实例 mangle 名，§8.4）与实例名冲突检查（§8.1）|✅ 实例名与普通名字一样带模块前缀（`m2__Vect_int`、`m2__id_int`、`m2__MyVec_char`），所以符号与 `-emit-header` 输出一致；用户手写同名 tag → `the instance name 'Vect_int' is already in use`|
 
 **阶段 3（收敛）**
 
