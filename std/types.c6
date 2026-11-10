@@ -1,0 +1,77 @@
+/* std/types：定宽整数类型与数值边界。
+ *
+ * c6 只继承 C 的 int/long/short/char，没有内建的 u8/i32 之类。标准库把
+ * 这些名字固定下来，并且让它们**没有代码**：全是 typedef 和 enum，所以
+ * `import std.types;` 只重放声明，链接时不需要 std/types 的目标文件。
+ *
+ * 用法：
+ *     import std.types;
+ *     u8 buf[16];
+ *     i64 n = (i64)1 << 40;
+ *
+ * 模块导出的名字带 `std__types__` 前缀（C 侧就是 `std__types__u8`），源码在
+ * import 之后照旧写短名。
+ */
+module std.types;
+
+typedef unsigned char      u8;
+typedef signed char        i8;
+typedef unsigned short     u16;
+typedef signed short       i16;
+typedef unsigned int       u32;
+typedef signed int         i32;
+typedef unsigned long long u64;
+typedef signed long long   i64;
+
+/* 指针大小 / 长度用的整数。c6 面向的平台上指针就是 8 字节。 */
+typedef unsigned long      usize;
+typedef signed long        isize;
+
+typedef float              f32;
+typedef double             f64;
+
+/* 字节与布尔：char 的符号性随平台，byte 明确按无符号字节用。 */
+typedef unsigned char      byte;
+typedef int                bool;
+
+/* 数值边界。c6 的 enum 成员是 int，比 int 宽的值写成常量表达式。 */
+enum Limits {
+    U8_MAX   = 0xff,
+    U16_MAX  = 0xffff,
+    I8_MAX   = 0x7f,
+    I16_MAX  = 0x7fff,
+    I32_MAX  = 0x7fffffff,
+};
+
+/* 返回值约定用的两个布尔常量。 */
+enum Bool { FALSE_ = 0, TRUE_ = 1 };
+
+test "定宽类型的大小是固定的" {
+    if (sizeof(u8) != 1 || sizeof(i8) != 1)
+        err(1, "u8/i8 不是 1 字节");
+    if (sizeof(u16) != 2 || sizeof(i16) != 2)
+        err(2, "u16/i16 不是 2 字节");
+    if (sizeof(u32) != 4 || sizeof(i32) != 4)
+        err(3, "u32/i32 不是 4 字节");
+    if (sizeof(u64) != 8 || sizeof(i64) != 8)
+        err(4, "u64/i64 不是 8 字节");
+    if (sizeof(usize) != sizeof(void *))
+        err(5, "usize 不是指针大小");
+}
+
+test "边界常量可以当无符号值使用" {
+    u16 m = U16_MAX;
+    u8 b = U8_MAX;
+    if (m != 65535 || b != 255)
+        err(6, "边界常量不对");
+    if (I32_MAX != 2147483647)
+        err(7, "I32_MAX 不对");
+}
+
+test "别名可以互相当作同一种类型" {
+    byte x = 200;
+    u8 y = x;
+    usize n = sizeof(byte);
+    if (y != 200 || n != 1)
+        err(8, "byte/u8 不是同一个类型");
+}

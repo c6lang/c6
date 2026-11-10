@@ -1,0 +1,358 @@
+/* std/str：字符串视图 Str。
+ *
+ *     import std.str;
+ *
+ *     Str s = { S("hello") };               // 字面量，零成本，不含结尾 NUL
+ *     Str t = str(buf);                 // C 字符串 -> 视图（要 strlen）
+ *     if ((&s)->eq(t)) ...
+ *     Str head = (&s)->take(2);
+ *
+ * Str 是 `char[:]` 的一层包装：**不拥有**内存、不分配、不复制，所以可以
+ * 按值声明和传参（它只有一对指针+长度，没有托管字段）。普通结构体的方法
+ * 就是「第一个参数是 `Str *` 的文件作用域函数」，调用要写 `(&s)->m()`：
+ *
+ *     Str s = { S("abc") };
+ *     Str *p = &s;              // 之后 p->count()、p->find_char('b') ...
+ *
+ * `S("...")` 是零成本修正：裸字面量转 `char[:]` 会把结尾的 NUL 也算进
+ * 长度（"hello" 得到 6），S() 用 sizeof-1 给出真实字符数。
+ *
+ * 生命周期由调用方保证：视图指向的内存必须比 Str 活得久。
+ */
+#include <string.h>
+
+module std.str;
+import std.types;
+
+/* 字面量 -> 视图：长度不含结尾 NUL */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct Str {
+    char[:] s;
+};
+
+int count(Str *self) { return self->s.len; }
+
+int is_empty(Str *self) { return self->s.len == 0; }
+
+/* 第 i 个字节；越界返回 0，扫描时不必先查长度 */
+char at(Str *self, int i)
+{
+    return (i >= 0 && i < self->s.len) ? self->s[i] : 0;
+}
+
+/* 带检查的取字节 */
+int get(Str *self, int i, char *out)
+{
+    if (i < 0 || i >= self->s.len)
+        return 0;
+    *out = self->s[i];
+    return 1;
+}
+
+/* 前 k 个 / 跳过前 k 个：只调整边界，不分配 */
+Str take(Str *self, int k)
+{
+    Str r = { self->s };
+
+    if (k < 0)
+        k = 0;
+    if (k > self->s.len)
+        k = self->s.len;
+    r.s = (char[:]){ self->s.data, k };
+    return r;
+}
+
+Str drop(Str *self, int k)
+{
+    Str r = { self->s };
+
+    if (k < 0)
+        k = 0;
+    if (k > self->s.len)
+        k = self->s.len;
+    r.s = (char[:]){ self->s.data + k, self->s.len - k };
+    return r;
+}
+
+Str sub(Str *self, int start, int n)
+{
+    Str r = { self->s };
+
+    if (start < 0)
+        start = 0;
+    if (start > self->s.len)
+        start = self->s.len;
+    if (n < 0)
+        n = 0;
+    if (start + n > self->s.len)
+        n = self->s.len - start;
+    r.s = (char[:]){ self->s.data + start, n };
+    return r;
+}
+
+/* 字节比较：-1 / 0 / 1 */
+int cmp(Str *self, char[:] o)
+{
+    int n = self->s.len < o.len ? self->s.len : o.len;
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        if (self->s[i] != o[i])
+            return self->s[i] < o[i] ? -1 : 1;
+    }
+    if (self->s.len == o.len)
+        return 0;
+    return self->s.len < o.len ? -1 : 1;
+}
+
+int eq(Str *self, char[:] o) { return self->cmp(o) == 0; }
+
+/* 子串第一次出现的位置，找不到返回 -1（朴素扫描，够用且无分配） */
+int find(Str *self, char[:] needle)
+{
+    int i = 0, j = 0;
+
+    if (needle.len == 0)
+        return 0;
+    if (needle.len > self->s.len)
+        return -1;
+    for (i = 0; i + needle.len <= self->s.len; i++) {
+        for (j = 0; j < needle.len; j++)
+            if (self->s[i + j] != needle[j])
+                break;
+        if (j == needle.len)
+            return i;
+    }
+    return -1;
+}
+
+int find_char(Str *self, char c)
+{
+    int i = 0;
+
+    for (i = 0; i < self->s.len; i++)
+        if (self->s[i] == c)
+            return i;
+    return -1;
+}
+
+int starts_with(Str *self, char[:] p)
+{
+    int i = 0;
+
+    if (p.len > self->s.len)
+        return 0;
+    for (i = 0; i < p.len; i++)
+        if (self->s[i] != p[i])
+            return 0;
+    return 1;
+}
+
+int ends_with(Str *self, char[:] p)
+{
+    int off = self->s.len - p.len;
+    int i = 0;
+
+    if (p.len > self->s.len)
+        return 0;
+    for (i = 0; i < p.len; i++)
+        if (self->s[off + i] != p[i])
+            return 0;
+    return 1;
+}
+
+/* 去掉两端空白，返回新视图（不改原视图） */
+Str trim(Str *self)
+{
+    Str r = { self->s };
+    int b = 0, e = self->s.len;
+
+    while (b < e && (self->s[b] == ' ' || self->s[b] == '\t' ||
+                     self->s[b] == '\n' || self->s[b] == '\r'))
+        b++;
+    while (e > b && (self->s[e - 1] == ' ' || self->s[e - 1] == '\t' ||
+                     self->s[e - 1] == '\n' || self->s[e - 1] == '\r'))
+        e--;
+    r.s = (char[:]){ self->s.data + b, e - b };
+    return r;
+}
+
+/* 十进制解析：整个视图必须是整数，允许前导 +/- 与两端空白 */
+int!error to_int(Str *self, int *out)
+{
+    Str t = self->trim();
+    Str *p = &t;
+    int i = 0, neg = 0;
+    long v = 0;
+    int digits = 0;
+
+    if (p->s.len == 0)
+        err(1, "str: empty number");
+    if (p->s[0] == '-' || p->s[0] == '+') {
+        neg = p->s[0] == '-';
+        i = 1;
+    }
+    for (; i < p->s.len; i++) {
+        if (p->s[i] < '0' || p->s[i] > '9')
+            err(2, "str: not a number");
+        v = v * 10 + (p->s[i] - '0');
+        if (v > 2147483647L)
+            err(3, "str: number out of range");
+        digits++;
+    }
+    if (!digits)
+        err(4, "str: no digits");
+    *out = (int)(neg ? -v : v);
+    return 0;
+}
+
+/* 写进外部缓冲：成功返回写入长度，空间不够返回 -1（不写半截） */
+int copy_to(Str *self, char *dst, int cap)
+{
+    if (cap <= self->s.len)
+        return -1;
+    memcpy(dst, self->s.data, (usize)self->s.len);
+    dst[self->s.len] = 0;
+    return self->s.len;
+}
+
+/* C 字符串 -> 视图（要 strlen；已知长度的字面量请用 S()） */
+Str str(char *z)
+{
+    Str r = { (char[:]){ z, 0 } };
+
+    if (z)
+        r.s = (char[:]){ z, (int)strlen(z) };
+    return r;
+}
+
+/* ---- 自测 ---- */
+
+test "S() 给出不含结尾 NUL 的长度" {
+    Str s = { S("hello") };
+    Str *p = &s;
+    Str e = { S("") };
+    Str *pe = &e;
+
+    if (p->count() != 5)
+        err(1, "S(\"hello\") 的长度不是 5");
+    if (pe->count() != 0)
+        err(2, "S(\"\") 的长度不是 0");
+    if (p->at(0) != 'h' || p->at(4) != 'o')
+        err(3, "at 不对");
+    if (p->at(5) != 0)
+        err(4, "越界没有返回 0");
+}
+
+test "str() 接 C 字符串" {
+    Str s = str((char *)"abc");
+    Str *p = &s;
+
+    if (p->count() != 3)
+        err(5, "str() 的长度不对");
+    if (!p->eq(S("abc")))
+        err(6, "str() 的内容不对");
+    if (p->count() != 3 || p->is_empty())
+        err(7, "空判断不对");
+}
+
+test "比较与相等" {
+    Str a = { S("abc") };
+    Str b = { S("abd") };
+    Str c = { S("abc") };
+    Str d = { S("ab") };
+    Str *pa = &a, *pb = &b, *pd = &d;
+
+    if (!pa->eq(c.s))
+        err(8, "相同内容不相等");
+    if (pa->eq(b.s))
+        err(9, "不同内容相等了");
+    if (pa->cmp(b.s) != -1 || pb->cmp(a.s) != 1)
+        err(10, "cmp 的正负不对");
+    if (pa->cmp(d.s) != 1 || pd->cmp(a.s) != -1)
+        err(11, "前缀关系不对");
+}
+
+test "find / find_char / starts_with / ends_with" {
+    Str s = { S("hello world") };
+    Str *p = &s;
+
+    if (p->find(S("world")) != 6)
+        err(12, "find 子串不对");
+    if (p->find(S("zzz")) != -1)
+        err(13, "找不到时应返回 -1");
+    if (p->find_char('o') != 4)
+        err(14, "find_char 不对");
+    if (!p->starts_with(S("hello")) || p->starts_with(S("world")))
+        err(15, "starts_with 不对");
+    if (!p->ends_with(S("world")) || p->ends_with(S("hello")))
+        err(16, "ends_with 不对");
+}
+
+test "trim / take / drop / sub 都是视图" {
+    Str s = { S("  hi \t") };
+    Str *p = &s;
+    Str t = p->trim();
+    Str *pt = &t;
+    Str a = p->take(3);
+    Str b = p->drop(2);
+    Str *pb = &b;
+    Str c = p->sub(2, 2);
+    Str *pc = &c;
+
+    if (pt->count() != 2 || !pt->eq(S("hi")))
+        err(17, "trim 不对");
+    if ((&a)->count() != 3)
+        err(18, "take 不对");
+    if (!pb->eq(S("hi \t")))
+        err(19, "drop 不对");
+    if (!pc->eq(S("hi")))
+        err(20, "sub 不对");
+    /* 视图指回原内存 */
+    if (t.s.data != s.s.data + 2)
+        err(21, "trim 没有指回原内存");
+}
+
+/* 成功返回 0，失败把错误 id 带出来（catch 体必须以 return/err/goto 结束） */
+int to_int_id(Str *s)
+{
+    int v = 0;
+
+    s->to_int(&v) catch e { return e.id; };
+    return 0;
+}
+
+test "十进制解析" {
+    Str a = { S(" -42 ") };
+    Str b = { S("7") };
+    Str c = { S("12x") };
+    Str d = { S("99999999999") };
+    int v = 0;
+
+    (&a)->to_int(&v) catch e { err(22, "负数解析失败"); };
+    if (v != -42)
+        err(23, "负数解析结果不对");
+    (&b)->to_int(&v) catch e { err(24, "正数解析失败"); };
+    if (v != 7)
+        err(25, "正数解析结果不对");
+    if (to_int_id(&c) != 2)
+        err(26, "非法字符应报 id 2");
+    if (to_int_id(&d) != 3)
+        err(27, "溢出应报 id 3");
+}
+
+test "copy_to 不写半截" {
+    char buf[4] = { 0, 0, 0, 0 };
+    Str ok = { S("abc") };
+    Str big = { S("abcdef") };
+
+    if ((&ok)->copy_to(buf, 4) != 3)
+        err(28, "copy_to 成功时应返回长度");
+    if (strcmp(buf, "abc") != 0)
+        err(29, "copy_to 内容不对");
+    if ((&big)->copy_to(buf, 4) != -1)
+        err(30, "空间不够时应返回 -1");
+    if (strcmp(buf, "abc") != 0)
+        err(31, "空间不够时改写了缓冲");
+}

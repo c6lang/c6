@@ -43,7 +43,8 @@ HOSTCC   ?= gcc
 
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
-        c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc
+        c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
+        stdtest std-demo
 
 all: build
 
@@ -91,6 +92,26 @@ test-plain: build-plain
 # c6 代码只能写在 .c6 文件里：后缀是唯一的开关，命令行没有 -std=c6。
 selftest: build
 	./$(SELFTEST)
+
+# std/：标准库。每个文件一个 module（模块名就是路径：std/vec.c6 -> std.vec），
+# 每个文件自带 test 块，逐个跑。
+stdtest: build
+	@fail=0; for f in std/*.c6; do \
+	    printf '%-16s ' "$$f"; \
+	    out=$$(./$(TCC_DIR)/tcc -B $(TCC_DIR) -I . -test $$f 2>&1) || fail=1; \
+	    echo "$$out" | tail -1; \
+	done; \
+	test $$fail -eq 0
+
+# 标准库的拼装示例：模块正文要单独编进程序（import 只带来声明），
+# 模块搜索路径靠 -I 给出（import wordcount.text 找 examples/wordcount/text.c6）。
+std-demo: build
+	@mkdir -p build
+	./$(TCC_DIR)/tcc -B $(TCC_DIR) -I examples -I . -o build/wordcount \
+	    examples/wordcount.c6 examples/wordcount/text.c6 \
+	    std/str.c6 std/types.c6 std/vec.c6 std/span.c6 std/fmt.c6 \
+	    std/range.c6 std/err.c6
+	./build/wordcount
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build

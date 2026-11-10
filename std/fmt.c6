@@ -1,0 +1,234 @@
+/* std/fmt：定长格式化缓冲 Buf@(N)。
+ *
+ *     import std.fmt;
+ *
+ *     Buf@(32) b = { { 0 }, 0 };
+ *     b->write(S("n=")) catch e { return e.id; };
+ *     b->write_int(42) catch e { return e.id; };
+ *     puts(b->cstr());
+ *
+ * 为什么是定长：c6 的所有权模型里没有「会自己长大的字符串」，而绝大多数
+ * 格式化场景（日志行、错误消息、命令行输出）都有天然上限。需要变大时用
+ * `std.vec` 的 `Vect@char`，那是另一个决定。Buf 是纯值类型（只有一个
+ * char 数组和一个长度），可以按值声明、按值传参，不涉及托管引用。
+ *
+ * 缓冲里始终留一格给结尾 NUL：容量 N 的 Buf 最多装 N-1 个字符。
+ * `write_*` 系列在空间不够时返回 `T!error`，并且**不写半截**。
+ */
+#include <string.h>
+
+module std.fmt;
+import std.types;
+
+struct Buf@(int N) {
+    char data[N];
+    int n;
+
+    int count() { return n; }
+
+    /* 总容量（含结尾 NUL 那一格） */
+    int cap() { return N; }
+
+    int is_empty() { return n == 0; }
+
+    /* 还能写几个字符 */
+    int room() { return N - 1 - n; }
+
+    void clear()
+    {
+        n = 0;
+        data[0] = 0;
+    }
+
+    /* 以 NUL 结尾的视图；调用后 data 里最多 N-1 个字符 + NUL */
+    char *cstr()
+    {
+        data[n] = 0;
+        return data;
+    }
+
+    /* 当前内容的视图（不含 NUL） */
+    char[:] slice() { return (char[:]){ data, n }; }
+
+    int!error add(char c)
+    {
+        if (n + 1 >= N)
+            err(1, "fmt: buffer full");
+        data[n] = c;
+        n++;
+        data[n] = 0;
+        return 0;
+    }
+
+    int!error write(char[:] s)
+    {
+        int i = 0;
+
+        if (s.len > N - 1 - n)
+            err(2, "fmt: buffer full");
+        for (i = 0; i < s.len; i++)
+            data[n + i] = s[i];
+        n += s.len;
+        data[n] = 0;
+        return 0;
+    }
+
+    /* 十进制无符号：从尾部倒着写 */
+    int!error write_uint(u32 v)
+    {
+        char tmp[16] = { 0 };
+        int k = 0, i = 0;
+
+        do {
+            tmp[k++] = (char)('0' + (v % 10u));
+            v /= 10u;
+        } while (v != 0u);
+        if (k > N - 1 - n)
+            err(3, "fmt: buffer full");
+        for (i = k - 1; i >= 0; i--)
+            data[n++] = tmp[i];
+        data[n] = 0;
+        return 0;
+    }
+
+    int!error write_int(int v)
+    {
+        if (v < 0) {
+            if (N - 1 - n < 1)
+                err(4, "fmt: buffer full");
+            data[n++] = '-';
+            /* 取反要在无符号域里做，INT_MIN 才有定义 */
+            try write_uint((u32)0 - (u32)v);   /* 原样转发，别 return e.id */
+            return 0;
+        }
+        try write_uint((u32)v);
+        return 0;
+    }
+
+    /* 右对齐写整数：不足 width 位时左边补 pad（通常是空格或 '0'） */
+    int!error write_pad(int v, int width, char pad)
+    {
+        char tmp[16] = { 0 };
+        int k = 0, i = 0, neg = 0;
+        u32 u = 0;
+
+        if (v < 0) {
+            neg = 1;
+            u = (u32)0 - (u32)v;
+        } else {
+            u = (u32)v;
+        }
+        do {
+            tmp[k++] = (char)('0' + (u % 10u));
+            u /= 10u;
+        } while (u != 0u);
+        if (neg)
+            tmp[k++] = '-';
+        if (k > width)
+            width = k;
+        if (width > N - 1 - n)
+            err(5, "fmt: buffer full");
+        for (i = width - k; i > 0; i--)
+            data[n++] = pad;
+        for (i = k - 1; i >= 0; i--)
+            data[n++] = tmp[i];
+        data[n] = 0;
+        return 0;
+    }
+};
+
+/* ---- 自测 ---- */
+
+test "add / write / cstr" {
+    Buf@(16) b = { { 0 }, 0 };
+    Buf@(16) *p = &b;
+
+    p->add('h') catch e { err(1, "add 失败"); };
+    p->write((char[:]){ (char *)"ello", 4 }) catch e { err(2, "write 失败"); };
+    if (p->count() != 5)
+        err(3, "count 不是 5");
+    if (p->cap() != 16 || p->room() != 10)
+        err(4, "cap/room 不对");
+    if (strcmp(p->cstr(), "hello") != 0)
+        err(5, "cstr 内容不对");
+}
+
+/* 注意别在文件作用域写「参数带实例类型」的辅助函数：那会让导入这个模块
+   的每个 TU 都提前实例化该类型（见 docs/stdlib.md 的已知限制）。所以这里
+   用 goto 把错误 id 带出来，catch 体仍然以 goto 结束。 */
+test "写满时返回错误，且不写半截" {
+    Buf@(4) b = { { 0 }, 0 };
+    Buf@(4) *p = &b;
+    int bad = 0;
+
+    p->write((char[:]){ (char *)"abc", 3 }) catch e { err(6, "write 失败"); };
+    if (p->room() != 0)
+        err(7, "room 应为 0");
+    p->write((char[:]){ (char *)"x", 1 }) catch e {
+        bad = e.id;
+        goto checked;
+    };
+checked:
+    if (bad != 2)
+        err(8, "写满应报 id 2");
+    if (p->count() != 3)
+        err(9, "失败时改动了长度");
+    if (strcmp(p->cstr(), "abc") != 0)
+        err(10, "失败时改动了内容");
+}
+
+test "十进制整数，含 INT_MIN" {
+    /* "0 -42 2147483647 -2147483648" 共 27 个字符，留一格 NUL */
+    Buf@(32) b = { { 0 }, 0 };
+    Buf@(32) *p = &b;
+
+    p->write_int(0) catch e { err(11, "0 失败"); };
+    p->add(' ') catch e { err(12, "空格失败"); };
+    p->write_int(-42) catch e { err(13, "-42 失败"); };
+    p->add(' ') catch e { err(14, "空格失败"); };
+    p->write_int(2147483647) catch e { err(15, "INT_MAX 失败"); };
+    p->add(' ') catch e { err(16, "空格失败"); };
+    /* INT_MIN：取反必须在无符号域里做 */
+    p->write_int(-2147483647 - 1) catch e { err(17, "INT_MIN 失败"); };
+    if (strcmp(p->cstr(), "0 -42 2147483647 -2147483648") != 0)
+        err(18, "整数格式化结果不对");
+}
+
+test "右对齐补位" {
+    Buf@(16) b = { { 0 }, 0 };
+    Buf@(16) *p = &b;
+
+    p->write_pad(42, 5, ' ') catch e { err(19, "空格补位失败"); };
+    p->add('|') catch e { err(20, "分隔失败"); };
+    p->write_pad(7, 3, '0') catch e { err(21, "零补位失败"); };
+    p->add('|') catch e { err(22, "分隔失败"); };
+    p->write_pad(-5, 4, ' ') catch e { err(23, "负数补位失败"); };
+    if (strcmp(p->cstr(), "   42|007|  -5") != 0)
+        err(24, "补位结果不对");
+}
+
+test "clear 之后可重复使用" {
+    Buf@(8) b = { { 0 }, 0 };
+    Buf@(8) *p = &b;
+
+    p->write((char[:]){ (char *)"abcdefg", 7 }) catch e { err(25, "write 失败"); };
+    p->clear();
+    if (p->count() != 0 || p->cstr()[0] != 0)
+        err(26, "clear 之后不干净");
+    p->write((char[:]){ (char *)"ok", 2 }) catch e { err(27, "重用失败"); };
+    if (strcmp(p->cstr(), "ok") != 0)
+        err(28, "重用后内容不对");
+}
+
+test "Buf 可以按值传递" {
+    Buf@(8) b = { { 0 }, 0 };
+    Buf@(8) *p = &b;
+    int n = 0;
+
+    p->write((char[:]){ (char *)"hi", 2 }) catch e { err(29, "write 失败"); };
+    n = p->count();
+    if (n != 2)
+        err(30, "count 不对");
+    if (p->slice().len != 2)
+        err(31, "slice 长度不对");
+}

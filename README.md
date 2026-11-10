@@ -37,9 +37,11 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 .
 ├── docs/plan.md      设计与实施方案（含实现状态）
 ├── docs/grammar.md   扩展语法的 BNF/EBNF 规范
+├── docs/stdlib.md    标准库 std/ 的设计、API 与写法约定
 ├── scripts/          bootstrap.sh：首次构建前跑 ./configure
 ├── tests/            c6 全部自测：*.c6 是 test 块，c6ext/*.c6 验证后缀，errors/ 是编译期诊断
-├── examples/         可运行示例（每个特性一个 *_demo.c6）
+├── std/              标准库：一个文件一个 module（std/vec.c6 -> std.vec），见 docs/stdlib.md
+├── examples/         可运行示例（每个特性一个 *_demo.c6，wordcount 是标准库的集成示例）
 ├── Makefile          便捷入口（bootstrap / build / selftest / test / clean）
 └── tcc/              TCC 源码树：上游基线 + 一个 c6 补丁一个提交
 ```
@@ -1522,6 +1524,44 @@ smp: 真并行 —— 两个任务同时跑在两个核上
 - 顺带修了个潜伏的：引导器原来把栈放在 `0x80000`，那个地址其实**落在 payload
   的 `.bss` 里面**，变量一多（这次是中断栈和堆）就会踩到栈 —— 现在挪到 16MB。
 
+## 标准库 `std/`
+
+标准库按「一个文件一个 module、模块名就是它的路径」组织：
+
+```
+std/types.c6   std.types   定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
+std/err.c6     std.err     错误码 enum Code（OK…BUSY）+ msg()/msg_of()/is_ok()
+std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T
+std/span.c6    std.span    别人内存上的窗口 Span@T（纯值、零拷贝）
+std/map.c6     std.map     开放寻址哈希表 Map@(K,V) + Entry/Iter
+std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()
+std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)
+std/range.c6   std.range   能被 foreach 吃掉的区间 Range/StepRange
+```
+
+```c
+import std.vec;
+import std.fmt;
+
+@Vect@int v = new Vect@int;                /* 托管字段 -> new 出来 */
+Buf@(32) b = { { 0 }, 0 };                 /* 纯值，栈上就够 */
+
+v->push(42) catch e { return e.id; };      /* 失败必须被 try/catch 消费 */
+b->write_int(v->count()) catch e { return 2; };
+printf("%s\n", b->cstr());
+```
+
+`import` 只带来声明，所以模块自己的 `.c6` 文件要一起编进程序：
+
+```sh
+./tcc/tcc -B tcc -I . -o build/app app.c6 std/vec.c6 std/fmt.c6 std/types.c6
+make stdtest     # 跑 std/ 下全部 test 块（43 个断言）
+make std-demo    # 编译并运行 examples/wordcount.c6（用到 7 个模块）
+```
+
+设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
+[`docs/stdlib.md`](docs/stdlib.md)。
+
 ## 测试
 
 c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
@@ -1556,6 +1596,7 @@ tests/
 ├── closure.c6         捕获式闭包（V2）
 ├── generic.c6         泛型：模板、实例、体内方法、值形参
 ├── generic_fn.c6      |T| 函数 / typedef 模板
+├── generic_scope.c6   模板实例的作用域边界（字段名 vs 同名方法、形参不漏出、跨 TU 弱符号）
 ├── async.c6           async / await / co / task
 ├── async_frame.c6     帧住在任务里：&local 跨 await、weak 形参
 ├── thread.c6          spawn（OS 线程）
@@ -1637,6 +1678,8 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
+make stdtest       # 标准库 std/ 的 test 块
+make std-demo      # 标准库集成示例（examples/wordcount.c6）
 make test-all      # selftest + tests2 + c6selfcheck + freestanding/裸机
 make check-all     # test-all + C99 后端两套用例 + 三条自举路线（发布前跑这条）
 ```
