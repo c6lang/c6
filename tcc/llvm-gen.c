@@ -990,14 +990,21 @@ static const char *l_sym_place(Sym *sym, long long addend, int is_call)
 
     if (!sym)
         tcc_error("llvm output: reference without a symbol");
+    if (nocode_wanted && !sym->c && !IS_ASM_FUNC(sym->type.t))
+        /* nothing is emitted here (the front-end is only sizing a type), so
+           the value never reaches the module; native tcc emits no relocation
+           for it either and the symbol has no Elf entry yet */
+        return l_ret("null");
     if (!sym->c && !IS_ASM_FUNC(sym->type.t))
         put_extern_sym(sym, NULL, 0, 0);
     idx = sym->c;
     if (idx > 0 && idx < (int)(l_s1->symtab->data_offset / sizeof(ElfSym))) {
         e = l_esym(idx);
         name = l_esym_name(idx);
+        /* a stale string offset must never reach the module, but the entry
+           itself may still be addressable through its section */
         if (!l_name_ok(name))
-            e = NULL;
+            name = "";
     }
     tok = l_token_name(sym);
     if (!e) {
@@ -2355,8 +2362,7 @@ ST_FUNC void gfunc_call(int nb_args)
         }
         if (fsym->f.func_type == FUNC_ELLIPSIS)
             n += snprintf(fty + n, sizeof fty - n, "%s...", n > 1 ? ", " : "");
-        else if (n == 1)
-            n += snprintf(fty + n, sizeof fty - n, "void");
+        /* an empty parameter list is '()': 'void' is only a result type */
         snprintf(fty + n, sizeof fty - n, ") ");
     } else {
         /* native code gives every called function an Elf symbol; the
