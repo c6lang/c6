@@ -133,6 +133,12 @@ std/bits.c6    std.bits   popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/cle
 std/hash.c6    std.hash   FNV-1a 32/64、CRC32、Adler-32 + 流式 Hasher
 std/path.c6    std.path   POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
 std/deque.c6   std.deque  环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
+std/ascii.c6   std.ascii  ASCII 判别/大小写/忽略大小写比较（收 int，EOF 与负 char 安全）
+std/num.c6     std.num    浮点格式化（固定/%e/%g）与解析（inf/nan、RANGE/PARSE 错误码）
+std/codec.c6   std.codec  Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
+std/rand.c6    std.rand   xorshift64*：可重放序列、无偏区间 rand_below、rand_f64、shuffle
+std/fs.c6      std.fs     stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
+std/set.c6     std.set    哈希集合 Set@K + SetIter（std.map 的薄包装，add 返回新增/已存在）
 ```
 
 ```c
@@ -154,9 +160,10 @@ printf("%s\n", b->cstr());
 ```sh
 ./tcc/c6 -B tcc -I . -o build/app app.c6 \
     std/vec.c6 std/fmt.c6 std/types.c6 std/str.c6 std/sort.c6 std/err.c6
-make stdtest     # 跑 std/ 下全部 test 块
-make std-demo    # 编译并运行 examples/wordcount.c6（标准库集成示例）
-make std-tour    # 编译并运行 examples/stdtour.c6（新模块的拼装示例，自带自检）
+make stdtest     # 跑 std/ 下全部 test 块（模块数与块数以实际输出为准）
+make std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
+make std-tour    # 编译并运行 examples/stdtour.c6（第二批模块的拼装示例）
+make std-kit     # 编译并运行 examples/stdkit.c6（第三批模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

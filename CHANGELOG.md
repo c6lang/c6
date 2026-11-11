@@ -25,6 +25,13 @@
 - **修正过期状态**：`gc-design.md` 的「设计定稿待编码」改为已落地（P0–P8）。
 - **`make help`** 从打印 20 行注释改为打印完整目标清单（37 个目标，按用途分组）。
 
+### 标准库
+
+- **标准库第三批**：`std.ascii` / `std.num` / `std.codec` / `std.rand` / `std.fs` /
+  `std.set` 六个模块，集成示例 `examples/stdkit.c6`（`make std-kit`）；顺手修掉
+  `std/map` 扩容复活墓碑的 bug（`std/set` 的对应用例钉住）。错误号段
+  `std.ascii`=0x6013 … `std.set`=0x6018。
+
 ## 2026-11-11
 
 - **LLVM IR 后端**：按输出后缀 `.ll` 选择，复用整个前端 — `a6543f2`

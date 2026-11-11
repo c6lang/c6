@@ -503,9 +503,9 @@ module，模块名就是路径），加一个集成示例 `examples/wordcount.c6
 （`make std-demo`）；第二批补了 `std/mem`、`std/io`、`std/math`、`std/time`、
 `std/strbuf`、`std/utf8`、`std/bits`、`std/hash`、`std/path`、`std/deque`，并给
 `str`/`vec`/`fmt` 补了 `to_u64`/`strip_prefix`/`strip_suffix`/`fields`、
-`any`/`all`/`find_if`/`swap`、`digits_*` 原语与 `write_hex64`（见 11.12）。现在
-`make stdtest` 是 19 个模块、149 个 `test` 块，集成示例两个：`std-demo` 和
-`std-tour`。设计、API、写法约定与编译器层面的已知限制见
+`any`/`all`/`find_if`/`swap`、`digits_*` 原语与 `write_hex64`（见 11.12）。第三批
+之后 `make stdtest` 是 25 个模块、197 个 `test` 块，集成示例三个：`std-demo`、
+`std-tour` 和 `std-kit`（见 11.13）。设计、API、写法约定与编译器层面的已知限制见
 [stdlib.md](../stdlib.md)；上面 11.10 的三处修复就是把它写出来时暴露的。
 
 ### 11.12 标准库第二批（strbuf / utf8 / bits / hash / path / deque）
@@ -558,5 +558,53 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
    `if (has_value && !c6_last_stmt_leaves) tcc_error(...)`，void 场景就允许
    fallthrough，非 void 场景仍然拦住。
 
-验收：`make stdtest`（19 个模块、149 个 `test` 块、0 failure）、`make std-tour`
+当时的验收：`make stdtest`（19 个模块、149 个 `test` 块、0 failure）、`make std-tour`
 （`examples/stdtour.c6`，73 条自检全过）、`make std-demo`、`make errcheck` 全绿。
+
+### 11.13 标准库第三批（ascii / num / codec / rand / fs / set）
+
+第三批补的不是容器，而是「程序除了容器还要用的那一层」：字节分类、浮点的
+出入口、文本编码、随机数、文件系统元数据、集合。前两批已经把这层的一半做完了
+（path/hash/bits/utf8 都是零分配），这一批继续守住同样的约定：能写调用方缓冲
+就不分配，放不下就返回 -1 且一个字节都不写。
+
+| 模块 | 定位 | 关键决定 |
+| --- | --- | --- |
+| `std.ascii` | 字节判别、大小写、忽略大小写比较 | 参数收 `int`：`fgetc()` 的 EOF(-1) 和带符号 char 都安全；`c < 0 || c > 127` 一律判「不是」，不读表越界；只认 ASCII，不做 locale |
+| `std.num` | 浮点格式化（固定 / `%e` / `%g`）与解析 | 不链 libm；`fmt_f64`/`fmt_f64_sci`/`fmt_f64_g` 都是四舍五入（.5 远离零）、放不下不写；`fmt_f64` 限制 `|x| < 1e18`（整数部分超出 u64 就没法固定表示），大数走 `_sci`；解析最多累积 19 位有效数字，明确不是正确舍入；溢出 `RANGE`、下溢给 0 |
+| `std.codec` | Base64 / 十六进制 / 百分号 | 解码先完整校验一遍、第二遍才写，非法输入不留半截；Base64 接受省略填充与 ASCII 空白，拒绝 `% 4 == 1`、`=` 在中间；百分号的 `+` 是显式参数，默认不当空格 |
+| `std.rand` | xorshift64* 伪随机 | 同一 seed 跨平台同一串数（不依赖 libc `rand()`）、纯值可重入；`rand_below` 用拒绝采样而不是「取模偏置」；种子 0 换成非零常量（全零状态是吸收态）；明确不是密码学随机 |
+| `std.fs` | stat/lstat、mkdir_p、目录遍历、rename/remove、cwd/chdir | `std.io` 管内容、`std.fs` 管元数据；`errno` 翻译成 `std.err`（`NO_ENT`/`EXIST`/`INVAL`/`IO`）；`dir_next` 用 1/0/-1/-2 区分「取到/结束/出错/名字太长」，名字太长不截断；POSIX-only，freestanding 用不了 |
+| `std.set` | 哈希集合 `Set@K` | 不复制 Map 的开放寻址/墓碑/扩容逻辑，直接包 `@Map@(K, int)`；`add` 返回 1（新增）/0（已存在），失败 `int!error`；代价是用 Set 的程序要把 `std/map.c6` 正文一起编 |
+
+**写这批时踩到并修掉的真 bug：`std/map` 扩容会复活墓碑。** `Map::reserve()`
+重建表时写的是 `if (!of[i]) continue;`，而 `SLOT_DEAD` 的值是 2（也是「非零」），
+于是墓碑连同旧键值被搬进新表：`count` 少一、已删除的键重新出现。Map 自己的
+用例没踩到是因为删除之后没有继续插到触发扩容；`Set` 的 add/remove 组合立刻
+暴露了它。修法是把条件改成 `of[i] != SLOT_LIVE`，并在 `std/map.c6` 补了
+「墓碑不会在扩容时复活」用例（删一个键、继续插到 cap 32→64、验证死键不在、
+活键都在，再 reuse 那个槽位）。
+
+编译器层面这一批确认了两件事：
+
+1. **嵌套泛型实例当字段是可行的**：`struct Set@K { @Map@(K, int) m; }` 能声明、
+   能 `new Map@(K, int)`、能调 `m->put()`，`Iter@(K, int)` 也能当 `SetIter@K`
+   的字段。11.12 里「模板体内方法不能返回多参数泛型实例」仍然成立，`Set.iter()`
+   因此返回单参数的 `SetIter@K`。
+2. **在导入方用实例类型写辅助函数仍会出警告**：在普通 TU 里写
+   `static int f(Set@int *s) { return s->has(k); }` 会得到
+   `assignment makes integer from pointer`（返回值类型没解析对），程序能跑但
+   不该依赖。`examples/stdkit.c6` 的 `tour_set` 因此把逻辑留在局部
+   `@Set@int` 变量上，`docs/stdlib.md` 的「写法约定 / 已知限制」记了这一条。
+
+号段继续按第一批的规矩追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：
+`std.ascii`=0x6013、`std.num`=0x6014、`std.codec`=0x6015、`std.rand`=0x6016、
+`std.fs`=0x6017、`std.set`=0x6018，`docs/reference/grammar.md` §8.1 同步。`errbase.def`
+仍然不动：std 池是编译器常量，C126（std 槽位不许被钉号）继续成立。
+
+集成示例是 `examples/stdkit.c6`（`make std-kit`，70 条自检），六节各对应一个
+模块，并且把 `std/fs.c6` 的目录生命周期完整走一遍（mkdir_p → 写文件 → stat →
+遍历 → rename → remove/rmdir）。验收：`make stdtest`（25 个模块、197 个
+`test` 块、0 failure）、`make std-kit`（70 条自检全过）、`make std-tour`、
+`make std-demo`、`make errcheck` 全绿。
+

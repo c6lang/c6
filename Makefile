@@ -47,7 +47,7 @@ HOSTCC   ?= gcc
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
-        stdtest errcheck std-demo std-tour
+        stdtest errcheck std-demo std-tour std-kit
 
 all: build
 
@@ -123,6 +123,7 @@ stdtest: build
 	    std/vec.c6)  deps="std/sort.c6 std/str.c6" ;; \
 	    std/strbuf.c6) deps="std/fmt.c6" ;; \
 	    std/path.c6) deps="std/str.c6" ;; \
+	    std/set.c6)  deps="std/map.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -155,6 +156,17 @@ std-tour: build
 	@mkdir -p build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdtour $(STDTOUR_SRCS)
 	./build/stdtour
+
+# 标准库第三批的一日游：ascii / num / codec / rand / fs / set。
+# set 是 map 的薄包装，所以 map 的正文也要在命令行上。
+STDKIT_SRCS := examples/stdkit.c6 std/types.c6 std/err.c6 std/map.c6 \
+               std/set.c6 std/ascii.c6 std/num.c6 std/codec.c6 \
+               std/rand.c6 std/fs.c6
+
+std-kit: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdkit $(STDKIT_SRCS)
+	./build/stdkit
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
@@ -260,7 +272,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
