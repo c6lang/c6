@@ -1572,6 +1572,7 @@ ST_FUNC int normalized_PATHCMP(const char *f1, const char *f2);
 #define OPT_HELP2 2
 #define OPT_V 3
 #define OPT_PRINT_DIRS 4
+#define OPT_PRINT_TARGETS 7
 #define OPT_AR 5
 #define OPT_IMPDEF 6
 #define OPT_M32 32
@@ -2032,6 +2033,8 @@ ST_FUNC int llvm_tool_cc(TCCState *s1, const char *irfile,
                          const char *outfile);
 /* make the preprocessor macros follow '--target=<triple>' */
 ST_FUNC void llvm_set_target(TCCState *s1);
+/* '--print-targets': the triples --target= knows (tcc/llvm-gen.c) */
+ST_FUNC void llvm_print_targets(TCCState *s1);
 #endif
 
 /* ------------ c67-gen.c ------------ */

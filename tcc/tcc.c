@@ -133,6 +133,7 @@ static const char help[] =
     "  --emit-llvm      with --target: stop at the .ll file\n"
     "  --cc=COMPILER    what turns the IR into the result [$TCC_CC, clang]\n"
     "                   (an -o name ending in .ll asks for the IR alone)\n"
+    "  -print-targets   list the triples --target= knows\n"
 #endif
     "Tools:\n"
     "  create library  : tcc -ar [crstvx] lib [files]\n"
@@ -164,6 +165,7 @@ static const char help2[] =
     "                                compiler build the result\n"
     "  --emit-llvm                   with --target: stop at the .ll\n"
     "  --cc=COMPILER                 build the IR with COMPILER [$TCC_CC, clang]\n"
+    "  -print-targets                list the triples --target= knows\n"
     "Ignored options:\n"
     "  -arch -C --param -pedantic -pipe -s -traditional\n"
     "-W[no-]... warnings:\n"
@@ -500,7 +502,8 @@ static int wants_llvm_output(int argc, char **argv)
         /* '--target=' / '-emit-llvm' ask for this back-end by name, whatever
            the output file is called */
         if (!strncmp(a, "-target", 7) || !strncmp(a, "--target", 8)
-            || !strcmp(a, "-emit-llvm") || !strcmp(a, "--emit-llvm"))
+            || !strcmp(a, "-emit-llvm") || !strcmp(a, "--emit-llvm")
+            || !strcmp(a, "-print-targets") || !strcmp(a, "--print-targets"))
             return 1;
         if (!strcmp(a, "-o")) {
             if (i + 1 < argc)
@@ -591,6 +594,14 @@ redo:
         if (opt == OPT_IMPDEF)
             ret = tcc_tool_impdef(argc, argv);
 #endif
+        if (opt == OPT_PRINT_TARGETS) {
+#ifdef TCC_TARGET_LLVM
+            llvm_print_targets(s);
+#else
+            fprintf(stderr, "tcc: this build has no LLVM IR back-end\n");
+            ret = 1;
+#endif
+        }
         if (opt == OPT_PRINT_DIRS) {
             /* initialize search dirs */
             set_environment(s);

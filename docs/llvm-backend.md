@@ -35,6 +35,21 @@ tcc/tcc -B tcc --target=x86_64-pc-linux-gnu   -o out in.c6 && ./out
 | `--target=<triple>` | 选 LLVM 后端，模块头写这个 triple，`-o` 是最终产物；不给 `-o` 时是 `a.out`（`-c` 时 `a.o`） |
 | `--emit-llvm` | 只要 `.ll`（等价于 `-o x.ll`，但可以配 `--target` 检查模块头） |
 | `--cc=<compiler>` | 用哪个 C 编译器转 IR，默认 `$TCC_CC`，再默认 `clang` |
+| `--print-targets` | 列出后端认识哪些 triple（各自要的运行库在不在），`-print-targets` 同义 |
+
+`--print-targets` 只列后端自己带了 datalayout 和前定义宏的架构；别的 triple 照样
+往下传，由 clang 决定认不认（`clang --print-targets` 是它那一侧的清单）：
+
+```
+$ tcc/tcc -B tcc --print-targets
+targets for --target=<triple>; anything else goes to the C compiler
+  triple                       runtime library
+  x86_64-pc-linux-gnu          libtcc1.a                ok
+  aarch64-unknown-linux-gnu    libtcc1-aarch64.a        missing
+  riscv64-unknown-linux-gnu    libtcc1-riscv64.a        missing
+  wasm32-unknown-unknown       libtcc1-wasm32.a         ok
+  wasm64-unknown-unknown       libtcc1-wasm64.a         missing
+```
 
 写了 `--target` 之后的流程是 `tcc_output_for_target()`：先把 IR 写到
 `<outfile>.ll`，再用 `llvm_tool_cc()`（`tcc/llvm-link.c`）拼出

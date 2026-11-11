@@ -1633,6 +1633,7 @@ enum {
     TCC_OPTION_nostdinc,
     TCC_OPTION_nostdlib,
     TCC_OPTION_print_search_dirs,
+    TCC_OPTION_print_targets,
     TCC_OPTION_rdynamic,
     TCC_OPTION_pthread,
     TCC_OPTION_run,
@@ -1750,6 +1751,8 @@ static const TCCOption tcc_options[] = {
     { "nostdinc", TCC_OPTION_nostdinc, 0 },
     { "nostdlib", TCC_OPTION_nostdlib, 0 },
     { "print-search-dirs", TCC_OPTION_print_search_dirs, 0 },
+    { "print-targets", TCC_OPTION_print_targets, 0 },
+    { "-print-targets", TCC_OPTION_print_targets, 0 },
     { "w", TCC_OPTION_w, 0 },
     { "E", TCC_OPTION_E, 0},
     { "M", TCC_OPTION_M, 0},
@@ -2350,6 +2353,9 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             goto extra_action;
         case TCC_OPTION_print_search_dirs:
             x = OPT_PRINT_DIRS;
+            goto extra_action;
+        case TCC_OPTION_print_targets:
+            x = OPT_PRINT_TARGETS;
             goto extra_action;
         case TCC_OPTION_impdef:
             x = OPT_IMPDEF;

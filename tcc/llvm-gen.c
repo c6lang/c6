@@ -190,6 +190,67 @@ static const char *l_idx_type(void)
     return l_ptr_bits() == 32 ? "i32" : "i64";
 }
 
+static int l_readable(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
+/* '--print-targets': what '--target=' is happy with.  These are the
+   architectures this back-end carries a data layout and predefines for; any
+   other triple is handed to the C compiler unchanged, so the list is not a
+   limit -- 'clang --print-targets' shows what that side knows.  What each row
+   really needs is a runtime library, so that is the second column. */
+ST_FUNC void llvm_print_targets(TCCState *s1)
+{
+    static const char *const l_triples[] = {
+        "x86_64-pc-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "riscv64-unknown-linux-gnu",
+        "wasm32-unknown-unknown",
+        "wasm64-unknown-unknown",
+    };
+    char path[1024], host[1024], arch[32], rtbuf[64];
+    const char *dir;
+    int i;
+
+    dir = s1 && s1->tcc_lib_path && *s1->tcc_lib_path ? s1->tcc_lib_path : ".";
+    snprintf(host, sizeof host, "%s/libtcc1.a", dir);
+    printf("targets for --target=<triple>; anything else goes to the C compiler\n");
+    printf("  %-28s %-24s %s\n", "triple", "runtime library", "");
+    for (i = 0; i < (int)countof(l_triples); i++) {
+        const char *t = l_triples[i];
+        size_t n = l_arch_len(t);
+        const char *rt;
+        int ok = 1;
+
+        if (n >= sizeof arch)
+            n = sizeof arch - 1;
+        memcpy(arch, t, n);
+        arch[n] = 0;
+        snprintf(path, sizeof path, "%s/libtcc1-%s.a", dir, arch);
+        snprintf(rtbuf, sizeof rtbuf, "libtcc1-%s.a", arch);
+        rt = rtbuf;
+        if (l_readable(path)) {
+            ok = 1;
+        } else if (i == 0 && l_readable(host)) {
+            ok = 1;                 /* the host has only the plain libtcc1.a */
+            rt = "libtcc1.a";
+        } else {
+            ok = 0;
+        }
+        printf("  %-28s %-24s %s\n", t, rt, ok ? "ok" : "missing");
+    }
+    printf("\n");
+    printf("build a missing runtime with: scripts/build-wasm-runtime.sh <triple>\n");
+    printf("wasm64 works as a code target, but LLVM 19's wasm-ld emits broken\n");
+    printf("element segments for it -- see docs/llvm-backend.md.\n");
+}
+
 /* The preprocessor has to follow '--target' as well, otherwise a header that
    asks '#ifdef __wasm__' still gets the host's answer.
 
