@@ -25,7 +25,7 @@
 /*                                                                           */
 /* Deferred statements need no runtime at all: a cleanup site is static, and  */
 /* whether it is armed lives in the frame of the call that registered it (see */
-/* docs/grammar.md, R6/D1-D6).  What is left here is the error slot.          */
+/* docs/reference/grammar.md, R6/D1-D6).  What is left here is the error slot.          */
 /*                                                                           */
 /* Every OS thread owns its error slot and coroutine pool, so a thread that   */
 /* runs c6 code cannot corrupt the state of another one.  The per-thread      */

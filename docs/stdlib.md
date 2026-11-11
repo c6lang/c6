@@ -1,5 +1,9 @@
 # c6 标准库 `std/`
 
+> **状态**：现行 API · **索引**：[文档索引](README.md) · **用法**：[manual/](manual/) · **诊断/号段**：[reference/grammar.md](reference/grammar.md)（§8.1）
+>
+> 一句话：`std/` 的设计原则、每个模块的 API、写法约定，以及编译器层面已知限制。
+
 标准库放在仓库根的 `std/` 下，**一个文件一个模块**，模块名就是它的路径：
 `std/vec.c6` 声明 `module std.vec;`，消费侧写 `import std.vec;`（编译时把仓库
 根放进 `-I`，或就在仓库根下编译）。
@@ -47,10 +51,11 @@
 | `std/fs.c6` | `std.fs` | POSIX 文件系统元数据与目录：`StatInfo`、`fs_stat`/`fs_lstat`/`fs_exists`/`fs_is_dir`/`fs_is_file`/`fs_size`、`fs_mkdir`/`fs_mkdir_p`/`fs_remove`/`fs_rmdir`/`fs_rename`、`fs_getcwd`/`fs_chdir`、零分配 `Dir` 遍历 |
 | `std/set.c6` | `std.set` | 哈希集合 `Set@K`（`std.map` 的薄包装）与 `SetIter@K`：`add`（1 新增 / 0 已存在）/`remove`/`has`/`count`/`capacity`/`reserve`/`clear`/`iter` |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
-| `examples/stdtour.c6` | （无模块） | 第二批模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带 73 条自检 |
-| `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`make std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带 70 条自检 |
+| `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带自检 |
+| `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`make std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带自检 |
 
-每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（一共 197 个 test 块）：
+每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
+以实际输出为准）：
 
 ```
 std/str.c6       22 test(s), 0 failure(s)
@@ -81,7 +86,7 @@ std/vec.c6       42 test(s), 0 failure(s)
 ```
 
 `-test` 的计数是命令行上**所有 TU** 的 `test` 块之和，所以带依赖跑的行会把自己
-和依赖的块一起算进去（行内加起来 290，去掉重复计算的依赖正好 197）：
+和依赖的块一起算进去，于是比模块本身的块数多：
 
 | 行 | 构成 |
 | --- | --- |
@@ -105,7 +110,7 @@ std/vec.c6       42 test(s), 0 failure(s)
 **2. 不分配的东西不该失败，会失败的写 `T!error`。**
 `span->at(i)` 越界返回 `0`/不写；`vec->push(v)` 可能没有内存，于是返回
 `int!error`，调用方必须 `try` 或 `catch` 消费（编译器强制，见
-`docs/grammar.md` C15）。这条分工让「几乎不会失败」的路径保持零开销，
+`docs/reference/grammar.md` C15）。这条分工让「几乎不会失败」的路径保持零开销，
 同时不会悄悄丢掉失败。
 
 **3. 容量由调用方给。**
@@ -142,7 +147,7 @@ id = (area << 27) | (slot << 12) | code     // area=1(std), slot=0x6000, code=3
 ```
 
 这个号在**任何**程序里都一样，不需要 `errbase.def`，也永远不参与自动池的
-哈希与撞号检查；std 模块的号段表见 [grammar.md](grammar.md) §8.1。
+哈希与撞号检查；std 模块的号段表见 [grammar.md](reference/grammar.md) §8.1。
 
 ### `Vect@T`：托管容器
 
@@ -650,7 +655,7 @@ fs 的 mkdir_p → 写文件 → stat → 目录遍历 → rename → 清理、s
 | ~~往 `Buf@(N)` 里加若干形状相同的方法会挂~~（曾经的 `skip(')')` → `end_macro()` 死循环） | **已消失**：同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）加到五个也编得过、跑得通，`std/fmt` 的 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr` 就是照这个形状补的（`tccpp.c` 的宏重放改写之后不再复现） |
 | ~~把 `Buf@(N)` 的 `write_hex` 形参从 `u32` 加宽到 `u64` 会**挂住编译器**~~（当时 `-c` 无输出直到超时，退出码 124） | **现在复现不出来**：当前 `std/fmt.c6` 的 body、旧版 body、带 `(char)` 强转的写法都在 1 秒内编过，`-test` 也是 10 个块全过。`write_hex(u32)`/`write_hex64(u64)` 双入口保留只是为了不动 API |
 
-这些限制在 `docs/grammar.md`（约束表 C1xx）和 `docs/plan.md` 里有对应的
+这些限制在 `docs/reference/grammar.md`（约束表 C1xx）和 `docs/design/plan.md` 里有对应的
 条目；标准库的写法就是它们当前的「推荐用法」。
 
 ## 相关回归用例
@@ -658,9 +663,9 @@ fs 的 mkdir_p → 写文件 → stat → 目录遍历 → rename → 清理、s
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
   边界（字段名 vs 同名方法、方法形参名不漏到调用方、两个 TU 都实例化同一
   模板时方法体是弱符号）。
-* `make stdtest`：`std/` 下二十五个模块的全部 `test` 块（197 个）。
+* `make stdtest`：`std/` 下每个模块的全部 `test` 块。
 * `make std-demo`：`examples/wordcount.c6` 那个集成示例。
-* `make std-tour`：`examples/stdtour.c6`，第二批模块的拼装示例（73 条自检）。
-* `make std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（70 条自检）。
+* `make std-tour`：`examples/stdtour.c6`，新模块的拼装示例（自带自检）。
+* `make std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（自带自检）。
 * `std/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，
   验证墓碑不会被搬进新表（写 `std/set` 时踩到的真实 bug）。

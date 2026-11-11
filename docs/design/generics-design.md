@@ -1,5 +1,7 @@
 # c6 泛型设计（`@` 应用 / `|…|` 绑定）
 
+> **状态**：已落地（阶段 1–3 全部完成） · **索引**：[文档索引](../README.md) · **语法**：[grammar.md §3.11](../reference/grammar.md) · **诊断**：[diagnostics.md](../reference/diagnostics.md)（C103–C116）
+
 状态：**阶段 1–3 已全部落地**（模板/实例、`|…|` 函数与 typedef 模板、值形参、
 体内成员函数 V3、模块前缀与实例名冲突检查、`-Wgeneric-depth`），`.c6` 文件里
 可用。能写的：`struct Vect@T {…}`
@@ -18,8 +20,8 @@ data[i]; } }` —— 方法体里接收者就是隐式的 `self`，字段和方�
 `-emit-header` 已经输出实例（`struct pkg__Vect_int` + 方法原型），模块前缀与
 实例名冲突检查也都在（§9 阶段 2）。
 
-相关：[grammar.md](grammar.md)（§3.2 方法、§3.3 切片 `T[:]`、§3.7 裸 tag 类型名 C41、
-§3.8 元组、§7 静态约束、§11 实现位置）、[closure-design.md](closure-design.md)
+相关：[grammar.md](../reference/grammar.md)（§3.2 方法、§3.3 切片 `T[:]`、§3.7 裸 tag 类型名 C41、
+§3.8 元组、§7 静态约束、implementation-notes.md 的实现位置表）、[closure-design.md](closure-design.md)
 （V2 闭包，`|…|` 记号的另一个用处）、[gc-design.md](gc-design.md)（`@T` 的计数与环检测）。
 
 ---

@@ -2,7 +2,7 @@
  *
  *     id = (area << 27) | (slot << 12) | code        (bit31 恒为 0)
  *
- * 检查四件事（见 docs/grammar.md §8.1）：
+ * 检查四件事（见 docs/reference/grammar.md §8.1）：
  *   - 没有 module 的文件 slot = 0，`return err(7, "…")` 的 id 仍然是 7；
  *   - 模块的 `enum Error` 成员落在这个模块自己的号段里，低 12 位是声明值；
  *   - 0 永远是「没有错误」，不参与加基址；

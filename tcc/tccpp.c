@@ -4497,7 +4497,7 @@ static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
           "#define C6_CO_KIND_DONE 0\n"
           "#define C6_CO_KIND_ERR  3\n"
           "#endif\n"
-          /* reference-counting GC (docs/gc-design.md): the per-type
+          /* reference-counting GC (docs/design/gc-design.md): the per-type
              descriptors the compiler emits and the runtime entry points that
              every generated store and release goes through */
           "#ifndef __TCC_GC_DEFINED\n"

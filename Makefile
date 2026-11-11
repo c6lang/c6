@@ -16,7 +16,7 @@
 #   make c99selfhost 用 C99 后端自举自己（生成 C -> gcc -> stage2 -> stage3）
 #   make c99selfhost-tcc 同上，但生成 C 之后由 tcc 自己编译（整条链不需要 gcc）
 #   make wasmrt      编目标平台的运行库 tcc/libtcc1-<arch>.a（需要 clang）
-#   make wasmtest    tcc --target=<triple> 出 .wasm 再用 node 跑（见 docs/llvm-backend.md）
+#   make wasmtest    tcc --target=<triple> 出 .wasm 再用 node 跑（见 docs/reference/llvm-backend.md）
 #   make clean       清理 tcc/ 的构建产物和自举产物
 #   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
 #
@@ -398,5 +398,62 @@ clean:
 distclean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) distclean || true
 
+# --- help begin
+# c6 —— 带语言扩展的 TinyCC
+#
+# 用法：make <目标>。提交/发布前跑 make check-all。
+# 编译器选项、环境变量、每个目标的细节见 docs/reference/cli.md。
+#
+# 构建
+#   bootstrap        首次配置 tcc/（已有 config.mak 就跳过，不联网）
+#   build            扩展模式构建（EXTRA-DEFS=-DC6_EXT，产物 tcc/c6）
+#   build-plain      上游模式构建（不定义 C6_EXT）
+#   check-tcc        检查 tcc/ 源码是否完整
+#   mode-ext         切到扩展模式（模式变化时自动清理旧产物）
+#   mode-plain       切到上游模式
+#   clean            清理构建产物与自举产物
+#   distclean        连 configure 结果一起清理（不删源码）
+#
+# 测试与回归
+#   test             上游 tests2 全量（扩展模式）
+#   test-plain       关闭扩展重建后跑同一套上游测试
+#   selftest         tests/ 下全部 c6 自测（test 块 + 编译期诊断）
+#   errcheck         errbase.def 本身与 C126–C128 的检查
+#   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
+#   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举）
+#
+# 标准库
+#   stdtest          std/ 下每个模块的 test 块
+#   std-demo         编译并运行 examples/wordcount.c6
+#   std-tour         编译并运行 examples/stdtour.c6
+#
+# freestanding、裸机与交叉目标
+#   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）
+#   fstest-go                freestanding + 程序自己实现的 pthread 层（spawn/thread）
+#   fstest-noos              完全没有操作系统（程序里一个 syscall 都没有）
+#   fstest-qemu              用 qemu-x86_64 用户态模拟器跑（需要 qemu-user）
+#   fstest-bare              512 字节 BIOS 引导扇区，在 qemu 空机器上启动
+#   fstest-bare-tests        把 tests/*.c6 的 test 块搬上裸机跑
+#   fstest-bare-go           裸机上的 go（自己写的抢占式调度器）
+#   fstest-bare-handle       裸机上的 spawn 句柄（join/value）
+#   fstest-bare-smp          裸机 SMP（2 核与 1 核各跑一遍）
+#   wasmrt                   编目标平台运行库 tcc/libtcc1-<arch>.a（需要 clang）
+#   wasmtest                 --target=<triple> 出 .wasm，再用 node 跑
+#
+# C99 输出后端
+#   c99              兼容旧脚本的占位目标（C99 后端已内置，用 -c99）
+#   c99test          与 selftest 同一套用例，经 C 后端后由 gcc 编译运行
+#   c99tcc-test      同上，宿主编译器换成 tcc/c6
+#
+# 自举
+#   c6selfcheck      tcc.c 拷成 .c6 用 c6 规则编译（初始化规则最严格的回归）
+#   selfhost         c6 路线：tcc -> stage1 -> stage2，目标文件逐字节比对
+#   c99selfhost      C99 路线：生成 C -> gcc -> stage2 -> stage3 -> 比对
+#   c99selfhost-tcc  同上，但生成的 C 也由 tcc 自己编（整条链不需要 gcc）
+#
+# 其它
+#   help             打印这份清单
+# --- help end
 help:
-	@sed -n '2,20p' Makefile
+	@sed -n '/^# --- help begin/,/^# --- help end/p' $(MAKEFILE_LIST) \
+	    | sed -e '1d' -e '$$d' -e 's/^# \{0,1\}//'

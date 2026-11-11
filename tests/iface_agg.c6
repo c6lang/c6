@@ -2,7 +2,7 @@
  *
  * 接口的方法列表按函数原型重放，所以参数和返回值都可以是 struct / union /
  * 元组：vtable 字段就是 `RET (*meth)(void *, PARAMS)`，调用点和普通方法调用
- * 走同一条路径。类型要在 interface 声明之前可见（见 docs/plan.md 的已知限制）。
+ * 走同一条路径。类型要在 interface 声明之前可见（见 docs/design/plan.md 的已知限制）。
  *
  * 运行（仓库根目录）：
  *   ./tcc/tcc -B tcc -test tests/iface_agg.c6
