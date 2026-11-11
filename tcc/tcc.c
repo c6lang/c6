@@ -125,6 +125,15 @@ static const char help[] =
 #if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
     "  -m32/64      defer to i386/x86_64 cross compiler\n"
 #endif
+#ifdef CONFIG_EMBED_LLVM
+    "LLVM IR back-end and cross targets:\n"
+    "  --target=TRIPLE  write IR for TRIPLE and let the C compiler build the\n"
+    "                   result (e.g. wasm32-unknown-unknown, or\n"
+    "                   aarch64-unknown-linux-gnu for a cross .o)\n"
+    "  --emit-llvm      with --target: stop at the .ll file\n"
+    "  --cc=COMPILER    what turns the IR into the result [$TCC_CC, clang]\n"
+    "                   (an -o name ending in .ll asks for the IR alone)\n"
+#endif
     "Tools:\n"
     "  create library  : tcc -ar [crstvx] lib [files]\n"
 #ifdef TCC_TARGET_PE
@@ -150,9 +159,9 @@ static const char help2[] =
     "  -print-search-dirs            print search paths\n"
     "  -rstdin file                  with -run: use 'file' as custom stdin\n"
     "  -dt                           with -run/-E: auto-define 'test_...' macros\n"
-    "LLVM IR back-end (an -o name ending in .ll selects it):\n"
-    "  --target=TRIPLE               write IR for TRIPLE and let clang build\n"
-    "                                the result (e.g. wasm32-unknown-unknown)\n"
+    "LLVM IR back-end (see also -h; '-o name.ll' asks for the IR alone):\n"
+    "  --target=TRIPLE               write IR for TRIPLE and let the C\n"
+    "                                compiler build the result\n"
     "  --emit-llvm                   with --target: stop at the .ll\n"
     "  --cc=COMPILER                 build the IR with COMPILER [$TCC_CC, clang]\n"
     "Ignored options:\n"
