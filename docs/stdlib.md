@@ -18,25 +18,35 @@
 | --- | --- | --- |
 | `std/types.c6` | `std.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`（`U8_MAX`…`I32_MIN`）/`Bool` 两个枚举 |
 | `std/err.c6` | `std.err` | 错误码 `enum Error`（`OK`…`BUSY`，16 个）与 `msg()`/`msg_of()`/`is_ok()`；号段固定在 `0x6000` |
-| `std/vec.c6` | `std.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T`：`push`/`pop`、`insert`/`remove_at`/`truncate`、`first`/`last`、`index_of`/`contains`、`reverse`、`slice`/`extend` |
+| `std/vec.c6` | `std.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T`：`push`/`pop`、`insert`/`remove_at`/`truncate`、`first`/`last`、`index_of`/`contains`、`reverse`、`slice`/`extend`、`sort`/`sort_lex`、`each`/`filter`/`fold` |
 | `std/span.c6` | `std.span` | 别人内存上的窗口 `Span@T`（纯值，零拷贝） |
-| `std/map.c6` | `std.map` | 开放寻址哈希表 `Map@(K, V)`、`Entry@(K, V)`、`Iter@(K, V)` |
-| `std/str.c6` | `std.str` | 字符串视图 `Str`（`char[:]` 的包装，不分配）与字面量宏 `S()`：切分 `split`/`lines`/`join`、查找 `find`/`last_find`/`contains`/`count_char`/`count_sub`、裁剪 `trim`/`trim_left`/`trim_right`、转换 `to_int`/`copy_upper`/`copy_lower`、`hash` |
-| `std/fmt.c6` | `std.fmt` | 定长格式化缓冲 `Buf@(N)`：整数、补位、拼接 |
+| `std/map.c6` | `std.map` | 开放寻址哈希表 `Map@(K, V)`、`Entry@(K, V)`、`Iter@(K, V)`：`put`/`get`/`get_or`/`set`/`put_new`/`remove`/`clear` |
+| `std/str.c6` | `std.str` | 字符串视图 `Str`（`char[:]` 的包装，不分配）与字面量宏 `S()`：切分 `split`/`lines`/`join`、查找 `find`/`last_find`/`contains`/`count_char`/`count_sub`、裁剪 `trim`/`trim_left`/`trim_right`、转换 `to_int`/`to_base`/`copy_upper`/`copy_lower`、`cmp`/`cmp_str`/`cmp_cstr`、`replace`/`split_once`、`hash` |
+| `std/fmt.c6` | `std.fmt` | 定长格式化缓冲 `Buf@(N)`：`write_int`/`write_uint`/`write_u64`、`write_hex`/`write_bin`、`write_bool`/`write_ptr`、`write_pad`、拼接 |
 | `std/range.c6` | `std.range` | 能被 `foreach` 吃掉的区间 `Range`/`StepRange` |
+| `std/sort.c6` | `std.sort` | 比较器驱动的排序与查找：`sort_bytes`/`sort_int`/`sort_u32`/`sort_f64`（稳定归并 + 小数组插入）、`find_bytes`/`find_int`/`find_u32`、`lower_bound_int`/`upper_bound_int`、`cmp_int`/`cmp_u32`/`cmp_f64`/`cmp_int_desc`、`is_sorted_int` |
+| `std/mem.c6` | `std.mem` | 借用式内存池 `Arena`（`alloc`/`alloc_array`/`reset`/`room`/`used`）、托管堆薄包装 `alloc_new`/`alloc_new_array`/`dealloc`、按元素的 `copy`/`fill`/`zero`/`swap`/`rotate`/`reverse_bytes`、`align_up`/`align_down`/`is_aligned` |
+| `std/io.c6` | `std.io` | 文件与标准流：`Reader`（`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`）、`Writer`（`write_line`/`write_bytes`/`write_slice`/`flush`）、零分配的按行迭代 `CFile` |
+| `std/math.c6` | `std.math` | 整数：`min`/`max`/`clamp`/`iabs`/`gcd`/`lcm`/`ipow`/`ipow_u64`/`imul_checked`/`sat_add`/`sat_mul`/`is_pow2`/`next_pow2`/`floor_div`/`mod`；浮点（不链 libm）：`sqrt`/`floor`/`ceil`/`trunc`/`round`/`fabs`/`nearly_eq`/`clamp_f64`/`fact` |
+| `std/time.c6` | `std.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `format_duration`、`Civil` 日历换算 `civil_from_unix`/`unix_from_civil`/`format_civil`（不依赖 localtime） |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
 
-每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（54 个断言）：
+每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（95 个断言）：
 
 ```
 std/err.c6       3 test(s), 0 failure(s)
-std/fmt.c6       6 test(s), 0 failure(s)
-std/map.c6       7 test(s), 0 failure(s)
+std/fmt.c6       8 test(s), 0 failure(s)
+std/io.c6        5 test(s), 0 failure(s)
+std/map.c6       8 test(s), 0 failure(s)
+std/math.c6      6 test(s), 0 failure(s)
+std/mem.c6       6 test(s), 0 failure(s)
 std/range.c6     6 test(s), 0 failure(s)
+std/sort.c6      6 test(s), 0 failure(s)
 std/span.c6      6 test(s), 0 failure(s)
-std/str.c6      14 test(s), 0 failure(s)
+std/str.c6      18 test(s), 0 failure(s)
+std/time.c6      7 test(s), 0 failure(s)
 std/types.c6     4 test(s), 0 failure(s)
-std/vec.c6       8 test(s), 0 failure(s)
+std/vec.c6      10 test(s), 0 failure(s)
 ```
 
 ## 设计原则
@@ -285,5 +295,5 @@ make std-demo
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
   边界（字段名 vs 同名方法、方法形参名不漏到调用方、两个 TU 都实例化同一
   模板时方法体是弱符号）。
-* `make stdtest`：`std/` 下八个模块的全部 `test` 块。
+* `make stdtest`：`std/` 下十三个模块的全部 `test` 块。
 * `make std-demo`：上面那个集成示例。

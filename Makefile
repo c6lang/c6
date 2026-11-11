@@ -104,10 +104,22 @@ errcheck: build
 
 # std/：标准库。每个文件一个 module（模块名就是路径：std/vec.c6 -> std.vec），
 # 每个文件自带 test 块，逐个跑。
+#
+# 模块之间可以互相 import（`std/vec.c6` 的 sort 就用 `std/sort.c6` 的内核），
+# 而 import 只带来**声明**：被依赖模块的 .c6 正文也要放上命令行。所以下面
+# 先跑被依赖的 `std/sort.c6`，其余模块按文件逐个跑，需要额外依赖的在 case
+# 里列出。没列出来的模块自成一体，单独跑。
+
 stdtest: build
-	@fail=0; for f in std/*.c6; do \
+	@fail=0; for f in std/str.c6 std/sort.c6 \
+	         $$(ls std/*.c6 | grep -vE '/(str|sort)\.c6$$'); do \
 	    printf '%-16s ' "$$f"; \
-	    out=$$(./$(TCC_DIR)/tcc -B $(TCC_DIR) -I . -test $$f 2>&1) || fail=1; \
+	    case $$f in \
+	    std/sort.c6) deps="std/str.c6" ;; \
+	    std/vec.c6)  deps="std/sort.c6 std/str.c6" ;; \
+	    *)           deps="" ;; \
+	    esac; \
+	    out=$$(./$(TCC_DIR)/tcc -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
 	    echo "$$out" | tail -1; \
 	done; \
 	test $$fail -eq 0

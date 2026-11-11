@@ -1604,12 +1604,17 @@ smp: 真并行 —— 两个任务同时跑在两个核上
 ```
 std/types.c6   std.types   定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
 std/err.c6     std.err     错误码 enum Error（OK…BUSY）+ msg()/msg_of()/is_ok()
-std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend
+std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold
 std/span.c6    std.span    别人内存上的窗口 Span@T（纯值、零拷贝）
-std/map.c6     std.map     开放寻址哈希表 Map@(K,V) + Entry/Iter
-std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、hash
-std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)
+std/map.c6     std.map     开放寻址哈希表 Map@(K,V) + Entry/Iter：put/get/get_or/set/put_new/remove
+std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、to_int/to_base、replace/split_once、hash
+std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)：write_int/u64/hex/bin/bool/ptr、write_pad
 std/range.c6   std.range   能被 foreach 吃掉的区间 Range/StepRange
+std/sort.c6    std.sort    比较器驱动的排序与二分查找：sort_int/sort_bytes、find_int、lower/upper_bound
+std/mem.c6     std.mem     借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
+std/io.c6      std.io      Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代
+std/math.c6    std.math    整数 gcd/lcm/ipow/clamp/floor_div/mod + 浮点 sqrt/floor/ceil/round（不链 libm）
+std/time.c6    std.time    now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 ```
 
 ```c
@@ -1628,7 +1633,7 @@ printf("%s\n", b->cstr());
 
 ```sh
 ./tcc/tcc -B tcc -I . -o build/app app.c6 std/vec.c6 std/fmt.c6 std/types.c6
-make stdtest     # 跑 std/ 下全部 test 块（54 个断言）
+make stdtest     # 跑 std/ 下全部 test 块（95 个断言）
 make std-demo    # 编译并运行 examples/wordcount.c6（用到 7 个模块）
 ```
 

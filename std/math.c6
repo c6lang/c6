@@ -1,0 +1,387 @@
+/* std/math：整数与浮点的常用函数。
+ *
+ *     import std.math;
+ *
+ *     int d = gcd(12, 18);            // 6
+ *     int p = ipow(2, 10);            // 1024
+ *     f64 r = (&x)->sqrt();           // 对 objs 没有 libm 时也能用
+ *
+ * 为什么要自己写 sqrt/floor：c6 的运行时是 libtcc1，不链 libm（README 的
+ * 「没有依赖」那一条）。所以这几个函数用纯算术实现，不需要 -lm；精度是
+ * 「常见范围精确」，不是 IEEE 的最终位（和 f-string 里浮点打印的约定一致）。
+ *
+ * 名字里不带 std__math__ 前缀，只有模块处在这个文件里；跨模块 import 之后
+ * 照旧写短名 `gcd(..)`，链接时要把这个文件放上命令行。
+ *
+ * 模块里的 int 都是 32 位；需要 64 位的长度/乘法请用 std.types 的 u64/i64
+ * 在调用方转过去（这里给显式的 ipow_u64 / sat_mul 是为了方便）。
+ */
+#include <string.h>
+
+module std.math;
+import std.types;
+import std.err;
+
+enum Consts {
+    PI_E3       = 3141,     /* π * 1000，整数常量，避免浮点常量表达式 */
+    E_E3        = 2718,
+    SQRT2_E3    = 1414,
+};
+
+/* ---- 整数 ---- */
+
+int min(int a, int b) { return a < b ? a : b; }
+
+int max(int a, int b) { return a > b ? a : b; }
+
+int clamp(int v, int lo, int hi)
+{
+    if (lo > hi) {
+        int t = lo;
+
+        lo = hi;
+        hi = t;
+    }
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+    return v;
+}
+
+/* 绝对值：对 INT_MIN 取反仍在无符号域里做，结果回绕成 INT_MIN（和 C 的
+   labs 一样是「不可能表示」，但至少不触发未定义行为） */
+int iabs(int v)
+{
+    u32 u = 0u;
+
+    if (v >= 0)
+        return v;
+    /* 先在无符号域里取反，再整体转回 int：写成 -(int)(0u - (u32)v) 的话
+       负号会先作用在 int 的 0 上，结果是 -42 而不是 42（c6 里踩过）。 */
+    u = 0u - (u32)v;
+    return (int)u;
+}
+
+/* 最大公约数：符号不算，gcd(0, x) == |x| */
+int gcd(int a, int b)
+{
+    u32 x = a < 0 ? (u32)0 - (u32)a : (u32)a;
+    u32 y = b < 0 ? (u32)0 - (u32)b : (u32)b;
+
+    while (y != 0u) {
+        u32 t = x % y;
+
+        x = y;
+        y = t;
+    }
+    return x > 2147483647u ? 0 : (int)x;
+}
+
+/* 最小公倍数：溢出（用 64 位算完超出 int）时返回 0，方便调用方判错 */
+int lcm(int a, int b)
+{
+    int g = gcd(a, b);
+    i64 r = 0;
+
+    if (g == 0)
+        return 0;
+    r = ((i64)(a / g)) * (i64)b;
+    if (r < 0)
+        r = -r;
+    if (r > 2147483647LL)
+        return 0;
+    return (int)r;
+}
+
+/* 整数幂：exp < 0 返回 0（除 1 和 -1 的倒数不存在，统一给 0）。
+   溢出按补码回绕，但 e >= 0 且 |b| <= 1 或 e <= 31 的常见情况是精确的；
+   要检查溢出用 imul_checked。 */
+int ipow(int b, int e)
+{
+    int r = 1;
+    int k = e;
+
+    if (e < 0)
+        return 0;
+    while (k > 0) {
+        if (k & 1)
+            r *= b;
+        k >>= 1;
+        if (k > 0)
+            b *= b;
+    }
+    return r;
+}
+
+u64 ipow_u64(u64 b, int e)
+{
+    u64 r = 1u;
+    int k = e;
+
+    if (e < 0)
+        return 0u;
+    while (k > 0) {
+        if (k & 1)
+            r *= b;
+        k >>= 1;
+        if (k > 0)
+            b *= b;
+    }
+    return r;
+}
+
+/* 乘法带溢出检查：溢出返回 0，不写 *out */
+int imul_checked(int a, int b, int *out)
+{
+    i64 r = (i64)a * (i64)b;
+
+    if (r > 2147483647LL || r < -2147483647LL - 1)
+        return 0;
+    *out = (int)r;
+    return 1;
+}
+
+/* 饱和加法/乘法：溢出时夹到 int 的两端 */
+int sat_add(int a, int b)
+{
+    i64 r = (i64)a + (i64)b;
+
+    if (r > 2147483647LL)
+        return 2147483647;
+    if (r < -2147483647LL - 1)
+        return -2147483647 - 1;
+    return (int)r;
+}
+
+int sat_mul(int a, int b)
+{
+    i64 r = (i64)a * (i64)b;
+
+    if (r > 2147483647LL)
+        return 2147483647;
+    if (r < -2147483647LL - 1)
+        return -2147483647 - 1;
+    return (int)r;
+}
+
+int is_pow2(u32 v) { return v != 0u && (v & (v - 1u)) == 0u; }
+
+/* 不小于 v 的最小 2 的幂；v == 0 给 1，超出 2^30 给 0（int 装不下） */
+int next_pow2(int v)
+{
+    u32 p = 1u;
+
+    if (v <= 1)
+        return 1;
+    while (p < (u32)v) {
+        if (p > 0x40000000u)
+            return 0;
+        p <<= 1;
+    }
+    return (int)p;
+}
+
+/* 往下取整的除法：floor_div(-7, 2) == -4（C 的 / 是向零取整，给 -3） */
+int floor_div(int a, int b)
+{
+    int q = 0;
+    int r = 0;
+
+    if (b == 0)
+        return 0;
+    q = a / b;
+    r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0)))
+        q--;
+    return q;
+}
+
+/* 非负模：mod(-7, 3) == 2 */
+int mod(int a, int b)
+{
+    int r = 0;
+
+    if (b == 0)
+        return 0;
+    r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0)))
+        r += b;
+    return r;
+}
+
+/* ---- 浮点 ---- */
+
+/* 整数绝对值辅助（不导出也不带实例类型，单参数标量，安全） */
+static f64 fabs_(f64 x) { return x < 0.0 ? -x : x; }
+
+/* 牛顿迭代求平方根：先估一个 2 的幂，再迭代到相邻两位不再变。
+   x <= 0 时给 0（负数没有实数根，和「不抛异常」的约定一致）。 */
+f64 sqrt(f64 x)
+{
+    f64 g = 0.0;
+    f64 ng = 0.0;
+    int i = 0;
+    u64 u = 0u;
+
+    if (x <= 0.0)
+        return 0.0;
+    /* 用二进制指数做初值：把 x 的指数大致砍半，迭代三两次就收敛 */
+    memcpy(&u, &x, 8);
+    u = (u >> 1) + (1023ull << 51);
+    memcpy(&g, &u, 8);
+    for (i = 0; i < 8; i++) {
+        ng = 0.5 * (g + x / g);
+        if (ng == g)
+            break;
+        g = ng;
+    }
+    return g;
+}
+
+/* 往下取整 */
+f64 floor(f64 x)
+{
+    f64 t = (f64)(i64)x;
+
+    if (t > x)
+        return t - 1.0;
+    return t;
+}
+
+/* 往上取整 */
+f64 ceil(f64 x)
+{
+    f64 t = (f64)(i64)x;
+
+    if (t < x)
+        return t + 1.0;
+    return t;
+}
+
+/* 去掉小数部分（向零取整） */
+f64 trunc(f64 x) { return (f64)(i64)x; }
+
+/* 四舍五入到最近整数（.5 向上，和 f-string 的约定一致） */
+f64 round(f64 x)
+{
+    if (x < 0.0)
+        return -floor(0.5 - x);
+    return floor(x + 0.5);
+}
+
+f64 fabs(f64 x) { return fabs_(x); }
+
+/* 绝对值比较：||a| - |b|| <= eps 视为相等 */
+int nearly_eq(f64 a, f64 b, f64 eps)
+{
+    f64 d = fabs_(a) - fabs_(b);
+
+    return fabs_(d) <= fabs_(eps);
+}
+
+/* 夹到 [lo, hi]（允许 lo > hi，自动交换） */
+f64 clamp_f64(f64 v, f64 lo, f64 hi)
+{
+    f64 t = 0.0;
+
+    if (lo > hi) {
+        t = lo;
+        lo = hi;
+        hi = t;
+    }
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+    return v;
+}
+
+/* 阶乘的浮点版：13! 之后 int 装不下，这里给 f64 */
+f64 fact(int n)
+{
+    f64 r = 1.0;
+    int i = 0;
+
+    for (i = 2; i <= n; i++)
+        r *= (f64)i;
+    return r;
+}
+
+/* ---- 自测 ---- */
+
+test "min / max / clamp / iabs" {
+    if (min(3, 7) != 3 || max(3, 7) != 7)
+        return err(1, "min/max 不对");
+    if (clamp(5, 0, 3) != 3 || clamp(-1, 0, 3) != 0 || clamp(2, 0, 3) != 2)
+        return err(2, "clamp 不对");
+    if (clamp(5, 9, 3) != 5)
+        return err(3, "clamp 不交换 lo/hi");
+    if (iabs(-42) != 42 || iabs(42) != 42 || iabs(0) != 0)
+        return err(4, "iabs 不对");
+}
+
+test "gcd / lcm / ipow" {
+    if (gcd(12, 18) != 6 || gcd(-12, 18) != 6 || gcd(0, 5) != 5)
+        return err(5, "gcd 不对");
+    if (lcm(4, 6) != 12 || lcm(7, 5) != 35)
+        return err(6, "lcm 不对");
+    if (ipow(2, 10) != 1024 || ipow(3, 0) != 1 || ipow(-2, 3) != -8)
+        return err(7, "ipow 不对");
+    if (ipow(2, -1) != 0)
+        return err(8, "负指数应给 0");
+    if (ipow_u64(2u, 40) != 1099511627776ull)
+        return err(9, "ipow_u64 不对");
+}
+
+test "溢出检查与饱和" {
+    int out = 0;
+
+    if (imul_checked(3, 4, &out) != 1 || out != 12)
+        return err(10, "imul_checked 正常路径不对");
+    if (imul_checked(100000, 100000, &out) != 0)
+        return err(11, "imul_checked 没报溢出");
+    if (sat_add(2147483647, 1) != 2147483647)
+        return err(12, "sat_add 上溢没夹住");
+    if (sat_add(-2147483647 - 1, -1) != -2147483647 - 1)
+        return err(13, "sat_add 下溢没夹住");
+    if (sat_mul(100000, 100000) != 2147483647)
+        return err(14, "sat_mul 上溢没夹住");
+}
+
+test "is_pow2 / next_pow2 / floor_div / mod" {
+    if (!is_pow2(64u) || is_pow2(63u) || is_pow2(0u))
+        return err(15, "is_pow2 不对");
+    if (next_pow2(1) != 1 || next_pow2(5) != 8 || next_pow2(8) != 8)
+        return err(16, "next_pow2 不对");
+    if (floor_div(-7, 2) != -4 || floor_div(7, 2) != 3)
+        return err(17, "floor_div 不对");
+    if (mod(-7, 3) != 2 || mod(7, 3) != 1 || mod(6, 3) != 0)
+        return err(18, "mod 不对");
+}
+
+test "sqrt 与取整" {
+    if (nearly_eq(sqrt(144.0), 12.0, 1e-9) != 1)
+        return err(19, "sqrt(144) 不是 12");
+    if (nearly_eq(sqrt(2.0), 1.4142135623730951, 1e-12) != 1)
+        return err(20, "sqrt(2) 不准");
+    if (sqrt(0.0) != 0.0 || sqrt(-4.0) != 0.0)
+        return err(21, "sqrt 的边界不对");
+    if (floor(2.9) != 2.0 || floor(-2.1) != -3.0)
+        return err(22, "floor 不对");
+    if (ceil(2.1) != 3.0 || ceil(-2.9) != -2.0)
+        return err(23, "ceil 不对");
+    if (trunc(-2.9) != -2.0 || trunc(2.9) != 2.0)
+        return err(24, "trunc 不对");
+    if (round(2.5) != 3.0 || round(-2.5) != -3.0 || round(2.4) != 2.0)
+        return err(25, "round 不对");
+}
+
+test "clamp_f64 / fabs / fact" {
+    if (clamp_f64(5.0, 0.0, 3.0) != 3.0 || clamp_f64(-1.0, 0.0, 3.0) != 0.0)
+        return err(26, "clamp_f64 不对");
+    if (fabs(-2.5) != 2.5 || fabs(2.5) != 2.5)
+        return err(27, "fabs 不对");
+    if (fact(5) != 120.0 || fact(0) != 1.0)
+        return err(28, "fact 不对");
+}
