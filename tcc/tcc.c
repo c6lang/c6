@@ -133,7 +133,7 @@ static const char help[] =
     "  --emit-llvm      with --target: stop at the .ll file\n"
     "  --cc=COMPILER    what turns the IR into the result [$TCC_CC, clang]\n"
     "                   (an -o name ending in .ll asks for the IR alone)\n"
-    "  -print-targets   list the triples --target= knows\n"
+    "  --print-targets  list the triples --target= knows (and their runtime)\n"
 #endif
     "Tools:\n"
     "  create library  : tcc -ar [crstvx] lib [files]\n"
@@ -165,7 +165,7 @@ static const char help2[] =
     "                                compiler build the result\n"
     "  --emit-llvm                   with --target: stop at the .ll\n"
     "  --cc=COMPILER                 build the IR with COMPILER [$TCC_CC, clang]\n"
-    "  -print-targets                list the triples --target= knows\n"
+    "  --print-targets               list the triples --target= knows\n"
     "Ignored options:\n"
     "  -arch -C --param -pedantic -pipe -s -traditional\n"
     "-W[no-]... warnings:\n"
