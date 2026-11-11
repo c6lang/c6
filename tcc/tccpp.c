@@ -1856,24 +1856,272 @@ ST_FUNC void tccpp_putfile(const char *filename)
 }
 
 #ifdef C6_EXT
-/* rename the identifiers marked with '__local' in a '#macro' body.
-   The whole body is processed before macro arguments are substituted,
-   so that hygiene does not leak into caller-supplied tokens. */
-static int c6_local_name(int v, int id)
+/* ---------------------------------------------------------------------- */
+/* c6 macros: 'stmt swap(expr a, expr b) { ... }'                          */
+/*                                                                        */
+/* The body is captured as raw tokens and replayed at the call site, so    */
+/* the locals it declares need a fresh name on every expansion: the caller */
+/* may have a 'tmp' of its own, and two expansions in one scope must not   */
+/* collide either.  A local becomes '<macro>__<name>__h<N>', where N       */
+/* counts expansions in the translation unit -- unique per expansion, and  */
+/* the macro name in front says where a name in -E output or in a debugger */
+/* came from.  Renaming happens before the arguments are substituted, so it */
+/* never touches caller-supplied tokens.                                   */
+static int c6_local_name(const char *mname, int v, int id)
 {
-    char buf[512] = {0};
-    snprintf(buf, sizeof buf, "%s__h%d", get_tok_str(v, NULL), id);
+    char buf[1024] = {0}, vbuf[256] = {0};
+
+    pstrcpy(vbuf, sizeof vbuf, get_tok_str(v, NULL)); /* cstr_buf: copy it */
+    if (strlen(mname) + strlen(vbuf) + 16 > sizeof buf)
+        tcc_error("the local '%s' of macro '%s' needs a name that is too long",
+                  vbuf, mname);
+    snprintf(buf, sizeof buf, "%s__%s__h%d", mname, vbuf, id);
     return tok_alloc(buf, strlen(buf))->tok;
 }
 
-static int *c6_hygiene_body(const int *body)
+/* tokens that can start the specifiers of a declaration: 1 = a declarator
+   follows directly, 2 = the name of a struct/union/enum tag follows */
+static int c6_type_start(int t)
+{
+    switch (t) {
+    case TOK_STRUCT: case TOK_UNION: case TOK_ENUM:
+        return 2;
+    case TOK_TYPEOF1: case TOK_TYPEOF2: case TOK_TYPEOF3:
+    case TOK_ALIGNOF1: case TOK_ALIGNOF2: case TOK_ALIGNOF3:
+    case TOK_VOID: case TOK_CHAR: case TOK_INT: case TOK_FLOAT:
+    case TOK_DOUBLE: case TOK_BOOL: case TOK_COMPLEX:
+    case TOK_SHORT: case TOK_LONG: case TOK_UNSIGNED:
+    case TOK_SIGNED1: case TOK_SIGNED2: case TOK_SIGNED3:
+    case TOK_CONST1: case TOK_CONST2: case TOK_CONST3:
+    case TOK_VOLATILE1: case TOK_VOLATILE2: case TOK_VOLATILE3:
+    case TOK_RESTRICT1: case TOK_RESTRICT2: case TOK_RESTRICT3:
+    case TOK_STATIC: case TOK_EXTERN: case TOK_AUTO: case TOK_REGISTER:
+    case TOK_TYPEDEF: case TOK_INLINE1: case TOK_INLINE2: case TOK_INLINE3:
+    case TOK_THREAD_LOCAL: case TOK___thread:
+        return 1;
+    }
+    return 0;
+}
+
+/* the role of macro parameter 't', or C6_ROLE_NONE when 't' is no parameter */
+ST_FUNC int c6_param_role(Sym *params, int t)
+{
+    Sym *s = 0;
+
+    for (s = params; s; s = s->next)
+        if ((s->v & ~SYM_FIELD) == t)
+            return s->c6_role;
+    return C6_ROLE_NONE;
+}
+
+/* '#' and '##' work on tokens, so the parameter they apply to must be an
+   'ident': a parenthesized expression cannot be stringized or pasted. */
+ST_FUNC void c6_macro_check_body(const int *body, Sym *params, int role)
+{
+    const int *p = body;
+    CValue cval = {0};
+    int t = 0, prev = 0, prole = 0, dp = 0, nsemi = 0, last = 0;
+
+    for (;;) {
+        TOK_GET(&t, &p, &cval);
+        if (t == 0)
+            break;
+        if (is_space(t) || t == TOK_LINEFEED)
+            continue;
+        if (t == TOK_PPJOIN || prev == '#' || prev == TOK_PPJOIN) {
+            int other = t == TOK_PPJOIN ? prev : t;
+            prole = c6_param_role(params, other);
+            if (prole && prole != C6_ROLE_IDENT)
+                tcc_error("'%s' has role '%s': '#' and '##' need an "
+                          "'ident' parameter", get_tok_str(other, NULL),
+                          prole == C6_ROLE_EXPR ? "expr"
+                        : prole == C6_ROLE_STMT ? "stmt" : "type");
+        }
+        if (role == C6_ROLE_EXPR) {
+            /* an 'expr' body is one expression, so it may carry a single ';'
+               at its very end and nothing else: statements need 'stmt' */
+            if (t == '(' || t == '[' || t == '{') {
+                dp++;
+            } else if (t == ')' || t == ']' || t == '}') {
+                if (dp > 0)
+                    dp--;
+            } else if (t == ';' && dp == 0) {
+                nsemi++;
+            }
+        }
+        prev = last = t;
+    }
+    if (role == C6_ROLE_EXPR) {
+        if (!last)
+            tcc_error("an 'expr' macro needs an expression in its body");
+        if (nsemi > 1 || (nsemi == 1 && last != ';'))
+            tcc_error("an 'expr' macro body is one expression: use a 'stmt' "
+                      "macro and '({ ... })' for statements");
+    }
+}
+
+static void c6_add_local(int **pv, int *pn, int t)
+{
+    int i = 0;
+
+    for (i = 0; i < *pn; i++)
+        if ((*pv)[i] == t)
+            return;
+    *pv = tcc_realloc(*pv, (*pn + 1) * sizeof(int));
+    (*pv)[(*pn)++] = t;
+}
+
+/* A c6 macro body is expanded before the parser sees it, so the declarations
+   it contains are found by their shape: at the start of a statement (or of a
+   'for' header) the specifiers, then the declarators.  A name that the scan
+   misses keeps its spelling -- write '__local NAME' to rename it by hand. */
+static void c6_scan_locals(const int *body, Sym *params, int **pv, int *pn)
+{
+    const int *p = body;
+    CValue cval = {0};
+    int t = 0, pd = 0, mode = 0, stmt_start = 1;
+    int tag = 0, forpend = 0, infor = 0, forpd = 0, skippd = -1, here = 0;
+
+    for (;;) {
+        TOK_GET(&t, &p, &cval);
+        if (t == 0)
+            break;
+        if (is_space(t) || t == TOK_LINEFEED)
+            continue;
+        if (skippd >= 0) {                   /* inside 'typeof ( ... )' */
+            if (t == '(' || t == '[')
+                pd++;
+            else if (t == ')' || t == ']') {
+                if (pd > 0)
+                    pd--;
+                if (pd == skippd) {
+                    skippd = -1;
+                    mode = 1;                /* the declarator follows */
+                }
+            }
+            continue;
+        }
+        here = (pd == 0) || (infor && pd == forpd);
+        switch (t) {
+        case '(':
+            pd++;
+            if (forpend) {
+                forpend = 0;
+                infor = 1;
+                forpd = pd;
+                stmt_start = 1;
+            }
+            break;
+        case '[':
+            pd++;
+            break;
+        case ')':
+        case ']':
+            if (infor && pd == forpd) {
+                infor = 0;
+                pd--;
+                stmt_start = 0;
+                mode = 0;
+            } else if (pd > 0) {
+                pd--;
+            }
+            break;
+        case '{':
+            tag = 0;
+            pd = 0;
+            infor = 0;
+            stmt_start = 1;
+            mode = 0;
+            break;
+        case '}':
+            pd = 0;
+            infor = 0;
+            stmt_start = 1;
+            mode = 0;
+            break;
+        case ';':
+        case ':':
+            if (here) {
+                stmt_start = 1;
+                mode = 0;
+            }
+            break;
+        case ',':
+            if (here && mode)
+                mode = 2;                /* 'int a, b;': the next declarator */
+            break;
+        case '=':
+            if (here && mode)
+                mode = 0;                /* an initializer declares nothing */
+            break;
+        case '*':
+            break;                       /* 'int *p': still the declarator */
+        default:
+            if (t == TOK_FOR && here) {
+                forpend = 1;
+                break;
+            }
+            if (tag) {
+                tag = 0;
+                mode = 1;
+                if (t >= TOK_UIDENT)
+                    break;               /* the tag name of 'struct S ...' */
+            }
+            if (stmt_start && here) {
+                int k = c6_type_start(t);
+                if (k) {
+                    stmt_start = 0;
+                    if (k == 2) {
+                        tag = 1;
+                        mode = 0;
+                    } else {
+                        mode = 1;
+                        if (t >= TOK_TYPEOF1 && t <= TOK_TYPEOF3)
+                            skippd = pd;
+                    }
+                    break;
+                }
+                if (t >= TOK_UIDENT) {
+                    int role = c6_param_role(params, t);
+                    if (role) {
+                        /* a 'type' parameter names a type in the body */
+                        if (role == C6_ROLE_TYPE) {
+                            stmt_start = 0;
+                            mode = 1;
+                        }
+                        break;
+                    }
+                    if (c6_is_typedef_name(t)) {
+                        stmt_start = 0;
+                        mode = 1;
+                        break;
+                    }
+                }
+                break;
+            }
+            if (mode && here && t >= TOK_UIDENT) {
+                if (!c6_param_role(params, t))
+                    c6_add_local(pv, pn, t);
+                mode = 2;
+            }
+            break;
+        }
+    }
+}
+
+/* rename the locals of a c6 macro body: the names marked with '__local' and
+   the ones c6_scan_locals finds.  The whole body is processed before macro
+   arguments are substituted, so hygiene does not leak into caller tokens. */
+static int *c6_hygiene_body(int mname, const int *body, Sym *params)
 {
     static int seq = 0;
     TokenString out = {0};
     CValue cval = {0};
     const int *p = 0;
+    char c6m[512] = {0};
     int hl = 0, id = 0, t = 0, i = 0, prev = 0, nb = 0, *locals = NULL;
 
+    pstrcpy(c6m, sizeof c6m, get_tok_str(mname, NULL));
     hl = tok_alloc("__local", 7)->tok;
     id = ++seq;
     p = body;
@@ -1886,18 +2134,20 @@ static int *c6_hygiene_body(const int *body)
             do {
                 TOK_GET(&t, &p, &cval);
             } while (t && (is_space(t) || t == TOK_LINEFEED));
+            if (t == '#' || t == TOK_PPJOIN || t == TOK_TWOSHARPS)
+                tcc_error("cannot apply '#' or '##' to a '__local' name");
             if (t < TOK_IDENT || TOK_HAS_VALUE(t))
                 tcc_error("'__local' must be followed by an identifier");
             if (prev == '#' || prev == TOK_PPJOIN || prev == TOK_TWOSHARPS)
                 tcc_error("cannot apply '#' or '##' to a '__local' name");
-            locals = tcc_realloc(locals, (nb + 1) * sizeof(int));
-            locals[nb++] = t;
+            c6_add_local(&locals, &nb, t);
             prev = t;
             continue;
         }
         if (!is_space(t) && t != TOK_LINEFEED)
             prev = t;
     }
+    c6_scan_locals(body, params, &locals, &nb);
     tok_str_new(&out);
     p = body;
     prev = 0;
@@ -1909,13 +2159,13 @@ static int *c6_hygiene_body(const int *body)
             do {
                 TOK_GET(&t, &p, &cval);
             } while (t && (is_space(t) || t == TOK_LINEFEED));
-            tok_str_add2(&out, c6_local_name(t, id), &cval);
+            tok_str_add2(&out, c6_local_name(c6m, t, id), &cval);
             continue;
         }
         if (t >= TOK_IDENT) {
             for (i = 0; i < nb; i++)
                 if (locals[i] == t) {
-                    t = c6_local_name(t, id);
+                    t = c6_local_name(c6m, t, id);
                     break;
                 }
         }
@@ -1926,50 +2176,15 @@ static int *c6_hygiene_body(const int *body)
     return out.str;
 }
 
-/* parse '#macro NAME(params) { body }' */
-static void parse_c6_macro(void)
+/* Take the tokens of a macro body: the current token must be '{' and is not
+   part of the body; on return it is the matching '}'.  '*flags' collects the
+   MACRO_* bits the body needs ('##' and the leading of the body). */
+ST_FUNC int *c6_macro_body_capture(int *flags)
 {
-    Sym *s = 0, *first = 0, **ps = 0;
-    int v = 0, t = 0, t0 = 0, level = 0;
-    int saved_parse_flags = parse_flags;
     TokenString str = {0};
+    int saved_parse_flags = parse_flags;
+    int t0 = 0, level = 0, f = 0;
 
-    next_nomacro();
-    v = tok;
-    if (v < TOK_IDENT || v == TOK_DEFINED)
-        tcc_error("invalid macro name '%s'", get_tok_str(tok, &tokc));
-    first = NULL;
-    t = MACRO_FUNC;
-    parse_flags = ((parse_flags & ~PARSE_FLAG_ASM_FILE) | PARSE_FLAG_SPACES);
-    next_nomacro();
-    parse_flags &= ~PARSE_FLAG_SPACES;
-    if (tok == '(') {
-        int dotid = set_idnum('.', 0);
-        next_nomacro();
-        ps = &first;
-        if (tok != ')') for (;;) {
-            int varg = tok;
-            next_nomacro();
-            if (varg < TOK_IDENT)
-        bad_list:
-                tcc_error("bad macro parameter list");
-            s = sym_push2(&define_stack, varg | SYM_FIELD, 0, 0);
-            *ps = s;
-            ps = &s->next;
-            if (tok == ')')
-                break;
-            if (tok != ',')
-                goto bad_list;
-            next_nomacro();
-        }
-        parse_flags |= PARSE_FLAG_SPACES;
-        next_nomacro();
-        set_idnum('.', dotid);
-    }
-    while (is_space(tok))
-        next_nomacro();
-    if (tok != '{')
-        tcc_error("'{' expected in '#macro' definition");
     parse_flags |= PARSE_FLAG_ACCEPT_STRAYS | PARSE_FLAG_SPACES;
     tok_str_new(&str);
     t0 = 0;
@@ -1977,7 +2192,7 @@ static void parse_c6_macro(void)
     next_nomacro();
     while (level > 0) {
         if (tok == TOK_EOF)
-            tcc_error("unexpected end of file in '#macro' definition");
+            tcc_error("unexpected end of file in a macro definition");
         if (tok == '{') {
             level++;
         } else if (tok == '}') {
@@ -1992,7 +2207,7 @@ static void parse_c6_macro(void)
                 if (0 == t0)
                     goto bad_twosharp;
                 tok = TOK_PPJOIN;
-                t |= MACRO_JOIN;
+                f |= MACRO_JOIN;
             }
             tok_str_add2_spc(&str, tok, &tokc);
             t0 = tok;
@@ -2003,10 +2218,57 @@ static void parse_c6_macro(void)
     tok_str_add(&str, 0);
     if (t0 == TOK_PPJOIN)
 bad_twosharp:
-        tcc_error("'##' cannot appear at either end of macro");
-    t |= MACRO_C6_LOCAL;
-    define_push(v, t, str.str, first);
-    next_nomacro();          /* consume '}' */
+        tcc_error("'##' cannot appear at either end of a macro body");
+    *flags = f;
+    return str.str;
+}
+
+/* how a body is wrapped at the call site: an 'expr' macro becomes '( ... )'
+   so that it can stand in an expression (the body's own trailing ';' is
+   dropped), a 'stmt' macro becomes '{ ... }', and 'ident'/'type' bodies are
+   replayed as raw tokens (a name, a type specifier).  Returns NULL when
+   nothing has to be wrapped. */
+static int *c6_macro_wrap(int type, const int *body)
+{
+    TokenString inner = {0}, out = {0};
+    CValue cval = {0};
+    const int *p = body;
+    int t = 0, i = 0, ret = type & MACRO_C6_RET_MASK;
+    int cut = -1, dp = 0, paren = 0;
+
+    if (ret == MACRO_C6_RET_IDENT || ret == MACRO_C6_RET_TYPE)
+        return NULL;                     /* raw tokens */
+    paren = ret == MACRO_C6_RET_EXPR;
+    tok_str_new(&inner);
+    for (;;) {
+        TOK_GET(&t, &p, &cval);
+        if (t == 0)
+            break;
+        if (paren) {
+            if (t == '(' || t == '[' || t == '{') {
+                dp++;
+            } else if (t == ')' || t == ']' || t == '}') {
+                if (dp > 0)
+                    dp--;
+            } else if (t == ';' && dp == 0) {
+                cut = inner.len;         /* the body's own ';' */
+                continue;
+            } else if (!is_space(t) && t != TOK_LINEFEED) {
+                cut = -1;
+            }
+        }
+        tok_str_add2(&inner, t, &cval);
+    }
+    if (paren && cut >= 0)
+        inner.len = cut;
+    tok_str_new(&out);
+    tok_str_add(&out, paren ? '(' : '{');
+    for (i = 0; i < inner.len; i++)
+        tok_str_add(&out, inner.str[i]);
+    tok_str_add(&out, paren ? ')' : '}');
+    tok_str_add(&out, 0);
+    tok_str_free_str(inner.str);
+    return out.str;
 }
 
 #endif /* C6_EXT */
@@ -2195,7 +2457,11 @@ ST_FUNC void preprocess(int is_bof)
             && !strcmp(get_tok_str(tok, NULL), "macro")) {
             if (!s1->c6_ext)
                 tcc_error("'#macro' requires a .c6 source file");
-            parse_c6_macro();
+            /* it is a declaration now, and the leading role says how the
+               expansion may be used */
+            tcc_error("'#macro' is gone: write 'stmt name(expr a, ident n) "
+                      "{ ... }' instead (the leading role says how the "
+                      "expansion is used)");
             break;
         }
 #endif
@@ -3465,7 +3731,7 @@ static int macro_subst(
    args (field d) and return allocated string */
 static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
 {
-    int t = 0, t0 = 0, t1 = 0, t2 = 0, n = 0;
+    int t = 0, t0 = 0, t1 = 0, t2 = 0, n = 0, paren = 0;
     const int *st = 0;
     Sym *s = 0;
     CValue cval = {0};
@@ -3523,6 +3789,7 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
             }
         } else if (t >= TOK_IDENT) {
             s = sym_find2(args, t);
+            paren = 0;
             if (s) {
                 st = s->d;
                 n = 0;
@@ -3563,11 +3830,19 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
 			s->e = str2.str;
 		    }
 		    st = s->e;
+                    /* an 'expr' parameter stands for a value: put its
+                       tokens in parentheses so that an operator inside the
+                       argument cannot bind across the substitution */
+                    paren = s->c6_role == C6_ROLE_EXPR;
                 }
+                if (paren)
+                    tok_str_add(&str, '(');
                 while (*st != TOK_EOF) {
                     TOK_GET(&t2, &st, &cval);
                     tok_str_add2(&str, t2, &cval);
                 }
+                if (paren)
+                    tok_str_add(&str, ')');
             } else {
                 /* keep the value: an f-string is a token above TOK_IDENT
                    that carries its raw text, and dropping it here would
@@ -3733,9 +4008,9 @@ static int macro_subst_tok(
         Sym *sa = 0;
         int ret = 0;
 #ifdef C6_EXT
-        int *hbody = NULL;
+        int *hbody = NULL, *wbody = NULL;
         if (s->type.t & MACRO_C6_LOCAL)
-            mstr = hbody = c6_hygiene_body(mstr);
+            mstr = hbody = c6_hygiene_body(v, mstr, s->next);
 #endif
 
         if (s->type.t & MACRO_FUNC) {
@@ -3804,6 +4079,7 @@ static int macro_subst_tok(
                 tok_str_add(&str, TOK_EOF);
                 sa1 = sym_push2(&args, sa->v & ~SYM_FIELD, sa->type.t, 0);
                 sa1->d = str.str;
+                sa1->c6_role = sa->c6_role;
                 sa = sa->next;
                 if (t == ')') {
                     if (!sa)
@@ -3836,6 +4112,15 @@ static int macro_subst_tok(
         jstr = mstr;
         if (s->type.t & MACRO_JOIN)
             jstr = macro_twosharps(mstr);
+#ifdef C6_EXT
+        /* the leading role of the definition decides how the tokens of the
+           body are wrapped for the call site */
+        if (s->type.t & MACRO_C6_RET_MASK) {
+            wbody = c6_macro_wrap(s->type.t, jstr);
+            if (wbody)
+                jstr = wbody;
+        }
+#endif
 
         sa = sym_push2(nested_list, v, 0, 0);
         ret = macro_subst(tok_str, nested_list, jstr);
@@ -3843,13 +4128,15 @@ static int macro_subst_tok(
         if (sa == *nested_list)
             *nested_list = sa->prev, sym_free(sa);
 
-        if (jstr != mstr)
+        if (jstr != mstr && jstr != wbody)
             tok_str_free_str(jstr);
-        if (mstr != s->d)
+        if (mstr != s->d && mstr != hbody)
             tok_str_free_str(mstr);
 #ifdef C6_EXT
-        if (hbody && mstr != hbody)
+        if (hbody)
             tok_str_free_str(hbody);
+        if (wbody)
+            tok_str_free_str(wbody);
 #endif
         return ret;
 

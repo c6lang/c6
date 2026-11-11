@@ -1,0 +1,81 @@
+/* c6 编译期诊断：宏定义 'ROLE 名字(ROLE 形参, ...) { 体 }'
+ *
+ * 每个片段单独用 -D<片段名> 编译（tests/run-tests.sh 驱动），
+ * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
+ * 不带任何 -D 时是本文件的“正常路径”，必须编译通过并运行成功。
+ *
+ * 定义期的检查只有两类：
+ *   1. 形状：角色词后面必须是名字，NAME 后面必须是 '('，形参前面必须有
+ *      角色，体必须用 '{' 包住——这些错在写宏的时候就该报。
+ *   2. '#' 和 '##' 的操作数必须是 'ident' 形参（角色决定它能不能被拼成
+ *      一个新记号），别的位置检查一律不做。
+ * 展开期的检查沿用旧规则：'__local' 后面必须是标识符，并且不能被拼。
+ */
+
+// EXPECT test_param_role: error: every macro parameter needs a role: 'expr', 'stmt', 'ident' or 'type'
+// EXPECT test_join_role: error: 'a' has role 'expr': '#' and '##' need an 'ident' parameter
+// EXPECT test_stringize_role: error: 's' has role 'stmt': '#' and '##' need an 'ident' parameter
+// EXPECT test_hash_macro: error: '#macro' is gone: write 'stmt name(expr a, ident n) { ... }' instead (the leading role says how the expansion is used)
+// EXPECT test_expr_statements: error: an 'expr' macro body is one expression: use a 'stmt' macro and '({ ... })' for statements
+// EXPECT test_expr_empty: error: an 'expr' macro needs an expression in its body
+// EXPECT test_no_lparen: error: '(' expected after the macro name 'f'
+// EXPECT test_no_body: error: '{' expected: the body of macro 'f'
+// EXPECT test_param_name: error: a parameter name must follow the 'expr' role
+// EXPECT test_param_comma: error: ',' or ')' expected in a macro parameter list
+// EXPECT test_join_end: error: '##' cannot appear at either end of a macro body
+// EXPECT test_local_name: error: '__local' must be followed by an identifier
+// EXPECT test_local_join: error: cannot apply '#' or '##' to a '__local' name
+
+#if defined test_param_role
+expr f(a) { a; }
+int main(void) { return 0; }
+#elif defined test_join_role
+ident f(expr a, ident b) { a ## b }
+int main(void) { return 0; }
+#elif defined test_stringize_role
+stmt f(stmt s) { #s }
+int main(void) { f(;) return 0; }
+#elif defined test_hash_macro
+#macro M(x) x
+int main(void) { return 0; }
+#elif defined test_expr_statements
+expr f(expr a) {
+    int t = a;
+    t;
+}
+int main(void) { return 0; }
+#elif defined test_expr_empty
+expr f(expr a) { }
+int main(void) { return 0; }
+#elif defined test_no_lparen
+expr f { 1; }
+int main(void) { return 0; }
+#elif defined test_no_body
+expr f(expr a) a;
+int main(void) { return 0; }
+#elif defined test_param_name
+expr f(expr) { 1; }
+int main(void) { return 0; }
+#elif defined test_param_comma
+expr f(expr a expr b) { a; }
+int main(void) { return 0; }
+#elif defined test_join_end
+stmt f(expr a) { ## a }
+int main(void) { f(1); return 0; }
+#elif defined test_local_name
+stmt f(expr a) { __local = 1; (a) = 2; }
+int main(void) { int v = 0; f(v); return 0; }
+#elif defined test_local_join
+ident f(ident a) { __local ## a }
+int main(void) { int v = 0; f(v); return 0; }
+#else
+/* 正常路径：能编、能跑 */
+expr one(expr a) { a; }
+stmt set(expr dst, expr v) { dst = v; }
+int main(void)
+{
+    int v = 0;
+    set(v, one(3));
+    return v == 3 ? 0 : 1;
+}
+#endif

@@ -20,7 +20,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `foreach (T v = a) { ... }` | 遍历数组、切片、整数区间，以及实现 `has()`/`next()` 协议的迭代器：头里声明绑定（`(T v = a)` / `((T i, T v) = a)` / `(T i = lo:hi)`），值绑定是元素副本 |
 | `(T1, T2, ...)` 元组 | 函数多返回值：`(int, int) f(void) { return {q, r}; }`、`(int q, int r) = f();`、`(q, r) = f();`，元素用常量下标 `t[0]` 访问 |
 | 函数字面量 | `void(int x) { ... }` 是表达式，值就是函数指针：可以存进变量、当实参、直接 `qsort`；捕获式闭包 `closure RET (P…)` 把外层块作用域名字按值捕获进隐藏的 env，见 [docs/closure-design.md](docs/closure-design.md) |
-| `#macro` + `__local` | 卫生宏：`__local` 标识符按展开序号重命名 |
+| 宏 `expr`/`stmt`/`ident`/`type` | 像函数一样写宏：`stmt swap(expr a, expr b) { ... }`，开头的角色说清展开结果怎么用；宏体里的局部变量自动卫生重命名（`__local` 仍可手动标注） |
 | 源文件后缀 `.c6` | **后缀是唯一的开关**：`.c6` 文件开启扩展（并定义 `__C6__`），`.c` 文件永远是普通 C；没有 `-std=c6` 这个选项。`import` 优先找 `NAME.c6`，再回退 `NAME.c` |
 | 变量初始化检查 | 每个变量定义都必须带初始化器（`static` 变量与 VLA 除外） |
 | 泛型（已落地） | 类型应用是 `@` 后缀，不是尖括号：`struct Vect@T { ... }` 定义模板，`Vect@int`、`Vect@Vect@int`、`Map@(char[:], int)` 建实例。返回类型/名字在前的声明用 `\|T\|` 前缀绑定形参：`\|T\| T vat(Vect@T *self, int i)` 一份模板覆盖所有实例，`vat@int(v, 0)` 与 `p->vat(0)` 等价。值形参写成 C 参数表形状 `struct Buf@(T, int N)`，实参 `Buf@(int, 4)` 进 mangle（`struct Buf_int_4`），体内当常量用，可作数组长度。单态化：实例就是普通 `struct Vect_int`、普通函数 `Vect_int_vat`（`module` 下带前缀，如 `struct m2__Vect_int`），`-emit-header` 直接导出，所以 c99 后端与纯 C 的 TU 零改动（见 `tests/abi/generic.c6`）。见 [docs/generics-design.md](docs/generics-design.md) |
@@ -1299,15 +1299,32 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 回归用例见 [tests/fstr.c6](tests/fstr.c6)（`make selftest` 里跑），编译期诊断见
 [tests/errors/fstr.c6](tests/errors/fstr.c6)。
 
-### #macro / __local
+### 宏：`expr` / `stmt` / `ident` / `type`
+
+宏写在文件作用域，长得像函数：开头的角色词说清展开结果怎么用，每个形参前面
+也带自己的角色（都不能省）：
 
 ```c
-#macro swap(a, b) {
-    typeof(a) __local tmp = (a);   /* tmp 按展开序号重命名，不会捕获调用者变量 */
+stmt swap(expr a, expr b) {          /* 当一条语句用：展开成 { ... } */
+    typeof(a) tmp = (a);             /* tmp 自动认成宏的局部变量，不会捕获调用者变量 */
     (a) = (b);
     (b) = tmp;
 }
+
+expr imax(expr a, expr b) { a > b ? a : b; }   /* 当值用：展开成 ( ... ) */
+stmt twice(stmt s) { s; s; }                   /* 实参就是一条语句 */
+ident cat(ident a, ident b) { a ## b }         /* 原样重放：int cat(ab, cd) → int abcd; */
+type ptr(type T) { T * }                       /* 原样重放：ptr(int) p → int *p; */
 ```
+
+- `expr` 的体只有一个表达式（结尾的 `;` 可有可无），实参自动加括号：
+  `sq(a + 1)` 就是 `((a + 1) * (a + 1))`；要多条语句就用 `stmt`。
+- 宏体里自己声明的局部变量自动做卫生重命名（展开成
+  `<宏名>__<变量名>__h<展开号>`）；想手动指定就写 `__local`。
+- 角色词是软关键字：只在文件作用域、后面紧跟标识符、且没有同名可见符号时才
+  开始一个宏定义，别的位置它们仍是普通标识符（`int expr = 1;` 照常）。
+- 定义期只检查形状和「`#` / `##` 的操作数必须是 `ident` 角色」。
+- 旧的 `#macro` 指令已删除，写它会得到一条迁移诊断。
 
 ### 无 libc（freestanding）
 
@@ -1634,7 +1651,7 @@ tests/
 ├── err_ids.c6         错误码号段：模块的 enum Error、std 内置号段（tu/err_ids.c6）
 ├── try.c6             try / catch
 ├── test-block.c6      test 块与 -test 模式本身
-├── macro.c6           #macro 与 __local 名字卫生
+├── macro.c6           expr/stmt/ident/type 宏与名字卫生
 ├── module.c6          module / import：限定名、带前缀的 C 符号、-emit-header
 ├── method.c6          结构体方法（含不同类型的同名方法与 libc 方法）
 ├── interface.c6       结构化接口

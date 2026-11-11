@@ -618,6 +618,7 @@ typedef struct Sym {
     int c6_sym_seq; /* c6: creation order, for literal capture analysis */
     unsigned char c6_cap_kind; /* c6: nonzero for a capture alias */
     /* 0 = ordinary symbol, C6_CAP_VALUE/TYPE/ZERO for a literal body alias */
+    unsigned char c6_role; /* c6: C6_ROLE_* of a macro parameter */
 } Sym;
 
 /* section definition */
@@ -676,7 +677,22 @@ typedef struct DLLReference {
 #define MACRO_FUNC     1 /* function like macro */
 #define MACRO_JOIN     2 /* macro uses ## */
 #ifdef C6_EXT
-#define MACRO_C6_LOCAL 8 /* '#macro' body: '__local' is renamed per expansion */
+#define MACRO_C6_LOCAL 8 /* c6 macro body: hygiene runs on every expansion */
+/* how the expansion may be used: the leading role of the definition.
+   'stmt' is 0, so a plain MACRO_FUNC|MACRO_C6_LOCAL is a statement macro */
+#define MACRO_C6_RET_EXPR  16 /* '( ... )': usable as a value */
+#define MACRO_C6_RET_IDENT 32 /* raw tokens: a name (##, stringize, decl) */
+#define MACRO_C6_RET_TYPE  64 /* raw tokens: a type specifier */
+#define MACRO_C6_RET_MASK  (MACRO_C6_RET_EXPR | MACRO_C6_RET_IDENT \
+                            | MACRO_C6_RET_TYPE)
+
+/* field 'Sym.c6_role' for a c6 macro parameter: the syntactic category of
+   the argument (see c6_macro_def_parse) */
+#define C6_ROLE_NONE  0
+#define C6_ROLE_EXPR  1
+#define C6_ROLE_STMT  2
+#define C6_ROLE_IDENT 3
+#define C6_ROLE_TYPE  4
 #endif
 
 /* field 'Sym.r' for C labels */
@@ -1639,6 +1655,18 @@ ST_FUNC void define_undef(Sym *s);
 ST_INLN Sym *define_find(int v);
 ST_FUNC void free_defines(Sym *b);
 ST_FUNC void parse_define(void);
+#ifdef C6_EXT
+/* tccpp.c: take the tokens of a c6 macro body.  The current token must be
+   '{'; on return it is the matching '}'.  Returns a NUL terminated token
+   string, and sets *flags to the MACRO_* bits the body needs. */
+ST_FUNC int *c6_macro_body_capture(int *flags);
+/* tccpp.c: the C6_ROLE_* of macro parameter 't' in 'params' */
+ST_FUNC int c6_param_role(Sym *params, int v);
+/* tccpp.c: reject '#'/'##' on a parameter whose role is not 'ident' */
+ST_FUNC void c6_macro_check_body(const int *body, Sym *params, int role);
+/* tccgen.c: is 'v' a typedef name here? */
+ST_FUNC int c6_is_typedef_name(int v);
+#endif
 ST_FUNC void skip_to_eol(int warn);
 ST_FUNC void preprocess(int is_bof);
 ST_FUNC void next(void);

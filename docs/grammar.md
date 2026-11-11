@@ -1153,29 +1153,64 @@ conv                   = "d" | "i" | "u" | "x" | "X" | "o" | "b"
 
 ---
 
-## 6. 预处理
+## 6. 宏
 
 ```
-c6-directive      = "#" , "macro" , identifier ,
-                      [ "(" , [ parameter-list ] , ")" ] ,
-                      "{" , { preprocessing-token } , "}" ;
+macro-def         = role , identifier , "(" , [ param { "," , param } ] , ")" ,
+                    "{" , { preprocessing-token } , "}" ;
 
-parameter-list    = identifier , { "," , identifier } ;
+param             = role , identifier ;
+
+role              = "expr" | "stmt" | "ident" | "type" ;
 ```
 
-`#macro` 与 `#define` 的区别：
+宏写在**文件作用域**，长得像函数：开头的角色词说清展开结果怎么用，每个形参
+前面也带自己的角色（角色不能省）。宏体用 `{ … }` 包住，因此可以跨行、可以带
+分号，展开点按角色重放：
 
-- 宏体用 `{ … }` 而不是“到行尾”，因此可以跨行、可以包含分号；
-- 形参表中的标识符在替换前先做替换（不需要 `#` 前缀）；
-- 宏体内以 `__local` 声明的标识符被**卫生重命名**为 `ident__hN`
-  （`N` 是展开计数器），因此不会与调用点的同名标识符冲突：
+| 角色 | 展开成 | 拿来干什么 |
+|---|---|---|
+| `expr` | `( 宏体 )` | 当值用；宏体是**一个表达式**（结尾可以带一个 `;`），实参也自动加括号 |
+| `stmt` | `{ 宏体 }` | 当一条语句用，可以展开任意多条语句 |
+| `ident` | 原样 token | 给 `##` 拼名字、`#` 字符串化、声明里的名字 |
+| `type` | 原样 token | 当类型说明符用 |
+
+- `expr` 的宏体只能是一个表达式：`expr imax(expr a, expr b) { a > b ? a : b; }`
+  展开成 `((a + 1) > (b * 2) ? (a + 1) : (b * 2))`。要写多条语句（局部变量、
+  `if`、循环）就用 `stmt` 角色，它在调用点本来就是一条语句。
+- 宏体里**自己声明的局部变量**自动做卫生重命名（按声明形状识别，不需要标
+  注）：展开成 `<宏名>__<变量名>__h<展开号>`，所以不会和调用点的同名变量打架。
+  想手动指定就写 `__local`（位置和类型名后面的普通标识符一样）。
+- 角色词是**软关键字**：只在文件作用域、后面紧跟一个标识符、并且当前没有同名
+  可见符号时才开启一个宏定义；别的位置它们就是普通标识符，`int expr = 1;`、
+  `stmt:` 照常成立（和 `module` / `spawn` / `co` 同一个规则）。
+- 定义期只查两类东西：
+  1. **形状**：角色词后面要有名字、名字后面要 `(`、每个形参前面要有角色、
+     宏体要用 `{` 包住；`expr` 的宏体必须是一个表达式。
+  2. **`#` / `##` 的操作数必须是 `ident` 角色**——角色决定它能不能被拼成一个
+     新记号，别的参数不给拼。除此之外不做位置检查。
+- 展开期的老规矩不变：`__local` 后面必须是标识符，并且不能被 `#` / `##` 碰。
 
 ```
-    #macro swap(a, b) {
-        typeof(a) __local t = (a);
-        (a) = (b); (b) = t;
+    stmt swap(expr a, expr b) {
+        typeof(a) tmp = (a);        /* tmp 自动认成宏的局部变量 */
+        (a) = (b);
+        (b) = tmp;
     }
+
+    expr imax(expr a, expr b) { a > b ? a : b; }   /* 当值用 */
+    expr sq(expr a) { a * a }                      /* 结尾的 ';' 可有可无 */
+    stmt twice(stmt s) { s; s; }                   /* 实参就是一条语句 */
+    ident cat(ident a, ident b) { a ## b }         /* int cat(ab, cd) → abcd */
+    type ptr(type T) { T * }                       /* ptr(int) p → int *p */
 ```
+
+旧的 `#macro` 预处理指令已经删除：写 `#macro` 会得到一条迁移诊断，提示改写成
+上面这种声明形式。`#define` 仍然是 C 预处理器的那一套，和这里的宏互不影响。
+
+宏的定义和展开都在语法分析阶段完成，所以 `-E` 的输出里它们是**原样的源码**、
+不是展开结果（`#define` 的宏在 `-E` 里照常展开）；要看展开结果就编译一遍或者
+用 `-run`。
 
 ---
 
@@ -1309,6 +1344,12 @@ parameter-list    = identifier , { "," , identifier } ;
 | C127 | 一次编译里两个模块不能落在同一个号段（自动池的哈希撞了，或者表里钉重了）；撞了就报错，不静默 | `tcc: error: error ids: modules '%s' and '%s' share the block 0x%04x; pin one of them in errbase.def` |
 | C128 | `-errbase-file=FILE` 指定的表必须存在（只有默认的 `errbase.def` 会被自动创建）；钉号池用完也是错误 | `cannot read error block table '%s'`；`tcc: error: the pinned pool 0x6100..0x7fff is full: errbase.def cannot grow` |
 | C121 | 声明式头里的绑定：不能是 `void`/数组/函数，不能改变托管所有权，下标必须是整数，头里必须写出类型和名字 | `a 'foreach' binding cannot be 'void'`；`a 'foreach' binding cannot be an array`；`a 'foreach' binding cannot be a function`；`a 'foreach' binding cannot change ownership: 'v' holds a managed reference`；`the index of a 'foreach' must have an integer type, not 'double'`；`a type name expected in the head of 'foreach'`；`'foreach' needs a parenthesised head now: write 'foreach ((size_t i, T v) = a) { ... }'` |
+| C129 | 宏定义的角色词后面必须有名字，名字后面必须有 `(`，体必须用 `{` 包住 | `a macro name must follow the '%s' role`；`'(' expected after the macro name '%s'`；`'{' expected: the body of macro '%s'` |
+| C130 | 宏的每个形参都必须带角色，角色后面必须有名字 | `every macro parameter needs a role: 'expr', 'stmt', 'ident' or 'type'`；`a parameter name must follow the '%s' role`；`',' or ')' expected in a macro parameter list` |
+| C131 | `#` / `##` 的操作数必须是 `ident` 角色的形参 | `'%s' has role '%s': '#' and '##' need an 'ident' parameter` |
+| C132 | `expr` 宏的体必须是一个表达式（结尾允许一个 `;`） | `an 'expr' macro body is one expression: use a 'stmt' macro and '({ ... })' for statements`；`an 'expr' macro needs an expression in its body` |
+| C133 | `##` 不能落在宏体的两端；`__local` 后面必须是标识符，且不能被 `#` / `##` 碰 | `'##' cannot appear at either end of a macro body`；`'__local' must be followed by an identifier`；`cannot apply '#' or '##' to a '__local' name` |
+| C134 | `#macro` 指令已删除，宏改写成文件作用域的声明形式 | `'#macro' is gone: write 'stmt name(expr a, ident n) { ... }' instead (the leading role says how the expansion is used)` |
 
 （闭包的 C90–C98 见 [closure-design.md](closure-design.md) §9，消息与
 `tccgen.c` 同步落地；C80 在 V2 下只剩「没有按值捕获、却引用了块作用域名字」
@@ -2313,7 +2354,7 @@ int main(void)
 | f-string 的 C 后端 | 同一组 `__c6_fmt_*` 的 C 实现、`c99_runtime_names[]` 里的声明 | `tcc/c99-rt.inc`、`tcc/c99-gen.c`、`tcc/tccpp.c` |
 | `try` | `c6_try_parse`（`unary()` 的前缀分支） | `tcc/tccgen.c` |
 | `catch` | `c6_catch_parse`（`expr_catch()` 层，位于 `expr_cond()` 之下） | `tcc/tccgen.c` |
-| `#macro` / `__local` | `parse_c6_macro` / `c6_hygiene_body` | `tcc/tccpp.c` |
+| 宏 `expr`/`stmt`/`ident`/`type` + `__local` | `c6_macro_def_parse` / `c6_role_of`（文件作用域的软关键字入口） / `c6_macro_body_capture` / `c6_macro_check_body` / `c6_hygiene_body` / `c6_scan_locals` / `c6_macro_wrap` / `c6_param_role` | `tcc/tccgen.c`、`tcc/tccpp.c`、`tcc/tcc.h` |
 | 变量初始化 | `c6_check_var_initialized`（在 `decl()` 的对象定义分支调用） | `tcc/tccgen.c` |
 | 裸 tag 类型名 | `parse_btype()` 的 `default` 分支：`sym_find()` 未命中时试 `struct_find()`，命中则走 `basic_type2`（与 `struct TAG` 同一条路径）；`ignore_label` 时 `TAG:` 退回标签 | `tcc/tccgen.c` |
 | 枚举成员 `Color.RED` | `struct_decl()` 的枚举循环（`<tag>.<成员>` 额外注册一个带点的常量名；裸名被别的枚举占用时记进 `c6_enum_poison`，裸用处报 C119）、`unary()` 的 `tok_identifier` 点号分支（先按带点名字查枚举常量，再按包名 mangle）、`decl()` 在条件位置的向前窥探（`Tag.` 一定不是声明，交回 `gexpr()`） | `tcc/tccgen.c` |
