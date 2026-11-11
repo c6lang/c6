@@ -19,7 +19,7 @@
 #   C99TCC    产出 C 源码的编译器（默认 <仓库>/tcc/c6）
 #   C99CC     编译生成代码的系统 C 编译器（默认 gcc）
 #   LLVMCC    把 .ll 编成可执行文件的 clang（默认 clang）
-#   LLVMFLAGS 交给 LLVMCC 的参数（默认 -fuse-ld=lld，见 docs/llvm-backend.md）
+#   LLVMFLAGS 交给 LLVMCC 的参数（默认 -fuse-ld=lld，见 docs/reference/llvm-backend.md）
 #   C99FLAGS  交给 C99CC 的参数（默认 ISO C99 + 严格告警）；把 C99CC 换成
 #             tcc 时用它去掉 gcc 专有的开关，例如 "-B <仓库>/tcc -std=c99 -w"
 #             （见 make c99tcc-test）
@@ -341,7 +341,7 @@ fi
 
 # ---- 1d2. test 块运行器本身：-test-filter 真的只跑匹配的块、以 err 结束的
 #            块被报成失败并让进程以非 0 退出、用户 main 不被调用 ----
-# 这三条是 docs/plan.md §9.1 里 `test` 那一行的「过滤 / 空 test 报 PASS、
+# 这三条是 docs/design/plan.md §9.1 里 `test` 那一行的「过滤 / 空 test 报 PASS、
 # err 报 FAIL / 与用户 main 共存」，只能由运行器驱动，test 块自己写不出来。
 if [ "$BACKEND" = native ] && is_wanted "test-block"; then
     ok=yes

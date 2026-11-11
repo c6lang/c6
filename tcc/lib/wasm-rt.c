@@ -4,7 +4,7 @@
  *
  *   1. ILP32 目标（wasm32）的 ABI 适配层。LLVM 后端输出的 IR 一直是 LP64
  *      模型：unsigned long、size_t、指针在 IR 里都是 i64（见
- *      docs/llvm-backend.md）。wasm32 的 C ABI 里它们是 32 位，所以
+ *      docs/reference/llvm-backend.md）。wasm32 的 C ABI 里它们是 32 位，所以
  *      libtcc1.c 用 -D__c6_gc_new=__c6_gc_new_lp64 这一类改名编出 32 位
  *      版本，这里再提供 IR 期望的 64 位签名去调用它。wasm64 的 long 和指针
  *      本来就是 64 位，这一段整个不编。

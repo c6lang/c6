@@ -6,7 +6,7 @@
 # 默认 triple 是 wasm32-unknown-unknown：wasm64 的 long 和指针与 IR 的 LP64
 # 模型天然一致，但 LLVM 19 的 wasm-ld 给函数指针表发出的 elem 段偏移用的是
 # 内存地址（64 位），模块一实例化就 "table index is out of bounds"（见
-# docs/llvm-backend.md）。所以冒烟跑 wasm32：它的 ABI 适配由
+# docs/reference/llvm-backend.md）。所以冒烟跑 wasm32：它的 ABI 适配由
 # tcc/lib/wasm-rt.c 负责。
 #
 # 没有 clang 或 node 时只跑“生成 IR”那一段，并说明跳过了什么。

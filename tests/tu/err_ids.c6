@@ -1,7 +1,7 @@
 /* tests/err_ids.c6 的第二个翻译单元：一个模块。
  *
  * 模块里的 `enum Error` 成员不是裸数字，而是落在这个模块自己的号段里
- * （id = area<<27 | slot<<12 | code，见 docs/grammar.md §8.1）。号段由模块名
+ * （id = area<<27 | slot<<12 | code，见 docs/reference/grammar.md §8.1）。号段由模块名
  * 决定：没有写进 errbase.def 时是模块名的哈希，写进去了就是表里的号。
  * 所以这里只断言号段的结构，不断言具体数字。
  */

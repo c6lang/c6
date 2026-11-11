@@ -5,7 +5,7 @@
 #
 # triple 默认 wasm32-unknown-unknown：wasm64 的 ABI 与 IR 的 LP64 模型天然
 # 一致，但 LLVM 19 的 wasm-ld 给函数指针表发的 elem 段是坏的（见
-# docs/llvm-backend.md），现阶段的 wasm 目标用 wasm32。
+# docs/reference/llvm-backend.md），现阶段的 wasm 目标用 wasm32。
 #
 # 用 clang 交叉编 tcc/lib 下的 C 源。跳过三个文件：
 #   atomic.S / alloca.S   x86 汇编，wasm 没有
@@ -24,7 +24,7 @@ usage: scripts/build-wasm-runtime.sh [triple]
 arguments:
   triple                 默认 wasm32-unknown-unknown。wasm64 的 ABI 和 IR 的
                          LP64 模型天然一致，但 LLVM 19 的 wasm-ld 给它发的
-                         elem 段是坏的（见 docs/llvm-backend.md），所以现阶段的
+                         elem 段是坏的（见 docs/reference/llvm-backend.md），所以现阶段的
                          wasm 目标用 wasm32。
 
 options:

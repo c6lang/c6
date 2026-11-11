@@ -83,7 +83,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type,
    linker and which startup files a triple needs, so the last step of a
    '--target' compile is a plain exec of clang.  The command line below is the
    same one tests/run-tests.sh uses for the LLVM back-end (see
-   docs/llvm-backend.md), plus what the triple itself asks for:
+   docs/reference/llvm-backend.md), plus what the triple itself asks for:
 
      - a wasm module never links a libc; it wants '--no-entry', everything
        exported, and no startup files (-nostdlib)

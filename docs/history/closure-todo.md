@@ -1,8 +1,9 @@
 # c6 捕获式闭包（V2）实施 todo
 
-设计见 [closure-design.md](closure-design.md)。本文是当初的执行清单：阶段、
-改动点、测试、验收命令。**P0–P5 已全部落地**（一个阶段一个提交，标题
-`closure: Pn …`），下面保留作验收对照。
+> **状态**：历史记录（P0–P5 全部完成） · **索引**：[文档索引](../README.md) · **设计**：[closure-design.md](../design/closure-design.md) · **总状态**：[status.md](status.md)
+>
+> 一句话：当初的执行清单——阶段、改动点、测试、验收命令。保留作验收对照，不再更新。
+> 每个阶段一个提交，标题 `closure: Pn …`。
 
 约定：
 

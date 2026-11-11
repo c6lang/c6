@@ -146,8 +146,8 @@ static struct scope {
    still armed, which cleanup request is being served -- lives in the *frame*
    of that very invocation.  A cleanup therefore needs no per-thread
    bookkeeping at all: it runs the same in an ISR, in a resumed coroutine (the
-   frame lives in the task) and in a plain nested call.  See docs/grammar.md
-   (R6, D1-D6) and docs/gc-design.md §9.1. */
+   frame lives in the task) and in a plain nested call.  See docs/reference/grammar.md
+   (R6, D1-D6) and docs/design/gc-design.md §9.1. */
 #define C6_DEFER_WORDS  4               /* 4 * 32 = 128 sites per function */
 #define C6_DEFER_LEVELS 8               /* cleanup bodies may nest this deep */
 typedef struct C6DeferSite {
@@ -19642,7 +19642,7 @@ static void c6_async_suspend(int kind)
 
     /* __c6_co_suspend(task, kind, state).  The cleanup state of the body
        lives in its frame, and the frame lives in the task, so there is nothing
-       to park: see docs/gc-design.md §9.1. */
+       to park: see docs/design/gc-design.md §9.1. */
     c6_rt_begin("__c6_co_suspend");
     c6_async_push_task();
     vpushi(kind);
