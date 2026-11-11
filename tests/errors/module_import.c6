@@ -14,6 +14,7 @@
 // EXPECT test_unknown_member_call: error: unresolved reference to 'tu__imp__nope'
 // EXPECT-C99 test_unknown_member_call: warning: implicit declaration of function 'tu.imp.nope'
 // EXPECT-C99 test_unknown_member_call: tu__imp__nope
+// EXPECT-LLVM test_unknown_member_call: undefined symbol: tu__imp__nope
 // EXPECT test_missing_member_name: error: identifier expected after '.'
 // EXPECT test_arrow_is_not_module_access: error: 'tu' is neither an enum nor an imported module (use 'import tu;')
 // EXPECT test_import_after_use: error: 'tu.imp' is neither an enum nor an imported module (use 'import tu.imp;')

@@ -71,6 +71,7 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type);
 #define TCC_OUTPUT_OBJ      3 /* object file */
 #define TCC_OUTPUT_PREPROCESS 5 /* only preprocess */
 #define TCC_OUTPUT_C99      6 /* emit portable C99 source code */
+#define TCC_OUTPUT_LLVM     7 /* emit LLVM IR (.ll) */
 
 /* equivalent to -Lpath option */
 LIBTCCAPI int tcc_add_library_path(TCCState *s, const char *pathname);

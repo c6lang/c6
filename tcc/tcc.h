@@ -159,12 +159,13 @@ extern long double strtold (const char *__nptr, char **__endptr);
 /* #define TCC_TARGET_C67    *//* TMS320C67xx code generator */
 /* #define TCC_TARGET_RISCV64 *//* risc-v code generator */
 /* #define TCC_TARGET_C99    *//* portable C99 code generator */
+/* #define TCC_TARGET_LLVM   *//* LLVM IR code generator */
 
 /* default target is I386 */
 #if !defined(TCC_TARGET_I386) && !defined(TCC_TARGET_ARM) && \
     !defined(TCC_TARGET_ARM64) && !defined(TCC_TARGET_C67) && \
     !defined(TCC_TARGET_X86_64) && !defined(TCC_TARGET_RISCV64) && \
-    !defined(TCC_TARGET_C99)
+    !defined(TCC_TARGET_C99) && !defined(TCC_TARGET_LLVM)
 # if defined __x86_64__
 #  define TCC_TARGET_X86_64
 # elif defined __arm__
@@ -397,6 +398,9 @@ extern long double strtold (const char *__nptr, char **__endptr);
 #elif defined TCC_TARGET_C99
 # include "c99-gen.c"
 # include "c99-link.c"
+#elif defined TCC_TARGET_LLVM
+# include "llvm-gen.c"
+# include "llvm-link.c"
 #elif defined(TCC_TARGET_RISCV64)
 # include "riscv64-gen.c"
 # include "riscv64-link.c"
@@ -931,6 +935,9 @@ struct TCCState {
     unsigned char option_r; /* option -r */
 #ifdef TCC_TARGET_C99
     unsigned char c99_compile_only; /* -c: one generated C file per TU */
+#endif
+#ifdef TCC_TARGET_LLVM
+    unsigned char llvm_compile_only; /* -c: one generated .ll per TU */
 #endif
     unsigned char do_bench; /* option -bench */
     unsigned char just_deps; /* option -M  */
@@ -1748,11 +1755,11 @@ ST_FUNC int expr_const(void);
 ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsigned long size);
 #endif
 #if defined TCC_TARGET_X86_64 && !defined TCC_TARGET_PE \
-    || defined TCC_TARGET_C99
+    || defined TCC_TARGET_C99 || defined TCC_TARGET_LLVM
 ST_FUNC int classify_x86_64_va_arg(CType *ty);
 #endif
 #ifdef CONFIG_TCC_BCHECK
-#ifndef TCC_TARGET_C99 /* the C99 backend has no bounds-checking prolog */
+#if !defined TCC_TARGET_C99 && !defined TCC_TARGET_LLVM /* no bcheck prolog */
 ST_FUNC void gbound_args(int nb_args);
 #endif
 ST_DATA int func_bound_add_epilog;
@@ -1888,7 +1895,8 @@ ST_FUNC void gen_cvt_ftoi(int t);
 ST_FUNC void gen_cvt_itof(int t);
 ST_FUNC void gen_cvt_ftof(int t);
 ST_FUNC void ggoto(void);
-#if !defined(TCC_TARGET_C67) && !defined(TCC_TARGET_C99)
+#if !defined(TCC_TARGET_C67) && !defined(TCC_TARGET_C99) \
+    && !defined(TCC_TARGET_LLVM)
 ST_FUNC void o(unsigned int c);
 #endif
 ST_FUNC void gen_vla_sp_save(int addr);
@@ -1980,6 +1988,14 @@ ST_FUNC void gen_opl(int op);
 ST_FUNC void gen_cvt_sxtw(void);
 ST_FUNC void c99_reset(void);
 ST_FUNC int c99_output_file(TCCState *s1, const char *filename);
+#endif
+
+/* ------------ llvm-gen.c ------------ */
+#ifdef TCC_TARGET_LLVM
+ST_FUNC void gen_opl(int op);
+ST_FUNC void gen_cvt_sxtw(void);
+ST_FUNC void llvm_reset(void);
+ST_FUNC int llvm_output_file(TCCState *s1, const char *filename);
 #endif
 
 /* ------------ c67-gen.c ------------ */

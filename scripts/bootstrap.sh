@@ -22,10 +22,11 @@ fi
 # 因此出现下面任一情况都重新生成一次：
 #   - configure 比 config.mak 新（configure 只在内容变化时才重写 config.h，
 #     所以时间戳以每次都会重写的 config.mak 为准）；
-#   - config.h 里没有 C99 目标（时间戳不可靠时也能识别出旧配置）。
+#   - config.h 里没有 C99/LLVM 目标（时间戳不可靠时也能识别出旧配置）。
 if [ -f "$TCC_DIR/config.mak" ] && [ -f "$TCC_DIR/config.h" ] \
    && [ ! "$TCC_DIR/configure" -nt "$TCC_DIR/config.mak" ] \
-   && grep -q TCC_TARGET_C99 "$TCC_DIR/config.h"; then
+   && grep -q TCC_TARGET_C99 "$TCC_DIR/config.h" \
+   && grep -q TCC_TARGET_LLVM "$TCC_DIR/config.h"; then
     echo "bootstrap: $TCC_DIR 已配置"
     exit 0
 fi

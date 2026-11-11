@@ -3542,6 +3542,10 @@ LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
     if (s->output_type == TCC_OUTPUT_C99)
         return c99_output_file(s, filename);
 #endif
+#ifdef TCC_TARGET_LLVM
+    if (s->output_type == TCC_OUTPUT_LLVM)
+        return llvm_output_file(s, filename);
+#endif
     if (s->output_type == TCC_OUTPUT_OBJ)
         return elf_output_obj(s, filename);
 #ifdef TCC_TARGET_PE
