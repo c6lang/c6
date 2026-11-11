@@ -74,4 +74,185 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type,
     llvm_no_link(s1, "llvm output: no machine code relocation");
 }
 
+/* ---------------------------------------------------------------------- */
+/* '--target=<triple>': driving the host compiler                           */
+
+/* The IR is portable, the toolchain around it is not: clang knows which
+   linker and which startup files a triple needs, so the last step of a
+   '--target' compile is a plain exec of clang.  The command line below is the
+   same one tests/run-tests.sh uses for the LLVM back-end (see
+   docs/llvm-backend.md), plus what the triple itself asks for:
+
+     - a wasm module never links a libc; it wants '--no-entry', everything
+       exported, and no startup files (-nostdlib)
+     - ELF targets link with lld, because libtcc1.a's .eh_frame makes GNU ld
+       report overlapping FDEs
+     - the runtime comes from the -B directory: 'libtcc1-<arch>.a' when the
+       target is not the host, 'libtcc1.a' otherwise
+
+   TCC_CC selects the compiler (--cc= wins), TCC_CCFLAGS adds flags. */
+static const char *l_cc(TCCState *s1)
+{
+    const char *p;
+
+    if (s1->llvm_cc && *s1->llvm_cc)
+        return s1->llvm_cc;
+    p = getenv("TCC_CC");
+    return p && *p ? p : "clang";
+}
+
+/* "<prefix><s>" in fresh memory */
+static char *l_join(const char *prefix, const char *s)
+{
+    char *r = tcc_malloc(strlen(prefix) + strlen(s) + 1);
+
+    sprintf(r, "%s%s", prefix, s);
+    return r;
+}
+
+static int l_file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
+/* the arch component of the triple: 'wasm32-unknown-unknown' -> 'wasm32' */
+static void l_arch(char *buf, int size, const char *triple)
+{
+    int i = 0;
+
+    if (!triple)
+        triple = "";
+    while (triple[i] && triple[i] != '-' && i < size - 1) {
+        buf[i] = triple[i];
+        i++;
+    }
+    buf[i] = 0;
+}
+
+ST_FUNC int llvm_tool_cc(TCCState *s1, const char *irfile, const char *outfile)
+{
+    char **av = tcc_malloc(64 * sizeof *av);
+    int n = 0, i;
+    char *buf;
+    char arch[64];
+    const char *triple = s1->target_triple;
+    int wasm, obj = s1->llvm_compile_only;
+
+    l_arch(arch, sizeof arch, triple);
+    wasm = !strcmp(arch, "wasm32") || !strcmp(arch, "wasm64");
+
+    av[n++] = (char *)l_cc(s1);
+    if (triple && *triple) {
+        buf = tcc_malloc(strlen(triple) + 10);
+        sprintf(buf, "--target=%s", triple);
+        av[n++] = buf;
+    }
+    if (!wasm && !obj)
+        av[n++] = "-fuse-ld=lld";
+    else if (wasm && !obj) {
+        av[n++] = "-nostdlib";
+        av[n++] = "-Wl,--no-entry";
+        av[n++] = "-Wl,--export-all";
+    }
+    if (obj)
+        av[n++] = "-c";
+    {
+        const char *fl = getenv("TCC_CCFLAGS");
+
+        if (fl && *fl) {
+            char *copy = tcc_strdup(fl), *p = copy, *q;
+
+            while (*p && n < 58) {
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (!*p)
+                    break;
+                q = p;
+                while (*q && *q != ' ' && *q != '\t')
+                    q++;
+                if (*q)
+                    *q++ = 0;
+                av[n++] = p;
+                p = q;
+            }
+        }
+    }
+    av[n++] = "-o";
+    av[n++] = (char *)outfile;
+    av[n++] = (char *)irfile;
+
+    /* The runtime: libtcc1 for the host, libtcc1-<arch> for another target.
+       The host archive cannot be used for another target (it is machine code
+       for this one), so a missing target library is an error instead of a
+       link that silently pulls in the wrong objects. */
+    if (!obj && s1->tcc_lib_path && *s1->tcc_lib_path) {
+        char lib[4096];
+        int host = !*arch || !strcmp(arch, "x86_64"), have;
+
+        av[n++] = l_join("-L", s1->tcc_lib_path);
+        snprintf(lib, sizeof lib, "%s/libtcc1-%s.a", s1->tcc_lib_path, arch);
+        have = l_file_exists(lib);
+        if (host) {
+            char hostlib[4096];
+
+            snprintf(hostlib, sizeof hostlib, "%s/libtcc1.a", s1->tcc_lib_path);
+            if (l_file_exists(hostlib))
+                av[n++] = "-ltcc1";
+        } else if (have) {
+            av[n++] = l_join("-ltcc1-", arch);
+        } else {
+            fprintf(stderr,
+                    "tcc: no runtime for target '%s': %s is missing\n"
+                    "tcc: build it with scripts/build-wasm-runtime.sh %s\n",
+                    triple, lib, triple);
+            return 1;
+        }
+    }
+    /* '-L' / '-l' given on the command line are for the same link */
+    for (i = 0; !obj && i < s1->nb_library_paths && n < 58; i++) {
+        buf = tcc_malloc(strlen(s1->library_paths[i]) + 4);
+        sprintf(buf, "-L%s", s1->library_paths[i]);
+        av[n++] = buf;
+    }
+    for (i = 0; !obj && i < s1->nb_files && n < 58; i++) {
+        struct filespec *f = s1->files[i];
+
+        if (f->type & AFF_TYPE_LIB) {
+            buf = tcc_malloc(strlen(f->name) + 4);
+            sprintf(buf, "-l%s", f->name);
+            av[n++] = buf;
+        }
+    }
+    av[n] = NULL;
+
+    if (s1->verbose) {
+        fprintf(stderr, "tcc: %s", av[0]);
+        for (i = 1; i < n; i++)
+            fprintf(stderr, " %s", av[i]);
+        fprintf(stderr, "\n");
+    }
+    execvp(av[0], av);
+    /* distros that keep clang out of $PATH install it under /usr/lib/llvm-N;
+       the same fallback as tests/run-tests.sh, so '-cc=clang' works there */
+    if (!strchr(av[0], '/')) {
+        static char alt[256];
+        int v;
+
+        for (v = 24; v >= 10; v--) {
+            sprintf(alt, "/usr/lib/llvm-%d/bin/%s", v, av[0]);
+            if (!l_file_exists(alt))
+                continue;
+            av[0] = alt;
+            execvp(alt, av);
+        }
+    }
+    fprintf(stderr, "tcc: could not run '%s': %s\n", av[0], strerror(errno));
+    return 1;
+}
+
 #endif /* !TARGET_DEFS_ONLY */

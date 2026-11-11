@@ -47,7 +47,16 @@ typedef union
   DWtype ll;
 } DWunion;
 
+/* The 'unsigned long long -> double' helpers use the widest float type as an
+   intermediate.  On x86 that is the 80-bit long double; a wasm target has no
+   such type (long double is f128 there and every operation on it needs
+   compiler-rt's __*tf3, which a freestanding wasm link does not have), so
+   plain double is used instead. */
+#if defined(__wasm__)
+typedef double XFtype;
+#else
 typedef long double XFtype;
+#endif
 #define WORD_SIZE (sizeof (Wtype) * BITS_PER_UNIT)
 #define HIGH_WORD_COEFF (((UDWtype) 1) << WORD_SIZE)
 
@@ -507,6 +516,11 @@ double __floatundidf(unsigned long long a)
     }
 }
 
+/* x87 soft-float: only meaningful where 'long double' is the 80-bit type.
+   A wasm target has no such type (clang lowers every long double operation
+   to compiler-rt's __*tf3 helpers there, which a freestanding wasm link does
+   not have), so the helpers are left out. */
+#if !defined(__arm__) && !defined(__wasm__)
 long double __floatundixf(unsigned long long a)
 {
     DWunion uu; 
@@ -521,6 +535,7 @@ long double __floatundixf(unsigned long long a)
         return (long double)r;
     }
 }
+#endif /* !arm && !wasm */
 
 unsigned long long __fixunssfdi (float a1)
 {
@@ -590,7 +605,7 @@ long long __fixdfdi (double a1)
     return s ? ret : -ret;
 }
 
-#ifndef __arm__
+#if !defined(__arm__) && !defined(__wasm__)
 unsigned long long __fixunsxfdi (long double a1)
 {
     register union ldouble_long dl1;
@@ -620,7 +635,7 @@ long long __fixxfdi (long double a1)
     ret = __fixunsxfdi((s = a1 >= 0) ? a1 : -a1);
     return s ? ret : -ret;
 }
-#endif /* !ARM */
+#endif /* !arm && !wasm */
 
 /* ------------------------------------------------------------------------- */
 /* c6 extension runtime: err                                              */
@@ -1178,7 +1193,7 @@ void __tcc_catch_fallthrough(void)
 /* never observes freed memory.                                             */
 
 #define C6_GC_HDR_SIZE   32     /* header in front of the payload */
-#define C6_GC_DEAD       (1UL << 63)  /* 'rc': the object is being freed */
+#define C6_GC_DEAD       (1ULL << 63)  /* 'rc': the object is being freed */
 /* store modes and object flags; the numbers must match tcc.h and the
    '#define's tcc_predefs() emits for compiled programs */
 #define C6_GC_FRESH      1
@@ -1187,7 +1202,7 @@ void __tcc_catch_fallthrough(void)
 #define C6_GC_OWN        8
 #define C6_GC_INIT       16
 
-#define C6_GC_META_COUNT 0xffffffffffUL   /* low 40 bits: element count */
+#define C6_GC_META_COUNT 0xffffffffffULL   /* low 40 bits: element count */
 
 /* field kinds, must match C6_GCK_* in tcc/tcc.h */
 #define C6_GCK_STRONG 1
@@ -1227,8 +1242,10 @@ struct C6GcDesc {
 };
 
 struct C6GcHdr {
-    unsigned long rc;           /* reference count, C6_GC_DEAD when dying */
-    unsigned long meta;         /* element count, flags in the high bits */
+    /* 64 bit on every target: the flags live in the high half, so a 32-bit
+       'unsigned long' (wasm32, ILP32) cannot carry them */
+    unsigned long long rc;      /* reference count, C6_GC_DEAD when dying */
+    unsigned long long meta;    /* element count, flags in the high bits */
     const C6GcDesc *desc;
     union {
         C6GcWeak *weak;         /* live object: weak references to it */
@@ -1484,7 +1501,7 @@ void *__c6_gc_new(unsigned long size, unsigned long count,
     h->rc = 1;
     h->meta = count & C6_GC_META_COUNT;
     if (flags & C6_GC_ATOMIC)
-        h->meta |= (unsigned long)C6_GC_ATOMIC << 40;
+        h->meta |= (unsigned long long)C6_GC_ATOMIC << 40;
     h->desc = (const C6GcDesc *)desc;
     c6_gc_live_count++;
     return h + 1;
@@ -1598,7 +1615,7 @@ void *__c6_gc_weak_store(void **dst, void **weak_slot, int mode)
     if (p) {
         h = c6_gc_hdr(p);
         if (c6_gc_is_atomic(h)) {
-            unsigned long expected, desired;
+            unsigned long long expected, desired;
             for (;;) {
                 expected = h->rc;
                 if (expected & C6_GC_DEAD)

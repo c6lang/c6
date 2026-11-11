@@ -1234,6 +1234,13 @@ struct TCCState {
     int nb_files; /* number thereof */
     int nb_libraries; /* number of libs thereof */
     char *outfile; /* output filename */
+    /* '--target=<triple>' (LLVM back-end only): the module is written with
+       this triple and the data layout that goes with it.  Unless
+       '-emit-llvm' asks to stop at the IR, the driver then runs '--cc'
+       (default: $TCC_CC, else clang) on the .ll to produce the artifact. */
+    char *target_triple;
+    char *llvm_cc;
+    unsigned char llvm_emit_only;
     char *deps_outfile; /* option -MF */
     int argc;
     char **argv;
@@ -2020,6 +2027,11 @@ ST_FUNC void gen_opl(int op);
 ST_FUNC void gen_cvt_sxtw(void);
 ST_FUNC void llvm_reset(void);
 ST_FUNC int llvm_output_file(TCCState *s1, const char *filename);
+/* hand a written .ll to the host compiler ('--target', see llvm-link.c) */
+ST_FUNC int llvm_tool_cc(TCCState *s1, const char *irfile,
+                         const char *outfile);
+/* make the preprocessor macros follow '--target=<triple>' */
+ST_FUNC void llvm_set_target(TCCState *s1);
 #endif
 
 /* ------------ c67-gen.c ------------ */

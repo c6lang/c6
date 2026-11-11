@@ -956,6 +956,8 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
     tcc_free(s1->fini_symbol);
     tcc_free(s1->mapfile);
     tcc_free(s1->outfile);
+    tcc_free(s1->target_triple);
+    tcc_free(s1->llvm_cc);
     tcc_free(s1->deps_outfile);
 #ifdef C6_EXT
     tcc_free(s1->c6_emit_header);
@@ -1606,6 +1608,9 @@ enum {
     TCC_OPTION_g,
     TCC_OPTION_c,
     TCC_OPTION_c99,
+    TCC_OPTION_cc,
+    TCC_OPTION_emit_llvm,
+    TCC_OPTION_target,
     TCC_OPTION_dumpmachine,
     TCC_OPTION_dumpversion,
     TCC_OPTION_d,
@@ -1697,6 +1702,15 @@ static const TCCOption tcc_options[] = {
 #endif
     { "c", TCC_OPTION_c, 0 },
     { "c99", TCC_OPTION_c99, 0 },
+    /* '--target=<triple>' and its friends: the LLVM back-end writes the
+       triple into the module and hands the IR to clang.  Both one and two
+       dashes are accepted ('-target=' / '--target='). */
+    { "cc", TCC_OPTION_cc, TCC_OPTION_HAS_ARG },
+    { "-cc", TCC_OPTION_cc, TCC_OPTION_HAS_ARG },
+    { "emit-llvm", TCC_OPTION_emit_llvm, 0 },
+    { "-emit-llvm", TCC_OPTION_emit_llvm, 0 },
+    { "target", TCC_OPTION_target, TCC_OPTION_HAS_ARG },
+    { "-target", TCC_OPTION_target, TCC_OPTION_HAS_ARG },
     { "dumpmachine", TCC_OPTION_dumpmachine, 0},
     { "dumpversion", TCC_OPTION_dumpversion, 0},
     { "d", TCC_OPTION_d, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
@@ -2040,6 +2054,21 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
         case TCC_OPTION_c99:
             x = TCC_OUTPUT_C99;
             goto set_output_type;
+        case TCC_OPTION_target:
+            if (*optarg == '=')
+                ++optarg;
+            if (!*optarg)
+                return tcc_error_noabort("missing triple in '--target='");
+            tcc_set_str(&s->target_triple, optarg);
+            break;
+        case TCC_OPTION_cc:
+            if (*optarg == '=')
+                ++optarg;
+            tcc_set_str(&s->llvm_cc, optarg);
+            break;
+        case TCC_OPTION_emit_llvm:
+            s->llvm_emit_only = 1;
+            break;
         case TCC_OPTION_c:
 #ifdef TCC_TARGET_C99
             /* this build can only emit C source: -c means "one output file
