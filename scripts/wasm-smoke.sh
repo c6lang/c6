@@ -12,6 +12,39 @@
 # 没有 clang 或 node 时只跑“生成 IR”那一段，并说明跳过了什么。
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+usage() {
+    cat <<'EOF'
+usage: scripts/wasm-smoke.sh [triple]
+
+端到端冒烟：tcc --target=<triple> 出 .wasm，再用 node 跑一遍。需要先 make build。
+
+arguments:
+  triple                 默认 wasm32-unknown-unknown
+
+options:
+  -h, --help             显示本帮助
+
+environment:
+  LLVMCC                 转 IR / 编运行库用的 C 编译器（默认 clang）
+  NODE                   跑 .wasm 的 node（默认 node；没有就只生成文件）
+
+检查的内容：
+  --emit-llvm 写出的模块头和 triple 一致
+  纯计算的导出函数（add / mul）
+  运行库：引用计数 GC、切片帮助函数、大结构体按值传参
+  examples/gc_demo.c6：printf 走控制台缓冲区、spawn/async 走内联线程和协程，
+                       要求跑出「全部检查通过」且 main() 返回 0
+
+运行库 tcc/libtcc1-<arch>.a 不存在时会先用 build-wasm-runtime.sh 建一份。
+EOF
+}
+
+case ${1:-} in
+-h|--help) usage; exit 0 ;;
+-*) printf 'wasm-smoke: 不认识的参数 %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
 TRIPLE=${1:-wasm32-unknown-unknown}
 ARCH=${TRIPLE%%-*}
 TCC=$ROOT/tcc/tcc

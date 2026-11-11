@@ -13,6 +13,45 @@
 # 运行期需要的 libc/线程符号由 -nostdlib 链接时的桩提供（见 wasm-rt.c）。
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+usage() {
+    cat <<'EOF'
+usage: scripts/build-wasm-runtime.sh [triple]
+
+为交叉目标构建 tcc 的运行库：tcc/libtcc1-<arch>.a（arch 取 triple 的第一段）。
+`tcc --target=<triple>` 链接时用的就是它，缺了会直接报错并提示跑这个脚本。
+
+arguments:
+  triple                 默认 wasm32-unknown-unknown。wasm64 的 ABI 和 IR 的
+                         LP64 模型天然一致，但 LLVM 19 的 wasm-ld 给它发的
+                         elem 段是坏的（见 docs/llvm-backend.md），所以现阶段的
+                         wasm 目标用 wasm32。
+
+options:
+  -h, --help             显示本帮助
+
+environment:
+  LLVMCC                 交叉用的 C 编译器，默认 clang（找不到时试
+                         /usr/lib/llvm-N/bin/clang）
+  LLVMAR                 归档工具，默认 llvm-ar（找不到时试 ar）
+
+examples:
+  ./scripts/build-wasm-runtime.sh
+  LLVMCC=/usr/lib/llvm-19/bin/clang ./scripts/build-wasm-runtime.sh \
+      aarch64-unknown-linux-gnu
+  make wasmrt WASM_TRIPLE=wasm32-unknown-unknown
+
+用 clang 交叉编 tcc/lib 下的 C 源，跳过 atomic.S / alloca.S（x86 汇编）和
+tcov.c（x86 覆盖钩子）。运行期要的 libc / 线程符号由 -nostdlib 链接时的桩
+提供，见 tcc/lib/wasm-rt.c。
+EOF
+}
+
+case ${1:-} in
+-h|--help) usage; exit 0 ;;
+-*) printf 'build-wasm-runtime: 不认识的参数 %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
 TRIPLE=${1:-wasm32-unknown-unknown}
 ARCH=${TRIPLE%%-*}
 CC=${LLVMCC:-clang}
