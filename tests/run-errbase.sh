@@ -31,8 +31,11 @@ if [ ! -x "$TCC" ]; then
 fi
 
 # 仓库里所有模块文件（模块名 = 文件路径去掉 .c6）
+# 跳过 .git：会话工作树（.git/dsh-worktrees/*）里是同一棵树的完整副本，扫进去
+# 每个模块都会出现两次，钉号时报 'link symbol ... defined twice'
 modules() {
-    cd "$ROOT" && grep -rl '^module ' --include=*.c6 . | sed 's,^\./,,' | sort
+    cd "$ROOT" && grep -rl '^module ' --include=*.c6 --exclude-dir=.git . \
+        | sed 's,^\./,,' | sort
 }
 
 # ---- 1. 提交进版本库的表必须是最新的 ----
