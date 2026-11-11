@@ -669,7 +669,7 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 | `tests/macro.c6` | `#macro` 与卫生的 `__local` |
 | `tests/module.c6` | `module` / `import`：限定名、带前缀的 C 符号、全限定函数取址、跨 TU |
 | `c6ext/modpath`（run-tests.sh） | 模块名即路径：分级查找、扁平拼写被拒绝、两个 TU |
-| `tests/method.c6` | 结构体方法、不同类型的同名方法、libc 方法（`p->fflush()`）、与方法或 libc 同名的普通函数不被顶掉，以及 `T!error` 方法 |
+| `tests/method.c6` | 结构体方法、值接收者（`v.f()` = `f(&v)`，改动可见、返回结构体、`!error`、泛型实例上的 `|T|` 方法、与接口 vtable 的分工）、不同类型的同名方法、libc 方法（`p->fflush()`）、与方法或 libc 同名的普通函数不被顶掉，以及 `T!error` 方法 |
 | `tests/interface.c6` | 接口、vtable、隐式/显式转换、跨 TU |
 | `tests/iface_agg.c6` | 接口方法签名里的聚合类型：struct 参数、struct 返回值、12 字节 struct 返回值（寄存器返回）、元组返回值（`tests/errors/iface.c6` 的 `test_proto_scope_tag` 守住“tag 必须在接口之前声明”的诊断） |
 | `tests/slice.c6` | `T[:]` 的构造、下标、区间、跨 TU |
@@ -766,8 +766,9 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
   `expression expected before '<'`）。现在这些点统一走 `tccpp.c` 的
   `macro_unwind_above()` / `end_macro_under()` / `macro_rewind()`：先把
   猜测期间压上去的回放全部弹掉，再回到自己的那一层；
-- 结构体方法必须在调用点之前声明或定义（单趟编译约束）；只支持 `->`，
-  `v.f()` 按普通成员访问处理，同名字段优先于方法；
+- 结构体方法必须在调用点之前声明或定义（单趟编译约束）；接收者写成指针
+  （`p->f()`）或值（`v.f()`，按 `&v` 传，要求左值）都行，同名字段优先于
+  方法，接口值上的 `.` 调用按 vtable 分派；
 - 方法符号是 `<结构体>_<方法>`，源码名是弱别名：同一个类型仍然只能有一个
   同名方法，不同类型的同名方法可以直接共存；`area(p)` 这种普通调用只指向
   本 TU 里第一个取到该名字的方法，有歧义时写 `p->area()`。`static` / `inline`、

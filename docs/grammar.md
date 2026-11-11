@@ -291,7 +291,21 @@ function-definition    = declaration-specifiers ,
     void f(struct Vec *p) { p->vec_sum(); }   (* 等价于 vec_sum(p) *)
 ```
 
-方法**不是**新的函数类型：调用约定不变，`vec_sum(p)` 与 `p->vec_sum()` 等价，
+接收者也可以写成**值**：`v.vec_sum()` 传的是 `&v`，与 `vec_sum(&v)` 是同一个
+调用（`v` 必须是可作左值的对象），所以方法里改的确实是 `v` 本身：
+
+```
+    void vec_bump(struct Vec *self) { self->x = self->x + 1; }
+
+    void g(void)
+    {
+        struct Vec v = {1, 2};
+        v.vec_bump();               (* 等价于 vec_bump(&v)，v.x 变成 2 *)
+    }
+```
+
+方法**不是**新的函数类型：调用约定不变，`vec_sum(p)`、`p->vec_sum()` 与
+`v.vec_sum()` 三者等价，
 接收者就是第一个实参。区别只在**符号名**：方法以 `<结构体>_<方法>` 的名字输出
 （上面的 `vec_sum` 是 `Vec_vec_sum`），源码里写的名字另外输出成一个**弱别名**，
 因此：
@@ -322,6 +336,11 @@ function-definition    = declaration-specifiers ,
   （`p->fflush()` 仍然调 libc 的 `fflush`）、匿名结构体的方法（匿名 tag
   的编号是每个 TU 各一份）。模块里的方法也不需要保留原名：符号只按接收者
   取名，模块前缀由 `NAME__` 那一层加上去。
+- 接收者写成值（`v.f(a)`）时按 `&v` 传，要求 `v` 是可作左值的对象（返回值、
+  常量不行）；指针写 `p->f(a)`，接口值写 `s.f(a)` 走 vtable。**同名字段永远
+  优先于方法**，方法必须在使用点之前可见，`v.f` / `p->f` 不带调用一律报 C20。
+  `const` 值上的点调用等于 `f(&c)`：接收者要声明成 `const T *`，否则和普通
+  调用一样报丢弃限定符的告警。
 
 约束见 C20。
 
@@ -799,6 +818,7 @@ Vect@Vect@int grid = {0};       /* 右结合，链上没有闭合符 */
 int x = p->vat(0);              /* 接收者定类型：Vect_int_vat */
 Stack@(int, 4) s = {0};
 int ok = (&s)->push(7);         /* 体内方法：Stack_int_4_push */
+int ok2 = s.push(7);            /* 值接收者：同一个调用，接收者是 '&s' */
 ```
 
 `@` 与托管引用共存：前缀 `@`（类型位置起点）是托管引用，后缀 `@`（类型名
@@ -1184,7 +1204,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C17 | `err` 只能出现在返回 `T!error` 的函数里 | `'err' requires the enclosing function to return 'T!error'` |
 | C18 | `error` 只能作为返回值，不能作为形参（含 `error*` / `error[]`，K&R 形参声明也算） | `'error' can only be a return type, not a parameter` |
 | C19 | 每个变量定义都必须带初始化器（`extern` 声明、形参、成员、`typedef`、`static` 变量除外；VLA 豁免） | `variable 'x' must be initialized` |
-| C20 | 方法调用要求：接收者是指向结构体/联合体的指针、该类型有同名方法、没有同名字段、方法在调用点之前已声明，且方法后面必须紧跟 `(` | `method 'f' must be called`；`duplicate method 'f' for 'T'`；其它情况按普通成员访问报 `field not found: f` |
+| C20 | 方法调用要求：接收者是指向结构体/联合体的指针（`p->f()`），或者是可作左值的结构体/联合体值（`v.f()` 按 `&v` 传）；该类型有同名方法、没有同名字段、方法在调用点之前已声明，且方法后面必须紧跟 `(` | `method 'f' must be called`；`duplicate method 'f' for 'T'`；`lvalue expected`（值接收者不是左值）；其它情况按普通成员访问报 `field not found: f` |
 | C21 | 结构体到接口的转换要求接口的每个方法都在**转换点之前**可见且签名兼容 | `'T' does not implement interface 'I': missing method 'm'`；`method 'm' of 'I' has an incompatible return type` / `… parameter` / `… wrong number of parameters` |
 | C22 | `[:]` 的元素必须是完整对象类型（不能是 `void`、函数、不完整类型或 VLA），且不能是 `error` | `'[:]' cannot have a 'void' element type`；`'[:]' requires a complete element type, not 'T'`；`'[:]' cannot have a function element type`；`'[:]' cannot have a variable length array element`；`'error' can only be a return type, not a slice element` |
 | C23 | 切片的 struct/union/enum 元素必须在文件作用域声明（函数内的局部 tag 会随块退出释放） | `the element type of '[:]' must be declared at file scope, but 'T' is local` |
@@ -1436,17 +1456,22 @@ pkg.member                       (* 'pkg' 已 import，或就是当前包 *)
 `.field` 交回普通成员访问，所以 `pkg.obj.field` 可用。第一段若命中
 当前可见的普通标识符，则**不**做包解析（保持 C 的成员访问语义）。
 
-**R8 — 方法调用 `p->f(args)`**
+**R8 — 方法调用 `p->f(args)` / `v.f(args)`**
 
 ```
 p->f(args)                       (* T 有方法 f，且没有同名字段 *)
 =>
     T_f(p, args)                 (* 符号按接收者取名，调用约定不变 *)
+
+v.f(args)                        (* V 有方法 f，且没有同名字段；v 是左值 *)
+=>
+    T_f(&v, args)                (* 值接收者取地址，和 f(&v, args) 同一个调用 *)
 ```
 
 接收者先求值并存入一个临时槽，再作为第一个实参压栈：若方法返回结构体，
 隐藏的 `self` 排在 sret 缓冲之后。`T_f` 就是方法定义处输出的符号
 （见 3.2；`static`/`inline`、`__` 开头和系统头文件里的声明保留原名）。
+接口值上的 `.` 调用不走这条：它按 vtable 分派（R9 之后的接口规则）。
 
 （`package` 已经删除，方法不再有「包内保留原名」这一种情况。）
 
@@ -2165,7 +2190,6 @@ int main(void)
 | `int x = Vec;`（tag 当值用） | tag 只在类型位置生效：`'Vec' undeclared` |
 | `math.add(1, 2)` 而此前没有 `import math;` | 约束 C14 |
 | `impl Shape for Circle { … }` | `impl` 不再是关键字，按普通声明解析而报错；改用「结构体拥有方法」实现接口 |
-| `v.f()`（值是结构体而不是指针） | 按普通成员访问报 `field not found: f`；方法调用只支持 `->` |
 | `p->f`（方法不带调用） | 约束 C20：`method 'f' must be called` |
 | 方法在使用点之后才声明 | 约束 C20/C21（TCC 单趟编译） |
 | `area(p)` 而 `area` 服务两个结构体 | 普通调用名是弱别名，只指向本 TU 里第一个取到该名字的方法；要明确调用写 `p->area()` |
