@@ -1,0 +1,390 @@
+/* std/sort：比较器驱动的排序与查找。
+ *
+ *     import std.sort;
+ *
+ *     int cmp_int(const void *a, const void *b)
+ *     {
+ *         int x = *(const int *)a, y = *(const int *)b;
+ *         return (x > y) - (x < y);
+ *     }
+ *
+ *     int a[5] = { 5, 2, 4, 1, 3 };
+ *     sort_int(a, 5);              // 最常用：升序
+ *
+ *     sort_bytes(a, 5, sizeof(int), cmp_int);   // 任意元素大小 + 自己的比较器
+ *     int i = find_int(a, 5, 3);                // 已排序数组里的二分查找
+ *
+ * 为什么比较器是 `const void *` 而不是泛型函数：c6 没有泛型函数指针，
+ * 但 C 函数指针能用，`sizeof(void *)` 是固定的，因此排序内核完全不依赖
+ * 元素类型——元素大小由调用方给字节数。比较器返回 `<0 / 0 / >0`，和
+ * `qsort` 的约定一致。
+ *
+ * 算法：小于 12 个元素时用插入排序（元素少时最快、且是稳定的），否则用
+ * 自底向上归并——归并排序**稳定**、不做递归、额外内存用 `calloc`。稳定
+ * 意味着相等元素保持原次序，这对「先按名字排、再按年龄排」这类多级排序
+ * 很重要。
+ */
+#include <string.h>
+#include <stdlib.h>
+
+module std.sort;
+import std.types;
+import std.err;
+
+/* ---- 比较器 ---- */
+
+/* 升序用的三种常见比较器：返回 <0 / 0 / >0，不会因相减溢出 */
+int cmp_int(const void *a, const void *b)
+{
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+
+    return (x > y) - (x < y);
+}
+
+int cmp_u32(const void *a, const void *b)
+{
+    u32 x = *(const u32 *)a;
+    u32 y = *(const u32 *)b;
+
+    return (x > y) - (x < y);
+}
+
+int cmp_f64(const void *a, const void *b)
+{
+    f64 x = *(const f64 *)a;
+    f64 y = *(const f64 *)b;
+
+    return (x > y) - (x < y);
+}
+
+/* ---- 底层：按字节的原语 ---- */
+
+/* 元素移动：等价于 `memcpy(dst, src, size)`，单独拆出来是为了让归并内核
+   只依赖这一个函数（元素大小、类型都无关）。 */
+static void move_elem(void *dst, const void *src, usize size)
+{
+    memcpy(dst, src, size);
+}
+
+/* 内部用：把 a、b 两个元素按字节交换 */
+static void swap_bytes(void *a, void *b, usize size)
+{
+    u8 tmp[16] = { 0 };
+    u8 *pa = (u8 *)a;
+    u8 *pb = (u8 *)b;
+    usize i = 0;
+    u8 t = 0;
+
+    if (size <= 16) {
+        memcpy(tmp, pa, size);
+        memcpy(pa, pb, size);
+        memcpy(pb, tmp, size);
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        t = pa[i];
+        pa[i] = pb[i];
+        pb[i] = t;
+    }
+}
+
+/* 插入排序：调用方保证 base 可写、n >= 1。稳定。 */
+static void insertion_sort(void *base, usize n, usize size,
+                           int (*cmp)(const void *, const void *))
+{
+    u8 *p = (u8 *)base;
+    u8 *tmp = 0;
+    usize i = 0, j = 0;
+
+    if (n < 2 || size == 0)
+        return;
+    tmp = (u8 *)calloc(1, size);
+    if (tmp == 0) {
+        /* 没有暂存空间时退化成两两交换（不稳定，但不会失败） */
+        for (i = 1; i < n; i++)
+            for (j = i; j > 0 && cmp(p + (j - 1) * size, p + j * size) > 0; j--)
+                swap_bytes(p + (j - 1) * size, p + j * size, size);
+        return;
+    }
+    for (i = 1; i < n; i++) {
+        int done = 0;
+
+        move_elem(tmp, p + i * size, size);
+        for (j = i; j > 0 && !done; j--) {
+            if (cmp(p + (j - 1) * size, tmp) <= 0) {
+                done = 1;
+                break;
+            }
+            move_elem(p + j * size, p + (j - 1) * size, size);
+        }
+        move_elem(p + j * size, tmp, size);
+    }
+    free(tmp);
+}
+
+/* 主体：稳定归并排序（自底向上，不用递归栈）。
+   返回 0 成功；分配暂存失败返回 -1（此时数组内容不变）。 */
+int sort_bytes(void *base, int n, usize size,
+               int (*cmp)(const void *, const void *))
+{
+    u8 *a = (u8 *)base;
+    u8 *tmp = 0;
+    usize width = 1;
+    int len = n;
+
+    if (size == 0 || n < 2)
+        return 0;
+    if (n < 12) {
+        insertion_sort(base, (usize)len, size, cmp);
+        return 0;
+    }
+    tmp = (u8 *)calloc((usize)len, size);
+    if (tmp == 0)
+        return -1;
+    for (width = 1; (int)width < len; width *= 2) {
+        usize lo = 0;
+
+        for (lo = 0; lo < (usize)len; lo += 2 * width) {
+            usize mid = lo + width;
+            usize hi = lo + 2 * width;
+            usize i = lo, j = 0, k = 0;
+
+            if (mid > (usize)len)
+                mid = (usize)len;
+            if (hi > (usize)len)
+                hi = (usize)len;
+            j = mid;
+            k = lo;
+            while (i < mid && j < hi) {
+                /* <= 取左边：相等时左边先出，保证稳定 */
+                if (cmp(a + i * size, a + j * size) <= 0)
+                    move_elem(tmp + (k++) * size, a + (i++) * size, size);
+                else
+                    move_elem(tmp + (k++) * size, a + (j++) * size, size);
+            }
+            while (i < mid)
+                move_elem(tmp + (k++) * size, a + (i++) * size, size);
+            while (j < hi)
+                move_elem(tmp + (k++) * size, a + (j++) * size, size);
+            /* 这一段已经有序，直接搬回原位，下一轮在 a 上继续 */
+            move_elem(a + lo * size, tmp + lo * size, (hi - lo) * size);
+        }
+    }
+    free(tmp);
+    return 0;
+}
+
+/* 反向比较器包装：把 cmp 的结果取反，用来排降序。
+   注意别对同一个比较器重复包两次（那等于没包）。 */
+typedef int (*CmpFn)(const void *, const void *);
+
+/* 这个文件只提供「升序 + 稳定」，降序在调用方把两个参数对调即可：
+   `cmp_desc` 就是给常用的 int 降序准备的。 */
+int cmp_int_desc(const void *a, const void *b) { return cmp_int(b, a); }
+
+/* ---- 定型快捷函数（最常用的写法） ---- */
+
+/* int/升序；失败返回 -1（只有元素很多、内存不够时才可能） */
+int sort_int(int *a, int n)
+{
+    return sort_bytes(a, n, sizeof(int), cmp_int);
+}
+
+int sort_u32(u32 *a, int n)
+{
+    return sort_bytes(a, n, sizeof(u32), cmp_u32);
+}
+
+int sort_f64(f64 *a, int n)
+{
+    return sort_bytes(a, n, sizeof(f64), cmp_f64);
+}
+
+/* ---- 二分查找（要求数组已按同一个 cmp 升序排好） ---- */
+
+/* 命中返回下标；没命中返回**应该插入的位置**的相反数减一
+   （即 -(ins) - 1，和 Java 的 binarySearch 一样），调用方可以据此插入
+   又不打乱顺序：想「插入后仍有序」就插在 `-r - 1` 的位置。 */
+int find_bytes(const void *base, int n, usize size, const void *key,
+               int (*cmp)(const void *, const void *))
+{
+    const u8 *a = (const u8 *)base;
+    int lo = 0;
+    int hi = n;
+
+    if (size == 0 || n <= 0)
+        return -1;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        int c = cmp(a + (usize)mid * size, key);
+
+        if (c == 0)
+            return mid;
+        if (c < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return -(lo) - 1;
+}
+
+int find_int(const int *a, int n, int key)
+{
+    return find_bytes(a, n, sizeof(int), &key, cmp_int);
+}
+
+int find_u32(const u32 *a, int n, u32 key)
+{
+    return find_bytes(a, n, sizeof(u32), &key, cmp_u32);
+}
+
+/* 有序数组里「第一个 >= key」的下标（n 表示全部元素都小） */
+int lower_bound_int(const int *a, int n, int key)
+{
+    int lo = 0;
+    int hi = n;
+
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+
+        if (a[mid] < key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* 有序数组里「第一个 > key」的下标 */
+int upper_bound_int(const int *a, int n, int key)
+{
+    int lo = 0;
+    int hi = n;
+
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+
+        if (a[mid] <= key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* 是否已按 cmp 升序（相邻两两比较，调试断言用） */
+int is_sorted_bytes(const void *base, int n, usize size,
+                    int (*cmp)(const void *, const void *))
+{
+    const u8 *a = (const u8 *)base;
+    int i = 0;
+
+    for (i = 1; i < n; i++)
+        if (cmp(a + (usize)(i - 1) * size, a + (usize)i * size) > 0)
+            return 0;
+    return 1;
+}
+
+int is_sorted_int(const int *a, int n) { return is_sorted_bytes(a, n, sizeof(int), cmp_int); }
+
+/* 相邻等值元素保持原次序：稳定性自测用的比较器见 test 块。 */
+
+/* ---- 自测 ---- */
+
+/* 稳定性自测专用：只比低 4 位，高位是原始序号 */
+static int cmp_low4(const void *a, const void *b)
+{
+    int x = *(const int *)a & 0xf;
+    int y = *(const int *)b & 0xf;
+
+    return (x > y) - (x < y);
+}
+
+test "sort_int 升序，小数组与大数组两条路径" {
+    int a[5] = { 5, 2, 4, 1, 3 };
+    int b[20] = { 19, 3, 17, 1, 8, 2, 15, 4, 11, 6, 13, 5, 18, 7, 16, 9,
+                  14, 10, 12, 0 };
+    int i = 0;
+
+    if (sort_int(a, 5) != 0)
+        return err(1, "sort_int 失败");
+    for (i = 1; i < 5; i++)
+        if (a[i - 1] > a[i])
+            return err(2, "小数组没排好");
+    if (sort_int(b, 20) != 0)
+        return err(3, "sort_int 大数组失败");
+    for (i = 0; i < 20; i++)
+        if (b[i] != i)
+            return err(4, "大数组结果不对");
+    if (!is_sorted_int(b, 20))
+        return err(5, "is_sorted_int 应为真");
+}
+
+test "sort_bytes 能让任意元素大小排好" {
+    int a[6] = { 9, -3, 0, 7, -1, 2 };
+
+    if (sort_bytes(a, 6, sizeof(int), cmp_int) != 0)
+        return err(6, "sort_bytes 失败");
+    if (a[0] != -3 || a[1] != -1 || a[5] != 9)
+        return err(7, "sort_bytes 结果不对");
+}
+
+test "排序是稳定的：相等元素的原始次序不变" {
+    /* 用 int 的低 4 位当排序键、高位当原始序号，比较只看低 4 位 */
+    int a[8] = { 0x03, 0x00, 0x13, 0x02, 0x20, 0x12, 0x01, 0x21 };
+    int i = 0, lastkey = -1, lastidx = -1;
+
+    sort_bytes(a, 8, sizeof(int), cmp_low4);
+    for (i = 0; i < 8; i++) {
+        int key = a[i] & 0xf;
+        int idx = a[i] >> 4;
+
+        if (key < lastkey)
+            return err(8, "稳定性排序没按 key 递增");
+        if (key == lastkey && idx < lastidx)
+            return err(9, "相等元素被打乱了次序（不稳定）");
+        lastkey = key;
+        lastidx = idx;
+    }
+}
+
+test "find_int 命中返回下标，没命中返回 -(插入点)-1" {
+    int a[5] = { 10, 20, 30, 40, 50 };
+
+    if (find_int(a, 5, 10) != 0 || find_int(a, 5, 30) != 2 || find_int(a, 5, 50) != 4)
+        return err(10, "find_int 命中下标不对");
+    if (find_int(a, 5, 25) != -3)
+        return err(11, "没命中应返回 -(2)-1");
+    if (find_int(a, 5, 5) != -1)
+        return err(12, "小于全部应返回 -(0)-1");
+    if (find_int(a, 5, 99) != -6)
+        return err(13, "大于全部应返回 -(5)-1");
+    if (find_int(a, 0, 1) != -1)
+        return err(14, "空数组应返回 -1");
+}
+
+test "lower_bound / upper_bound" {
+    int a[6] = { 1, 2, 2, 2, 5, 7 };
+
+    if (lower_bound_int(a, 6, 2) != 1 || upper_bound_int(a, 6, 2) != 4)
+        return err(15, "2 的上下界不对");
+    if (lower_bound_int(a, 6, 3) != 4 || upper_bound_int(a, 6, 3) != 4)
+        return err(16, "3 的上下界不对");
+    if (upper_bound_int(a, 6, 7) != 6)
+        return err(17, "大于全部的上界应为 n");
+}
+
+test "f64 与降序" {
+    f64 f[4] = { 2.5, -1.0, 3.25, 0.0 };
+    int a[4] = { 1, 3, 2, 4 };
+
+    if (sort_f64(f, 4) != 0)
+        return err(18, "sort_f64 失败");
+    if (f[0] != -1.0 || f[3] != 3.25)
+        return err(19, "f64 排序结果不对");
+    if (sort_bytes(a, 4, sizeof(int), cmp_int_desc) != 0)
+        return err(20, "降序排序失败");
+    if (a[0] != 4 || a[3] != 1)
+        return err(21, "降序结果不对");
+}

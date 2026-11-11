@@ -1,0 +1,451 @@
+/* std/time：单调时钟、墙钟与日期时间的换算。
+ *
+ *     import std.time;
+ *
+ *     u64 t0 = now_ns();
+ *     ... 干活 ...
+ *     printf("%llu ms\n", (now_ns() - t0) / 1000000ull);
+ *
+ *     Duration d = duration_ms(3725);          // 3.725 秒
+ *     Buf... 或 char buf[32];
+ *     format_duration(&d, buf, sizeof(buf));   // "1h2m5.000s"
+ *
+ * 两个时钟：
+ * - `now_ns()`：单调时钟（CLOCK_MONOTONIC），只用来算**间隔**，绝对值和
+ *   系统时间无关，重启/对时就可能变；
+ * - `now_unix()` / `now_ms()`：墙钟（CLOCK_REALTIME），是「现在几点」。
+ *
+ * 日期换算自己算：libtcc1 不带 `localtime`，freestanding 目标也没有，所以
+ * `civil_from_unix()` 用经典的「以 1970-03-01 为年首」算法，纯整数、无时区
+ * （UTC）。要本地时区请在调用方加偏移。
+ */
+#include <string.h>
+#include <time.h>
+
+module std.time;
+import std.types;
+import std.err;
+
+/* 常见的纳秒换算，够用时省得写零 */
+enum Units {
+    NS_PER_MS   = 1000000,
+    NS_PER_SEC  = 1000000000,
+    MS_PER_SEC  = 1000,
+    SEC_PER_MIN = 60,
+    SEC_PER_HOUR = 3600,
+    SEC_PER_DAY = 86400,
+};
+
+/* 单调时钟的纳秒计数（只用来算差值） */
+u64 now_ns(void)
+{
+    struct timespec ts = { 0, 0 };
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+
+/* 单调时钟的毫秒计数 */
+u64 now_ms(void)
+{
+    return now_ns() / 1000000ull;
+}
+
+/* 墙钟：Unix 纪元以来的秒数 */
+i64 now_unix(void)
+{
+    struct timespec ts = { 0, 0 };
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (i64)ts.tv_sec;
+}
+
+/* 墙钟：Unix 纪元以来的毫秒数 */
+i64 now_unix_ms(void)
+{
+    struct timespec ts = { 0, 0 };
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (i64)ts.tv_sec * 1000ll + (i64)(ts.tv_nsec / 1000000);
+}
+
+/* 睡一会儿：秒 + 纳秒（超出范围由 nanosleep 自己判） */
+int sleep_ns(i64 sec, long nsec)
+{
+    struct timespec ts = { 0, 0 };
+
+    if (sec < 0 || nsec < 0)
+        return -1;
+    ts.tv_sec = (long)sec;
+    ts.tv_nsec = nsec;
+    return nanosleep(&ts, 0) == 0 ? 0 : -1;
+}
+
+int sleep_ms(int ms)
+{
+    if (ms < 0)
+        return -1;
+    return sleep_ns(ms / 1000, (long)(ms % 1000) * 1000000L);
+}
+
+/* ---- 时长 ---- */
+
+/* 一个时长：拆成 天/时/分/秒/纳秒。纯值，可以按值传参。 */
+struct Duration {
+    int days;
+    int hours;
+    int mins;
+    int secs;
+    int nanos;
+};
+
+/* 毫秒 -> Duration（负数按 0 处理，时长没有负的） */
+Duration duration_ms(i64 ms)
+{
+    Duration d = { 0, 0, 0, 0, 0 };
+    i64 rest = ms > 0 ? ms : 0;
+
+    d.days = (int)(rest / 86400000ll);
+    rest %= 86400000ll;
+    d.hours = (int)(rest / 3600000ll);
+    rest %= 3600000ll;
+    d.mins = (int)(rest / 60000ll);
+    rest %= 60000ll;
+    d.secs = (int)(rest / 1000ll);
+    d.nanos = (int)((rest % 1000ll) * 1000000ll);
+    return d;
+}
+
+/* 秒 -> Duration */
+Duration duration_s(i64 sec)
+{
+    return duration_ms(sec > 0 ? sec * 1000ll : 0);
+}
+
+/* 两个时间点（纳秒）之间的 Duration，按差的绝对值算 */
+Duration duration_between(u64 a, u64 b)
+{
+    u64 d = a > b ? a - b : b - a;
+
+    return duration_ms((i64)(d / 1000000ull));
+}
+
+/* 总毫秒数（方便再塞回别的接口） */
+i64 duration_total_ms(Duration *self)
+{
+    return (i64)self->days * 86400000ll + (i64)self->hours * 3600000ll +
+           (i64)self->mins * 60000ll + (i64)self->secs * 1000ll +
+           (i64)(self->nanos / 1000000);
+}
+
+/* 内部：写无符号十进制，返回新的 k */
+static int append_uint(char *dst, u32 v)
+{
+    char tmp[12] = { 0 };
+    int k = 0, i = 0;
+
+    do {
+        tmp[k++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0u);
+    for (i = k - 1; i >= 0; i--)
+        dst[i] = tmp[k - 1 - i];
+    return k;
+}
+
+/* 从 dst + off 开始写无符号十进制，返回新的总长度（= off + 位数） */
+static int append_uint_at(char *dst, int off, u32 v)
+{
+    return off + append_uint(dst + off, v);
+}
+
+static void append_str(char *dst, int *k, char *s)
+{
+    int i = 0;
+
+    while (s[i]) {
+        dst[*k] = s[i];
+        (*k)++;
+        i++;
+    }
+}
+
+/* 毫秒 [0,999] 写成三位，补零 */
+static int append_frac3(char *dst, int ms)
+{
+    dst[0] = (char)('0' + (ms / 100) % 10);
+    dst[1] = (char)('0' + (ms / 10) % 10);
+    dst[2] = (char)('0' + ms % 10);
+    return 3;
+}
+
+static int put_nd(char *dst, int v, int width)
+{
+    int i = 0;
+
+    for (i = width - 1; i >= 0; i--) {
+        dst[i] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    return width;
+}
+
+/* 格式化：<<"1d2h3m4s"、"5.250s"、"12ms"、"800us">>。
+   把结果写进 dst（含 NUL），返回长度；空间不够返回 -1 且不写半截。
+   规则：有天后就不再写秒的零头；不足 1 秒时按 ms / us 选单位。 */
+int format_duration(Duration *self, char *dst, int cap)
+{
+    char tmp[64] = { 0 };
+    int k = 0, i = 0;
+    int total_ms = self->days * 86400000 + self->hours * 3600000 +
+                   self->mins * 60000 + self->secs * 1000 +
+                   self->nanos / 1000000;
+
+    if (cap <= 0)
+        return -1;
+    if (total_ms < 1000 && total_ms >= 0 && self->days == 0) {
+        /* 不足一秒：ms 或 us */
+        int us = total_ms * 1000 + self->nanos / 1000 % 1000;
+
+        if (total_ms > 0 || self->nanos >= 1000000) {
+            k = append_uint_at(tmp, k, (u32)total_ms);
+            append_str(tmp, &k, "ms");
+        } else if (us > 0) {
+            k = append_uint_at(tmp, k, (u32)(self->nanos / 1000));
+            append_str(tmp, &k, "us");
+        } else {
+            append_str(tmp, &k, "0s");
+        }
+    } else {
+        if (self->days > 0) {
+            k = append_uint_at(tmp, k, (u32)self->days);
+            append_str(tmp, &k, "d");
+        }
+        if (self->hours > 0 || self->days > 0) {
+            k = append_uint_at(tmp, k, (u32)self->hours);
+            append_str(tmp, &k, "h");
+        }
+        if (self->mins > 0 || self->hours > 0 || self->days > 0) {
+            k = append_uint_at(tmp, k, (u32)self->mins);
+            append_str(tmp, &k, "m");
+        }
+        k = append_uint_at(tmp, k, (u32)self->secs);
+        if (self->days == 0 && self->hours == 0 && self->mins == 0 &&
+            self->nanos > 0) {
+            append_str(tmp, &k, ".");
+            k += append_frac3(tmp + k, self->nanos / 1000000);
+        }
+        append_str(tmp, &k, "s");
+    }
+    if (cap <= k)
+        return -1;
+    memcpy(dst, tmp, (usize)k);
+    dst[k] = 0;
+    i = k;
+    return i;
+}
+
+/* ---- 日历 ---- */
+
+/* 拆好的日期时间（UTC）。纯值结构体，按值传参。 */
+struct Civil {
+    int year;    /* 1970.. */
+    int month;   /* 1..12 */
+    int day;     /* 1..31 */
+    int hour;    /* 0..23 */
+    int min;     /* 0..59 */
+    int sec;     /* 0..59 */
+    int wday;    /* 0=周日 .. 6=周六 */
+};
+
+/* Unix 秒 -> Civil（UTC），纯整数算法，不依赖 localtime */
+Civil civil_from_unix(i64 t)
+{
+    Civil c = { 0, 0, 0, 0, 0, 0, 0 };
+    i64 days = 0, secs = 0;
+    i64 z = 0, era = 0, doe = 0, yoe = 0, y = 0, doy = 0, mp = 0, d = 0, m = 0;
+
+    if (t < 0)
+        t = 0;
+    days = t / 86400ll;
+    secs = t % 86400ll;
+    c.hour = (int)(secs / 3600ll);
+    c.min = (int)((secs % 3600ll) / 60ll);
+    c.sec = (int)(secs % 60ll);
+    c.wday = (int)((days + 4ll) % 7ll);   /* 1970-01-01 是周四 */
+
+    /* Howard Hinnant 的 civil_from_days：以 0000-03-01 为年首 */
+    z = days + 719468ll;
+    era = (z >= 0 ? z : z - 146096ll) / 146097ll;
+    doe = z - era * 146097ll;
+    yoe = (doe - doe / 1460ll + doe / 36524ll - doe / 146096ll) / 365ll;
+    y = yoe + era * 400ll;
+    doy = doe - (365ll * yoe + yoe / 4ll - yoe / 100ll);
+    mp = (5ll * doy + 2ll) / 153ll;
+    d = doy - (153ll * mp + 2ll) / 5ll + 1ll;
+    m = mp < 10ll ? mp + 3ll : mp - 9ll;
+    c.year = (int)(m <= 2ll ? y + 1ll : y);
+    c.month = (int)m;
+    c.day = (int)d;
+    return c;
+}
+
+/* Civil -> Unix 秒（civil_from_unix 的逆） */
+i64 unix_from_civil(Civil *c)
+{
+    i64 y = (i64)c->year;
+    i64 m = (i64)c->month;
+    i64 d = (i64)c->day;
+    i64 days = 0, era = 0, doe = 0, yoe = 0, doy = 0, mp = 0;
+
+    if (m <= 2) {
+        y -= 1;
+        mp = m + 9;
+    } else {
+        mp = m - 3;
+    }
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = y - era * 400;
+    doy = (153 * mp + 2) / 5 + d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    days = era * 146097 + doe - 719468;
+    return days * 86400ll + (i64)c->hour * 3600ll + (i64)c->min * 60ll +
+           (i64)c->sec;
+}
+
+/* ISO 8601：<<"1970-01-02 03:04:05">>（UTC）。返回长度，放不下 -1。 */
+int format_civil(Civil *c, char *dst, int cap)
+{
+    char tmp[32] = { 0 };
+    int k = 0;
+
+    k = put_nd(tmp, c->year, 4);
+    tmp[k++] = '-';
+    k += put_nd(tmp + k, c->month, 2);
+    tmp[k++] = '-';
+    k += put_nd(tmp + k, c->day, 2);
+    tmp[k++] = ' ';
+    k += put_nd(tmp + k, c->hour, 2);
+    tmp[k++] = ':';
+    k += put_nd(tmp + k, c->min, 2);
+    tmp[k++] = ':';
+    k += put_nd(tmp + k, c->sec, 2);
+    if (cap <= k)
+        return -1;
+    memcpy(dst, tmp, (usize)k);
+    dst[k] = 0;
+    return k;
+}
+
+/* ---- 自测 ---- */
+
+test "now_ns / now_ms 单调不减" {
+    u64 a = now_ns();
+    u64 b = now_ns();
+    u64 m1 = now_ms();
+    u64 m2 = 0;
+
+    if (b < a)
+        return err(1, "now_ns 倒退");
+    if (b == 0)
+        return err(2, "now_ns 返回 0");
+    m2 = now_ms();
+    if (m2 < m1)
+        return err(3, "now_ms 倒退");
+}
+
+test "墙钟是 2020 年以后" {
+    i64 t = now_unix();
+
+    /* 1600000000 = 2020-09-13；时钟没设成 1970 就说明 CLOCK_REALTIME 通了 */
+    if (t < 1600000000ll)
+        return err(4, "now_unix 看起来还是 1970");
+    if (now_unix_ms() / 1000ll != t && now_unix_ms() / 1000ll != t + 1)
+        return err(5, "now_unix_ms 与 now_unix 不一致");
+}
+
+test "duration_ms 拆分与回转" {
+    Duration d = duration_ms(3725000ll);
+
+    if (d.hours != 1 || d.mins != 2 || d.secs != 5 || d.days != 0)
+        return err(6, "3725000ms 拆分不对");
+    if (d.nanos != 0)
+        return err(7, "整秒的 nanos 应为 0");
+    if (duration_total_ms(&d) != 3725000ll)
+        return err(8, "回转不一致");
+    d = duration_ms(-5);
+    if (d.days != 0 || d.secs != 0)
+        return err(9, "负时长应当按 0 处理");
+    d = duration_ms(86400000ll + 3600000ll);
+    if (d.days != 1 || d.hours != 1)
+        return err(10, "跨天拆分不对");
+}
+
+test "duration_between 与 format_duration" {
+    char buf[32] = { 0 };
+    Duration d = duration_ms(3725000ll);
+    Duration small = duration_ms(12);
+    Duration frac = duration_ms(5250);
+    u64 a = 1000000000ull;
+    u64 b = 1000000000ull + 500000000ull;
+
+    if (format_duration(&d, buf, sizeof(buf)) <= 0)
+        return err(11, "format_duration 失败");
+    if (strcmp(buf, "1h2m5s") != 0)
+        return err(12, "整时长格式不对");
+    if (format_duration(&small, buf, sizeof(buf)) <= 0 || strcmp(buf, "12ms") != 0)
+        return err(13, "毫秒格式不对");
+    if (format_duration(&frac, buf, sizeof(buf)) <= 0 || strcmp(buf, "5.250s") != 0)
+        return err(14, "带小数秒格式不对");
+    if (format_duration(&d, buf, 3) != -1)
+        return err(15, "空间不够应当返回 -1");
+    if (duration_between(a, b).nanos != 500000000)
+        return err(16, "duration_between 不对");
+}
+
+test "civil_from_unix / unix_from_civil 互逆" {
+    Civil c = civil_from_unix(0);
+    i64 back = 0;
+    Civil e = { 2024, 2, 29, 12, 30, 45, 0 };
+    i64 t = unix_from_civil(&e);
+
+    if (c.year != 1970 || c.month != 1 || c.day != 1 || c.hour != 0)
+        return err(17, "epoch 拆出来不对");
+    if (c.wday != 4)
+        return err(18, "1970-01-01 应当是周四");
+    back = unix_from_civil(&c);
+    if (back != 0)
+        return err(19, "epoch 回转不是 0");
+    if (t != 1709209845ll)
+        return err(20, "2024-02-29 12:30:45 的时间戳不对");
+    c = civil_from_unix(t);
+    if (c.year != 2024 || c.month != 2 || c.day != 29 || c.hour != 12)
+        return err(21, "闰日回转不对");
+}
+
+test "format_civil 输出 ISO 8601" {
+    char buf[32] = { 0 };
+    Civil c = civil_from_unix(0);
+    Civil d = { 2024, 2, 29, 1, 2, 3, 0 };
+
+    if (format_civil(&c, buf, sizeof(buf)) != 19)
+        return err(22, "ISO 格式长度应当是 19");
+    if (strcmp(buf, "1970-01-01 00:00:00") != 0)
+        return err(23, "epoch 的 ISO 文本不对");
+    if (format_civil(&d, buf, sizeof(buf)) <= 0 ||
+        strcmp(buf, "2024-02-29 01:02:03") != 0)
+        return err(24, "闰日的 ISO 文本不对");
+    if (format_civil(&d, buf, 5) != -1)
+        return err(25, "空间不够应当返回 -1");
+}
+
+test "sleep_ms 真的会等" {
+    u64 t0 = now_ms();
+    u64 dt = 0;
+
+    if (sleep_ms(20) != 0)
+        return err(26, "sleep_ms 失败");
+    dt = now_ms() - t0;
+    if (dt < 20)
+        return err(27, "sleep_ms 没等够");
+}

@@ -166,6 +166,37 @@ struct Map@(K, V) {
 
     int has(K k) { return find(&k) >= 0; }
 
+    /* 命中返回值，没命中返回 dflt（省掉 get + 判断两句） */
+    V get_or(K k, V dflt)
+    {
+        int i = find(&k);
+
+        if (i < 0)
+            return dflt;
+        return vals[i];
+    }
+
+    /* 命中则改成 v 并返回 1；没命中不改、返回 0（**不插入**，要插入用 put） */
+    int set(K k, V v)
+    {
+        int i = find(&k);
+
+        if (i < 0)
+            return 0;
+        vals[i] = v;
+        return 1;
+    }
+
+    /* 没有就插入、有就原样不动：返回 1 表示本次插入，0 表示本来就有。
+       常用来做去重 /「首次出现」计数。 */
+    int!error put_new(K k, V v)
+    {
+        if (find(&k) >= 0)
+            return 0;
+        try put(k, v);        /* 原样转发 */
+        return 1;
+    }
+
     /* 删除：留墓碑，容量不回收 */
     int remove(K k)
     {
@@ -345,4 +376,29 @@ test "键是指针，值是结构体" {
         return err(33, "指针键取值不对");
     if (m->get(&b, &out) != 0)
         return err(34, "不同的指针键命中了");
+}
+
+test "get_or / set / put_new" {
+    @Map@(int, int) m = new Map@(int, int);
+    int got = 0;
+    int ins = 0;
+
+    m->put(1, 100) catch e { return err(60, "put 失败"); };
+    if (m->get_or(1, -1) != 100)
+        return err(61, "get_or 命中的值不对");
+    if (m->get_or(2, -1) != -1)
+        return err(62, "get_or 没命中应给默认值");
+    if (m->set(1, 111) != 1 || m->get_or(1, 0) != 111)
+        return err(63, "set 命中没改成新值");
+    if (m->set(2, 222) != 0 || m->has(2) != 0)
+        return err(64, "set 没命中不该插入");
+    m->put_new(3, 300) catch e { return err(65, "put_new 首次失败"); };
+    if (m->has(3) != 1)
+        return err(66, "put_new 首次应插入");
+    m->put_new(3, 999) catch e { return err(70, "put_new 已存在不该报错"); };
+    if (m->get_or(3, 0) != 300)
+        return err(68, "put_new 已存在不该覆盖");
+    got = m->count();
+    if (got != 2)
+        return err(69, "最终 count 不对");
 }
