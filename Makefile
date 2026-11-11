@@ -15,6 +15,8 @@
 #   make selfhost    用 tcc 自举自己（stage1 -> stage2，比对目标文件）
 #   make c99selfhost 用 C99 后端自举自己（生成 C -> gcc -> stage2 -> stage3）
 #   make c99selfhost-tcc 同上，但生成 C 之后由 tcc 自己编译（整条链不需要 gcc）
+#   make wasmrt      编目标平台的运行库 tcc/libtcc1-<arch>.a（需要 clang）
+#   make wasmtest    tcc --target=<triple> 出 .wasm 再用 node 跑（见 docs/llvm-backend.md）
 #   make clean       清理 tcc/ 的构建产物和自举产物
 #   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
 #
@@ -125,6 +127,18 @@ fstest: build
 	./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_fstr \
 	    examples/freestanding_fstr.c6 tcc/libtcc1.a
 	./build/freestanding_fstr
+
+# wasm / 交叉目标：先编出目标运行库，再冒烟（需要 clang；跑起来需要 node）
+#   make wasmrt    只构建 tcc/libtcc1-<arch>.a
+#   make wasmtest  用 tcc --target=<triple> 出 .wasm，再用 node 跑一遍
+LLVMCC      ?= clang
+WASM_TRIPLE ?= wasm32-unknown-unknown
+
+wasmrt: build
+	LLVMCC=$(LLVMCC) ./scripts/build-wasm-runtime.sh $(WASM_TRIPLE)
+
+wasmtest: build
+	LLVMCC=$(LLVMCC) ./scripts/wasm-smoke.sh $(WASM_TRIPLE)
 
 # freestanding + 程序自己实现的 pthread 层：spawn / thread
 fstest-go: build
@@ -319,10 +333,11 @@ c99selfhost-tcc: build
 
 clean:
 	rm -rf $(SELFHOST)
+	rm -f $(TCC_DIR)/libtcc1-*.a
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true
 
 distclean:
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) distclean || true
 
 help:
-	@sed -n '2,18p' Makefile
+	@sed -n '2,20p' Makefile

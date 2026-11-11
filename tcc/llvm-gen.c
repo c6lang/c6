@@ -91,6 +91,109 @@ static const char llvm_datalayout[] =
     "f80:128-n8:16:32:64-S128";
 static const char llvm_triple[] = "x86_64-pc-linux-gnu";
 
+/* '--target=<triple>' selects another target than the host's.  Only the
+   module header changes here: the layout has to follow the triple, because a
+   module whose layout contradicts its target is rejected by LLVM, and a wrong
+   string/pointer layout silently miscompiles pointer arithmetic.  The values
+   below are the ones clang emits for the same triple.  An arch we do not know
+   gets no 'target datalayout' line at all -- LLVM then derives it from the
+   triple, which is always right. */
+static const struct LlvmTargetLayout {
+    const char *arch;           /* first component of the triple */
+    const char *datalayout;
+} l_target_layouts[] = {
+    { "x86_64",  llvm_datalayout },
+    { "aarch64", "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32" },
+    { "arm64",   "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32" },
+    { "riscv64", "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128" },
+    { "wasm32",  "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20" },
+    { "wasm64",  "e-m:e-p:64:64-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20" },
+};
+
+/* the arch component of a triple ('wasm32-unknown-unknown' -> 'wasm32') */
+static size_t l_arch_len(const char *triple)
+{
+    return triple ? strcspn(triple, "-") : 0;
+}
+
+/* NULL means "no data layout line": let LLVM derive it from the triple */
+static const char *l_datalayout(const char *triple)
+{
+    size_t n = l_arch_len(triple);
+    int i;
+
+    if (!triple || !*triple)
+        return llvm_datalayout;     /* the host default */
+    for (i = 0; i < (int)countof(l_target_layouts); i++)
+        if (strlen(l_target_layouts[i].arch) == n
+            && !strncmp(l_target_layouts[i].arch, triple, n))
+            return l_target_layouts[i].datalayout;
+    return NULL;
+}
+
+static TCCState *l_s1;         /* the state the emitter is writing for */
+
+/* The width of a pointer and of size_t on the target: 32 for the ILP32
+   triples (wasm32, i386, arm), 64 everywhere else.  It only matters for the
+   few places where the IR cannot use the front-end's LP64 model -- the memory
+   intrinsics carry the target's index type, not the host's. */
+static int l_ptr_bits(void)
+{
+    const char *t = l_s1 ? l_s1->target_triple : NULL;
+    size_t n = l_arch_len(t);
+
+    if (!n)
+        return 64;
+    if ((n == 6 && !strncmp(t, "wasm32", 6))
+        || (n == 3 && !strncmp(t, "arm", 3))
+        || (n == 5 && !strncmp(t, "thumb", 5))
+        || (n == 6 && !strncmp(t, "armv7", 5))
+        || (n == 4 && (!strncmp(t, "i386", 4) || !strncmp(t, "i486", 4)
+                       || !strncmp(t, "i586", 4) || !strncmp(t, "i686", 4))))
+        return 32;
+    return 64;
+}
+
+/* the target's index type: what a length in an llvm.mem* intrinsic is */
+static const char *l_idx_type(void)
+{
+    return l_ptr_bits() == 32 ? "i32" : "i64";
+}
+
+/* The preprocessor has to follow '--target' as well, otherwise a header that
+   asks '#ifdef __wasm__' still gets the host's answer.  Only the identity
+   macros move: the front-end's type model stays the x86-64 one (long is 64
+   bit, pointers are 64 bit), which is what every offset in the IR assumes. */
+ST_FUNC void llvm_set_target(TCCState *s1)
+{
+    const char *t = s1->target_triple;
+    size_t n;
+    int wasm, aarch64, riscv, x86;
+
+    if (!t || !*t)
+        return;
+    n = l_arch_len(t);
+    wasm = (n == 6 && !strncmp(t, "wasm32", 6)) || (n == 6 && !strncmp(t, "wasm64", 6));
+    aarch64 = (n == 7 && !strncmp(t, "aarch64", 7)) || (n == 5 && !strncmp(t, "arm64", 5));
+    riscv = n >= 5 && !strncmp(t, "riscv", 5);
+    x86 = n == 6 && !strncmp(t, "x86_64", 6);
+
+    if (x86)
+        return;                     /* target_machine_defs already says so */
+    tcc_undefine_symbol(s1, "__x86_64__");
+    tcc_undefine_symbol(s1, "__amd64__");
+    if (wasm) {
+        tcc_define_symbol(s1, "__wasm__", "1");
+        tcc_define_symbol(s1, n == 6 && t[4] == '6' ? "__wasm64__" : "__wasm32__", "1");
+    } else if (aarch64) {
+        tcc_define_symbol(s1, "__aarch64__", "1");
+    } else if (riscv) {
+        tcc_define_symbol(s1, "__riscv", "1");
+        if (strstr(t, "64"))
+            tcc_define_symbol(s1, "__riscv_xlen", "64");
+    }
+}
+
 #ifdef C6_EXT
 /* c6: the back end hands the body the frame its task owns, so an 'async'
    function needs no frame of its own and a suspension copies nothing (every
@@ -687,7 +790,6 @@ static char *l_type(char *buf, int size, CType *t)
 /* ====================================================================== */
 /* the symbol table                                                        */
 
-static TCCState *l_s1;
 
 static ElfSym *l_esym(int idx)
 {
@@ -1995,7 +2097,7 @@ static void l_arg(LBuf *args, int first, SValue *sv, CType *pt)
 static char *l_header;          /* the signature of the function being built */
 static int l_frame;
 static int l_va_used;
-static int l_memcpy_used;
+static int l_memcpy_used, l_memmove_used, l_memset_used;
 static int l_have_main;         /* this translation unit defines main() */
 static int l_skip_fn;           /* the body being generated is dropped */
 static int l_in_fn;             /* a function body is open */
@@ -2250,8 +2352,8 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
             if (cls == L_CL_INTEGER || cls == L_CL_SSE) {
                 l_emit("store %s %%a%d, ptr %s, align 1", tb, idx, a);
             } else {
-                l_emit("call void @llvm.memcpy.p0.p0.i64(ptr %s, ptr %%a%d, i64 %d, i1 false)",
-                       a, idx, size);
+                l_emit("call void @llvm.memcpy.p0.p0.%s(ptr %s, ptr %%a%d, %s %d, i1 false)",
+                       l_idx_type(), a, idx, l_idx_type(), size);
                 l_memcpy_used = 1;
             }
         } else {
@@ -2284,6 +2386,69 @@ static void l_ret_value(int bt, const char *val)
                   l_ext_i64(val, l_inttype(b), (bt & VT_UNSIGNED) != 0));
         break;
     }
+}
+
+/* The front-end hands memcpy/memmove/memset over as ordinary libcalls, but
+   such a call cannot stay a C call: the count argument has to be the target's
+   index type (i32 on wasm32), while the front-end pushes every argument as a
+   plain i64 value.  LLVM's memory intrinsics take exactly that shape, so the
+   calls are turned into them -- which also keeps the module free of a libc
+   dependency.  Returns non-zero when the call was handled. */
+static int l_mem_intrinsic(SValue *callee, int nb_args)
+{
+    const char *name = l_token_name(callee->sym);
+    int kind, aeabi = 0, count_is_second;
+    char a0[64], a1[64], a2[64], p0[32], p1[32], pl[32], pf[32];
+    const char *it = l_idx_type();
+
+    if (!name || nb_args != 3)
+        return 0;
+    if (!strcmp(name, "memset"))
+        kind = 1;
+    else if (!strcmp(name, "__aeabi_memset"))
+        kind = 1, aeabi = 1;
+    else if (!strcmp(name, "memcpy") || !strcmp(name, "__aeabi_memcpy"))
+        kind = 2;
+    else if (!strcmp(name, "memmove") || !strcmp(name, "__aeabi_memmove")
+             || !strcmp(name, "__aeabi_memmove4")
+             || !strcmp(name, "__aeabi_memmove8"))
+        kind = 3;
+    else
+        return 0;
+    /* __aeabi_memset(dst, n, byte) swaps the last two arguments */
+    count_is_second = kind == 1 && aeabi;
+    snprintf(a0, sizeof a0, "%s", l_int_value(&vtop[-nb_args + 1]));
+    snprintf(a1, sizeof a1, "%s", l_int_value(&vtop[-nb_args + 2]));
+    snprintf(a2, sizeof a2, "%s", l_int_value(&vtop[-nb_args + 3]));
+    snprintf(p0, sizeof p0, "%s", l_tmp());
+    l_emit("%s = inttoptr i64 %s to ptr", p0, a0);
+    if (kind != 1) {
+        snprintf(p1, sizeof p1, "%s", l_tmp());
+        l_emit("%s = inttoptr i64 %s to ptr", p1, a1);
+    }
+    if (kind == 1) {
+        snprintf(pf, sizeof pf, "%s", l_tmp());
+        l_emit("%s = trunc i64 %s to i8", pf, count_is_second ? a2 : a1);
+    }
+    if (l_ptr_bits() == 32) {
+        snprintf(pl, sizeof pl, "%s", l_tmp());
+        l_emit("%s = trunc i64 %s to i32", pl, count_is_second ? a1 : a2);
+    } else {
+        snprintf(pl, sizeof pl, "%s", count_is_second ? a1 : a2);
+    }
+    if (kind == 1) {
+        l_emit("call void @llvm.memset.p0.%s(ptr %s, i8 %s, %s %s, i1 false)",
+               it, p0, pf, it, pl);
+        l_memset_used = 1;
+    } else {
+        l_emit("call void @llvm.%s.p0.p0.%s(ptr %s, ptr %s, %s %s, i1 false)",
+               kind == 2 ? "memcpy" : "memmove", it, p0, p1, it, pl);
+        if (kind == 2)
+            l_memcpy_used = 1;
+        else
+            l_memmove_used = 1;
+    }
+    return 1;
 }
 
 ST_FUNC void gfunc_call(int nb_args)
@@ -2327,6 +2492,12 @@ ST_FUNC void gfunc_call(int nb_args)
     hidden_sret = ret_struct && !small_sret;
 
     save_regs(nb_args);
+
+    if (!is_indirect && callee->sym && IS_ASM_FUNC(callee->sym->type.t)
+        && l_mem_intrinsic(callee, nb_args)) {
+        vtop -= nb_args + 1;
+        return;
+    }
 
     memset(&args, 0, sizeof args);
     ps = fsym->next;
@@ -2590,6 +2761,99 @@ static int l_has_fn(const char *name)
     return 0;
 }
 
+/* Runtime helpers are declared with the prototype their call sites actually
+   use instead of the old blanket 'declare i64 @X(...)'.  Two reasons:
+   the IR stops contradicting itself (a variadic declaration next to a
+   'call ptr @X(i64, ...)' is accepted by x86-64 only because argument
+   registers are shared), and a strict linker -- wasm-ld checks call-site
+   against callee signatures and traps at run time when they differ -- sees
+   one signature per name.  A name that is not listed keeps the variadic
+   form: it is a function of another translation unit, whose prototype the
+   back-end cannot know.  Signedness does not matter here, only the machine
+   level type, which is what the IR carries. */
+static const struct LlvmProto {
+    const char *name;
+    const char *ret;
+    const char *args;
+} l_ext_protos[] = {
+    { "__c6_closure_code",   "ptr",  "ptr" },
+    { "__c6_closure_env",    "ptr",  "ptr" },
+    { "__c6_co_await",       "i32",  "ptr, ptr" },
+    { "__c6_co_destroy",     "void", "ptr" },
+    { "__c6_co_finish",      "void", "ptr, i32" },
+    { "__c6_co_kind",        "i32",  "ptr" },
+    { "__c6_co_new",         "ptr",  "ptr" },
+    { "__c6_co_restore",     "void", "ptr" },
+    { "__c6_co_rev",         "i32",  "ptr" },
+    { "__c6_co_run",         "i32",  "" },
+    { "__c6_co_set_io",      "void", "ptr, i32, i32" },
+    { "__c6_co_state",       "i32",  "ptr" },
+    { "__c6_co_suspend",     "void", "ptr, i32, i32" },
+    { "__c6_co_wait",        "i32",  "ptr" },
+    { "__c6_fmt_b",          "void", "i32, i32" },
+    { "__c6_fmt_beg",        "void", "" },
+    { "__c6_fmt_c",          "void", "ptr, i32" },
+    { "__c6_fmt_ch",         "void", "i32, i32" },
+    { "__c6_fmt_end",        "ptr",  "i32" },
+    { "__c6_fmt_f",          "void", "double, i32" },
+    { "__c6_fmt_i",          "void", "i64, i32" },
+    { "__c6_fmt_l",          "void", "ptr, i64" },
+    { "__c6_fmt_p",          "void", "ptr, i32" },
+    { "__c6_fmt_s",          "void", "ptr, i64, i32" },
+    { "__c6_fmt_sl",         "void", "ptr, i32" },
+    { "__c6_fmt_u",          "void", "i64, i32" },
+    { "__c6_gc_drain_budget", "void", "i32" },
+    { "__c6_gc_drop",        "ptr",  "ptr" },
+    { "__c6_gc_incref",      "ptr",  "ptr" },
+    { "__c6_gc_live",        "i64",  "" },
+    { "__c6_gc_move",        "ptr",  "ptr" },
+    { "__c6_gc_new",         "ptr",  "i64, i64, ptr, i32" },
+    { "__c6_gc_own_store",   "ptr",  "ptr, ptr, i32" },
+    { "__c6_gc_refcount",    "i64",  "ptr" },
+    { "__c6_gc_release",     "void", "ptr, i32" },
+    { "__c6_gc_root",        "void", "ptr, i32, i64, i64" },
+    { "__c6_gc_shutdown",    "void", "" },
+    { "__c6_gc_store",       "ptr",  "ptr, ptr, i32" },
+    { "__c6_gc_weak_store",  "ptr",  "ptr, ptr, i32" },
+    { "__c6_str_len",        "i64",  "ptr" },
+    { "__c6_task_done",      "i32",  "ptr" },
+    { "__c6_task_kind",      "i32",  "ptr" },
+    { "__c6_task_start",     "i32",  "ptr" },
+    { "__c6_task_wait",      "i32",  "ptr" },
+    { "__c6_th_join_all",    "void", "" },
+    { "__c6_th_release",     "void", "ptr" },
+    { "__c6_thread_done",    "i32",  "ptr" },
+    { "__c6_thread_join",    "i32",  "ptr" },
+    { "__c6_thread_value",   "i64",  "ptr" },
+    { "__tcc_co_spawn",      "void", "ptr" },
+    { "__tcc_err_flag_get",  "i32",  "" },
+    { "__tcc_err_flag_peek", "i32",  "i64" },
+    { "__tcc_err_id_get",    "i32",  "" },
+    { "__tcc_err_msg_get",   "ptr",  "" },
+    { "__tcc_err_set",       "void", "i32, ptr" },
+    { "__tcc_err_set_copy",  "i32",  "i64, i64" },
+    { "__tcc_iface_init",    "i32",  "i64, i64, i64" },
+    { "__tcc_slice_index",   "i32",  "i64, i64, i64, i64" },
+    { "__tcc_slice_sub",     "i32",  "i64, i64, i64, i64, i64" },
+    { "__tcc_sp_args",       "ptr",  "i64" },
+    { "__tcc_th_spawn",      "ptr",  "ptr, ptr" },
+    { "__tcc_th_start",      "i32",  "ptr, ptr" },
+    { "printf",              "i32",  "ptr, ..." },
+};
+
+/* '__tcc_err_clear' and '__tcc_error_take' are called both with and without a
+   result, so they keep the variadic declaration: a fixed prototype would make
+   the other kind of call site invalid. */
+static const struct LlvmProto *l_ext_proto(const char *name)
+{
+    int i;
+
+    for (i = 0; i < (int)countof(l_ext_protos); i++)
+        if (!strcmp(l_ext_protos[i].name, name))
+            return &l_ext_protos[i];
+    return NULL;
+}
+
 static void l_add_ctor(char ***tab, int *n, int *cap, const char *t)
 {
     if (*n >= *cap) {
@@ -2726,7 +2990,7 @@ ST_FUNC void llvm_reset(void)
     memset(&l_init, 0, sizeof l_init);
     l_init_used = 0;
     l_va_used = 0;
-    l_memcpy_used = 0;
+    l_memcpy_used = l_memmove_used = l_memset_used = 0;
     l_have_main = 0;
     for (i = 0; i < l_nstructs; i++)
         tcc_free(l_structdef[i]);
@@ -2890,8 +3154,15 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
         return -1;
     }
     fprintf(f, "; generated by the tcc LLVM back-end -- do not edit\n");
-    fprintf(f, "target datalayout = \"%s\"\n", llvm_datalayout);
-    fprintf(f, "target triple = \"%s\"\n\n", llvm_triple);
+    {
+        const char *dl = l_datalayout(s1->target_triple);
+
+        if (dl)
+            fprintf(f, "target datalayout = \"%s\"\n", dl);
+        fprintf(f, "target triple = \"%s\"\n\n",
+                s1->target_triple && *s1->target_triple
+                    ? s1->target_triple : llvm_triple);
+    }
 
     for (i = 0; i < l_nstructs; i++)
         if (l_structdef[i])
@@ -2902,7 +3173,14 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
     if (l_va_used)
         fprintf(f, "declare void @llvm.va_start.p0(ptr)\n");
     if (l_memcpy_used)
-        fprintf(f, "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
+        fprintf(f, "declare void @llvm.memcpy.p0.p0.%s(ptr, ptr, %s, i1)\n",
+                l_idx_type(), l_idx_type());
+    if (l_memmove_used)
+        fprintf(f, "declare void @llvm.memmove.p0.p0.%s(ptr, ptr, %s, i1)\n",
+                l_idx_type(), l_idx_type());
+    if (l_memset_used)
+        fprintf(f, "declare void @llvm.memset.p0.%s(ptr, i8, %s, i1)\n",
+                l_idx_type(), l_idx_type());
 
     /* one byte array per allocated data section */
     for (i = 1; i < s1->nb_sections; i++) {
@@ -2996,8 +3274,15 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
             fprintf(f, "@%s = external global i8\n", l_q(nm));
         }
     }
-    for (i = 0; i < l_nextfn; i++)
-        fprintf(f, "declare i64 @%s(...)\n", l_q(l_extfn[i]));
+    for (i = 0; i < l_nextfn; i++) {
+        const struct LlvmProto *p = l_ext_proto(l_extfn[i]);
+
+        if (p)
+            fprintf(f, "declare %s @%s(%s)\n", p->ret, l_q(l_extfn[i]),
+                    p->args);
+        else
+            fprintf(f, "declare i64 @%s(...)\n", l_q(l_extfn[i]));
+    }
 
     /* the constructor that patches the data sections */
     if (l_init_used) {

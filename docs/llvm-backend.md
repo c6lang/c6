@@ -16,8 +16,105 @@ clang -fuse-ld=lld -o out out.ll -L tcc -ltcc1
 ```
 
 判据在 `tcc/tcc.c` 的 `wants_llvm_output()`：`-o` 给出的文件名以 `.ll` 结尾，
-并且没要求 `-E / -c / -r / -shared / -M* / -run`（这些仍然走 native 语义）。
+或者命令行给了 `--target=` / `--emit-llvm`（见下一节），并且没要求
+`-E / -c / -r / -shared / -M* / -run`（这些仍然走 native 语义，`-c` 例外：
+`--target` 会把 `-c` 变成“出目标平台的可重定位目标文件”）。
 `-o <目录>` 仍然属于 C99 后端。
+
+## 直接出目标平台的文件：`--target=`
+
+`.ll` 之外还多了一条路：让它自己去调 clang 把 IR 编成目标文件，一条命令出结果。
+
+```
+tcc/tcc -B tcc --target=wasm32-unknown-unknown -o out.wasm in.c6
+tcc/tcc -B tcc --target=x86_64-pc-linux-gnu   -o out in.c6 && ./out
+```
+
+| 选项 | 作用 |
+| --- | --- |
+| `--target=<triple>` | 选 LLVM 后端，模块头写这个 triple，`-o` 是最终产物；不给 `-o` 时是 `a.out`（`-c` 时 `a.o`） |
+| `--emit-llvm` | 只要 `.ll`（等价于 `-o x.ll`，但可以配 `--target` 检查模块头） |
+| `--cc=<compiler>` | 用哪个 C 编译器转 IR，默认 `$TCC_CC`，再默认 `clang` |
+
+写了 `--target` 之后的流程是 `tcc_output_for_target()`：先把 IR 写到
+`<outfile>.ll`，再用 `llvm_tool_cc()`（`tcc/llvm-link.c`）拼出
+
+```
+<cc> --target=<triple> -fuse-ld=lld -o <outfile> <outfile>.ll -L<tcc 目录> -ltcc1
+```
+
+目标运行库按 arch 分名：有 `tcc/libtcc1-<arch>.a` 就用它，否则用
+`tcc/libtcc1.a`；两边都没有就报
+
+```
+tcc: no runtime for target 'wasm32-unknown-unknown': .../libtcc1-wasm32.a is missing
+     build it with scripts/build-wasm-runtime.sh wasm32-unknown-unknown
+```
+
+（不会拿宿主的 `libtcc1.a` 硬凑：那是 x86-64 的目标文件，链接器只会报
+`archive member ... is neither Wasm object file nor LLVM bitcode`。）
+
+### 目标运行库
+
+`libtcc1.c` 是普通 C，交叉编一遍就有了：
+
+```
+scripts/build-wasm-runtime.sh wasm32-unknown-unknown   # -> tcc/libtcc1-wasm32.a
+make wasmrt WASM_TRIPLE=wasm32-unknown-unknown         # 同上
+```
+
+脚本用 clang `--target=<triple> -O1 -c` 编 `libtcc1.c stdatomic.c builtin.c
+va_list.c dsohandle.c wasm-rt.c` 再 `llvm-ar rcs`。两处专门为目标平台让路：
+
+- `libtcc1.c` 的 x87 `long double` 帮助函数（`__fixxfdi` / `__floatundixf` …）
+  对 wasm 关掉，中间类型 `XFtype` 也退成 `double`：wasm 的 `long double` 是
+  `f128`，任何运算都会引 compiler-rt 的 `__addtf3` / `__floatditf`，而 freestanding
+  的 wasm 链接没有 compiler-rt。
+- `tcc/lib/wasm-rt.c` 提供 libc/线程的最小桩（4 MiB 静态池上的
+  `malloc/calloc/realloc/free`、`pthread_*`、`__cxa_atexit`、`select`），因为
+  wasm 模块是 `-nostdlib` 链的。
+
+### 目标 ABI 与 LP64 模型
+
+这个后端输出的 IR 一直是 LP64 模型：`long`、`size_t`、指针在 IR 里都是 `i64`
+（整个前端和 `%frmp` 偏移都按这个算）。`wasm64`/`aarch64`/`riscv64` 的 C ABI
+本来就是这样，`wasm32` 不是（它是 ILP32），所以要一层适配：
+
+- `build-wasm-runtime.sh` 编 `libtcc1.c` 时给 wasm32 加
+  `-D__c6_gc_new=__c6_gc_new_lp64` 一类改名，把带 `unsigned long` / 指针参数的
+  帮助函数编成 32 位版本；
+- `wasm-rt.c` 再用 IR 期望的 64 位签名包一层。切片那对帮助函数不能这样转调
+  （`libtcc1.c` 里 len 的位置是 `sizeof(void *)`，wasm32 上是 4，而 IR 里切片
+  恒为 `{ ptr, i64 len }`，len 在偏移 8），所以在 `wasm-rt.c` 里按 IR 布局重写。
+- 引用计数 GC 的头部字段是 `unsigned long long rc/meta`（不是 `unsigned long`）：
+  `C6_GC_DEAD` 在 bit 63，`C6_GC_META_COUNT` 占低 40 位，32 位的 `long` 装不下。
+- 内存 intrinsics 的长度参数跟随**目标的** index 类型：`llvm.memset.p0.i32` /
+  `llvm.memcpy.p0.p0.i32`（wasm32），其他目标仍是 `.i64`。前端把 `memset` /
+  `memcpy` / `memmove` 当普通 libcall 推上来，`gfunc_call()` 里
+  `l_mem_intrinsic()` 把它们转成 intrinsics，这样 wasm 模块不必再要 libc 的
+  `memset`（那里的 C 原型和 IR 的调用签名对不上：IR 是全 `i64`）。
+
+### `wasm64` 为什么要等 LLD
+
+`wasm64` 的 ABI 与 IR 的 LP64 模型天然一致，本来是最合适的目标，但 LLVM 19 的
+`wasm-ld` 给函数指针表发出的 elem 段偏移是内存地址而不是表下标：
+
+```
+table:  flags=0x05（table64）min=4 max=4
+elem:   i64.const 94545115086849, funcs=[27, 28, 107]
+```
+
+模块校验通过，一实例化就 `table index is out of bounds`。没有 elem 段的模块
+（纯计算、不引 libtcc1）能正常跑，所以这是链接器的问题，不是 IR 的问题。
+在此之前 wasm 冒烟跑 `wasm32`：
+
+```
+make wasmtest                                  # 默认 wasm32-unknown-unknown
+./scripts/wasm-smoke.sh aarch64-unknown-linux-gnu   # 只出文件，没有 node 侧验证
+```
+
+`scripts/wasm-smoke.sh` 需要 clang（编运行库、转 IR）和 node（实例化），
+缺 node 时只校验 `--emit-llvm` 的模块头。
 
 一次调用里的所有源文件合成**一个** `.ll`（与 `-o out.c` 把多个源文件合成一份
 C 完全相同）：`-test` 的测试块编号在同一个状态里递增，跨翻译单元不会撞名。
@@ -108,7 +205,7 @@ BACKEND=llvm LLVMCC=/usr/lib/llvm-19/bin/clang ./tests/run-tests.sh
 
 ## 现状
 
-`tests/` 的 98 组用例里 93 组通过（native 与 C99 后端全绿）。仍未通过：
+`tests/` 的 101 组用例里 96 组通过（native 与 C99 后端全绿）。仍未通过：
 
 - `closure` / `fn_lit` / `abi/fn_lit`：闭包（捕获环境）与函数字面量作为值传递
   时，间接调用的目标地址不对，运行期崩。`tests/closure.c6` 里能缩到“闭包捕获
@@ -127,8 +224,11 @@ BACKEND=llvm LLVMCC=/usr/lib/llvm-19/bin/clang ./tests/run-tests.sh
 | 文件 | 作用 |
 | --- | --- |
 | `tcc/llvm-gen.c` | 代码生成 + 模块拼装 |
-| `tcc/llvm-link.c` | 同名占位（不做链接，遇到请求直接报错） |
+| `tcc/llvm-link.c` | `llvm_tool_cc()`：拼 clang 命令行、找目标运行库 |
 | `tcc/tcc.c` | `wants_llvm_output()` 与 `llvm_main` 转交 |
 | `tcc/tccelf.c` | `tcc_output_file()` 分发到 `llvm_output_file()` |
 | `tcc/libtcc.c` | `TCC_OUTPUT_LLVM`、`-c`/`-test` 的输出类型 |
+| `tcc/lib/wasm-rt.c` | 目标运行库的 libc/线程桩 + ILP32 适配（只在 `__wasm__` 编） |
+| `scripts/build-wasm-runtime.sh` | 交叉编 `tcc/libtcc1-<arch>.a` |
+| `scripts/wasm-smoke.sh` | `--target` 的端到端冒烟（`make wasmtest`） |
 | `tests/run-tests.sh` | `BACKEND=llvm` 分支 |

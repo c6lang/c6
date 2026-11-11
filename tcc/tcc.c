@@ -150,6 +150,11 @@ static const char help2[] =
     "  -print-search-dirs            print search paths\n"
     "  -rstdin file                  with -run: use 'file' as custom stdin\n"
     "  -dt                           with -run/-E: auto-define 'test_...' macros\n"
+    "LLVM IR back-end (an -o name ending in .ll selects it):\n"
+    "  --target=TRIPLE               write IR for TRIPLE and let clang build\n"
+    "                                the result (e.g. wasm32-unknown-unknown)\n"
+    "  --emit-llvm                   with --target: stop at the .ll\n"
+    "  --cc=COMPILER                 build the IR with COMPILER [$TCC_CC, clang]\n"
     "Ignored options:\n"
     "  -arch -C --param -pedantic -pipe -s -traditional\n"
     "-W[no-]... warnings:\n"
@@ -303,6 +308,19 @@ static char *default_outputfile(TCCState *s, const char *first_file)
         name = "a";
     strcpy(buf, name);
     ext = tcc_fileextension(buf);
+    /* '--target=<triple>': the IR is only an intermediate file, so the default
+       output name is the artifact itself, exactly as in a native compile */
+    if (s->target_triple && !s->llvm_emit_only) {
+#ifdef TCC_TARGET_TEXT_OUT
+        if ((s->just_deps || TEXT_COMPILE_ONLY(s)) && *ext)
+#else
+        if (s->just_deps && *ext)
+#endif
+            strcpy(ext, ".o");
+        else
+            strcpy(buf, "a.out");
+        return tcc_strdup(buf);
+    }
 #ifdef TCC_TARGET_TEXT_OUT
     /* same convention as a.out, but the result is a source file; never derive
        the name from the input, that would overwrite the source itself */
@@ -466,6 +484,11 @@ static int wants_llvm_output(int argc, char **argv)
             || !strncmp(a, "-r", 2) || !strncmp(a, "-M", 2)
             || !strcmp(a, "-run") || !strcmp(a, "--run"))
             return 0;
+        /* '--target=' / '-emit-llvm' ask for this back-end by name, whatever
+           the output file is called */
+        if (!strncmp(a, "-target", 7) || !strncmp(a, "--target", 8)
+            || !strcmp(a, "-emit-llvm") || !strcmp(a, "--emit-llvm"))
+            return 1;
         if (!strcmp(a, "-o")) {
             if (i + 1 < argc)
                 out = argv[++i];
@@ -478,6 +501,25 @@ static int wants_llvm_output(int argc, char **argv)
 
 extern int llvm_main(int argc, char **argv);
 #endif /* CONFIG_EMBED_LLVM */
+
+#ifdef TCC_TARGET_LLVM
+/* '--target=<triple>' without '-emit-llvm': the IR is written next to the
+   output file and handed to clang, which produces the artifact the user asked
+   for (executable, object, wasm module, ...).  The .ll stays on disk: it is
+   what the error messages of the host compiler point at. */
+static int tcc_output_for_target(TCCState *s)
+{
+    char *ir = tcc_malloc(strlen(s->outfile) + 4);
+    int ret;
+
+    sprintf(ir, "%s.ll", s->outfile);
+    ret = tcc_output_file(s, ir);
+    if (!ret)
+        ret = llvm_tool_cc(s, ir, s->outfile);
+    tcc_free(ir);
+    return ret;
+}
+#endif
 
 int main(int argc, char **argv)
 {
@@ -505,6 +547,10 @@ redo:
     argc = argc0, argv = argv0;
     s = s1 = tcc_new();
     opt = tcc_parse_args(s, &argc, &argv);
+#ifdef TCC_TARGET_LLVM
+    if (s->target_triple)
+        llvm_set_target(s);
+#endif
 
     if (n == 0) {
         ret = 0;
@@ -694,7 +740,13 @@ redo:
                     ret = 1;
                 } else
 #endif
+#ifdef TCC_TARGET_LLVM
+                    ret = s->target_triple && !s->llvm_emit_only
+                        ? tcc_output_for_target(s)
+                        : tcc_output_file(s, s->outfile);
+#else
                     ret = tcc_output_file(s, s->outfile);
+#endif
             }
             if (!ret && s->gen_deps)
                 gen_makedeps(s, s->outfile, s->deps_outfile);
