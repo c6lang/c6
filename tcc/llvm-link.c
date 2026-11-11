@@ -6,6 +6,8 @@
  *  TinyCC (tccelf.c) refers to them, and they all refuse to run.
  */
 
+#include <sys/wait.h>
+
 #ifdef TARGET_DEFS_ONLY
 
 #define EM_TCC_TARGET EM_X86_64
@@ -134,6 +136,51 @@ static void l_arch(char *buf, int size, const char *triple)
     buf[i] = 0;
 }
 
+/* Run the C compiler and wait for it.  This cannot be a bare execvp(): the
+   parent still has the IR file to remove (or to keep, when the build failed)
+   and has to hand the child's exit status back. */
+static int l_spawn(char **av)
+{
+    char *argv0 = av[0];
+    int status;
+    pid_t pid;
+
+    fflush(NULL);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "tcc: could not run '%s': %s\n", argv0, strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        execvp(argv0, av);
+        /* distros that keep clang out of $PATH install it under /usr/lib/llvm-N;
+           the same fallback as tests/run-tests.sh, so '-cc=clang' works there */
+        if (!strchr(argv0, '/')) {
+            static char alt[256];
+            int v;
+
+            for (v = 24; v >= 10; v--) {
+                sprintf(alt, "/usr/lib/llvm-%d/bin/%s", v, argv0);
+                if (!l_file_exists(alt))
+                    continue;
+                av[0] = alt;
+                execvp(alt, av);
+            }
+        }
+        fprintf(stderr, "tcc: could not run '%s': %s\n", argv0, strerror(errno));
+        _exit(127);                 /* the parent turns this into 1 */
+    }
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            fprintf(stderr, "tcc: waitpid: %s\n", strerror(errno));
+            return 1;
+        }
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) == 127)
+        return 1;
+    return WEXITSTATUS(status);
+}
+
 ST_FUNC int llvm_tool_cc(TCCState *s1, const char *irfile, const char *outfile)
 {
     char **av = tcc_malloc(64 * sizeof *av);
@@ -236,23 +283,7 @@ ST_FUNC int llvm_tool_cc(TCCState *s1, const char *irfile, const char *outfile)
             fprintf(stderr, " %s", av[i]);
         fprintf(stderr, "\n");
     }
-    execvp(av[0], av);
-    /* distros that keep clang out of $PATH install it under /usr/lib/llvm-N;
-       the same fallback as tests/run-tests.sh, so '-cc=clang' works there */
-    if (!strchr(av[0], '/')) {
-        static char alt[256];
-        int v;
-
-        for (v = 24; v >= 10; v--) {
-            sprintf(alt, "/usr/lib/llvm-%d/bin/%s", v, av[0]);
-            if (!l_file_exists(alt))
-                continue;
-            av[0] = alt;
-            execvp(alt, av);
-        }
-    }
-    fprintf(stderr, "tcc: could not run '%s': %s\n", av[0], strerror(errno));
-    return 1;
+    return l_spawn(av);
 }
 
 #endif /* !TARGET_DEFS_ONLY */

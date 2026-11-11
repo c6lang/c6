@@ -54,6 +54,11 @@ tcc: no runtime for target 'wasm32-unknown-unknown': .../libtcc1-wasm32.a is mis
 （不会拿宿主的 `libtcc1.a` 硬凑：那是 x86-64 的目标文件，链接器只会报
 `archive member ... is neither Wasm object file nor LLVM bitcode`。）
 
+那份 `<outfile>.ll` 只是中间产物：成功就删掉，失败才留下并说一句
+`tcc: LLVM IR left in 'out.wasm.ll'`——编译不过的时候正好用它复现。编译器的
+退出码原样传出来（`fork` + `waitpid`，不是 `execvp` 顶掉自己）。要 IR 本身，
+用 `--emit-llvm`；`-o x.ll` 配 `--target` 也只是写 IR，不往下走。
+
 ### 目标运行库
 
 `libtcc1.c` 是普通 C，交叉编一遍就有了：
@@ -73,6 +78,37 @@ va_list.c dsohandle.c wasm-rt.c` 再 `llvm-ar rcs`。两处专门为目标平台
 - `tcc/lib/wasm-rt.c` 提供 libc/线程的最小桩（4 MiB 静态池上的
   `malloc/calloc/realloc/free`、`pthread_*`、`__cxa_atexit`、`select`），因为
   wasm 模块是 `-nostdlib` 链的。
+
+### 预处理宏：只加不减
+
+`--target` 只往预处理器里**加**目标的宏（`__wasm__` / `__wasm32__` /
+`__aarch64__` / `__riscv` …），不会撤掉宿主的 `__x86_64__`。看着不对，但前端只有
+一个类型模型（x86-64 的：`long` 和指针都是 64 位），而且读的还是**宿主的**
+头文件：glibc 的 `gnu/stubs.h` 只要发现 `__x86_64__` 没了就去 include
+`gnu/stubs-32.h`，机器上没装 32 位 glibc 头文件时连 `<stdio.h>` 都预处理不过
+（`error: include file 'gnu/stubs-32.h' not found`）。所以判断“我在哪”要测
+`__wasm32__` / `__aarch64__`，别测 `!__x86_64__`。
+
+### wasm 没有 libc
+
+wasm 目标用 `-nostdlib` 链，只带 `libtcc1`，所以除了运行库的帮助函数以外，
+任何 import 都会在链接期变成 `undefined symbol`。模块里真引了外部函数时会先打
+一条警告，省得只看到链接器的输出：
+
+```
+$ tcc/tcc -B tcc --target=wasm32-unknown-unknown -o out.wasm examples/gc_demo.c6
+tcc: warning: wasm has no libc: printf, usleep imported, the link will fail
+tcc: warning:   write freestanding code (no <stdio.h>), or provide those symbols yourself
+wasm-ld-19: error: ...: undefined symbol: printf
+```
+
+`printf` 也不是“写个 C 版本就行”：后端输出的 IR 把所有实参都当 `i64` 传（LP64
+模型），而 wasm32 上 libc 的 C 原型里指针和 `int` 是 32 位，签名对不上
+（wasm-ld 会报 `signature mismatch`）。运行库自带的那几个帮助函数有专门的适配层
+（见上），别的函数没有。**要跑在 wasm 上，就写 freestanding 的代码**：函数返回
+值，由 JS 侧调 `exports`。GC 也是这样验证的——`make wasmtest` 里那个
+`gc.c6` 用 `new` 分配、靠引用计数回收，外加切片和大结构体传参，全部在 node 里
+跑出预期值。
 
 ### 目标 ABI 与 LP64 模型
 
@@ -115,6 +151,15 @@ make wasmtest                                  # 默认 wasm32-unknown-unknown
 
 `scripts/wasm-smoke.sh` 需要 clang（编运行库、转 IR）和 node（实例化），
 缺 node 时只校验 `--emit-llvm` 的模块头。
+
+想看看 GC 在 wasm 上怎么跑，最快的路径是
+
+```
+make wasmrt      # 编 tcc/libtcc1-wasm32.a
+make wasmtest    # 出 .wasm 并用 node 跑：add/mul、GC 对、切片、大结构体
+```
+
+`examples/gc_demo.c6` 跑不了：它要 `printf` 和 `usleep`（见上）。
 
 一次调用里的所有源文件合成**一个** `.ll`（与 `-o out.c` 把多个源文件合成一份
 C 完全相同）：`-test` 的测试块编号在同一个状态里递增，跨翻译单元不会撞名。

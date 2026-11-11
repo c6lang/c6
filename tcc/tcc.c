@@ -459,12 +459,9 @@ static int wants_c99_output(int argc, char **argv)
 extern int c99_main(int argc, char **argv);
 #endif /* CONFIG_EMBED_C99 */
 
-#ifdef CONFIG_EMBED_LLVM
-/* The native tcc carries the LLVM IR generator as a second, embedded
-   compiler as well.  There is no option for it: an output file whose name
-   ends in .ll is what the IR back-end produces, everything else (including
-   -E, -c, -r, -shared and -run) keeps its native meaning.  Like '-o out.c',
-   one .ll file holds everything the command line compiles. */
+#if defined(CONFIG_EMBED_LLVM) || defined(TCC_TARGET_LLVM)
+/* an output name that asks for the IR back-end; needed by both builds (the
+   embedded one and the standalone TCC_TARGET_LLVM one) */
 static int has_llvm_suffix(const char *path)
 {
     int n = strlen(path);
@@ -472,7 +469,14 @@ static int has_llvm_suffix(const char *path)
     return n >= 3 && path[n - 3] == '.' && path[n - 2] == 'l'
         && path[n - 1] == 'l';
 }
+#endif
 
+#ifdef CONFIG_EMBED_LLVM
+/* The native tcc carries the LLVM IR generator as a second, embedded
+   compiler as well.  There is no option for it: an output file whose name
+   ends in .ll is what the IR back-end produces, everything else (including
+   -E, -c, -r, -shared and -run) keeps its native meaning.  Like '-o out.c',
+   one .ll file holds everything the command line compiles. */
 static int wants_llvm_output(int argc, char **argv)
 {
     const char *out = NULL;
@@ -507,6 +511,9 @@ extern int llvm_main(int argc, char **argv);
    output file and handed to clang, which produces the artifact the user asked
    for (executable, object, wasm module, ...).  The .ll stays on disk: it is
    what the error messages of the host compiler point at. */
+/* '--target=<triple>': write the IR next to the output, hand it to the C
+   compiler, then drop it -- it is only a step on the way.  A failed link keeps
+   it around, because that is exactly when somebody wants to look at it. */
 static int tcc_output_for_target(TCCState *s)
 {
     char *ir = tcc_malloc(strlen(s->outfile) + 4);
@@ -516,6 +523,10 @@ static int tcc_output_for_target(TCCState *s)
     ret = tcc_output_file(s, ir);
     if (!ret)
         ret = llvm_tool_cc(s, ir, s->outfile);
+    if (ret)
+        fprintf(stderr, "tcc: LLVM IR left in '%s'\n", ir);
+    else
+        remove(ir);
     tcc_free(ir);
     return ret;
 }
@@ -742,6 +753,7 @@ redo:
 #endif
 #ifdef TCC_TARGET_LLVM
                     ret = s->target_triple && !s->llvm_emit_only
+                        && !has_llvm_suffix(s->outfile)
                         ? tcc_output_for_target(s)
                         : tcc_output_file(s, s->outfile);
 #else

@@ -154,6 +154,21 @@ static int l_ptr_bits(void)
     return 64;
 }
 
+static int l_arch_wasm(void)
+{
+    const char *t = l_s1 ? l_s1->target_triple : NULL;
+    size_t n = l_arch_len(t);
+
+    return n == 6 && (!strncmp(t, "wasm32", 6) || !strncmp(t, "wasm64", 6));
+}
+
+/* the names the runtime library itself brings along */
+static int l_runtime_name(const char *n)
+{
+    return !strncmp(n, "__c6_", 5) || !strncmp(n, "__tcc_", 6)
+        || !strncmp(n, "__tcc1_", 7);
+}
+
 /* the target's index type: what a length in an llvm.mem* intrinsic is */
 static const char *l_idx_type(void)
 {
@@ -161,9 +176,15 @@ static const char *l_idx_type(void)
 }
 
 /* The preprocessor has to follow '--target' as well, otherwise a header that
-   asks '#ifdef __wasm__' still gets the host's answer.  Only the identity
-   macros move: the front-end's type model stays the x86-64 one (long is 64
-   bit, pointers are 64 bit), which is what every offset in the IR assumes. */
+   asks '#ifdef __wasm__' still gets the host's answer.
+
+   The host's own identity macros stay defined, and that is on purpose: the
+   front-end has exactly one type model -- x86-64's, where 'long' and every
+   pointer are 64 bit -- and it is still reading the *host's* headers.  glibc's
+   gnu/stubs.h reaches for 'gnu/stubs-32.h' the moment __x86_64__ disappears,
+   which a machine without 32-bit glibc headers cannot even preprocess.  So
+   nothing is undefined here, only the target's own macros are added; code that
+   wants to know where it is headed tests __wasm__ / __wasm32__ / __aarch64__. */
 ST_FUNC void llvm_set_target(TCCState *s1)
 {
     const char *t = s1->target_triple;
@@ -180,8 +201,6 @@ ST_FUNC void llvm_set_target(TCCState *s1)
 
     if (x86)
         return;                     /* target_machine_defs already says so */
-    tcc_undefine_symbol(s1, "__x86_64__");
-    tcc_undefine_symbol(s1, "__amd64__");
     if (wasm) {
         tcc_define_symbol(s1, "__wasm__", "1");
         tcc_define_symbol(s1, n == 6 && t[4] == '6' ? "__wasm64__" : "__wasm32__", "1");
@@ -2398,7 +2417,8 @@ static int l_mem_intrinsic(SValue *callee, int nb_args)
 {
     const char *name = l_token_name(callee->sym);
     int kind, aeabi = 0, count_is_second;
-    char a0[64], a1[64], a2[64], p0[32], p1[32], pl[32], pf[32];
+    char a0[64], a1[64], a2[64];
+    char p0[1088], p1[1088], pl[1088], pf[1088];
     const char *it = l_idx_type();
 
     if (!name || nb_args != 3)
@@ -3282,6 +3302,40 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
                     p->args);
         else
             fprintf(f, "declare i64 @%s(...)\n", l_q(l_extfn[i]));
+    }
+
+    /* A wasm module links without a libc and libtcc1 is the only library that
+       comes along, so any other import is going to fail at link time.  Say it
+       here, where the reason is still visible (and where the same lines land in
+       a --emit-llvm file that somebody else links). */
+    if (l_arch_wasm()) {
+        char buf[512];
+        int len = 0, shown = 0, more = 0;
+
+        buf[0] = 0;
+        for (i = 0; i < l_nextfn; i++) {
+            const char *nm = l_extfn[i];
+            size_t k = strlen(nm);
+
+            if (!k || l_runtime_name(nm))
+                continue;
+            if (shown < 4) {
+                len += snprintf(buf + len, sizeof buf - len, "%s%s",
+                                shown ? ", " : "", nm);
+                shown++;
+            } else {
+                more = 1;
+            }
+        }
+        if (shown) {
+            /* fprintf, not tcc_warning(): the back-end is a separate
+               compilation unit with its own state pointer, and this runs while
+               the module is written, not while code is generated */
+            fprintf(stderr, "tcc: warning: wasm has no libc: %s%s imported, "
+                    "the link will fail\n", buf, more ? " (and more)" : "");
+            fprintf(stderr, "tcc: warning:   write freestanding code (no "
+                    "<stdio.h>), or provide those symbols yourself\n");
+        }
     }
 
     /* the constructor that patches the data sections */
