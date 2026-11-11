@@ -40,25 +40,38 @@
 | `std/hash.c6` | `std.hash` | 哈希：FNV-1a 32/64（`fnv1a_bytes`/`fnv1a_cstr`/`fnv1a64_bytes`）、`crc32_bytes`、`adler32_bytes`，以及流式 `Hasher`（`hasher`/`update`/`digest`） |
 | `std/path.c6` | `std.path` | POSIX 路径：`path_base`/`path_dir`/`path_ext`/`path_stem`/`path_is_abs`/`path_has_ext`/`path_split`、`path_join`/`path_normalize`（写调用方缓冲，放不下返回 -1 且不写半截） |
 | `std/deque.c6` | `std.deque` | 环形缓冲双端队列 `Deque@T`（托管引用）与 `DIter@T`：`push_back`/`push_front`/`pop_back`/`pop_front`、`first`/`last`/`at`/`get`/`set`/`reserve`/`clear` |
+| `std/ascii.c6` | `std.ascii` | ASCII 判别与转换（零分配、零依赖）：`ascii_is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_print`/`is_punct`/`is_cntrl`、`ascii_digit_value`/`hex_value`/`hex_char`、`ascii_to_lower`/`to_upper`、原地 `ascii_lower`/`upper`、`ascii_cmp_nocase`/`eq_nocase` |
+| `std/num.c6` | `std.num` | 浮点格式化与解析（不链 libm）：`fmt_f64`（固定位）、`fmt_f64_sci`（`%e`）、`fmt_f64_g`（`%g` 语义、去尾零）、`round_to`、`f64_is_nan`/`f64_is_inf`、`parse_f64`/`parse_f64_cstr`（inf/nan、`INVAL`/`PARSE`/`RANGE`） |
+| `std/codec.c6` | `std.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
+| `std/rand.c6` | `std.rand` | xorshift64* 伪随机：`rand_seed`/`rand_u64`/`rand_u32`/`rand_below`（拒绝采样）/`rand_int`/`rand_int_incl`/`rand_f64`/`rand_bool`/`rand_fill`/`rand_shuffle`/`rand_shuffle_int` |
+| `std/fs.c6` | `std.fs` | POSIX 文件系统元数据与目录：`StatInfo`、`fs_stat`/`fs_lstat`/`fs_exists`/`fs_is_dir`/`fs_is_file`/`fs_size`、`fs_mkdir`/`fs_mkdir_p`/`fs_remove`/`fs_rmdir`/`fs_rename`、`fs_getcwd`/`fs_chdir`、零分配 `Dir` 遍历 |
+| `std/set.c6` | `std.set` | 哈希集合 `Set@K`（`std.map` 的薄包装）与 `SetIter@K`：`add`（1 新增 / 0 已存在）/`remove`/`has`/`count`/`capacity`/`reserve`/`clear`/`iter` |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
-| `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带 73 条自检 |
+| `examples/stdtour.c6` | （无模块） | 第二批模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带 73 条自检 |
+| `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`make std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带 70 条自检 |
 
-每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（一共 149 个 test 块）：
+每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（一共 197 个 test 块）：
 
 ```
 std/str.c6       22 test(s), 0 failure(s)
 std/sort.c6      30 test(s), 0 failure(s)
+std/ascii.c6      5 test(s), 0 failure(s)
 std/bits.c6       6 test(s), 0 failure(s)
+std/codec.c6      7 test(s), 0 failure(s)
 std/deque.c6      9 test(s), 0 failure(s)
 std/err.c6        3 test(s), 0 failure(s)
 std/fmt.c6       10 test(s), 0 failure(s)
+std/fs.c6         7 test(s), 0 failure(s)
 std/hash.c6       7 test(s), 0 failure(s)
 std/io.c6         5 test(s), 0 failure(s)
-std/map.c6        8 test(s), 0 failure(s)
+std/map.c6        9 test(s), 0 failure(s)
 std/math.c6       6 test(s), 0 failure(s)
 std/mem.c6        7 test(s), 0 failure(s)
+std/num.c6       11 test(s), 0 failure(s)
 std/path.c6      30 test(s), 0 failure(s)
+std/rand.c6       9 test(s), 0 failure(s)
 std/range.c6      6 test(s), 0 failure(s)
+std/set.c6       17 test(s), 0 failure(s)
 std/span.c6       6 test(s), 0 failure(s)
 std/strbuf.c6    18 test(s), 0 failure(s)
 std/time.c6       7 test(s), 0 failure(s)
@@ -68,7 +81,7 @@ std/vec.c6       42 test(s), 0 failure(s)
 ```
 
 `-test` 的计数是命令行上**所有 TU** 的 `test` 块之和，所以带依赖跑的行会把自己
-和依赖的块一起算进去（行内加起来 233，去掉重复计算的依赖正好 149）：
+和依赖的块一起算进去（行内加起来 290，去掉重复计算的依赖正好 197）：
 
 | 行 | 构成 |
 | --- | --- |
@@ -76,8 +89,10 @@ std/vec.c6       42 test(s), 0 failure(s)
 | `std/vec.c6` 42 | str 22 + sort 8 + vec 12 |
 | `std/path.c6` 30 | str 22 + path 8（path 只借 `Str` 这个类型，函数体不依赖 str 的代码） |
 | `std/strbuf.c6` 18 | fmt 10 + strbuf 8 |
+| `std/set.c6` 17 | map 9 + set 8 |
 
-`std/bits`、`std/hash`、`std/utf8`、`std/deque` 自成一体，单独跑就是自己的块数。
+`std/bits`、`std/hash`、`std/utf8`、`std/deque`、`std/ascii`、`std/num`、
+`std/codec`、`std/rand`、`std/fs` 自成一体，单独跑就是自己的块数。
 
 ## 设计原则
 
@@ -198,6 +213,11 @@ while (it->has()) {
 填充的小结构体都对；含指针/填充的大结构体要自己保证字节可比。
 `Map` 没有 `iter()` 方法——模板体内的方法还不能返回多参数泛型实例，
 迭代器直接聚合初始化（原因见下面「已知限制」）。
+
+扩容重建时**只搬 `SLOT_LIVE` 的条目**：墓碑是 `SLOT_DEAD`（值为 2），把它写成
+`if (!of[i]) continue;` 会把死键连同旧值一起「复活」，重建之后 `count` 少一、
+已删除的键又出现。这个坑是写 `std/set` 时踩到的（Set 的 add/remove 会留下墓碑，
+再插入就触发扩容），`std/map.c6` 的用例「墓碑不会在扩容时复活」钉住了它。
 
 ### `Str`：字符串视图
 
@@ -376,6 +396,142 @@ foreach (int x = d->iter()) { ... }
 才是它存在的理由。`push_*`/`reserve` 会分配，返回 `int!error`；`pop_*` 空容器
 给 0 且不写 `*out`；`at(i)` 是前置条件，要检查就用 `get`。
 
+### `ascii`：字节判别与大小写
+
+```c
+import std.ascii;
+
+ascii_is_digit('7');  ascii_is_alpha('A');  ascii_is_space('\t');
+ascii_hex_value('F');            /* 15；非法给 -1 */
+ascii_to_lower('Q');             /* 'q' */
+ascii_cmp_nocase(S("Hello"), S("hello"));   /* 0 */
+
+char buf[8] = "aBc";
+ascii_upper(buf, 3);             /* 原地 -> "ABC" */
+```
+
+参数收 `int` 而不是 `char`：`fgetc()` 的 EOF(-1) 和带符号 char 的负值都安全，
+`c < 0 || c > 127` 一律判为「不是」，转换函数原样返回。只认 ASCII、不看
+locale——多字节是 `std.utf8` 的事。`ascii_upper`/`ascii_lower` 是这一层唯一的
+「写」函数，原地改调用方缓冲；要不改原内存的大小写转换用 `std.str` 的
+`copy_upper`/`copy_lower`。
+
+### `num`：浮点的格式化与解析
+
+```c
+import std.num;
+
+char buf[64] = { 0 };
+fmt_f64(3.14159, buf, sizeof buf, 2);        /* "3.14" */
+fmt_f64_sci(12345.678, buf, sizeof buf, 2);  /* "1.23e+04" */
+fmt_f64_g(1.0, buf, sizeof buf, 6);          /* "1"（%g 去掉尾零） */
+fmt_f64_g(0.00001234, buf, sizeof buf, 6);   /* "1.234e-05" */
+
+f64 v = 0.0;
+parse_f64(S("3.25"), &v) catch e { return e.id; };
+```
+
+这一层是给「没有 printf 的 freestanding 目标」和「不想依赖 libc 浮点格式」
+的场合准备的，语义全部钉死：
+
+* `fmt_f64` 是固定小数位（`prec` 0..9，超出夹住），`|x| >= 1e18` 返回 -1；
+* `fmt_f64_sci` 是 `d.dddde±XX`，指数至少两位，和 C 的 `%e` 一致；
+* `fmt_f64_g` 在「指数 < -4 或 >= 有效位数」时用科学计数，否则固定，并去掉
+  尾零：`1.0` → `"1"`、`100.0` → `"100"`；
+* 三个函数都是**四舍五入（.5 远离零）**；二进制表示本身的误差照实反映
+  （`1.005` 实际略小于 1.005，所以两位给 `"1.00"`）；
+* 放不下返回 -1 且一个字节都不写；`nan`/`inf`/`-inf` 是固定拼写；
+* `parse_f64` 空/全空白 → `INVAL`、语法错 → `PARSE`、溢出 → `RANGE`，下溢
+  给 0；`inf`/`infinity`/`nan` 大小写不敏感。它不是「正确舍入」实现：最多
+  累积 19 位有效数字，常见输入（15 位以内）与 libc 一致。
+
+### `codec`：Base64 / 十六进制 / 百分号
+
+```c
+import std.codec;
+
+char b64[32] = { 0 };
+b64_encode(S("foobar"), b64, sizeof b64);        /* 8，"Zm9vYmFy" */
+b64_decode(S("Zm9vYmFy"), buf, sizeof buf);      /* 6，"foobar" */
+
+char hex[16] = { 0 };
+hex_encode(S("\xde\xad"), hex, sizeof hex, 1);   /* 4，"DEAD" */
+hex_decode(S("DEAD"), out, sizeof out);          /* 2 */
+
+char pct[32] = { 0 };
+pct_encode(S("a b/c"), pct, sizeof pct, (char *)"/");  /* 7，"a%20b/c" */
+pct_decode(S("a+b"), out, sizeof out, 1);        /* plus -> 空格 */
+```
+
+和 `std.path`/`std.fmt` 同一个约定：**不分配**，写调用方缓冲，放不下返回 -1
+且一个字节都不写。解码器先完整校验一遍再写第二遍，非法输入不会留下半截：
+Base64 接受省略填充和 ASCII 空白，拒绝 `% 4 == 1`、非法字符、`=` 在中间；
+十六进制要求偶数个字符、不跳空白；百分号拒绝截断的 `%X`。`*_encoded_len`/
+`*_decoded_len` 可以先问长度。
+
+### `rand`：确定性伪随机
+
+```c
+import std.rand;
+import std.time;
+
+Rand r = rand_seed(now_ns());           /* 纯值，可重放：同一个种子同一串数 */
+u64 x = rand_u64(&r);
+int d6 = rand_int_incl(&r, 1, 6);       /* [1, 6] */
+u64 b = rand_below(&r, 100);            /* [0, 100)，拒绝采样，无余数偏置 */
+f64 p = rand_f64(&r);                   /* [0, 1) */
+
+int a[10] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+rand_shuffle_int(&r, (int[:]){ a, 10 });
+```
+
+算法是 xorshift64*（只用 u64 的异或/移位/乘），种子 0 换成非零常量（全零状态
+是吸收态）。**不是密码学随机数**：密钥、令牌、盐不要用它。`rand_shuffle` 按
+字节交换，任意元素宽度都能用（`elem` 给 `sizeof`）。已知序列钉在
+`std/rand.c6` 的 `test` 块里。
+
+### `fs`：文件系统元数据与目录
+
+```c
+import std.fs;
+
+StatInfo st = { 0 };
+fs_stat("docs/stdlib.md", &st) catch e { return e.id; };
+st.is_file;  st.size;  st.mtime;
+
+fs_mkdir_p("build/out/a", 0755) catch e { return e.id; };
+
+Dir d = dir_open("std");
+Dir *pd = &d;
+char name[256] = { 0 };
+int is_dir = 0;
+while (pd->dir_next(name, sizeof name, &is_dir) > 0) { ... }
+pd->dir_close();
+```
+
+`std.io` 管内容、`std.fs` 管元数据和目录。`errno` 被翻译成 `std.err` 的码：
+不存在 → `NO_ENT`、已存在 → `EXIST`、参数/不是目录/没权限 → `INVAL`、其余 →
+`IO`。`dir_next` 返回 1 取到、0 结束、-1 出错、**-2 名字比 cap 长**（不截断，
+让调用方加大 buffer）；"."/".." 照常返回。`is_dir` 取自 `dirent.d_type`，
+`DT_UNKNOWN` 时给 0。这一层依赖 POSIX，freestanding 目标用不了（io 至少只要
+stdio）。
+
+### `set`：哈希集合
+
+```c
+import std.set;
+
+@Set@int s = new Set@int;
+s->add(7) catch e { return e.id; };   /* 返回值：1 本次新增、0 已经存在 */
+s->has(7);  s->remove(7);  s->count();
+foreach (int k = s->iter()) { ... }
+```
+
+键的要求和 `std.map` 完全一致（按 `sizeof(K)` 个字节做 FNV-1a、memcmp 判等），
+`Set` 就是 `@Map@(K, int)` 的薄包装——所以**用 Set 的程序要把 `std/map.c6` 的
+正文一起编**。`add` 会分配、返回 `int!error`（失败不改集合）；`remove`/`has`
+不失败；`iter()` 借用集合，改集合之前先迭代完。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -432,6 +588,23 @@ stdtour: 73 check(s), 0 failure(s)
 所以它既是演示也是集成用例：strbuf 拼串、path 拆装、hash 已知向量、bits
 位运算、utf8 的合法/非法输入、deque 滚动窗口。
 
+### 集成示例：`examples/stdkit.c6`
+
+```sh
+make std-kit
+```
+
+```
+stdkit: 标准库第三批一日游
+stdkit: 70 check(s), 0 failure(s)
+```
+
+第三批的六个模块各一节：ascii 分类与忽略大小写比较、num 的 `%f`/`%e`/`%g`
+和解析往返、codec 的 Base64 已知向量与非法输入、rand 的可重放/区间/shuffle、
+fs 的 mkdir_p → 写文件 → stat → 目录遍历 → rename → 清理、set 的增删改查与
+迭代器。示例里 `set` 依赖 `std/map.c6` 的正文，所以 `STDKIT_SRCS` 把它列在
+`std/set.c6` 前面。
+
 ## 写法约定（照着写就不会踩坑）
 
 * **普通结构体的方法就是「第一个参数是结构体指针」的文件作用域函数**：
@@ -456,6 +629,12 @@ stdtour: 73 check(s), 0 failure(s)
   「失败了记一笔再继续跑」这种写法要包一层：`static int put_int(StrBuf *b,
   int v) { b->write_int(v) catch e { return -1; }; return 0; }`，调用方
   `check(put_int(b, -42) == 0, "...")`（见 `examples/stdtour.c6`）。
+* 在 `T!error` 函数里转发错误用 `try f(...)`；要拿它的**返回值**参与判断就写
+  `(try f(...))`：`if ((try s->add(7)) != 0)`。`catch` 只交出错误，拿不到成功值。
+* 在**导入方**的文件作用域写 `static int f(Set@int *s) { return s->has(7); }`
+  会得到 `assignment makes integer from pointer` 警告——跨 TU 用实例类型时方法
+  的返回类型没被正确解析（能跑，但别依赖）。把这段逻辑放回定义模块，或在导入方
+  用局部 `@Set@int` 变量直接调方法（`examples/stdkit.c6` 的 `tour_set` 这么绕）。
 * `#include` 要写在 `module` 前面；`main` 不能出现在模块里。
 
 ## 已知限制（编译器层面，标准库已绕开）
@@ -467,7 +646,7 @@ stdtour: 73 check(s), 0 failure(s)
 | 模板体内方法不能返回**多参数泛型实例**或**元组**（`Entry@(K,V) next()`、`(K,V) next()` → `declaration expected`） | 返回单参数类型或标量，多出来的东西走 `cur` 字段（`Map` 的迭代器就是这么做的），或者干脆不提供工厂方法 |
 | 泛型**值形参**的模板写 `struct Buf@(int N)`、实例写 `Buf@(8)`（`Buf@(int, 8)` 会被当成两个实参） | 记住「声明带类型和名字，实例只给值」 |
 | **普通**（非泛型）结构体不能在 `struct` 体内写方法体（`a function cannot be defined inside a struct`） | 方法写成「第一个参数是结构体指针」的文件作用域函数，调用写 `(&v)->m()` |
-| 文件作用域里写「参数/返回类型带实例类型」的辅助函数，会让**导入这个模块的每个 TU** 都提前实例化该类型 | 别这么写；需要时把逻辑放进 `test` 块或用标量参数（`std/fmt.c6` 的测试用 `goto` 取错误码） |
+| 文件作用域里写「参数/返回类型带实例类型」的辅助函数，会让**导入这个模块的每个 TU** 都提前实例化该类型 | 别这么写；需要时把逻辑放进 `test` 块或用标量参数（`std/fmt.c6` 的测试用 `goto` 取错误码）。在导入方写 `static int f(Set@int *s)` 再调 `s->has()` 还会得到 pointer/integer 警告（返回值类型没解析对），见上面「写法约定」 |
 | ~~往 `Buf@(N)` 里加若干形状相同的方法会挂~~（曾经的 `skip(')')` → `end_macro()` 死循环） | **已消失**：同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）加到五个也编得过、跑得通，`std/fmt` 的 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr` 就是照这个形状补的（`tccpp.c` 的宏重放改写之后不再复现） |
 | ~~把 `Buf@(N)` 的 `write_hex` 形参从 `u32` 加宽到 `u64` 会**挂住编译器**~~（当时 `-c` 无输出直到超时，退出码 124） | **现在复现不出来**：当前 `std/fmt.c6` 的 body、旧版 body、带 `(char)` 强转的写法都在 1 秒内编过，`-test` 也是 10 个块全过。`write_hex(u32)`/`write_hex64(u64)` 双入口保留只是为了不动 API |
 
@@ -479,6 +658,9 @@ stdtour: 73 check(s), 0 failure(s)
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
   边界（字段名 vs 同名方法、方法形参名不漏到调用方、两个 TU 都实例化同一
   模板时方法体是弱符号）。
-* `make stdtest`：`std/` 下十九个模块的全部 `test` 块（149 个）。
+* `make stdtest`：`std/` 下二十五个模块的全部 `test` 块（197 个）。
 * `make std-demo`：`examples/wordcount.c6` 那个集成示例。
-* `make std-tour`：`examples/stdtour.c6`，新模块的拼装示例（73 条自检）。
+* `make std-tour`：`examples/stdtour.c6`，第二批模块的拼装示例（73 条自检）。
+* `make std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（70 条自检）。
+* `std/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，
+  验证墓碑不会被搬进新表（写 `std/set` 时踩到的真实 bug）。

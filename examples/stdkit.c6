@@ -1,0 +1,360 @@
+/* stdkit：标准库第三批（ascii / num / codec / rand / fs / set）的拼装示例。
+ *
+ * 和 stdtour 一样：这个文件没有 `module`（入口 `main` 只能在不属于任何模块
+ * 的文件里），六节各带自检，失败打 FAIL，最后按失败数决定退出码。它既是
+ * 演示，也是这六个模块的集成用例。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdkit \
+ *         examples/stdkit.c6 std/types.c6 std/err.c6 std/map.c6 \
+ *         std/set.c6 std/ascii.c6 std/num.c6 std/codec.c6 \
+ *         std/rand.c6 std/fs.c6
+ *
+ * 用到的东西：
+ *   std.ascii   ASCII 判别、大小写、忽略大小写比较
+ *   std.num     浮点格式化（固定/%e/%g）与解析（含 inf/nan、错误码）
+ *   std.codec   Base64 / 十六进制 / 百分号编码，全部写调用方缓冲
+ *   std.rand    xorshift64*：可重放序列、无偏区间、shuffle
+ *   std.fs      stat / mkdir_p / 目录遍历 / rename / remove
+ *   std.set     哈希集合（Map 的薄包装）
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.types;
+import std.err;
+import std.map;
+import std.set;
+import std.ascii;
+import std.num;
+import std.codec;
+import std.rand;
+import std.fs;
+
+/* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* ---- 把 T!error 折成普通 int 的小包装（catch 体必须以 return 结尾） ---- */
+
+static int mkdir_p(char *path)
+{
+    fs_mkdir_p(path, 0755) catch e { return -1; };
+    return 0;
+}
+
+static int remove_file(char *path)
+{
+    fs_remove(path) catch e { return -1; };
+    return 0;
+}
+
+static int remove_dir(char *path)
+{
+    fs_rmdir(path) catch e { return -1; };
+    return 0;
+}
+
+static int stat_size(char *path, i64 *size)
+{
+    StatInfo st = { 0 };
+
+    fs_stat(path, &st) catch e { return -1; };
+    *size = st.size;
+    return 0;
+}
+
+static int stat_info(char *path, StatInfo *out)
+{
+    fs_stat(path, out) catch e { return -1; };
+    return 0;
+}
+
+static int rename_file(char *from, char *to)
+{
+    fs_rename(from, to) catch e { return -1; };
+    return 0;
+}
+
+/* 0 = 成功；-1 = 失败 */
+static int parse_num(char[:] s, f64 *out)
+{
+    parse_f64(s, out) catch e { return -1; };
+    return 0;
+}
+
+/* ---- 1. ascii ---- */
+static void tour_ascii(void)
+{
+    char[:] text = S("Hello, std 2024!");
+    int i = 0, letters = 0, digits = 0, spaces = 0, punct = 0;
+    char buf[16] = { 0 };
+
+    for (i = 0; i < text.len; i++) {
+        int c = (int)(u8)text.data[i];
+
+        letters += ascii_is_alpha(c);
+        digits += ascii_is_digit(c);
+        spaces += ascii_is_space(c);
+        punct += ascii_is_punct(c);
+    }
+    check(letters == 8, "ascii: 字母数");
+    check(digits == 4, "ascii: 数字数");
+    check(spaces == 2, "ascii: 空白数");
+    check(punct == 2, "ascii: 标点数");
+    check(ascii_hex_value('F') == 15 && ascii_hex_value('g') == -1,
+          "ascii: 十六进制位");
+    check(ascii_hex_char(10, 1) == 'A' && ascii_hex_char(16, 1) == -1,
+          "ascii: 十六进制字符");
+    check(ascii_to_lower('Q') == 'q' && ascii_to_upper('m') == 'M',
+          "ascii: 大小写转换");
+    check(ascii_cmp_nocase(S("Hello"), S("hELLo")) == 0,
+          "ascii: 忽略大小写相等");
+    check(ascii_cmp_nocase(S("abc"), S("abd")) == -1,
+          "ascii: 忽略大小写排序");
+    memcpy(buf, "aBc", 4);
+    ascii_upper(buf, 3);
+    check(strcmp(buf, "ABC") == 0, "ascii: 原地大写");
+    check(!ascii_is_ascii(200) && ascii_is_print('~') && !ascii_is_print('\n'),
+          "ascii: 边界");
+}
+
+/* ---- 2. num ---- */
+static void tour_num(void)
+{
+    char buf[64] = { 0 };
+    f64 v = 0.0;
+
+    fmt_f64(3.14159, buf, sizeof buf, 2);
+    check(strcmp(buf, "3.14") == 0, "num: 固定两位");
+    fmt_f64(9.999, buf, sizeof buf, 2);
+    check(strcmp(buf, "10.00") == 0, "num: 进位");
+    fmt_f64_sci(12345.678, buf, sizeof buf, 2);
+    check(strcmp(buf, "1.23e+04") == 0, "num: 科学计数");
+    fmt_f64_g(1.0, buf, sizeof buf, 6);
+    check(strcmp(buf, "1") == 0, "num: %g 去掉尾零");
+    fmt_f64_g(0.00001234, buf, sizeof buf, 6);
+    check(strcmp(buf, "1.234e-05") == 0, "num: 小数用科学计数");
+    check(parse_num(S("nan"), &v) == 0 && f64_is_nan(v), "num: 解析 nan");
+    fmt_f64(v, buf, sizeof buf, 2);
+    check(strcmp(buf, "nan") == 0, "num: nan 的拼写");
+    check(parse_num(S("-inf"), &v) == 0 && f64_is_inf(v) && v < 0.0,
+          "num: 解析 -inf");
+    fmt_f64(v, buf, sizeof buf, 2);
+    check(strcmp(buf, "-inf") == 0, "num: -inf 的拼写");
+    check(parse_num(S("3.25"), &v) == 0 && v == 3.25, "num: 解析小数");
+    check(parse_num(S("-2.5e3"), &v) == 0 && v == -2500.0,
+          "num: 解析带指数");
+    check(parse_num(S("  1e-2  "), &v) == 0 && v == 0.01,
+          "num: 解析带空白");
+    check(parse_num(S("1.2.3"), &v) == -1, "num: 拒绝双小数点");
+    check(parse_num(S("1e400"), &v) == -1, "num: 拒绝溢出");
+    fmt_f64_g(1234.5678, buf, sizeof buf, 15);
+    check(parse_num((char[:]){ buf, (int)strlen(buf) }, &v) == 0
+              && v > 1234.567799 && v < 1234.567801,
+          "num: 格式化再解析");
+    check(round_to(1.25, 1) == 1.3, "num: round_to");
+}
+
+/* ---- 3. codec ---- */
+static void tour_codec(void)
+{
+    char b64[32] = { 0 };
+    char hex[16] = { 0 };
+    char pct[32] = { 0 };
+    char back[32] = { 0 };
+
+    check(b64_encode(S("foobar"), b64, sizeof b64) == 8
+              && strcmp(b64, "Zm9vYmFy") == 0,
+          "codec: Base64 编码");
+    check(b64_decode(S("Zm9vYmFy"), back, sizeof back) == 6
+              && strcmp(back, "foobar") == 0,
+          "codec: Base64 解码");
+    check(b64_decode(S("Zg=="), back, sizeof back) == 1
+              && back[0] == 'f',
+          "codec: Base64 带填充");
+    check(b64_decode_len(S("Zg")) == 1, "codec: Base64 省略填充");
+    check(b64_decode_len(S("Z")) == -1, "codec: Base64 非法长度");
+    check(hex_encode(S("\xde\xad\xbe\xef"), hex, sizeof hex, 1) == 8
+              && strcmp(hex, "DEADBEEF") == 0,
+          "codec: 十六进制大写");
+    check(hex_decode(S("DEADBEEF"), back, sizeof back) == 4
+              && (u8)back[0] == 0xde && (u8)back[3] == 0xef,
+          "codec: 十六进制解码");
+    check(hex_decode_len(S("abc")) == -1, "codec: 十六进制奇数长度");
+    check(pct_encode(S("a b/c"), pct, sizeof pct, (char *)"/") == 7
+              && strcmp(pct, "a%20b/c") == 0,
+          "codec: 百分号编码");
+    check(pct_decode(S("a%20b%2Fc"), back, sizeof back, 0) == 5
+              && strcmp(back, "a b/c") == 0,
+          "codec: 百分号解码");
+    check(pct_decode(S("a+b"), back, sizeof back, 1) == 3
+              && strcmp(back, "a b") == 0,
+          "codec: + 解成空格");
+    check(pct_decode_len(S("%zz"), 0) == -1, "codec: 非法转义");
+}
+
+/* ---- 4. rand ---- */
+static void tour_rand(void)
+{
+    Rand a = rand_seed(2024u);
+    Rand b = rand_seed(2024u);
+    Rand c = rand_seed(2025u);
+    Rand b2 = rand_seed(2024u);
+    int i = 0, same = 1, diff = 0, all_in_range = 1;
+    int deck[10] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    int seen[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    int sum = 0;
+    f64 mean = 0.0;
+    u64 acc = 0ull;
+
+    for (i = 0; i < 20; i++) {
+        if (rand_u64(&a) != rand_u64(&b))
+            same = 0;
+    }
+    for (i = 0; i < 20; i++) {
+        if (rand_u64(&c) != rand_u64(&b2))
+            diff = 1;
+    }
+    check(same, "rand: 同种子可重放");
+    check(diff, "rand: 不同种子不同序列");
+    for (i = 0; i < 500; i++) {
+        if (rand_below(&a, 7) >= 7ull)
+            all_in_range = 0;
+        acc += (u64)rand_int_incl(&a, 1, 6);
+    }
+    check(all_in_range, "rand: rand_below 上界");
+    check(acc >= 500ull * 1ull && acc <= 500ull * 6ull,
+          "rand: rand_int_incl 范围");
+    for (i = 0; i < 5000; i++)
+        mean += rand_f64(&a);
+    mean /= 5000.0;
+    check(mean > 0.47 && mean < 0.53, "rand: rand_f64 均值");
+    rand_shuffle_int(&a, (int[:]){ deck, 10 });
+    for (i = 0; i < 10; i++) {
+        if (deck[i] >= 0 && deck[i] < 10)
+            seen[deck[i]]++;
+        sum += deck[i];
+    }
+    for (i = 0; i < 10; i++)
+        if (seen[i] != 1)
+            sum = -1;
+    check(sum == 45, "rand: shuffle 保序集合");
+}
+
+/* ---- 5. fs ---- */
+static void tour_fs(void)
+{
+    char *root = (char *)"build/stdkit-fs";
+    char *f1 = (char *)"build/stdkit-fs/one.txt";
+    char *f2 = (char *)"build/stdkit-fs/two.txt";
+    FILE *f = 0;
+    i64 size = 0;
+    StatInfo st = { 0 };
+    Dir d = { 0 };
+    Dir *pd = &d;
+    char name[128] = { 0 };
+    int is_dir = 0, n = 0, saw_nested = 0, rc = 0;
+
+    check(mkdir_p(root) == 0, "fs: mkdir");
+    check(mkdir_p((char *)"build/stdkit-fs/nested/deep") == 0,
+          "fs: mkdir_p 嵌套");
+    check(mkdir_p(root) == 0, "fs: mkdir_p 幂等");
+    check(fs_is_dir(root) == 1 && fs_is_file(root) == 0,
+          "fs: is_dir / is_file");
+
+    f = fopen(f1, "wb");
+    if (!f) {
+        check(0, "fs: 写测试文件");
+        return;
+    }
+    fwrite("hello", 1, 5, f);
+    fclose(f);
+    check(stat_size(f1, &size) == 0 && size == 5, "fs: stat size");
+    check(stat_info(f1, &st) == 0 && st.is_file == 1 && st.is_dir == 0,
+          "fs: stat 类型");
+
+    d = dir_open(root);
+    if (!pd->dir_ok()) {
+        check(0, "fs: dir_open");
+        return;
+    }
+    while ((rc = pd->dir_next(name, sizeof name, &is_dir)) > 0) {
+        n++;
+        if (strcmp(name, "nested") == 0 && is_dir)
+            saw_nested = 1;
+    }
+    pd->dir_close();
+    check(rc == 0, "fs: dir_next 没有报错");
+    check(n >= 3 && saw_nested, "fs: 目录项与 is_dir");
+
+    check(rename_file(f1, f2) == 0, "fs: rename");
+    check(fs_exists(f1) == 0 && fs_exists(f2) == 1, "fs: rename 之后的存在性");
+
+    check(remove_file(f2) == 0, "fs: remove");
+    check(remove_dir((char *)"build/stdkit-fs/nested/deep") == 0,
+          "fs: rmdir deep");
+    check(remove_dir((char *)"build/stdkit-fs/nested") == 0,
+          "fs: rmdir nested");
+    check(remove_dir(root) == 0, "fs: rmdir 根");
+    check(fs_exists(root) == 0, "fs: 清理干净");
+}
+
+/* ---- 6. set ---- */
+static void tour_set(void)
+{
+    @Set@int s = new Set@int;
+    int i = 0, sum = 0, n = 0, before = 0;
+
+    check(s->count() == 0 && s->is_empty(), "set: 空集合");
+    before = s->count();
+    s->add(7) catch e { check(0, "set: add 失败"); return; };
+    check(s->count() == before + 1, "set: 首次 add 是新增");
+    s->add(7) catch e { check(0, "set: 重复 add 失败"); return; };
+    check(s->count() == before + 1 && s->has(7),
+          "set: 重复 add 不增加 count");
+    check(s->remove(7) == 1 && s->has(7) == 0, "set: remove");
+    check(s->remove(7) == 0, "set: 重复 remove");
+    for (i = 0; i < 200; i++)
+        s->add(i) catch e { check(0, "set: 批量 add"); return; };
+    check(s->count() == 200 && s->capacity() >= 200, "set: 扩容");
+    for (i = 0; i < 200; i++)
+        if (!s->has(i))
+            check(0, "set: 扩容后丢元素");
+    for (i = 0; i < 200; i += 2)
+        s->remove(i);
+    check(s->count() == 100, "set: 删除一半");
+    check(s->has(1) && !s->has(2), "set: 删除后的 has");
+    foreach (int k = s->iter()) {
+        sum += k;
+        n++;
+    }
+    check(n == 100 && sum == 10000, "set: 迭代器覆盖奇数");
+    s->clear();
+    check(s->count() == 0 && s->capacity() >= 200, "set: clear 保留容量");
+}
+
+int main(void)
+{
+    printf("stdkit: 标准库第三批一日游\n");
+    tour_ascii();
+    tour_num();
+    tour_codec();
+    tour_rand();
+    tour_fs();
+    tour_set();
+    printf("stdkit: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

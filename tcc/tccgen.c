@@ -12711,6 +12711,12 @@ static const struct C6ErrStdSlot {
     { "std.hash",  C6_ERR_SLOT_STD + 16 },
     { "std.path",  C6_ERR_SLOT_STD + 17 },
     { "std.deque", C6_ERR_SLOT_STD + 18 },
+    { "std.ascii", C6_ERR_SLOT_STD + 19 },
+    { "std.num",   C6_ERR_SLOT_STD + 20 },
+    { "std.codec", C6_ERR_SLOT_STD + 21 },
+    { "std.rand",  C6_ERR_SLOT_STD + 22 },
+    { "std.fs",    C6_ERR_SLOT_STD + 23 },
+    { "std.set",   C6_ERR_SLOT_STD + 24 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
