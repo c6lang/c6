@@ -1,0 +1,331 @@
+/* std/strbuf：会自己长大的字节/字符串缓冲。
+ *
+ *     import std.strbuf;
+ *
+ *     @StrBuf b = new StrBuf;
+ *     b->write(S("n=").s) catch e { return e.id; };
+ *     b->write_int(42) catch e { return e.id; };
+ *     puts(b->cstr());
+ *
+ * 和 std.fmt 的 Buf@(N) 分工：Buf 的容量是类型的一部分、纯值、栈上就够；
+ * StrBuf 没有上限，靠扩容，因此字段里有托管引用 `@char data`，按 GC 的规则
+ * **只能 new 出来用 `@StrBuf` 持有**，方法写成「第一参数是 StrBuf *」的文件
+ * 作用域函数（普通结构体不能在体内写方法）。
+ *
+ * 不变量：`cap > n` 恒成立——始终给结尾 NUL 留一格。所以 `cstr()` 只要
+ * 把 `data[n]` 写 0 就行，永远不需要（也没法）在现场分配。`data == 0` 表示
+ * 「还一次都没分配过」，这时 `cstr()` 返回一个只读的静态空串，`slice()`
+ * 返回 `{ 0, 0 }`。
+ *
+ * 失败约定与 std.fmt 一致：`write_*` 用 `int!error`，空间不够/分配失败都
+ * 会返回错误，且**不写半截**；不返回错误的访问器（`count`/`slice`/`cstr`）
+ * 永远成功。
+ */
+#include <string.h>
+
+module std.strbuf;
+import std.types;
+import std.err;
+import std.fmt;
+
+struct StrBuf {
+    @char data;
+    int n;
+    int cap;
+};
+
+int count(StrBuf *self) { return self->n; }
+
+int capacity(StrBuf *self) { return self->cap; }
+
+int is_empty(StrBuf *self) { return self->n == 0; }
+
+/* 还能再写几个字节（不含结尾 NUL 那一格） */
+int room(StrBuf *self)
+{
+    if (self->cap <= 0)
+        return 0;
+    return self->cap - 1 - self->n;
+}
+
+/* 保证能放下 want 个字节（不含 NUL）：成功后 cap > want。
+   失败时长度、内容、容量都不变。 */
+int!error reserve(StrBuf *self, int want)
+{
+    @char nd = self->data;
+    int ncap = self->cap > 0 ? self->cap : 64;
+    int i = 0;
+
+    if (want < 0)
+        return err(std.err.INVAL, "strbuf: negative reserve");
+    if (want <= self->cap - 1)
+        return 0;
+    if (want > 0x3fffffff)
+        return err(std.err.NOMEM, "strbuf: too large");
+    while (ncap <= want)
+        ncap *= 2;
+    nd = new char[ncap];
+    if (!nd)
+        return err(std.err.NOMEM, "strbuf: out of memory");
+    for (i = 0; i < self->n; i++)
+        nd[i] = self->data[i];
+    nd[self->n] = 0;
+    self->data = nd;
+    self->cap = ncap;
+    return 0;
+}
+
+/* 追加一段字节（Str 的内容用 `s.s` 传过来）；空切片什么都不做 */
+int!error write(StrBuf *self, char[:] s)
+{
+    int i = 0;
+
+    if (s.len <= 0 || !s.data)
+        return 0;
+    if (s.len > 0x3fffffff - self->n)
+        return err(std.err.NOMEM, "strbuf: too large");
+    try reserve(self, self->n + s.len);
+    for (i = 0; i < s.len; i++)
+        self->data[self->n + i] = s[i];
+    self->n += s.len;
+    self->data[self->n] = 0;
+    return 0;
+}
+
+/* 追加一个 C 字符串；NULL 当空串 */
+int!error write_cstr(StrBuf *self, char *z)
+{
+    if (!z)
+        return 0;
+    try write(self, (char[:]){ z, (int)strlen(z) });
+    return 0;
+}
+
+int!error push(StrBuf *self, char c)
+{
+    try reserve(self, self->n + 1);
+    self->data[self->n] = c;
+    self->n += 1;
+    self->data[self->n] = 0;
+    return 0;
+}
+
+/* 十进制无符号：先用 fmt 的原语转成数字，再一次性追加 */
+int!error write_u64(StrBuf *self, u64 v)
+{
+    char tmp[24] = { 0 };
+    int k = digits_u64(tmp, (int)sizeof tmp, v);
+    int i = 0;
+
+    if (k < 0)
+        return err(std.err.STATE, "strbuf: digits");
+    try reserve(self, self->n + k);
+    for (i = 0; i < k; i++)
+        self->data[self->n + i] = tmp[i];
+    self->n += k;
+    self->data[self->n] = 0;
+    return 0;
+}
+
+/* 十六进制（小写、无前缀、不补零），64 位 */
+int!error write_hex(StrBuf *self, u64 v)
+{
+    char tmp[16] = { 0 };
+    int k = digits_hex(tmp, (int)sizeof tmp, v);
+    int i = 0;
+
+    if (k < 0)
+        return err(std.err.STATE, "strbuf: digits");
+    try reserve(self, self->n + k);
+    for (i = 0; i < k; i++)
+        self->data[self->n + i] = tmp[i];
+    self->n += k;
+    self->data[self->n] = 0;
+    return 0;
+}
+
+/* 十进制有符号：符号单独写，量值走无符号域（INT_MIN 才有定义） */
+int!error write_int(StrBuf *self, int v)
+{
+    u32 u = 0;
+
+    if (v < 0) {
+        try push(self, '-');
+        u = (u32)0 - (u32)v;
+    } else {
+        u = (u32)v;
+    }
+    try write_u64(self, (u64)u);
+    return 0;
+}
+
+void clear(StrBuf *self)
+{
+    self->n = 0;
+    if (self->data)
+        self->data[0] = 0;
+}
+
+/* 只留前 k 个字节：k < 0 当 0，k > n 不动；容量不回收 */
+void truncate(StrBuf *self, int k)
+{
+    if (k < 0)
+        k = 0;
+    if (k > self->n)
+        k = self->n;
+    self->n = k;
+    if (self->data)
+        self->data[self->n] = 0;
+}
+
+char[:] slice(StrBuf *self)
+{
+    return (char[:]){ self->data, self->n };
+}
+
+/* 以 NUL 结尾的视图：就地写结尾（不变量保证有那一格）。
+   还一次都没分配过时返回只读的静态空串——别写它。 */
+char *cstr(StrBuf *self)
+{
+    if (!self->data)
+        return (char *)"";
+    self->data[self->n] = 0;
+    return self->data;
+}
+
+/* ---- 自测 ---- */
+
+test "空缓冲的访问器" {
+    @StrBuf b = new StrBuf;
+    char[:] s = b->slice();
+
+    if (b->count() != 0 || b->capacity() != 0 || !b->is_empty())
+        return err(1, "空缓冲的计数不对");
+    if (b->room() != 0)
+        return err(2, "空缓冲 room 应为 0");
+    if (s.len != 0 || s.data != 0)
+        return err(3, "空缓冲 slice 不是空的");
+    if (strcmp(b->cstr(), "") != 0)
+        return err(4, "空缓冲的 cstr 不是空串");
+}
+
+test "逐字节与批量写，自动扩容" {
+    @StrBuf b = new StrBuf;
+    int i = 0;
+
+    for (i = 0; i < 100; i++)
+        b->push('a') catch e { return err(5, "push 失败"); };
+    if (b->count() != 100 || b->capacity() < 101)
+        return err(6, "扩容后计数/容量不对");
+    b->write((char[:]){ (char *)"XYZ", 3 }) catch e { return err(7, "write 失败"); };
+    if (b->count() != 103)
+        return err(8, "write 之后计数不对");
+    if (b->slice().len != 103 || b->slice().data[0] != 'a')
+        return err(9, "slice 内容不对");
+    if (b->cstr()[102] != 'Z' || b->cstr()[103] != 0)
+        return err(10, "cstr 结尾不对");
+    /* 空切片 / NULL 指针的切片都不该动内容 */
+    b->write((char[:]){ (char *)"", 0 }) catch e { return err(11, "空串失败"); };
+    b->write((char[:]){ (char *)0, 0 }) catch e { return err(12, "空指针失败"); };
+    if (b->count() != 103)
+        return err(13, "空写改动了长度");
+}
+
+test "write_int 覆盖 0 / 负数 / INT_MIN / INT_MAX" {
+    @StrBuf b = new StrBuf;
+
+    b->write_int(0) catch e { return err(14, "0 失败"); };
+    b->push(' ') catch e { return err(15, "空格失败"); };
+    b->write_int(-42) catch e { return err(16, "-42 失败"); };
+    b->push(' ') catch e { return err(17, "空格失败"); };
+    b->write_int(2147483647) catch e { return err(18, "INT_MAX 失败"); };
+    b->push(' ') catch e { return err(19, "空格失败"); };
+    b->write_int(-2147483647 - 1) catch e { return err(20, "INT_MIN 失败"); };
+    if (strcmp(b->cstr(), "0 -42 2147483647 -2147483648") != 0)
+        return err(21, "整数结果不对");
+}
+
+test "write_u64 / write_hex 的宽度" {
+    @StrBuf b = new StrBuf;
+
+    b->write_u64(18446744073709551615ull) catch e { return err(22, "u64 失败"); };
+    b->push(' ') catch e { return err(23, "空格失败"); };
+    b->write_hex(0u) catch e { return err(24, "hex 0 失败"); };
+    b->push(' ') catch e { return err(25, "空格失败"); };
+    b->write_hex(~(u64)0) catch e { return err(26, "hex 2^64-1 失败"); };
+    if (strcmp(b->cstr(), "18446744073709551615 0 ffffffffffffffff") != 0)
+        return err(27, "u64/hex 结果不对");
+}
+
+test "truncate 与 clear：容量不丢，内容清干净" {
+    @StrBuf b = new StrBuf;
+    int cap0 = 0;
+
+    b->write_cstr((char *)"abcdef") catch e { return err(28, "write_cstr 失败"); };
+    cap0 = b->capacity();
+    b->truncate(3);
+    if (b->count() != 3 || strcmp(b->cstr(), "abc") != 0)
+        return err(29, "truncate 不对");
+    b->truncate(99);
+    if (b->count() != 3)
+        return err(30, "truncate 放大不该生效");
+    b->truncate(-1);
+    if (b->count() != 0 || b->cstr()[0] != 0)
+        return err(31, "truncate(-1) 应清空");
+    b->write_cstr((char *)"xy") catch e { return err(32, "重用失败"); };
+    b->clear();
+    if (b->count() != 0 || b->capacity() != cap0)
+        return err(33, "clear 丢了容量");
+    if (strcmp(b->cstr(), "") != 0)
+        return err(34, "clear 之后 cstr 不干净");
+    b->push('z') catch e { return err(35, "clear 之后不可重用"); };
+    if (strcmp(b->cstr(), "z") != 0)
+        return err(36, "重用后内容不对");
+}
+
+test "write_cstr 接 NULL 与空串" {
+    @StrBuf b = new StrBuf;
+
+    b->write_cstr((char *)0) catch e { return err(37, "NULL 失败"); };
+    b->write_cstr((char *)"") catch e { return err(38, "空串失败"); };
+    if (b->count() != 0)
+        return err(39, "空输入改动了长度");
+    b->write_cstr((char *)"hi") catch e { return err(40, "普通串失败"); };
+    if (b->count() != 2 || strcmp(b->cstr(), "hi") != 0)
+        return err(41, "普通串结果不对");
+}
+
+test "reserve 的护栏：负数报 INVAL，过大报 NOMEM，状态不变" {
+    @StrBuf b = new StrBuf;
+
+    b->write_cstr((char *)"keep") catch e { return err(42, "准备失败"); };
+    b->reserve(-1) catch e {
+        if (e.id != std.err.INVAL)
+            return err(43, "负数应该报 INVAL");
+        goto checked;
+    };
+    return err(44, "负数却没报错");
+checked:
+    if (b->count() != 4 || strcmp(b->cstr(), "keep") != 0)
+        return err(45, "失败时改动了内容");
+    b->reserve(0x40000000) catch e {
+        if (e.id != std.err.NOMEM)
+            return err(46, "过大应该报 NOMEM");
+        goto checked2;
+    };
+    return err(47, "过大却没报错");
+checked2:
+    if (b->count() != 4 || strcmp(b->cstr(), "keep") != 0)
+        return err(48, "失败时改动了内容");
+}
+
+test "reserve 足够时 room 与容量对上" {
+    @StrBuf b = new StrBuf;
+
+    b->reserve(100) catch e { return err(49, "reserve 失败"); };
+    if (b->capacity() < 101 || b->room() < 100)
+        return err(50, "reserve 之后的容量不对");
+    b->reserve(10) catch e { return err(51, "小 reserve 失败"); };
+    if (b->room() < 100)
+        return err(52, "reserve 不该缩容");
+}

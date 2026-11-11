@@ -1,0 +1,381 @@
+/* std/path：POSIX 路径的拆解与拼装。
+ *
+ *     import std.path;
+ *     import std.str;          // 为了 Str 这个类型（路径函数都返回它）
+ *
+ *     Str b = path_base(S("src/main.c6"));   // "main.c6"
+ *     Str d = path_dir(S("src/main.c6"));    // "src"
+ *     Str e = path_ext(S("src/main.c6"));    // ".c6"
+ *     char buf[64] = { 0 };
+ *     path_join(S("src"), S("main.c6"), buf, sizeof buf);   // "src/main.c6"
+ *
+ * 这一层**不分配**：拆出来的都是指向调用方内存的 Str 视图，拼装写进调用方
+ * 给的缓冲（放不下返回 -1，且不写半截）。只认 POSIX 的 '/'：没有盘符、不把
+ * '\\' 当分隔符，也不做 Unicode 处理（路径按字节）。
+ *
+ * 规则（都被自测逐条钉住）：
+ *   - 尾部 '/' 先删（只有 "/" 自己除外）；
+ *   - base 是最后一个 '/' 之后的部分；全是斜杠时 base 是 "/"；空串给 ""；
+ *   - dir 是最后一个 '/' 之前的部分；没有 '/' 给 "."（和 POSIX dirname 一致，
+ *     这样 join(dir(p), base(p)) 能还原 p）；根目录给 "/"；
+ *   - ext 必须「点 + 至少一个字符」，且 basename 开头的点不算扩展名：
+ *     ".bashrc"、"b." 都没有扩展名；stem = base 去掉 ext。
+ *
+ * 注意 dir 与 base 的边界：join 对 a == "." 特判成直接给 b，所以
+ * `path_join(path_dir(p), path_base(p))` 与 `path_normalize(p)` 对常见输入
+ * 给同一个结果（自测里成对验证）。
+ */
+module std.path;
+import std.str;
+
+/* 最后一个 '/' 的下标；没有给 -1 */
+static int last_slash(char[:] p)
+{
+    int i = 0;
+
+    for (i = p.len - 1; i >= 0; i--)
+        if (p.data[i] == '/')
+            return i;
+    return -1;
+}
+
+/* 删掉尾部斜杠，但 "/" 自己保留（多删会把根目录变成空串）。
+   切片的字段不能就地改（tcc 报 read-only location），所以用下标游标重建。 */
+static char[:] strip_trailing(char[:] p)
+{
+    int n = p.len;
+
+    while (n > 1 && p.data[n - 1] == '/')
+        n -= 1;
+    return (char[:]){ p.data, n };
+}
+
+Str path_base(char[:] p)
+{
+    char[:] q = strip_trailing(p);
+    Str r = { q };
+    int i = 0;
+
+    if (q.len == 0)
+        return r;
+    i = last_slash(q);
+    if (i < 0)
+        return r;                    /* 没有斜杠：base 就是整个串 */
+    if (i == q.len - 1)
+        return r;                    /* 全是斜杠（已经压成 "/"） */
+    r.s = (char[:]){ q.data + i + 1, q.len - i - 1 };
+    return r;
+}
+
+Str path_dir(char[:] p)
+{
+    char[:] q = strip_trailing(p);
+    Str r = { (char[:]){ (char *)".", 1 } };
+    int i = 0;
+
+    if (q.len == 0)
+        return r;                    /* 空串给 "." */
+    i = last_slash(q);
+    if (i < 0)
+        return r;                    /* 没有斜杠给 "." */
+    if (i == 0) {
+        r.s = (char[:]){ q.data, 1 };    /* 根目录 */
+        return r;
+    }
+    r.s = strip_trailing((char[:]){ q.data, i });
+    return r;
+}
+
+Str path_ext(char[:] p)
+{
+    Str b = path_base(p);
+    Str r = { (char[:]){ b.s.data + b.s.len, 0 } };
+    int i = 0;
+
+    for (i = b.s.len - 1; i > 0; i--) {
+        if (b.s.data[i] != '.')
+            continue;
+        if (i == b.s.len - 1)
+            return r;                /* "b." 没有扩展名 */
+        r.s = (char[:]){ b.s.data + i, b.s.len - i };
+        return r;
+    }
+    return r;                        /* 没有点，或者点在开头（".bashrc"） */
+}
+
+Str path_stem(char[:] p)
+{
+    Str b = path_base(p);
+    Str e = path_ext(p);
+
+    if (e.s.len == 0)
+        return b;
+    b.s = (char[:]){ b.s.data, b.s.len - e.s.len };
+    return b;
+}
+
+int path_is_abs(char[:] p) { return p.len > 0 && p.data[0] == '/'; }
+
+/* 扩展名是不是 ext（按字面比，调用方写 ".c6"） */
+int path_has_ext(char[:] p, char[:] ext)
+{
+    Str e = path_ext(p);
+    int i = 0;
+
+    if (ext.len == 0 || e.s.len != ext.len)
+        return 0;
+    for (i = 0; i < ext.len; i++)
+        if (e.s.data[i] != ext.data[i])
+            return 0;
+    return 1;
+}
+
+/* 同时给出 dir 和 base；base 非空返回 1 */
+int path_split(char[:] p, Str *dir, Str *base)
+{
+    *dir = path_dir(p);
+    *base = path_base(p);
+    return base->s.len > 0;
+}
+
+/* 拼两个路径写进 dst（cap 含结尾 NUL）：成功返回长度，放不下返回 -1 且
+   **一个字节都不写**。b 是绝对路径时结果就是 b；a 是 "." 时结果也是 b
+   （见头注释里和 path_dir 的配合）。 */
+int path_join(char[:] a, char[:] b, char *dst, int cap)
+{
+    int need = 0, k = 0, i = 0;
+    int skip_a = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    if (b.len > 0 && b.data[0] == '/')
+        skip_a = 1;
+    else if (a.len == 0 || (a.len == 1 && a.data[0] == '.'))
+        skip_a = 1;
+    if (skip_a) {
+        need = b.len;
+        if (cap <= need)
+            return -1;
+        for (i = 0; i < b.len; i++)
+            dst[i] = b.data[i];
+        dst[b.len] = 0;
+        return b.len;
+    }
+    if (b.len == 0) {
+        need = a.len;
+        if (cap <= need)
+            return -1;
+        for (i = 0; i < a.len; i++)
+            dst[i] = a.data[i];
+        dst[a.len] = 0;
+        return a.len;
+    }
+    need = a.len + b.len;
+    if (a.data[a.len - 1] != '/')
+        need += 1;
+    if (cap <= need)
+        return -1;
+    for (i = 0; i < a.len; i++)
+        dst[k++] = a.data[i];
+    if (dst[k - 1] != '/')
+        dst[k++] = '/';
+    for (i = 0; i < b.len; i++)
+        dst[k++] = b.data[i];
+    dst[k] = 0;
+    return k;
+}
+
+/* 词法归一：折叠重复的 '/'、去掉 "." 成分、去掉尾部 '/'。
+   ".." **原样保留**：词法消 ".." 会穿过符号链接改变语义（"a/../b" 不一定是
+   "b"），这种决定不能由库替调用方做。结果为空时相对路径给 "."、绝对给 "/"。
+   放不下返回 -1 且不写半截。 */
+int path_normalize(char[:] p, char *dst, int cap)
+{
+    int abs = 0, k = 0, i = 0, j = 0, b = 0, len = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    /* 输出永远不会比输入长（只删字符、重建分隔符）；空输入要写 "."，
+       所以至少还要一格 NUL。 */
+    if (cap <= p.len || cap <= 1)
+        return -1;
+    abs = p.len > 0 && p.data[0] == '/';
+    if (abs)
+        dst[k++] = '/';
+    while (i < p.len) {
+        while (i < p.len && p.data[i] == '/')
+            i++;
+        b = i;
+        while (i < p.len && p.data[i] != '/')
+            i++;
+        len = i - b;
+        if (len == 0)
+            continue;
+        if (len == 1 && p.data[b] == '.')
+            continue;                /* "." 成分没有意义 */
+        if (k > 0 && dst[k - 1] != '/')
+            dst[k++] = '/';
+        for (j = 0; j < len; j++)
+            dst[k++] = p.data[b + j];
+    }
+    if (k == 0) {
+        if (abs)
+            dst[k++] = '/';
+        else
+            dst[k++] = '.';
+    }
+    dst[k] = 0;
+    return k;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "base / dir 的规则表" {
+    Str b = path_base(S("src/main.c6"));
+    Str d = path_dir(S("src/main.c6"));
+    Str b2 = path_base(S("a//b/"));
+    Str d2 = path_dir(S("a//b/"));
+    Str b3 = path_base(S("/"));
+    Str d3 = path_dir(S("/"));
+    Str b4 = path_base(S(""));
+    Str d4 = path_dir(S(""));
+    Str b5 = path_base(S("plain"));
+    Str d5 = path_dir(S("plain"));
+
+    if (!(&b)->eq(S("main.c6")) || !(&d)->eq(S("src")))
+        return err(1, "普通路径拆解不对");
+    if (!(&b2)->eq(S("b")) || !(&d2)->eq(S("a")))
+        return err(2, "重复斜杠/尾斜杠拆解不对");
+    if (!(&b3)->eq(S("/")) || !(&d3)->eq(S("/")))
+        return err(3, "根目录拆解不对");
+    if ((&b4)->count() != 0 || !(&d4)->eq(S(".")))
+        return err(4, "空串拆解不对");
+    if (!(&b5)->eq(S("plain")) || !(&d5)->eq(S(".")))
+        return err(5, "无斜杠拆解不对");
+}
+
+test "ext / stem 对隐藏文件和尾点的约定" {
+    Str e = path_ext(S("a/b.tar.gz"));
+    Str s = path_stem(S("a/b.tar.gz"));
+    Str h = path_ext(S("a/.bashrc"));
+    Str t = path_ext(S("a/b."));
+    Str n = path_ext(S("a/b"));
+    Str s2 = path_stem(S(".bashrc"));
+
+    if (!(&e)->eq(S(".gz")) || !(&s)->eq(S("b.tar")))
+        return err(6, "多段扩展名不对");
+    if ((&h)->count() != 0)
+        return err(7, "隐藏文件不该有扩展名");
+    if ((&t)->count() != 0)
+        return err(8, "尾部点不该算扩展名");
+    if ((&n)->count() != 0)
+        return err(9, "没有点就不该有扩展名");
+    if (!(&s2)->eq(S(".bashrc")))
+        return err(10, "隐藏文件 stem 应原样");
+}
+
+test "is_abs / has_ext / split" {
+    Str dir = { S("x") };
+    Str base = { S("y") };
+
+    if (path_is_abs(S("/a")) != 1 || path_is_abs(S("a/b")) != 0
+        || path_is_abs(S("")) != 0)
+        return err(11, "path_is_abs 不对");
+    if (path_has_ext(S("a/b.c6"), S(".c6")) != 1)
+        return err(12, "has_ext 命中失败");
+    if (path_has_ext(S("a/b.c6"), S(".h")) != 0)
+        return err(13, "has_ext 误命中");
+    if (path_split(S("a/b.c6"), &dir, &base) != 1)
+        return err(14, "path_split 应返回 1");
+    if (!(&dir)->eq(S("a")) || !(&base)->eq(S("b.c6")))
+        return err(15, "path_split 结果不对");
+    if (path_split(S("/"), &dir, &base) != 1 || !(&base)->eq(S("/")))
+        return err(16, "根目录 split 不对");
+}
+
+test "join 的组合与 \".\" 特判" {
+    char buf[32] = { 0 };
+
+    if (path_join(S("src"), S("main.c6"), buf, sizeof buf) != 11
+        || strcmp(buf, "src/main.c6") != 0)
+        return err(17, "普通拼接不对");
+    if (path_join(S("src/"), S("main.c6"), buf, sizeof buf) != 11
+        || strcmp(buf, "src/main.c6") != 0)
+        return err(18, "尾斜杠拼接重复了分隔符");
+    if (path_join(S("."), S("a"), buf, sizeof buf) != 1
+        || strcmp(buf, "a") != 0)
+        return err(19, "join(\".\", b) 应给 b");
+    if (path_join(S("a"), S("/b"), buf, sizeof buf) != 2
+        || strcmp(buf, "/b") != 0)
+        return err(20, "绝对路径应覆盖 a");
+    if (path_join(S("a"), S(""), buf, sizeof buf) != 1
+        || strcmp(buf, "a") != 0)
+        return err(21, "空 b 应给 a");
+}
+
+test "join / normalize 放不下时一个字节都不写" {
+    char buf[8] = { 0 };
+    char small[4] = { 'X', 'X', 'X', 'X' };
+    char small2[4] = { 'X', 'X', 'X', 'X' };
+
+    if (path_join(S("source"), S("main.c6"), buf, 4) != -1 || buf[0] != 0)
+        return err(22, "join 放不下时写了半截");
+    if (path_join(S("source"), S("main.c6"), small, sizeof small) != -1
+        || small[0] != 'X')
+        return err(23, "join 放不下时改动了缓冲");
+    if (path_normalize(S("a/b/c"), small2, sizeof small2) != -1
+        || small2[0] != 'X')
+        return err(24, "normalize 放不下时改动了缓冲");
+    if (path_join(S("a"), S("b"), (char *)0, 8) != -1)
+        return err(25, "空目标没返回 -1");
+}
+
+test "normalize 折叠重复斜杠与点" {
+    char buf[32] = { 0 };
+
+    if (path_normalize(S("a//b/./c"), buf, sizeof buf) != 5
+        || strcmp(buf, "a/b/c") != 0)
+        return err(26, "相对路径归一不对");
+    if (path_normalize(S("/a/./b/"), buf, sizeof buf) != 4
+        || strcmp(buf, "/a/b") != 0)
+        return err(27, "绝对路径归一不对");
+    if (path_normalize(S(""), buf, sizeof buf) != 1
+        || strcmp(buf, ".") != 0)
+        return err(28, "空串归一应给 .");
+    if (path_normalize(S("///"), buf, sizeof buf) != 1
+        || strcmp(buf, "/") != 0)
+        return err(29, "全斜杠归一应给 /");
+    if (path_normalize(S("./a"), buf, sizeof buf) != 1
+        || strcmp(buf, "a") != 0)
+        return err(30, "前导 ./ 没去掉");
+}
+
+test "normalize 保留 \"..\"（词法不能消）" {
+    char buf[32] = { 0 };
+
+    if (path_normalize(S("a/../b"), buf, sizeof buf) != 6
+        || strcmp(buf, "a/../b") != 0)
+        return err(31, "\"..\" 不该被词法消掉");
+    if (path_normalize(S("../a"), buf, sizeof buf) != 4
+        || strcmp(buf, "../a") != 0)
+        return err(32, "开头的 .. 丢了");
+}
+
+test "join(dir, base) 与 normalize 对常见输入一致" {
+    char j[32] = { 0 };
+    char n[32] = { 0 };
+    Str dir = path_dir(S("a/b.c6"));
+    Str base = path_base(S("a/b.c6"));
+    Str pd = path_dir(S("plain"));
+    Str pb = path_base(S("plain"));
+
+    if (path_join(dir.s, base.s, j, sizeof j) != 6
+        || strcmp(j, "a/b.c6") != 0)
+        return err(33, "普通路径的拆解/拼装不自洽");
+    if (path_normalize(S("a/b.c6"), n, sizeof n) != 6 || strcmp(j, n) != 0)
+        return err(34, "join 与 normalize 不一致");
+    if (path_join(pd.s, pb.s, j, sizeof j) != 5 || strcmp(j, "plain") != 0)
+        return err(35, "无斜杠路径拼不回来");
+}

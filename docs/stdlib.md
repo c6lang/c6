@@ -27,36 +27,57 @@
 | `std/span.c6` | `std.span` | 别人内存上的窗口 `Span@T`（纯值，零拷贝） |
 | `std/map.c6` | `std.map` | 开放寻址哈希表 `Map@(K, V)`、`Entry@(K, V)`、`Iter@(K, V)`：`put`/`get`/`get_or`/`set`/`put_new`/`remove`/`clear` |
 | `std/str.c6` | `std.str` | 字符串视图 `Str`（`char[:]` 的包装，不分配）与字面量宏 `S()`：切分 `split`/`lines`/`join`、查找 `find`/`last_find`/`contains`/`count_char`/`count_sub`、裁剪 `trim`/`trim_left`/`trim_right`、转换 `to_int`/`to_base`/`copy_upper`/`copy_lower`、`cmp`/`cmp_str`/`cmp_cstr`、`replace`/`split_once`、`hash` |
-| `std/fmt.c6` | `std.fmt` | 定长格式化缓冲 `Buf@(N)`：`write_int`/`write_uint`/`write_u64`、`write_hex`/`write_bin`、`write_bool`/`write_ptr`、`write_pad`、拼接 |
+| `std/fmt.c6` | `std.fmt` | 定长格式化缓冲 `Buf@(N)`：`write_int`/`write_uint`/`write_u64`、`write_hex`/`write_hex64`/`write_bin`、`write_bool`/`write_ptr`、`write_pad`、拼接；数字转换原语 `digits_u32`/`digits_u64`/`digits_hex` 与 `std.strbuf` 共用 |
 | `std/range.c6` | `std.range` | 能被 `foreach` 吃掉的区间 `Range`/`StepRange` |
 | `std/sort.c6` | `std.sort` | 比较器驱动的排序与查找：`sort_bytes`/`sort_int`/`sort_u32`/`sort_f64`（稳定归并 + 小数组插入）、`find_bytes`/`find_int`/`find_u32`、`lower_bound_int`/`upper_bound_int`、`cmp_int`/`cmp_u32`/`cmp_f64`/`cmp_int_desc`、`is_sorted_int` |
 | `std/mem.c6` | `std.mem` | 借用式内存池 `Arena`（`alloc`/`alloc_array`/`reset`/`room`/`used`）、托管堆薄包装 `alloc_new`/`alloc_new_array`/`dealloc`、按元素的 `copy`/`fill`/`zero`/`swap`/`rotate`/`reverse_bytes`、`align_up`/`align_down`/`is_aligned` |
 | `std/io.c6` | `std.io` | 文件与标准流：`Reader`（`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`）、`Writer`（`write_line`/`write_bytes`/`write_slice`/`flush`）、零分配的按行迭代 `CFile` |
 | `std/math.c6` | `std.math` | 整数：`min`/`max`/`clamp`/`iabs`/`gcd`/`lcm`/`ipow`/`ipow_u64`/`imul_checked`/`sat_add`/`sat_mul`/`is_pow2`/`next_pow2`/`floor_div`/`mod`；浮点（不链 libm）：`sqrt`/`floor`/`ceil`/`trunc`/`round`/`fabs`/`nearly_eq`/`clamp_f64`/`fact` |
 | `std/time.c6` | `std.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `format_duration`、`Civil` 日历换算 `civil_from_unix`/`unix_from_civil`/`format_civil`（不依赖 localtime） |
+| `std/strbuf.c6` | `std.strbuf` | 会自己长大的字符缓冲 `StrBuf`（托管引用）：`write`/`write_cstr`/`push`、`write_int`/`write_u64`/`write_hex`、`reserve`/`truncate`/`clear`/`slice`/`cstr`（依赖 `std.fmt` 的数字原语） |
+| `std/utf8.c6` | `std.utf8` | UTF-8 解码 `utf8_decode`（返回 1..4，拒绝过长编码/代理区/超范围/截断）、编码 `utf8_encode`、`utf8_valid`/`utf8_count`、`Rune` 与 `utf8_runes()` 迭代器 |
+| `std/bits.c6` | `std.bits` | 位运算：`popcount32/64`、`parity32`、`clz32/64`、`ctz32/64`（0 输入给 32/64）、`rotl`/`rotr`、`bswap16/32/64`、`bit_get/set/clear/toggle`、`mask_low`/`mask_range`、`sign_extend`、`is_pow2_32/64` |
+| `std/hash.c6` | `std.hash` | 哈希：FNV-1a 32/64（`fnv1a_bytes`/`fnv1a_cstr`/`fnv1a64_bytes`）、`crc32_bytes`、`adler32_bytes`，以及流式 `Hasher`（`hasher`/`update`/`digest`） |
+| `std/path.c6` | `std.path` | POSIX 路径：`path_base`/`path_dir`/`path_ext`/`path_stem`/`path_is_abs`/`path_has_ext`/`path_split`、`path_join`/`path_normalize`（写调用方缓冲，放不下返回 -1 且不写半截） |
+| `std/deque.c6` | `std.deque` | 环形缓冲双端队列 `Deque@T`（托管引用）与 `DIter@T`：`push_back`/`push_front`/`pop_back`/`pop_front`、`first`/`last`/`at`/`get`/`set`/`reserve`/`clear` |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
+| `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带 73 条自检 |
 
-每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（140 个断言）：
+每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（一共 149 个 test 块）：
 
 ```
-std/err.c6       3 test(s), 0 failure(s)
-std/fmt.c6       8 test(s), 0 failure(s)
-std/io.c6        5 test(s), 0 failure(s)
-std/map.c6       8 test(s), 0 failure(s)
-std/math.c6      6 test(s), 0 failure(s)
-std/mem.c6       7 test(s), 0 failure(s)
-std/range.c6     6 test(s), 0 failure(s)
-std/sort.c6     26 test(s), 0 failure(s)
-std/span.c6      6 test(s), 0 failure(s)
-std/str.c6      18 test(s), 0 failure(s)
-std/time.c6      7 test(s), 0 failure(s)
-std/types.c6     4 test(s), 0 failure(s)
-std/vec.c6      36 test(s), 0 failure(s)
+std/str.c6       22 test(s), 0 failure(s)
+std/sort.c6      30 test(s), 0 failure(s)
+std/bits.c6       6 test(s), 0 failure(s)
+std/deque.c6      9 test(s), 0 failure(s)
+std/err.c6        3 test(s), 0 failure(s)
+std/fmt.c6       10 test(s), 0 failure(s)
+std/hash.c6       7 test(s), 0 failure(s)
+std/io.c6         5 test(s), 0 failure(s)
+std/map.c6        8 test(s), 0 failure(s)
+std/math.c6       6 test(s), 0 failure(s)
+std/mem.c6        7 test(s), 0 failure(s)
+std/path.c6      30 test(s), 0 failure(s)
+std/range.c6      6 test(s), 0 failure(s)
+std/span.c6       6 test(s), 0 failure(s)
+std/strbuf.c6    18 test(s), 0 failure(s)
+std/time.c6       7 test(s), 0 failure(s)
+std/types.c6      4 test(s), 0 failure(s)
+std/utf8.c6       7 test(s), 0 failure(s)
+std/vec.c6       42 test(s), 0 failure(s)
 ```
 
 `-test` 的计数是命令行上**所有 TU** 的 `test` 块之和，所以带依赖跑的行会把自己
-和依赖的块一起算进去：`std/sort.c6` 那行 = str 18 + sort 8，`std/vec.c6` 那行
-= str 18 + sort 8 + vec 10。
+和依赖的块一起算进去（行内加起来 233，去掉重复计算的依赖正好 149）：
+
+| 行 | 构成 |
+| --- | --- |
+| `std/sort.c6` 30 | str 22 + sort 8 |
+| `std/vec.c6` 42 | str 22 + sort 8 + vec 12 |
+| `std/path.c6` 30 | str 22 + path 8（path 只借 `Str` 这个类型，函数体不依赖 str 的代码） |
+| `std/strbuf.c6` 18 | fmt 10 + strbuf 8 |
+
+`std/bits`、`std/hash`、`std/utf8`、`std/deque` 自成一体，单独跑就是自己的块数。
 
 ## 设计原则
 
@@ -215,6 +236,21 @@ join(parts, 2, '-', buf, sizeof buf);        /* "a-bb"；空间不够给 -1，�
 按字节求哈希是同一套）。大小写转换不能改原内存，所以写成
 `copy_upper(dst, cap)` / `copy_lower(dst, cap)`：成功返回长度，空间不够给 -1。
 
+解析与剥离（都只动视图）：
+
+```c
+u64 n = 0ull;
+p->to_u64(&n) catch e { return err(e.id, e.msg); };  /* 1 空 2 非数字 3 越界 4 没数字 */
+Str rest = { S("") };
+if (p->strip_prefix(S("src/"), &rest)) { ... }       /* 命中给 1，没命中不动 *rest */
+p->strip_suffix(S(".c6"), &rest);                     /* 对称 */
+foreach (Str w = p->fields()) { ... }                 /* 按空白切分，连续空白只算一个 */
+```
+
+`to_u64` 先判 `(U64_MAX - d) / 10` 再乘，所以溢出不会悄悄回绕；`-1` 报码 2
+（无符号不接受负号），`+` 前缀可以。`fields()` 跳过空字段，`"  a  b "` 给
+`a`、`b`。
+
 ### `Buf@(N)`：定长格式化
 
 ```c
@@ -233,6 +269,111 @@ o->clear();  o->room();  o->cap();  o->count();
 
 容量 N 里始终留一格给结尾 NUL：最多装 `N-1` 个字符。空间不够时返回
 `T!error` 且**不写半截**（长度和内容都不动）。
+
+数字转换的脏活被抽成了三个文件作用域原语：`digits_u32`、`digits_u64`、
+`digits_hex`——往调用方给的缓冲里写十进制/十六进制，返回长度，放不下返回
+`-1` 且一个字节都不写。`Buf@(N)` 的 `write_*` 和 `std.strbuf` 都建在它们
+上面，所以两条路径的格式永远一致。`write_hex` 收 `u32`；要写满 64 位十六
+进制用 `write_hex64`（把 `write_hex` 直接加宽到 `u64` 会触发编译器挂起，
+见下面的「已知限制」）。
+
+### `StrBuf`：会自己长大的字符串
+
+```c
+import std.strbuf;
+
+@StrBuf b = new StrBuf;                  /* 托管引用：含 @char 字段，必须 new */
+b->write(S("n=")) catch e { return 1; }; /* 失败不改内容 */
+b->write_int(-42) catch e { return 1; };
+b->write_hex(0xdeadbeefu) catch e { return 1; };
+b->push('\n') catch e { return 1; };
+puts(b->cstr());                         /* 总是以 NUL 结尾 */
+b->count();  b->capacity();  b->room();  b->is_empty();
+b->slice();                              /* 当前内容的切片 */
+b->truncate(3);  b->clear();             /* 只改长度，容量留着 */
+b->reserve(4096) catch e { return 1; };  /* 翻倍策略写在库里 */
+```
+
+和 `Buf@(N)` 的分工：上限是常量（协议头、日志行）就用 `Buf@(N)`，纯值、零
+分配；长度事先不知道才用 `StrBuf`。扩容从 64 起翻倍，超过 `0x3fffffff` 直接
+报 `NOMEM`（不先分配再失败）。
+
+### `path_*`：POSIX 路径拆装
+
+```c
+import std.path;
+import std.str;                          /* 只为 Str 这个类型 */
+
+Str p = { S("docs/stdlib.md") };
+Str d = path_dir(p.s);                   /* "docs" */
+Str b = path_base(p.s);                  /* "stdlib.md" */
+Str e = path_ext(p.s);                   /* ".md" */
+Str s = path_stem(p.s);                  /* "stdlib" */
+
+char buf[64] = { 0 };
+path_join(d.s, b.s, buf, sizeof buf);    /* 14，"docs/stdlib.md" */
+path_normalize(S("./docs//stdlib.md"), buf, sizeof buf);
+```
+
+规则：只认 `/`（没有盘符），尾部斜杠先删；`dir` 没有斜杠时给 `"."`（POSIX
+`dirname` 的约定，配合 `join` 的特判能还原原路径）；`.bashrc`、`b.` 都算
+没有扩展名。`path_normalize` 折叠重复斜杠和 `"."`，但**保留 `".."`**——词法
+消 `".."` 会穿过符号链接改变语义，这个决定不能由库替调用方做。所有函数都
+不分配：拆出来的 `Str` 是指向调用方内存的视图，拼装写进调用方的缓冲，放不
+下返回 `-1` 且不写半截。
+
+### `hash` / `bits` / `utf8`：三块零分配的底层
+
+```c
+import std.hash;
+import std.bits;
+import std.utf8;
+
+u32 h = fnv1a_cstr("docs/stdlib.md");    /* 与 Str::hash、std.map 同算法 */
+u32 c = crc32_bytes("123456789", 9);     /* 0xCBF43926 */
+u64 h64 = fnv1a64_bytes(p, n);
+
+Hasher st = hasher();                    /* 流式：分几段喂结果一样 */
+update(&st, s1.data, (usize)s1.len);
+u32 d = digest(&st);
+
+popcount32(0xf0f0f0f0u);  clz32(1u);  ctz32(8u);   /* 0 输入给 32/64 */
+rotl32(v, 1);  bswap32(v);  mask_range(4, 8);
+is_pow2_32(1024u);
+
+u32 cp = 0;
+int n2 = utf8_decode(S("héllo"), 1, &cp);          /* 2，cp = 0xe9 */
+utf8_encode(0x4e16, buf, sizeof buf);              /* 3 字节；非法码点给 -1 */
+utf8_valid(S("..."));  utf8_count(S("..."));       /* 校验 / rune 计数 */
+foreach (Rune r = utf8_runes(S("héllo"))) { ... }  /* r.cp / r.pos / r.size / r.ok */
+```
+
+`utf8_decode` 返回 1..4（占用字节数），拒绝过长编码、代理区、`> U+10FFFF`
+和截断序列，坏字节只前进 1 个字节；`utf8_encode` 先校验码点，失败时**不写
+任何内容**。`crc32` 是逐位实现（没有 256 项的表），`adler32` 也是纯算术，
+两者都不链 `zlib`。
+
+### `Deque@T`：环形缓冲双端队列
+
+```c
+import std.deque;
+
+@Deque@int d = new Deque@int;
+d->push_back(2) catch e { return e.id; };
+d->push_front(1) catch e { return e.id; };
+int v = 0;
+d->pop_front(&v);                        /* 1 */
+d->pop_back(&v);                         /* 2 */
+d->at(0);  d->get(0, &v);  d->set(0, 7);
+d->first(&v);  d->last(&v);
+foreach (int x = d->iter()) { ... }
+```
+
+元素放在 `@T` 托管的环形数组里，逻辑下标是 `(head + i) % cap`；扩容后按逻辑
+顺序摊平（`head = 0`）。和 `Vect` 的分工：要连续内存（排序、切片、按字节搬）
+用 `Vect`，要两端进出用 `Deque`——`push_front` 在数组上只能是 O(n)，环形下标
+才是它存在的理由。`push_*`/`reserve` 会分配，返回 `int!error`；`pop_*` 空容器
+给 0 且不写 `*out`；`at(i)` 是前置条件，要检查就用 `get`。
 
 ### `Range`：能被 `foreach` 吃掉
 
@@ -269,6 +410,27 @@ make std-demo
 的排序内核来自 `std.sort`——`import` 只带声明，所以 `std/sort.c6` 的正文也
 必须一起编（背后一共 8 个 `std` 模块）。
 
+### 集成示例：`examples/stdtour.c6`
+
+```sh
+make std-tour
+```
+
+```
+stdtour: 标准库新模块一日游
+strbuf  -42 deadbeef             std/vec.c6 ...
+path    docs + stdlib.md = stdlib [.md]
+hash    fnv32=9cccb87e fnv64=b142c6921124ac1e crc32=123456789->cbf43926
+bits    0x0101010101010101 parity=0
+utf8    14 bytes / 9 runes, first=19990
+deque   窗口=[3 4 5 6] 加上 1 2 后 sum=21
+stdtour: 73 check(s), 0 failure(s)
+```
+
+六个新模块各一节，每节都带自检（失败打 `FAIL`，最后按失败数决定退出码），
+所以它既是演示也是集成用例：strbuf 拼串、path 拆装、hash 已知向量、bits
+位运算、utf8 的合法/非法输入、deque 滚动窗口。
+
 ## 写法约定（照着写就不会踩坑）
 
 * **普通结构体的方法就是「第一个参数是结构体指针」的文件作用域函数**：
@@ -284,6 +446,12 @@ make std-demo
   就 `catch e { id = e.id; goto done; }`。
 * `foreach` 体必须是 `{ }`；`has()`/`next()` 必须带函数体。
 * 泛型实参不要用块作用域里的 `struct` tag，把类型放到文件作用域。
+* **切片的字段不能就地改**：`char[:] p; p.len -= 1;` → `assignment of
+  read-only location`。用游标算完再重建：`(char[:]){ p.data, n }`。
+* `catch` 体里不能只写普通语句（必须 `return`/`err()`/`goto` 收尾），所以
+  「失败了记一笔再继续跑」这种写法要包一层：`static int put_int(StrBuf *b,
+  int v) { b->write_int(v) catch e { return -1; }; return 0; }`，调用方
+  `check(put_int(b, -42) == 0, "...")`（见 `examples/stdtour.c6`）。
 * `#include` 要写在 `module` 前面；`main` 不能出现在模块里。
 
 ## 已知限制（编译器层面，标准库已绕开）
@@ -297,6 +465,7 @@ make std-demo
 | **普通**（非泛型）结构体不能在 `struct` 体内写方法体（`a function cannot be defined inside a struct`） | 方法写成「第一个参数是结构体指针」的文件作用域函数，调用写 `(&v)->m()` |
 | 文件作用域里写「参数/返回类型带实例类型」的辅助函数，会让**导入这个模块的每个 TU** 都提前实例化该类型 | 别这么写；需要时把逻辑放进 `test` 块或用标量参数（`std/fmt.c6` 的测试用 `goto` 取错误码） |
 | ~~往 `Buf@(N)` 里加若干形状相同的方法会挂~~（曾经的 `skip(')')` → `end_macro()` 死循环） | **已消失**：同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）加到五个也编得过、跑得通，`std/fmt` 的 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr` 就是照这个形状补的（`tccpp.c` 的宏重放改写之后不再复现） |
+| 把 `Buf@(N)` 的 `write_hex` 形参从 `u32` 加宽到 `u64` 会**挂住编译器**（`-c` 无输出直到超时，退出码 124；最小复现里同样的 `data + n` 写法单独编没问题） | 保持 `write_hex(u32)`，另加 `write_hex64(u64)`：两个方法体不同形，触发点就绕开了 |
 
 这些限制在 `docs/grammar.md`（约束表 C1xx）和 `docs/plan.md` 里有对应的
 条目；标准库的写法就是它们当前的「推荐用法」。
@@ -306,5 +475,6 @@ make std-demo
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
   边界（字段名 vs 同名方法、方法形参名不漏到调用方、两个 TU 都实例化同一
   模板时方法体是弱符号）。
-* `make stdtest`：`std/` 下十三个模块的全部 `test` 块。
-* `make std-demo`：上面那个集成示例。
+* `make stdtest`：`std/` 下十九个模块的全部 `test` 块（149 个）。
+* `make std-demo`：`examples/wordcount.c6` 那个集成示例。
+* `make std-tour`：`examples/stdtour.c6`，新模块的拼装示例（73 条自检）。

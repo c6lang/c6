@@ -251,6 +251,53 @@ struct Vect@T {
             acc = op(acc, data[i]);
         return acc;
     }
+
+    /* 有没有元素满足 pred；空容器给 0 */
+    int any(int (*pred)(T v))
+    {
+        int i = 0;
+
+        for (i = 0; i < n; i++)
+            if (pred(data[i]))
+                return 1;
+        return 0;
+    }
+
+    /* 是不是每个元素都满足 pred；空容器给 1（vacuous truth） */
+    int all(int (*pred)(T v))
+    {
+        int i = 0;
+
+        for (i = 0; i < n; i++)
+            if (!pred(data[i]))
+                return 0;
+        return 1;
+    }
+
+    /* 第一个满足 pred 的下标；没有给 -1 */
+    int find_if(int (*pred)(T v))
+    {
+        int i = 0;
+
+        for (i = 0; i < n; i++)
+            if (pred(data[i]))
+                return i;
+        return -1;
+    }
+
+    /* 交换两个下标：成功返回 1，越界返回 0（不动内容） */
+    int swap(int i, int j)
+    {
+        if (!data || i < 0 || i >= n || j < 0 || j >= n)
+            return 0;
+        {
+            T t = data[i];
+
+            data[i] = data[j];
+            data[j] = t;
+        }
+        return 1;
+    }
 };
 
 struct Iter@T {
@@ -427,6 +474,10 @@ static int stop_at5(int v) { return v >= 5; }
 
 static int add2(int acc, int v) { return acc + v; }
 
+static int is_odd(int v) { return v % 2 != 0; }
+
+static int is_big(int v) { return v > 10; }
+
 test "sort / sort_lex" {
     @Vect@int v = new Vect@int;
     int i = 0;
@@ -470,4 +521,44 @@ test "each / filter / fold" {
         return err(71, "filter 留下的个数不对");
     if (w->at(0) != 2 || w->at(1) != 4)
         return err(72, "filter 结果不对");
+}
+
+test "any / all / find_if" {
+    @Vect@int v = new Vect@int;
+    @Vect@int e = new Vect@int;
+
+    v->push(1) catch err1 { return err(73, "push 失败"); };
+    v->push(2) catch err2 { return err(74, "push 失败"); };
+    v->push(3) catch err3 { return err(75, "push 失败"); };
+    if (v->any(&is_even) != 1 || v->any(&is_odd) != 1)
+        return err(76, "any 不对");
+    if (v->all(&is_even) != 0)
+        return err(77, "all 误判");
+    if (v->find_if(&is_even) != 1)
+        return err(78, "find_if 命中位置不对");
+    if (v->find_if(&is_big) != -1)
+        return err(79, "find_if 没命中应给 -1");
+    /* 空容器：any = 0，all = 1（vacuous truth） */
+    if (e->any(&is_even) != 0 || e->all(&is_even) != 1)
+        return err(80, "空容器的 any/all 约定不对");
+    if (e->find_if(&is_even) != -1)
+        return err(81, "空容器的 find_if 应给 -1");
+}
+
+test "swap 正常交换与越界不动" {
+    @Vect@int v = new Vect@int;
+
+    v->push(10) catch e { return err(82, "push 失败"); };
+    v->push(20) catch e { return err(83, "push 失败"); };
+    v->push(30) catch e { return err(84, "push 失败"); };
+    if (v->swap(0, 2) != 1)
+        return err(85, "swap 没成功");
+    if (v->at(0) != 30 || v->at(1) != 20 || v->at(2) != 10)
+        return err(86, "swap 之后内容不对");
+    if (v->swap(0, 3) != 0 || v->swap(-1, 0) != 0)
+        return err(87, "越界 swap 应返回 0");
+    if (v->at(0) != 30 || v->at(2) != 10)
+        return err(88, "越界 swap 改动了内容");
+    if (v->swap(1, 1) != 1 || v->at(1) != 20)
+        return err(89, "自交换不对");
 }
