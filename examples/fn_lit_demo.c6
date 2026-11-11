@@ -48,7 +48,7 @@ int main(void)
     /* 6. 可失败的字面量 */
     int (*divi)(int, int)!error = int!error (int a, int b) {
         if (!b)
-            err(1, "division by zero");
+            return err(1, "division by zero");
         return a / b;
     };
     divi(9, 0) catch e {

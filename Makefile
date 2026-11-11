@@ -22,6 +22,7 @@
 
 TCC_DIR  := tcc
 SELFTEST := tests/run-tests.sh
+ERRBASE := tests/run-errbase.sh
 JOBS     ?= $(shell nproc 2>/dev/null || echo 4)
 CFLAGS   ?= -g -O0 -Wall -Wno-unused-result
 EXT      := EXTRA-DEFS=-DC6_EXT
@@ -44,7 +45,7 @@ HOSTCC   ?= gcc
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
-        stdtest std-demo
+        stdtest errcheck std-demo
 
 all: build
 
@@ -92,6 +93,12 @@ test-plain: build-plain
 # c6 代码只能写在 .c6 文件里：后缀是唯一的开关，命令行没有 -std=c6。
 selftest: build
 	./$(SELFTEST)
+
+# 错误码号段表：errbase.def 必须与「现在 -emit-errbase 会产出的东西」一致
+# （加了模块忘了钉号、或者手改表改了别人的号，都会失败），并且表的各种约束
+# （C126/C127/C128）真的会报错。见 tests/run-errbase.sh。
+errcheck: build
+	./$(ERRBASE)
 
 # std/：标准库。每个文件一个 module（模块名就是路径：std/vec.c6 -> std.vec），
 # 每个文件自带 test 块，逐个跑。
@@ -200,7 +207,7 @@ test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
 # 完整验收：test-all 之外还有 C99 后端的两套用例（96 组各跑一遍）和三条
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
-check-all: test-all c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc
+check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc
 
 # C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。

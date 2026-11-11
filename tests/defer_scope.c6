@@ -61,7 +61,7 @@ static void nested_dispatch(void)
 test "清理体里退出作用域：嵌套派发" {
     nested_dispatch();
     if (!LG_IS("mAbBC"))
-        err(1, "清理体里的作用域没有正确派发");
+        return err(1, "清理体里的作用域没有正确派发");
 }
 
 /* 两层清理体套在一起 */
@@ -86,7 +86,7 @@ static void nested_two_deep(void)
 test "两层清理体里的 defer" {
     nested_two_deep();
     if (!LG_IS("m162435"))
-        err(1, "两层清理体的执行顺序不对");
+        return err(1, "两层清理体的执行顺序不对");
 }
 
 /* ---- 2. 正常退出作用域后 errdefer 被丢弃 ---- */
@@ -97,7 +97,7 @@ static int!error errdef_dropped(void)
     {
         errdefer g_dropped += 1;       /* 作用域正常退出：它被丢弃 */
     }
-    err(7, "boom");                    /* 这里不该再跑上面那个 errdefer */
+    return err(7, "boom");                    /* 这里不该再跑上面那个 errdefer */
     return 0;
 }
 
@@ -105,12 +105,12 @@ test "正常退出作用域的 errdefer 被丢弃" {
     g_dropped = 0;
     errdef_dropped() catch e {
         if (e.id != 7)
-            err(1, "错误码不对");
+            return err(1, "错误码不对");
         if (g_dropped != 0)
-            err(2, "已经正常退出作用域的 errdefer 又被执行了");
+            return err(2, "已经正常退出作用域的 errdefer 又被执行了");
         return 0;                      /* 进了 catch 就是预期路径 */
     };
-    err(3, "没有进入错误路径");
+    return err(3, "没有进入错误路径");
 }
 
 /* ---- 3. 错误路径：errdefer + defer，跨作用域逆序 ---- */
@@ -122,7 +122,7 @@ static int!error errdef_order(void)
         {
             errdefer lg("e");
             defer lg("2");
-            err(9, "deep");
+            return err(9, "deep");
         }
     }
     return 0;
@@ -132,12 +132,12 @@ test "错误路径把 errdefer 和 defer 一起逆序执行" {
     lg_reset();
     errdef_order() catch e {
         if (e.id != 9)
-            err(1, "错误码不对");
+            return err(1, "错误码不对");
         if (!LG_IS("2e1"))
-            err(2, "错误路径的清理顺序不对");
+            return err(2, "错误路径的清理顺序不对");
         return 0;
     };
-    err(3, "没有进入错误路径");
+    return err(3, "没有进入错误路径");
 }
 
 /* ---- 4. 同一个作用域实例里重复注册只跑一次 ---- */
@@ -157,7 +157,7 @@ again:
 test "同一个作用域实例里重复注册只跑一次" {
     arm_twice();
     if (g_twice != 1)
-        err(1, "同一个作用域实例里同一个清理点跑了不止一次");
+        return err(1, "同一个作用域实例里同一个清理点跑了不止一次");
 }
 
 /* ---- 5. goto 回到作用域入口：离开时清理，回来时重新注册 ----
@@ -184,7 +184,7 @@ loop:
 test "goto 回到作用域入口会重新注册" {
     goto_back();
     if (g_back != 3)
-        err(1, "每次进入作用域都应该重新注册一次清理");
+        return err(1, "每次进入作用域都应该重新注册一次清理");
 }
 
 /* ---- 6. 深递归：每帧独立，没有记录条数上限 ---- */
@@ -201,9 +201,9 @@ static int deep_rec(int n)
 test "20000 层递归每帧各跑一次清理" {
     g_rec = 0;
     if (deep_rec(20000) != 20000)
-        err(1, "深递归的返回值不对");
+        return err(1, "深递归的返回值不对");
     if (g_rec != 20001)
-        err(2, "深递归的清理次数不对（记录上限或互相覆盖）");
+        return err(2, "深递归的清理次数不对（记录上限或互相覆盖）");
 }
 
 /* ---- 7. 同一个作用域里 40 个清理点（位图跨字）---- */
@@ -258,5 +258,5 @@ static void many_sites(void)
 test "同一作用域 40 个清理点按逆序执行" {
     many_sites();
     if (!LG_IS("!>BAzyxwvutsrqponmlkjihgfedcba9876543210<"))
-        err(1, "40 个清理点没有按逆序执行");
+        return err(1, "40 个清理点没有按逆序执行");
 }

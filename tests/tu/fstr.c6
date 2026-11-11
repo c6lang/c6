@@ -16,6 +16,6 @@ int tu_text_len(const char *s)
 int!error tu_boom(int n, const char *msg)
 {
     if (n)
-        err(9, msg);
+        return err(9, msg);
     return 0;
 }

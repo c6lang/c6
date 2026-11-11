@@ -51,18 +51,18 @@ test "等三个线程里的第二个，返回值可用，其余各自收尾" {
     thread h3 = spawn slow(3);
     gate = 1;                       /* 三个一起开跑 */
     if (h2->join() != 0)
-        err(1, "join 失败");
+        return err(1, "join 失败");
     if (!h2->done())
-        err(2, "join 之后 done() 应为 1");
+        return err(2, "join 之后 done() 应为 1");
     if (h2->value() != 200)
-        err(3, "value() 没有拿回返回值");
+        return err(3, "value() 没有拿回返回值");
     if (ran[2] != 3)
-        err(4, "线程体没有跑到");
+        return err(4, "线程体没有跑到");
     /* 另外两个照样由启动者收尾 */
     if (h1->join() != 0 || h3->join() != 0)
-        err(5, "其余线程 join 失败");
+        return err(5, "其余线程 join 失败");
     if (ran[1] != 2 || ran[3] != 4)
-        err(6, "其余线程没有跑到");
+        return err(6, "其余线程没有跑到");
 }
 
 test "join() 幂等，done()/value() 与结果一致" {
@@ -70,15 +70,15 @@ test "join() 幂等，done()/value() 与结果一致" {
     ran[0] = 0;
     thread h = spawn slow(0);
     if (wait_nonzero(&ran[0]) == 0)
-        err(10, "线程没有跑起来");
+        return err(10, "线程没有跑起来");
     if (h->join() != 0)
-        err(11, "第一次 join 失败");
+        return err(11, "第一次 join 失败");
     if (h->join() != 0)
-        err(12, "第二次 join 应当也是 0（不重复 pthread_join）");
+        return err(12, "第二次 join 应当也是 0（不重复 pthread_join）");
     if (!h->done())
-        err(13, "done() 应为 1");
+        return err(13, "done() 应为 1");
     if (h->value() != 0)
-        err(14, "value() 应为 0");
+        return err(14, "value() 应为 0");
 }
 
 /* ---- 2. 句柄先走，线程仍然跑完 ---- */
@@ -92,7 +92,7 @@ test "句柄走了线程还在跑，引用不漏" {
         (void)h;                    /* 块尾自动归还句柄那一份 */
     }
     if (wait_nonzero(&ran[1]) == 0)
-        err(20, "放弃句柄之后线程没有跑完");
+        return err(20, "放弃句柄之后线程没有跑完");
 }
 
 /* ---- 3. 线程里再 spawn 并 join 孙线程 ---- */
@@ -121,11 +121,11 @@ test "线程内部再 spawn 并 join 孙线程" {
 
     inner_ran = 0;
     if (h->join() != 0)
-        err(30, "外层线程 join 失败");
+        return err(30, "外层线程 join 失败");
     if (h->value() != 42)
-        err(31, "孙线程的返回值没有传上来");
+        return err(31, "孙线程的返回值没有传上来");
     if (inner_ran != 41)
-        err(32, "孙线程没有跑");
+        return err(32, "孙线程没有跑");
 }
 
 /* ---- 4. 裸 spawn 照旧 ---- */
@@ -140,5 +140,5 @@ test "裸 spawn 不受影响，join_all 仍然等全部" {
         spawn slow(i);
     __c6_th_join_all();
     if (ran[1] != 2 || ran[2] != 3 || ran[3] != 4)
-        err(40, "裸 spawn 的线程没有跑完");
+        return err(40, "裸 spawn 的线程没有跑完");
 }

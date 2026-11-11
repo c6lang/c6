@@ -23,7 +23,7 @@ static int!error boom(void)
 {
     @Node p = new Node;
     p->v = 9;
-    err(3, "boom");
+    return err(3, "boom");
     return 0;
 }
 
@@ -34,37 +34,37 @@ static int take(@Node p)
 
 test "new 分配、零初始化、作用域退出自动释放" {
     if (__c6_gc_live() != 0)
-        err(1, "进入时就有活对象");
+        return err(1, "进入时就有活对象");
     {
         @Node p = new Node;
         if (p == NULL)
-            err(2, "new 返回了空值");
+            return err(2, "new 返回了空值");
         if (p->v != 0)
-            err(3, "new 没有把对象清零");
+            return err(3, "new 没有把对象清零");
         if (__c6_gc_refcount(p) != 1)
-            err(4, "新对象的计数不是 1");
+            return err(4, "新对象的计数不是 1");
         if (__c6_gc_live() != 1)
-            err(5, "活对象数不是 1");
+            return err(5, "活对象数不是 1");
         p->v = 7;
         if (p->v != 7)
-            err(6, "对象写不进去");
+            return err(6, "对象写不进去");
     }
     if (__c6_gc_live() != 0)
-        err(7, "离开作用域后对象没有释放");
+        return err(7, "离开作用域后对象没有释放");
 }
 
 test "p = NULL 释放；重复 NULL 无害" {
     @Node p = new Node;
     if (__c6_gc_live() != 1)
-        err(1, "分配失败");
+        return err(1, "分配失败");
     p = NULL;
     if (p != NULL)
-        err(2, "NULL 没有写进槽");
+        return err(2, "NULL 没有写进槽");
     if (__c6_gc_live() != 0)
-        err(3, "'p = NULL' 没有释放对象");
+        return err(3, "'p = NULL' 没有释放对象");
     p = NULL;
     if (__c6_gc_live() != 0)
-        err(4, "对空槽再赋 NULL 影响了计数");
+        return err(4, "对空槽再赋 NULL 影响了计数");
 }
 
 test "共享引用：p = q 计数加一，自赋值净变化为 0" {
@@ -72,57 +72,57 @@ test "共享引用：p = q 计数加一，自赋值净变化为 0" {
     {
         @Node q = p;
         if (__c6_gc_refcount(p) != 2)
-            err(1, "'@Node q = p' 没有加计数");
+            return err(1, "'@Node q = p' 没有加计数");
         if (__c6_gc_live() != 1)
-            err(2, "同一对象被算了两次");
+            return err(2, "同一对象被算了两次");
         p = p;
         if (__c6_gc_refcount(p) != 2)
-            err(3, "自赋值改变了计数");
+            return err(3, "自赋值改变了计数");
         q = NULL;
         if (__c6_gc_refcount(p) != 1)
-            err(4, "释放 q 后计数不是 1");
+            return err(4, "释放 q 后计数不是 1");
     }
     if (__c6_gc_live() != 1)
-        err(5, "p 还在却被释放了");
+        return err(5, "p 还在却被释放了");
 }
 
 test "return 把引用交给调用者" {
     {
         @Node r = give();
         if (r->v != 5)
-            err(1, "返回值不对");
+            return err(1, "返回值不对");
         if (__c6_gc_live() != 1)
-            err(2, "返回后活对象数不是 1");
+            return err(2, "返回后活对象数不是 1");
         if (__c6_gc_refcount(r) != 1)
-            err(3, "调用者拿到的计数不是 1");
+            return err(3, "调用者拿到的计数不是 1");
     }
     if (__c6_gc_live() != 0)
-        err(4, "调用者的引用没有释放");
+        return err(4, "调用者的引用没有释放");
 }
 
 test "err() 传播时释放局部对象" {
     boom() catch e {
         if (__c6_gc_live() != 0)
-            err(1, "错误路径没有释放对象");
+            return err(1, "错误路径没有释放对象");
         if (e.id != 3)
-            err(2, "错误码没有传出来");
+            return err(2, "错误码没有传出来");
         return 0;               /* 测试块返回 0 表示这一块还没失败 */
     };
-    err(3, "boom() 没有失败");
+    return err(3, "boom() 没有失败");
 }
 
 test "丢弃的 new 立刻释放" {
     new Node;
     if (__c6_gc_live() != 0)
-        err(1, "丢弃的 new 泄漏了");
+        return err(1, "丢弃的 new 泄漏了");
 }
 
 test "new 作实参：调用返回后释放" {
     int v = take(new Node);
     if (v != 0)
-        err(1, "实参对象的初值不是 0");
+        return err(1, "实参对象的初值不是 0");
     if (__c6_gc_live() != 0)
-        err(2, "实参对象在调用后没有释放");
+        return err(2, "实参对象在调用后没有释放");
 }
 
 test "own @T：独占，退出作用域销毁" {
@@ -130,26 +130,26 @@ test "own @T：独占，退出作用域销毁" {
         own @Node o = new Node;
         o->v = 4;
         if (__c6_gc_live() != 1)
-            err(1, "own 对象没有被分配");
+            return err(1, "own 对象没有被分配");
         if (__c6_gc_refcount(o) != 1)
-            err(2, "own 对象的计数不是 1");
+            return err(2, "own 对象的计数不是 1");
     }
     if (__c6_gc_live() != 0)
-        err(3, "own 对象没有销毁");
+        return err(3, "own 对象没有销毁");
 }
 
 test "weak @T：对象死了就变空" {
     @Node p = new Node;
     weak @Node w = p;
     if (w != p)
-        err(1, "弱引用没有指向对象");
+        return err(1, "弱引用没有指向对象");
     if (__c6_gc_refcount(p) != 1)
-        err(2, "弱引用不该加计数");
+        return err(2, "弱引用不该加计数");
     p = NULL;
     if (w != NULL)
-        err(3, "对象释放后弱引用没有变空");
+        return err(3, "对象释放后弱引用没有变空");
     if (__c6_gc_live() != 0)
-        err(4, "对象没有释放");
+        return err(4, "对象没有释放");
 }
 
 /* 方法调用的接收者只是被拷进一个临时槽：那份拷贝是借用，不该加计数，
@@ -165,14 +165,14 @@ test "托管接收者的方法调用不加计数、不读旧值" {
     c->held = new Node;
     c->held->v = 7;
     if (c->have() != 7)
-        err(1, "方法里读不到托管字段");
+        return err(1, "方法里读不到托管字段");
     if (__c6_gc_refcount(c->held) != 1)
-        err(2, "接收者的拷贝多算了引用");
+        return err(2, "接收者的拷贝多算了引用");
     for (i = 0; i < 10; i++)
         if (c->tick() != i + 1)
-            err(3, "字段累加不对");
+            return err(3, "字段累加不对");
     if (__c6_gc_refcount(c->held) != 1)
-        err(4, "调方法漏了引用");
+        return err(4, "调方法漏了引用");
 }
 
 test "循环里声明：每次迭代都释放" {
@@ -181,11 +181,11 @@ test "循环里声明：每次迭代都释放" {
     for (i = 0; i < 1000; i++) {
         @Node q = new Node;
         if (q == NULL)
-            err(1, "迭代里分配失败");
+            return err(1, "迭代里分配失败");
     }
     if (__c6_gc_live() != 1)
-        err(2, "循环里的对象没有逐个释放");
+        return err(2, "循环里的对象没有逐个释放");
     keep = NULL;
     if (__c6_gc_live() != 0)
-        err(3, "最后一个对象没有释放");
+        return err(3, "最后一个对象没有释放");
 }

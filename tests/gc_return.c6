@@ -36,43 +36,43 @@ test "新建对象返回：调用者拿到计数 1" {
     {
         @R r = fresh();
         if (r->v != 7)
-            err(1, "返回值不对");
+            return err(1, "返回值不对");
         if (__c6_gc_refcount(r) != 1)
-            err(2, "调用者拿到的计数不是 1");
+            return err(2, "调用者拿到的计数不是 1");
         if (__c6_gc_live() != 1)
-            err(3, "活对象数不是 1");
+            return err(3, "活对象数不是 1");
     }
     if (__c6_gc_live() != 0)
-        err(4, "返回值离开作用域后没有释放");
+        return err(4, "返回值离开作用域后没有释放");
 }
 
 test "借字段返回：只给调用者加计数" {
     @S s = new S;
     s->r = new R;
     if (__c6_gc_refcount(s->r) != 1)
-        err(1, "字段初始计数不是 1");
+        return err(1, "字段初始计数不是 1");
     {
         @R a = borrow_field(s);
         if (a->v != 0)
-            err(2, "借出来的对象不对");
+            return err(2, "借出来的对象不对");
         if (__c6_gc_refcount(s->r) != 2)
-            err(3, "调用者没有拿到新计数");
+            return err(3, "调用者没有拿到新计数");
     }
     if (__c6_gc_refcount(s->r) != 1)
-        err(4, "返回值泄漏了一个计数");
+        return err(4, "返回值泄漏了一个计数");
 }
 
 test "形参返回：只给调用者加计数" {
     @R p = new R;
     if (__c6_gc_refcount(p) != 1)
-        err(1, "初始计数不是 1");
+        return err(1, "初始计数不是 1");
     {
         @R q = pass_through(p);
         if (__c6_gc_refcount(p) != 2)
-            err(2, "调用者没有拿到新计数");
+            return err(2, "调用者没有拿到新计数");
     }
     if (__c6_gc_refcount(p) != 1)
-        err(3, "返回值泄漏了一个计数");
+        return err(3, "返回值泄漏了一个计数");
 }
 
 test "多次调用不累积计数" {
@@ -84,8 +84,8 @@ test "多次调用不累积计数" {
         @R a = borrow_field(s);
         @R b = pass_through(a);
         if (__c6_gc_refcount(s->r) != 3)
-            err(1, "循环里的计数不对");
+            return err(1, "循环里的计数不对");
     }
     if (__c6_gc_refcount(s->r) != 1)
-        err(2, "循环结束后计数没有回到 1");
+        return err(2, "循环结束后计数没有回到 1");
 }

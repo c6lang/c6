@@ -62,7 +62,7 @@ struct Map@(K, V) {
         nv = new V[ncap];
         nf = new u8[ncap];
         if (!nk || !nv || !nf)
-            err(std.err.NOMEM, "map: out of memory");
+            return err(std.err.NOMEM, "map: out of memory");
         memset(nf, 0, (usize)ncap);
         memset(nk, 0, (usize)ncap * sizeof(K));
         memset(nv, 0, (usize)ncap * sizeof(V));
@@ -229,30 +229,30 @@ test "put / get / has / count" {
     @Map@(int, int) m = new Map@(int, int);
     int out = 0;
 
-    m->put(1, 100) catch e { err(1, "put 失败"); };
-    m->put(2, 200) catch e { err(2, "put 失败"); };
+    m->put(1, 100) catch e { return err(1, "put 失败"); };
+    m->put(2, 200) catch e { return err(2, "put 失败"); };
     if (m->count() != 2)
-        err(3, "count 不对");
+        return err(3, "count 不对");
     if (m->get(1, &out) != 1 || out != 100)
-        err(4, "get 1 不对");
+        return err(4, "get 1 不对");
     if (m->get(2, &out) != 1 || out != 200)
-        err(5, "get 2 不对");
+        return err(5, "get 2 不对");
     if (m->get(3, &out) != 0)
-        err(6, "不存在的键没有返回 0");
+        return err(6, "不存在的键没有返回 0");
     if (m->has(2) != 1 || m->has(3) != 0)
-        err(7, "has 不对");
+        return err(7, "has 不对");
 }
 
 test "同一个键覆盖而不增加条目" {
     @Map@(int, int) m = new Map@(int, int);
     int out = 0;
 
-    m->put(7, 1) catch e { err(8, "put 失败"); };
-    m->put(7, 2) catch e { err(9, "put 失败"); };
+    m->put(7, 1) catch e { return err(8, "put 失败"); };
+    m->put(7, 2) catch e { return err(9, "put 失败"); };
     if (m->count() != 1)
-        err(10, "覆盖之后 count 变大了");
+        return err(10, "覆盖之后 count 变大了");
     if (m->get(7, &out) != 1 || out != 2)
-        err(11, "覆盖没有生效");
+        return err(11, "覆盖没有生效");
 }
 
 test "大量条目触发扩容，全部仍在" {
@@ -260,14 +260,14 @@ test "大量条目触发扩容，全部仍在" {
     int i = 0, out = 0;
 
     for (i = 0; i < 500; i++)
-        m->put(i * 3, i) catch e { err(12, "put 失败"); };
+        m->put(i * 3, i) catch e { return err(12, "put 失败"); };
     if (m->count() != 500)
-        err(13, "count 不是 500");
+        return err(13, "count 不是 500");
     if (m->capacity() < 500)
-        err(14, "容量不够");
+        return err(14, "容量不够");
     for (i = 0; i < 500; i++) {
         if (m->get(i * 3, &out) != 1 || out != i)
-            err(15, "扩容后丢了键");
+            return err(15, "扩容后丢了键");
     }
 }
 
@@ -276,23 +276,23 @@ test "删除留墓碑，之后还能插入新键" {
     int i = 0, out = 0;
 
     for (i = 0; i < 20; i++)
-        m->put(i, i * 10) catch e { err(16, "put 失败"); };
+        m->put(i, i * 10) catch e { return err(16, "put 失败"); };
     if (m->remove(5) != 1)
-        err(17, "remove 没有命中");
+        return err(17, "remove 没有命中");
     if (m->remove(5) != 0)
-        err(18, "第二次 remove 仍然命中");
+        return err(18, "第二次 remove 仍然命中");
     if (m->has(5) != 0)
-        err(19, "删除之后 has 仍为真");
+        return err(19, "删除之后 has 仍为真");
     if (m->count() != 19)
-        err(20, "删除之后 count 不对");
-    m->put(5, 999) catch e { err(21, "put 失败"); };
+        return err(20, "删除之后 count 不对");
+    m->put(5, 999) catch e { return err(21, "put 失败"); };
     if (m->get(5, &out) != 1 || out != 999)
-        err(22, "重新插入没有生效");
+        return err(22, "重新插入没有生效");
     for (i = 0; i < 20; i++) {
         if (i == 5)
             continue;
         if (m->get(i, &out) != 1 || out != i * 10)
-            err(23, "删除影响了别的键");
+            return err(23, "删除影响了别的键");
     }
 }
 
@@ -300,22 +300,22 @@ test "clear 之后是空的，容量保留" {
     @Map@(int, int) m = new Map@(int, int);
     int cap0 = 0;
 
-    m->put(1, 1) catch e { err(24, "put 失败"); };
+    m->put(1, 1) catch e { return err(24, "put 失败"); };
     cap0 = m->capacity();
     m->clear();
     if (m->count() != 0 || m->has(1) != 0)
-        err(25, "clear 之后还有条目");
+        return err(25, "clear 之后还有条目");
     if (m->capacity() != cap0)
-        err(26, "clear 把容量也丢了");
+        return err(26, "clear 把容量也丢了");
 }
 
 test "foreach 遍历 (K, V)" {
     @Map@(int, int) m = new Map@(int, int);
     int ks = 0, vs = 0, cnt = 0;
 
-    m->put(1, 10) catch e { err(27, "put 失败"); };
-    m->put(2, 20) catch e { err(28, "put 失败"); };
-    m->put(3, 30) catch e { err(29, "put 失败"); };
+    m->put(1, 10) catch e { return err(27, "put 失败"); };
+    m->put(2, 20) catch e { return err(28, "put 失败"); };
+    m->put(3, 30) catch e { return err(29, "put 失败"); };
     Iter@(int, int) iv = { m, 0, { 0, 0 } };
     Iter@(int, int) *it = &iv;      /* 值容器调用方法要走指针 */
 
@@ -327,7 +327,7 @@ test "foreach 遍历 (K, V)" {
         cnt++;
     }
     if (cnt != 3 || vs != 60 || ks != 6)
-        err(30, "迭代结果不对");
+        return err(30, "迭代结果不对");
 }
 
 /* 键类型要能被泛型参数指名，所以这个结构体放在文件作用域（块作用域里的
@@ -340,9 +340,9 @@ test "键是指针，值是结构体" {
     @Map@(TestKey *, TestKey) m = new Map@(TestKey *, TestKey);
     TestKey out = { 0, 0 };
 
-    m->put(&a, b) catch e { err(32, "put 失败"); };
+    m->put(&a, b) catch e { return err(32, "put 失败"); };
     if (m->get(&a, &out) != 1 || out.x != 3 || out.y != 4)
-        err(33, "指针键取值不对");
+        return err(33, "指针键取值不对");
     if (m->get(&b, &out) != 0)
-        err(34, "不同的指针键命中了");
+        return err(34, "不同的指针键命中了");
 }

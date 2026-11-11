@@ -104,15 +104,15 @@ test "数组隐式转切片，再包成 Span" {
     int out = 0;
 
     if (p->count() != 5)
-        err(1, "count 不是 5");
+        return err(1, "count 不是 5");
     if (p->at(2) != 30)
-        err(2, "at 不对");
+        return err(2, "at 不对");
     if (p->get(4, &out) != 1 || out != 50)
-        err(3, "get 不对");
+        return err(3, "get 不对");
     if (p->get(5, &out) != 0)
-        err(4, "越界没有返回 0");
+        return err(4, "越界没有返回 0");
     if (p->ptr() != a)
-        err(5, "ptr 不是数组首地址");
+        return err(5, "ptr 不是数组首地址");
 }
 
 test "Span 按值传递，视图共享同一段内存" {
@@ -123,9 +123,9 @@ test "Span 按值传递，视图共享同一段内存" {
 
     cp->set(0, 99);
     if (a[0] != 99)
-        err(6, "Span 的副本没有指向同一段内存");
+        return err(6, "Span 的副本没有指向同一段内存");
     if ((&s)->count() != 3)
-        err(7, "副本的 count 不对");
+        return err(7, "副本的 count 不对");
 }
 
 test "sub / take / drop 只调整边界" {
@@ -137,13 +137,13 @@ test "sub / take / drop 只调整边界" {
     Span@int *mp = &mid;
 
     if (mp->count() != 3 || mp->at(0) != 2 || mp->at(2) != 4)
-        err(8, "sub 不对");
+        return err(8, "sub 不对");
     if ((&head)->count() != 2 || (&head)->at(1) != 1)
-        err(9, "take 不对");
+        return err(9, "take 不对");
     if ((&tail)->count() != 2 || (&tail)->at(0) != 4)
-        err(10, "drop 不对");
+        return err(10, "drop 不对");
     if (mid.items.data != a + 2)
-        err(11, "sub 的指针不对");
+        return err(11, "sub 的指针不对");
 }
 
 test "越界的 sub 被夹住，不会越过原视图" {
@@ -154,11 +154,11 @@ test "越界的 sub 被夹住，不会越过原视图" {
     Span@int z = (&s)->sub(100, 1);
 
     if ((&x)->count() != 1 || (&x)->at(0) != 4)
-        err(12, "右越界没有夹住");
+        return err(12, "右越界没有夹住");
     if ((&y)->count() != 2)
-        err(13, "负起点没有夹住");
+        return err(13, "负起点没有夹住");
     if ((&z)->count() != 0 || (&z)->ptr() != 0)
-        err(14, "起点越界应得到空 Span");
+        return err(14, "起点越界应得到空 Span");
 }
 
 test "空 Span 是合法的" {
@@ -166,7 +166,7 @@ test "空 Span 是合法的" {
     Span@int *p = &e;
 
     if (p->count() != 0 || p->is_empty() != 1 || p->ptr() != 0)
-        err(15, "空 Span 的状态不对");
+        return err(15, "空 Span 的状态不对");
 }
 
 test "foreach 直接走切片" {
@@ -178,5 +178,5 @@ test "foreach 直接走切片" {
         sum += x;
     }
     if (sum != 10)
-        err(16, "迭代和不对");
+        return err(16, "迭代和不对");
 }

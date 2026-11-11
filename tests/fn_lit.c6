@@ -58,16 +58,16 @@ test "显式声明、就地调用、推断声明" {
     base = 100;
     say(3);
     if (calls != 1 || base != 103)
-        err(1, "显式声明的字面量没有跑");
+        return err(1, "显式声明的字面量没有跑");
     void(int x) { base = base + x; }(4);
     if (base != 107)
-        err(2, "就地调用的字面量没有跑");
+        return err(2, "就地调用的字面量没有跑");
     f = void(int x) { base = base + x; };
     f(5);
     if (base != 112)
-        err(3, "推断声明没有跑");
+        return err(3, "推断声明没有跑");
     if (f(6), base != 118)
-        err(4, "推断声明的变量不是函数指针");
+        return err(4, "推断声明的变量不是函数指针");
 }
 
 test "返回值、多个参数、无参数" {
@@ -76,12 +76,12 @@ test "返回值、多个参数、无参数" {
     void (*nothing)(void) = void() { };
 
     if (add(2, 3) != 5)
-        err(1, "两个参数的结果不对");
+        return err(1, "两个参数的结果不对");
     if (zero() != 7)
-        err(2, "'int()' 的无参形式不对");
+        return err(2, "'int()' 的无参形式不对");
     nothing();
     if (sizeof(zero) != sizeof(void (*)(void)))
-        err(3, "字面量的值不是函数指针大小");
+        return err(3, "字面量的值不是函数指针大小");
 }
 
 /* ---- 2. 体里能看见什么 ---- */
@@ -92,9 +92,9 @@ test "体里看得见文件作用域的函数和全局变量" {
     calls = 0;
     base = 10;
     if (f(3) != 16)
-        err(1, "体里调用文件作用域函数的结果不对");
+        return err(1, "体里调用文件作用域函数的结果不对");
     if (calls != 1)
-        err(2, "体里没有真的调到那个函数");
+        return err(2, "体里没有真的调到那个函数");
 }
 
 test "体里看得见文件作用域的 typedef 和 tag" {
@@ -104,7 +104,7 @@ test "体里看得见文件作用域的 typedef 和 tag" {
     };
 
     if (f(2) != 5)
-        err(1, "体里的 typedef/tag 用法不对");
+        return err(1, "体里的 typedef/tag 用法不对");
 }
 
 /* ---- 3. 返回值可以是任何能被一路带回来的类型 ---- */
@@ -117,12 +117,12 @@ test "返回结构体、切片和托管引用" {
     }(3);
 
     if (p.x != 3 || p.y != 6)
-        err(1, "结构体返回值不对");
+        return err(1, "结构体返回值不对");
     int[:] (*first)(int[:]) = int[:](int[:] s) { return s[0:2]; };
     int buf[4] = { 1, 2, 3, 4 };
     int[:] head = first((int[:]){ buf, 4 });
     if (head[0] != 1 || head[1] != 2)
-        err(2, "切片返回值不对");
+        return err(2, "切片返回值不对");
     @int (*mkbox)(int) = @int(int v) {
         @int p = new int;
 
@@ -131,7 +131,7 @@ test "返回结构体、切片和托管引用" {
     };
     @int b = mkbox(9);
     if (*b != 9)
-        err(3, "托管引用返回值不对");
+        return err(3, "托管引用返回值不对");
 }
 
 /* ---- 4. 和 c6 其它特性一起用 ---- */
@@ -149,30 +149,30 @@ test "变参字面量" {
     };
 
     if (sum(3, 4, 5, 6) != 15)
-        err(1, "变参字面量不对");
+        return err(1, "变参字面量不对");
 }
 
 test "可失败字面量：err 与 catch" {
     int (*divi)(int, int)!error = int!error (int a, int b) {
         if (!b)
-            err(9, "division by zero");
+            return err(9, "division by zero");
         return a / b;
     };
     int good = divi(8, 2) catch e {
-        err(91, "可失败字面量的正常路径不该失败");
+        return err(91, "可失败字面量的正常路径不该失败");
         return 0;
     };
 
     if (good != 4)
-        err(1, "可失败字面量的正常路径不对");
+        return err(1, "可失败字面量的正常路径不对");
     divi(1, 0) catch e {
         if (e.id != 9)
-            err(2, "可失败字面量的错误码不对");
+            return err(2, "可失败字面量的错误码不对");
         if (!e.msg || strcmp(e.msg, "division by zero"))
-            err(3, "可失败字面量的消息不对");
+            return err(3, "可失败字面量的消息不对");
         return 0;
     };
-    err(4, "可失败字面量没有报错");
+    return err(4, "可失败字面量没有报错");
 }
 
 test "体里可以用 defer" {
@@ -185,7 +185,7 @@ test "体里可以用 defer" {
     };
 
     if (f() != 2)
-        err(1, "defer 体的字面量结果不对");
+        return err(1, "defer 体的字面量结果不对");
 }
 
 test "字面量里再写字面量" {
@@ -195,7 +195,7 @@ test "字面量里再写字面量" {
     };
 
     if (outer(6) != 50)
-        err(1, "嵌套字面量不对");
+        return err(1, "嵌套字面量不对");
 }
 
 static inline int inline_user(int k)
@@ -206,7 +206,7 @@ static inline int inline_user(int k)
 
 test "static inline 体里的字面量" {
     if (inline_user(1) != 7)
-        err(1, "static inline 体里的字面量没有被编译");
+        return err(1, "static inline 体里的字面量没有被编译");
 }
 
 /* ---- 5. 当值用：函数指针能去哪儿，它就能去哪儿 ---- */
@@ -227,21 +227,21 @@ struct Ops {
 
 test "作为实参、存进结构体、放进数组" {
     if (apply(int(int v) { return v * 4; }, 3) != 12)
-        err(1, "字面量作实参不对");
+        return err(1, "字面量作实参不对");
     handler.cb = void(int v) { handler.seen = v; };
     handler.cb(21);
     if (handler.seen != 21)
-        err(2, "字面量存进结构体后调用不对");
+        return err(2, "字面量存进结构体后调用不对");
     struct Ops ops = { { int(int a, int b) { return a - b; } } };
     if (ops.op(9, 4) != 5)
-        err(3, "字面量作结构体成员初值不对");
+        return err(3, "字面量作结构体成员初值不对");
     int (*table[3])(int) = {
         { int(int v) { return v + 1; } },
         { int(int v) { return v + 2; } },
         { int(int v) { return v + 3; } },
     };
     if (table[0](0) != 1 || table[1](0) != 2 || table[2](0) != 3)
-        err(4, "字面量数组不对");
+        return err(4, "字面量数组不对");
 }
 
 test "赋给已有的函数指针" {
@@ -251,7 +251,7 @@ test "赋给已有的函数指针" {
     g = f;
     f = int(int v) { return v + 1000; };
     if (f(1) != 1001 || g(3) != 6)
-        err(1, "给已有函数指针赋值不对");
+        return err(1, "给已有函数指针赋值不对");
 }
 
 test "交给 C 库：qsort" {
@@ -264,7 +264,7 @@ test "交给 C 库：qsort" {
     });
     for (i = 1; i < 6; i++)
         if (v[i - 1] > v[i])
-            err(1, "qsort 没有排好");
+            return err(1, "qsort 没有排好");
 }
 
 test "文件作用域和 static 初始化的字面量" {
@@ -272,11 +272,11 @@ test "文件作用域和 static 初始化的字面量" {
 
     base = 10;
     if (file_scope(1) != 11)
-        err(1, "文件作用域的字面量不对");
+        return err(1, "文件作用域的字面量不对");
     if (file_scope_pub(3) != 6)
-        err(2, "公开的文件作用域字面量不对");
+        return err(2, "公开的文件作用域字面量不对");
     if (local_static() != 42)
-        err(3, "static 局部变量初始化的字面量不对");
+        return err(3, "static 局部变量初始化的字面量不对");
 }
 
 /* ---- 6. 两个不同位置的同形字面量是两个函数 ---- */
@@ -286,9 +286,9 @@ test "每个字面量各有自己的函数" {
     int (*b)(int) = int(int v) { return v; };
 
     if (a == b)
-        err(1, "两个字面量被当成了同一个函数");
+        return err(1, "两个字面量被当成了同一个函数");
     if (a(1) != 1 || b(2) != 2)
-        err(2, "两个同形字面量调用结果不对");
+        return err(2, "两个同形字面量调用结果不对");
 }
 
 /* ---- 7. 显式声明与推断声明是同一个类型 ---- */
@@ -300,9 +300,9 @@ test "推断声明得到的变量就是普通函数指针" {
     g = void(int x) { base = base + x * 2; };
     g(4);
     if (base != 8)
-        err(1, "推断声明的变量调用不对");
+        return err(1, "推断声明的变量调用不对");
     g = f;                              /* 和普通函数指针互相赋值 */
     g(1);
     if (base != 9)
-        err(2, "推断声明的变量收不住显式声明");
+        return err(2, "推断声明的变量收不住显式声明");
 }

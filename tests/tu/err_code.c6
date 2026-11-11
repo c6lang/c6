@@ -1,0 +1,26 @@
+/* tests/errors/err_code.c6 的第二个翻译单元：一个模块。
+ *
+ * 「模块里 enum Error 的成员必须落在 0..4095」这条诊断（C125）只能在模块里
+ * 看到，所以现场放在这里，主文件 import 它。
+ */
+module tu.err_code;
+
+#if defined too_big
+enum Error {
+    TOO_BIG = 4096,
+};
+#elif defined negative
+enum Error {
+    NEGATIVE = -1,
+};
+#else
+enum Error {
+    OK = 0,
+    A  = 1,
+};
+
+int!error fail_a(void)
+{
+    return err(A, "a");
+}
+#endif

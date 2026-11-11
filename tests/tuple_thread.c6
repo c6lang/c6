@@ -58,9 +58,9 @@ test "spawn 可以把元组按值传给线程" {
     spawn th_take(t);
     __c6_th_join_all();
     if (!got_ok)
-        err(1, "线程没有跑起来");
+        return err(1, "线程没有跑起来");
     if (got_a != 5 || got_b != 6)
-        err(2, "线程收到的元组不对");
+        return err(2, "线程收到的元组不对");
 }
 
 test "线程里调用返回元组的函数" {
@@ -70,9 +70,9 @@ test "线程里调用返回元组的函数" {
     spawn th_call(11);
     __c6_th_join_all();
     if (!got_ok)
-        err(1, "线程没有跑起来");
+        return err(1, "线程没有跑起来");
     if (got_a != 5 || got_b != 6)
-        err(2, "线程里解构出来的值不对");
+        return err(2, "线程里解构出来的值不对");
 }
 
 test "线程里用解构赋值" {
@@ -82,9 +82,9 @@ test "线程里用解构赋值" {
     spawn th_assign(20);
     __c6_th_join_all();
     if (!got_ok)
-        err(1, "线程没有跑起来");
+        return err(1, "线程没有跑起来");
     if (got_a != 10 || got_b != 10)
-        err(2, "线程里解构赋值的结果不对");
+        return err(2, "线程里解构赋值的结果不对");
 }
 
 test "spawn 的实参在 spawn 语句处求值一次" {
@@ -98,5 +98,5 @@ test "spawn 的实参在 spawn 语句处求值一次" {
     t[1] = 98;
     __c6_th_join_all();
     if (got_a != 1 || got_b != 2)
-        err(1, "元组实参没有在 spawn 语句处按值复制");
+        return err(1, "元组实参没有在 spawn 语句处按值复制");
 }

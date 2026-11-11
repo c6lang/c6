@@ -850,6 +850,9 @@ static void c6_gen_param_check(int name, int *ptok, int nparams);
 static int c6_ptr_tag(CType *type);
 /* 'module NAME;' namespace prefixing and 'import NAME;' declaration loading */
 static int c6_mod_name(int v);
+/* error id blocks: one 4096-code block per module (see c6_err_module_base) */
+static int c6_err_module_base(void);
+static long long c6_err_code(int base, long long v, int vtok);
 static void c6_module_parse(void);
 static void c6_module_import(const char *name);
 static void c6_skip_decl_tail(void);
@@ -8254,6 +8257,8 @@ static void struct_decl(CType *type, int u)
     int bit_size = 0, bsize = 0, bt = 0, ut = 0;
 #ifdef C6_EXT
     int c6_is_def = 0;         /* a body (not a declaration) was parsed */
+    int c6_tagtok = 0;         /* the tag as written, before any prefixing */
+    int c6_err_base = 0;       /* block of this module's 'enum Error' */
 #endif
     int c6_meth_end = 0;       /* the member just parsed was a function */
     Sym *s = 0, *ss = 0, **ps = 0;
@@ -8267,16 +8272,16 @@ static void struct_decl(CType *type, int u)
     v = 0;
     if (tok >= TOK_IDENT) {  /* struct/enum tag */
 #ifdef C6_EXT
-        int tagtok = tok;
+        c6_tagtok = tok;
 #endif
         v = tok, next();
 #ifdef C6_EXT
         /* a tag that is only visible through a block scope cannot travel
            into a function literal: replaying it would declare a new tag */
         if (tok != '{') {
-            Sym *tag = struct_find(tagtok);
-            c6_lit_scan_note_type(tagtok, tag);
-            c6_lit_cap_check(tagtok, tag);
+            Sym *tag = struct_find(c6_tagtok);
+            c6_lit_scan_note_type(c6_tagtok, tag);
+            c6_lit_cap_check(c6_tagtok, tag);
         }
 #endif
     }
@@ -8368,6 +8373,17 @@ do_decl:
             t.t = VT_INT|VT_STATIC|VT_ENUM_VAL;
             if (bt)
                 t.t = bt|VT_STATIC|VT_ENUM_VAL;
+#ifdef C6_EXT
+            /* a module's 'enum Error' is its error code table: every member
+               moves into the module's block (0 stays 0, it is "no error"),
+               so a code of one module can never be taken for one of
+               another.  The value written in the source stays the code
+               inside the block. */
+            if (tcc_state->c6_ext && c6_tagtok && file->c6_module
+                && local_scope == 0
+                && !strcmp(get_tok_str(c6_tagtok, NULL), "Error"))
+                c6_err_base = c6_err_module_base();
+#endif
             for(;;) {
 #ifdef C6_EXT
                 int qname = 0;              /* 'Color.RED' (dotted spelling) */
@@ -8422,7 +8438,7 @@ do_decl:
                     if (qname) {
                         Sym *prev = 0;
                         ss = sym_push(qname, &t, VT_CONST, 0);
-                        ss->enum_val = ll;
+                        ss->enum_val = c6_err_code(c6_err_base, ll, v);
                         *ps = ss, ps = &ss->next;
                         prev = sym_find_raw(v);
                         if (prev && sym_scope_ex(prev) == local_scope
@@ -8434,7 +8450,7 @@ do_decl:
                     }
                     if (!skip_bare) {
                         ss = sym_push(v, &t, VT_CONST, 0);
-                        ss->enum_val = ll;
+                        ss->enum_val = c6_err_code(c6_err_base, ll, v);
                         *ps = ss, ps = &ss->next;
                     }
                 }
@@ -11171,6 +11187,14 @@ special_math_val:
         break;
 #endif
 
+    case TOK_C6_ERR:
+        /* err() produces the value of the 'error' channel; the only
+           consumer is a 'return', so anywhere else it is an error.  In a
+           plain C file 'err' is an ordinary name. */
+        if (tcc_state->c6_ext)
+            tcc_error("'err' can only be used as 'return err(id, msg)'");
+        goto tok_identifier;
+
     default:
     tok_identifier:
         if (tok < TOK_UIDENT)
@@ -12567,6 +12591,10 @@ static void c6_module_parse(void)
     file->c6_module = tcc_malloc(strlen(name) + 3);
     sprintf(file->c6_module, "%s__", name);
     tcc_free(name);
+    /* note the module even when it declares no errors: '-emit-errbase'
+       freezes the block of every module it can see, so adding an
+       'enum Error' later cannot move anybody else's ids */
+    c6_err_module_base();
 }
 
 /* 'geo__circle' -> 'geo/circle' (the dotted file spelling) */
@@ -12583,6 +12611,452 @@ static void c6_module_dotted(const char *name, char *out, int outsz)
         }
     }
     out[n] = 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* error ids                                                         */
+/*                                                                   */
+/* Every module owns a block of 4096 error codes, so a code of one    */
+/* module can never be mistaken for one of another.  An id is        */
+/*                                                                   */
+/*     (area << 27) | (slot << 12) | code                            */
+/*                                                                   */
+/* area 0 is the application, area 1 the standard library, 2..7 are   */
+/* reserved.  slot 0 means "this file belongs to no module", which     */
+/* keeps the plain small ids: 'return err(1, "x")' in a file without   */
+/* a 'module' declaration is still 1.  The std slots are built into    */
+/* the compiler; any other module hashes its own name into the         */
+/* automatic pool -- a pure function of the name, so adding modules,   */
+/* codes or build order never moves an existing id -- and              */
+/* 'errbase.def' may pin a slot in the pinned pool instead.            */
+#define C6_ERR_AREA_SHIFT    27
+#define C6_ERR_SLOT_SHIFT    12
+#define C6_ERR_CODE_MASK     0xfff
+#define C6_ERR_SLOT_AUTO     0x0001    /* 1 .. AUTO_END: hashed by name */
+#define C6_ERR_SLOT_AUTO_END 0x5fff
+#define C6_ERR_SLOT_STD      0x6000    /* 0x6000 .. STD_END: built in */
+#define C6_ERR_SLOT_STD_END  0x60ff
+#define C6_ERR_SLOT_PIN      0x6100    /* 0x6100 .. END: pinned in def */
+#define C6_ERR_SLOT_END      0x7fff
+
+/* The std modules are part of this repository, so their blocks live in the
+   compiler: a program can never renumber them, and a new std module only
+   ever appends a line here (the numbers already handed out never change). */
+static const struct C6ErrStdSlot {
+    const char *name;
+    int slot;
+} c6_err_std_slots[] = {
+    { "std.err",   C6_ERR_SLOT_STD + 0 },
+    { "std.types", C6_ERR_SLOT_STD + 1 },
+    { "std.vec",   C6_ERR_SLOT_STD + 2 },
+    { "std.span",  C6_ERR_SLOT_STD + 3 },
+    { "std.map",   C6_ERR_SLOT_STD + 4 },
+    { "std.str",   C6_ERR_SLOT_STD + 5 },
+    { "std.fmt",   C6_ERR_SLOT_STD + 6 },
+    { "std.range", C6_ERR_SLOT_STD + 7 },
+};
+
+/* fnv1a32 of the dotted module name: the automatic slot is a pure function
+   of the name, so it never depends on how many modules a program links. */
+static unsigned c6_err_hash(const char *s)
+{
+    unsigned h = 2166136261u;
+
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* 'std__err__' -> 'std.err' (the spelling a module is written with) */
+static void c6_err_dotted(const char *mangled, char *out, int outsz)
+{
+    int n = 0;
+
+    while (*mangled && n < outsz - 1) {
+        if (mangled[0] == '_' && mangled[1] == '_') {
+            if (n == 0 || mangled[2] == 0)
+                break;                  /* the trailing '__' of the prefix */
+            out[n++] = '.';
+            mangled += 2;
+        } else {
+            out[n++] = *mangled++;
+        }
+    }
+    out[n] = 0;
+}
+
+/* the built-in block of a std module, -1 when DOTTED is not one */
+static int c6_err_std_slot(const char *dotted)
+{
+    int i = 0;
+
+    for (i = 0; i < (int)(sizeof c6_err_std_slots / sizeof *c6_err_std_slots);
+         i++)
+        if (!strcmp(dotted, c6_err_std_slots[i].name))
+            return c6_err_std_slots[i].slot;
+    return -1;
+}
+
+/* the modules seen in this run: the table is what '-emit-errbase' freezes and
+   what the end of the run checks for two modules in one block */
+static C6ErrMod *c6_err_mod_find(TCCState *s1, const char *dotted)
+{
+    int i = 0;
+
+    for (i = 0; i < s1->c6_nb_err_mods; i++)
+        if (!strcmp(s1->c6_err_mods[i]->name, dotted))
+            return s1->c6_err_mods[i];
+    return NULL;
+}
+
+static C6ErrMod *c6_err_mod_add(TCCState *s1, const char *dotted,
+                                int area, int slot, int pinned)
+{
+    C6ErrMod *m = c6_err_mod_find(s1, dotted);
+
+    if (m)
+        return m;
+    m = tcc_mallocz(sizeof *m);
+    m->name = tcc_strdup(dotted);
+    m->area = area;
+    m->slot = slot;
+    m->pinned = pinned ? 1 : 0;
+    dynarray_add(&s1->c6_err_mods, &s1->c6_nb_err_mods, m);
+    return m;
+}
+
+/* 'errbase.def' ----------------------------------------------------- */
+/* One '<module> <slot>' pair per line, '#' starts a comment.  Pinned slots
+   live in their own pool (0x6100..0x7fff), so a pinned module can never take a
+   block that a hashed module already owns: the two allocators cannot fight. */
+
+static int c6_err_name_ok(const char *name)
+{
+    int i = 0;
+
+    if (!name[0] || (name[0] >= '0' && name[0] <= '9'))
+        return 0;
+    for (i = 0; name[i]; i++)
+        if (!((name[i] >= 'a' && name[i] <= 'z')
+              || (name[i] >= 'A' && name[i] <= 'Z')
+              || (name[i] >= '0' && name[i] <= '9')
+              || name[i] == '_' || name[i] == '.'))
+            return 0;
+    return i > 0;
+}
+
+static void c6_errbase_parse(TCCState *s1, const char *path)
+{
+    int fd = open(path, O_RDONLY | O_BINARY);
+    char *text = 0, *p = 0;
+    int line = 0;
+
+    if (fd < 0)
+        return;
+    text = tcc_load_text(fd);
+    close(fd);
+    p = text;
+    while (p && *p) {
+        char name[256] = {0};
+        char *e = strchr(p, '\n');
+        char *hash = 0, *end = 0, *next = 0;
+        long slot = 0;
+        int n = 0, k = 0;
+        C6ErrMod *m = NULL, *o = NULL;
+
+        line++;
+        next = e ? e + 1 : p + strlen(p);
+        if (e)
+            *e = 0;
+        hash = strchr(p, '#');
+        if (hash)
+            *hash = 0;                  /* comment */
+        while (*p == ' ' || *p == '\t')
+            p++;
+        while (*p && *p != ' ' && *p != '\t' && n < (int)sizeof name - 1)
+            name[n++] = *p++;
+        name[n] = 0;
+        if (name[0]) {
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (!*p)
+                tcc_error("%s:%d: module '%s' needs a slot", path, line, name);
+            slot = strtol(p, &end, 0);
+            if (end == p)
+                tcc_error("%s:%d: '%s' is not a slot number", path, line, p);
+            while (*end == ' ' || *end == '\t')
+                end++;
+            if (*end)
+                tcc_error("%s:%d: unexpected '%s' after the slot",
+                          path, line, end);
+            if (!c6_err_name_ok(name))
+                tcc_error("%s:%d: '%s' is not a module name", path, line, name);
+            if (!strncmp(name, "std.", 4))
+                tcc_error("%s:%d: the blocks of the std modules are built "
+                          "into the compiler: remove '%s' from errbase.def",
+                          path, line, name);
+            if (slot < C6_ERR_SLOT_PIN || slot > C6_ERR_SLOT_END)
+                tcc_error("%s:%d: slot 0x%lx is outside the pinned pool "
+                          "0x%04x..0x%04x", path, line, slot,
+                          C6_ERR_SLOT_PIN, C6_ERR_SLOT_END);
+            m = c6_err_mod_find(s1, name);
+            if (m && m->pinned && m->slot != (int)slot)
+                tcc_error("%s:%d: module '%s' is pinned to 0x%04x already",
+                          path, line, name, m->slot);
+            for (k = 0; k < s1->c6_nb_err_mods; k++) {
+                C6ErrMod *o2 = s1->c6_err_mods[k];
+                if (o2->pinned && o2->slot == (int)slot
+                    && strcmp(o2->name, name))
+                    tcc_error("%s:%d: slot 0x%04x is used by '%s' already",
+                              path, line, (int)slot, o2->name);
+            }
+            /* std names were rejected above, so this is an app module */
+            o = c6_err_mod_add(s1, name, 0, (int)slot, 1);
+            o->pinned = 1;              /* may merge into an already seen
+                                           module: the pin wins */
+            o->slot = (int)slot;
+        }
+        p = next;
+    }
+    tcc_free(text);
+}
+
+/* the project's table: 'errbase.def' next to the build, then the -I paths */
+static int c6_errbase_find(TCCState *s1, char *out, int outsz)
+{
+    FILE *f = NULL;
+    int i = 0;
+
+    snprintf(out, outsz, "errbase.def");
+    f = tcc_fopen(out, "r");
+    if (f) {
+        tcc_fclose(f);
+        return 0;
+    }
+    for (i = 0; i < s1->nb_include_paths; i++) {
+        snprintf(out, outsz, "%s/errbase.def", s1->include_paths[i]);
+        f = tcc_fopen(out, "r");
+        if (f) {
+            tcc_fclose(f);
+            return 0;
+        }
+    }
+    out[0] = 0;
+    return -1;
+}
+
+static void c6_errbase_load(TCCState *s1)
+{
+    char path[1024] = {0};
+    int fd = 0;
+
+    if (s1->c6_errbase_loaded)
+        return;
+    s1->c6_errbase_loaded = 1;
+    if (s1->c6_errbase_off)
+        return;
+    if (s1->c6_errbase_file) {
+        /* an explicit table must exist: it is never created behind the
+           user's back */
+        fd = open(s1->c6_errbase_file, O_RDONLY | O_BINARY);
+        if (fd < 0)
+            tcc_error("cannot read error block table '%s'",
+                      s1->c6_errbase_file);
+        close(fd);
+        c6_errbase_parse(s1, s1->c6_errbase_file);
+        s1->c6_errbase_found = 1;
+        return;
+    }
+    if (c6_errbase_find(s1, path, sizeof path) == 0) {
+        c6_errbase_parse(s1, path);
+        s1->c6_errbase_found = 1;
+    }
+}
+
+/* the block of one module; *AREA receives 0 (application) or 1 (std) */
+static int c6_err_slot(const char *dotted, int *area)
+{
+    C6ErrMod *m = NULL;
+    int slot = 0;
+
+    *area = !strncmp(dotted, "std.", 4) ? 1 : 0;
+    slot = c6_err_std_slot(dotted);
+    if (slot >= 0)
+        return slot;                    /* built into the compiler */
+    c6_errbase_load(tcc_state);
+    m = c6_err_mod_find(tcc_state, dotted);
+    if (m && m->pinned)
+        return m->slot;                 /* frozen in errbase.def */
+    return C6_ERR_SLOT_AUTO + (int)(c6_err_hash(dotted)
+                                    % C6_ERR_SLOT_AUTO_END);
+}
+
+/* the base of the module the file being compiled belongs to, 0 when it has
+   none: a file without 'module' keeps the plain small ids */
+static int c6_err_module_base(void)
+{
+    char dotted[512] = {0};
+    int area = 0, slot = 0;
+
+    if (!tcc_state->c6_ext || !file || !file->c6_module)
+        return 0;
+    c6_err_dotted(file->c6_module, dotted, sizeof dotted);
+    slot = c6_err_slot(dotted, &area);
+    c6_err_mod_add(tcc_state, dotted, area, slot, 0);
+    return (area << C6_ERR_AREA_SHIFT) | (slot << C6_ERR_SLOT_SHIFT);
+}
+
+/* the stored value of one enumerator of a module's 'enum Error': 0 stays 0
+   (0 is "no error"), every other code moves into the module's block */
+static long long c6_err_code(int base, long long v, int vtok)
+{
+    const char *name = 0;
+
+    if (!base || v == 0)
+        return v;
+    if (v < 0 || v > C6_ERR_CODE_MASK) {
+        /* the member is already module-mangled here: report the source
+           spelling, which is what the programmer wrote */
+        name = get_tok_str(vtok, NULL);
+        if (file && file->c6_module
+            && !strncmp(name, file->c6_module, strlen(file->c6_module)))
+            name += strlen(file->c6_module);
+        tcc_error("error code of '%s' is not in 0..%d", name, C6_ERR_CODE_MASK);
+    }
+    return (long long)base + v;
+}
+
+/* The template of a fresh table: the file appears once the first program with
+   modules is linked, and its comments are all a reader needs to add a line. */
+static const char c6_errbase_head[] =
+"# c6 错误码号段表（errbase.def）\n"
+"#\n"
+"# 一个模块的 `enum Error` 的成员就落在它自己的号段里：\n"
+"#\n"
+"#     id = (area << 27) | (slot << 12) | code\n"
+"#\n"
+"#   area  0 = 应用（用户模块）  1 = std（内置在编译器里）  2..7 保留\n"
+"#   slot  0              不属于任何模块的文件（main 所在的 TU、tests）\n"
+"#         0x0001..0x5FFF 自动池：1 + fnv1a32(模块名) % 0x5FFF\n"
+"#         0x6000..0x60FF std 内置池（编译器里的常量表，别写进这个文件）\n"
+"#         0x6100..0x7FFF 钉号池：就是这个文件里的条目\n"
+"#   code  0 = 成功，1..0xFFF 是模块内的错误码\n"
+"#\n"
+"# 只有要钉住的模块才写在这里；没列出来的模块按模块名哈希自动拿号，号是\n"
+"# 名字的纯函数，加模块、加错误码、改编译顺序都不会让它变。写在这里的号\n"
+"# 永远不变。'tcc -emit-errbase' 把当前可见的模块一次全钉住（已有行原样\n"
+"# 保留，新模块追加在末尾）。\n"
+"#\n"
+"# 格式：  <模块名>  <slot>       slot 取 0x6100..0x7FFF\n";
+
+/* a fresh table is written next to the build the first time a program with
+   modules is linked and none is found: an empty table (comments only) keeps
+   the automatic blocks, so creating it never moves an id either */
+static void c6_errbase_create(TCCState *s1)
+{
+    FILE *f = NULL;
+
+    if (s1->c6_errbase_off || s1->c6_errbase_file)
+        return;
+    c6_errbase_load(s1);
+    if (s1->c6_errbase_found || s1->nb_errors || s1->c6_nb_err_mods <= 0)
+        return;
+    if (s1->output_type != TCC_OUTPUT_EXE && s1->output_type != TCC_OUTPUT_DLL
+        && s1->output_type != TCC_OUTPUT_MEMORY)
+        return;
+    f = tcc_fopen("errbase.def", "w");
+    if (!f)
+        return;
+    fputs(c6_errbase_head, f);
+    tcc_fclose(f);
+    s1->c6_errbase_found = 1;
+}
+
+/* end of a run: two modules must not end up in one block, and a project
+   without a table gets one */
+ST_FUNC int c6_err_finish(TCCState *s1)
+{
+    int i = 0, j = 0, bad = 0;
+
+    if (s1->c6_nb_err_mods <= 0)
+        return 0;               /* no module: nothing to check */
+    for (i = 0; i < s1->c6_nb_err_mods; i++) {
+        C6ErrMod *a = s1->c6_err_mods[i];
+        for (j = i + 1; j < s1->c6_nb_err_mods; j++) {
+            C6ErrMod *b = s1->c6_err_mods[j];
+            if (a->area != b->area || a->slot != b->slot)
+                continue;
+            bad = 1;
+            /* the run is over: no compile context to report through, so
+               speak to stderr directly */
+            fprintf(stderr, "tcc: error: error ids: modules '%s' and '%s' "
+                    "share the block 0x%04x; pin one of them in errbase.def\n",
+                    a->name, b->name, a->slot);
+        }
+    }
+    if (!bad)
+        c6_errbase_create(s1);
+    return bad;
+}
+
+/* '-emit-errbase': freeze the block of every module seen in this run */
+static int c6_err_mod_cmp(const void *pa, const void *pb)
+{
+    const C6ErrMod *a = *(const C6ErrMod *const *)pa;
+    const C6ErrMod *b = *(const C6ErrMod *const *)pb;
+
+    return strcmp(a->name, b->name);
+}
+
+ST_FUNC int c6_errbase_write(TCCState *s1, const char *path)
+{
+    FILE *f = NULL;
+    int i = 0, next = C6_ERR_SLOT_PIN, n = 0;
+    C6ErrMod **arr = NULL;
+
+    if (!path || !*path)
+        path = "errbase.def";
+    c6_errbase_load(s1);        /* keep every block that is already pinned */
+    for (i = 0; i < s1->c6_nb_err_mods; i++) {
+        C6ErrMod *m = s1->c6_err_mods[i];
+        if (m->area == 1)
+            continue;                   /* std is built into the compiler */
+        if (m->pinned && m->slot >= next)
+            next = m->slot + 1;
+        dynarray_add(&arr, &n, m);
+    }
+    /* by name, so that the file 'errbase.def' comes out identical however the
+       modules were ordered on the command line: a committed table must not
+       churn */
+    qsort(arr, n, sizeof *arr, c6_err_mod_cmp);
+    for (i = 0; i < n; i++) {
+        if (arr[i]->pinned)
+            continue;                   /* a pinned block never moves */
+        if (next > C6_ERR_SLOT_END) {
+            fprintf(stderr, "tcc: error: the pinned pool 0x%04x..0x%04x is "
+                    "full: errbase.def cannot grow\n",
+                    C6_ERR_SLOT_PIN, C6_ERR_SLOT_END);
+            tcc_free(arr);
+            return -1;
+        }
+        arr[i]->slot = next++;
+        arr[i]->pinned = 1;
+    }
+    f = tcc_fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "tcc: error: cannot write '%s'\n", path);
+        tcc_free(arr);
+        return -1;
+    }
+    fputs(c6_errbase_head, f);
+    fputc('\n', f);
+    for (i = 0; i < n; i++)
+        fprintf(f, "%-24s 0x%04x\n", arr[i]->name, arr[i]->slot);
+    tcc_free(arr);
+    tcc_fclose(f);
+    return 0;
 }
 
 /* Open the graded file of a module: the module name *is* its path, so
@@ -15801,10 +16275,11 @@ static void c6_emit_propagate(void)
     CODE_OFF();
 }
 
-/* parse "err(ID, MSG)": record the error, run the error-path cleanups
-   (errdefer and defer) of the whole function frame and return.  'err'
-   always returns immediately, so there is no re-raise form: callers that
-   want to forward an error use 'try' instead. */
+/* parse "return err(ID, MSG)": record the error, run the error-path cleanups
+   (errdefer and defer) of the whole function frame and return the sentinel.
+   'err' is the only producer of the 'error' value and 'return' is its only
+   consumer, so the call is not a statement: callers that want to forward an
+   error use 'try' instead. */
 static void c6_err_parse(void)
 {
     if (defer_state.body_depth > 0)
@@ -16568,6 +17043,17 @@ again:
     } else if (t == TOK_RETURN) {
 #ifdef C6_EXT
         c6_last_stmt_leaves = 1;
+        if (tcc_state->c6_ext && tok == TOK_C6_ERR) {
+            /* 'return err(id, msg)': err is the only producer of the
+               'error' value and 'return' is its only consumer.  err()
+               writes the slot, runs this frame's errdefer/defer in reverse
+               order and returns the sentinel itself, so none of the plain
+               'return' path applies -- not even the defer-body check,
+               which reports the 'err' spelling instead. */
+            next();             /* skip 'err': the '(' starts the call */
+            c6_err_parse();
+            goto c6_ret_done;
+        }
         if (defer_state.body_depth > 0)
             tcc_error("'return' is not allowed in a defer body");
         ret_off = 0;
@@ -16699,10 +17185,9 @@ again:
     } else if (t == TOK_C6_ERR) {
         if (!c6_ext_on())
             tcc_error("'err' requires a .c6 source file");
-        else {
-            c6_last_stmt_leaves = 1;
-            c6_err_parse();
-        }
+        /* err() yields the value of the 'error' channel; it is not a
+           statement, so a bare call would leave the error unreturned */
+        tcc_error("'err' can only be used as 'return err(id, msg)'");
 
     } else if (t == TOK_C6_TRY) {
         /* 'try f();' is an ordinary expression statement */
@@ -22619,7 +23104,14 @@ static void c6_check_error_param(CType *type)
 static void c6_check_var_initialized(CType *type, int has_init, int v,
                                          AttributeDef *ad)
 {
-    if (!tcc_state->c6_ext || has_init)
+    if (!tcc_state->c6_ext)
+        return;
+    /* 'error' is the payload of the 'T!error' return channel: it is
+       produced by 'return err(id, msg)' and never stored anywhere */
+    if (c6_is_error_type(type))
+        tcc_error("'error' is the type of 'err()': it can only be returned "
+                  "from a 'T!error' function");
+    if (has_init)
         return;
     if (type->t & (VT_EXTERN | VT_TYPEDEF | VT_VLA | VT_STATIC))
         return;

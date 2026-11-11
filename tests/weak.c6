@@ -22,18 +22,18 @@ test "弱引用不计数、可以升级" {
     @Node q = NULL;
 
     if (__c6_gc_refcount(p) != 1)
-        err(1, "弱引用不该增加计数");
+        return err(1, "弱引用不该增加计数");
     if (w == NULL)
-        err(2, "弱引用不该是空");
+        return err(2, "弱引用不该是空");
     q = w;                      /* 升级：原子 try-incref */
     if (q == NULL || q->v != 7)
-        err(3, "升级拿不到对象");
+        return err(3, "升级拿不到对象");
     if (__c6_gc_refcount(p) != 2)
-        err(4, "升级没有计数");
+        return err(4, "升级没有计数");
     q = NULL;
     p = NULL;
     if (__c6_gc_live() != 0)
-        err(5, "对象没有释放干净");
+        return err(5, "对象没有释放干净");
 }
 
 test "目标死亡后弱槽变成空" {
@@ -42,14 +42,14 @@ test "目标死亡后弱槽变成空" {
 
     p = NULL;                   /* 最后一个计数引用消失 */
     if (w != NULL)
-        err(1, "目标死亡后弱槽没有置空");
+        return err(1, "目标死亡后弱槽没有置空");
     {
         @Node q = w;            /* 升级一个空弱槽：得到空值 */
         if (q != NULL)
-            err(2, "空弱槽升级出了对象");
+            return err(2, "空弱槽升级出了对象");
     }
     if (__c6_gc_live() != 0)
-        err(3, "还有对象活着");
+        return err(3, "还有对象活着");
 }
 
 test "弱字段：结构体死亡后注销，目标活得更久" {
@@ -58,22 +58,22 @@ test "弱字段：结构体死亡后注销，目标活得更久" {
         @Holder h = new Holder;
         h->back = keep;
         if (__c6_gc_refcount(keep) != 1)
-            err(1, "弱字段增加了计数");
+            return err(1, "弱字段增加了计数");
         if (h->back == NULL)
-            err(2, "弱字段没有写进去");
+            return err(2, "弱字段没有写进去");
     }
     if (__c6_gc_live() != 1)
-        err(3, "Holder 没有释放");
+        return err(3, "Holder 没有释放");
     if (__c6_gc_refcount(keep) != 1)
-        err(4, "弱字段的目标被影响了");
+        return err(4, "弱字段的目标被影响了");
 
     /* 目标死亡时槽要失效 */
     weak @Node w = keep;
     keep = NULL;
     if (w != NULL)
-        err(5, "目标死亡后弱槽没有置空");
+        return err(5, "目标死亡后弱槽没有置空");
     if (__c6_gc_live() != 0)
-        err(6, "还有对象活着");
+        return err(6, "还有对象活着");
 }
 
 test "弱字段的升级" {
@@ -84,16 +84,16 @@ test "弱字段的升级" {
     {
         @Node q = h->back;
         if (q == NULL || q->v != 11)
-            err(1, "弱字段升级失败");
+            return err(1, "弱字段升级失败");
         if (__c6_gc_refcount(p) != 2)
-            err(2, "弱字段升级没有计数");
+            return err(2, "弱字段升级没有计数");
     }
     if (__c6_gc_refcount(p) != 1)
-        err(3, "升级出来的引用没有释放");
+        return err(3, "升级出来的引用没有释放");
     h = NULL;
     p = NULL;
     if (__c6_gc_live() != 0)
-        err(4, "还有对象活着");
+        return err(4, "还有对象活着");
 }
 
 test "全局弱引用与重新指向" {
@@ -102,18 +102,18 @@ test "全局弱引用与重新指向" {
 
     g_weak = a;
     if (g_weak != a)
-        err(1, "全局弱引用没有写进去");
+        return err(1, "全局弱引用没有写进去");
     g_weak = b;                 /* 重新指向：旧槽解注册 */
     if (g_weak != b)
-        err(2, "全局弱引用没有重新指向");
+        return err(2, "全局弱引用没有重新指向");
     a = NULL;
     if (g_weak != b)
-        err(3, "无关对象死亡影响了别的弱槽");
+        return err(3, "无关对象死亡影响了别的弱槽");
     b = NULL;
     if (g_weak != NULL)
-        err(4, "目标死亡后全局弱槽没有置空");
+        return err(4, "目标死亡后全局弱槽没有置空");
     if (__c6_gc_live() != 0)
-        err(5, "还有对象活着");
+        return err(5, "还有对象活着");
 }
 
 test "弱引用自己死亡时不影响目标" {
@@ -123,8 +123,8 @@ test "弱引用自己死亡时不影响目标" {
         (void)w;
     }
     if (__c6_gc_refcount(p) != 1)
-        err(1, "局部弱引用的死亡影响了目标");
+        return err(1, "局部弱引用的死亡影响了目标");
     p = NULL;
     if (__c6_gc_live() != 0)
-        err(2, "还有对象活着");
+        return err(2, "还有对象活着");
 }

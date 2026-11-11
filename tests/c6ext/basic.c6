@@ -10,7 +10,7 @@
 static int!error half(int n)
 {
     if ((n & 1) != 0)
-        err(1, "odd");
+        return err(1, "odd");
     return n / 2;
 }
 
@@ -29,24 +29,24 @@ test "后缀开启 defer" {
         defer { x = 2; }
         x = 1;
         if (x != 1)
-            err(1, "defer ran early");
+            return err(1, "defer ran early");
     }
     if (x != 2)
-        err(2, "defer did not run");
+        return err(2, "defer did not run");
 }
 
 test "后缀开启切片语法" {
     int a[4] = { 1, 2, 3, 4 };
     int[:] s = a;
     if (s.len != 4)
-        err(3, "slice len");
+        return err(3, "slice len");
     if (s[2] != 3)
-        err(4, "slice index");
+        return err(4, "slice index");
 }
 
 test "后缀开启 try/catch" {
     if (half_or_id(8) != 4)
-        err(5, "half(8)");
+        return err(5, "half(8)");
     if (half_or_id(9) != -1)
-        err(6, "half(9)");
+        return err(6, "half(9)");
 }

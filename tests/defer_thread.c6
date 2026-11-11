@@ -82,11 +82,11 @@ test "spawn 线程和主线程同时跑带 defer 的代码" {
     __c6_th_join_all();
 
     if (count_a != ROUNDS * (DEPTH + 1))
-        err(1, "线程 A 的清理次数不对（帧之间串了）");
+        return err(1, "线程 A 的清理次数不对（帧之间串了）");
     if (count_b != ROUNDS * (DEPTH + 1))
-        err(2, "线程 B 的清理次数不对（帧之间串了）");
+        return err(2, "线程 B 的清理次数不对（帧之间串了）");
     if (count_main != ROUNDS * (DEPTH + 1))
-        err(3, "主线程的清理次数不对（帧之间串了）");
+        return err(3, "主线程的清理次数不对（帧之间串了）");
 }
 
 /* ---- 线程里走错误路径：defer + errdefer 都要跑 ---- */
@@ -98,7 +98,7 @@ static int!error th_fail(int n)
 {
     defer count_err += 1;
     errdefer count_err += 10;
-    err(n, "thread");
+    return err(n, "thread");
     return 0;
 }
 
@@ -127,9 +127,9 @@ test "线程里的错误路径照样跑清理" {
     __c6_th_join_all();
 
     if (err_seen != 1)
-        err(1, "线程里没有拿到错误码");
+        return err(1, "线程里没有拿到错误码");
     if (count_err != 11)
-        err(2, "线程里错误路径的清理次数不对（defer 1 次 + errdefer 1 次）");
+        return err(2, "线程里错误路径的清理次数不对（defer 1 次 + errdefer 1 次）");
 }
 
 /* ---- 同一个 'spawn' 线程里反复进出带着清理点的函数 ---- */
@@ -169,5 +169,5 @@ test "一个线程里连续两次调用带清理的函数" {
     __c6_th_join_all();
 
     if (count_many != 2 * ROUNDS)
-        err(1, "两帧的清理次数不对");
+        return err(1, "两帧的清理次数不对");
 }

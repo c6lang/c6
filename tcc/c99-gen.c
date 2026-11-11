@@ -2500,6 +2500,66 @@ static void c99_undef_imports(FILE *f)
     fprintf(f, "#endif\n");
 }
 
+/* The '@S<n>@' placeholders hold a symbol index, and tccelf_end_file()
+   renumbers the symbols of the unit it just finished: an index recorded while
+   generating code is only valid right after that same unit ended.  The driver
+   therefore resolves once per translation unit (a later unit only appends
+   symbols, so the earlier indices stay put), and the final call from
+   c99_output_file() has nothing left to do in the normal case. */
+ST_FUNC void c99_tu_end(TCCState *s1)
+{
+    if (c99_prog.len)
+        c99_resolve_syms(s1);
+}
+
+/* tccelf_end_file() renumbers the symbols of the unit it just finished: a
+   definition an earlier unit already introduced is not appended a second
+   time, so every index that follows it moves down.  TR holds the new index of
+   the old index FIRST+i, and the text emitted for this unit still carries the
+   old numbers: translate them now, before c99_tu_end() resolves the
+   placeholders. */
+ST_FUNC void c99_sym_remap(TCCState *s1, int *tr, int first, int nb)
+{
+    C99Buf out;
+    int k = 0, changed = 0;
+
+    if (!c99_prog.len || nb <= 0)
+        return;
+    memset(&out, 0, sizeof out);
+    while (k < c99_prog.len) {
+        if (c99_prog.data[k] == '@' && k + 2 < c99_prog.len
+            && c99_prog.data[k + 1] == 'S') {
+            int j = k + 2, idx = 0, n = 0;
+            while (j < c99_prog.len && c99_prog.data[j] >= '0'
+                   && c99_prog.data[j] <= '9') {
+                idx = idx * 10 + c99_prog.data[j++] - '0';
+                n++;
+            }
+            if (n && j < c99_prog.len && c99_prog.data[j] == '@') {
+                if (idx >= first && idx < first + nb && tr[idx - first] > 0
+                    && tr[idx - first] != idx) {
+                    char tmp[32];
+                    snprintf(tmp, sizeof tmp, "@S%d@", tr[idx - first]);
+                    buf_puts(&out, tmp);
+                    changed = 1;
+                } else {
+                    buf_add(&out, c99_prog.data + k, j + 1 - k);
+                }
+                k = j + 1;
+                continue;
+            }
+        }
+        buf_add(&out, c99_prog.data + k, 1);
+        k++;
+    }
+    if (changed) {
+        tcc_free(c99_prog.data);
+        c99_prog = out;
+    } else {
+        tcc_free(out.data);
+    }
+}
+
 ST_FUNC int c99_output_file(TCCState *s1, const char *filename)
 {
     FILE *f;

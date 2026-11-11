@@ -27,19 +27,19 @@ test "字段名不被同名方法抢走" {
 
     c->grow(7);
     if (c->capacity() != 7)
-        err(1, "裸写 cap 应该取字段，而不是 Box 的 cap()");
+        return err(1, "裸写 cap 应该取字段，而不是 Box 的 cap()");
 }
 
 test "方法的形参名不漏到调用方作用域" {
     int i = 0;
     Box@(4) b = { { 0 }, 0 };
 
-    (&b)->add('a') catch e { err(2, "add 失败"); };
+    (&b)->add('a') catch e { return err(2, "add 失败"); };
     if ((&b)->at(0) != 'a')
-        err(3, "at 不对");
+        return err(3, "at 不对");
     i++;
     if (i != 1)
-        err(4, "'i' 被模板的形参污染了");
+        return err(4, "'i' 被模板的形参污染了");
 }
 
 test "同一个 TU 里两种模板实例并存" {
@@ -47,19 +47,19 @@ test "同一个 TU 里两种模板实例并存" {
     Box@(8) b = { { 0 }, 0 };
 
     c->grow(2);
-    (&b)->add('z') catch e { err(5, "add 失败"); };
+    (&b)->add('z') catch e { return err(5, "add 失败"); };
     if ((&b)->cap() != 8 || c->capacity() != 2)
-        err(6, "两个实例互相串了");
+        return err(6, "两个实例互相串了");
 }
 
 test "两个 TU 都实例化同一个模板" {
     Box@(8) b = { { 0 }, 0 };
 
     if (tu_fill() != 9)             /* cap() 的 8 + 一个字符 */
-        err(7, "第二个 TU 的实例结果不对");
-    (&b)->add('q') catch e { err(8, "add 失败"); };
+        return err(7, "第二个 TU 的实例结果不对");
+    (&b)->add('q') catch e { return err(8, "add 失败"); };
     if ((&b)->cap() != 8 || b.n != 1)
-        err(9, "本 TU 的实例结果不对");
+        return err(9, "本 TU 的实例结果不对");
 }
 
 test "实例的形参名也不和形参自己打架" {
@@ -68,8 +68,8 @@ test "实例的形参名也不和形参自己打架" {
     int i = 0;
 
     for (i = 0; i < 2; i++) {
-        (&b)->add((char)('m' + i)) catch e { err(10, "add 失败"); };
+        (&b)->add((char)('m' + i)) catch e { return err(10, "add 失败"); };
     }
     if ((&b)->at(0) != 'm' || (&b)->at(1) != 'n')
-        err(11, "追加的字符不对");
+        return err(11, "追加的字符不对");
 }

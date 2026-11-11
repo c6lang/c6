@@ -11,75 +11,75 @@ import tu.module;
 
 test "import 加载模块的声明，短名可以直接调用" {
     if (add(2, 3) != 5)
-        err(1, "add");
+        return err(1, "add");
     if (twice(21) != 42)
-        err(2, "twice");
+        return err(2, "twice");
 }
 
 test "模块的结构体、枚举和全局变量按前缀导出" {
     Point p = { 3, 4 };
     if (p.x != 3 || p.y != 4)
-        err(3, "Point");
+        return err(3, "Point");
     if (area(&p) != 12)
-        err(4, "area");
+        return err(4, "area");
     if (RED != 0 || GREEN != 1)
-        err(5, "Color");
+        return err(5, "Color");
     if (counter != 7)
-        err(6, "counter");
+        return err(6, "counter");
     counter = 9;
     if (bump() != 10)
-        err(7, "bump");
+        return err(7, "bump");
     if (counter != 10)
-        err(8, "counter after bump");
+        return err(8, "counter after bump");
 }
 
 test "import 之后仍可以写全限定名" {
     Point q = { 2, 5 };
     if (tu.module.add(1, 4) != 5)
-        err(9, "qualified add");
+        return err(9, "qualified add");
     if (tu.module.area(&q) != 10)
-        err(10, "qualified area");
+        return err(10, "qualified area");
 }
 
 test "模块类型可以写全限定名" {
     tu.module.Point p = { 4, 6 };
     tu.module.Point *q = &p;
     if (tu.module.area(q) != 24)
-        err(12, "qualified type");
+        return err(12, "qualified type");
 }
 
 test "interface 也从模块导入" {
     Point p = { 6, 7 };
     Shape s = p;
     if (s.area() != 42)
-        err(11, "interface area");
+        return err(11, "interface area");
 }
 
 test "模块成员就是普通的带前缀 C 符号" {
     if (tu__module__add(10, 20) != 30)
-        err(13, "mangled add");
+        return err(13, "mangled add");
     tu__module__counter = 99;           /* 和 'counter' 是同一个对象 */
     if (counter != 99)
-        err(14, "mangled counter");
+        return err(14, "mangled counter");
     counter = 7;
 }
 
 test "全限定的模块函数可以取地址" {
     int (*add_ref)(int, int) = tu.module.add;
     if (add_ref(20, 22) != 42)
-        err(15, "function pointer");
+        return err(15, "function pointer");
 }
 
 test "可见的对象优先于模块名" {
     struct Point tu = { 7, 8 };
     if (tu.x != 7)
-        err(16, "a visible object shadows the module name");
+        return err(16, "a visible object shadows the module name");
 }
 
 test "模块里的结构体全局可以逐字段读写" {
     if (tu.module.origin.x != 3 || tu.module.origin.y != 4)
-        err(17, "qualified struct global");
+        return err(17, "qualified struct global");
     *&tu.module.origin.x = 8;
     if (tu.module.origin.x != 8)
-        err(18, "write through the qualified global");
+        return err(18, "write through the qualified global");
 }

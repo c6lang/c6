@@ -25,9 +25,9 @@ int bump(void) { return ++counter; }
 test "模块内部照样用短名" {
     Point p = { 2, 2 };
     if (add(1, 1) != 2)
-        err(1, "internal add");
+        return err(1, "internal add");
     if (area(&p) != 4)
-        err(2, "internal area");
+        return err(2, "internal area");
     if (RED != 0)
-        err(3, "internal enum");
+        return err(3, "internal enum");
 }

@@ -11,20 +11,20 @@ import tu.c6mod;
 
 test "import 找到 .c6 模块" {
     if (add(2, 3) != 5)
-        err(1, "add");
+        return err(1, "add");
     if (twice(21) != 42)
-        err(2, "twice");
+        return err(2, "twice");
 }
 
 test "模块的 struct / enum / 全局变量" {
     Point p = { 3, 4 };
     if (area(&p) != 12)
-        err(3, "area");
+        return err(3, "area");
     if (GREEN != 1)
-        err(4, "enum");
+        return err(4, "enum");
     if (counter != 7)
-        err(5, "counter");
+        return err(5, "counter");
     counter = 9;
     if (bump() != 10)
-        err(6, "bump");
+        return err(6, "bump");
 }

@@ -48,24 +48,24 @@ enum Bool { FALSE_ = 0, TRUE_ = 1 };
 
 test "定宽类型的大小是固定的" {
     if (sizeof(u8) != 1 || sizeof(i8) != 1)
-        err(1, "u8/i8 不是 1 字节");
+        return err(1, "u8/i8 不是 1 字节");
     if (sizeof(u16) != 2 || sizeof(i16) != 2)
-        err(2, "u16/i16 不是 2 字节");
+        return err(2, "u16/i16 不是 2 字节");
     if (sizeof(u32) != 4 || sizeof(i32) != 4)
-        err(3, "u32/i32 不是 4 字节");
+        return err(3, "u32/i32 不是 4 字节");
     if (sizeof(u64) != 8 || sizeof(i64) != 8)
-        err(4, "u64/i64 不是 8 字节");
+        return err(4, "u64/i64 不是 8 字节");
     if (sizeof(usize) != sizeof(void *))
-        err(5, "usize 不是指针大小");
+        return err(5, "usize 不是指针大小");
 }
 
 test "边界常量可以当无符号值使用" {
     u16 m = U16_MAX;
     u8 b = U8_MAX;
     if (m != 65535 || b != 255)
-        err(6, "边界常量不对");
+        return err(6, "边界常量不对");
     if (I32_MAX != 2147483647)
-        err(7, "I32_MAX 不对");
+        return err(7, "I32_MAX 不对");
 }
 
 test "别名可以互相当作同一种类型" {
@@ -73,5 +73,5 @@ test "别名可以互相当作同一种类型" {
     u8 y = x;
     usize n = sizeof(byte);
     if (y != 200 || n != 1)
-        err(8, "byte/u8 不是同一个类型");
+        return err(8, "byte/u8 不是同一个类型");
 }

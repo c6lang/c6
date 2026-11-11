@@ -188,21 +188,21 @@ int!error to_int(Str *self, int *out)
     int digits = 0;
 
     if (p->s.len == 0)
-        err(1, "str: empty number");
+        return err(1, "str: empty number");
     if (p->s[0] == '-' || p->s[0] == '+') {
         neg = p->s[0] == '-';
         i = 1;
     }
     for (; i < p->s.len; i++) {
         if (p->s[i] < '0' || p->s[i] > '9')
-            err(2, "str: not a number");
+            return err(2, "str: not a number");
         v = v * 10 + (p->s[i] - '0');
         if (v > 2147483647L)
-            err(3, "str: number out of range");
+            return err(3, "str: number out of range");
         digits++;
     }
     if (!digits)
-        err(4, "str: no digits");
+        return err(4, "str: no digits");
     *out = (int)(neg ? -v : v);
     return 0;
 }
@@ -236,13 +236,13 @@ test "S() 给出不含结尾 NUL 的长度" {
     Str *pe = &e;
 
     if (p->count() != 5)
-        err(1, "S(\"hello\") 的长度不是 5");
+        return err(1, "S(\"hello\") 的长度不是 5");
     if (pe->count() != 0)
-        err(2, "S(\"\") 的长度不是 0");
+        return err(2, "S(\"\") 的长度不是 0");
     if (p->at(0) != 'h' || p->at(4) != 'o')
-        err(3, "at 不对");
+        return err(3, "at 不对");
     if (p->at(5) != 0)
-        err(4, "越界没有返回 0");
+        return err(4, "越界没有返回 0");
 }
 
 test "str() 接 C 字符串" {
@@ -250,11 +250,11 @@ test "str() 接 C 字符串" {
     Str *p = &s;
 
     if (p->count() != 3)
-        err(5, "str() 的长度不对");
+        return err(5, "str() 的长度不对");
     if (!p->eq(S("abc")))
-        err(6, "str() 的内容不对");
+        return err(6, "str() 的内容不对");
     if (p->count() != 3 || p->is_empty())
-        err(7, "空判断不对");
+        return err(7, "空判断不对");
 }
 
 test "比较与相等" {
@@ -265,13 +265,13 @@ test "比较与相等" {
     Str *pa = &a, *pb = &b, *pd = &d;
 
     if (!pa->eq(c.s))
-        err(8, "相同内容不相等");
+        return err(8, "相同内容不相等");
     if (pa->eq(b.s))
-        err(9, "不同内容相等了");
+        return err(9, "不同内容相等了");
     if (pa->cmp(b.s) != -1 || pb->cmp(a.s) != 1)
-        err(10, "cmp 的正负不对");
+        return err(10, "cmp 的正负不对");
     if (pa->cmp(d.s) != 1 || pd->cmp(a.s) != -1)
-        err(11, "前缀关系不对");
+        return err(11, "前缀关系不对");
 }
 
 test "find / find_char / starts_with / ends_with" {
@@ -279,15 +279,15 @@ test "find / find_char / starts_with / ends_with" {
     Str *p = &s;
 
     if (p->find(S("world")) != 6)
-        err(12, "find 子串不对");
+        return err(12, "find 子串不对");
     if (p->find(S("zzz")) != -1)
-        err(13, "找不到时应返回 -1");
+        return err(13, "找不到时应返回 -1");
     if (p->find_char('o') != 4)
-        err(14, "find_char 不对");
+        return err(14, "find_char 不对");
     if (!p->starts_with(S("hello")) || p->starts_with(S("world")))
-        err(15, "starts_with 不对");
+        return err(15, "starts_with 不对");
     if (!p->ends_with(S("world")) || p->ends_with(S("hello")))
-        err(16, "ends_with 不对");
+        return err(16, "ends_with 不对");
 }
 
 test "trim / take / drop / sub 都是视图" {
@@ -302,16 +302,16 @@ test "trim / take / drop / sub 都是视图" {
     Str *pc = &c;
 
     if (pt->count() != 2 || !pt->eq(S("hi")))
-        err(17, "trim 不对");
+        return err(17, "trim 不对");
     if ((&a)->count() != 3)
-        err(18, "take 不对");
+        return err(18, "take 不对");
     if (!pb->eq(S("hi \t")))
-        err(19, "drop 不对");
+        return err(19, "drop 不对");
     if (!pc->eq(S("hi")))
-        err(20, "sub 不对");
+        return err(20, "sub 不对");
     /* 视图指回原内存 */
     if (t.s.data != s.s.data + 2)
-        err(21, "trim 没有指回原内存");
+        return err(21, "trim 没有指回原内存");
 }
 
 /* 成功返回 0，失败把错误 id 带出来（catch 体必须以 return/err/goto 结束） */
@@ -330,16 +330,16 @@ test "十进制解析" {
     Str d = { S("99999999999") };
     int v = 0;
 
-    (&a)->to_int(&v) catch e { err(22, "负数解析失败"); };
+    (&a)->to_int(&v) catch e { return err(22, "负数解析失败"); };
     if (v != -42)
-        err(23, "负数解析结果不对");
-    (&b)->to_int(&v) catch e { err(24, "正数解析失败"); };
+        return err(23, "负数解析结果不对");
+    (&b)->to_int(&v) catch e { return err(24, "正数解析失败"); };
     if (v != 7)
-        err(25, "正数解析结果不对");
+        return err(25, "正数解析结果不对");
     if (to_int_id(&c) != 2)
-        err(26, "非法字符应报 id 2");
+        return err(26, "非法字符应报 id 2");
     if (to_int_id(&d) != 3)
-        err(27, "溢出应报 id 3");
+        return err(27, "溢出应报 id 3");
 }
 
 test "copy_to 不写半截" {
@@ -348,11 +348,11 @@ test "copy_to 不写半截" {
     Str big = { S("abcdef") };
 
     if ((&ok)->copy_to(buf, 4) != 3)
-        err(28, "copy_to 成功时应返回长度");
+        return err(28, "copy_to 成功时应返回长度");
     if (strcmp(buf, "abc") != 0)
-        err(29, "copy_to 内容不对");
+        return err(29, "copy_to 内容不对");
     if ((&big)->copy_to(buf, 4) != -1)
-        err(30, "空间不够时应返回 -1");
+        return err(30, "空间不够时应返回 -1");
     if (strcmp(buf, "abc") != 0)
-        err(31, "空间不够时改写了缓冲");
+        return err(31, "空间不够时改写了缓冲");
 }

@@ -5,7 +5,7 @@
  * 不带任何 -D 时是本文件的“正常路径”，必须编译通过。
  */
 static int ok_int(void) { return 1; }
-static int!error fails(int n) { if (n) err(1, "x"); return 0; }
+static int!error fails(int n) { if (n) return err(1, "x"); return 0; }
 struct S { int a; };
 
 // EXPECT test_try_in_plain_fn: error: 'try' requires the enclosing function to return 'T!error'
@@ -70,13 +70,13 @@ static int!error bad(void) { defer { int v = fails(0) catch e { return -1; }; } 
 int main(void) { return bad(); }
 #elif defined test_incomplete_return
 struct Never;
-static struct Never!error bad(void) { err(1, "x"); }
+static struct Never!error bad(void) { return err(1, "x"); }
 int main(void) { return 0; }
 #elif defined test_result_unused
 static int!error value(void) { return 1; }
 int main(void) { value(); return 0; }
 #elif defined test_err_no_args
-static int!error bad(void) { err(); }
+static int!error bad(void) { return err(); }
 int main(void) { return bad(); }
 #else
 static int!error check(void)

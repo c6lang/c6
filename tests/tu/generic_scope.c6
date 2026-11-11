@@ -19,7 +19,7 @@ struct Box@(int N) {
     int!error add(char c)
     {
         if (n + 1 >= N)
-            err(1, "box: full");
+            return err(1, "box: full");
         data[n++] = c;
         return 0;
     }

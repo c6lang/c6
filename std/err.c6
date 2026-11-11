@@ -1,7 +1,9 @@
 /* std/err：标准错误码与消息。
  *
  * c6 的 `T!error` 只带一个 int id 和一条消息（见 README 的 err/try/catch）。
- * 标准库把 id 的取值固定下来，这样跨模块的错误可以互相识别：
+ * 模块里的 `enum Error` 就是它的错误码表：编译器把每个成员放进本模块的
+ * 号段（`(area<<27) | (slot<<12) | code`，见 docs/grammar.md），所以
+ * `NOMEM` 实际是 `0x0E000003` —— 0 仍是「没有错误」，跨模块可以互相识别：
  *
  *     import std.err;
  *
@@ -18,7 +20,7 @@
 
 module std.err;
 
-enum Code {
+enum Error {
     OK       = 0,
     INVAL    = 1,   /* 参数不合法 */
     RANGE    = 2,   /* 越界 */
@@ -69,26 +71,26 @@ const char *const msg_of(int code) { return msg(code); }
 
 test "错误码从 0 开始且互不相同" {
     if (OK != 0)
-        err(1, "OK 不是 0");
+        return err(1, "OK 不是 0");
     if (is_ok(OK) != 1 || is_ok(INVAL) != 0)
-        err(2, "is_ok 不对");
+        return err(2, "is_ok 不对");
     if (INVAL == RANGE || RANGE == NOMEM || FULL == EMPTY)
-        err(3, "错误码重复");
+        return err(3, "错误码重复");
 }
 
 test "消息表覆盖所有已知错误码" {
     if (strcmp(msg(OK), "ok") != 0)
-        err(4, "OK 的消息不对");
+        return err(4, "OK 的消息不对");
     if (strcmp(msg(RANGE), "out of range") != 0)
-        err(5, "RANGE 的消息不对");
+        return err(5, "RANGE 的消息不对");
     if (strcmp(msg(FULL), "full") != 0)
-        err(6, "FULL 的消息不对");
+        return err(6, "FULL 的消息不对");
     if (strcmp(msg(12345), "unknown error") != 0)
-        err(7, "未知错误码没有兜底消息");
+        return err(7, "未知错误码没有兜底消息");
 }
 
 /* 把 std.err 的 id 当作 !error 的载荷传出去，再按 id 分辨 */
-int!error boom(void) { err(RANGE, msg(RANGE)); }
+int!error boom(void) { return err(RANGE, msg(RANGE)); }
 
 /* 成功时返回 0，失败时把错误 id 原样带出来 */
 int boom_id(void)
@@ -100,7 +102,7 @@ int boom_id(void)
 test "错误码可以跨模块识别" {
     int rc = boom_id();
     if (rc != RANGE)
-        err(8, "catch 拿到的 id 不是 RANGE");
+        return err(8, "catch 拿到的 id 不是 RANGE");
     if (strcmp(msg(rc), "out of range") != 0)
-        err(9, "按 id 取消息不对");
+        return err(9, "按 id 取消息不对");
 }

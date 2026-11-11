@@ -71,7 +71,7 @@ int main(void) { bad(); return 0; }
 static void bad(void) { defer { goto out; } out: ; }
 int main(void) { bad(); return 0; }
 #elif defined test_err_in_defer
-static int!error bad(void) { defer { err(1, "x"); } return 0; }
+static int!error bad(void) { defer { return err(1, "x"); } return 0; }
 int main(void) { return bad(); }
 #else
 /* 正常路径：正好 128 个清理点、正好 8 层清理体，都必须编译通过 */

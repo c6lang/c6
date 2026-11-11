@@ -47,17 +47,17 @@ test "整型、布尔、字符" {
     char c = 'Q';
 
     if (!eq(f"n={n}", "n=42"))
-        err(1, "int 插值不对");
+        return err(1, "int 插值不对");
     if (!eq(f"{u}/{ll}", "7/-5"))
-        err(2, "无符号和 long long 插值不对");
+        return err(2, "无符号和 long long 插值不对");
     if (!eq(f"{t}{f}", "truefalse"))
-        err(3, "_Bool 应该输出 true / false");
+        return err(3, "_Bool 应该输出 true / false");
     if (!eq(f"{c}", "Q"))
-        err(4, "char 应该输出字符本身");
+        return err(4, "char 应该输出字符本身");
     if (!eq(f"{'A'}", "65"))
-        err(5, "字符常量按 C 的规则是 int，应该输出 65");
+        return err(5, "字符常量按 C 的规则是 int，应该输出 65");
     if (!eq(f"{(int)c}", "81"))
-        err(5, "char 转 int 后应该输出数值");
+        return err(5, "char 转 int 后应该输出数值");
 }
 
 test "文本：C 字符串、数组、托管缓冲、字符切片" {
@@ -68,13 +68,13 @@ test "文本：C 字符串、数组、托管缓冲、字符切片" {
     @char m = @f"m{n}";
 
     if (!eq(f"[{s}]", "[abc]"))
-        err(1, "const char * 插值不对");
+        return err(1, "const char * 插值不对");
     if (!eq(f"[{a}]", "[xy]"))
-        err(2, "char 数组插值不对");
+        return err(2, "char 数组插值不对");
     if (!eq(f"[{sl}]", "[slice]"))
-        err(3, "char[:] 插值不该带上结尾的 0");
+        return err(3, "char[:] 插值不该带上结尾的 0");
     if (!eq(f"[{m}]", "[m1]"))
-        err(4, "@char 插值不对");
+        return err(4, "@char 插值不对");
 }
 
 test "指针" {
@@ -83,30 +83,30 @@ test "指针" {
     const char *np = 0;
 
     if (!eq(f"{np}", "(null)"))
-        err(1, "空的 const char * 应该输出 (null)");
+        return err(1, "空的 const char * 应该输出 (null)");
     if (!eq(f"{(void *)0}", "0x0"))
-        err(2, "空指针应该输出 0x0");
+        return err(2, "空指针应该输出 0x0");
     if (0 != strncmp(f"{p}", "0x", 2))
-        err(3, "指针应该输出成 0x 开头的地址");
+        return err(3, "指针应该输出成 0x 开头的地址");
 }
 
 test "花括号与转义" {
     int n = 1;
 
     if (!eq(f"{{}}", "{}"))
-        err(1, "'{{}}' 应该输出 '{}'");
+        return err(1, "'{{}}' 应该输出 '{}'");
     if (!eq(f"{{{n}}}", "{1}"))
-        err(2, "转义花括号中间夹插值不对");
+        return err(2, "转义花括号中间夹插值不对");
     if (!eq(f"a}}b", "a}b"))
-        err(3, "'}}' 应该输出 '}'");
+        return err(3, "'}}' 应该输出 '}'");
     if (!eq(f"\t{n}\n", "\t1\n"))
-        err(5, "\\t 和 \\n 转义不对");
+        return err(5, "\\t 和 \\n 转义不对");
     if (!eq(f"\"{n}\"", "\"1\""))
-        err(6, "\\\" 转义不对");
+        return err(6, "\\\" 转义不对");
     if (!eq(f"\\{n}", "\\1"))
-        err(7, "\\\\ 转义不对");
+        return err(7, "\\\\ 转义不对");
     if (!eq(f"\x41\101", "AA"))
-        err(8, "\\x 和八进制转义不对");
+        return err(8, "\\x 和八进制转义不对");
 }
 
 test "插值可以是任意表达式" {
@@ -114,26 +114,26 @@ test "插值可以是任意表达式" {
     int a = 3, b = 4;
 
     if (!eq(f"{a + b}", "7"))
-        err(1, "算术表达式不对");
+        return err(1, "算术表达式不对");
     if (!eq(f"{i++}{i}", "01"))
-        err(2, "各段从左到右求值");
+        return err(2, "各段从左到右求值");
     if (!eq(f"{a > b ? \"big\" : \"small\"}", "small"))
-        err(3, "条件表达式不对");
+        return err(3, "条件表达式不对");
     if (!eq(f"{(int)strlen(\"abcd\")}", "4"))
-        err(4, "调用表达式不对");
+        return err(4, "调用表达式不对");
     if (!eq(f"{-a}{+b}", "-34"))
-        err(5, "一元运算符不对");
+        return err(5, "一元运算符不对");
 }
 
 test "嵌套的 f\"..\"" {
     int n = 7;
 
     if (!eq(f"a{f\"b{n}c\"}d", "ab7cd"))
-        err(1, "嵌套一层不对");
+        return err(1, "嵌套一层不对");
     if (!eq(f"x{f\"y{f\\\"z{n}\\\"}y\"}x", "xyz7yx"))
-        err(2, "嵌套两层不对（每深一层多一个 '\\'）");
+        return err(2, "嵌套两层不对（每深一层多一个 '\\'）");
     if (!eq(f"{f\"{n}\"}", "7"))
-        err(3, "嵌套里只有插值也不对");
+        return err(3, "嵌套里只有插值也不对");
 }
 
 test "空串和长文本" {
@@ -142,14 +142,14 @@ test "空串和长文本" {
     const char *p = 0;
 
     if (!eq(f"", ""))
-        err(1, "空 f\"\" 应该是空串");
+        return err(1, "空 f\"\" 应该是空串");
     for (i = 0; i < 300; i++)
         buf[i] = 'x';
     p = f"[{buf}]";
     if (300 + 2 != (int)strlen(p))
-        err(2, "长文本长度不对");
+        return err(2, "长文本长度不对");
     if (p[0] != '[' || p[301] != ']' || p[150] != 'x')
-        err(3, "长文本内容不对");
+        return err(3, "长文本内容不对");
 }
 
 test "@f\"..\"：托管对象的生命周期跟着引用走" {
@@ -160,13 +160,13 @@ test "@f\"..\"：托管对象的生命周期跟着引用走" {
         p = @f"saved {n}";
     }
     if (!eq(p, "saved 3"))
-        err(1, "出作用域后托管文本不该失效");
+        return err(1, "出作用域后托管文本不该失效");
     if ((unsigned long long)strlen(p) != __c6_str_len(p))
-        err(2, "__c6_str_len 给的文本长度不对");
+        return err(2, "__c6_str_len 给的文本长度不对");
     {
         shared @char s = @f"shared {n}";
         if (!eq(s, "shared 3"))
-            err(3, "shared @char 存 @f 的结果不对");
+            return err(3, "shared @char 存 @f 的结果不对");
     }
 }
 
@@ -177,10 +177,10 @@ test "循环里的 @f\"..\" 每个都释放" {
     for (i = 0; i < 50; i++) {
         @char p = @f"i={i}";
         if (p[0] != 'i' || p[1] != '=')
-            err(1, "循环里的文本不对");
+            return err(1, "循环里的文本不对");
     }
     if (__c6_gc_live() != base)
-        err(2, "循环结束后有托管对象没有释放");
+        return err(2, "循环结束后有托管对象没有释放");
 }
 
 test "普通 f\"..\" 借用本深度的临时缓冲" {
@@ -189,22 +189,22 @@ test "普通 f\"..\" 借用本深度的临时缓冲" {
     const char *b = f"B{n}";
 
     if (!eq(b, "B1"))
-        err(1, "第二个 f\"\" 不对");
+        return err(1, "第二个 f\"\" 不对");
     /* 借用只在"下一次同一个深度求值"之前有效，见 README */
     if (!eq(a, "B1"))
-        err(2, "同一个深度应该复用同一块缓冲");
+        return err(2, "同一个深度应该复用同一块缓冲");
     if (!eq(f"ok {f\"in{n}\"}", "ok in1"))
-        err(3, "更深的嵌套有自己的缓冲，不该覆盖外层的");
+        return err(3, "更深的嵌套有自己的缓冲，不该覆盖外层的");
 }
 
 test "err(f\"..\") 的消息会被复制下来" {
     if (run_boom(9) != -1)
-        err(1, "应该走进 catch");
+        return err(1, "应该走进 catch");
     if (last_id != 9)
-        err(2, "错误号不对");
+        return err(2, "错误号不对");
     /* 消息来自另一个 TU 里的 @f".."：它已经随返回放开，留下来的必须是副本 */
     if (!eq(last_msg, "bad 9"))
-        err(3, "err(f\"\") 的消息不对，或者已经被覆盖");
+        return err(3, "err(f\"\") 的消息不对，或者已经被覆盖");
 }
 
 /* 宏里的 f".."：宏体、宏实参、字符串化都要能带着原始文本走 */
@@ -217,13 +217,13 @@ test "宏里的 f\"..\"" {
     int n = 7;
 
     if (!eq(FSTR_LIT, "macro"))
-        err(1, "对象式宏体里的 f\"..\" 不对");
+        return err(1, "对象式宏体里的 f\"..\" 不对");
     if (!eq(FSTR_NOP(), "zero"))
-        err(2, "函数式宏体里的 f\"..\" 不对");
+        return err(2, "函数式宏体里的 f\"..\" 不对");
     if (!eq(FSTR_ARG(f"a{n}"), "a7"))
-        err(3, "f\"..\" 当宏实参不对");
+        return err(3, "f\"..\" 当宏实参不对");
     if (0 != strcmp(FSTR_STR(f"a{n}"), "f\"a{n}\""))
-        err(4, "字符串化 f\"..\" 不对");
+        return err(4, "字符串化 f\"..\" 不对");
 }
 
 test "格式说明 {expr;spec}" {
@@ -237,53 +237,53 @@ test "格式说明 {expr;spec}" {
 
     /* 进制 */
     if (!eq(f"{n;x}", "2a"))
-        err(1, "十六进制不对");
+        return err(1, "十六进制不对");
     if (!eq(f"{n;X}", "2A"))
-        err(2, "大写十六进制不对");
+        return err(2, "大写十六进制不对");
     if (!eq(f"{n;#x}", "0x2a"))
-        err(3, "'#' 前缀不对");
+        return err(3, "'#' 前缀不对");
     if (!eq(f"{n;o}", "52") || !eq(f"{n;#o}", "052"))
-        err(4, "八进制不对");
+        return err(4, "八进制不对");
     if (!eq(f"{n;b}", "101010") || !eq(f"{n;#b}", "0b101010"))
-        err(5, "二进制不对");
+        return err(5, "二进制不对");
     /* 符号与无符号重解释 */
     if (!eq(f"{m;d}", "-5") || !eq(f"{n;+d}", "+42"))
-        err(6, "符号不对");
+        return err(6, "符号不对");
     if (!eq(f"{m;u}", "18446744073709551611"))
-        err(7, "负数的 u 应该是无符号解释");
+        return err(7, "负数的 u 应该是无符号解释");
     if (!eq(f"{m;x}", "fffffffffffffffb"))
-        err(8, "负数的 x 应该是无符号解释");
+        return err(8, "负数的 x 应该是无符号解释");
     /* 宽度、对齐、补零、精度 */
     if (!eq(f"{n;5}", "   42") || !eq(f"{n;-5}", "42   "))
-        err(9, "宽度与左对齐不对");
+        return err(9, "宽度与左对齐不对");
     if (!eq(f"{n;05}", "00042"))
-        err(10, "补零不对");
+        return err(10, "补零不对");
     if (!eq(f"{n;.4}", "0042") || !eq(f"{n;6.4}", "  0042"))
-        err(11, "精度（最少位数）不对");
+        return err(11, "精度（最少位数）不对");
     if (!eq(f"{n;08x}", "0000002a"))
-        err(12, "补零加进制不对");
+        return err(12, "补零加进制不对");
     /* 文本：宽度、左对齐、截断 */
     if (!eq(f"{t;8}", "   hello") || !eq(f"{t;-8}", "hello   "))
-        err(13, "文本宽度不对");
+        return err(13, "文本宽度不对");
     if (!eq(f"{t;.3}", "hel"))
-        err(14, "文本精度（最大长度）不对");
+        return err(14, "文本精度（最大长度）不对");
     if (!eq(f"{sl;.3}", "sli") || !eq(f"{sl;8}", "   slice"))
-        err(15, "切片上的格式说明不对");
+        return err(15, "切片上的格式说明不对");
     if (!eq(f"{mg;.4}", "mana"))
-        err(16, "托管缓冲上的格式说明不对");
+        return err(16, "托管缓冲上的格式说明不对");
     /* 字符、布尔、指针 */
     if (!eq(f"{c}", "Q") || !eq(f"{c;x}", "51") || !eq(f"{c;c}", "Q"))
-        err(17, "字符的格式说明不对");
+        return err(17, "字符的格式说明不对");
     if (!eq(f"{ok}", "true") || !eq(f"{ok;d}", "1") || !eq(f"{ok;6}", "  true"))
-        err(18, "布尔的格式说明不对");
+        return err(18, "布尔的格式说明不对");
     if (!eq(f"{np}", "0x0") || !eq(f"{np;x}", "0"))
-        err(19, "空指针的格式说明不对");
+        return err(19, "空指针的格式说明不对");
     /* @f".." 也认格式说明 */
     if (!eq(@f"{n;08x}", "0000002a"))
-        err(20, "@f\"..\" 上的格式说明不对");
+        return err(20, "@f\"..\" 上的格式说明不对");
     /* 嵌套里的格式说明 */
     if (!eq(f"a{f\"{n;x}\"}", "a2a"))
-        err(21, "嵌套里的格式说明不对");
+        return err(21, "嵌套里的格式说明不对");
 }
 
 test "浮点" {
@@ -293,44 +293,44 @@ test "浮点" {
 
     /* 默认是 %g：短的那一种，去掉结尾的零 */
     if (!eq(f"{d}", "1.5"))
-        err(1, "默认的浮点输出不对");
+        return err(1, "默认的浮点输出不对");
     if (!eq(f"{pi}", "3.14159"))
-        err(2, "默认精度应该是 6 位有效数字");
+        return err(2, "默认精度应该是 6 位有效数字");
     if (!eq(f"{fv}", "2.5"))
-        err(3, "float 应该被提升成 double");
+        return err(3, "float 应该被提升成 double");
     /* %f：定点 */
     if (!eq(f"{pi;.2f}", "3.14") || !eq(f"{d;f}", "1.500000"))
-        err(4, "%f 不对");
+        return err(4, "%f 不对");
     if (!eq(f"{pi;10.3f}", "     3.142") || !eq(f"{d;08.2f}", "00001.50"))
-        err(5, "宽度、补零、精度不对");
+        return err(5, "宽度、补零、精度不对");
     if (!eq(f"{big;.0f}", "1234568"))
-        err(6, "%.0f 应该四舍五入");
+        return err(6, "%.0f 应该四舍五入");
     if (!eq(f"{neg;.2f}", "-1.24"))
-        err(7, "负数的舍入不对");
+        return err(7, "负数的舍入不对");
     /* %e / %E */
     if (!eq(f"{big;e}", "1.234568e+06") || !eq(f"{big;E}", "1.234568E+06"))
-        err(8, "%e / %E 不对");
+        return err(8, "%e / %E 不对");
     if (!eq(f"{big;.2e}", "1.23e+06"))
-        err(9, "%e 的精度不对");
+        return err(9, "%e 的精度不对");
     /* %g */
     if (!eq(f"{tiny;g}", "0.000123456") || !eq(f"{tiny;.2g}", "0.00012"))
-        err(10, "%g 不对");
+        return err(10, "%g 不对");
     /* 零、负数零、inf、托管 */
     if (!eq(f"{z;f}", "0.000000") || !eq(f"{z}", "0"))
-        err(11, "零不对");
+        return err(11, "零不对");
     if (!eq(f"{1.0 / 0.0}", "inf"))
-        err(12, "inf 应该输出 inf");
+        return err(12, "inf 应该输出 inf");
     if (!eq(@f"{pi;.3f}", "3.142"))
-        err(13, "@f\"..\" 上的浮点格式说明不对");
+        return err(13, "@f\"..\" 上的浮点格式说明不对");
     if (!eq(f"{pi;.2e}", "3.14e+00"))
-        err(14, "小数的科学计数法不对");
+        return err(14, "小数的科学计数法不对");
 }
 
 test "跨翻译单元" {
     if (2 != tu_text_len(f"{7}{8}"))
-        err(1, "把 f\"\" 的结果传给另一个 TU 不对");
+        return err(1, "把 f\"\" 的结果传给另一个 TU 不对");
     if (3 != (int)strlen(f"{1}{2}{3}"))
-        err(2, "f\"\" 直接当实参不对");
+        return err(2, "f\"\" 直接当实参不对");
     if (!eq(mk_msg(5), "local5"))
-        err(3, "函数返回 @f\"\" 不对");
+        return err(3, "函数返回 @f\"\" 不对");
 }

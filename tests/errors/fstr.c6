@@ -158,7 +158,7 @@ int main(void)
 #elif defined try_in_fstr
 int!error boom(int n)
 {
-    err(1, "boom");
+    return err(1, "boom");
     return n;
 }
 static int!error test(void)

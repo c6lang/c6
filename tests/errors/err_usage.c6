@@ -1,0 +1,90 @@
+/* c6 编译期诊断：err() 只能写成 return err(id, msg)（C124）
+ *
+ * `err` 是语法糖，不是函数；`error` 也不是一等类型。所以单独写 `err(..)`、
+ * 把它的值赋给变量、拿它当条件、声明 `error` 对象或形参都是错误。
+ *
+ * 每个片段单独用 -D<片段名> 编译，`// EXPECT` 行声明该片段必须产生的诊断；
+ * 不带任何 -D 时是本文件的正常路径，必须编译并运行通过。
+ */
+// EXPECT stmt: error: 'err' can only be used as 'return err(id, msg)'
+// EXPECT cond: error: 'err' can only be used as 'return err(id, msg)'
+// EXPECT init: error: 'err' can only be used as 'return err(id, msg)'
+// EXPECT global: error: 'err' can only be used as 'return err(id, msg)'
+// EXPECT object: error: 'error' is the type of 'err()': it can only be returned from a 'T!error' function
+// EXPECT local: error: 'error' is the type of 'err()': it can only be returned from a 'T!error' function
+// EXPECT param: error: 'error' can only be a return type, not a parameter
+
+static int!error ok(void)
+{
+    return 0;                     /* 正常路径：没有错误 */
+}
+
+#if defined stmt
+/* 语句位置：err(..) 不是「直接返回」，必须写 return */
+static int!error bad(void)
+{
+    err(2, "forgot return");
+    return 0;
+}
+int main(void) { return bad() == 0 ? 1 : 0; }
+
+#elif defined cond
+/* 表达式位置：unary() 里拦下来 */
+static int!error bad(int c)
+{
+    if (c && err(2, "as a condition"))
+        return 0;
+    return 0;
+}
+int main(void) { return bad(0) == 0 ? 1 : 0; }
+
+#elif defined init
+/* 初始化器位置：err(..) 没有可以赋出去的值 */
+static int!error bad(void)
+{
+    int v = err(2, "as a value");
+    return v;
+}
+int main(void) { return bad() == 0 ? 1 : 0; }
+
+#elif defined global
+/* 文件作用域的初始化器 */
+static int g = err(2, "as a value");
+int main(void) { return g; }
+
+#elif defined object
+/* error 不是一等类型：不能声明对象 */
+int main(void)
+{
+    error e;
+    (void)e;
+    return 0;
+}
+
+#elif defined local
+/* 局部对象也一样 */
+static void!error bad(void)
+{
+    error e;
+    (void)e;
+}
+int main(void) { bad(); return 0; }
+
+#elif defined param
+/* 形参也不行：错误只通过返回值送出 */
+static int want(error e)
+{
+    (void)e;
+    return 0;
+}
+int main(void) { return want(0); }
+
+#else
+int main(void)
+{
+    int v = ok() catch e {
+        return e.id;
+    };
+    return v == 0 ? 0 : 1;
+}
+#endif

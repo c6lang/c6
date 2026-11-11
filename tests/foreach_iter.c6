@@ -221,14 +221,14 @@ test "值形态：从 n 倒数到 1，原对象保持副本语义" {
     int total = 0, n = 0;
     foreach (int v = c) {
         if (v != 3 - n)
-            err(1, "迭代值不对");
+            return err(1, "迭代值不对");
         total += v;
         n++;
     }
     if (n != 3 || total != 6)
-        err(2, "迭代次数/和不对");
+        return err(2, "迭代次数/和不对");
     if (c.n != 3)
-        err(3, "值形态不应推进原对象");
+        return err(3, "值形态不应推进原对象");
 }
 
 test "数组的元素类型本身是迭代器时，仍按数组迭代" {
@@ -238,7 +238,7 @@ test "数组的元素类型本身是迭代器时，仍按数组迭代" {
         total += v.n * (int)(i + 1);
     }
     if (total != 5)
-        err(1, "数组被误判成迭代器");
+        return err(1, "数组被误判成迭代器");
 }
 
 test "指针形态：迭代器状态就在原对象里" {
@@ -248,20 +248,20 @@ test "指针形态：迭代器状态就在原对象里" {
         total += v;
     }
     if (total != 6)
-        err(1, "求和不对");
+        return err(1, "求和不对");
     if (c.n != 0)
-        err(2, "指针形态应推进原对象");
+        return err(2, "指针形态应推进原对象");
 }
 
 test "接口值：vtable 分派，self 指向原对象" {
     struct Countdown c = {4};
     struct Steps s = {2};
     if (sum_iter(c) != 10)
-        err(1, "Countdown 的接口分派不对");
+        return err(1, "Countdown 的接口分派不对");
     if (sum_iter(s) != 3)
-        err(2, "Steps 的接口分派不对");
+        return err(2, "Steps 的接口分派不对");
     if (c.n != 0 || s.n != 0)
-        err(3, "接口形态应推进原对象");
+        return err(3, "接口形态应推进原对象");
 }
 
 test "元素是结构体：绑定是 next() 返回值的副本" {
@@ -269,14 +269,14 @@ test "元素是结构体：绑定是 next() 返回值的副本" {
     int n = 0;
     foreach (struct Pair p = ps) {
         if (p.a != n || p.b != n + 1)
-            err(1, "结构体元素的值不对");
+            return err(1, "结构体元素的值不对");
         p.a = 99;
         n++;
     }
     if (n != 2)
-        err(2, "迭代次数不对");
+        return err(2, "迭代次数不对");
     if (ps.i != 0)
-        err(3, "值形态的迭代器状态应是隐藏槽里的副本");
+        return err(3, "值形态的迭代器状态应是隐藏槽里的副本");
 }
 
 test "元素是指针：绑定就是 next() 的返回值" {
@@ -288,11 +288,11 @@ test "元素是指针：绑定就是 next() 的返回值" {
     ws.n = 3;
     foreach (char *s = ws) {
         if (strcmp(s, w[n]) != 0)
-            err(1, "指针元素不对");
+            return err(1, "指针元素不对");
         n++;
     }
     if (n != 3)
-        err(2, "迭代次数不对");
+        return err(2, "迭代次数不对");
 }
 
 test "'_' 绑定仍然推进迭代器" {
@@ -302,7 +302,7 @@ test "'_' 绑定仍然推进迭代器" {
         n++;
     }
     if (n != 3 || t.n != 3)
-        err(1, "'_' 没有按副本语义迭代三次");
+        return err(1, "'_' 没有按副本语义迭代三次");
 }
 
 test "托管元素：值绑定与 '_' 都不泄漏" {
@@ -312,14 +312,14 @@ test "托管元素：值绑定与 '_' 都不泄漏" {
         total += v->v;
     }
     if (total != 1)
-        err(1, "托管元素的值不对");
+        return err(1, "托管元素的值不对");
     if (__c6_gc_live() != 0)
-        err(2, "值绑定泄漏了托管对象");
+        return err(2, "值绑定泄漏了托管对象");
     it.i = 0;
     foreach (@MNode _ = it) {
     }
     if (__c6_gc_live() != 0)
-        err(3, "'_' 绑定泄漏了 next() 的返回值");
+        return err(3, "'_' 绑定泄漏了 next() 的返回值");
 }
 
 test "托管迭代器：own 与 borrow 的隐藏槽" {
@@ -330,13 +330,13 @@ test "托管迭代器：own 与 borrow 的隐藏槽" {
         total += v;
     }
     if (total != 6 || p->n != 0)
-        err(1, "own 迭代器不对");
+        return err(1, "own 迭代器不对");
     p->n = 3;
     if (sum_borrow(p) != 6 || p->n != 0)
-        err(2, "borrow 迭代器不对");
+        return err(2, "borrow 迭代器不对");
     p = 0;
     if (__c6_gc_live() != 0)
-        err(3, "托管迭代器隐藏槽泄漏了");
+        return err(3, "托管迭代器隐藏槽泄漏了");
 }
 
 test "托管临时迭代器：隐藏槽接管所有权" {
@@ -345,9 +345,9 @@ test "托管临时迭代器：隐藏槽接管所有权" {
         total += v;
     }
     if (total != 3)
-        err(1, "临时迭代器的值不对");
+        return err(1, "临时迭代器的值不对");
     if (__c6_gc_live() != 0)
-        err(2, "临时迭代器的隐藏槽泄漏了");
+        return err(2, "临时迭代器的隐藏槽泄漏了");
 }
 
 test "数组的托管元素绑定也不泄漏" {
@@ -361,11 +361,11 @@ test "数组的托管元素绑定也不泄漏" {
         total += v->v + (int)i;
     }
     if (total != 2)
-        err(1, "托管数组元素的值不对");
+        return err(1, "托管数组元素的值不对");
     a[0] = 0;
     a[1] = 0;
     if (__c6_gc_live() != 0)
-        err(2, "数组的托管元素绑定泄漏了");
+        return err(2, "数组的托管元素绑定泄漏了");
 }
 
 test "union 迭代器：值形态与指针形态" {
@@ -375,13 +375,13 @@ test "union 迭代器：值形态与指针形态" {
         total += v;
     }
     if (total != 6 || u.n != 3)
-        err(1, "union 值形态不对");
+        return err(1, "union 值形态不对");
     total = 0;
     foreach (int v = &u) {
         total += v;
     }
     if (total != 6 || u.n != 0)
-        err(2, "union 指针形态不对");
+        return err(2, "union 指针形态不对");
 }
 
 test "跨 TU 的 has()/next() 原型" {
@@ -391,7 +391,7 @@ test "跨 TU 的 has()/next() 原型" {
         total += v;
     }
     if (total != 6 || c.n != 0)
-        err(1, "跨 TU 方法调用不对");
+        return err(1, "跨 TU 方法调用不对");
 }
 
 test "可迭代值只求值一次" {
@@ -401,9 +401,9 @@ test "可迭代值只求值一次" {
         total += v;
     }
     if (calls != 1)
-        err(1, "可迭代值被求值了不止一次");
+        return err(1, "可迭代值被求值了不止一次");
     if (total != 3)
-        err(2, "求和不对");
+        return err(2, "求和不对");
 }
 
 test "has() 首次为假：零次迭代" {
@@ -413,7 +413,7 @@ test "has() 首次为假：零次迭代" {
         n += v;
     }
     if (n != 0)
-        err(1, "空迭代器不应进入循环体");
+        return err(1, "空迭代器不应进入循环体");
 }
 
 test "无限迭代器 + break" {
@@ -425,9 +425,9 @@ test "无限迭代器 + break" {
             break;
     }
     if (total != 1 + 2 + 3 + 4 + 5)
-        err(1, "break 之前的和不对");
+        return err(1, "break 之前的和不对");
     if (nat.n != 5)
-        err(2, "指针形态应推进原对象");
+        return err(2, "指针形态应推进原对象");
 }
 
 test "continue 回到 has() 判断" {
@@ -439,7 +439,7 @@ test "continue 回到 has() 判断" {
         total += v;
     }
     if (total != 4 + 2)
-        err(1, "continue 之后的迭代不对");
+        return err(1, "continue 之后的迭代不对");
 }
 
 test "defer 与 for 一致" {
@@ -450,7 +450,7 @@ test "defer 与 for 一致" {
         defer count++;
     }
     if (count != 3)
-        err(1, "defer 次数不对");
+        return err(1, "defer 次数不对");
 }
 
 test "绑定不泄漏到外层" {
@@ -458,10 +458,10 @@ test "绑定不泄漏到外层" {
     struct Countdown c = {1};
     foreach (int v = c) {
         if (v != 1)
-            err(1, "绑定值不对");
+            return err(1, "绑定值不对");
     }
     if (v != 7)
-        err(2, "绑定泄漏到了外层");
+        return err(2, "绑定泄漏到了外层");
 }
 
 test "嵌套：迭代器里套迭代器" {
@@ -475,14 +475,14 @@ test "嵌套：迭代器里套迭代器" {
         }
     }
     if (total != (2 + 1) + 1)
-        err(1, "嵌套迭代不对");
+        return err(1, "嵌套迭代不对");
 }
 
 test "隐藏槽跨 await 挂起仍然有效" {
     struct sum_await_task *t = sum_await(4);
     if (__c6_co_wait(t) != 0)
-        err(1, "驱动失败");
+        return err(1, "驱动失败");
     if (t->val != 10)
-        err(2, "挂起恢复后的求和不对");
+        return err(2, "挂起恢复后的求和不对");
     __c6_co_destroy(t);
 }
