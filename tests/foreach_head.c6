@@ -29,9 +29,9 @@ test "值绑定：(T v = a) 是元素的副本" {
         n++;
     }
     if (sum != 60 || n != 3)
-        err(1, "值绑定不对");
+        return err(1, "值绑定不对");
     if (a[0] != 10 || a[1] != 20 || a[2] != 30)
-        err(2, "写绑定改到了数组");
+        return err(2, "写绑定改到了数组");
 }
 
 test "值绑定：切片与迭代器同样适用" {
@@ -42,7 +42,7 @@ test "值绑定：切片与迭代器同样适用" {
         total += v;
     }
     if (total != 10)
-        err(1, "切片值绑定不对");
+        return err(1, "切片值绑定不对");
 
     struct It it = { 0, 3 };
     int seen = 0;
@@ -50,9 +50,9 @@ test "值绑定：切片与迭代器同样适用" {
         seen = seen * 10 + v;
     }
     if (seen != 12)
-        err(2, "迭代器值绑定不对");
+        return err(2, "迭代器值绑定不对");
     if (it.i != 0)
-        err(3, "值形态不该推进原迭代器");
+        return err(3, "值形态不该推进原迭代器");
 }
 
 test "区间：(T i = lo:hi) 是半开区间" {
@@ -61,7 +61,7 @@ test "区间：(T i = lo:hi) 是半开区间" {
         sum += i;
     }
     if (sum != 6)
-        err(1, "区间 0:4 不对");
+        return err(1, "区间 0:4 不对");
 
     const char *neg = 0;
     int n = 0;
@@ -70,7 +70,7 @@ test "区间：(T i = lo:hi) 是半开区间" {
         n++;
     }
     if (n != 4 || !neg)
-        err(2, "负数区间不对");
+        return err(2, "负数区间不对");
 }
 
 test "双绑定：((T i, T v) = a) 的下标与值一致" {
@@ -78,12 +78,12 @@ test "双绑定：((T i, T v) = a) 的下标与值一致" {
     int idx = 0, sum = 0;
     foreach ((size_t i, int v) = a) {
         if ((int)i != idx)
-            err(1, "下标不连续");
+            return err(1, "下标不连续");
         sum += v;
         idx++;
     }
     if (idx != 3 || sum != 24)
-        err(2, "双绑定不对");
+        return err(2, "双绑定不对");
 }
 
 test "绑定类型可以与元素类型不同（按赋值的规则转换）" {
@@ -93,7 +93,7 @@ test "绑定类型可以与元素类型不同（按赋值的规则转换）" {
         sum += (int)v;
     }
     if (sum != ('a' + 'b' + 'c'))
-        err(1, "窄化/拓宽转换不对");
+        return err(1, "窄化/拓宽转换不对");
 }
 
 test "写绑定不改变迭代次数" {
@@ -103,7 +103,7 @@ test "写绑定不改变迭代次数" {
         n++;
     }
     if (n != 3)
-        err(1, "写绑定影响了迭代");
+        return err(1, "写绑定影响了迭代");
 
     int a[2] = { 1, 2 };
     int m = 0;
@@ -113,7 +113,7 @@ test "写绑定不改变迭代次数" {
         m++;
     }
     if (m != 2)
-        err(2, "写双绑定影响了迭代");
+        return err(2, "写双绑定影响了迭代");
 }
 
 test "'_' 丢弃绑定" {
@@ -123,7 +123,7 @@ test "'_' 丢弃绑定" {
         sum += v;
     }
     if (sum != 11)
-        err(1, "丢弃下标后求和不对");
+        return err(1, "丢弃下标后求和不对");
 }
 
 test "同一双绑定头写两遍结果一致" {
@@ -136,12 +136,12 @@ test "同一双绑定头写两遍结果一致" {
         new_sum += (int)i * 10 + v;
     }
     if (old_sum != new_sum || new_sum != 17)
-        err(1, "两种写法结果不同");
+        return err(1, "两种写法结果不同");
 }
 
 test "'foreach' 仍然是软关键字" {
     /* 没有 '|' 也没有可解析的头时退回普通表达式 */
     int foreach = 3;
     if (foreach != 3)
-        err(1, "软关键字遮蔽失败");
+        return err(1, "软关键字遮蔽失败");
 }

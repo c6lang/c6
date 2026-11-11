@@ -721,7 +721,7 @@ inferred-declaration   = identifier , "=" , function-literal , ";" ;
     void(int x) { printf("%d\n", x); }(2);      (* 就地调用 *)
 
     f = int(int x) { return x * 2; };            (* 推断声明 *)
-    if (f(3) != 6) err(1, "…");
+    if (f(3) != 6) return err(1, "…");
 
     static int (*table[2])(int) = {
         { int(int v) { return v + 1; } },
@@ -1170,7 +1170,7 @@ parameter-list    = identifier , { "," , identifier } ;
 | C3 | `try` 的被调函数返回类型必须标记了 `!error` | 同 C2 |
 | C4 | `catch` 的操作数必须是调用表达式 | `'catch' requires a call to a function returning 'T!error'` |
 | C5 | `catch` 的被调函数返回类型必须标记了 `!error` | 同 C4 |
-| C6 | `catch` 的处理块必须自己离开（`return` / `err(id, msg)` / `goto`） | `'catch' body must end with 'return', 'err()' or 'goto'`；静态判断不出来时改为插入运行时陷阱 |
+| C6 | `catch` 的处理块必须自己离开（`return` / `return err(id, msg)` / `goto`） | `'catch' body must end with 'return', 'err()' or 'goto'`；静态判断不出来时改为插入运行时陷阱 |
 | C7 | `catch` 必须带操作数 | `'catch' has no operand` |
 | C8 | `!error` 必须修饰函数（或函数指针）声明符 | `'!error' requires a function declarator` |
 | C9 | `!error` 的函数返回类型必须是标量、枚举、指针、struct、union 或元组：标量失败时返回 `-1`，聚合类型失败时清零 | `'!error' does not support a 'double' return type` |
@@ -1283,6 +1283,11 @@ parameter-list    = identifier , { "," , identifier } ;
 | C120 | `Tag.成员` 里 `Tag` 必须是可见的枚举，成员必须存在 | `'Fruit' has no member 'APPLE'`；`'Nope' is neither an enum nor an imported module (use 'import Nope;')` |
 | C123 | 体内成员函数里裸名的解析次序：局部/形参 > 实例的字段与方法 > 文件作用域其他符号（文件作用域的同名函数不抢字段）；实例化不得把模板方法的原名或形参名留在调用方作用域里 | —（曾表现为 `redeclaration of 'i'` / 把字段当成函数） |
 | C122 | 模块名就是它的路径：`import a.b` 只按 `a/b.c6`（或 `a/b.c`）查找，扁平拼写被拒绝，找不到文件也是错误 | `module 'a.b' must live at 'a/b.c6', not in a flat 'a.b.c6': a module's name is its path`；`cannot find module 'a.b': expected a file at 'a/b.c6' in the search path (a module's name is its path)` |
+| C124 | `err(..)` 只能写成 `return err(id, msg)`：单独作表达式、语句、或赋值右值都是错误；`error` 不是一等类型，不能声明对象、形参、字段 | `'err' can only be used as 'return err(id, msg)'`；`'error' is the type of 'err()': it can only be returned from a 'T!error' function` |
+| C125 | `enum Error` 的成员必须落在 `0..4095`（`0` 仍是「没有错误」，不参与加基址） | `error code of '%s' is not in 0..4095` |
+| C126 | `errbase.def` 的每一行是 `<模块名> <slot>`；slot 只能落在钉号池 `0x6100..0x7FFF`；std 模块的号段内置在编译器里，写进来是错误；同一个号不能给两个模块，同一个模块不能钉两个号 | `%s:%d: module '%s' needs a slot`；`%s:%d: '%s' is not a slot number`；`%s:%d: '%s' is not a module name`；`%s:%d: the blocks of the std modules are built into the compiler: remove '%s' from errbase.def`；`%s:%d: slot 0x%lx is outside the pinned pool 0x6100..0x7fff`；`%s:%d: module '%s' is pinned to 0x%04x already`；`%s:%d: slot 0x%04x is used by '%s' already` |
+| C127 | 一次编译里两个模块不能落在同一个号段（自动池的哈希撞了，或者表里钉重了）；撞了就报错，不静默 | `tcc: error: error ids: modules '%s' and '%s' share the block 0x%04x; pin one of them in errbase.def` |
+| C128 | `-errbase-file=FILE` 指定的表必须存在（只有默认的 `errbase.def` 会被自动创建）；钉号池用完也是错误 | `cannot read error block table '%s'`；`tcc: error: the pinned pool 0x6100..0x7fff is full: errbase.def cannot grow` |
 | C121 | 声明式头里的绑定：不能是 `void`/数组/函数，不能改变托管所有权，下标必须是整数，头里必须写出类型和名字 | `a 'foreach' binding cannot be 'void'`；`a 'foreach' binding cannot be an array`；`a 'foreach' binding cannot be a function`；`a 'foreach' binding cannot change ownership: 'v' holds a managed reference`；`the index of a 'foreach' must have an integer type, not 'double'`；`a type name expected in the head of 'foreach'`；`'foreach' needs a parenthesised head now: write 'foreach ((size_t i, T v) = a) { ... }'` |
 
 （闭包的 C90–C98 见 [closure-design.md](closure-design.md) §9，消息与
@@ -1300,15 +1305,74 @@ C109 由普通类型检查给出（`cannot convert 'struct Vect_char' to 'struct
 扩展的语义可以用下列重写规则描述；规则中的 `$T` 表示被调函数的返回
 类型，`$S(x)` 表示“把 x 转成返回类型后可表示的哨兵值 `-1`”。
 
-**R1 — `err(id, msg)`**
+**R1 — `return err(id, msg)`**
 
 ```
-err(id, msg);
+return err(id, msg);
 =>
     __tcc_err_set(id, msg);        (* 写入错误槽：flag=1, id, msg *)
     <本函数帧的 errdefer 与 defer，按注册逆序就地展开>
     return $S(T);                  (* 函数返回类型为 void 时只 return *)
 ```
+
+`err` 是**语法糖**，不是函数，`error` 也不是一等类型：它俩只能在
+`T!error` 函数的 `return` 位置出现（C124）。`err` 的 id 在模块里通常写成
+本模块 `enum Error` 的成员，这样自然落在模块自己的号段里（见 §8.1）。
+
+### 8.1 错误码号段与 `errbase.def`
+
+一个模块的 `enum Error` 成员不是从 1 开始的裸数字，而是
+
+```
+id = (area << 27) | (slot << 12) | code        /* bit31 恒为 0 */
+```
+
+- `area`：`0` 应用（用户模块），`1` std（编译器内置），`2..7` 保留。
+- `slot`：模块的号段，见下表；`code`：模块内 `enum Error` 的声明值。
+- 不属于任何模块的文件（`main` 所在的 TU、`tests`）`slot = 0`，所以
+  `return err(1, "x")` 的 id 仍然是 `1`。
+
+| slot | 谁用 | 怎么来的 |
+|---|---|---|
+| `0x0000` | 无模块文件 | 固定 |
+| `0x0001..0x5FFF` | 自动池 | `1 + fnv1a32(点号模块名) % 0x5FFF`：号是名字的纯函数，加模块、加错误码、改编译顺序都不动它 |
+| `0x6000..0x60FF` | std 内置池 | 编译器里的常量表：`std.err`=0x6000、`std.types`=0x6001、`std.vec`=0x6002、`std.span`=0x6003、`std.map`=0x6004、`std.str`=0x6005、`std.fmt`=0x6006、`std.range`=0x6007 |
+| `0x6100..0x7FFF` | 钉号池 | 项目根的 `errbase.def` 里的一行 |
+
+自动池是 24575 个号段，撞号（两个模块同一个 slot）不会静默：同一次编译里
+发现就报 C127，让你把其中一个钉到 `errbase.def` 里。钉号池和自动池不重叠，
+所以「钉住」永远不会抢走别人已经拿到的号。
+
+`errbase.def` 每行 `<模块名> <slot>`，`#` 到行尾是注释：
+
+```
+# 格式：  <模块名>  <slot>       slot 取 0x6100..0x7FFF
+
+app.db       0x6100
+app.cli      0x6101
+```
+
+- 编译器在**项目根**（当前目录，然后各 `-I` 路径）找 `errbase.def`；
+  `-errbase-file=FILE` 指定别的文件（必须存在，C128）。
+- 没给 `-errbase-file` 又找不到表时，链接一个带模块的程序会**自动创建**
+  一份只有注释的空表：创建它不会改变任何 id。
+- `-emit-errbase[=FILE]`：把这次编译能看见的所有模块一次全钉住
+  （已有行原样保留，新模块按名字排序后从 `max(已用)+1` 接着编号，所以
+  输出与命令行顺序无关），写完就停。产出的文件进版本库，之后 id 就冻住了。
+- `-no-errbase`：不读也不写任何表，所有模块走自动池。
+- std 模块的号段内置在编译器里，`errbase.def` 里写 `std.*` 是错误（C126）。
+
+```sh
+./tcc/tcc -B tcc -I . -emit-errbase       # 钉住当前能看见的所有模块
+./tcc/tcc -B tcc -run app/main.c6         # 读 errbase.def，id 不再变
+make errcheck                             # 表是最新的、约束都还在报错
+```
+
+用例：[tests/err_ids.c6](../tests/err_ids.c6)（号段结构与 std 内置号段）、
+[tests/errors/err_usage.c6](../tests/errors/err_usage.c6)（C124）、
+[tests/errors/err_code.c6](../tests/errors/err_code.c6)（C125）、
+[tests/run-errbase.sh](../tests/run-errbase.sh)（C126–C128、自动创建、
+`-emit-errbase` 的幂等性）。
 
 **R2 — 强制消费**：`T!error` 调用的结果只能被 `try` 或 `catch` 消费。
 赋值、参与运算、作条件、`return` 出去或当语句丢弃都属于约束 C15
@@ -1633,7 +1697,7 @@ comp:                                       (* 这一轮做完了 *)
 static int!error parse(const char *s)
 {
     if (!s)
-        err(1, "string is NULL");
+        return err(1, "string is NULL");
     return s[0] - '0';
 }
 
@@ -1668,7 +1732,7 @@ failed:
 }
 
 /* 4. 无返回值的 T!error */
-static void!error check(int n) { if (n < 0) err(2, "negative"); }
+static void!error check(int n) { if (n < 0) return err(2, "negative"); }
 
 int use(int n)
 {

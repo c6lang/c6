@@ -62,16 +62,16 @@ test "spawn 的实参块持有一份引用" {
     p->v = 71;
     t1_done = 0;
     if (__c6_gc_refcount(p) != 1)
-        err(1, "new 之后计数不是 1");
+        return err(1, "new 之后计数不是 1");
     spawn t1_worker(p);
     if (!wait_flag(&t1_done))
-        err(2, "线程没有跑");
+        return err(2, "线程没有跑");
     if (t1_v != 71)
-        err(3, "线程里没读到内容");
+        return err(3, "线程里没读到内容");
     if (t1_rc != 2)
-        err(4, "线程里计数应为 2（主线程 + 实参块）");
+        return err(4, "线程里计数应为 2（主线程 + 实参块）");
     if (!wait_rc(p, 1))
-        err(5, "线程退出后实参块没有归还引用");
+        return err(5, "线程退出后实参块没有归还引用");
 }
 
 /* ---- 2. 主线程放手，线程继续用 ---- */
@@ -95,15 +95,15 @@ test "启动者放手后对象仍然活着" {
     t2_go = 0;
     spawn t2_worker(p);
     if (!wait_flag(&t2_ready))
-        err(10, "线程没有跑");
+        return err(10, "线程没有跑");
     p = NULL;                      /* 主线程这份没了 */
     if (__c6_gc_live() != 1)
-        err(11, "主线程放手后对象不该消失（实参块还持有）");
+        return err(11, "主线程放手后对象不该消失（实参块还持有）");
     t2_go = 1;
     if (!wait_live(0))
-        err(12, "线程退出后对象应当释放");
+        return err(12, "线程退出后对象应当释放");
     if (t2_v != 72)
-        err(13, "线程读到的内容不对");
+        return err(13, "线程读到的内容不对");
 }
 
 /* ---- 3. 交接：两个线程把一个引用传给主线程 ---- */
@@ -123,19 +123,19 @@ test "跨线程交接（存进 shared 全局）" {
     t3_done = 0;
     spawn t3_worker(p);
     if (!wait_flag(&t3_done))
-        err(20, "线程没有跑");
+        return err(20, "线程没有跑");
     if (!wait_rc(g_slot, 2))
-        err(21, "实参块没有归还");
+        return err(21, "实参块没有归还");
     if (g_slot == NULL || g_slot->v != 73)
-        err(22, "交接过来的引用不能用");
+        return err(22, "交接过来的引用不能用");
     if (__c6_gc_refcount(p) != 2)
-        err(23, "交接后计数应为 2（p + g_slot）");
+        return err(23, "交接后计数应为 2（p + g_slot）");
     p = NULL;
     if (__c6_gc_refcount(g_slot) != 1)
-        err(24, "放手后计数应为 1");
+        return err(24, "放手后计数应为 1");
     g_slot = NULL;
     if (__c6_gc_live() != 0)
-        err(25, "接管者放手后对象应当释放");
+        return err(25, "接管者放手后对象应当释放");
 }
 
 /* ---- 4. 两个线程同时对同一个对象加减计数 ---- */
@@ -178,8 +178,8 @@ test "两个线程同时对同一个对象加减" {
     }
     /* 主线程 1 + 两个实参块 2 + 两个全局槽 2 = 5：并发的 +1 一个都不能丢 */
     if (__c6_gc_refcount(p) != 5)
-        err(30, "两个线程都持有后计数应为 5");
+        return err(30, "两个线程都持有后计数应为 5");
     t4_go = 1;
     if (!wait_rc(p, 1))
-        err(31, "线程退出后计数应回到 1");
+        return err(31, "线程退出后计数应回到 1");
 }

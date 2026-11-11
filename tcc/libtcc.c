@@ -1636,6 +1636,9 @@ enum {
     TCC_OPTION_test,
     TCC_OPTION_test_filter,
     TCC_OPTION_emit_header,
+    TCC_OPTION_errbase_file,
+    TCC_OPTION_no_errbase,
+    TCC_OPTION_emit_errbase,
 #endif
     TCC_OPTION_w,
     TCC_OPTION_E,
@@ -1709,6 +1712,13 @@ static const TCCOption tcc_options[] = {
     { "test", TCC_OPTION_test, 0 },
     { "test-filter", TCC_OPTION_test_filter, TCC_OPTION_HAS_ARG },
     { "emit-header", TCC_OPTION_emit_header, TCC_OPTION_HAS_ARG },
+    /* error id blocks: the table of pinned module blocks (see tccgen.c) */
+    { "errbase-file", TCC_OPTION_errbase_file, TCC_OPTION_HAS_ARG },
+    { "no-errbase", TCC_OPTION_no_errbase, 0 },
+    /* '-emit-errbase' alone writes ./errbase.def, '-emit-errbase=FILE' the
+       named file (NOSEP: it never eats the next argument) */
+    { "emit-errbase", TCC_OPTION_emit_errbase,
+      TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
 #endif
     { "rdynamic", TCC_OPTION_rdynamic, 0 },
     { "r", TCC_OPTION_r, 0 },
@@ -2159,6 +2169,23 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
                 ++optarg;
             tcc_set_str(&s->c6_emit_header, optarg);
             break;
+        case TCC_OPTION_errbase_file:
+            if (*optarg == '=')
+                ++optarg;
+            tcc_set_str(&s->c6_errbase_file, optarg);
+            break;
+        case TCC_OPTION_no_errbase:
+            /* no table at all: every module gets its hashed block */
+            s->c6_errbase_off = 1;
+            break;
+        case TCC_OPTION_emit_errbase:
+            /* freeze the block of every module this build can see, then
+               stop: the table belongs in version control */
+            if (*optarg == '=')
+                ++optarg;
+            tcc_set_str(&s->c6_emit_errbase, *optarg ? optarg : "errbase.def");
+            x = TCC_OUTPUT_MEMORY;
+            goto set_output_type;
 #endif
         case TCC_OPTION_v:
             do ++s->verbose; while (*optarg++ == 'v');

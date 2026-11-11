@@ -139,7 +139,7 @@ static int!error fetch(int n)
 {
     errdefer lg("E");
     if (n < 0)
-        err(7, "negative");
+        return err(7, "negative");
     lg("N");
     return n * 2;
 }
@@ -213,18 +213,18 @@ test "整数、位运算与整型宽度" {
     long long big = 1LL << 40;
 
     if (a / b != 2 || a % b != 1)
-        err(1, "整数除/模不对");
+        return err(1, "整数除/模不对");
     if ((a << 3) != 56 || (a >> 1) != 3)
-        err(2, "移位不对");
+        return err(2, "移位不对");
     if ((a & b) != 3 || (a | b) != 7 || (a ^ b) != 4)
-        err(3, "位运算不对");
+        return err(3, "位运算不对");
     if ((u >> 4) != 0x0Fu || (~0u & 0xFFu) != 0xFFu)
-        err(4, "无符号运算不对");
+        return err(4, "无符号运算不对");
     if (big != 1099511627776LL)
-        err(5, "long long 不对");
+        return err(5, "long long 不对");
     if (sizeof(char) != 1 || sizeof(short) != 2 || sizeof(int) != 4
         || sizeof(long long) != 8)
-        err(6, "整型宽度不对");
+        return err(6, "整型宽度不对");
 }
 
 test "浮点与类型转换" {
@@ -234,19 +234,19 @@ test "浮点与类型转换" {
     double q = (double)7 / 2;
 
     if (d + e != 3.75)
-        err(1, "double 加法不对");
+        return err(1, "double 加法不对");
     if (f * 8.0f != 4.0f)
-        err(2, "float 乘法不对");
+        return err(2, "float 乘法不对");
     if (i != 6)
-        err(3, "double -> int 转换不对");
+        return err(3, "double -> int 转换不对");
     if (q != 3.5 || (int)q != 3)
-        err(4, "整数除法/截断不对");
+        return err(4, "整数除法/截断不对");
     if (!(d < e) || !(e > (double)f))
-        err(5, "浮点比较不对");
+        return err(5, "浮点比较不对");
     if (-d + 0.5 != -1.0)
-        err(6, "一元负号不对");
+        return err(6, "一元负号不对");
     if ((double)((int)3.9) != 3.0)
-        err(7, "浮点截断不对");
+        return err(7, "浮点截断不对");
 }
 
 test "指针、数组与字符串" {
@@ -261,21 +261,21 @@ test "指针、数组与字符串" {
     for (i = 0; i < 5; i++)
         total += p[i];
     if (total != 15)
-        err(1, "数组求和不对");
+        return err(1, "数组求和不对");
     if (*(p + 2) != 3 || p[4] != 5)
-        err(2, "指针运算不对");
+        return err(2, "指针运算不对");
     swap(&a[0], &a[4]);
     if (a[0] != 5 || a[4] != 1)
-        err(3, "指针传参没有写回");
+        return err(3, "指针传参没有写回");
     if (strlen(s) != 5 || strcmp(s, "hello") != 0)
-        err(4, "字符串常量不对");
+        return err(4, "字符串常量不对");
     s[0] = 'H';
     if (buf[0] != 'H')
-        err(5, "字符数组写入不对");
+        return err(5, "字符数组写入不对");
     if (strlen(lit) != 3 || lit[2] != '9')
-        err(6, "字符串字面量不对");
+        return err(6, "字符串字面量不对");
     if ((int)(sizeof(a) / sizeof(a[0])) != 5)
-        err(7, "sizeof 数组不对");
+        return err(7, "sizeof 数组不对");
 }
 
 test "控制流：if/while/do/for/switch" {
@@ -289,7 +289,7 @@ test "控制流：if/while/do/for/switch" {
         sum += i;
     }
     if (sum != 26)
-        err(1, "for + break/continue 不对");
+        return err(1, "for + break/continue 不对");
 
     i = 0;
     n = 0;
@@ -301,7 +301,7 @@ test "控制流：if/while/do/for/switch" {
         n++;
     } while (0);
     if (n != 4)
-        err(2, "while/do-while 不对");
+        return err(2, "while/do-while 不对");
 
     n = 0;
     switch (3) {
@@ -318,7 +318,7 @@ test "控制流：if/while/do/for/switch" {
         n = -1;
     }
     if (n != 11)
-        err(3, "switch fallthrough 不对");
+        return err(3, "switch fallthrough 不对");
 
     n = 0;
     switch (99) {
@@ -329,10 +329,10 @@ test "控制流：if/while/do/for/switch" {
         n = 2;
     }
     if (n != 2)
-        err(4, "switch default 不对");
+        return err(4, "switch default 不对");
 
     if (!(1 && 2) || (0 || 0) || (1 ? 5 : 6) != 5)
-        err(5, "逻辑/三目运算不对");
+        return err(5, "逻辑/三目运算不对");
 
     sum = 0;
     i = 0;
@@ -341,7 +341,7 @@ again:
     if (i < 3)
         goto again;
     if (sum != 3)
-        err(6, "goto 不对");
+        return err(6, "goto 不对");
 }
 
 test "64 位移位与无符号提升" {
@@ -351,36 +351,36 @@ test "64 位移位与无符号提升" {
     unsigned long long ul = (unsigned long long)u << 32;
 
     if ((one << 32) != 4294967296ULL)
-        err(1, "1ULL << 32 不对");
+        return err(1, "1ULL << 32 不对");
     if (((unsigned long long)i << 32) != 0xFFFFFFFF00000000ULL)
-        err(2, "符号扩展之后的 64 位移位不对");
+        return err(2, "符号扩展之后的 64 位移位不对");
     if (ul != 0xFFFFFFFF00000000ULL)
-        err(3, "unsigned int 提升到 64 位后移位不对");
+        return err(3, "unsigned int 提升到 64 位后移位不对");
     if ((one << 63) != 0x8000000000000000ULL)
-        err(4, "1ULL << 63 不对");
+        return err(4, "1ULL << 63 不对");
     if (((unsigned long long)i >> 32) != 0xFFFFFFFFULL)
-        err(5, "64 位逻辑右移不对");
+        return err(5, "64 位逻辑右移不对");
     if ((0x10ULL << 4) != 0x100ULL || (0x100ULL >> 4) != 0x10ULL)
-        err(6, "小的 64 位移位不对");
+        return err(6, "小的 64 位移位不对");
 }
 
 test "变参函数定义" {
     char buf[64] = {0};
 
     if (sum_ints(0) != 0)
-        err(1, "没有变参时不对");
+        return err(1, "没有变参时不对");
     if (sum_ints(3, 1, 2, 3) != 6)
-        err(2, "三个整型变参不对");
+        return err(2, "三个整型变参不对");
     if (sum_ints(10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) != 55)
-        err(3, "溢出到栈上的整型变参不对");
+        return err(3, "溢出到栈上的整型变参不对");
     if (sum_doubles(3, 1.5, 2.25, 3.25) != 7.0)
-        err(4, "浮点变参不对");
+        return err(4, "浮点变参不对");
     if (sum_doubles(10, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
         != 10.0)
-        err(5, "溢出到栈上的浮点变参不对");
+        return err(5, "溢出到栈上的浮点变参不对");
     if (vformat(buf, sizeof buf, "%s-%d", "x", 42) != 4
         || strcmp(buf, "x-42") != 0)
-        err(6, "把 va_list 交给 vsnprintf 不对");
+        return err(6, "把 va_list 交给 vsnprintf 不对");
 }
 
 test "无符号 64 位转浮点" {
@@ -391,27 +391,27 @@ test "无符号 64 位转浮点" {
     float f = (float)h;
 
     if (!(ld > 1.8e19L) || !(ld < 1.9e19L))
-        err(1, "unsigned long long -> long double 不对");
+        return err(1, "unsigned long long -> long double 不对");
     if (d != 9223372036854775808.0)
-        err(2, "unsigned long long -> double 不对");
+        return err(2, "unsigned long long -> double 不对");
     if (f != 9223372036854775808.0f)
-        err(3, "unsigned long long -> float 不对");
+        return err(3, "unsigned long long -> float 不对");
 }
 
 test "函数指针、递归与间接调用" {
     int (*op)(int, int) = mul;
 
     if (apply(op, 6, 7) != 42)
-        err(1, "局部函数指针不对");
+        return err(1, "局部函数指针不对");
     if (g_op(20, 22) != 42)
-        err(2, "全局函数指针初值不对");
+        return err(2, "全局函数指针初值不对");
     g_op = mul;
     if (g_op(6, 7) != 42)
-        err(3, "全局函数指针赋值不对");
+        return err(3, "全局函数指针赋值不对");
     if (apply(add, 1, 2) != 3)
-        err(4, "直接传函数名不对");
+        return err(4, "直接传函数名不对");
     if (fib(10) != 55)
-        err(5, "递归不对");
+        return err(5, "递归不对");
 }
 
 test "结构体、联合体与按值返回" {
@@ -422,20 +422,20 @@ test "结构体、联合体与按值返回" {
     struct Point arr[3] = { { 1, 2 }, { 3, 4 }, { 5, 6 } };
 
     if (p.x != 20 || p.y != 22 || point_sum(p) != 42)
-        err(1, "小结构体按值传递/返回不对");
+        return err(1, "小结构体按值传递/返回不对");
     if (big_sum(b) != 42 || b.c != 39)
-        err(2, "大结构体按值传递/返回不对");
+        return err(2, "大结构体按值传递/返回不对");
     q = p;
     q.x = 1;
     if (p.x != 20 || q.x != 1)
-        err(3, "结构体赋值不是值语义");
+        return err(3, "结构体赋值不是值语义");
     u.i = 0x41424344;
     if (u.i != 0x41424344)
-        err(4, "联合体成员读写不对");
+        return err(4, "联合体成员读写不对");
     if ((int)sizeof(struct Big) != 24)
-        err(5, "结构体 sizeof 不对");
+        return err(5, "结构体 sizeof 不对");
     if (arr[1].x != 3 || arr[2].y != 6)
-        err(6, "结构体数组不对");
+        return err(6, "结构体数组不对");
 }
 
 test "defer / errdefer / err / try / catch" {
@@ -448,29 +448,29 @@ test "defer / errdefer / err / try / catch" {
         lg("body");
     }
     if (!LOG_IS("bodyd2d1"))
-        err(1, "defer 顺序不对");
+        return err(1, "defer 顺序不对");
 
     log_reset();
     v = (try fetch(5));
     if (v != 10 || !LOG_IS("N"))
-        err(2, "成功路径的 try 或 errdefer 不对");
+        return err(2, "成功路径的 try 或 errdefer 不对");
 
     log_reset();
     v = probe(-1);
     if (v != -1 || last_id != 7 || strcmp(last_msg, "negative") != 0)
-        err(3, "catch 没有拿到错误码/消息");
+        return err(3, "catch 没有拿到错误码/消息");
     if (!LOG_IS("E"))
-        err(4, "失败路径没有执行 errdefer");
+        return err(4, "失败路径没有执行 errdefer");
     if (__tcc_err_flag_get())
-        err(5, "catch 之后错误槽没有清空");
+        return err(5, "catch 之后错误槽没有清空");
 
     last_id = 0;
     v = probe_twice(-2);
     if (v != -1 || last_id != 7)
-        err(6, "错误没有穿过 try 传播");
+        return err(6, "错误没有穿过 try 传播");
     v = probe_twice(20);
     if (v != 41)
-        err(7, "传播时的成功路径不对");
+        return err(7, "传播时的成功路径不对");
 }
 
 test "切片与 foreach" {
@@ -479,33 +479,33 @@ test "切片与 foreach" {
     int total = 0, count = 0;
 
     if ((int)s.len != 3 || sum_slice(s) != 9)
-        err(1, "切片长度或元素不对");
+        return err(1, "切片长度或元素不对");
     s[0] = 20;
     if (a[1] != 20)
-        err(2, "通过切片写入没有落到数组");
+        return err(2, "通过切片写入没有落到数组");
 
     foreach ((size_t i, int v) = a) {
         if ((int)i != count)
-            err(3, "foreach 下标不连续");
+            return err(3, "foreach 下标不连续");
         total += v;
         count++;
     }
     if (count != 5 || total != 1 + 20 + 3 + 4 + 5)
-        err(4, "数组 foreach 不对");
+        return err(4, "数组 foreach 不对");
 
     total = 0;
     foreach (int i = 0:4) {
         total += (int)i;
     }
     if (total != 6)
-        err(5, "区间 foreach 不对");
+        return err(5, "区间 foreach 不对");
 
     total = 0;
     foreach ((size_t _, int v) = s) {
         total += v;
     }
     if (total != 27)
-        err(6, "切片 foreach 不对");
+        return err(6, "切片 foreach 不对");
 }
 
 test "元组" {
@@ -513,14 +513,14 @@ test "元组" {
     (char *, int) g = { "hello", 5 };
 
     if (t[0] != 8 || t[1] != 2)
-        err(1, "元组返回值不对");
+        return err(1, "元组返回值不对");
     if ((int)sizeof(t) != 8)
-        err(2, "元组 sizeof 不对");
+        return err(2, "元组 sizeof 不对");
     if (strcmp(g[0], "hello") != 0 || g[1] != 5)
-        err(3, "带指针的元组不对");
+        return err(3, "带指针的元组不对");
     t[0] = 9;
     if (t[0] != 9)
-        err(4, "元组元素赋值不对");
+        return err(4, "元组元素赋值不对");
 }
 
 test "方法、接口与裸 tag 类型名" {
@@ -530,27 +530,27 @@ test "方法、接口与裸 tag 类型名" {
     Num num = n;
 
     if (p->vec_sum() != 7)
-        err(1, "方法调用不对");
+        return err(1, "方法调用不对");
     if (vec_sum(p) != 7)
-        err(2, "方法当普通函数调用不对");
+        return err(2, "方法当普通函数调用不对");
     if (num.num_twice() != 42)
-        err(3, "接口方法调用不对");
+        return err(3, "接口方法调用不对");
 }
 
 test "async / await 与 spawn 的运行时" {
     struct async_add_task *t = async_add(20, 22);
 
     if (__c6_co_wait(t) != 0)
-        err(1, "协程驱动失败");
+        return err(1, "协程驱动失败");
     if (t->val != 42)
-        err(2, "async 返回值不对");
+        return err(2, "async 返回值不对");
     __c6_co_destroy(t);
 
     go_flag = 0;
     spawn set_flag(1);
     __c6_th_join_all();
     if (go_flag != 1)
-        err(3, "spawn 线程没有跑起来");
+        return err(3, "spawn 线程没有跑起来");
 }
 
 test "c99 输出后端端到端标记" {

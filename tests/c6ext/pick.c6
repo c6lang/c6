@@ -11,5 +11,5 @@ import pick.m;
 
 test "import 优先 .c6" {
     if (PICK != 11)
-        err(1, "PICK");
+        return err(1, "PICK");
 }

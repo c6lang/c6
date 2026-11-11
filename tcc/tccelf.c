@@ -218,6 +218,15 @@ ST_FUNC void tccelf_end_file(TCCState *s1)
     }
     /* now update relocations */
     update_relocs(s1, s, tr, first_sym);
+#ifdef TCC_TARGET_C99
+    /* the C output keeps symbol indices in its text: translate them to the
+       new numbering, then resolve what this unit left unresolved (the
+       renumbering above is the last word on this unit's symbols) */
+    if (s1->output_type == TCC_OUTPUT_C99) {
+        c99_sym_remap(s1, tr, first_sym, nb_syms);
+        c99_tu_end(s1);
+    }
+#endif
     tcc_free(tr);
     /* record text/data/bss output for -bench info */
     for (i = 0; i < 4; ++i) {

@@ -39,7 +39,7 @@ async int twice(int k)
 async int!error boom(int k)
 {
     if (k < 0)
-        err(7, "负数是错的");
+        return err(7, "负数是错的");
     return k;
 }
 
@@ -49,41 +49,41 @@ test "t->wait() 驱动到结束，done/kind/val 一致" {
     task t = twice(5);
 
     if (t->done())
-        err(1, "还没驱动就说完成了");
+        return err(1, "还没驱动就说完成了");
     if (t->wait() != 0)
-        err(2, "wait 返回非 0");
+        return err(2, "wait 返回非 0");
     if (!t->done())
-        err(3, "wait 之后 done() 应为 1");
+        return err(3, "wait 之后 done() 应为 1");
     if (t->kind() != C6_CO_KIND_DONE)
-        err(4, "kind 应为 DONE");
+        return err(4, "kind 应为 DONE");
     if (t->val != 12)
-        err(5, "返回值不对");
+        return err(5, "返回值不对");
 }
 
 test "wait 幂等：结束之后再 wait 立刻返回 0" {
     task t = twice(1);
 
     if (t->wait() != 0)
-        err(10, "第一次 wait 失败");
+        return err(10, "第一次 wait 失败");
     if (t->wait() != 0)
-        err(11, "第二次 wait 应当也是 0");
+        return err(11, "第二次 wait 应当也是 0");
     if (t->wait() != 0)
-        err(12, "第三次 wait 应当也是 0");
+        return err(12, "第三次 wait 应当也是 0");
     if (t->val != 4)
-        err(13, "返回值不对");
+        return err(13, "返回值不对");
 }
 
 test "done() 不驱动：挂起的任务仍然是 0" {
     task t = twice(3);
 
     if (t->done())
-        err(20, "还没驱动就说完成了");
+        return err(20, "还没驱动就说完成了");
     if (t->kind() != C6_CO_KIND_DONE && t->done())
-        err(21, "done 与 kind 不一致");
+        return err(21, "done 与 kind 不一致");
     if (t->wait() != 0 || !t->done())
-        err(22, "驱动之后应当完成");
+        return err(22, "驱动之后应当完成");
     if (t->val != 8)
-        err(23, "返回值不对");
+        return err(23, "返回值不对");
 }
 
 /* ---- 2. 失败的任务 ---- */
@@ -92,11 +92,11 @@ test "失败的任务：wait 返回 -1，kind 报 ERR" {
     task t = boom(-1);
 
     if (t->wait() != -1)
-        err(30, "失败的任务 wait 应返回 -1");
+        return err(30, "失败的任务 wait 应返回 -1");
     if (t->kind() != C6_CO_KIND_ERR)
-        err(31, "kind 应为 ERR");
+        return err(31, "kind 应为 ERR");
     if (!t->done())
-        err(32, "失败也算结束");
+        return err(32, "失败也算结束");
 }
 
 test "成功的任务与失败的任务相邻，互不影响" {
@@ -105,11 +105,11 @@ test "成功的任务与失败的任务相邻，互不影响" {
     task c = twice(2);
 
     if (a->wait() != 0 || a->val != 7)
-        err(40, "第一个任务不对");
+        return err(40, "第一个任务不对");
     if (b->wait() != -1 || b->kind() != C6_CO_KIND_ERR)
-        err(41, "第二个任务应当失败");
+        return err(41, "第二个任务应当失败");
     if (c->wait() != 0 || c->val != 6)
-        err(42, "第三个任务不对");
+        return err(42, "第三个任务不对");
 }
 
 /* ---- 3. 句柄可以被放弃，作用域收尾照旧 ---- */
@@ -119,9 +119,9 @@ test "t = NULL 提前放弃，块尾不重复销毁" {
         task t = twice(4);
 
         if (t->wait() != 0)
-            err(50, "wait 失败");
+            return err(50, "wait 失败");
         if (t->val != 10)
-            err(51, "返回值不对");
+            return err(51, "返回值不对");
         t = NULL;               /* 提前放手：块尾的销毁是空操作 */
     }
     {
@@ -133,6 +133,6 @@ test "t = NULL 提前放弃，块尾不重复销毁" {
         task t = twice(8);
 
         if (t->wait() != 0 || t->val != 18)
-            err(52, "销毁过的任务影响到了新任务");
+            return err(52, "销毁过的任务影响到了新任务");
     }
 }

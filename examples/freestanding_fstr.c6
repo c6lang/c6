@@ -102,7 +102,7 @@ static int check(int cond, int id)
 int!error parse(int n)
 {
     if (n < 0)
-        err(7, f"negative: {n}");
+        return err(7, f"negative: {n}");
     return n * 2;
 }
 

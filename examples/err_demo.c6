@@ -22,7 +22,7 @@ static int!error open_file(const char *path)
     errdefer printf("  errdefer: 回滚已做的修改\n");
 
     if (!path) {
-        err(1, "path is NULL");     /* 不会执行到下一行 */
+        return err(1, "path is NULL");     /* 不会执行到下一行 */
         printf("unreachable\n");
     }
     printf("  ok: %s\n", path);
@@ -34,7 +34,7 @@ static void!error must_fail(int bad)
 {
     defer printf("  void: defer\n");
     if (bad)
-        err(7, "void 函数里的错误");
+        return err(7, "void 函数里的错误");
     printf("  void: 正常结束\n");
 }
 
@@ -51,7 +51,7 @@ static int normal_path(void)
 static int!error *ptr_fail(int fail)
 {
     if (fail)
-        err(9, "ptr");
+        return err(9, "ptr");
     return 0;
 }
 

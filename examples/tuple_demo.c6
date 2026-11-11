@@ -29,7 +29,7 @@ int sum((int, int) t)
 (int, int)!error parse_pair(const char *s)
 {
     if (!s || !s[0] || !s[1])
-        err(1, "need two characters");
+        return err(1, "need two characters");
     return {s[0], s[1]};
 }
 

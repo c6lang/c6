@@ -16,9 +16,9 @@ void __tcc_err_clear(void);
 static int!error parse(const char *s)
 {
     if (!s)
-        err(1, "string is NULL");
+        return err(1, "string is NULL");
     if (*s != '1')
-        err(2, "expected a leading '1'");
+        return err(2, "expected a leading '1'");
     return s[1] - '0';
 }
 
@@ -56,7 +56,7 @@ static int handle_plain(const char *s)
 static void!error require_int(const char *s)
 {
     if (!s || (*s < '0' || *s > '9'))
-        err(3, "not a digit");
+        return err(3, "not a digit");
 }
 
 static int check(const char *s)

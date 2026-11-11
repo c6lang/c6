@@ -642,6 +642,18 @@ redo:
     if (s->do_bench)
         end_time = getclock_ms();
 
+#ifdef C6_EXT
+    if (0 == ret && s->c6_emit_errbase) {
+        /* '-emit-errbase': write the table and stop, before any output */
+        if (c6_errbase_write(s, s->c6_emit_errbase) < 0)
+            ret = 1;
+        tcc_delete(s);
+        return ret;
+    }
+    if (0 == ret && c6_err_finish(s))
+        ret = 1;
+#endif
+
     if (s->run_test) {
         t = 0;
     } else if (s->output_type == TCC_OUTPUT_PREPROCESS) {

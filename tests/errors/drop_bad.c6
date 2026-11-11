@@ -34,7 +34,7 @@ int main(void)
 void!error drop(struct File *self)
 {
     (void)self;
-    err(1, "no");
+    return err(1, "no");
 }
 int main(void)
 {

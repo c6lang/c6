@@ -98,39 +98,39 @@ static int rec(int n)
 test "defer 在块退出时按注册的逆序执行" {
     basic();
     if (!LG_IS("bodycba"))
-        err(1, "defer 没有按逆序执行");
+        return err(1, "defer 没有按逆序执行");
 }
 
 test "break/continue 也会执行循环体的 defer" {
     in_loop();
     if (!LG_IS("iddid"))
-        err(1, "break/continue 的 defer 顺序不对");
+        return err(1, "break/continue 的 defer 顺序不对");
 }
 
 test "return 执行 defer 并保留返回值" {
     int v = 0;
     v = ret(5);
     if (v != 10)
-        err(1, "带 defer 的 return 返回值不对");
+        return err(1, "带 defer 的 return 返回值不对");
     if (!LG_IS("twoone"))
-        err(2, "return 路径的 defer 顺序不对");
+        return err(2, "return 路径的 defer 顺序不对");
     v = ret(-5);
     if (v != -1)
-        err(3, "错误分支的返回值不对");
+        return err(3, "错误分支的返回值不对");
     if (!LG_IS("threeone"))
-        err(4, "错误分支的 defer 顺序不对");
+        return err(4, "错误分支的 defer 顺序不对");
 }
 
 test "goto 只执行被离开块的 defer" {
     goto_out();
     if (!LG_IS("innerouter"))
-        err(1, "goto 的 defer 顺序不对");
+        return err(1, "goto 的 defer 顺序不对");
 }
 
 test "递归时每帧的 defer 独立执行" {
     lg_reset();
     if (rec(3) != 6)
-        err(1, "递归返回值不对");
+        return err(1, "递归返回值不对");
     if (!LG_IS("rrrr"))
-        err(2, "递归帧的 defer 数量不对");
+        return err(2, "递归帧的 defer 数量不对");
 }

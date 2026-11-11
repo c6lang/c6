@@ -7,7 +7,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 |---|---|
 | `defer { ... }` | 作用域/函数退出时逆序执行清理代码（注册状态在函数帧里，不需要 TLS） |
 | `errdefer { ... }` | 仅在错误路径上执行的 `defer` |
-| `err(code, "msg")` | 设置错误槽、就地展开清理并直接返回 |
+| `return err(id, "msg")` | 设置错误槽、就地展开清理并直接返回（只能在 `T!error` 函数里写 `return err(..)`） |
 | `func() T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 |
 | `async` / `await` / `co` / `task` | 无栈协程：`co f();` 顶层跑、`task t = f();` 拿句柄 |
 | `spawn f(...)` | OS 线程（`pthread_create`），语句立刻返回、真并发 |
@@ -86,7 +86,7 @@ int load(const char *path)
 {
     FILE *f = fopen(path, "r");
     if (!f)
-        err(1, "open failed");
+        return err(1, "open failed");
     defer fclose(f);                       /* 正常退出、return、break 都会执行 */
 
     char *buf = malloc(4096);
@@ -95,7 +95,7 @@ int load(const char *path)
     errdefer printf("load: cleaning up after error\n");
 
     if (fread(buf, 1, 4096, f) == 0)
-        err(2, "read failed");             /* 返回 -1，errdefer 逆序执行 */
+        return err(2, "read failed");      /* 返回 -1，errdefer 逆序执行 */
     return 0;
 }
 
@@ -120,9 +120,62 @@ int main(void)
 
 | 写法 | 行为 |
 |---|---|
-| `err(code, msg)` | 写入错误槽（`flag=1`），逆序执行本帧的 `errdefer` 与 `defer`，然后**直接返回**（返回值是哨兵 `-1`） |
+| `return err(id, msg)` | 写入错误槽（`flag=1`），逆序执行本帧的 `errdefer` 与 `defer`，然后返回哨兵 `-1`；`err(..)` 只能写成 `return err(..)` |
 | `defer stmt;` | 任何离开作用域的路径都执行（正常 `return`、`break`、`continue`、`goto`、`err`） |
 | `errdefer stmt;` | 仅在错误路径（本帧执行了 `err`）执行，正常返回时跳过 |
+
+### 错误码是模块自己的号段
+
+`err` 的 id 不是随手写的裸数字：模块里声明 `enum Error { ... }`，成员就落在
+**这个模块自己的号段**里，跨模块不会撞：
+
+```c
+// app/db.c6
+module app.db;
+
+enum Error {          // 成员的实际取值（app.db 钉在 0x6100）：
+    OK    = 0,        // 0x00000000 —— 0 永远是「没有错误」
+    NOPEN = 1,        // 0x06100001
+    BUSY  = 2,        // 0x06100002
+};
+
+int!error load(void)
+{
+    if (busy)
+        return err(BUSY, "db is busy");
+    return 0;
+}
+```
+
+```
+id = (area << 27) | (slot << 12) | code
+```
+
+| 号段 | 谁用 |
+|---|---|
+| `slot 0` | 不属于任何模块的文件（`main` 的 TU、`tests`）：`return err(1, "x")` 仍是 `1` |
+| `slot 1..0x5FFF` | 自动池：`1 + fnv1a32(模块名) % 0x5FFF`，号是名字的纯函数 |
+| `slot 0x6000..0x60FF` | std 内置池（`std.err`=0x6000，见 [docs/stdlib.md](docs/stdlib.md)） |
+| `slot 0x6100..0x7FFF` | 钉号池：项目根 `errbase.def` 里的行 |
+
+项目根有一个 `errbase.def`（一次 `-emit-errbase` 就生成，**建议进版本库**）：
+
+```
+# 格式：  <模块名>  <slot>       slot 取 0x6100..0x7FFF
+
+app.db       0x6100
+app.cli      0x6101
+```
+
+- 没列出来的模块按名字哈希自动拿号；列出来的号**永远不会变**。
+- `-emit-errbase[=FILE]`：把这次编译能看见的所有模块一次钉住（已有的行原样
+  保留，新模块按名字排序接在末尾），写完就停；产出的文件可以直接提交。
+- `-errbase-file=FILE` 指定别的表（必须存在）；`-no-errbase` 完全不读表。
+- 两个模块撞进同一个号段时**报错**，不静默：把其中一个钉进 `errbase.def`。
+- 没有 `errbase.def` 又没给 `-errbase-file` 时，链接带模块的程序会自动写一份
+  只有注释的空表 —— 空表不改变任何 id。
+
+细节与诊断（C124–C128）见 [docs/grammar.md](docs/grammar.md) §8.1。
 
 配套的运行时接口（`libtcc1` 提供，直接在源码里声明即可）：
 
@@ -187,7 +240,7 @@ int main(void)
 static int!error parse(const char *s)
 {
     if (!s)
-        err(1, "string is NULL");         /* 设置错误槽并直接返回 */
+        return err(1, "string is NULL");  /* 设置错误槽并返回哨兵 -1 */
     return s[0] - '0';
 }
 
@@ -218,7 +271,7 @@ int handle(const char *s)
 | `try f();` | 语句形式，返回值被丢弃 |
 | `e = f() catch { ... }` | 只在失败时进入处理块，不绑定错误值 |
 | `f() catch e { ... }` / `f() catch (e) { ... }` | 处理块里可用 `e.id` / `e.msg` |
-| `err(id, msg)` | 设置错误槽并立即返回；必须在 `T!error` 函数里使用 |
+| `return err(id, msg)` | 设置错误槽并立即返回；只能在 `T!error` 函数里这样写，单独写 `err(..)` 是错误 |
 
 `e` 的类型就是 `error`（编译器预置的 `typedef struct __tcc_error { int id; const char *msg; } error;`）。
 每次 `T!error` 调用之前都会先清空错误槽，`catch` 在进入处理块前再**快照并清空**一次，
@@ -228,7 +281,7 @@ int handle(const char *s)
 
 - `try` 只能出现在返回类型带 `!error` 的函数里，且操作数必须是一次调用；
 - `catch` 的操作数也必须是一次调用，被调函数要返回 `T!error`；
-- `catch` 处理块必须自己离开：`return` / `err(id, msg)` / `goto`；编译器判断
+- `catch` 处理块必须自己离开：`return` / `return err(id, msg)` / `goto`；编译器判断
   不出来时会在处理块末尾插入一个陷阱，运行时崩溃而不是悄悄走成功路径；
 - `try` / `catch` / `err` 不能写在 `defer` / `errdefer` 体内；
 - `T!error` 函数的返回值**必须**被 `try` 或 `catch` 消费；直接赋值、参与运算、
@@ -256,7 +309,7 @@ int handle(const char *s)
 ```c
 test "add works" {
     if (add(1, 2) != 3)
-        err(1, "1 + 2 != 3");
+        return err(1, "1 + 2 != 3");
 }
 ```
 
@@ -1208,7 +1261,7 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 - 插值里不能用 `try`：错误路径会从函数里返回，运行时的构造器就留在栈上了
   （要写 `int v = try f(); f"x{v}"`）；`;` 只用来引入格式说明，出现第二次
   就报错（C88）；
-- `err(id, f"..")` 的消息会**复制**一份（消息常常是这一帧里的借用缓冲），
+- `return err(id, f"..")` 的消息会**复制**一份（消息常常是这一帧里的借用缓冲），
   上限 511 字节，更长的部分被截断；
 - `__FILE__`、`__LINE__`、`__COUNTER__` 在插值里取到的是真实位置；插值里的
   诊断也报在源文件的行上；
@@ -1569,11 +1622,13 @@ c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 ```
 tests/
 ├── run-tests.sh      运行器（make selftest 调它）
+├── run-errbase.sh    errbase.def 的检查（make errcheck 调它）
 ├── defer.c6           defer 的时机、顺序与作用域
 ├── defer_scope.c6     defer 与块作用域、goto 跨作用域的清理
 ├── defer_reent.c6     递归/重入时的 defer 链
 ├── defer_thread.c6    线程里的 defer（裸机跑不了，boot/runtests.sh 跳过）
 ├── err.c6             err / errdefer / 清理顺序
+├── err_ids.c6         错误码号段：模块的 enum Error、std 内置号段（tu/err_ids.c6）
 ├── try.c6             try / catch
 ├── test-block.c6      test 块与 -test 模式本身
 ├── macro.c6           #macro 与 __local 名字卫生

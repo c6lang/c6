@@ -59,16 +59,16 @@ test "析构在最后一次释放时跑一次" {
         @Counter c = new Counter;
         c->v = 41;
         if (counter_runs != 0)
-            err(1, "对象还活着就跑了析构");
+            return err(1, "对象还活着就跑了析构");
         if (__c6_gc_refcount(c) != 1)
-            err(2, "计数不是 1");
+            return err(2, "计数不是 1");
     }
     if (counter_runs != 1)
-        err(3, "析构没有跑，或者跑了不止一次");
+        return err(3, "析构没有跑，或者跑了不止一次");
     if (counter_seen != 41)
-        err(4, "析构没拿到自己的内容");
+        return err(4, "析构没拿到自己的内容");
     if (__c6_gc_live() != 0)
-        err(5, "对象没有释放");
+        return err(5, "对象没有释放");
 }
 
 test "析构里能读自己的托管字段" {
@@ -81,11 +81,11 @@ test "析构里能读自己的托管字段" {
         p->v = 1;
     }
     if (pair_runs != 1)
-        err(1, "析构没有跑");
+        return err(1, "析构没有跑");
     if (pair_child_v != 7)
-        err(2, "析构跑的时候字段已经被释放了：顺序反了");
+        return err(2, "析构跑的时候字段已经被释放了：顺序反了");
     if (__c6_gc_live() != 0)
-        err(3, "父子的对象没有全部释放");
+        return err(3, "父子的对象没有全部释放");
 }
 
 test "析构里释放另一个对象" {
@@ -95,12 +95,12 @@ test "析构里释放另一个对象" {
         l->n = new Node;
         l->n->v = 5;
         if (__c6_gc_live() != 2)
-            err(1, "活对象数不对");
+            return err(1, "活对象数不对");
     }
     if (linked_runs != 1)
-        err(2, "析构没有跑");
+        return err(2, "析构没有跑");
     if (__c6_gc_live() != 0)
-        err(3, "重入释放留下了对象");
+        return err(3, "重入释放留下了对象");
 }
 
 test "两次引用只有最后一次触发析构" {
@@ -110,14 +110,14 @@ test "两次引用只有最后一次触发析构" {
         @Counter d = c;
         c->v = 9;
         if (__c6_gc_refcount(c) != 2)
-            err(1, "计数不是 2");
+            return err(1, "计数不是 2");
         c = NULL;
         if (counter_runs != 0)
-            err(2, "还有引用时跑了析构");
+            return err(2, "还有引用时跑了析构");
         d = NULL;
     }
     if (counter_runs != 1)
-        err(3, "析构次数不对");
+        return err(3, "析构次数不对");
 }
 
 /* 数组：每个元素各跑一次析构，和 C++ 一样 */
@@ -140,11 +140,11 @@ test "数组元素的析构逐个跑" {
         e[2].v = 3;
     }
     if (element_runs != 3)
-        err(1, "析构次数不是元素个数");
+        return err(1, "析构次数不是元素个数");
     if (element_sum != 6)
-        err(2, "析构没读到每个元素的内容");
+        return err(2, "析构没读到每个元素的内容");
     if (__c6_gc_live() != 0)
-        err(3, "数组没有释放");
+        return err(3, "数组没有释放");
 }
 
 /* 空转等待，有上界：出错时报失败而不是挂住 */
@@ -162,9 +162,9 @@ test "析构在 spawn 线程里也跑" {
     counter_seen = 0;
     spawn work();
     if (!wait_nonzero(&counter_runs))
-        err(1, "spawn 线程里的析构没有跑");
+        return err(1, "spawn 线程里的析构没有跑");
     if (counter_seen != 33)
-        err(2, "spawn 线程里的析构没拿到内容");
+        return err(2, "spawn 线程里的析构没拿到内容");
 }
 
 void work(void) {

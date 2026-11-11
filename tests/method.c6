@@ -69,7 +69,7 @@ int vec_area(struct Vec *v) { return v->x * v->y; }
 int!error vec_checked(struct Vec *v)
 {
     if (v->x < 0)
-        err(1, "negative x");
+        return err(1, "negative x");
     return v->x;
 }
 
@@ -91,49 +91,49 @@ test "不同结构体可以用同名方法（不需要 package）" {
     struct Circle c = { 2 };
     struct Rect r = { 2, 3 };
     if ((&c)->area() != 12)
-        err(1, "Circle 的 area 不对");
+        return err(1, "Circle 的 area 不对");
     if ((&r)->area() != 6)
-        err(2, "Rect 的 area 不对");
+        return err(2, "Rect 的 area 不对");
 }
 
 test "和方法同名的普通函数不会被方法顶掉" {
     struct Box b = { 3, 4 };
     if (plain_area() != 7)
-        err(1, "普通调用 plain_area() 被方法抢走了");
+        return err(1, "普通调用 plain_area() 被方法抢走了");
     if ((&b)->plain_area() != 12)
-        err(2, "方法调用 (&b)->plain_area() 不对");
+        return err(2, "方法调用 (&b)->plain_area() 不对");
 }
 
 test "和 libc 声明同名的方法不抢 libc 的名字" {
     struct Pid p = { 0 };
     if ((&p)->getpid() != 4242)
-        err(1, "方法 getpid 不对");
+        return err(1, "方法 getpid 不对");
     if (getpid() == 4242)
-        err(2, "普通调用 getpid() 被方法抢走了");
+        return err(2, "普通调用 getpid() 被方法抢走了");
 }
 
 test "同名方法按接收者区分，可以跨翻译单元" {
     struct Vec v = { 5, 2 };
     struct Depth d = { 3 };
     if ((&v)->depth() != 3)
-        err(1, "本 TU 的 depth 不对");
+        return err(1, "本 TU 的 depth 不对");
     if ((&d)->depth() != 12)
-        err(2, "另一个 TU 的 depth 不对");
+        return err(2, "另一个 TU 的 depth 不对");
 }
 
 test "普通调用形式在方法被改名后仍然可用" {
     struct Vec v = { 3, 4 };
     struct Circle c = { 2 };
     if (vec_sum(&v) != 7)
-        err(1, "普通调用 vec_sum 不对");
+        return err(1, "普通调用 vec_sum 不对");
     if (area(&c) != 12)          /* 弱别名指向本 TU 的第一个 area */
-        err(2, "普通调用 area 不对");
+        return err(2, "普通调用 area 不对");
 }
 
 test "方法里的 __func__ 是源码名" {
     struct Vec v = { 1, 2 };
     if (strcmp((&v)->vec_name(), "vec_name") != 0)
-        err(1, "__func__ 不是源码名");
+        return err(1, "__func__ 不是源码名");
 }
 
 test "系统头里声明的 libc 函数仍然是方法" {
@@ -151,11 +151,11 @@ test "方法调用就是普通函数调用" {
     struct Vec v = { 3, 4 };
     struct Vec *p = &v;
     if (p->vec_sum() != 7)
-        err(1, "p->vec_sum() 不对");
+        return err(1, "p->vec_sum() 不对");
     if (vec_sum(p) != 7)
-        err(2, "普通调用形式不对");
+        return err(2, "普通调用形式不对");
     if (p->vec_twice() != 14)
-        err(3, "方法调用另一个方法不对");
+        return err(3, "方法调用另一个方法不对");
 }
 
 test "返回结构体的方法" {
@@ -163,38 +163,38 @@ test "返回结构体的方法" {
     struct Vec *p = &v;
     struct Pair q = p->vec_pair();
     if (q.a != 6 || q.b != 12)
-        err(1, "sret 方法返回的结构体不对");
+        return err(1, "sret 方法返回的结构体不对");
 }
 
 test "真字段优先于同名方法" {
     struct Holder h = { 5, 99 };
     if (h.area != 99)
-        err(1, "字段没有优先");
+        return err(1, "字段没有优先");
     if (holder_area(&h) != 10)
-        err(2, "同名方法本身仍可普通调用");
+        return err(2, "同名方法本身仍可普通调用");
 }
 
 test "只有原型、类型尚不完整时也能调用方法" {
     struct Node n = { 7 };
     if ((&n)->node_depth() != 7)
-        err(1, "不完整类型的方法调用不对");
+        return err(1, "不完整类型的方法调用不对");
 }
 
 test "包里定义的方法按裸名字查找" {
     struct Vec v = { 3, 4 };
     struct Vec *p = &v;
     if (p->scaled(10) != 70)
-        err(1, "包方法 p->scaled 不对");
+        return err(1, "包方法 p->scaled 不对");
     if (p->vec_area() != 12)
-        err(2, "包方法 p->vec_area 不对");
+        return err(2, "包方法 p->vec_area 不对");
     if (vec_area(p) != 12)
-        err(3, "限定调用 vec_area 不对");
+        return err(3, "限定调用 vec_area 不对");
 }
 
 test "impl 现在是普通标识符" {
     int impl = 1;
     if (impl != 1)
-        err(1, "impl 不能当普通变量名");
+        return err(1, "impl 不能当普通变量名");
 }
 
 test "T!error 方法通过接收者语法传播错误" {
@@ -202,10 +202,10 @@ test "T!error 方法通过接收者语法传播错误" {
     struct Vec *p = &v;
     __tcc_err_clear();
     if (probe(p) != 30)
-        err(1, "正常路径的返回值不对");
+        return err(1, "正常路径的返回值不对");
     p->x = -1;
     if (probe(p) != -1)
-        err(2, "错误路径没有把错误码带回来");
+        return err(2, "错误路径没有把错误码带回来");
     __tcc_err_clear();
 }
 
@@ -213,9 +213,9 @@ test "方法可以跨翻译单元：本 TU 声明、另一个 TU 定义" {
     struct Vec v = { 3, 4 };
     struct Vec *p = &v;
     if (p->vec_scale(10) != 70)
-        err(1, "另一个 TU 的 vec_scale 不对");
+        return err(1, "另一个 TU 的 vec_scale 不对");
     if (p->tu_scale(2) != 14)
-        err(2, "另一个 TU 的方法里调用本 TU 的方法不对");
+        return err(2, "另一个 TU 的方法里调用本 TU 的方法不对");
     if (vec_scale(p, 1) != 7)
-        err(3, "跨 TU 的普通调用形式不对");
+        return err(3, "跨 TU 的普通调用形式不对");
 }

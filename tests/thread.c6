@@ -49,7 +49,7 @@ test "spawn 立刻返回：线程等 gate 打开后才继续" {
     gate = 1;                       /* 能走到这里就说明 spawn 没有阻塞 */
     (void)wait_nonzero(&seen);
     if (seen != 7)
-        err(1, "线程没有并发跑起来");
+        return err(1, "线程没有并发跑起来");
     __c6_th_join_all();
 }
 
@@ -71,7 +71,7 @@ test "参数在 spawn 处求值，之后改局部不影响线程" {
     v = 99;
     __c6_th_join_all();
     if (copied != 5)
-        err(1, "线程看到的不是 spawn 处的值");
+        return err(1, "线程看到的不是 spawn 处的值");
 }
 
 static int calls = 0;
@@ -87,7 +87,7 @@ test "参数里的副作用只发生一次" {
     spawn take_int(side());
     __c6_th_join_all();
     if (calls != 1 || copied != 1)
-        err(1, "参数表达式求值次数不对");
+        return err(1, "参数表达式求值次数不对");
 }
 
 /* ---- 3. 各种形状的参数 ---- */
@@ -113,7 +113,7 @@ test "结构体、指针、整数一起按值传" {
     v.a = 100;                      /* 线程已经拿到副本 */
     __c6_th_join_all();
     if (big_sum != 1 + 2 + 3 + 4 + 5 + 3 + 10)
-        err(1, "结构体参数没有按值复制");
+        return err(1, "结构体参数没有按值复制");
 }
 
 static volatile int noarg = 0;
@@ -129,7 +129,7 @@ test "无参函数也能 spawn" {
     spawn no_args();
     __c6_th_join_all();
     if (noarg != 1)
-        err(1, "无参线程没有跑");
+        return err(1, "无参线程没有跑");
 }
 
 static volatile int voided = 0;
@@ -144,7 +144,7 @@ test "返回 void 的函数也能 spawn" {
     spawn void_fn(3);
     __c6_th_join_all();
     if (voided != 3)
-        err(1, "void 函数的线程没有跑");
+        return err(1, "void 函数的线程没有跑");
 }
 
 /* ---- 4. 线程自己的 defer 和错误槽 ---- */
@@ -162,7 +162,7 @@ test "线程里的 defer 在线程退出时执行" {
     spawn thread_defer(9);
     __c6_th_join_all();
     if (dflag != 9)
-        err(1, "线程的 defer 没有执行");
+        return err(1, "线程的 defer 没有执行");
 }
 
 static volatile int ea = 0, eb = 0;
@@ -190,7 +190,7 @@ test "两个线程的错误槽互不干扰" {
     spawn fail_in(2);
     __c6_th_join_all();
     if (ea != 1 || eb != 2)
-        err(1, "线程之间的错误槽串了");
+        return err(1, "线程之间的错误槽串了");
 }
 
 /* ---- 5. 线程里的 async 协程 ---- */
@@ -217,7 +217,7 @@ test "线程里可以跑 async 协程" {
     spawn thread_co(21);
     __c6_th_join_all();
     if (co_val != 21)
-        err(1, "线程里的协程没有跑到");
+        return err(1, "线程里的协程没有跑到");
 }
 
 /* ---- 6. 线程里再 spawn ---- */
@@ -241,7 +241,7 @@ test "线程里再 spawn：外层退出时等内层" {
     spawn outer_fn();
     __c6_th_join_all();
     if (nested != 11)
-        err(1, "嵌套出去的线程没有被等完");
+        return err(1, "嵌套出去的线程没有被等完");
 }
 
 /* ---- 7. 一批线程 ---- */
@@ -266,7 +266,7 @@ test "16 个 spawn 并行跑完" {
         if (slots[i] != 100 + i)
             bad++;
     if (bad)
-        err(1, "有线程没有跑完");
+        return err(1, "有线程没有跑完");
 }
 
 /* ---- 8. 跨翻译单元 ---- */
@@ -275,7 +275,7 @@ test "spawn 可以调用别的翻译单元里的函数" {
     spawn tu_add(2, 3);
     __c6_th_join_all();
     if (tu_last_sum() != 5)
-        err(1, "跨 TU 的 spawn 结果不对");
+        return err(1, "跨 TU 的 spawn 结果不对");
 }
 
 /* ---- 9. 软关键字：普通位置还是标识符 ---- */
@@ -297,20 +297,20 @@ test "spawn/co/task 在标识符位置仍然是标识符" {
     spawn = spawn + 1;              /* 赋值，不是语句关键字 */
     x = spawn;
     if (x != 2)
-        err(1, "变量 spawn");
+        return err(1, "变量 spawn");
     if (task != 2)
-        err(2, "变量 task");
+        return err(2, "变量 task");
     if (co_typed != 3)
-        err(3, "typedef co");
+        return err(3, "typedef co");
     if (spawn_plus(5) != 6)
-        err(4, "函数名里带 spawn");
+        return err(4, "函数名里带 spawn");
     {
         co local = 4;               /* typedef 名做类型 */
         if (local != 4)
-            err(5, "局部 co");
+            return err(5, "局部 co");
     }
     goto done;                      /* 标签也不受影响 */
-    err(6, "goto 没跳");
+    return err(6, "goto 没跳");
 done:
     (void)0;
 }
@@ -320,32 +320,32 @@ test "软关键字和真语句按形状区分" {
 
     y = spawn + 1;                  /* 'spawn' 后面是 '='：表达式 */
     if (y != 3)
-        err(1, "spawn 做右值");
+        return err(1, "spawn 做右值");
     {
         int spawn = 40;             /* 局部变量名 */
         spawn = spawn + 2;
         if (spawn != 42)
-            err(2, "局部变量 spawn");
+            return err(2, "局部变量 spawn");
     }
     {
         int task = 3;
         task = task * 2;
         if (task != 6)
-            err(3, "局部变量 task");
+            return err(3, "局部变量 task");
     }
 }
 
 test "旧关键字名 go 仍然只是标识符" {
     go = go + 1;                    /* 赋值：后面不是标识符 */
     if (go != 5)
-        err(1, "变量 go");
+        return err(1, "变量 go");
     goto go;                        /* 标号也不受影响 */
-    err(2, "goto go 没跳");
+    return err(2, "goto go 没跳");
 go:
     {
         int go = 40;                /* 局部变量，遮蔽全局的同名变量 */
         go = go + 2;
         if (go != 42)
-            err(3, "局部变量 go");
+            return err(3, "局部变量 go");
     }
 }

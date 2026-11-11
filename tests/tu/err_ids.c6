@@ -1,0 +1,31 @@
+/* tests/err_ids.c6 的第二个翻译单元：一个模块。
+ *
+ * 模块里的 `enum Error` 成员不是裸数字，而是落在这个模块自己的号段里
+ * （id = area<<27 | slot<<12 | code，见 docs/grammar.md §8.1）。号段由模块名
+ * 决定：没有写进 errbase.def 时是模块名的哈希，写进去了就是表里的号。
+ * 所以这里只断言号段的结构，不断言具体数字。
+ */
+module tu.err_ids;
+
+enum Error {
+    OK   = 0,
+    A    = 1,
+    B    = 2,
+    LAST = 4095,        /* 成员的上限 */
+};
+
+int!error fail_a(void)
+{
+    return err(A, "a");
+}
+
+int!error fail_last(void)
+{
+    return err(LAST, "last");
+}
+
+/* 模块内部看到的就是带号段的真实值 */
+unsigned id_a(void)    { return (unsigned)A; }
+unsigned id_b(void)    { return (unsigned)B; }
+unsigned id_last(void) { return (unsigned)LAST; }
+unsigned id_ok(void)   { return (unsigned)OK; }

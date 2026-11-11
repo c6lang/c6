@@ -57,7 +57,7 @@ int main(void)
     };
     closure int!error(int) e = int!error (int x) {
         if (x < 0)
-            err(9, "negative");
+            return err(9, "negative");
         return x + base;
     };
     @Node p = new Node;

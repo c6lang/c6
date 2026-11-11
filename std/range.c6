@@ -100,22 +100,22 @@ test "左闭右开" {
         n++;
     }
     if (n != 5 || sum != 10)
-        err(1, "range(0,5) 应是 0..4");
+        return err(1, "range(0,5) 应是 0..4");
     if (p->count() != 5)
-        err(2, "count 不对");
+        return err(2, "count 不对");
     {
         Range e = range(3, 3);
         Range *pe = &e;
 
         if (pe->count() != 0)
-            err(3, "空区间 count 应为 0");
+            return err(3, "空区间 count 应为 0");
     }
     {
         Range e = range(5, 2);
         Range *pe = &e;
 
         if (pe->count() != 0 || pe->has())
-            err(4, "反向区间应是空的");
+            return err(4, "反向区间应是空的");
     }
 }
 
@@ -127,7 +127,7 @@ test "负区间" {
         n++;
     }
     if (n != 5 || sum != -5)
-        err(5, "-3..1 的结果不对");
+        return err(5, "-3..1 的结果不对");
 }
 
 test "带步长" {
@@ -138,7 +138,7 @@ test "带步长" {
         n++;
     }
     if (n != 4 || sum != 18)       /* 0 + 3 + 6 + 9 */
-        err(6, "步长 3 的结果不对");
+        return err(6, "步长 3 的结果不对");
 
     sum = 0;
     n = 0;
@@ -147,7 +147,7 @@ test "带步长" {
         n++;
     }
     if (n != 3 || sum != 9)        /* 5 + 3 + 1 */
-        err(7, "负步长的结果不对");
+        return err(7, "负步长的结果不对");
 
     /* 步长 0 当作 1 */
     sum = 0;
@@ -155,7 +155,7 @@ test "带步长" {
         sum += i;
     }
     if (sum != 3)
-        err(8, "步长 0 应退化为 1");
+        return err(8, "步长 0 应退化为 1");
 }
 
 test "闭区间" {
@@ -166,7 +166,7 @@ test "闭区间" {
         sum += i;
     }
     if (n != 4 || sum != 10)
-        err(9, "range_incl(1,4) 应是 1..4");
+        return err(9, "range_incl(1,4) 应是 1..4");
 }
 
 test "Range 是值，可以手工推进" {
@@ -174,11 +174,11 @@ test "Range 是值，可以手工推进" {
     Range *p = &r;
 
     if (!p->has())
-        err(10, "刚开始应该有元素");
+        return err(10, "刚开始应该有元素");
     if (p->next() != 0 || p->next() != 1 || p->next() != 2)
-        err(11, "手工推进的顺序不对");
+        return err(11, "手工推进的顺序不对");
     if (p->has())
-        err(12, "走完以后不该再有元素");
+        return err(12, "走完以后不该再有元素");
 }
 
 test "嵌套 foreach" {
@@ -190,5 +190,5 @@ test "嵌套 foreach" {
         }
     }
     if (pairs != 9)
-        err(13, "嵌套遍历应得 9 对");
+        return err(13, "嵌套遍历应得 9 对");
 }

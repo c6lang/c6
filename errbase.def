@@ -1,0 +1,29 @@
+# c6 错误码号段表（errbase.def）
+#
+# 一个模块的 `enum Error` 的成员就落在它自己的号段里：
+#
+#     id = (area << 27) | (slot << 12) | code
+#
+#   area  0 = 应用（用户模块）  1 = std（内置在编译器里）  2..7 保留
+#   slot  0              不属于任何模块的文件（main 所在的 TU、tests）
+#         0x0001..0x5FFF 自动池：1 + fnv1a32(模块名) % 0x5FFF
+#         0x6000..0x60FF std 内置池（编译器里的常量表，别写进这个文件）
+#         0x6100..0x7FFF 钉号池：就是这个文件里的条目
+#   code  0 = 成功，1..0xFFF 是模块内的错误码
+#
+# 只有要钉住的模块才写在这里；没列出来的模块按模块名哈希自动拿号，号是
+# 名字的纯函数，加模块、加错误码、改编译顺序都不会让它变。写在这里的号
+# 永远不变。'tcc -emit-errbase' 把当前可见的模块一次全钉住（已有行原样
+# 保留，新模块追加在末尾）。
+#
+# 格式：  <模块名>  <slot>       slot 取 0x6100..0x7FFF
+
+math                     0x6100
+pick.m                   0x6101
+tu.c6mod                 0x6102
+tu.err_code              0x6107
+tu.err_ids               0x6108
+tu.generic_scope         0x6103
+tu.imp                   0x6104
+tu.module                0x6105
+wordcount.text           0x6106

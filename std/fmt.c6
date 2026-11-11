@@ -53,7 +53,7 @@ struct Buf@(int N) {
     int!error add(char c)
     {
         if (n + 1 >= N)
-            err(1, "fmt: buffer full");
+            return err(1, "fmt: buffer full");
         data[n] = c;
         n++;
         data[n] = 0;
@@ -65,7 +65,7 @@ struct Buf@(int N) {
         int i = 0;
 
         if (s.len > N - 1 - n)
-            err(2, "fmt: buffer full");
+            return err(2, "fmt: buffer full");
         for (i = 0; i < s.len; i++)
             data[n + i] = s[i];
         n += s.len;
@@ -84,7 +84,7 @@ struct Buf@(int N) {
             v /= 10u;
         } while (v != 0u);
         if (k > N - 1 - n)
-            err(3, "fmt: buffer full");
+            return err(3, "fmt: buffer full");
         for (i = k - 1; i >= 0; i--)
             data[n++] = tmp[i];
         data[n] = 0;
@@ -95,7 +95,7 @@ struct Buf@(int N) {
     {
         if (v < 0) {
             if (N - 1 - n < 1)
-                err(4, "fmt: buffer full");
+                return err(4, "fmt: buffer full");
             data[n++] = '-';
             /* 取反要在无符号域里做，INT_MIN 才有定义 */
             try write_uint((u32)0 - (u32)v);   /* 原样转发，别 return e.id */
@@ -127,7 +127,7 @@ struct Buf@(int N) {
         if (k > width)
             width = k;
         if (width > N - 1 - n)
-            err(5, "fmt: buffer full");
+            return err(5, "fmt: buffer full");
         for (i = width - k; i > 0; i--)
             data[n++] = pad;
         for (i = k - 1; i >= 0; i--)
@@ -143,14 +143,14 @@ test "add / write / cstr" {
     Buf@(16) b = { { 0 }, 0 };
     Buf@(16) *p = &b;
 
-    p->add('h') catch e { err(1, "add 失败"); };
-    p->write((char[:]){ (char *)"ello", 4 }) catch e { err(2, "write 失败"); };
+    p->add('h') catch e { return err(1, "add 失败"); };
+    p->write((char[:]){ (char *)"ello", 4 }) catch e { return err(2, "write 失败"); };
     if (p->count() != 5)
-        err(3, "count 不是 5");
+        return err(3, "count 不是 5");
     if (p->cap() != 16 || p->room() != 10)
-        err(4, "cap/room 不对");
+        return err(4, "cap/room 不对");
     if (strcmp(p->cstr(), "hello") != 0)
-        err(5, "cstr 内容不对");
+        return err(5, "cstr 内容不对");
 }
 
 /* 注意别在文件作用域写「参数带实例类型」的辅助函数：那会让导入这个模块
@@ -161,20 +161,20 @@ test "写满时返回错误，且不写半截" {
     Buf@(4) *p = &b;
     int bad = 0;
 
-    p->write((char[:]){ (char *)"abc", 3 }) catch e { err(6, "write 失败"); };
+    p->write((char[:]){ (char *)"abc", 3 }) catch e { return err(6, "write 失败"); };
     if (p->room() != 0)
-        err(7, "room 应为 0");
+        return err(7, "room 应为 0");
     p->write((char[:]){ (char *)"x", 1 }) catch e {
         bad = e.id;
         goto checked;
     };
 checked:
     if (bad != 2)
-        err(8, "写满应报 id 2");
+        return err(8, "写满应报 id 2");
     if (p->count() != 3)
-        err(9, "失败时改动了长度");
+        return err(9, "失败时改动了长度");
     if (strcmp(p->cstr(), "abc") != 0)
-        err(10, "失败时改动了内容");
+        return err(10, "失败时改动了内容");
 }
 
 test "十进制整数，含 INT_MIN" {
@@ -182,42 +182,42 @@ test "十进制整数，含 INT_MIN" {
     Buf@(32) b = { { 0 }, 0 };
     Buf@(32) *p = &b;
 
-    p->write_int(0) catch e { err(11, "0 失败"); };
-    p->add(' ') catch e { err(12, "空格失败"); };
-    p->write_int(-42) catch e { err(13, "-42 失败"); };
-    p->add(' ') catch e { err(14, "空格失败"); };
-    p->write_int(2147483647) catch e { err(15, "INT_MAX 失败"); };
-    p->add(' ') catch e { err(16, "空格失败"); };
+    p->write_int(0) catch e { return err(11, "0 失败"); };
+    p->add(' ') catch e { return err(12, "空格失败"); };
+    p->write_int(-42) catch e { return err(13, "-42 失败"); };
+    p->add(' ') catch e { return err(14, "空格失败"); };
+    p->write_int(2147483647) catch e { return err(15, "INT_MAX 失败"); };
+    p->add(' ') catch e { return err(16, "空格失败"); };
     /* INT_MIN：取反必须在无符号域里做 */
-    p->write_int(-2147483647 - 1) catch e { err(17, "INT_MIN 失败"); };
+    p->write_int(-2147483647 - 1) catch e { return err(17, "INT_MIN 失败"); };
     if (strcmp(p->cstr(), "0 -42 2147483647 -2147483648") != 0)
-        err(18, "整数格式化结果不对");
+        return err(18, "整数格式化结果不对");
 }
 
 test "右对齐补位" {
     Buf@(16) b = { { 0 }, 0 };
     Buf@(16) *p = &b;
 
-    p->write_pad(42, 5, ' ') catch e { err(19, "空格补位失败"); };
-    p->add('|') catch e { err(20, "分隔失败"); };
-    p->write_pad(7, 3, '0') catch e { err(21, "零补位失败"); };
-    p->add('|') catch e { err(22, "分隔失败"); };
-    p->write_pad(-5, 4, ' ') catch e { err(23, "负数补位失败"); };
+    p->write_pad(42, 5, ' ') catch e { return err(19, "空格补位失败"); };
+    p->add('|') catch e { return err(20, "分隔失败"); };
+    p->write_pad(7, 3, '0') catch e { return err(21, "零补位失败"); };
+    p->add('|') catch e { return err(22, "分隔失败"); };
+    p->write_pad(-5, 4, ' ') catch e { return err(23, "负数补位失败"); };
     if (strcmp(p->cstr(), "   42|007|  -5") != 0)
-        err(24, "补位结果不对");
+        return err(24, "补位结果不对");
 }
 
 test "clear 之后可重复使用" {
     Buf@(8) b = { { 0 }, 0 };
     Buf@(8) *p = &b;
 
-    p->write((char[:]){ (char *)"abcdefg", 7 }) catch e { err(25, "write 失败"); };
+    p->write((char[:]){ (char *)"abcdefg", 7 }) catch e { return err(25, "write 失败"); };
     p->clear();
     if (p->count() != 0 || p->cstr()[0] != 0)
-        err(26, "clear 之后不干净");
-    p->write((char[:]){ (char *)"ok", 2 }) catch e { err(27, "重用失败"); };
+        return err(26, "clear 之后不干净");
+    p->write((char[:]){ (char *)"ok", 2 }) catch e { return err(27, "重用失败"); };
     if (strcmp(p->cstr(), "ok") != 0)
-        err(28, "重用后内容不对");
+        return err(28, "重用后内容不对");
 }
 
 test "Buf 可以按值传递" {
@@ -225,10 +225,10 @@ test "Buf 可以按值传递" {
     Buf@(8) *p = &b;
     int n = 0;
 
-    p->write((char[:]){ (char *)"hi", 2 }) catch e { err(29, "write 失败"); };
+    p->write((char[:]){ (char *)"hi", 2 }) catch e { return err(29, "write 失败"); };
     n = p->count();
     if (n != 2)
-        err(30, "count 不对");
+        return err(30, "count 不对");
     if (p->slice().len != 2)
-        err(31, "slice 长度不对");
+        return err(31, "slice 长度不对");
 }

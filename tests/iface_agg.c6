@@ -48,7 +48,7 @@ test "接口方法返回 struct" {
     struct P q = b.mk(10);
 
     if (q.x != 11 || q.y != 12)
-        err(1, "struct 返回值不对");
+        return err(1, "struct 返回值不对");
 }
 
 test "接口方法接收 struct 参数" {
@@ -56,7 +56,7 @@ test "接口方法接收 struct 参数" {
     Box b = p;
 
     if (b.total((struct P){3, 4}) != 10)
-        err(1, "struct 参数没有传进去");
+        return err(1, "struct 参数没有传进去");
 }
 
 test "接口方法返回 12 字节 struct" {
@@ -65,7 +65,7 @@ test "接口方法返回 12 字节 struct" {
     struct Q q = b.big(7);
 
     if (q.a != 1 || q.b != 2 || q.c != 7)
-        err(1, "12 字节 struct 返回值不对");
+        return err(1, "12 字节 struct 返回值不对");
 }
 
 test "接口方法返回元组" {
@@ -74,5 +74,5 @@ test "接口方法返回元组" {
     (int m, int n) = b.pair(3);
 
     if (m != 13 || n != 7)
-        err(1, "元组返回值不对");
+        return err(1, "元组返回值不对");
 }

@@ -52,7 +52,8 @@ set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TCC=${TCC:-$ROOT/tcc/tcc}
 TCCFLAGS=${TCCFLAGS:-}
-BASE="-B $ROOT/tcc -I $ROOT/tests"
+# -I $ROOT 让用例从任何工作目录都能 'import std.*'（模块名就是路径）
+BASE="-B $ROOT/tcc -I $ROOT/tests -I $ROOT"
 BACKEND=${BACKEND:-native}
 C99TCC=${C99TCC:-$ROOT/tcc/tcc}
 C99CC=${C99CC:-gcc}
@@ -137,7 +138,7 @@ build_exe() { # <可执行文件> <源文件>...
     exe=$1
     shift
     if [ "$BACKEND" = c99 ]; then
-        $C99TCC -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
+        $C99TCC -B "$ROOT/tcc" -I "$ROOT/tests" -I "$ROOT" $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c"
     elif [ "$BACKEND" = llvm ]; then
@@ -166,7 +167,7 @@ build_test_exe() { # <可执行文件> <源文件>...
     shift
     if [ "$BACKEND" = c99 ]; then
         # c99 后端里 -test 直接生成带测试入口的 C 源码
-        $C99TCC -test -B "$ROOT/tcc" -I "$ROOT/tests" $TCCFLAGS \
+        $C99TCC -test -B "$ROOT/tcc" -I "$ROOT/tests" -I "$ROOT" $TCCFLAGS \
             -o "$exe.c" "$@" || return 1
         $C99CC $C99FLAGS -o "$exe" "$exe.c" || return 1
         "$exe"
@@ -461,7 +462,8 @@ for src in "$ROOT"/tests/errors/*.c6; do
         fi
 
         if [ "$BACKEND" = c99 ]; then
-            if $C99TCC -B "$ROOT/tcc" $TCCFLAGS $eflags \
+            if $C99TCC -B "$ROOT/tcc" -I "$ROOT/tests" -I "$ROOT" \
+                    $TCCFLAGS $eflags \
                     -D"$frag" -o "$TMP/diag.c" "$src" $extra \
                     2>"$TMP/err" >/dev/null; then
                 # 生成成功不等于有错：没有机器码链接步骤的未解析引用，

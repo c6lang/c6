@@ -837,6 +837,15 @@ typedef struct C6HeaderDecl {
 #define C6_HD_FUNC    4
 #define C6_HD_VAR     5
 
+/* one module's error id block: a module's 'enum Error' members live in its
+   own block of 4096 codes (see c6_err_slot in tccgen.c) */
+typedef struct C6ErrMod {
+    char *name;             /* dotted module name, e.g. "std.err" */
+    int area;               /* 0 = application, 1 = standard library */
+    int slot;               /* the block inside the area */
+    unsigned char pinned;   /* the slot comes from errbase.def */
+} C6ErrMod;
+
 /* c6 managed references (reference-counting GC) ------------------------- */
 
 /* field kinds, must match 'struct __c6_gc_field.kind' in the runtime */
@@ -986,6 +995,15 @@ struct TCCState {
     struct C6HeaderDecl **c6_header_decls;
     int c6_nb_header_decls;
     char *c6_emit_header;
+    /* error id blocks: the modules seen in this run, and the
+       '-errbase-file' / '-no-errbase' / '-emit-errbase' options */
+    struct C6ErrMod **c6_err_mods;
+    int c6_nb_err_mods;
+    char *c6_errbase_file;      /* explicit table, NULL when not given */
+    char *c6_emit_errbase;      /* write the frozen table here, then stop */
+    unsigned char c6_errbase_off;    /* '-no-errbase': never read or write */
+    unsigned char c6_errbase_loaded; /* the table was looked for */
+    unsigned char c6_errbase_found;  /* ... and one was found */
     /* reference-counting GC: struct types with managed fields, and the
        strong edges between them (see docs/gc-design.md) */
     struct C6GcType **c6_gc_types;
@@ -1794,6 +1812,10 @@ ST_FUNC void *section_ptr_add(Section *sec, addr_t size);
 #ifdef C6_EXT
 /* the reference-cycle type graph written by every unit (design §8.2) */
 ST_FUNC void c6_gc_graph_check(TCCState *s1);
+/* error id blocks: report two modules that share a block, and (re)write
+   'errbase.def' */
+ST_FUNC int c6_err_finish(TCCState *s1);
+ST_FUNC int c6_errbase_write(TCCState *s1, const char *path);
 #endif
 ST_FUNC Section *find_section(TCCState *s1, const char *name);
 ST_FUNC void free_section(Section *s);
@@ -1987,6 +2009,8 @@ ST_FUNC void gen_clear_cache(void);
 ST_FUNC void gen_opl(int op);
 ST_FUNC void gen_cvt_sxtw(void);
 ST_FUNC void c99_reset(void);
+ST_FUNC void c99_tu_end(TCCState *s1);
+ST_FUNC void c99_sym_remap(TCCState *s1, int *tr, int first, int nb);
 ST_FUNC int c99_output_file(TCCState *s1, const char *filename);
 #endif
 

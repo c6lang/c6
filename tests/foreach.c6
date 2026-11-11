@@ -58,14 +58,14 @@ test "数组：下标从 0 开始，元素按顺序" {
     int n = 0, total = 0;
     foreach ((size_t i, int v) = a) {
         if ((int)i != n)
-            err(1, "下标不连续");
+            return err(1, "下标不连续");
         total += v;
         n++;
     }
     if (n != 4)
-        err(2, "迭代次数不对");
+        return err(2, "迭代次数不对");
     if (total != 100)
-        err(3, "元素之和不对");
+        return err(3, "元素之和不对");
 }
 
 test "值绑定是副本，写它不改数组" {
@@ -75,7 +75,7 @@ test "值绑定是副本，写它不改数组" {
         v = 99;
     }
     if (a[0] != 1 || a[1] != 2 || a[2] != 3)
-        err(1, "写值绑定改到了数组");
+        return err(1, "写值绑定改到了数组");
 }
 
 test "元素是结构体时也是副本" {
@@ -83,23 +83,23 @@ test "元素是结构体时也是副本" {
     int n = 0;
     foreach ((size_t i, struct Pair p) = ps) {
         if ((int)i != n)
-            err(1, "下标不对");
+            return err(1, "下标不对");
         if (p.b != ps[n].b)
-            err(2, "副本的初值不对");
+            return err(2, "副本的初值不对");
         p.a = 0;
         n++;
     }
     if (ps[0].a != 1 || ps[1].a != 3)
-        err(3, "写副本改到了数组");
+        return err(3, "写副本改到了数组");
 }
 
 test "切片参数与复合字面量切片" {
     int a[5] = { 10, 20, 30, 40, 50 };
     int[:] s = a[1:4];
     if (sum(s) != 90)
-        err(1, "切片求和不对");
+        return err(1, "切片求和不对");
     if (sum((int[:]){ a + 3, 2 }) != 90)
-        err(2, "复合字面量切片求和不对");
+        return err(2, "复合字面量切片求和不对");
 }
 
 test "字符串字面量是 char 数组，含结尾 NUL" {
@@ -107,14 +107,14 @@ test "字符串字面量是 char 数组，含结尾 NUL" {
     int n = 0;
     foreach ((size_t i, char c) = "abc") {
         if ((int)i >= 4)
-            err(1, "下标越界");
+            return err(1, "下标越界");
         buf[(int)i] = c;
         n++;
     }
     if (n != 4)
-        err(2, "字符串字面量是 char[4]");
+        return err(2, "字符串字面量是 char[4]");
     if (memcmp(buf, "abc", 4) != 0)
-        err(3, "字符内容不对");
+        return err(3, "字符内容不对");
 }
 
 test "区间 0:n 是半开区间" {
@@ -124,13 +124,13 @@ test "区间 0:n 是半开区间" {
         count++;
     }
     if (count != 3 || total != 3)
-        err(1, "0:3 应该是 0、1、2");
+        return err(1, "0:3 应该是 0、1、2");
     total = 0;
     foreach (int i = 2:5) {
         total += i;
     }
     if (total != 2 + 3 + 4)
-        err(2, "2:5 不对");
+        return err(2, "2:5 不对");
 }
 
 test "区间是空集时一次都不进" {
@@ -142,7 +142,7 @@ test "区间是空集时一次都不进" {
         n += i;
     }
     if (n != 0)
-        err(1, "空区间进入了循环体");
+        return err(1, "空区间进入了循环体");
 }
 
 test "区间支持负数和 long 界" {
@@ -153,7 +153,7 @@ test "区间支持负数和 long 界" {
         count++;
     }
     if (count != 3 || total != -6)
-        err(1, "-3:0 应该是 -3、-2、-1");
+        return err(1, "-3:0 应该是 -3、-2、-1");
     count = 0;
     total = 0;
     foreach (long i = lo:hi) {
@@ -161,7 +161,7 @@ test "区间支持负数和 long 界" {
         count++;
     }
     if (count != 3 || total != -3)
-        err(2, "long 区间不对");
+        return err(2, "long 区间不对");
 }
 
 test "可迭代值只求值一次（切片是快照）" {
@@ -174,9 +174,9 @@ test "可迭代值只求值一次（切片是快照）" {
         total += v;
     }
     if (calls != 1)
-        err(1, "切片表达式被求值了多次");
+        return err(1, "切片表达式被求值了多次");
     if (total != 30)
-        err(2, "求和不对");
+        return err(2, "求和不对");
 }
 
 test "'_' 丢弃绑定" {
@@ -192,9 +192,9 @@ test "'_' 丢弃绑定" {
         n++;
     }
     if (total != 6)
-        err(1, "丢弃下标后的求和不对");
+        return err(1, "丢弃下标后的求和不对");
     if (n != 3 + 2)
-        err(2, "丢弃值/丢弃两者的计数不对");
+        return err(2, "丢弃值/丢弃两者的计数不对");
 }
 
 test "break、continue、defer 与 for 一致" {
@@ -211,7 +211,7 @@ test "break、continue、defer 与 for 一致" {
         seen++;
     }
     if (total != 10 + 30 || seen != 2)
-        err(1, "break/continue 不对");
+        return err(1, "break/continue 不对");
 
     total = 0;
     foreach ((size_t i, int v) = a) {
@@ -220,7 +220,7 @@ test "break、continue、defer 与 for 一致" {
         total += v;
     }
     if (total != 1 + 3 + 4 + 5)
-        err(2, "按下标 continue 后的求和不对");
+        return err(2, "按下标 continue 后的求和不对");
 
     total = 0;
     foreach ((size_t i, int v) = a) {
@@ -232,7 +232,7 @@ test "break、continue、defer 与 for 一致" {
             break;
     }
     if (total != 306)
-        err(3, "defer 在 continue/break 时没有按 for 的方式执行");
+        return err(3, "defer 在 continue/break 时没有按 for 的方式执行");
 }
 
 test "嵌套 foreach，break 只跳出一层" {
@@ -248,7 +248,7 @@ test "嵌套 foreach，break 只跳出一层" {
         }
     }
     if (total != (1 + 2) * 10)
-        err(1, "内层 break 跳错了层");
+        return err(1, "内层 break 跳错了层");
 }
 
 test "绑定名遮蔽外层同名变量，出了循环不泄漏" {
@@ -256,10 +256,10 @@ test "绑定名遮蔽外层同名变量，出了循环不泄漏" {
     int a[2] = { 1, 2 };
     foreach ((size_t i, int v) = a) {
         if (v != i + 1)
-            err(1, "循环里 v 不是元素");
+            return err(1, "循环里 v 不是元素");
     }
     if (v != 7 || i != 9)
-        err(2, "绑定泄漏到了外层");
+        return err(2, "绑定泄漏到了外层");
 }
 
 test "下标是 size_t，写它不改迭代（绑定是副本）" {
@@ -267,21 +267,21 @@ test "下标是 size_t，写它不改迭代（绑定是副本）" {
     int total = 0;
     foreach ((size_t i, int v) = a) {
         if ((int)sizeof(i) != (int)sizeof(void *))
-            err(1, "下标不是 size_t");
+            return err(1, "下标不是 size_t");
         if (i == 1)
             i = 3;
         total += v;
     }
     if (total != 1 + 2 + 3 + 4 + 5)
-        err(2, "写下标改变了迭代");
+        return err(2, "写下标改变了迭代");
 }
 
 test "foreach 的隐藏槽跨 await 挂起仍然有效" {
     int a[4] = { 1, 2, 3, 4 };
     struct sum_with_await_task *t = sum_with_await(a);
     if (__c6_co_wait(t) != 0)
-        err(1, "驱动失败");
+        return err(1, "驱动失败");
     if (t->val != 10)
-        err(2, "挂起恢复后的求和不对");
+        return err(2, "挂起恢复后的求和不对");
     __c6_co_destroy(t);
 }

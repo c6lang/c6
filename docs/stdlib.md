@@ -17,7 +17,7 @@
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
 | `std/types.c6` | `std.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`/`Bool` 两个枚举 |
-| `std/err.c6` | `std.err` | 错误码 `Code`（`OK`…`BUSY`，16 个）与 `msg()`/`msg_of()`/`is_ok()` |
+| `std/err.c6` | `std.err` | 错误码 `enum Error`（`OK`…`BUSY`，16 个）与 `msg()`/`msg_of()`/`is_ok()`；号段固定在 `0x6000` |
 | `std/vec.c6` | `std.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T` |
 | `std/span.c6` | `std.span` | 别人内存上的窗口 `Span@T`（纯值，零拷贝） |
 | `std/map.c6` | `std.map` | 开放寻址哈希表 `Map@(K, V)`、`Entry@(K, V)`、`Iter@(K, V)` |
@@ -61,7 +61,7 @@ std/vec.c6       5 test(s), 0 failure(s)
 **4. 名字跟语言一致。**
 容器方法一律 `count()`（不叫 `len()`：字段已经叫 `len`/`n` 的不能同名）、
 `is_empty()`、`at()`/`get()`/`set()`、`push()`/`pop()`。错误码用
-`enum Code`，名字是 `INVAL`/`RANGE`/`NOMEM` 这种 C 风格的短名。
+`enum Error`，名字是 `INVAL`/`RANGE`/`NOMEM` 这种 C 风格的短名。
 
 ## 用法
 
@@ -78,7 +78,16 @@ if (!is_ok(code))
     printf("错误：%s\n", msg_of(code));       /* 或 msg(code) */
 ```
 
-`std.err.Code` 是普通枚举，模块外写 `std.err.NOMEM`，模块内写 `NOMEM`。
+`std.err.Error` 是普通枚举，模块外写 `std.err.NOMEM`，模块内写 `NOMEM`。
+std 模块的号段内置在编译器里（`std.err` = `0x6000`），所以 `std.err.NOMEM`
+的真实值是 `0x0E000003`：
+
+```
+id = (area << 27) | (slot << 12) | code     // area=1(std), slot=0x6000, code=3
+```
+
+这个号在**任何**程序里都一样，不需要 `errbase.def`，也永远不参与自动池的
+哈希与撞号检查；std 模块的号段表见 [grammar.md](grammar.md) §8.1。
 
 ### `Vect@T`：托管容器
 
@@ -160,7 +169,7 @@ p->starts_with(S("he"))  p->ends_with(S("lo"))
 Str head = p->take(2);  Str tail = p->drop(2);  Str mid = p->sub(1, 3);
 Str trimmed = p->trim();
 int v = 0;
-p->to_int(&v) catch e { err(e.id, e.msg); };   /* 失败给 1..4 的码 */
+p->to_int(&v) catch e { return err(e.id, e.msg); };   /* 失败给 1..4 的码 */
 p->copy_to(buf, sizeof buf);                   /* 空间不够返回 -1，不写半截 */
 ```
 
@@ -230,7 +239,7 @@ make std-demo
 * `S("...")` 不能直接当初始化表达式，写成 `Str s = { S("hi") };`。
 * 在 `T!error` 函数里转发错误用 `try f(...)`；`catch e { return e.id; }`
   会把 `e.id` 当成**成功**的返回值（`return` 只填值，不填错误槽）。
-* `catch` 体必须以 `return`/`err()`/`goto` 结束；想在普通函数里取出错误码，
+* `catch` 体必须以 `return`/`return err()`/`goto` 结束；想在普通函数里取出错误码，
   就 `catch e { id = e.id; goto done; }`。
 * `foreach` 体必须是 `{ }`；`has()`/`next()` 必须带函数体。
 * 泛型实参不要用块作用域里的 `struct` tag，把类型放到文件作用域。

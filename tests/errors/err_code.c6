@@ -1,0 +1,26 @@
+/* c6 编译期诊断：模块里 enum Error 的成员必须落在 0..4095（C125）
+ *
+ * 成员值会加在模块号段的低 12 位上，所以超出 12 位的成员会撞进邻居的号段，
+ * 报错而不是截断。0 仍然是「没有错误」，不参与加基址。
+ *
+ * 现场在第二个翻译单元 tests/tu/err_code.c6（一个模块）里。
+ */
+// EXPECT too_big: error: error code of 'TOO_BIG' is not in 0..4095
+// EXPECT negative: error: error code of 'NEGATIVE' is not in 0..4095
+
+#include <stdio.h>
+
+import tu.err_code;
+
+int main(void)
+{
+#if defined too_big || defined negative
+    return 0;                     /* 编译期就该报错，走不到这里 */
+#else
+    int v = tu.err_code.fail_a() catch e {
+        return e.id == (int)tu.err_code.A ? 0 : 1;
+    };
+    (void)v;
+    return 1;
+#endif
+}

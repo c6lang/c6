@@ -75,13 +75,13 @@ async int waiter(void)                  /* 碰 c6_io：裸机上没有 select */
 
 async int!error boom(void)
 {
-    err(7, "co boom");
+    return err(7, "co boom");
 }
 
 int!error half(int n)
 {
     if (n < 0)
-        err(9, f"negative {n}");
+        return err(9, f"negative {n}");
     return n / 2;
 }
 
