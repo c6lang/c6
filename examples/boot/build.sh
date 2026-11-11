@@ -52,13 +52,13 @@ if [ -n "$ONE_TU" ]; then
         *.plain.c)
             obj="$build/payload_$n.o"
             n=$((n + 1))
-            ./tcc/tcc -B tcc $EXTRA_CFLAGS -c -o "$obj" "$src"
+            ./tcc/c6 -B tcc $EXTRA_CFLAGS -c -o "$obj" "$src"
             plainobj="$plainobj $obj"
             ;;
         *) c6src="$c6src $src" ;;
         esac
     done
-    ./tcc/tcc -B tcc -static -nostdlib -o "$build/payload.elf" \
+    ./tcc/c6 -B tcc -static -nostdlib -o "$build/payload.elf" \
         $c6src $plainobj tcc/libtcc1.a "$APOBJ"
     n=-1
 fi
@@ -68,11 +68,11 @@ for src in $payload_src; do
     n=$((n + 1))
     # 语言由后缀决定：.c6 自己开启扩展，.c / .plain.c 是普通 C（要 .bss，
     # 也不受 c6 的"每个变量都要初始化器"的规矩约束），所以这里没有开关。
-    ./tcc/tcc -B tcc $EXTRA_CFLAGS -c -o "$obj" "$src"
+    ./tcc/c6 -B tcc $EXTRA_CFLAGS -c -o "$obj" "$src"
     objs="$objs $obj"
 done
 [ "$n" -lt 0 ] || \
-    ./tcc/tcc -B tcc -static -nostdlib -o "$build/payload.elf" $objs \
+    ./tcc/c6 -B tcc -static -nostdlib -o "$build/payload.elf" $objs \
         tcc/libtcc1.a "$APOBJ"
 info=$(python3 examples/boot/flat.py "$build/payload.elf" "$build/payload.bin" 0x400000)
 # shellcheck disable=SC2086

@@ -58,7 +58,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 
 # 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
-./tcc/tcc -B tcc -run hello.c6      # c6 代码放在 .c6 文件里，后缀就是开关
+./tcc/c6 -B tcc -run hello.c6      # c6 代码放在 .c6 文件里，后缀就是开关
 ```
 
 `make build` / `make selftest` / `make test-all` 都会先跑 `bootstrap`：`tcc/`
@@ -114,7 +114,7 @@ int main(void)
 完整可运行示例见 [examples/err_demo.c6](examples/err_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/err_demo.c6
+./tcc/c6 -B tcc -run examples/err_demo.c6
 ```
 
 `err` 速查：
@@ -300,7 +300,7 @@ int handle(const char *s)
 完整可运行示例见 [examples/try_demo.c6](examples/try_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/try_demo.c6
+./tcc/c6 -B tcc -run examples/try_demo.c6
 ```
 
 语法规范（EBNF）见 [docs/grammar.md](docs/grammar.md)。
@@ -315,8 +315,8 @@ test "add works" {
 ```
 
 ```sh
-./tcc/tcc -B tcc -test tests/slice.c6               # 运行全部 test 块
-./tcc/tcc -B tcc -test -test-filter=切片 tests/slice.c6
+./tcc/c6 -B tcc -test tests/slice.c6               # 运行全部 test 块
+./tcc/c6 -B tcc -test -test-filter=切片 tests/slice.c6
 ```
 
 运行器输出 `PASS:` / `FAIL:` 行与 `N test(s), M failure(s)`，全部通过时退出码为 0。
@@ -501,7 +501,7 @@ int main(void)
 完整可运行示例见 [examples/typename_demo.c6](examples/typename_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/typename_demo.c6
+./tcc/c6 -B tcc -run examples/typename_demo.c6
 ```
 
 ### 变量必须初始化
@@ -576,8 +576,8 @@ TCC 自己的源码也遵守这条规则（`make c6selfcheck` 把 `tcc.c` 拷成
 
 ```sh
 cp tcc/tcc.c build/tcc-c6.c6 && \
-    ./tcc/tcc -B tcc -I tcc -DC6_EXT -c build/tcc-c6.c6 -o tcc.o  # 原生目标文件
-./tcc/tcc -B tcc -I tcc -DC6_EXT -o tcc.c.c build/tcc-c6.c6       # C99 后端的输出
+    ./tcc/c6 -B tcc -I tcc -DC6_EXT -c build/tcc-c6.c6 -o tcc.o  # 原生目标文件
+./tcc/c6 -B tcc -I tcc -DC6_EXT -o tcc.c.c build/tcc-c6.c6       # C99 后端的输出
 ```
 
 为此 `tcc/tcc.h` 里那批编译器全局量（`tok`、`file`、`int_type`……）改成了
@@ -669,7 +669,7 @@ char[:] m = "hello";           /* 字符串字面量也是切片（len 含结尾
 完整可运行示例见 [examples/slice_demo.c6](examples/slice_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/slice_demo.c6
+./tcc/c6 -B tcc -run examples/slice_demo.c6
 ```
 
 跨 TU 时两边各自写 `T[:]` 即可（布局固定），不需要额外声明。
@@ -752,8 +752,8 @@ foreach (int v = it) { ... }    /* 迭代器：it 的类型提供 has(T *)/next(
 [examples/foreach_iter_demo.c6](examples/foreach_iter_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/foreach_demo.c6
-./tcc/tcc -B tcc -run examples/foreach_iter_demo.c6
+./tcc/c6 -B tcc -run examples/foreach_demo.c6
+./tcc/c6 -B tcc -run examples/foreach_iter_demo.c6
 ```
 
 ### 元组 `(T1, T2, ...)`
@@ -832,7 +832,7 @@ struct 传递路径，所以和等价的 struct 可以互操作：
 完整可运行示例见 [examples/tuple_demo.c6](examples/tuple_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/tuple_demo.c6
+./tcc/c6 -B tcc -run examples/tuple_demo.c6
 ```
 
 ### 函数字面量 `void(int x) { ... }`
@@ -894,7 +894,7 @@ qsort(v, n, sizeof v[0], int(const void *a, const void *b) {   /* 交给 C */
 V1 的完整可运行示例见 [examples/fn_lit_demo.c6](examples/fn_lit_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/fn_lit_demo.c6
+./tcc/c6 -B tcc -run examples/fn_lit_demo.c6
 ```
 
 #### 捕获式闭包 `closure`（V2）
@@ -1013,7 +1013,7 @@ arm、arm64、riscv64 与 C99 输出后端——都走"帧住在任务里"。）
 （一次 HTTP 请求，传输层用 `pipe()` 代替 socket，离线可跑）：
 
 ```sh
-./tcc/tcc -B tcc -run examples/async_demo.c6
+./tcc/c6 -B tcc -run examples/async_demo.c6
 ```
 
 ### spawn（OS 线程）
@@ -1094,7 +1094,7 @@ int n = (int)h->value();  /* 线程函数的返回值（整数或指针） */
 完整可运行示例见 [examples/thread_demo.c6](examples/thread_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/thread_demo.c6
+./tcc/c6 -B tcc -run examples/thread_demo.c6
 ```
 
 ### 托管引用（引用计数 GC）
@@ -1156,7 +1156,7 @@ void drop(struct File *self) { close(self->fd); }
 `__c6_gc_live()` 自证「全程没有泄漏」（`rc=0` 才算过）：
 
 ```sh
-./tcc/tcc -B tcc -run examples/gc_demo.c6
+./tcc/c6 -B tcc -run examples/gc_demo.c6
 ```
 
 代价与尺寸（x86_64，热缓存，跨 TU 不内联）：`@T` 的一次加/减约 2.2 ns，
@@ -1293,7 +1293,7 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 完整可运行示例见 [examples/fstr_demo.c6](examples/fstr_demo.c6)：
 
 ```sh
-./tcc/tcc -B tcc -run examples/fstr_demo.c6
+./tcc/c6 -B tcc -run examples/fstr_demo.c6
 ```
 
 回归用例见 [tests/fstr.c6](tests/fstr.c6)（`make selftest` 里跑），编译期诊断见
@@ -1342,7 +1342,7 @@ type ptr(type T) { T * }                       /* 原样重放：ptr(int) p → 
 也就是单线程的 freestanding 程序直接可用，程序这边什么都不用提供：
 
 ```sh
-./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_fstr \
+./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
     examples/freestanding_fstr.c6 tcc/libtcc1.a   # 或 make fstest
 ./build/freestanding_fstr
 ```
@@ -1632,8 +1632,8 @@ printf("%s\n", b->cstr());
 `import` 只带来声明，所以模块自己的 `.c6` 文件要一起编进程序：
 
 ```sh
-./tcc/tcc -B tcc -I . -o build/app app.c6 std/vec.c6 std/fmt.c6 std/types.c6
-make stdtest     # 跑 std/ 下全部 test 块（95 个断言）
+./tcc/c6 -B tcc -I . -o build/app app.c6 std/vec.c6 std/fmt.c6 std/types.c6
+make stdtest     # 跑 std/ 下全部 test 块（140 个断言）
 make std-demo    # 编译并运行 examples/wordcount.c6（用到 7 个模块）
 ```
 
@@ -1709,9 +1709,9 @@ tests/run-tests.sh --list           # 列出会跑的文件
 单个文件也可以直接跑：
 
 ```sh
-./tcc/tcc -B tcc -test tests/err.c6
-./tcc/tcc -B tcc -test tests/slice.c6 tests/tu/slice.c6
-./tcc/tcc -B tcc -test -test-filter=切片 tests/slice.c6   # 按描述过滤
+./tcc/c6 -B tcc -test tests/err.c6
+./tcc/c6 -B tcc -test tests/slice.c6 tests/tu/slice.c6
+./tcc/c6 -B tcc -test -test-filter=切片 tests/slice.c6   # 按描述过滤
 ```
 
 输出形如：
@@ -1829,14 +1829,14 @@ TCC 源码及本仓库对它的修改均遵循 **LGPL-2.1**（见 `tcc/COPYING`�
 
 `tcc/c99-gen.c` is a second code-generator back-end: it reuses the complete
 front-end and writes **portable C99 source** instead of machine code.  It is
-built into the normal `tcc/tcc` binary; there is no separate compiler.
+built into the normal `tcc/c6` binary; there is no separate compiler.
 
     make build                               # one tcc, both back-ends
-    tcc/tcc -B tcc -o out.c prog.c           # prog.c -> out.c (.c suffix selects C)
-    tcc/tcc -B tcc -c99 -o out.c prog.c      # same, explicit
+    ./tcc/c6 -B tcc -o out.c prog.c           # prog.c -> out.c (.c suffix selects C)
+    ./tcc/c6 -B tcc -c99 -o out.c prog.c      # same, explicit
     cc -std=c99 -o prog out.c && ./prog      # compile the result with any C compiler
 
-    tcc/tcc -B tcc -c -o out/ a.c b.c        # out/a.c, out/b.c (one .c per TU)
+    ./tcc/c6 -B tcc -c -o out/ a.c b.c        # out/a.c, out/b.c (one .c per TU)
 
     make c99test                             # same cases as selftest, via the C back-end
     make c99tcc-test                         # same, with tcc itself as the host compiler
@@ -1844,7 +1844,7 @@ built into the normal `tcc/tcc` binary; there is no separate compiler.
 `make c99test` runs the same corpus as `make selftest`: every `tests/*.c6`,
 `tests/c6ext/*.c6`, `tests/errors/*.c6`, `tests/exit/*.c6`, `tests/abi/*.c6` and
 `tests/c99/*.c6`
-case goes through the same `tcc/tcc` (asked for C source with `-o ...c`) and
+case goes through the same `tcc/c6` (asked for C source with `-o ...c`) and
 then through
 `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread`, with the same
 exit-code, output and diagnostic assertions.  Diagnostics that only differ
@@ -1852,7 +1852,7 @@ because they are produced by the C-output back-end are declared with
 `// EXPECT-C99` in the `tests/errors/*.c6` file; everything else is shared.
 `C99CC=clang make c99test` uses another host compiler, and
 `BACKEND=c99 tests/run-tests.sh` runs the same thing directly.
-`make c99tcc-test` is the same corpus with `C99CC=tcc/tcc` (`C99FLAGS` drops
+`make c99tcc-test` is the same corpus with `C99CC=tcc/c6` (`C99FLAGS` drops
 the gcc-only switches), so the generated C has to satisfy tcc too -- see
 "Self-hosting through the C back-end" below for what that costs.
 `tests/c99/c99test.c6` additionally exercises plain C and all the c6 features
@@ -1862,7 +1862,7 @@ listed below in one program.
 the language being compiled stays C.  The native binary contains both
 generators: the C one is selected by `-c99`, or automatically when `-o` names
 a `.c` file or an existing directory (or a path ending in `/`).  So
-`tcc/tcc -B tcc -o out.c prog.c` writes C source; with `-c99` and no `-o`
+`./tcc/c6 -B tcc -o out.c prog.c` writes C source; with `-c99` and no `-o`
 the output defaults to `a.c`.  `-c` means "one generated C file per
 translation unit", and `-test` together with a `.c` output writes the
 generated test-runner file.  `-o <dir>` gives every input translation unit its
@@ -1912,7 +1912,7 @@ TU.  Features covered by `tests/*.c6` include `defer`/`errdefer`, `err`,
 `async`/`await`, `co`, `spawn`, string interpolation (`f".."` / `@f".."`; the
 runtime prelude carries the same `__c6_fmt_*` builder) and `test` blocks:
 
-    tcc/tcc -B tcc -o out.c prog.c6
+    ./tcc/c6 -B tcc -o out.c prog.c6
     cc -std=c99 -pedantic -Wall -Wextra -Werror -o prog out.c
     ./prog
 
@@ -1943,7 +1943,7 @@ still compiles, but `async`/`spawn`/`c6_io` need a platform port.
 `make c99selfhost` is the end-to-end proof that the generated C is a working
 compiler, not just working code:
 
-    tcc/tcc -B tcc -DONE_SOURCE=1 -DC6_EXT -c99 -o build/selfhost/c99/tcc-c99.c tcc/tcc.c
+    ./tcc/c6 -B tcc -DONE_SOURCE=1 -DC6_EXT -c99 -o build/selfhost/c99/tcc-c99.c tcc/tcc.c
     cc -std=c99 -o build/selfhost/c99/tcc-stage2 build/selfhost/c99/tcc-c99.c -lm -ldl -lpthread
     build/selfhost/c99/tcc-stage2 -B tcc -DONE_SOURCE=1 -DC6_EXT -c tcc/tcc.c -o stage3.o
     build/selfhost/c99/tcc-stage2 -B tcc -o tcc-stage3 stage3.o -lm -ldl -lpthread

@@ -580,8 +580,8 @@ stmt swap(expr a, expr b) {
 
 ```bash
 cd tcc && make clean && make -j$(nproc) EXTRA-DEFS=-DC6_EXT CFLAGS="-g -O0"
-tcc/tcc -B. -run file.c6               # .c6 后缀开启扩展（唯一开关）
-tcc/tcc -B. -test file.c6              # 运行 test 块
+./tcc/c6 -B. -run file.c6               # .c6 后缀开启扩展（唯一开关）
+./tcc/c6 -B. -test file.c6              # 运行 test 块
 ```
 
 | 阶段 | 状态 | 关键实现位置 |
@@ -954,7 +954,7 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 
 新增 `tcc/c99-gen.c` + `tcc/c99-link.c`：复用全部前端（含 c6 语法），
 把代码生成到 C99 文本而不是机器码。它不再是独立编译器，而是并进普通的
-`tcc/tcc`：`tcc/Makefile` 把 `tcc.c` 以 `-DTCC_TARGET_C99` 单源再编一份
+`tcc/c6`：`tcc/Makefile` 把 `tcc.c` 以 `-DTCC_TARGET_C99` 单源再编一份
 `tcc-c99.o`，再用
 `objcopy --redefine-sym main=c99_main --keep-global-symbol=c99_main`
 把其余全局符号本地化，然后链进 `tcc`；`tcc.c` 的 `wants_c99_output()` 在
@@ -1001,11 +1001,11 @@ GCC/Clang 下运行时符号是 weak 的，多个 TU 共用同一份状态，没
 
 端到端回归直接复用 selftest 的整套用例：`BACKEND=c99 ./tests/run-tests.sh`
 （即 `make c99test`）把 `tests/*.c6`、`tests/errors/*.c6`、`tests/exit/*.c6`、
-`tests/abi/*.c6` 和 `tests/c99/*.c6` 都先用同一个 `tcc/tcc`（`-o ...c`）生成
+`tests/abi/*.c6` 和 `tests/c99/*.c6` 都先用同一个 `tcc/c6`（`-o ...c`）生成
 C 源码，再用
 `gcc -std=c99 -pedantic -Wall -Wextra -Werror -pthread` 编译并运行，断言与
 native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 C 输出后端
-才不同的诊断用 `// EXPECT-C99` 声明）。`make selftest` 用同一个 `tcc/tcc`
+才不同的诊断用 `// EXPECT-C99` 声明）。`make selftest` 用同一个 `tcc/c6`
 跑同一套用例（`tests/c99/c99test.c6` 用一份源码覆盖普通 C 和 c6 的全部特性）。
 
 变参函数**定义**也支持：`tccdefs.h` 在 `__c99__` 下给出与 SysV x86-64
@@ -1019,7 +1019,7 @@ native 模式相同（退出码、`// OUTPUT` 输出、`EXPECT` 诊断；只在 
 `tests/c99/c99test.c6` 里的“把 va_list 转手给宿主函数”都已覆盖。
 
 自举（`make selfhost` / `make c99selfhost`）：前者是 c6 后端编译自己
-（`tcc/tcc` -> stage1 -> stage2，两次目标文件 `cmp` 相同），后者是 C 输出
+（`tcc/c6` -> stage1 -> stage2，两次目标文件 `cmp` 相同），后者是 C 输出
 路线（`tcc -c99` 出 C -> 宿主 gcc 编出 stage2 -> stage2 编出 stage3，stage3
 再编一次目标文件与 stage2 的逐字节相同）。两条路线最后都让新编译器编一个
 小程序并运行，因此“生成的后端能跑”是被回归卡住的，不是靠人工抽查。这两条

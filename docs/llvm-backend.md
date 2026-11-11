@@ -11,7 +11,7 @@
 结尾就选 LLVM 后端：
 
 ```
-tcc/tcc -B tcc -o out.ll in.c6          # 生成 LLVM IR
+./tcc/c6 -B tcc -o out.ll in.c6          # 生成 LLVM IR
 clang -fuse-ld=lld -o out out.ll -L tcc -ltcc1
 ```
 
@@ -26,8 +26,8 @@ clang -fuse-ld=lld -o out out.ll -L tcc -ltcc1
 `.ll` 之外还多了一条路：让它自己去调 clang 把 IR 编成目标文件，一条命令出结果。
 
 ```
-tcc/tcc -B tcc --target=wasm32-unknown-unknown -o out.wasm in.c6
-tcc/tcc -B tcc --target=x86_64-pc-linux-gnu   -o out in.c6 && ./out
+./tcc/c6 -B tcc --target=wasm32-unknown-unknown -o out.wasm in.c6
+./tcc/c6 -B tcc --target=x86_64-pc-linux-gnu   -o out in.c6 && ./out
 ```
 
 | 选项 | 作用 |
@@ -41,7 +41,7 @@ tcc/tcc -B tcc --target=x86_64-pc-linux-gnu   -o out in.c6 && ./out
 往下传，由 clang 决定认不认（`clang --print-targets` 是它那一侧的清单）：
 
 ```
-$ tcc/tcc -B tcc --print-targets
+$ ./tcc/c6 -B tcc --print-targets
 targets for --target=<triple>; anything else goes to the C compiler
   triple                       runtime library
   x86_64-pc-linux-gnu          libtcc1.a                ok
@@ -113,7 +113,7 @@ wasm 目标用 `-nostdlib` 链，只带 `libtcc1`。运行库 `tcc/lib/wasm-rt.c
 链接期变成 `undefined symbol`，所以模块真引了运行库以外的函数时先打一条警告：
 
 ```
-$ tcc/tcc -B tcc --target=wasm32-unknown-unknown -o out.wasm prog.c6
+$ ./tcc/c6 -B tcc --target=wasm32-unknown-unknown -o out.wasm prog.c6
 tcc: warning: wasm has no libc: fork, sqrt imported, the link will fail
 tcc: warning:   write freestanding code (no <stdio.h>), or provide those symbols yourself
 ```

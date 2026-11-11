@@ -6,11 +6,11 @@
 #      有人加了模块却忘了重新钉号，或者手改表改了别人的号，都在这里报出来。
 #   2. 表本身的各种约束（C126/C127/C128）真的会报错，而不是被静默接受。
 #
-# 环境变量 TCC 覆盖编译器路径（默认 <仓库>/tcc/tcc）。
+# 环境变量 TCC 覆盖编译器路径（默认 <仓库>/tcc/c6）。
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-TCC=${TCC:-$ROOT/tcc/tcc}
+TCC=${TCC:-$ROOT/tcc/c6}
 BASE="-B $ROOT/tcc -I $ROOT"
 # 自动创建那一节不能用 -I $ROOT：仓库自己的表就在那里，会被优先找到
 BASE_MIN="-B $ROOT/tcc"
@@ -49,7 +49,7 @@ if $TCC $BASE $inc -emit-errbase="$TMP/fresh.def" $mods >"$TMP/err" 2>&1; then
     if diff -u "$ROOT/errbase.def" "$TMP/fresh.def" >"$TMP/diff" 2>&1; then
         pass "errbase.def 是最新的（$(grep -c '0x6' "$TMP/fresh.def") 个模块已钉号）"
     else
-        fail "errbase.def 过期了：跑 './tcc/tcc -B tcc -I . -emit-errbase' 重新生成" \
+        fail "errbase.def 过期了：跑 './tcc/c6 -B tcc -I . -emit-errbase' 重新生成" \
              "$(cat "$TMP/diff")"
     fi
 else

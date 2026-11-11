@@ -9,14 +9,14 @@
 #                                      （.c6 → .ll，再用 clang 链接 libtcc1.a）
 #
 # 环境变量：
-#   TCC       编译器路径（默认 <仓库>/tcc/tcc）
+#   TCC       编译器路径（默认 <仓库>/tcc/c6）
 #   TCCFLAGS  追加给编译器的参数
-#   BACKEND   native（默认）用 tcc/tcc 直接编译运行；c99 让同一个 tcc
+#   BACKEND   native（默认）用 tcc/c6 直接编译运行；c99 让同一个 tcc
 #             用 -o *.c / -o <目录> 生成 C 源码，再用系统 C 编译器编译运行；
 #             llvm 用 -o *.ll 生成 LLVM IR，再用 clang 链接 tcc/libtcc1.a。
 #             三种模式跑完全相同的测试文件和断言（tests/c99 与 -run 相关的
 #             用例除外）。
-#   C99TCC    产出 C 源码的编译器（默认 <仓库>/tcc/tcc）
+#   C99TCC    产出 C 源码的编译器（默认 <仓库>/tcc/c6）
 #   C99CC     编译生成代码的系统 C 编译器（默认 gcc）
 #   LLVMCC    把 .ll 编成可执行文件的 clang（默认 clang）
 #   LLVMFLAGS 交给 LLVMCC 的参数（默认 -fuse-ld=lld，见 docs/llvm-backend.md）
@@ -43,19 +43,19 @@
 #   tests/abi/*.c6    ABI 兼容；每个文件按 c6 编译（.c6 后缀），同名的
 #                     _plain.c 是纯 C 文件（.c 后缀），两个目标文件链接后运行，
 #                     比对 `// EXIT <n>` 声明的退出码。
-#   tests/c99/*.c6    C99 输出后端；每个文件先用 tcc/tcc 生成 C
+#   tests/c99/*.c6    C99 输出后端；每个文件先用 tcc/c6 生成 C
 #                     源码，再用 gcc -std=c99 编译并运行，比对
 #                     `// EXIT <n>`（默认 0）；带 `// OUTPUT <文本>` 时
 #                     还要求 stdout 含该文本。
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-TCC=${TCC:-$ROOT/tcc/tcc}
+TCC=${TCC:-$ROOT/tcc/c6}
 TCCFLAGS=${TCCFLAGS:-}
 # -I $ROOT 让用例从任何工作目录都能 'import std.*'（模块名就是路径）
 BASE="-B $ROOT/tcc -I $ROOT/tests -I $ROOT"
 BACKEND=${BACKEND:-native}
-C99TCC=${C99TCC:-$ROOT/tcc/tcc}
+C99TCC=${C99TCC:-$ROOT/tcc/c6}
 C99CC=${C99CC:-gcc}
 C99FLAGS=${C99FLAGS:-"-std=c99 -pedantic -Wall -Wextra -Werror -pthread"}
 LLVMCC=${LLVMCC:-clang}

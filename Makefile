@@ -8,7 +8,7 @@
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量 + c6selfcheck + freestanding/裸机
 #   make check-all   test-all + C99 后端用例 + 三条自举路线（发布前跑这一条）
-#   make c99         C99 输出后端已内置在 tcc/tcc（-c99 / -o *.c / -o <目录>）
+#   make c99         C99 输出后端已内置在 tcc/c6（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
 #   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
 #   make c6selfcheck tcc 自己的源码拷成 .c6 后用 c6 规则编译（初始化规则 + C99 后端）
@@ -119,7 +119,7 @@ stdtest: build
 	    std/vec.c6)  deps="std/sort.c6 std/str.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
-	    out=$$(./$(TCC_DIR)/tcc -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
+	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
 	    echo "$$out" | tail -1; \
 	done; \
 	test $$fail -eq 0
@@ -128,7 +128,7 @@ stdtest: build
 # 模块搜索路径靠 -I 给出（import wordcount.text 找 examples/wordcount/text.c6）。
 std-demo: build
 	@mkdir -p build
-	./$(TCC_DIR)/tcc -B $(TCC_DIR) -I examples -I . -o build/wordcount \
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I examples -I . -o build/wordcount \
 	    examples/wordcount.c6 examples/wordcount/text.c6 \
 	    std/str.c6 std/types.c6 std/vec.c6 std/span.c6 std/fmt.c6 \
 	    std/range.c6 std/err.c6
@@ -136,7 +136,7 @@ std-demo: build
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
-	./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_fstr \
+	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
 	    examples/freestanding_fstr.c6 tcc/libtcc1.a
 	./build/freestanding_fstr
 
@@ -154,15 +154,15 @@ wasmtest: build
 
 # freestanding + 程序自己实现的 pthread 层：spawn / thread
 fstest-go: build
-	./tcc/tcc -B tcc -c -o build/freestanding_pthread.o \
+	./tcc/c6 -B tcc -c -o build/freestanding_pthread.o \
 	    examples/freestanding_pthread.c
-	./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_go \
+	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_go \
 	    examples/freestanding_go.c6 build/freestanding_pthread.o tcc/libtcc1.a
 	./build/freestanding_go
 
 # 完全没有操作系统：程序里一个 syscall 都没有，靠 ud2 / 踩空报结果
 fstest-noos: build
-	./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_noos \
+	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_noos \
 	    examples/freestanding_noos.c6 tcc/libtcc1.a
 	@./build/freestanding_noos 2>/dev/null; st=$$?; \
 	 if [ $$st -eq 132 ]; then \
@@ -248,10 +248,10 @@ test-all: selftest test c6selfcheck stdtest std-demo fstest fstest-go \
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc
 
-# C99 输出后端已内置在 tcc/tcc 里：同一份二进制用 -c99（或 -o *.c、
+# C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
 c99: build
-	@echo "c99: C99 输出已内置在 $(TCC_DIR)/tcc，无需单独构建"
+	@echo "c99: C99 输出已内置在 $(TCC_DIR)/c6，无需单独构建"
 
 # C99 输出后端的端到端测试：与 selftest 相同的测试用例，但每个源文件先
 # 由同一个 tcc 生成 C 源码，再由系统 gcc 编译运行。
@@ -262,7 +262,7 @@ c99test: build
 # 生成的文件必须能被 tcc 编过（没有 GNU 的 alias 属性，方法名靠生成文件里
 # 的转发函数导出，va_list 助手用私有名字，见 tcc/c99-gen.c）。
 c99tcc-test: build
-	BACKEND=c99 C99CC=$(CURDIR)/$(TCC_DIR)/tcc \
+	BACKEND=c99 C99CC=$(CURDIR)/$(TCC_DIR)/c6 \
 	    C99FLAGS="-B $(CURDIR)/$(TCC_DIR) -std=c99 -w" ./$(SELFTEST)
 
 # c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿 c6
@@ -281,20 +281,20 @@ c99tcc-test: build
 c6selfcheck: build
 	@mkdir -p $(SELFHOST_C6)
 	@cp $(TCC_DIR)/tcc.c $(SELFHOST_C6)/selfcheck.c6
-	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -I $(TCC_DIR) $(SELFCHECK_DEFS) -c $(SELFHOST_C6)/selfcheck.c6 -o $(SELFHOST_C6)/selfcheck.o 2>&1`; \
+	@out=`$(TCC_DIR)/c6 -B $(TCC_DIR) -I $(TCC_DIR) $(SELFCHECK_DEFS) -c $(SELFHOST_C6)/selfcheck.c6 -o $(SELFHOST_C6)/selfcheck.o 2>&1`; \
 	if [ -n "$$out" ]; then \
 	    printf '%s\n' "$$out" >&2; \
 	    echo "c6selfcheck: 用 tcc 编译自身时不应有任何诊断输出（上面这些就是）" >&2; \
 	    exit 1; \
 	fi
-	@out=`$(TCC_DIR)/tcc -B $(TCC_DIR) -I $(TCC_DIR) $(SELFCHECK_DEFS) -o $(SELFHOST_C6)/selfcheck.c $(SELFHOST_C6)/selfcheck.c6 2>&1`; \
+	@out=`$(TCC_DIR)/c6 -B $(TCC_DIR) -I $(TCC_DIR) $(SELFCHECK_DEFS) -o $(SELFHOST_C6)/selfcheck.c $(SELFHOST_C6)/selfcheck.c6 2>&1`; \
 	if [ -n "$$out" ]; then \
 	    printf '%s\n' "$$out" >&2; \
 	    echo "c6selfcheck: 用 tcc 生成 C 时不应有任何诊断输出（上面这些就是）" >&2; \
 	    exit 1; \
 	fi
 	$(HOSTCC) -std=c99 -c -o $(SELFHOST_C6)/selfcheck-c99.o $(SELFHOST_C6)/selfcheck.c
-	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C6)/selfcheck $(SELFHOST_C6)/selfcheck.o $(SELFHOST_LIBS)
+	$(TCC_DIR)/c6 -B $(TCC_DIR) -o $(SELFHOST_C6)/selfcheck $(SELFHOST_C6)/selfcheck.o $(SELFHOST_LIBS)
 	$(SELFHOST_C6)/selfcheck -v
 
 # 自举（c6 模式）：tcc 用它自己的后端编译自己的源码，再用编出来的编译器
@@ -302,9 +302,9 @@ c6selfcheck: build
 # stage2 编一个程序跑通，确认它不只是"能启动"。
 selfhost: build
 	@mkdir -p $(SELFHOST_C6)
-	@echo "c6 自举 1/4：$(TCC_DIR)/tcc 编译自己的源码"
-	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/stage1.o
-	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C6)/tcc-stage1 $(SELFHOST_C6)/stage1.o $(SELFHOST_LIBS)
+	@echo "c6 自举 1/4：$(TCC_DIR)/c6 编译自己的源码"
+	$(TCC_DIR)/c6 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/stage1.o
+	$(TCC_DIR)/c6 -B $(TCC_DIR) -o $(SELFHOST_C6)/tcc-stage1 $(SELFHOST_C6)/stage1.o $(SELFHOST_LIBS)
 	@echo "c6 自举 2/4：stage1 重新编译同一份源码"
 	$(SELFHOST_C6)/tcc-stage1 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C6)/stage2.o
 	@echo "c6 自举 3/4：比较两次的目标文件"
@@ -322,7 +322,7 @@ selfhost: build
 c99selfhost: build
 	@mkdir -p $(SELFHOST_C99)
 	@echo "c99 自举 1/4：tcc 的 C99 后端把 tcc.c 翻成 C"
-	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c99 -o $(SELFHOST_C99)/tcc-c99.c $(TCC_DIR)/tcc.c
+	$(TCC_DIR)/c6 -B $(TCC_DIR) $(SELFHOST_DEFS) -c99 -o $(SELFHOST_C99)/tcc-c99.c $(TCC_DIR)/tcc.c
 	@echo "c99 自举 2/4：宿主 $(HOSTCC) 编译生成的 C，得到 stage2 编译器"
 	$(HOSTCC) -std=c99 -O0 -w -o $(SELFHOST_C99)/tcc-stage2 $(SELFHOST_C99)/tcc-c99.c $(SELFHOST_LIBS)
 	@echo "c99 自举 3/4：stage2 编译 tcc.c 得到 stage3"
@@ -343,12 +343,12 @@ c99selfhost: build
 c99selfhost-tcc: build
 	@mkdir -p $(SELFHOST_C99TCC)
 	@echo "c99+tcc 自举 1/4：tcc 的 C99 后端把 tcc.c 翻成 C"
-	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c99 -o $(SELFHOST_C99TCC)/tcc-c99.c $(TCC_DIR)/tcc.c
+	$(TCC_DIR)/c6 -B $(TCC_DIR) $(SELFHOST_DEFS) -c99 -o $(SELFHOST_C99TCC)/tcc-c99.c $(TCC_DIR)/tcc.c
 	@echo "c99+tcc 自举 2/4：同一个 tcc 编译生成的 C，得到 stage2 编译器"
-	$(TCC_DIR)/tcc -B $(TCC_DIR) -o $(SELFHOST_C99TCC)/tcc-stage2 $(SELFHOST_C99TCC)/tcc-c99.c $(SELFHOST_LIBS)
+	$(TCC_DIR)/c6 -B $(TCC_DIR) -o $(SELFHOST_C99TCC)/tcc-stage2 $(SELFHOST_C99TCC)/tcc-c99.c $(SELFHOST_LIBS)
 	@echo "c99+tcc 自举 3/4：stage2 编一遍 tcc.c，tcc 自己也编一遍"
 	$(SELFHOST_C99TCC)/tcc-stage2 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C99TCC)/stage3.o
-	$(TCC_DIR)/tcc -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C99TCC)/native.o
+	$(TCC_DIR)/c6 -B $(TCC_DIR) $(SELFHOST_DEFS) -c $(TCC_DIR)/tcc.c -o $(SELFHOST_C99TCC)/native.o
 	@echo "c99+tcc 自举 4/4：比较两个目标文件"
 	@cmp $(SELFHOST_C99TCC)/native.o $(SELFHOST_C99TCC)/stage3.o && echo "  逐字节相同"
 	@printf '%s\n' '#include <stdio.h>' 'int main(void)' '{' '    printf("hello from the tcc-hosted c99 self-hosted tcc\n");' '    return 0;' '}' > $(SELFHOST_C99TCC)/hello.c

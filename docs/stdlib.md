@@ -5,7 +5,7 @@
 根放进 `-I`，或就在仓库根下编译）。
 
 ```sh
-./tcc/tcc -B tcc -I . -I examples -o build/wordcount \
+./tcc/c6 -B tcc -I . -I examples -o build/wordcount \
     examples/wordcount.c6 examples/wordcount/text.c6 \
     std/str.c6 std/types.c6 std/vec.c6 std/span.c6 std/fmt.c6 \
     std/range.c6 std/err.c6

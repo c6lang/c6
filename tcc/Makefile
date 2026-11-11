@@ -83,7 +83,7 @@ endif
 TCCFLAGS-unx = -B$(TOP) -I$(TOPSRC)/include -I$(TOPSRC) -I$(TOP)
 TCCFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include -I$(TOPSRC) -I$(TOP) -L$(TOP)
 TCCFLAGS = $(TCCFLAGS$(CFG))
-TCC_LOCAL = $(TOP)/tcc$(EXESUF)
+TCC_LOCAL = $(TOP)/c6$(EXESUF)
 TCC = $(TCC_LOCAL) $(TCCFLAGS)
 
 # run tests with the installed tcc instead
@@ -130,7 +130,7 @@ ifeq ($(INCLUDED),no)
 # --------------------------------------------------------------------------
 # running top Makefile
 
-PROGS = tcc$(EXESUF)
+PROGS = c6$(EXESUF)
 TCCLIBS = $(LIBTCCDEF) $(LIBTCC) $(LIBTCC1)
 TCCDOCS = tcc.1 tcc-doc.html tcc-doc.info
 
@@ -276,7 +276,7 @@ $(X)tcc.o : tcctools.c
 $(X)tcc.o : DEFINES += $(DEF_GITHASH)
 
 # Host Tiny C Compiler
-tcc$(EXESUF): tcc.o $(LIBTCC) tcc-c99-p.o tcc-llvm-p.o
+c6$(EXESUF): tcc.o $(LIBTCC) tcc-c99-p.o tcc-llvm-p.o
 	$S$(CC) -o $@ $^ $(addsuffix ,$(LIBS) $(LDFLAGS) $(LINK_LIBTCC))
 
 # Cross Tiny C Compilers
@@ -326,12 +326,12 @@ libtcc.dll : $(LIBTCC_OBJ)
 libtcc.dll : DEFINES += -DLIBTCC_AS_DLL
 
 # import file for windows libtcc.dll
-libtcc.def : libtcc.dll tcc$(EXESUF)
+libtcc.def : libtcc.dll c6$(EXESUF)
 	$S$(XTCC) -impdef $< -o $@
-XTCC ?= ./tcc$(EXESUF)
+XTCC ?= ./c6$(EXESUF)
 
 # TinyCC runtime libraries
-libtcc1.a : tcc$(EXESUF) FORCE
+libtcc1.a : c6$(EXESUF) FORCE
 	@$(MAKE) -C lib
 
 # Cross libtcc1.a
@@ -491,7 +491,7 @@ test-install: $(TCCDEFS_H)
 	@$(MAKE) -C tests TESTINSTALL=yes #_all
 
 clean:
-	@rm -f tcc *-tcc tcc_p tcc_c tcc_s
+	@rm -f c6 *-tcc tcc_p tcc_c tcc_s
 	@rm -f tags ETAGS *.o *.a *.so* *.out *.log lib*.def *.exe *.dll
 	@rm -f a.out *.dylib *_.h *.pod *.tcov
 	@$(MAKE) -s -C lib $@
@@ -583,7 +583,7 @@ tcc-c99-p.o: tcc-c99.o
 # Compatibility: there is no separate C99 compiler any more.  Without this
 # explicit rule the generic cross-compiler pattern would build one from the
 # c99 target definition.
-c99-tcc$(EXESUF): tcc$(EXESUF)
+c99-tcc$(EXESUF): c6$(EXESUF)
 	@:
 
 # The LLVM IR back-end is embedded the same way: llvm-gen.c is a complete
@@ -605,6 +605,6 @@ tcc-llvm-p.o: tcc-llvm.o
 	$(OBJCOPY) --redefine-sym main=llvm_main --keep-global-symbol=llvm_main $@
 
 # same reason as for c99-tcc: no separate cross compiler for this target
-llvm-tcc$(EXESUF): tcc$(EXESUF)
+llvm-tcc$(EXESUF): c6$(EXESUF)
 	@:
 endif

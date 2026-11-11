@@ -47,7 +47,7 @@ esac
 
 TRIPLE=${1:-wasm32-unknown-unknown}
 ARCH=${TRIPLE%%-*}
-TCC=$ROOT/tcc/tcc
+TCC=$ROOT/tcc/c6
 RT=$ROOT/tcc/libtcc1-$ARCH.a
 NODE=${NODE:-node}
 CC=${LLVMCC:-clang}
