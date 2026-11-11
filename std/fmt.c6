@@ -166,8 +166,9 @@ struct Buf@(int N) {
     }
 
     /* 十六进制，小写、无前缀、不补零：0 写成 "0"。
-       形参保持 u32：把它直接放宽成 u64 会触发编译器的「同形状方法」死循环
-       （见 docs/stdlib.md 已知限制），64 位走 write_hex64。 */
+       形参是 u32，写满 64 位用 write_hex64（两者都是 digits_hex 的薄包装）。
+       历史备注：早期把这里直接放宽成 u64 时编译器会挂住，现在已复现不出来
+       （见 docs/stdlib.md「已知限制」），保留 u32 只是为了不动已有 API。 */
     int!error write_hex(u32 v)
     {
         char tmp[16] = { 0 };

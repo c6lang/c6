@@ -273,9 +273,10 @@ o->clear();  o->room();  o->cap();  o->count();
 数字转换的脏活被抽成了三个文件作用域原语：`digits_u32`、`digits_u64`、
 `digits_hex`——往调用方给的缓冲里写十进制/十六进制，返回长度，放不下返回
 `-1` 且一个字节都不写。`Buf@(N)` 的 `write_*` 和 `std.strbuf` 都建在它们
-上面，所以两条路径的格式永远一致。`write_hex` 收 `u32`；要写满 64 位十六
-进制用 `write_hex64`（把 `write_hex` 直接加宽到 `u64` 会触发编译器挂起，
-见下面的「已知限制」）。
+上面，所以两条路径的格式永远一致。`write_hex` 收 `u32`，要写满 64 位十六进制
+用 `write_hex64`（两个入口都只是 `digits_hex` 的薄包装）。曾经把 `write_hex`
+直接加宽到 `u64` 会挂住编译器，现在**复现不出来**了（见下面的「已知限制」），
+保留一个 `u32` 入口只是不想为改签名动 API。
 
 ### `StrBuf`：会自己长大的字符串
 
@@ -446,8 +447,11 @@ stdtour: 73 check(s), 0 failure(s)
   就 `catch e { id = e.id; goto done; }`。
 * `foreach` 体必须是 `{ }`；`has()`/`next()` 必须带函数体。
 * 泛型实参不要用块作用域里的 `struct` tag，把类型放到文件作用域。
-* **切片的字段不能就地改**：`char[:] p; p.len -= 1;` → `assignment of
-  read-only location`。用游标算完再重建：`(char[:]){ p.data, n }`。
+* **切片的字段按设计是只读的**：切片是 `struct { T *const data; const size_t
+  len; }`，`char[:] p; p.len -= 1;` 会得到一条 `assignment of read-only
+  location` 警告——而且**照样会改**（tcc 对 `const` 只警告），所以别依赖它。
+  要改视图就按视图重建：`(char[:]){ p.data, n }`（`std/path.c6` 的
+  `strip_trailing`）。
 * `catch` 体里不能只写普通语句（必须 `return`/`err()`/`goto` 收尾），所以
   「失败了记一笔再继续跑」这种写法要包一层：`static int put_int(StrBuf *b,
   int v) { b->write_int(v) catch e { return -1; }; return 0; }`，调用方
@@ -465,7 +469,7 @@ stdtour: 73 check(s), 0 failure(s)
 | **普通**（非泛型）结构体不能在 `struct` 体内写方法体（`a function cannot be defined inside a struct`） | 方法写成「第一个参数是结构体指针」的文件作用域函数，调用写 `(&v)->m()` |
 | 文件作用域里写「参数/返回类型带实例类型」的辅助函数，会让**导入这个模块的每个 TU** 都提前实例化该类型 | 别这么写；需要时把逻辑放进 `test` 块或用标量参数（`std/fmt.c6` 的测试用 `goto` 取错误码） |
 | ~~往 `Buf@(N)` 里加若干形状相同的方法会挂~~（曾经的 `skip(')')` → `end_macro()` 死循环） | **已消失**：同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）加到五个也编得过、跑得通，`std/fmt` 的 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr` 就是照这个形状补的（`tccpp.c` 的宏重放改写之后不再复现） |
-| 把 `Buf@(N)` 的 `write_hex` 形参从 `u32` 加宽到 `u64` 会**挂住编译器**（`-c` 无输出直到超时，退出码 124；最小复现里同样的 `data + n` 写法单独编没问题） | 保持 `write_hex(u32)`，另加 `write_hex64(u64)`：两个方法体不同形，触发点就绕开了 |
+| ~~把 `Buf@(N)` 的 `write_hex` 形参从 `u32` 加宽到 `u64` 会**挂住编译器**~~（当时 `-c` 无输出直到超时，退出码 124） | **现在复现不出来**：当前 `std/fmt.c6` 的 body、旧版 body、带 `(char)` 强转的写法都在 1 秒内编过，`-test` 也是 10 个块全过。`write_hex(u32)`/`write_hex64(u64)` 双入口保留只是为了不动 API |
 
 这些限制在 `docs/grammar.md`（约束表 C1xx）和 `docs/plan.md` 里有对应的
 条目；标准库的写法就是它们当前的「推荐用法」。

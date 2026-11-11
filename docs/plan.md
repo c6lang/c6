@@ -1104,14 +1104,26 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
 写这批时踩到并绕开的编译器限制（都记进了 [stdlib.md](stdlib.md) 的「已知限制」）：
 
 1. 把 `Buf@(N)->write_hex` 的形参从 `u32` 加宽到 `u64` 会让编译器**挂住**
-   （`-c` 无输出直到超时，退出码 124）。最小复现里同样的 `data + n` 写法单独编
-   没问题，所以绕法是保持 `write_hex(u32)`、另加 `write_hex64(u64)`。
-2. 切片的字段不能就地改：`char[:] p; p.len -= 1;` 报 `assignment of read-only
-   location`，改用游标算完再 `(char[:]){ p.data, n }` 重建（`std/path.c6` 的
-   `strip_trailing`）。
+   （当时 `-c` 无输出直到超时，退出码 124）。这条**现在已经复现不出来**：拿当前
+   `std/fmt.c6` 的 body、旧版（`2bf18ce`）的 body、加 `(char)` 强转的变体去试，
+   都能在 1 秒内编过，`-test` 也全过，所以留着 `write_hex(u32)` 只是不想为改签名
+   动 API（`write_hex64` 两个都是 `digits_hex` 的薄包装）。
+2. 切片的字段**按设计**只读：切片是 `struct { T *const data; const size_t
+   len; }`，`p.len -= 1` 只给一条 `assignment of read-only location` 警告，但
+   tcc 对 `const` 只警告、赋值**确实生效**。所以正确的说法不是「不能改」而是
+   「不该改」：视图要变就重建 `(char[:]){ p.data, n }`（`std/path.c6` 的
+   `strip_trailing`）。要让编译器真的拦住，得在 `verify_assign_cast()`
+   （`tcc/tccgen.c:5785`）里把「目标是编译器合成的 slice/tuple 描述符」从
+   warning 升级成 `tcc_error`。
 3. `catch` 体必须以 `return`/`err()`/`goto` 收尾，所以「失败了记一笔继续跑」的
    演示代码要包一层返回 `-1` 的辅助函数（`examples/stdtour.c6` 的
-   `append`/`put_int`/`dq_push_back`）。
+   `append`/`put_int`/`dq_push_back`）。这条是有意的：`catch` 之后走的是**成功
+   路径**，fallthrough 会继续往下执行并复用一个和当前表达式无关的值，所以编译器
+   宁可报错（真要掉下去还有 `__tcc_catch_fallthrough` 陷阱兜着）。可以按「被守护
+   表达式的值不被使用」放宽——`c6_save_operand()` 返回的 `has_value` 就是判据
+   （`void!error` 调用给 0）：把 `tcc/tccgen.c:16967` 的检查改成
+   `if (has_value && !c6_last_stmt_leaves) tcc_error(...)`，void 场景就允许
+   fallthrough，非 void 场景仍然拦住。
 
 验收：`make stdtest`（19 个模块、149 个 `test` 块、0 failure）、`make std-tour`
 （`examples/stdtour.c6`，73 条自检全过）、`make std-demo`、`make errcheck` 全绿。
