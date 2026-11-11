@@ -105,6 +105,94 @@ struct Buf@(int N) {
         return 0;
     }
 
+    /* 十进制无符号，64 位：与 write_uint 同一套倒写法，只是类型更宽。
+       tmp 要 20 格才装得下 2^64-1 的二十位十进制，这里给 24。 */
+    int!error write_u64(u64 v)
+    {
+        char tmp[24] = { 0 };
+        int k = 0, i = 0;
+
+        do {
+            tmp[k++] = (char)('0' + (v % 10u));
+            v /= 10u;
+        } while (v != 0u);
+        if (k > N - 1 - n)
+            return err(5, "fmt: buffer full");
+        for (i = k - 1; i >= 0; i--)
+            data[n++] = tmp[i];
+        data[n] = 0;
+        return 0;
+    }
+
+    /* 十六进制，小写、无前缀、不补零：0 写成 "0"。
+       16 格放得下 64 位的十六位数字（当前只收 u32，留出余量）。 */
+    int!error write_hex(u32 v)
+    {
+        char tmp[16] = { 0 };
+        const char *digits = "0123456789abcdef";
+        int k = 0, i = 0;
+
+        do {
+            tmp[k++] = digits[v & 0xfu];
+            v >>= 4;
+        } while (v != 0u);
+        if (k > N - 1 - n)
+            return err(6, "fmt: buffer full");
+        for (i = k - 1; i >= 0; i--)
+            data[n++] = tmp[i];
+        data[n] = 0;
+        return 0;
+    }
+
+    /* 二进制，无前缀、不补零：0 写成 "0"。32 位要 32 格。 */
+    int!error write_bin(u32 v)
+    {
+        char tmp[32] = { 0 };
+        int k = 0, i = 0;
+
+        do {
+            tmp[k++] = (char)('0' + (v & 1u));
+            v >>= 1;
+        } while (v != 0u);
+        if (k > N - 1 - n)
+            return err(7, "fmt: buffer full");
+        for (i = k - 1; i >= 0; i--)
+            data[n++] = tmp[i];
+        data[n] = 0;
+        return 0;
+    }
+
+    /* 布尔：非零写 "true"，零写 "false" */
+    int!error write_bool(bool v)
+    {
+        try write(v != 0 ? (char[:]){ (char *)"true", 4 }
+                         : (char[:]){ (char *)"false", 5 });
+        return 0;
+    }
+
+    /* 指针：0 写 "0x0"，否则写 "0x" + 十六进制（小写、不补零）。
+       用 usize 取地址值，避免在 64 位平台上截掉高 32 位。 */
+    int!error write_ptr(void *v)
+    {
+        char tmp[2 * sizeof(void *)] = { 0 };
+        const char *digits = "0123456789abcdef";
+        usize u = (usize)v;
+        int k = 0, i = 0;
+
+        do {
+            tmp[k++] = digits[u & 0xfu];
+            u >>= 4;
+        } while (u != 0u);
+        if (k + 2 > N - 1 - n)
+            return err(8, "fmt: buffer full");
+        data[n++] = '0';
+        data[n++] = 'x';
+        for (i = k - 1; i >= 0; i--)
+            data[n++] = tmp[i];
+        data[n] = 0;
+        return 0;
+    }
+
     /* 右对齐写整数：不足 width 位时左边补 pad（通常是空格或 '0'） */
     int!error write_pad(int v, int width, char pad)
     {
@@ -127,7 +215,7 @@ struct Buf@(int N) {
         if (k > width)
             width = k;
         if (width > N - 1 - n)
-            return err(5, "fmt: buffer full");
+            return err(9, "fmt: buffer full");
         for (i = width - k; i > 0; i--)
             data[n++] = pad;
         for (i = k - 1; i >= 0; i--)
@@ -231,4 +319,55 @@ test "Buf 可以按值传递" {
         return err(30, "count 不对");
     if (p->slice().len != 2)
         return err(31, "slice 长度不对");
+}
+
+test "u64 / 十六进制 / 二进制 / 布尔 / 指针" {
+    Buf@(96) b = { { 0 }, 0 };
+    Buf@(96) *p = &b;
+    u64 big = 18446744073709551615ull;   /* 2^64-1，二十位十进制 */
+
+    p->write_u64(big) catch e { return err(32, "u64 失败"); };
+    p->add(' ') catch e { return err(33, "空格失败"); };
+    p->write_hex(0) catch e { return err(34, "hex 0 失败"); };
+    p->add(' ') catch e { return err(35, "空格失败"); };
+    p->write_hex(0xdeadbeefu) catch e { return err(36, "hex 失败"); };
+    p->add(' ') catch e { return err(37, "空格失败"); };
+    p->write_bin(0u) catch e { return err(38, "bin 0 失败"); };
+    p->add(' ') catch e { return err(39, "空格失败"); };
+    p->write_bin(5u) catch e { return err(40, "bin 失败"); };
+    p->add(' ') catch e { return err(41, "空格失败"); };
+    p->write_bool(1) catch e { return err(42, "bool true 失败"); };
+    p->add(' ') catch e { return err(43, "空格失败"); };
+    p->write_bool(0) catch e { return err(44, "bool false 失败"); };
+    p->add(' ') catch e { return err(45, "空格失败"); };
+    p->write_ptr((void *)0) catch e { return err(46, "ptr 0 失败"); };
+    if (strcmp(p->cstr(),
+               "18446744073709551615 0 deadbeef 0 101 true false 0x0") != 0)
+        return err(47, "扩展格式结果不对");
+}
+
+test "扩展格式写满时返回错误，且不写半截" {
+    Buf@(4) b = { { 0 }, 0 };
+    Buf@(4) *p = &b;
+
+    /* "0xdeadbeef" 放不进 3 格 */
+    p->write_ptr((void *)0xdeadbeefu) catch e {
+        if (e.id != 8)
+            return err(48, "指针写满应报 id 8");
+        goto checked;
+    };
+    return err(49, "指针写满却没报错");
+checked:
+    if (p->count() != 0)
+        return err(50, "失败时改动了长度");
+    /* 2^64-1 有二十位，Buf@(4) 装不下 */
+    p->write_u64(18446744073709551615ull) catch e {
+        if (e.id != 5)
+            return err(51, "u64 写满应报 id 5");
+        goto checked2;
+    };
+    return err(52, "u64 写满却没报错");
+checked2:
+    if (p->count() != 0 || p->cstr()[0] != 0)
+        return err(53, "失败时改动了内容");
 }

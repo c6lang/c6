@@ -1,0 +1,30 @@
+/* 裸机上 spawn 句柄的最小验证：h->join() 要能等到、h->value() 要拿到返回值。 */
+
+void sched_init(void);
+void boot_exit(int code);
+int printf(const char *fmt, ...);
+
+static volatile int saw = 0;
+
+static int twice(int n)
+{
+    saw = 1;
+    return n * 2;
+}
+
+void _start(void)
+{
+    int ok = 0;
+    long long v = 0;
+    int j = 0;
+
+    sched_init();
+    thread h = spawn twice(21);
+
+    j = h->join();
+    v = h->value();
+
+    printf("handle: join=%d value=%lld saw=%d\n", j, v, saw);
+    ok = (j == 0) && (v == 42) && (saw == 1);
+    boot_exit(ok ? 0 : 3);
+}
