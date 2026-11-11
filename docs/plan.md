@@ -14,7 +14,7 @@
 | **G5** | `err()` 的 `goto __err_exit` 假设存在统一出口，但 TCC 没有“函数末尾统一清理标签”的现成机制 | 高 | 采用**每错误返回点就地生成清理序列**：`err()` 处直接展开 errdefer/defer 的逆序调用，然后 `return` 哨兵；不依赖间接跳转 |
 | **G6** | `test` 块的 runner 在 `-run` 模式下由 `libtcc.c` 遍历 `TCCState->tests`，但 TCC 的 `-run` 入口是用户 `main`，没有“先跑测试再跑 main”的钩子 | 中 | `-test` 模式下**不调用用户 `main`**，`libtcc.c` 直接遍历测试表；`-test` 与正常 `-run` 互斥，文档明确 |
 | **G7** | 扩展开关通过“运行时关键字映射”实现，但 TCC 的 `tok_alloc` 在词法阶段就将字符串 intern 为 `TokenSym`，后期切换映射不可行 | 中 | 改为**编译期条件编译**：`tcctok.h` 中 `#ifdef C6_EXT` 注册新 token；扩展关闭时这些字符串根本不进入关键字映射，零运行时开销 |
-| **G8** | `#macro` 的 `__local` 重命名通过 `TokenSym` 插入唯一名，但 TCC 的 `TokenSym` 是全局 intern 表，宏展开产生的临时标识符会永久累积 | 中 | 重命名使用**展开计数器后缀**（如 `tmp__h17`），但不在 `TokenSym` 中持久化；展开结束后从 intern 表移除，或接受可控的内存增长（首版可接受，后续优化） |
+| **G8** | 宏体里局部变量的卫生重命名通过 `TokenSym` 插入唯一名，但 TCC 的 `TokenSym` 是全局 intern 表，宏展开产生的临时标识符会永久累积 | 中 | 重命名使用**展开计数器后缀**（`<宏名>__<变量名>__h<展开号>`，如 `swap__tmp__h17`），但不在 `TokenSym` 中持久化；展开结束后从 intern 表移除，或接受可控的内存增长（首版可接受，后续优化） |
 | **G9** | 命名空间要在 `tccgen.c` 顶层处理，但 TCC 的顶层声明循环 (`decl`) 不天然支持“命名块”语法 | 中 | 命名空间 = 文件：`module NAME;` 给整个文件的文件作用域符号加前缀，路径就是名字（见第 6 章）。不需要“顶层块作用域”，也不做嵌套 mangle |
 | **G10** | `err` 的错误槽“通过隐藏参数传递”在 TCC 的调用约定中无现成支持 | 中 | 使用**每线程错误槽**（`pthread_key` + `pthread_getspecific`，不是 `__thread`：`-run` 不支持 TLS），调用者从槽读取；`spawn` 出去的线程有自己的槽，跨线程传播需手动复制。隐藏参数作为后续优化 |
 
@@ -26,7 +26,7 @@
 | 源文件 | 职责 | 扩展挂载点 |
 |---|---|---|
 | `tcctok.h` | 关键字与 token 编号 | `#ifdef C6_EXT` 注册新 token；关闭时零映射 |
-| `tccpp.c` | 预处理与词法分析 | `#macro` 指令识别、`__local` 重命名、include 路径扩展 |
+| `tccpp.c` | 预处理与词法分析 | 宏体的捕获 / 角色检查 / 卫生重命名（`__local` 与自动扫描）、include 路径扩展 |
 | `tccgen.c` | 语法分析与代码生成 | `module/import` mangle 与 `mod.member`、结构体方法注册、`interface` 转换与 vtable 生成、`defer/errdefer/err` 就地代码生成、`test` 块注册 |
 | `tcc.h` / `libtcc.c` | 符号表与编译状态 | `TCCState` 扩展字段、`-test` runner、扩展开关 |
 
@@ -458,34 +458,65 @@ int area(struct Rect *r)   { return r->w * r->h; }       /* Rect_area */
 `NAME__slice_N` / `NAME__tuple_N` typedef，托管字段另外写出 `__c6_gc_field` /
 `__c6_gc_desc` 描述符。C 侧包含头文件即可调用，不需要知道模块的存在。
 
-## 7. 卫生宏：`#macro` + `__local`（修复 G8）
+## 7. 宏：像函数一样写（修复 G8）
 
 ### 7.1 语法
 
+宏写在**文件作用域**，没有 `#` 前缀，读起来就是一个函数：开头的角色词说清
+展开结果怎么用，每个形参前面也带角色（都不能省）。
+
+```
+macro-def = role , identifier , "(" , [ param { "," , param } ] , ")" ,
+            "{" , { preprocessing-token } , "}" ;
+param     = role , identifier ;
+role      = "expr" | "stmt" | "ident" | "type" ;
+```
+
 ```c
-#macro swap(a, b) {
-    typeof(a) __local tmp = (a);
+stmt swap(expr a, expr b) {
+    typeof(a) tmp = (a);
     (a) = (b);
     (b) = tmp;
 }
 ```
 
-`#` 前缀作为预处理指令识别。`__local` 标注需要卫生重命名的标识符；宏参数和全局符号不重命名。
+| 角色 | 展开成 | 拿来干什么 |
+|---|---|---|
+| `expr` | `( 宏体 )` | 当值用；宏体是一个表达式（结尾可带一个 `;`），实参也自动加括号 |
+| `stmt` | `{ 宏体 }` | 当一条语句用，可以是任意多条语句 |
+| `ident` | 原样 token | `##` 拼名、`#` 字符串化、声明里的名字 |
+| `type` | 原样 token | 当类型说明符用 |
+
+角色词是**软关键字**：文件作用域、后面紧跟一个标识符、并且当前没有同名可见
+符号时才开启一个宏定义（`tccgen.c` 的文件作用域分派，与 `module` / `spawn`
+同一条路子）；别的位置它们是普通标识符。
 
 ### 7.2 展开（修复 G8）
 
-在 `macro_subst()` 中：
-
-1. 展开计数器自增得 `N`；
-2. 对每个 `__local ident` 生成唯一名 `ident__hN`，构造新 token 注入展开流；
-3. **不在 `TokenSym` 中持久化**临时名，避免 intern 表膨胀；展开结束后丢弃；
-4. `#`/`##` 用于 `__local` 标识符时首版报错；
-5. 递归展开沿用现有机制，每层独立计数。
+1. `macro_subst_tok()` 取到实参后，先对**宏体**做卫生重命名（在参数替换之前，
+   所以卫生不会漏进调用者的 token）；
+2. 重命名表由两处合成：宏体里 `__local` 标注的名字，加上 `c6_scan_locals()`
+   按声明形状（`typeof`/基本类型/typedef 名/`struct TAG`、`for` 头、多声明符、
+   `struct`/`union`/`enum` 的 tag）扫出来的局部变量名；
+3. 每个名字改写成 `<宏名>__<变量名>__h<N>`，`N` 是展开计数器——带宏名前缀，
+   所以不同宏的同名局部变量、同一个宏的多次展开都不会撞；
+4. `#` / `##` 的操作数在**定义期**检查：角色不是 `ident` 就报错；
+5. `expr` 的宏体在替换后套一层 `( … )`（丢掉它自己结尾的那个 `;`），`stmt`
+   套 `{ … }`，`ident` / `type` 原样重放；
+6. 递归展开沿用现有机制，每层独立计数。
 
 ### 7.3 限制
 
-首版只支持显式 `__local`；不支持宏体引入新 `#define`；错误消息映射回原始行号。
-
+- `expr` 的体必须是一个表达式。多语句的值宏要写成 `stmt` + 调用点的语句表达式
+  `({ … })`——注意这条路径现在有**已知缺陷**（见下），所以 `expr` 只做单表达式。
+- **已知缺陷（与本次重构无关，先记在这里）**：`.c6` 里的语句表达式
+  `({ … })` 在不少形状下算不出正确的值，纯 C（`.c`）里同样的代码是对的。
+  最小复现：`int a = 1, b = 2; int w = ({ a + b; });` 得到 `1` 而不是 `3`；
+  带 `?:`、或在赋值右侧用（`w = ({ … });`）也一样。原因在 c6 的清理帧 /
+  寄存器分配与 `block(STMT_EXPR)` 的 `vpop(); gexpr();` 交互上，需要单独修。
+  这也是 `expr` 角色只接受单表达式、并且展开成 `( … )` 而不是 `({ … })` 的
+  直接原因。
+- 不支持宏体里引入 `#define`；诊断的行号映射仍是老样子。
 
 ## 8. 分阶段实施计划
 
@@ -498,7 +529,7 @@ int area(struct Rect *r)   { return r->w * r->h; }       /* Rect_area */
 | **4** | 命名空间单文件：`module` mangle、import 按路径加载声明 | 符号可见性/冲突正确；不导出宏 | 3 |
 | **5** | `interface`：胖指针 ABI、结构化实现、vtable 生成 | 方法先于转换点；签名检查；用 `test` 验收 | 3 |
 | **6** | 跨文件包 + 跨 TU interface：包清单、`extern` vtable 声明 | 跨 TU 链接正确 | 4, 5 |
-| **7** | 卫生宏：`#macro` + `__local`、展开计数器重命名 | 正反例通过；用 `test` 验收 | 3 |
+| **7** | 宏：`expr`/`stmt`/`ident`/`type` 角色声明、自动卫生重命名（`__local` 保留为手动标注） | 正反例通过；用 `test` 验收 | 3 |
 
 **里程碑**：阶段 1 产出可工作的 `defer`；阶段 2 错误传播闭环；阶段 3 测试框架就位；阶段 5 `interface` 可运行；阶段 6 跨 TU 打通；阶段 7 卫生宏完成。
 
@@ -564,7 +595,7 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 | 4b 结构体方法 | ✅ | `decl()` 里 `c6_method_register`、`c6_method_symbol`（符号名 `<Tag>_<name>`，`static`/`inline`/`__` 开头/系统头/匿名 tag/包内方法不改名）、`c6_method_plain_decl` + `c6_method_alias`（源码名发布成弱别名，定义处用 `put_extern_sym2` 打上同一地址）、`c6_method_source_name`（`__func__` 显示源码名）、`c6_method_lookup` / `c6_has_field` / `c6_method_call_prep`、`unary()` 的 `->` 分支、`c6_self_*` 隐藏接收者（sret 之后）；`BufferedFile.sys_header`（`tccpp.c` 按 include 路径标记系统头） |
 | 5 `interface` | ✅ | `c6_interface_parse`（生成 `struct NAME_vt` + 胖指针 `struct NAME`）、`c6_auto_impl_ensure` / `c6_check_method`（惰性校验）、`c6_emit_auto_impls`（TU 末尾生成 `static` vtable）、`c6_iface_call_prep`（调用点改写）、`c6_iface_convert`（隐式/显式转换） |
 | 6 跨 TU | ✅ | 模块即文件，`import a.b;` 按路径读声明；接口与方法声明放头文件，每个 TU 各自生成 vtable；方法符号按接收者取名，所以同名方法跨 TU 也不需要命名空间；`c6_tu_reset` 在每个 TU 开头丢弃上一 TU 的模块状态/接口/方法/待生成 vtable |
-| 7 `#macro` + `__local` | ✅ | `tccpp.c`：`parse_c6_macro` / `c6_hygiene_body`（展开计数器 `ident__hN`，在参数替换前重命名，`#`/`##` 误用报错） |
+| 7 宏 `expr`/`stmt`/`ident`/`type` | ✅ | `tccgen.c`：`c6_role_of` / `c6_macro_def_parse`（文件作用域的软关键字入口，读 `ROLE NAME (ROLE param, ...) { body }`）；`tccpp.c`：`c6_macro_body_capture`（`{}` 配对捕获，`##` → `TOK_PPJOIN`）、`c6_macro_check_body`（`#`/`##` 操作数必须是 `ident` 角色；`expr` 只能一个表达式）、`c6_hygiene_body` / `c6_scan_locals` / `c6_local_name`（自动卫生重命名 `<宏名>__<变量>__h<N>`，`__local` 仍可手动标注）、`c6_macro_wrap`（`expr` → `( … )`、`stmt` → `{ … }`、`ident`/`type` 原样）、`c6_param_role`、`macro_arg_subst` 给 `expr` 实参加括号；`#macro` 只剩一条迁移诊断 |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/`static`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
 | 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task, void *frame)` 编译，`c6_async_func_begin` 生成恢复分发序言（非 0 状态就 `__c6_co_restore` + 跳恢复点）、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把错误槽 park 出去（帧住在任务里，不用搬，清理状态跟着帧走）；运行期 `libtcc1.c` 的 `__c6_co_new`（一次分配任务结构 + 帧）/ `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（按需 malloc + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
@@ -590,7 +621,7 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 | 31 `defer` 状态搬进函数帧 | ✅ | 清理点是编译期常量（`C6DeferSite`：id / 作用域深度 / kind / 标签），运行期只剩帧里的两样东西：`arm[C6_DEFER_WORDS]` 位图和 `dtgt`/`dres`（派发过滤 + 恢复点号，清理体每嵌套一层再存一份）；`c6_defer_func_init()` 只在序言里清 4 个 `int` 的位图（不再调用 `__tcc_defer_func_enter`；单趟编译在序言处不知道有没有清理点，所以这 16 字节是每个 c6 函数都付的固定开销），`c6_defer_func_end()` 生成一个逆序扫 site 的派发器，`c6_defer_begin()` 只写两个 `int` 就跳过去——于是没有 TLS/线程键、没有 8192 条记录上限（改成一个函数 128 个清理点、清理体 8 层，超了编译期报错）、ISR/线程/协程/递归同一套规则；`__tcc_defer_*` 五个入口与 `TccDeferRec`/`TccDeferCtx` 从 `libtcc1.c`、`c99-rt.inc`、`c99-gen.c` 的名字表里删掉，协程挂起只剩错误槽三项；向后跳转的 `goto` 在 `stmt()` 里自己发起清理请求（标签处的派发仍保留，向前跳转靠它）；语义见 [grammar.md](grammar.md) 8.2，约束 C101/C102；用例 `tests/defer_scope.c6`、`tests/defer_reent.c6`、`tests/defer_thread.c6`（裸机跑不了，`examples/boot/runtests.sh` 里跳过）、`tests/async_frame.c6` 第 8 组 |
 | 32 枚举成员的限定名 `Color.RED` | ✅ | `struct_decl()` 的枚举循环接受 `'<tag>.<成员>'`：常量另外注册成带点的 `Color.RED`（`tok_alloc_const`），裸名只在没被别的枚举占用时注册，否则记进 `c6_enum_poison` 并在裸用处报 C119；引用复用 `primary()` 里已有的 `pkg.member` 点号路径——先按带点名字查枚举常量，查不到再按包名 mangle；`decl()` 在条件位置向前看一个记号，`'Tag.'` 直接交回 `gexpr()`，所以 `if (Color.RED)`/`while`/`for` 的条件不会被当声明；诊断 C117–C120，语法见 [grammar.md](grammar.md) §3.8；`tests/enum_scope.c6`、`tests/errors/enum_scope.c6` |
 | 33 源文件后缀 `.c6` | ✅ | `libtcc.c`：`guess_filetype()` 把 `c6` 归入 `AFF_TYPE_C`；`tcc_add_file_internal()` 在 `(flags & AFF_TYPE_MASK) == AFF_TYPE_C` 且文件名后缀是 `.c6` 时临时置 `s1->c6_ext = 1`，`tcc_compile()` 返回后恢复——每个 TU 独立判断，`.c` 文件不会因为同批出现 `.c6` 而被连带开启，native 与内置 C99 后端共用 `libtcc.c`，C99 输出路径同样生效；`tccgen.c` 的 `c6_module_try()` 依次找 `NAME.c6`、`NAME.c`（点号形式同理，`.c6` 优先）；用例 `tests/c6ext/basic.c6`、`tests/c6ext/c6mod.c6` + `tests/tu/c6mod.c6`、`tests/c6ext/pick.c6`（同名 `.c6`/`.c` 并存时选 `.c6`），`tests/run-tests.sh` 的 1b（`-test`）与 1c（`-run`）两组 |
-| 34 后缀成为唯一开关（删除 `-std=c6`） | ✅ | `libtcc.c`：`TCC_OPTION_std` 的 `=c6` 分支改成硬报错 `-std=c6 is gone: the '.c6' suffix is the only switch, so drop the option (rename a plain C source to '*.c6' to enable the extensions)`（静默忽略只会让第一处 c6 语法报出莫名的 “identifier expected”）；`c6_ext` 只由 `tcc_add_file_internal()` 按后缀逐 TU 设置，`__C6__` 跟着 TU 走；`'defer'` / `'try'` / `'catch'` / `'foreach'` / `'#macro'` 一类的 “requires -std=c6” 诊断统一改成 “requires a .c6 source file”；仓库里的 c6 源码全部改成 `.c6`（`tests/`、`examples/`，包括裸机 payload 与 `harness.py`/`runtests.sh`），纯 C 仍是 `.c`（`*_plain.c`、`*.plain.c`、`examples/boot/io.c`、`examples/freestanding_pthread.c`）；`make c6selfcheck` 改成 `cp tcc/tcc.c build/selfhost/c6/selfcheck.c6` 再按 c6 规则编译（语言由顶层文件后缀决定，`#include` 进来的 `.c`/`.h` 跟同一份规则走），检查范围和以前用开关时一致 |
+| 34 后缀成为唯一开关（删除 `-std=c6`） | ✅ | `libtcc.c`：`TCC_OPTION_std` 的 `=c6` 分支改成硬报错 `-std=c6 is gone: the '.c6' suffix is the only switch, so drop the option (rename a plain C source to '*.c6' to enable the extensions)`（静默忽略只会让第一处 c6 语法报出莫名的 “identifier expected”）；`c6_ext` 只由 `tcc_add_file_internal()` 按后缀逐 TU 设置，`__C6__` 跟着 TU 走；`'defer'` / `'try'` / `'catch'` / `'foreach'` 一类的 “requires -std=c6” 诊断统一改成 “requires a .c6 source file”；仓库里的 c6 源码全部改成 `.c6`（`tests/`、`examples/`，包括裸机 payload 与 `harness.py`/`runtests.sh`），纯 C 仍是 `.c`（`*_plain.c`、`*.plain.c`、`examples/boot/io.c`、`examples/freestanding_pthread.c`）；`make c6selfcheck` 改成 `cp tcc/tcc.c build/selfhost/c6/selfcheck.c6` 再按 c6 规则编译（语言由顶层文件后缀决定，`#include` 进来的 `.c`/`.h` 跟同一份规则走），检查范围和以前用开关时一致 |
 | 35 泛型 `@` 应用 / `|…|` 绑定（阶段 1–3） | ✅ | `tccgen.c`：模板声明与 `@` 应用（`parse_btype()` / `c6_gen_btype` / `c6_gen_param` / `c6_gen_args` / `c6_gen_bind` / `c6_gen_one_arg`）、实例化与 mangle（`c6_gen_instance` / `c6_gen_mangle` / `c6_gen_mangle_name` / `c6_gen_declare` / `c6_gen_flush` / `c6_gen_drop_struct`）、`|T|` 函数/typedef 模板（`c6_gen_fn_apply` / `c6_gen_fn_instance` / `c6_gen_fn_drop`）、体内成员函数 V3（`c6_gen_meth_decl` / `c6_gen_meth_sym` / `c6_gen_method_resolve`）、值形参（`c6_gen_nominal` / `c6_gen_arg_only` / `c6_gen_arg_depth`）与深度告警（`-Wgeneric-depth`，`c6_gen_depth`）；实例名带模块前缀、`-emit-header` 导出；诊断 C103–C116；用例 `tests/generic.c6`、`tests/generic_fn.c6`、`tests/errors/generic.c6`、`tests/abi/generic.c6` + `_plain.c`、`tests/c99/generic.c6`、`tests/c99/generic_fn.c6`、`tests/tu/generic.c6`；设计见 [generics-design.md](generics-design.md) |
 
 `foreach` 的设计取舍（评审结论）：
@@ -666,7 +697,8 @@ tcc/tcc -B. -test file.c6              # 运行 test 块
 | `tests/err.c6` | `err` / `errdefer` 与清理顺序、错误槽 |
 | `tests/try.c6` | `try` / `catch`，含 `goto` 离开、嵌套传播、`void!error` |
 | `tests/test-block.c6` | `test` 块、`-test`、`-test-filter` |
-| `tests/macro.c6` | `#macro` 与卫生的 `__local` |
+| `tests/macro.c6` | 四种角色（`expr` 当值/`stmt` 当语句/`ident` 给 `##`/`type` 给声明）、`expr` 实参自动加括号、宏体局部变量自动卫生（同名用户变量不被捕获）、`__local` 手动标注、嵌套调用、同作用域多次展开、角色词当普通标识符 |
+| `tests/errors/macro.c6` | 宏定义的编译期诊断（C129–C134：形状、形参缺角色、`#`/`##` 用在非 `ident` 形参、`expr` 带语句、`#macro` 迁移、`__local` 拼名字） |
 | `tests/module.c6` | `module` / `import`：限定名、带前缀的 C 符号、全限定函数取址、跨 TU |
 | `c6ext/modpath`（run-tests.sh） | 模块名即路径：分级查找、扁平拼写被拒绝、两个 TU |
 | `tests/method.c6` | 结构体方法、值接收者（`v.f()` = `f(&v)`，改动可见、返回结构体、`!error`、泛型实例上的 `|T|` 方法、与接口 vtable 的分工）、不同类型的同名方法、libc 方法（`p->fflush()`）、与方法或 libc 同名的普通函数不被顶掉，以及 `T!error` 方法 |

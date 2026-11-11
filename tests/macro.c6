@@ -1,34 +1,64 @@
-/* c6 自测：#macro 与卫生的 __local 名字
+/* c6 自测：宏的角色声明、卫生重命名和 __local
  *
  * 运行（仓库根目录）：
  *   ./tcc/tcc -B tcc -test tests/macro.c6
+ *
+ * 宏写在文件作用域，长得像函数：开头一个角色词说清展开结果怎么用，
+ * 每个形参前面也带自己的角色。
+ *
+ *   expr  展开成 ( 表达式 )，能当值用
+ *   stmt  展开成 { 语句 }，当一条语句用
+ *   ident 原样重放，给 ## / 字符串化和声明用
+ *   type  原样重放，当类型说明符用
+ *
+ * 宏体里自己声明的局部变量会自动改名（卫生），用户变量不会被捕获；
+ * 想手动指定用 __local。
  */
 #include <stdio.h>
 #include <string.h>
 
-#macro swap(a, b) {
-    typeof(a) __local tmp = (a);
+/* ---- 各种角色的宏 ---- */
+
+stmt swap(expr a, expr b) {
+    typeof(a) tmp = (a);
     (a) = (b);
     (b) = tmp;
 }
 
-#macro maxv(x, y, out) {
-    typeof(x) __local m = (x);
-    if ((y) > m)
-        m = (y);
-    (out) = m;
+stmt bump(expr v) {
+    int tmp = (v);
+    tmp = tmp + 1;
+    (v) = tmp;
 }
 
-#macro twice(stmt) {
-    stmt;
-    stmt;
+stmt dbl(expr v) {
+    int __local tmp = (v);
+    tmp = tmp * 2;
+    (v) = tmp;
 }
 
-#macro outer(a, b) {
-    typeof(a) __local t = (a);
+stmt twice(stmt s) {
+    s;
+    s;
+}
+
+stmt outer(expr a, expr b) {
+    typeof(a) t = (a);
     swap(t, b);
     (a) = t;
 }
+
+/* 结尾的 ';' 可有可无：宏体读起来仍然像函数体 */
+expr imax(expr a, expr b) { a > b ? a : b; }
+expr imin(expr a, expr b) { a < b ? a : b }
+expr sq(expr a) { a * a; }
+
+ident cat(ident a, ident b) { a ## b }
+
+type ptr(type T) { T * }
+
+/* 角色词不是保留字：没有宏定义在等它的时候，它就是普通标识符 */
+static int expr = 1;
 
 static char logbuf[128] = {0};
 static int loglen = 0;
@@ -50,14 +80,14 @@ static void lg(const char *s)
 
 /* ---- 测试块 ---- */
 
-test "#macro swap 交换两个变量" {
+test "stmt 宏交换两个变量" {
     int a = 3, b = 9;
     swap(a, b);
     if (a != 9 || b != 3)
         return err(1, "swap 没有交换");
 }
 
-test "#macro 里的 __local 不捕获同名用户变量" {
+test "宏体里的局部变量自动改名，不捕获同名用户变量" {
     int a = 3, b = 9;
     int tmp = 42;
     swap(tmp, a);
@@ -65,30 +95,71 @@ test "#macro 里的 __local 不捕获同名用户变量" {
         return err(1, "swap 的结果不对");
     if (tmp != 3)
         return err(2, "用户变量 tmp 被宏捕获");
+    bump(a);
+    if (a != 43)
+        return err(3, "bump 没有自增");
 }
 
-test "#macro 可以带多个参数并用 typeof 推导类型" {
-    int a = 3, b = 9, m = 0;
-    maxv(a, b, m);
-    if (m != 9)
-        return err(1, "maxv 没有取到较大值");
-    maxv(b, a, m);
-    if (m != 9)
-        return err(2, "maxv 交换实参后结果不对");
+test "__local 仍然可以手动标注" {
+    int v = 21;
+    int tmp = 5;
+    dbl(v);
+    if (v != 42)
+        return err(1, "dbl 没有乘以 2");
+    if (tmp != 5)
+        return err(2, "用户变量 tmp 被 __local 的名字捕获");
 }
 
-test "#macro 可以展开语句两次" {
+test "expr 宏展开成 ( 表达式 )，实参自动加括号" {
+    int a = 3, b = 9;
+    if (imax(a + 1, b * 2) != 18)
+        return err(1, "imax 取错了较大值");
+    if (imin(a + 1, b * 2) != 4)
+        return err(2, "imin 取错了较小值");
+    if (sq(a + 1) != 16)
+        return err(3, "expr 宏的实参没有自动加括号");
+    if (imax(1, 2) != 2 || sq(2) != 4)
+        return err(4, "expr 宏的结果不对");
+}
+
+test "expr 宏可以直接写在声明和语句里" {
+    int m = imax(4, 7);
+    if (m != 7)
+        return err(1, "声明里的 expr 宏不对");
+    m = imin(m, 3);
+    if (m != 3)
+        return err(2, "赋值里的 expr 宏不对");
+    imax(1, 2);
+}
+
+test "stmt 宏的实参可以是语句，并且可以展开多次" {
     lg_reset();
     twice(lg("x"));
     if (!LG_IS("xx"))
         return err(1, "twice 没有展开两次");
 }
 
-test "#macro 可以调用另一个 #macro" {
+test "宏可以调用另一个宏" {
     int a = 3, b = 9;
     outer(a, b);
     if (a != 9 || b != 3)
         return err(1, "嵌套宏 outer 的结果不对");
+}
+
+test "ident 宏给 ## 用，type 宏给声明用" {
+    int cat(ab, cd) = 7;
+    int v = 3;
+    ptr(int) p = &v;
+    if (abcd != 7)
+        return err(1, "ident 宏没有拼出 abcd");
+    if (*p != 3)
+        return err(2, "type 宏没有给出 int *");
+}
+
+test "角色词在没被宏定义占用时是普通标识符" {
+    int stmt = 2;
+    if (expr + stmt != 3)
+        return err(1, "角色词不该抢走同名变量");
 }
 
 test "同一个作用域里多次展开不冲突" {

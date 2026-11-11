@@ -2658,6 +2658,17 @@ ST_INLN Sym *sym_find(int v)
     return s;
 }
 
+#ifdef C6_EXT
+/* tccpp.c scans a macro body for declarations and has to know whether a name
+   is a typedef; 'sym_find' is an inline over there, so expose the question. */
+ST_FUNC int c6_is_typedef_name(int v)
+{
+    Sym *s = sym_find(v);
+
+    return s && (s->r & VT_TYPEDEF);
+}
+#endif
+
 /* make sym in-/visible to the parser */
 static inline void sym_link(Sym *s, int yes)
 {
@@ -16442,6 +16453,106 @@ static void c6_test_parse(void)
     gen_function(sym);
 }
 
+/* ------------------------------------------------------------------------- */
+/* c6 macros: 'stmt swap(expr a, expr b) { ... }'                            */
+/*                                                                           */
+/* A macro definition reads like a function definition: the leading role is  */
+/* where the return type would be, and every parameter carries the syntactic */
+/* category of the argument it accepts.  The role of the definition says how */
+/* the expansion may be used -- 'expr' bodies expand to '( ... )' so that    */
+/* they can stand in an expression, 'stmt' bodies to '{ ... }', and          */
+/* 'ident'/'type' bodies to raw tokens (a name, a type specifier).           */
+/*                                                                           */
+/* The role words are soft keywords: at file scope a word only starts a      */
+/* definition when no visible symbol has that name and a name follows it, so */
+/* a program may still call a variable, type or function 'type'.             */
+static int c6_role_of(int t)
+{
+    const char *s = 0;
+
+    if (t < TOK_UIDENT)
+        return C6_ROLE_NONE;
+    s = get_tok_str(t, NULL);
+    switch (*s) {
+    case 'e': if (!strcmp(s, "expr"))  return C6_ROLE_EXPR;  break;
+    case 'i': if (!strcmp(s, "ident")) return C6_ROLE_IDENT; break;
+    case 's': if (!strcmp(s, "stmt"))  return C6_ROLE_STMT;  break;
+    case 't': if (!strcmp(s, "type"))  return C6_ROLE_TYPE;  break;
+    }
+    return C6_ROLE_NONE;
+}
+
+static const char *c6_role_name(int role)
+{
+    switch (role) {
+    case C6_ROLE_EXPR:  return "expr";
+    case C6_ROLE_STMT:  return "stmt";
+    case C6_ROLE_IDENT: return "ident";
+    case C6_ROLE_TYPE:  return "type";
+    }
+    return "?";
+}
+
+/* the MACRO_* bits the leading role of a definition puts on the macro */
+static int c6_role_flags(int role)
+{
+    switch (role) {
+    case C6_ROLE_EXPR:  return MACRO_C6_RET_EXPR;
+    case C6_ROLE_IDENT: return MACRO_C6_RET_IDENT;
+    case C6_ROLE_TYPE:  return MACRO_C6_RET_TYPE;
+    }
+    return 0;                            /* 'stmt' is the plain block */
+}
+
+/* parse the rest of '<role> NAME(<role> param, ...) { body }' and push the
+   macro on the define stack.  The leading role is the current token.  The
+   body scan ('#'/'##' need an 'ident' parameter, 'expr' holds a single
+   expression) lives in tccpp.c, where the token stream helpers are. */
+static void c6_macro_def_parse(void)
+{
+    Sym *first = 0, **ps = &first, *s = 0;
+    int role = c6_role_of(tok), name = 0, flags = 0, *body = 0;
+
+    next();                             /* the name of the macro */
+    if (tok < TOK_UIDENT)
+        tcc_error("a macro name must follow the '%s' role",
+                  c6_role_name(role));
+    name = tok;
+    next();
+    if (tok != '(')
+        tcc_error("'(' expected after the macro name '%s'",
+                  get_tok_str(name, NULL));
+    next();
+    if (tok != ')') for (;;) {
+        int prole = c6_role_of(tok);
+        if (!prole)
+            tcc_error("every macro parameter needs a role: 'expr', 'stmt', "
+                      "'ident' or 'type'");
+        next();
+        if (tok < TOK_UIDENT)
+            tcc_error("a parameter name must follow the '%s' role",
+                      c6_role_name(prole));
+        s = sym_push2(&define_stack, tok | SYM_FIELD, 0, 0);
+        s->c6_role = prole;
+        *ps = s;
+        ps = &s->next;
+        next();
+        if (tok == ')')
+            break;
+        if (tok != ',')
+            tcc_error("',' or ')' expected in a macro parameter list");
+        next();
+    }
+    next();                             /* the body of the macro */
+    if (tok != '{')
+        tcc_error("'{' expected: the body of macro '%s'",
+                  get_tok_str(name, NULL));
+    body = c6_macro_body_capture(&flags);
+    c6_macro_check_body(body, first, role);
+    define_push(name, MACRO_FUNC | MACRO_C6_LOCAL | flags
+                | c6_role_flags(role), body, first);
+}
+
 /* Emit the cleanup dispatcher of this function.  It is reached from every
    exit path that has cleanups to run, and from every cleanup body that
    finishes; the work to do is described by this frame:
@@ -23301,6 +23412,21 @@ static void c6_apply_fallible(CType *type)
                 if (tok >= TOK_UIDENT || tok == '.') {
                     unget_tok(c6_kw);
                     c6_module_parse();
+                    continue;
+                }
+                unget_tok(c6_kw);
+            }
+            /* '<role> NAME(<role> p, ...) { ... }' defines a macro.  The
+               role words are soft keywords too: they only start a definition
+               when no visible symbol of that name exists and a name follows,
+               so 'type' stays usable as a type or variable name. */
+            if (tok >= TOK_UIDENT && c6_role_of(tok) && !sym_find_raw(tok)) {
+                int c6_kw = tok;
+                next();
+                if (tok >= TOK_UIDENT) {
+                    unget_tok(c6_kw);
+                    c6_macro_def_parse();
+                    next();          /* past the closing '}' of the body */
                     continue;
                 }
                 unget_tok(c6_kw);
