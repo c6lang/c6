@@ -114,6 +114,7 @@ errcheck: build
 # 里列出。没列出来的模块自成一体，单独跑。
 
 stdtest: build
+	@mkdir -p build   # std/io.c6 的用例要往 build/ 写临时文件，干净树上得先有目录
 	@fail=0; for f in std/str.c6 std/sort.c6 \
 	         $$(ls std/*.c6 | grep -vE '/(str|sort)\.c6$$'); do \
 	    printf '%-16s ' "$$f"; \
@@ -127,14 +128,19 @@ stdtest: build
 	done; \
 	test $$fail -eq 0
 
+# std-demo 的源文件清单：示例两个文件 + 用到的模块正文。清单必须覆盖被
+# import 模块的正文（import 只带来声明）——`std/vec.c6` 的排序内核在
+# `std/sort.c6` 里，sort 自己又依赖 std/str.c6、std/err.c6、std/types.c6。
+# 改动 std/ 里的 import 时，这里和上面 stdtest 的 case 要一起更新。
+STDDEMO_SRCS := examples/wordcount.c6 examples/wordcount/text.c6 \
+                std/types.c6 std/err.c6 std/str.c6 std/sort.c6 \
+                std/vec.c6 std/span.c6 std/fmt.c6 std/range.c6
+
 # 标准库的拼装示例：模块正文要单独编进程序（import 只带来声明），
 # 模块搜索路径靠 -I 给出（import wordcount.text 找 examples/wordcount/text.c6）。
 std-demo: build
 	@mkdir -p build
-	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I examples -I . -o build/wordcount \
-	    examples/wordcount.c6 examples/wordcount/text.c6 \
-	    std/str.c6 std/types.c6 std/vec.c6 std/span.c6 std/fmt.c6 \
-	    std/range.c6 std/err.c6
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I examples -I . -o build/wordcount $(STDDEMO_SRCS)
 	./build/wordcount
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start

@@ -7,12 +7,17 @@
 ```sh
 ./tcc/c6 -B tcc -I . -I examples -o build/wordcount \
     examples/wordcount.c6 examples/wordcount/text.c6 \
-    std/str.c6 std/types.c6 std/vec.c6 std/span.c6 std/fmt.c6 \
-    std/range.c6 std/err.c6
+    std/types.c6 std/err.c6 std/str.c6 std/sort.c6 \
+    std/vec.c6 std/span.c6 std/fmt.c6 std/range.c6
 ```
 
 > `import` 只带来**声明**：模块的函数体要把它自己的 `.c6` 文件一起编进程序。
 > 上例里用到哪个 `std/*.c6` 就编哪个；`make std-demo` 是这条命令的缩写。
+>
+> 模块之间有依赖：`std/vec.c6` 的 `sort`/`sort_lex` 用 `std/sort.c6` 的内核，
+> 而 `std/sort.c6` 又 `import std.str`/`std.err`/`std.types`——所以用
+> `std.vec` 时这几份正文都得在命令行上，漏了会报
+> `unresolved reference to 'std__sort__sort_bytes'`。
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -31,7 +36,7 @@
 | `std/time.c6` | `std.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `format_duration`、`Civil` 日历换算 `civil_from_unix`/`unix_from_civil`/`format_civil`（不依赖 localtime） |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
 
-每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（95 个断言）：
+每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（140 个断言）：
 
 ```
 std/err.c6       3 test(s), 0 failure(s)
@@ -39,15 +44,19 @@ std/fmt.c6       8 test(s), 0 failure(s)
 std/io.c6        5 test(s), 0 failure(s)
 std/map.c6       8 test(s), 0 failure(s)
 std/math.c6      6 test(s), 0 failure(s)
-std/mem.c6       6 test(s), 0 failure(s)
+std/mem.c6       7 test(s), 0 failure(s)
 std/range.c6     6 test(s), 0 failure(s)
-std/sort.c6      6 test(s), 0 failure(s)
+std/sort.c6     26 test(s), 0 failure(s)
 std/span.c6      6 test(s), 0 failure(s)
 std/str.c6      18 test(s), 0 failure(s)
 std/time.c6      7 test(s), 0 failure(s)
 std/types.c6     4 test(s), 0 failure(s)
-std/vec.c6      10 test(s), 0 failure(s)
+std/vec.c6      36 test(s), 0 failure(s)
 ```
+
+`-test` 的计数是命令行上**所有 TU** 的 `test` 块之和，所以带依赖跑的行会把自己
+和依赖的块一起算进去：`std/sort.c6` 那行 = str 18 + sort 8，`std/vec.c6` 那行
+= str 18 + sort 8 + vec 10。
 
 ## 设计原则
 
@@ -256,7 +265,9 @@ make std-demo
 
 它同时用到 `std.types`、`std.err`、`std.str`、`std.vec`、`std.span`、
 `std.fmt`、`std.range` 和自己写的模块 `wordcount.text`
-（`examples/wordcount/text.c6`，说明模块边界怎么划、`-I` 怎么给）。
+（`examples/wordcount/text.c6`，说明模块边界怎么划、`-I` 怎么给）。`std.vec`
+的排序内核来自 `std.sort`——`import` 只带声明，所以 `std/sort.c6` 的正文也
+必须一起编（背后一共 8 个 `std` 模块）。
 
 ## 写法约定（照着写就不会踩坑）
 

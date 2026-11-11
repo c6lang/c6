@@ -1629,12 +1629,15 @@ b->write_int(v->count()) catch e { return 2; };
 printf("%s\n", b->cstr());
 ```
 
-`import` 只带来声明，所以模块自己的 `.c6` 文件要一起编进程序：
+`import` 只带来声明，所以模块自己的 `.c6` 文件要一起编进程序（`std/vec.c6`
+的排序内核在 `std/sort.c6` 里，sort 又依赖 str/err/types，用 vec 就得把这几个
+正文都放上命令行）：
 
 ```sh
-./tcc/c6 -B tcc -I . -o build/app app.c6 std/vec.c6 std/fmt.c6 std/types.c6
+./tcc/c6 -B tcc -I . -o build/app app.c6 \
+    std/vec.c6 std/fmt.c6 std/types.c6 std/str.c6 std/sort.c6 std/err.c6
 make stdtest     # 跑 std/ 下全部 test 块（140 个断言）
-make std-demo    # 编译并运行 examples/wordcount.c6（用到 7 个模块）
+make std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
