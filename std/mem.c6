@@ -95,6 +95,39 @@ void *alloc_array(Arena *self, int n, int size)
     return alloc(self, (int)total, is_pow2_u(a) ? size : 1);
 }
 
+/* 从 Arena 分配一块能放下 n 个字节 + 结尾 NUL 的内存并清零，
+   返回可当 char* 用的指针；放不下返回 0。调用方自己 memcpy 内容。 */
+char *alloc_str(Arena *self, int n)
+{
+    char *p = 0;
+
+    if (n < 0)
+        return 0;
+    p = (char *)alloc(self, n + 1, 1);
+    if (p == 0)
+        return 0;
+    p[n] = 0;
+    return p;
+}
+
+/* 从 Arena 复制一个 C 字符串（含 NUL）：失败返回 0 */
+char *alloc_copy(Arena *self, const char *z)
+{
+    usize n = 0;
+    char *p = 0;
+
+    if (z == 0)
+        return 0;
+    n = strlen(z);
+    if (n > 0x7fffffffu)
+        return 0;
+    p = (char *)alloc(self, (int)n + 1, 1);
+    if (p == 0)
+        return 0;
+    memcpy(p, z, n + 1);
+    return p;
+}
+
 /* ---- 托管堆的薄包装 ---- */
 
 /* 等价于 calloc(1, size)：清零，失败返回 0 */
@@ -339,4 +372,35 @@ test "rotate / reverse / align" {
         return err(27, "align 0 应当原样返回");
     if (!is_pow2_u(64u) || is_pow2_u(0u))
         return err(28, "is_pow2_u 不对");
+}
+
+test "Arena 分配字符串与拷贝 C 字符串" {
+    u8 buf[64] = { 0 };
+    Arena a = arena_make(buf, 64);
+    Arena *pa = &a;
+    char *s = 0;
+    char *c = 0;
+    char *big = 0;
+
+    s = pa->alloc_str(5);
+    if (s == 0)
+        return err(29, "alloc_str 失败");
+    if (s[0] != 0 || s[5] != 0)
+        return err(30, "alloc_str 没有清零");
+    memcpy(s, "hello", 5);
+    if (strcmp(s, "hello") != 0)
+        return err(31, "alloc_str 的内存不可写");
+    c = pa->alloc_copy((const char *)"world");
+    if (c == 0)
+        return err(32, "alloc_copy 失败");
+    if (strcmp(c, "world") != 0)
+        return err(33, "alloc_copy 内容不对");
+    if (c == s)
+        return err(34, "两次分配不该重合");
+    /* 64 字节的池子：5+1 + 5+1 之后还剩不少，但要不到 1000 字节 */
+    big = pa->alloc_str(1000);
+    if (big != 0)
+        return err(35, "超出容量应当返回 0");
+    if (pa->alloc_copy(0) != 0)
+        return err(36, "拷贝 NULL 应当返回 0");
 }

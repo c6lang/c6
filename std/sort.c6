@@ -30,6 +30,7 @@
 module std.sort;
 import std.types;
 import std.err;
+import std.str;
 
 /* ---- 比较器 ---- */
 
@@ -56,6 +57,14 @@ int cmp_f64(const void *a, const void *b)
     f64 y = *(const f64 *)b;
 
     return (x > y) - (x < y);
+}
+
+/* 按字节序升序（memcmp 的前 4 字节）：给「元素就是 4 字节无符号量」的场景，
+   比如 `Vect@int->sort_lex()`。负数会排在正数后面（按字节比的结果），
+   要正确的整数序请用 cmp_int。别的元素大小请用 sort_bytes + 自己的比较器。 */
+int cmp_mem4(const void *a, const void *b)
+{
+    return memcmp(a, b, 4);
 }
 
 /* ---- 底层：按字节的原语 ---- */
@@ -183,6 +192,16 @@ typedef int (*CmpFn)(const void *, const void *);
    `cmp_desc` 就是给常用的 int 降序准备的。 */
 int cmp_int_desc(const void *a, const void *b) { return cmp_int(b, a); }
 
+/* 字符串视图按字节序比较：给 `Str a[n]` 排序用。
+   注意元素是 `Str` 本体（两个字段的纯值），不是 `Str *`。 */
+int cmp_str(const void *a, const void *b)
+{
+    const Str *x = (const Str *)a;
+    const Str *y = (const Str *)b;
+
+    return x->cmp(y->s);
+}
+
 /* ---- 定型快捷函数（最常用的写法） ---- */
 
 /* int/升序；失败返回 -1（只有元素很多、内存不够时才可能） */
@@ -199,6 +218,12 @@ int sort_u32(u32 *a, int n)
 int sort_f64(f64 *a, int n)
 {
     return sort_bytes(a, n, sizeof(f64), cmp_f64);
+}
+
+/* Str 数组升序排序（元素是 Str 本体，不是指针） */
+int sort_str(Str *a, int n)
+{
+    return sort_bytes(a, n, sizeof(Str), cmp_str);
 }
 
 /* ---- 二分查找（要求数组已按同一个 cmp 升序排好） ---- */
@@ -240,6 +265,12 @@ int find_u32(const u32 *a, int n, u32 key)
 }
 
 /* 有序数组里「第一个 >= key」的下标（n 表示全部元素都小） */
+/* 在已按 cmp_str 排好序的 Str 数组里找 key：返回值同 find_bytes */
+int find_str(const Str *a, int n, Str *key)
+{
+    return find_bytes(a, n, sizeof(Str), key, cmp_str);
+}
+
 int lower_bound_int(const int *a, int n, int key)
 {
     int lo = 0;
@@ -375,6 +406,18 @@ test "lower_bound / upper_bound" {
         return err(17, "大于全部的上界应为 n");
 }
 
+test "cmp_mem4 按字节序比较" {
+    u32 a = 0x01020304u;
+    u32 b = 0x01020305u;
+
+    if (cmp_mem4(&a, &a) != 0)
+        return err(22, "相同字节应当相等");
+    if (cmp_mem4(&a, &b) >= 0)
+        return err(23, "小端字节序比较方向不对");
+    if (cmp_mem4(&b, &a) <= 0)
+        return err(24, "反向比较也不对");
+}
+
 test "f64 与降序" {
     f64 f[4] = { 2.5, -1.0, 3.25, 0.0 };
     int a[4] = { 1, 3, 2, 4 };
@@ -387,4 +430,31 @@ test "f64 与降序" {
         return err(20, "降序排序失败");
     if (a[0] != 4 || a[3] != 1)
         return err(21, "降序结果不对");
+}
+
+test "sort_str / find_str：字符串数组排序与查找" {
+    Str a[4] = { { S("pear") }, { S("apple") }, { S("fig") }, { S("banana") } };
+    Str key = { S("fig") };
+    char buf[16] = { 0 };
+    int i = 0, hit = 0;
+
+    if (sort_str(a, 4) != 0)
+        return err(25, "sort_str 失败");
+    if (!is_sorted_bytes(a, 4, sizeof(Str), cmp_str))
+        return err(26, "字符串数组没排好");
+    if (a[0].copy_to(buf, sizeof(buf)) != 5 || strcmp(buf, "apple") != 0)
+        return err(27, "首项应当是 apple");
+    hit = find_str(a, 4, &key);
+    if (hit < 0)
+        return err(28, "find_str 没找到 fig");
+    if (a[hit].copy_to(buf, sizeof(buf)) != 3 || strcmp(buf, "fig") != 0)
+        return err(29, "find_str 找错了位置");
+    /* 没命中的返回值是 -(插入点)-1：apple < banana < cherry < fig < pear，
+       所以 cherry 的插入点是 2，返回 -3 */
+    key = (Str){ S("cherry") };
+    if (find_str(a, 4, &key) != -3)
+        return err(30, "没命中应返回 -(2)-1");
+    for (i = 1; i < 4; i++)
+        if (cmp_str(&a[i - 1], &a[i]) > 0)
+            return err(31, "相邻顺序不对");
 }
