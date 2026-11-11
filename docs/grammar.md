@@ -1397,7 +1397,7 @@ id = (area << 27) | (slot << 12) | code        /* bit31 恒为 0 */
 |---|---|---|
 | `0x0000` | 无模块文件 | 固定 |
 | `0x0001..0x5FFF` | 自动池 | `1 + fnv1a32(点号模块名) % 0x5FFF`：号是名字的纯函数，加模块、加错误码、改编译顺序都不动它 |
-| `0x6000..0x60FF` | std 内置池 | 编译器里的常量表：`std.err`=0x6000、`std.types`=0x6001、`std.vec`=0x6002、`std.span`=0x6003、`std.map`=0x6004、`std.str`=0x6005、`std.fmt`=0x6006、`std.range`=0x6007 |
+| `0x6000..0x60FF` | std 内置池 | 编译器里的常量表：`std.err`=0x6000、`std.types`=0x6001、`std.vec`=0x6002、`std.span`=0x6003、`std.map`=0x6004、`std.str`=0x6005、`std.fmt`=0x6006、`std.range`=0x6007、`std.sort`=0x6008、`std.mem`=0x6009、`std.io`=0x600a、`std.math`=0x600b、`std.time`=0x600c |
 | `0x6100..0x7FFF` | 钉号池 | 项目根的 `errbase.def` 里的一行 |
 
 自动池是 24575 个号段，撞号（两个模块同一个 slot）不会静默：同一次编译里

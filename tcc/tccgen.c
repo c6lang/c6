@@ -12700,6 +12700,11 @@ static const struct C6ErrStdSlot {
     { "std.str",   C6_ERR_SLOT_STD + 5 },
     { "std.fmt",   C6_ERR_SLOT_STD + 6 },
     { "std.range", C6_ERR_SLOT_STD + 7 },
+    { "std.sort",  C6_ERR_SLOT_STD + 8 },
+    { "std.mem",   C6_ERR_SLOT_STD + 9 },
+    { "std.io",    C6_ERR_SLOT_STD + 10 },
+    { "std.math",  C6_ERR_SLOT_STD + 11 },
+    { "std.time",  C6_ERR_SLOT_STD + 12 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
