@@ -99,6 +99,9 @@ selftest: build
 # 错误码号段表：errbase.def 必须与「现在 -emit-errbase 会产出的东西」一致
 # （加了模块忘了钉号、或者手改表改了别人的号，都会失败），并且表的各种约束
 # （C126/C127/C128）真的会报错。见 tests/run-errbase.sh。
+# 注意 -emit-errbase 走的是正常编译流程，末尾会把清单里的模块连成一个可执行
+# 文件：清单里不能有第二个 main，带 main 的模块文件由 run-errbase.sh 的
+# MAIN_MODULES 显式排除（新增这类文件时那里会失败，提醒你去确认）。
 errcheck: build
 	./$(ERRBASE)
 

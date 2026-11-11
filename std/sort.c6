@@ -198,8 +198,12 @@ int cmp_str(const void *a, const void *b)
 {
     const Str *x = (const Str *)a;
     const Str *y = (const Str *)b;
+    /* 比较只读：把接收者显式还原成 `Str *` 再调 cmp。直接写 `x->cmp(...)`
+       会让方法调用把 `const Str *` 当成 `self` 传给 `Str *self`，触发一条
+       "assignment discards qualifiers from pointer target type" 警告。 */
+    char[:] ys = y->s;
 
-    return x->cmp(y->s);
+    return cmp((Str *)x, ys);
 }
 
 /* ---- 定型快捷函数（最常用的写法） ---- */

@@ -38,8 +38,37 @@ modules() {
         | sed 's,^\./,,' | sort
 }
 
+# 定义 main 的模块文件必须从 '-emit-errbase' 的清单里剔掉：那个选项走的是
+# 正常编译流程，末尾会把这些文件连成一个可执行文件，同一份清单里有两个 main
+# 就报 "link symbol 'main' defined twice"，整项检查跑不完。这些文件本来也
+# 不需要钉号（main 所在的 TU 不属于任何模块的号段），剔掉不影响表的内容。
+# 排除表是显式的：扫出来的带 main 文件集合必须与它完全一致，新增了带 main 的
+# 模块文件就在这里失败，逼人确认之后才放行，而不是被静默过滤掉。
+MAIN_MODULES='tests/errors/init.c6 tests/errors/module.c6'
+main_bearing() {
+    cd "$ROOT" && grep -lE '^[[:space:]]*(int|void)[[:space:]]+main[[:space:]]*\(' \
+        "$@" 2>/dev/null | sed 's,^\./,,' | sort
+}
+
 # ---- 1. 提交进版本库的表必须是最新的 ----
-mods=$(modules)
+all_mods=$(modules)
+# 排除表必须与实际情况一致：多一个少一个都失败，不静默过滤。
+# 两边都归一成「空格分隔、按名字排序」的字符串再比，免得一个换行分隔一个空格
+# 分隔就永远不相等。
+found_main=$(main_bearing $all_mods | tr '\n' ' ' | sed 's/ *$//')
+table_main=$(printf '%s\n' $MAIN_MODULES | sort | tr '\n' ' ' | sed 's/ *$//')
+if [ "$found_main" != "$table_main" ]; then
+    fail "带 main 的模块文件和排除表对不上（MAIN_MODULES）" \
+         "排除表: $table_main" \
+         "实际扫到: $found_main"
+fi
+mods=$(for m in $all_mods; do
+    keep=yes
+    for x in $MAIN_MODULES; do
+        [ "$m" = "$x" ] && keep=no && break
+    done
+    [ "$keep" = yes ] && echo "$m"
+done)
 inc=
 for d in $(echo "$mods" | sed 's,/[^/]*$,,' | sort -u); do
     inc="$inc -I $ROOT/$d"
