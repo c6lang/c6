@@ -16,7 +16,7 @@
  *
  * 用到的东西：
  *   std.types   u32 / i32 这些定宽类型
- *   std.err     Code 错误码与 msg_of()
+ *   std.err     Error 错误码与 msg_of()
  *   std.str     Str 视图：S()、str()、count()、at()
  *   std.vec     Vect@int：会自己长大的数组（托管引用，new 出来）
  *   std.span    Span@int：数组上的零拷贝窗口

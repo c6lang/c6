@@ -1586,11 +1586,11 @@ smp: 真并行 —— 两个任务同时跑在两个核上
 
 ```
 std/types.c6   std.types   定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
-std/err.c6     std.err     错误码 enum Code（OK…BUSY）+ msg()/msg_of()/is_ok()
-std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T
+std/err.c6     std.err     错误码 enum Error（OK…BUSY）+ msg()/msg_of()/is_ok()
+std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend
 std/span.c6    std.span    别人内存上的窗口 Span@T（纯值、零拷贝）
 std/map.c6     std.map     开放寻址哈希表 Map@(K,V) + Entry/Iter
-std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()
+std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、hash
 std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)
 std/range.c6   std.range   能被 foreach 吃掉的区间 Range/StepRange
 ```
@@ -1611,7 +1611,7 @@ printf("%s\n", b->cstr());
 
 ```sh
 ./tcc/tcc -B tcc -I . -o build/app app.c6 std/vec.c6 std/fmt.c6 std/types.c6
-make stdtest     # 跑 std/ 下全部 test 块（43 个断言）
+make stdtest     # 跑 std/ 下全部 test 块（54 个断言）
 make std-demo    # 编译并运行 examples/wordcount.c6（用到 7 个模块）
 ```
 
@@ -1738,7 +1738,7 @@ make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭
 make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
 make stdtest       # 标准库 std/ 的 test 块
 make std-demo      # 标准库集成示例（examples/wordcount.c6）
-make test-all      # selftest + tests2 + c6selfcheck + freestanding/裸机
+make test-all      # selftest + tests2 + c6selfcheck + 标准库（stdtest/std-demo）+ freestanding/裸机
 make check-all     # test-all + C99 后端两套用例 + 三条自举路线（发布前跑这条）
 ```
 
