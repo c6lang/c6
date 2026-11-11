@@ -1103,7 +1103,10 @@ test 块、0 失败，每个文件一个镜像（`examples/boot/runtests.sh`）�
 `gc_drop`/`tuple_thread` 要 `pthread_create`，`defer_thread` 要 `clone`/`futex`，
 `method` 要 libc 的 `FILE` 布局。整个文件跳太重时只跳一块：块上一行写
 `// BARE-SKIP`，harness 就把它从表里去掉、块号不变（`tests/generic_fn.c6`
-里起线程那块，同一个文件剩下 8 块仍跑）。踩到的三件事：默认 256KB 的 bump
+里起线程那块，同一个文件剩下 8 块仍跑）。条件编译里没开的块不用标：harness
+认 `#if`/`#ifdef`（裸机编译不带 `-D`，`#if defined X` 一律当假），这种块既不
+进表也不占号（`tests/test-block.c6` 的 `#if defined FAILING_BLOCK`，否则表里会
+多出 `__tcc_test_7` 这个悬空引用）。踩到的三件事：默认 256KB 的 bump
 arena 不够（给 calloc/free/realloc 就好）；`select` 要把 0/1/2 当永远就绪；
 多个 TU 一次编译会撞上 `c6_gc_new_lead` 的 NULL 标签名 strcmp（拆成 -c + 链接绕开）。
 

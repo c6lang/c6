@@ -1507,6 +1507,11 @@ bare tests: 35 通过, 0 失败（跳过: defer_thread gc_drop gc_thread method 
 「实例是普通函数：可以起线程」就是这么处理的 —— 它只缺线程，别的 8 个块
 在裸机上照样有意义。
 
+条件编译里没开的块不用标：harness 认 `#if` / `#ifdef` 的条件（裸机编译不带任何
+`-D`，所以 `#if defined X` 一律当假），这种块既不进表也不占块号。
+`tests/test-block.c6` 里藏在 `#if defined FAILING_BLOCK` 里的那一块就靠这个 ——
+不然表里会多一个 `__tcc_test_7`，链接期报 unresolved reference。
+
 三个只有真跑一遍才会知道的坑：
 
 - **默认 256KB 的 arena 跑不了一整套**。裸机上没有 `calloc` 时运行时用
