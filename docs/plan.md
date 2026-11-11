@@ -1172,7 +1172,9 @@ IDT，开中断等于三重故障。另外 `boot.S` 得把 LAPIC 那页（`0xFEE
 于是中断十有八九插在紧跟其后的 `ret` 上，这个偶发才显得那么"随机"。现在
 改成直接读硬件压下的 `rsp`，同一镜像连跑 40 次不再复现。
 
-遗留：`spawn` 的**句柄**
-（`h->join()`/`h->value()`）在裸机上还没打通：要走 `libtcc1` 的每线程块
-（`calloc`/`free` + pthread 键），实测任务收尾后三重故障 —— 调度这层本身
-没问题，`pthread_create` + `pthread_join` + 返回值用普通函数体任务测过。
+`spawn` 的**句柄**（`h->join()`/`h->value()`）在裸机上已打通：它走的还是
+`libtcc1` 的每线程块（`calloc`/`free` + pthread 键），而 `sched.plain.c` 把
+这 8 个 pthread 入口都给了最小实现（`pthread_join` 就是自旋等任务自己的
+`done`）。用 `thread h = spawn twice(21); h->join(); h->value();` 在裸机上实测
+是 `join=0 value=42`，任务体确实跑过（当初"任务收尾后三重故障"是调度器读
+被打断 `rsp` 那个 bug 的连带表现，那个修掉之后就不复现了）。
