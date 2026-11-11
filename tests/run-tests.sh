@@ -319,16 +319,17 @@ if [ "$BACKEND" = native ] && is_wanted "c6ext/rule"; then
 .c6 里的 defer 编不过:$(cat "$TMP/err")"
     fi
 
-    # -std=c6 已经取消：报错并让用户改后缀，而不是静默忽略
+    # -std=c6 已经取消：报错说明「后缀才是开关」，源文件本来就是 .c6 时
+    # 只需去掉选项（旧文案一律让用户改后缀，对这种情况是错的）
     if $TCC -B "$ROOT/tcc" $TCCFLAGS -std=c6 -run "$TMP/plain.c6" \
             >/dev/null 2>"$TMP/err"; then
         ok=no
         detail="$detail
 -std=c6 竟然被接受了"
-    elif ! grep -qF ".c6" "$TMP/err"; then
+    elif ! grep -qF -e "-std=c6 is gone: the '.c6' suffix is the only switch" "$TMP/err"; then
         ok=no
         detail="$detail
--std=c6 的报错没有提到 .c6:$(cat "$TMP/err")"
+-std=c6 的报错没有说明后缀才是开关:$(cat "$TMP/err")"
     fi
 
     if [ $ok = yes ]; then

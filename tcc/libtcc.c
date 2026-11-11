@@ -2093,11 +2093,14 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
                line: only a '.c6' file turns the extensions on (see
                tcc_add_file_internal()).  A switch would silently change what
                every plain C file in the same run means, so it is refused
-               instead of being ignored. */
+               instead of being ignored.  The old wording told everyone to
+               rename the source, which is wrong for the common case of a
+               '.c6' file with a stale option, so say what to do instead. */
             else if (strcmp(optarg, "=c6") == 0)
                 return tcc_error_noabort(
-                    "-std=c6 is gone: rename the source file to '*.c6' "
-                    "to enable the c6 extensions");
+                    "-std=c6 is gone: the '.c6' suffix is the only switch, "
+                    "so drop the option (rename a plain C source to '*.c6' "
+                    "to enable the extensions)");
 #endif
             break;
         case TCC_OPTION_shared:
