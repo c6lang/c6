@@ -20,6 +20,60 @@
 module std.fmt;
 import std.types;
 
+/* ---- 数字转换原语 ---- */
+/* 把 v 写成十进制 / 十六进制数字放进 dst（cap 是 dst 的字节容量），返回
+   长度；放不下返回 -1 且**一个字节都不写**。Buf@(N) 和 std.strbuf 共用
+   这一套，省得每个容器各写一份倒写循环——两处漂移过一次，就别再来第二次。 */
+int digits_u32(char *dst, int cap, u32 v)
+{
+    char tmp[16] = { 0 };
+    int k = 0, i = 0;
+
+    do {
+        tmp[k++] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    } while (v != 0u);
+    if (!dst || cap < k)
+        return -1;
+    for (i = 0; i < k; i++)
+        dst[i] = tmp[k - 1 - i];
+    return k;
+}
+
+int digits_u64(char *dst, int cap, u64 v)
+{
+    char tmp[24] = { 0 };
+    int k = 0, i = 0;
+
+    do {
+        tmp[k++] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    } while (v != 0u);
+    if (!dst || cap < k)
+        return -1;
+    for (i = 0; i < k; i++)
+        dst[i] = tmp[k - 1 - i];
+    return k;
+}
+
+/* 小写、无前缀、不补零：0 写成 "0"，2^64-1 写成 16 个 f */
+int digits_hex(char *dst, int cap, u64 v)
+{
+    char tmp[16] = { 0 };
+    const char *digits = "0123456789abcdef";
+    int k = 0, i = 0;
+
+    do {
+        tmp[k++] = digits[(int)(v & 0xfu)];
+        v >>= 4;
+    } while (v != 0ull);
+    if (!dst || cap < k)
+        return -1;
+    for (i = 0; i < k; i++)
+        dst[i] = tmp[k - 1 - i];
+    return k;
+}
+
 struct Buf@(int N) {
     char data[N];
     int n;
@@ -73,20 +127,14 @@ struct Buf@(int N) {
         return 0;
     }
 
-    /* 十进制无符号：从尾部倒着写 */
+    /* 十进制无符号：交给 digits_u32（放不下时它一个字节都不写） */
     int!error write_uint(u32 v)
     {
-        char tmp[16] = { 0 };
-        int k = 0, i = 0;
+        int k = digits_u32(data + n, N - 1 - n, v);
 
-        do {
-            tmp[k++] = (char)('0' + (v % 10u));
-            v /= 10u;
-        } while (v != 0u);
-        if (k > N - 1 - n)
+        if (k < 0)
             return err(3, "fmt: buffer full");
-        for (i = k - 1; i >= 0; i--)
-            data[n++] = tmp[i];
+        n += k;
         data[n] = 0;
         return 0;
     }
@@ -105,27 +153,21 @@ struct Buf@(int N) {
         return 0;
     }
 
-    /* 十进制无符号，64 位：与 write_uint 同一套倒写法，只是类型更宽。
-       tmp 要 20 格才装得下 2^64-1 的二十位十进制，这里给 24。 */
+    /* 十进制无符号，64 位：同一个原语，只是类型更宽 */
     int!error write_u64(u64 v)
     {
-        char tmp[24] = { 0 };
-        int k = 0, i = 0;
+        int k = digits_u64(data + n, N - 1 - n, v);
 
-        do {
-            tmp[k++] = (char)('0' + (v % 10u));
-            v /= 10u;
-        } while (v != 0u);
-        if (k > N - 1 - n)
+        if (k < 0)
             return err(5, "fmt: buffer full");
-        for (i = k - 1; i >= 0; i--)
-            data[n++] = tmp[i];
+        n += k;
         data[n] = 0;
         return 0;
     }
 
     /* 十六进制，小写、无前缀、不补零：0 写成 "0"。
-       16 格放得下 64 位的十六位数字（当前只收 u32，留出余量）。 */
+       形参保持 u32：把它直接放宽成 u64 会触发编译器的「同形状方法」死循环
+       （见 docs/stdlib.md 已知限制），64 位走 write_hex64。 */
     int!error write_hex(u32 v)
     {
         char tmp[16] = { 0 };
@@ -140,6 +182,18 @@ struct Buf@(int N) {
             return err(6, "fmt: buffer full");
         for (i = k - 1; i >= 0; i--)
             data[n++] = tmp[i];
+        data[n] = 0;
+        return 0;
+    }
+
+    /* 64 位十六进制：走共享原语，2^64-1 写成 16 个 f */
+    int!error write_hex64(u64 v)
+    {
+        int k = digits_hex(data + n, N - 1 - n, v);
+
+        if (k < 0)
+            return err(10, "fmt: buffer full");
+        n += k;
         data[n] = 0;
         return 0;
     }
@@ -370,4 +424,63 @@ checked:
 checked2:
     if (p->count() != 0 || p->cstr()[0] != 0)
         return err(53, "失败时改动了内容");
+}
+
+test "数字转换原语：长度、-1、不写半截" {
+    char buf[24] = { 0 };
+    int k = 0;
+
+    if (digits_u32(buf, (int)sizeof buf, 0u) != 1 || buf[0] != '0')
+        return err(54, "digits_u32(0) 不对");
+    memset(buf, 0, sizeof buf);
+    k = digits_u32(buf, 4, 1234u);
+    buf[k] = 0;
+    if (k != 4 || strcmp(buf, "1234") != 0)
+        return err(55, "digits_u32(1234) 不对");
+    memset(buf, 0, sizeof buf);
+    buf[0] = 'X';
+    if (digits_u32(buf, 3, 1234u) != -1 || buf[0] != 'X')
+        return err(56, "digits_u32 放不下时写了半截");
+    memset(buf, 0, sizeof buf);
+    k = digits_u64(buf, (int)sizeof buf, 18446744073709551615ull);
+    buf[k] = 0;
+    if (k != 20 || strcmp(buf, "18446744073709551615") != 0)
+        return err(57, "digits_u64(2^64-1) 不对");
+    memset(buf, 0, sizeof buf);
+    k = digits_hex(buf, (int)sizeof buf, 0u);
+    buf[k] = 0;
+    if (k != 1 || strcmp(buf, "0") != 0)
+        return err(58, "digits_hex(0) 不对");
+    memset(buf, 0, sizeof buf);
+    k = digits_hex(buf, (int)sizeof buf, 0xdeadbeefu);
+    buf[k] = 0;
+    if (k != 8 || strcmp(buf, "deadbeef") != 0)
+        return err(59, "digits_hex(deadbeef) 不对");
+    if (digits_hex(buf, 4, 0xdeadbeefu) != -1)
+        return err(60, "digits_hex 放不下没返回 -1");
+    if (digits_u32((char *)0, 8, 1u) != -1)
+        return err(61, "空目标没返回 -1");
+}
+
+test "write_hex64 写满 64 位（write_hex 仍是 u32）" {
+    Buf@(32) b = { { 0 }, 0 };
+    Buf@(32) *p = &b;
+    Buf@(4) s = { { 0 }, 0 };
+    Buf@(4) *q = &s;
+
+    p->write_hex(0u) catch e { return err(62, "hex 0 失败"); };
+    p->add(' ') catch e { return err(63, "空格失败"); };
+    p->write_hex64(~(u64)0) catch e { return err(64, "hex 2^64-1 失败"); };
+    if (strcmp(p->cstr(), "0 ffffffffffffffff") != 0)
+        return err(65, "64 位十六进制结果不对");
+    /* Buf@(4) 装不下 8 位十六进制：报 id 10，且不写半截 */
+    q->write_hex64(0xdeadbeefu) catch e {
+        if (e.id != 10)
+            return err(66, "write_hex64 写满应报 id 10");
+        goto checked;
+    };
+    return err(67, "write_hex64 写满却没报错");
+checked:
+    if (q->count() != 0 || q->cstr()[0] != 0)
+        return err(68, "失败时改动了内容");
 }

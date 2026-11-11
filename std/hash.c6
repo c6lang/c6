@@ -1,0 +1,198 @@
+/* std/hash：非加密哈希与校验和。
+ *
+ *     import std.hash;
+ *
+ *     u32 h = fnv1a_cstr("hello");
+ *     Hasher s = hasher();
+ *     update(&s, "foo", 3);
+ *     update(&s, "bar", 3);
+ *     u32 h2 = digest(&s);          // 与 fnv1a_cstr("foobar") 相同
+ *
+ * 这一层全是纯函数：不分配、不失败、不链 libm；`p == NULL` 一律当空输入
+ * （n 被忽略），所以「没有数据」不需要调用方先判空。
+ *
+ * 为什么只有 FNV / CRC32 / Adler-32：它们是校验和，不是密码学哈希。要抗
+ * 碰撞的场合请用专门的库；标准库不提供、也不假装提供。
+ *
+ * `fnv1a_bytes` 与 `std/str.c6` 的 `Str->hash()`、`std/map.c6` 模板内的
+ * 按键哈希是同一套常量（offset 2166136261、prime 16777619）。那两处为了
+ * 让「用 str/map 的程序不必多编一个文件」保持内联，三处的已知向量测试
+ * 互相钉住——改常量必须三处一起改。
+ */
+#include <string.h>
+
+module std.hash;
+import std.types;
+
+/* 流式 FNV-1a 32：`update` 可以分段喂，结果与一次喂完相同 */
+struct Hasher {
+    u32 h;
+    usize total;    /* 喂进去的字节数，方便调用方自己判空 */
+};
+
+Hasher hasher(void)
+{
+    Hasher s = { 2166136261u, 0u };
+
+    return s;
+}
+
+void update(Hasher *self, const void *p, usize n)
+{
+    const u8 *b = (const u8 *)p;
+    usize i = 0;
+
+    if (!b)
+        return;                 /* NULL 当空输入，n 被忽略 */
+    for (i = 0; i < n; i++)
+        self->h = (self->h ^ (u32)b[i]) * 16777619u;
+    self->total += n;
+}
+
+u32 digest(Hasher *self) { return self->h; }
+
+/* 一次性 FNV-1a 32 */
+u32 fnv1a_bytes(const void *p, usize n)
+{
+    Hasher s = hasher();
+
+    update(&s, p, n);
+    return digest(&s);
+}
+
+/* C 字符串版本：NULL 当空串（空串的 FNV-1a 32 是 0x811c9dc5） */
+u32 fnv1a_cstr(char *z)
+{
+    if (!z)
+        return 2166136261u;
+    return fnv1a_bytes(z, (usize)strlen(z));
+}
+
+/* 一次性 FNV-1a 64：给需要更宽摘要的场合 */
+u64 fnv1a64_bytes(const void *p, usize n)
+{
+    const u8 *b = (const u8 *)p;
+    u64 h = 14695981039346656037ull;
+    usize i = 0;
+
+    if (!b)
+        return h;
+    for (i = 0; i < n; i++)
+        h = (h ^ (u64)b[i]) * 1099511628211ull;
+    return h;
+}
+
+/* CRC-32（IEEE 802.3，反射多项式 0xEDB88320）。逐位实现，不带 1KB 表：
+   标准库这一层优先「小、可读、无静态状态」，吞吐不是它的目标。 */
+u32 crc32_bytes(const void *p, usize n)
+{
+    const u8 *b = (const u8 *)p;
+    u32 c = 0xffffffffu;
+    usize i = 0;
+    int k = 0;
+
+    if (!b)
+        return 0;
+    for (i = 0; i < n; i++) {
+        c ^= (u32)b[i];
+        for (k = 0; k < 8; k++) {
+            if (c & 1u)
+                c = (c >> 1) ^ 0xedb88320u;
+            else
+                c >>= 1;
+        }
+    }
+    return c ^ 0xffffffffu;
+}
+
+/* Adler-32：比 CRC32 快、比 CRC32 弱；空输入的规范值是 1 */
+u32 adler32_bytes(const void *p, usize n)
+{
+    const u8 *b = (const u8 *)p;
+    u32 a = 1u, s = 0u;
+    usize i = 0;
+
+    if (!b)
+        return 1u;
+    for (i = 0; i < n; i++) {
+        a = (a + (u32)b[i]) % 65521u;
+        s = (s + a) % 65521u;
+    }
+    return (s << 16) | a;
+}
+
+/* ---- 自测 ---- */
+
+test "FNV-1a 32 的已知向量" {
+    if (fnv1a_bytes((char *)"", 0) != 0x811c9dc5u)
+        return err(1, "空串的 FNV-1a 32 不对");
+    if (fnv1a_cstr((char *)"a") != 0xe40c292cu)
+        return err(2, "\"a\" 的 FNV-1a 32 不对");
+    if (fnv1a_cstr((char *)"foobar") != 0xbf9cf968u)
+        return err(3, "\"foobar\" 的 FNV-1a 32 不对");
+    /* NULL 当空串 */
+    if (fnv1a_cstr((char *)0) != 0x811c9dc5u)
+        return err(4, "NULL 没有当成空串");
+}
+
+test "流式 update 与一次性结果相同" {
+    Hasher a = hasher();
+    Hasher b = hasher();
+    usize before = 0;
+
+    update(&a, (char *)"foobar", 6);
+    update(&b, (char *)"foo", 3);
+    before = b.total;
+    update(&b, (char *)"bar", 3);
+    if (before != 3u || b.total != 6u)
+        return err(5, "total 没有累加");
+    if (digest(&a) != digest(&b))
+        return err(6, "分段 update 与一次喂完不同");
+    if (digest(&a) != fnv1a_bytes((char *)"foobar", 6))
+        return err(7, "digest 与 fnv1a_bytes 不同");
+}
+
+test "NULL 输入被当成空输入" {
+    Hasher s = hasher();
+
+    update(&s, (const void *)0, 99);
+    if (digest(&s) != 0x811c9dc5u || s.total != 0u)
+        return err(8, "NULL 输入改动了状态");
+    if (fnv1a64_bytes((const void *)0, 4) != 14695981039346656037ull)
+        return err(9, "NULL 输入的 FNV-1a 64 不是空值");
+    if (crc32_bytes((const void *)0, 4) != 0u)
+        return err(10, "NULL 输入的 CRC32 不是 0");
+    if (adler32_bytes((const void *)0, 4) != 1u)
+        return err(11, "NULL 输入的 Adler-32 不是 1");
+}
+
+test "FNV-1a 64 的已知向量" {
+    if (fnv1a64_bytes((char *)"", 0) != 0xcbf29ce484222325ull)
+        return err(12, "空串的 FNV-1a 64 不对");
+    if (fnv1a64_bytes((char *)"a", 1) != 0xaf63dc4c8601ec8cull)
+        return err(13, "\"a\" 的 FNV-1a 64 不对");
+}
+
+test "CRC-32 的已知向量" {
+    if (crc32_bytes((char *)"123456789", 9) != 0xcbf43926u)
+        return err(14, "CRC32(123456789) 不对");
+    if (crc32_bytes((char *)"", 0) != 0u)
+        return err(15, "空输入的 CRC32 不是 0");
+}
+
+test "Adler-32 的已知向量" {
+    if (adler32_bytes((char *)"Wikipedia", 9) != 0x11e60398u)
+        return err(16, "Adler-32(Wikipedia) 不对");
+    if (adler32_bytes((char *)"", 0) != 1u)
+        return err(17, "空输入的 Adler-32 不是 1");
+}
+
+test "同一份字节不同切法给出同一个校验和" {
+    char buf[6] = { 'a', 'b', 'c', 'd', 'e', 'f' };
+    char whole[6] = { 'a', 'b', 'c', 'd', 'e', 'f' };
+
+    if (fnv1a_bytes(buf, 6) != fnv1a_bytes(whole, 6))
+        return err(18, "同样的字节给了不同哈希");
+    if (crc32_bytes(buf, 6) != crc32_bytes(whole, 6))
+        return err(19, "同样的字节给了不同 CRC");
+}

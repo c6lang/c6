@@ -1064,12 +1064,57 @@ ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-6
 
 ### 11.11 标准库 `std/`
 
-写标准库是这一轮扩展的验收项：`std/types`、`std/err`、`std/vec`、`std/span`、
-`std/map`、`std/str`、`std/fmt`、`std/range` 八个模块（一个文件一个 module，
-模块名就是路径），43 个 `test` 断言（`make stdtest`），加一个集成示例
-`examples/wordcount.c6`（`make std-demo`）。设计、API、写法约定与编译器层面
-的已知限制见 [stdlib.md](stdlib.md)；上面 11.10 的三处修复就是把它写出来时
-暴露的。
+写标准库是这一轮扩展的验收项。第一批是 `std/types`、`std/err`、`std/vec`、
+`std/span`、`std/map`、`std/str`、`std/fmt`、`std/range` 八个模块（一个文件一个
+module，模块名就是路径），加一个集成示例 `examples/wordcount.c6`
+（`make std-demo`）；第二批补了 `std/mem`、`std/io`、`std/math`、`std/time`、
+`std/strbuf`、`std/utf8`、`std/bits`、`std/hash`、`std/path`、`std/deque`，并给
+`str`/`vec`/`fmt` 补了 `to_u64`/`strip_prefix`/`strip_suffix`/`fields`、
+`any`/`all`/`find_if`/`swap`、`digits_*` 原语与 `write_hex64`（见 11.12）。现在
+`make stdtest` 是 19 个模块、149 个 `test` 块，集成示例两个：`std-demo` 和
+`std-tour`。设计、API、写法约定与编译器层面的已知限制见
+[stdlib.md](stdlib.md)；上面 11.10 的三处修复就是把它写出来时暴露的。
+
+### 11.12 标准库第二批（strbuf / utf8 / bits / hash / path / deque）
+
+第二批的目标不是「再加几个容器」，而是把**零分配的那一层**补齐：路径、哈希、
+位运算、UTF-8 都能不碰堆直接用，容器只留真正需要动态内存的地方。
+
+| 模块 | 定位 | 关键决定 |
+| --- | --- | --- |
+| `std.strbuf` | 长度未知的字符串拼接 | 托管引用 + 从 64 起翻倍；数字转换复用 `std.fmt` 的 `digits_u32`/`digits_u64`/`digits_hex`，两条路径格式永远一致 |
+| `std.utf8` | 解码/编码/校验/计数 | 严格模式：拒绝过长编码、代理区、`> U+10FFFF`、截断；坏字节只前进 1 字节，不会「一错到底」；编码先校验码点，失败不写任何内容 |
+| `std.bits` | 位运算 | `clz/ctz` 对 0 输入给 32/64（不返回未定义值）；旋转对移位量取模；`bit_*` 越界是 no-op |
+| `std.hash` | FNV-1a 32/64、CRC32、Adler-32 + 流式 `Hasher` | CRC32 逐位算，不建 256 项表（不占数据、不链 zlib）；已知向量钉死在 `test` 块里（`"a"`、`"123456789"`、`"Wikipedia"`） |
+| `std.path` | POSIX 路径拆装 | 只借 `Str` 这个类型、函数体不依赖 `std.str`；**全部不分配**（视图 + 调用方缓冲）；`normalize` 保留 `".."`——词法消 `..` 会穿过符号链接改变语义 |
+| `std.deque` | 双端队列 | 环形缓冲（`(head + i) % cap`），扩容后按逻辑顺序摊平；`push_front` 若包在数组上就是 O(n)，所以不包装 `Vect` |
+
+`std.str` 补的四个 API 都守住「不分配」：`to_u64` 先判 `(U64_MAX - d) / 10` 再乘
+（不靠回绕），`strip_prefix`/`strip_suffix` 只给视图，`fields()` 是跳过空字段的
+空白分词迭代器。`std.vec` 补 `any`/`all`/`find_if`/`swap`（`all` 对空容器给 1，
+`find_if` 没命中给 -1，`swap` 越界返回 0 且不动内容）。`std.fmt` 把数字转换抽成
+共享原语后，`write_u64`/`write_int`/`write_hex` 只剩「先量长度、再搬字符」。
+
+三个新号段按第一批的规矩进编译器内建表（`tcc/tccgen.c` 的
+`c6_err_std_slots[]`）：`std.strbuf`=0x600d、`std.utf8`=0x600e、`std.bits`=0x600f、
+`std.hash`=0x6010、`std.path`=0x6011、`std.deque`=0x6012。`errbase.def` **不动**：
+std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/run-errbase.sh`
+的 C126（std 槽位不许被钉号）继续成立。
+
+写这批时踩到并绕开的编译器限制（都记进了 [stdlib.md](stdlib.md) 的「已知限制」）：
+
+1. 把 `Buf@(N)->write_hex` 的形参从 `u32` 加宽到 `u64` 会让编译器**挂住**
+   （`-c` 无输出直到超时，退出码 124）。最小复现里同样的 `data + n` 写法单独编
+   没问题，所以绕法是保持 `write_hex(u32)`、另加 `write_hex64(u64)`。
+2. 切片的字段不能就地改：`char[:] p; p.len -= 1;` 报 `assignment of read-only
+   location`，改用游标算完再 `(char[:]){ p.data, n }` 重建（`std/path.c6` 的
+   `strip_trailing`）。
+3. `catch` 体必须以 `return`/`err()`/`goto` 收尾，所以「失败了记一笔继续跑」的
+   演示代码要包一层返回 `-1` 的辅助函数（`examples/stdtour.c6` 的
+   `append`/`put_int`/`dq_push_back`）。
+
+验收：`make stdtest`（19 个模块、149 个 `test` 块、0 failure）、`make std-tour`
+（`examples/stdtour.c6`，73 条自检全过）、`make std-demo`、`make errcheck` 全绿。
 
 ## 裸机验证（fstest-bare）
 

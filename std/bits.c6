@@ -1,0 +1,314 @@
+/* std/bits：位运算原语。
+ *
+ *     import std.bits;
+ *
+ *     int n = popcount64(mask);
+ *     if (bit_get(flags, 3)) ...
+ *     bit_set(&flags, 3);
+ *     u64 low = mask_low(12);          // 0x000fff
+ *
+ * 全是纯算术、无查表、不链 libm。位移量一律先取模（旋转）或先夹取（掩码），
+ * 所以 `rotl32(v, 40)`、`mask_low(999)`、`bit_get(v, -1)` 都不会是未定义
+ * 行为——C 里「移满宽度」是 UB，这一层替调用方兜住。
+ *
+ * 与 std.math / std.mem 的分工：`std.math.is_pow2(int)`、`std.mem.is_pow2_u`
+ * 是给各自模块内部用的 int / usize 版本；这里是显式的 32/64 位版本，不互相
+ * 取代（宽度写进名字里，调用点不会靠猜）。
+ */
+module std.bits;
+import std.types;
+
+/* ---- 计数 ---- */
+
+int popcount32(u32 v)
+{
+    int n = 0;
+
+    while (v != 0u) {
+        n += (int)(v & 1u);
+        v >>= 1;
+    }
+    return n;
+}
+
+int popcount64(u64 v)
+{
+    int n = 0;
+
+    while (v != 0ull) {
+        n += (int)(v & 1ull);
+        v >>= 1;
+    }
+    return n;
+}
+
+/* 奇偶校验：1 表示有奇数个 1 */
+int parity32(u32 v) { return popcount32(v) & 1; }
+
+/* 前导零：0 给出 32 / 64（约定，不是 UB） */
+int clz32(u32 v)
+{
+    int i = 0;
+
+    if (v == 0u)
+        return 32;
+    for (i = 31; i >= 0; i--)
+        if ((v & ((u32)1 << i)) != 0u)
+            return 31 - i;
+    return 32;
+}
+
+int clz64(u64 v)
+{
+    int i = 0;
+
+    if (v == 0ull)
+        return 64;
+    for (i = 63; i >= 0; i--)
+        if ((v & ((u64)1 << i)) != 0ull)
+            return 63 - i;
+    return 64;
+}
+
+/* 尾部零：0 给出 32 / 64 */
+int ctz32(u32 v)
+{
+    int i = 0;
+
+    if (v == 0u)
+        return 32;
+    for (i = 0; i < 32; i++)
+        if ((v & ((u32)1 << i)) != 0u)
+            return i;
+    return 32;
+}
+
+int ctz64(u64 v)
+{
+    int i = 0;
+
+    if (v == 0ull)
+        return 64;
+    for (i = 0; i < 64; i++)
+        if ((v & ((u64)1 << i)) != 0ull)
+            return i;
+    return 64;
+}
+
+/* ---- 旋转 ---- */
+
+u32 rotl32(u32 v, int k)
+{
+    k &= 31;
+    if (k == 0)
+        return v;
+    return (v << k) | (v >> (32 - k));
+}
+
+u32 rotr32(u32 v, int k)
+{
+    k &= 31;
+    if (k == 0)
+        return v;
+    return (v >> k) | (v << (32 - k));
+}
+
+u64 rotl64(u64 v, int k)
+{
+    k &= 63;
+    if (k == 0)
+        return v;
+    return (v << k) | (v >> (64 - k));
+}
+
+u64 rotr64(u64 v, int k)
+{
+    k &= 63;
+    if (k == 0)
+        return v;
+    return (v >> k) | (v << (64 - k));
+}
+
+/* ---- 字节序 ---- */
+
+u16 bswap16(u16 v)
+{
+    return (u16)(((v & 0x00ffu) << 8) | ((v & 0xff00u) >> 8));
+}
+
+u32 bswap32(u32 v)
+{
+    return (v >> 24) | ((v >> 8) & 0x0000ff00u)
+         | ((v << 8) & 0x00ff0000u) | (v << 24);
+}
+
+u64 bswap64(u64 v)
+{
+    return ((u64)bswap32((u32)v) << 32) | (u64)bswap32((u32)(v >> 32));
+}
+
+/* ---- 单 bit ---- */
+
+int bit_get(u64 v, int i)
+{
+    if (i < 0 || i >= 64)
+        return 0;
+    return (int)((v >> i) & 1ull);
+}
+
+void bit_set(u64 *v, int i)
+{
+    if (v && i >= 0 && i < 64)
+        *v |= (u64)1 << i;
+}
+
+void bit_clear(u64 *v, int i)
+{
+    if (v && i >= 0 && i < 64)
+        *v &= ~((u64)1 << i);
+}
+
+void bit_toggle(u64 *v, int i)
+{
+    if (v && i >= 0 && i < 64)
+        *v ^= (u64)1 << i;
+}
+
+/* ---- 掩码 ---- */
+
+/* 低 n 位为 1：n <= 0 给 0，n >= 64 给全 1 */
+u64 mask_low(int n)
+{
+    if (n <= 0)
+        return 0ull;
+    if (n >= 64)
+        return ~(u64)0;
+    return ((u64)1 << n) - 1ull;
+}
+
+/* [lo, hi) 半开区间为 1；空区间或越界夹取后为空都给 0 */
+u64 mask_range(int lo, int hi)
+{
+    if (lo < 0)
+        lo = 0;
+    if (hi > 64)
+        hi = 64;
+    if (lo >= hi)
+        return 0ull;
+    return mask_low(hi) & ~mask_low(lo);
+}
+
+/* 把低 bits 位按补码符号扩展到 64 位：sign_extend(0xf, 4) == -1 */
+u64 sign_extend(u64 v, int bits)
+{
+    u64 m = 0ull;
+
+    if (bits <= 0 || bits >= 64)
+        return v;
+    m = (u64)1 << (bits - 1);
+    return (v ^ m) - m;
+}
+
+/* ---- 判定 ---- */
+
+int is_pow2_32(u32 v) { return v != 0u && (v & (v - 1u)) == 0u; }
+
+int is_pow2_64(u64 v) { return v != 0ull && (v & (v - 1ull)) == 0ull; }
+
+/* ---- 自测 ---- */
+
+test "popcount / parity" {
+    if (popcount32(0u) != 0 || popcount32(0xf0f0f0f0u) != 16)
+        return err(1, "popcount32 不对");
+    if (popcount32(0xffffffffu) != 32)
+        return err(2, "popcount32 全 1 不对");
+    if (popcount64(0ull) != 0 || popcount64(~(u64)0) != 64)
+        return err(3, "popcount64 边界不对");
+    if (parity32(1u) != 1 || parity32(3u) != 0 || parity32(7u) != 1)
+        return err(4, "parity32 不对");
+}
+
+test "clz / ctz 的 0 与最高位约定" {
+    if (clz32(0u) != 32 || ctz32(0u) != 32)
+        return err(5, "clz/ctz 的 0 约定不对");
+    if (clz64(0ull) != 64 || ctz64(0ull) != 64)
+        return err(6, "clz64/ctz64 的 0 约定不对");
+    if (clz32(1u) != 31 || clz32(0x80000000u) != 0)
+        return err(7, "clz32 不对");
+    if (ctz32(8u) != 3 || ctz32(0x80000000u) != 31)
+        return err(8, "ctz32 不对");
+    if (clz64(1ull) != 63 || ctz64((u64)1 << 40) != 40)
+        return err(9, "clz64/ctz64 不对");
+}
+
+test "旋转可逆且对位移量取模" {
+    u32 a = 0x80000001u;
+    u64 b = 0x8000000000000001ull;
+
+    if (rotl32(a, 1) != 0x00000003u)
+        return err(10, "rotl32 不对");
+    if (rotr32(rotl32(a, 5), 5) != a)
+        return err(11, "rotl32/rotr32 不互逆");
+    if (rotl32(a, 32) != a || rotl32(a, 40) != rotl32(a, 8))
+        return err(12, "rotl32 没有对 32 取模");
+    if (rotl64(b, 64) != b || rotr64(rotl64(b, 7), 7) != b)
+        return err(13, "rotl64/rotr64 不对");
+    if (rotl64(b, 65) != rotl64(b, 1))
+        return err(14, "rotl64 没有对 64 取模");
+}
+
+test "bswap 三种宽度" {
+    if (bswap16(0x1234u) != 0x3412u)
+        return err(15, "bswap16 不对");
+    if (bswap32(0x11223344u) != 0x44332211u)
+        return err(16, "bswap32 不对");
+    if (bswap64(0x1122334455667788ull) != 0x8877665544332211ull)
+        return err(17, "bswap64 不对");
+    if (bswap32(bswap32(0xdeadbeefu)) != 0xdeadbeefu)
+        return err(18, "bswap32 不互逆");
+}
+
+test "单 bit 读写与越界" {
+    u64 v = 0ull;
+
+    bit_set(&v, 3);
+    bit_set(&v, 63);
+    if (v != 0x8000000000000008ull)
+        return err(19, "bit_set 不对");
+    if (bit_get(v, 3) != 1 || bit_get(v, 4) != 0)
+        return err(20, "bit_get 不对");
+    bit_toggle(&v, 3);
+    if (bit_get(v, 3) != 0)
+        return err(21, "bit_toggle 没有清掉");
+    bit_clear(&v, 63);
+    if (v != 0ull)
+        return err(22, "bit_clear 不对");
+    /* 越界一律不动、不报错 */
+    bit_set(&v, -1);
+    bit_set(&v, 64);
+    bit_set((u64 *)0, 1);
+    if (v != 0ull || bit_get(v, 64) != 0 || bit_get(v, -3) != 0)
+        return err(23, "越界没有兜住");
+}
+
+test "mask / sign_extend / is_pow2" {
+    if (mask_low(0) != 0ull || mask_low(1) != 1ull || mask_low(12) != 0xfffull)
+        return err(24, "mask_low 不对");
+    if (mask_low(64) != ~(u64)0 || mask_low(999) != ~(u64)0 || mask_low(-1) != 0ull)
+        return err(25, "mask_low 边界不对");
+    if (mask_range(4, 8) != 0xf0ull)
+        return err(26, "mask_range 不是半开区间");
+    if (mask_range(8, 4) != 0ull || mask_range(0, 64) != ~(u64)0)
+        return err(27, "mask_range 边界不对");
+    if (sign_extend(0xfull, 4) != ~(u64)0)
+        return err(28, "sign_extend 负数不对");
+    if (sign_extend(0x7ull, 4) != 7ull)
+        return err(29, "sign_extend 正数不对");
+    if (sign_extend(0xfull, 64) != 0xfull)
+        return err(30, "sign_extend 满宽度应原样返回");
+    if (is_pow2_32(0u) != 0 || is_pow2_32(1u) != 1 || is_pow2_32(64u) != 1
+        || is_pow2_32(96u) != 0)
+        return err(31, "is_pow2_32 不对");
+    if (is_pow2_64(0ull) != 0 || is_pow2_64((u64)1 << 40) != 1)
+        return err(32, "is_pow2_64 不对");
+}

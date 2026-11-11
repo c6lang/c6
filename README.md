@@ -1609,17 +1609,23 @@ smp: 真并行 —— 两个任务同时跑在两个核上
 ```
 std/types.c6   std.types   定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
 std/err.c6     std.err     错误码 enum Error（OK…BUSY）+ msg()/msg_of()/is_ok()
-std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold
+std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 std/span.c6    std.span    别人内存上的窗口 Span@T（纯值、零拷贝）
 std/map.c6     std.map     开放寻址哈希表 Map@(K,V) + Entry/Iter：put/get/get_or/set/put_new/remove
-std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、to_int/to_base、replace/split_once、hash
-std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)：write_int/u64/hex/bin/bool/ptr、write_pad
+std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、to_int/to_u64、strip_prefix/suffix、fields、replace/split_once、hash
+std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)：write_int/u64/hex/hex64/bin/bool/ptr、write_pad（共用 digits_* 原语）
 std/range.c6   std.range   能被 foreach 吃掉的区间 Range/StepRange
 std/sort.c6    std.sort    比较器驱动的排序与二分查找：sort_int/sort_bytes、find_int、lower/upper_bound
 std/mem.c6     std.mem     借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
 std/io.c6      std.io      Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代
 std/math.c6    std.math    整数 gcd/lcm/ipow/clamp/floor_div/mod + 浮点 sqrt/floor/ceil/round（不链 libm）
 std/time.c6    std.time    now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
+std/strbuf.c6  std.strbuf  会长的字符缓冲 StrBuf（托管引用）：write/write_int/write_hex、reserve/truncate/cstr
+std/utf8.c6    std.utf8   UTF-8 解码/编码/校验/计数 + Rune 迭代器（拒绝过长编码、代理区、截断）
+std/bits.c6    std.bits   popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/clear、mask/sign_extend/is_pow2
+std/hash.c6    std.hash   FNV-1a 32/64、CRC32、Adler-32 + 流式 Hasher
+std/path.c6    std.path   POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
+std/deque.c6   std.deque  环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
 ```
 
 ```c
@@ -1641,8 +1647,9 @@ printf("%s\n", b->cstr());
 ```sh
 ./tcc/c6 -B tcc -I . -o build/app app.c6 \
     std/vec.c6 std/fmt.c6 std/types.c6 std/str.c6 std/sort.c6 std/err.c6
-make stdtest     # 跑 std/ 下全部 test 块（140 个断言）
+make stdtest     # 跑 std/ 下全部 test 块（19 个模块、149 个 test 块）
 make std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
+make std-tour    # 编译并运行 examples/stdtour.c6（6 个新模块，73 条自检）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
@@ -1768,7 +1775,8 @@ make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭
 make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
 make stdtest       # 标准库 std/ 的 test 块
 make std-demo      # 标准库集成示例（examples/wordcount.c6）
-make test-all      # selftest + tests2 + c6selfcheck + 标准库（stdtest/std-demo）+ freestanding/裸机
+make std-tour      # 新模块集成示例（examples/stdtour.c6，自带自检）
+make test-all      # selftest + tests2 + c6selfcheck + 标准库（stdtest/std-demo/std-tour）+ freestanding/裸机
 make check-all     # test-all + C99 后端两套用例 + 三条自举路线（发布前跑这条）
 ```
 

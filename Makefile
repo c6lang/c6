@@ -47,7 +47,7 @@ HOSTCC   ?= gcc
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
-        stdtest errcheck std-demo
+        stdtest errcheck std-demo std-tour
 
 all: build
 
@@ -121,6 +121,8 @@ stdtest: build
 	    case $$f in \
 	    std/sort.c6) deps="std/str.c6" ;; \
 	    std/vec.c6)  deps="std/sort.c6 std/str.c6" ;; \
+	    std/strbuf.c6) deps="std/fmt.c6" ;; \
+	    std/path.c6) deps="std/str.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -142,6 +144,17 @@ std-demo: build
 	@mkdir -p build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I examples -I . -o build/wordcount $(STDDEMO_SRCS)
 	./build/wordcount
+
+# 标准库一日游：把新加的模块（strbuf/utf8/bits/hash/path/deque）串成一个
+# 程序，顺带当它们的集成用例。模块正文照样要一个个列出来。
+STDTOUR_SRCS := examples/stdtour.c6 std/types.c6 std/err.c6 std/str.c6 \
+                std/span.c6 std/fmt.c6 std/strbuf.c6 std/utf8.c6 \
+                std/bits.c6 std/hash.c6 std/path.c6 std/deque.c6
+
+std-tour: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdtour $(STDTOUR_SRCS)
+	./build/stdtour
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
@@ -247,7 +260,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
