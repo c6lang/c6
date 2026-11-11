@@ -275,7 +275,7 @@ make std-demo
 | 泛型**值形参**的模板写 `struct Buf@(int N)`、实例写 `Buf@(8)`（`Buf@(int, 8)` 会被当成两个实参） | 记住「声明带类型和名字，实例只给值」 |
 | **普通**（非泛型）结构体不能在 `struct` 体内写方法体（`a function cannot be defined inside a struct`） | 方法写成「第一个参数是结构体指针」的文件作用域函数，调用写 `(&v)->m()` |
 | 文件作用域里写「参数/返回类型带实例类型」的辅助函数，会让**导入这个模块的每个 TU** 都提前实例化该类型 | 别这么写；需要时把逻辑放进 `test` 块或用标量参数（`std/fmt.c6` 的测试用 `goto` 取错误码） |
-| **待修（编译器 bug）**：往 `Buf@(N)` 里加若干形状相同的方法后，编译会挂在 `skip(')')` → `end_macro()` 的死循环里（`tccpp.c:1120`，gdb 栈：`unary` 的 cast 分支 → `expr_catch`） | 已复现：HEAD 的 `std/fmt.c6` 加 **3 个** 同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）再让一个 `test` 调其中之一就挂，只加 2 个正常；`-test` 与 `examples/wordcount.c6` 都会挂。所以 `std/fmt` 本轮没有加 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr`，等这个修掉再补 |
+| ~~往 `Buf@(N)` 里加若干形状相同的方法会挂~~（曾经的 `skip(')')` → `end_macro()` 死循环） | **已消失**：同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）加到五个也编得过、跑得通，`std/fmt` 的 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr` 就是照这个形状补的（`tccpp.c` 的宏重放改写之后不再复现） |
 
 这些限制在 `docs/grammar.md`（约束表 C1xx）和 `docs/plan.md` 里有对应的
 条目；标准库的写法就是它们当前的「推荐用法」。

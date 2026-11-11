@@ -203,6 +203,17 @@ fstest-bare-go: build
 	./examples/boot/build.sh examples/boot/go_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
+# 裸机上的 spawn 句柄：h->join() 等到任务结束、h->value() 拿到返回值。
+# 走的是 libtcc1 的每线程块 + sched.plain.c 里那 8 个 pthread 入口。
+fstest-bare-handle: build
+	@command -v qemu-system-x86_64 >/dev/null || { \
+	     echo "fstest-bare-handle: 没有 qemu-system-x86_64，跳过"; exit 0; }
+	@command -v as >/dev/null || { \
+	     echo "fstest-bare-handle: 没有 binutils，跳过"; exit 0; }
+	SMP=1 ./examples/boot/build.sh examples/boot/handle_bare.c6 \
+	    examples/boot/sched.plain.c examples/boot/shim.plain.c \
+	    examples/boot/io.c
+
 fstest-bare-smp: build
 	@command -v qemu-system-x86_64 >/dev/null || { \
 	     echo "fstest-bare-smp: 没有 qemu-system-x86_64，跳过"; exit 0; }
@@ -217,7 +228,8 @@ fstest-bare-smp: build
 
 test-all: selftest test c6selfcheck stdtest std-demo fstest fstest-go \
 	  fstest-noos fstest-qemu \
-	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-smp
+	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
+	  fstest-bare-smp
 
 # 完整验收：test-all 之外还有 C99 后端的两套用例（96 组各跑一遍）和三条
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
