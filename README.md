@@ -59,10 +59,14 @@ make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 
 # 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
 ./tcc/c6 -B tcc -run hello.c6      # c6 代码放在 .c6 文件里，后缀就是开关
+
+# 4. 提交前验证：一条命令跑完整回归（最慢的一条，见下面「完整回归」）
+make check-all
 ```
 
-`make build` / `make selftest` / `make test-all` 都会先跑 `bootstrap`：`tcc/`
-已经配置过（有 `config.mak`）就直接跳过，没有才跑一次 `./configure`。
+`make build` / `make selftest` / `make test-all` / `make check-all` 都会先跑
+`bootstrap`：`tcc/` 已经配置过（有 `config.mak`）就直接跳过，没有才跑一次
+`./configure`。
 
 `tcc/` 是普通源码：上游 TinyCC 的基线提交 2d3eea2 先整体导入，之后每个 c6 补丁
 一个提交（提交说明就是补丁标题）。要改 TCC 就直接改 `tcc/` 里的文件、按普通提交
@@ -1657,6 +1661,9 @@ make std-tour    # 编译并运行 examples/stdtour.c6（6 个新模块，73 条
 
 ## 测试
 
+提交前只跑一条命令就够：`make check-all`（= `test-all` + `errcheck` + C99 后端
+两套用例 + 三条自举路线），拆开看是下面「完整回归」里那些目标。
+
 c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 
 ```
@@ -1770,14 +1777,15 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 ### 完整回归
 
 ```sh
+make check-all     # 提交/发布前跑这一条：test-all + errcheck + C99 后端两套用例 + 三条自举路线
+make test-all      # check-all 的第一段：selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
 make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
+make errcheck      # errbase.def：钉号表本身和 C126/C127/C128 真的会报错
 make stdtest       # 标准库 std/ 的 test 块
 make std-demo      # 标准库集成示例（examples/wordcount.c6）
 make std-tour      # 新模块集成示例（examples/stdtour.c6，自带自检）
-make test-all      # selftest + tests2 + c6selfcheck + 标准库（stdtest/std-demo/std-tour）+ freestanding/裸机
-make check-all     # test-all + C99 后端两套用例 + 三条自举路线（发布前跑这条）
 ```
 
 自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：
