@@ -86,6 +86,20 @@ test "test 块之间的状态是共享的" {
         return err(1, "日志没有写进去");
 }
 
+/* 空 test 块：没有 err 就是 PASS（矩阵「空 test 报 PASS」）。
+ * 它和下面几个失败用例的区别只在于有没有返回 err。 */
+test "空的 test 块（体里什么都不做）" {
+}
+
+/* 矩阵「err 报 FAIL」：以 err 结尾的 test 块必须被报成失败。
+ * 这个块由 tests/run-tests.sh 单独驱动（带 -DFAILING_BLOCK），
+ * 在正常的 -test 运行里根本不注册，所以整套用例仍然是 0 失败。 */
+#if defined FAILING_BLOCK
+test "这一块必须失败" {
+    return err(7, "on purpose");
+}
+#endif
+
 /* -test 模式下 main 不会被调用 */
 int main(void)
 {

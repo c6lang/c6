@@ -249,6 +249,29 @@ test "显式转换与复合字面量" {
         return err(3, "复合字面量赋值不对");
 }
 
+/* 矩阵「元组 / 边界 / #pragma pack 不影响布局」：元组的布局在构造时按
+ * 自然对齐算好，不走 struct_layout，所以 pack 只压缩真正声明的 struct。 */
+#pragma pack(push, 1)
+struct Packed { char c; int i; };
+#pragma pack(pop)
+struct Unpacked { char c; int i; };
+
+test "#pragma pack 不影响元组的布局" {
+    (int, int) t = {1, 2};
+    (char, int) m = {'a', 7};
+
+    if (sizeof(struct Packed) != 5)
+        return err(1, "pack(1) 下的 struct 没有被压缩");
+    if (sizeof(struct Unpacked) != 8)
+        return err(2, "普通 struct 的布局变了");
+    if (sizeof((char, int)) != 8)
+        return err(3, "元组被 #pragma pack 压扁了");
+    if (sizeof((char, char)) != 2 || sizeof((int, int)) != 8)
+        return err(4, "元组的自然对齐布局不对");
+    if (t[1] != 2 || m[0] != 'a' || m[1] != 7)
+        return err(5, "pack 之后元组取值不对");
+}
+
 test "元组跨翻译单元共享同一布局" {
     (int, int) t = {4, 5};
 

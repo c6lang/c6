@@ -339,6 +339,89 @@ if [ "$BACKEND" = native ] && is_wanted "c6ext/rule"; then
     fi
 fi
 
+# ---- 1d2. test 块运行器本身：-test-filter 真的只跑匹配的块、以 err 结束的
+#            块被报成失败并让进程以非 0 退出、用户 main 不被调用 ----
+# 这三条是 docs/plan.md §9.1 里 `test` 那一行的「过滤 / 空 test 报 PASS、
+# err 报 FAIL / 与用户 main 共存」，只能由运行器驱动，test 块自己写不出来。
+if [ "$BACKEND" = native ] && is_wanted "test-block"; then
+    ok=yes
+    detail=
+    # 不带 -DFAILING_BLOCK 时，那个故意失败的块在 #if 里没有注册。
+    ntest=$(grep -cE '^test[ \t]' "$ROOT/tests/test-block.c6")
+    ntest=$((ntest - 1))
+
+    # 过滤：只留一个名字，报告里应当恰好出现它
+    if ! out=$($TCC -B "$ROOT/tcc" $TCCFLAGS -test -test-filter=算术 \
+                  "$ROOT/tests/test-block.c6" 2>"$TMP/err"); then
+        ok=no
+        detail="$detail
+-test-filter 运行失败:$(cat "$TMP/err")"
+    elif ! printf '%s\n' "$out" | grep -qx 'PASS: 算术'; then
+        ok=no
+        detail="$detail
+-test-filter=算术 没有跑到匹配的块:$out"
+    elif [ "$(printf '%s\n' "$out" | grep -c '^PASS:')" != 1 ]; then
+        ok=no
+        detail="$detail
+-test-filter=算术 跑了不止一个块:$out"
+    elif ! printf '%s\n' "$out" | tail -n 1 | grep -q '^1 test(s), 0 failure(s)$'; then
+        ok=no
+        detail="$detail
+-test-filter=算术 的收尾不对:$out"
+    fi
+
+    # 不过滤：块数等于文件里的 test 块数（含空的 test 块，它也是 PASS）
+    if $TCC -B "$ROOT/tcc" $TCCFLAGS -test "$ROOT/tests/test-block.c6" \
+            >"$TMP/tb.out" 2>"$TMP/err"; then
+        if ! tail -n 1 "$TMP/tb.out" | grep -q "^$ntest test(s), 0 failure(s)$"; then
+            ok=no
+            detail="$detail
+不带过滤时应当有 $ntest 个块且 0 失败:$(tail -n 1 "$TMP/tb.out")"
+        fi
+        if ! grep -qx 'PASS: 空的 test 块（体里什么都不做）' "$TMP/tb.out"; then
+            ok=no
+            detail="$detail
+空的 test 块没有被报成 PASS"
+        fi
+        if grep -q 'main should not run' "$TMP/tb.out"; then
+            ok=no
+            detail="$detail
+-test 模式下用户的 main 被调用了"
+        fi
+    else
+        ok=no
+        detail="$detail
+-test 运行失败:$(cat "$TMP/err")"
+    fi
+
+    # 以 err 结束的块：报 FAIL、带错误消息、退出码非 0
+    # （这个块由 -DFAILING_BLOCK 打开，正常跑的时候不注册）
+    $TCC -B "$ROOT/tcc" $TCCFLAGS -D FAILING_BLOCK -test \
+        "$ROOT/tests/test-block.c6" >"$TMP/tbf.out" 2>"$TMP/tbf.err"
+    got=$?
+    if [ "$got" = 0 ]; then
+        ok=no
+        detail="$detail
+失败的 test 块没有让进程以非 0 退出"
+    fi
+    if ! grep -q '^FAIL: 这一块必须失败: on purpose$' "$TMP/tbf.err"; then
+        ok=no
+        detail="$detail
+失败的块没有报 'FAIL: ...: on purpose':$(cat "$TMP/tbf.err")"
+    fi
+    if ! tail -n 1 "$TMP/tbf.out" | grep -q ', 1 failure(s)$'; then
+        ok=no
+        detail="$detail
+失败计数不对:$(tail -n 1 "$TMP/tbf.out")"
+    fi
+
+    if [ $ok = yes ]; then
+        note_pass "test-block: -test-filter 只跑匹配块、空块 PASS、err 块 FAIL、main 不执行"
+    else
+        fail "test-block/runner" "$detail"
+    fi
+fi
+
 # ---- 1e. 模块名就是它的路径：分级查找，扁平的 'a.b.c6' 不接受 ----
 if [ "$BACKEND" = native ] && is_wanted "c6ext/modpath"; then
     ok=yes
