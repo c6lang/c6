@@ -3,8 +3,13 @@
  * 每个片段单独用 -D<片段名> 编译（tests/run-errors.sh 驱动），
  * `// EXPECT <片段名>: <诊断文本>` 行声明该片段必须产生的诊断。
  * 不带任何 -D 时是本文件的“正常路径”，必须编译通过。
+ *
+ * 注意：`module` 必须是文件的第一条声明，所以用到它的片段自己声明
+ * `struct S`，不能靠文件顶部那份共享的。
  */
+#if !defined test_module_global && !defined test_module_local
 struct S { int a; };
+#endif
 
 // EXPECT test_local_int: error: variable 'x' must be initialized
 // EXPECT test_local_multi: error: variable 'y' must be initialized
@@ -13,6 +18,10 @@ struct S { int a; };
 // EXPECT test_local_pointer: error: variable 'p' must be initialized
 // EXPECT test_global_int: error: variable 'g' must be initialized
 // EXPECT test_for_init: error: variable 'k' must be initialized
+// 矩阵「变量初始化 / 正向 / 模块内报原名」：模块里的符号内部叫
+// ini__m__g，诊断必须报源码里的 'g'（mangle 之前的名字）。
+// EXPECT test_module_global: error: variable 'g' must be initialized
+// EXPECT test_module_local: error: variable 'x' must be initialized
 
 #if defined test_local_int
 static int f(void) { int x; return x; }
@@ -35,6 +44,18 @@ int main(void) { return g; }
 #elif defined test_for_init
 static int f(void) { int n = 0; for (int k; k < 1; k++) n++; return n; }
 int main(void) { return f(); }
+#elif defined test_module_global
+/* 模块里内部符号叫 ini__m__g，诊断必须报源码里的 'g' */
+module ini.m;
+int g;
+#elif defined test_module_local
+module ini.m;
+int f(void) { int x; return x; }
+#elif defined test_extern_exempt
+/* extern 不是定义，没有初始化器也必须通过 */
+static int e = 0, le = 0;
+extern int e;
+int main(void) { extern int le; return e + le; }
 #elif defined test_ok
 extern int e;
 typedef int myint;

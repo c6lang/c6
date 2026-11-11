@@ -57,6 +57,9 @@ ident cat(ident a, ident b) { a ## b }
 
 type ptr(type T) { T * }
 
+/* 给「实参里再展开宏」那组用：和 sq 组合出多层嵌套 */
+expr add1(expr a) { a + 1; }
+
 /* 角色词不是保留字：没有宏定义在等它的时候，它就是普通标识符 */
 static int expr = 1;
 
@@ -173,4 +176,25 @@ test "同一个作用域里多次展开不冲突" {
     swap(a, b);
     if (a != 9 || b != 3)
         return err(2, "五次 swap 之后应当交换");
+}
+
+/* 矩阵「卫生宏 / 边界 / 递归展开」：一个宏的实参里再展开另一个宏，
+ * 而且每一层都各自有自己的卫生局部变量。 */
+test "宏的实参里再展开宏（递归组合）" {
+    int x = 3;
+    if (add1(sq(x)) != 10)
+        return err(1, "add1(sq(x)) 不对");
+    if (sq(add1(x)) != 16)
+        return err(2, "sq(add1(x)) 不对");
+    if (sq(sq(x)) != 81)
+        return err(3, "sq(sq(x)) 不对");
+    if (imax(sq(2), add1(3)) != 4)
+        return err(4, "imax(sq(2), add1(3)) 不对");
+    /* 嵌套的 stmt 宏：swap 里再调用 outer，两层卫生变量都要各自独立 */
+    {
+        int p = 1, q = 2;
+        outer(p, q);
+        if (p != 2 || q != 1)
+            return err(5, "嵌套 stmt 宏不对");
+    }
 }
