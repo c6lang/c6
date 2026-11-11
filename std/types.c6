@@ -41,6 +41,9 @@ enum Limits {
     I8_MAX   = 0x7f,
     I16_MAX  = 0x7fff,
     I32_MAX  = 0x7fffffff,
+    I8_MIN   = -128,
+    I16_MIN  = -32768,
+    I32_MIN  = -2147483647 - 1,   /* 写成表达式：-2147483648 这个字面量不是 int */
 };
 
 /* 返回值约定用的两个布尔常量。 */
@@ -74,4 +77,13 @@ test "别名可以互相当作同一种类型" {
     usize n = sizeof(byte);
     if (y != 200 || n != 1)
         return err(8, "byte/u8 不是同一个类型");
+}
+
+test "MIN 常量与 MAX 对上" {
+    if (I8_MIN != -128 || I16_MIN != -32768)
+        return err(9, "I8_MIN/I16_MIN 不对");
+    if (I32_MIN != -I32_MAX - 1)
+        return err(10, "I32_MIN 不是 I32_MAX 的补");
+    if (I8_MAX + I8_MIN != -1 || I16_MAX + I16_MIN != -1)
+        return err(11, "MAX/MIN 不是补码关系");
 }

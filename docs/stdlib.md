@@ -16,17 +16,17 @@
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
-| `std/types.c6` | `std.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`/`Bool` 两个枚举 |
+| `std/types.c6` | `std.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`（`U8_MAX`…`I32_MIN`）/`Bool` 两个枚举 |
 | `std/err.c6` | `std.err` | 错误码 `enum Error`（`OK`…`BUSY`，16 个）与 `msg()`/`msg_of()`/`is_ok()`；号段固定在 `0x6000` |
-| `std/vec.c6` | `std.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T` |
+| `std/vec.c6` | `std.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T`：`push`/`pop`、`insert`/`remove_at`/`truncate`、`first`/`last`、`index_of`/`contains`、`reverse`、`slice`/`extend` |
 | `std/span.c6` | `std.span` | 别人内存上的窗口 `Span@T`（纯值，零拷贝） |
 | `std/map.c6` | `std.map` | 开放寻址哈希表 `Map@(K, V)`、`Entry@(K, V)`、`Iter@(K, V)` |
-| `std/str.c6` | `std.str` | 字符串视图 `Str`（`char[:]` 的包装，不分配）与字面量宏 `S()` |
+| `std/str.c6` | `std.str` | 字符串视图 `Str`（`char[:]` 的包装，不分配）与字面量宏 `S()`：切分 `split`/`lines`/`join`、查找 `find`/`last_find`/`contains`/`count_char`/`count_sub`、裁剪 `trim`/`trim_left`/`trim_right`、转换 `to_int`/`copy_upper`/`copy_lower`、`hash` |
 | `std/fmt.c6` | `std.fmt` | 定长格式化缓冲 `Buf@(N)`：整数、补位、拼接 |
 | `std/range.c6` | `std.range` | 能被 `foreach` 吃掉的区间 `Range`/`StepRange` |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
 
-每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（43 个断言）：
+每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑（54 个断言）：
 
 ```
 std/err.c6       3 test(s), 0 failure(s)
@@ -34,9 +34,9 @@ std/fmt.c6       6 test(s), 0 failure(s)
 std/map.c6       7 test(s), 0 failure(s)
 std/range.c6     6 test(s), 0 failure(s)
 std/span.c6      6 test(s), 0 failure(s)
-std/str.c6       7 test(s), 0 failure(s)
-std/types.c6     3 test(s), 0 failure(s)
-std/vec.c6       5 test(s), 0 failure(s)
+std/str.c6      14 test(s), 0 failure(s)
+std/types.c6     4 test(s), 0 failure(s)
+std/vec.c6       8 test(s), 0 failure(s)
 ```
 
 ## 设计原则
@@ -109,6 +109,12 @@ foreach (int x = v->iter()) {
 `at()` 不失败也不报错（越界给零值），要区分「0」和「越界」用
 `get(i, &out)`，它的返回值告诉你有没有取到。
 
+改内容用 `insert(i, v)`（`i` 可以等于 `count()`，等价于 `push`）、
+`remove_at(i)`（删掉给 1，越界给 0）、`truncate(k)`（只留前 k 个，容量不动）、
+`reverse()`、`extend(slice)`；看内容用 `first(&out)`/`last(&out)`（空容器给 0）、
+`index_of(v)`（按字节比较，找不到给 -1）、`contains(v)`、`slice()`（当前内容的
+`T[:]`，只读它，别拿它扩容后继续用）。
+
 ### `Span@T`：不拥有内存的窗口
 
 ```c
@@ -175,6 +181,20 @@ p->copy_to(buf, sizeof buf);                   /* 空间不够返回 -1，不写
 
 `S()` 存在的理由：裸字面量转 `char[:]` 会把结尾的 NUL 也算进长度
 （`"hello"` 得到 6）。`S(lit)` 用 `sizeof(lit) - 1` 给出真实字符数。
+
+切分与拼接（都只动视图，不分配）：
+
+```c
+foreach (Str tok = p->split(',')) { ... }    /* 空字段被跳过："a,,b" 给 a、b */
+foreach (Str line = p->lines()) { ... }      /* 去掉 '\n'，CRLF 的 '\r' 也去掉 */
+Str parts[2] = { { S("a") }, { S("bb") } };
+join(parts, 2, '-', buf, sizeof buf);        /* "a-bb"；空间不够给 -1，不写半截 */
+```
+
+其余：`contains()` / `last_find()` / `last_find_char()` / `count_char()` /
+`count_sub()` / `trim_left()` / `trim_right()` / `hash()`（FNV-1a，和 `std.map`
+按字节求哈希是同一套）。大小写转换不能改原内存，所以写成
+`copy_upper(dst, cap)` / `copy_lower(dst, cap)`：成功返回长度，空间不够给 -1。
 
 ### `Buf@(N)`：定长格式化
 
@@ -255,6 +275,7 @@ make std-demo
 | 泛型**值形参**的模板写 `struct Buf@(int N)`、实例写 `Buf@(8)`（`Buf@(int, 8)` 会被当成两个实参） | 记住「声明带类型和名字，实例只给值」 |
 | **普通**（非泛型）结构体不能在 `struct` 体内写方法体（`a function cannot be defined inside a struct`） | 方法写成「第一个参数是结构体指针」的文件作用域函数，调用写 `(&v)->m()` |
 | 文件作用域里写「参数/返回类型带实例类型」的辅助函数，会让**导入这个模块的每个 TU** 都提前实例化该类型 | 别这么写；需要时把逻辑放进 `test` 块或用标量参数（`std/fmt.c6` 的测试用 `goto` 取错误码） |
+| **待修（编译器 bug）**：往 `Buf@(N)` 里加若干形状相同的方法后，编译会挂在 `skip(')')` → `end_macro()` 的死循环里（`tccpp.c:1120`，gdb 栈：`unary` 的 cast 分支 → `expr_catch`） | 已复现：HEAD 的 `std/fmt.c6` 加 **3 个** 同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）再让一个 `test` 调其中之一就挂，只加 2 个正常；`-test` 与 `examples/wordcount.c6` 都会挂。所以 `std/fmt` 本轮没有加 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr`，等这个修掉再补 |
 
 这些限制在 `docs/grammar.md`（约束表 C1xx）和 `docs/plan.md` 里有对应的
 条目；标准库的写法就是它们当前的「推荐用法」。

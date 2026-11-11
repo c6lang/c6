@@ -95,6 +95,104 @@ struct Vect@T {
 
     void clear() { n = 0; }
 
+    /* 首个 / 末个元素：空容器返回 0（不写 *out） */
+    int first(T *out)
+    {
+        if (n == 0)
+            return 0;
+        *out = data[0];
+        return 1;
+    }
+
+    int last(T *out)
+    {
+        if (n == 0)
+            return 0;
+        *out = data[n - 1];
+        return 1;
+    }
+
+    /* 按字节相等线性查找：命中返回下标，否则 -1。
+       元素里有指针/填充字节时要求两个相等的值逐字节相同（和 std.map 的键一个要求）。 */
+    int index_of(T v)
+    {
+        int i = 0;
+
+        for (i = 0; i < n; i++)
+            if (!memcmp(&data[i], &v, sizeof(T)))
+                return i;
+        return -1;
+    }
+
+    int contains(T v) { return index_of(v) >= 0; }
+
+    /* 在下标 i 处插入：i 可以等于 count()（等价于 push）；插入需要空间，会失败 */
+    int!error insert(int i, T v)
+    {
+        int j = 0;
+
+        if (i < 0 || i > n)
+            return err(std.err.RANGE, "vector: insert out of range");
+        try reserve(n + 1);   /* 原样转发 */
+        for (j = n; j > i; j--)
+            data[j] = data[j - 1];
+        data[i] = v;
+        n++;
+        return 0;
+    }
+
+    /* 删除下标 i：返回 1；越界返回 0（不做事） */
+    int remove_at(int i)
+    {
+        int j = 0;
+
+        if (i < 0 || i >= n)
+            return 0;
+        for (j = i; j + 1 < n; j++)
+            data[j] = data[j + 1];
+        n--;
+        return 1;
+    }
+
+    /* 只保留前 k 个（k 为负当 0，超过 count() 不做事）；容量保留 */
+    void truncate(int k)
+    {
+        if (k < 0)
+            k = 0;
+        if (k < n)
+            n = k;
+    }
+
+    /* 原地反转 */
+    void reverse()
+    {
+        int i = 0, j = n - 1;
+
+        while (i < j) {
+            T t = data[i];
+
+            data[i] = data[j];
+            data[j] = t;
+            i++;
+            j--;
+        }
+    }
+
+    /* 当前内容（不含未用容量）的切片；只读它，别拿它扩容后继续用 */
+    T[:] slice() { return (T[:]){ data, n }; }
+
+    /* 追加整段：够快、不需要先手写循环，空间不够会失败 */
+    int!error extend(T[:] more)
+    {
+        int i = 0;
+
+        try reserve(n + more.len);   /* 原样转发 */
+        for (i = 0; i < more.len; i++)
+            data[n + i] = more[i];
+        n += more.len;
+        return 0;
+    }
+
     /* 迭代器：随实例生成，`foreach (T x = v->iter()) { ... }` 直接可用 */
     Iter@T iter()
     {
@@ -196,4 +294,76 @@ test "元素类型不限于整数" {
     }
     if (sum != 1.75)
         return err(24, "f64 元素的不对");
+}
+
+test "insert / remove_at / truncate" {
+    @Vect@int v = new Vect@int;
+    int i = 0;
+
+    for (i = 0; i < 3; i++)
+        v->push(i) catch e { return err(25, "push 失败"); };
+    v->insert(1, 99) catch e { return err(26, "insert 失败"); };
+    if (v->count() != 4)
+        return err(27, "insert 之后 count 不对");
+    if (v->at(0) != 0 || v->at(1) != 99 || v->at(2) != 1 || v->at(3) != 2)
+        return err(28, "insert 的位置不对");
+    v->insert(4, 7) catch e { return err(29, "尾部 insert 失败"); };
+    if (v->at(4) != 7)
+        return err(30, "尾插等价于 push");
+    if (v->remove_at(1) != 1 || v->count() != 4)
+        return err(31, "remove_at 没删掉");
+    if (v->at(1) != 1 || v->at(3) != 7)
+        return err(32, "remove_at 之后的顺序不对");
+    if (v->remove_at(4) != 0)
+        return err(33, "越界 remove_at 应返回 0");
+    v->truncate(2);
+    if (v->count() != 2 || v->at(0) != 0 || v->at(1) != 1)
+        return err(34, "truncate 不对");
+    v->truncate(99);
+    if (v->count() != 2)
+        return err(35, "truncate 到更大值不该长");
+}
+
+test "first / last / index_of / contains" {
+    @Vect@int v = new Vect@int;
+    int out = 0;
+
+    if (v->first(&out) != 0 || v->last(&out) != 0)
+        return err(36, "空容器 first/last 应返回 0");
+    v->push(10) catch e { return err(37, "push 失败"); };
+    v->push(20) catch e { return err(38, "push 失败"); };
+    v->push(10) catch e { return err(39, "push 失败"); };
+    if (v->first(&out) != 1 || out != 10)
+        return err(40, "first 不对");
+    if (v->last(&out) != 1 || out != 10)
+        return err(41, "last 不对");
+    if (v->index_of(20) != 1 || v->index_of(10) != 0)
+        return err(42, "index_of 不对");
+    if (v->index_of(99) != -1)
+        return err(43, "找不到应返回 -1");
+    if (v->contains(20) != 1 || v->contains(99) != 0)
+        return err(44, "contains 不对");
+}
+
+test "reverse / slice / extend" {
+    @Vect@int v = new Vect@int;
+    @Vect@int w = new Vect@int;
+    int i = 0;
+
+    for (i = 0; i < 3; i++)
+        v->push(i + 1) catch e { return err(45, "push 失败"); };
+    v->reverse();
+    if (v->at(0) != 3 || v->at(1) != 2 || v->at(2) != 1)
+        return err(46, "reverse 不对");
+    {
+        int[:] s = v->slice();
+
+        if (s.len != 3 || s.data[0] != 3)
+            return err(47, "slice 不对");
+    }
+    w->push(7) catch e { return err(48, "push 失败"); };
+    w->push(8) catch e { return err(49, "push 失败"); };
+    v->extend(w->slice()) catch e { return err(50, "extend 失败"); };
+    if (v->count() != 5 || v->at(3) != 7 || v->at(4) != 8)
+        return err(51, "extend 之后内容不对");
 }

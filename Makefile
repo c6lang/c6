@@ -215,7 +215,8 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck fstest fstest-go fstest-noos fstest-qemu \
+test-all: selftest test c6selfcheck stdtest std-demo fstest fstest-go \
+	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-smp
 
 # 完整验收：test-all 之外还有 C99 后端的两套用例（96 组各跑一遍）和三条
