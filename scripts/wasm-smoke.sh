@@ -100,10 +100,13 @@ if [ ! -f "$RT" ]; then
     LLVMCC=$CC "$ROOT/scripts/build-wasm-runtime.sh" $TRIPLE >/dev/null
 fi
 
-# 3) 直接出 .wasm
+# 3) 直接出 .wasm（demo 是仓库自带的例子：printf + usleep + spawn + async，
+#    走的是运行库的控制台和内联线程）
 "$TCC" -B "$ROOT/tcc" --target=$TRIPLE -o "$TMP/prog.wasm" "$TMP/prog.c6"
 "$TCC" -B "$ROOT/tcc" --target=$TRIPLE -o "$TMP/gc.wasm" "$TMP/gc.c6"
-for f in prog gc; do
+"$TCC" -B "$ROOT/tcc" --target=$TRIPLE -o "$TMP/demo.wasm" \
+    "$ROOT/examples/gc_demo.c6"
+for f in prog gc demo; do
     [ -s "$TMP/$f.wasm" ] || { say "  FAIL $f.wasm 没生成"; fail=1; }
 done
 
@@ -113,10 +116,17 @@ if command -v "$NODE" >/dev/null 2>&1; then
 const fs = require("fs");
 const dir = process.argv[1];
 let bad = 0;
-function run(name, checks) {
+/* --no-entry 的模块要自己跑构造器：数据节里的指针由 @__llvm_init 补齐 */
+function inst(name) {
     const buf = fs.readFileSync(dir + "/" + name + ".wasm");
-    if (!WebAssembly.validate(buf)) { console.log("  FAIL " + name + ".wasm 校验失败"); bad++; return; }
+    if (!WebAssembly.validate(buf)) { console.log("  FAIL " + name + ".wasm 校验失败"); bad++; return null; }
     const ex = new WebAssembly.Instance(new WebAssembly.Module(buf)).exports;
+    if (ex.__wasm_call_ctors) ex.__wasm_call_ctors();
+    return ex;
+}
+function run(name, checks) {
+    const ex = inst(name);
+    if (!ex) return;
     for (const [call, want] of checks) {
         const [fn, args] = call.split(":");
         const argv = args ? args.split(",").map(Number) : [];
@@ -126,8 +136,23 @@ function run(name, checks) {
         if (!ok) bad++;
     }
 }
+/* 控制台：printf 写进运行库的缓冲区，main() 的返回值是失败项数 */
+function demo(name, want) {
+    const ex = inst(name);
+    if (!ex) return;
+    const rc = Number(ex.main());
+    const ptr = Number(ex.__c6_wasm_con_ptr());
+    const len = Number(ex.__c6_wasm_con_len());
+    const text = new TextDecoder().decode(new Uint8Array(ex.memory.buffer, ptr, len));
+    const last = text.trim().split("\n").pop();
+    const ok = rc === 0 && text.includes(want);
+    console.log((ok ? "  ok   " : "  FAIL ") + "gc_demo: main() = " + rc +
+                "，最后一行 " + JSON.stringify(last));
+    if (!ok) { console.log(text); bad++; }
+}
 run("prog", [["add:2,3", 5], ["mul:4,5", 20]]);
 run("gc", [["pair_sum", 42], ["slice_sum", 9], ["big", 28]]);
+demo("demo", "全部检查通过");
 process.exit(bad ? 1 : 0);
 ' "$TMP" || fail=1
 else

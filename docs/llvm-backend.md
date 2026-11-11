@@ -89,26 +89,59 @@ va_list.c dsohandle.c wasm-rt.c` 再 `llvm-ar rcs`。两处专门为目标平台
 （`error: include file 'gnu/stubs-32.h' not found`）。所以判断“我在哪”要测
 `__wasm32__` / `__aarch64__`，别测 `!__x86_64__`。
 
-### wasm 没有 libc
+### 控制台：printf 写进缓冲区
 
-wasm 目标用 `-nostdlib` 链，只带 `libtcc1`，所以除了运行库的帮助函数以外，
-任何 import 都会在链接期变成 `undefined symbol`。模块里真引了外部函数时会先打
-一条警告，省得只看到链接器的输出：
+wasm 目标用 `-nostdlib` 链，只带 `libtcc1`。运行库 `tcc/lib/wasm-rt.c` 里放了一套
+最小的 libc：`printf` / `fprintf` / `fputs` / `puts` / `putchar` / `fflush`、
+`usleep` / `sleep`（立刻返回）、`malloc` / `calloc` / `realloc` / `free`
+（4 MiB 静态池）、`__cxa_atexit`、`select`、`pthread_*`。别的 import 还是会在
+链接期变成 `undefined symbol`，所以模块真引了运行库以外的函数时先打一条警告：
 
 ```
-$ tcc/tcc -B tcc --target=wasm32-unknown-unknown -o out.wasm examples/gc_demo.c6
-tcc: warning: wasm has no libc: printf, usleep imported, the link will fail
+$ tcc/tcc -B tcc --target=wasm32-unknown-unknown -o out.wasm prog.c6
+tcc: warning: wasm has no libc: fork, sqrt imported, the link will fail
 tcc: warning:   write freestanding code (no <stdio.h>), or provide those symbols yourself
-wasm-ld-19: error: ...: undefined symbol: printf
 ```
 
-`printf` 也不是“写个 C 版本就行”：后端输出的 IR 把所有实参都当 `i64` 传（LP64
-模型），而 wasm32 上 libc 的 C 原型里指针和 `int` 是 32 位，签名对不上
-（wasm-ld 会报 `signature mismatch`）。运行库自带的那几个帮助函数有专门的适配层
-（见上），别的函数没有。**要跑在 wasm 上，就写 freestanding 的代码**：函数返回
-值，由 JS 侧调 `exports`。GC 也是这样验证的——`make wasmtest` 里那个
-`gc.c6` 用 `new` 分配、靠引用计数回收，外加切片和大结构体传参，全部在 node 里
-跑出预期值。
+输出没有 fd 可写，所以 `printf` 把字符攒进一块 64 KiB 的静态缓冲区，由 embedder
+取出来打印：
+
+```js
+const ex = new WebAssembly.Instance(new WebAssembly.Module(buf), {}).exports;
+if (ex.__wasm_call_ctors) ex.__wasm_call_ctors();   /* 见下：--no-entry 要自己跑 */
+const rc = ex.main();
+const ptr = Number(ex.__c6_wasm_con_ptr());
+const len = Number(ex.__c6_wasm_con_len());
+console.log(new TextDecoder().decode(new Uint8Array(ex.memory.buffer, ptr, len)));
+```
+
+`__wasm_call_ctors()` 不能省：`--no-entry` 的模块 wasm-ld 只导出它，不会替你跑，
+而数据节里的代码指针（GC 描述符、协程入口、函数字面量）全靠 `@__llvm_init`
+补齐。不跑的话崩在第一次间接调用上（`null function or function signature
+mismatch`，看着像签名问题，其实是空指针）。
+
+格式化时的实参一律按 64 位读（`va_arg(ap, long long)`）：后端输出的 IR 把所有实参
+都提升成 i64 传，和宿主 libc 的 va_arg 布局对不上——照 glibc 的写法读，第二个
+实参就错了。`%d` / `%u` / `%x` / `%s` / `%c` / `%p` / `%f` / `%llu` 都支持，
+宽度和精度按最朴素的方式处理。
+
+### wasm 上的线程
+
+`pthread_create()` 不新建线程，而是在当前“线程”里把函数体跑完、把返回值记下来给
+`pthread_join()`：`spawn` 的任务因此真的会执行（顺序一致、不并发），
+`__c6_th_join_all()` 也有的可等。`pthread_key_*` 用一张固定的小表（没有并发，
+一份状态就够），`pthread_once` 是真实现。这是给演示和单线程逻辑准备的，别指望
+`shared` 的跨线程语义。
+
+### IR 直接写的数据结构必须 LP64
+
+描述符是**编译器**写进数据节的，一律按前端的 LP64 布局（指针占 8 字节）。运行库
+如果在 wasm32 上用 32 位指针读，偏移就全错了——所以 `C6GcField` / `C6GcDesc` /
+`TccCoDesc` 里的指针成员写成 `unsigned long long`，读的时候用
+`C6_DESC_PTR(type, word)` 转回来。这一条修好之前，`gc_demo` 能跑但每个检查都
+失败（`live=4`：对象一个都没回收），因为字段表和 drop 指针都读到了垃圾。
+
+同样的道理见上面的切片帮助函数（len 在偏移 8，不是 `sizeof(void *)`）。
 
 ### 目标 ABI 与 LP64 模型
 
@@ -156,10 +189,11 @@ make wasmtest                                  # 默认 wasm32-unknown-unknown
 
 ```
 make wasmrt      # 编 tcc/libtcc1-wasm32.a
-make wasmtest    # 出 .wasm 并用 node 跑：add/mul、GC 对、切片、大结构体
+make wasmtest    # 出 .wasm 并用 node 跑，其中包括 examples/gc_demo.c6
 ```
 
-`examples/gc_demo.c6` 跑不了：它要 `printf` 和 `usleep`（见上）。
+`make wasmtest` 最后一项就是仓库自带的 GC 演示：`printf` 走运行库的控制台，
+`spawn`/`async` 走内联线程和协程，node 里跑出 `全部检查通过`、`main()` 返回 0。
 
 一次调用里的所有源文件合成**一个** `.ll`（与 `-o out.c` 把多个源文件合成一份
 C 完全相同）：`-test` 的测试块编号在同一个状态里递增，跨翻译单元不会撞名。

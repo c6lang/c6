@@ -1230,15 +1230,22 @@ typedef struct C6GcWeak {
 typedef struct C6GcDesc C6GcDesc;
 typedef struct C6GcField C6GcField;
 
+/* Pointer members are 64 bit on every target: the compiler writes these
+   structures itself, always in the front-end's LP64 layout (8-byte words), so
+   a 32-bit pointer here would read 'fields' 4 bytes early on wasm32 -- the
+   whole field walk would then look at garbage.  C6_DESC_PTR() turns a word
+   back into a pointer. */
+#define C6_DESC_PTR(type, v) ((type)(unsigned long long)(v))
+
 struct C6GcField {
     unsigned off, kind, count, stride;
-    const C6GcDesc *sub;
+    unsigned long long sub;     /* const C6GcDesc * */
 };
 
 struct C6GcDesc {
     unsigned size, align, nfields, flags;
-    void (*drop)(void *);
-    const C6GcField *fields;
+    unsigned long long drop;    /* void (*)(void *) */
+    unsigned long long fields;  /* const C6GcField * */
 };
 
 struct C6GcHdr {
@@ -1322,7 +1329,7 @@ static void c6_gc_release_block(char *base, const C6GcDesc *d)
     if (!d)
         return;
     for (k = 0; k < d->nfields; k++) {
-        const C6GcField *f = &d->fields[k];
+        const C6GcField *f = &C6_DESC_PTR(const C6GcField *, d->fields)[k];
         unsigned i;
 
         if (f->kind == C6_GCK_EDGE)
@@ -1330,7 +1337,7 @@ static void c6_gc_release_block(char *base, const C6GcDesc *d)
         for (i = 0; i < f->count; i++) {
             char *p = base + f->off + (unsigned long)i * f->stride;
             if (f->kind == C6_GCK_EMBED)
-                c6_gc_release_block(p, f->sub);
+                c6_gc_release_block(p, C6_DESC_PTR(const C6GcDesc *, f->sub));
             else
                 c6_gc_release_slot((void **)p, (int)f->kind);
         }
@@ -1348,7 +1355,7 @@ static void c6_gc_free_one(C6GcHdr *h)
         for (i = 0; i < n; i++) {
             char *base = (char *)(h + 1) + i * (unsigned long)d->size;
             if (d->drop)
-                d->drop(base);
+                C6_DESC_PTR(void (*)(void *), d->drop)(base);
             if (d->nfields)
                 c6_gc_release_block(base, d);
         }
@@ -2578,10 +2585,12 @@ typedef struct TccCoTask {
     int waiting;                /* parked on wait_fd, waiting for select() */
 } TccCoTask;
 
+/* Same rule as C6GcDesc: the compiler writes this one too, in LP64 layout, so
+   the function pointers stay 64-bit words here as well. */
 typedef struct TccCoDesc {
     unsigned size, align;       /* 'struct NAME_task': header + declared fields */
-    int (*entry)(void *, void *);       /* (task, top of the frame) */
-    void (*release)(void *);    /* give back what the task slot owns */
+    unsigned long long entry;   /* int (*)(void *, void *): (task, frame top) */
+    unsigned long long release; /* void (*)(void *): what the task slot owns */
     unsigned frame_size;        /* the frame the task block owns, after 'size' */
 } TccCoDesc;
 
@@ -2863,7 +2872,7 @@ static int tcc_co_step_once(TccCoTask *t)
     leaf->busy++;
     /* the frame top is passed in every time: a body whose frame lives in the
        task ignores it, one that parks its native frame gets a harmless value */
-    k = d->entry(leaf, leaf->frame);
+    k = C6_DESC_PTR(int (*)(void *, void *), d->entry)(leaf, leaf->frame);
     leaf->busy--;
     switch (k) {
     case C6_CO_KIND_DONE:
@@ -3098,7 +3107,7 @@ void __c6_co_destroy(void *self)
     /* the task owned one reference per managed parameter (and the return
        value): give them back before the block is released */
     if (t->desc && ((TccCoDesc *)t->desc)->release)
-        ((TccCoDesc *)t->desc)->release(t);
+        C6_DESC_PTR(void (*)(void *), ((TccCoDesc *)t->desc)->release)(t);
     tcc_co_unlink((TccCoTask **)&co->runlist, t);
     c6_free(t);
 }

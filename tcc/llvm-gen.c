@@ -162,11 +162,26 @@ static int l_arch_wasm(void)
     return n == 6 && (!strncmp(t, "wasm32", 6) || !strncmp(t, "wasm64", 6));
 }
 
+/* libc entry points the wasm runtime stands in for (tcc/lib/wasm-rt.c): the
+   console writes into a buffer the embedder reads, sleeps return at once */
+static const char *const l_wasm_libc[] = {
+    "printf", "fprintf", "fputs", "puts", "putchar", "fflush",
+    "usleep", "sleep", "malloc", "calloc", "free", "realloc",
+    "__cxa_atexit", "select",
+};
+
 /* the names the runtime library itself brings along */
 static int l_runtime_name(const char *n)
 {
-    return !strncmp(n, "__c6_", 5) || !strncmp(n, "__tcc_", 6)
-        || !strncmp(n, "__tcc1_", 7);
+    int i;
+
+    if (!strncmp(n, "__c6_", 5) || !strncmp(n, "__tcc_", 6)
+        || !strncmp(n, "__tcc1_", 7))
+        return 1;
+    for (i = 0; i < (int)countof(l_wasm_libc); i++)
+        if (!strcmp(n, l_wasm_libc[i]))
+            return 1;
+    return 0;
 }
 
 /* the target's index type: what a length in an llvm.mem* intrinsic is */
