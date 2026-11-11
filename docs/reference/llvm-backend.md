@@ -1,5 +1,9 @@
 # LLVM IR 后端
 
+> **状态**：现行实现 · **索引**：[文档索引](../README.md) · **同级后端**：[c99-backend.md](c99-backend.md) · **构建目标**：[cli.md](cli.md)
+>
+> 一句话：复用整个前端，把虚拟寄存器翻译成文本 LLVM IR（`.ll`），再交给 clang 出目标文件。
+
 目标：复用整个前端（c6 的全部扩展），只换代码生成器——把前端的虚拟寄存器
 机器翻译成文本 LLVM IR（`.ll`）。做法和 C99 输出后端完全一样：`tcc/llvm-gen.c`
 是一份独立的单文件编译单元，编成 `tcc-llvm-p.o` 用 objcopy 把 `main` 改名成

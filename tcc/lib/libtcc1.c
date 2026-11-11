@@ -642,7 +642,7 @@ long long __fixxfdi (long double a1)
 /*                                                                           */
 /* Deferred statements need no runtime at all: a cleanup site is static, and  */
 /* whether it is armed lives in the frame of the call that registered it (see */
-/* docs/grammar.md, R6/D1-D6).  What is left here is the error slot.          */
+/* docs/reference/grammar.md, R6/D1-D6).  What is left here is the error slot.          */
 /*                                                                           */
 /* Every OS thread owns its error slot and coroutine pool, so a thread that   */
 /* runs c6 code cannot corrupt the state of another one.  The per-thread      */
@@ -2599,7 +2599,7 @@ typedef struct TccCoDesc {
    'frame' is the top of the frame region, which is what the body's frame
    pointer points at; a local lives at 'frame - offset'.  'frame_size' in the
    descriptor, not the pool, is what bounds it.  The cleanups of the body need
-   no room here: their state is in that frame (docs/gc-design.md §9.1). */
+   no room here: their state is in that frame (docs/design/gc-design.md §9.1). */
 struct TccCoPool {
     /* Top-level coroutines started with 'co': they belong to no scope and no
        parent, so the scheduler below owns them from creation to completion. */

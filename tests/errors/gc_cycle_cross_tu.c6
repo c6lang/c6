@@ -13,7 +13,7 @@
 struct B;
 
 // EXPECT cycle_cross: error: reference cycle across translation units: A -> B -> A
-// NATIVE-ONLY cycle_cross   （C99 后端不链接，见 docs/gc-design.md §15）
+// NATIVE-ONLY cycle_cross   （C99 后端不链接，见 docs/design/gc-design.md §15）
 
 #if defined cycle_cross
 /* A 强引用 B（B 在另一个 TU 里强引用 A）→ 链接期成环 */

@@ -1,11 +1,11 @@
 # c6 函数字面量与闭包设计
 
-状态：**V1 已实现**（无捕获的字面量 = 裸函数指针）。
-**V2（捕获式闭包）已实现**：本文是 V2 的规格（与 `tcc/tccgen.c`、`c99-gen.c`
-同步）；实施清单与用例对照见 [closure-todo.md](closure-todo.md)，语法与约束
-编号见 [grammar.md §3.10](grammar.md)。
+> **状态**：已落地（V1 无捕获字面量 = 裸函数指针；V2 捕获式闭包） · **索引**：[文档索引](../README.md) · **用法**：[manual/functions.md](../manual/functions.md) · **语法**：[grammar.md §3.10](../reference/grammar.md) · **施工日志**：[closure-todo.md](../history/closure-todo.md)
+>
+> 本文是 V2 的规格，与 `tcc/tccgen.c`、`c99-gen.c` 同步；诊断编号 C90–C98 的全文见
+> [diagnostics.md](../reference/diagnostics.md)。
 
-相关：[grammar.md §3.10](grammar.md)（V1 语法与 C80–C83）、
+相关：[grammar.md §3.10](../reference/grammar.md)（V1 语法与 C80–C83）、
 [gc-design.md](gc-design.md)（`@T` 的计数、描述符、环检测与跨线程规则）、
 `tests/fn_lit.c6` / `tests/errors/fn_lit.c6` / `tests/abi/fn_lit.c6`。
 
@@ -1196,7 +1196,7 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 
 ## 14. 实施顺序
 
-见 [closure-todo.md](closure-todo.md)。阶段划分：
+见 [closure-todo.md](../history/closure-todo.md)。阶段划分：
 
 | 阶段 | 内容 |
 |---|---|

@@ -1,7 +1,9 @@
 # c6 引用计数 GC 实施 todo
 
-设计见 [gc-design.md](gc-design.md)。本文是执行清单：阶段、改动点、测试、验收命令。
-每个阶段独立可编译、可回归、可提交。
+> **状态**：历史记录（P0–P8 全部完成） · **索引**：[文档索引](../README.md) · **设计**：[gc-design.md](../design/gc-design.md) · **总状态**：[status.md](status.md)
+>
+> 一句话：当初的执行清单——阶段、改动点、测试、验收命令，每阶段独立可编译、可回归、可提交。
+> 保留作验收对照，不再更新；收尾与「明确不做」清单见文末。
 
 约定：
 
@@ -457,14 +459,14 @@
   `p = NULL`、`move`、`drop`、环是编译错误、async/spawn 的限制、性能数字、
   与 C++ 智能指针的对照），并把「切片没有隐藏状态也没有 GC」那句改清楚
   （切片不是 GC 对象，托管引用是另一回事）；测试目录清单补上 7 个 gc 用例；
-- `docs/grammar.md`：§7 静态约束补 C66–C77（环、借用、`own`/`shared` 的
+- `docs/reference/grammar.md`：§7 静态约束补 C66–C77（环、借用、`own`/`shared` 的
   存储规则、跨帧/跨线程、`union`/块内定义/柔性数组、`memcpy`、析构、
   `move`）；新增 §8.1「托管引用的重写」（源码 → 生成代码对照表）；
   §10 未支持的写法补 7 条（显式调析构、`reset()`、跨边界传 `@T`、
   async 里的 `weak`、通用图、运行期环回收、自定义删除器）；§11 实现位置
   补 13 行；
-- `docs/plan.md`：§11 实施状态表补 19–25 行（P0/P1、P2、P3、P4、P5、P6、P7）；
-- `docs/gc-design.md` / `docs/gc-todo.md`：每个阶段的“落地状态（与计划的差异）”。
+- `docs/design/plan.md`：§11 实施状态表补 19–25 行（P0/P1、P2、P3、P4、P5、P6、P7）；
+- `docs/design/gc-design.md` / `docs/history/gc-todo.md`：每个阶段的“落地状态（与计划的差异）”。
 
 全量回归（P7 阶段最后一次）：`make test-all`（当时 selftest 51 + tests2 全绿）、
 `BACKEND=c99 tests/run-tests.sh` 52 通过、`make test-plain` 绿。
@@ -505,7 +507,7 @@
 ## 收尾状态
 
 P0–P8 全部完成，每阶段一个提交（`gc: Pn ...`），每个提交都带三条验收命令的
-结果。**明确不做**的（都已写进 `docs/gc-design.md` §17）：
+结果。**明确不做**的（都已写进 `docs/design/gc-design.md` §17）：
 
 1. `-c99` 后端的跨 TU 环检查（没有段、没有链接期）；
 2. `struct Node c6_graph` 通用图豁免（D2）；

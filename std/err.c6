@@ -2,7 +2,7 @@
  *
  * c6 的 `T!error` 只带一个 int id 和一条消息（见 README 的 err/try/catch）。
  * 模块里的 `enum Error` 就是它的错误码表：编译器把每个成员放进本模块的
- * 号段（`(area<<27) | (slot<<12) | code`，见 docs/grammar.md），所以
+ * 号段（`(area<<27) | (slot<<12) | code`，见 docs/reference/grammar.md），所以
  * `NOMEM` 实际是 `0x0E000003` —— 0 仍是「没有错误」，跨模块可以互相识别：
  *
  *     import std.err;

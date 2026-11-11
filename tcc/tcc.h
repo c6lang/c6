@@ -501,7 +501,7 @@ typedef struct CType {
 #define C6_GC_OWNED  2  /* read out of a managed slot: a borrow until stored */
 
 /* c6: runtime store mode bits, mirrored by the '#define's tcc_predefs()
-   emits for compiled programs (docs/gc-design.md) */
+   emits for compiled programs (docs/design/gc-design.md) */
 #define C6_GCM_FRESH  1  /* the value is a fresh reference: do not count it */
 #define C6_GCM_ATOMIC 2  /* the slot belongs to a 'shared @T' object */
 #define C6_GCM_WEAK   4  /* the slot is a 'weak @T' reference */
@@ -1021,7 +1021,7 @@ struct TCCState {
     unsigned char c6_errbase_loaded; /* the table was looked for */
     unsigned char c6_errbase_found;  /* ... and one was found */
     /* reference-counting GC: struct types with managed fields, and the
-       strong edges between them (see docs/gc-design.md) */
+       strong edges between them (see docs/design/gc-design.md) */
     struct C6GcType **c6_gc_types;
     int c6_nb_gc_types;
     C6GcRoot **c6_gc_roots;
@@ -1936,7 +1936,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym);
 ST_FUNC void gfunc_epilog(void);
 #ifdef C6_EXT
 /* 1 when this back end can run an async body with its locals inside the task
-   (see docs/gc-design.md, "frame in task"): gfunc_prolog() then points the
+   (see docs/design/gc-design.md, "frame in task"): gfunc_prolog() then points the
    frame register at the frame passed by the runtime instead of at %rsp, and
    gfunc_epilog() reports the frame size to the front end. */
 ST_FUNC int c6_backend_frame_in_task(void);

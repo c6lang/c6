@@ -248,7 +248,7 @@ ST_FUNC void llvm_print_targets(TCCState *s1)
     printf("\n");
     printf("build a missing runtime with: scripts/build-wasm-runtime.sh <triple>\n");
     printf("wasm64 works as a code target, but LLVM 19's wasm-ld emits broken\n");
-    printf("element segments for it -- see docs/llvm-backend.md.\n");
+    printf("element segments for it -- see docs/reference/llvm-backend.md.\n");
 }
 
 /* The preprocessor has to follow '--target' as well, otherwise a header that

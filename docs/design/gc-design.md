@@ -1,7 +1,9 @@
 # c6 引用计数 GC 设计（`@T` / `weak` / `own` / `shared` / `drop`）
 
-状态：设计定稿待编码。实施步骤见 [gc-todo.md](gc-todo.md)。
-文中行号是当前 `main` 的快照，实施时以符号名为准。
+> **状态**：已落地（P0–P8 全部完成） · **索引**：[文档索引](../README.md) · **用法**：[manual/gc.md](../manual/gc.md) · **施工日志**：[gc-todo.md](../history/gc-todo.md) · **诊断**：[diagnostics.md](../reference/diagnostics.md)（C66–C79）
+>
+> 一句话：`@T` 的计数、描述符、所有权检查、环检测与跨线程规则为什么长这样。
+> 文中行号是写作时 `main` 的快照，实施时以符号名为准。
 
 ---
 
@@ -25,7 +27,7 @@
 - 捕获式闭包：函数字面量 V1 是无捕获的裸函数指针；V2 的捕获式闭包已实现
   （`closure` 是托管引用，env 是一个 `@struct`，环检测走签名级保守边），
   见 [closure-design.md](closure-design.md) 与
-  [closure-todo.md](closure-todo.md)。
+  [closure-todo.md](../history/closure-todo.md)。
 
 ---
 
@@ -345,7 +347,7 @@ new T;` 的 FRESH 值没有第二个所有者，存进普通指针就再也没�
 
 用户写的 `defer`/`errdefer` 现在**也不需要运行期记录**了：清理点是编译期常量，
 "哪些已经注册"是函数帧里的一块位图，"正在服务哪个请求"是两个 `int`
-（语义见 [grammar.md](grammar.md) 8.2）。于是 H3（记录栈满 8192 静默丢）自然
+（语义见 [grammar.md](../reference/grammar.md) 8.2）。于是 H3（记录栈满 8192 静默丢）自然
 消失——没有记录栈可满，上限变成一个编译期数字（一个函数 128 个清理点，超了
 直接报错）。这条也顺带让 `defer` 在 ISR、`spawn` 线程、递归帧里都不需要任何
 线程级状态。
@@ -804,13 +806,13 @@ arm/aarch64/riscv 的 load/store/compare_exchange/fence）与 `lib/stdatomic.c`
 | H1 | `__c6_co_destroy` 不回卷未完成任务 | `lib/libtcc1.c:1580` | `__c6_co_abort`（§9.3） |
 | H2 | async 帧搬动 → 帧内绝对地址失效 | `lib/libtcc1.c` 的 `__c6_co_suspend`/`restore` | 已修：帧住进任务（§9.1，A3，五个后端 + C99）；拷贝模型与 `weak` 禁令已删除，c67 上 `async` 编译期报错 |
 | H4 | 方法调用的接收者被拷进临时槽时走了普通托管赋值：临时槽没初始化却先读旧值去释放（栈垃圾 → 崩），而且给接收者白加一个永不释放的引用 | `tcc/tccgen.c` 的 `c6_method_call_prep()` | 已修：接收者那份拷贝是借用，按 `C6_GCM_INIT \| C6_GCM_FRESH` 存（不计数、不读旧值） |
-| H3 | defer 栈满 8192 静默丢记录 | 原 `lib/libtcc1.c` 的 defer 记录栈 | 已消灭：记录栈整个删掉，清理状态搬进函数帧（§6、[grammar.md](grammar.md) 8.2），上限变成编译期报错（C101/C102） |
+| H3 | defer 栈满 8192 静默丢记录 | 原 `lib/libtcc1.c` 的 defer 记录栈 | 已消灭：记录栈整个删掉，清理状态搬进函数帧（§6、[grammar.md](../reference/grammar.md) 8.2），上限变成编译期报错（C101/C102） |
 
 ---
 
 ## 17. 未决问题
 
-见 [gc-todo.md](gc-todo.md) 的 D1–D6。此外 P6 之后仍开着两件：
+见 [gc-todo.md](../history/gc-todo.md) 的 D1–D6。此外 P6 之后仍开着两件：
 
 1. **链接期跨 TU 环检测只在原生后端**（§8.2 第 2 条、§15）：`-c99` 输出 C
    源码，没有段也没有链接期，跨 TU 环在那边仍然看不到；
