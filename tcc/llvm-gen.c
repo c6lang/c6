@@ -790,6 +790,8 @@ static NORETURN void l_fatal(const char *msg)
         ;
 }
 
+static int l_name_ok(const char *s);
+
 /* The name of the function that starts at 'off' in section 'shndx'.  A
    relocation to a static function is recorded against the section symbol of
    .text plus its offset, and IR needs the name. */
@@ -802,7 +804,7 @@ static const char *l_text_name(int shndx, long long off)
 
         if (e->st_shndx != shndx || (long long)e->st_value != off)
             continue;
-        if (!l_esym_name(i)[0])
+        if (!l_name_ok(l_esym_name(i)))
             continue;
         if (ELFW(ST_TYPE)(e->st_info) == STT_SECTION)
             continue;
@@ -884,6 +886,10 @@ static const char *l_symref(int idx, long long addend)
     }
     e = l_esym(idx);
     name = l_esym_name(idx);
+    if (!l_name_ok(name))
+        /* a string offset the front-end left stale while it reshuffled its
+           symbol table: never paste that into the module */
+        name = "";
     if (ELFW(ST_TYPE)(e->st_info) == STT_SECTION && l_is_func_sym(idx)) {
         /* a code address recorded as ".text + offset" */
         const char *fn = l_text_name(e->st_shndx,
@@ -1010,7 +1016,7 @@ static const char *l_sym_place(Sym *sym, long long addend, int is_call)
     if (!e) {
         /* no usable entry: the token name is all that is left */
         if (l_name_ok(tok)) {
-            snprintf(buf, sizeof buf, "@%c%s+%lld@", is_call ? 'K' : 'N',
+            snprintf(buf, sizeof buf, "@@%c%s+%lld@@", is_call ? 'K' : 'N',
                      tok, addend);
             return l_ret(buf);
         }
@@ -1022,7 +1028,7 @@ static const char *l_sym_place(Sym *sym, long long addend, int is_call)
             const char *fn = fs ? l_token_name(fs) : NULL;
 
             if (l_name_ok(fn)) {
-                snprintf(buf, sizeof buf, "@%c%s+%lld@",
+                snprintf(buf, sizeof buf, "@@%c%s+%lld@@",
                          is_call ? 'K' : 'N', fn, addend);
                 return l_ret(buf);
             }
@@ -1031,16 +1037,16 @@ static const char *l_sym_place(Sym *sym, long long addend, int is_call)
         }
     }
     if (name[0])
-        snprintf(buf, sizeof buf, "@%c%s+%lld@", is_call ? 'K' : 'N', name,
+        snprintf(buf, sizeof buf, "@@%c%s+%lld@@", is_call ? 'K' : 'N', name,
                  addend);
     else if (e->st_shndx == SHN_ABS)
-        snprintf(buf, sizeof buf, "@A%lld@",
+        snprintf(buf, sizeof buf, "@@A%lld@@",
                  (long long)e->st_value + addend);
     else if (e->st_shndx == SHN_UNDEF)
         tcc_error("llvm output: unnamed undefined symbol");
     else
         /* an anonymous object: its position inside its section is stable */
-        snprintf(buf, sizeof buf, "@%c%d+%lld@", is_call ? 'Q' : 'O',
+        snprintf(buf, sizeof buf, "@@%c%d+%lld@@", is_call ? 'Q' : 'O',
                  (int)e->st_shndx, (long long)e->st_value + addend);
     return l_ret(buf);
 }
@@ -2115,7 +2121,16 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     CType srt;
     int srt_align = 0, srt_regsize = 0;
 
+    /* The name the module must use is the one the symbol table carries: a
+       reference resolves its placeholder through that same name, and a stale
+       token buffer would give the definition a different spelling (the
+       front-end synthesizes some destructor/replay symbols from a token
+       string it has already freed). */
     fname = get_tok_str(func_sym->v, NULL);
+    if (func_sym->c > 0
+        && func_sym->c < (int)(l_s1->symtab->data_offset / sizeof(ElfSym))
+        && l_name_ok(l_esym_name(func_sym->c)))
+        fname = l_esym_name(func_sym->c);
     l_skip_fn = 0;
     if (!strcmp(fname, "main")) {
         if (tcc_state && tcc_state->c6_test_mode)
@@ -2377,7 +2392,7 @@ ST_FUNC void gfunc_call(int nb_args)
         if (is_helper) {
             /* a helper from libtcc1.a: it has no Elf entry of its own */
             char nb[256];
-            snprintf(nb, sizeof nb, "@F%s@", get_tok_str(callee->sym->v, NULL));
+            snprintf(nb, sizeof nb, "@@F%s@@", get_tok_str(callee->sym->v, NULL));
             cop = l_ret(nb);
         } else {
             cop = l_sym_place(callee->sym, 0, 1);
@@ -2531,15 +2546,6 @@ ST_FUNC void gfunc_epilog(void)
     }
     nocode_wanted = save_nocode;
 
-    if (getenv("TCC_LLVM_DBG")) {
-        FILE *d = fopen("/tmp/place.log", "a");
-        if (d) {
-            fprintf(d, "EPI n=%d off=%ld\n",
-                    (int)(l_s1->symtab->data_offset / sizeof(ElfSym)),
-                    (long)l_s1->symtab->data_offset);
-            fclose(d);
-        }
-    }
     if (l_skip_fn) {
         l_fn_reset();
         l_fn_pop();
@@ -2601,28 +2607,10 @@ static void l_subst(LBuf *dst, const char *src, int len)
     int k = 0;
 
     while (k < len) {
-        if (src[k] == '@' && k + 2 < len && src[k + 1] == 'F') {
-            int e = k + 2;
-
-            while (e < len && src[e] != '@')
-                e++;
-            if (e < len) {
-                char nm[512];
-                int n = e - (k + 2);
-
-                if (n > (int)sizeof nm - 1)
-                    n = sizeof nm - 1;
-                memcpy(nm, src + k + 2, n);
-                nm[n] = 0;
-                l_note_fn(nm);
-                lb_printf(dst, "@%s", l_q(nm));
-                k = e + 1;
-                continue;
-            }
-        }
-        if (src[k] == '@' && k + 2 < len
-            && strchr("NKQOA", src[k + 1]) && src[k + 1]) {
-            int kind = src[k + 1], p = k + 2, is_call = 0, val = 0, ok = 0;
+        /* a placeholder always starts with "@@": a plain reference such as
+           '@File_drop' must never be mistaken for one */
+        if (src[k] == '@' && k + 3 < len && src[k + 1] == '@') {
+            int kind = src[k + 2], p = k + 3, is_call = 0, val = 0, ok = 0;
             long long add = 0;
             char nm[512];
 
@@ -2634,25 +2622,42 @@ static void l_subst(LBuf *dst, const char *src, int len)
                 kind = 'O';
             }
             nm[0] = 0;
-            if (kind == 'N') {
-                int n = 0;
+            if (kind == 'F') {
+                int e = p;
 
-                while (p < len && src[p] != '+' && n < (int)sizeof nm - 1)
-                    nm[n++] = src[p++];
-                nm[n] = 0;
-                if (n && p < len && src[p] == '+')
-                    p++;
-            } else {
+                while (e < len && !(src[e] == '@' && e + 1 < len
+                                    && src[e + 1] == '@'))
+                    e++;
+                if (e < len) {
+                    int n = e - p;
+
+                    if (n > (int)sizeof nm - 1)
+                        n = sizeof nm - 1;
+                    memcpy(nm, src + p, n);
+                    nm[n] = 0;
+                    l_note_fn(nm);
+                    lb_printf(dst, "@%s", l_q(nm));
+                    k = e + 2;
+                    continue;
+                }
+            } else if (kind == 'A' || kind == 'O') {
                 while (p < len && src[p] >= '0' && src[p] <= '9') {
                     val = val * 10 + src[p] - '0';
                     p++;
                 }
-                if (p < len && src[p] == '+')
-                    p++;
+            } else if (kind == 'N') {
+                int n = 0;
+
+                while (p < len && src[p] != '+'
+                       && n < (int)sizeof nm - 1)
+                    nm[n++] = src[p++];
+                nm[n] = 0;
             }
-            {
+            if (kind != 'F') {
                 int neg = 0;
 
+                if (p < len && src[p] == '+')
+                    p++;
                 if (p < len && src[p] == '-') {
                     neg = 1;
                     p++;
@@ -2663,9 +2668,9 @@ static void l_subst(LBuf *dst, const char *src, int len)
                 }
                 if (neg)
                     add = -add;
+                if (p + 1 < len && src[p] == '@' && src[p + 1] == '@')
+                    ok = 1;
             }
-            if (p < len && src[p] == '@')
-                ok = 1;
             if (ok) {
                 if (kind == 'A') {
                     char ab[64];
@@ -2688,7 +2693,7 @@ static void l_subst(LBuf *dst, const char *src, int len)
                         lb_puts(dst, l_symref(idx, add));
                     }
                 }
-                k = p + 1;
+                k = p + 2;
                 continue;
             }
         }
@@ -2776,15 +2781,10 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
     int i, j, nsec, emit_test_main;
 
     l_s1 = s1;
-    if (getenv("TCC_LLVM_DBG")) {
-        FILE *d = fopen("/tmp/place.log", "a");
-        if (d) {
-            fprintf(d, "OUTPUT n=%d tab=%p data=%p\n",
-                    (int)(s1->symtab->data_offset / sizeof(ElfSym)),
-                    (void *)s1->symtab, (void *)s1->symtab->data);
-            fclose(d);
-        }
-    }
+    if (s1->nb_errors)
+        /* the front-end already complained (e.g. a reference cycle across
+           translation units): nothing to write */
+        return -1;
     memset(&body, 0, sizeof body);
     memset(&initf, 0, sizeof initf);
 
@@ -2862,21 +2862,14 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
         }
     }
 
-    if (getenv("TCC_LLVM_DUMP")) {
-        /* debugging aid: the bodies before the symbols are filled in */
-        FILE *d = fopen(getenv("TCC_LLVM_DUMP"), "w");
-
-        if (d) {
-            fwrite(l_prog.data ? l_prog.data : "", 1, l_prog.len, d);
-            fclose(d);
-        }
-    }
-
     /* resolve the function bodies; this also collects every symbol the
        module refers to, which the declaration block below needs */
     l_subst(&body, l_prog.data ? l_prog.data : "", l_prog.len);
     if (l_init_used)
-        l_subst(&initf, l_init.data ? l_init.data : "", l_init.len);
+        /* already resolved: substituting here would eat the '@F' of a symbol
+           like '@File_drop' as a helper placeholder */
+        if (l_init.data && l_init.len)
+            lb_add(&initf, l_init.data, l_init.len);
 
     /* '-test' (and a file that only has test blocks) needs a runner; the
        C99 back-end writes one in C, this one as IR.  Its two helpers have to
@@ -2942,7 +2935,7 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
         Section *sec;
         long long size;
 
-        if (!l_sym_extern_visible(i))
+        if (!l_sym_extern_visible(i) || !l_name_ok(l_esym_name(i)))
             continue;
         {
             int j, dup = 0;

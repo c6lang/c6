@@ -355,6 +355,8 @@ for src in "$ROOT"/tests/errors/*.c6; do
     # 期望表：片段名 <TAB> 诊断文本
     sed -n 's,^// *EXPECT *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect"
     sed -n 's,^// *EXPECT-C99 *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect-c99"
+    # LLVM 后端把链接交给外部链接器，链接期诊断的文本不一样
+    sed -n 's,^// *EXPECT-LLVM *\([A-Za-z0-9_]*\): *\(.*\)$,\1\t\2,p' "$src" > "$TMP/expect-llvm"
     # 只适用于本机后端的片段（C99 后端没有链接期检查之类）
     sed -n 's,^// *NATIVE-ONLY *\([A-Za-z0-9_]*\).*$,\1,p' "$src" > "$TMP/native-only"
     frags=$(cut -f1 "$TMP/expect" | awk '!seen[$0]++')
@@ -372,6 +374,10 @@ for src in "$ROOT"/tests/errors/*.c6; do
            && awk -F'\t' -v f="$frag" '$1 == f { found = 1 } END { exit !found }' \
                   "$TMP/expect-c99"; then
             expect_file="$TMP/expect-c99"
+        elif [ "$BACKEND" = llvm ] \
+           && awk -F'\t' -v f="$frag" '$1 == f { found = 1 } END { exit !found }' \
+                  "$TMP/expect-llvm"; then
+            expect_file="$TMP/expect-llvm"
         else
             expect_file="$TMP/expect"
         fi
