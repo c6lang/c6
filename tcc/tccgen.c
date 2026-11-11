@@ -878,6 +878,9 @@ static void c6_gc_drop_register(int name, int sym_tok, CType *type, int tag);
 static int c6_gc_is_drop(int sym_tok);
 static int c6_gc_drop_callee(Sym *s);
 static C6Method *c6_method_lookup(CType *type, int name);
+static C6Method *c6_method_lookup_value(CType *type, int name);
+static int c6_value_receiver(CType *type);
+static int c6_has_field_value(CType *type, int v);
 static int c6_task_head_ptr(CType *type, CType *out);
 static int c6_has_field(CType *type, int v);
 static int c6_gen_self_member(int name);
@@ -8000,11 +8003,10 @@ static int c6_gen_typedef_btype(CType *type)
 
 /* 'v->vat(0)' on an instance: the receiver already wrote T, so instantiate
    the method template that declares that receiver (D9) */
-static int c6_gen_method_resolve(CType *type, int mname)
+static int c6_gen_method_resolve_tag(int tag, int mname)
 {
     C6GenInst *inst = 0;
     C6GenFn *fn = 0;
-    int tag = c6_ptr_tag(type);
 
     if (!tag)
         return 0;
@@ -8021,6 +8023,11 @@ static int c6_gen_method_resolve(CType *type, int mname)
             return 1;
         }
     return 0;
+}
+
+static int c6_gen_method_resolve(CType *type, int mname)
+{
+    return c6_gen_method_resolve_tag(c6_ptr_tag(type), mname);
 }
 
 /* compile the bodies queued by function template instantiation */
@@ -11446,7 +11453,7 @@ special_math_val:
             c6_fallible_use();  /* 'f().x' would drop the error */
             arrow = tok == TOK_ARROW;
             next();                     /* skip '.' / '->' */
-            if (arrow && tok >= TOK_UIDENT) {
+            if (tok >= TOK_UIDENT) {
                 /* 'p->f(...)' is a method call when F is a registered method
                    of the type P points at; a real field of that name keeps
                    plain C semantics.  A task handle is a pointer to
@@ -11454,21 +11461,38 @@ special_math_val:
                    head', so the lookup falls back to the type of that first
                    field: 't->wait()' is the built-in task method. */
                 C6Method *m = 0;
+                int by_value = 0;
 
-                if (!c6_has_field(&vtop->type, tok)) {
-                    m = c6_method_lookup(&vtop->type, tok);
-                    if (!m) {
-                        CType head = {0};
-                        if (c6_task_head_ptr(&vtop->type, &head)) {
-                            m = c6_method_lookup(&head, tok);
-                            if (m)
-                                vtop->type = head;  /* head is at offset 0 */
-                        }
-                    }
-                    /* 'v->vat(0)' where 'vat' is a '|T|' template: the
-                       receiver already wrote T, so instantiate it (D9) */
-                    if (!m && c6_gen_method_resolve(&vtop->type, tok))
+                if (arrow) {
+                    if (!c6_has_field(&vtop->type, tok)) {
                         m = c6_method_lookup(&vtop->type, tok);
+                        if (!m) {
+                            CType head = {0};
+                            if (c6_task_head_ptr(&vtop->type, &head)) {
+                                m = c6_method_lookup(&head, tok);
+                                if (m)
+                                    vtop->type = head;  /* head is at 0 */
+                            }
+                        }
+                        /* 'v->vat(0)' where 'vat' is a '|T|' template: the
+                           receiver already wrote T, so instantiate it (D9) */
+                        if (!m && c6_gen_method_resolve(&vtop->type, tok))
+                            m = c6_method_lookup(&vtop->type, tok);
+                    }
+                } else if (!c6_has_field_value(&vtop->type, tok)
+                           && c6_value_receiver(&vtop->type)) {
+                    /* 'a.f(...)' on a struct/union value: the receiver is
+                       '&a', so the method is the very same
+                       'ret f(struct T *self, ...)' written at file scope */
+                    m = c6_method_lookup_value(&vtop->type, tok);
+                    if (!m) {
+                        /* 'v.vat(0)' where 'vat' is a '|T|' template: the
+                           value already wrote T, so instantiate it (D9) */
+                        if (c6_gen_method_resolve_tag(
+                                vtop->type.ref->v & ~SYM_STRUCT, tok))
+                            m = c6_method_lookup_value(&vtop->type, tok);
+                    }
+                    by_value = m != 0;
                 }
                 if (m) {
                     int mname = tok;
@@ -11476,6 +11500,15 @@ special_math_val:
                     if (tok != '(')
                         tcc_error("method '%s' must be called",
                                   get_tok_str(mname, NULL));
+                    if (by_value) {
+                        /* 'a.m()' passes the value's address: a struct is
+                           always in memory, so this is the plain '&a' */
+                        test_lvalue();
+                        if (vtop->sym)
+                            vtop->sym->a.addrtaken = 1;
+                        mk_pointer(&vtop->type);
+                        gaddrof();
+                    }
                     c6_method_call_prep(m);
                     continue;           /* let the '(' case do the call */
                 }
@@ -14303,10 +14336,22 @@ static Sym *c6_gen_meth_sym(int sym_tok)
     return sym_find_raw(sym_tok);
 }
 
+/* the method NAME registered for the struct/union tag TAG, or 0 */
+static C6Method *c6_method_find_tag(int tag, int name)
+{
+    C6Method *m = 0;
+
+    if (!tag)
+        return NULL;
+    for (m = c6_methods; m; m = m->next)
+        if (m->type_tag == tag && m->name == name)
+            return m;
+    return NULL;
+}
+
 /* is there a method NAME taking a pointer to the type TYPE points at? */
 static C6Method *c6_method_lookup(CType *type, int name)
 {
-    C6Method *m = 0;
     int tag = 0;
 
     if (!tcc_state->c6_ext || !c6_nb_methods)
@@ -14317,10 +14362,31 @@ static C6Method *c6_method_lookup(CType *type, int name)
     /* an interface value dispatches through its vtable instead */
     if (c6_iface_of_type(pointed_type(type)))
         return NULL;
-    for (m = c6_methods; m; m = m->next)
-        if (m->type_tag == tag && m->name == name)
-            return m;
-    return NULL;
+    return c6_method_find_tag(tag, name);
+}
+
+/* can TYPE be a receiver written as a value, i.e. 'a.f(...)'?  Not a pointer
+   (that is 'p->f(...)'), not an interface (its vtable dispatches the dot
+   call) and not an array.  No method has to be registered yet: a '|T|'
+   method template is instantiated by the call itself. */
+static int c6_value_receiver(CType *type)
+{
+    if (!tcc_state->c6_ext)
+        return 0;
+    if ((type->t & (VT_BTYPE | VT_ARRAY)) != VT_STRUCT || !type->ref)
+        return 0;
+    if (c6_iface_of_type(type))
+        return 0;
+    return 1;
+}
+
+/* the method NAME of the struct/union VALUE type TYPE, or 0.  'a.f()' passes
+   '&a', so the method is the same 'ret f(struct T *self, ...)' */
+static C6Method *c6_method_lookup_value(CType *type, int name)
+{
+    if (!c6_value_receiver(type))
+        return NULL;
+    return c6_method_find_tag(type->ref->v & ~SYM_STRUCT, name);
 }
 
 /* find_field() without the diagnostic: used to give a real field
@@ -14348,6 +14414,15 @@ static int c6_has_field(CType *type, int v)
     if (!c6_ptr_tag(type))
         return 0;
     return c6_find_field_quiet(pointed_type(type), v | SYM_FIELD) != 0;
+}
+
+/* the same question for a struct/union value ('a.m()' has the value, not a
+   pointer to it, on the stack) */
+static int c6_has_field_value(CType *type, int v)
+{
+    if ((type->t & VT_BTYPE) != VT_STRUCT || !type->ref)
+        return 0;
+    return c6_find_field_quiet(type, v | SYM_FIELD) != 0;
 }
 
 /* is NAME a field or a method of the instance whose body is being written?

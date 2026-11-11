@@ -10,7 +10,8 @@ int vec_sum(struct Vec *v) { return v->x + v->y; }
 
 // EXPECT test_method_without_call: error: method 'vec_sum' must be called
 // EXPECT test_duplicate_method: error: redefinition of 'Vec_area'
-// EXPECT test_value_receiver_needs_arrow: error: field not found: vec_sum
+// EXPECT test_value_method_without_call: error: method 'vec_sum' must be called
+// EXPECT test_value_field_takes_precedence: error: function pointer expected
 // EXPECT test_unknown_member: error: field not found: nope
 
 #if defined test_method_without_call
@@ -32,11 +33,19 @@ int main(void)
     struct Holder *p = &h;
     return p->vec_sum == 2 ? 0 : 1;     /* 字段优先于方法 */
 }
-#elif defined test_value_receiver_needs_arrow
+#elif defined test_value_method_without_call
 int main(void)
 {
     struct Vec v = { 1, 2 };
-    return v.vec_sum();         /* 只有 '->' 才是方法调用 */
+    return v.vec_sum;           /* 值接收者也必须带调用：v.vec_sum() */
+}
+#elif defined test_value_field_takes_precedence
+struct Sack { int n; int vec_sum; };
+int vec_sum(struct Sack *s) { return s->n; }
+int main(void)
+{
+    struct Sack s = { 4, 99 };
+    return s.vec_sum();         /* 字段优先：既不是方法也不是函数 */
 }
 #elif defined test_unknown_member
 int main(void)
@@ -50,6 +59,8 @@ int main(void)
 {
     struct Vec v = { 1, 2 };
     struct Vec *p = &v;
+    if (v.vec_sum() != 3)       /* 值接收者：等价于 vec_sum(&v) */
+        return 1;
     return p->vec_sum() == 3 ? 0 : 1;
 }
 #endif

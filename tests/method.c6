@@ -18,6 +18,17 @@ int vec_sum(struct Vec *v) { return v->x + v->y; }
 /* 方法可以调用同一个接收者的其它方法 */
 int vec_twice(struct Vec *v) { return v->vec_sum() * 2; }
 
+/* 值接收者：'v.vec_bump()' 就是 'vec_bump(&v)'，改的是 v 本身 */
+void vec_bump(struct Vec *v) { v->x = v->x + 1; }
+
+/* 值上的同名字段仍然优先：'d.dup_size' 是字段，方法只能普通调用 */
+struct Dup { int n; int dup_size; };
+int dup_size(struct Dup *d) { return d->n * 2; }
+
+/* 值接收者也认 '|T|' 方法模板：'v.vat(0)' 与 'vat@int(&v, 0)' 等价 */
+struct Vect@T { T *data; int len; };
+|T| T vat(Vect@T *self, int i) { return self->data[i]; }
+
 /* 返回结构体时，隐藏的接收者在 sret 缓冲区之后 */
 struct Pair vec_pair(struct Vec *v)
 {
@@ -82,6 +93,20 @@ int!error checked_times_ten(struct Vec *v)
 static int probe(struct Vec *v)
 {
     int x = checked_times_ten(v) catch e {
+        return -e.id;
+    };
+    return x;
+}
+
+/* 值接收者调 '!error' 方法：错误照常经过 'try' 往上走 */
+int!error checked_by_value(struct Vec v)
+{
+    return (try v.vec_checked()) * 10;
+}
+
+static int probe_value(struct Vec v)
+{
+    int x = checked_by_value(v) catch e {
         return -e.id;
     };
     return x;
@@ -218,4 +243,78 @@ test "方法可以跨翻译单元：本 TU 声明、另一个 TU 定义" {
         return err(2, "另一个 TU 的方法里调用本 TU 的方法不对");
     if (vec_scale(p, 1) != 7)
         return err(3, "跨 TU 的普通调用形式不对");
+}
+
+/* ---- 值接收者：'a.m()' 就是 'm(&a)' ---- */
+
+test "值接收者：v.f() 等价于 f(&v)" {
+    struct Vec v = { 3, 4 };
+    if (v.vec_sum() != 7)
+        return err(1, "v.vec_sum() 不对");
+    if (v.vec_sum() != vec_sum(&v))
+        return err(2, "v.f() 与 f(&v) 不是同一个调用");
+    v.vec_bump();
+    if (v.x != 4)
+        return err(3, "方法通过接收者改的是 v 本身");
+    v.vec_bump();
+    if (v.x != 5 || (&v)->x != 5)
+        return err(4, "连续两次 v.vec_bump() 不对");
+}
+
+test "值接收者：返回结构体的方法" {
+    struct Vec v = { 3, 4 };
+    struct Pair q = v.vec_pair();
+    if (q.a != 6 || q.b != 12)
+        return err(1, "v.vec_pair() 的 sret 不对");
+}
+
+test "值接收者：'!error' 方法照常传播错误" {
+    struct Vec v = { 3, 4 };
+    __tcc_err_clear();
+    if (probe_value(v) != 30)
+        return err(1, "正常路径的返回值不对");
+    v.x = -1;
+    if (probe_value(v) != -1)
+        return err(2, "错误路径没有把错误码带回来");
+    __tcc_err_clear();
+}
+
+test "值上的同名字段仍然优先于方法" {
+    struct Dup d = { 4, 99 };
+    if (d.dup_size != 99)
+        return err(1, "字段 dup_size 没有优先");
+    if (dup_size(&d) != 8)
+        return err(2, "同名方法本身仍然可以普通调用");
+}
+
+test "泛型实例的值也能点调用方法" {
+    int a[2] = { 7, 8 };
+    Vect@int v = { a, 2 };
+    if (v.vat(1) != 8)
+        return err(1, "值接收者的 vat 不对");
+    if ((&v)->vat(0) != 7)
+        return err(2, "指针接收者仍然可用");
+    if (v.vat(0) != vat@int(&v, 0))
+        return err(3, "v.vat(0) 与 vat@int(&v, 0) 不是同一个调用");
+}
+
+test "接口值上的点调用仍然走 vtable" {
+    struct Circle c = { 2 };
+    if (c.area() != 12)          /* 结构体值：方法接收者是 '&c' */
+        return err(1, "结构体值上的 area 不对");
+}
+
+/* 接口值上的点调用由 vtable 分派，不被「值接收者」这条新规则接管 */
+interface Weigh { int weight(); }
+
+struct Sack { int n; };
+int weight(struct Sack *s) { return s->n * 3; }
+
+test "接口值的点调用仍然走 vtable，不是值接收者" {
+    struct Sack k = { 4 };
+    Weigh w = k;                 /* Sack 实现了 Weigh */
+    if (w.weight() != 12)
+        return err(1, "接口值的点调用没有走 vtable");
+    if (k.weight() != 12)        /* 结构体值：接收者是 '&k' */
+        return err(2, "结构体值上的 weight 不对");
 }

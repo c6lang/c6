@@ -264,7 +264,7 @@ void f(Vect@int *v) {
   `T!error peek(int i) { return data[i]; }`、`int cap(void) { return N; }`。
 * 方法体里可以第一次实例化**别的**模板（内层实例的 tag 和方法签名就在那里
   建出来，形参作用域各算各的）：`Leaf@int leaf = {k}; return (&leaf)->get();`。
-  方法一律 `->` 调用，和文件作用域的方法写法一致。
+  方法照旧 `p->m()` 调用；接收者是值时也可以写 `v.m()`（等价于 `m(&v)`）。
 * 形参表按 C 的习惯写：`(void)` 和 `()` 都表示「只有接收者」，
   `void *p` 这种以 `void` 开头的形参不会被当成 `(void)`（收接收者 + 保住
   那个 `void`）。`const int a`、多形参、`(void *p, int n)` 都照常。

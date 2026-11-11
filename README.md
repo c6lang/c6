@@ -13,7 +13,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 | `spawn f(...)` | OS 线程（`pthread_create`），语句立刻返回、真并发 |
 | `test "描述" { ... }` + `-test` | 顶层测试块与测试运行器 |
 | `module` / `import` | 命名空间：一个文件一个模块，模块名就是它的路径；`mod__sym` 前缀与 `mod.member` 限定访问 |
-| 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 调用（符号是 `T_f`，不同类型可同名，`f(p)` 仍可用） |
+| 结构体方法 | `ret f(struct T *self, ...)` 即为 `T` 的方法，可用 `p->f(...)` 或 `v.f(...)`（接收者是 `&v`）调用（符号是 `T_f`，不同类型可同名，`f(p)` 仍可用） |
 | 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]`；被普通符号遮蔽时仍写 `struct` |
 | `interface` | 胖指针（`{void *self; const VT *vt;}`）+ 自动生成的 vtable 接口抽象 |
 | `T[:]` 切片 | 带长度与边界检查的数组视图（`{元素指针, 长度}` 两个机器字） |
@@ -403,7 +403,7 @@ int main(void)
 {
     struct Vec v = {3, 4};
     struct Rect r = {2, 3};
-    return (&v)->vec_twice() + (&r)->area();   /* 等价于 vec_twice(&v) + Rect_area(&r) */
+    return v.vec_twice() + r.area();   /* 等价于 vec_twice(&v) + Rect_area(&r) */
 }
 ```
 
@@ -419,8 +419,10 @@ int main(void)
 - 不改名的情形：`static` / `inline` 函数、`__` 开头的名字（编译器和 libtcc1 专用）、
   系统头文件里的声明（`p->fflush()`、`p->gettimeofday()` 这类 libc 成员照旧可用）、
   匿名结构体的方法；
-- 只支持 `->`（`p->f()`）；`v.f()` 仍是普通成员访问，`p->f`（不带调用）会报
-  `method 'f' must be called`；
+- 接收者可以写成指针，也可以写成**值**：`p->f(a)` 与 `v.f(a)` 都改写为
+  `T_f(接收者, a)`，其中 `v.f(a)` 传的是 `&v`（和 `f(&v, a)` 是同一个调用，
+  所以方法里改的确实是 `v`），`v` 必须是可作左值的对象；`p->f` / `v.f`（不带
+  调用）报 `method 'f' must be called`；
 - 结构体同名字段优先于方法；方法须在**使用点之前**可见（TCC 单趟编译）；
 - 模块里的方法也按接收者取名，模块前缀加在最外层（`geo__shape__Point_area`），
   所以同名方法放进不同模块、或干脆不进模块，都能共存；
