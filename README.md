@@ -444,6 +444,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/core/ode.c6            std.core.ode           常微分方程：Euler/中点/RK4，状态与 5n 缓冲由调用方给
   std/core/optimize.c6       std.core.optimize      一维极小：黄金分割/三分法/网格细化，best_x/best_value
   std/core/least.c6          std.core.least         最小二乘：直线与多项式拟合（正规方程 + 高斯消元，rss/r2）
+  std/core/lu.c6             std.core.lu            LU 分解（部分主元）：一次分解，反复 solve/inverse/det
+  std/core/eigen.c6          std.core.eigen         特征分解：Jacobi 旋转求全部特征值/向量 + 幂法求主特征值
+  std/core/tridiag.c6        std.core.tridiag       三对角 Thomas 算法：O(n) 求解、一次前代多次回代
+  std/core/sparse.c6         std.core.sparse        CSR 稀疏矩阵：begin/add/finish 构建、spmv/spmv_t/transpose
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -574,6 +578,7 @@ make std-match    # 编译并运行 examples/stdmatch.c6（第七十一批匹配
 make std-async    # 编译并运行 examples/stdasync.c6（第七十二批异步编程基础模块的拼装示例）
 make std-async2   # 编译并运行 examples/stdasync2.c6（第七十三批 executor/asio/retry/awaitgroup 示例）
 make std-math3    # 编译并运行 examples/stdmath3.c6（第七十四批数值方法与拟合模块的拼装示例）
+make std-linalg   # 编译并运行 examples/stdlinalg.c6（第七十五批线性代数模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

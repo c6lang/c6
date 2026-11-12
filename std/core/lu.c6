@@ -1,0 +1,306 @@
+/* std/core/lu：LU 分解（部分主元）——一次分解，多次求解、求逆、求行列式。
+ *
+ *     import std.core.lu;
+ *
+ *     double a[4] = { 4, 3, 6, 3 };      // 2x2
+ *     double lbuf[4] = { 0 };
+ *     int piv[2] = { 0, 0 };
+ *     Lu f = { 0 };
+ *     f.init(a, 2, lbuf, piv);           // 方法：init / solve / det / inverse
+ *     double b[2] = { 1, 1 }, x[2] = { 0 }, work[2] = { 0 };
+ *     f.solve(b, x, work);
+ *
+ * 分解结果就地放在调用方给的 `lu_buf`（`n*n` 个 `double`）里：下三角（不含对角线）
+ * 是 L、上三角是 U，对角线是 U 的对角线（L 的对角线隐含为 1）。
+ *
+ * 约定：
+ *
+ * - `f.init(a, n, lu_buf, piv_buf)` 做 PLU 分解，成功返回秩（正常等于 n），
+ *   矩阵奇异时返回 0 且 `f.singular() == 1`（分解本身仍然可用，只是 `solve`
+ *   会给 -1）；参数非法返回 -1；
+ * - `f.solve(b, x, work)` 解 `A·x = b`（`work` 长度 n），返回 1 成功、-1 奇异/参数错；
+ * - `f.det()` 行列式（奇异时为 0），`f.inverse(out, work)` 求逆（`out` 是 `n*n`，
+ *   `work` 长度 3n），返回 1/-1；
+ * - `f.dim()` 阶数，`f.sign()` 置换符号（+1/-1），`f.pivots(i)` 第 i 步选的主元行，
+ *   `f.lu(i, j)` 读分解后的元素（0 基），`f.singular()`；
+ * - 全部 `double`，需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ */
+#include <math.h>
+#include <string.h>
+
+module std.core.lu;
+import std.core.types;
+import std.text.str;
+
+struct Lu {
+    int n;
+    double *a;
+    int *piv;
+    int sign;
+    int singular_flag;
+};
+
+int init(Lu *f, const double *src, int n, void *lu_buf, void *piv_buf)
+{
+    int i = 0, j = 0, k = 0, rank = 0;
+
+    if (!f || !src || n <= 0 || !lu_buf || !piv_buf)
+        return -1;
+    memset(f, 0, sizeof *f);
+    f->n = n;
+    f->a = (double *)lu_buf;
+    f->piv = (int *)piv_buf;
+    f->sign = 1;
+    memcpy(lu_buf, src, sizeof(double) * (size_t)(n * n));
+    memset(piv_buf, 0, sizeof(int) * (size_t)n);
+    for (k = 0; k < n; k++) {
+        int piv = k;
+        double best = fabs(f->a[k * n + k]);
+
+        for (i = k + 1; i < n; i++) {
+            double v = fabs(f->a[i * n + k]);
+
+            if (v > best) {
+                best = v;
+                piv = i;
+            }
+        }
+        f->piv[k] = piv;
+        if (piv != k) {
+            for (j = 0; j < n; j++) {
+                double t = f->a[k * n + j];
+
+                f->a[k * n + j] = f->a[piv * n + j];
+                f->a[piv * n + j] = t;
+            }
+            f->sign = -f->sign;
+        }
+        if (best < 1e-14) {
+            continue;                   /* 该列已无可用主元：矩阵奇异 */
+        }
+        for (i = k + 1; i < n; i++) {
+            double factor = f->a[i * n + k] / f->a[k * n + k];
+
+            f->a[i * n + k] = factor;
+            for (j = k + 1; j < n; j++)
+                f->a[i * n + j] -= factor * f->a[k * n + j];
+        }
+    }
+    /* 秩：U 的非零对角个数 */
+    for (k = 0; k < n; k++) {
+        if (fabs(f->a[k * n + k]) >= 1e-14)
+            rank++;
+    }
+    if (rank < n)
+        f->singular_flag = 1;
+    return f->singular_flag ? 0 : rank;
+}
+
+int dim(Lu *f)
+{
+    return f ? f->n : 0;
+}
+
+int sign(Lu *f)
+{
+    return f ? f->sign : 1;
+}
+
+int singular(Lu *f)
+{
+    return f ? f->singular_flag : 1;
+}
+
+int pivots(Lu *f, int i)
+{
+    if (!f || !f->piv || i < 0 || i >= f->n)
+        return 0;
+    return f->piv[i];
+}
+
+double lu(Lu *f, int i, int j)
+{
+    if (!f || !f->a || i < 0 || i >= f->n || j < 0 || j >= f->n)
+        return 0.0;
+    return f->a[i * f->n + j];
+}
+
+double det(Lu *f)
+{
+    double d = 1.0;
+    int i = 0;
+
+    if (!f || !f->a)
+        return 0.0;
+    if (f->singular_flag)
+        return 0.0;
+    for (i = 0; i < f->n; i++)
+        d *= f->a[i * f->n + i];
+    return d * (double)f->sign;
+}
+
+int solve(Lu *f, const double *b, double *x, void *work)
+{
+    double *y = 0;
+    int i = 0, j = 0;
+
+    if (!f || !f->a || !b || !x || !work)
+        return -1;
+    if (f->singular_flag)
+        return -1;
+    y = (double *)work;
+    /* 应用行置换 */
+    for (i = 0; i < f->n; i++)
+        y[i] = b[i];
+    for (i = 0; i < f->n; i++) {
+        if (f->piv[i] != i) {
+            double t = y[i];
+
+            y[i] = y[f->piv[i]];
+            y[f->piv[i]] = t;
+        }
+    }
+    /* 前代（L 单位下三角） */
+    for (i = 0; i < f->n; i++) {
+        double s = y[i];
+
+        for (j = 0; j < i; j++)
+            s -= f->a[i * f->n + j] * y[j];
+        y[i] = s;
+    }
+    /* 回代（U 上三角） */
+    for (i = f->n - 1; i >= 0; i--) {
+        double s = y[i];
+
+        for (j = i + 1; j < f->n; j++)
+            s -= f->a[i * f->n + j] * y[j];
+        y[i] = s / f->a[i * f->n + i];
+    }
+    for (i = 0; i < f->n; i++)
+        x[i] = y[i];
+    return 1;
+}
+
+int inverse(Lu *f, double *out, void *work)
+{
+    double *e = 0;
+    double *y = 0;
+    double *x = 0;
+    int i = 0, j = 0;
+
+    if (!f || !out || !work)
+        return -1;
+    if (f->singular_flag)
+        return -1;
+    e = (double *)work;                 /* work 需要 3n 个 double：e / y / x */
+    y = e + f->n;
+    x = y + f->n;
+    for (j = 0; j < f->n; j++) {
+        for (i = 0; i < f->n; i++)
+            e[i] = (i == j) ? 1.0 : 0.0;
+        if (f->solve(e, x, (void *)y) != 1)
+            return -1;
+        for (i = 0; i < f->n; i++)
+            out[i * f->n + j] = x[i];
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "lu：分解、求解与行列式" {
+    double a[9] = { 2, 1, 1, 4, 3, 3, 8, 7, 9 };
+    double lbuf[9] = { 0 };
+    int piv[3] = { 0, 0, 0 };
+    Lu f = { 0 };
+    double b[3] = { 4, 10, 24 };
+    double x[3] = { 0, 0, 0 };
+    double w[6] = { 0 };
+
+    if (f.init(a, 3, lbuf, piv) != 3)
+        return err(1, "3x3 应该满秩");
+    if (f.dim() != 3 || f.singular() != 0)
+        return err(2, "维数/奇异标志不对");
+    if (fabs(f.det() - 4.0) > 1e-9)
+        return err(3, "行列式应该是 4");
+    if (f.solve(b, x, w) != 1)
+        return err(4, "求解失败");
+    if (fabs(x[0] - 1.0) > 1e-9 || fabs(x[1] - 1.0) > 1e-9
+        || fabs(x[2] - 1.0) > 1e-9)
+        return err(5, "解应该是 (1,1,1)");
+    /* 换个右端再解一次（复用分解） */
+    {
+        double b2[3] = { 1, 0, 0 };
+
+        if (f.solve(b2, x, w) != 1)
+            return err(6, "第二次求解失败");
+        /* 校验 A·x ≈ b2 */
+        if (fabs(2 * x[0] + x[1] + x[2] - 1.0) > 1e-9)
+            return err(7, "回代结果不满足方程");
+    }
+    if (f.lu(0, 0) == 0.0 || f.pivots(0) < 0)
+        return err(8, "分解元素/主元记录不对");
+}
+
+test "lu：求逆、奇异与二阶" {
+    double a[4] = { 4, 3, 6, 3 };
+    double lbuf[4] = { 0 };
+    int piv[2] = { 0, 0 };
+    Lu f = { 0 };
+    double inv[4] = { 0 };
+    double w[8] = { 0 };
+    double bt[2] = { 0 };
+    double xt[2] = { 0 };
+
+    /* 2x2：A = [[4,3],[6,3]]，det = 12-18 = -6 */
+    if (f.init(a, 2, lbuf, piv) != 2)
+        return err(9, "2x2 应该满秩");
+    if (fabs(f.det() + 6.0) > 1e-9)
+        return err(10, "行列式应该是 -6");
+    if (f.inverse(inv, w) != 1)
+        return err(11, "求逆失败");
+    /* A·A⁻¹ = I */
+    {
+        double e[4] = { 0 };
+        int i = 0, j = 0, k = 0;
+
+        for (i = 0; i < 2; i++) {
+            for (j = 0; j < 2; j++) {
+                for (k = 0; k < 2; k++)
+                    e[i * 2 + j] += a[i * 2 + k] * inv[k * 2 + j];
+            }
+        }
+        if (fabs(e[0] - 1.0) > 1e-9 || fabs(e[1]) > 1e-9 || fabs(e[2]) > 1e-9
+            || fabs(e[3] - 1.0) > 1e-9)
+            return err(12, "A·A⁻¹ 应该是单位矩阵");
+    }
+    /* 用逆解方程：[[4,3],[6,3]] x = [1,1] */
+    bt[0] = 1;
+    bt[1] = 1;
+    if (f.solve(bt, xt, (void *)w) != 1)
+        return err(13, "求解失败");
+    if (fabs(4 * xt[0] + 3 * xt[1] - 1.0) > 1e-9)
+        return err(14, "解不满足方程");
+    /* 奇异矩阵 */
+    {
+        double s[4] = { 1, 2, 2, 4 };
+        double sb[4] = { 0 };
+        int sp[2] = { 0, 0 };
+        Lu g = { 0 };
+        double xx[2] = { 0 };
+        double bb[2] = { 7, 8 };
+
+        if (g.init(s, 2, sb, sp) != 0 || g.singular() != 1)
+            return err(15, "奇异矩阵应该返回 0");
+        if (g.det() != 0.0)
+            return err(16, "奇异矩阵行列式应该是 0");
+        if (g.solve(bb, xx, (void *)w) != -1)
+            return err(17, "奇异矩阵求解应该 -1");
+        if (g.inverse(inv, w) != -1)
+            return err(18, "奇异矩阵求逆应该 -1");
+    }
+    if (f.init(a, 0, lbuf, piv) != -1)
+        return err(19, "n=0 应该 -1");
+}

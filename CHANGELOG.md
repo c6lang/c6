@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十五批（线性代数）**：`std.core.lu`（PLU 分解，反复求解/求逆/行列式）、
+  `std.core.eigen`（Jacobi 特征分解 + 幂法）、`std.core.tridiag`（Thomas 三对角求解）、
+  `std.core.sparse`（CSR 稀疏矩阵 SpMV/转置），集成示例 `examples/stdlinalg.c6`
+  （`make std-linalg`）。错误号段 `std.core.lu`=0x6135 … `std.core.sparse`=0x6138
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十四批（数值方法与拟合）**：`std.core.solve`（二分/牛顿/割线求根）、
   `std.core.ode`（Euler/中点/RK4 定步长积分）、`std.core.optimize`（黄金分割/三分/
   网格求一维极小）、`std.core.least`（直线与多项式最小二乘），集成示例

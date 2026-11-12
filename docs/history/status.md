@@ -2430,6 +2430,35 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（309 个模块、0 failure）、`make std-math3`（25 条自检全过）、
 `make check-all`。
 
+### 11.87 标准库第七十五批（lu / eigen / tridiag / sparse）
+
+第七十五批做「线性代数」：LU 分解、对称矩阵特征分解、三对角求解与 CSR 稀疏矩阵。
+`matrix.c6` 已经提供了稠密矩阵的加减乘、行列式与一次求解，这批补的是**反复使用**
+（一次分解多次求解/求逆）与**结构化矩阵**（三对角、稀疏）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.lu` | LU | PLU 就地分解（下三角是 L、上三角是 U，对角线是 U 的）；`init` 返回秩：满秩给 n、奇异给 0、参数错给 -1；`inverse` 要 `3n` 的 work（e/y/x 三块，一开始只留了 `2n`，`e` 被 `solve` 的 work 覆盖） |
+| `std.core.eigen` | 特征分解 | Jacobi 每步旋转最大的非对角元素（比循环扫掠收敛快），`sorted()` 让特征值升序、特征向量跟着换列；幂法的 Rayleigh 商用**新的**归一化向量算 |
+| `std.core.tridiag` | 三对角 | Thomas 前代只算一次（`cc[i]`），`solve` 只做右端的消元与回代；`buf` 是 `5n`（lo/di/up 副本 + cc/dd）；主元 < 1e-300 判退化 |
+| `std.core.sparse` | CSR | 三块缓冲由调用方给；构建期用 `begin`/`add`/`finish` 游标，**行号不能倒退**（倒退返回 -1，顺带保证 `ptr` 单调）；`transpose` 先用 `ptr2` 数每行个数、再前缀和、再用游标表填值（游标表上限 128 行） |
+
+踩到的坑：`Sparse` 的字段名一开始叫 `rows`/`cols`/`nnz`，正好和方法同名，编译先报
+「function pointer expected」再报「method 'rows' must be called」，统统改成
+`nr`/`nc`/`nz`；测试里 `fabs` 忘了 `#include <math.h>`，隐式声明按 `int` 返回，
+浮点比较全变成了垃圾值；`sparse` 的转置测试期望也算错过一次（`Aᵀ·x` 应该是
+`[2,15,4]`）。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.lu`=0x6135、
+`std.core.eigen`=0x6136、`std.core.tridiag`=0x6137、`std.core.sparse`=0x6138；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-linalg` 与 `STD_LINALG_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条，另需 `-lm`）。示例 `examples/stdlinalg.c6` 四节（31 条自检）。
+
+验收：`make stdtest`（313 个模块、0 failure）、`make std-linalg`（31 条自检全过）、
+`make check-all`。
+
+
 
 
 

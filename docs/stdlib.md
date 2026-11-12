@@ -341,6 +341,11 @@
 | `std/core/ode.c6` | `std.core.ode` | 常微分方程组定步长积分（**方法**：`o.setup`/`o.step`/`o.integrate`/`o.integrate_with`/`o.at`/`o.time_of`/`o.steps`/`o.evaluations`）：Euler/中点/RK4，状态与 `5n` 工作缓冲都由调用方给 |
 | `std/core/optimize.c6` | `std.core.optimize` | 一维极小（**方法**：`o.setup`/`o.golden`/`o.ternary`/`o.grid`/`o.best_x`/`o.best_value`/`o.iters`）：黄金分割、三分法、网格扫描 + 相邻格细化 |
 | `std/core/least.c6` | `std.core.least` | 最小二乘拟合（**方法**：`f.line`/`f.poly`/`f.value_at`/`f.coef`/`f.rss`/`f.r2`/`f.degree`/`f.npoints`）：正规方程 + 部分主元高斯消元，次数 ≤ 7，给残差平方和与决定系数 |
+| `std/core/lu.c6` | `std.core.lu` | LU 分解（**方法**：`f.init`/`f.solve`/`f.det`/`f.inverse`/`f.lu`/`f.pivots`/`f.dim`/`f.sign`/`f.singular`）：部分主元的 PLU，一次分解多次求解/求逆/行列式；奇异时 `init` 返回 0 且 `solve` 给 -1 |
+| `std/core/eigen.c6` | `std.core.eigen` | 对称矩阵特征分解（**方法**：`e.init`/`e.jacobi`/`e.sorted`/`e.value`/`e.vector_at`/`e.power`/`e.sweeps`/`e.converged`）：Jacobi 旋转求全部特征值与特征向量，幂法求主特征值；`jacobi` 会就地旋转 `a`，之后再幂法要另建实例 |
+| `std/core/tridiag.c6` | `std.core.tridiag` | 三对角求解（**方法**：`t.init`/`t.solve`/`t.det`/`t.diag_at`/`t.dim`/`t.degenerate`）：Thomas 算法 O(n)，前代系数算一次可反复回代，行列式 = 前代主元之积 |
+| `std/core/sparse.c6` | `std.core.sparse` | CSR 稀疏矩阵（**方法**：`s.init`/`s.begin`/`s.add`/`s.finish`/`s.dense`/`s.get`/`s.spmv`/`s.spmv_t`/`s.transpose`/`s.row_nnz`/`s.row_sum`/`s.nnz`/`s.rows`/`s.cols`）：构建期行号不能倒退，`dense` 从稠密矩阵建，转置写进另外三块缓冲 |
+
 
 
 
@@ -476,6 +481,7 @@
 | `examples/stdasync.c6` | （无模块） | 第七十二批（异步编程基础）的拼装示例（`make std-async`）：Future 回调与 all/any、定时器堆、协作式任务、poll 事件循环 + 定时器 |
 | `examples/stdasync2.c6` | （无模块） | 第七十三批（async 之上再盖一层）的拼装示例（`make std-async2`）：事件循环 tick、按行异步读、退避重试、完成计数组 |
 | `examples/stdmath3.c6` | （无模块） | 第七十四批（数值方法与拟合）的拼装示例（`make std-math3`）：三种求根、RK4/Euler 对比、黄金分割/三分/网格求极小、直线与二次最小二乘 |
+| `examples/stdlinalg.c6` | （无模块） | 第七十五批（线性代数）的拼装示例（`make std-linalg`）：LU 求解/求逆/行列式、Jacobi 特征值与幂法、8 阶 Poisson 三对角、CSR 的 SpMV 与转置 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -666,6 +672,10 @@ std/core/solve.c6          24 test(s), 0 failure(s)
 std/core/ode.c6            24 test(s), 0 failure(s)
 std/core/optimize.c6       24 test(s), 0 failure(s)
 std/core/least.c6          24 test(s), 0 failure(s)
+std/core/lu.c6             24 test(s), 0 failure(s)
+std/core/eigen.c6          24 test(s), 0 failure(s)
+std/core/tridiag.c6        24 test(s), 0 failure(s)
+std/core/sparse.c6         24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4216,6 +4226,17 @@ make std-math3
 黄金分割、三分法与网格细化找 `0.75` 处的极小；`Fit` 先拟合带噪直线（打印 rss/r2）
 再拟合抛物线并 `value_at(3)`。
 
+### 集成示例：`examples/stdlinalg.c6`
+
+```sh
+make std-linalg
+```
+
+四节都用方法：`Lu` 对 3×3 矩阵分解后打印 `det = 4`、解出 `(1,1,1)`、验 `A·A⁻¹`；
+`Eigen` 先 `jacobi` 拿到特征值 1 与 3（2 次扫掠）再另建实例用 `power` 得到 3；
+`Tridiag` 解 8 阶 Poisson 方程（`det = 9`、解全 1）；`Sparse` 从稠密矩阵建 CSR，
+打印行非零数/行和、`A·[1,2,3] = [7,6,19]`，最后转置并检查行偏移。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4359,6 +4380,8 @@ make std-math3
 * `make std-async2`：`examples/stdasync2.c6`，第七十三批（async 之上再盖一层）模块的拼装
   示例（自带自检）。
 * `make std-math3`：`examples/stdmath3.c6`，第七十四批（数值方法与拟合）模块的拼装示例
+  （自带自检）。
+* `make std-linalg`：`examples/stdlinalg.c6`，第七十五批（线性代数）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

@@ -13014,6 +13014,10 @@ static const struct C6ErrStdSlot {
     { "std.core.ode",           C6_ERR_SLOT_STD + 306 },
     { "std.core.optimize",      C6_ERR_SLOT_STD + 307 },
     { "std.core.least",         C6_ERR_SLOT_STD + 308 },
+    { "std.core.lu",            C6_ERR_SLOT_STD + 309 },
+    { "std.core.eigen",         C6_ERR_SLOT_STD + 310 },
+    { "std.core.tridiag",       C6_ERR_SLOT_STD + 311 },
+    { "std.core.sparse",        C6_ERR_SLOT_STD + 312 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
