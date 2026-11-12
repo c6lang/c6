@@ -1,0 +1,383 @@
+/* std/encoding/poly1305：Poly1305 一次性消息认证码（RFC 8439 §2.5）。
+ *
+ *     import std.encoding.poly1305;
+ *
+ *     u8 tag[16] = { 0 };
+ *     poly1305_mac(key32, msg, n, tag);      // 32 字节 key，16 字节 tag
+ *
+ *     Poly1305 p = poly1305_init(key32);     // 流式：任意切分结果相同
+ *     if (p.ok()) {
+ *         p.update("hello ", 6);
+ *         p.update("world", 5);
+ *         p.final(tag);
+ *     }
+ *
+ * Poly1305 是「一次性」MAC：**每把 key 只能用一次**（key 分两半，前 16 字节
+ * 是 r、后 16 字节是 s；重复用同一把 key 会泄露 r，安全性就没了）。它不是
+ * 哈希，不要拿它做完整性摘要；要多次认证请每次从会话密钥派生新 key（比如
+ * `std.encoding.hkdf`），或者直接用 AEAD（ChaCha20-Poly1305 = 本模块 +
+ * `std.encoding.chacha20`，按 RFC 8439 的构造把 AAD/密文长度也编进去）。
+ *
+ * 实现是 130 位模运算的 5×26 位肢体版本（poly1305-donna 的 32 位做法）：
+ * 所有中间乘积用 u64 装、进位每轮压回 26 位，不依赖 128 位整数；key 的
+ * clamp 折进 r 的掩码里。零分配、栈上 16 字节缓冲处理非整块输入。
+ *
+ * 约定：
+ *
+ * - `poly1305_init` 的 key 必须是 32 字节（多/少都不行，`ok()` 给 0）；
+ * - `update` 可以喂任意长度，`final` 之后句柄失效（要再用请重新 `init`）；
+ * - `final` 只写 16 字节，返回 1；坏句柄/空输出返回 0；
+ * - `poly1305_mac` 是一次性入口（内部走 init/update/final），key/msg 为空
+ *   指针时 msg 当空串（空消息的 tag 就是 key 的后 16 字节），key 为空返回 0。
+ */
+#include <string.h>
+
+module std.encoding.poly1305;
+import std.core.types;
+
+struct Poly1305 {
+    u32 r[5];
+    u32 h[5];
+    u32 pad[4];
+    u8 buf[16];
+    int used;
+    int valid;
+};
+
+static u32 poly_load32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static void poly_store32(u8 *p, u32 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
+}
+
+Poly1305 poly1305_init(const void *key32)
+{
+    Poly1305 st = { { 0 }, { 0 }, { 0 }, { 0 }, 0, 0 };
+    const u8 *k = (const u8 *)key32;
+
+    if (!k)
+        return st;
+    /* r = key[0..16] & 0x0ffffffc0ffffffc0ffffffc0fffffff（clamp 折进掩码） */
+    st.r[0] = poly_load32(k) & 0x3ffffffu;
+    st.r[1] = (poly_load32(k + 3) >> 2) & 0x3ffff03u;
+    st.r[2] = (poly_load32(k + 6) >> 4) & 0x3ffc0ffu;
+    st.r[3] = (poly_load32(k + 9) >> 6) & 0x3f03fffu;
+    st.r[4] = (poly_load32(k + 12) >> 8) & 0x00fffffu;
+    st.pad[0] = poly_load32(k + 16);
+    st.pad[1] = poly_load32(k + 20);
+    st.pad[2] = poly_load32(k + 24);
+    st.pad[3] = poly_load32(k + 28);
+    st.used = 0;
+    st.valid = 1;
+    return st;
+}
+
+int ok(Poly1305 *self) { return self && self->valid; }
+
+/* 压一块（16 字节）：h = (h + m + 2^128) * r mod 2^130-5 */
+static void poly_block(Poly1305 *st, const u8 *m, u32 hibit)
+{
+    u32 r0 = st->r[0], r1 = st->r[1], r2 = st->r[2], r3 = st->r[3];
+    u32 r4 = st->r[4];
+    u32 s1 = r1 * 5u, s2 = r2 * 5u, s3 = r3 * 5u, s4 = r4 * 5u;
+    u32 h0 = st->h[0], h1 = st->h[1], h2 = st->h[2], h3 = st->h[3];
+    u32 h4 = st->h[4];
+    u64 d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0;
+    u32 c = 0;
+
+    h0 += poly_load32(m) & 0x3ffffffu;
+    h1 += (poly_load32(m + 3) >> 2) & 0x3ffffffu;
+    h2 += (poly_load32(m + 6) >> 4) & 0x3ffffffu;
+    h3 += (poly_load32(m + 9) >> 6) & 0x3ffffffu;
+    h4 += (poly_load32(m + 12) >> 8) | hibit;
+
+    d0 = (u64)h0 * r0 + (u64)h1 * s4 + (u64)h2 * s3 + (u64)h3 * s2
+         + (u64)h4 * s1;
+    d1 = (u64)h0 * r1 + (u64)h1 * r0 + (u64)h2 * s4 + (u64)h3 * s3
+         + (u64)h4 * s2;
+    d2 = (u64)h0 * r2 + (u64)h1 * r1 + (u64)h2 * r0 + (u64)h3 * s4
+         + (u64)h4 * s3;
+    d3 = (u64)h0 * r3 + (u64)h1 * r2 + (u64)h2 * r1 + (u64)h3 * r0
+         + (u64)h4 * s4;
+    d4 = (u64)h0 * r4 + (u64)h1 * r3 + (u64)h2 * r2 + (u64)h3 * r1
+         + (u64)h4 * r0;
+
+    c = (u32)(d0 >> 26);
+    h0 = (u32)d0 & 0x3ffffffu;
+    d1 += c;
+    c = (u32)(d1 >> 26);
+    h1 = (u32)d1 & 0x3ffffffu;
+    d2 += c;
+    c = (u32)(d2 >> 26);
+    h2 = (u32)d2 & 0x3ffffffu;
+    d3 += c;
+    c = (u32)(d3 >> 26);
+    h3 = (u32)d3 & 0x3ffffffu;
+    d4 += c;
+    c = (u32)(d4 >> 26);
+    h4 = (u32)d4 & 0x3ffffffu;
+    h0 += c * 5u;
+    c = h0 >> 26;
+    h0 &= 0x3ffffffu;
+    h1 += c;
+
+    st->h[0] = h0;
+    st->h[1] = h1;
+    st->h[2] = h2;
+    st->h[3] = h3;
+    st->h[4] = h4;
+}
+
+/* 喂数据：buffer 满了就压一块，末尾不足 16 字节在 final 里补 */
+int update(Poly1305 *self, const void *p, usize n)
+{
+    const u8 *b = (const u8 *)p;
+    usize i = 0;
+
+    if (!self || !self->valid)
+        return 0;
+    if (!b || n == 0)
+        return 1;
+    if (self->used > 0) {
+        while (self->used < 16 && i < n)
+            self->buf[self->used++] = b[i++];
+        if (self->used < 16)
+            return 1;
+        poly_block(self, self->buf, 1u << 24);
+        self->used = 0;
+    }
+    for (; i + 16 <= n; i += 16)
+        poly_block(self, b + i, 1u << 24);
+    while (i < n)
+        self->buf[self->used++] = b[i++];
+    return 1;
+}
+
+/* 收尾：尾巴补 1 字节 0x01 + 零，算 tag = (h + s) mod 2^128 */
+int final(Poly1305 *self, void *out16)
+{
+    u8 *mac = (u8 *)out16;
+    u32 h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+    u32 g0 = 0, g1 = 0, g2 = 0, g3 = 0, g4 = 0;
+    u32 c = 0, mask = 0;
+    u64 f = 0;
+
+    if (!self || !self->valid || !mac)
+        return 0;
+    if (self->used > 0) {
+        self->buf[self->used++] = 1;
+        while (self->used < 16)
+            self->buf[self->used++] = 0;
+        poly_block(self, self->buf, 0);
+        self->used = 0;
+    }
+    h0 = self->h[0];
+    h1 = self->h[1];
+    h2 = self->h[2];
+    h3 = self->h[3];
+    h4 = self->h[4];
+    /* 把进位全部压干净 */
+    c = h1 >> 26;
+    h1 &= 0x3ffffffu;
+    h2 += c;
+    c = h2 >> 26;
+    h2 &= 0x3ffffffu;
+    h3 += c;
+    c = h3 >> 26;
+    h3 &= 0x3ffffffu;
+    h4 += c;
+    c = h4 >> 26;
+    h4 &= 0x3ffffffu;
+    h0 += c * 5u;
+    c = h0 >> 26;
+    h0 &= 0x3ffffffu;
+    h1 += c;
+    /* 算 h + 5 - 2^130，够减就选它（常数时间掩码） */
+    g0 = h0 + 5u;
+    c = g0 >> 26;
+    g0 &= 0x3ffffffu;
+    g1 = h1 + c;
+    c = g1 >> 26;
+    g1 &= 0x3ffffffu;
+    g2 = h2 + c;
+    c = g2 >> 26;
+    g2 &= 0x3ffffffu;
+    g3 = h3 + c;
+    c = g3 >> 26;
+    g3 &= 0x3ffffffu;
+    g4 = h4 + c - (1u << 26);
+    mask = (g4 >> 31) - 1u;     /* 没借位 -> 0xffffffff */
+    g0 &= mask;
+    g1 &= mask;
+    g2 &= mask;
+    g3 &= mask;
+    g4 &= mask;
+    mask = ~mask;
+    h0 = (h0 & mask) | g0;
+    h1 = (h1 & mask) | g1;
+    h2 = (h2 & mask) | g2;
+    h3 = (h3 & mask) | g3;
+    h4 = (h4 & mask) | g4;
+    /* 5×26 位拼回 4×32 位 */
+    h0 = (h0 | (h1 << 26)) & 0xffffffffu;
+    h1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffffu;
+    h2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffffu;
+    h3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffffu;
+    /* 加 s（mod 2^128） */
+    f = (u64)h0 + self->pad[0];
+    h0 = (u32)f;
+    f = (u64)h1 + self->pad[1] + (f >> 32);
+    h1 = (u32)f;
+    f = (u64)h2 + self->pad[2] + (f >> 32);
+    h2 = (u32)f;
+    f = (u64)h3 + self->pad[3] + (f >> 32);
+    h3 = (u32)f;
+    poly_store32(mac, h0);
+    poly_store32(mac + 4, h1);
+    poly_store32(mac + 8, h2);
+    poly_store32(mac + 12, h3);
+    memset(self, 0, sizeof *self);
+    return 1;
+}
+
+/* 一次性 MAC：0 失败（key 为空）/ 1 成功 */
+int poly1305_mac(const void *key32, const void *msg, usize n, void *out16)
+{
+    Poly1305 st = poly1305_init(key32);
+
+    if (!st.ok())
+        return 0;
+    st.update(msg, n);
+    return st.final(out16);
+}
+
+/* ---- 自测 ---- */
+
+static int hex_is(const u8 *d, int n, const char *want)
+{
+    char got[64] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        got[i * 2] = "0123456789abcdef"[(d[i] >> 4) & 0xf];
+        got[i * 2 + 1] = "0123456789abcdef"[d[i] & 0xf];
+    }
+    got[n * 2] = 0;
+    return strcmp(got, want) == 0;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0, i = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = -1, lo = -1;
+
+        for (i = 0; i < 16; i++) {
+            if ("0123456789abcdef"[i] == s[0])
+                hi = i;
+            if ("0123456789abcdef"[i] == s[1])
+                lo = i;
+        }
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+test "RFC 8439 的 Poly1305 向量" {
+    u8 key[32] = { 0 }, tag[16] = { 0 };
+    char *msg = (char *)"Cryptographic Forum Research Group";
+
+    if (unhex("85d6be7857556d337f4452fe42d506a8"
+              "0103808afb0db2fd4abff6af4149f51b",
+              key, 32)
+        != 32)
+        return err(1, "key 解不开");
+    if (!poly1305_mac(key, msg, (usize)strlen(msg), tag))
+        return err(2, "poly1305_mac 失败");
+    if (!hex_is(tag, 16, "a8061dc1305136c6c22b8baf0c0127a9"))
+        return err(3, "RFC 向量不对");
+    /* 空消息的 tag 就是 key 的后 16 字节 */
+    if (!poly1305_mac(key, 0, 0, tag)
+        || !hex_is(tag, 16, "0103808afb0db2fd4abff6af4149f51b"))
+        return err(4, "空消息的 tag 不对");
+    /* 另一把 key、短消息 */
+    {
+        u8 key2[32] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 32; i++)
+            key2[i] = (u8)i;
+        if (!poly1305_mac(key2, "hello poly1305", 14, tag)
+            || !hex_is(tag, 16, "7ab13fb20d79a2fd7895f260feeb9b63"))
+            return err(5, "短消息向量不对");
+    }
+}
+
+test "流式喂入、长消息与错误路径" {
+    u8 key[32] = { 0 }, tag[16] = { 0 }, tag2[16] = { 0 };
+    u8 msg[100] = { 0 };
+    Poly1305 st = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 32; i++)
+        key[i] = (u8)i;
+    for (i = 0; i < 100; i++)
+        msg[i] = (u8)i;
+    if (!poly1305_mac(key, msg, sizeof msg, tag)
+        || !hex_is(tag, 16, "2c48db4b08964d7e67950fbd89760c4d"))
+        return err(6, "100 字节向量不对");
+    /* 1 字节一喂 */
+    st = poly1305_init(key);
+    if (!st.ok())
+        return err(7, "init 失败");
+    for (i = 0; i < (int)sizeof msg; i++)
+        if (!st.update(msg + i, 1))
+            return err(8, "update 失败");
+    if (!st.final(tag2) || memcmp(tag, tag2, 16) != 0)
+        return err(9, "1 字节一喂和一次性不一致");
+    /* 15 / 16 / 17 字节边界 */
+    {
+        u8 a[16] = { 0 }, b[16] = { 0 };
+
+        poly1305_mac(key, msg, 15, a);
+        st = poly1305_init(key);
+        st.update(msg, 7);
+        st.update(msg + 7, 8);
+        st.final(b);
+        if (memcmp(a, b, 16) != 0)
+            return err(10, "15 字节的切分不一致");
+        poly1305_mac(key, msg, 17, a);
+        st = poly1305_init(key);
+        st.update(msg, 16);
+        st.update(msg + 16, 1);
+        st.final(b);
+        if (memcmp(a, b, 16) != 0)
+            return err(11, "17 字节的切分不一致");
+    }
+    /* 坏参数 */
+    {
+        Poly1305 bad = poly1305_init(0);
+
+        if (bad.ok() || bad.update("x", 1) || bad.final(tag2))
+            return err(12, "空 key 的句柄不该可用");
+        if (poly1305_mac(0, msg, 4, tag2))
+            return err(13, "空 key 的 one-shot 应该返回 0");
+        st = poly1305_init(key);
+        if (st.final(0))
+            return err(14, "空输出应该返回 0");
+        if (st.update(0, 0) != 1)
+            return err(15, "空输入应该是成功的空操作");
+    }
+}

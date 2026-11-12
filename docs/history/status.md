@@ -1159,3 +1159,26 @@ temp/mmap 自成一体（temp 只借 `Str` 类型）。示例 `examples/stdfsx.c
 
 验收：`make stdtest`（109 个模块、0 failure）、`make std-fsx`（33 条自检全过）、
 `make check-all`。
+
+### 11.37 标准库第二十五批（aes / chacha20 / poly1305 / random）
+
+第二十五批往密码学方向再走一步：上一批有哈希与 KDF（SHA-2/MD5/HKDF/PBKDF2），
+但「真的加密一段数据」还缺分组密码、流密码、MAC 和安全随机。四个模块都是纯
+计算（random 只读内核设备），零分配，测试向量全部来自 FIPS/NIST/RFC：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.aes` | AES-128/192/256 与 CTR | 只给分组原语 + 未认证的 CTR；S 盒/逆 S 盒/Rcon 由 GF(2^8) 的逆 + 仿射变换生成后写进表（生成脚本不进仓库）；CTR 的 counter 按整 16 字节大端递增（SP 800-38A 约定），最后一块可以不满；结构体只存 60 个轮密钥字，按值传递 |
+| `std.encoding.chacha20` | RFC 8439 流密码 | 12 字节 nonce（IETF 变体）而不是原始的 8 字节；32 位块计数器，单 (key, nonce) 上限 256 GiB；`chacha20_xor` 允许原地加解密，计数器在函数内部按块推进，所以「一次 200 字节」和「64+64+72 手工推进」结果一致 |
+| `std.encoding.poly1305` | RFC 8439 一次性 MAC | 5×26 位肢体做 130 位模运算：所有乘积用 u64 装、每轮把进位压回 26 位，**不需要 128 位整数**；key 的 clamp 折进 r 的掩码；文档最前面写清「同一把 key 只能用一次」 |
+| `std.encoding.random` | `/dev/urandom` | 每次调用 open/close、不缓存 fd（不引入全局状态、fork 之后不共享）；`rand_below` 用「掩码 + 拒绝采样」而不是取模；返回 1/0 而不是假装成功 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.aes`=0x606d、
+`std.encoding.chacha20`=0x606e、`std.encoding.poly1305`=0x606f、`std.encoding.random`=0x6070；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-cipher` 与 `STDCIPHER_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 的依赖表补上 chacha20（bits），
+aes/poly1305/random 自成一体。示例 `examples/stdcipher.c6` 前半段逐个验向量，
+后半段用随机 key/nonce 做 ChaCha20 + Poly1305 的 encrypt-then-MAC 与篡改检测。
+
+验收：`make stdtest`（113 个模块、0 failure）、`make std-cipher`（27 条自检全过）、
+`make check-all`。

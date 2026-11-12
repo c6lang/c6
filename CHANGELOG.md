@@ -47,6 +47,19 @@
 
 ### 标准库
 
+- **标准库第二十五批（对称加密基础）**：`std.encoding.aes` /
+  `std.encoding.chacha20` / `std.encoding.poly1305` / `std.encoding.random`
+  四个模块，集成示例 `examples/stdcipher.c6`（`make std-cipher`）。aes 是
+  FIPS 197 的分组密码（`aes_key` 支持 128/192/256 位、10/12/14 轮，
+  `encrypt_block`/`decrypt_block`/`ctr_xor`，S 盒与逆 S 盒由 GF(2^8) 生成）；
+  chacha20 是 RFC 8439 的流密码（`chacha20_block`/`chacha20_xor`，12 字节
+  nonce、32 位计数器）；poly1305 是一次性 MAC（5×26 位肢体做 130 位模运算、
+  u64 乘积、无 128 位整数）；random 从 `/dev/urandom` 取安全随机
+  （`rand_bytes`/`rand_u64`/`rand_below` 用拒绝采样避免取模偏置/`rand_hex`）。
+  三者都只给原语：CTR/流密码未认证，组合方式（encrypt-then-MAC）写在文档与
+  示例里。错误号段 `std.encoding.aes`=0x606d … `std.encoding.random`=0x6070
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第二十四批（文件系统进阶）**：`std.os.walk` / `std.os.temp` /
   `std.os.lock` / `std.os.mmap` 四个模块，集成示例 `examples/stdfsx.c6`
   （`make std-fsx`）。walk 把 `std.os.fs` 的单层 `Dir` 包成整棵树

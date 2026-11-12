@@ -12803,6 +12803,10 @@ static const struct C6ErrStdSlot {
     { "std.os.temp",            C6_ERR_SLOT_STD + 106 },
     { "std.os.lock",            C6_ERR_SLOT_STD + 107 },
     { "std.os.mmap",            C6_ERR_SLOT_STD + 108 },
+    { "std.encoding.aes",       C6_ERR_SLOT_STD + 109 },
+    { "std.encoding.chacha20",  C6_ERR_SLOT_STD + 110 },
+    { "std.encoding.poly1305",  C6_ERR_SLOT_STD + 111 },
+    { "std.encoding.random",    C6_ERR_SLOT_STD + 112 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

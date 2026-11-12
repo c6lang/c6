@@ -236,7 +236,7 @@ std/os/                     操作系统：流、文件系统与目录树、路�
   std/os/lock.c6            std.os.lock            文件建议锁（fcntl）：lock_open、FileLock 的 acquire(exclusive, wait_ms)/try_acquire/release/is_held/close_file；wait_ms<0 阻塞、0 只试一次、>0 重试到超时，整文件锁按进程合并
   std/os/mmap.c6            std.os.mmap            文件/匿名映射：map_file(path, writable)（可写 MAP_SHARED、只读 MAP_PRIVATE，空文件是坏映射）、map_anon（清零）、Map 的 data/size/sync/read_at/write_at/unmap；read_at/write_at 带边界检查
 
-std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
@@ -254,6 +254,10 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/sha512.c6    std.encoding.sha512    SHA-512/SHA-384 与 HMAC-SHA-512：init/init384/update/final（128 位长度）、sha512/sha384/*_hex、hmac_sha512(_hex)、常数时间 sha512_eq
   std/encoding/hkdf.c6      std.encoding.hkdf      HKDF（RFC 5869）：hkdf_extract/hkdf_expand/hkdf 一步版；空 salt 按 32 个零字节、输出上限 8160 字节
   std/encoding/pbkdf2.c6    std.encoding.pbkdf2    PBKDF2-HMAC-SHA-1/SHA-256（RFC 6070/8018）：pbkdf2_sha1/pbkdf2_sha256，iters<=0 与空输出直接拒绝，输出长度不限
+  std/encoding/aes.c6       std.encoding.aes       AES（FIPS 197）：aes_key(16/24/32)、Aes 的 encrypt_block/decrypt_block/ctr_xor（10/12/14 轮，CTR 按 16 字节大端计数器递增）
+  std/encoding/chacha20.c6  std.encoding.chacha20  ChaCha20（RFC 8439）：chacha20_block(key32, nonce12, counter, out64)、chacha20_xor（允许 in==out、跨块自动递增计数器）
+  std/encoding/poly1305.c6  std.encoding.poly1305  Poly1305 一次性 MAC（RFC 8439）：poly1305_init 的 update/final、一次性 poly1305_mac；5×26 位肢体做 130 位模运算，同一把 key 只能用一次
+  std/encoding/random.c6    std.encoding.random    安全随机（/dev/urandom）：rand_bytes/rand_u64/rand_below（掩码+拒绝采样）/rand_hex；每次 open/close，不缓存 fd
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
@@ -324,6 +328,7 @@ make std-client  # 编译并运行 examples/stdclient.c6（第二十一批网络
 make std-serve   # 编译并运行 examples/stdserve.c6（第二十二批 Web 服务端模块的拼装示例）
 make std-crypto  # 编译并运行 examples/stdcrypto.c6（第二十三批摘要与密钥派生模块的拼装示例）
 make std-fsx     # 编译并运行 examples/stdfsx.c6（第二十四批文件系统进阶模块的拼装示例）
+make std-cipher  # 编译并运行 examples/stdcipher.c6（第二十五批对称加密基础模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

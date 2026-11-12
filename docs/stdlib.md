@@ -16,7 +16,7 @@
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
-| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256/SHA-512/MD5、HKDF/PBKDF2、位流、UUID、LZ4/RLE、hexdump |
+| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
@@ -121,7 +121,7 @@
 | `std/os/lock.c6` | `std.os.lock` | 文件建议锁（`fcntl` 记录锁）：`lock_open` 工厂 + `FileLock` 的 `ok`/`fd`/`acquire(exclusive, wait_ms)`/`try_acquire`/`release`/`is_held`/`close_file`；`wait_ms < 0` 阻塞、`0` 只试一次、`>0` 按 5ms 重试到超时，返回 1/0/-1；整文件锁，按进程合并（测互斥要开子进程） |
 | `std/os/mmap.c6` | `std.os.mmap` | 文件/匿名映射（`mmap(2)`）：`map_file(path, writable)`（可写用 `O_RDWR`+`MAP_SHARED`，否则 `O_RDONLY`+`MAP_PRIVATE`，空文件是坏映射）/`map_anon(len)`（清零）、`Map` 的 `ok`/`data`/`size`/`can_write`/`is_anon`/`fd`/`sync`/`read_at`/`write_at`/`unmap`；`read_at`/`write_at` 做边界检查，`unmap` 可重复 |
 
-**`std/encoding/`**（编解码：Base64/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、位流、UUID）
+**`std/encoding/`**（编解码与密码学：Base64/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、位流、UUID）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -144,6 +144,10 @@
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
 | `std/encoding/hkdf.c6` | `std.encoding.hkdf` | HKDF（RFC 5869，基于 HMAC-SHA-256，零分配）：`hkdf_extract`/`hkdf_expand`/`hkdf`（一步版）；salt 为空按 32 个零字节、expand 上限 255*32=8160 字节（计数器只有一字节）、`out_len == 0` 是合法空操作；返回 0/-1 |
 | `std/encoding/pbkdf2.c6` | `std.encoding.pbkdf2` | PBKDF2-HMAC-SHA-1 / SHA-256（RFC 2898/8018，零分配）：`pbkdf2_sha1`/`pbkdf2_sha256`；每块 `U(1)=HMAC(P, S 拼上 INT(i))`、`U(j)=HMAC(P,U(j-1))`、`T=xor(U(1..iters))`；`iters <= 0`、空输出返回 -1，口令/盐传 0 当空串，输出长度不限（块号按需递增） |
+| `std/encoding/aes.c6` | `std.encoding.aes` | AES 分组密码（FIPS 197）：`aes_key(key, 16/24/32)` 工厂 + `Aes` 的 `ok`/`rounds`/`encrypt_block`/`decrypt_block`/`ctr_xor`；10/12/14 轮，S 盒/逆 S 盒/Rcon 由 GF(2^8) 生成，CTR 按整 16 字节大端计数器递增；只给分组原语与未认证的 CTR |
+| `std/encoding/chacha20.c6` | `std.encoding.chacha20` | ChaCha20 流密码（RFC 8439）：`chacha20_block(key32, nonce12, counter, out64)`、`chacha20_xor(key32, nonce12, counter, in, n, out)`（允许 `in == out`、跨块自动递增计数器）；12 字节 nonce、32 位计数器，20 轮 = 10 个双轮，旋转借 `std.core.bits` |
+| `std/encoding/poly1305.c6` | `std.encoding.poly1305` | Poly1305 一次性 MAC（RFC 8439 §2.5）：`poly1305_init(key32)` 工厂 + `Poly1305` 的 `ok`/`update`/`final`、一次性 `poly1305_mac`；5×26 位肢体做 130 位模运算（u64 乘积、无 128 位整数），key clamp 折进掩码；**同一把 key 只能用一次** |
+| `std/encoding/random.c6` | `std.encoding.random` | 操作系统安全随机（`/dev/urandom`）：`rand_bytes`/`rand_u64`/`rand_below(bound, out)`（掩码 + 拒绝采样，不用取模）/`rand_hex(out, bytes)`；每次调用 open/close 设备、不缓存 fd，返回 1/0 |
 
 **`std/data/`**（数据格式：JSON、CSV、INI）
 
@@ -207,6 +211,7 @@
 | `examples/stdserve.c6` | （无模块） | 第二十二批（Web 服务端）的拼装示例（`make std-serve`）：httpd 收请求、router 分发（参数/通配符）、assets 发静态文件（含 403 越界）、session 的 Set-Cookie 往返，客户端用 `std.net.httpc` 打回本地服务端子进程，自带自检 |
 | `examples/stdcrypto.c6` | （无模块） | 第二十三批（消息摘要与密钥派生）的拼装示例（`make std-crypto`）：md5 的 RFC 1321 向量与流式喂入、sha512/sha384 与 HMAC-SHA-512、HKDF 的 RFC 5869 用例、PBKDF2 的 RFC 6070 用例，最后用 HMAC-SHA-256 演示 token 签发/篡改检测，自带自检 |
 | `examples/stdfsx.c6` | （无模块） | 第二十四批（文件系统进阶）的拼装示例（`make std-fsx`）：临时文件/目录、匿名与文件映射（改字节后 sync 回盘）、目录树统计与删树、跨进程抢锁与超时等待，自带自检 |
+| `examples/stdcipher.c6` | （无模块） | 第二十五批（对称加密基础）的拼装示例（`make std-cipher`）：AES 的 FIPS 197 三组向量与 SP 800-38A CTR、ChaCha20 的 RFC 8439 块/加密向量、Poly1305 的 RFC 向量与流式喂入、`/dev/urandom` 随机，最后做一次 ChaCha20+Poly1305 的 encrypt-then-MAC 与篡改检测 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -249,6 +254,10 @@ std/encoding/md5.c6         9 test(s), 0 failure(s)
 std/encoding/sha512.c6      9 test(s), 0 failure(s)
 std/encoding/hkdf.c6       28 test(s), 0 failure(s)
 std/encoding/pbkdf2.c6     33 test(s), 0 failure(s)
+std/encoding/aes.c6         2 test(s), 0 failure(s)
+std/encoding/chacha20.c6    8 test(s), 0 failure(s)
+std/encoding/poly1305.c6    2 test(s), 0 failure(s)
+std/encoding/random.c6      3 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
 std/net/cookie.c6          4 test(s), 0 failure(s)
@@ -305,6 +314,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/encoding/sha512.c6` 9 | sha512 3 + bits 6（`rotr64` 是跨 TU 调用） |
 | `std/encoding/hkdf.c6` 28 | hkdf 2 + sha256 17 + bits 6 + err 3（HMAC 直接调 sha256） |
 | `std/encoding/pbkdf2.c6` 33 | pbkdf2 3 + sha1 4 + sha256 17 + bits 6 + err 3 |
+| `std/encoding/chacha20.c6` 8 | chacha20 2 + bits 6（`rotl32` 是跨 TU 调用） |
+| `std/encoding/aes.c6` 2 | 自成一体（S 盒直接写在模块里） |
+| `std/encoding/poly1305.c6` 2 | 自成一体（130 位模运算只用 u64） |
+| `std/encoding/random.c6` 3 | 自成一体（只读 /dev/urandom） |
 | `std/net/url.c6` 32 | url 10 + str 22（url 只借 `Str` 类型，正文不调用 str） |
 | `std/net/mime.c6` 37 | mime 7 + str 22 + path 8（取扩展名要 `std.os.path` 的正文） |
 | `std/encoding/uuid.c6` 24 | uuid 8 + rand 9 + time 7（v4/v7 要随机源，v7 要墙钟） |
@@ -339,7 +352,9 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/encoding/sha512` 的正文必须带 `std/core/bits`，`std/encoding/hkdf` 要
 `std/encoding/sha256`（连带 bits/err），`std/encoding/pbkdf2` 要 SHA-1、SHA-256 两个哈希，`std/os/walk` 要
 `std/os/fs`、`std/os/path`、`std/text/str`、`std/core/err`，`std/os/lock` 要
-`std/os/time`，`std/os/temp` 与 `std/os/mmap` 自成一体（temp 只借 `Str` 类型）。
+`std/os/time`，`std/os/temp` 与 `std/os/mmap` 自成一体（temp 只借 `Str` 类型），
+`std/encoding/aes`、`std/encoding/poly1305`、`std/encoding/random` 也自成一体，
+`std/encoding/chacha20` 的正文必须带 `std/core/bits`（`rotl32`）。
 
 ## 设计原则
 
@@ -2984,6 +2999,31 @@ stdfsx: 33 check(s), 0 failure(s)
 子进程退出后拿到。Makefile 里显式列出十一个模块正文（walk 要 fs/path/str/err，
 lock 要 time，temp 只借 Str 类型）。
 
+### 集成示例：`examples/stdcipher.c6`
+
+```sh
+make std-cipher
+```
+
+```
+stdcipher: 标准库第二十五批（aes / chacha20 / poly1305 / random）
+aes: 128/192/256 + CTR(SP 800-38A) 都对
+chacha20: RFC 8439 的块与加密向量都对
+poly1305: RFC 8439 向量与流式喂入都对
+random: 16 字节 / hex / [0,6) 都来自 /dev/urandom
+aead: ChaCha20 + Poly1305 的 encrypt-then-MAC 与篡改检测都对
+stdcipher: 27 check(s), 0 failure(s)
+```
+
+五节：「AES」验 FIPS 197 的 AES-128/192/256 三组分组向量（密钥就是
+`00 01 02 ...`）与 SP 800-38A 的 CTR 向量，再做一次 CTR 解密还原；「ChaCha20」
+验 RFC 8439 §2.3.2 的块函数和 §2.4.2 的加密向量（那段 "Ladies and
+Gentlemen..."），并解密还原；「Poly1305」验 RFC 8439 §2.5.2 的 tag，并用
+1 字节一喂验证流式与一次性一致；「random」从 `/dev/urandom` 取 16 字节、hex 与
+`[0, 6)`，确认两次不同、0 字节是空操作；最后是组合：随机生成加密 key、MAC key
+和 nonce，ChaCha20 加密、Poly1305 对密文打 MAC，收方先验 MAC 再解密，改一个
+密文字节之后 MAC 必须变。期望值全部来自 FIPS/NIST/RFC 向量，不联网。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3028,6 +3068,8 @@ lock 要 time，temp 只借 Str 类型）。
   拼装示例（自带自检）。
 * `make std-fsx`：`examples/stdfsx.c6`，第二十四批（文件系统进阶）模块的拼装
   示例（自带自检）。
+* `make std-cipher`：`examples/stdcipher.c6`，第二十五批（对称加密基础）模块的
+  拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -3064,6 +3106,14 @@ lock 要 time，temp 只借 Str 类型）。
   进程合并），子进程持有的排他锁才会挡住父进程；短超时返回 0、长等待拿到。
 * `std/os/mmap.c6` 的「读写映射落盘」：`write_at` 改首字节、`sync(MS_SYNC)`、
   `unmap` 之后从磁盘读回；匿名映射 `sync` 返回 0、长度 0 是坏映射。
+* `std/encoding/aes.c6` 的 FIPS 197 三组向量 + 逆密码：加密之后再 `decrypt_block`
+  必须还原，轮数分别是 10/12/14（顺带钉住密钥扩展的 `i % nk` 分支）。
+* `std/encoding/chacha20.c6` 的「分块 vs 一次」：200 字节按 64+64+72 切、计数器
+  手工推进 7/8/9，结果必须和一次调用完全一致（钉住计数器递增的位置）。
+* `std/encoding/poly1305.c6` 的「空消息」：tag 必须等于 key 的后 16 字节（钉住
+  `final` 里 `h + s` 的收尾和 padding 的边界）。
+* `std/encoding/random.c6` 的 `rand_below` 分布冒烟：300 次取 `[0,10)` 至少出现
+  5 种值（挡住「掩码写错导致只出 0」这类 bug），并检查大 bound 不越界。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，

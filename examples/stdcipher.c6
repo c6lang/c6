@@ -1,0 +1,252 @@
+/* stdcipher：标准库第二十五批（aes / chacha20 / poly1305 / random）的拼装示例。
+ *
+ * 和前面几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 各节自带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这批是**对称加密原语**：AES 分组 + CTR、ChaCha20 流密码、Poly1305 一次性
+ * MAC、以及操作系统的安全随机源。示例把四节串起来，最后做一个
+ * 「ChaCha20 加密 + Poly1305 认证」的 encrypt-then-MAC 演示（含篡改检测）：
+ *
+ *   1. AES：FIPS 197 的三组分组向量、CTR 的 SP 800-38A 向量；
+ *   2. ChaCha20：RFC 8439 的块函数与加密向量；
+ *   3. Poly1305：RFC 8439 的 MAC 向量，流式与一次性一致；
+ *   4. random：随机字节/hex/[0,bound)；
+ *   5. 组合：随机密钥 + ChaCha20 加密 + Poly1305 认证 + 篡改检测。
+ *
+ * 期望值全部来自 FIPS/NIST/RFC 向量或本机 `/dev/urandom`，不联网。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdcipher \
+ *         examples/stdcipher.c6 std/core/types.c6 std/core/bits.c6 \
+ *         std/encoding/aes.c6 std/encoding/chacha20.c6 \
+ *         std/encoding/poly1305.c6 std/encoding/random.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.encoding.aes;
+import std.encoding.chacha20;
+import std.encoding.poly1305;
+import std.encoding.random;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int hex_is(const u8 *d, int n, const char *want)
+{
+    char got[256] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        got[i * 2] = "0123456789abcdef"[(d[i] >> 4) & 0xf];
+        got[i * 2 + 1] = "0123456789abcdef"[d[i] & 0xf];
+    }
+    got[n * 2] = 0;
+    return strcmp(got, want) == 0;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0, i = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = -1, lo = -1;
+
+        for (i = 0; i < 16; i++) {
+            if ("0123456789abcdef"[i] == s[0])
+                hi = i;
+            if ("0123456789abcdef"[i] == s[1])
+                lo = i;
+        }
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 1) AES：FIPS 197 三组 + CTR 的 SP 800-38A */
+static void tour_aes(void)
+{
+    u8 pt[16] = { 0 }, ct[16] = { 0 }, back[16] = { 0 };
+    u8 key[32] = { 0 }, iv[16] = { 0 }, msg[32] = { 0 }, enc[32] = { 0 };
+    u8 back32[32] = { 0 };
+    Aes a = { 0 };
+    int i = 0;
+
+    if (unhex("00112233445566778899aabbccddeeff", pt, 16) != 16)
+        check(0, "aes: 向量解不开");
+    for (i = 0; i < 32; i++)
+        key[i] = (u8)i;
+    /* 128 位密钥 */
+    a = aes_key(key, 16);
+    check(a.ok() && a.rounds() == 10, "aes: 128 位密钥 10 轮");
+    a.encrypt_block(pt, ct);
+    check(hex_is(ct, 16, "69c4e0d86a7b0430d8cdb78070b4c55a"),
+          "aes: FIPS-197 AES-128 向量");
+    a.decrypt_block(ct, back);
+    check(memcmp(back, pt, 16) == 0, "aes: 分组解密还原");
+    /* 192 / 256 位密钥 */
+    a = aes_key(key, 24);
+    a.encrypt_block(pt, ct);
+    check(hex_is(ct, 16, "dda97ca4864cdfe06eaf70a0ec0d7191"),
+          "aes: AES-192 向量");
+    a = aes_key(key, 32);
+    a.encrypt_block(pt, ct);
+    check(hex_is(ct, 16, "8ea2b7ca516745bfeafc49904b496089"),
+          "aes: AES-256 向量");
+    /* CTR：SP 800-38A F.5.1 */
+    if (unhex("2b7e151628aed2a6abf7158809cf4f3c", key, 16) != 16
+        || unhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", iv, 16) != 16
+        || unhex("6bc1bee22e409f96e93d7e117393172a"
+                 "ae2d8a571e03ac9c9eb76fac45af8e51",
+                 msg, 32)
+               != 32)
+        check(0, "aes: CTR 向量解不开");
+    a = aes_key(key, 16);
+    a.ctr_xor(iv, msg, 32, enc);
+    check(hex_is(enc, 32,
+                 "874d6191b620e3261bef6864990db6ce"
+                 "9806f66b7970fdff8617187bb9fffdff"),
+          "aes: SP 800-38A CTR 向量");
+    a.ctr_xor(iv, enc, 32, back32);
+    check(memcmp(back32, msg, 32) == 0, "aes: CTR 解密还原");
+    printf("aes: 128/192/256 + CTR(SP 800-38A) 都对\n");
+}
+
+/* 2) ChaCha20：RFC 8439 的块函数与加密向量 */
+static void tour_chacha(void)
+{
+    u8 key[32] = { 0 }, nonce[12] = { 0 }, ks[64] = { 0 };
+    u8 back[128] = { 0 }, ct[128] = { 0 };
+    char *text = (char *)"Ladies and Gentlemen of the class of '99: If I "
+                         "could offer you only one tip for the future, "
+                         "sunscreen would be it.";
+    int n = (int)strlen(text);
+    int i = 0;
+
+    for (i = 0; i < 32; i++)
+        key[i] = (u8)i;
+    if (unhex("000000090000004a00000000", nonce, 12) != 12)
+        check(0, "chacha20: nonce 解不开");
+    check(chacha20_block(key, nonce, 1, ks) == 0, "chacha20: 块函数");
+    check(hex_is(ks, 64,
+                 "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+                 "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"),
+          "chacha20: RFC 8439 §2.3.2 块向量");
+    if (unhex("000000000000004a00000000", nonce, 12) != 12)
+        check(0, "chacha20: nonce 解不开");
+    check(chacha20_xor(key, nonce, 1, text, (usize)n, ct) == 0,
+          "chacha20: 加密");
+    check(hex_is(ct, n,
+                 "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b"
+                 "f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8"
+                 "07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736"
+                 "5af90bbf74a35be6b40b8eedf2785e42874d"),
+          "chacha20: RFC 8439 §2.4.2 加密向量");
+    check(chacha20_xor(key, nonce, 1, ct, (usize)n, back) == 0
+              && memcmp(back, text, (size_t)n) == 0,
+          "chacha20: 解密还原");
+    printf("chacha20: RFC 8439 的块与加密向量都对\n");
+}
+
+/* 3) Poly1305：RFC 8439 §2.5.2 + 流式一致性 */
+static void tour_poly(void)
+{
+    u8 key[32] = { 0 }, tag[16] = { 0 }, tag2[16] = { 0 };
+    char *msg = (char *)"Cryptographic Forum Research Group";
+    Poly1305 p = { 0 };
+    int i = 0;
+
+    if (unhex("85d6be7857556d337f4452fe42d506a8"
+              "0103808afb0db2fd4abff6af4149f51b",
+              key, 32)
+        != 32)
+        check(0, "poly: key 解不开");
+    check(poly1305_mac(key, msg, (usize)strlen(msg), tag) == 1,
+          "poly1305: 一次性 MAC");
+    check(hex_is(tag, 16, "a8061dc1305136c6c22b8baf0c0127a9"),
+          "poly1305: RFC 8439 §2.5.2 向量");
+    p = poly1305_init(key);
+    for (i = 0; i < (int)strlen(msg); i++)
+        p.update(msg + i, 1);
+    check(p.final(tag2) == 1 && memcmp(tag, tag2, 16) == 0,
+          "poly1305: 1 字节一喂与一次性一致");
+    printf("poly1305: RFC 8439 向量与流式喂入都对\n");
+}
+
+/* 4) random：随机字节、hex、区间 */
+static void tour_random(void)
+{
+    u8 a[16] = { 0 }, b[16] = { 0 };
+    char hex[33] = { 0 };
+    u64 v = 0;
+    int i = 0, same = 1;
+
+    check(rand_bytes(a, sizeof a) == 1, "random: rand_bytes");
+    check(rand_bytes(b, sizeof b) == 1, "random: 第二次 rand_bytes");
+    for (i = 0; i < 16; i++)
+        if (a[i] != b[i])
+            same = 0;
+    check(!same, "random: 两次不该相同");
+    check(rand_hex(hex, 16) == 1 && strlen(hex) == 32, "random: rand_hex");
+    check(rand_below(6, &v) == 1 && v < 6, "random: rand_below(6)");
+    check(rand_bytes(0, 0) == 1, "random: 0 字节是空操作");
+    printf("random: 16 字节 / hex / [0,6) 都来自 /dev/urandom\n");
+}
+
+/* 5) encrypt-then-MAC：ChaCha20 加密 + Poly1305 认证 */
+static void tour_aead(void)
+{
+    u8 key[32] = { 0 }, mac_key[32] = { 0 }, nonce[12] = { 0 };
+    u8 msg[64] = { 0 }, ct[64] = { 0 }, back[64] = { 0 };
+    u8 tag[16] = { 0 }, tag2[16] = { 0 };
+    char *text = (char *)"attack at dawn; bring coffee and a large towel.";
+    int n = (int)strlen(text);
+
+    check(rand_bytes(key, sizeof key) == 1
+              && rand_bytes(mac_key, sizeof mac_key) == 1
+              && rand_bytes(nonce, sizeof nonce) == 1,
+          "aead: 随机密钥/nonce");
+    memcpy(msg, text, (size_t)n);
+    check(chacha20_xor(key, nonce, 1, msg, (usize)n, ct) == 0,
+          "aead: 加密");
+    check(poly1305_mac(mac_key, ct, (usize)n, tag) == 1, "aead: 打 MAC");
+    /* 收方：先验 MAC，再解密 */
+    check(poly1305_mac(mac_key, ct, (usize)n, tag2) == 1
+              && memcmp(tag, tag2, 16) == 0,
+          "aead: MAC 校验通过");
+    check(chacha20_xor(key, nonce, 1, ct, (usize)n, back) == 0
+              && memcmp(back, msg, (size_t)n) == 0,
+          "aead: 解密还原");
+    /* 改一个密文字节：MAC 必须变 */
+    ct[3] ^= 1;
+    check(poly1305_mac(mac_key, ct, (usize)n, tag2) == 1
+              && memcmp(tag, tag2, 16) != 0,
+          "aead: 篡改检测");
+    printf("aead: ChaCha20 + Poly1305 的 encrypt-then-MAC 与篡改检测都对\n");
+}
+
+int main(void)
+{
+    printf("stdcipher: 标准库第二十五批（aes / chacha20 / poly1305 / random）\n");
+    tour_aes();
+    tour_chacha();
+    tour_poly();
+    tour_random();
+    tour_aead();
+    printf("stdcipher: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

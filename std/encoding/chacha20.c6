@@ -1,0 +1,297 @@
+/* std/encoding/chacha20：ChaCha20 流密码（RFC 8439）。
+ *
+ *     import std.encoding.chacha20;
+ *
+ *     u8 block[64] = { 0 };
+ *     chacha20_block(key32, nonce12, 1, block);      // 一段密钥流
+ *
+ *     u8 ct[N] = { 0 };
+ *     chacha20_xor(key32, nonce12, 1, msg, n, ct);   // 加密
+ *     chacha20_xor(key32, nonce12, 1, ct, n, back);  // 解密（同一个操作）
+ *
+ * ChaCha20 是「流密码 + 认证」组合里的那半个流密码：给 32 字节密钥、12 字节
+ * nonce 和一个 32 位块计数器，生成任意长度的密钥流，明文异或即可加解密。
+ * 它比 AES 更适合没有 AES-NI 的平台（纯 32 位加/异或/循环移位），也常和
+ * `std.encoding.poly1305` 拼成 ChaCha20-Poly1305（RFC 8439 的 AEAD）。
+ *
+ * 这一层只给**未认证**的流：密文可以被改，要认证就配 Poly1305/HMAC。nonce 在
+ * 同一密钥下绝不能重复（流密码复用密钥流等于把两条明文异或暴露出来）；计数器
+ * 是 32 位、块长 64 字节，所以单个 (key, nonce) 的上限是 256 GiB。
+ *
+ * 约定：
+ *
+ * - `chacha20_block` 输出 64 字节；`nonce12` 是 12 字节（RFC 8439 的 IETF 变体，
+ *   不是原始的 8 字节 nonce）；计数器按调用方给的值原样使用；
+ * - `chacha20_xor` 允许 `in == out`；`n == 0` 是空操作；`in` 为空指针且 `n > 0`
+ *   返回 -1；跨块时计数器自己递增（回绕由 u32 自然处理，调用方别把一段数据
+ *   用到 256 GiB 以上）；
+ * - 返回 0 = 成功、-1 = 参数不合法；密钥/nonce 指针为空一律 -1；
+ * - 状态和密钥流块都在栈上，用完清零；不 malloc。
+ */
+#include <string.h>
+
+module std.encoding.chacha20;
+import std.core.types;
+import std.core.bits;
+
+#define CHACHA_BLOCK_LEN 64
+
+static u32 chacha_load_le(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static void chacha_store_le(u8 *p, u32 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
+}
+
+/* RFC 8439 §2.1 的常数："expand 32-byte k" 的小端读法 */
+static void chacha_init(u32 *s, const u8 *key, const u8 *nonce, u32 counter)
+{
+    int i = 0;
+
+    s[0] = 0x61707865u;
+    s[1] = 0x3320646eu;
+    s[2] = 0x79622d32u;
+    s[3] = 0x6b206574u;
+    for (i = 0; i < 8; i++)
+        s[4 + i] = chacha_load_le(key + i * 4);
+    s[12] = counter;
+    s[13] = chacha_load_le(nonce);
+    s[14] = chacha_load_le(nonce + 4);
+    s[15] = chacha_load_le(nonce + 8);
+}
+
+#define CHACHA_QR(a, b, c, d)      \
+    do {                           \
+        a += b;                    \
+        d ^= a;                    \
+        d = rotl32(d, 16);         \
+        c += d;                    \
+        b ^= c;                    \
+        b = rotl32(b, 12);         \
+        a += b;                    \
+        d ^= a;                    \
+        d = rotl32(d, 8);          \
+        c += d;                    \
+        b ^= c;                    \
+        b = rotl32(b, 7);          \
+    } while (0)
+
+/* 20 轮（10 个双轮）：列方向 4 次 + 对角线方向 4 次 */
+static void chacha_rounds(u32 *x)
+{
+    int i = 0;
+
+    for (i = 0; i < 10; i++) {
+        CHACHA_QR(x[0], x[4], x[8], x[12]);
+        CHACHA_QR(x[1], x[5], x[9], x[13]);
+        CHACHA_QR(x[2], x[6], x[10], x[14]);
+        CHACHA_QR(x[3], x[7], x[11], x[15]);
+        CHACHA_QR(x[0], x[5], x[10], x[15]);
+        CHACHA_QR(x[1], x[6], x[11], x[12]);
+        CHACHA_QR(x[2], x[7], x[8], x[13]);
+        CHACHA_QR(x[3], x[4], x[9], x[14]);
+    }
+}
+
+/* 生成一段 64 字节密钥流：`out64` 至少 64 字节 */
+int chacha20_block(const void *key32, const void *nonce12, u32 counter,
+                   void *out64)
+{
+    u32 s[16] = { 0 };
+    u32 x[16] = { 0 };
+    u8 *out = (u8 *)out64;
+    int i = 0;
+
+    if (!key32 || !nonce12 || !out)
+        return -1;
+    chacha_init(s, (const u8 *)key32, (const u8 *)nonce12, counter);
+    memcpy(x, s, sizeof x);
+    chacha_rounds(x);
+    for (i = 0; i < 16; i++)
+        chacha_store_le(out + i * 4, x[i] + s[i]);
+    memset(s, 0, sizeof s);
+    memset(x, 0, sizeof x);
+    return 0;
+}
+
+/* 流式加解密：0 成功 / -1 参数不合法 */
+int chacha20_xor(const void *key32, const void *nonce12, u32 counter,
+                 const void *in, usize n, void *out)
+{
+    const u8 *src = (const u8 *)in;
+    u8 *dst = (u8 *)out;
+    u8 ks[CHACHA_BLOCK_LEN] = { 0 };
+    usize done = 0;
+
+    if (!key32 || !nonce12 || !dst)
+        return -1;
+    if (n == 0)
+        return 0;
+    if (!src)
+        return -1;
+    while (done < n) {
+        usize take = n - done;
+        usize i = 0;
+
+        if (take > CHACHA_BLOCK_LEN)
+            take = CHACHA_BLOCK_LEN;
+        chacha20_block(key32, nonce12, counter, ks);
+        for (i = 0; i < take; i++)
+            dst[done + i] = (u8)(src[done + i] ^ ks[i]);
+        done += take;
+        counter++;
+    }
+    memset(ks, 0, sizeof ks);
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+static int hex_is(const u8 *d, int n, const char *want)
+{
+    char got[256] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        got[i * 2] = "0123456789abcdef"[(d[i] >> 4) & 0xf];
+        got[i * 2 + 1] = "0123456789abcdef"[d[i] & 0xf];
+    }
+    got[n * 2] = 0;
+    return strcmp(got, want) == 0;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0, i = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = -1, lo = -1;
+
+        for (i = 0; i < 16; i++) {
+            if ("0123456789abcdef"[i] == s[0])
+                hi = i;
+            if ("0123456789abcdef"[i] == s[1])
+                lo = i;
+        }
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+static void fill_range(u8 *dst, int n, int start)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++)
+        dst[i] = (u8)(start + i);
+}
+
+test "RFC 8439 的块函数与加密向量" {
+    u8 key[32] = { 0 }, nonce[12] = { 0 }, ks[64] = { 0 };
+    u8 msg[128] = { 0 }, ct[128] = { 0 }, back[128] = { 0 };
+    int n = 0;
+
+    fill_range(key, 32, 0);
+    /* §2.3.2：nonce 00 00 00 09 00 00 00 4a 00 00 00 00、counter = 1 */
+    if (unhex("000000090000004a00000000", nonce, 12) != 12)
+        return err(1, "nonce 解不开");
+    if (chacha20_block(key, nonce, 1, ks) != 0)
+        return err(2, "chacha20_block 失败");
+    if (!hex_is(ks, 64,
+                "10f1e7e4d13b5915500fdd1fa32071c4"
+                "c7d1f4c733c068030422aa9ac3d46c4e"
+                "d2826446079faa0914c2d705d98b02a2"
+                "b5129cd1de164eb9cbd083e8a2503c4e"))
+        return err(3, "块函数向量不对");
+    /* §2.4.2：nonce 00..00 4a 00 00 00 00、counter = 1 的加密 */
+    {
+        char *text = (char *)"Ladies and Gentlemen of the class of '99: If I "
+                             "could offer you only one tip for the future, "
+                             "sunscreen would be it.";
+
+        n = (int)strlen(text);
+        if (unhex("000000000000004a00000000", nonce, 12) != 12)
+            return err(4, "nonce 解不开");
+        if (chacha20_xor(key, nonce, 1, text, (usize)n, ct) != 0)
+            return err(5, "加密失败");
+        if (!hex_is(ct, n,
+                    "6e2e359a2568f98041ba0728dd0d6981"
+                    "e97e7aec1d4360c20a27afccfd9fae0b"
+                    "f91b65c5524733ab8f593dabcd62b357"
+                    "1639d624e65152ab8f530c359f0861d8"
+                    "07ca0dbf500d6a6156a38e088a22b65e"
+                    "52bc514d16ccf806818ce91ab7793736"
+                    "5af90bbf74a35be6b40b8eedf2785e42"
+                    "874d"))
+            return err(6, "加密向量不对");
+        if (chacha20_xor(key, nonce, 1, ct, (usize)n, back) != 0)
+            return err(7, "解密失败");
+        if (memcmp(back, text, (size_t)n) != 0)
+            return err(8, "解密没还原");
+    }
+    (void)msg;
+}
+
+test "跨块计数、原地加解密与错误路径" {
+    u8 key[32] = { 0 }, nonce[12] = { 0 }, msg[200] = { 0 };
+    u8 all[200] = { 0 }, two[200] = { 0 }, back[200] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 32; i++)
+        key[i] = (u8)i;
+    for (i = 0; i < 12; i++)
+        nonce[i] = (u8)(0xa0 + i);
+    for (i = 0; i < 200; i++)
+        msg[i] = (u8)(i * 7);
+    /* 一次 200 字节 = 4 块（64*3 + 8） */
+    if (chacha20_xor(key, nonce, 7, msg, 200, all) != 0)
+        return err(9, "200 字节加密失败");
+    /* 手工分块：64 + 64 + 72 字节，计数器分别 7/8/9 */
+    if (chacha20_xor(key, nonce, 7, msg, 64, two) != 0
+        || chacha20_xor(key, nonce, 8, msg + 64, 64, two + 64) != 0
+        || chacha20_xor(key, nonce, 9, msg + 128, 72, two + 128) != 0)
+        return err(10, "分块加密失败");
+    if (memcmp(all, two, 200) != 0)
+        return err(11, "分块与一次的结果不一致");
+    /* 解密 */
+    if (chacha20_xor(key, nonce, 7, all, 200, back) != 0
+        || memcmp(back, msg, 200) != 0)
+        return err(12, "解密没还原");
+    /* 原地 */
+    memcpy(two, msg, 200);
+    chacha20_xor(key, nonce, 7, two, 200, two);
+    chacha20_xor(key, nonce, 7, two, 200, two);
+    if (memcmp(two, msg, 200) != 0)
+        return err(13, "原地加解密没还原");
+    /* 0 字节、空指针、坏参数 */
+    if (chacha20_xor(key, nonce, 1, msg, 0, all) != 0)
+        return err(14, "0 字节应该是空操作");
+    if (chacha20_xor(0, nonce, 1, msg, 1, all) != -1
+        || chacha20_xor(key, 0, 1, msg, 1, all) != -1
+        || chacha20_xor(key, nonce, 1, 0, 1, all) != -1
+        || chacha20_xor(key, nonce, 1, msg, 1, 0) != -1)
+        return err(15, "坏参数应该 -1");
+    if (chacha20_block(0, nonce, 1, all) != -1
+        || chacha20_block(key, 0, 1, all) != -1
+        || chacha20_block(key, nonce, 1, 0) != -1)
+        return err(16, "块函数的坏参数应该 -1");
+    /* 计数器不同 -> 密钥流不同 */
+    {
+        u8 b1[64] = { 0 }, b2[64] = { 0 };
+
+        chacha20_block(key, nonce, 1, b1);
+        chacha20_block(key, nonce, 2, b2);
+        if (memcmp(b1, b2, 64) == 0)
+            return err(17, "不同 counter 不该给同一段密钥流");
+    }
+}

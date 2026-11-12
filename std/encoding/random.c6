@@ -1,0 +1,228 @@
+/* std/encoding/random：操作系统提供的密码学安全随机数（`/dev/urandom`）。
+ *
+ *     import std.encoding.random;
+ *
+ *     u8 key[32] = { 0 };
+ *     if (!rand_bytes(key, sizeof key))
+ *         return 1;                      // 打不开 /dev/urandom
+ *     u64 nonce = 0;
+ *     rand_u64(&nonce);
+ *     char id[33] = { 0 };
+ *     rand_hex(id, 16);                  // 32 个小写十六进制 + NUL
+ *
+ * 和 `std.core.rand`（xorshift64*，确定性、可复现、**不安全**）分工明确：
+ * 这里要的是「不可预测」，种子从内核池来；`std.core.rand` 要的是「可复现」，
+ * 同一个种子在任何平台给出同一串数。密钥、nonce、盐、会话 id 用这个模块。
+ *
+ * 实现只做一件事：每调用一次 `open("/dev/urandom", O_RDONLY|O_CLOEXEC)`、
+ * 循环 `read` 到够、`close`。不缓存 fd（避免全局状态和 fork 之后的共享），
+ * 不分配内存；Linux/macOS/BSD 都有 `/dev/urandom`，Windows 不在支持范围。
+ *
+ * 约定：
+ *
+ * - `rand_bytes(p, n)`：1 成功 / 0 失败（打不开设备、读不够）；`n == 0` 是
+ *   成功的空操作，`p` 为空且 `n > 0` 返回 0；
+ * - `rand_u64`：按主机字节序填 8 字节，返回值同 `rand_bytes`；
+ * - `rand_below(bound, out)`：均匀取 `[0, bound)`，用「掩码 + 拒绝采样」而不是
+ *   取模（取模有偏置）；`bound == 0` 返回 0；`bound == 1` 直接给 0；
+ * - `rand_hex(out, bytes)`：`out` 至少 `2*bytes + 1` 字节，写小写十六进制 +
+ *   NUL，1 成功 / 0 失败。
+ */
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+module std.encoding.random;
+import std.core.types;
+
+#define RANDOM_PATH "/dev/urandom"
+
+/* 从内核随机池读满 n 字节：1 成功 / 0 失败 */
+int rand_bytes(void *p, usize n)
+{
+    u8 *dst = (u8 *)p;
+    usize done = 0;
+    int f = -1;
+
+    if (n == 0)
+        return 1;
+    if (!dst)
+        return 0;
+    f = open(RANDOM_PATH, O_RDONLY | O_CLOEXEC);
+    if (f < 0)
+        return 0;
+    while (done < n) {
+        ssize_t r = read(f, dst + done, (size_t)(n - done));
+
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            close(f);
+            return 0;
+        }
+        if (r == 0) {
+            close(f);
+            return 0;
+        }
+        done += (usize)r;
+    }
+    close(f);
+    return 1;
+}
+
+/* 8 字节随机数（主机字节序）：1 成功 / 0 失败 */
+int rand_u64(u64 *out)
+{
+    if (!out)
+        return 0;
+    return rand_bytes(out, sizeof *out);
+}
+
+/* 均匀取 [0, bound)：1 成功 / 0 失败或 bound 为 0 */
+int rand_below(u64 bound, u64 *out)
+{
+    u64 mask = 0, v = 0;
+
+    if (!out || bound == 0)
+        return 0;
+    if (bound == 1) {
+        *out = 0;
+        return 1;
+    }
+    /* 掩码取 bound-1 的最高有效位，让候选值落在 [0, 2^k) 里 */
+    mask = bound - 1;
+    mask |= mask >> 1;
+    mask |= mask >> 2;
+    mask |= mask >> 4;
+    mask |= mask >> 8;
+    mask |= mask >> 16;
+    mask |= mask >> 32;
+    for (;;) {
+        if (!rand_u64(&v))
+            return 0;
+        v &= mask;
+        if (v < bound) {
+            *out = v;
+            return 1;
+        }
+    }
+}
+
+/* 随机字节的十六进制：out 至少 2*bytes + 1 字节，1 成功 / 0 失败 */
+int rand_hex(char *out, int bytes)
+{
+    u8 buf[64] = { 0 };
+    int i = 0;
+
+    if (!out || bytes <= 0 || bytes > (int)sizeof buf)
+        return 0;
+    if (!rand_bytes(buf, (usize)bytes))
+        return 0;
+    for (i = 0; i < bytes; i++) {
+        out[i * 2] = "0123456789abcdef"[(buf[i] >> 4) & 0xf];
+        out[i * 2 + 1] = "0123456789abcdef"[buf[i] & 0xf];
+    }
+    out[bytes * 2] = 0;
+    memset(buf, 0, sizeof buf);
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static int hex_char(int c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+}
+
+test "rand_bytes / rand_u64 的基本性质" {
+    u8 a[32] = { 0 }, b[32] = { 0 };
+    u64 x = 0, y = 0;
+    int i = 0, same = 1;
+
+    if (!rand_bytes(a, sizeof a))
+        return err(1, "rand_bytes 失败");
+    if (!rand_bytes(b, sizeof b))
+        return err(2, "rand_bytes 第二次失败");
+    for (i = 0; i < 32; i++)
+        if (a[i] != b[i])
+            same = 0;
+    if (same)
+        return err(3, "两次随机字节不该完全相同");
+    /* 全零的概率是 2^-256，这里只当冒烟检查 */
+    same = 1;
+    for (i = 0; i < 32; i++)
+        if (a[i] != 0)
+            same = 0;
+    if (same)
+        return err(4, "32 字节全是 0 不像随机");
+    if (!rand_u64(&x) || !rand_u64(&y))
+        return err(5, "rand_u64 失败");
+    if (x == y && x == 0)
+        return err(6, "rand_u64 不该两次都给 0");
+    /* 边界参数 */
+    if (!rand_bytes(0, 0))
+        return err(7, "0 字节应该是成功的空操作");
+    if (rand_bytes(0, 4))
+        return err(8, "空指针 + 非零长度应该失败");
+    if (rand_u64(0))
+        return err(9, "空输出应该失败");
+}
+
+test "rand_below 的范围与分布" {
+    int seen[10] = { 0 };
+    int i = 0, distinct = 0;
+    u64 v = 0;
+
+    for (i = 0; i < 300; i++) {
+        if (!rand_below(10, &v))
+            return err(10, "rand_below 失败");
+        if (v >= 10)
+            return err(11, "rand_below 越界");
+        seen[v]++;
+    }
+    for (i = 0; i < 10; i++)
+        if (seen[i] > 0)
+            distinct++;
+    if (distinct < 5)
+        return err(12, "300 次取值只出现不到 5 种，像是有偏");
+    if (!rand_below(1, &v) || v != 0)
+        return err(13, "bound=1 应该只给 0");
+    if (rand_below(0, &v))
+        return err(14, "bound=0 应该失败");
+    if (rand_below(10, 0))
+        return err(15, "空输出应该失败");
+    /* 大 bound 也不能越界 */
+    for (i = 0; i < 20; i++) {
+        if (!rand_below(1000000000ull, &v) || v >= 1000000000ull)
+            return err(16, "大 bound 越界");
+    }
+}
+
+test "rand_hex 的输出格式" {
+    char hex[65] = { 0 };
+    int i = 0;
+
+    if (!rand_hex(hex, 16))
+        return err(17, "rand_hex 失败");
+    if ((int)strlen(hex) != 32)
+        return err(18, "16 字节应该给 32 个十六进制字符");
+    for (i = 0; i < 32; i++)
+        if (!hex_char(hex[i]))
+            return err(19, "输出里有非十六进制字符");
+    if (rand_hex(hex, 0))
+        return err(20, "0 字节应该失败");
+    if (rand_hex(0, 4))
+        return err(21, "空输出应该失败");
+    if (rand_hex(hex, 100))
+        return err(22, "超过内部缓冲应该失败");
+    /* 两次 hex 不该一样 */
+    {
+        char other[65] = { 0 };
+
+        if (!rand_hex(other, 16))
+            return err(23, "第二次 hex 失败");
+        if (strcmp(hex, other) == 0)
+            return err(24, "两次 hex 不该相同");
+    }
+}
