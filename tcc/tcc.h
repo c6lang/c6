@@ -437,6 +437,13 @@ extern long double strtold (const char *__nptr, char **__endptr);
 # define LONG_SIZE 4
 #endif
 
+/* c6: the width of a pointer and of 'long' follow the *output* target, not the
+   host the compiler was built for.  They stay 8 for a native x86-64 build and
+   become 4 for the 32-bit triples (wasm32, riscv32, arm, i386): 'long' is then
+   VT_INT|VT_LONG, and sizeof/layout/casts all read the size from here. */
+ST_DATA int c6_ptr_size;
+ST_DATA int c6_long_size;
+
 /* -------------------------------------------- */
 
 #define INCLUDE_STACK_SIZE  32

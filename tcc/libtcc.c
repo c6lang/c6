@@ -874,6 +874,30 @@ LIBTCCAPI void tcc_undefine_symbol(TCCState *s1, const char *sym)
 }
 
 
+/* c6: the width of pointers and of 'long' for an output target triple.  A
+   native build keeps the host width (x86-64 -> 8); the 32-bit triples that the
+   LLVM back-end can emit become 4, so sizeof/layout/casts agree with the
+   target ABI instead of the compiler's own. */
+static int c6_triple_bytes(const char *t)
+{
+    if (!t || !*t)
+        return sizeof(void *);
+    if (!strncmp(t, "wasm32", 6) || !strncmp(t, "riscv32", 7)
+        || !strncmp(t, "armv7", 5) || !strncmp(t, "thumb", 5)
+        || !strncmp(t, "i386", 4) || !strncmp(t, "i486", 4)
+        || !strncmp(t, "i586", 4) || !strncmp(t, "i686", 4))
+        return 4;
+    if (!strncmp(t, "arm", 3) && (t[3] == '\0' || t[3] == '-'))
+        return 4;
+    return sizeof(void *);
+}
+
+static void c6_set_target_sizes(const char *triple)
+{
+    c6_ptr_size = c6_triple_bytes(triple);
+    c6_long_size = c6_ptr_size;
+}
+
 LIBTCCAPI TCCState *tcc_new(void)
 {
     TCCState *s = 0;
@@ -882,6 +906,9 @@ LIBTCCAPI TCCState *tcc_new(void)
 #ifdef MEM_DEBUG
     tcc_memcheck(1);
 #endif
+
+    c6_ptr_size = sizeof(void *);
+    c6_long_size = sizeof(void *);
 
 #undef gnu_ext
     s->gnu_ext = 1;
@@ -2063,6 +2090,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
             if (!*optarg)
                 return tcc_error_noabort("missing triple in '--target='");
             tcc_set_str(&s->target_triple, optarg);
+            c6_set_target_sizes(optarg);
             break;
         case TCC_OPTION_cc:
             if (*optarg == '=')

@@ -145,6 +145,7 @@ static int l_ptr_bits(void)
     if (!n)
         return 64;
     if ((n == 6 && !strncmp(t, "wasm32", 6))
+        || (n == 7 && !strncmp(t, "riscv32", 7))
         || (n == 3 && !strncmp(t, "arm", 3))
         || (n == 5 && !strncmp(t, "thumb", 5))
         || (n == 6 && !strncmp(t, "armv7", 5))

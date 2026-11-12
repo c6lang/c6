@@ -348,3 +348,22 @@ BACKEND=llvm LLVMCC=/usr/lib/llvm-19/bin/clang ./tests/run-tests.sh
 （结构体本身），LLVM 后端会把它拆成多个 i32 传递，而 C 的 SysV ABI 要求压进
 一个寄存器——这类调用与 C 不兼容（`struct {int x, y;}` 作参数会丢字段）。
 绕过办法：传指针，或让结构体大于 16 字节（那样走 `byval`/`ptr`，与 C 一致）。
+
+### 目标指针/长整型宽度（32 位 triple）
+
+类型宽度跟着**输出目标**走，不是跟编译器自己（x86-64）走：`c6_ptr_size` /
+`c6_long_size` 在 `--target=` 解析时按 triple 设置，`type_size()`、`size_t` /
+`ptrdiff_t` 的选择、`long` 的种类（`VT_LLONG|VT_LONG` 还是 VT_INT|VT_LONG）都读它。
+
+| triple | sizeof(void*) | sizeof(long) | sizeof(size_t) |
+|---|---|---|---|
+| （默认，x86-64） | 8 | 8 | 8 |
+| `wasm32-unknown-unknown` | 4 | 4 | 4 |
+| `riscv32-*` / `arm` / `i386` | 4 | 4 | 4 |
+
+于是结构体里带指针的对象布局与目标 ABI 一致（例如 `struct { char tag; char *p; }`
+在 wasm32 上是 8 字节、`p` 在偏移 4），指针数组、指针相减、按字节取指都对。
+
+仍然是「编译器自身 ABI」的部分（已知限制，只影响不是本次目标的边角）：
+`#if PTR_SIZE == 8` 那几处（ELF 类、`va_list` 布局、闭包结构体的字段偏移）仍在
+编译期定死；在 32 位 triple 上用变参/闭包时需要另行处理。

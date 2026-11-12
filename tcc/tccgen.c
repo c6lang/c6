@@ -77,16 +77,27 @@ ST_DATA const char *funcname = 0;
 ST_DATA CType int_type = {0}, func_old_type = {0}, char_type = {0}, char_pointer_type = {0};
 static CString initstr = {0};
 
-#if PTR_SIZE == 4
-#define VT_SIZE_T (VT_INT | VT_UNSIGNED)
-#define VT_PTRDIFF_T VT_INT
-#elif LONG_SIZE == 4
-#define VT_SIZE_T (VT_LLONG | VT_UNSIGNED)
-#define VT_PTRDIFF_T VT_LLONG
-#else
-#define VT_SIZE_T (VT_LONG | VT_LLONG | VT_UNSIGNED)
-#define VT_PTRDIFF_T (VT_LONG | VT_LLONG)
-#endif
+/* c6: 'size_t'/'ptrdiff_t' follow the output target (see c6_ptr_size) */
+ST_DATA int c6_ptr_size = 8;
+ST_DATA int c6_long_size = 8;
+
+static int c6_vt_size_t(void)
+{
+    if (c6_ptr_size == 4)
+        return VT_INT | VT_UNSIGNED;
+    if (c6_long_size == 4)
+        return VT_LLONG | VT_UNSIGNED;
+    return VT_LONG | VT_LLONG | VT_UNSIGNED;
+}
+
+static int c6_vt_ptrdiff_t(void)
+{
+    if (c6_ptr_size == 4)
+        return VT_INT;
+    if (c6_long_size == 4)
+        return VT_LLONG;
+    return VT_LONG | VT_LLONG;
+}
 
 /* c6: one point in the 'move' analysis.  For every managed slot the check
    follows at that point it records whether the slot may have been handed
@@ -3009,7 +3020,7 @@ ST_FUNC void vpushi(int v)
 /* push a pointer sized constant */
 static void vpushs(addr_t v)
 {
-    vpush64(VT_SIZE_T, v);
+    vpush64(c6_vt_size_t(), v);
 }
 
 /* push long long constant */
@@ -3815,7 +3826,7 @@ static void incr_offset(int offset)
 {
     int t = vtop->type.t;
     gaddrof(); /* remove VT_LVAL */
-    vtop->type.t = VT_PTRDIFF_T; /* set scalar type */
+    vtop->type.t = c6_vt_ptrdiff_t(); /* set scalar type */
     vpushs(offset);
     gen_op('+');
     vtop->r |= VT_LVAL;
@@ -4006,7 +4017,7 @@ ST_FUNC int gv(int rc)
             }
 
             if (rc2) {
-                int load_type = (bt == VT_QFLOAT) ? VT_DOUBLE : VT_PTRDIFF_T;
+                int load_type = (bt == VT_QFLOAT) ? VT_DOUBLE : c6_vt_ptrdiff_t();
                 int original_type = vtop->type.t;
 
                 /* two register type load :
@@ -5135,7 +5146,7 @@ static int combine_types(CType *dest, SValue *op1, SValue *op2, int op)
             }
         }
         if (op == CMP_OP)
-          type.t = VT_SIZE_T;
+          type.t = c6_vt_size_t();
     } else if (bt1 == VT_STRUCT || bt2 == VT_STRUCT) {
         if (op != '?' || !compare_types(type1, type2, 1))
           ret = 0;
@@ -5230,7 +5241,7 @@ op_err:
             vtop->type.t &= ~VT_UNSIGNED;
             vrott(3);
             gen_opic(op);
-            vtop->type.t = VT_PTRDIFF_T;
+            vtop->type.t = c6_vt_ptrdiff_t();
             vswap();
             gen_op(TOK_PDIV);
         } else {
@@ -5664,8 +5675,8 @@ ST_FUNC int type_size(CType *type, int *a)
                 return s->c;
             return ts * s->c;
         } else {
-            *a = PTR_SIZE;
-            return PTR_SIZE;
+            *a = c6_ptr_size;
+            return c6_ptr_size;
         }
     } else if (IS_ENUM(type->t) && type->ref->c < 0) {
         *a = 0;
@@ -6034,7 +6045,7 @@ ST_FUNC void vstore(void)
             if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL) {
                 SValue sv = {0};
                 r = get_reg(RC_INT);
-                sv.type.t = VT_PTRDIFF_T;
+                sv.type.t = c6_vt_ptrdiff_t();
                 sv.r = VT_LOCAL | VT_LVAL;
                 sv.c.i = vtop[-1].c.i;
 		sv.sym = NULL;
@@ -6046,7 +6057,7 @@ ST_FUNC void vstore(void)
             /* two word case handling :
                store second register at word + 4 (or +8 for x86-64)  */
             if (USING_TWO_WORDS(dbt)) {
-                int load_type = (dbt == VT_QFLOAT) ? VT_DOUBLE : VT_PTRDIFF_T;
+                int load_type = (dbt == VT_QFLOAT) ? VT_DOUBLE : c6_vt_ptrdiff_t();
                 vtop[-1].type.t = load_type;
                 store(r, vtop - 1);
                 vswap();
@@ -8502,10 +8513,10 @@ do_decl:
             t.t = VT_INT;
             if (nl >= 0) {
                 if (pl != (unsigned)pl)
-                    t.t = (LONG_SIZE==8 ? VT_LLONG|VT_LONG : VT_LLONG);
+                    t.t = (c6_long_size == 8 ? VT_LLONG|VT_LONG : VT_LLONG);
                 t.t |= VT_UNSIGNED;
             } else if (pl != (int)pl || nl != (int)nl)
-                t.t = (LONG_SIZE==8 ? VT_LLONG|VT_LONG : VT_LLONG);
+                t.t = (c6_long_size == 8 ? VT_LLONG|VT_LONG : VT_LLONG);
 
             /* set type for enum members */
             for (ss = s->next; ss; ss = ss->next) {
@@ -8518,7 +8529,7 @@ do_decl:
                         continue;
                 }
                 ss->type.t = (ss->type.t & ~VT_BTYPE)
-                    | (LONG_SIZE==8 ? VT_LLONG|VT_LONG : VT_LLONG);
+                    | (c6_long_size == 8 ? VT_LLONG|VT_LONG : VT_LLONG);
             }
             s->c = 1;
         enum_done:
@@ -9411,7 +9422,7 @@ the_end:
     /* VT_LONG is used just as a modifier for VT_INT / VT_LLONG */
     bt = t & (VT_BTYPE|VT_LONG);
     if (bt == VT_LONG)
-        t |= LONG_SIZE == 8 ? VT_LLONG : VT_INT;
+        t |= c6_long_size == 8 ? VT_LLONG : VT_INT;
 #ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
     if (bt == VT_LDOUBLE)
         t = (t & ~(VT_BTYPE|VT_LONG)) | (VT_DOUBLE|VT_LONG);
@@ -9967,7 +9978,7 @@ static void parse_builtin_params(int nc, const char *args)
                 type.t = VT_INT;
                 break;
 	    case 'l':
-                type.t = VT_SIZE_T;
+                type.t = c6_vt_size_t();
                 break;
 	    default:
                 break;
@@ -10629,10 +10640,10 @@ ST_FUNC void unary(void)
 #endif
 	goto push_tokc;
     case TOK_CLONG:
-        t = (LONG_SIZE == 8 ? VT_LLONG : VT_INT) | VT_LONG;
+        t = (c6_long_size == 8 ? VT_LLONG : VT_INT) | VT_LONG;
 	goto push_tokc;
     case TOK_CULONG:
-        t = (LONG_SIZE == 8 ? VT_LLONG : VT_INT) | VT_LONG | VT_UNSIGNED;
+        t = (c6_long_size == 8 ? VT_LLONG : VT_INT) | VT_LONG | VT_UNSIGNED;
 	goto push_tokc;
     case TOK___FUNCTION__:
         if (!gnu_ext)
@@ -10869,7 +10880,7 @@ ST_FUNC void unary(void)
 #endif
         if (t == TOK_SIZEOF) {
             vpush_type_size(&type, &align);
-            gen_cast_s(VT_SIZE_T);
+            gen_cast_s(c6_vt_size_t());
         } else {
             type_size(&type, &align);
             s = NULL;
@@ -15145,7 +15156,7 @@ static int c6_emit_auto_impls(void)
 static CType c6_size_type(void)
 {
     CType t = {0};
-    t.t = VT_SIZE_T;
+    t.t = c6_vt_size_t();
     t.ref = NULL;
     return t;
 }
