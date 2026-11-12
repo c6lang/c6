@@ -184,6 +184,7 @@ std/text/                   文本：字符串视图与缓冲、格式化、UTF-
   std/text/num.c6           std.text.num           浮点格式化（固定/%e/%g）与解析（inf/nan、RANGE/PARSE 错误码）
   std/text/str.c6           std.text.str           字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、to_int/to_u64、strip_prefix/suffix、fields、replace/split_once、hash
   std/text/strbuf.c6        std.text.strbuf        会长的字符缓冲 StrBuf（托管引用）：write/write_int/write_hex、reserve/truncate/cstr
+  std/text/template.c6      std.text.template      `{{name}}` 文本模板（零分配）：tpl 工厂、Template 的 render/render_len/render_opt/vars；名字两侧空白忽略、`{{{{` 输出字面量 `{{`、缺变量严格报错（宽松模式给空串）、放不下不写半截
   std/text/utf8.c6          std.text.utf8          UTF-8 解码/编码/校验/计数 + Rune 迭代器（拒绝过长编码、代理区、截断）
   std/text/glob.c6          std.text.glob          shell 风格 glob（零分配）：Glob 的 match/match_path/has_magic、* ? [] 字符类与转义
   std/text/semver.c6        std.text.semver        语义化版本 2.0.0：semver_parse、Semver 的 compare/is_prerelease/format（严格前导零与标识校验）
@@ -231,10 +232,13 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
-std/data/                   数据格式：JSON、CSV、INI、.properties/.env
+std/data/                   数据格式：JSON、CSV、INI、.properties/.env、TOML、XML、查询串/表单
   std/data/csv.c6           std.data.csv           RFC 4180 CSV：零分配 CsvReader（引号/跨行/CRLF）+ csv_write_row
   std/data/ini.c6           std.data.ini           INI 配置的零分配读取：ini_open/next（字段都是输入上的视图）、ini_lookup/ini_has_section/ini_count、IniEntry.section/key/value/line；语法错误给行号
   std/data/json.c6          std.data.json          JSON 解析与写出：Arena 上的 DOM（a.json_parse）、Json 的 get/at、write/write_pretty/escape（数字保留原文）
+  std/data/query.c6         std.data.query         URL 查询串 / form-urlencoded（零分配）：query_open + QueryReader.next、QueryPair 的 name/value/has_eq、query_decode（`+` 与 %XX）、query_encode/query_build/query_build_len、query_get/query_get_nth/query_has
+  std/data/toml.c6          std.data.toml          TOML 子集零分配读取：toml_open + TomlReader.next、TomlEntry 的 kind/section/key/raw 与 decode、toml_int/toml_float/toml_bool、toml_array_len/toml_array_at；表/表数组、注释、基本与字面量字符串、数组、语法错误给行号
+  std/data/xml.c6           std.data.xml           XML 零分配扫描：xml_open + XmlReader.next（START/END/SELF/TEXT）、XmlEvent 的 name/text/attrs 与 attr_count/attr_at/attr、xml_unescape（5 个预定义实体 + 数字引用）；跳过注释/PI/DOCTYPE，CDATA 当文本，32 层标签配对校验
   std/data/props.c6         std.data.props         .properties/.env 零分配读取：props_open/next、e.decode(buf)、props_lookup/has/count（\n/\uXXXX/代理对/续行）
 
 std/net/                    网络与 Web：IP/CIDR、URL、MIME、HTTP/1.x、multipart
@@ -274,6 +278,7 @@ make std-embed   # 编译并运行 examples/stdembed.c6（第十一批嵌入式�
 make std-text    # 编译并运行 examples/stdtext.c6（第十二批文本算法模块的拼装示例）
 make std-num     # 编译并运行 examples/stdnum.c6（第十三批数值类型模块的拼装示例）
 make std-pack    # 编译并运行 examples/stdpack.c6（第十四批压缩与文本编码模块的拼装示例）
+make std-conf    # 编译并运行 examples/stdconf.c6（第十五批配置与文档格式模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

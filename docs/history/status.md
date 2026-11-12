@@ -927,3 +927,25 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`make stdtest`（69 个模块、0 failure）、`make std-pack`（24 条自检全过）、
 `make check-all`。
+
+### 11.27 标准库第十五批（toml / xml / query / template）
+
+第十五批补的是**配置与文档格式**这一层：从人写的文本里取值，再把人要看的内容拼回去。
+四个模块都是零分配（字段是输入上的视图），只依赖 `std.text.str`（toml 另用
+`std.text.num` 的浮点解析）：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.toml` | TOML 子集的事件式读取（`toml_open`/`TomlReader.next`/`TomlEntry.decode`/`toml_int`/`toml_float`/`toml_bool`/`toml_array_len`/`toml_array_at`） | 表与表数组、注释、基本/字面量字符串（含 `\uXXXX`）、十进制/0x/0o/0b 整数、浮点（委托 `std.text.num`）、布尔、可跨行数组；语法错误给行号且坏行会被跳过（能继续读）；不支持多行字符串/内联表类型化/点号键/日期时间语义（文档写明） |
+| `std.data.xml` | XML 扫描器（`xml_open`/`XmlReader.next`/`XmlEvent` 的 `attr_count`/`attr_at`/`attr`/`xml_unescape`） | START/END/SELF/TEXT 四种事件；跳过注释/PI/DOCTYPE，CDATA 当文本；属性按需解析（值保留原文，实体用 `xml_unescape` 解）；**做**32 层标签配对校验并用字节偏移报错；不做命名空间/DTD/编码转换 |
+| `std.data.query` | `application/x-www-form-urlencoded`（`query_open`/`next`/`query_decode`/`query_encode`/`query_build`/`query_get`/`query_get_nth`/`query_has`） | `&` 分隔、只按第一个 `=` 切、`+` 表示空格（和 `std.net.url` 的百分号语义分开）；解析零分配、名字/值保留原文；编码按 unreserved 原样、空格写 `+`、其它写大写 `%XX`；构建先量再写 |
+| `std.text.template` | `{{name}}` 模板（`tpl`/`Template.render`/`render_len`/`render_opt`/`vars`） | 名字两侧空白忽略、`{{{{` 输出字面量 `{{`、值不递归展开不转义；缺变量严格 -1、宽松给空串；`vars` 用「扫描前文」去重（不依赖额外存储）；先量再写 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.toml`=0x6045、
+`std.data.xml`=0x6046、`std.data.query`=0x6047、`std.text.template`=0x6048；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-conf` 与 `STDCONF_SRCS`，`stdtest`
+给 toml 补 `str/num/err` 依赖、给 xml/query/template 补 `str`，`test-all`/`check-all`
+都带上它。
+
+验收：`make stdtest`（73 个模块、0 failure）、`make std-conf`（19 条自检全过）、
+`make check-all`。

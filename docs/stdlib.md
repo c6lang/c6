@@ -17,7 +17,7 @@
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序 |
 | `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-256、位流、UUID、LZ4/RLE、hexdump |
-| `std/data/` | 数据格式：JSON、CSV、INI |
+| `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
 | `std/net/` | 网络与 Web：IP/CIDR、URL、MIME |
 
 ```sh
@@ -62,6 +62,7 @@
 | `std/text/fmt.c6` | `std.text.fmt` | 定长格式化缓冲 `Buf@(N)`：`write_int`/`write_uint`/`write_u64`、`write_hex`/`write_hex64`/`write_bin`、`write_bool`/`write_ptr`、`write_pad`、拼接；数字转换原语 `digits_u32`/`digits_u64`/`digits_hex` 与 `std.text.strbuf` 共用 |
 | `std/text/num.c6` | `std.text.num` | 浮点格式化与解析（不链 libm）：`fmt_f64`（固定位）、`fmt_f64_sci`（`%e`）、`fmt_f64_g`（`%g` 语义、去尾零）、`round_to`、`f64_is_nan`/`f64_is_inf`、`parse_f64`/`parse_f64_cstr`（inf/nan、`INVAL`/`PARSE`/`RANGE`） |
 | `std/text/str.c6` | `std.text.str` | 字符串视图 `Str`（`char[:]` 的包装，不分配）与字面量宏 `S()`：切分 `split`/`lines`/`join`、查找 `find`/`last_find`/`contains`/`count_char`/`count_sub`、裁剪 `trim`/`trim_left`/`trim_right`、转换 `to_int`/`to_base`/`copy_upper`/`copy_lower`、`cmp`/`cmp_str`/`cmp_cstr`、`replace`/`split_once`、`hash` |
+| `std/text/template.c6` | `std.text.template` | `{{name}}` 文本模板（零分配）：`tpl` 工厂、`Template` 的 `render`/`render_len`/`render_opt`/`vars`；名字两侧空白忽略、`{{{{` 输出字面量 `{{`、单独 `}}` 原样、缺变量严格 -1（`render_opt(..., 0)` 给空串）、值不递归展开、`vars` 去重收集名字、放不下不写半截 |
 | `std/text/strbuf.c6` | `std.text.strbuf` | 会自己长大的字符缓冲 `StrBuf`（托管引用）：`write`/`write_cstr`/`push`、`write_int`/`write_u64`/`write_hex`、`reserve`/`truncate`/`clear`/`slice`/`cstr`（依赖 `std.text.fmt` 的数字原语） |
 | `std/text/utf8.c6` | `std.text.utf8` | UTF-8 解码 `utf8_decode`（返回 1..4，拒绝过长编码/代理区/超范围/截断）、编码 `utf8_encode`、`utf8_valid`/`utf8_count`、`Rune` 与 `utf8_runes()` 迭代器 |
 | `std/text/glob.c6` | `std.text.glob` | shell 风格 glob（零分配）：`Glob` 的 `match`/`match_path`/`has_magic`、`glob` 工厂、`*`/`?`/`[a-z]`/`[!…]`/`\` 转义；`match_path` 的 `*`/`?` 不跨 `/` |
@@ -126,6 +127,9 @@
 | `std/data/csv.c6` | `std.data.csv` | RFC 4180 CSV（零分配）：`CsvReader` 的 `csv_reader`/`next`/`rewind`（引号字段可跨行、CRLF、`""` 转义）、`csv_need_quote`/`csv_write_field`/`csv_write_row`（写调用方缓冲）、`csv_count_fields`/`csv_count_rows` |
 | `std/data/ini.c6` | `std.data.ini` | INI 配置的零分配读取：`ini_open`/`next`（字段都是输入上的视图）、`ini_lookup`/`ini_has_section`/`ini_count`、`IniEntry.section`/`key`/`value`/`line`；语法错误给行号 |
 | `std/data/props.c6` | `std.data.props` | `.properties` / `.env` 的零分配读取：`props_open` 工厂 + `PropsReader` 的 `next`、`PropEntry` 的 `decode`、`props_decode`/`props_decoded_len`（`\n`/`\uXXXX`/代理对/续行）、`props_lookup`/`props_has`/`props_count`；空键给行号 |
+| `std/data/query.c6` | `std.data.query` | URL 查询串 / `application/x-www-form-urlencoded`（零分配）：`query_open` + `QueryReader.next`（跳过空段）、`QueryPair` 的 `name`/`value`/`has_eq`、`query_decode`（`+` → 空格、`%XX`、坏转义 -1）、`query_encode`/`query_encode_len`/`query_build`/`query_build_len`（`+` 表空格、其余 unreserved 原样）、`query_get`/`query_get_nth`/`query_has`（名字解码后比较） |
+| `std/data/toml.c6` | `std.data.toml` | TOML 子集零分配读取（事件式）：`toml_open` + `TomlReader.next`（`TOML_TABLE`/`TOML_ARRAY_TABLE`/`TOML_KEY`）、`TomlEntry` 的 `kind`/`section`/`key`/`raw`/`line` 与 `decode`（基本字符串转义与 `\uXXXX`）、`toml_int`（十进制/0x/0o/0b/`_`/符号）、`toml_float`（委托 `std.text.num` 的 `parse_f64`，含 inf/nan）、`toml_bool`、`toml_array_len`/`toml_array_at`；语法错误给行号且能继续读 |
+| `std/data/xml.c6` | `std.data.xml` | XML 零分配扫描（事件式，不做 DOM）：`xml_open` + `XmlReader.next`（`XML_START`/`XML_END`/`XML_SELF`/`XML_TEXT`）、`XmlEvent` 的 `name`/`text`/`attrs` 与 `attr_count`/`attr_at`/`attr`、`xml_unescape`（`&amp;` 等 5 个预定义实体 + `&#NNN;`/`&#xHH;`）；跳过注释/处理指令/DOCTYPE，CDATA 当文本，32 层标签配对校验，出错给字节位置 |
 | `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`Arena` 的 `json_parse`/`json_parse_at`、`Json` 的 `get`/`at`/`count`/`key`、`get_str`/`get_num`/`get_bool`、`write`/`write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
 
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME）
@@ -157,6 +161,7 @@
 | `examples/stdtext.c6` | （无模块） | 第十二批（文本算法）的拼装示例（`make std-text`）：regex 拆日志、fuzzy 命令补全、wrap 帮助折行、diff 配置对比，自带自检 |
 | `examples/stdnum.c6` | （无模块） | 第十三批（数值类型）的拼装示例（`make std-num`）：bignum 阶乘与进制、decimal 金额税额、rational 调和级数、complex 乘法与模，自带自检 |
 | `examples/stdpack.c6` | （无模块） | 第十四批（压缩与文本编码）的拼装示例（`make std-pack`）：lz4 压缩遥测帧、rle+delta 压采样、base85 转文本、hexdump 文本化，自带自检 |
+| `examples/stdconf.c6` | （无模块） | 第十五批（配置与文档格式）的拼装示例（`make std-conf`）：toml 读配置、xml 扫文档、query 解析/构建查询串、template 生成报告，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -1759,6 +1764,101 @@ hexundump((char[:]){ text, n }, back, (int)sizeof back);
   （所以 `DeAdBeEf` 这种纯数据行不会被误吞），遇到 `|` 或行尾就丢掉本行剩余部分。
 * `hexdump` 先按 `hexdump_len` 算长度，放不下返回 -1 且不写半截。
 
+### `toml`：TOML 读取器
+
+```c
+import std.data.toml;
+
+Str doc = { S("title = \"demo\"\n[server]\nhost = \"localhost\"\nport = 8080\n") };
+TomlReader r = toml_open(doc);
+TomlEntry e = { 0 };
+while (r.next(&e) == 1) {
+    if (e.kind == TOML_KEY && e.section.s.len == 6) {
+        char host[32] = { 0 };
+        if (e.key.s.len == 4 && memcmp(e.key.s.data, "host", 4) == 0)
+            e.decode((char[:]){ host, (int)sizeof host });
+    }
+}
+```
+
+* 事件式、零分配：`e.section`/`e.key`/`e.raw` 都是输入上的视图；`e.decode` 才把
+  基本字符串的转义（`\n`、`\uXXXX`…）写进调用方缓冲，字面量字符串（`'...'`）
+  不转义。
+* 数字/布尔/数组各走各的：`toml_int`（十进制、`0x`/`0o`/`0b`、`_`、`+/-`，溢出
+  返回 0）、`toml_float`（去掉 `_` 交给 `std.text.num` 的 `parse_f64`，`inf`/`nan`
+  自己处理）、`toml_bool`（只认小写）、`toml_array_len`/`toml_array_at`（数组可
+  跨行、元素保留原文）。
+* 表 `[a.b]` 与表数组 `[[a.b]]` 都会更新 `section`；**不支持**多行字符串、内联表
+  的类型化、点号键和日期时间语义（后两者按原文保留）。
+* 语法错误（缺 `=`、表头/字符串没闭合、空键/空值）`next` 返回 -1，行号进 `r.err`；
+  坏行会被跳过，所以错误之后还能继续读。
+
+### `xml`：XML 扫描器
+
+```c
+import std.data.xml;
+
+XmlReader r = xml_open(S("<doc><a x=\"1\">hi</a><b/></doc>"));
+XmlEvent e = { 0 };
+while (r.next(&e) == 1) {
+    if (e.kind == XML_START) {
+        Str v = { { (char *)0, 0 } };
+        if (e.attr(S("x"), &v)) { /* v 是引号里的原文 */ }
+    }
+}
+```
+
+* 四种事件：开始标签、结束标签、自闭合标签、文本；注释/处理指令/DOCTYPE 跳过，
+  CDATA 当作文本吐出。
+* 属性在事件上按需解析：`attr_count`、`attr_at(i, &attr)`、`attr(name, &value)`；
+  属性值保留原文（`&amp;` 不在这里解），要解用 `xml_unescape`（5 个预定义实体 +
+  `&#NNN;`/`&#xHH;`，坏引用返回 -1）。
+* **做**标签配对校验：32 层的名字栈，`</a>` 必须和最近的开始标签同名；读完还有
+  未闭合元素也算错。出错时 `next` 返回 -1，`r.err` 是出错字节偏移 + 1。
+* 不做命名空间、DTD/自定义实体、编码转换；元素名按 UTF-8 字节扫描（宽松）。
+
+### `query`：查询串 / 表单编码
+
+```c
+import std.data.query;
+
+QueryReader r = query_open(S("q=hello+world&page=2"));
+QueryPair p = { 0 };
+while (r.next(&p) == 1) { /* p.name / p.value 是原文视图 */ }
+
+char buf[32] = { 0 };
+query_get(S("q=hello+world"), S("q"), (char[:]){ buf, (int)sizeof buf });  /* "hello world" */
+```
+
+* 语义是 `application/x-www-form-urlencoded`：参数之间 `&`、只按**第一个** `=`
+  切、空段忽略、没有 `=` 的段 `has_eq = 0`。`+` 表示空格，和 `std.net.url` 的
+  百分号编解码**不同**，所以单独一个模块。
+* 解析零分配（`name`/`value` 保留 `%XX` 与 `+`）；`query_decode` 解码（坏转义
+  返回 -1），`query_encode` 编码（空格写 `+`、其余按 unreserved 原样、其它写大写
+  `%XX`）。
+* `query_get`/`query_get_nth` 先解码名字再比较，值解码后写调用方缓冲；名字最长
+  255 字节（内部临时缓冲），超了按未找到处理。
+* `query_build` 按 `a=b&c=d` 构建，先量再写，放不下不写半截。
+
+### `template`：`{{name}}` 模板
+
+```c
+import std.text.template;
+
+Var v[2] = { { S("name"), S("World") }, { S("n"), S("3") } };
+Template t = tpl(S("Hello {{name}}, {{ n }} messages"));
+char out[128] = { 0 };
+int n = t.render(v, 2, (char[:]){ out, (int)sizeof out });
+```
+
+* `{{name}}` 两侧空白忽略；`{{{{` 输出字面量 `{{`，单独的 `}}` 原样输出；值里的
+  内容不递归展开、不做 HTML 转义。
+* 缺变量：`render`/`render_len` 严格返回 -1；`render_opt(..., strict = 0)` 用空串
+  代替。`{{` 没闭合或名字为空都返回 -1。
+* `vars(out, cap)` 去重收集模板里出现过的名字（按出现顺序，不依赖额外存储）；
+  返回总数，`cap = 0` 可用来量个数。
+* 先量再写，放不下返回 -1 且不写半截。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -2074,6 +2174,30 @@ stdpack: 24 check(s), 0 failure(s)
 0x1000 起排版并反向解析，另验纯 hex 输入与大写/无 ASCII 列。Makefile 里显式列出
 六个模块正文（四个模块都只依赖 `std/core/types.c6`）。
 
+### 集成示例：`examples/stdconf.c6`
+
+```sh
+make std-conf
+```
+
+```
+stdconf: 标准库第十五批（toml / xml / query / template）
+toml: 6 条，title=demo host=localhost port=8080
+xml: 1 个开始 item、1 个自闭合、2 段文本
+query: q=hello world
+query: 构建 = q=hello+world&page=3
+template: [demo] localhost:8080 (debug=off)
+stdconf: 19 check(s), 0 failure(s)
+```
+
+四节：「配置」读一段带注释、表、数组、布尔与整数的 TOML，用 `decode`/`toml_int`/
+`toml_bool`/`toml_array_at` 取出 title/host/port/ports/debug；「文档」扫一段带属性、
+自闭合元素与实体的 XML，用 `attr` 取 id、用 `xml_unescape` 把 `&amp;` 解回来；
+「查询串」从 `q=hello+world&page=2&tag=%E4%B8%AD` 里取解码后的值，再把两个参数重新
+构建成 `q=hello+world&page=3`；「模板」把前面拿到的值填进
+`[{{title}}] {{host}}:{{port}} (debug={{debug}})`，并验严格/宽松两种缺变量行为。
+Makefile 里显式列出九个模块正文（toml 依赖 str+num+err，其余只依赖 str）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2097,6 +2221,8 @@ stdpack: 24 check(s), 0 failure(s)
 * `make std-num`：`examples/stdnum.c6`，第十三批（数值类型）模块的拼装示例
   （自带自检）。
 * `make std-pack`：`examples/stdpack.c6`，第十四批（压缩与文本编码）模块的拼装
+  示例（自带自检）。
+* `make std-conf`：`examples/stdconf.c6`，第十五批（配置与文档格式）模块的拼装
   示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

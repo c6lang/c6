@@ -1,0 +1,213 @@
+/* stdconf：标准库第十五批（toml / xml / query / template）的拼装示例。
+ *
+ * 和 stdform/stdtext/stdnum/stdpack 一样：这个文件没有 `module`（入口 `main`
+ * 只能写在模块外的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是一条「读配置 -> 读文档 -> 读请求参数 -> 生成报告」的链路：
+ *
+ *   - toml：读一段带表/数组/类型的配置；
+ *   - xml：扫一段带属性的小文档；
+ *   - query：解析 URL 查询串并重新构建（%XX 与 +）；
+ *   - template：把前面拿到的值填进 `{{name}}` 模板，生成一行报告。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdconf \
+ *         examples/stdconf.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/text/str.c6 std/text/num.c6 std/data/toml.c6 \
+ *         std/data/xml.c6 std/data/query.c6 std/text/template.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.template;
+import std.data.toml;
+import std.data.xml;
+import std.data.query;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static Str conf_str(char[:] s)
+{
+    Str r = { { (char *)0, 0 } };
+
+    r.s = s;
+    return r;
+}
+
+/* TOML：表、字符串、整数、布尔、数组 */
+static void tour_toml(void)
+{
+    Str doc = { S("# 一份小配置\n"
+                  "title = \"demo\"\n"
+                  "debug = true\n"
+                  "ports = [8080, 8443]\n"
+                  "[server]\n"
+                  "host = \"localhost\"\n"
+                  "port = 8080\n") };
+    TomlReader r = toml_open(doc);
+    TomlEntry e = { 0 };
+    char title[32] = { 0 };
+    char host[32] = { 0 };
+    char buf[32] = { 0 };
+    i64 port = 0;
+    int debug = 0, entries = 0, arr = 0;
+    Str el = { { (char *)0, 0 } };
+
+    while (r.next(&e) == 1) {
+        int n = 0;
+
+        entries++;
+        if (e.kind != TOML_KEY)
+            continue;
+        n = e.decode((char[:]){ buf, (int)sizeof buf - 1 });
+        if (n >= 0)
+            buf[n] = 0;
+        if (strncmp(e.key.s.data, "title", (size_t)e.key.s.len) == 0
+            && e.key.s.len == 5) {
+            if (n > 0) {
+                memcpy(title, buf, (size_t)n + 1);
+            }
+        } else if (e.key.s.len == 5 && memcmp(e.key.s.data, "debug", 5) == 0) {
+            check(toml_bool(e.raw, &debug) && debug == 1, "toml: debug");
+        } else if (e.key.s.len == 5 && memcmp(e.key.s.data, "ports", 5) == 0) {
+            arr = toml_array_len(e.raw);
+            check(arr == 2 && toml_array_at(e.raw, 1, &el) == 1
+                      && el.s.len == 4 && memcmp(el.s.data, "8443", 4) == 0,
+                  "toml: ports 数组");
+        } else if (e.key.s.len == 4 && memcmp(e.key.s.data, "host", 4) == 0) {
+            if (n > 0) {
+                memcpy(host, buf, (size_t)n + 1);
+            }
+        } else if (e.key.s.len == 4 && memcmp(e.key.s.data, "port", 4) == 0) {
+            check(toml_int(e.raw, &port) && port == 8080, "toml: port");
+        }
+    }
+    printf("toml: %d 条，title=%s host=%s port=%d\n", entries, title, host,
+           (int)port);
+    check(strcmp(title, "demo") == 0, "toml: title");
+    check(strcmp(host, "localhost") == 0, "toml: host");
+    check(r.err == 0, "toml: 没有语法错误");
+}
+
+/* XML：元素、属性、文本、自闭合 */
+static void tour_xml(void)
+{
+    Str doc = { S("<config><item id=\"a\">42</item><item id=\"b\"/>"
+                  "<note>a &amp; b</note></config>") };
+    XmlReader r = xml_open(doc);
+    XmlEvent e = { 0 };
+    char buf[32] = { 0 };
+    int items = 0, selfs = 0, texts = 0;
+    Str v = { { (char *)0, 0 } };
+
+    while (r.next(&e) == 1) {
+        if (e.kind == XML_START && e.name.s.len == 4
+            && memcmp(e.name.s.data, "item", 4) == 0) {
+            items++;
+            check(e.attr(conf_str(S("id")), &v) == 1, "xml: item 有 id");
+            check(v.s.len == 1, "xml: id 的长度");
+        } else if (e.kind == XML_SELF) {
+            selfs++;
+            check(e.name.s.len == 4 && memcmp(e.name.s.data, "item", 4) == 0,
+                  "xml: 自闭合 item");
+        } else if (e.kind == XML_TEXT) {
+            texts++;
+            if (e.text.s.len == 5) {
+                int n = xml_unescape(e.text, (char[:]){ buf, (int)sizeof buf - 1 });
+
+                buf[n > 0 ? n : 0] = 0;
+                check(n == 5 && strcmp(buf, "a & b") == 0, "xml: 实体解码");
+            }
+        }
+    }
+    printf("xml: %d 个开始 item、%d 个自闭合、%d 段文本\n", items, selfs, texts);
+    check(items == 1 && selfs == 1 && r.err == 0, "xml: 事件计数");
+}
+
+/* 查询串：解析、解码、构建 */
+static void tour_query(void)
+{
+    char buf[64] = { 0 };
+    char enc[64] = { 0 };
+    Str text = { S("q=hello+world&page=2&tag=%E4%B8%AD") };
+    int n = 0;
+    QueryPair p[2] = { { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 },
+                       { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 } };
+
+    n = query_get(text, S("q"), (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    printf("query: q=%s\n", buf);
+    check(n == 11 && strcmp(buf, "hello world") == 0, "query: q 解码");
+    n = query_get(text, S("tag"), (char[:]){ buf, (int)sizeof buf - 1 });
+    check(n == 3 && memcmp(buf, "\xe4\xb8\xad", 3) == 0, "query: UTF-8 解码");
+    check(query_has(text, S("page")) && !query_has(text, S("nope")),
+          "query: has");
+
+    p[0].name = conf_str(S("q"));
+    p[0].value = conf_str(S("hello world"));
+    p[1].name = conf_str(S("page"));
+    p[1].value = conf_str(S("3"));
+    n = query_build(p, 2, (char[:]){ enc, (int)sizeof enc - 1 });
+    enc[n > 0 ? n : 0] = 0;
+    printf("query: 构建 = %s\n", enc);
+    check(n == 20 && strcmp(enc, "q=hello+world&page=3") == 0, "query: 构建");
+}
+
+/* 模板：把配置值填进报告 */
+static void tour_template(void)
+{
+    Str report = { S("[{{title}}] {{host}}:{{port}} (debug={{debug}})") };
+    Var v[4] = { { { S("title") }, { S("demo") } },
+                 { { S("host") }, { S("localhost") } },
+                 { { S("port") }, { S("8080") } },
+                 { { S("debug") }, { S("off") } } };
+    Template t = tpl(report);
+    char out[128] = { 0 };
+    Var names[8] = { 0 };
+    int n = 0;
+
+    n = t.render(v, 4, (char[:]){ out, (int)sizeof out - 1 });
+    out[n > 0 ? n : 0] = 0;
+    printf("template: %s\n", out);
+    check(n > 0 && strcmp(out, "[demo] localhost:8080 (debug=off)") == 0,
+          "template: 渲染");
+    check(n == t.render_len(v, 4), "template: 长度一致");
+    check(t.vars(names, 8) == 4, "template: 收集 4 个变量");
+    /* 缺变量：严格失败，宽松给空 */
+    {
+        Str t2 = { S("x{{missing}}y") };
+        Template tp = tpl(t2);
+
+        check(tp.render(v, 4, (char[:]){ out, (int)sizeof out }) == -1,
+              "template: 严格模式");
+        n = tp.render_opt(v, 4, (char[:]){ out, (int)sizeof out - 1 }, 0);
+        out[n > 0 ? n : 0] = 0;
+        check(n == 2 && strcmp(out, "xy") == 0, "template: 宽松模式");
+    }
+}
+
+int main(void)
+{
+    printf("stdconf: 标准库第十五批（toml / xml / query / template）\n");
+    tour_toml();
+    tour_xml();
+    tour_query();
+    tour_template();
+    printf("stdconf: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}
