@@ -56,6 +56,16 @@
 
 ### 标准库
 
+- **标准库第三十一批（编码与凭据）**：`std.encoding.asn1` / `std.data.x509` /
+  `std.data.jwt` / `std.encoding.otp` 四个零分配模块，集成示例
+  `examples/stdenc.c6`（`make std-enc`）。asn1 是 DER 读取器（多字节 tag、长
+  长度、INTEGER/OID/BIT STRING/时间/字符串解码）；x509 在它上面解析 v3 证书
+  （版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/公钥位数/签名视图，
+  不验签）；jwt 验 HS256/HS384/HS512 紧凑令牌（常量时间比较，`alg=none` 与非
+  HMAC 拒绝）；otp 给 RFC 4226 的 HOTP 与 RFC 6238 的 TOTP（带时间窗口校验）。
+  `std.encoding.sha512` 顺带补 `hmac_sha384`。错误号段 `std.encoding.asn1`=0x6085
+  … `std.encoding.otp`=0x6088（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第三十批（图像解码）**：`std.data.bmp` / `std.data.tga` /
   `std.data.qoi` / `std.data.pnm` 四个模块，集成示例 `examples/stdimg.c6`
   （`make std-img`）。四个解码器都输出 RGBA8888、零分配：bmp 支持 24/32 位

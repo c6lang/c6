@@ -27,7 +27,7 @@
  *
  * 空指针约定与 sha256 一致：`p == 0` 当 0 字节输入，`out == 0` 直接返回。
  * `final` 永远写 64 字节；SHA-384 是「不同的 IV + 截到 48 字节」，所以
- * `sha384`/`sha384_hex` 只是把 64 字节结果截短（`final` 本身不知道要截）。
+ * `sha384`/`sha384_hex` 用 SHA-384 的 IV、再把 64 字节结果截到 48 字节。
  */
 #include <string.h>
 
@@ -338,6 +338,43 @@ void hmac_sha512(const void *key, usize klen, const void *msg, usize mlen,
     memset(kblock, 0, sizeof kblock);
     memset(pad, 0, sizeof pad);
     memset(inner, 0, sizeof inner);
+}
+
+/* HMAC-SHA-384：同样的 ipad/opad，只是用 SHA-384 的 IV，结果截到 48 字节 */
+void hmac_sha384(const void *key, usize klen, const void *msg, usize mlen,
+                 u8 *out48)
+{
+    u8 kblock[128] = { 0 };
+    u8 pad[128] = { 0 };
+    u8 inner[64] = { 0 }, full[64] = { 0 };
+    Sha512 st = { 0 };
+    int i = 0;
+
+    if (!out48)
+        return;
+    if (key) {
+        if (klen > sizeof kblock)
+            sha384(key, klen, kblock);
+        else if (klen > 0)
+            memcpy(kblock, key, klen);
+    }
+    for (i = 0; i < 128; i++)
+        pad[i] = (u8)(kblock[i] ^ 0x36);
+    st.init384();
+    st.update(pad, sizeof pad);
+    st.update(msg, mlen);
+    st.final(inner);
+    for (i = 0; i < 128; i++)
+        pad[i] = (u8)(kblock[i] ^ 0x5c);
+    st.init384();
+    st.update(pad, sizeof pad);
+    st.update(inner, 48);               /* SHA-384 的中间值是 48 字节 */
+    st.final(full);
+    memcpy(out48, full, 48);
+    memset(kblock, 0, sizeof kblock);
+    memset(pad, 0, sizeof pad);
+    memset(inner, 0, sizeof inner);
+    memset(full, 0, sizeof full);
 }
 
 /* HMAC-SHA-512 的小写 hex（out129 至少 129 字节） */

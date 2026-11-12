@@ -16,7 +16,7 @@
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
-| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、LZ4/RLE、hexdump |
+| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、LZ4/RLE、hexdump、DER/ASN.1、HOTP/TOTP |
 | `std/data/` | 数据格式与媒体：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM、WAV、PNG、ELF、ZIP、BMP/TGA/QOI/PNM 图像 |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
@@ -143,7 +143,7 @@
 | `std/encoding/sha1.c6` | `std.encoding.sha1` | SHA-1 与 HMAC-SHA1（FIPS 180-4 / RFC 2104，零分配）：`sha1_new`/`init`/`update`/`final`、一次性 `sha1`/`sha1_hex`、`hmac_sha1`/`hmac_sha1_hex`、常数时间 `sha1_eq`；用于协议互操作（WebSocket 握手、git 对象名、HTTP Digest），抗碰撞请用 `std.encoding.sha256` |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
 | `std/encoding/md5.c6` | `std.encoding.md5` | MD5（RFC 1321，零分配）：`Md5` 的 `init`/`update`/`final`、一次性 `md5`/`md5_hex`、常数时间 `md5_eq`；小端 32 位字、64 步四轮，T 表按 `sin(i+1)` 生成；**只用于校验和/兼容格式**，碰撞是分钟级的 |
-| `std/encoding/sha512.c6` | `std.encoding.sha512` | SHA-512 / SHA-384 与 HMAC-SHA-512（FIPS 180-4 / RFC 2104，零分配）：`Sha512` 的 `init`/`init384`/`update`/`final`（128 位长度计数）、一次性 `sha512`/`sha384`/`sha512_hex`/`sha384_hex`、`hmac_sha512`/`hmac_sha512_hex`、常数时间 `sha512_eq`；80 轮、64 位字，旋转借 `std.core.bits` |
+| `std/encoding/sha512.c6` | `std.encoding.sha512` | SHA-512 / SHA-384 与 HMAC-SHA-512（FIPS 180-4 / RFC 2104，零分配）：`Sha512` 的 `init`/`init384`/`update`/`final`（128 位长度计数）、一次性 `sha512`/`sha384`/`sha512_hex`/`sha384_hex`、`hmac_sha384`/`hmac_sha512`/`hmac_sha512_hex`、常数时间 `sha512_eq`；80 轮、64 位字，旋转借 `std.core.bits` |
 | `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
 | `std/encoding/hkdf.c6` | `std.encoding.hkdf` | HKDF（RFC 5869，基于 HMAC-SHA-256，零分配）：`hkdf_extract`/`hkdf_expand`/`hkdf`（一步版）；salt 为空按 32 个零字节、expand 上限 255*32=8160 字节（计数器只有一字节）、`out_len == 0` 是合法空操作；返回 0/-1 |
@@ -156,8 +156,10 @@
 | `std/encoding/zlib.c6` | `std.encoding.zlib` | zlib 容器（RFC 1950）：`adler32`/`adler32_update`（模 65521）、`zlib_compress`（`78 01` 头 + DEFLATE + Adler-32 大端）、`zlib_decompress`（校验 CM/CINFO/FCHECK/FDICT 与尾部校验和）、`zlib_bound`；不支持预设字典 |
 | `std/encoding/gzip.c6` | `std.encoding.gzip` | gzip 容器（RFC 1952）：`gzip_crc32`（IEEE 反射多项式）、`gzip_compress(in,n,out,cap,mtime)`（10 字节头 + DEFLATE + CRC-32/ISIZE 小端）、`gzip_decompress`（跳过 FEXTRA/FNAME/FCOMMENT/FHCRC 并校验页脚）、`gzip_bound`；只读单成员 |
 | `std/encoding/tar.c6` | `std.encoding.tar` | tar 归档（ustar，零分配）：`tar_reader` + `TarReader.next`（checksum 校验、prefix/name 拼接、数据视图、截断/非法八进制 -1、`error_at`）、`tar_writer` + `add_file`/`add_dir`/`finish`（八进制字段、512 对齐、结尾两个零块）；不压缩 |
+| `std/encoding/asn1.c6` | `std.encoding.asn1` | DER/ASN.1 读取器（零分配）：`asn1`/`asn1_sub` 造读取器，`next`/`peek` 切出 `Asn1Tag`（class/constructed/tag/内容偏移/长度），支持多字节 tag 号与 0x81..0x84 长长度、拒绝不定长与越界；`view`/`asn1_string` 给内容视图，`asn1_int`（1..8 字节二补码）/`asn1_oid`（点分十进制）/`asn1_bits`（跳过 unused 字节）/`asn1_time`（UTCTime/GeneralizedTime 归一成 6 个整数） |
+| `std/encoding/otp.c6` | `std.encoding.otp` | 一次性口令（RFC 4226 / 6238，零分配）：`hotp(secret, slen, counter, digits)`、`totp(secret, slen, unix_time, step, digits)`、`otp_format`（定宽补零）、`otp_verify_totp`（前后各 `window` 步、常量时间比较）；HMAC-SHA-1 动态截断，位数 4..9，密钥是原始字节（Base32 先走 `std.encoding.base32`） |
 
-**`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP，以及 BMP/TGA/QOI/PNM 图像解码）
+**`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP、X.509 证书与 JWT，以及 BMP/TGA/QOI/PNM 图像解码）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -180,6 +182,8 @@
 | `std/data/tga.c6` | `std.data.tga` | TGA 解码（零分配）：类型 2（未压缩）/10（RLE）真彩、24/32 位、四种原点（`top_origin`/`right_origin`）；`tga_decode` 把 BGR(A) 换回 RGBA8888，RLE 包可跨行，包越界/截断返回 -1 |
 | `std/data/qoi.c6` | `std.data.qoi` | QOI 解码与编码（零分配）：`qoi_decode` 支持 INDEX/DIFF/LUMA/RUN/RGB/RGBA 全套操作码并校验头与结束标记；`qoi_encode` 发 RUN/INDEX/RGB/RGBA 四种操作码（不生成 DIFF/LUMA，流合法但略大）；输出都是 RGBA8888 |
 | `std/data/pnm.c6` | `std.data.pnm` | Netpbm P5/P6 解码（零分配）：`pnm_parse` 支持注释、maxval 1..65535、8/16 位（大端）样本，`pnm_decode` 按 `v*255/maxval` 缩放到 RGBA8888；P1..P4/P7 与多图不支持 |
+| `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
+| `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
 
@@ -237,6 +241,7 @@
 | `examples/stdarch.c6` | （无模块） | 第二十八批（压缩与归档）的拼装示例（`make std-arch`）：deflate 的 fixed/stored 往返、zlib 头与 Adler-32、gzip 头与 CRC-32/ISIZE、tar 两个文件的读写，最后把 tar 再用 gzip 压成 `.tar.gz` 并解压重读 |
 | `examples/stdbin.c6` | （无模块） | 第二十九批（二进制文件格式）的拼装示例（`make std-bin`）：解析 48 字节 WAV、遍历 70 字节 PNG 并把 IDAT 交给 zlib 解出像素、读 320 字节 ELF64 的节名、解 225 字节 ZIP 的 stored/deflate 两个条目 |
 | `examples/stdimg.c6` | （无模块） | 第三十批（图像解码）的拼装示例（`make std-img`）：同一张 2x2 图分别用 BMP（24 位自下而上）、TGA（RLE）、QOI（RGB 流）、PNM（P6）解成 RGBA 后逐像素比对，再用 QOI 编码器写回解一遍 |
+| `examples/stdenc.c6` | （无模块） | 第三十一批（编码与凭据）的拼装示例（`make std-enc`）：手写 DER 逐层读 INTEGER/OID/UTF8String/UTCTime、解析一张 829 字节自签证书、HS256 令牌验签与改字节/换密钥的拒绝、RFC 4226 与 RFC 6238 的 OTP 向量与时间窗口 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -280,6 +285,8 @@ std/data/bmp.c6            2 test(s), 0 failure(s)
 std/data/tga.c6            2 test(s), 0 failure(s)
 std/data/qoi.c6            2 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
+std/data/x509.c6          26 test(s), 0 failure(s)
+std/data/jwt.c6            58 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
 std/data/props.c6          4 test(s), 0 failure(s)
@@ -303,6 +310,8 @@ std/encoding/deflate.c6     2 test(s), 0 failure(s)
 std/encoding/zlib.c6        4 test(s), 0 failure(s)
 std/encoding/gzip.c6        7 test(s), 0 failure(s)
 std/encoding/tar.c6        24 test(s), 0 failure(s)
+std/encoding/asn1.c6       24 test(s), 0 failure(s)
+std/encoding/otp.c6        13 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
 std/net/cookie.c6          4 test(s), 0 failure(s)
@@ -365,6 +374,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/tga.c6` 2 | 自成一体 |
 | `std/data/qoi.c6` 2 | 自成一体 |
 | `std/data/pnm.c6` 2 | 自成一体 |
+| `std/data/x509.c6` 26 | x509 2 + asn1 24（DER 读取器来自 std.encoding.asn1） |
+| `std/data/jwt.c6` 58 | jwt 2 + base64 8 + sha256 23 + sha512 9 + bits 6 + str 22（HMAC 直接调 sha256/sha512） |
 | `std/os/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/encoding/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
 | `std/encoding/md5.c6` 9 | md5 3 + bits 6（`rotr32` 是跨 TU 调用） |
@@ -376,6 +387,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/encoding/gzip.c6` 7 | gzip 2 + deflate 2 + crc 3（CRC-32 来自 std.core.crc） |
 | `std/encoding/deflate.c6` 2 | 自成一体（Huffman 表与位读写都在模块里） |
 | `std/encoding/tar.c6` 24 | tar 2 + str 22（只借 `Str` 类型，正文不调 str） |
+| `std/encoding/asn1.c6` 24 | asn1 2 + str 22 |
+| `std/encoding/otp.c6` 13 | otp 3 + sha1 6 + bits 6（HMAC-SHA-1 是跨 TU 调用） |
 | `std/encoding/aes.c6` 2 | 自成一体（S 盒直接写在模块里） |
 | `std/encoding/poly1305.c6` 2 | 自成一体（130 位模运算只用 u64） |
 | `std/encoding/random.c6` 3 | 自成一体（只读 /dev/urandom） |
@@ -425,7 +438,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/encoding/deflate` 也自成一体，`std/encoding/zlib` 要 deflate，`gzip` 要
 deflate + `std/core/crc`，`tar` 只借 `Str` 类型；`std/data/png` 只借 `Str`
 类型与 `crc`，`std/data/zip` 要 deflate + crc，`wav`/`elf`/`bmp`/`tga`/`qoi`/
-`pnm` 自成一体。
+`pnm` 自成一体；`std/data/x509` 要 asn1，`std/data/jwt` 要 base64 + sha256 +
+sha512，`std/encoding/asn1` 只借 `Str` 类型，`std/encoding/otp` 要 sha1。
 
 ## 设计原则
 
@@ -3208,6 +3222,38 @@ stdimg: 16 check(s), 0 failure(s)
 BGR 换序、QOI 的 RGB 操作码、PNM 的头解析。QOI 那一节还把解出的 RGBA 用
 `qoi_encode` 编回去（38 字节）再解一遍，验编码器的 RUN/INDEX 路径。
 
+### 集成示例：`examples/stdenc.c6`
+
+```sh
+make std-enc
+```
+
+```
+== asn1
+   INTEGER 7
+   OID 2.5.4.3
+   UTF8String hi
+   UTCTime 2026-01-01 00:00:00
+== x509
+   subject: C=CN O=SuperC CN=example.test
+   serial=1092  v3  key=2048  sig=256 字节
+   有效期: 2026-11-12 -> 2036-11-09
+== jwt
+   header : {"alg":"HS256","typ":"JWT"}
+   payload: {"sub":"1234567890","name":"John Doe","iat":1516239022}
+== otp
+   HOTP(6) 前五个：755224 287082 359152 969429 338314
+   TOTP(8) t=1234567890 -> 89005924
+
+24 check(s), 0 failure(s)
+```
+
+四节各钉一条线：asn1 用手写 DER 走 `SEQUENCE{INTEGER,OID,UTF8String,UTCTime}`
+的每一种解码；x509 解一张 829 字节的自签证书并核对版本/序列号/CN/有效期/
+2048 位公钥；jwt 用 HS256 已知令牌验签，再改载荷一个字节、换一把密钥看它被拒；
+otp 打 RFC 4226 的前五个计数器码与 RFC 6238 的 `t=1234567890` 八位码，并验
+前后一步的时间窗口。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3263,6 +3309,8 @@ BGR 换序、QOI 的 RGB 操作码、PNM 的头解析。QOI 那一节还把解�
 * `make std-bin`：`examples/stdbin.c6`，第二十九批（二进制文件格式）模块的
   拼装示例（自带自检）。
 * `make std-img`：`examples/stdimg.c6`，第三十批（图像解码）模块的拼装示例
+  （自带自检）。
+* `make std-enc`：`examples/stdenc.c6`，第三十一批（编码与凭据）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

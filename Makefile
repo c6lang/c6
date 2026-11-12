@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc
 
 all: build
 
@@ -186,6 +186,10 @@ stdtest: build
 	    std/data/tga.c6) deps="" ;; \
 	    std/data/qoi.c6) deps="" ;; \
 	    std/data/pnm.c6) deps="" ;; \
+	    std/encoding/asn1.c6) deps="std/text/str.c6" ;; \
+	    std/data/x509.c6) deps="std/encoding/asn1.c6 std/text/str.c6" ;; \
+	    std/data/jwt.c6) deps="std/encoding/base64.c6 std/encoding/sha256.c6 std/encoding/sha512.c6 std/core/bits.c6 std/text/str.c6" ;; \
+	    std/encoding/otp.c6) deps="std/encoding/sha1.c6 std/core/bits.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -563,6 +567,19 @@ std-img: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdimg $(STD_IMG_SRCS)
 	./build/stdimg
 
+# 标准库第三十一批（编码与凭据）：asn1 / x509 / jwt / otp。
+# 示例先走一遍手写 DER，再解一张自签证书、验一个 HS256 令牌、打几个 HOTP/TOTP 码。
+STD_ENC_SRCS := examples/stdenc.c6 std/core/types.c6 std/core/bits.c6 \
+                std/text/str.c6 std/encoding/asn1.c6 std/encoding/base64.c6 \
+                std/encoding/sha1.c6 std/encoding/sha256.c6 \
+                std/encoding/sha512.c6 std/encoding/otp.c6 \
+                std/data/x509.c6 std/data/jwt.c6
+
+std-enc: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdenc $(STD_ENC_SRCS)
+	./build/stdenc
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -667,7 +684,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -676,13 +693,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的三十个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的三十一个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
 # test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img
 # 是三十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -857,6 +874,7 @@ distclean:
 #   std-arch         编译并运行 examples/stdarch.c6（第二十八批，压缩与归档）
 #   std-bin          编译并运行 examples/stdbin.c6（第二十九批，二进制文件格式）
 #   std-img          编译并运行 examples/stdimg.c6（第三十批，图像解码）
+#   std-enc          编译并运行 examples/stdenc.c6（第三十一批，编码与凭据）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

@@ -1299,3 +1299,29 @@ Bencode/MessagePack/CBOR/PEM，但媒体容器（WAV）、图片（PNG）、可�
 
 验收：`make stdtest`（133 个模块、0 failure）、`make std-img`（16 条自检全过）、
 `make check-all`。
+
+### 11.43 标准库第三十一批（asn1 / x509 / jwt / otp）
+
+第三十一批补「凭据」这条线：DER 读取器打底，上面架证书与 JWT，另加一次性口令。
+四个模块都零分配，只依赖已有的哈希/Base64：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.asn1` | DER 读取器 | `asn1`/`asn1_sub` + `next`/`peek` 切 `Asn1Tag`（class/tag/内容偏移/长度），支持多字节 tag 号与 0x81..0x84 长长度，拒绝不定长与越界；值解码只给 INTEGER（≤8 字节）/OID/BIT STRING/UTCTime·GeneralizedTime/三种字符串；不校验 DER 规范性 |
+| `std.data.x509` | X.509 v3 证书解析 | 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，取版本、序列号（十六进制）、签名 OID、issuer/subject 的 CN·O·C、有效期、SPKI 视图、RSA 模数位数、签名视图；不验签/不验链/不处理 PEM，坏结构 `valid=0` |
+| `std.data.jwt` | JWS 紧凑格式验签 | 只支持 HS256/HS384/HS512：Base64URL 解头与载荷、按头里的 `alg` 选 HMAC、对 `h.p` 常量时间比较签名；`alg=none` 与非 HMAC 算法一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
+| `std.encoding.otp` | HOTP / TOTP | HMAC-SHA-1 + 动态截断，`hotp`/`totp`/`otp_format`/`otp_verify_totp`（前后各 `window` 步）；位数 4..9，密钥是原始字节（Base32 走 `std.encoding.base32`）；不做防重放 |
+
+这一批另外给 `std.encoding.sha512` 补了 `hmac_sha384`（原先只有 `sha384` 一次性
+哈希与 `hmac_sha512`，JWT 的 HS384 需要真正的 SHA-384 IV + 48 字节中间值）。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.asn1`=0x6085、
+`std.data.x509`=0x6086、`std.data.jwt`=0x6087、`std.encoding.otp`=0x6088；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-enc` 与 `STD_ENC_SRCS`，`test-all`/`check-all` 都带上
+它；`stdtest` 的依赖：asn1 借 `Str` 类型，x509 要 asn1，jwt 要 base64 + sha256 +
+sha512 + bits，otp 要 sha1 + bits。示例 `examples/stdenc.c6` 先走手写 DER，再解
+829 字节自签证书、验 HS256 令牌、打 RFC 4226/6238 的 OTP 码。
+
+验收：`make stdtest`（137 个模块、0 failure）、`make std-enc`（24 条自检全过）、
+`make check-all`。
+

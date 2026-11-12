@@ -1,0 +1,243 @@
+/* stdenc：标准库第三十一批（编码/凭据）的拼装示例。
+ *
+ * 没有 `module`（入口 `main` 只能写在模块外的文件里），各节自带自检。
+ *
+ *   1. asn1：一个手写的 DER 结构（SEQUENCE{ INTEGER, OID, UTF8String, UTCTime }）
+ *      逐层读出来；
+ *   2. x509：一张 openssl 生成的自签证书，取版本/序列号/CN/有效期/公钥位数；
+ *   3. jwt：HS256 令牌验签（payload 里的 sub），再改一个字节看它被拒；
+ *   4. otp：RFC 4226 的计数器码与 RFC 6238 的时间码，各打几个。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdenc \
+ *         examples/stdenc.c6 std/core/types.c6 std/core/bits.c6 \
+ *         std/text/str.c6 std/encoding/asn1.c6 std/encoding/base64.c6 \
+ *         std/encoding/sha1.c6 std/encoding/sha256.c6 std/encoding/sha512.c6 \
+ *         std/encoding/otp.c6 std/data/x509.c6 std/data/jwt.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.encoding.asn1;
+import std.encoding.otp;
+import std.data.x509;
+import std.data.jwt;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+static const char *CERT_DER =
+    "3082033930820221a00302010202021092300d06092a864886f70d01010b0500"
+    "3035310b300906035504061302434e310f300d060355040a0c06537570657243"
+    "3115301306035504030c0c6578616d706c652e74657374301e170d3236313131"
+    "323135323331345a170d3336313130393135323331345a3035310b3009060355"
+    "04061302434e310f300d060355040a0c06537570657243311530130603550403"
+    "0c0c6578616d706c652e7465737430820122300d06092a864886f70d01010105"
+    "000382010f003082010a0282010100b2414e0a4ad885526efbf8ebf3d54a09fa"
+    "12a714daae55cc8af8c1824c0ee80cef182a7d7043c529301f066daaf5feab41"
+    "f54477cd6d4019f9b5646ee23e00ea6a006d080daa4261b355d1a65f13f7b448"
+    "e81748d392d49816f720ade6c0b6227e5c4bf07c78441bfdf8505488ce9494dd"
+    "0071c2ce7a9ab46cf27acb81b124fe8e07a314ce1f14e92ce2c68e8db45eef2f"
+    "6be84715719518e7a2dccece7750abf42278f57044080d76043edcd56f40d98f"
+    "db3db7915da395187f63977f330dfdf4bd2750588a3741e8a73293aab68338c1"
+    "fa69ccdb4d1f59634cb47fca9065ee70014fd0f1d0bf2340267138845f2ec028"
+    "960b2c6382f3c551ab7d8969d3429d0203010001a3533051301d0603551d0e04"
+    "1604140ebd2bd1ee0946cd1fedebd16406193a61448226301f0603551d230418"
+    "301680140ebd2bd1ee0946cd1fedebd16406193a61448226300f0603551d1301"
+    "01ff040530030101ff300d06092a864886f70d01010b050003820101001aca9a"
+    "3633288f2b2d491bf7f2c50cbb353a802856f84be460384bf129ba59ab32e0d5"
+    "89a44e6dabd2252d32826eb699814d36a580835afbae7d09710a24eae1df8060"
+    "b5517cb3519790d6ec9d001567855b1562e649d6d8bc97b887312704ff671111"
+    "82c1c79e57ac0ef7bc49d4961e079c5c0b114b9b53b2b122c1299554a6a3d0bc"
+    "b9fc2279479ee0d9a93943df5ea751a0ef5a2eeb9749a518555f1476b3afac53"
+    "ad75cb29905d6f440ef25e2417c8ec59025a9b911d3e1f3b539b993cee59393a"
+    "05d2e279e848fca9ac369d91811109271bc1671382e7ee2f774ed4f68245d5e3"
+    "bf930904fc4722cbeeafa6d2363773405f7f17a3a560d87ae7b11e5bff";
+
+static void demo_asn1(void)
+{
+    /* SEQUENCE { INTEGER 7, OID 2.5.4.3, UTF8String "hi", UTCTime } */
+    static const char *hex =
+        "301b"
+        "020107"
+        "0603550403"
+        "0c026869"
+        "170d3236303130313030303030305a";
+    u8 der[128] = { 0 };
+    int n = unhex(hex, der, (int)sizeof der);
+    Asn1 r = asn1(der, n);
+    Asn1Tag t = { 0 };
+
+    printf("== asn1\n");
+    check(n > 0, "DEMO DER 解开");
+    if (r.next(&t) != 1 || t.tag != ASN1_SEQUENCE) {
+        check(0, "外层是 SEQUENCE");
+        return;
+    }
+    {
+        Asn1 body = asn1_sub(&r, &t);
+        Asn1Tag f = { 0 };
+        i64 v = 0;
+        char oid[64] = { 0 };
+        int tm[6] = { 0 };
+
+        if (body.next(&f) == 1 && asn1_int(&body, &f, &v) == 0) {
+            check(v == 7, "INTEGER = 7");
+            printf("   INTEGER %lld\n", (long long)v);
+        }
+        if (body.next(&f) == 1 && asn1_oid(&body, &f, oid, (int)sizeof oid) > 0) {
+            check(strcmp(oid, "2.5.4.3") == 0, "OID = 2.5.4.3");
+            printf("   OID %s\n", oid);
+        }
+        if (body.next(&f) == 1) {
+            Str s = asn1_string(&body, &f);
+
+            check(s.s.len == 2 && memcmp(s.s.data, "hi", 2) == 0,
+                  "UTF8String = hi");
+            printf("   UTF8String %.*s\n", (int)s.s.len, s.s.data);
+        }
+        if (body.next(&f) == 1 && asn1_time(&body, &f, tm) == 0) {
+            check(tm[0] == 2026 && tm[1] == 1 && tm[2] == 1, "UTCTime = 2026-01-01");
+            printf("   UTCTime %04d-%02d-%02d %02d:%02d:%02d\n", tm[0], tm[1],
+                   tm[2], tm[3], tm[4], tm[5]);
+        }
+    }
+}
+
+static void demo_x509(void)
+{
+    u8 der[1024] = { 0 };
+    int n = unhex(CERT_DER, der, (int)sizeof der);
+    X509Cert c = { 0 };
+
+    printf("== x509\n");
+    check(n == 829, "证书是 829 字节");
+    c = x509_parse(der, n);
+    check(c.valid, "证书能解析");
+    if (!c.valid)
+        return;
+    check(c.version == 3, "版本 v3");
+    check(strcmp(c.serial, "1092") == 0, "序列号 1092");
+    check(strcmp(c.subject.common_name, "example.test") == 0, "subject CN");
+    check(strcmp(c.issuer.common_name, "example.test") == 0, "issuer CN（自签）");
+    check(c.key_bits == 2048, "RSA 公钥 2048 位");
+    check(strcmp(c.sig_alg, "1.2.840.113549.1.1.11") == 0, "sha256WithRSA");
+    printf("   subject: C=%s O=%s CN=%s\n", c.subject.country, c.subject.org,
+           c.subject.common_name);
+    printf("   serial=%s  v%d  key=%d  sig=%d 字节\n", c.serial, c.version,
+           c.key_bits, c.sig_len);
+    printf("   有效期: %04d-%02d-%02d -> %04d-%02d-%02d\n", c.not_before[0],
+           c.not_before[1], c.not_before[2], c.not_after[0], c.not_after[1],
+           c.not_after[2]);
+}
+
+static void demo_jwt(void)
+{
+    char *token =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2"
+        "MjM5MDIyfQ."
+        "XbPfbIHMI6arZ3Y922BhjWgQzWXcXNrz0ogtVhfEd2o";
+    char hdr[256] = { 0 }, pay[512] = { 0 };
+    Jwt j = { 0 };
+
+    printf("== jwt\n");
+    j = jwt_verify(token, (int)strlen(token), "secret", 6, hdr,
+                   (int)sizeof hdr, pay, (int)sizeof pay);
+    check(j.valid, "HS256 验签通过");
+    check(j.alg == JWT_ALG_HS256, "alg = HS256");
+    if (j.valid) {
+        check(strstr(pay, "\"sub\":\"1234567890\"") != 0, "payload 里有 sub");
+        printf("   header : %s\n", hdr);
+        printf("   payload: %s\n", pay);
+    }
+    {
+        char bad[512] = { 0 };
+
+        memcpy(bad, token, strlen(token) + 1);
+        bad[45] = (bad[45] == 'A') ? 'B' : 'A';
+        check(!jwt_verify(bad, (int)strlen(bad), "secret", 6, hdr,
+                          (int)sizeof hdr, pay, (int)sizeof pay).valid,
+              "改一个字节就被拒");
+    }
+    check(!jwt_verify(token, (int)strlen(token), "Secret", 6, hdr,
+                      (int)sizeof hdr, pay, (int)sizeof pay).valid,
+          "换密钥就被拒");
+}
+
+static void demo_otp(void)
+{
+    static const char *K = "12345678901234567890";
+    char buf[16] = { 0 };
+    int i = 0;
+
+    printf("== otp\n");
+    printf("   HOTP(6) 前五个：");
+    for (i = 0; i < 5; i++) {
+        u32 c = hotp(K, 20, (u64)i, 6);
+
+        otp_format(c, 6, buf, (int)sizeof buf);
+        printf("%s%s", i ? " " : "", buf);
+    }
+    printf("\n");
+    check(hotp(K, 20, 0, 6) == 755224, "HOTP counter=0 是 755224");
+    check(hotp(K, 20, 9, 6) == 520489, "HOTP counter=9 是 520489");
+    {
+        u32 t = totp(K, 20, 1234567890ull, 30, 8);
+
+        otp_format(t, 8, buf, (int)sizeof buf);
+        check(t == 89005924, "TOTP t=1234567890 是 89005924");
+        printf("   TOTP(8) t=1234567890 -> %s\n", buf);
+        check(otp_verify_totp(K, 20, buf, 1234567890ull, 30, 8, 0), "当步通过");
+        check(otp_verify_totp(K, 20, buf, 1234567890ull + 30, 30, 8, 1),
+              "漂移一步通过");
+        check(!otp_verify_totp(K, 20, buf, 1234567890ull + 120, 30, 8, 1),
+              "漂移四步不通过");
+    }
+}
+
+int main(void)
+{
+    demo_asn1();
+    demo_x509();
+    demo_jwt();
+    demo_otp();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

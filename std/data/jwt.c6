@@ -1,0 +1,246 @@
+/* std/data/jwt：JWS 紧凑格式（JWT）的解析与 HMAC 验签（零分配）。
+ *
+ *     import std.data.jwt;
+ *
+ *     char hdr[512] = { 0 }, pay[1024] = { 0 };
+ *     Jwt j = jwt_verify(token, tlen, "secret", 6,
+ *                        hdr, (int)sizeof hdr, pay, (int)sizeof pay);
+ *     if (j.valid) {
+ *         // j.header / j.payload 是 Base64URL 解出来的 JSON 文本
+ *         // j.alg：JWT_HS256 / JWT_HS384 / JWT_HS512
+ *     }
+ *
+ * 只支持 **HMAC 系列**（HS256/HS384/HS512）：把 `h.p` 用密钥做 HMAC，与第三段
+ * 的 Base64URL 签名做**常量时间**比较。RS/ES/PS 系列（非对称）需要 RSA/ECDSA，
+ * 不在这一层；`alg=none` 一律拒绝。
+ *
+ * 约定：
+ *
+ * - 头/载荷解到调用方给的缓冲里并补 NUL（放不下返回 `valid=0`）；
+ * - 签名长度必须与算法匹配（HS256=32、HS384=48、HS512=64 字节）；
+ * - 不解析 JSON、不校验 `exp`/`nbf`/`iss`/`aud`——这些交给
+ *   `std.data.json` 与调用方的策略；
+ * - 只认三段式（两个 `.`），段里的 '=' 可有可无（Base64URL 无填充）。
+ */
+#include <string.h>
+
+module std.data.jwt;
+import std.core.types;
+import std.text.str;
+import std.encoding.base64;
+import std.encoding.sha256;
+import std.encoding.sha512;
+
+enum JwtAlg {
+    JWT_ALG_NONE = 0,
+    JWT_ALG_HS256 = 1,
+    JWT_ALG_HS384 = 2,
+    JWT_ALG_HS512 = 3,
+};
+
+struct Jwt {
+    int valid;
+    int alg;
+    Str header;
+    Str payload;
+};
+
+/* 在大写化无关的意义上找子串（头里是 "HS256" 这种） */
+static int jwt_has(const char *hay, int n, const char *needle)
+{
+    int nl = (int)strlen(needle);
+    int i = 0, j = 0;
+
+    for (i = 0; i + nl <= n; i++) {
+        for (j = 0; j < nl; j++)
+            if (hay[i + j] != needle[j])
+                break;
+        if (j == nl)
+            return 1;
+    }
+    return 0;
+}
+
+static int jwt_eq_ct(const u8 *a, const u8 *b, int n)
+{
+    int d = 0, i = 0;
+
+    for (i = 0; i < n; i++)
+        d |= a[i] ^ b[i];
+    return d == 0;
+}
+
+Jwt jwt_verify(const void *token, int n, const void *key, int klen,
+               char *hbuf, int hcap, char *pbuf, int pcap)
+{
+    Jwt j = { 0, 0, { { (char *)0, 0 } }, { { (char *)0, 0 } } };
+    const char *s = (const char *)token;
+    int d1 = -1, d2 = -1, hl = 0, pl = 0, sl = 0, i = 0;
+    u8 mac[64] = { 0 };
+    u8 sig[128] = { 0 };
+    int maclen = 0;
+
+    if (!token || n < 8 || !key || klen < 0 || !hbuf || hcap < 2 || !pbuf
+        || pcap < 2)
+        return j;
+    for (i = 0; i < n; i++) {
+        if (s[i] != '.')
+            continue;
+        if (d1 < 0)
+            d1 = i;
+        else if (d2 < 0) {
+            d2 = i;
+            break;
+        }
+    }
+    if (d1 <= 0 || d2 <= d1 + 1 || d2 >= n - 1)
+        return j;
+    hl = b64url_decode((char[:]){ (char *)s, d1 }, hbuf, hcap - 1);
+    if (hl < 0 || hl == 0)
+        return j;
+    hbuf[hl] = 0;
+    pl = b64url_decode((char[:]){ (char *)(s + d1 + 1), d2 - d1 - 1 }, pbuf,
+                       pcap - 1);
+    if (pl < 0)
+        return j;
+    pbuf[pl] = 0;
+    sl = b64url_decode((char[:]){ (char *)(s + d2 + 1), n - d2 - 1 },
+                       (char *)sig, (int)sizeof sig);
+    if (sl <= 0)
+        return j;
+    if (jwt_has(hbuf, hl, "HS256")) {
+        if (sl != 32)
+            return j;
+        hmac_sha256(key, (usize)klen, s, (usize)d2, mac);
+        maclen = 32;
+        j.alg = JWT_ALG_HS256;
+    } else if (jwt_has(hbuf, hl, "HS384")) {
+        if (sl != 48)
+            return j;
+        hmac_sha384(key, (usize)klen, s, (usize)d2, mac);
+        maclen = 48;
+        j.alg = JWT_ALG_HS384;
+    } else if (jwt_has(hbuf, hl, "HS512")) {
+        if (sl != 64)
+            return j;
+        hmac_sha512(key, (usize)klen, s, (usize)d2, mac);
+        maclen = 64;
+        j.alg = JWT_ALG_HS512;
+    } else {
+        return j;                       /* alg=none / RS256 / ES256：拒绝 */
+    }
+    if (sl != maclen || !jwt_eq_ct(mac, sig, maclen))
+        return j;
+    j.header = (Str){ (char[:]){ hbuf, hl } };
+    j.payload = (Str){ (char[:]){ pbuf, pl } };
+    j.valid = 1;
+    return j;
+}
+
+/* ---- 自测 ---- */
+
+test "HS256 的已知令牌" {
+    char *token =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2"
+        "MjM5MDIyfQ."
+        "XbPfbIHMI6arZ3Y922BhjWgQzWXcXNrz0ogtVhfEd2o";
+    char hdr[256] = { 0 }, pay[512] = { 0 };
+    Jwt j = jwt_verify(token, (int)strlen(token), "secret", 6, hdr,
+                       (int)sizeof hdr, pay, (int)sizeof pay);
+
+    if (!j.valid || j.alg != JWT_ALG_HS256)
+        return err(1, "HS256 令牌应该验签通过");
+    if (!jwt_has(hdr, (int)j.header.s.len, "\"alg\":\"HS256\""))
+        return err(2, "头里的 alg 不对");
+    if (!jwt_has(pay, (int)j.payload.s.len, "\"sub\":\"1234567890\""))
+        return err(3, "载荷里的 sub 不对");
+    /* 换密钥 */
+    if (jwt_verify(token, (int)strlen(token), "Secret", 6, hdr,
+                   (int)sizeof hdr, pay, (int)sizeof pay).valid)
+        return err(4, "错的密钥应该失败");
+    /* 改载荷（签名不变） */
+    {
+        char copy[512] = { 0 };
+
+        memcpy(copy, token, strlen(token) + 1);
+        copy[30] ^= 0x01;
+        if (jwt_verify(copy, (int)strlen(copy), "secret", 6, hdr,
+                       (int)sizeof hdr, pay, (int)sizeof pay).valid)
+            return err(5, "改过的载荷应该失败");
+    }
+    /* 缓冲太小 */
+    if (jwt_verify(token, (int)strlen(token), "secret", 6, hdr, 4, pay,
+                   (int)sizeof pay).valid)
+        return err(6, "头缓冲太小应该失败");
+}
+
+test "HS512、alg 混淆与坏输入" {
+    char *t512 =
+        "eyJhbGciOiJIUzUxMiJ9."
+        "eyJzdWIiOiJhYmMiLCJleHAiOjk5OTk5OTk5OTl9."
+        "zjOyzoBbP07_FCF8vbG940edaueyvguhAn7qM5ZxkGKgl206PGyfjVNCp8VAWQKn"
+        "IweEsq49IlIWRP_DE5eSSQ";
+    char hdr[256] = { 0 }, pay[512] = { 0 };
+    Jwt j = jwt_verify(t512, (int)strlen(t512), "topsecret", 9, hdr,
+                       (int)sizeof hdr, pay, (int)sizeof pay);
+
+    if (!j.valid || j.alg != JWT_ALG_HS512)
+        return err(7, "HS512 令牌应该验签通过");
+    if (!jwt_has(pay, (int)j.payload.s.len, "\"sub\":\"abc\""))
+        return err(8, "HS512 载荷不对");
+    /* HS384 */
+    {
+        char *t384 =
+            "eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJhYmMifQ."
+            "0xojfq-CIVGTuXYMEWVRKVqKYiLBZhcwohiRaSd9CAYVYjeBwLyeRocBvzTce9dz";
+        Jwt j3 = jwt_verify(t384, (int)strlen(t384), "topsecret", 9, hdr,
+                            (int)sizeof hdr, pay, (int)sizeof pay);
+
+        if (!j3.valid || j3.alg != JWT_ALG_HS384)
+            return err(15, "HS384 令牌应该验签通过");
+        if (!jwt_has(pay, (int)j3.payload.s.len, "\"sub\":\"abc\""))
+            return err(16, "HS384 载荷不对");
+    }
+    /* alg=none 拒绝 */
+    {
+        char *none =
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.";
+
+        if (jwt_verify(none, (int)strlen(none), "k", 1, hdr,
+                       (int)sizeof hdr, pay, (int)sizeof pay).valid)
+            return err(9, "alg=none 应该拒绝");
+    }
+    /* 头/载荷是坏 Base64URL */
+    {
+        char *bad = "!!!.eyJzdWIiOiJ4In0.abc";
+
+        if (jwt_verify(bad, (int)strlen(bad), "k", 1, hdr, (int)sizeof hdr,
+                       pay, (int)sizeof pay).valid)
+            return err(10, "坏 Base64URL 应该失败");
+    }
+    /* 段数不对 */
+    if (jwt_verify("abc", 3, "k", 1, hdr, (int)sizeof hdr, pay,
+                   (int)sizeof pay).valid)
+        return err(11, "单段输入应该失败");
+    if (jwt_verify("a.b", 3, "k", 1, hdr, (int)sizeof hdr, pay,
+                   (int)sizeof pay).valid)
+        return err(12, "两段输入应该失败");
+    /* 空指针 */
+    if (jwt_verify(0, 10, "k", 1, hdr, (int)sizeof hdr, pay,
+                   (int)sizeof pay).valid
+        || jwt_verify("a.b.c", 5, 0, 0, hdr, (int)sizeof hdr, pay,
+                      (int)sizeof pay).valid)
+        return err(13, "空指针应该失败");
+    /* 签名长度与 alg 不匹配：HS256 头 + 64 字节签名 */
+    {
+        char *mix =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0."
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        if (jwt_verify(mix, (int)strlen(mix), "k", 1, hdr, (int)sizeof hdr,
+                       pay, (int)sizeof pay).valid)
+            return err(14, "签名长度不匹配应该失败");
+    }
+}

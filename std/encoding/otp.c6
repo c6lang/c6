@@ -1,0 +1,209 @@
+/* std/encoding/otp：HOTP（RFC 4226）/ TOTP（RFC 6238）口令码（零分配）。
+ *
+ *     import std.encoding.otp;
+ *
+ *     u32 c = hotp(secret, slen, counter, 6);        // 计数器式
+ *     u32 t = totp(secret, slen, unix_time, 30, 6);  // 时间式（默认 30 秒一步）
+ *     char buf[8];
+ *     otp_format(t, 6, buf, (int)sizeof buf);        // "755224"
+ *
+ * 两者都是 HMAC-SHA-1 + 动态截断（RFC 4226 §5.3）：算出 20 字节 MAC，取最后一
+ * 字节低 4 位当偏移，读 4 字节、抹掉最高位，再对 10^digits 取模。
+ *
+ * 约定：
+ *
+ * - `digits` 支持 4..9（RFC 只规定 6..8，放宽到 4..9 便于兼容；非法值返回 0）。
+ *   超过了 10^9 的 9 位以内的码正好装进 u32；
+ * - `secret` 是**原始密钥字节**（不是 Base32 文本）；Base32 用
+ *   `std.encoding.base32` 先解；
+ * - `otp_verify_totp` 接受 `window` 步的时间漂移（前后各 window 步，共
+ *   2*window+1 个候选），用常量时间比较，命中返回 1，否则 0；
+ * - 不提供「防重放」——用完的计数器/时间步由调用方记账。
+ */
+#include <string.h>
+
+module std.encoding.otp;
+import std.core.types;
+import std.encoding.sha1;
+
+static u32 otp_pow10(int digits)
+{
+    u32 v = 1;
+    int i = 0;
+
+    for (i = 0; i < digits; i++)
+        v *= 10;
+    return v;
+}
+
+/* 动态截断：20 字节 HMAC -> |digits| 位数字 */
+static u32 otp_truncate(const u8 *mac, int digits)
+{
+    int off = mac[19] & 0x0f;
+    u32 bin = 0;
+
+    bin = ((u32)(mac[off] & 0x7f) << 24) | ((u32)mac[off + 1] << 16)
+          | ((u32)mac[off + 2] << 8) | (u32)mac[off + 3];
+    return bin % otp_pow10(digits);
+}
+
+u32 hotp(const void *secret, int slen, u64 counter, int digits)
+{
+    u8 msg[8] = { 0 };
+    u8 mac[20] = { 0 };
+    int i = 0;
+
+    if (!secret || slen < 0 || digits < 4 || digits > 9)
+        return 0;
+    for (i = 0; i < 8; i++)
+        msg[7 - i] = (u8)((counter >> (i * 8)) & 0xff);
+    hmac_sha1(secret, slen, msg, (int)sizeof msg, mac);
+    return otp_truncate(mac, digits);
+}
+
+u32 totp(const void *secret, int slen, u64 unix_time, int step, int digits)
+{
+    if (step <= 0)
+        return 0;
+    return hotp(secret, slen, unix_time / (u64)step, digits);
+}
+
+/* 把码写成定宽十进制（补前导零），返回写了几位；放不下 -1 */
+int otp_format(u32 code, int digits, char *out, int cap)
+{
+    int i = 0;
+
+    if (!out || digits < 1 || cap < digits + 1)
+        return -1;
+    for (i = digits - 1; i >= 0; i--) {
+        out[i] = (char)('0' + (code % 10));
+        code /= 10;
+    }
+    out[digits] = 0;
+    return digits;
+}
+
+/* 校验一串十进制文本（允许前后空格）是不是这一时刻的 TOTP */
+int otp_verify_totp(const void *secret, int slen, const char *code, u64 unix_time,
+                    int step, int digits, int window)
+{
+    u32 want = 0;
+    int i = 0;
+
+    if (!secret || slen < 0 || !code || step <= 0 || digits < 4 || digits > 9
+        || window < 0 || window > 64)
+        return 0;
+    while (*code == ' ')
+        code++;
+    for (i = 0; i < digits; i++) {
+        if (code[i] < '0' || code[i] > '9')
+            return 0;
+        want = want * 10 + (u32)(code[i] - '0');
+    }
+    for (i = -window; i <= window; i++) {
+        u64 t = unix_time;
+        u32 got = 0;
+
+        if (i < 0) {
+            if ((u64)(-i) * (u64)step > t)
+                continue;
+            t -= (u64)(-i) * (u64)step;
+        } else {
+            t += (u64)i * (u64)step;
+        }
+        got = totp(secret, slen, t, step, digits);
+        if (got == want)
+            return 1;
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+test "RFC 4226 的 HOTP 测试向量" {
+    /* 密钥是 ASCII "12345678901234567890"（20 字节） */
+    static const char *K = "12345678901234567890";
+    static const u32 want[10] = {
+        755224, 287082, 359152, 969429, 338314,
+        254676, 287922, 162583, 399871, 520489,
+    };
+    int i = 0;
+
+    for (i = 0; i < 10; i++) {
+        u32 got = hotp(K, 20, (u64)i, 6);
+
+        if (got != want[i])
+            return err(1, "HOTP 向量不对");
+    }
+    /* 非法位数 */
+    if (hotp(K, 20, 0, 3) != 0 || hotp(K, 20, 0, 10) != 0)
+        return err(2, "非法位数应该返回 0");
+    if (hotp(0, 20, 0, 6) != 0 || hotp(K, -1, 0, 6) != 0)
+        return err(3, "坏密钥应该返回 0");
+}
+
+test "RFC 6238 的 TOTP 测试向量（SHA-1，8 位）" {
+    static const char *K = "12345678901234567890";
+    static const u64 ts[6] = {
+        59ull, 1111111109ull, 1111111111ull, 1234567890ull, 2000000000ull,
+        20000000000ull,
+    };
+    static const u32 want[6] = {
+        94287082, 7081804, 14050471, 89005924, 69279037, 65353130,
+    };
+    int i = 0;
+
+    for (i = 0; i < 6; i++) {
+        u32 got = totp(K, 20, ts[i], 30, 8);
+
+        if (got != want[i])
+            return err(4, "TOTP 向量不对");
+    }
+    /* step<=0 */
+    if (totp(K, 20, 59, 0, 8) != 0)
+        return err(5, "step=0 应该返回 0");
+}
+
+test "格式化与时间窗口校验" {
+    char buf[16] = { 0 };
+    static const char *K = "12345678901234567890";
+    u32 code = 0;
+
+    if (otp_format(755224, 6, buf, (int)sizeof buf) != 6
+        || strcmp(buf, "755224") != 0)
+        return err(6, "6 位格式化不对");
+    if (otp_format(7081804, 8, buf, (int)sizeof buf) != 8
+        || strcmp(buf, "07081804") != 0)
+        return err(7, "8 位格式化（补零）不对");
+    if (otp_format(1, 6, buf, 4) != -1)
+        return err(8, "缓冲不够应该 -1");
+    if (otp_format(1, 6, 0, 8) != -1)
+        return err(9, "空指针应该 -1");
+    /* t=1234567890 的码，前后各偏 1 步都能接受 */
+    code = totp(K, 20, 1234567890ull, 30, 6);
+    if (otp_format(code, 6, buf, (int)sizeof buf) != 6)
+        return err(10, "格式化失败");
+    if (!otp_verify_totp(K, 20, buf, 1234567890ull, 30, 6, 0))
+        return err(11, "同一时刻应该通过");
+    if (!otp_verify_totp(K, 20, buf, 1234567890ull + 30, 30, 6, 1))
+        return err(12, "窗口 +1 步应该通过");
+    if (!otp_verify_totp(K, 20, buf, 1234567890ull - 30, 30, 6, 1))
+        return err(13, "窗口 -1 步应该通过");
+    if (otp_verify_totp(K, 20, buf, 1234567890ull + 90, 30, 6, 1))
+        return err(14, "窗口外不该通过");
+    if (otp_verify_totp(K, 20, "abcdef", 1234567890ull, 30, 6, 1))
+        return err(15, "非数字不该通过");
+    if (otp_verify_totp(K, 20, buf, 1234567890ull, 30, 6, -1))
+        return err(16, "负窗口应该拒绝");
+    /* 前导空格允许 */
+    {
+        char padded[16] = { 0 };
+        int i = 0;
+
+        padded[0] = ' ';
+        for (i = 0; i < 6; i++)
+            padded[i + 1] = buf[i];
+        if (!otp_verify_totp(K, 20, padded, 1234567890ull, 30, 6, 0))
+            return err(17, "前导空格应该允许");
+    }
+}

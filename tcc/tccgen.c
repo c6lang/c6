@@ -12838,6 +12838,10 @@ static const struct C6ErrStdSlot {
     { "std.data.tga",           C6_ERR_SLOT_STD + 130 },
     { "std.data.qoi",           C6_ERR_SLOT_STD + 131 },
     { "std.data.pnm",           C6_ERR_SLOT_STD + 132 },
+    { "std.encoding.asn1",      C6_ERR_SLOT_STD + 133 },
+    { "std.data.x509",          C6_ERR_SLOT_STD + 134 },
+    { "std.data.jwt",           C6_ERR_SLOT_STD + 135 },
+    { "std.encoding.otp",       C6_ERR_SLOT_STD + 136 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

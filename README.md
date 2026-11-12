@@ -240,7 +240,7 @@ std/os/                     操作系统：流、文件系统与目录树、路�
   std/os/lock.c6            std.os.lock            文件建议锁（fcntl）：lock_open、FileLock 的 acquire(exclusive, wait_ms)/try_acquire/release/is_held/close_file；wait_ms<0 阻塞、0 只试一次、>0 重试到超时，整文件锁按进程合并
   std/os/mmap.c6            std.os.mmap            文件/匿名映射：map_file(path, writable)（可写 MAP_SHARED、只读 MAP_PRIVATE，空文件是坏映射）、map_anon（清零）、Map 的 data/size/sync/read_at/write_at/unmap；read_at/write_at 带边界检查
 
-std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump、DER/ASN.1、HOTP/TOTP
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
@@ -255,7 +255,7 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/sha1.c6      std.encoding.sha1      SHA-1 与 HMAC-SHA1：流式 init/update/final、一次性 sha1/sha1_hex、hmac_sha1/hmac_sha1_hex、常数时间 sha1_eq（协议互操作：WebSocket 握手、git 对象名、HTTP Digest；抗碰撞请用 sha256）
   std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
   std/encoding/md5.c6       std.encoding.md5       MD5（RFC 1321）：Md5 的 init/update/final、一次性 md5/md5_hex、常数时间 md5_eq；只用于校验和/兼容格式（碰撞是分钟级的）
-  std/encoding/sha512.c6    std.encoding.sha512    SHA-512/SHA-384 与 HMAC-SHA-512：init/init384/update/final（128 位长度）、sha512/sha384/*_hex、hmac_sha512(_hex)、常数时间 sha512_eq
+  std/encoding/sha512.c6    std.encoding.sha512    SHA-512/SHA-384 与 HMAC-SHA-512：init/init384/update/final（128 位长度）、sha512/sha384/*_hex、hmac_sha384/hmac_sha512(_hex)、常数时间 sha512_eq
   std/encoding/hkdf.c6      std.encoding.hkdf      HKDF（RFC 5869）：hkdf_extract/hkdf_expand/hkdf 一步版；空 salt 按 32 个零字节、输出上限 8160 字节
   std/encoding/pbkdf2.c6    std.encoding.pbkdf2    PBKDF2-HMAC-SHA-1/SHA-256（RFC 6070/8018）：pbkdf2_sha1/pbkdf2_sha256，iters<=0 与空输出直接拒绝，输出长度不限
   std/encoding/aes.c6       std.encoding.aes       AES（FIPS 197）：aes_key(16/24/32)、Aes 的 encrypt_block/decrypt_block/ctr_xor（10/12/14 轮，CTR 按 16 字节大端计数器递增）
@@ -266,10 +266,12 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/zlib.c6      std.encoding.zlib      zlib 容器：adler32/adler32_update、zlib_compress（78 01 头 + DEFLATE + Adler-32）、zlib_decompress（校验头与尾）、zlib_bound
   std/encoding/gzip.c6      std.encoding.gzip      gzip 容器：gzip_crc32、gzip_compress(...,mtime)、gzip_decompress（跳过 FEXTRA/FNAME/FCOMMENT/FHCRC 并校验 CRC-32/ISIZE）、gzip_bound
   std/encoding/tar.c6       std.encoding.tar       tar（ustar）：tar_reader + next（checksum/prefix 拼接/数据视图）、tar_writer + add_file/add_dir/finish（八进制字段、512 对齐、两个零块）
+  std/encoding/asn1.c6      std.encoding.asn1      DER/ASN.1 读取器：asn1/asn1_sub + next/peek 切 Asn1Tag（多字节 tag、0x81..0x84 长度、拒绝不定长/越界）、asn1_int/asn1_oid/asn1_bits/asn1_time/asn1_string
+  std/encoding/otp.c6       std.encoding.otp       HOTP（RFC 4226）/TOTP（RFC 6238）：hotp/totp/otp_format、otp_verify_totp（前后各 window 步）；HMAC-SHA-1 动态截断，位数 4..9
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
-std/data/                   数据格式：JSON、CSV、INI、.properties/.env、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM
+std/data/                   数据格式：JSON、CSV、INI、.properties/.env、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM、X.509 证书、JWT
   std/data/csv.c6           std.data.csv           RFC 4180 CSV：零分配 CsvReader（引号/跨行/CRLF）+ csv_write_row
   std/data/ini.c6           std.data.ini           INI 配置的零分配读取：ini_open/next（字段都是输入上的视图）、ini_lookup/ini_has_section/ini_count、IniEntry.section/key/value/line；语法错误给行号
   std/data/json.c6          std.data.json          JSON 解析与写出：Arena 上的 DOM（a.json_parse）、Json 的 get/at、write/write_pretty/escape（数字保留原文）
@@ -289,6 +291,8 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/tga.c6           std.data.tga           TGA 解码：类型 2/10（未压缩/RLE）真彩、24/32 位、四种原点；BGR(A)→RGBA8888
   std/data/qoi.c6           std.data.qoi           QOI 解码与编码：qoi_decode（INDEX/DIFF/LUMA/RUN/RGB/RGBA）、qoi_encode（RUN/INDEX/RGB/RGBA），RGBA8888
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
+  std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
+  std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
 
 std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
@@ -354,6 +358,7 @@ make std-calc    # 编译并运行 examples/stdcalc.c6（第二十七批数值�
 make std-arch    # 编译并运行 examples/stdarch.c6（第二十八批压缩与归档模块的拼装示例）
 make std-bin     # 编译并运行 examples/stdbin.c6（第二十九批二进制文件格式模块的拼装示例）
 make std-img     # 编译并运行 examples/stdimg.c6（第三十批图像解码模块的拼装示例）
+make std-enc     # 编译并运行 examples/stdenc.c6（第三十一批编码与凭据模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

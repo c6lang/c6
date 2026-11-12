@@ -1,0 +1,410 @@
+/* std/data/x509：X.509 v3 证书解析（零分配，只读）。
+ *
+ *     import std.data.x509;
+ *
+ *     X509Cert c = x509_parse(der, n);
+ *     if (c.valid) {
+ *         // c.subject.common_name / c.issuer.org / c.not_after[0..5]
+ *         // c.sig_alg（点分 OID）/ c.key_bits / c.sig_len
+ *     }
+ *
+ * 走 `std.encoding.asn1` 的 DER 读取器，把 Certificate 拆成
+ * `tbsCertificate` + `signatureAlgorithm` + `signatureValue`，再从
+ * `tbsCertificate` 里取版本、序列号、签名算法、颁发者/主题（CN/O/C）、
+ * 有效期、SubjectPublicKeyInfo 和公钥位数。
+ *
+ * 约定：
+ *
+ * - 只**解析**，不验证签名/链/有效期（验证是 `std.encoding.rsa` 或调用方的事）；
+ * - `valid=0` 表示结构不对（不是 SEQUENCE、字段缺失、越界、名字过长）；
+ * - `serial` 是十六进制字符串（大写，最多 64 字符），保留前导零之外的原样字节；
+ * - `not_before`/`not_after` 是 {年,月,日,时,分,秒}（UTC），UTCTime 的两位年份
+ *   按 RFC 5280 的 1950/2050 分界展开；
+ * - `spki`/`sig` 是指向输入缓冲的视图（`sig` 已跳过 BIT STRING 的 unused 字节）；
+ * - 名字只取 CN/O/C 三个常见字段，其余 RDN 跳过（不报错）；
+ * - 不处理 PEM（用 `std.data.pem` 先解 Base64）。
+ */
+#include <string.h>
+
+module std.data.x509;
+import std.core.types;
+import std.text.str;
+import std.encoding.asn1;
+
+struct X509Name {
+    char common_name[128];
+    char org[128];
+    char country[16];
+};
+
+struct X509Cert {
+    int valid;
+    int version;
+    char serial[80];
+    char sig_alg[64];
+    X509Name issuer;
+    X509Name subject;
+    int not_before[6];
+    int not_after[6];
+    const u8 *spki;
+    int spki_len;
+    int key_bits;
+    const u8 *sig;
+    int sig_len;
+};
+
+static X509Cert x509_bad(void)
+{
+    X509Cert c = { 0 };
+
+    return c;
+}
+
+static void x509_copy(char *dst, int cap, Str s)
+{
+    int n = s.s.len;
+
+    if (n < 0)
+        n = 0;
+    if (n > cap - 1)
+        n = cap - 1;
+    if (n > 0)
+        memcpy(dst, s.s.data, (size_t)n);
+    dst[n] = 0;
+}
+
+/* 序列号 INTEGER -> 大写十六进制（去掉多余的 0x00 前导） */
+static int x509_serial(Asn1 *r, Asn1Tag *t, char *out, int cap)
+{
+    const u8 *p = 0;
+    int i = 0, n = 0;
+
+    if (!r || !t || t->off + t->len > r->len || t->len <= 0)
+        return -1;
+    p = r->p + t->off;
+    i = 0;
+    while (i < t->len - 1 && p[i] == 0)
+        i++;
+    for (; i < t->len; i++) {
+        if (n + 2 >= cap)
+            return -1;
+        out[n++] = "0123456789ABCDEF"[(p[i] >> 4) & 0xf];
+        out[n++] = "0123456789ABCDEF"[p[i] & 0xf];
+    }
+    out[n] = 0;
+    return n;
+}
+
+/* Name ::= SEQ OF SET OF SEQ { OID, value } */
+static int x509_name(Asn1 *cert, Asn1Tag *t, X509Name *out)
+{
+    Asn1 name = asn1_sub(cert, t);
+    Asn1Tag set = { 0 };
+
+    memset(out, 0, sizeof *out);
+    if (t->tag != ASN1_SEQUENCE)
+        return -1;
+    while (name.next(&set) == 1) {
+        Asn1 s = asn1_sub(&name, &set);
+        Asn1Tag atv = { 0 };
+
+        if (set.tag != ASN1_SET)
+            return -1;
+        while (s.next(&atv) == 1) {
+            Asn1 a = asn1_sub(&s, &atv);
+            Asn1Tag oid = { 0 }, val = { 0 };
+            char o[64] = { 0 };
+
+            if (atv.tag != ASN1_SEQUENCE)
+                return -1;
+            if (a.next(&oid) != 1 || a.next(&val) != 1)
+                return -1;
+            if (asn1_oid(&a, &oid, o, (int)sizeof o) < 0)
+                continue;
+            if (strcmp(o, "2.5.4.3") == 0)
+                x509_copy(out->common_name, (int)sizeof out->common_name,
+                          asn1_string(&a, &val));
+            else if (strcmp(o, "2.5.4.10") == 0)
+                x509_copy(out->org, (int)sizeof out->org,
+                          asn1_string(&a, &val));
+            else if (strcmp(o, "2.5.4.6") == 0)
+                x509_copy(out->country, (int)sizeof out->country,
+                          asn1_string(&a, &val));
+        }
+    }
+    return name.bad ? -1 : 0;
+}
+
+/* 从 SubjectPublicKeyInfo 里取 RSA 模数位数（取不到就给 0，不算错） */
+static int x509_key_bits(Asn1 *cert, Asn1Tag *t)
+{
+    Asn1 spki = asn1_sub(cert, t);
+    Asn1Tag alg = { 0 }, bits = { 0 };
+    const u8 *p = 0;
+    int nbits = 0;
+
+    if (spki.next(&alg) != 1 || spki.next(&bits) != 1)
+        return 0;
+    if (asn1_bits(&spki, &bits, &p, &nbits) != 0 || nbits <= 0)
+        return 0;
+    {
+        /* BIT STRING 里是 RSAPublicKey ::= SEQ { INTEGER n, INTEGER e } */
+        Asn1 rsa = asn1(p, nbits / 8);
+        Asn1Tag seq = { 0 }, mod = { 0 };
+
+        if (rsa.next(&seq) != 1 || seq.tag != ASN1_SEQUENCE)
+            return 0;
+        {
+            Asn1 body = asn1_sub(&rsa, &seq);
+
+            if (body.next(&mod) != 1 || mod.tag != ASN1_INTEGER)
+                return 0;
+            {
+                const u8 *m = body.p + mod.off;
+                int i = 0, bytes = mod.len;
+
+                while (i < bytes - 1 && m[i] == 0)
+                    i++;
+                if (i < bytes && m[i] == 0)
+                    return 0;
+                return (bytes - i) * 8;
+            }
+        }
+    }
+}
+
+X509Cert x509_parse(const void *der, int n)
+{
+    X509Cert c = { 0 };
+    Asn1 r = asn1(der, n);
+    Asn1Tag t = { 0 }, tbs = { 0 };
+    Asn1 body = { 0 };
+
+    if (!der || n <= 0)
+        return x509_bad();
+    if (r.next(&t) != 1 || t.tag != ASN1_SEQUENCE || !t.constructed)
+        return x509_bad();
+    {
+        Asn1 cert = asn1_sub(&r, &t);
+
+        if (cert.next(&tbs) != 1 || tbs.tag != ASN1_SEQUENCE)
+            return x509_bad();
+        body = asn1_sub(&cert, &tbs);
+        c.version = 1;
+        {
+            Asn1Tag p = { 0 };
+
+            if (body.peek(&p) == 1 && p.cls == ASN1_CONTEXT && p.tag == 0) {
+                Asn1 v = { 0 };
+                Asn1Tag vt = { 0 }, vi = { 0 };
+                i64 ver = 0;
+
+                if (body.next(&p) != 1)
+                    return x509_bad();
+                v = asn1_sub(&body, &p);
+                if (v.next(&vt) != 1 || vt.tag != ASN1_INTEGER)
+                    return x509_bad();
+                if (asn1_int(&v, &vt, &ver) != 0)
+                    return x509_bad();
+                c.version = (int)ver + 1;
+            }
+        }
+        /* serialNumber */
+        if (body.next(&t) != 1 || t.tag != ASN1_INTEGER)
+            return x509_bad();
+        if (x509_serial(&body, &t, c.serial, (int)sizeof c.serial) < 0)
+            return x509_bad();
+        /* signature AlgorithmIdentifier（tbs 里的这一份） */
+        {
+            Asn1Tag alg = { 0 };
+
+            if (body.next(&alg) != 1 || alg.tag != ASN1_SEQUENCE)
+                return x509_bad();
+            {
+                Asn1 a = asn1_sub(&body, &alg);
+                Asn1Tag oid = { 0 };
+
+                if (a.next(&oid) != 1 || oid.tag != ASN1_OID)
+                    return x509_bad();
+                if (asn1_oid(&a, &oid, c.sig_alg, (int)sizeof c.sig_alg) < 0)
+                    return x509_bad();
+            }
+        }
+        /* issuer */
+        if (body.next(&t) != 1 || x509_name(&body, &t, &c.issuer) != 0)
+            return x509_bad();
+        /* validity */
+        {
+            Asn1Tag val = { 0 };
+            Asn1 v = { 0 };
+            Asn1Tag nb = { 0 }, na = { 0 };
+
+            if (body.next(&val) != 1 || val.tag != ASN1_SEQUENCE)
+                return x509_bad();
+            v = asn1_sub(&body, &val);
+            if (v.next(&nb) != 1 || v.next(&na) != 1)
+                return x509_bad();
+            if (asn1_time(&v, &nb, c.not_before) != 0
+                || asn1_time(&v, &na, c.not_after) != 0)
+                return x509_bad();
+        }
+        /* subject */
+        if (body.next(&t) != 1 || x509_name(&body, &t, &c.subject) != 0)
+            return x509_bad();
+        /* subjectPublicKeyInfo */
+        if (body.next(&t) != 1 || t.tag != ASN1_SEQUENCE)
+            return x509_bad();
+        c.spki = body.p + t.off;
+        c.spki_len = t.len;
+        c.key_bits = x509_key_bits(&body, &t);
+        /* 外层：signatureAlgorithm + signatureValue */
+        {
+            Asn1Tag alg = { 0 }, sv = { 0 };
+            Asn1 a = { 0 };
+
+            if (cert.next(&alg) != 1 || alg.tag != ASN1_SEQUENCE)
+                return x509_bad();
+            a = asn1_sub(&cert, &alg);
+            if (a.next(&sv) != 1 || sv.tag != ASN1_OID)
+                return x509_bad();
+            if (cert.next(&sv) != 1 || sv.tag != ASN1_BIT_STRING)
+                return x509_bad();
+            {
+                const u8 *p = 0;
+                int nbits = 0;
+
+                if (asn1_bits(&cert, &sv, &p, &nbits) != 0)
+                    return x509_bad();
+                c.sig = p;
+                c.sig_len = nbits / 8;
+            }
+        }
+    }
+    if (body.bad)
+        return x509_bad();
+    c.valid = 1;
+    return c;
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* openssl req -x509 -newkey rsa:2048 -subj "/C=CN/O=SuperC/CN=example.test"
+   -set_serial 4242 -days 3650 生成的 DER（829 字节） */
+static const char *CERT_DER =
+    "3082033930820221a00302010202021092300d06092a864886f70d01010b0500"
+    "3035310b300906035504061302434e310f300d060355040a0c06537570657243"
+    "3115301306035504030c0c6578616d706c652e74657374301e170d3236313131"
+    "323135323331345a170d3336313130393135323331345a3035310b3009060355"
+    "04061302434e310f300d060355040a0c06537570657243311530130603550403"
+    "0c0c6578616d706c652e7465737430820122300d06092a864886f70d01010105"
+    "000382010f003082010a0282010100b2414e0a4ad885526efbf8ebf3d54a09fa"
+    "12a714daae55cc8af8c1824c0ee80cef182a7d7043c529301f066daaf5feab41"
+    "f54477cd6d4019f9b5646ee23e00ea6a006d080daa4261b355d1a65f13f7b448"
+    "e81748d392d49816f720ade6c0b6227e5c4bf07c78441bfdf8505488ce9494dd"
+    "0071c2ce7a9ab46cf27acb81b124fe8e07a314ce1f14e92ce2c68e8db45eef2f"
+    "6be84715719518e7a2dccece7750abf42278f57044080d76043edcd56f40d98f"
+    "db3db7915da395187f63977f330dfdf4bd2750588a3741e8a73293aab68338c1"
+    "fa69ccdb4d1f59634cb47fca9065ee70014fd0f1d0bf2340267138845f2ec028"
+    "960b2c6382f3c551ab7d8969d3429d0203010001a3533051301d0603551d0e04"
+    "1604140ebd2bd1ee0946cd1fedebd16406193a61448226301f0603551d230418"
+    "301680140ebd2bd1ee0946cd1fedebd16406193a61448226300f0603551d1301"
+    "01ff040530030101ff300d06092a864886f70d01010b050003820101001aca9a"
+    "3633288f2b2d491bf7f2c50cbb353a802856f84be460384bf129ba59ab32e0d5"
+    "89a44e6dabd2252d32826eb699814d36a580835afbae7d09710a24eae1df8060"
+    "b5517cb3519790d6ec9d001567855b1562e649d6d8bc97b887312704ff671111"
+    "82c1c79e57ac0ef7bc49d4961e079c5c0b114b9b53b2b122c1299554a6a3d0bc"
+    "b9fc2279479ee0d9a93943df5ea751a0ef5a2eeb9749a518555f1476b3afac53"
+    "ad75cb29905d6f440ef25e2417c8ec59025a9b911d3e1f3b539b993cee59393a"
+    "05d2e279e848fca9ac369d91811109271bc1671382e7ee2f774ed4f68245d5e3"
+    "bf930904fc4722cbeeafa6d2363773405f7f17a3a560d87ae7b11e5bff";
+
+test "自签证书的字段" {
+    u8 der[1024] = { 0 };
+    int n = unhex(CERT_DER, der, (int)sizeof der);
+    X509Cert c = x509_parse(der, n);
+
+    if (!c.valid)
+        return err(1, "证书应该能解析");
+    if (c.version != 3)
+        return err(2, "版本应该是 v3");
+    if (strcmp(c.serial, "1092") != 0)
+        return err(3, "序列号不对");
+    if (strcmp(c.sig_alg, "1.2.840.113549.1.1.11") != 0)
+        return err(4, "签名算法应该是 sha256WithRSAEncryption");
+    if (strcmp(c.subject.common_name, "example.test") != 0)
+        return err(5, "subject CN 不对");
+    if (strcmp(c.subject.org, "SuperC") != 0)
+        return err(6, "subject O 不对");
+    if (strcmp(c.subject.country, "CN") != 0)
+        return err(7, "subject C 不对");
+    if (strcmp(c.issuer.common_name, "example.test") != 0)
+        return err(8, "issuer CN 不对");
+    if (c.not_before[0] != 2026 || c.not_before[1] != 11
+        || c.not_before[2] != 12)
+        return err(9, "notBefore 日期不对");
+    if (c.not_after[0] != 2036 || c.not_after[1] != 11
+        || c.not_after[2] != 9)
+        return err(10, "notAfter 日期不对");
+    if (c.key_bits != 2048)
+        return err(11, "公钥位数应该是 2048");
+    if (c.sig_len != 256)
+        return err(12, "签名长度应该是 256 字节");
+    if (c.spki_len <= 0 || c.sig_len <= 0)
+        return err(13, "SPKI/签名的视图不对");
+}
+
+test "坏证书与边界" {
+    u8 der[1024] = { 0 };
+    int n = unhex(CERT_DER, der, (int)sizeof der);
+
+    /* 截断 */
+    if (x509_parse(der, n - 1).valid)
+        return err(14, "少一个字节不该有效");
+    if (x509_parse(der, 40).valid)
+        return err(15, "只有头不该有效");
+    /* 外层 tag 不是 SEQUENCE */
+    {
+        u8 bad[1024] = { 0 };
+
+        memcpy(bad, der, (size_t)n);
+        bad[0] = 0x31;
+        if (x509_parse(bad, n).valid)
+            return err(16, "外层不是 SEQUENCE 不该有效");
+    }
+    /* 把 serial 的 tag 改坏 */
+    {
+        u8 bad[1024] = { 0 };
+
+        memcpy(bad, der, (size_t)n);
+        bad[13] = 0x04;         /* 原为 0x02（INTEGER） */
+        if (x509_parse(bad, n).valid)
+            return err(17, "serial tag 坏不该有效");
+    }
+    /* 空指针 / 空输入 */
+    if (x509_parse(0, 100).valid || x509_parse(der, 0).valid)
+        return err(18, "空输入不该有效");
+}

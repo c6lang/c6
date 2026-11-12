@@ -1,0 +1,459 @@
+/* std/encoding/asn1：DER（ASN.1 可辨别编码规则）读取器（零分配）。
+ *
+ *     import std.encoding.asn1;
+ *
+ *     Asn1 r = asn1(der, n);
+ *     Asn1Tag t = { 0 };
+ *     while (r.next(&t) == 1) {
+ *         if (t.cls == ASN1_UNIVERSAL && t.tag == ASN1_SEQUENCE) {
+ *             Asn1 sub = asn1_sub(&r, &t);
+ *             // 进子序列继续读
+ *         }
+ *     }
+ *
+ * 只做**读**：解析 tag（含多字节 tag 号）、长度（短形式 / 0x81..0x84 长形式，
+ * 拒绝不定长 0x80）和内容的边界，内容永远是原缓冲上的视图。值解码是几个
+ * 小助手：INTEGER、OID、BIT STRING、时间、字符串。
+ *
+ * 约定：
+ *
+ * - `next`：1 取到 / 0 读完 / -1 结构坏（截断、长度越界、不定长、tag 号过大）；
+ *   `peek` 同语义但不前进；
+ * - `view` 给内容视图，`asn1_sub` 造一个只在内容里的子读取器；
+ * - `asn1_int` 支持 1..8 字节的有符号二补码；`asn1_oid` 输出点分十进制；
+ *   `asn1_bits` 跳过 unused-bits 字节；`asn1_time` 认 UTCTime(23)/GeneralizedTime(24)
+ *   并归一成 6 个整数；`asn1_string` 给 UTF8String/PrintableString/IA5String 的视图；
+ * - 不校验 DER 的规范性（比如整数最短编码、SET 排序），只保证边界安全。
+ */
+#include <stdio.h>
+#include <string.h>
+
+module std.encoding.asn1;
+import std.core.types;
+import std.text.str;
+
+enum Asn1Class {
+    ASN1_UNIVERSAL = 0,
+    ASN1_APPLICATION = 1,
+    ASN1_CONTEXT = 2,
+    ASN1_PRIVATE = 3,
+};
+
+enum Asn1TagNo {
+    ASN1_BOOLEAN = 1,
+    ASN1_INTEGER = 2,
+    ASN1_BIT_STRING = 3,
+    ASN1_OCTET_STRING = 4,
+    ASN1_NULL = 5,
+    ASN1_OID = 6,
+    ASN1_UTF8STRING = 12,
+    ASN1_SEQUENCE = 16,
+    ASN1_SET = 17,
+    ASN1_PRINTABLESTRING = 19,
+    ASN1_IA5STRING = 22,
+    ASN1_UTCTIME = 23,
+    ASN1_GENERALIZEDTIME = 24,
+};
+
+struct Asn1 {
+    const u8 *p;
+    int len;
+    int pos;
+    int bad;
+};
+
+struct Asn1Tag {
+    int cls;
+    int constructed;
+    int tag;
+    int off;        /* 内容在缓冲里的偏移 */
+    int len;        /* 内容长度 */
+    int hdr;        /* 头长度 */
+};
+
+Asn1 asn1(const void *p, int n)
+{
+    Asn1 r = { (const u8 *)p, n, 0, 0 };
+
+    if ((!p && n > 0) || n < 0)
+        r.bad = 1;
+    return r;
+}
+
+Asn1 asn1_sub(Asn1 *self, Asn1Tag *t)
+{
+    Asn1 r = { 0, 0, 0, 1 };
+
+    if (!self || !t || self->bad || t->off < 0 || t->len < 0
+        || t->off + t->len > self->len)
+        return r;
+    r.p = self->p + t->off;
+    r.len = t->len;
+    r.pos = 0;
+    r.bad = 0;
+    return r;
+}
+
+/* 解析一个 tag（不前进） */
+static int asn1_peek_at(Asn1 *self, Asn1Tag *t)
+{
+    const u8 *p = 0;
+    int pos = 0, b0 = 0, len = 0, nb = 0, i = 0;
+
+    if (!self || !t || self->bad)
+        return -1;
+    if (self->pos >= self->len)
+        return 0;
+    p = self->p;
+    pos = self->pos;
+    b0 = p[pos++];
+    memset(t, 0, sizeof *t);
+    t->cls = b0 >> 6;
+    t->constructed = (b0 >> 5) & 1;
+    t->tag = b0 & 0x1f;
+    if (t->tag == 0x1f) {
+        int v = 0;
+
+        for (i = 0; i < 3; i++) {
+            if (pos >= self->len)
+                goto bad;
+            b0 = p[pos++];
+            v = (v << 7) | (b0 & 0x7f);
+            if (!(b0 & 0x80))
+                break;
+            if (i == 2)
+                goto bad;
+        }
+        t->tag = v;
+    }
+    if (pos >= self->len)
+        goto bad;
+    b0 = p[pos++];
+    if (b0 < 0x80) {
+        len = b0;
+    } else {
+        nb = b0 & 0x7f;
+        if (nb == 0 || nb > 4)
+            goto bad;                   /* 不定长或过长的长度 */
+        if (pos + nb > self->len)
+            goto bad;
+        for (i = 0; i < nb; i++) {
+            len = (len << 8) | p[pos++];
+            if (len < 0)
+                goto bad;
+        }
+    }
+    if (len < 0 || pos + len > self->len)
+        goto bad;
+    t->off = pos;
+    t->len = len;
+    t->hdr = pos - self->pos;
+    return 1;
+bad:
+    self->bad = 1;
+    return -1;
+}
+
+int next(Asn1 *self, Asn1Tag *t)
+{
+    int r = asn1_peek_at(self, t);
+
+    if (r == 1)
+        self->pos = t->off + t->len;
+    return r;
+}
+
+int peek(Asn1 *self, Asn1Tag *t) { return asn1_peek_at(self, t); }
+
+Str view(Asn1 *self, Asn1Tag *t)
+{
+    Str s = { { (char *)0, 0 } };
+
+    if (!self || !t || self->bad || t->off < 0 || t->len < 0
+        || t->off + t->len > self->len)
+        return s;
+    s.s = (char[:]){ (char *)self->p + t->off, t->len };
+    return s;
+}
+
+/* INTEGER -> i64（1..8 字节，二补码） */
+int asn1_int(Asn1 *self, Asn1Tag *t, i64 *out)
+{
+    const u8 *p = 0;
+    i64 v = 0;
+    int i = 0;
+
+    if (!self || !t || !out || t->len < 1 || t->len > 8
+        || t->off + t->len > self->len)
+        return -1;
+    p = self->p + t->off;
+    v = (p[0] & 0x80) ? -1 : 0;
+    for (i = 0; i < t->len; i++)
+        v = (v << 8) | (i64)p[i];
+    *out = v;
+    return 0;
+}
+
+/* OID -> 点分十进制；返回长度，放不下/-1 失败 */
+int asn1_oid(Asn1 *self, Asn1Tag *t, char *buf, int cap)
+{
+    const u8 *p = 0;
+    int i = 0, n = 0, first = 0;
+    u64 v = 0;
+
+    if (!self || !t || !buf || cap < 4 || t->len < 1
+        || t->off + t->len > self->len)
+        return -1;
+    p = self->p + t->off;
+    first = p[0];
+    n = 0;
+    {
+        int a = first / 40, b = first % 40;
+
+        if (a > 2) {
+            a = 2;
+            b = first - 80;
+        }
+        n += (int)((u32)snprintf(buf + n, (size_t)(cap - n), "%d.%d", a, b));
+    }
+    for (i = 1; i < t->len; i++) {
+        v = (v << 7) | (u64)(p[i] & 0x7f);
+        if (p[i] & 0x80)
+            continue;
+        if (n >= cap - 2)
+            return -1;
+        n += (int)((u32)snprintf(buf + n, (size_t)(cap - n), ".%llu",
+                                 (unsigned long long)v));
+        v = 0;
+    }
+    return n;
+}
+
+/* BIT STRING：跳过 unused-bits 字节，给内容和位数 */
+int asn1_bits(Asn1 *self, Asn1Tag *t, const u8 **out, int *nbits)
+{
+    if (!self || !t || t->len < 1 || t->off + t->len > self->len)
+        return -1;
+    if (out)
+        *out = self->p + t->off + 1;
+    if (nbits)
+        *nbits = (t->len - 1) * 8 - self->p[t->off];
+    return 0;
+}
+
+/* 时间：UTCTime / GeneralizedTime -> {年,月,日,时,分,秒}（UTC） */
+int asn1_time(Asn1 *self, Asn1Tag *t, int out[6])
+{
+    const u8 *p = 0;
+    int i = 0, generalized = 0;
+
+    if (!self || !t || !out || t->off + t->len > self->len)
+        return -1;
+    generalized = (t->tag == ASN1_GENERALIZEDTIME);
+    p = self->p + t->off;
+    if (t->len < (generalized ? 12 : 10))
+        return -1;
+    for (i = 0; i < (generalized ? 12 : 10); i++)
+        if (p[i] < '0' || p[i] > '9')
+            return -1;
+    if (generalized) {
+        out[0] = (p[0] - '0') * 1000 + (p[1] - '0') * 100
+                 + (p[2] - '0') * 10 + (p[3] - '0');
+        p += 4;
+    } else {
+        int yy = (p[0] - '0') * 10 + (p[1] - '0');
+
+        out[0] = (yy < 50) ? 2000 + yy : 1900 + yy;
+        p += 2;
+    }
+    out[1] = (p[0] - '0') * 10 + (p[1] - '0');
+    out[2] = (p[2] - '0') * 10 + (p[3] - '0');
+    out[3] = (p[4] - '0') * 10 + (p[5] - '0');
+    out[4] = (p[6] - '0') * 10 + (p[7] - '0');
+    out[5] = (p[8] - '0') * 10 + (p[9] - '0');
+    return 0;
+}
+
+/* 字符串（UTF8/Printable/IA5）的视图 */
+Str asn1_string(Asn1 *self, Asn1Tag *t)
+{
+    if (!t)
+        return (Str){ { (char *)0, 0 } };
+    if (t->tag != ASN1_UTF8STRING && t->tag != ASN1_PRINTABLESTRING
+        && t->tag != ASN1_IA5STRING)
+        return (Str){ { (char *)0, 0 } };
+    return view(self, t);
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+test "基本类型：INTEGER / OID / BIT STRING / 时间" {
+    /* 30 0b 02 01 05 06 09 ...（SEQUENCE 里塞不下，分开测） */
+    u8 der[128] = { 0 };
+    int n = 0;
+    Asn1 r = { 0 };
+    Asn1Tag t = { 0 };
+    i64 v = 0;
+
+    /* INTEGER 5 */
+    n = unhex("020105", der, (int)sizeof der);
+    r = asn1(der, n);
+    if (r.next(&t) != 1 || t.cls != ASN1_UNIVERSAL || t.tag != ASN1_INTEGER)
+        return err(1, "INTEGER tag 不对");
+    if (asn1_int(&r, &t, &v) != 0 || v != 5)
+        return err(2, "INTEGER 5 解码不对");
+    /* INTEGER -1（0xff） */
+    n = unhex("0201ff", der, (int)sizeof der);
+    r = asn1(der, n);
+    r.next(&t);
+    if (asn1_int(&r, &t, &v) != 0 || v != -1)
+        return err(3, "INTEGER -1 解码不对");
+    /* OID 1.2.840.113549.1.1.11（sha256WithRSAEncryption） */
+    n = unhex("06092a864886f70d01010b", der, (int)sizeof der);
+    r = asn1(der, n);
+    if (r.next(&t) != 1)
+        return err(4, "OID tag 不对");
+    {
+        char oid[64] = { 0 };
+
+        if (asn1_oid(&r, &t, oid, (int)sizeof oid) < 0
+            || strcmp(oid, "1.2.840.113549.1.1.11") != 0)
+            return err(5, "OID 点分十进制不对");
+        /* OID 2.5.4.3（CN） */
+        n = unhex("0603550403", der, (int)sizeof der);
+        r = asn1(der, n);
+        r.next(&t);
+        if (asn1_oid(&r, &t, oid, (int)sizeof oid) < 0
+            || strcmp(oid, "2.5.4.3") != 0)
+            return err(6, "CN 的 OID 不对");
+    }
+    /* BIT STRING：unused=0 + 0xde 0xad */
+    n = unhex("030300dead", der, (int)sizeof der);
+    r = asn1(der, n);
+    r.next(&t);
+    {
+        const u8 *bits = 0;
+        int nbits = 0;
+
+        if (asn1_bits(&r, &t, &bits, &nbits) != 0 || nbits != 16
+            || bits[0] != 0xde || bits[1] != 0xad)
+            return err(7, "BIT STRING 不对");
+    }
+    /* UTCTime 260101000000Z -> 2026-01-01 00:00:00 */
+    n = unhex("170d3236303130313030303030305a", der, (int)sizeof der);
+    r = asn1(der, n);
+    r.next(&t);
+    {
+        int tm[6] = { 0 };
+
+        if (asn1_time(&r, &t, tm) != 0 || tm[0] != 2026 || tm[1] != 1
+            || tm[2] != 1 || tm[3] != 0)
+            return err(8, "UTCTime 不对");
+    }
+    /* GeneralizedTime 20500101123045Z */
+    n = unhex("180f32303530303130313132333034355a", der, (int)sizeof der);
+    r = asn1(der, n);
+    r.next(&t);
+    {
+        int tm[6] = { 0 };
+
+        if (asn1_time(&r, &t, tm) != 0 || tm[0] != 2050 || tm[1] != 1
+            || tm[2] != 1 || tm[3] != 12 || tm[4] != 30 || tm[5] != 45)
+            return err(9, "GeneralizedTime 不对");
+    }
+}
+
+test "嵌套 SEQUENCE、长长度与坏结构" {
+    u8 der[300] = { 0 };
+    Asn1 r = { 0 };
+    Asn1Tag t = { 0 };
+    int n = 0, count = 0;
+
+    /* SEQUENCE { INTEGER 1, UTF8String "hi" }，长度用 0x81 长形式 */
+    n = unhex("3081070201010c026869", der, (int)sizeof der);
+    r = asn1(der, n);
+    if (r.next(&t) != 1 || t.tag != ASN1_SEQUENCE || !t.constructed)
+        return err(10, "外层 SEQUENCE 不对");
+    {
+        Asn1 sub = asn1_sub(&r, &t);
+        Asn1Tag s = { 0 };
+        i64 v = 0;
+
+        if (sub.next(&s) != 1 || asn1_int(&sub, &s, &v) != 0 || v != 1)
+            return err(11, "子序列第一个元素不对");
+        if (sub.next(&s) != 1)
+            return err(12, "子序列第二个元素不对");
+        {
+            Str str = asn1_string(&sub, &s);
+
+            if (str.s.len != 2 || memcmp(str.s.data, "hi", 2) != 0)
+                return err(13, "UTF8String 视图不对");
+        }
+        if (sub.next(&s) != 0)
+            return err(14, "子序列应该读完");
+    }
+    /* 遍历外层：只有一个元素 */
+    r = asn1(der, n);
+    while (r.next(&t) == 1)
+        count++;
+    if (count != 1)
+        return err(15, "外层元素数不对");
+    /* 坏结构：长度越界、不定长、截断 */
+    {
+        u8 bad[16] = { 0 };
+        int m = unhex("3005 020101", bad, (int)sizeof bad);
+
+        if (asn1(bad, m).next(&t) != -1)
+            return err(16, "长度越界应该 -1");
+        m = unhex("3080 020101", bad, (int)sizeof bad);
+        if (asn1(bad, m).next(&t) != -1)
+            return err(17, "不定长应该 -1");
+        m = unhex("02 05 01", bad, (int)sizeof bad);
+        if (asn1(bad, m).next(&t) != -1)
+            return err(18, "内容截断应该 -1");
+        m = unhex("02 85 0102030405", bad, (int)sizeof bad);
+        if (asn1(bad, m).next(&t) != -1)
+            return err(19, "5 字节长度应该 -1");
+    }
+    /* peek 不前进 */
+    {
+        int m = unhex("020105", der, (int)sizeof der);
+        Asn1 pr = asn1(der, m);
+        Asn1Tag p1 = { 0 }, p2 = { 0 };
+
+        if (pr.peek(&p1) != 1 || pr.peek(&p2) != 1)
+            return err(20, "peek 失败");
+        if (p1.off != p2.off || p1.len != p2.len)
+            return err(21, "peek 不该前进");
+        if (pr.next(&p2) != 1 || pr.next(&p2) != 0)
+            return err(22, "peek 之后 next 应该还能读到同一个元素");
+    }
+    if (asn1(0, 4).bad == 0 || asn1(der, -1).bad == 0)
+        return err(23, "坏参数应该 bad");
+    if (next(0, &t) != -1 || peek(0, &t) != -1)
+        return err(24, "空 reader 应该 -1");
+}
