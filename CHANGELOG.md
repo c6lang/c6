@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第五十批（日志与数据库）**：`std.os.log`（定长环形日志，级别过滤）、
+  `std.data.sqlite`（文件头 + B-tree 页 + 单元 + 变长整数）、`std.net.postgres`
+  （v3 报文、启动包、错误字段）、`std.net.mysql`（报文拆帧、HandshakeV10、
+  长度编码整数、COM_QUERY），集成示例 `examples/stddb.c6`（`make std-db`）。
+  错误号段 `std.os.log`=0x60d1 … `std.net.mysql`=0x60d4（`c6_err_std_slots[]`
+  追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十九批（网络报文）**：`std.net.ntp`（NTPv4 报文与时间戳换算）、
   `std.net.syslog`（RFC 5424 / 3164 解析与构造）、`std.net.stun`（STUN 头/属性/
   XOR-MAPPED-ADDRESS）、`std.net.tftp`（RRQ/WRQ/DATA/ACK/ERROR/OACK），集成示例

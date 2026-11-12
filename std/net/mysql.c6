@@ -1,0 +1,343 @@
+/* std/net/mysql：MySQL 客户端/服务端报文的拆帧、初始握手包与命令构造。
+ *
+ *     import std.net.mysql;
+ *
+ *     MyPacket p = { 0 };
+ *     MyHandshake hs = { 0 };
+ *     if (my_parse(buf, n, 0, &p) == 1 && my_handshake(buf, n, &hs) == 1)
+ *         // hs.protocol / hs.server_version / hs.salt_len
+ *
+ * 报文（packet）是「3 字节小端长度 + 1 字节序号 + 正文」，长度**不含**这 4 字节头。
+ *
+ * 初始握手包（Protocol::HandshakeV10）正文：协议版本（1，值为 10）、服务端版本
+ * （`\0` 结尾）、连接 ID（4 小端）、挑战串前 8 字节、填充 0、能力低 16 位、字符集、
+ * 状态字、能力高 16 位、挑战串长度、10 字节保留、挑战串后段（最多 13 字节）、
+ * 插件名（`\0` 结尾）。
+ *
+ * 约定：
+ *
+ * - `my_parse` 从 `off` 解一个报文，`payload_off` 指向正文；
+ * - `my_handshake` 的 `src` 必须是**报文起点**（含 4 字节头），它内部自己拆帧；
+ * - `salt` 是前 8 字节 + 后段（去掉结尾的 `\0`），最多 20 字节；
+ * - 能力位是低 16 位与高 16 位拼成的 32 位值；
+ * - `my_lenenc` 解长度编码整数（1 字节 < 0xFB；0xFC/0xFD/0xFE 后跟 2/3/8 字节），
+ *   `0xFB` 是 NULL，返回 0 并置 `*is_null`；
+ * - `my_build_query` 生成 `COM_QUERY`（0x03）报文，`my_build_auth` 生成
+ *   `COM_STMT_PREPARE` 之外的认证应答（交给握手后的 `HandshakeResponse41` 的
+ *   简化形式：只有挑战串应答）；
+ * - 不实现协议压缩、SSL 请求与预处理语句的参数绑定。
+ */
+#include <string.h>
+
+module std.net.mysql;
+import std.core.types;
+import std.text.str;
+
+struct MyPacket {
+    int len;
+    int seq;
+    int payload_off;
+    int total;
+};
+
+struct MyHandshake {
+    int protocol;
+    Str server_version;
+    u32 conn_id;
+    u8 salt[20];
+    int salt_len;
+    u32 caps;
+    int charset;
+    int status;
+};
+
+static u32 my_le16(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8);
+}
+
+static u32 my_le24(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16);
+}
+
+static u32 my_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static void my_put24(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+}
+
+int my_parse(const void *src, int n, int off, MyPacket *out)
+{
+    const u8 *p = (const u8 *)src;
+    int len = 0;
+
+    if (!src || !out || off < 0 || off + 4 > n)
+        return -1;
+    len = (int)my_le24(p + off);
+    if (off + 4 + len > n)
+        return -1;
+    out->len = len;
+    out->seq = (int)p[off + 3];
+    out->payload_off = off + 4;
+    out->total = 4 + len;
+    return 1;
+}
+
+int my_handshake(const void *src, int n, MyHandshake *out)
+{
+    const u8 *p = (const u8 *)src;
+    MyPacket pk = { 0 };
+    int i = 0, end = 0, vstart = 0, vlen = 0;
+    int part1 = 0, caps_lo = 0, caps_hi = 0, salt_len = 0;
+
+    if (!src || !out || my_parse(src, n, 0, &pk) != 1)
+        return -1;
+    memset(out, 0, sizeof *out);
+    i = pk.payload_off;
+    end = pk.payload_off + pk.len;
+    if (i >= end)
+        return -1;
+    out->protocol = (int)p[i];
+    if (out->protocol != 10)
+        return -1;
+    i++;
+    vstart = i;
+    while (i < end && p[i] != 0)
+        i++;
+    if (i >= end)
+        return -1;
+    out->server_version.s = (char[:]){ (char *)p + vstart, i - vstart };
+    i++;
+    if (i + 4 + 8 + 1 + 2 + 1 + 2 > end)
+        return -1;
+    out->conn_id = my_le32(p + i);
+    i += 4;
+    part1 = i;
+    i += 8;
+    i++;                                /* 填充 0 */
+    caps_lo = (int)my_le16(p + i);
+    i += 2;
+    out->charset = (int)p[i];
+    i++;
+    out->status = (int)my_le16(p + i);
+    i += 2;
+    if (i + 2 + 1 > end)
+        return -1;
+    caps_hi = (int)my_le16(p + i);
+    i += 2;
+    out->caps = (u32)(caps_lo | (caps_hi << 16));
+    salt_len = (int)p[i];
+    i++;
+    i += 10;                            /* 保留区 */
+    memcpy(out->salt, p + part1, 8);
+    out->salt_len = 8;
+    if (i < end) {
+        int take = salt_len > 8 ? salt_len - 8 : 13;
+        int k = 0;
+
+        if (i + take > end)
+            take = end - i;
+        for (k = 0; k < take && out->salt_len < 20; k++) {
+            if (p[i + k] == 0)
+                break;
+            out->salt[out->salt_len++] = p[i + k];
+        }
+        vlen = 0;
+        (void)vlen;
+    }
+    return 1;
+}
+
+int my_lenenc(const void *src, int n, int off, i64 *out, int *used,
+              int *is_null)
+{
+    const u8 *p = (const u8 *)src;
+    u8 first = 0;
+
+    if (!src || !out || off < 0 || off >= n)
+        return -1;
+    if (is_null)
+        *is_null = 0;
+    first = p[off];
+    if (first < 0xFB) {
+        *out = (i64)first;
+        if (used)
+            *used = 1;
+        return 1;
+    }
+    if (first == 0xFB) {
+        if (is_null)
+            *is_null = 1;
+        if (used)
+            *used = 1;
+        return 1;
+    }
+    if (first == 0xFC) {
+        if (off + 3 > n)
+            return -1;
+        *out = (i64)my_le16(p + off + 1);
+        if (used)
+            *used = 3;
+        return 1;
+    }
+    if (first == 0xFD) {
+        if (off + 4 > n)
+            return -1;
+        *out = (i64)my_le24(p + off + 1);
+        if (used)
+            *used = 4;
+        return 1;
+    }
+    if (first == 0xFE) {
+        if (off + 9 > n)
+            return -1;
+        *out = (i64)my_le32(p + off + 1)
+               | ((i64)my_le32(p + off + 5) << 32);
+        if (used)
+            *used = 9;
+        return 1;
+    }
+    return -1;
+}
+
+int my_build_query(const char *sql, int seq, void *dst, int cap)
+{
+    u8 *p = (u8 *)dst;
+    int len = sql ? (int)strlen(sql) : 0;
+
+    if (!dst || !sql || cap < 4 + 1 + len)
+        return -1;
+    my_put24(p, (u32)(1 + len));
+    p[3] = (u8)(seq & 0xFF);
+    p[4] = 0x03;                        /* COM_QUERY */
+    memcpy(p + 5, sql, (size_t)len);
+    return 4 + 1 + len;
+}
+
+int my_build_auth(const void *scramble, int len, int seq, void *dst, int cap)
+{
+    u8 *p = (u8 *)dst;
+
+    if (!dst || len < 0 || cap < 4 + len || (len > 0 && !scramble))
+        return -1;
+    my_put24(p, (u32)len);
+    p[3] = (u8)(seq & 0xFF);
+    if (len > 0)
+        memcpy(p + 4, scramble, (size_t)len);
+    return 4 + len;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "mysql：报文与握手包" {
+    static u8 buf[256] = { 0 };
+    MyPacket pk = { 0 };
+    MyHandshake hs = { 0 };
+    int n = 0, i = 0;
+
+    /* 报文：长度 5、序号 0、正文 "hello" */
+    buf[0] = 5;
+    buf[1] = 0;
+    buf[2] = 0;
+    buf[3] = 0;
+    memcpy(buf + 4, "hello", 5);
+    if (my_parse(buf, 9, 0, &pk) != 1)
+        return err(1, "报文解析失败");
+    if (pk.len != 5 || pk.seq != 0 || pk.payload_off != 4 || pk.total != 9)
+        return err(2, "报文字段不对");
+    if (my_parse(buf, 8, 0, &pk) != -1)
+        return err(3, "长度越界应该 -1");
+    /* 握手包：v10、版本 8.0.36、连接 ID、盐 */
+    memset(buf, 0, sizeof buf);
+    i = 4;                              /* 正文从 4 开始 */
+    buf[i++] = 10;
+    memcpy(buf + i, "8.0.36", 6);
+    i += 7;                             /* 含结尾 0 */
+    buf[i++] = 0x39;
+    buf[i++] = 0x30;
+    buf[i++] = 0;
+    buf[i++] = 0;                       /* 连接 ID = 0x3039 = 12345 */
+    memcpy(buf + i, "12345678", 8);
+    i += 8;                             /* 盐前段 */
+    buf[i++] = 0;
+    buf[i++] = 0x00;
+    buf[i++] = 0x08;                    /* 能力低 16 位 = 0x0800 */
+    buf[i++] = 33;                      /* 字符集 */
+    buf[i++] = 0x02;
+    buf[i++] = 0;                       /* 状态 = 2 */
+    buf[i++] = 0x00;
+    buf[i++] = 0x00;                    /* 能力高 16 位 = 0 */
+    buf[i++] = 21;                      /* 挑战串长度 21 */
+    for (n = 0; n < 10; n++)
+        buf[i++] = 0;                   /* 保留区 */
+    memcpy(buf + i, "abcdefghijklm", 13);
+    i += 13;
+    n = 0;
+    buf[n] = (u8)((i - 4) & 0xFF);
+    buf[n + 1] = (u8)(((i - 4) >> 8) & 0xFF);
+    buf[n + 2] = (u8)(((i - 4) >> 16) & 0xFF);
+    buf[3] = 0;
+    if (my_handshake(buf, i, &hs) != 1)
+        return err(4, "握手包解析失败");
+    if (hs.protocol != 10)
+        return err(5, "协议版本不对");
+    if (hs.server_version.s.len != 6
+        || memcmp(hs.server_version.s.data, "8.0.36", 6) != 0)
+        return err(6, "服务端版本不对");
+    if (hs.conn_id != 12345)
+        return err(7, "连接 ID 不对");
+    if (hs.caps != 0x0800 || hs.charset != 33 || hs.status != 2)
+        return err(8, "能力位/字符集/状态不对");
+    if (hs.salt_len != 20)
+        return err(9, "盐长度不对（挑战串 20 字节，第 21 个是结尾 NUL）");
+    if (memcmp(hs.salt, "12345678abcdefghijkl", 20) != 0)
+        return err(10, "盐内容不对");
+}
+
+test "mysql：长度编码与构造" {
+    static u8 buf[128] = { 0 };
+    MyPacket pk = { 0 };
+    i64 v = 0;
+    int used = 0, is_null = 0;
+    u8 scramble[20] = { 0 };
+
+    if (my_lenenc("\x05", 1, 0, &v, &used, &is_null) != 1 || v != 5
+        || used != 1 || is_null != 0)
+        return err(11, "单字节长度编码不对");
+    if (my_lenenc("\xfc\x34\x12", 3, 0, &v, &used, &is_null) != 1
+        || v != 0x1234 || used != 3)
+        return err(12, "两字节长度编码不对");
+    if (my_lenenc("\xfd\x56\x34\x12", 4, 0, &v, &used, &is_null) != 1
+        || v != 0x123456 || used != 4)
+        return err(13, "三字节长度编码不对");
+    if (my_lenenc("\xfe\x78\x56\x34\x12\x00\x00\x00\x00", 9, 0, &v, &used,
+                  &is_null) != 1
+        || v != 0x12345678 || used != 9)
+        return err(14, "八字节长度编码不对");
+    if (my_lenenc("\xfb", 1, 0, &v, &used, &is_null) != 1 || is_null != 1)
+        return err(15, "0xFB 应该是 NULL");
+    if (my_lenenc("\xfc\x01", 2, 0, &v, &used, &is_null) != -1)
+        return err(16, "截断的两字节长度编码应该 -1");
+    /* COM_QUERY */
+    if (my_build_query("SELECT 1", 0, buf, (int)sizeof buf) != 13)
+        return err(17, "COM_QUERY 长度不对");
+    if (my_parse(buf, 13, 0, &pk) != 1 || pk.len != 9 || pk.seq != 0)
+        return err(18, "COM_QUERY 报文头不对");
+    if (buf[pk.payload_off] != 0x03
+        || memcmp(buf + pk.payload_off + 1, "SELECT 1", 8) != 0)
+        return err(19, "COM_QUERY 正文不对");
+    if (my_build_auth(scramble, 20, 1, buf, (int)sizeof buf) != 24)
+        return err(20, "认证应答长度不对");
+    if (my_parse(buf, 24, 0, &pk) != 1 || pk.seq != 1 || pk.len != 20)
+        return err(21, "认证应答报文头不对");
+}

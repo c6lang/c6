@@ -1,0 +1,213 @@
+/* examples/stddb.c6 —— 第五十批（日志与数据库）的集成示例。
+ *
+ *     make std-db
+ *
+ * 四节：环形日志（级别过滤 + dump）、SQLite 文件头与 B-tree 页、PostgreSQL 报文
+ * 拆帧/启动包、MySQL 握手包与 COM_QUERY。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.os.log;
+import std.data.sqlite;
+import std.net.postgres;
+import std.net.mysql;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+static void put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+static void put24le(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+}
+
+static void do_log(void)
+{
+    LogRec recs[4] = { 0 };
+    Log lg = { 0 };
+    LogRec *r = 0;
+    char out[256] = { 0 };
+
+    printf("== log\n");
+    check(log_init(&lg, recs, 4, LOG_INFO) == 1, "初始化");
+    check(log_add(&lg, LOG_DEBUG, S("db"), S("connect attempt")) == 0,
+          "DEBUG 被过滤");
+    check(log_add(&lg, LOG_INFO, S("db"), S("connected")) == 1, "INFO 写入");
+    check(log_add(&lg, LOG_ERROR, S("db"), S("query failed")) == 1,
+          "ERROR 写入");
+    check(log_filtered(&lg) == 1 && log_count(&lg) == 2, "计数");
+    r = log_at(&lg, 0);
+    if (r)
+        printf("   最新：[%s] %s: %s\n", log_level_name(r->level), r->scope,
+               r->msg);
+    check(r && r->level == LOG_ERROR, "最新一条是 ERROR");
+    log_add(&lg, LOG_WARN, S("io"), S("slow"));
+    log_add(&lg, LOG_WARN, S("io"), S("slower"));
+    log_add(&lg, LOG_FATAL, S("io"), S("gone"));
+    check(log_count(&lg) == 4 && log_dropped(&lg) == 1, "环形覆盖");
+    {
+        int n = log_dump(&lg, out, (int)sizeof out);
+
+        printf("   dump（%d 字节）：\n%s", n, out);
+        check(n > 0 && memcmp(out, "#1 ERROR db: query failed\n", 25) == 0,
+              "dump 从最旧的可用记录开始");
+    }
+    check(log_level_parse(S("warn")) == LOG_WARN, "级别名解析");
+}
+
+static void do_sqlite(void)
+{
+    static u8 buf[4096 * 2] = { 0 };
+    SqliteHdr h = { 0 };
+    SqlitePage pg = { 0 };
+    SqliteCell c = { 0 };
+    u8 *page = 0;
+
+    printf("== sqlite\n");
+    memcpy(buf, "SQLite format 3", 15);
+    put16(buf + 16, 4096);
+    buf[18] = 1;
+    buf[19] = 1;
+    buf[21] = 64;
+    put32(buf + 28, 2);
+    put32(buf + 56, 1);
+    check(sqlite_header(buf, 4096, &h) == 1, "文件头解析");
+    printf("   页大小 %d，%u 页，文本编码 %d\n", h.page_size, h.db_pages,
+           h.text_encoding);
+    check(h.page_size == 4096 && h.db_pages == 2 && h.text_encoding == 1,
+          "文件头字段");
+    /* 第 2 页：叶子表页，一个单元 payload "hi"、rowid 7 */
+    page = buf + 4096;
+    page[0] = 13;
+    put16(page + 3, 1);
+    put16(page + 5, 4096 - 8);
+    page[4096 - 8] = 2;                 /* payload 长度 */
+    page[4096 - 7] = 7;                 /* rowid */
+    memcpy(page + 4096 - 6, "hi", 2);
+    put16(page + 8, 4096 - 8);
+    check(sqlite_page(buf, (int)sizeof buf, 2, &h, &pg) == 1, "页解析");
+    printf("   页类型 %d，%d 个单元\n", pg.type, pg.ncell);
+    check(pg.type == 13 && pg.ncell == 1, "页头字段");
+    check(sqlite_cell(buf, (int)sizeof buf, &h, 2, &pg, 0, &c) == 1, "单元解析");
+    printf("   单元：rowid=%lld payload=%lld（本地 %d 字节）\n",
+           (long long)c.rowid, (long long)c.payload_len, c.local_payload);
+    check(c.rowid == 7 && c.payload_len == 2 && c.local_payload == 2,
+          "单元字段");
+    check(memcmp(buf + c.payload_off, "hi", 2) == 0, "payload 内容");
+    {
+        i64 v = 0;
+        int used = 0;
+
+        check(sqlite_varint("\xbd\x84\x40", 3, 0, &v, &used) == 1
+              && v == 1000000, "变长整数 1000000");
+    }
+}
+
+static void do_postgres(void)
+{
+    static u8 buf[128] = { 0 };
+    PgMsg m = { 0 };
+    PgStartup st = { 0 };
+    Str v = { 0 };
+    int n = 0;
+
+    printf("== postgres\n");
+    n = pg_build_query("SELECT 1", buf, (int)sizeof buf);
+    check(n == 14, "COM 查询长度");
+    check(pg_parse(buf, n, 0, &m) == 1 && m.type == 'Q', "拆帧");
+    printf("   报文类型 '%c'，长度 %d，正文 %d 字节\n", (char)m.type, m.len,
+           m.len - 4);
+    check(m.len == 13 && memcmp(buf + m.body_off, "SELECT 1", 8) == 0,
+          "正文字段");
+    n = pg_build_startup("alice", "appdb", buf, (int)sizeof buf);
+    check(n > 0 && pg_startup(buf, n, &st) == 1, "启动包");
+    check(st.protocol == 196608, "协议版本 3.0");
+    check(pg_startup_param(buf, n, "user", &v) == 1 && v.s.len == 5
+          && memcmp(v.s.data, "alice", 5) == 0, "user 参数");
+    check(pg_startup_param(buf, n, "database", &v) == 1
+          && memcmp(v.s.data, "appdb", 5) == 0, "database 参数");
+}
+
+static void do_mysql(void)
+{
+    static u8 buf[256] = { 0 };
+    MyPacket pk = { 0 };
+    MyHandshake hs = { 0 };
+    int n = 0, i = 0;
+
+    printf("== mysql\n");
+    n = my_build_query("SELECT 1", 0, buf, (int)sizeof buf);
+    check(n == 13 && my_parse(buf, n, 0, &pk) == 1 && pk.len == 9
+          && pk.seq == 0, "COM_QUERY 拆帧");
+    check(buf[pk.payload_off] == 0x03, "命令字节 0x03");
+    /* 最小握手包 v10 */
+    memset(buf, 0, sizeof buf);
+    i = 4;
+    buf[i++] = 10;
+    memcpy(buf + i, "8.0.36", 6);
+    i += 7;
+    buf[i++] = 0x39;
+    buf[i++] = 0x30;
+    i += 2;                             /* 连接 ID 12345 */
+    memcpy(buf + i, "12345678", 8);
+    i += 8;
+    buf[i++] = 0;
+    buf[i++] = 0x00;
+    buf[i++] = 0x08;                    /* 能力 0x0800 */
+    buf[i++] = 33;
+    buf[i++] = 0x02;
+    buf[i++] = 0;
+    buf[i++] = 0;
+    buf[i++] = 0;
+    buf[i++] = 21;
+    i += 10;
+    memcpy(buf + i, "abcdefghijkl", 12);
+    i += 12;
+    put24le(buf, (u32)(i - 4));
+    check(my_handshake(buf, i, &hs) == 1, "握手包解析");
+    printf("   服务端 %.*s，连接 %u，盐 %d 字节\n", hs.server_version.s.len,
+           hs.server_version.s.data, hs.conn_id, hs.salt_len);
+    check(hs.protocol == 10 && hs.conn_id == 12345, "握手基本字段");
+    check(hs.caps == 0x0800 && hs.charset == 33 && hs.status == 2,
+          "能力/字符集/状态");
+    check(hs.salt_len == 20, "盐长度为 20");
+}
+
+int main(void)
+{
+    do_log();
+    do_sqlite();
+    do_postgres();
+    do_mysql();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

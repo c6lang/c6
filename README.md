@@ -344,6 +344,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/net/syslog.c6         std.net.syslog         syslog：RFC 5424 与 RFC 3164 解析（PRI/设施/级别/结构化数据）、5424 构造
   std/net/stun.c6           std.net.stun           STUN：位交错类型字段、TLV 属性、XOR-MAPPED-ADDRESS 解码与构造
   std/net/tftp.c6           std.net.tftp           TFTP：RRQ/WRQ/DATA/ACK/ERROR/OACK 解析与构造
+  std/os/log.c6             std.os.log            定长环形日志：TRACE..FATAL 级别过滤、覆盖/过滤计数、dump 格式化
+  std/data/sqlite.c6        std.data.sqlite       SQLite：100 字节文件头、B-tree 页头与单元（payload/rowid）、1..9 字节变长整数
+  std/net/postgres.c6       std.net.postgres      PostgreSQL v3：报文拆帧、启动包键值对、ErrorResponse 字段、构造查询/口令
+  std/net/mysql.c6          std.net.mysql         MySQL：3 字节小端长度报文、HandshakeV10、长度编码整数、COM_QUERY
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -449,6 +453,7 @@ make std-words    # 编译并运行 examples/stdwords.c6（第四十六批文本
 make std-math2    # 编译并运行 examples/stdnumeric.c6（第四十七批数值工具模块的拼装示例，链接带 -lm）
 make std-time     # 编译并运行 examples/stdtime.c6（第四十八批时间工具模块的拼装示例）
 make std-packet   # 编译并运行 examples/stdpacket.c6（第四十九批网络报文模块的拼装示例）
+make std-db       # 编译并运行 examples/stddb.c6（第五十批日志与数据库模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

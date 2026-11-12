@@ -1,0 +1,317 @@
+/* std/net/postgres：PostgreSQL 前/后端报文（v3 协议）的拆帧、启动包与错误字段。
+ *
+ *     import std.net.postgres;
+ *
+ *     PgMsg m = { 0 };
+ *     if (pg_parse(buf, n, 0, &m) == 1)
+ *         // m.type == 'T'（RowDescription）、m.len（含长度字段自身的 4 字节）
+ *     pg_startup_param(buf, n, "user", &val);
+ *
+ * 报文格式：普通报文是「1 字节类型 + 4 字节长度（含这 4 字节，不含类型）+ 正文」；
+ * 启动包（StartupMessage / SSLRequest）**没有类型字节**，只有「4 字节长度 + 正文」，
+ * 正文头 4 字节是协议号（3.0 是 196608）。
+ *
+ * 启动包正文之后是一串 `键\0值\0`，最后以额外的 `\0` 结尾。
+ *
+ * 约定：
+ *
+ * - `pg_parse` 从 `off` 解一个普通报文，`body_off`/`len` 指向正文；
+ * - `pg_startup` 解启动包：给协议号与正文范围，`pg_startup_param` 按名字取键值
+ *   （名字大小写敏感，PostgreSQL 惯例是小写）；
+ * - `pg_error_field` 解 ErrorResponse/NoticeResponse 里的字段（`S` 严重级别、`C`
+ *   SQLSTATE、`M` 消息、`D` 细节、`H` 提示…），找不到返回 0；
+ * - 构造函数：`pg_build_msg`（任意类型 + 正文）、`pg_build_query`（`Q` + SQL）、
+ *   `pg_build_password`（`p` + 口令）、`pg_build_startup`（`user`/`database`）；
+ * - 不处理 SASL/SCRAM 的多步握手，也不解 RowDescription/DataRow 的列值。
+ */
+#include <string.h>
+
+module std.net.postgres;
+import std.core.types;
+import std.text.str;
+
+struct PgMsg {
+    int type;
+    int len;                /* 长度字段的值（含自身 4 字节） */
+    int body_off;
+    int total;
+};
+
+struct PgStartup {
+    int protocol;
+    int body_off;
+    int body_len;
+};
+
+static u32 pg_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static void pg_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+int pg_parse(const void *src, int n, int off, PgMsg *out)
+{
+    const u8 *p = (const u8 *)src;
+    int len = 0;
+
+    if (!src || !out || off < 0 || off + 5 > n)
+        return -1;
+    len = (int)pg_be32(p + off + 1);
+    if (len < 4 || off + 1 + len > n)
+        return -1;
+    out->type = (int)p[off];
+    out->len = len;
+    out->body_off = off + 5;
+    out->total = 1 + len;
+    return 1;
+}
+
+int pg_startup(const void *src, int n, PgStartup *out)
+{
+    const u8 *p = (const u8 *)src;
+    int len = 0;
+
+    if (!src || !out || n < 8)
+        return -1;
+    len = (int)pg_be32(p);
+    if (len < 8 || len > n)
+        return -1;
+    out->protocol = (int)pg_be32(p + 4);
+    out->body_off = 8;
+    out->body_len = len - 8;
+    if (out->protocol <= 0)
+        return -1;
+    return 1;
+}
+
+int pg_startup_param(const void *src, int n, const char *key, Str *out)
+{
+    PgStartup st = { 0 };
+    const u8 *p = (const u8 *)src;
+    int i = 0, end = 0, klen = 0;
+
+    if (!src || !key)
+        return -1;
+    if (pg_startup(src, n, &st) != 1)
+        return -1;
+    klen = (int)strlen(key);
+    i = st.body_off;
+    end = st.body_off + st.body_len;
+    while (i < end) {
+        int kstart = i, klen_found = 0, vstart = 0, vlen = 0;
+
+        while (i < end && p[i] != 0)
+            i++;
+        if (i >= end)
+            return -1;
+        klen_found = i - kstart;
+        i++;
+        if (klen_found == 0)
+            return 0;                   /* 键值区结束 */
+        vstart = i;
+        while (i < end && p[i] != 0)
+            i++;
+        if (i >= end)
+            return -1;
+        vlen = i - vstart;
+        i++;
+        if (klen_found == klen && memcmp(p + kstart, key, (size_t)klen) == 0) {
+            if (out)
+                out->s = (char[:]){ (char *)p + vstart, vlen };
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int pg_error_field(const void *src, int n, int off, char code, Str *out)
+{
+    const u8 *p = (const u8 *)src;
+    int i = off;
+
+    if (!src || off < 0 || off >= n)
+        return -1;
+    while (i < n) {
+        int field = (int)p[i];
+        int start = 0, len = 0;
+
+        if (field == 0)
+            return 0;                   /* 列表结束 */
+        i++;
+        start = i;
+        while (i < n && p[i] != 0)
+            i++;
+        if (i >= n)
+            return -1;
+        len = i - start;
+        i++;
+        if ((char)field == code) {
+            if (out)
+                out->s = (char[:]){ (char *)p + start, len };
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int pg_build_msg(char type, const void *body, int blen, void *dst, int cap)
+{
+    u8 *p = (u8 *)dst;
+
+    if (!dst || blen < 0 || cap < 5 + blen)
+        return -1;
+    if (blen > 0 && !body)
+        return -1;
+    p[0] = (u8)type;
+    pg_put32(p + 1, (u32)(4 + blen));
+    if (blen > 0)
+        memcpy(p + 5, body, (size_t)blen);
+    return 5 + blen;
+}
+
+int pg_build_query(const char *sql, void *dst, int cap)
+{
+    if (!sql)
+        return -1;
+    return pg_build_msg('Q', sql, (int)strlen(sql) + 1, dst, cap);
+}
+
+int pg_build_password(const char *pw, void *dst, int cap)
+{
+    if (!pw)
+        return -1;
+    return pg_build_msg('p', pw, (int)strlen(pw) + 1, dst, cap);
+}
+
+int pg_build_startup(const char *user, const char *db, void *dst, int cap)
+{
+    u8 *p = (u8 *)dst;
+    int o = 8, need = 8;
+
+    if (!dst || !user || !db)
+        return -1;
+    need += 5 + (int)strlen(user) + 1;          /* "user\0" + user + \0 */
+    need += 9 + (int)strlen(db) + 1;            /* "database\0" + db + \0 */
+    need += 1;                                  /* 结尾的 \0 */
+    if (cap < need)
+        return -1;
+    memset(p, 0, (size_t)need);
+    pg_put32(p + 4, 196608);                    /* 3.0 */
+    {
+        static const char *k1 = "user";
+        int i = 0;
+
+        for (i = 0; k1[i]; i++)
+            p[o++] = (u8)k1[i];
+        p[o++] = 0;
+        for (i = 0; user[i]; i++)
+            p[o++] = (u8)user[i];
+        p[o++] = 0;
+    }
+    {
+        static const char *k2 = "database";
+        int i = 0;
+
+        for (i = 0; k2[i]; i++)
+            p[o++] = (u8)k2[i];
+        p[o++] = 0;
+        for (i = 0; db[i]; i++)
+            p[o++] = (u8)db[i];
+        p[o++] = 0;
+    }
+    p[o++] = 0;
+    pg_put32(p, (u32)o);
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "postgres：报文拆帧与构造" {
+    static u8 buf[128] = { 0 };
+    PgMsg m = { 0 };
+
+    /* 'Q' + 长度 13 + "SELECT 1\0" */
+    buf[0] = 'Q';
+    pg_put32(buf + 1, 13);
+    memcpy(buf + 5, "SELECT 1", 9);
+    if (pg_parse(buf, 18, 0, &m) != 1)
+        return err(1, "报文解析失败");
+    if (m.type != 'Q' || m.len != 13 || m.body_off != 5 || m.total != 14)
+        return err(2, "报文头字段不对");
+    if (memcmp(buf + m.body_off, "SELECT 1", 8) != 0)
+        return err(3, "正文内容不对");
+    if (pg_build_query("SELECT 1", buf, (int)sizeof buf) != 14)
+        return err(4, "构造查询的长度不对");
+    if (pg_parse(buf, 14, 0, &m) != 1 || m.type != 'Q'
+        || memcmp(buf + m.body_off, "SELECT 1", 8) != 0)
+        return err(5, "查询往返不一致");
+    if (pg_build_password("s3cret", buf, (int)sizeof buf) != 12)
+        return err(6, "构造口令的长度不对");
+    if (pg_parse(buf, 12, 0, &m) != 1 || m.type != 'p')
+        return err(7, "口令报文类型不对");
+    if (pg_parse(buf, 10, 0, &m) != -1)
+        return err(8, "长度越界应该 -1");
+    if (pg_build_query("x", buf, 4) != -1)
+        return err(9, "容量不够应该 -1");
+}
+
+test "postgres：启动包与错误字段" {
+    static u8 buf[128] = { 0 };
+    PgStartup st = { 0 };
+    Str v = { 0 };
+    int n = 0;
+
+    n = pg_build_startup("alice", "appdb", buf, (int)sizeof buf);
+    if (n <= 0)
+        return err(10, "构造启动包失败");
+    if (pg_startup(buf, n, &st) != 1 || st.protocol != 196608)
+        return err(11, "启动包解析失败");
+    if (pg_startup_param(buf, n, "user", &v) != 1 || v.s.len != 5
+        || memcmp(v.s.data, "alice", 5) != 0)
+        return err(12, "user 参数不对");
+    if (pg_startup_param(buf, n, "database", &v) != 1 || v.s.len != 5
+        || memcmp(v.s.data, "appdb", 5) != 0)
+        return err(13, "database 参数不对");
+    if (pg_startup_param(buf, n, "options", &v) != 0)
+        return err(14, "不存在的参数应该 0");
+    /* ErrorResponse 正文：'S' 'FATAL' 0 'C' '28P01' 0 'M' 'bad password' 0 0 */
+    {
+        static u8 erec[64] = { 0 };
+        int o = 0;
+
+        erec[o++] = 'S';
+        memcpy(erec + o, "FATAL", 5);
+        o += 5;
+        erec[o++] = 0;
+        erec[o++] = 'C';
+        memcpy(erec + o, "28P01", 5);
+        o += 5;
+        erec[o++] = 0;
+        erec[o++] = 'M';
+        memcpy(erec + o, "bad password", 12);
+        o += 12;
+        erec[o++] = 0;
+        erec[o] = 0;
+        if (pg_error_field(erec, o + 1, 0, 'S', &v) != 1 || v.s.len != 5)
+            return err(15, "严重级别字段不对");
+        if (pg_error_field(erec, o + 1, 0, 'C', &v) != 1
+            || memcmp(v.s.data, "28P01", 5) != 0)
+            return err(16, "SQLSTATE 不对");
+        if (pg_error_field(erec, o + 1, 0, 'M', &v) != 1 || v.s.len != 12)
+            return err(17, "消息字段不对");
+        if (pg_error_field(erec, o + 1, 0, 'H', &v) != 0)
+            return err(18, "不存在的字段应该 0");
+    }
+    if (pg_startup("\x00\x00", 2, &st) != -1)
+        return err(19, "太短的启动包应该 -1");
+}

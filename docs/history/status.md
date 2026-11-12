@@ -1776,6 +1776,33 @@ FTP 的解析坑值得记一笔：`LIST` 行是定字段的「权限 链接 属�
 验收：`make stdtest`（209 个模块、0 failure）、`make std-packet`（29 条自检全过）、
 `make check-all`。
 
+### 11.62 标准库第五十批（log / sqlite / postgres / mysql）
+
+第五十批按「日志 + 数据库」补齐：定长环形日志、SQLite 文件结构、PostgreSQL 与
+MySQL 的前端报文。数据库这三个都只做**报文/页结构**，不连库、不发 SQL。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.os.log` | 环形日志 | 记录是定长槽位（`scope` 24、`msg` 96），不分配不落盘；`max_level` 以上才写，`log_at(0)` 是最新一条；`log_dump` 从最旧的可用记录开始；覆盖与过滤分别计数 |
+| `std.data.sqlite` | 文件 + B-tree 页 | 页大小字段值为 1 表示 65536；页类型只认 2/5/10/13；单元按类型分别解 rowid（表页才有）；本地 payload 长度用 SQLite 的 `maxLocal/minLocal` 公式，超出时置 `overflow` 但不跟溢出页 |
+| `std.net.postgres` | v3 报文 | 普通报文长度字段**含自身 4 字节、不含类型字节**；启动包反过来（没有类型字节、长度含自身）；启动参数是 `键\0值\0`、最后再来一个 `\0` |
+| `std.net.mysql` | 报文 + 握手 | 报文长度是 3 字节**小端**（与 MySQL 里几乎所有的多字节整数一致）；握手包的能力位分低/高两段，挑战串也是两段（8 + 至多 13），合计 20 字节（第 21 个是结尾 NUL） |
+
+踩坑：`Str` 只有 `s` 一个切片字段，取长度要写 `v.s.len`（直接写 `v.len` 会报
+`field not found`）；切片字段的 `len` 是只读的，想「清空」只能整体赋成零长切片；
+另外变量别叫 `err`（内置构造），`static u8 err[64]` 会直接编译失败。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.os.log`=0x60d1、
+`std.data.sqlite`=0x60d2、`std.net.postgres`=0x60d3、`std.net.mysql`=0x60d4；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-db` 与 `STD_DB_SRCS`，`test-all`/
+`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（log/postgres/mysql 各 24 条，sqlite 25 条）。示例 `examples/stddb.c6` 四节
+（30 条自检）。
+
+验收：`make stdtest`（213 个模块、0 failure）、`make std-db`（30 条自检全过）、
+`make check-all`。
+
+
 
 
 

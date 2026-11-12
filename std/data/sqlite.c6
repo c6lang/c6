@@ -1,0 +1,398 @@
+/* std/data/sqlite：SQLite 数据库文件的文件头与 B-tree 页（不执行 SQL）。
+ *
+ *     import std.data.sqlite;
+ *
+ *     SqliteHdr h = { 0 };
+ *     SqlitePage pg = { 0 };
+ *     SqliteCell cell = { 0 };
+ *     if (sqlite_header(buf, n, &h) == 1
+ *         && sqlite_page(buf, n, 1, &h, &pg) == 1
+ *         && sqlite_cell(buf, n, &h, 1, &pg, 0, &cell) == 1)
+ *         // cell.rowid / cell.payload_len / cell.payload_off
+ *
+ * 文件头 100 字节：`SQLite format 3\0`、页大小（偏移 16，大端 16 位；值 1 表示
+ * 65536）、写/读格式版本、保留区大小、三个 payload 分界值、文件变更计数、库页数、
+ * freelist、schema cookie、schema 格式、文本编码（1 UTF-8 / 2 UTF-16le /
+ * 3 UTF-16be）、user_version、application_id、版本有效号、SQLite 版本号。
+ *
+ * B-tree 页头：类型（2 内部索引 / 5 内部表 / 10 叶子索引 / 13 叶子表）、首个空闲块、
+ * 单元数、单元内容起点、碎片字节数，内部页还多 4 字节最右子页；随后是每单元 2 字节
+ * 的单元指针数组。
+ *
+ * 单元（cell）格式：表叶子是 `payload 长度 varint + rowid varint + payload`，
+ * 索引叶子是 `payload 长度 varint + payload`，内部页先有 4 字节子页号。
+ *
+ * 约定：
+ *
+ * - 页号从 1 开始，`sqlite_page` 用头里的页大小自己算偏移；
+ * - `sqlite_varint` 按 SQLite 的 1..9 字节变长整数解（第 9 字节可用满 8 位）；
+ * - `sqlite_cell` 给出 payload 在原文件里的偏移（**不含**溢出页处理：
+ *   `overflow` 非 0 时说明 payload 尾部在溢出页里，本模块不跟）；
+ * - 不解析 record 格式（列类型/值序列），也不做 freelist 与 WAL；
+ * - 只读：不检查页校验和（SQLite 本身也没有）。
+ */
+#include <string.h>
+
+module std.data.sqlite;
+import std.core.types;
+import std.text.str;
+
+struct SqliteHdr {
+    int page_size;
+    int write_version;
+    int read_version;
+    int reserved;
+    int max_payload;
+    int min_payload;
+    int leaf_payload;
+    u32 change_counter;
+    u32 db_pages;
+    u32 freelist_head;
+    u32 freelist_pages;
+    u32 schema_cookie;
+    u32 schema_format;
+    u32 user_version;
+    u32 app_id;
+    int text_encoding;
+    u32 version_valid_for;
+    u32 sqlite_version;
+    int usable_size;
+};
+
+struct SqlitePage {
+    int type;
+    int first_free;
+    int ncell;
+    int cell_start;
+    int fragments;
+    u32 right_child;
+    int hdr_size;
+    int offset;             /* 页在文件里的字节偏移 */
+};
+
+struct SqliteCell {
+    int off;                /* 单元自身在文件里的偏移 */
+    i64 payload_len;
+    i64 rowid;
+    u32 child;
+    int payload_off;
+    int local_payload;
+    int overflow;
+};
+
+static u32 sq_be16(const u8 *p)
+{
+    return ((u32)p[0] << 8) | (u32)p[1];
+}
+
+static u32 sq_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+int sqlite_header(const void *src, int n, SqliteHdr *out)
+{
+    const u8 *p = (const u8 *)src;
+    int ps = 0;
+
+    if (!src || !out || n < 100)
+        return -1;
+    if (memcmp(p, "SQLite format 3", 15) != 0 || p[15] != 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    ps = (int)sq_be16(p + 16);
+    if (ps == 1)
+        ps = 65536;
+    if (ps < 512 || ps > 65536 || (ps & (ps - 1)) != 0)
+        return -1;
+    out->page_size = ps;
+    out->write_version = (int)p[18];
+    out->read_version = (int)p[19];
+    out->reserved = (int)p[20];
+    out->max_payload = (int)p[21];
+    out->min_payload = (int)p[22];
+    out->leaf_payload = (int)p[23];
+    out->change_counter = sq_be32(p + 24);
+    out->db_pages = sq_be32(p + 28);
+    out->freelist_head = sq_be32(p + 32);
+    out->freelist_pages = sq_be32(p + 36);
+    out->schema_cookie = sq_be32(p + 40);
+    out->schema_format = sq_be32(p + 44);
+    out->user_version = sq_be32(p + 60);
+    out->app_id = sq_be32(p + 68);
+    out->version_valid_for = sq_be32(p + 92);
+    out->sqlite_version = sq_be32(p + 96);
+    out->text_encoding = (int)sq_be32(p + 56);
+    out->usable_size = ps - out->reserved;
+    if (out->write_version < 1 || out->write_version > 2)
+        return -1;
+    if (out->text_encoding < 0 || out->text_encoding > 3)
+        return -1;
+    if (out->usable_size < 480)
+        return -1;
+    return 1;
+}
+
+int sqlite_varint(const void *src, int n, int off, i64 *out, int *used)
+{
+    const u8 *p = (const u8 *)src;
+    u64 v = 0;
+    int i = 0;
+
+    if (!src || !out || off < 0 || off >= n)
+        return -1;
+    for (i = 0; i < 9; i++) {
+        u8 b = 0;
+
+        if (off + i >= n)
+            return -1;
+        b = p[off + i];
+        if (i == 8) {
+            v = (v << 8) | (u64)b;
+            if (used)
+                *used = 9;
+            *out = (i64)v;
+            return 1;
+        }
+        v = (v << 7) | (u64)(b & 0x7F);
+        if ((b & 0x80) == 0) {
+            if (used)
+                *used = i + 1;
+            *out = (i64)v;
+            return 1;
+        }
+    }
+    return -1;
+}
+
+int sqlite_page(const void *src, int n, int page_no, const SqliteHdr *h,
+                SqlitePage *out)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 0;
+
+    if (!src || !h || !out || page_no < 1 || h->page_size <= 0)
+        return -1;
+    off = (page_no - 1) * h->page_size;
+    if (off + 8 > n || off + h->page_size > n)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->type = (int)p[off];
+    out->offset = off;
+    if (out->type != 2 && out->type != 5 && out->type != 10
+        && out->type != 13)
+        return -1;
+    out->first_free = (int)sq_be16(p + off + 1);
+    out->ncell = (int)sq_be16(p + off + 3);
+    out->cell_start = (int)sq_be16(p + off + 5);
+    out->fragments = (int)p[off + 7];
+    out->hdr_size = (out->type == 2 || out->type == 5) ? 12 : 8;
+    if (out->hdr_size == 12)
+        out->right_child = sq_be32(p + off + 8);
+    if (out->ncell > (h->usable_size - out->hdr_size) / 2)
+        return -1;
+    if (out->cell_start < out->hdr_size || out->cell_start > h->usable_size)
+        return -1;
+    return 1;
+}
+
+int sqlite_cell(const void *src, int n, const SqliteHdr *h, int page_no,
+                const SqlitePage *pg, int idx, SqliteCell *out)
+{
+    const u8 *p = (const u8 *)src;
+    int ptr_off = 0, cell_off = 0, used = 0, cursor = 0;
+    i64 v = 0;
+    int max_local = 0;
+
+    if (!src || !h || !pg || !out || idx < 0 || idx >= pg->ncell)
+        return -1;
+    ptr_off = pg->offset + pg->hdr_size + idx * 2;
+    if (ptr_off + 2 > n)
+        return -1;
+    cell_off = pg->offset + (int)sq_be16(p + ptr_off);
+    if (cell_off < pg->offset || cell_off + 2 > n)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->off = cell_off;
+    cursor = cell_off;
+    if (pg->type == 2 || pg->type == 5) {
+        if (cursor + 4 > n)
+            return -1;
+        out->child = sq_be32(p + cursor);
+        cursor += 4;
+    }
+    if (sqlite_varint(src, n, cursor, &out->payload_len, &used) != 1)
+        return -1;
+    cursor += used;
+    if (pg->type == 13 || pg->type == 5) {
+        if (sqlite_varint(src, n, cursor, &out->rowid, &used) != 1)
+            return -1;
+        cursor += used;
+    }
+    out->payload_off = cursor;
+    /* 本地 payload 长度（不含溢出页）：SQLite 的分界公式 */
+    max_local = h->usable_size - 35;
+    if (out->payload_len <= (i64)max_local) {
+        out->local_payload = (int)out->payload_len;
+    } else {
+        int min_local = ((max_local - 12) * 32 / 255) - 23;
+
+        if (min_local < 0)
+            min_local = 0;
+        out->local_payload = min_local
+                             + (int)((out->payload_len - min_local)
+                                     % (max_local - min_local));
+        if (out->local_payload > max_local)
+            out->local_payload = max_local;
+        out->overflow = 1;
+    }
+    if (out->payload_off + out->local_payload > n)
+        return -1;
+    (void)v;
+    (void)page_no;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static void sq_put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+static void sq_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+/* 造 100 字节文件头：4096 字节页、UTF-8、3 页 */
+static void mk_sqlite_hdr(u8 *buf)
+{
+    memset(buf, 0, 100);
+    memcpy(buf, "SQLite format 3", 15);
+    buf[15] = 0;
+    sq_put16(buf + 16, 4096);
+    buf[18] = 1;
+    buf[19] = 1;
+    buf[21] = 64;
+    buf[22] = 32;
+    buf[23] = 32;
+    sq_put32(buf + 24, 7);              /* change counter */
+    sq_put32(buf + 28, 3);              /* 3 页 */
+    sq_put32(buf + 40, 11);             /* schema cookie */
+    sq_put32(buf + 44, 4);              /* schema format */
+    sq_put32(buf + 56, 1);              /* UTF-8 */
+    sq_put32(buf + 60, 2);              /* user version */
+    sq_put32(buf + 68, 0x12345678u);    /* application id */
+    sq_put32(buf + 96, 3045000);        /* sqlite version */
+}
+
+test "sqlite：文件头" {
+    static u8 buf[4096 * 3] = { 0 };
+    SqliteHdr h = { 0 };
+
+    mk_sqlite_hdr(buf);
+    if (sqlite_header(buf, 4096, &h) != 1)
+        return err(1, "文件头解析失败");
+    if (h.page_size != 4096 || h.usable_size != 4096 - h.reserved)
+        return err(2, "页大小不对");
+    if (h.write_version != 1 || h.read_version != 1)
+        return err(3, "格式版本不对");
+    if (h.max_payload != 64 || h.min_payload != 32 || h.leaf_payload != 32)
+        return err(4, "payload 分界值不对");
+    if (h.change_counter != 7 || h.db_pages != 3)
+        return err(5, "变更计数或页数不对");
+    if (h.schema_cookie != 11 || h.schema_format != 4)
+        return err(6, "schema cookie/格式不对");
+    if (h.text_encoding != 1 || h.user_version != 2
+        || h.app_id != 0x12345678u)
+        return err(7, "文本编码/用户版本/应用 ID 不对");
+    if (h.sqlite_version != 3045000)
+        return err(8, "库版本不对");
+    /* 魔数不对、页大小非法 */
+    buf[0] = 'X';
+    if (sqlite_header(buf, 4096, &h) != -1)
+        return err(9, "魔数不对应该 -1");
+    mk_sqlite_hdr(buf);
+    sq_put16(buf + 16, 1000);
+    if (sqlite_header(buf, 4096, &h) != -1)
+        return err(10, "页大小不是 2 的幂应该 -1");
+}
+
+test "sqlite：页与单元" {
+    static u8 buf[4096 * 3] = { 0 };
+    SqliteHdr h = { 0 };
+    SqlitePage pg = { 0 };
+    SqliteCell c = { 0 };
+    u8 *page = 0;
+
+    mk_sqlite_hdr(buf);
+    if (sqlite_header(buf, 4096, &h) != 1)
+        return err(11, "文件头解析失败");
+    page = buf + 4096;                  /* 第 2 页 */
+    page[0] = 13;                       /* 叶子表页 */
+    sq_put16(page + 3, 2);              /* 2 个单元 */
+    sq_put16(page + 5, 4096 - 16);      /* 单元内容起点 */
+    /* 单元 0：payload 5、rowid 100，payload "hello" */
+    {
+        int cell = 4096 - 16;
+
+        page[cell] = 5;
+        page[cell + 1] = 100;
+        memcpy(page + cell + 2, "hello", 5);
+        sq_put16(page + 8, cell);
+    }
+    /* 单元 1：payload 3、rowid 200，payload "abc" */
+    {
+        int cell = 4096 - 8;
+
+        page[cell] = 3;
+        page[cell + 1] = 0x81;          /* varint 200 = 0x81 0x48 */
+        page[cell + 2] = 0x48;
+        memcpy(page + cell + 3, "abc", 3);
+        sq_put16(page + 10, cell);
+    }
+    if (sqlite_page(buf, (int)sizeof buf, 2, &h, &pg) != 1)
+        return err(12, "页解析失败");
+    if (pg.type != 13 || pg.ncell != 2 || pg.hdr_size != 8)
+        return err(13, "页头字段不对");
+    if (pg.offset != 4096 || pg.cell_start != 4096 - 16)
+        return err(14, "页偏移或单元起点不对");
+    if (sqlite_cell(buf, (int)sizeof buf, &h, 2, &pg, 0, &c) != 1)
+        return err(15, "单元 0 解析失败");
+    if (c.payload_len != 5 || c.rowid != 100 || c.local_payload != 5)
+        return err(16, "单元 0 字段不对");
+    if (memcmp(buf + c.payload_off, "hello", 5) != 0)
+        return err(17, "单元 0 的 payload 不对");
+    if (sqlite_cell(buf, (int)sizeof buf, &h, 2, &pg, 1, &c) != 1)
+        return err(18, "单元 1 解析失败");
+    if (c.rowid != 200 || c.payload_len != 3)
+        return err(19, "单元 1 的 rowid 或长度不对");
+    if (sqlite_cell(buf, (int)sizeof buf, &h, 2, &pg, 5, &c) != -1)
+        return err(20, "越界单元应该 -1");
+}
+
+test "sqlite：变长整数" {
+    i64 v = 0;
+    int used = 0;
+
+    if (sqlite_varint("\x00", 1, 0, &v, &used) != 1 || v != 0 || used != 1)
+        return err(21, "0 的变长整数不对");
+    if (sqlite_varint("\x7f", 1, 0, &v, &used) != 1 || v != 127)
+        return err(22, "127 的变长整数不对");
+    if (sqlite_varint("\x81\x48", 2, 0, &v, &used) != 1 || v != 200
+        || used != 2)
+        return err(23, "200 的变长整数不对");
+    if (sqlite_varint("\x81\x00", 2, 0, &v, &used) != 1 || v != 128)
+        return err(24, "128 的变长整数不对");
+    if (sqlite_varint("\xbd\x84\x40", 3, 0, &v, &used) != 1
+        || used != 3 || v != 1000000)
+        return err(25, "1000000 的三字节变长整数不对");
+    if (sqlite_varint("\x80", 1, 0, &v, &used) != -1)
+        return err(26, "截断的变长整数应该 -1");
+}

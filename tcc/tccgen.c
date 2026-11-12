@@ -12914,6 +12914,10 @@ static const struct C6ErrStdSlot {
     { "std.net.syslog",         C6_ERR_SLOT_STD + 206 },
     { "std.net.stun",           C6_ERR_SLOT_STD + 207 },
     { "std.net.tftp",           C6_ERR_SLOT_STD + 208 },
+    { "std.os.log",             C6_ERR_SLOT_STD + 209 },
+    { "std.data.sqlite",        C6_ERR_SLOT_STD + 210 },
+    { "std.net.postgres",       C6_ERR_SLOT_STD + 211 },
+    { "std.net.mysql",          C6_ERR_SLOT_STD + 212 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

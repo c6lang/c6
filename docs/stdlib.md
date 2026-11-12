@@ -241,6 +241,10 @@
 | `std/net/syslog.c6` | `std.net.syslog` | syslog：`syslog_parse` 同时认 RFC 5424（`<PRI>1 时间 主机 应用 procid msgid 结构数据 消息`）与老式 RFC 3164（`<PRI>MMM dd hh:mm:ss 主机 TAG: 消息`），`syslog_pri` 算 PRI，`syslog_build` 生成 5424 简化报文；字段都是原缓冲区的视图 |
 | `std/net/stun.c6` | `std.net.stun` | STUN（RFC 5389）：`stun_parse` 解 20 字节头（类型位交错的方法/类别、魔术字、事务 ID），`stun_attr_at`/`stun_find` 走 TLV 属性（按 4 字节补齐），`stun_xor_addr` 解 XOR-MAPPED-ADDRESS（IPv4），`stun_build`/`stun_make_type` 反向构造 |
 | `std/net/tftp.c6` | `std.net.tftp` | TFTP：`tftp_parse` 解 RRQ/WRQ（文件名 + 模式 + 选项区）、DATA（块号 + 数据）、ACK、ERROR、OACK；`tftp_build_rrq`/`tftp_build_wrq`/`tftp_build_data`/`tftp_build_ack`/`tftp_build_error` 负责构造 |
+| `std/os/log.c6` | `std.os.log` | 定长环形日志：`log_init` 给槽位数组与最高级别，`log_add` 按 `LOG_TRACE`..`LOG_FATAL` 过滤并写入（超长截断），`log_at`/`log_text`/`log_dump` 取记录与格式化，`log_count_level`/`log_dropped`/`log_filtered` 给统计 |
+| `std/data/sqlite.c6` | `std.data.sqlite` | SQLite 文件：`sqlite_header` 解 100 字节文件头（页大小/格式版本/payload 分界/库页数/schema/文本编码/user_version/app_id），`sqlite_page` 解 B-tree 页头与单元数，`sqlite_cell` 解单元（payload 长度 + rowid + 本地 payload，溢出页标记），`sqlite_varint` 解 1..9 字节变长整数 |
+| `std/net/postgres.c6` | `std.net.postgres` | PostgreSQL v3：`pg_parse` 拆「1 字节类型 + 4 字节长度」的报文，`pg_startup`/`pg_startup_param` 解启动包里的 `键\0值\0` 对，`pg_error_field` 取 ErrorResponse 字段，`pg_build_msg`/`pg_build_query`/`pg_build_password`/`pg_build_startup` 负责构造 |
+| `std/net/mysql.c6` | `std.net.mysql` | MySQL：`my_parse` 拆「3 字节小端长度 + 序号 + 正文」的报文，`my_handshake` 解 HandshakeV10（服务端版本/连接 ID/能力位/字符集/20 字节挑战串），`my_lenenc` 解长度编码整数（含 `0xFB` NULL），`my_build_query`/`my_build_auth` 构造 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -333,6 +337,7 @@
 | `examples/stdnumeric.c6` | （无模块） | 第四十七批（数值工具）的拼装示例（`make std-math2`）：矢量运算、多项式求值/求导/求根、FFT 往返与单频频谱、样条采样；链接带 `-lm` |
 | `examples/stdtime.c6` | （无模块） | 第四十八批（时间工具）的拼装示例（`make std-time`）：日历换算、ISO 8601 解析/格式化、时长解析/格式化、cron 匹配与下次运行 |
 | `examples/stdpacket.c6` | （无模块） | 第四十九批（网络报文）的拼装示例（`make std-packet`）：NTP 时间戳与偏移、syslog 两种 RFC、STUN 属性与 XOR 地址、TFTP 四种报文 |
+| `examples/stddb.c6` | （无模块） | 第五十批（日志与数据库）的拼装示例（`make std-db`）：环形日志过滤与 dump、SQLite 文件头/页/单元、PostgreSQL 报文与启动包、MySQL 握手与 COM_QUERY |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -423,6 +428,10 @@ std/net/ntp.c6             24 test(s), 0 failure(s)
 std/net/syslog.c6          24 test(s), 0 failure(s)
 std/net/stun.c6            24 test(s), 0 failure(s)
 std/net/tftp.c6            24 test(s), 0 failure(s)
+std/os/log.c6              24 test(s), 0 failure(s)
+std/data/sqlite.c6         25 test(s), 0 failure(s)
+std/net/postgres.c6        24 test(s), 0 failure(s)
+std/net/mysql.c6           24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3702,6 +3711,17 @@ make std-packet
 5424 与 3164 各一条并构造 5424；STUN 造一条带 XOR-MAPPED-ADDRESS 的成功应答再解回
 `192.0.2.1:32853`；TFTP 把 RRQ/DATA/ACK/ERROR 各来回一遍。
 
+### 集成示例：`examples/stddb.c6`
+
+```sh
+make std-db
+```
+
+四节：日志先用 `LOG_INFO` 档位验证 DEBUG 被过滤、环形覆盖后 dump 从最旧的可用记录
+开始；SQLite 造「文件头 + 叶子表页 + 一个单元」并解出 rowid 与 payload；PostgreSQL
+构造并拆 `Q` 报文与启动包、按名取 `user`/`database`；MySQL 拆 `COM_QUERY` 并解析
+一个最小 HandshakeV10。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3795,6 +3815,8 @@ make std-packet
 * `make std-time`：`examples/stdtime.c6`，第四十八批（时间工具）模块的拼装示例
   （自带自检）。
 * `make std-packet`：`examples/stdpacket.c6`，第四十九批（网络报文）模块的拼装示例
+  （自带自检）。
+* `make std-db`：`examples/stddb.c6`，第五十批（日志与数据库）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
