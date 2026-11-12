@@ -1,0 +1,237 @@
+/* std/data/voc：Creative Voice File（`.voc`，Sound Blaster）的块遍历。
+ *
+ *     import std.data.voc;
+ *
+ *     VocDoc doc = { 0 };
+ *     VocBlock b = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / rewind / rate
+ *     while (doc.next(&b) == 1)
+ *         // b.type / b.size / b.data_off
+ *
+ * 文件头 26 字节：`Creative Voice File` + 0x1A（20 字节）、头长度（2，小端）、
+ * 版本号（2）、校验（2）。之后是一串块：类型（1）+ 长度（3 字节小端）+ 数据。
+ *
+ * 常见块类型：1 声音数据（首字节是 `256 - 1000000/rate`）、2 续块、3 静音、
+ * 4 标记、5 文本、6 重复开始、7 重复结束、8 扩展（带 16 位率与压缩类型）、
+ * 9 新格式（32 位率）。
+ *
+ * 约定：
+ *
+ * - `open` 校验魔数并定位第一个块，返回块数；`next` 顺序返回，`rewind` 复位；
+ * - `rate` 从块 1（8 位率）或块 9（32 位率）里解出采样率，解不出返回 0；
+ * - 块长度按 3 字节小端读，`size` 是数据长度（不含 4 字节块头）；
+ * - 未知块类型照样返回（`type` 原样给出），调用方自己决定跳过；
+ * - `data_off` 越界的文件在 `open` 时返回 -1。
+ */
+#include <string.h>
+
+module std.data.voc;
+import std.core.types;
+import std.text.str;
+
+struct VocBlock {
+    int type;
+    u32 size;
+    int data_off;
+};
+
+struct VocDoc {
+    const char *src;
+    int n;
+    int off;
+    int nblocks;
+    int srate;
+};
+
+static int voc_le16(const u8 *p)
+{
+    return (int)((u32)p[0] | ((u32)p[1] << 8));
+}
+
+static u32 voc_le24(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16);
+}
+
+int open(VocDoc *d, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    int hdr = 0, off = 0, count = 0, rate = 0;
+
+    if (!d || !src || n < 26)
+        return -1;
+    if (memcmp(p, "Creative Voice File", 19) != 0 || p[19] != 0x1A)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    hdr = voc_le16(p + 20);
+    if (hdr < 26 || hdr > n)
+        return -1;
+    d->off = hdr;
+    off = hdr;
+    while (off + 4 <= n) {
+        int type = (int)p[off];
+        u32 size = voc_le24(p + off + 1);
+
+        if (type == 0)
+            break;                      /* 0 号块表示结束 */
+        if (off + 4 + (int)size > n)
+            break;
+        if (type == 1 && size >= 2 && rate == 0) {
+            int r = (int)p[off + 4];
+
+            if (r != 0)
+                rate = 1000000 / (256 - r);
+        }
+        if (type == 9 && size >= 12) {
+            u32 r9 = (u32)p[off + 4] | ((u32)p[off + 5] << 8)
+                     | ((u32)p[off + 6] << 16) | ((u32)p[off + 7] << 24);
+
+            if (r9 != 0)
+                rate = (int)r9;         /* 新格式块的率字段为 0 时沿用旧值 */
+        }
+        count++;
+        off += 4 + (int)size;
+    }
+    d->nblocks = count;
+    d->srate = rate;
+    return count;
+}
+
+int next(VocDoc *d, VocBlock *out)
+{
+    const u8 *p = 0;
+    int type = 0;
+    u32 size = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    if (d->off + 4 > d->n)
+        return 0;
+    p = (const u8 *)d->src;
+    type = (int)p[d->off];
+    if (type == 0) {
+        d->off = d->n;
+        return 0;
+    }
+    size = voc_le24(p + d->off + 1);
+    if (d->off + 4 + (int)size > d->n)
+        return -1;
+    out->type = type;
+    out->size = size;
+    out->data_off = d->off + 4;
+    d->off += 4 + (int)size;
+    return 1;
+}
+
+int count(VocDoc *d)
+{
+    return d ? d->nblocks : 0;
+}
+
+int rewind(VocDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 26;
+    return 1;
+}
+
+int rate(VocDoc *d)
+{
+    return d ? d->srate : 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void voc_put16(u8 *p, int v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+}
+
+static void voc_put24(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+}
+
+static void voc_put32(u8 *p, u32 v)
+{
+    voc_put16(p, (int)(v & 0xFFFF));
+    voc_put16(p + 2, (int)((v >> 16) & 0xFFFF));
+}
+
+/* 造一个含「声音数据块（8 位 11111Hz）+ 标记块 + 结束块」的 voc */
+static int mk_voc(u8 *buf)
+{
+    int o = 26;
+
+    memset(buf, 0, 256);
+    memcpy(buf, "Creative Voice File", 19);
+    buf[19] = 0x1A;
+    voc_put16(buf + 20, 26);
+    voc_put16(buf + 22, 0x010A);
+    voc_put16(buf + 24, 0x1111);
+    /* 块 1：声音数据，率字节 166 → 1000000/(256-166)=11111，4 字节样本 */
+    buf[o] = 1;
+    voc_put24(buf + o + 1, 5);
+    buf[o + 4] = 166;
+    memcpy(buf + o + 5, "abcd", 4);
+    o += 4 + 5;
+    /* 块 4：标记，2 字节 */
+    buf[o] = 4;
+    voc_put24(buf + o + 1, 2);
+    buf[o + 4] = 'M';
+    buf[o + 5] = '1';
+    o += 4 + 2;
+    /* 块 9：新格式，12 字节（率 48000、位深 16、声道 2、压缩 0） */
+    buf[o] = 9;
+    voc_put24(buf + o + 1, 12);
+    voc_put32(buf + o + 4, 0);
+    buf[o + 8] = 16;
+    buf[o + 9] = 2;
+    voc_put16(buf + o + 10, 0);
+    voc_put16(buf + o + 12, 0);
+    o += 4 + 12;
+    /* 结束块 */
+    buf[o] = 0;
+    o += 1;
+    return o;
+}
+
+test "voc：块遍历与采样率" {
+    static u8 buf[256] = { 0 };
+    VocDoc d = { 0 };
+    VocBlock b = { 0 };
+    int n = mk_voc(buf);
+
+    if (d.open(buf, n) != 3)
+        return err(1, "应该有 3 个块（0 号结束块不算）");
+    if (d.count() != 3)
+        return err(2, "count() 不对");
+    if (d.rate() != 11111)
+        return err(3, "采样率应该是 11111");
+    if (d.next(&b) != 1 || b.type != 1 || b.size != 5)
+        return err(4, "第一个块是声音数据（5 字节）");
+    if (buf[b.data_off] != 166)
+        return err(5, "声音数据块首字节应该是率字节");
+    if (d.next(&b) != 1 || b.type != 4 || b.size != 2)
+        return err(6, "第二个块是标记");
+    if (d.next(&b) != 1 || b.type != 9 || b.size != 12)
+        return err(7, "第三个块是新格式");
+    if (d.next(&b) != 0)
+        return err(8, "读到结束块应该返回 0");
+    d.rewind();
+    if (d.next(&b) != 1 || b.type != 1)
+        return err(9, "rewind 之后应该回到第一个块");
+    if (d.open("Creative Voice File\x1A", 20) != -1)
+        return err(10, "太短应该 -1");
+    buf[0] = 'X';
+    if (d.open(buf, n) != -1)
+        return err(11, "魔数不对应该 -1");
+}

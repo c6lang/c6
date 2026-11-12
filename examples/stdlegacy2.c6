@@ -1,0 +1,192 @@
+/* examples/stdlegacy2.c6 —— 第六十六批（老音频格式头）的集成示例。
+ *
+ *     make std-audio2
+ *
+ * 四节：AIFF（FORM 块 + 80 位采样率）、AU、VOC（块遍历）、IRCAM。都是纯头解析。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.aiff;
+import std.data.au;
+import std.data.voc;
+import std.data.ircam;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void put32be(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+static void put32le(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void put16le(u8 *p, int v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+}
+
+/* 80 位扩展浮点：value = M * 2^(E-16383-63) */
+static void put80(u8 *p, int v)
+{
+    u32 t = (u32)v;
+    int s = 0, k = 0, exp = 0, i = 0;
+    u64 mant = 0;
+
+    memset(p, 0, 10);
+    if (v == 0)
+        return;
+    while ((t & 0x80000000u) == 0) {
+        t <<= 1;
+        s++;
+    }
+    k = 31 - s;
+    exp = 16383 + k;
+    mant = (u64)(u32)v << (63 - k);
+    p[0] = (u8)((exp >> 8) & 0x7F);
+    p[1] = (u8)(exp & 0xFF);
+    for (i = 0; i < 8; i++)
+        p[2 + i] = (u8)((mant >> (56 - i * 8)) & 0xFF);
+}
+
+static void do_aiff(void)
+{
+    static u8 buf[256] = { 0 };
+    AiffDoc doc = { 0 };
+    AiffChunk ch = { 0 };
+    int o = 0, n = 0;
+
+    printf("== aiff\n");
+    memcpy(buf, "FORM", 4);
+    memcpy(buf + 8, "AIFF", 4);
+    o = 12;
+    memcpy(buf + o, "COMM", 4);
+    put32be(buf + o + 4, 18);
+    buf[o + 9] = 1;                     /* 1 声道 */
+    put32be(buf + o + 10, 800);         /* 800 帧 */
+    buf[o + 15] = 16;
+    put80(buf + o + 16, 8000);
+    o += 8 + 18;
+    memcpy(buf + o, "SSND", 4);
+    put32be(buf + o + 4, 8 + 16);
+    put32be(buf + o + 8, 0);
+    memcpy(buf + o + 16, "PCM!", 4);
+    o += 8 + 24;
+    put32be(buf + 4, (u32)(o - 8));
+    n = o;
+    check(doc.open(buf, n) == 2, "open 两个块");
+    printf("   %d 声道，%lld 帧，%d 位，%.0f Hz\n", doc.info.channels,
+           (long long)doc.info.frames, doc.info.bits, doc.info.rate);
+    check(doc.info.channels == 1 && doc.info.frames == 800, "声道与帧数");
+    check(doc.info.bits == 16 && doc.info.rate > 7999 && doc.info.rate < 8001,
+          "位深与采样率（80 位扩展浮点）");
+    check(doc.ssnd_data_off() > 0 && doc.ssnd_size() == 16, "采样数据位置");
+    while (doc.next(&ch) == 1)
+        printf("   块 %.*s（%u 字节）\n", ch.id.s.len, ch.id.s.data, ch.size);
+    doc.rewind();
+    check(doc.next(&ch) == 1 && memcmp(ch.id.s.data, "COMM", 4) == 0, "块顺序");
+}
+
+static void do_au(void)
+{
+    static u8 buf[64] = { 0 };
+    AuInfo a = { 0 };
+
+    printf("== au\n");
+    put32be(buf, 0x2E736E64u);
+    put32be(buf + 4, 24);
+    put32be(buf + 8, 1000);
+    put32be(buf + 12, 3);
+    put32be(buf + 16, 16000);
+    put32be(buf + 20, 1);
+    check(a.parse(buf, 40) == 1, "parse");
+    printf("   %s，%d Hz，%d 声道\n", a.encoding_name(), a.rate, a.channels);
+    check(a.encoding == 3 && a.rate == 16000, "编码与采样率");
+    check(a.bytes_per_sample() == 2 && a.data_off == 24, "每样本字节与偏移");
+    check(a.has_comment == 0, "没有注释");
+}
+
+static void do_voc(void)
+{
+    static u8 buf[128] = { 0 };
+    VocDoc doc = { 0 };
+    VocBlock b = { 0 };
+    int o = 26, n = 0;
+
+    printf("== voc\n");
+    memcpy(buf, "Creative Voice File", 19);
+    buf[19] = 0x1A;
+    put16le(buf + 20, 26);
+    buf[o] = 1;                         /* 声音数据块 */
+    buf[o + 1] = 5;
+    buf[o + 2] = 0;
+    buf[o + 3] = 0;
+    buf[o + 4] = 166;                   /* 1000000/(256-166)=11111 */
+    memcpy(buf + o + 5, "abcd", 4);
+    o += 4 + 5;
+    buf[o] = 0;                         /* 结束块 */
+    o += 1;
+    n = o;
+    check(doc.open(buf, n) == 1, "open 一个块");
+    printf("   采样率 %d Hz\n", doc.rate());
+    check(doc.rate() == 11111, "率字节换算");
+    check(doc.next(&b) == 1 && b.type == 1 && b.size == 5, "块字段");
+    check(doc.next(&b) == 0, "结束块返回 0");
+}
+
+static void do_ircam(void)
+{
+    static u8 buf[64] = { 0 };
+    IrcamInfo m = { 0 };
+    int i = 0;
+    /* 22050 = 1.345...×2^14：手写浮点位太啰嗦，这里用 32768（2^15）验证解码 */
+    u32 bits = ((u32)(127 + 15) << 23);
+
+    printf("== ircam\n");
+    put32be(buf, 0x0001A364u);
+    put32be(buf + 4, bits);
+    put32be(buf + 8, 1);
+    put32be(buf + 12, 2);
+    check(m.parse(buf, 20) == 1, "parse");
+    printf("   %.0f Hz，%d 声道，%s，数据从 %d 开始\n", m.rate, m.channels,
+           m.encoding_name(), m.data_off);
+    check(m.rate > 32767 && m.rate < 32769, "浮点采样率解码");
+    check(m.encoding == 2 && m.bytes_per_sample() == 1, "编码与字节数");
+    check(m.data_off == 16, "没有 info 时数据偏移 16");
+    for (i = 0; i < 0; i++)
+        ;
+}
+
+int main(void)
+{
+    do_aiff();
+    do_au();
+    do_voc();
+    do_ircam();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

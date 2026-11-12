@@ -305,6 +305,11 @@
 | `std/text/bmh.c6` | `std.text.bmh` | Boyer-Moore-Horspool（**方法**：`h.init`/`h.find`/`h.count`/`h.skip_of`/`h.pattern_len`）：256 项坏字符表内嵌在结构里，`count` 按**不重叠**计，`skip_of` 便于观察跳跃步长 |
 | `std/text/suffix.c6` | `std.text.suffix` | 后缀数组（**方法**：`x.build`/`x.at`/`x.search`/`x.lcp`/`x.count`）：插入排序构造（O(n²) 最坏，适合几千字节），`search` 二分后在同一前缀段里取**最早**出现，`lcp` 用 Kasai 算法 |
 | `std/text/wordplay.c6` | `std.text.wordplay` | 文字游戏：`is_palindrome`（忽略标点与大小写）、`longest_palindrome`（中心扩展，`*start` 给起点）、`count_palindromes`、`reverse_words`；`Ana` 结构存 26 字母计数指纹（**方法**：`a.build`/`a.same`/`a.canonical`/`a.count`/`a.letters`）判异位词 |
+| `std/data/aiff.c6` | `std.data.aiff` | AIFF/AIFF-C（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.rewind`/`doc.ssnd_data_off`/`doc.ssnd_size`）：`FORM`+块遍历（偶数对齐），`COMM` 给声道/帧数/位深与 **80 位扩展浮点**采样率，`SSND` 定位采样数据起点 |
+| `std/data/au.c6` | `std.data.au` | Sun/NeXT `.au`（**方法**：`a.parse`/`a.encoding_name`/`a.bytes_per_sample`）：24 字节大端头（魔数 `.snd`、数据偏移、编码、采样率、声道），编码 1..7 与 27（μ-law/A-law/PCM/浮点） |
+| `std/data/voc.c6` | `std.data.voc` | Creative Voice（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.rewind`/`doc.rate`）：`Creative Voice File\x1A` 头 + 块遍历（1 字节类型 + 3 字节长度），采样率从块 1（8 位率）或块 9（32 位率）解出 |
+| `std/data/ircam.c6` | `std.data.ircam` | IRCAM/Berkeley `SF`（**方法**：`m.parse`/`m.encoding_name`/`m.bytes_per_sample`）：`0x0001A364` 魔数 + 单精度浮点采样率 + 声道 + 编码，可选 `info` 文本块决定数据偏移 |
+
 
 
 
@@ -422,6 +427,7 @@
 | `examples/stdcontainers.c6` | （无模块） | 第六十三批（基础容器补充）的拼装示例（`make std-cont`）：栈做括号匹配、队列验回绕、槽位分配与复用、多重集合计数与最多次数 |
 | `examples/stdstats2.c6` | （无模块） | 第六十四批（统计小工具）的拼装示例（`make std-stats`）：直方图分箱与众数箱、SMA/EMA、序列均值/标准差/相关、分位数与四分位；链接带 `-lm` |
 | `examples/stdsearch.c6` | （无模块） | 第六十五批（字符串算法）的拼装示例（`make std-search`）：KMP/BMH 查找与计数、后缀数组检索与 LCP、回文与异位词 |
+| `examples/stdlegacy2.c6` | （无模块） | 第六十六批（老音频格式头）的拼装示例（`make std-audio2`）：AIFF 块与 80 位采样率、AU 编码、VOC 块遍历、IRCAM 浮点采样率 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -576,6 +582,10 @@ std/text/kmp.c6            24 test(s), 0 failure(s)
 std/text/bmh.c6            24 test(s), 0 failure(s)
 std/text/suffix.c6         24 test(s), 0 failure(s)
 std/text/wordplay.c6       24 test(s), 0 failure(s)
+std/data/aiff.c6           24 test(s), 0 failure(s)
+std/data/au.c6             23 test(s), 0 failure(s)
+std/data/voc.c6            23 test(s), 0 failure(s)
+std/data/ircam.c6          23 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4027,6 +4037,17 @@ make std-search
 `5 3 1 0 4 2`、用 `x.search("ana")` 得最早出现 1、`x.lcp` 打印相邻 LCP；wordplay 验
 经典回文句、`cbbd` 的最长回文与 `listen`/`silent` 的异位词判定。
 
+### 集成示例：`examples/stdlegacy2.c6`
+
+```sh
+make std-audio2
+```
+
+四节：AIFF 现场拼 `COMM`/`SSND` 两个块，验证 80 位扩展浮点的采样率（8000 Hz）、
+声道/帧数与采样数据位置，再用 `doc.next` 遍历块；AU 验证 `pcm16` 编码、每样本字节数
+与数据偏移；VOC 用率字节 166 得到 11111 Hz 并遍历块；IRCAM 用单精度浮点位解出
+32768 Hz 并检查 `info` 块缺失时的数据偏移。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4153,6 +4174,8 @@ make std-search
   （自带自检，链接带 `-lm`）。
 * `make std-search`：`examples/stdsearch.c6`，第六十五批（字符串算法）模块的拼装示例
   （自带自检）。
+* `make std-audio2`：`examples/stdlegacy2.c6`，第六十六批（老音频格式头）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

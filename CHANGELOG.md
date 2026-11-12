@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第六十六批（老音频格式头）**：`std.data.aiff`（FORM 块 + 80 位扩展浮点
+  采样率）、`std.data.au`（Sun `.au` 编码表）、`std.data.voc`（Creative Voice 块遍历）、
+  `std.data.ircam`（IRCAM `SF` 浮点采样率），集成示例 `examples/stdlegacy2.c6`
+  （`make std-audio2`）。错误号段 `std.data.aiff`=0x6111 … `std.data.ircam`=0x6114
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十五批（字符串算法）**：`std.text.kmp`（KMP + 可重叠计数）、
   `std.text.bmh`（Boyer-Moore-Horspool）、`std.text.suffix`（后缀数组 + 二分检索 +
   Kasai LCP）、`std.text.wordplay`（回文/最长回文/倒序单词/异位词指纹），集成示例

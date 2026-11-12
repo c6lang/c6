@@ -2212,6 +2212,28 @@ systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，�
 验收：`make stdtest`（273 个模块、0 failure）、`make std-search`（22 条自检全过）、
 `make check-all`。
 
+### 11.78 标准库第六十六批（aiff / au / voc / ircam）
+
+第六十六批做「老音频格式头」：AIFF、Sun `.au`、Creative Voice 与 IRCAM。四种都是
+「固定头 + 块/编码号」的结构，AIFF 与 VOC 用块游标，AU 与 IRCAM 用带方法的小结构。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.aiff` | AIFF/AIFF-C | `COMM` 里的采样率是 **80 位扩展浮点**（符号+15 位指数+64 位尾数，值 = M·2^(E−16383−63)）；第一版把指数算错成 `E = 16383+63−shift`，44100 解出来大得离谱，改成 `E = 16383 + bitpos` 才对；块长度奇数要跳 1 字节 |
+| `std.data.au` | Sun `.au` | 24 字节大端头；编码号 1..7 与 27（A-law），`bytes_per_sample` 做映射；数据偏移 < 24 判坏 |
+| `std.data.voc` | Creative Voice | 1 字节类型 + **3 字节小端**长度；采样率来自块 1（`1000000/(256-rate)`）或块 9（32 位率），块 9 的率字段为 0 时要**沿用旧值**而不是清零 |
+| `std.data.ircam` | IRCAM `SF` | 魔数 `0x0001A364` + **单精度浮点**采样率（手写解码，不用 libm）；`info` 块存在时数据偏移要跳过它 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.aiff`=0x6111、
+`std.data.au`=0x6112、`std.data.voc`=0x6113、`std.data.ircam`=0x6114；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-audio2` 与 `STD_AUDIO2_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（aiff 24 条，
+au/voc/ircam 各 23 条）。示例 `examples/stdlegacy2.c6` 四节（17 条自检）。
+
+验收：`make stdtest`（277 个模块、0 failure）、`make std-audio2`（17 条自检全过）、
+`make check-all`。
+
+
 
 
 

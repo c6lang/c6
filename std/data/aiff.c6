@@ -1,0 +1,303 @@
+/* std/data/aiff：AIFF / AIFF-C（Apple 音频交换格式）的 FORM 结构与 COMM/SSND 块。
+ *
+ *     import std.data.aiff;
+ *
+ *     AiffDoc doc = { 0 };
+ *     AiffChunk ch = { 0 };
+ *     doc.open(buf, n);                  // 游标：open / next / count / rewind
+ *     // doc.info.channels / doc.info.frames / doc.info.bits / doc.info.rate
+ *     while (doc.next(&ch) == 1)
+ *         // ch.id（"COMM"/"SSND"…）/ ch.size / ch.data_off
+ *
+ * 结构：`FORM<大小>AIFF` 之后是一串块：4 字节 id + 4 字节大端长度 + 数据（偶数对齐）。
+ * `COMM` 块给出声道数、帧数、位深、采样率（80 位扩展浮点）与 AIFF-C 的压缩类型；
+ * `SSND` 块开头 8 字节是偏移与块大小，之后才是采样数据。
+ *
+ * 约定：
+ *
+ * - `open` 校验 `FORM`/`AIFF`|`AIFC` 并解析 `COMM`、定位 `SSND`，返回块数；
+ * - `info.rate` 已把 80 位扩展浮点解成 `double`；`info.compression` 是 AIFF-C 的
+ *   4 字节压缩类型（AIFF 为空串）；
+ * - `next` 顺序返回每个块（含 `COMM`/`SSND`）；`ssnd_data_off` 是**采样数据**起点
+ *   （已跳过 8 字节偏移），`ssnd_size` 是采样数据长度；
+ * - 块长度是奇数时跳过 1 字节补齐；`open` 对截断文件返回 -1；
+ * - 不做采样解码（8/16/24/32 位 PCM 由调用方按 `bits` 自行解释）。
+ */
+#include <string.h>
+
+module std.data.aiff;
+import std.core.types;
+import std.text.str;
+
+struct AiffInfo {
+    int channels;
+    i64 frames;
+    int bits;
+    double rate;
+    int is_aifc;
+    Str compression;
+};
+
+struct AiffChunk {
+    Str id;
+    u32 size;
+    int data_off;
+};
+
+struct AiffDoc {
+    const char *src;
+    int n;
+    int off;
+    int nchunks;
+    AiffInfo info;
+    int ssnd_off;       /* 字段名不能与 ssnd_data_off() 方法冲突 */
+    u32 ssnd_bytes;     /* 同上，避免与 ssnd_size() 冲突 */
+};
+
+static u32 aiff_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+int open(AiffDoc *d, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 0, count = 0;
+
+    if (!d || !src || n < 12)
+        return -1;
+    if (memcmp(p, "FORM", 4) != 0)
+        return -1;
+    if (memcmp(p + 8, "AIFF", 4) != 0 && memcmp(p + 8, "AIFC", 4) != 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    d->info.is_aifc = memcmp(p + 8, "AIFC", 4) == 0 ? 1 : 0;
+    off = 12;
+    while (off + 8 <= n) {
+        u32 size = aiff_be32(p + off + 4);
+
+        if (off + 8 + (int)size > n)
+            return -1;
+        if (memcmp(p + off, "COMM", 4) == 0 && size >= 18) {
+            const u8 *c = p + off + 8;
+            u32 frames = aiff_be32(c + 2);
+
+            d->info.channels = (int)(((u32)c[0] << 8) | c[1]);
+            /* frames 是 32 位无符号，但 AIFF 允许更大的值（这里按 32 位读） */
+            d->info.frames = (i64)frames;
+            d->info.bits = (int)(((u32)c[6] << 8) | c[7]);
+            d->info.rate = 0;           /* 下面用 80 位解，先占位 */
+            {
+                /* 采样率是 10 字节 80 位扩展浮点：符号+15 位指数+64 位尾数 */
+                int exp = ((int)c[8] << 8) | (int)c[9];
+                u64 mant = 0;
+                int k = 0;
+
+                for (k = 0; k < 8; k++)
+                    mant = (mant << 8) | (u64)c[10 + k];
+                if (exp != 0 || mant != 0) {
+                    int e2 = (exp & 0x7FFF) - 16383 - 63;
+                    double scale = 1.0;
+
+                    if (e2 >= 0) {
+                        for (k = 0; k < e2; k++)
+                            scale *= 2.0;
+                    } else {
+                        for (k = 0; k < -e2; k++)
+                            scale *= 0.5;
+                    }
+                    d->info.rate = (double)mant * scale;
+                    if ((exp & 0x8000) != 0)
+                        d->info.rate = -d->info.rate;
+                }
+            }
+            if (size >= 22 && d->info.is_aifc) {
+                d->info.compression.s = (char[:]){ (char *)c + 18, 4 };
+            }
+        } else if (memcmp(p + off, "SSND", 4) == 0 && size >= 8) {
+            const u8 *c = p + off + 8;
+
+            d->ssnd_off = off + 8 + 8 + (int)aiff_be32(c);
+            d->ssnd_bytes = size - 8;
+            if (d->ssnd_off > n)
+                return -1;
+        }
+        count++;
+        off += 8 + (int)size;
+        if ((size & 1) != 0)
+            off++;
+    }
+    d->nchunks = count;
+    d->off = 12;
+    if (d->info.channels <= 0 || d->info.bits <= 0 || d->info.rate <= 0)
+        return -1;
+    return count;
+}
+
+int next(AiffDoc *d, AiffChunk *out)
+{
+    const u8 *p = 0;
+    u32 size = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    if (d->off + 8 > d->n)
+        return 0;
+    p = (const u8 *)d->src;
+    size = aiff_be32(p + d->off + 4);
+    if (d->off + 8 + (int)size > d->n)
+        return -1;
+    out->id.s = (char[:]){ (char *)p + d->off, 4 };
+    out->size = size;
+    out->data_off = d->off + 8;
+    d->off += 8 + (int)size;
+    if ((size & 1) != 0)
+        d->off++;
+    return 1;
+}
+
+int count(AiffDoc *d)
+{
+    return d ? d->nchunks : 0;
+}
+
+int rewind(AiffDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 12;
+    return 1;
+}
+
+int ssnd_data_off(AiffDoc *d)
+{
+    return d ? d->ssnd_off : -1;
+}
+
+u32 ssnd_size(AiffDoc *d)
+{
+    return d ? d->ssnd_bytes : 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void aiff_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+/* 写 80 位扩展浮点（只支持整数值，足够测试采样率）：
+ * value = M * 2^(E-16383-63)，其中 M 的整数位在 bit63 */
+static void aiff_put80(u8 *p, int v)
+{
+    u64 mant = 0;
+    int k = 0, s = 0, exp = 0, i = 0;
+    u32 t = 0;
+
+    memset(p, 0, 10);
+    if (v == 0)
+        return;
+    t = (u32)v;
+    while ((t & 0x80000000u) == 0) {
+        t <<= 1;
+        s++;
+    }
+    k = 31 - s;                         /* 最高位所在的位置 */
+    exp = 16383 + k;
+    mant = (u64)(u32)v << (63 - k);
+    p[0] = (u8)((exp >> 8) & 0x7F);
+    p[1] = (u8)(exp & 0xFF);
+    for (i = 0; i < 8; i++)
+        p[2 + i] = (u8)((mant >> (56 - i * 8)) & 0xFF);
+}
+
+static int mk_aiff(u8 *buf)
+{
+    int o = 0;
+
+    memset(buf, 0, 512);
+    memcpy(buf, "FORM", 4);
+    aiff_put32(buf + 4, 0);             /* 大小稍后回填 */
+    memcpy(buf + 8, "AIFF", 4);
+    o = 12;
+    /* COMM：2 声道、1000 帧、16 位、44100 */
+    memcpy(buf + o, "COMM", 4);
+    aiff_put32(buf + o + 4, 18);
+    buf[o + 8] = 0;
+    buf[o + 9] = 2;
+    aiff_put32(buf + o + 10, 1000);
+    buf[o + 14] = 0;
+    buf[o + 15] = 16;
+    aiff_put80(buf + o + 16, 44100);
+    o += 8 + 18;
+    /* SSND：offset=0、blocksize=0，后面 200 字节数据 */
+    memcpy(buf + o, "SSND", 4);
+    aiff_put32(buf + o + 4, 8 + 200);
+    aiff_put32(buf + o + 8, 0);
+    memcpy(buf + o + 16, "DATA", 4);
+    o += 8 + 208;
+    aiff_put32(buf + 4, (u32)(o - 8));
+    return o;
+}
+
+test "aiff：头与块游标" {
+    static u8 buf[512] = { 0 };
+    AiffDoc d = { 0 };
+    AiffChunk ch = { 0 };
+    int n = mk_aiff(buf);
+
+    if (d.open(buf, n) != 2)
+        return err(1, "应该有 COMM 与 SSND 两个块");
+    if (d.info.channels != 2 || d.info.bits != 16)
+        return err(2, "声道数或位深不对");
+    if (d.info.frames != 1000)
+        return err(3, "帧数不对");
+    if (d.info.rate < 44099.0 || d.info.rate > 44101.0)
+        return err(4, "采样率应该约 44100");
+    if (d.info.is_aifc != 0)
+        return err(5, "不该识别为 AIFC");
+    if (d.count() != 2)
+        return err(6, "count() 不对");
+    if (d.next(&ch) != 1 || memcmp(ch.id.s.data, "COMM", 4) != 0)
+        return err(7, "第一个块应该是 COMM");
+    if (ch.size != 18)
+        return err(8, "COMM 长度应该是 18");
+    if (d.next(&ch) != 1 || memcmp(ch.id.s.data, "SSND", 4) != 0)
+        return err(9, "第二个块应该是 SSND");
+    if (ch.size != 208)
+        return err(10, "SSND 长度不对");
+    if (d.ssnd_data_off() <= 0 || d.ssnd_size() != 200)
+        return err(11, "采样数据偏移/长度不对");
+    if (memcmp(buf + d.ssnd_data_off(), "DATA", 4) != 0)
+        return err(12, "采样数据起点不对");
+    if (d.next(&ch) != 0)
+        return err(13, "读完应该返回 0");
+    d.rewind();
+    if (d.next(&ch) != 1)
+        return err(14, "rewind 之后应该能重新读");
+}
+
+test "aiff：坏数据" {
+    static u8 buf[512] = { 0 };
+    AiffDoc d = { 0 };
+    int n = mk_aiff(buf);
+
+    if (d.open("XXXX", 4) != -1)
+        return err(15, "魔数不对应该 -1");
+    buf[8] = 'X';
+    if (d.open(buf, n) != -1)
+        return err(16, "格式不是 AIFF/AIFC 应该 -1");
+    /* 块长度越界 */
+    mk_aiff(buf);
+    aiff_put32(buf + 12 + 4, 4000);
+    if (d.open(buf, n) != -1)
+        return err(17, "块长度越界应该 -1");
+}

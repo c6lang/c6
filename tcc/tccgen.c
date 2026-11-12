@@ -12978,6 +12978,10 @@ static const struct C6ErrStdSlot {
     { "std.text.bmh",           C6_ERR_SLOT_STD + 270 },
     { "std.text.suffix",        C6_ERR_SLOT_STD + 271 },
     { "std.text.wordplay",      C6_ERR_SLOT_STD + 272 },
+    { "std.data.aiff",          C6_ERR_SLOT_STD + 273 },
+    { "std.data.au",            C6_ERR_SLOT_STD + 274 },
+    { "std.data.voc",           C6_ERR_SLOT_STD + 275 },
+    { "std.data.ircam",         C6_ERR_SLOT_STD + 276 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

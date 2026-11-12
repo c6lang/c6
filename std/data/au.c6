@@ -1,0 +1,173 @@
+/* std/data/au：Sun/NeXT `.au`（`.snd`）音频头。
+ *
+ *     import std.data.au;
+ *
+ *     AuInfo a = { 0 };
+ *     a.parse(buf, n);              // 方法：parse / encoding_name / bytes_per_sample
+ *     // a.rate / a.channels / a.encoding
+ *
+ * 头部固定 24 字节（大端）：魔数 0x2E736E64（ASCII `.snd`）、数据起始偏移、数据
+ * 字节数（0xFFFFFFFF 表示未知）、编码、采样率、声道数；之后是注释字符串。
+ *
+ * 编码码（1..7 与 27）：1 μ-law、2 线性 8 位、3 线性 16 位、4 线性 24 位、
+ * 5 线性 32 位、6 浮点 32 位、7 浮点 64 位、27 A-law。
+ *
+ * 约定：
+ *
+ * - `a.parse(src, n)` 校验魔数、偏移与编码，成功返回 1，否则 -1；
+ * - `a.encoding_name()` 给编码的短名（`"ulaw"`、`"pcm16"`…），未知返回 `"?"`；
+ * - `a.bytes_per_sample()` 给每样本字节数（μ-law/A-law 是 1），未知返回 0；
+ * - `data_off`/`data_size` 直接来自头（`data_size` 可能是 0xFFFFFFFF）；样本数据
+ *   从 `data_off` 开始，是否包含注释由头里的偏移决定；
+ * - 不做解码。
+ */
+#include <string.h>
+
+module std.data.au;
+import std.core.types;
+import std.text.str;
+
+struct AuInfo {
+    u32 data_off;
+    u32 data_size;
+    int encoding;
+    int rate;
+    int channels;
+    int has_comment;
+};
+
+static u32 au_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+int parse(AuInfo *a, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    u32 off = 0;
+
+    if (!a || !src || n < 24)
+        return -1;
+    if (au_be32(p) != 0x2E736E64u)
+        return -1;
+    memset(a, 0, sizeof *a);
+    off = au_be32(p + 4);
+    if (off < 24 || (int)off > n)
+        return -1;
+    a->data_off = off;
+    a->data_size = au_be32(p + 8);
+    a->encoding = (int)au_be32(p + 12);
+    a->rate = (int)au_be32(p + 16);
+    a->channels = (int)au_be32(p + 20);
+    a->has_comment = off > 24 ? 1 : 0;
+    if (a->encoding < 1 || (a->encoding > 7 && a->encoding != 27))
+        return -1;
+    if (a->rate <= 0 || a->channels <= 0)
+        return -1;
+    return 1;
+}
+
+const char *encoding_name(AuInfo *a)
+{
+    if (!a)
+        return "?";
+    switch (a->encoding) {
+    case 1: return "ulaw";
+    case 2: return "pcm8";
+    case 3: return "pcm16";
+    case 4: return "pcm24";
+    case 5: return "pcm32";
+    case 6: return "float32";
+    case 7: return "float64";
+    case 27: return "alaw";
+    default: return "?";
+    }
+}
+
+int bytes_per_sample(AuInfo *a)
+{
+    if (!a)
+        return 0;
+    switch (a->encoding) {
+    case 1:
+    case 2:
+    case 27:
+        return 1;
+    case 3:
+        return 2;
+    case 4:
+        return 3;
+    case 5:
+    case 6:
+        return 4;
+    case 7:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void au_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+static int mk_au(u8 *buf)
+{
+    memset(buf, 0, 64);
+    au_put32(buf, 0x2E736E64u);
+    au_put32(buf + 4, 28);              /* 28 = 24 + 4 字节注释 */
+    au_put32(buf + 8, 16);
+    au_put32(buf + 12, 3);              /* 线性 16 位 */
+    au_put32(buf + 16, 22050);
+    au_put32(buf + 20, 2);
+    memcpy(buf + 24, "clab", 4);
+    return 44;
+}
+
+test "au：头部与编码" {
+    static u8 buf[64] = { 0 };
+    AuInfo a = { 0 };
+    int n = mk_au(buf);
+
+    if (a.parse(buf, n) != 1)
+        return err(1, "解析失败");
+    if (a.data_off != 28 || a.data_size != 16)
+        return err(2, "数据偏移或大小不对");
+    if (a.encoding != 3 || a.rate != 22050 || a.channels != 2)
+        return err(3, "编码/采样率/声道不对");
+    if (a.has_comment != 1)
+        return err(4, "应该识别出注释");
+    if (strcmp(a.encoding_name(), "pcm16") != 0 || a.bytes_per_sample() != 2)
+        return err(5, "编码名或每样本字节数不对");
+    /* μ-law 是 1 字节 */
+    au_put32(buf + 12, 1);
+    if (a.parse(buf, n) != 1 || a.bytes_per_sample() != 1
+        || strcmp(a.encoding_name(), "ulaw") != 0)
+        return err(6, "μ-law 不对");
+    au_put32(buf + 12, 6);
+    a.parse(buf, n);
+    if (strcmp(a.encoding_name(), "float32") != 0 || a.bytes_per_sample() != 4)
+        return err(7, "float32 不对");
+    if (a.parse("nope", 4) != -1)
+        return err(8, "太短应该 -1");
+    au_put32(buf, 0x12345678u);
+    if (a.parse(buf, n) != -1)
+        return err(9, "魔数不对应该 -1");
+    au_put32(buf, 0x2E736E64u);
+    au_put32(buf + 12, 99);
+    if (a.parse(buf, n) != -1)
+        return err(10, "未知编码应该 -1");
+    au_put32(buf + 12, 3);
+    au_put32(buf + 4, 8);
+    if (a.parse(buf, n) != -1)
+        return err(11, "偏移小于 24 应该 -1");
+}
