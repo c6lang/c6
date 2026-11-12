@@ -33,6 +33,51 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 （并定义 `__C6__`），`.c` 文件不会因为同一次编译里出现 `.c6` 而被连带开启。`import NAME;`
 优先查找 `NAME.c6`，找不到才回退到 `NAME.c`。
 
+## 先看一眼：`defer` / `errdefer` 管资源
+
+C 里最容易写错的不是功能，而是**每条出口都得把已拿到的资源还回去**。c6 让你在拿到资源的
+那一行就把它登记给 `defer`，函数出口只剩一处；「失败才需要撤销」的那部分单独交给 `errdefer`：
+
+```c
+/* 以前：出口有几条，清理就写几遍；再添一个资源，所有出口都得重排 */
+int save(const char *path, const char *data, int n)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    char *tmp = malloc((size_t)n);
+    if (!tmp) { fclose(f); return -1; }
+    if (fwrite(data, 1, (size_t)n, f) != (size_t)n) { free(tmp); fclose(f); remove(path); return -1; }
+    free(tmp); fclose(f);
+    return 0;
+}
+```
+
+```c
+/* c6：拿到就登记，清理只写一次；出错时的回滚写在 errdefer 里 */
+int!error save(const char *path, const char *data, int n)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return err(1, "open failed");
+    errdefer remove(path);                 /* 只有失败才删半成品 */
+    defer fclose(f);                       /* 正常返回、err 返回都执行 */
+
+    char *tmp = malloc((size_t)n);
+    if (!tmp)
+        return err(2, "out of memory");
+    defer free(tmp);                       /* LIFO：free 先于 fclose */
+
+    if (fwrite(data, 1, (size_t)n, f) != (size_t)n)
+        return err(3, "short write");      /* 跑 free → fclose → remove */
+    return 0;
+}
+```
+
+记住三条：登记顺序的**倒序**执行（`defer` 与 `errdefer` 混在一起排队）；`defer` 覆盖所有出口
+（`return` / `break` / `continue` / `goto` / `err`）；`errdefer` 只在本次调用真的 `err` 过时跑，
+正常返回跳过。清理状态放在**函数帧**里而不是 TLS，所以 `tcc -run` 和裸机上一样能用。
+细节见[错误处理](docs/manual/errors.md)，可运行示例 `./tcc/c6 -B tcc -run examples/err_demo.c6`。
+
 ## 快速开始
 
 依赖：`git`、`make`、C 编译器（gcc/clang）、`binutils`。
