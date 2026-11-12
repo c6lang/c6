@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第八十一批（三维网格与材质）**：`std.data.obj`（Wavefront OBJ 游标解析：
+  顶点/法向/纹理/面，负数索引）、`std.data.stl`（二进制与 ASCII 自动识别，面积/体积）、
+  `std.data.ply`（ASCII PLY 头解析 + 顶点列号 + list 面）、`std.data.mtl`
+  （MTL 材质块游标 + 按名字查），示例 `examples/stdmesh.c6`（`make std-mesh`）。
+  错误号段 `std.data.obj`=0x614d … `std.data.mtl`=0x6150。
+
 - **标准库第八十批（语言级 async 的库支持）**：`std.async.aio`（`await c6_io` 之上的
   `aio_wait`/`aio_read`/`aio_read_exact`/`aio_write_all`/`aio_read_line`）、
   `std.async.achan`（`AChan` + `achan_send`/`achan_recv`，长度前缀帧）、

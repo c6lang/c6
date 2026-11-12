@@ -1,0 +1,452 @@
+/* std/data/stl：STL 三角网格（二进制与 ASCII 自动识别，游标式逐面读取）。
+ *
+ *     import std.data.stl;
+ *
+ *     Stl s = { 0 };
+ *     s.load(buf, len);               // 方法：自动判断二进制/ASCII
+ *     StlTri t = { 0 };
+ *     while (s.next(&t)) {            // 游标：法向 + 三个顶点
+ *         …
+ *     }
+ *     s.restart();
+ *     s.count();                      // 三角形数
+ *     s.volume();                     // 散度定理算体积（闭合网格）
+ *     s.area();                       // 表面积
+ *
+ * 二进制 STL：80 字节头 + 4 字节小端三角形数 + 每个三角形 50 字节
+ * （法向 3 个 float、三个顶点各 3 个 float、2 字节属性）。识别规则就是
+ * 「`84 + 50 * n == len`」，对不上再按 ASCII 解析。
+ *
+ * ASCII STL：`solid/facet normal …/outer loop/vertex …/endloop/endfacet/endsolid`，
+ * 只认 `normal` 与 `vertex` 两个关键字，其余（名字、空白、大小写）都不敏感。
+ *
+ * 约定：
+ *
+ * - `s.load(data, len)` 不改写输入，只记指针 + 算包围盒；
+ * - `s.is_binary()` 是不是二进制；`s.count()` 三角形数（ASCII 也在载入时数好）；
+ * - `s.next(&tri)` 推进游标取下一个三角形，取完返回 0；`s.restart()` 归零；
+ * - `s.triangle(i, &tri)` 随机访问（O(n)），越界返回 -1；
+ * - `s.bbox(&x0,&y0,&z0,&x1,&y1,&z1)` 载入时算好的包围盒（没有三角形返回 -1）；
+ * - `s.volume()`/`s.area()` 全扫一遍；体积按有向体积求和，网格不闭合时没有意义；
+ * - 参数错（空指针、len 太小、既不是二进制也不含 `facet`）`load` 返回 -1。
+ */
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+module std.data.stl;
+import std.core.types;
+import std.text.str;
+
+#define STL_HDR 84
+#define STL_TRI 50
+
+struct StlTri {
+    float n[3];
+    float v[3][3];
+};
+
+struct Stl {
+    const unsigned char *data;
+    int len;
+    int bin;
+    int nt;
+    int pos;
+    int idx;
+    double x0, y0, z0, x1, y1, z1;
+    int has_bbox;
+};
+
+static unsigned int stl_u32(const unsigned char *p)
+{
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8)
+           | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+static float stl_f32(const unsigned char *p)
+{
+    union {
+        unsigned int u;
+        float f;
+    } c = { 0 };
+
+    c.u = stl_u32(p);
+    return c.f;
+}
+
+static const char *stl_find(const char *p, const char *end, const char *tok)
+{
+    int n = (int)strlen(tok);
+
+    while (p + n <= end) {
+        if (memcmp(p, tok, (size_t)n) == 0)
+            return p + n;
+        p++;
+    }
+    return 0;
+}
+
+/* ASCII 里数一下 `normal` 的个数（每个 facet 一个；
+ * 不能数 `facet`，因为 `endfacet` 里也含这个词） */
+static int stl_count_ascii(const char *p, const char *end)
+{
+    int n = 0;
+
+    while (1) {
+        const char *q = stl_find(p, end, "normal");
+
+        if (!q)
+            break;
+        n++;
+        p = q;
+    }
+    return n;
+}
+
+static void stl_grow(Stl *s, float x, float y, float z)
+{
+    if (!s->has_bbox) {
+        s->x0 = s->x1 = (double)x;
+        s->y0 = s->y1 = (double)y;
+        s->z0 = s->z1 = (double)z;
+        s->has_bbox = 1;
+        return;
+    }
+    if ((double)x < s->x0)
+        s->x0 = (double)x;
+    if ((double)x > s->x1)
+        s->x1 = (double)x;
+    if ((double)y < s->y0)
+        s->y0 = (double)y;
+    if ((double)y > s->y1)
+        s->y1 = (double)y;
+    if ((double)z < s->z0)
+        s->z0 = (double)z;
+    if ((double)z > s->z1)
+        s->z1 = (double)z;
+}
+
+int next(Stl *s, StlTri *out);          /* 前向声明：load 里要先扫一遍算 bbox */
+
+int load(Stl *s, const void *data, int len)
+{
+    const unsigned char *b = (const unsigned char *)data;
+    int i = 0;
+    int k = 0;
+
+    if (!s || !data || len <= 0)
+        return -1;
+    memset(s, 0, sizeof *s);
+    s->data = b;
+    s->len = len;
+    if (len >= STL_HDR) {
+        unsigned int n = stl_u32(b + 80);
+
+        if (n > 0 && (long)STL_HDR + (long)STL_TRI * (long)n == (long)len) {
+            s->bin = 1;
+            s->nt = (int)n;
+            for (i = 0; i < s->nt; i++) {
+                const unsigned char *p = b + STL_HDR + (long)i * STL_TRI + 12;
+
+                for (k = 0; k < 3; k++) {
+                    stl_grow(s, stl_f32(p + 12 * k), stl_f32(p + 12 * k + 4),
+                             stl_f32(p + 12 * k + 8));
+                }
+            }
+            return 1;
+        }
+    }
+    /* ASCII */
+    if (!stl_find((const char *)b, (const char *)b + len, "facet"))
+        return -1;
+    s->bin = 0;
+    s->nt = stl_count_ascii((const char *)b, (const char *)b + len);
+    if (s->nt <= 0)
+        return -1;
+    /* 扫一遍把包围盒算好（ASCII 没有现成的头） */
+    {
+        StlTri t = { { 0, 0, 0 }, { { 0, 0, 0 } } };
+
+        s->idx = 0;
+        s->pos = 0;
+        while (next(s, &t))
+            ;
+        s->idx = 0;
+        s->pos = 0;
+    }
+    return 1;
+}
+
+int is_binary(Stl *s)
+{
+    return s ? s->bin : 0;
+}
+
+int count(Stl *s)
+{
+    return s ? s->nt : 0;
+}
+
+void restart(Stl *s)
+{
+    if (s) {
+        s->pos = 0;
+        s->idx = 0;
+    }
+}
+
+int next(Stl *s, StlTri *out)
+{
+    if (!s || !out || s->idx >= s->nt)
+        return 0;
+    if (s->bin) {
+        const unsigned char *p = s->data + STL_HDR + (long)s->idx * STL_TRI;
+        int k = 0;
+
+        for (k = 0; k < 3; k++) {
+            out->n[k] = stl_f32(p + 4 * k);
+            out->v[0][k] = stl_f32(p + 12 + 4 * k);
+            out->v[1][k] = stl_f32(p + 24 + 4 * k);
+            out->v[2][k] = stl_f32(p + 36 + 4 * k);
+        }
+        s->idx++;
+        return 1;
+    } else {
+        const char *p = (const char *)s->data + s->pos;
+        const char *end = (const char *)s->data + s->len;
+        const char *q = 0;
+        char *stop = 0;
+        int k = 0;
+
+        q = stl_find(p, end, "facet");
+        if (!q)
+            return 0;
+        q = stl_find(q, end, "normal");
+        if (!q)
+            return 0;
+        for (k = 0; k < 3; k++) {
+            out->n[k] = (float)strtod(q, &stop);
+            if (stop == q)
+                return 0;
+            q = stop;
+        }
+        for (k = 0; k < 3; k++) {
+            int j = 0;
+
+            q = stl_find(q, end, "vertex");
+            if (!q)
+                return 0;
+            for (j = 0; j < 3; j++) {
+                out->v[k][j] = (float)strtod(q, &stop);
+                if (stop == q)
+                    return 0;
+                q = stop;
+            }
+            stl_grow(s, out->v[k][0], out->v[k][1], out->v[k][2]);
+        }
+        s->pos = (int)(q - (const char *)s->data);
+        s->idx++;
+        return 1;
+    }
+}
+
+int triangle(Stl *s, int i, StlTri *out)
+{
+    if (!s || !out || i < 0 || i >= s->nt)
+        return -1;
+    s->idx = i;
+    if (!next(s, out))
+        return -1;
+    return 1;
+}
+
+int bbox(Stl *s, double *x0, double *y0, double *z0, double *x1, double *y1,
+         double *z1)
+{
+    if (!s || !x0 || !y0 || !z0 || !x1 || !y1 || !z1 || !s->has_bbox)
+        return -1;
+    *x0 = s->x0;
+    *y0 = s->y0;
+    *z0 = s->z0;
+    *x1 = s->x1;
+    *y1 = s->y1;
+    *z1 = s->z1;
+    return 1;
+}
+
+double volume(Stl *s)
+{
+    StlTri t = { { 0, 0, 0 }, { { 0, 0, 0 } } };
+    double v = 0.0;
+    int save = 0;
+
+    if (!s)
+        return 0.0;
+    save = s->idx;
+    s->idx = 0;
+    s->pos = 0;
+    while (next(s, &t)) {
+        double ax = t.v[0][0], ay = t.v[0][1], az = t.v[0][2];
+        double bx = t.v[1][0], by = t.v[1][1], bz = t.v[1][2];
+        double cx = t.v[2][0], cy = t.v[2][1], cz = t.v[2][2];
+
+        v += (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx)
+              + az * (bx * cy - by * cx)) / 6.0;
+    }
+    s->idx = save;
+    return v;
+}
+
+double area(Stl *s)
+{
+    StlTri t = { { 0, 0, 0 }, { { 0, 0, 0 } } };
+    double a = 0.0;
+    int save = 0;
+
+    if (!s)
+        return 0.0;
+    save = s->idx;
+    s->idx = 0;
+    s->pos = 0;
+    while (next(s, &t)) {
+        double ux = (double)t.v[1][0] - t.v[0][0];
+        double uy = (double)t.v[1][1] - t.v[0][1];
+        double uz = (double)t.v[1][2] - t.v[0][2];
+        double wx = (double)t.v[2][0] - t.v[0][0];
+        double wy = (double)t.v[2][1] - t.v[0][1];
+        double wz = (double)t.v[2][2] - t.v[0][2];
+        double cxx = uy * wz - uz * wy;
+        double cyy = uz * wx - ux * wz;
+        double czz = ux * wy - uy * wx;
+
+        a += 0.5 * sqrt(cxx * cxx + cyy * cyy + czz * czz);
+    }
+    s->idx = save;
+    return a;
+}
+
+/* ---- 自测 ---- */
+
+/* 自测用：往缓冲里写一个小端 float */
+static void stl_test_put(unsigned char *p, float f)
+{
+    union {
+        unsigned int u;
+        float f;
+    } c = { 0 };
+
+    c.f = f;
+    p[0] = (unsigned char)(c.u & 0xff);
+    p[1] = (unsigned char)((c.u >> 8) & 0xff);
+    p[2] = (unsigned char)((c.u >> 16) & 0xff);
+    p[3] = (unsigned char)((c.u >> 24) & 0xff);
+}
+
+test "stl：二进制逐面读取" {
+    static unsigned char bin[STL_HDR + 2 * STL_TRI] = { 0 };
+    Stl s = { 0 };
+    StlTri t = { { 0, 0, 0 }, { { 0, 0, 0 } } };
+    unsigned char *p = 0;
+    int k = 0;
+
+    memset(bin, 0, sizeof bin);
+    memcpy(bin, "binary demo", 11);
+    bin[80] = 2;                        /* 三角形数 = 2 */
+    /* 三角形 0：法向 (0,0,1)，顶点 (0,0,0) (1,0,0) (0,1,0) */
+    p = bin + STL_HDR;
+    stl_test_put(p + 0, 0.0f);
+    stl_test_put(p + 4, 0.0f);
+    stl_test_put(p + 8, 1.0f);
+    stl_test_put(p + 12, 0.0f);
+    stl_test_put(p + 16, 0.0f);
+    stl_test_put(p + 20, 0.0f);
+    stl_test_put(p + 24, 1.0f);
+    stl_test_put(p + 28, 0.0f);
+    stl_test_put(p + 32, 0.0f);
+    stl_test_put(p + 36, 0.0f);
+    stl_test_put(p + 40, 1.0f);
+    stl_test_put(p + 44, 0.0f);
+    /* 三角形 1：法向 (0,0,-1)，顶点全在 z = 1 */
+    p = bin + STL_HDR + STL_TRI;
+    for (k = 0; k < 3; k++)
+        stl_test_put(p + 4 * k, 0.0f);
+    stl_test_put(p + 8, -1.0f);
+    for (k = 0; k < 3; k++) {
+        stl_test_put(p + 12 + 12 * k + 8, 1.0f);
+    }
+    stl_test_put(p + 24, 1.0f);
+    stl_test_put(p + 40, 1.0f);
+    if (s.load(bin, (int)sizeof bin) != 1)
+        return err(1, "二进制 load 失败");
+    if (!s.is_binary() || s.count() != 2)
+        return err(2, "应该识别成 2 个三角形的二进制");
+    if (!s.next(&t) || t.n[2] != 1.0f)
+        return err(3, "第 0 个三角形的法向不对");
+    if (t.v[1][0] != 1.0f || t.v[2][1] != 1.0f)
+        return err(4, "顶点坐标不对");
+    s.restart();
+    if (!s.next(&t) || !s.next(&t) || s.next(&t))
+        return err(5, "游标应该正好走两个");
+    if (s.triangle(1, &t) != 1 || s.triangle(2, &t) != -1)
+        return err(6, "随机访问边界不对");
+}
+
+test "stl：ASCII 解析、包围盒与体积" {
+    static const char *ascii =
+        "solid cube\n"
+        " facet normal 0 0 1\n"
+        "  outer loop\n"
+        "   vertex 0 0 0\n"
+        "   vertex 1 0 0\n"
+        "   vertex 0 1 0\n"
+        "  endloop\n"
+        " endfacet\n"
+        " facet normal 0 0 -1\n"
+        "  outer loop\n"
+        "   vertex 0 0 1\n"
+        "   vertex 0 1 1\n"
+        "   vertex 1 0 1\n"
+        "  endloop\n"
+        " endfacet\n"
+        "endsolid cube\n";
+    Stl s = { 0 };
+    StlTri t = { { 0, 0, 0 }, { { 0, 0, 0 } } };
+    double x0 = 0, y0 = 0, z0 = 0, x1 = 0, y1 = 0, z1 = 0;
+    double a = 0.0;
+    int n = 0;
+
+    if (s.load(ascii, (int)strlen(ascii)) != 1)
+        return err(7, "ASCII load 失败");
+    if (s.is_binary() != 0 || s.count() != 2)
+        return err(8, "应该是 2 个三角形的 ASCII");
+    while (s.next(&t))
+        n++;
+    if (n != 2)
+        return err(9, "游标应该走两个三角形");
+    s.restart();
+    if (!s.next(&t) || t.n[2] != 1.0f)
+        return err(10, "ASCII 第一面的法向应该是 (0,0,1)");
+    if (t.v[0][0] != 0.0f || t.v[0][1] != 0.0f || t.v[1][0] != 1.0f
+        || t.v[2][1] != 1.0f)
+        return err(11, "ASCII 顶点解析不对");
+    if (s.bbox(&x0, &y0, &z0, &x1, &y1, &z1) != 1)
+        return err(12, "bbox 失败");
+    if (x0 != 0.0 || y0 != 0.0 || z0 != 0.0 || x1 != 1.0 || y1 != 1.0 || z1 != 1.0)
+        return err(13, "包围盒应该是单位立方体");
+    a = s.area();
+    if (a <= 0.0 || a > 2.0)
+        return err(14, "两个三角形的面积不该超过 2");
+    if (volume(&s) == 0.0)
+        return err(15, "体积不该是 0（两个三角形不闭合，但和也不该正好 0）");
+    /* 参数错 */
+    {
+        Stl e = { 0 };
+
+        if (e.load(0, 0) != -1)
+            return err(16, "空输入应该 -1");
+        if (e.load("hello", 5) != -1)
+            return err(17, "不是 STL 应该 -1");
+        if (e.count() != 0 || e.next(&t) != 0)
+            return err(18, "空文档没有三角形");
+    }
+}

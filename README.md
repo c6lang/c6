@@ -468,6 +468,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/async/achan.c6          std.async.achan       async 通道：AChan + achan_send/recv（pipe 长度前缀帧）
   std/async/art.c6            std.async.art         async 运行时驱动：Rt 封装 __c6_co_wait/__c6_co_run + 统计
   std/async/apump.c6          std.async.apump       async 转发：fd→fd、限量、按行、通道→fd
+  std/data/obj.c6             std.data.obj           Wavefront OBJ：顶点/面游标、负数索引、包围盒
+  std/data/stl.c6             std.data.stl           STL 三角网格：二进制/ASCII 自动识别、面积/体积
+  std/data/ply.c6             std.data.ply           ASCII PLY：头解析、x/y/z 列号、list 面
+  std/data/mtl.c6             std.data.mtl           MTL 材质库：游标取块 + 按名字查
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -604,6 +608,7 @@ make std-graph2   # 编译并运行 examples/stdgraph2.c6（第七十七批图�
 make std-async3   # 编译并运行 examples/stdasync3.c6（第七十八批 co / async-await 框架示例）
 make std-geo2     # 编译并运行 examples/stdgeo2.c6（第七十九批计算几何模块的拼装示例）
 make std-async4   # 编译并运行 examples/stdasync4.c6（第八十批语言级 async 示例）
+make std-mesh     # 编译并运行 examples/stdmesh.c6（第八十一批 OBJ/STL/PLY/MTL 示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

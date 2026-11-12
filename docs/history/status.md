@@ -2589,6 +2589,33 @@ executor（39 条）、await/scope 依赖同一串再加 co（各 41 条）、li
 验收：`make stdtest`（333 个模块、0 failure）、`make std-async4`（18 条自检全过）、
 `make check-all`。
 
+### 11.93 标准库第八十一批（obj / stl / ply / mtl：三维网格与材质）
+
+第八十一批做「三维资产格式」：Wavefront 的 OBJ/MTL 与两种三角网格 STL、PLY。
+四个模块都是**游标式**（载入一次记指针，`next_*` 逐条取，`restart` 复位，另给随机访问），
+不分配内存，调用方只需要给一段文本/二进制缓冲。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.obj` | OBJ 网格 | 逐行按首词分类（`v`/`vn`/`vt`/`f`），`load` 只统计；面索引支持 `1`/`1/1`/`1/1/1` 三种写法，负数按 `base - v` 解析（`-1` = 最后一个顶点）；`bbox` 会临时挪游标再还原 |
+| `std.data.stl` | STL 网格 | 识别二进制靠 `84 + 50n == len`；ASCII 数三角形要数 `normal`，**不能数 `facet`**（`endfacet` 里也含）；ASCII 的包围盒在 `load` 里先扫一遍（用前向声明的 `next`）|
+| `std.data.ply` | ASCII PLY | 头里的 `element`/`property` 真解析：记 `x`/`y`/`z` 的列号（可以不在前三列），面按 list 处理（先个数再下标）；数据区起点单独记 `dstart`，否则 `restart` 回不到开头 |
+| `std.data.mtl` | MTL 材质 | `next` 先清零再填默认值（`Kd=1,1,1`、`d=1`、`Ni=1`），再逐键覆盖；`find` 就是 `restart` + 循环 `next` 比对名字 |
+
+踩到的坑（都是自己写错的）：`obj` 的负数索引第一版写成 `base + v`（`-3` 变成 6），
+正确的是 `base - v`；`stl` 的 union 必须显式 `= { 0 }` 初始化（`variable 'c' must be
+initialized`）；`ply` 的 `face(i)` 只重置了 `vidx` 没重置 `vpos`，重扫时把面行当顶点读；
+`stl`/`mtl` 里数三角形的 `facet` 与默认值顺序各踩一次。
+
+错误号段继续追加：`std.data.obj`=0x614d、`std.data.stl`=0x614e、`std.data.ply`=0x614f、
+`std.data.mtl`=0x6150（`grammar.md` §8.1 同步）。`Makefile` 增加 `std-mesh` 与
+`STD_MESH_SRCS`；四个模块在 `stdtest` 里分别 25/24/24/24 条（都只依赖 `std/text/str.c6`，
+`stl` 另需 `-lm`）。示例 `examples/stdmesh.c6` 24 条自检。
+
+验收：`make stdtest`（337 个模块、0 failure）、`make std-mesh`（24 条自检全过）、
+`make check-all`。
+
+
 
 
 

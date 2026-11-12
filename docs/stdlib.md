@@ -365,6 +365,11 @@
 | `std/async/achan.c6` | `std.async.achan` | **async 通道**：`AChan`（方法 `init`/`init_pair`/`close_chan`/`rfd`/`wfd`/`maxmsg`/`sent`/`recv_count`/`bytes`）+ `async int achan_send(void *, …)`/`achan_recv(void *, …)`；pipe 上的「4 字节大端长度 + 载荷」帧，单帧上限 4000（留在 `PIPE_BUF` 内，多写方也原子），单消费者 |
 | `std/async/art.c6` | `std.async.art` | **运行时驱动**：`Rt`（方法 `wait`/`run`/`destroy`/`state`/`kind`/`waits`/`runs`/`destroys`/`last_rc`/`ok`/`event_read`/`event_write`）把 `__c6_co_wait`/`__c6_co_run`/`__c6_co_destroy`/`__c6_co_state` 包成方法并记统计；`state` 在任务结束后变 -1 |
 | `std/async/apump.c6` | `std.async.apump` | **流式转发**：`async int apump_fd/apump_n/apump_lines/apump_chan`（fd→fd 到 EOF、限量、按行补 `\n`、`AChan`→fd），由 aio 与 achan 组合而成，参数错一律 -1 |
+| `std/data/obj.c6` | `std.data.obj` | Wavefront OBJ 网格（**方法**：`d.load`/`d.next_vertex`/`d.next_face`/`d.vertex`/`d.face`/`d.restart`/`d.count_vertices`/`d.count_faces`/`d.count_normals`/`d.count_uvs`/`d.bbox`/`d.line_count`）：游标式逐条取顶点/面，面索引支持 `1`、`1/1`、`1/1/1` 与负数（相对）写法，返回 0 基下标 |
+| `std/data/stl.c6` | `std.data.stl` | STL 三角网格（**方法**：`s.load`/`s.next`/`s.triangle`/`s.restart`/`s.count`/`s.is_binary`/`s.bbox`/`s.volume`/`s.area`）：二进制（80 字节头 + 50 字节/面）与 ASCII 自动识别，`StlTri` 给法向 + 三个顶点，体积用散度定理 |
+| `std/data/ply.c6` | `std.data.ply` | ASCII PLY 网格（**方法**：`d.load`/`d.next_vertex`/`d.next_face`/`d.vertex`/`d.face`/`d.restart`/`d.count_vertices`/`d.count_faces`/`d.prop_count`/`d.xyz_columns`/`d.is_ascii`）：头里的 `element`/`property` 真解析，`x`/`y`/`z` 可以不在前三列，面是「先个数再下标」的 list |
+| `std/data/mtl.c6` | `std.data.mtl` | Wavefront MTL 材质库（**方法**：`m.load`/`m.next`/`m.find`/`m.restart`/`m.count`/`m.index_of`）：`MtlMat` 收 `Kd`/`Ks`/`Ke`/`Ns`/`Ni`/`d`/`map_Kd`，没写的键给默认值，`find` 按名字查 |
+
 
 
 
@@ -512,6 +517,7 @@
 | `examples/stdasync3.c6` | （无模块） | 第七十八批（co / async-await 框架）的拼装示例（`make std-async3`）：三种挂起点、宏式线性 await、结构化并发（含失败传播）、并发额度转交 |
 | `examples/stdgeo2.c6` | （无模块） | 第七十九批（计算几何）的拼装示例（`make std-geo2`）：凸包面积/周长/点内、凹多边形形心与边游标、线段相交/共线重叠/投影、最近点对分治 vs 暴力 |
 | `examples/stdasync4.c6` | （无模块） | 第八十批（语言级 async）的拼装示例（`make std-async4`）：`async`/`await` 的行读写、`AChan` 收发、`apump_fd` 转发、`Rt.wait`/`Rt.run` 驱动 |
+| `examples/stdmesh.c6` | （无模块） | 第八十一批（三维网格）的拼装示例（`make std-mesh`）：OBJ 四面体（顶点/面游标 + 包围盒）、STL ASCII 与二进制（面积）、PLY 四边形面、MTL 材质查表 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -726,6 +732,10 @@ std/async/aio.c6           25 test(s), 0 failure(s)
 std/async/achan.c6         27 test(s), 0 failure(s)
 std/async/art.c6           27 test(s), 0 failure(s)
 std/async/apump.c6         29 test(s), 0 failure(s)
+std/data/obj.c6            25 test(s), 0 failure(s)
+std/data/stl.c6            24 test(s), 0 failure(s)
+std/data/ply.c6            24 test(s), 0 failure(s)
+std/data/mtl.c6            24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4353,6 +4363,17 @@ make std-async4
 3. `c6_io` 只保证「fd 可读/可写」，不排队：同一个 fd 上只该有一个读任务、一个写任务。
    行读要区分「空行」和「EOF」时用 `aio_read_line_x(…, &eof)`。
 
+### 集成示例：`examples/stdmesh.c6`
+
+```sh
+make std-mesh
+```
+
+四节都走「载入 → 游标 → 计数/包围盒」：OBJ 里数出 4 顶点 4 面、法向 1 个、包围盒
+`[0,1]³`；STL 先按 ASCII 解一个三角形（面积 0.5），再手搓一段二进制 STL 验证小端
+浮点读出来的顶点是 (2,0,0) 与 (0,2,0)；PLY 的四边形面报出 4 个顶点、前三个 0/1/2；
+MTL 先遍历两块材质，再 `find("red")` 取 `Kd`/`Ns`/`map_Kd`，`find("steel")` 取 `Ni`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4508,6 +4529,8 @@ make std-async4
 * `make std-geo2`：`examples/stdgeo2.c6`，第七十九批（计算几何）模块的拼装示例
   （自带自检）。
 * `make std-async4`：`examples/stdasync4.c6`，第八十批（语言级 async）模块的拼装示例
+  （自带自检）。
+* `make std-mesh`：`examples/stdmesh.c6`，第八十一批（OBJ/STL/PLY/MTL）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

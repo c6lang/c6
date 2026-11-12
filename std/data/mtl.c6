@@ -1,0 +1,328 @@
+/* std/data/mtl：Wavefront MTL 材质库（游标式：逐块取材质，另可按名字查）。
+ *
+ *     import std.data.mtl;
+ *
+ *     Mtl m = { 0 };
+ *     m.load(text, len);              // 方法：统计 newmtl 的个数
+ *     MtlMat mat = { 0 };
+ *     while (m.next(&mat)) {          // 游标：一块一块取
+ *         // mat.name / mat.kd / mat.ks / mat.ns / mat.map …
+ *     }
+ *     m.restart();
+ *     if (m.find("red", &mat) == 1) { … }   // 按名字查
+ *
+ * 认的键：`newmtl`（名字）、`Kd`（漫反射）、`Ks`（高光）、`Ke`（自发光）、
+ * `Ns`（高光指数）、`Ni`（折射率）、`d`（不透明度）、`map_Kd`（漫反射贴图文件名）。
+ * 其它键（`Ka`、`illum`、`Tr`、`map_Bump`…）跳过，注释与空行也跳过。
+ *
+ * 约定：
+ *
+ * - `m.load(src, len)` 只统计与记指针，成功返回 1，空输入返回 -1；
+ * - `m.next(&mat)` 取下一块材质（**先清零再填**，没写的键是默认值：
+ *   `Kd = 1,1,1`、`Ks = 0,0,0`、`Ns = 0`、`d = 1`、`map` 为空），取完返回 0；
+ * - `m.find("name", &mat)` 按名字查，命中返回 1、没找到 -1；
+ * - `m.restart()` 游标归零；`m.count()` 载入时数好的材质块数；
+ * - `m.index()` 当前游标位置（已经取过几块）；
+ * - `mat.name`/`mat.map` 是定长数组（31 / 63 字节封顶），超出部分截断。
+ */
+#include <stdlib.h>
+#include <string.h>
+
+module std.data.mtl;
+import std.core.types;
+import std.text.str;
+
+struct MtlMat {
+    char name[32];
+    double kd[3];
+    double ks[3];
+    double ke[3];
+    double ns;
+    double ni;
+    double d;
+    char map[64];
+};
+
+struct Mtl {
+    const char *src;
+    int len;
+    int pos;
+    int n;
+    int idx;
+};
+
+static int mtl_sep(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+static const char *mtl_eol(const char *p, const char *end)
+{
+    while (p < end && *p != '\n')
+        p++;
+    return p;
+}
+
+static const char *mtl_next_line(const char *p, const char *end)
+{
+    const char *nl = mtl_eol(p, end);
+
+    return nl < end ? nl + 1 : end;
+}
+
+static int mtl_key_is(const char *p, const char *end, const char *key)
+{
+    int n = (int)strlen(key);
+
+    if (end - p < n)
+        return 0;
+    if (memcmp(p, key, (size_t)n) != 0)
+        return 0;
+    return end - p == n || mtl_sep(p[n]) || p[n] == '\n';
+}
+
+static const char *mtl_skip_ws(const char *p, const char *end)
+{
+    while (p < end && mtl_sep(*p))
+        p++;
+    return p;
+}
+
+static const char *mtl_word(const char *p, const char *end, char *buf, int cap)
+{
+    int n = 0;
+
+    p = mtl_skip_ws(p, end);
+    while (p < end && !mtl_sep(*p) && *p != '\n') {
+        if (n < cap - 1)
+            buf[n++] = *p;
+        p++;
+    }
+    buf[n < cap ? n : cap - 1] = '\0';
+    return p;
+}
+
+static int mtl_triple(const char *p, const char *end, double *out)
+{
+    char *stop = 0;
+    int i = 0;
+
+    for (i = 0; i < 3; i++) {
+        out[i] = strtod(p, &stop);
+        if (stop == p)
+            return 0;
+        p = stop;
+    }
+    (void)end;
+    return 1;
+}
+
+int load(Mtl *m, const char *src, int len)
+{
+    const char *p = 0;
+    const char *end = 0;
+
+    if (!m)
+        return -1;
+    memset(m, 0, sizeof *m);
+    if (!src || len <= 0)
+        return -1;
+    m->src = src;
+    m->len = len;
+    end = src + len;
+    for (p = src; p < end; ) {
+        if (mtl_key_is(p, end, "newmtl"))
+            m->n++;
+        p = mtl_next_line(p, end);
+    }
+    return 1;
+}
+
+int count(Mtl *m)
+{
+    return m ? m->n : 0;
+}
+
+int index_of(Mtl *m)
+{
+    return m ? m->idx : 0;
+}
+
+void restart(Mtl *m)
+{
+    if (m) {
+        m->pos = 0;
+        m->idx = 0;
+    }
+}
+
+static void mtl_defaults(MtlMat *out)
+{
+    memset(out, 0, sizeof *out);
+    out->kd[0] = out->kd[1] = out->kd[2] = 1.0;
+    out->ks[0] = out->ks[1] = out->ks[2] = 0.0;
+    out->ke[0] = out->ke[1] = out->ke[2] = 0.0;
+    out->ns = 0.0;
+    out->ni = 1.0;
+    out->d = 1.0;
+}
+
+int next(Mtl *m, MtlMat *out)
+{
+    const char *p = 0;
+    const char *end = 0;
+    char key[32] = { 0 };
+
+    if (!m || !out)
+        return 0;
+    if (!m->src || m->pos >= m->len)
+        return 0;
+    end = m->src + m->len;
+    p = m->src + m->pos;
+    /* 找到下一块的开头 */
+    while (p < end && !mtl_key_is(p, end, "newmtl"))
+        p = mtl_next_line(p, end);
+    if (p >= end) {
+        m->pos = m->len;
+        return 0;
+    }
+    mtl_defaults(out);
+    /* 名字 */
+    p = mtl_word(p + 6, end, out->name, (int)sizeof out->name);
+    p = mtl_next_line(p, end);
+    /* 键值 */
+    while (p < end && !mtl_key_is(p, end, "newmtl")) {
+        const char *line = p;
+
+        p = mtl_word(p, end, key, (int)sizeof key);
+        if (strcmp(key, "Kd") == 0)
+            mtl_triple(p, end, out->kd);
+        else if (strcmp(key, "Ks") == 0)
+            mtl_triple(p, end, out->ks);
+        else if (strcmp(key, "Ke") == 0)
+            mtl_triple(p, end, out->ke);
+        else if (strcmp(key, "Ns") == 0)
+            out->ns = strtod(p, 0);
+        else if (strcmp(key, "Ni") == 0)
+            out->ni = strtod(p, 0);
+        else if (strcmp(key, "d") == 0 || strcmp(key, "Tr") == 0)
+            out->d = strtod(p, 0);
+        else if (strcmp(key, "map_Kd") == 0)
+            mtl_word(p, end, out->map, (int)sizeof out->map);
+        p = mtl_next_line(line, end);
+    }
+    m->pos = (int)(p - m->src);
+    m->idx++;
+    return 1;
+}
+
+int find(Mtl *m, const char *name, MtlMat *out)
+{
+    MtlMat cur = { { 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, 0, 0, 0, { 0 } };
+
+    if (!m || !name || !out)
+        return -1;
+    restart(m);
+    while (next(m, &cur)) {
+        if (strcmp(cur.name, name) == 0) {
+            *out = cur;
+            return 1;
+        }
+    }
+    return -1;
+}
+
+/* ---- 自测 ---- */
+
+static const char *mtl_demo =
+    "# 材质库\n"
+    "newmtl red\n"
+    "Kd 1.0 0.0 0.0\n"
+    "Ks 0.5 0.5 0.5\n"
+    "Ns 32\n"
+    "map_Kd red.png\n"
+    "\n"
+    "newmtl steel\n"
+    "Kd 0.6 0.6 0.65\n"
+    "Ni 1.5\n"
+    "d 0.9\n"
+    "illum 2\n"
+    "newmtl glass\n"
+    "Kd 0.9 0.9 0.95\n"
+    "Ns 96\n";
+
+test "mtl：游标遍历与字段解析" {
+    Mtl m = { 0 };
+    MtlMat mat = { { 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, 0, 0, 0, { 0 } };
+    int n = 0;
+
+    if (m.load(mtl_demo, (int)strlen(mtl_demo)) != 1)
+        return err(1, "load 失败");
+    if (m.count() != 3)
+        return err(2, "应该有三块材质");
+    if (!m.next(&mat))
+        return err(3, "第一块取不到");
+    if (strcmp(mat.name, "red") != 0)
+        return err(4, "第一块应该叫 red");
+    if (mat.kd[0] != 1.0 || mat.kd[1] != 0.0 || mat.kd[2] != 0.0)
+        return err(5, "Kd 解析不对");
+    if (mat.ks[0] != 0.5 || mat.ns != 32.0)
+        return err(6, "Ks/Ns 解析不对");
+    if (strcmp(mat.map, "red.png") != 0)
+        return err(7, "map_Kd 解析不对");
+    if (mat.d != 1.0)
+        return err(8, "没写 d 时应该是默认 1.0");
+    n = 1;
+    while (m.next(&mat))
+        n++;
+    if (n != 3)
+        return err(9, "游标应该正好走三块");
+    if (m.index_of() != 3)
+        return err(10, "index_of 应该是 3");
+    if (m.next(&mat))
+        return err(11, "取完应该返回 0");
+}
+
+test "mtl：按名字查、默认值与边界" {
+    Mtl m = { 0 };
+    MtlMat mat = { { 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, 0, 0, 0, { 0 } };
+
+    m.load(mtl_demo, (int)strlen(mtl_demo));
+    if (m.find("steel", &mat) != 1)
+        return err(12, "find(steel) 应该命中");
+    if (mat.kd[2] != 0.65 || mat.ni != 1.5 || mat.d != 0.9)
+        return err(13, "steel 的字段不对");
+    if (mat.map[0] != '\0')
+        return err(14, "steel 不该有贴图");
+    if (m.find("glass", &mat) != 1 || mat.ns != 96.0)
+        return err(15, "find(glass) 不对");
+    if (m.find("nope", &mat) != -1)
+        return err(16, "找不到应该 -1");
+    /* 查找之后游标停在末尾，restart 能回到开头 */
+    m.restart();
+    if (m.index_of() != 0 || !m.next(&mat) || strcmp(mat.name, "red") != 0)
+        return err(17, "restart 之后应该从头开始");
+    /* 空输入 */
+    {
+        Mtl e = { 0 };
+
+        if (e.load(0, 0) != -1)
+            return err(18, "空输入应该 -1");
+        if (e.count() != 0 || e.next(&mat) != 0)
+            return err(19, "空文档没有材质");
+        if (e.find("red", &mat) != -1)
+            return err(20, "空文档查不到东西");
+    }
+    /* 只有一块、没有键值 */
+    {
+        Mtl one = { 0 };
+        static const char *bare = "newmtl only\n";
+
+        if (one.load(bare, (int)strlen(bare)) != 1)
+            return err(21, "单块 load 失败");
+        if (!one.next(&mat) || strcmp(mat.name, "only") != 0)
+            return err(22, "单块名字不对");
+        if (mat.kd[0] != 1.0 || mat.d != 1.0 || mat.ni != 1.0)
+            return err(23, "默认值不对");
+    }
+}

@@ -1,0 +1,451 @@
+/* std/data/obj：Wavefront OBJ 文本网格（游标式：载入一次，逐条取顶点/面）。
+ *
+ *     import std.data.obj;
+ *
+ *     ObjDoc d = { 0 };
+ *     d.load(text, len);              // 方法：统计 v / vn / vt / f
+ *     double x = 0, y = 0, z = 0;
+ *     while (d.next_vertex(&x, &y, &z)) {          // 游标逐条取
+ *         …
+ *     }
+ *     d.restart();                    // 复位游标
+ *     int a = 0, b = 0, c = 0, n = 0;
+ *     d.next_face(&a, &b, &c, &n);    // n = 这一面的顶点数（≥3），a/b/c 是前三个
+ *
+ * 只认 OBJ 里最常见的四类行：`v`（顶点）、`vn`（法向）、`vt`（纹理坐标）、`f`（面）。
+ * 其它行（`mtllib`、`usemtl`、`g`、`o`、`s`、注释…）一律跳过。面里的索引支持三种写法：
+ *
+ * - `f 1 2 3`：纯顶点索引；
+ * - `f 1/1 2/2 3/3`：顶点/纹理；
+ * - `f 1/1/1 2/2/2 3/3/3`：顶点/纹理/法向；
+ * - 负数索引（`-1` = 最后一个顶点）按 OBJ 规范解析成绝对下标。
+ *
+ * 返回的下标统一是 **0 基**（OBJ 文件里是 1 基）。
+ *
+ * 约定：
+ *
+ * - `d.load(src, len)` 只做统计与记录，不改写 `src`；`src` 必须比整个解析周期活得久；
+ * - `d.next_vertex(&x,&y,&z)` / `d.next_face(&a,&b,&c,&n)` 推进游标，取完返回 0；
+ * - `d.vertex(i, …)` / `d.face(i, …)` 是随机访问（内部从头发扫，O(n)），
+ *   下标越界返回 -1；
+ * - `d.restart()` 游标归零；`d.count_vertices()`/`count_faces()`/`count_normals()`/
+ *   `count_uvs()` 是统计值；`d.bbox(…)` 全扫一遍算包围盒（没有顶点返回 -1）；
+ * - `d.line_count()` 载入时扫过的行数（调试用）。
+ */
+#include <stdlib.h>
+#include <string.h>
+
+module std.data.obj;
+import std.core.types;
+import std.text.str;
+
+struct ObjDoc {
+    const char *src;
+    int len;
+    int pos;
+    int nv;
+    int vn;
+    int vt;
+    int nf;
+    int lines;
+};
+
+static int obj_sep(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+static const char *obj_eol(const char *p, const char *end)
+{
+    while (p < end && *p != '\n')
+        p++;
+    return p;
+}
+
+/* 跳过空白，返回下一个非空白位置 */
+static const char *obj_skip_ws(const char *p, const char *end)
+{
+    while (p < end && (obj_sep(*p) || *p == '\n'))
+        p++;
+    return p;
+}
+
+/* 这一行是不是 `key` + 空白 */
+static int obj_has_key(const char *p, const char *end, const char *key)
+{
+    int n = (int)strlen(key);
+
+    if (end - p < n + 1)
+        return 0;
+    if (memcmp(p, key, (size_t)n) != 0)
+        return 0;
+    return obj_sep(p[n]) || p[n] == '\n';
+}
+
+int load(ObjDoc *d, const char *src, int len)
+{
+    const char *p = 0;
+    const char *end = 0;
+
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    if (!src || len <= 0)
+        return -1;
+    d->src = src;
+    d->len = len;
+    end = src + len;
+    for (p = src; p < end; ) {
+        if (obj_has_key(p, end, "v"))
+            d->nv++;
+        else if (obj_has_key(p, end, "vn"))
+            d->vn++;
+        else if (obj_has_key(p, end, "vt"))
+            d->vt++;
+        else if (obj_has_key(p, end, "f"))
+            d->nf++;
+        d->lines++;
+        p = obj_eol(p, end);
+        if (p < end)
+            p++;
+    }
+    return 1;
+}
+
+int count_vertices(ObjDoc *d)
+{
+    return d ? d->nv : 0;
+}
+
+int count_faces(ObjDoc *d)
+{
+    return d ? d->nf : 0;
+}
+
+int count_normals(ObjDoc *d)
+{
+    return d ? d->vn : 0;
+}
+
+int count_uvs(ObjDoc *d)
+{
+    return d ? d->vt : 0;
+}
+
+int line_count(ObjDoc *d)
+{
+    return d ? d->lines : 0;
+}
+
+void restart(ObjDoc *d)
+{
+    if (d)
+        d->pos = 0;
+}
+
+/* 从 pos 起找下一条以 key 开头的行，找到就返回内容起点，并把 pos 推到该行末尾之后 */
+static const char *obj_seek(ObjDoc *d, const char *key)
+{
+    const char *p = 0;
+    const char *end = 0;
+
+    if (!d || !d->src)
+        return 0;
+    end = d->src + d->len;
+    p = d->src + d->pos;
+    while (p < end) {
+        const char *nl = obj_eol(p, end);
+
+        if (obj_has_key(p, end, key)) {
+            d->pos = (int)(nl - d->src);
+            if (nl < end)
+                d->pos++;
+            return p + strlen(key);
+        }
+        p = nl;
+        if (p < end)
+            p++;
+    }
+    d->pos = d->len;
+    return 0;
+}
+
+static int obj_parse_index(const char *p, const char *end, int base, int *out,
+                           const char **next)
+{
+    int neg = 0;
+    int v = 0;
+    int any = 0;
+
+    p = obj_skip_ws(p, end);
+    if (p < end && (*p == '-' || *p == '+')) {
+        neg = *p == '-';
+        p++;
+    }
+    while (p < end && *p >= '0' && *p <= '9') {
+        v = v * 10 + (*p - '0');
+        p++;
+        any = 1;
+    }
+    if (!any)
+        return 0;
+    if (next)
+        *next = p;
+    if (neg)
+        v = base - v;                   /* -1 → base-1，-3 → base-3 */
+    else
+        v = v - 1;                      /* OBJ 是 1 基 */
+    *out = v;
+    return 1;
+}
+
+int next_vertex(ObjDoc *d, double *x, double *y, double *z)
+{
+    const char *p = 0;
+    const char *end = 0;
+    char *stop = 0;
+
+    if (!d || !x || !y || !z)
+        return 0;
+    p = obj_seek(d, "v");
+    if (!p)
+        return 0;
+    end = d->src + d->len;
+    *x = strtod(p, &stop);
+    if (stop == p)
+        return 0;
+    p = stop;
+    *y = strtod(p, &stop);
+    if (stop == p)
+        return 0;
+    p = stop;
+    *z = strtod(p, &stop);
+    if (stop == p)
+        return 0;
+    (void)end;
+    return 1;
+}
+
+int next_face(ObjDoc *d, int *a, int *b, int *c, int *n)
+{
+    const char *p = 0;
+    const char *end = 0;
+    int idx[3] = { -1, -1, -1 };
+    int got = 0;
+    int total = 0;
+
+    if (!d || !a || !b || !c || !n)
+        return 0;
+    p = obj_seek(d, "f");
+    if (!p)
+        return 0;
+    end = d->src + d->len;
+    while (1) {
+        const char *q = p;
+        int v = 0;
+
+        q = obj_skip_ws(q, end);
+        if (q >= end || *q == '\n')
+            break;
+        if (!obj_parse_index(q, end, d->nv, &v, &p))
+            break;
+        if (got < 3)
+            idx[got] = v;
+        got++;
+        total++;
+        /* 跳过 /vt /vn 部分 */
+        while (p < end && *p == '/') {
+            p++;
+            while (p < end && *p != '/' && !obj_sep(*p) && *p != '\n')
+                p++;
+        }
+        if (total > 4096)
+            break;
+    }
+    if (got < 3)
+        return 0;
+    *a = idx[0];
+    *b = idx[1];
+    *c = idx[2];
+    *n = got;
+    return 1;
+}
+
+int vertex(ObjDoc *d, int i, double *x, double *y, double *z)
+{
+    int k = 0;
+
+    if (!d || i < 0 || i >= d->nv)
+        return -1;
+    d->pos = 0;
+    for (k = 0; k <= i; k++) {
+        if (!next_vertex(d, x, y, z))
+            return -1;
+    }
+    return 1;
+}
+
+int face(ObjDoc *d, int i, int *a, int *b, int *c, int *n)
+{
+    int k = 0;
+
+    if (!d || i < 0 || i >= d->nf)
+        return -1;
+    d->pos = 0;
+    for (k = 0; k <= i; k++) {
+        if (!next_face(d, a, b, c, n))
+            return -1;
+    }
+    return 1;
+}
+
+int bbox(ObjDoc *d, double *minx, double *miny, double *minz, double *maxx,
+         double *maxy, double *maxz)
+{
+    int save = 0;
+    double x = 0.0, y = 0.0, z = 0.0;
+    int any = 0;
+
+    if (!d || !minx || !miny || !minz || !maxx || !maxy || !maxz)
+        return -1;
+    if (d->nv <= 0)
+        return -1;
+    save = d->pos;
+    d->pos = 0;
+    while (next_vertex(d, &x, &y, &z)) {
+        if (!any) {
+            *minx = *maxx = x;
+            *miny = *maxy = y;
+            *minz = *maxz = z;
+            any = 1;
+        } else {
+            if (x < *minx)
+                *minx = x;
+            if (x > *maxx)
+                *maxx = x;
+            if (y < *miny)
+                *miny = y;
+            if (y > *maxy)
+                *maxy = y;
+            if (z < *minz)
+                *minz = z;
+            if (z > *maxz)
+                *maxz = z;
+        }
+    }
+    d->pos = save;
+    return any ? 1 : -1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static const char *obj_demo =
+    "# 一个四面体\n"
+    "mtllib demo.mtl\n"
+    "o tetra\n"
+    "v 0 0 0\n"
+    "v 1 0 0\n"
+    "v 0 1 0\n"
+    "v 0 0 1\n"
+    "vt 0 0\n"
+    "vt 1 0\n"
+    "vn 0 0 -1\n"
+    "usemtl red\n"
+    "f 1/1/1 2/2/1 3/1/1\n"
+    "f 1//1 3//1 4//1\n"
+    "f 1 2 4\n"
+    "f 2 3 4\n";
+
+test "obj：统计与游标取顶点" {
+    ObjDoc d = { 0 };
+    double x = 0.0, y = 0.0, z = 0.0;
+    int n = 0;
+
+    if (d.load(obj_demo, (int)strlen(obj_demo)) != 1)
+        return err(1, "load 失败");
+    if (d.count_vertices() != 4 || d.count_faces() != 4)
+        return err(2, "顶点/面计数不对");
+    if (d.count_normals() != 1 || d.count_uvs() != 2)
+        return err(3, "法向/纹理计数不对");
+    while (d.next_vertex(&x, &y, &z))
+        n++;
+    if (n != 4)
+        return err(4, "游标应该走 4 个顶点");
+    /* 取完再取应该是 0 */
+    if (d.next_vertex(&x, &y, &z))
+        return err(5, "取完之后应该返回 0");
+    d.restart();
+    if (!d.next_vertex(&x, &y, &z) || x != 0.0 || y != 0.0 || z != 0.0)
+        return err(6, "第一个顶点应该是原点");
+    d.restart();
+    d.next_vertex(&x, &y, &z);
+    d.next_vertex(&x, &y, &z);
+    d.next_vertex(&x, &y, &z);
+    if (!d.next_vertex(&x, &y, &z) || x != 0.0 || y != 0.0 || z != 1.0)
+        return err(7, "第四个顶点应该是 (0,0,1)");
+}
+
+test "obj：面索引与包围盒" {
+    ObjDoc d = { 0 };
+    int a = 0, b = 0, c = 0, n = 0;
+    double x = 0.0, y = 0.0, z = 0.0;
+    double x0 = 0, y0 = 0, z0 = 0, x1 = 0, y1 = 0, z1 = 0;
+
+    d.load(obj_demo, (int)strlen(obj_demo));
+    /* 第一面：v/vt/vn 三段式 → 0 1 2 */
+    if (d.next_face(&a, &b, &c, &n) != 1 || n != 3)
+        return err(8, "第一个面应该是三角形");
+    if (a != 0 || b != 1 || c != 2)
+        return err(9, "第一个面的索引不对（应为 0 1 2）");
+    /* 第二面：v//vn → 0 2 3 */
+    d.next_face(&a, &b, &c, &n);
+    if (a != 0 || b != 2 || c != 3)
+        return err(10, "v//vn 写法的索引不对");
+    /* 随机访问第三面 */
+    d.face(2, &a, &b, &c, &n);
+    if (a != 0 || b != 1 || c != 3)
+        return err(11, "face(2) 的索引不对");
+    if (d.face(9, &a, &b, &c, &n) != -1)
+        return err(12, "越界应该 -1");
+    d.vertex(1, &x, &y, &z);
+    if (x != 1.0 || y != 0.0 || z != 0.0)
+        return err(13, "vertex(1) 应该是 (1,0,0)");
+    if (d.vertex(-1, &x, &y, &z) != -1)
+        return err(14, "负下标应该 -1");
+    if (d.bbox(&x0, &y0, &z0, &x1, &y1, &z1) != 1)
+        return err(15, "bbox 失败");
+    if (x0 != 0.0 || y0 != 0.0 || z0 != 0.0 || x1 != 1.0 || y1 != 1.0 || z1 != 1.0)
+        return err(16, "包围盒应该是单位立方体");
+}
+
+test "obj：负数索引与空输入" {
+    static const char *neg =
+        "v 0 0 0\n"
+        "v 2 0 0\n"
+        "v 2 3 0\n"
+        "f -3 -2 -1\n";
+    ObjDoc d = { 0 };
+    int a = 0, b = 0, c = 0, n = 0;
+    double x = 0, y = 0, z = 0;
+    double x0 = 0, y0 = 0, z0 = 0, x1 = 0, y1 = 0, z1 = 0;
+
+    if (d.load(neg, (int)strlen(neg)) != 1)
+        return err(17, "负数索引样例 load 失败");
+    if (d.next_face(&a, &b, &c, &n) != 1)
+        return err(18, "负数索引的面应该能解析");
+    if (a != 0 || b != 1 || c != 2)
+        return err(19, "-3 -2 -1 应该解析成 0 1 2");
+    /* 空输入 */
+    {
+        ObjDoc e = { 0 };
+
+        if (e.load("", 0) != -1)
+            return err(20, "空输入应该 -1");
+        if (e.count_vertices() != 0 || e.next_vertex(&x, &y, &z) != 0)
+            return err(21, "空文档没有顶点");
+        if (e.bbox(&x0, &y0, &z0, &x1, &y1, &z1) != -1)
+            return err(22, "空文档 bbox 应该 -1");
+    }
+}

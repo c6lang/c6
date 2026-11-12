@@ -13038,6 +13038,10 @@ static const struct C6ErrStdSlot {
     { "std.async.achan",        C6_ERR_SLOT_STD + 330 },
     { "std.async.art",          C6_ERR_SLOT_STD + 331 },
     { "std.async.apump",        C6_ERR_SLOT_STD + 332 },
+    { "std.data.obj",           C6_ERR_SLOT_STD + 333 },
+    { "std.data.stl",           C6_ERR_SLOT_STD + 334 },
+    { "std.data.ply",           C6_ERR_SLOT_STD + 335 },
+    { "std.data.mtl",           C6_ERR_SLOT_STD + 336 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
