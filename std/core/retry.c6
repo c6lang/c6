@@ -1,0 +1,199 @@
+/* std/core/retry：重试与指数退避策略（异步重连/轮询的节奏控制）。
+ *
+ *     import std.core.retry;
+ *
+ *     Retry r = { 0 };
+ *     r.init(100, 5000, 5);          // 方法：init / fail / due / next_at / gave_up
+ *     i64 wait = r.fail(now);        // 第一次失败 → 100ms 后再试
+ *     if (r.due(now + wait))         // 到点了吗
+ *         ;                          // 再试一次
+ *     r.succeed();                   // 成功就复位
+ *
+ * 退避是「base × 2^(n-1) 封顶 max」：第 1 次失败等 `base`、第 2 次 `2×base`、
+ * 第 3 次 `4×base`……直到 `max`。时间同样是**调用方给的毫秒**，所以可确定性测试。
+ *
+ * 约定：
+ *
+ * - `r.init(base_ms, max_ms, max_attempts)`：`max_attempts <= 0` 表示不限次数；
+ *   `base_ms <= 0` 或 `max_ms < base_ms` 返回 -1；
+ * - `r.fail(now)` 记一次失败并臂上下一次重试，返回**下次要等多少毫秒**；
+ *   次数用完返回 -1 且 `r.gave_up() == 1`（此后 `fail` 一直 -1，除非 `reset`）；
+ * - `r.due(now)` 判断是否到点（未臂定时器返回 0），`r.next_at()` 给绝对时间；
+ * - `r.delay_for(n)` 单独算「第 n 次失败的延时」（不改变状态），方便展示；
+ * - `r.succeed()` 复位并返回之前的失败次数，`r.reset(now)` 清状态（`now` 只用于
+ *   让 `next_at` 归零）；
+ * - `r.attempts()` 已失败次数，`r.gave_up()` 是否放弃，`r.next_at()` 下次时间。
+ */
+#include <string.h>
+
+module std.core.retry;
+import std.core.types;
+import std.text.str;
+
+struct Retry {
+    i64 base;
+    i64 ceiling;
+    int max_tries;
+    int tries;
+    i64 next_at_v;
+    int armed;
+    int gave_up_v;
+};
+
+int init(Retry *r, i64 base_ms, i64 max_ms, int max_attempts)
+{
+    if (!r || base_ms <= 0 || max_ms < base_ms)
+        return -1;
+    memset(r, 0, sizeof *r);
+    r->base = base_ms;
+    r->ceiling = max_ms;
+    r->max_tries = max_attempts;
+    return 1;
+}
+
+int attempts(Retry *r)
+{
+    return r ? r->tries : 0;
+}
+
+int gave_up(Retry *r)
+{
+    return r ? r->gave_up_v : 1;
+}
+
+i64 next_at(Retry *r)
+{
+    return r ? r->next_at_v : 0;
+}
+
+i64 delay_for(Retry *r, int n)
+{
+    i64 d = 0;
+    int i = 0;
+
+    if (!r || n <= 0)
+        return 0;
+    d = r->base;
+    for (i = 1; i < n; i++) {
+        if (d >= r->ceiling)
+            return r->ceiling;
+        d *= 2;
+    }
+    return d > r->ceiling ? r->ceiling : d;
+}
+
+i64 fail(Retry *r, i64 now)
+{
+    i64 delay = 0;
+
+    if (!r)
+        return -1;
+    if (r->gave_up_v)
+        return -1;
+    r->tries++;
+    if (r->max_tries > 0 && r->tries >= r->max_tries) {
+        /* 最后一次机会用完了：不再臂下一轮 */
+        r->gave_up_v = 1;
+        r->armed = 0;
+        return -1;
+    }
+    delay = delay_for(r, r->tries);
+    r->next_at_v = now + delay;
+    r->armed = 1;
+    return delay;
+}
+
+int due(Retry *r, i64 now)
+{
+    if (!r || !r->armed)
+        return 0;
+    return now >= r->next_at_v ? 1 : 0;
+}
+
+int succeed(Retry *r)
+{
+    int n = 0;
+
+    if (!r)
+        return 0;
+    n = r->tries;
+    r->tries = 0;
+    r->armed = 0;
+    r->gave_up_v = 0;
+    r->next_at_v = 0;
+    return n;
+}
+
+int reset(Retry *r, i64 now)
+{
+    if (!r)
+        return -1;
+    (void)now;
+    r->tries = 0;
+    r->armed = 0;
+    r->gave_up_v = 0;
+    r->next_at_v = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "retry：指数退避" {
+    Retry r = { 0 };
+
+    if (r.init(100, 1000, 0) != 1)
+        return err(1, "init 失败");
+    if (r.attempts() != 0 || r.gave_up() != 0 || r.due(0) != 0)
+        return err(2, "初始状态不对");
+    if (r.fail(1000) != 100)
+        return err(3, "第一次失败应该等 100ms");
+    if (r.next_at() != 1100 || r.due(1099) != 0 || r.due(1100) != 1)
+        return err(4, "下次时间/到点判断不对");
+    if (r.fail(1100) != 200)
+        return err(5, "第二次应该等 200ms");
+    if (r.fail(1300) != 400 || r.fail(1700) != 800)
+        return err(6, "第三、四次应该是 400/800");
+    if (r.fail(2500) != 1000)
+        return err(7, "800 之后翻倍到 1600 应该被 1000 封顶");
+    if (r.attempts() != 5)
+        return err(8, "失败次数应该是 5");
+    if (r.delay_for(1) != 100 || r.delay_for(4) != 800 || r.delay_for(9) != 1000)
+        return err(9, "delay_for 不对");
+    if (r.succeed() != 5)
+        return err(10, "succeed 应该返回之前的失败次数");
+    if (r.attempts() != 0 || r.due(9999) != 0)
+        return err(11, "成功之后应该复位");
+}
+
+test "retry：次数上限与复位" {
+    Retry r = { 0 };
+
+    if (r.init(10, 40, 3) != 1)
+        return err(12, "init 失败");
+    if (r.fail(0) != 10)
+        return err(13, "第一次 10ms");
+    if (r.fail(10) != 20)
+        return err(14, "第二次 20ms");
+    /* max_attempts=3：第三次失败就用完了 */
+    if (r.fail(30) != -1 || r.gave_up() != 1)
+        return err(15, "第三次失败应该放弃");
+    if (r.fail(50) != -1 || r.due(99999) != 0)
+        return err(16, "放弃之后一直是 -1");
+    if (r.reset(50) != 1 || r.gave_up() != 0 || r.attempts() != 0)
+        return err(17, "reset 之后应该清零");
+    if (r.fail(50) != 10)
+        return err(18, "reset 之后重新从 10ms 开始");
+    /* 参数校验 */
+    if (r.init(0, 10, 1) != -1 || r.init(100, 10, 1) != -1)
+        return err(19, "非法参数应该 -1");
+    /* 不限次数时的封顶 */
+    {
+        Retry q = { 0 };
+
+        q.init(3, 10, 0);
+        if (q.fail(0) != 3 || q.fail(3) != 6 || q.fail(9) != 10 || q.fail(19) != 10)
+            return err(20, "封顶曲线不对");
+    }
+}

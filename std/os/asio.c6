@@ -1,0 +1,366 @@
+/* std/os/asio：异步按行读取（reactor 之上的流缓冲 + 行切分 + 写队列）。
+ *
+ *     import std.os.asio;
+ *
+ *     char buf[256] = { 0 };
+ *     Asio a = { 0 };
+ *     a.init(&re, fd, buf, 256);            // 方法：init / watch / feed / next_line
+ *     a.watch(on_line, 0);                  // 可读时把整行交给回调
+ *     a.pump();                             // 每次可读事件调一次：读一次并切行
+ *
+ * 这是「异步网络/管道读取」最常用的那一层：把字节流切成行，行没读全就留在缓冲里等
+ * 下一次可读事件。缓冲由调用方给（`char` 数组），模块自己不分配内存。
+ *
+ * 约定：
+ *
+ * - `a.init(re, fd, buf, cap)` 绑定 reactor、fd 与缓冲区（`cap` 至少 2）；
+ * - `a.watch(cb, ctx)` 在 reactor 上注册读事件，可读时自动 `pump`；`cb` 可以是 0
+ *   （只喂缓冲），回调签名 `void (*)(void *ctx, char[:] line)`，行尾的 `\n`/`\r\n`
+ *   已被去掉，空行是长度 0 的 `char[:]`；
+ * - `a.pump()` 做一次 `read` 并把完整的行全部交出去，返回**本次交付行数**；
+ *   返回 -1 表示读出错（`a.error()`），`a.is_eof()` 表示对端关闭；
+ * - `a.next_line(out, outcap)` 手动取一行（不含换行），返回 1 成功 / 0 还没有整行 / -1
+ *   行比 `outcap-1` 长（此时这一行会被丢弃）；
+ * - `a.pending()` 是缓冲里还没成行的字节数，`a.lines()`/`a.bytes()` 是累计计数；
+ * - `a.drain()` 把缓冲里剩下的尾巴（没有换行的那段）当最后一行交出去（对端关闭后用）；
+ * - 一次 `read` 读满缓冲还没换行时返回「行过长」错误（`a.error() == -2`），避免吞数据；
+ * - 单线程使用；`fd` 最好是非阻塞的（可读事件里 `read` 不会阻塞）。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.os.asio;
+import std.core.types;
+import std.text.str;
+import std.os.poll;
+import std.os.reactor;
+
+typedef void (*AsioLine)(void *ctx, char[:] line);
+
+struct Asio {
+    Reactor *re;
+    int fd;
+    char *buf;
+    int cap;
+    int len;        /* 已用的字节数 [0, len) */
+    int eof;
+    int errc;
+    AsioLine cb;
+    void *ctx;
+    int nlines;
+    i64 nbytes;
+};
+
+int init(Asio *a, Reactor *re, int fd, void *buf, int cap)
+{
+    if (!a || !re || fd < 0 || !buf || cap < 2)
+        return -1;
+    memset(a, 0, sizeof *a);
+    memset(buf, 0, (size_t)cap);
+    a->re = re;
+    a->fd = fd;
+    a->buf = (char *)buf;
+    a->cap = cap;
+    return 1;
+}
+
+int pending(Asio *a)
+{
+    return a ? a->len : 0;
+}
+
+int is_eof(Asio *a)
+{
+    return a ? a->eof : 1;
+}
+
+int error(Asio *a)
+{
+    return a ? a->errc : 0;
+}
+
+int lines(Asio *a)
+{
+    return a ? a->nlines : 0;
+}
+
+i64 bytes(Asio *a)
+{
+    return a ? a->nbytes : 0;
+}
+
+/* 从缓冲头部取一行（含换行就吃掉），成功返回行长，没有整行返回 -1 */
+static int as_take_line(Asio *a, char *out, int outcap)
+{
+    int i = 0, n = 0;
+
+    for (i = 0; i < a->len; i++) {
+        if (a->buf[i] == '\n')
+            break;
+    }
+    if (i >= a->len)
+        return -1;                      /* 还没有整行 */
+    n = i;
+    if (n > 0 && a->buf[n - 1] == '\r')
+        n--;
+    if (out && outcap > 0) {
+        int copy = n < outcap - 1 ? n : outcap - 1;
+
+        memcpy(out, a->buf, (size_t)copy);
+        out[copy] = 0;
+    }
+    /* 消费掉这一行（含 \n） */
+    {
+        int used = i + 1;
+
+        a->len -= used;
+        if (a->len > 0)
+            memmove(a->buf, a->buf + used, (size_t)a->len);
+    }
+    a->nlines++;
+    return n;
+}
+
+/* 交付一行给回调（没有回调就丢弃） */
+static void as_deliver(Asio *a, char *line, int n)
+{
+    if (a->cb) {
+        char[:] view = (char[:]){ line, n };
+
+        a->cb(a->ctx, view);
+    }
+}
+
+int next_line(Asio *a, char *out, int outcap)
+{
+    char tmp[4096] = { 0 };
+    int n = 0;
+
+    if (!a || !a->buf)
+        return 0;
+    n = as_take_line(a, tmp, (int)sizeof tmp);
+    if (n < 0)
+        return 0;
+    if (outcap > 0 && out) {
+        if (n >= outcap) {
+            if (outcap > 0)
+                out[0] = 0;
+            return -1;                  /* 太长，已经丢弃 */
+        }
+        memcpy(out, tmp, (size_t)n);
+        out[n] = 0;
+    }
+    if (a->cb)
+        as_deliver(a, tmp, n);
+    return 1;
+}
+
+int pump(Asio *a)
+{
+    int n = 0, got = 0;
+
+    if (!a || !a->buf || !a->re)
+        return -1;
+    if (a->eof || a->errc != 0)
+        return 0;
+    if (a->len >= a->cap - 1) {
+        a->errc = -2;                   /* 缓冲满还没换行：行太长 */
+        return -1;
+    }
+    n = (int)read(a->fd, a->buf + a->len, (size_t)(a->cap - 1 - a->len));
+    if (n < 0) {
+        a->errc = -1;
+        return -1;
+    }
+    if (n == 0) {
+        a->eof = 1;
+        return 0;
+    }
+    a->len += n;
+    a->nbytes += n;
+    /* 没有回调时把行留在缓冲里给 next_line 取 */
+    if (!a->cb)
+        return 0;
+    /* 把完整的行都切出去 */
+    while (1) {
+        char tmp[4096] = { 0 };
+        int k = as_take_line(a, tmp, (int)sizeof tmp);
+
+        if (k < 0)
+            break;
+        as_deliver(a, tmp, k);
+        got++;
+    }
+    return got;
+}
+
+int drain(Asio *a)
+{
+    char tmp[4096] = { 0 };
+    int n = 0;
+
+    if (!a || !a->buf || a->len <= 0)
+        return 0;
+    n = a->len;
+    if (n > 0 && a->buf[n - 1] == '\r')
+        n--;
+    if (n > (int)sizeof tmp - 1)
+        n = (int)sizeof tmp - 1;
+    memcpy(tmp, a->buf, (size_t)n);
+    tmp[n] = 0;
+    a->len = 0;
+    a->nlines++;
+    as_deliver(a, tmp, n);
+    return 1;
+}
+
+static void asio_on_readable(void *ctx, int fd, int events)
+{
+    Asio *a = (Asio *)ctx;
+
+    (void)fd;
+    (void)events;
+    a->pump();
+}
+
+int watch(Asio *a, AsioLine cb, void *ctx)
+{
+    if (!a || !a->re)
+        return -1;
+    a->cb = cb;
+    a->ctx = ctx;
+    return a->re->on(a->fd, EVENT_READ, asio_on_readable, a);
+}
+
+int unwatch(Asio *a)
+{
+    if (!a || !a->re)
+        return 0;
+    return a->re->off(a->fd);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct LineSink {
+    int n;
+    char last[32];
+    int lastlen;
+    int empties;
+};
+
+static void on_line(void *ctx, char[:] line)
+{
+    struct LineSink *s = (struct LineSink *)ctx;
+    int copy = line.len < 31 ? line.len : 31;
+
+    s->n++;
+    if (line.len == 0)
+        s->empties++;
+    if (copy > 0)
+        memcpy(s->last, line.data, (size_t)copy);
+    s->last[copy] = 0;
+    s->lastlen = line.len;
+}
+
+test "asio：按行切分" {
+    static char buf[64] = { 0 };
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[2] = { { 0, 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Reactor re = { 0 };
+    Asio a = { 0 };
+    struct LineSink sink = { 0, { 0 }, 0, 0 };
+    int fds[2] = { -1, -1 };
+    char line[32] = { 0 };
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe 失败");
+    if (re.init(&ps, regs, 2, tbuf, 2) != 1)
+        return err(2, "reactor init 失败");
+    if (a.init(&re, fds[0], buf, 64) != 1)
+        return err(3, "asio init 失败");
+    if (a.pending() != 0 || a.is_eof() != 0 || a.error() != 0)
+        return err(4, "初始状态不对");
+    if (a.watch(on_line, &sink) != 1)
+        return err(5, "watch 失败");
+    /* 两行 + 半行 */
+    write(fds[1], "ab\ncd\nxy", 8);
+    if (a.pump() != 2)
+        return err(6, "应该交付 2 行");
+    if (sink.n != 2 || sink.lastlen != 2)
+        return err(7, "回调收到的行不对");
+    if (memcmp(sink.last, "cd", 2) != 0)
+        return err(8, "最后一行应该是 cd");
+    if (a.pending() != 2 || a.lines() != 2)
+        return err(9, "缓冲里应该剩 2 字节的半个行");
+    if (a.bytes() != 8)
+        return err(10, "累计字节数应该是 8");
+    /* 再补齐成一行 */
+    write(fds[1], "z\n", 2);
+    if (a.pump() != 1 || sink.lastlen != 3)
+        return err(11, "补齐之后应该再来一行");
+    if (memcmp(sink.last, "xyz", 3) != 0)
+        return err(12, "行内容应该是 xyz");
+    /* 空行与 CRLF */
+    write(fds[1], "\r\nok\r\n", 6);
+    if (a.pump() != 2 || sink.empties != 1)
+        return err(13, "CRLF 空行应该交付一条空行");
+    if (memcmp(sink.last, "ok", 2) != 0 || sink.lastlen != 2)
+        return err(14, "CRLF 应该被去掉");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "asio：EOF、drain 与手动取行" {
+    static char buf[32] = { 0 };
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[2] = { { 0, 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Reactor re = { 0 };
+    Asio a = { 0 };
+    struct LineSink sink = { 0, { 0 }, 0, 0 };
+    int fds[2] = { -1, -1 };
+    char line[16] = { 0 };
+
+    if (pipe(fds) != 0)
+        return err(15, "pipe 失败");
+    re.init(&ps, regs, 2, tbuf, 2);
+    a.init(&re, fds[0], buf, 32);
+    /* 没有回调时用 next_line 手动取 */
+    write(fds[1], "one\ntwo", 7);
+    if (a.pump() != 0 || a.pending() != 7)
+        return err(16, "没有回调时 pump 只喂缓冲、不切行");
+    if (a.next_line(line, (int)sizeof line) != 1 || memcmp(line, "one", 3) != 0)
+        return err(17, "next_line 应该取出 one");
+    if (a.next_line(line, (int)sizeof line) != 0)
+        return err(18, "没有整行时应该返回 0");
+    /* 关掉写端 → EOF */
+    close(fds[1]);
+    if (a.pump() != 0 || a.is_eof() != 1)
+        return err(19, "对端关闭后应该标记 EOF");
+    /* drain 交付尾巴 */
+    if (a.drain() != 1 || sink.n != 0)
+        return err(20, "没有回调时 drain 不该计数到 sink");
+    if (a.pending() != 0)
+        return err(21, "drain 之后缓冲应该清空");
+    close(fds[0]);
+    /* 回调 + drain */
+    if (pipe(fds) != 0)
+        return err(22, "pipe 失败");
+    re.init(&ps, regs, 2, tbuf, 2);
+    a.init(&re, fds[0], buf, 32);
+    if (a.watch(on_line, &sink) != 1)
+        return err(26, "watch 失败");
+    write(fds[1], "tail", 4);
+    a.pump();
+    if (sink.n != 0 || a.pending() != 4)
+        return err(23, "没有换行时不该交付");
+    if (a.drain() != 1 || sink.n != 1 || memcmp(sink.last, "tail", 4) != 0)
+        return err(24, "drain 应该把尾巴交出去");
+    if (a.unwatch() != 1)
+        return err(25, "unwatch 失败");
+    close(fds[0]);
+    close(fds[1]);
+}

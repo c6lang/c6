@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十三批（async 之上再盖一层）**：`std.core.executor`（事件循环执行器）、
+  `std.os.asio`（异步按行读）、`std.core.retry`（指数退避重试）、`std.core.awaitgroup`
+  （完成计数组），集成示例 `examples/stdasync2.c6`（`make std-async2`）。错误号段
+  `std.core.executor`=0x612d … `std.core.awaitgroup`=0x6130（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第七十二批（异步编程基础）**：`std.core.future`（Future/Promise 与
   all/any 组合）、`std.core.timer`（定时器小顶堆）、`std.core.task`（协作式任务调度）、
   `std.os.reactor`（poll + 定时器的事件循环），集成示例 `examples/stdasync.c6`

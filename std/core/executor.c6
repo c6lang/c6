@@ -1,0 +1,306 @@
+/* std/core/executor：事件循环执行器（reactor 的 fd/定时器 + 协作式任务，一起驱动）。
+ *
+ *     import std.core.executor;
+ *
+ *     Executor e = { 0 };
+ *     e.init(&ps, regs, 8, tbuf, 8, tasks, 8);   // 方法：init / spawn / after / tick
+ *     e.on(fd, EVENT_READ, on_read, 0);
+ *     e.after(50, on_timeout, 0);                // 相对 e->cur 的 50ms
+ *     e.spawn(step, &state);
+ *     e.tick(now_ms(), 100);                     // 触发定时器 + 派发 fd + 每个任务走一步
+ *
+ * 这是「异步程序的主循环」：`tick` 内部先派发 I/O 与到期定时器（`std.os.reactor`），
+ * 再让所有任务各走一步（`std.core.task`），返回本 tick 处理的事件数。
+ *
+ * 约定：
+ *
+ * - `e.init(ps, regs, rcap, timer_buf, tcap, task_buf, kcap)` 绑定四块**调用方给的**
+ *   缓冲区：`PollSet`、fd 注册表、定时器数组、任务槽；
+ * - `e.spawn(step, state)` 加任务，`e.after(delay, cb, ctx)` 加定时器（相对时间，
+ *   基准是最近一次 `tick` 的 `now`），`e.on`/`e.off` 注册 fd 事件；
+ * - `e.tick(now, max_wait_ms)` 做一轮：定时器 → fd → 任务，返回处理的事件数；
+ *   `max_wait_ms < 0` 表示「按最近定时器算超时」；
+ * - `e.run(now, max_rounds, wait_ms)` 连续 `tick`，直到没活干、被 `e.stop()` 或
+ *   轮数用完，返回实际轮数；**时间不会自己走**，需要真实推进请每轮传新的 `now`
+ *   （测试里用假时钟即可）；
+ * - `e.active()` 活动任务数，`e.timers()` 未触发定时器数，`e.nfds()` 注册的 fd 数，
+ *   `e.events()` 累计事件数，`e.now()` 最近一次 tick 的时间；
+ * - 单线程无锁；回调里可以再 `spawn`/`after`/`on`。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.core.executor;
+import std.core.types;
+import std.text.str;
+import std.os.poll;
+import std.core.timer;
+import std.core.task;
+import std.os.reactor;
+
+struct Executor {
+    Reactor re;
+    Sched sched;
+    i64 cur;        /* 字段名不叫 now，避免与 now() 方法冲突 */
+    i64 nev;
+    int stop_flag;
+};
+
+int init(Executor *e, void *ps, void *regs, int rcap, void *timer_buf, int tcap,
+         void *task_buf, int kcap)
+{
+    if (!e || !ps || !regs || rcap <= 0 || !timer_buf || tcap <= 0 || !task_buf
+        || kcap <= 0)
+        return -1;
+    memset(e, 0, sizeof *e);
+    if (e->re.init((PollSet *)ps, regs, rcap, timer_buf, tcap) != 1)
+        return -1;
+    if (e->sched.init(task_buf, kcap) != 1)
+        return -1;
+    e->cur = 0;
+    e->nev = 0;
+    e->stop_flag = 0;
+    return 1;
+}
+
+i64 now(Executor *e)
+{
+    return e ? e->cur : 0;
+}
+
+i64 events(Executor *e)
+{
+    return e ? e->nev : 0;
+}
+
+int active(Executor *e)
+{
+    return e ? e->sched.active() : 0;
+}
+
+int timers(Executor *e)
+{
+    return e ? e->re.timer_count() : 0;
+}
+
+int nfds(Executor *e)
+{
+    return e ? e->re.io_count() : 0;
+}
+
+int stopped(Executor *e)
+{
+    return e ? e->stop_flag : 1;
+}
+
+i64 spawn(Executor *e, TaskStep step, void *state)
+{
+    if (!e || e->stop_flag)
+        return -1;
+    return e->sched.spawn(step, state);
+}
+
+i64 after(Executor *e, i64 delay, TimerCb cb, void *ctx)
+{
+    if (!e || e->stop_flag || delay < 0)
+        return -1;
+    return e->re.after(e->cur, delay, cb, ctx);
+}
+
+int on(Executor *e, int fd, int events_bits, IoHandler cb, void *ctx)
+{
+    if (!e || e->stop_flag)
+        return -1;
+    return e->re.on(fd, events_bits, cb, ctx);
+}
+
+int off(Executor *e, int fd)
+{
+    return e ? e->re.off(fd) : 0;
+}
+
+int tick(Executor *e, i64 t, int max_wait_ms)
+{
+    int nevents = 0, stepped = 0;
+
+    if (!e)
+        return -1;
+    if (e->stop_flag)
+        return 0;
+    e->cur = t;
+    nevents = e->re.run_once(t, max_wait_ms);
+    if (nevents < 0)
+        nevents = 0;
+    stepped = e->sched.active();        /* 本轮各走一步的任务数 */
+    e->sched.step_all();
+    e->nev += nevents;
+    return nevents + stepped;
+}
+
+i64 run(Executor *e, i64 t, int max_rounds, int wait_ms)
+{
+    int i = 0;
+
+    if (!e || max_rounds <= 0)
+        return -1;
+    for (i = 0; i < max_rounds; i++) {
+        if (e->stop_flag)
+            break;
+        if (e->sched.active() <= 0 && e->re.timer_count() <= 0
+            && e->re.io_count() <= 0)
+            break;
+        e->tick(t, wait_ms);
+    }
+    return (i64)i;
+}
+
+int stop(Executor *e)
+{
+    if (!e)
+        return -1;
+    e->stop_flag = 1;
+    e->re.stop();
+    return 1;
+}
+
+int resume(Executor *e)
+{
+    if (!e)
+        return -1;
+    e->stop_flag = 0;
+    return e->re.resume();
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct ExState {
+    int ticks;
+    int limit;
+    int finished;
+};
+
+static int ex_step(void *state)
+{
+    struct ExState *s = (struct ExState *)state;
+
+    s->ticks++;
+    if (s->ticks >= s->limit) {
+        s->finished = 1;
+        return 0;
+    }
+    return 1;
+}
+
+struct ExEv {
+    int reads;
+    int timeouts;
+};
+
+static void ex_read(void *ctx, int fd, int events)
+{
+    struct ExEv *c = (struct ExEv *)ctx;
+
+    (void)events;
+    c->reads++;
+    {
+        char buf[8] = { 0 };
+
+        read(fd, buf, sizeof buf);
+    }
+}
+
+static void ex_timeout(void *ctx, i64 id)
+{
+    struct ExEv *c = (struct ExEv *)ctx;
+
+    (void)id;
+    c->timeouts++;
+}
+
+test "executor：任务、定时器与 fd 一起驱动" {
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[4] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor e = { 0 };
+    struct ExState st = { 0, 3, 0 };
+    struct ExEv ev = { 0, 0 };
+    int fds[2] = { -1, -1 };
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe 失败");
+    if (e.init(&ps, regs, 4, tbuf, 4, kbuf, 4) != 1)
+        return err(2, "init 失败");
+    if (e.now() != 0 || e.active() != 0 || e.timers() != 0 || e.nfds() != 0)
+        return err(3, "初始状态不对");
+    if (e.spawn(ex_step, &st) <= 0)
+        return err(4, "spawn 失败");
+    if (e.after(100, ex_timeout, &ev) <= 0)
+        return err(5, "after 失败");
+    if (e.on(fds[0], EVENT_READ, ex_read, &ev) != 1)
+        return err(6, "on 失败");
+    if (e.timers() != 1 || e.nfds() != 1 || e.active() != 1)
+        return err(7, "注册计数不对");
+    /* 第 0 轮：任务走一步，定时器没到期，管道没数据 */
+    if (e.tick(0, 0) != 1 || st.ticks != 1 || ev.timeouts != 0)
+        return err(8, "第一轮只应该跑一个任务");
+    if (e.now() != 0)
+        return err(9, "now 应该被更新");
+    /* 第 100 轮：定时器到期 + 任务再走一步 */
+    if (e.tick(100, 0) != 2 || ev.timeouts != 1)
+        return err(10, "100 时应该触发定时器并跑一个任务");
+    /* 写数据 → fd 事件 */
+    write(fds[1], "x", 1);
+    if (e.tick(100, 50) != 2 || ev.reads != 1)
+        return err(11, "写数据后应该派发读事件");
+    /* 第三轮：任务完成 */
+    e.tick(100, 0);
+    if (st.finished != 1 || e.active() != 0)
+        return err(12, "任务应该在三轮后完成");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "executor：run 循环、停止与边界" {
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[2] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[2] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor e = { 0 };
+    struct ExState st = { 0, 2, 0 };
+    struct ExEv ev = { 0, 0 };
+
+    if (e.init(&ps, regs, 2, tbuf, 2, kbuf, 2) != 1)
+        return err(13, "init 失败");
+    e.spawn(ex_step, &st);
+    /* run：两轮之后任务完成、没活干就退出 */
+    if (e.run(0, 10, 0) != 2)
+        return err(14, "run 应该在任务完成后提前退出（2 轮）");
+    if (st.finished != 1)
+        return err(15, "任务应该完成");
+    /* 只有定时器时 run 会一直跑到上限 */
+    e.after(1000, ex_timeout, &ev);
+    if (e.run(0, 5, 0) != 5)
+        return err(16, "只有定时器时 run 应该跑满 5 轮");
+    if (ev.timeouts != 0)
+        return err(17, "1000 之前不该触发");
+    /* stop / resume */
+    if (e.stop() != 1 || e.stopped() != 1)
+        return err(18, "stop 失败");
+    if (e.spawn(ex_step, &st) != -1)
+        return err(19, "停止后 spawn 应该 -1");
+    if (e.tick(2000, 0) != 0)
+        return err(20, "停止后 tick 应该返回 0");
+    if (e.resume() != 1 || e.stopped() != 0)
+        return err(21, "resume 失败");
+    if (e.tick(2000, 0) != 1 || ev.timeouts != 1)
+        return err(22, "恢复后 tick 应该把到期定时器补触发");
+    if (e.run(0, 0, 0) != -1)
+        return err(23, "max_rounds=0 应该 -1");
+    if (e.after(-1, ex_timeout, &ev) != -1)
+        return err(24, "负延时应该 -1");
+    if (e.events() < 0)
+        return err(25, "events 不该为负");
+}

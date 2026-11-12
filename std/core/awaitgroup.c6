@@ -1,0 +1,252 @@
+/* std/core/awaitgroup：异步完成计数组（add/done + 全部完成时 resolve 一个 Future）。
+ *
+ *     import std.core.awaitgroup;
+ *
+ *     AwaitGroup g = { 0 };
+ *     Future all = { 0 };
+ *     g.init();                      // 方法：init / add / done / fail / remaining
+ *     all.init();
+ *     g.bind(&all);                  // 计数归零时 all 变成就绪
+ *     g.add(2);                      // 两个在飞的任务
+ *     g.done();                      // 完成一个 → 还剩 1
+ *     g.done();                      // 全部完成 → all.resolve(2)
+ *     all.value();                   // 2（总数）
+ *
+ * 这是异步版的 WaitGroup：计数到 0 时把绑定的 `Future` 变成就绪；有一个失败就
+ * 变成失败（错误码取**第一个**失败的）。常用于「等一批并发任务都收尾」。
+ *
+ * 约定：
+ *
+ * - `g.init()` 复位（计数 0、无失败、解绑）；
+ * - `g.add(n)` 加计数（`n < 0` 返回 -1，不会减到负数），返回加完后的计数；
+ * - `g.done()` 完成一个，返回剩余数（已经是 0 时返回 0 且不改状态）；
+ * - `g.fail(code)` 记一次失败（计数照样减一），返回剩余数；之后的 `done` 也照样减；
+ * - `g.remaining()` 剩余数、`g.total()` 累计加过的总数、`g.is_done()`、
+ *   `g.failed()`/`g.code()` 失败状态；
+ * - `g.bind(f)` 绑一个 `Future`：归零时就绪（值 = `total`），有失败则失败；
+ *   绑定时如果**已经**归零/已失败，立刻结算；
+ * - `g.reset()` 清空计数与失败标志，但**保留**绑定（下次归零还是会结算）；
+ * - 单线程使用（`Future` 本身不加锁）。
+ */
+#include <string.h>
+
+module std.core.awaitgroup;
+import std.core.types;
+import std.text.str;
+import std.core.future;
+
+struct AwaitGroup {
+    int cnt;        /* 剩余 */
+    int ntotal;     /* 累计 add 的总数 */
+    int failed_flag;
+    int errc;
+    Future *fut;
+};
+
+int init(AwaitGroup *g)
+{
+    if (!g)
+        return -1;
+    memset(g, 0, sizeof *g);
+    return 1;
+}
+
+int remaining(AwaitGroup *g)
+{
+    return g ? g->cnt : 0;
+}
+
+int total(AwaitGroup *g)
+{
+    return g ? g->ntotal : 0;
+}
+
+int is_done(AwaitGroup *g)
+{
+    if (!g)
+        return 1;
+    return g->cnt <= 0 ? 1 : 0;
+}
+
+int failed(AwaitGroup *g)
+{
+    return g ? g->failed_flag : 0;
+}
+
+int code(AwaitGroup *g)
+{
+    return g && g->failed_flag ? g->errc : 0;
+}
+
+static void ag_settle(AwaitGroup *g)
+{
+    if (!g->fut || g->cnt > 0)
+        return;
+    if (g->failed_flag)
+        g->fut->reject(g->errc);
+    else
+        g->fut->resolve((i64)g->ntotal);
+}
+
+int bind(AwaitGroup *g, Future *f)
+{
+    if (!g || !f)
+        return -1;
+    g->fut = f;
+    if (g->cnt <= 0 && (g->ntotal > 0 || g->failed_flag))
+        ag_settle(g);
+    return 1;
+}
+
+int unbind(AwaitGroup *g)
+{
+    if (!g)
+        return -1;
+    g->fut = 0;
+    return 1;
+}
+
+int add(AwaitGroup *g, int n)
+{
+    if (!g || n < 0)
+        return -1;
+    g->cnt += n;
+    g->ntotal += n;
+    return g->cnt;
+}
+
+int done(AwaitGroup *g)
+{
+    if (!g)
+        return 0;
+    if (g->cnt > 0)
+        g->cnt--;
+    ag_settle(g);
+    return g->cnt;
+}
+
+int fail(AwaitGroup *g, int errc)
+{
+    if (!g)
+        return 0;
+    if (!g->failed_flag) {
+        g->failed_flag = 1;
+        g->errc = errc;
+    }
+    if (g->cnt > 0)
+        g->cnt--;
+    ag_settle(g);
+    return g->cnt;
+}
+
+int reset(AwaitGroup *g)
+{
+    if (!g)
+        return -1;
+    g->cnt = 0;
+    g->ntotal = 0;
+    g->failed_flag = 0;
+    g->errc = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct AwaitCbTest {
+    int calls;
+    i64 value;
+    int errc;
+};
+
+static void await_test_on_done(void *self, void *ctx)
+{
+    Future *f = (Future *)self;
+    struct AwaitCbTest *c = (struct AwaitCbTest *)ctx;
+
+    c->calls++;
+    c->value = f->val;
+    c->errc = f->errc;
+}
+
+test "awaitgroup：计数与结算" {
+    AwaitGroup g = { 0 };
+    Future f = { 0 };
+    struct AwaitCbTest cb = { 0, 0, 0 };
+
+    if (g.init() != 1)
+        return err(1, "init 失败");
+    if (g.remaining() != 0 || g.is_done() != 1 || g.failed() != 0)
+        return err(2, "初始状态不对");
+    f.init();
+    f.then(await_test_on_done, &cb);
+    if (g.bind(&f) != 1)
+        return err(3, "bind 失败");
+    if (g.add(2) != 2)
+        return err(4, "add 应该返回 2");
+    if (g.is_done() != 0 || g.total() != 2)
+        return err(5, "加了 2 之后不该完成");
+    if (g.done() != 1)
+        return err(6, "done 之后应该剩 1");
+    if (cb.calls != 0)
+        return err(7, "没归零不该结算");
+    if (g.done() != 0)
+        return err(8, "done 之后应该归零");
+    if (cb.calls != 1 || cb.value != 2)
+        return err(9, "归零应该 resolve 绑定的 Future，值是总数 2");
+    if (f.state() != FUT_READY || g.is_done() != 1)
+        return err(10, "状态不对");
+    if (g.done() != 0)
+        return err(11, "已经归零时 done 不该变负");
+    if (g.add(-1) != -1)
+        return err(12, "add 负数应该 -1");
+}
+
+test "awaitgroup：失败、复位与已归零绑定" {
+    AwaitGroup g = { 0 };
+    Future f = { 0 };
+    struct AwaitCbTest cb = { 0, 0, 0 };
+
+    g.init();
+    f.init();
+    f.then(await_test_on_done, &cb);
+    g.bind(&f);
+    g.add(3);
+    if (g.fail(-7) != 2)
+        return err(13, "fail 之后应该剩 2");
+    if (g.failed() != 1 || g.code() != -7)
+        return err(14, "失败标志/错误码不对");
+    if (g.fail(-9) != 1 || g.code() != -7)
+        return err(15, "错误码应该保留第一个");
+    if (cb.calls != 0)
+        return err(16, "还没归零不该结算");
+    if (g.done() != 0)
+        return err(17, "最后一个 done 应该归零");
+    if (cb.calls != 1 || cb.errc != -7 || f.state() != FUT_REJECTED)
+        return err(18, "归零后应该 reject 且带第一个错误码");
+    /* 复位：保留绑定，计数清零 */
+    if (g.reset() != 1 || g.remaining() != 0 || g.failed() != 0 || g.total() != 0)
+        return err(19, "reset 之后应该清零");
+    /* 已归零 + 新 Future：bind 应该立刻结算 */
+    {
+        Future f2 = { 0 };
+        struct AwaitCbTest cb2 = { 0, 0, 0 };
+
+        f2.init();
+        f2.then(await_test_on_done, &cb2);
+        g.add(1);
+        g.done();
+        if (g.bind(&f2) != 1)
+            return err(20, "bind 失败");
+        if (cb2.calls != 1 || f2.value() != 1)
+            return err(21, "已经归零时 bind 应该立刻 resolve");
+        if (g.unbind() != 1)
+            return err(22, "unbind 失败");
+        /* 解绑后 done 不再结算 */
+        g.add(1);
+        g.done();
+        if (cb2.calls != 1)
+            return err(23, "解绑之后不该再结算");
+    }
+}

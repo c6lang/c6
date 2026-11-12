@@ -1,0 +1,227 @@
+/* examples/stdasync2.c6 —— 第七十三批（基于 async 再往上盖一层）的集成示例。
+ *
+ *     make std-async2
+ *
+ * 四节：Executor 主循环、Asio 按行异步读、Retry 退避、AwaitGroup 完成计数。
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.future;
+import std.os.poll;
+import std.core.timer;
+import std.core.task;
+import std.core.executor;
+import std.os.reactor;
+import std.os.asio;
+import std.core.retry;
+import std.core.awaitgroup;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+struct Count {
+    int ticks;
+    int limit;
+    int finished;
+};
+
+static int count_step(void *state)
+{
+    struct Count *c = (struct Count *)state;
+
+    c->ticks++;
+    if (c->ticks >= c->limit) {
+        c->finished = 1;
+        return 0;
+    }
+    return 1;
+}
+
+struct Evc {
+    int reads;
+    int timeouts;
+};
+
+static void on_readable(void *ctx, int fd, int events)
+{
+    struct Evc *c = (struct Evc *)ctx;
+    char buf[16] = { 0 };
+
+    (void)events;
+    c->reads++;
+    read(fd, buf, sizeof buf);
+}
+
+static void on_timeout(void *ctx, i64 id)
+{
+    struct Evc *c = (struct Evc *)ctx;
+
+    (void)id;
+    c->timeouts++;
+}
+
+static void do_executor(void)
+{
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[4] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor e = { 0 };
+    struct Count c = { 0, 2, 0 };
+    struct Evc ev = { 0, 0 };
+    int fds[2] = { -1, -1 };
+
+    printf("== executor\n");
+    if (pipe(fds) != 0) {
+        check(0, "pipe 创建");
+        return;
+    }
+    check(e.init(&ps, regs, 4, tbuf, 4, kbuf, 4) == 1, "init");
+    e.spawn(count_step, &c);
+    e.after(100, on_timeout, &ev);
+    e.on(fds[0], EVENT_READ, on_readable, &ev);
+    check(e.active() == 1 && e.timers() == 1 && e.nfds() == 1, "注册");
+    check(e.tick(0, 0) == 1 && c.ticks == 1, "tick(0)：任务走一步");
+    check(e.tick(100, 0) == 2 && ev.timeouts == 1, "tick(100)：定时器 + 任务");
+    write(fds[1], "x", 1);
+    check(e.tick(100, 50) == 1 && ev.reads == 1, "管道可读被派发（任务已完成，只算 I/O）");
+    check(c.finished == 1 && e.active() == 0, "任务完成");
+    printf("   累计事件 %lld，now=%lld\n", (long long)e.events(), (long long)e.now());
+    e.stop();
+    check(e.stopped() == 1, "stop");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+struct Sink {
+    int n;
+    char lines[4][16];
+};
+
+static void on_line(void *ctx, char[:] line)
+{
+    struct Sink *s = (struct Sink *)ctx;
+    int copy = line.len < 15 ? line.len : 15;
+
+    if (s->n < 4 && copy > 0)
+        memcpy(s->lines[s->n], line.data, (size_t)copy);
+    s->n++;
+}
+
+static void do_asio(void)
+{
+    static char buf[64] = { 0 };
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[2] = { { 0, 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Reactor re = { 0 };
+    Asio a = { 0 };
+    struct Sink sink = { 0, { { 0 } } };
+    int fds[2] = { -1, -1 };
+
+    printf("== asio\n");
+    if (pipe(fds) != 0) {
+        check(0, "pipe 创建");
+        return;
+    }
+    re.init(&ps, regs, 2, tbuf, 2);
+    check(a.init(&re, fds[0], buf, 64) == 1, "init");
+    check(a.watch(on_line, &sink) == 1, "watch");
+    write(fds[1], "alpha\nbe", 8);
+    check(a.pump() == 1 && sink.n == 1, "第一行 alpha 交付");
+    check(a.pending() == 2, "半个行留在缓冲里");
+    write(fds[1], "ta\ngamma\n", 9);
+    check(a.pump() == 2 && sink.n == 3, "补齐 beta 并交付 gamma");
+    printf("   行：%s / %s / %s（累计 %d 行、%lld 字节）\n", sink.lines[0],
+           sink.lines[1], sink.lines[2], a.lines(), (long long)a.bytes());
+    check(memcmp(sink.lines[1], "beta", 4) == 0, "第二行是 beta");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+static void do_retry(void)
+{
+    Retry r = { 0 };
+    i64 now = 1000;
+    i64 delay = 0;
+    int i = 0;
+
+    printf("== retry\n");
+    check(r.init(100, 1000, 0) == 1, "init");
+    for (i = 0; i < 5; i++) {
+        delay = r.fail(now);
+        printf("   第 %d 次失败 → 等 %lldms\n", i + 1, (long long)delay);
+        check(delay > 0, "每次都应该给出等待时间");
+        now += delay;
+    }
+    check(r.attempts() == 5, "失败计数 5");
+    check(r.delay_for(9) == 1000, "封顶 1000");
+    check(r.due(now) == 1, "到点了");
+    check(r.succeed() == 5, "成功返回之前的失败次数");
+    check(r.attempts() == 0 && r.due(now) == 0, "成功之后复位");
+}
+
+struct AgCb {
+    int calls;
+    i64 value;
+};
+
+static void ag_done(void *self, void *ctx)
+{
+    Future *f = (Future *)self;
+    struct AgCb *c = (struct AgCb *)ctx;
+
+    c->calls++;
+    c->value = f->val;
+}
+
+static void do_group(void)
+{
+    AwaitGroup g = { 0 };
+    Future f = { 0 };
+    struct AgCb cb = { 0, 0 };
+
+    printf("== awaitgroup\n");
+    check(g.init() == 1, "init");
+    f.init();
+    f.then(ag_done, &cb);
+    check(g.bind(&f) == 1, "bind");
+    check(g.add(3) == 3, "add(3)");
+    g.done();
+    check(cb.calls == 0 && g.remaining() == 2, "还剩 2 个不结算");
+    g.done();
+    g.done();
+    printf("   三个任务收尾 → Future 就绪，值 %lld\n", (long long)cb.value);
+    check(cb.calls == 1 && cb.value == 3, "归零结算为总数 3");
+    check(g.is_done() == 1 && g.failed() == 0, "组已完成且无失败");
+    g.reset();
+    g.add(1);
+    g.fail(-4);
+    check(g.failed() == 1 && g.code() == -4, "失败码 -4");
+    check(g.remaining() == 0, "失败也减计数");
+}
+
+int main(void)
+{
+    do_executor();
+    do_asio();
+    do_retry();
+    do_group();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

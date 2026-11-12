@@ -333,6 +333,11 @@
 | `std/core/timer.c6` | `std.core.timer` | 定时器小顶堆（**方法**：`t.init`/`t.add`/`t.cancel`/`t.fire`/`t.next_deadline`/`t.count`/`t.clear`）：时间是调用方给的整数毫秒（可用假时钟测），`add` 返回递增 id，`fire(now)` 按截止时间升序触发、回调里可继续 add |
 | `std/core/task.c6` | `std.core.task` | 协作式任务调度（**方法**：`s.init`/`s.spawn`/`s.step_all`/`s.run`/`s.cancel`/`s.active`/`s.rounds`/`s.clear`）：任务即 `int step(void *)`（1 继续、0 完成），每轮各走一步，`step_all` 避开系统 `poll(2)` 符号 |
 | `std/os/reactor.c6` | `std.os.reactor` | poll 事件循环（**方法**：`r.init`/`r.on`/`r.off`/`r.after`/`r.cancel_timer`/`r.run_once`/`r.stop`/`r.resume`/`r.io_count`/`r.dispatches`）：fd 注册表 + 定时器堆，`run_once(now, max_wait)` 用最近定时器算 poll 超时，返回派发次数；单线程无锁 |
+| `std/core/executor.c6` | `std.core.executor` | 事件循环执行器（**方法**：`e.init`/`e.spawn`/`e.after`/`e.on`/`e.off`/`e.tick`/`e.run`/`e.stop`/`e.resume`）：把 `PollSet` + 定时器堆 + 协作任务绑在一起，`tick(now, wait)` 依次做「定时器 → fd → 任务」并返回处理的事件数 |
+| `std/os/asio.c6` | `std.os.asio` | 异步按行读（**方法**：`a.init`/`a.watch`/`a.pump`/`a.next_line`/`a.drain`/`a.pending`/`a.is_eof`）：reactor 可读事件里读一次并切行交回调（`char[:]`，去掉 `\r\n`），无回调时把行留给 `next_line` |
+| `std/core/retry.c6` | `std.core.retry` | 重试退避策略（**方法**：`r.init`/`r.fail`/`r.due`/`r.next_at`/`r.delay_for`/`r.succeed`/`r.reset`/`r.attempts`/`r.gave_up`）：`base × 2^(n-1)` 封顶 `max`，`fail(now)` 返回等待毫秒并臂上下次，次数用完返回 -1 |
+| `std/core/awaitgroup.c6` | `std.core.awaitgroup` | 异步完成计数组（**方法**：`g.init`/`g.add`/`g.done`/`g.fail`/`g.bind`/`g.unbind`/`g.remaining`/`g.total`/`g.is_done`/`g.failed`/`g.code`/`g.reset`）：归零时把绑定的 `Future` 结算（值 = 总数，有失败则 reject 第一个错误码） |
+
 
 
 
@@ -464,6 +469,7 @@
 | `examples/stdcfg.c6` | （无模块） | 第七十批（系统配置文件）的拼装示例（`make std-cfg2`）：`.env` 取值、`hosts` 别名查找、`resolv.conf` 统计、`known_hosts` 匹配 |
 | `examples/stdmatch.c6` | （无模块） | 第七十一批（匹配与对齐）的拼装示例（`make std-match`）：多模式扫描、滚动哈希查找、区间集合合并/挖洞、GATTACA 序列比对 |
 | `examples/stdasync.c6` | （无模块） | 第七十二批（异步编程基础）的拼装示例（`make std-async`）：Future 回调与 all/any、定时器堆、协作式任务、poll 事件循环 + 定时器 |
+| `examples/stdasync2.c6` | （无模块） | 第七十三批（async 之上再盖一层）的拼装示例（`make std-async2`）：事件循环 tick、按行异步读、退避重试、完成计数组 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -646,6 +652,10 @@ std/core/future.c6         24 test(s), 0 failure(s)
 std/core/timer.c6          24 test(s), 0 failure(s)
 std/core/task.c6           24 test(s), 0 failure(s)
 std/os/reactor.c6          31 test(s), 0 failure(s)
+std/core/executor.c6       35 test(s), 0 failure(s)
+std/os/asio.c6             33 test(s), 0 failure(s)
+std/core/retry.c6          24 test(s), 0 failure(s)
+std/core/awaitgroup.c6     26 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4174,6 +4184,17 @@ make std-async
 管道读事件与 100ms 定时器，`run_once(900, 0)` 无事发生、`run_once(1100, 0)` 触发
 定时器、写入数据后被派发读事件。
 
+### 集成示例：`examples/stdasync2.c6`
+
+```sh
+make std-async2
+```
+
+四节都用方法：`Executor` 同时挂任务、定时器与管道读事件，打印每个 `tick` 处理的事件数；
+`Asio` 先写 `alpha\nbe`（交付 1 行、留半个行）、再写 `ta\ngamma\n` 凑齐 `beta` 并交付
+`gamma`；`Retry` 连失败 5 次打印 100/200/400/800/1000ms 的退避曲线；`AwaitGroup`
+三个任务收尾后把 Future 结算成 3，再用 `fail(-4)` 演示失败码。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4314,6 +4335,8 @@ make std-async
   （自带自检）。
 * `make std-async`：`examples/stdasync.c6`，第七十二批（异步编程基础）模块的拼装示例
   （自带自检）。
+* `make std-async2`：`examples/stdasync2.c6`，第七十三批（async 之上再盖一层）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

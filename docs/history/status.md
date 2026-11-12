@@ -2379,6 +2379,34 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（301 个模块、0 failure）、`make std-async`（25 条自检全过）、
 `make check-all`。
 
+### 11.85 标准库第七十三批（executor / asio / retry / awaitgroup）
+
+第七十三批「基于 async 再往上盖一层」：把上批的 Future/定时器/任务/事件循环组合成
+可用的异步设施——执行器、按行异步读、退避重试、完成计数组。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.executor` | 主循环 | 内部就是 `Reactor` + `Sched` 的组合；`tick(now, wait)` 顺序是「到期定时器 → fd 事件 → 任务各走一步」，返回 `I/O 事件数 + 本轮步进的任务数`（一开始拿 `step_all()` 的返回值当步进数，结果语义错了：它返回的是**剩余**任务数，改成先取 `active()`） |
+| `std.os.asio` | 按行读 | 缓冲由调用方给；`pump()` 读一次、把完整行交回调；**没有回调时不切行**，把整段留在缓冲里给 `next_line`（否则 `next_line` 永远取不到东西）；缓冲满还没换行报 `-2` |
+| `std.core.retry` | 退避 | `base × 2^(n-1)` 用循环算（不用 pow，避免浮点）；`max_attempts` 的语义是「最多失败这么多次」，最后一次失败直接 `gave_up` |
+| `std.core.awaitgroup` | 完成计数 | 复用 `std.core.future`：归零即结算（值 = 累计 add 总数），失败保留**第一个**错误码；`reset()` 保留绑定，`bind()` 时若已归零则立刻结算 |
+
+这一批的坑：`Executor.now` 字段与 `now()` 方法撞名（`field not found` 之后是
+`function pointer expected`），字段改名 `cur`；测试辅助结构再次污染公共命名空间
+（`AgCb` 与示例同名），统一加 `…Test` 后缀；`e.after(0, -1, cb, &ctx)` 这种按 C
+函数原型写的调用在方法形式下要多一个参数（方法首参隐含），改成 `e.after(-1, cb, &ctx)`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.executor`=0x612d、
+`std.os.asio`=0x612e、`std.core.retry`=0x612f、`std.core.awaitgroup`=0x6130；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-async2` 与 `STD_ASYNC2_SRCS`，`test-all`/`check-all` 都
+带上它；四模块在 `stdtest` 里的依赖分别是 executor（str+poll+timer+task+reactor，
+35 条）、asio（str+poll+timer+reactor，33 条）、retry（str，24 条）、awaitgroup
+（str+future，26 条）。示例 `examples/stdasync2.c6` 四节（32 条自检）。
+
+验收：`make stdtest`（305 个模块、0 failure）、`make std-async2`（32 条自检全过）、
+`make check-all`。
+
+
 
 
 

@@ -436,6 +436,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/core/timer.c6          std.core.timer         定时器小顶堆：add/cancel/fire，时间由调用方给（可测）
   std/core/task.c6           std.core.task          协作式任务：step 函数 + spawn/step_all/run 轮转调度
   std/os/reactor.c6          std.os.reactor         poll 事件循环：fd 注册 + 定时器，run_once 自动算超时
+  std/core/executor.c6       std.core.executor      事件循环执行器：reactor + 任务，tick 依次走「定时器→fd→任务」
+  std/os/asio.c6             std.os.asio            异步按行读：pump/watch 切行交回调，next_line 手动取、drain 收尾
+  std/core/retry.c6          std.core.retry         重试退避：base×2^(n-1) 封顶，fail(now) 给等待毫秒
+  std/core/awaitgroup.c6     std.core.awaitgroup    完成计数组：add/done 归零时结算绑定的 Future
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -564,6 +568,7 @@ make std-textan   # 编译并运行 examples/stdtextan.c6（第六十九批文�
 make std-cfg2     # 编译并运行 examples/stdcfg.c6（第七十批系统配置文件模块的拼装示例）
 make std-match    # 编译并运行 examples/stdmatch.c6（第七十一批匹配与对齐模块的拼装示例）
 make std-async    # 编译并运行 examples/stdasync.c6（第七十二批异步编程基础模块的拼装示例）
+make std-async2   # 编译并运行 examples/stdasync2.c6（第七十三批 executor/asio/retry/awaitgroup 示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

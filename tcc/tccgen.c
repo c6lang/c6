@@ -13006,6 +13006,10 @@ static const struct C6ErrStdSlot {
     { "std.core.timer",         C6_ERR_SLOT_STD + 298 },
     { "std.core.task",          C6_ERR_SLOT_STD + 299 },
     { "std.os.reactor",         C6_ERR_SLOT_STD + 300 },
+    { "std.core.executor",      C6_ERR_SLOT_STD + 301 },
+    { "std.os.asio",            C6_ERR_SLOT_STD + 302 },
+    { "std.core.retry",         C6_ERR_SLOT_STD + 303 },
+    { "std.core.awaitgroup",    C6_ERR_SLOT_STD + 304 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
