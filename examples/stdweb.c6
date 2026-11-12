@@ -1,0 +1,305 @@
+/* stdweb：标准库第五批（base64 / url / uuid / mime）的拼装示例。
+ *
+ * 和 stdtour / stdkit / stdbox 一样：这个文件没有 `module`（入口 `main` 只能
+ * 写在不属于任何模块的文件里），四节各带自检，失败打 FAIL，最后按失败数决定
+ * 退出码。它既是演示，也是这四个模块的集成用例。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdweb \
+ *         examples/stdweb.c6 std/types.c6 std/err.c6 std/str.c6 \
+ *         std/path.c6 std/base64.c6 std/url.c6 std/rand.c6 \
+ *         std/time.c6 std/uuid.c6 std/mime.c6
+ *
+ * 用到的东西：
+ *   std.base64  标准表/URL 安全表、严格填充、就地解码
+ *   std.url     RFC 3986 分解、相对解析、查询参数、百分号编解码
+ *   std.uuid    v4/v5/v7、解析与格式化、版本/变体
+ *   std.mime    扩展名 ↔ 类型、分类、魔数嗅探
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.types;
+import std.err;
+import std.str;
+import std.path;
+import std.base64;
+import std.url;
+import std.rand;
+import std.time;
+import std.uuid;
+import std.mime;
+
+/* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* 视图与 C 字面量比较（不要求 NUL 结尾） */
+static int eq_lit(char[:] s, char *lit)
+{
+    int n = (int)strlen(lit);
+
+    return s.len == n && (n == 0 || memcmp(s.data, lit, (size_t)n) == 0);
+}
+
+static int str_is(Str *s, char *lit) { return eq_lit(s->s, lit); }
+
+/* ---- 1. base64：JWT 风格的编码/解码 ---- */
+
+static void tour_base64(void)
+{
+    char enc[64] = { 0 };
+    char dec[64] = { 0 };
+    int n = 0;
+
+    /* 标准表：RFC 4648 的 "foobar" 向量 */
+    n = b64_encode(S("foobar"), enc, sizeof enc);
+    check(n == 8 && strcmp(enc, "Zm9vYmFy") == 0, "base64: 标准表编码");
+    n = b64_decode(S("Zm9vYmFy"), dec, sizeof dec);
+    check(n == 6 && memcmp(dec, "foobar", 6) == 0, "base64: 标准表解码");
+
+    /* URL 安全表：不带填充，`-`/`_` 代替 `+`/`/`。
+       编码不写结尾 NUL（长度就是返回值），复用缓冲前先清掉上一次的尾巴。 */
+    memset(enc, 0, sizeof enc);
+    n = b64url_encode(S("\xfb\xff"), enc, sizeof enc);
+    check(n == 3 && strcmp(enc, "-_8") == 0, "base64: URL 安全表");
+    n = b64url_decode(S("-_8"), dec, sizeof dec);
+    check(n == 2 && (u8)dec[0] == 0xfb && (u8)dec[1] == 0xff,
+          "base64: URL 安全表解码");
+    /* URL 变体下 `=` 是非法字符（JWT 用错表的典型症状） */
+    check(b64url_decode(S("Zg=="), dec, sizeof dec) == -1,
+          "base64: URL 变体拒收 `=`");
+
+    /* 严格填充：标准表缺填充要报错，宽松口径接受 */
+    check(b64_decode(S("Zg"), dec, sizeof dec) == -1,
+          "base64: pad = 1 时缺填充报错");
+    check(b64_decode_ex(S("Zg"), dec, sizeof dec, 0, 0) == 1,
+          "base64: pad = 0 时接受省略填充");
+
+    /* 空白（MIME 换行）跳过 */
+    n = b64_decode(S("Zm9v\r\nYmFy"), dec, sizeof dec);
+    check(n == 6 && memcmp(dec, "foobar", 6) == 0, "base64: 跳过 CRLF");
+
+    /* 就地解码会补结尾 NUL，可以直接当字符串用 */
+    {
+        char buf[16] = { 0 };
+
+        memcpy(buf, "Zm9vYmFy", 8);
+        n = b64_decode_inplace((char[:]){ buf, 8 }, buf, sizeof buf);
+        check(n == 6 && strcmp(buf, "foobar") == 0, "base64: 就地解码补 NUL");
+    }
+
+    /* 放不下时一个字节都不写 */
+    {
+        char small[4] = { 'Z', 'Z', 'Z', 0 };
+
+        check(b64_encode(S("foobar"), small, sizeof small) == -1
+                  && small[0] == 'Z',
+              "base64: 放不下不写半截");
+    }
+}
+
+/* ---- 2. url：分解、相对解析、查询参数 ---- */
+
+static void tour_url(void)
+{
+    Url u = url_parse(
+        S("https://user:pw@example.com:8443/a/b?q=1&r=2#frag"));
+    char out[256] = { 0 };
+    Pair p = { { { (char *)0, 0 } }, { { (char *)0, 0 } } };
+    int at = 0;
+    int n = 0;
+
+    check(u.ok == 1, "url: 解析成功");
+    check(str_is(&u.scheme, "https"), "url: scheme");
+    check(str_is(&u.userinfo, "user:pw"), "url: userinfo");
+    check(str_is(&u.host, "example.com"), "url: host");
+    check(u.port == 8443, "url: port");
+    check(str_is(&u.path, "/a/b"), "url: path");
+    check(str_is(&u.query, "q=1&r=2"), "url: query");
+    check(str_is(&u.fragment, "frag"), "url: fragment");
+    check(url_effective_port(&u) == 8443, "url: 显式端口优先");
+    check(url_effective_port(&(Url){ 0 }) == -1, "url: 空 URL 没有默认端口");
+
+    /* IPv6 字面量里的冒号不是端口分隔符 */
+    {
+        Url v6 = url_parse(S("http://[::1]:9090/x"));
+
+        check(v6.ok == 1 && str_is(&v6.host, "[::1]") && v6.port == 9090,
+              "url: IPv6 字面量");
+        check(url_effective_port(&v6) == 9090, "url: IPv6 的端口");
+    }
+
+    /* 默认端口 */
+    {
+        Url h = url_parse(S("http://h/"));
+
+        check(url_effective_port(&h) == 80, "url: http 默认 80 端口");
+    }
+
+    /* 查询参数逐个取出 */
+    check(url_next_pair(&u.query, &at, &p) == 1 && str_is(&p.key, "q")
+              && str_is(&p.value, "1"),
+          "url: 第一个参数");
+    check(url_next_pair(&u.query, &at, &p) == 1 && str_is(&p.key, "r")
+              && str_is(&p.value, "2"),
+          "url: 第二个参数");
+    check(url_next_pair(&u.query, &at, &p) == 0, "url: 参数取完");
+
+    /* 相对解析：RFC 3986 §5.4 的几条代表 */
+    n = url_resolve(S("http://a/b/c/d;p?q"), S("../g"), out, sizeof out);
+    check(n == 12 && strcmp(out, "http://a/b/g") == 0, "url: 相对解析 ../g");
+    memset(out, 0, sizeof out);
+    n = url_resolve(S("http://a/b/c/d;p?q"), S("//g"), out, sizeof out);
+    check(n == 8 && strcmp(out, "http://g") == 0, "url: 相对解析 //g");
+    memset(out, 0, sizeof out);
+    n = url_resolve(S("http://a/b/c/d;p?q"), S("g?y"), out, sizeof out);
+    check(n == 16 && strcmp(out, "http://a/b/c/g?y") == 0,
+          "url: 相对解析 g?y");
+
+    /* 百分号编解码往返（out 也要先清：编码同样不写 NUL） */
+    memset(out, 0, sizeof out);
+    n = url_encode(S("a b&c"), out, sizeof out);
+    check(n == 9 && strcmp(out, "a%20b%26c") == 0, "url: 百分号编码");
+    {
+        char back[32] = { 0 };
+
+        n = url_decode(S("a%20b%26c"), back, sizeof back);
+        check(n == 5 && memcmp(back, "a b&c", 5) == 0, "url: 百分号解码");
+        /* 非法转义原样保留 */
+        memset(back, 0, sizeof back);
+        n = url_decode(S("100%"), back, sizeof back);
+        check(n == 4 && memcmp(back, "100%", 4) == 0, "url: 孤立 % 保留");
+    }
+}
+
+/* ---- 3. uuid：v5 已知向量、v4、v7、解析与格式化 ---- */
+
+static void tour_uuid(void)
+{
+    Uuid ns = uuid_ns_dns();
+    Uuid v5 = uuid_v5(&ns, S("www.example.com"));
+    Uuid v4 = uuid_v4();
+    Rand r = rand_seed(20240101ull);
+    Uuid v7a = uuid_v7_at(1700000000123ull, &r);
+    Uuid v7b = uuid_v7_at(1700000000124ull, &r);
+    Uuid back = { { 0 } };
+    char buf[40] = { 0 };
+    char simple[40] = { 0 };
+
+    /* v5 是确定的，用 Python uuid5 的结果钉住 */
+    check(uuid_format(&v5, buf, sizeof buf) == 36
+              && strcmp(buf, "2ed6657d-e927-568b-95e1-2665a8aea6a2") == 0,
+          "uuid: v5 已知向量");
+    check(uuid_version(&v5) == 5 && uuid_variant(&v5) == 1,
+          "uuid: v5 的版本与变体");
+    /* 同一输入永远同一结果 */
+    {
+        Uuid again = uuid_v5(&ns, S("www.example.com"));
+
+        check(uuid_eq(&v5, &again), "uuid: v5 确定性");
+    }
+
+    /* v4：随机，版本位固定 */
+    check(uuid_version(&v4) == 4 && uuid_variant(&v4) == 1
+              && !uuid_is_nil(&v4),
+          "uuid: v4 的版本与变体");
+
+    /* v7：前 48 位是毫秒时间戳，字典序 = 时间序 */
+    check(uuid_version(&v7a) == 7 && uuid_time_v7(&v7a) == 1700000000123ull,
+          "uuid: v7 时间戳");
+    check(memcmp(v7a.b, v7b.b, 6) < 0, "uuid: v7 前 6 字节按时间递增");
+
+    /* 格式化 / 解析往返 */
+    uuid_format(&v5, buf, sizeof buf);
+    check(uuid_parse((char[:]){ buf, (int)strlen(buf) }, &back) == 1
+              && uuid_eq(&v5, &back),
+          "uuid: 格式化再解析还原");
+    uuid_format_simple(&v5, simple, sizeof simple);
+    check(strlen(simple) == 32
+              && strcmp(simple, "2ed6657de927568b95e12665a8aea6a2") == 0,
+          "uuid: simple 形式");
+    check(!uuid_parse(S("not-a-uuid"), &back), "uuid: 拒绝坏输入");
+
+    /* nil */
+    {
+        Uuid nil = uuid_nil();
+
+        check(uuid_is_nil(&nil) && uuid_version(&nil) == 0, "uuid: nil");
+    }
+}
+
+/* ---- 4. mime：扩展名、分类、嗅探 ---- */
+
+static void tour_mime(void)
+{
+    Str t = { { (char *)0, 0 } };
+    char png[8] = { (char)0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    char gz[4] = { (char)0x1f, (char)0x8b, 8, 0 };
+    char html[8] = { '<', '!', 'D', 'O', 'C', 'T' };
+
+    t = mime_of_path(S("site/index.HTML"));
+    check(str_is(&t, "text/html"), "mime: 路径扩展名（大写）");
+    t = mime_of_path(S("a/b/c.tar.gz"));
+    check(str_is(&t, "application/gzip"), "mime: 多重扩展名取最后一段");
+    t = mime_of_path(S("noext"));
+    check(str_is(&t, "application/octet-stream"), "mime: 未知给 octet-stream");
+    t = mime_of_ext(S(".WOFF2"));
+    check(str_is(&t, "font/woff2"), "mime: 带点的大写扩展名");
+
+    check(mime_is_text(S("text/css")) == 1, "mime: text/css 是文本");
+    check(mime_is_text(S("image/svg+xml")) == 1, "mime: svg 算文本（+xml）");
+    check(mime_is_text(S("image/png")) == 0, "mime: png 不是文本");
+    check(mime_is_image(S("image/png")) == 1, "mime: image/ 分类");
+    check(mime_is_audio(S("audio/mpeg")) == 1, "mime: audio/ 分类");
+
+    t = mime_charset(S("application/json"));
+    check(str_is(&t, "utf-8"), "mime: JSON 的字符集");
+    t = mime_charset(S("image/png"));
+    check(t.s.len == 0, "mime: 二进制没有字符集");
+
+    /* 反向查表 */
+    t = mime_ext_of(S("image/jpeg"));
+    check(str_is(&t, "jpg"), "mime: 反向查表取第一个");
+
+    /* 魔数嗅探 */
+    t = mime_sniff((char[:]){ png, 8 });
+    check(str_is(&t, "image/png"), "mime: PNG 魔数");
+    t = mime_sniff((char[:]){ gz, 3 });
+    check(str_is(&t, "application/gzip"), "mime: gzip 魔数");
+    t = mime_sniff((char[:]){ html, 6 });
+    check(t.s.len == 0, "mime: 纯文本认不出来（返回空）");
+
+    /* 扩展名猜一个、嗅探再纠正：内容优先的典型用法 */
+    {
+        Str by_ext = mime_of_path(S("photo.dat"));
+
+        check(str_is(&by_ext, "application/octet-stream"),
+              "mime: .dat 没有登记");
+    }
+}
+
+int main(void)
+{
+    printf("stdweb: 标准库第五批（base64 / url / uuid / mime）\n");
+
+    tour_base64();
+    tour_url();
+    tour_uuid();
+    tour_mime();
+
+    printf("stdweb: %d 条自检, %d 个失败\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

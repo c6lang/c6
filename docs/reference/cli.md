@@ -87,6 +87,7 @@
 | `make std-tour` | 编译并运行 `examples/stdtour.c6`（新模块自带自检） |
 | `make std-kit` | 编译并运行 `examples/stdkit.c6`（第三批模块的拼装示例） |
 | `make std-box` | 编译并运行 `examples/stdbox.c6`（第四批模块的拼装示例） |
+| `make std-web` | 编译并运行 `examples/stdweb.c6`（第五批模块的拼装示例） |
 
 ### freestanding、裸机与交叉目标
 

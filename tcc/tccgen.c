@@ -12721,6 +12721,10 @@ static const struct C6ErrStdSlot {
     { "std.sha256", C6_ERR_SLOT_STD + 26 },
     { "std.csv",   C6_ERR_SLOT_STD + 27 },
     { "std.env",   C6_ERR_SLOT_STD + 28 },
+    { "std.base64", C6_ERR_SLOT_STD + 29 },
+    { "std.url",   C6_ERR_SLOT_STD + 30 },
+    { "std.uuid",  C6_ERR_SLOT_STD + 31 },
+    { "std.mime",  C6_ERR_SLOT_STD + 32 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
