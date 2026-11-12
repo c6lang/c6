@@ -416,6 +416,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/net/gopher.c6          std.net.gopher         Gopher 菜单游标：open/next/count/find，类型名与 is_text/is_dir 判断
   std/net/whois.c6           std.net.whois          WHOIS 应答字段游标：find/get 大小写不敏感取「键: 值」
   std/net/ident.c6           std.net.ident          ident（RFC 1413）：查询/应答解析与构造，USERID/ERROR 两种应答
+  std/text/rst.c6            std.text.rst           reST 结构：标题层级/指令/列表/段落，游标 open/next/count
+  std/text/org.c6            std.text.org           Org-mode：* 层级 + TODO/DONE + :tags: + #+KEY 指令 + org_link
+  std/text/tex.c6            std.text.tex           LaTeX：章节七级/begin-end 环境/注释，tex_escape 转义往返
+  std/text/pod.c6            std.text.pod           Perl POD：head/item/over/back/cut 游标 + pod_strip 去格式码
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -539,6 +543,7 @@ make std-stats    # 编译并运行 examples/stdstats2.c6（第六十四批统�
 make std-search   # 编译并运行 examples/stdsearch.c6（第六十五批字符串算法模块的拼装示例）
 make std-audio2   # 编译并运行 examples/stdlegacy2.c6（第六十六批老音频格式头模块的拼装示例）
 make std-proto3   # 编译并运行 examples/stdnet2.c6（第六十七批小型文本协议模块的拼装示例）
+make std-markup   # 编译并运行 examples/stdmarkup.c6（第六十八批轻量标记语言模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

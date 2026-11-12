@@ -1,0 +1,371 @@
+/* std/text/tex：LaTeX 简单结构解析（章节、环境、注释）与转义/去转义。
+ *
+ *     import std.text.tex;
+ *
+ *     TexDoc doc = { 0 };
+ *     TexItem it = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / rewind
+ *     while (doc.next(&it) == 1)
+ *         // it.kind（TEX_SECTION / TEX_BEGIN / TEX_END / TEX_COMMAND）
+ *
+ * 识别：
+ *
+ * - **章节命令**：`\part`、`\chapter`、`\section`、`\subsection`、
+ *   `\subsubsection`、`\paragraph`、`\subparagraph`（可带 `*`），参数是 `{...}`
+ *   里的文字（嵌套花括号按层数配对）；`level` 依次是 0..6；
+ * - **环境**：`\begin{name}` / `\end{name}`，`text` 是环境名；
+ * - **其它命令**：`\cmd`（不带参数）记成 TEX_COMMAND，`level` 恒 0；
+ * - **注释**：`%` 到行尾被丢掉（`\%` 不算注释）。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 数出条目并返回；`doc.next(&it)` 逐条返回；
+ * - `it.text` 是章节标题或环境名，`it.line` 是行号；
+ * - `tex_escape(src, dst, cap)` 转义 `\ { } $ & # ^ _ % ~`（返回写入长度）；
+ * - `tex_unescape(src, dst, cap)` 反向（`\%`→`%`、`\_`→`_`…，其它 `\x` 保留 `x`）；
+ * - 不做数学模式/macro 展开。
+ */
+#include <string.h>
+
+module std.text.tex;
+import std.core.types;
+import std.text.str;
+
+enum {
+    TEX_SECTION = 1,
+    TEX_BEGIN = 2,
+    TEX_END = 3,
+    TEX_COMMAND = 4
+};
+
+struct TexItem {
+    int kind;
+    int level;
+    int line;
+    Str text;
+};
+
+struct TexDoc {
+    const char *src;
+    int n;
+    int off;
+    int line;
+    int nitems;
+};
+
+static const char *tex_secs[7] = { "part", "chapter", "section", "subsection",
+                                   "subsubsection", "paragraph",
+                                   "subparagraph" };
+
+const char *command_name(int kind)
+{
+    switch (kind) {
+    case TEX_SECTION: return "section";
+    case TEX_BEGIN: return "begin";
+    case TEX_END: return "end";
+    case TEX_COMMAND: return "command";
+    default: return "?";
+    }
+}
+
+/* 从 p[*i] 开始读 {…}（允许嵌套），成功返回 1 并跳过整段 */
+static int tex_group(const char *p, int n, int *i, int *content_start,
+                     int *content_end)
+{
+    int depth = 0, start = 0;
+
+    if (*i >= n || p[*i] != '{')
+        return 0;
+    depth = 1;
+    start = ++(*i);
+    while (*i < n && depth > 0) {
+        if (p[*i] == '{')
+            depth++;
+        else if (p[*i] == '}') {
+            depth--;
+            if (depth == 0)
+                break;
+        }
+        (*i)++;
+    }
+    if (depth != 0)
+        return 0;
+    *content_start = start;
+    *content_end = *i;
+    (*i)++;                             /* 跳过 '}' */
+    return 1;
+}
+
+static int tex_cmp(const char *p, int start, int end, const char *lit)
+{
+    int len = (int)strlen(lit);
+
+    if (end - start != len)
+        return 0;
+    return memcmp(p + start, lit, (size_t)len) == 0;
+}
+
+static int tex_parse(TexDoc *d, int *pos, TexItem *it)
+{
+    const char *p = d->src;
+
+    while (*pos < d->n) {
+        int c = *pos, start = 0, end = 0;
+
+        if (p[c] == '\n') {
+            d->line++;
+            (*pos)++;
+            continue;
+        }
+        if (p[c] == '%') {              /* 注释到行尾 */
+            while (*pos < d->n && p[*pos] != '\n')
+                (*pos)++;
+            continue;
+        }
+        if (p[c] != '\\') {
+            (*pos)++;
+            continue;
+        }
+        /* 反斜杠命令 */
+        start = c + 1;
+        end = start;
+        while (end < d->n && ((p[end] >= 'a' && p[end] <= 'z')
+                              || (p[end] >= 'A' && p[end] <= 'Z')
+                              || p[end] == '*'))
+            end++;
+        if (end == start) {
+            (*pos)++;                   /* 单独一个反斜杠 */
+            continue;
+        }
+        {
+            int i = end, cs = 0, ce = 0, level = -1;
+
+            /* 章节命令？ */
+            if (p[end - 1] == '*')
+                ;
+            {
+                int k = 0;
+
+                for (k = 0; k < 7; k++) {
+                    if (tex_cmp(p, start, end, tex_secs[k])) {
+                        level = k;
+                        break;
+                    }
+                    /* 允许尾随 '*' */
+                    if (end - start == (int)strlen(tex_secs[k]) + 1
+                        && p[end - 1] == '*'
+                        && memcmp(p + start, tex_secs[k],
+                                  strlen(tex_secs[k])) == 0) {
+                        level = k;
+                        break;
+                    }
+                }
+            }
+            if (level >= 0) {
+                memset(it, 0, sizeof *it);
+                it->kind = TEX_SECTION;
+                it->level = level;
+                it->line = d->line;
+                if (tex_group(p, d->n, &i, &cs, &ce)) {
+                    it->text.s = (char[:]){ (char *)p + cs, ce - cs };
+                    *pos = i;
+                    return 1;
+                }
+                *pos = end;
+                return 1;
+            }
+            if (tex_cmp(p, start, end, "begin") || tex_cmp(p, start, end, "end")) {
+                int is_begin = p[start] == 'b';
+
+                memset(it, 0, sizeof *it);
+                it->kind = is_begin ? TEX_BEGIN : TEX_END;
+                it->line = d->line;
+                if (tex_group(p, d->n, &i, &cs, &ce)) {
+                    it->text.s = (char[:]){ (char *)p + cs, ce - cs };
+                    *pos = i;
+                    return 1;
+                }
+                *pos = end;
+                return 1;
+            }
+            memset(it, 0, sizeof *it);
+            it->kind = TEX_COMMAND;
+            it->line = d->line;
+            it->text.s = (char[:]){ (char *)p + start, end - start };
+            *pos = end;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int open(TexDoc *d, const void *src, int n)
+{
+    int pos = 0, count = 0;
+    TexItem it = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    d->line = 1;
+    while (tex_parse(d, &pos, &it) == 1)
+        count++;
+    d->nitems = count;
+    d->off = 0;
+    d->line = 1;
+    return count;
+}
+
+int next(TexDoc *d, TexItem *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return tex_parse(d, &d->off, out);
+}
+
+int count(TexDoc *d)
+{
+    return d ? d->nitems : 0;
+}
+
+int rewind(TexDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    d->line = 1;
+    return 1;
+}
+
+static int tex_put(char *dst, int cap, int o, char c)
+{
+    if (o >= cap)
+        return -1;
+    dst[o] = c;
+    return o + 1;
+}
+
+int tex_escape(char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0;
+
+    if (!src.data || !dst || cap <= 0)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        char c = src.data[i];
+        int needs = (c == '\\' || c == '{' || c == '}' || c == '$'
+                     || c == '&' || c == '#' || c == '^' || c == '_'
+                     || c == '%' || c == '~');
+
+        if (needs) {
+            o = tex_put(dst, cap, o, '\\');
+            if (o < 0)
+                return -1;
+        }
+        o = tex_put(dst, cap, o, c);
+        if (o < 0)
+            return -1;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int tex_unescape(char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0;
+
+    if (!src.data || !dst || cap <= 0)
+        return -1;
+    while (i < src.len) {
+        if (src.data[i] == '\\' && i + 1 < src.len) {
+            char c = src.data[i + 1];
+            int special = (c == '\\' || c == '{' || c == '}' || c == '$'
+                           || c == '&' || c == '#' || c == '^' || c == '_'
+                           || c == '%' || c == '~');
+
+            o = tex_put(dst, cap, o, special ? c : src.data[i]);
+            if (o < 0)
+                return -1;
+            if (!special) {
+                o = tex_put(dst, cap, o, c);
+                if (o < 0)
+                    return -1;
+            }
+            i += 2;
+            continue;
+        }
+        o = tex_put(dst, cap, o, src.data[i]);
+        if (o < 0)
+            return -1;
+        i++;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "tex：章节、环境与注释" {
+    static const char *doc =
+        "% 这是注释 \\section{Not a section}\n"
+        "\\documentclass{article}\n"
+        "\\begin{document}\n"
+        "\\section{Intro}\n"
+        "\\subsection*{Sub \\emph{one}}\n"
+        "\\end{document}\n";
+    TexDoc d = { 0 };
+    TexItem it = { 0 };
+
+    if (d.open(doc, (int)strlen(doc)) != 5)
+        return err(1, "应该有 5 条（注释里的命令不算）");
+    if (d.next(&it) != 1 || it.kind != TEX_COMMAND)
+        return err(2, "第一条应该是 documentclass 命令");
+    if (it.text.s.len != 13 || memcmp(it.text.s.data, "documentclass", 13) != 0)
+        return err(3, "命令名不对");
+    if (d.next(&it) != 1 || it.kind != TEX_BEGIN || it.text.s.len != 8)
+        return err(4, "\\begin{document} 不对");
+    if (d.next(&it) != 1 || it.kind != TEX_SECTION || it.level != 2)
+        return err(5, "\\section 应该是 level 2");
+    if (it.text.s.len != 5 || memcmp(it.text.s.data, "Intro", 5) != 0)
+        return err(6, "章节标题不对");
+    if (d.next(&it) != 1 || it.kind != TEX_SECTION || it.level != 3)
+        return err(7, "\\subsection* 应该是 level 3");
+    if (it.text.s.len != 14 || memcmp(it.text.s.data, "Sub \\emph{one}", 14) != 0)
+        return err(8, "带嵌套命令的标题不对");
+    if (d.next(&it) != 1 || it.kind != TEX_END || it.text.s.len != 8)
+        return err(9, "\\end{document} 不对");
+    if (strcmp(command_name(TEX_SECTION), "section") != 0)
+        return err(10, "command_name 不对");
+}
+
+test "tex：转义往返" {
+    char out[128] = { 0 };
+    char back[128] = { 0 };
+
+    if (tex_escape(S("a_b & 50% {x}"), out, (int)sizeof out) != 18)
+        return err(11, "转义长度不对");
+    if (memcmp(out, "a\\_b \\& 50\\% \\{x\\}", 18) != 0)
+        return err(12, "转义内容不对");
+    if (tex_unescape((char[:]){ out, 18 }, back, (int)sizeof back) != 13)
+        return err(13, "去转义长度不对");
+    if (memcmp(back, "a_b & 50% {x}", 13) != 0)
+        return err(14, "往返之后内容不对");
+    if (tex_unescape(S("\\textbf{x}"), back, (int)sizeof back) != 10)
+        return err(15, "非特殊字符的反斜杠应该保留");
+    if (memcmp(back, "\\textbf{x}", 10) != 0)
+        return err(16, "保留下来的内容不对");
+    if (tex_escape(S("abc"), out, 2) != -1)
+        return err(17, "容量不够应该 -1");
+    {
+        TexDoc e = { 0 };
+
+        if (e.open("", 0) != -1)
+            return err(18, "空输入应该 -1");
+    }
+}

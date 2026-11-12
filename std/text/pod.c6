@@ -1,0 +1,411 @@
+/* std/text/pod：Perl POD（Plain Old Documentation）的段落游标。
+ *
+ *     import std.text.pod;
+ *
+ *     PodDoc doc = { 0 };
+ *     PodItem it = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / rewind
+ *     while (doc.next(&it) == 1)
+ *         // it.kind（POD_HEAD / POD_ITEM / POD_OVER / POD_BACK / POD_TEXT …）
+ *         // it.level / it.text
+ *     pod_strip(S("B<bold> and C<code>"), out, (int)sizeof out);   // "bold and code"
+ *
+ * 识别的命令：`=head1`..`=head4`（level 1..4）、`=item`、`=over`、`=back`、
+ * `=begin`/`=end`（`text` 是格式名）、`=cut`（结束 POD 块）、`=pod`/`=for` 等其它
+ * `=` 命令记成 POD_COMMAND。其余非空行是 POD_TEXT（连续行合并成一段）。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 只解析**第一个** POD 块（从首个 `=` 命令开始，到 `=cut` 或
+ *   文件结尾）；`doc.count()` 是该块的条目数；
+ * - `_strip(src, dst, cap)` 去掉 `B<>`/`I<>`/`C<>`/`L<>`/`E<>` 等格式化码（保留
+ *   里面文字，`E<lt>` 之类实体转成字符），返回写入长度；
+ * - `_heading(text)` 判断一行是不是 `=headN`，返回 N（1..4），否则 0；
+ * - 不做 POD 到 HTML/Man 的完整转换。
+ */
+#include <string.h>
+
+module std.text.pod;
+import std.core.types;
+import std.text.str;
+
+enum {
+    POD_HEAD = 1,
+    POD_ITEM = 2,
+    POD_OVER = 3,
+    POD_BACK = 4,
+    POD_BEGIN = 5,
+    POD_END = 6,
+    POD_COMMAND = 7,
+    POD_TEXT = 8,
+    POD_CUT = 9
+};
+
+struct PodItem {
+    int kind;
+    int level;
+    Str text;
+    Str arg;
+};
+
+struct PodDoc {
+    const char *src;
+    int n;
+    int off;
+    int nitems;
+    int started;
+};
+
+static int pod_line(const char *p, int n, int *pos, int *start, int *end)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *end = i;
+    if (*end > *start && p[*end - 1] == '\r')
+        (*end)--;
+    *pos = (i < n) ? i + 1 : i;
+    return 1;
+}
+
+static void pod_trim(const char *p, int *start, int *end)
+{
+    while (*start < *end && (p[*start] == ' ' || p[*start] == '\t'))
+        (*start)++;
+    while (*end > *start && (p[*end - 1] == ' ' || p[*end - 1] == '\t'))
+        (*end)--;
+}
+
+int pod_heading(char[:] text)
+{
+    if (!text.data || text.len < 6 || text.data[0] != '=')
+        return 0;
+    if (memcmp(text.data, "=head", 5) != 0)
+        return 0;
+    if (text.data[5] >= '1' && text.data[5] <= '4')
+        return (int)(text.data[5] - '0');
+    return 0;
+}
+
+static int pod_parse(PodDoc *d, int *pos, PodItem *it)
+{
+    const char *p = d->src;
+
+    while (1) {
+        int start = 0, end = 0;
+
+        if (!pod_line(p, d->n, pos, &start, &end))
+            return 0;
+        {
+            int s = start, e = end;
+
+            pod_trim(p, &s, &e);
+            /* 还没进 POD 块：等到第一个 '=' 命令 */
+            if (!d->started) {
+                if (s < e && p[s] == '=')
+                    d->started = 1;
+                else
+                    continue;
+            }
+            if (s >= e)
+                continue;
+            if (p[s] == '=') {
+                int k = s + 1;
+
+                while (k < e && ((p[k] >= 'a' && p[k] <= 'z')
+                                 || (p[k] >= 'A' && p[k] <= 'Z')
+                                 || (p[k] >= '0' && p[k] <= '9')))
+                    k++;
+                memset(it, 0, sizeof *it);
+                it->text.s = (char[:]){ (char *)p + s + 1, k - s - 1 };
+                {
+                    int a = k, a_end = e;
+
+                    pod_trim(p, &a, &a_end);
+                    it->arg.s = (char[:]){ (char *)p + a, a_end - a };
+                }
+                if (pod_heading((char[:]){ (char *)p + s, e - s }) > 0) {
+                    it->kind = POD_HEAD;
+                    it->level = (int)(p[s + 5] - '0');
+                    return 1;
+                }
+                if (k - s - 1 == 4 && memcmp(p + s + 1, "item", 4) == 0) {
+                    it->kind = POD_ITEM;
+                    return 1;
+                }
+                if (k - s - 1 == 4 && memcmp(p + s + 1, "over", 4) == 0) {
+                    it->kind = POD_OVER;
+                    return 1;
+                }
+                if (k - s - 1 == 4 && memcmp(p + s + 1, "back", 4) == 0) {
+                    it->kind = POD_BACK;
+                    return 1;
+                }
+                if (k - s - 1 == 3 && memcmp(p + s + 1, "cut", 3) == 0) {
+                    it->kind = POD_CUT;
+                    return 1;
+                }
+                if (k - s - 1 == 5 && memcmp(p + s + 1, "begin", 5) == 0) {
+                    it->kind = POD_BEGIN;
+                    return 1;
+                }
+                if (k - s - 1 == 3 && memcmp(p + s + 1, "end", 3) == 0) {
+                    it->kind = POD_END;
+                    return 1;
+                }
+                it->kind = POD_COMMAND;
+                return 1;
+            }
+            /* 普通段落：本行 + 后续非命令行 */
+            memset(it, 0, sizeof *it);
+            it->kind = POD_TEXT;
+            it->text.s = (char[:]){ (char *)p + s, e - s };
+            while (1) {
+                int s2 = 0, e2 = 0, mark = *pos, s3 = 0, e3 = 0;
+
+                if (!pod_line(p, d->n, pos, &s2, &e2))
+                    break;
+                s3 = s2;
+                e3 = e2;
+                pod_trim(p, &s3, &e3);
+                if (s3 >= e3 || p[s3] == '=') {
+                    *pos = mark;
+                    break;
+                }
+            }
+            return 1;
+        }
+    }
+}
+
+int open(PodDoc *d, const void *src, int n)
+{
+    int pos = 0, count = 0;
+    PodItem it = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    while (pod_parse(d, &pos, &it) == 1) {
+        count++;
+        if (it.kind == POD_CUT)
+            break;
+    }
+    d->nitems = count;
+    d->off = 0;
+    d->started = 0;
+    return count;
+}
+
+int next(PodDoc *d, PodItem *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    if (pod_parse(d, &d->off, out) != 1)
+        return 0;
+    if (out->kind == POD_CUT)
+        d->off = d->n;
+    return 1;
+}
+
+int count(PodDoc *d)
+{
+    return d ? d->nitems : 0;
+}
+
+int rewind(PodDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    d->started = 0;
+    return 1;
+}
+
+const char *pod_kind_name(int kind)
+{
+    switch (kind) {
+    case POD_HEAD: return "head";
+    case POD_ITEM: return "item";
+    case POD_OVER: return "over";
+    case POD_BACK: return "back";
+    case POD_BEGIN: return "begin";
+    case POD_END: return "end";
+    case POD_COMMAND: return "command";
+    case POD_TEXT: return "text";
+    case POD_CUT: return "cut";
+    default: return "?";
+    }
+}
+
+int pod_strip(char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0;
+
+    if (!src.data || !dst || cap <= 0)
+        return -1;
+    while (i < src.len) {
+        char c = src.data[i];
+
+        /* 形如 X<...> 的格式化码：X 是单个大写字母 */
+        if (c >= 'A' && c <= 'Z' && i + 1 < src.len && src.data[i + 1] == '<') {
+            int depth = 0, j = i + 1;
+
+            while (j < src.len) {
+                if (src.data[j] == '<')
+                    depth++;
+                else if (src.data[j] == '>') {
+                    depth--;
+                    if (depth == 0)
+                        break;
+                }
+                j++;
+            }
+            if (j < src.len) {
+                /* 特殊实体：E<lt> E<gt> E<amp> E<quot> E<sol> */
+                if (c == 'E') {
+                    int k = i + 2, e = j;
+                    char ch = 0;
+
+                    if (e - k == 2 && memcmp(src.data + k, "lt", 2) == 0)
+                        ch = '<';
+                    else if (e - k == 2 && memcmp(src.data + k, "gt", 2) == 0)
+                        ch = '>';
+                    else if (e - k == 3 && memcmp(src.data + k, "amp", 3) == 0)
+                        ch = '&';
+                    else if (e - k == 4 && memcmp(src.data + k, "quot", 4) == 0)
+                        ch = '"';
+                    if (ch) {
+                        if (o >= cap)
+                            return -1;
+                        dst[o++] = ch;
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                /* 跳过 "X<"，把内容原样拷出来（内层码一并保留文字） */
+                {
+                    int k = i + 2, depth2 = 0;
+
+                    (void)j;
+                    while (k < src.len) {
+                        if (src.data[k] == '>') {
+                            if (depth2 == 0)
+                                break;
+                            depth2--;
+                        } else if (src.data[k] == '<') {
+                            depth2++;
+                        }
+                        if (o >= cap)
+                            return -1;
+                        dst[o++] = src.data[k];
+                        k++;
+                    }
+                    i = k + 1;
+                }
+                continue;
+            }
+        }
+        if (o >= cap)
+            return -1;
+        dst[o++] = c;
+        i++;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "pod：段落游标" {
+    static const char *txt =
+        "#!perl\n"
+        "print \"hi\";\n"
+        "=head1 NAME\n"
+        "\n"
+        "Demo - a demo module\n"
+        "\n"
+        "=over 4\n"
+        "\n"
+        "=item B<new>\n"
+        "\n"
+        "Constructor.\n"
+        "\n"
+        "=back\n"
+        "\n"
+        "=cut\n"
+        "print 1;\n";
+    PodDoc d = { 0 };
+    PodItem it = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 7)
+        return err(1, "应该有 7 条（head1/文本/over/item/文本/back/cut）");
+    if (d.next(&it) != 1 || it.kind != POD_HEAD || it.level != 1)
+        return err(2, "=head1 不对");
+    if (it.arg.s.len != 4 || memcmp(it.arg.s.data, "NAME", 4) != 0)
+        return err(3, "head1 的标题不对");
+    if (d.next(&it) != 1 || it.kind != POD_TEXT)
+        return err(4, "第二条应该是文本");
+    if (it.text.s.len != 20 || memcmp(it.text.s.data, "Demo - a demo module", 20) != 0)
+        return err(5, "文本内容不对");
+    if (d.next(&it) != 1 || it.kind != POD_OVER || it.arg.s.len != 1)
+        return err(6, "=over 4 不对");
+    if (d.next(&it) != 1 || it.kind != POD_ITEM)
+        return err(7, "=item 不对");
+    if (it.arg.s.len != 6 || memcmp(it.arg.s.data, "B<new>", 6) != 0)
+        return err(8, "=item 的参数不对");
+    if (d.next(&it) != 1 || it.kind != POD_TEXT)
+        return err(9, "item 后面的文本不对");
+    if (d.next(&it) != 1 || it.kind != POD_BACK)
+        return err(10, "=back 不对");
+    if (strcmp(pod_kind_name(POD_BACK), "back") != 0)
+        return err(11, "kind_name 不对");
+}
+
+test "pod：strip 与边界" {
+    char out[64] = { 0 };
+    PodDoc d = { 0 };
+    PodItem it = { 0 };
+
+    if (pod_heading(S("=head2 Sub")) != 2 || pod_heading(S("=item x")) != 0
+        || pod_heading(S("text")) != 0)
+        return err(12, "pod_heading 判断不对");
+    if (pod_strip(S("B<bold> and C<code>"), out, (int)sizeof out) != 13)
+        return err(13, "strip 长度不对");
+    if (memcmp(out, "bold and code", 13) != 0)
+        return err(14, "strip 内容不对");
+    if (pod_strip(S("a E<lt> b"), out, (int)sizeof out) != 5)
+        return err(15, "实体 strip 长度不对");
+    if (memcmp(out, "a < b", 5) != 0)
+        return err(16, "实体 strip 内容不对");
+    if (pod_strip(S("plain"), out, 3) != -1)
+        return err(17, "容量不够应该 -1");
+    /* 没有 POD 块的输入：0 条 */
+    {
+        PodDoc e = { 0 };
+
+        if (e.open("no pod here\n", 12) != 0)
+            return err(18, "没有 POD 块应该 0 条");
+        if (e.open("", 0) != -1)
+            return err(19, "空输入应该 -1");
+    }
+    /* cut 之后的内容不该再被算进来 */
+    {
+        static const char *txt = "=head1 A\n\n=cut\n\n=head1 B\n";
+        PodDoc c = { 0 };
+
+        if (c.open(txt, (int)strlen(txt)) != 2)
+            return err(20, "cut 之后应该停止（head1 + cut）");
+    }
+    (void)d;
+    (void)it;
+}

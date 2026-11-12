@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第六十八批（轻量标记语言）**：`std.text.rst`（reST 标题/指令/列表）、
+  `std.text.org`（Org 标题层级/TODO/标签/链接）、`std.text.tex`（LaTeX 章节/环境/
+  转义）、`std.text.pod`（POD 段落与格式化码剥离），集成示例
+  `examples/stdmarkup.c6`（`make std-markup`）。错误号段 `std.text.rst`=0x6119 …
+  `std.text.pod`=0x611c（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十七批（小型文本协议）**：`std.net.irc`（IRC 消息解析/构造）、
   `std.net.gopher`（Gopher 菜单游标）、`std.net.whois`（WHOIS 字段游标）、
   `std.net.ident`（RFC 1413 查询/应答），集成示例 `examples/stdnet2.c6`

@@ -2255,6 +2255,32 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（281 个模块、0 failure）、`make std-proto3`（22 条自检全过）、
 `make check-all`。
 
+### 11.80 标准库第六十八批（rst / org / tex / pod）
+
+第六十八批做「轻量标记语言」：reStructuredText、Org-mode、LaTeX 与 Perl POD。四个都是
+「逐行扫描 + 游标」（`open`/`next`/`count`/`rewind`），只抓结构不解释内容。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.rst` | reST | 标题靠「文字 + 下划线」两行，层级按**下划线字符首次出现的顺序**编号；第一版有两处 `keep = *pos` 取在 `rst_line` **之后**，回退时把下一行也吃掉了（`- a/- b/- c` 只能读到 a 和 c），改成先记 `mark = *pos` 再读；段落续行的边界同样用 `mark` |
+| `std.text.org` | Org-mode | 标题要拆三样：`*` 层级、`TODO`/`DONE` 关键字、尾部 `:a:b:` 标签（标签从末尾往前扫到空格）；`#+KEY: value` 单独一类；`org_link` 找 `[[url][desc]]` 并支持无 desc 形式 |
+| `std.text.tex` | LaTeX | 七级章节命令（允许 `*`），`{...}` 参数按**花括号嵌套**配对；`%` 到行尾是注释（`\%` 不算）；`tex_escape`/`tex_unescape` 处理十个特殊字符，非特殊 `\x` 原样保留 |
+| `std.text.pod` | POD | 只解析第一个 POD 块（首个 `=` 命令到 `=cut`）；`pod_strip` 遇到 `X<...>` 要跳过 `X<` 并从内容开头逐字节拷到匹配的 `>`，第一版只 `i++` 导致输出里留下 `<bold>` 的尖括号；`E<lt>`/`E<gt>`/`E<amp>` 等解成字符 |
+
+这一批还踩了**跨模块同名自由函数**的坑：`rst` 与 `pod` 都导出 `kind_name`，同时 import
+时链接器只认先到的一个，POD 的条目打印成了 reST 的种类名。改名为 `rst_kind_name` /
+`pod_kind_name` 后正常——自由函数一律带模块前缀。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.rst`=0x6119、
+`std.text.org`=0x611a、`std.text.tex`=0x611b、`std.text.pod`=0x611c；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-markup` 与 `STD_MARKUP_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条用例）。示例
+`examples/stdmarkup.c6` 四节（18 条自检）。
+
+验收：`make stdtest`（285 个模块、0 failure）、`make std-markup`（18 条自检全过）、
+`make check-all`。
+
+
 
 
 

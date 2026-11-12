@@ -1,0 +1,430 @@
+/* std/text/org：Org-mode 的简单结构解析（标题层级、TODO 关键字、标签、列表、链接）。
+ *
+ *     import std.text.org;
+ *
+ *     OrgDoc doc = { 0 };
+ *     OrgItem it = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / rewind
+ *     while (doc.next(&it) == 1)
+ *         // it.kind / it.level / it.title / it.todo / it.tags
+ *     org_link(S("see [[https://x.org][home]] now"), &url, &desc);
+ *
+ * 识别：
+ *
+ * - **标题**：`*` 开头（1..8 个），后面空格 + 文本；文本开头的 `TODO`/`DONE`
+ *   （或 `WAITING`/`CANCELLED`）单独拆出来，尾部 `:a:b:` 形式的标签拆到 `tags`；
+ * - **列表项**：行首 `-`/`+` 或 `1.`/`1)`；
+ * - **段落**：其余非空行（连续行合并成一条，遇到新块就停）；
+ * - **`#+KEY: value` 指令行**：作为 `ORG_KEYWORD`，`text` 是 KEY、`arg` 是 value。
+ *
+ * 约定：
+ *
+ * - `it.todo` 是 TODO 关键字的种类（0 无、1 TODO、2 DONE、3 WAITING、4 CANCELLED）；
+ * - `it.tags` 不含两端的冒号；`it.title` 是去掉 TODO 与标签后的标题文字；
+ * - `org_link(text, &url, &desc)` 找第一个 `[[url][desc]]`（没有 desc 时 desc 等于 url
+ *   且 `has_desc=0`），成功返回 1；
+ * - `org_todo_name(kind)` 给关键字名字（`"TODO"`…），0 返回空串；
+ * - 不做 babel/表格/脚注等复杂语法。
+ */
+#include <string.h>
+
+module std.text.org;
+import std.core.types;
+import std.text.str;
+
+enum {
+    ORG_HEADING = 1,
+    ORG_LIST = 2,
+    ORG_PARAGRAPH = 3,
+    ORG_KEYWORD = 4
+};
+
+struct OrgItem {
+    int kind;
+    int level;
+    int todo;
+    Str text;
+    Str title;
+    Str tags;
+    Str arg;
+};
+
+struct OrgDoc {
+    const char *src;
+    int n;
+    int off;
+    int nitems;
+};
+
+const char *todo_name(int kind)
+{
+    switch (kind) {
+    case 1: return "TODO";
+    case 2: return "DONE";
+    case 3: return "WAITING";
+    case 4: return "CANCELLED";
+    default: return "";
+    }
+}
+
+/* 在 start..end 上匹配一个关键字（大写），返回种类 */
+static int org_todo_at(const char *p, int start, int end)
+{
+    static const char *names[4] = { "TODO", "DONE", "WAITING", "CANCELLED" };
+    int k = 0;
+
+    for (k = 0; k < 4; k++) {
+        int len = (int)strlen(names[k]);
+
+        if (end - start >= len && memcmp(p + start, names[k], (size_t)len) == 0
+            && (end - start == len || p[start + len] == ' '))
+            return k + 1;
+    }
+    return 0;
+}
+
+static int org_line(const char *p, int n, int *pos, int *start, int *end)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *end = i;
+    if (*end > *start && p[*end - 1] == '\r')
+        (*end)--;
+    *pos = (i < n) ? i + 1 : i;
+    return 1;
+}
+
+static void org_trim(const char *p, int *start, int *end)
+{
+    while (*start < *end && (p[*start] == ' ' || p[*start] == '\t'))
+        (*start)++;
+    while (*end > *start && (p[*end - 1] == ' ' || p[*end - 1] == '\t'))
+        (*end)--;
+}
+
+static int org_parse(OrgDoc *d, int *pos, OrgItem *it)
+{
+    const char *p = d->src;
+
+    while (1) {
+        int start = 0, end = 0, mark = *pos;
+
+        if (!org_line(p, d->n, pos, &start, &end))
+            return 0;
+        {
+            int s = start, e = end;
+
+            org_trim(p, &s, &e);
+            if (s >= e)
+                continue;
+            /* 标题 */
+            if (p[s] == '*') {
+                int stars = 0, t = s;
+
+                while (t < e && p[t] == '*') {
+                    stars++;
+                    t++;
+                }
+                if (stars <= 8 && t < e && p[t] == ' ') {
+                    int body = t;
+
+                    org_trim(p, &body, &e);
+                    memset(it, 0, sizeof *it);
+                    it->kind = ORG_HEADING;
+                    it->level = stars;
+                    it->title.s = (char[:]){ (char *)p + body, e - body };
+                    it->text = it->title;
+                    /* TODO 关键字 */
+                    {
+                        int k = org_todo_at(p, body, e);
+
+                        if (k) {
+                            int len = (int)strlen(todo_name(k));
+
+                            it->todo = k;
+                            it->title.s = (char[:]){ (char *)p + body + len + 1,
+                                                     e - body - len - 1 };
+                            it->text = it->title;
+                        }
+                    }
+                    /* 尾部标签 :a:b: */
+                    {
+                        Str t2 = it->title;
+                        int ts = 0, te = t2.s.len;
+
+                        while (te > 0 && (t2.s.data[te - 1] == ' '
+                                          || t2.s.data[te - 1] == '\t'))
+                            te--;
+                        if (te > 0 && t2.s.data[te - 1] == ':') {
+                            int k = te - 1, found = 0;
+
+                            while (k >= 0 && t2.s.data[k] != ' ') {
+                                if (t2.s.data[k] == ':')
+                                    found = 1;
+                                k--;
+                            }
+                            if (found && k + 1 < te) {
+                                ts = k + 1;
+                                it->tags.s = (char[:]){ t2.s.data + ts + 1,
+                                                        te - ts - 2 };
+                                it->title.s = (char[:]){ t2.s.data, (ts > 0
+                                                              ? ts - 1 : 0) };
+                                it->text = it->title;
+                            }
+                        }
+                    }
+                    return 1;
+                }
+            }
+            /* #+KEY: value */
+            if (p[s] == '#' && s + 1 < e && p[s + 1] == '+') {
+                int k = s + 2, colon = -1;
+
+                while (k < e) {
+                    if (p[k] == ':') {
+                        colon = k;
+                        break;
+                    }
+                    k++;
+                }
+                if (colon > s + 2) {
+                    int a = colon + 1, a_end = e;
+
+                    org_trim(p, &a, &a_end);
+                    memset(it, 0, sizeof *it);
+                    it->kind = ORG_KEYWORD;
+                    it->text.s = (char[:]){ (char *)p + s + 2,
+                                            colon - s - 2 };
+                    it->arg.s = (char[:]){ (char *)p + a, a_end - a };
+                    return 1;
+                }
+            }
+            /* 列表项 */
+            if ((p[s] == '-' || p[s] == '+') && s + 1 < e
+                && (p[s + 1] == ' ' || p[s + 1] == '\t')) {
+                int t = s + 1;
+
+                org_trim(p, &t, &e);
+                memset(it, 0, sizeof *it);
+                it->kind = ORG_LIST;
+                it->text.s = (char[:]){ (char *)p + t, e - t };
+                return 1;
+            }
+            if (p[s] >= '0' && p[s] <= '9') {
+                int t = s;
+
+                while (t < e && p[t] >= '0' && p[t] <= '9')
+                    t++;
+                if (t + 1 < e && (p[t] == '.' || p[t] == ')')
+                    && p[t + 1] == ' ') {
+                    int u = t + 2;
+
+                    org_trim(p, &u, &e);
+                    memset(it, 0, sizeof *it);
+                    it->kind = ORG_LIST;
+                    it->text.s = (char[:]){ (char *)p + u, e - u };
+                    return 1;
+                }
+            }
+            /* 段落：本行 + 后续普通行 */
+            memset(it, 0, sizeof *it);
+            it->kind = ORG_PARAGRAPH;
+            it->text.s = (char[:]){ (char *)p + s, e - s };
+            while (1) {
+                int s2 = 0, e2 = 0, m2 = *pos, s3 = 0, e3 = 0;
+
+                if (!org_line(p, d->n, pos, &s2, &e2))
+                    break;
+                s3 = s2;
+                e3 = e2;
+                org_trim(p, &s3, &e3);
+                if (s3 >= e3)
+                    break;
+                if (p[s3] == '*' || p[s3] == '#' || p[s3] == '-'
+                    || p[s3] == '+' || (p[s3] >= '0' && p[s3] <= '9')) {
+                    *pos = m2;
+                    break;
+                }
+            }
+            return 1;
+        }
+        (void)mark;
+    }
+}
+
+int open(OrgDoc *d, const void *src, int n)
+{
+    int pos = 0, count = 0;
+    OrgItem it = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    while (org_parse(d, &pos, &it) == 1)
+        count++;
+    d->nitems = count;
+    d->off = 0;
+    return count;
+}
+
+int next(OrgDoc *d, OrgItem *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return org_parse(d, &d->off, out);
+}
+
+int count(OrgDoc *d)
+{
+    return d ? d->nitems : 0;
+}
+
+int rewind(OrgDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int org_link(char[:] text, Str *url, Str *desc, int *has_desc)
+{
+    int i = 0;
+
+    if (url)
+        *url = (Str){ (char[:]){ 0, 0 } };
+    if (desc)
+        *desc = (Str){ (char[:]){ 0, 0 } };
+    if (has_desc)
+        *has_desc = 0;
+    if (!text.data)
+        return 0;
+    for (i = 0; i + 1 < text.len; i++) {
+        if (text.data[i] == '[' && text.data[i + 1] == '[') {
+            int j = i + 2, k = 0;
+
+            while (j + 1 < text.len
+                   && !(text.data[j] == ']' && text.data[j + 1] == ']'))
+                j++;
+            if (j + 1 >= text.len)
+                return 0;
+            k = j;
+            /* 找中间的 ][ */
+            {
+                int sep = -1, m = i + 2;
+
+                while (m + 1 < k) {
+                    if (text.data[m] == ']' && text.data[m + 1] == '[') {
+                        sep = m;
+                        break;
+                    }
+                    m++;
+                }
+                if (sep >= 0) {
+                    if (url)
+                        *url = (Str){ (char[:]){ text.data + i + 2,
+                                                 sep - i - 2 } };
+                    if (desc)
+                        *desc = (Str){ (char[:]){ text.data + sep + 2,
+                                                  k - sep - 2 } };
+                    if (has_desc)
+                        *has_desc = 1;
+                } else {
+                    if (url)
+                        *url = (Str){ (char[:]){ text.data + i + 2,
+                                                 k - i - 2 } };
+                    if (desc)
+                        *desc = *url;
+                }
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "org：标题、TODO 与标签" {
+    static const char *doc =
+        "#+TITLE: Demo\n"
+        "* TODO write docs :work:urgent:\n"
+        "** DONE sub item\n"
+        "Some paragraph text.\n"
+        "- list item\n";
+    OrgDoc d = { 0 };
+    OrgItem it = { 0 };
+
+    if (d.open(doc, (int)strlen(doc)) != 5)
+        return err(1, "应该有 5 条（关键字 + 2 标题 + 段落 + 列表）");
+    if (d.next(&it) != 1 || it.kind != ORG_KEYWORD)
+        return err(2, "第一条应该是 #+TITLE");
+    if (it.text.s.len != 5 || memcmp(it.text.s.data, "TITLE", 5) != 0)
+        return err(3, "关键字名不对");
+    if (it.arg.s.len != 4 || memcmp(it.arg.s.data, "Demo", 4) != 0)
+        return err(4, "关键字值不对");
+    if (d.next(&it) != 1 || it.kind != ORG_HEADING || it.level != 1)
+        return err(5, "一级标题不对");
+    if (it.todo != 1 || strcmp(todo_name(it.todo), "TODO") != 0)
+        return err(6, "TODO 关键字不对");
+    if (it.title.s.len != 10 || memcmp(it.title.s.data, "write docs", 10) != 0)
+        return err(7, "去掉 TODO/标签之后的标题不对");
+    if (it.tags.s.len != 11 || memcmp(it.tags.s.data, "work:urgent", 11) != 0)
+        return err(8, "标签不对");
+    if (d.next(&it) != 1 || it.level != 2 || it.todo != 2)
+        return err(9, "二级 DONE 标题不对");
+    if (it.title.s.len != 8)
+        return err(10, "DONE 之后的标题不对");
+}
+
+test "org：列表、段落与链接" {
+    static const char *doc =
+        "- one\n"
+        "- two\n"
+        "\n"
+        "paragraph line\n"
+        "still same paragraph\n"
+        "\n"
+        "\n"
+        "1. numbered\n";
+    OrgDoc d = { 0 };
+    OrgItem it = { 0 };
+    Str url = { (char[:]){ 0, 0 } };
+    Str desc = { (char[:]){ 0, 0 } };
+    int has = 0;
+
+    if (d.open(doc, (int)strlen(doc)) != 4)
+        return err(11, "应该有 4 条（2 列表 + 段落 + 编号列表）");
+    if (d.next(&it) != 1 || it.kind != ORG_LIST || it.text.s.len != 3)
+        return err(12, "第一个列表项不对");
+    if (d.next(&it) != 1 || it.text.s.len != 3
+        || memcmp(it.text.s.data, "two", 3) != 0)
+        return err(13, "第二个列表项不对");
+    if (d.next(&it) != 1 || it.kind != ORG_PARAGRAPH)
+        return err(14, "段落条目不对");
+    if (it.text.s.len != 14)
+        return err(15, "段落只给首行（14 字节）");
+    if (d.next(&it) != 1 || it.kind != ORG_LIST
+        || memcmp(it.text.s.data, "numbered", 8) != 0)
+        return err(16, "编号列表项不对");
+    if (org_link(S("see [[https://x.org][home]] now"), &url, &desc, &has) != 1)
+        return err(17, "链接解析失败");
+    if (url.s.len != 13 || memcmp(url.s.data, "https://x.org", 13) != 0)
+        return err(18, "链接 URL 不对");
+    if (has != 1 || desc.s.len != 4 || memcmp(desc.s.data, "home", 4) != 0)
+        return err(19, "链接描述不对");
+    if (org_link(S("[[https://y.org]]"), &url, &desc, &has) != 1 || has != 0
+        || url.s.len != 13)
+        return err(20, "无描述的链接不对");
+    if (org_link(S("no link here"), &url, &desc, &has) != 0)
+        return err(21, "没有链接应该返回 0");
+}

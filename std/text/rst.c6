@@ -1,0 +1,416 @@
+/* std/text/rst：reStructuredText 的简单结构解析（标题、指令、列表、代码块）。
+ *
+ *     import std.text.rst;
+ *
+ *     RstDoc doc = { 0 };
+ *     RstItem it = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / rewind
+ *     while (doc.next(&it) == 1)
+ *         // it.kind（RST_HEADING / RST_DIRECTIVE / RST_LIST / RST_PARAGRAPH）
+ *         // it.level / it.text / it.arg
+ *
+ * 只做「结构」不做完整语法：识别
+ *
+ * - **标题**：一行文字 + 下划线（`===`、`---`、`~~~` 等），层级按**下划线字符首次
+ *   出现的顺序**编号（1 开始），与 docutils 的惯例一致；
+ * - **指令**：`.. name:: arg`（name 是标识符，arg 到行尾），上一行就是指令名时
+ *   视为「无参数指令」；
+ * - **列表项**：行首 `-`/`*`/`+` 或 `1.`/`1)` 后跟空格；
+ * - **段落**：其余非空、非注释（`..` 开头且不是指令）的行，连续行合并成一条。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 数出条目数并返回；`doc.next(&it)` 逐条返回；
+ * - `it.text` 是内容视图（标题文字、列表项正文、段落首行），`it.level` 只对标题有意义；
+ * - 指令行的 `arg` 是指令后的参数（可能为空），`text` 是指令名；
+ * - `it.line` 是条目在原文里的行号（1 开始）；
+ * - `doc.heading_level(ch)` 给某个下划线字符对应的标题层级（没出现过返回 0）。
+ */
+#include <string.h>
+
+module std.text.rst;
+import std.core.types;
+import std.text.str;
+
+enum {
+    RST_HEADING = 1,
+    RST_DIRECTIVE = 2,
+    RST_LIST = 3,
+    RST_PARAGRAPH = 4
+};
+
+struct RstItem {
+    int kind;
+    int level;
+    int line;
+    Str text;
+    Str arg;
+};
+
+struct RstDoc {
+    const char *src;
+    int n;
+    int off;
+    int line;
+    int nitems;
+    char order[16];
+    int norder;
+};
+
+static int rst_is_underline(const char *p, int start, int end)
+{
+    char c = 0;
+    int i = 0, len = end - start;
+
+    if (len < 1)
+        return 0;
+    c = p[start];
+    if (c != '=' && c != '-' && c != '~' && c != '^' && c != '"' && c != '\''
+        && c != '`' && c != ':' && c != '.' && c != '*' && c != '+' && c != '#')
+        return 0;
+    for (i = start; i < end; i++) {
+        if (p[i] != c)
+            return 0;
+    }
+    return 1;
+}
+
+static void rst_trim(const char *p, int *start, int *end)
+{
+    while (*start < *end && (p[*start] == ' ' || p[*start] == '\t'))
+        (*start)++;
+    while (*end > *start && (p[*end - 1] == ' ' || p[*end - 1] == '\t'))
+        (*end)--;
+}
+
+/* 取下一行的范围；返回 0 到头 */
+static int rst_line(const char *p, int n, int *pos, int *start, int *end)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *end = i;
+    if (*end > *start && p[*end - 1] == '\r')
+        (*end)--;
+    *pos = (i < n) ? i + 1 : i;
+    return 1;
+}
+
+static int rst_order_index(RstDoc *d, char ch)
+{
+    int i = 0;
+
+    for (i = 0; i < d->norder; i++) {
+        if (d->order[i] == ch)
+            return i + 1;
+    }
+    if (d->norder < 15) {
+        d->order[d->norder++] = ch;
+        return d->norder;
+    }
+    return 15;
+}
+
+int heading_level(RstDoc *d, char ch)
+{
+    int i = 0;
+
+    if (!d)
+        return 0;
+    for (i = 0; i < d->norder; i++) {
+        if (d->order[i] == ch)
+            return i + 1;
+    }
+    return 0;
+}
+
+/* 解析一行（必要时看下一行判断标题/指令）；成功返回 1 并更新 *pos */
+static int rst_parse(RstDoc *d, const char *p, int *pos, RstItem *it)
+{
+    int start = 0, end = 0, line_no = d->line;
+    int save = *pos;
+
+    while (rst_line(p, d->n, pos, &start, &end)) {
+        int s = start, e = end, s2 = 0, e2 = 0;
+
+        save = *pos;
+
+        d->line++;
+        rst_trim(p, &s, &e);
+        if (s >= e) {
+            line_no = d->line;
+            continue;
+        }
+        /* 标题：本行文字 + 下一行是下划线 */
+        {
+        int mark = *pos;
+
+        if (rst_line(p, d->n, pos, &s2, &e2)) {
+            int s3 = s2, e3 = e2;
+
+            rst_trim(p, &s3, &e3);
+            if (e3 - s3 >= (e - s) && rst_is_underline(p, s3, e3)) {
+                memset(it, 0, sizeof *it);
+                it->kind = RST_HEADING;
+                it->level = rst_order_index(d, p[s3]);
+                it->line = d->line - 1;
+                it->text.s = (char[:]){ (char *)p + s, e - s };
+                return 1;
+            }
+        }
+        *pos = mark;                    /* 不是标题：退回下一行开头 */
+        }
+        /* 指令：.. name:: arg */
+        if (e - s >= 3 && p[s] == '.' && p[s + 1] == '.') {
+            int k = s + 2;
+
+            while (k < e && (p[k] == ' ' || p[k] == '\t'))
+                k++;
+            if (k + 2 <= e && p[k] != '.') {
+                int nstart = k, colon = -1;
+
+                while (k < e) {
+                    if (k + 1 < e && p[k] == ':' && p[k + 1] == ':') {
+                        colon = k;
+                        break;
+                    }
+                    k++;
+                }
+                if (colon > nstart) {
+                    int a = colon + 2, a_end = e;
+
+                    rst_trim(p, &a, &a_end);
+                    memset(it, 0, sizeof *it);
+                    it->kind = RST_DIRECTIVE;
+                    it->line = d->line;
+                    it->text.s = (char[:]){ (char *)p + nstart,
+                                            colon - nstart };
+                    it->arg.s = (char[:]){ (char *)p + a, a_end - a };
+                    return 1;
+                }
+            }
+            /* 纯注释行：跳过 */
+            line_no = d->line;
+            continue;
+        }
+        /* 列表项 */
+        if ((p[s] == '-' || p[s] == '*' || p[s] == '+') && s + 1 < e
+            && (p[s + 1] == ' ' || p[s + 1] == '\t')) {
+            int t = s + 1;
+
+            rst_trim(p, &t, &e);
+            memset(it, 0, sizeof *it);
+            it->kind = RST_LIST;
+            it->line = d->line;
+            it->text.s = (char[:]){ (char *)p + t, e - t };
+            return 1;
+        }
+        if (p[s] >= '0' && p[s] <= '9') {
+            int t = s;
+
+            while (t < e && p[t] >= '0' && p[t] <= '9')
+                t++;
+            if (t + 1 < e && (p[t] == '.' || p[t] == ')') && p[t + 1] == ' ') {
+                int u = t + 2;
+
+                rst_trim(p, &u, &e);
+                memset(it, 0, sizeof *it);
+                it->kind = RST_LIST;
+                it->line = d->line;
+                it->text.s = (char[:]){ (char *)p + u, e - u };
+                return 1;
+            }
+        }
+        /* 段落：本行 + 后续的普通行（遇到空行/新块/标题就停，并把位置退回该行开头） */
+        memset(it, 0, sizeof *it);
+        it->kind = RST_PARAGRAPH;
+        it->line = d->line;
+        it->text.s = (char[:]){ (char *)p + s, e - s };
+        while (1) {
+            int s2 = 0, e2 = 0, mark = *pos, s4 = 0, e4 = 0;
+            int s5 = 0, e5 = 0, mark2 = 0, s6 = 0, e6 = 0;
+
+            if (!rst_line(p, d->n, pos, &s2, &e2))
+                break;
+            s4 = s2;
+            e4 = e2;
+            rst_trim(p, &s4, &e4);
+            if (s4 >= e4) {
+                d->line++;              /* 空行：段落结束 */
+                break;
+            }
+            if (p[s4] == '.' || p[s4] == '-' || p[s4] == '*'
+                || p[s4] == '+' || (p[s4] >= '0' && p[s4] <= '9')) {
+                *pos = mark;            /* 可能是新块，退回这行开头 */
+                break;
+            }
+            /* 这一行后面跟下划线 → 它是标题，退回 */
+            mark2 = *pos;
+            if (rst_line(p, d->n, pos, &s5, &e5)) {
+                s6 = s5;
+                e6 = e5;
+                rst_trim(p, &s6, &e6);
+                if (rst_is_underline(p, s6, e6) && e6 - s6 >= (e4 - s4)) {
+                    *pos = mark;
+                    break;
+                }
+            }
+            *pos = mark2;
+            d->line++;
+        }
+        return 1;
+    }
+    *pos = save;
+    return 0;
+}
+
+int open(RstDoc *d, const void *src, int n)
+{
+    const char *p = (const char *)src;
+    int pos = 0, count = 0;
+    RstItem it = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    d->line = 0;
+    while (rst_parse(d, p, &pos, &it) == 1)
+        count++;
+    d->nitems = count;
+    d->off = 0;
+    d->line = 0;
+    return count;
+}
+
+int next(RstDoc *d, RstItem *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return rst_parse(d, d->src, &d->off, out);
+}
+
+int count(RstDoc *d)
+{
+    return d ? d->nitems : 0;
+}
+
+int rewind(RstDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    d->line = 0;
+    return 1;
+}
+
+const char *rst_kind_name(int kind)
+{
+    switch (kind) {
+    case RST_HEADING: return "heading";
+    case RST_DIRECTIVE: return "directive";
+    case RST_LIST: return "list";
+    case RST_PARAGRAPH: return "para";
+    default: return "?";
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "rst：标题、指令与列表" {
+    static const char *doc =
+        "Title\n"
+        "=====\n"
+        "\n"
+        "Intro paragraph here.\n"
+        "\n"
+        "Sub\n"
+        "---\n"
+        "\n"
+        ".. note:: be careful\n"
+        "\n"
+        "- first item\n"
+        "- second item\n"
+        "\n"
+        "1. numbered\n"
+        "\n"
+        ".. this is a comment\n"
+        "\n"
+        "End paragraph.\n";
+    RstDoc d = { 0 };
+    RstItem it = { 0 };
+    int n = 0;
+
+    if (d.open(doc, (int)strlen(doc)) != 8)
+        return err(1, "应该有 8 条（2 标题 + 2 段落 + 1 指令 + 3 列表）");
+    if (d.count() != 8)
+        return err(2, "count() 不对");
+    if (d.next(&it) != 1 || it.kind != RST_HEADING)
+        return err(3, "第一条应该是标题");
+    if (it.level != 1 || it.text.s.len != 5)
+        return err(4, "标题层级或文字不对");
+    if (memcmp(it.text.s.data, "Title", 5) != 0)
+        return err(5, "标题内容不对");
+    if (d.next(&it) != 1 || it.kind != RST_PARAGRAPH)
+        return err(6, "第二条应该是段落");
+    if (it.text.s.len != 21)
+        return err(7, "段落文字长度不对");
+    if (d.next(&it) != 1 || it.kind != RST_HEADING || it.level != 2)
+        return err(8, "第二个标题层级应该是 2");
+    if (d.next(&it) != 1 || it.kind != RST_DIRECTIVE)
+        return err(9, "指令条目不对");
+    if (it.text.s.len != 4 || memcmp(it.text.s.data, "note", 4) != 0)
+        return err(10, "指令名不对");
+    if (it.arg.s.len != 10 || memcmp(it.arg.s.data, "be careful", 10) != 0)
+        return err(11, "指令参数不对");
+    if (d.next(&it) != 1 || it.kind != RST_LIST || it.text.s.len != 10)
+        return err(12, "第一个列表项不对");
+    if (d.next(&it) != 1 || it.kind != RST_LIST || it.text.s.len != 11
+        || memcmp(it.text.s.data, "second item", 11) != 0)
+        return err(13, "第二个列表项不对");
+    if (d.next(&it) != 1 || it.kind != RST_LIST
+        || memcmp(it.text.s.data, "numbered", 8) != 0)
+        return err(14, "编号列表项不对");
+}
+
+test "rst：层级表与编号列表" {
+    static const char *doc =
+        "A\n"
+        "=\n"
+        "B\n"
+        "-\n"
+        "C\n"
+        "=\n";
+    RstDoc d = { 0 };
+    RstItem it = { 0 };
+
+    if (d.open(doc, (int)strlen(doc)) != 3)
+        return err(13, "三个标题应该算 3 条");
+    if (d.heading_level('=') != 1 || d.heading_level('-') != 2
+        || d.heading_level('~') != 0)
+        return err(14, "层级表不对");
+    d.next(&it);
+    if (it.level != 1 || it.text.s.len != 1)
+        return err(15, "第一个标题不对");
+    d.next(&it);
+    if (it.level != 2)
+        return err(16, "第二个标题层级应该是 2");
+    d.next(&it);
+    if (it.level != 1)
+        return err(17, "同一种下划线应该回到层级 1");
+    if (strcmp(rst_kind_name(RST_HEADING), "heading") != 0
+        || strcmp(rst_kind_name(RST_LIST), "list") != 0)
+        return err(18, "kind_name 不对");
+    if (d.open("", 0) != -1)
+        return err(19, "空输入应该 -1");
+    d.rewind();
+    if (d.next(&it) != 1)
+        return err(20, "rewind 之后应该能重新读");
+}

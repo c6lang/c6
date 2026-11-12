@@ -12986,6 +12986,10 @@ static const struct C6ErrStdSlot {
     { "std.net.gopher",         C6_ERR_SLOT_STD + 278 },
     { "std.net.whois",          C6_ERR_SLOT_STD + 279 },
     { "std.net.ident",          C6_ERR_SLOT_STD + 280 },
+    { "std.text.rst",           C6_ERR_SLOT_STD + 281 },
+    { "std.text.org",           C6_ERR_SLOT_STD + 282 },
+    { "std.text.tex",           C6_ERR_SLOT_STD + 283 },
+    { "std.text.pod",           C6_ERR_SLOT_STD + 284 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

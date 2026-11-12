@@ -1,0 +1,152 @@
+/* examples/stdmarkup.c6 —— 第六十八批（轻量标记语言）的集成示例。
+ *
+ *     make std-markup
+ *
+ * 四节：reST、Org-mode、LaTeX、POD。都用**游标方法**（`doc.next`、`doc.rewind`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.rst;
+import std.text.org;
+import std.text.tex;
+import std.text.pod;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_rst(void)
+{
+    static const char *doc =
+        "Guide\n"
+        "=====\n"
+        "\n"
+        "Intro text.\n"
+        "\n"
+        ".. note:: keep it short\n"
+        "\n"
+        "- one\n"
+        "- two\n";
+    RstDoc d = { 0 };
+    RstItem it = { 0 };
+    int heads = 0, lists = 0;
+
+    printf("== reST\n");
+    check(d.open(doc, (int)strlen(doc)) == 5, "open 5 条");
+    while (d.next(&it) == 1) {
+        printf("   %-9s lvl=%d %.*s\n", rst_kind_name(it.kind), it.level,
+               it.text.s.len, it.text.s.data);
+        if (it.kind == RST_HEADING)
+            heads++;
+        if (it.kind == RST_LIST)
+            lists++;
+    }
+    check(heads == 1 && lists == 2, "标题 1 条、列表 2 条");
+    check(d.heading_level('=') == 1, "层级表记住 = 是第 1 级");
+    check(d.count() == 5 && d.rewind() == 1, "count() 与 rewind()");
+}
+
+static void do_org(void)
+{
+    static const char *doc =
+        "#+TITLE: Notes\n"
+        "* TODO ship it :work:\n"
+        "** DONE done part\n"
+        "- a task\n";
+    OrgDoc d = { 0 };
+    OrgItem it = { 0 };
+    Str url = { (char[:]){ 0, 0 } };
+    Str desc = { (char[:]){ 0, 0 } };
+    int has = 0;
+
+    printf("== org\n");
+    check(d.open(doc, (int)strlen(doc)) == 4, "open 4 条");
+    while (d.next(&it) == 1) {
+        printf("   kind=%d lvl=%d todo=%-9s title=%.*s\n", it.kind, it.level,
+               todo_name(it.todo), it.title.s.len, it.title.s.data);
+    }
+    check(d.rewind() == 1 && d.next(&it) == 1 && it.kind == ORG_KEYWORD, "第一条是 #+TITLE");
+    d.next(&it);
+    check(it.todo == 1 && it.level == 1, "TODO 一级标题");
+    check(org_link(S("[[https://example.org][Example]]"), &url, &desc, &has) == 1,
+          "链接解析");
+    check(has == 1 && desc.s.len == 7, "链接描述");
+}
+
+static void do_tex(void)
+{
+    static const char *doc =
+        "\\begin{document}\n"
+        "\\section{Intro}\n"
+        "\\subsection{Detail}\n"
+        "\\end{document}\n";
+    TexDoc d = { 0 };
+    TexItem it = { 0 };
+    char out[64] = { 0 };
+
+    printf("== LaTeX\n");
+    check(d.open(doc, (int)strlen(doc)) == 4, "open 4 条");
+    while (d.next(&it) == 1)
+        printf("   %-8s lvl=%d %.*s\n", command_name(it.kind), it.level,
+               it.text.s.len, it.text.s.data);
+    check(d.rewind() == 1 && d.next(&it) == 1 && it.kind == TEX_BEGIN, "第一条是 begin");
+    check(tex_escape(S("50% & 3_2"), out, (int)sizeof out) == 12, "转义长度");
+    check(memcmp(out, "50\\% \\& 3\\_2", 12) == 0, "转义内容");
+}
+
+static void do_pod(void)
+{
+    static const char *doc =
+        "=head1 NAME\n"
+        "\n"
+        "Demo - does things\n"
+        "\n"
+        "=over 4\n"
+        "\n"
+        "=item B<new>\n"
+        "\n"
+        "=back\n"
+        "\n"
+        "=cut\n";
+    PodDoc d = { 0 };
+    PodItem it = { 0 };
+    char out[64] = { 0 };
+    int n = 0;
+
+    printf("== POD\n");
+    check(d.open(doc, (int)strlen(doc)) == 6, "open 6 条（到 cut 为止）");
+    while (d.next(&it) == 1) {
+        printf("   %-7s lvl=%d arg=%.*s\n", pod_kind_name(it.kind), it.level,
+               it.arg.s.len, it.arg.s.data);
+        n++;
+        if (it.kind == POD_CUT)
+            break;
+    }
+    check(n == 6, "遍历到 cut");
+    check(pod_heading(S("=head3 Deep")) == 3, "pod_heading");
+    check(pod_strip(S("B<bold> text"), out, (int)sizeof out) == 9, "strip 长度");
+    check(memcmp(out, "bold text", 9) == 0, "strip 内容");
+}
+
+int main(void)
+{
+    do_rst();
+    do_org();
+    do_tex();
+    do_pod();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
