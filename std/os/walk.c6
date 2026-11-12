@@ -1,0 +1,420 @@
+/* std/os/walk：目录树的递归遍历与删除（POSIX，零分配）。
+ *
+ *     import std.os.walk;
+ *
+ *     WalkOpts o = walk_default();          // 不限深度、不跟随符号链接
+ *     WalkStats st = { 0 };
+ *     walk_stat("src", o, &st);             // st.files / st.dirs / st.bytes
+ *
+ *     // 逐个访问：返回 1 继续、0 跳过这棵子树、-1 中止（walk 返回 -1）
+ *     int on_file(char *path, StatInfo *si, int depth, void *ud) { ... }
+ *     walk("src", o, on_file, 0);
+ *
+ *     remove_tree("build/tmp");             // 递归删除（后序）
+ *
+ * `std.os.fs` 给的是**单层**目录句柄（`Dir`），这一层把它包成「整棵树」：
+ * 深度优先、目录先回调再下钻、`remove_tree` 后序删除。路径都拼在 512 字节的
+ * 栈上缓冲里，递归深度受 `WALK_DEPTH_MAX`（32）限制——超了返回 -1，不会把
+ * 栈耗尽。
+ *
+ * 约定：
+ *
+ * - `walk` 不回调 root 自己，只回调它的后代；深度从 1 开始；
+ * - `max_depth` 是「最多访问到第几层」：1 = 只访问 root 的直属条目，2 = 再
+ *   下一层，0 = 一个都不访问，负数 = 不限；
+ * - `WalkOpts.visit_dirs == 0` 时目录不回调（只用于下钻），回调里 `si->is_dir`
+ *   永远为 0；要看目录就把 `visit_dirs` 设 1；
+ * - 符号链接默认**不跟随**：当普通条目回调（`si->is_link == 1`），不进入；
+ *   `follow_links = 1` 时用 `stat` 跟随（可能走出 root，自己确认树里没有
+ *   外链）；
+ * - 回调返回 0 只对目录有意义（跳过这棵子树），对文件等同于 1；返回 -1
+ *   立刻中止，`walk` 返回 -1；
+ * - 返回值：1 走完、0 被回调中止之外的正常情况不会出现（保留）、-1 出错
+ *   （root 打不开/不是目录、path 太长、深度超限、opendir 失败）；
+ * - `remove_tree`：1 删掉、0 本来就不存在、-1 出错（权限、非空目录删不掉等）。
+ *   `remove_tree` 不跟随符号链接（删链接本身，不删目标）。
+ */
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+
+module std.os.walk;
+import std.core.types;
+import std.core.err;
+import std.os.fs;
+import std.os.path;
+
+#define WALK_PATH_MAX 512
+#define WALK_NAME_MAX 256
+#define WALK_DEPTH_MAX 32
+
+struct WalkOpts {
+    int max_depth;      /* <0 = 不限；0 = 不进入 root 的子目录；N = 最多 N 层 */
+    int follow_links;
+    int visit_dirs;
+};
+
+struct WalkStats {
+    i64 bytes;
+    int files;
+    int dirs;
+    int links;
+};
+
+WalkOpts walk_default(void)
+{
+    WalkOpts o = { -1, 0, 0 };
+
+    return o;
+}
+
+/* 1 拿到元数据 / 0 不存在 / -1 其它错误 */
+static int walk_stat_path(char *path, StatInfo *out, int follow)
+{
+    if (follow) {
+        fs_stat(path, out) catch e {
+            return e.id == std.core.err.NO_ENT ? 0 : -1;
+        };
+    } else {
+        fs_lstat(path, out) catch e {
+            return e.id == std.core.err.NO_ENT ? 0 : -1;
+        };
+    }
+    return 1;
+}
+
+static int walk_dir(char *dir, int depth, WalkOpts *o,
+                    int (*fn)(char *, StatInfo *, int, void *), void *ud,
+                    WalkStats *st)
+{
+    Dir d = { 0 };
+    char name[WALK_NAME_MAX] = { 0 };
+    char child[WALK_PATH_MAX] = { 0 };
+    int rc = 0;
+
+    if (depth > WALK_DEPTH_MAX)
+        return -1;
+    d = dir_open(dir);
+    if (!d.ok())
+        return -1;
+    while ((rc = d.next(name, (int)sizeof name, 0)) == 1) {
+        StatInfo si = { 0 };
+        int sr = 0, hr = 1;
+
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+            continue;
+        if (path_join((char[:]){ dir, (int)strlen(dir) },
+                      (char[:]){ name, (int)strlen(name) }, child,
+                      (int)sizeof child)
+            < 0) {
+            d.close();
+            return -1;
+        }
+        sr = walk_stat_path(child, &si, o->follow_links);
+        if (sr == 0)
+            continue;               /* 遍历途中被删掉：跳过 */
+        if (sr < 0) {
+            d.close();
+            return -1;
+        }
+        if (o->max_depth >= 0 && depth + 1 > o->max_depth)
+            continue;               /* 超出访问深度：这一项不算 */
+        if (si.is_link && !o->follow_links) {
+            if (st)
+                st->links++;
+        }
+        if (si.is_dir) {
+            if (st)
+                st->dirs++;
+            if (o->visit_dirs && fn) {
+                hr = fn(child, &si, depth + 1, ud);
+                if (hr < 0) {
+                    d.close();
+                    return -1;
+                }
+                if (hr == 0)
+                    continue;       /* 跳过子树 */
+            }
+            if (walk_dir(child, depth + 1, o, fn, ud, st) != 1) {
+                d.close();
+                return -1;
+            }
+        } else {
+            if (st) {
+                st->files++;
+                st->bytes += si.size;
+            }
+            if (fn) {
+                hr = fn(child, &si, depth + 1, ud);
+                if (hr < 0) {
+                    d.close();
+                    return -1;
+                }
+            }
+        }
+    }
+    d.close();
+    return rc == 0 ? 1 : -1;
+}
+
+/* 遍历一棵树：1 走完 / -1 出错（见文件头） */
+int walk(char *root, WalkOpts opts, int (*fn)(char *, StatInfo *, int, void *),
+         void *ud)
+{
+    StatInfo si = { 0 };
+    WalkOpts o = opts;
+    int rc = 0;
+
+    if (!root || !*root)
+        return -1;
+    rc = walk_stat_path(root, &si, o.follow_links);
+    if (rc != 1 || !si.is_dir)
+        return -1;
+    return walk_dir(root, 0, &o, fn, ud, 0);
+}
+
+/* 只统计，不回调：1 走完 / -1 出错；*out 只在成功时可信 */
+int walk_stat(char *root, WalkOpts opts, WalkStats *out)
+{
+    StatInfo si = { 0 };
+    WalkOpts o = opts;
+    WalkStats st = { 0 };
+    int rc = 0;
+
+    if (!root || !*root || !out)
+        return -1;
+    rc = walk_stat_path(root, &si, o.follow_links);
+    if (rc != 1 || !si.is_dir)
+        return -1;
+    if (walk_dir(root, 0, &o, 0, 0, &st) != 1)
+        return -1;
+    *out = st;
+    return 1;
+}
+
+static int remove_tree_at(char *path, int depth)
+{
+    StatInfo si = { 0 };
+    Dir d = { 0 };
+    char name[WALK_NAME_MAX] = { 0 };
+    char child[WALK_PATH_MAX] = { 0 };
+    int rc = 0;
+
+    if (depth > WALK_DEPTH_MAX)
+        return -1;
+    rc = walk_stat_path(path, &si, 0);
+    if (rc == 0)
+        return 0;
+    if (rc < 0)
+        return -1;
+    if (!si.is_dir)
+        return unlink(path) == 0 ? 1 : -1;
+    d = dir_open(path);
+    if (!d.ok())
+        return -1;
+    while ((rc = d.next(name, (int)sizeof name, 0)) == 1) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+            continue;
+        if (path_join((char[:]){ path, (int)strlen(path) },
+                      (char[:]){ name, (int)strlen(name) }, child,
+                      (int)sizeof child)
+            < 0) {
+            d.close();
+            return -1;
+        }
+        rc = remove_tree_at(child, depth + 1);
+        if (rc < 0) {
+            d.close();
+            return -1;
+        }
+    }
+    d.close();
+    if (rc != 0)
+        return -1;
+    return rmdir(path) == 0 ? 1 : -1;
+}
+
+/* 递归删除：1 删掉 / 0 本来就不存在 / -1 出错 */
+int remove_tree(char *path) { return remove_tree_at(path, 0); }
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static void put_file(char *path, char *text)
+{
+    FILE *f = fopen(path, "wb");
+
+    if (f) {
+        fwrite(text, 1, strlen(text), f);
+        fclose(f);
+    }
+}
+
+static int abort_fn(char *path, StatInfo *si, int depth, void *ud)
+{
+    (void)path;
+    (void)si;
+    (void)depth;
+    (void)ud;
+    return -1;
+}
+
+static int count_hits = 0;
+static int count_depth = 0;
+static int skip_name_hits = 0;
+
+static int count_fn(char *path, StatInfo *si, int depth, void *ud)
+{
+    int *skip = ud;
+
+    count_hits++;
+    if (depth > count_depth)
+        count_depth = depth;
+    if (skip && strstr(path, "sub") != 0) {
+        skip_name_hits++;
+        return 0;                   /* 跳过这棵子树 */
+    }
+    if (si->is_dir)
+        return 1;
+    return 1;
+}
+
+static void make_tree(char *root)
+{
+    char buf[WALK_PATH_MAX] = { 0 };
+
+    remove_tree(root);
+    mkdir("build", 0755);
+    mkdir(root, 0755);
+    snprintf(buf, sizeof buf, "%s/a.txt", root);
+    put_file(buf, "aaa");
+    snprintf(buf, sizeof buf, "%s/b.txt", root);
+    put_file(buf, "bb");
+    snprintf(buf, sizeof buf, "%s/sub", root);
+    mkdir(buf, 0755);
+    snprintf(buf, sizeof buf, "%s/sub/c.txt", root);
+    put_file(buf, "cccc");
+    snprintf(buf, sizeof buf, "%s/sub/deep", root);
+    mkdir(buf, 0755);
+    snprintf(buf, sizeof buf, "%s/sub/deep/d.txt", root);
+    put_file(buf, "d");
+    snprintf(buf, sizeof buf, "%s/empty", root);
+    mkdir(buf, 0755);
+}
+
+test "walk_stat 统计文件/目录/字节" {
+    WalkStats st = { 0 };
+    WalkOpts o = walk_default();
+    char *root = (char *)"build/walk-test";
+
+    make_tree(root);
+    if (walk_stat(root, o, &st) != 1)
+        return err(1, "walk_stat 失败");
+    if (st.files != 4)
+        return err(2, "文件数不对");
+    if (st.dirs != 3)
+        return err(3, "目录数不对（sub/deep/empty）");
+    if (st.bytes != 3 + 2 + 4 + 1)
+        return err(4, "字节数不对");
+    /* 深度 0：一个都不访问 */
+    o.max_depth = 0;
+    memset(&st, 0, sizeof st);
+    if (walk_stat(root, o, &st) != 1 || st.files != 0 || st.dirs != 0)
+        return err(5, "max_depth=0 应该什么都不访问");
+    /* 深度 1：只访问 root 的直属条目（a/b + sub/empty） */
+    o.max_depth = 1;
+    memset(&st, 0, sizeof st);
+    if (walk_stat(root, o, &st) != 1 || st.files != 2 || st.dirs != 2)
+        return err(6, "max_depth=1 的统计不对");
+    /* 深度 2：再下一层（c.txt + sub/deep） */
+    o.max_depth = 2;
+    memset(&st, 0, sizeof st);
+    if (walk_stat(root, o, &st) != 1 || st.files != 3 || st.dirs != 3)
+        return err(7, "max_depth=2 的统计不对");
+    /* 不存在的 root / 不是目录 */
+    if (walk_stat((char *)"build/walk-test-nope", o, &st) != -1)
+        return err(8, "不存在的 root 应该 -1");
+    if (walk_stat((char *)"build/walk-test/a.txt", o, &st) != -1)
+        return err(9, "文件当 root 应该 -1");
+    if (walk_stat(0, o, &st) != -1 || walk_stat(root, o, 0) != -1)
+        return err(10, "空参数应该 -1");
+    remove_tree(root);
+    if (walk_stat(root, walk_default(), &st) != -1)
+        return err(11, "删掉之后应该 -1");
+}
+
+test "walk 回调、跳过子树与深度" {
+    WalkOpts o = walk_default();
+    char *root = (char *)"build/walk-test";
+    int skip = 1;
+
+    make_tree(root);
+    count_hits = 0;
+    count_depth = 0;
+    if (walk(root, o, count_fn, 0) != 1)
+        return err(11, "walk 失败");
+    if (count_hits != 4)
+        return err(12, "默认只回调文件（4 个）");
+    if (count_depth != 3)
+        return err(13, "最深应该是 3（sub/deep/d.txt）");
+    /* visit_dirs = 1：目录也回调 */
+    o.visit_dirs = 1;
+    count_hits = 0;
+    count_depth = 0;
+    if (walk(root, o, count_fn, 0) != 1 || count_hits != 7)
+        return err(14, "visit_dirs=1 应该回调 7 个（4 文件 + 3 目录）");
+    /* 回调返回 0 跳过 sub 子树：只剩余 2 个文件 + 1 个 empty 目录 */
+    o.visit_dirs = 1;
+    count_hits = 0;
+    skip_name_hits = 0;
+    if (walk(root, o, count_fn, &skip) != 1)
+        return err(15, "带跳过的 walk 失败");
+    if (count_hits != 4 || skip_name_hits != 1)
+        return err(16, "sub 自己被回调后跳过子树（共 4 次回调）");
+    /* 深度 1：只到 root 的直属条目 */
+    o.visit_dirs = 0;
+    o.max_depth = 1;
+    count_hits = 0;
+    count_depth = 0;
+    if (walk(root, o, count_fn, 0) != 1 || count_hits != 2)
+        return err(17, "max_depth=1 应该只回调 a/b 两个文件");
+    if (count_depth != 1)
+        return err(18, "深度应该停在 1");
+    /* 中止：回调返回 -1 */
+    {
+        int r = walk(root, walk_default(), abort_fn, 0);
+
+        if (r != -1)
+            return err(19, "回调返回 -1 时 walk 应该 -1");
+    }
+    remove_tree(root);
+}
+
+test "remove_tree 的后序删除" {
+    char *root = (char *)"build/walk-rm";
+    char buf[WALK_PATH_MAX] = { 0 };
+    WalkStats st = { 0 };
+
+    make_tree(root);
+    /* 加一个符号链接：remove_tree 只删链接本身 */
+    snprintf(buf, sizeof buf, "%s/link", root);
+    unlink(buf);
+    if (symlink("a.txt", buf) == 0) {
+        if (walk_stat(root, walk_default(), &st) != 1 || st.links != 1)
+            return err(20, "符号链接应该被统计");
+    }
+    if (remove_tree(root) != 1)
+        return err(21, "remove_tree 失败");
+    if (walk_stat(root, walk_default(), &st) != -1)
+        return err(22, "删完应该不存在");
+    if (remove_tree(root) != 0)
+        return err(23, "重复删除应该是 0");
+    if (remove_tree((char *)"build/walk-rm-nope") != 0)
+        return err(24, "不存在的路径应该是 0");
+    if (remove_tree(0) != -1)
+        return err(25, "空参数应该 -1");
+}

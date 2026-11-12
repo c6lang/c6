@@ -15,7 +15,7 @@
 | `std/core/` | 基础：定宽类型、错误码、内存、数学、位运算、哈希、随机 |
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
-| `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程 |
+| `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256/SHA-512/MD5、HKDF/PBKDF2、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
@@ -99,7 +99,7 @@
 | `std/container/trie.c6` | `std.container.trie` | 字节前缀树（节点池由调用方给）：`trie_init`、`Trie` 的 `put`（新键 1/覆盖 0/池满 -1）/`get`/`has_prefix`/`remove`（只清词尾标记）/`clear`/`size`/`node_count`；键是任意字节序列（含 `\0`，长度显式传） |
 | `std/container/vec.c6` | `std.container.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T`：`push`/`pop`、`insert`/`remove_at`/`truncate`、`first`/`last`、`index_of`/`contains`、`reverse`、`slice`/`extend`、`sort`/`sort_lex`、`each`/`filter`/`fold` |
 
-**`std/os/`**（操作系统：流、文件系统、路径、环境变量、时间）
+**`std/os/`**（操作系统：流、文件系统与目录树、路径、环境变量、时间、临时文件、锁、内存映射）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -116,6 +116,10 @@
 | `std/os/pipe.c6` | `std.os.pipe` | 匿名管道（`pipe(2)`）：`Pipe` 的 `init`/`init_nonblock`、`read_bytes`（`0`=EOF、`-1`=错误）、`read_exact`、`write_bytes`（返回实际字节数）、`set_nonblock`、`close_read`/`close_write`/`close_all`、`read_fd`/`write_fd`/`is_open`、`would_block()`；读写都重试 `EINTR`，fd 带 `FD_CLOEXEC` |
 | `std/os/poll.c6` | `std.os.poll` | 多路等待（`poll(2)`）：`PollSet`（`POLL_MAX`=32 个槽，零分配）的 `init`/`add`（同 fd 改事件）/`modify`/`remove_fd`/`find`/`count`/`wait`（`<0` 永远等、`0` 立刻、`>0` 毫秒；返回就绪个数）/`is_ready`/`ready`/`fd_at`/`clear_ready`，单 fd 的 `wait_readable`/`wait_writable`/`wait_any`（1/0/-1）；事件位 `EVENT_READ`/`EVENT_WRITE`/`EVENT_ERROR`/`EVENT_HUP`/`EVENT_INVALID` |
 | `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `d.format(buf, cap)`、`Civil` 日历换算 `civil_from_unix`/`c.to_unix()`/`c.format(...)`，不依赖 localtime |
+| `std/os/walk.c6` | `std.os.walk` | 目录树递归遍历与删除（在 `std.os.fs` 的单层 `Dir` 之上，零分配）：`walk`/`walk_stat`（`WalkOpts` 的 `max_depth`/`follow_links`/`visit_dirs`、`WalkStats` 的文件/目录/字节/链接计数）、回调 `int (*)(path, StatInfo *, depth, ud)` 返回 1 继续 / 0 跳过子树 / -1 中止；`remove_tree` 后序删除；路径 512 字节、深度上限 32 |
+| `std/os/temp.c6` | `std.os.temp` | 临时文件与目录（`mkstemp`/`mkdtemp` 薄封装，零分配）：`temp_file`/`temp_file_named`（默认前缀 `c6-`、目录空则 `$TMPDIR` 或 `/tmp`）、`temp_dir`/`temp_dir_in`、`TempFile` 的 `ok`/`path`/`fd`/`write_all`/`close_file`/`remove`；创建的文件 0600 且带 `FD_CLOEXEC`，不会自动删除 |
+| `std/os/lock.c6` | `std.os.lock` | 文件建议锁（`fcntl` 记录锁）：`lock_open` 工厂 + `FileLock` 的 `ok`/`fd`/`acquire(exclusive, wait_ms)`/`try_acquire`/`release`/`is_held`/`close_file`；`wait_ms < 0` 阻塞、`0` 只试一次、`>0` 按 5ms 重试到超时，返回 1/0/-1；整文件锁，按进程合并（测互斥要开子进程） |
+| `std/os/mmap.c6` | `std.os.mmap` | 文件/匿名映射（`mmap(2)`）：`map_file(path, writable)`（可写用 `O_RDWR`+`MAP_SHARED`，否则 `O_RDONLY`+`MAP_PRIVATE`，空文件是坏映射）/`map_anon(len)`（清零）、`Map` 的 `ok`/`data`/`size`/`can_write`/`is_anon`/`fd`/`sync`/`read_at`/`write_at`/`unmap`；`read_at`/`write_at` 做边界检查，`unmap` 可重复 |
 
 **`std/encoding/`**（编解码：Base64/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、位流、UUID）
 
@@ -202,6 +206,7 @@
 | `examples/stdclient.c6` | （无模块） | 第二十一批（网络客户端）的拼装示例（`make std-client`）：UDP 绑定/连接/空报文/超时、UDS socketpair 与路径 socket、resolv.conf 解析 + 本地 DNS 子进程上的一次 A 查询、本地 HTTP 子进程上的一次 chunked GET，自带自检 |
 | `examples/stdserve.c6` | （无模块） | 第二十二批（Web 服务端）的拼装示例（`make std-serve`）：httpd 收请求、router 分发（参数/通配符）、assets 发静态文件（含 403 越界）、session 的 Set-Cookie 往返，客户端用 `std.net.httpc` 打回本地服务端子进程，自带自检 |
 | `examples/stdcrypto.c6` | （无模块） | 第二十三批（消息摘要与密钥派生）的拼装示例（`make std-crypto`）：md5 的 RFC 1321 向量与流式喂入、sha512/sha384 与 HMAC-SHA-512、HKDF 的 RFC 5869 用例、PBKDF2 的 RFC 6070 用例，最后用 HMAC-SHA-256 演示 token 签发/篡改检测，自带自检 |
+| `examples/stdfsx.c6` | （无模块） | 第二十四批（文件系统进阶）的拼装示例（`make std-fsx`）：临时文件/目录、匿名与文件映射（改字节后 sync 回盘）、目录树统计与删树、跨进程抢锁与超时等待，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -265,6 +270,10 @@ std/os/fs.c6               7 test(s), 0 failure(s)
 std/os/io.c6               5 test(s), 0 failure(s)
 std/os/path.c6             30 test(s), 0 failure(s)
 std/os/time.c6             7 test(s), 0 failure(s)
+std/os/walk.c6            43 test(s), 0 failure(s)
+std/os/temp.c6             3 test(s), 0 failure(s)
+std/os/lock.c6             9 test(s), 0 failure(s)
+std/os/mmap.c6             2 test(s), 0 failure(s)
 std/text/ansi.c6           4 test(s), 0 failure(s)
 std/text/ascii.c6          5 test(s), 0 failure(s)
 std/text/fmt.c6            10 test(s), 0 failure(s)
@@ -304,6 +313,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/text/width.c6` 10 | utf8 7 + width 3（判宽要 `utf8_decode`） |
 | `std/encoding/punycode.c6` 11 | utf8 7 + punycode 4（编码/解码都走 `utf8_decode`） |
 | `std/container/chan.c6` 10 | chan 4 + sync 6（Mutex/Cond 的正文来自 `std.os.sync`） |
+| `std/os/walk.c6` 43 | walk 3 + fs 7 + path 8 + str 22 + err 3（遍历用 `Dir`，拼路径用 path） |
+| `std/os/lock.c6` 9 | lock 2 + time 7（超时等待要 `sleep_ms`） |
+| `std/os/temp.c6` 3 | 只借 `Str` 类型，正文不依赖别的模块 |
+| `std/os/mmap.c6` 2 | 自成一体（只用 mmap/msync/munmap） |
 | `std/net/resolver.c6` 36 | resolver 3 + dns 3 + udp 3 + io 5 + str 22（报文格式来自 dns、收发来自 udp，conf 读文件要 io） |
 | `std/net/httpc.c6` 39 | httpc 4 + tcp 3 + url 10 + str 22（连接用 tcp、拆 URL 用 url） |
 | `std/net/httpd.c6` 33 | httpd 3 + http 5 + tcp 3 + str 22（报文解析来自 http、连接来自 tcp） |
@@ -324,7 +337,9 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/net/url`、`std/os/fs`、`std/os/io`、`std/os/path`、`std/core/err`，`std/net/session`
 要 `std/core/rand`、`std/os/time`、`std/net/cookie`，`std/encoding/md5`、
 `std/encoding/sha512` 的正文必须带 `std/core/bits`，`std/encoding/hkdf` 要
-`std/encoding/sha256`（连带 bits/err），`std/encoding/pbkdf2` 要 SHA-1、SHA-256 两个哈希。
+`std/encoding/sha256`（连带 bits/err），`std/encoding/pbkdf2` 要 SHA-1、SHA-256 两个哈希，`std/os/walk` 要
+`std/os/fs`、`std/os/path`、`std/text/str`、`std/core/err`，`std/os/lock` 要
+`std/os/time`，`std/os/temp` 与 `std/os/mmap` 自成一体（temp 只借 `Str` 类型）。
 
 ## 设计原则
 
@@ -2944,6 +2959,31 @@ SHA-1 向量和 SHA-256 的 64 字节向量。最后用 HMAC-SHA-256 拼一个�
 输出与平台无关。Makefile 里显式列出十一个模块正文（md5/sha512 要 bits，
 hkdf 要 sha256，pbkdf2 要 sha1+sha256）。
 
+### 集成示例：`examples/stdfsx.c6`
+
+```sh
+make std-fsx
+```
+
+```
+stdfsx: 标准库第二十四批（walk / temp / lock / mmap）
+temp: 临时文件/目录都建在系统临时目录下
+mmap: anon 4 KiB 清零、文件映射改字节并 sync 回盘
+walk: 2 文件 1 目录 7 字节，max_depth 与删树都对
+lock: 跨进程互斥、超时与等待都对
+stdfsx: 33 check(s), 0 failure(s)
+```
+
+四节：「temp」建临时文件写 6 字节、回读、删掉（第二次给 0），再建一个
+`c6-dir-` 临时目录；「mmap」匿名映射 4 KiB 确认全零、填 `a..p` 再读回，
+临时文件写 11 字节后做可写映射、改首字母、`sync(MS_SYNC)`、`unmap`，
+再从磁盘读回 `Hello world`；「walk」在临时目录里搭 `a.txt` + `sub/b.txt`，
+`walk_stat` 数出 2 文件 1 目录 7 字节，`max_depth = 1` 只看直属条目，
+最后 `remove_tree` 删干净；「lock」`fork` 一个子进程持排他锁 250ms，父进程
+先 `try_acquire` 拿到 0（忙）、`acquire(…, 60)` 超时、`acquire(…, 2000)` 等到
+子进程退出后拿到。Makefile 里显式列出十一个模块正文（walk 要 fs/path/str/err，
+lock 要 time，temp 只借 Str 类型）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2986,6 +3026,8 @@ hkdf 要 sha256，pbkdf2 要 sha1+sha256）。
   示例（自带自检）。
 * `make std-crypto`：`examples/stdcrypto.c6`，第二十三批（摘要与密钥派生）模块的
   拼装示例（自带自检）。
+* `make std-fsx`：`examples/stdfsx.c6`，第二十四批（文件系统进阶）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -3016,6 +3058,12 @@ hkdf 要 sha256，pbkdf2 要 sha1+sha256）。
   跨块且末尾半块的扩展。
 * `std/encoding/pbkdf2.c6` 的「iters=1 等于一次 HMAC」：把 PBKDF2 的块公式和
   `hmac_sha1` 对上，钉住 `INT(i)` 的大端编码。
+* `std/os/walk.c6` 的「max_depth 与跳过子树」：0 层一个不访问、1 层只访问直属
+  条目、目录回调返回 0 时整棵子树被跳过（目录自己仍被回调一次）。
+* `std/os/lock.c6` 的「跨进程互斥」：同一进程两个句柄**不**冲突（fcntl 锁按
+  进程合并），子进程持有的排他锁才会挡住父进程；短超时返回 0、长等待拿到。
+* `std/os/mmap.c6` 的「读写映射落盘」：`write_at` 改首字节、`sync(MS_SYNC)`、
+  `unmap` 之后从磁盘读回；匿名映射 `sync` 返回 0、长度 0 是坏映射。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，

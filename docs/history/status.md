@@ -1135,3 +1135,27 @@ hkdf（sha256+bits+err）、pbkdf2（sha1+sha256+bits+err）。示例
 
 验收：`make stdtest`（105 个模块、0 failure）、`make std-crypto`（28 条自检全过）、
 `make check-all`。
+
+### 11.36 标准库第二十四批（walk / temp / lock / mmap）
+
+第二十四批补的是**文件系统进阶**：`std.os.fs` 已经给了 `stat`/`mkdir`/单层
+`Dir`，但「遍历整棵树」「安全地拿临时名字」「多个进程协调同一个文件」「大文件
+不整块读进堆」还缺。四个模块都是 POSIX 薄封装、零分配：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.os.walk` | 目录树遍历/统计/删除 | 在 `Dir` 上做深度优先递归，路径拼在 512 字节栈缓冲、递归上限 32 层；`max_depth` 定义成「最多访问到第几层」（1 = 只访问 root 的直属条目），回调返回 0 只对目录有意义（跳过子树）；`remove_tree` 后序删，符号链接只删链接本身 |
+| `std.os.temp` | 临时文件与目录 | 只包 `mkstemp`/`mkdtemp`，不自己拼随机名（那是竞态和可预测名字的来源）；目录空时按 `$TMPDIR` → `/tmp`；文件 0600、`FD_CLOEXEC`，**不自动删除**（要删显式 `remove`），前缀里的 `/` 直接拒 |
+| `std.os.lock` | 建议锁 | 只做整文件 `fcntl` 记录锁，不做区间锁；`acquire` 用 1/0/-1 区分「拿到/超时/出错」，`wait_ms < 0` 走 `F_SETLKW`、`>0` 按 5ms 重试；文档把「fcntl 锁按进程合并、子进程不继承、close 会释放该文件所有锁」三个坑写在最前面 |
+| `std.os.mmap` | 文件/匿名映射 | `map_file` 映射整个文件（可写 `MAP_SHARED`、只读 `MAP_PRIVATE`），空文件直接给坏映射（`mmap` 不接受长度 0）；`read_at`/`write_at` 做边界检查，`data()` 不检查（和 C 指针一致）；匿名映射 `sync` 返回 0（没有盘可刷） |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.os.walk`=0x6069、
+`std.os.temp`=0x606a、`std.os.lock`=0x606b、`std.os.mmap`=0x606c；`grammar.md`
+§8.1 的表同步。`Makefile` 增加 `std-fsx` 与 `STDFSX_SRCS`，`test-all`/`check-all`
+都带上它；`stdtest` 的依赖表补上 walk（fs/path/str/err）与 lock（time），
+temp/mmap 自成一体（temp 只借 `Str` 类型）。示例 `examples/stdfsx.c6` 把四节
+串成「临时文件 → 就地改字节 → 扫目录 → 跨进程抢锁」，全程只碰系统临时目录和
+`build/`。
+
+验收：`make stdtest`（109 个模块、0 failure）、`make std-fsx`（33 条自检全过）、
+`make check-all`。

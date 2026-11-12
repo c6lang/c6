@@ -47,6 +47,18 @@
 
 ### 标准库
 
+- **标准库第二十四批（文件系统进阶）**：`std.os.walk` / `std.os.temp` /
+  `std.os.lock` / `std.os.mmap` 四个模块，集成示例 `examples/stdfsx.c6`
+  （`make std-fsx`）。walk 把 `std.os.fs` 的单层 `Dir` 包成整棵树
+  （`walk`/`walk_stat` 带深度/符号链接/目录回调选项与文件/目录/字节计数，
+  回调返回 0 跳过子树，`remove_tree` 后序删除）；temp 是 `mkstemp`/`mkdtemp`
+  的安全封装（`temp_file`/`temp_file_named`/`temp_dir`，0600 + `FD_CLOEXEC`，
+  不自动删除）；lock 是 `fcntl` 建议锁（`acquire` 的阻塞/非阻塞/超时三态、
+  同一进程两个句柄不冲突、跨进程才互斥）；mmap 做文件与匿名映射
+  （`map_file` 可写走 `MAP_SHARED`、`map_anon` 清零、`sync`/`read_at`/`write_at`
+  带边界检查、`unmap` 可重复）。错误号段 `std.os.walk`=0x6069 …
+  `std.os.mmap`=0x606c（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第二十三批（消息摘要与密钥派生）**：`std.encoding.md5` /
   `std.encoding.sha512` / `std.encoding.hkdf` / `std.encoding.pbkdf2` 四个模块，
   集成示例 `examples/stdcrypto.c6`（`make std-crypto`）。md5 是兼容用的校验和

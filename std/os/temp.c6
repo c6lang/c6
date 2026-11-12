@@ -1,0 +1,328 @@
+/* std/os/temp：临时文件与临时目录（mkstemp / mkdtemp 的薄封装）。
+ *
+ *     import std.os.temp;
+ *
+ *     TempFile f = temp_file(0);            // 系统临时目录（$TMPDIR 或 /tmp）
+ *     if (f.ok()) {
+ *         f.write_all("hello", 5);
+ *         printf("%s\n", f.path().s.data);
+ *         f.remove();                       // 关 fd + unlink
+ *     }
+ *
+ *     char dir[TEMP_PATH_MAX] = { 0 };
+ *     if (temp_dir(dir, (int)sizeof dir) == 1) { ... }
+ *
+ * 这一层只做「安全地拿到一个没人用过的名字」：`mkstemp`/`mkdtemp` 在 libc 里
+ * 已经是原子创建（`O_CREAT|O_EXCL`、0600），不要自己拼 `rand()` 名字——那是
+ * 竞态和可预测名字的经典来源。仍然零分配：路径拼在调用方缓冲或结构体的
+ * 512 字节字段里。
+ *
+ * 约定：
+ *
+ * - `temp_file(dir)` 的 `dir` 为 0 或空串时用系统临时目录（`$TMPDIR`，没有就
+ *   `/tmp`）；目录不存在或不可写时返回 `ok() == 0` 的 `TempFile`（`fd == -1`）；
+ * - `temp_file_named(dir, prefix)` 的前缀为空时用 `c6-`；前缀里的 `/` 会被拒
+ *   （避免拼出别的目录）；
+ * - 临时文件创建后**不会**自动删除：要删调 `remove()`（关 fd + unlink），
+ *   要保留调 `close_file()`（只关 fd）；进程退出时内核关 fd，但文件会留下；
+ * - `temp_dir` 创建的是 0700 目录，同样不自动删；`temp_dir` 返回 1 成功、
+ *   0 放不下、-1 失败；
+ * - `path()` 给的是视图，指向结构体里的字段；`fd()` 是原始 fd（可以 dup/传给
+ *   子进程，注意本模块创建的 fd 带 `FD_CLOEXEC`）。
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+
+module std.os.temp;
+import std.core.types;
+import std.text.str;
+
+#define TEMP_PATH_MAX 512
+#define TEMP_NAME_MAX 64
+
+struct TempFile {
+    char name[TEMP_PATH_MAX];
+    int handle;
+};
+
+TempFile temp_bad(void)
+{
+    TempFile t = { { 0 }, -1 };
+
+    return t;
+}
+
+int ok(TempFile *self)
+{
+    return self && self->handle >= 0 && self->name[0] != 0;
+}
+
+Str path(TempFile *self)
+{
+    Str s = { { (char *)0, 0 } };
+
+    if (!self)
+        return s;
+    return (Str){ (char[:]){ self->name, (int)strlen(self->name) } };
+}
+
+int fd(TempFile *self) { return self ? self->handle : -1; }
+
+/* 系统临时目录：$TMPDIR 优先，其次 /tmp */
+static char *temp_home(void)
+{
+    char *p = getenv("TMPDIR");
+
+    if (p && *p)
+        return p;
+    return (char *)"/tmp";
+}
+
+static int temp_join(char *dir, char *prefix, char *out, int cap)
+{
+    char *base = dir;
+    int dl = 0, pl = 0;
+
+    if (!out || cap <= 0)
+        return 0;
+    if (!base || !*base)
+        base = temp_home();
+    if (!prefix || !*prefix)
+        prefix = (char *)"c6-";
+    dl = (int)strlen(base);
+    pl = (int)strlen(prefix);
+    if (dl + pl + 8 > cap || pl >= TEMP_NAME_MAX || strchr(prefix, '/'))
+        return 0;
+    memcpy(out, base, (size_t)dl);
+    if (dl > 0 && base[dl - 1] != '/')
+        out[dl++] = '/';
+    memcpy(out + dl, prefix, (size_t)pl);
+    memcpy(out + dl + pl, "XXXXXX", 6);
+    out[dl + pl + 6] = 0;
+    return 1;
+}
+
+/* 带前缀的临时文件（`dir` 为空用系统临时目录） */
+TempFile temp_file_named(char *dir, char *prefix)
+{
+    TempFile t = { { 0 }, -1 };
+    int f = -1;
+
+    if (!temp_join(dir, prefix, t.name, (int)sizeof t.name))
+        return temp_bad();
+    f = mkstemp(t.name);
+    if (f < 0) {
+        t.name[0] = 0;
+        return temp_bad();
+    }
+    fcntl(f, F_SETFD, FD_CLOEXEC);      /* 别漏给子进程 */
+    t.handle = f;
+    return t;
+}
+
+TempFile temp_file(char *dir) { return temp_file_named(dir, (char *)"c6-"); }
+
+/* 临时目录（mkdtemp，0700）：1 成功 / 0 放不下 / -1 失败 */
+int temp_dir_in(char *dir, char *out, int cap)
+{
+    char tmpl[TEMP_PATH_MAX] = { 0 };
+
+    if (!out || cap <= 0)
+        return -1;
+    if (!temp_join(dir, (char *)"c6-dir-", tmpl, (int)sizeof tmpl))
+        return 0;
+    if (!mkdtemp(tmpl))
+        return -1;
+    if ((int)strlen(tmpl) + 1 > cap) {
+        rmdir(tmpl);                    /* 放不下就把刚建的目录收掉 */
+        return 0;
+    }
+    memcpy(out, tmpl, strlen(tmpl) + 1);
+    return 1;
+}
+
+int temp_dir(char *out, int cap) { return temp_dir_in(0, out, cap); }
+
+/* 写一段：1 成功 / -1 失败（内部重试 EINTR，短写会继续） */
+int write_all(TempFile *self, const void *p, int n)
+{
+    const char *b = (const char *)p;
+    int done = 0;
+
+    if (!self || self->handle < 0 || n < 0)
+        return -1;
+    if (!b)
+        return -1;
+    while (done < n) {
+        ssize_t w = write(self->handle, b + done, (size_t)(n - done));
+
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (w == 0)
+            return -1;
+        done += (int)w;
+    }
+    return 1;
+}
+
+void close_file(TempFile *self)
+{
+    if (!self)
+        return;
+    if (self->handle >= 0)
+        close(self->handle);
+    self->handle = -1;
+}
+
+/* 关 fd + unlink：1 删掉 / 0 文件本来就不在 / -1 失败 */
+int remove(TempFile *self)
+{
+    int rc = 0;
+
+    if (!self || self->name[0] == 0)
+        return -1;
+    close_file(self);
+    if (unlink(self->name) == 0)
+        return 1;
+    rc = errno == ENOENT ? 0 : -1;
+    if (rc == 0)
+        self->name[0] = 0;
+    return rc;
+}
+
+/* ---- 自测 ---- */
+
+static int file_exists(char *p)
+{
+    return access(p, F_OK) == 0;
+}
+
+static int file_text(char *p, char *dst, int cap)
+{
+    FILE *f = fopen(p, "rb");
+    int n = 0;
+
+    if (!f)
+        return -1;
+    n = (int)fread(dst, 1, (size_t)cap - 1, f);
+    fclose(f);
+    dst[n > 0 ? n : 0] = 0;
+    return n;
+}
+
+test "临时文件的创建、写入与删除" {
+    TempFile f = temp_file(0);
+    TempFile g = { { 0 }, -1 };
+    char body[64] = { 0 };
+    char keep[512] = { 0 };
+
+    if (!f.ok() || f.fd() < 0)
+        return err(1, "temp_file 失败");
+    if (strstr(f.path().s.data, "c6-") == 0)
+        return err(2, "默认前缀不对");
+    if (!file_exists(f.path().s.data))
+        return err(3, "临时文件应该已创建");
+    if (f.write_all("hello", 5) != 1)
+        return err(4, "write_all 失败");
+    if (file_text(f.path().s.data, body, (int)sizeof body) != 5
+        || strcmp(body, "hello") != 0)
+        return err(5, "写入内容不对");
+    /* close 只关 fd，文件留下 */
+    memcpy(keep, f.path().s.data, strlen(f.path().s.data) + 1);
+    f.close_file();
+    if (f.fd() != -1 || !file_exists(keep))
+        return err(6, "close 不该删文件");
+    if (unlink(keep) != 0)
+        return err(7, "清理失败");
+    /* remove 会关 + 删；第二次 remove 返回 0 */
+    g = temp_file_named(0, (char *)"pfx-");
+    if (!g.ok() || strstr(g.path().s.data, "pfx-") == 0)
+        return err(8, "自定义前缀不对");
+    if (g.remove() != 1)
+        return err(9, "remove 失败");
+    if (file_exists(g.path().s.data) && g.path().s.len > 0)
+        return err(10, "remove 之后文件不该存在");
+    if (g.remove() != 0)
+        return err(11, "重复 remove 应该是 0");
+    if (temp_file(0).ok() == 0)
+        return err(12, "还能继续创建临时文件");
+}
+
+test "唯一性、坏目录与临时目录" {
+    TempFile a = temp_file(0);
+    TempFile b = temp_file(0);
+    TempFile bad = { { 0 }, -1 };
+    char dir[512] = { 0 };
+    char inside[600] = { 0 };
+    char body[16] = { 0 };
+
+    if (!a.ok() || !b.ok())
+        return err(13, "连续创建失败");
+    if (strcmp(a.path().s.data, b.path().s.data) == 0)
+        return err(14, "两个临时文件不该同名");
+    /* 坏目录：创建失败，fd = -1、名字为空、ok = 0 */
+    bad = temp_file((char *)"build/temp-nope-dir");
+    if (bad.ok() || bad.fd() != -1 || bad.path().s.len != 0)
+        return err(15, "不存在的目录应该失败");
+    if (bad.remove() != -1)
+        return err(16, "失败句柄 remove 应该 -1");
+    /* 前缀里有 / 被拒 */
+    if (temp_file_named(0, (char *)"a/b").ok())
+        return err(17, "前缀里的 / 应该被拒");
+    /* 空指针参数 */
+    if (temp_dir(0, 16) != -1 || temp_dir(dir, 0) != -1)
+        return err(18, "空参数应该 -1");
+    /* 临时目录 + 里面的文件 */
+    if (temp_dir(dir, (int)sizeof dir) != 1)
+        return err(19, "temp_dir 失败");
+    if (!file_exists(dir))
+        return err(20, "临时目录应该已创建");
+    snprintf(inside, sizeof inside, "%s/x.txt", dir);
+    {
+        FILE *fp = fopen(inside, "wb");
+
+        if (!fp)
+            return err(21, "临时目录不可写");
+        fwrite("ok", 1, 2, fp);
+        fclose(fp);
+    }
+    if (file_text(inside, body, (int)sizeof body) != 2 || strcmp(body, "ok") != 0)
+        return err(22, "临时目录里的文件读写不对");
+    unlink(inside);
+    if (rmdir(dir) != 0)
+        return err(23, "清理临时目录失败");
+    /* 输出缓冲太小：目录不该留下 */
+    if (temp_dir(dir, 4) != 0)
+        return err(24, "缓冲太小应该返回 0");
+    a.remove();
+    b.remove();
+}
+
+test "路径拼接与 TMPDIR" {
+    char dir[512] = { 0 };
+    char *old = getenv("TMPDIR");
+    char save[512] = { 0 };
+
+    if (old) {
+        memcpy(save, old, strlen(old) + 1);
+    }
+    mkdir("build", 0755);
+    if (setenv("TMPDIR", "build", 1) != 0)
+        return err(25, "setenv 失败");
+    if (temp_dir(dir, (int)sizeof dir) != 1 || strstr(dir, "build/c6-dir-") == 0)
+        return err(26, "TMPDIR 没被采用");
+    rmdir(dir);
+    if (old)
+        setenv("TMPDIR", save, 1);
+    else
+        unsetenv("TMPDIR");
+}

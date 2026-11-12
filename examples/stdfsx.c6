@@ -1,0 +1,228 @@
+/* stdfsx：标准库第二十四批（walk / temp / lock / mmap）的拼装示例。
+ *
+ * 和前面几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 各节自带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这批是**文件系统进阶**：`std.os.walk` 遍历/删树、`std.os.temp` 安全地拿
+ * 临时名字、`std.os.lock` 建议锁、`std.os.mmap` 文件/匿名映射。示例把它们
+ * 串成一个「就地改一个大文件，再扫一遍目录」的小流程：
+ *
+ *   1. temp：建临时文件写内容、建临时目录；
+ *   2. mmap：匿名映射填 4 KiB、文件映射就地改字节并 sync 回盘；
+ *   3. walk：在临时目录里搭一棵树，统计文件/目录/字节，再 remove_tree；
+ *   4. lock：fork 一个子进程持锁，父进程先试（忙）再等（拿到）。
+ *
+ * 全程只碰系统临时目录和 `build/`，所以 `make std-fsx` 不依赖外部输入。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdfsx \
+ *         examples/stdfsx.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/os/walk.c6 std/os/temp.c6 std/os/lock.c6 std/os/mmap.c6 \
+ *         std/os/fs.c6 std/os/path.c6 std/os/time.c6 std/text/str.c6
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+import std.core.types;
+import std.os.walk;
+import std.os.temp;
+import std.os.lock;
+import std.os.mmap;
+import std.os.fs;
+import std.os.time;
+import std.text.str;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static void put_text(char *path, char *text)
+{
+    FILE *f = fopen(path, "wb");
+
+    if (f) {
+        fwrite(text, 1, strlen(text), f);
+        fclose(f);
+    }
+}
+
+static int get_text(char *path, char *dst, int cap)
+{
+    FILE *f = fopen(path, "rb");
+    int n = 0;
+
+    if (!f)
+        return -1;
+    n = (int)fread(dst, 1, (size_t)cap - 1, f);
+    fclose(f);
+    dst[n > 0 ? n : 0] = 0;
+    return n;
+}
+
+/* 1) temp：临时文件写入、临时目录 */
+static void tour_temp(void)
+{
+    TempFile f = temp_file(0);
+    char body[64] = { 0 };
+    char dir[TEMP_PATH_MAX] = { 0 };
+
+    check(f.ok(), "temp: 建临时文件");
+    check(f.write_all("abcdef", 6) == 1, "temp: 写入");
+    check(get_text(f.path().s.data, body, (int)sizeof body) == 6
+              && strcmp(body, "abcdef") == 0,
+          "temp: 回读内容");
+    check(f.remove() == 1, "temp: 删除");
+    check(f.remove() == 0, "temp: 重复删除给 0");
+    check(temp_dir(dir, (int)sizeof dir) == 1, "temp: 建临时目录");
+    check(dir[0] == '/' && strstr(dir, "c6-dir-") != 0, "temp: 目录名");
+    printf("temp: 临时文件/目录都建在系统临时目录下\n");
+    rmdir(dir);
+}
+
+/* 2) mmap：匿名映射 + 文件映射就地改字节 */
+static void tour_mmap(void)
+{
+    Map a = map_anon(4096);
+    Map m = { 0 };
+    TempFile f = temp_file(0);
+    char body[32] = { 0 };
+    u8 *p = 0;
+    int i = 0, zero = 1;
+
+    check(a.ok() && a.size() == 4096, "mmap: 匿名映射 4 KiB");
+    p = a.data();
+    for (i = 0; i < 4096; i++)
+        if (p[i] != 0)
+            zero = 0;
+    check(zero, "mmap: 匿名映射是清零的");
+    for (i = 0; i < 16; i++)
+        p[i] = (u8)('a' + i);
+    check(a.read_at(0, body, 8) == 1 && body[0] == 'a' && body[7] == 'h',
+          "mmap: 匿名映射读写");
+    check(a.sync(1) == 0, "mmap: 匿名映射没有盘可刷");
+    a.unmap();
+    /* 文件映射：写内容 -> 映射可写 -> 改首字节 -> sync -> 回读 */
+    check(f.ok(), "mmap: 临时文件");
+    f.write_all("hello world", 11);
+    m = map_file(f.path().s.data, 1);
+    check(m.ok() && m.size() == 11 && m.can_write(), "mmap: 文件映射可写");
+    check(m.write_at(0, "H", 1) == 1, "mmap: write_at");
+    check(m.sync(1) == 1, "mmap: msync(MS_SYNC)");
+    m.unmap();
+    check(get_text(f.path().s.data, body, (int)sizeof body) == 11
+              && strcmp(body, "Hello world") == 0,
+          "mmap: 改动能落盘");
+    check(m.ok() == 0 && m.data() == 0, "mmap: unmap 之后无效");
+    f.remove();
+    printf("mmap: anon 4 KiB 清零、文件映射改字节并 sync 回盘\n");
+}
+
+/* 3) walk：搭树 -> 统计 -> 删树 */
+static int walk_hits = 0;
+
+static int count_fn(char *path, StatInfo *si, int depth, void *ud)
+{
+    (void)path;
+    (void)si;
+    (void)depth;
+    (void)ud;
+    walk_hits++;
+    return 1;
+}
+
+static void tour_walk(void)
+{
+    char root[TEMP_PATH_MAX] = { 0 };
+    char sub[TEMP_PATH_MAX] = { 0 };
+    char file[TEMP_PATH_MAX] = { 0 };
+    WalkStats st = { 0 };
+
+    check(temp_dir(root, (int)sizeof root) == 1, "walk: 临时根目录");
+    snprintf(sub, sizeof sub, "%s/sub", root);
+    mkdir(sub, 0755);
+    snprintf(file, sizeof file, "%s/a.txt", root);
+    put_text(file, "aaa");
+    snprintf(file, sizeof file, "%s/sub/b.txt", root);
+    put_text(file, "bbbb");
+    check(walk_stat(root, walk_default(), &st) == 1, "walk: walk_stat");
+    check(st.files == 2 && st.dirs == 1 && st.bytes == 7,
+          "walk: 文件/目录/字节计数");
+    walk_hits = 0;
+    check(walk(root, walk_default(), count_fn, 0) == 1, "walk: 遍历");
+    check(walk_hits == 2, "walk: 回调了 2 个文件");
+    {
+        WalkOpts o = walk_default();
+
+        o.max_depth = 1;
+        memset(&st, 0, sizeof st);
+        check(walk_stat(root, o, &st) == 1 && st.files == 1 && st.dirs == 1
+                  && st.bytes == 3,
+              "walk: max_depth=1 只看直属条目");
+    }
+    check(remove_tree(root) == 1, "walk: remove_tree");
+    check(walk_stat(root, walk_default(), &st) == -1, "walk: 删完不存在");
+    printf("walk: 2 文件 1 目录 7 字节，max_depth 与删树都对\n");
+}
+
+/* 4) lock：子进程持锁，父进程先试后等 */
+static void tour_lock(void)
+{
+    char path[64] = { 0 };
+    FileLock lk = { 0 };
+    pid_t pid = 0;
+    int st = 0;
+
+    snprintf(path, sizeof path, "build/std-fsx-%d.lock", (int)getpid());
+    mkdir("build", 0755);
+    lk = lock_open(path);
+    check(lk.ok(), "lock: 打开锁文件");
+    check(lk.try_acquire(1) == 1, "lock: 先拿一次排他锁");
+    check(lk.release() == 1, "lock: 释放");
+    pid = fork();
+    if (pid == 0) {
+        FileLock c = lock_open(path);
+
+        if (!c.ok() || c.try_acquire(1) != 1)
+            _exit(2);
+        sleep_ms(250);
+        c.close_file();
+        _exit(0);
+    }
+    check(pid > 0, "lock: fork");
+    if (pid > 0) {
+        sleep_ms(80);
+        check(lk.try_acquire(1) == 0, "lock: 子进程持锁时父进程忙");
+        check(lk.acquire(1, 60) == 0, "lock: 短超时返回 0");
+        check(lk.acquire(1, 2000) == 1, "lock: 等子进程退出后拿到");
+        lk.release();
+        waitpid(pid, &st, 0);
+        check(st == 0, "lock: 子进程正常退出");
+    }
+    lk.close_file();
+    unlink(path);
+    printf("lock: 跨进程互斥、超时与等待都对\n");
+}
+
+int main(void)
+{
+    printf("stdfsx: 标准库第二十四批（walk / temp / lock / mmap）\n");
+    tour_temp();
+    tour_mmap();
+    tour_walk();
+    tour_lock();
+    printf("stdfsx: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

@@ -1,0 +1,313 @@
+/* std/os/mmap：文件映射与匿名映射（`mmap(2)` 的薄封装）。
+ *
+ *     import std.os.mmap;
+ *
+ *     Map m = map_file("data.bin", 1);       // 可写：MAP_SHARED
+ *     if (m.ok()) {
+ *         u8 *p = m.data();
+ *         p[0] = 'X';
+ *         m.sync(1);                         // msync(MS_SYNC)
+ *         m.unmap();
+ *     }
+ *
+ *     Map a = map_anon(4096);                // 匿名、清零、MAP_PRIVATE
+ *     a.write_at(0, "hi", 2);                // 带边界检查的辅助入口
+ *
+ * 这一层只做「把文件/一段匿名内存变成可以按字节访问的指针」：没有缓冲区、
+ * 没有拷贝、没有分配。大文件按需换页，读文件时不用先 `read` 到堆里。
+ *
+ * 约定：
+ *
+ * - `map_file(path, writable)` 映射**整个文件**：`writable != 0` 用 `O_RDWR` +
+ *   `MAP_SHARED`（写回文件），否则 `O_RDONLY` + `MAP_PRIVATE`；空文件
+ *   （`mmap` 不接受长度 0）、不存在的文件、目录都会得到 `ok() == 0` 的坏映射；
+ * - `map_anon(len)` 是 `MAP_PRIVATE|MAP_ANONYMOUS`、清零，`len == 0` 也是坏映射；
+ * - 映射的指针在 `unmap()` 之前有效；`unmap` 之后 `data()` 给 0、`size()` 给 0，
+ *   重复 `unmap` 是安全的；
+ * - `sync(synchronous)`：文件映射走 `msync(MS_SYNC/MS_ASYNC)`，匿名映射没有
+ *   后备文件，直接返回 0（没有东西要同步）；
+ * - `read_at`/`write_at` 做边界检查（`off + n <= size`），越界返回 -1 且不碰
+ *   内存；`data()` 不做检查，越界访问是调用方的事（和 C 指针一致）；
+ * - 写映射的可见性依赖 `msync`：`MS_ASYNC` 只保证「迟早」，`MS_SYNC` 返回时
+ *   已经落盘；`unmap` 也会隐式刷，但错误拿不到（所以重要数据要显式 `sync`）。
+ */
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+module std.os.mmap;
+import std.core.types;
+
+struct Map {
+    void *addr;
+    usize len;
+    int handle;     /* 文件映射的 fd；匿名映射是 -1 */
+    int writable;
+    int anon;
+};
+
+Map map_bad(void)
+{
+    Map m = { 0, 0, -1, 0, 0 };
+
+    return m;
+}
+
+int ok(Map *self) { return self && self->addr && self->len > 0; }
+
+/* 映射的起点；坏映射/已 unmap 给 0 */
+u8 *data(Map *self)
+{
+    if (!ok(self))
+        return 0;
+    return (u8 *)self->addr;
+}
+
+usize size(Map *self) { return self ? self->len : 0; }
+
+int can_write(Map *self) { return self && self->writable; }
+
+int is_anon(Map *self) { return self && self->anon; }
+
+int fd(Map *self) { return self ? self->handle : -1; }
+
+/* 整个文件映射：`writable` 决定只读/读写（见文件头） */
+Map map_file(char *path, int writable)
+{
+    Map m = map_bad();
+    struct stat st = { 0 };
+    int f = -1, flags = 0, prot = 0;
+
+    if (!path || !*path)
+        return m;
+    f = open(path, writable ? O_RDWR : O_RDONLY);
+    if (f < 0)
+        return m;
+    if (fstat(f, &st) != 0 || st.st_size <= 0) {
+        close(f);
+        return m;
+    }
+    prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+    flags = writable ? MAP_SHARED : MAP_PRIVATE;
+    m.addr = mmap(0, (size_t)st.st_size, prot, flags, f, 0);
+    if (m.addr == MAP_FAILED) {
+        close(f);
+        return map_bad();
+    }
+    fcntl(f, F_SETFD, FD_CLOEXEC);
+    m.len = (usize)st.st_size;
+    m.handle = f;
+    m.writable = writable ? 1 : 0;
+    m.anon = 0;
+    return m;
+}
+
+/* 匿名映射（清零、私有）：`len == 0` 给坏映射 */
+Map map_anon(usize len)
+{
+    Map m = map_bad();
+
+    if (len == 0)
+        return m;
+    m.addr = mmap(0, (size_t)len, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m.addr == MAP_FAILED)
+        return map_bad();
+    m.len = len;
+    m.handle = -1;
+    m.writable = 1;
+    m.anon = 1;
+    return m;
+}
+
+/* 刷回磁盘：文件映射 1 / 匿名映射 0（没有后备）/ -1 出错 */
+int sync(Map *self, int synchronous)
+{
+    if (!ok(self))
+        return -1;
+    if (self->anon)
+        return 0;
+    if (msync(self->addr, (size_t)self->len,
+              synchronous ? MS_SYNC : MS_ASYNC)
+        != 0)
+        return -1;
+    return 1;
+}
+
+/* 带边界检查的读：1 成功 / -1 越界或参数错 */
+int read_at(Map *self, usize off, void *dst, usize n)
+{
+    if (!ok(self) || !dst)
+        return -1;
+    if (off > self->len || n > self->len - off)
+        return -1;
+    if (n > 0)
+        memcpy(dst, (const u8 *)self->addr + off, (size_t)n);
+    return 1;
+}
+
+/* 带边界检查的写：1 成功 / -1 越界、只读或参数错 */
+int write_at(Map *self, usize off, const void *src, usize n)
+{
+    if (!ok(self) || !self->writable || !src)
+        return -1;
+    if (off > self->len || n > self->len - off)
+        return -1;
+    if (n > 0)
+        memcpy((u8 *)self->addr + off, src, (size_t)n);
+    return 1;
+}
+
+/* 解除映射并关 fd：可重复调用 */
+void unmap(Map *self)
+{
+    if (!self)
+        return;
+    if (self->addr && self->len > 0)
+        munmap(self->addr, (size_t)self->len);
+    if (self->handle >= 0)
+        close(self->handle);
+    self->addr = 0;
+    self->len = 0;
+    self->handle = -1;
+    self->writable = 0;
+    self->anon = 0;
+}
+
+/* ---- 自测 ---- */
+
+#include <stdio.h>
+#include <sys/types.h>
+
+static char *mmap_file(void) { return (char *)"build/mmap-test.bin"; }
+
+static void put_text(char *path, char *text)
+{
+    FILE *f = fopen(path, "wb");
+
+    if (f) {
+        fwrite(text, 1, strlen(text), f);
+        fclose(f);
+    }
+}
+
+static int read_text(char *path, char *dst, int cap)
+{
+    FILE *f = fopen(path, "rb");
+    int n = 0;
+
+    if (!f)
+        return -1;
+    n = (int)fread(dst, 1, (size_t)cap - 1, f);
+    fclose(f);
+    dst[n > 0 ? n : 0] = 0;
+    return n;
+}
+
+test "文件映射：只读、读写、sync 与 unmap" {
+    char body[64] = { 0 };
+    Map ro = map_bad(), rw = map_bad();
+    u8 first = 0;
+
+    mkdir("build", 0755);
+    put_text(mmap_file(), "hello world");
+    ro = map_file(mmap_file(), 0);
+    if (!ro.ok() || ro.size() != 11 || ro.can_write() || ro.is_anon())
+        return err(1, "只读映射的字段不对");
+    if (ro.data()[0] != 'h' || ro.data()[10] != 'd')
+        return err(2, "只读映射的内容不对");
+    if (ro.read_at(6, &first, 1) != 1 || first != 'w')
+        return err(3, "read_at 不对");
+    if (ro.write_at(0, "H", 1) != -1)
+        return err(4, "只读映射不该允许 write_at");
+    if (ro.sync(1) != 1)
+        return err(5, "只读映射 sync 失败");
+    ro.unmap();
+    if (ro.ok() || ro.data() != 0 || ro.size() != 0)
+        return err(6, "unmap 之后应该无效");
+    ro.unmap();                 /* 重复 unmap 安全 */
+    /* 读写映射：改一个字节并同步回文件 */
+    rw = map_file(mmap_file(), 1);
+    if (!rw.ok() || !rw.can_write() || rw.size() != 11)
+        return err(7, "读写映射的字段不对");
+    if (rw.write_at(0, "H", 1) != 1)
+        return err(8, "write_at 失败");
+    rw.data()[6] = 'W';
+    if (rw.sync(1) != 1)
+        return err(9, "sync 失败");
+    rw.unmap();
+    if (read_text(mmap_file(), body, (int)sizeof body) != 11)
+        return err(10, "回读失败");
+    if (strcmp(body, "Hello World") != 0)
+        return err(11, "写映射没有落盘");
+    /* 越界检查 */
+    rw = map_file(mmap_file(), 0);
+    if (rw.read_at(11, &first, 0) != 1 || rw.read_at(12, &first, 0) != -1)
+        return err(12, "read_at 的边界不对");
+    if (rw.read_at(0, &first, 12) != -1)
+        return err(13, "read_at 超长应该 -1");
+    if (rw.read_at(0, 0, 1) != -1 || rw.write_at(0, "x", 1) != -1)
+        return err(14, "空指针/只读写应该 -1");
+    rw.unmap();
+    unlink(mmap_file());
+}
+
+test "匿名映射、清零与错误路径" {
+    Map a = map_bad(), b = map_bad();
+    u8 *p = 0;
+    int i = 0, zero = 1;
+    char tiny[8] = { 0 };
+
+    a = map_anon(4096);
+    if (!a.ok() || a.size() != 4096 || !a.can_write() || !a.is_anon()
+        || a.fd() != -1)
+        return err(15, "匿名映射字段不对");
+    p = a.data();
+    if (!p)
+        return err(16, "匿名映射没有指针");
+    for (i = 0; i < 4096; i++)
+        if (p[i] != 0)
+            zero = 0;
+    if (!zero)
+        return err(17, "匿名映射应该清零");
+    for (i = 0; i < 16; i++)
+        p[i] = (u8)('a' + i);
+    if (a.read_at(0, tiny, 8) != 1 || tiny[0] != 'a' || tiny[7] != 'h')
+        return err(18, "匿名映射读写不对");
+    if (a.sync(1) != 0)
+        return err(19, "匿名映射 sync 应该返回 0");
+    a.unmap();
+    /* 两块匿名映射互不影响 */
+    a = map_anon(64);
+    b = map_anon(64);
+    if (!a.ok() || !b.ok() || a.data() == b.data())
+        return err(20, "两块匿名映射不该重叠");
+    a.write_at(0, "x", 1);
+    if (b.data()[0] != 0)
+        return err(21, "写一块不该影响另一块");
+    a.unmap();
+    b.unmap();
+    /* 错误路径 */
+    if (map_anon(0).ok())
+        return err(22, "长度 0 应该是坏映射");
+    if (map_file(0, 0).ok() || map_file((char *)"", 0).ok())
+        return err(23, "空路径应该是坏映射");
+    if (map_file((char *)"build/mmap-nope.bin", 0).ok())
+        return err(24, "不存在的文件应该是坏映射");
+    put_text((char *)"build/mmap-empty.bin", "");
+    if (map_file((char *)"build/mmap-empty.bin", 0).ok())
+        return err(25, "空文件应该是坏映射");
+    unlink("build/mmap-empty.bin");
+    {
+        Map bad = map_bad();
+
+        if (bad.ok() || bad.data() != 0 || bad.size() != 0
+            || bad.fd() != -1 || bad.sync(1) != -1
+            || bad.read_at(0, tiny, 1) != -1)
+            return err(26, "坏映射的入口不对");
+        bad.unmap();
+    }
+}

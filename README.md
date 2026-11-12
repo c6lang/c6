@@ -217,7 +217,7 @@ std/container/              容器与算法：向量、位集合、跨度、映�
   std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
   std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 
-std/os/                     操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程、同步原语、线程池、终端、信号、管道、多路复用
+std/os/                     操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、同步原语、线程池、终端、信号、管道、多路复用、临时文件、文件锁、内存映射
   std/os/env.c6             std.os.env             环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
   std/os/fs.c6              std.os.fs              stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
   std/os/io.c6              std.os.io              Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代，方法调用写 pr->read_line(...)
@@ -231,6 +231,10 @@ std/os/                     操作系统：流、文件系统、路径、环境�
   std/os/pipe.c6            std.os.pipe            匿名管道（零分配）：init/init_nonblock、read_bytes（0=EOF）/read_exact、write_bytes（返回实际字节数）、set_nonblock、close_read/close_write/close_all、would_block；重试 EINTR、fd 带 FD_CLOEXEC
   std/os/poll.c6            std.os.poll            多路等待（poll(2)）：PollSet（32 槽、零分配）的 add/modify/remove_fd/find/count/wait（返回就绪个数）/is_ready/ready/fd_at，单 fd 的 wait_readable/wait_writable/wait_any（1/0/-1）；EVENT_READ/WRITE/HUP/ERROR
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
+  std/os/walk.c6            std.os.walk            目录树遍历与删除：walk/walk_stat（WalkOpts 的 max_depth/follow_links/visit_dirs、WalkStats 计数）、回调 1 继续 / 0 跳过子树 / -1 中止、remove_tree 后序删除
+  std/os/temp.c6            std.os.temp            临时文件/目录：temp_file/temp_file_named/temp_dir（mkstemp/mkdtemp，$TMPDIR 或 /tmp）、TempFile 的 ok/path/fd/write_all/close_file/remove，0600 + FD_CLOEXEC，不自动删除
+  std/os/lock.c6            std.os.lock            文件建议锁（fcntl）：lock_open、FileLock 的 acquire(exclusive, wait_ms)/try_acquire/release/is_held/close_file；wait_ms<0 阻塞、0 只试一次、>0 重试到超时，整文件锁按进程合并
+  std/os/mmap.c6            std.os.mmap            文件/匿名映射：map_file(path, writable)（可写 MAP_SHARED、只读 MAP_PRIVATE，空文件是坏映射）、map_anon（清零）、Map 的 data/size/sync/read_at/write_at/unmap；read_at/write_at 带边界检查
 
 std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
@@ -319,6 +323,7 @@ make std-term    # 编译并运行 examples/stdterm.c6（第二十批终端与�
 make std-client  # 编译并运行 examples/stdclient.c6（第二十一批网络客户端模块的拼装示例）
 make std-serve   # 编译并运行 examples/stdserve.c6（第二十二批 Web 服务端模块的拼装示例）
 make std-crypto  # 编译并运行 examples/stdcrypto.c6（第二十三批摘要与密钥派生模块的拼装示例）
+make std-fsx     # 编译并运行 examples/stdfsx.c6（第二十四批文件系统进阶模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

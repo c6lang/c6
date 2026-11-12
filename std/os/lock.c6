@@ -1,0 +1,278 @@
+/* std/os/lock：文件建议锁（POSIX `fcntl` 记录锁的薄封装）。
+ *
+ *     import std.os.lock;
+ *
+ *     FileLock lk = lock_open("build/app.lock");
+ *     if (!lk.ok())
+ *         return 1;
+ *     if (lk.acquire(1, 0) == 0)          // 非阻塞拿排他锁
+ *         printf("另一个进程正拿着锁\n");
+ *     ...
+ *     lk.release();
+ *     lk.close_file();
+ *
+ * 这是**建议锁**（advisory）：只有同样用 `fcntl` 锁的进程才会被挡住，普通
+ * `read`/`write` 不受影响；它也不是文件的「打开即锁」——锁属于 (进程, 文件)
+ * 这一对，`fork` 出来的子进程**不继承**锁（`close` 任一指向同一文件的 fd
+ * 会释放该进程在该文件上的**所有**锁，这是 POSIX 记录锁的经典坑）。
+ *
+ * 约定：
+ *
+ * - `lock_open(path)` 用 `O_RDWR|O_CREAT`（0600）打开/创建锁文件；失败给
+ *   `ok() == 0`、`fd() == -1`；
+ * - `acquire(exclusive, wait_ms)`：`wait_ms < 0` 阻塞等（`F_SETLKW`），
+ *   `0` 只试一次，`>0` 按 5ms 间隔重试到超时；返回 1 拿到 / 0 超时没拿到 /
+ *   -1 出错；
+ * - `release()` 释放（没拿着也算成功），`is_held()` 查当前是否持有；
+ * - 同一进程里对同一文件再开一个 `FileLock` 再锁**不会**冲突（fcntl 锁按
+ *   进程合并）——要测互斥必须开子进程；
+ * - 只支持整文件锁（`l_start = 0`、`l_len = 0`），区间锁不在这一层。
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+module std.os.lock;
+import std.core.types;
+import std.os.time;
+
+struct FileLock {
+    int handle;
+    int held;
+};
+
+FileLock lock_bad(void)
+{
+    FileLock l = { -1, 0 };
+
+    return l;
+}
+
+int ok(FileLock *self) { return self && self->handle >= 0; }
+
+int fd(FileLock *self) { return self ? self->handle : -1; }
+
+int is_held(FileLock *self) { return self && self->held; }
+
+FileLock lock_open(char *path)
+{
+    FileLock l = { -1, 0 };
+    int f = -1;
+
+    if (!path || !*path)
+        return l;
+    f = open(path, O_RDWR | O_CREAT, 0600);
+    if (f < 0)
+        return l;
+    fcntl(f, F_SETFD, FD_CLOEXEC);
+    l.handle = f;
+    return l;
+}
+
+static int lock_op(FileLock *self, int exclusive, int wait_ms)
+{
+    struct flock fl = { 0 };
+    int cmd = 0;
+
+    if (!self || self->handle < 0)
+        return -1;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = exclusive ? F_WRLCK : F_RDLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;               /* 0 = 到文件尾（整文件） */
+    if (wait_ms < 0) {
+        /* 阻塞版：被信号打断就重来 */
+        for (;;) {
+            if (fcntl(self->handle, F_SETLKW, &fl) == 0) {
+                self->held = 1;
+                return 1;
+            }
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+    }
+    cmd = F_SETLK;
+    for (;;) {
+        if (fcntl(self->handle, cmd, &fl) == 0) {
+            self->held = 1;
+            return 1;
+        }
+        if (errno == EACCES || errno == EAGAIN) {
+            if (wait_ms <= 0)
+                return 0;
+            if (wait_ms < 5) {
+                sleep_ms((u64)wait_ms);
+                wait_ms = 0;
+            } else {
+                sleep_ms(5);
+                wait_ms -= 5;
+            }
+            continue;
+        }
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
+/* 拿锁：1 拿到 / 0 超时 / -1 出错（语义见文件头） */
+int acquire(FileLock *self, int exclusive, int wait_ms)
+{
+    if (!self || self->handle < 0)
+        return -1;
+    if (self->held)
+        return 1;               /* 已经拿着：不重复加锁 */
+    return lock_op(self, exclusive, wait_ms);
+}
+
+/* 只试一次，不睡 */
+int try_acquire(FileLock *self, int exclusive)
+{
+    return acquire(self, exclusive, 0);
+}
+
+/* 1 释放了 / 0 本来没拿 / -1 出错 */
+int release(FileLock *self)
+{
+    struct flock fl = { 0 };
+
+    if (!self || self->handle < 0)
+        return -1;
+    if (!self->held)
+        return 0;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    if (fcntl(self->handle, F_SETLK, &fl) != 0)
+        return -1;
+    self->held = 0;
+    return 1;
+}
+
+void close_file(FileLock *self)
+{
+    if (!self)
+        return;
+    if (self->handle >= 0)
+        close(self->handle);    /* 关 fd 会释放该进程在该文件上的所有锁 */
+    self->handle = -1;
+    self->held = 0;
+}
+
+/* ---- 自测 ---- */
+
+static char *lock_path(void) { return (char *)"build/lock-test.lock"; }
+
+test "打开、拿锁、释放与重复释放" {
+    FileLock lk = lock_open(lock_path());
+    FileLock bad = lock_bad();
+
+    mkdir("build", 0755);
+    if (!lk.ok() || lk.fd() < 0)
+        return err(1, "lock_open 失败");
+    if (lk.is_held() || lk.release() != 0)
+        return err(2, "没拿锁时 release 应该是 0");
+    if (lk.try_acquire(1) != 1 || !lk.is_held())
+        return err(3, "排他锁没拿到");
+    if (lk.acquire(1, 0) != 1)
+        return err(4, "已经持有时再 acquire 应该直接成功");
+    if (lk.release() != 1 || lk.is_held())
+        return err(5, "release 失败");
+    if (lk.try_acquire(0) != 1 || lk.release() != 1)
+        return err(6, "共享锁往返失败");
+    /* 同一进程两个句柄不冲突（fcntl 锁按进程合并） */
+    {
+        FileLock b = lock_open(lock_path());
+
+        if (!b.ok())
+            return err(7, "第二个句柄打开失败");
+        if (lk.try_acquire(1) != 1 || b.try_acquire(1) != 1)
+            return err(8, "同进程同文件的两个句柄不该冲突");
+        lk.release();
+        b.release();
+        b.close_file();
+    }
+    /* 坏参数 */
+    if (bad.ok() || bad.fd() != -1 || bad.is_held())
+        return err(9, "lock_bad 字段不对");
+    if (bad.acquire(1, 0) != -1 || bad.release() != -1)
+        return err(10, "坏句柄应该 -1");
+    if (lock_open(0).ok() || lock_open((char *)"").ok())
+        return err(11, "空路径应该失败");
+    lk.close_file();
+    if (lk.ok() || lk.fd() != -1)
+        return err(12, "close_file 之后应该无效");
+}
+
+test "跨进程互斥与超时" {
+    FileLock parent = lock_open(lock_path());
+
+    mkdir("build", 0755);
+    if (!parent.ok())
+        return err(13, "父进程打开失败");
+    /* 子进程拿排他锁 300ms */
+    {
+        pid_t pid = fork();
+        int st = 0;
+
+        if (pid == 0) {
+            FileLock c = lock_open(lock_path());
+
+            if (!c.ok() || c.try_acquire(1) != 1)
+                _exit(2);
+            sleep_ms(300);
+            c.close_file();
+            _exit(0);
+        }
+        if (pid < 0)
+            return err(14, "fork 失败");
+        sleep_ms(80);           /* 让子进程先拿到锁 */
+        if (parent.try_acquire(1) != 0)
+            return err(15, "子进程持锁时父进程不该拿到");
+        if (parent.try_acquire(0) != 0)
+            return err(16, "共享锁也该被排他锁挡住");
+        if (parent.acquire(1, 60) != 0)
+            return err(17, "短超时应该返回 0");
+        if (parent.acquire(1, 2000) != 1)
+            return err(18, "等子进程退出后应该拿到锁");
+        parent.release();
+        waitpid(pid, &st, 0);
+        if (st != 0)
+            return err(19, "子进程没正常退出");
+    }
+    /* 两个子进程一个共享一个排他：应该互斥 */
+    {
+        pid_t pid = fork();
+        int st = 0;
+
+        if (pid == 0) {
+            FileLock c = lock_open(lock_path());
+
+            if (!c.ok() || c.try_acquire(0) != 1)
+                _exit(2);
+            sleep_ms(200);
+            c.close_file();
+            _exit(0);
+        }
+        if (pid < 0)
+            return err(20, "第二次 fork 失败");
+        sleep_ms(60);
+        if (parent.try_acquire(1) != 0)
+            return err(21, "共享锁持有时排他锁不该拿到");
+        parent.release();
+        waitpid(pid, &st, 0);
+        if (st != 0)
+            return err(22, "子进程没正常退出");
+    }
+    parent.close_file();
+    unlink(lock_path());
+}
