@@ -754,3 +754,23 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 验收：`make stdtest`（37 个模块、0 failure）、`make std-demo`、`make std-tour`、
 `make std-kit`、`make std-box`、`make std-web`、`make std-net`、`make selftest`、
 `make errcheck`。
+
+### 11.18 标准库第七批（bitset / glob / base32 / http）
+
+第七批补的是**底层容器原语、模式匹配和两种文本协议**，并且按 11.17 写下的硬性要求，
+所有能表达成方法的 API 都写成方法：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.container.bitset` | 借用调用方 `u64` 缓冲的位集合 `Bitset` | 纯值视图，不分配；写越界给 `INVAL`、读越界给 0/-1；最后一个字超出 `size()` 的位始终清零，所以 `count`/`equals`/集合运算不用再掩码；集合运算要求两边位数相同，失败不改接收者 |
+| `std.text.glob` | `Glob` 的 `match`/`match_path`/`has_magic`，`glob` 工厂 | `*`/`?`/`[a-z]`/`[!…]`/`\` 转义；`match_path` 的 `*`/`?` 不跨 `/`；坏字符类退回字面量 `[`，不报错 |
+| `std.encoding.base32` | RFC 4648 标准表与 base32hex | 和 base64 同口径：不分配、写调用方缓冲、放不下不写半截；`pad=1` 严格要求填充，`pad=0` 编码不补、解码两种都收；解码跳过空白、接受小写、拒绝非零填充位 |
+| `std.net.http` | HTTP/1.x 请求/响应零分配解析 | `HttpMessage` 的起始行/头字段/body 都是输入上的视图；头字段名大小写不敏感，值 trim SP/HTAB，不接受 obs-fold；`content_length` 只做语法解析，不截断 body |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.container.bitset`=0x6025、
+`std.text.glob`=0x6026、`std.encoding.base32`=0x6027、`std.net.http`=0x6028；`grammar.md`
+§8.1 的表同步。`Makefile` 增加 `std-more`，`STDMORE_SRCS` 显式列出模块正文，`stdtest`
+给 bitset 补上 `std/core/bits.c6` 依赖，`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（41 个模块、0 failure）、`make std-more`（28 条自检全过）、
+`make check-all`。

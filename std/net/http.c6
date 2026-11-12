@@ -1,0 +1,570 @@
+/* std/net/http：HTTP/1.x 请求与响应的零分配解析。
+ *
+ *     import std.net.http;
+ *
+ *     Str raw = { S("GET /hi HTTP/1.1\r\nHost: example.com\r\n\r\n") };
+ *     HttpMessage req = http_parse_request(raw);
+ *     req.method;                    // "GET"
+ *     req.target;                    // "/hi"
+ *     req.header(S("Host"));         // "example.com"
+ *     req.body();                    // 空视图
+ *
+ * 这一层只解析**已经收完的字节**，不碰 socket、不分配、不复制：起始行和每个
+ * 头字段都是 `raw` 上的视图。需要发请求/收响应由调用方自己接 `std.net` 或
+ * 宿主 socket；这里负责把字节变成可查询的结构。
+ *
+ * 解析口径：
+ * - 起始行和头字段接受 CRLF，也接受裸 LF（很多测试/代理会这么发）；
+ * - 请求行是 `METHOD SP target SP HTTP/x.y`，方法只收 token 字符；
+ * - 状态行是 `HTTP/x.y SP 3 位状态码 SP reason`，reason 可以为空；
+ * - 头字段名是 token，冒号后的值去掉首尾 SP/HTAB；不接受 obs-fold
+ *   （以空格/制表符开头的续行）；
+ * - 头字段必须有结尾空行；空行之后的内容全部算 body，`Content-Length`
+ *   只做语法解析，不在这里截断 body。
+ *
+ * 失败时返回的 HttpMessage `ok == 0`，`err` 是 `PARSE`（格式错）或 `INVAL`
+ * （空输入/空指针）。部分字段可能已经被填上，调用方应以 `ok` 为准。
+ */
+#include <string.h>
+
+module std.net.http;
+import std.core.types;
+import std.text.str;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2 };
+
+enum Kind { REQUEST = 1, RESPONSE = 2 };
+
+struct HttpMessage {
+    Str raw;
+    int kind;
+    int start_len;   /* 起始行之后的偏移 */
+    int head_end;    /* 空行之后的偏移，也就是 body 起点 */
+    Str method;      /* 请求行 */
+    Str target;
+    Str version;
+    int code;        /* 状态行 */
+    Str reason;
+    int ok;
+    int err;
+};
+
+static int http_space(int c) { return c == ' ' || c == '\t'; }
+
+static int http_token_char(int c)
+{
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+        || (c >= '0' && c <= '9'))
+        return 1;
+    return c == '!' || c == '#' || c == '$' || c == '%' || c == '&'
+        || c == '\'' || c == '*' || c == '+' || c == '-' || c == '.'
+        || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+}
+
+static int http_token(Str s)
+{
+    int i = 0;
+
+    if (s.s.len <= 0)
+        return 0;
+    for (i = 0; i < s.s.len; i++)
+        if (!http_token_char((u8)s.s.data[i]))
+            return 0;
+    return 1;
+}
+
+static Str http_trim(Str s)
+{
+    int a = 0;
+    int b = s.s.len;
+
+    while (a < b && http_space((u8)s.s.data[a]))
+        a++;
+    while (b > a && http_space((u8)s.s.data[b - 1]))
+        b--;
+    s.s = (char[:]){ s.s.data + a, b - a };
+    return s;
+}
+
+static int http_ieq(Str a, Str b)
+{
+    int i = 0;
+
+    if (a.s.len != b.s.len)
+        return 0;
+    for (i = 0; i < a.s.len; i++) {
+        int ca = (u8)a.s.data[i];
+        int cb = (u8)b.s.data[i];
+
+        if (ca >= 'A' && ca <= 'Z')
+            ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z')
+            cb += 'a' - 'A';
+        if (ca != cb)
+            return 0;
+    }
+    return 1;
+}
+
+static int http_version(Str s)
+{
+    if (s.s.len != 8)
+        return 0;
+    if (s.s.data[0] != 'H' || s.s.data[1] != 'T' || s.s.data[2] != 'T'
+        || s.s.data[3] != 'P' || s.s.data[4] != '/')
+        return 0;
+    if (s.s.data[5] < '0' || s.s.data[5] > '9' || s.s.data[6] != '.'
+        || s.s.data[7] < '0' || s.s.data[7] > '9')
+        return 0;
+    return 1;
+}
+
+static int http_target_ok(Str s)
+{
+    int i = 0;
+
+    if (s.s.len <= 0)
+        return 0;
+    for (i = 0; i < s.s.len; i++) {
+        int c = (u8)s.s.data[i];
+
+        if (c <= 0x20 || c == 0x7f)
+            return 0;
+    }
+    return 1;
+}
+
+/* 读一行（到 \n，去掉行尾 \r）；*pos 移到下一行。没有 \n 返回 0。 */
+static int http_line(Str raw, int *pos, int end, Str *line)
+{
+    int start = *pos;
+    int i = start;
+    int stop = 0;
+
+    while (i < end && raw.s.data[i] != '\n')
+        i++;
+    if (i >= end)
+        return 0;
+    stop = i;
+    if (stop > start && raw.s.data[stop - 1] == '\r')
+        stop--;
+    line->s = (char[:]){ raw.s.data + start, stop - start };
+    *pos = i + 1;
+    return 1;
+}
+
+/* 跳开头的空行（CRLF 或 LF）；HTTP 允许请求前多一个空行。 */
+static void http_skip_blank(Str raw, int *pos)
+{
+    int p = *pos;
+
+    while (p < raw.s.len) {
+        if (raw.s.data[p] == '\n') {
+            p++;
+            continue;
+        }
+        if (raw.s.data[p] == '\r' && p + 1 < raw.s.len
+            && raw.s.data[p + 1] == '\n') {
+            p += 2;
+            continue;
+        }
+        break;
+    }
+    *pos = p;
+}
+
+/* 解析一个头字段行：name 是 token，value 去掉首尾 SP/HTAB。 */
+static int http_header_line(Str line, Str *name, Str *value)
+{
+    int i = 0;
+    int colon = -1;
+
+    for (i = 0; i < line.s.len; i++) {
+        if (line.s.data[i] == ':') {
+            colon = i;
+            break;
+        }
+    }
+    if (colon <= 0)
+        return 0;
+    name->s = (char[:]){ line.s.data, colon };
+    if (!http_token(*name))
+        return 0;
+    value->s = (char[:]){ line.s.data + colon + 1, line.s.len - colon - 1 };
+    *value = http_trim(*value);
+    for (i = 0; i < value->s.len; i++) {
+        int c = (u8)value->s.data[i];
+
+        if (c < 0x20 && c != '\t')
+            return 0;
+    }
+    return 1;
+}
+
+static HttpMessage http_fail(Str raw, int kind, int ecode)
+{
+    HttpMessage m = { 0 };
+
+    m.raw = raw;
+    m.kind = kind;
+    m.err = ecode;
+    return m;
+}
+
+static HttpMessage http_parse(Str raw, int kind)
+{
+    HttpMessage m = { 0 };
+    Str line = { 0 };
+    Str name = { 0 };
+    Str value = { 0 };
+    int pos = 0;
+    int sp1 = -1;
+    int sp2 = -1;
+    int i = 0;
+
+    if (!raw.s.data || raw.s.len <= 0)
+        return http_fail(raw, kind, INVAL);
+    m.raw = raw;
+    m.kind = kind;
+    http_skip_blank(raw, &pos);
+    if (!http_line(raw, &pos, raw.s.len, &line) || line.s.len == 0)
+        return http_fail(raw, kind, PARSE);
+
+    for (i = 0; i < line.s.len; i++) {
+        if (line.s.data[i] == ' ') {
+            if (sp1 < 0)
+                sp1 = i;
+            else if (sp2 < 0) {
+                sp2 = i;
+                break;
+            }
+        }
+    }
+    if (kind == REQUEST) {
+        if (sp1 <= 0 || sp2 <= sp1 + 1)
+            return http_fail(raw, kind, PARSE);
+        m.method.s = (char[:]){ line.s.data, sp1 };
+        m.target.s = (char[:]){ line.s.data + sp1 + 1, sp2 - sp1 - 1 };
+        m.version.s = (char[:]){ line.s.data + sp2 + 1, line.s.len - sp2 - 1 };
+        if (!http_token(m.method) || !http_target_ok(m.target)
+            || !http_version(m.version))
+            return http_fail(raw, kind, PARSE);
+    } else {
+        if (sp1 <= 0 || sp1 + 4 >= line.s.len)
+            return http_fail(raw, kind, PARSE);
+        m.version.s = (char[:]){ line.s.data, sp1 };
+        if (!http_version(m.version))
+            return http_fail(raw, kind, PARSE);
+        if (line.s.data[sp1 + 4] != ' ')
+            return http_fail(raw, kind, PARSE);
+        for (i = 1; i <= 3; i++)
+            if (line.s.data[sp1 + i] < '0' || line.s.data[sp1 + i] > '9')
+                return http_fail(raw, kind, PARSE);
+        m.code = (line.s.data[sp1 + 1] - '0') * 100
+                 + (line.s.data[sp1 + 2] - '0') * 10
+                 + (line.s.data[sp1 + 3] - '0');
+        if (m.code < 100 || m.code > 599)
+            return http_fail(raw, kind, PARSE);
+        m.reason.s = (char[:]){ line.s.data + sp1 + 5, line.s.len - sp1 - 5 };
+        m.reason = http_trim(m.reason);
+    }
+    m.start_len = pos;
+
+    while (pos < raw.s.len) {
+        if (!http_line(raw, &pos, raw.s.len, &line))
+            return http_fail(raw, kind, PARSE);
+        if (line.s.len == 0) {
+            m.head_end = pos;
+            m.ok = 1;
+            return m;
+        }
+        if (line.s.data[0] == ' ' || line.s.data[0] == '\t')
+            return http_fail(raw, kind, PARSE);
+        if (!http_header_line(line, &name, &value))
+            return http_fail(raw, kind, PARSE);
+    }
+    return http_fail(raw, kind, PARSE);   /* 少了结尾空行 */
+}
+
+HttpMessage http_parse_request(Str raw) { return http_parse(raw, REQUEST); }
+
+HttpMessage http_parse_response(Str raw) { return http_parse(raw, RESPONSE); }
+
+int is_request(HttpMessage *self) { return self && self->ok && self->kind == REQUEST; }
+
+int is_response(HttpMessage *self) { return self && self->ok && self->kind == RESPONSE; }
+
+/* 起始行之后的头字段个数；解析失败给 0。 */
+int header_count(HttpMessage *self)
+{
+    Str line = { 0 };
+    Str name = { 0 };
+    Str value = { 0 };
+    int pos = 0;
+    int n = 0;
+
+    if (!self || !self->ok)
+        return 0;
+    pos = self->start_len;
+    while (pos < self->head_end) {
+        if (!http_line(self->raw, &pos, self->head_end, &line))
+            break;
+        if (line.s.len == 0)
+            break;
+        if (!http_header_line(line, &name, &value))
+            break;
+        n++;
+    }
+    return n;
+}
+
+/* 第 index 个头字段（从 0 起）；越界给 0，name/value 可以为 0。 */
+int header_at(HttpMessage *self, int index, Str *name, Str *value)
+{
+    Str line = { 0 };
+    Str n = { 0 };
+    Str v = { 0 };
+    int pos = 0;
+    int i = 0;
+
+    if (!self || !self->ok || index < 0)
+        return 0;
+    pos = self->start_len;
+    while (pos < self->head_end) {
+        if (!http_line(self->raw, &pos, self->head_end, &line))
+            return 0;
+        if (line.s.len == 0)
+            break;
+        if (!http_header_line(line, &n, &v))
+            return 0;
+        if (i == index) {
+            if (name)
+                *name = n;
+            if (value)
+                *value = v;
+            return 1;
+        }
+        i++;
+    }
+    return 0;
+}
+
+/* 按名字取第一个头字段（大小写不敏感）；没有给空视图。 */
+Str header(HttpMessage *self, Str name)
+{
+    Str line = { 0 };
+    Str n = { 0 };
+    Str v = { 0 };
+    Str empty = { { (char *)0, 0 } };
+    int pos = 0;
+
+    if (!self || !self->ok)
+        return empty;
+    pos = self->start_len;
+    while (pos < self->head_end) {
+        if (!http_line(self->raw, &pos, self->head_end, &line))
+            return empty;
+        if (line.s.len == 0)
+            break;
+        if (!http_header_line(line, &n, &v))
+            return empty;
+        if (http_ieq(n, name))
+            return v;
+    }
+    return empty;
+}
+
+/* body 是从 head_end 到输入末尾的视图（不按 Content-Length 截断）。 */
+Str body(HttpMessage *self)
+{
+    Str empty = { { (char *)0, 0 } };
+
+    if (!self || !self->ok || self->head_end >= self->raw.s.len)
+        return empty;
+    return (Str){ (char[:]){ self->raw.s.data + self->head_end,
+                             self->raw.s.len - self->head_end } };
+}
+
+/* Content-Length 的十进制值；没有、重复歧义或语法错给 -1。 */
+int content_length(HttpMessage *self)
+{
+    Str v = { 0 };
+    int i = 0;
+    int n = 0;
+    int d = 0;
+
+    if (!self || !self->ok)
+        return -1;
+    v = header(self, (Str){ (char[:]){ (char *)"Content-Length", 14 } });
+    if (v.s.len <= 0)
+        return -1;
+    for (i = 0; i < v.s.len; i++) {
+        if (v.s.data[i] < '0' || v.s.data[i] > '9')
+            return -1;
+        d = v.s.data[i] - '0';
+        if (n > (2147483647 - d) / 10)
+            return -1;
+        n = n * 10 + d;
+    }
+    return n;
+}
+
+/* 常见状态码的 reason phrase；不认识的给 "Unknown"。 */
+char *http_status_text(int code)
+{
+    switch (code) {
+    case 100: return (char *)"Continue";
+    case 101: return (char *)"Switching Protocols";
+    case 200: return (char *)"OK";
+    case 201: return (char *)"Created";
+    case 202: return (char *)"Accepted";
+    case 204: return (char *)"No Content";
+    case 206: return (char *)"Partial Content";
+    case 301: return (char *)"Moved Permanently";
+    case 302: return (char *)"Found";
+    case 304: return (char *)"Not Modified";
+    case 307: return (char *)"Temporary Redirect";
+    case 308: return (char *)"Permanent Redirect";
+    case 400: return (char *)"Bad Request";
+    case 401: return (char *)"Unauthorized";
+    case 403: return (char *)"Forbidden";
+    case 404: return (char *)"Not Found";
+    case 405: return (char *)"Method Not Allowed";
+    case 408: return (char *)"Request Timeout";
+    case 409: return (char *)"Conflict";
+    case 413: return (char *)"Payload Too Large";
+    case 415: return (char *)"Unsupported Media Type";
+    case 418: return (char *)"I'm a teapot";
+    case 422: return (char *)"Unprocessable Entity";
+    case 429: return (char *)"Too Many Requests";
+    case 500: return (char *)"Internal Server Error";
+    case 501: return (char *)"Not Implemented";
+    case 502: return (char *)"Bad Gateway";
+    case 503: return (char *)"Service Unavailable";
+    case 504: return (char *)"Gateway Timeout";
+    default: return (char *)"Unknown";
+    }
+}
+
+/* ---- 自测 ---- */
+
+static Str hs(const char *s)
+{
+    return (Str){ (char[:]){ (char *)s, (int)strlen(s) } };
+}
+
+static int body_is(HttpMessage *m, const char *s)
+{
+    Str b = m->body();
+
+    return b.s.len == (int)strlen(s) && memcmp(b.s.data, s, b.s.len) == 0;
+}
+
+test "请求行、头字段与 body" {
+    Str raw = hs("GET /hi?q=1 HTTP/1.1\r\nHost: example.com\r\n"
+                 "Content-Length: 5\r\n\r\nhello");
+    HttpMessage req = http_parse_request(raw);
+    Str host = hs("Host");
+    Str cl = hs("content-length");
+    Str name = { 0 };
+    Str value = { 0 };
+
+    if (!req.ok || req.err != 0 || !req.is_request() || req.is_response())
+        return err(1, "请求没有解析成功");
+    if (req.method.s.len != 3 || memcmp(req.method.s.data, "GET", 3) != 0)
+        return err(2, "method 不对");
+    if (req.target.s.len != 7 || memcmp(req.target.s.data, "/hi?q=1", 7) != 0)
+        return err(3, "target 不对");
+    if (req.version.s.len != 8 || memcmp(req.version.s.data, "HTTP/1.1", 8) != 0)
+        return err(4, "version 不对");
+    if (req.header_count() != 2)
+        return err(5, "头字段个数不对");
+    if (!req.header_at(0, &name, &value) || name.s.len != 4
+        || memcmp(name.s.data, "Host", 4) != 0
+        || value.s.len != 11 || memcmp(value.s.data, "example.com", 11) != 0)
+        return err(6, "header_at 不对");
+    if (req.header(host).s.len != 11
+        || memcmp(req.header(host).s.data, "example.com", 11) != 0)
+        return err(7, "按名字取 Host 不对");
+    if (req.header(cl).s.len != 1 || req.header(cl).s.data[0] != '5')
+        return err(8, "头字段名没有忽略大小写");
+    if (req.content_length() != 5 || !body_is(&req, "hello"))
+        return err(9, "content_length / body 不对");
+}
+
+test "响应行、reason 与状态文本" {
+    Str raw = hs("HTTP/1.1 404 Not Found\r\nServer: c6\r\n\r\nmissing");
+    HttpMessage res = http_parse_response(raw);
+    Str server = hs("SERVER");
+
+    if (!res.ok || !res.is_response() || res.is_request())
+        return err(10, "响应没有解析成功");
+    if (res.version.s.len != 8 || memcmp(res.version.s.data, "HTTP/1.1", 8) != 0)
+        return err(11, "响应 version 不对");
+    if (res.code != 404)
+        return err(12, "状态码不对");
+    if (res.reason.s.len != 9 || memcmp(res.reason.s.data, "Not Found", 9) != 0)
+        return err(13, "reason 不对");
+    if (res.header_count() != 1 || res.header(server).s.len != 2)
+        return err(14, "响应头不对");
+    if (strcmp(http_status_text(200), "OK") != 0
+        || strcmp(http_status_text(404), "Not Found") != 0
+        || strcmp(http_status_text(599), "Unknown") != 0)
+        return err(15, "status_text 不对");
+    if (!body_is(&res, "missing"))
+        return err(16, "响应 body 不对");
+}
+
+test "裸 LF、前导空行与空 body" {
+    Str raw = hs("\r\n\nHTTP/1.0 204 No Content\nX: y\n\n");
+    HttpMessage res = http_parse_response(raw);
+    Str x = hs("x");
+
+    if (!res.ok || res.code != 204 || res.header_count() != 1
+        || res.header(x).s.len != 1 || res.body().s.len != 0)
+        return err(17, "裸 LF / 前导空行 / 空 body 不对");
+    if (res.content_length() != -1)
+        return err(18, "没有 Content-Length 时不是 -1");
+}
+
+test "非法起始行与头字段" {
+    Str bad1 = hs("GET /hi HTTP/1.1\r\nHost example.com\r\n\r\n");
+    Str bad2 = hs("GET /hi\r\n\r\n");
+    Str bad3 = hs("HTTP/1.1 20 OK\r\n\r\n");
+    Str bad4 = hs("HTTP/1.1 200 OK\r\n Host: x\r\n\r\n");
+    Str bad5 = hs("GET /hi HTTP/1.1\r\nHost: x\r\n");
+    Str bad6 = hs("GET /hi HTTP/1.1\r\nContent-Length: nope\r\n\r\n");
+    HttpMessage r1 = http_parse_request(bad1);
+    HttpMessage r2 = http_parse_request(bad2);
+    HttpMessage r3 = http_parse_response(bad3);
+    HttpMessage r4 = http_parse_response(bad4);
+    HttpMessage r5 = http_parse_request(bad5);
+    HttpMessage r6 = http_parse_request(bad6);
+
+    if (r1.ok || r1.err != PARSE)
+        return err(19, "坏头字段没有报 PARSE");
+    if (r2.ok || r2.err != PARSE)
+        return err(20, "缺 version 没有报 PARSE");
+    if (r3.ok || r3.err != PARSE)
+        return err(21, "坏状态码没有报 PARSE");
+    if (r4.ok || r4.err != PARSE)
+        return err(22, "obs-fold 没有报 PARSE");
+    if (r5.ok || r5.err != PARSE)
+        return err(23, "缺结尾空行没有报 PARSE");
+    if (!r6.ok || r6.err != 0 || r6.content_length() != -1)
+        return err(24, "坏的 Content-Length 不该影响解析");
+}
+
+test "空输入与空指针" {
+    Str empty = { { (char *)0, 0 } };
+    HttpMessage a = http_parse_request(empty);
+    HttpMessage b = http_parse_response(empty);
+    HttpMessage *np = 0;
+
+    if (a.ok || a.err != INVAL || b.ok || b.err != INVAL)
+        return err(25, "空输入没有给 INVAL");
+    if (np->is_request() || np->is_response() || np->header_count() != 0)
+        return err(26, "空指针方法没有兜住");
+    if (np->body().s.len != 0 || np->content_length() != -1)
+        return err(27, "空指针 body / content_length 不对");
+}

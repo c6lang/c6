@@ -39,6 +39,15 @@
   `ini_open`）仍是自由函数。`std/`、`examples/std*.c6`、`docs/stdlib.md`、`README.md`
   已全部改用方法语法。
 
+- **标准库第七批**：`std.container.bitset` / `std.text.glob` / `std.encoding.base32` /
+  `std.net.http` 四个模块，集成示例 `examples/stdmore.c6`（`make std-more`）。
+  bitset 借用调用方 `u64` 缓冲，末字多余位始终清零；glob 是 `Glob` 对象上的
+  `match`/`match_path`，支持 `*`/`?`/字符类/转义；base32 覆盖 RFC 4648 标准表与
+  base32hex，填充策略显式、拒绝非零填充位；http 零分配解析请求/响应，头字段名
+  大小写不敏感、不接受 obs-fold。错误号段 `std.container.bitset`=0x6025 …
+  `std.net.http`=0x6028；模块、示例、文档都按 `docs/stdlib.md` 的「API 形态：
+  硬性要求」写成结构体方法。
+
 - **标准库分目录**：`std/` 从平铺改成按领域分七个子目录。模块名就是路径，所以
   模块名多了一段（`std.vec` → `std.container.vec`、`std.err` → `std.core.err`）。
   分组：
