@@ -1,0 +1,277 @@
+/* std/data/pnm：Netpbm（P5/P6）灰度/真彩图像解码（零分配）。
+ *
+ *     import std.data.pnm;
+ *
+ *     PnmInfo p = pnm_parse(buf, n);
+ *     if (p.valid) {
+ *         unsigned char rgba[4096];
+ *         int px = pnm_decode(buf, n, rgba, (int)sizeof rgba);
+ *     }
+ *
+ * 支持 P5（灰度）与 P6（RGB），`maxval` 1..65535：8 位样本直接给，16 位样本
+ * 按**大端**读并线性缩放到 0..255（`v * 255 / maxval`）。注释（`#` 到行尾）
+ * 可以出现在 maxval 之前的任何位置。
+ *
+ * 不支持：P1..P4/P7（ASCII 与 PAM）、多图（P5/P6 的串联只解第一张）。
+ *
+ * 约定：`PnmInfo.valid=0` 表示头不对/数据越界；`pnm_decode` 返回像素数，
+ * 失败 -1（灰度会展开成 R=G=B，alpha 恒 255）。
+ */
+#include <string.h>
+
+module std.data.pnm;
+import std.core.types;
+
+struct PnmInfo {
+    int valid;
+    int width;
+    int height;
+    int maxval;
+    int channels;
+    int sixteen;
+    i64 data_offset;
+};
+
+static PnmInfo pnm_bad(void)
+{
+    PnmInfo p = { 0, 0, 0, 0, 0, 0, 0 };
+
+    return p;
+}
+
+/* 读一个十进制字段，跳过空白与注释；失败返 -1 */
+static int pnm_read_field(const u8 *p, int n, int *pos, int *out)
+{
+    int v = 0, seen = 0;
+
+    while (*pos < n) {
+        int c = p[*pos];
+
+        if (c == '#') {
+            while (*pos < n && p[*pos] != '\n')
+                (*pos)++;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (seen)
+                break;
+            (*pos)++;
+            continue;
+        }
+        if (c < '0' || c > '9')
+            return -1;
+        v = v * 10 + (c - '0');
+        seen = 1;
+        (*pos)++;
+    }
+    if (!seen)
+        return -1;
+    *out = v;
+    return 0;
+}
+
+PnmInfo pnm_parse(const void *p, int n)
+{
+    PnmInfo info = { 0, 0, 0, 0, 0, 0, 0 };
+    const u8 *b = (const u8 *)p;
+    int pos = 0, w = 0, h = 0, maxv = 0;
+
+    if (!p || n < 8)
+        return pnm_bad();
+    if (b[0] != 'P' || (b[1] != '5' && b[1] != '6'))
+        return pnm_bad();
+    info.channels = (b[1] == '6') ? 3 : 1;
+    pos = 2;
+    if (pnm_read_field(b, n, &pos, &w) != 0
+        || pnm_read_field(b, n, &pos, &h) != 0
+        || pnm_read_field(b, n, &pos, &maxv) != 0)
+        return pnm_bad();
+    if (w <= 0 || h <= 0 || maxv < 1 || maxv > 65535)
+        return pnm_bad();
+    if (pos >= n)
+        return pnm_bad();
+    /* maxval 之后必须正好一个空白字节，随后就是样本 */
+    if (b[pos] != ' ' && b[pos] != '\n' && b[pos] != '\r' && b[pos] != '\t')
+        return pnm_bad();
+    pos++;
+    info.width = w;
+    info.height = h;
+    info.maxval = maxv;
+    info.sixteen = (maxv > 255) ? 1 : 0;
+    info.data_offset = pos;
+    {
+        i64 need = (i64)w * h * info.channels * (info.sixteen ? 2 : 1);
+
+        if (info.data_offset + need > (i64)n)
+            return pnm_bad();
+    }
+    info.valid = 1;
+    return info;
+}
+
+int pnm_decode(const void *p, int n, void *rgba, int cap)
+{
+    PnmInfo info = pnm_parse(p, n);
+    const u8 *src = 0;
+    u8 *dst = (u8 *)rgba;
+    int total = 0, i = 0, step = 0;
+
+    if (!info.valid || !rgba || cap < info.width * info.height * 4)
+        return -1;
+    src = (const u8 *)p + info.data_offset;
+    total = info.width * info.height;
+    step = info.sixteen ? 2 : 1;
+    for (i = 0; i < total; i++) {
+        int c = 0;
+        u8 *o = dst + (i64)i * 4;
+
+        if (info.channels == 1) {
+            int g = 0;
+
+            if (step == 1) {
+                g = src[(i64)i];
+            } else {
+                g = ((int)src[(i64)i * 2] << 8) | (int)src[(i64)i * 2 + 1];
+            }
+            g = (int)((i64)g * 255 / info.maxval);
+            o[0] = (u8)g;
+            o[1] = (u8)g;
+            o[2] = (u8)g;
+            o[3] = 255;
+        } else {
+            int v[3] = { 0, 0, 0 };
+
+            for (c = 0; c < 3; c++) {
+                if (step == 1) {
+                    v[c] = src[(i64)i * 3 + c];
+                } else {
+                    int base = (int)(((i64)i * 3 + c) * 2);
+
+                    v[c] = ((int)src[base] << 8) | (int)src[base + 1];
+                }
+                v[c] = (int)((i64)v[c] * 255 / info.maxval);
+            }
+            o[0] = (u8)v[0];
+            o[1] = (u8)v[1];
+            o[2] = (u8)v[2];
+            o[3] = 255;
+        }
+    }
+    return total;
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* P6 2x2 maxval 255：红、绿 / 蓝、白 */
+static const char *PPM6 =
+    "50360a3220320a3235350aff000000ff000000ffffffff";
+
+test "P6 真彩 8 位" {
+    u8 buf[64] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(PPM6, buf, (int)sizeof buf);
+    PnmInfo p = pnm_parse(buf, n);
+
+    if (!p.valid || p.width != 2 || p.height != 2 || p.channels != 3)
+        return err(1, "P6 头不对");
+    if (p.maxval != 255 || p.sixteen || p.data_offset != 11)
+        return err(2, "maxval/位宽/数据偏移不对");
+    if (pnm_decode(buf, n, rgba, (int)sizeof rgba) != 4)
+        return err(3, "P6 解码失败");
+    if (rgba[0] != 255 || rgba[1] != 0 || rgba[2] != 0)
+        return err(4, "第一个像素应该是红色");
+    if (rgba[8] != 0 || rgba[9] != 0 || rgba[10] != 255)
+        return err(11, "第三个像素应该是蓝色");
+    if (rgba[12] != 255 || rgba[13] != 255 || rgba[14] != 255)
+        return err(12, "第四个像素应该是白色");
+    if (pnm_decode(buf, n, rgba, 8) != -1)
+        return err(13, "缓冲不够应该 -1");
+}
+
+test "P5 灰度、注释、16 位缩放与错误路径" {
+    u8 buf[128] = { 0 };
+    u8 rgba[64] = { 0 };
+    /* P5，含注释，2x1，maxval 15 -> 0 与 15（满值） */
+    int m = unhex("50350a2320636f6d6d656e740a3220310a31350a000f", buf,
+                  (int)sizeof buf);
+    PnmInfo p = pnm_parse(buf, m);
+
+    if (!p.valid || p.width != 2 || p.height != 1 || p.channels != 1)
+        return err(14, "带注释的 P5 解析失败");
+    if (p.maxval != 15 || p.sixteen)
+        return err(15, "P5 的 maxval 不对");
+    if (pnm_decode(buf, m, rgba, (int)sizeof rgba) != 2)
+        return err(16, "P5 解码失败");
+    if (rgba[0] != 0 || rgba[1] != 0 || rgba[2] != 0
+        || rgba[3] != 255)
+        return err(17, "灰度 0 应该是黑色");
+    if (rgba[4] != 255 || rgba[5] != 255 || rgba[6] != 255)
+        return err(18, "灰度满值应该是白色");
+    /* 16 位 P6：maxval 65535，两个像素（65535,0,0）与（0,65535,0） */
+    {
+        u8 b16[128] = { 0 };
+        int k = unhex("50360a3120320a3635353335"
+                      "0affff000000000000ffff0000",
+                      b16, (int)sizeof b16);
+        PnmInfo p16 = pnm_parse(b16, k);
+
+        if (!p16.valid || !p16.sixteen || p16.maxval != 65535)
+            return err(19, "16 位 P6 头不对");
+        if (pnm_decode(b16, k, rgba, (int)sizeof rgba) != 2)
+            return err(20, "16 位 P6 解码失败");
+        if (rgba[0] != 255 || rgba[1] != 0 || rgba[2] != 0
+            || rgba[4] != 0 || rgba[5] != 255)
+            return err(21, "16 位像素缩放不对");
+    }
+    /* 坏 magic / maxval / 截断 */
+    {
+        u8 bad[128] = { 0 };
+
+        memcpy(bad, buf, (size_t)m);
+        bad[1] = '2';
+        if (pnm_parse(bad, m).valid)
+            return err(22, "P2 不该有效");
+        memcpy(bad, buf, (size_t)m);
+        bad[0] = 'X';
+        if (pnm_parse(bad, m).valid)
+            return err(23, "坏 magic 不该有效");
+        if (pnm_parse(buf, m - 1).valid)
+            return err(24, "截断的样本不该有效");
+        if (pnm_parse(buf, 4).valid || pnm_parse(0, 40).valid)
+            return err(25, "短输入/空指针不该有效");
+    }
+    if (pnm_decode(buf, m, 0, 64) != -1)
+        return err(26, "空输出应该 -1");
+    /* maxval 为 0 */
+    {
+        u8 z[64] = { 0 };
+        int k = unhex("50350a3120310a300a00", z, (int)sizeof z);
+
+        if (pnm_parse(z, k).valid)
+            return err(27, "maxval 0 不该有效");
+    }
+}

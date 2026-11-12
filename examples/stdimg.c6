@@ -1,0 +1,165 @@
+/* stdimg：标准库第三十批（图像解码）的拼装示例。
+ *
+ * 没有 `module`（入口 `main` 只能写在模块外的文件里），各节自带自检。
+ *
+ * 这批四个格式读的是同一张 2x2 的图（上排红/绿、下排蓝/白），示例先分别解成
+ * RGBA8888 再逐像素比较，最后用 QOI 的编码器把 RGBA 写回去再解一遍：
+ *
+ *   1. bmp：24 位、自下而上、行 4 字节对齐；
+ *   2. tga：24 位 RLE、左下原点；
+ *   3. qoi：RGB 操作码流，解完再用 qoi_encode 编回去解回来；
+ *   4. pnm：P6 真彩 8 位与 P5 灰度 16 位（maxval 缩放）。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdimg \
+ *         examples/stdimg.c6 std/core/types.c6 \
+ *         std/data/bmp.c6 std/data/tga.c6 std/data/qoi.c6 std/data/pnm.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.data.bmp;
+import std.data.tga;
+import std.data.qoi;
+import std.data.pnm;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, unsigned char *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (unsigned char)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 期望的 2x2 RGBA：红、绿 / 蓝、白 */
+static const unsigned char WANT[16] = {
+    255, 0, 0, 255,  0, 255, 0, 255,
+    0, 0, 255, 255,  255, 255, 255, 255,
+};
+
+static const char *BMP24 =
+    "424d46000000000000003600000028000000020000000200000001001800000000"
+    "0010000000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff"
+    "000000";
+
+static const char *TGA_RLE =
+    "00000a00000000000000000002000200180003ff0000ffffff0000ff00ff00";
+
+static const char *QOI_RGB =
+    "716f696600000002000000020400feff0000fe00ff00fe0000fffeffffff"
+    "0000000000000001";
+
+static const char *PPM6 = "50360a3220320a3235350aff000000ff000000ffffffff";
+
+static void tour_bmp(void)
+{
+    unsigned char buf[128] = { 0 };
+    unsigned char rgba[64] = { 0 };
+    int n = unhex(BMP24, buf, (int)sizeof buf);
+    BmpInfo b = bmp_parse(buf, n);
+
+    check(b.valid && b.width == 2 && b.height == 2 && b.bpp == 24,
+          "bmp: 2x2 24 位");
+    check(!b.top_down && b.row_bytes == 8, "bmp: 自下而上、行宽 8");
+    check(bmp_decode(buf, n, rgba, (int)sizeof rgba) == 4, "bmp: 解码 4 像素");
+    check(memcmp(rgba, WANT, 16) == 0, "bmp: 像素与期望一致");
+    printf("bmp: %d 字节、24 位、行对齐后 %d 字节/行\n", n, b.row_bytes);
+}
+
+static void tour_tga(void)
+{
+    unsigned char buf[64] = { 0 };
+    unsigned char rgba[64] = { 0 };
+    int n = unhex(TGA_RLE, buf, (int)sizeof buf);
+    TgaInfo t = tga_parse(buf, n);
+
+    check(t.valid && t.type == 10 && t.bpp == 24, "tga: RLE 真彩 24 位");
+    check(!t.top_origin && !t.right_origin, "tga: 左下原点");
+    check(tga_decode(buf, n, rgba, (int)sizeof rgba) == 4, "tga: 解码 4 像素");
+    check(memcmp(rgba, WANT, 16) == 0, "tga: 像素与期望一致");
+    printf("tga: %d 字节、类型 %d、左下原点\n", n, t.type);
+}
+
+static void tour_qoi(void)
+{
+    unsigned char buf[128] = { 0 };
+    unsigned char rgba[64] = { 0 };
+    unsigned char enc[128] = { 0 };
+    unsigned char back[64] = { 0 };
+    int n = unhex(QOI_RGB, buf, (int)sizeof buf);
+    int w = 0, h = 0, m = 0, k = 0;
+
+    check(qoi_decode(buf, n, rgba, (int)sizeof rgba, &w, &h) == 4,
+          "qoi: 解码 4 像素");
+    check(w == 2 && h == 2 && memcmp(rgba, WANT, 16) == 0,
+          "qoi: 尺寸与像素");
+    m = qoi_encode(rgba, w, h, enc, (int)sizeof enc);
+    check(m > 0 && memcmp(enc, "qoif", 4) == 0, "qoi: 重新编码");
+    k = qoi_decode(enc, m, back, (int)sizeof back, &w, &h);
+    check(k == 4 && memcmp(back, WANT, 16) == 0, "qoi: 编码后再解回");
+    printf("qoi: %d 字节解出 2x2，重编码 %d 字节后仍一致\n", n, m);
+}
+
+static void tour_pnm(void)
+{
+    unsigned char buf[64] = { 0 };
+    unsigned char rgba[64] = { 0 };
+    int n = unhex(PPM6, buf, (int)sizeof buf);
+    PnmInfo p = pnm_parse(buf, n);
+
+    check(p.valid && p.channels == 3 && p.maxval == 255, "pnm: P6 8 位");
+    check(pnm_decode(buf, n, rgba, (int)sizeof rgba) == 4, "pnm: 解码 4 像素");
+    check(memcmp(rgba, WANT, 16) == 0, "pnm: 像素与期望一致");
+    /* 16 位灰度：maxval 65535，一个 0、一个满值 */
+    {
+        unsigned char g[64] = { 0 };
+        int m = unhex("50350a3120320a36353533350a0000ffff", g,
+                      (int)sizeof g);
+        int k = 0;
+        k = pnm_decode(g, m, rgba, (int)sizeof rgba);
+        check(k == 2 && rgba[0] == 0 && rgba[4] == 255,
+              "pnm: 16 位灰度缩放");
+    }
+    printf("pnm: %d 字节 P6，另加一张 16 位灰度\n", n);
+}
+
+int main(void)
+{
+    printf("stdimg: 标准库第三十批（bmp / tga / qoi / pnm）\n");
+    tour_bmp();
+    tour_tga();
+    tour_qoi();
+    tour_pnm();
+    printf("stdimg: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

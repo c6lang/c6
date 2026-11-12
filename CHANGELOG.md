@@ -47,6 +47,15 @@
 
 ### 标准库
 
+- **标准库第三十批（图像解码）**：`std.data.bmp` / `std.data.tga` /
+  `std.data.qoi` / `std.data.pnm` 四个模块，集成示例 `examples/stdimg.c6`
+  （`make std-img`）。四个解码器都输出 RGBA8888、零分配：bmp 支持 24/32 位
+  真彩与 8 位调色板、上下行序与 4 字节行对齐；tga 支持类型 2/10（未压缩/
+  RLE）与四种原点；qoi 既能解码全套操作码（INDEX/DIFF/LUMA/RUN/RGB/RGBA）
+  也能编码（RUN/INDEX/RGB/RGBA）；pnm 支持 P5/P6、注释、maxval 1..65535
+  与 8/16 位大端样本缩放。错误号段 `std.data.bmp`=0x6081 … `std.data.pnm`=0x6084
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第二十九批（二进制文件格式）**：`std.data.wav` / `std.data.png` /
   `std.data.elf` / `std.data.zip` 四个只读解析模块，集成示例
   `examples/stdbin.c6`（`make std-bin`）。wav 解析 RIFF/WAVE 的 `fmt `/`data`

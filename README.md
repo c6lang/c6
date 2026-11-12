@@ -285,6 +285,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/png.c6           std.data.png           PNG 块遍历：png_reader + next 切块（类型/长度/偏移/CRC）、data 视图、png_parse 解析 IHDR；CRC 按 IEEE 校验
   std/data/elf.c6           std.data.elf           ELF 头与节表：elf_parse 支持 ELF32/64 大小端，elf_reader + next 给出节名/类型/flags/addr/offset/size（名字取自 shstrtab）
   std/data/zip.c6           std.data.zip           ZIP 解析：EOCD → 中央目录 → 本地头，stored/deflate 两种条目解压并校验 CRC；ZIP64/加密/未知方法 -1
+  std/data/bmp.c6           std.data.bmp           Windows BMP 解码：bmp_parse（24/32 位真彩 + 8 位调色板、上下行序、4 字节行对齐）、bmp_decode 输出 RGBA8888
+  std/data/tga.c6           std.data.tga           TGA 解码：类型 2/10（未压缩/RLE）真彩、24/32 位、四种原点；BGR(A)→RGBA8888
+  std/data/qoi.c6           std.data.qoi           QOI 解码与编码：qoi_decode（INDEX/DIFF/LUMA/RUN/RGB/RGBA）、qoi_encode（RUN/INDEX/RGB/RGBA），RGBA8888
+  std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
 
 std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
@@ -349,6 +353,7 @@ make std-data    # 编译并运行 examples/stddata.c6（第二十六批数据�
 make std-calc    # 编译并运行 examples/stdcalc.c6（第二十七批数值工具模块的拼装示例）
 make std-arch    # 编译并运行 examples/stdarch.c6（第二十八批压缩与归档模块的拼装示例）
 make std-bin     # 编译并运行 examples/stdbin.c6（第二十九批二进制文件格式模块的拼装示例）
+make std-img     # 编译并运行 examples/stdimg.c6（第三十批图像解码模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

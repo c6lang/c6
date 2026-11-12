@@ -1,0 +1,264 @@
+/* std/data/bmp：Windows BMP 解码（24/32 位真彩 + 8 位调色板，零分配）。
+ *
+ *     import std.data.bmp;
+ *
+ *     BmpInfo b = bmp_parse(buf, n);
+ *     if (b.valid) {
+ *         unsigned char rgba[4096];
+ *         int px = bmp_decode(buf, n, rgba, (int)sizeof rgba);  // w*h
+ *     }
+ *
+ * 这一层把像素解成 **RGBA8888**（每像素 4 字节、行内顺序 RGB A），`decode`
+ * 返回像素数，失败返回 -1。支持：
+ *
+ * - BITMAPINFOHEADER（40 字节，也接受更大的 V4/V5 头——只读前 40 字节）；
+ * - 24 位（BGR）与 32 位（BGRA，alpha 为 0 时按不透明处理）BI_RGB；
+ * - 8 位调色板（`clrUsed` 个 BGRX 表项；`clrUsed == 0` 时按 256 项）；
+ * - 自下而上（height > 0）与自上而下（height < 0）两种行序；
+ * - 行按 4 字节对齐。
+ *
+ * 不支持：BI_RLE8/BI_RLE4/BI_BITFIELDS（压缩方式非 0 直接 `valid=0`）、
+ * 16 位、OS/2 的 12 字节核心头、ICC/嵌入对象。
+ */
+#include <string.h>
+
+module std.data.bmp;
+import std.core.types;
+
+struct BmpInfo {
+    int valid;
+    int width;
+    int height;
+    int bpp;
+    int top_down;
+    int compression;
+    int ncolors;
+    i64 data_offset;
+    int row_bytes;
+};
+
+static BmpInfo bmp_bad(void)
+{
+    BmpInfo b = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    return b;
+}
+
+static u32 bmp_rd32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static int bmp_rd16(const u8 *p) { return (int)p[0] | ((int)p[1] << 8); }
+
+BmpInfo bmp_parse(const void *p, int n)
+{
+    BmpInfo b = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const u8 *h = (const u8 *)p;
+    int hdr = 0;
+
+    if (!p || n < 26)
+        return bmp_bad();
+    if (h[0] != 'B' || h[1] != 'M')
+        return bmp_bad();
+    hdr = (int)bmp_rd32(h + 14);
+    if (hdr < 40 || n < 14 + 40)
+        return bmp_bad();
+    b.compression = (int)bmp_rd32(h + 30);
+    if (b.compression != 0)
+        return bmp_bad();
+    b.width = (int)bmp_rd32(h + 18);
+    b.height = (int)bmp_rd32(h + 22);
+    b.bpp = bmp_rd16(h + 28);
+    b.data_offset = (i64)bmp_rd32(h + 10);
+    if (b.height < 0) {
+        b.top_down = 1;
+        b.height = -b.height;
+    }
+    b.ncolors = (int)bmp_rd32(h + 46);
+    if (b.width <= 0 || b.height <= 0)
+        return bmp_bad();
+    if (b.bpp != 8 && b.bpp != 24 && b.bpp != 32)
+        return bmp_bad();
+    if (b.bpp == 8 && b.ncolors == 0)
+        b.ncolors = 256;
+    b.row_bytes = ((b.bpp * b.width + 31) / 32) * 4;
+    if (b.data_offset < 0
+        || b.data_offset + (i64)b.row_bytes * (i64)b.height > (i64)n)
+        return bmp_bad();
+    b.valid = 1;
+    return b;
+}
+
+int bmp_decode(const void *p, int n, void *rgba, int cap)
+{
+    BmpInfo b = bmp_parse(p, n);
+    const u8 *h = (const u8 *)p;
+    const u8 *pal = 0;
+    u8 *dst = (u8 *)rgba;
+    int x = 0, y = 0;
+
+    if (!b.valid || !rgba || cap < b.width * b.height * 4)
+        return -1;
+    if (b.bpp == 8) {
+        pal = h + 14 + 40;
+        if (b.data_offset < 14 + 40 + (i64)b.ncolors * 4)
+            return -1;
+    }
+    for (y = 0; y < b.height; y++) {
+        int src_row = b.top_down ? y : (b.height - 1 - y);
+        const u8 *row = h + b.data_offset + (i64)src_row * b.row_bytes;
+
+        for (x = 0; x < b.width; x++) {
+            u8 *o = dst + ((i64)y * b.width + x) * 4;
+
+            if (b.bpp == 8) {
+                int idx = row[x];
+
+                if (idx >= b.ncolors)
+                    return -1;
+                o[0] = pal[idx * 4 + 2];
+                o[1] = pal[idx * 4 + 1];
+                o[2] = pal[idx * 4 + 0];
+                o[3] = 255;
+            } else if (b.bpp == 24) {
+                const u8 *s = row + x * 3;
+
+                o[0] = s[2];
+                o[1] = s[1];
+                o[2] = s[0];
+                o[3] = 255;
+            } else {
+                const u8 *s = row + x * 4;
+
+                o[0] = s[2];
+                o[1] = s[1];
+                o[2] = s[0];
+                o[3] = s[3] ? s[3] : 255;
+            }
+        }
+    }
+    return b.width * b.height;
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 2x2 24 位、自下而上：上排红/绿，下排蓝/白 */
+static const char *BMP24 =
+    "424d46000000000000003600000028000000020000000200000001001800000000"
+    "0010000000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff"
+    "000000";
+
+test "24 位 BMP 的头与像素" {
+    u8 buf[128] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(BMP24, buf, (int)sizeof buf);
+    BmpInfo b = bmp_parse(buf, n);
+    int px = 0;
+
+    if (!b.valid || b.width != 2 || b.height != 2 || b.bpp != 24)
+        return err(1, "24 位 BMP 头不对");
+    if (b.top_down || b.row_bytes != 8 || b.data_offset != 54)
+        return err(2, "行序/行宽/数据偏移不对");
+    px = bmp_decode(buf, n, rgba, (int)sizeof rgba);
+    if (px != 4)
+        return err(3, "应该解出 4 个像素");
+    /* 上排：红、绿；下排：蓝、白 */
+    if (rgba[0] != 255 || rgba[1] != 0 || rgba[2] != 0 || rgba[3] != 255)
+        return err(4, "左上角应该是红色");
+    if (rgba[4] != 0 || rgba[5] != 255 || rgba[6] != 0)
+        return err(5, "右上角应该是绿色");
+    if (rgba[8] != 0 || rgba[9] != 0 || rgba[10] != 255)
+        return err(6, "左下角应该是蓝色");
+    if (rgba[12] != 255 || rgba[13] != 255 || rgba[14] != 255)
+        return err(7, "右下角应该是白色");
+    if (bmp_decode(buf, n, rgba, 8) != -1)
+        return err(8, "缓冲不够应该 -1");
+}
+
+test "坏头与容量边界" {
+    u8 buf[128] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(BMP24, buf, (int)sizeof buf);
+
+    /* 坏 magic */
+    {
+        u8 bad[128] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[0] = 'X';
+        if (bmp_parse(bad, n).valid)
+            return err(9, "坏 magic 不该有效");
+    }
+    /* 压缩方式非 0 */
+    {
+        u8 bad[128] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[30] = 1;
+        if (bmp_parse(bad, n).valid)
+            return err(10, "压缩方式非 0 不该有效");
+    }
+    /* 位宽不支持 */
+    {
+        u8 bad[128] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[28] = 16;
+        if (bmp_parse(bad, n).valid)
+            return err(11, "16 位不该有效");
+    }
+    /* 数据区越界 */
+    if (bmp_parse(buf, n - 1).valid)
+        return err(12, "少一个字节不该有效");
+    if (bmp_parse(buf, 20).valid || bmp_parse(0, 100).valid)
+        return err(13, "短输入/空指针不该有效");
+    if (bmp_decode(buf, 20, rgba, (int)sizeof rgba) != -1)
+        return err(14, "坏的 decode 应该 -1");
+    if (bmp_decode(buf, n, 0, 64) != -1)
+        return err(15, "空输出应该 -1");
+    /* 8 位调色板：2x2，调色板 2 项（黑、红） */
+    {
+        u8 pal[128] = { 0 };
+        int m = unhex(
+            "424d46000000000000003e000000280000000200000002000000010008000000"
+            "000008000000130b0000130b00000200000000000000000000000000ff000001"
+            "000001000000",
+            pal, (int)sizeof pal);
+        BmpInfo pb = bmp_parse(pal, m);
+
+        if (!pb.valid || pb.bpp != 8 || pb.ncolors != 2)
+            return err(16, "8 位调色板 BMP 头不对");
+        if (bmp_decode(pal, m, rgba, (int)sizeof rgba) != 4)
+            return err(17, "8 位解码失败");
+        /* 自下而上：文件底行是黑、红；上排应为红、黑 */
+        if (rgba[0] != 255 || rgba[1] != 0 || rgba[4] != 0
+            || rgba[5] != 0)
+            return err(18, "8 位调色板像素不对");
+    }
+}

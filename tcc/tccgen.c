@@ -12823,6 +12823,10 @@ static const struct C6ErrStdSlot {
     { "std.data.png",           C6_ERR_SLOT_STD + 126 },
     { "std.data.elf",           C6_ERR_SLOT_STD + 127 },
     { "std.data.zip",           C6_ERR_SLOT_STD + 128 },
+    { "std.data.bmp",           C6_ERR_SLOT_STD + 129 },
+    { "std.data.tga",           C6_ERR_SLOT_STD + 130 },
+    { "std.data.qoi",           C6_ERR_SLOT_STD + 131 },
+    { "std.data.pnm",           C6_ERR_SLOT_STD + 132 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

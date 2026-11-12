@@ -1,0 +1,339 @@
+/* std/data/qoi：Quite OK Image 解码与编码（零分配）。
+ *
+ *     import std.data.qoi;
+ *
+ *     int w = 0, h = 0;
+ *     int px = qoi_decode(buf, n, rgba, (int)sizeof rgba, &w, &h);
+ *     int m = qoi_encode(rgba, w, h, out, (int)sizeof out);
+ *
+ * QOI 是「14 字节头 + 一串操作码 + 8 字节结束标记」的极简无损格式，支持 RGB
+ * 与 RGBA（`channels` 3/4）。解码把像素展开成 RGBA8888；编码器发
+ * `QOI_OP_RUN`（重复像素）、`QOI_OP_INDEX`（60 项缓存命中）、`QOI_OP_RGB`
+ * 与 `QOI_OP_RGBA` 四种操作码（不生成 DIFF/LUMA，流会比参考实现略大，但完全
+ * 合法、任何解码器都能读）。
+ *
+ * 约定：
+ *
+ * - `qoi_decode` 返回像素数（w*h），`w`/`h` 通过出参给回；头不对、操作码越界、
+ *   输入截断、输出放不下返回 -1；
+ * - `qoi_encode` 返回字节数，容量不够返回 -1（不写半截）；结束标记写入
+ *   `00 00 00 00 00 00 00 01`；
+ * - 编码器要求 `rgba` 至少 w*h*4 字节；w/h 必须 > 0。
+ */
+#include <string.h>
+
+module std.data.qoi;
+import std.core.types;
+
+#define QOI_HASH(p) (((int)(p)[0] * 3 + (int)(p)[1] * 5 + (int)(p)[2] * 7 \
+                      + (int)(p)[3] * 11) % 64)
+
+static u32 qoi_rd32be(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static void qoi_wr32be(u8 *p, u32 v)
+{
+    p[0] = (u8)(v >> 24);
+    p[1] = (u8)(v >> 16);
+    p[2] = (u8)(v >> 8);
+    p[3] = (u8)v;
+}
+
+int qoi_decode(const void *in, int n, void *rgba, int cap, int *w, int *h)
+{
+    const u8 *src = (const u8 *)in;
+    u8 *dst = (u8 *)rgba;
+    u8 index[64 * 4] = { 0 };
+    u8 px[4] = { 0, 0, 0, 255 };
+    int width = 0, height = 0, total = 0, done = 0, pos = 14;
+
+    if (!in || n < 22 || !rgba || cap < 0 || !w || !h)
+        return -1;
+    if (memcmp(src, "qoif", 4) != 0)
+        return -1;
+    width = (int)qoi_rd32be(src + 4);
+    height = (int)qoi_rd32be(src + 8);
+    if (width <= 0 || height <= 0)
+        return -1;
+    if (src[12] != 3 && src[12] != 4)
+        return -1;
+    if (src[13] > 1)
+        return -1;
+    if (src[12] == 3)
+        px[3] = 255;
+    if ((i64)width * (i64)height * 4 > (i64)cap)
+        return -1;
+    total = width * height;
+    if (n < 14 + 8)
+        return -1;
+    while (done < total && pos < n - 8) {
+        int b = src[pos++];
+        int run = 0;
+
+        if (b == 0xfe) {                /* RGB */
+            if (pos + 3 > n - 8)
+                return -1;
+            px[0] = src[pos];
+            px[1] = src[pos + 1];
+            px[2] = src[pos + 2];
+            pos += 3;
+        } else if (b == 0xff) {         /* RGBA */
+            if (pos + 4 > n - 8)
+                return -1;
+            px[0] = src[pos];
+            px[1] = src[pos + 1];
+            px[2] = src[pos + 2];
+            px[3] = src[pos + 3];
+            pos += 4;
+        } else if ((b & 0xc0) == 0x00) { /* INDEX */
+            memcpy(px, index + (b & 0x3f) * 4, 4);
+        } else if ((b & 0xc0) == 0x40) { /* DIFF */
+            px[0] = (u8)(px[0] + ((b >> 4) & 3) - 2);
+            px[1] = (u8)(px[1] + ((b >> 2) & 3) - 2);
+            px[2] = (u8)(px[2] + (b & 3) - 2);
+        } else if ((b & 0xc0) == 0x80) { /* LUMA */
+            int b2 = 0, dg = 0, dr_dg = 0, db_dg = 0;
+
+            if (pos + 1 > n - 8)
+                return -1;
+            b2 = src[pos++];
+            dg = (b & 0x3f) - 32;
+            dr_dg = (b2 >> 4) - 8;
+            db_dg = (b2 & 0x0f) - 8;
+            px[0] = (u8)(px[0] + dg + dr_dg);
+            px[1] = (u8)(px[1] + dg);
+            px[2] = (u8)(px[2] + dg + db_dg);
+        } else {                        /* RUN */
+            run = (b & 0x3f) + 1;
+        }
+        if (run > 0) {
+            int k = 0;
+
+            if (done + run > total)
+                return -1;
+            for (k = 0; k < run; k++) {
+                memcpy(dst + (i64)(done + k) * 4, px, 4);
+            }
+            done += run;
+        } else {
+            memcpy(dst + (i64)done * 4, px, 4);
+            memcpy(index + QOI_HASH(px) * 4, px, 4);
+            done++;
+        }
+    }
+    if (done != total)
+        return -1;
+    *w = width;
+    *h = height;
+    return total;
+}
+
+int qoi_encode(const void *rgba, int w, int h, void *out, int cap)
+{
+    const u8 *src = (const u8 *)rgba;
+    u8 *dst = (u8 *)out;
+    u8 index[64 * 4] = { 0 };
+    u8 prev[4] = { 0, 0, 0, 255 };
+    int total = 0, i = 0, op = 0, run = 0;
+
+    if ((!rgba && w > 0 && h > 0) || w <= 0 || h <= 0 || !out || cap < 22)
+        return -1;
+    if ((i64)w * (i64)h * 4 > (i64)0x7fffffff)
+        return -1;
+    total = w * h;
+    memcpy(dst, "qoif", 4);
+    qoi_wr32be(dst + 4, (u32)w);
+    qoi_wr32be(dst + 8, (u32)h);
+    dst[12] = 4;                        /* RGBA */
+    dst[13] = 0;                        /* sRGB */
+    op = 14;
+    for (i = 0; i < total; i++) {
+        const u8 *p = src + (i64)i * 4;
+        int same = (memcmp(p, prev, 4) == 0);
+
+        if (same) {
+            run++;
+            if (run == 62 || i == total - 1) {
+                if (op + 1 > cap)
+                    return -1;
+                dst[op++] = (u8)(0xc0 | (run - 1));
+                run = 0;
+            }
+            continue;
+        }
+        if (run > 0) {
+            if (op + 1 > cap)
+                return -1;
+            dst[op++] = (u8)(0xc0 | (run - 1));
+            run = 0;
+        }
+        {
+            int idx = QOI_HASH(p);
+
+            if (memcmp(index + idx * 4, p, 4) == 0) {
+                if (op + 1 > cap)
+                    return -1;
+                dst[op++] = (u8)idx;
+            } else if (p[3] == prev[3]) {
+                if (op + 4 > cap)
+                    return -1;
+                dst[op++] = 0xfe;
+                dst[op++] = p[0];
+                dst[op++] = p[1];
+                dst[op++] = p[2];
+            } else {
+                if (op + 5 > cap)
+                    return -1;
+                dst[op++] = 0xff;
+                dst[op++] = p[0];
+                dst[op++] = p[1];
+                dst[op++] = p[2];
+                dst[op++] = p[3];
+            }
+            memcpy(index + idx * 4, p, 4);
+        }
+        memcpy(prev, p, 4);
+    }
+    if (op + 8 > cap)
+        return -1;
+    memset(dst + op, 0, 7);
+    dst[op + 7] = 1;
+    op += 8;
+    return op;
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 2x2：红、绿 / 蓝、白 */
+static const u8 QOI_PX[16] = {
+    255, 0, 0, 255,  0, 255, 0, 255,
+    0, 0, 255, 255,  255, 255, 255, 255,
+};
+
+test "解码一条 2x2 的 RGB 流" {
+    u8 buf[128] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex("716f696600000002000000020400feff0000fe00ff00fe0000fffeffffff"
+                  "0000000000000001",
+                  buf, (int)sizeof buf);
+    int w = 0, h = 0, px = 0;
+
+    px = qoi_decode(buf, n, rgba, (int)sizeof rgba, &w, &h);
+    if (px != 4 || w != 2 || h != 2)
+        return err(1, "解码像素数/尺寸不对");
+    if (memcmp(rgba, QOI_PX, 16) != 0)
+        return err(2, "解码内容不对");
+    /* 容量不够 */
+    if (qoi_decode(buf, n, rgba, 8, &w, &h) != -1)
+        return err(3, "缓冲不够应该 -1");
+    /* 头坏 */
+    {
+        u8 bad[128] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[0] = 'X';
+        if (qoi_decode(bad, n, rgba, (int)sizeof rgba, &w, &h) != -1)
+            return err(4, "坏 magic 应该 -1");
+        memcpy(bad, buf, (size_t)n);
+        bad[12] = 5;
+        if (qoi_decode(bad, n, rgba, (int)sizeof rgba, &w, &h) != -1)
+            return err(5, "channels 非法应该 -1");
+        memcpy(bad, buf, (size_t)n);
+        bad[13] = 2;
+        if (qoi_decode(bad, n, rgba, (int)sizeof rgba, &w, &h) != -1)
+            return err(6, "colorspace 非法应该 -1");
+    }
+    if (qoi_decode(buf, 10, rgba, (int)sizeof rgba, &w, &h) != -1)
+        return err(7, "太短的输入应该 -1");
+    if (qoi_decode(buf, n, rgba, (int)sizeof rgba, 0, &h) != -1)
+        return err(8, "空出参应该 -1");
+}
+
+test "编码后能解回（含 RUN / INDEX / RGBA）" {
+    u8 buf[128] = { 0 };
+    u8 rgba[64] = { 0 };
+    u8 px[64] = { 0 };
+    int n = 0, w = 0, h = 0, i = 0;
+
+    /* 3x2：一半是纯色、一半带 alpha 变化 */
+    for (i = 0; i < 6; i++) {
+        if (i < 3) {
+            px[i * 4 + 0] = 10;
+            px[i * 4 + 1] = 20;
+            px[i * 4 + 2] = 30;
+            px[i * 4 + 3] = 200;
+        } else {
+            px[i * 4 + 0] = (u8)(i * 40);
+            px[i * 4 + 1] = (u8)(255 - i * 30);
+            px[i * 4 + 2] = (u8)(i * 17);
+            px[i * 4 + 3] = 255;
+        }
+    }
+    n = qoi_encode(px, 3, 2, buf, (int)sizeof buf);
+    if (n <= 0)
+        return err(9, "qoi_encode 失败");
+    if (memcmp(buf, "qoif", 4) != 0
+        || ((u8)buf[14] != 0xfe && (u8)buf[14] != 0xff
+            && (u8)buf[14] != 0xc0))
+        return err(10, "编码头/第一个操作码不对");
+    if (qoi_decode(buf, n, rgba, (int)sizeof rgba, &w, &h) != 6
+        || w != 3 || h != 2)
+        return err(11, "编码结果解不回来");
+    if (memcmp(rgba, px, 24) != 0)
+        return err(12, "往返内容不一致");
+    /* 全同色：应该只发 RUN */
+    {
+        u8 same[16] = { 0 };
+        u8 back[16] = { 0 };
+        int m = 0;
+
+        for (i = 0; i < 4; i++) {
+            same[i * 4 + 0] = 7;
+            same[i * 4 + 1] = 8;
+            same[i * 4 + 2] = 9;
+            same[i * 4 + 3] = 255;
+        }
+        m = qoi_encode(same, 2, 2, buf, (int)sizeof buf);
+        if (m <= 0)
+            return err(13, "纯色编码失败");
+        if (m > 30)
+            return err(14, "纯色应该压得很短（RUN）");
+        if (qoi_decode(buf, m, back, (int)sizeof back, &w, &h) != 4
+            || memcmp(back, same, 16) != 0)
+            return err(15, "纯色往返失败");
+    }
+    /* 容量与参数 */
+    if (qoi_encode(px, 3, 2, buf, 20) != -1)
+        return err(16, "容量不够应该 -1");
+    if (qoi_encode(px, 0, 2, buf, (int)sizeof buf) != -1
+        || qoi_encode(0, 2, 2, buf, 64) != -1
+        || qoi_encode(px, 3, 2, 0, 64) != -1)
+        return err(17, "坏参数应该 -1");
+}

@@ -17,7 +17,7 @@
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、LZ4/RLE、hexdump |
-| `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM、WAV、PNG、ELF、ZIP |
+| `std/data/` | 数据格式与媒体：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM、WAV、PNG、ELF、ZIP、BMP/TGA/QOI/PNM 图像 |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
 ```sh
@@ -157,7 +157,7 @@
 | `std/encoding/gzip.c6` | `std.encoding.gzip` | gzip 容器（RFC 1952）：`gzip_crc32`（IEEE 反射多项式）、`gzip_compress(in,n,out,cap,mtime)`（10 字节头 + DEFLATE + CRC-32/ISIZE 小端）、`gzip_decompress`（跳过 FEXTRA/FNAME/FCOMMENT/FHCRC 并校验页脚）、`gzip_bound`；只读单成员 |
 | `std/encoding/tar.c6` | `std.encoding.tar` | tar 归档（ustar，零分配）：`tar_reader` + `TarReader.next`（checksum 校验、prefix/name 拼接、数据视图、截断/非法八进制 -1、`error_at`）、`tar_writer` + `add_file`/`add_dir`/`finish`（八进制字段、512 对齐、结尾两个零块）；不压缩 |
 
-**`std/data/`**（数据格式：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP 的读取）
+**`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP，以及 BMP/TGA/QOI/PNM 图像解码）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -176,6 +176,10 @@
 | `std/data/png.c6` | `std.data.png` | PNG 块遍历（零分配）：`png_reader` 校验 8 字节签名、`next` 切成 `PngChunk`（类型/长度/数据偏移/CRC）、`data` 给数据视图、`png_parse` 解析 IHDR（宽/高/位深/颜色类型/隔行）；CRC 按 IEEE 多项式校验，CRC 错只置 `crc_ok=0` 不中止 |
 | `std/data/elf.c6` | `std.data.elf` | ELF 头与节表（零分配）：`elf_parse` 支持 ELF32/64、小端/大端（class/data/version 校验、节表越界拒绝），`elf_reader` + `ElfSection` 的 `next` 逐节给出名字（从 `shstrndx` 字符串表取，超 63 字节截断）/类型/flags/addr/offset/size/link/info/align/entsize |
 | `std/data/zip.c6` | `std.data.zip` | ZIP 解析（零分配）：`zip_reader` 从尾部找 EOCD、`next` 走中央目录得到 `ZipEntry`（名字/方法/flags/CRC/压缩前后大小/本地头偏移）、`data` 按本地头取数据（stored 拷贝、deflate 走 `std.encoding.deflate`）并校验 CRC；ZIP64/加密/未知方法返回 -1 |
+| `std/data/bmp.c6` | `std.data.bmp` | Windows BMP 解码（零分配）：`bmp_parse` 读 BITMAPINFOHEADER（也接受 V4/V5 头的前 40 字节）、24/32 位真彩与 8 位调色板、自下而上/自上而下、行 4 字节对齐；`bmp_decode` 输出 RGBA8888，压缩方式非 0/16 位/越界一律拒绝 |
+| `std/data/tga.c6` | `std.data.tga` | TGA 解码（零分配）：类型 2（未压缩）/10（RLE）真彩、24/32 位、四种原点（`top_origin`/`right_origin`）；`tga_decode` 把 BGR(A) 换回 RGBA8888，RLE 包可跨行，包越界/截断返回 -1 |
+| `std/data/qoi.c6` | `std.data.qoi` | QOI 解码与编码（零分配）：`qoi_decode` 支持 INDEX/DIFF/LUMA/RUN/RGB/RGBA 全套操作码并校验头与结束标记；`qoi_encode` 发 RUN/INDEX/RGB/RGBA 四种操作码（不生成 DIFF/LUMA，流合法但略大）；输出都是 RGBA8888 |
+| `std/data/pnm.c6` | `std.data.pnm` | Netpbm P5/P6 解码（零分配）：`pnm_parse` 支持注释、maxval 1..65535、8/16 位（大端）样本，`pnm_decode` 按 `v*255/maxval` 缩放到 RGBA8888；P1..P4/P7 与多图不支持 |
 
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
 
@@ -232,6 +236,7 @@
 | `examples/stdcalc.c6` | （无模块） | 第二十七批（数值工具）的拼装示例（`make std-calc`）：Welford 统计与分位数/直方图/相关、2x2 乘法与 3x3 行列式和线性方程组、3-4-5 向量与矩形交并、lerp/remap/缓动/Catmull-Rom |
 | `examples/stdarch.c6` | （无模块） | 第二十八批（压缩与归档）的拼装示例（`make std-arch`）：deflate 的 fixed/stored 往返、zlib 头与 Adler-32、gzip 头与 CRC-32/ISIZE、tar 两个文件的读写，最后把 tar 再用 gzip 压成 `.tar.gz` 并解压重读 |
 | `examples/stdbin.c6` | （无模块） | 第二十九批（二进制文件格式）的拼装示例（`make std-bin`）：解析 48 字节 WAV、遍历 70 字节 PNG 并把 IDAT 交给 zlib 解出像素、读 320 字节 ELF64 的节名、解 225 字节 ZIP 的 stored/deflate 两个条目 |
+| `examples/stdimg.c6` | （无模块） | 第三十批（图像解码）的拼装示例（`make std-img`）：同一张 2x2 图分别用 BMP（24 位自下而上）、TGA（RLE）、QOI（RGB 流）、PNM（P6）解成 RGBA 后逐像素比对，再用 QOI 编码器写回解一遍 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -271,6 +276,10 @@ std/data/wav.c6            2 test(s), 0 failure(s)
 std/data/png.c6           27 test(s), 0 failure(s)
 std/data/elf.c6            2 test(s), 0 failure(s)
 std/data/zip.c6            7 test(s), 0 failure(s)
+std/data/bmp.c6            2 test(s), 0 failure(s)
+std/data/tga.c6            2 test(s), 0 failure(s)
+std/data/qoi.c6            2 test(s), 0 failure(s)
+std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
 std/data/props.c6          4 test(s), 0 failure(s)
@@ -352,6 +361,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/png.c6` 27 | png 2 + crc 3 + str 22（CRC-32 来自 std.core.crc，`Str` 是数据视图） |
 | `std/data/elf.c6` 2 | 自成一体（名字拷贝用 memcpy，不借 str） |
 | `std/data/zip.c6` 7 | zip 2 + deflate 2 + crc 3（deflate 解条目、crc 校验内容） |
+| `std/data/bmp.c6` 2 | 自成一体 |
+| `std/data/tga.c6` 2 | 自成一体 |
+| `std/data/qoi.c6` 2 | 自成一体 |
+| `std/data/pnm.c6` 2 | 自成一体 |
 | `std/os/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/encoding/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
 | `std/encoding/md5.c6` 9 | md5 3 + bits 6（`rotr32` 是跨 TU 调用） |
@@ -411,7 +424,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/core/geometry`、`std/core/interp`、`std/core/stats`、`std/core/matrix` 都自成一体，
 `std/encoding/deflate` 也自成一体，`std/encoding/zlib` 要 deflate，`gzip` 要
 deflate + `std/core/crc`，`tar` 只借 `Str` 类型；`std/data/png` 只借 `Str`
-类型与 `crc`，`std/data/zip` 要 deflate + crc，`wav`/`elf` 自成一体。
+类型与 `crc`，`std/data/zip` 要 deflate + crc，`wav`/`elf`/`bmp`/`tga`/`qoi`/
+`pnm` 自成一体。
 
 ## 设计原则
 
@@ -3174,6 +3188,26 @@ stdbin: 20 check(s), 0 failure(s)
 - ZIP：EOCD → 中央目录两项（`a.txt` stored 9 字节、`b.txt` deflate 51→22
   字节），`data()` 解出并校验 CRC。
 
+### 集成示例：`examples/stdimg.c6`
+
+```sh
+make std-img
+```
+
+```
+stdimg: 标准库第三十批（bmp / tga / qoi / pnm）
+bmp: 70 字节、24 位、行对齐后 8 字节/行
+tga: 31 字节、类型 10、左下原点
+qoi: 38 字节解出 2x2，重编码 38 字节后仍一致
+pnm: 23 字节 P6，另加一张 16 位灰度
+stdimg: 16 check(s), 0 failure(s)
+```
+
+四个格式读的是同一张 2x2 图（上排红/绿、下排蓝/白），解出来必须逐字节等于
+同一份 RGBA 期望值——这同时钉住了 BMP 的自下而上行序、TGA 的左下原点与
+BGR 换序、QOI 的 RGB 操作码、PNM 的头解析。QOI 那一节还把解出的 RGBA 用
+`qoi_encode` 编回去（38 字节）再解一遍，验编码器的 RUN/INDEX 路径。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3228,6 +3262,8 @@ stdbin: 20 check(s), 0 failure(s)
   示例（自带自检）。
 * `make std-bin`：`examples/stdbin.c6`，第二十九批（二进制文件格式）模块的
   拼装示例（自带自检）。
+* `make std-img`：`examples/stdimg.c6`，第三十批（图像解码）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -3298,6 +3334,14 @@ stdbin: 20 check(s), 0 failure(s)
   一起钉。
 * `std/encoding/gzip.c6` 的「页脚」：改 CRC、改 ISIZE、改 magic、置保留位，
   四条都必须 -1；外部 Python gzip 向量能解出原文。
+* `std/data/bmp.c6` 的 8 位调色板：`clrUsed=2` 的两项调色板 + 两行像素
+  （每行 2 字节对齐），上排得到红/黑，钉住调色板与自下而上的组合。
+* `std/data/tga.c6` 的 32 位未压缩 + 左上原点（descriptor 0x28）：alpha 128
+  的半透明白必须原样保留，`top_origin` 为真。
+* `std/data/qoi.c6` 的「纯色流」：2x2 同色只需要一个 RGB 操作码加一个 RUN，
+  编码结果不超过 30 字节；解码端的 `done != total` 会在流提前结束时报错。
+* `std/data/pnm.c6` 的 16 位 P6：maxval 65535 的 0xffff/0x0000 样本按
+  `v*255/maxval` 缩放后必须是 255/0，大端读法错了这一条会立刻红。
 * `std/data/wav.c6` 的「跳块」：`JUNK` 块（3 字节 + 1 补齐）之后的 `fmt `
   仍能解析；`data` 在 `fmt` 之前时整体判无效。
 * `std/data/png.c6` 的「坏 CRC」：改 IHDR 数据的一个字节后块仍能切出来，但

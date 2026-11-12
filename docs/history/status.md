@@ -1277,3 +1277,25 @@ Bencode/MessagePack/CBOR/PEM，但媒体容器（WAV）、图片（PNG）、可�
 
 验收：`make stdtest`（129 个模块、0 failure）、`make std-bin`（20 条自检全过）、
 `make check-all`。
+
+### 11.42 标准库第三十批（bmp / tga / qoi / pnm）
+
+第三十批继续补 `std.data` 的媒体解析：上一批做了 WAV/PNG/ELF/ZIP，这一批把
+另外四种「结构简单、没有大表」的图像格式补齐，全部解成 RGBA8888：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.bmp` | Windows BMP | BITMAPINFOHEADER（也接受 V4/V5 头的前 40 字节）、24/32 位 BI_RGB、8 位调色板（`clrUsed`）、自下而上/自上而下、行 4 字节对齐；BI_RLE/BI_BITFIELDS/16 位/OS2 核心头不支持 |
+| `std.data.tga` | Truevision TGA | 类型 2（未压缩）与 10（RLE）真彩、24/32 位、四种原点；RLE 包按一维像素流处理（允许跨行），包越界/截断 -1；调色板与灰度类型不支持 |
+| `std.data.qoi` | Quite OK Image | 解码支持 INDEX/DIFF/LUMA/RUN/RGB/RGBA 与结束标记；编码器只发 RUN/INDEX/RGB/RGBA（不生成 DIFF/LUMA，合法但略大）；两侧都是 RGBA8888，零分配 |
+| `std.data.pnm` | Netpbm P5/P6 | 注释、maxval 1..65535、8/16 位（大端）样本，按 `v*255/maxval` 缩放；P1..P4/P7 与多图不支持 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.bmp`=0x6081、
+`std.data.tga`=0x6082、`std.data.qoi`=0x6083、`std.data.pnm`=0x6084；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-img` 与 `STD_IMG_SRCS`，`test-all`/`check-all` 都
+带上它；四个模块在 `stdtest` 里都自成一体（`deps=""`）。示例
+`examples/stdimg.c6` 让四个解码器读同一张 2x2 图并逐字节比对 RGBA，QOI 那一节
+再做一次编码→解码往返。
+
+验收：`make stdtest`（133 个模块、0 failure）、`make std-img`（16 条自检全过）、
+`make check-all`。

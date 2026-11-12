@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img
 
 all: build
 
@@ -182,6 +182,10 @@ stdtest: build
 	    std/data/png.c6) deps="std/core/crc.c6 std/text/str.c6" ;; \
 	    std/data/elf.c6) deps="" ;; \
 	    std/data/zip.c6) deps="std/encoding/deflate.c6 std/core/crc.c6" ;; \
+	    std/data/bmp.c6) deps="" ;; \
+	    std/data/tga.c6) deps="" ;; \
+	    std/data/qoi.c6) deps="" ;; \
+	    std/data/pnm.c6) deps="" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -548,6 +552,17 @@ std-bin: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdbin $(STD_BIN_SRCS)
 	./build/stdbin
 
+# 标准库第三十批（图像解码）：bmp / tga / qoi / pnm。
+# 四个模块都解成 RGBA8888，示例读同一张 2x2 图（红/绿、蓝/白）逐像素比对，
+# 再用 QOI 的编码器写回去解一遍。
+STD_IMG_SRCS := examples/stdimg.c6 std/core/types.c6 std/data/bmp.c6 \
+                std/data/tga.c6 std/data/qoi.c6 std/data/pnm.c6
+
+std-img: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdimg $(STD_IMG_SRCS)
+	./build/stdimg
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -652,7 +667,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -661,13 +676,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的二十九个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的三十个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin
-# 是二十九批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img
+# 是三十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -808,7 +823,7 @@ distclean:
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
-#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin）
+#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
@@ -841,6 +856,7 @@ distclean:
 #   std-calc         编译并运行 examples/stdcalc.c6（第二十七批，数值工具）
 #   std-arch         编译并运行 examples/stdarch.c6（第二十八批，压缩与归档）
 #   std-bin          编译并运行 examples/stdbin.c6（第二十九批，二进制文件格式）
+#   std-img          编译并运行 examples/stdimg.c6（第三十批，图像解码）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）
