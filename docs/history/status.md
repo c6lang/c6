@@ -794,3 +794,22 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 
 验收：`make stdtest`（45 个模块、0 failure）、`make std-next`（23 条自检全过）、
 `make check-all`。
+
+### 11.20 标准库第九批（list / ring / utf16 / ansi）
+
+第九批补的是**侵入式/固定容量容器和两种文本层工具**：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.container.list` | 侵入式双向链表 `List`/`ListNode` | 不拥有节点、不分配；push/pop/remove 只改指针；`remove` 先 O(n) 确认节点在本链表，避免误删别的链；`clear` 摘下节点但不碰 data；`ListIter` 提供 has/next |
+| `std.container.ring` | 借用调用方数组的固定容量环形队列 | 纯值视图，不分配；满时 push 返回 0 且不覆盖；pop/peek/at 用输出参数返回 void*，元素为 0 也能和空区分 |
+| `std.text.utf16` | UTF-16 解码/编码/计数 | 代理对解码成一个码点；落单代理/坏代理对给 -1，代理对中间截断给 0；编码只收 <= U+10FFFF 且不在代理区的码点；不做 BOM/字节序转换 |
+| `std.text.ansi` | ANSI 转义序列构造器 `Ansi` | 只拼字节、不写 stdout；借用调用方缓冲，满了置 ok=0 并忽略后续写入；SGR/8 色/256 色/清屏/光标移动；cstr() 末尾补 NUL |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.container.list`=0x602d、
+`std.container.ring`=0x602e、`std.text.utf16`=0x602f、`std.text.ansi`=0x6030；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-node` 与 `STDNODE_SRCS`，
+`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（49 个模块、0 failure）、`make std-node`（17 条自检全过）、
+`make check-all`。

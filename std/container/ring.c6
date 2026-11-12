@@ -1,0 +1,150 @@
+/* std/container/ring：借用调用方数组的固定容量环形队列。
+ *
+ *     import std.container.ring;
+ *
+ *     void *slots[4] = { 0 };
+ *     Ring r = ring_make(slots, 4);
+ *     r.push(&a);  r.push(&b);
+ *     r.pop(&out);                  // &a
+ *
+ * 和 `Span`/`Bitset` 一样是**纯值视图**：Ring 只包指针数组、容量、头下标和
+ * 元素个数，不分配、不拥有；`slots` 必须比 Ring 活得久。满时 `push` 返回 0
+ * （不覆盖旧值）；要覆盖就自己先 `pop` 或先查 `is_full()`。`pop`/`peek` 用
+ * 输出参数返回 `void *`，所以元素本身是 0 也能和「空」区分。
+ */
+#include <string.h>
+
+module std.container.ring;
+import std.core.types;
+
+struct Ring {
+    void **buf;
+    int cap;
+    int head;       /* 最旧元素的下标 */
+    int n;
+};
+
+Ring ring_make(void **buf, int cap)
+{
+    Ring r = { 0 };
+
+    if (!buf || cap <= 0)
+        return r;
+    r.buf = buf;
+    r.cap = cap;
+    return r;
+}
+
+int count(Ring *self) { return self ? self->n : 0; }
+
+int capacity(Ring *self) { return self ? self->cap : 0; }
+
+int is_empty(Ring *self) { return !self || self->n == 0; }
+
+int is_full(Ring *self) { return self && self->cap > 0 && self->n >= self->cap; }
+
+/* 入队；满、空视图或 v 为 0 返回 0。 */
+int push(Ring *self, void *v)
+{
+    int at = 0;
+
+    if (!self || !self->buf || self->cap <= 0 || self->n >= self->cap || !v)
+        return 0;
+    at = (self->head + self->n) % self->cap;
+    self->buf[at] = v;
+    self->n++;
+    return 1;
+}
+
+/* 出队；空返回 0，成功时 *out 是元素（out 不能为空）。 */
+int pop(Ring *self, void **out)
+{
+    if (!self || !out || self->n <= 0)
+        return 0;
+    *out = self->buf[self->head];
+    self->head = (self->head + 1) % self->cap;
+    self->n--;
+    if (self->n == 0)
+        self->head = 0;
+    return 1;
+}
+
+/* 看最旧元素但不出队。 */
+int peek(Ring *self, void **out)
+{
+    if (!self || !out || self->n <= 0)
+        return 0;
+    *out = self->buf[self->head];
+    return 1;
+}
+
+/* 按从旧到新的顺序取第 i 个（0 <= i < count）；越界返回 0。 */
+int at(Ring *self, int i, void **out)
+{
+    int idx = 0;
+
+    if (!self || !out || i < 0 || i >= self->n)
+        return 0;
+    idx = (self->head + i) % self->cap;
+    *out = self->buf[idx];
+    return 1;
+}
+
+void clear(Ring *self)
+{
+    if (!self)
+        return;
+    self->head = 0;
+    self->n = 0;
+}
+
+/* ---- 自测 ---- */
+
+test "FIFO 顺序与满 / 空" {
+    void *s[3] = { 0 };
+    Ring r = ring_make(s, 3);
+    int a = 1, b = 2, c = 3, d = 4;
+    void *out = 0;
+
+    if (r.count() != 0 || r.capacity() != 3 || !r.is_empty() || r.is_full())
+        return err(1, "空环状态不对");
+    if (!r.push(&a) || !r.push(&b) || !r.push(&c))
+        return err(2, "push 失败");
+    if (!r.is_full() || r.push(&d) != 0)
+        return err(3, "满了还 push 成功");
+    if (!r.peek(&out) || out != &a)
+        return err(4, "peek 不对");
+    if (!r.pop(&out) || out != &a)
+        return err(5, "第一次 pop 不对");
+    if (!r.push(&d))
+        return err(6, "pop 之后 push 失败");
+    if (!r.pop(&out) || out != &b || !r.pop(&out) || out != &c
+        || !r.pop(&out) || out != &d)
+        return err(7, "环形回绕顺序不对");
+    if (!r.is_empty() || r.pop(&out) != 0 || r.peek(&out) != 0)
+        return err(8, "空环 pop/peek 不对");
+}
+
+test "at / clear / 空指针与容量 0" {
+    void *s[4] = { 0 };
+    Ring r = ring_make(s, 4);
+    Ring z = ring_make(0, 4);
+    Ring z2 = ring_make(s, 0);
+    int a = 1, b = 2, c = 3;
+    void *out = 0;
+
+    r.push(&a);
+    r.push(&b);
+    r.push(&c);
+    if (!r.at(0, &out) || out != &a || !r.at(2, &out) || out != &c)
+        return err(9, "at 顺序不对");
+    if (r.at(-1, &out) || r.at(3, &out) || r.at(0, 0))
+        return err(10, "at 越界没有返回 0");
+    r.clear();
+    if (!r.is_empty() || r.count() != 0 || r.at(0, &out))
+        return err(11, "clear 不对");
+    if (!z.is_empty() || z.push(&a) || !z2.is_empty() || z2.push(&a))
+        return err(12, "空视图没有兜住");
+    if (r.push(0) || r.pop(0) || r.peek(0))
+        return err(13, "空参数没有返回 0");
+}

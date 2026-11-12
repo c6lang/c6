@@ -1,0 +1,131 @@
+/* stdnode：标准库第九批（list / ring / utf16 / ansi）的拼装示例。
+ *
+ * 和 stdtour/stdkit/stdmore/stdnext 一样：这个文件没有 `module`（入口 `main`
+ * 只能写在模块外的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdnode \
+ *         examples/stdnode.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/container/list.c6 std/container/ring.c6 \
+ *         std/text/utf16.c6 std/text/ansi.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.err;
+import std.container.list;
+import std.container.ring;
+import std.text.utf16;
+import std.text.ansi;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static void tour_list(void)
+{
+    List l = { 0 };
+    ListNode a = { 0 }, b = { 0 }, c = { 0 };
+    ListIter it = { 0 };
+    int va = 1, vb = 2, vc = 3;
+    int sum = 0;
+    int n = 0;
+
+    a.data = &va;
+    b.data = &vb;
+    c.data = &vc;
+    l.init();
+    l.push_back(&a);
+    l.push_back(&b);
+    l.push_front(&c);
+    check(l.count() == 3 && l.first() == &c && l.last() == &b,
+          "list: push 与首尾");
+    it = l.iter();
+    while (it.has()) {
+        sum += *(int *)it.next();
+        n++;
+    }
+    check(n == 3 && sum == 6, "list: 迭代器");
+    check(l.remove(&b) && !l.contains(&b) && l.count() == 2,
+          "list: remove");
+    check(l.pop_front() == &c && l.pop_back() == &a && l.is_empty(),
+          "list: pop 到空");
+}
+
+static void tour_ring(void)
+{
+    void *slots[3] = { 0 };
+    Ring r = ring_make(slots, 3);
+    int a = 1, b = 2, c = 3, d = 4;
+    void *out = 0;
+
+    r.push(&a);
+    r.push(&b);
+    r.push(&c);
+    check(r.is_full() && !r.push(&d), "ring: 满了不覆盖");
+    check(r.pop(&out) && out == &a, "ring: 弹出最旧");
+    check(r.push(&d) && r.at(0, &out) && out == &b, "ring: 回绕后 at");
+    check(r.pop(&out) && out == &b && r.pop(&out) && out == &c
+              && r.pop(&out) && out == &d && r.is_empty(),
+          "ring: FIFO 顺序");
+    r.clear();
+    check(r.count() == 0, "ring: clear");
+}
+
+static void tour_utf16(void)
+{
+    u16 units[5] = { 'h', 'i', 0xd83d, 0xde00, '!' };
+    Utf16 s = utf16((u16[:]){ units, 5 });
+    u16 enc[2] = { 0 };
+    int pos = 0;
+    u32 cp = 0;
+
+    check(s.valid() && s.count() == 4, "utf16: 计数");
+    check(s.decode(&pos, &cp) == 1 && cp == 'h', "utf16: BMP 解码");
+    pos = 2;
+    check(s.decode(&pos, &cp) == 1 && cp == 0x1f600u && pos == 4,
+          "utf16: 代理对解码");
+    check(utf16_encode(0x1f600u, enc, 2) == 2 && enc[0] == 0xd83d
+              && enc[1] == 0xde00,
+          "utf16: 代理对编码");
+    check(utf16_encode(0xd800u, enc, 2) == -1, "utf16: 拒绝代理码点");
+}
+
+static void tour_ansi(void)
+{
+    char buf[64] = { 0 };
+    Ansi a = ansi_make(buf, sizeof buf);
+
+    a.reset();
+    a.bold();
+    a.fg_basic(2);
+    a.move(3, 4);
+    check(a.ok && strcmp(a.cstr(), "\x1b[0m\x1b[1m\x1b[32m\x1b[3;4H") == 0,
+          "ansi: SGR 与光标移动");
+    a.fg(196);
+    a.clear_line();
+    check(a.ok && strstr(a.cstr(), "\x1b[38;5;196m\x1b[K") != 0,
+          "ansi: 256 色与清行");
+    check(a.up(-1) == 0 && a.length() > 0, "ansi: 非法参数不写");
+}
+
+int main(void)
+{
+    printf("stdnode: 标准库第九批（list / ring / utf16 / ansi）\n");
+    tour_list();
+    tour_ring();
+    tour_utf16();
+    tour_ansi();
+    printf("stdnode: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

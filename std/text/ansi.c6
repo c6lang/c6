@@ -1,0 +1,245 @@
+/* std/text/ansi：ANSI 转义序列构造器（零分配）。
+ *
+ *     import std.text.ansi;
+ *
+ *     char buf[64] = { 0 };
+ *     Ansi a = ansi_make(buf, sizeof buf);
+ *     a.reset();  a.bold();  a.fg_basic(1);   // ESC[0m ESC[1m ESC[31m
+ *     a.move(2, 3);                            // ESC[2;3H
+ *     puts(a.cstr());                          // NUL 结尾，可直接输出
+ *
+ * 只负责拼字节，不判断终端、不写 stdout；要不要输出由调用方决定。`Ansi` 是
+ * 纯值视图：借用调用方缓冲，满了就把 `ok` 置 0，后续写入全部忽略。失败时
+ * 缓冲里可能留下半条转义序列，所以**先看 `ok` 再用**（或者按 `length()` 截断）。
+ *
+ * 颜色分两种：`fg_basic`/`bg_basic` 是 8 色（`30..37`/`40..47`），`fg`/`bg`
+ * 是 256 色（`38;5;n`/`48;5;n`）。光标移动的 row/col 从 1 起，和终端一致。
+ */
+#include <string.h>
+
+module std.text.ansi;
+import std.core.types;
+
+struct Ansi {
+    char *buf;
+    int cap;
+    int len;
+    int ok;
+};
+
+Ansi ansi_make(char *buf, int cap)
+{
+    Ansi a = { 0 };
+
+    if (!buf || cap <= 0)
+        return a;
+    a.buf = buf;
+    a.cap = cap;
+    a.ok = 1;
+    return a;
+}
+
+int length(Ansi *self) { return self ? self->len : 0; }
+
+static int an_put(Ansi *self, const char *s, int n)
+{
+    if (!self || !self->ok || n < 0)
+        return 0;
+    if (self->len + n > self->cap) {
+        self->ok = 0;
+        return 0;
+    }
+    memcpy(self->buf + self->len, s, n);
+    self->len += n;
+    return 1;
+}
+
+static int an_num(Ansi *self, int v)
+{
+    char tmp[16] = { 0 };
+    int n = 0;
+
+    if (v < 0)
+        return 0;
+    do {
+        tmp[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v > 0);
+    while (n > 0)
+        if (!an_put(self, &tmp[--n], 1))
+            return 0;
+    return 1;
+}
+
+/* 单码 SGR：ESC[<code>m */
+static int an_sgr(Ansi *self, int code)
+{
+    return an_put(self, "\x1b[", 2) && an_num(self, code)
+        && an_put(self, "m", 1);
+}
+
+int reset(Ansi *self) { return an_sgr(self, 0); }
+
+int bold(Ansi *self) { return an_sgr(self, 1); }
+
+int dim(Ansi *self) { return an_sgr(self, 2); }
+
+int italic(Ansi *self) { return an_sgr(self, 3); }
+
+int underline(Ansi *self) { return an_sgr(self, 4); }
+
+int reverse(Ansi *self) { return an_sgr(self, 7); }
+
+int fg_basic(Ansi *self, int color)
+{
+    if (color < 0 || color > 7)
+        return 0;
+    return an_sgr(self, 30 + color);
+}
+
+int bg_basic(Ansi *self, int color)
+{
+    if (color < 0 || color > 7)
+        return 0;
+    return an_sgr(self, 40 + color);
+}
+
+/* 256 色：ESC[38;5;<n>m / ESC[48;5;<n>m */
+static int an_256(Ansi *self, int base, int color)
+{
+    if (color < 0 || color > 255)
+        return 0;
+    return an_put(self, "\x1b[", 2) && an_num(self, base)
+        && an_put(self, ";5;", 3) && an_num(self, color)
+        && an_put(self, "m", 1);
+}
+
+int fg(Ansi *self, int color) { return an_256(self, 38, color); }
+
+int bg(Ansi *self, int color) { return an_256(self, 48, color); }
+
+int clear_screen(Ansi *self) { return an_put(self, "\x1b[2J", 4); }
+
+int clear_line(Ansi *self) { return an_put(self, "\x1b[K", 3); }
+
+int home(Ansi *self) { return an_put(self, "\x1b[H", 3); }
+
+/* 光标移到 1 起的 (row, col)。 */
+int move(Ansi *self, int row, int col)
+{
+    if (row < 1 || col < 1)
+        return 0;
+    return an_put(self, "\x1b[", 2) && an_num(self, row)
+        && an_put(self, ";", 1) && an_num(self, col)
+        && an_put(self, "H", 1);
+}
+
+static int an_dir(Ansi *self, int n, char c)
+{
+    if (n < 0)
+        return 0;
+    return an_put(self, "\x1b[", 2) && an_num(self, n)
+        && an_put(self, &c, 1);
+}
+
+int up(Ansi *self, int n) { return an_dir(self, n, 'A'); }
+
+int down(Ansi *self, int n) { return an_dir(self, n, 'B'); }
+
+int right(Ansi *self, int n) { return an_dir(self, n, 'C'); }
+
+int left(Ansi *self, int n) { return an_dir(self, n, 'D'); }
+
+int hide_cursor(Ansi *self) { return an_put(self, "\x1b[?25l", 6); }
+
+int show_cursor(Ansi *self) { return an_put(self, "\x1b[?25h", 6); }
+
+/* 在末尾补 NUL（需要多一格）；返回缓冲首地址。 */
+char *cstr(Ansi *self)
+{
+    if (!self || !self->buf)
+        return (char *)0;
+    if (self->len < self->cap)
+        self->buf[self->len] = 0;
+    return self->buf;
+}
+
+/* ---- 自测 ---- */
+
+test "SGR 与基础颜色" {
+    char buf[64] = { 0 };
+    Ansi a = ansi_make(buf, sizeof buf);
+
+    if (!a.ok || a.length() != 0)
+        return err(1, "初始状态不对");
+    a.reset();
+    a.bold();
+    a.fg_basic(1);
+    if (!a.ok || strcmp(buf, "\x1b[0m\x1b[1m\x1b[31m") != 0)
+        return err(2, "SGR 输出不对");
+    if (a.bg_basic(4) != 1 || a.fg_basic(8) != 0 || a.bg_basic(-1) != 0)
+        return err(3, "基础颜色边界不对");
+    a.clear_screen();
+    a.clear_line();
+    a.home();
+    if (!a.ok || strcmp(a.cstr(), "\x1b[0m\x1b[1m\x1b[31m\x1b[44m\x1b[2J\x1b[K\x1b[H") != 0)
+        return err(4, "清屏/回车序列不对");
+}
+
+test "256 色与光标移动" {
+    char buf[64] = { 0 };
+    Ansi a = ansi_make(buf, sizeof buf);
+
+    a.fg(196);
+    a.bg(17);
+    if (!a.ok || strcmp(buf, "\x1b[38;5;196m\x1b[48;5;17m") != 0)
+        return err(5, "256 色序列不对");
+    a.move(2, 3);
+    a.up(2);
+    a.down(0);
+    a.right(10);
+    a.left(1);
+    if (!a.ok
+        || strcmp(a.cstr(),
+                  "\x1b[38;5;196m\x1b[48;5;17m\x1b[2;3H\x1b[2A\x1b[0B"
+                  "\x1b[10C\x1b[1D") != 0)
+        return err(6, "光标移动序列不对");
+    if (a.move(0, 1) != 0 || a.fg(256) != 0 || a.fg(-1) != 0)
+        return err(7, "非法参数没有返回 0");
+}
+
+test "容量、隐藏光标与失败后忽略" {
+    char small[4] = { 0 };
+    char buf[64] = { 0 };
+    Ansi a = ansi_make(small, sizeof small);
+    Ansi b = ansi_make(buf, sizeof buf);
+    Ansi e1 = ansi_make(0, 0);
+    Ansi e2 = ansi_make(buf, 0);
+
+    if (a.hide_cursor() != 0 || a.ok)
+        return err(8, "容量不够没有失败");
+    if (a.length() != 0 || a.show_cursor() != 0)
+        return err(9, "失败后还在写");
+    b.hide_cursor();
+    b.show_cursor();
+    if (!b.ok || strcmp(b.cstr(), "\x1b[?25l\x1b[?25h") != 0)
+        return err(10, "隐藏/显示光标不对");
+    if (e1.ok || e2.ok)
+        return err(11, "空工厂不是失败状态");
+    if (b.cstr() != buf || b.length() != 12)
+        return err(12, "cstr/length 不对");
+}
+
+test "参数边界与空指针" {
+    char buf[64] = { 0 };
+    Ansi a = ansi_make(buf, sizeof buf);
+    Ansi *np = 0;
+
+    if (a.up(-1) != 0 || a.move(1, 0) != 0)
+        return err(13, "负移动量没有返回 0");
+    if (np->length() != 0 || np->reset() || np->cstr() != 0)
+        return err(14, "空指针方法没有兜住");
+    if (a.dim() != 1 || a.italic() != 1 || a.underline() != 1
+        || a.reverse() != 1)
+        return err(15, "其余 SGR 不对");
+}

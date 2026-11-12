@@ -59,6 +59,8 @@
 | `std/text/utf8.c6` | `std.text.utf8` | UTF-8 解码 `utf8_decode`（返回 1..4，拒绝过长编码/代理区/超范围/截断）、编码 `utf8_encode`、`utf8_valid`/`utf8_count`、`Rune` 与 `utf8_runes()` 迭代器 |
 | `std/text/glob.c6` | `std.text.glob` | shell 风格 glob（零分配）：`Glob` 的 `match`/`match_path`/`has_magic`、`glob` 工厂、`*`/`?`/`[a-z]`/`[!…]`/`\` 转义；`match_path` 的 `*`/`?` 不跨 `/` |
 | `std/text/semver.c6` | `std.text.semver` | 语义化版本 2.0.0：`semver_parse` 工厂、`Semver` 的 `compare`/`is_prerelease`/`format`；严格前导零/标识校验，构建标识不参与优先级 |
+| `std/text/utf16.c6` | `std.text.utf16` | UTF-16 解码/编码/计数：`Utf16` 的 `decode`/`valid`/`count`、`utf16_encode`/`utf16_encoded_len`；代理对、BMP、非法代理与截断（零分配） |
+| `std/text/ansi.c6` | `std.text.ansi` | ANSI 转义构造器 `Ansi`：`reset`/`bold`/`fg_basic`/`bg_basic`/`fg`/`bg`/`move`/`up`/`down`/`clear_screen`/`clear_line`/`hide_cursor`/`show_cursor`，满了置 `ok=0` |
 
 **`std/container/`**（容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序）
 
@@ -71,6 +73,8 @@
 | `std/container/set.c6` | `std.container.set` | 哈希集合 `Set@K`（`std.container.map` 的薄包装）与 `SetIter@K`：`add`（1 新增 / 0 已存在）/`remove`/`has`/`count`/`capacity`/`reserve`/`clear`/`iter` |
 | `std/container/sort.c6` | `std.container.sort` | 比较器驱动的排序与查找：`sort_bytes`/`sort_int`/`sort_u32`/`sort_f64`（稳定归并 + 小数组插入）、`find_bytes`/`find_int`/`find_u32`、`lower_bound_int`/`upper_bound_int`、`cmp_int`/`cmp_u32`/`cmp_f64`/`cmp_int_desc`、`is_sorted_int` |
 | `std/container/bitset.c6` | `std.container.bitset` | 借用调用方 `u64` 缓冲的位集合 `Bitset`：`set`/`clear`/`toggle`/`bit`/`count`/`first_set`/`next_set`、`set_all`/`clear_all`、`union_with`/`intersect_with`/`difference_with`/`toggle_with`/`equals`/`copy_from` |
+| `std/container/list.c6` | `std.container.list` | 侵入式双向链表 `List`/`ListNode`：`init`/`push_back`/`push_front`/`pop_front`/`pop_back`/`remove`/`clear`/`contains`、`ListIter` 的 `has`/`next` |
+| `std/container/ring.c6` | `std.container.ring` | 借用调用方数组的固定容量环形队列 `Ring`：`ring_make`、`push`（满不覆盖）/`pop`/`peek`/`at`/`clear`、`count`/`capacity`/`is_empty`/`is_full` |
 | `std/container/span.c6` | `std.container.span` | 别人内存上的窗口 `Span@T`（纯值，零拷贝） |
 | `std/container/vec.c6` | `std.container.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T`：`push`/`pop`、`insert`/`remove_at`/`truncate`、`first`/`last`、`index_of`/`contains`、`reverse`、`slice`/`extend`、`sort`/`sort_lex`、`each`/`filter`/`fold` |
 
@@ -127,6 +131,7 @@
 | `examples/stdnet.c6` | （无模块） | 第六批模块的拼装示例（`make std-net`）：inet/bitbuf/pqueue/ini 各一节，自带自检 |
 | `examples/stdmore.c6` | （无模块） | 第七批模块的拼装示例（`make std-more`）：bitset/glob/base32/http 各一节，自带自检 |
 | `examples/stdnext.c6` | （无模块） | 第八批模块的拼装示例（`make std-next`）：base58/varint/semver/cookie 各一节，自带自检 |
+| `examples/stdnode.c6` | （无模块） | 第九批模块的拼装示例（`make std-node`）：list/ring/utf16/ansi 各一节，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -134,9 +139,11 @@
 ```
 std/container/bitset.c6    11 test(s), 0 failure(s)
 std/container/deque.c6     9 test(s), 0 failure(s)
+std/container/list.c6      4 test(s), 0 failure(s)
 std/container/map.c6       9 test(s), 0 failure(s)
 std/container/pqueue.c6    38 test(s), 0 failure(s)
 std/container/range.c6     6 test(s), 0 failure(s)
+std/container/ring.c6      2 test(s), 0 failure(s)
 std/container/set.c6       17 test(s), 0 failure(s)
 std/container/sort.c6      30 test(s), 0 failure(s)
 std/container/span.c6      6 test(s), 0 failure(s)
@@ -169,6 +176,7 @@ std/os/fs.c6               7 test(s), 0 failure(s)
 std/os/io.c6               5 test(s), 0 failure(s)
 std/os/path.c6             30 test(s), 0 failure(s)
 std/os/time.c6             7 test(s), 0 failure(s)
+std/text/ansi.c6           4 test(s), 0 failure(s)
 std/text/ascii.c6          5 test(s), 0 failure(s)
 std/text/fmt.c6            10 test(s), 0 failure(s)
 std/text/glob.c6           6 test(s), 0 failure(s)
@@ -176,6 +184,7 @@ std/text/num.c6            11 test(s), 0 failure(s)
 std/text/semver.c6         4 test(s), 0 failure(s)
 std/text/strbuf.c6         18 test(s), 0 failure(s)
 std/text/str.c6            22 test(s), 0 failure(s)
+std/text/utf16.c6          4 test(s), 0 failure(s)
 std/text/utf8.c6           7 test(s), 0 failure(s)
 ```
 
@@ -200,7 +209,7 @@ std/text/utf8.c6           7 test(s), 0 failure(s)
 | `std/container/bitset.c6` 11 | bitset 5 + bits 6（`popcount64`/`ctz64` 是跨 TU 调用） |
 
 `std/core/bits`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
-`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`
+`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`
 自成一体，单独跑就是自己的块数；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
 `std.text.str`（正文不调用），`std/net/mime` 的正文必须带 `std/os/path`，`std/encoding/sha256` 的正文
 必须带 `std/core/bits`，`std/os/env` 的正文必须带 `std/text/str`，`std/encoding/uuid` 的正文必须带
@@ -321,6 +330,43 @@ b.union_with(&other) catch e { return e.id; };
 写操作（`set`/`clear`/`toggle`）越界返回 `INVAL`，读操作（`bit`/`next_set`/`first_set`）
 越界给 0 / -1；最后一个字里超出 `size()` 的位始终是 0，所以 `count()`、`equals()` 和
 集合运算都不需要再掩码。集合运算要求两边 `size()` 相同，失败时不改接收者。
+
+### `List`：侵入式双向链表
+
+```c
+import std.container.list;
+
+List l = { 0 };
+ListNode a = { 0 }, b = { 0 };
+a.data = "a";  b.data = "b";
+l.push_back(&a);  l.push_back(&b);
+l.count();                 /* 2 */
+l.first()->data;           /* "a" */
+l.pop_front();             /* &a */
+```
+
+链表不拥有节点：`ListNode` 由调用方声明，`List` 只维护 `head`/`tail`/`n`，
+push/pop/remove 只改指针、不分配。`clear` 把节点全部摘下（next/prev 置 0）但不动
+`data`；`remove` 先 O(n) 确认节点在本链表里，避免误删别的链。一个节点同一时刻
+只能属于一个链表，已经链在别处的节点再 push 会让原链断掉，库不检测。
+`ListIter` 提供 `has`/`next`，可以手写遍历。
+
+### `Ring`：固定容量环形队列
+
+```c
+import std.container.ring;
+
+void *slots[4] = { 0 };
+Ring r = ring_make(slots, 4);
+r.push(&a);  r.push(&b);
+r.pop(&out);               /* 1, out == &a */
+r.peek(&out);              /* 看最旧，不出队 */
+r.at(0, &out);             /* 从旧到新取第 0 个 */
+```
+
+和 `Span`/`Bitset` 一样是纯值视图：借用调用方数组，不分配。满了 `push` 返回 0，
+**不覆盖旧值**；要覆盖先 `pop` 或查 `is_full()`。`pop`/`peek`/`at` 用输出参数返回
+`void *`，所以元素本身是 0 也能和「空」区分。
 
 ### `Map@(K, V)`：开放寻址哈希表
 
@@ -444,6 +490,50 @@ v.format(buf, sizeof buf);       /* "1.2.3-rc.1+build.7" */
 严格按 semver.org：数字标识不能有前导零，预发布/构建标识非空且只含
 `[0-9A-Za-z-]`；预发布里纯数字标识按数值比较、数字小于非数字，构建标识不参与
 优先级。解析失败时 `ok == 0`，`err` 是 `PARSE` 或 `INVAL`。
+
+### `utf16`：UTF-16 解码与编码
+
+```c
+import std.text.utf16;
+
+u16 units[5] = { 'h', 'i', 0xd83d, 0xde00, '!' };  /* "hi😀!" */
+Utf16 s = utf16((u16[:]){ units, 5 });
+int pos = 0;
+u32 cp = 0;
+
+s.valid();                 /* 1 */
+s.count();                 /* 4 */
+s.decode(&pos, &cp);       /* 1, 'h' */
+pos = 2;
+s.decode(&pos, &cp);       /* 1, U+1F600, pos == 4 */
+
+u16 out[2] = { 0 };
+utf16_encode(0x1f600u, out, 2);   /* 2, { 0xd83d, 0xde00 } */
+```
+
+按 UTF-16 代码单元处理：代理对解码成一个码点，落单代理或高代理后接非低代理返回
+-1，代理对中间截断返回 0；`count` 遇非法序列给 -1。编码只接受 <= U+10FFFF 且不在
+代理区的码点，失败不写任何单元。不做 BOM，也不换字节序（`u16` 是宿主端序）。
+
+### `ansi`：ANSI 转义构造器
+
+```c
+import std.text.ansi;
+
+char buf[64] = { 0 };
+Ansi a = ansi_make(buf, sizeof buf);
+
+a.reset();          /* ESC[0m */
+a.bold();           /* ESC[1m */
+a.fg_basic(1);      /* ESC[31m */
+a.move(2, 3);       /* ESC[2;3H */
+a.fg(196);          /* ESC[38;5;196m */
+puts(a.cstr());     /* 末尾补 NUL，可直接输出 */
+```
+
+只拼字节，不判断终端、不写 stdout；`cstr()` 在末尾补 NUL（需要多一格）。缓冲
+放不下时把 `ok` 置 0，后续写入全部忽略；失败时可能留下半条序列，所以先看 `ok`
+再用。`fg_basic`/`bg_basic` 是 8 色，`fg`/`bg` 是 256 色；光标移动的 row/col 从 1 起。
 
 ### `Buf@(N)`：定长格式化
 
@@ -1432,6 +1522,20 @@ stdnext: 23 check(s), 0 failure(s)
 四节分别是 base58 的已知向量/前导零、varint 的 300/负数往返、semver 的经典优先级
 序列、cookie 的属性与 Max-Age。和 `stdmore` 一样，Makefile 里显式列出模块正文。
 
+### 集成示例：`examples/stdnode.c6`
+
+```sh
+make std-node
+```
+
+```
+stdnode: 标准库第九批（list / ring / utf16 / ansi）
+stdnode: 17 check(s), 0 failure(s)
+```
+
+四节分别是侵入式链表的 push/迭代/remove、环形队列的回绕、UTF-16 代理对与非法
+代理、ANSI SGR/256 色/光标移动。Makefile 里照旧显式列出四个模块正文。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1446,6 +1550,7 @@ stdnext: 23 check(s), 0 failure(s)
 * `make std-net`：`examples/stdnet.c6`，第六批模块的拼装示例（自带自检）。
 * `make std-more`：`examples/stdmore.c6`，第七批模块的拼装示例（自带自检）。
 * `make std-next`：`examples/stdnext.c6`，第八批模块的拼装示例（自带自检）。
+* `make std-node`：`examples/stdnode.c6`，第九批模块的拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
