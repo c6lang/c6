@@ -20,9 +20,9 @@
  *
  * 设计与取舍：
  * - **DOM 在 Arena 上**：节点、键数组、解码后的字符串全部走
- *   `arena->alloc` / `alloc_array` / `alloc_str`，一次都不 malloc。解析出来的
- *   `Json` 树和输入文本一样，生命周期由调用方给的 arena 决定；
- *   `Arena::reset()` 一把全扔。
+ *   `arena->arena_alloc` / `arena_alloc_array` / `arena_alloc_str`，一次都
+ *   不 malloc。解析出来的 `Json` 树和输入文本一样，生命周期由调用方给的
+ *   arena 决定；`pa->arena_reset()` 一把全扔。
  * - **数字保留原文**：`Json.raw` 是输入里的那段文本（**视图，不复制**），
  *   `num` 是解析出来的 f64。写回时优先用 `raw`，所以
  *   `9007199254740993` 这种超过 f64 精度的整数写出还是原样；`raw` 为空
@@ -348,7 +348,7 @@ static int jp_read_string(Jp *ps, Str *out)
     rc = jp_scan_string(ps, &start, &len);
     if (rc)
         return rc;
-    buf = ps->a->alloc_str(len);   /* len + 1 字节，结尾有 NUL */
+    buf = ps->a->arena_alloc_str(len);   /* len + 1 字节，结尾有 NUL */
     if (!buf)
         return jp_fail(ps, NOMEM, "arena 放不下解码后的字符串");
     jp_decode(buf, ps->p + start, ps->i - start);
@@ -511,7 +511,7 @@ static int jp_array(Jp *ps, Json *out)
     if (ps->depth + 1 > JSON_MAX_DEPTH)
         return jp_fail(ps, RANGE, "嵌套深度超过 64 层");
     if (cnt > 0) {
-        kids = (Json *)ps->a->alloc(cnt * (int)sizeof(Json), 8);
+        kids = (Json *)ps->a->arena_alloc(cnt * (int)sizeof(Json), 8);
         if (!kids)
             return jp_fail(ps, NOMEM, "arena 放不下数组");
         memset(kids, 0, (size_t)cnt * sizeof(Json));
@@ -550,8 +550,8 @@ static int jp_object(Jp *ps, Json *out)
     if (ps->depth + 1 > JSON_MAX_DEPTH)
         return jp_fail(ps, RANGE, "嵌套深度超过 64 层");
     if (cnt > 0) {
-        kids = (Json *)ps->a->alloc(cnt * (int)sizeof(Json), 8);
-        keys = (Str *)ps->a->alloc(cnt * (int)sizeof(Str), 8);
+        kids = (Json *)ps->a->arena_alloc(cnt * (int)sizeof(Json), 8);
+        keys = (Str *)ps->a->arena_alloc(cnt * (int)sizeof(Str), 8);
         if (!kids || !keys)
             return jp_fail(ps, NOMEM, "arena 放不下对象");
         memset(kids, 0, (size_t)cnt * sizeof(Json));
@@ -1354,7 +1354,7 @@ test "数字文法：逐条拒绝非法写法" {
 next:
         if (id != PARSE)
             return err(60 + i, "非法数字的错误码不是 PARSE");
-        pa->reset();
+        pa->arena_reset();
     }
     /* 数组里同样拒绝 */
     {
@@ -1428,7 +1428,7 @@ ctl_done:
 next:
         if (id2 != PARSE)
             return err(100 + i, "非法转义的错误码不是 PARSE");
-        pa->reset();
+        pa->arena_reset();
     }
 }
 
@@ -1465,7 +1465,7 @@ empty_done:
 bad_done:
         if (id2 != PARSE)
             return err(130 + i, "坏输入的错误码不是 PARSE");
-        pa->reset();
+        pa->arena_reset();
     }
     /* 未转义的 NUL 字节是控制字符 */
     {
@@ -1551,7 +1551,7 @@ test "嵌套深度上限 64：64 层可以，65 层报 RANGE" {
         if (json_count(p) != 0)
             return err(161, "最里层应当是空数组");
     }
-    pa->reset();
+    pa->arena_reset();
     text[64] = '[';
     for (i = 0; i < 65; i++)
         text[65 + i] = ']';
