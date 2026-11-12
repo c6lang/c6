@@ -1,0 +1,179 @@
+/* std/core/quantile：分位数与四分位距（就地排序后按线性插值取值）。
+ *
+ *     import std.core.quantile;
+ *
+ *     double xs[9] = { 9, 1, 8, 2, 7, 3, 6, 4, 5 };
+ *     Quartiles q = { 0 };
+ *     q.compute(xs, 9);            // 方法：compute / median / quantile
+ *     // q.p25 = 3, q.p50 = 5, q.p75 = 7, q.iqr = 4
+ *
+ * 采用「线性插值」定义（与 NumPy 默认的 `linear` 一致）：把排序后的样本看作
+ * `x[0..n-1]`，位置 `h = (n-1)*q`，取 `floor(h)` 与 `ceil(h)` 两个样本做插值。
+ *
+ * 约定：
+ *
+ * - `sort_asc(p, n)` 是插入排序（O(n²)），只适合小数据集（< 数万）；已排序返回 1；
+ * - `quantile(p, n, q)` **会就地排序** `p`，`q` 夹到 0..1，空数组返回 0；
+ * - `median(p, n)` 就是 `quantile(p, n, 0.5)`；
+ * - `Quartiles` 的 `compute(p, n)` 一次算 p25/p50/p75 与 `iqr = p75 - p25`，
+ *   `n <= 0` 返回 -1；
+ * - `values_in(p, n, lo_q, hi_q)` 返回落在 [lo_q, hi_q] 之间的样本个数（也排序）；
+ * - 调用方要保留原顺序就自己先复制一份。
+ */
+#include <string.h>
+
+module std.core.quantile;
+import std.core.types;
+import std.text.str;
+
+struct Quartiles {
+    double p25;
+    double p50;
+    double p75;
+    double iqr;
+};
+
+int sort_asc(double *p, int n)
+{
+    int i = 0, j = 0;
+
+    if (!p || n < 0)
+        return -1;
+    for (i = 1; i < n; i++) {
+        double v = p[i];
+
+        j = i - 1;
+        while (j >= 0 && p[j] > v) {
+            p[j + 1] = p[j];
+            j--;
+        }
+        p[j + 1] = v;
+    }
+    return 1;
+}
+
+double quantile(double *p, int n, double q)
+{
+    double qq = q;
+    double h = 0;
+    int lo = 0, hi = 0;
+
+    if (!p || n <= 0)
+        return 0;
+    if (qq < 0)
+        qq = 0;
+    if (qq > 1)
+        qq = 1;
+    sort_asc(p, n);
+    if (n == 1)
+        return p[0];
+    h = (double)(n - 1) * qq;
+    lo = (int)h;
+    hi = lo + 1;
+    if (hi > n - 1)
+        hi = n - 1;
+    if (lo > n - 1)
+        lo = n - 1;
+    return p[lo] + (p[hi] - p[lo]) * (h - (double)lo);
+}
+
+double median(double *p, int n)
+{
+    return quantile(p, n, 0.5);
+}
+
+int compute(Quartiles *q, double *p, int n)
+{
+    if (!q || !p || n <= 0)
+        return -1;
+    sort_asc(p, n);
+    q->p25 = quantile(p, n, 0.25);
+    q->p50 = quantile(p, n, 0.50);
+    q->p75 = quantile(p, n, 0.75);
+    q->iqr = q->p75 - q->p25;
+    return 1;
+}
+
+int values_in(double *p, int n, double lo_q, double hi_q)
+{
+    double lo = 0, hi = 0;
+    int i = 0, count = 0;
+
+    if (!p || n <= 0)
+        return 0;
+    lo = quantile(p, n, lo_q);
+    hi = quantile(p, n, hi_q);
+    for (i = 0; i < n; i++) {
+        if (p[i] >= lo && p[i] <= hi)
+            count++;
+    }
+    return count;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int qnear(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+test "quantile：排序与分位" {
+    double xs[9] = { 9, 1, 8, 2, 7, 3, 6, 4, 5 };
+    int i = 0;
+
+    if (sort_asc(xs, 9) != 1)
+        return err(1, "排序失败");
+    for (i = 0; i < 9; i++) {
+        if (!qnear(xs[i], (double)(i + 1), 1e-9))
+            return err(2, "排序结果不对");
+    }
+    if (!qnear(quantile(xs, 9, 0.5), 5.0, 1e-9))
+        return err(3, "中位数应该是 5");
+    if (!qnear(quantile(xs, 9, 0.0), 1.0, 1e-9)
+        || !qnear(quantile(xs, 9, 1.0), 9.0, 1e-9))
+        return err(4, "0 与 1 分位应该是首尾元素");
+    if (!qnear(quantile(xs, 9, 0.25), 3.0, 1e-9)
+        || !qnear(quantile(xs, 9, 0.75), 7.0, 1e-9))
+        return err(5, "四分位不对");
+    if (!qnear(median(xs, 9), 5.0, 1e-9))
+        return err(6, "median 应该等于 0.5 分位");
+    if (!qnear(quantile(xs, 9, 2.0), 9.0, 1e-9)
+        || !qnear(quantile(xs, 9, -1.0), 1.0, 1e-9))
+        return err(7, "q 应该夹到 0..1");
+}
+
+test "quantile：四分位与区间" {
+    double even[4] = { 4, 1, 3, 2 };
+    Quartiles q = { 0 };
+    double single[1] = { 42 };
+
+    if (q.compute(even, 4) != 1)
+        return err(8, "compute 失败");
+    if (!qnear(q.p50, 2.5, 1e-9))
+        return err(9, "偶数个样本的中位数应该是 2.5");
+    if (!qnear(q.p25, 1.75, 1e-9) || !qnear(q.p75, 3.25, 1e-9))
+        return err(10, "四分位插值不对");
+    if (!qnear(q.iqr, 1.5, 1e-9))
+        return err(11, "IQR 应该是 1.5");
+    /* 单样本 */
+    if (q.compute(single, 1) != 1 || !qnear(q.p50, 42.0, 1e-9)
+        || !qnear(q.iqr, 0.0, 1e-9))
+        return err(12, "单样本的四分位应该都等于它");
+    /* 落在中间 50% 的样本个数 */
+    {
+        double xs[9] = { 9, 1, 8, 2, 7, 3, 6, 4, 5 };
+
+        if (values_in(xs, 9, 0.25, 0.75) != 5)
+            return err(13, "中间 50% 应该有 5 个样本（3..7）");
+    }
+    if (q.compute(0, 4) != -1 || q.compute(even, 0) != -1)
+        return err(14, "空指针或 0 长度应该 -1");
+    if (!qnear(quantile(0, 0, 0.5), 0.0, 1e-9))
+        return err(15, "空数组的分位应该 0");
+}

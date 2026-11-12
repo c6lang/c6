@@ -1,0 +1,209 @@
+/* std/core/moving：滑动窗口统计（简单平均 SMA 与指数平均 EMA）。
+ *
+ *     import std.core.moving;
+ *
+ *     double buf[8] = { 0 };
+ *     Ma m = { 0 };
+ *     m.init(buf, 8);              // 方法：init / push / sma / ema_push
+ *     m.push(10);                  // 返回当前窗口的 SMA
+ *     m.ema_push(10, 0.5);         // 返回 EMA
+ *
+ * `Ma` 用一个环形缓冲区保存最近 `n` 个样本，`sum` 常驻，所以每次 `push` 都是 O(1)。
+ * EMA 是独立的累加器（不受窗口长度影响），第一个样本直接作为初值。
+ *
+ * 约定：
+ *
+ * - `init(buf, n)` 清空缓冲区并把计数归零，`n <= 0` 返回 -1；
+ * - `push(v)` 返回**推入之后**的 SMA（窗口没满时按已有样本数平均），
+ *   `sma()` 只读当前值；`count()` 是当前窗口里的样本数，`capacity()` 是窗口长度；
+ * - `ema_push(v, alpha)` 按 `ema = alpha*v + (1-alpha)*ema` 更新并返回新 EMA，
+ *   `alpha` 会夹到 0..1；`alpha <= 0` 时 EMA 保持不变；
+ * - `reset()` 清空窗口与 EMA；
+ * - 不处理 NaN/Inf（传进来会污染后续结果）。
+ */
+#include <string.h>
+
+module std.core.moving;
+import std.core.types;
+import std.text.str;
+
+struct Ma {
+    double *buf;
+    int cap;
+    int n;
+    int pos;
+    double sum;
+    double emav;        /* 字段名不能与 ema() 方法冲突 */
+    int ema_set;
+};
+
+int init(Ma *m, double *buf, int n)
+{
+    if (!m || !buf || n <= 0)
+        return -1;
+    memset(buf, 0, sizeof(double) * (size_t)n);
+    m->buf = buf;
+    m->cap = n;
+    m->n = 0;
+    m->pos = 0;
+    m->sum = 0;
+    m->emav = 0;
+    m->ema_set = 0;
+    return 1;
+}
+
+int capacity(Ma *m)
+{
+    return m ? m->cap : 0;
+}
+
+int count(Ma *m)
+{
+    return m ? m->n : 0;
+}
+
+double sma(Ma *m)
+{
+    if (!m || m->n <= 0)
+        return 0;
+    return m->sum / (double)m->n;
+}
+
+double push(Ma *m, double v)
+{
+    if (!m || !m->buf || m->cap <= 0)
+        return 0;
+    if (m->n < m->cap) {
+        m->buf[m->pos] = v;
+        m->sum += v;
+        m->pos = (m->pos + 1) % m->cap;
+        m->n++;
+    } else {
+        m->sum -= m->buf[m->pos];
+        m->buf[m->pos] = v;
+        m->sum += v;
+        m->pos = (m->pos + 1) % m->cap;
+    }
+    return m->sum / (double)m->n;
+}
+
+double ema_push(Ma *m, double v, double alpha)
+{
+    double a = alpha;
+
+    if (!m)
+        return 0;
+    if (a < 0)
+        a = 0;
+    if (a > 1)
+        a = 1;
+    if (!m->ema_set) {
+        m->emav = v;
+        m->ema_set = 1;
+        return m->emav;
+    }
+    m->emav = a * v + (1.0 - a) * m->emav;
+    return m->emav;
+}
+
+double ema(Ma *m)
+{
+    return m && m->ema_set ? m->emav : 0;
+}
+
+double last(Ma *m)
+{
+    int idx = 0;
+
+    if (!m || !m->buf || m->n <= 0)
+        return 0;
+    idx = (m->pos - 1 + m->cap) % m->cap;
+    return m->buf[idx];
+}
+
+int reset(Ma *m)
+{
+    if (!m || !m->buf)
+        return -1;
+    memset(m->buf, 0, sizeof(double) * (size_t)m->cap);
+    m->n = 0;
+    m->pos = 0;
+    m->sum = 0;
+    m->emav = 0;
+    m->ema_set = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int mnear(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+test "moving：窗口平均" {
+    double buf[4] = { 0 };
+    Ma m = { 0 };
+    double v = 0;
+
+    if (m.init(buf, 4) != 1)
+        return err(1, "init 失败");
+    if (m.capacity() != 4 || m.count() != 0 || !mnear(m.sma(), 0.0, 1e-9))
+        return err(2, "初始状态不对");
+    v = m.push(10);
+    if (!mnear(v, 10.0, 1e-9) || m.count() != 1)
+        return err(3, "第一个样本的 SMA 应该是 10");
+    v = m.push(20);
+    if (!mnear(v, 15.0, 1e-9))
+        return err(4, "两个样本的 SMA 应该是 15");
+    m.push(30);
+    v = m.push(40);
+    if (!mnear(v, 25.0, 1e-9) || m.count() != 4)
+        return err(5, "满窗 SMA 应该是 (10+20+30+40)/4=25");
+    if (!mnear(m.last(), 40.0, 1e-9))
+        return err(6, "last 应该是 40");
+    /* 推入第 5 个：丢掉 10 */
+    v = m.push(50);
+    if (!mnear(v, 35.0, 1e-9))
+        return err(7, "滑出 10 之后 SMA 应该是 (20+30+40+50)/4=35");
+    if (!mnear(m.last(), 50.0, 1e-9))
+        return err(8, "last 应该是 50");
+}
+
+test "moving：EMA 与复位" {
+    double buf[3] = { 0 };
+    Ma m = { 0 };
+    double v = 0;
+
+    if (m.init(buf, 3) != 1)
+        return err(9, "init 失败");
+    v = m.ema_push(10, 0.5);
+    if (!mnear(v, 10.0, 1e-9) || !mnear(m.ema(), 10.0, 1e-9))
+        return err(10, "第一个 EMA 应该等于首样本");
+    v = m.ema_push(20, 0.5);
+    if (!mnear(v, 15.0, 1e-9))
+        return err(11, "第二个 EMA 应该是 15");
+    v = m.ema_push(30, 0.5);
+    if (!mnear(v, 22.5, 1e-9))
+        return err(12, "第三个 EMA 应该是 22.5");
+    /* alpha 夹断 */
+    v = m.ema_push(100, 2.0);
+    if (!mnear(v, 100.0, 1e-9))
+        return err(13, "alpha 大于 1 应该按 1 处理（完全跟随新值）");
+    v = m.ema_push(0, -1.0);
+    if (!mnear(v, 100.0, 1e-9))
+        return err(14, "alpha 小于 0 应该按 0 处理（EMA 不变）");
+    /* 复位 */
+    if (m.reset() != 1 || m.count() != 0 || !mnear(m.ema(), 0.0, 1e-9))
+        return err(15, "reset 之后应该清空");
+    if (!mnear(m.push(1.0), 1.0, 1e-9))
+        return err(16, "reset 之后还能继续用");
+    if (m.init(buf, 0) != -1)
+        return err(17, "窗口 0 应该 -1");
+}

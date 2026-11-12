@@ -297,6 +297,11 @@
 | `std/container/queue.c6` | `std.container.queue` | 环形 FIFO（**方法**：`q.bind`/`q.push`/`q.pop`/`q.peek`/`q.size`/`q.is_full`/`q.clear`）：`(head + n) % cap` 处理回绕，满时拒绝入队 |
 | `std/container/slots.c6` | `std.container.slots` | 位图槽位分配器（**方法**：`s.bind`/`s.alloc`/`s.free_slot`/`s.is_used`/`s.alloc_contig`/`s.used`/`s.total`/`s.free_count`/`s.clear`）：一个 bit 一个槽位，`alloc_contig(k)` 找连续空位，越界 `is_used` 当占用（防止误用） |
 | `std/container/bag.c6` | `std.container.bag` | `i64` 多重集合（**方法**：`b.bind`/`b.add`/`b.remove`/`b.count_of`/`b.total`/`b.distinct`/`b.max`/`b.clear`）：开放寻址 + 线性探测，删到 0 留墓碑（`used = 2`）不破坏同簇查找，装载率 3/4 后拒绝新键 |
+| `std/core/histogram.c6` | `std.core.histogram` | 等宽直方图（**方法**：`h.init`/`h.add`/`h.bin_of`/`h.count`/`h.total`/`h.mode`/`h.mean`/`h.step`/`h.bins`/`h.max_count`/`h.clear`）：越界值夹到首尾箱，`mean` 用箱中心估计，`mode` 给计数最大的箱区间 |
+| `std/core/moving.c6` | `std.core.moving` | 滑动窗口统计（**方法**：`m.init`/`m.push`/`m.sma`/`m.ema_push`/`m.ema`/`m.last`/`m.count`/`m.capacity`/`m.reset`）：环形缓冲 + 常驻 `sum` 实现 O(1) SMA，EMA 独立累加器（`alpha` 夹到 0..1，首样本即初值） |
+| `std/core/series.c6` | `std.core.series` | 序列统计（**方法**：`s.bind`/`s.mean`/`s.variance`/`s.stddev`/`s.minimum`/`s.maximum`/`s.cov`/`s.corr`/`s.summarize`/`s.count`）：样本方差（n-1），Pearson 相关，长度不等时按前 n 个**配对**（均值也只取这 n 个） |
+| `std/core/quantile.c6` | `std.core.quantile` | 分位数（**方法**：`q.compute`）：`sort_asc` 插入排序（小数据集），`quantile`/`median` 用线性插值（与 NumPy 默认一致）并**就地排序**，`Quartiles` 一次给 p25/p50/p75/iqr，`values_in` 数区间内样本 |
+
 
 
 
@@ -410,6 +415,7 @@
 | `examples/stdclean.c6` | （无模块） | 第六十一批（文本清洗与标注）的拼装示例（`make std-clean`）：SanOpts 清洗、TabStops 展开/还原、Quoter 引用往返、NatoOpts 拼读解码 |
 | `examples/stdcolor.c6` | （无模块） | 第六十二批（颜色与单位）的拼装示例（`make std-color`）：颜色 hex/HSL/混合/对比度、GIMP 调色板、命名颜色与最近匹配、单位换算 |
 | `examples/stdcontainers.c6` | （无模块） | 第六十三批（基础容器补充）的拼装示例（`make std-cont`）：栈做括号匹配、队列验回绕、槽位分配与复用、多重集合计数与最多次数 |
+| `examples/stdstats2.c6` | （无模块） | 第六十四批（统计小工具）的拼装示例（`make std-stats`）：直方图分箱与众数箱、SMA/EMA、序列均值/标准差/相关、分位数与四分位；链接带 `-lm` |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -556,6 +562,10 @@ std/container/stack.c6     24 test(s), 0 failure(s)
 std/container/queue.c6     24 test(s), 0 failure(s)
 std/container/slots.c6     24 test(s), 0 failure(s)
 std/container/bag.c6       24 test(s), 0 failure(s)
+std/core/histogram.c6      24 test(s), 0 failure(s)
+std/core/moving.c6         24 test(s), 0 failure(s)
+std/core/series.c6         24 test(s), 0 failure(s)
+std/core/quantile.c6       24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3985,6 +3995,17 @@ make std-cont
 1..4 后出两个、再进 10/11 验证回绕顺序；槽位分配器演示分配/释放/复用与
 `alloc_contig`；多重集合统计 `42×5 / 7×2 / 99×1` 并用 `b.max` 找出出现最多的键。
 
+### 集成示例：`examples/stdstats2.c6`
+
+```sh
+make std-stats
+```
+
+四节都用方法：直方图把 20 个样本分进 5 箱并打印箱宽与箱中心均值、用 `h.mode` 找众数
+箱；`m.push` 演示窗口滑动（10,20,30 → 20.0，滑入 50 后 35.0）与 `m.ema_push`；
+`a.summarize` 一次给出均值/标准差/最值、`a.corr(&b)` 验完全相关；`q.compute` 给
+p25/p50/p75/IQR。链接带 `-lm`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4107,6 +4128,8 @@ make std-cont
   （自带自检）。
 * `make std-cont`：`examples/stdcontainers.c6`，第六十三批（基础容器补充）模块的拼装
   示例（自带自检）。
+* `make std-stats`：`examples/stdstats2.c6`，第六十四批（统计小工具）模块的拼装示例
+  （自带自检，链接带 `-lm`）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

@@ -1,0 +1,130 @@
+/* examples/stdstats2.c6 —— 第六十四批（统计小工具）的集成示例。
+ *
+ *     make std-stats
+ *
+ * 四节：直方图分箱、滑动平均（SMA/EMA）、序列统计（均值/标准差/相关）、
+ * 分位数与四分位。全部用**方法**（`h.add`、`m.push`、`a.mean`、`q.compute`）。
+ * 链接需要 `-lm`（series 用了 sqrt）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.histogram;
+import std.core.moving;
+import std.core.series;
+import std.core.quantile;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static int near(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+static void do_histogram(void)
+{
+    i64 counts[5] = { 0 };
+    Hist h = { 0 };
+    double lo = 0, hi = 0;
+    int i = 0;
+
+    printf("== histogram\n");
+    check(h.init(counts, 5, 0.0, 5.0) == 1, "init 5 箱");
+    for (i = 0; i < 20; i++)
+        h.add((double)(i % 5) + 0.5);
+    printf("   20 个样本，箱宽 %.1f，均值 ≈ %.2f\n", h.step(), h.mean());
+    check(h.total() == 20 && h.step() > 0.999 && h.step() < 1.001, "总数与箱宽");
+    check(h.count(0) == 4 && h.count(4) == 4, "每箱各 4 个");
+    check(h.mode(&lo, &hi) == 1 && near(lo, 0.0, 1e-9), "众数箱从左数第一个");
+    check(near(h.mean(), 2.5, 0.01), "箱中心均值约 2.5");
+    check(h.max_count() == 4, "最大计数");
+}
+
+static void do_moving(void)
+{
+    double buf[4] = { 0 };
+    Ma m = { 0 };
+    double v = 0, e = 0;
+
+    printf("== moving\n");
+    check(m.init(buf, 4) == 1, "init 窗口 4");
+    m.push(10);
+    m.push(20);
+    v = m.push(30);
+    printf("   10,20,30 → SMA %.1f，", v);
+    check(near(v, 20.0, 1e-9), "三个样本的 SMA");
+    m.push(40);
+    v = m.push(50);
+    e = m.ema_push(50, 0.5);
+    printf("滑入 50 后 SMA %.1f，EMA %.1f\n", v, e);
+    check(near(v, 35.0, 1e-9), "窗口滑动后 SMA 35");
+    check(near(m.last(), 50.0, 1e-9), "last 是 50");
+    m.reset();
+    check(m.count() == 0 && near(m.sma(), 0.0, 1e-9), "reset 之后清零");
+}
+
+static void do_series(void)
+{
+    double xs[5] = { 1, 2, 3, 4, 5 };
+    double ys[5] = { 2, 4, 6, 8, 10 };
+    Series a = { 0 };
+    Series b = { 0 };
+    double m = 0, sd = 0, lo = 0, hi = 0;
+
+    printf("== series\n");
+    a.bind(xs, 5);
+    b.bind(ys, 5);
+    a.summarize(&m, &sd, &lo, &hi);
+    printf("   xs：均值 %.1f，标准差 %.3f，范围 %.0f..%.0f\n", m, sd, lo, hi);
+    check(near(m, 3.0, 1e-9) && near(lo, 1.0, 1e-9) && near(hi, 5.0, 1e-9),
+          "均值与最值");
+    check(near(sd, 1.5811388, 1e-6), "样本标准差");
+    check(near(a.corr(&b), 1.0, 1e-9), "xs 与 2×xs 完全相关");
+    check(near(a.cov(&b), 5.0, 1e-9), "协方差 5");
+    check(a.count() == 5 && b.count() == 5, "count 方法");
+}
+
+static void do_quantile(void)
+{
+    double xs[9] = { 9, 1, 8, 2, 7, 3, 6, 4, 5 };
+    Quartiles q = { 0 };
+    double copy[9] = { 9, 1, 8, 2, 7, 3, 6, 4, 5 };
+
+    printf("== quantile\n");
+    check(q.compute(xs, 9) == 1, "compute");
+    printf("   p25=%.1f p50=%.1f p75=%.1f IQR=%.1f\n", q.p25, q.p50, q.p75,
+           q.iqr);
+    check(near(q.p25, 3.0, 1e-9) && near(q.p50, 5.0, 1e-9)
+          && near(q.p75, 7.0, 1e-9), "四分位");
+    check(near(q.iqr, 4.0, 1e-9), "IQR");
+    check(near(median(copy, 9), 5.0, 1e-9), "median");
+    check(values_in(copy, 9, 0.25, 0.75) == 5, "中间 50% 的样本数");
+}
+
+int main(void)
+{
+    do_histogram();
+    do_moving();
+    do_series();
+    do_quantile();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

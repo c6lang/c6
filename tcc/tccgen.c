@@ -12970,6 +12970,10 @@ static const struct C6ErrStdSlot {
     { "std.container.queue",    C6_ERR_SLOT_STD + 262 },
     { "std.container.slots",    C6_ERR_SLOT_STD + 263 },
     { "std.container.bag",      C6_ERR_SLOT_STD + 264 },
+    { "std.core.histogram",     C6_ERR_SLOT_STD + 265 },
+    { "std.core.moving",        C6_ERR_SLOT_STD + 266 },
+    { "std.core.series",        C6_ERR_SLOT_STD + 267 },
+    { "std.core.quantile",      C6_ERR_SLOT_STD + 268 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

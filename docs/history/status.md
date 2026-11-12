@@ -2168,6 +2168,30 @@ systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，�
 验收：`make stdtest`（265 个模块、0 failure）、`make std-cont`（22 条自检全过）、
 `make check-all`。
 
+### 11.76 标准库第六十四批（histogram / moving / series / quantile）
+
+第六十四批补「统计小工具」：等宽直方图、滑动平均（SMA/EMA）、序列统计与分位数。
+四个都是「调用方给缓冲区/数组 + 方法读状态」的形态。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.histogram` | 直方图 | 等宽分箱，越界值夹到首尾箱；`mean` 用箱中心近似（文档写明「夹断会有偏」）；`mode` 返回箱的左右边界而不是箱号，调用方更好用 |
+| `std.core.moving` | 滑动平均 | 环形缓冲 + 常驻 `sum` → `push` 是 O(1)；EMA 是独立累加器、首样本直接作初值；`alpha` 夹到 0..1，`alpha=0` 时 EMA 不变 |
+| `std.core.series` | 序列统计 | 方差用样本公式（n-1）；`cov`/`corr` 长度不等时按前 n 个**配对**，均值也只取这 n 个（第一版用整段均值，结果和配对样本不自洽，测试里 4 vs 2 才发现） |
+| `std.core.quantile` | 分位数 | 线性插值定义与 NumPy 默认一致；`quantile` **就地排序**（文档强调要保留顺序先复制）；插入排序只适合小数据集 |
+
+字段与同名方法的老问题又出现两次：`Hist.total` → `n`、`Ma.ema` → `emav`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.histogram`=0x6109、
+`std.core.moving`=0x610a、`std.core.series`=0x610b、`std.core.quantile`=0x610c；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-stats` 与 `STD_STATS2_SRCS`（带 `-lm`），
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdstats2.c6` 四节（21 条自检）。
+
+验收：`make stdtest`（269 个模块、0 failure）、`make std-stats`（21 条自检全过）、
+`make check-all`。
+
+
 
 
 

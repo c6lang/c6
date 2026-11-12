@@ -400,6 +400,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/container/queue.c6    std.container.queue    环形 FIFO：方法 bind/push/pop/peek，回绕后仍保持先进先出
   std/container/slots.c6    std.container.slots    位图槽位分配器：alloc/free_slot/alloc_contig/is_used，一个 bit 一个槽
   std/container/bag.c6      std.container.bag      i64 多重集合：add/remove/count_of/max，删到 0 留墓碑保护同簇查找
+  std/core/histogram.c6     std.core.histogram     等宽直方图：分箱计数、众数箱、按箱中心估计均值
+  std/core/moving.c6        std.core.moving        滑动平均：O(1) SMA（环形缓冲）与 EMA（alpha 夹断）
+  std/core/series.c6        std.core.series        序列统计：均值/样本方差/标准差/协方差/Pearson 相关/summarize
+  std/core/quantile.c6      std.core.quantile      分位数：线性插值（NumPy 风格）、中位数、四分位距、区间计数
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -519,6 +523,7 @@ make std-bin2     # 编译并运行 examples/stdbin2.c6（第六十批二进制�
 make std-clean    # 编译并运行 examples/stdclean.c6（第六十一批文本清洗与标注模块的拼装示例）
 make std-color    # 编译并运行 examples/stdcolor.c6（第六十二批颜色与单位模块的拼装示例）
 make std-cont     # 编译并运行 examples/stdcontainers.c6（第六十三批基础容器补充模块的拼装示例）
+make std-stats    # 编译并运行 examples/stdstats2.c6（第六十四批统计小工具模块的拼装示例，链接带 -lm）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

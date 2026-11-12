@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第六十四批（统计小工具）**：`std.core.histogram`（等宽直方图与众数箱）、
+  `std.core.moving`（SMA/EMA 滑动平均）、`std.core.series`（均值/方差/协方差/相关）、
+  `std.core.quantile`（分位数、中位数、四分位距），集成示例
+  `examples/stdstats2.c6`（`make std-stats`，链接带 `-lm`）。错误号段
+  `std.core.histogram`=0x6109 … `std.core.quantile`=0x610c
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十三批（基础容器补充）**：`std.container.stack`（i64 栈）、
   `std.container.queue`（环形 FIFO）、`std.container.slots`（位图槽位分配器）、
   `std.container.bag`（i64 多重集合，墓碑删除），集成示例
