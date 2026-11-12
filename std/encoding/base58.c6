@@ -1,0 +1,246 @@
+/* std/encoding/base58：Bitcoin 风格的 Base58（不分配）。
+ *
+ *     import std.encoding.base58;
+ *
+ *     char out[64] = { 0 };
+ *     int n = b58_encode(S("hello world"), out, sizeof out);  // "StV1DL6CwTryKyV"
+ *     b58_decode(S("StV1DL6CwTryKyV"), buf, sizeof buf);     // 11, "hello world"
+ *
+ * 字母表是 Bitcoin 的 `123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`
+ * （去掉了容易混淆的 0/O/I/l）。编码把输入当大端无符号整数反复除以 58，前导
+ * 零字节写成前导 `1`；解码反过来。和 base32/base64 一样：写调用方缓冲，
+ * 放不下返回 -1 且一个字节都不写；解码先校验字符再写第二遍。
+ *
+ * `b58_encoded_len` 是**上界**（`zeros + (n-zeros)*138/100 + 1`），不是精确值：
+ * 精确长度要真做一遍大数除法，调用方按上界给缓冲即可；`b58_encode` 返回实际长度。
+ */
+#include <string.h>
+
+module std.encoding.base58;
+import std.core.types;
+
+static char *b58_alpha(void)
+{
+    return (char *)"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+}
+
+static int b58_val(int c)
+{
+    int i = 0;
+
+    for (i = 0; i < 58; i++)
+        if (b58_alpha()[i] == c)
+            return i;
+    return -1;
+}
+
+/* 编码上界；空输入给 0，全零输入给 n（每个零字节一个 '1'）。 */
+int b58_encoded_len(char[:] s)
+{
+    int n = s.len;
+    int zeros = 0;
+
+    if (n <= 0)
+        return 0;
+    while (zeros < n && s.data[zeros] == 0)
+        zeros++;
+    if (zeros == n)
+        return zeros;
+    return zeros + (n - zeros) * 138 / 100 + 1;
+}
+
+/* 解码缓冲的上界：n 个 base58 字符最多产生这么多字节。 */
+int b58_max_decoded_len(int n)
+{
+    if (n <= 0)
+        return 0;
+    return n * 733 / 1000 + 1;
+}
+
+int b58_valid(char[:] s)
+{
+    int i = 0;
+
+    for (i = 0; i < s.len; i++)
+        if (b58_val((u8)s.data[i]) < 0)
+            return 0;
+    return 1;
+}
+
+/* 编码；cap 不够返回 -1 且不写任何内容。 */
+int b58_encode(char[:] s, char *dst, int cap)
+{
+    int n = s.len;
+    int zeros = 0;
+    int size = 0;
+    int i = 0;
+    int j = 0;
+    int carry = 0;
+    int high = 0;
+
+    if (n < 0 || (n > 0 && !dst))
+        return -1;
+    while (zeros < n && s.data[zeros] == 0)
+        zeros++;
+    if (zeros == n) {            /* 全是前导零：只写 '1'，不占 size */
+        if (zeros > cap)
+            return -1;
+        for (i = 0; i < zeros; i++)
+            dst[i] = '1';
+        return zeros;
+    }
+    size = (n - zeros) * 138 / 100 + 1;
+    if (zeros + size > cap)
+        return -1;
+    for (i = 0; i < zeros; i++)
+        dst[i] = '1';
+    memset(dst + zeros, 0, size);
+    for (i = zeros; i < n; i++) {
+        carry = (u8)s.data[i];
+        for (j = 0; j < size; j++) {
+            carry += 256 * (u8)dst[zeros + j];
+            dst[zeros + j] = (char)(carry % 58);
+            carry /= 58;
+        }
+    }
+    high = size - 1;
+    while (high >= 0 && dst[zeros + high] == 0)
+        high--;
+    if (high < 0)
+        return zeros;
+    for (i = 0; i <= high / 2; i++) {
+        char t = dst[zeros + i];
+
+        dst[zeros + i] = dst[zeros + high - i];
+        dst[zeros + high - i] = t;
+    }
+    for (i = 0; i <= high; i++)
+        dst[zeros + i] = b58_alpha()[(u8)dst[zeros + i]];
+    return zeros + high + 1;
+}
+
+/* 解码；非法字符或 cap 不够返回 -1 且不写任何内容。 */
+int b58_decode(char[:] s, char *dst, int cap)
+{
+    int n = s.len;
+    int ones = 0;
+    int size = 0;
+    int i = 0;
+    int j = 0;
+    int carry = 0;
+    int high = 0;
+
+    if (n < 0 || (n > 0 && !dst))
+        return -1;
+    for (i = 0; i < n; i++)
+        if (b58_val((u8)s.data[i]) < 0)
+            return -1;
+    while (ones < n && s.data[ones] == '1')
+        ones++;
+    if (ones == n) {
+        if (ones > cap)
+            return -1;
+        memset(dst, 0, ones);
+        return ones;
+    }
+    size = (n - ones) * 733 / 1000 + 1;
+    if (ones + size > cap)
+        return -1;
+    memset(dst + ones, 0, size);
+    for (i = ones; i < n; i++) {
+        carry = b58_val((u8)s.data[i]);
+        for (j = 0; j < size; j++) {
+            carry += 58 * (u8)dst[ones + j];
+            dst[ones + j] = (char)(carry & 0xff);
+            carry >>= 8;
+        }
+    }
+    high = size - 1;
+    while (high >= 0 && dst[ones + high] == 0)
+        high--;
+    if (high < 0)
+        return ones;
+    for (i = 0; i <= high / 2; i++) {
+        char t = dst[ones + i];
+
+        dst[ones + i] = dst[ones + high - i];
+        dst[ones + high - i] = t;
+    }
+    memset(dst, 0, ones);
+    return ones + high + 1;
+}
+
+/* ---- 自测 ---- */
+
+#define B58S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int enc(const char *p, int n, char *out, int cap)
+{
+    if (out && cap > 0)
+        memset(out, 0, cap);
+    return b58_encode((char[:]){ (char *)p, n }, out, cap);
+}
+
+test "已知向量与前导零" {
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+
+    if (enc("", 0, out, sizeof out) != 0)
+        return err(1, "空串编码不是 0");
+    if (enc("hello world", 11, out, sizeof out) != 15
+        || strcmp(out, "StV1DL6CwTryKyV") != 0)
+        return err(2, "hello world 向量不对");
+    if (enc("abc", 3, out, sizeof out) != 4 || strcmp(out, "ZiCa") != 0)
+        return err(3, "abc 向量不对");
+    if (enc("\0", 1, out, sizeof out) != 1 || out[0] != '1')
+        return err(4, "单个零字节不是 1");
+    if (enc("\0\0", 2, out, sizeof out) != 2 || out[0] != '1' || out[1] != '1')
+        return err(5, "两个零字节不是 11");
+    if (enc("\0\0\1", 3, out, sizeof out) != 3
+        || strcmp(out, "112") != 0)
+        return err(6, "前导零加 1 不对");
+    if (b58_decode(B58S("112"), back, sizeof back) != 3
+        || back[0] != 0 || back[1] != 0 || back[2] != 1)
+        return err(7, "前导零解码不对");
+}
+
+test "往返：含零字节与高位字节" {
+    char src[32] = { 0 };
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+    int i = 0;
+    int n = 0;
+
+    for (i = 0; i < (int)sizeof src; i++)
+        src[i] = (char)((i * 37 + 11) & 0xff);
+    n = b58_encode((char[:]){ src, sizeof src }, out, sizeof out);
+    if (n <= 0 || b58_decode((char[:]){ out, n }, back, sizeof back) != (int)sizeof src)
+        return err(8, "往返长度不对");
+    if (memcmp(src, back, sizeof src) != 0)
+        return err(9, "往返内容不对");
+    if (!b58_valid((char[:]){ out, n }))
+        return err(10, "编码结果不是合法 base58");
+}
+
+test "非法字符、valid 与容量" {
+    char out[8] = { 0 };
+    char back[8] = { 0 };
+    int i = 0;
+
+    if (b58_valid(B58S("0OIl")) || b58_valid(B58S("abc0")))
+        return err(11, "非法字符被 valid 放过");
+    for (i = 0; i < (int)sizeof back; i++)
+        back[i] = (char)0xaa;
+    if (b58_decode(B58S("0OIl"), back, sizeof back) != -1)
+        return err(12, "非法字符没有拒绝");
+    for (i = 0; i < (int)sizeof back; i++)
+        if (back[i] != (char)0xaa)
+            return err(13, "拒绝非法输入时写了半个结果");
+    if (enc("hello world", 11, out, 4) != -1)
+        return err(14, "编码容量不够没有返回 -1");
+    if (b58_decode(B58S("StV1DL6CwTryKyV"), back, 4) != -1)
+        return err(15, "解码容量不够没有返回 -1");
+    if (b58_encoded_len(B58S("hello world")) < 14
+        || b58_max_decoded_len(14) < 11)
+        return err(16, "长度上界太小");
+}

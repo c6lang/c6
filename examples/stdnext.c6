@@ -1,0 +1,149 @@
+/* stdnext：标准库第八批（base58 / varint / semver / cookie）的拼装示例。
+ *
+ * 和 stdtour/stdkit/stdmore 一样：这个文件没有 `module`（入口 `main` 只能写在
+ * 不属于任何模块的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdnext \
+ *         examples/stdnext.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/text/str.c6 std/encoding/base58.c6 std/encoding/varint.c6 \
+ *         std/text/semver.c6 std/net/cookie.c6
+ *
+ * 用到的东西：
+ *   std.encoding.base58   Bitcoin Base58：前导零、字母表、编解码
+ *   std.encoding.varint   LEB128 无符号/有符号（zigzag）
+ *   std.text.semver       语义化版本 2.0.0 的解析、优先级比较、格式化
+ *   std.net.cookie        Set-Cookie / Cookie: 的零分配解析
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.err;
+import std.text.str;
+import std.encoding.base58;
+import std.encoding.varint;
+import std.text.semver;
+import std.net.cookie;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static Str hs(const char *s)
+{
+    return (Str){ (char[:]){ (char *)s, (int)strlen(s) } };
+}
+
+static void tour_base58(void)
+{
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+    int n = 0;
+
+    n = b58_encode(S("hello world"), out, sizeof out);
+    check(n == 15 && strcmp(out, "StV1DL6CwTryKyV") == 0,
+          "base58: hello world 编码");
+    n = b58_decode(S("StV1DL6CwTryKyV"), back, sizeof back);
+    check(n == 11 && memcmp(back, "hello world", 11) == 0,
+          "base58: 解码往返");
+    n = b58_encode(S("\0\0\1"), out, sizeof out);
+    check(n == 3 && memcmp(out, "112", 3) == 0, "base58: 前导零");
+    check(!b58_valid(S("0OIl")), "base58: 非法字母表");
+}
+
+static void tour_varint(void)
+{
+    char buf[16] = { 0 };
+    u64 u = 0;
+    i64 s = 0;
+    int n = 0;
+    int pos = 0;
+
+    n = uvarint_encode(300, buf, sizeof buf);
+    check(n == 2 && (u8)buf[0] == 0xac && (u8)buf[1] == 0x02,
+          "varint: 300 编码");
+    pos = 0;
+    if (uvarint_decode((char[:]){ buf, n }, &pos, &u) != 1) {
+        check(0, "varint: 解码失败");
+        return;
+    }
+    check(u == 300 && pos == 2, "varint: 300 解码");
+
+    n = svarint_encode(-1234567890123ll, buf, sizeof buf);
+    pos = 0;
+    if (svarint_decode((char[:]){ buf, n }, &pos, &s) != 1) {
+        check(0, "varint: 有符号解码失败");
+        return;
+    }
+    check(s == -1234567890123ll, "varint: 有符号往返");
+    check(uvarint_encoded_len(0xffffffffffffffffull) == 10,
+          "varint: u64 长度");
+}
+
+static void tour_semver(void)
+{
+    const char *order[] = {
+        "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-beta", "1.0.0-rc.1",
+        "1.0.0"
+    };
+    Semver v = semver_parse(hs("2.3.4-rc.1+build.9"));
+    char buf[64] = { 0 };
+    int i = 0;
+
+    check(v.ok && v.major == 2 && v.minor == 3 && v.patch == 4,
+          "semver: 解析数字段");
+    check(v.is_prerelease() && v.pre.s.len == 4, "semver: 预发布视图");
+    check(v.format(buf, sizeof buf) == 18
+              && strcmp(buf, "2.3.4-rc.1+build.9") == 0,
+          "semver: 格式化");
+    for (i = 0; i + 1 < 5; i++) {
+        Semver a = semver_parse(hs(order[i]));
+        Semver b = semver_parse(hs(order[i + 1]));
+
+        check(a.compare(&b) == -1, "semver: 优先级顺序");
+    }
+    check(!semver_parse(hs("01.2.3")).ok, "semver: 拒绝前导零");
+}
+
+static void tour_cookie(void)
+{
+    Cookie c = cookie_parse_set(hs("sid=abc123; Path=/app; Max-Age=3600; "
+                                   "Secure; HttpOnly; SameSite=Lax"));
+    char buf[32] = { 0 };
+    int age = 0;
+
+    check(c.ok && c.name.s.len == 3 && c.value.s.len == 6,
+          "cookie: name/value");
+    check(c.path().s.len == 4 && memcmp(c.path().s.data, "/app", 4) == 0,
+          "cookie: Path");
+    check(c.is_secure() && c.is_http_only(), "cookie: 旗标");
+    check(c.max_age(&age) && age == 3600, "cookie: Max-Age");
+    check(c.same_site().s.len == 3, "cookie: SameSite");
+    check(cookie_write_pair(c.name, c.value, buf, sizeof buf) == 10
+              && strcmp(buf, "sid=abc123") == 0,
+          "cookie: 写回 name=value");
+    check(!cookie_parse_set(hs("bad; Path=/")).ok, "cookie: 拒绝坏输入");
+}
+
+int main(void)
+{
+    printf("stdnext: 标准库第八批（base58 / varint / semver / cookie）\n");
+    tour_base58();
+    tour_varint();
+    tour_semver();
+    tour_cookie();
+    printf("stdnext: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

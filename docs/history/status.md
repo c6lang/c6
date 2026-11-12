@@ -774,3 +774,23 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 
 验收：`make stdtest`（41 个模块、0 failure）、`make std-more`（28 条自检全过）、
 `make check-all`。
+
+### 11.19 标准库第八批（base58 / varint / semver / cookie）
+
+第八批补的是**大数编码、变长整数和两个协议/版本辅助模块**，继续按 11.17 的硬性要求
+用结构体方法：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.base58` | Bitcoin 字母表的 Base58 | 前导零字节写 `1`；编码把输入当大端整数反复除 58；`b58_encoded_len` 明确是上界（精确长度要真做一遍大数除法），解码按 `b58_max_decoded_len` 给缓冲；放不下不写半截 |
+| `std.encoding.varint` | LEB128 无符号 / 有符号（zigzag） | 无符号最多 10 字节；解码返回 1/0/-1（成功/截断/非法或溢出），只有成功才更新游标与输出；zigzag 让小的负数也短 |
+| `std.text.semver` | 语义化版本 2.0.0 | 严格前导零与标识字符校验；预发布标识逐个比较（数字按长度、数字 < 非数字），构建标识不参与优先级；`format` 先算总长再写，放不下不写半截 |
+| `std.net.cookie` | Cookie / Set-Cookie 零分配解析 | 第一段 `name=value` 与 `;` 分隔的属性都是输入上的视图；属性名大小写不敏感，`Secure`/`HttpOnly` 无值旗标也算存在；不处理引号里的分号（明确限定） |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.base58`=0x6029、
+`std.encoding.varint`=0x602a、`std.text.semver`=0x602b、`std.net.cookie`=0x602c；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-next` 与 `STDNEXT_SRCS`，
+`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（45 个模块、0 failure）、`make std-next`（23 条自检全过）、
+`make check-all`。

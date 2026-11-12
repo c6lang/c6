@@ -90,6 +90,7 @@
 | `make std-web` | 编译并运行 `examples/stdweb.c6`（第五批模块的拼装示例） |
 | `make std-net` | 编译并运行 `examples/stdnet.c6`（第六批模块的拼装示例） |
 | `make std-more` | 编译并运行 `examples/stdmore.c6`（第七批模块的拼装示例） |
+| `make std-next` | 编译并运行 `examples/stdnext.c6`（第八批模块的拼装示例） |
 
 ### freestanding、裸机与交叉目标
 

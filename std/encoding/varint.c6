@@ -1,0 +1,220 @@
+/* std/encoding/varint：LEB128 变长整数与 zigzag 有符号编码。
+ *
+ *     import std.encoding.varint;
+ *
+ *     char buf[10] = { 0 };
+ *     int n = uvarint_encode(300, buf, sizeof buf);      // 2, { 0xac, 0x02 }
+ *     int pos = 0;
+ *     u64 v = 0;
+ *     uvarint_decode((char[:]){ buf, n }, &pos, &v);      // 1, v == 300
+ *
+ * 这是 Protobuf/LEB128 的那套：每字节低 7 位是数据，最高位表示还有下一字节；
+ * 无符号数最多 10 字节。`svarint_*` 先做 zigzag 映射（0 → 0、-1 → 1、1 → 2、
+ * -2 → 3），所以小的负数也只需要一个字节。
+ *
+ * 解码返回 1（成功）、0（输入在中间截断）、-1（非法/溢出/参数错）。只有成功时
+ * 才更新 `*pos` 并写 `*out`；失败时游标不动，方便调用方重试或报错。
+ */
+#include <string.h>
+
+module std.encoding.varint;
+import std.core.types;
+
+int uvarint_encoded_len(u64 v)
+{
+    int n = 1;
+
+    while (v >= 0x80) {
+        v >>= 7;
+        n++;
+    }
+    return n;
+}
+
+int uvarint_encode(u64 v, char *dst, int cap)
+{
+    int need = uvarint_encoded_len(v);
+    int i = 0;
+
+    if (need > cap || (need > 0 && !dst))
+        return -1;
+    while (v >= 0x80) {
+        dst[i++] = (char)((v & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    dst[i++] = (char)v;
+    return i;
+}
+
+int uvarint_decode(char[:] s, int *pos, u64 *out)
+{
+    int i = 0;
+    int shift = 0;
+    u64 v = 0;
+
+    if (!pos || !out || s.len < 0 || *pos < 0 || *pos > s.len)
+        return -1;
+    i = *pos;
+    while (i < s.len) {
+        int b = (u8)s.data[i++];
+
+        if (shift == 63) {
+            if ((b & 0x7e) != 0)
+                return -1;      /* 第 10 字节只能贡献最低位 */
+            v |= (u64)(b & 1) << 63;
+        } else if (shift < 63) {
+            v |= (u64)(b & 0x7f) << shift;
+        } else {
+            return -1;
+        }
+        if (!(b & 0x80)) {
+            *pos = i;
+            *out = v;
+            return 1;
+        }
+        shift += 7;
+        if (shift > 63)
+            return -1;
+    }
+    return 0;                   /* 截断 */
+}
+
+u64 zigzag_encode(i64 v)
+{
+    return ((u64)v << 1) ^ (u64)(v >> 63);
+}
+
+i64 zigzag_decode(u64 v)
+{
+    return (i64)(v >> 1) ^ -(i64)(v & 1);
+}
+
+int svarint_encoded_len(i64 v)
+{
+    return uvarint_encoded_len(zigzag_encode(v));
+}
+
+int svarint_encode(i64 v, char *dst, int cap)
+{
+    return uvarint_encode(zigzag_encode(v), dst, cap);
+}
+
+int svarint_decode(char[:] s, int *pos, i64 *out)
+{
+    u64 v = 0;
+    int rc = 0;
+
+    if (!out)
+        return -1;
+    rc = uvarint_decode(s, pos, &v);
+    if (rc == 1)
+        *out = zigzag_decode(v);
+    return rc;
+}
+
+/* ---- 自测 ---- */
+
+#define VI(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int uenc(u64 v, char *buf, int cap)
+{
+    return uvarint_encode(v, buf, cap);
+}
+
+static int udec(char *buf, int n, u64 *out)
+{
+    int pos = 0;
+    int rc = uvarint_decode((char[:]){ buf, n }, &pos, out);
+
+    return rc == 1 && pos == n ? 1 : rc;
+}
+
+test "无符号 LEB128 已知字节" {
+    char b[16] = { 0 };
+    u64 v = 0;
+
+    if (uenc(0, b, sizeof b) != 1 || b[0] != 0)
+        return err(1, "0 的编码不对");
+    if (uenc(127, b, sizeof b) != 1 || b[0] != 0x7f)
+        return err(2, "127 的编码不对");
+    if (uenc(128, b, sizeof b) != 2 || (u8)b[0] != 0x80 || b[1] != 1)
+        return err(3, "128 的编码不对");
+    if (uenc(300, b, sizeof b) != 2 || (u8)b[0] != 0xac || b[1] != 2)
+        return err(4, "300 的编码不对");
+    if (uenc(624485, b, sizeof b) != 3 || (u8)b[0] != 0xe5
+        || (u8)b[1] != 0x8e || b[2] != 0x26)
+        return err(5, "624485 的编码不对");
+    if (udec(b, 3, &v) != 1 || v != 624485)
+        return err(6, "624485 的解码不对");
+    if (uvarint_encoded_len(0) != 1 || uvarint_encoded_len(127) != 1
+        || uvarint_encoded_len(128) != 2 || uvarint_encoded_len(300) != 2)
+        return err(7, "encoded_len 不对");
+}
+
+test "u64 最大值与截断 / 溢出" {
+    char b[16] = { 0 };
+    u64 v = 0;
+    int n = 0;
+
+    n = uenc(0xffffffffffffffffull, b, sizeof b);
+    if (n != 10 || (u8)b[9] != 1)
+        return err(8, "u64 最大值的编码不对");
+    if (udec(b, n, &v) != 1 || v != 0xffffffffffffffffull)
+        return err(9, "u64 最大值的解码不对");
+    if (udec(b, n - 1, &v) != 0)
+        return err(10, "截断输入没有返回 0");
+
+    memset(b, 0x80, 11);
+    b[10] = 0;
+    if (udec(b, 11, &v) != -1)
+        return err(11, "超长 varint 没有报错");
+    memset(b, 0x80, 9);
+    b[9] = 0x02;
+    if (udec(b, 10, &v) != -1)
+        return err(12, "第 10 字节溢出没有报错");
+}
+
+test "zigzag 有符号往返" {
+    char b[16] = { 0 };
+    i64 vals[8] = { 0, -1, 1, -2, 2, -1234567890123ll, 1234567890123ll,
+                    -9223372036854775807ll - 1 };
+    int i = 0;
+    int pos = 0;
+
+    if (zigzag_encode(0) != 0 || zigzag_encode(-1) != 1
+        || zigzag_encode(1) != 2 || zigzag_encode(-2) != 3)
+        return err(13, "zigzag 映射不对");
+    if (zigzag_decode(0) != 0 || zigzag_decode(1) != -1
+        || zigzag_decode(2) != 1 || zigzag_decode(3) != -2)
+        return err(14, "zigzag 反映射不对");
+    for (i = 0; i < 8; i++) {
+        i64 out = 0;
+        int n = svarint_encode(vals[i], b, sizeof b);
+
+        pos = 0;
+        if (n <= 0 || svarint_decode((char[:]){ b, n }, &pos, &out) != 1)
+            return err(15, "sv 编解码失败");
+        if (out != vals[i])
+            return err(16, "sv 往返值不对");
+    }
+}
+
+test "容量、空指针与游标" {
+    char b[2] = { 0 };
+    u64 v = 0;
+    i64 sv = 0;
+    int pos = 0;
+
+    if (uvarint_encode(300, b, 1) != -1)
+        return err(17, "容量不够没有返回 -1");
+    if (uvarint_encode(1, 0, 0) != -1)
+        return err(18, "空缓冲没有返回 -1");
+    if (uvarint_decode(VI(""), &pos, &v) != 0 || pos != 0)
+        return err(19, "空输入不是截断");
+    pos = 1;
+    if (uvarint_decode(VI(""), &pos, &v) != -1)
+        return err(20, "越界 pos 没有报错");
+    pos = 0;
+    if (svarint_decode(VI("\x80"), &pos, &sv) != 0)
+        return err(21, "截断的 sv 不是 0");
+}

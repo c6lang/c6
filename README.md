@@ -179,6 +179,7 @@ std/text/                   文本：字符串视图与缓冲、格式化、UTF-
   std/text/strbuf.c6        std.text.strbuf        会长的字符缓冲 StrBuf（托管引用）：write/write_int/write_hex、reserve/truncate/cstr
   std/text/utf8.c6          std.text.utf8          UTF-8 解码/编码/校验/计数 + Rune 迭代器（拒绝过长编码、代理区、截断）
   std/text/glob.c6          std.text.glob          shell 风格 glob（零分配）：Glob 的 match/match_path/has_magic、* ? [] 字符类与转义
+  std/text/semver.c6        std.text.semver        语义化版本 2.0.0：semver_parse、Semver 的 compare/is_prerelease/format（严格前导零与标识校验）
 
 std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序
   std/container/deque.c6    std.container.deque    环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
@@ -200,6 +201,8 @@ std/os/                     操作系统：流、文件系统、路径、环境�
 
 std/encoding/               编解码：Base32/Base64/十六进制/百分号、SHA-256、位流、UUID
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
+  std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
+  std/encoding/varint.c6    std.encoding.varint    LEB128：uvarint/svarint 编解码、zigzag、*_encoded_len（解码返回 1/0/-1）
   std/encoding/base64.c6    std.encoding.base64    Base64（RFC 4648）标准表与 URL 安全表：b64_encode/b64_decode、b64url_encode/b64url_decode、显式表与填充的 b64_encode_ex/b64_decode_ex/b64_decoded_len/b64_encoded_len、b64_valid、就地 b64_decode_inplace/b64url_decode_inplace（跳过空白、严格填充、放不下不写半截）
   std/encoding/bitbuf.c6    std.encoding.bitbuf    位级读写器（零分配、MSB 先）：bw_open/put/put_u64/put_bit/align/put_bytes/patch（回填不改游标）、br_open/get/get_u64/get_bit/peek/skip/align/get_bytes、bit_count/byte_count/ok/remaining/eof
   std/encoding/codec.c6     std.encoding.codec     Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
@@ -212,6 +215,7 @@ std/data/                   数据格式：JSON、CSV、INI
   std/data/json.c6          std.data.json          JSON 解析与写出：Arena 上的 DOM（a.json_parse）、Json 的 get/at、write/write_pretty/escape（数字保留原文）
 
 std/net/                    网络与 Web：IP/CIDR、URL、MIME、HTTP/1.x
+  std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
   std/net/http.c6           std.net.http           HTTP/1.x 零分配解析：http_parse_request/response、HttpMessage 的 header/header_at/body/content_length、http_status_text
   std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_parse_v4/inet_parse_v6，Ip/Ipv4/Ipv6 的 format（IPv6 按 RFC 5952 压缩）、inet_parse_cidr/cidr_contains/cidr_mask/inet_v4_mask、is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
   std/net/mime.c6           std.net.mime           扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：mime_of_ext/mime_of_path/mime_ext_of/mime_ext_at/mime_type_at/mime_count、mime_is_text/is_image/is_audio/is_video/is_font、mime_charset、mime_sniff、mime_default

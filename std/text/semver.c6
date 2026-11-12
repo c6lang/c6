@@ -1,0 +1,405 @@
+/* std/text/semver：语义化版本 2.0.0 的解析、比较与格式化。
+ *
+ *     import std.text.semver;
+ *
+ *     Semver v = semver_parse(S("1.2.3-rc.1+build.7"));
+ *     v.major;  v.minor;  v.patch;
+ *     v.pre;    v.build;              // 输入上的视图
+ *     v.is_prerelease();              // 1
+ *     v.compare(&other);              // -1 / 0 / 1
+ *     v.format(buf, sizeof buf);      // "1.2.3-rc.1+build.7"
+ *
+ * 严格按 semver.org 的语法：`major.minor.patch`，数字标识不能有前导零；
+ * 预发布标识在 `-` 后、构建标识在 `+` 后，都用 `.` 分隔，只允许
+ * `[0-9A-Za-z-]`。预发布里纯数字的标识按数值比较，数字标识小于非数字标识；
+ * 构建标识**不参与优先级**。解析失败时 `ok == 0`，`err` 是 `PARSE`（语法错）
+ * 或 `INVAL`（空输入）。
+ */
+#include <string.h>
+
+module std.text.semver;
+import std.core.types;
+import std.text.str;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2 };
+
+struct Semver {
+    i64 major;
+    i64 minor;
+    i64 patch;
+    Str pre;
+    Str build;
+    int ok;
+    int err;
+};
+
+static int sv_digit(int c) { return c >= '0' && c <= '9'; }
+
+static int sv_num(Str s, int *pos, i64 *out)
+{
+    int p = *pos;
+    int start = p;
+    i64 v = 0;
+
+    if (p >= s.s.len || !sv_digit((u8)s.s.data[p]))
+        return 0;
+    if (s.s.data[p] == '0' && p + 1 < s.s.len
+        && sv_digit((u8)s.s.data[p + 1]))
+        return 0;               /* 前导零 */
+    while (p < s.s.len && sv_digit((u8)s.s.data[p])) {
+        int d = s.s.data[p] - '0';
+
+        if (v > (9223372036854775807ll - d) / 10)
+            return 0;           /* 溢出 */
+        v = v * 10 + d;
+        p++;
+    }
+    if (p == start)
+        return 0;
+    *pos = p;
+    *out = v;
+    return 1;
+}
+
+static int sv_id_char(int c)
+{
+    return sv_digit(c) || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+        || c == '-';
+}
+
+/* 校验一串用 '.' 分隔的标识；pre != 0 时纯数字标识不能有前导零。 */
+static int sv_ids_ok(Str s, int pre)
+{
+    int p = 0;
+
+    if (s.s.len <= 0)
+        return 0;
+    while (p < s.s.len) {
+        int start = p;
+        int numeric = 1;
+
+        while (p < s.s.len && s.s.data[p] != '.') {
+            if (!sv_id_char((u8)s.s.data[p]))
+                return 0;
+            if (!sv_digit((u8)s.s.data[p]))
+                numeric = 0;
+            p++;
+        }
+        if (p == start)
+            return 0;           /* 空标识 */
+        if (pre && numeric && p - start > 1 && s.s.data[start] == '0')
+            return 0;           /* 预发布数字标识的前导零 */
+        if (p < s.s.len)
+            p++;                /* 跳过 '.' */
+    }
+    return 1;
+}
+
+static Semver sv_fail(int ecode)
+{
+    Semver v = { 0 };
+
+    v.err = ecode;
+    return v;
+}
+
+Semver semver_parse(Str s)
+{
+    Semver v = { 0 };
+    int p = 0;
+    int start = 0;
+
+    if (!s.s.data || s.s.len <= 0)
+        return sv_fail(INVAL);
+    if (!sv_num(s, &p, &v.major) || p >= s.s.len || s.s.data[p++] != '.')
+        return sv_fail(PARSE);
+    if (!sv_num(s, &p, &v.minor) || p >= s.s.len || s.s.data[p++] != '.')
+        return sv_fail(PARSE);
+    if (!sv_num(s, &p, &v.patch))
+        return sv_fail(PARSE);
+
+    if (p < s.s.len && s.s.data[p] == '-') {
+        start = ++p;
+        while (p < s.s.len && s.s.data[p] != '+')
+            p++;
+        v.pre.s = (char[:]){ s.s.data + start, p - start };
+        if (!sv_ids_ok(v.pre, 1))
+            return sv_fail(PARSE);
+    }
+    if (p < s.s.len && s.s.data[p] == '+') {
+        start = ++p;
+        p = s.s.len;
+        v.build.s = (char[:]){ s.s.data + start, p - start };
+        if (!sv_ids_ok(v.build, 0))
+            return sv_fail(PARSE);
+    }
+    if (p != s.s.len)
+        return sv_fail(PARSE);
+    v.ok = 1;
+    return v;
+}
+
+int is_prerelease(Semver *self)
+{
+    return self && self->ok && self->pre.s.len > 0;
+}
+
+static int sv_numeric(Str s)
+{
+    int i = 0;
+
+    if (s.s.len <= 0)
+        return 0;
+    for (i = 0; i < s.s.len; i++)
+        if (!sv_digit((u8)s.s.data[i]))
+            return 0;
+    return 1;
+}
+
+/* 预发布标识逐个比较：数字按长度/字典序（无前导零，长度即大小）。 */
+static int sv_cmp_id(Str a, Str b)
+{
+    int na = sv_numeric(a);
+    int nb = sv_numeric(b);
+    int n = 0;
+    int c = 0;
+
+    if (na && nb) {
+        if (a.s.len != b.s.len)
+            return a.s.len < b.s.len ? -1 : 1;
+        c = memcmp(a.s.data, b.s.data, a.s.len);
+        return c < 0 ? -1 : c > 0 ? 1 : 0;
+    }
+    if (na != nb)
+        return na ? -1 : 1;
+    n = a.s.len < b.s.len ? a.s.len : b.s.len;
+    c = memcmp(a.s.data, b.s.data, n);
+    if (c != 0)
+        return c < 0 ? -1 : 1;
+    if (a.s.len == b.s.len)
+        return 0;
+    return a.s.len < b.s.len ? -1 : 1;
+}
+
+static int sv_next_id(Str s, int *pos, Str *id)
+{
+    int p = *pos;
+    int start = p;
+
+    if (p >= s.s.len)
+        return 0;
+    while (p < s.s.len && s.s.data[p] != '.')
+        p++;
+    id->s = (char[:]){ s.s.data + start, p - start };
+    *pos = p < s.s.len ? p + 1 : p;
+    return 1;
+}
+
+static int sv_cmp_pre(Str a, Str b)
+{
+    int pa = 0;
+    int pb = 0;
+    int ha = 0;
+    int hb = 0;
+    int c = 0;
+    Str ia = { 0 };
+    Str ib = { 0 };
+
+    while (1) {
+        ha = sv_next_id(a, &pa, &ia);
+        hb = sv_next_id(b, &pb, &ib);
+        if (!ha && !hb)
+            return 0;
+        if (!ha)
+            return -1;
+        if (!hb)
+            return 1;
+        c = sv_cmp_id(ia, ib);
+        if (c != 0)
+            return c;
+    }
+}
+
+int compare(Semver *a, Semver *b)
+{
+    if (!a || !b || !a->ok || !b->ok)
+        return 0;
+    if (a->major != b->major)
+        return a->major < b->major ? -1 : 1;
+    if (a->minor != b->minor)
+        return a->minor < b->minor ? -1 : 1;
+    if (a->patch != b->patch)
+        return a->patch < b->patch ? -1 : 1;
+    if (a->pre.s.len == 0 && b->pre.s.len == 0)
+        return 0;
+    if (a->pre.s.len == 0)
+        return 1;               /* 正式版大于预发布 */
+    if (b->pre.s.len == 0)
+        return -1;
+    return sv_cmp_pre(a->pre, b->pre);
+}
+
+static int sv_num_len(i64 v)
+{
+    int n = 1;
+
+    if (v < 0)
+        return 1 + sv_num_len(-v);
+    while (v >= 10) {
+        v /= 10;
+        n++;
+    }
+    return n;
+}
+
+static int sv_put_num(char *dst, int *o, i64 v)
+{
+    char tmp[24] = { 0 };
+    int n = 0;
+
+    if (v < 0) {
+        dst[(*o)++] = '-';
+        v = -v;
+    }
+    do {
+        tmp[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    } while (v > 0);
+    while (n > 0)
+        dst[(*o)++] = tmp[--n];
+    return 1;
+}
+
+int format(Semver *self, char *dst, int cap)
+{
+    int need = 0;
+    int o = 0;
+
+    if (!self || !self->ok)
+        return -1;
+    need = sv_num_len(self->major) + 1 + sv_num_len(self->minor) + 1
+           + sv_num_len(self->patch);
+    if (self->pre.s.len > 0)
+        need += 1 + self->pre.s.len;
+    if (self->build.s.len > 0)
+        need += 1 + self->build.s.len;
+    if (need > cap || (need > 0 && !dst))
+        return -1;
+    sv_put_num(dst, &o, self->major);
+    dst[o++] = '.';
+    sv_put_num(dst, &o, self->minor);
+    dst[o++] = '.';
+    sv_put_num(dst, &o, self->patch);
+    if (self->pre.s.len > 0) {
+        dst[o++] = '-';
+        memcpy(dst + o, self->pre.s.data, self->pre.s.len);
+        o += self->pre.s.len;
+    }
+    if (self->build.s.len > 0) {
+        dst[o++] = '+';
+        memcpy(dst + o, self->build.s.data, self->build.s.len);
+        o += self->build.s.len;
+    }
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+static Str ss(const char *s)
+{
+    return (Str){ (char[:]){ (char *)s, (int)strlen(s) } };
+}
+
+static Semver pv(const char *s)
+{
+    return semver_parse(ss(s));
+}
+
+static int cmp(const char *a, const char *b)
+{
+    Semver x = pv(a);
+    Semver y = pv(b);
+
+    if (!x.ok || !y.ok)
+        return -99;
+    return x.compare(&y);
+}
+
+test "解析与格式化" {
+    Semver v = pv("1.2.3-rc.1+build.7");
+    char buf[64] = { 0 };
+
+    if (!v.ok || v.err != 0)
+        return err(1, "合法版本没有解析成功");
+    if (v.major != 1 || v.minor != 2 || v.patch != 3)
+        return err(2, "数字段不对");
+    if (v.pre.s.len != 4 || memcmp(v.pre.s.data, "rc.1", 4) != 0)
+        return err(3, "pre 视图不对");
+    if (v.build.s.len != 7 || memcmp(v.build.s.data, "build.7", 7) != 0)
+        return err(4, "build 视图不对");
+    if (!v.is_prerelease())
+        return err(5, "is_prerelease 不对");
+    if (v.format(buf, sizeof buf) != 18
+        || strcmp(buf, "1.2.3-rc.1+build.7") != 0)
+        return err(6, "format 不对");
+    if (pv("0.0.0").is_prerelease())
+        return err(7, "正式版被当成预发布");
+    if (pv("1.2.3+only.build").format(buf, sizeof buf) != 16)
+        return err(8, "只有 build 的格式化不对");
+}
+
+test "严格语法：前导零、缺段、空标识、非法字符" {
+    const char *bad[] = {
+        "", "1", "1.2", "1.2.", "1.2.3.", "01.2.3", "1.02.3", "1.2.03",
+        "1.2.3-", "1.2.3+", "1.2.3-01", "1.2.3-a..b", "1.2.3-a_b",
+        "1.2.3+b..c", "1.2.3+b_c", "1.2.3-rc+", "1.2.3+rc..", "v1.2.3",
+        "1.2.3.4", "-1.2.3"
+    };
+    int i = 0;
+
+    for (i = 0; i < (int)(sizeof bad / sizeof bad[0]); i++) {
+        Semver v = pv(bad[i]);
+
+        if (v.ok)
+            return err(9, "非法版本被接受");
+        if (v.err != PARSE && v.err != INVAL)
+            return err(10, "非法版本的错误码不对");
+    }
+    if (!pv("1.2.3-a.0").ok || !pv("1.2.3-0.a").ok)
+        return err(11, "合法预发布被误拒");
+    if (!pv("1.2.3-0").ok || !pv("1.2.3-a-b").ok || !pv("1.2.3+001").ok)
+        return err(12, "边界标识被误拒");
+}
+
+test "优先级：semver.org 的经典序列" {
+    const char *order[] = {
+        "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta",
+        "1.0.0-beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1",
+        "1.0.0"
+    };
+    int i = 0;
+
+    for (i = 0; i + 1 < (int)(sizeof order / sizeof order[0]); i++)
+        if (cmp(order[i], order[i + 1]) != -1)
+            return err(13, "预发布序列的顺序不对");
+    if (cmp("2.0.0", "10.0.0") != -1 || cmp("1.0.0", "1.0.0") != 0)
+        return err(14, "数字段比较不对");
+    if (cmp("1.0.0+build.1", "1.0.0+build.2") != 0)
+        return err(15, "build 参与了优先级");
+    if (cmp("1.0.0-999999999999999999999", "1.0.0-1000000000000000000000") != -1)
+        return err(16, "大数字标识没有按长度比较");
+}
+
+test "format 容量与错误输入" {
+    Semver v = pv("1.2.3-alpha+build");
+    char buf[8] = { 0 };
+
+    if (v.format(buf, 5) != -1)
+        return err(17, "容量不够没有返回 -1");
+    if (v.format(0, 64) != -1)
+        return err(18, "空缓冲没有返回 -1");
+    if (pv("1.2.3").format(buf, sizeof buf) != 5)
+        return err(19, "最小缓冲不够");
+    if (pv("1.2.3").compare(0) != 0)
+        return err(20, "空比较没有兜住");
+}

@@ -58,6 +58,7 @@
 | `std/text/strbuf.c6` | `std.text.strbuf` | 会自己长大的字符缓冲 `StrBuf`（托管引用）：`write`/`write_cstr`/`push`、`write_int`/`write_u64`/`write_hex`、`reserve`/`truncate`/`clear`/`slice`/`cstr`（依赖 `std.text.fmt` 的数字原语） |
 | `std/text/utf8.c6` | `std.text.utf8` | UTF-8 解码 `utf8_decode`（返回 1..4，拒绝过长编码/代理区/超范围/截断）、编码 `utf8_encode`、`utf8_valid`/`utf8_count`、`Rune` 与 `utf8_runes()` 迭代器 |
 | `std/text/glob.c6` | `std.text.glob` | shell 风格 glob（零分配）：`Glob` 的 `match`/`match_path`/`has_magic`、`glob` 工厂、`*`/`?`/`[a-z]`/`[!…]`/`\` 转义；`match_path` 的 `*`/`?` 不跨 `/` |
+| `std/text/semver.c6` | `std.text.semver` | 语义化版本 2.0.0：`semver_parse` 工厂、`Semver` 的 `compare`/`is_prerelease`/`format`；严格前导零/标识校验，构建标识不参与优先级 |
 
 **`std/container/`**（容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序）
 
@@ -89,6 +90,8 @@
 | --- | --- | --- |
 | `std/encoding/base64.c6` | `std.encoding.base64` | Base64（RFC 4648）标准表与 URL 安全表：`b64_encode`/`b64_decode`、`b64url_encode`/`b64url_decode`、显式表与填充的 `b64_encode_ex`/`b64_decode_ex`/`b64_decoded_len`/`b64_encoded_len`、`b64_valid`、就地 `b64_decode_inplace`/`b64url_decode_inplace`（跳过空白、严格填充、放不下不写半截） |
 | `std/encoding/base32.c6` | `std.encoding.base32` | Base32（RFC 4648）：`b32_encode`/`b32_decode`/`b32hex_encode`/`b32hex_decode`、`b32_encode_ex`/`b32_decode_ex`（显式表与填充策略）、`b32_encoded_len`/`b32_decoded_len`/`b32_valid`；解码跳过空白、接受省略填充与小写，拒绝非零填充位 |
+| `std/encoding/base58.c6` | `std.encoding.base58` | Bitcoin Base58：`b58_encode`/`b58_decode`、`b58_encoded_len`（上界）/`b58_max_decoded_len`/`b58_valid`；前导零写 `1`，解码拒绝歧义字符 |
+| `std/encoding/varint.c6` | `std.encoding.varint` | LEB128：`uvarint_encode`/`uvarint_decode`、`svarint_encode`/`svarint_decode`、`zigzag_encode`/`zigzag_decode`、`*_encoded_len`；解码返回 1/0/-1（成功/截断/非法） |
 | `std/encoding/bitbuf.c6` | `std.encoding.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`put`/`put_u64`/`put_bit`/`align`/`put_bytes`/`patch`（回填不改游标）、`br_open`/`get`/`get_u64`/`get_bit`/`peek`/`skip`/`align`/`get_bytes`、`bit_count`/`byte_count`/`ok`/`remaining`/`eof` |
 | `std/encoding/codec.c6` | `std.encoding.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
@@ -109,6 +112,7 @@
 | `std/net/inet.c6` | `std.net.inet` | IP 地址与 CIDR（零分配）：`inet_parse`/`inet_parse_v4`/`inet_parse_v6`，`Ip`/`Ipv4`/`Ipv6` 的 `format`（IPv6 按 RFC 5952 压缩）、`inet_parse_cidr`/`cidr_contains`/`cidr_mask`/`inet_v4_mask`、`is_private`/`is_loopback`/`is_link_local`/`is_multicast`/`is_unspecified`、`inet_parse_port` |
 | `std/net/mime.c6` | `std.net.mime` | 扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：`mime_of_ext`/`mime_of_path`/`mime_ext_of`/`mime_ext_at`/`mime_type_at`/`mime_count`、`mime_is_text`/`is_image`/`is_audio`/`is_video`/`is_font`、`mime_charset`、`mime_sniff`、`mime_default` |
 | `std/net/http.c6` | `std.net.http` | HTTP/1.x 零分配解析：`http_parse_request`/`http_parse_response` 得到 `HttpMessage`，`HttpMessage` 的 `header`/`header_at`/`header_count`/`body`/`content_length`/`is_request`/`is_response`，`http_status_text`；头字段名大小写不敏感，不接受 obs-fold |
+| `std/net/cookie.c6` | `std.net.cookie` | Cookie / Set-Cookie 零分配解析：`cookie_parse_set`/`cookie_parse_pair` 得到 `Cookie`，`Cookie` 的 `attribute`/`has_attribute`/`path`/`domain`/`expires`/`same_site`/`max_age`/`is_secure`/`is_http_only`、`cookie_write_pair` |
 | `std/net/url.c6` | `std.net.url` | URL（RFC 3986）解析与相对解析：`url_parse` 工厂 + `Url` 的 `effective_port`/`is_absolute`/`has_host`、`url_resolve`（§5.2 全算法）、查询参数 `next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
 
 **集成示例**（`main` 只能写在模块外的文件里）
@@ -122,6 +126,7 @@
 | `examples/stdweb.c6` | （无模块） | 第五批模块的拼装示例（`make std-web`）：base64/url/uuid/mime 各一节，自带自检 |
 | `examples/stdnet.c6` | （无模块） | 第六批模块的拼装示例（`make std-net`）：inet/bitbuf/pqueue/ini 各一节，自带自检 |
 | `examples/stdmore.c6` | （无模块） | 第七批模块的拼装示例（`make std-more`）：bitset/glob/base32/http 各一节，自带自检 |
+| `examples/stdnext.c6` | （无模块） | 第八批模块的拼装示例（`make std-next`）：base58/varint/semver/cookie 各一节，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -147,11 +152,14 @@ std/data/csv.c6            41 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
 std/encoding/base32.c6     5 test(s), 0 failure(s)
+std/encoding/base58.c6     3 test(s), 0 failure(s)
 std/encoding/base64.c6     8 test(s), 0 failure(s)
 std/encoding/bitbuf.c6     7 test(s), 0 failure(s)
 std/encoding/codec.c6      7 test(s), 0 failure(s)
 std/encoding/sha256.c6     23 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
+std/encoding/varint.c6     4 test(s), 0 failure(s)
+std/net/cookie.c6          4 test(s), 0 failure(s)
 std/net/http.c6            5 test(s), 0 failure(s)
 std/net/inet.c6            8 test(s), 0 failure(s)
 std/net/mime.c6            37 test(s), 0 failure(s)
@@ -165,6 +173,7 @@ std/text/ascii.c6          5 test(s), 0 failure(s)
 std/text/fmt.c6            10 test(s), 0 failure(s)
 std/text/glob.c6           6 test(s), 0 failure(s)
 std/text/num.c6            11 test(s), 0 failure(s)
+std/text/semver.c6         4 test(s), 0 failure(s)
 std/text/strbuf.c6         18 test(s), 0 failure(s)
 std/text/str.c6            22 test(s), 0 failure(s)
 std/text/utf8.c6           7 test(s), 0 failure(s)
@@ -191,7 +200,7 @@ std/text/utf8.c6           7 test(s), 0 failure(s)
 | `std/container/bitset.c6` 11 | bitset 5 + bits 6（`popcount64`/`ctz64` 是跨 TU 调用） |
 
 `std/core/bits`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
-`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`
+`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`
 自成一体，单独跑就是自己的块数；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
 `std.text.str`（正文不调用），`std/net/mime` 的正文必须带 `std/os/path`，`std/encoding/sha256` 的正文
 必须带 `std/core/bits`，`std/os/env` 的正文必须带 `std/text/str`，`std/encoding/uuid` 的正文必须带
@@ -416,6 +425,25 @@ glob_match(pat, path);   /* 一次性入口 */
 不做 locale。没有 `**` 的特殊语义，两个星号等价于一个。坏字符类（没有结尾 `]`）
 退回字面量 `[`，不报错——glob 是匹配器，不是语法检查器；要判断有没有通配符用
 `has_magic()`。
+
+### `semver`：语义化版本 2.0.0
+
+```c
+import std.text.semver;
+
+Str raw = { S("1.2.3-rc.1+build.7") };
+Semver v = semver_parse(raw);
+
+v.ok;  v.major;  v.minor;  v.patch;
+v.pre;  v.build;                 /* 输入上的视图 */
+v.is_prerelease();               /* 1 */
+v.compare(&other);               /* -1 / 0 / 1 */
+v.format(buf, sizeof buf);       /* "1.2.3-rc.1+build.7" */
+```
+
+严格按 semver.org：数字标识不能有前导零，预发布/构建标识非空且只含
+`[0-9A-Za-z-]`；预发布里纯数字标识按数值比较、数字小于非数字，构建标识不参与
+优先级。解析失败时 `ok == 0`，`err` 是 `PARSE` 或 `INVAL`。
 
 ### `Buf@(N)`：定长格式化
 
@@ -874,6 +902,46 @@ b32_decode_ex(S("MY"), back, sizeof back, 0, 1);   /* -1：严格要求填充 */
 校验再写第二遍。`pad = 1` 编码补 `=`、解码要求填充；`pad = 0` 编码不补、解码两种
 都收。解码一律跳过 ASCII 空白，接受小写，拒绝非零填充位和凑不出整字节的长度。
 
+### `base58`：Bitcoin 风格的大数编码
+
+```c
+import std.encoding.base58;
+
+char out[64] = { 0 };
+char back[64] = { 0 };
+
+b58_encode(S("hello world"), out, sizeof out);   /* 15, "StV1DL6CwTryKyV" */
+b58_decode(S("StV1DL6CwTryKyV"), back, sizeof back); /* 11, "hello world" */
+b58_encode(S("\0\0\1"), out, sizeof out);          /* 3, "112"（前导零写 1） */
+```
+
+字母表是 Bitcoin 的 `123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`，
+去掉了 `0/O/I/l`。编码把输入当大端整数反复除以 58，前导零字节写成前导 `1`；
+解码拒绝字母表外的字符。`b58_encoded_len` 是上界（精确长度要真做一遍大数除法），
+按 `b58_max_decoded_len` 给解码缓冲即可；两个方向都是放不下返回 -1 且不写半截。
+
+### `varint`：LEB128 与 zigzag
+
+```c
+import std.encoding.varint;
+
+char buf[10] = { 0 };
+u64 v = 0;
+i64 sv = 0;
+int pos = 0;
+
+int n = uvarint_encode(300, buf, sizeof buf);     /* 2, { 0xac, 0x02 } */
+uvarint_decode((char[:]){ buf, n }, &pos, &v);    /* 1, v == 300, pos == 2 */
+
+n = svarint_encode(-1234567890123ll, buf, sizeof buf);
+pos = 0;
+svarint_decode((char[:]){ buf, n }, &pos, &sv);   /* zigzag：小负数也短 */
+```
+
+无符号数最多 10 字节；解码返回 1（成功）、0（输入截断）、-1（非法/溢出/参数错），
+只有成功才更新 `*pos` 与 `*out`。`zigzag_encode`/`zigzag_decode` 把有符号数映射到
+无符号（0→0、-1→1、1→2、-2→3）。
+
 ### `url`：RFC 3986 的分解、相对解析与百分号
 
 ```c
@@ -933,6 +1001,31 @@ req.body();             /* "hi" 的视图 */
 头字段名必须是 token，值去掉首尾 SP/HTAB，不接受 obs-fold（以空格/HTAB 开头的
 续行）。失败时 `ok == 0`，`err` 是 `PARSE` 或 `INVAL`。`content_length()` 只做
 十进制语法解析，不按它截断 `body()`。
+
+### `cookie`：Cookie 与 Set-Cookie
+
+```c
+import std.net.cookie;
+
+Str raw = { S("sid=abc123; Path=/app; Max-Age=3600; Secure; "
+              "HttpOnly; SameSite=Lax") };
+Cookie c = cookie_parse_set(raw);
+
+c.name;  c.value;                /* "sid", "abc123" */
+c.path();                        /* "/app" */
+c.is_secure();  c.is_http_only();/* 1, 1 */
+c.same_site();                   /* "Lax" */
+int age = 0;
+c.max_age(&age);                 /* 1, age == 3600 */
+
+Str name = { 0 }, value = { 0 };
+cookie_parse_pair(S("a=b; c=d"), &name, &value);   /* 1, "a", "b" */
+cookie_write_pair(c.name, c.value, buf, sizeof buf); /* "sid=abc123" */
+```
+
+属性名大小写不敏感，`Secure`/`HttpOnly` 这类没有值的旗标也算存在；`attribute()`
+可以取任意属性。所有字段都是输入上的视图，不分配。这一层不处理引号里的分号
+（`value="a;b"` 会被当成两段）——需要完整 RFC 6265 引号语法时先自己拆好。
 
 ### `uuid`：v4 / v5 / v7
 
@@ -1325,6 +1418,20 @@ stdmore: 28 check(s), 0 failure(s)
 模式、base32 的 RFC 向量与非法输入、http 的请求/响应/头字段/body。它和
 `stdtest` 一样，把「模块正文要单独列在命令行上」这件事钉在 Makefile 里。
 
+### 集成示例：`examples/stdnext.c6`
+
+```sh
+make std-next
+```
+
+```
+stdnext: 标准库第八批（base58 / varint / semver / cookie）
+stdnext: 23 check(s), 0 failure(s)
+```
+
+四节分别是 base58 的已知向量/前导零、varint 的 300/负数往返、semver 的经典优先级
+序列、cookie 的属性与 Max-Age。和 `stdmore` 一样，Makefile 里显式列出模块正文。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1338,6 +1445,7 @@ stdmore: 28 check(s), 0 failure(s)
 * `make std-web`：`examples/stdweb.c6`，第五批模块的拼装示例（自带自检）。
 * `make std-net`：`examples/stdnet.c6`，第六批模块的拼装示例（自带自检）。
 * `make std-more`：`examples/stdmore.c6`，第七批模块的拼装示例（自带自检）。
+* `make std-next`：`examples/stdnext.c6`，第八批模块的拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
