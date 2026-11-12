@@ -1,0 +1,478 @@
+/* std/data/class：Java `.class` 文件的常量池、方法表与类头。
+ *
+ *     import std.data.class;
+ *
+ *     ClassDoc doc = { 0 };
+ *     CpEntry cp = { 0 };
+ *     ClassMethod m = { 0 };
+ *     Str name = { 0 };
+ *     doc.open(buf, n);                    // 游标：open / next / cp_at / method
+ *     while (doc.next(&cp) == 1)
+ *         // cp.tag / cp.utf8 / cp.name_idx / cp.class_idx
+ *     doc.method(0, &m);                   // m.access / m.name / m.desc
+ *
+ * 常量池从 `1` 号开始计数（0 号空），`Long`/`Double` 占**两个**槽位，所以
+ * `cp_at(5)` 之后的下一个有效槽是 7。
+ *
+ * 约定：
+ *
+ * - `ClassDoc` 是游标：`open` 读头并定位常量池，`next` 顺序遍历常量池，
+ *   `rewind` 复位，`count()` 给 `constant_pool_count`（含那个占位的 0 号）；
+ * - `cp_at(idx, &e)` 按序号取；`utf8(idx, &s)` 把 `CONSTANT_Utf8` 解成字符串视图，
+ *   不是 Utf8 或找不到返回 0；
+ * - `method(i, &m)` 的第 i 个方法给访问标志、名字、描述符（名字/描述符都通过
+ *   `utf8` 解析后给出视图）；
+ * - 只读「常量池 + 类头 + 接口 + 字段 + 方法」的骨架，**不**解 Code 等属性内容；
+ * - 魔数必须是 `0xCAFEBABE`，不做版本兼容检查。
+ */
+#include <string.h>
+
+module std.data.class;
+import std.core.types;
+import std.text.str;
+
+struct ClassHeader {
+    int minor;
+    int major;
+    int cp_count;
+    int access;
+    int this_class;
+    int super_class;
+    int interfaces;
+    int fields;
+    int methods;
+};
+
+struct CpEntry {
+    int tag;
+    int off;
+    int size;
+    Str utf8;
+    int name_idx;
+    int class_idx;
+    int string_idx;
+    int desc_idx;
+    int ref1;
+    int ref2;
+    i64 value;
+};
+
+struct ClassMethod {
+    int access;
+    Str name;
+    Str desc;
+    int name_idx;
+    int desc_idx;
+    int off;
+};
+
+struct ClassDoc {
+    const char *src;
+    int n;
+    ClassHeader hdr;
+    int cp_off;
+    int cp_cur;
+    int methods_off;
+    int nmethods;
+};
+
+static u32 cls_be16(const u8 *p)
+{
+    return ((u32)p[0] << 8) | (u32)p[1];
+}
+
+static u32 cls_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+/* 常量池条目的字节数（Long/Double 返回 8 但占两个槽） */
+static int cls_entry_size(int tag, const u8 *p, int n, int off)
+{
+    switch (tag) {
+    case 1:
+        return 3 + (int)cls_be16(p + off + 1);
+    case 3:
+    case 4:
+        return 5;
+    case 5:
+    case 6:
+        return 9;
+    case 7:
+    case 8:
+    case 16:
+    case 19:
+    case 20:
+        return 3;
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+    case 17:
+    case 18:
+        return 5;
+    case 15:
+        return 4;
+    default:
+        return -1;
+    }
+}
+
+int cp_at(ClassDoc *d, int idx, CpEntry *out)
+{
+    const u8 *p = 0;
+    int i = 1, off = 0;
+
+    if (!d || !out || idx <= 0 || idx >= d->hdr.cp_count)
+        return -1;
+    p = (const u8 *)d->src;
+    off = d->cp_off;
+    for (i = 1; i < idx; i++) {
+        int tag = (int)p[off];
+        int size = cls_entry_size(tag, p, d->n, off);
+
+        if (size <= 0 || off + size > d->n)
+            return -1;
+        off += size;
+        if (tag == 5 || tag == 6)
+            i++;                        /* 占两个槽位 */
+    }
+    {
+        int tag = (int)p[off];
+        int size = cls_entry_size(tag, p, d->n, off);
+
+        if (size <= 0 || off + size > d->n)
+            return -1;
+        memset(out, 0, sizeof *out);
+        out->tag = tag;
+        out->off = off;
+        out->size = size;
+        switch (tag) {
+        case 1:
+            out->utf8.s = (char[:]){ (char *)p + off + 3, (int)size - 3 };
+            break;
+        case 7:
+            out->class_idx = (int)cls_be16(p + off + 1);
+            break;
+        case 8:
+            out->string_idx = (int)cls_be16(p + off + 1);
+            break;
+        case 3:
+            out->value = (i64)(int)cls_be32(p + off + 1);
+            break;
+        case 4:
+            out->value = (i64)cls_be32(p + off + 1);
+            break;
+        case 5:
+        case 6:
+            out->value = ((i64)cls_be32(p + off + 1) << 32)
+                         | (i64)cls_be32(p + off + 5);
+            break;
+        case 12:
+            out->name_idx = (int)cls_be16(p + off + 1);
+            out->desc_idx = (int)cls_be16(p + off + 3);
+            break;
+        default:
+            if (size >= 3) {
+                out->name_idx = (int)cls_be16(p + off + 1);
+                if (size >= 5)
+                    out->desc_idx = (int)cls_be16(p + off + 3);
+            }
+            break;
+        }
+        return 1;
+    }
+}
+
+int utf8(ClassDoc *d, int idx, Str *out)
+{
+    CpEntry e = { 0 };
+
+    if (!out || cp_at(d, idx, &e) != 1)
+        return 0;
+    if (e.tag != 1)
+        return 0;
+    *out = e.utf8;
+    return 1;
+}
+
+int open(ClassDoc *d, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 0, i = 0, ifaces = 0, fields = 0, methods = 0;
+
+    if (!d || !src || n < 24)
+        return -1;
+    if (cls_be32(p) != 0xCAFEBABEu)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    d->hdr.minor = (int)cls_be16(p + 4);
+    d->hdr.major = (int)cls_be16(p + 6);
+    d->hdr.cp_count = (int)cls_be16(p + 8);
+    if (d->hdr.cp_count <= 0 || d->hdr.cp_count > 65535)
+        return -1;
+    d->cp_off = 10;
+    /* 跳过常量池 */
+    off = d->cp_off;
+    for (i = 1; i < d->hdr.cp_count; i++) {
+        int tag = (int)p[off];
+        int size = cls_entry_size(tag, p, n, off);
+
+        if (size <= 0 || off + size > n)
+            return -1;
+        off += size;
+        if (tag == 5 || tag == 6)
+            i++;
+    }
+    if (off + 8 > n)
+        return -1;
+    d->hdr.access = (int)cls_be16(p + off);
+    d->hdr.this_class = (int)cls_be16(p + off + 2);
+    d->hdr.super_class = (int)cls_be16(p + off + 4);
+    ifaces = (int)cls_be16(p + off + 6);
+    off += 8 + ifaces * 2;
+    if (off + 2 > n)
+        return -1;
+    d->hdr.interfaces = ifaces;
+    fields = (int)cls_be16(p + off);
+    d->hdr.fields = fields;
+    off += 2;
+    /* 跳过字段：access/name/desc 各 2 字节 + 属性表 */
+    for (i = 0; i < fields; i++) {
+        int attrs = 0, k = 0;
+
+        if (off + 8 > n)
+            return -1;
+        attrs = (int)cls_be16(p + off + 6);
+        off += 8;
+        for (k = 0; k < attrs; k++) {
+            u32 len = 0;
+
+            if (off + 6 > n)
+                return -1;
+            len = cls_be32(p + off + 2);
+            off += 6 + (int)len;
+        }
+    }
+    if (off + 2 > n)
+        return -1;
+    d->methods_off = off;
+    methods = (int)cls_be16(p + off);
+    d->nmethods = methods;
+    d->hdr.methods = methods;
+    d->cp_cur = 1;
+    return methods;
+}
+
+int count(ClassDoc *d)
+{
+    return d ? d->hdr.cp_count : 0;
+}
+
+int next(ClassDoc *d, CpEntry *out)
+{
+    int r = 0;
+
+    if (!d || !out)
+        return -1;
+    if (d->cp_cur >= d->hdr.cp_count) {
+        d->cp_cur = 1;
+        return 0;
+    }
+    r = cp_at(d, d->cp_cur, out);
+    if (r != 1)
+        return -1;
+    if (out->tag == 5 || out->tag == 6)
+        d->cp_cur += 2;
+    else
+        d->cp_cur++;
+    return 1;
+}
+
+int rewind(ClassDoc *d)
+{
+    if (!d)
+        return -1;
+    d->cp_cur = 1;
+    return 1;
+}
+
+int method_count(ClassDoc *d)
+{
+    return d ? d->nmethods : 0;
+}
+
+int method(ClassDoc *d, int idx, ClassMethod *out)
+{
+    const u8 *p = 0;
+    int off = 0, i = 0;
+
+    if (!d || !out || idx < 0 || idx >= d->nmethods)
+        return -1;
+    p = (const u8 *)d->src;
+    off = d->methods_off + 2;
+    for (i = 0; i < idx; i++) {
+        int attrs = 0, k = 0;
+
+        if (off + 8 > d->n)
+            return -1;
+        attrs = (int)cls_be16(p + off + 6);
+        off += 8;
+        for (k = 0; k < attrs; k++) {
+            u32 len = 0;
+
+            if (off + 6 > d->n)
+                return -1;
+            len = cls_be32(p + off + 2);
+            off += 6 + (int)len;
+        }
+    }
+    if (off + 8 > d->n)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->access = (int)cls_be16(p + off);
+    out->name_idx = (int)cls_be16(p + off + 2);
+    out->desc_idx = (int)cls_be16(p + off + 4);
+    out->off = off;
+    utf8(d, out->name_idx, &out->name);
+    utf8(d, out->desc_idx, &out->desc);
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void cls_put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+static void cls_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+/* 造一个最小类：常量池 6 项 + 1 个方法 */
+static int mk_class(u8 *buf)
+{
+    int o = 0;
+
+    memset(buf, 0, 512);
+    cls_put32(buf, 0xCAFEBABEu);
+    cls_put16(buf + 4, 0);
+    cls_put16(buf + 6, 52);
+    cls_put16(buf + 8, 6);              /* cp_count = 6（1..5 有效） */
+    o = 10;
+    /* #1 Utf8 "Hello" */
+    buf[o++] = 1;
+    cls_put16(buf + o, 5);
+    o += 2;
+    memcpy(buf + o, "Hello", 5);
+    o += 5;
+    /* #2 Class → #1 */
+    buf[o++] = 7;
+    cls_put16(buf + o, 1);
+    o += 2;
+    /* #3 Utf8 "main" */
+    buf[o++] = 1;
+    cls_put16(buf + o, 4);
+    o += 2;
+    memcpy(buf + o, "main", 4);
+    o += 4;
+    /* #4 Utf8 "()V" */
+    buf[o++] = 1;
+    cls_put16(buf + o, 3);
+    o += 2;
+    memcpy(buf + o, "()V", 3);
+    o += 3;
+    /* #5 Utf8 "java/lang/Object" */
+    buf[o++] = 1;
+    cls_put16(buf + o, 16);
+    o += 2;
+    memcpy(buf + o, "java/lang/Object", 16);
+    o += 16;
+    /* 类头：access=0x0021、this=#2、super=#2、ifaces=0 */
+    cls_put16(buf + o, 0x0021);
+    cls_put16(buf + o + 2, 2);
+    cls_put16(buf + o + 4, 2);
+    cls_put16(buf + o + 6, 0);
+    o += 8;
+    /* fields=0 */
+    cls_put16(buf + o, 0);
+    o += 2;
+    /* methods=1：access=0x0009、name=#3、desc=#4、attrs=0 */
+    cls_put16(buf + o, 1);
+    cls_put16(buf + o + 2, 0x0009);
+    cls_put16(buf + o + 4, 3);
+    cls_put16(buf + o + 6, 4);
+    cls_put16(buf + o + 8, 0);
+    o += 10;
+    return o;
+}
+
+test "class：常量池游标" {
+    static u8 buf[512] = { 0 };
+    ClassDoc d = { 0 };
+    CpEntry cp = { 0 };
+    Str s = { 0 };
+    int n = mk_class(buf);
+    int k = 0;
+
+    if (d.open(buf, n) != 1)
+        return err(1, "open 失败（应该有 1 个方法）");
+    if (d.count() != 6)
+        return err(2, "常量池计数不对");
+    if (d.next(&cp) != 1 || cp.tag != 1)
+        return err(3, "第 1 项应该是 Utf8");
+    if (cp.utf8.s.len != 5 || memcmp(cp.utf8.s.data, "Hello", 5) != 0)
+        return err(4, "第 1 项内容不对");
+    if (d.next(&cp) != 1 || cp.tag != 7 || cp.class_idx != 1)
+        return err(5, "第 2 项应该是指向 #1 的 Class");
+    k = 0;
+    d.rewind();
+    while (d.next(&cp) == 1)
+        k++;
+    if (k != 5)
+        return err(6, "常量池应该有 5 个有效项");
+    if (utf8(&d, 3, &s) != 1 || s.s.len != 4
+        || memcmp(s.s.data, "main", 4) != 0)
+        return err(7, "utf8(#3) 应该得到 main");
+    if (utf8(&d, 2, &s) != 0)
+        return err(8, "非 Utf8 项应该返回 0");
+    if (d.cp_at(6, &cp) != -1)
+        return err(9, "越界序号应该 -1");
+}
+
+test "class：类头与方法" {
+    static u8 buf[512] = { 0 };
+    ClassDoc d = { 0 };
+    ClassMethod m = { 0 };
+    int n = mk_class(buf);
+
+    if (d.open(buf, n) != 1)
+        return err(10, "open 失败");
+    if (d.method_count() != 1)
+        return err(11, "方法数不对");
+    if (d.method(0, &m) != 1)
+        return err(12, "第 0 个方法取不到");
+    if (m.access != 0x0009)
+        return err(13, "方法访问标志不对");
+    if (m.name.s.len != 4 || memcmp(m.name.s.data, "main", 4) != 0)
+        return err(14, "方法名不对");
+    if (m.desc.s.len != 3 || memcmp(m.desc.s.data, "()V", 3) != 0)
+        return err(15, "方法描述符不对");
+    if (d.method(1, &m) != -1)
+        return err(16, "越界方法号应该 -1");
+    /* 魔数不对 */
+    cls_put32(buf, 0x12345678u);
+    if (d.open(buf, n) != -1)
+        return err(17, "魔数不对应该 -1");
+}

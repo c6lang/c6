@@ -1,0 +1,358 @@
+/* std/data/coff：COFF 目标文件（Microsoft COFF / PE 的 `.obj`）的头、节与符号表。
+ *
+ *     import std.data.coff;
+ *
+ *     CoffDoc doc = { 0 };
+ *     CoffSection sec = { 0 };
+ *     CoffSym sym = { 0 };
+ *     doc.open(buf, n);                    // 游标：open / section / symbol
+ *     doc.section(0, &sec);                // sec.name / sec.vaddr / sec.raw_size
+ *     doc.symbol(0, &sym);                 // sym.name / sym.value / sym.section
+ *
+ * 头 20 字节：机器类型、节数、时间戳、符号表偏移、符号数、可选头大小、特征位。
+ * 节头 40 字节：名字（8 字节，`/123` 表示字符串表偏移）、虚拟大小/地址、原始数据
+ * 大小/偏移、重定位表偏移、行号表偏移、重定位数、行号数、特征位。
+ * 符号表 18 字节：名字（前 4 字节为 0 时后 4 字节是字符串表偏移）、值、所在节号、
+ * 类型、存储类别、辅助记录数。
+ *
+ * 约定：
+ *
+ * - `CoffDoc` 是游标：`open` 读头并定位字符串表，`section(i, &s)`/`symbol(i, &sym)`
+ *   按序号直接取（不是顺序游标），`section_count()`/`symbol_count()` 给数量；
+ * - 名字用 `Str` 视图；`/123` 形式会去字符串表里取（从 `strtab+123` 到 `\0`）；
+ * - 只读 20 字节标准头，不解析可选头（`.obj` 一般没有，`PE` 镜像才有）；
+ * - 不解析重定位项与行号，也不解 `.drectve` 等特殊节的内容。
+ */
+#include <string.h>
+
+module std.data.coff;
+import std.core.types;
+import std.text.str;
+
+struct CoffHeader {
+    int machine;
+    int nsections;
+    u32 timestamp;
+    u32 symtab_off;
+    u32 nsyms;
+    int opt_hdr_size;
+    int characteristics;
+};
+
+struct CoffSection {
+    Str name;
+    u32 vsize;
+    u32 vaddr;
+    u32 raw_size;
+    u32 raw_off;
+    u32 reloc_off;
+    u32 line_off;
+    int nreloc;
+    int nline;
+    u32 characteristics;
+};
+
+struct CoffSym {
+    Str name;
+    u32 value;
+    int section;
+    int type;
+    int storage;
+    int naux;
+    int off;
+};
+
+struct CoffDoc {
+    const char *src;
+    int n;
+    CoffHeader hdr;
+    int sec_off;
+    int sym_off;
+    u32 strtab_off;
+    u32 strtab_size;
+};
+
+static u32 coff_le16(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8);
+}
+
+static u32 coff_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+int coff_header(const void *src, int n, CoffHeader *out)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!src || !out || n < 20)
+        return -1;
+    out->machine = (int)coff_le16(p);
+    out->nsections = (int)coff_le16(p + 2);
+    out->timestamp = coff_le32(p + 4);
+    out->symtab_off = coff_le32(p + 8);
+    out->nsyms = coff_le32(p + 12);
+    out->opt_hdr_size = (int)coff_le16(p + 16);
+    out->characteristics = (int)coff_le16(p + 18);
+    if (out->machine == 0 || out->nsections <= 0 || out->nsections > 512)
+        return -1;
+    if (20 + out->opt_hdr_size + out->nsections * 40 > n)
+        return -1;
+    return 1;
+}
+
+int open(CoffDoc *d, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    u32 sym_end = 0;
+
+    if (!d || !src || n < 20)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    if (coff_header(src, n, &d->hdr) != 1)
+        return -1;
+    d->sec_off = 20 + d->hdr.opt_hdr_size;
+    d->sym_off = (int)d->hdr.symtab_off;
+    if (d->hdr.nsyms > 0 && d->sym_off > 0) {
+        sym_end = d->hdr.symtab_off + d->hdr.nsyms * 18u;
+        if (sym_end + 4 <= (u32)n) {
+            d->strtab_off = sym_end;
+            d->strtab_size = coff_le32(p + sym_end);
+        }
+    }
+    return d->hdr.nsections;
+}
+
+int section_count(CoffDoc *d)
+{
+    return d ? d->hdr.nsections : 0;
+}
+
+int symbol_count(CoffDoc *d)
+{
+    return d ? (int)d->hdr.nsyms : 0;
+}
+
+static Str coff_name(CoffDoc *d, const u8 *e)
+{
+    const char *p = d->src;
+
+    if (e[0] == 0 && e[1] == 0 && e[2] == 0 && e[3] == 0) {
+        /* 名字在字符串表里 */
+        u32 off = coff_le32(e + 4);
+
+        if (d->strtab_size > 0 && off < d->strtab_size) {
+            u32 start = d->strtab_off + off, end = start;
+
+            while (end < (u32)d->n && p[end] != 0)
+                end++;
+            return (Str){ (char[:]){ (char *)p + start, (int)(end - start) } };
+        }
+        return (Str){ (char[:]){ 0, 0 } };
+    }
+    if (e[0] == '/') {
+        /* 节的 `/123` 形式 */
+        u32 off = 0;
+        int i = 1;
+
+        while (i < 8 && e[i] >= '0' && e[i] <= '9') {
+            off = off * 10 + (u32)(e[i] - '0');
+            i++;
+        }
+        if (d->strtab_size > 0 && off < d->strtab_size) {
+            u32 start = d->strtab_off + off, end = start;
+
+            while (end < (u32)d->n && p[end] != 0)
+                end++;
+            return (Str){ (char[:]){ (char *)p + start, (int)(end - start) } };
+        }
+        return (Str){ (char[:]){ 0, 0 } };
+    }
+    {
+        int len = 8;
+
+        while (len > 0 && e[len - 1] == 0)
+            len--;
+        return (Str){ (char[:]){ (char *)e, len } };
+    }
+}
+
+int section(CoffDoc *d, int idx, CoffSection *out)
+{
+    const u8 *p = 0;
+
+    if (!d || !out || idx < 0 || idx >= d->hdr.nsections)
+        return -1;
+    p = (const u8 *)d->src + d->sec_off + idx * 40;
+    memset(out, 0, sizeof *out);
+    out->name = coff_name(d, p);
+    out->vsize = coff_le32(p + 8);
+    out->vaddr = coff_le32(p + 12);
+    out->raw_size = coff_le32(p + 16);
+    out->raw_off = coff_le32(p + 20);
+    out->reloc_off = coff_le32(p + 24);
+    out->line_off = coff_le32(p + 28);
+    out->nreloc = (int)coff_le16(p + 32);
+    out->nline = (int)coff_le16(p + 34);
+    out->characteristics = coff_le32(p + 36);
+    return 1;
+}
+
+int symbol(CoffDoc *d, int idx, CoffSym *out)
+{
+    const u8 *p = 0;
+
+    if (!d || !out || idx < 0 || idx >= (int)d->hdr.nsyms)
+        return -1;
+    if (d->sym_off <= 0 || d->sym_off + (idx + 1) * 18 > d->n)
+        return -1;
+    p = (const u8 *)d->src + d->sym_off + idx * 18;
+    memset(out, 0, sizeof *out);
+    out->name = coff_name(d, p);
+    out->value = coff_le32(p + 8);
+    out->section = (int)(short)coff_le16(p + 12);
+    out->type = (int)coff_le16(p + 14);
+    out->storage = (int)p[16];
+    out->naux = (int)p[17];
+    out->off = d->sym_off + idx * 18;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void coff_put16(u8 *p, int v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+}
+
+static void coff_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+/* 造一个 2 节 + 2 符号的 COFF */
+static int mk_coff(u8 *buf)
+{
+    int o = 0, i = 0;
+
+    memset(buf, 0, 1024);
+    coff_put16(buf, 0x8664);            /* x86-64 */
+    coff_put16(buf + 2, 2);
+    coff_put32(buf + 4, 1700000000);
+    /* 符号表在 20 + 80 = 100 之后，先占位，稍后回填 */
+    coff_put32(buf + 8, 140);
+    coff_put32(buf + 12, 2);
+    coff_put16(buf + 16, 0);
+    coff_put16(buf + 18, 0);
+    o = 20;
+    /* 节 0：.text */
+    memcpy(buf + o, ".text", 5);
+    coff_put32(buf + o + 8, 16);
+    coff_put32(buf + o + 16, 16);
+    coff_put32(buf + o + 20, 300);
+    coff_put32(buf + o + 36, 0x60000020);
+    /* 节 1：/4 → 字符串表偏移 4（内容 "mydata"），字符串表从 140 的下一字节开始 */
+    memcpy(buf + o + 40, "/4", 2);
+    coff_put32(buf + o + 40 + 16, 8);
+    coff_put32(buf + o + 40 + 20, 400);
+    coff_put32(buf + o + 40 + 36, 0xC0000040);
+    /* 符号表在 140：两个 18 字节条目 */
+    {
+        u8 *s = buf + 140;
+
+        /* 符号 0：短名 "main" */
+        memcpy(s, "main", 4);
+        coff_put32(s + 8, 0);
+        coff_put16(s + 12, 1);
+        coff_put16(s + 14, 0x20);
+        s[16] = 2;                      /* external */
+        s[17] = 0;
+        /* 符号 1：名字在字符串表里（偏移 4） */
+        s[18] = 0;
+        s[19] = 0;
+        s[20] = 0;
+        s[21] = 0;
+        coff_put32(s + 22, 4);
+        coff_put32(s + 26, 8);
+        coff_put16(s + 30, 0);
+        coff_put16(s + 32, 0);
+        s[34] = 3;                      /* static */
+        s[35] = 0;
+    }
+    /* 字符串表在 140 + 36 = 176：4 字节长度 + "mydata\0" */
+    coff_put32(buf + 176, 12);
+    memcpy(buf + 180, "mydata", 7);
+    for (i = 0; i < 7; i++) { }
+    return 200;
+}
+
+test "coff：头与节" {
+    static u8 buf[1024] = { 0 };
+    CoffDoc d = { 0 };
+    CoffHeader h = { 0 };
+    CoffSection s = { 0 };
+    int n = mk_coff(buf);
+
+    if (coff_header(buf, n, &h) != 1)
+        return err(1, "头解析失败");
+    if (h.machine != 0x8664 || h.nsections != 2 || h.nsyms != 2)
+        return err(2, "头字段不对");
+    if (h.symtab_off != 140 || h.opt_hdr_size != 0)
+        return err(3, "符号表偏移或可选头大小不对");
+    if (d.open(buf, n) != 2)
+        return err(4, "open 失败");
+    if (d.section_count() != 2 || d.symbol_count() != 2)
+        return err(5, "数量方法不对");
+    if (d.section(0, &s) != 1)
+        return err(6, "第 0 节取不到");
+    if (s.name.s.len != 5 || memcmp(s.name.s.data, ".text", 5) != 0)
+        return err(7, "第 0 节名字不对");
+    if (s.raw_size != 16 || s.raw_off != 300)
+        return err(8, "第 0 节大小或偏移不对");
+    if (s.characteristics != 0x60000020)
+        return err(9, "第 0 节特征位不对");
+    if (d.section(1, &s) != 1)
+        return err(10, "第 1 节取不到");
+    if (s.name.s.len != 6 || memcmp(s.name.s.data, "mydata", 6) != 0)
+        return err(11, "第 1 节应该从字符串表取长名字");
+    if (d.section(2, &s) != -1)
+        return err(12, "越界节号应该 -1");
+}
+
+test "coff：符号表" {
+    static u8 buf[1024] = { 0 };
+    CoffDoc d = { 0 };
+    CoffSym s = { 0 };
+    int n = mk_coff(buf);
+
+    if (d.open(buf, n) != 2)
+        return err(13, "open 失败");
+    if (d.symbol(0, &s) != 1)
+        return err(14, "第 0 个符号取不到");
+    if (s.name.s.len != 4 || memcmp(s.name.s.data, "main", 4) != 0)
+        return err(15, "第 0 个符号名字不对");
+    if (s.section != 1 || s.storage != 2 || s.type != 0x20)
+        return err(16, "第 0 个符号字段不对");
+    if (d.symbol(1, &s) != 1)
+        return err(17, "第 1 个符号取不到");
+    if (s.name.s.len != 6 || memcmp(s.name.s.data, "mydata", 6) != 0)
+        return err(18, "第 1 个符号名字应该来自字符串表");
+    if (s.value != 8 || s.storage != 3)
+        return err(19, "第 1 个符号的值或存储类别不对");
+    if (d.symbol(2, &s) != -1)
+        return err(20, "越界符号号应该 -1");
+    /* 机器类型为 0：坏头 */
+    coff_put16(buf, 0);
+    if (d.open(buf, n) != -1)
+        return err(21, "机器类型 0 应该 -1");
+}

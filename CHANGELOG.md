@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第五十七批（目标文件与包）**：`std.data.ar`（Unix 归档，含 GNU/BSD 长名）、
+  `std.data.coff`（MS COFF 头/节/符号表）、`std.data.class`（Java class 常量池与
+  方法表）、`std.data.rpm`（lead + 主头索引表），集成示例 `examples/stdpkg.c6`
+  （`make std-pkg`）。四个模块都提供游标方法。错误号段 `std.data.ar`=0x60ed …
+  `std.data.rpm`=0x60f0（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十六批（地理编码）**：`std.core.geo`（haversine 距离、方位、目的地、
   半径包围盒）、`std.data.geohash`（编码/解码/边界/邻居）、`std.data.maidenhead`
   （2/4/6/8 位网格）、`std.data.dms`（度分秒解析与格式化，带 `to_deg`/`from_deg`/

@@ -1,0 +1,399 @@
+/* std/data/rpm：RPM 包文件的 lead 与主头（tag 索引表）解析。
+ *
+ *     import std.data.rpm;
+ *
+ *     RpmDoc doc = { 0 };
+ *     RpmEntry e = { 0 };
+ *     Str name = { 0 };
+ *     doc.open(buf, n);                    // 游标：open / next / count / get
+ *     if (doc.get(RPMTAG_NAME, &e) == 1)
+ *         doc.value(&e, &name);            // 指向数据区的字符串视图
+ *
+ * 布局：
+ *
+ *     lead       96 字节：魔数 ED AB EE DB + 主次版本 + 类型 + 架构号 +
+ *                66 字节包名 + 操作系统号 + 签名类型 + 16 字节保留
+ *     signature  头部结构（可选，本模块按 `open` 的偏移参数处理）
+ *     header     16 字节头：魔数 8E AD E8 + 版本(1) + 保留(4) + 索引数(4 BE)
+ *                + 数据区大小(4 BE)，随后是 nindex 个 16 字节索引项
+ *                （tag / type / offset / count，都是大端 32 位），最后是数据区
+ *
+ * 约定：
+ *
+ * - `RpmDoc` 是游标：`open(buf, n)` 解析 lead + 头，`next(&e)` 顺序遍历索引项，
+ *   `rewind` 复位，`count()` 给索引项数量；
+ * - `get(tag, &e)` 按 tag 取第一项；
+ * - `value(&e, &s)` 把索引项的值当**字符串**给出视图（`RPM_TYPE_STRING` 才有效），
+ *   `int32(&e, &v)`/`int16(&e, &v)` 取整数（按大端、`count` 个元素里的第一个）；
+ * - `tag_name(tag)` 给常见 tag 的名字，未知返回 `"?"`；
+ * - 不解析 lead 之后真正属于「签名」的那一段（调用方可以自己算偏移再 open），
+ *   也不解 cpio 负载。
+ */
+#include <string.h>
+
+module std.data.rpm;
+import std.core.types;
+import std.text.str;
+
+#define RPMTAG_NAME 1000
+#define RPMTAG_VERSION 1001
+#define RPMTAG_RELEASE 1002
+#define RPMTAG_SUMMARY 1004
+#define RPMTAG_ARCH 1022
+#define RPMTAG_LICENSE 1014
+#define RPMTAG_VENDOR 1011
+#define RPMTAG_URL 1020
+
+enum {
+    RPM_TYPE_NULL = 0,
+    RPM_TYPE_CHAR = 1,
+    RPM_TYPE_INT8 = 2,
+    RPM_TYPE_INT16 = 3,
+    RPM_TYPE_INT32 = 4,
+    RPM_TYPE_INT64 = 5,
+    RPM_TYPE_STRING = 6,
+    RPM_TYPE_BIN = 7,
+    RPM_TYPE_STRING_ARRAY = 8,
+    RPM_TYPE_I18NSTRING = 9
+};
+
+struct RpmLead {
+    int major;
+    int minor;
+    int type;
+    int archnum;
+    char name[67];
+    int osnum;
+    int sig_type;
+};
+
+struct RpmEntry {
+    int tag;
+    int type;
+    u32 offset;
+    u32 count;
+    int index_off;
+};
+
+struct RpmDoc {
+    const char *src;
+    int n;
+    RpmLead lead;
+    u32 nindex;
+    u32 data_size;
+    int data_off;
+    int cur;
+};
+
+static u32 rpm_be16(const u8 *p)
+{
+    return ((u32)p[0] << 8) | (u32)p[1];
+}
+
+static u32 rpm_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+const char *tag_name(int tag)
+{
+    switch (tag) {
+    case RPMTAG_NAME:
+        return "NAME";
+    case RPMTAG_VERSION:
+        return "VERSION";
+    case RPMTAG_RELEASE:
+        return "RELEASE";
+    case RPMTAG_SUMMARY:
+        return "SUMMARY";
+    case RPMTAG_ARCH:
+        return "ARCH";
+    case RPMTAG_LICENSE:
+        return "LICENSE";
+    case RPMTAG_VENDOR:
+        return "VENDOR";
+    case RPMTAG_URL:
+        return "URL";
+    default:
+        return "?";
+    }
+}
+
+int open(RpmDoc *d, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    int i = 0;
+
+    if (!d || !src || n < 96 + 16)
+        return -1;
+    if (!(p[0] == 0xED && p[1] == 0xAB && p[2] == 0xEE && p[3] == 0xDB))
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    d->lead.major = (int)p[4];
+    d->lead.minor = (int)p[5];
+    d->lead.type = (int)rpm_be16(p + 6);
+    d->lead.archnum = (int)rpm_be16(p + 8);
+    for (i = 0; i < 66; i++)
+        d->lead.name[i] = (char)p[10 + i];
+    d->lead.name[66] = 0;
+    d->lead.osnum = (int)rpm_be16(p + 76);
+    d->lead.sig_type = (int)rpm_be16(p + 78);
+    /* 主头 */
+    if (!(p[96] == 0x8E && p[97] == 0xAD && p[98] == 0xE8))
+        return -1;
+    if (p[99] != 1)
+        return -1;
+    d->nindex = rpm_be32(p + 104);
+    d->data_size = rpm_be32(p + 108);
+    if (d->nindex == 0 || d->nindex > 65535)
+        return -1;
+    d->data_off = 96 + 16 + (int)d->nindex * 16;
+    if (d->data_off + (int)d->data_size > n)
+        return -1;
+    d->cur = 0;
+    return (int)d->nindex;
+}
+
+int count(RpmDoc *d)
+{
+    return d ? (int)d->nindex : 0;
+}
+
+static int rpm_index(RpmDoc *d, int idx, RpmEntry *out)
+{
+    const u8 *p = 0;
+    int off = 0;
+
+    if (!d || !out || idx < 0 || idx >= (int)d->nindex)
+        return -1;
+    p = (const u8 *)d->src;
+    off = 96 + 16 + idx * 16;
+    out->tag = (int)rpm_be32(p + off);
+    out->type = (int)rpm_be32(p + off + 4);
+    out->offset = rpm_be32(p + off + 8);
+    out->count = rpm_be32(p + off + 12);
+    out->index_off = off;
+    if (out->offset > d->data_size)
+        return -1;
+    return 1;
+}
+
+int next(RpmDoc *d, RpmEntry *out)
+{
+    if (!d || !out)
+        return -1;
+    if (d->cur >= (int)d->nindex)
+        return 0;
+    if (rpm_index(d, d->cur, out) != 1)
+        return -1;
+    d->cur++;
+    return 1;
+}
+
+int rewind(RpmDoc *d)
+{
+    if (!d)
+        return -1;
+    d->cur = 0;
+    return 1;
+}
+
+int get(RpmDoc *d, int tag, RpmEntry *out)
+{
+    int i = 0;
+
+    if (!d || !out)
+        return -1;
+    for (i = 0; i < (int)d->nindex; i++) {
+        RpmEntry e = { 0 };
+
+        if (rpm_index(d, i, &e) != 1)
+            return -1;
+        if (e.tag == tag) {
+            *out = e;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int value(RpmDoc *d, RpmEntry *e, Str *out)
+{
+    const char *p = 0;
+    int start = 0, len = 0;
+
+    if (!d || !e || !out)
+        return -1;
+    if (e->type != RPM_TYPE_STRING && e->type != RPM_TYPE_STRING_ARRAY
+        && e->type != RPM_TYPE_I18NSTRING)
+        return 0;
+    p = d->src;
+    start = d->data_off + (int)e->offset;
+    while (start + len < d->data_off + (int)d->data_size && p[start + len] != 0)
+        len++;
+    out->s = (char[:]){ (char *)p + start, len };
+    return 1;
+}
+
+int int32(RpmDoc *d, RpmEntry *e, i64 *out)
+{
+    const u8 *p = 0;
+
+    if (!d || !e || !out)
+        return -1;
+    if (e->type != RPM_TYPE_INT32)
+        return 0;
+    p = (const u8 *)d->src + d->data_off + (int)e->offset;
+    if (d->data_off + (int)e->offset + 4 > d->n)
+        return -1;
+    *out = (i64)(i32)rpm_be32(p);
+    return 1;
+}
+
+int int16(RpmDoc *d, RpmEntry *e, i64 *out)
+{
+    const u8 *p = 0;
+
+    if (!d || !e || !out)
+        return -1;
+    if (e->type != RPM_TYPE_INT16)
+        return 0;
+    p = (const u8 *)d->src + d->data_off + (int)e->offset;
+    if (d->data_off + (int)e->offset + 2 > d->n)
+        return -1;
+    *out = (i64)(short)rpm_be16(p);
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void rpm_put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+static void rpm_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+/* 造一个 3 项头的 rpm（NAME/VERSION/ARCH） + 一个 int32 项 */
+static int mk_rpm(u8 *buf)
+{
+    int o = 0, data = 0;
+
+    memset(buf, 0, 1024);
+    buf[0] = 0xED;
+    buf[1] = 0xAB;
+    buf[2] = 0xEE;
+    buf[3] = 0xDB;
+    buf[4] = 3;
+    buf[5] = 0;
+    rpm_put16(buf + 6, 0);              /* type = binary */
+    rpm_put16(buf + 8, 1);              /* archnum = i386 */
+    memcpy(buf + 10, "demo-1.0-1", 10);
+    rpm_put16(buf + 76, 1);             /* osnum = Linux */
+    rpm_put16(buf + 78, 5);             /* sig_type */
+    /* 主头 */
+    buf[96] = 0x8E;
+    buf[97] = 0xAD;
+    buf[98] = 0xE8;
+    buf[99] = 1;
+    rpm_put32(buf + 104, 4);            /* 4 个索引项 */
+    /* 数据区：0: "demo\0" 5: "1.0\0" 9: "noarch\0" 16: int32 42 */
+    data = 96 + 16 + 4 * 16;
+    memcpy(buf + data, "demo", 5);
+    memcpy(buf + data + 5, "1.0", 4);
+    memcpy(buf + data + 9, "noarch", 7);
+    rpm_put32(buf + data + 16, 42);
+    rpm_put32(buf + 108, 20);           /* 数据区大小 */
+    o = 112;
+    rpm_put32(buf + o, RPMTAG_NAME);
+    rpm_put32(buf + o + 4, RPM_TYPE_STRING);
+    rpm_put32(buf + o + 8, 0);
+    rpm_put32(buf + o + 12, 1);
+    rpm_put32(buf + o + 16, RPMTAG_VERSION);
+    rpm_put32(buf + o + 20, RPM_TYPE_STRING);
+    rpm_put32(buf + o + 24, 5);
+    rpm_put32(buf + o + 28, 1);
+    rpm_put32(buf + o + 32, RPMTAG_ARCH);
+    rpm_put32(buf + o + 36, RPM_TYPE_STRING);
+    rpm_put32(buf + o + 40, 9);
+    rpm_put32(buf + o + 44, 1);
+    rpm_put32(buf + o + 48, 5000);      /* 自定义 tag：int32 */
+    rpm_put32(buf + o + 52, RPM_TYPE_INT32);
+    rpm_put32(buf + o + 56, 16);
+    rpm_put32(buf + o + 60, 1);
+    return data + 20;
+}
+
+test "rpm：lead 与头" {
+    static u8 buf[1024] = { 0 };
+    RpmDoc d = { 0 };
+    RpmEntry e = { 0 };
+    int n = mk_rpm(buf);
+    int k = 0;
+
+    if (d.open(buf, n) != 4)
+        return err(1, "open 应该返回 4 个索引项");
+    if (d.count() != 4)
+        return err(2, "count() 不对");
+    if (d.lead.major != 3 || d.lead.archnum != 1 || d.lead.osnum != 1)
+        return err(3, "lead 字段不对");
+    if (memcmp(d.lead.name, "demo-1.0-1", 10) != 0)
+        return err(4, "lead 里的包名不对");
+    if (d.next(&e) != 1 || e.tag != RPMTAG_NAME || e.type != RPM_TYPE_STRING)
+        return err(5, "第 1 个索引项不对");
+    k = 0;
+    d.rewind();
+    while (d.next(&e) == 1)
+        k++;
+    if (k != 4)
+        return err(6, "顺序遍历应该有 4 项");
+    if (d.next(&e) != 0)
+        return err(7, "读完应该返回 0");
+}
+
+test "rpm：取值与 tag 名" {
+    static u8 buf[1024] = { 0 };
+    RpmDoc d = { 0 };
+    RpmEntry e = { 0 };
+    Str v = { 0 };
+    i64 iv = 0;
+    int n = mk_rpm(buf);
+
+    if (d.open(buf, n) != 4)
+        return err(8, "open 失败");
+    if (d.get(RPMTAG_NAME, &e) != 1)
+        return err(9, "取不到 NAME");
+    if (d.value(&e, &v) != 1 || v.s.len != 4
+        || memcmp(v.s.data, "demo", 4) != 0)
+        return err(10, "NAME 的值不对");
+    if (d.get(RPMTAG_VERSION, &e) != 1 || d.value(&e, &v) != 1
+        || memcmp(v.s.data, "1.0", 3) != 0)
+        return err(11, "VERSION 的值不对");
+    if (d.get(RPMTAG_ARCH, &e) != 1 || d.value(&e, &v) != 1 || v.s.len != 6)
+        return err(12, "ARCH 的值不对");
+    if (d.get(RPMTAG_URL, &e) != 0)
+        return err(13, "不存在的 tag 应该 0");
+    if (d.get(5000, &e) != 1 || d.int32(&e, &iv) != 1 || iv != 42)
+        return err(14, "int32 类型的值不对");
+    if (d.get(5000, &e) != 1 || d.value(&e, &v) != 0)
+        return err(15, "int32 项按字符串取值应该返回 0");
+    if (strcmp(tag_name(RPMTAG_NAME), "NAME") != 0
+        || strcmp(tag_name(9999), "?") != 0)
+        return err(16, "tag_name 不对");
+    /* lead 魔数坏掉 */
+    buf[0] = 0;
+    if (d.open(buf, n) != -1)
+        return err(17, "lead 魔数不对应该 -1");
+}

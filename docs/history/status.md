@@ -1986,6 +1986,37 @@ blk.get(buf, n, "user", &user);        // 块内取键（大小写不敏感）
 验收：`make stdtest`（237 个模块、0 failure）、`make std-geo`（30 条自检全过）、
 `make check-all`。
 
+### 11.69 标准库第五十七批（ar / coff / class / rpm）
+
+第五十七批做「目标文件与包」：`ar` 归档、MS COFF 目标文件、Java `.class`、RPM 包头。
+四个都是「固定头 + 索引表 + 变长名字」的结构，统一成**游标方法**：
+
+```c
+ArDoc doc = { 0 };
+ArMember m = { 0 };
+doc.open(buf, n);
+while (doc.next(&m) == 1)
+    …
+doc.find(S("util.o"), &m);
+```
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.ar` | Unix 归档 | 名字四种形态都要认：`name/`、`/`（符号表）、`//`（字符串表）、`/123`（长名偏移）与 BSD `#1/N`（名字在数据开头）；`next` 里跳过特殊成员后**必须推进游标**，否则会原地打转（这批踩到的死循环） |
+| `std.data.coff` | MS COFF | 20 字节头 + 40 字节节头 + 18 字节符号；节名 `/<digits>` 与符号名（前 4 字节为 0 时后 4 字节是字符串表偏移）都要查字符串表 |
+| `std.data.class` | Java class | 常量池 14 种 tag 的长度表，`Long`/`Double` 占**两个槽位**（遍历时 `i++` 两次）；方法要跨过字段的属性表才能定位，名字/描述符是 `Utf8` 项的视图 |
+| `std.data.rpm` | RPM | lead（96 字节）与主头（16 字节 + `nindex × 16`）都是大端；索引项给 tag/type/offset/count，字符串取到 `\0` 为止，整数按大端解 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.ar`=0x60ed、
+`std.data.coff`=0x60ee、`std.data.class`=0x60ef、`std.data.rpm`=0x60f0；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-pkg` 与 `STD_PKG_SRCS`，`test-all`/`check-all` 都带上
+它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条用例）。示例
+`examples/stdpkg.c6` 四节（22 条自检，全部方法调用）。
+
+验收：`make stdtest`（241 个模块、0 failure）、`make std-pkg`（22 条自检全过）、
+`make check-all`。
+
+
 
 
 

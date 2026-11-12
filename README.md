@@ -372,6 +372,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/geohash.c6       std.data.geohash       Geohash：base32 编码/解码、格子边界、邻居（跨日界线折回）
   std/data/maidenhead.c6    std.data.maidenhead    Maidenhead 网格：2/4/6/8 位（20°×10° 到 0.5′×0.25′）编解码
   std/data/dms.c6           std.data.dms           度分秒：灵活解析 + to_deg/from_deg/format 方法与 N/S/E/W 方向
+  std/data/ar.c6            std.data.ar            Unix ar 归档：60 字节成员头、GNU 长名（// + /123）与 BSD #1/N，find 按名查
+  std/data/coff.c6          std.data.coff          MS COFF：20 字节头 + 40 字节节头 + 18 字节符号表（含字符串表长名）
+  std/data/class.c6         std.data.class         Java .class：CAFEBABE、常量池 14 种 tag（Long/Double 占两槽）、方法与描述符
+  std/data/rpm.c6           std.data.rpm           RPM 包：96 字节 lead + 主头索引表（tag/type/offset/count），tag_name 命名
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -484,6 +488,7 @@ make std-bwt      # 编译并运行 examples/stdcmp.c6（第五十三批变换�
 make std-subs     # 编译并运行 examples/stdsubs.c6（第五十四批字幕与播放列表模块的拼装示例）
 make std-creds    # 编译并运行 examples/stdcreds.c6（第五十五批凭据与配置模块的拼装示例）
 make std-geo      # 编译并运行 examples/stdgeo.c6（第五十六批地理编码模块的拼装示例，链接带 -lm）
+make std-pkg      # 编译并运行 examples/stdpkg.c6（第五十七批目标文件与包模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

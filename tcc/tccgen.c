@@ -12942,6 +12942,10 @@ static const struct C6ErrStdSlot {
     { "std.data.geohash",       C6_ERR_SLOT_STD + 234 },
     { "std.data.maidenhead",    C6_ERR_SLOT_STD + 235 },
     { "std.data.dms",           C6_ERR_SLOT_STD + 236 },
+    { "std.data.ar",            C6_ERR_SLOT_STD + 237 },
+    { "std.data.coff",          C6_ERR_SLOT_STD + 238 },
+    { "std.data.class",         C6_ERR_SLOT_STD + 239 },
+    { "std.data.rpm",           C6_ERR_SLOT_STD + 240 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
