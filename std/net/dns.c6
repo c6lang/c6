@@ -1,0 +1,526 @@
+/* std/net/dns：DNS 报文（RFC 1035）的解析与查询构建（零分配）。
+ *
+ *     import std.net.dns;
+ *
+ *     char q[512] = { 0 };
+ *     int n = dns_build_query("example.com", DNS_A, 0x1234,
+ *                             (char[:]){ q, (int)sizeof q });
+ *     // 把 q[0..n) 发出去，收回来交给下面的解析函数
+ *
+ *     DnsHeader h = { 0 };
+ *     dns_header(resp, rn, &h);                 // 12 字节头
+ *     char name[256] = { 0 };
+ *     DnsRR rr = { 0 };
+ *     int next = 0;
+ *     dns_rr(resp, rn, off, &rr, (char[:]){ name, (int)sizeof name }, &next);
+ *     u32 ip = 0;
+ *     dns_a(resp, rn, &rr, &ip);                // A 记录的 4 字节
+ *
+ * 只做「和字节打交道」的部分，不碰 socket（收发用 `std.net.tcp`/UDP 自己来）：
+ *
+ * - `dns_header` 拆 12 字节头（id/flags/四个计数/rcode）。
+ * - `dns_question`/`dns_rr` 按偏移读一条问题/资源记录；名字支持**压缩指针**
+ *   （只允许向前指、最多 64 次跳转，防环），解码成点分字符串写调用方缓冲。
+ * - `dns_a`/`dns_aaaa`/`dns_cname` 从 RR 里取地址/CNAME 目标。
+ * - `dns_build_query` 生成一个标准查询（RD=1、一个问题）。
+ * - `dns_type_name`/`dns_rcode_name` 给类型和响应码的名字。
+ *
+ * 约定：`*next` 永远是「这条记录之后的下一个偏移」，方便顺着 ancount 遍历；
+ * 截断/坏指针/名字超长/缓冲放不下都返回 -1（解析函数）或 0（布尔函数）。
+ * 不做的：EDNS0 扩展、DNS over TCP 的两字节长度前缀、名字里的转义（`.` 就是
+ * 分隔符，标签里的特殊字节原样输出）。
+ */
+#include <string.h>
+
+module std.net.dns;
+import std.core.types;
+
+enum DnsType {
+    DNS_A = 1,
+    DNS_NS = 2,
+    DNS_CNAME = 5,
+    DNS_SOA = 6,
+    DNS_PTR = 12,
+    DNS_MX = 15,
+    DNS_TXT = 16,
+    DNS_AAAA = 28,
+    DNS_SRV = 33,
+};
+
+enum DnsLimits {
+    DNS_HEADER = 12,
+    DNS_MAX_NAME = 255,
+};
+
+struct DnsHeader {
+    int id;
+    int qr, opcode, aa, tc, rd, ra, rcode;
+    int qdcount, ancount, nscount, arcount;
+};
+
+struct DnsRR {
+    u16 type;
+    u16 rclass;
+    u32 ttl;
+    int rdata_off;
+    int rdlength;
+};
+
+static int dns_u16(const u8 *p)
+{
+    return ((int)p[0] << 8) | (int)p[1];
+}
+
+static u32 dns_u32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+/* 12 字节头；成功返回 1 */
+int dns_header(const void *msg, int n, DnsHeader *h)
+{
+    const u8 *m = (const u8 *)msg;
+    int flags = 0;
+
+    if (!msg || !h || n < DNS_HEADER)
+        return 0;
+    h->id = dns_u16(m);
+    flags = dns_u16(m + 2);
+    h->qr = (flags >> 15) & 1;
+    h->opcode = (flags >> 11) & 0xf;
+    h->aa = (flags >> 10) & 1;
+    h->tc = (flags >> 9) & 1;
+    h->rd = (flags >> 8) & 1;
+    h->ra = (flags >> 7) & 1;
+    h->rcode = flags & 0xf;
+    h->qdcount = dns_u16(m + 4);
+    h->ancount = dns_u16(m + 6);
+    h->nscount = dns_u16(m + 8);
+    h->arcount = dns_u16(m + 10);
+    return 1;
+}
+
+/* 读名字（支持压缩指针）到 out；返回名字字节数，*next 是名字之后的偏移；-1 失败 */
+int dns_name(const void *msg, int n, int off, char[:] out, int *next)
+{
+    const u8 *m = (const u8 *)msg;
+    int pos = off, di = 0, jumps = 0, after = -1;
+
+    if (!msg || off < 0 || off >= n)
+        return -1;
+    for (;;) {
+        int c = 0;
+
+        if (pos < 0 || pos >= n)
+            return -1;
+        c = m[pos];
+        if ((c & 0xc0) == 0xc0) {
+            int ptr = 0;
+
+            if (pos + 1 >= n)
+                return -1;
+            ptr = ((c & 0x3f) << 8) | (int)m[pos + 1];
+            if (after < 0)
+                after = pos + 2;
+            if (ptr >= pos)                /* 只允许向前指，防环 */
+                return -1;
+            pos = ptr;
+            if (++jumps > 64)
+                return -1;
+            continue;
+        }
+        if ((c & 0xc0) != 0)
+            return -1;                     /* 保留位 */
+        if (c == 0) {
+            pos++;
+            if (after < 0)
+                after = pos;
+            break;
+        }
+        if (c > 63 || pos + 1 + c > n)
+            return -1;
+        if (di > 0) {
+            if (di + 1 > out.len)
+                return -1;
+            out.data[di++] = '.';
+        }
+        if (di + c > out.len)
+            return -1;
+        memcpy(out.data + di, m + pos + 1, (usize)c);
+        di += c;
+        pos += 1 + c;
+        if (di > DNS_MAX_NAME)
+            return -1;
+    }
+    if (next)
+        *next = after;
+    return di;
+}
+
+/* 读一条问题：名字写 out，类型/类给 qtype/qclass，*next 是下一条的偏移 */
+int dns_question(const void *msg, int n, int off, char[:] out, u16 *qtype,
+                 u16 *qclass, int *next)
+{
+    const u8 *m = (const u8 *)msg;
+    int after = 0, k = 0;
+
+    k = dns_name(msg, n, off, out, &after);
+    if (k < 0)
+        return -1;
+    if (after + 4 > n)
+        return -1;
+    if (qtype)
+        *qtype = (u16)dns_u16(m + after);
+    if (qclass)
+        *qclass = (u16)dns_u16(m + after + 2);
+    if (next)
+        *next = after + 4;
+    return k;
+}
+
+/* 读一条资源记录：名字写 out，其余字段填 rr，*next 是下一条的偏移 */
+int dns_rr(const void *msg, int n, int off, DnsRR *rr, char[:] out, int *next)
+{
+    const u8 *m = (const u8 *)msg;
+    int after = 0, k = 0, rdoff = 0;
+
+    if (!rr)
+        return -1;
+    k = dns_name(msg, n, off, out, &after);
+    if (k < 0)
+        return -1;
+    if (after + 10 > n)
+        return -1;
+    rr->type = (u16)dns_u16(m + after);
+    rr->rclass = (u16)dns_u16(m + after + 2);
+    rr->ttl = dns_u32(m + after + 4);
+    rr->rdlength = dns_u16(m + after + 8);
+    rdoff = after + 10;
+    if (rdoff + rr->rdlength > n)
+        return -1;
+    rr->rdata_off = rdoff;
+    if (next)
+        *next = rdoff + rr->rdlength;
+    return k;
+}
+
+/* A 记录的 4 字节地址（网络序转成主机序的 u32） */
+int dns_a(const void *msg, int n, DnsRR *rr, u32 *ip)
+{
+    const u8 *m = (const u8 *)msg;
+
+    if (!msg || !rr || !ip || rr->type != DNS_A || rr->rdlength != 4)
+        return 0;
+    if (rr->rdata_off < 0 || rr->rdata_off + 4 > n)
+        return 0;
+    *ip = dns_u32(m + rr->rdata_off);
+    return 1;
+}
+
+/* AAAA 记录的 16 字节地址 */
+int dns_aaaa(const void *msg, int n, DnsRR *rr, u8 *out16)
+{
+    const u8 *m = (const u8 *)msg;
+
+    if (!msg || !rr || !out16 || rr->type != DNS_AAAA || rr->rdlength != 16)
+        return 0;
+    if (rr->rdata_off < 0 || rr->rdata_off + 16 > n)
+        return 0;
+    memcpy(out16, m + rr->rdata_off, 16);
+    return 1;
+}
+
+/* CNAME/NS/PTR 的目标名字（rdata 里是压缩名字） */
+int dns_cname(const void *msg, int n, DnsRR *rr, char[:] out, int *after)
+{
+    if (!rr || (rr->type != DNS_CNAME && rr->type != DNS_NS
+                && rr->type != DNS_PTR))
+        return -1;
+    return dns_name(msg, n, rr->rdata_off, out, after);
+}
+
+/* 构建查询：name 是点分名字，qtype 是 DNS_A 等；返回报文长度或 -1 */
+int dns_build_query(const char *name, u16 qtype, u16 id, char[:] out)
+{
+    u8 *d = (u8 *)out.data;
+    int len = 0, i = 0, di = DNS_HEADER, start = 0;
+
+    if (!name || out.len < DNS_HEADER)
+        return -1;
+    len = (int)strlen(name);
+    if (len > DNS_MAX_NAME)
+        return -1;
+    memset(d, 0, (usize)DNS_HEADER);
+    d[0] = (u8)((id >> 8) & 0xff);
+    d[1] = (u8)(id & 0xff);
+    d[2] = 0x01;                 /* RD = 1 */
+    d[3] = 0x00;
+    d[5] = 0x01;                 /* qdcount = 1 */
+    /* 根名字 "" / "." 就是一个 0 字节 */
+    if (len == 0 || (len == 1 && name[0] == '.')) {
+        if (di + 1 > out.len)
+            return -1;
+        d[di++] = 0;
+    } else {
+        i = 0;
+        while (i <= len) {
+            if (i == len || name[i] == '.') {
+                int lbl = i - start;
+
+                if (lbl <= 0 || lbl > 63)
+                    return -1;
+                if (di + 1 + lbl > out.len)
+                    return -1;
+                d[di++] = (u8)lbl;
+                memcpy(d + di, name + start, (usize)lbl);
+                di += lbl;
+                start = i + 1;
+            }
+            i++;
+        }
+        if (di + 1 > out.len)
+            return -1;
+        d[di++] = 0;
+    }
+    if (di + 4 > out.len)
+        return -1;
+    d[di++] = (u8)((qtype >> 8) & 0xff);
+    d[di++] = (u8)(qtype & 0xff);
+    d[di++] = 0x00;              /* class IN */
+    d[di++] = 0x01;
+    return di;
+}
+
+static int dns_emit(char[:] out, const char *s)
+{
+    int n = (int)strlen(s);
+
+    if (n > out.len)
+        return -1;
+    if (n > 0)
+        memcpy(out.data, s, (usize)n);
+    return n;
+}
+
+int dns_type_name(u16 type, char[:] out)
+{
+    switch (type) {
+    case DNS_A:
+        return dns_emit(out, "A");
+    case DNS_NS:
+        return dns_emit(out, "NS");
+    case DNS_CNAME:
+        return dns_emit(out, "CNAME");
+    case DNS_SOA:
+        return dns_emit(out, "SOA");
+    case DNS_PTR:
+        return dns_emit(out, "PTR");
+    case DNS_MX:
+        return dns_emit(out, "MX");
+    case DNS_TXT:
+        return dns_emit(out, "TXT");
+    case DNS_AAAA:
+        return dns_emit(out, "AAAA");
+    case DNS_SRV:
+        return dns_emit(out, "SRV");
+    }
+    return dns_emit(out, "?");
+}
+
+int dns_rcode_name(int rcode, char[:] out)
+{
+    switch (rcode) {
+    case 0:
+        return dns_emit(out, "NOERROR");
+    case 1:
+        return dns_emit(out, "FORMERR");
+    case 2:
+        return dns_emit(out, "SERVFAIL");
+    case 3:
+        return dns_emit(out, "NXDOMAIN");
+    case 4:
+        return dns_emit(out, "NOTIMP");
+    case 5:
+        return dns_emit(out, "REFUSED");
+    }
+    return dns_emit(out, "RCODE?");
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+/* 一段真实的响应：example.com 的 A 记录（手工构造，带压缩指针） */
+static const u8 dns_resp[] = {
+    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+    0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c,
+    0x00, 0x04, 0x5d, 0xb8, 0xd8, 0x22,
+};
+
+test "构建查询" {
+    char q[128] = { 0 };
+    int n = 0, k = 0;
+    DnsHeader h = { 0 };
+    u16 qt = 0, qc = 0;
+    char name[128] = { 0 };
+    int next = 0;
+
+    n = dns_build_query("example.com", DNS_A, 0x1234,
+                        (char[:]){ q, (int)sizeof q });
+    if (n != 12 + 13 + 4)
+        return err(1, "查询长度");
+    if ((u8)q[0] != 0x12 || (u8)q[1] != 0x34 || (u8)q[2] != 0x01
+        || (u8)q[5] != 0x01)
+        return err(2, "查询头");
+    if ((u8)q[12] != 7 || memcmp(q + 13, "example", 7) != 0
+        || (u8)q[20] != 3 || memcmp(q + 21, "com", 3) != 0
+        || (u8)q[24] != 0)
+        return err(3, "qname");
+    if ((u8)q[25] != 0 || (u8)q[26] != 1 || (u8)q[27] != 0 || (u8)q[28] != 1)
+        return err(4, "qtype/qclass");
+    /* 再解回来 */
+    if (!dns_header(q, n, &h) || h.id != 0x1234 || h.qr != 0
+        || h.rd != 1 || h.qdcount != 1 || h.ancount != 0)
+        return err(5, "解查询头");
+    k = dns_question(q, n, DNS_HEADER, (char[:]){ name, (int)sizeof name }, &qt,
+                     &qc, &next);
+    if (k != 11 || strcmp(name, "example.com") != 0 || qt != DNS_A || qc != 1
+        || next != n)
+        return err(6, "解 query 段");
+    /* 根名字 */
+    n = dns_build_query("", DNS_AAAA, 1, (char[:]){ q, (int)sizeof q });
+    if (n != 12 + 1 + 4 || (u8)q[12] != 0)
+        return err(7, "根名字");
+    /* 非法名字 */
+    if (dns_build_query("a..b", DNS_A, 1, (char[:]){ q, (int)sizeof q }) != -1)
+        return err(8, "空标签");
+    {
+        char longlbl[80] = { 0 };
+
+        memset(longlbl, 'a', 70);
+        if (dns_build_query(longlbl, DNS_A, 1, (char[:]){ q, (int)sizeof q }) != -1)
+            return err(9, "标签太长");
+    }
+    if (dns_build_query("example.com", DNS_A, 1, (char[:]){ q, 20 }) != -1)
+        return err(10, "放不下");
+}
+
+test "解析响应" {
+    DnsHeader h = { 0 };
+    char name[128] = { 0 };
+    DnsRR rr = { 0 };
+    u32 ip = 0;
+    int next = 0, k = 0;
+
+    if (!dns_header(dns_resp, (int)sizeof dns_resp, &h))
+        return err(11, "响应头");
+    if (h.id != 0x1234 || h.qr != 1 || h.rd != 1 || h.ra != 1
+        || h.rcode != 0 || h.qdcount != 1 || h.ancount != 1)
+        return err(12, "响应头的字段");
+    k = dns_question(dns_resp, (int)sizeof dns_resp, DNS_HEADER,
+                     (char[:]){ name, (int)sizeof name }, (u16 *)0, (u16 *)0,
+                     &next);
+    if (k != 11 || strcmp(name, "example.com") != 0)
+        return err(13, "响应里的问题");
+    if (next != 29)
+        return err(14, "问题之后的偏移");
+    k = dns_rr(dns_resp, (int)sizeof dns_resp, next, &rr,
+               (char[:]){ name, (int)sizeof name }, &next);
+    if (k != 11 || strcmp(name, "example.com") != 0)
+        return err(15, "压缩指针解出的名字");
+    if (rr.type != DNS_A || rr.rclass != 1 || rr.ttl != 300 || rr.rdlength != 4)
+        return err(16, "RR 字段");
+    if (!dns_a(dns_resp, (int)sizeof dns_resp, &rr, &ip)
+        || ip != 0x5db8d822u)
+        return err(17, "A 记录地址");
+    if (next != (int)sizeof dns_resp)
+        return err(18, "RR 之后的偏移");
+    /* 类型名 */
+    {
+        char buf[16] = { 0 };
+        int n = dns_type_name(DNS_AAAA, (char[:]){ buf, (int)sizeof buf });
+
+        buf[n > 0 ? n : 0] = 0;
+        if (n != 4 || strcmp(buf, "AAAA") != 0)
+            return err(19, "类型名");
+        n = dns_rcode_name(3, (char[:]){ buf, (int)sizeof buf });
+        buf[n > 0 ? n : 0] = 0;
+        if (n != 8 || strcmp(buf, "NXDOMAIN") != 0)
+            return err(20, "rcode 名");
+        if (dns_type_name(DNS_A, (char[:]){ buf, 0 }) != -1)
+            return err(21, "类型名放不下");
+    }
+}
+
+test "CNAME、AAAA 与坏报文" {
+    /* 问题 www.example.com + CNAME 到 alias */
+    static const u8 cname_msg[] = {
+        0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 'w', 'w', 'w', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03,
+        'c', 'o', 'm', 0x00, 0x00, 0x05, 0x00, 0x01,
+        0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x07,
+        0x05, 'a', 'l', 'i', 'a', 's', 0x00,
+    };
+    char name[128] = { 0 };
+    char target[128] = { 0 };
+    DnsRR rr = { 0 };
+    int next = 0, k = 0, t = 0;
+
+    k = dns_rr(cname_msg, (int)sizeof cname_msg, 12 + 17 + 4, &rr,
+               (char[:]){ name, (int)sizeof name }, &next);
+    if (k < 0 || rr.type != DNS_CNAME || rr.ttl != 60)
+        return err(22, "CNAME 记录");
+    t = dns_cname(cname_msg, (int)sizeof cname_msg, &rr,
+                  (char[:]){ target, (int)sizeof target }, &next);
+    target[t > 0 ? t : 0] = 0;
+    if (t != 5 || strcmp(target, "alias") != 0)
+        return err(23, "CNAME 目标");
+    /* AAAA */
+    {
+        static const u8 aaaa[] = {
+            0x00, 0x02, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x00,
+            0x01, 'a', 0x00, 0x00, 0x1c, 0x00, 0x01,
+            0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00,
+            0x10,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        };
+        u8 out16[16] = { 0 };
+
+        k = dns_rr(aaaa, (int)sizeof aaaa, 12 + 7, &rr,
+                   (char[:]){ name, (int)sizeof name }, &next);
+        if (k < 0 || rr.type != DNS_AAAA || rr.rdlength != 16)
+            return err(24, "AAAA 记录");
+        if (!dns_aaaa(aaaa, (int)sizeof aaaa, &rr, out16)
+            || out16[0] != 0x20 || out16[1] != 0x01 || out16[15] != 1)
+            return err(25, "AAAA 地址");
+    }
+    /* 压缩指针成环：指向自己 */
+    {
+        char loop[16] = { 0 };
+
+        loop[12] = (char)0xc0;
+        loop[13] = 0x0c;
+        if (dns_name(loop, (int)sizeof loop, 12,
+                     (char[:]){ name, (int)sizeof name }, &next) != -1)
+            return err(26, "自指指针要拒绝");
+    }
+    /* 截断 */
+    if (dns_name(dns_resp, 20, DNS_HEADER,
+                 (char[:]){ name, (int)sizeof name }, &next) != -1)
+        return err(27, "截断的名字");
+    if (dns_rr(dns_resp, 30, 29, &rr, (char[:]){ name, (int)sizeof name },
+               &next) != -1)
+        return err(28, "截断的 RR");
+    /* 名字放不下 */
+    if (dns_name(dns_resp, (int)sizeof dns_resp, DNS_HEADER,
+                 (char[:]){ name, 4 }, &next) != -1)
+        return err(29, "名字放不下");
+    /* 头不够 12 字节 */
+    if (dns_header(dns_resp, 11, (DnsHeader *)0) != 0)
+        return err(30, "头太短/空指针");
+}

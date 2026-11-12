@@ -1,0 +1,364 @@
+/* std/net/ws：WebSocket 帧与握手（RFC 6455，零分配）。
+ *
+ *     import std.net.ws;
+ *
+ *     char accept[32] = { 0 };
+ *     ws_accept(S("dGhlIHNhbXBsZSBub25jZQ=="), (char[:]){ accept, (int)sizeof accept });
+ *     // "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+ *
+ *     char frame[64] = { 0 };
+ *     int n = ws_encode(WS_TEXT, 1, "Hello", 5, 0x37fa213du,
+ *                       (char[:]){ frame, (int)sizeof frame });
+ *     WsFrame f = { 0 };
+ *     char payload[64] = { 0 };
+ *     int m = ws_decode(frame, n, &f, (char[:]){ payload, (int)sizeof payload });
+ *
+ * 只做协议里和字节打交道的两件事：
+ *
+ * - **握手**：`ws_accept` 算 `Sec-WebSocket-Accept`——`base64(SHA1(key + GUID))`，
+ *   依赖 `std.encoding.sha1` 与 `std.encoding.base64`。
+ * - **帧**：`ws_encode`/`ws_parse`/`ws_decode` 处理 FIN/opcode、7/16/64 位负载
+ *   长度、掩码（客户端帧必须掩码，服务端不掩码）。掩码参数是 u32，编码时按
+ *   大端写 4 字节、解码时按同样顺序还原。
+ *
+ * 约定：
+ *
+ * - `ws_parse` 只解析头：返回 1 = 头完整（`len`/`header_len`/`mask` 有效），
+ *   0 = 字节还不够，-1 = 坏帧（长度高位非法等）。
+ * - `ws_decode` 解整帧并把**去掩码后的负载**写进调用方缓冲；返回负载字节数，
+ *   0 = 数据还没收全，-1 = 坏帧/缓冲放不下。不做分片重组（FIN=0 的帧也按单帧
+ *   解出来，分片由调用方自己按 opcode 0 拼）——`fin` 原样给出。
+ * - `ws_encode` 的 `mask` 非 0 表示掩码（客户端）；服务端用 0。掩码键要随机，
+ *   可以拿 `std.core.rand` 生成。
+ * - 不分配、不链 libc；TCP 连接本身用 `std.net.tcp`。
+ */
+#include <string.h>
+
+module std.net.ws;
+import std.core.types;
+import std.encoding.sha1;
+import std.encoding.base64;
+
+enum WsOpcode {
+    WS_CONT = 0,
+    WS_TEXT = 1,
+    WS_BINARY = 2,
+    WS_CLOSE = 8,
+    WS_PING = 9,
+    WS_PONG = 10,
+};
+
+enum WsLimits {
+    WS_GUID_LEN = 36,
+};
+
+struct WsFrame {
+    int fin;
+    int opcode;
+    int masked;
+    u64 len;                 /* 负载长度 */
+    int header_len;          /* 头长度（含掩码键） */
+    u32 mask;                /* 掩码键（masked 时） */
+};
+
+static const char ws_guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/* 握手：base64(SHA1(key + GUID))；返回写入字节数，放不下/参数错返回 -1 */
+int ws_accept(char[:] key, char[:] out)
+{
+    u8 digest[SHA1_DIGEST] = { 0 };
+    Sha1 s = sha1_new();
+    char tmp[28] = { 0 };
+    int n = 0;
+
+    if (key.len <= 0 || out.len < 28)
+        return -1;
+    s.update(key.data, key.len);
+    s.update((const void *)ws_guid, WS_GUID_LEN);
+    s.final(digest);
+    {
+        char[:] d = { (char *)digest, SHA1_DIGEST };
+
+        n = b64_encode(d, tmp, (int)sizeof tmp);
+    }
+    if (n <= 0 || n > out.len)
+        return -1;
+    memcpy(out.data, tmp, (usize)n);
+    return n;
+}
+
+/* 帧头解析：1 = 头完整，0 = 还不够，-1 = 坏帧 */
+int ws_parse(const void *frame, int n, WsFrame *out)
+{
+    const u8 *p = (const u8 *)frame;
+    u8 b0 = 0, b1 = 0;
+    u64 len = 0;
+    int hdr = 2;
+
+    if (!out || !frame || n < 0)
+        return -1;
+    if (n < 2)
+        return 0;
+    b0 = p[0];
+    b1 = p[1];
+    out->fin = (b0 >> 7) & 1;
+    out->opcode = b0 & 0x0f;
+    out->masked = (b1 >> 7) & 1;
+    len = (u64)(b1 & 0x7f);
+    if ((b1 & 0x7f) == 126) {
+        if (n < 4)
+            return 0;
+        len = ((u64)p[2] << 8) | (u64)p[3];
+        hdr = 4;
+    } else if ((b1 & 0x7f) == 127) {
+        int i = 0;
+
+        if (n < 10)
+            return 0;
+        len = 0;
+        for (i = 0; i < 8; i++)
+            len = (len << 8) | (u64)p[2 + i];
+        if ((len >> 63) != 0u)          /* 最高位必须为 0 */
+            return -1;
+        hdr = 10;
+    }
+    out->len = len;
+    out->mask = 0;
+    if (out->masked) {
+        if (n < hdr + 4)
+            return 0;
+        out->mask = ((u32)p[hdr] << 24) | ((u32)p[hdr + 1] << 16)
+                    | ((u32)p[hdr + 2] << 8) | (u32)p[hdr + 3];
+        hdr += 4;
+    }
+    out->header_len = hdr;
+    return 1;
+}
+
+/* 解一帧：返回负载字节数，0 = 还没收全，-1 = 坏帧/放不下 */
+int ws_decode(const void *frame, int n, WsFrame *out, char[:] payload)
+{
+    const u8 *p = (const u8 *)frame;
+    int rc = 0, i = 0;
+
+    rc = ws_parse(frame, n, out);
+    if (rc != 1)
+        return rc;                       /* 0 或 -1 */
+    if (out->len > (u64)I32_MAX)
+        return -1;
+    if ((u64)n < (u64)out->header_len + out->len)
+        return 0;                        /* 负载还没收全 */
+    if ((int)out->len > payload.len)
+        return -1;
+    if (out->masked) {
+        u32 m = out->mask;
+
+        for (i = 0; i < (int)out->len; i++) {
+            int shift = (3 - (i & 3)) * 8;
+            u8 k = (u8)((m >> shift) & 0xffu);
+
+            payload.data[i] = (char)(p[out->header_len + i] ^ k);
+        }
+    } else {
+        if ((int)out->len > 0)
+            memcpy(payload.data, p + out->header_len, (usize)out->len);
+    }
+    return (int)out->len;
+}
+
+/* 编码后的总长度；payload_len < 0 返回 -1 */
+int ws_encode_len(int payload_len, int masked)
+{
+    i64 v = 0;
+
+    if (payload_len < 0)
+        return -1;
+    v = 2 + (payload_len < 126 ? 0 : (payload_len <= 0xffff ? 2 : 8))
+        + (masked ? 4 : 0) + payload_len;
+    if (v > (i64)I32_MAX)
+        return -1;
+    return (int)v;
+}
+
+/* 编码一帧：mask 非 0 时掩码（客户端）；返回总字节数，放不下返回 -1 */
+int ws_encode(int opcode, int fin, const void *payload, int payload_len,
+              u32 mask, char[:] out)
+{
+    u8 *d = (u8 *)out.data;
+    const u8 *pl = (const u8 *)payload;
+    int hdr = 2, i = 0, masked = (mask != 0);
+    int need = 0;
+
+    if (payload_len < 0 || (payload_len > 0 && !payload))
+        return -1;
+    if (payload_len >= 126)
+        hdr += (payload_len <= 0xffff) ? 2 : 8;
+    if (masked)
+        hdr += 4;
+    need = hdr + payload_len;
+    if (need > out.len)
+        return -1;
+    d[0] = (u8)((fin ? 0x80 : 0) | (opcode & 0x0f));
+    if (payload_len < 126) {
+        d[1] = (u8)((masked ? 0x80 : 0) | payload_len);
+    } else if (payload_len <= 0xffff) {
+        d[1] = (u8)((masked ? 0x80 : 0) | 126);
+        d[2] = (u8)((payload_len >> 8) & 0xff);
+        d[3] = (u8)(payload_len & 0xff);
+    } else {
+        u64 v = (u64)payload_len;
+        int k = 0;
+
+        d[1] = (u8)((masked ? 0x80 : 0) | 127);
+        for (k = 0; k < 8; k++)
+            d[2 + k] = (u8)((v >> (56 - k * 8)) & 0xffu);
+    }
+    if (masked) {
+        d[hdr - 4] = (u8)((mask >> 24) & 0xffu);
+        d[hdr - 3] = (u8)((mask >> 16) & 0xffu);
+        d[hdr - 2] = (u8)((mask >> 8) & 0xffu);
+        d[hdr - 1] = (u8)(mask & 0xffu);
+        for (i = 0; i < payload_len; i++) {
+            int shift = (3 - (i & 3)) * 8;
+
+            d[hdr + i] = (u8)(pl[i] ^ (u8)((mask >> shift) & 0xffu));
+        }
+    } else if (payload_len > 0) {
+        memcpy(d + hdr, pl, (usize)payload_len);
+    }
+    return need;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "握手 accept-key" {
+    char buf[32] = { 0 };
+    int n = 0;
+
+    n = ws_accept(S("dGhlIHNhbXBsZSBub25jZQ=="),
+                  (char[:]){ buf, (int)sizeof buf });
+    buf[n > 0 ? n : 0] = 0;
+    if (n != 28 || strcmp(buf, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != 0)
+        return err(1, "RFC 6455 的握手向量");
+    if (ws_accept(S("abc"), (char[:]){ buf, 8 }) != -1)
+        return err(2, "放不下");
+    if (ws_accept(S(""), (char[:]){ buf, (int)sizeof buf }) != -1)
+        return err(3, "空 key");
+    /* 空 key 之外的任意 key 都能算出一个 28 字节的串 */
+    n = ws_accept(S("x"), (char[:]){ buf, (int)sizeof buf });
+    if (n != 28)
+        return err(4, "短 key 的长度");
+}
+
+test "帧的编码与已知字节" {
+    char frame[64] = { 0 };
+    int n = 0;
+
+    /* 服务端文本帧 "Hello"：0x81 0x05 'H' 'e' 'l' 'l' 'o' */
+    n = ws_encode(WS_TEXT, 1, "Hello", 5, 0, (char[:]){ frame, (int)sizeof frame });
+    if (n != 7 || (u8)frame[0] != 0x81 || (u8)frame[1] != 0x05
+        || memcmp(frame + 2, "Hello", 5) != 0)
+        return err(5, "文本帧");
+    if (n != ws_encode_len(5, 0))
+        return err(6, "长度一致");
+    /* ping + FIN=0 */
+    n = ws_encode(WS_PING, 0, "x", 1, 0, (char[:]){ frame, (int)sizeof frame });
+    if (n != 3 || (u8)frame[0] != 0x09 || (u8)frame[1] != 0x01 || frame[2] != 'x')
+        return err(7, "ping");
+    /* 126 长度用 16 位 */
+    {
+        char big[200] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < (int)sizeof big; i++)
+            big[i] = (char)('a' + i % 26);
+        n = ws_encode(WS_BINARY, 1, big, 130, 0,
+                      (char[:] ){ frame, 0 });
+        if (n != -1)
+            return err(8, "放不下要 -1");
+        {
+            char out[200] = { 0 };
+
+            n = ws_encode(WS_BINARY, 1, big, 130, 0,
+                          (char[:]){ out, (int)sizeof out });
+            if (n != 4 + 130 || (u8)out[1] != 126 || (u8)out[2] != 0
+                || (u8)out[3] != 130)
+                return err(9, "16 位长度");
+        }
+    }
+    /* 65KiB 用 64 位长度 */
+    {
+        static char big[66000] = { 0 };
+        static char out[66100] = { 0 };
+
+        n = ws_encode(WS_BINARY, 1, big, 65536, 0,
+                      (char[:]){ out, (int)sizeof out });
+        if (n != 10 + 65536 || (u8)out[1] != 127)
+            return err(10, "64 位长度");
+        if ((u8)out[2] != 0 || (u8)out[3] != 0 || (u8)out[4] != 0
+            || (u8)out[5] != 0 || (u8)out[6] != 0 || (u8)out[7] != 1
+            || (u8)out[8] != 0 || (u8)out[9] != 0)
+            return err(11, "64 位长度的大端");
+    }
+    /* 参数错误 */
+    if (ws_encode(WS_TEXT, 1, (const void *)0, 3, 0, (char[:]){ frame, 8 }) != -1)
+        return err(12, "空负载指针");
+    if (ws_encode(WS_TEXT, 1, "x", -1, 0, (char[:]){ frame, 8 }) != -1)
+        return err(13, "负长度");
+}
+
+test "帧的解码与掩码" {
+    char frame[64] = { 0 };
+    char payload[64] = { 0 };
+    WsFrame f = { 0 };
+    int n = 0, m = 0;
+
+    /* 不掩码：直接往返 */
+    n = ws_encode(WS_TEXT, 1, "Hello", 5, 0, (char[:]){ frame, (int)sizeof frame });
+    m = ws_decode(frame, n, &f, (char[:]){ payload, (int)sizeof payload });
+    if (m != 5 || !f.fin || f.opcode != WS_TEXT || f.masked
+        || memcmp(payload, "Hello", 5) != 0)
+        return err(14, "不掩码往返");
+    /* 掩码：加密后的字节不该是明文，解出来要还原 */
+    n = ws_encode(WS_TEXT, 1, "Hello", 5, 0x37fa213du,
+                  (char[:]){ frame, (int)sizeof frame });
+    if ((u8)frame[1] != 0x85)
+        return err(15, "掩码位与长度");
+    if (memcmp(frame + 6, "Hello", 5) == 0)
+        return err(16, "掩码后不该是明文");
+    m = ws_decode(frame, n, &f, (char[:]){ payload, (int)sizeof payload });
+    if (m != 5 || !f.masked || f.mask != 0x37fa213du
+        || memcmp(payload, "Hello", 5) != 0)
+        return err(17, "掩码往返");
+    /* 半截头 / 半截负载 */
+    if (ws_decode(frame, 1, &f, (char[:]){ payload, (int)sizeof payload }) != 0)
+        return err(18, "半截头");
+    if (ws_decode(frame, n - 1, &f, (char[:]){ payload, (int)sizeof payload }) != 0)
+        return err(19, "半截负载");
+    /* 负载缓冲放不下 */
+    if (ws_decode(frame, n, &f, (char[:]){ payload, 4 }) != -1)
+        return err(20, "负载放不下");
+    /* 坏帧：64 位长度最高位为 1 */
+    {
+        char bad[12] = { 0 };
+
+        bad[0] = (char)0x82;
+        bad[1] = 127;
+        bad[2] = (char)0x80;
+        if (ws_decode(bad, 12, &f, (char[:]){ payload, (int)sizeof payload }) != -1)
+            return err(21, "非法 64 位长度");
+    }
+    /* 0 长度帧（close/ping） */
+    n = ws_encode(WS_CLOSE, 1, (const void *)0, 0, 0,
+                  (char[:]){ frame, (int)sizeof frame });
+    m = ws_decode(frame, n, &f, (char[:]){ payload, (int)sizeof payload });
+    if (n != 2 || m != 0 || f.opcode != WS_CLOSE || f.fin != 1)
+        return err(22, "空帧");
+    /* 分片帧的 FIN 原样给出 */
+    n = ws_encode(WS_TEXT, 0, "ab", 2, 0, (char[:]){ frame, (int)sizeof frame });
+    m = ws_decode(frame, n, &f, (char[:]){ payload, (int)sizeof payload });
+    if (m != 2 || f.fin != 0)
+        return err(23, "FIN=0");
+}

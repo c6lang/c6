@@ -1,0 +1,187 @@
+/* stdwire：标准库第十七批（sha1 / ws / dns / tcp）的拼装示例。
+ *
+ * 和 stdform/stdtext/stdnum/stdpack/stdconf/stdcli 一样：这个文件没有 `module`
+ * （入口 `main` 只能写在模块外的文件里），四节各带自检，失败打 FAIL，最后按
+ * 失败数决定退出码。
+ *
+ * 四节讲的是一条「网络协议」链路：
+ *
+ *   - sha1：摘要与 HMAC 的已知向量；
+ *   - ws：握手 accept-key + 一帧带掩码的文本（编码再解码）；
+ *   - dns：构建 example.com 的 A 查询，再解一段带压缩指针的响应；
+ *   - tcp：在 loopback 上监听/连接/接受/收发（端口让内核挑）。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdwire \
+ *         examples/stdwire.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/encoding/base64.c6 std/encoding/sha1.c6 std/net/ws.c6 \
+ *         std/net/dns.c6 std/net/tcp.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.encoding.sha1;
+import std.net.ws;
+import std.net.dns;
+import std.net.tcp;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* sha1：摘要 + HMAC */
+static void tour_sha1(void)
+{
+    char hex[41] = { 0 };
+    int n = 0;
+
+    n = sha1_hex("abc", 3, (char[:]){ hex, (int)sizeof hex });
+    hex[n > 0 ? n : 0] = 0;
+    printf("sha1: sha1(abc) = %s\n", hex);
+    check(n == 40 && strcmp(hex, "a9993e364706816aba3e25717850c26c9cd0d89d") == 0,
+          "sha1: abc 的向量");
+    {
+        u8 key[20] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 20; i++)
+            key[i] = 0x0b;
+        n = hmac_sha1_hex(key, 20, "Hi There", 8, (char[:]){ hex, (int)sizeof hex });
+        hex[n > 0 ? n : 0] = 0;
+        check(strcmp(hex, "b617318655057264e28bc0b6fb378c8ef146be00") == 0,
+              "sha1: HMAC 向量");
+    }
+}
+
+/* ws：握手 + 帧 */
+static void tour_ws(void)
+{
+    char accept[32] = { 0 };
+    char frame[64] = { 0 };
+    char payload[64] = { 0 };
+    WsFrame f = { 0 };
+    int n = 0, m = 0;
+
+    n = ws_accept(S("dGhlIHNhbXBsZSBub25jZQ=="),
+                  (char[:]){ accept, (int)sizeof accept - 1 });
+    accept[n > 0 ? n : 0] = 0;
+    printf("ws: accept = %s\n", accept);
+    check(n == 28 && strcmp(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") == 0,
+          "ws: 握手向量");
+
+    n = ws_encode(WS_TEXT, 1, "Hello", 5, 0x37fa213du,
+                  (char[:]){ frame, (int)sizeof frame });
+    m = ws_decode(frame, n, &f, (char[:]){ payload, (int)sizeof payload });
+    check(n == 11 && m == 5 && f.opcode == WS_TEXT && f.masked
+              && memcmp(payload, "Hello", 5) == 0,
+          "ws: 掩码文本帧往返");
+    printf("ws: 帧 %d 字节，解出 \"%.*s\"\n", n, m, payload);
+    /* ping 帧（不掩码） */
+    n = ws_encode(WS_PING, 1, "p", 1, 0, (char[:]){ frame, (int)sizeof frame });
+    check(n == 3 && (u8)frame[0] == 0x89, "ws: ping 帧");
+}
+
+/* dns：构建查询 + 解析响应 */
+static void tour_dns(void)
+{
+    char q[128] = { 0 };
+    int n = 0;
+    /* 手工构造的响应：example.com 的 A 记录（带压缩指针） */
+    static const u8 resp[] = {
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+        0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c,
+        0x00, 0x04, 0x5d, 0xb8, 0xd8, 0x22,
+    };
+    DnsHeader h = { 0 };
+    char name[128] = { 0 };
+    DnsRR rr = { 0 };
+    u32 ip = 0;
+    int next = 0;
+
+    n = dns_build_query("example.com", DNS_A, 0x1234,
+                        (char[:]){ q, (int)sizeof q });
+    check(n == 29 && (u8)q[12] == 7 && memcmp(q + 13, "example", 7) == 0,
+          "dns: 查询报文");
+    if (!dns_header(resp, (int)sizeof resp, &h))
+        return;
+    check(h.qr == 1 && h.ancount == 1, "dns: 响应头");
+    {
+        int k = dns_question(resp, (int)sizeof resp, DNS_HEADER,
+                             (char[:]){ name, (int)sizeof name }, (u16 *)0,
+                             (u16 *)0, &next);
+
+        if (k < 0)
+            return;
+        name[k] = 0;
+    }
+    if (dns_rr(resp, (int)sizeof resp, next, &rr,
+               (char[:]){ name, (int)sizeof name }, &next) < 0)
+        return;
+    check(rr.type == DNS_A && rr.ttl == 300 && dns_a(resp, (int)sizeof resp, &rr, &ip),
+          "dns: A 记录");
+    printf("dns: %s A %u.%u.%u.%u ttl=%u\n", name, (ip >> 24) & 0xff,
+           (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, (unsigned)rr.ttl);
+    check(ip == 0x5db8d822u, "dns: 地址");
+}
+
+/* tcp：loopback 往返 */
+static void tour_tcp(void)
+{
+    Tcp srv = tcp_listen("127.0.0.1", 0, 4);
+    int p = 0, n = 0;
+    Tcp cli = { -1 }, peer = { -1 };
+    char buf[32] = { 0 };
+
+    check(srv.ok(), "tcp: 监听");
+    if (!srv.ok())
+        return;
+    p = srv.port();
+    printf("tcp: 监听端口 %d\n", p);
+    check(p > 0, "tcp: 端口");
+    cli = tcp_connect("127.0.0.1", p, 1000);
+    check(cli.ok(), "tcp: 连接");
+    peer = srv.accept_client();
+    check(peer.ok(), "tcp: 接受");
+    if (!cli.ok() || !peer.ok())
+        return;
+    check(cli.write_all("ping", 4) == 4, "tcp: 发送");
+    n = peer.read_all(buf, 4);
+    buf[n > 0 ? n : 0] = 0;
+    check(n == 4 && strcmp(buf, "ping") == 0, "tcp: 接收");
+    check(peer.write_all("pong", 4) == 4 && cli.read_all(buf, 4) == 4
+              && memcmp(buf, "pong", 4) == 0,
+          "tcp: 双向");
+    printf("tcp: 往返 %d 字节\n", n);
+    /* 超时 */
+    check(peer.set_timeout(50), "tcp: 设置超时");
+    check(peer.read_bytes(buf, (int)sizeof buf) == -1, "tcp: 超时返回 -1");
+    cli.close_socket();
+    check(peer.read_bytes(buf, (int)sizeof buf) == 0, "tcp: 对端关闭给 0");
+    peer.close_socket();
+    srv.close_socket();
+}
+
+int main(void)
+{
+    printf("stdwire: 标准库第十七批（sha1 / ws / dns / tcp）\n");
+    tour_sha1();
+    tour_ws();
+    tour_dns();
+    tour_tcp();
+    printf("stdwire: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

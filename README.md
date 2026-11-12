@@ -220,7 +220,7 @@ std/os/                     操作系统：流、文件系统、路径、环境�
   std/os/proc.c6            std.os.proc            子进程（POSIX）：proc_run/proc_spawn/proc_wait（ProcStatus 的 exited/exit_code/signaled/signal）、proc_run_sh（/bin/sh -c）、proc_which（PATH 查找）
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
-std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、SHA-256、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
@@ -232,6 +232,7 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/frame.c6     std.encoding.frame     串行分帧（零分配）：COBS 的 cobs_max_len/cobs_encoded_len/cobs_encode/cobs_decode/cobs_encode_frame/cobs_decode_frame 与 SLIP（RFC 1055）的 slip_encoded_len/slip_encode/slip_decode/slip_encode_frame/slip_decode_frame；坏格式/放不下都不写半截
   std/encoding/lz4.c6       std.encoding.lz4       LZ4 块压缩/解压（零分配）：lz4_compress（调用方给 int[lz4_table_size()] 哈希表）/lz4_decompress、lz4_compress_bound；兼容标准 LZ4 块格式，坏偏移/截断/放不下都拒绝
   std/encoding/rle.c6       std.encoding.rle       PackBits 游程（rle_encode/decode、rle_encoded_len/decoded_len、rle_bound）与一阶差分（delta_encode/decode，模 256）
+  std/encoding/sha1.c6      std.encoding.sha1      SHA-1 与 HMAC-SHA1：流式 init/update/final、一次性 sha1/sha1_hex、hmac_sha1/hmac_sha1_hex、常数时间 sha1_eq（协议互操作：WebSocket 握手、git 对象名、HTTP Digest；抗碰撞请用 sha256）
   std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
@@ -245,12 +246,15 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/xml.c6           std.data.xml           XML 零分配扫描：xml_open + XmlReader.next（START/END/SELF/TEXT）、XmlEvent 的 name/text/attrs 与 attr_count/attr_at/attr、xml_unescape（5 个预定义实体 + 数字引用）；跳过注释/PI/DOCTYPE，CDATA 当文本，32 层标签配对校验
   std/data/props.c6         std.data.props         .properties/.env 零分配读取：props_open/next、e.decode(buf)、props_lookup/has/count（\n/\uXXXX/代理对/续行）
 
-std/net/                    网络与 Web：IP/CIDR、URL、MIME、HTTP/1.x、multipart
+std/net/                    网络与 Web：TCP 套接字、DNS 报文、WebSocket 帧、IP/CIDR、URL、MIME、HTTP/1.x、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
   std/net/http.c6           std.net.http           HTTP/1.x 零分配解析：http_parse_request/response、HttpMessage 的 header/header_at/body/content_length、http_status_text
   std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_parse_v4/inet_parse_v6，Ip/Ipv4/Ipv6 的 format（IPv6 按 RFC 5952 压缩）、inet_parse_cidr/cidr_contains/cidr_mask/inet_v4_mask、is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
   std/net/mime.c6           std.net.mime           扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：mime_of_ext/mime_of_path/mime_ext_of/mime_ext_at/mime_type_at/mime_count、mime_is_text/is_image/is_audio/is_video/is_font、mime_charset、mime_sniff、mime_default
   std/net/multipart.c6      std.net.multipart      multipart/form-data 零分配解析：mp_open/mp_open_boundary、Multipart 的 next/count、Part 的 name/filename/content_type/body、mp_header/mp_param
+  std/net/dns.c6            std.net.dns            DNS 报文（RFC 1035）：dns_header、dns_question/dns_rr（压缩指针、*next 遍历）、dns_a/dns_aaaa/dns_cname、dns_build_query、dns_type_name/dns_rcode_name
+  std/net/tcp.c6            std.net.tcp            TCP 套接字（POSIX）：tcp_listen/tcp_connect（超时）/accept_client、Tcp 的 write_bytes/write_all/read_bytes/read_all/set_timeout/set_nodelay/shutdown_write/close_socket、port/ok
+  std/net/ws.c6             std.net.ws             WebSocket（RFC 6455）：ws_accept 握手、ws_encode/ws_parse/ws_decode 帧（FIN/opcode/7-16-64 位长度/掩码）、WsFrame
   std/net/url.c6            std.net.url            URL（RFC 3986）解析与相对解析：Url 的 url_parse/effective_port/is_absolute/has_host、url_resolve（§5.2 全算法）、查询参数 next_pair/Pair、百分号 url_encode/url_encode_component/url_decode/url_decode_at/url_encoded_len/url_decoded_len
 ```
 
@@ -284,6 +288,7 @@ make std-num     # 编译并运行 examples/stdnum.c6（第十三批数值类型
 make std-pack    # 编译并运行 examples/stdpack.c6（第十四批压缩与文本编码模块的拼装示例）
 make std-conf    # 编译并运行 examples/stdconf.c6（第十五批配置与文档格式模块的拼装示例）
 make std-cli     # 编译并运行 examples/stdcli.c6（第十六批命令行工具基础模块的拼装示例）
+make std-wire    # 编译并运行 examples/stdwire.c6（第十七批网络协议基础模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

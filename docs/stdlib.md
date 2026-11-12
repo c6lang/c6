@@ -16,9 +16,9 @@
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序 |
 | `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程 |
-| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-256、位流、UUID、LZ4/RLE、hexdump |
+| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
-| `std/net/` | 网络与 Web：IP/CIDR、URL、MIME |
+| `std/net/` | 网络与 Web：TCP 套接字、DNS 报文、WebSocket 帧、IP/CIDR、URL、MIME |
 
 ```sh
 ./tcc/c6 -B tcc -I . -I examples -o build/wordcount \
@@ -120,6 +120,7 @@
 | `std/encoding/frame.c6` | `std.encoding.frame` | 串行分帧（零分配，写调用方缓冲）：COBS 的 `cobs_max_len`（上界）/`cobs_encoded_len`（精确）/`cobs_encode`/`cobs_decode`/`cobs_encode_frame`/`cobs_decode_frame`，SLIP（RFC 1055）的 `slip_encoded_len`/`slip_encode`/`slip_decode`/`slip_encode_frame`/`slip_decode_frame`；坏 code 字节、截断/非法转义、负载里的分隔符都拒绝，失败时不写半截 |
 | `std/encoding/lz4.c6` | `std.encoding.lz4` | LZ4 块压缩/解压（零分配）：`lz4_compress`（调用方给 `int[lz4_table_size()]` 哈希表）/`lz4_decompress`/`lz4_compress_bound`；兼容标准 LZ4 块格式（结尾 5 字节字面量、最后匹配不早于结尾前 12 字节），坏偏移/截断/放不下都返回 -1 |
 | `std/encoding/rle.c6` | `std.encoding.rle` | PackBits 游程（`rle_encode`/`rle_decode`/`rle_encoded_len`/`rle_decoded_len`/`rle_bound`，控制字节 0..127 字面量、129..255 重复、128 no-op，单段 ≤128）与一阶差分 `delta_encode`/`delta_decode`（模 256，和 RLE/LZ4 组合用） |
+| `std/encoding/sha1.c6` | `std.encoding.sha1` | SHA-1 与 HMAC-SHA1（FIPS 180-4 / RFC 2104，零分配）：`sha1_new`/`init`/`update`/`final`、一次性 `sha1`/`sha1_hex`、`hmac_sha1`/`hmac_sha1_hex`、常数时间 `sha1_eq`；用于协议互操作（WebSocket 握手、git 对象名、HTTP Digest），抗碰撞请用 `std.encoding.sha256` |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
 | `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
@@ -145,6 +146,9 @@
 | `std/net/http.c6` | `std.net.http` | HTTP/1.x 零分配解析：`http_parse_request`/`http_parse_response` 得到 `HttpMessage`，`HttpMessage` 的 `header`/`header_at`/`header_count`/`body`/`content_length`/`is_request`/`is_response`，`http_status_text`；头字段名大小写不敏感，不接受 obs-fold |
 | `std/net/cookie.c6` | `std.net.cookie` | Cookie / Set-Cookie 零分配解析：`cookie_parse_set`/`cookie_parse_pair` 得到 `Cookie`，`Cookie` 的 `attribute`/`has_attribute`/`path`/`domain`/`expires`/`same_site`/`max_age`/`is_secure`/`is_http_only`、`cookie_write_pair` |
 | `std/net/multipart.c6` | `std.net.multipart` | `multipart/form-data` 零分配解析（RFC 7578）：`mp_open`/`mp_open_boundary` 工厂 + `Multipart` 的 `next`/`count`、`Part` 的 `headers`/`disposition`/`name`/`filename`/`content_type`/`body`/`index`、`mp_header`/`mp_param`；伪分隔符当 preamble、无头 part、CRLF/LF 都认 |
+| `std/net/dns.c6` | `std.net.dns` | DNS 报文（RFC 1035，零分配）：`dns_header`（id/flags/计数/rcode）、`dns_question`/`dns_rr`（压缩指针只允许向前指、最多 64 跳；`*next` 顺序遍历）、`dns_a`/`dns_aaaa`/`dns_cname`、`dns_build_query`（点分名字 → 查询报文）、`dns_type_name`/`dns_rcode_name`；不做 EDNS0/DoT/名字转义 |
+| `std/net/tcp.c6` | `std.net.tcp` | TCP 套接字（POSIX 薄封装）：`tcp_listen`（port 0 = 内核挑）、`tcp_connect`（`timeout_ms >= 0` 用非阻塞 connect + `poll`）、`accept_client`、`Tcp` 的 `write_bytes`/`write_all`/`read_bytes`/`read_all`/`set_timeout`/`set_nodelay`/`shutdown_write`/`close_socket`/`port`/`ok`；getaddrinfo 解析主机（IPv4/IPv6/localhost），失败 `fd = -1` |
+| `std/net/ws.c6` | `std.net.ws` | WebSocket（RFC 6455，零分配）：`ws_accept`（`base64(SHA1(key+GUID))`）、`ws_encode`/`ws_parse`/`ws_decode`（FIN/opcode、7/16/64 位长度、客户端掩码、u32 掩码键）、`ws_encode_len`、`WsFrame`；不重组分片（FIN 原样给出） |
 | `std/net/url.c6` | `std.net.url` | URL（RFC 3986）解析与相对解析：`url_parse` 工厂 + `Url` 的 `effective_port`/`is_absolute`/`has_host`、`url_resolve`（§5.2 全算法）、查询参数 `next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
 
 **集成示例**（`main` 只能写在模块外的文件里）
@@ -167,6 +171,7 @@
 | `examples/stdpack.c6` | （无模块） | 第十四批（压缩与文本编码）的拼装示例（`make std-pack`）：lz4 压缩遥测帧、rle+delta 压采样、base85 转文本、hexdump 文本化，自带自检 |
 | `examples/stdconf.c6` | （无模块） | 第十五批（配置与文档格式）的拼装示例（`make std-conf`）：toml 读配置、xml 扫文档、query 解析/构建查询串、template 生成报告，自带自检 |
 | `examples/stdcli.c6` | （无模块） | 第十六批（命令行工具基础）的拼装示例（`make std-cli`）：args 解析参数、natural 排序与人类可读化、table 排版、proc 跑子进程，自带自检 |
+| `examples/stdwire.c6` | （无模块） | 第十七批（网络协议基础）的拼装示例（`make std-wire`）：sha1 向量、ws 握手/分帧、dns 查询与响应、loopback TCP 往返，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -1959,6 +1964,103 @@ if (proc_run(3, argv, &st) && st.exited)
   可执行文件（名字带 `/` 就直接检查），找到把路径写调用方缓冲。
 * 不做重定向/管道/超时/Windows；`proc_run_sh` 的命令串上限 4KB（栈缓冲，不分配）。
 
+### `sha1`：SHA-1 与 HMAC-SHA1
+
+```c
+import std.encoding.sha1;
+
+Sha1 s = sha1_new();
+s.update("abc", 3);
+u8 d[20] = { 0 };
+s.final(d);                          /* a9993e36... */
+char hex[41] = { 0 };
+sha1_hex("abc", 3, (char[:]){ hex, (int)sizeof hex });
+```
+
+* 流式接口 `sha1_new`/`init`/`update`/`final`（`final` 之后要重用就 `init`）；
+  一次性 `sha1`/`sha1_hex`；HMAC 的 `hmac_sha1`/`hmac_sha1_hex`（长 key 先摘要）；
+  `sha1_eq` 是常数时间比较（20 字节）。
+* SHA-1 在密码学上已经不安全（碰撞可构造），这里是为了**协议互操作**：
+  WebSocket 握手、git 对象名、HTTP Digest 等。要抗碰撞用 `std.encoding.sha256`。
+* 零分配、不链 libc 加密库；hex 是小写 40 字符。
+
+### `ws`：WebSocket 帧与握手
+
+```c
+import std.net.ws;
+
+char accept[28] = { 0 };
+ws_accept(S("dGhlIHNhbXBsZSBub25jZQ=="), (char[:]){ accept, (int)sizeof accept });
+/* "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" */
+
+char frame[64] = { 0 };
+int n = ws_encode(WS_TEXT, 1, "Hello", 5, 0x37fa213du,
+                  (char[:]){ frame, (int)sizeof frame });
+WsFrame f = { 0 };
+char payload[64] = { 0 };
+int m = ws_decode(frame, n, &f, (char[:]){ payload, (int)sizeof payload });
+```
+
+* 握手：`ws_accept` = `base64(SHA1(key + GUID))`，依赖 sha1 与 base64。
+* 帧：`ws_encode`（FIN/opcode、7/16/64 位长度、`mask` 非 0 时掩码）/
+  `ws_parse`（只解析头：1 完整、0 还不够、-1 坏帧）/`ws_decode`（整帧并去掩码）。
+* `mask` 是 u32，编码按大端写 4 字节掩码键、解码按同样顺序还原；掩码键要随机
+  （可以用 `std.core.rand`）。
+* 不做分片重组：FIN=0 的帧也按单帧解出来，`fin` 原样给出，分片由调用方自己拼。
+
+### `dns`：DNS 报文
+
+```c
+import std.net.dns;
+
+char q[128] = { 0 };
+int n = dns_build_query("example.com", DNS_A, 0x1234,
+                        (char[:]){ q, (int)sizeof q });
+
+DnsHeader h = { 0 };
+dns_header(resp, rn, &h);
+char name[128] = { 0 };
+DnsRR rr = { 0 };
+int next = 0;
+dns_rr(resp, rn, off, &rr, (char[:]){ name, (int)sizeof name }, &next);
+u32 ip = 0;
+dns_a(resp, rn, &rr, &ip);
+```
+
+* 解析：`dns_header` 拆 12 字节头；`dns_question`/`dns_rr` 按偏移读一条记录，
+  名字支持**压缩指针**（只允许向前指、最多 64 跳防环），解码成点分字符串；
+  `*next` 是下一条的偏移，顺着 ancount 遍历即可。
+* 记录取值：`dns_a`（4 字节）、`dns_aaaa`（16 字节）、`dns_cname`（CNAME/NS/PTR
+  的目标名字）。
+* 构建：`dns_build_query` 生成 RD=1、一个问题、class IN 的标准查询。
+* 不做 EDNS0、DoT、DNS over TCP 的两字节长度前缀、名字里的转义。
+
+### `tcp`：TCP 套接字
+
+```c
+import std.net.tcp;
+
+Tcp srv = tcp_listen("127.0.0.1", 0, 4);      /* 0 = 内核挑端口 */
+int port = srv.port();
+Tcp cli = tcp_connect("127.0.0.1", port, 1000);
+Tcp peer = srv.accept_client();
+peer.write_all("hi", 2);
+char buf[8] = { 0 };
+cli.read_all(buf, 2);
+cli.close_socket();
+```
+
+* 工厂 `tcp_listen`/`tcp_connect`/`accept_client` 返回 `Tcp`，失败时 `fd = -1`，
+  用 `ok()` 判断；其它方法对无效 fd 返回 -1/0，不会崩。
+* `tcp_connect` 的 `timeout_ms >= 0` 用非阻塞 connect + `poll` 实现超时；
+  `< 0` 是普通阻塞 connect。
+* `read_bytes` 返回 0 表示对端关闭（EOF）、-1 表示错误/超时；`write_bytes` 可能
+  只发一部分，要发完整用 `write_all`；`read_all` 读满 n 字节。
+* `set_timeout`（SO_RCVTIMEO/SO_SNDTIMEO）、`set_nodelay`、`shutdown_write`（半关闭）、
+  `close_socket`（重复调用安全）。
+* 名字避开 libc 的 `send`/`recv`/`close`/`accept`（同名会与系统头冲突）。
+* 不做 TLS；DNS 报文用 `std.net.dns`，WebSocket 分帧用 `std.net.ws`。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -2330,6 +2432,30 @@ stdcli: 17 check(s), 0 failure(s)
 `kill -TERM $$` 的信号终止，最后在 PATH 里找 `sh`。Makefile 里显式列出九个模块
 正文（args 依赖 str、table 依赖 width+utf8，natural 与 proc 只依赖 types）。
 
+### 集成示例：`examples/stdwire.c6`
+
+```sh
+make std-wire
+```
+
+```
+stdwire: 标准库第十七批（sha1 / ws / dns / tcp）
+sha1: sha1(abc) = a9993e364706816aba3e25717850c26c9cd0d89d
+ws: accept = s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+ws: 帧 11 字节，解出 "Hello"
+dns: example.com A 93.184.216.34 ttl=300
+tcp: 监听端口 35579
+tcp: 往返 4 字节
+stdwire: 19 check(s), 0 failure(s)
+```
+
+四节：「摘要」钉住 `abc` 的 SHA-1 与 RFC 2202 的 HMAC 向量；「握手/分帧」用
+RFC 6455 的 `Sec-WebSocket-Accept` 向量，再编码一帧带掩码的文本并解回来；
+「DNS」构建 example.com 的 A 查询，再解一段带压缩指针的响应（地址、TTL）；
+「TCP」在 127.0.0.1:0 上监听、连接、接受、双向收发，并验超时返回 -1、对端关闭
+返回 0。Makefile 里显式列出八个模块正文（ws 依赖 sha1+base64+err，其余只依赖
+types）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2357,6 +2483,8 @@ stdcli: 17 check(s), 0 failure(s)
 * `make std-conf`：`examples/stdconf.c6`，第十五批（配置与文档格式）模块的拼装
   示例（自带自检）。
 * `make std-cli`：`examples/stdcli.c6`，第十六批（命令行工具基础）模块的拼装
+  示例（自带自检）。
+* `make std-wire`：`examples/stdwire.c6`，第十七批（网络协议基础）模块的拼装
   示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

@@ -1,0 +1,430 @@
+/* std/encoding/sha1：SHA-1 与 HMAC-SHA1（FIPS 180-4 / RFC 2104，零分配）。
+ *
+ *     import std.encoding.sha1;
+ *
+ *     Sha1 s = sha1_new();
+ *     s.update("abc", 3);
+ *     u8 d[20] = { 0 };
+ *     s.final(d);
+ *
+ *     u8 one[20] = { 0 };
+ *     sha1("abc", 3, one);                  // 一次性
+ *     char hex[41] = { 0 };
+ *     sha1_hex("abc", 3, (char[:]){ hex, (int)sizeof hex });
+ *
+ * SHA-1 在密码学上已经不安全（碰撞可构造），但它在**协议互操作**里还到处都在：
+ * WebSocket 握手（RFC 6455 的 `Sec-WebSocket-Accept`）、HTTP Digest、git 的对象
+ * 名、老式签名格式。要抗碰撞请用 `std.encoding.sha256`。
+ *
+ * 约定：
+ *
+ * - 流式接口：`sha1_new` 工厂 → `update` 喂任意段 → `final` 出 20 字节；
+ *   `final` 之后对象不可再用（要重来就再 `init`）。
+ * - 一次性入口 `sha1`/`sha1_hex`/`hmac_sha1`/`hmac_sha1_hex`；hex 是小写 40 字符。
+ * - `sha1_eq` 是常数时间比较（20 字节），给 HMAC 校验用。
+ * - 不分配、不链 libc 的加密库；输入可以是任意字节，长度用 int（单次调用）。
+ */
+#include <string.h>
+
+module std.encoding.sha1;
+import std.core.types;
+
+enum Sha1Size {
+    SHA1_DIGEST = 20,
+    SHA1_BLOCK = 64,
+};
+
+struct Sha1 {
+    u32 h[5];
+    u64 bits;                /* 已处理的位数 */
+    u8 buf[SHA1_BLOCK];
+    int n;                   /* buf 里待处理的字节数 */
+};
+
+static u32 sha1_rol(u32 v, int n)
+{
+    return (v << n) | (v >> (32 - n));
+}
+
+static u32 sha1_load_be(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static void sha1_block(Sha1 *s, const u8 *p)
+{
+    u32 w[80] = { 0 };
+    u32 a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, k = 0, t = 0;
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        w[i] = sha1_load_be(p + i * 4);
+    for (i = 16; i < 80; i++)
+        w[i] = sha1_rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    a = s->h[0];
+    b = s->h[1];
+    c = s->h[2];
+    d = s->h[3];
+    e = s->h[4];
+    for (i = 0; i < 80; i++) {
+        if (i < 20) {
+            f = (b & c) | ((~b) & d);
+            k = 0x5a827999u;
+        } else if (i < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ed9eba1u;
+        } else if (i < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8f1bbcdcu;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xca62c1d6u;
+        }
+        t = sha1_rol(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = sha1_rol(b, 30);
+        b = a;
+        a = t;
+    }
+    s->h[0] += a;
+    s->h[1] += b;
+    s->h[2] += c;
+    s->h[3] += d;
+    s->h[4] += e;
+}
+
+Sha1 sha1_new(void)
+{
+    Sha1 s = { { 0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u,
+                 0xc3d2e1f0u }, 0u, { 0 }, 0 };
+
+    return s;
+}
+
+/* 重置（等价于重新 sha1_new，但保留同一块内存） */
+void init(Sha1 *self)
+{
+    self->h[0] = 0x67452301u;
+    self->h[1] = 0xefcdab89u;
+    self->h[2] = 0x98badcfeu;
+    self->h[3] = 0x10325476u;
+    self->h[4] = 0xc3d2e1f0u;
+    self->bits = 0u;
+    self->n = 0;
+}
+
+void update(Sha1 *self, const void *p, int n)
+{
+    const u8 *b = (const u8 *)p;
+    int i = 0;
+
+    if (!p || n <= 0)
+        return;
+    self->bits += (u64)n * 8u;
+    if (self->n > 0) {
+        int take = SHA1_BLOCK - self->n;
+
+        if (take > n)
+            take = n;
+        for (i = 0; i < take; i++)
+            self->buf[self->n + i] = b[i];
+        self->n += take;
+        b += take;
+        n -= take;
+        if (self->n == SHA1_BLOCK) {
+            sha1_block(self, self->buf);
+            self->n = 0;
+        }
+    }
+    while (n >= SHA1_BLOCK) {
+        sha1_block(self, b);
+        b += SHA1_BLOCK;
+        n -= SHA1_BLOCK;
+    }
+    for (i = 0; i < n; i++)
+        self->buf[self->n + i] = b[i];
+    self->n += n;
+}
+
+void final(Sha1 *self, u8 *out)
+{
+    u64 bits = self->bits;
+    int i = 0;
+
+    self->buf[self->n++] = 0x80;
+    if (self->n > 56) {
+        while (self->n < SHA1_BLOCK)
+            self->buf[self->n++] = 0;
+        sha1_block(self, self->buf);
+        self->n = 0;
+    }
+    while (self->n < 56)
+        self->buf[self->n++] = 0;
+    for (i = 0; i < 8; i++)
+        self->buf[56 + i] = (u8)((bits >> (56 - i * 8)) & 0xffu);
+    sha1_block(self, self->buf);
+    self->n = 0;
+    for (i = 0; i < 5; i++) {
+        out[i * 4] = (u8)((self->h[i] >> 24) & 0xffu);
+        out[i * 4 + 1] = (u8)((self->h[i] >> 16) & 0xffu);
+        out[i * 4 + 2] = (u8)((self->h[i] >> 8) & 0xffu);
+        out[i * 4 + 3] = (u8)(self->h[i] & 0xffu);
+    }
+}
+
+/* 一次性：算 20 字节摘要 */
+void sha1(const void *p, int n, u8 *out)
+{
+    Sha1 s = sha1_new();
+
+    s.update(p, n);
+    s.final(out);
+}
+
+/* 一次性 hex（小写 40 字符）；out 放不下返回 -1 */
+int sha1_hex(const void *p, int n, char[:] out)
+{
+    static const char hex[] = "0123456789abcdef";
+    u8 d[SHA1_DIGEST] = { 0 };
+    int i = 0;
+
+    if (out.len < 40)
+        return -1;
+    sha1(p, n, d);
+    for (i = 0; i < SHA1_DIGEST; i++) {
+        out.data[i * 2] = hex[(d[i] >> 4) & 0xfu];
+        out.data[i * 2 + 1] = hex[d[i] & 0xfu];
+    }
+    return 40;
+}
+
+/* 常数时间比较两个 20 字节摘要 */
+int sha1_eq(const u8 *a, const u8 *b)
+{
+    u8 x = 0;
+    int i = 0;
+
+    if (!a || !b)
+        return 0;
+    for (i = 0; i < SHA1_DIGEST; i++)
+        x |= (u8)(a[i] ^ b[i]);
+    return x == 0u;
+}
+
+/* HMAC-SHA1（RFC 2104）；key 任意长度，out 20 字节 */
+void hmac_sha1(const void *key, int klen, const void *msg, int mlen, u8 *out)
+{
+    u8 k[SHA1_BLOCK] = { 0 };
+    u8 pad[SHA1_BLOCK] = { 0 };
+    u8 inner[SHA1_DIGEST] = { 0 };
+    Sha1 s = sha1_new();
+    int i = 0;
+
+    if (klen > SHA1_BLOCK) {
+        sha1(key, klen, k);          /* 长 key 先摘要，剩下的补 0 */
+    } else if (klen > 0 && key) {
+        for (i = 0; i < klen; i++)
+            k[i] = ((const u8 *)key)[i];
+    }
+    for (i = 0; i < SHA1_BLOCK; i++)
+        pad[i] = (u8)(k[i] ^ 0x36u);
+    s.update(pad, SHA1_BLOCK);
+    s.update(msg, mlen);
+    s.final(inner);
+    for (i = 0; i < SHA1_BLOCK; i++)
+        pad[i] = (u8)(k[i] ^ 0x5cu);
+    s.init();
+    s.update(pad, SHA1_BLOCK);
+    s.update(inner, SHA1_DIGEST);
+    s.final(out);
+}
+
+/* HMAC-SHA1 的 hex（小写 40 字符） */
+int hmac_sha1_hex(const void *key, int klen, const void *msg, int mlen,
+                  char[:] out)
+{
+    static const char hex[] = "0123456789abcdef";
+    u8 d[SHA1_DIGEST] = { 0 };
+    int i = 0;
+
+    if (out.len < 40)
+        return -1;
+    hmac_sha1(key, klen, msg, mlen, d);
+    for (i = 0; i < SHA1_DIGEST; i++) {
+        out.data[i * 2] = hex[(d[i] >> 4) & 0xfu];
+        out.data[i * 2 + 1] = hex[d[i] & 0xfu];
+    }
+    return 40;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int sha1_hex_is(const char *msg, int n, const char *want)
+{
+    char buf[41] = { 0 };
+    int k = sha1_hex(msg, n, (char[:]){ buf, (int)sizeof buf });
+
+    if (k != 40)
+        return 0;
+    buf[40] = 0;
+    return strcmp(buf, want) == 0;
+}
+
+test "SHA-1 的已知向量" {
+    if (!sha1_hex_is("", 0, "da39a3ee5e6b4b0d3255bfef95601890afd80709"))
+        return err(1, "空串");
+    if (!sha1_hex_is("abc", 3, "a9993e364706816aba3e25717850c26c9cd0d89d"))
+        return err(2, "abc");
+    if (!sha1_hex_is("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                     56, "84983e441c3bd26ebaae4aa1f95129e5e54670f1"))
+        return err(3, "56 字节的官方向量");
+    if (!sha1_hex_is("The quick brown fox jumps over the lazy dog", 43,
+                     "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12"))
+        return err(4, "quick brown fox");
+    /* 一百万字节 'a' 的官方向量 */
+    {
+        char big[1000] = { 0 };
+        Sha1 s = sha1_new();
+        u8 d[SHA1_DIGEST] = { 0 };
+        char hex[41] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < (int)sizeof big; i++)
+            big[i] = 'a';
+        for (i = 0; i < 1000; i++)
+            s.update(big, (int)sizeof big);
+        s.final(d);
+        for (i = 0; i < SHA1_DIGEST; i++) {
+            static const char h[] = "0123456789abcdef";
+
+            hex[i * 2] = h[(d[i] >> 4) & 0xf];
+            hex[i * 2 + 1] = h[d[i] & 0xf];
+        }
+        hex[40] = 0;
+        if (strcmp(hex, "34aa973cd4c4daa4f61eeb2bdbad27316534016f") != 0)
+            return err(5, "一百万个 a");
+    }
+}
+
+test "流式与一次性一致" {
+    char msg[200] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < (int)sizeof msg; i++)
+        msg[i] = (char)(i * 7 + 3);
+    for (i = 0; i <= (int)sizeof msg; i += 17) {
+        Sha1 s = sha1_new();
+        u8 a[SHA1_DIGEST] = { 0 };
+        u8 b[SHA1_DIGEST] = { 0 };
+
+        s.update(msg, i);
+        s.update(msg + i, (int)sizeof msg - i);
+        s.final(a);
+        sha1(msg, (int)sizeof msg, b);
+        if (!sha1_eq(a, b))
+            return err(6, "分批喂与一次喂不一致");
+    }
+    /* 各种边界长度（55/56/63/64/65） */
+    {
+        int lens[5] = { 55, 56, 63, 64, 65 };
+        int k = 0;
+
+        for (k = 0; k < 5; k++) {
+            char tmp[80] = { 0 };
+            Sha1 s = sha1_new();
+            u8 a[SHA1_DIGEST] = { 0 };
+            u8 b[SHA1_DIGEST] = { 0 };
+
+            for (i = 0; i < lens[k]; i++)
+                tmp[i] = (char)i;
+            s.update(tmp, lens[k]);
+            s.final(a);
+            sha1(tmp, lens[k], b);
+            if (!sha1_eq(a, b))
+                return err(7, "边界长度");
+        }
+    }
+    /* final 之后 init 可以重来 */
+    {
+        Sha1 s = sha1_new();
+        u8 d1[SHA1_DIGEST] = { 0 };
+        u8 d2[SHA1_DIGEST] = { 0 };
+        u8 d3[SHA1_DIGEST] = { 0 };
+
+        s.update("abc", 3);
+        s.final(d1);
+        s.init();
+        s.update("abc", 3);
+        s.final(d2);
+        sha1("abc", 3, d3);
+        if (!sha1_eq(d1, d2) || !sha1_eq(d2, d3))
+            return err(8, "init 重用");
+    }
+}
+
+test "hex 与常数时间比较" {
+    char small[40] = { 0 };
+    char buf[41] = { 0 };
+    u8 a[SHA1_DIGEST] = { 0 };
+    u8 b[SHA1_DIGEST] = { 0 };
+
+    if (sha1_hex("abc", 3, (char[:]){ small, 39 }) != -1)
+        return err(9, "放不下要给 -1");
+    if (sha1_hex("abc", 3, (char[:]){ buf, 40 }) != 40 || buf[0] != 'a')
+        return err(10, "正好 40 字节");
+    sha1("abc", 3, a);
+    sha1("abc", 3, b);
+    if (!sha1_eq(a, b))
+        return err(11, "相同摘要");
+    b[19] ^= 1u;
+    if (sha1_eq(a, b))
+        return err(12, "不同摘要");
+    if (sha1_eq((const u8 *)0, a))
+        return err(13, "空指针");
+}
+
+test "HMAC-SHA1" {
+    /* RFC 2202 的测试向量 */
+    char hex[41] = { 0 };
+    u8 key[20] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 20; i++)
+        key[i] = 0x0bu;
+    if (hmac_sha1_hex(key, 20, "Hi There", 8, (char[:]){ hex, 41 }) != 40)
+        return err(14, "HMAC 放不下");
+    hex[40] = 0;
+    if (strcmp(hex, "b617318655057264e28bc0b6fb378c8ef146be00") != 0)
+        return err(15, "RFC 2202 case 1");
+    if (hmac_sha1_hex("Jefe", 4, "what do ya want for nothing?", 28,
+                      (char[:]){ hex, 41 }) != 40)
+        return err(16, "HMAC case 2 放不下");
+    hex[40] = 0;
+    if (strcmp(hex, "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79") != 0)
+        return err(17, "RFC 2202 case 2");
+    /* 长 key（>64 字节）走先摘要的路径 */
+    {
+        char longkey[80] = { 0 };
+
+        for (i = 0; i < 80; i++)
+            longkey[i] = 0xaau;
+        if (hmac_sha1_hex(longkey, 80, "Test Using Larger Than Block-Size Key - Hash Key First", 54,
+                          (char[:]){ hex, 41 }) != 40)
+            return err(18, "长 key 放不下");
+        hex[40] = 0;
+        if (strcmp(hex, "aa4ae5e15272d00e95705637ce8a3b55ed402112") != 0)
+            return err(19, "RFC 2202 case 6");
+    }
+    /* NULL key / 0 长度消息 */
+    {
+        u8 d[SHA1_DIGEST] = { 0 };
+
+        hmac_sha1((const void *)0, 0, (const void *)0, 0, d);
+        if (!sha1_eq(d, d))
+            return err(20, "空 key/消息不该崩");
+    }
+}
