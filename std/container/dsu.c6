@@ -1,0 +1,170 @@
+/* std/container/dsu：并查集（union-find），按大小合并 + 路径减半。
+ *
+ *     import std.container.dsu;
+ *
+ *     int parent[8] = { 0 };
+ *     int size[8] = { 0 };
+ *     Dsu d = { 0 };
+ *     dsu_init(&d, parent, size, 8);
+ *     dsu_union(&d, 1, 2);
+ *     dsu_same(&d, 1, 2);        // 1
+ *
+ * 约定：
+ *
+ * - 存储由调用方给（`parent`、`size` 各至少 `n` 个 `int`），本模块不分配；
+ * - `dsu_find` 用**路径减半**（迭代，不递归），摊还接近常数；
+ * - `dsu_union` 按集合大小合并（小的挂到大的下面），合并成功返回新根，
+ *   本来就在同一集合返回 -1；
+ * - `dsu_count` 是当前集合个数（初始为 `n`），`dsu_size(d, x)` 是 `x` 所在集合的
+ *   元素数；
+ * - 下标越界一律按 -1 / 0 处理，不报错。
+ */
+#include <string.h>
+
+module std.container.dsu;
+import std.core.types;
+
+struct Dsu {
+    int *parent;
+    int *size;
+    int n;
+    int count;
+};
+
+void dsu_init(Dsu *d, int *parent, int *size, int n)
+{
+    int i = 0;
+
+    if (!d)
+        return;
+    d->parent = parent;
+    d->size = size;
+    d->n = n < 0 ? 0 : n;
+    d->count = d->n;
+    for (i = 0; i < d->n; i++) {
+        if (parent)
+            parent[i] = i;
+        if (size)
+            size[i] = 1;
+    }
+}
+
+int dsu_find(Dsu *d, int x)
+{
+    int root = x;
+
+    if (!d || !d->parent || x < 0 || x >= d->n)
+        return -1;
+    while (d->parent[root] != root)
+        root = d->parent[root];
+    while (d->parent[x] != root) {
+        int next = d->parent[x];
+
+        d->parent[x] = root;            /* 路径减半：直接挂到根上 */
+        x = next;
+    }
+    return root;
+}
+
+int dsu_union(Dsu *d, int a, int b)
+{
+    int ra = dsu_find(d, a), rb = dsu_find(d, b);
+
+    if (ra < 0 || rb < 0)
+        return -1;
+    if (ra == rb)
+        return -1;
+    if (d->size && d->size[ra] < d->size[rb]) {
+        int t = ra;
+
+        ra = rb;
+        rb = t;
+    }
+    d->parent[rb] = ra;
+    if (d->size)
+        d->size[ra] += d->size[rb];
+    d->count--;
+    return ra;
+}
+
+int dsu_same(Dsu *d, int a, int b)
+{
+    int ra = dsu_find(d, a), rb = dsu_find(d, b);
+
+    if (ra < 0 || rb < 0)
+        return 0;
+    return ra == rb ? 1 : 0;
+}
+
+int dsu_size(Dsu *d, int x)
+{
+    int r = dsu_find(d, x);
+
+    if (r < 0 || !d->size)
+        return 0;
+    return d->size[r];
+}
+
+int dsu_count(Dsu *d)
+{
+    return d ? d->count : 0;
+}
+
+/* ---- 自测 ---- */
+
+test "dsu：合并与查询" {
+    int parent[8] = { 0 };
+    int size[8] = { 0 };
+    Dsu d = { 0 };
+
+    dsu_init(&d, parent, size, 8);
+    if (dsu_count(&d) != 8)
+        return err(1, "初识集合数应该是 8");
+    if (dsu_find(&d, 3) != 3)
+        return err(2, "未合并时根是自己");
+    if (dsu_union(&d, 1, 2) < 0)
+        return err(3, "合并 1-2 失败");
+    if (dsu_count(&d) != 7)
+        return err(4, "合并后集合数应该是 7");
+    if (dsu_same(&d, 1, 2) != 1 || dsu_same(&d, 1, 3) != 0)
+        return err(5, "same 判定不对");
+    if (dsu_union(&d, 1, 2) != -1)
+        return err(6, "重复合并应该 -1");
+    if (dsu_size(&d, 2) != 2)
+        return err(7, "集合大小应该是 2");
+    /* 链式合并 3-4、2-3 → 1,2,3,4 一共四个 */
+    dsu_union(&d, 3, 4);
+    dsu_union(&d, 2, 3);
+    if (dsu_size(&d, 4) != 4 || dsu_count(&d) != 5)
+        return err(8, "链式合并后大小或集合数不对");
+    if (dsu_same(&d, 1, 4) != 1)
+        return err(9, "链式合并后应该同集合");
+    if (dsu_find(&d, 4) != dsu_find(&d, 1))
+        return err(10, "根应该一致");
+}
+
+test "dsu：边界与路径压缩" {
+    int parent[16] = { 0 };
+    int size[16] = { 0 };
+    Dsu d = { 0 };
+    int i = 0;
+
+    dsu_init(&d, parent, size, 16);
+    /* 串成一条链，验证路径压缩后的根与高度无关 */
+    for (i = 1; i < 16; i++)
+        parent[i] = i - 1;
+    d.count = 1;
+    size[0] = 16;
+    if (dsu_find(&d, 15) != 0)
+        return err(11, "链尾的根应该是 0");
+    if (parent[15] != 0)
+        return err(12, "路径压缩后 15 应该直接挂在 0");
+    if (dsu_find(&d, 15) != 0 || parent[14] == 13)
+        return err(13, "第二次查找也应该压缩");
+    if (dsu_find(&d, -1) != -1 || dsu_find(&d, 99) != -1)
+        return err(14, "越界应该 -1");
+    if (dsu_union(&d, -1, 0) != -1)
+        return err(15, "越界合并应该 -1");
+    if (dsu_size(&d, 99) != 0)
+        return err(16, "越界取大小应该 0");
+}

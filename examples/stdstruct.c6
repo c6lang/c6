@@ -1,0 +1,147 @@
+/* examples/stdstruct.c6 —— 第四十五批（基础数据结构）的集成示例。
+ *
+ *     make std-ds
+ *
+ * 四节：树状数组（前缀和 + 按前缀和定位）、线段树（区间求和与最值）、并查集
+ * （合并/同集合/集合大小）、布隆过滤器（加入与查询）。全部用调用方给的缓冲区。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.container.fenwick;
+import std.container.segtree;
+import std.container.dsu;
+import std.container.bloom;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_fenwick(void)
+{
+    i64 buf[16] = { 0 };
+    Fenwick f = { 0 };
+    int i = 0;
+
+    printf("== fenwick\n");
+    fenwick_init(&f, buf, 8);
+    for (i = 0; i < 8; i++)
+        fenwick_add(&f, i, (i64)(1 << i));      /* 1,2,4,8,16,32,64,128 */
+    printf("   前缀和 [0..3] = %lld，总和 = %lld\n",
+           (long long)fenwick_sum(&f, 3), (long long)fenwick_all(&f));
+    check(fenwick_sum(&f, 3) == 15, "前缀和 1+2+4+8");
+    check(fenwick_all(&f) == 255, "总和 255");
+    check(fenwick_range(&f, 4, 6) == 112, "区间 [4..6] = 16+32+64");
+    check(fenwick_lower(&f, 100) == 6, "前缀和首次 >=100 的位置是 6");
+    check(fenwick_lower(&f, 256) == 8, "超过总和返回 n");
+    fenwick_add(&f, 0, -1);
+    check(fenwick_sum(&f, 0) == 0, "单点减回去");
+}
+
+static void do_segtree(void)
+{
+    i64 sbuf[32] = { 0 };
+    i64 mbuf[32] = { 0 };
+    SegTree sum = { 0 };
+    SegTree mn = { 0 };
+    static const i64 vals[8] = { 4, 9, 2, 7, 5, 1, 8, 3 };
+    int i = 0;
+
+    printf("== segtree\n");
+    if (seg_init(&sum, sbuf, 32, 8, SEG_SUM) != 1
+        || seg_init(&mn, mbuf, 32, 8, SEG_MIN) != 1) {
+        check(0, "线段树初始化");
+        return;
+    }
+    for (i = 0; i < 8; i++) {
+        seg_set(&sum, i, vals[i]);
+        seg_set(&mn, i, vals[i]);
+    }
+    printf("   总和 = %lld，最小值 = %lld，[0..3] 和 = %lld\n",
+           (long long)seg_all(&sum), (long long)seg_all(&mn),
+           (long long)seg_range(&sum, 0, 3));
+    check(seg_all(&sum) == 39, "总和 39");
+    check(seg_range(&sum, 0, 3) == 22, "[0..3] = 4+9+2+7");
+    check(seg_all(&mn) == 1, "最小值 1");
+    check(seg_range(&mn, 1, 3) == 2, "[1..3] 最小值 2");
+    seg_set(&sum, 5, 100);
+    seg_set(&mn, 5, 100);
+    check(seg_range(&sum, 4, 7) == 116, "改点后 [4..7] = 5+100+8+3");
+    check(seg_range(&mn, 0, 5) == 2, "改点后 [0..5] 最小值仍是 2");
+    check(seg_range(&sum, 6, 5) == 0, "空区间求和是 0");
+}
+
+static void do_dsu(void)
+{
+    int parent[8] = { 0 };
+    int size[8] = { 0 };
+    Dsu d = { 0 };
+    int i = 0;
+
+    printf("== dsu\n");
+    dsu_init(&d, parent, size, 8);
+    check(dsu_count(&d) == 8, "初始 8 个集合");
+    for (i = 0; i < 7; i++)
+        dsu_union(&d, i, i + 1);
+    printf("   合并后集合数 = %d，0 所在集合大小 = %d\n", dsu_count(&d),
+           dsu_size(&d, 0));
+    check(dsu_same(&d, 0, 7) == 1, "0 与 7 同集合");
+    check(dsu_same(&d, 0, 4) == 1 && dsu_same(&d, 2, 6) == 1,
+          "链上的点都同集合");
+    check(dsu_count(&d) == 1, "全部合并后只剩 1 个集合");
+    check(dsu_size(&d, 3) == 8, "集合大小 8");
+    check(dsu_union(&d, 0, 7) == -1, "重复合并返回 -1");
+    check(dsu_find(&d, 99) == -1, "越界返回 -1");
+}
+
+static void do_bloom(void)
+{
+    static u8 buf[512] = { 0 };
+    Bloom b = { 0 };
+    int misses = 0, i = 0;
+
+    printf("== bloom\n");
+    check(bloom_init(&b, buf, 2048, 4) == 1, "初始化");
+    bloom_add(&b, S("alpha"));
+    bloom_add(&b, S("beta"));
+    bloom_add(&b, S("gamma"));
+    check(bloom_has(&b, S("alpha")) == 1 && bloom_has(&b, S("gamma")) == 1,
+          "已加入的键查得到");
+    check(bloom_has(&b, S("delta")) == 0, "未加入的键查不到");
+    printf("   置位 %d / %d（千分数 %d）\n", bloom_set_bits(&b),
+           bloom_capacity(&b), bloom_fill_ratio(&b));
+    check(bloom_set_bits(&b) >= 1 && bloom_set_bits(&b) <= 12, "置位数");
+    for (i = 0; i < 50; i++) {
+        char key[8] = { 0 };
+
+        key[0] = 'k';
+        key[1] = (char)('0' + i % 10);
+        key[2] = (char)('a' + i % 26);
+        if (bloom_has(&b, (char[:]){ key, 3 }) == 0)
+            misses++;
+    }
+    check(misses >= 40, "未加入的键绝大多数查不到");
+    check(bloom_fill_ratio(&b) < 1000, "填充率小于 1");
+}
+
+int main(void)
+{
+    do_fenwick();
+    do_segtree();
+    do_dsu();
+    do_bloom();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

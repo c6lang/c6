@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第四十五批（基础数据结构）**：`std.container.fenwick`（树状数组 + 前缀
+  定位）、`std.container.segtree`（迭代线段树，求和/最值）、`std.container.dsu`
+  （并查集，路径减半 + 按大小合并）、`std.container.bloom`（布隆过滤器），集成
+  示例 `examples/stdstruct.c6`（`make std-ds`）。错误号段
+  `std.container.fenwick`=0x60bd … `std.container.bloom`=0x60c0
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十四批（文本行协议）**：`std.net.smtp`（应答/命令/DATA 点填充）、
   `std.net.ftp`（应答/PASV/LIST/MLSD）、`std.net.redis`（RESP 编解码）、
   `std.net.telnet`（IAC 协商与去转义），集成示例 `examples/stdproto2.c6`

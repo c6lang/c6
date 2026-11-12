@@ -1,0 +1,162 @@
+/* std/container/fenwick：树状数组（Fenwick / BIT），前缀和与「按前缀和找位置」。
+ *
+ *     import std.container.fenwick;
+ *
+ *     long long buf[16] = { 0 };
+ *     Fenwick f = { 0 };
+ *     fenwick_init(&f, buf, 8);
+ *     fenwick_add(&f, 3, 5);
+ *     fenwick_sum(&f, 3);        // 前缀和 [0..3]
+ *
+ * 约定：
+ *
+ * - 存储由调用方给（`buf` 至少 `n+1` 个 `i64`），本模块不分配；
+ * - 下标对外都是 **0 起**，内部用 1 起的树；
+ * - `fenwick_add` 往单点加增量（可以是负数）；
+ * - `fenwick_sum(f, i)` 求 `[0..i]` 的前缀和，`i < 0` 返回 0；
+ * - `fenwick_range(f, l, r)` 求 `[l..r]`，区间空返回 0；
+ * - `fenwick_lower(f, target)` 找第一个「前缀和 >= target」的下标（要求所有元素
+ *   非负），没有就返回 `n`；
+ * - `fenwick_all(f)` 是总和。
+ */
+#include <string.h>
+
+module std.container.fenwick;
+import std.core.types;
+
+struct Fenwick {
+    i64 *tree;
+    int n;
+};
+
+void fenwick_init(Fenwick *f, i64 *buf, int n)
+{
+    int i = 0;
+
+    if (!f)
+        return;
+    f->tree = buf;
+    f->n = n < 0 ? 0 : n;
+    if (!buf)
+        return;
+    for (i = 0; i <= f->n; i++)
+        buf[i] = 0;
+}
+
+void fenwick_add(Fenwick *f, int idx, i64 delta)
+{
+    int i = 0;
+
+    if (!f || !f->tree || idx < 0 || idx >= f->n)
+        return;
+    for (i = idx + 1; i <= f->n; i += i & (-i))
+        f->tree[i] += delta;
+}
+
+i64 fenwick_sum(Fenwick *f, int idx)
+{
+    i64 s = 0;
+    int i = 0;
+
+    if (!f || !f->tree)
+        return 0;
+    if (idx >= f->n)
+        idx = f->n - 1;
+    for (i = idx + 1; i > 0; i -= i & (-i))
+        s += f->tree[i];
+    return s;
+}
+
+i64 fenwick_range(Fenwick *f, int l, int r)
+{
+    if (!f || l > r || l >= f->n)
+        return 0;
+    if (l < 0)
+        l = 0;
+    return fenwick_sum(f, r) - fenwick_sum(f, l - 1);
+}
+
+i64 fenwick_all(Fenwick *f)
+{
+    return fenwick_sum(f, f ? f->n - 1 : -1);
+}
+
+int fenwick_lower(Fenwick *f, i64 target)
+{
+    int pos = 0;
+    i64 rem = target;
+    int step = 1;
+
+    if (!f || !f->tree || f->n <= 0)
+        return -1;
+    while (step * 2 <= f->n)
+        step *= 2;
+    for (; step > 0; step /= 2) {
+        if (pos + step <= f->n && f->tree[pos + step] < rem) {
+            pos += step;
+            rem -= f->tree[pos];
+        }
+    }
+    if (pos >= f->n)
+        return f->n;
+    return pos;                         /* 内部下标 pos+1 对应外部 pos */
+}
+
+/* ---- 自测 ---- */
+
+test "fenwick：单点加与前缀和" {
+    i64 buf[16] = { 0 };
+    Fenwick f = { 0 };
+    int i = 0;
+
+    fenwick_init(&f, buf, 8);
+    for (i = 0; i < 8; i++)
+        fenwick_add(&f, i, (i64)(i + 1));
+    if (fenwick_sum(&f, 0) != 1)
+        return err(1, "前缀和 [0..0] 不对");
+    if (fenwick_sum(&f, 3) != 10)
+        return err(2, "前缀和 [0..3] 应该是 1+2+3+4=10");
+    if (fenwick_sum(&f, 7) != 36)
+        return err(3, "总和应该是 36");
+    if (fenwick_all(&f) != 36)
+        return err(4, "fenwick_all 不对");
+    if (fenwick_sum(&f, -1) != 0)
+        return err(5, "负数下标的和应该是 0");
+    if (fenwick_sum(&f, 100) != 36)
+        return err(6, "越界下标按末尾算");
+    /* 再减回去 */
+    fenwick_add(&f, 3, -4);
+    if (fenwick_sum(&f, 3) != 6 || fenwick_all(&f) != 32)
+        return err(7, "负数增量不对");
+}
+
+test "fenwick：区间和与按前缀和找位置" {
+    i64 buf[16] = { 0 };
+    Fenwick f = { 0 };
+    int i = 0;
+
+    fenwick_init(&f, buf, 6);
+    for (i = 0; i < 6; i++)
+        fenwick_add(&f, i, 2);
+    if (fenwick_range(&f, 1, 3) != 6)
+        return err(8, "区间 [1..3] 应该是 6");
+    if (fenwick_range(&f, 5, 1) != 0)
+        return err(9, "空区间应该是 0");
+    if (fenwick_range(&f, 4, 100) != 4)
+        return err(10, "右端越界按末尾算");
+    /* 前缀和 2,4,6,8,10,12 → 目标 5 落在下标 2 */
+    if (fenwick_lower(&f, 1) != 0)
+        return err(11, "目标 1 应该在下标 0");
+    if (fenwick_lower(&f, 5) != 2)
+        return err(12, "目标 5 应该在下标 2");
+    if (fenwick_lower(&f, 6) != 2)
+        return err(13, "目标 6 正好落在下标 2");
+    if (fenwick_lower(&f, 13) != 6)
+        return err(14, "目标超过总和应该返回 n");
+    /* 全零的树 */
+    fenwick_init(&f, buf, 6);
+    if (fenwick_lower(&f, 1) != 6)
+        return err(15, "全零应该返回 n");
+    if (fenwick_sum(&f, 5) != 0)
+        return err(16, "全零的前缀和应该是 0");
+}

@@ -1,0 +1,208 @@
+/* std/container/segtree：迭代式线段树（区间求和 / 最小值 / 最大值）。
+ *
+ *     import std.container.segtree;
+ *
+ *     i64 buf[32] = { 0 };
+ *     SegTree t = { 0 };
+ *     seg_init(&t, buf, 32, 8, SEG_SUM);
+ *     seg_set(&t, 3, 10);
+ *     seg_range(&t, 1, 4);       // [1..4] 的聚合值
+ *
+ * 实现是最常见的「2n 迭代线段树」：叶子在 `[n, 2n)`，父节点是子节点的聚合，
+ * 所以 `buf` 至少要 `2*n` 个 `i64`。聚合方式由 `op` 决定。
+ *
+ * 约定：
+ *
+ * - 存储由调用方给，本模块不分配；`seg_init` 会把用到的部分清零并按 `op` 的
+ *   单位元建树（求和是 0、最小值是 `SEG_INF`、最大值是 `-SEG_INF`）；
+ * - `seg_set` 是**点赋值**（不是加），`seg_add` 是点加；
+ * - `seg_range(t, l, r)` 是闭区间 `[l..r]`，空区间返回单位元；
+ * - `op` 取 `SEG_SUM` / `SEG_MIN` / `SEG_MAX`；
+ * - `seg_all` 是整棵树的聚合值。
+ */
+#include <string.h>
+
+module std.container.segtree;
+import std.core.types;
+
+#define SEG_INF 0x3FFFFFFFFFFFFFFFLL
+
+enum {
+    SEG_SUM = 0,
+    SEG_MIN = 1,
+    SEG_MAX = 2
+};
+
+struct SegTree {
+    i64 *t;
+    int n;
+    int cap;
+    int op;
+};
+
+static i64 seg_identity(int op)
+{
+    if (op == SEG_MIN)
+        return SEG_INF;
+    if (op == SEG_MAX)
+        return -SEG_INF;
+    return 0;
+}
+
+static i64 seg_combine(int op, i64 a, i64 b)
+{
+    if (op == SEG_MIN)
+        return a < b ? a : b;
+    if (op == SEG_MAX)
+        return a > b ? a : b;
+    return a + b;
+}
+
+int seg_init(SegTree *t, i64 *buf, int cap, int n, int op)
+{
+    int i = 0;
+
+    if (!t || !buf || n < 0)
+        return -1;
+    if (op != SEG_SUM && op != SEG_MIN && op != SEG_MAX)
+        return -1;
+    if (cap < 2 * n || cap <= 0)
+        return -1;
+    t->t = buf;
+    t->n = n;
+    t->cap = cap;
+    t->op = op;
+    for (i = 0; i < 2 * n; i++)
+        buf[i] = seg_identity(op);
+    return 1;
+}
+
+static void seg_rebuild(SegTree *t, int p)
+{
+    while (p > 1) {
+        p /= 2;
+        t->t[p] = seg_combine(t->op, t->t[2 * p], t->t[2 * p + 1]);
+    }
+}
+
+void seg_set(SegTree *t, int idx, i64 v)
+{
+    if (!t || !t->t || idx < 0 || idx >= t->n)
+        return;
+    t->t[t->n + idx] = v;
+    seg_rebuild(t, t->n + idx);
+}
+
+void seg_add(SegTree *t, int idx, i64 delta)
+{
+    if (!t || !t->t || idx < 0 || idx >= t->n)
+        return;
+    seg_set(t, idx, t->t[t->n + idx] + delta);
+}
+
+i64 seg_get(SegTree *t, int idx)
+{
+    if (!t || !t->t || idx < 0 || idx >= t->n)
+        return 0;
+    return t->t[t->n + idx];
+}
+
+i64 seg_range(SegTree *t, int l, int r)
+{
+    i64 left = 0, right = 0;
+    int a = 0, b = 0;
+
+    if (!t || !t->t)
+        return 0;
+    if (l < 0)
+        l = 0;
+    if (r >= t->n)
+        r = t->n - 1;
+    if (l > r)
+        return seg_identity(t->op);
+    a = l + t->n;
+    b = r + t->n + 1;
+    left = seg_identity(t->op);
+    right = seg_identity(t->op);
+    while (a < b) {
+        if (a & 1) {
+            left = seg_combine(t->op, left, t->t[a]);
+            a++;
+        }
+        if (b & 1) {
+            b--;
+            right = seg_combine(t->op, t->t[b], right);
+        }
+        a /= 2;
+        b /= 2;
+    }
+    return seg_combine(t->op, left, right);
+}
+
+i64 seg_all(SegTree *t)
+{
+    if (!t || !t->t || t->n <= 0)
+        return 0;
+    return t->t[1];
+}
+
+/* ---- 自测 ---- */
+
+test "segtree：区间求和" {
+    i64 buf[32] = { 0 };
+    SegTree t = { 0 };
+    int i = 0;
+
+    if (seg_init(&t, buf, 32, 8, SEG_SUM) != 1)
+        return err(1, "初始化失败");
+    for (i = 0; i < 8; i++)
+        seg_set(&t, i, (i64)(i + 1));
+    if (seg_all(&t) != 36)
+        return err(2, "整棵树的和对不对（应该 36）");
+    if (seg_range(&t, 0, 7) != 36)
+        return err(3, "全区间和对不对");
+    if (seg_range(&t, 2, 4) != 12)
+        return err(4, "区间 [2..4] 应该是 3+4+5=12");
+    if (seg_range(&t, 5, 1) != 0)
+        return err(5, "空区间应该是 0");
+    if (seg_get(&t, 3) != 4)
+        return err(6, "单点取值不对");
+    seg_set(&t, 3, 40);
+    if (seg_get(&t, 3) != 40 || seg_all(&t) != 72)
+        return err(7, "点赋值后总和不对");
+    seg_add(&t, 3, -30);
+    if (seg_get(&t, 3) != 10 || seg_range(&t, 3, 3) != 10)
+        return err(8, "点加后取值不对");
+    if (seg_range(&t, -5, 100) != 42)
+        return err(9, "越界区间应该夹到端点");
+}
+
+test "segtree：最小值与最大值" {
+    i64 minbuf[32] = { 0 };
+    i64 maxbuf[32] = { 0 };
+    SegTree mn = { 0 };
+    SegTree mx = { 0 };
+    static const i64 vals[6] = { 5, 3, 7, 1, 9, 2 };
+    int i = 0;
+
+    if (seg_init(&mn, minbuf, 32, 6, SEG_MIN) != 1
+        || seg_init(&mx, maxbuf, 32, 6, SEG_MAX) != 1)
+        return err(10, "初始化失败");
+    for (i = 0; i < 6; i++) {
+        seg_set(&mn, i, vals[i]);
+        seg_set(&mx, i, vals[i]);
+    }
+    if (seg_all(&mn) != 1 || seg_all(&mx) != 9)
+        return err(11, "最值不对");
+    if (seg_range(&mn, 1, 3) != 1 || seg_range(&mx, 1, 3) != 7)
+        return err(12, "区间最值不对");
+    if (seg_range(&mn, 0, 1) != 3 || seg_range(&mx, 4, 5) != 9)
+        return err(13, "小范围最值不对");
+    /* 空区间返回单位元 */
+    if (seg_range(&mn, 3, 2) != SEG_INF)
+        return err(14, "最小值的空区间应该是 INF");
+    if (seg_range(&mx, 3, 2) != -SEG_INF)
+        return err(15, "最大值的空区间应该是 -INF");
+    if (seg_init(&mn, minbuf, 8, 6, SEG_MIN) != -1)
+        return err(16, "容量不够应该 -1");
+}

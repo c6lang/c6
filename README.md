@@ -324,6 +324,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/net/ftp.c6            std.net.ftp            FTP：应答行、PASV 地址与端口、LIST 长格式与 MLSD 事实行
   std/net/redis.c6          std.net.redis          RESP：+/−/:/$/* 五种类型解析与 bulk/int/array/cmd 编码
   std/net/telnet.c6         std.net.telnet         Telnet：IAC 协商（WILL/WONT/DO/DONT/SB…SE）、IAC IAC 转义与去转义
+  std/container/fenwick.c6 std.container.fenwick 树状数组：单点加、前缀和/区间和、按前缀和定位首个 >= target 的下标
+  std/container/segtree.c6 std.container.segtree 迭代线段树（2n 数组）：求和/最小/最大，点赋值与点加，闭区间聚合
+  std/container/dsu.c6      std.container.dsu      并查集：迭代路径减半、按大小合并、集合数与集合大小
+  std/container/bloom.c6    std.container.bloom    布隆过滤器：FNV-1a 双哈希、置位统计与填充比例
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -424,6 +428,7 @@ make std-disk    # 编译并运行 examples/stddisk.c6（第四十一批分区�
 make std-transcode # 编译并运行 examples/stdtranscode.c6（第四十二批老式文本编码模块的拼装示例）
 make std-audio    # 编译并运行 examples/stdaudio.c6（第四十三批音频容器模块的拼装示例）
 make std-proto2   # 编译并运行 examples/stdproto2.c6（第四十四批文本行协议模块的拼装示例）
+make std-ds       # 编译并运行 examples/stdstruct.c6（第四十五批基础数据结构模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

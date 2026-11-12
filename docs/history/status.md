@@ -1650,6 +1650,33 @@ FTP 的解析坑值得记一笔：`LIST` 行是定字段的「权限 链接 属�
 验收：`make stdtest`（189 个模块、0 failure）、`make std-proto2`（23 条自检全过）、
 `make check-all`。
 
+### 11.57 标准库第四十五批（fenwick / segtree / dsu / bloom）
+
+第四十五批补数据结构：树状数组、迭代线段树、并查集、布隆过滤器。四个都是
+「调用方给缓冲区、模块只管算法」的形态，与 `std.container.region`/`pool` 的
+零分配风格一致。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.container.fenwick` | 树状数组 | 对外下标 0 起、内部树 1 起；`fenwick_lower` 用「从最高 2 的幂往下跳」的经典写法找首个前缀和 >= target 的位置，超过总和返回 `n` |
+| `std.container.segtree` | 迭代线段树 | 2n 数组，叶子在 `[n,2n)`；聚合方式由 `op` 决定，单位元也跟着变（求和 0、最小 `SEG_INF`、最大 `-SEG_INF`）；`seg_range` 用左右两个累加器再合成，保证非交换聚合也正确 |
+| `std.container.dsu` | 并查集 | `dsu_find` 是**迭代**路径减半（不递归，深链也不会爆栈）；`dsu_union` 按集合大小合并并维护 `count` |
+| `std.container.bloom` | 布隆过滤器 | FNV-1a 双哈希 + 线性组合 `h1+i*h2`；`count` 记录已置位个数，`bloom_fill_ratio` 给千分数，避开浮点依赖 |
+
+一个容易写错的地方：线段树的 `seg_range` 左右两个累加器合并顺序不同（右边要
+`combine(t[b], right)`），写成一样的顺序在求和的树上没问题，换成非交换的聚合就
+会错。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.container.fenwick`=0x60bd、
+`std.container.segtree`=0x60be、`std.container.dsu`=0x60bf、`std.container.bloom`=0x60c0；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-ds` 与 `STD_DS_SRCS`，`test-all`/`check-all`
+都带上它；前三个模块无依赖（各自 2 条用例），`bloom` 依赖 `std/text/str.c6`（24 条）。
+示例 `examples/stdstruct.c6` 四节（26 条自检）。
+
+验收：`make stdtest`（193 个模块、0 failure）、`make std-ds`（26 条自检全过）、
+`make check-all`。
+
+
 
 
 

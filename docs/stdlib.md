@@ -221,6 +221,10 @@
 | `std/net/ftp.c6` | `std.net.ftp` | FTP：`ftp_reply` 解状态码与多行标志，`ftp_pasv` 从 `227 …(h1,h2,h3,h4,p1,p2)` 拼出地址与端口（`p1*256+p2`），`ftp_cmd` 拼命令，`ftp_list_line` 解类 Unix 长格式、`ftp_mlsd_line` 解 `type=…;size=…; name` |
 | `std/net/redis.c6` | `std.net.redis` | RESP：`resp_parse` 解 `+`/`-`/`:`/`$`/`*` 五种类型（给出内容偏移、长度、整段字节数，`$-1`/`*-1` 是 null），`resp_encode_bulk`/`resp_encode_int`/`resp_encode_array_hdr`/`resp_encode_cmd` 负责编码；数组只解头 |
 | `std/net/telnet.c6` | `std.net.telnet` | Telnet：`telnet_parse` 分别返回协商命令（WILL/WONT/DO/DONT/SB…SE）、普通数据字节、`IAC IAC` 转义的 0xFF，`telnet_reply` 按方向给应答（WILL→DO、DO→WILL），`telnet_unescape` 丢协商、还原 0xFF |
+| `std/container/fenwick.c6` | `std.container.fenwick` | 树状数组：`fenwick_add` 单点加、`fenwick_sum`/`fenwick_range` 前缀与区间和、`fenwick_lower` 按前缀和二分定位；存储由调用方给（`n+1` 个 `i64`） |
+| `std/container/segtree.c6` | `std.container.segtree` | 迭代线段树（2n 数组）：`seg_init` 按 `SEG_SUM`/`SEG_MIN`/`SEG_MAX` 建树，`seg_set` 点赋值、`seg_add` 点加、`seg_range` 闭区间聚合、`seg_all` 整树值 |
+| `std/container/dsu.c6` | `std.container.dsu` | 并查集：`dsu_find` 路径减半（迭代）、`dsu_union` 按大小合并（已同集合返回 -1）、`dsu_same`/`dsu_size`/`dsu_count`；`parent`/`size` 缓冲区由调用方给 |
+| `std/container/bloom.c6` | `std.container.bloom` | 布隆过滤器：FNV-1a 双哈希（`h1 + i*h2`）取模置位，`bloom_add`/`bloom_has`（1 可能在、0 一定不在），`bloom_set_bits`/`bloom_fill_ratio` 给置位统计 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -308,6 +312,7 @@
 | `examples/stdtranscode.c6` | （无模块） | 第四十二批（老式文本编码）的拼装示例（`make std-transcode`）：basE91、uuencode、yEnc、EBCDIC 各编码一遍再解回原文 |
 | `examples/stdaudio.c6` | （无模块） | 第四十三批（音频容器）的拼装示例（`make std-audio`）：MP3 标签与帧头、Ogg 页与 Opus 头、FLAC 的 STREAMINFO/VORBIS_COMMENT、MIDI 轨事件 |
 | `examples/stdproto2.c6` | （无模块） | 第四十四批（文本行协议）的拼装示例（`make std-proto2`）：SMTP 应答/命令/DATA 点填充、FTP 应答/PASV/列表行、RESP 编解码、Telnet IAC 协商与去转义 |
+| `examples/stdstruct.c6` | （无模块） | 第四十五批（基础数据结构）的拼装示例（`make std-ds`）：树状数组、线段树、并查集、布隆过滤器各跑一遍 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -378,6 +383,10 @@ std/net/smtp.c6            24 test(s), 0 failure(s)
 std/net/ftp.c6             24 test(s), 0 failure(s)
 std/net/redis.c6           24 test(s), 0 failure(s)
 std/net/telnet.c6          24 test(s), 0 failure(s)
+std/container/fenwick.c6   2 test(s), 0 failure(s)
+std/container/segtree.c6   2 test(s), 0 failure(s)
+std/container/dsu.c6       2 test(s), 0 failure(s)
+std/container/bloom.c6     24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3606,6 +3615,17 @@ make std-proto2
 FTP 走「220 + PASV 解析 + RETR + LIST/MLSD 行」；RESP 解批量串与整数、再编一条
 `SET k v`；Telnet 造 `IAC WILL ECHO` 与 `IAC IAC`，验证应答方向与去转义。
 
+### 集成示例：`examples/stdstruct.c6`
+
+```sh
+make std-ds
+```
+
+四节：树状数组用 2 的幂做数据，核对前缀和、区间和与「首个前缀和 >= target」的
+定位；线段树同时建求和与最值两棵，改点后核对区间值；并查集把 0..7 串成一条链，
+核对集合数、集合大小与重复合并返回 -1；布隆过滤器加入三个键再验未加入的键基本
+查不到（并打印置位比例）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3689,6 +3709,8 @@ FTP 走「220 + PASV 解析 + RETR + LIST/MLSD 行」；RESP 解批量串与整�
 * `make std-audio`：`examples/stdaudio.c6`，第四十三批（音频容器）模块的拼装示例
   （自带自检）。
 * `make std-proto2`：`examples/stdproto2.c6`，第四十四批（文本行协议）模块的拼装
+  示例（自带自检）。
+* `make std-ds`：`examples/stdstruct.c6`，第四十五批（基础数据结构）模块的拼装
   示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
