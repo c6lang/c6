@@ -2233,6 +2233,29 @@ au/voc/ircam 各 23 条）。示例 `examples/stdlegacy2.c6` 四节（17 条自�
 验收：`make stdtest`（277 个模块、0 failure）、`make std-audio2`（17 条自检全过）、
 `make check-all`。
 
+### 11.79 标准库第六十七批（irc / gopher / whois / ident）
+
+第六十七批做「小型文本协议」：IRC 消息、Gopher 菜单、WHOIS 字段与 ident 查询应答。
+Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 ident 是
+「解析成结构 + 构造回字符串」的一对函数。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.net.irc` | IRC 消息 | `prefix`/`trailing` 去掉前导冒号后以 `Str` 视图给出；`params` 最多 15 个；`irc_build` 的参数里含空格直接返回 -1（要用 trailing 段） |
+| `std.net.gopher` | Gopher 菜单 | 每行要四个字段（三个制表符），残缺行**跳过**而不是报错；`i` 类型标 `clean_display`（服务端插的假行）；第一版 `display_name()` 还想去掉首字符，结果 `Icon` 变 `con`，改为原样返回 |
+| `std.net.whois` | WHOIS 应答 | 只认「键: 值」，注释与续行跳过；`continuation` 标志告诉调用方下一行是续行（不在缓冲区里拼接）；`get()` 直接给 C 字符串 |
+| `std.net.ident` | ident | 查询与应答共用端口对解析；`USERID` 后面必须有系统与用户两段，`ERROR` 只要求一段说明（第一版强制三段，`ERROR : NO-USER` 直接失败） |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.net.irc`=0x6115、
+`std.net.gopher`=0x6116、`std.net.whois`=0x6117、`std.net.ident`=0x6118；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-proto3` 与 `STD_PROTO3_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条用例）。示例
+`examples/stdnet2.c6` 四节（22 条自检）。
+
+验收：`make stdtest`（281 个模块、0 failure）、`make std-proto3`（22 条自检全过）、
+`make check-all`。
+
+
 
 
 

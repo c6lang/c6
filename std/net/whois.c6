@@ -1,0 +1,254 @@
+/* std/net/whois：WHOIS 应答（`Key: value` 文本）的字段游标。
+ *
+ *     import std.net.whois;
+ *
+ *     WhoisDoc doc = { 0 };
+ *     WhoisField f = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / find / rewind
+ *     while (doc.next(&f) == 1)
+ *         // f.key / f.value
+ *     doc.find(S("Registrar"), &f);
+ *
+ * WHOIS 应答是自由格式，但绝大多数行是 `键: 值`；以 `%`/`#` 开头的行是注释，以空格
+ * 开头的行是上一个字段的续行。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 数出「键: 值」行数（注释、续行、空行不算），返回该数；
+ * - `doc.next(&f)` 逐条返回；键是冒号前的部分（去掉尾部空格），值是冒号后的部分
+ *   （去掉前导空格），**续行**会被拼到上一条的值末尾吗？——不会：为了不改缓冲区，
+ *   `next` 只给单行，续行通过 `f.continuation`（1 表示下一行是续行）提示；
+ * - `doc.find(key, &f)` 大小写不敏感地按键名精确匹配（键名带 `Registrar`/`registrar`
+ *   都行），返回 1/0；
+ * - `doc.get(key, dst, cap)` 直接把值拷成 C 字符串（找不到返回 -1）；
+ * - 值可能含 `:`（如时间戳），按**第一个**冒号切分。
+ */
+#include <string.h>
+
+module std.net.whois;
+import std.core.types;
+import std.text.str;
+
+struct WhoisField {
+    Str key;
+    Str value;
+    int continuation;
+};
+
+struct WhoisDoc {
+    const char *src;
+    int n;
+    int off;
+    int nfields;
+};
+
+static char who_lower(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    return c;
+}
+
+/* 找下一个「键: 值」行；返回 1 成功，0 到头 */
+static int who_next_raw(const char *p, int n, int *off, WhoisField *f)
+{
+    while (*off < n) {
+        int start = *off, end = *off, colon = -1, i = 0;
+        int next_is_cont = 0;
+
+        while (end < n && p[end] != '\n')
+            end++;
+        if (end > start && p[end - 1] == '\r')
+            end--;
+        *off = (end < n && p[end] == '\n') ? end + 1 : end;
+        if (*off <= start)
+            *off = start + 1;
+        if (start >= end)
+            continue;
+        if (p[start] == '%' || p[start] == '#')
+            continue;
+        if (p[start] == ' ' || p[start] == '\t')
+            continue;                   /* 续行：单独返回不做 */
+        for (i = start; i < end; i++) {
+            if (p[i] == ':') {
+                colon = i;
+                break;
+            }
+        }
+        if (colon < 0)
+            continue;
+        memset(f, 0, sizeof *f);
+        {
+            int k_end = colon;
+
+            while (k_end > start && (p[k_end - 1] == ' ' || p[k_end - 1] == '\t'))
+                k_end--;
+            f->key.s = (char[:]){ (char *)p + start, k_end - start };
+        }
+        {
+            int v_start = colon + 1;
+
+            while (v_start < end && (p[v_start] == ' ' || p[v_start] == '\t'))
+                v_start++;
+            f->value.s = (char[:]){ (char *)p + v_start, end - v_start };
+        }
+        /* 看下一行是不是续行（不改游标，只探测） */
+        if (*off < n && (p[*off] == ' ' || p[*off] == '\t'))
+            next_is_cont = 1;
+        f->continuation = next_is_cont;
+        return 1;
+    }
+    return 0;
+}
+
+int open(WhoisDoc *d, const void *src, int n)
+{
+    const char *p = (const char *)src;
+    int off = 0, count = 0;
+    WhoisField f = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    while (who_next_raw(p, n, &off, &f) == 1)
+        count++;
+    d->nfields = count;
+    d->off = 0;
+    return count;
+}
+
+int next(WhoisDoc *d, WhoisField *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return who_next_raw(d->src, d->n, &d->off, out);
+}
+
+int count(WhoisDoc *d)
+{
+    return d ? d->nfields : 0;
+}
+
+int rewind(WhoisDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int key_is(Str key, char[:] want)
+{
+    int i = 0;
+
+    if (key.s.len != want.len)
+        return 0;
+    for (i = 0; i < want.len; i++) {
+        if (who_lower(key.s.data[i]) != who_lower(want.data[i]))
+            return 0;
+    }
+    return 1;
+}
+
+int find(WhoisDoc *d, char[:] want, WhoisField *out)
+{
+    WhoisField f = { 0 };
+
+    if (!d || !want.data || !out)
+        return -1;
+    rewind(d);
+    while (next(d, &f) == 1) {
+        if (key_is(f.key, want)) {
+            *out = f;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int get(WhoisDoc *d, char[:] want, char *dst, int cap)
+{
+    WhoisField f = { 0 };
+    int i = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    if (find(d, want, &f) != 1)
+        return -1;
+    if (f.value.s.len + 1 > cap)
+        return -1;
+    for (i = 0; i < f.value.s.len; i++)
+        dst[i] = f.value.s.data[i];
+    dst[i] = 0;
+    return i;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "whois：字段游标" {
+    static const char *txt =
+        "% whois server comment\n"
+        "Domain Name: EXAMPLE.COM\n"
+        "Registrar: Example Registrar, Inc.\n"
+        "   WHOIS Server: whois.example.com\n"
+        "Updated Date: 2024-01-02T03:04:05Z\n"
+        "# hash comment\n"
+        "\n"
+        "Name Server: NS1.EXAMPLE.COM\n";
+    WhoisDoc d = { 0 };
+    WhoisField f = { 0 };
+    char buf[64] = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 4)
+        return err(1, "应该有 4 个字段（注释/续行/空行不算）");
+    if (d.count() != 4)
+        return err(2, "count() 不对");
+    if (d.next(&f) != 1 || !key_is(f.key, S("Domain Name")))
+        return err(3, "第一个键不对");
+    if (f.value.s.len != 11 || memcmp(f.value.s.data, "EXAMPLE.COM", 11) != 0)
+        return err(4, "第一个值不对");
+    if (f.continuation != 0)
+        return err(5, "第一行后面不是续行");
+    if (d.next(&f) != 1 || !key_is(f.key, S("registrar")))
+        return err(6, "键名匹配应该大小写不敏感");
+    if (f.continuation != 1)
+        return err(7, "Registrar 后面有续行");
+    if (d.next(&f) != 1 || f.value.s.len != 20)
+        return err(8, "时间戳值长度不对");
+    if (d.next(&f) != 1 || !key_is(f.key, S("Name Server")))
+        return err(9, "最后一个键不对");
+    if (d.next(&f) != 0)
+        return err(10, "读完应该返回 0");
+}
+
+test "whois：按键取值" {
+    static const char *txt =
+        "Domain Name: EXAMPLE.COM\n"
+        "Registrar: Example Registrar\n"
+        "Status: active\n";
+    WhoisDoc d = { 0 };
+    WhoisField f = { 0 };
+    char buf[64] = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 3)
+        return err(11, "应该有 3 个字段");
+    if (d.find(S("Registrar"), &f) != 1)
+        return err(12, "find(Registrar) 失败");
+    if (f.value.s.len != 17)
+        return err(13, "Registrar 的值长度不对");
+    if (d.get(S("status"), buf, (int)sizeof buf) != 6
+        || memcmp(buf, "active", 6) != 0)
+        return err(14, "get(status) 不对");
+    if (d.get(S("nope"), buf, (int)sizeof buf) != -1)
+        return err(15, "不存在的键应该 -1");
+    if (d.get(S("Registrar"), buf, 4) != -1)
+        return err(16, "容量不够应该 -1");
+    if (d.find(S("Registrar"), &f) != 1)
+        return err(17, "find 之后游标位置应该仍在命中处");
+    if (d.open("", 0) != -1)
+        return err(18, "空输入应该 -1");
+}

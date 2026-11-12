@@ -412,6 +412,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/au.c6            std.data.au            Sun/NeXT .au：24 字节头 + 编码表（μ-law/A-law/PCM/浮点）与每样本字节数
   std/data/voc.c6           std.data.voc           Creative Voice：块遍历（1 字节类型 + 3 字节长度），率字节换算采样率
   std/data/ircam.c6         std.data.ircam         IRCAM/Berkeley SF：魔数 + 单精度浮点采样率 + 可选 info 块
+  std/net/irc.c6             std.net.irc            IRC 消息：irc_parse 拆 prefix/command/params/trailing，irc_build 拼行
+  std/net/gopher.c6          std.net.gopher         Gopher 菜单游标：open/next/count/find，类型名与 is_text/is_dir 判断
+  std/net/whois.c6           std.net.whois          WHOIS 应答字段游标：find/get 大小写不敏感取「键: 值」
+  std/net/ident.c6           std.net.ident          ident（RFC 1413）：查询/应答解析与构造，USERID/ERROR 两种应答
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -534,6 +538,7 @@ make std-cont     # 编译并运行 examples/stdcontainers.c6（第六十三批�
 make std-stats    # 编译并运行 examples/stdstats2.c6（第六十四批统计小工具模块的拼装示例，链接带 -lm）
 make std-search   # 编译并运行 examples/stdsearch.c6（第六十五批字符串算法模块的拼装示例）
 make std-audio2   # 编译并运行 examples/stdlegacy2.c6（第六十六批老音频格式头模块的拼装示例）
+make std-proto3   # 编译并运行 examples/stdnet2.c6（第六十七批小型文本协议模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

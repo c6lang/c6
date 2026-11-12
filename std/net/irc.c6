@@ -1,0 +1,240 @@
+/* std/net/irc：IRC 协议消息（RFC 1459/2812）的解析与构造。
+ *
+ *     import std.net.irc;
+ *
+ *     IrcMsg m = { 0 };
+ *     char out[128] = { 0 };
+ *     irc_parse(S(":nick!user@host PRIVMSG #chan :Hello there"), &m);
+ *     // m.prefix = "nick!user@host"、m.command = "PRIVMSG"、
+ *     // m.params = "#chan"、m.trailing = "Hello there"
+ *     irc_build("PRIVMSG", "#chan", "hi", out, (int)sizeof out);
+ *
+ * 线路格式：`[":" prefix SPACE] command *(SPACE param) [SPACE ":" trailing]`。
+ *
+ * 约定：
+ *
+ * - `irc_parse(line, &m)` 去掉行尾 `\r\n` 后解析，成功返回 1，空行/坏行返回 -1；
+ * - `prefix` 与 `trailing` 含前导 `:` 时**不**带冒号（冒号被吃掉）；
+ *   `params` 是冒号前的所有参数（用空格分隔），以 `Str` 视图给出；
+ *   `nparams` 是参数个数（最多 15）；
+ * - `irc_build(cmd, params, trailing, dst, cap)` 拼一行（自动补 `\r\n`），
+ *   `trailing` 为空则不写尾部段；`params` 里含空格会返回 -1（要用 trailing）；
+ * - `irc_numeric(m)` 若命令是三位数字返回该数值，否则返回 -1（便于判断 `433` 之类）；
+ * - `irc_prefix_nick(m, dst, cap)` 从 prefix 里取出 nick（到 `!` 或 `@` 为止）；
+ * - 不做 UTF-8 校验、不处理 IRCv3 tag（`@a=b ` 开头会被当成 command）。
+ */
+#include <string.h>
+
+module std.net.irc;
+import std.core.types;
+import std.text.str;
+
+struct IrcMsg {
+    Str prefix;
+    Str command;
+    int nparams;
+    Str params[15];
+    Str trailing;
+    int has_trailing;
+};
+
+int irc_parse(char[:] line, IrcMsg *out)
+{
+    int i = 0, n = 0;
+
+    if (!line.data || !out || line.len <= 0)
+        return -1;
+    n = line.len;
+    while (n > 0 && (line.data[n - 1] == '\r' || line.data[n - 1] == '\n'))
+        n--;
+    if (n == 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    i = 0;
+    if (line.data[i] == ':') {
+        int start = ++i;
+
+        while (i < n && line.data[i] != ' ')
+            i++;
+        out->prefix.s = (char[:]){ line.data + start, i - start };
+        if (i < n)
+            i++;
+    }
+    {
+        int start = i;
+
+        while (i < n && line.data[i] != ' ')
+            i++;
+        if (i == start)
+            return -1;
+        out->command.s = (char[:]){ line.data + start, i - start };
+    }
+    while (i < n) {
+        int start = 0;
+
+        if (line.data[i] == ' ')
+            i++;
+        if (i >= n)
+            break;
+        if (line.data[i] == ':') {
+            out->trailing.s = (char[:]){ line.data + i + 1, n - i - 1 };
+            out->has_trailing = 1;
+            return 1;
+        }
+        start = i;
+        while (i < n && line.data[i] != ' ')
+            i++;
+        if (out->nparams < 15)
+            out->params[out->nparams++] = (Str){ (char[:]){ line.data + start,
+                                                             i - start } };
+    }
+    return 1;
+}
+
+int irc_numeric(IrcMsg *m)
+{
+    int v = 0, i = 0;
+
+    if (!m || m->command.s.len != 3)
+        return -1;
+    for (i = 0; i < 3; i++) {
+        char c = m->command.s.data[i];
+
+        if (c < '0' || c > '9')
+            return -1;
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
+int irc_prefix_nick(IrcMsg *m, char *dst, int cap)
+{
+    int i = 0;
+
+    if (!m || !dst || cap <= 0 || m->prefix.s.len == 0)
+        return -1;
+    for (i = 0; i < m->prefix.s.len; i++) {
+        char c = m->prefix.s.data[i];
+
+        if (c == '!' || c == '@')
+            break;
+        if (i + 1 > cap)
+            return -1;
+        dst[i] = c;
+    }
+    if (i + 1 > cap)
+        return -1;
+    dst[i] = 0;
+    return i;
+}
+
+int irc_build(const char *cmd, const char *params, const char *trailing,
+              char *dst, int cap)
+{
+    int o = 0, i = 0;
+
+    if (!cmd || !dst || cap <= 0)
+        return -1;
+    if (params && strchr(params, ' '))
+        return -1;
+    for (i = 0; cmd[i]; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = cmd[i];
+    }
+    if (params && params[0]) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = ' ';
+        for (i = 0; params[i]; i++) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = params[i];
+        }
+    }
+    if (trailing && trailing[0]) {
+        if (o + 2 > cap)
+            return -1;
+        dst[o++] = ' ';
+        dst[o++] = ':';
+        for (i = 0; trailing[i]; i++) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = trailing[i];
+        }
+    }
+    if (o + 2 > cap)
+        return -1;
+    dst[o++] = '\r';
+    dst[o++] = '\n';
+    dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "irc：解析消息" {
+    IrcMsg m = { 0 };
+    char nick[32] = { 0 };
+
+    if (irc_parse(S(":nick!user@host PRIVMSG #chan :Hello there\r\n"), &m) != 1)
+        return err(1, "解析失败");
+    if (m.prefix.s.len != 14 || memcmp(m.prefix.s.data, "nick!user@host", 14) != 0)
+        return err(2, "prefix 不对");
+    if (m.command.s.len != 7 || memcmp(m.command.s.data, "PRIVMSG", 7) != 0)
+        return err(3, "command 不对");
+    if (m.nparams != 1 || m.params[0].s.len != 5)
+        return err(4, "参数个数或内容不对");
+    if (m.has_trailing != 1 || m.trailing.s.len != 11
+        || memcmp(m.trailing.s.data, "Hello there", 11) != 0)
+        return err(5, "trailing 不对");
+    if (irc_prefix_nick(&m, nick, (int)sizeof nick) != 4
+        || memcmp(nick, "nick", 4) != 0)
+        return err(6, "取 nick 不对");
+    if (irc_numeric(&m) != -1)
+        return err(7, "PRIVMSG 不是数字命令");
+    /* 数字命令 */
+    if (irc_parse(S(":irc.server 433 * nick :Nickname in use"), &m) != 1)
+        return err(8, "433 解析失败");
+    if (irc_numeric(&m) != 433)
+        return err(9, "433 数值不对");
+    if (m.nparams != 2 || m.params[1].s.len != 4)
+        return err(10, "433 的参数不对");
+    /* 没有 prefix、没有 trailing */
+    if (irc_parse(S("PING"), &m) != 1 || m.command.s.len != 4
+        || m.prefix.s.len != 0 || m.has_trailing != 0)
+        return err(11, "只有命令的消息解析不对");
+    if (irc_parse(S(""), &m) != -1 || irc_parse(S("\r\n"), &m) != -1)
+        return err(12, "空行应该 -1");
+}
+
+test "irc：构造" {
+    char out[128] = { 0 };
+    int n = 0;
+
+    n = irc_build("PRIVMSG", "#chan", "hi there", out, (int)sizeof out);
+    if (n != 25 || memcmp(out, "PRIVMSG #chan :hi there\r\n", 25) != 0)
+        return err(13, "PRIVMSG 构造不对");
+    n = irc_build("PING", 0, "token", out, (int)sizeof out);
+    if (n != 13 || memcmp(out, "PING :token\r\n", 13) != 0)
+        return err(14, "PING 构造不对");
+    n = irc_build("QUIT", 0, 0, out, (int)sizeof out);
+    if (n != 6 || memcmp(out, "QUIT\r\n", 6) != 0)
+        return err(15, "QUIT 构造不对");
+    if (irc_build("NICK", "a b", 0, out, (int)sizeof out) != -1)
+        return err(16, "参数含空格应该 -1");
+    if (irc_build("PRIVMSG", "#c", "hi", out, 8) != -1)
+        return err(17, "容量不够应该 -1");
+    /* 构造出来的能被解析回来 */
+    irc_build("JOIN", "#test", 0, out, (int)sizeof out);
+    {
+        IrcMsg m = { 0 };
+
+        if (irc_parse((char[:]){ out, (int)strlen(out) }, &m) != 1)
+            return err(18, "自产自解失败");
+        if (m.command.s.len != 4 || m.nparams != 1 || m.params[0].s.len != 5)
+            return err(19, "自产自解字段不对");
+    }
+}

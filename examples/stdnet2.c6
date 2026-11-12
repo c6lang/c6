@@ -1,0 +1,127 @@
+/* examples/stdnet2.c6 —— 第六十七批（小型文本协议）的集成示例。
+ *
+ *     make std-proto3
+ *
+ * 四节：IRC 消息解析/构造、Gopher 菜单遍历、WHOIS 字段、ident 查询/应答。
+ * 全部用**方法**（`doc.next`、`doc.find`、`doc.get`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.net.irc;
+import std.net.gopher;
+import std.net.whois;
+import std.net.ident;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_irc(void)
+{
+    IrcMsg m = { 0 };
+    char nick[32] = { 0 };
+    char out[128] = { 0 };
+
+    printf("== irc\n");
+    check(irc_parse(S(":nick!user@host PRIVMSG #chan :Hello there\r\n"), &m) == 1,
+          "解析 PRIVMSG");
+    irc_prefix_nick(&m, nick, (int)sizeof nick);
+    printf("   %s → %.*s %.*s : %.*s\n", nick, m.command.s.len,
+           m.command.s.data, m.params[0].s.len, m.params[0].s.data,
+           m.trailing.s.len, m.trailing.s.data);
+    check(memcmp(nick, "nick", 4) == 0, "取 nick");
+    check(m.nparams == 1 && m.has_trailing == 1, "参数与 trailing");
+    check(irc_parse(S(":irc 433 * nick :in use"), &m) == 1 && irc_numeric(&m) == 433,
+          "数字命令 433");
+    check(irc_build("PRIVMSG", "#chan", "hi there", out, (int)sizeof out) == 25,
+          "构造 PRIVMSG");
+    check(memcmp(out, "PRIVMSG #chan :hi there\r\n", 25) == 0, "构造内容");
+    check(irc_build("PING", 0, "tok", out, (int)sizeof out) == 11, "构造 PING");
+}
+
+static void do_gopher(void)
+{
+    static const char *menu =
+        "1About\t/about\texample.org\t70\r\n"
+        "0README\t/readme.txt\texample.org\t70\r\n"
+        "7Search\t/search\texample.org\t70\r\n"
+        ".\r\n";
+    GopherDoc doc = { 0 };
+    GopherItem it = { 0 };
+    int n = 0;
+
+    printf("== gopher\n");
+    check(doc.open(menu, (int)strlen(menu)) == 3, "open 3 条");
+    while (doc.next(&it) == 1) {
+        printf("   %c %-8.*s %s:%d\n", it.type, it.display.s.len,
+               it.display.s.data, type_name(it.type), it.port);
+        n++;
+    }
+    check(n == 3, "遍历 3 条");
+    check(doc.find(S("Search")) == 1, "按名字查找");
+    check(doc.find(S("nothing")) == 0, "找不到");
+}
+
+static void do_whois(void)
+{
+    static const char *txt =
+        "% comment\n"
+        "Domain Name: EXAMPLE.COM\n"
+        "Registrar: Example Registrar\n"
+        "Status: active\n";
+    WhoisDoc doc = { 0 };
+    WhoisField f = { 0 };
+    char buf[64] = { 0 };
+
+    printf("== whois\n");
+    check(doc.open(txt, (int)strlen(txt)) == 3, "open 3 个字段");
+    check(doc.get(S("domain name"), buf, (int)sizeof buf) == 11, "取域名");
+    printf("   域名 %s\n", buf);
+    check(memcmp(buf, "EXAMPLE.COM", 11) == 0, "域名内容");
+    check(doc.find(S("Status"), &f) == 1 && f.value.s.len == 6, "取状态");
+    check(doc.get(S("nope"), buf, (int)sizeof buf) == -1, "不存在的键");
+}
+
+static void do_ident(void)
+{
+    IdentQuery q = { 0 };
+    IdentReply r = { 0 };
+    char out[128] = { 0 };
+
+    printf("== ident\n");
+    check(ident_parse_query(S("4321 , 5678\r\n"), &q) == 1, "解析查询");
+    check(q.server_port == 4321 && q.client_port == 5678, "端口对");
+    check(ident_build_reply(4321, 5678, "UNIX", "alice", out, (int)sizeof out)
+              == 37,
+          "构造应答");
+    check(ident_parse_reply((char[:]){ out, 37 }, &q, &r) == 1 && r.ok == 1,
+          "解析应答");
+    printf("   %d , %d : %.*s : %.*s\n", q.server_port, q.client_port,
+           r.os.s.len, r.os.s.data, r.user.s.len, r.user.s.data);
+    check(r.user.s.len == 5 && memcmp(r.user.s.data, "alice", 5) == 0, "用户名");
+    check(ident_build_error(80, 1024, out, (int)sizeof out) == 29,
+          "构造 ERROR");
+}
+
+int main(void)
+{
+    do_irc();
+    do_gopher();
+    do_whois();
+    do_ident();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

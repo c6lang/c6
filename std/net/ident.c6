@@ -1,0 +1,356 @@
+/* std/net/ident：ident（RFC 1413）查询与应答的解析/构造。
+ *
+ *     import std.net.ident;
+ *
+ *     IdentQuery q = { 0 };
+ *     ident_parse_query(S("4321 , 5678\r\n"), &q);
+ *     // q.server_port = 4321、q.client_port = 5678
+ *     IrcReply r = { 0 };   // 见 std.net.irc
+ *     ident_parse_reply(S("4321 , 5678 : USERID : UNIX : alice"), &q, &rep);
+ *
+ * 查询格式：`<服务端端口> , <客户端端口>`（逗号两侧的空格可有可无，行尾 `\r\n`）。
+ * 应答格式：`<同上的端口对> : <USERID|ERROR> : <系统名> : <标识>`。
+ *
+ * 约定：
+ *
+ * - `ident_parse_query(line, &q)` 解析端口对，成功返回 1，坏输入返回 -1；
+ * - `ident_parse_reply(line, &q, &r)` 解析端口对与后三段，`r.ok` 为 1 表示
+ *   `USERID`（成功），0 表示 `ERROR`；`r.os`/`r.user` 是 `Str` 视图；
+ * - `ident_build_query(server, client, dst, cap)` 生成规范查询行（`4321 , 5678\r\n`），
+ *   返回写入长度；`ident_build_reply(...)` 同理生成 `USERID` 应答；
+ * - `ident_build_error(q, dst, cap)` 生成 `ERROR : NO-USER` 应答；
+ * - 端口范围 1..65535，越界返回 -1；
+ * - 不做 UTF-8 校验。
+ */
+#include <string.h>
+
+module std.net.ident;
+import std.core.types;
+import std.text.str;
+
+struct IdentQuery {
+    int server_port;
+    int client_port;
+};
+
+struct IdentReply {
+    int ok;
+    Str os;
+    Str user;
+};
+
+/* 读一个十进制端口，跳过前导空格 */
+static int id_num(const char *p, int n, int *pos, int *out)
+{
+    int i = *pos, v = 0, digits = 0;
+
+    while (i < n && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    while (i < n && p[i] >= '0' && p[i] <= '9') {
+        v = v * 10 + (p[i] - '0');
+        digits++;
+        i++;
+        if (v > 65535)
+            return -1;
+    }
+    if (!digits)
+        return -1;
+    *pos = i;
+    *out = v;
+    return 1;
+}
+
+static int id_skip_ws(const char *p, int n, int *pos)
+{
+    int i = *pos;
+
+    while (i < n && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    *pos = i;
+    return 1;
+}
+
+static int id_ports(const char *p, int n, int *pos, IdentQuery *q)
+{
+    if (id_num(p, n, pos, &q->server_port) != 1)
+        return -1;
+    id_skip_ws(p, n, pos);
+    if (*pos < n && p[*pos] == ',')
+        (*pos)++;
+    else
+        return -1;
+    if (id_num(p, n, pos, &q->client_port) != 1)
+        return -1;
+    if (q->server_port <= 0 || q->client_port <= 0)
+        return -1;
+    return 1;
+}
+
+int ident_parse_query(char[:] line, IdentQuery *q)
+{
+    int n = 0, pos = 0;
+
+    if (!line.data || !q || line.len <= 0)
+        return -1;
+    n = line.len;
+    while (n > 0 && (line.data[n - 1] == '\r' || line.data[n - 1] == '\n'))
+        n--;
+    memset(q, 0, sizeof *q);
+    if (id_ports(line.data, n, &pos, q) != 1)
+        return -1;
+    return 1;
+}
+
+int ident_parse_reply(char[:] line, IdentQuery *q, IdentReply *r)
+{
+    int n = 0, pos = 0;
+    int f_start = 0, f = 0;
+
+    if (!line.data || !q || !r || line.len <= 0)
+        return -1;
+    n = line.len;
+    while (n > 0 && (line.data[n - 1] == '\r' || line.data[n - 1] == '\n'))
+        n--;
+    memset(q, 0, sizeof *q);
+    memset(r, 0, sizeof *r);
+    if (id_ports(line.data, n, &pos, q) != 1)
+        return -1;
+    /* 类型段：USERID 后面必须还有两段（系统、用户），ERROR 后面一到两段（说明） */
+    {
+        int start = 0, end = 0, is_userid = 0;
+
+        id_skip_ws(line.data, n, &pos);
+        if (pos >= n || line.data[pos] != ':')
+            return -1;
+        pos++;
+        id_skip_ws(line.data, n, &pos);
+        start = pos;
+        while (pos < n && line.data[pos] != ':')
+            pos++;
+        end = pos;
+        while (end > start && (line.data[end - 1] == ' '
+                               || line.data[end - 1] == '\t'))
+            end--;
+        if (end - start == 6 && memcmp(line.data + start, "USERID", 6) == 0)
+            is_userid = 1;
+        else if (end - start == 5 && memcmp(line.data + start, "ERROR", 5) == 0)
+            is_userid = 0;
+        else
+            return -1;
+        r->ok = is_userid;
+        {
+            int f = 0;
+
+            for (f = 0; f < 2; f++) {
+                size_t off = 0;
+
+                id_skip_ws(line.data, n, &pos);
+                if (pos >= n || line.data[pos] != ':') {
+                    if (is_userid)
+                        return -1;      /* USERID 必须给全两段 */
+                    break;
+                }
+                pos++;
+                id_skip_ws(line.data, n, &pos);
+                start = pos;
+                while (pos < n && line.data[pos] != ':')
+                    pos++;
+                end = pos;
+                while (end > start && (line.data[end - 1] == ' '
+                                       || line.data[end - 1] == '\t'))
+                    end--;
+                off = 0;
+                if (f == 0)
+                    r->os.s = (char[:]){ line.data + start, end - start };
+                else
+                    r->user.s = (char[:]){ line.data + start, end - start };
+                (void)off;
+            }
+        }
+    }
+    return 1;
+}
+
+static int id_put(char *dst, int cap, int o, const char *lit)
+{
+    int i = 0;
+
+    for (i = 0; lit[i]; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = lit[i];
+    }
+    return o;
+}
+
+static int id_put_num(char *dst, int cap, int o, int v)
+{
+    char tmp[8] = { 0 };
+    int k = 0;
+
+    if (v == 0) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = '0';
+        return o;
+    }
+    while (v > 0 && k < 7) {
+        tmp[k++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    for (k = k - 1; k >= 0; k--) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = tmp[k];
+    }
+    return o;
+}
+
+int ident_build_query(int server_port, int client_port, char *dst, int cap)
+{
+    int o = 0;
+
+    if (!dst || cap <= 0 || server_port <= 0 || client_port <= 0
+        || server_port > 65535 || client_port > 65535)
+        return -1;
+    o = id_put_num(dst, cap, o, server_port);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, " , ");
+    if (o < 0)
+        return -1;
+    o = id_put_num(dst, cap, o, client_port);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, "\r\n");
+    if (o < 0)
+        return -1;
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int ident_build_reply(int server_port, int client_port, const char *os,
+                      const char *user, char *dst, int cap)
+{
+    int o = 0;
+
+    if (!dst || cap <= 0 || !os || !user || server_port <= 0 || client_port <= 0)
+        return -1;
+    o = id_put_num(dst, cap, o, server_port);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, " , ");
+    if (o < 0)
+        return -1;
+    o = id_put_num(dst, cap, o, client_port);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, " : USERID : ");
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, os);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, " : ");
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, user);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, "\r\n");
+    if (o < 0)
+        return -1;
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int ident_build_error(int server_port, int client_port, char *dst, int cap)
+{
+    int o = 0;
+
+    if (!dst || cap <= 0 || server_port <= 0 || client_port <= 0)
+        return -1;
+    o = id_put_num(dst, cap, o, server_port);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, " , ");
+    if (o < 0)
+        return -1;
+    o = id_put_num(dst, cap, o, client_port);
+    if (o < 0)
+        return -1;
+    o = id_put(dst, cap, o, " : ERROR : NO-USER\r\n");
+    if (o < 0)
+        return -1;
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "ident：查询与应答解析" {
+    IdentQuery q = { 0 };
+    IdentReply r = { 0 };
+
+    if (ident_parse_query(S("4321 , 5678\r\n"), &q) != 1)
+        return err(1, "解析查询失败");
+    if (q.server_port != 4321 || q.client_port != 5678)
+        return err(2, "端口对不对");
+    /* 逗号两侧无空格也能解析 */
+    if (ident_parse_query(S("80,1024"), &q) != 1 || q.server_port != 80
+        || q.client_port != 1024)
+        return err(3, "紧凑写法不对");
+    if (ident_parse_query(S("4321"), &q) != -1)
+        return err(4, "缺端口应该 -1");
+    if (ident_parse_query(S("0 , 5"), &q) != -1)
+        return err(5, "端口 0 应该 -1");
+    if (ident_parse_query(S("70000 , 5"), &q) != -1)
+        return err(6, "端口越界应该 -1");
+    if (ident_parse_reply(S("4321 , 5678 : USERID : UNIX : alice\r\n"), &q, &r)
+        != 1)
+        return err(7, "解析应答失败");
+    if (r.ok != 1)
+        return err(8, "应该是 USERID 应答");
+    if (r.os.s.len != 4 || memcmp(r.os.s.data, "UNIX", 4) != 0)
+        return err(9, "系统名不对");
+    if (r.user.s.len != 5 || memcmp(r.user.s.data, "alice", 5) != 0)
+        return err(10, "用户名不对");
+    if (ident_parse_reply(S("4321 , 5678 : ERROR : NO-USER"), &q, &r) != 1
+        || r.ok != 0)
+        return err(11, "ERROR 应答解析不对");
+    if (r.os.s.len != 7 || memcmp(r.os.s.data, "NO-USER", 7) != 0)
+        return err(11, "ERROR 的说明段不对");
+    if (ident_parse_reply(S("4321 , 5678 : BOGUS : UNIX : x"), &q, &r) != -1)
+        return err(12, "未知类型应该 -1");
+}
+
+test "ident：构造" {
+    char out[128] = { 0 };
+    IdentQuery q = { 0 };
+    IdentReply r = { 0 };
+    int n = 0;
+
+    n = ident_build_query(4321, 5678, out, (int)sizeof out);
+    if (n != 13 || memcmp(out, "4321 , 5678\r\n", 13) != 0)
+        return err(13, "查询构造不对");
+    n = ident_build_reply(4321, 5678, "UNIX", "alice", out, (int)sizeof out);
+    if (n != 37 || memcmp(out, "4321 , 5678 : USERID : UNIX : alice\r\n", 37) != 0)
+        return err(14, "应答构造不对");
+    /* 自产自解 */
+    if (ident_parse_reply((char[:]){ out, n }, &q, &r) != 1)
+        return err(15, "自产自解失败");
+    if (r.user.s.len != 5 || q.server_port != 4321)
+        return err(16, "自产自解字段不对");
+    n = ident_build_error(4321, 5678, out, (int)sizeof out);
+    if (n != 31 || memcmp(out, "4321 , 5678 : ERROR : NO-USER\r\n", 31) != 0)
+        return err(17, "ERROR 构造不对");
+    if (ident_build_query(0, 1, out, (int)sizeof out) != -1)
+        return err(18, "端口 0 应该 -1");
+    if (ident_build_query(4321, 5678, out, 5) != -1)
+        return err(19, "容量不够应该 -1");
+}

@@ -1,0 +1,312 @@
+/* std/net/gopher：Gopher 菜单（RFC 1436）的行解析与游标遍历。
+ *
+ *     import std.net.gopher;
+ *
+ *     GopherDoc doc = { 0 };
+ *     GopherItem it = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / rewind / find
+ *     while (doc.next(&it) == 1)
+ *         // it.type / it.display / it.selector / it.host / it.port
+ *     it.type_name();                // "text"、"dir"、"search"…
+ *
+ * 菜单行格式：`<类型字符><显示名>\t<选择串>\t<主机>\t<端口>`，行尾 `\r\n`；
+ * 以 `.` 单独一行表示结束。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 数出条目数（点行与空行不算），返回条目数；
+ * - `doc.next(&it)` 逐条返回；`it.clean_display` 为真表示这是一条 **info/假行**
+ *   （类型 `i`，选择串是 `fake`、主机 `(NULL)`），界面上通常隐藏；
+ *   `doc.find(pattern)` 按显示名子串找第一条，返回 1/0；
+ * - 字段缺失（没有三个制表符）的行被跳过而不是报错——真实服务器常有残缺行；
+ * - `it.type_name()` 给类型字符的名字（`0`→`"text"`、`1`→`"dir"`、`7`→`"search"`…）；
+ * - `it.is_text()`/`it.is_dir()`/`it.is_binary()` 是便捷判断。
+ */
+#include <string.h>
+
+module std.net.gopher;
+import std.core.types;
+import std.text.str;
+
+struct GopherItem {
+    char type;
+    Str display;
+    Str selector;
+    Str host;
+    int port;
+    int clean_display;
+};
+
+struct GopherDoc {
+    const char *src;
+    int n;
+    int off;
+    int nitems;
+};
+
+const char *type_name(char t)
+{
+    switch (t) {
+    case '0': return "text";
+    case '1': return "dir";
+    case '2': return "csos";
+    case '3': return "error";
+    case '4': return "binhex";
+    case '5': return "dos";
+    case '6': return "uu";
+    case '7': return "search";
+    case '8': return "telnet";
+    case '9': return "binary";
+    case 'g': return "gif";
+    case 'h': return "html";
+    case 'i': return "info";
+    case 'I': return "image";
+    case 'T': return "tn3270";
+    default: return "?";
+    }
+}
+
+int is_text(GopherItem *it)
+{
+    return it && it->type == '0';
+}
+
+int is_dir(GopherItem *it)
+{
+    return it && it->type == '1';
+}
+
+int is_binary(GopherItem *it)
+{
+    return it && (it->type == '9' || it->type == '5' || it->type == '4'
+                  || it->type == '6' || it->type == 'g' || it->type == 'I');
+}
+
+Str display_name(GopherItem *it)
+{
+    if (!it)
+        return (Str){ (char[:]){ 0, 0 } };
+    return it->display;
+}
+
+/* 解析一行；返回 1 成功、0 空行/点行、-1 残缺 */
+static int gp_line(const char *p, int start, int end, GopherItem *it)
+{
+    int i = start, tab = 0;
+
+    if (start >= end)
+        return 0;
+    if (end - start == 1 && p[start] == '.')
+        return 0;
+    memset(it, 0, sizeof *it);
+    it->type = p[start];
+    i = start + 1;
+    {
+        int f_start = i;
+
+        /* 显示名到第一个制表符 */
+        while (i < end && p[i] != '\t')
+            i++;
+        if (i >= end)
+            return -1;
+        it->display.s = (char[:]){ (char *)p + f_start, i - f_start };
+        it->clean_display = (f_start == start + 1 && it->type == 'i') ? 1 : 0;
+        tab++;
+    }
+    i++;
+    {
+        int f_start = i;
+
+        while (i < end && p[i] != '\t')
+            i++;
+        if (i >= end)
+            return -1;
+        it->selector.s = (char[:]){ (char *)p + f_start, i - f_start };
+        tab++;
+    }
+    i++;
+    {
+        int f_start = i;
+
+        while (i < end && p[i] != '\t')
+            i++;
+        if (i >= end)
+            return -1;
+        it->host.s = (char[:]){ (char *)p + f_start, i - f_start };
+        tab++;
+    }
+    i++;
+    {
+        int v = 0, digits = 0;
+
+        while (i < end && p[i] >= '0' && p[i] <= '9') {
+            v = v * 10 + (p[i] - '0');
+            digits++;
+            i++;
+        }
+        if (!digits)
+            return -1;
+        it->port = v;
+    }
+    if (tab != 3)
+        return -1;
+    return 1;
+}
+
+int open(GopherDoc *d, const void *src, int n)
+{
+    const char *p = (const char *)src;
+    int off = 0, count = 0;
+    GopherItem it = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    while (off < n) {
+        int start = off, end = off;
+
+        while (end < n && p[end] != '\n')
+            end++;
+        if (end > start && p[end - 1] == '\r')
+            end--;
+        if (gp_line(p, start, end, &it) == 1)
+            count++;
+        off = (end < n && p[end] == '\n') ? end + 1 : end;
+        if (off <= start)
+            off = start + 1;
+    }
+    d->nitems = count;
+    d->off = 0;
+    return count;
+}
+
+int next(GopherDoc *d, GopherItem *out)
+{
+    const char *p = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    while (d->off < d->n) {
+        int start = d->off, end = d->off, rc = 0;
+
+        while (end < d->n && p[end] != '\n')
+            end++;
+        if (end > start && p[end - 1] == '\r')
+            end--;
+        d->off = (end < d->n && p[end] == '\n') ? end + 1 : end;
+        if (d->off <= start)
+            d->off = start + 1;
+        rc = gp_line(p, start, end, out);
+        if (rc == 1)
+            return 1;
+    }
+    return 0;
+}
+
+int count(GopherDoc *d)
+{
+    return d ? d->nitems : 0;
+}
+
+int rewind(GopherDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int find(GopherDoc *d, char[:] needle)
+{
+    GopherItem it = { 0 };
+
+    if (!d || !needle.data)
+        return -1;
+    rewind(d);
+    while (next(d, &it) == 1) {
+        Str name = display_name(&it);
+        int i = 0;
+
+        if (needle.len > name.s.len)
+            continue;
+        for (i = 0; i + needle.len <= name.s.len; i++) {
+            if (memcmp(name.s.data + i, needle.data, (size_t)needle.len) == 0) {
+                *d = *d;                 /* 保持游标位置（命中后停在这里） */
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "gopher：菜单解析" {
+    static const char *menu =
+        "Welcome to the test server\t\terror.host\t1\r\n"
+        "1About\t/about\texample.org\t70\r\n"
+        "0README\t/readme.txt\texample.org\t70\r\n"
+        "7Search\t/search\texample.org\t70\r\n"
+        "9Archive\t/archive.tar\texample.org\t70\r\n"
+        "iIcon\tfake\t(NULL)\t0\r\n"
+        ".\r\n";
+    GopherDoc d = { 0 };
+    GopherItem it = { 0 };
+    Str name = { (char[:]){ 0, 0 } };
+
+    if (d.open(menu, (int)strlen(menu)) != 6)
+        return err(1, "应该识别出 6 个条目（点行不算）");
+    if (d.count() != 6)
+        return err(2, "count() 不对");
+    if (d.next(&it) != 1 || it.type != 'W')
+        return err(3, "第一个条目的类型不对");
+    if (it.selector.s.len != 0 || it.host.s.len != 10)
+        return err(4, "空选择串或主机名不对");
+    if (it.port != 1)
+        return err(5, "port 不对");
+    if (d.next(&it) != 1 || it.type != '1' || it.is_dir() != 1)
+        return err(6, "目录条目不对");
+    if (it.display.s.len != 5 || memcmp(it.display.s.data, "About", 5) != 0)
+        return err(7, "显示名不对");
+    if (it.port != 70 || it.host.s.len != 11)
+        return err(8, "端口或主机不对");
+    if (d.next(&it) != 1 || it.is_text() != 1)
+        return err(9, "文本条目不对");
+    if (d.next(&it) != 1 || strcmp(type_name(it.type), "search") != 0)
+        return err(10, "搜索条目类型名不对");
+    if (d.next(&it) != 1 || it.is_binary() != 1)
+        return err(11, "二进制条目判断不对");
+    if (d.next(&it) != 1 || it.clean_display != 1)
+        return err(12, "信息行需要清显示名");
+    name = display_name(&it);
+    if (name.s.len != 4 || memcmp(name.s.data, "Icon", 4) != 0)
+        return err(13, "清过之后的名字不对");
+    if (d.next(&it) != 0)
+        return err(14, "读完应该返回 0");
+}
+
+test "gopher：查找与残缺行" {
+    static const char *menu =
+        "1About\t/about\texample.org\t70\r\n"
+        "broken line without tabs\r\n"
+        "0README\t/readme.txt\texample.org\t70\r\n";
+    GopherDoc d = { 0 };
+    GopherItem it = { 0 };
+
+    if (d.open(menu, (int)strlen(menu)) != 2)
+        return err(15, "残缺行应该被跳过，剩 2 条");
+    if (d.find(S("README")) != 1)
+        return err(16, "按显示名子串查找失败");
+    if (d.find(S("nope")) != 0)
+        return err(17, "找不到应该 0");
+    d.rewind();
+    if (d.next(&it) != 1 || it.type != '1')
+        return err(18, "rewind 之后第一条不对");
+    if (d.open("", 0) != -1)
+        return err(19, "空输入应该 -1");
+}

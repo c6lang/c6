@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第六十七批（小型文本协议）**：`std.net.irc`（IRC 消息解析/构造）、
+  `std.net.gopher`（Gopher 菜单游标）、`std.net.whois`（WHOIS 字段游标）、
+  `std.net.ident`（RFC 1413 查询/应答），集成示例 `examples/stdnet2.c6`
+  （`make std-proto3`）。错误号段 `std.net.irc`=0x6115 … `std.net.ident`=0x6118
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十六批（老音频格式头）**：`std.data.aiff`（FORM 块 + 80 位扩展浮点
   采样率）、`std.data.au`（Sun `.au` 编码表）、`std.data.voc`（Creative Voice 块遍历）、
   `std.data.ircam`（IRCAM `SF` 浮点采样率），集成示例 `examples/stdlegacy2.c6`
