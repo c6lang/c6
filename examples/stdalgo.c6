@@ -1,0 +1,163 @@
+/* stdalgo：标准库第十八批（graph / lru / trie / region）的拼装示例。
+ *
+ * 和前面几批的示例一样：这个文件没有 `module`（入口 `main` 只能写在模块外的
+ * 文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是「数据结构与算法」这条链路：
+ *
+ *   - graph：任务依赖的拓扑排序 + 带权图的最短路；
+ *   - lru：容量 3 的缓存，看命中/未命中/淘汰；
+ *   - trie：命令前缀树（get / has_prefix / size）；
+ *   - region：地址段集合的合并、包含与找空隙。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdalgo \
+ *         examples/stdalgo.c6 std/core/types.c6 std/container/graph.c6 \
+ *         std/container/lru.c6 std/container/trie.c6 std/container/region.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.container.graph;
+import std.container.lru;
+import std.container.trie;
+import std.container.region;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* 图：拓扑排序 + 最短路 */
+static void tour_graph(void)
+{
+    int head[6] = { 0 }, next[12] = { 0 }, to[12] = { 0 }, w[12] = { 0 };
+    int order[6] = { 0 }, indeg[6] = { 0 }, queue[6] = { 0 };
+    int dist[6] = { 0 }, prev[6] = { 0 }, heap[6] = { 0 }, pos[6] = { 0 };
+    Graph g = { 0 };
+    int i = 0, rank[6] = { 0 };
+
+    graph_init(&g, 5, head, next, to, w, 12);
+    /* 0 -> 1 -> 3 -> 4, 0 -> 2 -> 3：一条构建依赖链 */
+    g.add_edge(0, 1, 1);
+    g.add_edge(0, 2, 1);
+    g.add_edge(1, 3, 1);
+    g.add_edge(2, 3, 1);
+    g.add_edge(3, 4, 1);
+    check(g.toposort(order, indeg, queue, 6) == 1, "graph: 拓扑排序");
+    for (i = 0; i < 5; i++)
+        rank[order[i]] = i;
+    check(rank[0] < rank[1] && rank[1] < rank[3] && rank[3] < rank[4],
+          "graph: 拓扑序满足依赖");
+    printf("graph: 拓扑序 %d %d %d %d %d\n", order[0], order[1], order[2],
+           order[3], order[4]);
+
+    /* 带权最短路：0->1(4), 0->2(1), 2->1(2), 1->3(1), 2->3(5) */
+    {
+        int h2[4] = { 0 }, n2[8] = { 0 }, t2[8] = { 0 }, w2[8] = { 0 };
+        int d2[4] = { 0 }, p2[4] = { 0 }, hp[4] = { 0 }, po[4] = { 0 };
+        Graph g2 = { 0 };
+
+        graph_init(&g2, 4, h2, n2, t2, w2, 8);
+        g2.add_edge(0, 1, 4);
+        g2.add_edge(0, 2, 1);
+        g2.add_edge(2, 1, 2);
+        g2.add_edge(1, 3, 1);
+        g2.add_edge(2, 3, 5);
+        check(g2.dijkstra(0, d2, hp, po, p2) == 1, "graph: dijkstra");
+        check(d2[1] == 3 && d2[2] == 1 && d2[3] == 4, "graph: 最短路距离");
+        check(p2[1] == 2 && p2[3] == 1, "graph: 前驱链");
+        printf("graph: 到 1/2/3 的最短距离 = %d/%d/%d（经 %d,%d）\n", d2[1],
+               d2[2], d2[3], p2[1], p2[3]);
+    }
+}
+
+/* LRU：容量 3 */
+static void tour_lru(void)
+{
+    u64 keys[3] = { 0 };
+    int vals[3] = { 0 }, prev[3] = { 0 }, next[3] = { 0 }, hnext[3] = { 0 };
+    int ht[8] = { 0 };
+    Lru l = { 0 };
+    int v = 0;
+
+    check(lru_init(&l, 3, 8, keys, vals, prev, next, hnext, ht) == 1,
+          "lru: 初始化");
+    l.put(1, 10);
+    l.put(2, 20);
+    l.put(3, 30);
+    check(l.get(1, &v) && v == 10, "lru: 命中 1");
+    check(!l.get(9, &v), "lru: 未命中 9");
+    /* 1 刚被访问过，插入 4 应该淘汰 2 */
+    check(l.put(4, 40) == 1, "lru: 插入 4");
+    check(!l.get(2, &v), "lru: 2 被淘汰");
+    check(l.get(1, &v) && l.get(3, &v) && l.get(4, &v), "lru: 其余还在");
+    printf("lru: size=%d hits=%d misses=%d evicts=%d\n", l.size(), l.hits,
+           l.misses, l.evicts);
+    check(l.size() == 3 && l.hits == 4 && l.misses == 2 && l.evicts == 1,
+          "lru: 统计");
+}
+
+/* trie：命令前缀 */
+static void tour_trie(void)
+{
+    TrieNode pool[64] = { 0 };
+    Trie t = { 0 };
+    const char *cmds[5] = { "git", "git add", "git commit", "go", "gofmt" };
+    int i = 0, v = 0;
+
+    check(trie_init(&t, pool, 64) == 1, "trie: 初始化");
+    for (i = 0; i < 5; i++)
+        t.put(cmds[i], (int)strlen(cmds[i]), i + 1);
+    check(t.size() == 5, "trie: size");
+    check(t.get("git", 3, &v) && v == 1, "trie: git");
+    check(t.get("git commit", 10, &v) && v == 3, "trie: git commit");
+    check(t.has_prefix("git ", 4), "trie: git 前缀");
+    check(!t.has_prefix("gitz", 4), "trie: gitz 不是前缀");
+    printf("trie: %d 个命令、%d 个节点；\"git \" 前缀命中\n", t.size(),
+           t.node_count());
+    check(t.remove("go", 2) && !t.get("go", 2, &v), "trie: 删除 go");
+    check(t.has_prefix("go", 2), "trie: gofmt 还在");
+}
+
+/* region：地址段 */
+static void tour_region(void)
+{
+    i64 lo[8] = { 0 }, hi[8] = { 0 };
+    Region r = { 0 };
+    i64 gap = 0;
+
+    check(region_init(&r, lo, hi, 8) == 1, "region: 初始化");
+    r.add(0x1000, 0x2000);
+    r.add(0x3000, 0x4000);
+    check(r.count_region() == 2 && r.total() == 0x2000, "region: 两段");
+    check(r.contains(0x1000) && !r.contains(0x2000), "region: 半开区间");
+    check(r.overlaps(0x1500, 0x1600) && !r.overlaps(0x2000, 0x3000),
+          "region: 重叠");
+    check(r.find_gap(0x2000, 0x1000, &gap) && gap == 0x2000, "region: 找空隙");
+    /* 桥接两段 */
+    r.add(0x2000, 0x3000);
+    check(r.count_region() == 1 && r.hi[0] == 0x4000, "region: 桥接");
+    printf("region: %d 段、共 0x%llx 字节，空隙在 0x%llx\n", r.count_region(),
+           (unsigned long long)r.total(), (unsigned long long)gap);
+}
+
+int main(void)
+{
+    printf("stdalgo: 标准库第十八批（graph / lru / trie / region）\n");
+    tour_graph();
+    tour_lru();
+    tour_trie();
+    tour_region();
+    printf("stdalgo: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

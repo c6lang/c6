@@ -1,0 +1,316 @@
+/* std/container/trie：字节 trie（前缀树，借用调用方节点池，零分配）。
+ *
+ *     import std.container.trie;
+ *
+ *     TrieNode pool[64] = { 0 };
+ *     Trie t = { 0 };
+ *     trie_init(&t, pool, 64);
+ *     t.put("cart", 4, 1);
+ *     t.put("car", 3, 2);
+ *     int v = 0;
+ *     t.get("car", 3, &v);           // 1, v = 2
+ *     t.has_prefix("ca", 2);         // 1
+ *
+ * 表示：每个节点是「边上的一个字节 + 子节点链（first 头、next 兄弟）」。
+ * 根节点固定是 0 号，键可以是任意字节序列（包括 `\0`，因为长度是显式传的）。
+ * 节点池由调用方给，池满时 `put` 返回 -1（不会写坏已有结构）。
+ *
+ * 约定：
+ *
+ * - `trie_init` 要求 `cap >= 1`（根节点要占一个）；返回 1/0。
+ * - `put`：新键返回 1，覆盖已有键返回 0，池满/参数错返回 -1；`has` 字段标记
+ *   词尾，`value` 是调用方自己解释的 int。
+ * - `get` 命中返回 1 并写 `*out`；`has_prefix` 只判断「有没有以它开头的键」
+ *   （节点只为插入过的键创建，所以路径存在就等价于有词在子树里）。
+ * - `remove` 只清词尾标记、不回收节点（trie 的节点是共享的）；返回 1/0。
+ * - `size` 是不同键的个数；`clear` 把池清空并从根重来。
+ * - 查找是 O(len × 兄弟数)；兄弟链是头插的，分支多的节点会慢一些，够用。
+ */
+#include <string.h>
+
+module std.container.trie;
+import std.core.types;
+
+struct TrieNode {
+    int first;               /* 第一个子节点（槽位），-1 无 */
+    int next;                /* 下一个兄弟 */
+    int value;               /* 词尾的值 */
+    int has;                 /* 1 = 这里是一个键的结尾 */
+    u8 ch;                   /* 从父节点过来的字节 */
+};
+
+struct Trie {
+    TrieNode *nodes;
+    int cap;                 /* 节点池容量 */
+    int used;                /* 已用节点数（0 是根） */
+    int count;               /* 不同键的个数 */
+};
+
+/* 初始化：池至少 1 个节点（根）；返回 1/0 */
+int trie_init(Trie *self, TrieNode *pool, int cap)
+{
+    if (!self || !pool || cap < 1)
+        return 0;
+    memset(self, 0, sizeof *self);
+    self->nodes = pool;
+    self->cap = cap;
+    self->used = 1;
+    self->count = 0;
+    memset(pool, 0, sizeof(TrieNode) * (usize)cap);
+    pool[0].first = -1;
+    pool[0].next = -1;
+    pool[0].has = 0;
+    return 1;
+}
+
+int size(Trie *self) { return self ? self->count : 0; }
+
+int node_count(Trie *self) { return self ? self->used : 0; }
+
+int is_empty(Trie *self) { return !self || self->count == 0; }
+
+static int trie_child(Trie *self, int node, u8 ch)
+{
+    int c = self->nodes[node].first;
+
+    while (c >= 0) {
+        if (self->nodes[c].ch == ch)
+            return c;
+        c = self->nodes[c].next;
+    }
+    return -1;
+}
+
+/* 新建一个挂到 parent 下面的子节点；池满返回 -1 */
+static int trie_new_node(Trie *self, int parent, u8 ch)
+{
+    int n = self->used;
+
+    if (n >= self->cap)
+        return -1;
+    self->nodes[n].first = -1;
+    self->nodes[n].next = self->nodes[parent].first;
+    self->nodes[n].value = 0;
+    self->nodes[n].has = 0;
+    self->nodes[n].ch = ch;
+    self->nodes[parent].first = n;
+    self->used = n + 1;
+    return n;
+}
+
+/* 插入/覆盖：新键 1、覆盖 0、池满/参数错 -1 */
+int put(Trie *self, const void *key, int len, int value)
+{
+    const u8 *k = (const u8 *)key;
+    int node = 0, i = 0;
+
+    if (!self || !self->nodes || self->cap <= 0 || len < 0
+        || (len > 0 && !key))
+        return -1;
+    for (i = 0; i < len; i++) {
+        int c = trie_child(self, node, k[i]);
+
+        if (c < 0) {
+            c = trie_new_node(self, node, k[i]);
+            if (c < 0)
+                return -1;
+        }
+        node = c;
+    }
+    if (!self->nodes[node].has) {
+        self->nodes[node].has = 1;
+        self->nodes[node].value = value;
+        self->count++;
+        return 1;
+    }
+    self->nodes[node].value = value;
+    return 0;
+}
+
+/* 查找：命中 1 并写 *out */
+int get(Trie *self, const void *key, int len, int *out)
+{
+    const u8 *k = (const u8 *)key;
+    int node = 0, i = 0;
+
+    if (!self || !self->nodes || len < 0 || (len > 0 && !key))
+        return 0;
+    for (i = 0; i < len; i++) {
+        node = trie_child(self, node, k[i]);
+        if (node < 0)
+            return 0;
+    }
+    if (!self->nodes[node].has)
+        return 0;
+    if (out)
+        *out = self->nodes[node].value;
+    return 1;
+}
+
+/* 有没有以 key 为前缀的键：1/0 */
+int has_prefix(Trie *self, const void *key, int len)
+{
+    const u8 *k = (const u8 *)key;
+    int node = 0, i = 0;
+
+    if (!self || !self->nodes || len < 0 || (len > 0 && !key))
+        return 0;
+    for (i = 0; i < len; i++) {
+        node = trie_child(self, node, k[i]);
+        if (node < 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* 删除键（只清词尾标记）：1 = 删了，0 = 没有 */
+int remove(Trie *self, const void *key, int len)
+{
+    const u8 *k = (const u8 *)key;
+    int node = 0, i = 0;
+
+    if (!self || !self->nodes || len < 0 || (len > 0 && !key))
+        return 0;
+    for (i = 0; i < len; i++) {
+        node = trie_child(self, node, k[i]);
+        if (node < 0)
+            return 0;
+    }
+    if (!self->nodes[node].has)
+        return 0;
+    self->nodes[node].has = 0;
+    self->count--;
+    return 1;
+}
+
+/* 清空（保留池容量） */
+void clear(Trie *self)
+{
+    if (!self || !self->nodes || self->cap < 1)
+        return;
+    memset(self->nodes, 0, sizeof(TrieNode) * (usize)self->cap);
+    self->nodes[0].first = -1;
+    self->nodes[0].next = -1;
+    self->used = 1;
+    self->count = 0;
+}
+
+/* ---- 自测 ---- */
+
+test "基本插入与查找" {
+    TrieNode pool[64] = { 0 };
+    Trie t = { 0 };
+    int v = 0;
+
+    if (!trie_init(&t, pool, 64))
+        return err(1, "初始化");
+    if (t.put("car", 3, 1) != 1 || t.put("cart", 4, 2) != 1)
+        return err(2, "插入");
+    if (t.size() != 2)
+        return err(3, "size");
+    if (!t.get("car", 3, &v) || v != 1)
+        return err(4, "car");
+    if (!t.get("cart", 4, &v) || v != 2)
+        return err(5, "cart");
+    if (t.get("ca", 2, &v) || t.get("cars", 4, &v) || t.get("", 0, &v))
+        return err(6, "不该命中");
+    /* 覆盖 */
+    if (t.put("car", 3, 9) != 0 || t.size() != 2)
+        return err(7, "覆盖");
+    if (!t.get("car", 3, &v) || v != 9)
+        return err(8, "覆盖后的值");
+    /* 空前缀 / 空键 */
+    if (!t.has_prefix("", 0) || !t.has_prefix("ca", 2))
+        return err(9, "前缀");
+    if (t.has_prefix("cat", 3) || t.has_prefix("carts", 5))
+        return err(10, "不存在的前缀");
+    if (t.put("", 0, 7) != 1 || !t.get("", 0, &v) || v != 7)
+        return err(11, "空键");
+    if (t.size() != 3)
+        return err(12, "空键计入 size");
+}
+
+test "共享前缀、删除与二进制键" {
+    TrieNode pool[128] = { 0 };
+    Trie t = { 0 };
+    const char *words[6] = { "a", "ab", "abc", "abcd", "b", "ba" };
+    int i = 0, v = 0;
+
+    if (!trie_init(&t, pool, 128))
+        return err(13, "初始化");
+    for (i = 0; i < 6; i++) {
+        int n = (int)strlen(words[i]);
+
+        if (t.put(words[i], n, i + 1) != 1)
+            return err(14, "插入共享前缀");
+    }
+    if (t.size() != 6)
+        return err(15, "size");
+    for (i = 0; i < 6; i++) {
+        int n = (int)strlen(words[i]);
+
+        if (!t.get(words[i], n, &v) || v != i + 1)
+            return err(16, "共享前缀查找");
+    }
+    /* 删除中间词：前缀还在 */
+    if (!t.remove("abc", 3) || t.get("abc", 3, &v))
+        return err(17, "删除");
+    if (!t.has_prefix("abc", 3) || !t.get("abcd", 4, &v))
+        return err(18, "删除后前缀仍有效");
+    if (t.size() != 5 || t.remove("abc", 3) != 0)
+        return err(19, "删除计数");
+    /* 二进制键（含 \0） */
+    {
+        const u8 bin1[3] = { 0x00, 0xff, 0x10 };
+        const u8 bin2[3] = { 0x00, 0xff, 0x11 };
+
+        if (t.put(bin1, 3, 100) != 1 || t.put(bin2, 3, 101) != 1)
+            return err(20, "二进制键");
+        if (!t.get(bin1, 3, &v) || v != 100 || !t.get(bin2, 3, &v) || v != 101)
+            return err(21, "二进制查找");
+        if (!t.has_prefix(bin1, 2))
+            return err(22, "二进制前缀");
+    }
+    /* clear 之后从根重来 */
+    t.clear();
+    if (t.size() != 0 || t.node_count() != 1 || t.get("a", 1, &v))
+        return err(23, "clear");
+    if (t.put("z", 1, 1) != 1)
+        return err(24, "clear 后插入");
+}
+
+test "池满与参数" {
+    TrieNode pool[2] = { 0 };
+    Trie t = { 0 };
+    TrieNode one[1] = { 0 };
+    Trie t1 = { 0 };
+    int v = 0;
+
+    /* cap=2：根 + 1 个节点，插入 3 字节的键会中途满 */
+    if (!trie_init(&t, pool, 2))
+        return err(25, "初始化");
+    if (t.put("abc", 3, 1) != -1)
+        return err(26, "池满要 -1");
+    if (t.size() != 0 || t.node_count() != 2)
+        return err(27, "池满后的状态");
+    /* 单节点池只能放空键 */
+    if (!trie_init(&t1, one, 1))
+        return err(28, "单节点初始化");
+    if (t1.put("", 0, 5) != 1 || !t1.get("", 0, &v) || v != 5)
+        return err(29, "单节点的空键");
+    if (t1.put("a", 1, 1) != -1)
+        return err(30, "单节点池满");
+    /* 参数错误 */
+    {
+        Trie bad = { 0 };
+
+        if (trie_init((Trie *)0, pool, 2) || trie_init(&bad, (TrieNode *)0, 2)
+            || trie_init(&bad, pool, 0))
+            return err(31, "非法初始化");
+        if (bad.put("a", 1, 1) != -1 || bad.get("a", 1, &v)
+            || bad.has_prefix("a", 1) || bad.remove("a", 1))
+            return err(32, "未初始化对象");
+        if (t.put((const void *)0, 1, 1) != -1 || t.put("a", -1, 1) != -1)
+            return err(33, "非法键");
+    }
+}

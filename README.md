@@ -198,7 +198,7 @@ std/text/                   文本：字符串视图与缓冲、格式化、UTF-
   std/text/fuzzy.c6         std.text.fuzzy         模糊匹配：lev_distance/lev_distance_max/lev_ratio、damerau_distance（相邻换位算 1）、subsequence_match/subsequence_score、fuzzy_best（did you mean；按码点、256 上限）
   std/text/wrap.c6          std.text.wrap          按显示列折行/缩进/居中：wrap_make/wrap_indented、Wrap 的 count/write/lines、text_indent/text_center；CJK 2 列、超长词按码点硬切、放不下不写半截
 
-std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序
+std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树
   std/container/deque.c6    std.container.deque    环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
   std/container/map.c6      std.container.map      开放寻址哈希表 Map@(K,V) + Entry/Iter：put/get/get_or/set/put_new/remove
   std/container/pqueue.c6   std.container.pqueue   二叉堆 PQueue@T（托管容器）：push/pop/peek/push_pop/heapify/clear、count/capacity/is_empty/is_valid、init/set_cmp/set_max（比较器与 std.container.sort 的 cmp_int/cmp_str 通用）
@@ -208,6 +208,10 @@ std/container/              容器与算法：向量、位集合、跨度、映�
   std/container/bitset.c6   std.container.bitset   借用 u64 缓冲的位集合 Bitset：set/clear/toggle/bit/count/next_set、集合运算
   std/container/list.c6     std.container.list     侵入式双向链表 List/ListNode：push/pop/remove/clear、contains、ListIter
   std/container/ring.c6     std.container.ring     借用调用方数组的固定容量环形队列 Ring：push/pop/peek/at、is_full
+  std/container/graph.c6    std.container.graph    邻接表图（借用调用方数组）：graph_init/add_edge、Graph 的 bfs/dfs/toposort/components/dijkstra（BFS 无权最短路、迭代 DFS、Kahn 拓扑排序、并查集弱连通分量、非负权 Dijkstra + 前驱链）
+  std/container/lru.c6      std.container.lru      LRU 缓存（借用调用方数组，O(1)）：lru_init、Lru 的 get/peek/put/remove/clear/size/capacity/is_empty，命中/未命中/淘汰统计
+  std/container/region.c6   std.container.region   半开区间集合（借用调用方数组）：region_init、Region 的 add（重叠与相邻合并）/contains/overlaps/find_gap/total/count_region/clear
+  std/container/trie.c6     std.container.trie     字节前缀树（调用方节点池）：trie_init、Trie 的 put/get/has_prefix/remove/clear/size/node_count
   std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
   std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 
@@ -289,6 +293,7 @@ make std-pack    # 编译并运行 examples/stdpack.c6（第十四批压缩与�
 make std-conf    # 编译并运行 examples/stdconf.c6（第十五批配置与文档格式模块的拼装示例）
 make std-cli     # 编译并运行 examples/stdcli.c6（第十六批命令行工具基础模块的拼装示例）
 make std-wire    # 编译并运行 examples/stdwire.c6（第十七批网络协议基础模块的拼装示例）
+make std-algo    # 编译并运行 examples/stdalgo.c6（第十八批算法与容器模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

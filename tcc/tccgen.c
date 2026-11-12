@@ -12775,6 +12775,10 @@ static const struct C6ErrStdSlot {
     { "std.net.ws",             C6_ERR_SLOT_STD + 78 },
     { "std.net.dns",            C6_ERR_SLOT_STD + 79 },
     { "std.net.tcp",            C6_ERR_SLOT_STD + 80 },
+    { "std.container.graph",    C6_ERR_SLOT_STD + 81 },
+    { "std.container.lru",      C6_ERR_SLOT_STD + 82 },
+    { "std.container.trie",     C6_ERR_SLOT_STD + 83 },
+    { "std.container.region",   C6_ERR_SLOT_STD + 84 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

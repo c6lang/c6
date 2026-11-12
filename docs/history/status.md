@@ -989,3 +989,23 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`make stdtest`（81 个模块、0 failure）、`make std-wire`（19 条自检全过）、
 `make check-all`。
+
+### 11.30 标准库第十八批（graph / lru / trie / region）
+
+第十八批补的是**数据结构与算法**：图、LRU、前缀树、区间集合。四个模块都只依赖
+`std.core.types`，所有数组/节点池都由调用方给，模块本身不分配：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.container.graph` | 邻接表图的遍历与最短路（`graph_init`/`add_edge`/`bfs`/`dfs`/`toposort`/`components`/`dijkstra`） | 前向星表示（`head`/`next`/`to`/`w` 全由调用方给），`add_edge` O(1)；BFS 无权最短路、DFS 用显式栈（深图不爆栈）、Kahn 拓扑排序有环返回 0、并查集弱连通分量、非负权 Dijkstra + `prev` 回溯链；队列/栈放不下返回 -1 |
+| `std.container.lru` | LRU 缓存（链式哈希表 + 双向链表） | `get`/`put`/`remove` O(1)，`peek` 不动顺序；`put` 满了淘汰尾部；`hits`/`misses`/`evicts` 统计；初始化校验 `htsize` 是 2 的幂且 ≥ 2*cap；未初始化对象的所有入口都安全返回错误 |
+| `std.container.trie` | 字节前缀树（调用方节点池） | 节点是「字节 + 兄弟链」，键可为任意字节序列（含 `\0`）；`put` 池满返回 -1 且不写坏结构；`remove` 只清词尾标记（共享节点不回收）；`has_prefix` 判前缀存在 |
+| `std.container.region` | 半开区间集合（`add`/`contains`/`overlaps`/`find_gap`/`total`） | 始终保持有序、互不重叠；`add` 合并重叠与相邻、失败不改内容；`contains` 二分；`find_gap` 带 `from + len` 溢出保护；i64 坐标允许负数 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.container.graph`=0x6051、
+`std.container.lru`=0x6052、`std.container.trie`=0x6053、`std.container.region`=0x6054；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-algo` 与 `STDALGO_SRCS`（四个模块
+都只依赖 types，stdtest 不需要额外依赖），`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（85 个模块、0 failure）、`make std-algo`（26 条自检全过）、
+`make check-all`。

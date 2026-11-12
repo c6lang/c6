@@ -47,6 +47,16 @@
 
 ### 标准库
 
+- **标准库第十八批（算法与容器）**：`std.container.graph` / `std.container.lru` /
+  `std.container.trie` / `std.container.region` 四个模块，集成示例
+  `examples/stdalgo.c6`（`make std-algo`）。graph 是前向星表示的图算法（BFS 无权
+  最短路、迭代 DFS、Kahn 拓扑排序、并查集连通分量、非负权 Dijkstra + 前驱链）；
+  lru 是链式哈希 + 双向链表的 O(1) 缓存（命中/未命中/淘汰统计）；trie 是任意
+  字节键的前缀树（节点池由调用方给，池满不写坏结构）；region 是自动合并的
+  半开区间集合（包含/重叠/找空隙，带溢出保护）。四个模块都零分配，错误号段
+  `std.container.graph`=0x6051 … `std.container.region`=0x6054（`tcc/tccgen.c` 的
+  `c6_err_std_slots[]` 追加）。
+
 - **标准库第十七批（网络协议基础）**：`std.encoding.sha1` / `std.net.ws` /
   `std.net.dns` / `std.net.tcp` 四个模块，集成示例 `examples/stdwire.c6`
   （`make std-wire`）。sha1 是流式 + 一次性的 SHA-1 / HMAC-SHA1（含 RFC 2202
