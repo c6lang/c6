@@ -1925,6 +1925,42 @@ lrc 24、m3u 24 条）。示例 `examples/stdsubs.c6` 四节（22 条自检，�
 验收：`make stdtest`（229 个模块、0 failure）、`make std-subs`（22 条自检全过）、
 `make check-all`。
 
+### 11.67 标准库第五十五批（netrc / sshconfig / keys / crontab）
+
+第五十五批做「凭据与配置」：`.netrc`、OpenSSH 配置、`authorized_keys` 行与 crontab。
+四种都是「一行一条记录 + 少量缩进/引号」的文本格式，延续上一批的**游标方法**形态：
+
+```c
+SshDoc doc = { 0 };
+SshBlock blk = { 0 };
+Str user = { 0 };
+doc.open(buf, n);
+doc.match(S("web"), &blk);              // 按 Host 模式匹配
+blk.get(buf, n, "user", &user);        // 块内取键（大小写不敏感）
+```
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.netrc` | 凭据文件 | `next` 用「读到下一个 `machine` 关键字就把游标退回该关键字之前」的办法分割条目；`#` 注释在行内也生效（`password pb # 备注`）；`macdef` 正文跳到空行 |
+| `std.data.sshconfig` | SSH 配置 | 关键字匹配要**跳过行首缩进**（`    User deploy`），所以抽了 `ssh_keyword_at` 返回「值从哪开始」；模式匹配支持空格分隔多模式、`!` 排除与 `*`/`?`（`glob_match` 是双指针回溯版本） |
+| `std.data.keys` | 公钥行 | `command="echo hi"` 里的空格不能当分隔，所以词法要跟踪双引号；类型位数按名字给（`ecdsa-*-384` 之类） |
+| `std.data.crontab` | crontab | 定时行与环境变量共用一个文件、但用**两个游标**（`off`/`voff`）；`@reboot` 之类别名整行进 `command` 并置 `alias`；字段不足返回 -1 |
+
+又踩了一次「注释里出现 `*/`」：crontab 文档里写 `*/5 * * * *` 会把块注释提前结束，
+改成反引号包起来的 `*` `/5`。另外 c6 要求「首参是结构体指针的函数必须用方法语法
+调用」，所以 `open` 里想复用 `next` 计数时要注意**定义顺序**（`next` 必须在
+`open` 之前），否则报 `too many arguments to function`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.netrc`=0x60e5、
+`std.data.sshconfig`=0x60e6、`std.data.keys`=0x60e7、`std.data.crontab`=0x60e8；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-creds` 与 `STD_CREDS_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdcreds.c6` 四节（20 条自检，全部方法调用）。
+
+验收：`make stdtest`（233 个模块、0 failure）、`make std-creds`（20 条自检全过）、
+`make check-all`。
+
+
 
 
 

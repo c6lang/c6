@@ -1,0 +1,159 @@
+/* examples/stdcreds.c6 —— 第五十五批（凭据与配置）的集成示例。
+ *
+ *     make std-creds
+ *
+ * 四节：netrc 凭据、ssh config（主机匹配 + 选项）、公钥行、crontab。
+ * 全部用**结构体方法**调用（`doc.open(...)` / `doc.next(&x)` / `doc.match(...)`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.netrc;
+import std.data.sshconfig;
+import std.data.keys;
+import std.data.crontab;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_netrc(void)
+{
+    static const char *src =
+        "machine deploy.example.com\n"
+        "  login ci password s3cret\n"
+        "default login anonymous password anon@\n";
+    NetrcDoc doc = { 0 };
+    NetrcEntry e = { 0 };
+
+    printf("== netrc\n");
+    check(doc.open(src, (int)strlen(src)) == 2, "open 计数");
+    check(doc.count() == 2, "count() 方法");
+    if (doc.find(S("deploy.example.com"), &e) == 1) {
+        printf("   deploy：login=%.*s password=****\n", e.login.s.len,
+               e.login.s.data);
+        check(e.login.s.len == 2 && e.password.s.len == 6, "find 命中字段");
+    } else {
+        check(0, "find 应该命中 deploy");
+    }
+    if (doc.find(S("unknown.host"), &e) == 1)
+        check(e.is_default == 1, "未知主机应该退回 default");
+    else
+        check(0, "应该退回 default");
+    doc.rewind();
+    check(doc.next(&e) == 1 && e.machine.s.len == 18, "rewind 之后 next() 从第一条开始");
+}
+
+static void do_ssh(void)
+{
+    static const char *src =
+        "Host web\n"
+        "    HostName web.example.com\n"
+        "    User deploy\n"
+        "    Port 2222\n"
+        "\n"
+        "Host *\n"
+        "    User fallback\n";
+    SshDoc doc = { 0 };
+    SshBlock blk = { 0 };
+    Str v = { 0 };
+
+    printf("== sshconfig\n");
+    check(doc.open(src, (int)strlen(src)) == 2, "open 计数");
+    check(doc.count() == 2, "count() 方法");
+    if (doc.match(S("web"), &blk) == 1) {
+        printf("   块模式：%.*s\n", blk.patterns.s.len, blk.patterns.s.data);
+        if (blk.get(src, (int)strlen(src), "hostname", &v) == 1)
+            printf("   host=%s user=", "web.example.com");
+        blk.get(src, (int)strlen(src), "user", &v);
+        printf("%.*s\n", v.s.len, v.s.data);
+        check(v.s.len == 6, "web 块的 user");
+    } else {
+        check(0, "match(web) 应该命中第一块");
+    }
+    check(doc.lookup(S("db"), "user", &v) == 1 && v.s.len == 8,
+          "未匹配的主机落到 Host *");
+    check(doc.lookup(S("web"), "port", &v) == 1 && v.s.len == 4, "查 port");
+    check(glob_match(S("*.example.com"), S("web.example.com")) == 1,
+          "glob_match 方法无关的通配函数");
+}
+
+static void do_keys(void)
+{
+    static const char *src =
+        "# CI 的部署公钥\n"
+        "command=\"backup\",no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc ci@build\n"
+        "ssh-rsa AAAAB3NzaC1yc2EAAA dev@laptop\n";
+    KeyDoc doc = { 0 };
+    KeyLine k = { 0 };
+    int n = 0;
+
+    printf("== keys\n");
+    check(doc.open(src, (int)strlen(src)) == 2, "open 计数");
+    while (doc.next(&k) == 1) {
+        printf("   %.*s（%d 位）%.*s\n", k.type.s.len, k.type.s.data, k.bits_hint,
+               k.comment.s.len, k.comment.s.data);
+        n++;
+    }
+    check(n == 2, "逐行读出 2 个公钥");
+    doc.rewind();
+    check(doc.next(&k) == 1 && k.options.s.len == 23, "第 1 行带引号选项");
+    check(k.type.s.len == 11 && k.bits_hint == 256, "第 1 行是 ed25519");
+}
+
+static void do_crontab(void)
+{
+    static const char *src =
+        "# 每日任务\n"
+        "PATH=/usr/local/bin:/usr/bin\n"
+        "0 3 * * * /usr/local/bin/backup\n"
+        "@reboot /usr/local/bin/warmup\n";
+    CrontabDoc doc = { 0 };
+    CronLine line = { 0 };
+    Str path = { 0 };
+    int n = 0;
+
+    printf("== crontab\n");
+    check(doc.open(src, (int)strlen(src)) == 2, "open 计数");
+    check(doc.count() == 2 && doc.var_count() == 1, "count()/var_count()");
+    if (doc.var("PATH", &path) == 1)
+        printf("   PATH=% .*s\n", path.s.len, path.s.data);
+    check(path.s.len == 23, "取 PATH 变量");
+    while (doc.next(&line) == 1) {
+        if (line.alias)
+            printf("   %.*s\n", line.command.s.len, line.command.s.data);
+        else
+            printf("   %.*s %.*s %.*s %.*s %.*s → %.*s\n", line.minute.s.len,
+                   line.minute.s.data, line.hour.s.len, line.hour.s.data,
+                   line.dom.s.len, line.dom.s.data, line.month.s.len,
+                   line.month.s.data, line.dow.s.len, line.dow.s.data,
+                   line.command.s.len, line.command.s.data);
+        n++;
+    }
+    check(n == 2, "逐行读出 2 条定时行");
+    doc.rewind();
+    check(doc.next(&line) == 1 && line.minute.s.len == 1
+          && line.command.s.len == 21, "第 1 条字段");
+}
+
+int main(void)
+{
+    do_netrc();
+    do_ssh();
+    do_keys();
+    do_crontab();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

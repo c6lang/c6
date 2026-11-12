@@ -1,0 +1,274 @@
+/* std/data/keys：`authorized_keys` / `known_hosts` 风格公钥行的解析。
+ *
+ *     import std.data.keys;
+ *
+ *     KeyDoc doc = { 0 };
+ *     KeyLine k = { 0 };
+ *     doc.open(buf, n);                     // 游标：open / next / count
+ *     while (doc.next(&k) == 1)
+ *         // k.type / k.blob / k.comment / k.options
+ *
+ * 一行形如：
+ *
+ *     command="foo",no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... me@host
+ *     ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ... user@host
+ *
+ * 约定：
+ *
+ * - 空行与 `#` 开头的注释行跳过；
+ * - 第一个字段若以 `ssh-`/`ecdsa-`/`sk-` 开头，说明这一行**没有**选项，
+ *   否则第一个字段是逗号分隔的选项、第二个才是类型；
+ * - `comment` 是类型与 blob 之后剩下的全部内容（可以为空）；
+ * - `bits_hint` 按类型名给一个粗略位数（`ssh-ed25519`→256、`ssh-rsa`→0 表示要看
+ *   blob、`ecdsa-*-256`→256…），仅供显示用；
+ * - `KeyDoc` 是游标：`open` 数行、`next` 逐行、`rewind` 复位；
+ * - 不校验 base64、不解析 blob 内部结构、不处理 known_hosts 的主机字段
+ *   （那种行会被当作「选项字段」原样返回）。
+ */
+#include <string.h>
+
+module std.data.keys;
+import std.core.types;
+import std.text.str;
+
+struct KeyLine {
+    Str options;
+    Str type;
+    Str blob;
+    Str comment;
+    int bits_hint;
+};
+
+struct KeyDoc {
+    const char *src;
+    int n;
+    int off;
+    int nkeys;
+};
+
+int key_type_bits(char[:] type)
+{
+    if (type.len == 0 || !type.data)
+        return 0;
+    if (type.len >= 11 && memcmp(type.data, "ssh-ed25519", 11) == 0)
+        return 256;
+    if (type.len >= 7 && memcmp(type.data, "ssh-rsa", 7) == 0)
+        return 0;                       /* RSA 的位数在 blob 里 */
+    if (type.len >= 7 && memcmp(type.data, "ssh-dss", 7) == 0)
+        return 1024;
+    if (type.len >= 5 && memcmp(type.data, "ecdsa", 5) == 0) {
+        int i = 0;
+
+        for (i = 0; i + 3 <= type.len; i++) {
+            if (memcmp(type.data + i, "256", 3) == 0)
+                return 256;
+            if (memcmp(type.data + i, "384", 3) == 0)
+                return 384;
+            if (memcmp(type.data + i, "521", 3) == 0)
+                return 521;
+        }
+        return 0;
+    }
+    if (type.len >= 2 && memcmp(type.data, "sk", 2) == 0)
+        return 256;
+    return 0;
+}
+
+static int key_is_type_token(Str w)
+{
+    if (w.s.len >= 4 && memcmp(w.s.data, "ssh-", 4) == 0)
+        return 1;
+    if (w.s.len >= 6 && memcmp(w.s.data, "ecdsa-", 6) == 0)
+        return 1;
+    if (w.s.len >= 3 && memcmp(w.s.data, "sk-", 3) == 0)
+        return 1;
+    return 0;
+}
+
+/* 读一行（去掉行尾 CR），返回 0 表示结束 */
+static int key_line(const char *p, int n, int *pos, int *start, int *len)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *len = i - *start;
+    if (*len > 0 && p[*start + *len - 1] == '\r')
+        (*len)--;
+    if (i < n)
+        i++;
+    *pos = i;
+    return 1;
+}
+
+/* 从 pos 起跳一个词（双引号里的空白不算分隔）；返回 1 有词 */
+static int key_word(const char *p, int end, int *pos, Str *out)
+{
+    int i = *pos, start = 0, quoted = 0;
+
+    while (i < end && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    if (i >= end)
+        return 0;
+    start = i;
+    while (i < end) {
+        if (p[i] == '"') {
+            quoted = !quoted;
+            i++;
+            continue;
+        }
+        if (!quoted && (p[i] == ' ' || p[i] == '\t'))
+            break;
+        i++;
+    }
+    out->s = (char[:]){ (char *)p + start, i - start };
+    *pos = i;
+    return 1;
+}
+
+int next(KeyDoc *d, KeyLine *out)
+{
+    const char *p = 0;
+    int pos = 0, start = 0, len = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    pos = d->off;
+    while (key_line(p, d->n, &pos, &start, &len)) {
+        int i = start, end = start + len;
+        Str w = { 0 };
+
+        memset(out, 0, sizeof *out);
+        while (i < end && (p[i] == ' ' || p[i] == '\t'))
+            i++;
+        if (i >= end)
+            continue;                   /* 空行 */
+        if (p[i] == '#')
+            continue;                   /* 注释 */
+        if (key_word(p, end, &i, &w) != 1)
+            continue;
+        if (key_is_type_token(w) == 1) {
+            out->type = w;
+        } else {
+            out->options = w;
+            if (key_word(p, end, &i, &w) != 1)
+                return -1;
+            out->type = w;
+        }
+        if (key_word(p, end, &i, &w) != 1)
+            return -1;
+        out->blob = w;
+        /* 注释：剩下的全部（去掉两端空白） */
+        while (i < end && (p[i] == ' ' || p[i] == '\t'))
+            i++;
+        out->comment.s = (char[:]){ (char *)p + i, end - i };
+        out->bits_hint = key_type_bits((char[:]){ out->type.s.data,
+                                                 out->type.s.len });
+        d->off = pos;
+        return 1;
+    }
+    d->off = pos;
+    return 0;
+}
+
+int count(KeyDoc *d)
+{
+    return d ? d->nkeys : 0;
+}
+
+int rewind(KeyDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int open(KeyDoc *d, const void *src, int n)
+{
+    KeyLine k = { 0 };
+    int count = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    {
+        KeyDoc tmp = { 0 };
+
+        tmp.src = d->src;
+        tmp.n = n;
+        while (next(&tmp, &k) == 1)
+            count++;
+    }
+    d->nkeys = count;
+    d->off = 0;
+    return count;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "keys：类型位数" {
+    if (key_type_bits(S("ssh-ed25519")) != 256)
+        return err(1, "ed25519 应该是 256 位");
+    if (key_type_bits(S("ssh-rsa")) != 0)
+        return err(2, "RSA 位数应该留给 blob");
+    if (key_type_bits(S("ecdsa-sha2-nistp384")) != 384)
+        return err(3, "ecdsa 384 不对");
+    if (key_type_bits(S("ecdsa-sha2-nistp521")) != 521)
+        return err(4, "ecdsa 521 不对");
+    if (key_type_bits(S("sk-ssh-ed25519@openssh.com")) != 256)
+        return err(5, "sk 类型应该是 256");
+    if (key_type_bits(S("unknown")) != 0)
+        return err(6, "未知类型应该是 0");
+}
+
+test "keys：公钥行与游标" {
+    static const char *src =
+        "# 注释行\n"
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc me@host\n"
+        "\n"
+        "command=\"echo hi\",no-pty ssh-rsa AAAAB3NzaC1yc2EAAA deploy@ci\n"
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNh no-comment\n";
+    KeyDoc d = { 0 };
+    KeyLine k = { 0 };
+    int n = 0;
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(7, "应该有 3 个公钥");
+    if (d.count() != 3)
+        return err(8, "count() 不对");
+    if (d.next(&k) != 1)
+        return err(9, "第 1 行读不到");
+    if (k.options.s.len != 0)
+        return err(10, "第 1 行不该有选项");
+    if (k.type.s.len != 11 || memcmp(k.type.s.data, "ssh-ed25519", 11) != 0)
+        return err(11, "第 1 行类型不对");
+    if (k.blob.s.len != 28)
+        return err(12, "第 1 行 blob 长度不对");
+    if (k.comment.s.len != 7 || memcmp(k.comment.s.data, "me@host", 7) != 0)
+        return err(13, "第 1 行注释不对");
+    if (k.bits_hint != 256)
+        return err(14, "第 1 行位数提示不对");
+    if (d.next(&k) != 1 || k.options.s.len != 24)
+        return err(15, "第 2 行的选项长度不对");
+    if (k.type.s.len != 7 || memcmp(k.type.s.data, "ssh-rsa", 7) != 0)
+        return err(16, "第 2 行类型不对");
+    if (d.next(&k) != 1 || k.comment.s.len != 10)
+        return err(17, "第 3 行注释不对");
+    if (d.next(&k) != 0)
+        return err(18, "读完应该返回 0");
+    d.rewind();
+    n = 0;
+    while (d.next(&k) == 1)
+        n++;
+    if (n != 3)
+        return err(19, "rewind 之后应该又能读出 3 行");
+}

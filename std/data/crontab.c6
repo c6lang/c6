@@ -1,0 +1,357 @@
+/* std/data/crontab：crontab 文件的解析（定时行与环境变量）。
+ *
+ *     import std.data.crontab;
+ *
+ *     CrontabDoc doc = { 0 };
+ *     CronLine line = { 0 };
+ *     CronVar v = { 0 };
+ *     doc.open(buf, n);                     // 游标：open / next / count
+ *     while (doc.next(&line) == 1)
+ *         // line.minute / line.hour / line.dom / line.month / line.dow / line.command
+ *
+ * crontab 一行五段式：
+ *
+ *     分 时 日 月 周  命令
+ *     `*` `/5` `*` `*` `*`  /usr/bin/backup --fast   （即每 5 分钟）
+ *
+ * 另外还有两类行：`# 注释` 与 `NAME=value` 的环境变量（变量可以插到命令里）。
+ *
+ * 约定：
+ *
+ * - `CrontabDoc` 是游标：`open` 同时数定时行与环境变量，`next` 只走定时行；
+ * - `next_var` 走环境变量（独立游标，互不影响），`var(name, &value)` 按名字取；
+ * - 五段字段是原样字符串视图（**不**校验取值），命令取到行尾（去掉两端空白）；
+ * - `@reboot`/`@daily` 这类别名整行当作 `command`，五个字段为空串（`alias` 置 1）；
+ * - `#` 只在一行开头算注释（`VAR=value # 这是值的一部分`）；
+ * - 不展开 `%` 的特殊含义、不处理 `CRON_TZ`。
+ */
+#include <string.h>
+
+module std.data.crontab;
+import std.core.types;
+import std.text.str;
+
+struct CronLine {
+    Str minute;
+    Str hour;
+    Str dom;
+    Str month;
+    Str dow;
+    Str command;
+    int alias;
+};
+
+struct CronVar {
+    Str name;
+    Str value;
+};
+
+struct CrontabDoc {
+    const char *src;
+    int n;
+    int off;
+    int voff;
+    int nlines;
+    int nvars;
+};
+
+static int cron_lineat(const char *p, int n, int *pos, int *start, int *len)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *len = i - *start;
+    if (*len > 0 && p[*start + *len - 1] == '\r')
+        (*len)--;
+    if (i < n)
+        i++;
+    *pos = i;
+    return 1;
+}
+
+static int cron_word(const char *p, int end, int *pos, Str *out)
+{
+    int i = *pos, start = 0;
+
+    while (i < end && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    if (i >= end)
+        return 0;
+    start = i;
+    while (i < end && p[i] != ' ' && p[i] != '\t')
+        i++;
+    out->s = (char[:]){ (char *)p + start, i - start };
+    *pos = i;
+    return 1;
+}
+
+int open(CrontabDoc *d, const void *src, int n)
+{
+    const char *p = (const char *)src;
+    int pos = 0, start = 0, len = 0, lines = 0, vars = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = p;
+    d->n = n;
+    while (cron_lineat(p, n, &pos, &start, &len)) {
+        const char *l = p + start;
+        int i = 0;
+
+        while (i < len && (l[i] == ' ' || l[i] == '\t'))
+            i++;
+        if (i >= len)
+            continue;                   /* 空行 */
+        if (l[i] == '#')
+            continue;                   /* 注释 */
+        if (l[i] == '@') {
+            lines++;
+            continue;
+        }
+        /* 形如 NAME=value 的是环境变量 */
+        {
+            int k = i, eq = -1;
+
+            for (; k < len; k++) {
+                if (l[k] == '=')
+                    eq = k;
+                if (l[k] == ' ' || l[k] == '\t')
+                    break;
+            }
+            if (eq > i) {
+                vars++;
+                continue;
+            }
+        }
+        lines++;
+    }
+    d->nlines = lines;
+    d->nvars = vars;
+    d->off = 0;
+    d->voff = 0;
+    return lines;
+}
+
+int next(CrontabDoc *d, CronLine *out)
+{
+    const char *p = 0;
+    int pos = 0, start = 0, len = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    pos = d->off;
+    while (cron_lineat(p, d->n, &pos, &start, &len)) {
+        const char *l = p + start;
+        int i = start, end = start + len, k = 0;
+        Str w[5] = { { (char[:]){ 0, 0 } }, { (char[:]){ 0, 0 } },
+                     { (char[:]){ 0, 0 } }, { (char[:]){ 0, 0 } },
+                     { (char[:]){ 0, 0 } } };
+
+        while (i < end && (p[i] == ' ' || p[i] == '\t'))
+            i++;
+        if (i >= end || p[i] == '#')
+            continue;
+        memset(out, 0, sizeof *out);
+        if (p[i] == '@') {
+            out->alias = 1;
+            out->command.s = (char[:]){ (char *)p + i, end - i };
+            d->off = pos;
+            return 1;
+        }
+        /* 先看是不是 NAME=value */
+        {
+            int e = i, eq = -1;
+
+            for (; e < end; e++) {
+                if (p[e] == '=')
+                    eq = e;
+                if (p[e] == ' ' || p[e] == '\t')
+                    break;
+            }
+            if (eq > i)
+                continue;               /* 环境变量行，跳过 */
+        }
+        for (k = 1; k <= 5; k++) {
+            if (cron_word(p, end, &i, &w[k - 1]) != 1)
+                return -1;
+        }
+        out->minute = w[0];
+        out->hour = w[1];
+        out->dom = w[2];
+        out->month = w[3];
+        out->dow = w[4];
+        while (i < end && (p[i] == ' ' || p[i] == '\t'))
+            i++;
+        out->command.s = (char[:]){ (char *)p + i, end - i };
+        d->off = pos;
+        return 1;
+    }
+    d->off = pos;
+    return 0;
+}
+
+int count(CrontabDoc *d)
+{
+    return d ? d->nlines : 0;
+}
+
+int var_count(CrontabDoc *d)
+{
+    return d ? d->nvars : 0;
+}
+
+int rewind(CrontabDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int next_var(CrontabDoc *d, CronVar *out)
+{
+    const char *p = 0;
+    int pos = 0, start = 0, len = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    pos = d->voff;
+    while (cron_lineat(p, d->n, &pos, &start, &len)) {
+        const char *l = p + start;
+        int i = start, end = start + len, eq = -1, k = 0;
+
+        while (i < end && (l[i - start] == ' ' || l[i - start] == '\t'))
+            i++;
+        if (i >= end || p[i] == '#')
+            continue;
+        for (k = i; k < end; k++) {
+            if (p[k] == '=')
+                eq = k;
+            if (p[k] == ' ' || p[k] == '\t')
+                break;
+        }
+        if (eq <= i)
+            continue;
+        out->name.s = (char[:]){ (char *)p + i, eq - i };
+        {
+            int v = eq + 1, vend = end;
+
+            while (v < vend && (p[v] == ' ' || p[v] == '\t'))
+                v++;
+            while (vend > v && (p[vend - 1] == ' ' || p[vend - 1] == '\t'))
+                vend--;
+            out->value.s = (char[:]){ (char *)p + v, vend - v };
+        }
+        d->voff = pos;
+        return 1;
+    }
+    d->voff = pos;
+    return 0;
+}
+
+int var(CrontabDoc *d, const char *name, Str *value)
+{
+    CronVar v = { 0 };
+    int nlen = 0;
+
+    if (!d || !name || !value)
+        return -1;
+    nlen = (int)strlen(name);
+    d->voff = 0;
+    while (next_var(d, &v) == 1) {
+        if (v.name.s.len == nlen
+            && memcmp(v.name.s.data, name, (size_t)nlen) == 0) {
+            *value = v.value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "crontab：定时行与游标" {
+    static const char *src =
+        "# 备份任务\n"
+        "MAILTO=\"ops@example.com\"\n"
+        "SHELL=/bin/bash\n"
+        "*/5 * * * * /usr/bin/backup --fast\n"
+        "30 3 1 * *  /usr/bin/rotate weekly\n"
+        "\n"
+        "@reboot /usr/bin/warmup\n";
+    CrontabDoc d = { 0 };
+    CronLine line = { 0 };
+    CronVar v = { 0 };
+    Str val = { 0 };
+    int n = 0;
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(1, "应该有 3 条定时行（含 @reboot）");
+    if (d.count() != 3 || d.var_count() != 2)
+        return err(2, "count()/var_count() 不对");
+    if (d.next(&line) != 1)
+        return err(3, "第 1 条读不到");
+    if (line.minute.s.len != 3 || memcmp(line.minute.s.data, "*/5", 3) != 0)
+        return err(4, "第 1 条的分钟字段不对");
+    if (line.hour.s.len != 1 || line.dow.s.len != 1)
+        return err(5, "第 1 条的其它字段不对");
+    if (line.command.s.len != 22)
+        return err(6, "第 1 条的命令长度不对");
+    if (d.next(&line) != 1 || line.minute.s.len != 2)
+        return err(7, "第 2 条不对");
+    if (line.command.s.len != 22)
+        return err(8, "第 2 条的命令长度不对");
+    if (d.next(&line) != 1 || line.alias != 1)
+        return err(9, "第 3 条应该是 @reboot 别名");
+    if (line.command.s.len != 23
+        || memcmp(line.command.s.data, "@reboot", 7) != 0)
+        return err(10, "第 3 条的命令不对");
+    if (d.next(&line) != 0)
+        return err(11, "读完应该返回 0");
+    /* 环境变量独立游标 */
+    if (d.next_var(&v) != 1 || v.name.s.len != 6
+        || memcmp(v.name.s.data, "MAILTO", 6) != 0)
+        return err(12, "第一个变量应该是 MAILTO");
+    if (v.value.s.len != 17)
+        return err(13, "MAILTO 的值应该是带引号的地址");
+    if (d.var("SHELL", &val) != 1 || val.s.len != 9
+        || memcmp(val.s.data, "/bin/bash", 9) != 0)
+        return err(14, "取 SHELL 不对");
+    if (d.var("PATH", &val) != 0)
+        return err(15, "不存在的变量应该 0");
+    n = 0;
+    d.rewind();
+    while (d.next(&line) == 1)
+        n++;
+    if (n != 3)
+        return err(16, "rewind 之后应该又能读出 3 条");
+}
+
+test "crontab：边界" {
+    static const char *src =
+        "   # 缩进的注释\n"
+        "\n"
+        "0 0 * * * /bin/true\n"
+        "BAD LINE WITHOUT FIELDS\n";
+    CrontabDoc d = { 0 };
+    CronLine line = { 0 };
+
+    if (d.open(src, (int)strlen(src)) != 2)
+        return err(17, "应该有 2 条定时行");
+    if (d.next(&line) != 1 || line.minute.s.len != 1)
+        return err(18, "第 1 条不对");
+    /* 字段不足的行应当返回 -1（坏数据） */
+    if (d.next(&line) != -1)
+        return err(19, "字段不足应该 -1");
+    if (d.open("", 0) != -1)
+        return err(20, "空输入应该在 open 时就被拒（返回 -1）");
+}

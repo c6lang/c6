@@ -1,0 +1,323 @@
+/* std/data/netrc：`.netrc`（ftp/curl 用的凭据文件）的解析。
+ *
+ *     import std.data.netrc;
+ *
+ *     NetrcDoc doc = { 0 };
+ *     NetrcEntry e = { 0 };
+ *     doc.open(buf, n);                       // 游标方法：open / next / count / find
+ *     while (doc.next(&e) == 1)
+ *         // e.machine / e.login / e.password
+ *     doc.find(S("mail.example.com"), &e);    // 精确匹配，找不到退回 default
+ *
+ * 语法：一行一条 `machine <name>` 或 `default`，后面跟 `login`/`password`/`account`
+ * 等键值对；键与值之间用空白分隔，`#` 开头到行尾是注释；`macdef <name>` 后面的
+ * 若干行是宏定义正文，直到**空行**为止，正文内容整体跳过。
+ *
+ * 约定：
+ *
+ * - `NetrcDoc` 是游标：`open` 数条目，`next` 逐条返回，`rewind` 复位；
+ * - `find(doc, machine)` 先找 `machine` 完全相同的条目，找不到再找 `default`，
+ *   都没有返回 0；
+ * - 所有字段都是原缓冲区视图；缺失的字段长度为 0；
+ * - 不展开 `~`、不做权限检查、不处理 `macdef` 的内容（只跳过）；
+ * - 允许多个条目之间没有空行，也允许缩进。
+ */
+#include <string.h>
+
+module std.data.netrc;
+import std.core.types;
+import std.text.str;
+
+struct NetrcEntry {
+    Str machine;
+    Str login;
+    Str password;
+    Str account;
+    int is_default;
+    int start_off;
+};
+
+struct NetrcDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+};
+
+static int netrc_word(const char *p, int n, int *pos, Str *out)
+{
+    int i = *pos, start = 0;
+
+    while (i < n && (p[i] == ' ' || p[i] == '\t' || p[i] == '\r'
+                     || p[i] == '\n'))
+        i++;
+    if (i >= n)
+        return 0;
+    if (p[i] == '#') {                  /* 注释到行尾 */
+        while (i < n && p[i] != '\n')
+            i++;
+        *pos = i;
+        return 2;
+    }
+    start = i;
+    while (i < n && p[i] != ' ' && p[i] != '\t' && p[i] != '\r'
+           && p[i] != '\n') {
+        /* 遇到注释符就截断（`machine host # 备注`） */
+        if (p[i] == '#') {
+            int end = start;
+
+            while (end > start && (p[end - 1] == ' ' || p[end - 1] == '\t'))
+                end--;
+            out->s = (char[:]){ (char *)p + start, end - start };
+            while (i < n && p[i] != '\n')
+                i++;
+            *pos = i;
+            return 1;
+        }
+        i++;
+    }
+    out->s = (char[:]){ (char *)p + start, i - start };
+    *pos = i;
+    return 1;
+}
+
+static int netrc_eq(Str a, const char *lit)
+{
+    int n = (int)strlen(lit);
+
+    if (a.s.len != n)
+        return 0;
+    return memcmp(a.s.data, lit, (size_t)n) == 0;
+}
+
+static void netrc_skip_macdef(const char *p, int n, int *pos)
+{
+    int i = *pos;
+
+    /* 跳到行尾（宏名之后） */
+    while (i < n && p[i] != '\n')
+        i++;
+    if (i < n)
+        i++;
+    /* 正文到空行为止 */
+    while (i < n) {
+        int start = i, blank = 1;
+
+        while (i < n && p[i] != '\n') {
+            if (p[i] != ' ' && p[i] != '\t' && p[i] != '\r')
+                blank = 0;
+            i++;
+        }
+        if (i < n)
+            i++;
+        if (blank && i > start)
+            break;
+    }
+    *pos = i;
+}
+
+int next(NetrcDoc *d, NetrcEntry *out)
+{
+    const char *p = 0;
+    int pos = 0;
+    Str w = { 0 };
+    int have_entry = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    pos = d->off;
+    memset(out, 0, sizeof *out);
+    for (;;) {
+        int before = pos;
+        int r = netrc_word(p, d->n, &pos, &w);
+
+        if (r == 0) {
+            d->off = pos;
+            return have_entry ? 1 : 0;
+        }
+        if (r == 2)
+            continue;
+        if (netrc_eq(w, "machine") || netrc_eq(w, "default")) {
+            if (have_entry) {
+                d->off = before;        /* 下一条从这里重新读 */
+                return 1;
+            }
+            have_entry = 1;
+            out->start_off = before;
+            out->is_default = netrc_eq(w, "default");
+            if (!out->is_default) {
+                if (netrc_word(p, d->n, &pos, &w) != 1)
+                    return -1;
+                out->machine = w;
+            }
+            continue;
+        }
+        if (netrc_eq(w, "login")) {
+            if (!have_entry)
+                return -1;
+            if (netrc_word(p, d->n, &pos, &w) == 1)
+                out->login = w;
+            continue;
+        }
+        if (netrc_eq(w, "password")) {
+            if (!have_entry)
+                return -1;
+            if (netrc_word(p, d->n, &pos, &w) == 1)
+                out->password = w;
+            continue;
+        }
+        if (netrc_eq(w, "account")) {
+            if (!have_entry)
+                return -1;
+            if (netrc_word(p, d->n, &pos, &w) == 1)
+                out->account = w;
+            continue;
+        }
+        if (netrc_eq(w, "macdef")) {
+            netrc_skip_macdef(p, d->n, &pos);
+            continue;
+        }
+        /* 其它未知键：跳过它的值 */
+        netrc_word(p, d->n, &pos, &w);
+    }
+}
+
+int count(NetrcDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int rewind(NetrcDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int find(NetrcDoc *d, char[:] machine, NetrcEntry *out)
+{
+    NetrcEntry e = { 0 };
+    NetrcEntry def = { 0 };
+    int have_def = 0;
+
+    if (!d || !out || !machine.data)
+        return -1;
+    rewind(d);
+    while (next(d, &e) == 1) {
+        if (e.is_default) {
+            def = e;
+            have_def = 1;
+            continue;
+        }
+        if (e.machine.s.len == machine.len
+            && memcmp(e.machine.s.data, machine.data, (size_t)machine.len) == 0) {
+            *out = e;
+            return 1;
+        }
+    }
+    if (have_def) {
+        *out = def;
+        return 1;
+    }
+    return 0;
+}
+
+int open(NetrcDoc *d, const void *src, int n)
+{
+    NetrcEntry e = { 0 };
+    int off = 0, count = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    /* 先数一遍（next 会改游标，所以用临时结构） */
+    {
+        NetrcDoc tmp = { 0 };
+
+        tmp.src = d->src;
+        tmp.n = n;
+        while (next(&tmp, &e) == 1)
+            count++;
+    }
+    d->nentries = count;
+    d->off = 0;
+    return count;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "netrc：条目与游标" {
+    static const char *src =
+        "# 凭据文件\n"
+        "machine mail.example.com\n"
+        "login me@example.com password s3cret\n"
+        "machine ftp.example.com login anonymous password guest\n"
+        "default login anonymous password user@site\n";
+    NetrcDoc d = { 0 };
+    NetrcEntry e = { 0 };
+    int n = 0;
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(1, "应该有 3 个条目（含 default）");
+    if (d.count() != 3)
+        return err(2, "count() 不对");
+    if (d.next(&e) != 1)
+        return err(3, "第 1 条读不到");
+    if (e.machine.s.len != 16
+        || memcmp(e.machine.s.data, "mail.example.com", 16) != 0)
+        return err(4, "第 1 条的 machine 不对");
+    if (e.login.s.len != 14 || e.password.s.len != 6)
+        return err(5, "第 1 条的 login/password 不对");
+    if (d.next(&e) != 1 || e.machine.s.len != 15)
+        return err(6, "第 2 条不对");
+    if (d.next(&e) != 1 || e.is_default != 1)
+        return err(7, "第 3 条应该是 default");
+    if (d.next(&e) != 0)
+        return err(8, "读完应该返回 0");
+    n = 0;
+    d.rewind();
+    while (d.next(&e) == 1)
+        n++;
+    if (n != 3)
+        return err(9, "rewind 之后应该又能读出 3 条");
+}
+
+test "netrc：查找、注释与 macdef" {
+    static const char *src =
+        "machine a.example.com login alice password pa\n"
+        "machine b.example.com login bob password pb # 行尾注释\n"
+        "macdef init\n"
+        "  cd /pub\n"
+        "  binary\n"
+        "\n"
+        "default login anon password anon@\n";
+    NetrcDoc d = { 0 };
+    NetrcEntry e = { 0 };
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(10, "应该有 3 个条目（macdef 不算）");
+    if (d.find(S("b.example.com"), &e) != 1 || e.login.s.len != 3
+        || memcmp(e.login.s.data, "bob", 3) != 0)
+        return err(11, "查 b.example.com 不对");
+    if (e.password.s.len != 2 || memcmp(e.password.s.data, "pb", 2) != 0)
+        return err(12, "行尾注释应该被去掉");
+    if (d.find(S("nope.example.com"), &e) != 1 || e.is_default != 1)
+        return err(13, "找不到时应该退回 default");
+    if (e.login.s.len != 4 || memcmp(e.login.s.data, "anon", 4) != 0)
+        return err(14, "default 的 login 不对");
+    /* 没有 default 的情况 */
+    {
+        static const char *only = "machine x login u password p\n";
+
+        if (d.open(only, (int)strlen(only)) != 1)
+            return err(15, "单条文件应该有 1 个条目");
+        if (d.find(S("y"), &e) != 0)
+            return err(16, "没有 default 时找不到应该返回 0");
+    }
+}

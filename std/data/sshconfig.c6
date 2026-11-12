@@ -1,0 +1,385 @@
+/* std/data/sshconfig：OpenSSH `~/.ssh/config` 的解析、主机匹配与选项取值。
+ *
+ *     import std.data.sshconfig;
+ *
+ *     SshDoc doc = { 0 };
+ *     SshBlock blk = { 0 };
+ *     Str user = { 0 };
+ *     doc.open(buf, n);                       // 游标：open / next / count / match
+ *     if (doc.lookup(S("web.example.com"), "user", &user) == 1)
+ *         // user.s → "deploy"
+ *
+ * 配置是「`Host` 行 + 若干 `键 值` 行」的分块结构：
+ *
+ *     Host web *.internal
+ *         HostName web.example.com
+ *         User deploy
+ *         Port 2222
+ *
+ * 约定：
+ *
+ * - `SshDoc` 是游标：`open` 数块数，`next` 逐块返回（`patterns` 是 `Host` 后那一整
+ *   行，`off`/`len` 是块正文范围），`rewind` 复位；
+ * - `doc.match(host, &blk)` 按 OpenSSH 的规则找**第一个**匹配的块：`patterns` 里
+ *   空格分隔的每个模式用 `*`/`?` 通配，`!` 前缀是排除（命中排除即视为不匹配）；
+ *   支持 `Host *` 兜底块；
+ * - `blk.get(src, n, "user", &value)` 在该块里按**大小写不敏感**找第一个键，值取
+ *   到行尾（去掉行尾注释与两端空白）；
+ * - `doc.lookup(host, key, &value)` = `match` + `get` 一步到位，找不到返回 0；
+ * - 所有 `Str` 都是原缓冲区视图；`Include`、`Match`、`Hostname` 的通配展开都不处理
+ *   （`Include` 只当普通键保存，不递归读文件）。
+ */
+#include <string.h>
+
+module std.data.sshconfig;
+import std.core.types;
+import std.text.str;
+
+struct SshBlock {
+    Str patterns;
+    int off;
+    int len;
+    int index;
+};
+
+struct SshDoc {
+    const char *src;
+    int n;
+    int off;
+    int nblocks;
+};
+
+static int ssh_lowerc(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A' + 'a';
+    return c;
+}
+
+/* 一行：返回 1 有内容，0 结束；*start/*len 去掉了行尾 CR，*kwlen 是第一个词长 */
+static int ssh_line(const char *p, int n, int *pos, int *start, int *len)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *len = i - *start;
+    if (*len > 0 && p[*start + *len - 1] == '\r')
+        (*len)--;
+    if (i < n)
+        i++;
+    *pos = i;
+    return 1;
+}
+
+static int ssh_is_blank(const char *p, int start, int len)
+{
+    int i = 0;
+
+    for (i = start; i < start + len; i++) {
+        if (p[i] != ' ' && p[i] != '\t')
+            return 0;
+    }
+    return 1;
+}
+
+/* 行内找关键字：命中返回「关键字之后」的位置（值从这里开始），否则 -1。
+ * 允许行首缩进，关键字与值之间必须是空白。 */
+static int ssh_keyword_at(const char *p, int start, int len, const char *kw)
+{
+    int klen = (int)strlen(kw);
+    int i = 0, s = start;
+
+    while (s < start + len && (p[s] == ' ' || p[s] == '\t'))
+        s++;
+    if (start + len - s < klen)
+        return -1;
+    for (i = 0; i < klen; i++) {
+        if (ssh_lowerc(p[s + i]) != ssh_lowerc(kw[i]))
+            return -1;
+    }
+    if (s + klen < start + len && p[s + klen] != ' ' && p[s + klen] != '\t')
+        return -1;
+    return s + klen;
+}
+
+/* `*` `?` 通配匹配（不区分大小写） */
+int glob_match(char[:] pattern, char[:] host)
+{
+    int pi = 0, hi = 0, star = -1, mark = 0;
+
+    if (!pattern.data || !host.data)
+        return 0;
+    while (hi < host.len) {
+        if (pi < pattern.len
+            && (pattern.data[pi] == '?'
+                || ssh_lowerc(pattern.data[pi]) == ssh_lowerc(host.data[hi]))) {
+            pi++;
+            hi++;
+        } else if (pi < pattern.len && pattern.data[pi] == '*') {
+            star = pi++;
+            mark = hi;
+        } else if (star >= 0) {
+            pi = star + 1;
+            hi = ++mark;
+        } else {
+            return 0;
+        }
+    }
+    while (pi < pattern.len && pattern.data[pi] == '*')
+        pi++;
+    return pi == pattern.len ? 1 : 0;
+}
+
+int open(SshDoc *d, const void *src, int n)
+{
+    const char *p = (const char *)src;
+    int pos = 0, start = 0, len = 0, blocks = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = p;
+    d->n = n;
+    while (ssh_line(p, n, &pos, &start, &len)) {
+        if (ssh_is_blank(p, start, len))
+            continue;
+        if (ssh_keyword_at(p, start, len, "host") > 0)
+            blocks++;
+    }
+    d->nblocks = blocks;
+    d->off = 0;
+    return blocks;
+}
+
+int next(SshDoc *d, SshBlock *out)
+{
+    const char *p = 0;
+    int pos = 0, start = 0, len = 0;
+    int have = 0, body_start = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    pos = d->off;
+    memset(out, 0, sizeof *out);
+    while (ssh_line(p, d->n, &pos, &start, &len)) {
+        if (ssh_is_blank(p, start, len))
+            continue;
+        if (ssh_keyword_at(p, start, len, "host") > 0) {
+            if (have) {
+                out->len = start - body_start;
+                d->off = start;         /* 下一块从这一行开始 */
+                return 1;
+            }
+            have = 1;
+            out->index = 0;
+            {
+                int k = start + 4;
+
+                while (k < start + len && (p[k] == ' ' || p[k] == '\t'))
+                    k++;
+                out->patterns.s = (char[:]){ (char *)p + k,
+                                             start + len - k };
+            }
+            body_start = pos;
+            out->off = body_start;
+        }
+    }
+    if (have) {
+        out->off = body_start;
+        out->len = d->n - body_start;
+        d->off = d->n;
+        return 1;
+    }
+    return 0;
+}
+
+int count(SshDoc *d)
+{
+    return d ? d->nblocks : 0;
+}
+
+int rewind(SshDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+/* 一个 Host 行里的模式串是否匹配 host（处理空格分隔与 ! 排除） */
+static int ssh_patterns_match(Str pats, char[:] host)
+{
+    int i = 0, matched = 0;
+
+    while (i < pats.s.len) {
+        int start = 0, len = 0, neg = 0;
+
+        while (i < pats.s.len && (pats.s.data[i] == ' ' || pats.s.data[i] == '\t'))
+            i++;
+        if (i >= pats.s.len)
+            break;
+        start = i;
+        while (i < pats.s.len && pats.s.data[i] != ' ' && pats.s.data[i] != '\t')
+            i++;
+        len = i - start;
+        if (len > 0 && pats.s.data[start] == '!') {
+            neg = 1;
+            start++;
+            len--;
+        }
+        if (len <= 0)
+            continue;
+        if (glob_match((char[:]){ pats.s.data + start, len }, host) == 1) {
+            if (neg)
+                return 0;               /* 命中排除：整个块不匹配 */
+            matched = 1;
+        }
+    }
+    return matched;
+}
+
+int match(SshDoc *d, char[:] host, SshBlock *out)
+{
+    SshBlock b = { 0 };
+
+    if (!d || !out || !host.data)
+        return -1;
+    rewind(d);
+    while (next(d, &b) == 1) {
+        if (ssh_patterns_match(b.patterns, host) == 1) {
+            *out = b;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int get(SshBlock *b, const void *src, int n, const char *key, Str *value)
+{
+    const char *p = (const char *)src;
+    int pos = 0, start = 0, len = 0, end = 0;
+
+    if (!b || !src || !key || !value)
+        return -1;
+    end = b->off + b->len;
+    if (end > n)
+        end = n;
+    pos = b->off;
+    while (pos < end && ssh_line(p, end, &pos, &start, &len)) {
+        if (ssh_is_blank(p, start, len))
+            continue;
+        {
+            int after = ssh_keyword_at(p, start, len, key);
+            int vstart = 0, vend = start + len;
+
+            if (after < 0)
+                continue;
+            vstart = after;
+            while (vstart < vend && (p[vstart] == ' ' || p[vstart] == '\t'))
+                vstart++;
+            /* 去掉行尾注释（值里的 # 前有空白才算注释） */
+            {
+                int i = vend - 1;
+
+                for (; i > vstart; i--) {
+                    if (p[i] == '#' && (p[i - 1] == ' ' || p[i - 1] == '\t')) {
+                        vend = i;
+                        break;
+                    }
+                }
+            }
+            while (vend > vstart && (p[vend - 1] == ' ' || p[vend - 1] == '\t'))
+                vend--;
+            value->s = (char[:]){ (char *)p + vstart, vend - vstart };
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int lookup(SshDoc *d, char[:] host, const char *key, Str *value)
+{
+    SshBlock b = { 0 };
+
+    if (!d || !key || !value)
+        return -1;
+    if (match(d, host, &b) != 1)
+        return 0;
+    return get(&b, d->src, d->n, key, value);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "sshconfig：通配匹配" {
+    if (glob_match(S("*"), S("anything")) != 1)
+        return err(1, "* 应该匹配一切");
+    if (glob_match(S("*.internal"), S("db.internal")) != 1)
+        return err(2, "*.internal 应该匹配 db.internal");
+    if (glob_match(S("*.internal"), S("db.example.com")) != 0)
+        return err(3, "*.internal 不该匹配 example.com");
+    if (glob_match(S("web?"), S("web1")) != 1
+        || glob_match(S("web?"), S("web12")) != 0)
+        return err(4, "? 只匹配一个字符");
+    if (glob_match(S("WEB.example.com"), S("web.example.com")) != 1)
+        return err(5, "匹配应该不区分大小写");
+    if (glob_match(S("a*b*c"), S("axxbyyc")) != 1)
+        return err(6, "多个 * 应该都能匹配");
+    if (glob_match(S("abc"), S("abcd")) != 0)
+        return err(7, "短模式不该匹配长主机");
+}
+
+test "sshconfig：块与选项" {
+    static const char *src =
+        "Host web\n"
+        "    HostName web.example.com\n"
+        "    User deploy\n"
+        "    Port 2222\n"
+        "\n"
+        "Host *.internal !db.internal\n"
+        "    User admin\n"
+        "\n"
+        "Host *\n"
+        "    User default\n"
+        "    ServerAliveInterval 30  # 每 30 秒\n";
+    SshDoc d = { 0 };
+    SshBlock b = { 0 };
+    Str v = { 0 };
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(8, "应该有 3 个 Host 块");
+    if (d.count() != 3)
+        return err(9, "count() 不对");
+    if (d.next(&b) != 1 || b.patterns.s.len != 3)
+        return err(10, "第一块的模式串不对");
+    if (b.get(src, (int)strlen(src), "user", &v) != 1 || v.s.len != 6
+        || memcmp(v.s.data, "deploy", 6) != 0)
+        return err(11, "第一块的 user 不对");
+    if (b.get(src, (int)strlen(src), "PORT", &v) != 1 || v.s.len != 4)
+        return err(12, "键名应该大小写不敏感");
+    if (b.get(src, (int)strlen(src), "nope", &v) != 0)
+        return err(13, "不存在的键应该 0");
+    if (d.match(S("web"), &b) != 1)
+        return err(14, "web 应该匹配第一块");
+    if (d.lookup(S("web"), "hostname", &v) != 1 || v.s.len != 15)
+        return err(15, "lookup hostname 不对");
+    /* 通配块 + 排除 */
+    if (d.lookup(S("app.internal"), "user", &v) != 1 || v.s.len != 5
+        || memcmp(v.s.data, "admin", 5) != 0)
+        return err(16, "app.internal 应该命中 admin 块");
+    if (d.lookup(S("db.internal"), "user", &v) != 1 || v.s.len != 7
+        || memcmp(v.s.data, "default", 7) != 0)
+        return err(17, "db.internal 被排除，应该落到 Host * 块");
+    /* 兜底块里的行尾注释 */
+    if (d.lookup(S("other"), "serveraliveinterval", &v) != 1 || v.s.len != 2)
+        return err(18, "行尾注释应该被去掉");
+    d.rewind();
+    if (d.next(&b) != 1 || b.patterns.s.len != 3)
+        return err(19, "rewind 之后应该回到第一块");
+}

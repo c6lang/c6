@@ -12934,6 +12934,10 @@ static const struct C6ErrStdSlot {
     { "std.data.ass",           C6_ERR_SLOT_STD + 226 },
     { "std.data.lrc",           C6_ERR_SLOT_STD + 227 },
     { "std.data.m3u",           C6_ERR_SLOT_STD + 228 },
+    { "std.data.netrc",         C6_ERR_SLOT_STD + 229 },
+    { "std.data.sshconfig",     C6_ERR_SLOT_STD + 230 },
+    { "std.data.keys",          C6_ERR_SLOT_STD + 231 },
+    { "std.data.crontab",       C6_ERR_SLOT_STD + 232 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

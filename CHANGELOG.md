@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第五十五批（凭据与配置）**：`std.data.netrc`（`.netrc` 凭据 + `find` 兜底）、
+  `std.data.sshconfig`（`Host` 分块、`*`/`?` 与 `!` 匹配、块内取键）、
+  `std.data.keys`（`authorized_keys` 行，含引号选项）、`std.data.crontab`（定时行 +
+  `@reboot` 别名 + 环境变量双游标），集成示例 `examples/stdcreds.c6`
+  （`make std-creds`）。四个模块都提供游标方法。错误号段 `std.data.netrc`=0x60e5 …
+  `std.data.crontab`=0x60e8（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十四批（字幕与播放列表）**：`std.data.srt`（SubRip + WebVTT）、
   `std.data.ass`（ASS/SSA 脚本信息与事件）、`std.data.lrc`（LRC 歌词与元信息）、
   `std.data.m3u`（M3U/M3U8，含 `#EXTINF` 与 HLS 判断），集成示例
