@@ -1,38 +1,5 @@
 # c6 —— 带语言扩展的 TinyCC
 
-c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏原有 C 语义的前提下加入
-一组系统编程友好的语言扩展。**开关只有两个**：编译器打开 `C6_EXT`、源文件用 `.c6` 后缀
-（`.c` 文件永远是普通 C，没有 `-std=c6` 这个选项）。
-
-| 扩展 | 作用 | 详情 |
-|---|---|---|
-| `defer` / `errdefer` | 作用域/函数退出时逆序清理；`errdefer` 只在错误路径执行（状态在函数帧里，不需要 TLS） | [错误处理](docs/manual/errors.md) |
-| `T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 | [错误处理](docs/manual/errors.md) |
-| `return err(id, "msg")` | 设置错误槽、就地展开清理并直接返回（只能写在 `T!error` 函数里） | [错误处理](docs/manual/errors.md) |
-| 错误码号段 | 每个模块一个号段（`(area<<27)\|(slot<<12)\|code`），`errbase.def` 钉号，撞号是硬错误 | [错误码](docs/manual/errors.md#错误码是模块自己的号段) |
-| `module` / `import` | 一个文件一个模块，模块名就是它的路径；`mod.member` 限定访问，符号带 `mod__` 前缀 | [模块](docs/manual/modules.md) |
-| 结构体方法 | `ret f(struct T *self, ...)` 即 `T` 的方法，`p->f()` / `v.f()` 都是调用（符号是 `T_f`） | [方法与 interface](docs/manual/methods.md) |
-| `interface` | 胖指针 `{void *self; const VT *vt;}` + 自动生成的 vtable | [方法与 interface](docs/manual/methods.md) |
-| 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]` | [声明](docs/manual/declarations.md) |
-| 变量必须初始化 | 每个变量定义都带初始化器（`static` 与 VLA 除外） | [声明](docs/manual/declarations.md) |
-| `T[:]` 切片 | 带长度与边界检查的数组视图，两个机器字 `{元素指针, 长度}` | [切片](docs/manual/slices.md) |
-| `foreach` | 遍历数组、切片、整数区间，以及实现 `has()`/`next()` 的迭代器 | [foreach](docs/manual/foreach.md) |
-| 元组 `(T1, T2, ...)` | 函数多返回值：`return {q, r};`、`(int q, int r) = f();`、`t[0]` | [元组](docs/manual/tuples.md) |
-| 函数字面量 / 闭包 | `void(int x) { ... }` 是表达式；`closure RET (P…)` 按值捕获外层块作用域 | [函数字面量](docs/manual/functions.md) |
-| `async` / `await` / `co` / `task` | 无栈协程：`co f();` 顶层跑，`task t = f();` 拿句柄 | [并发](docs/manual/concurrency.md) |
-| `spawn` | OS 线程（`pthread_create`），语句立刻返回、真并发 | [并发](docs/manual/concurrency.md) |
-| 托管引用 `@T` | 引用计数 GC：`@T` / `weak` / `own` / `shared` / `drop`，环是硬错误 | [托管引用](docs/manual/gc.md) |
-| `f"..{expr}.."` | 零分配栈缓冲的字符串插值；`@f".."` 产出托管字符串 | [字符串插值](docs/manual/fstrings.md) |
-| 宏 `expr`/`stmt`/`ident`/`type` | 像函数一样写宏，角色词说明展开结果怎么用，局部变量自动卫生重命名 | [宏](docs/manual/macros.md) |
-| 泛型 `@` | `struct Vect@T { ... }` 定义模板，`Vect@int` 建实例；`\|T\|` 前缀绑定形参；单态化导出普通 C | [泛型设计](docs/design/generics-design.md) |
-| 无 libc | freestanding：运行库外部依赖全是 weak，一直到 512 字节引导扇区的裸机 | [无 libc](docs/manual/freestanding.md) |
-| `test "描述" { ... }` + `-test` | 顶层测试块与内建测试运行器 | [测试](docs/manual/testing.md) |
-
-扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
-`C6_EXT` 只决定「有没有这套扩展」，真正启用哪一份代码由**源文件后缀**决定：`.c6` 文件开启扩展
-（并定义 `__C6__`），`.c` 文件不会因为同一次编译里出现 `.c6` 而被连带开启。`import NAME;`
-优先查找 `NAME.c6`，找不到才回退到 `NAME.c`。
-
 ## 先看一眼：`defer` / `errdefer` 管资源
 
 C 里最容易写错的不是功能，而是**每条出口都得把已拿到的资源还回去**。c6 让你在拿到资源的
@@ -77,6 +44,41 @@ int!error save(const char *path, const char *data, int n)
 （`return` / `break` / `continue` / `goto` / `err`）；`errdefer` 只在本次调用真的 `err` 过时跑，
 正常返回跳过。清理状态放在**函数帧**里而不是 TLS，所以 `tcc -run` 和裸机上一样能用。
 细节见[错误处理](docs/manual/errors.md)，可运行示例 `./tcc/c6 -B tcc -run examples/err_demo.c6`。
+
+## 这是什么
+
+c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏原有 C 语义的前提下加入
+一组系统编程友好的语言扩展。**开关只有两个**：编译器打开 `C6_EXT`、源文件用 `.c6` 后缀
+（`.c` 文件永远是普通 C，没有 `-std=c6` 这个选项）。
+
+| 扩展 | 作用 | 详情 |
+|---|---|---|
+| `defer` / `errdefer` | 作用域/函数退出时逆序清理；`errdefer` 只在错误路径执行（状态在函数帧里，不需要 TLS） | [错误处理](docs/manual/errors.md) |
+| `T!error` + `try` / `catch` | 声明可能失败的函数；`try` 原样传播，`catch e { ... }` 就地处理并清空错误槽 | [错误处理](docs/manual/errors.md) |
+| `return err(id, "msg")` | 设置错误槽、就地展开清理并直接返回（只能写在 `T!error` 函数里） | [错误处理](docs/manual/errors.md) |
+| 错误码号段 | 每个模块一个号段（`(area<<27)\|(slot<<12)\|code`），`errbase.def` 钉号，撞号是硬错误 | [错误码](docs/manual/errors.md#错误码是模块自己的号段) |
+| `module` / `import` | 一个文件一个模块，模块名就是它的路径；`mod.member` 限定访问，符号带 `mod__` 前缀 | [模块](docs/manual/modules.md) |
+| 结构体方法 | `ret f(struct T *self, ...)` 即 `T` 的方法，`p->f()` / `v.f()` 都是调用（符号是 `T_f`） | [方法与 interface](docs/manual/methods.md) |
+| `interface` | 胖指针 `{void *self; const VT *vt;}` + 自动生成的 vtable | [方法与 interface](docs/manual/methods.md) |
+| 省略 `struct` | tag 本身就是类型名：`Vec v;`、`sizeof(Vec)`、`Vec[:]` | [声明](docs/manual/declarations.md) |
+| 变量必须初始化 | 每个变量定义都带初始化器（`static` 与 VLA 除外） | [声明](docs/manual/declarations.md) |
+| `T[:]` 切片 | 带长度与边界检查的数组视图，两个机器字 `{元素指针, 长度}` | [切片](docs/manual/slices.md) |
+| `foreach` | 遍历数组、切片、整数区间，以及实现 `has()`/`next()` 的迭代器 | [foreach](docs/manual/foreach.md) |
+| 元组 `(T1, T2, ...)` | 函数多返回值：`return {q, r};`、`(int q, int r) = f();`、`t[0]` | [元组](docs/manual/tuples.md) |
+| 函数字面量 / 闭包 | `void(int x) { ... }` 是表达式；`closure RET (P…)` 按值捕获外层块作用域 | [函数字面量](docs/manual/functions.md) |
+| `async` / `await` / `co` / `task` | 无栈协程：`co f();` 顶层跑，`task t = f();` 拿句柄 | [并发](docs/manual/concurrency.md) |
+| `spawn` | OS 线程（`pthread_create`），语句立刻返回、真并发 | [并发](docs/manual/concurrency.md) |
+| 托管引用 `@T` | 引用计数 GC：`@T` / `weak` / `own` / `shared` / `drop`，环是硬错误 | [托管引用](docs/manual/gc.md) |
+| `f"..{expr}.."` | 零分配栈缓冲的字符串插值；`@f".."` 产出托管字符串 | [字符串插值](docs/manual/fstrings.md) |
+| 宏 `expr`/`stmt`/`ident`/`type` | 像函数一样写宏，角色词说明展开结果怎么用，局部变量自动卫生重命名 | [宏](docs/manual/macros.md) |
+| 泛型 `@` | `struct Vect@T { ... }` 定义模板，`Vect@int` 建实例；`\|T\|` 前缀绑定形参；单态化导出普通 C | [泛型设计](docs/design/generics-design.md) |
+| 无 libc | freestanding：运行库外部依赖全是 weak，一直到 512 字节引导扇区的裸机 | [无 libc](docs/manual/freestanding.md) |
+| `test "描述" { ... }` + `-test` | 顶层测试块与内建测试运行器 | [测试](docs/manual/testing.md) |
+
+扩展默认不启用，且是**编译期可裁剪**的：不定义 `C6_EXT` 构建出的编译器与上游 TCC 行为完全一致。
+`C6_EXT` 只决定「有没有这套扩展」，真正启用哪一份代码由**源文件后缀**决定：`.c6` 文件开启扩展
+（并定义 `__C6__`），`.c` 文件不会因为同一次编译里出现 `.c6` 而被连带开启。`import NAME;`
+优先查找 `NAME.c6`，找不到才回退到 `NAME.c`。
 
 ## 快速开始
 
