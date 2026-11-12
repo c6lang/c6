@@ -18,6 +18,12 @@
  */
 #include <string.h>
 
+/* glibc 的 <netdb.h> 把 BSD 兼容常量定义成了宏（NO_DATA 等）。c6 的 import 是
+ * 在**导入方**的宏环境里展开被导入文件的，所以「先 include <netdb.h>、再
+ * import 本模块」时下面的 `NO_DATA` 会被换成数字，报 `identifier expected`。
+ * 先 undef 掉，让枚举成员在任何导入顺序下都是标识符。 */
+#undef NO_DATA
+
 module std.core.err;
 
 enum Error {

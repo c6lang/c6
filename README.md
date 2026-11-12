@@ -258,7 +258,7 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/xml.c6           std.data.xml           XML 零分配扫描：xml_open + XmlReader.next（START/END/SELF/TEXT）、XmlEvent 的 name/text/attrs 与 attr_count/attr_at/attr、xml_unescape（5 个预定义实体 + 数字引用）；跳过注释/PI/DOCTYPE，CDATA 当文本，32 层标签配对校验
   std/data/props.c6         std.data.props         .properties/.env 零分配读取：props_open/next、e.decode(buf)、props_lookup/has/count（\n/\uXXXX/代理对/续行）
 
-std/net/                    网络与 Web：TCP 套接字、DNS 报文、WebSocket 帧、IP/CIDR、URL、MIME、HTTP/1.x、multipart
+std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析与客户端、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
   std/net/http.c6           std.net.http           HTTP/1.x 零分配解析：http_parse_request/response、HttpMessage 的 header/header_at/body/content_length、http_status_text
   std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_parse_v4/inet_parse_v6，Ip/Ipv4/Ipv6 的 format（IPv6 按 RFC 5952 压缩）、inet_parse_cidr/cidr_contains/cidr_mask/inet_v4_mask、is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
@@ -268,6 +268,10 @@ std/net/                    网络与 Web：TCP 套接字、DNS 报文、WebSock
   std/net/tcp.c6            std.net.tcp            TCP 套接字（POSIX）：tcp_listen/tcp_connect（超时）/accept_client、Tcp 的 write_bytes/write_all/read_bytes/read_all/set_timeout/set_nodelay/shutdown_write/close_socket、port/ok
   std/net/ws.c6             std.net.ws             WebSocket（RFC 6455）：ws_accept 握手、ws_encode/ws_parse/ws_decode 帧（FIN/opcode/7-16-64 位长度/掩码）、WsFrame
   std/net/url.c6            std.net.url            URL（RFC 3986）解析与相对解析：Url 的 url_parse/effective_port/is_absolute/has_host、url_resolve（§5.2 全算法）、查询参数 next_pair/Pair、百分号 url_encode/url_encode_component/url_decode/url_decode_at/url_encoded_len/url_decoded_len
+  std/net/udp.c6            std.net.udp            UDP 套接字（POSIX）：udp_bind/udp_connect/udp_bad、Udp 的 send_to/send_bytes/recv_bytes/recv_from/set_timeout/set_broadcast/port/ok/close_socket、UdpAddr（超时 -1、空报文 0）
+  std/net/uds.c6            std.net.uds            AF_UNIX 本地套接字：uds_pair/uds_listen/uds_connect/accept_client、Uds 的 write_bytes/write_all/read_bytes/read_all/set_timeout/shutdown_write/close_socket、UdsPair 的 ok_pair/close_pair（EOF 返回 0）
+  std/net/resolver.c6       std.net.resolver       DNS 查询客户端：resolver_open/resolver_from_server、Resolver 的 resolve_a/resolve_aaaa/resolve_ip/set_timeout/ok、parse_reply（校验 id/TC/rcode）、resolver_conf_parse/resolver_conf_file、ipv4_format/ipv6_format
+  std/net/httpc.c6          std.net.httpc          HTTP/1.1 客户端：build_request（先量再写）/fetch/parse_response（1/0/-1）、Response 的 is_ok/header/header_int 与 status/reason/body/chunked/content_length/needs_close，支持 chunked 解码（只做 http://）
 ```
 
 ```c
@@ -304,6 +308,7 @@ make std-wire    # 编译并运行 examples/stdwire.c6（第十七批网络协�
 make std-algo    # 编译并运行 examples/stdalgo.c6（第十八批算法与容器模块的拼装示例）
 make std-thread  # 编译并运行 examples/stdthread.c6（第十九批并发与同步模块的拼装示例）
 make std-term    # 编译并运行 examples/stdterm.c6（第二十批终端与进程控制模块的拼装示例）
+make std-client  # 编译并运行 examples/stdclient.c6（第二十一批网络客户端模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

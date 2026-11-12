@@ -1,0 +1,417 @@
+/* std/net/udp：UDP 数据报套接字（POSIX 薄封装，消息边界由内核保留）。
+ *
+ *     import std.net.udp;
+ *
+ *     Udp srv = udp_bind("127.0.0.1", 0);        // 0 = 内核挑端口
+ *     int port = srv.port();
+ *     Udp cli = udp_connect("127.0.0.1", port);  // 记住默认对端
+ *     cli.send_bytes("ping", 4);
+ *
+ *     char buf[64] = { 0 };
+ *     UdpAddr from = { 0 };
+ *     int n = srv.recv_from(buf, (int)sizeof buf, &from);
+ *     // n == 4，from.ip == "127.0.0.1"，from.port == cli.port()
+ *
+ * 和 `std.net.tcp` 的分工一样：这里只包最常用的动作，报文本身的内容由调用方
+ * 解释（DNS 查询用 `std.net.dns`/`std.net.resolver`，其它协议自己来）。
+ *
+ * 约定：
+ *
+ * - 工厂 `udp_bind`/`udp_connect` 返回 `Udp`，失败时 `fd = -1`，用 `ok()` 判断；
+ *   其它方法对 `fd = -1` 返回 -1/0，不会崩。
+ * - `udp_bind` 的 `host` 传 0 或 `""` 是任意地址；`port` 传 0 让内核挑，
+ *   之后用 `port()` 读回来再告诉对端。
+ * - `udp_connect` 不产生网络流量：它只是给 socket 记住默认对端，之后可以
+ *   用 `send_bytes`/`recv_bytes`，内核还会顺带过滤掉其它来源的报文。
+ * - **一个数据报就是一个消息**：`send_bytes` 要么整条发出去（返回 n），要么
+ *   返回 -1；`recv_bytes`/`recv_from` 返回的是一条报文的长度，缓冲不够时
+ *   **多余的字节被内核丢掉**（UDP 不重组），返回的是实际写进缓冲的长度。
+ * - 空报文是合法的：`send_bytes(p, 0)` 返回 0，收端 `recv_*` 也返回 0。
+ *   这跟 TCP 的「0 = EOF」不是一回事，UDP 没有 EOF。
+ * - `set_timeout` 设的是 SO_RCVTIMEO/SO_SNDTIMEO；超时之后 `recv_*` 返回 -1
+ *   （不区分超时和错误，需要区分就自己看 `errno`）。
+ * - `recv_from` 的 `from` 可以为 0；给了就填数字形式的地址（IPv6 也可能是
+ *   `::1` 这种写法）和端口，缓冲固定 64 字节足够放下 `INET6_ADDRSTRLEN`。
+ * - 不做 `connect` 的超时（UDP 的 connect 是本地操作）、不做校验和/分片处理、
+ *   不做多播加入（组播地址可以直接 `send_to`，收端要 `bind` 到 0.0.0.0）。
+ */
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+module std.net.udp;
+import std.core.types;
+
+struct Udp {
+    int fd;
+};
+
+/* recv_from 的「谁发来的」：数字形式的 IP + 端口 */
+struct UdpAddr {
+    char ip[64];
+    int port;
+};
+
+static Udp udp_bad(void)
+{
+    Udp u = { -1 };
+
+    return u;
+}
+
+int ok(Udp *self) { return self && self->fd >= 0; }
+
+/* 端口号转成服务名（十进制字符串） */
+static void udp_service(int port, char *buf, int cap)
+{
+    char rev[8] = { 0 };
+    int n = 0, i = 0;
+
+    if (port <= 0) {
+        buf[0] = '0';
+        buf[1] = 0;
+        return;
+    }
+    while (port > 0 && n < 8) {
+        rev[n++] = (char)('0' + port % 10);
+        port /= 10;
+    }
+    if (n >= cap)
+        n = cap - 1;
+    for (i = 0; i < n; i++)
+        buf[i] = rev[n - 1 - i];
+    buf[n] = 0;
+}
+
+/* 本地端口；失败（或 fd 无效）返回 -1 */
+int port(Udp *self)
+{
+    struct sockaddr_storage ss = { 0 };
+    socklen_t len = sizeof ss;
+
+    if (!ok(self))
+        return -1;
+    if (getsockname(self->fd, (struct sockaddr *)&ss, &len) != 0)
+        return -1;
+    if (ss.ss_family == AF_INET) {
+        struct sockaddr_in *in = (struct sockaddr_in *)&ss;
+
+        return (int)ntohs(in->sin_port);
+    }
+    if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&ss;
+
+        return (int)ntohs(in6->sin6_port);
+    }
+    return -1;
+}
+
+/* 绑定：host 为 0/"" 表示任意地址；port 为 0 让内核挑；失败 fd = -1 */
+Udp udp_bind(const char *host, int port)
+{
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = 0, *ai = 0;
+    char svc[8] = { 0 };
+    Udp out = udp_bad();
+    int one = 1;
+
+    udp_service(port, svc, (int)sizeof svc);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE;
+    if (getaddrinfo((host && host[0]) ? host : 0, svc, &hints, &res) != 0)
+        return out;
+    for (ai = res; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+
+        if (fd < 0)
+            continue;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, (socklen_t)sizeof one);
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            out.fd = fd;
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+/* 连接：只是记住默认对端；失败 fd = -1 */
+Udp udp_connect(const char *host, int port)
+{
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = 0, *ai = 0;
+    char svc[8] = { 0 };
+    Udp out = udp_bad();
+
+    if (!host || !host[0] || port <= 0 || port > 65535)
+        return out;
+    udp_service(port, svc, (int)sizeof svc);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, svc, &hints, &res) != 0)
+        return out;
+    for (ai = res; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+
+        if (fd < 0)
+            continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            out.fd = fd;
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+/* 设置收发超时（毫秒）；0 表示取消超时 */
+int set_timeout(Udp *self, int ms)
+{
+    struct timeval tv = { 0 };
+
+    if (!ok(self) || ms < 0)
+        return 0;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    if (setsockopt(self->fd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                   (socklen_t)sizeof tv) != 0)
+        return 0;
+    if (setsockopt(self->fd, SOL_SOCKET, SO_SNDTIMEO, &tv,
+                   (socklen_t)sizeof tv) != 0)
+        return 0;
+    return 1;
+}
+
+/* 允许往广播地址发；失败返回 0 */
+int set_broadcast(Udp *self)
+{
+    int one = 1;
+
+    if (!ok(self))
+        return 0;
+    return setsockopt(self->fd, SOL_SOCKET, SO_BROADCAST, &one,
+                      (socklen_t)sizeof one) == 0;
+}
+
+/* 发一条报文到指定地址：成功返回字节数（0 是空报文），失败 -1 */
+int send_to(Udp *self, const char *host, int port, const void *p, int n)
+{
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = 0, *ai = 0;
+    char svc[8] = { 0 };
+    int rc = -1;
+
+    if (!ok(self) || !host || !host[0] || port <= 0 || port > 65535
+        || n < 0 || (n > 0 && !p))
+        return -1;
+    udp_service(port, svc, (int)sizeof svc);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, svc, &hints, &res) != 0)
+        return -1;
+    for (ai = res; ai; ai = ai->ai_next) {
+        ssize_t k = 0;
+
+        do {
+            k = sendto(self->fd, p, (size_t)n, 0, ai->ai_addr, ai->ai_addrlen);
+        } while (k < 0 && errno == EINTR);
+        if (k >= 0 && (int)k == n) {
+            rc = (int)k;
+            break;
+        }
+    }
+    freeaddrinfo(res);
+    return rc;
+}
+
+/* 发给 connect 记住的对端：成功返回字节数（0 是空报文），失败 -1 */
+int send_bytes(Udp *self, const void *p, int n)
+{
+    if (!ok(self) || n < 0 || (n > 0 && !p))
+        return -1;
+    for (;;) {
+        ssize_t k = send(self->fd, p, (size_t)n, 0);
+
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        return (int)k;
+    }
+}
+
+/* 收一条报文，不关心来源：返回长度（0 是空报文），失败/超时 -1 */
+int recv_bytes(Udp *self, void *p, int cap)
+{
+    if (!ok(self) || cap < 0 || (cap > 0 && !p))
+        return -1;
+    for (;;) {
+        ssize_t k = recv(self->fd, p, (size_t)cap, 0);
+
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        return (int)k;
+    }
+}
+
+/* 收一条报文并记下来源；from 可以为 0。返回长度，失败/超时 -1 */
+int recv_from(Udp *self, void *p, int cap, UdpAddr *from)
+{
+    struct sockaddr_storage ss = { 0 };
+    socklen_t slen = sizeof ss;
+
+    if (!ok(self) || cap < 0 || (cap > 0 && !p))
+        return -1;
+    if (from) {
+        from->ip[0] = 0;
+        from->port = -1;
+    }
+    for (;;) {
+        ssize_t k = recvfrom(self->fd, p, (size_t)cap, 0,
+                             (struct sockaddr *)&ss, &slen);
+
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (from) {
+            from->port = -1;
+            if (ss.ss_family == AF_INET)
+                from->port = (int)ntohs(((struct sockaddr_in *)&ss)->sin_port);
+            else if (ss.ss_family == AF_INET6)
+                from->port = (int)ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+            if (getnameinfo((struct sockaddr *)&ss, slen, from->ip,
+                            (socklen_t)sizeof from->ip, 0, 0,
+                            NI_NUMERICHOST) != 0)
+                from->ip[0] = 0;
+        }
+        return (int)k;
+    }
+}
+
+/* 关闭；重复调用安全（名字避开 libc 的 close） */
+void close_socket(Udp *self)
+{
+    if (!self || self->fd < 0)
+        return;
+    close(self->fd);
+    self->fd = -1;
+}
+
+/* ---- 自测 ---- */
+
+test "绑定、连接与收发" {
+    Udp srv = udp_bind("127.0.0.1", 0);
+    int p = 0;
+    Udp cli = udp_bad();
+    char buf[16] = { 0 };
+    UdpAddr from = { 0 };
+    int n = 0;
+
+    if (!srv.ok() || (p = srv.port()) <= 0)
+        return err(1, "绑定 127.0.0.1:0 失败");
+    cli = udp_connect("127.0.0.1", p);
+    if (!cli.ok() || cli.port() <= 0)
+        return err(2, "udp_connect 失败");
+    if (cli.send_bytes("ping", 4) != 4)
+        return err(3, "send_bytes 没有发全");
+    if (!srv.set_timeout(2000))
+        return err(4, "set_timeout 失败");
+    n = srv.recv_from(buf, (int)sizeof buf, &from);
+    if (n != 4 || memcmp(buf, "ping", 4) != 0)
+        return err(5, "recv_from 收到的内容不对");
+    if (from.port != cli.port())
+        return err(6, "来源端口不对");
+    if (strcmp(from.ip, "127.0.0.1") != 0)
+        return err(7, "来源地址不对");
+    /* 连接过的 socket 也能收：对端回一条 */
+    if (srv.send_to("127.0.0.1", from.port, "pong", 4) != 4)
+        return err(8, "send_to 回包失败");
+    n = cli.recv_bytes(buf, (int)sizeof buf);
+    if (n != 4 || memcmp(buf, "pong", 4) != 0)
+        return err(9, "recv_bytes 收到的内容不对");
+    cli.close_socket();
+    srv.close_socket();
+}
+
+test "未连接 socket 与空报文" {
+    Udp srv = udp_bind("127.0.0.1", 0);
+    Udp cli = udp_bind("127.0.0.1", 0);
+    int p = srv.port();
+    char buf[8] = { 0 };
+    UdpAddr from = { 0 };
+    int n = 0;
+
+    if (!srv.ok() || !cli.ok())
+        return err(10, "两个 udp_bind 都得成功");
+    if (!cli.set_timeout(2000) || !srv.set_timeout(2000))
+        return err(11, "set_timeout 失败");
+    if (cli.send_to("127.0.0.1", p, "hi", 2) != 2)
+        return err(12, "send_to 失败");
+    n = srv.recv_bytes(buf, (int)sizeof buf);
+    if (n != 2 || memcmp(buf, "hi", 2) != 0)
+        return err(13, "未连接 socket 的收发不对");
+    /* 空报文：长度 0，但不是失败，也不是 EOF */
+    if (cli.send_to("127.0.0.1", p, "", 0) != 0)
+        return err(14, "空报文没有发出去");
+    n = srv.recv_from(buf, (int)sizeof buf, &from);
+    if (n != 0)
+        return err(15, "空报文的长度不是 0");
+    if (from.port != cli.port())
+        return err(16, "空报文的来源端口不对");
+    /* 对端没 connect，recv_bytes 仍然能收（不按来源过滤） */
+    if (cli.send_to("127.0.0.1", p, "xy", 2) != 2)
+        return err(17, "send_to 失败");
+    /* 缓冲不够：UDP 截断，返回实际写进去的长度，多余的字节被丢掉 */
+    n = srv.recv_from(buf, 1, 0);
+    if (n != 1 || buf[0] != 'x')
+        return err(18, "小缓冲应该截断到 1 字节");
+    cli.close_socket();
+    srv.close_socket();
+}
+
+test "超时、广播与错误路径" {
+    Udp srv = udp_bind("127.0.0.1", 0);
+    Udp bad = udp_bad();
+    char buf[4] = { 0 };
+
+    if (!srv.ok())
+        return err(19, "udp_bind 失败");
+    if (!srv.set_timeout(60))
+        return err(20, "set_timeout 失败");
+    if (srv.recv_bytes(buf, (int)sizeof buf) != -1)
+        return err(21, "没有报文时 recv 应该超时");
+    if (!srv.set_broadcast())
+        return err(22, "set_broadcast 失败");
+    if (srv.set_timeout(-1) != 0)
+        return err(23, "负超时应该失败");
+    if (bad.send_bytes("x", 1) != -1 || bad.recv_bytes(buf, 4) != -1)
+        return err(24, "fd=-1 的收发应该失败");
+    if (bad.send_to("127.0.0.1", 9, "x", 1) != -1)
+        return err(25, "fd=-1 的 send_to 应该失败");
+    if (bad.port() != -1 || bad.set_timeout(10) != 0 || bad.set_broadcast())
+        return err(26, "fd=-1 的其它方法应该失败");
+    bad.close_socket();
+    if (srv.send_to("127.0.0.1", 0, "x", 1) != -1)
+        return err(27, "端口 0 的 send_to 应该失败");
+    if (srv.send_to("127.0.0.1", 9, "x", -1) != -1)
+        return err(28, "负长度应该失败");
+    if (srv.recv_bytes(buf, -1) != -1)
+        return err(29, "负容量应该失败");
+    if (udp_bind("no-such-host.invalid", 0).ok())
+        return err(30, "坏主机名应该返回 fd=-1");
+    srv.close_socket();
+    srv.close_socket();
+}

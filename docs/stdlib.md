@@ -18,7 +18,7 @@
 | `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
-| `std/net/` | 网络与 Web：TCP 套接字、DNS 报文、WebSocket 帧、IP/CIDR、URL、MIME |
+| `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端、WebSocket 帧、IP/CIDR、URL、MIME |
 
 ```sh
 ./tcc/c6 -B tcc -I . -I examples -o build/wordcount \
@@ -149,7 +149,7 @@
 | `std/data/xml.c6` | `std.data.xml` | XML 零分配扫描（事件式，不做 DOM）：`xml_open` + `XmlReader.next`（`XML_START`/`XML_END`/`XML_SELF`/`XML_TEXT`）、`XmlEvent` 的 `name`/`text`/`attrs` 与 `attr_count`/`attr_at`/`attr`、`xml_unescape`（`&amp;` 等 5 个预定义实体 + `&#NNN;`/`&#xHH;`）；跳过注释/处理指令/DOCTYPE，CDATA 当文本，32 层标签配对校验，出错给字节位置 |
 | `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`Arena` 的 `json_parse`/`json_parse_at`、`Json` 的 `get`/`at`/`count`/`key`、`get_str`/`get_num`/`get_bool`、`write`/`write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
 
-**`std/net/`**（网络与 Web：IP/CIDR、URL、MIME）
+**`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -162,6 +162,10 @@
 | `std/net/tcp.c6` | `std.net.tcp` | TCP 套接字（POSIX 薄封装）：`tcp_listen`（port 0 = 内核挑）、`tcp_connect`（`timeout_ms >= 0` 用非阻塞 connect + `poll`）、`accept_client`、`Tcp` 的 `write_bytes`/`write_all`/`read_bytes`/`read_all`/`set_timeout`/`set_nodelay`/`shutdown_write`/`close_socket`/`port`/`ok`；getaddrinfo 解析主机（IPv4/IPv6/localhost），失败 `fd = -1` |
 | `std/net/ws.c6` | `std.net.ws` | WebSocket（RFC 6455，零分配）：`ws_accept`（`base64(SHA1(key+GUID))`）、`ws_encode`/`ws_parse`/`ws_decode`（FIN/opcode、7/16/64 位长度、客户端掩码、u32 掩码键）、`ws_encode_len`、`WsFrame`；不重组分片（FIN 原样给出） |
 | `std/net/url.c6` | `std.net.url` | URL（RFC 3986）解析与相对解析：`url_parse` 工厂 + `Url` 的 `effective_port`/`is_absolute`/`has_host`、`url_resolve`（§5.2 全算法）、查询参数 `next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
+| `std/net/udp.c6` | `std.net.udp` | UDP 套接字（POSIX 薄封装，零分配）：`udp_bind`/`udp_connect`/`udp_bad` 工厂 + `Udp` 的 `send_to`/`send_bytes`/`recv_bytes`/`recv_from`/`set_timeout`/`set_broadcast`/`port`/`ok`/`close_socket`、`UdpAddr`（`ip`/`port`）；`recv_*` 返回字节数（超时 -1、空报文 0），缓冲区小就按 `cap` 截断并返回实际写入长度；`udp_bind` 的 port 0 由内核挑 |
+| `std/net/uds.c6` | `std.net.uds` | AF_UNIX 本地套接字：`uds_pair`（`socketpair`）/`uds_listen(path, backlog)`/`uds_connect(path, timeout_ms)` 工厂 + `Uds` 的 `write_bytes`/`write_all`/`read_bytes`/`read_all`/`set_timeout`/`shutdown_write`/`close_socket`/`ok`、`UdsPair` 的 `ok_pair`/`close_pair`；`read_*` 到对端关闭返回 0；超时长连接沿用 `std.net.tcp` 的非阻塞 connect + `poll`；路径 socket 的 `unlink` 交给调用方 |
+| `std/net/resolver.c6` | `std.net.resolver` | DNS 查询客户端（在 `std.net.dns` 报文层与 `std.net.udp` 传输层之上，零分配）：`resolver_open`（读 `/etc/resolv.conf`，没有就用 127.0.0.1:53）/`resolver_from_server` 工厂 + `Resolver` 的 `resolve_a`/`resolve_aaaa`/`resolve_ip`/`set_timeout`/`ok`、`parse_reply`（校验 id/TC/rcode 并提取 A/AAAA）；`resolver_conf_parse`/`resolver_conf_file` 单独暴露（能解内存里的 conf 文本），`ipv4_format`/`ipv6_format` 输出点分/压缩形式；一次一查，不做重试、EDNS0、DoT |
+| `std/net/httpc.c6` | `std.net.httpc` | HTTP/1.1 客户端（在 `std.net.tcp`/`std.net.url` 之上，零分配）：`build_request`（先量再写，容量不够返回 -1 且 `dst` 一个字节不动）、`fetch`（连接、发送、收到完整响应、解析一次到位）、`parse_response`（1 完整 / 0 还不够 / -1 坏报文）、`Response` 的 `is_ok`/`header`/`header_int` 与字段 `status`/`reason`/`body`/`chunked`/`content_length`/`needs_close`；请求自动补 `Host`/`User-Agent`/`Accept`/`Connection: close`/`Content-Length`（调用方自己给了就不重复），响应支持 chunked 解码（含扩展与 trailer）；只做 `http://`，不跟重定向、不做 100-continue |
 
 **集成示例**（`main` 只能写在模块外的文件里）
 
@@ -187,6 +191,7 @@
 | `examples/stdalgo.c6` | （无模块） | 第十八批（算法与容器）的拼装示例（`make std-algo`）：依赖拓扑排序 + 最短路、LRU 缓存、命令前缀树、地址区间，自带自检 |
 | `examples/stdthread.c6` | （无模块） | 第十九批（并发与同步）的拼装示例（`make std-thread`）：原子计数 + 自旋锁、互斥锁 + 条件变量握手、线程池跑任务、通道收发，自带自检 |
 | `examples/stdterm.c6` | （无模块） | 第二十批（终端与进程控制）的拼装示例（`make std-term`）：伪终端检测/窗口大小/原始模式、信号处理与屏蔽、管道读写与 EOF、poll 多路等待，自带自检 |
+| `examples/stdclient.c6` | （无模块） | 第二十一批（网络客户端）的拼装示例（`make std-client`）：UDP 绑定/连接/空报文/超时、UDS socketpair 与路径 socket、resolv.conf 解析 + 本地 DNS 子进程上的一次 A 查询、本地 HTTP 子进程上的一次 chunked GET，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -233,6 +238,10 @@ std/net/inet.c6            8 test(s), 0 failure(s)
 std/net/mime.c6            37 test(s), 0 failure(s)
 std/net/multipart.c6       4 test(s), 0 failure(s)
 std/net/url.c6             32 test(s), 0 failure(s)
+std/net/udp.c6             3 test(s), 0 failure(s)
+std/net/uds.c6             2 test(s), 0 failure(s)
+std/net/resolver.c6       36 test(s), 0 failure(s)
+std/net/httpc.c6          39 test(s), 0 failure(s)
 std/os/env.c6              39 test(s), 0 failure(s)
 std/os/fs.c6               7 test(s), 0 failure(s)
 std/os/io.c6               5 test(s), 0 failure(s)
@@ -273,15 +282,19 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/text/width.c6` 10 | utf8 7 + width 3（判宽要 `utf8_decode`） |
 | `std/encoding/punycode.c6` 11 | utf8 7 + punycode 4（编码/解码都走 `utf8_decode`） |
 | `std/container/chan.c6` 10 | chan 4 + sync 6（Mutex/Cond 的正文来自 `std.os.sync`） |
+| `std/net/resolver.c6` 36 | resolver 3 + dns 3 + udp 3 + io 5 + str 22（报文格式来自 dns、收发来自 udp，conf 读文件要 io） |
+| `std/net/httpc.c6` 39 | httpc 4 + tcp 3 + url 10 + str 22（连接用 tcp、拆 URL 用 url） |
 
 `std/core/bits`、`std/core/crc`、`std/core/fixed`、`std/core/pool`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
 `std/encoding/codec`、`std/encoding/frame`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
-`std/data/props`、`std/net/multipart`
+`std/data/props`、`std/net/multipart`、`std/net/udp`、`std/net/uds`
 自成一体，单独跑就是自己的块数（props/multipart 只借 `Str` 这个类型）；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
 `std.text.str`（正文不调用），`std/net/mime` 的正文必须带 `std/os/path`，`std/encoding/sha256` 的正文
 必须带 `std/core/bits`，`std/os/env` 的正文必须带 `std/text/str`，`std/encoding/uuid` 的正文必须带
 `std/core/rand` 与 `std/os/time`，`std/container/pqueue` 的正文必须带 `std/container/sort`，`std/text/width` 与
-`std/encoding/punycode` 的正文必须带 `std/text/utf8`。
+`std/encoding/punycode` 的正文必须带 `std/text/utf8`，`std/net/resolver` 的正文必须带
+`std/net/dns`、`std/net/udp`、`std/os/io`、`std/text/str`，`std/net/httpc` 的正文必须带
+`std/net/tcp`、`std/net/url`、`std/text/str`。
 
 ## 设计原则
 
@@ -2825,6 +2838,36 @@ stdterm: 45 check(s), 0 failure(s)
 `EVENT_READ`，单 fd 的 `wait_readable` 超时/就绪都对。Makefile 里显式列出六个
 模块正文（tty/signal/pipe/poll 都只依赖 `std/core/types.c6`）。
 
+### 集成示例：`examples/stdclient.c6`
+
+```sh
+make std-client
+```
+
+```
+stdclient: 标准库第二十一批（udp / uds / resolver / httpc）
+udp: 127.0.0.1:38150 收发 4 字节，空报文与超时都对
+uds: socketpair 2 字节、EOF=0；路径 build/stdclient.sock 也通了
+resolver: example.com -> 93.184.216.34（ttl=60）
+httpc: http://127.0.0.1:45043/hello -> 200 OK，chunked body = "hello, world"（12 字节）
+stdclient: 36 check(s), 0 failure(s)
+```
+
+（端口由内核挑，每次不同。）四节：「UDP」绑一个 socket、连上去发 4 字节、
+`recv_from` 连来源地址一起拿回来，再发一条 0 字节报文确认空报文不是错误，最后
+把超时压到 80ms 确认没人发时 `recv_bytes` 给 -1；「UDS」`socketpair` 双向收发，
+`shutdown_write` 之后对端读到 0（EOF），再在 `build/stdclient.sock` 上走一遍
+`uds_listen`/`uds_connect`/`accept_client`；「resolver」先用
+`resolver_conf_parse` 解一段 `nameserver` 文本，再 `fork` 一个子进程当本地 DNS
+服务器（收到查询就把问题段原样复制、填上 `ancount = 1` 和一条 A 记录
+93.184.216.34 发回去），父进程用 `resolver_from_server` 指过去查
+`example.com`，`ipv4_format` 打出来再 `waitpid`；「httpc」再 `fork` 一个子进程
+当本地 HTTP 服务器（读一个请求、回一段 chunked 响应），父进程用 `fetch` 发
+`GET /hello`，检查状态码、`res.chunked`、body 拼接结果、头字段大小写不敏感和
+「chunked 响应没有 `Content-Length`」。两个子进程都在 127.0.0.1 上，所以整份
+示例离线可跑；Makefile 里显式列出十二个模块正文（udp/uds 只依赖
+`std/core/types.c6`，resolver 要 dns/udp/io/str，httpc 要 tcp/url/str）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2861,6 +2904,8 @@ stdterm: 45 check(s), 0 failure(s)
   示例（自带自检）。
 * `make std-term`：`examples/stdterm.c6`，第二十批（终端与进程控制）模块的拼装
   示例（自带自检）。
+* `make std-client`：`examples/stdclient.c6`，第二十一批（网络客户端）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -2872,6 +2917,12 @@ stdterm: 45 check(s), 0 failure(s)
 * `std/net/url.c6` 的「RFC 3986 §5.4 的相对解析」：23 条 normal + abnormal 用例
   （`../..//g`、`g;x=1/../y`、结尾 `/.` 与 `/..` 都在里面），钉住 `remove_dots`
   的每个分支；另有「全零初始化的 `Url` 不该给出端口」的回归。
+* `std/net/httpc.c6` 的「构建请求」用例：先量再写的容量边界（放不下返回 -1 且
+  `dst` 一个字节不动）、调用方给了 `Host`/`Content-Length` 时自动头不重复追加。
+* `std/net/httpc.c6` 的「chunked 解码」用例：带扩展（`5;ext=1`）、带 trailer、
+  数据不够（返回 0 + `incomplete`）、body 缓冲太小、chunk 数据后缺 CRLF 都钉住。
+* `std/net/resolver.c6` 的 `parse_reply` 用例：id 不匹配、TC 置位、rcode 非 0、
+  RR 被截断都返回 0/-1；`a`/`a16` 传 0 时不提取记录（只做校验）。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，

@@ -1,0 +1,503 @@
+/* std/net/resolver：DNS 查询客户端（resolv.conf + UDP + `std.net.dns` 的报文层）。
+ *
+ *     import std.net.resolver;
+ *
+ *     Resolver r = resolver_open();           // /etc/resolv.conf 的第一条 nameserver
+ *     u32 ip = 0;
+ *     u32 ttl = 0;
+ *     int rc = r.resolve_a("example.com", &ip, &ttl);   // 1 = 有 A 记录
+ *     char text[64] = { 0 };
+ *     ipv4_format(ip, text, (int)sizeof text);          // "93.184.216.34"
+ *
+ * `std.net.dns` 只和字节打交道（构建查询、解析报文），这里补上「怎么把查询发
+ * 出去、怎么把回复收回来」：读 `/etc/resolv.conf` 拿第一台服务器、用 UDP 发
+ * 一个查询、校验 id/rcode、顺着 ancount 找第一条 A/AAAA。零分配：报文缓冲、
+ * 名字缓冲都在栈上。
+ *
+ * 约定：
+ *
+ * - 一次性查询返回 1（找到记录）/ 0（查询成功但没有这类记录，比如 NXDOMAIN、
+ *   只有 CNAME、响应被截断）/ -1（参数、网络、超时、报文格式错）。
+ *   最后一次响应的细节留在 `rcode`/`truncated`/`ancount` 字段里（`-1` 表示
+ *   这次查询没拿到可解析的响应）。
+ * - `timeout_ms` 默认 2000，用 `set_timeout` 改；一次查询只发一次，不重试。
+ * - `id` 是每次自增的 16 位序号，回复的 id 必须对得上（对不上按坏报文处理）。
+ * - 只查 IN 类；AAAA 返回 16 字节网络序。`resolve_ip` 先 A 后 AAAA，两次查询。
+ * - 响应带 TC（截断）标志时直接给 0，**不自动改用 TCP 重查**——那需要调用方
+ *   自己用 `std.net.tcp` 加两字节长度前缀（`std.net.dns` 也没做）。
+ * - `resolver_conf_parse` 只认 `nameserver` 行（`#`/`;` 注释、空行、其它指令
+ *   都跳过），认第一条；文件读不了/没有 nameserver 时 `server` 为空、`ok()`
+ *   为 0。`resolver_open` 在这种情况下退回 `127.0.0.1`（本机解析器）。
+ * - 不做 search/ndots 后缀搜索、不做 EDNS0（回复缓冲给 1500 字节，够大多数
+ *   服务器用）。
+ */
+#include <string.h>
+#include <stdio.h>
+#include <arpa/inet.h>
+
+module std.net.resolver;
+import std.core.types;
+import std.net.dns;
+import std.net.udp;
+import std.os.io;
+import std.text.str;
+
+/* 字面量 -> 视图（宏不随 import 传递，每个模块自己定义一次） */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+/* 格式化（实现在后面；resolve_ip 先用） */
+int ipv4_format(u32 addr, char *out, int cap);
+int ipv6_format(const u8 *addr16, char *out, int cap);
+
+struct Resolver {
+    char server[64];    /* 服务器地址（数字形式或主机名） */
+    int port;           /* 默认 53 */
+    int timeout_ms;     /* 单次查询超时 */
+    u16 next_id;        /* 下一个查询序号 */
+    int rcode;          /* 上一次响应的 rcode；-1 = 没有可解析的响应 */
+    int truncated;      /* 上一次响应带 TC */
+    int ancount;        /* 上一次响应的回答数 */
+};
+
+static int resolv_space(int c) { return c == ' ' || c == '\t'; }
+
+int ok(Resolver *self)
+{
+    return self && self->server[0] != 0 && self->port > 0;
+}
+
+/* 写服务器地址：太长就失败，成功后 server 一定有结尾 NUL */
+static int resolv_set_server(Resolver *self, const char *host, int n)
+{
+    if (!self || !host || n <= 0 || n >= (int)sizeof self->server)
+        return 0;
+    memcpy(self->server, host, (size_t)n);
+    self->server[n] = 0;
+    return 1;
+}
+
+int set_timeout(Resolver *self, int ms)
+{
+    if (!self || ms < 0)
+        return 0;
+    self->timeout_ms = ms;
+    return 1;
+}
+
+/* 解析 resolv.conf 的文本：返回找到的 nameserver 条数，第一条写进 out。
+   out 的其它字段（port/timeout/id）不动。 */
+int resolver_conf_parse(Str text, Resolver *out)
+{
+    int len = 0, i = 0, count = 0;
+
+    if (!out || !text.s.data || text.s.len < 0)
+        return 0;
+    out->server[0] = 0;
+    len = text.s.len;
+    while (i < len) {
+        int start = i, end = i, key = 0, vstart = 0, vlen = 0;
+
+        while (end < len && text.s.data[end] != '\n')
+            end++;
+        i = end + 1;
+        while (start < end && resolv_space((int)(u8)text.s.data[start]))
+            start++;
+        while (end > start && resolv_space((int)(u8)text.s.data[end - 1]))
+            end--;
+        if (start >= end || text.s.data[start] == '#'
+            || text.s.data[start] == ';')
+            continue;
+        key = start;
+        while (key < end && !resolv_space((int)(u8)text.s.data[key]))
+            key++;
+        if (key - start != 10
+            || memcmp(text.s.data + start, "nameserver", 10) != 0)
+            continue;
+        while (key < end && resolv_space((int)(u8)text.s.data[key]))
+            key++;
+        vstart = key;
+        while (key < end && !resolv_space((int)(u8)text.s.data[key])
+               && text.s.data[key] != '#' && text.s.data[key] != ';')
+            key++;
+        vlen = key - vstart;
+        if (vlen <= 0 || vlen >= 64)
+            continue;
+        if (count == 0 && !resolv_set_server(out, text.s.data + vstart, vlen))
+            continue;
+        count++;
+    }
+    return count;
+}
+
+/* 从文件读 resolv.conf 并解析（超过 4 KiB 的文件按失败处理） */
+int resolver_conf_file(char *path, Resolver *out)
+{
+    char buf[4096] = { 0 };
+    Reader rd = reader_open(path);
+    int n = 0, c = 0;
+
+    if (!out || !rd.ok())
+        return 0;
+    n = rd.read_all(buf, (int)sizeof buf);
+    rd.close();
+    if (n <= 0)
+        return 0;
+    c = resolver_conf_parse((Str){ (char[:]){ buf, n } }, out);
+    return c;
+}
+
+/* 读 /etc/resolv.conf；没有就退回本机 127.0.0.1 */
+Resolver resolver_open(void)
+{
+    Resolver r = { { 0 }, 53, 2000, 0x4000, -1, 0, 0 };
+
+    if (resolver_conf_file((char *)"/etc/resolv.conf", &r) <= 0) {
+        strcpy(r.server, "127.0.0.1");
+        r.port = 53;
+    }
+    return r;
+}
+
+/* 显式给服务器（不做名字解析，`server` 原样传给 `std.net.udp`） */
+Resolver resolver_from_server(const char *server, int port)
+{
+    Resolver r = { { 0 }, 53, 2000, 0x4000, -1, 0, 0 };
+
+    if (server && server[0]
+        && resolv_set_server(&r, server, (int)strlen(server))
+        && port > 0 && port <= 65535)
+        r.port = port;
+    return r;
+}
+
+/* 解析一段响应：id 必须对得上、必须是响应；返回 1/0/-1（见文件头）。
+   a 给 A 记录用，a16 给 AAAA 记录用，不用的传 0。 */
+int parse_reply(Resolver *self, Str reply, u16 id, u16 qtype, u32 *a, u8 *a16,
+                u32 *ttl)
+{
+    DnsHeader h = { 0 };
+    DnsRR rr = { 0 };
+    char name[DNS_MAX_NAME + 1] = { 0 };
+    int off = 0, i = 0, found = 0;
+    u32 secs = 0;
+
+    if (!self || !reply.s.data || reply.s.len < DNS_HEADER)
+        return -1;
+    self->rcode = -1;
+    self->truncated = 0;
+    self->ancount = 0;
+    if (!dns_header(reply.s.data, reply.s.len, &h))
+        return -1;
+    if (h.id != (int)id || !h.qr)
+        return -1;
+    self->rcode = h.rcode;
+    self->truncated = h.tc;
+    self->ancount = h.ancount;
+    if (h.rcode != 0 || h.tc)
+        return 0;
+    off = DNS_HEADER;
+    for (i = 0; i < h.qdcount; i++)
+        if (dns_question(reply.s.data, reply.s.len, off,
+                         (char[:]){ name, (int)sizeof name }, 0, 0, &off) < 0)
+            return -1;
+    for (i = 0; i < h.ancount; i++) {
+        if (dns_rr(reply.s.data, reply.s.len, off, &rr,
+                   (char[:]){ name, (int)sizeof name }, &off) < 0)
+            return -1;
+        if (rr.rclass != 1)
+            continue;
+        if (qtype == DNS_A && a && dns_a(reply.s.data, reply.s.len, &rr, a)) {
+            secs = rr.ttl;
+            found = 1;
+            break;
+        }
+        if (qtype == DNS_AAAA && a16
+            && dns_aaaa(reply.s.data, reply.s.len, &rr, a16)) {
+            secs = rr.ttl;
+            found = 1;
+            break;
+        }
+    }
+    if (found && ttl)
+        *ttl = secs;
+    return found ? 1 : 0;
+}
+
+/* 发一个查询并解析回复（网络部分；parse_reply 是纯函数，可单独测） */
+static int resolv_lookup(Resolver *self, const char *host, u16 qtype, u32 *a,
+                         u8 *a16, u32 *ttl)
+{
+    char q[512] = { 0 };
+    char reply[1500] = { 0 };
+    Udp sock = { -1 };
+    int qn = 0, rn = 0;
+    u16 id = 0;
+
+    if (!ok(self) || !host || !host[0] || strlen(host) > 253)
+        return -1;
+    self->rcode = -1;
+    self->truncated = 0;
+    self->ancount = 0;
+    self->next_id = (u16)(self->next_id + 1);
+    id = self->next_id;
+    qn = dns_build_query(host, qtype, id, (char[:]){ q, (int)sizeof q });
+    if (qn <= 0)
+        return -1;
+    sock = udp_connect(self->server, self->port);
+    if (!sock.ok())
+        return -1;
+    if (!sock.set_timeout(self->timeout_ms) || sock.send_bytes(q, qn) != qn) {
+        sock.close_socket();
+        return -1;
+    }
+    rn = sock.recv_bytes(reply, (int)sizeof reply);
+    sock.close_socket();
+    if (rn <= 0)
+        return -1;
+    return parse_reply(self, (Str){ (char[:]){ reply, rn } }, id, qtype, a, a16,
+                       ttl);
+}
+
+int resolve_a(Resolver *self, const char *host, u32 *a, u32 *ttl)
+{
+    return resolv_lookup(self, host, DNS_A, a, 0, ttl);
+}
+
+int resolve_aaaa(Resolver *self, const char *host, u8 *a16, u32 *ttl)
+{
+    return resolv_lookup(self, host, DNS_AAAA, 0, a16, ttl);
+}
+
+/* 先 A 后 AAAA，返回地址文本的长度（不含 NUL）；0/-1 同上面 */
+int resolve_ip(Resolver *self, const char *host, char *out, int cap)
+{
+    u32 a = 0;
+    u8 a16[16] = { 0 };
+    u32 ttl = 0;
+    int rc = 0;
+
+    rc = resolv_lookup(self, host, DNS_A, &a, 0, &ttl);
+    if (rc == 1)
+        return ipv4_format(a, out, cap);
+    if (rc < 0)
+        return rc;
+    rc = resolv_lookup(self, host, DNS_AAAA, 0, a16, &ttl);
+    if (rc == 1)
+        return ipv6_format(a16, out, cap);
+    return rc;
+}
+
+/* 网络序 u32 -> "a.b.c.d"；返回长度（不含 NUL），放不下 -1 */
+int ipv4_format(u32 addr, char *out, int cap)
+{
+    char tmp[16] = { 0 };
+    int n = 0;
+
+    if (!out || cap <= 0)
+        return -1;
+    n = snprintf(tmp, (size_t)sizeof tmp, "%u.%u.%u.%u",
+                 (unsigned)((addr >> 24) & 0xffu),
+                 (unsigned)((addr >> 16) & 0xffu),
+                 (unsigned)((addr >> 8) & 0xffu), (unsigned)(addr & 0xffu));
+    if (n < 0 || n + 1 > cap)
+        return -1;
+    memcpy(out, tmp, (size_t)n + 1);
+    return n;
+}
+
+/* 16 字节 IPv6 -> 文本（RFC 5952 压缩由 inet_ntop 负责） */
+int ipv6_format(const u8 *addr16, char *out, int cap)
+{
+    char tmp[48] = { 0 };
+    int n = 0;
+
+    if (!addr16 || !out || cap <= 0)
+        return -1;
+    if (!inet_ntop(AF_INET6, addr16, tmp, (socklen_t)sizeof tmp))
+        return -1;
+    n = (int)strlen(tmp);
+    if (n + 1 > cap)
+        return -1;
+    memcpy(out, tmp, (size_t)n + 1);
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+/* 手搓一段响应：问题用 host IN qtype，回答里放一条 A/AAAA 记录（an=0 时不放） */
+static int mk_reply(u8 *r, int id, int flags, int an, const char *host, u16 qtype,
+                    const u8 *data, int dlen)
+{
+    int n = 12, start = 0, j = 0;
+
+    r[0] = (u8)((id >> 8) & 0xff);
+    r[1] = (u8)(id & 0xff);
+    r[2] = (u8)((flags >> 8) & 0xff);
+    r[3] = (u8)(flags & 0xff);
+    r[4] = 0; r[5] = 1;                     /* qdcount */
+    r[6] = 0; r[7] = (u8)an;                /* ancount */
+    r[8] = 0; r[9] = 0;
+    r[10] = 0; r[11] = 0;
+    for (j = 0; host[j]; j++) {
+        if (host[j] == '.') {
+            r[n++] = (u8)(j - start);
+            memcpy(r + n, host + start, (size_t)(j - start));
+            n += j - start;
+            start = j + 1;
+        }
+    }
+    if (j > start) {
+        r[n++] = (u8)(j - start);
+        memcpy(r + n, host + start, (size_t)(j - start));
+        n += j - start;
+    }
+    r[n++] = 0;
+    r[n++] = (u8)((qtype >> 8) & 0xff);
+    r[n++] = (u8)(qtype & 0xff);
+    r[n++] = 0; r[n++] = 1;
+    if (an > 0) {
+        r[n++] = 0xc0; r[n++] = 0x0c;       /* 指向问题里的名字 */
+        r[n++] = (u8)((qtype >> 8) & 0xff);
+        r[n++] = (u8)(qtype & 0xff);
+        r[n++] = 0; r[n++] = 1;
+        r[n++] = 0; r[n++] = 0; r[n++] = 0; r[n++] = 60;   /* ttl */
+        r[n++] = (u8)((dlen >> 8) & 0xff);
+        r[n++] = (u8)(dlen & 0xff);
+        memcpy(r + n, data, (size_t)dlen);
+        n += dlen;
+    }
+    return n;
+}
+
+test "resolv.conf 解析" {
+    Resolver r = { { 0 }, 53, 2000, 0x4000, -1, 0, 0 };
+    Str conf = { S("# comment\n"
+                   "search example.com\n"
+                   "nameserver 10.0.0.1\n"
+                   "nameserver   10.0.0.2  # backup\n"
+                   "options timeout:1\n") };
+    Str none = { S("# 只有注释\nsearch x\n") };
+    Str six = { S("nameserver 2001:db8::1\n") };
+
+    if (resolver_conf_parse(conf, &r) != 2)
+        return err(1, "应该找到两条 nameserver");
+    if (strcmp(r.server, "10.0.0.1") != 0)
+        return err(2, "第一条 nameserver 不对");
+    if (resolver_conf_parse(none, &r) != 0 || r.server[0] != 0)
+        return err(3, "没有 nameserver 时应该清空");
+    if (resolver_conf_parse(six, &r) != 1 || strcmp(r.server, "2001:db8::1") != 0)
+        return err(4, "IPv6 nameserver 不对");
+    if (resolver_conf_parse((Str){ S("") }, &r) != 0)
+        return err(5, "空文本应该给 0");
+    /* 文件路径：写一份再读回来 */
+    {
+        Writer w = writer_open((char *)"build/std-resolver.conf");
+        Resolver f = { { 0 }, 53, 2000, 0x4000, -1, 0, 0 };
+
+        if (!w.ok())
+            return err(6, "写不了 build/std-resolver.conf");
+        w.write_bytes("nameserver 10.1.2.3\n", 21);
+        w.close();
+        if (resolver_conf_file((char *)"build/std-resolver.conf", &f) != 1
+            || strcmp(f.server, "10.1.2.3") != 0)
+            return err(7, "文件读回来不对");
+        remove("build/std-resolver.conf");
+        if (resolver_conf_file((char *)"build/no-such.conf", &f) != 0)
+            return err(8, "不存在的文件应该给 0");
+    }
+}
+
+test "响应解析：A / AAAA / NXDOMAIN / 截断" {
+    u8 r[128] = { 0 };
+    u8 data4[4] = { 93, 184, 216, 34 };
+    u8 data6[16] = { 0 };
+    u8 out6[16] = { 0 };
+    Resolver rv = { { 0 }, 53, 2000, 0x4000, -1, 0, 0 };
+    u32 ip = 0, ttl = 0;
+    int n = 0;
+    char text[64] = { 0 };
+
+    data6[15] = 1;                          /* ::1 */
+    n = mk_reply(r, 0x4242, 0x8180, 1, "example.com", DNS_A, data4, 4);
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, n } }, 0x4242, DNS_A, &ip,
+                    0, &ttl) != 1)
+        return err(9, "A 记录没解析出来");
+    if (ip != 0x5db8d822u || ttl != 60)
+        return err(10, "A 记录的地址或 TTL 不对");
+    if (rv.rcode != 0 || rv.ancount != 1 || rv.truncated)
+        return err(11, "响应头字段不对");
+    if (ipv4_format(ip, text, (int)sizeof text) != 13
+        || strcmp(text, "93.184.216.34") != 0)
+        return err(12, "ipv4_format 不对");
+    if (ipv4_format(ip, text, 4) != -1)
+        return err(13, "ipv4_format 容量不够应该给 -1");
+    n = mk_reply(r, 0x4242, 0x8180, 1, "example.com", DNS_AAAA, data6, 16);
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, n } }, 0x4242, DNS_AAAA,
+                    0, out6, &ttl) != 1)
+        return err(14, "AAAA 记录没解析出来");
+    if (memcmp(out6, data6, 16) != 0)
+        return err(15, "AAAA 地址不对");
+    if (ipv6_format(out6, text, (int)sizeof text) != 3
+        || strcmp(text, "::1") != 0)
+        return err(16, "ipv6_format 不对");
+    /* 问 A 但回答是 AAAA：查询成功、没有这类记录 */
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, n } }, 0x4242, DNS_A, &ip,
+                    0, 0) != 0)
+        return err(17, "类型不匹配应该是 0");
+    /* NXDOMAIN：rcode=3、ancount=0 */
+    n = mk_reply(r, 0x4242, 0x8183, 0, "example.com", DNS_A, data4, 4);
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, n } }, 0x4242, DNS_A, &ip,
+                    0, 0) != 0 || rv.rcode != 3 || rv.ancount != 0)
+        return err(18, "NXDOMAIN 应该是 0 且 rcode=3");
+    /* TC=1、ancount=0 */
+    n = mk_reply(r, 0x4242, 0x8380, 0, "example.com", DNS_A, data4, 4);
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, n } }, 0x4242, DNS_A, &ip,
+                    0, 0) != 0 || !rv.truncated)
+        return err(19, "截断响应应该是 0 且 truncated=1");
+    /* 坏报文：id 不对、太短；没有输出指针时只是「没取到记录」 */
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, n } }, 0x4243, DNS_A, &ip,
+                    0, 0) != -1)
+        return err(20, "id 对不上应该给 -1");
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, 5 } }, 0x4242, DNS_A, &ip,
+                    0, 0) != -1)
+        return err(21, "太短的响应应该给 -1");
+    n = mk_reply(r, 0x4242, 0x8180, 1, "example.com", DNS_A, data4, 4);
+    if (rv.parse_reply((Str){ (char[:]){ (char *)r, n } }, 0x4242, DNS_A, 0, 0,
+                    0) != 0)
+        return err(22, "没给输出指针应该给 0（不取记录）");
+}
+
+test "传输、超时与参数检查" {
+    Udp sink = udp_bind("127.0.0.1", 0);
+    Resolver r = resolver_from_server("127.0.0.1", sink.port());
+    Resolver bad = { { 0 }, 53, 2000, 0x4000, -1, 0, 0 };
+    u32 ip = 0, ttl = 0;
+    u8 a16[16] = { 0 };
+    char text[64] = { 0 };
+
+    if (!sink.ok() || !r.ok())
+        return err(23, "本地 UDP 接收端或 resolver 建不起来");
+    if (!r.set_timeout(120) || r.set_timeout(-1))
+        return err(24, "set_timeout 语义不对");
+    /* 有接收端但没人回答 -> 超时 */
+    if (r.resolve_a("example.com", &ip, &ttl) != -1)
+        return err(25, "没人回答应该超时给 -1");
+    if (r.resolve_aaaa("example.com", a16, &ttl) != -1)
+        return err(26, "AAAA 查询同样应该超时");
+    if (r.resolve_a("", &ip, &ttl) != -1 || r.resolve_a(0, &ip, &ttl) != -1)
+        return err(27, "空主机名应该给 -1");
+    if (!bad.ok() && bad.resolve_a("example.com", &ip, &ttl) == -1)
+        ;
+    else
+        return err(28, "没有服务器的 resolver 应该失败");
+    if (resolver_from_server("", 53).ok())
+        return err(29, "空服务器地址不该 ok");
+    if (resolver_from_server("127.0.0.1", 70000).port != 53)
+        return err(30, "非法端口应该退回 53");
+    if (!resolver_from_server("127.0.0.1", 5353).ok())
+        return err(31, "合法端口应该 ok");
+    if (r.resolve_ip("example.com", text, (int)sizeof text) != -1)
+        return err(32, "超时之后 resolve_ip 也应该给 -1");
+    sink.close_socket();
+}

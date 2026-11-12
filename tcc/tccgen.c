@@ -12787,6 +12787,10 @@ static const struct C6ErrStdSlot {
     { "std.os.signal",          C6_ERR_SLOT_STD + 90 },
     { "std.os.pipe",            C6_ERR_SLOT_STD + 91 },
     { "std.os.poll",            C6_ERR_SLOT_STD + 92 },
+    { "std.net.udp",            C6_ERR_SLOT_STD + 93 },
+    { "std.net.uds",            C6_ERR_SLOT_STD + 94 },
+    { "std.net.resolver",       C6_ERR_SLOT_STD + 95 },
+    { "std.net.httpc",          C6_ERR_SLOT_STD + 96 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

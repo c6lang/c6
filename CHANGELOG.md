@@ -47,6 +47,26 @@
 
 ### 标准库
 
+- **标准库第二十一批（网络客户端）**：`std.net.udp` / `std.net.uds` /
+  `std.net.resolver` / `std.net.httpc` 四个模块，集成示例
+  `examples/stdclient.c6`（`make std-client`）。udp 是数据报薄封装
+  （`udp_bind`/`udp_connect`、`send_to`/`send_bytes`/`recv_bytes`/`recv_from`、
+  `set_timeout`/`set_broadcast`，超时 -1、空报文 0、缓冲区小就截断）；uds 是
+  AF_UNIX 本地套接字（`uds_pair`、`uds_listen`/`uds_connect`/`accept_client`、
+  `shutdown_write` 之后对端读到 EOF=0，路径 socket 的 `unlink` 交给调用方）；
+  resolver 把 `std.net.dns` 的报文层和 `std.net.udp` 的传输层接起来
+  （`resolver_open` 读 `/etc/resolv.conf`、`resolver_from_server`、`resolve_a`/
+  `resolve_aaaa`/`resolve_ip`、`parse_reply` 校验 id/TC/rcode 并提取记录，
+  `resolver_conf_parse`/`resolver_conf_file` 单独可测，`ipv4_format`/
+  `ipv6_format`）；httpc 在 `std.net.tcp`+`std.net.url` 上做 HTTP/1.1 客户端
+  （`build_request` 先量再写、`fetch` 一次到位、`parse_response` 的 1/0/-1 三态、
+  chunked 解码含扩展与 trailer、`Response.header`/`header_int` 大小写不敏感，
+  只做明文 `http://`）。错误号段 `std.net.udp`=0x605d … `std.net.httpc`=0x6060
+  （`tcc/tccgen.c` 的 `c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+  另在 `std/core/err.c6` 里加 `#undef NO_DATA`：glibc 的 `<netdb.h>` 把这个
+  名字定义成宏，会污染 `enum Error` 的成员名（import 是在导入方的宏环境里展开
+  的）。
+
 - **标准库第二十批（终端与进程控制）**：`std.os.tty` / `std.os.signal` /
   `std.os.pipe` / `std.os.poll` 四个模块，集成示例 `examples/stdterm.c6`
   （`make std-term`）。tty 是 termios 薄封装（`is_tty`、`size`/`width`/`height`、

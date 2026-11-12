@@ -1,0 +1,269 @@
+/* stdclient：标准库第二十一批（udp / uds / resolver / httpc）的拼装示例。
+ *
+ * 和前面几批的示例一样：这个文件没有 `module`（入口 `main` 只能写在模块外的
+ * 文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是「网络客户端」这条链路：
+ *
+ *   - udp：绑定、连接、空报文、截断与超时；
+ *   - uds：socketpair 双向收发 + 路径监听/连接；
+ *   - resolver：resolv.conf 解析 + 本地 UDP「DNS 服务器」（子进程）上的一次
+ *     真实 A 查询；
+ *   - httpc：本地 TCP「HTTP 服务器」（子进程）上的一次 chunked 响应。
+ *
+ * 两个子进程都用 `fork` 起（示例是 POSIX 程序），不联外网、不依赖 DNS 服务器：
+ * 所有流量都在 127.0.0.1 上，所以 `make std-client` 在离线环境里也能跑。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdclient \
+ *         examples/stdclient.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/net/udp.c6 std/net/uds.c6 std/net/dns.c6 std/net/resolver.c6 \
+ *         std/os/io.c6 std/text/str.c6 std/net/tcp.c6 std/net/url.c6 \
+ *         std/net/httpc.c6
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+import std.core.types;
+import std.net.udp;
+import std.net.uds;
+import std.net.resolver;
+import std.net.tcp;
+import std.net.url;
+import std.net.httpc;
+import std.text.str;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* UDP：绑定 -> 连接 -> 收发；再来一条空报文和一次超时 */
+static void tour_udp(void)
+{
+    Udp srv = udp_bind("127.0.0.1", 0);
+    Udp cli = { -1 };
+    char buf[16] = { 0 };
+    UdpAddr from = { 0 };
+    int p = 0, n = 0;
+
+    check(srv.ok() && (p = srv.port()) > 0, "udp: 绑定 127.0.0.1:0");
+    cli = udp_connect("127.0.0.1", p);
+    check(cli.ok() && cli.port() > 0, "udp: 连接");
+    check(cli.send_bytes("ping", 4) == 4, "udp: 发送 4 字节");
+    check(srv.set_timeout(2000), "udp: 设置超时");
+    n = srv.recv_from(buf, (int)sizeof buf, &from);
+    check(n == 4 && memcmp(buf, "ping", 4) == 0, "udp: 收到报文");
+    check(from.port == cli.port() && strcmp(from.ip, "127.0.0.1") == 0,
+          "udp: 来源地址/端口");
+    /* 空报文：长度 0，不是错误 */
+    check(cli.send_to("127.0.0.1", p, "", 0) == 0, "udp: 空报文");
+    n = srv.recv_from(buf, (int)sizeof buf, &from);
+    check(n == 0, "udp: 空报文长度 0");
+    /* 没人再发：超时给 -1 */
+    srv.set_timeout(80);
+    check(srv.recv_bytes(buf, (int)sizeof buf) == -1, "udp: 超时");
+    printf("udp: 127.0.0.1:%d 收发 4 字节，空报文与超时都对\n", p);
+    cli.close_socket();
+    srv.close_socket();
+}
+
+/* UDS：socketpair 双向 + 路径 socket */
+static void tour_uds(void)
+{
+    UdsPair pair = uds_pair();
+    char buf[16] = { 0 };
+    Uds srv = { -1 }, cli = { -1 }, peer = { -1 };
+    char *path = (char *)"build/stdclient.sock";
+
+    check(pair.ok_pair(), "uds: socketpair");
+    check(pair.b.set_timeout(2000), "uds: 超时");
+    check(pair.a.write_all("hi", 2) == 2, "uds: 写 2 字节");
+    check(pair.b.read_all(buf, 2) == 2 && memcmp(buf, "hi", 2) == 0,
+          "uds: 读回 2 字节");
+    check(pair.a.shutdown_write(), "uds: 半关闭");
+    check(pair.b.read_bytes(buf, (int)sizeof buf) == 0, "uds: EOF 是 0");
+    pair.close_pair();
+
+    unlink(path);
+    srv = uds_listen(path, 4);
+    check(srv.ok(), "uds: 路径监听");
+    cli = uds_connect(path, 2000);
+    check(cli.ok(), "uds: 路径连接");
+    peer = srv.accept_client();
+    check(peer.ok(), "uds: 接受");
+    check(cli.write_all("ping", 4) == 4, "uds: 路径发送");
+    check(peer.read_all(buf, 4) == 4 && memcmp(buf, "ping", 4) == 0,
+          "uds: 路径接收");
+    printf("uds: socketpair 2 字节、EOF=0；路径 %s 也通了\n", path);
+    peer.close_socket();
+    cli.close_socket();
+    srv.close_socket();
+    unlink(path);
+}
+
+/* 子进程：把收到的 DNS 查询原样加上一条 A 记录发回去 */
+static void dns_child(Udp *sink)
+{
+    char q[512] = { 0 };
+    char reply[600] = { 0 };
+    UdpAddr from = { 0 };
+    int qn = 0, rn = 0;
+
+    sink->set_timeout(5000);
+    qn = sink->recv_from(q, (int)sizeof q, &from);
+    if (qn < 12)
+        _exit(1);
+    memcpy(reply, q, (size_t)qn);
+    reply[2] = (char)0x81;      /* QR=1, RD=1 */
+    reply[3] = (char)0x80;      /* RA=1, rcode=0 */
+    reply[6] = 0;
+    reply[7] = 1;               /* ancount = 1 */
+    rn = qn;
+    reply[rn++] = (char)0xc0;
+    reply[rn++] = 0x0c;         /* 名字指回问题里的偏移 12 */
+    reply[rn++] = 0; reply[rn++] = 1;      /* type A */
+    reply[rn++] = 0; reply[rn++] = 1;      /* class IN */
+    reply[rn++] = 0; reply[rn++] = 0; reply[rn++] = 0; reply[rn++] = 60;
+    reply[rn++] = 0; reply[rn++] = 4;
+    reply[rn++] = 93; reply[rn++] = (char)184; reply[rn++] = (char)216;
+    reply[rn++] = 34;
+    sink->send_to(from.ip, from.port, reply, rn);
+    sink->close_socket();
+}
+
+/* resolver：conf 解析 + 一次真的 UDP 查询（服务器是 fork 出来的子进程） */
+static void tour_resolver(void)
+{
+    Udp sink = udp_bind("127.0.0.1", 0);
+    Resolver r = resolver_from_server("127.0.0.1", sink.port());
+    Resolver conf = { { 0 }, 53, 2000, 0x4000, -1, 0, 0 };
+    Str text = { S("nameserver 10.0.0.1\nnameserver 10.0.0.2\n") };
+    u32 ip = 0, ttl = 0;
+    char addr[64] = { 0 };
+    int pid = 0;
+
+    check(sink.ok() && r.ok(), "resolver: 本地 UDP 服务器");
+    check(resolver_conf_parse(text, &conf) == 2
+          && strcmp(conf.server, "10.0.0.1") == 0, "resolver: resolv.conf");
+    check(r.set_timeout(2000), "resolver: 超时");
+    pid = fork();
+    if (pid == 0) {
+        dns_child(&sink);
+        _exit(0);
+    }
+    check(pid > 0, "resolver: fork");
+    check(r.resolve_a("example.com", &ip, &ttl) == 1, "resolver: A 查询");
+    check(ip == 0x5db8d822u && ttl == 60, "resolver: 地址与 TTL");
+    check(ipv4_format(ip, addr, (int)sizeof addr) == 13
+          && strcmp(addr, "93.184.216.34") == 0, "resolver: 格式化");
+    if (pid > 0) {
+        int st = 0;
+
+        waitpid(pid, &st, 0);
+        check(st == 0, "resolver: 子进程正常退出");
+    }
+    printf("resolver: example.com -> %s（ttl=%u）\n", addr, (unsigned)ttl);
+    sink.close_socket();
+}
+
+/* 子进程：读一个请求，回一段 chunked 响应 */
+static void http_child(Tcp *srv)
+{
+    Tcp peer = srv->accept_client();
+    char req[1024] = { 0 };
+    int n = 0;
+    char *resp = "HTTP/1.1 200 OK\r\n"
+                 "Content-Type: text/plain\r\n"
+                 "Transfer-Encoding: chunked\r\n"
+                 "\r\n"
+                 "5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n";
+
+    if (!peer.ok())
+        _exit(1);
+    peer.set_timeout(5000);
+    while (n < (int)sizeof req - 1) {
+        int k = peer.read_bytes(req + n, (int)sizeof req - 1 - n);
+
+        if (k <= 0)
+            break;
+        n += k;
+        req[n] = 0;
+        if (strstr(req, "\r\n\r\n"))
+            break;
+    }
+    peer.write_all(resp, (int)strlen(resp));
+    peer.close_socket();
+    srv->close_socket();
+}
+
+/* httpc：本地 TCP 服务器上一次完整的 GET（chunked 响应） */
+static void tour_httpc(void)
+{
+    Tcp srv = tcp_listen("127.0.0.1", 0, 4);
+    int p = srv.port();
+    char url[64] = { 0 };
+    char raw[8192] = { 0 };
+    char body[8192] = { 0 };
+    Response res = { 0 };
+    int pid = 0, rc = 0;
+
+    check(srv.ok() && p > 0, "httpc: 监听");
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/hello", p);
+    pid = fork();
+    if (pid == 0) {
+        http_child(&srv);
+        _exit(0);
+    }
+    check(pid > 0, "httpc: fork");
+    rc = fetch(SS("GET"), (Str){ (char[:]){ url, (int)strlen(url) } }, SS(""),
+               SS(""), 3000, raw, (int)sizeof raw, &res, body,
+               (int)sizeof body);
+    check(rc == 1, "httpc: fetch");
+    check(res.status == 200 && res.is_ok(), "httpc: 200");
+    check(res.chunked && res.body.s.len == 12
+          && memcmp(res.body.s.data, "hello, world", 12) == 0,
+          "httpc: chunked body");
+    check(res.header(SS("Content-Type")).s.len == 10
+          && memcmp(res.header(SS("content-type")).s.data, "text/plain", 10) == 0,
+          "httpc: 头字段");
+    {
+        i64 cl = 0;
+
+        check(!res.header_int(SS("Content-Length"), &cl),
+              "httpc: chunked 没有 Content-Length");
+    }
+    if (pid > 0) {
+        int st = 0;
+
+        waitpid(pid, &st, 0);
+        check(st == 0, "httpc: 子进程正常退出");
+    }
+    printf("httpc: %s -> 200 OK，chunked body = \"%.*s\"（%d 字节）\n", url,
+           res.body.s.len, res.body.s.data, res.body.s.len);
+    srv.close_socket();
+}
+
+int main(void)
+{
+    printf("stdclient: 标准库第二十一批（udp / uds / resolver / httpc）\n");
+    tour_udp();
+    tour_uds();
+    tour_resolver();
+    tour_httpc();
+    printf("stdclient: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

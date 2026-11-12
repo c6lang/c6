@@ -1056,3 +1056,31 @@ POSIX 环境里都能跑。
 
 验收：`make stdtest`（93 个模块、0 failure）、`make std-term`（45 条自检全过）、
 `make check-all`。
+
+### 11.33 标准库第二十一批（udp / uds / resolver / httpc）
+
+第二十一批补的是**网络客户端**：第十七批把报文层铺好了
+（`std.net.dns` 的报文、`std.net.ws` 的帧、`std.net.tcp` 的连接），但「怎么发
+一个数据报」、「不用 TCP 的两个本地进程怎么说话」、「域名怎么真的变成地址」、
+「HTTP 响应怎么收完并解出 body」这一层还空着。四个模块仍然全部零分配：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.net.udp` | `udp_bind`/`udp_connect`、收发、超时、广播 | `recv_*` 的返回值分三种：字节数、`0`（空报文，不是错误）、`-1`（超时/错误）；缓冲区小就按 `cap` 截断并返回实际写入长度（`recv_from` 保证不越界）；`udp_connect` 只是记下默认对端（之后也能 `send_to` 别人）；`send_to` 用 `getaddrinfo`，主机名照样能用 |
+| `std.net.uds` | `socketpair`、路径监听/连接、半关闭 | `Uds` 和 `Tcp` 分开是因为生命周期不同：路径 socket 要 `unlink`，抽象命名空间不落盘；`read_*` 到对端关闭返回 `0`（和 `std.os.io` 的「EOF 是 0」一致）；连接超时沿用 `std.net.tcp` 的非阻塞 connect + `poll` |
+| `std.net.resolver` | DNS 查询客户端 | 只做「一次一问」：没有重试、没有 EDNS0、没有 DoT；`parse_reply` 把 id 不匹配、TC 置位（截断）、rcode 非 0、RR 不完整都当失败（返回 0/-1），`a`/`a16` 传 `0` 时只校验不提取；`resolver_conf_parse` 单独暴露，配置文本不用落盘也能测 |
+| `std.net.httpc` | 请求构建、响应解析、chunked、发一次请求 | `build_request` 先量再写（放不下返回 -1 且 `dst` 一个字节不动）；`parse_response` 用 1/0/-1 三态把「完整/还不够/坏报文」分开，`fetch` 靠它决定继续读还是收工；chunked 解到调用方缓冲（零分配），支持扩展与 trailer；只做 `http://`，不跟重定向、不做 100-continue、HEAD 要自己用 `build_request` |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.net.udp`=0x605d、
+`std.net.uds`=0x605e、`std.net.resolver`=0x605f、`std.net.httpc`=0x6060；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-client` 与 `STDCLIENT_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 的依赖表补上 resolver（dns/udp/io/str）
+与 httpc（tcp/url/str）。示例 `examples/stdclient.c6` 里两个「服务器」都用
+`fork` 起在 127.0.0.1 上（一个回 DNS 响应、一个回 chunked 响应），所以整份示例
+离线可跑。顺带修了一个宏污染：glibc 的 `<netdb.h>` 把 `NO_DATA` 定义成宏，
+`import` 在导入方的宏环境里展开，于是 `std/core/err.c6` 的 `enum Error` 成员名
+被替换掉；在 err 模块顶上 `#undef NO_DATA` 之后，同时 include `<netdb.h>` 并
+import `std.os.io` 的 TU 也能编过。
+
+验收：`make stdtest`（97 个模块、0 failure）、`make std-client`（36 条自检全过）、
+`make check-all`。
