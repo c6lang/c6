@@ -1,0 +1,253 @@
+/* std/core/interp：插值、重映射与缓动曲线（纯函数，f64）。
+ *
+ *     import std.core.interp;
+ *
+ *     f64 v = lerp(10.0, 20.0, 0.25);        // 12.5
+ *     f64 t = inv_lerp(10.0, 20.0, 12.5);    // 0.25
+ *     f64 r = remap(5.0, 0.0, 10.0, 100.0, 200.0);   // 150
+ *     f64 a = ease(EASE_IN_QUAD, 0.5);       // 0.25
+ *     f64 s = smoothstep(0.5);               // 0.5
+ *
+ * 这一层给动画/采样/映射用的小工具：线性插值、逆插值、区间重映射、
+ * smoothstep/smootherstep、几条常用缓动曲线和 Catmull-Rom 一维插值。
+ * 全部是纯函数、不分配、不链 libm。
+ *
+ * 约定：
+ *
+ * - `lerp` **不钳制** `t`（外插是合法用法）；要钳制用 `lerp_clamped`；
+ * - `inv_lerp` 在 `a == b` 时返回 0（不产生除零）；`remap` 同理；
+ * - `ease(kind, t)` 假定 t 在 [0,1]，但**不钳制**；`EASE_*` 端点都满足
+ *   f(0)=0、f(1)=1（`EASE_OUT_BACK` 在中间会超过 1，这是它的定义）；
+ * - `catmull_rom` 的分段参数 t 在 [0,1] 内，p1/p2 是这一段的两端；
+ * - `ease` 的 kind 不认识时按线性处理。
+ */
+#include <string.h>
+
+module std.core.interp;
+import std.core.types;
+
+enum Easing {
+    EASE_LINEAR = 0,
+    EASE_IN_QUAD = 1,
+    EASE_OUT_QUAD = 2,
+    EASE_IN_OUT_QUAD = 3,
+    EASE_IN_CUBIC = 4,
+    EASE_OUT_CUBIC = 5,
+    EASE_IN_OUT_CUBIC = 6,
+    EASE_IN_SINE = 7,
+    EASE_OUT_SINE = 8,
+    EASE_IN_OUT_SINE = 9,
+    EASE_OUT_BACK = 10,
+};
+
+#define INTERP_PI 3.14159265358979323846
+
+f64 lerp(f64 a, f64 b, f64 t) { return a + (b - a) * t; }
+
+f64 lerp_clamped(f64 a, f64 b, f64 t)
+{
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 1.0)
+        t = 1.0;
+    return lerp(a, b, t);
+}
+
+/* (v - a) / (b - a)；a == b 时给 0 */
+f64 inv_lerp(f64 a, f64 b, f64 v)
+{
+    f64 d = b - a;
+
+    if (d == 0.0)
+        return 0.0;
+    return (v - a) / d;
+}
+
+/* 把 in 区间里的 v 映射到 out 区间（不钳制） */
+f64 remap(f64 v, f64 in_lo, f64 in_hi, f64 out_lo, f64 out_hi)
+{
+    return lerp(out_lo, out_hi, inv_lerp(in_lo, in_hi, v));
+}
+
+/* 3t^2 - 2t^3 */
+f64 smoothstep(f64 t) { return t * t * (3.0 - 2.0 * t); }
+
+/* 6t^5 - 15t^4 + 10t^3 */
+f64 smootherstep(f64 t)
+{
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+/* sin(pi*t/2)，t 在 [0,1]：泰勒级数到 x^15，端点误差 < 1e-12，不链 libm */
+static f64 interp_sin(f64 t)
+{
+    f64 x = t * (INTERP_PI * 0.5);
+    f64 x2 = x * x;
+    f64 term = x;
+    f64 sum = x;
+    int k = 0;
+
+    for (k = 1; k <= 7; k++) {
+        term = -term * x2 / (f64)((2 * k) * (2 * k + 1));
+        sum += term;
+    }
+    return sum;
+}
+
+f64 ease(int kind, f64 t)
+{
+    switch (kind) {
+    case EASE_IN_QUAD:
+        return t * t;
+    case EASE_OUT_QUAD:
+        return t * (2.0 - t);
+    case EASE_IN_OUT_QUAD:
+        if (t < 0.5)
+            return 2.0 * t * t;
+        return 1.0 - 2.0 * (1.0 - t) * (1.0 - t);
+    case EASE_IN_CUBIC:
+        return t * t * t;
+    case EASE_OUT_CUBIC:
+        {
+            f64 u = 1.0 - t;
+
+            return 1.0 - u * u * u;
+        }
+    case EASE_IN_OUT_CUBIC:
+        if (t < 0.5)
+            return 4.0 * t * t * t;
+        {
+            f64 u = 1.0 - t;
+
+            return 1.0 - 4.0 * u * u * u;
+        }
+    case EASE_IN_SINE:
+        return 1.0 - interp_sin(1.0 - t);
+    case EASE_OUT_SINE:
+        return interp_sin(t);
+    case EASE_IN_OUT_SINE:
+        if (t < 0.5)
+            return 0.5 * (1.0 - interp_sin(1.0 - 2.0 * t));
+        return 0.5 + 0.5 * interp_sin(2.0 * t - 1.0);
+    case EASE_OUT_BACK:
+        {
+            f64 u = t - 1.0;
+            f64 c = 1.70158;
+
+            return 1.0 + (c + 1.0) * u * u * u + c * u * u;
+        }
+    case EASE_LINEAR:
+    default:
+        return t;
+    }
+}
+
+/* 一维 Catmull-Rom：p1 -> p2，p0/p3 是影响切线的前后点 */
+f64 catmull_rom(f64 p0, f64 p1, f64 p2, f64 p3, f64 t)
+{
+    f64 t2 = t * t;
+    f64 t3 = t2 * t;
+
+    return 0.5 * ((2.0 * p1) + (-p0 + p2) * t
+                  + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                  + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+}
+
+/* ---- 自测 ---- */
+
+static int close_to(f64 a, f64 b, f64 eps)
+{
+    f64 d = a - b;
+
+    if (d < 0.0)
+        d = -d;
+    return d <= eps;
+}
+
+test "lerp / inv_lerp / remap 与 smoothstep" {
+    if (lerp(10.0, 20.0, 0.25) != 12.5)
+        return err(1, "lerp 不对");
+    if (lerp(10.0, 20.0, 2.0) != 30.0)
+        return err(2, "lerp 应该允许外插");
+    if (lerp_clamped(10.0, 20.0, 2.0) != 20.0
+        || lerp_clamped(10.0, 20.0, -1.0) != 10.0)
+        return err(3, "lerp_clamped 不对");
+    if (inv_lerp(10.0, 20.0, 12.5) != 0.25)
+        return err(4, "inv_lerp 不对");
+    if (inv_lerp(5.0, 5.0, 7.0) != 0.0)
+        return err(5, "inv_lerp 除零应该给 0");
+    if (remap(5.0, 0.0, 10.0, 100.0, 200.0) != 150.0)
+        return err(6, "remap 不对");
+    if (remap(0.0, 0.0, 0.0, 1.0, 2.0) != 1.0)
+        return err(7, "remap 除零应该给 out_lo");
+    if (smoothstep(0.0) != 0.0 || smoothstep(1.0) != 1.0
+        || smoothstep(0.5) != 0.5)
+        return err(8, "smoothstep 端点/中点不对");
+    if (smootherstep(0.0) != 0.0 || smootherstep(1.0) != 1.0
+        || smootherstep(0.5) != 0.5)
+        return err(9, "smootherstep 端点/中点不对");
+    /* 单调：smoothstep 在 [0,1] 上递增 */
+    {
+        f64 prev = -1.0;
+        int i = 0;
+
+        for (i = 0; i <= 20; i++) {
+            f64 v = smoothstep((f64)i / 20.0);
+
+            if (v < prev)
+                return err(10, "smoothstep 不单调");
+            prev = v;
+        }
+    }
+}
+
+test "缓动曲线的端点、中点与数值" {
+    int kinds[11] = { EASE_LINEAR, EASE_IN_QUAD, EASE_OUT_QUAD,
+                      EASE_IN_OUT_QUAD, EASE_IN_CUBIC, EASE_OUT_CUBIC,
+                      EASE_IN_OUT_CUBIC, EASE_IN_SINE, EASE_OUT_SINE,
+                      EASE_IN_OUT_SINE, EASE_OUT_BACK };
+    int i = 0;
+
+    for (i = 0; i < 11; i++) {
+        f64 a = ease(kinds[i], 0.0);
+        f64 b = ease(kinds[i], 1.0);
+
+        if (!close_to(a, 0.0, 1e-9) || !close_to(b, 1.0, 1e-9))
+            return err(11, "缓动曲线的端点必须是 0 和 1");
+    }
+    if (ease(EASE_IN_QUAD, 0.5) != 0.25)
+        return err(12, "ease_in_quad(0.5) 不对");
+    if (ease(EASE_OUT_QUAD, 0.5) != 0.75)
+        return err(13, "ease_out_quad(0.5) 不对");
+    if (ease(EASE_IN_CUBIC, 0.5) != 0.125)
+        return err(14, "ease_in_cubic(0.5) 不对");
+    if (!close_to(ease(EASE_IN_OUT_CUBIC, 0.5), 0.5, 1e-12))
+        return err(15, "ease_in_out_cubic(0.5) 不对");
+    if (!close_to(ease(EASE_IN_OUT_SINE, 0.5), 0.5, 1e-6))
+        return err(16, "ease_in_out_sine(0.5) 不对");
+    if (!close_to(ease(EASE_OUT_SINE, 0.5), 0.70710678, 1e-4))
+        return err(17, "ease_out_sine(0.5) 不对");
+    /* 不认识的 kind 按线性 */
+    if (ease(99, 0.3) != 0.3)
+        return err(18, "未知 kind 应该按线性");
+    /* OUT_BACK 会超过 1 */
+    {
+        int over = 0;
+        int k = 0;
+
+        for (k = 1; k < 10; k++)
+            if (ease(EASE_OUT_BACK, (f64)k / 10.0) > 1.0)
+                over = 1;
+        if (!over)
+            return err(19, "out_back 中段应该超过 1");
+    }
+    /* Catmull-Rom 端点与直线情形 */
+    if (!close_to(catmull_rom(0.0, 1.0, 2.0, 3.0, 0.0), 1.0, 1e-12)
+        || !close_to(catmull_rom(0.0, 1.0, 2.0, 3.0, 1.0), 2.0, 1e-12))
+        return err(20, "catmull_rom 端点不对");
+    if (!close_to(catmull_rom(0.0, 1.0, 2.0, 3.0, 0.5), 1.5, 1e-12))
+        return err(21, "catmull_rom 中点不对");
+    /* 直线上的四点应该给线性结果 */
+    if (!close_to(catmull_rom(1.0, 2.0, 3.0, 4.0, 0.25), 2.25, 1e-12))
+        return err(22, "catmull_rom 直线插值不对");
+}

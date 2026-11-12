@@ -1,0 +1,333 @@
+/* std/core/geometry：二维/三维向量与矩形（纯值，f64）。
+ *
+ *     import std.core.geometry;
+ *
+ *     Vec2 a = vec2(3.0, 4.0);
+ *     f64 n = vec2_len(a);                  // 5.0
+ *     Vec2 b = vec2_norm(a);                // (0.6, 0.8)
+ *     Rect r = rect(0, 0, 10, 20);
+ *     if (rect_contains(r, a)) ...          // 注意 a 的 y=4 在范围内
+ *
+ * 为什么是自由函数而不是方法：`Vec2`/`Vec3`/`Rect` 都是**值类型**，传值比传
+ * 指针自然（`vec2_add(a, b)` 读起来就是数学式）；按 `docs/stdlib.md` 的约定，
+ * 「首参是 `T *`」才必须写成方法，所以这里用 `vec2_*`/`vec3_*`/`rect_*` 前缀
+ * 避免和别的模块撞名。
+ *
+ * 约定：
+ *
+ * - 所有函数都是纯函数，不分配、不改入参；`vec2_norm` 对零向量返回 (0, 0)
+ *   （不产生 NaN）；
+ * - 角度用弧度，`deg2rad`/`rad2deg` 提供换算（不链 libm）；
+ * - `Rect` 的 `w`/`h` 允许为负？不允许：`rect()` 把负宽/高翻成正的，
+ *   `rect_intersect` 无交集时返回 `w == 0`（用 `rect_empty` 判断）；
+ * - 比较浮点是否相等不提供，调用方自己用容差。
+ */
+
+module std.core.geometry;
+import std.core.types;
+
+struct Vec2 {
+    f64 x;
+    f64 y;
+};
+
+struct Vec3 {
+    f64 x;
+    f64 y;
+    f64 z;
+};
+
+struct Rect {
+    f64 x;
+    f64 y;
+    f64 w;
+    f64 h;
+};
+
+#define GEO_PI 3.14159265358979323846
+
+Vec2 vec2(f64 x, f64 y)
+{
+    Vec2 v = { x, y };
+
+    return v;
+}
+
+Vec2 vec2_add(Vec2 a, Vec2 b) { return vec2(a.x + b.x, a.y + b.y); }
+
+Vec2 vec2_sub(Vec2 a, Vec2 b) { return vec2(a.x - b.x, a.y - b.y); }
+
+Vec2 vec2_scale(Vec2 a, f64 k) { return vec2(a.x * k, a.y * k); }
+
+f64 vec2_dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
+
+/* 二维叉积的标量值（z 分量）：>0 表示 b 在 a 的逆时针方向 */
+f64 vec2_cross(Vec2 a, Vec2 b) { return a.x * b.y - a.y * b.x; }
+
+f64 vec2_len_sq(Vec2 a) { return a.x * a.x + a.y * a.y; }
+
+f64 vec2_len(Vec2 a)
+{
+    f64 l = vec2_len_sq(a);
+
+    if (l <= 0.0)
+        return 0.0;
+    /* 牛顿迭代开方，避免链 libm 的 sqrt */
+    {
+        f64 g = l > 1.0 ? l : 1.0;
+        int i = 0;
+
+        for (i = 0; i < 32; i++)
+            g = 0.5 * (g + l / g);
+        return g;
+    }
+}
+
+Vec2 vec2_norm(Vec2 a)
+{
+    f64 l = vec2_len(a);
+
+    if (l <= 0.0)
+        return vec2(0.0, 0.0);
+    return vec2(a.x / l, a.y / l);
+}
+
+Vec2 vec2_lerp(Vec2 a, Vec2 b, f64 t)
+{
+    return vec2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+}
+
+/* 逆时针旋转 90 度 */
+Vec2 vec2_perp(Vec2 a) { return vec2(-a.y, a.x); }
+
+Vec3 vec3(f64 x, f64 y, f64 z)
+{
+    Vec3 v = { x, y, z };
+
+    return v;
+}
+
+Vec3 vec3_add(Vec3 a, Vec3 b) { return vec3(a.x + b.x, a.y + b.y, a.z + b.z); }
+
+Vec3 vec3_sub(Vec3 a, Vec3 b) { return vec3(a.x - b.x, a.y - b.y, a.z - b.z); }
+
+Vec3 vec3_scale(Vec3 a, f64 k)
+{
+    return vec3(a.x * k, a.y * k, a.z * k);
+}
+
+f64 vec3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+Vec3 vec3_cross(Vec3 a, Vec3 b)
+{
+    return vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+                a.x * b.y - a.y * b.x);
+}
+
+f64 vec3_len_sq(Vec3 a) { return a.x * a.x + a.y * a.y + a.z * a.z; }
+
+f64 vec3_len(Vec3 a)
+{
+    f64 l = vec3_len_sq(a);
+    f64 g = 0.0;
+    int i = 0;
+
+    if (l <= 0.0)
+        return 0.0;
+    g = l > 1.0 ? l : 1.0;
+    for (i = 0; i < 32; i++)
+        g = 0.5 * (g + l / g);
+    return g;
+}
+
+Vec3 vec3_norm(Vec3 a)
+{
+    f64 l = vec3_len(a);
+
+    if (l <= 0.0)
+        return vec3(0.0, 0.0, 0.0);
+    return vec3(a.x / l, a.y / l, a.z / l);
+}
+
+Vec3 vec3_lerp(Vec3 a, Vec3 b, f64 t)
+{
+    return vec3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+                a.z + (b.z - a.z) * t);
+}
+
+/* 矩形：负宽高翻正（左上角跟着挪） */
+Rect rect(f64 x, f64 y, f64 w, f64 h)
+{
+    Rect r = { x, y, w, h };
+
+    if (w < 0.0) {
+        r.x = x + w;
+        r.w = -w;
+    }
+    if (h < 0.0) {
+        r.y = y + h;
+        r.h = -h;
+    }
+    return r;
+}
+
+f64 rect_area(Rect r) { return r.w * r.h; }
+
+int rect_empty(Rect r) { return r.w <= 0.0 || r.h <= 0.0; }
+
+Vec2 rect_center(Rect r)
+{
+    return vec2(r.x + r.w * 0.5, r.y + r.h * 0.5);
+}
+
+/* 点在矩形内（含边界） */
+int rect_contains(Rect r, Vec2 p)
+{
+    return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+}
+
+int rect_intersects(Rect a, Rect b)
+{
+    if (rect_empty(a) || rect_empty(b))
+        return 0;
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h
+           && b.y < a.y + a.h;
+}
+
+/* 交集：没有交集时给 w == 0 的空矩形 */
+Rect rect_intersect(Rect a, Rect b)
+{
+    f64 x0 = a.x > b.x ? a.x : b.x;
+    f64 y0 = a.y > b.y ? a.y : b.y;
+    f64 x1 = (a.x + a.w) < (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    f64 y1 = (a.y + a.h) < (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+
+    if (x1 <= x0 || y1 <= y0)
+        return rect(x0, y0, 0.0, 0.0);
+    return rect(x0, y0, x1 - x0, y1 - y0);
+}
+
+Rect rect_union(Rect a, Rect b)
+{
+    f64 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+
+    if (rect_empty(a))
+        return b;
+    if (rect_empty(b))
+        return a;
+    x0 = a.x < b.x ? a.x : b.x;
+    y0 = a.y < b.y ? a.y : b.y;
+    x1 = (a.x + a.w) > (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    y1 = (a.y + a.h) > (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+    return rect(x0, y0, x1 - x0, y1 - y0);
+}
+
+/* 四周各外扩 d（d < 0 是收缩） */
+Rect rect_expand(Rect r, f64 d)
+{
+    return rect(r.x - d, r.y - d, r.w + 2.0 * d, r.h + 2.0 * d);
+}
+
+f64 clampf(f64 v, f64 lo, f64 hi)
+{
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+    return v;
+}
+
+f64 deg2rad(f64 deg) { return deg * GEO_PI / 180.0; }
+
+f64 rad2deg(f64 rad) { return rad * 180.0 / GEO_PI; }
+
+/* ---- 自测 ---- */
+
+test "Vec2 / Vec3 的运算" {
+    Vec2 a = vec2(3.0, 4.0), b = vec2(1.0, 2.0);
+    Vec3 u = vec3(0.0, 0.0, 1.0), v = vec3(0.0, 1.0, 0.0);
+
+    if (vec2_len_sq(a) != 25.0 || vec2_len(a) != 5.0)
+        return err(1, "长度不对");
+    if (vec2_dot(a, b) != 11.0)
+        return err(2, "点积不对");
+    if (vec2_cross(a, b) != 2.0)
+        return err(3, "叉积不对");
+    {
+        Vec2 s = vec2_add(a, b), d = vec2_sub(a, b);
+        Vec2 k = vec2_scale(a, 2.0), n = vec2_norm(a);
+        Vec2 p = vec2_perp(a), m = vec2_lerp(a, b, 0.5);
+
+        if (s.x != 4.0 || s.y != 6.0 || d.x != 2.0 || d.y != 2.0)
+            return err(4, "加减不对");
+        if (k.x != 6.0 || k.y != 8.0)
+            return err(5, "数乘不对");
+        if (n.x != 0.6 || n.y != 0.8)
+            return err(6, "单位化不对");
+        if (p.x != -4.0 || p.y != 3.0)
+            return err(7, "垂直向量不对");
+        if (m.x != 2.0 || m.y != 3.0)
+            return err(8, "lerp 不对");
+    }
+    /* 零向量不产生 NaN */
+    {
+        Vec2 z = vec2_norm(vec2(0.0, 0.0));
+
+        if (z.x != 0.0 || z.y != 0.0)
+            return err(9, "零向量单位化应该是零");
+    }
+    if (vec3_dot(u, v) != 0.0)
+        return err(10, "三维点积不对");
+    {
+        Vec3 c = vec3_cross(u, v);
+
+        if (c.x != -1.0 || c.y != 0.0 || c.z != 0.0)
+            return err(11, "三维叉积不对");
+        if (vec3_len(vec3(2.0, 3.0, 6.0)) != 7.0)
+            return err(12, "三维长度不对");
+        if (vec3_norm(vec3(0.0, 3.0, 4.0)).y != 0.6)
+            return err(13, "三维单位化不对");
+    }
+}
+
+test "Rect 与标量工具" {
+    Rect r = rect(0.0, 0.0, 10.0, 20.0);
+    Rect s = rect(5.0, 10.0, 10.0, 10.0);
+    Rect neg = rect(10.0, 20.0, -10.0, -20.0);
+    Rect i = rect_intersect(r, s);
+    Rect u = rect_union(r, s);
+    Rect far = rect(100.0, 100.0, 1.0, 1.0);
+
+    if (rect_area(r) != 200.0 || rect_empty(r) || rect_empty(far) != 0)
+        return err(14, "面积/空判断不对");
+    if (!rect_contains(r, vec2(0.0, 0.0))
+        || !rect_contains(r, vec2(10.0, 20.0))
+        || rect_contains(r, vec2(10.1, 20.0)))
+        return err(15, "contains 不对");
+    if (!rect_intersects(r, s) || rect_intersects(r, far))
+        return err(16, "intersects 不对");
+    if (i.x != 5.0 || i.y != 10.0 || i.w != 5.0 || i.h != 10.0)
+        return err(17, "交集不对");
+    if (!rect_empty(rect_intersect(r, far)))
+        return err(18, "无交集应该是空矩形");
+    if (u.x != 0.0 || u.y != 0.0 || u.w != 15.0 || u.h != 20.0)
+        return err(19, "并集不对");
+    if (neg.x != 0.0 || neg.y != 0.0 || neg.w != 10.0 || neg.h != 20.0)
+        return err(20, "负宽高应该翻正");
+    if (rect_center(r).x != 5.0 || rect_center(r).y != 10.0)
+        return err(21, "中心不对");
+    if (rect_expand(r, 1.0).w != 12.0 || rect_expand(r, -1.0).w != 8.0)
+        return err(22, "外扩/收缩不对");
+    if (clampf(5.0, 0.0, 3.0) != 3.0 || clampf(-1.0, 0.0, 3.0) != 0.0
+        || clampf(2.0, 0.0, 3.0) != 2.0)
+        return err(23, "clamp 不对");
+    {
+        f64 d = deg2rad(180.0);
+        f64 back = rad2deg(GEO_PI / 2.0);
+
+        if (d < 3.14159 || d > 3.1416)
+            return err(24, "deg2rad 不对");
+        if (back < 89.999 || back > 90.001)
+            return err(25, "rad2deg 不对");
+    }
+}

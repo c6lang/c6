@@ -1205,3 +1205,26 @@ aes/poly1305/random 自成一体。示例 `examples/stdcipher.c6` 前半段逐�
 
 验收：`make stdtest`（117 个模块、0 failure）、`make std-data`（15 条自检全过）、
 `make check-all`。
+
+### 11.39 标准库第二十七批（geometry / interp / stats / matrix）
+
+第二十七批补的是**数值工具**：`std.core.math` 只有标量函数，`std.core.complex`/
+`bignum`/`decimal`/`rational` 是数本身，但「向量怎么算、区间怎么映射、一组
+样本的方差是多少、矩阵怎么解」这一层还空着。四个模块都是纯函数、零分配：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.geometry` | Vec2/Vec3/Rect | 值类型 + 自由函数（`vec2_add(a, b)` 读起来就是数学式，也符合「首参 `T *` 才是方法」的约定）；零向量单位化给 (0,0) 不产生 NaN；开方用牛顿迭代（32 次），不链 libm；`Rect` 负宽高翻正，`rect_intersect` 无交集给 `w == 0` |
+| `std.core.interp` | 插值/重映射/缓动 | `lerp` 不钳制（外插合法），`lerp_clamped` 才钳；11 条缓动曲线的端点严格 f(0)=0、f(1)=1（测试逐条钉），`out_back` 中段按定义超过 1；sin 用 15 阶泰勒级数（端点误差 <1e-12），不链 libm |
+| `std.core.stats` | 描述统计 | 流式用 Welford（比 `sum(x²)-n·mean²` 稳），一遍数据给均值/样本方差/总体方差/标准差/最值；分位数/中位数就地插入排序 + 线性插值（和 numpy 默认口径一致）；直方图左闭右开、右端点进最后一格；空样本全给 0 不产生 NaN |
+| `std.core.matrix` | 行主序矩阵 | 缓冲由调用方给，`mat_strided` 允许行间有空洞（子矩阵/图像行走廊）；`det`/`solve` 用部分主元高斯消元，scratch 也由调用方给（零分配）；维度不匹配返回 0、参数错返回 -1；结果不能和入参重叠（不做临时拷贝） |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.stats`=0x6075、
+`std.core.matrix`=0x6076、`std.core.geometry`=0x6077、`std.core.interp`=0x6078；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-calc` 与 `STDCALC_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 的依赖表里四个模块都自成一体。
+示例 `examples/stdcalc.c6` 把四节串成「采样 → 统计 → 线性拟合 → 坐标变换 →
+缓动」的链路，全是纯计算。
+
+验收：`make stdtest`（121 个模块、0 failure）、`make std-calc`（32 条自检全过）、
+`make check-all`。

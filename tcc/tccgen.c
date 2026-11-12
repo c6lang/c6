@@ -12811,6 +12811,10 @@ static const struct C6ErrStdSlot {
     { "std.data.cbor",          C6_ERR_SLOT_STD + 114 },
     { "std.data.bencode",       C6_ERR_SLOT_STD + 115 },
     { "std.data.pem",           C6_ERR_SLOT_STD + 116 },
+    { "std.core.stats",         C6_ERR_SLOT_STD + 117 },
+    { "std.core.matrix",        C6_ERR_SLOT_STD + 118 },
+    { "std.core.geometry",      C6_ERR_SLOT_STD + 119 },
+    { "std.core.interp",        C6_ERR_SLOT_STD + 120 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

@@ -1,0 +1,475 @@
+/* std/core/matrix：行主序矩阵（f64，缓冲由调用方给，零分配）。
+ *
+ *     import std.core.matrix;
+ *
+ *     f64 buf[4] = { 1, 2, 3, 4 };          // 2x2
+ *     Mat m = mat(buf, 2, 2);
+ *     f64 out[4] = { 0 };
+ *     Mat r = mat(out, 2, 2);
+ *     r.mul(&m, &m);                        // r = m * m
+ *     f64 d = m.det(work);                  // 需要 r*c 大小的 scratch
+ *
+ * 为什么不是「会自己分配」的矩阵库：标准库的数值层统一走「结果写调用方缓冲」
+ * 的路子，这样矩阵可以是栈上的、可以是更大缓冲里的一块（`mat_strided` 支持
+ * 行间有空洞，方便切子矩阵/图像行），也不会因为一次 `mul` 在堆上留垃圾。
+ *
+ * 约定：
+ *
+ * - 布局是行主序：`a[r * step + c]`；`step >= cols`，`mat()` 的 step = cols，
+ *   `mat_strided` 让调用方给 step（子矩阵视图、图像行对齐都用得上）；
+ * - 运算都检查维度，不匹配返回 0（`det`/`solve` 对非方阵也返回 0），参数错
+ *   （空指针、维度为负）返回 -1；`add`/`sub`/`mul` 的结果不能和入参重叠
+ *   （库不做临时拷贝，重叠时结果未定义）；
+ * - `det`/`solve` 会把矩阵拷贝到调用方给的 `work` 里做高斯消元（部分主元），
+ *   `work` 至少 `rows * cols` 个 f64；`solve` 的 `work` 同上，`b`/`x` 长度是
+ *   `rows`；
+ * - 浮点比较不提供（没有 epsilon），调用方自己判。
+ */
+
+module std.core.matrix;
+import std.core.types;
+
+static f64 mat_abs(f64 v) { return v < 0.0 ? -v : v; }
+
+struct Mat {
+    f64 *a;
+    int rows_n;
+    int cols_n;
+    int step;
+};
+
+Mat mat(void *buf, int rows, int cols)
+{
+    Mat m = { (f64 *)buf, rows, cols, cols };
+
+    if (!buf || rows <= 0 || cols <= 0) {
+        m.a = 0;
+        m.rows_n = 0;
+        m.cols_n = 0;
+        m.step = 0;
+    }
+    return m;
+}
+
+Mat mat_strided(void *buf, int rows, int cols, int step)
+{
+    Mat m = mat(buf, rows, cols);
+
+    if (m.a && step >= cols)
+        m.step = step;
+    else if (m.a) {
+        m.a = 0;
+        m.rows_n = 0;
+        m.cols_n = 0;
+        m.step = 0;
+    }
+    return m;
+}
+
+int ok(Mat *self) { return self && self->a && self->rows_n > 0 && self->cols_n > 0; }
+
+int rows(Mat *self) { return self ? self->rows_n : 0; }
+
+int cols(Mat *self) { return self ? self->cols_n : 0; }
+
+int stride(Mat *self) { return self ? self->step : 0; }
+
+f64 at(Mat *self, int r, int c)
+{
+    if (!ok(self) || r < 0 || r >= self->rows_n || c < 0 || c >= self->cols_n)
+        return 0.0;
+    return self->a[r * self->step + c];
+}
+
+/* 1 写入 / 0 越界 */
+int set(Mat *self, int r, int c, f64 v)
+{
+    if (!ok(self) || r < 0 || r >= self->rows_n || c < 0 || c >= self->cols_n)
+        return 0;
+    self->a[r * self->step + c] = v;
+    return 1;
+}
+
+void fill(Mat *self, f64 v)
+{
+    int r = 0, c = 0;
+
+    if (!ok(self))
+        return;
+    for (r = 0; r < self->rows_n; r++)
+        for (c = 0; c < self->cols_n; c++)
+            self->a[r * self->step + c] = v;
+}
+
+/* 方阵的单位阵；非方阵返回 0 */
+int identity(Mat *self)
+{
+    int r = 0, c = 0;
+
+    if (!ok(self) || self->rows_n != self->cols_n)
+        return 0;
+    for (r = 0; r < self->rows_n; r++)
+        for (c = 0; c < self->cols_n; c++)
+            self->a[r * self->step + c] = (r == c) ? 1.0 : 0.0;
+    return 1;
+}
+
+static int same_dims(Mat *x, Mat *y)
+{
+    return x->rows_n == y->rows_n && x->cols_n == y->cols_n;
+}
+
+/* self = a + b */
+int add(Mat *self, Mat *a, Mat *b)
+{
+    int r = 0, c = 0;
+
+    if (!ok(self) || !ok(a) || !ok(b))
+        return -1;
+    if (!same_dims(self, a) || !same_dims(a, b))
+        return 0;
+    for (r = 0; r < self->rows_n; r++)
+        for (c = 0; c < self->cols_n; c++)
+            self->a[r * self->step + c] = at(a, r, c) + at(b, r, c);
+    return 1;
+}
+
+/* self = a - b */
+int sub(Mat *self, Mat *a, Mat *b)
+{
+    int r = 0, c = 0;
+
+    if (!ok(self) || !ok(a) || !ok(b))
+        return -1;
+    if (!same_dims(self, a) || !same_dims(a, b))
+        return 0;
+    for (r = 0; r < self->rows_n; r++)
+        for (c = 0; c < self->cols_n; c++)
+            self->a[r * self->step + c] = at(a, r, c) - at(b, r, c);
+    return 1;
+}
+
+/* self = a * k */
+int scale(Mat *self, f64 k)
+{
+    int r = 0, c = 0;
+
+    if (!ok(self))
+        return -1;
+    for (r = 0; r < self->rows_n; r++)
+        for (c = 0; c < self->cols_n; c++)
+            self->a[r * self->step + c] *= k;
+    return 1;
+}
+
+/* self = a * b（self 不能和 a/b 重叠） */
+int mul(Mat *self, Mat *a, Mat *b)
+{
+    int r = 0, c = 0, k = 0;
+
+    if (!ok(self) || !ok(a) || !ok(b))
+        return -1;
+    if (self->rows_n != a->rows_n || self->cols_n != b->cols_n
+        || a->cols_n != b->rows_n)
+        return 0;
+    for (r = 0; r < self->rows_n; r++) {
+        for (c = 0; c < self->cols_n; c++) {
+            f64 sum = 0.0;
+
+            for (k = 0; k < a->cols_n; k++)
+                sum += at(a, r, k) * at(b, k, c);
+            self->a[r * self->step + c] = sum;
+        }
+    }
+    return 1;
+}
+
+/* self = a^T（self 的维度应该是 a.cols x a.rows） */
+int transpose(Mat *self, Mat *a)
+{
+    int r = 0, c = 0;
+
+    if (!ok(self) || !ok(a))
+        return -1;
+    if (self->rows_n != a->cols_n || self->cols_n != a->rows_n)
+        return 0;
+    for (r = 0; r < self->rows_n; r++)
+        for (c = 0; c < self->cols_n; c++)
+            self->a[r * self->step + c] = at(a, c, r);
+    return 1;
+}
+
+f64 trace(Mat *self)
+{
+    f64 sum = 0.0;
+    int i = 0, n = 0;
+
+    if (!ok(self) || self->rows_n != self->cols_n)
+        return 0.0;
+    n = self->rows_n;
+    for (i = 0; i < n; i++)
+        sum += at(self, i, i);
+    return sum;
+}
+
+/* 行列式：把 self 拷到 work 上做部分主元高斯消元；非方阵/空 work 给 -1 */
+f64 det(Mat *self, f64 *work)
+{
+    int n = 0, i = 0, j = 0, k = 0, sign = 1;
+    f64 d = 1.0;
+
+    if (!ok(self) || !work)
+        return -1.0;
+    if (self->rows_n != self->cols_n)
+        return -1.0;
+    n = self->rows_n;
+    for (i = 0; i < n; i++)
+        for (j = 0; j < n; j++)
+            work[i * n + j] = at(self, i, j);
+    for (i = 0; i < n; i++) {
+        int piv = i;
+
+        for (k = i + 1; k < n; k++)
+            if (mat_abs(work[k * n + i]) > mat_abs(work[piv * n + i]))
+                piv = k;
+        if (work[piv * n + i] == 0.0)
+            return 0.0;
+        if (piv != i) {
+            for (j = 0; j < n; j++) {
+                f64 t = work[i * n + j];
+
+                work[i * n + j] = work[piv * n + j];
+                work[piv * n + j] = t;
+            }
+            sign = -sign;
+        }
+        d *= work[i * n + i];
+        for (k = i + 1; k < n; k++) {
+            f64 f = work[k * n + i] / work[i * n + i];
+
+            for (j = i; j < n; j++)
+                work[k * n + j] -= f * work[i * n + j];
+        }
+    }
+    return sign < 0 ? -d : d;
+}
+
+/* 解 A x = b：1 成功 / 0 奇异 / -1 参数错 */
+int solve(Mat *a, f64 *b, f64 *x, f64 *work)
+{
+    int n = 0, i = 0, j = 0, k = 0;
+
+    if (!ok(a) || !b || !x || !work)
+        return -1;
+    if (a->rows_n != a->cols_n)
+        return -1;
+    n = a->rows_n;
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < n; j++)
+            work[i * n + j] = at(a, i, j);
+        x[i] = b[i];
+    }
+    for (i = 0; i < n; i++) {
+        int piv = i;
+
+        for (k = i + 1; k < n; k++)
+            if (mat_abs(work[k * n + i]) > mat_abs(work[piv * n + i]))
+                piv = k;
+        if (work[piv * n + i] == 0.0)
+            return 0;
+        if (piv != i) {
+            f64 t = 0.0;
+
+            for (j = 0; j < n; j++) {
+                t = work[i * n + j];
+                work[i * n + j] = work[piv * n + j];
+                work[piv * n + j] = t;
+            }
+            t = x[i];
+            x[i] = x[piv];
+            x[piv] = t;
+        }
+        for (k = i + 1; k < n; k++) {
+            f64 f = work[k * n + i] / work[i * n + i];
+
+            for (j = i; j < n; j++)
+                work[k * n + j] -= f * work[i * n + j];
+            x[k] -= f * x[i];
+        }
+    }
+    /* 回代 */
+    for (i = n - 1; i >= 0; i--) {
+        f64 s = x[i];
+
+        for (j = i + 1; j < n; j++)
+            s -= work[i * n + j] * x[j];
+        x[i] = s / work[i * n + i];
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static int close_to(f64 a, f64 b)
+{
+    f64 d = a - b;
+
+    if (d < 0.0)
+        d = -d;
+    return d <= 1e-9;
+}
+
+test "取值、填充、单位阵与加减" {
+    f64 buf[6] = { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+    Mat m = mat(buf, 2, 3);
+    f64 out[6] = { 0 };
+    Mat o = mat(out, 2, 3);
+    f64 idb[4] = { 0 };
+    Mat id = mat(idb, 2, 2);
+
+    if (!m.ok() || m.rows() != 2 || m.cols() != 3 || m.stride() != 3)
+        return err(1, "2x3 的维度不对");
+    if (at(&m, 0, 0) != 1.0 || at(&m, 1, 2) != 6.0)
+        return err(2, "取值不对");
+    if (at(&m, 2, 0) != 0.0 || at(&m, 0, 3) != 0.0)
+        return err(3, "越界取值应该给 0");
+    if (!m.set(0, 1, 20.0) || at(&m, 0, 1) != 20.0)
+        return err(4, "set 不对");
+    if (m.set(2, 0, 1.0))
+        return err(5, "越界 set 应该返回 0");
+    m.set(0, 1, 2.0);
+    o.fill(1.0);
+    if (at(&o, 1, 2) != 1.0)
+        return err(6, "fill 不对");
+    if (!id.identity() || at(&id, 0, 0) != 1.0 || at(&id, 0, 1) != 0.0)
+        return err(7, "单位阵不对");
+    if (o.add(&m, &m) != 1 || at(&o, 0, 0) != 2.0 || at(&o, 1, 2) != 12.0)
+        return err(8, "加法不对");
+    if (o.sub(&m, &m) != 1 || at(&o, 0, 0) != 0.0)
+        return err(9, "减法不对");
+    o.fill(2.0);
+    if (o.scale(3.0) != 1 || at(&o, 0, 0) != 6.0)
+        return err(10, "数乘不对");
+    /* 维度不匹配 */
+    {
+        f64 b2[4] = { 0 };
+        Mat m2 = mat(b2, 2, 2);
+
+        if (o.add(&m, &m2) != 0 || o.sub(&m, &m2) != 0)
+            return err(11, "维度不匹配应该返回 0");
+    }
+    /* 非方阵不能单位化/求迹 */
+    if (m.identity() != 0 || m.trace() != 0.0)
+        return err(12, "非方阵不该有单位阵/迹");
+    /* 坏参数 */
+    if (mat(0, 2, 2).ok() || mat(buf, 0, 2).ok())
+        return err(13, "空缓冲/零维度应该无效");
+    {
+        Mat bad = { 0 };
+
+        if (bad.add(&m, &m) != -1 || bad.scale(2.0) != -1)
+            return err(14, "坏矩阵应该 -1");
+    }
+}
+
+test "乘法、转置与带 stride 的子矩阵" {
+    f64 ab[4] = { 1.0, 2.0, 3.0, 4.0 };
+    f64 bb[4] = { 5.0, 6.0, 7.0, 8.0 };
+    f64 ob[4] = { 0 };
+    Mat a = mat(ab, 2, 2), b = mat(bb, 2, 2), o = mat(ob, 2, 2);
+    /* 3x2 存在 3x3 的缓冲里（每行留一个空洞） */
+    f64 sbuf[9] = { 1.0, 2.0, 99.0, 3.0, 4.0, 99.0, 5.0, 6.0, 99.0 };
+    Mat s = mat_strided(sbuf, 3, 2, 3);
+    f64 tb[6] = { 0 };
+    Mat t = mat(tb, 2, 3);
+
+    if (o.mul(&a, &b) != 1)
+        return err(15, "2x2 乘法失败");
+    if (at(&o, 0, 0) != 19.0 || at(&o, 0, 1) != 22.0
+        || at(&o, 1, 0) != 43.0 || at(&o, 1, 1) != 50.0)
+        return err(16, "2x2 乘法结果不对");
+    /* 单位阵 */
+    {
+        f64 ib[4] = { 0 };
+        Mat id = mat(ib, 2, 2);
+
+        id.identity();
+        o.fill(0.0);
+        if (o.mul(&a, &id) != 1 || at(&o, 1, 0) != 3.0)
+            return err(17, "乘以单位阵不对");
+    }
+    /* 维度不匹配 */
+    {
+        f64 b3[6] = { 0 };
+        Mat m3 = mat(b3, 2, 3);
+
+        if (o.mul(&a, &m3) != 0)
+            return err(18, "维度不匹配的乘法应该返回 0");
+    }
+    /* stride 视图上的转置 */
+    if (!s.ok() || at(&s, 1, 1) != 4.0 || at(&s, 2, 0) != 5.0)
+        return err(19, "stride 视图取值不对");
+    if (t.transpose(&s) != 1 || t.rows() != 2 || t.cols() != 3)
+        return err(20, "转置维度不对");
+    if (at(&t, 0, 0) != 1.0 || at(&t, 1, 0) != 2.0
+        || at(&t, 0, 2) != 5.0 || at(&t, 1, 2) != 6.0)
+        return err(21, "转置结果不对");
+    /* 迹 */
+    if (a.trace() != 5.0)
+        return err(22, "2x2 的迹不对");
+}
+
+test "行列式与线性方程组" {
+    f64 w[16] = { 0 };
+    f64 a3[9] = { 1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0 };
+    Mat m3 = mat(a3, 3, 3);
+    f64 a2[4] = { 2.0, 1.0, 1.0, 3.0 };
+    Mat m2 = mat(a2, 2, 2);
+    f64 rhs[2] = { 5.0, 10.0 };
+    f64 xs[2] = { 0 };
+
+    if (!close_to(m3.det(w), 1.0))
+        return err(23, "3x3 行列式不对");
+    if (!close_to(m2.det(w), 5.0))
+        return err(24, "2x2 行列式不对");
+    /* 奇异矩阵 */
+    {
+        f64 sing[4] = { 1.0, 2.0, 2.0, 4.0 };
+        Mat sm = mat(sing, 2, 2);
+
+        if (sm.det(w) != 0.0)
+            return err(25, "奇异矩阵的行列式应该是 0");
+        if (sm.solve(rhs, xs, w) != 0)
+            return err(26, "奇异矩阵 solve 应该返回 0");
+    }
+    /* 2x2 解 */
+    if (m2.solve(rhs, xs, w) != 1)
+        return err(27, "solve 失败");
+    if (!close_to(xs[0], 1.0) || !close_to(xs[1], 3.0))
+        return err(28, "解的数值不对");
+    /* 3x3 解：x=1, y=2, z=3 代入 A 得到 b */
+    {
+        f64 b3[3] = { 0 };
+        f64 x3[3] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 3; i++)
+            b3[i] = at(&m3, i, 0) * 1.0 + at(&m3, i, 1) * 2.0
+                    + at(&m3, i, 2) * 3.0;
+        if (m3.solve(b3, x3, w) != 1)
+            return err(29, "3x3 solve 失败");
+        if (!close_to(x3[0], 1.0) || !close_to(x3[1], 2.0)
+            || !close_to(x3[2], 3.0))
+            return err(30, "3x3 解的数值不对");
+    }
+    /* 参数错 */
+    {
+        f64 b4[4] = { 0 };
+        Mat m4 = mat(b4, 2, 2);
+
+        if (m2.det(0) != -1.0 || m2.solve(rhs, 0, w) != -1
+            || m2.solve(rhs, xs, 0) != -1 || solve(0, rhs, xs, w) != -1
+            || m4.solve(rhs, xs, w) != 0)
+            return err(31, "det/solve 的参数检查不对");
+    }
+}

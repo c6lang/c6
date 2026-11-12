@@ -162,7 +162,7 @@ make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后
 （目录是模块名的一部分：`std/container/vec.c6` 就是 `std.container.vec`）：
 
 ```
-std/core/                   基础：定宽类型、错误码、内存、数学、位运算、哈希、随机、原子操作
+std/core/                   基础：定宽类型、错误码、内存、数学、位运算、哈希、随机、原子操作、向量/统计/矩阵/插值
   std/core/atomic.c6        std.core.atomic        原子操作与自旋锁（零分配、不依赖 pthread）：Atomic(i64)/Atomic32(int) 的 load/store/add/sub/fetch_*/exchange/cas/位运算，默认 seq_cst（另有 relaxed/release 发布口）、fence 屏障、TAS 自旋锁 SpinLock（不变量：字段 v 只通过方法访问）
   std/core/bignum.c6        std.core.bignum        任意精度整数（1024 位、零分配）：big_parse/parse_base/from_i64/from_u64、Big 的 add/sub/mul/div/mod/divmod/pow、cmp、to_i64/to_u64、format/format_base（2..36 进制）；超 1024 位报 err
   std/core/bits.c6          std.core.bits          popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/clear、mask/sign_extend/is_pow2
@@ -178,6 +178,10 @@ std/core/                   基础：定宽类型、错误码、内存、数学�
   std/core/rand.c6          std.core.rand          xorshift64*：可重放序列、无偏区间 below/int_range、next_f64/next_bool、fill/shuffle
   std/core/rational.c6      std.core.rational      精确有理数 Rat（i64 分子/分母、自动约分）：rat_make/from_i64/parse、add/sub/mul/div/inv/neg/abs、cmp（连分数比较，不经过 double）、to_i64/to_f64、format（n/d）
   std/core/types.c6         std.core.types         定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
+  std/core/geometry.c6      std.core.geometry      Vec2/Vec3/Rect：vec2_*/vec3_* 的 add/sub/scale/dot/cross/len/norm/lerp、rect/rect_contains/rect_intersect/rect_union/rect_expand、clampf/deg2rad/rad2deg（牛顿迭代开方）
+  std/core/interp.c6        std.core.interp        插值与缓动：lerp/lerp_clamped/inv_lerp/remap/smoothstep/smootherstep、ease(kind,t) 共 11 种曲线、catmull_rom
+  std/core/stats.c6         std.core.stats         Welford 流式统计（add/mean/variance/variance_pop/stddev/min/max）、stats_median/quantile/histogram/corr
+  std/core/matrix.c6        std.core.matrix        行主序矩阵：mat/mat_strided、at/set/fill/identity/add/sub/scale/mul/transpose/trace、det/solve（部分主元高斯消元，scratch 由调用方给）
 
 std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、glob、显示宽度、表格与自然排序
   std/text/ascii.c6         std.text.ascii         ASCII 判别/大小写/忽略大小写比较（收 int，EOF 与负 char 安全）
@@ -334,6 +338,7 @@ make std-crypto  # 编译并运行 examples/stdcrypto.c6（第二十三批摘要
 make std-fsx     # 编译并运行 examples/stdfsx.c6（第二十四批文件系统进阶模块的拼装示例）
 make std-cipher  # 编译并运行 examples/stdcipher.c6（第二十五批对称加密基础模块的拼装示例）
 make std-data    # 编译并运行 examples/stddata.c6（第二十六批数据格式模块的拼装示例）
+make std-calc    # 编译并运行 examples/stdcalc.c6（第二十七批数值工具模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

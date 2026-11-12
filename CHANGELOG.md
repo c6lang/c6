@@ -47,6 +47,17 @@
 
 ### 标准库
 
+- **标准库第二十七批（数值工具）**：`std.core.geometry` / `std.core.interp` /
+  `std.core.stats` / `std.core.matrix` 四个模块，集成示例 `examples/stdcalc.c6`
+  （`make std-calc`）。geometry 是 Vec2/Vec3/Rect（自由函数、纯值、牛顿迭代
+  开方不链 libm）；interp 是 lerp/inv_lerp/remap/smoothstep 与 11 条缓动曲线
+  （端点严格 0→1，sin 用 15 阶泰勒）加一维 Catmull-Rom；stats 是 Welford 流式
+  均值/方差/最值，加中位数/分位数（就地排序 + 线性插值）/直方图/Pearson 相关；
+  matrix 是行主序矩阵（`mat_strided` 支持子矩阵视图）与由调用方给 scratch 的
+  行列式、线性方程组。四个模块都是纯函数、零分配、自成一体。错误号段
+  `std.core.stats`=0x6075 … `std.core.interp`=0x6078（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第二十六批（数据格式）**：`std.data.bencode` / `std.data.msgpack` /
   `std.data.cbor` / `std.data.pem` 四个模块，集成示例 `examples/stddata.c6`
   （`make std-data`）。bencode 是 BitTorrent 的元信息格式（写整数/字节串/

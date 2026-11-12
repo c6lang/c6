@@ -12,7 +12,7 @@
 
 | 目录 | 领域 |
 | --- | --- |
-| `std/core/` | 基础：定宽类型、错误码、内存、数学、位运算、哈希、随机 |
+| `std/core/` | 基础：定宽类型、错误码、内存、数学、位运算、哈希、随机、数值工具（向量/统计/矩阵/插值） |
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
@@ -35,7 +35,7 @@
 > `std.container.vec` 时这几份正文都得在命令行上，漏了会报
 > `unresolved reference to 'std__container__sort__sort_bytes'`。
 
-**`std/core/`**（基础：定宽类型、错误码、内存、数学、位运算、哈希、随机）
+**`std/core/`**（基础：类型、错误、内存、数学、位运算、哈希、随机、向量/统计/矩阵/插值）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -54,6 +54,10 @@
 | `std/core/rand.c6` | `std.core.rand` | xorshift64* 伪随机：`rand_seed` + `Rand` 方法 `next_u64`/`next_u32`/`below`（拒绝采样）/`int_range`/`int_range_incl`/`next_f64`/`next_bool`/`fill`/`shuffle`/`shuffle_int` |
 | `std/core/rational.c6` | `std.core.rational` | 精确有理数 `Rat`（i64 分子/分母，始终最简、`den > 0`）：`rat_make`/`rat_from_i64`/`rat_parse`（`a/b` 或 `a`）、`add`/`sub`/`mul`/`div`/`inv`/`neg`/`abs`、`cmp`（连分数比较，交叉相乘会溢出也不经过 double）、`to_i64`/`to_f64`、`format`（`n/d`）；加减的中间分子溢出报 `err` |
 | `std/core/types.c6` | `std.core.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`（`U8_MAX`…`I32_MIN`）/`Bool` 两个枚举 |
+| `std/core/geometry.c6` | `std.core.geometry` | 二维/三维向量与矩形（纯值 f64，自由函数）：`Vec2` 的 `vec2`/`vec2_add`/`sub`/`scale`/`dot`/`cross`/`len`/`len_sq`/`norm`/`lerp`/`perp`，`Vec3` 的同一套加 `vec3_cross`，`Rect` 的 `rect`/`rect_area`/`rect_empty`/`rect_center`/`rect_contains`/`rect_intersects`/`rect_intersect`/`rect_union`/`rect_expand`，`clampf`/`deg2rad`/`rad2deg`；零向量单位化给 (0,0)，开方用牛顿迭代不链 libm |
+| `std/core/interp.c6` | `std.core.interp` | 插值与缓动（纯函数）：`lerp`/`lerp_clamped`/`inv_lerp`/`remap`/`smoothstep`/`smootherstep`、`ease(kind, t)`（线性/quad/cubic/sine/out_back 共 11 种，端点严格 0→1）、`catmull_rom(p0,p1,p2,p3,t)`；除零与 a==b 时给 0，sin 用 15 阶泰勒不链 libm |
+| `std/core/stats.c6` | `std.core.stats` | 描述统计（f64）：`Stats` 的 Welford 流式 `add`/`add_n`/`mean`/`variance`（样本）/`variance_pop`/`stddev`/`min`/`max`/`total`/`count`，一次性 `stats_median`/`stats_quantile`（就地排序 + 线性插值）/`stats_histogram`（左闭右开，右端点进最后一格）/`stats_corr`（Pearson）；空样本全给 0 |
+| `std/core/matrix.c6` | `std.core.matrix` | 行主序矩阵（f64，调用方给缓冲）：`mat`/`mat_strided` 工厂 + `Mat` 的 `at`/`set`/`fill`/`identity`/`add`/`sub`/`scale`/`mul`/`transpose`/`trace`/`det(work)`/`solve(b,x,work)`；维度不匹配返回 0，参数错返回 -1，`det`/`solve` 用部分主元高斯消元（scratch 由调用方给） |
 
 **`std/text/`**（文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换）
 
@@ -217,6 +221,7 @@
 | `examples/stdfsx.c6` | （无模块） | 第二十四批（文件系统进阶）的拼装示例（`make std-fsx`）：临时文件/目录、匿名与文件映射（改字节后 sync 回盘）、目录树统计与删树、跨进程抢锁与超时等待，自带自检 |
 | `examples/stdcipher.c6` | （无模块） | 第二十五批（对称加密基础）的拼装示例（`make std-cipher`）：AES 的 FIPS 197 三组向量与 SP 800-38A CTR、ChaCha20 的 RFC 8439 块/加密向量、Poly1305 的 RFC 向量与流式喂入、`/dev/urandom` 随机，最后做一次 ChaCha20+Poly1305 的 encrypt-then-MAC 与篡改检测 |
 | `examples/stddata.c6` | （无模块） | 第二十六批（数据格式）的拼装示例（`make std-data`）：同一份嵌套数据走 bencode/msgpack/cbor 三种编码并核对规范字节，再用 PEM 封装一段 DER 并多块拆封 |
+| `examples/stdcalc.c6` | （无模块） | 第二十七批（数值工具）的拼装示例（`make std-calc`）：Welford 统计与分位数/直方图/相关、2x2 乘法与 3x3 行列式和线性方程组、3-4-5 向量与矩形交并、lerp/remap/缓动/Catmull-Rom |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -239,6 +244,10 @@ std/core/err.c6            3 test(s), 0 failure(s)
 std/core/fixed.c6          4 test(s), 0 failure(s)
 std/core/hash.c6           7 test(s), 0 failure(s)
 std/core/math.c6           6 test(s), 0 failure(s)
+std/core/geometry.c6      2 test(s), 0 failure(s)
+std/core/interp.c6        2 test(s), 0 failure(s)
+std/core/stats.c6         3 test(s), 0 failure(s)
+std/core/matrix.c6        3 test(s), 0 failure(s)
 std/core/mem.c6            7 test(s), 0 failure(s)
 std/core/pool.c6           2 test(s), 0 failure(s)
 std/core/rand.c6           9 test(s), 0 failure(s)
@@ -339,6 +348,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/text/width.c6` 10 | utf8 7 + width 3（判宽要 `utf8_decode`） |
 | `std/encoding/punycode.c6` 11 | utf8 7 + punycode 4（编码/解码都走 `utf8_decode`） |
 | `std/container/chan.c6` 10 | chan 4 + sync 6（Mutex/Cond 的正文来自 `std.os.sync`） |
+| `std/core/geometry.c6` 2 | 自成一体（只用 f64 运算） |
+| `std/core/interp.c6` 2 | 自成一体（sin 用泰勒级数） |
+| `std/core/stats.c6` 3 | 自成一体（Welford + 插入排序） |
+| `std/core/matrix.c6` 3 | 自成一体（高斯消元） |
 | `std/os/walk.c6` 43 | walk 3 + fs 7 + path 8 + str 22 + err 3（遍历用 `Dir`，拼路径用 path） |
 | `std/os/lock.c6` 9 | lock 2 + time 7（超时等待要 `sleep_ms`） |
 | `std/os/temp.c6` 3 | 只借 `Str` 类型，正文不依赖别的模块 |
@@ -368,7 +381,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/os/time`，`std/os/temp` 与 `std/os/mmap` 自成一体（temp 只借 `Str` 类型），
 `std/encoding/aes`、`std/encoding/poly1305`、`std/encoding/random` 也自成一体，
 `std/encoding/chacha20` 的正文必须带 `std/core/bits`（`rotl32`），`std/data/pem`
-要 `std/encoding/base64`，bencode/msgpack/cbor 只借 `Str` 类型（正文不调 str）。
+要 `std/encoding/base64`，bencode/msgpack/cbor 只借 `Str` 类型（正文不调 str），
+`std/core/geometry`、`std/core/interp`、`std/core/stats`、`std/core/matrix` 都自成一体。
 
 ## 设计原则
 
@@ -3059,6 +3073,28 @@ stddata: 15 check(s), 0 failure(s)
 `-1000` 的 `3903e7` 和半精度 `f93e00` → 1.5；pem 把 48 字节「假 DER」封装成
 `PUBLIC KEY` 块再拆封回原字节，最后把两块拼起来确认迭代器能读 2 块。
 
+### 集成示例：`examples/stdcalc.c6`
+
+```sh
+make std-calc
+```
+
+```
+stdcalc: 标准库第二十七批（geometry / interp / stats / matrix）
+stats: 1..5 均值 3、样本方差 2.5，分位数/直方图/相关都对
+matrix: 2x2 乘法、3x3 det=1、solve 得到 (1,3)
+geometry: 向量/单位化/矩形交并都对
+interp: lerp/remap/smoothstep/缓动/Catmull-Rom 都对
+stdcalc: 32 check(s), 0 failure(s)
+```
+
+四节都是纯计算：stats 用 Welford 流式累加 1..5（均值 3、样本方差 2.5、总体
+方差 2），再对 1..9 求中位数 5、25% 分位 3、4 格直方图 `[2,2,2,3]` 和完全正
+相关；matrix 算 2x2 乘法（19/22/43/50）、3x3 行列式 1、2x2 方程组
+`2x+y=5, x+3y=10` 的解 `(1,3)`；geometry 验 3-4-5 向量、单位化 (0.6,0.8)、
+叉积与矩形交并；interp 验 lerp/remap/smoothstep、`ease_in_quad(0.5)=0.25`、
+`ease_out_sine(0.5)≈0.7071` 和 Catmull-Rom 中点。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3106,6 +3142,8 @@ stddata: 15 check(s), 0 failure(s)
 * `make std-cipher`：`examples/stdcipher.c6`，第二十五批（对称加密基础）模块的
   拼装示例（自带自检）。
 * `make std-data`：`examples/stddata.c6`，第二十六批（数据格式）模块的拼装示例
+  （自带自检）。
+* `make std-calc`：`examples/stdcalc.c6`，第二十七批（数值工具）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
@@ -3159,6 +3197,14 @@ stddata: 15 check(s), 0 failure(s)
   逐个钉住 0/1/2/4/8 字节的长度编码，另验 `f9` 半精度转 f64。
 * `std/data/pem.c6` 的「100 字节 DER」：Base64 正好 3 行（64/64/8）、最宽 64，
   且容量不够时不写半截。
+* `std/core/stats.c6` 的「Welford 与 add_n 一致」：1..5 的样本方差必须是 2.5、
+  总体方差 2；2,4,4,4 的均值 3.5/样本方差 1，钉住在线更新的分母。
+* `std/core/matrix.c6` 的「stride 视图上的转置」：3x2 存在 3x3 缓冲里（每行
+  一个空洞），转置成 2x3 之后逐元素核对，钉住 `r*step+c` 的下标。
+* `std/core/matrix.c6` 的「行列式与奇异矩阵」：3x3 的 det=1、2x2 的 det=5，
+  奇异矩阵 det=0 且 `solve` 返回 0。
+* `std/core/interp.c6` 的「缓动端点」：11 条曲线都满足 f(0)=0、f(1)=1，
+  `out_back` 中段必须超过 1（钉住它不是被钳制的曲线）。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，

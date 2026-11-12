@@ -1,0 +1,355 @@
+/* std/core/stats：描述统计（均值/方差/分位数/直方图/相关系数，f64）。
+ *
+ *     import std.core.stats;
+ *
+ *     Stats st = stats_new();
+ *     st.add(1.0);
+ *     st.add(3.0);
+ *     f64 m = st.mean();                    // 2.0
+ *     f64 v = st.variance();                // 样本方差 2.0
+ *
+ *     f64 data[5] = { 5, 1, 4, 2, 3 };
+ *     f64 med = stats_median(data, 5);      // 3.0（会就地排序）
+ *
+ * 两种用法：
+ *
+ * - **流式**：`Stats` 用 Welford 的在线算法累加，一遍数据就能给出均值/样本
+ *   方差/总体方差/标准差/最值，不用先存整个数组；
+ * - **一次性**：分位数/中位数/直方图/相关系数需要看全体数据，参数是调用方的
+ *   `f64` 数组（`f64[:]` 视图），分位数会**就地排序**（插入排序，小样本够用；
+ *   大数组请先自己用 `std.container.sort` 排好再传 `sorted = 1` 的版本）。
+ *
+ * 约定：
+ *
+ * - 空样本：`mean`/`min`/`max` 给 0，`variance` 给 0，`count` 给 0；
+ * - `variance` 是**样本**方差（除以 n-1，n < 2 时给 0），
+ *   `variance_pop` 是总体方差（除以 n）；
+ * - `stats_median`/`stats_quantile` 用线性插值（和 numpy 的默认口径一致）：
+ *   位置 h = (n-1)*q，取 floor/ceil 两个点插值；
+ * - `stats_histogram` 的区间是左闭右开 `[lo, hi)`，等于 `hi` 的值进最后一格；
+ *   数据落在 `[lo, hi]` 之外的不计数（返回总计数方便调用方核对）；
+ * - `stats_corr` 是 Pearson 相关系数，长度不等或方差为 0 时给 0。
+ */
+#include <string.h>
+
+module std.core.stats;
+import std.core.types;
+
+struct Stats {
+    i64 n;
+    f64 avg;        /* 均值（用 avg 避免和 mean() 方法撞名） */
+    f64 m2;
+    f64 lo;
+    f64 hi;
+    f64 sum_total;
+};
+
+Stats stats_new(void)
+{
+    Stats s = { 0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+
+    return s;
+}
+
+/* Welford：数值上比 sum(x^2) - n*mean^2 稳 */
+void add(Stats *self, f64 x)
+{
+    f64 d = 0.0;
+
+    if (!self)
+        return;
+    if (self->n == 0) {
+        self->lo = x;
+        self->hi = x;
+    } else {
+        if (x < self->lo)
+            self->lo = x;
+        if (x > self->hi)
+            self->hi = x;
+    }
+    self->n++;
+    self->sum_total += x;
+    d = x - self->avg;
+    self->avg += d / (f64)self->n;
+    self->m2 += d * (x - self->avg);
+}
+
+void add_n(Stats *self, f64[:] xs)
+{
+    int i = 0;
+
+    if (!self || !xs.data)
+        return;
+    for (i = 0; i < xs.len; i++)
+        self->add(xs.data[i]);
+}
+
+i64 count(Stats *self) { return self ? self->n : 0; }
+
+f64 mean(Stats *self) { return self ? self->avg : 0.0; }
+
+f64 total(Stats *self) { return self ? self->sum_total : 0.0; }
+
+f64 min(Stats *self) { return self ? self->lo : 0.0; }
+
+f64 max(Stats *self) { return self ? self->hi : 0.0; }
+
+/* 样本方差（除以 n-1） */
+f64 variance(Stats *self)
+{
+    if (!self || self->n < 2)
+        return 0.0;
+    return self->m2 / (f64)(self->n - 1);
+}
+
+/* 总体方差（除以 n） */
+f64 variance_pop(Stats *self)
+{
+    if (!self || self->n < 1)
+        return 0.0;
+    return self->m2 / (f64)self->n;
+}
+
+f64 stddev(Stats *self)
+{
+    f64 v = self->variance();
+
+    if (v <= 0.0)
+        return 0.0;
+    {
+        f64 g = v > 1.0 ? v : 1.0;
+        int i = 0;
+
+        for (i = 0; i < 32; i++)
+            g = 0.5 * (g + v / g);
+        return g;
+    }
+}
+
+/* 插入排序（NaN 当最大值排到后面） */
+static void stats_sort(f64 *a, int n)
+{
+    int i = 0, j = 0;
+
+    for (i = 1; i < n; i++) {
+        f64 v = a[i];
+
+        j = i - 1;
+        while (j >= 0 && a[j] > v) {
+            a[j + 1] = a[j];
+            j--;
+        }
+        a[j + 1] = v;
+    }
+}
+
+/* 中位数：会就地排序；空数组给 0 */
+f64 stats_median(f64[:] xs)
+{
+    if (!xs.data || xs.len <= 0)
+        return 0.0;
+    stats_sort(xs.data, xs.len);
+    if (xs.len % 2 == 1)
+        return xs.data[xs.len / 2];
+    return 0.5 * (xs.data[xs.len / 2 - 1] + xs.data[xs.len / 2]);
+}
+
+/* 分位数（线性插值，q 在 [0,1] 外会外插）：会就地排序 */
+f64 stats_quantile(f64[:] xs, f64 q)
+{
+    f64 h = 0.0;
+    int lo = 0, hi = 0;
+
+    if (!xs.data || xs.len <= 0)
+        return 0.0;
+    if (xs.len == 1)
+        return xs.data[0];
+    stats_sort(xs.data, xs.len);
+    h = (f64)(xs.len - 1) * q;
+    if (h <= 0.0)
+        return xs.data[0];
+    if (h >= (f64)(xs.len - 1))
+        return xs.data[xs.len - 1];
+    lo = (int)h;
+    hi = lo + 1;
+    return xs.data[lo] + (xs.data[hi] - xs.data[lo]) * (h - (f64)lo);
+}
+
+/* 直方图：bins 个格子写进 counts，返回落进 [lo,hi] 的样本数，参数错给 -1 */
+int stats_histogram(f64[:] xs, f64 lo, f64 hi, int *counts, int bins)
+{
+    int i = 0, got = 0;
+    f64 span = 0.0;
+
+    if (!xs.data || !counts || bins <= 0 || !(hi > lo))
+        return -1;
+    memset(counts, 0, sizeof(int) * (size_t)bins);
+    span = hi - lo;
+    for (i = 0; i < xs.len; i++) {
+        f64 x = xs.data[i];
+        int k = 0;
+
+        if (x < lo || x > hi || x != x)
+            continue;
+        if (x == hi)
+            k = bins - 1;
+        else
+            k = (int)((x - lo) / span * (f64)bins);
+        if (k < 0)
+            k = 0;
+        if (k >= bins)
+            k = bins - 1;
+        counts[k]++;
+        got++;
+    }
+    return got;
+}
+
+/* Pearson 相关系数；长度不等/方差为 0 给 0 */
+f64 stats_corr(f64[:] xs, f64[:] ys)
+{
+    Stats sx = stats_new(), sy = stats_new();
+    f64 cov = 0.0;
+    int i = 0;
+
+    if (!xs.data || !ys.data || xs.len != ys.len || xs.len < 2)
+        return 0.0;
+    sx.add_n(xs);
+    sy.add_n(ys);
+    if (sx.m2 <= 0.0 || sy.m2 <= 0.0)
+        return 0.0;
+    for (i = 0; i < xs.len; i++)
+        cov += (xs.data[i] - sx.avg) * (ys.data[i] - sy.avg);
+    return cov / (f64)(xs.len - 1) / (stddev(&sx) * stddev(&sy));
+}
+
+/* ---- 自测 ---- */
+
+test "流式统计：均值、方差、最值" {
+    Stats st = stats_new();
+    Stats empty = stats_new();
+    int i = 0;
+
+    for (i = 1; i <= 5; i++)
+        st.add((f64)i);
+    if (st.count() != 5 || st.mean() != 3.0 || st.total() != 15.0)
+        return err(1, "均值/计数/求和不对");
+    if (st.min() != 1.0 || st.max() != 5.0)
+        return err(2, "最值不对");
+    /* 1..5 的样本方差是 2.5，总体方差是 2 */
+    if (st.variance() != 2.5 || st.variance_pop() != 2.0)
+        return err(3, "方差不对");
+    {
+        f64 s = st.stddev();
+
+        if (s < 1.5811 || s > 1.5812)
+            return err(4, "标准差不对");
+    }
+    /* 单个样本：样本方差 0，总体方差 0 */
+    {
+        Stats one = stats_new();
+
+        one.add(42.0);
+        if (one.variance() != 0.0 || one.variance_pop() != 0.0
+            || one.mean() != 42.0)
+            return err(5, "单样本统计不对");
+    }
+    /* 空样本 */
+    if (empty.count() != 0 || empty.mean() != 0.0 || empty.min() != 0.0
+        || empty.variance() != 0.0)
+        return err(6, "空样本应该全给 0");
+    /* add_n 与逐个 add 一致 */
+    {
+        f64 xs[4] = { 2.0, 4.0, 4.0, 4.0 };
+        Stats a = stats_new(), b = stats_new();
+
+        a.add_n((f64[:]){ xs, 4 });
+        for (i = 0; i < 4; i++)
+            b.add(xs[i]);
+        if (a.mean() != b.mean() || a.variance() != b.variance()
+            || a.count() != 4)
+            return err(7, "add_n 与 add 不一致");
+        /* 2,4,4,4 -> 均值 3.5，样本方差 1.0 */
+        if (a.mean() != 3.5 || a.variance() != 1.0)
+            return err(8, "2/4/4/4 的统计不对");
+    }
+}
+
+test "中位数、分位数与直方图" {
+    f64 odd[5] = { 5.0, 1.0, 4.0, 2.0, 3.0 };
+    f64 even[4] = { 4.0, 1.0, 3.0, 2.0 };
+    f64 hist[11] = { 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0 };
+    int counts[5] = { 0 };
+
+    if (stats_median((f64[:]){ odd, 5 }) != 3.0)
+        return err(9, "奇数个的中位数不对");
+    if (stats_median((f64[:]){ even, 4 }) != 2.5)
+        return err(10, "偶数个的中位数不对");
+    /* quantile：0/0.25/0.5/0.75/1 */
+    {
+        f64 a[5] = { 10.0, 20.0, 30.0, 40.0, 50.0 };
+        f64 q25 = stats_quantile((f64[:]){ a, 5 }, 0.25);
+        f64 q50 = stats_quantile((f64[:]){ a, 5 }, 0.5);
+        f64 q75 = stats_quantile((f64[:]){ a, 5 }, 0.75);
+
+        if (q25 != 20.0 || q50 != 30.0 || q75 != 40.0)
+            return err(11, "分位数不对");
+        if (stats_quantile((f64[:]){ a, 5 }, 0.0) != 10.0
+            || stats_quantile((f64[:]){ a, 5 }, 1.0) != 50.0)
+            return err(12, "分位数端点不对");
+    }
+    /* 直方图：[0,10) 分 5 格，10 进最后一格 */
+    {
+        int got = stats_histogram((f64[:]){ hist, 11 }, 0.0, 10.0, counts, 5);
+
+        if (got != 11)
+            return err(13, "直方图计数不对");
+        if (counts[0] != 2 || counts[1] != 2 || counts[2] != 2
+            || counts[3] != 2 || counts[4] != 3)
+            return err(14, "直方图分布不对");
+    }
+    /* 越界样本不计数 */
+    {
+        f64 far[3] = { -5.0, 5.0, 100.0 };
+        int c2[2] = { 0 };
+
+        if (stats_histogram((f64[:]){ far, 3 }, 0.0, 10.0, c2, 2) != 1)
+            return err(15, "越界样本不该计数");
+    }
+    /* 参数错 */
+    if (stats_histogram((f64[:]){ hist, 11 }, 0.0, 10.0, 0, 5) != -1
+        || stats_histogram((f64[:]){ hist, 11 }, 0.0, 10.0, counts, 0) != -1
+        || stats_histogram((f64[:]){ hist, 11 }, 10.0, 0.0, counts, 5) != -1)
+        return err(16, "坏参数应该 -1");
+    /* 空数组 */
+    if (stats_median((f64[:]){ (f64 *)0, 0 }) != 0.0
+        || stats_quantile((f64[:]){ (f64 *)0, 0 }, 0.5) != 0.0)
+        return err(17, "空数组应该给 0");
+}
+
+test "相关系数与线性关系" {
+    f64 x[5] = { 1.0, 2.0, 3.0, 4.0, 5.0 };
+    f64 y[5] = { 2.0, 4.0, 6.0, 8.0, 10.0 };
+    f64 z[5] = { 10.0, 8.0, 6.0, 4.0, 2.0 };
+    f64 flat[5] = { 3.0, 3.0, 3.0, 3.0, 3.0 };
+    f64 short2[3] = { 1.0, 2.0, 3.0 };
+
+    {
+        f64 c = stats_corr((f64[:]){ x, 5 }, (f64[:]){ y, 5 });
+
+        if (c < 0.9999 || c > 1.0001)
+            return err(18, "完全正相关应该给 1");
+    }
+    {
+        f64 c = stats_corr((f64[:]){ x, 5 }, (f64[:]){ z, 5 });
+
+        if (c > -0.9999 || c < -1.0001)
+            return err(19, "完全负相关应该给 -1");
+    }
+    if (stats_corr((f64[:]){ x, 5 }, (f64[:]){ flat, 5 }) != 0.0)
+        return err(20, "常数列的相关系数应该给 0");
+    if (stats_corr((f64[:]){ x, 5 }, (f64[:]){ short2, 3 }) != 0.0)
+        return err(21, "长度不等应该给 0");
+    if (stats_corr((f64[:]){ x, 5 }, (f64[:]){ (f64 *)0, 0 }) != 0.0)
+        return err(22, "空指针应该给 0");
+}
