@@ -1076,7 +1076,16 @@ ST_FUNC void load(int r, SValue *sv)
         case VT_BYTE:    c99_printf("__c99_r[%d].i = (long long)(unsigned int)*(%s char *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
         case VT_SHORT:   c99_printf("__c99_r[%d].i = (long long)(unsigned int)*(%s short *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
         case VT_INT:     c99_printf("__c99_r[%d].i = (long long)(unsigned int)*(%s int *)%s;\n", r, uns ? "unsigned" : "signed", a); break;
-        case VT_LLONG:   c99_printf("__c99_r[%d].i = *(long long *)%s;\n", r, a); break;
+        case VT_LLONG:
+            /* 指针变量在局部槽里只占指针宽度；按 void* 加载再经 unsigned long
+               零扩展，避免 64 位 load 把相邻槽的脏高半读进来（32 位目标上
+               t != 0 会永远为真）。 */
+            if (sv->sym && (((sv->sym->type.t & VT_BTYPE) == VT_PTR)
+                            || ((sv->sym->type.t & VT_BTYPE) == VT_FUNC)))
+                c99_printf("__c99_r[%d].i = (long long)(unsigned long)*(void **)%s;\n", r, a);
+            else
+                c99_printf("__c99_r[%d].i = *(long long *)%s;\n", r, a);
+            break;
         case VT_PTR:
         case VT_FUNC:    c99_printf("__c99_r[%d].p = *(void **)%s;\n", r, a); break;
         case VT_FLOAT:   c99_printf("__c99_r[%d].f = *(float *)%s;\n", r, a); break;
