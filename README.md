@@ -260,6 +260,10 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
   std/encoding/md5.c6       std.encoding.md5       MD5（RFC 1321）：Md5 的 init/update/final、一次性 md5/md5_hex、常数时间 md5_eq；只用于校验和/兼容格式（碰撞是分钟级的）
   std/encoding/sha512.c6    std.encoding.sha512    SHA-512/SHA-384 与 HMAC-SHA-512：init/init384/update/final（128 位长度）、sha512/sha384/*_hex、hmac_sha384/hmac_sha512(_hex)、常数时间 sha512_eq
+  std/encoding/sha3.c6       std.encoding.sha3      SHA3-224/256/384/512 与 SHAKE128/256（Keccak 海绵，可连续挤压）
+  std/encoding/blake2s.c6    std.encoding.blake2s   BLAKE2s：输出 1~32 字节，init/update/final 与一次性 blake2s_hash
+  std/encoding/crc32c.c6     std.encoding.crc32c    CRC-32C（Castagnoli）：crc32c/crc32c_str 与裸寄存器分段 crc32c_update
+  std/encoding/xxhash.c6     std.encoding.xxhash    xxHash：xxh32/xxh64（带种子）与流式 Xxh32/Xxh64（digest 可重复）
   std/encoding/hkdf.c6      std.encoding.hkdf      HKDF（RFC 5869）：hkdf_extract/hkdf_expand/hkdf 一步版；空 salt 按 32 个零字节、输出上限 8160 字节
   std/encoding/pbkdf2.c6    std.encoding.pbkdf2    PBKDF2-HMAC-SHA-1/SHA-256（RFC 6070/8018）：pbkdf2_sha1/pbkdf2_sha256，iters<=0 与空输出直接拒绝，输出长度不限
   std/encoding/aes.c6       std.encoding.aes       AES（FIPS 197）：aes_key(16/24/32)、Aes 的 encrypt_block/decrypt_block/ctr_xor（10/12/14 轮，CTR 按 16 字节大端计数器递增）
@@ -389,6 +393,7 @@ make std-proto   # 编译并运行 examples/stdproto.c6（第三十四批网络�
 make std-exec    # 编译并运行 examples/stdexec.c6（第三十五批二进制容器格式模块的拼装示例）
 make std-ser     # 编译并运行 examples/stdser.c6（第三十六批序列化与标记模块的拼装示例）
 make std-sys     # 编译并运行 examples/stdsys.c6（第三十七批系统视图模块的拼装示例）
+make std-hash    # 编译并运行 examples/stdhash.c6（第三十八批哈希与校验模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

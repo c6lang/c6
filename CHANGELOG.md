@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第三十八批（哈希与校验）**：`std.encoding.sha3`（SHA3-224/256/384/512 +
+  SHAKE128/256）、`std.encoding.blake2s`（输出 1~32 字节）、`std.encoding.crc32c`
+  （CRC-32C，含分段接口）、`std.encoding.xxhash`（XXH32/XXH64，一次性 + 流式），
+  集成示例 `examples/stdhash.c6`（`make std-hash`）。错误号段
+  `std.encoding.sha3`=0x60a1 … `std.encoding.xxhash`=0x60a4（`c6_err_std_slots[]`
+  追加，`grammar.md` §8.1 同步）。
+
 - **标准库第三十七批（系统视图）**：`std.os.sysinfo` / `std.os.resource` /
   `std.os.user` / `std.os.pty` 四个 libc 薄封装模块，集成示例
   `examples/stdsys.c6`（`make std-sys`）。sysinfo 给 uname/运行时长/负载/CPU 数/

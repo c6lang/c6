@@ -1,0 +1,458 @@
+/* std/encoding/xxhash：xxHash（XXH32 与 XXH64，带种子、带流式）。
+ *
+ *     import std.encoding.xxhash;
+ *
+ *     u32 h32 = xxh32("abc", 3, 0);        // 0x32D153FF
+ *     u64 h64 = xxh64("abc", 3, 0);        // 0x44BC2CF5AD770999
+ *
+ *     Xxh32 s = { 0 };
+ *     s.xxh32_init(0);                     // 种子
+ *     s.xxh32_update("ab", 2);
+ *     s.xxh32_update("c", 1);
+ *     h32 = s.xxh32_digest();
+ *
+ * 约定：
+ *
+ * - 算法按官方规格（小端读、4/8 字节 stripe、`rotl`、末尾 avalanche）；
+ * - `xxh32`/`xxh64` 的 `n` 是字节数，空数据给 0（指针可以是 0）；
+ * - 流式接口的 `digest` 不消耗状态，可以多次调用（内部只读）；
+ * - 种子为 0 与官方 `XXH32(data, n, 0)` 一致；
+ * - 不做 XXH3 与 XXH128（规格复杂得多，不在本模块范围）。
+ */
+#include <string.h>
+
+module std.encoding.xxhash;
+import std.core.types;
+import std.text.str;
+
+#define XXH_P32_1 0x9E3779B1u
+#define XXH_P32_2 0x85EBCA77u
+#define XXH_P32_3 0xC2B2AE3Du
+#define XXH_P32_4 0x27D4EB2Fu
+#define XXH_P32_5 0x165667B1u
+
+#define XXH_P64_1 0x9E3779B185EBCA87ULL
+#define XXH_P64_2 0xC2B2AE3D27D4EB4FULL
+#define XXH_P64_3 0x165667B19E3779F9ULL
+#define XXH_P64_4 0x85EBCA77C2B2AE63ULL
+#define XXH_P64_5 0x27D4EB2F165667C5ULL
+
+struct Xxh32 {
+    u32 v1, v2, v3, v4;
+    u32 seed;
+    u32 total;
+    u8 buf[16];
+    int pos;
+};
+
+struct Xxh64 {
+    u64 v1, v2, v3, v4;
+    u64 seed;
+    u64 total;
+    u8 buf[32];
+    int pos;
+};
+
+static u32 xxh_rotl32(u32 v, int n)
+{
+    return (v << n) | (v >> (32 - n));
+}
+
+static u64 xxh_rotl64(u64 v, int n)
+{
+    return (v << n) | (v >> (64 - n));
+}
+
+static u32 xxh_ld32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u64 xxh_ld64(const u8 *p)
+{
+    return (u64)xxh_ld32(p) | ((u64)xxh_ld32(p + 4) << 32);
+}
+
+static u32 xxh32_round(u32 acc, u32 in)
+{
+    acc += in * XXH_P32_2;
+    acc = xxh_rotl32(acc, 13);
+    acc *= XXH_P32_1;
+    return acc;
+}
+
+static u64 xxh64_round(u64 acc, u64 in)
+{
+    acc += in * XXH_P64_2;
+    acc = xxh_rotl64(acc, 31);
+    acc *= XXH_P64_1;
+    return acc;
+}
+
+static u64 xxh64_merge(u64 acc, u64 v)
+{
+    acc ^= xxh64_round(0, v);
+    acc = acc * XXH_P64_1 + XXH_P64_4;
+    return acc;
+}
+
+u32 xxh32(const void *src, int n, u32 seed)
+{
+    const u8 *p = (const u8 *)src;
+    const u8 *end = p + (n > 0 ? n : 0);
+    u32 h = 0;
+
+    if (n < 0 || (n > 0 && !src))
+        return 0;
+    if (n >= 16) {
+        u32 v1 = seed + XXH_P32_1 + XXH_P32_2;
+        u32 v2 = seed + XXH_P32_2;
+        u32 v3 = seed;
+        u32 v4 = seed - XXH_P32_1;
+        const u8 *limit = end - 16;
+
+        do {
+            v1 = xxh32_round(v1, xxh_ld32(p));
+            v2 = xxh32_round(v2, xxh_ld32(p + 4));
+            v3 = xxh32_round(v3, xxh_ld32(p + 8));
+            v4 = xxh32_round(v4, xxh_ld32(p + 12));
+            p += 16;
+        } while (p <= limit);
+        h = xxh_rotl32(v1, 1) + xxh_rotl32(v2, 7) + xxh_rotl32(v3, 12)
+            + xxh_rotl32(v4, 18);
+    } else {
+        h = seed + XXH_P32_5;
+    }
+    h += (u32)n;
+    while (p + 4 <= end) {
+        h += xxh_ld32(p) * XXH_P32_3;
+        h = xxh_rotl32(h, 17) * XXH_P32_4;
+        p += 4;
+    }
+    while (p < end) {
+        h += (u32)(*p) * XXH_P32_5;
+        h = xxh_rotl32(h, 11) * XXH_P32_1;
+        p++;
+    }
+    h ^= h >> 15;
+    h *= XXH_P32_2;
+    h ^= h >> 13;
+    h *= XXH_P32_3;
+    h ^= h >> 16;
+    return h;
+}
+
+u64 xxh64(const void *src, int n, u64 seed)
+{
+    const u8 *p = (const u8 *)src;
+    const u8 *end = p + (n > 0 ? n : 0);
+    u64 h = 0;
+
+    if (n < 0 || (n > 0 && !src))
+        return 0;
+    if (n >= 32) {
+        u64 v1 = seed + XXH_P64_1 + XXH_P64_2;
+        u64 v2 = seed + XXH_P64_2;
+        u64 v3 = seed;
+        u64 v4 = seed - XXH_P64_1;
+        const u8 *limit = end - 32;
+
+        do {
+            v1 = xxh64_round(v1, xxh_ld64(p));
+            v2 = xxh64_round(v2, xxh_ld64(p + 8));
+            v3 = xxh64_round(v3, xxh_ld64(p + 16));
+            v4 = xxh64_round(v4, xxh_ld64(p + 24));
+            p += 32;
+        } while (p <= limit);
+        h = xxh_rotl64(v1, 1) + xxh_rotl64(v2, 7) + xxh_rotl64(v3, 12)
+            + xxh_rotl64(v4, 18);
+        h = xxh64_merge(h, v1);
+        h = xxh64_merge(h, v2);
+        h = xxh64_merge(h, v3);
+        h = xxh64_merge(h, v4);
+    } else {
+        h = seed + XXH_P64_5;
+    }
+    h += (u64)n;
+    while (p + 8 <= end) {
+        h ^= xxh64_round(0, xxh_ld64(p));
+        h = xxh_rotl64(h, 27) * XXH_P64_1 + XXH_P64_4;
+        p += 8;
+    }
+    if (p + 4 <= end) {
+        h ^= (u64)xxh_ld32(p) * XXH_P64_1;
+        h = xxh_rotl64(h, 23) * XXH_P64_2 + XXH_P64_3;
+        p += 4;
+    }
+    while (p < end) {
+        h ^= (u64)(*p) * XXH_P64_5;
+        h = xxh_rotl64(h, 11) * XXH_P64_1;
+        p++;
+    }
+    h ^= h >> 33;
+    h *= XXH_P64_2;
+    h ^= h >> 29;
+    h *= XXH_P64_3;
+    h ^= h >> 32;
+    return h;
+}
+
+int xxh32_init(Xxh32 *self, u32 seed)
+{
+    if (!self)
+        return -1;
+    memset(self, 0, sizeof *self);
+    self->seed = seed;
+    self->v1 = seed + XXH_P32_1 + XXH_P32_2;
+    self->v2 = seed + XXH_P32_2;
+    self->v3 = seed;
+    self->v4 = seed - XXH_P32_1;
+    return 1;
+}
+
+static void xxh32_stripe(Xxh32 *self, const u8 *p)
+{
+    self->v1 = xxh32_round(self->v1, xxh_ld32(p));
+    self->v2 = xxh32_round(self->v2, xxh_ld32(p + 4));
+    self->v3 = xxh32_round(self->v3, xxh_ld32(p + 8));
+    self->v4 = xxh32_round(self->v4, xxh_ld32(p + 12));
+}
+
+int xxh32_update(Xxh32 *self, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!self || n < 0 || (n > 0 && !src))
+        return -1;
+    self->total += (u32)n;
+    if (self->pos + n < 16) {
+        memcpy(self->buf + self->pos, p, (size_t)n);
+        self->pos += n;
+        return 1;
+    }
+    if (self->pos > 0) {
+        int fill = 16 - self->pos;
+
+        memcpy(self->buf + self->pos, p, (size_t)fill);
+        xxh32_stripe(self, self->buf);
+        p += fill;
+        n -= fill;
+        self->pos = 0;
+    }
+    while (n >= 16) {
+        xxh32_stripe(self, p);
+        p += 16;
+        n -= 16;
+    }
+    if (n > 0) {
+        memcpy(self->buf, p, (size_t)n);
+        self->pos = n;
+    }
+    return 1;
+}
+
+u32 xxh32_digest(Xxh32 *self)
+{
+    const u8 *p = 0;
+    const u8 *end = 0;
+    u32 h = 0;
+
+    if (!self)
+        return 0;
+    p = self->buf;
+    end = self->buf + self->pos;
+    if (self->total >= 16)
+        h = xxh_rotl32(self->v1, 1) + xxh_rotl32(self->v2, 7)
+            + xxh_rotl32(self->v3, 12) + xxh_rotl32(self->v4, 18);
+    else
+        h = self->seed + XXH_P32_5;
+    h += self->total;
+    while (p + 4 <= end) {
+        h += xxh_ld32(p) * XXH_P32_3;
+        h = xxh_rotl32(h, 17) * XXH_P32_4;
+        p += 4;
+    }
+    while (p < end) {
+        h += (u32)(*p) * XXH_P32_5;
+        h = xxh_rotl32(h, 11) * XXH_P32_1;
+        p++;
+    }
+    h ^= h >> 15;
+    h *= XXH_P32_2;
+    h ^= h >> 13;
+    h *= XXH_P32_3;
+    h ^= h >> 16;
+    return h;
+}
+
+int xxh64_init(Xxh64 *self, u64 seed)
+{
+    if (!self)
+        return -1;
+    memset(self, 0, sizeof *self);
+    self->seed = seed;
+    self->v1 = seed + XXH_P64_1 + XXH_P64_2;
+    self->v2 = seed + XXH_P64_2;
+    self->v3 = seed;
+    self->v4 = seed - XXH_P64_1;
+    return 1;
+}
+
+static void xxh64_stripe(Xxh64 *self, const u8 *p)
+{
+    self->v1 = xxh64_round(self->v1, xxh_ld64(p));
+    self->v2 = xxh64_round(self->v2, xxh_ld64(p + 8));
+    self->v3 = xxh64_round(self->v3, xxh_ld64(p + 16));
+    self->v4 = xxh64_round(self->v4, xxh_ld64(p + 24));
+}
+
+int xxh64_update(Xxh64 *self, const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!self || n < 0 || (n > 0 && !src))
+        return -1;
+    self->total += (u64)n;
+    if (self->pos + n < 32) {
+        memcpy(self->buf + self->pos, p, (size_t)n);
+        self->pos += n;
+        return 1;
+    }
+    if (self->pos > 0) {
+        int fill = 32 - self->pos;
+
+        memcpy(self->buf + self->pos, p, (size_t)fill);
+        xxh64_stripe(self, self->buf);
+        p += fill;
+        n -= fill;
+        self->pos = 0;
+    }
+    while (n >= 32) {
+        xxh64_stripe(self, p);
+        p += 32;
+        n -= 32;
+    }
+    if (n > 0) {
+        memcpy(self->buf, p, (size_t)n);
+        self->pos = n;
+    }
+    return 1;
+}
+
+u64 xxh64_digest(Xxh64 *self)
+{
+    const u8 *p = 0;
+    const u8 *end = 0;
+    u64 h = 0;
+
+    if (!self)
+        return 0;
+    p = self->buf;
+    end = self->buf + self->pos;
+    if (self->total >= 32) {
+        h = xxh_rotl64(self->v1, 1) + xxh_rotl64(self->v2, 7)
+            + xxh_rotl64(self->v3, 12) + xxh_rotl64(self->v4, 18);
+        h = xxh64_merge(h, self->v1);
+        h = xxh64_merge(h, self->v2);
+        h = xxh64_merge(h, self->v3);
+        h = xxh64_merge(h, self->v4);
+    } else {
+        h = self->seed + XXH_P64_5;
+    }
+    h += self->total;
+    while (p + 8 <= end) {
+        h ^= xxh64_round(0, xxh_ld64(p));
+        h = xxh_rotl64(h, 27) * XXH_P64_1 + XXH_P64_4;
+        p += 8;
+    }
+    if (p + 4 <= end) {
+        h ^= (u64)xxh_ld32(p) * XXH_P64_1;
+        h = xxh_rotl64(h, 23) * XXH_P64_2 + XXH_P64_3;
+        p += 4;
+    }
+    while (p < end) {
+        h ^= (u64)(*p) * XXH_P64_5;
+        h = xxh_rotl64(h, 11) * XXH_P64_1;
+        p++;
+    }
+    h ^= h >> 33;
+    h *= XXH_P64_2;
+    h ^= h >> 29;
+    h *= XXH_P64_3;
+    h ^= h >> 32;
+    return h;
+}
+
+/* ---- 自测 ---- */
+
+test "xxhash：XXH32 与 XXH64 的已知向量" {
+    if (xxh32("", 0, 0) != 0x02CC5D05u)
+        return err(1, "XXH32(\"\") 不对");
+    if (xxh32("abc", 3, 0) != 0x32D153FFu)
+        return err(2, "XXH32(abc) 不对");
+    if (xxh64("", 0, 0) != 0xEF46DB3751D8E999ULL)
+        return err(3, "XXH64(\"\") 不对");
+    if (xxh64("abc", 3, 0) != 0x44BC2CF5AD770999ULL)
+        return err(4, "XXH64(abc) 不对");
+    /* 种子会改变结果 */
+    if (xxh32("abc", 3, 1) == xxh32("abc", 3, 0))
+        return err(5, "种子应该影响结果");
+    if (xxh64("abc", 3, 1) == xxh64("abc", 3, 0))
+        return err(6, "种子应该影响结果");
+    /* 长度 > stripe 的路径 */
+    {
+        char buf[100] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 100; i++)
+            buf[i] = (char)i;
+        if (xxh32(buf, 100, 0) == xxh32(buf, 99, 0))
+            return err(7, "不同长度结果不该相同");
+        if (xxh64(buf, 100, 0) == xxh64(buf, 99, 0))
+            return err(8, "不同长度结果不该相同");
+    }
+}
+
+test "xxhash：流式与一次性一致" {
+    char msg[300] = { 0 };
+    Xxh32 a = { 0 }, b = { 0 };
+    Xxh64 c = { 0 }, d = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 300; i++)
+        msg[i] = (char)('a' + (i * 7) % 26);
+    if (a.xxh32_init(0) != 1 || c.xxh64_init(0) != 1)
+        return err(9, "init 失败");
+    for (i = 0; i < 300; i += 13)
+        if (a.xxh32_update(msg + i, 300 - i < 13 ? 300 - i : 13) != 1
+            || c.xxh64_update(msg + i, 300 - i < 13 ? 300 - i : 13) != 1)
+            return err(10, "update 失败");
+    if (a.xxh32_digest() != xxh32(msg, 300, 0))
+        return err(11, "XXH32 流式与一次性不一致");
+    if (c.xxh64_digest() != xxh64(msg, 300, 0))
+        return err(12, "XXH64 流式与一次性不一致");
+    /* digest 可以重复调用 */
+    if (a.xxh32_digest() != a.xxh32_digest())
+        return err(13, "digest 应该可重复");
+    if (c.xxh64_digest() != c.xxh64_digest())
+        return err(14, "digest 应该可重复");
+    /* 空流的流式结果等于一次性 */
+    if (b.xxh32_init(0) != 1 || b.xxh32_digest() != 0x02CC5D05u)
+        return err(15, "空流 XXH32 不对");
+    if (d.xxh64_init(0) != 1 || d.xxh64_digest() != 0xEF46DB3751D8E999ULL)
+        return err(16, "空流 XXH64 不对");
+    /* 分段点刚好落在 stripe 边界 */
+    if (b.xxh32_init(0) != 1 || b.xxh32_update(msg, 16) != 1
+        || b.xxh32_update(msg + 16, 16) != 1
+        || b.xxh32_digest() != xxh32(msg, 32, 0))
+        return err(17, "16 字节边界不对");
+    if (d.xxh64_init(0) != 1 || d.xxh64_update(msg, 32) != 1
+        || d.xxh64_update(msg + 32, 32) != 1
+        || d.xxh64_digest() != xxh64(msg, 64, 0))
+        return err(18, "32 字节边界不对");
+    if (xxh32_init(0, 0) != -1 || xxh64_init(0, 0) != -1)
+        return err(19, "空指针 init 应该 -1");
+    if (xxh32_digest(0) != 0 || xxh64_digest(0) != 0)
+        return err(20, "空指针 digest 应该 0");
+}

@@ -147,8 +147,16 @@
 | `std/encoding/sha1.c6` | `std.encoding.sha1` | SHA-1 与 HMAC-SHA1（FIPS 180-4 / RFC 2104，零分配）：`sha1_new`/`init`/`update`/`final`、一次性 `sha1`/`sha1_hex`、`hmac_sha1`/`hmac_sha1_hex`、常数时间 `sha1_eq`；用于协议互操作（WebSocket 握手、git 对象名、HTTP Digest），抗碰撞请用 `std.encoding.sha256` |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
 | `std/encoding/md5.c6` | `std.encoding.md5` | MD5（RFC 1321，零分配）：`Md5` 的 `init`/`update`/`final`、一次性 `md5`/`md5_hex`、常数时间 `md5_eq`；小端 32 位字、64 步四轮，T 表按 `sin(i+1)` 生成；**只用于校验和/兼容格式**，碰撞是分钟级的 |
+| `std/encoding/sha3.c6` 24 | sha3 2 + str 22 |
+| `std/encoding/blake2s.c6` 24 | blake2s 2 + str 22 |
+| `std/encoding/crc32c.c6` 24 | crc32c 2 + str 22 |
+| `std/encoding/xxhash.c6` 24 | xxhash 2 + str 22 |
 | `std/encoding/sha512.c6` | `std.encoding.sha512` | SHA-512 / SHA-384 与 HMAC-SHA-512（FIPS 180-4 / RFC 2104，零分配）：`Sha512` 的 `init`/`init384`/`update`/`final`（128 位长度计数）、一次性 `sha512`/`sha384`/`sha512_hex`/`sha384_hex`、`hmac_sha384`/`hmac_sha512`/`hmac_sha512_hex`、常数时间 `sha512_eq`；80 轮、64 位字，旋转借 `std.core.bits` |
-| `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
+
+| `std/encoding/sha3.c6` | `std.encoding.sha3` | SHA-3 / SHAKE（Keccak-f1600 海绵，零分配）：`Sha3` 的 `sha3_init(224/256/384/512)`/`sha3_update`/`sha3_final`、`shake_init(128/256)` + `shake_out`（可连续挤任意长度）、一次性 `sha3_hash`；填充 0x06（SHA-3）/0x1F（SHAKE），rate = 200-2·输出字节 |
+| `std/encoding/blake2s.c6` | `std.encoding.blake2s` | BLAKE2s（32 位，输出 1~32 字节）：`Blake2s` 的 `blake2s_init(outlen)`/`blake2s_update`/`blake2s_final(dst,outlen)` 与一次性 `blake2s_hash`；参数块只填输出长度（无 key/salt/personal） |
+| `std/encoding/crc32c.c6` | `std.encoding.crc32c` | CRC-32C（Castagnoli，反射多项式 0x82F63B78）：一次算完的 `crc32c`/`crc32c_str`，裸寄存器分段的 `crc32c_update`（初值 0xFFFFFFFF、自己末取反）；256 项表惰性生成 |
+| `std/encoding/xxhash.c6` | `std.encoding.xxhash` | xxHash：一次性 `xxh32`/`xxh64`（带种子）与流式 `Xxh32`/`Xxh64`（`init`/`update`/`digest`，`digest` 可重复调用）；按官方规格 16/32 字节 stripe + avalanche；不做 XXH3/XXH128 || `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
 | `std/encoding/hkdf.c6` | `std.encoding.hkdf` | HKDF（RFC 5869，基于 HMAC-SHA-256，零分配）：`hkdf_extract`/`hkdf_expand`/`hkdf`（一步版）；salt 为空按 32 个零字节、expand 上限 255*32=8160 字节（计数器只有一字节）、`out_len == 0` 是合法空操作；返回 0/-1 |
 | `std/encoding/pbkdf2.c6` | `std.encoding.pbkdf2` | PBKDF2-HMAC-SHA-1 / SHA-256（RFC 2898/8018，零分配）：`pbkdf2_sha1`/`pbkdf2_sha256`；每块 `U(1)=HMAC(P, S 拼上 INT(i))`、`U(j)=HMAC(P,U(j-1))`、`T=xor(U(1..iters))`；`iters <= 0`、空输出返回 -1，口令/盐传 0 当空串，输出长度不限（块号按需递增） |
@@ -268,6 +276,7 @@
 | `examples/stdexec.c6` | （无模块） | 第三十五批（二进制容器格式）的拼装示例（`make std-exec`）：内存里现场拼出 cpio 归档（目录+文件+收尾）、PE32+ 映像（节表 + RVA 映射）、Mach-O 64 位映像（`LC_SEGMENT_64` + `LC_MAIN`）与 wasm 模块（导出表），再逐个解析 |
 | `examples/stdser.c6` | （无模块） | 第三十六批（序列化与标记）的拼装示例（`make std-ser`）：现场拼 BSON 与 UBJSON 文档、解一段 plistlib 生成的二进制 plist（58 字节）、把一段 Markdown 渲染成 HTML |
 | `examples/stdsys.c6` | （无模块） | 第三十七批（系统视图）的拼装示例（`make std-sys`）：打印 uname/负载/运行时长/CPU/页大小、rlimit/rusage、当前用户与主组，再用伪终端跑 `sh -c` 并抓它的输出 |
+| `examples/stdhash.c6` | （无模块） | 第三十八批（哈希与校验）的拼装示例（`make std-hash`）：SHA-3-256/SHAKE128、BLAKE2s-256/128、CRC-32C、XXH32/XXH64 的已知向量与流式一致性 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -345,6 +354,10 @@ std/encoding/punycode.c6   11 test(s), 0 failure(s)
 std/encoding/sha256.c6     23 test(s), 0 failure(s)
 std/encoding/md5.c6         9 test(s), 0 failure(s)
 std/encoding/sha512.c6      9 test(s), 0 failure(s)
+std/encoding/sha3.c6       24 test(s), 0 failure(s)
+std/encoding/blake2s.c6    24 test(s), 0 failure(s)
+std/encoding/crc32c.c6     24 test(s), 0 failure(s)
+std/encoding/xxhash.c6     24 test(s), 0 failure(s)
 std/encoding/hkdf.c6       28 test(s), 0 failure(s)
 std/encoding/pbkdf2.c6     33 test(s), 0 failure(s)
 std/encoding/aes.c6         2 test(s), 0 failure(s)
@@ -3464,6 +3477,16 @@ make std-sys
 缺页与上下文切换；`user` 打印当前用户、家目录、登录壳与主组；`pty` 用伪终端
 跑 `sh -c "echo pty-ok; tty"` 并抓输出，再回读窗口大小。
 
+### 集成示例：`examples/stdhash.c6`
+
+```sh
+make std-hash
+```
+
+四节各自对已知向量：`SHA3-256("abc")`、`SHAKE128("",32)`、`BLAKE2s-256("abc")`、
+`BLAKE2s-128("abc")`、`CRC32C("123456789")`、`XXH32("")` / `XXH64("")`；另外
+每节都验一遍「流式喂」与「一次喂完」结果相同。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3533,6 +3556,8 @@ make std-sys
 * `make std-ser`：`examples/stdser.c6`，第三十六批（序列化与标记）模块的拼装示例
   （自带自检）。
 * `make std-sys`：`examples/stdsys.c6`，第三十七批（系统视图）模块的拼装示例
+  （自带自检）。
+* `make std-hash`：`examples/stdhash.c6`，第三十八批（哈希与校验）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

@@ -1474,6 +1474,31 @@ libc 薄封装，重点在把 errno 变成明确的 1/0/-1 语义、把结构体
 验收：`make stdtest`（161 个模块、0 failure）、`make std-sys`（13 条自检全过）、
 `make check-all`。
 
+### 11.50 标准库第三十八批（sha3 / blake2s / crc32c / xxhash）
+
+第三十八批补哈希与校验：Keccak 家族的 SHA-3/SHAKE、BLAKE2s、CRC-32C 与 xxHash。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.sha3` | SHA3-224/256/384/512 + SHAKE128/256 | Keccak-f1600 的 θ/ρ/π/χ/ι 五步按 `st[x+5y]` 展平；吸收按字节写进 64 位 lane（`(pos%8)*8` 移位），这样 rate 不必是 8 的倍数；SHAKE 的挤压位置单独记，`shake_out` 可连续调用 |
+| `std.encoding.blake2s` | BLAKE2s（1~32 字节输出） | update **不压最后一块**（压了就丢 `last` 标记），留给 final；t 计数在压块前累加；正好 64 字节时 `pos==64` 由 final 处理 |
+| `std.encoding.crc32c` | CRC-32C | 反射多项式 0x82F63B78；`crc32c` 自己管初值/末取反，`crc32c_update` 是裸寄存器接口，两种接口要能对上 |
+| `std.encoding.xxhash` | XXH32/XXH64 | 一次性与流式两套；流式 `digest` 只读状态，可重复调用；`total >= stripe` 才走 accumulator 合并路径，短输入用 `seed + P5` |
+
+两个坑：一是「先解引用再判空」——`xxh32_digest` 一开头就 `self->buf`，传 0 直接
+段错误，把判空提到最前面；二是 SHAKE 的填充时机——必须在**第一次挤压**前补
+（用 `squeezed` 标记），不能放在 `shake_out` 的循环里按「位置是否为 0」猜。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.sha3`=0x60a1、
+`std.encoding.blake2s`=0x60a2、`std.encoding.crc32c`=0x60a3、`std.encoding.xxhash`=0x60a4；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-hash` 与 `STD_HASH_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。
+示例 `examples/stdhash.c6` 四节（17 条自检）。
+
+验收：`make stdtest`（165 个模块、0 failure）、`make std-hash`（17 条自检全过）、
+`make check-all`。
+
+
 
 
 
