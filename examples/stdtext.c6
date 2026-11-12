@@ -1,0 +1,198 @@
+/* stdtext：标准库第十二批（regex / diff / fuzzy / wrap）的拼装示例。
+ *
+ * 和 stdform/stdnode/stdembed 一样：这个文件没有 `module`（入口 `main`
+ * 只能写在模块外的文件里），四节各带自检，失败打 FAIL，最后按失败数决定
+ * 退出码。
+ *
+ * 四节讲的是一条「文本处理」链路：
+ *
+ *   - regex：从日志行里用捕获组拆出时间/级别/消息，再 find_all 扫数字；
+ *   - fuzzy：命令名拼错时给「did you mean」，编辑距离 + 子序列打分排序；
+ *   - wrap：把帮助文本按 34 列折行（首行缩进 2、续行 6），中文按 2 列算；
+ *   - diff：两份配置的 unified diff（Hirschberg LCS，ctx=1）。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdtext \
+ *         examples/stdtext.c6 std/core/types.c6 std/core/mem.c6 \
+ *         std/text/regex.c6 std/text/utf8.c6 std/text/diff.c6 \
+ *         std/text/fuzzy.c6 std/text/wrap.c6 std/text/width.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.mem;
+import std.text.regex;
+import std.text.diff;
+import std.text.fuzzy;
+import std.text.wrap;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* 正则：捕获组拆日志、find_all 扫数字、编译错误给位置 */
+static void tour_regex(void)
+{
+    const char *log[4] = {
+        "12:00:01 ERROR: disk full",
+        "12:00:02 INFO: started",
+        "12:00:03 WARN: low memory",
+        "12:00:04 ERROR: network down",
+    };
+    Regex re = re_compile(S("^(\\S+) (ERROR|WARN|INFO): (.*)$"));
+    int i = 0, errors = 0;
+
+    check(re.is_valid() && re.groups() == 3, "regex: 模式编译与捕获组数");
+    for (i = 0; i < 4; i++) {
+        Match m = { 0 };
+        char[:] line = { (char *)log[i], (int)strlen(log[i]) };
+        char[:] ts = { 0 };
+        char[:] lvl = { 0 };
+        char[:] msg = { 0 };
+
+        check(re.find(line, &m), "regex: 每条日志都能匹配");
+        ts = m.group(line, 1);
+        lvl = m.group(line, 2);
+        msg = m.group(line, 3);
+        check(ts.len == 8 && lvl.len >= 4 && msg.len > 0,
+              "regex: 三个捕获组都有值");
+        if (lvl.len == 5 && memcmp(lvl.data, "ERROR", 5) == 0)
+            errors++;
+    }
+    check(errors == 2, "regex: ERROR 行数");
+
+    {
+        Regex num = re_compile(S("\\d+"));
+        Match found[8] = { { 0 } };
+        int k = num.find_all(S("a1 bb22 ccc333"), found, 8);
+
+        check(k == 3, "regex: find_all 扫出三段数字");
+        check(found[2].end - found[2].start == 3, "regex: 最后一段是 3 位");
+        check(found[1].start == 5, "regex: 第二段从字节 5 开始");
+    }
+    {
+        Regex bad = re_compile(S("(x"));
+
+        check(!bad.is_valid() && bad.error_pos() == 2,
+              "regex: 少了右括号，位置指向末尾");
+    }
+}
+
+/* 模糊匹配：编辑距离、相似度、给定候选挑最像的 */
+static void tour_fuzzy(void)
+{
+    const char *cmds[7] = { "install", "remove", "search",
+                            "update", "upgrade", "list", "info" };
+    char[:] cands[7] = { { 0 } };
+    int i = 0;
+
+    for (i = 0; i < 7; i++)
+        cands[i] = (char[:]){ (char *)cmds[i], (int)strlen(cmds[i]) };
+    check(fuzzy_best(S("instal"), cands, 7, 2) == 0, "fuzzy: instal -> install");
+    check(fuzzy_best(S("zzz"), cands, 7, 1) == -1, "fuzzy: 都不像给 -1");
+    check(lev_distance(S("kitten"), S("sitting")) == 3, "fuzzy: kitten/sitting");
+    check(damerau_distance(S("ab"), S("ba")) == 1, "fuzzy: 相邻换位算 1");
+    check(lev_ratio(S("install"), S("instal")) == 857, "fuzzy: 相似度千分比");
+    check(subsequence_match(S("srch"), S("search")), "fuzzy: 子序列匹配");
+    check(!subsequence_match(S("hcraes"), S("search")), "fuzzy: 顺序反了不匹配");
+    {
+        /* 补全场景：按子序列分数挑最像的候选 */
+        int best = -1, best_score = -1, sc = 0;
+
+        for (i = 0; i < 7; i++) {
+            sc = subsequence_score(S("updt"), cands[i]);
+            if (sc > best_score) {
+                best_score = sc;
+                best = i;
+            }
+        }
+        check(best == 3 && best_score > 0, "fuzzy: updt 最像 update");
+    }
+}
+
+/* 折行：按显示列数排版；中文 2 列、组合符 0 列 */
+static void tour_wrap(void)
+{
+    char buf[512] = { 0 };
+    char[:] out = { buf, (int)sizeof buf - 1 };
+    char[:] text = S("fuzzy search finds the closest command; 折行让帮助文本在窄终端里"
+                     "也能读，中英混排按显示列算宽度。");
+    Wrap w = wrap_indented(34, 2, 6);
+    int n = 0, i = 0, start = 0, ok = 1;
+
+    n = w.write(text, out);
+    buf[n > 0 ? n : 0] = 0;
+    printf("---- wrap(34, indent 2 / hang 6) ----\n%s", buf);
+    check(n == w.count(text), "wrap: count 与 write 一致");
+    check(w.lines(text) >= 3, "wrap: 至少三行");
+    check(buf[0] == ' ' && buf[1] == ' ', "wrap: 首行缩进两个空格");
+    for (i = 0; i <= n; i++) {
+        if (i == n || buf[i] == '\n') {
+            char[:] line = { buf + start, i - start };
+
+            if (text_width(line) > 34)
+                ok = 0;
+            start = i + 1;
+        }
+    }
+    check(ok, "wrap: 每一行都不超过 34 列");
+
+    n = text_center(S("标准库第十二批"), out, 30);
+    buf[n > 0 ? n : 0] = 0;
+    printf("---- center(30) ----\n%s", buf);
+    check(n > 0 && text_width((char[:]){ buf, n - 1 }) == 30,
+          "wrap: 居中后正好 30 列");
+}
+
+/* 差异：Hirschberg LCS + unified 输出 */
+static void tour_diff(void)
+{
+    static char work[8192] = { 0 };
+    char out[1024] = { 0 };
+    Arena ar = arena_make(work, (int)sizeof work);
+    char[:] old_text = S("port = 8080\nhost = localhost\ndebug = false\ntimeout = 30\n");
+    char[:] new_text = S("port = 9090\nhost = localhost\ndebug = true\ntimeout = 60\n");
+    Diff d = diff_make(&ar, old_text, new_text);
+    int n = 0;
+
+    check(d.err == 0, "diff: 工作区够用");
+    check(d.removed == 3 && d.added == 3 && d.same == 1, "diff: 增删统计");
+    check(d.script_len() > 0, "diff: script 有内容");
+    n = d.write_unified((char[:]){ out, (int)sizeof out - 1 }, 1);
+    out[n > 0 ? n : 0] = 0;
+    printf("---- diff -u (ctx=1) ----\n%s", out);
+    check(n > 0 && strstr(out, "@@ -1,4 +1,4 @@") != 0, "diff: hunk 头");
+    check(strstr(out, "-port = 8080") != 0 && strstr(out, "+port = 9090") != 0,
+          "diff: 端口那一行");
+    check(strstr(out, " host = localhost") != 0, "diff: 相同行带上下文");
+    check(d.write_unified((char[:]){ out, 8 }, 1) == -1,
+          "diff: 放不下给 -1");
+
+    /* 完全相同的两份文本：一条 op、没有任何增删 */
+    d = diff_make(&ar, S("a\nb\n"), S("a\nb\n"));
+    check(d.added == 0 && d.removed == 0 && d.same == 2 && d.nops == 2,
+          "diff: 相同文本没有变更");
+}
+
+int main(void)
+{
+    printf("stdtext: 标准库第十二批（regex / diff / fuzzy / wrap）\n");
+    tour_regex();
+    tour_fuzzy();
+    tour_wrap();
+    tour_diff();
+    printf("stdtext: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

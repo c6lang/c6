@@ -65,6 +65,10 @@
 | `std/text/utf16.c6` | `std.text.utf16` | UTF-16 解码/编码/计数：`Utf16` 的 `decode`/`valid`/`count`、`utf16_encode`/`utf16_encoded_len`；代理对、BMP、非法代理与截断（零分配） |
 | `std/text/ansi.c6` | `std.text.ansi` | ANSI 转义构造器 `Ansi`：`reset`/`bold`/`fg_basic`/`bg_basic`/`fg`/`bg`/`move`/`up`/`down`/`clear_screen`/`clear_line`/`hide_cursor`/`show_cursor`，满了置 `ok=0` |
 | `std/text/width.c6` | `std.text.width` | 终端显示宽度（Unicode 15.0）：`cp_width`、`text_width`/`text_width_checked`、按列裁剪补齐 `text_prefix_len`/`text_fit`/`text_pad`/`text_clip`；W/F 算 2 列、组合符/格式符 0 列、只在码点边界切 |
+| `std/text/regex.c6` | `std.text.regex` | 回溯式正则（零分配、按码点）：`re_compile`/`re_compile_flags`（`RE_ICASE`/`RE_DOTALL`/`RE_MULTILINE`）、`Regex` 的 `find`/`find_from`/`match_at`/`matches`/`full`/`find_all`/`groups`/`is_valid`/`error_pos`、`Match` 的 `span`/`group`；`*`/`+`/`?`/`{m,n}`（懒惰后缀）、捕获与非捕获组、分支、字符类、`\d\w\s\b`、锚点；位置是字节、匹配按码点，容量上限见枚举 |
+| `std/text/diff.c6` | `std.text.diff` | 行级差异：`diff_make`（Hirschberg LCS，时间 O(na*nb)、空间 O(nb)，工作区从 `Arena` 分）、`Diff` 的 `write_script`/`write_unified`/`script_len`/`unified_len`/`op_at` 与 `added`/`removed`/`same`；先剥公共前后缀，hunk 按 ctx 合并，放不下不写半截 |
+| `std/text/fuzzy.c6` | `std.text.fuzzy` | 模糊匹配（按码点、零分配）：`lev_distance`/`lev_distance_max`/`lev_ratio`（千分比）、`damerau_distance`（OSA，相邻换位算 1）、`subsequence_match`/`subsequence_score`（连续与词首加分）、`fuzzy_best`（候选里挑最近的）；`FUZZY_MAX`=256 码点，超了给 -1 |
+| `std/text/wrap.c6` | `std.text.wrap` | 按显示列折行与排版：`wrap_make`/`wrap_indented`、`Wrap` 的 `count`/`write`/`lines`、`text_indent`/`text_indent_len`/`text_center`/`text_center_len`；CJK 2 列、组合符 0 列、CJK 之间可直接断行、超长词按码点硬切（`WRAP_BREAK_LONG`）；先量再写，放不下不写半截 |
 
 **`std/container/`**（容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序）
 
@@ -142,6 +146,7 @@
 | `examples/stdnode.c6` | （无模块） | 第九批模块的拼装示例（`make std-node`）：list/ring/utf16/ansi 各一节，自带自检 |
 | `examples/stdform.c6` | （无模块） | 第十批模块的拼装示例（`make std-form`）：props/multipart/punycode/width 各一节，自带自检 |
 | `examples/stdembed.c6` | （无模块） | 第十一批（嵌入式基础）的拼装示例（`make std-embed`）：fixed/crc/pool/frame 各一节，串成「采样 → 定点 → 分帧 → 校验 → 池」链路，自带自检 |
+| `examples/stdtext.c6` | （无模块） | 第十二批（文本算法）的拼装示例（`make std-text`）：regex 拆日志、fuzzy 命令补全、wrap 帮助折行、diff 配置对比，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -1441,6 +1446,90 @@ int bytes = text_prefix_len(S("a中b"), 2);                             /* 1, �
   半个 UTF-8 序列；`text_pad` 宽了先截、窄了补空格到恰好 N 列，`text_clip` 截断时
   补 `...`（总宽度仍 ≤ N）。都写调用方缓冲，放不下返回 -1 且不写。
 
+### `regex`：回溯式正则
+
+```c
+import std.text.regex;
+
+Regex re = re_compile(S("^(\\S+) (ERROR|WARN): (.*)$"));
+Match m = { 0 };
+if (re.find(line, &m)) {
+    char[:] level = m.group(line, 2);
+    char[:] msg = m.group(line, 3);
+    printf("%.*s %.*s\n", level.len, level.data, msg.len, msg.data);
+}
+```
+
+* 支持：字面量（UTF-8 按码点）、`.`、`[...]`/`[^...]`/`[a-z]`、`*` `+` `?`
+  `{m}` `{m,}` `{m,n}`（后缀 `?` 懒惰）、`(...)` 捕获组、`(?:...)`、`|`、
+  `^` `$`、`\d \D \w \W \s \S \b \B`、`\n \t \r \f \v \0 \xHH` 与标点
+  转义。**不支持**反向引用、前后瞻、命名组、`[[:alpha:]]`、`\p{..}`。
+* **位置是字节、匹配按码点**：`Match.start`/`end` 和 `group` 都是字节偏移，正好
+  切 `char[:]`；`.` 吃一个码点。`\d \w \s \b` 按 ASCII 判定，`RE_ICASE` 只折 ASCII。
+* 量词默认贪婪；`find` 从第一个能匹配的位置开始，`full` 等价于 `^(?:pat)$`
+  （会为「吃到文本结尾」回溯），`find_all` 遇到空匹配也会前进一个码点。
+* 容量上限写在枚举里：64 个节点、8 个字符类（每类 16 段区间）、9 个捕获组、
+  `{m,n}` 的 n ≤ 255；匹配深度 4096，超了 `Match.aborted` 置 1、`find` 返回 0。
+* 单字符量词（`.*`、`[a-z]+`、`\d{2,4}`）和「定长链 + 一层捕获组」的组量词
+  （`(ab)*`）走迭代快路径，是线性的；分支/嵌套组上的量词才是经典回溯。
+
+### `diff`：行级差异与 unified 输出
+
+```c
+import std.core.mem;
+import std.text.diff;
+
+char work[16384] = { 0 };
+Arena ar = arena_make(work, (int)sizeof work);
+Diff d = diff_make(&ar, old_text, new_text);
+char out[1024] = { 0 };
+int n = d.write_unified((char[:]){ out, (int)sizeof out }, 3);   // ctx=3
+```
+
+* Hirschberg LCS：时间 O(na*nb)、额外空间 O(nb)（两行 DP + 匹配表），先剥公共
+  前后缀，所以「长文件里改几行」接近线性。工作区全部从 `Arena` 分，不 malloc。
+* 行切分：`\n` 结尾算一行，最后一行没有 `\n` 也算一行，空文本 0 行；`\r` 算行内容。
+* 输出：`write_script`（` `/`-`/`+` 前缀）与 `write_unified`（`@@ -a,b +c,d @@`，
+  不含 `---`/`+++`，相邻 hunk 按 `ctx` 合并）；`script_len`/`unified_len` 给精确
+  长度，都是先量再写、放不下返回 -1 且不写半截；`op_at` 逐条取编辑动作。
+* 工作区不够时 `err = DIFF_ENOMEM`，之后所有写接口返回 -1。
+
+### `fuzzy`：编辑距离、相似度与子序列
+
+```c
+import std.text.fuzzy;
+
+lev_distance(S("kitten"), S("sitting"));        /* 3 */
+lev_ratio(S("install"), S("instal"));           /* 857（千分比） */
+damerau_distance(S("ab"), S("ba"));             /* 1（相邻换位） */
+fuzzy_best(S("instal"), cands, n, 2);           /* 最近的候选下标 */
+```
+
+* 全部**按码点**（`中文` 对 `中问` 是 1，不是 3），坏 UTF-8 字节算一个字符。
+* `lev_distance` 是 Levenshtein；`damerau_distance` 是 OSA（相邻换位算 1，不做
+  完整 Damerau）；`lev_ratio` = `(maxlen - dist) * 1000 / maxlen`。
+* `lev_distance_max` 只看「超过阈值没有」：长度差先挡一道，超过给 `maxd+1`。
+* `subsequence_match`/`subsequence_score` 是 fzf 式判据与打分（ASCII 大小写不敏感，
+  连续命中 +4、词首命中 +6、跳过字符扣分）；`fuzzy_best` 用它做「did you mean」。
+* `FUZZY_MAX` = 256 码点：超了返回 -1（栈上两张码点表 + 两三行 DP，约 5KB）。
+
+### `wrap`：按显示列折行、缩进与居中
+
+```c
+import std.text.wrap;
+
+Wrap w = wrap_indented(40, 2, 6);      /* 40 列，首行缩进 2、续行 6 */
+char out[512] = { 0 };
+int n = w.write(text, (char[:]){ out, (int)sizeof out });
+```
+
+* 宽度是**显示列**（`std.text.width` 的 `cp_width`）：CJK/全角 2 列、组合符 0 列。
+* 空白分隔词（同一行压成一个空格）；**CJK 字符之间可以直接断行**；超长词默认按
+  码点硬切（`WRAP_BREAK_LONG`），清掉这个开关就整段溢出、下一段再换行。
+* 输入空行原样保留，`\r\n` 按 `\n` 处理；输出每行都以 `\n` 结尾，空输入 0 字节。
+* `count`/`lines` 与 `write` 共用一套渲染，长度精确；`write` 放不下返回 -1 且不写
+  半截。`text_indent`/`text_center` 是整段缩进与居中（各有 `*_len` 版本）。
+
 ### 嵌入式基础：`crc` / `fixed` / `pool` / `frame`
 
 四个模块都只依赖 `std.core.types`，不分配、不链 libm、不碰 `pthread`，所以
@@ -1758,6 +1847,26 @@ crc 算 Modbus 请求的 CRC-16、1-Wire ROM 的 CRC-8、CRC-32C 与 Fletcher/LR
 「负载里未转义的 END 要报错」）。Makefile 里显式列出四个模块正文，它们都只
 依赖 `std/core/types.c6`。
 
+### 集成示例：`examples/stdtext.c6`
+
+```sh
+make std-text
+```
+
+```
+stdtext: 标准库第十二批（regex / diff / fuzzy / wrap）
+stdtext: 35 check(s), 0 failure(s)
+```
+
+四节：regex 用 `^(\\S+) (ERROR|WARN|INFO): (.*)$` 把四条日志拆成时间/级别/消息并
+数 ERROR，再用 `\\d+` 的 `find_all` 扫 `a1 bb22 ccc333` 的三段数字，最后钉住
+「少右括号」的编译错误位置；fuzzy 对 7 条子命令做「instal → install」的建议、
+kitten/sitting 的编辑距离、换位距离、千分比与子序列打分（`updt` 最像 `update`）；
+wrap 把中英混排的帮助文本折成 34 列（首行缩进 2、续行 6），逐行验宽度 ≤ 34，
+再用 `text_center` 居中标题；diff 给两份 4 行配置的 `@@ -1,4 +1,4 @@`（ctx=1），
+并验「放不下返回 -1」。Makefile 里显式列出八个模块正文（regex/fuzzy 依赖
+`std/text/utf8.c6`，wrap 再依赖 `std/text/width.c6`，diff 依赖 `std/core/mem.c6`）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1775,6 +1884,8 @@ crc 算 Modbus 请求的 CRC-16、1-Wire ROM 的 CRC-8、CRC-32C 与 Fletcher/LR
 * `make std-node`：`examples/stdnode.c6`，第九批模块的拼装示例（自带自检）。
 * `make std-form`：`examples/stdform.c6`，第十批模块的拼装示例（自带自检）。
 * `make std-embed`：`examples/stdembed.c6`，第十一批（嵌入式基础）模块的拼装示例
+  （自带自检）。
+* `make std-text`：`examples/stdtext.c6`，第十二批（文本算法）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

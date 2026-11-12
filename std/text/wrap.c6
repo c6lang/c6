@@ -1,0 +1,582 @@
+/* std/text/wrap：按**显示列数**折行、缩进与居中（零分配、写调用方缓冲）。
+ *
+ *     import std.text.wrap;
+ *
+ *     Wrap w = wrap_make(40);                 // 40 列
+ *     char out[256] = { 0 };
+ *     int n = w.write(text, (char[:]){ out, (int)sizeof out });
+ *
+ *     Wrap q = wrap_indented(40, 4, 8);       // 首行缩进 4、续行缩进 8
+ *     text_center(S("标题"), (char[:]){ out, (int)sizeof out }, 20);
+ *
+ * 宽度用 `std.text.width` 的 `cp_width`：CJK/全角算 2 列、组合符与格式符 0 列、
+ * 其余 1 列；**不是字节数**，所以一段中文和一段英文混排也能对齐。
+ *
+ * 断行规则（有意做得很朴素）：
+ *
+ * - 空白（空格/制表/`\v`/`\f`）分隔词；同一行的词之间压成一个空格。
+ * - **CJK 字符之间可以直接断行**：宽度 2 的码点各自成原子，不靠空格也能折行。
+ * - 一个词比整行还宽时：默认（`WRAP_BREAK_LONG`）按码点硬切；清掉这个开关就
+ *   整段塞进去、让它溢出，下一段再换行。
+ * - 输入里的空行原样保留（输出一个 `\n`，不带缩进）；`\r\n` 按 `\n` 处理。
+ * - 输出**每行都以 `\n` 结尾**（包括最后一行）；空输入输出 0 字节。
+ *
+ * 两个约定和其它 `std/` 模块一致：`count`/`write` 走同一套渲染，长度精确；
+ * `write` 放不下返回 -1 且**一个字节都不写**。不做字素簇合并（组合符单独
+ * 成原子），要精确的 emoji 排版别用它。
+ */
+#include <string.h>
+
+module std.text.wrap;
+import std.core.types;
+import std.text.utf8;
+import std.text.width;
+
+/* 折行开关 */
+enum WrapFlags {
+    WRAP_BREAK_LONG = 1,      /* 超长词按码点硬切（默认） */
+};
+
+/* 工厂的失败码 */
+enum WrapErr {
+    WRAP_OK = 0,
+    WRAP_EBADWIDTH = 1,       /* width <= 0 */
+};
+
+struct Wrap {
+    int width;                /* 总列宽 */
+    int indent;               /* 首行缩进列数 */
+    int hang;                 /* 续行缩进列数 */
+    int flags;
+    int err;
+};
+
+Wrap wrap_make(int width)
+{
+    Wrap w = { 0 };
+
+    w.width = width;
+    w.flags = WRAP_BREAK_LONG;
+    if (width <= 0) {
+        w.width = 1;
+        w.err = WRAP_EBADWIDTH;
+    }
+    return w;
+}
+
+Wrap wrap_indented(int width, int indent, int hang)
+{
+    Wrap w = wrap_make(width);
+
+    if (indent < 0)
+        indent = 0;
+    if (hang < 0)
+        hang = 0;
+    if (indent >= w.width)
+        indent = 0;
+    if (hang >= w.width)
+        hang = 0;
+    w.indent = indent;
+    w.hang = hang;
+    return w;
+}
+
+/* ---- 输出缓冲 ---- */
+
+struct WOut {
+    char[:] buf;
+    int n;
+    int count_only;
+    int lines;
+};
+
+static const char w_spaces[] = "                ";
+
+static void o_bytes(WOut *o, const char *p, int n)
+{
+    if (!o->count_only && n > 0 && o->n + n <= o->buf.len)
+        memcpy(o->buf.data + o->n, p, (usize)n);
+    o->n += n;
+}
+
+static void o_spaces(WOut *o, int n)
+{
+    int k = 0;
+
+    while (n > 0) {
+        k = (n > 16) ? 16 : n;
+        o_bytes(o, w_spaces, k);
+        n -= k;
+    }
+}
+
+static void o_nl(WOut *o)
+{
+    o_bytes(o, "\n", 1);
+    o->lines++;
+}
+
+/* ---- 码点小工具 ---- */
+
+/* 返回消耗的字节数；越界给 0；坏字节按 1 字节的字符 */
+static int w_step(char[:] s, int pos, u32 *cp)
+{
+    int k = 0;
+
+    if (pos < 0 || pos >= s.len)
+        return 0;
+    k = utf8_decode(s, pos, cp);
+    if (k <= 0) {
+        *cp = (u8)s.data[pos];
+        k = 1;
+    }
+    return k;
+}
+
+static int w_is_space(u32 cp)
+{
+    return cp == ' ' || cp == '\t' || cp == '\v' || cp == '\f' || cp == '\r';
+}
+
+/* [start, end) 的显示列数 */
+static int w_width(char[:] s, int start, int end)
+{
+    int p = start, k = 0, w = 0;
+    u32 cp = 0;
+
+    while (p < end) {
+        k = w_step(s, p, &cp);
+        if (k <= 0)
+            break;
+        w += cp_width(cp);
+        p += k;
+    }
+    return w;
+}
+
+/* 一个「原子」的结束位置：宽字符单独成原子，窄字符连成一段 */
+static int w_atom_end(char[:] s, int start, int end)
+{
+    int p = start, k = 0;
+    u32 cp = 0;
+
+    while (p < end) {
+        k = w_step(s, p, &cp);
+        if (k <= 0)
+            break;
+        if (w_is_space(cp))
+            break;
+        if (cp_width(cp) == 2)
+            return (p == start) ? p + k : p;
+        p += k;
+    }
+    return p;
+}
+
+/* ---- 折行 ---- */
+
+static void wrap_line(Wrap *self, char[:] s, int start, int end, WOut *o)
+{
+    int p = start, k = 0, col = 0, has = 0, need_space = 0;
+    int ae = 0, aw = 0, avail = 0, q = 0, cw = 0, w = 0;
+    u32 cp = 0;
+
+    if (start >= end) {
+        o_nl(o);
+        return;
+    }
+    if (self->indent > 0)
+        o_spaces(o, self->indent);
+    col = self->indent;
+    while (p < end) {
+        k = w_step(s, p, &cp);
+        if (k <= 0)
+            break;
+        if (w_is_space(cp)) {
+            p += k;
+            if (has)
+                need_space = 1;
+            continue;
+        }
+        ae = w_atom_end(s, p, end);
+        aw = w_width(s, p, ae);
+        if (col + (need_space ? 1 : 0) + aw <= self->width) {
+            if (need_space) {
+                o_bytes(o, " ", 1);
+                col++;
+            }
+            o_bytes(o, s.data + p, ae - p);
+            col += aw;
+            has = 1;
+            need_space = 0;
+            p = ae;
+            continue;
+        }
+        if (has) {                       /* 先换个行再放这个原子 */
+            o_nl(o);
+            if (self->hang > 0)
+                o_spaces(o, self->hang);
+            col = self->hang;
+            has = 0;
+            need_space = 0;
+            continue;
+        }
+        avail = self->width - col;
+        if (avail < 1)
+            avail = 1;
+        if (self->flags & WRAP_BREAK_LONG) {
+            /* 当前行是空的：按码点硬切，至少切一个码点保证前进 */
+            q = p;
+            cw = 0;
+            while (q < ae) {
+                k = w_step(s, q, &cp);
+                if (k <= 0)
+                    break;
+                w = cp_width(cp);
+                if (cw > 0 && cw + w > avail)
+                    break;
+                cw += w;
+                q += k;
+            }
+            o_bytes(o, s.data + p, q - p);
+            col += cw;
+            has = 1;
+            p = q;
+            if (p < ae) {
+                o_nl(o);
+                if (self->hang > 0)
+                    o_spaces(o, self->hang);
+                col = self->hang;
+                has = 0;
+            }
+            continue;
+        }
+        /* 不切：整段塞进去，溢出一行 */
+        o_bytes(o, s.data + p, ae - p);
+        col += aw;
+        has = 1;
+        p = ae;
+        need_space = 0;
+    }
+    o_nl(o);
+}
+
+static void render_wrap(Wrap *self, char[:] s, WOut *o)
+{
+    int pos = 0, e = 0, end = 0;
+
+    if (s.len <= 0)
+        return;
+    for (;;) {
+        e = pos;
+        while (e < s.len && s.data[e] != '\n')
+            e++;
+        end = e;
+        if (end > pos && s.data[end - 1] == '\r')
+            end--;
+        wrap_line(self, s, pos, end, o);
+        if (e >= s.len)
+            break;
+        pos = e + 1;
+        if (pos >= s.len)
+            break;
+    }
+}
+
+/* 折行后占多少字节（不含结尾 NUL）；width 非法给 -1 */
+int count(Wrap *self, char[:] s)
+{
+    WOut o = { { (char *)0, 0 }, 0, 1, 0 };
+
+    if (self->err)
+        return -1;
+    render_wrap(self, s, &o);
+    return o.n;
+}
+
+/* 折行后有多少行 */
+int lines(Wrap *self, char[:] s)
+{
+    WOut o = { { (char *)0, 0 }, 0, 1, 0 };
+
+    if (self->err)
+        return -1;
+    render_wrap(self, s, &o);
+    return o.lines;
+}
+
+/* 写进 out：返回字节数；放不下给 -1，且一个字节都不写 */
+int write(Wrap *self, char[:] s, char[:] out)
+{
+    WOut o = { { (char *)0, 0 }, 0, 0, 0 };
+    int need = count(self, s);
+
+    if (need < 0)
+        return -1;
+    if (need > out.len)
+        return -1;
+    o.buf = out;
+    render_wrap(self, s, &o);
+    return o.n;
+}
+
+/* ---- 整段缩进 / 居中 ---- */
+
+static void render_indent(char[:] s, char[:] prefix, WOut *o)
+{
+    int pos = 0, e = 0;
+
+    if (s.len <= 0)
+        return;
+    for (;;) {
+        e = pos;
+        while (e < s.len && s.data[e] != '\n')
+            e++;
+        o_bytes(o, prefix.data, prefix.len);
+        if (e > pos)
+            o_bytes(o, s.data + pos, e - pos);
+        o_nl(o);
+        if (e >= s.len)
+            break;
+        pos = e + 1;
+        if (pos >= s.len)
+            break;
+    }
+}
+
+/* 每行前面加 prefix（空行也加），每行以 '\n' 结尾 */
+int text_indent_len(char[:] s, char[:] prefix)
+{
+    WOut o = { { (char *)0, 0 }, 0, 1, 0 };
+
+    render_indent(s, prefix, &o);
+    return o.n;
+}
+
+int text_indent(char[:] s, char[:] out, char[:] prefix)
+{
+    WOut o = { { (char *)0, 0 }, 0, 0, 0 };
+    int need = text_indent_len(s, prefix);
+
+    if (need > out.len)
+        return -1;
+    o.buf = out;
+    render_indent(s, prefix, &o);
+    return o.n;
+}
+
+static void render_center(char[:] s, int cols, WOut *o)
+{
+    int pos = 0, e = 0, end = 0, w = 0, left = 0;
+
+    if (s.len <= 0)
+        return;
+    if (cols < 0)
+        cols = 0;
+    for (;;) {
+        e = pos;
+        while (e < s.len && s.data[e] != '\n')
+            e++;
+        end = e;
+        if (end > pos && s.data[end - 1] == '\r')
+            end--;
+        w = w_width(s, pos, end);
+        left = (w < cols) ? (cols - w) / 2 : 0;
+        o_spaces(o, left);
+        if (end > pos)
+            o_bytes(o, s.data + pos, end - pos);
+        if (w < cols)
+            o_spaces(o, cols - w - left);
+        o_nl(o);
+        if (e >= s.len)
+            break;
+        pos = e + 1;
+        if (pos >= s.len)
+            break;
+    }
+}
+
+int text_center_len(char[:] s, int cols)
+{
+    WOut o = { { (char *)0, 0 }, 0, 1, 0 };
+
+    render_center(s, cols, &o);
+    return o.n;
+}
+
+/* 每行居中到 cols 列（不够补空格，超了不裁），每行以 '\n' 结尾 */
+int text_center(char[:] s, char[:] out, int cols)
+{
+    WOut o = { { (char *)0, 0 }, 0, 0, 0 };
+    int need = text_center_len(s, cols);
+
+    if (need > out.len)
+        return -1;
+    o.buf = out;
+    render_center(s, cols, &o);
+    return o.n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static char wbuf[1024] = { 0 };
+
+/* 折行并和期望文本逐字节比较（write 不写 NUL，这里自己补） */
+static int w_try(Wrap *w, const char *text, const char *want)
+{
+    int n = w->write((char[:]){ (char *)text, (int)strlen(text) },
+                     (char[:]){ wbuf, (int)sizeof wbuf - 1 });
+
+    if (n < 0)
+        return 0;
+    wbuf[n] = 0;
+    return strcmp(wbuf, want) == 0;
+}
+
+test "英文按词折行" {
+    Wrap w = wrap_make(10);
+
+    if (!w_try(&w, "the quick brown fox", "the quick\nbrown fox\n"))
+        return err(1, "the quick brown fox");
+    if (w.count(S("the quick brown fox")) != 20)
+        return err(2, "count 和 write 不一致");
+    if (w.lines(S("the quick brown fox")) != 2)
+        return err(3, "行数");
+    /* 11 列放不进 10 列：整个词换行 */
+    if (!w_try(&w, "12345 67890", "12345\n67890\n"))
+        return err(4, "放不下就换行");
+    /* 正好 10 列：不换行 */
+    if (!w_try(&w, "12345 6789", "12345 6789\n"))
+        return err(5, "正好卡在边界");
+    /* 连续空白压成一个空格 */
+    if (!w_try(&w, "a   b", "a b\n"))
+        return err(6, "空白压缩");
+    /* 首尾空白不留 */
+    if (!w_try(&w, "  a b  ", "a b\n"))
+        return err(7, "首尾空白");
+}
+
+test "超长词：硬切与溢出" {
+    Wrap w = wrap_make(5);
+
+    if (!w_try(&w, "abcdefgh", "abcde\nfgh\n"))
+        return err(8, "硬切长词");
+    if (w.count(S("abcdefgh")) != 10)
+        return err(9, "硬切的长度");
+    /* 关掉 WRAP_BREAK_LONG：整段塞进去，溢出一行 */
+    w.flags = 0;
+    if (!w_try(&w, "abcdefgh", "abcdefgh\n"))
+        return err(10, "不切长词");
+    if (w.count(S("abcdefgh")) != 9)
+        return err(11, "不切的长度");
+    /* 放得下的词跟在后面，放不下的整体换行 */
+    w = wrap_make(10);
+    if (!w_try(&w, "ab abcdefgh", "ab\nabcdefgh\n"))
+        return err(12, "放不下整个词就换行");
+    if (!w_try(&w, "ab abcdefghi", "ab\nabcdefghi\n"))
+        return err(13, "长词放不下就整体换行");
+    w = wrap_make(12);
+    if (!w_try(&w, "ab abcdefg", "ab abcdefg\n"))
+        return err(14, "12 列正好放下");
+}
+
+test "CJK 按列折行" {
+    Wrap w = wrap_make(6);
+
+    /* 每个汉字 2 列，一行 3 个字 */
+    if (!w_try(&w, "中文测试一二三四", "中文测\n试一二\n三四\n"))
+        return err(15, "中文折行");
+    if (w.count(S("中文测试一二三四")) != 27)
+        return err(16, "中文的字节数");
+    if (w.lines(S("中文测试一二三四")) != 3)
+        return err(17, "中文行数");
+    /* 中英混排：中文之间不补空格，英文词之间有空格 */
+    w = wrap_make(12);
+    if (!w_try(&w, "Hello 中文 world", "Hello 中文\nworld\n"))
+        return err(18, "中英混排");
+    /* 组合符 0 列：e + U+0301 算 1 列，和 x 一起放进 2 列 */
+    w = wrap_make(2);
+    if (!w_try(&w, "e\xcc\x81x", "e\xcc\x81x\n"))
+        return err(19, "组合符按 0 列");
+    /* 宽度 1：一个汉字（2 列）也塞得进去，不死循环 */
+    w = wrap_make(1);
+    if (!w_try(&w, "中中", "中\n中\n"))
+        return err(20, "宽度小于一个汉字");
+}
+
+test "缩进、空行与 CRLF" {
+    Wrap w = wrap_indented(20, 2, 4);
+
+    if (!w_try(&w, "aaa bbb ccc ddd eee", "  aaa bbb ccc ddd\n    eee\n"))
+        return err(21, "首行/续行缩进");
+    w = wrap_make(10);
+    if (!w_try(&w, "a\n\nb", "a\n\nb\n"))
+        return err(22, "空行保留");
+    if (w.count(S("a\n\nb")) != 5)
+        return err(23, "空行的长度");
+    if (!w_try(&w, "a\r\nb\r\n", "a\nb\n"))
+        return err(24, "CRLF");
+    if (w.write(S(""), (char[:]){ wbuf, (int)sizeof wbuf }) != 0)
+        return err(25, "空输入");
+    if (w.count(S("")) != 0 || w.lines(S("")) != 0)
+        return err(26, "空输入的长度/行数");
+    if (!w_try(&w, "\n\n", "\n\n"))
+        return err(27, "纯换行");
+}
+
+test "放不下与非法宽度" {
+    Wrap w = wrap_make(5);
+    char small[4] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 4; i++)
+        small[i] = 'Z';
+    if (w.write(S("abcdefgh"), (char[:]){ small, 4 }) != -1)
+        return err(28, "放不下给 -1");
+    for (i = 0; i < 4; i++)
+        if (small[i] != 'Z')
+            return err(29, "放不下时写了半截");
+    w = wrap_make(0);
+    if (w.err != WRAP_EBADWIDTH || w.count(S("x")) != -1
+        || w.write(S("x"), (char[:]){ wbuf, 8 }) != -1)
+        return err(30, "width<=0");
+    /* 缩进比宽度还大：夹回 0，不进入死循环 */
+    w = wrap_indented(4, 9, 9);
+    if (w.indent != 0 || w.hang != 0)
+        return err(31, "缩进夹回 0");
+    if (!w_try(&w, "abcdefg", "abcd\nefg\n"))
+        return err(32, "夹回后仍能折");
+}
+
+test "整段缩进与居中" {
+    char[:] out = { wbuf, (int)sizeof wbuf - 1 };
+    int n = 0;
+
+    n = text_indent(S("a\nb"), out, S("> "));
+    wbuf[n > 0 ? n : 0] = 0;
+    if (n != 8 || strcmp(wbuf, "> a\n> b\n") != 0)
+        return err(33, "text_indent");
+    if (text_indent_len(S("a\nb"), S("> ")) != 8)
+        return err(34, "text_indent_len");
+    n = text_indent(S(""), out, S("> "));
+    if (n != 0 || text_indent_len(S(""), S("> ")) != 0)
+        return err(35, "text_indent 空输入");
+    n = text_center(S("ab"), out, 6);
+    wbuf[n > 0 ? n : 0] = 0;
+    if (n != 7 || strcmp(wbuf, "  ab  \n") != 0)
+        return err(36, "text_center");
+    /* 中文按 2 列：4 列宽里放 1 个字 → 左 1 右 1 */
+    n = text_center(S("中"), out, 4);
+    wbuf[n > 0 ? n : 0] = 0;
+    if (n != 6 || strcmp(wbuf, " 中 \n") != 0)
+        return err(37, "text_center 中文");
+    /* 比目标宽：不裁也不补 */
+    n = text_center(S("abcdef"), out, 4);
+    wbuf[n > 0 ? n : 0] = 0;
+    if (n != 7 || strcmp(wbuf, "abcdef\n") != 0)
+        return err(38, "text_center 超宽");
+    if (text_center(S("abcdef"), (char[:]){ wbuf, 3 }, 4) != -1)
+        return err(39, "text_center 放不下");
+}

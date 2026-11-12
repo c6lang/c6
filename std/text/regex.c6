@@ -1,0 +1,1611 @@
+/* std/text/regex：小型正则表达式引擎（零分配、UTF-8 按码点匹配）。
+ *
+ *     import std.text.regex;
+ *
+ *     Regex re = re_compile(S("^\\s*(ERROR|WARN)\\s+(\\w+)"));
+ *     Match m = { 0 };
+ *     if (re.find(line, &m)) {
+ *         printf("%d..%d\n", m.start, m.end);
+ *         printf("级别=%s\n", m.group(line, 1));
+ *     }
+ *
+ * 支持的是**回溯式**的一个子集（够日常筛选/提取用，不是 PCRE）：
+ *
+ *   字面量（UTF-8 按码点）、`.`、`[...]` / `[^...]` / `[a-z]`、
+ *   `*` `+` `?` `{m}` `{m,}` `{m,n}`（后缀 `?` 表示懒惰）、
+ *   `(...)` 捕获组、`(?:...)` 非捕获组、`|`、`^` `$`、
+ *   `\d \D \w \W \s \S \b \B`、`\n \t \r \f \v \0 \xHH`、`\<标点>` 转义。
+ *
+ *   **不支持**：反向引用、前后瞻、命名组、POSIX 字符类 `[[:alpha:]]`、
+ *   Unicode 属性（`\p{..}`）。需要这些请换专门的库。
+ *
+ * 语义约定（写死在 test 块里）：
+ *
+ * - **按码点匹配，位置按字节**：`.` 吃掉一个 UTF-8 码点（不是字节），
+ *   `Match.start/end` 和捕获组都是**字节**偏移，正好能切 `char[:]`。
+ *   非法 UTF-8 字节按「一个 1 字节的字符」处理，不会卡住。
+ * - `\d \w \s \b` 按 ASCII 判定（`\w` = `[0-9A-Za-z_]`）；`RE_ICASE` 只折 ASCII。
+ * - greediness：量词默认贪婪，`*?`/`+?`/`??`/`{m,n}?` 懒惰。
+ * - 模式里 `^` 是「文本开头或（`RE_MULTILINE` 时）行首」，`$` 同理在行尾。
+ * - 空模式合法：在位置 0 匹配一个空串。
+ *
+ * 上限（都写在枚举里，编译期就报错，不会越界）：模式最多 64 个节点、
+ * 8 个字符类（每类 16 段区间）、9 个捕获组、`{m,n}` 的 n 最多 255。匹配
+ * 深度上限 `RE_MAX_DEPTH`，超过时 `Match.aborted` 置 1、`find` 返回 0
+ * ——这是防递归爆栈的保险，正常模式碰不到。
+ *
+ * 复杂度：量词的子表达式是**单个字符/字符类/`.`** 时走迭代快路径
+ * （`.*`、`[a-z]+` 这类是线性的，不会按字节递归）；子表达式是组或分支
+ * 时才是经典的回溯，最坏是指数级——和所有回溯引擎一样，模式别写成
+ * `(a+)+` 那种。
+ */
+#include <string.h>
+
+module std.text.regex;
+import std.core.types;
+import std.text.utf8;
+
+/* 容量上限：编译时超了给 RE_ERR_TOO_COMPLEX */
+enum ReLimits {
+    RE_MAX_NODES = 64,
+    RE_MAX_CLASSES = 8,
+    RE_MAX_RANGES = 16,
+    RE_MAX_GROUPS = 10,       /* 0 是整体匹配，1..9 是捕获组 */
+    RE_MAX_REPEAT = 255,      /* {m,n} 的 n 上限 */
+    RE_INF = 1073741823,      /* `*`/`+`/`{m,}` 的「无限」 */
+    RE_MAX_DEPTH = 4096,      /* 回溯深度上限（防爆栈） */
+};
+
+/* 编译开关 */
+enum ReFlags {
+    RE_ICASE = 1,             /* ASCII 大小写不敏感 */
+    RE_DOTALL = 2,            /* `.` 也吃换行 */
+    RE_MULTILINE = 4,         /* `^`/`$` 认行首行尾 */
+};
+
+/* 编译错误码（re_error 给中文文本） */
+enum ReError {
+    RE_OK = 0,
+    RE_ERR_MISSING_PAREN = 1,   /* 少了 ')' */
+    RE_ERR_UNEXPECTED_PAREN = 2,/* 多了 ')' */
+    RE_ERR_BAD_CLASS = 3,       /* 字符类没闭合/为空 */
+    RE_ERR_BAD_ESCAPE = 4,      /* 未知的字母转义 */
+    RE_ERR_BAD_QUANT = 5,       /* 量词没东西可量化 / 量化了可空表达式 */
+    RE_ERR_BAD_UTF8 = 6,        /* 模式里的非法 UTF-8 */
+    RE_ERR_TOO_COMPLEX = 7,     /* 超过节点/类/组上限 */
+};
+
+/* AST 节点类型 */
+enum ReNodeType {
+    RN_CHAR = 0,      /* a = 码点 */
+    RN_ANY = 1,       /* `.` */
+    RN_CLASS = 2,     /* a = 字符类下标 */
+    RN_BOL = 3,       /* `^` */
+    RN_EOL = 4,       /* `$` */
+    RN_WORDB = 5,     /* `\b` */
+    RN_NWORDB = 6,    /* `\B` */
+    RN_GROUP = 7,     /* a = 组号（-1 非捕获），b = 子链 */
+    RN_ALT = 8,       /* a = 左分支，b = 右分支 */
+    RN_REP = 9,       /* a = 子链，b = min，c = max，d = 懒惰 */
+};
+
+/* 一段码点区间（字符类里的一项） */
+struct ReRange {
+    u32 lo;
+    u32 hi;
+};
+
+/* 字符类：neg 非 0 表示取反，r[0..nr) 是区间 */
+struct ReClass {
+    int neg;
+    int nr;
+    ReRange r[RE_MAX_RANGES];
+};
+
+/* 一个 AST 节点：next 是「这条链上下一个节点」，-1 表示链结束。
+   链尾继续走外层 continuation，所以分支/分组的子链 tail 一定是 -1。 */
+struct ReNode {
+    int type;
+    int a;
+    int b;
+    int c;
+    int d;
+    int next;
+};
+
+/* 编译后的模式。`err` 非 0 时除了 is_valid/error_pos 之外的方法都不干活。 */
+struct Regex {
+    int head;         /* 第一条链的头节点，-1 = 空模式 */
+    int nnodes;
+    int nclasses;
+    int ngroups;      /* 捕获组个数（不含整体） */
+    int flags;
+    int anchored;     /* 模式以 `^` 开头（find 的起点只能是行首） */
+    int err_code;
+    int err_pos;
+    ReNode nodes[RE_MAX_NODES];
+    ReClass classes[RE_MAX_CLASSES];
+};
+
+/* 一次匹配的结果。组 0 是整体，1..ngroups 是捕获组；没参与的组是 -1。 */
+struct Match {
+    int start;        /* 整体起点（字节），-1 = 没匹配 */
+    int end;          /* 整体终点（字节，开区间） */
+    int ngroups;
+    int aborted;      /* 1 = 撞上 RE_MAX_DEPTH，结果不可信 */
+    int gs[RE_MAX_GROUPS];
+    int ge[RE_MAX_GROUPS];
+};
+
+/* ---- 编译 ---- */
+
+struct Parser {
+    Regex *re;
+    char[:] p;
+    int pos;
+    int err;
+    int err_pos;
+};
+
+static int p_alt(Parser *ps);
+static int p_atom(Parser *ps);
+static int p_nullable_chain(Regex *re, int n);
+static int p_nullable_node(Regex *re, int n);
+
+static void p_fail(Parser *ps, int code)
+{
+    if (!ps->err) {
+        ps->err = code;
+        ps->err_pos = ps->pos;
+    }
+}
+
+/* 从模式里解一个码点；非法序列按 1 字节的字面量处理并记一个错误 */
+static int p_cp(Parser *ps, u32 *cp)
+{
+    int k = utf8_decode(ps->p, ps->pos, cp);
+
+    if (k > 0)
+        return k;
+    *cp = (u8)ps->p.data[ps->pos];
+    p_fail(ps, RE_ERR_BAD_UTF8);
+    return 1;
+}
+
+static int p_new(Regex *re, int type)
+{
+    int i = re->nnodes;
+
+    if (i >= RE_MAX_NODES)
+        return -1;
+    re->nodes[i].type = type;
+    re->nodes[i].a = -1;
+    re->nodes[i].b = 0;
+    re->nodes[i].c = 0;
+    re->nodes[i].d = 0;
+    re->nodes[i].next = -1;
+    re->nnodes = i + 1;
+    return i;
+}
+
+static int p_node(Parser *ps, int type)
+{
+    int n = p_new(ps->re, type);
+
+    if (n < 0)
+        p_fail(ps, RE_ERR_TOO_COMPLEX);
+    return n;
+}
+
+static int p_class_new(Regex *re)
+{
+    int i = re->nclasses;
+
+    if (i >= RE_MAX_CLASSES)
+        return -1;
+    re->classes[i].neg = 0;
+    re->classes[i].nr = 0;
+    re->nclasses = i + 1;
+    return i;
+}
+
+static int p_class_range(Regex *re, int ci, u32 lo, u32 hi)
+{
+    int nr = re->classes[ci].nr;
+
+    if (nr >= RE_MAX_RANGES)
+        return 0;
+    re->classes[ci].r[nr].lo = lo;
+    re->classes[ci].r[nr].hi = hi;
+    re->classes[ci].nr = nr + 1;
+    return 1;
+}
+
+static int p_hex(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 预定义字符类：kind 是 'd'/'w'/'s'，neg 非 0 取反 */
+static int p_shorthand(Parser *ps, char kind, int neg)
+{
+    Regex *re = ps->re;
+    int ci = p_class_new(re);
+    int n = 0;
+
+    if (ci < 0) {
+        p_fail(ps, RE_ERR_TOO_COMPLEX);
+        return -1;
+    }
+    re->classes[ci].neg = neg;
+    if (kind == 'd' || kind == 'w') {
+        if (!p_class_range(re, ci, '0', '9'))
+            goto too_many;
+        if (kind == 'w') {
+            if (!p_class_range(re, ci, 'A', 'Z')
+                || !p_class_range(re, ci, '_', '_')
+                || !p_class_range(re, ci, 'a', 'z'))
+                goto too_many;
+        }
+    }
+    if (kind == 's') {
+        if (!p_class_range(re, ci, '\t', '\r')
+            || !p_class_range(re, ci, ' ', ' '))
+            goto too_many;
+    }
+    n = p_node(ps, RN_CLASS);
+    if (n >= 0)
+        re->nodes[n].a = ci;
+    return n;
+too_many:
+    p_fail(ps, RE_ERR_TOO_COMPLEX);
+    return -1;
+}
+
+/* `\...`：转义与预定义类 */
+static int p_escape(Parser *ps)
+{
+    Regex *re = ps->re;
+    char c = 0;
+    u32 cp = 0;
+    int k = 0, n = 0;
+
+    ps->pos++;                       /* 跳过反斜杠 */
+    if (ps->pos >= ps->p.len) {
+        p_fail(ps, RE_ERR_BAD_ESCAPE);
+        return -1;
+    }
+    c = ps->p.data[ps->pos++];
+    switch (c) {
+    case 'd': case 'D': case 'w': case 'W': case 's': case 'S':
+        return p_shorthand(ps, (char)(c | 0x20), c != (char)(c | 0x20));
+    case 'b':
+        return p_node(ps, RN_WORDB);
+    case 'B':
+        return p_node(ps, RN_NWORDB);
+    case 'n':
+        cp = '\n';
+        break;
+    case 't':
+        cp = '\t';
+        break;
+    case 'r':
+        cp = '\r';
+        break;
+    case 'f':
+        cp = '\f';
+        break;
+    case 'v':
+        cp = '\v';
+        break;
+    case '0':
+        cp = 0;
+        break;
+    case 'x':
+        if (ps->pos + 1 >= ps->p.len
+            || p_hex(ps->p.data[ps->pos]) < 0
+            || p_hex(ps->p.data[ps->pos + 1]) < 0) {
+            p_fail(ps, RE_ERR_BAD_ESCAPE);
+            return -1;
+        }
+        cp = (u32)(p_hex(ps->p.data[ps->pos]) * 16
+                   + p_hex(ps->p.data[ps->pos + 1]));
+        ps->pos += 2;
+        break;
+    default:
+        /* 字母转义不认识的报错，标点转义就是它自己 */
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            p_fail(ps, RE_ERR_BAD_ESCAPE);
+            return -1;
+        }
+        cp = (u8)c;
+        break;
+    }
+    n = p_node(ps, RN_CHAR);
+    if (n >= 0)
+        re->nodes[n].a = (int)cp;
+    return n;
+}
+
+/* `[...]`：区间、取反、`]` 在开头算字面量、`-` 在两端算字面量 */
+static int p_bracket(Parser *ps)
+{
+    Regex *re = ps->re;
+    int ci = p_class_new(re);
+    int n = 0, first = 1, neg = 0;
+    u32 lo = 0, hi = 0;
+    int k = 0;
+
+    if (ci < 0) {
+        p_fail(ps, RE_ERR_TOO_COMPLEX);
+        return -1;
+    }
+    ps->pos++;                       /* '[' */
+    if (ps->pos < ps->p.len && ps->p.data[ps->pos] == '^') {
+        neg = 1;
+        ps->pos++;
+    }
+    re->classes[ci].neg = neg;
+    while (ps->pos < ps->p.len) {
+        if (ps->p.data[ps->pos] == ']' && !first) {
+            ps->pos++;
+            if (re->classes[ci].nr == 0) {
+                p_fail(ps, RE_ERR_BAD_CLASS);
+                return -1;
+            }
+            n = p_node(ps, RN_CLASS);
+            if (n >= 0)
+                re->nodes[n].a = ci;
+            return n;
+        }
+        first = 0;
+        if (ps->p.data[ps->pos] == '\\') {
+            ps->pos++;
+            if (ps->pos >= ps->p.len) {
+                p_fail(ps, RE_ERR_BAD_CLASS);
+                return -1;
+            }
+            switch (ps->p.data[ps->pos]) {
+            case 'd':
+                ps->pos++;
+                if (!p_class_range(re, ci, '0', '9')) {
+                    p_fail(ps, RE_ERR_TOO_COMPLEX);
+                    return -1;
+                }
+                continue;
+            case 'w':
+                ps->pos++;
+                if (!p_class_range(re, ci, '0', '9')
+                    || !p_class_range(re, ci, 'A', 'Z')
+                    || !p_class_range(re, ci, '_', '_')
+                    || !p_class_range(re, ci, 'a', 'z')) {
+                    p_fail(ps, RE_ERR_TOO_COMPLEX);
+                    return -1;
+                }
+                continue;
+            case 's':
+                ps->pos++;
+                if (!p_class_range(re, ci, '\t', '\r')
+                    || !p_class_range(re, ci, ' ', ' ')) {
+                    p_fail(ps, RE_ERR_TOO_COMPLEX);
+                    return -1;
+                }
+                continue;
+            default:
+                k = p_cp(ps, &lo);
+                ps->pos += k;
+                break;
+            }
+        } else {
+            k = p_cp(ps, &lo);
+            ps->pos += k;
+        }
+        if (ps->pos + 1 < ps->p.len && ps->p.data[ps->pos] == '-'
+            && ps->p.data[ps->pos + 1] != ']') {
+            ps->pos++;
+            if (ps->p.data[ps->pos] == '\\') {
+                ps->pos++;
+                if (ps->pos >= ps->p.len) {
+                    p_fail(ps, RE_ERR_BAD_CLASS);
+                    return -1;
+                }
+            }
+            k = p_cp(ps, &hi);
+            ps->pos += k;
+            if (lo > hi) {
+                u32 t = lo;
+
+                lo = hi;
+                hi = t;
+            }
+        } else {
+            hi = lo;
+        }
+        if (!p_class_range(re, ci, lo, hi)) {
+            p_fail(ps, RE_ERR_TOO_COMPLEX);
+            return -1;
+        }
+    }
+    p_fail(ps, RE_ERR_BAD_CLASS);
+    return -1;
+}
+
+static int p_repeat(Parser *ps)
+{
+    Regex *re = ps->re;
+    int atom = 0, node = 0;
+    int min = 0, max = 0, lazy = 0;
+    char c = 0;
+
+    atom = p_atom(ps);
+    while (atom >= 0 && !ps->err && ps->pos < ps->p.len) {
+        c = ps->p.data[ps->pos];
+        if (c != '*' && c != '+' && c != '?' && c != '{')
+            break;
+        if (re->nodes[atom].type == RN_REP) {
+            p_fail(ps, RE_ERR_BAD_QUANT);
+            return -1;
+        }
+        if (p_nullable_chain(re, atom)) {
+            p_fail(ps, RE_ERR_BAD_QUANT);
+            return -1;
+        }
+        min = 0;
+        max = 0;
+        lazy = 0;
+        if (c == '*') {
+            max = RE_INF;
+            ps->pos++;
+        } else if (c == '+') {
+            min = 1;
+            max = RE_INF;
+            ps->pos++;
+        } else if (c == '?') {
+            max = 1;
+            ps->pos++;
+        } else {
+            /* {m} / {m,} / {m,n} */
+            ps->pos++;
+            if (ps->pos >= ps->p.len || ps->p.data[ps->pos] < '0'
+                || ps->p.data[ps->pos] > '9') {
+                p_fail(ps, RE_ERR_BAD_QUANT);
+                return -1;
+            }
+            while (ps->pos < ps->p.len && ps->p.data[ps->pos] >= '0'
+                   && ps->p.data[ps->pos] <= '9') {
+                min = min * 10 + (ps->p.data[ps->pos] - '0');
+                ps->pos++;
+            }
+            max = min;
+            if (ps->pos < ps->p.len && ps->p.data[ps->pos] == ',') {
+                ps->pos++;
+                if (ps->pos < ps->p.len && ps->p.data[ps->pos] >= '0'
+                    && ps->p.data[ps->pos] <= '9') {
+                    max = 0;
+                    while (ps->pos < ps->p.len && ps->p.data[ps->pos] >= '0'
+                           && ps->p.data[ps->pos] <= '9') {
+                        max = max * 10 + (ps->p.data[ps->pos] - '0');
+                        ps->pos++;
+                    }
+                } else {
+                    max = RE_INF;
+                }
+            }
+            if (ps->pos >= ps->p.len || ps->p.data[ps->pos] != '}') {
+                p_fail(ps, RE_ERR_BAD_QUANT);
+                return -1;
+            }
+            ps->pos++;
+            if (min > RE_MAX_REPEAT || max < min
+                || (max != RE_INF && max > RE_MAX_REPEAT)) {
+                p_fail(ps, RE_ERR_TOO_COMPLEX);
+                return -1;
+            }
+        }
+        if (ps->pos < ps->p.len && ps->p.data[ps->pos] == '?') {
+            lazy = 1;
+            ps->pos++;
+        }
+        if (p_nullable_chain(re, atom)) {
+            p_fail(ps, RE_ERR_BAD_QUANT);
+            return -1;
+        }
+        node = p_node(ps, RN_REP);
+        if (node < 0)
+            return -1;
+        re->nodes[node].a = atom;
+        re->nodes[node].b = min;
+        re->nodes[node].c = max;
+        re->nodes[node].d = lazy;
+        atom = node;
+    }
+    return atom;
+}
+
+static int p_group(Parser *ps)
+{
+    Regex *re = ps->re;
+    int child = 0, node = 0, g = -1, capture = 1;
+
+    ps->pos++;                       /* '(' */
+    if (ps->pos + 1 < ps->p.len && ps->p.data[ps->pos] == '?'
+        && ps->p.data[ps->pos + 1] == ':') {
+        ps->pos += 2;
+        capture = 0;
+    }
+    if (capture) {
+        if (re->ngroups + 1 >= RE_MAX_GROUPS) {
+            p_fail(ps, RE_ERR_TOO_COMPLEX);
+            return -1;
+        }
+        g = ++re->ngroups;
+    }
+    child = p_alt(ps);
+    if (ps->err)
+        return -1;
+    if (ps->pos >= ps->p.len || ps->p.data[ps->pos] != ')') {
+        p_fail(ps, RE_ERR_MISSING_PAREN);
+        return -1;
+    }
+    ps->pos++;
+    node = p_node(ps, RN_GROUP);
+    if (node < 0)
+        return -1;
+    re->nodes[node].a = capture ? g : -1;
+    re->nodes[node].b = child;
+    return node;
+}
+
+static int p_atom(Parser *ps)
+{
+    Regex *re = ps->re;
+    u32 cp = 0;
+    int k = 0, n = 0;
+
+    if (ps->pos >= ps->p.len)
+        return -1;
+    switch (ps->p.data[ps->pos]) {
+    case '|':
+    case ')':
+        return -1;
+    case '(':
+        return p_group(ps);
+    case '[':
+        return p_bracket(ps);
+    case '.':
+        ps->pos++;
+        return p_node(ps, RN_ANY);
+    case '^':
+        ps->pos++;
+        return p_node(ps, RN_BOL);
+    case '$':
+        ps->pos++;
+        return p_node(ps, RN_EOL);
+    case '\\':
+        return p_escape(ps);
+    case '*':
+    case '+':
+    case '?':
+    case '{':
+        p_fail(ps, RE_ERR_BAD_QUANT);
+        return -1;
+    default:
+        k = p_cp(ps, &cp);
+        ps->pos += k;
+        n = p_node(ps, RN_CHAR);
+        if (n >= 0)
+            re->nodes[n].a = (int)cp;
+        return n;
+    }
+}
+
+static int p_concat(Parser *ps)
+{
+    int first = -1, last = -1, item = 0;
+
+    for (;;) {
+        if (ps->err || ps->pos >= ps->p.len)
+            break;
+        if (ps->p.data[ps->pos] == '|' || ps->p.data[ps->pos] == ')')
+            break;
+        item = p_repeat(ps);
+        if (ps->err)
+            return -1;
+        if (item < 0)
+            break;
+        if (first < 0)
+            first = item;
+        else
+            ps->re->nodes[last].next = item;
+        last = item;
+    }
+    return first;
+}
+
+static int p_alt(Parser *ps)
+{
+    Regex *re = ps->re;
+    int left = 0, right = 0, node = 0;
+
+    left = p_concat(ps);
+    if (ps->err)
+        return -1;
+    while (ps->pos < ps->p.len && ps->p.data[ps->pos] == '|') {
+        ps->pos++;
+        right = p_concat(ps);
+        if (ps->err)
+            return -1;
+        node = p_node(ps, RN_ALT);
+        if (node < 0)
+            return -1;
+        re->nodes[node].a = left;
+        re->nodes[node].b = right;
+        left = node;
+    }
+    return left;
+}
+
+/* 编译：默认开关 */
+Regex re_compile_flags(char[:] pat, int flags);
+
+Regex re_compile(char[:] pat)
+{
+    return re_compile_flags(pat, 0);
+}
+
+/* 编译：带开关。`err` 非 0 时模式不可用（`error_pos` 给字节偏移）。 */
+Regex re_compile_flags(char[:] pat, int flags)
+{
+    Regex re = { 0 };
+    Parser ps = { 0 };
+
+    re.head = -1;
+    re.flags = flags;
+    ps.re = &re;
+    ps.p = pat;
+    ps.pos = 0;
+    ps.err = 0;
+    ps.err_pos = 0;
+    re.head = p_alt(&ps);
+    if (!ps.err && ps.pos < pat.len) {
+        ps.err = (pat.data[ps.pos] == ')') ? RE_ERR_UNEXPECTED_PAREN
+                                           : RE_ERR_TOO_COMPLEX;
+        ps.err_pos = ps.pos;
+    }
+    re.err_code = ps.err;
+    re.err_pos = ps.err_pos;
+    re.anchored = (re.head >= 0 && re.nodes[re.head].type == RN_BOL);
+    return re;
+}
+
+char *re_error(int code)
+{
+    switch (code) {
+    case RE_OK:
+        return "没有错误";
+    case RE_ERR_MISSING_PAREN:
+        return "少了 ')'";
+    case RE_ERR_UNEXPECTED_PAREN:
+        return "多了 ')'";
+    case RE_ERR_BAD_CLASS:
+        return "字符类没有闭合或是空的";
+    case RE_ERR_BAD_ESCAPE:
+        return "未知的转义";
+    case RE_ERR_BAD_QUANT:
+        return "量词没有可量化的表达式，或量化了可空表达式";
+    case RE_ERR_BAD_UTF8:
+        return "模式里不是合法 UTF-8";
+    case RE_ERR_TOO_COMPLEX:
+        return "超过容量上限（节点/字符类/捕获组/重复次数）";
+    }
+    return "未知错误";
+}
+
+/* ---- 编译期静态检查：链能否匹配空串 ---- */
+
+static int p_nullable_node(Regex *re, int n);
+
+static int p_nullable_chain(Regex *re, int n)
+{
+    while (n >= 0) {
+        if (!p_nullable_node(re, n))
+            return 0;
+        n = re->nodes[n].next;
+    }
+    return 1;
+}
+
+static int p_nullable_node(Regex *re, int n)
+{
+    ReNode *nd = &re->nodes[n];
+
+    switch (nd->type) {
+    case RN_CHAR:
+    case RN_ANY:
+    case RN_CLASS:
+        return 0;
+    case RN_GROUP:
+        return p_nullable_chain(re, nd->b);
+    case RN_ALT:
+        return p_nullable_chain(re, nd->a) || p_nullable_chain(re, nd->b);
+    case RN_REP:
+        return nd->b == 0 || p_nullable_chain(re, nd->a);
+    }
+    return 1;                        /* ^ $ \b \B 是零宽断言 */
+}
+
+/* ---- 匹配 ---- */
+
+enum ReContKind {
+    RK_NODE = 0,      /* 继续匹配 node（iter 只对 RN_REP 有意义） */
+    RK_GEND = 1,      /* 关掉捕获组 group，然后往上 */
+};
+
+struct Cont {
+    int kind;
+    int node;
+    int iter;
+    int group;
+    struct Cont *up;
+};
+
+struct MState {
+    Regex *re;
+    char[:] t;
+    Match *m;
+    int need_end;     /* 1 = 只认「吃到文本结尾」的匹配（full 用） */
+    int err;          /* 1 = 撞上深度上限 */
+};
+
+static int re_m(struct MState *st, int node, int pos, int iter,
+                struct Cont *cont, int *end, int depth);
+
+static int re_resume(struct MState *st, struct Cont *c, int pos, int *end,
+                     int depth)
+{
+    if (!c) {
+        if (st->need_end && pos != st->t.len)
+            return 0;
+        *end = pos;
+        return 1;
+    }
+    if (c->kind == RK_GEND) {
+        if (c->group >= 0 && c->group < RE_MAX_GROUPS)
+            st->m->ge[c->group] = pos;
+        return re_resume(st, c->up, pos, end, depth);
+    }
+    return re_m(st, c->node, pos, c->iter, c->up, end, depth + 1);
+}
+
+static int re_eq_cp(Regex *re, u32 a, u32 b)
+{
+    if (a == b)
+        return 1;
+    if (!(re->flags & RE_ICASE))
+        return 0;
+    if (a >= 'A' && a <= 'Z')
+        a += 32;
+    if (b >= 'A' && b <= 'Z')
+        b += 32;
+    return a == b;
+}
+
+static int re_class_match(Regex *re, int ci, u32 cp)
+{
+    ReClass *c = &re->classes[ci];
+    int hit = 0, i = 0;
+    u32 lo = 0, hi = 0;
+
+    for (i = 0; i < c->nr; i++) {
+        lo = c->r[i].lo;
+        hi = c->r[i].hi;
+        if (cp >= lo && cp <= hi) {
+            hit = 1;
+            break;
+        }
+        if (re->flags & RE_ICASE) {
+            if (cp >= 'A' && cp <= 'Z' && cp + 32 >= lo && cp + 32 <= hi) {
+                hit = 1;
+                break;
+            }
+            if (cp >= 'a' && cp <= 'z' && cp - 32 >= lo && cp - 32 <= hi) {
+                hit = 1;
+                break;
+            }
+        }
+    }
+    return c->neg ? !hit : hit;
+}
+
+/* 单个字符节点在 pos 处能吃掉几个字节；0 = 不匹配 */
+static int re_atom_len(struct MState *st, int node, int pos)
+{
+    Regex *re = st->re;
+    ReNode *n = &re->nodes[node];
+    u32 cp = 0;
+    int k = 0;
+
+    if (pos < 0 || pos >= st->t.len)
+        return 0;
+    k = utf8_decode(st->t, pos, &cp);
+    if (k <= 0) {
+        cp = (u8)st->t.data[pos];
+        k = 1;                       /* 坏字节按一字节字符 */
+    }
+    switch (n->type) {
+    case RN_ANY:
+        if (cp == '\n' && !(re->flags & RE_DOTALL))
+            return 0;
+        return k;
+    case RN_CHAR:
+        return re_eq_cp(re, (u32)n->a, cp) ? k : 0;
+    case RN_CLASS:
+        return re_class_match(re, n->a, cp) ? k : 0;
+    }
+    return 0;
+}
+
+static int re_is_atom_only(Regex *re, int node)
+{
+    if (node < 0 || re->nodes[node].next >= 0)
+        return 0;
+    switch (re->nodes[node].type) {
+    case RN_CHAR:
+    case RN_ANY:
+    case RN_CLASS:
+        return 1;
+    }
+    return 0;
+}
+
+static int re_prev_cp(char[:] t, int pos)
+{
+    pos--;
+    while (pos > 0 && ((u8)t.data[pos] & 0xc0) == 0x80)
+        pos--;
+    return pos;
+}
+
+static int re_is_word(char[:] t, int pos)
+{
+    u8 c = 0;
+
+    if (pos < 0 || pos >= t.len)
+        return 0;
+    c = (u8)t.data[pos];
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+           || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+/* 链里全是单码点原子（外加零宽断言）时返回「每轮消费几个码点」，
+   否则 -1。这种链每轮长度固定，量和分组都能用迭代快路径跑。 */
+static int re_fixed_chain(Regex *re, int node)
+{
+    int k = 0;
+
+    while (node >= 0) {
+        switch (re->nodes[node].type) {
+        case RN_CHAR:
+        case RN_ANY:
+        case RN_CLASS:
+            k++;
+            break;
+        case RN_BOL:
+        case RN_EOL:
+        case RN_WORDB:
+        case RN_NWORDB:
+            break;
+        default:
+            return -1;
+        }
+        node = re->nodes[node].next;
+    }
+    return k;
+}
+
+/* 跑一遍固定链：返回结束位置，失败给 -1 */
+static int re_chain_at(struct MState *st, int node, int pos)
+{
+    Regex *re = st->re;
+    int k = 0, p = pos;
+
+    while (node >= 0) {
+        switch (re->nodes[node].type) {
+        case RN_CHAR:
+        case RN_ANY:
+        case RN_CLASS:
+            k = re_atom_len(st, node, p);
+            if (k <= 0)
+                return -1;
+            p += k;
+            break;
+        case RN_BOL:
+            if (p != 0
+                && !((re->flags & RE_MULTILINE) && st->t.data[p - 1] == '\n'))
+                return -1;
+            break;
+        case RN_EOL:
+            if (p != st->t.len
+                && !((re->flags & RE_MULTILINE) && st->t.data[p] == '\n'))
+                return -1;
+            break;
+        case RN_WORDB:
+        case RN_NWORDB:
+            k = re_is_word(st->t, p - 1) != re_is_word(st->t, p);
+            if ((re->nodes[node].type == RN_WORDB) ? !k : k)
+                return -1;
+            break;
+        default:
+            return -1;
+        }
+        node = re->nodes[node].next;
+    }
+    return p;
+}
+
+/* 从 p 往回退 k 个码点（每轮固定消费 k 个码点，回溯时用） */
+static int re_back_cp(char[:] t, int p, int k)
+{
+    while (k-- > 0 && p > 0)
+        p = re_prev_cp(t, p);
+    return p;
+}
+
+/* 量词的子表达式是单个字符节点时走迭代快路径：`.*`/`[a-z]+` 是线性的 */
+static int re_rep_fast(struct MState *st, int node, int pos, struct Cont *cont,
+                       int *end, int depth)
+{
+    ReNode *n = &st->re->nodes[node];
+    int p = pos, cnt = 0, k = 0;
+
+    if (n->d) {                      /* 懒惰：每个位置先试退出 */
+        for (;;) {
+            if (cnt >= n->b
+                && re_m(st, n->next, p, 0, cont, end, depth + 1))
+                return 1;
+            if (cnt >= n->c)
+                break;
+            k = re_atom_len(st, n->a, p);
+            if (k <= 0)
+                break;
+            p += k;
+            cnt++;
+        }
+        return 0;
+    }
+    while (cnt < n->c) {             /* 贪婪：先吃到不能再吃，再回退 */
+        k = re_atom_len(st, n->a, p);
+        if (k <= 0)
+            break;
+        p += k;
+        cnt++;
+    }
+    while (cnt >= n->b) {
+        if (re_m(st, n->next, p, 0, cont, end, depth + 1))
+            return 1;
+        if (cnt == n->b)
+            break;
+        p = re_prev_cp(st->t, p);
+        cnt--;
+    }
+    return 0;
+}
+
+static int re_rep_slow(struct MState *st, int node, int pos, int iter,
+                       struct Cont *cont, int *end, int depth);
+
+/* 子表达式是「每轮定长的链（可包一层捕获组）」时的迭代快路径：
+   贪婪吃到不能吃，再按轮回退；捕获组取最后一轮。 */
+static int re_rep_chain(struct MState *st, int node, int pos, struct Cont *cont,
+                        int *end, int depth)
+{
+    ReNode *n = &st->re->nodes[node];
+    int child = n->a;
+    int head = child;
+    int g = -1;
+    int k = 0, cnt = 0, p = pos, e = 0;
+    Match save = { 0 };
+
+    if (child >= 0 && st->re->nodes[child].type == RN_GROUP) {
+        g = st->re->nodes[child].a;
+        head = st->re->nodes[child].b;
+    }
+    k = re_fixed_chain(st->re, head);
+    if (k <= 0)
+        return re_rep_slow(st, node, pos, 0, cont, end, depth);
+    if (n->d) {                      /* 懒惰：每个位置先试退出 */
+        for (;;) {
+            if (cnt >= n->b) {
+                save = *st->m;
+                if (g >= 0) {
+                    st->m->gs[g] = (cnt > 0) ? re_back_cp(st->t, p, k) : -1;
+                    st->m->ge[g] = (cnt > 0) ? p : -1;
+                }
+                if (re_m(st, n->next, p, 0, cont, end, depth + 1))
+                    return 1;
+                *st->m = save;
+            }
+            if (cnt >= n->c)
+                break;
+            e = re_chain_at(st, head, p);
+            if (e < 0)
+                break;
+            p = e;
+            cnt++;
+        }
+        return 0;
+    }
+    while (cnt < n->c) {             /* 贪婪 */
+        e = re_chain_at(st, head, p);
+        if (e < 0)
+            break;
+        p = e;
+        cnt++;
+    }
+    while (cnt >= n->b) {
+        save = *st->m;
+        if (g >= 0) {
+            st->m->gs[g] = (cnt > 0) ? re_back_cp(st->t, p, k) : -1;
+            st->m->ge[g] = (cnt > 0) ? p : -1;
+        }
+        if (re_m(st, n->next, p, 0, cont, end, depth + 1))
+            return 1;
+        *st->m = save;
+        if (cnt == n->b)
+            break;
+        p = re_back_cp(st->t, p, k);
+        cnt--;
+    }
+    return 0;
+}
+
+/* 子表达式是组/分支时的通用回溯。iter 是本节点已经迭代的次数。 */
+static int re_rep_slow(struct MState *st, int node, int pos, int iter,
+                       struct Cont *cont, int *end, int depth)
+{
+    ReNode *n = &st->re->nodes[node];
+    struct Cont back = { 0 };
+    Match save = { 0 };
+    int can_exit = iter >= n->b;
+    int can_iter = iter < n->c;
+    int lazy = n->d;
+
+    if (can_exit && (lazy || !can_iter)) {
+        save = *st->m;
+        if (re_m(st, n->next, pos, 0, cont, end, depth + 1))
+            return 1;
+        *st->m = save;
+        if (!can_iter)
+            return 0;
+    }
+    if (can_iter) {
+        back.kind = RK_NODE;
+        back.node = node;
+        back.iter = iter + 1;
+        back.group = 0;
+        back.up = cont;
+        save = *st->m;
+        if (re_m(st, n->a, pos, 0, &back, end, depth + 1))
+            return 1;
+        *st->m = save;
+    }
+    if (can_exit && !(lazy || !can_iter)) {
+        save = *st->m;
+        if (re_m(st, n->next, pos, 0, cont, end, depth + 1))
+            return 1;
+        *st->m = save;
+    }
+    return 0;
+}
+
+static int re_m(struct MState *st, int node, int pos, int iter,
+                struct Cont *cont, int *end, int depth)
+{
+    Regex *re = st->re;
+    ReNode *n = 0;
+    int k = 0;
+
+    if (st->err)
+        return 0;
+    if (depth > RE_MAX_DEPTH) {
+        st->err = 1;
+        return 0;
+    }
+    if (node < 0)
+        return re_resume(st, cont, pos, end, depth);
+    n = &re->nodes[node];
+    switch (n->type) {
+    case RN_CHAR:
+    case RN_ANY:
+    case RN_CLASS:
+        k = re_atom_len(st, node, pos);
+        if (k <= 0)
+            return 0;
+        return re_m(st, n->next, pos + k, 0, cont, end, depth + 1);
+    case RN_BOL:
+        if (pos != 0
+            && !((re->flags & RE_MULTILINE) && st->t.data[pos - 1] == '\n'))
+            return 0;
+        return re_m(st, n->next, pos, 0, cont, end, depth + 1);
+    case RN_EOL:
+        if (pos != st->t.len
+            && !((re->flags & RE_MULTILINE) && st->t.data[pos] == '\n'))
+            return 0;
+        return re_m(st, n->next, pos, 0, cont, end, depth + 1);
+    case RN_WORDB:
+    case RN_NWORDB:
+        k = re_is_word(st->t, pos - 1) != re_is_word(st->t, pos);
+        if ((n->type == RN_WORDB) ? !k : k)
+            return 0;
+        return re_m(st, n->next, pos, 0, cont, end, depth + 1);
+    case RN_GROUP: {
+        /* up 是「组结束后回到 n->next」；close 是「先记组尾再回 up」 */
+        struct Cont up = { RK_NODE, n->next, 0, 0, cont };
+        struct Cont close = { RK_GEND, -1, 0, -1, &up };
+        Match save = *st->m;
+
+        if (n->a >= 0) {
+            st->m->gs[n->a] = pos;
+            st->m->ge[n->a] = -1;
+            close.group = n->a;
+            if (re_m(st, n->b, pos, 0, &close, end, depth + 1))
+                return 1;
+        } else {
+            if (re_m(st, n->b, pos, 0, &up, end, depth + 1))
+                return 1;
+        }
+        *st->m = save;
+        return 0;
+    }
+    case RN_ALT: {
+        struct Cont up = { RK_NODE, n->next, 0, 0, cont };
+        Match save = *st->m;
+
+        if (re_m(st, n->a, pos, 0, &up, end, depth + 1))
+            return 1;
+        *st->m = save;
+        return re_m(st, n->b, pos, 0, &up, end, depth + 1);
+    }
+    case RN_REP: {
+        int child = n->a;
+        int head = child;
+        int g = -1;
+
+        if (child >= 0 && re->nodes[child].type == RN_GROUP) {
+            g = re->nodes[child].a;
+            head = re->nodes[child].b;
+        }
+        if (head >= 0 && re_fixed_chain(re, head) > 0)
+            return re_rep_chain(st, node, pos, cont, end, depth);
+        if (re_is_atom_only(re, child))
+            return re_rep_fast(st, node, pos, cont, end, depth);
+        return re_rep_slow(st, node, pos, iter, cont, end, depth);
+    }
+    }
+    return 0;
+}
+
+/* ---- 对外接口 ---- */
+
+int is_valid(Regex *self) { return self->err_code == 0; }
+
+int error_pos(Regex *self) { return self->err_pos; }
+
+int groups(Regex *self) { return self->ngroups; }
+
+static void m_clear(Match *m, int ngroups)
+{
+    int i = 0;
+
+    m->start = -1;
+    m->end = -1;
+    m->ngroups = ngroups;
+    m->aborted = 0;
+    for (i = 0; i < RE_MAX_GROUPS; i++) {
+        m->gs[i] = -1;
+        m->ge[i] = -1;
+    }
+}
+
+/* 从 from 开始找：返回 1 并填 *m，找不到返回 0。 */
+int find_from(Regex *self, char[:] text, int from, Match *m)
+{
+    struct MState st = { 0 };
+    int p = 0, e = 0, k = 0;
+
+    if (!m)
+        return 0;
+    m_clear(m, self->ngroups);
+    if (self->err_code || from > text.len)
+        return 0;
+    if (from < 0)
+        from = 0;
+    st.re = self;
+    st.t = text;
+    st.m = m;
+    st.err = 0;
+    p = from;
+    while (p <= text.len) {
+        m->gs[0] = p;
+        if (re_m(&st, self->head, p, 0, (struct Cont *)0, &e, 0)) {
+            m->start = p;
+            m->end = e;
+            m->ge[0] = e;
+            return 1;
+        }
+        if (st.err) {
+            m->aborted = 1;
+            m_clear(m, self->ngroups);
+            m->aborted = 1;
+            return 0;
+        }
+        if (p == text.len)
+            break;
+        k = utf8_decode(text, p, (u32 *)0);
+        p += (k > 0) ? k : 1;
+    }
+    return 0;
+}
+
+/* 从 0 开始找第一处 */
+int find(Regex *self, char[:] text, Match *m)
+{
+    return find_from(self, text, 0, m);
+}
+
+/* 在 at 处锚定匹配；need_end 时只认吃到文本结尾的匹配 */
+static int m_at(Regex *self, char[:] text, int at, Match *m, int need_end)
+{
+    struct MState st = { 0 };
+    int e = 0;
+
+    if (!m)
+        return 0;
+    m_clear(m, self->ngroups);
+    if (self->err_code || at < 0 || at > text.len)
+        return 0;
+    st.re = self;
+    st.t = text;
+    st.m = m;
+    st.need_end = need_end;
+    st.err = 0;
+    m->gs[0] = at;
+    if (!re_m(&st, self->head, at, 0, (struct Cont *)0, &e, 0)) {
+        if (st.err) {
+            m_clear(m, self->ngroups);
+            m->aborted = 1;
+        }
+        return 0;
+    }
+    m->start = at;
+    m->end = e;
+    m->ge[0] = e;
+    return 1;
+}
+
+int match_at(Regex *self, char[:] text, int at, Match *m)
+{
+    return m_at(self, text, at, m, 0);
+}
+
+/* 任意位置能匹配就行 */
+int matches(Regex *self, char[:] text)
+{
+    Match m = { 0 };
+
+    return find(self, text, &m);
+}
+
+/* 整个文本都要匹配（相当于 `^(?:pat)$`，会为「吃到结尾」回溯） */
+int full(Regex *self, char[:] text)
+{
+    Match m = { 0 };
+
+    return m_at(self, text, 0, &m, 1);
+}
+
+/* 连续找：最多写 cap 条到 out，返回写入条数（空匹配也会前进一个码点） */
+int find_all(Regex *self, char[:] text, Match *out, int cap)
+{
+    int n = 0, p = 0, k = 0;
+    Match m = { 0 };
+
+    while (n < cap && p <= text.len) {
+        if (!find_from(self, text, p, &m))
+            break;
+        out[n] = m;
+        n++;
+        if (m.end > m.start) {
+            p = m.end;
+        } else {
+            k = utf8_decode(text, m.end, (u32 *)0);
+            p = m.end + ((k > 0) ? k : 1);
+            if (m.end >= text.len)
+                break;
+        }
+    }
+    return n;
+}
+
+/* 组 g 的字节区间；组没参与返回 0 */
+int span(Match *self, int g, int *begin, int *end)
+{
+    if (g < 0 || g >= RE_MAX_GROUPS)
+        return 0;
+    if (self->gs[g] < 0 || self->ge[g] < 0)
+        return 0;
+    if (begin)
+        *begin = self->gs[g];
+    if (end)
+        *end = self->ge[g];
+    return 1;
+}
+
+/* 组 g 在 text 上的视图；组没参与返回空切片 */
+char[:] group(Match *self, char[:] text, int g)
+{
+    int s = 0, e = 0;
+
+    if (!span(self, g, &s, &e))
+        return (char[:]){ (char *)0, 0 };
+    if (s < 0 || e < s || e > text.len)
+        return (char[:]){ (char *)0, 0 };
+    return (char[:]){ text.data + s, e - s };
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "字面量、点号与转义" {
+    Regex re = re_compile(S("a.c"));
+    Match m = { 0 };
+
+    if (!re.is_valid())
+        return err(1, "简单的模式编不过");
+    if (!re.full(S("abc")) || re.matches(S("abd")))
+        return err(2, "点号匹配错了");
+    if (re.matches(S("ac")))
+        return err(3, "点号应该吃掉一个字符");
+    if (!re.find(S("xxabcxx"), &m) || m.start != 2 || m.end != 5)
+        return err(4, "find 的偏移不对");
+
+    re = re_compile(S("a\\.c"));
+    if (!re.full(S("a.c")) || re.matches(S("abc")))
+        return err(5, "转义的点号");
+    re = re_compile(S("a\\x41"));
+    if (!re.full(S("aA")))
+        return err(6, "\\xHH 转义");
+    re = re_compile(S("a\\tb"));
+    if (!re.full(S("a\tb")))
+        return err(7, "\\t 转义");
+}
+
+test "字符类与预定义类" {
+    Regex re = re_compile(S("[a-c]+"));
+    Match m = { 0 };
+
+    if (!re.full(S("abcabc")))
+        return err(8, "区间类");
+    if (re.full(S("abd")))
+        return err(9, "区间外不该匹配");
+    re = re_compile(S("[^0-9]+"));
+    if (!re.full(S("abc")) || re.full(S("ab1")))
+        return err(10, "取反类");
+    re = re_compile(S("\\d{3}"));
+    if (!re.full(S("123")) || re.matches(S("12a")))
+        return err(11, "\\d 与 {m}");
+    re = re_compile(S("\\w+"));
+    if (!re.full(S("a_1")) || re.full(S("a-1")))
+        return err(12, "\\w");
+    re = re_compile(S("\\s+"));
+    if (!re.full(S(" \t\n")))
+        return err(13, "\\s");
+    re = re_compile(S("[-a]"));
+    if (!re.full(S("-")) || !re.full(S("a")))
+        return err(14, "类首的减号是字面量");
+    re = re_compile(S("[]a]"));
+    if (!re.full(S("]")))
+        return err(15, "类首的 ] 是字面量");
+    re = re_compile(S("[\\d]+"));
+    if (!re.full(S("42")))
+        return err(16, "类里的 \\d");
+}
+
+test "量词：贪婪、懒惰与上限" {
+    Regex re = re_compile(S("a+"));
+    Match m = { 0 };
+
+    if (!re.find(S("aaa"), &m) || m.end != 3)
+        return err(17, "贪婪 +");
+    re = re_compile(S("a+?"));
+    if (!re.find(S("aaa"), &m) || m.end != 1)
+        return err(18, "懒惰 +?");
+    re = re_compile(S("a*"));
+    if (!re.match_at(S("bbb"), 0, &m) || m.end != 0)
+        return err(19, "空匹配");
+    re = re_compile(S("a{2,3}"));
+    if (!re.find(S("aaaa"), &m) || m.end != 3)
+        return err(20, "{m,n} 贪婪");
+    if (re.find(S("a"), &m))
+        return err(21, "{2,3} 不该匹配一个 a");
+    re = re_compile(S("a{2,}"));
+    if (!re.find(S("aaaaa"), &m) || m.end != 5)
+        return err(22, "{m,}");
+    re = re_compile(S("ab?c"));
+    if (!re.full(S("ac")) || !re.full(S("abc")) || re.full(S("abbc")))
+        return err(23, "? 量词");
+    re = re_compile(S("(ab)*"));
+    if (!re.full(S("ababab")) || !re.full(S("")))
+        return err(24, "组上的量词");
+    /* 懒惰只影响「匹配到哪」；full() 等价于 ^(?:pat)$，会为吃到结尾而回溯 */
+    re = re_compile(S("(ab)+?"));
+    if (!re.match_at(S("abab"), 0, &m) || m.end != 2)
+        return err(25, "组上的懒惰量词");
+}
+
+test "分组、捕获与分支" {
+    Regex re = re_compile(S("(\\w+)@(\\w+)\\.com"));
+    Match m = { 0 };
+    char[:] user = { 0 };
+    char[:] host = { 0 };
+    char[:] g = { 0 };
+    int s = 0, e = 0;
+
+    if (!re.find(S("mail me at bob@example.com now"), &m))
+        return err(26, "邮箱模式没匹配");
+    if (re.groups() != 2)
+        return err(27, "捕获组计数");
+    user = m.group(S("mail me at bob@example.com now"), 1);
+    host = m.group(S("mail me at bob@example.com now"), 2);
+    if (user.len != 3 || host.len != 7)
+        return err(28, "捕获组长度不对");
+    if (user.data[0] != 'b' || host.data[0] != 'e')
+        return err(29, "捕获组内容不对");
+    if (!m.span(0, &s, &e) || s != 11 || e != 26)
+        return err(30, "整体区间不对");
+    if (m.span(3, &s, &e))
+        return err(31, "不存在的组不该有区间");
+
+    re = re_compile(S("^(ERROR|WARN)$"));
+    if (!re.full(S("WARN")) || re.full(S("INFO")))
+        return err(32, "分支匹配");
+    g = m.group(S("x"), 1);
+    if (g.len != 0)
+        return err(33, "未匹配时 group 给空视图");
+
+    re = re_compile(S("(a)(b)(c)"));
+    if (!re.full(S("abc")) || re.groups() != 3)
+        return err(34, "多个组");
+    re = re_compile(S("(?:ab)+"));
+    if (!re.full(S("abab")) || re.groups() != 0)
+        return err(35, "非捕获组");
+}
+
+test "锚点、词边界与多行" {
+    Regex re = re_compile(S("^abc$"));
+
+    if (!re.full(S("abc")) || re.full(S("xabc")))
+        return err(36, "^ 与 $");
+    re = re_compile_flags(S("^b"), RE_MULTILINE);
+    if (!re.matches(S("a\nb")))
+        return err(37, "多行 ^");
+    re = re_compile(S("\\bword\\b"));
+    if (!re.matches(S("a word here")) || re.matches(S("swordfish")))
+        return err(38, "\\b");
+    re = re_compile(S("\\Bord"));
+    if (!re.matches(S("word")))
+        return err(39, "\\B");
+    re = re_compile(S("."));
+    if (!re.full(S("x")) || re.full(S("\n")))
+        return err(40, "点号不吃换行");
+    re = re_compile_flags(S("."), RE_DOTALL);
+    if (!re.full(S("\n")))
+        return err(41, "DOTALL");
+}
+
+test "UTF-8 与大小写" {
+    Regex re = re_compile(S("中."));
+    Match m = { 0 };
+
+    if (!re.full(S("中文")))
+        return err(42, "UTF-8 字面量");
+    if (re.full(S("中")))
+        return err(43, "点号应该吃掉一个码点");
+    re = re_compile_flags(S("hello"), RE_ICASE);
+    if (!re.full(S("HeLLo")))
+        return err(44, "ICASE");
+    re = re_compile_flags(S("[a-z]+"), RE_ICASE);
+    if (!re.full(S("ABC")))
+        return err(45, "ICASE 字符类");
+    re = re_compile(S("[一]"));
+    if (!re.full(S("一")))
+        return err(46, "类里的 UTF-8 字面量");
+    re = re_compile(S("(中+)"));
+    if (!re.find(S("中中"), &m))
+        return err(47, "UTF-8 捕获组");
+    if (m.end != 6 || m.group(S("中中"), 1).len != 6)
+        return err(48, "位置按字节、不是按码点");
+}
+
+test "编译错误与容量上限" {
+    Regex re = re_compile(S("(abc"));
+
+    if (re.is_valid() || re.error_pos() != 4)
+        return err(49, "少了右括号");
+    if (strcmp(re_error(RE_ERR_MISSING_PAREN), "少了 ')'") != 0)
+        return err(50, "错误文本");
+    re = re_compile(S("abc)"));
+    if (re.is_valid() || strcmp(re_error(re.err_code), "多了 ')'") != 0)
+        return err(51, "多了右括号");
+    re = re_compile(S("[abc"));
+    if (re.is_valid())
+        return err(52, "类没闭合");
+    re = re_compile(S("[]"));
+    if (re.is_valid())
+        return err(53, "空类");
+    re = re_compile(S("\\q"));
+    if (re.is_valid())
+        return err(54, "未知转义");
+    re = re_compile(S("*a"));
+    if (re.is_valid())
+        return err(55, "量词没东西可量化");
+    re = re_compile(S("a**"));
+    if (re.is_valid())
+        return err(56, "连续量词");
+    re = re_compile(S("(a*)*"));
+    if (re.is_valid())
+        return err(57, "量化可空表达式");
+    re = re_compile(S("a{3,2}"));
+    if (re.is_valid())
+        return err(58, "min > max");
+    re = re_compile(S("a{999}"));
+    if (re.is_valid())
+        return err(59, "超过重复上限");
+    /* 每类 16 段区间：16 个单字符合法，17 个要报 TOO_COMPLEX */
+    re = re_compile(S("[abcdefghijklmnop]"));
+    if (!re.is_valid())
+        return err(60, "16 段区间的字符类应该合法");
+    re = re_compile(S("[abcdefghijklmnopq]"));
+    if (re.is_valid() || re.err_code != RE_ERR_TOO_COMPLEX)
+        return err(61, "17 段区间要给 TOO_COMPLEX");
+    re = re_compile(S("((((((((((a))))))))))"));
+    if (re.is_valid())
+        return err(62, "超过捕获组上限");
+    /* 非法模式的所有匹配入口都不能干活 */
+    re = re_compile(S("("));
+    if (re.find(S("x"), (Match *)0) || re.full(S("x")) || re.matches(S("x")))
+        return err(63, "坏模式不该匹配");
+}
+
+test "空模式、find_all 与迭代" {
+    Regex re = re_compile(S(""));
+    Match m = { 0 };
+    Match ms[4] = { { 0 } };
+    int n = 0;
+
+    if (!re.is_valid() || !re.match_at(S("abc"), 0, &m) || m.end != 0)
+        return err(64, "空模式");
+    re = re_compile(S("\\d+"));
+    n = re.find_all(S("a1b22c333"), ms, 4);
+    if (n != 3)
+        return err(65, "find_all 计数");
+    if (ms[0].end - ms[0].start != 1 || ms[2].end - ms[2].start != 3)
+        return err(66, "find_all 结果");
+    n = re.find_all(S("a1b22c333"), ms, 2);
+    if (n != 2)
+        return err(67, "find_all 的 cap");
+    /* 空匹配也要能前进：否则会在同一个位置死循环 */
+    re = re_compile(S("x*"));
+    n = re.find_all(S("abc"), ms, 4);
+    if (n != 4)
+        return err(68, "空匹配的迭代");
+    if (ms[1].start != 1)
+        return err(69, "空匹配之间前进了一个码点");
+}

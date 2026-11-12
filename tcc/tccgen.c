@@ -12751,6 +12751,10 @@ static const struct C6ErrStdSlot {
     { "std.core.fixed",         C6_ERR_SLOT_STD + 54 },
     { "std.core.pool",          C6_ERR_SLOT_STD + 55 },
     { "std.encoding.frame",     C6_ERR_SLOT_STD + 56 },
+    { "std.text.regex",         C6_ERR_SLOT_STD + 57 },
+    { "std.text.diff",          C6_ERR_SLOT_STD + 58 },
+    { "std.text.fuzzy",         C6_ERR_SLOT_STD + 59 },
+    { "std.text.wrap",          C6_ERR_SLOT_STD + 60 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
