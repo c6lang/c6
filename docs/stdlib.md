@@ -16,7 +16,7 @@
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
-| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、位流、UUID、LZ4/RLE、hexdump |
+| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
@@ -125,7 +125,7 @@
 | `std/os/lock.c6` | `std.os.lock` | 文件建议锁（`fcntl` 记录锁）：`lock_open` 工厂 + `FileLock` 的 `ok`/`fd`/`acquire(exclusive, wait_ms)`/`try_acquire`/`release`/`is_held`/`close_file`；`wait_ms < 0` 阻塞、`0` 只试一次、`>0` 按 5ms 重试到超时，返回 1/0/-1；整文件锁，按进程合并（测互斥要开子进程） |
 | `std/os/mmap.c6` | `std.os.mmap` | 文件/匿名映射（`mmap(2)`）：`map_file(path, writable)`（可写用 `O_RDWR`+`MAP_SHARED`，否则 `O_RDONLY`+`MAP_PRIVATE`，空文件是坏映射）/`map_anon(len)`（清零）、`Map` 的 `ok`/`data`/`size`/`can_write`/`is_anon`/`fd`/`sync`/`read_at`/`write_at`/`unmap`；`read_at`/`write_at` 做边界检查，`unmap` 可重复 |
 
-**`std/encoding/`**（编解码与密码学：Base64/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、位流、UUID）
+**`std/encoding/`**（编解码与压缩：Base64/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -152,6 +152,10 @@
 | `std/encoding/chacha20.c6` | `std.encoding.chacha20` | ChaCha20 流密码（RFC 8439）：`chacha20_block(key32, nonce12, counter, out64)`、`chacha20_xor(key32, nonce12, counter, in, n, out)`（允许 `in == out`、跨块自动递增计数器）；12 字节 nonce、32 位计数器，20 轮 = 10 个双轮，旋转借 `std.core.bits` |
 | `std/encoding/poly1305.c6` | `std.encoding.poly1305` | Poly1305 一次性 MAC（RFC 8439 §2.5）：`poly1305_init(key32)` 工厂 + `Poly1305` 的 `ok`/`update`/`final`、一次性 `poly1305_mac`；5×26 位肢体做 130 位模运算（u64 乘积、无 128 位整数），key clamp 折进掩码；**同一把 key 只能用一次** |
 | `std/encoding/random.c6` | `std.encoding.random` | 操作系统安全随机（`/dev/urandom`）：`rand_bytes`/`rand_u64`/`rand_below(bound, out)`（掩码 + 拒绝采样，不用取模）/`rand_hex(out, bytes)`；每次调用 open/close 设备、不缓存 fd，返回 1/0 |
+| `std/encoding/deflate.c6` | `std.encoding.deflate` | DEFLATE（RFC 1951，零分配）：`inflate` 完整支持 stored / 固定 Huffman / 动态 Huffman 三种块（回溯直接读输出缓冲，无额外窗口）、`deflate_stored`（不压缩但一定合法）、`deflate_fixed`（贪心 LZ77 + 固定 Huffman，4096 槽单候选哈希表在栈上）、`deflate_bound`；坏块/截断/放不下返回 -1 |
+| `std/encoding/zlib.c6` | `std.encoding.zlib` | zlib 容器（RFC 1950）：`adler32`/`adler32_update`（模 65521）、`zlib_compress`（`78 01` 头 + DEFLATE + Adler-32 大端）、`zlib_decompress`（校验 CM/CINFO/FCHECK/FDICT 与尾部校验和）、`zlib_bound`；不支持预设字典 |
+| `std/encoding/gzip.c6` | `std.encoding.gzip` | gzip 容器（RFC 1952）：`gzip_crc32`（IEEE 反射多项式）、`gzip_compress(in,n,out,cap,mtime)`（10 字节头 + DEFLATE + CRC-32/ISIZE 小端）、`gzip_decompress`（跳过 FEXTRA/FNAME/FCOMMENT/FHCRC 并校验页脚）、`gzip_bound`；只读单成员 |
+| `std/encoding/tar.c6` | `std.encoding.tar` | tar 归档（ustar，零分配）：`tar_reader` + `TarReader.next`（checksum 校验、prefix/name 拼接、数据视图、截断/非法八进制 -1、`error_at`）、`tar_writer` + `add_file`/`add_dir`/`finish`（八进制字段、512 对齐、结尾两个零块）；不压缩 |
 
 **`std/data/`**（数据格式：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM）
 
@@ -222,6 +226,7 @@
 | `examples/stdcipher.c6` | （无模块） | 第二十五批（对称加密基础）的拼装示例（`make std-cipher`）：AES 的 FIPS 197 三组向量与 SP 800-38A CTR、ChaCha20 的 RFC 8439 块/加密向量、Poly1305 的 RFC 向量与流式喂入、`/dev/urandom` 随机，最后做一次 ChaCha20+Poly1305 的 encrypt-then-MAC 与篡改检测 |
 | `examples/stddata.c6` | （无模块） | 第二十六批（数据格式）的拼装示例（`make std-data`）：同一份嵌套数据走 bencode/msgpack/cbor 三种编码并核对规范字节，再用 PEM 封装一段 DER 并多块拆封 |
 | `examples/stdcalc.c6` | （无模块） | 第二十七批（数值工具）的拼装示例（`make std-calc`）：Welford 统计与分位数/直方图/相关、2x2 乘法与 3x3 行列式和线性方程组、3-4-5 向量与矩形交并、lerp/remap/缓动/Catmull-Rom |
+| `examples/stdarch.c6` | （无模块） | 第二十八批（压缩与归档）的拼装示例（`make std-arch`）：deflate 的 fixed/stored 往返、zlib 头与 Adler-32、gzip 头与 CRC-32/ISIZE、tar 两个文件的读写，最后把 tar 再用 gzip 压成 `.tar.gz` 并解压重读 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -276,6 +281,10 @@ std/encoding/aes.c6         2 test(s), 0 failure(s)
 std/encoding/chacha20.c6    8 test(s), 0 failure(s)
 std/encoding/poly1305.c6    2 test(s), 0 failure(s)
 std/encoding/random.c6      3 test(s), 0 failure(s)
+std/encoding/deflate.c6     2 test(s), 0 failure(s)
+std/encoding/zlib.c6        4 test(s), 0 failure(s)
+std/encoding/gzip.c6        7 test(s), 0 failure(s)
+std/encoding/tar.c6        24 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
 std/net/cookie.c6          4 test(s), 0 failure(s)
@@ -337,6 +346,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/encoding/hkdf.c6` 28 | hkdf 2 + sha256 17 + bits 6 + err 3（HMAC 直接调 sha256） |
 | `std/encoding/pbkdf2.c6` 33 | pbkdf2 3 + sha1 4 + sha256 17 + bits 6 + err 3 |
 | `std/encoding/chacha20.c6` 8 | chacha20 2 + bits 6（`rotl32` 是跨 TU 调用） |
+| `std/encoding/zlib.c6` 4 | zlib 2 + deflate 2（压缩/解压都走 deflate 的正文） |
+| `std/encoding/gzip.c6` 7 | gzip 2 + deflate 2 + crc 3（CRC-32 来自 std.core.crc） |
+| `std/encoding/deflate.c6` 2 | 自成一体（Huffman 表与位读写都在模块里） |
+| `std/encoding/tar.c6` 24 | tar 2 + str 22（只借 `Str` 类型，正文不调 str） |
 | `std/encoding/aes.c6` 2 | 自成一体（S 盒直接写在模块里） |
 | `std/encoding/poly1305.c6` 2 | 自成一体（130 位模运算只用 u64） |
 | `std/encoding/random.c6` 3 | 自成一体（只读 /dev/urandom） |
@@ -382,7 +395,9 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/encoding/aes`、`std/encoding/poly1305`、`std/encoding/random` 也自成一体，
 `std/encoding/chacha20` 的正文必须带 `std/core/bits`（`rotl32`），`std/data/pem`
 要 `std/encoding/base64`，bencode/msgpack/cbor 只借 `Str` 类型（正文不调 str），
-`std/core/geometry`、`std/core/interp`、`std/core/stats`、`std/core/matrix` 都自成一体。
+`std/core/geometry`、`std/core/interp`、`std/core/stats`、`std/core/matrix` 都自成一体，
+`std/encoding/deflate` 也自成一体，`std/encoding/zlib` 要 deflate，`gzip` 要
+deflate + `std/core/crc`，`tar` 只借 `Str` 类型。
 
 ## 设计原则
 
@@ -3095,6 +3110,29 @@ stdcalc: 32 check(s), 0 failure(s)
 叉积与矩形交并；interp 验 lerp/remap/smoothstep、`ease_in_quad(0.5)=0.25`、
 `ease_out_sine(0.5)≈0.7071` 和 Catmull-Rom 中点。
 
+### 集成示例：`examples/stdarch.c6`
+
+```sh
+make std-arch
+```
+
+```
+stdarch: 标准库第二十八批（deflate / zlib / gzip / tar）
+deflate: 600 字节重复文本压到 28 字节，stored 兜底也通
+zlib: 600 字节 -> 34 字节（含 6 字节头尾）
+gzip: 600 字节 -> 46 字节，mtime 与校验都写进去了
+tar: 2 个文件、3072 字节归档，读回来都对
+targz: tar(3072) -> gzip(162) -> 解压回 tar，读回 readme.txt
+stdarch: 22 check(s), 0 failure(s)
+```
+
+五节按依赖顺序：deflate 先把 600 字节重复文本用 fixed Huffman 压到 28 字节、
+stored 兜底也往返；zlib 套上 `78 01` 头与 Adler-32；gzip 套上 10 字节头
+（mtime=1234567890）与 CRC-32/ISIZE；tar 写两个文件（`a.txt` 9 字节、
+`dir/b.txt` 3 字节、mtime=1700000000）再读回来核对名字/大小/内容/时间；
+最后把 3072 字节的 tar 用 gzip 压成 162 字节，解压后重新用 tar 读——一次
+`.tar.gz` 的完整链路。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3145,6 +3183,8 @@ stdcalc: 32 check(s), 0 failure(s)
   （自带自检）。
 * `make std-calc`：`examples/stdcalc.c6`，第二十七批（数值工具）模块的拼装示例
   （自带自检）。
+* `make std-arch`：`examples/stdarch.c6`，第二十八批（压缩与归档）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -3205,6 +3245,18 @@ stdcalc: 32 check(s), 0 failure(s)
   奇异矩阵 det=0 且 `solve` 返回 0。
 * `std/core/interp.c6` 的「缓动端点」：11 条曲线都满足 f(0)=0、f(1)=1，
   `out_back` 中段必须超过 1（钉住它不是被钳制的曲线）。
+* `std/encoding/deflate.c6` 的「三种块」：Python zlib 生成的 stored（200 字节）、
+  固定 Huffman（同一段文本）、动态 Huffman（108 字节的 `abc` 重复）三条向量，
+  钉住 BTYPE 分支与动态表的 code-length 解码。
+* `std/encoding/deflate.c6` 的「空输入与单字节」：`deflate_fixed(0,0)` 仍是合法
+  空流（只有块结束码），单字节往返不丢。
+* `std/encoding/zlib.c6` 的「FCHECK 与校验和」：改 FLG 的一位、改尾部的
+  Adler-32、把 CM 改成 9，都必须 -1；`78 01` 的头字节与 `(CMF<<8|FLG)%31==0`
+  一起钉。
+* `std/encoding/gzip.c6` 的「页脚」：改 CRC、改 ISIZE、改 magic、置保留位，
+  四条都必须 -1；外部 Python gzip 向量能解出原文。
+* `std/encoding/tar.c6` 的「长名字」：200 字节的路径拆进 prefix/name 之后能原样
+  拼回来；checksum 字段按「全空格」口径计算并与读端一致。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，

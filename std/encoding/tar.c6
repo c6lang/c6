@@ -1,0 +1,501 @@
+/* std/encoding/tar：tar 归档（ustar/POSIX 格式，零分配）。
+ *
+ *     import std.encoding.tar;
+ *
+ *     char arc[4096] = { 0 };
+ *     TarWriter w = tar_writer(arc, (int)sizeof arc);
+ *     w.add_file("a.txt", "hello", 5, 0644, 0);
+ *     w.add_file("dir/b.txt", "xyz", 3, 0644, 0);
+ *     w.finish();
+ *
+ *     TarReader r = tar_reader(arc, w.len());
+ *     TarEntry e = { 0 };
+ *     while (r.next(&e) == 1) {
+ *         // e.name / e.size / e.data / e.type
+ *     }
+ *
+ * tar 就是「512 字节头 + 数据补齐到 512」的串联，结尾两个全零块。这一层只做
+ * **读取和写入**，不压缩（要压就用 `std.encoding.gzip` 再套一层）。
+ *
+ * 约定：
+ *
+ * - 头字段用八进制：size/mtime 是 11 位八进制 + NUL，mode 是 7 位 + NUL，
+ *   checksum 是 6 位八进制 + NUL + 空格；读取时容忍尾部空格/NUL；
+ * - 名字走 ustar 的 `prefix` 字段拆成「前缀/名字」（各 ≤100/155 字节），
+ *   合起来超过 256 字节写不进去（`add_file` 返回 0）；
+ * - 只写普通文件（type `'0'`）和目录（`'5'`，大小为 0）；读的时候其它类型
+ *   原样给出 `type`，数据视图仍按 size 截取；
+ * - `TarReader.next`：1 取到 / 0 归档结束（全零块或读到末尾）/ -1 坏
+ *   （checksum 不对、数据被截断、头字段不是八进制）；`entry.data` 是归档缓冲
+ *   上的视图；
+ * - `TarWriter` 满了置 `ok = 0` 并忽略后续写入；`finish` 写两个零块并返回总
+ *   长度，`len()` 也能拿到当前长度。
+ */
+#include <string.h>
+
+module std.encoding.tar;
+import std.core.types;
+import std.text.str;
+
+#define TAR_BLOCK 512
+#define TAR_NAME_MAX 256
+#define TAR_PREFIX_MAX 156
+
+struct TarEntry {
+    char name[TAR_NAME_MAX];
+    i64 size;
+    i64 mtime;
+    int mode;
+    char type;
+    Str data;
+};
+
+struct TarReader {
+    const u8 *p;
+    int len;
+    int pos;
+    int bad;
+};
+
+struct TarWriter {
+    u8 *buf;
+    int cap;
+    int used;
+    int bad;
+};
+
+/* 八进制字段：width 个字节里写 width-1 位数字 + NUL */
+static void tar_put_octal(u8 *dst, int width, i64 v)
+{
+    int i = 0;
+
+    for (i = width - 2; i >= 0; i--) {
+        dst[i] = (u8)('0' + (int)(v & 7));
+        v >>= 3;
+    }
+    dst[width - 1] = 0;
+}
+
+/* 读八进制字段：跳过前导空格，遇到 NUL/空格停止；非法给 -1 */
+static int tar_get_octal(const u8 *p, int width, i64 *out)
+{
+    i64 v = 0;
+    int i = 0, seen = 0;
+
+    for (i = 0; i < width; i++) {
+        int c = p[i];
+
+        if (c == 0 || c == ' ') {
+            if (seen)
+                break;
+            continue;
+        }
+        if (c < '0' || c > '7')
+            return -1;
+        v = (v << 3) + (c - '0');
+        seen = 1;
+    }
+    *out = v;
+    return 0;
+}
+
+static int tar_block_zero(const u8 *p)
+{
+    int i = 0;
+
+    for (i = 0; i < TAR_BLOCK; i++)
+        if (p[i] != 0)
+            return 0;
+    return 1;
+}
+
+static u32 tar_checksum(const u8 *hdr)
+{
+    u32 sum = 0;
+    int i = 0;
+
+    for (i = 0; i < TAR_BLOCK; i++)
+        sum += (i >= 148 && i < 156) ? (u32)' ' : (u32)hdr[i];
+    return sum;
+}
+
+TarReader tar_reader(const void *p, int n)
+{
+    TarReader r = { (const u8 *)p, n, 0, 0 };
+
+    if ((!p && n > 0) || n < 0)
+        r.bad = 1;
+    return r;
+}
+
+int error_at(TarReader *self) { return self ? self->pos : -1; }
+
+static void tar_copy_str(char *dst, int cap, const u8 *src, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n && src[i] != 0 && i + 1 < cap; i++)
+        dst[i] = (char)src[i];
+    dst[i] = 0;
+}
+
+/* 1 取到 / 0 结束 / -1 坏 */
+int next(TarReader *self, TarEntry *out)
+{
+    const u8 *h = 0;
+    i64 size = 0, mtime = 0, mode = 0, want = 0, got = 0;
+    int name_n = 0, prefix_n = 0, pad = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    if (self->pos + TAR_BLOCK > self->len) {
+        if (self->pos == self->len)
+            return 0;
+        self->bad = 1;
+        return -1;
+    }
+    h = self->p + self->pos;
+    if (tar_block_zero(h)) {
+        self->pos += TAR_BLOCK;
+        return 0;
+    }
+    if (tar_get_octal(h + 148, 8, &want) != 0)
+        return -1;
+    got = (i64)tar_checksum(h);
+    if (want != got) {
+        self->bad = 1;
+        return -1;
+    }
+    if (tar_get_octal(h + 124, 12, &size) != 0
+        || tar_get_octal(h + 136, 12, &mtime) != 0
+        || tar_get_octal(h + 100, 8, &mode) != 0) {
+        self->bad = 1;
+        return -1;
+    }
+    if (size < 0) {
+        self->bad = 1;
+        return -1;
+    }
+    out->size = size;
+    out->mtime = mtime;
+    out->mode = (int)mode;
+    out->type = (char)(h[156] ? h[156] : '0');
+    /* 名字：prefix + '/' + name */
+    prefix_n = 0;
+    while (prefix_n < 155 && h[345 + prefix_n] != 0)
+        prefix_n++;
+    name_n = 0;
+    while (name_n < 100 && h[name_n] != 0)
+        name_n++;
+    out->name[0] = 0;
+    if (prefix_n > 0) {
+        if (prefix_n + 1 + name_n >= TAR_NAME_MAX) {
+            self->bad = 1;
+            return -1;
+        }
+        memcpy(out->name, h + 345, (size_t)prefix_n);
+        out->name[prefix_n] = '/';
+        memcpy(out->name + prefix_n + 1, h, (size_t)name_n);
+        out->name[prefix_n + 1 + name_n] = 0;
+    } else {
+        tar_copy_str(out->name, TAR_NAME_MAX, h, name_n);
+    }
+    self->pos += TAR_BLOCK;
+    if (size > 0) {
+        if (self->pos + size > self->len) {
+            self->bad = 1;
+            return -1;
+        }
+        out->data = (Str){ (char[:]){ (char *)self->p + self->pos, (int)size } };
+    } else {
+        out->data = (Str){ { (char *)0, 0 } };
+    }
+    pad = (int)((TAR_BLOCK - (size % TAR_BLOCK)) % TAR_BLOCK);
+    self->pos += (int)size + pad;
+    return 1;
+}
+
+TarWriter tar_writer(void *buf, int cap)
+{
+    TarWriter w = { (u8 *)buf, cap, 0, 0 };
+
+    if (!buf || cap <= 0)
+        w.bad = 1;
+    return w;
+}
+
+int ok(TarWriter *self) { return self && !self->bad; }
+
+int len(TarWriter *self) { return self ? self->used : 0; }
+
+static void tw_bytes(TarWriter *w, const void *p, int n)
+{
+    if (w->bad || n < 0)
+        return;
+    if (w->used + n > w->cap) {
+        w->bad = 1;
+        return;
+    }
+    if (n > 0)
+        memcpy(w->buf + w->used, p, (size_t)n);
+    w->used += n;
+}
+
+/* 把名字拆进 ustar 的 prefix/name：1 成功 / 0 放不下 */
+static int tar_split_name(char *name, u8 *hdr)
+{
+    int n = (int)strlen(name);
+    int i = 0;
+
+    memset(hdr, 0, 100);
+    memset(hdr + 345, 0, 155);
+    if (n <= 100) {
+        memcpy(hdr, name, (size_t)n);
+        return 1;
+    }
+    /* 从右往左找第一个能拆的位置（前缀 ≤155、后缀 ≤100） */
+    for (i = n - 2; i > 0; i--) {
+        if (name[i] != '/')
+            continue;
+        if (i > 155 || n - i - 1 > 100)
+            continue;
+        memcpy(hdr + 345, name, (size_t)i);
+        memcpy(hdr, name + i + 1, (size_t)(n - i - 1));
+        return 1;
+    }
+    return 0;
+}
+
+/* 写一个头（type '0' 或 '5'，size=0 表示目录） */
+static int tar_add(TarWriter *w, char *name, const void *data, int n, int mode,
+                   i64 mtime, char type)
+{
+    u8 hdr[TAR_BLOCK] = { 0 };
+    u32 sum = 0;
+
+    if (!w || w->bad || !name || n < 0 || (n > 0 && !data))
+        return 0;
+    if (strlen(name) == 0)
+        return 0;
+    if (!tar_split_name(name, hdr))
+        return 0;
+    tar_put_octal(hdr + 100, 8, (i64)(mode & 07777));
+    tar_put_octal(hdr + 108, 8, 0);         /* uid */
+    tar_put_octal(hdr + 116, 8, 0);         /* gid */
+    tar_put_octal(hdr + 124, 12, (i64)(type == '5' ? 0 : n));
+    tar_put_octal(hdr + 136, 12, mtime);
+    memset(hdr + 148, ' ', 8);
+    hdr[156] = (u8)type;
+    memcpy(hdr + 257, "ustar", 5);
+    hdr[257 + 5] = 0;
+    hdr[263] = '0';
+    hdr[264] = '0';
+    sum = tar_checksum(hdr);
+    {
+        u8 tmp[8] = { 0 };
+
+        tar_put_octal(tmp, 7, (i64)sum);
+        memcpy(hdr + 148, tmp, 6);
+        hdr[148 + 6] = 0;
+        hdr[148 + 7] = ' ';
+    }
+    tw_bytes(w, hdr, TAR_BLOCK);
+    if (type != '5' && n > 0) {
+        int pad = (int)((TAR_BLOCK - (n % TAR_BLOCK)) % TAR_BLOCK);
+        static const u8 zeros[TAR_BLOCK] = { 0 };
+
+        tw_bytes(w, data, n);
+        if (pad > 0)
+            tw_bytes(w, zeros, pad);
+    }
+    return w->bad ? 0 : 1;
+}
+
+int add_file(TarWriter *self, char *name, const void *data, int n, int mode,
+             i64 mtime)
+{
+    return tar_add(self, name, data, n, mode, mtime, '0');
+}
+
+int add_dir(TarWriter *self, char *name, int mode, i64 mtime)
+{
+    return tar_add(self, name, 0, 0, mode, mtime, '5');
+}
+
+/* 结尾两个零块：返回总长度 / -1 */
+int finish(TarWriter *self)
+{
+    static const u8 zeros[TAR_BLOCK * 2] = { 0 };
+
+    if (!self || self->bad)
+        return -1;
+    tw_bytes(self, zeros, (int)sizeof zeros);
+    return self->bad ? -1 : self->used;
+}
+
+/* ---- 自测 ---- */
+
+test "写归档 + 读回来" {
+    char arc[4096] = { 0 };
+    TarWriter w = tar_writer(arc, (int)sizeof arc);
+    TarReader r = { 0 };
+    TarEntry e = { 0 };
+    int n = 0;
+
+    if (!w.ok())
+        return err(1, "tar_writer 失败");
+    if (!w.add_file("a.txt", "hello", 5, 0644, 0))
+        return err(2, "add_file 失败");
+    if (!w.add_file("dir/b.txt", "xyz", 3, 0600, 1700000000ll))
+        return err(3, "第二个文件失败");
+    if (!w.add_dir("dir/", 0755, 0))
+        return err(4, "add_dir 失败");
+    n = w.finish();
+    if (n <= 0)
+        return err(5, "finish 失败");
+    /* 3 个头 + 2 个数据块 + 2 个零块 = 7 * 512 */
+    if (n != 7 * 512)
+        return err(6, "归档长度不对");
+    r = tar_reader(arc, n);
+    if (r.next(&e) != 1 || strcmp(e.name, "a.txt") != 0 || e.size != 5
+        || e.data.s.len != 5
+        || memcmp(e.data.s.data, "hello", 5) != 0 || e.type != '0')
+        return err(7, "第一个条目不对");
+    if (r.next(&e) != 1 || strcmp(e.name, "dir/b.txt") != 0 || e.size != 3
+        || memcmp(e.data.s.data, "xyz", 3) != 0 || e.mtime != 1700000000ll)
+        return err(8, "第二个条目不对");
+    if (r.next(&e) != 1 || strcmp(e.name, "dir/") != 0 || e.size != 0
+        || e.type != '5')
+        return err(9, "目录条目不对");
+    if (r.next(&e) != 0)
+        return err(10, "归档结束应该返回 0");
+    /* 空归档：只有两个零块 */
+    {
+        char empty[2048] = { 0 };
+        TarWriter ew = tar_writer(empty, (int)sizeof empty);
+        TarReader er = { 0 };
+
+        if (ew.finish() != 1024)
+            return err(11, "空归档长度不对");
+        er = tar_reader(empty, 1024);
+        if (er.next(&e) != 0)
+            return err(12, "空归档应该直接结束");
+    }
+    /* 长名字走 prefix */
+    {
+        char longname[220] = { 0 };
+        char arc2[2048] = { 0 };
+        TarWriter lw = tar_writer(arc2, (int)sizeof arc2);
+        TarReader lr = { 0 };
+
+        for (n = 0; n < 120; n++)
+            longname[n] = 'd';
+        longname[120] = '/';
+        for (n = 121; n < 200; n++)
+            longname[n] = 'f';
+        longname[200] = 0;
+        if (!lw.add_file(longname, "z", 1, 0644, 0))
+            return err(13, "长名字应该能拆进 prefix");
+        if (lw.finish() <= 0)
+            return err(14, "长名字归档失败");
+        lr = tar_reader(arc2, lw.len());
+        if (lr.next(&e) != 1 || strcmp(e.name, longname) != 0)
+            return err(15, "长名字读回来不对");
+    }
+    /* 容量不够 */
+    {
+        char small[600] = { 0 };
+        TarWriter sw = tar_writer(small, (int)sizeof small);
+
+        if (sw.add_file("a", "12345", 5, 0644, 0))
+            return err(16, "容量不够应该返回 0");
+        if (sw.ok())
+            return err(17, "容量不够应该置 ok=0");
+    }
+}
+
+test "坏归档：checksum、截断、八进制字段" {
+    char arc[4096] = { 0 };
+    TarWriter w = tar_writer(arc, (int)sizeof arc);
+    TarReader r = { 0 };
+    TarEntry e = { 0 };
+    int n = 0;
+
+    w.add_file("f.txt", "abcdef", 6, 0644, 0);
+    n = w.finish();
+    if (n <= 0)
+        return err(18, "准备失败");
+    /* checksum 坏 */
+    {
+        char copy[4096] = { 0 };
+
+        memcpy(copy, arc, (size_t)n);
+        copy[148] = '9';
+        r = tar_reader(copy, n);
+        if (r.next(&e) != -1 || r.error_at() < 0)
+            return err(19, "checksum 不对应该 -1");
+    }
+    /* 数据被截断 */
+    {
+        r = tar_reader(arc, 512 + 3);
+        if (r.next(&e) != -1)
+            return err(20, "数据截断应该 -1");
+    }
+    /* 八进制字段非法 */
+    {
+        char copy[4096] = { 0 };
+
+        memcpy(copy, arc, (size_t)n);
+        copy[124] = 'x';
+        /* 修好 checksum，让它走到字段解析 */
+        {
+            u32 sum = 0;
+            int i = 0;
+
+            for (i = 0; i < 512; i++)
+                sum += (i >= 148 && i < 156) ? (u32)' ' : (u32)(u8)copy[i];
+            memset(copy + 148, ' ', 8);
+            {
+                u8 tmp[8] = { 0 };
+
+                tar_put_octal(tmp, 7, (i64)sum);
+                memcpy(copy + 148, tmp, 6);
+                copy[154] = 0;
+                copy[155] = ' ';
+            }
+        }
+        r = tar_reader(copy, n);
+        if (r.next(&e) != -1)
+            return err(21, "非法八进制字段应该 -1");
+    }
+    /* 头被截断 */
+    {
+        char copy[4096] = { 0 };
+
+        memcpy(copy, arc, 300);
+        r = tar_reader(copy, 300);
+        if (r.next(&e) != -1)
+            return err(22, "半个头应该 -1");
+    }
+    /* 空输入 / 坏参数 */
+    {
+        TarReader er = tar_reader("", 0);
+
+        if (er.bad || er.next(&e) != 0)
+            return err(23, "空输入应该返回 0");
+        {
+            TarReader bad = tar_reader(0, 1);
+
+            if (!bad.bad)
+                return err(24, "空指针应该坏");
+        }
+        if (next(0, &e) != -1)
+            return err(25, "空 reader 应该 -1");
+        if (tar_writer(0, 10).ok() || tar_writer(arc, 0).ok())
+            return err(26, "空缓冲应该无效");
+        if (finish(0) != -1)
+            return err(27, "空 writer 应该 -1");
+        if (add_file(0, "x", "y", 1, 0644, 0) != 0)
+            return err(28, "空 writer 应该返回 0");
+    }
+}

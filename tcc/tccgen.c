@@ -12815,6 +12815,10 @@ static const struct C6ErrStdSlot {
     { "std.core.matrix",        C6_ERR_SLOT_STD + 118 },
     { "std.core.geometry",      C6_ERR_SLOT_STD + 119 },
     { "std.core.interp",        C6_ERR_SLOT_STD + 120 },
+    { "std.encoding.deflate",   C6_ERR_SLOT_STD + 121 },
+    { "std.encoding.zlib",      C6_ERR_SLOT_STD + 122 },
+    { "std.encoding.gzip",      C6_ERR_SLOT_STD + 123 },
+    { "std.encoding.tar",       C6_ERR_SLOT_STD + 124 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

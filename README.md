@@ -240,7 +240,7 @@ std/os/                     操作系统：流、文件系统与目录树、路�
   std/os/lock.c6            std.os.lock            文件建议锁（fcntl）：lock_open、FileLock 的 acquire(exclusive, wait_ms)/try_acquire/release/is_held/close_file；wait_ms<0 阻塞、0 只试一次、>0 重试到超时，整文件锁按进程合并
   std/os/mmap.c6            std.os.mmap            文件/匿名映射：map_file(path, writable)（可写 MAP_SHARED、只读 MAP_PRIVATE，空文件是坏映射）、map_anon（清零）、Map 的 data/size/sync/read_at/write_at/unmap；read_at/write_at 带边界检查
 
-std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
@@ -262,6 +262,10 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/chacha20.c6  std.encoding.chacha20  ChaCha20（RFC 8439）：chacha20_block(key32, nonce12, counter, out64)、chacha20_xor（允许 in==out、跨块自动递增计数器）
   std/encoding/poly1305.c6  std.encoding.poly1305  Poly1305 一次性 MAC（RFC 8439）：poly1305_init 的 update/final、一次性 poly1305_mac；5×26 位肢体做 130 位模运算，同一把 key 只能用一次
   std/encoding/random.c6    std.encoding.random    安全随机（/dev/urandom）：rand_bytes/rand_u64/rand_below（掩码+拒绝采样）/rand_hex；每次 open/close，不缓存 fd
+  std/encoding/deflate.c6   std.encoding.deflate   DEFLATE（RFC 1951）：inflate 支持 stored/固定/动态 Huffman、deflate_stored、deflate_fixed（LZ77 + 固定 Huffman，栈上哈希表）、deflate_bound
+  std/encoding/zlib.c6      std.encoding.zlib      zlib 容器：adler32/adler32_update、zlib_compress（78 01 头 + DEFLATE + Adler-32）、zlib_decompress（校验头与尾）、zlib_bound
+  std/encoding/gzip.c6      std.encoding.gzip      gzip 容器：gzip_crc32、gzip_compress(...,mtime)、gzip_decompress（跳过 FEXTRA/FNAME/FCOMMENT/FHCRC 并校验 CRC-32/ISIZE）、gzip_bound
+  std/encoding/tar.c6       std.encoding.tar       tar（ustar）：tar_reader + next（checksum/prefix 拼接/数据视图）、tar_writer + add_file/add_dir/finish（八进制字段、512 对齐、两个零块）
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
@@ -339,6 +343,7 @@ make std-fsx     # 编译并运行 examples/stdfsx.c6（第二十四批文件系
 make std-cipher  # 编译并运行 examples/stdcipher.c6（第二十五批对称加密基础模块的拼装示例）
 make std-data    # 编译并运行 examples/stddata.c6（第二十六批数据格式模块的拼装示例）
 make std-calc    # 编译并运行 examples/stdcalc.c6（第二十七批数值工具模块的拼装示例）
+make std-arch    # 编译并运行 examples/stdarch.c6（第二十八批压缩与归档模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

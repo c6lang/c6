@@ -1228,3 +1228,27 @@ aes/poly1305/random 自成一体。示例 `examples/stdcipher.c6` 前半段逐�
 
 验收：`make stdtest`（121 个模块、0 failure）、`make std-calc`（32 条自检全过）、
 `make check-all`。
+
+### 11.40 标准库第二十八批（deflate / zlib / gzip / tar）
+
+第二十八批补的是**压缩与归档**：`std.encoding` 已经有 LZ4/RLE/Base64/SHA/AES，
+但「zlib/gzip 那种 DEFLATE 流」和「tar 归档」还缺。四个模块零分配、写调用方
+缓冲，解压侧覆盖真实世界的 gzip（动态 Huffman），压缩侧给出可用的 fixed
+Huffman：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.deflate` | DEFLATE（RFC 1951） | `inflate` 三种块（stored/固定/动态）全支持：回溯直接读调用方输出缓冲（不额外开 32 KiB 窗口），动态表用 puff 的 count/symbol 规范解码；压缩侧分两档：`deflate_stored`（不压缩但一定合法）与 `deflate_fixed`（贪心 LZ77 + 固定 Huffman，4096 槽单候选哈希表在栈上，够压重复文本，压缩率不如 zlib 的链表+动态树） |
+| `std.encoding.zlib` | RFC 1950 容器 | 头固定 `78 01`；解压校验 CM=8、CINFO≤7、`(CMF<<8|FLG)%31==0`、拒绝 FDICT；Adler-32 模 65521 覆盖解压后的数据 |
+| `std.encoding.gzip` | RFC 1952 容器 | 只写 10 字节最小头（不写文件名/注释）；解压按 FLG 跳过 FEXTRA/FNAME/FCOMMENT/FHCRC；页脚校验 CRC-32 与 ISIZE（原长度 mod 2^32）；CRC 走 `std.core.crc` 的 `crc32_update` |
+| `std.encoding.tar` | ustar 归档 | 读端校验 checksum（chksum 字段按 8 个空格算）、拼 prefix/name、数据给视图、坏八进制/截断返回 -1；写端 512 对齐、八进制字段、结尾两个零块；名字超过 100 字节就拆进 prefix（各 ≤100/155） |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.deflate`=0x6079、
+`std.encoding.zlib`=0x607a、`std.encoding.gzip`=0x607b、`std.encoding.tar`=0x607c；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-arch` 与 `STDARCH_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 的依赖表补上 zlib（deflate）、
+gzip（deflate+crc）、tar（str），deflate 自成一体。示例 `examples/stdarch.c6`
+按依赖顺序串起四节，最后做一次 `.tar.gz` 的完整链路。
+
+验收：`make stdtest`（125 个模块、0 failure）、`make std-arch`（22 条自检全过）、
+`make check-all`。

@@ -1,0 +1,201 @@
+/* stdarch：标准库第二十八批（deflate / zlib / gzip / tar）的拼装示例。
+ *
+ * 和前面几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 各节自带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这批是**压缩与归档**，示例按依赖顺序串起来：
+ *
+ *   1. deflate：fixed 压缩一段重复文本、stored 兜底，再解压回原文；
+ *   2. zlib：套上 zlib 头与 Adler-32，验头字节与往返；
+ *   3. gzip：套上 gzip 头与 CRC-32/ISIZE，验 mtime 与往返；
+ *   4. tar：写两个文件的 ustar 归档，读回来核对；
+ *   5. 组合：把 tar 归档再用 gzip 压一遍（`.tar.gz`），解压后重新读归档。
+ *
+ * 全程纯计算、零外部依赖，`make std-arch` 在任何平台都给同一串字节。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdarch \
+ *         examples/stdarch.c6 std/core/types.c6 std/core/crc.c6 \
+ *         std/encoding/deflate.c6 std/encoding/zlib.c6 std/encoding/gzip.c6 \
+ *         std/encoding/tar.c6 std/text/str.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.crc;
+import std.encoding.deflate;
+import std.encoding.zlib;
+import std.encoding.gzip;
+import std.encoding.tar;
+import std.text.str;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* 一份可重复的测试文本（600 字节） */
+static int make_text(char *dst, int cap)
+{
+    int i = 0, n = 600;
+
+    if (n > cap)
+        n = cap;
+    for (i = 0; i < n; i++)
+        dst[i] = (char)('a' + i % 19);
+    return n;
+}
+
+/* 1) deflate：fixed / stored 往返 */
+static void tour_deflate(void)
+{
+    char text[640] = { 0 };
+    char packed[1024] = { 0 };
+    char back[1024] = { 0 };
+    int n = 0, m = 0, tlen = 0;
+
+    tlen = make_text(text, (int)sizeof text);
+    n = deflate_fixed(text, tlen, packed, (int)sizeof packed);
+    check(n > 0 && n < tlen, "deflate: fixed 压缩应该变短");
+    m = inflate(packed, n, back, (int)sizeof back);
+    check(m == tlen && memcmp(back, text, (size_t)tlen) == 0,
+          "deflate: fixed 往返");
+    n = deflate_stored(text, tlen, packed, (int)sizeof packed);
+    check(n > tlen, "deflate: stored 应该略大于原文");
+    m = inflate(packed, n, back, (int)sizeof back);
+    check(m == tlen && memcmp(back, text, (size_t)tlen) == 0,
+          "deflate: stored 往返");
+    printf("deflate: 600 字节重复文本压到 %d 字节，stored 兜底也通\n",
+           deflate_fixed(text, tlen, packed, (int)sizeof packed));
+}
+
+/* 2) zlib：头 + Adler-32 */
+static void tour_zlib(void)
+{
+    char text[640] = { 0 };
+    char packed[1024] = { 0 };
+    char back[1024] = { 0 };
+    int n = 0, m = 0, tlen = make_text(text, (int)sizeof text);
+
+    n = zlib_compress(text, tlen, packed, (int)sizeof packed);
+    check(n > 6 && (unsigned char)packed[0] == 0x78,
+          "zlib: 压缩与头字节");
+    check((((unsigned char)packed[0] << 8) | (unsigned char)packed[1]) % 31
+              == 0,
+          "zlib: FCHECK");
+    m = zlib_decompress(packed, n, back, (int)sizeof back);
+    check(m == tlen && memcmp(back, text, (size_t)tlen) == 0, "zlib: 往返");
+    check(adler32(text, (usize)tlen)
+              == (((u32)(unsigned char)packed[n - 4] << 24)
+                  | ((u32)(unsigned char)packed[n - 3] << 16)
+                  | ((u32)(unsigned char)packed[n - 2] << 8)
+                  | (u32)(unsigned char)packed[n - 1]),
+          "zlib: 尾部 Adler-32");
+    printf("zlib: 600 字节 -> %d 字节（含 6 字节头尾）\n", n);
+}
+
+/* 3) gzip：头 + CRC-32/ISIZE */
+static void tour_gzip(void)
+{
+    char text[640] = { 0 };
+    char packed[1024] = { 0 };
+    char back[1024] = { 0 };
+    int n = 0, m = 0, tlen = make_text(text, (int)sizeof text);
+
+    n = gzip_compress(text, tlen, packed, (int)sizeof packed, 1234567890ll);
+    check(n > 18 && (unsigned char)packed[0] == 0x1f
+              && (unsigned char)packed[1] == 0x8b
+              && (unsigned char)packed[2] == 0x08,
+          "gzip: 头字节");
+    check((unsigned char)packed[8] == 0x02, "gzip: XFL");
+    m = gzip_decompress(packed, n, back, (int)sizeof back);
+    check(m == tlen && memcmp(back, text, (size_t)tlen) == 0, "gzip: 往返");
+    check(gzip_crc32(text, (usize)tlen)
+              == (((u32)(unsigned char)packed[n - 8])
+                  | ((u32)(unsigned char)packed[n - 7] << 8)
+                  | ((u32)(unsigned char)packed[n - 6] << 16)
+                  | ((u32)(unsigned char)packed[n - 5] << 24)),
+          "gzip: 尾部 CRC-32");
+    printf("gzip: 600 字节 -> %d 字节，mtime 与校验都写进去了\n", n);
+}
+
+/* 4) tar：两个文件的 ustar 归档 */
+static void tour_tar(void)
+{
+    char arc[4096] = { 0 };
+    TarWriter w = tar_writer(arc, (int)sizeof arc);
+    TarReader r = { 0 };
+    TarEntry e = { 0 };
+    int n = 0, count = 0;
+
+    check(w.add_file("a.txt", "hello tar", 9, 0644, 0), "tar: 写第一个文件");
+    check(w.add_file("dir/b.txt", "xyz", 3, 0600, 1700000000ll),
+          "tar: 写第二个文件");
+    n = w.finish();
+    check(n == 6 * 512, "tar: 归档长度（2 头 + 2 数据 + 2 零块）");
+    r = tar_reader(arc, n);
+    while (r.next(&e) == 1) {
+        count++;
+        if (count == 1) {
+            check(strcmp(e.name, "a.txt") == 0 && e.size == 9
+                      && memcmp(e.data.s.data, "hello tar", 9) == 0,
+                  "tar: 第一个条目");
+        }
+        if (count == 2) {
+            check(strcmp(e.name, "dir/b.txt") == 0 && e.mtime == 1700000000ll
+                      && memcmp(e.data.s.data, "xyz", 3) == 0,
+                  "tar: 第二个条目");
+        }
+    }
+    check(count == 2, "tar: 迭代到 2 个条目");
+    printf("tar: 2 个文件、%d 字节归档，读回来都对\n", n);
+}
+
+/* 5) 组合：tar.gz */
+static void tour_targz(void)
+{
+    char arc[4096] = { 0 };
+    char gz[8192] = { 0 };
+    char back[8192] = { 0 };
+    TarWriter w = tar_writer(arc, (int)sizeof arc);
+    TarReader r = { 0 };
+    TarEntry e = { 0 };
+    int arc_n = 0, gz_n = 0, back_n = 0;
+
+    w.add_file("readme.txt", "compressed tar archive", 22, 0644, 0);
+    w.add_file("data.bin", "0123456789", 10, 0644, 0);
+    arc_n = w.finish();
+    check(arc_n > 0, "targz: 归档");
+    gz_n = gzip_compress(arc, arc_n, gz, (int)sizeof gz, 0);
+    check(gz_n > 0, "targz: gzip 压缩");
+    back_n = gzip_decompress(gz, gz_n, back, (int)sizeof back);
+    check(back_n == arc_n && memcmp(back, arc, (size_t)arc_n) == 0,
+          "targz: 解压回归档");
+    r = tar_reader(back, back_n);
+    check(r.next(&e) == 1 && strcmp(e.name, "readme.txt") == 0
+              && e.size == 22,
+          "targz: 解压后的归档能读");
+    printf("targz: tar(%d) -> gzip(%d) -> 解压回 tar，读回 readme.txt\n",
+           arc_n, gz_n);
+}
+
+int main(void)
+{
+    printf("stdarch: 标准库第二十八批（deflate / zlib / gzip / tar）\n");
+    tour_deflate();
+    tour_zlib();
+    tour_gzip();
+    tour_tar();
+    tour_targz();
+    printf("stdarch: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

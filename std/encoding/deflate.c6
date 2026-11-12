@@ -1,0 +1,643 @@
+/* std/encoding/deflate：DEFLATE（RFC 1951）解压与压缩。
+ *
+ *     import std.encoding.deflate;
+ *
+ *     char packed[256] = { 0 };
+ *     int n = deflate_fixed(text, tlen, packed, (int)sizeof packed);
+ *     char back[1024] = { 0 };
+ *     int m = inflate(packed, n, back, (int)sizeof back);   // m == tlen
+ *
+ * 解压 `inflate` 是**完整**实现：stored / 固定 Huffman / 动态 Huffman 三种块都
+ * 支持，带 32 KiB 的回溯窗口（直接回溯到调用方输出缓冲里，不需要额外窗口）。
+ * 压缩侧给两个入口：
+ *
+ *   - `deflate_stored`：只发 stored 块（不压缩，但一定合法，用来兜底/测试）；
+ *   - `deflate_fixed`：贪心 LZ77 + 固定 Huffman（真的会压缩）。用的是 4096 槽
+ *     的单候选哈希表（栈上 16 KiB），压缩率不如 zlib 的链表+动态 Huffman，
+ *     但对「配置/日志/文本」这类重复度高的数据够用；要更好的压缩率用外部库
+ *     离线压好再让 `inflate` 读。
+ *
+ * 约定：
+ *
+ * - 全部零分配：输出写调用方缓冲，压缩用的哈希表在函数栈上（16 KiB）；太大的
+ *   输入请分块调用（`deflate_stored` 的返回值可以直接拼成一条流，单个块上限
+ *   65535 字节）；
+ * - `inflate` 返回解压后的字节数，数据坏/输出放不下/输入截断返回 -1；
+ *   距离超出已输出范围、Huffman 表非法、BTYPE=3 都算错；
+ * - `deflate_*` 返回压缩后的字节数，容量不够返回 -1（不写半截）；
+ * - `deflate_bound(n)` 给 stored 侧的保守上界（n + n/65535*5 + 5）。
+ */
+#include <string.h>
+
+module std.encoding.deflate;
+import std.core.types;
+
+#define DEFL_MAX_BITS 15
+#define DEFL_MAX_LIT 288
+#define DEFL_MAX_DIST 30
+#define DEFL_HASH_SIZE 4096
+#define DEFL_MAX_MATCH 258
+#define DEFL_MIN_MATCH 3
+#define DEFL_WINDOW 32768
+
+/* ---------- 位读取（LSB 先） ---------- */
+
+struct BitReader {
+    const u8 *p;
+    int len;
+    int pos;
+    u32 buf;
+    int cnt;
+    int bad;
+};
+
+static int br_bits(BitReader *br, int need)
+{
+    u32 v = 0;
+
+    while (br->cnt < need) {
+        if (br->pos >= br->len) {
+            br->bad = 1;
+            return 0;
+        }
+        br->buf |= (u32)br->p[br->pos++] << br->cnt;
+        br->cnt += 8;
+    }
+    v = br->buf & ((1u << need) - 1u);
+    br->buf >>= need;
+    br->cnt -= need;
+    return (int)v;
+}
+
+static void br_align(BitReader *br)
+{
+    br->buf = 0;
+    br->cnt = 0;
+}
+
+/* ---------- 规范 Huffman 解码（puff 的做法） ---------- */
+
+struct Huff {
+    u16 count[DEFL_MAX_BITS + 1];
+    u16 symbol[DEFL_MAX_LIT];
+};
+
+static void huff_build(Huff *h, const u8 *lengths, int n)
+{
+    u16 offs[DEFL_MAX_BITS + 2] = { 0 };
+    int i = 0, len = 0;
+
+    memset(h->count, 0, sizeof h->count);
+    for (i = 0; i < n; i++)
+        h->count[lengths[i]]++;
+    h->count[0] = 0;
+    offs[1] = 0;
+    for (len = 1; len < DEFL_MAX_BITS; len++)
+        offs[len + 1] = (u16)(offs[len] + h->count[len]);
+    for (i = 0; i < n; i++)
+        if (lengths[i] != 0)
+            h->symbol[offs[lengths[i]]++] = (u16)i;
+}
+
+static int huff_decode(BitReader *br, Huff *h)
+{
+    int len = 0, code = 0, first = 0, index = 0;
+
+    for (len = 1; len <= DEFL_MAX_BITS; len++) {
+        int count = 0;
+
+        code |= br_bits(br, 1);
+        if (br->bad)
+            return -1;
+        count = h->count[len];
+        if (code - first < count)
+            return h->symbol[index + (code - first)];
+        index += count;
+        first = (first + count) << 1;
+        code <<= 1;
+    }
+    br->bad = 1;
+    return -1;
+}
+
+static const u16 defl_lbase[29] = {
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+};
+static const u8 defl_lext[29] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+};
+static const u16 defl_dbase[30] = {
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+    8193, 12289, 16385, 24577,
+};
+static const u8 defl_dext[30] = {
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+};
+
+static void defl_fixed_tables(Huff *lit, Huff *dist)
+{
+    u8 lens[DEFL_MAX_LIT] = { 0 };
+    u8 dl[32] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 144; i++)
+        lens[i] = 8;
+    for (i = 144; i < 256; i++)
+        lens[i] = 9;
+    for (i = 256; i < 280; i++)
+        lens[i] = 7;
+    for (i = 280; i < 288; i++)
+        lens[i] = 8;
+    for (i = 0; i < 32; i++)
+        dl[i] = 5;
+    huff_build(lit, lens, DEFL_MAX_LIT);
+    huff_build(dist, dl, 32);
+}
+
+/* 解压：返回输出字节数 / -1 */
+int inflate(const void *in, int n, void *out, int cap)
+{
+    static const u8 cl_order[19] = {
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    };
+    BitReader br = { 0 };
+    Huff lit = { { 0 }, { 0 } }, dist = { { 0 }, { 0 } };
+    u8 *dst = (u8 *)out;
+    int op = 0, final = 0;
+
+    if (!in || n <= 0 || !out || cap < 0)
+        return -1;
+    br.p = (const u8 *)in;
+    br.len = n;
+    do {
+        int type = 0, do_codes = 0;
+
+        final = br_bits(&br, 1);
+        type = br_bits(&br, 2);
+        if (br.bad)
+            return -1;
+        if (type == 0) {
+            int len = 0, nlen = 0;
+
+            br_align(&br);
+            if (br.pos + 4 > br.len)
+                return -1;
+            len = (int)br.p[br.pos] | ((int)br.p[br.pos + 1] << 8);
+            nlen = (int)br.p[br.pos + 2] | ((int)br.p[br.pos + 3] << 8);
+            br.pos += 4;
+            if ((len ^ 0xffff) != nlen || br.pos + len > br.len)
+                return -1;
+            if (op + len > cap)
+                return -1;
+            memcpy(dst + op, br.p + br.pos, (size_t)len);
+            br.pos += len;
+            op += len;
+        } else if (type == 1) {
+            defl_fixed_tables(&lit, &dist);
+            do_codes = 1;
+        } else if (type == 2) {
+            int hlit = 0, hdist = 0, hclen = 0, i = 0, total = 0;
+            u8 cl[DEFL_MAX_BITS + 1] = { 0 };
+            u8 lens[DEFL_MAX_LIT] = { 0 };
+            Huff clh = { { 0 }, { 0 } };
+
+            hlit = br_bits(&br, 5) + 257;
+            hdist = br_bits(&br, 5) + 1;
+            hclen = br_bits(&br, 4) + 4;
+            if (br.bad || hlit > 286 || hdist > 30)
+                return -1;
+            for (i = 0; i < hclen; i++) {
+                cl[cl_order[i]] = (u8)br_bits(&br, 3);
+                if (br.bad)
+                    return -1;
+            }
+            huff_build(&clh, cl, 19);
+            total = hlit + hdist;
+            i = 0;
+            while (i < total) {
+                int sym = huff_decode(&br, &clh);
+                int rep = 0, val = 0;
+
+                if (sym < 0)
+                    return -1;
+                if (sym < 16) {
+                    lens[i++] = (u8)sym;
+                    continue;
+                }
+                if (sym == 16) {
+                    if (i == 0)
+                        return -1;
+                    val = lens[i - 1];
+                    rep = 3 + br_bits(&br, 2);
+                } else if (sym == 17) {
+                    val = 0;
+                    rep = 3 + br_bits(&br, 3);
+                } else if (sym == 18) {
+                    val = 0;
+                    rep = 11 + br_bits(&br, 7);
+                } else {
+                    return -1;
+                }
+                if (br.bad || i + rep > total)
+                    return -1;
+                while (rep-- > 0)
+                    lens[i++] = (u8)val;
+            }
+            huff_build(&lit, lens, hlit);
+            huff_build(&dist, lens + hlit, hdist);
+            do_codes = 1;
+        } else {
+            return -1;
+        }
+        if (do_codes) {
+            for (;;) {
+                int sym = huff_decode(&br, &lit);
+
+                if (sym < 0)
+                    return -1;
+                if (sym < 256) {
+                    if (op >= cap)
+                        return -1;
+                    dst[op++] = (u8)sym;
+                } else if (sym == 256) {
+                    break;
+                } else {
+                    int idx = sym - 257, length = 0, dsym = 0, d = 0;
+                    int k = 0;
+
+                    if (idx >= 29)
+                        return -1;
+                    length = defl_lbase[idx] + br_bits(&br, defl_lext[idx]);
+                    dsym = huff_decode(&br, &dist);
+                    if (dsym < 0 || dsym >= 30)
+                        return -1;
+                    d = defl_dbase[dsym] + br_bits(&br, defl_dext[dsym]);
+                    if (br.bad || d <= 0 || d > op || op + length > cap)
+                        return -1;
+                    for (k = 0; k < length; k++) {
+                        dst[op] = dst[op - d];
+                        op++;
+                    }
+                }
+            }
+        }
+    } while (!final);
+    return op;
+}
+
+/* ---------- 位写出（LSB 先） ---------- */
+
+struct BitWriter {
+    u8 *out;
+    int cap;
+    int pos;
+    u32 buf;
+    int cnt;
+    int bad;
+};
+
+static void bw_put(BitWriter *w, u32 v, int n)
+{
+    if (w->bad || n <= 0)
+        return;
+    w->buf |= (v & ((1u << n) - 1u)) << w->cnt;
+    w->cnt += n;
+    while (w->cnt >= 8) {
+        if (w->pos >= w->cap) {
+            w->bad = 1;
+            return;
+        }
+        w->out[w->pos++] = (u8)(w->buf & 0xffu);
+        w->buf >>= 8;
+        w->cnt -= 8;
+    }
+}
+
+static int bw_flush(BitWriter *w)
+{
+    if (w->bad)
+        return -1;
+    if (w->cnt > 0) {
+        if (w->pos >= w->cap)
+            return -1;
+        w->out[w->pos++] = (u8)(w->buf & 0xffu);
+        w->buf = 0;
+        w->cnt = 0;
+    }
+    return w->pos;
+}
+
+static u32 bw_rev(u32 v, int n)
+{
+    u32 r = 0;
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        r = (r << 1) | (v & 1u);
+        v >>= 1;
+    }
+    return r;
+}
+
+int deflate_bound(int n)
+{
+    int blocks = 0;
+
+    if (n <= 0)
+        return 5;
+    blocks = (n + 65534) / 65535;
+    return n + blocks * 5 + 5;
+}
+
+/* stored 块：不压缩，多块拼成一条流；返回字节数 / -1 */
+int deflate_stored(const void *in, int n, void *out, int cap)
+{
+    const u8 *src = (const u8 *)in;
+    u8 *dst = (u8 *)out;
+    int off = 0, op = 0;
+
+    if ((!in && n > 0) || n < 0 || !out || cap < 0)
+        return -1;
+    do {
+        int take = n - off;
+        int final = 0;
+
+        if (take > 65535)
+            take = 65535;
+        final = (off + take >= n);
+        if (op + 5 + take > cap)
+            return -1;
+        dst[op++] = (u8)(final ? 1 : 0);
+        dst[op++] = (u8)(take & 0xff);
+        dst[op++] = (u8)((take >> 8) & 0xff);
+        dst[op++] = (u8)((~take) & 0xff);
+        dst[op++] = (u8)(((~take) >> 8) & 0xff);
+        if (take > 0)
+            memcpy(dst + op, src + off, (size_t)take);
+        op += take;
+        off += take;
+    } while (off < n);
+    return op;
+}
+
+/* 固定 Huffman 的字面量/长度码 */
+static void bw_fixed_lit(BitWriter *w, int sym)
+{
+    if (sym <= 143)
+        bw_put(w, bw_rev((u32)(0x30 + sym), 8), 8);
+    else if (sym <= 255)
+        bw_put(w, bw_rev((u32)(0x190 + sym - 144), 9), 9);
+    else if (sym <= 279)
+        bw_put(w, bw_rev((u32)(sym - 256), 7), 7);
+    else
+        bw_put(w, bw_rev((u32)(0xC0 + sym - 280), 8), 8);
+}
+
+static int defl_len_sym(int len)
+{
+    int i = 0;
+
+    for (i = 0; i < 29; i++)
+        if (len >= defl_lbase[i]
+            && len < defl_lbase[i] + (1 << defl_lext[i]))
+            return i;
+    return 28;
+}
+
+static int defl_dist_sym(int d)
+{
+    int i = 0;
+
+    for (i = 0; i < 30; i++)
+        if (d >= defl_dbase[i]
+            && d < defl_dbase[i] + (1 << defl_dext[i]))
+            return i;
+    return 29;
+}
+
+/* 固定 Huffman + 贪心 LZ77：返回字节数 / -1 */
+int deflate_fixed(const void *in, int n, void *out, int cap)
+{
+    const u8 *src = (const u8 *)in;
+    int table[DEFL_HASH_SIZE] = { 0 };
+    BitWriter w = { 0 };
+    int i = 0;
+
+    if ((!in && n > 0) || n < 0 || !out || cap < 0)
+        return -1;
+    w.out = (u8 *)out;
+    w.cap = cap;
+    bw_put(&w, 1, 1);           /* BFINAL */
+    bw_put(&w, 1, 2);           /* BTYPE = 01（固定 Huffman） */
+    while (i < n) {
+        int best_len = 0, best_dist = 0;
+
+        if (i + DEFL_MIN_MATCH <= n) {
+            u32 h = (((u32)src[i] << 10) ^ ((u32)src[i + 1] << 5)
+                     ^ (u32)src[i + 2])
+                    & (DEFL_HASH_SIZE - 1);
+            int cand = table[h] - 1;
+
+            table[h] = i + 1;
+            if (cand >= 0 && i - cand <= DEFL_WINDOW) {
+                int max = n - i;
+                int k = 0;
+
+                if (max > DEFL_MAX_MATCH)
+                    max = DEFL_MAX_MATCH;
+                while (k < max && src[cand + k] == src[i + k])
+                    k++;
+                if (k >= DEFL_MIN_MATCH) {
+                    best_len = k;
+                    best_dist = i - cand;
+                }
+            }
+        }
+        if (best_len >= DEFL_MIN_MATCH) {
+            int lsym = defl_len_sym(best_len);
+            int dsym = defl_dist_sym(best_dist);
+            int k = 0;
+
+            bw_fixed_lit(&w, 257 + lsym);
+            bw_put(&w, (u32)(best_len - defl_lbase[lsym]), defl_lext[lsym]);
+            bw_put(&w, bw_rev((u32)dsym, 5), 5);
+            bw_put(&w, (u32)(best_dist - defl_dbase[dsym]),
+                   defl_dext[dsym]);
+            /* 把匹配覆盖到的位置也放进哈希表，后面的匹配还能用到 */
+            for (k = 1; k < best_len && i + k + DEFL_MIN_MATCH <= n; k++) {
+                u32 h2 = (((u32)src[i + k] << 10) ^ ((u32)src[i + k + 1] << 5)
+                          ^ (u32)src[i + k + 2])
+                         & (DEFL_HASH_SIZE - 1);
+
+                table[h2] = i + k + 1;
+            }
+            i += best_len;
+        } else {
+            bw_fixed_lit(&w, (int)src[i]);
+            i++;
+        }
+        if (w.bad)
+            return -1;
+    }
+    bw_fixed_lit(&w, 256);      /* 块结束 */
+    return bw_flush(&w);
+}
+
+/* ---- 自测 ---- */
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0, i = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = -1, lo = -1;
+
+        for (i = 0; i < 16; i++) {
+            if ("0123456789abcdef"[i] == s[0])
+                hi = i;
+            if ("0123456789abcdef"[i] == s[1])
+                lo = i;
+        }
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+test "inflate：stored / 固定 / 动态三种块" {
+    u8 packed[512] = { 0 };
+    u8 out[2048] = { 0 };
+    int n = 0, m = 0;
+
+    /* stored：Python zlib level=0 压出来的 200 字节文本 */
+    n = unhex(
+        "01c80037ff68656c6c6f2068656c6c6f2068656c6c6f2068656c6c6f2c206465"
+        "666c61746520776f726c64212068656c6c6f2068656c6c6f2068656c6c6f20"
+        "68656c6c6f2c206465666c61746520776f726c64212068656c6c6f2068656c"
+        "6c6f2068656c6c6f2068656c6c6f2c206465666c61746520776f726c642120"
+        "68656c6c6f2068656c6c6f2068656c6c6f2068656c6c6f2c206465666c6174"
+        "6520776f726c64212068656c6c6f2068656c6c6f2068656c6c6f2068656c6c"
+        "6f2c206465666c61746520776f726c642120",
+        packed, (int)sizeof packed);
+    m = inflate(packed, n, out, (int)sizeof out);
+    if (m != 200)
+        return err(1, "stored 块解压长度不对");
+    if (memcmp(out, "hello hello hello hello, deflate world! ", 40) != 0)
+        return err(2, "stored 块内容不对");
+    /* 固定 Huffman（zlib 对同一段文本选了 fixed） */
+    n = unhex("cb48cdc9c957c8402775145252d372124b5215caf38b72521431550c327500",
+              packed, (int)sizeof packed);
+    m = inflate(packed, n, out, (int)sizeof out);
+    if (m != 200
+        || memcmp(out, "hello hello hello hello, deflate world! ", 40) != 0)
+        return err(3, "固定 Huffman 块解压不对");
+    /* 动态 Huffman：zlib 的 Z_HUFFMAN_ONLY 对 108 字节的 abc 重复 */
+    {
+        char text[108] = { 0 };
+
+        for (m = 0; m < 108; m++)
+            text[m] = (char)("abcabcabcabc"[m % 12]);
+        n = unhex("05c1010100000040a0adf8ff4161188661188661188661188661188661"
+                  "18866118866118866118860d",
+                  packed, (int)sizeof packed);
+        m = inflate(packed, n, out, (int)sizeof out);
+        if (m != 108)
+            return err(4, "动态 Huffman 块解压长度不对");
+        if (memcmp(out, text, 108) != 0)
+            return err(5, "动态 Huffman 块内容不对");
+    }
+    /* 122 字节的英文句子（另一个动态表） */
+    {
+        char want[128] = { 0 };
+        int i = 0;
+        char *line = (char *)"the quick brown fox jumps over the lazy dog ";
+        int ln = (int)strlen(line);
+
+        for (i = 0; i < 4; i++)
+            memcpy(want + i * ln, line, (size_t)ln);
+        n = unhex("05c1870180201000b1556e35ca232af24851617a931e857beceec4567d3341"
+                  "3f8e7195863e52e95148664dbc6ef428dc637727b6ea9b09fa718cab34f491"
+                  "4a8f42326be275a347e11ebb3bb155df4cd08f635ca5a18f547a14925913af"
+                  "1b3d0af7d8dd89adfa66827e1ce32a0d7da4d2a390cc9a78ddf801",
+                  packed, (int)sizeof packed);
+        m = inflate(packed, n, out, (int)sizeof out);
+        if (m != 176)
+            return err(6, "176 字节动态块长度不对");
+        if (memcmp(out, want, 176) != 0)
+            return err(7, "176 字节动态块内容不对");
+    }
+}
+
+test "deflate_stored / deflate_fixed 的往返" {
+    char text[600] = { 0 };
+    u8 packed[1024] = { 0 };
+    u8 back[1024] = { 0 };
+    int i = 0, n = 0, m = 0;
+
+    for (i = 0; i < 600; i++)
+        text[i] = (char)('a' + i % 23);
+    /* stored 往返 */
+    n = deflate_stored(text, 600, packed, (int)sizeof packed);
+    if (n <= 0 || n > (int)sizeof packed)
+        return err(8, "deflate_stored 失败");
+    m = inflate(packed, n, back, (int)sizeof back);
+    if (m != 600 || memcmp(back, text, 600) != 0)
+        return err(9, "stored 往返失败");
+    /* fixed 往返，且要比原数据短（abc... 重复度高） */
+    n = deflate_fixed(text, 600, packed, (int)sizeof packed);
+    if (n <= 0)
+        return err(10, "deflate_fixed 失败");
+    if (n >= 600)
+        return err(11, "重复文本应该压得比原文短");
+    m = inflate(packed, n, back, (int)sizeof back);
+    if (m != 600 || memcmp(back, text, 600) != 0)
+        return err(12, "fixed 往返失败");
+    /* 空输入 */
+    if (deflate_stored(0, 0, packed, (int)sizeof packed) < 0)
+        return err(13, "stored 空输入应该成功");
+    n = deflate_fixed(0, 0, packed, (int)sizeof packed);
+    if (n <= 0 || inflate(packed, n, back, (int)sizeof back) != 0)
+        return err(14, "fixed 空输入往返失败");
+    /* 单字节 */
+    n = deflate_fixed("Z", 1, packed, (int)sizeof packed);
+    if (n <= 0 || inflate(packed, n, back, (int)sizeof back) != 1
+        || back[0] != 'Z')
+        return err(15, "单字节往返失败");
+    /* 不可压缩的随机字节也不该坏 */
+    {
+        u8 rnd[256] = { 0 };
+
+        for (i = 0; i < 256; i++)
+            rnd[i] = (u8)((i * 137 + 91) & 0xff);
+        n = deflate_fixed(rnd, 256, packed, (int)sizeof packed);
+        if (n <= 0)
+            return err(16, "随机字节压缩失败");
+        m = inflate(packed, n, back, (int)sizeof back);
+        if (m != 256 || memcmp(back, rnd, 256) != 0)
+            return err(17, "随机字节往返失败");
+    }
+    /* 容量不够 */
+    if (deflate_stored(text, 600, packed, 100) != -1)
+        return err(18, "stored 容量不够应该 -1");
+    if (deflate_fixed(text, 600, packed, 8) != -1)
+        return err(19, "fixed 容量不够应该 -1");
+    /* 截断的输入 */
+    n = deflate_fixed(text, 600, packed, (int)sizeof packed);
+    if (inflate(packed, n / 2, back, (int)sizeof back) != -1)
+        return err(20, "截断的输入应该 -1");
+    if (inflate(packed, n, back, 100) != -1)
+        return err(21, "输出放不下应该 -1");
+    /* 坏参数 */
+    if (inflate(0, 4, back, 8) != -1 || inflate(packed, 0, back, 8) != -1
+        || inflate(packed, n, 0, 8) != -1)
+        return err(22, "inflate 坏参数应该 -1");
+    if (deflate_stored(0, 4, packed, 8) != -1
+        || deflate_fixed(text, 4, 0, 8) != -1)
+        return err(23, "deflate 坏参数应该 -1");
+}

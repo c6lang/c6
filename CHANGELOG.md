@@ -47,6 +47,18 @@
 
 ### 标准库
 
+- **标准库第二十八批（压缩与归档）**：`std.encoding.deflate` /
+  `std.encoding.zlib` / `std.encoding.gzip` / `std.encoding.tar` 四个模块，
+  集成示例 `examples/stdarch.c6`（`make std-arch`）。deflate 的 `inflate` 完整
+  支持 stored/固定 Huffman/动态 Huffman 三种块（回溯直接读输出缓冲），压缩侧
+  给 `deflate_stored` 与「贪心 LZ77 + 固定 Huffman」的 `deflate_fixed`；zlib
+  是 `78 01` 头 + DEFLATE + Adler-32（`adler32`/`adler32_update`）；gzip 是
+  10 字节头 + DEFLATE + CRC-32/ISIZE（`gzip_crc32` 走 `std.core.crc`，
+  `gzip_decompress` 会跳过 FEXTRA/FNAME/FCOMMENT/FHCRC 并校验页脚）；tar 是
+  ustar 的读写（checksum、prefix/name 拆分、512 对齐、结尾两个零块）。四个
+  模块都是零分配、调用方给缓冲。错误号段 `std.encoding.deflate`=0x6079 …
+  `std.encoding.tar`=0x607c（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第二十七批（数值工具）**：`std.core.geometry` / `std.core.interp` /
   `std.core.stats` / `std.core.matrix` 四个模块，集成示例 `examples/stdcalc.c6`
   （`make std-calc`）。geometry 是 Vec2/Vec3/Rect（自由函数、纯值、牛顿迭代
