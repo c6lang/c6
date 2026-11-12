@@ -1,0 +1,399 @@
+/* std/encoding/hexdump：hexdump 文本的生成与反向解析（零分配、写调用方缓冲）。
+ *
+ *     import std.encoding.hexdump;
+ *
+ *     HexOpts o = hex_opts();               // 16 字节一行、小写、带 ASCII 列
+ *     char out[256] = { 0 };
+ *     int n = hexdump(src, src_len, (char[:]){ out, (int)sizeof out }, o);
+ *     int m = hexundump((char[:]){ out, n }, back, (int)sizeof back);
+ *
+ * 输出格式（和 `xxd` 的经典布局一致，每个字段宽度固定）：
+ *
+ *     00000000  48 65 6c 6c 6f                                    |Hello           |
+ *     ^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+ *     偏移 8 位  每字节 3 字符（"xx "），第 8 个字节后多一个空格   ' ' + '|' + width 个字符 + '|'
+ *
+ * - 偏移是 `base + 行号 * width`，按 32 位取模后输出 8 位小写十六进制。
+ * - 不足一行的字节：hex 区补空格，ASCII 区补空格；不可打印字节（< 32 或 > 126）
+ *   在 ASCII 列写 `.`。
+ * - 关闭 ASCII 列（`o.ascii = 0`）时行尾没有 `|...|` 段；`o.upper = 1` 输出大写。
+ * - `width` 允许 1..64，0 表示默认 16；`hexdump` 先按 `hexdump_len` 算长度，
+ *   放不下返回 -1 且**一个字节都不写**。
+ *
+ * 反向解析 `hexundump` 只认数据：行首如果恰好是 **8 个十六进制数字 + 空白**
+ * 就当成偏移丢掉；之后按两位一组解析十六进制，遇到 `|` 或行尾就跳掉该行剩余
+ * 部分（ASCII 列）。所以 `xxd`/`hexdump -C` 的输出能直接喂进来，手写的纯
+ * `48 65 6c` 也认（没有 8 位偏移不会被误吞）。奇数个数字、非十六进制字符、
+ * 输出放不下都返回 -1。
+ */
+#include <string.h>
+
+module std.encoding.hexdump;
+import std.core.types;
+
+enum HexLimits {
+    HEX_DEFAULT_WIDTH = 16,
+    HEX_MAX_WIDTH = 64,
+    HEX_OFFSET_DIGITS = 8,
+};
+
+/* 排版选项 */
+struct HexOpts {
+    int width;      /* 每行字节数 1..64；0 = 默认 16 */
+    int upper;      /* 1 = 大写十六进制 */
+    int ascii;      /* 1 = 行尾带 |...| */
+    u32 base;       /* 第一行的偏移 */
+};
+
+HexOpts hex_opts(void)
+{
+    HexOpts o = { 0 };
+
+    o.width = HEX_DEFAULT_WIDTH;
+    o.ascii = 1;
+    return o;
+}
+
+static int hex_width(HexOpts o)
+{
+    if (o.width == 0)
+        return HEX_DEFAULT_WIDTH;
+    if (o.width < 1 || o.width > HEX_MAX_WIDTH)
+        return 0;
+    return o.width;
+}
+
+/* 一行的字节数（含行尾 '\n'） */
+static int hex_line_len(int width, int ascii)
+{
+    int n = HEX_OFFSET_DIGITS + 2 + width * 3;
+
+    if (width > 8)
+        n += 1;                       /* 第 8 字节后的分组空格 */
+    if (ascii)
+        n += 1 + 1 + width + 1;       /* ' ' + '|' + width + '|' */
+    return n + 1;                     /* '\n' */
+}
+
+/* 输出需要多少字节；参数非法/溢出给 -1 */
+int hexdump_len(int n, HexOpts o)
+{
+    int w = hex_width(o);
+    i64 lines = 0, v = 0;
+
+    if (n < 0 || w == 0)
+        return -1;
+    if (n == 0)
+        return 0;
+    lines = ((i64)n + w - 1) / w;
+    v = lines * hex_line_len(w, o.ascii != 0);
+    if (v > (i64)I32_MAX)
+        return -1;
+    return (int)v;
+}
+
+static const char hex_lower[] = "0123456789abcdef";
+static const char hex_upper[] = "0123456789ABCDEF";
+
+/* 生成：返回写入字节数；放不下/参数非法返回 -1（不写半截） */
+int hexdump(const void *src, int n, char[:] out, HexOpts o)
+{
+    const u8 *s = (const u8 *)src;
+    const char *digits = 0;
+    int w = hex_width(o);
+    int need = 0, di = 0, pos = 0, line = 0;
+
+    if (n < 0 || (n > 0 && !src))
+        return -1;
+    need = hexdump_len(n, o);
+    if (need < 0 || need > out.len || (need > 0 && !out.data))
+        return -1;
+    digits = o.upper ? hex_upper : hex_lower;
+    while (pos < n) {
+        u32 off = o.base + (u32)(line * w);
+        int cnt = (n - pos < w) ? (n - pos) : w;
+        int j = 0;
+
+        for (j = 7; j >= 0; j--)
+            out.data[di++] = digits[(off >> (j * 4)) & 0xfu];
+        out.data[di++] = ' ';
+        out.data[di++] = ' ';
+        for (j = 0; j < w; j++) {
+            if (j < cnt) {
+                u8 b = s[pos + j];
+
+                out.data[di++] = digits[(b >> 4) & 0xfu];
+                out.data[di++] = digits[b & 0xfu];
+            } else {
+                out.data[di++] = ' ';
+                out.data[di++] = ' ';
+            }
+            out.data[di++] = ' ';
+            if (j == 7 && w > 8)
+                out.data[di++] = ' ';
+        }
+        if (o.ascii) {
+            out.data[di++] = ' ';
+            out.data[di++] = '|';
+            for (j = 0; j < w; j++) {
+                u8 b = 0;
+
+                if (j < cnt) {
+                    b = s[pos + j];
+                    out.data[di++] = (b >= 32 && b <= 126) ? (char)b : '.';
+                } else {
+                    out.data[di++] = ' ';
+                }
+            }
+            out.data[di++] = '|';
+        }
+        out.data[di++] = '\n';
+        pos += cnt;
+        line++;
+    }
+    return di;
+}
+
+static int hex_val(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 解析：返回字节数；坏字符/奇数位/放不下返回 -1 */
+int hexundump(char[:] text, char[:] out)
+{
+    int i = 0, di = 0;
+
+    if (text.len < 0 || out.len < 0)
+        return -1;
+    if (text.len > 0 && !text.data)
+        return -1;
+    if (out.len > 0 && !out.data && text.len > 0)
+        return -1;
+    while (i < text.len) {
+        int line_start = i;
+        int j = 0;
+
+        /* 行首恰好 8 个十六进制数字 + 空白 → 是偏移，跳过 */
+        j = i;
+        while (j < text.len && j - i < HEX_OFFSET_DIGITS
+               && hex_val((u8)text.data[j]) >= 0)
+            j++;
+        if (j - i == HEX_OFFSET_DIGITS && j < text.len
+            && (text.data[j] == ' ' || text.data[j] == '\t')) {
+            i = j;
+        } else {
+            i = line_start;
+        }
+        /* 解析这一行的十六进制字节，直到 '|' 或行尾 */
+        while (i < text.len && text.data[i] != '\n' && text.data[i] != '|') {
+            if (text.data[i] == ' ' || text.data[i] == '\t') {
+                i++;
+                continue;
+            }
+            if (hex_val((u8)text.data[i]) < 0)
+                return -1;
+            if (i + 1 >= text.len || hex_val((u8)text.data[i + 1]) < 0)
+                return -1;
+            if (di >= out.len)
+                return -1;
+            out.data[di++] = (u8)(hex_val((u8)text.data[i]) * 16
+                                  + hex_val((u8)text.data[i + 1]));
+            i += 2;
+        }
+        while (i < text.len && text.data[i] != '\n')
+            i++;
+        if (i < text.len)
+            i++;
+    }
+    return di;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int hex_dump_is(char[:] src, const char *want, HexOpts o)
+{
+    char buf[1024] = { 0 };
+    int n = hexdump(src.data, src.len, (char[:]){ buf, (int)sizeof buf - 1 }, o);
+
+    if (n < 0)
+        return 0;
+    buf[n] = 0;
+    return strcmp(buf, want) == 0;
+}
+
+test "默认布局" {
+    HexOpts o = hex_opts();
+    char out[256] = { 0 };
+    int n = 0;
+
+    n = hexdump("Hello", 5, (char[:]){ out, (int)sizeof out }, o);
+    out[n > 0 ? n : 0] = 0;
+    if (n != hexdump_len(5, o))
+        return err(1, "长度与实现不一致");
+    if (strcmp(out,
+               "00000000  48 65 6c 6c 6f                                    |Hello           |\n")
+        != 0)
+        return err(2, "默认布局");
+    /* 空输入：0 字节 */
+    if (hexdump("", 0, (char[:]){ out, (int)sizeof out }, o) != 0
+        || hexdump_len(0, o) != 0)
+        return err(3, "空输入");
+    /* 正好一行 */
+    if (!hex_dump_is(S("0123456789abcdef"),
+                     "00000000  30 31 32 33 34 35 36 37  38 39 61 62 63 64 65 66  |0123456789abcdef|\n",
+                     o))
+        return err(4, "整行");
+    /* 换行后的第二行偏移 */
+    if (!hex_dump_is(S("0123456789abcdefX"),
+                     "00000000  30 31 32 33 34 35 36 37  38 39 61 62 63 64 65 66  |0123456789abcdef|\n"
+                     "00000010  58                                                |X               |\n",
+                     o))
+        return err(5, "第二行");
+}
+
+test "宽度、大小写、ASCII 列与偏移" {
+    HexOpts o = hex_opts();
+    char out[512] = { 0 };
+    int n = 0;
+
+    o.width = 8;
+    if (!hex_dump_is(S("\x00\x01\x20\x7e\x7f\xff\x41\x42"),
+                     "00000000  00 01 20 7e 7f ff 41 42  |.. ~..AB|\n", o))
+        return err(6, "width=8 与不可打印字符");
+    o.width = 4;
+    o.upper = 1;
+    if (!hex_dump_is(S("\xde\xad\xbe\xef"),
+                     "00000000  DE AD BE EF  |....|\n", o))
+        return err(7, "width=4 大写");
+    o = hex_opts();
+    o.ascii = 0;
+    if (!hex_dump_is(S("AB"), "00000000  41 42                                            \n",
+                     o))
+        return err(8, "关闭 ASCII 列");
+    o = hex_opts();
+    o.base = 0x100u;
+    o.width = 4;
+    n = hexdump("ABCD", 4, (char[:]){ out, (int)sizeof out }, o);
+    out[n > 0 ? n : 0] = 0;
+    if (strncmp(out, "00000100  ", 10) != 0)
+        return err(9, "偏移基数");
+    if (hexdump_len(4, o) != n)
+        return err(10, "偏移行的长度");
+}
+
+test "容量与非法参数" {
+    HexOpts o = hex_opts();
+    char out[8] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 8; i++)
+        out[i] = 'Z';
+    if (hexdump("Hello", 5, (char[:]){ out, 8 }, o) != -1)
+        return err(11, "放不下要给 -1");
+    for (i = 0; i < 8; i++)
+        if (out[i] != 'Z')
+            return err(12, "放不下时写了半截");
+    o.width = 65;
+    if (hexdump_len(4, o) != -1 || hexdump("abcd", 4, (char[:]){ out, 8 }, o) != -1)
+        return err(13, "width 越界");
+    o = hex_opts();
+    if (hexdump_len(-1, o) != -1)
+        return err(14, "负数长度");
+    /* width=1..64 都能量出长度并往返 */
+    {
+        char big[4096] = { 0 };
+        char back[128] = { 0 };
+        char src[64] = { 0 };
+
+        for (i = 0; i < 64; i++)
+            src[i] = (char)i;
+        o = hex_opts();
+        o.width = 1;
+        for (i = 0; i < 64; i++) {
+            int m = 0;
+
+            o.width = i + 1;
+            m = hexdump(src, 64, (char[:]){ big, (int)sizeof big }, o);
+            if (m < 0 || m != hexdump_len(64, o))
+                return err(15, "width 1..64 的长度");
+            if (hexundump((char[:]){ big, m }, (char[:]){ back, (int)sizeof back }) != 64
+                || memcmp(back, src, 64) != 0)
+                return err(16, "width 1..64 的往返");
+        }
+    }
+}
+
+test "反向解析" {
+    char out[64] = { 0 };
+    int n = 0;
+
+    /* 带偏移与 ASCII 列 */
+    n = hexundump(S("00000000  48 65 6c 6c 6f                                    |Hello           |\n"),
+                  (char[:]){ out, (int)sizeof out });
+    if (n != 5 || memcmp(out, "Hello", 5) != 0)
+        return err(17, "标准 hexdump 行");
+    /* 多行 */
+    n = hexundump(S("00000000  41 42  |AB|\n00000002  43  |C |\n"),
+                  (char[:]){ out, (int)sizeof out });
+    if (n != 3 || memcmp(out, "ABC", 3) != 0)
+        return err(18, "多行");
+    /* 没有偏移的纯十六进制 */
+    n = hexundump(S("48 65 6c 6c 6f\n"), (char[:]){ out, (int)sizeof out });
+    if (n != 5 || memcmp(out, "Hello", 5) != 0)
+        return err(19, "纯 hex");
+    /* 大小写混用、紧凑写 */
+    n = hexundump(S("DeAdBeEf"), (char[:]){ out, (int)sizeof out });
+    if (n != 4 || memcmp(out, "\xde\xad\xbe\xef", 4) != 0)
+        return err(20, "大小写混用");
+    /* 奇数个数字 */
+    if (hexundump(S("4 8\n"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(21, "奇数位");
+    if (hexundump(S("0x41\n"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(22, "0x 前缀不是十六进制");
+    if (hexundump(S("zz\n"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(23, "非法字符");
+    if (hexundump(S("41 42"), (char[:]){ out, 1 }) != -1)
+        return err(24, "输出放不下");
+    /* 空输入 */
+    if (hexundump(S(""), (char[:]){ out, (int)sizeof out }) != 0)
+        return err(25, "空输入");
+    /* 行尾没有换行 */
+    if (hexundump(S("41"), (char[:]){ out, (int)sizeof out }) != 1 || out[0] != 'A')
+        return err(26, "无结尾换行");
+}
+
+test "hexdump 与 hexundump 往返" {
+    HexOpts o = hex_opts();
+    char src[200] = { 0 };
+    char text[4096] = { 0 };
+    char back[200] = { 0 };
+    int i = 0, n = 0, m = 0;
+
+    for (i = 0; i < 200; i++)
+        src[i] = (char)(i * 31 + 7);
+    for (i = 1; i <= 64; i *= 2) {
+        o.width = i;
+        n = hexdump(src, 100, (char[:]){ text, (int)sizeof text }, o);
+        if (n < 0)
+            return err(27, "hexdump 失败");
+        m = hexundump((char[:]){ text, n }, (char[:]){ back, (int)sizeof back });
+        if (m != 100 || memcmp(back, src, 100) != 0)
+            return err(28, "hexdump 往返");
+    }
+    /* 关闭 ASCII 列也要能解回来 */
+    o.width = 16;
+    o.ascii = 0;
+    n = hexdump(src, 100, (char[:]){ text, (int)sizeof text }, o);
+    m = hexundump((char[:]){ text, n }, (char[:]){ back, (int)sizeof back });
+    if (m != 100 || memcmp(back, src, 100) != 0)
+        return err(29, "无 ASCII 列的往返");
+}

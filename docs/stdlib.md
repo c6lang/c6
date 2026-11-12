@@ -16,7 +16,7 @@
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序 |
 | `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间 |
-| `std/encoding/` | 编解码：Base64/十六进制/百分号、SHA-256、位流、UUID |
+| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-256、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI |
 | `std/net/` | 网络与 Web：IP/CIDR、URL、MIME |
 
@@ -106,11 +106,15 @@
 | --- | --- | --- |
 | `std/encoding/base64.c6` | `std.encoding.base64` | Base64（RFC 4648）标准表与 URL 安全表：`b64_encode`/`b64_decode`、`b64url_encode`/`b64url_decode`、显式表与填充的 `b64_encode_ex`/`b64_decode_ex`/`b64_decoded_len`/`b64_encoded_len`、`b64_valid`、就地 `b64_decode_inplace`/`b64url_decode_inplace`（跳过空白、严格填充、放不下不写半截） |
 | `std/encoding/base32.c6` | `std.encoding.base32` | Base32（RFC 4648）：`b32_encode`/`b32_decode`/`b32hex_encode`/`b32hex_decode`、`b32_encode_ex`/`b32_decode_ex`（显式表与填充策略）、`b32_encoded_len`/`b32_decoded_len`/`b32_valid`；解码跳过空白、接受省略填充与小写，拒绝非零填充位 |
+| `std/encoding/base85.c6` | `std.encoding.base85` | Ascii85（Adobe）与 Z85（ZeroMQ）：`a85_encode`/`a85_decode`、`a85_encoded_len`/`a85_decoded_len`/`a85_valid`（`z` 简写、部分组 n+1 字符、解码跳空白、`~>` 终止、溢出/非法字符拒绝）；`z85_encode`/`z85_decode`/`z85_valid`/`z85_encoded_len`/`z85_decoded_len`（长度必须 4/5 的倍数、严格字母表） |
 | `std/encoding/base58.c6` | `std.encoding.base58` | Bitcoin Base58：`b58_encode`/`b58_decode`、`b58_encoded_len`（上界）/`b58_max_decoded_len`/`b58_valid`；前导零写 `1`，解码拒绝歧义字符 |
 | `std/encoding/varint.c6` | `std.encoding.varint` | LEB128：`uvarint_encode`/`uvarint_decode`、`svarint_encode`/`svarint_decode`、`zigzag_encode`/`zigzag_decode`、`*_encoded_len`；解码返回 1/0/-1（成功/截断/非法） |
 | `std/encoding/bitbuf.c6` | `std.encoding.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`put`/`put_u64`/`put_bit`/`align`/`put_bytes`/`patch`（回填不改游标）、`br_open`/`get`/`get_u64`/`get_bit`/`peek`/`skip`/`align`/`get_bytes`、`bit_count`/`byte_count`/`ok`/`remaining`/`eof` |
 | `std/encoding/codec.c6` | `std.encoding.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
+| `std/encoding/hexdump.c6` | `std.encoding.hexdump` | hexdump 文本与反向解析：`hex_opts`、`hexdump`/`hexdump_len`（width 1..64、`upper`、`ascii` 列、`base` 偏移；不足一行补空格、不可打印字节写 `.`）、`hexundump`（行首 8 位十六进制 + 空白当偏移，遇到 `|` 跳过 ASCII 列；奇数位/非法字符/放不下返回 -1） |
 | `std/encoding/frame.c6` | `std.encoding.frame` | 串行分帧（零分配，写调用方缓冲）：COBS 的 `cobs_max_len`（上界）/`cobs_encoded_len`（精确）/`cobs_encode`/`cobs_decode`/`cobs_encode_frame`/`cobs_decode_frame`，SLIP（RFC 1055）的 `slip_encoded_len`/`slip_encode`/`slip_decode`/`slip_encode_frame`/`slip_decode_frame`；坏 code 字节、截断/非法转义、负载里的分隔符都拒绝，失败时不写半截 |
+| `std/encoding/lz4.c6` | `std.encoding.lz4` | LZ4 块压缩/解压（零分配）：`lz4_compress`（调用方给 `int[lz4_table_size()]` 哈希表）/`lz4_decompress`/`lz4_compress_bound`；兼容标准 LZ4 块格式（结尾 5 字节字面量、最后匹配不早于结尾前 12 字节），坏偏移/截断/放不下都返回 -1 |
+| `std/encoding/rle.c6` | `std.encoding.rle` | PackBits 游程（`rle_encode`/`rle_decode`/`rle_encoded_len`/`rle_decoded_len`/`rle_bound`，控制字节 0..127 字面量、129..255 重复、128 no-op，单段 ≤128）与一阶差分 `delta_encode`/`delta_decode`（模 256，和 RLE/LZ4 组合用） |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
 | `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
@@ -152,6 +156,7 @@
 | `examples/stdembed.c6` | （无模块） | 第十一批（嵌入式基础）的拼装示例（`make std-embed`）：fixed/crc/pool/frame 各一节，串成「采样 → 定点 → 分帧 → 校验 → 池」链路，自带自检 |
 | `examples/stdtext.c6` | （无模块） | 第十二批（文本算法）的拼装示例（`make std-text`）：regex 拆日志、fuzzy 命令补全、wrap 帮助折行、diff 配置对比，自带自检 |
 | `examples/stdnum.c6` | （无模块） | 第十三批（数值类型）的拼装示例（`make std-num`）：bignum 阶乘与进制、decimal 金额税额、rational 调和级数、complex 乘法与模，自带自检 |
+| `examples/stdpack.c6` | （无模块） | 第十四批（压缩与文本编码）的拼装示例（`make std-pack`）：lz4 压缩遥测帧、rle+delta 压采样、base85 转文本、hexdump 文本化，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -1675,6 +1680,85 @@ Complex w = z.mul(cplx(1.0, -2.0));  /* 11 - 2i */
   精确比较，浮点运算之后请用 `near(o, eps)`。
 * **没有** `arg`/`exp`/`log`/`sin`：这些要 `atan2`/`exp`，标准库目前不提供。
 
+### `lz4`：LZ4 块压缩/解压
+
+```c
+import std.encoding.lz4;
+
+int table[lz4_table_size()];          /* 1024 个 int，约 4KB，调用方给 */
+char packed[4096] = { 0 };
+int n = lz4_compress(src, src_len, packed, (int)sizeof packed, table,
+                     lz4_table_size());
+char back[4096] = { 0 };
+int m = lz4_decompress(packed, n, back, (int)sizeof back);
+```
+
+* 实现的是 **LZ4 块格式**（不是带帧头/校验和的 frame 格式），和上游
+  `LZ4_compress_default` 兼容：test 块里有手写的标准块向量，也和独立的参考实现
+  做了双向交叉验证。
+* 零分配：哈希表是调用方的 `int[lz4_table_size()]`，输出写调用方缓冲；压缩前按
+  `lz4_compress_bound(n)` 检查容量，放不下返回 -1 且一个字节都不写。
+* 压缩器遵守 LZ4 的两条格式承诺：最后 5 字节一定是字面量、最后一个匹配不早于
+  结尾前 12 字节。
+* 解码是流式校验：偏移为 0 / 越过已产出的数据、扩展长度被截断、输出放不下都返回
+  -1；失败时目标缓冲内容未定义（已写了一部分），要保留原内容请先解到临时缓冲。
+* 空输入的编码是 1 个字节（`0x00`），解码回 0 字节。
+
+### `rle`：PackBits 游程与一阶差分
+
+```c
+import std.encoding.rle;
+
+char packed[256] = { 0 };
+int n = rle_encode(src, src_len, packed, (int)sizeof packed);
+char diffs[256] = { 0 };
+delta_encode(samples, n, diffs, (int)sizeof diffs);
+```
+
+* PackBits（Apple/TIFF）：控制字节 `0..127` 表示后面跟 `c+1` 个字面量，`129..255`
+  表示后面那 1 个字节重复 `257-c` 次，`128` 是空操作；单段最多 128 字节。
+* `delta_encode`/`delta_decode` 是一阶差分（模 256）：缓变的 ADC/计数器差分后
+  全是小值，再交给 RLE 或 LZ4 能压得更狠；两者严格互逆。
+* `rle_bound` 是上界、`rle_encoded_len` 是精确长度，先量再写；解码先校验截断，
+  坏数据/放不下返回 -1。
+
+### `base85`：Ascii85 与 Z85
+
+```c
+import std.encoding.base85;
+
+char buf[64] = { 0 };
+int n = a85_encode(S("hello"), buf, (int)sizeof buf);   /* "BOu!rDZ" */
+a85_decode((char[:]){ buf, n }, out, (int)sizeof out);
+```
+
+* 两种都是 4 字节 → 5 个字符（85^5 > 2^32）。
+* **Ascii85**（Adobe）：字母表 `!`..`u`；4 个零字节写成 `z`；结尾不足 4 字节输出
+  n+1 个字符；解码跳过空白、遇到 `~>` 停止（`<~` 开头由调用方剥掉）。部分组补齐
+  用 `u`，数值超过 32 位视为非法。
+* **Z85**（ZeroMQ）：字母表 `0-9a-zA-Z.-:+=^!/*?&<>()[]{}@%$#`；编码长度必须是
+  4 的倍数、解码长度必须是 5 的倍数，没有 `z` 简写、不跳空白。
+* 都写调用方缓冲，放不下返回 -1 且不写半截。
+
+### `hexdump`：十六进制文本化与反向解析
+
+```c
+import std.encoding.hexdump;
+
+HexOpts o = hex_opts();          /* 16 字节一行、小写、带 ASCII 列、偏移 0 */
+char text[256] = { 0 };
+int n = hexdump(src, src_len, (char[:]){ text, (int)sizeof text }, o);
+hexundump((char[:]){ text, n }, back, (int)sizeof back);
+```
+
+* 固定布局：8 位偏移（`base + 行号 * width`，32 位取模）+ 2 空格 + 每字节 3 字符
+  （第 8 字节后多一个分组空格）+ ` |ASCII 列|`；不足一行补空格，不可打印字节写 `.`。
+* `width` 允许 1..64（0 表示默认 16）；`upper` 大写十六进制；`ascii = 0` 去掉
+  ASCII 列；`base` 是首行偏移。
+* `hexundump` 只认数据：行首恰好 8 个十六进制数字 **且后面跟空白** 才当偏移丢掉
+  （所以 `DeAdBeEf` 这种纯数据行不会被误吞），遇到 `|` 或行尾就丢掉本行剩余部分。
+* `hexdump` 先按 `hexdump_len` 算长度，放不下返回 -1 且不写半截。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -1966,6 +2050,30 @@ stdnum: 21 check(s), 0 failure(s)
 两个大分数；「复数」算 `(3+4i)(1-2i) = 11-2i`、`|3+4i| = 5`、`(3+4i)^2`、共轭乘积
 与除零的 IEEE 行为。Makefile 里显式列出六个模块正文（complex 依赖 `std/core/math.c6`）。
 
+### 集成示例：`examples/stdpack.c6`
+
+```sh
+make std-pack
+```
+
+```
+stdpack: 标准库第十四批（lz4 / rle / base85 / hexdump）
+lz4: 1024 -> 34 字节（3%）
+rle: 256 字节采样 -> 差分 256 -> RLE 6 字节
+---- hexdump(width=8, base=0x1000) ----
+00001000  68 65 78 64 75 6d 70 20  |hexdump |
+00001008  72 6f 63 6b 73 21 68 65  |rocks!he|
+00001010  78 64 75 6d              |xdum    |
+stdpack: 24 check(s), 0 failure(s)
+```
+
+四节：「压缩」把 1024 字节的重复遥测帧压到 34 字节再解回来（并验偏移 0 的坏块被
+拒绝）；「游程」对 256 个缓变采样先差分再 RLE（6 字节），再解回原采样（并验截断
+的字面量被拒绝）；「文本编码」钉住 Ascii85 的 `hello → BOu!rDZ` 与 Z85 的标准向量
+`HelloWorld`，再做 37 字节任意二进制的往返；「十六进制」按 8 字节一行、偏移从
+0x1000 起排版并反向解析，另验纯 hex 输入与大写/无 ASCII 列。Makefile 里显式列出
+六个模块正文（四个模块都只依赖 `std/core/types.c6`）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1988,6 +2096,8 @@ stdnum: 21 check(s), 0 failure(s)
   （自带自检）。
 * `make std-num`：`examples/stdnum.c6`，第十三批（数值类型）模块的拼装示例
   （自带自检）。
+* `make std-pack`：`examples/stdpack.c6`，第十四批（压缩与文本编码）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

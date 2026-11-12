@@ -215,14 +215,18 @@ std/os/                     操作系统：流、文件系统、路径、环境�
   std/os/path.c6            std.os.path            POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
-std/encoding/               编解码：Base32/Base64/十六进制/百分号、SHA-256、位流、UUID、Punycode/IDNA、串行分帧
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、SHA-256、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
+  std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
   std/encoding/varint.c6    std.encoding.varint    LEB128：uvarint/svarint 编解码、zigzag、*_encoded_len（解码返回 1/0/-1）
   std/encoding/base64.c6    std.encoding.base64    Base64（RFC 4648）标准表与 URL 安全表：b64_encode/b64_decode、b64url_encode/b64url_decode、显式表与填充的 b64_encode_ex/b64_decode_ex/b64_decoded_len/b64_encoded_len、b64_valid、就地 b64_decode_inplace/b64url_decode_inplace（跳过空白、严格填充、放不下不写半截）
   std/encoding/bitbuf.c6    std.encoding.bitbuf    位级读写器（零分配、MSB 先）：bw_open/put/put_u64/put_bit/align/put_bytes/patch（回填不改游标）、br_open/get/get_u64/get_bit/peek/skip/align/get_bytes、bit_count/byte_count/ok/remaining/eof
   std/encoding/codec.c6     std.encoding.codec     Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
+  std/encoding/hexdump.c6   std.encoding.hexdump   hexdump 文本：hex_opts、hexdump/hexdump_len（width 1..64、大小写、ASCII 列、偏移基数）、hexundump 反向解析（认行首 8 位偏移、跳过 `|...|`）
   std/encoding/frame.c6     std.encoding.frame     串行分帧（零分配）：COBS 的 cobs_max_len/cobs_encoded_len/cobs_encode/cobs_decode/cobs_encode_frame/cobs_decode_frame 与 SLIP（RFC 1055）的 slip_encoded_len/slip_encode/slip_decode/slip_encode_frame/slip_decode_frame；坏格式/放不下都不写半截
+  std/encoding/lz4.c6       std.encoding.lz4       LZ4 块压缩/解压（零分配）：lz4_compress（调用方给 int[lz4_table_size()] 哈希表）/lz4_decompress、lz4_compress_bound；兼容标准 LZ4 块格式，坏偏移/截断/放不下都拒绝
+  std/encoding/rle.c6       std.encoding.rle       PackBits 游程（rle_encode/decode、rle_encoded_len/decoded_len、rle_bound）与一阶差分（delta_encode/decode，模 256）
   std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
@@ -269,6 +273,7 @@ make std-box     # 编译并运行 examples/stdbox.c6（第四批模块的拼装
 make std-embed   # 编译并运行 examples/stdembed.c6（第十一批嵌入式模块的拼装示例）
 make std-text    # 编译并运行 examples/stdtext.c6（第十二批文本算法模块的拼装示例）
 make std-num     # 编译并运行 examples/stdnum.c6（第十三批数值类型模块的拼装示例）
+make std-pack    # 编译并运行 examples/stdpack.c6（第十四批压缩与文本编码模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
