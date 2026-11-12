@@ -424,6 +424,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/text/sentences.c6      std.text.sentences     切句游标：. ! ? 加空白断句、换行也断句、连续标点并到句尾
   std/text/ngram.c6          std.text.ngram         字符 n-gram：调用方给池，add/at/freq/unique，含重叠与大小写折叠
   std/text/readability.c6    std.text.readability   可读性：元音组估音节 + Flesch / Flesch-Kincaid 年级（ReadStats 方法）
+  std/data/dotenv.c6         std.data.dotenv        .env 解析：export 前缀、成对引号、尾部注释、键大小写敏感
+  std/data/hosts.c6          std.data.hosts         /etc/hosts：地址+主机名+别名，lookup 在别名里大小写不敏感查找
+  std/data/resolvconf.c6     std.data.resolvconf    /etc/resolv.conf：nameserver/search/domain/options 分类与统计
+  std/data/knownhosts.c6     std.data.knownhosts    SSH known_hosts：主机列表/密钥/base64，哈希条目单独标记与跳过
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -549,6 +553,7 @@ make std-audio2   # 编译并运行 examples/stdlegacy2.c6（第六十六批老�
 make std-proto3   # 编译并运行 examples/stdnet2.c6（第六十七批小型文本协议模块的拼装示例）
 make std-markup   # 编译并运行 examples/stdmarkup.c6（第六十八批轻量标记语言模块的拼装示例）
 make std-textan   # 编译并运行 examples/stdtextan.c6（第六十九批文本分析模块的拼装示例）
+make std-cfg2     # 编译并运行 examples/stdcfg.c6（第七十批系统配置文件模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

@@ -1,0 +1,272 @@
+/* std/data/resolvconf：`/etc/resolv.conf` 解析（nameserver / search / options / domain）。
+ *
+ *     import std.data.resolvconf;
+ *
+ *     ResolvDoc doc = { 0 };
+ *     ResolvEntry e = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / rewind
+ *     while (doc.next(&e) == 1)
+ *         // e.kind（RESOLV_NAMESERVER / RESOLV_SEARCH / RESOLV_OPTION / RESOLV_DOMAIN
+ *         //        / RESOLV_OTHER）与 e.value
+ *     doc.nameservers();             // 有几个 nameserver
+ *
+ * 语法：每行第一个词是关键字，其余是值；`#`/`;` 起到行尾是注释，空行忽略。
+ * 常见关键字：`nameserver`、`search`、`domain`、`options`、`sortlist`、`sortlist`。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 数出条目数并返回；`e.kind` 按上表分类，未知关键字是
+ *   `RESOLV_OTHER`（`e.key` 保留原词）；
+ * - `e.value` 是关键字之后的内容（已去掉注释与首尾空白）；
+ * - `doc.nameservers()` 数 `nameserver` 条目，`doc.first_nameserver(dst, cap)` 取第一个
+ *   地址（没有返回 -1）；
+ * - `doc.search_list()` 返回 `search` 条目个数（`search` 的值为空格分隔的域列表）；
+ * - 不做地址格式校验。
+ */
+#include <string.h>
+
+module std.data.resolvconf;
+import std.core.types;
+import std.text.str;
+
+enum {
+    RESOLV_NAMESERVER = 1,
+    RESOLV_SEARCH = 2,
+    RESOLV_DOMAIN = 3,
+    RESOLV_OPTION = 4,
+    RESOLV_OTHER = 5
+};
+
+struct ResolvEntry {
+    int kind;
+    Str key;
+    Str value;
+};
+
+struct ResolvDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+    int nservers;
+    int nsearch;
+    int first_ns_off;
+    int first_ns_len;
+};
+
+static int rv_eq(const char *p, int start, int end, const char *lit)
+{
+    int len = (int)strlen(lit);
+
+    if (end - start != len)
+        return 0;
+    return memcmp(p + start, lit, (size_t)len) == 0;
+}
+
+static int rv_parse(ResolvDoc *d, ResolvEntry *out)
+{
+    const char *p = d->src;
+
+    while (d->off < d->n) {
+        int ls = d->off, le = d->off, i = 0, k_start = 0, k_end = 0;
+        int v_start = 0, v_end = 0;
+
+        while (le < d->n && p[le] != '\n')
+            le++;
+        d->off = (le < d->n) ? le + 1 : d->n;
+        if (le > ls && p[le - 1] == '\r')
+            le--;
+        for (i = ls; i < le; i++) {
+            if (p[i] == '#' || p[i] == ';') {
+                le = i;
+                break;
+            }
+        }
+        while (ls < le && (p[ls] == ' ' || p[ls] == '\t'))
+            ls++;
+        while (le > ls && (p[le - 1] == ' ' || p[le - 1] == '\t'))
+            le--;
+        if (ls >= le)
+            continue;
+        k_start = ls;
+        while (k_start < le && p[k_start] != ' ' && p[k_start] != '\t')
+            k_start++;
+        k_end = k_start;
+        v_start = k_start;
+        while (v_start < le && (p[v_start] == ' ' || p[v_start] == '\t'))
+            v_start++;
+        v_end = le;
+        memset(out, 0, sizeof *out);
+        out->key.s = (char[:]){ (char *)p + ls, k_end - ls };
+        out->value.s = (char[:]){ (char *)p + v_start, v_end - v_start };
+        if (rv_eq(p, ls, k_end, "nameserver"))
+            out->kind = RESOLV_NAMESERVER;
+        else if (rv_eq(p, ls, k_end, "search"))
+            out->kind = RESOLV_SEARCH;
+        else if (rv_eq(p, ls, k_end, "domain"))
+            out->kind = RESOLV_DOMAIN;
+        else if (rv_eq(p, ls, k_end, "options"))
+            out->kind = RESOLV_OPTION;
+        else
+            out->kind = RESOLV_OTHER;
+        return 1;
+    }
+    return 0;
+}
+
+int open(ResolvDoc *d, const void *src, int n)
+{
+    int count = 0;
+    ResolvEntry e = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    d->first_ns_len = 0;
+    while (rv_parse(d, &e) == 1) {
+        count++;
+        if (e.kind == RESOLV_NAMESERVER) {
+            d->nservers++;
+            if (d->first_ns_len == 0) {
+                d->first_ns_off = (int)(e.value.s.data - (const char *)src);
+                d->first_ns_len = e.value.s.len;
+            }
+        }
+        if (e.kind == RESOLV_SEARCH)
+            d->nsearch++;
+    }
+    d->nentries = count;
+    d->off = 0;
+    return count;
+}
+
+int next(ResolvDoc *d, ResolvEntry *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return rv_parse(d, out);
+}
+
+int count(ResolvDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int rewind(ResolvDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int nameservers(ResolvDoc *d)
+{
+    return d ? d->nservers : 0;
+}
+
+int search_list(ResolvDoc *d)
+{
+    return d ? d->nsearch : 0;
+}
+
+int first_nameserver(ResolvDoc *d, char *dst, int cap)
+{
+    int i = 0;
+
+    if (!d || !dst || cap <= 0 || d->first_ns_len <= 0)
+        return -1;
+    if (d->first_ns_len + 1 > cap)
+        return -1;
+    for (i = 0; i < d->first_ns_len; i++)
+        dst[i] = d->src[d->first_ns_off + i];
+    dst[i] = 0;
+    return i;
+}
+
+const char *kind_name(int kind)
+{
+    switch (kind) {
+    case RESOLV_NAMESERVER: return "nameserver";
+    case RESOLV_SEARCH: return "search";
+    case RESOLV_DOMAIN: return "domain";
+    case RESOLV_OPTION: return "options";
+    case RESOLV_OTHER: return "other";
+    default: return "?";
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "resolvconf：条目与统计" {
+    static const char *txt =
+        "# generated\n"
+        "nameserver 8.8.8.8\n"
+        "nameserver 1.1.1.1   # 备用\n"
+        "search example.com corp.example.com\n"
+        "options edns0 timeout:2\n"
+        "domain internal\n"
+        "sortlist 130.155.160.0/255.255.240.0\n";
+    ResolvDoc d = { 0 };
+    ResolvEntry e = { 0 };
+    char ns[32] = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 6)
+        return err(1, "应该有 6 条（注释不算）");
+    if (d.count() != 6 || d.nameservers() != 2 || d.search_list() != 1)
+        return err(2, "统计不对");
+    if (d.first_nameserver(ns, (int)sizeof ns) != 7
+        || memcmp(ns, "8.8.8.8", 7) != 0)
+        return err(3, "第一个 nameserver 不对");
+    if (d.next(&e) != 1 || e.kind != RESOLV_NAMESERVER)
+        return err(4, "第一条应该是 nameserver");
+    if (e.value.s.len != 7)
+        return err(5, "values 长度不对");
+    if (d.next(&e) != 1 || e.kind != RESOLV_NAMESERVER || e.value.s.len != 7)
+        return err(6, "第二条 nameserver 的注释应该被去掉");
+    if (d.next(&e) != 1 || e.kind != RESOLV_SEARCH || e.value.s.len != 28)
+        return err(7, "search 值长度不对");
+    if (d.next(&e) != 1 || e.kind != RESOLV_OPTION || e.value.s.len != 15)
+        return err(8, "options 值长度不对");
+    if (d.next(&e) != 1 || e.kind != RESOLV_DOMAIN || e.value.s.len != 8)
+        return err(9, "domain 值不对");
+    if (d.next(&e) != 1 || e.kind != RESOLV_OTHER)
+        return err(10, "sortlist 应该归到 other");
+    if (strcmp(kind_name(RESOLV_NAMESERVER), "nameserver") != 0)
+        return err(11, "kind_name 不对");
+    if (d.next(&e) != 0)
+        return err(12, "读完应该返回 0");
+}
+
+test "resolvconf：边界" {
+    static const char *txt = "nameserver 127.0.0.53\n";
+    ResolvDoc d = { 0 };
+    char ns[32] = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 1)
+        return err(13, "应该有 1 条");
+    if (d.first_nameserver(ns, 5) != -1)
+        return err(14, "容量不够应该 -1");
+    {
+        ResolvEntry e2 = { 0 };
+
+        if (d.rewind() != 1 || d.next(&e2) != 1)
+            return err(15, "rewind 之后应该能读");
+    }
+    /* 没有 nameserver 的文件 */
+    {
+        static const char *t2 = "options rotate\n";
+        ResolvDoc e = { 0 };
+
+        if (e.open(t2, (int)strlen(t2)) != 1 || e.nameservers() != 0)
+            return err(16, "没有 nameserver 时统计应该是 0");
+        if (e.first_nameserver(ns, (int)sizeof ns) != -1)
+            return err(17, "没有 nameserver 应该 -1");
+    }
+    if (d.open("", 0) != -1)
+        return err(18, "空输入应该 -1");
+}

@@ -2305,6 +2305,31 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（289 个模块、0 failure）、`make std-textan`（22 条自检全过）、
 `make check-all`。
 
+### 11.82 标准库第七十批（dotenv / hosts / resolvconf / knownhosts）
+
+第七十批做「系统配置文件」：`.env`、`/etc/hosts`、`/etc/resolv.conf` 与 SSH
+`known_hosts`。四个都是游标（`open`/`next`/`count`/`rewind` + 各自的查找方法）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.dotenv` | `.env` | 引号要**成对**才去掉（`'keep $x'` 单引号内不转义）；无引号值只去掉 ` #` 起的注释（行内独立 `#` 才算，`a#b` 保留）；键名只允许字母数字下划线点；重复键返回第一条 |
+| `std.data.hosts` | `/etc/hosts` | `names` 给「第一个主机名到行尾」的整段（含别名），`name` 只给第一个；只有地址没有主机名的行忽略；`lookup` 在整段别名里按词匹配（大小写不敏感） |
+| `std.data.resolvconf` | `resolv.conf` | 按首个词分类，未知关键字归 `other` 保留原词；`#` 与 `;` 都是注释；`first_nameserver` 在 `open` 时记住偏移，避免再扫一遍 |
+| `std.data.knownhosts` | `known_hosts` | `@cert-authority`/`@revoked` 标记拆到 `marker`；`|1|salt|hash` 哈希条目置 `hashed` 且 `match` 跳过（离线无法验证）；主机列表按逗号切分做大小写不敏感匹配 |
+
+这一批没有新的语法坑，主要是**字节长度**（注释前的别名段、`search` 的域列表等）
+需要按实际内容数清楚。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.dotenv`=0x6121、
+`std.data.hosts`=0x6122、`std.data.resolvconf`=0x6123、`std.data.knownhosts`=0x6124；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-cfg2` 与 `STD_CFG2_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdcfg.c6` 四节（20 条自检）。
+
+验收：`make stdtest`（293 个模块、0 failure）、`make std-cfg2`（20 条自检全过）、
+`make check-all`。
+
+
 
 
 

@@ -321,6 +321,11 @@
 | `std/text/sentences.c6` | `std.text.sentences` | 切句（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.rewind`）：`.`/`!`/`?` 后跟空白或结尾断句、换行也断句、连续标点并在句尾；不处理缩写（文档写明） |
 | `std/text/ngram.c6` | `std.text.ngram` | 字符 n-gram（**方法**：`g.init`/`g.add`/`g.at`/`g.count`/`g.freq`/`g.unique`/`g.clear`）：池由调用方给（`cap` 个槽位、每个 `n` 字节），`add` 含重叠、池满即停，`freq` 支持大小写折叠 |
 | `std/text/readability.c6` | `std.text.readability` | 可读性（**方法**：`st.analyze`/`st.flesch`/`st.fk`/`st.grade`/`st.words`/`st.sentences`/`st.syllables`/`st.complex_words`）：元音组启发式估音节（哑 e 与 `-le` 特判），Flesch 与 Flesch-Kincaid 公式，`grade()` 四舍五入并夹到 0..20 |
+| `std/data/dotenv.c6` | `std.data.dotenv` | `.env` 解析（**方法**：`env.open`/`env.next`/`env.count`/`env.find`/`env.get`/`env.rewind`）：`export` 前缀、单/双引号（成对才去）、无引号值的 ` #` 注释、键名大小写敏感；`env_unescape` 解 `\n`/`\t`/`\"`/`\\` |
+| `std/data/hosts.c6` | `std.data.hosts` | `/etc/hosts`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.lookup`/`doc.rewind`）：`地址 主机名 [别名…]`，`#` 注释与空行跳过，只有地址的行忽略；`lookup` 在所有别名里大小写不敏感查找 |
+| `std/data/resolvconf.c6` | `std.data.resolvconf` | `/etc/resolv.conf`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.nameservers`/`doc.search_list`/`doc.first_nameserver`/`doc.rewind`）：按首个词分类 `nameserver`/`search`/`domain`/`options`/其它，`#` 与 `;` 都是注释 |
+| `std/data/knownhosts.c6` | `std.data.knownhosts` | SSH `known_hosts`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.match`/`doc.hashed_count`/`doc.rewind`）：主机列表（逗号分隔）/密钥类型/base64/注释，`@cert-authority`/`@revoked` 标记拆到 `marker`，`|1|…` 哈希条目置 `hashed` 并在 `match` 时跳过 |
+
 
 
 
@@ -446,6 +451,7 @@
 | `examples/stdnet2.c6` | （无模块） | 第六十七批（小型文本协议）的拼装示例（`make std-proto3`）：IRC 消息解析与构造、Gopher 菜单遍历、WHOIS 字段取值、ident 端口对与应答 |
 | `examples/stdmarkup.c6` | （无模块） | 第六十八批（轻量标记语言）的拼装示例（`make std-markup`）：reST 结构、Org 的 TODO/标签/链接、LaTeX 章节与转义、POD 段落与 strip |
 | `examples/stdtextan.c6` | （无模块） | 第六十九批（文本分析）的拼装示例（`make std-textan`）：切词统计、切句、字符三元组频次、Flesch 可读性与年级 |
+| `examples/stdcfg.c6` | （无模块） | 第七十批（系统配置文件）的拼装示例（`make std-cfg2`）：`.env` 取值、`hosts` 别名查找、`resolv.conf` 统计、`known_hosts` 匹配 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -616,6 +622,10 @@ std/text/words.c6          24 test(s), 0 failure(s)
 std/text/sentences.c6      24 test(s), 0 failure(s)
 std/text/ngram.c6          24 test(s), 0 failure(s)
 std/text/readability.c6    28 test(s), 0 failure(s)
+std/data/dotenv.c6         24 test(s), 0 failure(s)
+std/data/hosts.c6          24 test(s), 0 failure(s)
+std/data/resolvconf.c6     24 test(s), 0 failure(s)
+std/data/knownhosts.c6     24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4111,6 +4121,17 @@ make std-textan
 给不同数与 `ana` 的频次；`ReadStats.analyze` 对简单句与堆长词的句子算 Flesch 与年级，
 对比「谁更难读」。
 
+### 集成示例：`examples/stdcfg.c6`
+
+```sh
+make std-cfg2
+```
+
+四节都用方法：`DotEnv` 读 `PORT`/`HOST`/`DEBUG`（引号与尾部注释都处理掉）；`HostsDoc`
+用 `doc.lookup("web.alias")` 走别名表；`ResolvDoc` 统计两个 `nameserver` 并用
+`first_nameserver` 取第一个地址；`KnownDoc` 用 `doc.match` 命中 IP 与大小写不同的域名，
+说明哈希条目会被跳过。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4244,6 +4265,8 @@ make std-textan
 * `make std-markup`：`examples/stdmarkup.c6`，第六十八批（轻量标记语言）模块的拼装
   示例（自带自检）。
 * `make std-textan`：`examples/stdtextan.c6`，第六十九批（文本分析）模块的拼装示例
+  （自带自检）。
+* `make std-cfg2`：`examples/stdcfg.c6`，第七十批（系统配置文件）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

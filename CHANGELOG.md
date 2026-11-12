@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十批（系统配置文件）**：`std.data.dotenv`（`.env` 解析）、
+  `std.data.hosts`（`/etc/hosts`）、`std.data.resolvconf`（`/etc/resolv.conf`）、
+  `std.data.knownhosts`（SSH `known_hosts`），集成示例 `examples/stdcfg.c6`
+  （`make std-cfg2`）。错误号段 `std.data.dotenv`=0x6121 … `std.data.knownhosts`=0x6124
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十九批（文本分析）**：`std.text.words`（切词游标）、
   `std.text.sentences`（切句游标）、`std.text.ngram`（字符 n-gram 池）、
   `std.text.readability`（音节估计 + Flesch 指数与年级），集成示例

@@ -1,0 +1,287 @@
+/* std/data/knownhosts：SSH `known_hosts` 解析（主机列表 + 密钥类型 + base64 + 注释）。
+ *
+ *     import std.data.knownhosts;
+ *
+ *     KnownDoc doc = { 0 };
+ *     KnownHost kh = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / match / rewind
+ *     while (doc.next(&kh) == 1)
+ *         // kh.hosts / kh.keytype / kh.blob / kh.comment / kh.hashed
+ *     doc.match("example.com", &kh);
+ *
+ * 行格式：`<主机[,主机…]> <密钥类型> <base64> [注释]`。主机可以是
+ *
+ * - 明文主机名（可带 `[host]:port` 形式）；
+ * - 逗号分隔的多个主机；
+ * - 或 `@cert-authority` / `@revoked` 标记开头；
+ * - 或 OpenSSH 的哈希形式 `|1|salt|hash`（无法离线匹配，标 `hashed = 1`）。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 数出条目并返回；`doc.next(&kh)` 逐条返回；
+ * - `kh.marker` 是 `@cert-authority`/`@revoked`（没有则长度为 0），此时代码会把
+ *   `hosts` 指向标记之后的第一个字段（便于统一处理）；
+ * - `kh.hashed` 为 1 表示主机字段是 `|1|…` 哈希；
+ * - `doc.match(host, &kh)` 大小写不敏感地匹配**明文**主机列表里的任意一项，
+ *   命中返回 1，未命中返回 0，参数为空返回 -1（哈希条目会被跳过）；
+ * - `doc.hashed_count()` 数哈希条目数；`doc.count()` 是总条目数；
+ * - 不做 base64 校验、不做密钥指纹计算。
+ */
+#include <string.h>
+
+module std.data.knownhosts;
+import std.core.types;
+import std.text.str;
+
+struct KnownHost {
+    Str marker;
+    Str hosts;
+    Str keytype;
+    Str blob;
+    Str comment;
+    int hashed;
+};
+
+struct KnownDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+    int nhashed;
+};
+
+static char kh_low(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    return c;
+}
+
+/* 跳过一个字段（到下一个空白），返回字段范围 */
+static void kh_field(const char *p, int *i, int limit, int *fs, int *fe)
+{
+    while (*i < limit && (p[*i] == ' ' || p[*i] == '\t'))
+        (*i)++;
+    *fs = *i;
+    while (*i < limit && p[*i] != ' ' && p[*i] != '\t')
+        (*i)++;
+    *fe = *i;
+}
+
+static int kh_parse(KnownDoc *d, KnownHost *out)
+{
+    const char *p = d->src;
+
+    while (d->off < d->n) {
+        int ls = d->off, le = d->off, i = 0, fs = 0, fe = 0;
+
+        while (le < d->n && p[le] != '\n')
+            le++;
+        d->off = (le < d->n) ? le + 1 : d->n;
+        if (le > ls && p[le - 1] == '\r')
+            le--;
+        while (ls < le && (p[ls] == ' ' || p[ls] == '\t'))
+            ls++;
+        if (ls >= le || p[ls] == '#')
+            continue;
+        memset(out, 0, sizeof *out);
+        i = ls;
+        kh_field(p, &i, le, &fs, &fe);
+        if (fe <= fs)
+            continue;
+        /* @marker */
+        if (p[fs] == '@') {
+            out->marker.s = (char[:]){ (char *)p + fs, fe - fs };
+            kh_field(p, &i, le, &fs, &fe);   /* 标记之后是主机列表 */
+            if (fe <= fs)
+                continue;
+        }
+        out->hosts.s = (char[:]){ (char *)p + fs, fe - fs };
+        if (p[fs] == '|')
+            out->hashed = 1;
+        kh_field(p, &i, le, &fs, &fe);       /* 密钥类型 */
+        if (fe <= fs)
+            continue;
+        out->keytype.s = (char[:]){ (char *)p + fs, fe - fs };
+        kh_field(p, &i, le, &fs, &fe);       /* base64 */
+        if (fe <= fs)
+            continue;
+        out->blob.s = (char[:]){ (char *)p + fs, fe - fs };
+        {
+            int cs = i, ce = le;
+
+            while (cs < ce && (p[cs] == ' ' || p[cs] == '\t'))
+                cs++;
+            while (ce > cs && (p[ce - 1] == ' ' || p[ce - 1] == '\t'))
+                ce--;
+            out->comment.s = (char[:]){ (char *)p + cs, ce - cs };
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int open(KnownDoc *d, const void *src, int n)
+{
+    int count = 0, hashed = 0;
+    KnownHost kh = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    while (kh_parse(d, &kh) == 1) {
+        count++;
+        if (kh.hashed)
+            hashed++;
+    }
+    d->nentries = count;
+    d->nhashed = hashed;
+    d->off = 0;
+    return count;
+}
+
+int next(KnownDoc *d, KnownHost *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return kh_parse(d, out);
+}
+
+int count(KnownDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int hashed_count(KnownDoc *d)
+{
+    return d ? d->nhashed : 0;
+}
+
+int rewind(KnownDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+/* hosts 字段里是否有某个主机（逗号分隔，大小写不敏感） */
+static int kh_has_host(Str hosts, char[:] want)
+{
+    int i = 0;
+
+    if (want.len <= 0)
+        return 0;
+    while (i < hosts.s.len) {
+        int start = 0, end = 0, k = 0;
+
+        start = i;
+        while (i < hosts.s.len && hosts.s.data[i] != ',')
+            i++;
+        end = i;
+        if (end - start == want.len) {
+            for (k = 0; k < want.len; k++) {
+                if (kh_low(hosts.s.data[start + k]) != kh_low(want.data[k]))
+                    break;
+            }
+            if (k == want.len)
+                return 1;
+        }
+        if (i < hosts.s.len)
+            i++;
+    }
+    return 0;
+}
+
+int match(KnownDoc *d, char[:] host, KnownHost *out)
+{
+    KnownHost kh = { 0 };
+
+    if (!d || !host.data || host.len <= 0 || !out)
+        return -1;
+    rewind(d);
+    while (next(d, &kh) == 1) {
+        if (kh.hashed)
+            continue;
+        if (kh_has_host(kh.hosts, host)) {
+            *out = kh;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "knownhosts：条目与匹配" {
+    static const char *txt =
+        "# comment line\n"
+        "example.com,203.0.113.5 ssh-ed25519 AAAAC3Nza comment here\n"
+        "|1|abcd|efgh ssh-rsa AAAAB3Nza\n"
+        "@cert-authority *.example.net ssh-ed25519 AAAAC3Cert\n"
+        "192.0.2.10 ssh-ed25519 AAAAC3Nza\n";
+    KnownDoc d = { 0 };
+    KnownHost kh = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 4)
+        return err(1, "应该有 4 条（注释不算）");
+    if (d.count() != 4 || d.hashed_count() != 1)
+        return err(2, "统计不对");
+    if (d.next(&kh) != 1 || kh.hashed != 0)
+        return err(3, "第一条不该是哈希");
+    if (kh.hosts.s.len != 23)
+        return err(4, "主机列表长度不对");
+    if (kh.keytype.s.len != 11 || memcmp(kh.keytype.s.data, "ssh-ed25519", 11) != 0)
+        return err(5, "密钥类型不对");
+    if (kh.blob.s.len != 9)
+        return err(6, "base64 长度不对");
+    if (kh.comment.s.len != 12)
+        return err(7, "注释长度不对");
+    if (d.next(&kh) != 1 || kh.hashed != 1)
+        return err(8, "第二条应该是哈希条目");
+    if (d.next(&kh) != 1 || kh.marker.s.len != 15)
+        return err(9, "第三条应该是 @cert-authority");
+    if (kh.hosts.s.len != 13)
+        return err(10, "标记之后的主机列表不对");
+    if (d.next(&kh) != 1 || kh.marker.s.len != 0 || kh.keytype.s.len != 11)
+        return err(11, "第四条是普通条目");
+    if (d.next(&kh) != 0)
+        return err(12, "读完应该返回 0");
+}
+
+test "knownhosts：按主机查" {
+    static const char *txt =
+        "example.com,203.0.113.5 ssh-ed25519 AAAAC3Nza\n"
+        "|1|salt|hash ssh-rsa AAAAB3Nza\n";
+    KnownDoc d = { 0 };
+    KnownHost kh = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 2)
+        return err(13, "应该有 2 条");
+    if (d.match(S("example.com"), &kh) != 1)
+        return err(14, "match(example.com) 失败");
+    if (d.match(S("203.0.113.5"), &kh) != 1)
+        return err(15, "逗号分隔的第二个主机应该能匹配");
+    if (d.match(S("EXAMPLE.COM"), &kh) != 1)
+        return err(16, "匹配应该大小写不敏感");
+    if (d.match(S("nomatch.org"), &kh) != 0)
+        return err(17, "查不到应该 0");
+    if (d.match(S(""), &kh) != -1)
+        return err(18, "空主机名应该 -1");
+    if (d.open("", 0) != -1)
+        return err(19, "空输入应该 -1");
+    /* 只有哈希条目时 match 返回 0 */
+    {
+        static const char *t2 = "|1|a|b ssh-rsa AAAAB3Nza\n";
+        KnownDoc e = { 0 };
+
+        if (e.open(t2, (int)strlen(t2)) != 1 || e.hashed_count() != 1)
+            return err(20, "哈希条目统计不对");
+        if (e.match(S("example.com"), &kh) != 0)
+            return err(21, "哈希条目不该匹配明文主机名");
+    }
+}

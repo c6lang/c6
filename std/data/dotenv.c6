@@ -1,0 +1,333 @@
+/* std/data/dotenv：`.env` 文件解析（`KEY=value`、`export`、引号、注释）。
+ *
+ *     import std.data.dotenv;
+ *
+ *     DotEnv env = { 0 };
+ *     EnvVar v = { 0 };
+ *     env.open(buf, n);              // 游标：open / next / count / find / get
+ *     while (env.next(&v) == 1)
+ *         // v.key / v.value / v.quoted
+ *     env.get("HOME", out, (int)sizeof out);
+ *
+ * 规则（与常见 dotenv 实现一致）：
+ *
+ * - 空行与 `#` 开头的行忽略；`export KEY=value` 的 `export ` 前缀去掉；
+ * - `KEY` 允许字母数字与下划线，`=` 两侧空白被去掉；
+ * - 值两侧**成对**的单引号或双引号会被去掉并置 `quoted`；单引号内不做转义；
+ *   双引号内 `\n`/`\t`/`\"`/`\\` 转义（返回的仍是原缓冲区视图，`\n` 不解码，
+ *   由调用方用 `env_unescape` 处理）；
+ * - 值后面 ` #` 开头的注释被去掉（引号内的不算）；
+ * - 没有 `=` 的行忽略。
+ *
+ * 约定：
+ *
+ * - `env.open(src, n)` 数出变量数并返回，`env.next(&v)` 逐条返回；
+ * - `env.find(key)` 返回 1/0（键名**大小写敏感**）；`env.get(key, dst, cap)` 把值拷成
+ *   C 字符串（找不到返回 -1，容量不够返回 -1）；
+ * - `env_unescape(src, dst, cap)` 解双引号里那几种转义；
+ * - 不做 `${VAR}` 展开（需要的话用 `env.get` 自己拼）。
+ */
+#include <string.h>
+
+module std.data.dotenv;
+import std.core.types;
+import std.text.str;
+
+struct EnvVar {
+    Str key;
+    Str value;
+    int quoted;
+};
+
+struct DotEnv {
+    const char *src;
+    int n;
+    int off;
+    int nvars;
+};
+
+static int de_key_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+           || (c >= '0' && c <= '9') || c == '_' || c == '.';
+}
+
+static int de_parse(DotEnv *d, EnvVar *out)
+{
+    const char *p = d->src;
+
+    while (d->off < d->n) {
+        int start = 0, end = 0, eq = -1, i = 0;
+
+        start = d->off;
+        end = d->off;
+        while (end < d->n && p[end] != '\n')
+            end++;
+        d->off = (end < d->n) ? end + 1 : d->n;
+        if (end > start && p[end - 1] == '\r')
+            end--;                      /* 去掉行尾 \r */
+        /* 行首空白 */
+        while (start < end && (p[start] == ' ' || p[start] == '\t'))
+            start++;
+        if (start >= end)
+            continue;
+        if (p[start] == '#')
+            continue;
+        /* export 前缀 */
+        if (end - start > 7 && memcmp(p + start, "export ", 7) == 0) {
+            start += 7;
+            while (start < end && (p[start] == ' ' || p[start] == '\t'))
+                start++;
+        }
+        for (i = start; i < end; i++) {
+            if (p[i] == '=') {
+                eq = i;
+                break;
+            }
+        }
+        if (eq < 0)
+            continue;
+        {
+            int k_end = eq, v_start = eq + 1, v_end = end, quoted = 0;
+
+            while (k_end > start && (p[k_end - 1] == ' ' || p[k_end - 1] == '\t'))
+                k_end--;
+            if (k_end <= start)
+                continue;
+            for (i = start; i < k_end; i++) {
+                if (!de_key_char(p[i]))
+                    break;
+            }
+            if (i != k_end)
+                continue;
+            while (v_start < v_end && (p[v_start] == ' ' || p[v_start] == '\t'))
+                v_start++;
+            if (v_start < v_end && (p[v_start] == '"' || p[v_start] == '\'')) {
+                char q = p[v_start];
+                int j = v_start + 1;
+
+                while (j < v_end) {
+                    if (p[j] == '\\' && q == '"' && j + 1 < v_end) {
+                        j += 2;
+                        continue;
+                    }
+                    if (p[j] == q)
+                        break;
+                    j++;
+                }
+                if (j < v_end) {
+                    memset(out, 0, sizeof *out);
+                    out->key.s = (char[:]){ (char *)p + start, k_end - start };
+                    out->value.s = (char[:]){ (char *)p + v_start + 1,
+                                              j - v_start - 1 };
+                    out->quoted = 1;
+                    return 1;
+                }
+                quoted = 0;
+                (void)quoted;
+            }
+            /* 无引号：去掉 ` #` 之后的注释与尾部空白 */
+            for (i = v_start; i < v_end; i++) {
+                if (p[i] == '#' && (i == v_start || p[i - 1] == ' '
+                                    || p[i - 1] == '\t')) {
+                    v_end = i;
+                    break;
+                }
+            }
+            while (v_end > v_start && (p[v_end - 1] == ' ' || p[v_end - 1] == '\t'))
+                v_end--;
+            memset(out, 0, sizeof *out);
+            out->key.s = (char[:]){ (char *)p + start, k_end - start };
+            out->value.s = (char[:]){ (char *)p + v_start, v_end - v_start };
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int open(DotEnv *d, const void *src, int n)
+{
+    int count = 0;
+    EnvVar v = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    while (de_parse(d, &v) == 1)
+        count++;
+    d->nvars = count;
+    d->off = 0;
+    return count;
+}
+
+int next(DotEnv *d, EnvVar *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return de_parse(d, out);
+}
+
+int count(DotEnv *d)
+{
+    return d ? d->nvars : 0;
+}
+
+int rewind(DotEnv *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+static int de_key_eq(Str key, char[:] want)
+{
+    if (key.s.len != want.len)
+        return 0;
+    return memcmp(key.s.data, want.data, (size_t)key.s.len) == 0;
+}
+
+int find(DotEnv *d, char[:] key, EnvVar *out)
+{
+    EnvVar v = { 0 };
+
+    if (!d || !key.data || !out)
+        return -1;
+    rewind(d);
+    while (next(d, &v) == 1) {
+        if (de_key_eq(v.key, key)) {
+            *out = v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int get(DotEnv *d, char[:] key, char *dst, int cap)
+{
+    EnvVar v = { 0 };
+    int i = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    if (find(d, key, &v) != 1)
+        return -1;
+    if (v.value.s.len + 1 > cap)
+        return -1;
+    for (i = 0; i < v.value.s.len; i++)
+        dst[i] = v.value.s.data[i];
+    dst[i] = 0;
+    return i;
+}
+
+int env_unescape(char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0;
+
+    if (!src.data || !dst || cap <= 0)
+        return -1;
+    while (i < src.len) {
+        if (src.data[i] == '\\' && i + 1 < src.len) {
+            char c = src.data[i + 1];
+            char out = 0;
+            int have = 1;
+
+            if (c == 'n')
+                out = '\n';
+            else if (c == 't')
+                out = '\t';
+            else if (c == 'r')
+                out = '\r';
+            else if (c == '"' || c == '\\' || c == '\'')
+                out = c;
+            else
+                have = 0;
+            if (have) {
+                if (o >= cap)
+                    return -1;
+                dst[o++] = out;
+                i += 2;
+                continue;
+            }
+        }
+        if (o >= cap)
+            return -1;
+        dst[o++] = src.data[i];
+        i++;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "dotenv：键值与引号" {
+    static const char *txt =
+        "# comment\n"
+        "PLAIN=value\n"
+        "export EXPORTED=two words\n"
+        "QUOTED=\"a b c\"\n"
+        "SINGLE='keep $notexpanded'\n"
+        "TRAILING=hello # trailing comment\n"
+        "  SPACED  =  padded  \n"
+        "\n"
+        "badline\n";
+    DotEnv env = { 0 };
+    EnvVar v = { 0 };
+    char buf[64] = { 0 };
+
+    if (env.open(txt, (int)strlen(txt)) != 6)
+        return err(1, "应该有 6 个变量（注释/空行/坏行不算）");
+    if (env.count() != 6)
+        return err(2, "count() 不对");
+    if (env.next(&v) != 1 || memcmp(v.key.s.data, "PLAIN", 5) != 0
+        || memcmp(v.value.s.data, "value", 5) != 0)
+        return err(3, "第一个变量不对");
+    if (env.get(S("EXPORTED"), buf, (int)sizeof buf) != 9)
+        return err(4, "export 前缀与含空格的值不对");
+    if (memcmp(buf, "two words", 9) != 0)
+        return err(5, "export 值内容不对");
+    if (env.find(S("QUOTED"), &v) != 1 || v.quoted != 1 || v.value.s.len != 5)
+        return err(6, "双引号值不对");
+    if (env.find(S("SINGLE"), &v) != 1 || v.value.s.len != 17)
+        return err(7, "单引号值不对");
+    if (memcmp(v.value.s.data, "keep $notexpanded", 17) != 0)
+        return err(8, "单引号内容不对");
+    if (env.get(S("TRAILING"), buf, (int)sizeof buf) != 5)
+        return err(9, "尾部注释应该被去掉");
+    if (env.get(S("SPACED"), buf, (int)sizeof buf) != 6)
+        return err(10, "两侧空白应该被去掉");
+    if (env.get(S("missing"), buf, (int)sizeof buf) != -1)
+        return err(11, "不存在的键应该 -1");
+}
+
+test "dotenv：转义与边界" {
+    char out[32] = { 0 };
+    DotEnv env = { 0 };
+
+    if (env_unescape(S("a\\nb\\tc"), out, (int)sizeof out) != 5)
+        return err(12, "转义解出长度不对");
+    if (out[0] != 'a' || out[1] != '\n' || out[3] != '\t')
+        return err(13, "转义字符不对");
+    if (env_unescape(S("keep\\q"), out, (int)sizeof out) != 6)
+        return err(14, "未知转义应该原样保留");
+    if (env.get(S("X"), out, (int)sizeof out) != -1)
+        return err(15, "未打开时取值应该 -1");
+    if (env.open("", 0) != -1)
+        return err(16, "空输入应该 -1");
+    env.open("A=1\nA=2\n", 8);
+    {
+        EnvVar v = { 0 };
+
+        env.find(S("A"), &v);
+        if (v.value.s.len != 1 || v.value.s.data[0] != '1')
+            return err(18, "重复键应该返回第一条");
+    }
+    if (env.get(S("A"), out, 1) != -1)
+        return err(19, "容量不够应该 -1");
+}

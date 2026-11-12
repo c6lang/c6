@@ -1,0 +1,121 @@
+/* examples/stdcfg.c6 —— 第七十批（系统配置文件）的集成示例。
+ *
+ *     make std-cfg2
+ *
+ * 四节：`.env`、`/etc/hosts`、`/etc/resolv.conf`、`known_hosts`。
+ * 全部用游标方法（`doc.next`、`doc.get`、`doc.match`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.dotenv;
+import std.data.hosts;
+import std.data.resolvconf;
+import std.data.knownhosts;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_dotenv(void)
+{
+    static const char *txt =
+        "# demo\n"
+        "PORT=8080\n"
+        "export HOST=\"api.example.com\"\n"
+        "DEBUG=true # 注释\n";
+    DotEnv env = { 0 };
+    EnvVar v = { 0 };
+    char buf[64] = { 0 };
+
+    printf("== dotenv\n");
+    check(env.open(txt, (int)strlen(txt)) == 3, "open 3 个变量");
+    while (env.next(&v) == 1)
+        printf("   %.*s=%.*s\n", v.key.s.len, v.key.s.data, v.value.s.len,
+               v.value.s.data);
+    check(env.get(S("PORT"), buf, (int)sizeof buf) == 4, "取 PORT");
+    check(memcmp(buf, "8080", 4) == 0, "PORT 的值");
+    check(env.get(S("HOST"), buf, (int)sizeof buf) == 15, "取 HOST（引号已去掉）");
+    check(env.get(S("DEBUG"), buf, (int)sizeof buf) == 4, "尾部注释已去掉");
+    check(env.count() == 3, "count() 方法");
+}
+
+static void do_hosts(void)
+{
+    static const char *txt =
+        "127.0.0.1 localhost\n"
+        "10.0.0.5 web.internal Web.Alias # 内网\n";
+    HostsDoc doc = { 0 };
+    HostEntry e = { 0 };
+
+    printf("== hosts\n");
+    check(doc.open(txt, (int)strlen(txt)) == 2, "open 2 条");
+    while (doc.next(&e) == 1)
+        printf("   %.*s → %.*s\n", e.addr.s.len, e.addr.s.data, e.name.s.len,
+               e.name.s.data);
+    check(doc.lookup(S("web.alias"), &e) == 1, "别名查找（大小写不敏感）");
+    check(e.addr.s.len == 8, "命中的地址长度");
+    check(doc.lookup(S("nothing"), &e) == 0, "查不到返回 0");
+}
+
+static void do_resolv(void)
+{
+    static const char *txt =
+        "nameserver 1.1.1.1\n"
+        "nameserver 8.8.8.8 # 备用\n"
+        "search example.com\n";
+    ResolvDoc doc = { 0 };
+    ResolvEntry e = { 0 };
+    char ns[32] = { 0 };
+
+    printf("== resolv.conf\n");
+    check(doc.open(txt, (int)strlen(txt)) == 3, "open 3 条");
+    while (doc.next(&e) == 1)
+        printf("   %-11s %.*s\n", kind_name(e.kind), e.value.s.len, e.value.s.data);
+    check(doc.nameservers() == 2, "两个 nameserver");
+    check(doc.first_nameserver(ns, (int)sizeof ns) == 7
+          && memcmp(ns, "1.1.1.1", 7) == 0, "第一个 nameserver");
+    check(doc.search_list() == 1, "一个 search");
+}
+
+static void do_known(void)
+{
+    static const char *txt =
+        "example.com,203.0.113.5 ssh-ed25519 AAAAC3Nza note\n"
+        "|1|salt|hash ssh-rsa AAAAB3Nza\n";
+    KnownDoc doc = { 0 };
+    KnownHost kh = { 0 };
+
+    printf("== known_hosts\n");
+    check(doc.open(txt, (int)strlen(txt)) == 2, "open 2 条");
+    while (doc.next(&kh) == 1)
+        printf("   %s %.*s %.*s\n", kh.hashed ? "(hashed)" : "plain  ",
+               kh.keytype.s.len, kh.keytype.s.data, kh.blob.s.len, kh.blob.s.data);
+    check(doc.hashed_count() == 1, "一条哈希条目");
+    check(doc.match(S("203.0.113.5"), &kh) == 1, "按 IP 匹配");
+    check(doc.match(S("EXAMPLE.COM"), &kh) == 1, "大小写不敏感匹配");
+    check(doc.match(S("other.org"), &kh) == 0, "未命中");
+    check(kh.keytype.s.len == 0 || kh.keytype.s.len == 11, "密钥类型字段");
+}
+
+int main(void)
+{
+    do_dotenv();
+    do_hosts();
+    do_resolv();
+    do_known();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

@@ -1,0 +1,243 @@
+/* std/data/hosts：`/etc/hosts` 解析（IP + 多个主机名 + 注释）。
+ *
+ *     import std.data.hosts;
+ *
+ *     HostsDoc doc = { 0 };
+ *     HostEntry e = { 0 };
+ *     doc.open(buf, n);              // 游标：open / next / count / lookup / rewind
+ *     while (doc.next(&e) == 1)
+ *         // e.addr / e.name（第一个主机名）/ e.names（全部，空格分隔）
+ *     doc.lookup("localhost", &e);   // 按主机名查（大小写不敏感）
+ *
+ * 行格式：`<地址> <主机名> [别名…] [# 注释]`；`#` 起到行尾是注释，空行忽略。
+ *
+ * 约定：
+ *
+ * - `doc.open(src, n)` 数出条目数并返回；`doc.next(&e)` 逐条返回；
+ * - `e.addr` 是地址视图（IPv4/IPv6 字符串，不做校验与解析）；
+ *   `e.name` 是第一个主机名，`e.names` 是第一个主机名到行尾（含别名）；
+ * - `doc.lookup(name, &e)` 大小写不敏感地在**所有**主机名/别名里找，返回第一条；
+ * - `doc.count()`/`doc.rewind()` 常规游标；
+ * - 只解析格式，不做 DNS 回退。
+ */
+#include <string.h>
+
+module std.data.hosts;
+import std.core.types;
+import std.text.str;
+
+struct HostEntry {
+    Str addr;
+    Str name;
+    Str names;
+};
+
+struct HostsDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+};
+
+static char hs_low(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    return c;
+}
+
+static int hs_parse(HostsDoc *d, HostEntry *out)
+{
+    const char *p = d->src;
+
+    while (d->off < d->n) {
+        int ls = d->off, le = d->off, i = 0, a_start = 0, a_end = 0;
+        int n_start = 0, n_end = 0;
+
+        while (le < d->n && p[le] != '\n')
+            le++;
+        d->off = (le < d->n) ? le + 1 : d->n;
+        if (le > ls && p[le - 1] == '\r')
+            le--;
+        /* 去注释 */
+        for (i = ls; i < le; i++) {
+            if (p[i] == '#') {
+                le = i;
+                break;
+            }
+        }
+        while (ls < le && (p[ls] == ' ' || p[ls] == '\t'))
+            ls++;
+        while (le > ls && (p[le - 1] == ' ' || p[le - 1] == '\t'))
+            le--;
+        if (ls >= le)
+            continue;
+        a_start = ls;
+        while (a_start < le && p[a_start] != ' ' && p[a_start] != '\t')
+            a_start++;
+        a_end = a_start;
+        while (a_start < le && (p[a_start] == ' ' || p[a_start] == '\t'))
+            a_start++;
+        if (a_start >= le)
+            continue;                   /* 只有地址没有主机名 */
+        n_start = a_start;
+        n_end = le;
+        {
+            int first_end = n_start;
+
+            while (first_end < le && p[first_end] != ' ' && p[first_end] != '\t')
+                first_end++;
+            memset(out, 0, sizeof *out);
+            out->addr.s = (char[:]){ (char *)p + ls, a_end - ls };
+            out->name.s = (char[:]){ (char *)p + n_start, first_end - n_start };
+            out->names.s = (char[:]){ (char *)p + n_start, n_end - n_start };
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int open(HostsDoc *d, const void *src, int n)
+{
+    int count = 0;
+    HostEntry e = { 0 };
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    while (hs_parse(d, &e) == 1)
+        count++;
+    d->nentries = count;
+    d->off = 0;
+    return count;
+}
+
+int next(HostsDoc *d, HostEntry *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return hs_parse(d, out);
+}
+
+int count(HostsDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int rewind(HostsDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+/* 在 names 里找一个词（大小写不敏感） */
+static int hs_has_name(Str names, char[:] want)
+{
+    int i = 0;
+
+    if (want.len <= 0)
+        return 0;
+    while (i < names.s.len) {
+        int start = 0, end = 0, k = 0;
+
+        while (i < names.s.len && (names.s.data[i] == ' '
+                                   || names.s.data[i] == '\t'))
+            i++;
+        start = i;
+        while (i < names.s.len && names.s.data[i] != ' '
+               && names.s.data[i] != '\t')
+            i++;
+        end = i;
+        if (end - start != want.len)
+            continue;
+        for (k = 0; k < want.len; k++) {
+            if (hs_low(names.s.data[start + k]) != hs_low(want.data[k]))
+                break;
+        }
+        if (k == want.len)
+            return 1;
+    }
+    return 0;
+}
+
+int lookup(HostsDoc *d, char[:] name, HostEntry *out)
+{
+    HostEntry e = { 0 };
+
+    if (!d || !name.data || !out)
+        return -1;
+    rewind(d);
+    while (next(d, &e) == 1) {
+        if (hs_has_name(e.names, name)) {
+            *out = e;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "hosts：条目与查找" {
+    static const char *txt =
+        "# loopback\n"
+        "127.0.0.1\tlocalhost localhost.localdomain\n"
+        "\n"
+        "::1             ip6-localhost ip6-loopback\n"
+        "10.0.0.5  web.internal  Web.Alias   # 内网\n";
+    HostsDoc d = { 0 };
+    HostEntry e = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 3)
+        return err(1, "应该有 3 条（注释与空行不算）");
+    if (d.count() != 3)
+        return err(2, "count() 不对");
+    if (d.next(&e) != 1 || e.addr.s.len != 9)
+        return err(3, "第一条地址长度不对");
+    if (e.name.s.len != 9 || memcmp(e.name.s.data, "localhost", 9) != 0)
+        return err(4, "第一个主机名不对");
+    if (e.names.s.len != 31)
+        return err(5, "names 应该包含别名（31 字节）");
+    if (d.next(&e) != 1 || e.addr.s.len != 3)
+        return err(6, "IPv6 条目地址不对");
+    if (e.name.s.len != 13 || memcmp(e.name.s.data, "ip6-localhost", 13) != 0)
+        return err(7, "IPv6 主机名不对");
+    if (d.next(&e) != 1 || e.addr.s.len != 8)
+        return err(8, "第三条地址不对");
+    if (e.names.s.len != 23)
+        return err(9, "注释之前的别名应该都算进去");
+    if (d.next(&e) != 0)
+        return err(10, "读完应该返回 0");
+}
+
+test "hosts：按名字查" {
+    static const char *txt =
+        "127.0.0.1 localhost\n"
+        "10.0.0.5 web.internal Web.Alias\n";
+    HostsDoc d = { 0 };
+    HostEntry e = { 0 };
+
+    if (d.open(txt, (int)strlen(txt)) != 2)
+        return err(11, "应该有 2 条");
+    if (d.lookup(S("localhost"), &e) != 1 || e.addr.s.len != 9)
+        return err(12, "查 localhost 失败");
+    if (d.lookup(S("WEB.ALIAS"), &e) != 1)
+        return err(13, "别名查找应该大小写不敏感");
+    if (e.addr.s.len != 8 || memcmp(e.addr.s.data, "10.0.0.5", 8) != 0)
+        return err(14, "别名命中的地址不对");
+    if (d.lookup(S("nomatch"), &e) != 0)
+        return err(15, "查不到应该 0");
+    if (d.lookup(S("localhost.localdomain"), &e) != 0)
+        return err(16, "不该匹配到别的条目");
+    if (d.open("", 0) != -1)
+        return err(17, "空输入应该 -1");
+    /* 只有地址的行被跳过 */
+    if (d.open("192.168.0.1\n\n192.168.0.2 host2\n", 32) != 1)
+        return err(18, "只有地址的行应该被跳过");
+}
