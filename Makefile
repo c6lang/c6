@@ -7,7 +7,7 @@
 #   make test        跑 tests2 上游全量测试（扩展模式）
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量 + c6selfcheck + freestanding/裸机
-#   make check-all   test-all + C99 后端用例 + 三条自举路线（发布前跑这一条）
+#   make check-all   test-all + C99 后端用例 + 三条自举路线 + 标准库（发布前跑这一条）
 #   make c99         C99 输出后端已内置在 tcc/c6（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
 #   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
@@ -296,7 +296,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box fs
 # 完整验收：test-all 之外还有 C99 后端的两套用例（96 组各跑一遍）和三条
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
-check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc
+#
+# 标准库的五个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下 29 个模块逐个跑
+# test 块，std-demo/tour/kit/box 是四批模块拼出来的集成示例。以后 test-all
+# 增删标准库目标，也不会悄悄改变 check-all 的语义。
+check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
+           stdtest std-demo std-tour std-kit std-box
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -436,7 +442,8 @@ distclean:
 #   selftest         tests/ 下全部 c6 自测（test 块 + 编译期诊断）
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
-#   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举）
+#   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
+#                    + 标准库的 stdtest/std-demo/std-tour/std-kit/std-box）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
