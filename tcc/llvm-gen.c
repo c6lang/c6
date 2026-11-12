@@ -3062,6 +3062,9 @@ static void l_subst(LBuf *dst, const char *src, int len)
     }
 }
 
+/* 短于此长度的零段仍写进字符串里：切分太碎反而让 IR 更难读 */
+#define L_ZRUN_MIN 32
+
 static int l_all_zero(const unsigned char *p, int n)
 {
     int i;
@@ -3291,15 +3294,108 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
                        "zeroinitializer, align 16\n", i, size);
             continue;
         }
-        fprintf(f, "@__llvm_d%d = internal global [%d x i8] c\"", i, size);
-        for (j = 0; j < size; j++) {
-            unsigned char c = j < (int)s->data_offset ? s->data[j] : 0;
-            if (c >= 32 && c < 127 && c != '"' && c != '\\')
-                fputc(c, f);
-            else
-                fprintf(f, "\\%02X", c);
+        /* Long all-zero stretches are emitted as separate zeroinitializer
+           members: a single c"..." string for a mostly-zero section is both
+           huge (a 1 MiB zero array costs ~1 MiB of \\00 escapes) and slow to
+           assemble.  The members sit in one anonymous struct so the section
+           stays a single contiguous object that is still addressable by byte
+           offset (see l_symref / l_shndx_addr). */
+        {
+            struct { int off, len, zero; } *runs = NULL;
+            int nrun = 0, rcap = 0, pos = 0, split = 0;
+
+#define L_ZB(k) ((k) >= (int)s->data_offset || s->data[k] == 0)
+#define L_PUSH(o, l, z)                                                   \
+            do {                                                          \
+                if (nrun == rcap) {                                       \
+                    rcap = rcap ? rcap * 2 : 16;                          \
+                    runs = tcc_realloc(runs, rcap * sizeof *runs);        \
+                }                                                         \
+                runs[nrun].off = (o);                                     \
+                runs[nrun].len = (l);                                     \
+                runs[nrun].zero = (z);                                    \
+                nrun++;                                                   \
+            } while (0)
+
+            while (pos < size) {
+                int z = 0;
+
+                if (L_ZB(pos)) {
+                    while (pos + z < size && L_ZB(pos + z))
+                        z++;
+                    if (z >= L_ZRUN_MIN) {
+                        L_PUSH(pos, z, 1);
+                        pos += z;
+                        continue;
+                    }
+                }
+                {
+                    int start = pos;
+
+                    while (pos < size) {
+                        int zz = 0;
+
+                        if (L_ZB(pos)) {
+                            while (pos + zz < size && L_ZB(pos + zz))
+                                zz++;
+                            if (zz >= L_ZRUN_MIN)
+                                break;
+                            pos += zz;
+                        } else {
+                            pos++;
+                        }
+                    }
+                    L_PUSH(start, pos - start, 0);
+                }
+            }
+            for (j = 0; j < nrun; j++)
+                if (runs[j].zero)
+                    split = 1;
+
+            if (!split) {
+                /* no long zero stretch: keep the single-array form */
+                fprintf(f, "@__llvm_d%d = internal global [%d x i8] c\"", i,
+                        size);
+                for (j = 0; j < size; j++) {
+                    unsigned char c = L_ZB(j) ? 0 : s->data[j];
+
+                    if (c >= 32 && c < 127 && c != '"' && c != '\\')
+                        fputc(c, f);
+                    else
+                        fprintf(f, "\\%02X", c);
+                }
+                fprintf(f, "\", align 16\n");
+            } else {
+                fprintf(f, "@__llvm_d%d = internal global { ", i);
+                for (j = 0; j < nrun; j++)
+                    fprintf(f, "%s[%d x i8]", j ? ", " : "", runs[j].len);
+                fprintf(f, " } { ");
+                for (j = 0; j < nrun; j++) {
+                    int k;
+
+                    if (j)
+                        fprintf(f, ", ");
+                    if (runs[j].zero) {
+                        fprintf(f, "[%d x i8] zeroinitializer", runs[j].len);
+                        continue;
+                    }
+                    fprintf(f, "[%d x i8] c\"", runs[j].len);
+                    for (k = 0; k < runs[j].len; k++) {
+                        unsigned char c = s->data[runs[j].off + k];
+
+                        if (c >= 32 && c < 127 && c != '"' && c != '\\')
+                            fputc(c, f);
+                        else
+                            fprintf(f, "\\%02X", c);
+                    }
+                    fprintf(f, "\"");
+                }
+                fprintf(f, " }, align 16\n");
+            }
+            tcc_free(runs);
+#undef L_ZB
+#undef L_PUSH
         }
-        fprintf(f, "\", align 16\n");
     }
 
     /* the globals other translation units can see keep their linker name */
@@ -3326,11 +3422,10 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
         sec = s1->sections[e->st_shndx];
         size = e->st_size > 0 ? e->st_size : 1;
         fprintf(f, "@%s = %salias [%lld x i8], ptr getelementptr inbounds "
-                   "([%d x i8], ptr @__llvm_d%d, i64 0, i64 %lld)\n",
+                   "(i8, ptr @__llvm_d%d, i64 %lld)\n",
                 l_q(l_esym_name(i)),
                 ELFW(ST_BIND)(e->st_info) == STB_WEAK ? "weak " : "",
-                size, (int)(sec->data_offset ? sec->data_offset : 1),
-                (int)e->st_shndx, (long long)e->st_value);
+                size, (int)e->st_shndx, (long long)e->st_value);
     }
 
     /* c6 methods are reachable under their plain name: the front-end records
