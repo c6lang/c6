@@ -47,6 +47,20 @@
 
 ### 标准库
 
+- **标准库第二十批（终端与进程控制）**：`std.os.tty` / `std.os.signal` /
+  `std.os.pipe` / `std.os.poll` 四个模块，集成示例 `examples/stdterm.c6`
+  （`make std-term`）。tty 是 termios 薄封装（`is_tty`、`size`/`width`/`height`、
+  `TtyMode` 的 `raw`/`restore`/`is_active`，失败不动输出参数）；signal 包
+  `sigaction`/`sigprocmask`/`raise`/`kill`（`install` 带 `SA_RESTART`、`ignore`/
+  `reset`、`block`/`unblock`/`is_blocked`/`is_pending`、`send_self`/`send_to`、
+  `signal_name`/`signal_number`，名字统一成动词以避开 libc 同名函数）；pipe 是
+  匿名管道的 `Pipe`（`init`/`init_nonblock`、`read_bytes` 的 0=EOF、`read_exact`、
+  `write_bytes` 返回实际字节数、`close_read`/`close_write`/`close_all`、
+  `would_block()`，读写都重试 `EINTR`、fd 带 `FD_CLOEXEC`）；poll 把 `poll(2)`
+  包成 32 槽零分配的 `PollSet`（`add` 同 fd 改事件、`wait` 返回就绪个数、
+  `is_ready`/`ready`/`fd_at`）与单 fd 的 `wait_readable`/`wait_writable`。
+  错误号段 `std.os.tty`=0x6059 … `std.os.poll`=0x605c（`c6_err_std_slots[]` 追加）。
+
 - **标准库第十九批（并发与同步）**：`std.core.atomic` / `std.os.sync` /
   `std.os.thread` / `std.container.chan` 四个模块，集成示例
   `examples/stdthread.c6`（`make std-thread`）。atomic 是 `Atomic`/`Atomic32`
