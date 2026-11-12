@@ -1,0 +1,129 @@
+/* examples/stdtextan.c6 —— 第六十九批（文本分析）的集成示例。
+ *
+ *     make std-textan
+ *
+ * 四节：切词、切句、字符 n-gram、可读性统计。都用**游标方法**（`doc.next`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.words;
+import std.text.sentences;
+import std.text.ngram;
+import std.text.readability;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_words(void)
+{
+    static const char *txt = "The quick brown fox jumps over the lazy dog.";
+    WordDoc d = { 0 };
+    Word w = { 0 };
+    int n = 0;
+
+    printf("== words\n");
+    check(d.open((char[:]){ (char *)txt, (int)strlen(txt) }, 1) == 9,
+          "open 9 个词");
+    while (d.next(&w) == 1) {
+        if (n < 4)
+            printf("   %.*s ", w.len, w.text.s.data);
+        n++;
+    }
+    printf("…（共 %d 个）\n", n);
+    check(n == 9, "遍历 9 个词");
+    check(word_count((char[:]){ (char *)txt, (int)strlen(txt) }) == 9,
+          "word_count 方法");
+    check(average_len((char[:]){ (char *)txt, (int)strlen(txt) }) == 3,
+          "平均词长 3");
+    d.rewind();
+    d.next(&w);
+    check(word_eq(&w, "the") == 1, "首词（忽略大小写）是 the");
+}
+
+static void do_sentences(void)
+{
+    static const char *txt = "First one. Second! Third?";
+    SentDoc d = { 0 };
+    Sent s = { 0 };
+    int n = 0;
+
+    printf("== sentences\n");
+    check(d.open((char[:]){ (char *)txt, (int)strlen(txt) }) == 3, "open 3 句");
+    while (d.next(&s) == 1) {
+        printf("   [%.*s] ", s.len, s.text.s.data);
+        n++;
+    }
+    printf("\n");
+    check(n == 3, "遍历 3 句");
+    check(sentence_count((char[:]){ (char *)txt, (int)strlen(txt) }) == 3,
+          "sentence_count");
+    d.rewind();
+    d.next(&s);
+    check(s.start == 0 && s.len == 10, "第一句的范围");
+}
+
+static void do_ngram(void)
+{
+    static char buf[16 * 3] = { 0 };
+    Ngram g = { 0 };
+    Str out = { (char[:]){ 0, 0 } };
+
+    printf("== ngram\n");
+    check(g.init(buf, 16, 3) == 16, "init 16 个槽位、gram 长 3");
+    check(g.add(S("banana")) == 4, "banana 有 4 个三元组");
+    g.at(0, &out);
+    printf("   首个 %.*s，不同 gram %d 个，\"ana\" 出现 %d 次\n", out.s.len,
+           out.s.data, g.unique(), g.freq(S("ana"), 0));
+    check(g.count() == 4, "count 4");
+    check(memcmp(out.s.data, "ban", 3) == 0, "首个三元组是 ban");
+    check(g.freq(S("ana"), 0) == 2, "ana 出现 2 次");
+    check(g.unique() == 3, "不同 gram 3 个（ban/ana/nan）");
+    check(g.clear() == 1 && g.count() == 0, "clear");
+}
+
+static void do_readability(void)
+{
+    ReadStats easy = { 0 };
+    ReadStats hard = { 0 };
+
+    printf("== readability\n");
+    check(easy.analyze(S("The cat sat on the mat. It was happy.")) == 9,
+          "analyze 9 个词");
+    printf("   简单句：%d 词 %d 句 %d 音节，Flesch %.1f，年级 %d\n",
+           easy.words(), easy.sentences(), easy.syllables(), easy.flesch(),
+           easy.grade());
+    check(easy.flesch() > 80.0, "简单句 Flesch > 80");
+    check(easy.grade() <= 6, "简单句年级 <= 6");
+    hard.analyze(S("Notwithstanding the aforementioned considerations, "
+                   "implementation methodologies necessitate comprehensive "
+                   "reassessment."));
+    printf("   长词句：Flesch %.1f，年级 %d，长词 %d 个\n", hard.flesch(),
+           hard.grade(), hard.complex_words());
+    check(hard.flesch() < easy.flesch(), "长词句更难读");
+    check(hard.complex_words() >= 3, "至少 3 个长词");
+    check(syllables_word(S("beautiful")) == 3, "beautiful 3 个音节");
+}
+
+int main(void)
+{
+    do_words();
+    do_sentences();
+    do_ngram();
+    do_readability();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

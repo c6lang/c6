@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第六十九批（文本分析）**：`std.text.words`（切词游标）、
+  `std.text.sentences`（切句游标）、`std.text.ngram`（字符 n-gram 池）、
+  `std.text.readability`（音节估计 + Flesch 指数与年级），集成示例
+  `examples/stdtextan.c6`（`make std-textan`）。错误号段 `std.text.words`=0x611d …
+  `std.text.readability`=0x6120（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十八批（轻量标记语言）**：`std.text.rst`（reST 标题/指令/列表）、
   `std.text.org`（Org 标题层级/TODO/标签/链接）、`std.text.tex`（LaTeX 章节/环境/
   转义）、`std.text.pod`（POD 段落与格式化码剥离），集成示例

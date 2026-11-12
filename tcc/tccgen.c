@@ -12990,6 +12990,10 @@ static const struct C6ErrStdSlot {
     { "std.text.org",           C6_ERR_SLOT_STD + 282 },
     { "std.text.tex",           C6_ERR_SLOT_STD + 283 },
     { "std.text.pod",           C6_ERR_SLOT_STD + 284 },
+    { "std.text.words",         C6_ERR_SLOT_STD + 285 },
+    { "std.text.sentences",     C6_ERR_SLOT_STD + 286 },
+    { "std.text.ngram",         C6_ERR_SLOT_STD + 287 },
+    { "std.text.readability",   C6_ERR_SLOT_STD + 288 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

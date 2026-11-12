@@ -1,0 +1,215 @@
+/* std/text/sentences：按标点切句（`.`/`!`/`?` 加空白或结尾，以及换行）。
+ *
+ *     import std.text.sentences;
+ *
+ *     SentDoc doc = { 0 };
+ *     Sent s = { 0 };
+ *     doc.open(S("One. Two! Three?"));    // 方法：open / next / count / rewind
+ *     while (doc.next(&s) == 1)
+ *         // s.text / s.start / s.len
+ *
+ * 规则（刻意保持简单、可预测）：
+ *
+ * - 句子在 `.`/`!`/`?` 之后结束，条件是后面是空白或文本结尾；
+ * - 换行也结束句子（列表、标题常常不带句号）；
+ * - 连续的标点（`?!`、`...`）并到同一句尾；
+ * - 句首空白被跳过，句内空白保留（含换行）；
+ * - **不处理缩写**（`Dr. Smith` 会切成两句）——需要时请先替换缩写。
+ *
+ * 约定：
+ *
+ * - `doc.open(text)` 数出句子并返回；`doc.next(&s)` 逐条返回；
+ * - `s.text` 是句子视图（不含首尾空白），`s.start` 是原文偏移；
+ * - `doc.count()`/`doc.rewind()` 常规游标；
+ * - `sentence_count(text)` 是便捷计数。
+ */
+#include <string.h>
+
+module std.text.sentences;
+import std.core.types;
+import std.text.str;
+
+struct Sent {
+    Str text;
+    int start;
+    int len;
+};
+
+struct SentDoc {
+    const char *src;
+    int n;
+    int off;
+    int nsent;
+};
+
+static int se_end_punct(char c)
+{
+    return c == '.' || c == '!' || c == '?';
+}
+
+static int se_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static int se_parse(SentDoc *d, Sent *out)
+{
+    const char *p = d->src;
+
+    while (d->off < d->n) {
+        int start = d->off, end = 0, i = 0;
+
+        while (start < d->n && se_space(p[start]))
+            start++;
+        if (start >= d->n) {
+            d->off = d->n;
+            return 0;
+        }
+        i = start;
+        end = 0;
+        while (i < d->n) {
+            if (se_end_punct(p[i])) {
+                /* 吃掉连续标点 */
+                while (i < d->n && se_end_punct(p[i]))
+                    i++;
+                end = i;
+                /* 后面必须是空白或结尾 */
+                if (i >= d->n || se_space(p[i]))
+                    break;
+                continue;
+            }
+            if (p[i] == '\n') {
+                end = i;
+                break;
+            }
+            i++;
+        }
+        if (end == 0)
+            end = d->n;
+        {
+            int e = end;
+
+            while (e > start && se_space(p[e - 1]))
+                e--;
+            if (e <= start) {
+                d->off = (end < d->n) ? end + 1 : d->n;
+                continue;
+            }
+            d->off = end;
+            while (d->off < d->n && !se_end_punct(p[d->off])
+                   && p[d->off] != '\n')
+                d->off++;
+            memset(out, 0, sizeof *out);
+            out->text.s = (char[:]){ (char *)p + start, e - start };
+            out->start = start;
+            out->len = e - start;
+            /* 让游标跳过句子分隔符与空白 */
+            {
+                int k = end;
+
+                while (k < d->n && (se_space(p[k]) || se_end_punct(p[k])))
+                    k++;
+                d->off = k;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int open(SentDoc *d, char[:] text)
+{
+    int count = 0;
+    Sent s = { 0 };
+
+    if (!d || (!text.data && text.len > 0) || text.len < 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = text.data;
+    d->n = text.len;
+    while (se_parse(d, &s) == 1)
+        count++;
+    d->nsent = count;
+    d->off = 0;
+    return count;
+}
+
+int next(SentDoc *d, Sent *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return se_parse(d, out);
+}
+
+int count(SentDoc *d)
+{
+    return d ? d->nsent : 0;
+}
+
+int rewind(SentDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int sentence_count(char[:] text)
+{
+    SentDoc d = { 0 };
+
+    if (open(&d, text) < 0)
+        return 0;
+    return d.count();
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "sentences：按标点切句" {
+    SentDoc d = { 0 };
+    Sent s = { 0 };
+
+    if (d.open(S("One. Two! Three?")) != 3)
+        return err(1, "应该切成 3 句");
+    if (d.next(&s) != 1 || s.len != 4 || memcmp(s.text.s.data, "One.", 4) != 0)
+        return err(2, "第一句不对");
+    if (s.start != 0)
+        return err(3, "第一句偏移应该是 0");
+    if (d.next(&s) != 1 || memcmp(s.text.s.data, "Two!", 4) != 0)
+        return err(4, "第二句不对");
+    if (d.next(&s) != 1 || memcmp(s.text.s.data, "Three?", 6) != 0)
+        return err(5, "第三句不对");
+    if (d.next(&s) != 0)
+        return err(6, "读完应该返回 0");
+    if (d.count() != 3 || sentence_count(S("a. b.")) != 2)
+        return err(7, "count/sentence_count 不对");
+}
+
+test "sentences：换行、连续标点与缩写" {
+    SentDoc d = { 0 };
+    Sent s = { 0 };
+
+    if (d.open(S("Title\nBody text. More?!")) != 3)
+        return err(8, "换行也断句，应该有 3 句");
+    if (d.next(&s) != 1 || memcmp(s.text.s.data, "Title", 5) != 0)
+        return err(9, "第一句（标题）不对");
+    if (d.next(&s) != 1 || memcmp(s.text.s.data, "Body text.", 10) != 0)
+        return err(10, "第二句不对");
+    if (d.next(&s) != 1 || memcmp(s.text.s.data, "More?!", 6) != 0)
+        return err(11, "连续标点应该并在一句");
+    /* 缩写会被切开（文档写明） */
+    if (d.open(S("Dr. Smith arrived.")) != 2)
+        return err(12, "缩写按规则会被切开，应该是 2 句");
+    /* 句首空白跳过 */
+    if (d.open(S("   Leading.  Trailing.   ")) != 2)
+        return err(13, "句首空白应该跳过");
+    d.next(&s);
+    if (s.start != 3 || s.len != 8)
+        return err(14, "跳过空白后的偏移不对");
+    if (d.open(S("")) != 0 || sentence_count(S("   ")) != 0)
+        return err(15, "空文本应该 0 句");
+    if (d.open(S("no terminator")) != 1)
+        return err(16, "没有句末标点也算一句");
+}

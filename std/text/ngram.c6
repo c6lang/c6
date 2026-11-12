@@ -1,0 +1,212 @@
+/* std/text/ngram：字符 n-gram 抽取（固定容量池 + 频次统计）。
+ *
+ *     import std.text.ngram;
+ *
+ *     char buf[64 * 3] = { 0 };
+ *     Ngram g = { 0 };
+ *     Str out = { (char[:]){ 0, 0 } };
+ *     g.init(buf, 64, 3);              // 方法：init / add / at / count / freq
+ *     g.add(S("hello"));
+ *     g.count();                       // 3（hel/ell/llo）
+ *     g.at(0, &out);                   // "hel"
+ *     g.freq(S("ell"), 0);             // 1
+ *
+ * `Ngram` 把每个 gram 的**副本**拷进调用方给的缓冲区（`cap` 个槽位、每个 `n` 字节），
+ * 所以 `at()` 返回的是稳定视图。
+ *
+ * 约定：
+ *
+ * - `g.init(buf, cap, n)` 设定池大小与 gram 长度（`n` 取 1..16，`cap > 0`）；
+ * - `g.add(text)` 抽取 `text` 的**所有**连续 n-gram（含重叠），池满时停止并返回已存数量；
+ *   返回本次新增的条数；
+ * - `g.at(i, &out)` 取第 i 个 gram（按抽取顺序），越界返回 0；
+ * - `g.freq(gram, fold)` 数某个 gram 在池里出现几次，`fold=1` 忽略大小写；
+ * - `g.count()` 是已存条数，`g.resize(...)` 不提供（池固定）；
+ * - `g.unique()` 数不同的 gram 个数（O(n²) 比较，池小的时候够用）。
+ */
+#include <string.h>
+
+module std.text.ngram;
+import std.core.types;
+import std.text.str;
+
+struct Ngram {
+    char *buf;
+    int cap;
+    int n;
+    int used;
+};
+
+static char ng_low(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    return c;
+}
+
+int init(Ngram *g, char *buf, int cap, int n)
+{
+    if (!g || !buf || cap <= 0 || n <= 0 || n > 16)
+        return -1;
+    memset(buf, 0, (size_t)(cap * n));
+    g->buf = buf;
+    g->cap = cap;
+    g->n = n;
+    g->used = 0;
+    return cap;
+}
+
+int gram_len(Ngram *g)
+{
+    return g ? g->n : 0;
+}
+
+int capacity(Ngram *g)
+{
+    return g ? g->cap : 0;
+}
+
+int count(Ngram *g)
+{
+    return g ? g->used : 0;
+}
+
+int add(Ngram *g, char[:] text)
+{
+    int i = 0, added = 0;
+
+    if (!g || !g->buf || !text.data)
+        return -1;
+    for (i = 0; i + g->n <= text.len; i++) {
+        if (g->used >= g->cap)
+            break;
+        memcpy(g->buf + (size_t)g->used * (size_t)g->n, text.data + i,
+               (size_t)g->n);
+        g->used++;
+        added++;
+    }
+    return added;
+}
+
+int at(Ngram *g, int i, Str *out)
+{
+    if (!g || !g->buf || !out || i < 0 || i >= g->used)
+        return 0;
+    out->s = (char[:]){ g->buf + (size_t)i * (size_t)g->n, g->n };
+    return 1;
+}
+
+static int ng_eq(const char *a, char[:] b, int n, int fold)
+{
+    int i = 0;
+
+    if (!b.data || b.len != n)
+        return 0;
+    for (i = 0; i < n; i++) {
+        if (fold ? (ng_low(a[i]) != ng_low(b.data[i])) : (a[i] != b.data[i]))
+            return 0;
+    }
+    return 1;
+}
+
+int freq(Ngram *g, char[:] gram, int fold)
+{
+    int i = 0, n = 0;
+
+    if (!g || !g->buf)
+        return -1;
+    for (i = 0; i < g->used; i++) {
+        if (ng_eq(g->buf + (size_t)i * (size_t)g->n, gram, g->n, fold))
+            n++;
+    }
+    return n;
+}
+
+int unique(Ngram *g)
+{
+    int i = 0, j = 0, n = 0;
+
+    if (!g || !g->buf)
+        return 0;
+    for (i = 0; i < g->used; i++) {
+        int dup = 0;
+
+        for (j = 0; j < i; j++) {
+            if (ng_eq(g->buf + (size_t)j * (size_t)g->n,
+                      (char[:]){ g->buf + (size_t)i * (size_t)g->n, g->n },
+                      g->n, 0)) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup)
+            n++;
+    }
+    return n;
+}
+
+int clear(Ngram *g)
+{
+    if (!g || !g->buf)
+        return -1;
+    memset(g->buf, 0, (size_t)(g->cap * g->n));
+    g->used = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "ngram：抽取与频次" {
+    static char buf[16 * 3] = { 0 };
+    Ngram g = { 0 };
+    Str out = { (char[:]){ 0, 0 } };
+
+    if (g.init(buf, 16, 3) != 16)
+        return err(1, "init 失败");
+    if (g.gram_len() != 3 || g.capacity() != 16)
+        return err(2, "gram 长度或容量不对");
+    if (g.add(S("hello")) != 3)
+        return err(3, "hello 应该有 3 个三元组");
+    if (g.count() != 3)
+        return err(4, "count() 不对");
+    if (g.at(0, &out) != 1 || out.s.len != 3
+        || memcmp(out.s.data, "hel", 3) != 0)
+        return err(5, "第一个 gram 应该是 hel");
+    if (g.at(2, &out) != 1 || memcmp(out.s.data, "llo", 3) != 0)
+        return err(6, "第三个 gram 应该是 llo");
+    if (g.at(3, &out) != 0)
+        return err(7, "越界 at 应该返回 0");
+    if (g.freq(S("ell"), 0) != 1 || g.freq(S("zzz"), 0) != 0)
+        return err(8, "freq 不对");
+    if (g.freq(S("ELL"), 0) != 0 || g.freq(S("ELL"), 1) != 1)
+        return err(9, "freq 的大小写开关不对");
+    if (g.unique() != 3)
+        return err(10, "hello 的三个 gram 都不同");
+}
+
+test "ngram：重复、池满与清空" {
+    static char buf[8 * 2] = { 0 };
+    Ngram g = { 0 };
+    Str out = { (char[:]){ 0, 0 } };
+
+    if (g.init(buf, 8, 2) != 8)
+        return err(11, "init 失败");
+    if (g.add(S("banana")) != 5)
+        return err(12, "banana 应该有 5 个二元组");
+    if (g.freq(S("an"), 0) != 2 || g.freq(S("na"), 0) != 2)
+        return err(13, "banana 的 an/na 各出现 2 次");
+    if (g.unique() != 3)
+        return err(14, "banana 的不同二元组应该是 3 个（ba/an/na）");
+    if (g.add(S("xyzxyz")) != 3)
+        return err(15, "池只剩 3 个空位，应该只加 3 条");
+    if (g.count() != 8)
+        return err(16, "池满之后 count 应该是 8");
+    if (g.clear() != 1 || g.count() != 0 || g.at(0, &out) != 0)
+        return err(17, "clear 之后应该是空池");
+    if (g.init(buf, 0, 2) != -1 || g.init(buf, 4, 17) != -1)
+        return err(18, "非法容量或 gram 长度应该 -1");
+    if (g.add(S("ab")) != 1)
+        return err(19, "长度为 n 的文本应该只有 1 个 gram");
+}

@@ -2280,6 +2280,32 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（285 个模块、0 failure）、`make std-markup`（18 条自检全过）、
 `make check-all`。
 
+### 11.81 标准库第六十九批（words / sentences / ngram / readability）
+
+第六十九批做「文本分析」：切词、切句、字符 n-gram 与可读性评分。前三个是游标
+（`open`/`next`/`count`/`rewind`），可读性用带方法的小统计结构 `ReadStats`。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.words` | 切词 | 字母数字下划线算词内字符，`'`/`-` 默认分隔；`keep_joiner(1)` 把连接符并入词并去掉**词尾**连接符；`open(text, fold)` 的第二个参数只记标志（视图不复制，折叠比较交给 `word_eq`） |
+| `std.text.sentences` | 切句 | `.`/`!`/`?` 后必须跟空白或结尾才断句，连续标点并在句尾；换行也断句（标题/列表行常常不带句号）；**不处理缩写**，文档里明说 |
+| `std.text.ngram` | n-gram | 池由调用方给（`cap × n` 字节），`add` 含重叠、满了就停并返回实际新增数；`freq` 有 `fold` 参数；`unique` 是 O(k²) 比较，池小的时候够用 |
+| `std.text.readability` | 可读性 | 音节用元音组启发式（哑 `e` 不算、`-le` 结尾特判、至少 1）；Flesch 与 Flesch-Kincaid 都用 double，`grade()` 四舍五入并夹到 0..20（堆长词的句子算出来是负数，夹到 0） |
+
+这一批的坑还是「字段与同名方法」：`WordDoc.keep_joiner` 与 `keep_joiner()` 撞车，
+字段改名 `joiner`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.words`=0x611d、
+`std.text.sentences`=0x611e、`std.text.ngram`=0x611f、`std.text.readability`=0x6120；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-textan` 与 `STD_TEXTAN_SRCS`，
+`test-all`/`check-all` 都带上它；`words`/`sentences`/`ngram` 在 `stdtest` 里只依赖
+`std/text/str.c6`（各 24 条），`readability` 依赖 str + words + sentences（28 条）。
+示例 `examples/stdtextan.c6` 四节（22 条自检）。
+
+验收：`make stdtest`（289 个模块、0 failure）、`make std-textan`（22 条自检全过）、
+`make check-all`。
+
+
 
 
 

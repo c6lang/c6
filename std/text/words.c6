@@ -1,0 +1,253 @@
+/* std/text/words：按「字母数字」切词（支持大小写归一与长度过滤）。
+ *
+ *     import std.text.words;
+ *
+ *     WordDoc doc = { 0 };
+ *     Word w = { 0 };
+ *     doc.open(S("Hello, world! It's 2024."), 0);   // 方法：open / next / count / rewind
+ *     while (doc.next(&w) == 1)
+ *         // w.text（原文视图）/ w.len / w.start
+ *     doc.open(text, 1);                            // 1 = 忽略大小写（不复制，只标记）
+ *
+ * 切词规则：连续 `[A-Za-z0-9_]` 算一个词，其余字符（含 UTF-8 多字节字符的每个字节）
+ * 都是分隔符；`'` 与 `-` 默认算分隔符（`don't` → `don` 与 `t`），
+ * `keep_joiner = 1` 时把 `'-` 当作词内字符（`don't` 保持一个词）。
+ *
+ * 约定：
+ *
+ * - `doc.open(text, fold)`：`fold != 0` 时 `w.lower` 是词的小写视图（需要调用方再复制
+ *   才能持久化）；`fold == 0` 时 `w.lower` 与 `w.text` 相同；
+ * - `doc.next(&w)` 逐条返回，`w.start` 是词在原文里的字节偏移；
+ * - `doc.count()`/`doc.rewind()` 是常规游标操作；
+ * - `word_eq(w, "hello")` 忽略大小写比较（ASCII）；
+ * - `word_count(text)` 是便捷计数（不建游标）。
+ */
+#include <string.h>
+
+module std.text.words;
+import std.core.types;
+import std.text.str;
+
+struct Word {
+    Str text;
+    Str lower;
+    int start;
+    int len;
+};
+
+struct WordDoc {
+    const char *src;
+    int n;
+    int off;
+    int fold;
+    int joiner;         /* 字段名不能与 keep_joiner() 方法冲突 */
+    int nwords;
+};
+
+static int wd_alpha(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+           || (c >= '0' && c <= '9') || c == '_';
+}
+
+static char wd_low(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    return c;
+}
+
+int word_eq(Word *w, const char *lit)
+{
+    int i = 0, n = (int)strlen(lit);
+
+    if (!w || w->len != n)
+        return 0;
+    for (i = 0; i < n; i++) {
+        if (wd_low(w->text.s.data[i]) != wd_low(lit[i]))
+            return 0;
+    }
+    return 1;
+}
+
+static int wd_parse(WordDoc *d, Word *out)
+{
+    const char *p = d->src;
+
+    while (d->off < d->n) {
+        int start = d->off, end = 0;
+
+        while (start < d->n
+               && !wd_alpha(p[start])
+               && !(d->joiner && (p[start] == '\'' || p[start] == '-')))
+            start++;
+        if (start >= d->n) {
+            d->off = d->n;
+            return 0;
+        }
+        end = start;
+        while (end < d->n
+               && (wd_alpha(p[end])
+                   || (d->joiner && (p[end] == '\'' || p[end] == '-'))))
+            end++;
+        /* 词尾的连接符不算 */
+        while (end > start && !wd_alpha(p[end - 1]))
+            end--;
+        if (end <= start) {
+            d->off = start + 1;
+            continue;
+        }
+        d->off = end;
+        memset(out, 0, sizeof *out);
+        out->text.s = (char[:]){ (char *)p + start, end - start };
+        out->start = start;
+        out->len = end - start;
+        out->lower = out->text;
+        return 1;
+    }
+    return 0;
+}
+
+int open(WordDoc *d, char[:] text, int fold)
+{
+    int pos = 0, count = 0;
+    Word w = { 0 };
+
+    if (!d || (!text.data && text.len > 0) || text.len < 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = text.data;
+    d->n = text.len;
+    d->fold = fold ? 1 : 0;
+    d->joiner = 0;
+    d->off = 0;
+    while (wd_parse(d, &w) == 1)
+        count++;
+    d->nwords = count;
+    d->off = 0;
+    (void)pos;
+    return count;
+}
+
+int next(WordDoc *d, Word *out)
+{
+    if (!d || !d->src || !out)
+        return -1;
+    return wd_parse(d, out);
+}
+
+int count(WordDoc *d)
+{
+    return d ? d->nwords : 0;
+}
+
+int rewind(WordDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int keep_joiner(WordDoc *d, int on)
+{
+    if (!d)
+        return -1;
+    d->joiner = on ? 1 : 0;
+    d->off = 0;
+    return 1;
+}
+
+int word_count(char[:] text)
+{
+    WordDoc d = { 0 };
+    Word w = { 0 };
+
+    if (open(&d, text, 0) < 0)
+        return 0;
+    while (d.next(&w) == 1)
+        ;
+    return d.count();
+}
+
+int average_len(char[:] text)
+{
+    WordDoc d = { 0 };
+    Word w = { 0 };
+    int total = 0, n = 0;
+
+    if (open(&d, text, 0) < 0)
+        return 0;
+    while (d.next(&w) == 1) {
+        total += w.len;
+        n++;
+    }
+    if (n == 0)
+        return 0;
+    return total / n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "words：切词与计数" {
+    WordDoc d = { 0 };
+    Word w = { 0 };
+
+    if (d.open(S("Hello, world! It's 2024_x."), 1) != 5)
+        return err(1, "应该切出 5 个词（Hello/world/It/s/2024_x）");
+    if (d.next(&w) != 1 || !word_eq(&w, "hello"))
+        return err(2, "第一个词应该是 Hello（忽略大小写）");
+    if (w.start != 0 || w.len != 5)
+        return err(3, "第一个词的位置不对");
+    if (d.next(&w) != 1 || !word_eq(&w, "WORLD"))
+        return err(4, "第二个词不对");
+    if (d.next(&w) != 1 || !word_eq(&w, "It"))
+        return err(5, "第三个词不对");
+    if (d.next(&w) != 1 || !word_eq(&w, "s"))
+        return err(6, "撇号两侧应该分开");
+    if (d.next(&w) != 1 || !word_eq(&w, "2024_x"))
+        return err(7, "下划线与数字应该在同一词里");
+    if (d.next(&w) != 0)
+        return err(8, "读完应该返回 0");
+    if (d.count() != 5)
+        return err(9, "count() 不对");
+    if (word_count(S("one two three")) != 3)
+        return err(10, "word_count 不对");
+    if (average_len(S("aa bbb")) != 2)
+        return err(11, "平均长度应该是 (2+3)/2=2");
+}
+
+test "words：连接符与边界" {
+    WordDoc d = { 0 };
+    Word w = { 0 };
+
+    if (d.open(S("don't stop-me"), 0) != 4)
+        return err(12, "默认连接符是分隔符，应该 4 个词");
+    d.open(S("don't stop-me"), 0);
+    d.keep_joiner(1);
+    {
+        int n = 0;
+
+        while (d.next(&w) == 1)
+            n++;
+        if (n != 2)
+            return err(13, "keep_joiner 之后应该是 2 个词");
+        d.rewind();
+    }
+    if (d.next(&w) != 1 || w.len != 5)
+        return err(14, "don't 应该是 5 字节");
+    if (d.next(&w) != 1 || w.len != 7)
+        return err(15, "stop-me 应该是 7 字节");
+    /* 尾部连接符不算词 */
+    d.open(S("hi- there"), 0);
+    d.keep_joiner(1);
+    if (d.next(&w) != 1 || w.len != 2 || !word_eq(&w, "hi"))
+        return err(16, "尾部连接符应该被去掉");
+    /* 空文本与纯分隔符 */
+    if (d.open(S(""), 0) != 0 || word_count(S("   ,,, ")) != 0)
+        return err(17, "空文本或纯分隔符应该 0 个词");
+    if (d.open(S("x"), 1) != 1 || d.next(&w) != 1 || w.lower.s.len != 1)
+        return err(18, "单字符词不对");
+}

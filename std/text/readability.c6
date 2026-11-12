@@ -1,0 +1,230 @@
+/* std/text/readability：可读性评分（音节估计、Flesch 指数、年级水平）。
+ *
+ *     import std.text.readability;
+ *
+ *     ReadStats st = { 0 };
+ *     st.analyze(S("The cat sat on the mat. It was happy."));
+ *     st.flesch();          // 约 100（很容易读）
+ *     st.grade();           // 约 2
+ *
+ * 音节用**元音组**启发式估计：连续的 `aeiouy` 算一个音节，词尾的哑 `e` 不算，
+ * 至少 1；`strength`→1、`hello`→2、`beautiful`→3。这是常见的近似算法，对英文够用，
+ * 对其它语言没有意义。
+ *
+ * 约定：
+ *
+ * - `st.analyze(text)` 统计词数/句数/音节数/长词数（>= 3 音节的词）/字符数，返回词数；
+ * - `st.flesch()` 返回 Flesch Reading Ease（越高越容易读，约 0..120；
+ *   词数或句数为 0 时返回 0）；
+ * - `st.fk()` 返回 Flesch-Kincaid 年级水平；`st.grade()` 是四舍五入后的整数；
+ * - `st.words()`/`st.sentences()`/`st.syllables()`/`st.complex_words()` 给原始统计；
+ * - `syllables_word(word)` 单独估计一个词的音节数；
+ * - 依赖 `std.text.words` 与 `std.text.sentences`。
+ */
+#include <string.h>
+
+module std.text.readability;
+import std.core.types;
+import std.text.str;
+import std.text.words;
+import std.text.sentences;
+
+struct ReadStats {
+    int nwords;
+    int nsent;
+    int nsyll;
+    int ncomplex;
+    int nchars;
+};
+
+static int rd_vowel(char c)
+{
+    return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'y'
+           || c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U'
+           || c == 'Y';
+}
+
+static char rd_low(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    return c;
+}
+
+int syllables_word(char[:] word)
+{
+    int i = 0, n = 0, in_vowel = 0;
+
+    if (!word.data || word.len <= 0)
+        return 0;
+    for (i = 0; i < word.len; i++) {
+        if (rd_vowel(word.data[i])) {
+            if (!in_vowel) {
+                n++;
+                in_vowel = 1;
+            }
+        } else {
+            in_vowel = 0;
+        }
+    }
+    /* 词尾哑 e：长度 > 2、以 e 结尾、且不是 -le 结尾 */
+    if (word.len > 2 && rd_low(word.data[word.len - 1]) == 'e'
+        && !(word.len > 2 && rd_low(word.data[word.len - 2]) == 'l'))
+        n--;
+    if (n < 1)
+        n = 1;
+    return n;
+}
+
+int analyze(ReadStats *st, char[:] text)
+{
+    WordDoc wd = { 0 };
+    SentDoc sd = { 0 };
+    Word w = { 0 };
+    Sent s = { 0 };
+
+    if (!st || (!text.data && text.len > 0))
+        return -1;
+    memset(st, 0, sizeof *st);
+    st->nchars = text.len;
+    if (sd.open(text) < 0)
+        return -1;
+    while (sd.next(&s) == 1)
+        st->nsent++;
+    if (wd.open(text, 1) < 0)
+        return -1;
+    while (wd.next(&w) == 1) {
+        int syl = syllables_word(w.text.s);
+
+        st->nwords++;
+        st->nsyll += syl;
+        if (syl >= 3)
+            st->ncomplex++;
+    }
+    return st->nwords;
+}
+
+int words(ReadStats *st)
+{
+    return st ? st->nwords : 0;
+}
+
+int sentences(ReadStats *st)
+{
+    return st ? st->nsent : 0;
+}
+
+int syllables(ReadStats *st)
+{
+    return st ? st->nsyll : 0;
+}
+
+int complex_words(ReadStats *st)
+{
+    return st ? st->ncomplex : 0;
+}
+
+double flesch(ReadStats *st)
+{
+    double wps = 0, spw = 0;
+
+    if (!st || st->nwords <= 0 || st->nsent <= 0)
+        return 0;
+    wps = (double)st->nwords / (double)st->nsent;
+    spw = (double)st->nsyll / (double)st->nwords;
+    return 206.835 - 1.015 * wps - 84.6 * spw;
+}
+
+double fk(ReadStats *st)
+{
+    double wps = 0, spw = 0;
+
+    if (!st || st->nwords <= 0 || st->nsent <= 0)
+        return 0;
+    wps = (double)st->nwords / (double)st->nsent;
+    spw = (double)st->nsyll / (double)st->nwords;
+    return 0.39 * wps + 11.8 * spw - 15.59;
+}
+
+int grade(ReadStats *st)
+{
+    double v = fk(st);
+    int g = 0;
+
+    if (v <= 0)
+        return 0;
+    g = (int)(v + 0.5);
+    if (g > 20)
+        g = 20;
+    return g;
+}
+
+int flesch_rounded(ReadStats *st)
+{
+    double v = flesch(st);
+
+    if (v < 0)
+        return 0;
+    return (int)(v + 0.5);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "readability：音节估计" {
+    if (syllables_word(S("strength")) != 1)
+        return err(1, "strength 应该是 1 个音节");
+    if (syllables_word(S("hello")) != 2)
+        return err(2, "hello 应该是 2 个音节");
+    if (syllables_word(S("beautiful")) != 3)
+        return err(3, "beautiful 应该是 3 个音节");
+    if (syllables_word(S("the")) != 1)
+        return err(4, "the 应该是 1 个音节");
+    if (syllables_word(S("table")) != 2)
+        return err(5, "table（-le 结尾）应该是 2 个音节");
+    if (syllables_word(S("my")) != 1)
+        return err(6, "my（y 当元音）应该是 1 个音节");
+    if (syllables_word(S("")) != 0)
+        return err(7, "空词应该是 0");
+}
+
+test "readability：评分" {
+    ReadStats st = { 0 };
+    ReadStats hard = { 0 };
+
+    if (st.analyze(S("The cat sat on the mat. It was happy.")) != 9)
+        return err(8, "应该统计到 9 个词");
+    if (st.sentences() != 2)
+        return err(9, "应该是 2 句");
+    if (st.words() != 9)
+        return err(10, "words() 不对");
+    if (st.syllables() < 8 || st.syllables() > 14)
+        return err(11, "音节数应该在这个范围内");
+    if (st.flesch() < 80.0)
+        return err(12, "这么简单的句子 Flesch 应该很高（> 80）");
+    if (st.grade() > 6)
+        return err(13, "年级水平应该很低");
+    /* 长句 + 长词 → 更难 */
+    hard.analyze(S("Notwithstanding the aforementioned considerations, "
+                   "implementation methodologies necessitate comprehensive "
+                   "reassessment."));
+    if (hard.flesch() >= st.flesch())
+        return err(14, "堆长词的句子应该更难读");
+    if (hard.complex_words() < 3)
+        return err(15, "长词应该被计入 complex_words");
+    if (hard.grade() < 10)
+        return err(16, "长词句子的年级水平应该更高");
+    /* 空文本 */
+    {
+        ReadStats e = { 0 };
+
+        e.analyze(S(""));
+        if (e.flesch() != 0.0 || e.fk() != 0.0 || e.grade() != 0)
+            return err(17, "空文本的分数应该都是 0");
+        if (e.analyze(S("   ")) != 0)
+            return err(18, "纯空白应该 0 个词");
+    }
+    if (flesch_rounded(&st) < 80)
+        return err(19, "四舍五入的 Flesch 也不该低于 80");
+}
