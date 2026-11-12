@@ -1853,6 +1853,32 @@ Treap 那个「槽位不回收」的坑值得记：一开始用 `t->n--` 同时�
 验收：`make stdtest`（221 个模块、0 failure）、`make std-ordered`（26 条自检全过）、
 `make check-all`。
 
+### 11.65 标准库第五十三批（bwt / mtf / delta / huffman）
+
+第五十三批做「变换式压缩积木」：BWT、MTF、差分、规范 Huffman。前三节正好是 bzip2
+的前半段（BWT → MTF → 熵编码），Huffman 是最后那一步的教科书实现。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.bwt` | Burrows-Wheeler | 排循环移位用「倍增 + 计数排序」（O(n log n)），等价类 `c[i]` 表示以 i 开头的 2^h 长子串名次；逆变换用 LF 映射一遍 O(n) 还原。临时数组是模块静态缓冲（上限 65536），所以不可重入 |
+| `std.encoding.mtf` | Move-To-Front | 256 项定长符号表，输出位置后把符号移到表头；连续相同字节第一个输出其初值、其余全是 0 |
+| `std.encoding.delta` | 差分 | 字节版按模 256 差分（递减时是 0xFF），64 位版直接相减；一字节错会传播到结尾，文档里写清 |
+| `std.encoding.huffman` | 规范 Huffman | 先建树拿码长、再按 (码长, 符号) 分配规范码；**单符号要特判**（长度 1 的码 Kraft 等式不成立，但这是合法输入）；解码逐位累积 + 线性找同长度码，简单但慢 |
+
+两个小坑：MTF 示例里 200 字节塞进 64 字节缓冲会静默踩坏相邻变量（表现为「0 的
+个数不对」），加缓冲断言/放大数组即可；BWT 的"主行号"必须在 `[0, n)`，逆变换
+对越界值返回 -1。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.bwt`=0x60dd、
+`std.encoding.mtf`=0x60de、`std.encoding.delta`=0x60df、`std.encoding.huffman`=0x60e0；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-bwt` 与 `STD_BWT_SRCS`，`test-all`/
+`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条）。
+示例 `examples/stdcmp.c6` 四节（22 条自检）。
+
+验收：`make stdtest`（225 个模块、0 failure）、`make std-bwt`（22 条自检全过）、
+`make check-all`。
+
+
 
 
 

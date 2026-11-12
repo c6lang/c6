@@ -1,0 +1,156 @@
+/* std/encoding/delta：差分编码（把相邻值的差当输出，适合单调递增的序列）。
+ *
+ *     import std.encoding.delta;
+ *
+ *     char enc[64] = { 0 };
+ *     char back[64] = { 0 };
+ *     delta_encode(S("abcdef"), enc, (int)sizeof enc);
+ *     delta_decode((char[:]){ enc, 6 }, back, (int)sizeof back);
+ *
+ * 字节版本：第一个字节原样输出，之后每个字节输出 `cur - prev`（模 256）。
+ * 64 位版本对 `i64` 数组做同样的差分（不取模，直接用减法，溢出按二进制补码回绕）。
+ *
+ * 约定：
+ *
+ * - `delta_encode`/`delta_decode` 输入输出长度相等，容量不足返回 -1；
+ * - 空输入返回 0；
+ * - `delta_encode64`/`delta_decode64` 用 `i64` 指针与元素个数（不是字节数）；
+ * - 解码需要按顺序从头开始（不可随机访问）；
+ * - 差分后数据本身的「位置信息」被抹掉，所以**不适合**随机访问或需要并行解码的
+ *   场景；错误会一直传播到结尾（一字节错全错），要抗错请配合校验和分块。
+ */
+#include <string.h>
+
+module std.encoding.delta;
+import std.core.types;
+import std.text.str;
+
+int delta_encode(char[:] src, char *dst, int cap)
+{
+    int i = 0;
+    unsigned char prev = 0;
+
+    if (!src.data || !dst || cap < src.len || src.len < 0)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        unsigned char cur = (unsigned char)src.data[i];
+
+        if (i == 0)
+            dst[i] = (char)cur;
+        else
+            dst[i] = (char)((cur - prev) & 0xFF);
+        prev = cur;
+    }
+    return src.len;
+}
+
+int delta_decode(char[:] src, char *dst, int cap)
+{
+    int i = 0;
+    unsigned char prev = 0;
+
+    if (!src.data || !dst || cap < src.len || src.len < 0)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        unsigned char cur = 0;
+
+        if (i == 0)
+            cur = (unsigned char)src.data[i];
+        else
+            cur = (unsigned char)((prev + (unsigned char)src.data[i]) & 0xFF);
+        dst[i] = (char)cur;
+        prev = cur;
+    }
+    return src.len;
+}
+
+int delta_encode64(const i64 *src, int n, i64 *dst, int cap)
+{
+    int i = 0;
+
+    if (!src || !dst || n < 0 || cap < n)
+        return -1;
+    for (i = 0; i < n; i++) {
+        if (i == 0)
+            dst[i] = src[i];
+        else
+            dst[i] = src[i] - src[i - 1];
+    }
+    return n;
+}
+
+int delta_decode64(const i64 *src, int n, i64 *dst, int cap)
+{
+    int i = 0;
+
+    if (!src || !dst || n < 0 || cap < n)
+        return -1;
+    for (i = 0; i < n; i++) {
+        if (i == 0)
+            dst[i] = src[i];
+        else
+            dst[i] = src[i] + dst[i - 1];
+    }
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "delta：字节差分" {
+    char enc[64] = { 0 };
+    char back[64] = { 0 };
+    int n = 0;
+
+    n = delta_encode(S("abcd"), enc, (int)sizeof enc);
+    if (n != 4)
+        return err(1, "长度不对");
+    if (enc[0] != 'a' || enc[1] != 1 || enc[2] != 1 || enc[3] != 1)
+        return err(2, "abcd 的差分应该是 a,1,1,1");
+    if (delta_decode((char[:]){ enc, n }, back, (int)sizeof back) != 4
+        || memcmp(back, "abcd", 4) != 0)
+        return err(3, "abcd 往返不对");
+    /* 递减：用模 256 表示 */
+    n = delta_encode(S("dcba"), enc, (int)sizeof enc);
+    if ((unsigned char)enc[1] != 0xFF)
+        return err(4, "递减时差分应该是 0xFF");
+    if (delta_decode((char[:]){ enc, n }, back, (int)sizeof back) != 4
+        || memcmp(back, "dcba", 4) != 0)
+        return err(5, "dcba 往返不对");
+    if (delta_encode(S(""), enc, (int)sizeof enc) != 0)
+        return err(6, "空输入应该 0");
+    if (delta_encode(S("abc"), enc, 2) != -1)
+        return err(7, "容量不够应该 -1");
+}
+
+test "delta：64 位差分" {
+    i64 raw[8] = { 100, 105, 111, 118, 126, 135, 145, 156 };
+    i64 enc[8] = { 0 };
+    i64 back[8] = { 0 };
+    int i = 0;
+
+    if (delta_encode64(raw, 8, enc, 8) != 8)
+        return err(8, "64 位编码失败");
+    if (enc[0] != 100 || enc[1] != 5 || enc[7] != 11)
+        return err(9, "64 位差分值不对");
+    if (delta_decode64(enc, 8, back, 8) != 8)
+        return err(10, "64 位解码失败");
+    for (i = 0; i < 8; i++) {
+        if (back[i] != raw[i])
+            return err(11, "64 位往返不一致");
+    }
+    /* 单调递增的大数（时间戳场景） */
+    {
+        i64 ts[4] = { 1704067200LL, 1704067260LL, 1704067320LL, 1704067380LL };
+
+        if (delta_encode64(ts, 4, enc, 4) != 4)
+            return err(12, "时间戳编码失败");
+        if (enc[1] != 60 || enc[2] != 60 || enc[3] != 60)
+            return err(13, "等间隔时间戳的差分应该都是 60");
+        if (delta_decode64(enc, 4, back, 4) != 4 || back[3] != ts[3])
+            return err(14, "时间戳往返不一致");
+    }
+    if (delta_encode64(raw, 8, enc, 4) != -1)
+        return err(15, "容量不够应该 -1");
+}

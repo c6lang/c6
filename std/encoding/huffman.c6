@@ -1,0 +1,429 @@
+/* std/encoding/huffman：规范 Huffman 编码（按码长建表、编码、解码）。
+ *
+ *     import std.encoding.huffman;
+ *
+ *     int lens[256] = { 0 };
+ *     HuffTable t = { 0 };
+ *     unsigned char out[64] = { 0 };
+ *     long long nbits = 0;
+ *     huff_lengths(S("abracadabra"), lens);        // 统计频率后算码长
+ *     huff_codes(lens, &t);                        // 由码长生成规范码
+ *     huff_encode(S("abracadabra"), &t, out, (int)sizeof out, &nbits);
+ *
+ * 两步走：先按频率建 Huffman 树得到每个符号的**码长**（`huff_lengths`），再用
+ * 「按 (码长, 符号值) 排序 + 递推」的标准算法给每个符号分配**规范码**
+ * （`huff_codes`）。这样解码侧只要有码长表就能还原同一套码，不必传整棵树。
+ *
+ * 约定：
+ *
+ * - `lens` 是 256 项数组，`0` 表示该符号没出现；
+ * - `huff_lengths` 返回用到的不同符号数；只出现一种符号时给该符号长度 1；
+ * - `huff_codes` 校验「码长集合是完备的」（Kraft 等式成立），不满足返回 -1；
+ * - `huff_encode` 把码按**高位在前**写进 `dst`，返回字节数，位数写进 `*out_bits`；
+ *   末尾不足一字节的部分补 0；
+ * - `huff_decode` 只读前 `nbits` 位，遇到表里没有的码返回 -1，容量不够也返回 -1；
+ * - 码长上限 32（超过视为非法，Huffman 树深一般远小于此）；
+ * - 解码用「逐位累积 + 线性找同长度符号」，简单但慢（O(256) 每符号），适合教学
+ *   与中等数据量；要快要换成查表/双级表。
+ */
+#include <string.h>
+
+module std.encoding.huffman;
+import std.core.types;
+import std.text.str;
+
+#define HUFF_SYMS 256
+#define HUFF_MAXLEN 32
+
+struct HuffTable {
+    int len[HUFF_SYMS];
+    u32 code[HUFF_SYMS];
+    int nsyms;
+};
+
+/* 建树用的小根堆（按频率，频率相同按符号值，保证确定性） */
+struct HuffNode {
+    i64 freq;
+    int sym;            /* >= 0 是叶子，-1 是内部节点 */
+    int left;
+    int right;
+};
+
+static HuffNode huff_nodes[2 * HUFF_SYMS];
+static int huff_heap[2 * HUFF_SYMS];
+
+static int huff_less(int a, int b)
+{
+    if (huff_nodes[a].freq != huff_nodes[b].freq)
+        return huff_nodes[a].freq < huff_nodes[b].freq;
+    return huff_nodes[a].sym < huff_nodes[b].sym;
+}
+
+static void huff_heap_push(int *heap, int *n, int v)
+{
+    int i = (*n)++;
+
+    heap[i] = v;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+
+        if (!huff_less(heap[i], heap[parent]))
+            break;
+        {
+            int t = heap[i];
+
+            heap[i] = heap[parent];
+            heap[parent] = t;
+        }
+        i = parent;
+    }
+}
+
+static int huff_heap_pop(int *heap, int *n)
+{
+    int top = heap[0];
+    int i = 0;
+
+    (*n)--;
+    heap[0] = heap[*n];
+    for (;;) {
+        int l = i * 2 + 1, r = i * 2 + 2, best = i;
+
+        if (l < *n && huff_less(heap[l], heap[best]))
+            best = l;
+        if (r < *n && huff_less(heap[r], heap[best]))
+            best = r;
+        if (best == i)
+            break;
+        {
+            int t = heap[i];
+
+            heap[i] = heap[best];
+            heap[best] = t;
+        }
+        i = best;
+    }
+    return top;
+}
+
+static void huff_depth(int idx, int depth, int *lens)
+{
+    if (idx < 0)
+        return;
+    if (huff_nodes[idx].sym >= 0) {
+        lens[huff_nodes[idx].sym] = depth;
+        return;
+    }
+    huff_depth(huff_nodes[idx].left, depth + 1, lens);
+    huff_depth(huff_nodes[idx].right, depth + 1, lens);
+}
+
+int huff_lengths(char[:] data, int *lens)
+{
+    i64 freq[HUFF_SYMS] = { 0 };
+    int heap[HUFF_SYMS * 2] = { 0 };
+    int hn = 0, i = 0, used = 0, idx = 0;
+    int only = -1;
+
+    if (!data.data || !lens || data.len <= 0)
+        return -1;
+    memset(lens, 0, sizeof(int) * HUFF_SYMS);
+    for (i = 0; i < data.len; i++)
+        freq[(unsigned char)data.data[i]]++;
+    for (i = 0; i < HUFF_SYMS; i++) {
+        if (freq[i] > 0) {
+            used++;
+            only = i;
+        }
+    }
+    if (used == 1) {
+        lens[only] = 1;                 /* 单符号：给 1 位，避免空码 */
+        return 1;
+    }
+    memset(huff_nodes, 0, sizeof huff_nodes);
+    idx = 0;
+    for (i = 0; i < HUFF_SYMS; i++) {
+        if (freq[i] == 0)
+            continue;
+        huff_nodes[idx].freq = freq[i];
+        huff_nodes[idx].sym = i;
+        huff_nodes[idx].left = -1;
+        huff_nodes[idx].right = -1;
+        huff_heap_push(heap, &hn, idx);
+        idx++;
+    }
+    while (hn > 1) {
+        int a = huff_heap_pop(heap, &hn);
+        int b = huff_heap_pop(heap, &hn);
+
+        huff_nodes[idx].freq = huff_nodes[a].freq + huff_nodes[b].freq;
+        huff_nodes[idx].sym = -1;
+        huff_nodes[idx].left = a;
+        huff_nodes[idx].right = b;
+        huff_heap_push(heap, &hn, idx);
+        idx++;
+    }
+    huff_depth(heap[0], 0, lens);
+    for (i = 0; i < HUFF_SYMS; i++) {
+        if (lens[i] > HUFF_MAXLEN)
+            return -1;
+    }
+    return used;
+}
+
+int huff_codes(int *lens, HuffTable *t)
+{
+    int count[HUFF_MAXLEN + 1] = { 0 };
+    u32 next[HUFF_MAXLEN + 1] = { 0 };
+    int i = 0, l = 0, n = 0;
+    u32 code = 0;
+
+    if (!lens || !t)
+        return -1;
+    memset(t, 0, sizeof *t);
+    for (i = 0; i < HUFF_SYMS; i++) {
+        t->len[i] = lens[i];
+        if (lens[i] < 0 || lens[i] > HUFF_MAXLEN)
+            return -1;
+        if (lens[i] > 0) {
+            count[lens[i]]++;
+            n++;
+        }
+    }
+    if (n == 0)
+        return -1;
+    if (n == 1) {
+        /* 单符号：码长 1、码 0（此时 Kraft 等式不成立，特判） */
+        for (i = 0; i < HUFF_SYMS; i++) {
+            if (t->len[i] > 0) {
+                t->code[i] = 0;
+                t->nsyms = 1;
+                return 1;
+            }
+        }
+        return -1;
+    }
+    /* Kraft 等式：sum 2^(maxlen-len) 必须等于 2^maxlen */
+    {
+        i64 sum = 0;
+        int maxlen = 0;
+
+        for (l = 1; l <= HUFF_MAXLEN; l++) {
+            if (count[l] > 0)
+                maxlen = l;
+        }
+        if (maxlen == 0)
+            return -1;
+        for (l = 1; l <= maxlen; l++) {
+            if (count[l] == 0)
+                continue;
+            sum += (i64)count[l] * ((i64)1 << (maxlen - l));
+        }
+        if (sum != ((i64)1 << maxlen))
+            return -1;
+    }
+    /* 规范码：按码长从小到大，逐个递推 */
+    code = 0;
+    for (l = 1; l <= HUFF_MAXLEN; l++) {
+        code = (code + (u32)(l > 1 ? count[l - 1] : 0)) << 1;
+        next[l] = code;
+    }
+    for (i = 0; i < HUFF_SYMS; i++) {
+        if (t->len[i] > 0) {
+            t->code[i] = next[t->len[i]]++;
+        }
+    }
+    t->nsyms = n;
+    return 1;
+}
+
+i64 huff_encoded_bits(char[:] data, const HuffTable *t)
+{
+    i64 bits = 0;
+    int i = 0;
+
+    if (!data.data || !t)
+        return 0;
+    for (i = 0; i < data.len; i++)
+        bits += t->len[(unsigned char)data.data[i]];
+    return bits;
+}
+
+int huff_encode(char[:] data, const HuffTable *t, void *dst, int cap,
+                i64 *out_bits)
+{
+    unsigned char *out = (unsigned char *)dst;
+    i64 bitpos = 0;
+    int i = 0;
+
+    if (!data.data || !t || !dst || cap < 0)
+        return -1;
+    memset(out, 0, (size_t)cap);
+    for (i = 0; i < data.len; i++) {
+        int sym = (unsigned char)data.data[i];
+        int len = t->len[sym];
+        u32 code = t->code[sym];
+        int k = 0;
+
+        if (len <= 0)
+            return -1;
+        for (k = len - 1; k >= 0; k--) {
+            int bit = (int)((code >> k) & 1u);
+            int byte = (int)(bitpos >> 3);
+            int shift = 7 - (int)(bitpos & 7);
+
+            if (byte >= cap)
+                return -1;
+            if (bit)
+                out[byte] |= (unsigned char)(1 << shift);
+            bitpos++;
+        }
+    }
+    if (out_bits)
+        *out_bits = bitpos;
+    return (int)((bitpos + 7) / 8);
+}
+
+int huff_decode(const HuffTable *t, const void *bits, i64 nbits, char *dst,
+                int cap)
+{
+    const unsigned char *in = (const unsigned char *)bits;
+    i64 pos = 0;
+    int o = 0;
+
+    if (!t || !bits || !dst || nbits < 0 || cap < 0)
+        return -1;
+    while (pos < nbits) {
+        u32 acc = 0;
+        i64 start = pos;
+        int matched = -1;
+
+        while (pos < nbits && pos - start < HUFF_MAXLEN) {
+            int byte = (int)(pos >> 3);
+            int shift = 7 - (int)(pos & 7);
+            int bit = (in[byte] >> shift) & 1;
+            int i = 0;
+
+            acc = (acc << 1) | (u32)bit;
+            pos++;
+            for (i = 0; i < HUFF_SYMS; i++) {
+                if (t->len[i] == (int)(pos - start) && t->code[i] == acc) {
+                    matched = i;
+                    break;
+                }
+            }
+            if (matched >= 0)
+                break;
+        }
+        if (matched < 0)
+            return -1;
+        if (o >= cap)
+            return -1;
+        dst[o++] = (char)matched;
+    }
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "huffman：码长与规范码" {
+    int lens[256] = { 0 };
+    HuffTable t = { 0 };
+
+    if (huff_lengths(S("aaaa"), lens) != 1)
+        return err(1, "单符号应该只用 1 种符号");
+    if (lens['a'] != 1)
+        return err(2, "单符号的码长应该是 1");
+    if (huff_codes(lens, &t) != 1)
+        return err(3, "单符号建表失败");
+    if (t.len['a'] != 1 || t.code['a'] != 0)
+        return err(4, "单符号的码应该是 0");
+    /* 两种符号等频：码长都是 1，码是 0/1 */
+    {
+        int l2[256] = { 0 };
+        HuffTable t2 = { 0 };
+
+        huff_lengths(S("abab"), l2);
+        if (l2['a'] != 1 || l2['b'] != 1)
+            return err(5, "两符号等频的码长应该都是 1");
+        if (huff_codes(l2, &t2) != 1)
+            return err(6, "两符号建表失败");
+        if (t2.code['a'] == t2.code['b'])
+            return err(7, "两个码不该相同");
+    }
+    /* 频率悬殊：abracadabra → a 最多、码最短 */
+    {
+        int l3[256] = { 0 };
+        HuffTable t3 = { 0 };
+
+        if (huff_lengths(S("abracadabra"), l3) != 5)
+            return err(8, "abracadabra 应该有 5 种符号");
+        if (huff_codes(l3, &t3) != 1)
+            return err(9, "abracadabra 建表失败");
+        if (l3['a'] >= l3['b'] || l3['a'] >= l3['r'])
+            return err(10, "出现最多的 a 码应该最短");
+        if (t3.nsyms != 5)
+            return err(11, "符号数不对");
+    }
+    /* Kraft 不成立的表要被拒 */
+    {
+        int bad[256] = { 0 };
+
+        bad[0] = 1;
+        bad[1] = 1;
+        bad[2] = 1;                     /* 三个长度都为 1 的码，和超过 1 */
+        if (huff_codes(bad, &t) != -1)
+            return err(12, "Kraft 不成立应该 -1");
+    }
+}
+
+test "huffman：编码与解码往返" {
+    int lens[256] = { 0 };
+    HuffTable t = { 0 };
+    unsigned char out[128] = { 0 };
+    char back[128] = { 0 };
+    i64 nbits = 0;
+    int nbytes = 0;
+
+    huff_lengths(S("abracadabra"), lens);
+    if (huff_codes(lens, &t) != 1)
+        return err(13, "建表失败");
+    nbytes = huff_encode(S("abracadabra"), &t, out, (int)sizeof out, &nbits);
+    if (nbytes <= 0 || nbits <= 0)
+        return err(14, "编码失败");
+    if (nbits != huff_encoded_bits(S("abracadabra"), &t))
+        return err(15, "位数与预估不一致");
+    if (huff_decode(&t, out, nbits, back, (int)sizeof back) != 11)
+        return err(16, "解码长度不对");
+    if (memcmp(back, "abracadabra", 11) != 0)
+        return err(17, "abracadabra 往返不一致");
+    /* 更长的混合数据 */
+    {
+        char raw[200] = { 0 };
+        unsigned char enc[400] = { 0 };
+        char dec[200] = { 0 };
+        int i = 0, seed = 7, m = 0, k = 0;
+        i64 b = 0;
+
+        for (i = 0; i < 200; i++) {
+            seed = seed * 1103515245 + 12345;
+            raw[i] = (char)('a' + (int)(((unsigned int)seed >> 16) % 6u));
+        }
+        if (huff_lengths((char[:]){ raw, 200 }, lens) != 6)
+            return err(18, "200 字节应该只有 6 种符号");
+        if (huff_codes(lens, &t) != 1)
+            return err(19, "建表失败");
+        m = huff_encode((char[:]){ raw, 200 }, &t, enc, (int)sizeof enc, &b);
+        if (m <= 0)
+            return err(20, "200 字节编码失败");
+        k = huff_decode(&t, enc, b, dec, (int)sizeof dec);
+        if (k != 200 || memcmp(dec, raw, 200) != 0)
+            return err(21, "200 字节往返不一致");
+        if ((i64)m * 8 >= (i64)200 * 8)
+            return err(22, "6 种符号的编码应该比原文短");
+    }
+    if (huff_encode(S("abracadabra"), &t, out, 2, &nbits) != -1)
+        return err(23, "容量不够应该 -1");
+}

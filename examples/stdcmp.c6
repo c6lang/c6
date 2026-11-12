@@ -1,0 +1,161 @@
+/* examples/stdcmp.c6 —— 第五十三批（变换式压缩积木）的集成示例。
+ *
+ *     make std-bwt
+ *
+ * 四节：BWT（含逆变换）、MTF、差分、规范 Huffman。前三节刚好是 bzip2 的前半段：
+ *     BWT → MTF → 熵编码
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.encoding.bwt;
+import std.encoding.mtf;
+import std.encoding.delta;
+import std.encoding.huffman;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_bwt(void)
+{
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+    int primary = 0, n = 0;
+
+    printf("== bwt\n");
+    n = bwt_transform(S("banana"), out, &primary);
+    printf("   banana → %.*s（主行号 %d）\n", n, out, primary);
+    check(n == 6 && memcmp(out, "nnbaaa", 6) == 0, "banana 的 BWT");
+    check(primary == 3, "主行号 3");
+    check(bwt_inverse((char[:]){ out, n }, primary, back, (int)sizeof back) == 6
+          && memcmp(back, "banana", 6) == 0, "逆变换还原");
+    /* 更长一点的串：重复子串多，BWT 后会出现连续相同字符 */
+    {
+        static const char *text = "mississippi river mississippi delta";
+        int len = (int)strlen(text);
+        int runs = 0, i = 0;
+
+        n = bwt_transform((char[:]){ (char *)text, len }, out, &primary);
+        check(n == len, "长串变换长度");
+        for (i = 1; i < n; i++) {
+            if (out[i] == out[i - 1])
+                runs++;
+        }
+        printf("   \"%s\" 变换后有 %d 处相邻重复\n", text, runs);
+        check(runs >= 10, "重复子串多的文本应该产生连续重复");
+        check(bwt_inverse((char[:]){ out, n }, primary, back, (int)sizeof back)
+              == len && memcmp(back, text, (size_t)len) == 0, "长串往返");
+    }
+}
+
+static void do_mtf(void)
+{
+    unsigned char enc[256] = { 0 };
+    char back[256] = { 0 };
+    int n = 0, zeros = 0, i = 0;
+
+    printf("== mtf\n");
+    n = mtf_encode(S("banana"), (char *)enc, (int)sizeof enc);
+    printf("   banana →");
+    for (i = 0; i < n; i++)
+        printf(" %d", (int)enc[i]);
+    printf("\n");
+    check(n == 6 && enc[0] == 98 && enc[3] == 1, "banana 的 MTF 索引");
+    check(mtf_decode((char[:]){ (char *)enc, n }, back, (int)sizeof back) == 6
+          && memcmp(back, "banana", 6) == 0, "MTF 往返");
+    /* 大量重复时 MTF 输出里 0 很多 */
+    {
+        char rep[200] = { 0 };
+
+        memset(rep, 'x', sizeof rep);
+        mtf_encode((char[:]){ rep, 200 }, (char *)enc, (int)sizeof enc);
+        for (i = 0; i < 200; i++) {
+            if (enc[i] == 0)
+                zeros++;
+        }
+        printf("   200 个相同字节 → %d 个 0\n", zeros);
+        check(zeros == 199, "重复字节的 MTF 应该只有第一个非 0");
+    }
+}
+
+static void do_delta(void)
+{
+    char enc[64] = { 0 };
+    char back[64] = { 0 };
+    i64 ts[5] = { 1704067200LL, 1704067260LL, 1704067320LL, 1704067380LL,
+                  1704067440LL };
+    i64 denc[5] = { 0 };
+    i64 dback[5] = { 0 };
+
+    printf("== delta\n");
+    check(delta_encode(S("abcd"), enc, (int)sizeof enc) == 4, "字节差分");
+    check((unsigned char)enc[1] == 1 && (unsigned char)enc[3] == 1,
+          "等间隔字节差分为 1");
+    check(delta_decode((char[:]){ enc, 4 }, back, (int)sizeof back) == 4
+          && memcmp(back, "abcd", 4) == 0, "字节差分往返");
+    check(delta_encode64(ts, 5, denc, 5) == 5, "时间戳差分");
+    printf("   时间戳差分：%lld + 4×%lld\n", (long long)denc[0],
+           (long long)denc[1]);
+    check(denc[1] == 60 && denc[2] == 60 && denc[3] == 60, "差分都是 60");
+    check(delta_decode64(denc, 5, dback, 5) == 5 && dback[4] == ts[4],
+          "时间戳往返");
+}
+
+static void do_huffman(void)
+{
+    static const char *text = "abracadabra abracadabra abracadabra";
+    int lens[256] = { 0 };
+    HuffTable t = { 0 };
+    unsigned char enc[128] = { 0 };
+    char dec[128] = { 0 };
+    i64 nbits = 0;
+    int nbytes = 0, used = 0, out = 0;
+
+    printf("== huffman\n");
+    used = huff_lengths((char[:]){ (char *)text, (int)strlen(text) }, lens);
+    check(used == 6, "五行 abracadabra 里 6 种符号（a b r c d 空格）");
+    check(huff_codes(lens, &t) == 1, "规范码建表");
+    nbytes = huff_encode((char[:]){ (char *)text, (int)strlen(text) }, &t, enc,
+                         (int)sizeof enc, &nbits);
+    out = huff_decode(&t, enc, nbits, dec, (int)sizeof dec);
+    printf("   %d 字节 → %d 字节（%lld 位），解回 %d 字节\n",
+           (int)strlen(text), nbytes, (long long)nbits, out);
+    check(nbytes > 0 && nbytes < (int)strlen(text), "重复文本应该变短");
+    check(out == (int)strlen(text)
+          && memcmp(dec, text, (size_t)out) == 0, "Huffman 往返");
+    check(nbits == huff_encoded_bits((char[:]){ (char *)text, (int)strlen(text) },
+                                     &t),
+          "位数与预估一致");
+    /* 单符号 */
+    {
+        int one[256] = { 0 };
+        HuffTable t1 = { 0 };
+
+        check(huff_lengths(S("aaaa"), one) == 1 && one['a'] == 1,
+              "单符号码长 1");
+        check(huff_codes(one, &t1) == 1 && t1.code['a'] == 0, "单符号码为 0");
+    }
+}
+
+int main(void)
+{
+    do_bwt();
+    do_mtf();
+    do_delta();
+    do_huffman();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

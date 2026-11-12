@@ -356,6 +356,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/container/heap.c6     std.container.heap     二叉堆：最小/最大、O(n) 堆化、pushpop（top-k）、原地堆排序
   std/container/skiplist.c6 std.container.skiplist 8 层跳表：有序 map，首元素/后继遍历与按序号取
   std/container/counter.c6  std.container.counter  频次计数器：开放寻址，键定长 23 字节，取出现最多的键
+  std/encoding/bwt.c6        std.encoding.bwt       Burrows-Wheeler：倍增+计数排序排循环移位，LF 映射逆变换
+  std/encoding/mtf.c6        std.encoding.mtf       Move-To-Front：输出符号表位置并前移，BWT 之后把重复变成 0
+  std/encoding/delta.c6      std.encoding.delta     差分编码：字节（模 256）与 i64 数组两种，适合单调序列
+  std/encoding/huffman.c6    std.encoding.huffman   规范 Huffman：频率建树→码长→规范码，Kraft 校验，位打包编解码
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -464,6 +468,7 @@ make std-packet   # 编译并运行 examples/stdpacket.c6（第四十九批网�
 make std-db       # 编译并运行 examples/stddb.c6（第五十批日志与数据库模块的拼装示例）
 make std-hash2    # 编译并运行 examples/stdhash2.c6（第五十一批非加密散列模块的拼装示例）
 make std-ordered  # 编译并运行 examples/stdordered.c6（第五十二批有序容器模块的拼装示例）
+make std-bwt      # 编译并运行 examples/stdcmp.c6（第五十三批变换式压缩积木模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

@@ -1,0 +1,214 @@
+/* std/encoding/bwt：Burrows-Wheeler 变换与逆变换（bzip2 的第一步）。
+ *
+ *     import std.encoding.bwt;
+ *
+ *     char out[256] = { 0 };
+ *     char back[256] = { 0 };
+ *     int primary = 0;
+ *     int n = bwt_transform(S("banana"), out, &primary);   // 6
+ *     bwt_inverse((char[:]){ out, n }, primary, back, (int)sizeof back);
+ *
+ * 正变换把输入的所有**循环移位**排序，输出每个移位的最后一个字符，外加「原串在
+ * 排序后位于第几行」（`primary`）；逆变换靠这个行号还原。
+ *
+ * 实现是「倍增 + 计数排序」的循环移位排序（O(n log n)），不是暴力比较所有移位：
+ * 用等价类 `c[i]` 表示以 i 开头的长度 `2^h` 的子串名次，每轮把 `(c[i], c[i+2^h])`
+ * 当二元组重排，直到 `2^h >= n`。
+ *
+ * 约定：
+ *
+ * - `bwt_transform` 返回输出长度（等于输入长度），空输入返回 0；`*primary` 由
+ *   函数填；`dst` 容量不足或内部临时缓冲申请失败返回 -1；
+ * - 临时数组（计数、名次、临时排序结果）用模块内的**静态缓冲**（上限
+ *   `BWT_MAX = 65536`），因此不可重入、也不能并发调用；超过上限返回 -1；
+ * - `bwt_inverse` 用「LF 映射 + 计数」还原，O(n)；
+ * - 输入按**字节**处理，不认字符边界。
+ */
+#include <string.h>
+
+module std.encoding.bwt;
+import std.core.types;
+import std.text.str;
+
+#define BWT_MAX 65536
+
+static int bwt_p[BWT_MAX];
+static int bwt_c[BWT_MAX];
+static int bwt_pn[BWT_MAX];
+static int bwt_cn[BWT_MAX];
+static int bwt_cnt[BWT_MAX + 1];
+
+int bwt_transform(char[:] src, char *dst, int *primary)
+{
+    int n = src.len, i = 0, h = 0;
+    const unsigned char *s = (const unsigned char *)src.data;
+
+    if (!src.data || !dst || !primary || n < 0)
+        return -1;
+    if (n == 0)
+        return 0;
+    if (n > BWT_MAX)
+        return -1;
+    /* 初始：按字节分组 */
+    memset(bwt_cnt, 0, sizeof(int) * 257);
+    for (i = 0; i < n; i++)
+        bwt_cnt[s[i] + 1]++;
+    for (i = 0; i < 256; i++)
+        bwt_cnt[i + 1] += bwt_cnt[i];
+    for (i = 0; i < n; i++)
+        bwt_p[bwt_cnt[s[i]]++] = i;
+    bwt_c[bwt_p[0]] = 0;
+    for (i = 1; i < n; i++) {
+        int cur = bwt_p[i], prev = bwt_p[i - 1];
+
+        bwt_c[cur] = bwt_c[prev] + (s[cur] != s[prev] ? 1 : 0);
+    }
+    for (h = 0; (1 << h) < n; h++) {
+        int shift = 1 << h;
+        int classes = bwt_c[bwt_p[n - 1]] + 1;
+
+        for (i = 0; i < n; i++) {
+            int v = bwt_p[i] - shift;
+
+            if (v < 0)
+                v += n;
+            bwt_pn[i] = v;
+        }
+        memset(bwt_cnt, 0, sizeof(int) * (size_t)(classes + 1));
+        for (i = 0; i < n; i++)
+            bwt_cnt[bwt_c[bwt_pn[i]] + 1]++;
+        for (i = 0; i < classes; i++)
+            bwt_cnt[i + 1] += bwt_cnt[i];
+        for (i = 0; i < n; i++)
+            bwt_p[bwt_cnt[bwt_c[bwt_pn[i]]]++] = bwt_pn[i];
+        bwt_cn[bwt_p[0]] = 0;
+        for (i = 1; i < n; i++) {
+            int cur = bwt_p[i], prev = bwt_p[i - 1];
+            int a1 = bwt_c[cur], b1 = bwt_c[(cur + shift) % n];
+            int a2 = bwt_c[prev], b2 = bwt_c[(prev + shift) % n];
+
+            bwt_cn[cur] = bwt_cn[prev] + ((a1 != a2 || b1 != b2) ? 1 : 0);
+        }
+        for (i = 0; i < n; i++)
+            bwt_c[i] = bwt_cn[i];
+    }
+    /* 输出每个移位的最后一个字节 */
+    *primary = -1;
+    for (i = 0; i < n; i++) {
+        int start = bwt_p[i];
+        int last = start - 1;
+
+        if (last < 0)
+            last += n;
+        dst[i] = src.data[last];
+        if (start == 0)
+            *primary = i;
+    }
+    return *primary >= 0 ? n : -1;
+}
+
+int bwt_inverse(char[:] src, int primary, char *dst, int cap)
+{
+    int n = src.len, i = 0;
+    const unsigned char *s = (const unsigned char *)src.data;
+    int *lf = bwt_p;                    /* 复用静态缓冲：LF 映射 */
+    int *next = bwt_c;
+
+    if (!src.data || !dst || n < 0 || primary < 0 || primary >= n)
+        return -1;
+    if (n == 0)
+        return 0;
+    if (n > BWT_MAX || cap < n)
+        return -1;
+    memset(bwt_cnt, 0, sizeof(int) * 257);
+    for (i = 0; i < n; i++)
+        bwt_cnt[s[i] + 1]++;
+    for (i = 0; i < 256; i++)
+        bwt_cnt[i + 1] += bwt_cnt[i];
+    /* LF(i)：F 列里第 k 个相同字符对应 L 列里的位置 */
+    for (i = 0; i < n; i++)
+        next[bwt_cnt[s[i]]++] = i;
+    {
+        int row = primary;
+
+        for (i = 0; i < n; i++) {
+            row = next[row];
+            dst[i] = src.data[row];
+        }
+    }
+    (void)lf;
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "bwt：小串与逆变换" {
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+    int primary = 0, n = 0;
+
+    n = bwt_transform(S("banana"), out, &primary);
+    if (n != 6)
+        return err(1, "banana 的变换长度不对");
+    if (memcmp(out, "nnbaaa", 6) != 0)
+        return err(2, "banana 的 BWT 应该是 nnbaaa");
+    if (primary != 3)
+        return err(3, "banana 的主行号应该是 3");
+    if (bwt_inverse((char[:]){ out, n }, primary, back, (int)sizeof back) != 6)
+        return err(4, "banana 的逆变换失败");
+    if (memcmp(back, "banana", 6) != 0)
+        return err(5, "banana 逆变换内容不对");
+    /* 单字符与空串 */
+    if (bwt_transform(S("x"), out, &primary) != 1 || out[0] != 'x'
+        || primary != 0)
+        return err(6, "单字符变换不对");
+    if (bwt_transform(S(""), out, &primary) != 0)
+        return err(7, "空输入应该 0");
+    if (bwt_transform(S("abc"), out, 0) != -1)
+        return err(8, "空指针应该 -1");
+}
+
+test "bwt：往返与主行号" {
+    char out[256] = { 0 };
+    char back[256] = { 0 };
+    int primary = 0, i = 0;
+
+    /* 全同字符：排序后所有移位等价 */
+    if (bwt_transform(S("aaaa"), out, &primary) != 4)
+        return err(9, "aaaa 变换失败");
+    if (memcmp(out, "aaaa", 4) != 0)
+        return err(10, "aaaa 的 BWT 应该还是 aaaa");
+    if (bwt_inverse((char[:]){ out, 4 }, primary, back, (int)sizeof back) != 4
+        || memcmp(back, "aaaa", 4) != 0)
+        return err(11, "aaaa 往返不对");
+    /* 随机串：50 个字节，跑 5 组种子 */
+    {
+        int seed = 1;
+
+        for (i = 0; i < 5; i++) {
+            char raw[64] = { 0 };
+            int k = 0, n = 0;
+
+            for (k = 0; k < 50; k++) {
+                seed = seed * 1103515245 + 12345;
+                raw[k] = (char)('a' + ((seed >> 16) & 0x03));
+            }
+            n = bwt_transform((char[:]){ raw, 50 }, out, &primary);
+            if (n != 50)
+                return err(12, "50 字节变换失败");
+            if (bwt_inverse((char[:]){ out, n }, primary, back,
+                            (int)sizeof back) != 50)
+                return err(13, "50 字节逆变换失败");
+            if (memcmp(back, raw, 50) != 0)
+                return err(14, "50 字节往返不一致");
+        }
+    }
+    /* 主行号必须在 [0, n) 内，且唯一 */
+    if (bwt_transform(S("abcabc"), out, &primary) != 6 || primary < 0
+        || primary >= 6)
+        return err(15, "主行号越界");
+    if (bwt_inverse((char[:]){ out, 6 }, 99, back, (int)sizeof back) != -1)
+        return err(16, "非法主行号应该 -1");
+}

@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第五十三批（变换式压缩积木）**：`std.encoding.bwt`（Burrows-Wheeler 双向
+  变换）、`std.encoding.mtf`（Move-To-Front）、`std.encoding.delta`（字节与 i64
+  差分）、`std.encoding.huffman`（规范 Huffman 建表/编码/解码），集成示例
+  `examples/stdcmp.c6`（`make std-bwt`）。错误号段 `std.encoding.bwt`=0x60dd …
+  `std.encoding.huffman`=0x60e0（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十二批（有序容器）**：`std.container.treap`（随机化 BST + 排名/第 k
   小）、`std.container.heap`（二叉堆，含 pushpop 与原地堆化）、
   `std.container.skiplist`（8 层跳表 + 有序遍历）、`std.container.counter`（字符串

@@ -253,6 +253,10 @@
 | `std/container/heap.c6` | `std.container.heap` | 数组二叉堆（i64）：`heap_init`（最小/最大）、`heap_push`/`heap_pop`/`heap_peek`、`heap_build` 原地 O(n) 堆化、`heap_pushpop`（top-k 常用）、`heap_sort` 原地排序 |
 | `std/container/skiplist.c6` | `std.container.skiplist` | 数组跳表（有序 map，8 层）：`skip_put`/`skip_get`/`skip_del`、`skip_first`/`skip_next` 升序遍历、`skip_at` 取第 idx 个；`nodes[0]` 是头哨兵，层数按几何分布随机 |
 | `std/container/counter.c6` | `std.container.counter` | 字符串频次计数器（开放寻址 + 线性探测）：`counter_add`（可负增量）、`counter_get`、`counter_top`（出现最多的键）、`counter_keys`/`counter_total`/`counter_clear`；键定长 23 字节，装到 3/4 返回满 |
+| `std/encoding/bwt.c6` | `std.encoding.bwt` | Burrows-Wheeler 变换：`bwt_transform` 用「倍增 + 计数排序」排循环移位（O(n log n)），输出末列与主行号；`bwt_inverse` 用 LF 映射 O(n) 还原。临时缓冲是模块静态区（上限 65536，不可重入） |
+| `std/encoding/mtf.c6` | `std.encoding.mtf` | Move-To-Front：`mtf_encode` 输出每个字节在 256 项符号表里的位置并把它移到表头，`mtf_decode` 反向；BWT 之后连续重复会变成一串 0 |
+| `std/encoding/delta.c6` | `std.encoding.delta` | 差分编码：`delta_encode`/`delta_decode` 按字节差分（模 256），`delta_encode64`/`delta_decode64` 对 `i64` 数组差分（时间戳等单调序列） |
+| `std/encoding/huffman.c6` | `std.encoding.huffman` | 规范 Huffman：`huff_lengths` 按频率建树给码长（单符号特判长度 1），`huff_codes` 用 Kraft 等式校验并按 (码长, 符号) 分配规范码，`huff_encode`/`huff_decode` 按高位在前打包与逐位解码 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -348,6 +352,7 @@
 | `examples/stddb.c6` | （无模块） | 第五十批（日志与数据库）的拼装示例（`make std-db`）：环形日志过滤与 dump、SQLite 文件头/页/单元、PostgreSQL 报文与启动包、MySQL 握手与 COM_QUERY |
 | `examples/stdhash2.c6` | （无模块） | 第五十一批（非加密散列补齐）的拼装示例（`make std-hash2`）：FNV（一次性 + 流式）、Adler-32（合并）、MurmurHash3 32/128、SipHash 2-4/1-3 |
 | `examples/stdordered.c6` | （无模块） | 第五十二批（有序容器）的拼装示例（`make std-ordered`）：Treap 排名/第 k 小、堆 top-k 与排序、跳表有序遍历、频次计数器 |
+| `examples/stdcmp.c6` | （无模块） | 第五十三批（变换式压缩积木）的拼装示例（`make std-bwt`）：BWT↔逆变换、MTF、差分（字节与时间戳）、规范 Huffman 往返 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -450,6 +455,10 @@ std/container/treap.c6     2 test(s), 0 failure(s)
 std/container/heap.c6      2 test(s), 0 failure(s)
 std/container/skiplist.c6  2 test(s), 0 failure(s)
 std/container/counter.c6   24 test(s), 0 failure(s)
+std/encoding/bwt.c6        24 test(s), 0 failure(s)
+std/encoding/mtf.c6        24 test(s), 0 failure(s)
+std/encoding/delta.c6      24 test(s), 0 failure(s)
+std/encoding/huffman.c6    24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3760,6 +3769,16 @@ make std-ordered
 再用最小堆演示「排序得降序」与 `pushpop` 的 top-k 用法；跳表乱序插 8 个键后按
 `skip_first`/`skip_next` 遍历并核对升序；计数器统计 HTTP 方法频次并取最多的键。
 
+### 集成示例：`examples/stdcmp.c6`
+
+```sh
+make std-bwt
+```
+
+四节：BWT 用 `banana` 核 `nnbaaa`/主行号 3，再用一段重复子串多的文本验证「变换后
+相邻重复变多」并逆变换还原；MTF 核对索引序列与「200 个相同字节 → 199 个 0」；
+差分覆盖字节与时间戳两种；Huffman 用重复文本算压缩率并往返，另验单符号特判。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3859,6 +3878,8 @@ make std-ordered
 * `make std-hash2`：`examples/stdhash2.c6`，第五十一批（非加密散列补齐）模块的拼装
   示例（自带自检）。
 * `make std-ordered`：`examples/stdordered.c6`，第五十二批（有序容器）模块的拼装示例
+  （自带自检）。
+* `make std-bwt`：`examples/stdcmp.c6`，第五十三批（变换式压缩积木）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
