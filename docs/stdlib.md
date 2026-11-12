@@ -349,6 +349,11 @@
 | `std/text/bm25.c6` | `std.text.bm25` | BM25 打分（**方法**：`m.setup`/`m.add_doc`/`m.finish`/`m.idf`/`m.score`/`m.docs`/`m.avgdl`/`m.reset`）：`k1`/`b` 可调，IDF 用 `ln(1+(N-df+.5)/(df+.5))`，检查过「tf 越大越高、文档越长越低、df 越大越低」 |
 | `std/text/keyword.c6` | `std.text.keyword` | 词频关键词（**方法**：`k.init`/`k.add`/`k.add_text`/`k.top`/`k.count_of`/`k.unique`/`k.total`/`k.word_at`/`k.reset`）：内置英文停用词表 + 最小词长过滤，`top` 按次数降序、同次数按首次出现顺序 |
 | `std/text/stem.c6` | `std.text.stem` | 轻量词干化（**方法**：`s.init`/`s.stem`/`s.result`/`s.rules`）：复数 → `-ed`/`-ing` → `-ly` → `-ness`/`-ment`/`-ful`/`-less` → `-er`/`-est` → 词尾 `-e`，只在剩余部分含元音时去后缀 |
+| `std/container/mst.c6` | `std.container.mst` | 最小生成树（**方法**：`m.kruskal`/`m.prim`/`m.edge_at`/`m.count`/`m.total`/`m.vertices`/`m.components`/`m.connected`）：Kruskal 用稳定插入排序 + 并查集（按秩合并），Prim 用邻接矩阵贪心（只支持正权，`0` 表示无边） |
+| `std/container/flow.c6` | `std.container.flow` | 最大流（**方法**：`f.setup`/`f.add_edge`/`f.max_flow`/`f.flow_on`/`f.residual`/`f.value`/`f.reset_flow`）：残余容量矩阵 + BFS 最短增广路（Edmonds-Karp），可反复求解、可读任意边的净流量 |
+| `std/container/scc.c6` | `std.container.scc` | 强连通分量（**方法**：`s.tarjan`/`s.comp_of`/`s.size`/`s.count`）：CSR 输入（`ptr` + `adj`），Tarjan 一次 DFS 求 `low/index` 与栈，分量编号按弹出顺序（汇在前）；递归实现，`work` 是 `5n` |
+| `std/container/match.c6` | `std.container.match` | 二分图最大匹配（**方法**：`m.setup`/`m.kuhn`/`m.pair_left`/`m.pair_right`/`m.size`/`m.perfect`/`m.left`/`m.right`）：Kuhn 增广路（DFS，允许抢已匹配右顶点），`work` 是 `nleft + 2·nright` |
+
 
 
 
@@ -488,6 +493,7 @@
 | `examples/stdmath3.c6` | （无模块） | 第七十四批（数值方法与拟合）的拼装示例（`make std-math3`）：三种求根、RK4/Euler 对比、黄金分割/三分/网格求极小、直线与二次最小二乘 |
 | `examples/stdlinalg.c6` | （无模块） | 第七十五批（线性代数）的拼装示例（`make std-linalg`）：LU 求解/求逆/行列式、Jacobi 特征值与幂法、8 阶 Poisson 三对角、CSR 的 SpMV 与转置 |
 | `examples/stdsearch2.c6` | （无模块） | 第七十六批（检索与关键词）的拼装示例（`make std-search2`）：倒排索引单词/AND 查询、BM25 长短文档对比、词频 Top-3、词干化五例 |
+| `examples/stdgraph2.c6` | （无模块） | 第七十七批（图算法进阶）的拼装示例（`make std-graph2`）：Kruskal/Prim 互验、CLRS 最大流、Tarjan 分量、Kuhn 匹配 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -686,6 +692,10 @@ std/text/inverted.c6       24 test(s), 0 failure(s)
 std/text/bm25.c6           24 test(s), 0 failure(s)
 std/text/keyword.c6        24 test(s), 0 failure(s)
 std/text/stem.c6           24 test(s), 0 failure(s)
+std/container/mst.c6       24 test(s), 0 failure(s)
+std/container/flow.c6      24 test(s), 0 failure(s)
+std/container/scc.c6       24 test(s), 0 failure(s)
+std/container/match.c6     24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4258,6 +4268,18 @@ make std-search2
 （1.7263）高于长文档（1.3921）；`Keyword` 对一句话取 Top-3（`fox ×2` 居首）；
 `Stem` 打印 running/caresses/quickly/happiness/cats 的词干。
 
+### 集成示例：`examples/stdgraph2.c6`
+
+```sh
+make std-graph2
+```
+
+四节都用方法：`Mst` 对 5 个点 6 条边跑 Kruskal（总权 11，打印选中的四条边）再用
+`prim` 交叉验证；`Flow` 复现 CLRS 的 6 顶点网络（最大流 23、源点两条边 12/11、
+反向残余 12）并验证 `reset_flow` 后可重算；`Scc` 对「一个三元环 + 自环 + 孤立点」
+给出 3 个分量；`Match` 给出 3 对完美匹配，再用「三个左点只连一个右点」验证最大基数
+只有 1。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4405,6 +4427,8 @@ make std-search2
 * `make std-linalg`：`examples/stdlinalg.c6`，第七十五批（线性代数）模块的拼装示例
   （自带自检）。
 * `make std-search2`：`examples/stdsearch2.c6`，第七十六批（检索与关键词）模块的拼装示例
+  （自带自检）。
+* `make std-graph2`：`examples/stdgraph2.c6`，第七十七批（图算法进阶）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

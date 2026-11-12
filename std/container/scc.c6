@@ -1,0 +1,177 @@
+/* std/container/scc：强连通分量（Tarjan：一次 DFS 求 low/index，栈上成环）。
+ *
+ *     import std.container.scc;
+ *
+ *     int ptr[5] = { 0, 1, 2, 3, 4 };    // CSR：顶点 v 的边是 adj[ptr[v]..ptr[v+1])
+ *     int adj[4] = { 1, 2, 0, 3 };
+ *     int work[20] = { 0 };
+ *     Scc s = { 0 };
+ *     s.tarjan(4, ptr, adj, work);       // 方法：tarjan / comp_of / size / count
+ *     s.count();                         // 分量个数
+ *     s.comp_of(0);                      // 顶点 0 属于哪个分量
+ *
+ * 输入用 CSR（`ptr[v]..ptr[v+1]` 是顶点 v 的出边在 `adj` 里的区间），这是图算法里
+ * 最省内存的邻接表形式，调用方自己按需构造。
+ *
+ * 约定：
+ *
+ * - `s.tarjan(nverts, ptr, adj, work)`：`ptr` 长度 `nverts + 1`，`work` 是 `5 * nverts`
+ *   个 `int`（index / low / comp / onstack / 栈），返回**分量个数**；
+ * - 分量编号按 Tarjan 的**弹出顺序**给（先弹出的是「汇」方向的分量，编号从 0 开始）；
+ * - `s.comp_of(v)` 顶点所属分量，`s.size(c)` 分量大小，`s.count()` 分量个数，
+ *   `s.comps()` 同 `count()`；
+ * - DFS 是递归实现的（深度最坏 `nverts`），超大图请自己改写成显式栈；
+ * - 顶点 0 基，单线程无锁。
+ */
+#include <string.h>
+
+module std.container.scc;
+import std.core.types;
+import std.text.str;
+
+struct Scc {
+    int n;
+    int *index;
+    int *low;
+    int *comp;
+    int *onstack;
+    int *stack;
+    int sp;
+    int idx;
+    int ncomp;
+    const int *ptr;
+    const int *adj;
+};
+
+static void sc_dfs(Scc *s, int v)
+{
+    int i = 0;
+
+    s->idx++;
+    s->index[v] = s->idx;
+    s->low[v] = s->idx;
+    s->stack[s->sp++] = v;
+    s->onstack[v] = 1;
+    for (i = s->ptr[v]; i < s->ptr[v + 1]; i++) {
+        int w = s->adj[i];
+
+        if (s->index[w] == 0) {
+            sc_dfs(s, w);
+            if (s->low[w] < s->low[v])
+                s->low[v] = s->low[w];
+        } else if (s->onstack[w] && s->index[w] < s->low[v]) {
+            s->low[v] = s->index[w];
+        }
+    }
+    if (s->low[v] == s->index[v]) {
+        int w = 0;
+
+        do {
+            w = s->stack[--s->sp];
+            s->onstack[w] = 0;
+            s->comp[w] = s->ncomp;
+        } while (w != v);
+        s->ncomp++;
+    }
+}
+
+int tarjan(Scc *s, int nverts, const int *ptr, const int *adj, void *work)
+{
+    int i = 0;
+
+    if (!s || nverts <= 0 || !ptr || !adj || !work)
+        return -1;
+    memset(s, 0, sizeof *s);
+    s->n = nverts;
+    s->index = (int *)work;
+    s->low = s->index + nverts;
+    s->comp = s->low + nverts;
+    s->onstack = s->comp + nverts;
+    s->stack = s->onstack + nverts;
+    memset(work, 0, sizeof(int) * (size_t)(5 * nverts));
+    s->ptr = ptr;
+    s->adj = adj;
+    for (i = 0; i < nverts; i++) {
+        if (s->index[i] == 0)
+            sc_dfs(s, i);
+    }
+    /* 用 low 数组当计数器统计各分量大小 */
+    memset(s->low, 0, sizeof(int) * (size_t)nverts);
+    for (i = 0; i < nverts; i++)
+        s->low[s->comp[i]]++;
+    return s->ncomp;
+}
+
+int count(Scc *s)
+{
+    return s ? s->ncomp : 0;
+}
+
+int comp_of(Scc *s, int v)
+{
+    if (!s || !s->comp || v < 0 || v >= s->n)
+        return -1;
+    return s->comp[v];
+}
+
+int size(Scc *s, int c)
+{
+    if (!s || !s->low || c < 0 || c >= s->ncomp)
+        return 0;
+    return s->low[c];
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "scc：环、单点与 DAG" {
+    /* 0→1→2→0 一个环，3 自环，4 孤立 */
+    int ptr[6] = { 0, 1, 2, 3, 4, 4 };
+    int adj[4] = { 1, 2, 0, 3 };
+    int work[25] = { 0 };
+    Scc s = { 0 };
+
+    if (s.tarjan(5, ptr, adj, work) != 3)
+        return err(1, "应该是 3 个分量（{0,1,2}、{3}、{4}）");
+    if (s.count() != 3)
+        return err(2, "count 不对");
+    if (s.comp_of(0) != s.comp_of(1) || s.comp_of(1) != s.comp_of(2))
+        return err(3, "0/1/2 应该在同一个分量");
+    if (s.comp_of(0) == s.comp_of(3) || s.comp_of(3) == s.comp_of(4))
+        return err(4, "3 和 4 应该各自独立");
+    if (s.size(s.comp_of(0)) != 3 || s.size(s.comp_of(4)) != 1)
+        return err(5, "分量大小不对");
+    if (s.comp_of(9) != -1 || s.size(9) != 0)
+        return err(6, "越界应该 -1/0");
+}
+
+test "scc：DAG 与链上的分量编号" {
+    /* DAG：0→1、1→2、0→2（每个点自己一个分量） */
+    int ptr[6] = { 0, 2, 3, 3 };
+    int adj[3] = { 1, 2, 2 };
+    int work[15] = { 0 };
+    Scc s = { 0 };
+
+    if (s.tarjan(3, ptr, adj, work) != 3)
+        return err(7, "DAG 应该每个点一个分量");
+    if (s.size(s.comp_of(0)) != 1 || s.size(s.comp_of(2)) != 1)
+        return err(8, "分量大小都应该 1");
+    /* Tarjan 的弹出顺序：先弹出 2，再 1，再 0 → 编号 comp(2)=0、comp(1)=1、comp(0)=2 */
+    if (s.comp_of(2) != 0 || s.comp_of(1) != 1 || s.comp_of(0) != 2)
+        return err(9, "分量编号应该按弹出顺序（汇在前）");
+    /* 两条互相独立的环 */
+    {
+        int p2[5] = { 0, 1, 2, 3, 4 };
+        int a2[4] = { 1, 0, 3, 2 };
+        int w2[20] = { 0 };
+        Scc t = { 0 };
+
+        if (t.tarjan(4, p2, a2, w2) != 2)
+            return err(10, "两个二元环应该是 2 个分量");
+        if (t.size(t.comp_of(0)) != 2 || t.size(t.comp_of(2)) != 2)
+            return err(11, "每个分量大小 2");
+    }
+    if (s.tarjan(0, ptr, adj, work) != -1)
+        return err(12, "nverts=0 应该 -1");
+}

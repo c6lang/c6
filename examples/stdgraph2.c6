@@ -1,0 +1,152 @@
+/* examples/stdgraph2.c6 —— 第七十七批（图算法进阶）的集成示例。
+ *
+ *     make std-graph2
+ *
+ * 四节：最小生成树（Kruskal 与 Prim 互验）、最大流（Edmonds-Karp）、强连通分量
+ * （Tarjan）、二分图最大匹配（Kuhn）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.container.mst;
+import std.container.flow;
+import std.container.scc;
+import std.container.match;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_mst(void)
+{
+    MstEdge es[6] = { { 0, 1, 4 }, { 0, 2, 1 }, { 1, 2, 2 },
+                      { 1, 3, 5 }, { 2, 3, 8 }, { 3, 4, 3 } };
+    MstEdge ebuf[6] = { { 0, 0, 0 } };
+    int pbuf[10] = { 0 };
+    Mst m = { 0 };
+    MstEdge e = { 0, 0, 0 };
+    int i = 0;
+
+    printf("== mst\n");
+    check(m.kruskal(5, es, 6, ebuf, pbuf) == 4, "Kruskal 选 4 条边");
+    printf("   Kruskal：总权 %ld，边", m.total());
+    for (i = 0; i < m.count(); i++) {
+        m.edge_at(i, &e);
+        printf(" %d-%d(%d)", e.u, e.v, e.w);
+    }
+    printf("\n");
+    check(m.total() == 11 && m.connected() == 1, "Kruskal 总权 11 且连通");
+    /* Prim 用同一个图（邻接矩阵）互验 */
+    {
+        int adj[25] = { 0 };
+        MstEdge pb[4] = { { 0, 0, 0 } };
+        int work[10] = { 0 };
+
+        adj[0 * 5 + 1] = 4;
+        adj[1 * 5 + 0] = 4;
+        adj[0 * 5 + 2] = 1;
+        adj[2 * 5 + 0] = 1;
+        adj[1 * 5 + 2] = 2;
+        adj[2 * 5 + 1] = 2;
+        adj[1 * 5 + 3] = 5;
+        adj[3 * 5 + 1] = 5;
+        adj[2 * 5 + 3] = 8;
+        adj[3 * 5 + 2] = 8;
+        adj[3 * 5 + 4] = 3;
+        adj[4 * 5 + 3] = 3;
+        check(m.prim(5, adj, pb, work) == 4, "Prim 选 4 条边");
+        printf("   Prim：总权 %ld\n", m.total());
+        check(m.total() == 11, "Prim 总权也是 11");
+    }
+}
+
+static void do_flow(void)
+{
+    int cap[36] = { 0 }, orig[36] = { 0 }, work[12] = { 0 };
+    Flow f = { 0 };
+
+    printf("== flow\n");
+    check(f.setup(6, cap, orig, work) == 1, "setup");
+    f.add_edge(0, 1, 16);
+    f.add_edge(0, 2, 13);
+    f.add_edge(1, 2, 10);
+    f.add_edge(2, 1, 4);
+    f.add_edge(1, 3, 12);
+    f.add_edge(3, 2, 9);
+    f.add_edge(2, 4, 14);
+    f.add_edge(4, 3, 7);
+    f.add_edge(3, 5, 20);
+    f.add_edge(4, 5, 4);
+    check(f.max_flow(0, 5) == 23, "最大流 23");
+    printf("   最大流 %d：0→1 %d、0→2 %d、3→5 %d\n", f.value(), f.flow_on(0, 1),
+           f.flow_on(0, 2), f.flow_on(3, 5));
+    check(f.flow_on(0, 1) == 12 && f.flow_on(0, 2) == 11, "源点两条边 12/11");
+    check(f.residual(1, 0) == 12, "反向残余 12");
+    check(f.reset_flow() == 1 && f.max_flow(0, 5) == 23, "重置之后还能求 23");
+}
+
+static void do_scc(void)
+{
+    int ptr[6] = { 0, 1, 2, 3, 4, 4 };
+    int adj[4] = { 1, 2, 0, 3 };
+    int work[25] = { 0 };
+    Scc s = { 0 };
+    int i = 0;
+
+    printf("== scc\n");
+    check(s.tarjan(5, ptr, adj, work) == 3, "3 个强连通分量");
+    for (i = 0; i < 5; i++)
+        printf("   顶点 %d → 分量 %d\n", i, s.comp_of(i));
+    check(s.comp_of(0) == s.comp_of(2), "0 和 2 同属一个环");
+    check(s.comp_of(3) != s.comp_of(4), "3 与 4 各自独立");
+    check(s.size(s.comp_of(0)) == 3 && s.size(s.comp_of(4)) == 1, "分量大小 3/1");
+}
+
+static void do_match(void)
+{
+    int ptr[4] = { 0, 2, 3, 4 };
+    int adj[4] = { 0, 1, 1, 2 };
+    int work[16] = { 0 };
+    Match m = { 0 };
+    int u = 0;
+
+    printf("== match\n");
+    check(m.setup(3, 3, ptr, adj, work) == 1, "setup");
+    check(m.kuhn() == 3, "3 对完美匹配");
+    for (u = 0; u < 3; u++)
+        printf("   左 %d ↔ 右 %d\n", u, m.pair_left(u));
+    check(m.perfect() == 1 && m.size() == 3, "perfect/size");
+    /* 三个左顶点都只连右 0 */
+    {
+        int p2[4] = { 0, 1, 2, 3 };
+        int a2[3] = { 0, 0, 0 };
+        int w2[8] = { 0 };
+        Match t = { 0 };
+
+        t.setup(3, 2, p2, a2, w2);
+        check(t.kuhn() == 1, "抢一个位置只能配 1 对");
+        check(t.perfect() == 0, "不是完美匹配");
+    }
+}
+
+int main(void)
+{
+    do_mst();
+    do_flow();
+    do_scc();
+    do_match();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

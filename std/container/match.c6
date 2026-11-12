@@ -1,0 +1,226 @@
+/* std/container/match：二分图最大匹配（Kuhn 增广路，匈牙利算法的 DFS 版）。
+ *
+ *     import std.container.match;
+ *
+ *     int ptr[4] = { 0, 2, 3, 4 };      // 左顶点 u 的邻接是 adj[ptr[u]..ptr[u+1])
+ *     int adj[4] = { 0, 1, 1, 2 };
+ *     int work[8] = { 0 };
+ *     Match m = { 0 };
+ *     m.setup(3, 3, ptr, adj, work);    // 方法：setup / kuhn / pair_left / size
+ *     m.kuhn();                         // 3
+ *     m.pair_left(0);                   // 0 匹配到的右顶点
+ *
+ * 每次从左部的一个顶点出发，用 DFS 找增广路（沿途允许「抢」已匹配的右顶点，
+ * 让被抢的左顶点再去找别人）——找不到增广路就说明当前匹配已经最大。
+ *
+ * 约定：
+ *
+ * - `m.setup(nleft, nright, ptr, adj, work)`：`ptr` 长度 `nleft + 1`，`work` 是
+ *   `nleft + 2 * nright` 个 `int`（左匹配 / 访问标记（按右顶点记）/ 右匹配）；返回 1；
+ * - `m.kuhn()` 求最大匹配并返回匹配边数；可重复调用（每次从零重算）；
+ * - `m.pair_left(u)` 左顶点 `u` 匹配到的右顶点（没有返回 -1），
+ *   `m.pair_right(v)` 右顶点 `v` 匹配到的左顶点（没有返回 -1）；
+ * - `m.size()` 最近一次的匹配边数，`m.left()`/`m.right()` 两侧顶点数，
+ *   `m.perfect()` 是否完美匹配（匹配数等于两侧较小者）；
+ * - 顶点 0 基；匹配是**最大基数**匹配（不看权值），单线程无锁。
+ */
+#include <string.h>
+
+module std.container.match;
+import std.core.types;
+import std.text.str;
+
+struct Match {
+    int nl;
+    int nr;
+    int *pair_l;
+    int *seen;
+    int *pair_r;
+    int size_v;
+    const int *ptr;
+    const int *adj;
+};
+
+int setup(Match *m, int nleft, int nright, const int *ptr, const int *adj, void *work)
+{
+    if (!m || nleft < 0 || nright < 0 || !ptr || !adj || !work)
+        return -1;
+    memset(m, 0, sizeof *m);
+    memset(work, 0, sizeof(int) * (size_t)(nleft + 2 * nright));
+    m->nl = nleft;
+    m->nr = nright;
+    m->pair_l = (int *)work;
+    m->seen = m->pair_l + nleft;
+    m->pair_r = m->seen + nright;
+    m->ptr = ptr;
+    m->adj = adj;
+    {
+        int i = 0;
+
+        for (i = 0; i < nleft; i++)
+            m->pair_l[i] = -1;
+        for (i = 0; i < nright; i++)
+            m->pair_r[i] = -1;
+    }
+    return 1;
+}
+
+int size(Match *m)
+{
+    return m ? m->size_v : 0;
+}
+
+int left(Match *m)
+{
+    return m ? m->nl : 0;
+}
+
+int right(Match *m)
+{
+    return m ? m->nr : 0;
+}
+
+int perfect(Match *m)
+{
+    int small = 0;
+
+    if (!m)
+        return 0;
+    small = m->nl < m->nr ? m->nl : m->nr;
+    return m->size_v == small ? 1 : 0;
+}
+
+int pair_left(Match *m, int u)
+{
+    if (!m || !m->pair_l || u < 0 || u >= m->nl)
+        return -1;
+    return m->pair_l[u];
+}
+
+int pair_right(Match *m, int v)
+{
+    if (!m || !m->pair_r || v < 0 || v >= m->nr)
+        return -1;
+    return m->pair_r[v];
+}
+
+/* 尝试给左顶点 u 找一条增广路 */
+static int mt_try(Match *m, int u)
+{
+    int i = 0;
+
+    for (i = m->ptr[u]; i < m->ptr[u + 1]; i++) {
+        int v = m->adj[i];
+
+        if (v < 0 || v >= m->nr || m->seen[v])
+            continue;
+        m->seen[v] = 1;
+        if (m->pair_r[v] < 0 || mt_try(m, m->pair_r[v])) {
+            m->pair_r[v] = u;
+            m->pair_l[u] = v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int kuhn(Match *m)
+{
+    int u = 0, v = 0;
+
+    if (!m || !m->pair_l)
+        return -1;
+    for (u = 0; u < m->nl; u++)
+        m->pair_l[u] = -1;
+    for (v = 0; v < m->nr; v++)
+        m->pair_r[v] = -1;
+    m->size_v = 0;
+    for (u = 0; u < m->nl; u++) {
+        memset(m->seen, 0, sizeof(int) * (size_t)m->nr);
+        if (mt_try(m, u))
+            m->size_v++;
+    }
+    return m->size_v;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "match：完美匹配" {
+    int ptr[4] = { 0, 2, 3, 4 };
+    int adj[4] = { 0, 1, 1, 2 };
+    int work[16] = { 0 };
+    Match m = { 0 };
+    int u = 0;
+
+    if (m.setup(3, 3, ptr, adj, work) != 1)
+        return err(1, "setup 失败");
+    if (m.left() != 3 || m.right() != 3)
+        return err(2, "两侧顶点数不对");
+    if (m.kuhn() != 3)
+        return err(3, "应该能匹配 3 对");
+    if (m.size() != 3 || m.perfect() != 1)
+        return err(4, "size/perfect 不对");
+    /* 匹配是合法且覆盖所有左顶点 */
+    for (u = 0; u < 3; u++) {
+        int v = m.pair_left(u);
+
+        if (v < 0)
+            return err(5, "每个左顶点都该有匹配");
+        if (m.pair_right(v) != u)
+            return err(6, "左右匹配必须对称");
+    }
+}
+
+test "match：最大基数（非完美）与边界" {
+    /* 左 3 个顶点都只连右顶点 0 → 最多 1 对 */
+    int ptr[4] = { 0, 1, 2, 3 };
+    int adj[3] = { 0, 0, 0 };
+    int work[8] = { 0 };
+    Match m = { 0 };
+
+    m.setup(3, 2, ptr, adj, work);
+    if (m.kuhn() != 1)
+        return err(7, "三个人抢一个位置，只能配 1 对");
+    if (m.perfect() != 0)
+        return err(8, "不该是完美匹配");
+    {
+        int cnt = 0, u = 0;
+
+        for (u = 0; u < 3; u++) {
+            if (m.pair_left(u) >= 0)
+                cnt++;
+        }
+        if (cnt != 1)
+            return err(9, "只有一个左顶点该被匹配");
+    }
+    /* 完全二分图 K3,3 */
+    {
+        int p2[4] = { 0, 3, 6, 9 };
+        int a2[9] = { 0, 1, 2, 0, 1, 2, 0, 1, 2 };
+        int w2[16] = { 0 };
+        Match t = { 0 };
+
+        t.setup(3, 3, p2, a2, w2);
+        if (t.kuhn() != 3 || t.perfect() != 1)
+            return err(10, "K3,3 应该有完美匹配");
+    }
+    /* 没有边 */
+    {
+        int p3[3] = { 0, 0, 0 };
+        int a3[1] = { 0 };
+        int w3[6] = { 0 };
+        Match t = { 0 };
+
+        t.setup(2, 2, p3, a3, w3);
+        if (t.kuhn() != 0)
+            return err(11, "没有边应该 0 对");
+        if (t.pair_left(0) != -1 || t.pair_right(1) != -1)
+            return err(12, "没有匹配应该 -1");
+    }
+    if (m.pair_left(9) != -1 || m.pair_right(9) != -1)
+        return err(13, "越界应该 -1");
+    if (m.setup(2, 2, 0, adj, work) != -1)
+        return err(14, "空 ptr 应该 -1");
+}

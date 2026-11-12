@@ -1,0 +1,277 @@
+/* std/container/mst：最小生成树（Kruskal 排序 + 并查集；Prim 稠密版）。
+ *
+ *     import std.container.mst;
+ *
+ *     MstEdge es[4] = { { 0, 1, 1 }, { 1, 2, 2 }, { 0, 2, 3 }, { 2, 3, 4 } };
+ *     MstEdge ebuf[4] = { { 0, 0, 0 } };
+ *     int pbuf[8] = { 0 };
+ *     Mst m = { 0 };
+ *     m.kruskal(4, es, 4, ebuf, pbuf);   // 方法：kruskal / prim / edge_at / total
+ *     m.total();                         // 7
+ *     m.count();                         // 3（n-1 条边）
+ *
+ * 两种算法各有所长：Kruskal 适合**稀疏图**（边列表 + 排序 + 并查集），Prim 适合
+ * **稠密图**（邻接矩阵 + 每次贪心挑最近的未访问点）。所有缓冲由调用方给。
+ *
+ * 约定：
+ *
+ * - `m.kruskal(nverts, edges, nedges, edge_buf, parent_buf)`：`edge_buf` 是
+ *   `nedges` 个 `MstEdge`（内部会拷贝并排序，选中的边就放在它前面），`parent_buf`
+ *   是 `2 * nverts` 个 `int`；返回选中边数（连通的图等于 `nverts - 1`）；
+ * - `m.prim(nverts, adj, edge_buf, work)`：`adj` 是 `nverts * nverts` 的权值矩阵，
+ *   `0` 表示没有边（只支持正权），`edge_buf` 是 `nverts - 1` 个 `MstEdge`，
+ *   `work` 是 `2 * nverts` 个 `int`（key / 是否在树里）；从顶点 0 出发，图不连通时
+ *   只覆盖 0 所在的分量；
+ * - `m.count()` 选中边数，`m.total()` 总权值，`m.edge_at(i, &e)` 取第 i 条边，
+ *   `m.components()` Kruskal 之后的分量数，`m.vertices()` 顶点数，`m.connected()`
+ *   是否连通；
+ * - 顶点编号 0 基；相等权值的边按输入顺序（排序是稳定的插入排序）。
+ */
+#include <string.h>
+
+module std.container.mst;
+import std.core.types;
+import std.text.str;
+
+struct MstEdge {
+    int u;
+    int v;
+    int w;
+};
+
+struct Mst {
+    MstEdge *chosen;
+    int nch;
+    int nvert;
+    int ncomp;
+    long total_w;
+    int connected_v;
+};
+
+int count(Mst *m)
+{
+    return m ? m->nch : 0;
+}
+
+long total(Mst *m)
+{
+    return m ? m->total_w : 0;
+}
+
+int vertices(Mst *m)
+{
+    return m ? m->nvert : 0;
+}
+
+int components(Mst *m)
+{
+    return m ? m->ncomp : 0;
+}
+
+int connected(Mst *m)
+{
+    return m ? m->connected_v : 0;
+}
+
+int edge_at(Mst *m, int i, MstEdge *out)
+{
+    if (!m || !m->chosen || i < 0 || i >= m->nch)
+        return 0;
+    if (out)
+        *out = m->chosen[i];
+    return 1;
+}
+
+static int mt_find(int *parent, int x)
+{
+    while (parent[x] != x)
+        x = parent[x];
+    return x;
+}
+
+int kruskal(Mst *m, int nverts, const MstEdge *edges, int nedges, void *edge_buf,
+            void *parent_buf)
+{
+    MstEdge *es = 0;
+    int *parent = 0;
+    int *rank = 0;
+    int i = 0, j = 0;
+
+    if (!m || nverts <= 0 || !edges || nedges < 0 || !edge_buf || !parent_buf)
+        return -1;
+    memset(m, 0, sizeof *m);
+    es = (MstEdge *)edge_buf;
+    parent = (int *)parent_buf;
+    rank = parent + nverts;
+    memcpy(edge_buf, edges, sizeof(MstEdge) * (size_t)nedges);
+    /* 稳定的插入排序（按权值升序） */
+    for (i = 1; i < nedges; i++) {
+        MstEdge cur = es[i];
+
+        for (j = i - 1; j >= 0 && es[j].w > cur.w; j--)
+            es[j + 1] = es[j];
+        es[j + 1] = cur;
+    }
+    for (i = 0; i < nverts; i++) {
+        parent[i] = i;
+        rank[i] = 0;
+    }
+    m->chosen = es;
+    m->nvert = nverts;
+    m->ncomp = nverts;
+    for (i = 0; i < nedges && m->nch < nverts - 1; i++) {
+        int ru = mt_find(parent, es[i].u);
+        int rv = mt_find(parent, es[i].v);
+
+        if (ru == rv)
+            continue;
+        if (rank[ru] < rank[rv])
+            parent[ru] = rv;
+        else if (rank[ru] > rank[rv])
+            parent[rv] = ru;
+        else {
+            parent[rv] = ru;
+            rank[ru]++;
+        }
+        es[m->nch] = es[i];
+        m->nch++;
+        m->total_w += es[i].w;
+        m->ncomp--;
+    }
+    m->connected_v = (m->ncomp == 1) ? 1 : 0;
+    return m->nch;
+}
+
+int prim(Mst *m, int nverts, const int *adj, void *edge_buf, void *work)
+{
+    int *key = 0;
+    int *in_tree = 0;
+    int i = 0, iter = 0;
+
+    if (!m || nverts <= 0 || !adj || !edge_buf || !work)
+        return -1;
+    memset(m, 0, sizeof *m);
+    key = (int *)work;
+    in_tree = key + nverts;
+    m->chosen = (MstEdge *)edge_buf;
+    m->nvert = nverts;
+    for (i = 0; i < nverts; i++) {
+        key[i] = -1;                    /* -1 表示无穷 */
+        in_tree[i] = 0;
+    }
+    key[0] = 0;
+    for (iter = 0; iter < nverts; iter++) {
+        int best = -1, u = -1;
+
+        for (i = 0; i < nverts; i++) {
+            if (in_tree[i] || key[i] < 0)
+                continue;
+            if (best < 0 || key[i] < best) {
+                best = key[i];
+                u = i;
+            }
+        }
+        if (u < 0)
+            break;                      /* 剩下的点不可达 */
+        in_tree[u] = 1;
+        if (u != 0) {
+            /* 记录这条边：父顶点是把它拉进来的那个（用 key 的最小来源重算） */
+            int pv = -1, pw = 0;
+
+            for (i = 0; i < nverts; i++) {
+                int w = adj[i * nverts + u];
+
+                if (in_tree[i] && i != u && w > 0 && (pv < 0 || w < pw)) {
+                    pv = i;
+                    pw = w;
+                }
+            }
+            m->chosen[m->nch].u = pv;
+            m->chosen[m->nch].v = u;
+            m->chosen[m->nch].w = key[u];
+            m->nch++;
+            m->total_w += key[u];
+        }
+        for (i = 0; i < nverts; i++) {
+            int w = adj[u * nverts + i];
+
+            if (w > 0 && !in_tree[i] && (key[i] < 0 || w < key[i]))
+                key[i] = w;
+        }
+    }
+    m->ncomp = 0;
+    for (i = 0; i < nverts; i++) {
+        if (!in_tree[i])
+            m->ncomp++;
+    }
+    m->ncomp = m->ncomp > 0 ? m->ncomp + 1 : 1;
+    m->connected_v = (m->nch == nverts - 1) ? 1 : 0;
+    return m->nch;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "mst：Kruskal 求最小生成树" {
+    MstEdge es[5] = { { 0, 1, 4 }, { 0, 2, 1 }, { 1, 2, 2 }, { 1, 3, 5 },
+                      { 2, 3, 8 } };
+    MstEdge ebuf[5] = { { 0, 0, 0 } };
+    int pbuf[8] = { 0 };
+    Mst m = { 0 };
+    MstEdge e = { 0, 0, 0 };
+
+    if (m.kruskal(4, es, 5, ebuf, pbuf) != 3)
+        return err(1, "应该选 3 条边");
+    if (m.count() != 3 || m.vertices() != 4)
+        return err(2, "边数/顶点数不对");
+    /* 最小生成树：1(0-2) + 2(1-2) + 5(1-3) = 8 */
+    if (m.total() != 8)
+        return err(3, "总权值应该是 8");
+    if (m.connected() != 1 || m.components() != 1)
+        return err(4, "应该连通");
+    if (m.edge_at(0, &e) != 1 || e.w != 1 || e.u != 0 || e.v != 2)
+        return err(5, "第一条边应该是 0-2(1)");
+    if (m.edge_at(1, &e) != 1 || e.w != 2)
+        return err(6, "第二条边权值应该是 2");
+    if (m.edge_at(9, &e) != 0)
+        return err(7, "越界应该 0");
+}
+
+test "mst：不连通与 Prim" {
+    MstEdge es[2] = { { 0, 1, 3 }, { 2, 3, 5 } };
+    MstEdge ebuf[2] = { { 0, 0, 0 } };
+    int pbuf[16] = { 0 };
+    Mst m = { 0 };
+
+    if (m.kruskal(5, es, 2, ebuf, pbuf) != 2)
+        return err(8, "不连通图应该选 2 条边");
+    if (m.connected() != 0 || m.components() != 3)
+        return err(9, "5 个点 2 条边 → 3 个分量");
+    if (m.total() != 8)
+        return err(10, "总权值 8");
+    /* 只有单点：0 条边 */
+    {
+        MstEdge one[1] = { { 0, 0, 1 } };
+        MstEdge ob[1] = { { 0, 0, 0 } };
+        int pb[2] = { 0 };
+
+        if (m.kruskal(1, one, 1, ob, pb) != 0 || m.total() != 0)
+            return err(11, "单点应该 0 条边");
+    }
+    /* Prim：同一个图（0-1=4, 0-2=1, 1-2=2, 1-3=5, 2-3=8） */
+    {
+        int adj[16] = { 0, 4, 1, 0, 4, 0, 2, 5, 1, 2, 0, 8, 0, 5, 8, 0 };
+        MstEdge pb2[3] = { { 0, 0, 0 } };
+        int work[8] = { 0 };
+
+        if (m.prim(4, adj, pb2, work) != 3)
+            return err(12, "Prim 应该选 3 条边");
+        if (m.total() != 8)
+            return err(13, "Prim 总权值也应该是 8");
+        if (m.connected() != 1)
+            return err(14, "Prim 应该连通");
+    }
+    if (m.kruskal(0, es, 2, ebuf, pbuf) != -1)
+        return err(15, "nverts=0 应该 -1");
+}

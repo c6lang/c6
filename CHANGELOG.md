@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十七批（图算法进阶）**：`std.container.mst`（Kruskal + Prim 最小生成树）、
+  `std.container.flow`（Edmonds-Karp 最大流）、`std.container.scc`（Tarjan 强连通分量）、
+  `std.container.match`（Kuhn 二分图最大匹配），集成示例 `examples/stdgraph2.c6`
+  （`make std-graph2`）。错误号段 `std.container.mst`=0x613d … `std.container.match`=0x6140
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十六批（检索与关键词）**：`std.text.inverted`（倒排索引 + AND 查询）、
   `std.text.bm25`（BM25 相关度打分）、`std.text.keyword`（词频 Top-N 与停用词过滤）、
   `std.text.stem`（轻量英文词干化），集成示例 `examples/stdsearch2.c6`

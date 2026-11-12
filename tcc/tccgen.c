@@ -13022,6 +13022,10 @@ static const struct C6ErrStdSlot {
     { "std.text.bm25",          C6_ERR_SLOT_STD + 314 },
     { "std.text.keyword",       C6_ERR_SLOT_STD + 315 },
     { "std.text.stem",          C6_ERR_SLOT_STD + 316 },
+    { "std.container.mst",      C6_ERR_SLOT_STD + 317 },
+    { "std.container.flow",     C6_ERR_SLOT_STD + 318 },
+    { "std.container.scc",      C6_ERR_SLOT_STD + 319 },
+    { "std.container.match",    C6_ERR_SLOT_STD + 320 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

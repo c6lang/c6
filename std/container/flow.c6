@@ -1,0 +1,248 @@
+/* std/container/flow：最大流（Edmonds-Karp：BFS 找增广路，O(VE²)）。
+ *
+ *     import std.container.flow;
+ *
+ *     int cap[36] = { 0 }, orig[36] = { 0 }, work[12] = { 0 };
+ *     Flow f = { 0 };
+ *     f.setup(6, cap, orig, work);      // 方法：setup / add_edge / max_flow
+ *     f.add_edge(0, 1, 16);
+ *     f.max_flow(0, 5);                 // 23
+ *     f.flow_on(0, 1);                  // 12
+ *
+ * 用**残余容量矩阵**表示网络：`add_edge(u, v, c)` 在 `cap[u][v]` 上加 `c`（同一对顶点
+ * 多次 add 会累加，反向边由残余矩阵自己体现）。BFS 每次找一条最短增广路，直到没有
+ * 增广路为止——这就是最大流最小割定理的最短增广写法。
+ *
+ * 约定：
+ *
+ * - `f.setup(nverts, cap_buf, orig_buf, work)`：`cap_buf`/`orig_buf` 各 `n*n` 个
+ *   `int`，`work` 是 `2n` 个 `int`（前驱 + BFS 队列）；返回 1；
+ * - `f.add_edge(u, v, c)` 加一条容量 `c > 0` 的有向边（返回 1，非法返回 -1）；
+ * - `f.max_flow(src, sink)` 求最大流并返回流量（`src == sink` 返回 -1）；
+ *   重复调用会**接着**上次的残余网络继续增广（结果仍正确，等价于再求一次）；
+ * - `f.flow_on(u, v)` 是边 `u→v` 上的实际流量（`orig - 残余`，可能是负数，表示
+ *   净流量反方向），`f.residual(u, v)` 是当前残余容量；
+ * - `f.value()` 最近一次 `max_flow` 的结果，`f.nverts()` 顶点数；
+ * - `f.reset_flow()` 清空流量（残余恢复成原始容量）；
+ * - 顶点 0 基，容量用 `int`；单线程无锁。
+ */
+#include <string.h>
+
+module std.container.flow;
+import std.core.types;
+import std.text.str;
+
+struct Flow {
+    int n;
+    int *cap;       /* 残余容量 */
+    int *orig;      /* 原始容量 */
+    int *prev;      /* BFS 前驱 */
+    int *queue;     /* BFS 队列 */
+    int value_v;
+};
+
+int setup(Flow *f, int nverts, void *cap_buf, void *orig_buf, void *work)
+{
+    if (!f || nverts <= 0 || !cap_buf || !orig_buf || !work)
+        return -1;
+    memset(f, 0, sizeof *f);
+    memset(cap_buf, 0, sizeof(int) * (size_t)(nverts * nverts));
+    memset(orig_buf, 0, sizeof(int) * (size_t)(nverts * nverts));
+    memset(work, 0, sizeof(int) * (size_t)(2 * nverts));
+    f->n = nverts;
+    f->cap = (int *)cap_buf;
+    f->orig = (int *)orig_buf;
+    f->prev = (int *)work;
+    f->queue = f->prev + nverts;
+    return 1;
+}
+
+int nverts(Flow *f)
+{
+    return f ? f->n : 0;
+}
+
+int value(Flow *f)
+{
+    return f ? f->value_v : 0;
+}
+
+int add_edge(Flow *f, int u, int v, int c)
+{
+    if (!f || !f->cap || u < 0 || v < 0 || u >= f->n || v >= f->n || c <= 0)
+        return -1;
+    f->cap[u * f->n + v] += c;
+    f->orig[u * f->n + v] += c;
+    return 1;
+}
+
+int reset_flow(Flow *f)
+{
+    if (!f || !f->cap)
+        return -1;
+    memcpy(f->cap, f->orig, sizeof(int) * (size_t)(f->n * f->n));
+    memset(f->prev, 0, sizeof(int) * (size_t)(2 * f->n));
+    f->value_v = 0;
+    return 1;
+}
+
+int residual(Flow *f, int u, int v)
+{
+    if (!f || !f->cap || u < 0 || v < 0 || u >= f->n || v >= f->n)
+        return 0;
+    return f->cap[u * f->n + v];
+}
+
+int flow_on(Flow *f, int u, int v)
+{
+    if (!f || !f->orig || u < 0 || v < 0 || u >= f->n || v >= f->n)
+        return 0;
+    return f->orig[u * f->n + v] - f->cap[u * f->n + v];
+}
+
+/* BFS：找一条从 src 到 sink 的增广路，返回可增广的容量（0 表示没有） */
+static int fl_augment(Flow *f, int src, int sink)
+{
+    int front = 0, end = 0, i = 0;
+    int bottleneck = 0;
+
+    for (i = 0; i < f->n; i++)
+        f->prev[i] = -1;
+    f->prev[src] = src;
+    f->queue[end++] = src;
+    while (front < end) {
+        int u = f->queue[front++];
+        int v = 0;
+
+        for (v = 0; v < f->n; v++) {
+            if (f->cap[u * f->n + v] > 0 && f->prev[v] < 0) {
+                f->prev[v] = u;
+                f->queue[end++] = v;
+                if (v == sink)
+                    break;
+            }
+        }
+        if (f->prev[sink] >= 0)
+            break;
+    }
+    if (f->prev[sink] < 0)
+        return 0;
+    bottleneck = 0;
+    {
+        int v = sink;
+
+        while (v != src) {
+            int u = f->prev[v];
+            int c = f->cap[u * f->n + v];
+
+            if (bottleneck == 0 || c < bottleneck)
+                bottleneck = c;
+            v = u;
+        }
+    }
+    {
+        int v = sink;
+
+        while (v != src) {
+            int u = f->prev[v];
+
+            f->cap[u * f->n + v] -= bottleneck;
+            f->cap[v * f->n + u] += bottleneck;
+            v = u;
+        }
+    }
+    return bottleneck;
+}
+
+int max_flow(Flow *f, int src, int sink)
+{
+    int total = 0, added = 0;
+
+    if (!f || !f->cap || src < 0 || sink < 0 || src >= f->n || sink >= f->n
+        || src == sink)
+        return -1;
+    while ((added = fl_augment(f, src, sink)) > 0)
+        total += added;
+    f->value_v += total;
+    return f->value_v;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "flow：CLRS 经典网络" {
+    int cap[36] = { 0 }, orig[36] = { 0 }, work[12] = { 0 };
+    Flow f = { 0 };
+
+    if (f.setup(6, cap, orig, work) != 1)
+        return err(1, "setup 失败");
+    if (f.nverts() != 6)
+        return err(2, "顶点数不对");
+    f.add_edge(0, 1, 16);
+    f.add_edge(0, 2, 13);
+    f.add_edge(1, 2, 10);
+    f.add_edge(2, 1, 4);
+    f.add_edge(1, 3, 12);
+    f.add_edge(3, 2, 9);
+    f.add_edge(2, 4, 14);
+    f.add_edge(4, 3, 7);
+    f.add_edge(3, 5, 20);
+    f.add_edge(4, 5, 4);
+    if (f.max_flow(0, 5) != 23)
+        return err(3, "最大流应该是 23");
+    if (f.value() != 23)
+        return err(4, "value() 应该是 23");
+    /* 各边的净流量（CLRS 的解之一） */
+    if (f.flow_on(0, 1) != 12 || f.flow_on(0, 2) != 11)
+        return err(5, "源点两条边的流量不对");
+    if (f.flow_on(1, 3) + f.flow_on(1, 2) != 12)
+        return err(6, "顶点 1 的流量应该守恒");
+    if (f.residual(1, 0) != 12)
+        return err(7, "反向残余容量应该等于流量");
+    /* 再求一次不会重复累加 */
+    if (f.max_flow(0, 5) != 23)
+        return err(8, "第二次 max_flow 应该还是 23");
+}
+
+test "flow：小网络、重置与边界" {
+    int cap[16] = { 0 }, orig[16] = { 0 }, work[8] = { 0 };
+    Flow f = { 0 };
+
+    f.setup(4, cap, orig, work);
+    /* 0→1→3 容量 2，0→2→3 容量 3 */
+    f.add_edge(0, 1, 2);
+    f.add_edge(1, 3, 2);
+    f.add_edge(0, 2, 3);
+    f.add_edge(2, 3, 3);
+    if (f.max_flow(0, 3) != 5)
+        return err(9, "并联两路应该是 5");
+    if (f.flow_on(0, 1) != 2 || f.flow_on(0, 2) != 3)
+        return err(10, "两条支路流量不对");
+    /* 重置之后残余恢复，再求结果一致 */
+    if (f.reset_flow() != 1 || f.value() != 0)
+        return err(11, "reset_flow 应该清零");
+    if (f.cap[2] != 0 && f.residual(0, 1) != 2)
+        return err(12, "残余应该恢复成原始容量");
+    if (f.max_flow(0, 3) != 5)
+        return err(13, "重置之后最大流还是 5");
+    /* 无路径 */
+    {
+        Flow g = { 0 };
+        int c2[9] = { 0 }, o2[9] = { 0 }, w2[6] = { 0 };
+
+        g.setup(3, c2, o2, w2);
+        g.add_edge(0, 1, 5);
+        if (g.max_flow(0, 2) != 0)
+            return err(14, "没有路径应该 0");
+    }
+    /* 边界 */
+    if (f.max_flow(1, 1) != -1)
+        return err(15, "src == sink 应该 -1");
+    if (f.add_edge(0, 1, 0) != -1)
+        return err(16, "容量 0 应该 -1");
+    if (f.add_edge(0, 9, 1) != -1)
+        return err(17, "越界顶点应该 -1");
+    if (f.setup(0, cap, orig, work) != -1)
+        return err(18, "nverts=0 应该 -1");
+}

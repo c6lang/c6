@@ -452,6 +452,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/text/bm25.c6            std.text.bm25          BM25 打分：k1/b 可调，idf(tf,dl,df) 三条单调性
   std/text/keyword.c6         std.text.keyword       词频关键词：停用词过滤 + Top-N（同频按首次出现）
   std/text/stem.c6            std.text.stem          轻量词干化：复数/-ed/-ing/-ly/-ness/-er → 词干
+  std/container/mst.c6        std.container.mst      最小生成树：Kruskal（排序+并查集）与 Prim（邻接矩阵）
+  std/container/flow.c6       std.container.flow     最大流：残余矩阵 + BFS 增广（Edmonds-Karp），可查每条边流量
+  std/container/scc.c6        std.container.scc      强连通分量：Tarjan 一次 DFS，CSR 输入
+  std/container/match.c6      std.container.match    二分图最大匹配：Kuhn 增广路，pair_left/pair_right
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -584,6 +588,7 @@ make std-async2   # 编译并运行 examples/stdasync2.c6（第七十三批 exec
 make std-math3    # 编译并运行 examples/stdmath3.c6（第七十四批数值方法与拟合模块的拼装示例）
 make std-linalg   # 编译并运行 examples/stdlinalg.c6（第七十五批线性代数模块的拼装示例）
 make std-search2  # 编译并运行 examples/stdsearch2.c6（第七十六批检索与关键词模块的拼装示例）
+make std-graph2   # 编译并运行 examples/stdgraph2.c6（第七十七批图算法进阶模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

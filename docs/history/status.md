@@ -2483,6 +2483,32 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（317 个模块、0 failure）、`make std-search2`（25 条自检全过）、
 `make check-all`。
 
+### 11.89 标准库第七十七批（mst / flow / scc / match）
+
+第七十七批做「图算法进阶」：最小生成树、最大流、强连通分量与二分图匹配。
+`graph.c6` 已有 BFS/DFS/拓扑排序/dijkstra，这批补的是另外四大经典算法。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.container.mst` | 最小生成树 | Kruskal 用**稳定**插入排序（同权值按输入顺序）+ 按秩合并的并查集，选中的边就压在排序缓冲前面；Prim 用邻接矩阵（`0` = 无边，只支持正权），从顶点 0 出发，记录边权时用 `key[u]`、父顶点回查最小邻边 |
+| `std.container.flow` | 最大流 | 残余容量矩阵 + BFS 最短增广（Edmonds-Karp），同时保留原始容量矩阵以便 `flow_on` = 原容量 − 残余（可为负，表示净流量反向）；`max_flow` 累加到 `value()`，可重复调用继续增广 |
+| `std.container.scc` | 强连通分量 | CSR 输入，Tarjan 一次 DFS；分量大小统计复用 `low` 数组（求完就改当计数器）；测试特意断言「分量编号按弹出顺序（汇在前）」 |
+| `std.container.match` | 二分图匹配 | Kuhn 的 DFS 增广，`seen` 按**右顶点**记（一开始按左顶点开数组，遍历越界写坏内存，测试直接失败）；`pair_l`/`pair_r` 双向对称 |
+
+踩到的坑：`match` 的 work 分配写成 `2*nleft + nright`，但 `seen` 是按右顶点索引的，
+应该 `nleft + 2*nright`，示例与测试里的缓冲也得跟着放大；`mst` 里 `count`/`total`/
+`vertices`/`components` 都是通用名（本批内与其他模块无同签名冲突）。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.container.mst`=0x613d、
+`std.container.flow`=0x613e、`std.container.scc`=0x613f、`std.container.match`=0x6140；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-graph2` 与 `STD_GRAPH2_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条）。示例 `examples/stdgraph2.c6` 四节（18 条自检）。
+
+验收：`make stdtest`（321 个模块、0 failure）、`make std-graph2`（18 条自检全过）、
+`make check-all`。
+
+
 
 
 
