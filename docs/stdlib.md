@@ -16,7 +16,7 @@
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
-| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、LZ4/RLE、hexdump、DER/ASN.1、HOTP/TOTP |
+| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、LZ4/RLE、hexdump、DER/ASN.1、HOTP/TOTP、GIF 的 LZW |
 | `std/data/` | 数据格式与媒体：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM、WAV、PNG、ELF、ZIP、BMP/TGA/QOI/PNM 图像 |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
@@ -158,8 +158,9 @@
 | `std/encoding/tar.c6` | `std.encoding.tar` | tar 归档（ustar，零分配）：`tar_reader` + `TarReader.next`（checksum 校验、prefix/name 拼接、数据视图、截断/非法八进制 -1、`error_at`）、`tar_writer` + `add_file`/`add_dir`/`finish`（八进制字段、512 对齐、结尾两个零块）；不压缩 |
 | `std/encoding/asn1.c6` | `std.encoding.asn1` | DER/ASN.1 读取器（零分配）：`asn1`/`asn1_sub` 造读取器，`next`/`peek` 切出 `Asn1Tag`（class/constructed/tag/内容偏移/长度），支持多字节 tag 号与 0x81..0x84 长长度、拒绝不定长与越界；`view`/`asn1_string` 给内容视图，`asn1_int`（1..8 字节二补码）/`asn1_oid`（点分十进制）/`asn1_bits`（跳过 unused 字节）/`asn1_time`（UTCTime/GeneralizedTime 归一成 6 个整数） |
 | `std/encoding/otp.c6` | `std.encoding.otp` | 一次性口令（RFC 4226 / 6238，零分配）：`hotp(secret, slen, counter, digits)`、`totp(secret, slen, unix_time, step, digits)`、`otp_format`（定宽补零）、`otp_verify_totp`（前后各 `window` 步、常量时间比较）；HMAC-SHA-1 动态截断，位数 4..9，密钥是原始字节（Base32 先走 `std.encoding.base32`） |
+| `std/encoding/lzw.c6` | `std.encoding.lzw` | GIF 变体的 LZW（零分配）：`lzw_gif_decode(src, n, out, cap, min_code)`（LSB 先、clear/eoi、码宽 2..12 位、码值越界/截断/放不下返回 -1）与 `lzw_gif_encode`（贪心最长匹配 + 线性扫字典，字典满时发 clear）；不处理 TIFF/Unix compress 的 MSB 变体 |
 
-**`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP、X.509 证书与 JWT，以及 BMP/TGA/QOI/PNM 图像解码）
+**`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP、X.509 证书与 JWT，以及 BMP/TGA/QOI/PNM/GIF/TIFF/ICO 图像解码）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -175,7 +176,7 @@
 | `std/data/cbor.c6` | `std.data.cbor` | CBOR（RFC 8949，零分配）：`cbor_writer` + `CborWriter` 的 `write_uint`/`write_int`/`write_bytes`/`write_text`/`write_array`/`write_map`/`write_bool`/`write_null`/`write_f64`、`cbor_reader` + `CborReader.next` 得到 `CborTag`；主类型 0..5 全支持、半/单/双精度都转 f64；不定长、标签（主类型 6）、`f7`/`f8` 一律 -1 |
 | `std/data/pem.c6` | `std.data.pem` | PEM（RFC 7468）：`pem_encode`（每行 64 列、先算长度再写）、`pem_reader` + `PemReader.next` 得到 `PemBlock`（`label` + Base64 视图、多块迭代、CRLF/前后噪声容忍）、`PemBlock.decode_der` 走 `std.encoding.base64`；标签 1..48 个可打印 ASCII（不含 `-`、首尾不能是空格） |
 | `std/data/wav.c6` | `std.data.wav` | RIFF/WAVE 头解析（零分配）：`wav_parse` 给出格式/声道/采样率/位宽/对齐/`data_offset`/`data_size`，`WavInfo.frames` 按 block_align 算帧数；跳过 LIST/JUNK 等未知块（含奇数长度补齐），fmt 必须在 data 之前，截断/坏 magic 时 `valid=0` |
-| `std/data/png.c6` | `std.data.png` | PNG 块遍历（零分配）：`png_reader` 校验 8 字节签名、`next` 切成 `PngChunk`（类型/长度/数据偏移/CRC）、`data` 给数据视图、`png_parse` 解析 IHDR（宽/高/位深/颜色类型/隔行）；CRC 按 IEEE 多项式校验，CRC 错只置 `crc_ok=0` 不中止 |
+| `std/data/png.c6` | `std.data.png` | PNG 块遍历（零分配）：`png_reader` 校验 8 字节签名、`next` 切成 `PngChunk`（类型/长度/数据偏移/CRC）、`data` 给数据视图、`png_parse` 解析 IHDR（宽/高/位深/颜色类型/隔行）；CRC 按 IEEE 多项式校验，CRC 错只置 `crc_ok=0` 不中止；`png_decode` 解像素（8 位、非隔行、颜色类型 0/2/3/4/6、五种滤波、tRNS）输出 RGBA8888 |
 | `std/data/elf.c6` | `std.data.elf` | ELF 头与节表（零分配）：`elf_parse` 支持 ELF32/64、小端/大端（class/data/version 校验、节表越界拒绝），`elf_reader` + `ElfSection` 的 `next` 逐节给出名字（从 `shstrndx` 字符串表取，超 63 字节截断）/类型/flags/addr/offset/size/link/info/align/entsize |
 | `std/data/zip.c6` | `std.data.zip` | ZIP 解析（零分配）：`zip_reader` 从尾部找 EOCD、`next` 走中央目录得到 `ZipEntry`（名字/方法/flags/CRC/压缩前后大小/本地头偏移）、`data` 按本地头取数据（stored 拷贝、deflate 走 `std.encoding.deflate`）并校验 CRC；ZIP64/加密/未知方法返回 -1 |
 | `std/data/bmp.c6` | `std.data.bmp` | Windows BMP 解码（零分配）：`bmp_parse` 读 BITMAPINFOHEADER（也接受 V4/V5 头的前 40 字节）、24/32 位真彩与 8 位调色板、自下而上/自上而下、行 4 字节对齐；`bmp_decode` 输出 RGBA8888，压缩方式非 0/16 位/越界一律拒绝 |
@@ -185,6 +186,9 @@
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
+| `std/data/gif.c6` | `std.data.gif` | GIF87a/89a 解码（零分配）：`gif_info` 给画布尺寸/全局调色板/帧数/背景色，`gif_frame`/`gif_decode` 按索引取帧并解成 RGBA8888；支持全局/局部调色板、图形控制扩展（透明色/延迟/处置方式）、隔行扫描（4 遍重排）、多帧；不合成画布、不处理处置方式 |
+| `std/data/tiff.c6` | `std.data.tiff` | 基线 TIFF 解码（零分配）：`tiff_info` 读 IFD（尺寸/样本数/位深/压缩/光度/条带数），`tiff_decode` 逐条带解压成 RGBA；支持 II/MM 字节序、STRIP 组织、8 位、chunky、压缩 none/Deflate(zlib)/PackBits、RGB 与 BlackIsZero/WhiteIsZero 灰度、1/3/4 样本；LZW/JPEG/16 位/分平面/分块不支持 |
+| `std/data/ico.c6` | `std.data.ico` | Windows 图标（零分配）：`ico_info`/`ico_entry` 读 ICONDIR 与目录项（宽高/位深/字节数/偏移/是否 PNG），`ico_decode` 解 32/24/8/4/1 位 DIB（自下而上 + AND 掩码透明 + 32 位 alpha 全 0 按不透明）或内嵌 PNG（交给 `png_decode`）；.cur 与 RLE/16 位 DIB 不支持 |
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
 
 | 文件 | 模块 | 内容 |
@@ -242,6 +246,7 @@
 | `examples/stdbin.c6` | （无模块） | 第二十九批（二进制文件格式）的拼装示例（`make std-bin`）：解析 48 字节 WAV、遍历 70 字节 PNG 并把 IDAT 交给 zlib 解出像素、读 320 字节 ELF64 的节名、解 225 字节 ZIP 的 stored/deflate 两个条目 |
 | `examples/stdimg.c6` | （无模块） | 第三十批（图像解码）的拼装示例（`make std-img`）：同一张 2x2 图分别用 BMP（24 位自下而上）、TGA（RLE）、QOI（RGB 流）、PNM（P6）解成 RGBA 后逐像素比对，再用 QOI 编码器写回解一遍 |
 | `examples/stdenc.c6` | （无模块） | 第三十一批（编码与凭据）的拼装示例（`make std-enc`）：手写 DER 逐层读 INTEGER/OID/UTF8String/UTCTime、解析一张 829 字节自签证书、HS256 令牌验签与改字节/换密钥的拒绝、RFC 4226 与 RFC 6238 的 OTP 向量与时间窗口 |
+| `examples/stdgfx.c6` | （无模块） | 第三十二批（图像与 LZW）的拼装示例（`make std-gfx`）：LZW 编码→解码往返、3x2 透明 GIF、4x3 未压缩 RGB TIFF、同一张图的 32 位 DIB 与 PNG 两个 ICO 负载（结果必须逐字节一致），最后把 ICO 里那段 PNG 单独交给 `png_decode` |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -278,7 +283,7 @@ std/data/msgpack.c6        24 test(s), 0 failure(s)
 std/data/cbor.c6           24 test(s), 0 failure(s)
 std/data/pem.c6            32 test(s), 0 failure(s)
 std/data/wav.c6            2 test(s), 0 failure(s)
-std/data/png.c6           27 test(s), 0 failure(s)
+std/data/png.c6           33 test(s), 0 failure(s)
 std/data/elf.c6            2 test(s), 0 failure(s)
 std/data/zip.c6            7 test(s), 0 failure(s)
 std/data/bmp.c6            2 test(s), 0 failure(s)
@@ -287,6 +292,9 @@ std/data/qoi.c6            2 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
+std/data/gif.c6             5 test(s), 0 failure(s)
+std/data/tiff.c6           11 test(s), 0 failure(s)
+std/data/ico.c6            35 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
 std/data/props.c6          4 test(s), 0 failure(s)
@@ -312,6 +320,7 @@ std/encoding/gzip.c6        7 test(s), 0 failure(s)
 std/encoding/tar.c6        24 test(s), 0 failure(s)
 std/encoding/asn1.c6       24 test(s), 0 failure(s)
 std/encoding/otp.c6        13 test(s), 0 failure(s)
+std/encoding/lzw.c6         2 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
 std/net/cookie.c6          4 test(s), 0 failure(s)
@@ -367,7 +376,7 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/cbor.c6` 24 | cbor 2 + str 22（同上） |
 | `std/data/pem.c6` 32 | pem 2 + base64 8 + str 22（Base64 解码用 base64 的正文） |
 | `std/data/wav.c6` 2 | 自成一体 |
-| `std/data/png.c6` 27 | png 2 + crc 3 + str 22（CRC-32 来自 std.core.crc，`Str` 是数据视图） |
+| `std/data/png.c6` 33 | png 4 + crc 3 + str 22 + zlib 4（`png_decode` 借 zlib 解 IDAT） |
 | `std/data/elf.c6` 2 | 自成一体（名字拷贝用 memcpy，不借 str） |
 | `std/data/zip.c6` 7 | zip 2 + deflate 2 + crc 3（deflate 解条目、crc 校验内容） |
 | `std/data/bmp.c6` 2 | 自成一体 |
@@ -376,6 +385,9 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/pnm.c6` 2 | 自成一体 |
 | `std/data/x509.c6` 26 | x509 2 + asn1 24（DER 读取器来自 std.encoding.asn1） |
 | `std/data/jwt.c6` 58 | jwt 2 + base64 8 + sha256 23 + sha512 9 + bits 6 + str 22（HMAC 直接调 sha256/sha512） |
+| `std/data/gif.c6` 5 | gif 3 + lzw 2（LZW 是跨 TU 调用） |
+| `std/data/tiff.c6` 11 | tiff 3 + zlib 4 + deflate 2 + rle 2（Deflate 走 zlib、PackBits 走 rle） |
+| `std/data/ico.c6` 35 | ico 2 + png 33（PNG 负载交给 png_decode） |
 | `std/os/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/encoding/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
 | `std/encoding/md5.c6` 9 | md5 3 + bits 6（`rotr32` 是跨 TU 调用） |
@@ -389,6 +401,7 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/encoding/tar.c6` 24 | tar 2 + str 22（只借 `Str` 类型，正文不调 str） |
 | `std/encoding/asn1.c6` 24 | asn1 2 + str 22 |
 | `std/encoding/otp.c6` 13 | otp 3 + sha1 6 + bits 6（HMAC-SHA-1 是跨 TU 调用） |
+| `std/encoding/lzw.c6` 2 | 自成一体 |
 | `std/encoding/aes.c6` 2 | 自成一体（S 盒直接写在模块里） |
 | `std/encoding/poly1305.c6` 2 | 自成一体（130 位模运算只用 u64） |
 | `std/encoding/random.c6` 3 | 自成一体（只读 /dev/urandom） |
@@ -439,7 +452,9 @@ std/text/width.c6          10 test(s), 0 failure(s)
 deflate + `std/core/crc`，`tar` 只借 `Str` 类型；`std/data/png` 只借 `Str`
 类型与 `crc`，`std/data/zip` 要 deflate + crc，`wav`/`elf`/`bmp`/`tga`/`qoi`/
 `pnm` 自成一体；`std/data/x509` 要 asn1，`std/data/jwt` 要 base64 + sha256 +
-sha512，`std/encoding/asn1` 只借 `Str` 类型，`std/encoding/otp` 要 sha1。
+sha512，`std/encoding/asn1` 只借 `Str` 类型，`std/encoding/otp` 要 sha1；
+`std/data/gif` 要 lzw，`std/data/tiff` 要 zlib + rle，`std/data/ico` 要 png
+（PNG 负载），`std/encoding/lzw` 自成一体。
 
 ## 设计原则
 
@@ -3254,6 +3269,33 @@ make std-enc
 otp 打 RFC 4226 的前五个计数器码与 RFC 6238 的 `t=1234567890` 八位码，并验
 前后一步的时间窗口。
 
+### 集成示例：`examples/stdgfx.c6`
+
+```sh
+make std-gfx
+```
+
+```
+== lzw
+   256 字节压缩成 57 字节，解回来 256 字节
+== gif
+   3x2，4 个全局色，透明索引 1
+== tiff
+   4x3，3 样本/像素，压缩 1，1 条带
+== ico
+   4x3，DIB 位深 32、PNG 负载 102 字节
+== png
+   4x3 RGBA，颜色类型 6，位深 8
+
+18 check(s), 0 failure(s)
+```
+
+LZW 那一节用 256 字节的周期序列把字典撑到码宽增长再解回来；GIF 验画布/全局
+调色板/透明索引；TIFF 验 IFD 的样本数与条带数并抽查首尾像素；ICO 用**同一张
+图**的两种负载（32 位 DIB 与 PNG）解码后逐字节比对——这同时钉住了 DIB 的自下
+而上行序、BGRA 换序、AND 掩码和 PNG 负载的分派；最后把 ICO 里那段 PNG 单独
+交给 `png_decode`，验 IHDR 与首像素。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3311,6 +3353,8 @@ otp 打 RFC 4226 的前五个计数器码与 RFC 6238 的 `t=1234567890` 八位�
 * `make std-img`：`examples/stdimg.c6`，第三十批（图像解码）模块的拼装示例
   （自带自检）。
 * `make std-enc`：`examples/stdenc.c6`，第三十一批（编码与凭据）模块的拼装示例
+  （自带自检）。
+* `make std-gfx`：`examples/stdgfx.c6`，第三十二批（图像与 LZW）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

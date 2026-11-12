@@ -56,6 +56,16 @@
 
 ### 标准库
 
+- **标准库第三十二批（图像与 LZW）**：`std.encoding.lzw` / `std.data.gif` /
+  `std.data.tiff` / `std.data.ico` 四个零分配模块，集成示例
+  `examples/stdgfx.c6`（`make std-gfx`）。lzw 是 GIF 变体（LSB 打包、clear/eoi、
+  码宽 2..12）；gif 支持全局/局部调色板、透明色、隔行扫描与多帧；tiff 支持
+  II/MM 字节序、STRIP、8 位、none/Deflate(zlib)/PackBits 压缩与 RGB/灰度；
+  ico 支持 DIB（1/4/8/24/32 位）与内嵌 PNG 负载。顺带给 `std.data.png` 补了
+  像素解码 `png_decode`（颜色类型 0/2/3/4/6、五种滤波、tRNS）。错误号段
+  `std.encoding.lzw`=0x6089 … `std.data.ico`=0x608c（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第三十一批（编码与凭据）**：`std.encoding.asn1` / `std.data.x509` /
   `std.data.jwt` / `std.encoding.otp` 四个零分配模块，集成示例
   `examples/stdenc.c6`（`make std-enc`）。asn1 是 DER 读取器（多字节 tag、长

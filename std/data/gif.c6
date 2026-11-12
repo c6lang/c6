@@ -1,0 +1,526 @@
+/* std/data/gif：GIF87a/89a 解码（零分配，解成一帧 RGBA8888）。
+ *
+ *     import std.data.gif;
+ *
+ *     GifInfo gi = gif_info(data, n);
+ *     u8 rgba[4 * 4096];
+ *     GifFrame f = { 0 };
+ *     if (gif_decode(data, n, 0, rgba, (int)sizeof rgba, &f) == 0) {
+ *         // rgba 是 f.w * f.h 个像素，非透明像素 alpha=255
+ *     }
+ *
+ * 支持：全局/局部调色板、图像描述符、图形控制扩展（透明色、延迟、处置方式）、
+ * 隔行扫描（4 遍）、多帧（按索引取任意一帧）、应用/注释扩展（跳过）。
+ *
+ * 约定：
+ *
+ * - `gif_info` 只扫结构，给出画布尺寸、全局调色板颜色数、帧数和背景色；
+ * - `gif_decode` 解第 `index` 帧（从 0 数），像素按 `f.x/f.y` 放回画布坐标原样
+ *   输出成 `f.w x f.h` 的 RGBA（不合成到画布、不处理处置方式——那是调用方的
+ *   合成器的事）；透明像素的 RGBA 是 `0,0,0,0`；
+ * - 输出缓冲至少 `4*w*h` 字节，放不下返回 -1；帧索引越界、LZW 坏流、缺调色板、
+ *   结构截断都返回 -1；
+ * - 压缩数据先拼进栈上的 32KB 临时区，超过就返回 -1（单帧压缩数据上限）。
+ */
+#include <string.h>
+
+module std.data.gif;
+import std.core.types;
+import std.encoding.lzw;
+
+struct GifInfo {
+    int valid;
+    int width;
+    int height;
+    int gct_colors;     /* 0 表示没有全局表 */
+    int frames;
+    int bg;
+    int aspect;
+};
+
+struct GifFrame {
+    int valid;
+    int x;
+    int y;
+    int w;
+    int h;
+    int interlaced;
+    int lct_colors;     /* 0 表示用全局表 */
+    int lct_off;        /* 局部调色板在输入里的偏移 */
+    int transparent;    /* -1 表示不透明 */
+    int delay_cs;       /* 1/100 秒 */
+    int disposal;
+};
+
+void gif_deinterlace(u8 *rgba, int w, int h);
+
+struct GifWalk {
+    const u8 *p;
+    int n;
+    int pos;
+    int width;
+    int height;
+    int gct_colors;
+    int gct_off;
+    int bg;
+    int aspect;
+};
+
+static GifInfo gif_bad(void)
+{
+    GifInfo g = { 0 };
+
+    return g;
+}
+
+static GifFrame gif_bad_frame(void)
+{
+    GifFrame f = { 0 };
+
+    f.transparent = -1;
+    return f;
+}
+
+static int gif_u16(const u8 *p) { return p[0] | (p[1] << 8); }
+
+static int gif_open(GifWalk *w, const void *data, int n)
+{
+    const u8 *p = (const u8 *)data;
+    int packed = 0;
+
+    if (!w || !data || n < 13)
+        return -1;
+    if (memcmp(p, "GIF87a", 6) != 0 && memcmp(p, "GIF89a", 6) != 0)
+        return -1;
+    w->p = p;
+    w->n = n;
+    w->pos = 6;
+    w->width = gif_u16(p + 6);
+    w->height = gif_u16(p + 8);
+    packed = p[10];
+    w->bg = p[11];
+    w->aspect = p[12];
+    w->gct_off = 0;
+    w->gct_colors = 0;
+    w->pos = 13;
+    if (packed & 0x80) {
+        int cnt = 1 << ((packed & 0x07) + 1);
+
+        if (w->pos + cnt * 3 > n)
+            return -1;
+        w->gct_off = w->pos;
+        w->gct_colors = cnt;
+        w->pos += cnt * 3;
+    }
+    return 0;
+}
+
+/* 跳过一串子块，返回 0/-1 */
+static int gif_skip_blocks(GifWalk *w)
+{
+    while (w->pos < w->n) {
+        int len = w->p[w->pos++];
+
+        if (len == 0)
+            return 0;
+        if (w->pos + len > w->n)
+            return -1;
+        w->pos += len;
+    }
+    return -1;
+}
+
+/* 把一个扩展块整体跳过（label 已读） */
+static int gif_skip_ext(GifWalk *w, int label)
+{
+    (void)label;
+    return gif_skip_blocks(w);
+}
+
+/* 读图像描述符；成功时 w->pos 停在 LZW 最小码长前后由调用方决定 */
+static int gif_image(GifWalk *w, GifFrame *f)
+{
+    int packed = 0, cnt = 0;
+
+    if (w->pos + 10 > w->n)
+        return -1;
+    f->x = gif_u16(w->p + w->pos);
+    f->y = gif_u16(w->p + w->pos + 2);
+    f->w = gif_u16(w->p + w->pos + 4);
+    f->h = gif_u16(w->p + w->pos + 6);
+    packed = w->p[w->pos + 8];
+    w->pos += 9;
+    f->interlaced = (packed & 0x40) ? 1 : 0;
+    f->lct_colors = 0;
+    if (packed & 0x80) {
+        cnt = 1 << ((packed & 0x07) + 1);
+        if (w->pos + cnt * 3 > w->n)
+            return -1;
+        f->lct_colors = cnt;
+        w->pos += cnt * 3;
+    }
+    if (f->w <= 0 || f->h <= 0)
+        return -1;
+    f->valid = 1;
+    return 0;
+}
+
+GifInfo gif_info(const void *data, int n)
+{
+    GifInfo gi = { 0 };
+    GifWalk w = { 0 };
+    GifFrame f = { 0 };
+    int gce_trans = -1, gce_delay = 0, gce_disp = 0;
+
+    if (gif_open(&w, data, n) != 0)
+        return gif_bad();
+    gi.width = w.width;
+    gi.height = w.height;
+    gi.gct_colors = w.gct_colors;
+    gi.bg = w.bg;
+    gi.aspect = w.aspect;
+    while (w.pos < w.n) {
+        int b = w.p[w.pos++];
+
+        if (b == 0x3b)
+            break;
+        if (b == 0x21) {
+            int label = 0;
+
+            if (w.pos >= w.n)
+                return gif_bad();
+            label = w.p[w.pos++];
+            if (label == 0xf9) {
+                int len = 0;
+
+                if (w.pos >= w.n)
+                    return gif_bad();
+                len = w.p[w.pos++];
+                if (len < 4 || w.pos + len > w.n)
+                    return gif_bad();
+                gce_disp = (w.p[w.pos] >> 2) & 0x07;
+                gce_trans = (w.p[w.pos] & 0x01) ? w.p[w.pos + 3] : -1;
+                gce_delay = gif_u16(w.p + w.pos + 1);
+                w.pos += len;
+                if (gif_skip_blocks(&w) != 0)
+                    return gif_bad();
+            } else if (gif_skip_ext(&w, label) != 0) {
+                return gif_bad();
+            }
+            continue;
+        }
+        if (b == 0x2c) {
+            memset(&f, 0, sizeof f);
+            f.transparent = -1;
+            if (gif_image(&w, &f) != 0)
+                return gif_bad();
+            f.transparent = gce_trans;
+            f.delay_cs = gce_delay;
+            f.disposal = gce_disp;
+            gi.frames++;
+            if (w.pos >= w.n)
+                return gif_bad();
+            w.pos++;                    /* LZW minimum code size */
+            if (gif_skip_blocks(&w) != 0)
+                return gif_bad();
+            gce_trans = -1;
+            gce_delay = 0;
+            gce_disp = 0;
+            continue;
+        }
+        return gif_bad();
+    }
+    gi.valid = w.width > 0 && w.height > 0;
+    return gi;
+}
+
+/* 把第 index 帧的压缩数据拼到 comp，返回压缩字节数；同时填 f */
+static int gif_collect(GifWalk *w, int index, GifFrame *f, u8 *comp, int cap,
+                       int *min_code)
+{
+    int gce_trans = -1, gce_delay = 0, gce_disp = 0, seen = 0;
+
+    while (w->pos < w->n) {
+        int b = w->p[w->pos++];
+
+        if (b == 0x3b)
+            return -1;
+        if (b == 0x21) {
+            int label = 0;
+
+            if (w->pos >= w->n)
+                return -1;
+            label = w->p[w->pos++];
+            if (label == 0xf9) {
+                int len = 0;
+
+                if (w->pos >= w->n)
+                    return -1;
+                len = w->p[w->pos++];
+                if (len < 4 || w->pos + len > w->n)
+                    return -1;
+                gce_disp = (w->p[w->pos] >> 2) & 0x07;
+                gce_trans = (w->p[w->pos] & 0x01) ? w->p[w->pos + 3] : -1;
+                gce_delay = gif_u16(w->p + w->pos + 1);
+                w->pos += len;
+                if (gif_skip_blocks(w) != 0)
+                    return -1;
+            } else if (gif_skip_ext(w, label) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (b != 0x2c)
+            return -1;
+        memset(f, 0, sizeof *f);
+        f->transparent = -1;
+        if (gif_image(w, f) != 0)
+            return -1;
+        f->lct_off = w->pos - f->lct_colors * 3;
+        f->transparent = gce_trans;
+        f->delay_cs = gce_delay;
+        f->disposal = gce_disp;
+        if (seen++ != index) {
+            if (w->pos >= w->n)
+                return -1;
+            w->pos++;
+            if (gif_skip_blocks(w) != 0)
+                return -1;
+            gce_trans = -1;
+            gce_delay = 0;
+            gce_disp = 0;
+            continue;
+        }
+        if (w->pos >= w->n)
+            return -1;
+        *min_code = w->p[w->pos++];
+        {
+            int o = 0;
+
+            while (w->pos < w->n) {
+                int len = w->p[w->pos++];
+
+                if (len == 0)
+                    return o;
+                if (w->pos + len > w->n || o + len > cap)
+                    return -1;
+                memcpy(comp + o, w->p + w->pos, (size_t)len);
+                o += len;
+                w->pos += len;
+            }
+        }
+        return -1;
+    }
+    return -1;
+}
+
+int gif_decode(const void *data, int n, int index, u8 *rgba, int cap, GifFrame *out)
+{
+    GifWalk w = { 0 };
+    GifFrame f = { 0 };
+    u8 comp[32768] = { 0 };
+    int min_code = 0, clen = 0, i = 0, pixels = 0;
+    const u8 *pal = 0;
+    int palsz = 0;
+
+    if (!data || !rgba || index < 0 || cap <= 0)
+        return -1;
+    if (gif_open(&w, data, n) != 0)
+        return -1;
+    memset(&f, 0, sizeof f);
+    f.transparent = -1;
+    clen = gif_collect(&w, index, &f, comp, (int)sizeof comp, &min_code);
+    if (clen < 0)
+        return -1;
+    pixels = f.w * f.h;
+    if (pixels <= 0 || cap < pixels * 4)
+        return -1;
+    /* LZW 直接解进 rgba 的前半段（4 字节/像素的缓冲装得下索引） */
+    i = lzw_gif_decode(comp, clen, rgba, cap, min_code);
+    if (i != pixels)
+        return -1;
+    if (f.lct_colors > 0) {
+        pal = w.p + f.lct_off;
+        palsz = f.lct_colors;
+    } else {
+        pal = w.p + w.gct_off;
+        palsz = w.gct_colors;
+    }
+    if (!pal || palsz <= 0)
+        return -1;
+    /* 从后往前展开成 RGBA（写 4i..4i+3 不会覆盖还没读的索引 i） */
+    for (i = pixels - 1; i >= 0; i--) {
+        int idx = rgba[i];
+        int a = (idx == f.transparent) ? 0 : 255;
+        int r = 0, g = 0, b = 0;
+
+        if (idx < palsz) {
+            r = pal[idx * 3];
+            g = pal[idx * 3 + 1];
+            b = pal[idx * 3 + 2];
+        }
+        rgba[i * 4] = (u8)r;
+        rgba[i * 4 + 1] = (u8)g;
+        rgba[i * 4 + 2] = (u8)b;
+        rgba[i * 4 + 3] = (u8)a;
+    }
+    if (f.interlaced)
+        gif_deinterlace(rgba, f.w, f.h);
+    if (out)
+        *out = f;
+    return 0;
+}
+
+/* 隔行扫描的 4 遍：先重排到临时区，再拷回去 */
+void gif_deinterlace(u8 *rgba, int w, int h)
+{
+    static const int start[4] = { 0, 4, 2, 1 };
+    static const int step[4] = { 8, 8, 4, 2 };
+    u8 tmp[65536] = { 0 };
+    int rows = 0, pass = 0, y = 0, src = 0;
+
+    if (!rgba || w <= 0 || h <= 0 || (int)sizeof tmp < w * h * 4)
+        return;
+    rows = 0;
+    for (pass = 0; pass < 4; pass++)
+        for (y = start[pass]; y < h; y += step[pass])
+            rows++;
+    if (rows != h)
+        return;
+    src = 0;
+    for (pass = 0; pass < 4; pass++) {
+        for (y = start[pass]; y < h; y += step[pass]) {
+            memcpy(tmp + (size_t)y * w * 4, rgba + (size_t)src * w * 4,
+                   (size_t)w * 4);
+            src++;
+        }
+    }
+    memcpy(rgba, tmp, (size_t)w * h * 4);
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 3x2 调色板 GIF（4 色，索引 1 透明）*/
+static const char *GIF_STATIC =
+    "47494638396103000200810000ff000000ff000000ffffff0021f90401000001"
+    "002c00000000030002000008080001041030704040003b";
+
+/* 2x2 两帧动画（延迟 10/20 厘秒）*/
+static const char *GIF_ANIM =
+    "47494638396102000200810000ff000000000000000000000021ff0b4e455453"
+    "43415045322e30030100000021f904000a0000002c0000000002000200000806"
+    "0001080410100021f90401140001002c0000000002000200810000ff00000000"
+    "00000000000806000108041010003b";
+
+/* 4x8 隔行 GIF（每 4 列一条色带）*/
+static const char *GIF_INTERLACE =
+    "47494638396104000800810000ff000000ff000000ffffff002c000000000400"
+    "08004008160001081c285080c1830603280c30a0e180850c1d0604003b";
+
+test "静态 GIF：画布/调色板/透明色" {
+    u8 data[256] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(GIF_STATIC, data, (int)sizeof data);
+    GifInfo gi = gif_info(data, n);
+    GifFrame f = { 0 };
+
+    if (!gi.valid || gi.width != 3 || gi.height != 2)
+        return err(1, "画布尺寸不对");
+    if (gi.gct_colors != 4 || gi.frames != 1)
+        return err(2, "全局调色板或帧数不对");
+    if (gif_decode(data, n, 0, rgba, (int)sizeof rgba, &f) != 0)
+        return err(3, "解码失败");
+    if (f.w != 3 || f.h != 2 || f.transparent != 1 || f.interlaced)
+        return err(4, "帧头不对");
+    /* 索引序列 0,1,2,1,2,3：像素 1 和 3 透明，5 是黄色 */
+    if (rgba[0] != 255 || rgba[1] != 0 || rgba[2] != 0 || rgba[3] != 255)
+        return err(5, "像素 0 不是红色");
+    if (rgba[7] != 0 || rgba[15] != 0)
+        return err(6, "透明像素的 alpha 应该是 0");
+    if (rgba[8] != 0 || rgba[10] != 255 || rgba[11] != 255)
+        return err(7, "像素 2 不是蓝色");
+    if (rgba[20] != 255 || rgba[21] != 255 || rgba[22] != 0)
+        return err(8, "像素 5 不是黄色");
+    /* 越界帧索引与坏数据 */
+    if (gif_decode(data, n, 1, rgba, (int)sizeof rgba, 0) != -1)
+        return err(9, "越界帧应该失败");
+    if (gif_info(data, 5).valid)
+        return err(10, "截断的 GIF 不该有效");
+    data[0] = 'X';
+    if (gif_info(data, n).valid)
+        return err(11, "坏签名不该有效");
+}
+
+test "动画 GIF：帧数、延迟与逐帧解码" {
+    u8 data[256] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(GIF_ANIM, data, (int)sizeof data);
+    GifInfo gi = gif_info(data, n);
+    GifFrame f0 = { 0 }, f1 = { 0 };
+
+    if (!gi.valid || gi.frames != 2 || gi.width != 2 || gi.height != 2)
+        return err(12, "动画元信息不对");
+    if (gif_decode(data, n, 0, rgba, (int)sizeof rgba, &f0) != 0)
+        return err(13, "第 0 帧解码失败");
+    if (f0.delay_cs != 10 || rgba[0] != 255 || rgba[1] != 0 || rgba[2] != 0)
+        return err(14, "第 0 帧内容/延迟不对");
+    if (gif_decode(data, n, 1, rgba, (int)sizeof rgba, &f1) != 0)
+        return err(15, "第 1 帧解码失败");
+    if (f1.delay_cs != 20 || rgba[0] != 0 || rgba[1] != 0 || rgba[2] != 255)
+        return err(16, "第 1 帧内容/延迟不对");
+    /* 输出缓冲不够 */
+    if (gif_decode(data, n, 0, rgba, 8, 0) != -1)
+        return err(17, "缓冲不够应该 -1");
+}
+
+test "隔行 GIF：四遍重排回正常行序" {
+    u8 data[256] = { 0 };
+    u8 rgba[256] = { 0 };
+    int n = unhex(GIF_INTERLACE, data, (int)sizeof data);
+    GifFrame f = { 0 };
+    int y = 0, x = 0;
+    static const u8 want[4][4] = {
+        { 255, 0, 0, 255 }, { 0, 255, 0, 255 },
+        { 0, 0, 255, 255 }, { 255, 255, 0, 255 },
+    };
+
+    if (gif_decode(data, n, 0, rgba, (int)sizeof rgba, &f) != 0)
+        return err(18, "隔行 GIF 解码失败");
+    if (!f.interlaced || f.w != 4 || f.h != 8)
+        return err(19, "隔行帧头不对");
+    for (y = 0; y < 8; y++) {
+        int c = y % 4;
+
+        for (x = 0; x < 4; x++) {
+            const u8 *p = rgba + (y * 4 + x) * 4;
+
+            if (p[0] != want[c][0] || p[1] != want[c][1] || p[2] != want[c][2]
+                || p[3] != want[c][3])
+                return err(20, "隔行重排后的像素不对");
+        }
+    }
+}

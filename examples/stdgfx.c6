@@ -1,0 +1,202 @@
+/* stdgfx：标准库第三十二批（图像与 LZW）的拼装示例。
+ *
+ * 没有 `module`（入口 `main` 只能写在模块外的文件里），各节自带自检。
+ *
+ *   1. lzw：GIF 变体 LZW 的编码→解码往返（含字典涨满后的码宽提升）；
+ *   2. gif：3x2 的四色 GIF，带透明色，解出 RGBA 并核对；
+ *   3. tiff：4x3 的未压缩 RGB TIFF，解出 RGBA 并核对；
+ *   4. ico：同一张 4x3 图的两个图标（32 位 DIB 与 PNG 负载），两边结果必须一致；
+ *   5. png：把 ICO 里那段 PNG 单独交给 `std.data.png` 的 `png_decode`。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdgfx \
+ *         examples/stdgfx.c6 std/core/types.c6 std/core/crc.c6 \
+ *         std/text/str.c6 std/encoding/lzw.c6 std/encoding/zlib.c6 \
+ *         std/encoding/deflate.c6 std/data/png.c6 std/data/gif.c6 \
+ *         std/data/tiff.c6 std/data/ico.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.encoding.lzw;
+import std.data.gif;
+import std.data.png;
+import std.data.tiff;
+import std.data.ico;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 3x2 四色 GIF，索引 1 透明 */
+static const char *GIF_HEX =
+    "47494638396103000200810000ff000000ff000000ffffff0021f90401000001002c"
+    "00000000030002000008080001041030704040003b";
+
+/* 4x3 未压缩 RGB TIFF */
+static const char *TIFF_HEX =
+    "49492a00080000000a00000104000100000004000000010104000100000003000000"
+    "02010300030000008600000003010300010000000100000006010300010000000200"
+    "000011010400010000008c0000001501030001000000030000001601040001000000"
+    "030000001701040001000000240000001c0103000100000001000000000000000800"
+    "08000800ff000000ff000000ffffff000a141e28323c46505a646e78ffffff808080"
+    "000000c86432";
+
+/* 4x3 的 32 位 DIB 图标与同一张图的 PNG 负载图标 */
+static const char *ICO_DIB_HEX =
+    "0000010001000403000001002000640000001600000028000000040000000600000001"
+    "002000000000003000000000000000000000000000000000000000ffffffff808080ff"
+    "000000ff3264c8ff1e140a003c3228ff5a5046ff786e64ff0000ffff00ff00ffff0000"
+    "8000ffffff000000000000000000000000";
+
+static const char *ICO_PNG_HEX =
+    "0000010001000403000000002000660000001600000089504e470d0a1a0a0000000d49"
+    "48445200000004000000030806000000b4f4aec60000002d49444154789c05c13101"
+    "c02010c0c0b076668e083455c8cbc355b82388089aa2f56d515351a16a6602baffe9"
+    "01fa1e149a934ba2460000000049454e44ae426082";
+
+static void demo_lzw(void)
+{
+    u8 px[256] = { 0 };
+    u8 enc[512] = { 0 };
+    u8 dec[256] = { 0 };
+    int i = 0, n = 0, m = 0;
+
+    printf("== lzw\n");
+    for (i = 0; i < 256; i++)
+        px[i] = (u8)((i * 7) % 5);
+    n = lzw_gif_encode(px, 256, enc, (int)sizeof enc, 8);
+    m = lzw_gif_decode(enc, n > 0 ? n : 0, dec, (int)sizeof dec, 8);
+    check(n > 0 && m == 256 && memcmp(px, dec, 256) == 0, "LZW 往返");
+    printf("   256 字节压缩成 %d 字节，解回来 %d 字节\n", n, m);
+}
+
+static void demo_gif(void)
+{
+    u8 data[256] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(GIF_HEX, data, (int)sizeof data);
+    GifInfo gi = gif_info(data, n);
+    GifFrame f = { 0 };
+
+    printf("== gif\n");
+    check(gi.valid && gi.width == 3 && gi.height == 2 && gi.frames == 1,
+          "GIF 元信息");
+    check(gif_decode(data, n, 0, rgba, (int)sizeof rgba, &f) == 0, "GIF 解码");
+    check(rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0, "第一个像素是红色");
+    check(rgba[7] == 0, "透明像素 alpha=0");
+    printf("   %dx%d，%d 个全局色，透明索引 %d\n", gi.width, gi.height,
+           gi.gct_colors, f.transparent);
+}
+
+static void demo_tiff(void)
+{
+    u8 data[256] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(TIFF_HEX, data, (int)sizeof data);
+    TiffInfo ti = tiff_info(data, n);
+
+    printf("== tiff\n");
+    check(ti.valid && ti.width == 4 && ti.height == 3 && ti.samples == 3,
+          "TIFF 元信息");
+    check(tiff_decode(data, n, rgba, (int)sizeof rgba) == 0, "TIFF 解码");
+    check(rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0, "像素 0 是红色");
+    check(rgba[11 * 4] == 200 && rgba[11 * 4 + 1] == 100
+              && rgba[11 * 4 + 2] == 50,
+          "像素 11 是 (200,100,50)");
+    printf("   %dx%d，%d 样本/像素，压缩 %d，%d 条带\n", ti.width, ti.height,
+           ti.samples, ti.compression, ti.strips);
+}
+
+static void demo_ico(void)
+{
+    u8 dib[256] = { 0 }, png[256] = { 0 };
+    u8 a[64] = { 0 }, b[64] = { 0 };
+    int nd = unhex(ICO_DIB_HEX, dib, (int)sizeof dib);
+    int np = unhex(ICO_PNG_HEX, png, (int)sizeof png);
+    IcoEntry ed = ico_entry(dib, nd, 0);
+    IcoEntry ep = ico_entry(png, np, 0);
+
+    printf("== ico\n");
+    check(ed.valid && !ed.is_png && ed.width == 4 && ed.height == 3,
+          "DIB 图标目录项");
+    check(ep.valid && ep.is_png, "PNG 图标目录项");
+    check(ico_decode(dib, nd, 0, a, (int)sizeof a) == 0, "DIB 图标解码");
+    check(ico_decode(png, np, 0, b, (int)sizeof b) == 0, "PNG 图标解码");
+    check(memcmp(a, b, 48) == 0, "两种负载解出同一张图");
+    printf("   4x3，DIB 位深 %d、PNG 负载 %d 字节\n", ed.bpp, ep.size);
+}
+
+static void demo_png(void)
+{
+    u8 ico[256] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(ICO_PNG_HEX, ico, (int)sizeof ico);
+    IcoEntry e = ico_entry(ico, n, 0);
+    PngInfo pi = { 0 };
+    int dashes = 0, i = 0;
+
+    printf("== png\n");
+    if (!e.valid || !e.is_png) {
+        check(0, "PNG 图标目录项");
+        return;
+    }
+    pi = png_parse(ico + e.offset, e.size);
+    check(pi.valid && pi.width == 4 && pi.height == 3 && pi.color_type == 6,
+          "PNG IHDR");
+    check(png_decode(ico + e.offset, e.size, rgba, (int)sizeof rgba) == 0,
+          "png_decode");
+    check(rgba[0] == 255 && rgba[3] == 255, "PNG 首像素 RGBA");
+    for (i = 0; i < 12 * 4; i++) {
+        if (rgba[i] != 0)
+            dashes++;
+    }
+    /* 12 个像素里只有 3 个非零通道值很少的像素，用非零字节数做个粗校验 */
+    check(dashes > 12, "PNG 解出的像素不是全黑");
+    printf("   4x3 RGBA，颜色类型 %d，位深 %d\n", pi.color_type, pi.bit_depth);
+}
+
+int main(void)
+{
+    demo_lzw();
+    demo_gif();
+    demo_tiff();
+    demo_ico();
+    demo_png();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

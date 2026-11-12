@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx
 
 all: build
 
@@ -179,7 +179,7 @@ stdtest: build
 	    std/encoding/gzip.c6) deps="std/encoding/deflate.c6 std/core/crc.c6" ;; \
 	    std/encoding/tar.c6) deps="std/text/str.c6" ;; \
 	    std/data/wav.c6) deps="" ;; \
-	    std/data/png.c6) deps="std/core/crc.c6 std/text/str.c6" ;; \
+	    std/data/png.c6) deps="std/core/crc.c6 std/text/str.c6 std/encoding/zlib.c6 std/encoding/deflate.c6" ;; \
 	    std/data/elf.c6) deps="" ;; \
 	    std/data/zip.c6) deps="std/encoding/deflate.c6 std/core/crc.c6" ;; \
 	    std/data/bmp.c6) deps="" ;; \
@@ -190,6 +190,10 @@ stdtest: build
 	    std/data/x509.c6) deps="std/encoding/asn1.c6 std/text/str.c6" ;; \
 	    std/data/jwt.c6) deps="std/encoding/base64.c6 std/encoding/sha256.c6 std/encoding/sha512.c6 std/core/bits.c6 std/text/str.c6" ;; \
 	    std/encoding/otp.c6) deps="std/encoding/sha1.c6 std/core/bits.c6" ;; \
+	    std/encoding/lzw.c6) deps="" ;; \
+	    std/data/gif.c6) deps="std/encoding/lzw.c6" ;; \
+	    std/data/tiff.c6) deps="std/encoding/zlib.c6 std/encoding/deflate.c6 std/encoding/rle.c6" ;; \
+	    std/data/ico.c6) deps="std/data/png.c6 std/core/crc.c6 std/text/str.c6 std/encoding/zlib.c6 std/encoding/deflate.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -580,6 +584,18 @@ std-enc: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdenc $(STD_ENC_SRCS)
 	./build/stdenc
 
+# 标准库第三十二批（图像与 LZW）：lzw / gif / tiff / ico（并给 png 补 png_decode）。
+# 示例做 LZW 往返、解四种格式，最后把 ICO 里嵌的 PNG 单独解一遍。
+STD_GFX_SRCS := examples/stdgfx.c6 std/core/types.c6 std/core/crc.c6 \
+                std/text/str.c6 std/encoding/lzw.c6 std/encoding/zlib.c6 \
+                std/encoding/deflate.c6 std/encoding/rle.c6 std/data/png.c6 \
+                std/data/gif.c6 std/data/tiff.c6 std/data/ico.c6
+
+std-gfx: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdgfx $(STD_GFX_SRCS)
+	./build/stdgfx
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -684,7 +700,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -693,13 +709,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的三十一个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的三十二个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
 # test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img
 # 是三十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -875,6 +891,7 @@ distclean:
 #   std-bin          编译并运行 examples/stdbin.c6（第二十九批，二进制文件格式）
 #   std-img          编译并运行 examples/stdimg.c6（第三十批，图像解码）
 #   std-enc          编译并运行 examples/stdenc.c6（第三十一批，编码与凭据）
+#   std-gfx          编译并运行 examples/stdgfx.c6（第三十二批，图像与 LZW）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

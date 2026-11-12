@@ -1,0 +1,367 @@
+/* std/data/ico：Windows 图标（.ico）解析与解码（零分配）。
+ *
+ *     import std.data.ico;
+ *
+ *     IcoInfo ii = ico_info(data, n);
+ *     u8 rgba[4 * 4096];
+ *     if (ico_decode(data, n, 0, rgba, (int)sizeof rgba) == 0) {
+ *         // 第 0 个图标的 RGBA8888
+ *     }
+ *
+ * .ico 是「ICONDIR + 若干 ICONDIRENTRY + 各自的图像数据」。图像数据有两种：
+ *
+ *   - **PNG**（现代工具常用）：整个 PNG 文件内嵌，直接交给
+ *     `std.data.png` 的 `png_decode`；
+ *   - **DIB**：一个没有 BITMAPFILEHEADER 的 BITMAPINFOHEADER + 调色板 +
+ *     自下而上的 XOR 位图 + 1bpp 的 AND 掩码（透明位）。
+ *
+ * 支持：1/4/8/24/32 位 DIB、调色板（`clrUsed` 为 0 时按 2^bpp）、AND 掩码透明、
+ * 32 位的 alpha（全 0 时按不透明处理——老图标常这么写）、PNG 负载。
+ *
+ * 约定：
+ *
+ * - `ico_entry` 给第 `index` 个目录项（宽高、位深、字节数、偏移、是否 PNG）；
+ * - `ico_decode` 输出 `entry.width x entry.height` 的 RGBA；PNG 负载的尺寸必须
+ *   跟目录项一致，否则 -1；
+ * - 不支持 BI_RLE/BI_PNG 之外的压缩 DIB（`biCompression != 0` 且 `!= 3`
+ *   一律 -1）、16 位 555/565、.cur 光标（type=2 直接 -1）；
+ * - 目录项宽度/高度字节为 0 表示 256。
+ */
+#include <string.h>
+
+module std.data.ico;
+import std.core.types;
+import std.data.png;
+
+struct IcoEntry {
+    int valid;
+    int width;
+    int height;
+    int planes;
+    int bpp;
+    int size;
+    int offset;
+    int is_png;
+};
+
+struct IcoInfo {
+    int valid;
+    int count;
+};
+
+static IcoEntry ico_bad_entry(void)
+{
+    IcoEntry e = { 0 };
+
+    return e;
+}
+
+static int ico_u16(const u8 *p) { return p[0] | (p[1] << 8); }
+
+static u64 ico_u32(const u8 *p)
+{
+    return (u64)p[0] | ((u64)p[1] << 8) | ((u64)p[2] << 16)
+           | ((u64)p[3] << 24);
+}
+
+static int ico_s32(const u8 *p)
+{
+    i64 v = (i64)(ico_u32(p) & 0xffffffffu);
+
+    if (v & (i64)0x80000000)
+        v -= (i64)0x100000000;
+    return (int)v;
+}
+
+IcoInfo ico_info(const void *data, int n)
+{
+    IcoInfo ii = { 0 };
+    const u8 *p = (const u8 *)data;
+
+    if (!p || n < 6 || ico_u16(p) != 0 || ico_u16(p + 2) != 1)
+        return ii;
+    ii.count = ico_u16(p + 4);
+    if (ii.count <= 0 || 6 + ii.count * 16 > n)
+        return ii;
+    ii.valid = 1;
+    return ii;
+}
+
+IcoEntry ico_entry(const void *data, int n, int index)
+{
+    IcoEntry e = { 0 };
+    const u8 *p = (const u8 *)data;
+
+    if (!p || n < 6 || index < 0 || 6 + (index + 1) * 16 > n)
+        return ico_bad_entry();
+    if (ico_u16(p) != 0 || ico_u16(p + 2) != 1)
+        return ico_bad_entry();
+    if (index >= ico_u16(p + 4))
+        return ico_bad_entry();
+    p += 6 + index * 16;
+    e.width = p[0] ? p[0] : 256;
+    e.height = p[1] ? p[1] : 256;
+    e.planes = ico_u16(p + 4);
+    e.bpp = ico_u16(p + 6);
+    e.size = (int)ico_u32(p + 8);
+    e.offset = (int)ico_u32(p + 12);
+    if (e.width <= 0 || e.height <= 0 || e.size <= 0 || e.offset <= 0
+        || (i64)e.offset + e.size > n)
+        return ico_bad_entry();
+    if (e.size >= 8 && memcmp((const u8 *)data + e.offset, "\x89PNG\r\n\x1a\n", 8) == 0)
+        e.is_png = 1;
+    e.valid = 1;
+    return e;
+}
+
+/* DIB 负载 */
+static int ico_dib(const u8 *d, int n, IcoEntry *e, u8 *rgba, int cap)
+{
+    int hdr = 0, w = 0, h = 0, bpp = 0, comp = 0, clr = 0, pal = 0;
+    int xor_off = 0, row = 0, mask_off = 0, mask_row = 0, has_mask = 0;
+    int x = 0, y = 0;
+
+    if (n < 40)
+        return -1;
+    hdr = (int)ico_u32(d);
+    if (hdr < 40 || hdr > n)
+        return -1;
+    w = ico_s32(d + 4);
+    h = ico_s32(d + 8);
+    bpp = ico_u16(d + 14);
+    comp = (int)ico_u32(d + 16);
+    clr = (int)ico_u32(d + 32);
+    /* biHeight 是像素高度的两倍（XOR 位图 + AND 掩码）；少数文件只写一份 */
+    if (w <= 0 || h <= 0 || w != e->width
+        || (h != e->height * 2 && h != e->height))
+        return -1;
+    {
+        int with_mask = (h == e->height * 2);
+
+        h = e->height;
+        mask_row = with_mask ? (((w + 31) / 32) * 4) : 0;
+    }
+    if (comp != 0 && comp != 3)
+        return -1;
+    if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32)
+        return -1;
+    if (bpp <= 8) {
+        if (clr == 0)
+            clr = 1 << bpp;
+        if (clr <= 0 || clr > 256 || hdr + clr * 4 > n)
+            return -1;
+    } else {
+        clr = 0;
+    }
+    pal = hdr;
+    xor_off = hdr + clr * 4;
+    row = ((w * bpp + 31) / 32) * 4;
+    if (xor_off + row * h > n)
+        return -1;
+    mask_off = xor_off + row * h;
+    has_mask = (mask_row > 0 && mask_off + mask_row * h <= n);
+    if (cap < w * h * 4)
+        return -1;
+    /* 32 位图标的 alpha 全 0 时按不透明处理（老工具写的图标没有 alpha 通道）*/
+    {
+        int has_alpha = 0;
+
+        if (bpp == 32) {
+            for (y = 0; y < h && !has_alpha; y++) {
+                const u8 *src = d + xor_off + (size_t)y * row;
+
+                for (x = 0; x < w; x++)
+                    if (src[x * 4 + 3] != 0) {
+                        has_alpha = 1;
+                        break;
+                    }
+            }
+            if (!has_alpha)
+                bpp = 32 | 0x100;       /* 标记：按不透明读 */
+        }
+    }
+    for (y = 0; y < h; y++) {
+        const u8 *src = d + xor_off + (size_t)(h - 1 - y) * row;
+        const u8 *msk = has_mask ? d + mask_off + (size_t)(h - 1 - y) * mask_row : 0;
+        u8 *o = rgba + (size_t)y * w * 4;
+
+        for (x = 0; x < w; x++, o += 4) {
+            int transparent = 0;
+
+            if (msk && (msk[x >> 3] & (0x80 >> (x & 7))))
+                transparent = 1;
+            if ((bpp & 0xff) == 32) {
+                int b0 = src[x * 4], g0 = src[x * 4 + 1];
+                int r0 = src[x * 4 + 2], a0 = src[x * 4 + 3];
+
+                if (transparent)
+                    a0 = 0;
+                else if (bpp & 0x100)
+                    a0 = 255;
+                o[0] = (u8)r0;
+                o[1] = (u8)g0;
+                o[2] = (u8)b0;
+                o[3] = (u8)a0;
+            } else if (bpp == 24) {
+                o[0] = src[x * 3 + 2];
+                o[1] = src[x * 3 + 1];
+                o[2] = src[x * 3];
+                o[3] = transparent ? 0 : 255;
+            } else {
+                int idx = 0;
+
+                if (bpp == 8) {
+                    idx = src[x];
+                } else if (bpp == 4) {
+                    idx = (x & 1) ? (src[x >> 1] & 0x0f) : (src[x >> 1] >> 4);
+                } else {
+                    idx = (src[x >> 3] >> (7 - (x & 7))) & 1;
+                }
+                if (idx >= clr)
+                    idx = 0;
+                o[0] = d[pal + idx * 4 + 2];
+                o[1] = d[pal + idx * 4 + 1];
+                o[2] = d[pal + idx * 4];
+                o[3] = transparent ? 0 : 255;
+            }
+        }
+    }
+    return 0;
+}
+
+int ico_decode(const void *data, int n, int index, u8 *rgba, int cap)
+{
+    IcoEntry e = ico_entry(data, n, index);
+    const u8 *p = (const u8 *)data;
+
+    if (!e.valid || !rgba || cap < e.width * e.height * 4)
+        return -1;
+    if (e.is_png) {
+        PngInfo pi = png_parse(p + e.offset, e.size);
+
+        if (!pi.valid || pi.width != e.width || pi.height != e.height)
+            return -1;
+        return png_decode(p + e.offset, e.size, rgba, cap);
+    }
+    return ico_dib(p + e.offset, e.size, &e, rgba, cap);
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 4x3 的 32 位 DIB 图标（自下而上 + 全零 AND 掩码）*/
+static const char *ICO_DIB =
+    "00000100010004030000010020006400000016000000280000000400000006000000"
+    "01002000000000003000000000000000000000000000000000000000ffffffff8080"
+    "80ff000000ff3264c8ff1e140a003c3228ff5a5046ff786e64ff0000ffff00ff00ff"
+    "ff00008000ffffff000000000000000000000000";
+
+/* 同一张图、PNG 负载的图标 */
+static const char *ICO_PNG =
+    "0000010001000403000000002000660000001600000089504e470d0a1a0a0000000d49"
+    "48445200000004000000030806000000b4f4aec60000002d49444154789c05c13101"
+    "c02010c0c0b076668e083455c8cbc355b82388089aa2f56d515351a16a6602baffe9"
+    "01fa1e149a934ba2460000000049454e44ae426082";
+
+/* 期望 RGBA（12 个像素）*/
+static const char *ICO_WANT =
+    "ff0000ff00ff00ff0000ff80ffff00ff0a141e0028323cff46505aff646e78ffffffff"
+    "ff808080ff000000ffc86432ff";
+
+static int ico_check(const char *hex, const char *want_hex)
+{
+    u8 buf[512] = { 0 };
+    u8 rgba[64] = { 0 };
+    u8 want[64] = { 0 };
+    int n = unhex(hex, buf, (int)sizeof buf);
+    int wn = unhex(want_hex, want, (int)sizeof want);
+
+    if (n <= 0 || wn <= 0)
+        return -1;
+    if (ico_decode(buf, n, 0, rgba, (int)sizeof rgba) != 0)
+        return -2;
+    if (memcmp(rgba, want, (size_t)wn) != 0)
+        return -3;
+    return 0;
+}
+
+test "DIB 与 PNG 两种负载都解成 RGBA" {
+    u8 buf[512] = { 0 };
+    int n = unhex(ICO_DIB, buf, (int)sizeof buf);
+    IcoInfo ii = ico_info(buf, n);
+    IcoEntry e = ico_entry(buf, n, 0);
+
+    if (!ii.valid || ii.count != 1)
+        return err(1, "ICONDIR 不对");
+    if (!e.valid || e.width != 4 || e.height != 3 || e.bpp != 32 || e.is_png)
+        return err(2, "DIB 目录项不对");
+    if (ico_check(ICO_DIB, ICO_WANT) != 0)
+        return err(3, "DIB 图标解码不对");
+    if (ico_entry(buf, n, 1).valid)
+        return err(4, "越界目录项不该有效");
+    /* PNG 负载 */
+    if (ico_check(ICO_PNG, ICO_WANT) != 0)
+        return err(5, "PNG 图标解码不对");
+    memset(buf, 0, sizeof buf);
+    n = unhex(ICO_PNG, buf, (int)sizeof buf);
+    {
+        IcoEntry ep = ico_entry(buf, n, 0);
+
+        if (!ep.valid || !ep.is_png || ep.width != 4 || ep.height != 3)
+            return err(6, "PNG 目录项不对");
+    }
+}
+
+test "坏图标与容量边界" {
+    u8 buf[512] = { 0 };
+    u8 rgba[64] = { 0 };
+    int n = unhex(ICO_DIB, buf, (int)sizeof buf);
+
+    if (ico_info(buf, 5).valid)
+        return err(7, "截断的 ICONDIR 不该有效");
+    if (ico_info(buf, n).count != 1)
+        return err(8, "目录项计数不对");
+    buf[2] = 2;                         /* type=2（.cur）*/
+    if (ico_info(buf, n).valid || ico_entry(buf, n, 0).valid)
+        return err(9, ".cur 不该有效");
+    buf[2] = 1;
+    if (ico_decode(buf, n, 0, rgba, 8) != -1)
+        return err(10, "缓冲不够应该 -1");
+    if (ico_decode(buf, n, 3, rgba, (int)sizeof rgba) != -1)
+        return err(11, "越界索引应该 -1");
+    if (ico_decode(0, n, 0, rgba, (int)sizeof rgba) != -1
+        || ico_decode(buf, n, 0, 0, (int)sizeof rgba) != -1)
+        return err(12, "空指针应该 -1");
+    /* 目录项声明的尺寸跟 DIB 头不一致 */
+    {
+        u8 copy[512] = { 0 };
+
+        memcpy(copy, buf, (size_t)n);
+        copy[6] = 5;                    /* 目录项宽改成 5 */
+        if (ico_decode(copy, n, 0, rgba, (int)sizeof rgba) != -1)
+            return err(13, "尺寸不一致应该 -1");
+    }
+}

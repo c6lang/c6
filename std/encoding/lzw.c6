@@ -1,0 +1,365 @@
+/* std/encoding/lzw：GIF 变体的 LZW 编解码（零分配）。
+ *
+ *     import std.encoding.lzw;
+ *
+ *     u8 px[4096];
+ *     int n = lzw_gif_decode(data, len, px, (int)sizeof px, 8);
+ *     int m = lzw_gif_encode(px, n, out, (int)sizeof out, 8);
+ *
+ * GIF 的 LZW 有这几个特点，和 TIFF/Unix compress 的变体都不一样：
+ *
+ *   - 码流按**低位在前**（LSB）打包；
+ *   - 起始码宽 `min_code+1`，`clear = 1<<min_code`、`eoi = clear+1`；
+ *   - 字典涨到 `1<<码宽` 时码宽加一，最大 12 位；
+ *   - 遇到 clear 就重置字典和码宽（编码器在字典满时发 clear）；
+ *   - 没有 early-change，最后一个码之后直接是 eoi。
+ *
+ * `lzw_gif_decode` 的 `min_code` 取 2..8（GIF 的 LZW minimum code size），
+ * `lzw_gif_encode` 用贪心最长匹配 + 线性扫字典（数据量小、代码小；不追求速度）。
+ *
+ * 约定：
+ *
+ * - 解码返回写出的字节数；码流截断、码值超过字典、字典溢出、放不下都返回 -1，
+ *   且失败时不写半截（先解到内部临时区，成功才拷出去）；
+ * - 编码返回字节数；`cap` 不够返回 -1（不写半截）；
+ * - 输入为空时解码返回 0（合法），编码也返回 0；
+ * - 中间缓冲在栈上（约 20KB），不要在很深的递归里用。
+ */
+#include <string.h>
+
+module std.encoding.lzw;
+import std.core.types;
+
+#define LZW_MAX_CODES 4096
+
+struct LzwDict {
+    int prefix[LZW_MAX_CODES];
+    u8 suffix[LZW_MAX_CODES];
+    u8 first[LZW_MAX_CODES];
+};
+
+/* LSB 先的位读取器 */
+struct LzwBits {
+    const u8 *p;
+    int n;
+    int pos;
+    u32 acc;
+    int bits;
+};
+
+static int lzw_bits_get(LzwBits *b, int size)
+{
+    while (b->bits < size) {
+        if (b->pos >= b->n)
+            return -1;
+        b->acc |= (u32)b->p[b->pos++] << b->bits;
+        b->bits += 8;
+    }
+    {
+        u32 mask = (1u << size) - 1u;
+        u32 v = b->acc & mask;
+
+        b->acc >>= size;
+        b->bits -= size;
+        return (int)v;
+    }
+}
+
+/* 把 code 对应的串写进 out（从 o 开始），返回新的 o；放不下 -1 */
+static int lzw_emit(LzwDict *d, int code, u8 *out, int o, int cap)
+{
+    u8 tmp[LZW_MAX_CODES] = { 0 };
+    int t = 0;
+
+    while (code >= 0) {
+        if (code >= LZW_MAX_CODES || t >= LZW_MAX_CODES)
+            return -1;
+        tmp[t++] = d->suffix[code];
+        code = d->prefix[code];
+    }
+    if (o + t > cap)
+        return -1;
+    while (t > 0)
+        out[o++] = tmp[--t];
+    return o;
+}
+
+static void lzw_reset(LzwDict *d, int clear)
+{
+    int i = 0;
+
+    for (i = 0; i < clear; i++) {
+        d->prefix[i] = -1;
+        d->suffix[i] = (u8)i;
+        d->first[i] = (u8)i;
+    }
+}
+
+int lzw_gif_decode(const void *src, int n, u8 *out, int cap, int min_code)
+{
+    LzwBits b = { 0, 0, 0, 0, 0 };
+    LzwDict d = { 0 };
+    u8 tmp[LZW_MAX_CODES * 2] = { 0 };
+    int clear = 0, eoi = 0, next = 0, size = 0;
+    int o = 0, prev = -1, code = 0;
+
+    if (!src || !out || n < 0 || cap < 0 || min_code < 2 || min_code > 8)
+        return -1;
+    if (n == 0)
+        return 0;
+    clear = 1 << min_code;
+    eoi = clear + 1;
+    b.p = (const u8 *)src;
+    b.n = n;
+    b.pos = 0;
+    b.acc = 0;
+    b.bits = 0;
+    lzw_reset(&d, clear);
+    next = eoi + 1;
+    size = min_code + 1;
+    for (;;) {
+        code = lzw_bits_get(&b, size);
+        if (code < 0)
+            break;                  /* 没 eoi 就结束：GIF 里常见，按截断处理 */
+        if (code == clear) {
+            lzw_reset(&d, clear);
+            next = eoi + 1;
+            size = min_code + 1;
+            prev = -1;
+            continue;
+        }
+        if (code == eoi)
+            break;
+        if (prev < 0) {
+            if (code >= clear)
+                return -1;
+            if (o >= cap)
+                return -1;
+            tmp[o++] = d.suffix[code];
+            prev = code;
+            continue;
+        }
+        if (code > next)
+            return -1;
+        {
+            int old_next = next;
+            int emit_code = (code == old_next) ? prev : code;
+            int kwkwk = (code == old_next);
+            u8 fc = 0;
+
+            if (kwkwk)
+                fc = d.first[prev];
+            else
+                fc = d.first[code];
+            if (next < LZW_MAX_CODES) {
+                d.prefix[next] = prev;
+                d.suffix[next] = fc;
+                d.first[next] = d.first[prev];
+                next++;
+                /* 解码器比编码器晚一个条目建表，所以码宽要早一格长 */
+                if (next == (1 << size) - 1 && size < 12)
+                    size++;
+            }
+            o = lzw_emit(&d, emit_code, tmp, o, (int)sizeof tmp);
+            if (o < 0)
+                return -1;
+            if (kwkwk) {
+                if (o >= (int)sizeof tmp)
+                    return -1;
+                tmp[o++] = fc;
+            }
+            prev = code;
+        }
+    }
+    if (o > cap)
+        return -1;
+    memcpy(out, tmp, (size_t)o);
+    return o;
+}
+
+/* 字典查找：找 (prefix, byte) 的编码；没有返回 -1 */
+static int lzw_find(LzwDict *d, int prefix, int byte, int next)
+{
+    int i = 0;
+
+    for (i = 0; i < next; i++)
+        if (d->prefix[i] == prefix && d->suffix[i] == (u8)byte)
+            return i;
+    return -1;
+}
+
+struct LzwOut {
+    u8 *p;
+    int cap;
+    int n;
+    u32 acc;
+    int bits;
+    int overflow;
+};
+
+static void lzw_put(LzwOut *o, int code, int size)
+{
+    o->acc |= (u32)code << o->bits;
+    o->bits += size;
+    while (o->bits >= 8) {
+        if (o->n < o->cap)
+            o->p[o->n] = (u8)(o->acc & 0xff);
+        else
+            o->overflow = 1;
+        o->n++;
+        o->acc >>= 8;
+        o->bits -= 8;
+    }
+}
+
+static void lzw_flush(LzwOut *o)
+{
+    if (o->bits > 0) {
+        if (o->n < o->cap)
+            o->p[o->n] = (u8)(o->acc & 0xff);
+        else
+            o->overflow = 1;
+        o->n++;
+        o->acc = 0;
+        o->bits = 0;
+    }
+}
+
+int lzw_gif_encode(const void *src, int n, u8 *out, int cap, int min_code)
+{
+    LzwDict d = { 0 };
+    LzwOut w = { 0 };
+    const u8 *s = (const u8 *)src;
+    int clear = 0, eoi = 0, next = 0, size = 0;
+    int i = 0, cur = -1;
+
+    if (!src || !out || n < 0 || cap < 0 || min_code < 2 || min_code > 8)
+        return -1;
+    if (n == 0)
+        return 0;
+    clear = 1 << min_code;
+    eoi = clear + 1;
+    lzw_reset(&d, clear);
+    next = eoi + 1;
+    size = min_code + 1;
+    w.p = out;
+    w.cap = cap;
+    w.n = 0;
+    w.acc = 0;
+    w.bits = 0;
+    w.overflow = 0;
+    lzw_put(&w, clear, size);
+    cur = s[0];
+    for (i = 1; i < n; i++) {
+        int found = lzw_find(&d, cur, s[i], next);
+
+        if (found >= 0) {
+            cur = found;
+            continue;
+        }
+        lzw_put(&w, cur, size);
+        if (next < LZW_MAX_CODES) {
+            d.prefix[next] = cur;
+            d.suffix[next] = s[i];
+            d.first[next] = d.first[cur];
+            next++;
+            if (next == (1 << size) && size < 12)
+                size++;
+        } else {
+            lzw_put(&w, clear, size);
+            lzw_reset(&d, clear);
+            next = eoi + 1;
+            size = min_code + 1;
+        }
+        cur = s[i];
+    }
+    lzw_put(&w, cur, size);
+    lzw_put(&w, eoi, size);
+    lzw_flush(&w);
+    if (w.overflow)
+        return -1;
+    return w.n;
+}
+
+/* ---- 自测 ---- */
+
+test "GIF LZW 往返（min_code 2 与 8）" {
+    u8 px[512] = { 0 };
+    u8 enc[1024] = { 0 };
+    u8 dec[512] = { 0 };
+    int i = 0, n = 0, m = 0, k = 0;
+
+    /* 四色交替 */
+    for (i = 0; i < 512; i++)
+        px[i] = (u8)(i % 4);
+    n = lzw_gif_encode(px, 512, enc, (int)sizeof enc, 2);
+    if (n <= 0)
+        return err(1, "min_code=2 编码失败");
+    m = lzw_gif_decode(enc, n, dec, (int)sizeof dec, 2);
+    if (m != 512 || memcmp(px, dec, 512) != 0)
+        return err(2, "min_code=2 往返不一致");
+    /* 长串重复（RUN 式）跑满字典增长与 clear */
+    for (i = 0; i < 512; i++)
+        px[i] = 7;
+    n = lzw_gif_encode(px, 512, enc, (int)sizeof enc, 8);
+    if (n <= 0)
+        return err(3, "min_code=8 编码失败");
+    m = lzw_gif_decode(enc, n, dec, (int)sizeof dec, 8);
+    if (m != 512 || memcmp(px, dec, 512) != 0)
+        return err(4, "min_code=8 往返不一致");
+    /* 伪随机序列让字典真的长起来 */
+    {
+        u32 x = 12345;
+
+        for (i = 0; i < 512; i++) {
+            x = x * 1103515245u + 12345u;
+            px[i] = (u8)((x >> 16) & 0xff);
+        }
+        n = lzw_gif_encode(px, 512, enc, (int)sizeof enc, 8);
+        m = lzw_gif_decode(enc, n, dec, (int)sizeof dec, 8);
+        if (n <= 0 || m != 512 || memcmp(px, dec, 512) != 0)
+            return err(5, "随机数据的往返不一致");
+    }
+    k = lzw_gif_encode(px, 0, enc, (int)sizeof enc, 8);
+    if (k != 0)
+        return err(6, "空输入编码应该 0");
+    if (lzw_gif_decode(enc, 0, dec, (int)sizeof dec, 8) != 0)
+        return err(7, "空输入解码应该 0");
+}
+
+test "坏码流与容量边界" {
+    u8 enc[64] = { 0 };
+    u8 dec[64] = { 0 };
+    u8 small[4] = { 0 };
+
+    /* clear + eoi，码宽 3 */
+    /* 000 001 011 -> 3 个 3 位码：clear=4,eoi=5 */
+    enc[0] = 0x2c;                  /* 100 101 00 的 LSB 打包 */
+    enc[1] = 0x01;
+    if (lzw_gif_decode(enc, 2, dec, (int)sizeof dec, 2) != 0)
+        return err(8, "只有 clear+eoi 应该解出空");
+    /* 截断：一个不带 eoi 的码 */
+    enc[0] = 0x04;
+    if (lzw_gif_decode(enc, 1, dec, (int)sizeof dec, 2) < 0)
+        return err(9, "截断的码流不该崩");
+    /* 放不下 */
+    {
+        u8 px[32] = { 0 };
+        int n = 0, j = 0;
+
+        for (j = 0; j < 32; j++)
+            px[j] = (u8)(j % 3);
+        n = lzw_gif_encode(px, 32, enc, (int)sizeof enc, 2);
+        if (n <= 0 || lzw_gif_decode(enc, n, small, (int)sizeof small, 2) != -1)
+            return err(10, "输出缓冲不够应该 -1");
+    }
+    /* 参数检查 */
+    if (lzw_gif_decode(0, 4, dec, (int)sizeof dec, 2) != -1
+        || lzw_gif_decode(enc, 4, 0, 4, 2) != -1)
+        return err(11, "空指针应该 -1");
+    if (lzw_gif_encode(dec, 4, enc, (int)sizeof enc, 1) != -1
+        || lzw_gif_encode(dec, 4, enc, (int)sizeof enc, 9) != -1)
+        return err(12, "非法 min_code 应该 -1");
+    if (lzw_gif_encode(dec, 4, enc, 2, 8) != -1)
+        return err(13, "编码缓冲不够应该 -1");
+}

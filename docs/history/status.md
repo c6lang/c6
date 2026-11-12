@@ -1325,3 +1325,29 @@ sha512 + bits，otp 要 sha1 + bits。示例 `examples/stdenc.c6` 先走手写 D
 验收：`make stdtest`（137 个模块、0 failure）、`make std-enc`（24 条自检全过）、
 `make check-all`。
 
+### 11.44 标准库第三十二批（lzw / gif / tiff / ico）
+
+第三十二批补图像这条线里剩下的常见格式，外加它们共用的 LZW：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.lzw` | GIF 变体 LZW | LSB 打包、clear/eoi、码宽 2..12 位；解码端比编码端晚一个条目建表，所以码宽早一格长（`next == (1<<size)-1`）；编码器贪心最长匹配 + 线性扫字典（数据量小，代码小）；不处理 TIFF/Unix compress 的 MSB 变体 |
+| `std.data.gif` | GIF87a/89a | 全局/局部调色板、图形控制扩展（透明色/延迟/处置）、隔行扫描 4 遍重排、多帧按索引取；LZW 直接解进调用方的 RGBA 缓冲再倒着展开（省一次拷贝）；不合成画布 |
+| `std.data.tiff` | 基线 TIFF | II/MM 字节序、STRIP、8 位 chunky、none/Deflate(zlib)/PackBits、RGB 与两种灰度、1/3/4 样本；LZW/JPEG/16 位/分平面/分块一律 -1；单条带临时区上限 64KB |
+| `std.data.ico` | Windows .ico | 目录项 + 32/24/8/4/1 位 DIB（自下而上、BGRA、AND 掩码透明、32 位 alpha 全 0 按不透明）或内嵌 PNG（分派给 `png_decode`）；.cur 与 16 位 DIB 不支持 |
+
+顺带给 `std.data.png` 补了真正的像素解码 `png_decode`：8 位、非隔行、颜色类型
+0/2/3/4/6、五种滤波（None/Sub/Up/Average/Paeth）、tRNS 透明色与调色板 alpha，
+输出 RGBA8888；16 位、1/2/4 位、Adam7 隔行返回 -1。ICO 的 PNG 负载与示例都靠它。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.lzw`=0x6089、
+`std.data.gif`=0x608a、`std.data.tiff`=0x608b、`std.data.ico`=0x608c；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-gfx` 与 `STD_GFX_SRCS`，`test-all`/`check-all` 都带上
+它；`stdtest` 的依赖：gif 要 lzw，tiff 要 zlib + rle，ico 要 png，lzw 自成一体。
+示例 `examples/stdgfx.c6` 做 LZW 往返、解 GIF/TIFF、用同一张图的两个 ICO 负载
+逐字节比对，再把 ICO 里的 PNG 单独解一遍。
+
+验收：`make stdtest`（141 个模块、0 failure）、`make std-gfx`（18 条自检全过）、
+`make check-all`。
+
+

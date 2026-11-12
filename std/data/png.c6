@@ -20,7 +20,12 @@
  *   偏移，`c.crc_ok` 用 IEEE CRC-32 校验；CRC 错**不**中止遍历（让调用方决定
  *   是忽略这块还是拒绝整个文件）；
  * - `png_parse` 是便捷入口：校验签名 + 解析 IHDR，给出宽/高/位深/颜色类型；
- * - 只支持标准 PNG（APNG 的 `acTL` 等块会当未知块跳过）。
+ * - 只支持标准 PNG（APNG 的 `acTL` 等块会当未知块跳过）；
+ * - `png_decode` 是完整的像素解码：8 位、非隔行、颜色类型 0/2/3/4/6，
+ *   五种滤波（None/Sub/Up/Average/Paeth），tRNS 透明色/调色板 alpha；
+ *   输出 RGBA8888。16 位、1/2/4 位、Adam7 隔行返回 -1。
+ *   压缩后的 IDAT 总长上限 64KB，解压后的原始扫描线上限 128KB
+ *   （`PNG_MAX_IDAT` / `PNG_MAX_RAW`），超了返回 -1。
  */
 #include <string.h>
 
@@ -28,6 +33,7 @@ module std.data.png;
 import std.core.types;
 import std.core.crc;
 import std.text.str;
+import std.encoding.zlib;
 
 #define PNG_CRC_POLY 0x04c11db7u
 
@@ -161,6 +167,197 @@ PngInfo png_parse(const void *p, int n)
         info.valid = 1;
     }
     return info;
+}
+
+#define PNG_MAX_IDAT 65536
+#define PNG_MAX_RAW 131072
+
+static int png_abs(int v) { return v < 0 ? -v : v; }
+
+static int png_paeth(int a, int b, int c)
+{
+    int p = a + b - c;
+    int pa = png_abs(p - a), pb = png_abs(p - b), pc = png_abs(p - c);
+
+    if (pa <= pb && pa <= pc)
+        return a;
+    if (pb <= pc)
+        return b;
+    return c;
+}
+
+int png_decode(const void *png, int n, u8 *rgba, int cap)
+{
+    PngReader r = png_reader(png, n);
+    PngChunk c = { 0 };
+    u8 comp[PNG_MAX_IDAT] = { 0 };
+    u8 raw[PNG_MAX_RAW] = { 0 };
+    u8 plte[768] = { 0 };
+    u8 trns[256] = { 0 };
+    int comp_len = 0, raw_len = 0, plte_len = 0, trns_len = 0;
+    int w = 0, h = 0, bd = 0, ct = 0, inter = 0;
+    int ch = 0, stride = 0, i = 0, x = 0, y = 0;
+
+    if (r.bad || !rgba || cap <= 0)
+        return -1;
+    for (;;) {
+        int k = r.next(&c);
+
+        if (k < 0)
+            return -1;          /* 块结构坏了，后面可能还缺 IDAT */
+        if (k == 0)
+            break;
+        if (memcmp(c.type, "IHDR", 4) == 0) {
+            const u8 *d = 0;
+
+            if (c.length != 13 || !c.crc_ok)
+                return -1;
+            d = r.p + c.offset;
+            w = (int)png_le32(d);
+            h = (int)png_le32(d + 4);
+            bd = d[8];
+            ct = d[9];
+            inter = d[12];
+            if (w <= 0 || h <= 0 || bd != 8 || inter != 0)
+                return -1;
+        } else if (memcmp(c.type, "PLTE", 4) == 0) {
+            if (c.length < 3 || c.length > 768 || c.length % 3 != 0)
+                return -1;
+            memcpy(plte, r.p + c.offset, (size_t)c.length);
+            plte_len = (int)c.length / 3;
+        } else if (memcmp(c.type, "tRNS", 4) == 0) {
+            if (c.length < 1 || c.length > 256)
+                return -1;
+            memcpy(trns, r.p + c.offset, (size_t)c.length);
+            trns_len = (int)c.length;
+        } else if (memcmp(c.type, "IDAT", 4) == 0) {
+            if (comp_len + (int)c.length > (int)sizeof comp)
+                return -1;
+            memcpy(comp + comp_len, r.p + c.offset, (size_t)c.length);
+            comp_len += (int)c.length;
+        } else if (memcmp(c.type, "IEND", 4) == 0) {
+            break;
+        }
+    }
+    if (w <= 0 || h <= 0 || comp_len <= 0)
+        return -1;
+    if (ct == 0)
+        ch = 1;
+    else if (ct == 2)
+        ch = 3;
+    else if (ct == 3)
+        ch = 1;
+    else if (ct == 4)
+        ch = 2;
+    else if (ct == 6)
+        ch = 4;
+    else
+        return -1;
+    if (ct == 3 && plte_len <= 0)
+        return -1;
+    stride = w * ch;
+    if ((i64)(stride + 1) * h > (i64)sizeof raw || (i64)stride * h > (i64)cap)
+        return -1;
+    raw_len = zlib_decompress(comp, comp_len, raw, (int)sizeof raw);
+    if (raw_len != (stride + 1) * h)
+        return -1;
+    /* 逐行反滤波，结果先写在 rgba 的前 stride*h 字节里 */
+    for (y = 0; y < h; y++) {
+        const u8 *src = raw + (size_t)y * (stride + 1) + 1;
+        u8 *dst = rgba + (size_t)y * stride;
+        u8 *up = (y > 0) ? dst - stride : 0;
+        int f = raw[(size_t)y * (stride + 1)];
+
+        for (x = 0; x < stride; x++) {
+            int a = (x >= ch) ? dst[x - ch] : 0;
+            int b = up ? up[x] : 0;
+            int ul = (up && x >= ch) ? up[x - ch] : 0;
+            int v = src[x];
+
+            if (f == 0)
+                ;
+            else if (f == 1)
+                v += a;
+            else if (f == 2)
+                v += b;
+            else if (f == 3)
+                v += (a + b) / 2;
+            else if (f == 4)
+                v += png_paeth(a, b, ul);
+            else
+                return -1;
+            dst[x] = (u8)(v & 0xff);
+        }
+    }
+    /* 从后往前展开成 RGBA（4i >= 源下标，倒着写不会盖掉还没读的像素） */
+    if (ct == 6) {
+        if (cap < w * h * 4)
+            return -1;
+        for (i = 0; i < w * h; i++)
+            rgba[i * 4 + 3] = rgba[i * 4 + 3];   /* 已经是 RGBA */
+        return 0;
+    }
+    if (ct == 2 && trns_len >= 3) {
+        for (i = w * h - 1; i >= 0; i--) {
+            int r0 = rgba[i * 3], g0 = rgba[i * 3 + 1], b0 = rgba[i * 3 + 2];
+            int al = (r0 == trns[1] && g0 == trns[3] && b0 == trns[5]) ? 0 : 255;
+
+            rgba[i * 4] = (u8)r0;
+            rgba[i * 4 + 1] = (u8)g0;
+            rgba[i * 4 + 2] = (u8)b0;
+            rgba[i * 4 + 3] = (u8)al;
+        }
+        return 0;
+    }
+    if (ct == 2) {
+        for (i = w * h - 1; i >= 0; i--) {
+            int r0 = rgba[i * 3], g0 = rgba[i * 3 + 1], b0 = rgba[i * 3 + 2];
+
+            rgba[i * 4] = (u8)r0;
+            rgba[i * 4 + 1] = (u8)g0;
+            rgba[i * 4 + 2] = (u8)b0;
+            rgba[i * 4 + 3] = 255;
+        }
+        return 0;
+    }
+    if (ct == 0) {
+        int key = (trns_len >= 2) ? trns[1] : -1;
+
+        for (i = w * h - 1; i >= 0; i--) {
+            int v = rgba[i];
+
+            rgba[i * 4] = (u8)v;
+            rgba[i * 4 + 1] = (u8)v;
+            rgba[i * 4 + 2] = (u8)v;
+            rgba[i * 4 + 3] = (v == key) ? 0 : 255;
+        }
+        return 0;
+    }
+    if (ct == 4) {
+        for (i = w * h - 1; i >= 0; i--) {
+            int v = rgba[i * 2], al = rgba[i * 2 + 1];
+
+            rgba[i * 4] = (u8)v;
+            rgba[i * 4 + 1] = (u8)v;
+            rgba[i * 4 + 2] = (u8)v;
+            rgba[i * 4 + 3] = (u8)al;
+        }
+        return 0;
+    }
+    /* ct == 3：调色板 */
+    for (i = w * h - 1; i >= 0; i--) {
+        int idx = rgba[i];
+        int al = (idx < trns_len) ? trns[idx] : 255;
+        int r0 = (idx < plte_len) ? plte[idx * 3] : 0;
+        int g0 = (idx < plte_len) ? plte[idx * 3 + 1] : 0;
+        int b0 = (idx < plte_len) ? plte[idx * 3 + 2] : 0;
+
+        rgba[i * 4] = (u8)r0;
+        rgba[i * 4 + 1] = (u8)g0;
+        rgba[i * 4 + 2] = (u8)b0;
+        rgba[i * 4 + 3] = (u8)al;
+    }
+    return 0;
 }
 
 /* ---- 自测 ---- */
@@ -313,4 +510,119 @@ test "非法类型与数据视图边界" {
     }
     if (png_parse(buf, 20).valid)
         return err(22, "截断的 png_parse 不该有效");
+}
+
+/* ---- png_decode 的向量与用例 ---- */
+
+static const char *PNG_RGBA =
+    "89504e470d0a1a0a0000000d4948445200000004000000030806000000b4f4ae"
+    "c60000002d49444154789c05c13101c02010c0c0b076668e083455c8cbc355b8"
+    "2388089aa2f56d515351a16a6602baffe901fa1e149a934ba246000000004945"
+    "4e44ae426082";
+
+static const char *PNG_RGBA_WANT =
+    "ff0000ff00ff00ff0000ff80ffff00ff0a141e0028323cff46505aff646e78ff"
+    "ffffffff808080ff000000ffc86432ff";
+
+static const char *PNG_RGB =
+    "89504e470d0a1a0a0000000d49484452000000040000000308020000003b9639"
+    "910000002849444154789c63f8cfc0c0f09f8181e1ffffff0c8c5c227270c0f0"
+    "ffffff86860606068613294600e75b0c22529174700000000049454e44ae4260"
+    "82";
+
+static const char *PNG_RGB_WANT =
+    "ff0000ff00ff00ff0000ffffffff00ff0a141eff28323cff46505aff646e78ff"
+    "ffffffff808080ff000000ffc86432ff";
+
+static const char *PNG_GRAY =
+    "89504e470d0a1a0a0000000d4948445200000004000000030800000000919ff1"
+    "1a0000001749444154789c63f09926fb8851484e4e8ee96dc0260100202b0450"
+    "33ad28e80000000049454e44ae426082";
+
+static const char *PNG_GRAY_WANT =
+    "4c4c4cff969696ff1d1d1dffe2e2e2ff121212ff303030ff4e4e4eff6c6c6cff"
+    "ffffffff808080ff000000ff7c7c7cff";
+
+static const char *PNG_GA =
+    "89504e470d0a1a0a0000000d49484452000000040000000308040000001efd66"
+    "4d0000002449444154789c63f0f93fedbf6cc3a3ff8c420c72ffe518e41898de"
+    "fe0f60d8c420c000009e4909cb02a405720000000049454e44ae426082";
+
+static const char *PNG_GA_WANT =
+    "4c4c4cff969696ff1d1d1d80e2e2e2ff12121200303030ff4e4e4eff6c6c6cff"
+    "ffffffff808080ff000000ff7c7c7cff";
+
+static const char *PNG_PAL =
+    "89504e470d0a1a0a0000000d4948445200000004000000030803000000832a5e"
+    "f40000000c504c5445ff000000ff000000ffffff00d6028f7b0000000274524e"
+    "53ff00e5b7304a0000000f49444154789c63606064626680130000870013223d"
+    "5f880000000049454e44ae426082";
+
+static const char *PNG_PAL_WANT =
+    "ff0000ff00ff00000000ffffffff00ffff0000ff00ff00000000ffffffff00ff"
+    "ff0000ff00ff00000000ffffffff00ff";
+
+
+static int png_check(const char *hex, const char *want_hex)
+{
+    u8 buf[1024] = { 0 };
+    u8 rgba[256] = { 0 };
+    u8 want[256] = { 0 };
+    int n = unhex(hex, buf, (int)sizeof buf);
+    int wn = unhex(want_hex, want, (int)sizeof want);
+
+    if (n <= 0 || wn <= 0)
+        return -1;
+    if (png_decode(buf, n, rgba, (int)sizeof rgba) != 0)
+        return -2;
+    if (memcmp(rgba, want, (size_t)wn) != 0)
+        return -3;
+    return 0;
+}
+
+test "png_decode：五种颜色类型都解成 RGBA" {
+    if (png_check(PNG_RGBA, PNG_RGBA_WANT) != 0)
+        return err(30, "RGBA PNG 解码不对");
+    if (png_check(PNG_RGB, PNG_RGB_WANT) != 0)
+        return err(31, "RGB PNG 解码不对");
+    if (png_check(PNG_GRAY, PNG_GRAY_WANT) != 0)
+        return err(32, "灰度 PNG 解码不对");
+    if (png_check(PNG_GA, PNG_GA_WANT) != 0)
+        return err(33, "灰度+alpha PNG 解码不对");
+    if (png_check(PNG_PAL, PNG_PAL_WANT) != 0)
+        return err(34, "调色板 PNG 解码不对");
+}
+
+test "png_decode：坏输入与不支持的特性" {
+    u8 buf[1024] = { 0 };
+    u8 rgba[256] = { 0 };
+    int n = unhex(PNG_RGBA, buf, (int)sizeof buf);
+
+    /* 截断 */
+    if (png_decode(buf, n - 5, rgba, (int)sizeof rgba) != -1)
+        return err(35, "截断的 PNG 应该 -1");
+    /* 位深 16 */
+    {
+        u8 copy[1024] = { 0 };
+
+        memcpy(copy, buf, (size_t)n);
+        copy[24] = 16;
+        if (png_decode(copy, n, rgba, (int)sizeof rgba) != -1)
+            return err(36, "16 位 PNG 应该 -1");
+    }
+    /* 隔行 */
+    {
+        u8 copy[1024] = { 0 };
+
+        memcpy(copy, buf, (size_t)n);
+        copy[28] = 1;
+        if (png_decode(copy, n, rgba, (int)sizeof rgba) != -1)
+            return err(37, "隔行 PNG 应该 -1");
+    }
+    /* 输出缓冲不够 */
+    if (png_decode(buf, n, rgba, 8) != -1)
+        return err(38, "缓冲不够应该 -1");
+    if (png_decode(0, n, rgba, (int)sizeof rgba) != -1
+        || png_decode(buf, n, 0, (int)sizeof rgba) != -1)
+        return err(39, "空指针应该 -1");
 }

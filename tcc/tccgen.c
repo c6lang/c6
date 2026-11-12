@@ -12842,6 +12842,10 @@ static const struct C6ErrStdSlot {
     { "std.data.x509",          C6_ERR_SLOT_STD + 134 },
     { "std.data.jwt",           C6_ERR_SLOT_STD + 135 },
     { "std.encoding.otp",       C6_ERR_SLOT_STD + 136 },
+    { "std.encoding.lzw",       C6_ERR_SLOT_STD + 137 },
+    { "std.data.gif",           C6_ERR_SLOT_STD + 138 },
+    { "std.data.tiff",          C6_ERR_SLOT_STD + 139 },
+    { "std.data.ico",           C6_ERR_SLOT_STD + 140 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
