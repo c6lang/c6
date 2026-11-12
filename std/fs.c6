@@ -12,7 +12,7 @@
  *     char name[256] = { 0 };
  *     int is_dir = 0;
  *     while (pd->dir_next(name, sizeof name, &is_dir) > 0) { ... }
- *     pd->dir_close();
+ *     pd->close();
  *
  * 这一层是 `std.io`（流读写）的姊妹：io 管**内容**，fs 管**元数据与目录**。
  * 它比 io 更依赖宿主：用到 `stat`/`mkdir`/`opendir`/`chdir`，freestanding 目标
@@ -23,8 +23,9 @@
  * 约定：
  * - 路径都是 NUL 结尾的 `char *`（POSIX 接口如此）；要拼路径用 `std.path`；
  * - `fs_stat`/`fs_lstat` 只在成功时写 `*out`；
- * - `dir_next` 返回 1 取到、0 结束、-1 出错、**-2 名字比 cap 长**（不截断，
- *   让调用方把 buffer 加大再重来）；"." / ".." 照常返回，由调用方过滤；
+ * - `d->dir_next(...)`（就是 `dir_next(&d, ...)`）返回 1 取到、0 结束、
+ *   -1 出错、**-2 名字比 cap 长**（不截断，让调用方把 buffer 加大再重来）；
+ *   "." / ".." 照常返回，由调用方过滤；
  * - `is_dir` 取自 `dirent.d_type`；文件系统不支持时（`DT_UNKNOWN`）给 0。
  */
 #include <sys/stat.h>
@@ -266,6 +267,9 @@ Dir dir_open(char *path)
     return r;
 }
 
+/* 注意方法名：`Dir` 是普通结构体，体内写不了方法体，所以方法写在体外。
+   `ok()` 不行——`ok` 会被注册成 `Dir_ok` 外加裸名弱别名，和 `reader_ok`
+   （`std.io`）之类同名的裸别名抢符号；`dir_*` 前缀没有这个问题。 */
 int dir_ok(Dir *self) { return self->d ? 1 : 0; }
 
 /* 打开/读取失败的 errno；0 表示没有错误 */

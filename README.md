@@ -124,7 +124,7 @@ std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)：write_int/u64/hex/hex
 std/range.c6   std.range   能被 foreach 吃掉的区间 Range/StepRange
 std/sort.c6    std.sort    比较器驱动的排序与二分查找：sort_int/sort_bytes、find_int、lower/upper_bound
 std/mem.c6     std.mem     借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
-std/io.c6      std.io      Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代
+std/io.c6      std.io      Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代（方法名带 reader_/writer_/cfile_ 前缀）
 std/math.c6    std.math    整数 gcd/lcm/ipow/clamp/floor_div/mod + 浮点 sqrt/floor/ceil/round（不链 libm）
 std/time.c6    std.time    now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 std/strbuf.c6  std.strbuf  会长的字符缓冲 StrBuf（托管引用）：write/write_int/write_hex、reserve/truncate/cstr
@@ -136,7 +136,7 @@ std/deque.c6   std.deque  环形缓冲双端队列 Deque@T + DIter：push/pop �
 std/ascii.c6   std.ascii  ASCII 判别/大小写/忽略大小写比较（收 int，EOF 与负 char 安全）
 std/num.c6     std.num    浮点格式化（固定/%e/%g）与解析（inf/nan、RANGE/PARSE 错误码）
 std/codec.c6   std.codec  Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
-std/rand.c6    std.rand   xorshift64*：可重放序列、无偏区间 rand_below、rand_f64、shuffle
+std/rand.c6    std.rand   xorshift64*：可重放序列、无偏区间 below/int、f64、shuffle（方法名 random_*）
 std/fs.c6      std.fs     stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
 std/set.c6     std.set    哈希集合 Set@K + SetIter（std.map 的薄包装，add 返回新增/已存在）
 std/json.c6    std.json   JSON 解析与写出：arena 上的 DOM、json_get/json_at、json_write/pretty/escape（数字保留原文）
