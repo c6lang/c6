@@ -1,0 +1,173 @@
+/* std/os/user：用户与组的查询（getpwuid / getpwnam / getgrgid）。
+ *
+ *     import std.os.user;
+ *
+ *     User u = { 0 };
+ *     if (user_current(&u) == 1)
+ *         printf("%.*s %d\n", u.name.len, u.name.data, u.uid);
+ *
+ * 约定：
+ *
+ * - `User`/`Group` 里的 `Str` 指向模块内的**静态缓冲区**，下一次查询会覆盖；
+ * - `user_by_uid`/`user_by_name` 找不到返回 0，出错返回 -1；
+ * - `group_by_gid` 同上；
+ * - `user_current` 用 `geteuid`，一般都能成；
+ * - 只给主组 `gid`，不展开附加组（`getgrouplist` 不在范围内）；
+ * - 需要 libc 的 NSS（`/etc/passwd`、systemd-homed、LDAP 都照常走），所以这个
+ *   模块只能在有 libc 的环境用，裸机/`-ffreestanding` 下用不了。
+ */
+#include <string.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <grp.h>
+
+module std.os.user;
+import std.core.types;
+import std.text.str;
+
+struct User {
+    int uid;
+    int gid;
+    Str name;
+    Str dir;
+    Str shell;
+};
+
+struct Group {
+    int gid;
+    Str name;
+};
+
+static char user_buf[4][256] = { { 0 } };
+
+static void user_copy(char *dst, const char *src)
+{
+    int n = src ? (int)strlen(src) : 0;
+
+    if (n > 255)
+        n = 255;
+    if (n > 0)
+        memcpy(dst, src, (size_t)n);
+    dst[n] = 0;
+}
+
+static Str user_view(char *p)
+{
+    Str s = { 0 };
+
+    s.s = (char[:]){ p, (int)strlen(p) };
+    return s;
+}
+
+static void user_fill(User *out, const struct passwd *pw)
+{
+    user_copy(user_buf[0], pw->pw_name);
+    user_copy(user_buf[1], pw->pw_dir);
+    user_copy(user_buf[2], pw->pw_shell);
+    out->uid = (int)pw->pw_uid;
+    out->gid = (int)pw->pw_gid;
+    out->name = user_view(user_buf[0]);
+    out->dir = user_view(user_buf[1]);
+    out->shell = user_view(user_buf[2]);
+}
+
+int user_by_uid(int uid, User *out)
+{
+    struct passwd *pw = 0;
+
+    if (!out)
+        return -1;
+    pw = getpwuid((unsigned)uid);
+    if (!pw)
+        return 0;
+    user_fill(out, pw);
+    return 1;
+}
+
+int user_by_name(Str name, User *out)
+{
+    char buf[256] = { 0 };
+    struct passwd *pw = 0;
+    int n = name.s.len;
+
+    if (!out || n <= 0 || n > 255)
+        return -1;
+    memcpy(buf, name.s.data, (size_t)n);
+    buf[n] = 0;
+    pw = getpwnam(buf);
+    if (!pw)
+        return 0;
+    user_fill(out, pw);
+    return 1;
+}
+
+int user_current(User *out)
+{
+    return user_by_uid((int)geteuid(), out);
+}
+
+int group_by_gid(int gid, Group *out)
+{
+    struct group *gr = 0;
+
+    if (!out)
+        return -1;
+    gr = getgrgid((unsigned)gid);
+    if (!gr)
+        return 0;
+    user_copy(user_buf[3], gr->gr_name);
+    out->gid = (int)gr->gr_gid;
+    out->name = user_view(user_buf[3]);
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "user：当前用户与 uid 反查一致" {
+    User u = { 0 }, u2 = { 0 };
+
+    if (user_current(&u) != 1)
+        return err(1, "当前用户查不到");
+    if (u.uid != (int)geteuid())
+        return err(2, "uid 不匹配");
+    if (u.name.s.len <= 0)
+        return err(3, "用户名不该为空");
+    if (u.gid < 0)
+        return err(4, "主组号不该为负");
+    if (user_by_uid(u.uid, &u2) != 1 || u2.uid != u.uid
+        || u2.name.s.len != u.name.s.len
+        || memcmp(u2.name.s.data, u.name.s.data, (size_t)u.name.s.len) != 0)
+        return err(5, "按 uid 反查结果不一致");
+    /* 按名字查回来还是同一个 uid */
+    if (user_by_name(u.name, &u2) != 1 || u2.uid != u.uid)
+        return err(6, "按名字查不一致");
+    if (u2.dir.s.len < 0 || u2.shell.s.len < 0)
+        return err(7, "目录/壳字段不合理");
+}
+
+test "user：查不到的项与组" {
+    User u = { 0 };
+    Group g = { 0 };
+    Str nobody = { S("definitely-no-such-user-abcxyz") };
+    Str empty = { S("") };
+
+    if (user_by_uid(0x7FFFFF00, &u) != 0)
+        return err(8, "不存在的 uid 应该 0");
+    if (user_by_name(nobody, &u) != 0)
+        return err(9, "不存在的名字应该 0");
+    if (user_by_name(empty, &u) != -1)
+        return err(10, "空名字应该 -1");
+    if (user_by_uid(0, 0) != -1)
+        return err(11, "空指针应该 -1");
+    /* 组：拿当前用户的主组 */
+    if (user_current(&u) != 1)
+        return err(12, "当前用户查不到");
+    if (group_by_gid(u.gid, &g) == 1) {
+        if (g.gid != u.gid || g.name.s.len <= 0)
+            return err(13, "主组信息不对");
+    }
+    if (group_by_gid(0x7FFFFF00, &g) != 0)
+        return err(14, "不存在的组应该 0");
+    if (group_by_gid(0, 0) != -1)
+        return err(15, "空指针应该 -1");
+}

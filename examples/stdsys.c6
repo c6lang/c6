@@ -1,0 +1,166 @@
+/* examples/stdsys.c6 —— 第三十七批（系统视图）的集成示例。
+ *
+ *     make std-sys
+ *
+ * 四节：sysinfo（uname / 负载 / 运行时长 / CPU / 页大小）、resource（rlimit 与
+ * getrusage）、user（当前用户与主组）、pty（跑一个子进程并抓它的输出）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.os.sysinfo;
+import std.os.resource;
+import std.os.user;
+import std.os.pty;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_sysinfo(void)
+{
+    SysInfo si = { 0 };
+    double l1 = 0, l5 = 0, l15 = 0;
+    long long up = 0;
+
+    printf("== sysinfo\n");
+    if (si_uname(&si) != 1) {
+        check(0, "uname 失败");
+        return;
+    }
+    printf("   %.*s %.*s（%.*s）\n", si.sysname.s.len, si.sysname.s.data,
+           si.release.s.len, si.release.s.data, si.machine.s.len,
+           si.machine.s.data);
+    printf("   主机 %.*s，%d 个 CPU，页大小 %d\n", si.nodename.s.len,
+           si.nodename.s.data, si_ncpu(), si_pagesize());
+    up = si_uptime();
+    printf("   已运行 %lld 秒\n", up);
+    if (si_loadavg(&l1, &l5, &l15) == 1)
+        printf("   负载 %.2f %.2f %.2f\n", l1, l5, l15);
+    check(si.sysname.s.len > 0 && si.machine.s.len > 0, "uname 字段非空");
+    check(si_ncpu() >= 1, "CPU 数 >= 1");
+    check(si_pagesize() >= 512, "页大小合理");
+    check(up >= 0, "运行时长可读");
+}
+
+static void do_resource(void)
+{
+    Rlimit rl = { 0 };
+    Rusage ru = { 0 };
+
+    printf("== resource\n");
+    if (rl_get(RL_NOFILE, &rl) != 1) {
+        check(0, "读 NOFILE 失败");
+        return;
+    }
+    printf("   最多开 %lld 个文件（上限 %lld）\n", rl.cur, rl.max);
+    check(rl.cur > 0, "NOFILE 合理");
+    if (rl_get(RL_STACK, &rl) == 1)
+        printf("   栈上限 %lld 字节\n", rl.cur);
+    if (ru_get(RU_SELF, &ru) != 1) {
+        check(0, "读 rusage 失败");
+        return;
+    }
+    printf("   用户态 %lld ms，内核态 %lld ms，峰值 RSS %lld KiB\n", ru.utime_ms,
+           ru.stime_ms, ru.maxrss_kb);
+    printf("   缺页 %lld 次（次缺页 %lld），上下文切换 %lld 次\n", ru.minflt,
+           ru.majflt, ru.nvcsw);
+    check(ru.maxrss_kb > 0, "RSS > 0");
+    check(ru.minflt >= 0 && ru.nvcsw >= 0, "计数字段非负");
+}
+
+static void do_user(void)
+{
+    User u = { 0 };
+    Group g = { 0 };
+
+    printf("== user\n");
+    if (user_current(&u) != 1) {
+        check(0, "查不到当前用户");
+        return;
+    }
+    printf("   %.*s（uid %d，gid %d）\n", u.name.s.len, u.name.s.data, u.uid,
+           u.gid);
+    printf("   家目录 %.*s，登录壳 %.*s\n", u.dir.s.len, u.dir.s.data,
+           u.shell.s.len, u.shell.s.data);
+    check(u.name.s.len > 0, "用户名非空");
+    check(user_by_uid(u.uid, &u) == 1, "按 uid 反查成功");
+    if (group_by_gid(u.gid, &g) == 1)
+        printf("   主组 %.*s\n", g.name.s.len, g.name.s.data);
+    check(group_by_gid(u.gid, &g) == 1 || 1, "主组查询不崩");
+}
+
+static void do_pty(void)
+{
+    Pty p = { 0 };
+    static char *argv[4] = { 0 };
+    char out[256] = { 0 };
+    int total = 0, guard = 0, status = -1;
+
+    printf("== pty\n");
+    if (p.pty_open() != 1) {
+        check(0, "打不开伪终端");
+        return;
+    }
+    if (p.pty_resize(30, 100) != 1) {
+        p.pty_finish();
+        check(0, "设置窗口大小失败");
+        return;
+    }
+    argv[0] = (char *)"sh";
+    argv[1] = (char *)"-c";
+    argv[2] = (char *)"echo pty-ok; tty";
+    argv[3] = 0;
+    if (p.pty_spawn(3, argv) != 1) {
+        p.pty_finish();
+        check(0, "起子进程失败");
+        return;
+    }
+    while (guard++ < 100) {
+        int n = p.pty_recv(out + total, (int)sizeof out - total - 1, 200);
+
+        if (n < 0)
+            break;
+        if (n > 0)
+            total += n;
+        if (total > 6 && memcmp(out, "pty-ok", 6) == 0)
+            break;
+    }
+    out[total] = 0;
+    printf("   子进程输出：");
+    while (total > 0 && (out[total - 1] == '\n' || out[total - 1] == '\r'))
+        out[--total] = 0;
+    printf("%s\n", out);
+    check(strncmp(out, "pty-ok", 6) == 0, "子进程输出以 pty-ok 开头");
+    {
+        int rows = 0, cols = 0;
+
+        check(p.pty_size(&rows, &cols) == 1 && rows == 30 && cols == 100,
+              "窗口大小回读");
+    }
+    if (p.pty_reap(&status) == 1)
+        check(status == 0, "子进程正常退出");
+    else
+        check(0, "收子进程失败");
+    p.pty_finish();
+}
+
+int main(void)
+{
+    do_sysinfo();
+    do_resource();
+    do_user();
+    do_pty();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

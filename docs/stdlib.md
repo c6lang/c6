@@ -121,7 +121,11 @@
 | `std/os/poll.c6` | `std.os.poll` | 多路等待（`poll(2)`）：`PollSet`（`POLL_MAX`=32 个槽，零分配）的 `init`/`add`（同 fd 改事件）/`modify`/`remove_fd`/`find`/`count`/`wait`（`<0` 永远等、`0` 立刻、`>0` 毫秒；返回就绪个数）/`is_ready`/`ready`/`fd_at`/`clear_ready`，单 fd 的 `wait_readable`/`wait_writable`/`wait_any`（1/0/-1）；事件位 `EVENT_READ`/`EVENT_WRITE`/`EVENT_ERROR`/`EVENT_HUP`/`EVENT_INVALID` |
 | `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `d.format(buf, cap)`、`Civil` 日历换算 `civil_from_unix`/`c.to_unix()`/`c.format(...)`，不依赖 localtime |
 | `std/os/walk.c6` | `std.os.walk` | 目录树递归遍历与删除（在 `std.os.fs` 的单层 `Dir` 之上，零分配）：`walk`/`walk_stat`（`WalkOpts` 的 `max_depth`/`follow_links`/`visit_dirs`、`WalkStats` 的文件/目录/字节/链接计数）、回调 `int (*)(path, StatInfo *, depth, ud)` 返回 1 继续 / 0 跳过子树 / -1 中止；`remove_tree` 后序删除；路径 512 字节、深度上限 32 |
-| `std/os/temp.c6` | `std.os.temp` | 临时文件与目录（`mkstemp`/`mkdtemp` 薄封装，零分配）：`temp_file`/`temp_file_named`（默认前缀 `c6-`、目录空则 `$TMPDIR` 或 `/tmp`）、`temp_dir`/`temp_dir_in`、`TempFile` 的 `ok`/`path`/`fd`/`write_all`/`close_file`/`remove`；创建的文件 0600 且带 `FD_CLOEXEC`，不会自动删除 |
+
+| `std/os/sysinfo.c6` | `std.os.sysinfo` | 系统信息：`si_uname` 给 `sysname`/`release`/`machine`/`nodename`/`version`（视图指向模块静态缓冲区）、`si_uptime`（整秒）、`si_loadavg`（1/5/15 分钟，参数可传 0）、`si_ncpu`、`si_pagesize` |
+| `std/os/resource.c6` | `std.os.resource` | 资源限制与用量：`rl_get`/`rl_set`（`RL_CPU`/`RL_FSIZE`/`RL_DATA`/`RL_STACK`/`RL_CORE`/`RL_NOFILE`/`RL_AS`/`RL_MEMLOCK`，`RL_INFINITY` 映射无限）、`ru_get(RU_SELF|RU_CHILDREN)` 给毫秒级 CPU 时间、峰值 RSS、缺页、块 IO、上下文切换，`ru_nice` |
+| `std/os/user.c6` | `std.os.user` | 用户与组：`user_by_uid`/`user_by_name`/`user_current` 给 `uid`/`gid`/`name`/`dir`/`shell`，`group_by_gid` 给 `gid`/`name`；查不到返回 0、出错 -1；走 libc 的 NSS，裸机不可用 |
+| `std/os/pty.c6` | `std.os.pty` | 伪终端：`pty_open` 给一对 master/slave，`pty_spawn(argc, argv)` fork 子进程（`setsid` + `TIOCSCTTY` + dup2 到 0/1/2 + `execvp`），`pty_send`/`pty_recv`（`poll` 带超时，0 超时 / -1 出错）、`pty_size`/`pty_resize`（`TIOCSWINSZ`）、`pty_reap`、`pty_finish`（还活着先 SIGTERM） || `std/os/temp.c6` | `std.os.temp` | 临时文件与目录（`mkstemp`/`mkdtemp` 薄封装，零分配）：`temp_file`/`temp_file_named`（默认前缀 `c6-`、目录空则 `$TMPDIR` 或 `/tmp`）、`temp_dir`/`temp_dir_in`、`TempFile` 的 `ok`/`path`/`fd`/`write_all`/`close_file`/`remove`；创建的文件 0600 且带 `FD_CLOEXEC`，不会自动删除 |
 | `std/os/lock.c6` | `std.os.lock` | 文件建议锁（`fcntl` 记录锁）：`lock_open` 工厂 + `FileLock` 的 `ok`/`fd`/`acquire(exclusive, wait_ms)`/`try_acquire`/`release`/`is_held`/`close_file`；`wait_ms < 0` 阻塞、`0` 只试一次、`>0` 按 5ms 重试到超时，返回 1/0/-1；整文件锁，按进程合并（测互斥要开子进程） |
 | `std/os/mmap.c6` | `std.os.mmap` | 文件/匿名映射（`mmap(2)`）：`map_file(path, writable)`（可写用 `O_RDWR`+`MAP_SHARED`，否则 `O_RDONLY`+`MAP_PRIVATE`，空文件是坏映射）/`map_anon(len)`（清零）、`Map` 的 `ok`/`data`/`size`/`can_write`/`is_anon`/`fd`/`sync`/`read_at`/`write_at`/`unmap`；`read_at`/`write_at` 做边界检查，`unmap` 可重复 |
 
@@ -263,6 +267,7 @@
 | `examples/stdproto.c6` | （无模块） | 第三十四批（网络协议编解码）的拼装示例（`make std-proto`）：解析 SSE 事件流（含多行 data）、构造 SOCKS5 问候与域名 CONNECT 并解应答、构造/解析 MQTT CONNECT 与 PUBLISH 并做主题通配、Snappy 压缩往返 |
 | `examples/stdexec.c6` | （无模块） | 第三十五批（二进制容器格式）的拼装示例（`make std-exec`）：内存里现场拼出 cpio 归档（目录+文件+收尾）、PE32+ 映像（节表 + RVA 映射）、Mach-O 64 位映像（`LC_SEGMENT_64` + `LC_MAIN`）与 wasm 模块（导出表），再逐个解析 |
 | `examples/stdser.c6` | （无模块） | 第三十六批（序列化与标记）的拼装示例（`make std-ser`）：现场拼 BSON 与 UBJSON 文档、解一段 plistlib 生成的二进制 plist（58 字节）、把一段 Markdown 渲染成 HTML |
+| `examples/stdsys.c6` | （无模块） | 第三十七批（系统视图）的拼装示例（`make std-sys`）：打印 uname/负载/运行时长/CPU/页大小、rlimit/rusage、当前用户与主组，再用伪终端跑 `sh -c` 并抓它的输出 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -379,6 +384,10 @@ std/os/io.c6               5 test(s), 0 failure(s)
 std/os/path.c6             30 test(s), 0 failure(s)
 std/os/time.c6             7 test(s), 0 failure(s)
 std/os/walk.c6            43 test(s), 0 failure(s)
+std/os/sysinfo.c6          24 test(s), 0 failure(s)
+std/os/resource.c6         24 test(s), 0 failure(s)
+std/os/user.c6             24 test(s), 0 failure(s)
+std/os/pty.c6              24 test(s), 0 failure(s)
 std/os/temp.c6             3 test(s), 0 failure(s)
 std/os/lock.c6             9 test(s), 0 failure(s)
 std/os/mmap.c6             2 test(s), 0 failure(s)
@@ -467,6 +476,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/core/stats.c6` 3 | 自成一体（Welford + 插入排序） |
 | `std/core/matrix.c6` 3 | 自成一体（高斯消元） |
 | `std/os/walk.c6` 43 | walk 3 + fs 7 + path 8 + str 22 + err 3（遍历用 `Dir`，拼路径用 path） |
+| `std/os/sysinfo.c6` 24 | sysinfo 2 + str 22 |
+| `std/os/resource.c6` 24 | resource 2 + str 22 |
+| `std/os/user.c6` 24 | user 2 + str 22 |
+| `std/os/pty.c6` 24 | pty 2 + str 22 |
 | `std/os/lock.c6` 9 | lock 2 + time 7（超时等待要 `sleep_ms`） |
 | `std/os/temp.c6` 3 | 只借 `Str` 类型，正文不依赖别的模块 |
 | `std/os/mmap.c6` 2 | 自成一体（只用 mmap/msync/munmap） |
@@ -3440,6 +3453,17 @@ make std-ser
 现场拼同样形状的文档（含 `#` 计数数组）、plist 解一段 58 字节的 `bplist00`、
 Markdown 把一段带标题/列表/代码块的文档渲染成 HTML。
 
+### 集成示例：`examples/stdsys.c6`
+
+```sh
+make std-sys
+```
+
+四节：`sysinfo` 打印内核版本、主机名、CPU 数、页大小、运行时长与负载；
+`resource` 打印 `RLIMIT_NOFILE`/`RLIMIT_STACK` 与自身的 CPU 时间、峰值 RSS、
+缺页与上下文切换；`user` 打印当前用户、家目录、登录壳与主组；`pty` 用伪终端
+跑 `sh -c "echo pty-ok; tty"` 并抓输出，再回读窗口大小。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3507,6 +3531,8 @@ Markdown 把一段带标题/列表/代码块的文档渲染成 HTML。
 * `make std-exec`：`examples/stdexec.c6`，第三十五批（二进制容器格式）模块的拼装
   示例（自带自检）。
 * `make std-ser`：`examples/stdser.c6`，第三十六批（序列化与标记）模块的拼装示例
+  （自带自检）。
+* `make std-sys`：`examples/stdsys.c6`，第三十七批（系统视图）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

@@ -1,0 +1,331 @@
+/* std/os/pty：伪终端（posix_openpt 一对 + 起子进程）。
+ *
+ *     import std.os.pty;
+ *
+ *     Pty p = { 0 };
+ *     if (p.pty_open() == 1) {
+ *         p.pty_resize(24, 80);
+ *         p.pty_send((Str){ S("echo hi\n") });
+ *         char buf[256] = { 0 };
+ *         int n = p.pty_recv(buf, sizeof buf, 1000);
+ *         p.pty_finish();
+ *     }
+ *
+ * 约定：
+ *
+ * - `pty_open` 一次给出一对 fd（master 与 slave 都留着；spawn 之后父进程应把
+ *   slave 关掉用 `pty_finish`）；
+ * - `pty_spawn(argc, argv)` fork 一个子进程：`setsid` + 把 slave 设为控制终端 +
+ *   dup2 到 0/1/2，然后 `execvp`；`argc` 是 argv 里有效项数，argv 必须 NULL 结尾；
+ * - `pty_send` 往 master 写，`pty_recv` 从 master 读到调用方缓冲区（带
+ *   `timeout_ms`，0 表示只探一次，-1 表示一直等）；返回读到的字节数 / 0 超时 /
+ *   -1 出错；
+ * - `pty_size` 用 `TIOCGWINSZ` 读 master 的行列，`pty_resize` 用 `TIOCSWINSZ`
+ *   写（子进程会收到 SIGWINCH）；
+ * - `pty_reap` 等子进程退出并回填状态码（`WIFEXITED` 为真时取 `WEXITSTATUS`），
+ *   没子进程返回 -1；
+ * - `pty_finish` 关掉两个 fd（子进程还活着时先 kill 再关，用 SIGTERM）。
+ */
+/* posix_openpt/grantpt/unlockpt/ptsname 在严格 C99 下不暴露，先要 XOPEN */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 600
+#endif
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+module std.os.pty;
+import std.core.types;
+import std.text.str;
+
+struct Pty {
+    int master;
+    int slave;
+    int pid;
+};
+
+int pty_open(Pty *self)
+{
+    int m = 0, s = 0;
+    char *name = 0;
+
+    if (!self)
+        return -1;
+    self->master = -1;
+    self->slave = -1;
+    self->pid = -1;
+    m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0)
+        return -1;
+    if (grantpt(m) != 0 || unlockpt(m) != 0) {
+        close(m);
+        return -1;
+    }
+    name = ptsname(m);
+    if (!name) {
+        close(m);
+        return -1;
+    }
+    s = open(name, O_RDWR | O_NOCTTY);
+    if (s < 0) {
+        close(m);
+        return -1;
+    }
+    self->master = m;
+    self->slave = s;
+    return 1;
+}
+
+int pty_spawn(Pty *self, int argc, char **argv)
+{
+    int pid = 0;
+
+    if (!self || self->master < 0 || self->slave < 0 || !argv || argc <= 0)
+        return -1;
+    if (self->pid > 0)
+        return -1;                  /* 已经起过一个 */
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        setsid();
+        ioctl(self->slave, TIOCSCTTY, 0);
+        dup2(self->slave, 0);
+        dup2(self->slave, 1);
+        dup2(self->slave, 2);
+        if (self->slave > 2)
+            close(self->slave);
+        close(self->master);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    self->pid = pid;
+    return 1;
+}
+
+int pty_send(Pty *self, Str data)
+{
+    int n = 0, off = 0;
+
+    if (!self || self->master < 0 || !data.s.data || data.s.len <= 0)
+        return -1;
+    while (off < data.s.len) {
+        n = (int)write(self->master, data.s.data + off,
+                       (size_t)(data.s.len - off));
+        if (n <= 0)
+            return -1;
+        off += n;
+    }
+    return off;
+}
+
+int pty_recv(Pty *self, char *dst, int cap, int timeout_ms)
+{
+    struct pollfd pfd = { 0 };
+    int r = 0;
+
+    if (!self || self->master < 0 || !dst || cap <= 0)
+        return -1;
+    pfd.fd = self->master;
+    pfd.events = POLLIN;
+    r = poll(&pfd, 1, timeout_ms);
+    if (r < 0)
+        return -1;
+    if (r == 0)
+        return 0;
+    r = (int)read(self->master, dst, (size_t)cap);
+    return r;
+}
+
+int pty_size(Pty *self, int *rows, int *cols)
+{
+    struct winsize ws = { 0 };
+
+    if (!self || self->master < 0)
+        return -1;
+    if (ioctl(self->master, TIOCGWINSZ, &ws) != 0)
+        return -1;
+    if (rows)
+        *rows = (int)ws.ws_row;
+    if (cols)
+        *cols = (int)ws.ws_col;
+    return 1;
+}
+
+int pty_resize(Pty *self, int rows, int cols)
+{
+    struct winsize ws = { 0 };
+
+    if (!self || self->master < 0 || rows <= 0 || cols <= 0 || rows > 65535
+        || cols > 65535)
+        return -1;
+    ws.ws_row = (unsigned short)rows;
+    ws.ws_col = (unsigned short)cols;
+    if (ioctl(self->master, TIOCSWINSZ, &ws) != 0)
+        return -1;
+    return 1;
+}
+
+int pty_reap(Pty *self, int *status)
+{
+    int st = 0;
+    int r = 0;
+
+    if (!self || self->pid <= 0)
+        return -1;
+    r = (int)waitpid(self->pid, &st, 0);
+    if (r < 0)
+        return -1;
+    self->pid = -1;
+    if (status) {
+        if (WIFEXITED(st))
+            *status = WEXITSTATUS(st);
+        else if (WIFSIGNALED(st))
+            *status = -WTERMSIG(st);
+        else
+            *status = 0;
+    }
+    return 1;
+}
+
+int pty_finish(Pty *self)
+{
+    if (!self)
+        return -1;
+    if (self->pid > 0) {
+        kill(self->pid, SIGTERM);
+        waitpid(self->pid, 0, 0);
+        self->pid = -1;
+    }
+    if (self->master >= 0) {
+        close(self->master);
+        self->master = -1;
+    }
+    if (self->slave >= 0) {
+        close(self->slave);
+        self->slave = -1;
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "pty：打开一对、名字、收发与窗口大小" {
+    Pty p = { 0 };
+    char buf[256] = { 0 };
+    int n = 0, rows = 0, cols = 0;
+
+    if (p.pty_open() != 1)
+        return err(1, "打不开伪终端");
+    if (p.master < 0 || p.slave < 0)
+        return err(2, "两个 fd 都该有效");
+    if (p.pty_resize(24, 80) != 1)
+        return err(3, "设置窗口大小失败");
+    if (p.pty_size(&rows, &cols) != 1 || rows != 24 || cols != 80)
+        return err(4, "读回的窗口大小不对");
+    /* 往 master 写，从 slave 读（slave 是行规程，行尾要有 \n） */
+    if (p.pty_send((Str){ S("hi\n") }) != 3)
+        return err(5, "写 master 失败");
+    {
+        struct pollfd pfd = { 0 };
+
+        pfd.fd = p.slave;
+        pfd.events = POLLIN;
+        if (poll(&pfd, 1, 1000) != 1)
+            return err(6, "slave 上没有可读数据");
+    }
+    n = (int)read(p.slave, buf, sizeof buf);
+    if (n != 3 || memcmp(buf, "hi\n", 3) != 0)
+        return err(7, "从 slave 读到的内容不对");
+    /* 反方向：往 slave 写，从 master 读（master 上还会先看到回显，跳过它） */
+    if (write(p.slave, "yo\n", 3) != 3)
+        return err(8, "写 slave 失败");
+    {
+        int found = 0, guard = 0, total = 0, i = 0;
+
+        while (guard++ < 20 && !found) {
+            n = p.pty_recv(buf + total, (int)sizeof buf - total - 1, 200);
+            if (n <= 0)
+                continue;
+            total += n;
+            for (i = 0; i + 1 < total; i++)
+                if (buf[i] == 'y' && buf[i + 1] == 'o')
+                    found = 1;
+        }
+        if (!found)
+            return err(9, "从 master 读到的内容不对");
+    }
+    if (p.pty_finish() != 1)
+        return err(10, "关闭失败");
+    if (p.master != -1 || p.slave != -1)
+        return err(11, "关闭后 fd 应该置 -1");
+}
+
+test "pty：recv 超时、坏参数与子进程" {
+    Pty p = { 0 };
+    char buf[64] = { 0 };
+    int status = -1;
+
+    if (p.pty_open() != 1)
+        return err(12, "打不开伪终端");
+    /* 没数据时 recv 应该超时返回 0 */
+    if (p.pty_recv(buf, sizeof buf, 50) != 0)
+        return err(13, "没数据应该返回 0");
+    if (p.pty_recv(buf, 0, 10) != -1)
+        return err(14, "cap 为 0 应该 -1");
+    if (p.pty_resize(0, 80) != -1)
+        return err(15, "行列非法应该 -1");
+    if (p.pty_reap(&status) != -1)
+        return err(16, "没子进程时 reap 应该 -1");
+    /* 起一个子进程：跑 sh -c 'echo ok' */
+    {
+        static char *argv[4] = { 0 };
+
+        argv[0] = (char *)"sh";
+        argv[1] = (char *)"-c";
+        argv[2] = (char *)"echo ok";
+        argv[3] = 0;
+        if (p.pty_spawn(3, argv) != 1) {
+            p.pty_finish();
+            return err(17, "起子进程失败");
+        }
+        if (p.pty_spawn(3, argv) != -1) {
+            p.pty_finish();
+            return err(18, "重复 spawn 应该 -1");
+        }
+    }
+    /* 从 master 读子进程的输出 */
+    {
+        int total = 0, guard = 0;
+        char out[256] = { 0 };
+
+        while (guard++ < 50) {
+            int n = p.pty_recv(out + total, (int)sizeof out - total - 1, 200);
+
+            if (n < 0)
+                break;
+            if (n == 0)
+                continue;
+            total += n;
+            if (total > 2 && memcmp(out, "ok", 2) == 0)
+                break;
+        }
+        if (!(total >= 2 && out[0] == 'o' && out[1] == 'k')) {
+            p.pty_finish();
+            return err(19, "子进程的输出不对");
+        }
+    }
+    if (p.pty_reap(&status) != 1 || status != 0) {
+        p.pty_finish();
+        return err(20, "子进程状态不对");
+    }
+    if (p.pty_finish() != 1)
+        return err(21, "关闭失败");
+}

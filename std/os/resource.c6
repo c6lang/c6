@@ -1,0 +1,198 @@
+/* std/os/resource：资源限制与用量（getrlimit / getrusage / nice）。
+ *
+ *     import std.os.resource;
+ *
+ *     Rlimit rl = { 0 };
+ *     rl_get(RL_NOFILE, &rl);          // 能开多少文件
+ *     Rusage ru = { 0 };
+ *     ru_get(RU_SELF, &ru);            // 自己的 CPU 时间与缺页
+ *
+ * 约定：
+ *
+ * - `Rlimit.cur`/`max` 是 `long long`，`RL_INFINITY` 表示无上限（映射自
+ *   `RLIM_INFINITY`）；
+ * - `rl_get`/`rl_set`/`ru_get` 返回 1 成功 / -1 失败（errno 不暴露，调用方看
+ *   返回值即可）；
+ * - `Rusage` 的时间是毫秒（`ru_utime` 秒+微秒合成），`maxrss_kb` 是 KiB，
+ *   其余是同名计数字段；
+ * - `ru_get(RU_CHILDREN, ...)` 要等子进程被回收后才有数；
+ * - `rl_nice(inc, &new)`：`inc` 为正降优先级（和 `nice(2)` 一致），`new` 可传 0。
+ */
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+
+module std.os.resource;
+import std.core.types;
+import std.text.str;
+
+/* 限制种类：和 RLIMIT_* 一一对应 */
+#define RL_CPU 0
+#define RL_FSIZE 1
+#define RL_DATA 2
+#define RL_STACK 3
+#define RL_CORE 4
+#define RL_NOFILE 7
+#define RL_AS 9
+#define RL_NPROC 6
+#define RL_MEMLOCK 8
+#define RL_INFINITY (-1)
+
+/* 谁的用量 */
+#define RU_SELF 0
+#define RU_CHILDREN (-1)
+
+struct Rlimit {
+    long long cur;
+    long long max;
+};
+
+struct Rusage {
+    long long utime_ms;
+    long long stime_ms;
+    long long maxrss_kb;
+    long long minflt;
+    long long majflt;
+    long long inblock;
+    long long oublock;
+    long long nvcsw;
+    long long nivcsw;
+};
+
+static int rl_kind(int which, int *out)
+{
+    switch (which) {
+    case RL_CPU: *out = RLIMIT_CPU; return 1;
+    case RL_FSIZE: *out = RLIMIT_FSIZE; return 1;
+    case RL_DATA: *out = RLIMIT_DATA; return 1;
+    case RL_STACK: *out = RLIMIT_STACK; return 1;
+    case RL_CORE: *out = RLIMIT_CORE; return 1;
+    case RL_NOFILE: *out = RLIMIT_NOFILE; return 1;
+    case RL_AS: *out = RLIMIT_AS; return 1;
+    case RL_MEMLOCK: *out = RLIMIT_MEMLOCK; return 1;
+    default: return -1;             /* RL_NPROC 在 RLIMIT_NPROC 存在时才有 */
+    }
+}
+
+static long long rl_out(rlim_t v)
+{
+    return v == RLIM_INFINITY ? RL_INFINITY : (long long)v;
+}
+
+static rlim_t rl_in(long long v)
+{
+    return v < 0 ? RLIM_INFINITY : (rlim_t)v;
+}
+
+int rl_get(int which, Rlimit *out)
+{
+    struct rlimit rl = { 0 };
+    int k = 0;
+
+    if (!out || rl_kind(which, &k) != 1)
+        return -1;
+    if (getrlimit(k, &rl) != 0)
+        return -1;
+    out->cur = rl_out(rl.rlim_cur);
+    out->max = rl_out(rl.rlim_max);
+    return 1;
+}
+
+int rl_set(int which, long long cur, long long max)
+{
+    struct rlimit rl = { 0 };
+    int k = 0;
+
+    if (rl_kind(which, &k) != 1)
+        return -1;
+    rl.rlim_cur = rl_in(cur);
+    rl.rlim_max = rl_in(max);
+    return setrlimit(k, &rl) == 0 ? 1 : -1;
+}
+
+static long long ru_ms(const struct timeval *tv)
+{
+    return (long long)tv->tv_sec * 1000 + (long long)tv->tv_usec / 1000;
+}
+
+int ru_get(int who, Rusage *out)
+{
+    struct rusage ru = { 0 };
+    int w = 0;
+
+    if (!out)
+        return -1;
+    w = who == RU_CHILDREN ? RUSAGE_CHILDREN : RUSAGE_SELF;
+    if (getrusage(w, &ru) != 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->utime_ms = ru_ms(&ru.ru_utime);
+    out->stime_ms = ru_ms(&ru.ru_stime);
+    out->maxrss_kb = (long long)ru.ru_maxrss;
+    out->minflt = (long long)ru.ru_minflt;
+    out->majflt = (long long)ru.ru_majflt;
+    out->inblock = (long long)ru.ru_inblock;
+    out->oublock = (long long)ru.ru_oublock;
+    out->nvcsw = (long long)ru.ru_nvcsw;
+    out->nivcsw = (long long)ru.ru_nivcsw;
+    return 1;
+}
+
+int ru_nice(int inc, int *out)
+{
+    int r = nice(inc);
+
+    /* nice(2) 成功也可能返回 -1，所以不拿返回值判成败，只回填新优先级 */
+    if (out)
+        *out = r;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "resource：RLIMIT 读与写" {
+    Rlimit rl = { 0 }, rl2 = { 0 };
+
+    if (rl_get(RL_NOFILE, &rl) != 1)
+        return err(1, "读 NOFILE 失败");
+    if (rl.cur <= 0 && rl.cur != RL_INFINITY)
+        return err(2, "NOFILE 的 cur 不合理");
+    if (rl.max != RL_INFINITY && rl.max < rl.cur)
+        return err(3, "max 不该小于 cur");
+    if (rl_get(RL_STACK, &rl) != 1 || rl.cur == 0)
+        return err(4, "栈限制应该非 0");
+    if (rl_get(RL_CORE, &rl2) != 1)
+        return err(5, "读 CORE 失败");
+    /* 把 CORE 设回当前值：不该报错 */
+    if (rl_set(RL_CORE, rl2.cur, rl2.max) != 1)
+        return err(6, "写 CORE 失败");
+    /* 非法种类 */
+    if (rl_get(RL_NPROC, &rl) != -1)
+        return err(7, "非法种类应该 -1");
+    if (rl_get(RL_NOFILE, 0) != -1)
+        return err(8, "空指针应该 -1");
+}
+
+test "resource：getrusage 与 nice" {
+    Rusage ru = { 0 };
+    int nice_now = 0;
+
+    if (ru_get(RU_SELF, &ru) != 1)
+        return err(9, "读自身用量失败");
+    if (ru.utime_ms < 0 || ru.stime_ms < 0)
+        return err(10, "CPU 时间不该为负");
+    if (ru.maxrss_kb <= 0)
+        return err(11, "RSS 应该 > 0");
+    if (ru.minflt < 0)
+        return err(12, "缺页计数不该为负");
+    if (ru_get(RU_CHILDREN, &ru) != 1)
+        return err(13, "读子进程用量失败");
+    if (ru_get(RU_SELF, 0) != -1)
+        return err(14, "空指针应该 -1");
+    if (ru_nice(0, &nice_now) != 1)
+        return err(15, "nice 0 应该成功");
+    if (nice_now < -20 || nice_now > 19)
+        return err(16, "nice 值越界");
+}

@@ -1449,6 +1449,32 @@ socks5 还要 `std/net/inet.c6`，snappy 自成一体。示例 `examples/stdprot
 验收：`make stdtest`（157 个模块、0 failure）、`make std-ser`（14 条自检全过）、
 `make check-all`。
 
+### 11.49 标准库第三十七批（sysinfo / resource / user / pty）
+
+第三十七批看系统本身：内核与负载、资源限制与用量、用户/组、伪终端。四个都是
+libc 薄封装，重点在把 errno 变成明确的 1/0/-1 语义、把结构体拍平成 `long long`。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.os.sysinfo` | uname / uptime / loadavg / ncpu / pagesize | `Str` 视图指向模块内静态缓冲区（下次调用即失效），换来零分配；`getloadavg` 的三个参数都可以传 0 |
+| `std.os.resource` | rlimit / rusage / nice | `RL_INFINITY` 是 -1（`rlim_t` 是无符号，直接比较会踩坑）；`getrusage` 的秒+微秒合成毫秒；`nice(2)` 成功也可能返回 -1，所以不拿返回值判成败 |
+| `std.os.user` | passwd / group 查询 | 查不到返回 0、出错返回 -1（这个区别调用方常常要）；只给主组，不展开附加组 |
+| `std.os.pty` | posix_openpt 一对 + fork 子进程 | `posix_openpt`/`grantpt`/`unlockpt`/`ptsname` 在严格 C99 下不声明，文件头要先 `#define _XOPEN_SOURCE 600`；子进程里 `setsid` + `TIOCSCTTY` 才能真正拿到控制终端；`pty_recv` 用 `poll` 给超时 |
+
+两个坑：一是 pty 的**回显**——往 master 写的数据会被行规程回显回 master，测试里
+从 master 读时必须先跳过回显、并且按「累积后再找子串」判，按「一次 read 的开头
+匹配」会随机失败；二是 `nice(2)` 的返回值不能当错误码用。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.os.sysinfo`=0x609d、
+`std.os.resource`=0x609e、`std.os.user`=0x609f、`std.os.pty`=0x60a0；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-sys` 与 `STD_SYS_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。示例
+`examples/stdsys.c6` 四节（13 条自检）。
+
+验收：`make stdtest`（161 个模块、0 failure）、`make std-sys`（13 条自检全过）、
+`make check-all`。
+
+
 
 
 

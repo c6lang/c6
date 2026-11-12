@@ -12862,6 +12862,10 @@ static const struct C6ErrStdSlot {
     { "std.data.ubjson",        C6_ERR_SLOT_STD + 154 },
     { "std.data.plist",         C6_ERR_SLOT_STD + 155 },
     { "std.text.markdown",      C6_ERR_SLOT_STD + 156 },
+    { "std.os.sysinfo",         C6_ERR_SLOT_STD + 157 },
+    { "std.os.resource",        C6_ERR_SLOT_STD + 158 },
+    { "std.os.user",            C6_ERR_SLOT_STD + 159 },
+    { "std.os.pty",             C6_ERR_SLOT_STD + 160 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

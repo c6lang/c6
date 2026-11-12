@@ -236,6 +236,10 @@ std/os/                     操作系统：流、文件系统与目录树、路�
   std/os/poll.c6            std.os.poll            多路等待（poll(2)）：PollSet（32 槽、零分配）的 add/modify/remove_fd/find/count/wait（返回就绪个数）/is_ready/ready/fd_at，单 fd 的 wait_readable/wait_writable/wait_any（1/0/-1）；EVENT_READ/WRITE/HUP/ERROR
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
   std/os/walk.c6            std.os.walk            目录树遍历与删除：walk/walk_stat（WalkOpts 的 max_depth/follow_links/visit_dirs、WalkStats 计数）、回调 1 继续 / 0 跳过子树 / -1 中止、remove_tree 后序删除
+  std/os/sysinfo.c6         std.os.sysinfo         uname 五字段（静态缓冲区视图）、运行时长、负载、CPU 数、页大小
+  std/os/resource.c6        std.os.resource        rlimit 读写（8 种限制，-1 表示无限）、getrusage（毫秒 CPU 时间/峰值 RSS/缺页/上下文切换）、nice
+  std/os/user.c6            std.os.user            passwd/group 查询：user_by_uid/name/current、group_by_gid（查不到 0、出错 -1）
+  std/os/pty.c6             std.os.pty             伪终端：pty_open 一对 fd、pty_spawn 起子进程、带 poll 超时的收发、pty_resize、pty_reap
   std/os/temp.c6            std.os.temp            临时文件/目录：temp_file/temp_file_named/temp_dir（mkstemp/mkdtemp，$TMPDIR 或 /tmp）、TempFile 的 ok/path/fd/write_all/close_file/remove，0600 + FD_CLOEXEC，不自动删除
   std/os/lock.c6            std.os.lock            文件建议锁（fcntl）：lock_open、FileLock 的 acquire(exclusive, wait_ms)/try_acquire/release/is_held/close_file；wait_ms<0 阻塞、0 只试一次、>0 重试到超时，整文件锁按进程合并
   std/os/mmap.c6            std.os.mmap            文件/匿名映射：map_file(path, writable)（可写 MAP_SHARED、只读 MAP_PRIVATE，空文件是坏映射）、map_anon（清零）、Map 的 data/size/sync/read_at/write_at/unmap；read_at/write_at 带边界检查
@@ -384,6 +388,7 @@ make std-doc     # 编译并运行 examples/stddoc.c6（第三十三批结构化
 make std-proto   # 编译并运行 examples/stdproto.c6（第三十四批网络协议编解码模块的拼装示例）
 make std-exec    # 编译并运行 examples/stdexec.c6（第三十五批二进制容器格式模块的拼装示例）
 make std-ser     # 编译并运行 examples/stdser.c6（第三十六批序列化与标记模块的拼装示例）
+make std-sys     # 编译并运行 examples/stdsys.c6（第三十七批系统视图模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

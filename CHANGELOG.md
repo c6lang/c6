@@ -56,6 +56,14 @@
 
 ### 标准库
 
+- **标准库第三十七批（系统视图）**：`std.os.sysinfo` / `std.os.resource` /
+  `std.os.user` / `std.os.pty` 四个 libc 薄封装模块，集成示例
+  `examples/stdsys.c6`（`make std-sys`）。sysinfo 给 uname/运行时长/负载/CPU 数/
+  页大小；resource 给 rlimit 与 getrusage（毫秒 CPU 时间、峰值 RSS、缺页、上下文
+  切换）；user 给 passwd/group 查询（查不到 0、出错 -1）；pty 给伪终端一对 +
+  fork 子进程 + 带超时的收发 + 窗口大小。错误号段 `std.os.sysinfo`=0x609d …
+  `std.os.pty`=0x60a0（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第三十六批（序列化与标记）**：`std.data.bson` / `std.data.ubjson` /
   `std.data.plist` / `std.text.markdown` 四个零分配模块，集成示例
   `examples/stdser.c6`（`make std-ser`）。BSON 逐元素切视图并做 int32 符号扩展；

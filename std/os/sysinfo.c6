@@ -1,0 +1,153 @@
+/* std/os/sysinfo：系统信息（uname / 负载 / 运行时长 / CPU 数 / 页大小）。
+ *
+ *     import std.os.sysinfo;
+ *
+ *     SysInfo si = { 0 };
+ *     si_uname(&si);
+ *     printf("%.*s %.*s\n", si.sysname.len, si.sysname.data, si.release.len, si.release.data);
+ *
+ * 约定：
+ *
+ * - `SysInfo` 里的 `Str` 指向模块内的**静态缓冲区**，下一次 `si_uname` 会覆盖，
+ *   要长期保存请自己拷走；
+ * - `si_uptime` 给整秒（`/proc/uptime` 的小数部分丢掉），读不到返回 -1；
+ * - `si_loadavg` 给 1/5/15 分钟负载，参数可以传 0 表示不要；
+ * - `si_ncpu` 用 `sysconf(_SC_NPROCESSORS_ONLN)`，失败返回 1；
+ * - `si_pagesize` 失败返回 4096。
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/utsname.h>
+#include <sys/sysinfo.h>
+
+module std.os.sysinfo;
+import std.core.types;
+import std.text.str;
+
+struct SysInfo {
+    Str sysname;
+    Str release;
+    Str machine;
+    Str nodename;
+    Str version;
+};
+
+static char si_buf[5][256] = { { 0 } };
+
+static Str si_view(char *p)
+{
+    Str s = { 0 };
+
+    s.s = (char[:]){ p, (int)strlen(p) };
+    return s;
+}
+
+static void si_copy(char *dst, const char *src)
+{
+    int n = (int)strlen(src);
+
+    if (n > 255)
+        n = 255;
+    memcpy(dst, src, (size_t)n);
+    dst[n] = 0;
+}
+
+int si_uname(SysInfo *out)
+{
+    struct utsname u = { 0 };
+
+    if (!out)
+        return -1;
+    if (uname(&u) != 0)
+        return -1;
+    si_copy(si_buf[0], u.sysname);
+    si_copy(si_buf[1], u.release);
+    si_copy(si_buf[2], u.machine);
+    si_copy(si_buf[3], u.nodename);
+    si_copy(si_buf[4], u.version);
+    out->sysname = si_view(si_buf[0]);
+    out->release = si_view(si_buf[1]);
+    out->machine = si_view(si_buf[2]);
+    out->nodename = si_view(si_buf[3]);
+    out->version = si_view(si_buf[4]);
+    return 1;
+}
+
+long long si_uptime(void)
+{
+    struct sysinfo si = { 0 };
+
+    if (sysinfo(&si) != 0)
+        return -1;
+    return (long long)si.uptime;
+}
+
+int si_loadavg(double *l1, double *l5, double *l15)
+{
+    double v[3] = { 0, 0, 0 };
+
+    if (getloadavg(v, 3) != 3)
+        return -1;
+    if (l1)
+        *l1 = v[0];
+    if (l5)
+        *l5 = v[1];
+    if (l15)
+        *l15 = v[2];
+    return 1;
+}
+
+int si_ncpu(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+
+    return n > 0 ? (int)n : 1;
+}
+
+int si_pagesize(void)
+{
+    long n = sysconf(_SC_PAGESIZE);
+
+    return n > 0 ? (int)n : 4096;
+}
+
+/* ---- 自测 ---- */
+
+test "sysinfo：uname 五个字段与机器信息" {
+    SysInfo si = { 0 };
+    int i = 0;
+
+    if (si_uname(&si) != 1)
+        return err(1, "uname 应该成功");
+    if (si.sysname.s.len <= 0 || si.release.s.len <= 0
+        || si.machine.s.len <= 0 || si.nodename.s.len <= 0
+        || si.version.s.len <= 0)
+        return err(2, "五个字段都该非空");
+    /* 视图指向静态缓冲区，内容可读 */
+    for (i = 0; i < si.sysname.s.len; i++)
+        if (si.sysname.s.data[i] == 0)
+            return err(3, "sysname 里不该有 NUL");
+    if (si_ncpu() < 1)
+        return err(4, "CPU 数至少 1");
+    if (si_pagesize() < 512)
+        return err(5, "页大小不该这么小");
+    if (si_uptime() < 0)
+        return err(6, "运行时长读不到");
+}
+
+test "sysinfo：负载与空指针" {
+    double l1 = -1, l5 = -1, l15 = -1;
+
+    if (si_loadavg(&l1, &l5, &l15) != 1)
+        return err(7, "负载应该成功");
+    if (l1 < 0 || l5 < 0 || l15 < 0)
+        return err(8, "负载不该是负数");
+    /* 可以只要其中一个 */
+    if (si_loadavg(0, 0, &l15) != 1 || l15 < 0)
+        return err(9, "只要 15 分钟负载");
+    if (si_loadavg(0, 0, 0) != 1)
+        return err(10, "全 0 也应该成功");
+    if (si_uname(0) != -1)
+        return err(11, "空指针应该 -1");
+}
