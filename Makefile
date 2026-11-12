@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more
+        std-more std-next
 
 all: build
 
@@ -224,6 +224,16 @@ std-more: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdmore $(STDMORE_SRCS)
 	./build/stdmore
 
+# 标准库第八批：base58 / varint / semver / cookie。
+STDNEXT_SRCS := examples/stdnext.c6 std/core/types.c6 std/core/err.c6 \
+                std/text/str.c6 std/encoding/base58.c6 std/encoding/varint.c6 \
+                std/text/semver.c6 std/net/cookie.c6
+
+std-next: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdnext $(STDNEXT_SRCS)
+	./build/stdnext
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -328,7 +338,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -337,13 +347,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的八个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的九个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more 是
-# 七批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next 是
+# 八批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -484,7 +494,7 @@ distclean:
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
-#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more）
+#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
@@ -495,6 +505,7 @@ distclean:
 #   std-web          编译并运行 examples/stdweb.c6（第五批）
 #   std-net          编译并运行 examples/stdnet.c6（第六批）
 #   std-more         编译并运行 examples/stdmore.c6（第七批）
+#   std-next         编译并运行 examples/stdnext.c6（第八批）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

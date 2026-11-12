@@ -39,6 +39,13 @@
   `ini_open`）仍是自由函数。`std/`、`examples/std*.c6`、`docs/stdlib.md`、`README.md`
   已全部改用方法语法。
 
+- **标准库第八批**：`std.encoding.base58` / `std.encoding.varint` / `std.text.semver` /
+  `std.net.cookie` 四个模块，集成示例 `examples/stdnext.c6`（`make std-next`）。
+  Base58 走 Bitcoin 字母表、前导零写 `1`；varint 提供 LEB128 无符号/有符号
+  （zigzag）编解码，解码区分成功/截断/非法；semver 严格按 SemVer 2.0.0 解析与
+  比较优先级；cookie 零分配解析 Set-Cookie / Cookie:，属性名大小写不敏感。
+  错误号段 `std.encoding.base58`=0x6029 … `std.net.cookie`=0x602c。
+
 - **标准库第七批**：`std.container.bitset` / `std.text.glob` / `std.encoding.base32` /
   `std.net.http` 四个模块，集成示例 `examples/stdmore.c6`（`make std-more`）。
   bitset 借用调用方 `u64` 缓冲，末字多余位始终清零；glob 是 `Glob` 对象上的
