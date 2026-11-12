@@ -1,0 +1,290 @@
+/* std/encoding/hkdf：HKDF（RFC 5869，基于 HMAC-SHA-256）。
+ *
+ *     import std.encoding.hkdf;
+ *
+ *     u8 prk[32] = { 0 };
+ *     hkdf_extract(salt, salt_len, ikm, ikm_len, prk);   // 提取
+ *     u8 okm[42] = { 0 };
+ *     hkdf_expand(prk, sizeof prk, info, info_len, okm, sizeof okm);  // 扩展
+ *
+ *     // 或者一步到位
+ *     hkdf(salt, salt_len, ikm, ikm_len, info, info_len, okm, sizeof okm);
+ *
+ * HKDF 是「把一段共享秘密（DH 的共享密钥、口令导出的种子……）摊成任意长度
+ * 密钥材料」的标准做法：extract 用 salt 当 HMAC key 压出 32 字节 PRK，
+ * expand 再用 PRK 反复 HMAC（T(i) = HMAC(PRK, T(i-1) || info || i)）拼出输出。
+ * 它**不是**口令哈希——口令要用 `std.encoding.pbkdf2`（带迭代，故意慢）。
+ *
+ * 约定：
+ *
+ * - salt 为 0 或长度 0 时按 RFC 用 32 个零字节（不是「不加盐」）；
+ * - `hkdf_expand` 的输出上限是 255 * 32 = 8160 字节（计数器只有一个字节），
+ *   超了返回 -1；`out_len == 0` 是合法的空操作，返回 0；
+ * - info 可以为 0（当空串），prk 必须是 32 字节（`find` 不检查长度，调用方
+ *   自己保证；`hkdf` 一步版没这个问题）；
+ * - 返回 0 = 成功，-1 = 参数不合法（空输出、超长、prk 为空）。
+ * - 中间块（T(i)、PRK、ipad/opad）都在栈上，用完清零；不 malloc。
+ */
+#include <string.h>
+
+module std.encoding.hkdf;
+import std.core.types;
+import std.encoding.sha256;
+
+#define HKDF_HASH_LEN 32
+#define HKDF_BLOCK_LEN 64
+#define HKDF_MAX_OUT (255 * HKDF_HASH_LEN)
+
+/* HMAC-SHA-256 的流式版本：消息由 a、b、counter（可选）三片拼成。
+   counter < 0 表示没有第三片。 */
+static void hkdf_hmac(const u8 *key, usize klen, const void *a, usize alen,
+                      const void *b, usize blen, int counter, u8 *out32)
+{
+    u8 kblock[HKDF_BLOCK_LEN] = { 0 };
+    u8 pad[HKDF_BLOCK_LEN] = { 0 };
+    u8 inner[HKDF_HASH_LEN] = { 0 };
+    Sha256 st = { 0 };
+    int i = 0;
+
+    if (key && klen > 0) {
+        if (klen > sizeof kblock)
+            sha256(key, klen, kblock);
+        else
+            memcpy(kblock, key, (size_t)klen);
+    }
+    for (i = 0; i < HKDF_BLOCK_LEN; i++)
+        pad[i] = (u8)(kblock[i] ^ 0x36);
+    st.init();
+    st.update(pad, sizeof pad);
+    st.update(a, alen);
+    st.update(b, blen);
+    if (counter >= 0) {
+        u8 c = (u8)counter;
+
+        st.update(&c, 1);
+    }
+    st.final(inner);
+    for (i = 0; i < HKDF_BLOCK_LEN; i++)
+        pad[i] = (u8)(kblock[i] ^ 0x5c);
+    st.init();
+    st.update(pad, sizeof pad);
+    st.update(inner, sizeof inner);
+    st.final(out32);
+    memset(kblock, 0, sizeof kblock);
+    memset(pad, 0, sizeof pad);
+    memset(inner, 0, sizeof inner);
+}
+
+/* 提取：PRK = HMAC(salt, IKM)；salt 为空时用 32 个零字节当 key */
+int hkdf_extract(const void *salt, usize salt_len, const void *ikm,
+                 usize ikm_len, u8 *out32)
+{
+    u8 zeros[HKDF_HASH_LEN] = { 0 };
+
+    if (!out32)
+        return -1;
+    if (!salt || salt_len == 0) {
+        hmac_sha256(zeros, sizeof zeros, ikm, ikm_len, out32);
+        return 0;
+    }
+    hmac_sha256(salt, salt_len, ikm, ikm_len, out32);
+    return 0;
+}
+
+/* 扩展：T(i) = HMAC(PRK, T(i-1) || info || i)，i 从 1 开始 */
+int hkdf_expand(const void *prk, usize prk_len, const void *info,
+                usize info_len, u8 *out, usize out_len)
+{
+    u8 t[HKDF_HASH_LEN] = { 0 };
+    usize done = 0;
+    int i = 0;
+
+    if (!out || out_len == 0)
+        return out_len == 0 && out ? 0 : -1;
+    if (!prk || prk_len == 0)
+        return -1;
+    if (out_len > (usize)HKDF_MAX_OUT)
+        return -1;
+    for (i = 1; done < out_len; i++) {
+        u8 block[HKDF_HASH_LEN] = { 0 };
+        usize take = out_len - done;
+
+        if (take > (usize)HKDF_HASH_LEN)
+            take = (usize)HKDF_HASH_LEN;
+        hkdf_hmac((const u8 *)prk, prk_len, t, (usize)(i == 1 ? 0 : HKDF_HASH_LEN),
+                  info, info_len, i, block);
+        memcpy(t, block, sizeof t);
+        memcpy(out + done, block, (size_t)take);
+        done += take;
+        memset(block, 0, sizeof block);
+    }
+    memset(t, 0, sizeof t);
+    return 0;
+}
+
+/* 一步：extract + expand */
+int hkdf(const void *salt, usize salt_len, const void *ikm, usize ikm_len,
+         const void *info, usize info_len, u8 *out, usize out_len)
+{
+    u8 prk[HKDF_HASH_LEN] = { 0 };
+    int rc = 0;
+
+    if (!out || out_len == 0)
+        return out_len == 0 && out ? 0 : -1;
+    if (hkdf_extract(salt, salt_len, ikm, ikm_len, prk) != 0)
+        return -1;
+    rc = hkdf_expand(prk, sizeof prk, info, info_len, out, out_len);
+    memset(prk, 0, sizeof prk);
+    return rc;
+}
+
+/* ---- 自测 ---- */
+
+static int hex_is(const u8 *d, int n, const char *want)
+{
+    char got[256] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        got[i * 2] = "0123456789abcdef"[(d[i] >> 4) & 0xf];
+        got[i * 2 + 1] = "0123456789abcdef"[d[i] & 0xf];
+    }
+    got[n * 2] = 0;
+    return strcmp(got, want) == 0;
+}
+
+static int from_hex(const char *s, u8 *dst, int cap)
+{
+    int n = 0, i = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = -1, lo = -1;
+
+        for (i = 0; i < 16; i++) {
+            if ("0123456789abcdef"[i] == s[0])
+                hi = i;
+            if ("0123456789abcdef"[i] == s[1])
+                lo = i;
+        }
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+test "RFC 5869 的三个用例" {
+    u8 ikm[22] = { 0 }, salt[13] = { 0 }, info[10] = { 0 };
+    u8 prk[32] = { 0 }, okm[42] = { 0 };
+
+    /* case 1：SHA-256，salt/IKM/info 都不是空 */
+    if (from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", ikm, 22) != 22
+        || from_hex("000102030405060708090a0b0c", salt, 13) != 13
+        || from_hex("f0f1f2f3f4f5f6f7f8f9", info, 10) != 10)
+        return err(1, "测试向量解不开");
+    if (hkdf_extract(salt, sizeof salt, ikm, sizeof ikm, prk) != 0)
+        return err(2, "extract 失败");
+    if (!hex_is(prk, 32,
+                "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"))
+        return err(3, "case 1 PRK 不对");
+    if (hkdf_expand(prk, sizeof prk, info, sizeof info, okm, sizeof okm) != 0)
+        return err(4, "expand 失败");
+    if (!hex_is(okm, 42,
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+                "34007208d5b887185865"))
+        return err(5, "case 1 OKM 不对");
+    /* case 2：80 字节的 IKM / salt / info，L = 82（多块 + 末尾半块） */
+    {
+        u8 salt2[80] = { 0 }, ikm2[80] = { 0 }, info2[80] = { 0 };
+        u8 okm2[82] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 80; i++) {
+            ikm2[i] = (u8)i;
+            salt2[i] = (u8)(0x60 + i);
+            info2[i] = (u8)(0xb0 + i);
+        }
+        if (hkdf_extract(salt2, sizeof salt2, ikm2, sizeof ikm2, prk) != 0)
+            return err(6, "case 2 extract 失败");
+        if (!hex_is(prk, 32,
+                    "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244"))
+            return err(7, "case 2 PRK 不对");
+        if (hkdf_expand(prk, sizeof prk, info2, sizeof info2, okm2,
+                        sizeof okm2)
+            != 0)
+            return err(8, "case 2 expand 失败");
+        if (!hex_is(okm2, 82,
+                    "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c"
+                    "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71"
+                    "cc30c58179ec3e87c14c01d5c1f3434f1d87"))
+            return err(9, "case 2 OKM 不对");
+    }
+    /* case 3：salt 和 info 都为空 */
+    {
+        u8 okm3[42] = { 0 };
+
+        if (hkdf(0, 0, ikm, sizeof ikm, 0, 0, okm3, sizeof okm3) != 0)
+            return err(11, "case 3 失败");
+        if (!hex_is(okm3, 42,
+                    "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
+                    "9d201395faa4b61a96c8"))
+            return err(12, "case 3 OKM 不对");
+    }
+}
+
+test "分块、长度与错误路径" {
+    u8 ikm[22] = { 0 }, salt[13] = { 0 }, info[10] = { 0 };
+    u8 a[42] = { 0 }, b[42] = { 0 }, prk[32] = { 0 };
+    u8 one[32] = { 0 }, two[64] = { 0 };
+
+    memset(ikm, 0x0b, sizeof ikm);
+    memset(salt, 0, sizeof salt);
+    memset(info, 0, sizeof info);
+    if (hkdf(salt, sizeof salt, ikm, sizeof ikm, info, sizeof info, a,
+             sizeof a)
+        != 0)
+        return err(13, "hkdf 一步版失败");
+    /* 一步版和分离版必须一致 */
+    hkdf_extract(salt, sizeof salt, ikm, sizeof ikm, prk);
+    hkdf_expand(prk, sizeof prk, info, sizeof info, b, sizeof b);
+    if (memcmp(a, b, sizeof a) != 0)
+        return err(14, "一步版和分离版不一致");
+    /* 32 字节（一块）和非 32 倍数（42）都要对 */
+    if (hkdf_expand(prk, sizeof prk, 0, 0, one, 32) != 0
+        || hkdf_expand(prk, sizeof prk, 0, 0, two, 64) != 0)
+        return err(15, "32/64 字节扩展失败");
+    if (memcmp(two, one, 32) != 0)
+        return err(16, "64 字节输出的前 32 字节应该等于 32 字节输出");
+    if (memcmp(two + 32, one, 32) == 0)
+        return err(17, "第二块不该和第一块相同");
+    /* 输出长度 0 是合法空操作 */
+    if (hkdf_expand(prk, sizeof prk, 0, 0, one, 0) != 0)
+        return err(18, "0 长度应该是成功");
+    if (hkdf(0, 0, ikm, sizeof ikm, 0, 0, 0, 16) != -1)
+        return err(19, "空输出应该失败");
+    /* 超过 255*32 上限 */
+    {
+        char big[255 * 32 + 1] = { 0 };
+
+        if (hkdf_expand(prk, sizeof prk, 0, 0, (u8 *)big, 255 * 32 + 1) != -1)
+            return err(20, "超过 8160 字节应该失败");
+        if (hkdf_expand(prk, sizeof prk, 0, 0, (u8 *)big, 255 * 32) != 0)
+            return err(21, "正好 8160 字节应该成功");
+    }
+    /* 空 PRK */
+    if (hkdf_expand(0, 0, 0, 0, one, 16) != -1)
+        return err(22, "空 PRK 应该失败");
+    if (hkdf_expand(prk, 0, 0, 0, one, 16) != -1)
+        return err(23, "PRK 长度为 0 应该失败");
+    /* salt 为 NULL 等价于 32 个零字节 */
+    {
+        u8 z[32] = { 0 };
+        u8 p1[32] = { 0 }, p2[32] = { 0 };
+
+        hkdf_extract(0, 0, ikm, sizeof ikm, p1);
+        hkdf_extract(z, sizeof z, ikm, sizeof ikm, p2);
+        if (memcmp(p1, p2, 32) != 0)
+            return err(24, "NULL salt 应该等于 32 个零字节");
+    }
+}

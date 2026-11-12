@@ -1110,3 +1110,28 @@ str），router 只借 `Str` 类型所以不用额外正文。示例 `examples/s
 
 验收：`make stdtest`（101 个模块、0 failure）、`make std-serve`（28 条自检全过）、
 `make check-all`。
+
+### 11.35 标准库第二十三批（md5 / sha512 / hkdf / pbkdf2）
+
+第二十三批是**纯计算**的一批：前面已经有 SHA-1/SHA-256，但「老数据的校验和
+（MD5）」「更强的摘要（SHA-512/384）」「把共享秘密摊成密钥（HKDF）」「把口令
+摊成密钥（PBKDF2）」还缺。四个模块都不碰 I/O、不依赖平台，全部用 RFC 向量
+钉住：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.md5` | MD5 与流式句柄 | 只做校验和/兼容格式，文档头明确写「碰撞是分钟级的」；T 表按 `sin(i+1)` 生成后核对；长度按小端 64 位，`md5_eq` 是 16 字节常数时间比较 |
+| `std.encoding.sha512` | SHA-512 / SHA-384 / HMAC-SHA-512 | 长度用 `n_hi`/`n_lo` 两个 u64 记字节数，收尾换成 128 位比特（跨 2^61 字节也不绕回）；SHA-384 不是「截 64 字节」，要 `init384` 换 IV；HMAC 的块长是 128（不是 SHA-256 的 64） |
+| `std.encoding.hkdf` | RFC 5869 | 空 salt 按 RFC 用 32 个零字节（不是「不加盐」）；expand 的计数器只有一字节，所以上限是 255*32=8160，超了返回 -1；info/salt 长度任意，靠流式 HMAC 分片喂，不拼临时缓冲 |
+| `std.encoding.pbkdf2` | PBKDF2-HMAC-SHA-1/SHA-256 | 迭代次数是安全参数，`iters <= 0` 直接拒绝（不默默降级成 1）；`U(1)=HMAC(P, S 拼上 INT(i))` 的 `INT(i)` 是大端 4 字节，测试用「iters=1 等于一次 HMAC」钉住；口令/盐传 0 当空串 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.md5`=0x6065、
+`std.encoding.sha512`=0x6066、`std.encoding.hkdf`=0x6067、`std.encoding.pbkdf2`=0x6068；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-crypto` 与 `STDCRYPTO_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 的依赖表补上 md5/sha512（bits）、
+hkdf（sha256+bits+err）、pbkdf2（sha1+sha256+bits+err）。示例
+`examples/stdcrypto.c6` 把四节串起来，最后用 HMAC-SHA-256 做一次 token 签发/
+篡改检测——期望值全来自 RFC，所以 `make std-crypto` 的输出与平台无关。
+
+验收：`make stdtest`（105 个模块、0 failure）、`make std-crypto`（28 条自检全过）、
+`make check-all`。

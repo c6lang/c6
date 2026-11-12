@@ -12795,6 +12795,10 @@ static const struct C6ErrStdSlot {
     { "std.net.router",         C6_ERR_SLOT_STD + 98 },
     { "std.net.assets",         C6_ERR_SLOT_STD + 99 },
     { "std.net.session",        C6_ERR_SLOT_STD + 100 },
+    { "std.encoding.md5",       C6_ERR_SLOT_STD + 101 },
+    { "std.encoding.sha512",    C6_ERR_SLOT_STD + 102 },
+    { "std.encoding.hkdf",      C6_ERR_SLOT_STD + 103 },
+    { "std.encoding.pbkdf2",    C6_ERR_SLOT_STD + 104 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

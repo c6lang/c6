@@ -16,7 +16,7 @@
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程 |
-| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、LZ4/RLE、hexdump |
+| `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256/SHA-512/MD5、HKDF/PBKDF2、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
@@ -117,7 +117,7 @@
 | `std/os/poll.c6` | `std.os.poll` | 多路等待（`poll(2)`）：`PollSet`（`POLL_MAX`=32 个槽，零分配）的 `init`/`add`（同 fd 改事件）/`modify`/`remove_fd`/`find`/`count`/`wait`（`<0` 永远等、`0` 立刻、`>0` 毫秒；返回就绪个数）/`is_ready`/`ready`/`fd_at`/`clear_ready`，单 fd 的 `wait_readable`/`wait_writable`/`wait_any`（1/0/-1）；事件位 `EVENT_READ`/`EVENT_WRITE`/`EVENT_ERROR`/`EVENT_HUP`/`EVENT_INVALID` |
 | `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `d.format(buf, cap)`、`Civil` 日历换算 `civil_from_unix`/`c.to_unix()`/`c.format(...)`，不依赖 localtime |
 
-**`std/encoding/`**（编解码：Base64/十六进制/百分号、SHA-256、位流、UUID）
+**`std/encoding/`**（编解码：Base64/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、位流、UUID）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -134,8 +134,12 @@
 | `std/encoding/rle.c6` | `std.encoding.rle` | PackBits 游程（`rle_encode`/`rle_decode`/`rle_encoded_len`/`rle_decoded_len`/`rle_bound`，控制字节 0..127 字面量、129..255 重复、128 no-op，单段 ≤128）与一阶差分 `delta_encode`/`delta_decode`（模 256，和 RLE/LZ4 组合用） |
 | `std/encoding/sha1.c6` | `std.encoding.sha1` | SHA-1 与 HMAC-SHA1（FIPS 180-4 / RFC 2104，零分配）：`sha1_new`/`init`/`update`/`final`、一次性 `sha1`/`sha1_hex`、`hmac_sha1`/`hmac_sha1_hex`、常数时间 `sha1_eq`；用于协议互操作（WebSocket 握手、git 对象名、HTTP Digest），抗碰撞请用 `std.encoding.sha256` |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
+| `std/encoding/md5.c6` | `std.encoding.md5` | MD5（RFC 1321，零分配）：`Md5` 的 `init`/`update`/`final`、一次性 `md5`/`md5_hex`、常数时间 `md5_eq`；小端 32 位字、64 步四轮，T 表按 `sin(i+1)` 生成；**只用于校验和/兼容格式**，碰撞是分钟级的 |
+| `std/encoding/sha512.c6` | `std.encoding.sha512` | SHA-512 / SHA-384 与 HMAC-SHA-512（FIPS 180-4 / RFC 2104，零分配）：`Sha512` 的 `init`/`init384`/`update`/`final`（128 位长度计数）、一次性 `sha512`/`sha384`/`sha512_hex`/`sha384_hex`、`hmac_sha512`/`hmac_sha512_hex`、常数时间 `sha512_eq`；80 轮、64 位字，旋转借 `std.core.bits` |
 | `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
+| `std/encoding/hkdf.c6` | `std.encoding.hkdf` | HKDF（RFC 5869，基于 HMAC-SHA-256，零分配）：`hkdf_extract`/`hkdf_expand`/`hkdf`（一步版）；salt 为空按 32 个零字节、expand 上限 255*32=8160 字节（计数器只有一字节）、`out_len == 0` 是合法空操作；返回 0/-1 |
+| `std/encoding/pbkdf2.c6` | `std.encoding.pbkdf2` | PBKDF2-HMAC-SHA-1 / SHA-256（RFC 2898/8018，零分配）：`pbkdf2_sha1`/`pbkdf2_sha256`；每块 `U(1)=HMAC(P, S 拼上 INT(i))`、`U(j)=HMAC(P,U(j-1))`、`T=xor(U(1..iters))`；`iters <= 0`、空输出返回 -1，口令/盐传 0 当空串，输出长度不限（块号按需递增） |
 
 **`std/data/`**（数据格式：JSON、CSV、INI）
 
@@ -197,6 +201,7 @@
 | `examples/stdterm.c6` | （无模块） | 第二十批（终端与进程控制）的拼装示例（`make std-term`）：伪终端检测/窗口大小/原始模式、信号处理与屏蔽、管道读写与 EOF、poll 多路等待，自带自检 |
 | `examples/stdclient.c6` | （无模块） | 第二十一批（网络客户端）的拼装示例（`make std-client`）：UDP 绑定/连接/空报文/超时、UDS socketpair 与路径 socket、resolv.conf 解析 + 本地 DNS 子进程上的一次 A 查询、本地 HTTP 子进程上的一次 chunked GET，自带自检 |
 | `examples/stdserve.c6` | （无模块） | 第二十二批（Web 服务端）的拼装示例（`make std-serve`）：httpd 收请求、router 分发（参数/通配符）、assets 发静态文件（含 403 越界）、session 的 Set-Cookie 往返，客户端用 `std.net.httpc` 打回本地服务端子进程，自带自检 |
+| `examples/stdcrypto.c6` | （无模块） | 第二十三批（消息摘要与密钥派生）的拼装示例（`make std-crypto`）：md5 的 RFC 1321 向量与流式喂入、sha512/sha384 与 HMAC-SHA-512、HKDF 的 RFC 5869 用例、PBKDF2 的 RFC 6070 用例，最后用 HMAC-SHA-256 演示 token 签发/篡改检测，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -235,6 +240,10 @@ std/encoding/codec.c6      7 test(s), 0 failure(s)
 std/encoding/frame.c6      4 test(s), 0 failure(s)
 std/encoding/punycode.c6   11 test(s), 0 failure(s)
 std/encoding/sha256.c6     23 test(s), 0 failure(s)
+std/encoding/md5.c6         9 test(s), 0 failure(s)
+std/encoding/sha512.c6      9 test(s), 0 failure(s)
+std/encoding/hkdf.c6       28 test(s), 0 failure(s)
+std/encoding/pbkdf2.c6     33 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
 std/net/cookie.c6          4 test(s), 0 failure(s)
@@ -283,6 +292,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/csv.c6` 41 | csv 19 + str 22（csv 只借 `Str` 类型，函数体不依赖 str 的代码） |
 | `std/os/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/encoding/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
+| `std/encoding/md5.c6` 9 | md5 3 + bits 6（`rotr32` 是跨 TU 调用） |
+| `std/encoding/sha512.c6` 9 | sha512 3 + bits 6（`rotr64` 是跨 TU 调用） |
+| `std/encoding/hkdf.c6` 28 | hkdf 2 + sha256 17 + bits 6 + err 3（HMAC 直接调 sha256） |
+| `std/encoding/pbkdf2.c6` 33 | pbkdf2 3 + sha1 4 + sha256 17 + bits 6 + err 3 |
 | `std/net/url.c6` 32 | url 10 + str 22（url 只借 `Str` 类型，正文不调用 str） |
 | `std/net/mime.c6` 37 | mime 7 + str 22 + path 8（取扩展名要 `std.os.path` 的正文） |
 | `std/encoding/uuid.c6` 24 | uuid 8 + rand 9 + time 7（v4/v7 要随机源，v7 要墙钟） |
@@ -309,7 +322,9 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/net/tcp`、`std/net/url`、`std/text/str`，`std/net/httpd` 的正文必须带
 `std/net/http`、`std/net/tcp`、`std/text/str`，`std/net/assets` 还要 `std/net/mime`、
 `std/net/url`、`std/os/fs`、`std/os/io`、`std/os/path`、`std/core/err`，`std/net/session`
-要 `std/core/rand`、`std/os/time`、`std/net/cookie`。
+要 `std/core/rand`、`std/os/time`、`std/net/cookie`，`std/encoding/md5`、
+`std/encoding/sha512` 的正文必须带 `std/core/bits`，`std/encoding/hkdf` 要
+`std/encoding/sha256`（连带 bits/err），`std/encoding/pbkdf2` 要 SHA-1、SHA-256 两个哈希。
 
 ## 设计原则
 
@@ -2905,6 +2920,30 @@ sid=...`）、带 Cookie 的 `/me`（`user=ada`）、不带 Cookie 的 `/me`（4
 Makefile 里显式列出十九个模块正文（httpd 要 http/tcp，assets 还要
 mime/url/fs/io/path/err，session 要 rand/time/cookie，客户端要 httpc）。
 
+### 集成示例：`examples/stdcrypto.c6`
+
+```sh
+make std-crypto
+```
+
+```
+stdcrypto: 标准库第二十三批（md5 / sha512 / hkdf / pbkdf2）
+md5: abc = 900150983cd24fb0d6963f7d28e17f72
+sha512: abc = ddaf35a193617abacc417349ae204131...
+hkdf: prk = 077709362c2e32df0ddc3f0dc47bba63...
+pbkdf2: sha1(salt,4096) = 4b007901b765489abead49d926f721...
+token: hmac-sha256 = 7d2f...（校验用常数时间比较）
+stdcrypto: 28 check(s), 0 failure(s)
+```
+
+四节全是纯计算：md5 用 RFC 1321 的向量和 63/64/65 切分验证流式喂入；sha512
+验 SHA-512/SHA-384 的 FIPS 向量与 RFC 4231 的 HMAC-SHA-512；hkdf 走 RFC 5869
+case 1 的 extract+expand 并核对 8160 字节上限；pbkdf2 用 RFC 6070 的 4096 次
+SHA-1 向量和 SHA-256 的 64 字节向量。最后用 HMAC-SHA-256 拼一个「签名 token」：
+签发、用 `sha256_eq` 常数时间校验、改一个字节后拒绝。期望值都来自 RFC，所以
+输出与平台无关。Makefile 里显式列出十一个模块正文（md5/sha512 要 bits，
+hkdf 要 sha256，pbkdf2 要 sha1+sha256）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2945,6 +2984,8 @@ mime/url/fs/io/path/err，session 要 rand/time/cookie，客户端要 httpc）�
   示例（自带自检）。
 * `make std-serve`：`examples/stdserve.c6`，第二十二批（Web 服务端）模块的拼装
   示例（自带自检）。
+* `make std-crypto`：`examples/stdcrypto.c6`，第二十三批（摘要与密钥派生）模块的
+  拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -2969,6 +3010,12 @@ mime/url/fs/io/path/err，session 要 rand/time/cookie，客户端要 httpc）�
   的计数。
 * `std/net/httpd.c6` 的「三态」用例：`read_request` 的 1/0/-1、chunked 请求与
   不完整请求、`serve_once` 的 200/404/400 与空连接 0。
+* `std/encoding/sha512.c6` 的「112 字节向量」与「127/128/129 切分」：钉住 128
+  字节块边界和 128 位长度填充（长度跨 2^61 字节才用得上高 64 位）。
+* `std/encoding/hkdf.c6` 的 RFC 5869 A.2：80 字节的 IKM/salt/info、L=82，一次
+  跨块且末尾半块的扩展。
+* `std/encoding/pbkdf2.c6` 的「iters=1 等于一次 HMAC」：把 PBKDF2 的块公式和
+  `hmac_sha1` 对上，钉住 `INT(i)` 的大端编码。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，

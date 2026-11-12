@@ -47,6 +47,17 @@
 
 ### 标准库
 
+- **标准库第二十三批（消息摘要与密钥派生）**：`std.encoding.md5` /
+  `std.encoding.sha512` / `std.encoding.hkdf` / `std.encoding.pbkdf2` 四个模块，
+  集成示例 `examples/stdcrypto.c6`（`make std-crypto`）。md5 是兼容用的校验和
+  （`Md5` 的 `init`/`update`/`final`、`md5`/`md5_hex`/`md5_eq`，RFC 1321 的 T 表，
+  明确标注不安全）；sha512 补 SHA-512/SHA-384 与 HMAC-SHA-512（128 位长度计数、
+  `init384` 换 IV、`hmac_sha512` 的 128 字节块）；hkdf 在 HMAC-SHA-256 上做
+  `extract`/`expand`（RFC 5869，空 salt 按 32 个零字节、expand 上限 8160 字节）；
+  pbkdf2 是带迭代的口令 KDF（`pbkdf2_sha1`/`pbkdf2_sha256`，RFC 6070/8018，
+  `iters <= 0` 直接拒绝）。错误号段 `std.encoding.md5`=0x6065 …
+  `std.encoding.pbkdf2`=0x6068（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第二十二批（Web 服务端）**：`std.net.httpd` / `std.net.router` /
   `std.net.assets` / `std.net.session` 四个模块，集成示例
   `examples/stdserve.c6`（`make std-serve`）。httpd 把 `std.net.http` 的解析和

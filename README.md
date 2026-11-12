@@ -232,7 +232,7 @@ std/os/                     操作系统：流、文件系统、路径、环境�
   std/os/poll.c6            std.os.poll            多路等待（poll(2)）：PollSet（32 槽、零分配）的 add/modify/remove_fd/find/count/wait（返回就绪个数）/is_ready/ready/fd_at，单 fd 的 wait_readable/wait_writable/wait_any（1/0/-1）；EVENT_READ/WRITE/HUP/ERROR
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
-std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
@@ -246,6 +246,10 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/rle.c6       std.encoding.rle       PackBits 游程（rle_encode/decode、rle_encoded_len/decoded_len、rle_bound）与一阶差分（delta_encode/decode，模 256）
   std/encoding/sha1.c6      std.encoding.sha1      SHA-1 与 HMAC-SHA1：流式 init/update/final、一次性 sha1/sha1_hex、hmac_sha1/hmac_sha1_hex、常数时间 sha1_eq（协议互操作：WebSocket 握手、git 对象名、HTTP Digest；抗碰撞请用 sha256）
   std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
+  std/encoding/md5.c6       std.encoding.md5       MD5（RFC 1321）：Md5 的 init/update/final、一次性 md5/md5_hex、常数时间 md5_eq；只用于校验和/兼容格式（碰撞是分钟级的）
+  std/encoding/sha512.c6    std.encoding.sha512    SHA-512/SHA-384 与 HMAC-SHA-512：init/init384/update/final（128 位长度）、sha512/sha384/*_hex、hmac_sha512(_hex)、常数时间 sha512_eq
+  std/encoding/hkdf.c6      std.encoding.hkdf      HKDF（RFC 5869）：hkdf_extract/hkdf_expand/hkdf 一步版；空 salt 按 32 个零字节、输出上限 8160 字节
+  std/encoding/pbkdf2.c6    std.encoding.pbkdf2    PBKDF2-HMAC-SHA-1/SHA-256（RFC 6070/8018）：pbkdf2_sha1/pbkdf2_sha256，iters<=0 与空输出直接拒绝，输出长度不限
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
@@ -314,6 +318,7 @@ make std-thread  # 编译并运行 examples/stdthread.c6（第十九批并发与
 make std-term    # 编译并运行 examples/stdterm.c6（第二十批终端与进程控制模块的拼装示例）
 make std-client  # 编译并运行 examples/stdclient.c6（第二十一批网络客户端模块的拼装示例）
 make std-serve   # 编译并运行 examples/stdserve.c6（第二十二批 Web 服务端模块的拼装示例）
+make std-crypto  # 编译并运行 examples/stdcrypto.c6（第二十三批摘要与密钥派生模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
