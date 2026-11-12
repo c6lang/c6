@@ -13047,6 +13047,10 @@ static const struct C6ErrStdSlot {
     { "std.net.https",          C6_ERR_SLOT_STD + 339 },
     { "std.net.httpsa",         C6_ERR_SLOT_STD + 340 },
     { "std.async.abench",       C6_ERR_SLOT_STD + 341 },
+    { "std.async.abudget",      C6_ERR_SLOT_STD + 342 },
+    { "std.async.agroup",       C6_ERR_SLOT_STD + 343 },
+    { "std.async.apool",        C6_ERR_SLOT_STD + 344 },
+    { "std.async.acancel",      C6_ERR_SLOT_STD + 345 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

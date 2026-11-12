@@ -1,0 +1,224 @@
+/* examples/stdasync5.c6 —— 第八十三批（完整的语言级异步框架：预算/任务组/额度/取消）。
+ *
+ *     make std-async5
+ *
+ * 五节，每一节对应框架的一个横切面：
+ *   1. 额度（APool）：最多 N 个任务同时在跑；
+ *   2. 任务组（AGroup）：一批 async 任务攒起来一起收尾；
+ *   3. 预算（ABudget）：合作式超时，`while (!b.expired())` + `await ayield()`；
+ *   4. 取消（ACancel）：父作用域置位 → 子任务在安全点自己退出；
+ *   5. 指标（ABench）：任务开销 / 挂起恢复 / co 批量。
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+import std.core.types;
+import std.text.str;
+import std.async.aio;
+import std.async.abench;
+import std.async.abudget;
+import std.async.agroup;
+import std.async.apool;
+import std.async.acancel;
+
+static int checks = 0;
+static int nfail = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        nfail++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_pool(void)
+{
+    APool p = { 0 };
+    int pa[2] = { -1, -1 };
+    int pb[2] = { -1, -1 };
+    int pc[2] = { -1, -1 };
+    char b1[16] = { 0 }, b2[16] = { 0 }, b3[16] = { 0 };
+    struct aio_read_task *t1 = 0, *t2 = 0, *t3 = 0;
+
+    printf("== apool（并发额度）\n");
+    check(p.init(2) == 1, "init(2)");
+    /* 每路一个管道：一个管道里的数据会被第一次读一口气取走 */
+    if (pipe(pa) != 0 || pipe(pb) != 0 || pipe(pc) != 0) {
+        check(0, "pipe");
+        return;
+    }
+    write(pa[1], "aa", 2);
+    write(pb[1], "bb", 2);
+    write(pc[1], "cc", 2);
+    check(p.acquire() == 1, "第一个额度");
+    t1 = aio_read(pa[0], b1, (int)sizeof b1);
+    check(p.acquire() == 1, "第二个额度");
+    t2 = aio_read(pb[0], b2, (int)sizeof b2);
+    check(p.acquire() == 0, "第三个被拒");
+    check(p.full() && p.denied() == 1, "满了且记了一次拒绝");
+    t3 = aio_read(pc[0], b3, (int)sizeof b3);       /* 被拒不代表不能跑 */
+    {
+        AGroup g = { { 0 }, 0, 0, 0 };
+        g.reset();
+        g.add(t1);
+        g.add(t2);
+        g.add(t3);
+        check(g.join() == 0, "三个读任务都完成");
+        check(t1->val == 2 && t2->val == 2 && t3->val == 2, "各读到 2 字节");
+        check(g.joined() == 3 && g.fails() == 0, "组记账");
+    }
+    printf("   active=%d peak=%d acquired=%ld denied=%ld\n", p.active(), p.peak(),
+           p.acquired(), p.denied());
+    check(p.active() == 2 && p.peak() == 2, "额度状态");
+    __c6_co_destroy(t1);
+    __c6_co_destroy(t2);
+    __c6_co_destroy(t3);
+    p.release();
+    p.release();
+    check(p.active() == 0 && p.release() == -1, "配对释放");
+    close(pa[0]);
+    close(pa[1]);
+    close(pb[0]);
+    close(pb[1]);
+    close(pc[0]);
+    close(pc[1]);
+}
+
+static void do_group(void)
+{
+    AGroup g = { { 0 }, 0, 0, 0 };
+    int a[2] = { -1, -1 };
+    char buf[64] = { 0 };
+    struct aio_write_all_task *w = 0;
+
+    printf("== agroup（任务组）\n");
+    if (pipe(a) != 0) {
+        check(0, "pipe");
+        return;
+    }
+    g.reset();
+    check(g.capacity() == 32 && !g.full(), "容量 32");
+    /* 一个写任务 + 三个读任务塞进同一个组 */
+    w = aio_write_all(a[1], "hello world", 11);
+    check(g.add(w) == 1, "add 写任务");
+    check(g.add(aio_read(a[0], buf, 5)) == 2, "add 读任务 1");
+    check(g.add(aio_read(a[0], buf + 5, 3)) == 3, "add 读任务 2");
+    check(g.add(aio_read(a[0], buf + 8, 3)) == 4, "add 读任务 3");
+    check(g.count() == 4, "组内 4 个任务");
+    check(g.join() == 0, "全部完成");
+    printf("   joined=%ld count=%d fails=%ld\n", g.joined(), g.count(), g.fails());
+    check(g.joined() == 4 && g.count() == 4, "记账");
+    __c6_co_destroy(w);
+    close(a[0]);
+    close(a[1]);
+}
+
+static void do_budget(void)
+{
+    Budget b = { 0 };
+    struct aspin_task *s = 0;
+    int rounds = 0;
+
+    printf("== abudget（预算 / 让出）\n");
+    check(b.start(1000) == 1, "start(1000)");
+    check(b.limited() && b.left_ms() > 0, "限时预算");
+    while (!b.expired() && rounds < 20) {
+        s = aspin(&b, 1);
+        __c6_co_wait(s);
+        __c6_co_destroy(s);
+        rounds++;
+    }
+    b.stop();
+    printf("   走了 %d 轮，用掉 %ld ms，剩 %ld ms\n", rounds, b.used_ms(),
+           b.left_ms());
+    check(rounds == 20, "预算足够时应该走满 20 轮");
+    check(!b.expired(), "1000ms 预算不该到期");
+    check(b.limit_of() == 1000 && !b.is_running(), "读数与停表");
+    /* 不限时的预算：读数边界 */
+    {
+        Budget e = { 0 };
+
+        e.start(0);
+        check(!e.limited() && e.left_ms() == -1 && !e.expired(), "不限时的预算");
+        e.stop();
+        check(e.used_ms() >= 0, "停表后 used_ms 可读");
+    }
+}
+
+static void do_cancel(void)
+{
+    ACancel parent = { 0, 0, 0, 0, 0 };
+    ACancel child = { 0, 0, 0, 0, 0 };
+    struct astep_task *t = 0;
+
+    printf("== acancel（协作取消）\n");
+    parent.reset();
+    child.reset();
+    check(child.link(&parent) == 1, "link 父子");
+    check(!child.poll(), "初始未取消");
+    t = astep(&child, 8);
+    check(__c6_co_wait(t) == 0 && t->val == 8, "未取消时走完 8 步");
+    __c6_co_destroy(t);
+    /* 父置位 → 子在下一次安全点看到 */
+    parent.set(ACANCEL_TIMEOUT);
+    check(child.poll() == 1 && child.reason() == ACANCEL_TIMEOUT, "联动取消");
+    t = astep(&child, 8);
+    check(__c6_co_wait(t) == 0 && t->val == 0, "取消后一步不走");
+    __c6_co_destroy(t);
+    printf("   parent.reason=%d child.checks=%ld child.steps=%ld\n",
+           parent.reason(), child.check_count(), child.step_count());
+    check(child.step_count() == 8, "取消前的步数保留");
+    child.unlink();
+    parent.reset();
+    child.reset();
+}
+
+static void do_bench(void)
+{
+    Bench b = { { 0 }, 0, 0, 0, 0, 0 };
+    char line[192] = { 0 };
+    int fds[2] = { -1, -1 };
+
+    printf("== 性能指标\n");
+    if (b.run_null(2000) != 1) {
+        check(0, "run_null");
+        return;
+    }
+    b.report(line, (int)sizeof line);
+    printf("   %s\n", line);
+    check(b.ops() == 2000 && b.fail_count() == 0, "2000 次任务开销");
+    if (pipe(fds) != 0) {
+        check(0, "pipe");
+        return;
+    }
+    if (b.run_io(300, fds[0], fds[1]) != 1) {
+        check(0, "run_io");
+        return;
+    }
+    b.report(line, (int)sizeof line);
+    printf("   %s\n", line);
+    check(b.ops() == 300 && b.fail_count() == 0, "300 次挂起+恢复");
+    if (b.run_co(300, fds[0], fds[1]) != 1) {
+        check(0, "run_co");
+        return;
+    }
+    b.report(line, (int)sizeof line);
+    printf("   %s\n", line);
+    check(b.ops() == 300 && b.fail_count() == 0, "300 次 co 批量");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+int main(void)
+{
+    do_pool();
+    do_group();
+    do_budget();
+    do_cancel();
+    do_bench();
+    printf("\n%d check(s), %d failure(s)\n", checks, nfail);
+    return nfail == 0 ? 0 : 1;
+}

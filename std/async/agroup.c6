@@ -1,0 +1,195 @@
+/* std/async/agroup：任务组（把一批 `task` 句柄攒起来一起收尾，等价于 errgroup.Wait）。
+ *
+ *     import std.async.agroup;
+ *
+ *     AGroup g = { 0 };
+ *     g.reset();                             // 方法：add / join / count / fails / reset
+ *     g.add(aio_read(fd1, buf1, cap));       // async 调用直接建任务
+ *     g.add(aio_read(fd2, buf2, cap));
+ *     int bad = g.join();                    // 依次驱动到完成，返回失败数
+ *
+ * 句柄是 `struct NAME_task *`，为了通用这里收成 `void *`。`g.join()` 按**加入顺序**
+ * 逐个 `__c6_co_wait`，所以它不是「谁先完成谁先返回」——合作式框架里要那样得自己写
+ * 轮询循环；这一层的用途是「一组异步操作全干完再往下走」，并且把失败数一次汇总。
+ *
+ * 约定：
+ *
+ * - `g.reset()` 清空组（不驱动、不释放任务），返回 1；
+ * - `g.add(task)` 追加一个任务句柄，成功返回组内序号（从 1 起），满了或空句柄返回 -1；
+ * - `g.join()` 依次驱动全部任务（**不** destroy，句柄归调用方或 `task` 声明的作用域），
+ *   返回「结束码非 0」的个数——只有用 `T!error` 声明并以 `err` 结束的 async 函数才会
+ *   让 `__c6_co_wait` 返回非 0；普通函数返回 `-1` 这种**业务失败**不算（请自己看
+ *   `t->val`）。驱动之后组本身保留，方便再 `join`（已完成的任务立即返回）；
+ * - `g.count()` 组内任务数，`g.joined()` 累计驱动过的任务数，`g.fails()` 累计失败数；
+ * - `g.full()` 是否已经塞满（上限 `AGROUP_MAX`），`g.capacity()` 上限；
+ * - `g.at(i)` 取第 i 个句柄（调试用），越界返回 0。
+ */
+#include <string.h>
+
+module std.async.agroup;
+import std.core.types;
+import std.text.str;
+import std.async.aio;
+
+#define AGROUP_MAX 32
+
+struct AGroup {
+    void *tasks[AGROUP_MAX];
+    int n;
+    long njoined;
+    long nfail;
+};
+
+int reset(AGroup *g)
+{
+    if (!g)
+        return -1;
+    memset(g, 0, sizeof *g);
+    return 1;
+}
+
+int add(AGroup *g, void *task)
+{
+    if (!g || !task || g->n >= AGROUP_MAX)
+        return -1;
+    g->tasks[g->n] = task;
+    g->n++;
+    return g->n;
+}
+
+int join(AGroup *g)
+{
+    int i = 0;
+    int bad = 0;
+
+    if (!g)
+        return -1;
+    for (i = 0; i < g->n; i++) {
+        int rc = __c6_co_wait(g->tasks[i]);
+
+        g->njoined++;
+        if (rc != 0) {
+            g->nfail++;
+            bad++;
+        }
+    }
+    return bad;
+}
+
+int count(AGroup *g)
+{
+    return g ? g->n : 0;
+}
+
+long joined(AGroup *g)
+{
+    return g ? g->njoined : 0;
+}
+
+long fails(AGroup *g)
+{
+    return g ? g->nfail : 0;
+}
+
+int capacity(AGroup *g)
+{
+    (void)g;
+    return AGROUP_MAX;
+}
+
+int full(AGroup *g)
+{
+    return g && g->n >= AGROUP_MAX ? 1 : 0;
+}
+
+void *at(AGroup *g, int i)
+{
+    if (!g || i < 0 || i >= g->n)
+        return 0;
+    return g->tasks[i];
+}
+
+/* ---- 自测 ---- */
+
+test "agroup：攒任务一起收尾" {
+    int a[2] = { -1, -1 };
+    int b[2] = { -1, -1 };
+    char ba[16] = { 0 };
+    char bb[16] = { 0 };
+    AGroup g = { { 0 }, 0, 0, 0 };
+    struct aio_read_task *t1 = 0;
+    struct aio_read_task *t2 = 0;
+
+    if (pipe(a) != 0 || pipe(b) != 0)
+        return err(1, "pipe 失败");
+    if (g.reset() != 1 || g.count() != 0)
+        return err(2, "reset 失败");
+    if (g.capacity() != AGROUP_MAX || g.full())
+        return err(3, "容量不对");
+    write(a[1], "one", 3);
+    write(b[1], "two!", 4);
+    t1 = aio_read(a[0], ba, (int)sizeof ba);
+    t2 = aio_read(b[0], bb, (int)sizeof bb);
+    if (g.add(t1) != 1 || g.add(t2) != 2)
+        return err(4, "add 序号不对");
+    if (g.count() != 2)
+        return err(5, "count 不对");
+    if (g.at(0) == 0 || g.at(2) != 0 || g.at(-1) != 0)
+        return err(6, "at 不对");
+    if (g.join() != 0)
+        return err(7, "两个任务都该正常结束");
+    if (t1->val != 3 || t2->val != 4)
+        return err(8, "任务返回值不对");
+    if (g.joined() != 2 || g.fails() != 0)
+        return err(9, "记账不对");
+    /* 再 join 一次：驱动数继续累加，但任务已经完成（不阻塞） */
+    if (g.join() != 0 || g.joined() != 4)
+        return err(10, "重复 join 的行为不对");
+    __c6_co_destroy(t1);
+    __c6_co_destroy(t2);
+    close(a[0]);
+    close(a[1]);
+    close(b[0]);
+    close(b[1]);
+}
+
+test "agroup：满、空句柄与失败计数" {
+    int a[2] = { -1, -1 };
+    char buf[8] = { 0 };
+    AGroup g = { { 0 }, 0, 0, 0 };
+    struct aio_read_task *t = 0;
+    struct aio_read_task *many[AGROUP_MAX] = { 0 };
+    int i = 0;
+
+    if (pipe(a) != 0)
+        return err(11, "pipe 失败");
+    g.reset();
+    if (g.add(0) != -1)
+        return err(12, "空句柄应该 -1");
+    /* 塞满 */
+    for (i = 0; i < AGROUP_MAX; i++) {
+        many[i] = aio_read(a[0], buf, (int)sizeof buf);
+        if (g.add(many[i]) != i + 1)
+            return err(13, "塞满过程失败");
+    }
+    if (!g.full() || g.add(many[0]) != -1)
+        return err(14, "满了之后 add 应该 -1");
+    /* 数据不够，任务会一直挂着；这里只验证 add 的边界，不再 join */
+    for (i = 0; i < AGROUP_MAX; i++)
+        __c6_co_destroy(many[i]);
+    /* 失败计数：读一个已经关闭的 fd，任务应以 -1 结束 */
+    close(a[1]);
+    g.reset();
+    t = aio_read(-1, buf, (int)sizeof buf);
+    if (t == 0)
+        return err(15, "空 fd 也该能建任务");
+    if (g.add(t) != 1)
+        return err(16, "add 失败");
+    /* 业务上的 -1 是「返回值」，不是运行时的 err，所以 join 返回 0 */
+    if (g.join() != 0)
+        return err(17, "返回 -1 的任务不算运行时失败");
+    if (g.fails() != 0 || t->val != -1)
+        return err(18, "失败记账不对");
+    __c6_co_destroy(t);
+    close(a[0]);
+}

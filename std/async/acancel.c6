@@ -1,0 +1,210 @@
+/* std/async/acancel：取消标志（合作式框架里的「让它自己停下来」）。
+ *
+ *     import std.async.acancel;
+ *
+ *     Cancel c = { 0 };
+ *     c.reset();                          // 方法：reset / set / is_set / check
+ *     if (c.poll())                      // 安全点：取消了吗？
+ *         return -1;
+ *
+ * 合作式调度**不能**从外面掐断一个协程：取消只能是「置一个标志 + 协程自己在安全点
+ * 检查并退出」。这一层就是那个标志，带原因码与检查计数，方便统计「一次取消省下了多少
+ * 步」。
+ *
+ * 约定：
+ *
+ * - `c.reset()` 清标志、原因、计数，返回 1；
+ * - `c.set(reason)` 置取消并记原因（`1 = 超时`、`2 = 手动`、`3 = 上游错误`，其它值原样
+ *   保留），返回 1；
+ * - `c.is_set()` 只读标志（不计数），`c.poll()` 读标志并累加检查次数（安全点用它）；
+ * - `c.reason()` 原因码（没取消返回 0），`c.check_count()` 检查次数，
+ *   `c.step_count()` 累计步数（这两个名字避开调用方文件里的同名静态变量）；
+ * - `await astep(&c, n)` 模拟 n 步可取消的工作：每步 `poll()`，一旦取消立即返回已走的
+ *   步数（`n <= 0` 返回 -1）；正常走完返回 n；
+ * - `c.link(&other)` 让两个标志联动（任一置位，另一个在下次 `poll()` 时也视为取消）——
+ *   用来把父作用域的取消传给子任务。
+ */
+#include <string.h>
+
+module std.async.acancel;
+import std.core.types;
+import std.text.str;
+
+#define ACANCEL_TIMEOUT 1
+#define ACANCEL_MANUAL 2
+#define ACANCEL_UPSTREAM 3
+
+struct ACancel {
+    int flag;
+    int rsn;
+    long nchk;
+    long nsteps;
+    ACancel *peer;
+};
+
+int reset(ACancel *c)
+{
+    if (!c)
+        return -1;
+    memset(c, 0, sizeof *c);
+    return 1;
+}
+
+int set(ACancel *c, int reason)
+{
+    if (!c)
+        return -1;
+    if (!c->flag) {
+        c->flag = 1;
+        c->rsn = reason;
+    }
+    return 1;
+}
+
+int is_set(ACancel *c)
+{
+    if (!c)
+        return 0;
+    if (c->flag)
+        return 1;
+    return c->peer && c->peer->flag ? 1 : 0;
+}
+
+int poll(ACancel *c)
+{
+    if (!c)
+        return 0;
+    c->nchk++;
+    if (c->flag)
+        return 1;
+    if (c->peer && c->peer->flag) {
+        c->flag = 1;
+        c->rsn = c->peer->rsn;
+        return 1;
+    }
+    return 0;
+}
+
+int reason(ACancel *c)
+{
+    return c ? c->rsn : 0;
+}
+
+long check_count(ACancel *c)
+{
+    return c ? c->nchk : 0;
+}
+
+long step_count(ACancel *c)
+{
+    return c ? c->nsteps : 0;
+}
+
+int link(ACancel *c, ACancel *other)
+{
+    if (!c || !other || c == other)
+        return -1;
+    c->peer = other;
+    other->peer = c;
+    return 1;
+}
+
+int unlink(ACancel *c)
+{
+    if (!c)
+        return -1;
+    if (c->peer) {
+        c->peer->peer = 0;
+        c->peer = 0;
+    }
+    return 1;
+}
+
+async int aio_null_step(void)
+{
+    return 0;
+}
+
+/* 模拟 n 步可取消工作：每步一个安全点 */
+async int astep(void *cp, int n)
+{
+    ACancel *c = (ACancel *)cp;
+    int i = 0;
+
+    if (!c || n <= 0)
+        return -1;
+    for (i = 0; i < n; i++) {
+        if (poll(c))
+            return i;
+        c->nsteps++;
+        await aio_null_step();
+    }
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+test "acancel：标志、原因与检查计数" {
+    ACancel c = { 0, 0, 0, 0, 0 };
+    ACancel d = { 0, 0, 0, 0, 0 };
+
+    if (c.is_set() || c.poll())
+        return err(1, "初始不该取消");
+    if (c.check_count() != 1)
+        return err(2, "check 应该计数");
+    if (c.reset() != 1 || c.check_count() != 0)
+        return err(3, "reset 没清计数");
+    if (c.set(ACANCEL_TIMEOUT) != 1)
+        return err(4, "set 失败");
+    if (!c.is_set() || !c.poll() || c.reason() != ACANCEL_TIMEOUT)
+        return err(5, "取消状态不对");
+    /* 重复 set 不覆盖原因 */
+    c.set(ACANCEL_MANUAL);
+    if (c.reason() != ACANCEL_TIMEOUT)
+        return err(6, "重复 set 不该覆盖原因");
+    /* 联动：d 跟着 c 一起取消 */
+    d.reset();
+    c.reset();
+    if (d.link(&c) != 1)
+        return err(7, "link 失败");
+    if (d.poll())
+        return err(8, "还没置位就不该取消");
+    c.set(ACANCEL_UPSTREAM);
+    if (!d.poll() || d.reason() != ACANCEL_UPSTREAM)
+        return err(9, "联动取消没生效");
+    if (d.unlink() != 1 || d.poll() != 1)
+        return err(10, "unlink 之后 d 自己已经置位，仍算取消");
+    if (d.link(&d) != -1 || d.link(0) != -1)
+        return err(11, "非法 link 应该 -1");
+}
+
+test "acancel：可取消的步进" {
+    ACancel c = { 0, 0, 0, 0, 0 };
+    struct astep_task *t = 0;
+
+    c.reset();
+    t = astep(&c, 5);
+    if (__c6_co_wait(t) != 0 || t->val != 5)
+        return err(12, "没取消时应该走完 5 步");
+    __c6_co_destroy(t);
+    if (c.step_count() != 5 || c.check_count() != 5)
+        return err(13, "步数/检查数不对");
+    /* 取消之后：立即返回已走的步数（0） */
+    c.reset();
+    c.set(ACANCEL_MANUAL);
+    t = astep(&c, 5);
+    if (__c6_co_wait(t) != 0 || t->val != 0)
+        return err(14, "已取消应该一步不走");
+    __c6_co_destroy(t);
+    if (c.step_count() != 0)
+        return err(15, "取消后不该累计步数");
+    /* 参数边界 */
+    t = astep(&c, 0);
+    if (__c6_co_wait(t) != 0 || t->val != -1)
+        return err(16, "n=0 应该 -1");
+    __c6_co_destroy(t);
+    t = astep(0, 3);
+    if (__c6_co_wait(t) != 0 || t->val != -1)
+        return err(17, "空标志应该 -1");
+    __c6_co_destroy(t);
+}

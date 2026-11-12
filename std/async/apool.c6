@@ -1,0 +1,186 @@
+/* std/async/apool：并发额度池（合作式框架里的「最多 N 个同时在跑」）。
+ *
+ *     import std.async.apool;
+ *
+ *     APool p = { 0 };
+ *     p.init(4);                          // 方法：init / acquire / release / active
+ *     if (p.acquire()) {
+ *         task t = httpsa_get(&h, "example.com", "/");
+ *         ...
+ *         p.release();
+ *     } else {
+ *         // 满了：要么排队（自己留 pending），要么拒绝
+ *     }
+ *
+ * 与 `std.async.limiter`（自带请求队列与 `__c6_co_run` 驱动）不同，这一层是**纯计数**：
+ * 不建任务、不排队、不驱动，只回答「现在还能不能再起一个」。要排队的上层用
+ * `std.container.queue` 自己攒，要驱动的用 `co`/`task`。
+ *
+ * 约定：
+ *
+ * - `p.init(limit)`：上限 `limit > 0`，清零计数，返回 1；
+ * - `p.acquire()`：拿到额度返回 1，超限返回 0（并记一次 `denied`）；
+ * - `p.release()`：还额度，返回剩余在跑数；没有在跑的还返回 -1（防止重复 release）；
+ * - `p.active()` 在跑数，`p.limit()` 上限，`p.peak()` 历史峰值，`p.acquired()`
+ *   成功次数，`p.denied()` 被拒次数，`p.full()` 是否已满，`p.reset()` 复位（不动上限）；
+ * - 额度池不认「谁」拿的：用 `defer { p.release(); }` 配对最稳。
+ */
+#include <string.h>
+
+module std.async.apool;
+import std.core.types;
+import std.text.str;
+import std.async.aio;
+
+struct APool {
+    int cap;
+    int cur;
+    int peakv;
+    long acq;
+    long den;
+};
+
+int init(APool *p, int limit)
+{
+    if (!p || limit <= 0)
+        return -1;
+    memset(p, 0, sizeof *p);
+    p->cap = limit;
+    return 1;
+}
+
+int acquire(APool *p)
+{
+    if (!p || p->cap <= 0)
+        return -1;
+    if (p->cur >= p->cap) {
+        p->den++;
+        return 0;
+    }
+    p->cur++;
+    p->acq++;
+    if (p->cur > p->peakv)
+        p->peakv = p->cur;
+    return 1;
+}
+
+int release(APool *p)
+{
+    if (!p || p->cur <= 0)
+        return -1;
+    p->cur--;
+    return p->cur;
+}
+
+int active(APool *p)
+{
+    return p ? p->cur : 0;
+}
+
+int limit(APool *p)
+{
+    return p ? p->cap : 0;
+}
+
+int peak(APool *p)
+{
+    return p ? p->peakv : 0;
+}
+
+long acquired(APool *p)
+{
+    return p ? p->acq : 0;
+}
+
+long denied(APool *p)
+{
+    return p ? p->den : 0;
+}
+
+int full(APool *p)
+{
+    return p && p->cap > 0 && p->cur >= p->cap ? 1 : 0;
+}
+
+int reset(APool *p)
+{
+    int cap = 0;
+
+    if (!p)
+        return -1;
+    cap = p->cap;
+    memset(p, 0, sizeof *p);
+    p->cap = cap;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "apool：额度、峰值与被拒" {
+    APool p = { 0 };
+
+    if (p.init(0) != -1 || p.init(-3) != -1)
+        return err(1, "非法上限应该 -1");
+    if (p.init(2) != 1 || p.limit() != 2)
+        return err(2, "init(2) 失败");
+    if (p.acquire() != 1 || p.acquire() != 1)
+        return err(3, "两个额度都该拿到");
+    if (p.active() != 2 || !p.full())
+        return err(4, "应该在跑 2 个且已满");
+    if (p.acquire() != 0)
+        return err(5, "第三次应该被拒");
+    if (p.denied() != 1 || p.acquired() != 2)
+        return err(6, "计数不对");
+    if (p.peak() != 2)
+        return err(7, "峰值应该是 2");
+    if (p.release() != 1 || p.full())
+        return err(8, "释放之后应该还能再拿");
+    if (p.acquire() != 1)
+        return err(9, "释放后应该能再拿到额度");
+    if (p.release() != 1 || p.release() != 0)
+        return err(10, "依次释放的返回值不对");
+    if (p.release() != -1)
+        return err(11, "空池再释放应该 -1");
+    if (p.acquire() != 1)
+        return err(12, "复位前再拿一次");
+    if (p.reset() != 1 || p.active() != 0 || p.limit() != 2)
+        return err(13, "reset 应该清计数但保留上限");
+    if (p.acquired() != 0 || p.denied() != 0 || p.peak() != 0)
+        return err(14, "reset 之后计数该清零");
+}
+
+test "apool：与任务配对使用" {
+    APool p = { 0 };
+    int a[2] = { -1, -1 };
+    char bufs[3][16] = { { 0 }, { 0 }, { 0 } };
+    struct aio_read_task *t0 = 0;
+    struct aio_read_task *t1 = 0;
+
+    if (p.init(1) != 1)
+        return err(15, "init(1) 失败");
+    if (pipe(a) != 0)
+        return err(16, "pipe 失败");
+    if (p.acquire() != 1)
+        return err(17, "第一个额度");
+    write(a[1], "z", 1);
+    t0 = aio_read(a[0], bufs[0], (int)sizeof bufs[0]);
+    if (p.acquire() != 0)
+        return err(18, "上限 1 时第二个应该被拒");
+    /* 被拒之后仍然可以把已有的任务跑完 —— 拒绝不等于阻塞 */
+    if (__c6_co_wait(t0) != 0 || t0->val != 1)
+        return err(19, "已拿额度的任务应该正常完成");
+    __c6_co_destroy(t0);
+    p.release();
+    if (p.acquire() != 1)
+        return err(20, "释放后应该能再拿");
+    write(a[1], "w", 1);
+    t1 = aio_read(a[0], bufs[1], (int)sizeof bufs[1]);
+    if (__c6_co_wait(t1) != 0 || t1->val != 1)
+        return err(21, "第二个任务完成失败");
+    __c6_co_destroy(t1);
+    p.release();
+    if (p.active() != 0 || p.acquired() != 2 || p.denied() != 1)
+        return err(22, "最终计数不对");
+    close(a[0]);
+    close(a[1]);
+}

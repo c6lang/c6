@@ -1,0 +1,202 @@
+/* std/async/abudget：协程的时间预算 / 截止时间（合作式框架里的「超时」那一半）。
+ *
+ *     import std.async.abudget;
+ *
+ *     Budget b = { 0 };
+ *     b.start(50);                    // 方法：start / left_ms / expired / used_ms
+ *     while (!b.expired()) {
+ *         int n = await arecv(&ch);   // 每轮做一小步
+ *         ...
+ *     }
+ *     b.stop();
+ *
+ * 合作式调度里不能「打断」一个正在跑的协程：超时只能由**协程自己**在每个安全点检查。
+ * 所以这里给的是一套预算表——`b.expired()` 就是安全点的判断，`await ayield()` 是主动
+ * 让出一次调度（`await` 一个空子任务，不碰 fd、也不等时间）。
+ *
+ * 同时提供了一个「让出 N 次」的小工具 `await aspin(&b, n)`，用来在预算耗尽前把控制权
+ * 交回去（也常拿它量调度开销）。
+ *
+ * 约定：
+ *
+ * - `b.start(limit_ms)`：起表，`limit_ms <= 0` 表示不限时（`b.limited()` 为 0，
+ *   `b.left_ms()` 返回 -1，`b.expired()` 永远 0）；
+ * - `b.left_ms()` 剩余毫秒（可为 0），`b.used_ms()` 已用毫秒，`b.used_ns()` 已用纳秒；
+ * - `b.expired()` 是否到点，`b.stop()` 停表（之后读数冻结），`b.limited()` 是否限时；
+ * - `await ayield()` 让出一次，返回 0；
+ * - `await aspin(&b, n)` 连续让出 `n` 次，返回实际让出次数（`n <= 0` 返回 -1）；
+ * - 计时用 `now_ns()`（`CLOCK_MONOTONIC`），不受系统时间调整影响。
+ */
+#include <string.h>
+
+module std.async.abudget;
+import std.core.types;
+import std.text.str;
+import std.os.time;
+
+struct Budget {
+    u64 t0;
+    u64 t1;
+    long limit_ms;
+    int running;
+};
+
+/* 让出一次：await 一个空子任务（不等 fd、不等时间） */
+async int ayield(void)
+{
+    return 0;
+}
+
+async int aspin(void *bp, int n)
+{
+    int i = 0;
+
+    if (!bp || n <= 0)
+        return -1;
+    for (i = 0; i < n; i++)
+        await ayield();
+    return n;
+}
+
+int start(Budget *b, long limit_ms)
+{
+    if (!b)
+        return -1;
+    memset(b, 0, sizeof *b);
+    b->t0 = now_ns();
+    b->limit_ms = limit_ms > 0 ? limit_ms : 0;
+    b->running = 1;
+    return 1;
+}
+
+void stop(Budget *b)
+{
+    if (!b || !b->running)
+        return;
+    b->t1 = now_ns();
+    b->running = 0;
+}
+
+int limited(Budget *b)
+{
+    return b && b->limit_ms > 0 ? 1 : 0;
+}
+
+u64 used_ns(Budget *b)
+{
+    u64 end = 0;
+
+    if (!b)
+        return 0;
+    end = b->running ? now_ns() : (b->t1 > b->t0 ? b->t1 : b->t0);
+    return end > b->t0 ? end - b->t0 : 0;
+}
+
+long used_ms(Budget *b)
+{
+    return b ? (long)(used_ns(b) / 1000000ULL) : 0;
+}
+
+long left_ms(Budget *b)
+{
+    long used = 0;
+
+    if (!b || b->limit_ms <= 0)
+        return -1;
+    used = used_ms(b);
+    return used >= b->limit_ms ? 0 : b->limit_ms - used;
+}
+
+int expired(Budget *b)
+{
+    if (!b || b->limit_ms <= 0)
+        return 0;
+    return used_ms(b) >= b->limit_ms ? 1 : 0;
+}
+
+long limit_of(Budget *b)
+{
+    return b ? b->limit_ms : 0;
+}
+
+int is_running(Budget *b)
+{
+    return b ? b->running : 0;
+}
+
+/* ---- 自测 ---- */
+
+test "abudget：预算读数与边界" {
+    Budget b = { 0 };
+    Budget none = { 0 };
+    u64 t0 = 0;
+
+    if (none.left_ms() != -1 || none.expired() || none.limited())
+        return err(1, "未 start 的预算不该限时");
+    if (b.start(0) != 1)
+        return err(2, "start(0) 失败");
+    if (b.limited() || b.expired() || b.left_ms() != -1)
+        return err(3, "limit_ms=0 表示不限时");
+    b.stop();
+    if (b.is_running())
+        return err(4, "stop 之后不该在跑");
+    if (b.start(1000) != 1 || !b.limited())
+        return err(5, "start(1000) 失败");
+    if (b.limit_of() != 1000)
+        return err(6, "limit_of 不对");
+    /* 忙等一小会儿，读数应该单调增长 */
+    t0 = now_ns();
+    while (now_ns() - t0 < 2000000ULL)
+        ;
+    b.stop();
+    if (b.used_ms() < 1)
+        return err(7, "忙等 2ms 之后 used_ms 应该 ≥ 1");
+    if (b.left_ms() > 1000)
+        return err(8, "left_ms 不该超过上限");
+    if (b.used_ns() == 0)
+        return err(9, "used_ns 不该是 0");
+    /* 已经过期的预算 */
+    {
+        Budget e = { 0 };
+
+        e.start(1);
+        t0 = now_ns();
+        while (now_ns() - t0 < 3000000ULL)
+            ;
+        if (!e.expired() || e.left_ms() != 0)
+            return err(10, "1ms 预算应该早就到期");
+    }
+}
+
+test "abudget：让出与步进" {
+    Budget b = { 0 };
+    struct ayield_task *t = 0;
+    struct aspin_task *s = 0;
+
+    if (b.start(500) != 1)
+        return err(11, "start 失败");
+    /* 单次让出：任务能正常跑完 */
+    t = ayield();
+    if (t == 0)
+        return err(12, "建让出任务失败");
+    if (__c6_co_wait(t) != 0 || t->val != 0)
+        return err(13, "ayield 结果不对");
+    __c6_co_destroy(t);
+    /* 连续让出 10 次 */
+    s = aspin(&b, 10);
+    if (__c6_co_wait(s) != 0 || s->val != 10)
+        return err(14, "aspin(10) 应该返回 10");
+    __c6_co_destroy(s);
+    if (b.expired())
+        return err(15, "10 次让出不该用完 500ms 预算");
+    /* 参数边界 */
+    s = aspin(&b, 0);
+    if (__c6_co_wait(s) != 0 || s->val != -1)
+        return err(16, "aspin(0) 应该 -1");
+    __c6_co_destroy(s);
+    s = aspin(0, 5);
+    if (__c6_co_wait(s) != 0 || s->val != -1)
+        return err(17, "空预算应该 -1");
+    __c6_co_destroy(s);
+    b.stop();
+}

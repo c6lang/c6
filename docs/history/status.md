@@ -2651,6 +2651,37 @@ co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 
 验收：`make stdtest`（342 个模块、0 failure）、`make std-https`（25 条自检全过）、
 `make check-all`。
 
+### 11.95 标准库第八十三批（异步框架的横切面：预算 / 任务组 / 额度 / 取消）
+
+第八十二批把 HTTPS 的两条路铺好、把指标量出来之后，回头看**框架本身**还缺四个横切面：
+合作式超时、批量收尾、并发上限、取消传播。这一批补上，并顺手把框架整体写成一篇
+`docs/async-framework.md`（分层图 + 三种启动方式 + 实测开销 + 诚实清单）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.async.abudget` | 时间预算与让出 | 无栈协程不可抢占，`await` 又只能等 fd，所以「超时」只能是**协程自己在安全点查表**：`b.expired()`；`await ayield()` 是 `await` 一个空子任务（不碰 fd、不等时间），`aspin(&b,n)` 连让 n 次 |
+| `std.async.agroup` | 任务组 | 不同 async 函数的任务类型不同，句柄收成 `void *`；`join()` 按加入顺序 `__c6_co_wait`。**语义澄清**：返回的是「`__c6_co_wait` 非 0」的个数——只有 `T!error` 声明并以 `err` 结束的 async 函数才会如此，业务上的 `-1` 返回值不算失败（这条是写测试时踩出来的：`aio_read(-1,…)` 的 `val` 是 -1 但 `wait` 返回 0） |
+| `std.async.apool` | 并发额度 | 与 `limiter` 分工：`limiter` 排队 + 自带驱动，`apool` 纯计数、拒绝即返回 0、上层自己决定排队还是放弃；`release()` 在空池上返回 -1，防止重复还额度悄悄把上限放大 |
+| `std.async.acancel` | 协作取消 | 标志 + 原因码 + 检查计数；`poll()` 读标志并计数（名字避开调用方常见的 `check()` 助手），`link()` 双向联动把父作用域的取消传给子任务；`astep(&c, n)` 是「n 步可取消工作」的样板：每步一个安全点，取消即返回已走步数 |
+
+命名上又撞了两回：`abench.fails()` 和 `acancel.checks()`/`check()` 会和**调用方文件里的
+同名静态变量/函数**进同一个符号空间（`incompatible types for redefinition of
+'std__async__acancel__check'`），所以方法名一律取「加后缀」的写法
+（`fail_count`/`check_count`/`step_count`/`poll`）。
+
+新增一篇 `docs/async-framework.md`：分层（运行时 → 驱动 → 原语 → 组合）、三种启动方式
+（`co` / `task` / `spawn`）的生命周期对照、一页速查、实测开销表、以及「这套框架没有做
+的事」（时间轮、跨线程唤醒、抢占式取消、一任务一 fd）——避免把限制留给读者猜。
+
+错误号段继续追加：`std.async.abudget`=0x6156、`std.async.agroup`=0x6157、
+`std.async.apool`=0x6158、`std.async.acancel`=0x6159。`Makefile` 增加 `std-async5` 与
+`STD_ASYNC5_SRCS`；四个模块在 `stdtest` 里分别 31/27/27/24 条。示例
+`examples/stdasync5.c6` 34 条自检 + 三行指标。
+
+验收：`make stdtest`（346 个模块、0 failure）、`make std-async5`（34 条自检全过）、
+`make check-all`。
+
+
 
 
 

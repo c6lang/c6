@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第八十三批（异步框架横切面）**：`std.async.abudget`（时间预算 +
+  `await ayield()`/`aspin`）、`std.async.agroup`（任务组 `g.add`/`g.join`）、
+  `std.async.apool`（并发额度 `p.acquire`/`p.release`）、`std.async.acancel`（协作取消 +
+  `c.link` 父子联动 + `async astep`），示例 `examples/stdasync5.c6`（`make std-async5`），
+  并新增文档 [docs/async-framework.md](docs/async-framework.md)（语言级异步框架整体：
+  分层、启动方式、实测开销、限制清单）。错误号段 0x6156–0x6159。
+
 - **标准库第八十二批（同步/异步 HTTPS + async 性能指标）**：`std.net.tlskdf`
   （TLS 1.3 密钥调度：`expand_label`/`derive_secret`/`traffic_key`/`traffic_iv` 与
   `Tls13` 的方法，向量对齐 RFC 8446）、`std.net.tlsrec`（TLS 1.3 记录层 +
