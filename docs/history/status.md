@@ -646,3 +646,44 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
 IPv6 → 查询参数 → 相对解析 → 百分号往返」，uuid 走「v5 已知向量 → v4 → v7 时间序 →
 格式化/解析往返」，mime 走「路径 → 分类 → 字符集 → 反查 → 魔数」。验收：`make stdtest`
 （33 个模块，0 failure）、`make std-web`（58 条自检全过）、`make errcheck` 全绿。
+
+### 11.15 标准库第六批（inet / bitbuf / pqueue / ini）
+
+第六批补的是**网络与二进制协议的原语**：地址、位流、优先队列、配置文件。它们的
+共同点是「标准写得很细、实现很容易在边角上出错」，所以这一批的重点是把边角钉成
+自测用例，而不是铺 API 面积。
+
+| 模块 | 定位 | 关键决定 |
+| --- | --- | --- |
+| `std.inet` | IPv4/IPv6、CIDR、端口 | IPv6 输出按 **RFC 5952** 规范化（最长零段压 `::`、同长取第一个、单组零不压、v4-mapped 写 `::ffff:a.b.c.d`），10 组输入/期望全在自测里；解析严格：前导零、两个 `::`、组数不对、内嵌 IPv4 不在末尾都拒。分类函数把 v4-mapped 折回 v4 再判 |
+| `std.bitbuf` | 位级读写器 | **MSB-first**；越界只报 `FULL`/`SHORT` 且不动游标、不写半截；`bw_patch` 在字节对齐处回填 8/16/32 位且**不移动游标**；`bw_put_bytes`/`br_get_bytes` 要求已对齐（半字节读写没有意义） |
+| `std.pqueue` | 托管二叉堆 `PQueue@T` | 比较器用 qsort 风格函数指针，与 `std.sort` 的 `cmp_int`/`cmp_str` 通用；不设比较器时按字节序（同 `sort_lex` 口径）；`push_pop` 做 top-k，`heapify` 重建，`is_valid` 给测试用 |
+| `std.ini` | INI 零分配读取 | 字段全是指向输入的 `Str` 视图；`#`/`;` 只做**整行注释**（值里可以有 `#`）；`key = value` 取**第一个** `=`；坏行返回 -1 并给准确行号；`ini_lookup` 遇坏行直接放弃，不假装读到后面的键 |
+
+写这一批时踩到并修掉的三个真问题：
+
+1. **`bw_put_bytes`/`br_get_bytes` 用增长中的游标当下标。** 循环里既写
+   `dst[bits/8 + i]` 又 `bits += 8`，于是第二字节跳到 `i+3` 的位置。写得对称
+   （读侧同样的错），所以「写进去再读出来」的往返用例反而互相抵消、看不出问题——
+   直到示例里按位置断言字节才暴露。修法是先算一次 `base = bits/8` 再循环，
+   循环结束后一次性加 `n*8`。
+2. **模块自己的错误码不能当 `int` 字段用。** `std.bitbuf` 的 `err` 字段记「第一个
+   错误的 id」，最初写成 `w->err = std.bitbuf.FULL;`，编译报
+   `cannot convert 'struct __tcc_error' to 'int'`：`模块.成员` 是带 id 与消息的
+   错误值（这就是 `err()` 的入参类型），赋给 int 要显式 `(int)`，比较则可以直接比。
+   同一批还确认了两条语言规则：`err()` **必须两个参数**（码 + 消息），重抛没有
+   `err()` 形式、要写 `try expr;`。
+3. **`heapify` 之后下标算错会被 `is_valid` 立刻抓住。** 自测里每个 push/pop 步骤
+   都跑一遍 `is_valid()`，把 `sift_down` 的「左右孩子都看完再交换」钉住——只比
+   左孩子是这类实现最常见的错。
+
+号段照旧追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.inet`=0x6021、
+`std.bitbuf`=0x6022、`std.pqueue`=0x6023、`std.ini`=0x6024，
+`docs/reference/grammar.md` §8.1 同步；`errbase.def` 不动，C126 继续成立。
+
+集成示例是 `examples/stdnet.c6`（`make std-net`，47 条自检）：inet 走「v4/v6 往返、
+RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界」，bitbuf 走「三字段
+记录头 → 正文 → 读回、peek 不动游标、FULL 不写半截、回填不改游标」，pqueue 走
+「小顶/大顶、堆顶、top-k、空堆」，ini 走「逐条读、按 (section,key) 查、值里的
+`=` 与 `#`、坏行行号」。验收：`make stdtest`（36 个模块、0 failure）、
+`make std-net`（47 条自检全过）、`make errcheck` 全绿。

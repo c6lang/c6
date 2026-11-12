@@ -1,0 +1,359 @@
+/* stdnet：标准库第六批（inet / bitbuf / pqueue / ini）的拼装示例。
+ *
+ * 和 stdtour / stdkit / stdbox / stdweb 一样：这个文件没有 `module`（入口
+ * `main` 只能写在不属于任何模块的文件里），四节各带自检，失败打 FAIL，最后
+ * 按失败数决定退出码。它既是演示，也是这四个模块的集成用例。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdnet \
+ *         examples/stdnet.c6 std/types.c6 std/err.c6 std/str.c6 \
+ *         std/sort.c6 std/inet.c6 std/bitbuf.c6 std/pqueue.c6 std/ini.c6
+ *
+ * 用到的东西：
+ *   std.inet    IPv4/IPv6 解析与格式化、CIDR 判断、端口、地址分类
+ *   std.bitbuf  位级读写器（MSB 先）、回填、越界诊断
+ *   std.pqueue  泛型二叉堆（小顶/大顶、top-k）
+ *   std.ini     INI 配置的零分配迭代读取与查找
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.types;
+import std.err;
+import std.str;
+import std.sort;
+import std.inet;
+import std.bitbuf;
+import std.pqueue;
+import std.ini;
+
+/* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* 视图与 C 字面量比较（不要求 NUL 结尾） */
+static int eq_lit(char[:] s, char *lit)
+{
+    int n = (int)strlen(lit);
+
+    return s.len == n && (n == 0 || memcmp(s.data, lit, (size_t)n) == 0);
+}
+
+static int str_is(Str *s, char *lit) { return eq_lit(s->s, lit); }
+
+/* ---- 1. inet：地址解析、CIDR 归属、端口 ---- */
+
+static void tour_inet(void)
+{
+    Ip a = { 0 };
+    Ip net = { 0 };
+    char buf[64] = { 0 };
+    int prefix = 0;
+    u16 port = 0;
+
+    /* v4：解析 → 格式化往返 */
+    check(inet_parse(S("192.168.0.1"), &a) == 1, "inet: 解析 v4");
+    check(a.family == IP_V4, "inet: 家族是 V4");
+    check(inet_format(&a, buf, sizeof buf) == 11
+          && strcmp(buf, "192.168.0.1") == 0, "inet: v4 格式化往返");
+
+    /* v6：RFC 5952 压缩（输入是展开形式） */
+    check(inet_parse(S("2001:0db8:0000:0000:0000:ff00:0042:8329"), &a) == 1,
+          "inet: 解析展开的 v6");
+    check(inet_format(&a, buf, sizeof buf) == 22
+          && strcmp(buf, "2001:db8::ff00:42:8329") == 0,
+          "inet: v6 按 RFC 5952 压缩");
+    check(inet_parse(S("::1"), &a) == 1 && inet_is_loopback(&a) == 1,
+          "inet: ::1 是回环");
+    check(inet_parse(S("::ffff:10.0.0.1"), &a) == 1
+          && inet_is_private(&a) == 1, "inet: v4-mapped 折回 v4 判私网");
+
+    /* 坏输入 */
+    check(inet_parse(S("256.1.1.1"), &a) == 0, "inet: 256 不合法");
+    check(inet_parse(S("1::2::3"), &a) == 0, "inet: 两个 :: 不合法");
+
+    /* CIDR：10.0.0.0/8 里有谁 */
+    check(inet_parse_cidr(S("10.0.0.0/8"), &net, &prefix) == 1
+          && prefix == 8, "inet: 解析 CIDR");
+    check(inet_parse(S("10.1.2.3"), &a) == 1
+          && inet_cidr_contains(&net, prefix, &a) == 1,
+          "inet: 10.1.2.3 在 10/8 里");
+    check(inet_parse(S("11.1.2.3"), &a) == 1
+          && inet_cidr_contains(&net, prefix, &a) == 0,
+          "inet: 11.1.2.3 不在 10/8 里");
+    /* 网络地址形式 */
+    check(inet_parse(S("10.1.2.3"), &a) == 1, "inet: 再解析一次");
+    inet_cidr_mask(&a, 8);
+    check(inet_format(&a, buf, sizeof buf) == 8
+          && strcmp(buf, "10.0.0.0") == 0, "inet: 清位成网络地址");
+
+    /* 端口 */
+    check(inet_parse_port(S("8443"), &port) == 1 && port == 8443,
+          "inet: 端口 8443");
+    check(inet_parse_port(S("65536"), &port) == 0, "inet: 端口越界");
+    check(inet_parse_port(S(""), &port) == 0, "inet: 空端口不合法");
+}
+
+/* ---- 2. bitbuf：写一个紧凑的记录头再读回来 ---- */
+
+/* 把 !error 调用折成布尔：出错就记一条 FAIL 并返回 0（错误本身已被消耗） */
+static int bb_put(BitWriter *w, u32 v, int n)
+{
+    bw_put(w, v, n) catch e {
+        check(0, "bitbuf: 写失败");
+        return 0;
+    };
+    return 1;
+}
+
+static int bb_put_bytes(BitWriter *w, char[:] b)
+{
+    bw_put_bytes(w, b) catch e {
+        check(0, "bitbuf: 写整段失败");
+        return 0;
+    };
+    return 1;
+}
+
+static int bb_patch(BitWriter *w, int at, u32 v, int n)
+{
+    bw_patch(w, at, v, n) catch e {
+        check(0, "bitbuf: 回填失败");
+        return 0;
+    };
+    return 1;
+}
+
+static int bb_get(BitReader *r, int n, u32 *out)
+{
+    br_get(r, n, out) catch e {
+        check(0, "bitbuf: 读失败");
+        return 0;
+    };
+    return 1;
+}
+
+static int bb_get_bytes(BitReader *r, char *dst, int n)
+{
+    br_get_bytes(r, dst, n) catch e {
+        check(0, "bitbuf: 读整段失败");
+        return 0;
+    };
+    return 1;
+}
+
+static int bb_peek(BitReader *r, int n, u32 *out)
+{
+    br_peek(r, n, out) catch e {
+        check(0, "bitbuf: peek 失败");
+        return 0;
+    };
+    return 1;
+}
+
+static void tour_bitbuf(void)
+{
+    char buf[16] = { 0 };
+    BitWriter w = bw_open(buf, (int)sizeof buf);
+    BitReader r = br_open((char[:]){ buf, 0 });
+    u32 ver = 0;
+    u32 flags = 0;
+    u32 len = 0;
+    u32 v = 0;
+
+    /* 记录头：版本 3 位 + 标志 5 位 + 长度 16 位，正好 3 字节 */
+    bb_put(&w, 2, 3);
+    bb_put(&w, 0x1f, 5);
+    bb_put(&w, 300, 16);
+    check(bw_bits(&w) == 24, "bitbuf: 头正好 24 位");
+    bb_put_bytes(&w, S("hi"));
+    check(bw_bytes(&w) == 5, "bitbuf: 用完 5 字节");
+
+    /* 读回：位宽与顺序必须完全一致 */
+    r = br_open((char[:]){ buf, bw_bytes(&w) });
+    bb_get(&r, 3, &ver);
+    bb_get(&r, 5, &flags);
+    bb_get(&r, 16, &len);
+    check(ver == 2, "bitbuf: 版本读回");
+    check(flags == 0x1f, "bitbuf: 标志读回");
+    check(len == 300, "bitbuf: 长度读回");
+    {
+        char body[4] = { 0 };
+
+        bb_get_bytes(&r, body, 2);
+        check(body[0] == 'h' && body[1] == 'i', "bitbuf: 正文读回");
+    }
+    check(br_eof(&r) == 1, "bitbuf: 正好读完");
+
+    /* peek 不动游标 */
+    r = br_open((char[:]){ buf, 1 });
+    bb_peek(&r, 3, &v);
+    check(v == 2 && br_bits(&r) == 0, "bitbuf: peek 不推进");
+
+    /* 越界是错误而不是截断 */
+    {
+        BitWriter small = bw_open(buf, 1);
+
+        bb_put(&small, 0xff, 8);
+        bw_put(&small, 1, 1) catch e { goto full_seen; };
+        check(0, "bitbuf: 第 9 位应当报 FULL");
+full_seen:;
+        check(bw_ok(&small) == 0 && bw_bits(&small) == 8,
+              "bitbuf: FULL 之后游标不动");
+    }
+    /* 回填：长度先留空、写完再补 */
+    {
+        BitWriter p = bw_open(buf, 8);
+
+        bb_put(&p, 0, 16);
+        bb_put(&p, 0xabc, 16);
+        bb_patch(&p, 0, 2, 16);
+        check(bw_bits(&p) == 32, "bitbuf: 回填不动游标");
+        check((u8)buf[1] == 2, "bitbuf: 回填的值落在大端低位");
+    }
+}
+
+/* ---- 3. pqueue：按时间戳取最近的 N 个事件 ---- */
+
+static int pq_push(@PQueue@int q, int v)
+{
+    q->push(v) catch e {
+        check(0, "pqueue: push 失败");
+        return 0;
+    };
+    return 1;
+}
+
+static void tour_pqueue(void)
+{
+    @PQueue@int q = new PQueue@int;
+    int times[7] = { 120, 5, 77, 30, 200, 1, 45 };
+    int keep[3] = { 0, 0, 0 };
+    int i = 0;
+    int v = 0;
+
+    /* 小顶堆：最早的先出来 */
+    q->init(&cmp_int, 0);
+    for (i = 0; i < 7; i++)
+        pq_push(q, times[i]);
+    check(q->count() == 7, "pqueue: 计数");
+    check(q->is_valid() == 1, "pqueue: 堆序");
+    check(q->peek(&v) == 1 && v == 1, "pqueue: 堆顶最小");
+    check(q->pop(&v) == 1 && v == 1, "pqueue: 弹出最小");
+
+    /* 大顶堆：推迟的（时间戳最大的）先出来 */
+    q->clear();
+    q->set_max(1);
+    for (i = 0; i < 7; i++)
+        pq_push(q, times[i]);
+    check(q->peek(&v) == 1 && v == 200, "pqueue: 大顶堆顶最大");
+
+    /* top-k：小顶堆 + push_pop 留下最大的 3 个 */
+    q->clear();
+    q->init(&cmp_int, 0);
+    for (i = 0; i < 7; i++) {
+        if (q->count() < 3) {
+            pq_push(q, times[i]);
+            continue;
+        }
+        q->peek(&v);
+        if (times[i] > v)
+            q->push_pop(times[i], &v);
+    }
+    for (i = 0; i < 3; i++)
+        if (!q->pop(&keep[i]))
+            check(0, "pqueue: top-k pop");
+    check(keep[0] == 77 && keep[1] == 120 && keep[2] == 200,
+          "pqueue: 最大的三个是 77/120/200");
+
+    /* 空堆 */
+    q->clear();
+    check(q->is_empty() == 1, "pqueue: clear 之后为空");
+    check(q->pop(&v) == 0 && q->peek(&v) == 0, "pqueue: 空堆取不出东西");
+}
+
+/* ---- 4. ini：读一份配置 ---- */
+
+static char *CONF =
+    "# 服务配置\n"
+    "[server]\n"
+    "host = 0.0.0.0\n"
+    "port = 8080\n"
+    "  debug = yes\n"
+    "\n"
+    "[db]\n"
+    "url = postgres://h/db?sslmode=require\n"
+    "pool = 8\n";
+
+static void tour_ini(void)
+{
+    IniReader r = ini_open((char[:]){ CONF, (int)strlen(CONF) });
+    IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                   { { (char *)0, 0 } }, 0 };
+    Str v = { { (char *)0, 0 } };
+    int n = 0;
+
+    /* 逐条读：section / key / value 都是输入上的视图 */
+    while (ini_next(&r, &e) == 1)
+        n++;
+    check(n == 5, "ini: 五条键值（注释和空行不算）");
+    check(r.err == 0, "ini: 没有语法错误");
+
+    /* 按 (section, key) 查找 */
+    check(ini_lookup((char[:]){ CONF, (int)strlen(CONF) }, S("server"),
+                     S("port"), &v) == 1 && str_is(&v, "8080"),
+          "ini: server.port");
+    check(ini_lookup((char[:]){ CONF, (int)strlen(CONF) }, S("db"),
+                     S("pool"), &v) == 1 && str_is(&v, "8"),
+          "ini: db.pool");
+    /* 值里可以带 = 和 # */
+    check(ini_lookup((char[:]){ CONF, (int)strlen(CONF) }, S("db"),
+                     S("url"), &v) == 1
+          && str_is(&v, "postgres://h/db?sslmode=require"),
+          "ini: 值里的 = 原样保留");
+    check(ini_lookup((char[:]){ CONF, (int)strlen(CONF) }, S("server"),
+                     S("nope"), &v) == 0, "ini: 不存在的键");
+    check(ini_has_section((char[:]){ CONF, (int)strlen(CONF) }, S("db")) == 1,
+          "ini: 有 db 节");
+    check(ini_count((char[:]){ CONF, (int)strlen(CONF) }, S("server")) == 3,
+          "ini: server 节有 3 条");
+
+    /* 坏行：给出准确的行号，且不假装读到了后面的键 */
+    {
+        char *bad = "[sec\nk = v\n";
+        char[:] bt = { bad, (int)strlen(bad) };
+        IniReader br = ini_open(bt);
+        IniEntry be = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                        { { (char *)0, 0 } }, 0 };
+
+        check(ini_next(&br, &be) == -1, "ini: 坏节头报错");
+        check(br.err == 1, "ini: 错误行号是 1");
+        check(ini_lookup(bt, S(""), S("k"), &v) == 0,
+              "ini: 有坏行时 lookup 直接给 0");
+    }
+}
+
+int main(void)
+{
+    printf("stdnet: 标准库第六批（inet / bitbuf / pqueue / ini）\n");
+
+    tour_inet();
+    tour_bitbuf();
+    tour_pqueue();
+    tour_ini();
+
+    printf("stdnet: %d 条自检, %d 个失败\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

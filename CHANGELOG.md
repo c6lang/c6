@@ -31,6 +31,13 @@
   `std.set` 六个模块，集成示例 `examples/stdkit.c6`（`make std-kit`）；顺手修掉
   `std/map` 扩容复活墓碑的 bug（`std/set` 的对应用例钉住）。错误号段
   `std.ascii`=0x6013 … `std.set`=0x6018。
+- **标准库第六批**：`std.inet` / `std.bitbuf` / `std.pqueue` / `std.ini` 四个模块，
+  集成示例 `examples/stdnet.c6`（`make std-net`）。inet 的 IPv6 输出按 RFC 5952
+  规范化（最长零段压缩、同长取第一个、v4-mapped 写点分），解析对前导零/多余冒号
+  一律严格；bitbuf 是 MSB-first 的位读写器，越界只报 `FULL`/`SHORT` 而不写半截，
+  `bw_patch` 支持不移动游标的回填；pqueue 是托管二叉堆，比较器与 `std.sort` 通用，
+  带 `push_pop`（top-k）与 `heapify`；ini 是零分配迭代读取器，坏行给准确行号。
+  错误号段 `std.inet`=0x6021 … `std.ini`=0x6024。
 - **标准库第五批**：`std.base64` / `std.url` / `std.uuid` / `std.mime` 四个模块，
   集成示例 `examples/stdweb.c6`（`make std-web`）。Base64 把「表」与「填充」变成显式
   参数（标准表/URL 安全表不能混用）；URL 是 RFC 3986 §5.2 的完整相对解析（§5.4 的

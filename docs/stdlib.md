@@ -58,11 +58,16 @@
 | `std/url.c6` | `std.url` | URL（RFC 3986）解析与相对解析：`Url` 的 `url_parse`/`url_effective_port`/`url_is_absolute`/`url_has_host`、`url_resolve`（§5.2 全算法）、查询参数 `url_next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
 | `std/uuid.c6` | `std.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`uuid_v4_seeded`、`uuid_v7`/`uuid_v7_at`/`uuid_time_v7`、`uuid_v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`/`uuid_format`/`uuid_format_simple`/`uuid_format_upper`、`uuid_version`/`uuid_variant`/`uuid_eq`/`uuid_nil`/`uuid_is_nil` |
 | `std/mime.c6` | `std.mime` | 扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：`mime_of_ext`/`mime_of_path`/`mime_ext_of`/`mime_ext_at`/`mime_type_at`/`mime_count`、`mime_is_text`/`is_image`/`is_audio`/`is_video`/`is_font`、`mime_charset`、`mime_sniff`、`mime_default` |
+| `std/inet.c6` | `std.inet` | IP 地址与 CIDR（零分配）：`inet_parse`/`inet_format`、`inet_parse_v4`/`inet_format_v4`、`inet_parse_v6`/`inet_format_v6`（输出按 RFC 5952 压缩）、`inet_parse_cidr`/`inet_cidr_contains`/`inet_cidr_mask`/`inet_v4_mask`、`inet_is_private`/`is_loopback`/`is_link_local`/`is_multicast`/`is_unspecified`、`inet_parse_port` |
+| `std/bitbuf.c6` | `std.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`bw_put`/`bw_put_u64`/`bw_put_bit`/`bw_align`/`bw_put_bytes`/`bw_patch`（回填不改游标）、`br_open`/`br_get`/`br_get_u64`/`br_get_bit`/`br_peek`/`br_skip`/`br_align`/`br_get_bytes`、`bw_bits`/`bw_bytes`/`bw_ok`/`br_remaining`/`br_eof` |
+| `std/pqueue.c6` | `std.pqueue` | 二叉堆 `PQueue@T`（托管容器）：`push`/`pop`/`peek`/`push_pop`/`heapify`/`clear`、`count`/`capacity`/`is_empty`/`is_valid`、`init`/`set_cmp`/`set_max`（比较器与 `std.sort` 的 `cmp_int`/`cmp_str` 通用） |
+| `std/ini.c6` | `std.ini` | INI 配置的零分配读取：`ini_open`/`ini_next`（字段都是输入上的视图）、`ini_lookup`/`ini_has_section`/`ini_count`、`IniEntry.section`/`key`/`value`/`line`；语法错误给行号 |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
 | `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带自检 |
 | `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`make std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带自检 |
 | `examples/stdbox.c6` | （无模块） | 第四批模块的拼装示例（`make std-box`）：json/sha256/csv/env 各一节，自带自检 |
 | `examples/stdweb.c6` | （无模块） | 第五批模块的拼装示例（`make std-web`）：base64/url/uuid/mime 各一节，自带自检 |
+| `examples/stdnet.c6` | （无模块） | 第六批模块的拼装示例（`make std-net`）：inet/bitbuf/pqueue/ini 各一节，自带自检 |
 
 每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -72,6 +77,7 @@ std/str.c6       22 test(s), 0 failure(s)
 std/sort.c6      30 test(s), 0 failure(s)
 std/ascii.c6      5 test(s), 0 failure(s)
 std/base64.c6     8 test(s), 0 failure(s)
+std/bitbuf.c6     7 test(s), 0 failure(s)
 std/bits.c6       6 test(s), 0 failure(s)
 std/codec.c6      7 test(s), 0 failure(s)
 std/csv.c6       41 test(s), 0 failure(s)
@@ -81,6 +87,8 @@ std/err.c6        3 test(s), 0 failure(s)
 std/fmt.c6       10 test(s), 0 failure(s)
 std/fs.c6         7 test(s), 0 failure(s)
 std/hash.c6       7 test(s), 0 failure(s)
+std/inet.c6       8 test(s), 0 failure(s)
+std/ini.c6        6 test(s), 0 failure(s)
 std/io.c6         5 test(s), 0 failure(s)
 std/json.c6      60 test(s), 0 failure(s)
 std/map.c6        9 test(s), 0 failure(s)
@@ -89,6 +97,7 @@ std/mem.c6        7 test(s), 0 failure(s)
 std/mime.c6      37 test(s), 0 failure(s)
 std/num.c6       11 test(s), 0 failure(s)
 std/path.c6      30 test(s), 0 failure(s)
+std/pqueue.c6    38 test(s), 0 failure(s)
 std/rand.c6       9 test(s), 0 failure(s)
 std/range.c6      6 test(s), 0 failure(s)
 std/set.c6       17 test(s), 0 failure(s)
@@ -120,12 +129,14 @@ std/vec.c6       42 test(s), 0 failure(s)
 | `std/url.c6` 32 | url 10 + str 22（url 只借 `Str` 类型，正文不调用 str） |
 | `std/mime.c6` 37 | mime 7 + str 22 + path 8（取扩展名要 `std.path` 的正文） |
 | `std/uuid.c6` 24 | uuid 8 + rand 9 + time 7（v4/v7 要随机源，v7 要墙钟） |
+| `std/pqueue.c6` 38 | pqueue 8 + sort 30（比较器来自 `std.sort`；`cmp_str` 又拉上 `std.str`，但那样跑才有 str 的块参与） |
 
 `std/bits`、`std/hash`、`std/utf8`、`std/deque`、`std/ascii`、`std/num`、
-`std/codec`、`std/rand`、`std/fs`、`std/base64` 自成一体，单独跑就是自己的块数；
-`std/csv`、`std/url` 只有声明依赖 `std.str`（正文不调用），`std/mime` 的正文
-必须带 `std/path`，`std/sha256` 的正文必须带 `std/bits`，`std/env` 的正文必须带
-`std/str`，`std/uuid` 的正文必须带 `std/rand` 与 `std/time`。
+`std/codec`、`std/rand`、`std/fs`、`std/base64`、`std/inet`、`std/bitbuf`
+自成一体，单独跑就是自己的块数；`std/csv`、`std/url`、`std/ini` 只有声明依赖
+`std.str`（正文不调用），`std/mime` 的正文必须带 `std/path`，`std/sha256` 的正文
+必须带 `std/bits`，`std/env` 的正文必须带 `std/str`，`std/uuid` 的正文必须带
+`std/rand` 与 `std/time`，`std/pqueue` 的正文必须带 `std/sort`。
 
 ## 设计原则
 
@@ -836,6 +847,149 @@ Str s = mime_sniff(bytes);                    /* 按魔数给类型；认不出�
 WEBP-WAVE-AVI/OGG/FLAC/ID3/MP4/wasm/ELF/BMP），不做全文启发式：认不出的
 （包括纯文本）返回空，要用扩展名兜底就自己接 `mime_of_path`。
 
+### `inet`：地址、CIDR 与端口
+
+```c
+import std.inet;
+
+Ip a = { 0 };
+char buf[64] = { 0 };
+
+inet_parse(S("192.168.0.1"), &a);          /* 1；a.family = IP_V4 */
+inet_parse(S("2001:db8::1"), &a);          /* 1；a.family = IP_V6 */
+inet_format(&a, buf, sizeof buf);          /* "2001:db8::1" */
+
+Ip net = { 0 };
+int prefix = 0;
+Ip host = { 0 };
+
+inet_parse_cidr(S("10.0.0.0/8"), &net, &prefix);      /* 1，prefix = 8 */
+inet_parse(S("10.1.2.3"), &host);
+inet_cidr_contains(&net, prefix, &host);              /* 1 */
+
+u16 port = 0;
+inet_parse_port(S("8443"), &port);                    /* 1 */
+```
+
+`Ip` 是纯值（`int family` + 16 字节），v4 用前 4 字节，所以同一个类型能装两种
+地址、也能互相比较（`inet_eq` 要求族相同）。
+
+解析的严格性是**刻意的**，为的是让「看起来像地址但其实不是」的东西尽早露出来：
+
+* **IPv4** 四段、每段 0..255、**拒绝前导零**（`010.0.0.1` 有八进制歧义，
+  `inet_pton` 也拒）、不跳过空白（要就自己先 `trim`）；
+* **IPv6** 每组 1..4 个十六进制位、`::` 至多一次、末尾可内嵌点分 IPv4（占两组）；
+  输出按 **RFC 5952**：最长零段压成 `::`（同长取第一个、单组零不压）、小写、
+  无前导零，IPv4-mapped 一律写 `::ffff:a.b.c.d`；
+* **端口**是纯十进制 0..65535（`65536`/`-1`/` 80`/`080` 都拒）。
+
+分类函数按族各看各的号段，**v4-mapped 的 v6 先折回 v4** 再判——`::ffff:127.0.0.1`
+算回环、`::ffff:10.0.0.1` 算私网，这是调用方最可能期待的行为。
+
+格式化一律「先量长度再落笔」：放不下返回 -1，`dst` 一个字节都不动。
+
+### `bitbuf`：位级读写
+
+```c
+import std.bitbuf;
+
+char buf[16] = { 0 };
+BitWriter w = bw_open(buf, (int)sizeof buf);
+
+bw_put(&w, 2, 3)   catch e { return e.id; };   /* 版本 3 位 */
+bw_put(&w, 0x1f, 5) catch e { return e.id; };  /* 标志 5 位 */
+bw_put(&w, 300, 16) catch e { return e.id; };  /* 长度 16 位 */
+bw_put_bytes(&w, S("hi")) catch e { return e.id; };
+bw_bits(&w);                                   /* 40 */
+
+BitReader r = br_open((char[:]){ buf, bw_bytes(&w) });
+u32 ver = 0;
+br_get(&r, 3, &ver) catch e { return e.id; };  /* ver = 2 */
+```
+
+* **位序是 MSB-first**（同一字节里先出现的是高位）——Deflate/JPEG 之外的格式
+  基本都这样；要 LSB-first 请在调用方自己翻位；
+* 写侧零分配，缓冲是调用方的：`bw_open` 不碰它，第一次写某字节时才把那一格
+  清 0，所以没写到的地方保持原样；
+* **越界是错误而不是截断**：写侧 `FULL`、读侧 `SHORT`，两种情况都**不动游标**、
+  也不写半截（一次调用要么整段成功要么整段失败）；
+* `bw_patch(w, at, v, n)` 在字节对齐处回填 8/16/32 位**且不移动游标**，
+  用于「长度先留空、写完再补」；`bw_align`/`br_align` 补/跳 0 到字节边界；
+* `bw_put_bytes`/`br_get_bytes` 要求已经在字节边界上，否则 `INVAL`（半个字节的
+  读写在协议里没有意义）；
+* `n == 0` 是合法空操作，`n` 超过 32/64 是 `INVAL`。
+
+错误码记在 `w.err`/`r.err` 里（第一个错误的 id），`bw_ok`/`r.err` 可以事后查。
+
+### `pqueue`：二叉堆
+
+```c
+import std.pqueue;
+import std.sort;                       /* cmp_int */
+
+@PQueue@int q = new PQueue@int;
+q->init(&cmp_int, 0);                  /* 0 = 小顶堆，1 = 大顶堆 */
+
+q->push(5) catch e { return e.id; };
+q->push(1) catch e { return e.id; };
+
+int top = 0;
+q->peek(&top);                         /* 1，top = 1 */
+q->pop(&top);                          /* 1，top = 1 */
+```
+
+和 `std.vec` 同族：托管容器、只能 `new`、方法接收者是指针。比较器是 **qsort
+风格** `int (*cmp)(const void *, const void *)`，和 `std.sort` 的 `cmp_int`/
+`cmp_u32`/`cmp_str` 直接通用（`vec->sort` 也是这套）。**没设比较器时按字节序**
+（`memcmp`）比，和 `sort_lex` 同口径：纯无符号小整数够用，负数会排到正数后面。
+
+| 方法 | 说明 |
+| --- | --- |
+| `push(v)` | 压入，摊销 O(log n)；分配失败给 `std.err.NOMEM` |
+| `pop(&out)` / `peek(&out)` | 弹顶/看顶；堆空返回 0（不是错误） |
+| `push_pop(v, &out)` | 弹顶再压入，一次 sift，top-k 的标准写法 |
+| `heapify()` | 用现有 `data[0..n)` 重建堆（整段读入之后） |
+| `is_valid()` | 堆序检查，测试/断言用 |
+
+top-k 的惯用法（留最大的 3 个）：小顶堆 + 满了就 `push_pop`——堆顶是当前
+「入选里最小的」，新值比它大才替换。
+
+### `ini`：INI 配置
+
+```c
+import std.ini;
+
+char *text = "[db]\nhost = localhost\nport = 5432\n";
+char[:] t = { text, (int)strlen(text) };
+
+IniReader r = ini_open(t);
+IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+               { { (char *)0, 0 } }, 0 };
+while (ini_next(&r, &e) == 1) {
+    /* e.section / e.key / e.value 都是输入上的视图，e.line 是行号 */
+}
+
+Str host = { { (char *)0, 0 } };
+ini_lookup(t, S("db"), S("host"), &host);      /* 1 */
+```
+
+和 `std.csv` 一个思路：**不分配、不复制**，字段都是指向输入文本的视图，所以输入
+必须活到用完为止。语法有意做小：
+
+* 行分隔 `\n`（`\r\n` 也认）；空行忽略；trim 之后以 `#` 或 `;` 开头的行是
+  **整行注释**——行内的 `#` 不是注释（值里可以有 URL 片段）；
+* `[section]` 切节，节名 trim，同名节等于合并；第一节之前的键属于**根区**
+  （`section` 是空视图）；
+* `key = value` 用**第一个** `=` 分隔，两侧 trim，所以值里可以再出现 `=`；
+  值可以为空（`k =`），键不能为空；
+* 其它非空行都是**语法错误**：`ini_next` 返回 -1，行号在 `r.err`（1 起），
+  之后可以继续读下一行；`ini_lookup`/`ini_has_section`/`ini_count` 遇到坏行
+  直接放弃（`ini_count` 给 -1），不假装读到了后面的键；
+* 键或节重复时 `ini_lookup` 给**最后一个**（「后写覆盖先写」）。
+
+不做类型转换、不处理转义、不合并续行、不解析引号——拿到 `Str` 之后用
+`std.str` 的 `to_int`/`trim` 等自己处理。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -1003,6 +1157,15 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
 * `make std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（自带自检）。
 * `make std-box`：`examples/stdbox.c6`，第四批模块的拼装示例（自带自检）。
 * `make std-web`：`examples/stdweb.c6`，第五批模块的拼装示例（自带自检）。
+* `make std-net`：`examples/stdnet.c6`，第六批模块的拼装示例（自带自检）。
+* `std/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
+  `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
+  单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
+* `std/bitbuf.c6` 的「整段字节」用例：写/读两侧共用一套边界，钉住
+  `bw_put_bytes`/`br_get_bytes` 的起始下标（曾经在循环里用增长中的游标当下标，
+  第二字节写到了下一格）。
+* `std/pqueue.c6` 的「交错 push/pop」：100 次混合操作，每步都跑 `is_valid()`，
+  钉住 sift_up/sift_down 的四种交换方向。
 * `std/url.c6` 的「RFC 3986 §5.4 的相对解析」：23 条 normal + abnormal 用例
   （`../..//g`、`g;x=1/../y`、结尾 `/.` 与 `/..` 都在里面），钉住 `remove_dots`
   的每个分支；另有「全零初始化的 `Url` 不该给出端口」的回归。
