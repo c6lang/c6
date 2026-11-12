@@ -1,0 +1,161 @@
+/* examples/stdcheck.c6 —— 第五十八批（校验与纠错）的集成示例。
+ *
+ *     make std-check
+ *
+ * 四节：校验位（Luhn/ISBN/Verhoeff）、CRC-8/16（流式）、汉明码纠 1 位错、
+ * 经典密码往返。Crc 与 HammingBlock 都用**方法**调用。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.encoding.luhn;
+import std.encoding.crc16;
+import std.encoding.hamming;
+import std.encoding.classic;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_checkdigit(void)
+{
+    char buf[24] = { 0 };
+    int d = 0;
+
+    printf("== 校验位\n");
+    check(luhn_check(S("79927398713")) == 1, "Luhn 合法号");
+    check(luhn_check(S("79927398710")) == 0, "Luhn 改一位应非法");
+    d = luhn_digit(S("7992739871"));
+    check(d == 3, "Luhn 校验位 = 3");
+    check(isbn10_check(S("0306406152")) == 1, "ISBN-10 合法");
+    check(isbn10_check(S("097522980X")) == 1, "ISBN-10 校验位 X");
+    check(isbn13_check(S("9780306406157")) == 1, "ISBN-13 合法");
+    check(isbn13_digit(S("978030640615")) == 7, "ISBN-13 校验位 = 7");
+    check(verhoeff_check(S("2363")) == 1, "Verhoeff 合法");
+    check(verhoeff_digit(S("236")) == 3, "Verhoeff 校验位 = 3");
+    /* 让读者看到拼装过程 */
+    {
+        static const char *body = "7992739871";
+        int k = luhn_digit((char[:]){ (char *)body, (int)strlen(body) });
+
+        memcpy(buf, body, 10);
+        buf[10] = (char)('0' + k);
+        buf[11] = 0;
+        printf("   %s + 校验位 %d = %s（%s）\n", body, k, buf,
+               luhn_check((char[:]){ buf, 11 }) == 1 ? "合法" : "非法");
+        check(luhn_check((char[:]){ buf, 11 }) == 1, "拼出来的号应该合法");
+    }
+}
+
+static void do_crc(void)
+{
+    Crc c = { 0 };
+    static const char *vec = "123456789";
+
+    printf("== CRC\n");
+    check(crc16_ccitt(S("123456789")) == 0x29B1u, "CCITT 检查值");
+    check(crc16_modbus(S("123456789")) == 0x4B37u, "MODBUS 检查值");
+    check(crc8(S("123456789")) == 0xF4u, "CRC-8 检查值");
+    /* 流式与整体一致 */
+    c.init(CRC16_CCITT);
+    c.update((char[:]){ (char *)vec, 4 });
+    c.update((char[:]){ (char *)vec + 4, 5 });
+    printf("   分片更新 CRC-16/CCITT = 0x%04X\n", c.final());
+    check(c.bits() == 16 && c.final() == 0x29B1u, "流式更新一致");
+    c.reset();
+    c.update(S("123456789"));
+    check(c.value() == 0x29B1u, "reset 之后重算一致");
+    check(crc16_xmodem(S("")) == 0, "空输入的 XMODEM 是 0");
+}
+
+static void do_hamming(void)
+{
+    HammingBlock b = { { 0 } };
+    u8 out = 0;
+    int i = 0, bad = 0;
+
+    printf("== 汉明码\n");
+    for (i = 0; i < 16; i++) {
+        b.encode((u8)i);
+        if (b.syndrome() != 0)
+            bad++;
+        b.decode(&out);
+        if (out != (u8)i)
+            bad++;
+    }
+    check(bad == 0, "16 个 nibble 编解码往返");
+    /* 打错一位再看纠正 */
+    b.encode(0x0A);
+    b.bits[2] = (u8)(b.bits[2] ^ 1u);
+    printf("   打错 1 位后校验子 = %d，", b.syndrome());
+    check(b.syndrome() == 3, "校验子指出第 3 位");
+    check(b.fix() == 1, "纠正 1 位");
+    b.decode(&out);
+    printf("纠正后解出 0x%X\n", out);
+    check(out == 0x0A, "纠正后数据正确");
+    /* 字节流接口 */
+    {
+        u8 enc[64] = { 0 };
+        char dec[8] = { 0 };
+        int fixed = 0;
+
+        hamming_encode(S("Hi!"), enc, (int)sizeof enc);
+        enc[5] ^= 1;
+        check(hamming_decode(enc, 42, dec, (int)sizeof dec, &fixed) == 3
+              && fixed == 1 && memcmp(dec, "Hi!", 3) == 0,
+              "字节流错 1 位可纠正");
+    }
+}
+
+static void do_classic(void)
+{
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+    int n = 0;
+
+    printf("== 经典密码\n");
+    caesar(S("Hello, World!"), 3, out, (int)sizeof out);
+    printf("   凯撒 +3：%s\n", out);
+    check(memcmp(out, "Khoor, Zruog!", 13) == 0, "凯撒 +3");
+    rot13(S("Hello"), out, (int)sizeof out);
+    check(memcmp(out, "Uryyb", 5) == 0, "ROT13");
+    atbash(S("abcXYZ"), out, (int)sizeof out);
+    check(memcmp(out, "zyxCBA", 6) == 0, "Atbash");
+    memset(out, 0, sizeof out);
+    n = vigenere(S("ATTACKATDAWN"), S("LEMON"), 0, out, (int)sizeof out);
+    out[n] = 0;
+    printf("   维吉尼亚（key=LEMON）：%s\n", out);
+    check(n == 12 && memcmp(out, "LXFOPVEFRNHR", 12) == 0, "维吉尼亚加密");
+    vigenere((char[:]){ out, n }, S("LEMON"), 1, back, (int)sizeof back);
+    check(memcmp(back, "ATTACKATDAWN", 12) == 0, "维吉尼亚解密");
+    n = xor_cipher(S("secret"), S("key"), out, (int)sizeof out);
+    xor_cipher((char[:]){ out, n }, S("key"), back, (int)sizeof back);
+    check(memcmp(back, "secret", 6) == 0, "异或自逆");
+    memset(out, 0, sizeof out);
+    n = railfence(S("WEAREDISCOVEREDFLEEATONCE"), 3, out, (int)sizeof out);
+    out[n] = 0;
+    printf("   栅栏 3 栏：%s\n", out);
+    check(memcmp(out, "WECRLTEERDSOEEFEAOCAIVDEN", 25) == 0, "栅栏加密");
+}
+
+int main(void)
+{
+    do_checkdigit();
+    do_crc();
+    do_hamming();
+    do_classic();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

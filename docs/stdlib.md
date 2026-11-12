@@ -273,6 +273,11 @@
 | `std/data/coff.c6` | `std.data.coff` | MS COFF 目标文件（**方法**：`doc.open`/`doc.section`/`doc.symbol`/`doc.section_count`/`doc.symbol_count`）：20 字节头 + 40 字节节头 + 18 字节符号表（含字符串表长名与节的 `/123` 形式） |
 | `std/data/class.c6` | `std.data.class` | Java `.class`（**方法**：`doc.open`/`doc.next`/`doc.cp_at`/`doc.utf8`/`doc.method`/`doc.count`/`doc.method_count`）：魔数 `CAFEBABE`、常量池（14 种 tag，`Long`/`Double` 占两个槽位）、类头与字段/方法骨架，方法名与描述符经 `utf8` 解析成视图 |
 | `std/data/rpm.c6` | `std.data.rpm` | RPM 包（**方法**：`doc.open`/`doc.next`/`doc.get`/`doc.count`/`doc.value`/`doc.int32`/`doc.int16`）：96 字节 lead（魔数 `ED AB EE DB`）+ 主头（`8E AD E8` + 索引表），`tag_name` 给常见 tag 的名字 |
+| `std/encoding/luhn.c6` | `std.encoding.luhn` | 校验位：`luhn_check`/`luhn_digit`（跳过分隔符）、`isbn10_check`/`isbn10_digit`（校验位可为 `X`）、`isbn13_check`/`isbn13_digit`、`verhoeff_check`/`verhoeff_digit`（标准 d/p/inv 表） |
+| `std/encoding/crc16.c6` | `std.encoding.crc16` | CRC-8 与 CRC-16（**方法**：`c.init`/`c.update`/`c.final`/`c.reset`/`c.bits`）：支持 `CRC8`(0xF4)、`CRC16_CCITT`(0x29B1)、`CRC16_XMODEM`(0x31C3)、`CRC16_MODBUS`(0x4B37)、`CRC16_ARC`(0xBB3D) 五种参数，反射在内部处理，另有一次性接口 |
+| `std/encoding/hamming.c6` | `std.encoding.hamming` | 汉明码 (7,4)（**方法**：`b.encode`/`b.syndrome`/`b.fix`/`b.decode`）：4 位数据 → 7 位码，校验子指出出错位置并纠正 1 位；`hamming_encode`/`hamming_decode` 按字节数组处理（每字节两块）并统计纠正位数 |
+| `std/encoding/classic.c6` | `std.encoding.classic` | 经典密码：`caesar`（可负位移）、`rot13`、`atbash`、`vigenere`（`decrypt` 开关，key 只取字母）、`xor_cipher`（自逆）、`railfence`/`railfence_decode`；只动 ASCII 字母，其余原样 |
+
 
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
@@ -374,6 +379,7 @@
 | `examples/stdcreds.c6` | （无模块） | 第五十五批（凭据与配置）的拼装示例（`make std-creds`）：netrc 查找、ssh 主机匹配与选项、公钥行、crontab 定时行与环境变量，全部方法调用 |
 | `examples/stdgeo.c6` | （无模块） | 第五十六批（地理编码）的拼装示例（`make std-geo`）：球面距离/方位/包围盒（方法）、Geohash、Maidenhead 网格、度分秒格式化；链接带 `-lm` |
 | `examples/stdpkg.c6` | （无模块） | 第五十七批（目标文件与包）的拼装示例（`make std-pkg`）：ar 成员与按名查找、COFF 节、Java class 常量池与方法、RPM 头取值 |
+| `examples/stdcheck.c6` | （无模块） | 第五十八批（校验与纠错）的拼装示例（`make std-check`）：Luhn/ISBN/Verhoeff 校验位、CRC-8/16 流式与方法、汉明纠 1 位错、经典密码往返 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -496,6 +502,10 @@ std/data/ar.c6             24 test(s), 0 failure(s)
 std/data/coff.c6           24 test(s), 0 failure(s)
 std/data/class.c6          24 test(s), 0 failure(s)
 std/data/rpm.c6            24 test(s), 0 failure(s)
+std/encoding/luhn.c6       24 test(s), 0 failure(s)
+std/encoding/crc16.c6      24 test(s), 0 failure(s)
+std/encoding/hamming.c6    24 test(s), 0 failure(s)
+std/encoding/classic.c6    24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3860,6 +3870,18 @@ COFF 造一个 `.text` 节验证 `doc.section(0, &s)`；Java class 造三个常�
 用 `doc.next(&cp)` 数 Utf8 项、`doc.method(0, &m)` 取方法名与描述符；RPM 造两个 tag
 并用 `doc.get(RPMTAG_NAME, &e)` + `doc.value(&e, &v)` 取值。
 
+### 集成示例：`examples/stdcheck.c6`
+
+```sh
+make std-check
+```
+
+四节：校验位用 Luhn/ISBN-10(`X`)/ISBN-13/Verhoeff 各验一条合法与非法号，并现场用
+`luhn_digit` 拼出一个合法号；CRC 用 `"123456789"` 的五个标准检查值，再用 `c.init`/
+`c.update` 分片更新与 `c.reset` 对比；汉明码对 16 个 nibble 做往返、再打错一位看
+`b.syndrome()`/`b.fix()` 纠正；经典密码把凯撒/ROT13/Atbash/维吉尼亚/异或/栅栏都跑
+一遍往返。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3970,6 +3992,8 @@ COFF 造一个 `.text` 节验证 `doc.section(0, &s)`；Java class 造三个常�
   （自带自检，链接带 `-lm`）。
 * `make std-pkg`：`examples/stdpkg.c6`，第五十七批（目标文件与包）模块的拼装示例
   （自带自检，全部用结构体方法调用）。
+* `make std-check`：`examples/stdcheck.c6`，第五十八批（校验与纠错）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

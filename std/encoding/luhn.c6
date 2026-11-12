@@ -1,0 +1,292 @@
+/* std/encoding/luhn：常见的校验位算法（Luhn、ISBN-10/13、Verhoeff）。
+ *
+ *     import std.encoding.luhn;
+ *
+ *     luhn_check(S("79927398713"));        // 1
+ *     luhn_digit(S("7992739871"));         // 3（补在末尾就是合法号）
+ *     isbn13_check(S("9780306406157"));    // 1
+ *     verhoeff_check(S("2363"));           // 1
+ *
+ * 约定：
+ *
+ * - 所有函数都先**跳过**非数字字符（空格、连字符），所以 `7992-7398-713` 与
+ *   `79927398713` 等价；
+ * - `*_check` 返回 1 合法 / 0 非法；`*_digit` 返回应当补的校验位（0..9），
+ *   输入不合法（全是非数字）返回 -1；
+ * - `luhn_digit`/`isbn10_digit`/`isbn13_digit`/`verhoeff_digit` 都假设传入的是
+ *   **不含校验位**的主体；
+ * - ISBN-10 的校验位可能是 `X`（表示 10），`isbn10_check` 接受大小写 `x`；
+ * - Verhoeff 用的是标准 `d`/`p`/`inv` 表；
+ * - 不做长度检查（除了 ISBN-10 需要 9+1 位、ISBN-13 需要 12+1 位）。
+ */
+#include <string.h>
+
+module std.encoding.luhn;
+import std.core.types;
+import std.text.str;
+
+static int luhn_digit_at(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    return -1;
+}
+
+int luhn_check(char[:] src)
+{
+    int sum = 0, pos = 0, i = 0, digits = 0;
+
+    if (!src.data)
+        return 0;
+    /* 从右往左数，偶数位（0 起）翻倍 */
+    for (i = src.len - 1; i >= 0; i--) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        if (pos % 2 == 1) {
+            d *= 2;
+            if (d > 9)
+                d -= 9;
+        }
+        sum += d;
+        pos++;
+        digits++;
+    }
+    if (digits < 2)
+        return 0;
+    return sum % 10 == 0 ? 1 : 0;
+}
+
+int luhn_digit(char[:] src)
+{
+    int sum = 0, pos = 0, i = 0, digits = 0;
+
+    if (!src.data)
+        return -1;
+    /* 主体 + 校验位后，校验位在「最右」位置；等价于把主体当成「从右数第 2 位起」 */
+    for (i = src.len - 1; i >= 0; i--) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        if (pos % 2 == 0) {
+            d *= 2;
+            if (d > 9)
+                d -= 9;
+        }
+        sum += d;
+        pos++;
+        digits++;
+    }
+    if (digits == 0)
+        return -1;
+    return (10 - (sum % 10)) % 10;
+}
+
+int isbn10_check(char[:] src)
+{
+    int sum = 0, pos = 0, i = 0;
+
+    if (!src.data)
+        return 0;
+    for (i = 0; i < src.len; i++) {
+        char c = src.data[i];
+        int d = luhn_digit_at(c);
+
+        if (d < 0) {
+            if ((c == 'x' || c == 'X') && pos == 9) {
+                d = 10;
+            } else {
+                continue;
+            }
+        }
+        pos++;
+        sum += d * (11 - pos);
+    }
+    if (pos != 10)
+        return 0;
+    return sum % 11 == 0 ? 1 : 0;
+}
+
+int isbn10_digit(char[:] src)
+{
+    int sum = 0, pos = 0, i = 0, r = 0;
+
+    if (!src.data)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        pos++;
+        if (pos > 9)
+            return -1;
+        sum += d * (11 - pos);
+    }
+    if (pos != 9)
+        return -1;
+    r = (11 - (sum % 11)) % 11;
+    return r;                           /* 10 表示校验位是 X */
+}
+
+int isbn13_check(char[:] src)
+{
+    int sum = 0, pos = 0, i = 0;
+
+    if (!src.data)
+        return 0;
+    for (i = 0; i < src.len; i++) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        sum += d * (pos % 2 == 0 ? 1 : 3);
+        pos++;
+    }
+    if (pos != 13)
+        return 0;
+    return sum % 10 == 0 ? 1 : 0;
+}
+
+int isbn13_digit(char[:] src)
+{
+    int sum = 0, pos = 0, i = 0;
+
+    if (!src.data)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        if (pos >= 12)
+            return -1;
+        sum += d * (pos % 2 == 0 ? 1 : 3);
+        pos++;
+    }
+    if (pos != 12)
+        return -1;
+    return (10 - (sum % 10)) % 10;
+}
+
+static const int ver_d[10][10] = {
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, { 1, 2, 3, 4, 0, 6, 7, 8, 9, 5 },
+    { 2, 3, 4, 0, 1, 7, 8, 9, 5, 6 }, { 3, 4, 0, 1, 2, 8, 9, 5, 6, 7 },
+    { 4, 0, 1, 2, 3, 9, 5, 6, 7, 8 }, { 5, 9, 8, 7, 6, 0, 4, 3, 2, 1 },
+    { 6, 5, 9, 8, 7, 1, 0, 4, 3, 2 }, { 7, 6, 5, 9, 8, 2, 1, 0, 4, 3 },
+    { 8, 7, 6, 5, 9, 3, 2, 1, 0, 4 }, { 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 }
+};
+
+static const int ver_p[8][10] = {
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, { 1, 5, 7, 6, 2, 8, 3, 0, 9, 4 },
+    { 5, 8, 0, 3, 7, 9, 6, 1, 4, 2 }, { 8, 9, 1, 6, 0, 4, 3, 5, 2, 7 },
+    { 9, 4, 5, 3, 1, 2, 6, 8, 7, 0 }, { 4, 2, 8, 6, 5, 7, 3, 9, 0, 1 },
+    { 2, 7, 9, 3, 8, 0, 6, 4, 1, 5 }, { 7, 0, 4, 6, 9, 1, 3, 2, 5, 8 }
+};
+
+static const int ver_inv[10] = { 0, 4, 3, 2, 1, 5, 6, 7, 8, 9 };
+
+static int verhoeff_sum(char[:] src, int with_check)
+{
+    int c = 0, i = 0, pos = 0;
+
+    for (i = src.len - 1; i >= 0; i--) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        pos++;
+        c = ver_d[c][ver_p[pos % 8][d]];
+    }
+    if (with_check)
+        return c;
+    return c;
+}
+
+int verhoeff_check(char[:] src)
+{
+    int c = 0, i = 0, pos = 0;
+
+    if (!src.data)
+        return 0;
+    for (i = src.len - 1; i >= 0; i--) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        c = ver_d[c][ver_p[pos % 8][d]];
+        pos++;
+    }
+    if (pos < 2)
+        return 0;
+    return c == 0 ? 1 : 0;
+}
+
+int verhoeff_digit(char[:] src)
+{
+    int c = 0, i = 0, pos = 1;          /* 校验位占 0 号位置 */
+
+    if (!src.data)
+        return -1;
+    for (i = src.len - 1; i >= 0; i--) {
+        int d = luhn_digit_at(src.data[i]);
+
+        if (d < 0)
+            continue;
+        c = ver_d[c][ver_p[pos % 8][d]];
+        pos++;
+    }
+    if (pos < 2)
+        return -1;
+    return ver_inv[c];
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "luhn：Luhn 校验" {
+    if (luhn_check(S("79927398713")) != 1)
+        return err(1, "79927398713 应该是合法 Luhn 号");
+    if (luhn_check(S("79927398710")) != 0)
+        return err(2, "改一位应该非法");
+    if (luhn_check(S("7992-7398-713")) != 1)
+        return err(3, "带连字符也应该合法");
+    if (luhn_check(S("4111111111111111")) != 1)
+        return err(4, "测试卡号应该合法");
+    if (luhn_check(S("4111111111111112")) != 0)
+        return err(5, "测试卡号改一位应该非法");
+    if (luhn_digit(S("7992739871")) != 3)
+        return err(6, "7992739871 的校验位应该是 3");
+    if (luhn_digit(S("411111111111111")) != 1)
+        return err(7, "测试卡号主体的校验位应该是 1");
+    if (luhn_digit(S("abc")) != -1)
+        return err(8, "没有数字应该 -1");
+}
+
+test "luhn：ISBN 与 Verhoeff" {
+    if (isbn10_check(S("0306406152")) != 1)
+        return err(9, "0306406152 应该是合法 ISBN-10");
+    if (isbn10_check(S("097522980X")) != 1)
+        return err(10, "校验位 X 应该被接受");
+    if (isbn10_check(S("0306406153")) != 0)
+        return err(11, "改一位应该非法");
+    if (isbn10_digit(S("030640615")) != 2)
+        return err(12, "030640615 的校验位应该是 2");
+    if (isbn13_check(S("9780306406157")) != 1)
+        return err(13, "9780306406157 应该是合法 ISBN-13");
+    if (isbn13_check(S("9780306406158")) != 0)
+        return err(14, "改一位应该非法");
+    if (isbn13_digit(S("978030640615")) != 7)
+        return err(15, "978030640615 的校验位应该是 7");
+    if (verhoeff_check(S("2363")) != 1)
+        return err(16, "2363 应该是合法 Verhoeff 号");
+    if (verhoeff_check(S("2364")) != 0)
+        return err(17, "2364 应该非法");
+    if (verhoeff_digit(S("236")) != 3)
+        return err(18, "236 的 Verhoeff 校验位应该是 3");
+    if (verhoeff_check(S("123451")) != 1)
+        return err(19, "123451 应该是合法 Verhoeff 号");
+}

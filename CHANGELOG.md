@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第五十八批（校验与纠错）**：`std.encoding.luhn`（Luhn/ISBN-10/ISBN-13/
+  Verhoeff 校验位）、`std.encoding.crc16`（CRC-8 与四种 CRC-16，流式方法）、
+  `std.encoding.hamming`（汉明 (7,4) 编解码与纠 1 位错）、`std.encoding.classic`
+  （凯撒/ROT13/Atbash/维吉尼亚/异或/栅栏），集成示例 `examples/stdcheck.c6`
+  （`make std-check`）。错误号段 `std.encoding.luhn`=0x60f1 … `std.encoding.classic`=0x60f4
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十七批（目标文件与包）**：`std.data.ar`（Unix 归档，含 GNU/BSD 长名）、
   `std.data.coff`（MS COFF 头/节/符号表）、`std.data.class`（Java class 常量池与
   方法表）、`std.data.rpm`（lead + 主头索引表），集成示例 `examples/stdpkg.c6`

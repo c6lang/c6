@@ -2016,6 +2016,32 @@ doc.find(S("util.o"), &m);
 验收：`make stdtest`（241 个模块、0 failure）、`make std-pkg`（22 条自检全过）、
 `make check-all`。
 
+### 11.70 标准库第五十八批（luhn / crc16 / hamming / classic）
+
+第五十八批做「校验与纠错」：校验位（Luhn / ISBN / Verhoeff）、CRC-8/16、汉明码 (7,4)
+与几个经典替换密码。`Crc` 与 `HammingBlock` 都是**方法优先**的形态。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.luhn` | 校验位 | Luhn 从右往左按「偶数位翻倍」，`luhn_digit` 要把主体当成「校验位在最右」反着算；ISBN-10 的校验位可能是 `X`(10)；Verhoeff 用 d/p/inv 三张表，校验位的下标要从 1 起算 |
+| `std.encoding.crc16` | CRC-8/16 | 五种参数（多项式/初值/是否反射）用一张 `init` 分派表；反射版多项式写成反向形式（0xA001），`update` 按低位先处理；`"123456789"` 的五个标准检查值全对上 |
+| `std.encoding.hamming` | 汉明 (7,4) | 位置 1/2/4 是校验位、3/5/6/7 是数据位；校验子直接给出出错位置（1..7），异或那一位即可纠正；码距 3 只能纠 1 位错 |
+| `std.encoding.classic` | 经典密码 | 只动 ASCII 字母（大小写保持），维吉尼亚的 key 跳过非字母、`decrypt` 做减法；栅栏密码的编码/解码都用「每栏读一遍」的走法 |
+
+又踩了字段与同名方法的冲突：`Crc.width` 与 `width()` 方法撞车（`function pointer
+expected`），把字段全改成带后缀的名字（`wbits`/`initv`/`polyn`/`refl`/`kindc`），
+`width()` 方法改名 `bits()`。这类冲突现在已经有固定套路：**字段加后缀、方法用动词**。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.luhn`=0x60f1、
+`std.encoding.crc16`=0x60f2、`std.encoding.hamming`=0x60f3、`std.encoding.classic`=0x60f4；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-check` 与 `STD_CHECK_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdcheck.c6` 四节（28 条自检）。
+
+验收：`make stdtest`（245 个模块、0 failure）、`make std-check`（28 条自检全过）、
+`make check-all`。
+
+
 
 
 

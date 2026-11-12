@@ -1,0 +1,239 @@
+/* std/encoding/crc16：CRC-8 与三种 CRC-16（CCITT-FALSE / XMODEM / MODBUS / ARC）。
+ *
+ *     import std.encoding.crc16;
+ *
+ *     Crc c = { 0 };
+ *     c.init(CRC16_CCITT);            // 方法：init / update / final
+ *     c.update(S("123456789"));
+ *     c.final();                      // 0x29B1
+ *
+ * 参数表（`check` 值是 `"123456789"` 的标准结果）：
+ *
+ *     种类            宽度  多项式   初值     反射   结果
+ *     CRC8            8     0x07     0x00     否     0xF4
+ *     CRC16_CCITT     16    0x1021   0xFFFF   否     0x29B1
+ *     CRC16_XMODEM    16    0x1021   0x0000   否     0x31C3
+ *     CRC16_MODBUS    16    0xA001   0xFFFF   是     0x4B37
+ *     CRC16_ARC       16    0xA001   0x0000   是     0xBB3D
+ *
+ * 约定：
+ *
+ * - `Crc` 是流式状态：`init(kind)` 设参数与初值，`update(data)` 可多次调用，
+ *   `final()` 返回最终校验和（调用后状态仍是「已更新」的样子，想重来就再 `init`）；
+ * - 反射（reflect in/out）在内部处理：`MODBUS`/`ARC` 的多项式已写成反向形式，
+ *   `update` 按「低位先」处理；
+ * - 一次性接口 `crc8`/`crc16_ccitt`/`crc16_xmodem`/`crc16_modbus`/`crc16_arc`
+ *   内部就是 init + update + final；
+ * - `bits()` 方法给宽度（8 或 16），`reset()` 恢复到 `init` 后的状态。
+ */
+#include <string.h>
+
+module std.encoding.crc16;
+import std.core.types;
+import std.text.str;
+
+enum {
+    CRC8 = 1,
+    CRC16_CCITT = 2,
+    CRC16_XMODEM = 3,
+    CRC16_MODBUS = 4,
+    CRC16_ARC = 5
+};
+
+struct Crc {
+    u32 reg;
+    u32 polyn;
+    u32 initv;
+    int wbits;
+    int refl;
+    int kindc;
+};
+
+int init(Crc *c, int kind)
+{
+    if (!c)
+        return -1;
+    memset(c, 0, sizeof *c);
+    c->kindc = kind;
+    switch (kind) {
+    case CRC8:
+        c->wbits = 8;
+        c->polyn = 0x07;
+        c->initv = 0x00;
+        c->refl = 0;
+        break;
+    case CRC16_CCITT:
+        c->wbits = 16;
+        c->polyn = 0x1021;
+        c->initv = 0xFFFF;
+        c->refl = 0;
+        break;
+    case CRC16_XMODEM:
+        c->wbits = 16;
+        c->polyn = 0x1021;
+        c->initv = 0x0000;
+        c->refl = 0;
+        break;
+    case CRC16_MODBUS:
+        c->wbits = 16;
+        c->polyn = 0xA001;
+        c->initv = 0xFFFF;
+        c->refl = 1;
+        break;
+    case CRC16_ARC:
+        c->wbits = 16;
+        c->polyn = 0xA001;
+        c->initv = 0x0000;
+        c->refl = 1;
+        break;
+    default:
+        return -1;
+    }
+    c->reg = c->initv;
+    return 1;
+}
+
+int reset(Crc *c)
+{
+    if (!c || c->kindc == 0)
+        return -1;
+    c->reg = c->initv;
+    return 1;
+}
+
+int update(Crc *c, char[:] data)
+{
+    int i = 0, k = 0;
+
+    if (!c || !data.data || c->kindc == 0)
+        return -1;
+    if (c->refl) {
+        for (i = 0; i < data.len; i++) {
+            c->reg ^= (u32)(unsigned char)data.data[i];
+            for (k = 0; k < 8; k++) {
+                if (c->reg & 1u)
+                    c->reg = (c->reg >> 1) ^ c->polyn;
+                else
+                    c->reg >>= 1;
+            }
+            c->reg &= c->wbits == 8 ? 0xFFu : 0xFFFFu;
+        }
+    } else {
+        u32 top = c->wbits == 8 ? 0x80u : 0x8000u;
+        u32 mask = c->wbits == 8 ? 0xFFu : 0xFFFFu;
+
+        for (i = 0; i < data.len; i++) {
+            c->reg ^= ((u32)(unsigned char)data.data[i])
+                      << (c->wbits == 8 ? 0 : 8);
+            c->reg &= mask;
+            for (k = 0; k < 8; k++) {
+                if (c->reg & top)
+                    c->reg = ((c->reg << 1) ^ c->polyn) & mask;
+                else
+                    c->reg = (c->reg << 1) & mask;
+            }
+        }
+    }
+    return (int)c->reg;
+}
+
+u32 final(Crc *c)
+{
+    if (!c || c->kindc == 0)
+        return 0;
+    return c->reg & (c->wbits == 8 ? 0xFFu : 0xFFFFu);
+}
+
+u32 value(Crc *c)
+{
+    return final(c);
+}
+
+int bits(Crc *c)
+{
+    return c ? c->wbits : 0;
+}
+
+static u32 crc_once(int kind, char[:] data)
+{
+    Crc c = { 0 };
+
+    init(&c, kind);
+    update(&c, data);
+    return final(&c);
+}
+
+u32 crc8(char[:] data)
+{
+    return crc_once(CRC8, data);
+}
+
+u32 crc16_ccitt(char[:] data)
+{
+    return crc_once(CRC16_CCITT, data);
+}
+
+u32 crc16_xmodem(char[:] data)
+{
+    return crc_once(CRC16_XMODEM, data);
+}
+
+u32 crc16_modbus(char[:] data)
+{
+    return crc_once(CRC16_MODBUS, data);
+}
+
+u32 crc16_arc(char[:] data)
+{
+    return crc_once(CRC16_ARC, data);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "crc16：标准检查值" {
+    if (crc16_ccitt(S("123456789")) != 0x29B1u)
+        return err(1, "CRC-16/CCITT-FALSE 应该是 0x29B1");
+    if (crc16_xmodem(S("123456789")) != 0x31C3u)
+        return err(2, "CRC-16/XMODEM 应该是 0x31C3");
+    if (crc16_modbus(S("123456789")) != 0x4B37u)
+        return err(3, "CRC-16/MODBUS 应该是 0x4B37");
+    if (crc16_arc(S("123456789")) != 0xBB3Du)
+        return err(4, "CRC-16/ARC 应该是 0xBB3D");
+    if (crc8(S("123456789")) != 0xF4u)
+        return err(5, "CRC-8 应该是 0xF4");
+    if (crc16_ccitt(S("")) != 0xFFFFu)
+        return err(6, "空输入的 CCITT 应该等于初值 0xFFFF");
+    if (crc16_xmodem(S("")) != 0x0000u)
+        return err(7, "空输入的 XMODEM 应该是 0");
+}
+
+test "crc16：流式与复位" {
+    Crc c = { 0 };
+
+    if (c.init(CRC16_CCITT) != 1)
+        return err(8, "init 失败");
+    if (c.bits() != 16)
+        return err(9, "width() 不对");
+    c.update(S("1234"));
+    c.update(S("56789"));
+    if (c.final() != 0x29B1u)
+        return err(10, "分片更新应该与整体一致");
+    if (c.value() != 0x29B1u)
+        return err(11, "value() 应该等于 final()");
+    c.reset();
+    c.update(S("123456789"));
+    if (c.final() != 0x29B1u)
+        return err(12, "reset 之后应该能重算");
+    /* CRC-8 流式 */
+    if (c.init(CRC8) != 1 || c.bits() != 8)
+        return err(13, "CRC-8 init 失败");
+    c.update(S("123456789"));
+    if (c.final() != 0xF4u)
+        return err(14, "CRC-8 流式结果不对");
+    if (c.init(99) != -1)
+        return err(15, "未知种类应该 -1");
+    if (c.update((char[:]){ 0, 0 }) != -1)
+        return err(16, "空数据指针应该 -1");
+}
