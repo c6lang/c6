@@ -1,0 +1,255 @@
+/* std/async/aio：语言级 async 的异步 I/O 原语（`await c6_io` 之上的收发封装）。
+ *
+ *     import std.async.aio;
+ *
+ *     async int fetch(int fd, char *buf, int cap)
+ *     {
+ *         int n = await aio_read_line(fd, buf, cap);   // 挂起到有整行可读
+ *         return n;
+ *     }
+ *
+ *     // 驱动：task 拿句柄，__c6_co_wait 跑到完成
+ *     task t = fetch(fd, buf, sizeof buf);
+ *     __c6_co_wait(t);
+ *     int n = t->val;
+ *
+ * 这一层就是 **c6 关键字的 async**：函数标上 `async`，函数体里用 `await` 挂起，
+ * 调用它得到的是任务句柄（`struct NAME_task *`），由 `__c6_co_wait` / `__c6_co_run`
+ * 驱动。`await c6_io(fd, ev)` 是编译器内建的挂起点（fd 必须在 `[0, 1024)`）。
+ *
+ * 约定：
+ *
+ * - `await aio_wait(fd, ev)` 等事件并返回就绪掩码（`C6_CO_EV_READ`/`C6_CO_EV_WRITE`）；
+ *   `ev` 也可以写 `C6_CO_EV_READ | C6_CO_EV_WRITE`；
+ * - `await aio_read(fd, buf, cap)` 先等可读再读一次，返回读到的字节数（0 = EOF、-1 = 错）；
+ * - `await aio_read_exact(fd, buf, cap)` 读满 `cap` 字节或遇到 EOF（返回实际字节数）；
+ * - `await aio_write_all(fd, buf, len)` 循环写到写完，返回写了多少（< 0 表示出错）；
+ * - `await aio_read_line_x(fd, buf, cap, &eof)` 同上，但用 `eof` 区分「空行」与
+ *   「流结束」（两种情况的返回值都是 0）；
+ * - `await aio_read_line(fd, buf, cap)` 读到 `\n` 为止（`\r\n` 会一起去掉，缓冲里补
+ *   NUL），返回行长；返回 0 表示 EOF 或空行；-1 表示行比 `cap - 1` 长（多余字节留在
+ *   fd 里，调用方自己决定怎么清）。
+ * - 一个 fd 上同一时刻**只该有一个读任务/一个写任务**：`c6_io` 只保证「可读」，
+ *   不排队，多个读者会互相抢数据。
+ * - 这些都是 `async` 函数：**不能**在普通函数里直接调用（编译器会报错），必须
+ *   `await`（在 async 函数里）或 `task t = …` 拿句柄后交给驱动方。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.async.aio;
+import std.core.types;
+import std.text.str;
+
+async int aio_wait(int fd, int ev)
+{
+    int rev = 0;
+
+    if (fd < 0 || fd >= 1024)
+        return -1;
+    rev = await c6_io(fd, ev);
+    return rev;
+}
+
+async int aio_read(int fd, char *buf, int cap)
+{
+    int rev = 0;
+    int n = 0;
+
+    if (!buf || cap <= 0 || fd < 0)
+        return -1;
+    rev = await c6_io(fd, C6_CO_EV_READ);
+    if (rev < 0)
+        return -1;
+    n = (int)read(fd, buf, (size_t)cap);
+    return n;
+}
+
+async int aio_read_exact(int fd, char *buf, int cap)
+{
+    int off = 0;
+    int n = 0;
+
+    if (!buf || cap <= 0 || fd < 0)
+        return -1;
+    while (off < cap) {
+        await c6_io(fd, C6_CO_EV_READ);
+        n = (int)read(fd, buf + off, (size_t)(cap - off));
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            break;                      /* EOF */
+        off += n;
+    }
+    return off;
+}
+
+async int aio_write_all(int fd, const char *buf, int len)
+{
+    int off = 0;
+    int n = 0;
+
+    if (!buf || len < 0 || fd < 0)
+        return -1;
+    while (off < len) {
+        await c6_io(fd, C6_CO_EV_WRITE);
+        n = (int)write(fd, buf + off, (size_t)(len - off));
+        if (n <= 0)
+            return -1;
+        off += n;
+    }
+    return off;
+}
+
+/* 带 EOF 标志的行读：空行（长度 0、eof=0）与 EOF（长度 0、eof=1）能区分 */
+async int aio_read_line_x(int fd, char *buf, int cap, int *eof)
+{
+    int len = 0;
+    int n = 0;
+    char c = 0;
+
+    if (!buf || cap < 2 || fd < 0)
+        return -1;
+    if (eof)
+        *eof = 0;
+    while (len < cap - 1) {
+        await c6_io(fd, C6_CO_EV_READ);
+        n = (int)read(fd, &c, 1);
+        if (n < 0)
+            return -1;
+        if (n == 0) {
+            if (eof)
+                *eof = 1;
+            break;                      /* EOF */
+        }
+        if (c == '\n') {
+            if (len > 0 && buf[len - 1] == '\r')
+                len--;
+            buf[len] = '\0';
+            return len;
+        }
+        buf[len++] = c;
+    }
+    buf[len] = '\0';
+    if (len >= cap - 1)
+        return -1;                      /* 行太长 */
+    return len;
+}
+
+async int aio_read_line(int fd, char *buf, int cap)
+{
+    int eof = 0;
+
+    return await aio_read_line_x(fd, buf, cap, &eof);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "aio：异步读与写" {
+    int fds[2] = { -1, -1 };
+    char buf[16] = { 0 };
+    struct aio_read_task *r = 0;
+    struct aio_write_all_task *w = 0;
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe 失败");
+    if (write(fds[1], "hello", 5) != 5)
+        return err(2, "准备数据失败");
+    r = aio_read(fds[0], buf, (int)sizeof buf);
+    if (__c6_co_wait(r) != 0)
+        return err(3, "读任务失败");
+    if (r->val != 5)
+        return err(4, "应该读到 5 字节");
+    if (memcmp(buf, "hello", 5) != 0)
+        return err(5, "读到的内容不对");
+    __c6_co_destroy(r);
+    /* 写：任务写、主线程读 */
+    w = aio_write_all(fds[1], "world", 5);
+    if (__c6_co_wait(w) != 0 || w->val != 5)
+        return err(6, "写任务失败");
+    __c6_co_destroy(w);
+    memset(buf, 0, sizeof buf);
+    if (read(fds[0], buf, sizeof buf) != 5 || memcmp(buf, "world", 5) != 0)
+        return err(7, "写出去的内容不对");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "aio：read_exact 与 read_line" {
+    int fds[2] = { -1, -1 };
+    char buf[16] = { 0 };
+    struct aio_read_exact_task *e = 0;
+    struct aio_read_line_task *l = 0;
+
+    if (pipe(fds) != 0)
+        return err(8, "pipe 失败");
+    write(fds[1], "abcdef", 6);
+    e = aio_read_exact(fds[0], buf, 6);
+    if (__c6_co_wait(e) != 0 || e->val != 6)
+        return err(9, "read_exact 应该读满 6 字节");
+    if (memcmp(buf, "abcdef", 6) != 0)
+        return err(10, "read_exact 内容不对");
+    __c6_co_destroy(e);
+    /* 行读：两行 + CRLF */
+    write(fds[1], "one\r\ntwo\n", 9);
+    memset(buf, 0, sizeof buf);
+    l = aio_read_line(fds[0], buf, (int)sizeof buf);
+    if (__c6_co_wait(l) != 0 || l->val != 3)
+        return err(11, "第一行应该是 3 字节");
+    if (memcmp(buf, "one", 3) != 0)
+        return err(12, "CRLF 应该被去掉");
+    __c6_co_destroy(l);
+    memset(buf, 0, sizeof buf);
+    l = aio_read_line(fds[0], buf, (int)sizeof buf);
+    if (__c6_co_wait(l) != 0 || l->val != 3 || memcmp(buf, "two", 3) != 0)
+        return err(13, "第二行不对");
+    __c6_co_destroy(l);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "aio：EOF、参数与事件掩码" {
+    int fds[2] = { -1, -1 };
+    char buf[8] = { 0 };
+    struct aio_read_task *r = 0;
+    struct aio_wait_task *w = 0;
+    struct aio_read_line_task *l = 0;
+
+    if (pipe(fds) != 0)
+        return err(14, "pipe 失败");
+    /* 关掉写端 → 读到 EOF（0 字节） */
+    close(fds[1]);
+    r = aio_read(fds[0], buf, (int)sizeof buf);
+    if (__c6_co_wait(r) != 0 || r->val != 0)
+        return err(15, "对端关闭应该返回 0");
+    __c6_co_destroy(r);
+    l = aio_read_line(fds[0], buf, (int)sizeof buf);
+    if (__c6_co_wait(l) != 0 || l->val != 0)
+        return err(16, "行读遇到 EOF 应该返回 0");
+    __c6_co_destroy(l);
+    /* 写端可写事件 */
+    {
+        int p2[2] = { -1, -1 };
+
+        if (pipe(p2) != 0)
+            return err(17, "pipe 失败");
+        w = aio_wait(p2[1], C6_CO_EV_WRITE);
+        if (__c6_co_wait(w) != 0 || w->val <= 0)
+            return err(18, "写端应该立刻可写");
+        __c6_co_destroy(w);
+        close(p2[0]);
+        close(p2[1]);
+    }
+    /* 非法 fd（越界）由运行时按失败回收 */
+    w = aio_wait(2000, C6_CO_EV_READ);
+    if (__c6_co_wait(w) != 0 || w->val != -1)
+        return err(19, "越界 fd 应该返回 -1");
+    __c6_co_destroy(w);
+    r = aio_read(fds[0], buf, 0);
+    if (__c6_co_wait(r) != 0 || r->val != -1)
+        return err(20, "cap=0 应该 -1");
+    __c6_co_destroy(r);
+    close(fds[0]);
+}

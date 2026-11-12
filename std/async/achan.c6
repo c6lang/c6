@@ -1,0 +1,277 @@
+/* std/async/achan：语言级 async 的异步通道（pipe + 长度前缀帧，send/recv 都是 await 点）。
+ *
+ *     import std.async.achan;
+ *
+ *     AChan ch = { 0 };
+ *     ch.init();                  // 方法：init / init_pair / close_chan / rfd / wfd
+ *     task s = achan_send(&ch, "hi", 2);          // async 函数用 void* 句柄
+ *     __c6_co_wait(s);
+ *     char buf[16] = { 0 };
+ *     task r = achan_recv(&ch, buf, sizeof buf);
+ *     __c6_co_wait(r);                            // r->val == 2，buf == "hi"
+ *
+ * 通道底层就是一对 pipe：`achan_send` 写「4 字节大端长度 + 载荷」，`achan_recv` 先读
+ * 长度再读载荷。所以它是**单消费者**的（一个 fd 上只该有一个读任务），多个发送方只要
+ * 每帧不超过 `maxmsg`（默认 4000，留在 `PIPE_BUF` 里）就是原子的。
+ *
+ * 约定（为什么是 `void *` 句柄）：
+ *
+ * c6 的编译器**不允许 async 函数当方法**（`'async' functions cannot be methods`），
+ * 所以 async 函数的第一参数统一写成 `void *`（调用方传 `&ch`），非 async 的辅助函数
+ * 仍然是普通方法（`ch.init()` / `ch.close()`）。
+ *
+ * - `ch.init()` 建一对 pipe（`maxmsg = 4000`），`ch.init_pair(rfd, wfd, maxmsg)`
+ *   接管已有的两个 fd（测试、或者把一个 pipe 的两端分给两个进程时用）；
+ * - `ch.close_chan()` 关掉两端（名字带后缀是为了避开 libc 的 `close`）；`ch.rfd()`/`ch.wfd()` 取 fd；`ch.maxmsg()` 单帧上限；
+ * - `await achan_send(&ch, buf, len)` 写一帧，返回 `len`；`len > maxmsg` 或参数错返回 -1；
+ * - `await achan_recv(&ch, buf, cap)` 读一帧，返回载荷长度；对端关闭返回 0
+ *   （通道 EOF）；载荷比 `cap` 大返回 -1（此时这一帧已经被读掉）；
+ * - `ch.sent()`/`ch.recv_count()` 累计成功收发的帧数，`ch.bytes()` 累计载荷字节数；
+ * - 帧长上限之外**不做**任何同步：同一个 AChan 只该有一个读者。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.async.achan;
+import std.core.types;
+import std.text.str;
+import std.async.aio;
+
+struct AChan {
+    int rd;         /* 字段名避开 rfd()/wfd()/maxmsg() 方法 */
+    int wr;
+    int maxm;
+    long nsent;
+    long nrecv;
+    long nbytes;
+};
+
+int init(AChan *c)
+{
+    int fds[2] = { -1, -1 };
+
+    if (!c)
+        return -1;
+    if (pipe(fds) != 0)
+        return -1;
+    memset(c, 0, sizeof *c);
+    c->rd = fds[0];
+    c->wr = fds[1];
+    c->maxm = 4000;
+    return 1;
+}
+
+int init_pair(AChan *c, int rfd, int wfd, int maxmsg)
+{
+    if (!c || rfd < 0 || wfd < 0)
+        return -1;
+    memset(c, 0, sizeof *c);
+    c->rd = rfd;
+    c->wr = wfd;
+    c->maxm = (maxmsg > 0 && maxmsg <= 65535) ? maxmsg : 4000;
+    return 1;
+}
+
+int close_chan(AChan *c)
+{
+    if (!c)
+        return -1;
+    if (c->rd >= 0)
+        close(c->rd);
+    if (c->wr >= 0 && c->wr != c->rd)
+        close(c->wr);
+    c->rd = -1;
+    c->wr = -1;
+    return 1;
+}
+
+int rfd(AChan *c)
+{
+    return c ? c->rd : -1;
+}
+
+int wfd(AChan *c)
+{
+    return c ? c->wr : -1;
+}
+
+int maxmsg(AChan *c)
+{
+    return c ? c->maxm : 0;
+}
+
+long sent(AChan *c)
+{
+    return c ? c->nsent : 0;
+}
+
+long recv_count(AChan *c)
+{
+    return c ? c->nrecv : 0;
+}
+
+long bytes(AChan *c)
+{
+    return c ? c->nbytes : 0;
+}
+
+/* 4 字节大端长度 + 载荷 */
+async int achan_send(void *vp, const char *buf, int len)
+{
+    AChan *c = (AChan *)vp;
+    unsigned char hdr[4] = { 0, 0, 0, 0 };
+    int n = 0;
+
+    if (!c || !buf || len < 0 || c->wr < 0)
+        return -1;
+    if (len > c->maxm)
+        return -1;
+    hdr[0] = (unsigned char)((len >> 24) & 0xff);
+    hdr[1] = (unsigned char)((len >> 16) & 0xff);
+    hdr[2] = (unsigned char)((len >> 8) & 0xff);
+    hdr[3] = (unsigned char)(len & 0xff);
+    n = await aio_write_all(c->wr, (const char *)hdr, 4);
+    if (n != 4)
+        return -1;
+    n = await aio_write_all(c->wr, buf, len);
+    if (n != len)
+        return -1;
+    c->nsent++;
+    c->nbytes += len;
+    return len;
+}
+
+async int achan_recv(void *vp, char *buf, int cap)
+{
+    AChan *c = (AChan *)vp;
+    unsigned char hdr[4] = { 0, 0, 0, 0 };
+    int len = 0;
+    int n = 0;
+
+    if (!c || !buf || cap <= 0 || c->rd < 0)
+        return -1;
+    n = await aio_read_exact(c->rd, (char *)hdr, 4);
+    if (n == 0)
+        return 0;                       /* 对端关闭 */
+    if (n != 4)
+        return -1;
+    len = ((int)hdr[0] << 24) | ((int)hdr[1] << 16) | ((int)hdr[2] << 8)
+          | (int)hdr[3];
+    if (len < 0 || len > c->maxm)
+        return -1;
+    if (len > cap) {
+        /* 帧比缓冲大：把这一帧读掉再报错，避免把流搞乱 */
+        int left = len;
+        char junk[64] = { 0 };
+
+        while (left > 0) {
+            int chunk = left < (int)sizeof junk ? left : (int)sizeof junk;
+
+            n = await aio_read_exact(c->rd, junk, chunk);
+            if (n <= 0)
+                return -1;
+            left -= n;
+        }
+        return -1;
+    }
+    if (len > 0) {
+        n = await aio_read_exact(c->rd, buf, len);
+        if (n != len)
+            return -1;
+    }
+    c->nrecv++;
+    c->nbytes += len;
+    return len;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "achan：发送与接收" {
+    AChan ch = { 0 };
+    char buf[32] = { 0 };
+    char raw[16] = { 0 };
+    struct achan_send_task *s = 0;
+    struct achan_recv_task *r = 0;
+
+    if (ch.init() != 1)
+        return err(1, "init 失败");
+    if (ch.rfd() < 0 || ch.wfd() < 0 || ch.maxmsg() != 4000)
+        return err(2, "初始状态不对");
+    s = achan_send(&ch, "hello", 5);
+    if (__c6_co_wait(s) != 0 || s->val != 5)
+        return err(3, "send 失败");
+    __c6_co_destroy(s);
+    if (ch.sent() != 1)
+        return err(4, "sent 计数不对");
+    r = achan_recv(&ch, buf, (int)sizeof buf);
+    if (__c6_co_wait(r) != 0 || r->val != 5)
+        return err(5, "recv 失败");
+    if (memcmp(buf, "hello", 5) != 0)
+        return err(6, "收到的内容不对");
+    __c6_co_destroy(r);
+    if (ch.recv_count() != 1 || ch.bytes() != 10)
+        return err(7, "计数不对");
+    /* 再看一眼帧格式：4 字节长度 + 载荷 */
+    s = achan_send(&ch, "ab", 2);
+    __c6_co_wait(s);
+    __c6_co_destroy(s);
+    if (read(ch.rfd(), raw, 6) != 6)
+        return err(8, "帧没写进去");
+    if (raw[0] != 0 || raw[1] != 0 || raw[2] != 0 || raw[3] != 2)
+        return err(9, "帧头应该是大端 2");
+    if (raw[4] != 'a' || raw[5] != 'b')
+        return err(10, "载荷不对");
+    ch.close_chan();
+}
+
+test "achan：多帧、上限与 EOF" {
+    static int fds[2] = { -1, -1 };
+    AChan ch = { 0 };
+    char buf[64] = { 0 };
+    struct achan_send_task *s = 0;
+    struct achan_recv_task *r = 0;
+    int i = 0;
+
+    if (pipe(fds) != 0)
+        return err(11, "pipe 失败");
+    if (ch.init_pair(fds[0], fds[1], 8) != 1)
+        return err(12, "init_pair 失败");
+    if (ch.maxmsg() != 8)
+        return err(13, "maxmsg 应该是 8");
+    /* 三帧 */
+    for (i = 0; i < 3; i++) {
+        s = achan_send(&ch, "abc", 3);
+        if (__c6_co_wait(s) != 0 || s->val != 3)
+            return err(14, "多帧发送失败");
+        __c6_co_destroy(s);
+    }
+    for (i = 0; i < 3; i++) {
+        memset(buf, 0, sizeof buf);
+        r = achan_recv(&ch, buf, (int)sizeof buf);
+        if (__c6_co_wait(r) != 0 || r->val != 3 || memcmp(buf, "abc", 3) != 0)
+            return err(15, "多帧接收顺序不对");
+        __c6_co_destroy(r);
+    }
+    /* 超过上限 */
+    s = achan_send(&ch, "0123456789", 10);
+    if (__c6_co_wait(s) != 0 || s->val != -1)
+        return err(16, "超过 maxmsg 应该 -1");
+    __c6_co_destroy(s);
+    /* 帧比接收缓冲大：读掉并报错 */
+    s = achan_send(&ch, "5678", 4);
+    __c6_co_wait(s);
+    __c6_co_destroy(s);
+    r = achan_recv(&ch, buf, 2);
+    if (__c6_co_wait(r) != 0 || r->val != -1)
+        return err(17, "缓冲太小应该 -1");
+    __c6_co_destroy(r);
+    /* 关掉写端 → EOF */
+    close(fds[1]);
+    r = achan_recv(&ch, buf, (int)sizeof buf);
+    if (__c6_co_wait(r) != 0 || r->val != 0)
+        return err(18, "对端关闭应该返回 0");
+    __c6_co_destroy(r);
+    close(fds[0]);
+}

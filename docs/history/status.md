@@ -2560,6 +2560,36 @@ executor（39 条）、await/scope 依赖同一串再加 co（各 41 条）、li
 验收：`make stdtest`（329 个模块、0 failure）、`make std-geo2`（23 条自检全过）、
 `make check-all`。
 
+### 11.92 标准库第八十批（aio / achan / art / apump：语言级 async 的库支持）
+
+第八十批把标准库的异步支持**建在 c6 的关键字上**（`async`/`await`/`task`/`co` 与运行时
+`__c6_co_*`），不再自己造协程框架：`std.async.co`/`await`/`scope`/`limiter` 那批是
+用户态调度器，这批是「用语言原语写库」。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.async.aio` | `await c6_io` 之上的收发原语 | `aio_wait`/`aio_read`/`aio_read_exact`/`aio_write_all`/`aio_read_line`；行读的「空行」与「EOF」返回值都是 0，所以补了 `aio_read_line_x(…, &eof)`，`aio_read_line` 就是它的薄包装（async 里 `await` 另一个 async 再 `return` 合法） |
+| `std.async.achan` | async 通道 | pipe 上的「4 字节大端长度 + 载荷」帧；单帧上限 4000（`PIPE_BUF` 内，多个发送方也原子）；帧比接收缓冲大时先把这一帧读掉再报错，避免把流搞乱 |
+| `std.async.art` | 运行时驱动 | 把 `__c6_co_wait`/`__c6_co_run`/`__c6_co_destroy`/`__c6_co_state` 包成 `Rt` 的方法并记统计；`state` 在任务跑完后是 -1（挂起时非负） |
+| `std.async.apump` | 流式转发 | aio + achan 组合：fd→fd 到 EOF、限量、按行（补 `\n`）、通道→fd；`apump_lines` 用 `aio_read_line_x` 区分空行与 EOF |
+
+最大的坑是**编译器约束**：`async` 函数不能是方法（`'async' functions cannot be methods`），
+所以这批的 async 函数第一参数一律 `void *`（调用方传 `&ch`），只有非 async 的辅助函数
+才做成方法（`ch.init()`、`rt.wait(t)`）。`void *` 首参不会被当成方法，实测可行。
+
+另外两个测试自己写错的坑：`apump_n` 的测试里往 pipe 的**读端**写数据（`write(a[0])`），
+以及 `close(c[1])` 在 `__c6_co_wait` 之前——任务还 park 在那个 fd 上，读到 EBADF。
+
+错误号段继续追加：`std.async.aio`=0x6149、`std.async.achan`=0x614a、
+`std.async.art`=0x614b、`std.async.apump`=0x614c（`grammar.md` §8.1 同步）。
+`Makefile` 增加 `std-async4` 与 `STD_ASYNC4_SRCS`；四个模块在 `stdtest` 里分别 25/27/27/29
+条（依赖 `std/text/str.c6`，其中后三者还依赖 `std.async.aio`/`achan`）。示例
+`examples/stdasync4.c6` 18 条自检。
+
+验收：`make stdtest`（333 个模块、0 failure）、`make std-async4`（18 条自检全过）、
+`make check-all`。
+
+
 
 
 

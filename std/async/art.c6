@@ -1,0 +1,194 @@
+/* std/async/art：语言级 async 的运行时驱动（`__c6_co_wait`/`__c6_co_run` 的封装 + 统计）。
+ *
+ *     import std.async.art;
+ *
+ *     Rt rt = { 0 };
+ *     task t = fetch(fd, buf, cap);      // 拿任务句柄
+ *     rt.wait(t);                        // 方法：wait / run / destroy / state
+ *     int rc = t->val;
+ *
+ * c6 的 `async` 函数被调用时只是**建任务**，真正往前跑要靠驱动方：
+ * `__c6_co_wait(task)` 一路推进到完成（遇到 `await c6_io` 就用 `select()` 等），
+ * `__c6_co_run()` 把 `co` 出去的顶层任务全部跑完、返回以 `err` 结束的个数。
+ * 这个模块把它们包成 `Rt` 上的方法，顺手记下调用统计，省得业务代码里到处写
+ * `__c6_co_*`。
+ *
+ * 约定：
+ *
+ * - `rt.wait(task)` 驱动一个任务到完成，返回它的结束码（0 = 正常结束）；
+ * - `rt.run()` 跑完所有顶层（`co` 出来的）任务，返回失败的个数；
+ * - `rt.destroy(task)` 释放任务槽（没完成也能释放，未完成的子任务一起回收）；
+ * - `rt.state(task)`/`rt.kind(task)` 是运行时的内部状态/种类（调试用）：任务刚建好
+ *   时 `state` 是挂起值（非负），跑完之后变成 -1；
+ * - `rt.waits()`/`rt.runs()`/`rt.destroys()` 累计调用次数，
+ *   `rt.last_rc()` 最近一次 `wait` 的返回码，`rt.ok()` 最近一次是否正常结束；
+ * - `rt.event_read()`/`rt.event_write()` 给 `c6_io` 的事件位（1 / 2），
+ *   省得直接写 `C6_CO_EV_*`；
+ * - `task` 句柄是 `struct NAME_task *`，为了通用这里收成 `void *`；`rt_*` 这些函数
+ *   不做检查，句柄必须是活的（`task` 声明在作用域退出时会自动 `destroy`）。
+ */
+#include <string.h>
+
+module std.async.art;
+import std.core.types;
+import std.text.str;
+import std.async.aio;
+
+struct Rt {
+    long nwaits;
+    long nruns;
+    long ndestroys;
+    int last_rc_v;
+};
+
+int wait(Rt *r, void *task)
+{
+    int rc = 0;
+
+    if (!r || !task)
+        return -1;
+    rc = __c6_co_wait(task);
+    r->nwaits++;
+    r->last_rc_v = rc;
+    return rc;
+}
+
+int run(Rt *r)
+{
+    int rc = 0;
+
+    if (!r)
+        return -1;
+    rc = __c6_co_run();
+    r->nruns++;
+    return rc;
+}
+
+int destroy(Rt *r, void *task)
+{
+    if (!r)
+        return -1;
+    if (!task)
+        return -1;
+    __c6_co_destroy(task);
+    r->ndestroys++;
+    return 1;
+}
+
+int state(Rt *r, void *task)
+{
+    (void)r;
+    if (!task)
+        return -1;
+    return __c6_co_state(task);
+}
+
+int kind(Rt *r, void *task)
+{
+    (void)r;
+    if (!task)
+        return -1;
+    return __c6_co_kind(task);
+}
+
+long waits(Rt *r)
+{
+    return r ? r->nwaits : 0;
+}
+
+long runs(Rt *r)
+{
+    return r ? r->nruns : 0;
+}
+
+long destroys(Rt *r)
+{
+    return r ? r->ndestroys : 0;
+}
+
+int last_rc(Rt *r)
+{
+    return r ? r->last_rc_v : -1;
+}
+
+int ok(Rt *r)
+{
+    return r && r->last_rc_v == 0 ? 1 : 0;
+}
+
+int event_read(Rt *r)
+{
+    (void)r;
+    return C6_CO_EV_READ;
+}
+
+int event_write(Rt *r)
+{
+    (void)r;
+    return C6_CO_EV_WRITE;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "art：驱动任务与统计" {
+    Rt rt = { 0 };
+    int fds[2] = { -1, -1 };
+    char buf[16] = { 0 };
+    struct aio_read_task *t = 0;
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe 失败");
+    if (rt.event_read() != 1 || rt.event_write() != 2)
+        return err(2, "事件位应该是 1 与 2");
+    write(fds[1], "data", 4);
+    t = aio_read(fds[0], buf, (int)sizeof buf);
+    if (rt.wait(t) != 0)
+        return err(3, "wait 应该返回 0");
+    if (t->val != 4)
+        return err(4, "任务结果不对");
+    if (rt.waits() != 1 || rt.last_rc() != 0 || rt.ok() != 1)
+        return err(5, "统计不对");
+    if (rt.destroy(t) != 1 || rt.destroys() != 1)
+        return err(6, "destroy 失败");
+    /* run：co 出去的顶层任务 */
+    write(fds[1], "0123456789", 10);
+    co aio_read(fds[0], buf, (int)sizeof buf);
+    if (rt.run() != 0)
+        return err(7, "run 不该有失败");
+    if (rt.runs() != 1)
+        return err(8, "runs 计数不对");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "art：状态查询与边界" {
+    Rt rt = { 0 };
+    int fds[2] = { -1, -1 };
+    char buf[8] = { 0 };
+    struct aio_read_task *t = 0;
+
+    if (rt.state(0) != -1 || rt.kind(0) != -1)
+        return err(9, "空任务应该 -1");
+    if (rt.destroy(0) != -1 || rt.wait(0) != -1 || rt.run() != 0)
+        return err(10, "空参数的处理不对");
+    if (pipe(fds) != 0)
+        return err(11, "pipe 失败");
+    write(fds[1], "z", 1);
+    t = aio_read(fds[0], buf, (int)sizeof buf);
+    /* 建好但没跑：state 是挂起值（0 / 非负）；跑完变成 -1 */
+    if (rt.state(t) < 0 || rt.kind(t) < 0)
+        return err(12, "任务建好后状态应该是非负的挂起值");
+    if (rt.wait(t) != 0)
+        return err(15, "wait 失败");
+    if (rt.state(t) >= 0)
+        return err(16, "跑完之后 state 应该变成 -1");
+    rt.destroy(t);
+    close(fds[0]);
+    close(fds[1]);
+    if (rt.waits() != 1 || rt.destroys() != 1 || rt.ok() != 1)
+        return err(13, "统计不对");
+    if (rt.event_read() != C6_CO_EV_READ || rt.event_write() != C6_CO_EV_WRITE)
+        return err(14, "事件位应该与运行时一致");
+}

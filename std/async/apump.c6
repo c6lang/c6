@@ -1,0 +1,218 @@
+/* std/async/apump：语言级 async 的流式转发（fd→fd、限量、按行、通道→fd）。
+ *
+ *     import std.async.apump;
+ *
+ *     task t = apump_fd(src, dst, buf, sizeof buf);   // 把 src 拷到 dst 直到 EOF
+ *     __c6_co_wait(t);
+ *     int copied = t->val;
+ *
+ * 这一层把 `std.async.aio` 的读写原语与 `std.async.achan` 的通道拼成常见的数据通路：
+ * 代理转发、日志搬运、协议管道。每个函数都是 `async`，体内 `await` 读写点，所以一条
+ * 转发链可以同时挂着很多路而互不阻塞（合作式，靠 `await c6_io` 让出）。
+ *
+ * 约定：
+ *
+ * - `await apump_fd(rfd, wfd, buf, cap)` 读到 EOF 或出错，返回拷贝的字节数
+ *   （-1 表示出错）；缓冲 `cap` 建议 ≥ 512；
+ * - `await apump_n(rfd, wfd, buf, cap, limit)` 最多拷 `limit` 字节，返回实际字节数；
+ * - `await apump_lines(rfd, wfd, buf, cap, maxlines)` 按行搬运（每行补一个 `\n`），
+ *   返回搬运的**行数**；`maxlines <= 0` 表示搬到 EOF；
+ * - `await apump_chan(ch, wfd, buf, cap, maxmsgs)` 从 `std.async.achan` 通道里搬
+ *   `maxmsgs` 条消息（`<= 0` 表示搬到通道 EOF），返回搬运的字节总数；
+ * - 参数错（fd < 0、空缓冲、`cap` 太小）返回 -1；
+ * - 这些函数是 async，**不能**当方法（编译器限制），所以通道参数写成 `void *`。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.async.apump;
+import std.core.types;
+import std.text.str;
+import std.async.aio;
+import std.async.achan;
+
+async int apump_fd(int rfd, int wfd, char *buf, int cap)
+{
+    int total = 0;
+    int n = 0;
+
+    if (rfd < 0 || wfd < 0 || !buf || cap <= 0)
+        return -1;
+    while (1) {
+        n = await aio_read(rfd, buf, cap);
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            break;
+        if (await aio_write_all(wfd, buf, n) != n)
+            return -1;
+        total += n;
+    }
+    return total;
+}
+
+async int apump_n(int rfd, int wfd, char *buf, int cap, int limit)
+{
+    int total = 0;
+    int n = 0;
+    int want = 0;
+
+    if (rfd < 0 || wfd < 0 || !buf || cap <= 0 || limit < 0)
+        return -1;
+    while (total < limit) {
+        want = limit - total < cap ? limit - total : cap;
+        n = await aio_read(rfd, buf, want);
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            break;
+        if (await aio_write_all(wfd, buf, n) != n)
+            return -1;
+        total += n;
+    }
+    return total;
+}
+
+async int apump_lines(int rfd, int wfd, char *buf, int cap, int maxlines)
+{
+    int lines = 0;
+    int n = 0;
+    int eof = 0;
+
+    if (rfd < 0 || wfd < 0 || !buf || cap < 2)
+        return -1;
+    while (maxlines <= 0 || lines < maxlines) {
+        eof = 0;
+        n = await aio_read_line_x(rfd, buf, cap, &eof);
+        if (n < 0)
+            return -1;
+        if (eof)
+            break;                      /* 流结束（空行不算 EOF） */
+        if (await aio_write_all(wfd, buf, n) != n)
+            return -1;
+        if (await aio_write_all(wfd, "\n", 1) != 1)
+            return -1;
+        lines++;
+    }
+    return lines;
+}
+
+async int apump_chan(void *vp, int wfd, char *buf, int cap, int maxmsgs)
+{
+    int msgs = 0;
+    int total = 0;
+    int n = 0;
+
+    if (!vp || wfd < 0 || !buf || cap <= 0)
+        return -1;
+    while (maxmsgs <= 0 || msgs < maxmsgs) {
+        n = await achan_recv(vp, buf, cap);
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            break;                      /* 通道 EOF */
+        if (await aio_write_all(wfd, buf, n) != n)
+            return -1;
+        total += n;
+        msgs++;
+    }
+    return total;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "apump：fd 之间的搬运" {
+    int a[2] = { -1, -1 };
+    int b[2] = { -1, -1 };
+    char buf[32] = { 0 };
+    char out[64] = { 0 };
+    struct apump_fd_task *t = 0;
+    struct apump_n_task *u = 0;
+
+    if (pipe(a) != 0 || pipe(b) != 0)
+        return err(1, "pipe 失败");
+    write(a[1], "hello world", 11);
+    close(a[1]);
+    t = apump_fd(a[0], b[1], buf, (int)sizeof buf);
+    if (__c6_co_wait(t) != 0 || t->val != 11)
+        return err(2, "应该搬运 11 字节");
+    __c6_co_destroy(t);
+    if (read(b[0], out, (int)sizeof out) != 11 || memcmp(out, "hello world", 11) != 0)
+        return err(3, "搬运的内容不对");
+    /* 限量搬运（重开一对 pipe，写端要活着，且要等任务跑完再关 fd） */
+    {
+        int c[2] = { -1, -1 };
+
+        if (pipe(c) != 0)
+            return err(15, "第二个 pipe 失败");
+        write(c[1], "0123456789", 10);
+        u = apump_n(c[0], b[1], buf, (int)sizeof buf, 4);
+        if (__c6_co_wait(u) != 0 || u->val != 4)
+            return err(4, "限量搬运只该搬 4 字节");
+        __c6_co_destroy(u);
+        memset(out, 0, sizeof out);
+        if (read(b[0], out, (int)sizeof out) != 4 || memcmp(out, "0123", 4) != 0)
+            return err(5, "限量搬运的内容不对");
+        close(c[0]);
+        close(c[1]);
+    }
+    close(a[0]);
+    close(b[0]);
+    close(b[1]);
+    /* 参数错 */
+    t = apump_fd(-1, b[1], buf, (int)sizeof buf);
+    if (__c6_co_wait(t) != 0 || t->val != -1)
+        return err(6, "非法 fd 应该 -1");
+    __c6_co_destroy(t);
+}
+
+test "apump：按行搬运与通道搬运" {
+    int a[2] = { -1, -1 };
+    int b[2] = { -1, -1 };
+    char buf[32] = { 0 };
+    char out[64] = { 0 };
+    struct apump_lines_task *l = 0;
+    AChan ch = { 0 };
+    struct apump_chan_task *c = 0;
+    struct achan_send_task *s = 0;
+
+    if (pipe(a) != 0 || pipe(b) != 0)
+        return err(7, "pipe 失败");
+    write(a[1], "one\ntwo\nthree\n", 14);
+    close(a[1]);
+    l = apump_lines(a[0], b[1], buf, (int)sizeof buf, 2);
+    if (__c6_co_wait(l) != 0 || l->val != 2)
+        return err(8, "只该搬 2 行");
+    __c6_co_destroy(l);
+    memset(out, 0, sizeof out);
+    if (read(b[0], out, (int)sizeof out) != 8)
+        return err(9, "两行应该 8 字节");
+    if (memcmp(out, "one\ntwo\n", 8) != 0)
+        return err(10, "按行搬运的内容不对");
+    /* 通道 → fd */
+    if (ch.init() != 1)
+        return err(11, "通道 init 失败");
+    s = achan_send(&ch, "abc", 3);
+    __c6_co_wait(s);
+    __c6_co_destroy(s);
+    s = achan_send(&ch, "de", 2);
+    __c6_co_wait(s);
+    __c6_co_destroy(s);
+    c = apump_chan(&ch, b[1], buf, (int)sizeof buf, 2);
+    if (__c6_co_wait(c) != 0 || c->val != 5)
+        return err(12, "通道搬运应该 5 字节");
+    __c6_co_destroy(c);
+    memset(out, 0, sizeof out);
+    if (read(b[0], out, (int)sizeof out) != 5 || memcmp(out, "abcde", 5) != 0)
+        return err(13, "通道搬运的内容不对");
+    ch.close_chan();
+    close(a[0]);
+    close(b[0]);
+    close(b[1]);
+    l = apump_lines(-1, 1, buf, (int)sizeof buf, 0);
+    if (__c6_co_wait(l) != 0 || l->val != -1)
+        return err(14, "非法参数应该 -1");
+    __c6_co_destroy(l);
+}

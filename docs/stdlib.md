@@ -361,6 +361,11 @@
 | `std/core/polygon.c6` | `std.core.polygon` | 简单多边形（**方法**：`p.init`/`p.count`/`p.at`/`p.edge`/`p.signed_area`/`p.area`/`p.perimeter`/`p.is_convex`/`p.is_clockwise`/`p.contains`/`p.centroid`/`p.bbox`）：射线法判点内（边界算包含），面积加权形心，首尾重复点自动去掉 |
 | `std/core/segment.c6` | `std.core.segment` | 线段工具（**方法**：`s.intersect`/`s.length`/`s.midpoint`/`s.distance_to_point`/`s.project`/`s.contains_point`/`s.bbox`/`s.dx`/`s.dy`）：跨立实验 + 共线特判，`intersect` 返回 0/1/2（不相交/单点/共线重叠，重叠给中点） |
 | `std/core/closest.c6` | `std.core.closest` | 平面最近点对（**方法**：`c.compute`/`c.brute`/`c.distance`/`c.index_a`/`c.index_b`/`c.found`/`c.points`）：分治 O(n log n)（条带按 y 插入排序、每点最多看 7 个后继），`brute` 是 O(n²) 对拍版 |
+| `std/async/aio.c6` | `std.async.aio` | **语言级 async 的 I/O 原语**：`async int aio_wait/aio_read/aio_read_exact/aio_write_all/aio_read_line/aio_read_line_x`，体内全部是 `await c6_io(fd, ev)`；`async` 函数**不能**是方法（编译器限制：`'async' functions cannot be methods`），所以句柄类参数统一写成 `void *` |
+| `std/async/achan.c6` | `std.async.achan` | **async 通道**：`AChan`（方法 `init`/`init_pair`/`close_chan`/`rfd`/`wfd`/`maxmsg`/`sent`/`recv_count`/`bytes`）+ `async int achan_send(void *, …)`/`achan_recv(void *, …)`；pipe 上的「4 字节大端长度 + 载荷」帧，单帧上限 4000（留在 `PIPE_BUF` 内，多写方也原子），单消费者 |
+| `std/async/art.c6` | `std.async.art` | **运行时驱动**：`Rt`（方法 `wait`/`run`/`destroy`/`state`/`kind`/`waits`/`runs`/`destroys`/`last_rc`/`ok`/`event_read`/`event_write`）把 `__c6_co_wait`/`__c6_co_run`/`__c6_co_destroy`/`__c6_co_state` 包成方法并记统计；`state` 在任务结束后变 -1 |
+| `std/async/apump.c6` | `std.async.apump` | **流式转发**：`async int apump_fd/apump_n/apump_lines/apump_chan`（fd→fd 到 EOF、限量、按行补 `\n`、`AChan`→fd），由 aio 与 achan 组合而成，参数错一律 -1 |
+
 
 
 
@@ -506,6 +511,7 @@
 | `examples/stdgraph2.c6` | （无模块） | 第七十七批（图算法进阶）的拼装示例（`make std-graph2`）：Kruskal/Prim 互验、CLRS 最大流、Tarjan 分量、Kuhn 匹配 |
 | `examples/stdasync3.c6` | （无模块） | 第七十八批（co / async-await 框架）的拼装示例（`make std-async3`）：三种挂起点、宏式线性 await、结构化并发（含失败传播）、并发额度转交 |
 | `examples/stdgeo2.c6` | （无模块） | 第七十九批（计算几何）的拼装示例（`make std-geo2`）：凸包面积/周长/点内、凹多边形形心与边游标、线段相交/共线重叠/投影、最近点对分治 vs 暴力 |
+| `examples/stdasync4.c6` | （无模块） | 第八十批（语言级 async）的拼装示例（`make std-async4`）：`async`/`await` 的行读写、`AChan` 收发、`apump_fd` 转发、`Rt.wait`/`Rt.run` 驱动 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -716,6 +722,10 @@ std/core/hull.c6           24 test(s), 0 failure(s)
 std/core/polygon.c6        24 test(s), 0 failure(s)
 std/core/segment.c6        24 test(s), 0 failure(s)
 std/core/closest.c6        24 test(s), 0 failure(s)
+std/async/aio.c6           25 test(s), 0 failure(s)
+std/async/achan.c6         27 test(s), 0 failure(s)
+std/async/art.c6           27 test(s), 0 failure(s)
+std/async/apump.c6         29 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4322,6 +4332,27 @@ make std-geo2
 （2,2）、共线重叠段中点（3,0）与垂足参数；`Closest` 分治与暴力两种算法给出同一对
 （0 与 2，距离 √2）。
 
+### 集成示例：`examples/stdasync4.c6`
+
+```sh
+make std-async4
+```
+
+四节都是「建任务 → 驱动 → 看结果」：`aio_write_all` 写两行、`aio_read_line` 逐行读回
+（`alpha` / `beta`）；`achan_send`/`achan_recv` 传一条 `ping`（累计 1 帧 8 字节）；
+`apump_fd` 把 14 字节流搬过一对 pipe；`Rt.wait` 驱动一个读任务并查到 `state` 变 -1，
+再用 `co` + `Rt.run()` 跑一个顶层任务。
+
+### 语言级 async 的三条硬约束（写库时踩过）
+
+1. `async` 函数**不能是方法**：`async int f(Str *s)` 直接报
+   `'async' functions cannot be methods`。所以 async 函数的句柄参数写成 `void *`，
+   非 async 的辅助函数才用方法（`ch.init()`、`rt.wait(t)`）。
+2. `await` 只能出现在 `async` 函数体里，操作数只能是 async 调用或 `c6_io(fd, ev)`；
+   想在普通函数里发起任务就用 `task t = f(…)` 拿句柄，再交给 `__c6_co_wait`/`Rt.wait`。
+3. `c6_io` 只保证「fd 可读/可写」，不排队：同一个 fd 上只该有一个读任务、一个写任务。
+   行读要区分「空行」和「EOF」时用 `aio_read_line_x(…, &eof)`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4475,6 +4506,8 @@ make std-geo2
 * `make std-async3`：`examples/stdasync3.c6`，第七十八批（co / async-await 框架）模块的
   拼装示例（自带自检）。
 * `make std-geo2`：`examples/stdgeo2.c6`，第七十九批（计算几何）模块的拼装示例
+  （自带自检）。
+* `make std-async4`：`examples/stdasync4.c6`，第八十批（语言级 async）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

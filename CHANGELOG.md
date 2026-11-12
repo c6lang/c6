@@ -56,6 +56,14 @@
 
 ### 标准库
 
+- **标准库第八十批（语言级 async 的库支持）**：`std.async.aio`（`await c6_io` 之上的
+  `aio_wait`/`aio_read`/`aio_read_exact`/`aio_write_all`/`aio_read_line`）、
+  `std.async.achan`（`AChan` + `achan_send`/`achan_recv`，长度前缀帧）、
+  `std.async.art`（`Rt`：`__c6_co_wait`/`__c6_co_run` 的方法封装 + 统计）、
+  `std.async.apump`（fd→fd / 限量 / 按行 / 通道→fd 的 async 转发），
+  示例 `examples/stdasync4.c6`（`make std-async4`）。`async` 函数不能是方法，
+  故句柄参数为 `void *`。错误号段 `std.async.aio`=0x6149 … `std.async.apump`=0x614c。
+
 - **标准库第七十九批（计算几何）**：`std.core.hull`（Andrew 单调链凸包 + 面积/周长/
   点内）、`std.core.polygon`（简单多边形：面积/凸性/点内/形心/边游标）、
   `std.core.segment`（线段相交/共线重叠/点到线段距离/投影）、`std.core.closest`

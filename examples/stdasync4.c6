@@ -1,0 +1,151 @@
+/* examples/stdasync4.c6 —— 第八十批（语言级 async 关键字的库支持）的集成示例。
+ *
+ *     make std-async4
+ *
+ * 四节：aio（async 读写）、achan（async 通道）、apump（流式转发）、art（运行时驱动）。
+ * 全部用 c6 的 `async` / `await` / `task` / `co` 关键字，任务句柄交给 `__c6_co_wait`
+ * 或 `rt.wait` 驱动。
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+import std.core.types;
+import std.text.str;
+import std.async.aio;
+import std.async.achan;
+import std.async.apump;
+import std.async.art;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_aio(void)
+{
+    int fds[2] = { -1, -1 };
+    char buf[32] = { 0 };
+    struct aio_read_line_task *l = 0;
+    struct aio_write_all_task *w = 0;
+
+    printf("== aio\n");
+    if (pipe(fds) != 0) {
+        check(0, "pipe 失败");
+        return;
+    }
+    /* 写任务：把两行写进管道 */
+    w = aio_write_all(fds[1], "alpha\nbeta\n", 11);
+    check(__c6_co_wait(w) == 0 && w->val == 11, "写任务写了 11 字节");
+    __c6_co_destroy(w);
+    /* 读任务：逐行读出 */
+    l = aio_read_line(fds[0], buf, (int)sizeof buf);
+    check(__c6_co_wait(l) == 0 && l->val == 5, "第一行 5 字节");
+    printf("   第一行 %s\n", buf);
+    check(memcmp(buf, "alpha", 5) == 0, "第一行是 alpha");
+    __c6_co_destroy(l);
+    memset(buf, 0, sizeof buf);
+    l = aio_read_line(fds[0], buf, (int)sizeof buf);
+    check(__c6_co_wait(l) == 0 && l->val == 4, "第二行 4 字节");
+    printf("   第二行 %s\n", buf);
+    check(memcmp(buf, "beta", 4) == 0, "第二行是 beta");
+    __c6_co_destroy(l);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+static void do_achan(void)
+{
+    AChan ch = { 0 };
+    char buf[32] = { 0 };
+    struct achan_send_task *s = 0;
+    struct achan_recv_task *r = 0;
+
+    printf("== achan\n");
+    check(ch.init() == 1, "init");
+    s = achan_send(&ch, "ping", 4);
+    check(__c6_co_wait(s) == 0 && s->val == 4, "send 4 字节");
+    __c6_co_destroy(s);
+    r = achan_recv(&ch, buf, (int)sizeof buf);
+    check(__c6_co_wait(r) == 0 && r->val == 4, "recv 4 字节");
+    __c6_co_destroy(r);
+    printf("   通道收到 %s（累计 %ld 帧 / %ld 字节）\n", buf, ch.sent(),
+           ch.bytes());
+    check(memcmp(buf, "ping", 4) == 0, "内容一致");
+    check(ch.sent() == 1 && ch.recv_count() == 1, "收发计数各 1");
+    ch.close_chan();
+}
+
+static void do_apump(void)
+{
+    int a[2] = { -1, -1 };
+    int b[2] = { -1, -1 };
+    char buf[32] = { 0 };
+    char out[32] = { 0 };
+    struct apump_fd_task *t = 0;
+
+    printf("== apump\n");
+    if (pipe(a) != 0 || pipe(b) != 0) {
+        check(0, "pipe 失败");
+        return;
+    }
+    write(a[1], "streaming data", 14);
+    close(a[1]);
+    t = apump_fd(a[0], b[1], buf, (int)sizeof buf);
+    check(__c6_co_wait(t) == 0 && t->val == 14, "转发 14 字节");
+    __c6_co_destroy(t);
+    read(b[0], out, (int)sizeof out);
+    printf("   转发结果 %s\n", out);
+    check(memcmp(out, "streaming data", 14) == 0, "内容一致");
+    close(a[0]);
+    close(b[0]);
+    close(b[1]);
+}
+
+static void do_art(void)
+{
+    Rt rt = { 0 };
+    int fds[2] = { -1, -1 };
+    char buf[16] = { 0 };
+    struct aio_read_task *t = 0;
+
+    printf("== art\n");
+    check(rt.event_read() == 1 && rt.event_write() == 2, "事件位 1/2");
+    if (pipe(fds) != 0) {
+        check(0, "pipe 失败");
+        return;
+    }
+    write(fds[1], "task!", 5);
+    t = aio_read(fds[0], buf, (int)sizeof buf);
+    check(rt.wait(t) == 0 && t->val == 5, "rt.wait 驱动任务");
+    printf("   读到 %s（wait %ld 次，state %d）\n", buf, rt.waits(), rt.state(t));
+    check(rt.ok() == 1 && rt.waits() == 1, "统计 ok");
+    rt.destroy(t);
+    check(rt.destroys() == 1, "destroy 计数");
+    /* co 出去的顶层任务交给 rt.run() */
+    write(fds[1], "abc", 3);
+    co aio_read(fds[0], buf, (int)sizeof buf);
+    check(rt.run() == 0, "run 无失败");
+    check(rt.runs() == 1, "runs 计数");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+int main(void)
+{
+    do_aio();
+    do_achan();
+    do_apump();
+    do_art();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
