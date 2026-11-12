@@ -357,6 +357,11 @@
 | `std/async/await.c6` | `std.async.await` | async/await 宏（在 co 之上）：`AW_BEGIN(s)` / `AW_SLEEP(s,aw,ms)` / `AW_WAIT(s,aw,f)` / `AW_YIELD(s,aw,v)` / `AW_END(s)` / `AW_IN(aw)`，靠 `pc` + `__LINE__` 把状态机藏进宏里，代码保持线性 |
 | `std/async/scope.c6` | `std.async.scope` | 结构化并发（**方法**：`sc.init`/`sc.spawn`/`sc.cancel`/`sc.fail`/`sc.join`/`sc.running`/`sc.completed`/`sc.spawned`/`sc.reset`）：一批子协程同生共死，`fail(code)` 立刻取消其余，最后一个收尾时 `join` 的 Future 结算（正常给完成数、失败给错误码、取消给 -1） |
 | `std/async/limiter.c6` | `std.async.limiter` | 并发额度（**方法**：`l.init`/`l.acquire`/`l.try_acquire`/`l.release`/`l.used`/`l.waiting`/`l.queued_at`/`l.granted`/`l.denied`/`l.reset`）：最多 N 个在飞，超出排队，释放时把额度**转交**给队头（占用数不变） |
+| `std/core/hull.c6` | `std.core.hull` | 二维凸包（**方法**：`h.convex`/`h.size`/`h.point_at`/`h.area`/`h.perimeter`/`h.contains`）：Andrew 单调链，排序缓冲与凸包缓冲**分开**（上凸壳那一趟会往前写，复用同一块会把还没读的点覆盖）；顶点逆时针、去共线点 |
+| `std/core/polygon.c6` | `std.core.polygon` | 简单多边形（**方法**：`p.init`/`p.count`/`p.at`/`p.edge`/`p.signed_area`/`p.area`/`p.perimeter`/`p.is_convex`/`p.is_clockwise`/`p.contains`/`p.centroid`/`p.bbox`）：射线法判点内（边界算包含），面积加权形心，首尾重复点自动去掉 |
+| `std/core/segment.c6` | `std.core.segment` | 线段工具（**方法**：`s.intersect`/`s.length`/`s.midpoint`/`s.distance_to_point`/`s.project`/`s.contains_point`/`s.bbox`/`s.dx`/`s.dy`）：跨立实验 + 共线特判，`intersect` 返回 0/1/2（不相交/单点/共线重叠，重叠给中点） |
+| `std/core/closest.c6` | `std.core.closest` | 平面最近点对（**方法**：`c.compute`/`c.brute`/`c.distance`/`c.index_a`/`c.index_b`/`c.found`/`c.points`）：分治 O(n log n)（条带按 y 插入排序、每点最多看 7 个后继），`brute` 是 O(n²) 对拍版 |
+
 
 
 
@@ -500,6 +505,7 @@
 | `examples/stdsearch2.c6` | （无模块） | 第七十六批（检索与关键词）的拼装示例（`make std-search2`）：倒排索引单词/AND 查询、BM25 长短文档对比、词频 Top-3、词干化五例 |
 | `examples/stdgraph2.c6` | （无模块） | 第七十七批（图算法进阶）的拼装示例（`make std-graph2`）：Kruskal/Prim 互验、CLRS 最大流、Tarjan 分量、Kuhn 匹配 |
 | `examples/stdasync3.c6` | （无模块） | 第七十八批（co / async-await 框架）的拼装示例（`make std-async3`）：三种挂起点、宏式线性 await、结构化并发（含失败传播）、并发额度转交 |
+| `examples/stdgeo2.c6` | （无模块） | 第七十九批（计算几何）的拼装示例（`make std-geo2`）：凸包面积/周长/点内、凹多边形形心与边游标、线段相交/共线重叠/投影、最近点对分治 vs 暴力 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -706,6 +712,10 @@ std/async/co.c6            39 test(s), 0 failure(s)
 std/async/await.c6         41 test(s), 0 failure(s)
 std/async/scope.c6         41 test(s), 0 failure(s)
 std/async/limiter.c6       24 test(s), 0 failure(s)
+std/core/hull.c6           24 test(s), 0 failure(s)
+std/core/polygon.c6        24 test(s), 0 failure(s)
+std/core/segment.c6        24 test(s), 0 failure(s)
+std/core/closest.c6        24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4301,6 +4311,17 @@ make std-async3
 `Scope` 起三个子协程、打印 `completed=3`、再用 `fail(-5)` 演示「一个失败全体收尾」；
 `Limiter` 用 2 个额度 + 2 个排队演示额度转交。
 
+### 集成示例：`examples/stdgeo2.c6`
+
+```sh
+make std-geo2
+```
+
+四节都用方法：`Hull` 从 6 个点里算出 4 个顶点的凸包（面积/周长都是 16，打印第 3 个
+顶点）；`Poly` 用凹的 L 形算面积 12、判非凸、求形心与逐条边；`Seg` 求对角线交点
+（2,2）、共线重叠段中点（3,0）与垂足参数；`Closest` 分治与暴力两种算法给出同一对
+（0 与 2，距离 √2）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4453,6 +4474,8 @@ make std-async3
   （自带自检）。
 * `make std-async3`：`examples/stdasync3.c6`，第七十八批（co / async-await 框架）模块的
   拼装示例（自带自检）。
+* `make std-geo2`：`examples/stdgeo2.c6`，第七十九批（计算几何）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

@@ -2535,6 +2535,32 @@ executor（39 条）、await/scope 依赖同一串再加 co（各 41 条）、li
 验收：`make stdtest`（325 个模块、0 failure）、`make std-async3`（24 条自检全过）、
 `make check-all`。
 
+### 11.91 标准库第七十九批（hull / polygon / segment / closest：计算几何）
+
+第七十九批做「计算几何」：凸包、简单多边形、线段运算与最近点对。
+`geometry.c6` 只有 `Vec2`/`Vec3` 的向量运算，这批补的是**几何算法**。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.hull` | 凸包 | Andrew 单调链：排序副本与凸包输出**必须分开**（上凸壳从右往左扫时 `out[k]` 会写到还没读的位置，第一版复用同一块缓冲，结果全错）；`hull_buf` 要 `2n`，最终结果压在开头 `size()` 个；共线点按 `cross <= 0` 剔除 |
+| `std.core.polygon` | 多边形 | 有向面积定方向、射线法判点内（边界单独判并算包含）、面积加权形心（退化时按顶点均值）；`edge(i, …)` 是游标式接口，最后一条边自动接回首点 |
+| `std.core.segment` | 线段 | 跨立实验 + 共线特判：返回 0/1/2，共线重叠给重叠段中点；`project` 的参数夹到 `[0,1]`，所以 `distance_to_point` 是到**线段**的距离；退化线段（起点=终点）单独处理 |
+| `std.core.closest` | 最近点对 | 分治 + 条带按 y 插入排序，每个点最多看 7 个后继；条带缓冲用 `buf + n + lo`（每个递归帧用自己那一段，父帧在子帧返回后才写，互不干扰）；`brute` 留作对拍 |
+
+踩到的坑：`segment` 的测试里我把 (1,1)-(3,1) 当成「与对角线平行且不相交」，其实它的
+起点就在对角线上——测试自己错了，改成 (1,0)-(4,3)；`closest` 的字段 `found` 与
+`found()` 方法同名（`function pointer expected`），改名 `ok`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.hull`=0x6145、
+`std.core.polygon`=0x6146、`std.core.segment`=0x6147、`std.core.closest`=0x6148；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-geo2` 与 `STD_GEO2_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条，另需 `-lm`）。示例 `examples/stdgeo2.c6` 四节（23 条自检）。
+
+验收：`make stdtest`（329 个模块、0 failure）、`make std-geo2`（23 条自检全过）、
+`make check-all`。
+
+
 
 
 

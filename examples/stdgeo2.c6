@@ -1,0 +1,130 @@
+/* examples/stdgeo2.c6 —— 第七十九批（计算几何）的集成示例。
+ *
+ *     make std-geo2
+ *
+ * 四节：凸包（面积/周长/点内）、多边形（凹形、形心、边游标）、线段（相交/距离）、
+ * 最近点对（分治与暴力对拍）。
+ */
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.hull;
+import std.core.polygon;
+import std.core.segment;
+import std.core.closest;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_hull(void)
+{
+    HullPt pts[6] = { { 0, 0 }, { 4, 0 }, { 4, 4 }, { 0, 4 }, { 2, 2 }, { 1, 3 } };
+    HullPt sbuf[6] = { { 0, 0 } };
+    HullPt hbuf[12] = { { 0, 0 } };
+    Hull h = { 0 };
+    double x = 0.0, y = 0.0;
+
+    printf("== hull\n");
+    check(h.convex(pts, 6, sbuf, hbuf) == 4, "6 个点里 4 个是凸包顶点");
+    printf("   顶点 %d 个，面积 %.1f，周长 %.1f\n", h.size(), h.area(),
+           h.perimeter());
+    check(fabs(h.area() - 16.0) < 1e-9, "面积 16");
+    check(fabs(h.perimeter() - 16.0) < 1e-9, "周长 16");
+    h.point_at(2, &x, &y);
+    printf("   第 3 个顶点 (%.0f, %.0f)\n", x, y);
+    check(x == 4.0 && y == 4.0, "第 3 个顶点是 (4,4)");
+    check(h.contains(1, 3) == 1 && h.contains(2.5, 2.5) == 1, "内部点包含");
+    check(h.contains(4.1, 2) == 0, "边界外不包含");
+}
+
+static void do_polygon(void)
+{
+    PolyPt pts[6] = { { 0, 0 }, { 4, 0 }, { 4, 2 }, { 2, 2 }, { 2, 4 }, { 0, 4 } };
+    PolyPt buf[6] = { { 0, 0 } };
+    Poly p = { 0 };
+    double cx = 0.0, cy = 0.0;
+    double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
+    int i = 0;
+
+    printf("== polygon\n");
+    check(p.init(pts, 6, buf) == 6, "L 形 6 个顶点");
+    printf("   面积 %.1f，周长 %.1f，凸？%d\n", p.area(), p.perimeter(),
+           p.is_convex());
+    check(fabs(p.area() - 12.0) < 1e-9, "L 形面积 12");
+    check(p.is_convex() == 0, "L 形不凸");
+    check(p.is_clockwise() == 0, "这组点是逆时针");
+    p.centroid(&cx, &cy);
+    printf("   形心 (%.3f, %.3f)\n", cx, cy);
+    check(cx > 0 && cx < 4 && cy > 0 && cy < 4, "形心在包围盒内");
+    check(p.contains(1, 1) == 1 && p.contains(3, 3) == 0, "凹口判断");
+    for (i = 0; i < p.count(); i++) {
+        p.edge(i, &x1, &y1, &x2, &y2);
+        if (i == 0)
+            check(x1 == 0 && y1 == 0 && x2 == 4 && y2 == 0, "第 0 条边");
+    }
+}
+
+static void do_segment(void)
+{
+    Seg a = { 0, 0, 4, 4 };
+    Seg b = { 0, 4, 4, 0 };
+    Seg c = { 0, 0, 4, 0 };
+    Seg d = { 2, 0, 6, 0 };
+    SegHit hit = { 0, 0, 0 };
+    double t = 0.0, x = 0.0, y = 0.0;
+
+    printf("== segment\n");
+    check(a.intersect(&b, &hit) == 1, "对角线相交");
+    printf("   交点 (%.1f, %.1f)，kind=%d\n", hit.x, hit.y, hit.kind);
+    check(fabs(hit.x - 2.0) < 1e-9 && fabs(hit.y - 2.0) < 1e-9, "交于 (2,2)");
+    check(c.intersect(&d, &hit) == 2, "共线重叠");
+    printf("   重叠段中点 (%.1f, %.1f)\n", hit.x, hit.y);
+    check(fabs(hit.x - 3.0) < 1e-9, "重叠段中点 x=3");
+    check(fabs(a.distance_to_point(0, 4) - 2.0 * sqrt(2.0)) < 1e-9,
+          "到对角线距离 2√2");
+    c.project(2, 5, &t, &x, &y);
+    printf("   投影参数 t=%.2f，垂足 (%.1f, %.1f)\n", t, x, y);
+    check(fabs(t - 0.5) < 1e-12 && fabs(y) < 1e-12, "垂足 (2,0)");
+}
+
+static void do_closest(void)
+{
+    CpPt pts[6] = { { 0, 0, 0 }, { 5, 0, 0 }, { 1, 1, 0 },
+                    { 10, 10, 0 }, { 4, 4, 0 }, { 2, 9, 0 } };
+    CpPt buf[12] = { { 0, 0, 0 } };
+    Closest c = { 0 };
+    Closest b = { 0 };
+
+    printf("== closest\n");
+    check(c.compute(pts, 6, buf) == 1, "分治求解");
+    b.brute(pts, 6);
+    printf("   分治 %.6f（%d-%d） vs 暴力 %.6f（%d-%d）\n", c.distance(),
+           c.index_a(), c.index_b(), b.distance(), b.index_a(), b.index_b());
+    check(fabs(c.distance() - sqrt(2.0)) < 1e-12, "最近距离 √2");
+    check(c.index_a() == 0 && c.index_b() == 2, "最近对是 0 与 2");
+    check(fabs(c.distance() - b.distance()) < 1e-12, "两种算法一致");
+}
+
+int main(void)
+{
+    do_hull();
+    do_polygon();
+    do_segment();
+    do_closest();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

@@ -1,0 +1,263 @@
+/* std/core/closest：平面最近点对（分治 O(n log n)，返回距离与两个下标）。
+ *
+ *     import std.core.closest;
+ *
+ *     CpPt pts[4] = { { 0, 0, 0 }, { 5, 0, 1 }, { 1, 1, 2 }, { 10, 10, 3 } };
+ *     CpPt buf[8] = { { 0, 0, 0 } };
+ *     Closest c = { 0 };
+ *     c.compute(pts, 4, buf);          // 方法：compute / brute / distance
+ *     c.distance();                     // 1.4142…（(0,0)-(1,1)）
+ *     c.index_a(); c.index_b();         // 原始下标 0 与 2
+ *
+ * 分治：按 x 排序后对半切，左右各求一次，再检查「跨中线、x 距离小于当前最优」的
+ * 条带（strip）——条带里按 y 排序后每个点只需要看后面最多 7 个点，所以总复杂度
+ * O(n log n)。
+ *
+ * 约定：
+ *
+ * - `c.compute(pts, n, buf)`：`buf` 是 `2 * n` 个 `CpPt`（排序副本 + 条带区），
+ *   返回最近点对的距离；`n < 2` 返回 -1（`c.found()` 为 0）；
+ * - `c.brute(pts, n)` 是 O(n²) 的暴力版（小数据、对拍用），返回同上；
+ * - `c.distance()` 距离，`c.index_a()`/`c.index_b()` 两个点**原始下标**
+ *   （`index_a < index_b`），`c.found()` 是否找到了点对，`c.points()` 点数；
+ * - 输入点用 `CpPt.x/.y` 给坐标，`.id` 由 `compute` 覆盖成原始下标（可以给 0）；
+ * - 有重叠点时距离为 0；需要 `-lm`。
+ */
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+module std.core.closest;
+import std.core.types;
+import std.text.str;
+
+struct CpPt {
+    double x;
+    double y;
+    int id;
+};
+
+struct Closest {
+    double best;
+    int ia;
+    int ib;
+    int n;
+    int ok;         /* 字段名避开 found() 方法 */
+};
+
+static int cp_cmp(const void *a, const void *b)
+{
+    const CpPt *p = (const CpPt *)a;
+    const CpPt *q = (const CpPt *)b;
+
+    if (p->x < q->x)
+        return -1;
+    if (p->x > q->x)
+        return 1;
+    if (p->y < q->y)
+        return -1;
+    if (p->y > q->y)
+        return 1;
+    return 0;
+}
+
+double distance(Closest *c)
+{
+    if (!c || !c->ok)
+        return -1.0;
+    return c->best;
+}
+
+int index_a(Closest *c)
+{
+    return c && c->ok ? c->ia : -1;
+}
+
+int index_b(Closest *c)
+{
+    return c && c->ok ? c->ib : -1;
+}
+
+int found(Closest *c)
+{
+    return c ? c->ok : 0;
+}
+
+int points(Closest *c)
+{
+    return c ? c->n : 0;
+}
+
+static void cl_update(Closest *c, CpPt a, CpPt b)
+{
+    double dx = a.x - b.x, dy = a.y - b.y;
+    double d = sqrt(dx * dx + dy * dy);
+
+    if (d < c->best) {
+        c->best = d;
+        c->ia = a.id < b.id ? a.id : b.id;
+        c->ib = a.id < b.id ? b.id : a.id;
+        c->ok = 1;
+    }
+}
+
+static void cl_rec(Closest *c, CpPt *p, int lo, int hi, CpPt *strip)
+{
+    int i = 0, j = 0, k = 0, mid = 0;
+    double midx = 0.0;
+
+    if (hi - lo <= 3) {
+        for (i = lo; i < hi; i++) {
+            for (j = i + 1; j < hi; j++)
+                cl_update(c, p[i], p[j]);
+        }
+        return;
+    }
+    mid = (lo + hi) / 2;
+    midx = p[mid].x;
+    cl_rec(c, p, lo, mid, strip);
+    cl_rec(c, p, mid, hi, strip);
+    /* 条带：与中线 x 距离小于当前最优的点 */
+    for (i = lo; i < hi; i++) {
+        if (fabs(p[i].x - midx) < c->best)
+            strip[k++] = p[i];
+    }
+    /* 按 y 插入排序（条带通常很短） */
+    for (i = 1; i < k; i++) {
+        CpPt cur = strip[i];
+
+        for (j = i - 1; j >= 0 && strip[j].y > cur.y; j--)
+            strip[j + 1] = strip[j];
+        strip[j + 1] = cur;
+    }
+    for (i = 0; i < k; i++) {
+        for (j = i + 1; j < k && (strip[j].y - strip[i].y) < c->best; j++)
+            cl_update(c, strip[i], strip[j]);
+    }
+}
+
+int compute(Closest *c, const CpPt *pts, int n, void *buf)
+{
+    CpPt *p = 0;
+    CpPt *strip = 0;
+    int i = 0;
+
+    if (!c || !pts || n < 0 || !buf)
+        return -1;
+    memset(c, 0, sizeof *c);
+    c->best = HUGE_VAL;
+    c->n = n;
+    if (n < 2)
+        return -1;
+    p = (CpPt *)buf;
+    strip = p + n;
+    memcpy(buf, pts, sizeof(CpPt) * (size_t)n);
+    for (i = 0; i < n; i++)
+        p[i].id = i;
+    qsort(buf, (size_t)n, sizeof(CpPt), cp_cmp);
+    cl_rec(c, p, 0, n, strip);
+    return c->ok ? 1 : -1;
+}
+
+int brute(Closest *c, const CpPt *pts, int n)
+{
+    int i = 0, j = 0;
+
+    if (!c || !pts || n < 0)
+        return -1;
+    memset(c, 0, sizeof *c);
+    c->best = HUGE_VAL;
+    c->n = n;
+    if (n < 2)
+        return -1;
+    for (i = 0; i < n; i++) {
+        for (j = i + 1; j < n; j++) {
+            double dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y;
+            double d = sqrt(dx * dx + dy * dy);
+
+            if (d < c->best) {
+                c->best = d;
+                c->ia = i < j ? i : j;
+                c->ib = i < j ? j : i;
+                c->ok = 1;
+            }
+        }
+    }
+    return c->ok ? 1 : -1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "closest：分治与暴力对拍" {
+    CpPt pts[6] = { { 0, 0, 0 }, { 5, 0, 0 }, { 1, 1, 0 },
+                    { 10, 10, 0 }, { 4, 4, 0 }, { 2, 9, 0 } };
+    CpPt buf[12] = { { 0, 0, 0 } };
+    Closest c = { 0 };
+    Closest b = { 0 };
+
+    if (c.compute(pts, 6, buf) != 1)
+        return err(1, "compute 失败");
+    if (!c.found() || c.points() != 6)
+        return err(2, "found/points 不对");
+    if (fabs(c.distance() - sqrt(2.0)) > 1e-12)
+        return err(3, "最近距离应该是 √2");
+    if (c.index_a() != 0 || c.index_b() != 2)
+        return err(4, "最近点对应该是 0 与 2");
+    /* 与暴力版对拍 */
+    b.brute(pts, 6);
+    if (fabs(b.distance() - c.distance()) > 1e-12)
+        return err(5, "分治与暴力结果不一致");
+    if (b.index_a() != c.index_a() || b.index_b() != c.index_b())
+        return err(6, "分治与暴力的下标不一致");
+}
+
+test "closest：重复点、少量点与边界" {
+    /* 重复点 → 距离 0 */
+    {
+        CpPt pts[3] = { { 1, 1, 0 }, { 4, 4, 0 }, { 1, 1, 0 } };
+        CpPt buf[6] = { { 0, 0, 0 } };
+        Closest c = { 0 };
+
+        if (c.compute(pts, 3, buf) != 1 || c.distance() != 0.0)
+            return err(7, "重复点距离应该是 0");
+        if (c.index_a() != 0 || c.index_b() != 2)
+            return err(8, "重复点的下标不对");
+    }
+    /* 两个点 */
+    {
+        CpPt pts[2] = { { 0, 0, 0 }, { 3, 4, 0 } };
+        CpPt buf[4] = { { 0, 0, 0 } };
+        Closest c = { 0 };
+
+        if (c.compute(pts, 2, buf) != 1 || fabs(c.distance() - 5.0) > 1e-12)
+            return err(9, "两点距离应该是 5");
+    }
+    /* 点数不足 */
+    {
+        CpPt pts[1] = { { 0, 0, 0 } };
+        CpPt buf[2] = { { 0, 0, 0 } };
+        Closest c = { 0 };
+
+        if (c.compute(pts, 1, buf) != -1 || c.found() != 0)
+            return err(10, "一个点应该 -1");
+        if (c.distance() != -1.0 || c.index_a() != -1)
+            return err(11, "没有点对时应该 -1");
+    }
+    /* 共线密集点（分治的经典坏例子，条带里点很多） */
+    {
+        CpPt pts[9] = { { 0, 0, 0 }, { 1, 0, 0 }, { 2, 0, 0 }, { 3, 0, 0 },
+                        { 4, 0, 0 }, { 5, 0, 0 }, { 6, 0, 0 }, { 7, 0, 0 },
+                        { 8, 0, 0 } };
+        CpPt buf[18] = { { 0, 0, 0 } };
+        Closest c = { 0 };
+
+        if (c.compute(pts, 9, buf) != 1 || fabs(c.distance() - 1.0) > 1e-12)
+            return err(12, "共线点最近距离应该是 1");
+        if (c.index_b() - c.index_a() != 1)
+            return err(13, "共线点的最近对应该是相邻下标");
+        if (compute((Closest *)0, pts, 9, buf) != -1)
+            return err(14, "空结构体指针应该 -1");
+    }
+}

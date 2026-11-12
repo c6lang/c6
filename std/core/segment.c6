@@ -1,0 +1,335 @@
+/* std/core/segment：线段相交、点到线段距离、投影参数（2D 基础几何）。
+ *
+ *     import std.core.segment;
+ *
+ *     Seg a = { 0, 0, 4, 4 };
+ *     Seg b = { 0, 4, 4, 0 };
+ *     SegHit hit = { 0, 0, 0 };
+ *     a.intersect(&b, &hit);          // 1（相交），hit.x/hit.y = (2,2)
+ *     a.distance_to_point(0, 4);      // 2.828…（到线段而不是直线的距离）
+ *     a.project(2, 0, &t, &x, &y);    // 垂足参数 t=0.5 → (2,2)
+ *
+ * 相交用「跨立实验」（两条线段互相跨过对方所在直线）+ 共线特判：返回 1 表示单点相交、
+ * 2 表示共线重叠（`hit.x/hit.y` 给重叠段的中点）、0 表示不相交。
+ *
+ * 约定：
+ *
+ * - `s.intersect(&other, &hit)`：`hit` 可以为 0（只问是否相交）；端点接触算 1；
+ * - `s.length()` 长度，`s.midpoint(&x, &y)` 中点，`s.dx()`/`s.dy()` 分量；
+ * - `s.distance_to_point(px, py)` 点到**线段**的距离（不是到直线的距离）；
+ * - `s.project(px, py, &t, &x, &y)`：最近点的参数 `t`（夹到 `[0,1]`）与坐标，
+ *   返回 1；`t = 0` 表示起点最近、`1` 表示终点最近；
+ * - `s.bbox(&x0, &y0, &x1, &y1)` 包围盒，`s.contains_point(px, py, eps)` 点是否在
+ *   线段上（距离 ≤ eps，默认 `1e-9`）；
+ * - 浮点容差 `1e-12`（叉积）/`1e-9`（距离），需要 `-lm`。
+ */
+#include <math.h>
+#include <string.h>
+
+module std.core.segment;
+import std.core.types;
+import std.text.str;
+
+struct Seg {
+    double x1;
+    double y1;
+    double x2;
+    double y2;
+};
+
+struct SegHit {
+    double x;
+    double y;
+    int kind;       /* 0 不相交、1 单点、2 共线重叠 */
+};
+
+double dx(Seg *s)
+{
+    return s ? s->x2 - s->x1 : 0.0;
+}
+
+double dy(Seg *s)
+{
+    return s ? s->y2 - s->y1 : 0.0;
+}
+
+double length(Seg *s)
+{
+    double ax = 0.0, ay = 0.0;
+
+    if (!s)
+        return 0.0;
+    ax = s->x2 - s->x1;
+    ay = s->y2 - s->y1;
+    return sqrt(ax * ax + ay * ay);
+}
+
+int midpoint(Seg *s, double *x, double *y)
+{
+    if (!s)
+        return -1;
+    if (x)
+        *x = 0.5 * (s->x1 + s->x2);
+    if (y)
+        *y = 0.5 * (s->y1 + s->y2);
+    return 1;
+}
+
+int bbox(Seg *s, double *x0, double *y0, double *x1, double *y1)
+{
+    if (!s)
+        return -1;
+    if (x0)
+        *x0 = s->x1 < s->x2 ? s->x1 : s->x2;
+    if (x1)
+        *x1 = s->x1 > s->x2 ? s->x1 : s->x2;
+    if (y0)
+        *y0 = s->y1 < s->y2 ? s->y1 : s->y2;
+    if (y1)
+        *y1 = s->y1 > s->y2 ? s->y1 : s->y2;
+    return 1;
+}
+
+static double sg_cross(double ax, double ay, double bx, double by, double cx,
+                       double cy)
+{
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+int project(Seg *s, double px, double py, double *t, double *x, double *y)
+{
+    double ax = 0.0, ay = 0.0, len2 = 0.0, k = 0.0;
+
+    if (!s)
+        return -1;
+    ax = s->x2 - s->x1;
+    ay = s->y2 - s->y1;
+    len2 = ax * ax + ay * ay;
+    if (len2 <= 0.0) {
+        if (t)
+            *t = 0.0;
+        if (x)
+            *x = s->x1;
+        if (y)
+            *y = s->y1;
+        return 1;
+    }
+    k = ((px - s->x1) * ax + (py - s->y1) * ay) / len2;
+    if (k < 0.0)
+        k = 0.0;
+    if (k > 1.0)
+        k = 1.0;
+    if (t)
+        *t = k;
+    if (x)
+        *x = s->x1 + k * ax;
+    if (y)
+        *y = s->y1 + k * ay;
+    return 1;
+}
+
+double distance_to_point(Seg *s, double px, double py)
+{
+    double x = 0.0, y = 0.0;
+
+    if (!s)
+        return -1.0;
+    project(s, px, py, 0, &x, &y);
+    return sqrt((px - x) * (px - x) + (py - y) * (py - y));
+}
+
+int contains_point(Seg *s, double px, double py, double eps)
+{
+    if (!s)
+        return 0;
+    if (eps <= 0.0)
+        eps = 1e-9;
+    if (distance_to_point(s, px, py) > eps)
+        return 0;
+    return 1;
+}
+
+int intersect(Seg *s, const Seg *o, SegHit *out)
+{
+    double d1 = 0.0, d2 = 0.0, d3 = 0.0, d4 = 0.0;
+    double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0, den = 0.0, t = 0.0;
+
+    if (!s || !o)
+        return 0;
+    if (out) {
+        out->kind = 0;
+        out->x = 0.0;
+        out->y = 0.0;
+    }
+    d1 = sg_cross(s->x1, s->y1, s->x2, s->y2, o->x1, o->y1);
+    d2 = sg_cross(s->x1, s->y1, s->x2, s->y2, o->x2, o->y2);
+    d3 = sg_cross(o->x1, o->y1, o->x2, o->y2, s->x1, s->y1);
+    d4 = sg_cross(o->x1, o->y1, o->x2, o->y2, s->x2, s->y2);
+    /* 共线（四个叉积都为 0）：看投影区间是否重叠 */
+    if (fabs(d1) <= 1e-12 && fabs(d2) <= 1e-12 && fabs(d3) <= 1e-12
+        && fabs(d4) <= 1e-12) {
+        double t0 = 0.0, t1 = 0.0, u0 = 0.0, u1 = 0.0;
+        double lo = 0.0, hi = 0.0;
+
+        ax = s->x2 - s->x1;
+        ay = s->y2 - s->y1;
+        den = ax * ax + ay * ay;
+        if (den <= 0.0)
+            return 0;
+        t0 = ((o->x1 - s->x1) * ax + (o->y1 - s->y1) * ay) / den;
+        t1 = ((o->x2 - s->x1) * ax + (o->y2 - s->y1) * ay) / den;
+        u0 = t0 < t1 ? t0 : t1;
+        u1 = t0 > t1 ? t0 : t1;
+        lo = u0 > 0.0 ? u0 : 0.0;
+        hi = u1 < 1.0 ? u1 : 1.0;
+        if (lo > hi + 1e-12)
+            return 0;
+        if (out) {
+            out->kind = 2;
+            t = 0.5 * (lo + hi);
+            out->x = s->x1 + t * ax;
+            out->y = s->y1 + t * ay;
+        }
+        return 2;
+    }
+    /* 跨立 */
+    if (((d1 > 1e-12 && d2 < -1e-12) || (d1 < -1e-12 && d2 > 1e-12))
+        && ((d3 > 1e-12 && d4 < -1e-12) || (d3 < -1e-12 && d4 > 1e-12))) {
+        ax = s->x2 - s->x1;
+        ay = s->y2 - s->y1;
+        bx = o->x2 - o->x1;
+        by = o->y2 - o->y1;
+        den = ax * by - ay * bx;
+        if (fabs(den) <= 1e-12)
+            return 0;
+        t = ((o->x1 - s->x1) * by - (o->y1 - s->y1) * bx) / den;
+        if (out) {
+            out->kind = 1;
+            out->x = s->x1 + t * ax;
+            out->y = s->y1 + t * ay;
+        }
+        return 1;
+    }
+    /* 端点接触（点在另一条线段上） */
+    if (contains_point(s, o->x1, o->y1, 1e-9)
+        || contains_point(s, o->x2, o->y2, 1e-9)
+        || contains_point((Seg *)o, s->x1, s->y1, 1e-9)
+        || contains_point((Seg *)o, s->x2, s->y2, 1e-9)) {
+        if (out) {
+            out->kind = 1;
+            if (contains_point(s, o->x1, o->y1, 1e-9)) {
+                out->x = o->x1;
+                out->y = o->y1;
+            } else if (contains_point(s, o->x2, o->y2, 1e-9)) {
+                out->x = o->x2;
+                out->y = o->y2;
+            } else if (contains_point((Seg *)o, s->x1, s->y1, 1e-9)) {
+                out->x = s->x1;
+                out->y = s->y1;
+            } else {
+                out->x = s->x2;
+                out->y = s->y2;
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "segment：相交与共线" {
+    Seg a = { 0, 0, 4, 4 };
+    Seg b = { 0, 4, 4, 0 };
+    Seg c = { 5, 5, 6, 6 };
+    Seg h = { 1, 0, 4, 3 };             /* 与 a 平行（方向 3,3）但错开，不共线 */
+    SegHit hit = { 0, 0, 0 };
+
+    if (a.intersect(&b, &hit) != 1)
+        return err(1, "对角线应该相交");
+    if (fabs(hit.x - 2.0) > 1e-9 || fabs(hit.y - 2.0) > 1e-9 || hit.kind != 1)
+        return err(2, "交点应该是 (2,2)");
+    if (a.intersect(&c, 0) != 0)
+        return err(3, "不相交应该 0");
+    if (a.intersect(&h, 0) != 0)
+        return err(4, "平行不共线不该相交");
+    /* 端点接触 */
+    {
+        Seg t1 = { 0, 0, 2, 0 };
+        Seg t2 = { 2, 0, 4, 0 };
+
+        if (t1.intersect(&t2, &hit) != 2 || hit.kind != 2)
+            return err(5, "共线只接触一点应判为 2");
+        if (fabs(hit.x - 2.0) > 1e-9)
+            return err(6, "重叠段的中点应该在 2");
+    }
+    /* 部分重叠 */
+    {
+        Seg o1 = { 0, 0, 4, 0 };
+        Seg o2 = { 2, 0, 6, 0 };
+
+        if (o1.intersect(&o2, &hit) != 2 || hit.kind != 2)
+            return err(7, "部分重叠应判为 2");
+        if (fabs(hit.x - 3.0) > 1e-9)
+            return err(8, "重叠段 [2,4] 的中点应该是 3");
+    }
+    /* 垂直相交 */
+    {
+        Seg v = { 2, -1, 2, 5 };
+
+        if (a.intersect(&v, &hit) != 1 || fabs(hit.x - 2.0) > 1e-9
+            || fabs(hit.y - 2.0) > 1e-9)
+            return err(9, "垂直线段应该交于 (2,2)");
+    }
+}
+
+test "segment：距离、投影与包围盒" {
+    Seg a = { 0, 0, 4, 0 };
+    double t = 0.0, x = 0.0, y = 0.0;
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+
+    if (fabs(a.length() - 4.0) > 1e-12)
+        return err(10, "长度应该是 4");
+    if (fabs(a.dx() - 4.0) > 1e-12 || fabs(a.dy()) > 1e-12)
+        return err(11, "分量不对");
+    if (a.midpoint(&x, &y) != 1 || fabs(x - 2.0) > 1e-12 || fabs(y) > 1e-12)
+        return err(12, "中点应该是 (2,0)");
+    /* 到线段的距离：垂足在段内 → 3；垂足在段外 → 到端点 */
+    if (fabs(a.distance_to_point(2, 3) - 3.0) > 1e-12)
+        return err(13, "垂足在段内，距离 3");
+    if (fabs(a.distance_to_point(-3, 0) - 3.0) > 1e-12)
+        return err(14, "垂足在段外，距离到起点的 3");
+    if (fabs(a.distance_to_point(6, 8) - sqrt(4.0 + 64.0)) > 1e-12)
+        return err(15, "到终点的距离不对");
+    /* 投影参数被夹到 [0,1] */
+    a.project(-3, 0, &t, &x, &y);
+    if (fabs(t) > 1e-12 || fabs(x) > 1e-12)
+        return err(16, "段外的投影应该夹到起点");
+    a.project(6, 0, &t, &x, &y);
+    if (fabs(t - 1.0) > 1e-12 || fabs(x - 4.0) > 1e-12)
+        return err(17, "段外的投影应该夹到终点");
+    a.project(2, 5, &t, &x, &y);
+    if (fabs(t - 0.5) > 1e-12 || fabs(y) > 1e-12)
+        return err(18, "段内投影参数应该是 0.5");
+    /* 包围盒与点在线段上 */
+    if (a.bbox(&x0, &y0, &x1, &y1) != 1 || x0 != 0.0 || x1 != 4.0 || y0 != 0.0)
+        return err(19, "包围盒不对");
+    if (a.contains_point(2, 0, 0) != 1 || a.contains_point(2, 0.5, 0) != 0)
+        return err(20, "contains_point 不对");
+    /* 退化线段（起点=终点） */
+    {
+        Seg d = { 1, 1, 1, 1 };
+
+        if (fabs(d.length()) > 1e-12)
+            return err(21, "退化线段长度为 0");
+        if (fabs(d.distance_to_point(1, 4) - 3.0) > 1e-12)
+            return err(22, "退化线段距离应该按点算");
+        d.project(5, 5, &t, &x, &y);
+        if (fabs(x - 1.0) > 1e-12 || fabs(y - 1.0) > 1e-12)
+            return err(23, "退化线段的投影就是它自己");
+    }
+    if (intersect((Seg *)0, &a, 0) != 0)
+        return err(24, "空指针应该 0");
+}

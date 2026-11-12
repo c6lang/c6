@@ -460,6 +460,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/async/await.c6          std.async.await        async/await 宏：AW_BEGIN/AW_SLEEP/AW_WAIT/AW_YIELD/AW_END 线性书写
   std/async/scope.c6          std.async.scope        结构化并发：spawn 一批子协程，fail 全体取消，全部收尾时 join
   std/async/limiter.c6        std.async.limiter      并发额度：最多 N 个在飞，释放时额度转交队头
+  std/core/hull.c6            std.core.hull          二维凸包：单调链 + 面积/周长/点内判断
+  std/core/polygon.c6         std.core.polygon       简单多边形：有向面积/凸性/射线法点内/形心/边游标
+  std/core/segment.c6         std.core.segment       线段：相交（含共线重叠）、点到线段距离、投影参数
+  std/core/closest.c6         std.core.closest       最近点对：分治 O(n log n)，另有暴力对拍版
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -594,6 +598,7 @@ make std-linalg   # 编译并运行 examples/stdlinalg.c6（第七十五批线�
 make std-search2  # 编译并运行 examples/stdsearch2.c6（第七十六批检索与关键词模块的拼装示例）
 make std-graph2   # 编译并运行 examples/stdgraph2.c6（第七十七批图算法进阶模块的拼装示例）
 make std-async3   # 编译并运行 examples/stdasync3.c6（第七十八批 co / async-await 框架示例）
+make std-geo2     # 编译并运行 examples/stdgeo2.c6（第七十九批计算几何模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

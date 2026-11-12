@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第七十九批（计算几何）**：`std.core.hull`（Andrew 单调链凸包 + 面积/周长/
+  点内）、`std.core.polygon`（简单多边形：面积/凸性/点内/形心/边游标）、
+  `std.core.segment`（线段相交/共线重叠/点到线段距离/投影）、`std.core.closest`
+  （分治最近点对 + 暴力对拍），集成示例 `examples/stdgeo2.c6`（`make std-geo2`）。
+  错误号段 `std.core.hull`=0x6145 … `std.core.closest`=0x6148
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十八批（co / async-await 框架）**：新目录 `std/async/`——`std.async.co`
   （co 运行器：立即值/Future/定时器三种挂起点）、`std.async.await`（`AW_BEGIN`/`AW_SLEEP`/
   `AW_WAIT`/`AW_YIELD`/`AW_END` 宏，把状态机藏起来写线性代码）、`std.async.scope`

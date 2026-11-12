@@ -1,0 +1,259 @@
+/* std/core/hull：二维凸包（Andrew 单调链 O(n log n)），带面积/周长/包含判断。
+ *
+ *     import std.core.hull;
+ *
+ *     HullPt pts[5] = { { 0, 0 }, { 4, 0 }, { 4, 4 }, { 0, 4 }, { 2, 2 } };
+ *     HullPt sbuf[5] = { { 0, 0 } };
+ *     HullPt hbuf[10] = { { 0, 0 } };    // 2n
+ *     Hull h = { 0 };
+ *     h.convex(pts, 5, sbuf, hbuf);   // 方法：convex / area / perimeter / contains
+ *     h.size();                        // 4（内部的 (2,2) 不算顶点）
+ *     h.area();                        // 16
+ *
+ * 单调链：把点按 (x, y) 排序，从左往右造下凸壳、从右往左造上凸壳，拼起来就是整个
+ * 凸包。排序缓冲与凸包缓冲**分开**（上凸壳那一趟会往前面写，复用同一个缓冲会把还没
+ * 读到的点覆盖掉）。凸包顶点按**逆时针**保存，不含共线的中间点。
+ *
+ * 约定：
+ *
+ * - `h.convex(points, n, sort_buf, hull_buf)`：`sort_buf` 是 `n` 个 `HullPt`（排序
+ *   副本），`hull_buf` 要 **`2 * n`** 个（中途会写到下凸壳后面，最后结果压在
+ *   开头 `h.size()` 个），返回凸包顶点数；`n <= 0` 返回 -1；
+ *   全部共线的点集返回 2 个端点；
+ * - `h.size()` 顶点数，`h.point_at(i, &x, &y)` 取第 i 个顶点（逆时针）；
+ * - `h.area()` 面积（逆时针有向面积取绝对），`h.perimeter()` 周长；
+ * - `h.contains(x, y)` 是否在凸包内或边界上（顶点数 1/2 时按点/线段处理）；
+ * - 共线判定是 `cross <= 0`（严格凸包，共线点只保留端点）；
+ * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ */
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+module std.core.hull;
+import std.core.types;
+import std.text.str;
+
+struct HullPt {
+    double x;
+    double y;
+};
+
+struct Hull {
+    HullPt *pts;
+    int n;
+};
+
+static int hu_cmp(const void *a, const void *b)
+{
+    const HullPt *p = (const HullPt *)a;
+    const HullPt *q = (const HullPt *)b;
+
+    if (p->x < q->x)
+        return -1;
+    if (p->x > q->x)
+        return 1;
+    if (p->y < q->y)
+        return -1;
+    if (p->y > q->y)
+        return 1;
+    return 0;
+}
+
+static double hu_cross(HullPt o, HullPt a, HullPt b)
+{
+    return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+int convex(Hull *h, const HullPt *points, int n, void *sort_buf, void *hull_buf)
+{
+    HullPt *srt = 0;
+    HullPt *out = 0;
+    int k = 0, i = 0, t = 0;
+
+    if (!h || !points || n <= 0 || !sort_buf || !hull_buf)
+        return -1;
+    memset(h, 0, sizeof *h);
+    srt = (HullPt *)sort_buf;
+    out = (HullPt *)hull_buf;
+    memcpy(sort_buf, points, sizeof(HullPt) * (size_t)n);
+    qsort(sort_buf, (size_t)n, sizeof(HullPt), hu_cmp);
+    h->pts = out;
+    if (n <= 2) {
+        for (i = 0; i < n; i++)
+            out[i] = srt[i];
+        h->n = n;
+        return n;
+    }
+    /* 下凸壳：k <= i，写 out[k] 不会碰到还没读的 srt[i] */
+    k = 0;
+    for (i = 0; i < n; i++) {
+        while (k >= 2 && hu_cross(out[k - 2], out[k - 1], srt[i]) <= 0.0)
+            k--;
+        out[k++] = srt[i];
+    }
+    /* 上凸壳：写到 out 的后半段（t 是下凸壳长度 + 1），不和 srt 抢 */
+    t = k + 1;
+    for (i = n - 2; i >= 0; i--) {
+        while (k >= t && hu_cross(out[k - 2], out[k - 1], srt[i]) <= 0.0)
+            k--;
+        out[k++] = srt[i];
+    }
+    /* 上凸壳接在下凸壳后面写，最后一点与起点重合，所以有效顶点是 k-1 个 */
+    h->n = k - 1;
+    return h->n;
+}
+
+int size(Hull *h)
+{
+    return h ? h->n : 0;
+}
+
+int point_at(Hull *h, int i, double *x, double *y)
+{
+    if (!h || !h->pts || i < 0 || i >= h->n)
+        return 0;
+    if (x)
+        *x = h->pts[i].x;
+    if (y)
+        *y = h->pts[i].y;
+    return 1;
+}
+
+double area(Hull *h)
+{
+    double s = 0.0;
+    int i = 0;
+
+    if (!h || !h->pts || h->n < 3)
+        return 0.0;
+    for (i = 0; i < h->n; i++) {
+        int j = (i + 1) % h->n;
+
+        s += h->pts[i].x * h->pts[j].y - h->pts[j].x * h->pts[i].y;
+    }
+    s = 0.5 * s;
+    return s < 0.0 ? -s : s;
+}
+
+double perimeter(Hull *h)
+{
+    double s = 0.0;
+    int i = 0;
+
+    if (!h || !h->pts || h->n < 2)
+        return 0.0;
+    for (i = 0; i < h->n; i++) {
+        int j = (i + 1) % h->n;
+        double dx = h->pts[j].x - h->pts[i].x;
+        double dy = h->pts[j].y - h->pts[i].y;
+
+        s += sqrt(dx * dx + dy * dy);
+    }
+    return s;
+}
+
+int contains(Hull *h, double x, double y)
+{
+    HullPt q = { 0.0, 0.0 };
+    int i = 0;
+
+    if (!h || !h->pts)
+        return 0;
+    q.x = x;
+    q.y = y;
+    if (h->n == 1)
+        return (h->pts[0].x == x && h->pts[0].y == y) ? 1 : 0;
+    if (h->n == 2) {
+        double c = hu_cross(h->pts[0], h->pts[1], q);
+
+        if (fabs(c) > 1e-12)
+            return 0;
+        return (x >= fmin(h->pts[0].x, h->pts[1].x) - 1e-12
+                && x <= fmax(h->pts[0].x, h->pts[1].x) + 1e-12
+                && y >= fmin(h->pts[0].y, h->pts[1].y) - 1e-12
+                && y <= fmax(h->pts[0].y, h->pts[1].y) + 1e-12)
+                   ? 1
+                   : 0;
+    }
+    /* 逆时针凸包：点在每条边的左侧（含边界） */
+    for (i = 0; i < h->n; i++) {
+        int j = (i + 1) % h->n;
+
+        if (hu_cross(h->pts[i], h->pts[j], q) < -1e-12)
+            return 0;
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "hull：正方形与内部点" {
+    HullPt pts[5] = { { 0, 0 }, { 4, 0 }, { 4, 4 }, { 0, 4 }, { 2, 2 } };
+    HullPt sbuf[5] = { { 0, 0 } };
+    HullPt hbuf[10] = { { 0, 0 } };
+    Hull h = { 0 };
+    double x = 0.0, y = 0.0;
+
+    if (h.convex(pts, 5, sbuf, hbuf) != 4)
+        return err(1, "正方形凸包应该是 4 个顶点");
+    if (h.size() != 4)
+        return err(2, "size 不对");
+    if (fabs(h.area() - 16.0) > 1e-9)
+        return err(3, "面积应该是 16");
+    if (fabs(h.perimeter() - 16.0) > 1e-9)
+        return err(4, "周长应该是 16");
+    if (h.point_at(0, &x, &y) != 1 || x != 0.0 || y != 0.0)
+        return err(5, "第一个顶点应该是 (0,0)");
+    if (h.contains(2, 2) != 1 || h.contains(0, 0) != 1)
+        return err(6, "内部点与边界点都应该包含");
+    if (h.contains(5, 2) != 0 || h.contains(-1, 3) != 0)
+        return err(7, "外部点不该包含");
+    if (h.point_at(9, &x, &y) != 0)
+        return err(8, "越界应该 0");
+}
+
+test "hull：共线、少量点与三角形" {
+    {
+        HullPt pts[3] = { { 2, 2 }, { 0, 0 }, { 1, 1 } };
+        HullPt sbuf[3] = { { 0, 0 } };
+        HullPt hbuf[6] = { { 0, 0 } };
+        Hull h = { 0 };
+
+        if (h.convex(pts, 3, sbuf, hbuf) != 2)
+            return err(9, "共线应该只剩 2 个端点");
+        if (h.area() != 0.0)
+            return err(10, "共线面积 0");
+        if (h.contains(1, 1) != 1 || h.contains(1, 2) != 0)
+            return err(11, "线段包含判断不对");
+    }
+    {
+        HullPt pts[1] = { { 3, 7 } };
+        HullPt sbuf[1] = { { 0, 0 } };
+        HullPt hbuf[2] = { { 0, 0 } };
+        Hull h = { 0 };
+
+        if (h.convex(pts, 1, sbuf, hbuf) != 1 || h.contains(3, 7) != 1
+            || h.contains(0, 0) != 0)
+            return err(12, "单点凸包不对");
+    }
+    {
+        HullPt pts[5] = { { 0, 0 }, { 6, 0 }, { 3, 6 }, { 3, 0 }, { 2, 2 } };
+        HullPt sbuf[5] = { { 0, 0 } };
+        HullPt hbuf[10] = { { 0, 0 } };
+        Hull h = { 0 };
+
+        if (h.convex(pts, 5, sbuf, hbuf) != 3)
+            return err(13, "三角形凸包应该是 3 个顶点");
+        if (fabs(h.area() - 18.0) > 1e-9)
+            return err(14, "三角形面积应该是 18");
+        if (h.contains(3, 6) != 1 || h.contains(3, 6.1) != 0)
+            return err(15, "顶点边界判断不对");
+        if (h.contains(3, 1) != 1)
+            return err(16, "内部点应该包含");
+        if (h.convex(pts, 0, sbuf, hbuf) != -1)
+            return err(17, "n=0 应该 -1");
+    }
+}
