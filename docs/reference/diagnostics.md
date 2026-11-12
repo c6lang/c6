@@ -18,7 +18,7 @@
 | C6 | `catch` 的处理块必须自己离开（`return` / `return err(id, msg)` / `goto`） | `'catch' body must end with 'return', 'err()' or 'goto'`；静态判断不出来时改为插入运行时陷阱 |
 | C7 | `catch` 必须带操作数 | `'catch' has no operand` |
 | C8 | `!error` 必须修饰函数（或函数指针）声明符 | `'!error' requires a function declarator` |
-| C9 | `!error` 的函数返回类型必须是标量、枚举、指针、struct、union 或元组：标量失败时返回 `-1`，聚合类型失败时清零 | `'!error' does not support a 'double' return type` |
+| C9 | `!error` 的返回类型必须是 C 允许按值返回的类型（数组不行）：整数类标量失败时返回 `-1`，聚合与 `float`/`double`/`long double` 失败时清零 | `'!error' does not support a 'int [3]' return type` |
 | C10 | `expr` 中不能直接写裸 `catch` | 同 C7 |
 | C11 | `try` / `catch` / `err` 不得出现在 `defer` / `errdefer` 体内 | `'try' is not allowed in a defer body` 等 |
 | C12 | 返回类型大小未知（不完整类型）的函数不能传播错误 | `cannot propagate an error from a function with an incomplete return type` |

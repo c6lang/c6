@@ -832,3 +832,16 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 
 验收：`make stdtest`（53 个模块、0 failure）、`make std-form`（26 条自检全过）、
 `make check-all`。
+
+### 11.22 `!error` 支持浮点返回类型
+
+C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要么用 `-1`
+哨兵（浮点的 `-1` 位型是 NaN），要么按聚合清零，两者都不适用。现在把浮点并进
+聚合那条路：`c6_emit_propagate` 与 `c6_async_propagate` 对 `is_float()` 的返回
+类型改为清零局部槽再返回（全零位型 = `+0.0`），C99 后端与 native 后端共用同一
+套 vstack 操作。整数类标量仍是 `-1` 哨兵；数组仍被 C9 拒绝（不是 C 的返回类型），
+诊断用例改成数组。失败值本身仍不可观测（C15 强制消费），所以这只影响“编译器
+能不能构造出失败值”，不改变错误槽语义。
+
+验收：`tests/run-tests.sh try`（22 条）、`tests/run-tests.sh errors/try`
+（17 个片段）、`make check-all`。

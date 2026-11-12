@@ -1229,7 +1229,7 @@ role              = "expr" | "stmt" | "ident" | "type" ;
 ## 8. 语义重写规则
 
 扩展的语义可以用下列重写规则描述；规则中的 `$T` 表示被调函数的返回
-类型，`$S(x)` 表示“把 x 转成返回类型后可表示的哨兵值 `-1`”。
+类型，`$S(x)` 表示“返回类型上的失败值：整数类标量是哨兵 `-1`，聚合与浮点是全零”。
 
 **R1 — `return err(id, msg)`**
 
@@ -1316,7 +1316,7 @@ make errcheck                             # 表是最新的、约束都还在报
 try f(args)
 =>
     __tcc_err_clear();             (* 由调用点插入，见 R3 *)
-    $T tmp = f(args);              (* 记下返回值，失败时哨兵即 -1 *)
+    $T tmp = f(args);              (* 记下返回值；失败时是 -1 或全零 *)
     if (__tcc_err_flag_get()) {
         <本函数帧的 errdefer 与 defer，按注册逆序就地展开>
         return $S(T);              (* 函数返回类型为 void 时只 return *)
@@ -1346,8 +1346,8 @@ expr catch e { body }
 `__tcc_catch_fallthrough()` 作为陷阱，避免悄悄落回成功路径。
 
 **R6 — `T!error f(…)`**：只改变调用点的类型信息（允许 `try` / `catch`
-作用其上），不改变调用约定；错误只通过返回值送出（失败方返回哨兵 `-1`，
-id/msg 走错误槽），从不经过形参，因此 `error` 被禁止出现在形参表里
+作用其上），不改变调用约定；错误只通过返回值送出（整数类标量返回哨兵 `-1`，
+聚合与浮点返回全零，id/msg 走错误槽），从不经过形参，因此 `error` 被禁止出现在形参表里
 （约束 C18）。
 
 **R7 — 包限定访问 `pkg.member`**
@@ -1845,18 +1845,18 @@ const struct __c6_desc __c6_desc_f =
 
 同样适用于 struct / union 返回值（C59 只要求返回类型是这三种之一）。
 
-**R22 — `!error` 的聚合返回值**
+**R22 — `!error` 的聚合与浮点返回值**
 
 ```
-    return $S(T);                           (* 失败路径：$S(T) 是聚合类型 *)
+    return $S(T);                           (* 失败路径：T 是聚合或浮点类型 *)
 =>
-    memset(&__c6_ret, 0, sizeof(T));        (* 全零，而不是 -1 *)
+    memset(&__c6_ret, 0, sizeof(T));        (* 全零，而不是 -1；浮点即 +0.0 *)
     return __c6_ret;
 ```
 
 失败与否只由错误槽（`__tcc_err_flag_peek`）判定，返回值只承载成功路径的值，
 而 C15 又强制 `T!error` 的返回值必须被 `try` / `catch` 消费，因此失败路径上
-那个全零的值永远不可观测。标量返回类型仍用哨兵 `-1`（C9）。
+那个全零的值永远不可观测。整数类标量返回类型仍用哨兵 `-1`（C9）。
 
 **R23 — 函数字面量**
 
@@ -2082,7 +2082,7 @@ int main(void)
 | `try a = f();` | 语法错误（`try` 只接调用表达式） |
 | `catch` 处理块自然落到末尾 | 约束 C6 |
 | `int v = 0; try v;` | 约束 C1/C2 |
-| `double!error f(void)` | 约束 C9：`float`/`double` 既没有哨兵也不是聚合类型；struct / union / 元组可以 |
+| `typedef int A[3]; A!error f(void)` | 约束 C9：数组不是 C 的返回类型；`float`/`double`/`long double` 与 struct / union / 元组都可以 |
 | `int!error x;` | 约束 C8 |
 | `try` / `catch` / `err` 写在 `defer` 体内 | 约束 C11 |
 | `err();`（无参数重抛） | 约束 C16，请改用 `try` |
