@@ -1,0 +1,588 @@
+/* std/data/svg：SVG 路径数据（`<path d="…">`）解析与包围盒。
+ *
+ *     import std.data.svg;
+ *
+ *     SvgSeg seg = { 0 };
+ *     int n = svg_path_count((Str){ S("M0 0 L10 0 L10 10 Z") });
+ *     for (int i = 0; i < n; i++)           // 注意 c6 不允许 for 内声明
+ *         if (svg_path_at(d, i, &seg) == 1)
+ *             // seg.cmd / seg.p[]
+ *
+ * 规范化：所有坐标都换成分量绝对坐标，命令只剩
+ *
+ *     'M'（起点）  'L'（直线，H/V 已并入）  'C'（三次贝塞尔）
+ *     'Q'（二次贝塞尔）  'A'（椭圆弧）  'Z'（闭合）
+ *
+ * 约定：
+ *
+ * - `svg_path_at` 按序号取段，返回 1 / 0（没有更多）/ -1（数据坏）；
+ * - `S`/`s` 按「上一个 C 的第二控制点」做反射，`T`/`t` 按上一个 Q 的控制点
+ *   反射；没有可反射的点时用当前点；
+ * - `A` 的七个参数原样给出（`rx ry rot laf sf x y`），不拆成贝塞尔；
+ * - `svg_path_bbox` 用**控制点凸包**（不是曲线真实极值）：C 计入两个控制点、
+ *   Q 计入控制点、A 用「起点到终点」的矩形再向外扩 `rx`/`ry` 的绝对值，所以
+ *   结果只会偏大不会偏小；
+ * - 支持 `,` 与空白作分隔、`1.5e3` 指数、`+.5` 这类省略整数部分的写法；
+ * - 不支持 `pathLength`、`transform`、`arc` 的退化修正（`rx=0` 时按直线处理）。
+ */
+#include <math.h>
+#include <string.h>
+
+module std.data.svg;
+import std.core.types;
+import std.text.str;
+
+struct SvgSeg {
+    int cmd;
+    double p[7];        /* M/L: x y；C: x1 y1 x2 y2 x y；Q: cx cy x y；
+                           A: rx ry rot laf sf x y */
+};
+
+struct SvgPs {
+    Str d;
+    int pos;
+    double cx;
+    double cy;
+    double sx;          /* 子路径起点 */
+    double sy;
+    double last_cx;     /* 上一个 C 的第二控制点 */
+    double last_cy;
+    double last_qx;     /* 上一个 Q 的控制点 */
+    double last_qy;
+    int last_cmd;
+    int bad;
+};
+
+static int svg_is_sep(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',';
+}
+
+static int svg_num(SvgPs *ps, double *out)
+{
+    const char *s = ps->d.s.data;
+    int n = ps->d.s.len;
+    int i = ps->pos, start = 0, digits = 0;
+    int sign = 1;
+    double v = 0, frac = 0.1;
+    int exp = 0, esign = 1;
+
+    while (i < n && svg_is_sep(s[i]))
+        i++;
+    start = i;
+    if (i < n && (s[i] == '-' || s[i] == '+')) {
+        if (s[i] == '-')
+            sign = -1;
+        i++;
+    }
+    while (i < n && s[i] >= '0' && s[i] <= '9') {
+        v = v * 10 + (s[i] - '0');
+        digits++;
+        i++;
+    }
+    if (i < n && s[i] == '.') {
+        i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            v += (s[i] - '0') * frac;
+            frac /= 10;
+            digits++;
+            i++;
+        }
+    }
+    if (!digits)
+        return -1;
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        int ds = 0;
+
+        i++;
+        if (i < n && (s[i] == '-' || s[i] == '+')) {
+            if (s[i] == '-')
+                esign = -1;
+            i++;
+        }
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            exp = exp * 10 + (s[i] - '0');
+            ds++;
+            i++;
+        }
+        if (!ds || exp > 300)
+            return -1;
+        v *= pow(10.0, (double)(exp * esign));
+    }
+    (void)start;
+    *out = sign * v;
+    ps->pos = i;
+    return 1;
+}
+
+static int svg_flag(SvgPs *ps, int *out)
+{
+    const char *s = ps->d.s.data;
+    int n = ps->d.s.len;
+    int i = ps->pos;
+
+    while (i < n && svg_is_sep(s[i]))
+        i++;
+    if (i >= n || (s[i] != '0' && s[i] != '1'))
+        return -1;
+    *out = s[i] - '0';
+    ps->pos = i + 1;
+    return 1;
+}
+
+static int svg_skip_sep(SvgPs *ps)
+{
+    const char *s = ps->d.s.data;
+    int n = ps->d.s.len;
+
+    while (ps->pos < n && svg_is_sep(s[ps->pos]))
+        ps->pos++;
+    return ps->pos < n ? 1 : 0;
+}
+
+static int svg_is_cmd(char c)
+{
+    return memchr("MmLlHhVvCcSsQqTtAaZz", c, 20) != 0;
+}
+
+/* 读一段：1 有段 / 0 结束 / -1 坏 */
+static int svg_next(SvgPs *ps, SvgSeg *out)
+{
+    const char *s = ps->d.s.data;
+    int n = ps->d.s.len;
+    char cmd = 0;
+    int rel = 0;
+
+    if (ps->bad)
+        return -1;
+    if (svg_skip_sep(ps) != 1)
+        return 0;
+    cmd = s[ps->pos];
+    if (svg_is_cmd(cmd)) {
+        ps->pos++;
+    } else {
+        /* 隐式重复：M 之后是 L，Z 之后没有 */
+        if (ps->last_cmd == 'M')
+            cmd = 'L';
+        else if (ps->last_cmd == 'm')
+            cmd = 'l';
+        else if (ps->last_cmd == 'Z' || ps->last_cmd == 'z')
+            return 0;
+        else if (ps->last_cmd == 0)
+            return -1;
+        else
+            cmd = (char)ps->last_cmd;
+    }
+    rel = cmd >= 'a' && cmd <= 'z';
+    memset(out, 0, sizeof *out);
+    switch (cmd) {
+    case 'M':
+    case 'm':
+    case 'L':
+    case 'l': {
+        double x = 0, y = 0;
+
+        if (svg_num(ps, &x) != 1 || svg_num(ps, &y) != 1)
+            goto bad;
+        if (rel) {
+            x += ps->cx;
+            y += ps->cy;
+        }
+        if (cmd == 'M' || cmd == 'm') {
+            out->cmd = 'M';
+            ps->sx = x;
+            ps->sy = y;
+        } else {
+            out->cmd = 'L';
+        }
+        out->p[0] = x;
+        out->p[1] = y;
+        ps->cx = x;
+        ps->cy = y;
+        ps->last_cmd = cmd;
+        return 1;
+    }
+    case 'H':
+    case 'h':
+    case 'V':
+    case 'v': {
+        double v = 0;
+
+        if (svg_num(ps, &v) != 1)
+            goto bad;
+        if (cmd == 'H' || cmd == 'h') {
+            double x = rel ? ps->cx + v : v;
+
+            out->cmd = 'L';
+            out->p[0] = x;
+            out->p[1] = ps->cy;
+            ps->cx = x;
+        } else {
+            double y = rel ? ps->cy + v : v;
+
+            out->cmd = 'L';
+            out->p[0] = ps->cx;
+            out->p[1] = y;
+            ps->cy = y;
+        }
+        ps->last_cmd = cmd;
+        return 1;
+    }
+    case 'C':
+    case 'c': {
+        double x1 = 0, y1 = 0, x2 = 0, y2 = 0, x = 0, y = 0;
+
+        if (svg_num(ps, &x1) != 1 || svg_num(ps, &y1) != 1
+            || svg_num(ps, &x2) != 1 || svg_num(ps, &y2) != 1
+            || svg_num(ps, &x) != 1 || svg_num(ps, &y) != 1)
+            goto bad;
+        if (rel) {
+            x1 += ps->cx;
+            y1 += ps->cy;
+            x2 += ps->cx;
+            y2 += ps->cy;
+            x += ps->cx;
+            y += ps->cy;
+        }
+        out->cmd = 'C';
+        out->p[0] = x1;
+        out->p[1] = y1;
+        out->p[2] = x2;
+        out->p[3] = y2;
+        out->p[4] = x;
+        out->p[5] = y;
+        ps->last_cx = x2;
+        ps->last_cy = y2;
+        ps->cx = x;
+        ps->cy = y;
+        ps->last_cmd = cmd;
+        return 1;
+    }
+    case 'S':
+    case 's': {
+        double x2 = 0, y2 = 0, x = 0, y = 0;
+
+        if (svg_num(ps, &x2) != 1 || svg_num(ps, &y2) != 1
+            || svg_num(ps, &x) != 1 || svg_num(ps, &y) != 1)
+            goto bad;
+        if (rel) {
+            x2 += ps->cx;
+            y2 += ps->cy;
+            x += ps->cx;
+            y += ps->cy;
+        }
+        /* 反射上一个 C 的第二控制点 */
+        if (ps->last_cmd == 'C' || ps->last_cmd == 'c'
+            || ps->last_cmd == 'S' || ps->last_cmd == 's') {
+            out->p[0] = 2 * ps->cx - ps->last_cx;
+            out->p[1] = 2 * ps->cy - ps->last_cy;
+        } else {
+            out->p[0] = ps->cx;
+            out->p[1] = ps->cy;
+        }
+        out->cmd = 'C';
+        out->p[2] = x2;
+        out->p[3] = y2;
+        out->p[4] = x;
+        out->p[5] = y;
+        ps->last_cx = x2;
+        ps->last_cy = y2;
+        ps->cx = x;
+        ps->cy = y;
+        ps->last_cmd = cmd == 'S' ? 'C' : 'c';
+        return 1;
+    }
+    case 'Q':
+    case 'q':
+    case 'T':
+    case 't': {
+        double qx = 0, qy = 0, x = 0, y = 0;
+
+        if (cmd == 'Q' || cmd == 'q') {
+            if (svg_num(ps, &qx) != 1 || svg_num(ps, &qy) != 1)
+                goto bad;
+            if (rel) {
+                qx += ps->cx;
+                qy += ps->cy;
+            }
+        } else {
+            if (ps->last_cmd == 'Q' || ps->last_cmd == 'q'
+                || ps->last_cmd == 'T' || ps->last_cmd == 't') {
+                qx = 2 * ps->cx - ps->last_qx;
+                qy = 2 * ps->cy - ps->last_qy;
+            } else {
+                qx = ps->cx;
+                qy = ps->cy;
+            }
+        }
+        if (svg_num(ps, &x) != 1 || svg_num(ps, &y) != 1)
+            goto bad;
+        if (rel) {
+            x += ps->cx;
+            y += ps->cy;
+        }
+        out->cmd = 'Q';
+        out->p[0] = qx;
+        out->p[1] = qy;
+        out->p[2] = x;
+        out->p[3] = y;
+        ps->last_qx = qx;
+        ps->last_qy = qy;
+        ps->cx = x;
+        ps->cy = y;
+        ps->last_cmd = cmd;
+        return 1;
+    }
+    case 'A':
+    case 'a': {
+        double rx = 0, ry = 0, rot = 0, x = 0, y = 0;
+        int laf = 0, sf = 0;
+
+        if (svg_num(ps, &rx) != 1 || svg_num(ps, &ry) != 1
+            || svg_num(ps, &rot) != 1)
+            goto bad;
+        if (svg_flag(ps, &laf) != 1 || svg_flag(ps, &sf) != 1)
+            goto bad;
+        if (svg_num(ps, &x) != 1 || svg_num(ps, &y) != 1)
+            goto bad;
+        if (rel) {
+            x += ps->cx;
+            y += ps->cy;
+        }
+        out->cmd = 'A';
+        out->p[0] = rx;
+        out->p[1] = ry;
+        out->p[2] = rot;
+        out->p[3] = laf;
+        out->p[4] = sf;
+        out->p[5] = x;
+        out->p[6] = y;
+        ps->cx = x;
+        ps->cy = y;
+        ps->last_cx = x;
+        ps->last_cy = y;
+        ps->last_cmd = cmd;
+        return 1;
+    }
+    case 'Z':
+    case 'z':
+        out->cmd = 'Z';
+        ps->cx = ps->sx;
+        ps->cy = ps->sy;
+        ps->last_cmd = cmd;
+        return 1;
+    default:
+        goto bad;
+    }
+bad:
+    ps->bad = 1;
+    return -1;
+}
+
+int svg_path_count(Str d)
+{
+    SvgPs ps = { 0 };
+    SvgSeg seg = { 0 };
+    int count = 0, r = 0;
+
+    ps.d = d;
+    for (;;) {
+        r = svg_next(&ps, &seg);
+        if (r != 1)
+            return r < 0 ? -1 : count;
+        count++;
+    }
+}
+
+int svg_path_at(Str d, int idx, SvgSeg *out)
+{
+    SvgPs ps = { 0 };
+    SvgSeg seg = { 0 };
+    int i = 0, r = 0;
+
+    if (idx < 0 || !out)
+        return -1;
+    ps.d = d;
+    for (i = 0; i <= idx; i++) {
+        r = svg_next(&ps, &seg);
+        if (r != 1)
+            return r < 0 ? -1 : 0;
+    }
+    *out = seg;
+    return 1;
+}
+
+/* 包围盒：控制点凸包（只大不小） */
+struct SvgBox {
+    double x0, y0, x1, y1;
+    int any;
+};
+
+static void svg_add(SvgBox *b, double x, double y)
+{
+    if (!b->any) {
+        b->x0 = b->x1 = x;
+        b->y0 = b->y1 = y;
+        b->any = 1;
+        return;
+    }
+    if (x < b->x0)
+        b->x0 = x;
+    if (x > b->x1)
+        b->x1 = x;
+    if (y < b->y0)
+        b->y0 = y;
+    if (y > b->y1)
+        b->y1 = y;
+}
+
+int svg_path_bbox(Str d, double *minx, double *miny, double *maxx, double *maxy)
+{
+    SvgPs ps = { 0 };
+    SvgSeg seg = { 0 };
+    SvgBox box = { 0 };
+    int r = 0;
+
+    ps.d = d;
+    for (;;) {
+        r = svg_next(&ps, &seg);
+        if (r != 1)
+            break;
+        if (seg.cmd == 'M' || seg.cmd == 'L') {
+            svg_add(&box, seg.p[0], seg.p[1]);
+        } else if (seg.cmd == 'C') {
+            svg_add(&box, seg.p[0], seg.p[1]);
+            svg_add(&box, seg.p[2], seg.p[3]);
+            svg_add(&box, seg.p[4], seg.p[5]);
+        } else if (seg.cmd == 'Q') {
+            svg_add(&box, seg.p[0], seg.p[1]);
+            svg_add(&box, seg.p[2], seg.p[3]);
+        } else if (seg.cmd == 'A') {
+            double rx = fabs(seg.p[0]), ry = fabs(seg.p[1]);
+
+            svg_add(&box, seg.p[5] - rx, seg.p[6] - ry);
+            svg_add(&box, seg.p[5] + rx, seg.p[6] + ry);
+        }
+    }
+    if (r < 0)
+        return -1;
+    if (!box.any)
+        return 0;
+    if (minx)
+        *minx = box.x0;
+    if (miny)
+        *miny = box.y0;
+    if (maxx)
+        *maxx = box.x1;
+    if (maxy)
+        *maxy = box.y1;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "svg：绝对坐标、隐式重复与闭合" {
+    Str d = { S("M0 0 L10 0 L10 10 Z") };
+    SvgSeg seg = { 0 };
+
+    if (svg_path_count(d) != 4)
+        return err(1, "段数不对");
+    if (svg_path_at(d, 0, &seg) != 1 || seg.cmd != 'M' || seg.p[0] != 0
+        || seg.p[1] != 0)
+        return err(2, "第一段不对");
+    if (svg_path_at(d, 2, &seg) != 1 || seg.cmd != 'L' || seg.p[0] != 10
+        || seg.p[1] != 10)
+        return err(3, "第三段不对");
+    if (svg_path_at(d, 3, &seg) != 1 || seg.cmd != 'Z')
+        return err(4, "闭合段不对");
+    if (svg_path_at(d, 4, &seg) != 0)
+        return err(5, "越界应该 0");
+    /* 隐式重复：M 后面的坐标对是 L */
+    {
+        Str m = { S("M1 2 3 4 5 6") };
+
+        if (svg_path_count(m) != 3)
+            return err(6, "隐式 L 的段数不对");
+        if (svg_path_at(m, 1, &seg) != 1 || seg.cmd != 'L' || seg.p[0] != 3
+            || seg.p[1] != 4)
+            return err(7, "隐式 L 坐标不对");
+    }
+    /* 相对坐标与 H/V */
+    {
+        Str r = { S("m10 10 l5 5 h10 v10 z") };
+
+        if (svg_path_count(r) != 5)
+            return err(8, "相对路径段数不对");
+        if (svg_path_at(r, 0, &seg) != 1 || seg.cmd != 'M' || seg.p[0] != 10)
+            return err(9, "相对 M 不对");
+        if (svg_path_at(r, 1, &seg) != 1 || seg.cmd != 'L' || seg.p[0] != 15
+            || seg.p[1] != 15)
+            return err(10, "相对 l 不对");
+        if (svg_path_at(r, 2, &seg) != 1 || seg.cmd != 'L' || seg.p[0] != 25
+            || seg.p[1] != 15)
+            return err(11, "h 不对");
+        if (svg_path_at(r, 3, &seg) != 1 || seg.p[0] != 25 || seg.p[1] != 25)
+            return err(12, "v 不对");
+    }
+}
+
+test "svg：曲线反射、弧与包围盒" {
+    SvgSeg seg = { 0 };
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+
+    /* C 之后 S 反射第一控制点 */
+    {
+        Str d = { S("M0 0 C1 1 2 2 3 3 S5 5 6 6") };
+
+        if (svg_path_at(d, 1, &seg) != 1 || seg.cmd != 'C')
+            return err(13, "C 段不对");
+        if (svg_path_at(d, 2, &seg) != 1 || seg.cmd != 'C' || seg.p[0] != 4
+            || seg.p[1] != 4 || seg.p[4] != 6 || seg.p[5] != 6)
+            return err(14, "S 反射控制点不对");
+    }
+    /* Q 之后 T 反射 */
+    {
+        Str d = { S("M0 0 Q1 1 2 2 T4 4") };
+
+        if (svg_path_at(d, 2, &seg) != 1 || seg.cmd != 'Q' || seg.p[0] != 3
+            || seg.p[1] != 3 || seg.p[2] != 4 || seg.p[3] != 4)
+            return err(15, "T 反射控制点不对");
+    }
+    /* 弧 */
+    {
+        Str d = { S("M0 0 A5 3 0 1 0 10 0") };
+
+        if (svg_path_at(d, 1, &seg) != 1 || seg.cmd != 'A')
+            return err(16, "A 段不对");
+        if (seg.p[0] != 5 || seg.p[1] != 3 || seg.p[3] != 1 || seg.p[4] != 0
+            || seg.p[5] != 10 || seg.p[6] != 0)
+            return err(17, "A 参数不对");
+    }
+    /* 包围盒：C 计入控制点 */
+    {
+        Str d = { S("M0 0 C0 10 10 10 10 0 Z") };
+
+        if (svg_path_bbox(d, &x0, &y0, &x1, &y1) != 1)
+            return err(18, "包围盒失败");
+        if (x0 != 0 || y0 != 0 || x1 != 10 || y1 != 10)
+            return err(19, "包围盒数值不对");
+    }
+    /* 弧的包围盒按 rx/ry 外扩 */
+    {
+        Str d = { S("M0 0 A5 3 0 0 0 10 0") };
+
+        if (svg_path_bbox(d, &x0, &y0, &x1, &y1) != 1)
+            return err(20, "弧包围盒失败");
+        if (x0 != 0 || y0 != -3 || x1 != 15 || y1 != 3)
+            return err(21, "弧包围盒数值不对");
+    }
+    /* 坏数据与空数据 */
+    if (svg_path_count((Str){ S("") }) != 0)
+        return err(22, "空路径应该 0 段");
+    if (svg_path_count((Str){ S("M1") }) != -1)
+        return err(23, "缺坐标应该 -1");
+    if (svg_path_at((Str){ S("M0 0") }, -1, &seg) != -1)
+        return err(24, "负序号应该 -1");
+    if (svg_path_bbox((Str){ S("L1 2") }, &x0, &y0, &x1, &y1) != 1)
+        return err(25, "只有 L 也应该能算");
+}

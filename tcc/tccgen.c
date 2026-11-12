@@ -12874,6 +12874,10 @@ static const struct C6ErrStdSlot {
     { "std.data.hdr",           C6_ERR_SLOT_STD + 166 },
     { "std.data.xbm",           C6_ERR_SLOT_STD + 167 },
     { "std.data.xpm",           C6_ERR_SLOT_STD + 168 },
+    { "std.data.bdf",           C6_ERR_SLOT_STD + 169 },
+    { "std.data.woff",          C6_ERR_SLOT_STD + 170 },
+    { "std.data.svg",           C6_ERR_SLOT_STD + 171 },
+    { "std.data.ttf",           C6_ERR_SLOT_STD + 172 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

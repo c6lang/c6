@@ -1,0 +1,397 @@
+/* std/data/ttf：TrueType/OpenType 字体表目录与常用度量。
+ *
+ *     import std.data.ttf;
+ *
+ *     Ttf f = { 0 };
+ *     if (ttf_info(buf, n, &f) == 1) {
+ *         int gid = ttf_glyph(buf, n, &f, 'A');      // 字形号，没有就 -1
+ *         int adv = ttf_advance(buf, n, &f, gid);    // 前进宽度（font units）
+ *     }
+ *
+ * 只看：sfnt 表目录、`head`（unitsPerEm、indexToLocFormat）、`hhea`（ascender/
+ * descender/numberOfHMetrics）、`maxp`（numGlyphs）、`cmap`（优先 format 4，
+ * 其次 format 12）、`hmtx`（每字形 advanceWidth）。
+ *
+ * 约定：
+ *
+ * - 认 `0x00010000`（TrueType）与 `OTTO`（CFF）两种 flavor，`ttcf` 集合不支持；
+ * - `cmap` 只会挑第一个 `(3,1)` 或 `(3,10)` 子表，其它平台不管；
+ * - `ttf_glyph` 找不到返回 -1（不是 0——0 是 `.notdef`）；
+ * - `ttf_advance` 对超出 `numberOfHMetrics` 的字形按最后一个 advance 处理
+ *   （TrueType 的规则）；读不到返回 -1；
+ * - 只做度量，不解析 glyf/CFF 轮廓，也不做变量字体的轴处理。
+ */
+#include <string.h>
+
+module std.data.ttf;
+import std.core.types;
+import std.text.str;
+
+struct Ttf {
+    int units_per_em;
+    int n_glyphs;
+    int ascender;
+    int descender;
+    int n_hmetrics;
+    int index_to_loc;
+    int head_off;
+    int hhea_off;
+    int maxp_off;
+    int hmtx_off;
+    int cmap_off;           /* 选中的子表起点 */
+    int cmap_fmt;
+};
+
+static u32 ttf_u32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static u32 ttf_u16(const u8 *p)
+{
+    return ((u32)p[0] << 8) | (u32)p[1];
+}
+
+static int ttf_find_table(const u8 *p, int n, const char *tag, int *off,
+                          int *len)
+{
+    int ntables = 0, i = 0;
+
+    if (n < 12)
+        return -1;
+    ntables = (int)ttf_u16(p + 4);
+    if (ntables <= 0 || ntables > 512 || 12 + ntables * 16 > n)
+        return -1;
+    for (i = 0; i < ntables; i++) {
+        const u8 *e = p + 12 + i * 16;
+        u32 o = ttf_u32(e + 8), l = ttf_u32(e + 12);
+
+        if (memcmp(e, tag, 4) != 0)
+            continue;
+        if ((u64)o + (u64)l > (u64)n)
+            return -1;
+        *off = (int)o;
+        *len = (int)l;
+        return 1;
+    }
+    return 0;
+}
+
+int ttf_info(const void *src, int n, Ttf *out)
+{
+    const u8 *p = (const u8 *)src;
+    u32 flavor = 0;
+    int off = 0, len = 0;
+
+    if (!src || !out || n < 12)
+        return -1;
+    flavor = ttf_u32(p);
+    if (flavor != 0x00010000u && memcmp(p, "OTTO", 4) != 0
+        && memcmp(p, "true", 4) != 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (ttf_find_table(p, n, "head", &off, &len) != 1 || len < 54)
+        return -1;
+    out->head_off = off;
+    out->units_per_em = (int)ttf_u16(p + off + 18);
+    out->index_to_loc = (int)ttf_u16(p + off + 50);
+    if (out->units_per_em <= 0)
+        return -1;
+    if (ttf_find_table(p, n, "hhea", &off, &len) != 1 || len < 36)
+        return -1;
+    out->hhea_off = off;
+    out->ascender = (short)ttf_u16(p + off + 4);
+    out->descender = (short)ttf_u16(p + off + 6);
+    out->n_hmetrics = (int)ttf_u16(p + off + 34);
+    if (out->n_hmetrics <= 0)
+        return -1;
+    if (ttf_find_table(p, n, "maxp", &off, &len) != 1 || len < 6)
+        return -1;
+    out->maxp_off = off;
+    out->n_glyphs = (int)ttf_u16(p + off + 4);
+    if (out->n_glyphs <= 0)
+        return -1;
+    if (ttf_find_table(p, n, "hmtx", &off, &len) != 1
+        || len < out->n_hmetrics * 4)
+        return -1;
+    out->hmtx_off = off;
+    /* cmap：挑第一个 (3,1) 或 (3,10) 子表 */
+    if (ttf_find_table(p, n, "cmap", &off, &len) == 1) {
+        int nsub = (int)ttf_u16(p + off + 2), i = 0;
+        int best = 0, best_fmt = 0;
+
+        for (i = 0; i < nsub; i++) {
+            const u8 *rec = p + off + 4 + i * 8;
+            int platform = (int)ttf_u16(rec);
+            int encoding = (int)ttf_u16(rec + 2);
+            u32 so = ttf_u32(rec + 4);
+
+            if (platform != 3)
+                continue;
+            if (encoding != 1 && encoding != 10)
+                continue;
+            if ((u64)off + (u64)so + 4 > (u64)n)
+                continue;
+            {
+                int fmt = (int)ttf_u16(p + off + so);
+
+                if (fmt == 4 || fmt == 12) {
+                    best = (int)(off + so);
+                    best_fmt = fmt;
+                    if (fmt == 12)
+                        break;
+                }
+            }
+        }
+        out->cmap_off = best;
+        out->cmap_fmt = best_fmt;
+    }
+    return 1;
+}
+
+int ttf_glyph(const void *src, int n, const Ttf *f, u32 code)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!src || !f || !f->cmap_off || code > 0x10FFFF)
+        return -1;
+    if (f->cmap_fmt == 4) {
+        int base = f->cmap_off;
+        int segx2 = (int)ttf_u16(p + base + 6);
+        int segs = segx2 / 2, i = 0;
+        int end_b = base + 14;
+        int start_b = end_b + segx2 + 2;
+        int delta_b = start_b + segx2;
+        int range_b = delta_b + segx2;
+
+        if (base + 16 + segx2 * 4 > n || segs <= 0)
+            return -1;
+        for (i = 0; i < segs; i++) {
+            int end = (int)ttf_u16(p + end_b + i * 2);
+            int start = (int)ttf_u16(p + start_b + i * 2);
+            int delta = (short)ttf_u16(p + delta_b + i * 2);
+            int ro = (int)ttf_u16(p + range_b + i * 2);
+
+            if ((int)code > end)
+                continue;
+            if ((int)code < start)
+                return -1;
+            if (ro == 0)
+                return (int)((code + (u32)delta) & 0xFFFFu);
+            {
+                int idx = range_b + i * 2 + ro + ((int)code - start) * 2;
+
+                if (idx + 2 > n)
+                    return -1;
+                {
+                    int g = (int)ttf_u16(p + idx);
+
+                    if (g == 0)
+                        return 0;
+                    return (int)((g + delta) & 0xFFFF);
+                }
+            }
+        }
+        return -1;
+    }
+    if (f->cmap_fmt == 12) {
+        int base = f->cmap_off;
+        u32 ngroups = ttf_u32(p + base + 12);
+        u32 i = 0;
+
+        if (ngroups > 100000 || base + 16 + (int)ngroups * 12 > n)
+            return -1;
+        for (i = 0; i < ngroups; i++) {
+            const u8 *g = p + base + 16 + (int)i * 12;
+            u32 start = ttf_u32(g), end = ttf_u32(g + 4);
+
+            if (code < start)
+                return -1;
+            if (code <= end)
+                return (int)(ttf_u32(g + 8) + (code - start));
+        }
+        return -1;
+    }
+    return -1;
+}
+
+int ttf_advance(const void *src, int n, const Ttf *f, int gid)
+{
+    const u8 *p = (const u8 *)src;
+    int idx = 0;
+
+    if (!src || !f || gid < 0)
+        return -1;
+    if (gid >= f->n_hmetrics)
+        gid = f->n_hmetrics - 1;
+    idx = f->hmtx_off + gid * 4;
+    if (idx + 2 > n)
+        return -1;
+    return (int)ttf_u16(p + idx);
+}
+
+/* ---- 自测 ---- */
+
+static void ttf_put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+static void ttf_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+/* 造一个最小字体：5 张表，cmap format 4 映射 'A'/'B' 到 1/2 */
+static int mk_ttf(u8 *buf)
+{
+    int off = 12 + 5 * 16;
+    int head = 0, hhea = 0, maxp = 0, cmap = 0, hmtx = 0;
+    int i = 0;
+    static const char *tags[5] = { "cmap", "head", "hhea", "hmtx", "maxp" };
+    int offs[5] = { 0 };
+
+    memset(buf, 0, 1024);
+    ttf_put32(buf, 0x00010000u);
+    ttf_put16(buf + 4, 5);
+    ttf_put16(buf + 6, 128);
+    /* 先把每张表的偏移算出来（都 4 字节对齐） */
+    cmap = off;
+    off += 4 + 8 + 4 + 4 + 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2;
+    off = (off + 3) & ~3;
+    head = off;
+    off += 54;
+    off = (off + 3) & ~3;
+    hhea = off;
+    off += 36;
+    off = (off + 3) & ~3;
+    maxp = off;
+    off += 32;
+    off = (off + 3) & ~3;
+    hmtx = off;
+    off += 3 * 4;                       /* 3 个 hMetric */
+    offs[0] = cmap;
+    offs[1] = head;
+    offs[2] = hhea;
+    offs[3] = hmtx;
+    offs[4] = maxp;
+    for (i = 0; i < 5; i++) {
+        u8 *e = buf + 12 + i * 16;
+        int len = 54;
+
+        memcpy(e, tags[i], 4);
+        ttf_put32(e + 8, (u32)offs[i]);
+        if (i == 0)
+            len = 44;
+        else if (i == 2)
+            len = 36;
+        else if (i == 3)
+            len = 12;
+        else if (i == 4)
+            len = 32;
+        ttf_put32(e + 12, (u32)len);
+    }
+    /* cmap：1 个子表 (3,1)，format 4，两个段 */
+    ttf_put16(buf + cmap, 0);
+    ttf_put16(buf + cmap + 2, 1);
+    ttf_put16(buf + cmap + 4, 3);
+    ttf_put16(buf + cmap + 6, 1);
+    ttf_put32(buf + cmap + 8, 12);
+    {
+        u8 *s = buf + cmap + 12;
+
+        ttf_put16(s, 4);                /* format */
+        ttf_put16(s + 2, 32);           /* length */
+        ttf_put16(s + 4, 0);            /* language */
+        ttf_put16(s + 6, 4);            /* segCountX2 = 2 段 */
+        ttf_put16(s + 8, 4);            /* searchRange */
+        ttf_put16(s + 10, 1);           /* entrySelector */
+        ttf_put16(s + 12, 0);           /* rangeShift */
+        ttf_put16(s + 14, 0x42);        /* endCode[0] = 'B' */
+        ttf_put16(s + 16, 0xFFFF);      /* endCode[1] */
+        ttf_put16(s + 18, 0);           /* reservedPad */
+        ttf_put16(s + 20, 0x41);        /* startCode[0] = 'A' */
+        ttf_put16(s + 22, 0xFFFF);      /* startCode[1] */
+        ttf_put16(s + 24, (0x10000 - 0x41 + 1) & 0xFFFF);  /* idDelta[0] */
+        ttf_put16(s + 26, 1);           /* idDelta[1] */
+        ttf_put16(s + 28, 0);           /* idRangeOffset[0] */
+        ttf_put16(s + 30, 0);           /* idRangeOffset[1] */
+    }
+    /* head */
+    ttf_put32(buf + head, 0x00010000u);
+    ttf_put16(buf + head + 18, 1000);   /* unitsPerEm */
+    ttf_put16(buf + head + 50, 0);      /* indexToLocFormat */
+    /* hhea */
+    ttf_put32(buf + hhea, 0x00010000u);
+    ttf_put16(buf + hhea + 4, 800);     /* ascender */
+    ttf_put16(buf + hhea + 6, (u16)(-200 & 0xFFFF));  /* descender */
+    ttf_put16(buf + hhea + 34, 3);      /* numberOfHMetrics */
+    /* maxp */
+    ttf_put32(buf + maxp, 0x00010000u);
+    ttf_put16(buf + maxp + 4, 3);       /* numGlyphs */
+    /* hmtx：500 / 600 / 700 */
+    ttf_put16(buf + hmtx, 500);
+    ttf_put16(buf + hmtx + 4, 600);
+    ttf_put16(buf + hmtx + 8, 700);
+    return off;
+}
+
+test "ttf：表目录与常用度量" {
+    static u8 buf[1024] = { 0 };
+    Ttf f = { 0 };
+    int n = mk_ttf(buf);
+
+    if (ttf_info(buf, n, &f) != 1)
+        return err(1, "字体解析失败");
+    if (f.units_per_em != 1000 || f.n_glyphs != 3 || f.n_hmetrics != 3)
+        return err(2, "基本字段不对");
+    if (f.ascender != 800 || f.descender != -200)
+        return err(3, "升降部不对");
+    if (f.cmap_fmt != 4 || f.cmap_off <= 0)
+        return err(4, "应该选中 format 4");
+    if (f.index_to_loc != 0 || f.head_off <= 0 || f.hmtx_off <= 0)
+        return err(5, "表偏移不对");
+    if (ttf_glyph(buf, n, &f, 'A') != 1 || ttf_glyph(buf, n, &f, 'B') != 2)
+        return err(6, "字形映射不对");
+    if (ttf_glyph(buf, n, &f, 'C') != -1)
+        return err(7, "不存在的字符应该 -1");
+    if (ttf_advance(buf, n, &f, 0) != 500 || ttf_advance(buf, n, &f, 1) != 600
+        || ttf_advance(buf, n, &f, 2) != 700)
+        return err(8, "前进宽度不对");
+    /* 超出 numberOfHMetrics 的字形按最后一个算 */
+    if (ttf_advance(buf, n, &f, 99) != 700)
+        return err(9, "超界应该用最后一个 advance");
+}
+
+test "ttf：坏数据与边界" {
+    static u8 buf[1024] = { 0 };
+    Ttf f = { 0 };
+    int n = mk_ttf(buf);
+
+    if (ttf_info("not a font at all", 17, &f) != -1)
+        return err(10, "flavor 不对应该 -1");
+    if (ttf_info(buf, 8, &f) != -1)
+        return err(11, "太短应该 -1");
+    if (ttf_info(buf, n, 0) != -1)
+        return err(12, "空指针应该 -1");
+    if (ttf_info(buf, n, &f) != 1 || ttf_glyph(buf, n, &f, 0x1F600) != -1)
+        return err(13, "没有的码点应该 -1");
+    if (ttf_advance(buf, n, &f, -1) != -1)
+        return err(14, "负字形号应该 -1");
+    /* 表数过大 */
+    ttf_put16(buf + 4, 1000);
+    if (ttf_info(buf, n, &f) != -1)
+        return err(15, "表数过大应该 -1");
+    /* 表偏移越界 */
+    ttf_put16(buf + 4, 5);
+    ttf_put32(buf + 12 + 16 + 8, 4096);
+    if (ttf_info(buf, n, &f) != -1)
+        return err(16, "表偏移越界应该 -1");
+    if (ttf_glyph(buf, n, 0, 'A') != -1)
+        return err(17, "空字体应该 -1");
+}

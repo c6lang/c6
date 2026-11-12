@@ -1523,6 +1523,34 @@ libc 薄封装，重点在把 errno 变成明确的 1/0/-1 语义、把结构体
 验收：`make stdtest`（169 个模块、0 failure）、`make std-legacy`（24 条自检全过）、
 `make check-all`。
 
+### 11.52 标准库第四十批（bdf / woff / svg / ttf）
+
+第四十批拐到「字体与矢量」：位图字体的老格式 BDF、Web 字体容器 WOFF、矢量路径
+（SVG 的 `d`）与 TrueType 度量。四者共同点是**表/段目录先行**，正文按偏移取。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.bdf` | BDF | 关键字白名单式扫描；`bbw/bbh` 决定每行 `ceil(w/8)` 字节；位图按十六进制两字符一字节、高位在左；`ENCODING -1` 的复合字形返回 0 跳过 |
+| `std.data.woff` | WOFF 1.0 | 只解容器：`compLength < origLength` 的表原样交出偏移与长度，解压交给 `std.encoding.zlib`；校验 `length` 不小于目录长度、每表偏移不越界 |
+| `std.data.svg` | SVG path | 全部分量绝对化，`H/V`→`L`，`S`/`T` 反射上一控制点，`M` 后隐式 `L`；`A` 保留七参数不拆贝塞尔；包围盒用**控制点凸包**，弧按端点 ±`rx`/`ry` 外扩，因此只大不小 |
+| `std.data.ttf` | TTF/OTF | 只读 `head`/`hhea`/`maxp`/`cmap`/`hmtx`；`cmap` 只挑 `(3,1)`、`(3,10)` 子表的 format 4/12；`ttf_glyph` 未映射返回 -1（0 是 `.notdef`） |
+
+BDF 的十六进制行有个小坑：一行写奇数个 nibble 是坏数据（要报错），但不能因为
+行比 `ceil(w/8)` 长就拒绝——有些生成器会补尾随空白。SVG 的 `A` 起点并不在参数
+里，包围盒要用解析器当前的 `cx/cy`，所以 `svg_path_bbox` 必须和 `svg_next` 共用
+同一套状态。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.bdf`=0x60a9、
+`std.data.woff`=0x60aa、`std.data.svg`=0x60ab、`std.data.ttf`=0x60ac；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-font` 与 `STD_FONT_SRCS`（链接带 `-lm`，因为
+`svg` 用 `pow`/`fabs`），`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里
+都只依赖 `std/text/str.c6`。顺带修掉上一批文档表格里 `std/data/pnm.c6` 那一行被
+接到 `xpm` 行末尾的问题。
+
+验收：`make stdtest`（173 个模块、0 failure）、`make std-font`（24 条自检全过）、
+`make check-all`。
+
+
 
 
 

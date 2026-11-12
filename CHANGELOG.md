@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第四十批（字体与矢量）**：`std.data.bdf`（BDF 位图字体）、
+  `std.data.woff`（WOFF 1.0 容器）、`std.data.svg`（路径规范化 + 包围盒）、
+  `std.data.ttf`（表目录 + cmap/hmtx 度量），集成示例 `examples/stdfont.c6`
+  （`make std-font`，链接带 `-lm`）。错误号段 `std.data.bdf`=0x60a9 …
+  `std.data.ttf`=0x60ac（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第三十九批（老图形格式）**：`std.data.pcx`（RLE + 调色板/24 位/1 位）、
   `std.data.hdr`（Radiance RGBE，新老两种扫描线，含 `hdr_to_rgb`）、
   `std.data.xbm`（C 源码位图）、`std.data.xpm`（C 源码彩图 + 透明键），集成示例

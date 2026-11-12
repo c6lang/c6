@@ -304,6 +304,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/hdr.c6           std.data.hdr           Radiance RGBE：头解析、新式扫描线 RLE 与老式平铺（含 1 1 1 count）、hdr_to_rgb 色调映射
   std/data/xbm.c6           std.data.xbm           X BitMap：从 #define *_width/*_height 取尺寸，解花括号里的字节，xbm_pixel 按 X11 位序
   std/data/xpm.c6           std.data.xpm           X PixMap：w h ncolors cpp + 颜色表 + 像素行，支持 None/#RGB/#RRGGBB/#RRRRGGGGBBBB
+  std/data/bdf.c6           std.data.bdf           BDF 位图字体：FONT/SIZE/FONTBOUNDINGBOX/CHARS 头，DWIDTH/BBX 度量，十六进制位图（高位在左）
+  std/data/woff.c6          std.data.woff          WOFF 1.0 容器：44 字节头 + 每表 20 字节目录，给出 offset/compLength/origLength/checksum
+  std/data/svg.c6           std.data.svg           SVG 路径：d 规范化为 M/L/C/Q/A/Z（H/V 并入、S/T 反射），包围盒用控制点凸包
+  std/data/ttf.c6           std.data.ttf           TrueType/OTF 度量：表目录 + head/hhea/maxp/cmap(format 4/12)/hmtx，ttf_glyph/ttf_advance
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -399,6 +403,7 @@ make std-ser     # 编译并运行 examples/stdser.c6（第三十六批序列化
 make std-sys     # 编译并运行 examples/stdsys.c6（第三十七批系统视图模块的拼装示例）
 make std-hash    # 编译并运行 examples/stdhash.c6（第三十八批哈希与校验模块的拼装示例）
 make std-legacy  # 编译并运行 examples/stdlegacy.c6（第三十九批老图形格式模块的拼装示例）
+make std-font    # 编译并运行 examples/stdfont.c6（第四十批字体与矢量模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
