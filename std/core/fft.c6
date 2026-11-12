@@ -1,0 +1,198 @@
+/* std/core/fft：基 2 的迭代式快速傅里叶变换（正变换与逆变换）。
+ *
+ *     import std.core.fft;
+ *
+ *     double re[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+ *     double im[8] = { 0 };
+ *     fft(re, im, 8, 0);          // 冲激 → 全 1
+ *     fft(re, im, 8, 1);          // 逆变换：带 1/n 归一化
+ *
+ * 约定：
+ *
+ * - `re`/`im` 分别是实部与虚部数组，长度 `n` **必须是 2 的幂**（`fft_ok(n)` 判断），
+ *   否则返回 -1；
+ * - 正变换用 `exp(-2πik/n)`，逆变换用 `exp(+2πik/n)` 并在最后除以 `n`，
+ *   所以「正变换 + 逆变换」能原样还原输入；
+ * - 原地运算，不分配内存；位反转与旋转因子都在循环里现算；
+ * - `fft_magnitude` 输出 `sqrt(re²+im²)`，`fft_power` 输出 `re²+im²`；
+ * - 结果有浮点误差（量级 1e-15），比较时请用容差；
+ * - 不处理奇数长度（要的话自己补零到 2 的幂）。
+ */
+#include <math.h>
+
+module std.core.fft;
+import std.core.types;
+
+#define FFT_PI 3.14159265358979323846
+
+int fft_ok(int n)
+{
+    if (n <= 0)
+        return 0;
+    return (n & (n - 1)) == 0;
+}
+
+int fft(double *re, double *im, int n, int inverse)
+{
+    int i = 0, j = 0, len = 0;
+
+    if (!re || !im || !fft_ok(n) || n < 2)
+        return -1;
+    /* 位反转置换 */
+    for (i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+
+        for (; j & bit; bit >>= 1)
+            j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            double tr = re[i], ti = im[i];
+
+            re[i] = re[j];
+            im[i] = im[j];
+            re[j] = tr;
+            im[j] = ti;
+        }
+    }
+    for (len = 2; len <= n; len <<= 1) {
+        double ang = 2 * FFT_PI / (double)len * (inverse ? 1.0 : -1.0);
+        double wr = cos(ang), wi = sin(ang);
+        int half = len / 2;
+
+        for (i = 0; i < n; i += len) {
+            double cr = 1, ci = 0;
+            int k = 0;
+
+            for (k = 0; k < half; k++) {
+                int a = i + k, b = i + k + half;
+                double xr = re[b] * cr - im[b] * ci;
+                double xi = re[b] * ci + im[b] * cr;
+                double nr = 0, ni = 0;
+
+                re[b] = re[a] - xr;
+                im[b] = im[a] - xi;
+                re[a] += xr;
+                im[a] += xi;
+                nr = cr * wr - ci * wi;
+                ni = cr * wi + ci * wr;
+                cr = nr;
+                ci = ni;
+            }
+        }
+    }
+    if (inverse) {
+        for (i = 0; i < n; i++) {
+            re[i] /= (double)n;
+            im[i] /= (double)n;
+        }
+    }
+    return 0;
+}
+
+int fft_magnitude(const double *re, const double *im, double *out, int n)
+{
+    int i = 0;
+
+    if (!re || !im || !out || n <= 0)
+        return -1;
+    for (i = 0; i < n; i++)
+        out[i] = sqrt(re[i] * re[i] + im[i] * im[i]);
+    return 0;
+}
+
+int fft_power(const double *re, const double *im, double *out, int n)
+{
+    int i = 0;
+
+    if (!re || !im || !out || n <= 0)
+        return -1;
+    for (i = 0; i < n; i++)
+        out[i] = re[i] * re[i] + im[i] * im[i];
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+static int fnear(double a, double b)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d < 1e-9;
+}
+
+test "fft：冲激与常数" {
+    double re[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+    double im[8] = { 0 };
+    int i = 0;
+
+    if (fft_ok(8) != 1 || fft_ok(6) != 0 || fft_ok(0) != 0)
+        return err(1, "fft_ok 不对");
+    if (fft(re, im, 8, 0) != 0)
+        return err(2, "正变换失败");
+    for (i = 0; i < 8; i++) {
+        if (!fnear(re[i], 1) || !fnear(im[i], 0))
+            return err(3, "冲激的频谱应该全是 1");
+    }
+    /* 常数序列 1,1,...,1 → 只有 DC 分量是 n */
+    for (i = 0; i < 8; i++) {
+        re[i] = 1;
+        im[i] = 0;
+    }
+    if (fft(re, im, 8, 0) != 0)
+        return err(4, "正变换失败");
+    if (!fnear(re[0], 8) || !fnear(im[0], 0))
+        return err(5, "DC 分量应该是 8");
+    for (i = 1; i < 8; i++) {
+        if (!fnear(re[i], 0) || !fnear(im[i], 0))
+            return err(6, "非 DC 分量应该是 0");
+    }
+    if (fft(re, im, 6, 0) != -1)
+        return err(7, "非 2 的幂应该 -1");
+}
+
+test "fft：单频与往返" {
+    double re[16] = { 0 };
+    double im[16] = { 0 };
+    double mag[16] = { 0 };
+    double orig[16] = { 0 };
+    int i = 0, peak = 0;
+
+    /* 频率 2 的正弦：cos(2π*2*i/16) */
+    for (i = 0; i < 16; i++) {
+        re[i] = cos(2 * FFT_PI * 2.0 * (double)i / 16.0);
+        im[i] = 0;
+        orig[i] = re[i];
+    }
+    if (fft(re, im, 16, 0) != 0)
+        return err(8, "正变换失败");
+    if (fft_magnitude(re, im, mag, 16) != 0)
+        return err(9, "幅度计算失败");
+    for (i = 1; i < 16; i++) {
+        if (mag[i] > mag[peak])
+            peak = i;
+    }
+    /* 实信号：第 2 与第 14 个频点是共轭对，两个都应该接近 n/2 */
+    if (!fnear(mag[2], 8) || !fnear(mag[14], 8))
+        return err(10, "第 2/14 频点的幅度应该是 8");
+    if (mag[5] > 1e-9 || mag[0] > 1e-9)
+        return err(14, "非峰值频点应该接近 0");
+    (void)peak;
+    /* 往返还原 */
+    if (fft(re, im, 16, 1) != 0)
+        return err(11, "逆变换失败");
+    for (i = 0; i < 16; i++) {
+        if (!fnear(re[i], orig[i]) || !fnear(im[i], 0))
+            return err(12, "往返不一致");
+    }
+    /* 功率谱 */
+    for (i = 0; i < 16; i++) {
+        re[i] = 0;
+        im[i] = 0;
+    }
+    re[0] = 3;
+    im[0] = 4;
+    if (fft_power(re, im, mag, 16) != 0 || !fnear(mag[0], 25))
+        return err(13, "功率谱不对");
+}

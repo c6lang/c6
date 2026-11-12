@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第四十七批（数值工具）**：`std.core.vector`（Vec2/Vec3 运算）、
+  `std.core.polynomial`（求值/求导/加减乘/二次求根）、`std.core.fft`（基 2 迭代
+  FFT，正逆变换）、`std.core.spline`（贝塞尔/Hermite/Catmull-Rom），集成示例
+  `examples/stdnumeric.c6`（`make std-math2`，链接带 `-lm`）。错误号段
+  `std.core.vector`=0x60c5 … `std.core.spline`=0x60c8（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第四十六批（文本变换）**：`std.text.slug`（URL slug，UTF-8 + 去音标）、
   `std.text.casing`（snake/kebab/camel/Pascal/title 互转）、`std.text.roman`
   （罗马数字往返 + 标准形式校验）、`std.text.phonetic`（Soundex + 简化 Metaphone），

@@ -1,0 +1,136 @@
+/* std/core/spline：贝塞尔、Hermite 与 Catmull-Rom 插值（标量版本）。
+ *
+ *     import std.core.spline;
+ *
+ *     double y = bezier3(0, 1, 2, 3, 0.5);       // 三次贝塞尔
+ *     double z = catmull_rom(0, 1, 2, 3, 0.5);   // 过中间两点的样条
+ *
+ * 这里全是**标量**曲线：二维/三维曲线按分量分别调用即可（`y = catmull_rom(p0.y,
+ * p1.y, p2.y, p3.y, t)`）。参数一律 `t ∈ [0,1]`（超出范围会按公式外推，不夹断）。
+ *
+ * 约定：
+ *
+ * - `bezier2(p0,p1,p2,t)`：二次贝塞尔；
+ * - `bezier3(p0,p1,p2,p3,t)`：三次贝塞尔，`bezier3_deriv` 给导数（对 t）；
+ * - `hermite(p0,p1,m0,m1,t)`：给定两端切线的三次 Hermite；
+ * - `catmull_rom(p0,p1,p2,p3,t)`：过 `p1`→`p2` 的 Catmull-Rom 段，`p0`/`p3` 只
+ *   用来算切线（`(p2-p0)/2`、`(p3-p1)/2`）；
+ * - `spline_segments(len, max_seg)`：按每段不超过 `max_seg` 的段长算需要几段
+ *   （至少 1），方便调用方采样；
+ * - 不分配内存、不做弧长参数化。
+ */
+#include <math.h>
+
+module std.core.spline;
+import std.core.types;
+
+double bezier2(double p0, double p1, double p2, double t)
+{
+    double u = 1 - t;
+
+    return u * u * p0 + 2 * u * t * p1 + t * t * p2;
+}
+
+double bezier3(double p0, double p1, double p2, double p3, double t)
+{
+    double u = 1 - t;
+
+    return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2
+           + t * t * t * p3;
+}
+
+double bezier3_deriv(double p0, double p1, double p2, double p3, double t)
+{
+    double u = 1 - t;
+
+    return 3 * u * u * (p1 - p0) + 6 * u * t * (p2 - p1)
+           + 3 * t * t * (p3 - p2);
+}
+
+double hermite(double p0, double p1, double m0, double m1, double t)
+{
+    double t2 = t * t, t3 = t2 * t;
+
+    return (2 * t3 - 3 * t2 + 1) * p0 + (t3 - 2 * t2 + t) * m0
+           + (-2 * t3 + 3 * t2) * p1 + (t3 - t2) * m1;
+}
+
+double catmull_rom(double p0, double p1, double p2, double p3, double t)
+{
+    double m0 = (p2 - p0) * 0.5;
+    double m1 = (p3 - p1) * 0.5;
+
+    return hermite(p1, p2, m0, m1, t);
+}
+
+int spline_segments(double len, double max_seg)
+{
+    int n = 0;
+
+    if (len <= 0)
+        return 1;
+    if (max_seg <= 0)
+        return 1;
+    n = (int)(len / max_seg);
+    if ((double)n * max_seg < len)
+        n++;
+    if (n < 1)
+        n = 1;
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+static int snear(double a, double b)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d < 1e-9;
+}
+
+test "spline：贝塞尔" {
+    if (!snear(bezier2(0, 1, 2, 0), 0))
+        return err(1, "二次贝塞尔 t=0 应该是 p0");
+    if (!snear(bezier2(0, 1, 2, 1), 2))
+        return err(2, "二次贝塞尔 t=1 应该是 p2");
+    if (!snear(bezier2(0, 1, 2, 0.5), 1))
+        return err(3, "二次贝塞尔中点应该是 1");
+    if (!snear(bezier3(0, 1, 2, 3, 0), 0) || !snear(bezier3(0, 1, 2, 3, 1), 3))
+        return err(4, "三次贝塞尔端点不对");
+    if (!snear(bezier3(0, 1, 2, 3, 0.5), 1.5))
+        return err(5, "三次贝塞尔中点应该是 1.5");
+    /* 导数：t=0 时是 3*(p1-p0) */
+    if (!snear(bezier3_deriv(0, 1, 2, 3, 0), 3))
+        return err(6, "t=0 的导数应该是 3");
+    if (!snear(bezier3_deriv(0, 1, 2, 3, 1), 3))
+        return err(7, "t=1 的导数应该是 3");
+    if (!snear(bezier2(5, 5, 5, 0.37), 5))
+        return err(8, "常值曲线应该恒为 5");
+}
+
+test "spline：Hermite 与 Catmull-Rom" {
+    double v = 0;
+
+    if (!snear(hermite(0, 10, 0, 0, 0), 0)
+        || !snear(hermite(0, 10, 0, 0, 1), 10))
+        return err(9, "Hermite 端点不对");
+    if (!snear(hermite(0, 10, 0, 0, 0.5), 5))
+        return err(10, "Hermite 中点应该是 5");
+    /* 切线影响中点：m0 = 10, m1 = 10 → 中点 = 0.5*0 + 0.125*10 + 0.5*10 + ... */
+    v = hermite(0, 10, 10, 0, 0.5);
+    if (!snear(v, 6.25))
+        return err(11, "带切线的 Hermite 中点不对");
+    /* Catmull-Rom 过中间两点 */
+    if (!snear(catmull_rom(0, 1, 2, 3, 0), 1))
+        return err(12, "Catmull-Rom t=0 应该等于 p1");
+    if (!snear(catmull_rom(0, 1, 2, 3, 1), 2))
+        return err(13, "Catmull-Rom t=1 应该等于 p2");
+    if (!snear(catmull_rom(0, 1, 2, 3, 0.5), 1.5))
+        return err(14, "等距四点的中点应该是 1.5");
+    if (spline_segments(10, 2) != 5 || spline_segments(9, 2) != 5)
+        return err(15, "段数计算不对");
+    if (spline_segments(0, 2) != 1 || spline_segments(1, 0) != 1)
+        return err(16, "退化情况应该至少 1 段");
+}

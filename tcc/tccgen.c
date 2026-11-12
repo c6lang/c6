@@ -12902,6 +12902,10 @@ static const struct C6ErrStdSlot {
     { "std.text.casing",        C6_ERR_SLOT_STD + 194 },
     { "std.text.roman",         C6_ERR_SLOT_STD + 195 },
     { "std.text.phonetic",      C6_ERR_SLOT_STD + 196 },
+    { "std.core.vector",        C6_ERR_SLOT_STD + 197 },
+    { "std.core.polynomial",    C6_ERR_SLOT_STD + 198 },
+    { "std.core.fft",           C6_ERR_SLOT_STD + 199 },
+    { "std.core.spline",        C6_ERR_SLOT_STD + 200 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

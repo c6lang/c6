@@ -1,0 +1,154 @@
+/* examples/stdnumeric.c6 —— 第四十七批（数值工具）的集成示例。
+ *
+ *     make std-math2
+ *
+ * 四节：矢量运算、多项式（求值/求导/求根）、FFT（往返还原与单频频谱）、
+ * 曲线插值（贝塞尔 / Catmull-Rom 采样）。链接需要 `-lm`。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.vector;
+import std.core.polynomial;
+import std.core.fft;
+import std.core.spline;
+
+#define FFT_PI 3.14159265358979323846
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static int near(double a, double b)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d < 1e-9;
+}
+
+static void do_vector(void)
+{
+    Vec3 a = vec3_make(1, 2, 3);
+    Vec3 b = vec3_make(0, 1, 0);
+    Vec3 c = vec3_cross(a, b);
+    Vec2 p = vec2_make(3, 4);
+
+    printf("== vector\n");
+    printf("   |(3,4)| = %g，a·b = %g，a×b = (%g,%g,%g)\n", vec2_len(p),
+           vec3_dot(a, b), c.x, c.y, c.z);
+    check(near(vec2_len(p), 5), "二维长度");
+    check(near(vec3_dot(a, b), 2), "三维点积");
+    check(near(c.x, -3) && near(c.y, 0) && near(c.z, 1), "三维叉积");
+    check(near(vec2_norm(p).x, 0.6) && near(vec2_norm(p).y, 0.8), "归一化");
+    check(near(vec3_project(vec3_make(4, 0, 0), vec3_make(2, 0, 0)).x, 4),
+          "投影");
+    check(near(vec3_angle(vec3_make(1, 0, 0), vec3_make(1, 1, 0)),
+               FFT_PI / 4), "45 度夹角");
+}
+
+static void do_poly(void)
+{
+    double c[4] = { 1, 0, -1, 2 };      /* 1 - x^2 + 2x^3 */
+    double d[8] = { 0 };
+    double x1 = 0, x2 = 0;
+    int n = 0;
+
+    printf("== poly\n");
+    printf("   p(2) = %g，p'(2) = %g\n", poly_eval(c, 4, 2),
+           poly_eval_deriv(c, 4, 2));
+    check(near(poly_eval(c, 4, 2), 13), "p(2)");
+    check(near(poly_eval_deriv(c, 4, 2), 20), "p'(2)");
+    n = poly_deriv(c, 4, d, 8);
+    printf("   p'(x) = %g + %g x + %g x^2\n", d[0], d[1], d[2]);
+    check(n == 3 && near(d[0], 0) && near(d[1], -2) && near(d[2], 6),
+          "导数系数");
+    check(poly_roots2(1, -3, 2, &x1, &x2) == 2 && near(x1, 1) && near(x2, 2),
+          "x^2-3x+2 的根");
+    check(poly_roots2(1, 0, 1, &x1, &x2) == 0, "无实根");
+    {
+        double a[3] = { 1, 2, 3 };
+        double b[2] = { 0, 1 };
+        double out[8] = { 0 };
+        int m = poly_mul(a, 3, b, 2, out, 8);
+
+        check(m == 4 && near(out[1], 1) && near(out[3], 3), "多项式乘法");
+    }
+}
+
+static void do_fft(void)
+{
+    double re[16] = { 0 };
+    double im[16] = { 0 };
+    double orig[16] = { 0 };
+    double mag[16] = { 0 };
+    int i = 0, ok = 1;
+
+    printf("== fft\n");
+    for (i = 0; i < 16; i++) {
+        re[i] = cos(2 * FFT_PI * 2.0 * (double)i / 16.0);
+        orig[i] = re[i];
+        im[i] = 0;
+    }
+    check(fft(re, im, 16, 0) == 0, "正变换");
+    fft_magnitude(re, im, mag, 16);
+    printf("   峰值频点 2 的幅度 = %g（n/2 = 8），DC = %g\n", mag[2], mag[0]);
+    check(near(mag[2], 8) && near(mag[14], 8), "共轭频点幅度");
+    check(mag[0] < 1e-9, "DC 接近 0");
+    check(fft(re, im, 16, 1) == 0, "逆变换");
+    for (i = 0; i < 16; i++) {
+        double d = re[i] - orig[i];
+
+        if (d < 0)
+            d = -d;
+        if (d > 1e-9)
+            ok = 0;
+    }
+    check(ok == 1, "往返还原");
+    check(fft(re, im, 12, 0) == -1, "非 2 的幂报错");
+}
+
+static void do_spline(void)
+{
+    int i = 0, mono = 1;
+    double prev = -1e9;
+
+    printf("== spline\n");
+    check(near(bezier3(0, 1, 2, 3, 0.5), 1.5), "三次贝塞尔中点");
+    check(near(bezier2(0, 1, 2, 0.5), 1), "二次贝塞尔中点");
+    check(near(catmull_rom(0, 1, 2, 3, 0), 1)
+          && near(catmull_rom(0, 1, 2, 3, 1), 2), "Catmull-Rom 端点");
+    printf("   采样：");
+    for (i = 0; i <= 4; i++) {
+        double t = (double)i / 4.0;
+        double y = catmull_rom(0, 1, 2, 3, t);
+
+        printf("%g ", y);
+        if (y < prev)
+            mono = 0;
+        prev = y;
+    }
+    printf("\n");
+    check(mono == 1, "等距四点的样条单调");
+    check(spline_segments(10, 2) == 5 && spline_segments(9, 2) == 5, "段数");
+}
+
+int main(void)
+{
+    do_vector();
+    do_poly();
+    do_fft();
+    do_spline();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

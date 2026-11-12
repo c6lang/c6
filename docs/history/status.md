@@ -1701,6 +1701,32 @@ FTP 的解析坑值得记一笔：`LIST` 行是定字段的「权限 链接 属�
 验收：`make stdtest`（197 个模块、0 failure）、`make std-words`（23 条自检全过）、
 `make check-all`。
 
+### 11.59 标准库第四十七批（vector / polynomial / fft / spline）
+
+第四十七批补数值工具：矢量、多项式、FFT、曲线插值。这一批开始碰 `libm`，
+`stdtest` 里没关系（测试驱动一直带 `-lm`），但拼装示例的目标要在链接行显式加 `-lm`。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.vector` | Vec2 / Vec3 | 值类型、按值传参；归一化遇到零矢量返回零矢量而不是 NaN；`vec2_cross` 返回标量、`vec3_cross` 返回矢量；`vec3_angle` 把 `dot/(|a||b|)` 夹到 `[-1,1]` 再 `acos` |
+| `std.core.polynomial` | 多项式 | 系数升幂、`n` 是系数个数；求值用 Horner；加减乘都写到调用方缓冲并 `poly_trim` 去尾零；`poly_roots2` 按判别式返回根数并保证 `x1 <= x2` |
+| `std.core.fft` | 基 2 FFT | 原地位反转 + 三层循环蝶形；逆变换带 `1/n` 归一化；**要求长度是 2 的幂**（`fft_ok`），奇数长度直接 -1 而不是偷偷补零 |
+| `std.core.spline` | 贝塞尔 / Hermite / Catmull-Rom | 全部是标量函数（多维按分量调用）；Catmull-Rom 的切线取 `(p2-p0)/2`、`(p3-p1)/2`；`hermite` 的四个基函数系数容易抄错，测试里用「两端切线为 0 时中点等于中值」和「只有 m0 时中点 = 0.625*Δ」两种情形卡住 |
+
+模块名踩坑两处：文件必须叫 `polynomial.c6`（`module std.core.polynomial` 的名字就是
+路径，写成 `poly.c6` 会报 `module file declares … expected …`）；示例 `import` 的名字
+也得跟着改。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.vector`=0x60c5、
+`std.core.polynomial`=0x60c6、`std.core.fft`=0x60c7、`std.core.spline`=0x60c8；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-math2` 与 `STD_MATH2_SRCS`（链接带
+`-lm`），`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里无依赖、各 2 条用例。
+示例 `examples/stdnumeric.c6` 四节（23 条自检）。
+
+验收：`make stdtest`（201 个模块、0 failure）、`make std-math2`（23 条自检全过）、
+`make check-all`。
+
+
 
 
 
