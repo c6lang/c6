@@ -217,6 +217,10 @@
 | `std/data/ogg.c6` | `std.data.ogg` | Ogg：`ogg_page` 解 27 字节页头 + 段表（算出数据偏移与整页长度，granule 按 64 位有符号读），`ogg_stream` 从 BOS 页首包识别 Vorbis / Opus / Speex / FLAC / Theora 并取声道与采样率 |
 | `std/data/flac.c6` | `std.data.flac` | FLAC：`flac_info` 解析 `fLaC` + STREAMINFO（块/帧大小、20 位采样率、3 位声道-1、5 位位深-1、36 位总样本数、MD5），`flac_block_at` 走元数据块链，`flac_vendor`/`flac_tag_count`/`flac_tag` 读 VORBIS_COMMENT |
 | `std/data/midi.c6` | `std.data.midi` | 标准 MIDI 文件：`midi_info` 解 `MThd`（格式/轨数/division，含 SMPTE 分支），`midi_track_at` 按 `MTrk` 取轨，`midi_vlq` 解 1~4 字节变长量，`midi_event_at` 解通道消息 / meta / sysex（running status 不支持） |
+| `std/net/smtp.c6` | `std.net.smtp` | SMTP：`smtp_reply` 解三位状态码（`250-` 表示还有后续行、`250 ` 是末行），`smtp_cmd` 拼「动词 + 参数 + CRLF」并拒 CR/LF 注入，`smtp_data` 做 DATA 段的三件事（CRLF 归一、行首点再补点、末尾 `.<CRLF>`） |
+| `std/net/ftp.c6` | `std.net.ftp` | FTP：`ftp_reply` 解状态码与多行标志，`ftp_pasv` 从 `227 …(h1,h2,h3,h4,p1,p2)` 拼出地址与端口（`p1*256+p2`），`ftp_cmd` 拼命令，`ftp_list_line` 解类 Unix 长格式、`ftp_mlsd_line` 解 `type=…;size=…; name` |
+| `std/net/redis.c6` | `std.net.redis` | RESP：`resp_parse` 解 `+`/`-`/`:`/`$`/`*` 五种类型（给出内容偏移、长度、整段字节数，`$-1`/`*-1` 是 null），`resp_encode_bulk`/`resp_encode_int`/`resp_encode_array_hdr`/`resp_encode_cmd` 负责编码；数组只解头 |
+| `std/net/telnet.c6` | `std.net.telnet` | Telnet：`telnet_parse` 分别返回协商命令（WILL/WONT/DO/DONT/SB…SE）、普通数据字节、`IAC IAC` 转义的 0xFF，`telnet_reply` 按方向给应答（WILL→DO、DO→WILL），`telnet_unescape` 丢协商、还原 0xFF |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -303,6 +307,7 @@
 | `examples/stddisk.c6` | （无模块） | 第四十一批（分区与文件系统）的拼装示例（`make std-disk`）：现场拼 MBR+GPT、FAT16 BPB 与目录、ISO 9660 卷与目录记录、ext2 超级块与 inode |
 | `examples/stdtranscode.c6` | （无模块） | 第四十二批（老式文本编码）的拼装示例（`make std-transcode`）：basE91、uuencode、yEnc、EBCDIC 各编码一遍再解回原文 |
 | `examples/stdaudio.c6` | （无模块） | 第四十三批（音频容器）的拼装示例（`make std-audio`）：MP3 标签与帧头、Ogg 页与 Opus 头、FLAC 的 STREAMINFO/VORBIS_COMMENT、MIDI 轨事件 |
+| `examples/stdproto2.c6` | （无模块） | 第四十四批（文本行协议）的拼装示例（`make std-proto2`）：SMTP 应答/命令/DATA 点填充、FTP 应答/PASV/列表行、RESP 编解码、Telnet IAC 协商与去转义 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -369,6 +374,10 @@ std/data/mp3.c6            24 test(s), 0 failure(s)
 std/data/ogg.c6            24 test(s), 0 failure(s)
 std/data/flac.c6           24 test(s), 0 failure(s)
 std/data/midi.c6           24 test(s), 0 failure(s)
+std/net/smtp.c6            24 test(s), 0 failure(s)
+std/net/ftp.c6             24 test(s), 0 failure(s)
+std/net/redis.c6           24 test(s), 0 failure(s)
+std/net/telnet.c6          24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3587,6 +3596,16 @@ Ogg 造一个 Opus BOS 页，验证页长度与 `pre-skip`；FLAC 造 STREAMINFO
 VORBIS_COMMENT 两块，验证按位打包的采样率与注释；MIDI 造一条轨，把三个事件顺次
 走完并核对与 `MTrk` 长度一致。
 
+### 集成示例：`examples/stdproto2.c6`
+
+```sh
+make std-proto2
+```
+
+四节：SMTP 走「多行应答 + 末行应答 + EHLO + DATA 点填充」并验证 CR/LF 注入被拒；
+FTP 走「220 + PASV 解析 + RETR + LIST/MLSD 行」；RESP 解批量串与整数、再编一条
+`SET k v`；Telnet 造 `IAC WILL ECHO` 与 `IAC IAC`，验证应答方向与去转义。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3669,6 +3688,8 @@ VORBIS_COMMENT 两块，验证按位打包的采样率与注释；MIDI 造一条
   的拼装示例（自带自检）。
 * `make std-audio`：`examples/stdaudio.c6`，第四十三批（音频容器）模块的拼装示例
   （自带自检）。
+* `make std-proto2`：`examples/stdproto2.c6`，第四十四批（文本行协议）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

@@ -1625,6 +1625,32 @@ MIDI（轨 + 变长量事件）。
 验收：`make stdtest`（185 个模块、0 failure）、`make std-audio`（26 条自检全过）、
 `make check-all`。
 
+### 11.56 标准库第四十四批（smtp / ftp / redis / telnet）
+
+第四十四批补「文本行协议」：SMTP、FTP、Redis 的 RESP、Telnet。它们的共同点是
+「一行一条消息 + 少量二进制控制字节」，正好把行解析与状态机的小把戏收拾干净。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.net.smtp` | 应答 + DATA | 状态码后第 4 个字节是 `-` 表示还有后续行、是空格表示末行；`smtp_data` 要同时做「CRLF 归一」「行首点再补点」「末尾 `.<CRLF>`」三件事，且不能把已是 CRLF 的输入再插一个 `\r` |
+| `std.net.ftp` | 应答 + PASV + 列表 | PASV 的端口是 `p1*256+p2`（所以 `10,20` 是 2580）；`LIST` 行第 5 个字段是大小、之后跳过月/日/时间才是文件名，字段数**数错一列**文件名就会带上前面的时间 |
+| `std.net.redis` | RESP | 五种前缀各一套语义：`$` 的 `len` 是数据长度、`*` 的 `len` 是元素个数、`-1` 是 null；数组只解头，元素靠 `total` 递进 |
+| `std.net.telnet` | IAC | `IAC IAC` 是一个字面 0xFF（不是两个字节的数据）；应答方向是 WILL→DO、DO→WILL、WONT→DONT、DONT→WONT；SB…SE 整段跳过 |
+
+FTP 的解析坑值得记一笔：`LIST` 行是定字段的「权限 链接 属主 属组 大小 月 日 时间
+名字」，早期按「循环跳 8 个字段再读大小」写，结果大小读到的位置偏移了一列；改成
+「先跳 4 个、读大小、再跳 3 个」就稳了。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.net.smtp`=0x60b9、
+`std.net.ftp`=0x60ba、`std.net.redis`=0x60bb、`std.net.telnet`=0x60bc；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-proto2` 与 `STD_PROTO2_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。示例
+`examples/stdproto2.c6` 四节（23 条自检）。
+
+验收：`make stdtest`（189 个模块、0 failure）、`make std-proto2`（23 条自检全过）、
+`make check-all`。
+
+
 
 
 

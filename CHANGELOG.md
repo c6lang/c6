@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第四十四批（文本行协议）**：`std.net.smtp`（应答/命令/DATA 点填充）、
+  `std.net.ftp`（应答/PASV/LIST/MLSD）、`std.net.redis`（RESP 编解码）、
+  `std.net.telnet`（IAC 协商与去转义），集成示例 `examples/stdproto2.c6`
+  （`make std-proto2`）。错误号段 `std.net.smtp`=0x60b9 … `std.net.telnet`=0x60bc
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十三批（音频容器）**：`std.data.mp3`（ID3v2/v1 + MPEG 帧头）、
   `std.data.ogg`（页头 + Vorbis/Opus/Speex/FLAC 识别）、`std.data.flac`（STREAMINFO
   与 VORBIS_COMMENT）、`std.data.midi`（MThd/MTrk + 变长量事件），集成示例

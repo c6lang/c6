@@ -12890,6 +12890,10 @@ static const struct C6ErrStdSlot {
     { "std.data.ogg",           C6_ERR_SLOT_STD + 182 },
     { "std.data.flac",          C6_ERR_SLOT_STD + 183 },
     { "std.data.midi",          C6_ERR_SLOT_STD + 184 },
+    { "std.net.smtp",           C6_ERR_SLOT_STD + 185 },
+    { "std.net.ftp",            C6_ERR_SLOT_STD + 186 },
+    { "std.net.redis",          C6_ERR_SLOT_STD + 187 },
+    { "std.net.telnet",         C6_ERR_SLOT_STD + 188 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

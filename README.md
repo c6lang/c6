@@ -320,6 +320,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/ogg.c6           std.data.ogg           Ogg：27 字节页头 + 段表，BOS 首包识别 Vorbis/Opus/Speex/FLAC/Theora
   std/data/flac.c6          std.data.flac          FLAC：fLaC + 元数据块链，STREAMINFO 按位读采样率/声道/位深，VORBIS_COMMENT 取注释
   std/data/midi.c6          std.data.midi          MIDI：MThd/MTrk、变长量 delta、通道消息/meta/sysex 事件
+  std/net/smtp.c6           std.net.smtp           SMTP：三位状态码 + 多行标志、命令拼装（拒 CRLF 注入）、DATA 点填充与 CRLF 归一
+  std/net/ftp.c6            std.net.ftp            FTP：应答行、PASV 地址与端口、LIST 长格式与 MLSD 事实行
+  std/net/redis.c6          std.net.redis          RESP：+/−/:/$/* 五种类型解析与 bulk/int/array/cmd 编码
+  std/net/telnet.c6         std.net.telnet         Telnet：IAC 协商（WILL/WONT/DO/DONT/SB…SE）、IAC IAC 转义与去转义
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -419,6 +423,7 @@ make std-font    # 编译并运行 examples/stdfont.c6（第四十批字体与�
 make std-disk    # 编译并运行 examples/stddisk.c6（第四十一批分区与文件系统模块的拼装示例）
 make std-transcode # 编译并运行 examples/stdtranscode.c6（第四十二批老式文本编码模块的拼装示例）
 make std-audio    # 编译并运行 examples/stdaudio.c6（第四十三批音频容器模块的拼装示例）
+make std-proto2   # 编译并运行 examples/stdproto2.c6（第四十四批文本行协议模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

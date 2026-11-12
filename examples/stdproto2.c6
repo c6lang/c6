@@ -1,0 +1,141 @@
+/* examples/stdproto2.c6 —— 第四十四批（文本行协议）的集成示例。
+ *
+ *     make std-proto2
+ *
+ * 四节：SMTP（应答 + 命令 + DATA 点填充）、FTP（应答 + PASV + LIST/MLSD 行）、
+ * Redis RESP（解析 + 命令编码）、Telnet（IAC 协商 + 去转义）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.net.smtp;
+import std.net.ftp;
+import std.net.redis;
+import std.net.telnet;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_smtp(void)
+{
+    SmtpReply r = { 0 };
+    char cmd[128] = { 0 };
+    char data[128] = { 0 };
+    int n = 0;
+
+    printf("== smtp\n");
+    check(smtp_reply(S("250-mail.example.com\r\n"), &r) == 1 && r.more == 1,
+          "多行应答");
+    check(smtp_reply(S("250 2.0.0 Ok\r\n"), &r) == 1 && r.code == 250
+          && r.more == 0, "末行应答");
+    printf("   末行：%d %s\n", r.code, r.text);
+    n = smtp_cmd("EHLO", "client.local", cmd, (int)sizeof cmd);
+    check(n == 19 && memcmp(cmd, "EHLO client.local\r\n", 19) == 0, "EHLO 命令");
+    n = smtp_data(S("line one\n.leading dot\nend"), data, (int)sizeof data);
+    printf("   DATA → %d 字节\n", n);
+    check(n == 33, "DATA 长度");
+    check(memcmp(data, "line one\r\n..leading dot\r\nend\r\n.\r\n", 33) == 0,
+          "DATA 点填充与 CRLF");
+    check(smtp_cmd("MAIL", "a\nb", cmd, (int)sizeof cmd) == -1, "注入被拒");
+}
+
+static void do_ftp(void)
+{
+    FtpReply r = { 0 };
+    FtpEntry e = { 0 };
+    char host[64] = { 0 };
+    char cmd[64] = { 0 };
+    int port = 0;
+
+    printf("== ftp\n");
+    check(ftp_reply(S("220 vsFTPd ready\r\n"), &r) == 1 && r.code == 220,
+          "220 应答");
+    check(ftp_pasv(S("227 Entering Passive Mode (10,0,0,7,195,80)\r\n"), host,
+                   (int)sizeof host, &port) == 1, "PASV 解析");
+    printf("   PASV → %s:%d\n", host, port);
+    check(strcmp(host, "10.0.0.7") == 0 && port == 195 * 256 + 80, "PASV 结果");
+    check(ftp_cmd("RETR", "a.bin", cmd, (int)sizeof cmd) == 12
+          && memcmp(cmd, "RETR a.bin\r\n", 12) == 0, "RETR 命令");
+    check(ftp_list_line(S("-rw-r--r-- 1 u g 2048 Feb 3 09:10 data.bin"), &e)
+          == 1, "LIST 行");
+    printf("   LIST：%c %lld %s\n", (char)e.mode, (long long)e.size, e.name);
+    check(e.mode == '-' && e.size == 2048
+          && memcmp(e.name, "data.bin", 8) == 0, "LIST 字段");
+    check(ftp_mlsd_line(S("type=dir;size=0; backup"), &e) == 1 && e.mode == 'd',
+          "MLSD 目录行");
+}
+
+static void do_redis(void)
+{
+    Resp r = { 0 };
+    static const char *argv[3] = { "SET", "k", "v" };
+    char out[256] = { 0 };
+    static u8 buf[64] = { 0 };
+    int n = 0;
+
+    printf("== redis\n");
+    memcpy(buf, "$5\r\nhello\r\n", 11);
+    check(resp_parse(buf, 11, 0, &r) == 1 && r.type == '$' && r.len == 5,
+          "批量串解析");
+    printf("   批量串：%d 字节，从偏移 %d 开始\n", r.len, r.data_off);
+    check(memcmp(buf + r.data_off, "hello", 5) == 0 && r.total == 11,
+          "批量串内容与总长");
+    memcpy(buf, ":1234\r\n", 7);
+    check(resp_parse(buf, 7, 0, &r) == 1 && r.integer == 1234, "整数解析");
+    n = resp_encode_cmd(argv, 3, out, (int)sizeof out);
+    printf("   SET k v → %d 字节\n", n);
+    check(n == 27
+          && memcmp(out, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n", 27) == 0,
+          "命令编码");
+    check(resp_encode_int(-7, out, (int)sizeof out) == 5
+          && memcmp(out, ":-7\r\n", 5) == 0, "负整数编码");
+    check(resp_parse((u8 *)"$5\r\nhello", 10, 0, &r) == -1, "缺尾巴报错");
+}
+
+static void do_telnet(void)
+{
+    static u8 seq[8] = { 0 };
+    static u8 rep[4] = { 0 };
+    TelnetCmd c = { 0 };
+    char out[32] = { 0 };
+    int negs = 0, n = 0;
+
+    printf("== telnet\n");
+    seq[0] = TEL_IAC;
+    seq[1] = TEL_WILL;
+    seq[2] = 1;
+    check(telnet_parse(seq, 8, 0, &c) == 1 && c.verb == TEL_WILL
+          && c.option == 1, "WILL ECHO");
+    check(telnet_reply(TEL_WILL, 1, rep, 4) == 3 && rep[1] == TEL_DO,
+          "回 DO ECHO");
+    seq[3] = TEL_IAC;
+    seq[4] = TEL_IAC;
+    n = telnet_unescape((char[:]){ (char *)seq, 5 }, out, (int)sizeof out,
+                        &negs);
+    printf("   去转义：%d 字节数据，%d 条协商\n", n, negs);
+    check(n == 1 && (unsigned char)out[0] == 0xFF && negs == 1, "去转义结果");
+    check(telnet_parse((u8 *)"\xff", 1, 0, &c) == -1, "只有 IAC 报错");
+}
+
+int main(void)
+{
+    do_smtp();
+    do_ftp();
+    do_redis();
+    do_telnet();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

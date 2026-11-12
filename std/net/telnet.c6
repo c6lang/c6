@@ -1,0 +1,234 @@
+/* std/net/telnet：Telnet 的 IAC 选项协商与数据流去转义。
+ *
+ *     import std.net.telnet;
+ *
+ *     TelnetCmd c = { 0 };
+ *     if (telnet_parse(buf, n, 0, &c) == 1)
+ *         // c.verb（WILL/WONT/DO/DONT/SB）、c.option、c.size
+ *     telnet_unescape(S("hi\xff\xfb\x01there"), out, (int)sizeof out);
+ *
+ * 控制字节是 IAC（0xFF）：`IAC WILL x`(251) / `IAC WONT x`(252) / `IAC DO x`(253) /
+ * `IAC DONT x`(254) / `IAC SB … IAC SE`(250 … 240)；`IAC IAC` 是一个字面 0xFF。
+ *
+ * 约定：
+ *
+ * - `telnet_parse` 的返回值：1 = 一条协商命令（`size` 是命令字节数），
+ *   0 = 一个普通数据字节（`value` 给出该字节），2 = 转义出来的字面 0xFF，
+ *   -1 = 数据不足或不合法的 IAC；
+ * - `telnet_reply` 按「对方 WILL → 我回 DO、对方 DO → 我回 WILL」的方向给应答；
+ *   对 SB（子协商）不生成应答，返回 -1；
+ * - `telnet_unescape` 把数据字节原样拷出、丢掉协商命令、`IAC IAC` 解成一个 0xFF；
+ *   `neg_count`（可为 0）写遇到的协商命令条数；
+ * - 子协商（SB … SE）在 `telnet_parse` 里会整段跳过，`data_off`/`size` 指向
+ *   SE 之后；不解释具体选项（NAWS、TTYPE 等）的内容。
+ */
+#include <string.h>
+
+module std.net.telnet;
+import std.core.types;
+import std.text.str;
+
+enum {
+    TEL_SE = 240,
+    TEL_SB = 250,
+    TEL_WILL = 251,
+    TEL_WONT = 252,
+    TEL_DO = 253,
+    TEL_DONT = 254,
+    TEL_IAC = 255
+};
+
+struct TelnetCmd {
+    int verb;
+    int option;
+    int size;
+    int value;
+};
+
+int telnet_parse(const void *src, int n, int off, TelnetCmd *out)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!src || !out || off < 0 || off >= n)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (p[off] != TEL_IAC) {
+        out->value = (int)p[off];
+        out->size = 1;
+        return 0;
+    }
+    if (off + 1 >= n)
+        return -1;
+    if (p[off + 1] == TEL_IAC) {
+        out->value = TEL_IAC;
+        out->size = 2;
+        return 2;
+    }
+    if (p[off + 1] == TEL_SB) {
+        int i = off + 2;
+
+        while (i + 1 < n) {
+            if (p[i] == TEL_IAC && p[i + 1] == TEL_SE) {
+                out->verb = TEL_SB;
+                out->option = off + 2 < n ? (int)p[off + 2] : 0;
+                out->size = i + 2 - off;
+                return 1;
+            }
+            i++;
+        }
+        return -1;
+    }
+    if (p[off + 1] >= TEL_WILL && p[off + 1] <= TEL_DONT) {
+        if (off + 2 >= n)
+            return -1;
+        out->verb = (int)p[off + 1];
+        out->option = (int)p[off + 2];
+        out->size = 3;
+        return 1;
+    }
+    return -1;
+}
+
+int telnet_reply(int verb, int option, u8 *dst, int cap)
+{
+    int reply = 0;
+
+    if (!dst || cap < 3 || option < 0 || option > 255)
+        return -1;
+    if (verb == TEL_WILL)
+        reply = TEL_DO;
+    else if (verb == TEL_WONT)
+        reply = TEL_DONT;
+    else if (verb == TEL_DO)
+        reply = TEL_WILL;
+    else if (verb == TEL_DONT)
+        reply = TEL_WONT;
+    else
+        return -1;
+    dst[0] = (u8)TEL_IAC;
+    dst[1] = (u8)reply;
+    dst[2] = (u8)option;
+    return 3;
+}
+
+int telnet_unescape(char[:] src, char *dst, int cap, int *neg_count)
+{
+    int off = 0, o = 0, negs = 0;
+
+    if (!dst || cap < 0 || src.len < 0)
+        return -1;
+    while (off < src.len) {
+        TelnetCmd c = { 0 };
+        int r = telnet_parse(src.data, src.len, off, &c);
+
+        if (r < 0)
+            return -1;
+        if (r == 0 || r == 2) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = (char)c.value;
+        } else {
+            negs++;
+        }
+        off += c.size;
+    }
+    if (neg_count)
+        *neg_count = negs;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "telnet：IAC 解析" {
+    TelnetCmd c = { 0 };
+    static u8 buf[16] = { 0 };
+
+    buf[0] = TEL_IAC;
+    buf[1] = TEL_WILL;
+    buf[2] = 1;
+    if (telnet_parse(buf, 16, 0, &c) != 1)
+        return err(1, "WILL 解析失败");
+    if (c.verb != TEL_WILL || c.option != 1 || c.size != 3)
+        return err(2, "WILL 字段不对");
+    buf[0] = 0x41;
+    if (telnet_parse(buf, 16, 0, &c) != 0 || c.value != 0x41)
+        return err(3, "普通数据字节不对");
+    buf[0] = TEL_IAC;
+    buf[1] = TEL_IAC;
+    if (telnet_parse(buf, 16, 0, &c) != 2 || c.value != 255 || c.size != 2)
+        return err(4, "IAC IAC 应该解成 0xFF");
+    buf[0] = TEL_IAC;
+    buf[1] = TEL_DO;
+    buf[2] = 3;
+    if (telnet_parse(buf, 16, 0, &c) != 1 || c.verb != TEL_DO
+        || c.option != 3)
+        return err(5, "DO 解析不对");
+    /* SB … SE */
+    buf[0] = TEL_IAC;
+    buf[1] = TEL_SB;
+    buf[2] = 31;
+    buf[3] = 0;
+    buf[4] = 80;
+    buf[5] = TEL_IAC;
+    buf[6] = TEL_SE;
+    if (telnet_parse(buf, 16, 0, &c) != 1 || c.verb != TEL_SB
+        || c.option != 31 || c.size != 7)
+        return err(6, "子协商解析不对");
+    buf[0] = TEL_IAC;
+    if (telnet_parse(buf, 1, 0, &c) != -1)
+        return err(7, "只有 IAC 应该 -1");
+    buf[0] = TEL_IAC;
+    buf[1] = 0x01;
+    if (telnet_parse(buf, 2, 0, &c) != -1)
+        return err(8, "非法 IAC 后续应该 -1");
+}
+
+test "telnet：应答与去转义" {
+    static u8 rep[8] = { 0 };
+    char out[64] = { 0 };
+    int negs = 0;
+
+    if (telnet_reply(TEL_WILL, 1, rep, (int)sizeof rep) != 3)
+        return err(9, "WILL 的应答长度不对");
+    if (rep[0] != TEL_IAC || rep[1] != TEL_DO || rep[2] != 1)
+        return err(10, "WILL 应该回 DO");
+    if (telnet_reply(TEL_DO, 3, rep, (int)sizeof rep) != 3
+        || rep[1] != TEL_WILL)
+        return err(11, "DO 应该回 WILL");
+    if (telnet_reply(TEL_DONT, 3, rep, (int)sizeof rep) != 3
+        || rep[1] != TEL_WONT)
+        return err(12, "DONT 应该回 WONT");
+    if (telnet_reply(TEL_WONT, 3, rep, (int)sizeof rep) != 3
+        || rep[1] != TEL_DONT)
+        return err(13, "WONT 应该回 DONT");
+    if (telnet_reply(TEL_SB, 3, rep, (int)sizeof rep) != -1)
+        return err(14, "子协商不该有应答");
+    /* 去转义：保留数据、丢掉协商、解 IAC IAC */
+    {
+        static u8 seq[10] = { 0 };
+        int n = 0;
+
+        seq[0] = 'h';
+        seq[1] = 'i';
+        seq[2] = TEL_IAC;
+        seq[3] = TEL_WILL;
+        seq[4] = 1;
+        seq[5] = TEL_IAC;
+        seq[6] = TEL_IAC;
+        seq[7] = '!';
+        n = telnet_unescape((char[:]){ (char *)seq, 8 }, out, (int)sizeof out,
+                            &negs);
+        if (n != 4)
+            return err(15, "去转义长度不对");
+        if (memcmp(out, "hi\xff!", 4) != 0)
+            return err(16, "去转义内容不对");
+        if (negs != 1)
+            return err(17, "协商计数不对");
+    }
+    if (telnet_unescape(S("plain"), out, (int)sizeof out, 0) != 5)
+        return err(18, "纯数据应该原样通过");
+    if (telnet_unescape(S("plain"), out, 3, 0) != -1)
+        return err(19, "容量不够应该 -1");
+}
