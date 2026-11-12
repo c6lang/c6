@@ -39,6 +39,12 @@
   `ini_open`）仍是自由函数。`std/`、`examples/std*.c6`、`docs/stdlib.md`、`README.md`
   已全部改用方法语法。
 
+- **标准库第九批**：`std.container.list` / `std.container.ring` / `std.text.utf16` /
+  `std.text.ansi` 四个模块，集成示例 `examples/stdnode.c6`（`make std-node`）。
+  侵入式双向链表不拥有节点、remove 先确认归属；环形队列借用调用方数组、满时不
+  覆盖；UTF-16 处理代理对/非法代理/截断；ANSI 构造器拼 SGR、256 色与光标移动，
+  满了置 ok=0。错误号段 `std.container.list`=0x602d … `std.text.ansi`=0x6030。
+
 - **标准库第八批**：`std.encoding.base58` / `std.encoding.varint` / `std.text.semver` /
   `std.net.cookie` 四个模块，集成示例 `examples/stdnext.c6`（`make std-next`）。
   Base58 走 Bitcoin 字母表、前导零写 `1`；varint 提供 LEB128 无符号/有符号

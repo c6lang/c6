@@ -1,0 +1,293 @@
+/* std/container/list：侵入式双向链表（零分配）。
+ *
+ *     import std.container.list;
+ *
+ *     List l = { 0 };
+ *     ListNode a = { 0 }, b = { 0 };
+ *     a.data = "a";  b.data = "b";
+ *     l.push_back(&a);  l.push_back(&b);
+ *     l.count();                  // 2
+ *     l.first()->data;            // "a"
+ *     l.pop_front();              // &a
+ *
+ * 链表**不拥有节点**：ListNode 由调用方声明（栈、数组或自己的分配器），
+ * List 只维护 `head`/`tail`/`count`。push/pop/remove 只改指针，不分配、不释放；
+ * `clear` 会把链表里的节点全部摘下（节点的 next/prev 置 0），但不动 `data`。
+ *
+ * 节点同一时刻只能属于一个链表；已经链在别处的节点再 push 会让原来那条链
+ * 断掉，库不做检测（没有额外的 owner 字段，单节点时也看不出来）。`remove`
+ * 会先 O(n) 确认节点确实在本链表里，避免误删别的链。
+ */
+#include <string.h>
+
+module std.container.list;
+import std.core.types;
+
+struct ListNode {
+    struct ListNode *next;
+    struct ListNode *prev;
+    void *data;
+};
+
+struct List {
+    ListNode *head;
+    ListNode *tail;
+    int n;
+};
+
+void init(List *self)
+{
+    if (!self)
+        return;
+    self->head = 0;
+    self->tail = 0;
+    self->n = 0;
+}
+
+int count(List *self) { return self ? self->n : 0; }
+
+int is_empty(List *self) { return !self || self->n == 0; }
+
+ListNode *first(List *self) { return self ? self->head : 0; }
+
+ListNode *last(List *self) { return self ? self->tail : 0; }
+
+/* 追加到尾部；self/node 为空返回 0。 */
+int push_back(List *self, ListNode *node)
+{
+    if (!self || !node)
+        return 0;
+    node->next = 0;
+    node->prev = self->tail;
+    if (self->tail)
+        self->tail->next = node;
+    else
+        self->head = node;
+    self->tail = node;
+    self->n++;
+    return 1;
+}
+
+/* 插到头部；self/node 为空返回 0。 */
+int push_front(List *self, ListNode *node)
+{
+    if (!self || !node)
+        return 0;
+    node->prev = 0;
+    node->next = self->head;
+    if (self->head)
+        self->head->prev = node;
+    else
+        self->tail = node;
+    self->head = node;
+    self->n++;
+    return 1;
+}
+
+ListNode *pop_front(List *self)
+{
+    ListNode *node = 0;
+
+    if (!self || !self->head)
+        return 0;
+    node = self->head;
+    self->head = node->next;
+    if (self->head)
+        self->head->prev = 0;
+    else
+        self->tail = 0;
+    node->next = 0;
+    node->prev = 0;
+    self->n--;
+    return node;
+}
+
+ListNode *pop_back(List *self)
+{
+    ListNode *node = 0;
+
+    if (!self || !self->tail)
+        return 0;
+    node = self->tail;
+    self->tail = node->prev;
+    if (self->tail)
+        self->tail->next = 0;
+    else
+        self->head = 0;
+    node->next = 0;
+    node->prev = 0;
+    self->n--;
+    return node;
+}
+
+int contains(List *self, ListNode *node)
+{
+    ListNode *p = 0;
+
+    if (!self || !node)
+        return 0;
+    for (p = self->head; p; p = p->next)
+        if (p == node)
+            return 1;
+    return 0;
+}
+
+/* 摘掉一个节点；节点不在本链表里返回 0（先 O(n) 确认，防止误删别的链）。 */
+int remove(List *self, ListNode *node)
+{
+    ListNode *p = 0;
+
+    if (!self || !node)
+        return 0;
+    for (p = self->head; p; p = p->next)
+        if (p == node)
+            break;
+    if (!p)
+        return 0;
+    if (node->prev)
+        node->prev->next = node->next;
+    else
+        self->head = node->next;
+    if (node->next)
+        node->next->prev = node->prev;
+    else
+        self->tail = node->prev;
+    node->next = 0;
+    node->prev = 0;
+    self->n--;
+    return 1;
+}
+
+/* 摘下所有节点（节点的 next/prev 置 0），不触碰 data。 */
+void clear(List *self)
+{
+    ListNode *p = 0;
+    ListNode *next = 0;
+
+    if (!self)
+        return;
+    for (p = self->head; p; p = next) {
+        next = p->next;
+        p->next = 0;
+        p->prev = 0;
+    }
+    self->head = 0;
+    self->tail = 0;
+    self->n = 0;
+}
+
+/* 迭代器：`foreach (void *p = l.iter())` 或手写 has()/next()。 */
+struct ListIter {
+    List *list;
+    ListNode *cur;
+};
+
+ListIter iter(List *self)
+{
+    ListIter it = { self, self ? self->head : 0 };
+
+    return it;
+}
+
+int has(ListIter *self) { return self && self->cur; }
+
+void *next(ListIter *self)
+{
+    void *data = 0;
+
+    if (!self || !self->cur)
+        return 0;
+    data = self->cur->data;
+    self->cur = self->cur->next;
+    return data;
+}
+
+/* ---- 自测 ---- */
+
+test "push / pop / first / last / count" {
+    List l = { 0 };
+    ListNode a = { 0 }, b = { 0 }, c = { 0 };
+
+    a.data = "a";
+    b.data = "b";
+    c.data = "c";
+    l.init();
+    if (!l.is_empty() || l.count() != 0 || l.first() || l.last())
+        return err(1, "空链表状态不对");
+    if (!l.push_back(&a) || !l.push_back(&b) || !l.push_front(&c))
+        return err(2, "push 失败");
+    if (l.count() != 3 || l.first() != &c || l.last() != &b)
+        return err(3, "push 后的首尾不对");
+    if (!l.contains(&a) || !l.contains(&b) || !l.contains(&c))
+        return err(4, "contains 不对");
+    if (l.pop_front() != &c || l.pop_back() != &b || l.pop_front() != &a)
+        return err(5, "pop 顺序不对");
+    if (!l.is_empty() || l.pop_front() != 0 || l.pop_back() != 0)
+        return err(6, "空链表 pop 不对");
+}
+
+test "remove 只摘本链表的节点" {
+    List l = { 0 };
+    List other = { 0 };
+    ListNode a = { 0 }, b = { 0 }, x = { 0 };
+
+    l.init();
+    other.init();
+    l.push_back(&a);
+    l.push_back(&b);
+    other.push_back(&x);
+    if (l.remove(&x) != 0 || l.count() != 2)
+        return err(7, "remove 误摘了别的链表的节点");
+    if (!l.remove(&a) || l.count() != 1 || l.first() != &b || l.last() != &b)
+        return err(8, "remove 头节点不对");
+    if (!l.remove(&b) || !l.is_empty())
+        return err(9, "remove 尾节点不对");
+    if (l.remove(0) || l.remove(&a))
+        return err(10, "remove 已摘节点没有返回 0");
+}
+
+test "clear 与迭代器" {
+    List l = { 0 };
+    ListNode a = { 0 }, b = { 0 }, c = { 0 };
+    ListIter it = { 0 };
+    int sum = 0;
+    int n = 0;
+    int va = 1, vb = 2, vc = 3;
+
+    a.data = &va;
+    b.data = &vb;
+    c.data = &vc;
+    l.init();
+    l.push_back(&a);
+    l.push_back(&b);
+    l.push_back(&c);
+    it = l.iter();
+    while (it.has()) {
+        int *p = (int *)it.next();
+
+        sum += *p;
+        n++;
+    }
+    if (n != 3 || sum != 6)
+        return err(11, "迭代器顺序或值不对");
+    l.clear();
+    if (l.count() != 0 || l.first() || l.last() || a.next || a.prev
+        || b.next || b.prev || c.next || c.prev)
+        return err(12, "clear 没有摘干净");
+    if (it.has())
+        return err(13, "迭代器在 clear 后还有元素");
+}
+
+test "空指针与重复 init" {
+    List l = { 0 };
+    ListNode a = { 0 };
+
+    if (l.count() || !l.is_empty() || l.first() || l.last())
+        return err(14, "零初始化的链表状态不对");
+    if (l.push_back(0) || l.push_front(0) || l.remove(0) || l.contains(0))
+        return err(15, "空参数没有返回 0");
+    l.push_back(&a);
+    l.init();
+    if (l.count() != 0 || !l.is_empty())
+        return err(16, "重复 init 没有清空");
+}

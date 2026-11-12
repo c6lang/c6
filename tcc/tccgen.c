@@ -12739,6 +12739,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.varint",    C6_ERR_SLOT_STD + 42 },
     { "std.text.semver",        C6_ERR_SLOT_STD + 43 },
     { "std.net.cookie",         C6_ERR_SLOT_STD + 44 },
+    { "std.container.list",     C6_ERR_SLOT_STD + 45 },
+    { "std.container.ring",     C6_ERR_SLOT_STD + 46 },
+    { "std.text.utf16",         C6_ERR_SLOT_STD + 47 },
+    { "std.text.ansi",          C6_ERR_SLOT_STD + 48 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

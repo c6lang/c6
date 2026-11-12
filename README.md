@@ -180,6 +180,8 @@ std/text/                   文本：字符串视图与缓冲、格式化、UTF-
   std/text/utf8.c6          std.text.utf8          UTF-8 解码/编码/校验/计数 + Rune 迭代器（拒绝过长编码、代理区、截断）
   std/text/glob.c6          std.text.glob          shell 风格 glob（零分配）：Glob 的 match/match_path/has_magic、* ? [] 字符类与转义
   std/text/semver.c6        std.text.semver        语义化版本 2.0.0：semver_parse、Semver 的 compare/is_prerelease/format（严格前导零与标识校验）
+  std/text/utf16.c6         std.text.utf16         UTF-16 解码/编码/计数：代理对、BMP、非法代理与截断（零分配）
+  std/text/ansi.c6          std.text.ansi          ANSI 转义构造器 Ansi：SGR/基础与 256 色/清屏/光标移动/隐藏光标
 
 std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序
   std/container/deque.c6    std.container.deque    环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
@@ -189,6 +191,8 @@ std/container/              容器与算法：向量、位集合、跨度、映�
   std/container/set.c6      std.container.set      哈希集合 Set@K + SetIter（std.container.map 的薄包装，add 返回新增/已存在）
   std/container/sort.c6     std.container.sort     比较器驱动的排序与二分查找：sort_int/sort_bytes、find_int、lower/upper_bound
   std/container/bitset.c6   std.container.bitset   借用 u64 缓冲的位集合 Bitset：set/clear/toggle/bit/count/next_set、集合运算
+  std/container/list.c6     std.container.list     侵入式双向链表 List/ListNode：push/pop/remove/clear、contains、ListIter
+  std/container/ring.c6     std.container.ring     借用调用方数组的固定容量环形队列 Ring：push/pop/peek/at、is_full
   std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
   std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 
