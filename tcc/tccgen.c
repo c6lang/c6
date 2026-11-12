@@ -12886,6 +12886,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.uu",        C6_ERR_SLOT_STD + 178 },
     { "std.encoding.yenc",      C6_ERR_SLOT_STD + 179 },
     { "std.encoding.ebcdic",    C6_ERR_SLOT_STD + 180 },
+    { "std.data.mp3",           C6_ERR_SLOT_STD + 181 },
+    { "std.data.ogg",           C6_ERR_SLOT_STD + 182 },
+    { "std.data.flac",          C6_ERR_SLOT_STD + 183 },
+    { "std.data.midi",          C6_ERR_SLOT_STD + 184 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

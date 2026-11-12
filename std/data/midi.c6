@@ -1,0 +1,340 @@
+/* std/data/midi：标准 MIDI 文件（SMF）的头块、轨块与事件。
+ *
+ *     import std.data.midi;
+ *
+ *     MidiInfo mi = { 0 };
+ *     MidiTrack tr = { 0 };
+ *     MidiEvent ev = { 0 };
+ *     if (midi_info(buf, n, &mi) == 1 && midi_track_at(buf, n, 0, &tr) == 1)
+ *         while (midi_event_at(buf, n, off, &ev) == 1) off += ev.size;
+ *
+ * 头块：`MThd` + 长度 6 + 格式（0/1/2）+ 轨数 + 时间分割。轨块：`MTrk` + 大端长度
+ * + 事件流。每个事件先是变长量 delta time，再是状态字节：
+ *
+ * - `0x8n`~`0xEn`：通道消息（note off / note on / poly pressure / control change /
+ *   program change / channel pressure / pitch bend），后跟 1~2 个数据字节；
+ * - `0xFF`：meta 事件（类型 1 字节 + 变长长度 + 数据），类型 `0x2F` 是轨结束；
+ * - `0xF0`/`0xF7`：sysex（变长长度 + 数据）。
+ *
+ * 约定：
+ *
+ * - `midi_info` 只认 `MThd`，格式支持 0/1/2；`division` 若最高位为 1 则按 SMPTE
+ *   解释（`smpte=1`，`fps` 是「-高字节」帧率，`ticks_per_frame` 是低字节）；
+ * - `midi_track_at` 按 `MTrk` 顺序找，返回数据长度与偏移，找不到返回 0；
+ * - `midi_vlq` 解 1~4 字节的变长量，`*used` 是消耗的字节数，坏数据返回 -1；
+ * - `midi_event_at` 解一个事件，`size` 是含 delta 的整段长度，`data_off` 指向
+ *   事件数据（通道消息是第一个数据字节，meta/sysex 是内容起点）；
+ * - **不支持 running status**（省略状态字节的写法），遇到会返回 -1。
+ */
+#include <string.h>
+
+module std.data.midi;
+import std.core.types;
+import std.text.str;
+
+struct MidiInfo {
+    int format;
+    int ntracks;
+    int division;
+    int smpte;
+    int fps;
+    int ticks_per_frame;
+};
+
+struct MidiTrack {
+    u32 len;
+    int data_off;
+};
+
+struct MidiEvent {
+    u32 delta;
+    int status;
+    int kind;           /* 1 = 通道消息，2 = meta，3 = sysex */
+    int channel;
+    int d1;
+    int d2;
+    int meta_type;
+    u32 len;
+    int data_off;
+    int size;
+};
+
+static u32 midi_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static u32 midi_be16(const u8 *p)
+{
+    return ((u32)p[0] << 8) | (u32)p[1];
+}
+
+int midi_vlq(const u8 *src, int n, int *used)
+{
+    u32 v = 0;
+    int i = 0;
+
+    if (!src || n <= 0)
+        return -1;
+    for (i = 0; i < 4 && i < n; i++) {
+        v = (v << 7) | (u32)(src[i] & 0x7F);
+        if ((src[i] & 0x80) == 0) {
+            if (used)
+                *used = i + 1;
+            return (int)v;
+        }
+    }
+    return -1;
+}
+
+int midi_info(const void *src, int n, MidiInfo *out)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!src || !out || n < 14)
+        return -1;
+    if (memcmp(p, "MThd", 4) != 0)
+        return -1;
+    if (midi_be32(p + 4) != 6)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->format = (int)midi_be16(p + 8);
+    out->ntracks = (int)midi_be16(p + 10);
+    out->division = (int)midi_be16(p + 12);
+    if (out->format < 0 || out->format > 2)
+        return -1;
+    if (out->ntracks <= 0)
+        return -1;
+    if (out->division & 0x8000) {
+        int high = (out->division >> 8) & 0xFF;
+
+        out->smpte = 1;
+        out->fps = 256 - high;
+        out->ticks_per_frame = out->division & 0xFF;
+        if (out->fps <= 0 || out->ticks_per_frame <= 0)
+            return -1;
+    } else if (out->division == 0) {
+        return -1;
+    }
+    return 1;
+}
+
+int midi_track_at(const void *src, int n, int idx, MidiTrack *out)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 14, k = 0;
+
+    if (!src || !out || idx < 0 || n < 14)
+        return -1;
+    if (memcmp(p, "MThd", 4) != 0)
+        return -1;
+    while (off + 8 <= n) {
+        u32 len = midi_be32(p + off + 4);
+
+        if (memcmp(p + off, "MTrk", 4) == 0) {
+            if (off + 8 + (int)len > n)
+                return -1;
+            if (k == idx) {
+                out->len = len;
+                out->data_off = off + 8;
+                return 1;
+            }
+            k++;
+            off += 8 + (int)len;
+            continue;
+        }
+        /* 未知块：按长度跳过 */
+        if (off + 8 + (int)len > n)
+            return -1;
+        off += 8 + (int)len;
+    }
+    return 0;
+}
+
+int midi_event_at(const void *src, int n, int off, MidiEvent *out)
+{
+    const u8 *p = (const u8 *)src;
+    int dbytes = 0, delta = 0, lenbytes = 0;
+    int st = 0;
+
+    if (!src || !out || off < 0 || off + 2 > n)
+        return -1;
+    delta = midi_vlq(p + off, n - off, &dbytes);
+    if (delta < 0)
+        return -1;
+    off += dbytes;
+    if (off >= n)
+        return -1;
+    st = (int)p[off];
+    if (st < 0x80)
+        return -1;                      /* running status 不支持 */
+    memset(out, 0, sizeof *out);
+    out->delta = (u32)delta;
+    out->status = st;
+    if (st <= 0xEF) {
+        int hi = (st >> 4) & 0x0F;
+
+        out->kind = 1;
+        out->channel = st & 0x0F;
+        out->data_off = off + 1;
+        if (hi == 0x0C || hi == 0x0D) {
+            if (off + 2 > n)
+                return -1;
+            out->d1 = (int)p[off + 1];
+            out->size = dbytes + 2;
+            return 1;
+        }
+        if (off + 3 > n)
+            return -1;
+        out->d1 = (int)p[off + 1];
+        out->d2 = (int)p[off + 2];
+        out->size = dbytes + 3;
+        return 1;
+    }
+    if (st == 0xFF) {
+        int len = 0;
+
+        if (off + 2 > n)
+            return -1;
+        out->kind = 2;
+        out->meta_type = (int)p[off + 1];
+        len = midi_vlq(p + off + 2, n - off - 2, &lenbytes);
+        if (len < 0)
+            return -1;
+        if (off + 2 + lenbytes + len > n)
+            return -1;
+        out->len = (u32)len;
+        out->data_off = off + 2 + lenbytes;
+        out->size = dbytes + 2 + lenbytes + len;
+        return 1;
+    }
+    if (st == 0xF0 || st == 0xF7) {
+        int len = midi_vlq(p + off + 1, n - off - 1, &lenbytes);
+
+        if (len < 0)
+            return -1;
+        if (off + 1 + lenbytes + len > n)
+            return -1;
+        out->kind = 3;
+        out->len = (u32)len;
+        out->data_off = off + 1 + lenbytes;
+        out->size = dbytes + 1 + lenbytes + len;
+        return 1;
+    }
+    return -1;
+}
+
+/* ---- 自测 ---- */
+
+static void midi_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+static void midi_put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+test "midi：头块与轨块" {
+    static u8 buf[256] = { 0 };
+    MidiInfo mi = { 0 };
+    MidiTrack tr = { 0 };
+
+    memcpy(buf, "MThd", 4);
+    midi_put32(buf + 4, 6);
+    midi_put16(buf + 8, 1);
+    midi_put16(buf + 10, 2);
+    midi_put16(buf + 12, 480);
+    memcpy(buf + 14, "MTrk", 4);
+    midi_put32(buf + 18, 8);
+    memcpy(buf + 30, "MTrk", 4);
+    midi_put32(buf + 34, 4);
+    if (midi_info(buf, 256, &mi) != 1)
+        return err(1, "头块解析失败");
+    if (mi.format != 1 || mi.ntracks != 2 || mi.division != 480)
+        return err(2, "头块字段不对");
+    if (mi.smpte != 0)
+        return err(3, "480 不是 SMPTE");
+    if (midi_track_at(buf, 256, 0, &tr) != 1)
+        return err(4, "第 0 轨取不到");
+    if (tr.len != 8 || tr.data_off != 22)
+        return err(5, "第 0 轨长度或偏移不对");
+    if (midi_track_at(buf, 256, 1, &tr) != 1 || tr.len != 4)
+        return err(6, "第 1 轨不对");
+    if (midi_track_at(buf, 256, 2, &tr) != 0)
+        return err(7, "越界轨序号应该 0");
+    /* SMPTE：-25 fps、40 ticks/frame → 0xE728 */
+    midi_put16(buf + 12, 0xE728);
+    if (midi_info(buf, 256, &mi) != 1)
+        return err(8, "SMPTE 头解析失败");
+    if (mi.smpte != 1 || mi.fps != 25 || mi.ticks_per_frame != 40)
+        return err(9, "SMPTE 字段不对");
+    if (midi_info("MThd", 4, &mi) != -1)
+        return err(10, "太短应该 -1");
+}
+
+test "midi：变长量与事件" {
+    static u8 buf[256] = { 0 };
+    MidiEvent ev = { 0 };
+    int used = 0;
+
+    /* 变长量：0x00=0、0x7F=127、0x81 0x00=128、0xFF 0x7F=16383 */
+    if (midi_vlq((u8 *)"\x00", 1, &used) != 0 || used != 1)
+        return err(11, "0 的变长量不对");
+    if (midi_vlq((u8 *)"\x7F", 1, &used) != 127)
+        return err(12, "127 的变长量不对");
+    if (midi_vlq((u8 *)"\x81\x00", 2, &used) != 128 || used != 2)
+        return err(13, "128 的变长量不对");
+    if (midi_vlq((u8 *)"\xFF\x7F", 2, &used) != 16383)
+        return err(14, "16383 的变长量不对");
+    if (midi_vlq((u8 *)"\x81\x80\x80\x80\x00", 5, &used) != -1)
+        return err(15, "五字节的变长量应该 -1");
+    /* 通道消息：delta 0，0x90 60 100 */
+    buf[0] = 0x00;
+    buf[1] = 0x90;
+    buf[2] = 60;
+    buf[3] = 100;
+    if (midi_event_at(buf, 256, 0, &ev) != 1)
+        return err(16, "note on 解析失败");
+    if (ev.kind != 1 || ev.status != 0x90 || ev.channel != 0)
+        return err(17, "note on 状态/通道不对");
+    if (ev.d1 != 60 || ev.d2 != 100 || ev.delta != 0 || ev.size != 4)
+        return err(18, "note on 数据或长度不对");
+    /* delta 200 的 note off：81 48 80 60 00 */
+    buf[4] = 0x81;
+    buf[5] = 0x48;
+    buf[6] = 0x80;
+    buf[7] = 60;
+    buf[8] = 0x00;
+    if (midi_event_at(buf, 256, 4, &ev) != 1)
+        return err(19, "note off 解析失败");
+    if (ev.delta != 200 || ev.status != 0x80 || ev.size != 5)
+        return err(20, "note off 的 delta/长度不对");
+    /* meta 结束：FF 2F 00 */
+    buf[9] = 0x00;
+    buf[10] = 0xFF;
+    buf[11] = 0x2F;
+    buf[12] = 0x00;
+    if (midi_event_at(buf, 256, 9, &ev) != 1)
+        return err(21, "meta 解析失败");
+    if (ev.kind != 2 || ev.meta_type != 0x2F || ev.len != 0 || ev.size != 4)
+        return err(22, "meta 字段不对");
+    /* program change 只有一个数据字节 */
+    buf[13] = 0x00;
+    buf[14] = 0xC3;
+    buf[15] = 42;
+    if (midi_event_at(buf, 256, 13, &ev) != 1 || ev.size != 3
+        || ev.d1 != 42 || ev.channel != 3)
+        return err(23, "program change 不对");
+    /* running status 不支持 */
+    buf[16] = 0x00;
+    buf[17] = 60;
+    if (midi_event_at(buf, 256, 16, &ev) != -1)
+        return err(24, "缺少状态字节应该 -1");
+}

@@ -1,0 +1,395 @@
+/* std/data/flac：FLAC 的文件头、STREAMINFO 与 VORBIS_COMMENT 元数据块。
+ *
+ *     import std.data.flac;
+ *
+ *     FlacInfo fi = { 0 };
+ *     FlacBlock blk = { 0 };
+ *     if (flac_info(buf, n, &fi) == 1)
+ *         // fi.sample_rate / fi.channels / fi.bits_per_sample / fi.total_samples
+ *
+ * 结构：`fLaC` 魔数 + 若干元数据块。每块头 4 字节：1 字节「最后块标志(bit7) +
+ * 类型(bit0..6)」+ 3 字节大端长度，随后是数据。类型 0 是 STREAMINFO（34 字节）：
+ * 最小/最大块大小(16+16)、最小/最大帧大小(24+24)，然后按位打包 20 位采样率、
+ * 3 位「声道数-1」、5 位「位深-1」、36 位总样本数，最后 16 字节 MD5。
+ * 类型 4 是 VORBIS_COMMENT：小端 vendor 长度 + vendor + 条数 + 每条「长度+文本」。
+ *
+ * 约定：
+ *
+ * - `flac_info` 只要求第一块是 STREAMINFO，块长必须是 34；
+ * - `flac_block_at` 按序号（0 起，0 号就是 STREAMINFO）走块链，返回块的类型、
+ *   长度、数据偏移与「是否最后一块」；
+ * - `flac_vendor` 取 VORBIS_COMMENT 里的 vendor 串，`flac_tag_count` 取注释条数；
+ * - `flac_tag` 取第 idx 条注释（`TITLE=…` 这种原样输出）；
+ * - 不解析帧（不含子帧/残差），也不解 PICTURE / SEEKTABLE。
+ */
+#include <string.h>
+
+module std.data.flac;
+import std.core.types;
+import std.text.str;
+
+struct FlacInfo {
+    int min_block;
+    int max_block;
+    int min_frame;
+    int max_frame;
+    int sample_rate;
+    int channels;
+    int bits_per_sample;
+    i64 total_samples;
+    int nblocks;
+    int has_md5;
+    u8 md5[16];
+};
+
+struct FlacBlock {
+    int type;
+    int last;
+    u32 len;
+    int data_off;
+};
+
+static u32 flac_be24(const u8 *p)
+{
+    return ((u32)p[0] << 16) | ((u32)p[1] << 8) | (u32)p[2];
+}
+
+static u32 flac_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u32 flac_bits(const u8 *p, int bitoff, int nbits)
+{
+    u32 v = 0;
+    int i = 0;
+
+    for (i = 0; i < nbits; i++) {
+        int bit = bitoff + i;
+        int byte = bit / 8;
+
+        v = (v << 1) | (u32)((p[byte] >> (7 - (bit % 8))) & 1);
+    }
+    return v;
+}
+
+int flac_block_at(const void *src, int n, int idx, FlacBlock *out)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 4, i = 0;
+
+    if (!src || !out || idx < 0 || n < 8)
+        return -1;
+    if (memcmp(p, "fLaC", 4) != 0)
+        return -1;
+    for (i = 0;; i++) {
+        int type = 0, last = 0;
+        u32 len = 0;
+
+        if (off + 4 > n)
+            return -1;
+        last = (p[off] & 0x80) ? 1 : 0;
+        type = (int)(p[off] & 0x7F);
+        len = flac_be24(p + off + 1);
+        if (off + 4 + (int)len > n)
+            return -1;
+        if (i == idx) {
+            out->type = type;
+            out->last = last;
+            out->len = len;
+            out->data_off = off + 4;
+            return 1;
+        }
+        off += 4 + (int)len;
+        if (last)
+            return 0;
+    }
+}
+
+int flac_info(const void *src, int n, FlacInfo *out)
+{
+    const u8 *p = (const u8 *)src;
+    FlacBlock b = { 0 };
+    const u8 *d = 0;
+    int i = 0;
+
+    if (!src || !out || n < 8)
+        return -1;
+    if (flac_block_at(src, n, 0, &b) != 1)
+        return -1;
+    if (b.type != 0 || b.len != 34)
+        return -1;
+    memset(out, 0, sizeof *out);
+    d = p + b.data_off;
+    out->min_block = (int)(((u32)d[0] << 8) | (u32)d[1]);
+    out->max_block = (int)(((u32)d[2] << 8) | (u32)d[3]);
+    out->min_frame = (int)flac_be24(d + 4);
+    out->max_frame = (int)flac_be24(d + 7);
+    out->sample_rate = (int)flac_bits(d + 10, 0, 20);
+    out->channels = (int)flac_bits(d + 10, 20, 3) + 1;
+    out->bits_per_sample = (int)flac_bits(d + 10, 23, 5) + 1;
+    out->total_samples = (i64)flac_bits(d + 10, 28, 36);
+    for (i = 0; i < 16; i++)
+        out->md5[i] = d[18 + i];
+    out->has_md5 = 1;
+    /* 数一下一共几个块 */
+    {
+        FlacBlock t = { 0 };
+        int k = 0;
+
+        while (flac_block_at(src, n, k, &t) == 1) {
+            k++;
+            if (t.last)
+                break;
+        }
+        out->nblocks = k;
+    }
+    if (out->min_block <= 0 || out->max_block < out->min_block)
+        return -1;
+    if (out->sample_rate <= 0 || out->channels <= 0
+        || out->bits_per_sample < 4)
+        return -1;
+    return 1;
+}
+
+/* 找第一个 VORBIS_COMMENT 块 */
+static int flac_find_comment(const void *src, int n, FlacBlock *out)
+{
+    FlacBlock b = { 0 };
+    int k = 0;
+
+    for (;;) {
+        int r = flac_block_at(src, n, k, &b);
+
+        if (r != 1)
+            return r;
+        if (b.type == 4) {
+            *out = b;
+            return 1;
+        }
+        if (b.last)
+            return 0;
+        k++;
+    }
+}
+
+int flac_vendor(const void *src, int n, char *dst, int cap)
+{
+    const u8 *p = (const u8 *)src;
+    FlacBlock b = { 0 };
+    const u8 *d = 0;
+    u32 vlen = 0, i = 0, o = 0;
+
+    if (!src || !dst || cap <= 0)
+        return -1;
+    if (flac_find_comment(src, n, &b) != 1)
+        return -1;
+    d = p + b.data_off;
+    if (b.len < 4)
+        return -1;
+    vlen = flac_le32(d);
+    if (vlen + 4 > b.len)
+        return -1;
+    for (i = 0; i < vlen; i++) {
+        if (o + 1 < (u32)cap)
+            dst[o++] = (char)d[4 + i];
+    }
+    dst[o] = 0;
+    return (int)o;
+}
+
+int flac_tag_count(const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    FlacBlock b = { 0 };
+    const u8 *d = 0;
+    u32 vlen = 0;
+
+    if (!src || flac_find_comment(src, n, &b) != 1)
+        return -1;
+    d = p + b.data_off;
+    if (b.len < 4)
+        return -1;
+    vlen = flac_le32(d);
+    if (vlen + 8 > b.len)
+        return -1;
+    return (int)flac_le32(d + 4 + vlen);
+}
+
+int flac_tag(const void *src, int n, int idx, char *dst, int cap)
+{
+    const u8 *p = (const u8 *)src;
+    FlacBlock b = { 0 };
+    const u8 *d = 0;
+    u32 vlen = 0, count = 0, off = 0, i = 0, o = 0;
+
+    if (!src || !dst || cap <= 0 || idx < 0)
+        return -1;
+    if (flac_find_comment(src, n, &b) != 1)
+        return -1;
+    d = p + b.data_off;
+    if (b.len < 4)
+        return -1;
+    vlen = flac_le32(d);
+    if (vlen + 8 > b.len)
+        return -1;
+    count = flac_le32(d + 4 + vlen);
+    if ((u32)idx >= count)
+        return 0;
+    off = 4 + vlen + 4;
+    for (i = 0; i < (u32)idx; i++) {
+        u32 len = flac_le32(d + off);
+
+        if (off + 4 + len > b.len)
+            return -1;
+        off += 4 + len;
+    }
+    {
+        u32 len = flac_le32(d + off);
+
+        if (off + 4 + len > b.len)
+            return -1;
+        for (i = 0; i < len; i++) {
+            if (o + 1 < (u32)cap)
+                dst[o++] = (char)d[off + 4 + i];
+        }
+    }
+    dst[o] = 0;
+    return (int)o;
+}
+
+/* ---- 自测 ---- */
+
+static void flac_put_be24(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 16) & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)(v & 0xFF);
+}
+
+static void flac_put_le32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+/* 按位写：从 byte0 的 bit0（最高位）开始，共 8 字节 */
+static void flac_put_bits(u8 *p, int bitoff, int nbits, u64 v)
+{
+    int i = 0;
+
+    for (i = 0; i < nbits; i++) {
+        int bit = bitoff + i;
+        int byte = bit / 8;
+        int shift = 7 - (bit % 8);
+
+        if ((v >> (nbits - 1 - i)) & 1)
+            p[byte] |= (u8)(1 << shift);
+        else
+            p[byte] &= (u8)~(1 << shift);
+    }
+}
+
+/* fLaC + STREAMINFO + VORBIS_COMMENT(last) */
+static int mk_flac(u8 *buf)
+{
+    int o = 0;
+    u8 *d = 0;
+
+    memset(buf, 0, 512);
+    memcpy(buf, "fLaC", 4);
+    o = 4;
+    /* STREAMINFO */
+    buf[o] = 0x00;
+    flac_put_be24(buf + o + 1, 34);
+    d = buf + o + 4;
+    d[0] = 0x10;
+    d[1] = 0x00;                        /* min block 4096 */
+    d[2] = 0x10;
+    d[3] = 0x00;                        /* max block 4096 */
+    flac_put_be24(d + 4, 100);
+    flac_put_be24(d + 7, 200);
+    flac_put_bits(d + 10, 0, 20, 44100);
+    flac_put_bits(d + 10, 20, 3, 1);    /* 2 声道 */
+    flac_put_bits(d + 10, 23, 5, 15);   /* 16 位 */
+    flac_put_bits(d + 10, 28, 36, 12345);
+    o += 4 + 34;
+    /* VORBIS_COMMENT，最后一块 */
+    buf[o] = 0x80 | 4;
+    {
+        int start = o + 4;
+        int q = 0;
+
+        flac_put_le32(buf + start, 3);  /* vendor "ref" */
+        memcpy(buf + start + 4, "ref", 3);
+        flac_put_le32(buf + start + 7, 2);
+        q = start + 11;
+        flac_put_le32(buf + q, 9);
+        memcpy(buf + q + 4, "TITLE=abc", 9);
+        q += 13;
+        flac_put_le32(buf + q, 8);
+        memcpy(buf + q + 4, "ARTIST=z", 8);
+        q += 12;
+        flac_put_be24(buf + o + 1, (u32)(q - start));
+        o = q;
+    }
+    return o;
+}
+
+test "flac：STREAMINFO" {
+    static u8 buf[512] = { 0 };
+    FlacInfo fi = { 0 };
+    FlacBlock b = { 0 };
+    int n = mk_flac(buf);
+
+    if (flac_info(buf, n, &fi) != 1)
+        return err(1, "STREAMINFO 解析失败");
+    if (fi.min_block != 4096 || fi.max_block != 4096)
+        return err(2, "块大小不对");
+    if (fi.min_frame != 100 || fi.max_frame != 200)
+        return err(3, "帧大小不对");
+    if (fi.sample_rate != 44100 || fi.channels != 2
+        || fi.bits_per_sample != 16)
+        return err(4, "采样率/声道/位深不对");
+    if (fi.total_samples != 12345)
+        return err(5, "总样本数不对");
+    if (fi.nblocks != 2 || fi.has_md5 != 1)
+        return err(6, "块数或 MD5 标志不对");
+    if (flac_block_at(buf, n, 0, &b) != 1 || b.type != 0 || b.len != 34
+        || b.last != 0)
+        return err(7, "第 0 块字段不对");
+    if (flac_block_at(buf, n, 1, &b) != 1 || b.type != 4 || b.last != 1)
+        return err(8, "第 1 块字段不对");
+    if (flac_block_at(buf, n, 2, &b) != 0)
+        return err(9, "越界块序号应该 0");
+    if (flac_block_at("nope", 8, 0, &b) != -1)
+        return err(10, "魔数不对应该 -1");
+}
+
+test "flac：VORBIS_COMMENT" {
+    static u8 buf[512] = { 0 };
+    char text[64] = { 0 };
+    int n = mk_flac(buf);
+
+    if (flac_vendor(buf, n, text, (int)sizeof text) != 3
+        || memcmp(text, "ref", 3) != 0)
+        return err(11, "vendor 不对");
+    if (flac_tag_count(buf, n) != 2)
+        return err(12, "注释条数不对");
+    if (flac_tag(buf, n, 0, text, (int)sizeof text) != 9
+        || memcmp(text, "TITLE=abc", 9) != 0)
+        return err(13, "第 0 条注释不对");
+    if (flac_tag(buf, n, 1, text, (int)sizeof text) != 8
+        || memcmp(text, "ARTIST=z", 8) != 0)
+        return err(14, "第 1 条注释不对");
+    if (flac_tag(buf, n, 2, text, (int)sizeof text) != 0)
+        return err(15, "越界条数应该 0");
+    /* 小块被截断 */
+    if (flac_vendor(buf, 20, text, (int)sizeof text) != -1)
+        return err(16, "截断的文件应该 -1");
+    if (flac_tag_count(buf, 20) != -1)
+        return err(17, "截断的文件取条数应该 -1");
+}

@@ -316,6 +316,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/encoding/uu.c6        std.encoding.uu        uuencode/uudecode：45 字节/行、行首长度字符、` 代零，完整 begin/end 块
   std/encoding/yenc.c6      std.encoding.yenc      yEnc：+42 与 = 转义（结果落在 0x00/0x0A/0x0D/0x3D），=ybegin 头与 128 折行
   std/encoding/ebcdic.c6    std.encoding.ebcdic    EBCDIC CP037 ↔ ASCII：95 个可打印字符的双向表，表外写 ?/报错
+  std/data/mp3.c6           std.data.mp3           MP3：ID3v2（synchsafe）+ 末尾 ID3v1 + MPEG 帧头（码率/采样率/帧长）
+  std/data/ogg.c6           std.data.ogg           Ogg：27 字节页头 + 段表，BOS 首包识别 Vorbis/Opus/Speex/FLAC/Theora
+  std/data/flac.c6          std.data.flac          FLAC：fLaC + 元数据块链，STREAMINFO 按位读采样率/声道/位深，VORBIS_COMMENT 取注释
+  std/data/midi.c6          std.data.midi          MIDI：MThd/MTrk、变长量 delta、通道消息/meta/sysex 事件
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -414,6 +418,7 @@ make std-legacy  # 编译并运行 examples/stdlegacy.c6（第三十九批老图
 make std-font    # 编译并运行 examples/stdfont.c6（第四十批字体与矢量模块的拼装示例）
 make std-disk    # 编译并运行 examples/stddisk.c6（第四十一批分区与文件系统模块的拼装示例）
 make std-transcode # 编译并运行 examples/stdtranscode.c6（第四十二批老式文本编码模块的拼装示例）
+make std-audio    # 编译并运行 examples/stdaudio.c6（第四十三批音频容器模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

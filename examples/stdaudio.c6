@@ -1,0 +1,241 @@
+/* examples/stdaudio.c6 —— 第四十三批（音频容器）的集成示例。
+ *
+ *     make std-audio
+ *
+ * 四节：MP3（ID3v1 + 帧头）、Ogg（页头 + Opus/Vorbis 识别）、FLAC（STREAMINFO +
+ * VORBIS_COMMENT）、MIDI（头块 + 轨块 + 事件）。都在内存里现场拼。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.mp3;
+import std.data.ogg;
+import std.data.flac;
+import std.data.midi;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void be32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+static void le32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void be16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+static void do_mp3(void)
+{
+    static u8 buf[512] = { 0 };
+    Mp3Tag tag = { 0 };
+    Mp3Frame fr = { 0 };
+    int v1 = 512 - 128;
+
+    printf("== mp3\n");
+    memcpy(buf, "ID3", 3);
+    buf[3] = 3;
+    buf[6] = 0;
+    buf[7] = 0;
+    buf[8] = 0;
+    buf[9] = 20;                        /* ID3v2 共 30 字节 */
+    memcpy(buf + v1, "TAG", 3);
+    memcpy(buf + v1 + 3, "Demo Song", 9);
+    memcpy(buf + v1 + 33, "Demo Band", 9);
+    memcpy(buf + v1 + 63, "Demo Album", 10);
+    memcpy(buf + v1 + 93, "2025", 4);
+    buf[30] = 0xFF;
+    buf[31] = 0xFB;
+    buf[32] = 0x90;
+    buf[33] = 0x00;
+    check(mp3_tags(buf, 512, &tag) == 1, "标签解析");
+    printf("   ID3v2.%d（%u 字节），v1 标题 \"%s\"\n", tag.id3_version,
+           tag.id3_size, tag.v1_title);
+    check(tag.id3_version == 3 && tag.id3_size == 30, "ID3v2 头");
+    check(tag.has_v1 == 1 && memcmp(tag.v1_title, "Demo Song", 9) == 0,
+          "ID3v1 标题");
+    check(memcmp(tag.v1_artist, "Demo Band", 9) == 0
+          && memcmp(tag.v1_year, "2025", 4) == 0, "艺术家与年份");
+    check(mp3_first_frame(buf, 512, &fr) == 1, "跳过 ID3v2 找首帧");
+    printf("   MPEG%d Layer%d %d kbps %d Hz %d 声道，帧长 %d\n", fr.version,
+           fr.layer, fr.bitrate_kbps, fr.sample_rate, fr.channels, fr.length);
+    check(fr.version == 1 && fr.layer == 3, "版本与层");
+    check(fr.bitrate_kbps == 128 && fr.sample_rate == 44100, "码率与采样率");
+    check(fr.length == 417 && fr.channels == 2, "帧长与声道");
+}
+
+static void do_ogg(void)
+{
+    static u8 buf[256] = { 0 };
+    u8 opus[19] = { 0 };
+    OggPage pg = { 0 };
+    OggStream st = { 0 };
+    int n = 0, o = 0;
+
+    printf("== ogg\n");
+    memcpy(opus, "OpusHead", 8);
+    opus[8] = 1;
+    opus[9] = 2;
+    opus[10] = 0x38;
+    opus[11] = 0x01;
+    le32(opus + 12, 48000);
+    memcpy(buf, "OggS", 4);
+    buf[4] = 0;
+    buf[5] = 0x02;
+    buf[6] = 0;                         /* granule 0 */
+    le32(buf + 14, 0xABCD);
+    le32(buf + 18, 0);
+    le32(buf + 22, 0);
+    buf[26] = 1;
+    buf[27] = 19;
+    o = 28;
+    memcpy(buf + o, opus, 19);
+    n = o + 19;
+    check(ogg_page(buf, n, 0, &pg) == 1, "页头解析");
+    printf("   页：serial 0x%X，%d 段，数据 %d 字节，总长 %d\n", pg.serial,
+           pg.nseg, pg.body_len, pg.total_len);
+    check(pg.flags == 2 && pg.nseg == 1 && pg.body_len == 19, "页字段");
+    check(pg.total_len == n && pg.body_off == 28, "页长度与数据偏移");
+    check(ogg_stream(buf, n, &st) == 1 && st.codec == OGG_CODEC_OPUS,
+          "Opus 识别");
+    printf("   Opus：%d 声道，pre-skip %d，输入采样率 %d\n", st.channels,
+           st.pre_skip, st.sample_rate);
+    check(st.channels == 2 && st.pre_skip == 312 && st.sample_rate == 48000,
+          "Opus 字段");
+}
+
+static void do_flac(void)
+{
+    static u8 buf[512] = { 0 };
+    FlacInfo fi = { 0 };
+    char text[64] = { 0 };
+    u8 *d = 0;
+    int o = 4, start = 0, q = 0, n = 0;
+    int i = 0;
+
+    printf("== flac\n");
+    memcpy(buf, "fLaC", 4);
+    buf[o] = 0x00;
+    buf[o + 1] = 0;
+    buf[o + 2] = 0;
+    buf[o + 3] = 34;
+    d = buf + o + 4;
+    d[0] = 0x10;
+    d[2] = 0x10;                        /* 4096 / 4096 */
+    /* 20 位采样率 44100、3 位声道-1、5 位位深-1、36 位总样本数 */
+    {
+        u64 v = ((u64)44100 << 44) | ((u64)1 << 41) | ((u64)15 << 36)
+                | (u64)88200;
+
+        for (i = 0; i < 8; i++)
+            d[10 + i] = (u8)((v >> (56 - 8 * i)) & 0xFF);
+    }
+    o += 38;
+    buf[o] = 0x80 | 4;
+    start = o + 4;
+    le32(buf + start, 10);
+    memcpy(buf + start + 4, "c6 encoder", 10);
+    le32(buf + start + 14, 1);
+    q = start + 18;
+    le32(buf + q, 9);
+    memcpy(buf + q + 4, "TITLE=Hey", 9);
+    q += 13;
+    buf[o + 1] = (u8)(((q - start) >> 16) & 0xFF);
+    buf[o + 2] = (u8)(((q - start) >> 8) & 0xFF);
+    buf[o + 3] = (u8)((q - start) & 0xFF);
+    n = q;
+    check(flac_info(buf, n, &fi) == 1, "STREAMINFO 解析");
+    printf("   %d Hz，%d 声道，%d 位，%lld 个样本，%d 个元数据块\n",
+           fi.sample_rate, fi.channels, fi.bits_per_sample,
+           (long long)fi.total_samples, fi.nblocks);
+    check(fi.sample_rate == 44100 && fi.channels == 2
+          && fi.bits_per_sample == 16, "采样参数");
+    check(fi.total_samples == 88200 && fi.nblocks == 2, "样本数与块数");
+    check(flac_vendor(buf, n, text, (int)sizeof text) == 10
+          && memcmp(text, "c6 encoder", 10) == 0, "vendor");
+    check(flac_tag_count(buf, n) == 1, "注释条数");
+    check(flac_tag(buf, n, 0, text, (int)sizeof text) == 9
+          && memcmp(text, "TITLE=Hey", 9) == 0, "注释内容");
+}
+
+static void do_midi(void)
+{
+    static u8 buf[128] = { 0 };
+    MidiInfo mi = { 0 };
+    MidiTrack tr = { 0 };
+    MidiEvent ev = { 0 };
+    int off = 0;
+
+    printf("== midi\n");
+    memcpy(buf, "MThd", 4);
+    be32(buf + 4, 6);
+    be16(buf + 8, 1);
+    be16(buf + 10, 1);
+    be16(buf + 12, 480);
+    memcpy(buf + 14, "MTrk", 4);
+    be32(buf + 18, 13);
+    buf[22] = 0x00;                     /* delta 0 */
+    buf[23] = 0x90;                     /* note on */
+    buf[24] = 60;
+    buf[25] = 100;
+    buf[26] = 0x81;
+    buf[27] = 0x48;                     /* delta 200 */
+    buf[28] = 0x80;                     /* note off */
+    buf[29] = 60;
+    buf[30] = 0x00;
+    buf[31] = 0x00;
+    buf[32] = 0xFF;
+    buf[33] = 0x2F;
+    buf[34] = 0x00;
+    check(midi_info(buf, 128, &mi) == 1, "头块解析");
+    printf("   format %d，%d 轨，%d ticks/四分音符\n", mi.format, mi.ntracks,
+           mi.division);
+    check(mi.format == 1 && mi.ntracks == 1 && mi.division == 480, "头块字段");
+    check(midi_track_at(buf, 128, 0, &tr) == 1 && tr.len == 13, "轨块");
+    printf("   轨 0：%u 字节\n", tr.len);
+    off = tr.data_off;
+    check(midi_event_at(buf, 128, off, &ev) == 1 && ev.d1 == 60
+          && ev.d2 == 100, "note on");
+    off += ev.size;
+    check(midi_event_at(buf, 128, off, &ev) == 1 && ev.delta == 200
+          && ev.status == 0x80, "note off");
+    printf("   note off 的 delta = %u\n", ev.delta);
+    off += ev.size;
+    check(midi_event_at(buf, 128, off, &ev) == 1 && ev.kind == 2
+          && ev.meta_type == 0x2F, "轨结束");
+    check(off + ev.size == (int)(tr.data_off + tr.len), "事件刚好走完轨");
+}
+
+int main(void)
+{
+    do_mp3();
+    do_ogg();
+    do_flac();
+    do_midi();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

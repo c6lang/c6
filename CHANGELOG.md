@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第四十三批（音频容器）**：`std.data.mp3`（ID3v2/v1 + MPEG 帧头）、
+  `std.data.ogg`（页头 + Vorbis/Opus/Speex/FLAC 识别）、`std.data.flac`（STREAMINFO
+  与 VORBIS_COMMENT）、`std.data.midi`（MThd/MTrk + 变长量事件），集成示例
+  `examples/stdaudio.c6`（`make std-audio`）。错误号段 `std.data.mp3`=0x60b5 …
+  `std.data.midi`=0x60b8（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十二批（老式文本编码）**：`std.encoding.base91`（basE91）、
   `std.encoding.uu`（uuencode/uudecode）、`std.encoding.yenc`（yEnc 含 `=ybegin`
   头部字段）、`std.encoding.ebcdic`（CP037 双向表），集成示例

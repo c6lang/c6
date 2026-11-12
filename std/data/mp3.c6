@@ -1,0 +1,294 @@
+/* std/data/mp3：MP3 的 ID3 标签与 MPEG 音频帧头。
+ *
+ *     import std.data.mp3;
+ *
+ *     Mp3Tag tag = { 0 };
+ *     Mp3Frame fr = { 0 };
+ *     if (mp3_tags(buf, n, &tag) == 1 && mp3_first_frame(buf, n, &fr) == 1)
+ *         // tag.id3_version / tag.v1_title / fr.bitrate_kbps / fr.length
+ *
+ * 认三样东西：
+ *
+ * - ID3v2 头（文件开头 10 字节）：`ID3`、主次版本、标志、synchsafe 长度；
+ * - ID3v1 标签（文件末尾 128 字节）：`TAG` + 30/30/30/4/30/1 的定长字段；
+ * - MPEG 帧头（4 字节）：11 位同步字 + 版本 + 层 + 保护 + 码率索引 + 采样率索引
+ *   + 填充 + 声道模式。
+ *
+ * 约定：
+ *
+ * - `mp3_tags` 只读头尾，不解析 ID3v2 的帧内容（要帧内容请自己从 10 字节后开始读）；
+ * - `mp3_frame_at` 要求 `off` 正好指在帧头，返回 1 / -1（不是合法帧）；
+ * - `mp3_first_frame` 跳过 ID3v2 后在**前 64KB**里找第一个同步字，找不到返回 0；
+ * - `version` 用 1 / 2 / 25 表示 MPEG1 / MPEG2 / MPEG2.5；
+ * - 码率按 VB1 表（Layer III 的常用表也在内），`free`（索引 0）与 `bad`（索引 15）
+ *   都返回 -1；
+ * - `length` 是整帧字节数：Layer I 是 `(12*br/sr + pad)*4`，Layer II/III 在 MPEG1
+ *   是 `144*br/sr + pad`，MPEG2/2.5 的 Layer III 是 `72*br/sr + pad`。
+ */
+#include <string.h>
+
+module std.data.mp3;
+import std.core.types;
+import std.text.str;
+
+struct Mp3Tag {
+    int id3_version;
+    u32 id3_size;
+    int has_v1;
+    char v1_title[31];
+    char v1_artist[31];
+    char v1_album[31];
+    char v1_year[5];
+};
+
+struct Mp3Frame {
+    int version;
+    int layer;
+    int bitrate_kbps;
+    int sample_rate;
+    int channels;
+    int padding;
+    int crc;
+    int length;
+};
+
+/* 码率表（kbps）：[版本组][层][索引]；版本组 0 = MPEG1，1 = MPEG2/2.5 */
+static const short mp3_br_v1[3][15] = {
+    { 0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448 },
+    { 0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384 },
+    { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320 }
+};
+
+static const short mp3_br_v2[3][15] = {
+    { 0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256 },
+    { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 },
+    { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 }
+};
+
+static const int mp3_sr_v1[3] = { 44100, 48000, 32000 };
+static const int mp3_sr_v2[3] = { 22050, 24000, 16000 };
+static const int mp3_sr_v25[3] = { 11025, 12000, 8000 };
+
+static u32 mp3_synchsafe(const u8 *p)
+{
+    return ((u32)(p[0] & 0x7F) << 21) | ((u32)(p[1] & 0x7F) << 14)
+           | ((u32)(p[2] & 0x7F) << 7) | (u32)(p[3] & 0x7F);
+}
+
+static void mp3_fixed(char *dst, int cap, const u8 *src, int len)
+{
+    int i = 0, end = len;
+
+    while (end > 0 && (src[end - 1] == 0 || src[end - 1] == ' '))
+        end--;
+    for (i = 0; i < end && i + 1 < cap; i++)
+        dst[i] = (char)src[i];
+    dst[i] = 0;
+}
+
+int mp3_tags(const void *src, int n, Mp3Tag *out)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!src || !out || n < 10)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (memcmp(p, "ID3", 3) == 0) {
+        out->id3_version = (int)p[3];
+        out->id3_size = mp3_synchsafe(p + 6) + 10;
+        if (out->id3_version < 2 || out->id3_version > 4)
+            return -1;
+        if (out->id3_size > (u32)n)
+            out->id3_size = (u32)n;     /* 截断的文件照样能用 */
+    }
+    if (n >= 128 && memcmp(p + n - 128, "TAG", 3) == 0) {
+        const u8 *t = p + n - 128;
+
+        out->has_v1 = 1;
+        mp3_fixed(out->v1_title, (int)sizeof out->v1_title, t + 3, 30);
+        mp3_fixed(out->v1_artist, (int)sizeof out->v1_artist, t + 33, 30);
+        mp3_fixed(out->v1_album, (int)sizeof out->v1_album, t + 63, 30);
+        mp3_fixed(out->v1_year, (int)sizeof out->v1_year, t + 93, 4);
+    }
+    if (out->id3_version == 0 && !out->has_v1)
+        return 0;
+    return 1;
+}
+
+int mp3_frame_at(const void *src, int n, int off, Mp3Frame *out)
+{
+    const u8 *p = (const u8 *)src;
+    const u8 *h = 0;
+    int ver = 0, layer_bits = 0, br_idx = 0, sr_idx = 0, pad = 0, mode = 0;
+    int br = 0, sr = 0;
+
+    if (!src || !out || off < 0 || off + 4 > n)
+        return -1;
+    h = p + off;
+    if (h[0] != 0xFF || (h[1] & 0xE0) != 0xE0)
+        return -1;                      /* 11 位同步字 */
+    if ((h[1] & 0x18) == 0x08)
+        return -1;                      /* 保留的版本位 */
+    if ((h[1] & 0x06) == 0x00)
+        return -1;                      /* 保留的层位 */
+    memset(out, 0, sizeof *out);
+    /* 版本：00 = MPEG2.5、10 = MPEG2、11 = MPEG1 */
+    if ((h[1] & 0x18) == 0x18)
+        out->version = 1;
+    else if ((h[1] & 0x18) == 0x10)
+        out->version = 2;
+    else
+        out->version = 25;
+    /* 层：01 = III、10 = II、11 = I */
+    layer_bits = (h[1] >> 1) & 0x03;
+    out->layer = layer_bits == 1 ? 3 : (layer_bits == 2 ? 2 : 1);
+    out->crc = (h[1] & 0x01) ? 0 : 1;
+    br_idx = (h[2] >> 4) & 0x0F;
+    sr_idx = (h[2] >> 2) & 0x03;
+    pad = (h[2] >> 1) & 0x01;
+    mode = (h[3] >> 6) & 0x03;
+    if (br_idx == 0 || br_idx == 15 || sr_idx == 3)
+        return -1;                      /* free / bad / 保留采样率 */
+    if (out->version == 1)
+        br = mp3_br_v1[out->layer - 1][br_idx];
+    else
+        br = mp3_br_v2[out->layer - 1][br_idx];
+    if (out->version == 1)
+        sr = mp3_sr_v1[sr_idx];
+    else if (out->version == 2)
+        sr = mp3_sr_v2[sr_idx];
+    else
+        sr = mp3_sr_v25[sr_idx];
+    if (br <= 0 || sr <= 0)
+        return -1;
+    out->bitrate_kbps = br;
+    out->sample_rate = sr;
+    out->padding = pad;
+    out->channels = mode == 3 ? 1 : 2;
+    if (out->layer == 1) {
+        out->length = (12 * br * 1000 / sr + pad) * 4;
+    } else if (out->version == 1) {
+        out->length = 144 * br * 1000 / sr + pad;
+    } else if (out->layer == 3) {
+        out->length = 72 * br * 1000 / sr + pad;
+    } else {
+        out->length = 144 * br * 1000 / sr + pad;
+    }
+    if (out->length <= 4)
+        return -1;
+    return 1;
+}
+
+int mp3_first_frame(const void *src, int n, Mp3Frame *out)
+{
+    Mp3Tag tag = { 0 };
+    int start = 0, limit = 0, i = 0;
+
+    if (!src || !out || n < 4)
+        return -1;
+    if (mp3_tags(src, n, &tag) == 1 && tag.id3_size > 0)
+        start = (int)tag.id3_size;
+    limit = start + 65536;
+    if (limit > n - 4)
+        limit = n - 4;
+    for (i = start; i <= limit; i++) {
+        if (mp3_frame_at(src, n, i, out) == 1)
+            return 1;
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+static void mp3_put_synchsafe(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 21) & 0x7F);
+    p[1] = (u8)((v >> 14) & 0x7F);
+    p[2] = (u8)((v >> 7) & 0x7F);
+    p[3] = (u8)(v & 0x7F);
+}
+
+test "mp3：ID3v2 与 ID3v1 标签" {
+    static u8 buf[1024] = { 0 };
+    Mp3Tag tag = { 0 };
+
+    memcpy(buf, "ID3", 3);
+    buf[3] = 3;
+    buf[4] = 0;
+    mp3_put_synchsafe(buf + 6, 100);
+    memcpy(buf + 384, "TAG", 3);
+    memcpy(buf + 384 + 3, "My Title", 8);
+    memcpy(buf + 384 + 33, "An Artist", 9);
+    memcpy(buf + 384 + 63, "An Album", 8);
+    memcpy(buf + 384 + 93, "2024", 4);
+    if (mp3_tags(buf, 512, &tag) != 1)
+        return err(1, "标签解析失败");
+    if (tag.id3_version != 3 || tag.id3_size != 110)
+        return err(2, "ID3v2 头不对");
+    if (tag.has_v1 != 1)
+        return err(3, "应该认出 ID3v1");
+    if (memcmp(tag.v1_title, "My Title", 8) != 0 || tag.v1_title[8] != 0)
+        return err(4, "标题不对");
+    if (memcmp(tag.v1_artist, "An Artist", 9) != 0)
+        return err(5, "艺术家不对");
+    if (memcmp(tag.v1_album, "An Album", 8) != 0
+        || memcmp(tag.v1_year, "2024", 4) != 0)
+        return err(6, "专辑或年份不对");
+    /* 只有 ID3v1 */
+    buf[0] = 'X';
+    if (mp3_tags(buf, 512, &tag) != 1 || tag.id3_version != 0
+        || tag.has_v1 != 1)
+        return err(7, "只有 v1 时也要能解析");
+    /* 什么都没有 */
+    memset(buf, 0, 512);
+    if (mp3_tags(buf, 512, &tag) != 0)
+        return err(8, "没有标签应该 0");
+}
+
+test "mp3：帧头与首帧定位" {
+    static u8 buf[1024] = { 0 };
+    Mp3Frame fr = { 0 };
+
+    /* MPEG1 Layer III 128kbps 44100Hz 立体声 */
+    buf[0] = 0xFF;
+    buf[1] = 0xFB;
+    buf[2] = 0x90;
+    buf[3] = 0x00;
+    if (mp3_frame_at(buf, 512, 0, &fr) != 1)
+        return err(9, "MPEG1 帧头解析失败");
+    if (fr.version != 1 || fr.layer != 3 || fr.crc != 0)
+        return err(10, "版本/层/保护位不对");
+    if (fr.bitrate_kbps != 128 || fr.sample_rate != 44100)
+        return err(11, "码率或采样率不对");
+    if (fr.channels != 2 || fr.padding != 0 || fr.length != 417)
+        return err(12, "声道/填充/帧长不对");
+    /* MPEG2 Layer III 64kbps 22050Hz 单声道 */
+    buf[4] = 0xFF;
+    buf[5] = 0xF3;
+    buf[6] = 0x80;
+    buf[7] = 0xC0;
+    if (mp3_frame_at(buf, 512, 4, &fr) != 1)
+        return err(13, "MPEG2 帧头解析失败");
+    if (fr.version != 2 || fr.bitrate_kbps != 64 || fr.sample_rate != 22050)
+        return err(14, "MPEG2 码率/采样率不对");
+    if (fr.channels != 1 || fr.length != 208)
+        return err(15, "MPEG2 帧长不对");
+    /* 跳过 ID3v2 后找首帧 */
+    memcpy(buf, "ID3", 3);
+    buf[3] = 3;
+    mp3_put_synchsafe(buf + 6, 20);     /* 标签共 30 字节 */
+    buf[30] = 0xFF;
+    buf[31] = 0xFB;
+    buf[32] = 0x90;
+    buf[33] = 0x00;
+    if (mp3_first_frame(buf, 512, &fr) != 1 || fr.bitrate_kbps != 128)
+        return err(16, "跳过 ID3v2 找首帧失败");
+    /* 坏帧 */
+    buf[0] = 0xFF;
+    buf[1] = 0xFF;                      /* 版本位 11、层位 11？0xFF 的层位是 11 */
+    if (mp3_frame_at(buf, 512, 0, &fr) != 1)
+        return err(17, "0xFF 0xFF 应该是合法帧（Layer I）");
+    buf[2] = 0xF0;                      /* 码率索引 15 = bad */
+    if (mp3_frame_at(buf, 512, 0, &fr) != -1)
+        return err(18, "bad 码率应该 -1");
+}

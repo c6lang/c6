@@ -1600,6 +1600,32 @@ yEnc 的转义集合是**编码后**的值，所以原始 `0xD6`/`0xE0`/`0xE3`/`
 验收：`make stdtest`（181 个模块、0 failure）、`make std-transcode`（21 条自检全过）、
 `make check-all`。
 
+### 11.55 标准库第四十三批（mp3 / ogg / flac / midi）
+
+第四十三批做音频容器。除了已有的 WAV，这一批补齐「编码流」侧的四种格式：MP3
+（帧头 + ID3）、Ogg（页 + 编解码识别）、FLAC（元数据块 + 按位打包的 STREAMINFO）、
+MIDI（轨 + 变长量事件）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.mp3` | ID3 + 帧头 | ID3v2 长度是 synchsafe（每字节只用 7 位）；ID3v1 固定 128 字节在文件尾；帧头的码率表按「MPEG1 / MPEG2·2.5」和层分三套，`free`/`bad` 索引都判坏；Layer III 在 MPEG2 上帧长用 72 而不是 144 |
+| `std.data.ogg` | 页 + 流头 | 页长度 = 27 + 段数 + 段表字节和；granule 是 64 位**有符号**（-1 表示无值）；BOS 标志在标志字节的 0x02 位，首包按魔数分派 Vorbis/Opus/Speex/FLAC/Theora |
+| `std.data.flac` | STREAMINFO | 采样率/声道/位深/总样本数是**跨字节按位**打包（20+3+5+36 位挤在 8 字节里），要按位读而不是按字节读；元数据块的「最后一块」标志在第 1 字节的 bit7 |
+| `std.data.midi` | SMF | delta time 是 1~4 字节变长量（每字节 7 位、最高位是续位）；通道消息按高 4 位决定跟 1 个还是 2 个数据字节（`0xC`/`0xD` 只跟 1 个）；running status 明确不支持 |
+
+坑记一个：MIDI 事件的整段长度必须把 delta 的字节数算进去，否则「事件刚好走完轨」
+这类自检会差一个字节——`size` 是「delta 字节数 + 状态与数据」。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.mp3`=0x60b5、
+`std.data.ogg`=0x60b6、`std.data.flac`=0x60b7、`std.data.midi`=0x60b8；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-audio` 与 `STD_AUDIO_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。示例
+`examples/stdaudio.c6` 四节（26 条自检）。
+
+验收：`make stdtest`（185 个模块、0 failure）、`make std-audio`（26 条自检全过）、
+`make check-all`。
+
+
 
 
 

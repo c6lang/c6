@@ -1,0 +1,292 @@
+/* std/data/ogg：Ogg 容器页头与首个流的编解码识别（Vorbis / Opus / Speex / FLAC）。
+ *
+ *     import std.data.ogg;
+ *
+ *     OggPage pg = { 0 };
+ *     OggStream st = { 0 };
+ *     if (ogg_page(buf, n, 0, &pg) == 1 && ogg_stream(buf, n, &st) == 1)
+ *         // pg.granule / pg.serial / st.codec / st.channels / st.sample_rate
+ *
+ * 页结构（27 字节头）：`OggS`、版本、标志（0x01 续页 / 0x02 BOS / 0x04 EOS）、
+ * 8 字节 granule（小端，无值为 -1）、流序号、页序号、CRC、段数、段表（每字节是
+ * 该段长度，255 表示续段）、最后是数据。一页的总长 = 27 + 段数 + 各段长度之和。
+ *
+ * 约定：
+ *
+ * - `ogg_page` 不验 CRC（要验自己算，多项式 0x04C11DB7、无反射、初值 0）；
+ * - `ogg_next` 与 `ogg_page` 相同，按偏移取页，方便循环；
+ * - `ogg_stream` 只看**第一个 BOS 页**的首个完整包：`\x01vorbis`、`OpusHead`、
+ *   `Speex   `、`\x7fFLAC`；识别结果写进 `codec`（1..4，0 = 未知）；
+ * - Vorbis 给 `channels`/`sample_rate`/`blocksize`，Opus 给 `channels`/
+ *   `pre_skip`/`input_rate`，其余只填 `codec`；
+ * - 不支持多流复用（只认第一页）与 Ogg Skeleton。
+ */
+#include <string.h>
+
+module std.data.ogg;
+import std.core.types;
+import std.text.str;
+
+struct OggPage {
+    int version;
+    int flags;
+    i64 granule;
+    u32 serial;
+    u32 seq;
+    u32 crc;
+    int nseg;
+    int body_len;
+    int header_len;
+    int total_len;
+    int body_off;
+};
+
+struct OggStream {
+    int codec;
+    int channels;
+    int sample_rate;
+    int pre_skip;
+    int blocksize;
+};
+
+enum {
+    OGG_CODEC_UNKNOWN = 0,
+    OGG_CODEC_VORBIS = 1,
+    OGG_CODEC_OPUS = 2,
+    OGG_CODEC_SPEEX = 3,
+    OGG_CODEC_FLAC = 4,
+    OGG_CODEC_THEORA = 5
+};
+
+static u32 ogg_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static i64 ogg_le64(const u8 *p)
+{
+    return (i64)ogg_le32(p) | ((i64)ogg_le32(p + 4) << 32);
+}
+
+int ogg_page(const void *src, int n, int off, OggPage *out)
+{
+    const u8 *p = (const u8 *)src;
+    const u8 *h = 0;
+    int nseg = 0, i = 0, body = 0;
+
+    if (!src || !out || off < 0 || off + 27 > n)
+        return -1;
+    h = p + off;
+    if (memcmp(h, "OggS", 4) != 0)
+        return -1;
+    if (h[4] != 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->version = (int)h[4];
+    out->flags = (int)h[5];
+    out->granule = ogg_le64(h + 6);
+    out->serial = ogg_le32(h + 14);
+    out->seq = ogg_le32(h + 18);
+    out->crc = ogg_le32(h + 22);
+    nseg = (int)h[26];
+    if (off + 27 + nseg > n)
+        return -1;
+    for (i = 0; i < nseg; i++)
+        body += (int)h[27 + i];
+    if (off + 27 + nseg + body > n)
+        return -1;
+    out->nseg = nseg;
+    out->body_len = body;
+    out->header_len = 27 + nseg;
+    out->body_off = off + 27 + nseg;
+    out->total_len = 27 + nseg + body;
+    return 1;
+}
+
+int ogg_next(const void *src, int n, int off, OggPage *out)
+{
+    return ogg_page(src, n, off, out);
+}
+
+int ogg_stream(const void *src, int n, OggStream *out)
+{
+    const u8 *p = (const u8 *)src;
+    OggPage pg = { 0 };
+    const u8 *b = 0;
+    int avail = 0;
+
+    if (!src || !out || n < 27)
+        return -1;
+    if (ogg_page(src, n, 0, &pg) != 1)
+        return -1;
+    if ((pg.flags & 0x02) == 0)
+        return -1;                      /* 首页必须是 BOS */
+    memset(out, 0, sizeof *out);
+    b = p + pg.body_off;
+    avail = pg.body_len;
+    if (avail >= 7 && memcmp(b, "\x01vorbis", 7) == 0) {
+        out->codec = OGG_CODEC_VORBIS;
+        if (avail < 30)
+            return 1;
+        out->channels = (int)b[11];
+        out->sample_rate = (int)ogg_le32(b + 12);
+        out->blocksize = (int)b[28];
+        if (out->channels <= 0 || out->sample_rate <= 0)
+            return -1;
+        return 1;
+    }
+    if (avail >= 8 && memcmp(b, "OpusHead", 8) == 0) {
+        out->codec = OGG_CODEC_OPUS;
+        if (avail < 19)
+            return 1;
+        out->channels = (int)b[9];
+        out->pre_skip = (int)((u32)b[10] | ((u32)b[11] << 8));
+        out->sample_rate = (int)ogg_le32(b + 12);
+        if (out->channels <= 0)
+            return -1;
+        return 1;
+    }
+    if (avail >= 8 && memcmp(b, "Speex   ", 8) == 0) {
+        out->codec = OGG_CODEC_SPEEX;
+        if (avail < 60)
+            return 1;
+        out->sample_rate = (int)ogg_le32(b + 36);
+        out->channels = (int)ogg_le32(b + 48);
+        return 1;
+    }
+    if (avail >= 5 && memcmp(b, "\x7f" "FLAC", 5) == 0) {
+        out->codec = OGG_CODEC_FLAC;
+        return 1;
+    }
+    if (avail >= 7 && memcmp(b, "\x80theora", 7) == 0) {
+        out->codec = OGG_CODEC_THEORA;
+        return 1;
+    }
+    out->codec = OGG_CODEC_UNKNOWN;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static void ogg_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void ogg_put64(u8 *p, i64 v)
+{
+    ogg_put32(p, (u32)(v & 0xFFFFFFFF));
+    ogg_put32(p + 4, (u32)((u64)v >> 32));
+}
+
+/* 造一个单段页，数据是 packet */
+static int mk_ogg_page(u8 *buf, int flags, i64 granule, u32 serial, u32 seq,
+                       const u8 *packet, int plen)
+{
+    int nseg = 0, i = 0, o = 0;
+    int remain = plen;
+
+    memcpy(buf, "OggS", 4);
+    buf[4] = 0;
+    buf[5] = (u8)flags;
+    ogg_put64(buf + 6, granule);
+    ogg_put32(buf + 14, serial);
+    ogg_put32(buf + 18, seq);
+    ogg_put32(buf + 22, 0);
+    o = 27;
+    while (remain >= 255) {
+        buf[o++] = 255;
+        nseg++;
+        remain -= 255;
+    }
+    buf[o++] = (u8)remain;
+    nseg++;
+    buf[26] = (u8)nseg;
+    for (i = 0; i < plen; i++)
+        buf[o + i] = packet[i];
+    return o + plen;
+}
+
+test "ogg：页头" {
+    static u8 buf[512] = { 0 };
+    OggPage pg = { 0 };
+    u8 pkt[3] = { 1, 2, 3 };
+    int n = 0;
+
+    n = mk_ogg_page(buf, 0x02, 0, 0x1234, 0, pkt, 3);
+    if (ogg_page(buf, n, 0, &pg) != 1)
+        return err(1, "页头解析失败");
+    if (pg.version != 0 || pg.flags != 2 || pg.granule != 0)
+        return err(2, "版本/标志/granule 不对");
+    if (pg.serial != 0x1234 || pg.seq != 0 || pg.crc != 0)
+        return err(3, "流序号/页序号/CRC 不对");
+    if (pg.nseg != 1 || pg.body_len != 3 || pg.total_len != 31)
+        return err(4, "段数/数据长度/总长不对");
+    if (pg.body_off != 28)
+        return err(5, "数据偏移不对");
+    /* granule 用 -1 表示无值 */
+    n = mk_ogg_page(buf, 0x04, -1, 7, 9, pkt, 3);
+    if (ogg_page(buf, n, 0, &pg) != 1 || pg.granule != -1)
+        return err(6, "-1 的 granule 不对");
+    if (ogg_page(buf, n, 1, &pg) != -1)
+        return err(7, "不是 OggS 应该 -1");
+    if (ogg_page(buf, 10, 0, &pg) != -1)
+        return err(8, "太短应该 -1");
+}
+
+test "ogg：流识别" {
+    static u8 buf[512] = { 0 };
+    OggStream st = { 0 };
+    u8 vorbis[30] = { 0 };
+    u8 opus[19] = { 0 };
+    u8 speex[60] = { 0 };
+    int n = 0;
+
+    /* Vorbis：\x01vorbis + 版本 + 声道 + 采样率 + ... */
+    memcpy(vorbis, "\x01vorbis", 7);
+    ogg_put32(vorbis + 7, 0);
+    vorbis[11] = 2;
+    ogg_put32(vorbis + 12, 44100);
+    vorbis[28] = 0xB8;
+    n = mk_ogg_page(buf, 0x02, 0, 1, 0, vorbis, 30);
+    if (ogg_stream(buf, n, &st) != 1 || st.codec != OGG_CODEC_VORBIS)
+        return err(9, "Vorbis 识别失败");
+    if (st.channels != 2 || st.sample_rate != 44100)
+        return err(10, "Vorbis 声道/采样率不对");
+    /* Opus */
+    memcpy(opus, "OpusHead", 8);
+    opus[8] = 1;
+    opus[9] = 2;
+    opus[10] = 0x38;
+    opus[11] = 0x01;                    /* pre-skip 312 */
+    ogg_put32(opus + 12, 48000);
+    n = mk_ogg_page(buf, 0x02, 0, 2, 0, opus, 19);
+    if (ogg_stream(buf, n, &st) != 1 || st.codec != OGG_CODEC_OPUS)
+        return err(11, "Opus 识别失败");
+    if (st.channels != 2 || st.pre_skip != 312 || st.sample_rate != 48000)
+        return err(12, "Opus 字段不对");
+    /* Speex */
+    memcpy(speex, "Speex   ", 8);
+    ogg_put32(speex + 36, 16000);
+    ogg_put32(speex + 48, 1);
+    n = mk_ogg_page(buf, 0x02, 0, 3, 0, speex, 60);
+    if (ogg_stream(buf, n, &st) != 1 || st.codec != OGG_CODEC_SPEEX)
+        return err(13, "Speex 识别失败");
+    if (st.sample_rate != 16000 || st.channels != 1)
+        return err(14, "Speex 字段不对");
+    /* 未知编解码 */
+    memcpy(speex, "NOPE    ", 8);
+    n = mk_ogg_page(buf, 0x02, 0, 4, 0, speex, 8);
+    if (ogg_stream(buf, n, &st) != 1 || st.codec != OGG_CODEC_UNKNOWN)
+        return err(15, "未知编解码应该 0");
+    /* 非 BOS 页 */
+    n = mk_ogg_page(buf, 0x00, 0, 5, 1, opus, 19);
+    if (ogg_stream(buf, n, &st) != -1)
+        return err(16, "非 BOS 首页应该 -1");
+    if (ogg_stream(buf, 10, &st) != -1)
+        return err(17, "太短应该 -1");
+}

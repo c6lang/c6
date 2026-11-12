@@ -213,6 +213,10 @@
 | `std/encoding/uu.c6` | `std.encoding.uu` | uuencode/uudecode：每行 45 字节，行首 `(n&0x3F)+0x20`，3 字节拆 4 个 6 位组（0 写成 `` ` ``）；`uu_encode` 出完整 `begin 644 …`/`end` 块，`uu_encode_named` 自定义名字，`uu_decode` 跳过头部行与换行 |
 | `std/encoding/yenc.c6` | `std.encoding.yenc` | yEnc：字节 `+42`，落在 `0x00`/`0x0A`/`0x0D`/`0x3D` 时转义成 `=` + `(值+64)`；`yenc_encode`/`yenc_decode` 走数据部分，`yenc_encode_full` 带 `=ybegin`/`=yend` 并每 128 字节折行，`yenc_field` 取头部 `name=`/`size=` |
 | `std/encoding/ebcdic.c6` | `std.encoding.ebcdic` | EBCDIC CP037 与 ASCII 互转：`ebcdic_char`/`ebcdic_ascii` 单字符双向查表（95 个可打印字符），`ebcdic_encode` 表外字符写 `0x6F`（`?`），`ebcdic_decode` 表外字节返回 -1 |
+| `std/data/mp3.c6` | `std.data.mp3` | MP3：`mp3_tags` 读 ID3v2 头（`ID3` + synchsafe 长度）与末尾 128 字节的 ID3v1（标题/艺术家/专辑/年份），`mp3_frame_at` 解 MPEG 帧头（版本/层/码率/采样率/声道/帧长），`mp3_first_frame` 跳过 ID3v2 后在 64KB 内找首帧 |
+| `std/data/ogg.c6` | `std.data.ogg` | Ogg：`ogg_page` 解 27 字节页头 + 段表（算出数据偏移与整页长度，granule 按 64 位有符号读），`ogg_stream` 从 BOS 页首包识别 Vorbis / Opus / Speex / FLAC / Theora 并取声道与采样率 |
+| `std/data/flac.c6` | `std.data.flac` | FLAC：`flac_info` 解析 `fLaC` + STREAMINFO（块/帧大小、20 位采样率、3 位声道-1、5 位位深-1、36 位总样本数、MD5），`flac_block_at` 走元数据块链，`flac_vendor`/`flac_tag_count`/`flac_tag` 读 VORBIS_COMMENT |
+| `std/data/midi.c6` | `std.data.midi` | 标准 MIDI 文件：`midi_info` 解 `MThd`（格式/轨数/division，含 SMPTE 分支），`midi_track_at` 按 `MTrk` 取轨，`midi_vlq` 解 1~4 字节变长量，`midi_event_at` 解通道消息 / meta / sysex（running status 不支持） |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -298,6 +302,7 @@
 | `examples/stdfont.c6` | （无模块） | 第四十批（字体与矢量）的拼装示例（`make std-font`）：现场拼 BDF 字体、WOFF 容器、SVG 路径与最小 TrueType，各自解析一遍 |
 | `examples/stddisk.c6` | （无模块） | 第四十一批（分区与文件系统）的拼装示例（`make std-disk`）：现场拼 MBR+GPT、FAT16 BPB 与目录、ISO 9660 卷与目录记录、ext2 超级块与 inode |
 | `examples/stdtranscode.c6` | （无模块） | 第四十二批（老式文本编码）的拼装示例（`make std-transcode`）：basE91、uuencode、yEnc、EBCDIC 各编码一遍再解回原文 |
+| `examples/stdaudio.c6` | （无模块） | 第四十三批（音频容器）的拼装示例（`make std-audio`）：MP3 标签与帧头、Ogg 页与 Opus 头、FLAC 的 STREAMINFO/VORBIS_COMMENT、MIDI 轨事件 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -360,6 +365,10 @@ std/encoding/base91.c6     24 test(s), 0 failure(s)
 std/encoding/uu.c6         24 test(s), 0 failure(s)
 std/encoding/yenc.c6       24 test(s), 0 failure(s)
 std/encoding/ebcdic.c6     24 test(s), 0 failure(s)
+std/data/mp3.c6            24 test(s), 0 failure(s)
+std/data/ogg.c6            24 test(s), 0 failure(s)
+std/data/flac.c6           24 test(s), 0 failure(s)
+std/data/midi.c6           24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3567,6 +3576,17 @@ make std-transcode
 yEnc 校验转义、`=ybegin` 头部字段与往返；EBCDIC 校验 CP037 的码位（`A`=0xC1、
 `0`=0xF0、空格=0x40）与表外字符替换。
 
+### 集成示例：`examples/stdaudio.c6`
+
+```sh
+make std-audio
+```
+
+四节：MP3 造「ID3v2 头 + ID3v1 尾 + 一帧」，验证跳过标签后的首帧定位与帧长；
+Ogg 造一个 Opus BOS 页，验证页长度与 `pre-skip`；FLAC 造 STREAMINFO 与
+VORBIS_COMMENT 两块，验证按位打包的采样率与注释；MIDI 造一条轨，把三个事件顺次
+走完并核对与 `MTrk` 长度一致。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3647,6 +3667,8 @@ yEnc 校验转义、`=ybegin` 头部字段与往返；EBCDIC 校验 CP037 的码
   示例（自带自检）。
 * `make std-transcode`：`examples/stdtranscode.c6`，第四十二批（老式文本编码）模块
   的拼装示例（自带自检）。
+* `make std-audio`：`examples/stdaudio.c6`，第四十三批（音频容器）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
