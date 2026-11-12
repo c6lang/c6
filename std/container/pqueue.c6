@@ -1,0 +1,445 @@
+/* std/container/pqueue：二叉堆 PQueue@T——优先队列 / 堆排序 / top-k。
+ *
+ *     import std.container.pqueue;
+ *     import std.container.sort;                     // 用现成的 cmp_int
+ *
+ *     @PQueue@int q = new PQueue@int;
+ *     q->init(&cmp_int, 0);               // 小顶堆
+ *     q->push(5) catch e { return e.id; };
+ *     q->push(1) catch e { return e.id; };
+ *     q->push(3) catch e { return e.id; };
+ *
+ *     int top = 0;
+ *     q->peek(&top);                      // 1，top = 1（小顶堆）
+ *     q->pop(&top);                       // 1，top = 1
+ *
+ * 设计要点：
+ * - 和 `std.container.vec` 一样是**托管容器**（元素在 `@T data` 里），只能 `new` 出来；
+ *   方法接收者是指针，值容器调用写 `q->push(v)`。
+ * - 比较用 **qsort 风格的函数指针** `int (*cmp)(const void *, const void *)`，
+ *   和 `std.container.sort` 的 `cmp_int`/`cmp_str` 等直接通用（`vec->sort` 也是这套）。
+ *   没设比较器时按**字节序**（`memcmp`）比，和 `sort_lex` 同口径：纯无符号
+ *   小整数够用，负数会排到正数后面，要正确的整数序就 `set_cmp(&cmp_int)`。
+ * - 默认**小顶堆**（`pop` 先给最小）；`set_max(1)` 换成大顶堆。
+ * - `push`/`reserve` 会分配，失败返回 `T!error`（`std.core.err.NOMEM`），调用方
+ *   必须 `try`/`catch` 消费；`pop`/`peek` 不分配，用返回值 0 表示「堆是空的」。
+ * - 方法名不和字段（`n`/`cap`/`data`/`cmp`）重名：访问器是 `count()`/`capacity()`。
+ */
+#include <string.h>
+
+module std.container.pqueue;
+import std.core.types;
+import std.core.err;
+
+enum Error { OK = 0, INVAL = 1 };
+
+struct PQueue@T {
+    @T data;
+    int n;
+    int cap;
+    int (*cmp)(const void *, const void *);
+    int max;
+
+    /* 元素个数 */
+    int count() { return n; }
+
+    /* 已分配容量 */
+    int capacity() { return cap; }
+
+    int is_empty() { return n == 0; }
+
+    /* 设置比较器（qsort 风格：a 优先于 b 时返回负数） */
+    void set_cmp(int (*fn)(const void *, const void *)) { cmp = fn; }
+
+    /* 一步设好比较器与堆方向（0 = 小顶，1 = 大顶） */
+    void init(int (*fn)(const void *, const void *), int max_top)
+    {
+        cmp = fn;
+        max = max_top ? 1 : 0;
+    }
+
+    /* 1 = 大顶堆，0 = 小顶堆（默认） */
+    void set_max(int on) { max = on ? 1 : 0; }
+
+    int is_max() { return max; }
+
+    void clear() { n = 0; }
+
+    /* a 是否应当排在 b 前面（比 b 更优先） */
+    int less(T a, T b)
+    {
+        int r = 0;
+
+        if (cmp) {
+            r = cmp(&a, &b);
+            return max ? (r > 0) : (r < 0);
+        }
+        r = memcmp(&a, &b, sizeof(T));
+        return max ? (r > 0) : (r < 0);
+    }
+
+    void swap_at(int i, int j)
+    {
+        T tmp = data[i];
+
+        data[i] = data[j];
+        data[j] = tmp;
+    }
+
+    void sift_up(int i)
+    {
+        while (i > 0) {
+            int parent = (i - 1) / 2;
+
+            if (!less(data[i], data[parent]))
+                return;
+            swap_at(i, parent);
+            i = parent;
+        }
+    }
+
+    void sift_down(int i)
+    {
+        for (;;) {
+            int l = i * 2 + 1;
+            int r = l + 1;
+            int best = i;
+
+            if (l < n && less(data[l], data[best]))
+                best = l;
+            if (r < n && less(data[r], data[best]))
+                best = r;
+            if (best == i)
+                return;
+            swap_at(i, best);
+            i = best;
+        }
+    }
+
+    /* 预留容量；cap 只增不减 */
+    int!error reserve(int want)
+    {
+        int newcap = cap > 0 ? cap : 8;
+        @T nd = data;
+        int i = 0;
+
+        if (want <= cap)
+            return 0;
+        while (newcap < want)
+            newcap *= 2;
+        nd = new T[newcap];
+        if (!nd)
+            return err(std.core.err.NOMEM, "pqueue: out of memory");
+        for (i = 0; i < n; i++)
+            nd[i] = data[i];
+        data = nd;
+        cap = newcap;
+        return 0;
+    }
+
+    /* 压入一个元素；分配失败给 NOMEM */
+    int!error push(T v)
+    {
+        try reserve(n + 1);
+        data[n] = v;
+        n++;
+        sift_up(n - 1);
+        return 0;
+    }
+
+    /* 弹出堆顶到 *out；堆空返回 0（不算错误） */
+    int pop(T *out)
+    {
+        if (n <= 0)
+            return 0;
+        if (out)
+            *out = data[0];
+        n--;
+        if (n > 0) {
+            data[0] = data[n];
+            sift_down(0);
+        }
+        return 1;
+    }
+
+    /* 看一眼堆顶，不弹出 */
+    int peek(T *out)
+    {
+        if (n <= 0)
+            return 0;
+        if (out)
+            *out = data[0];
+        return 1;
+    }
+
+    /* 弹顶再压入：比单独 pop+push 少一次 sift。用于 top-k。
+       *out 收被弹出的堆顶；堆空返回 0（此时也不压入）。 */
+    int push_pop(T v, T *out)
+    {
+        if (n <= 0)
+            return 0;
+        if (out)
+            *out = data[0];
+        data[0] = v;
+        sift_down(0);
+        return 1;
+    }
+
+    /* 用现有的 data[0..n) 重建堆（比如整段读进来之后） */
+    void heapify()
+    {
+        int i = 0;
+
+        for (i = n / 2 - 1; i >= 0; i--)
+            sift_down(i);
+    }
+
+    /* 堆序检查：每个父节点都不比孩子差；测试和断言用 */
+    int is_valid()
+    {
+        int i = 0;
+
+        for (i = 1; i < n; i++)
+            if (less(data[i], data[(i - 1) / 2]))
+                return 0;
+        return 1;
+    }
+};
+
+/* ---- 自测 ---- */
+
+import std.container.sort;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "小顶堆：push 之后按升序 pop" {
+    @PQueue@int q = new PQueue@int;
+    int in[8] = { 5, 3, 8, 1, 9, 2, 7, 4 };
+    int i = 0;
+    int v = 0;
+
+    q->init(&cmp_int, 0);
+    for (i = 0; i < 8; i++)
+        q->push(in[i]) catch e { return err(2, "push 失败"); };
+    if (q->count() != 8 || q->is_empty())
+        return err(3, "计数不对");
+    if (!q->is_valid())
+        return err(4, "push 之后堆序不成立");
+    if (!q->peek(&v) || v != 1)
+        return err(5, "堆顶应当是最小值 1");
+    if (q->count() != 8)
+        return err(6, "peek 不该改变计数");
+    {
+        int want[8] = { 1, 2, 3, 4, 5, 7, 8, 9 };
+
+        for (i = 0; i < 8; i++) {
+            if (!q->pop(&v))
+                return err(7, "pop 失败");
+            if (v != want[i])
+                return err(8, "升序弹出失败");
+            if (!q->is_valid())
+                return err(9, "pop 之后堆序不成立");
+        }
+    }
+    if (!q->is_empty() || q->pop(&v) != 0)
+        return err(10, "空堆应当 pop 不出来");
+    if (q->peek(&v) != 0)
+        return err(11, "空堆 peek 应当返回 0");
+}
+
+test "大顶堆：set_max(1) 之后按降序 pop" {
+    @PQueue@int q = new PQueue@int;
+    int in[6] = { 5, 3, 8, 1, 9, 2 };
+    int i = 0;
+    int v = 0;
+
+    q->set_cmp(&cmp_int);
+    q->set_max(1);
+    if (!q->is_max())
+        return err(12, "set_max(1) 之后 is_max 该是 1");
+    for (i = 0; i < 6; i++)
+        q->push(in[i]) catch e { return err(13, "push 失败"); };
+    if (!q->is_valid())
+        return err(14, "大顶堆的堆序不成立");
+    {
+        int want[6] = { 9, 8, 5, 3, 2, 1 };
+
+        for (i = 0; i < 6; i++) {
+            if (!q->pop(&v))
+                return err(15, "pop 失败");
+            if (v != want[i])
+                return err(16, "降序弹出失败");
+        }
+    }
+    /* 再切回小顶堆仍然可用 */
+    q->set_max(0);
+    q->push(4) catch e { return err(17, "push 失败"); };
+    q->push(2) catch e { return err(18, "push 失败"); };
+    if (!q->pop(&v) || v != 2)
+        return err(19, "切回小顶堆之后堆顶不对");
+}
+
+test "默认比较器按字节序（无符号小整数可用）" {
+    @PQueue@u8 q = new PQueue@u8;
+    int i = 0;
+    u8 v = 0;
+
+    for (i = 5; i >= 1; i--)
+        q->push((u8)i) catch e { return err(20, "push 失败"); };
+    for (i = 1; i <= 5; i++) {
+        if (!q->pop(&v) || v != (u8)i)
+            return err(21, "默认比较器的顺序不对");
+    }
+}
+
+test "字符串元素：cmp_str 生效" {
+    @PQueue@Str q = new PQueue@Str;
+    Str a = { S("pear") };
+    Str b = { S("apple") };
+    Str c = { S("fig") };
+    Str v = { { (char *)0, 0 } };
+
+    q->set_cmp(&cmp_str);
+    q->push(a) catch e { return err(22, "push 失败"); };
+    q->push(b) catch e { return err(23, "push 失败"); };
+    q->push(c) catch e { return err(24, "push 失败"); };
+    if (!q->pop(&v) || v.s.len != 5 || memcmp(v.s.data, "apple", 5) != 0)
+        return err(25, "字典序最小的应当是 apple");
+    if (!q->pop(&v) || v.s.len != 3 || memcmp(v.s.data, "fig", 3) != 0)
+        return err(26, "第二个应当是 fig");
+    if (!q->pop(&v) || v.s.len != 4 || memcmp(v.s.data, "pear", 4) != 0)
+        return err(27, "第三个应当是 pear");
+}
+
+test "push_pop：top-k 的用法" {
+    @PQueue@int q = new PQueue@int;
+    int in[8] = { 5, 1, 9, 3, 7, 2, 8, 6 };
+    int keep[3] = { 0, 0, 0 };
+    int i = 0;
+    int v = 0;
+
+    q->init(&cmp_int, 0);
+    /* 用「小顶堆 + push_pop」留最大的 3 个 */
+    for (i = 0; i < 8; i++) {
+        if (q->count() < 3) {
+            q->push(in[i]) catch e { return err(29, "push 失败"); };
+            continue;
+        }
+        q->peek(&v);
+        if (in[i] > v)
+            q->push_pop(in[i], &v);
+    }
+    if (q->count() != 3)
+        return err(31, "留下的个数不对");
+    for (i = 0; i < 3; i++) {
+        if (!q->pop(&keep[i]))
+            return err(32, "pop 失败");
+    }
+    if (!(keep[0] == 7 && keep[1] == 8 && keep[2] == 9))
+        return err(33, "留下的应当是 7/8/9");
+    /* 空堆 push_pop 应当返回 0 */
+    q->clear();
+    if (q->push_pop(1, &v) != 0)
+        return err(34, "空堆 push_pop 应当返回 0");
+}
+
+test "heapify：整段数据重建堆" {
+    @PQueue@int q = new PQueue@int;
+
+    try q->reserve(8);
+    q->data[0] = 9;
+    q->data[1] = 2;
+    q->data[2] = 7;
+    q->data[3] = 1;
+    q->data[4] = 8;
+    q->n = 5;
+    q->set_cmp(&cmp_int);
+    if (q->is_valid())
+        return err(35, "乱序数据不该是合法堆");
+    q->heapify();
+    if (!q->is_valid())
+        return err(36, "heapify 之后应当合法");
+    {
+        int want[5] = { 1, 2, 7, 8, 9 };
+        int i = 0;
+        int v = 0;
+
+        for (i = 0; i < 5; i++) {
+            if (!q->pop(&v))
+                return err(37, "pop 失败");
+            if (v != want[i])
+                return err(38, "heapify 之后应当升序弹出");
+        }
+    }
+    /* 空堆和单元素堆的 heapify 不应当出事 */
+    q->clear();
+    q->heapify();
+    q->push(42) catch e { return err(39, "push 失败"); };
+    q->heapify();
+    {
+        int v = 0;
+
+        if (!q->pop(&v) || v != 42)
+            return err(40, "单元素堆应当还能用");
+    }
+}
+
+test "交错 push/pop 与容量增长" {
+    @PQueue@int q = new PQueue@int;
+    int seen = 0;
+    int v = 0;
+    int i = 0;
+
+    q->init(&cmp_int, 0);
+    for (i = 0; i < 100; i++) {
+        q->push((i * 37) % 101) catch e { return err(42, "push 失败"); };
+        if (i % 3 == 0) {
+            if (!q->pop(&v))
+                return err(43, "pop 失败");
+            seen++;
+        }
+        if (!q->is_valid())
+            return err(44, "交错操作后堆序不成立");
+    }
+    if (q->capacity() < q->count())
+        return err(45, "容量不该小于计数");
+    /* 剩下的全部弹出 */
+    while (q->pop(&v)) {
+        seen++;
+        if (!q->is_valid())
+            return err(47, "弹出过程中堆序不成立");
+    }
+    if (seen != 100)
+        return err(48, "进出总数应当是 100");
+    if (!q->is_empty())
+        return err(49, "最后应当空了");
+}
+
+test "空队列、默认比较器与大顶" {
+    @PQueue@int q = new PQueue@int;
+    int v = 0;
+
+    if (!q->is_empty() || q->count() != 0 || q->capacity() != 0)
+        return err(50, "新建的队列应当是空的");
+    if (q->pop(&v) != 0 || q->peek(&v) != 0)
+        return err(51, "空队列 pop/peek 应当返回 0");
+    /* 不设比较器也能 push */
+    q->push(3) catch e { return err(52, "push 失败"); };
+    q->push(1) catch e { return err(53, "push 失败"); };
+    if (!q->pop(&v) || v != 1)
+        return err(54, "默认比较器下堆顶应当是 1");
+    q->clear();
+    if (!q->is_empty())
+        return err(55, "clear 之后应当空");
+    /* 默认比较器 + 大顶：u8 也能直接用 */
+    {
+        @PQueue@u8 mq = new PQueue@u8;
+        u8 top = 0;
+
+        mq->set_max(1);
+        mq->push((u8)1) catch e { return err(56, "push 失败"); };
+        mq->push((u8)9) catch e { return err(57, "push 失败"); };
+        if (!mq->pop(&top) || top != 9)
+            return err(58, "大顶堆默认比较器应当先给 9");
+    }
+}

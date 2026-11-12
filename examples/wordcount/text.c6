@@ -7,7 +7,7 @@
  */
 module wordcount.text;
 
-import std.str;
+import std.text.str;
 
 /* 单词 = 一段连续的非空白字符 */
 int words(char[:] line)

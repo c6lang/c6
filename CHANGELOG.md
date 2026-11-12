@@ -27,28 +27,41 @@
 
 ### 标准库
 
-- **标准库第三批**：`std.ascii` / `std.num` / `std.codec` / `std.rand` / `std.fs` /
-  `std.set` 六个模块，集成示例 `examples/stdkit.c6`（`make std-kit`）；顺手修掉
-  `std/map` 扩容复活墓碑的 bug（`std/set` 的对应用例钉住）。错误号段
-  `std.ascii`=0x6013 … `std.set`=0x6018。
-- **标准库第六批**：`std.inet` / `std.bitbuf` / `std.pqueue` / `std.ini` 四个模块，
+- **标准库分目录**：`std/` 从平铺改成按领域分七个子目录。模块名就是路径，所以
+  模块名多了一段（`std.vec` → `std.container.vec`、`std.err` → `std.core.err`）。
+  分组：
+  - `std/core/`：`types` `err` `mem` `math` `bits` `hash` `rand`
+  - `std/text/`：`str` `strbuf` `fmt` `utf8` `ascii` `num`
+  - `std/container/`：`vec` `span` `map` `set` `deque` `pqueue` `range` `sort`
+  - `std/os/`：`io` `fs` `path` `env` `time`
+  - `std/encoding/`：`codec` `base64` `sha256` `bitbuf` `uuid`
+  - `std/data/`：`json` `csv` `ini`
+  - `std/net/`：`inet` `url` `mime`
+
+  编译器里的 std 错误号段表只改了名字，**槽位数值一个没动**（`std.core.err`
+  仍是 0x6000），`errbase.def` 不动；`make stdtest` 改为遍历 `std/` 下的子目录。
+- **标准库第三批**：`std.text.ascii` / `std.text.num` / `std.encoding.codec` / `std.core.rand` / `std.os.fs` /
+  `std.container.set` 六个模块，集成示例 `examples/stdkit.c6`（`make std-kit`）；顺手修掉
+  `std/container/map` 扩容复活墓碑的 bug（`std/container/set` 的对应用例钉住）。错误号段
+  `std.text.ascii`=0x6013 … `std.container.set`=0x6018。
+- **标准库第六批**：`std.net.inet` / `std.encoding.bitbuf` / `std.container.pqueue` / `std.data.ini` 四个模块，
   集成示例 `examples/stdnet.c6`（`make std-net`）。inet 的 IPv6 输出按 RFC 5952
   规范化（最长零段压缩、同长取第一个、v4-mapped 写点分），解析对前导零/多余冒号
   一律严格；bitbuf 是 MSB-first 的位读写器，越界只报 `FULL`/`SHORT` 而不写半截，
-  `bw_patch` 支持不移动游标的回填；pqueue 是托管二叉堆，比较器与 `std.sort` 通用，
+  `bw_patch` 支持不移动游标的回填；pqueue 是托管二叉堆，比较器与 `std.container.sort` 通用，
   带 `push_pop`（top-k）与 `heapify`；ini 是零分配迭代读取器，坏行给准确行号。
-  错误号段 `std.inet`=0x6021 … `std.ini`=0x6024。
-- **标准库第五批**：`std.base64` / `std.url` / `std.uuid` / `std.mime` 四个模块，
+  错误号段 `std.net.inet`=0x6021 … `std.data.ini`=0x6024。
+- **标准库第五批**：`std.encoding.base64` / `std.net.url` / `std.encoding.uuid` / `std.net.mime` 四个模块，
   集成示例 `examples/stdweb.c6`（`make std-web`）。Base64 把「表」与「填充」变成显式
   参数（标准表/URL 安全表不能混用）；URL 是 RFC 3986 §5.2 的完整相对解析（§5.4 的
   23 条 normal + abnormal 用例钉死）；UUID 覆盖 v4（随机）/v5（SHA-1 名字派生，已知
   向量与 Python `uuid5` 一致）/v7（48 位毫秒时间戳）；MIME 是扩展名表 + 分类 + 魔数
-  嗅探。错误号段 `std.base64`=0x601d … `std.mime`=0x6020。
-- **标准库第四批**：`std.json` / `std.sha256` / `std.csv` / `std.env` 四个模块，
+  嗅探。错误号段 `std.encoding.base64`=0x601d … `std.net.mime`=0x6020。
+- **标准库第四批**：`std.data.json` / `std.encoding.sha256` / `std.data.csv` / `std.os.env` 四个模块，
   集成示例 `examples/stdbox.c6`（`make std-box`）。JSON 是 arena 上的 DOM（数字保留
   原文、严格 RFC 8259、代理对解码）；SHA-256/HMAC 的 FIPS 180-4 与 RFC 4231 向量
   钉死在用例里；CSV 是零分配读取器 + 写调用方缓冲；env 管环境变量与 `argc/argv`。
-  错误号段 `std.json`=0x6019 … `std.env`=0x601c。
+  错误号段 `std.data.json`=0x6019 … `std.os.env`=0x601c。
 
 ## 2026-11-11
 

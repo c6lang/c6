@@ -1,0 +1,194 @@
+/* std/container/range：区间与迭代器。
+ *
+ *     import std.container.range;
+ *
+ *     Range r = range(0, 10);            // 左闭右开 [0, 10)
+ *     foreach (int i = r) {
+ *         ...
+ *     }
+ *
+ * 或者只要一个「能被 foreach 吃掉的表达式」：
+ *
+ *     foreach (int i = range(0, 10)) { ... }
+ *
+ * foreach 协议要求两个方法：`has()` 判断还有没有下一个，`next()` 取下一个
+ * 并前进。普通结构体的方法就是「第一个参数是结构体指针的文件作用域函数」，
+ * 所以这里写 `int has(Range *self)`，调用侧写 `(&r)->has()`——foreach 自己
+ * 会这么展开。
+ *
+ * `step_range(0, 10, 2)` 会走 0,2,4,6,8；步长为负就往回走。步长为 0 当 1
+ * 处理：Range 的构造不该失败（真要报错请调用方自己检查）。
+ */
+module std.container.range;
+
+struct Range {
+    int lo;
+    int hi;
+    int cur;
+};
+
+int has(Range *self) { return self->cur < self->hi; }
+
+int next(Range *self)
+{
+    int v = self->cur;
+
+    self->cur++;
+    return v;
+}
+
+/* 区间长度（空区间和反向区间都是 0） */
+int count(Range *self)
+{
+    int n = self->hi - self->lo;
+
+    return n > 0 ? n : 0;
+}
+
+struct StepRange {
+    int cur;
+    int hi;
+    int step;
+};
+
+int has(StepRange *self)
+{
+    return self->step > 0 ? self->cur < self->hi : self->cur > self->hi;
+}
+
+int next(StepRange *self)
+{
+    int v = self->cur;
+
+    self->cur += self->step;
+    return v;
+}
+
+/* 左闭右开：[lo, hi) */
+Range range(int lo, int hi)
+{
+    Range r = { lo, hi, lo };
+
+    return r;
+}
+
+/* 带步长；step 为 0 时当作 1 */
+StepRange step_range(int lo, int hi, int step)
+{
+    StepRange r = { lo, hi, step == 0 ? 1 : step };
+
+    return r;
+}
+
+/* 闭区间：[lo, hi]，常用在「从 1 数到 n」 */
+Range range_incl(int lo, int hi)
+{
+    Range r = { lo, hi + 1, lo };
+
+    return r;
+}
+
+/* ---- 自测 ---- */
+
+test "左闭右开" {
+    int sum = 0, n = 0;
+    Range r = range(0, 5);
+    Range *p = &r;
+
+    foreach (int i = range(0, 5)) {
+        sum += i;
+        n++;
+    }
+    if (n != 5 || sum != 10)
+        return err(1, "range(0,5) 应是 0..4");
+    if (p->count() != 5)
+        return err(2, "count 不对");
+    {
+        Range e = range(3, 3);
+        Range *pe = &e;
+
+        if (pe->count() != 0)
+            return err(3, "空区间 count 应为 0");
+    }
+    {
+        Range e = range(5, 2);
+        Range *pe = &e;
+
+        if (pe->count() != 0 || pe->has())
+            return err(4, "反向区间应是空的");
+    }
+}
+
+test "负区间" {
+    int sum = 0, n = 0;
+
+    foreach (int i = range(-3, 2)) {
+        sum += i;
+        n++;
+    }
+    if (n != 5 || sum != -5)
+        return err(5, "-3..1 的结果不对");
+}
+
+test "带步长" {
+    int sum = 0, n = 0;
+
+    foreach (int i = step_range(0, 10, 3)) {
+        sum += i;
+        n++;
+    }
+    if (n != 4 || sum != 18)       /* 0 + 3 + 6 + 9 */
+        return err(6, "步长 3 的结果不对");
+
+    sum = 0;
+    n = 0;
+    foreach (int i = step_range(5, -1, -2)) {
+        sum += i;
+        n++;
+    }
+    if (n != 3 || sum != 9)        /* 5 + 3 + 1 */
+        return err(7, "负步长的结果不对");
+
+    /* 步长 0 当作 1 */
+    sum = 0;
+    foreach (int i = step_range(0, 3, 0)) {
+        sum += i;
+    }
+    if (sum != 3)
+        return err(8, "步长 0 应退化为 1");
+}
+
+test "闭区间" {
+    int n = 0, sum = 0;
+
+    foreach (int i = range_incl(1, 4)) {
+        n++;
+        sum += i;
+    }
+    if (n != 4 || sum != 10)
+        return err(9, "range_incl(1,4) 应是 1..4");
+}
+
+test "Range 是值，可以手工推进" {
+    Range r = range(0, 3);
+    Range *p = &r;
+
+    if (!p->has())
+        return err(10, "刚开始应该有元素");
+    if (p->next() != 0 || p->next() != 1 || p->next() != 2)
+        return err(11, "手工推进的顺序不对");
+    if (p->has())
+        return err(12, "走完以后不该再有元素");
+}
+
+test "嵌套 foreach" {
+    int pairs = 0;
+
+    foreach (int i = range(0, 3)) {
+        foreach (int j = range(0, 3)) {
+            pairs++;
+        }
+    }
+    if (pairs != 9)
+        return err(13, "嵌套遍历应得 9 对");
+}

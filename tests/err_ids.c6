@@ -6,7 +6,7 @@
  *   - 没有 module 的文件 slot = 0，`return err(7, "…")` 的 id 仍然是 7；
  *   - 模块的 `enum Error` 成员落在这个模块自己的号段里，低 12 位是声明值；
  *   - 0 永远是「没有错误」，不参与加基址；
- *   - std 模块的号段内置在编译器里：std.err 固定在 0x6000。
+ *   - std 模块的号段内置在编译器里：std.core.err 固定在 0x6000。
  *
  * 运行（仓库根目录）：
  *   ./tcc/tcc -B tcc -I tests -I . -test tests/err_ids.c6 tests/tu/err_ids.c6
@@ -14,7 +14,7 @@
 #include <stdio.h>
 
 import tu.err_ids;
-import std.err;
+import std.core.err;
 
 #define AREA(id) (((unsigned)(id) >> 27) & 0xfu)
 #define SLOT(id) (((unsigned)(id) >> 12) & 0x7fffu)
@@ -83,18 +83,18 @@ test "err(A) 送出的 id 就是模块里的成员值" {
 }
 
 test "std 模块的号段内置在编译器里" {
-    if (AREA(std.err.NOMEM) != 1)
+    if (AREA(std.core.err.NOMEM) != 1)
         return err(1, "std 的 area 必须是 1");
-    if (SLOT(std.err.NOMEM) != 0x6000)
-        return err(2, "std.err 的号段固定在 0x6000");
-    if (SLOT(std.err.INVAL) != SLOT(std.err.BUSY))
+    if (SLOT(std.core.err.NOMEM) != 0x6000)
+        return err(2, "std.core.err 的号段固定在 0x6000");
+    if (SLOT(std.core.err.INVAL) != SLOT(std.core.err.BUSY))
         return err(3, "同一个 std 模块共用一个号段");
-    if (CODE(std.err.NOMEM) != 3)
-        return err(4, "std.err.NOMEM 的码是 3");
-    if (CODE(std.err.BUSY) != 15)
-        return err(5, "std.err.BUSY 的码是 15");
-    if (std.err.OK != 0)
-        return err(6, "std.err.OK 必须是 0");
-    if ((unsigned)std.err.NOMEM != 0x0e000003u)
-        return err(7, "std.err.NOMEM 必须是 0x0e000003");
+    if (CODE(std.core.err.NOMEM) != 3)
+        return err(4, "std.core.err.NOMEM 的码是 3");
+    if (CODE(std.core.err.BUSY) != 15)
+        return err(5, "std.core.err.BUSY 的码是 15");
+    if (std.core.err.OK != 0)
+        return err(6, "std.core.err.OK 必须是 0");
+    if ((unsigned)std.core.err.NOMEM != 0x0e000003u)
+        return err(7, "std.core.err.NOMEM 必须是 0x0e000003");
 }

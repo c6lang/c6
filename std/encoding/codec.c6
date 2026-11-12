@@ -1,0 +1,491 @@
+/* std/encoding/codec：文本编码的编解码（Base64 / 十六进制 / 百分号）。
+ *
+ *     import std.encoding.codec;
+ *
+ *     char out[32] = { 0 };
+ *     int n = b64_encode(S("foobar"), out, sizeof out);   // 8, "Zm9vYmFy"
+ *     b64_decode(S("Zm9vYmFy"), buf, sizeof buf);         // 6, "foobar"
+ *
+ * 这一层的约定和 `std.text.fmt` / `std.os.path` 一致：**不分配**，结果写调用方的缓冲，
+ * 放不下返回 -1 并且**一个字节都不写**（不是「写一半再报错」）。所有编码器的
+ * 长度都能先算出来（`*_encoded_len`），解码器先完整校验一遍再写第二遍，所以
+ * 非法输入不会留下半截结果。
+ *
+ * 解码一律**接受省略的填充**（"Zm9v" 不带 `=` 也能解），Base64 还会跳过
+ * ASCII 空白（MIME 换行）；拒绝的是真正非法的输入：长度 `% 4 == 1`、非法
+ * 字符、`=` 出现在中间、填充位数不对。十六进制要求偶数个字符、不加空白，
+ * 这样「解出来几个字节」没有歧义。
+ *
+ * 不做 URL 安全的 Base64 变体（`-`/`_`）：要那种变体请调用方自己换表，标准库
+ * 不在同一个名字里塞两种语义。
+ */
+#include <string.h>
+
+module std.encoding.codec;
+import std.core.types;
+
+/* ---- Base64 ---- */
+
+static int b64_sextet(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A';
+    if (c >= 'a' && c <= 'z')
+        return c - 'a' + 26;
+    if (c >= '0' && c <= '9')
+        return c - '0' + 52;
+    if (c == '+')
+        return 62;
+    if (c == '/')
+        return 63;
+    return -1;
+}
+
+static int codec_is_space(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v'
+        || c == '\f';
+}
+
+/* 编成 Base64 需要多少字节（不含结尾 NUL；n <= 0 给 0） */
+int b64_encoded_len(int n)
+{
+    if (n <= 0)
+        return 0;
+    return ((n + 2) / 3) * 4;
+}
+
+/* 只校验 + 算长度：返回解码后的字节数，非法输入返回 -1 */
+int b64_decode_len(char[:] s)
+{
+    int i = 0, sym = 0, pad = 0, seen_pad = 0;
+
+    if (!s.data || s.len <= 0)
+        return 0;
+    for (i = 0; i < s.len; i++) {
+        int c = (int)(u8)s.data[i];
+
+        if (codec_is_space(c))
+            continue;
+        if (c == '=') {
+            seen_pad = 1;
+            pad++;
+            if (pad > 2)
+                return -1;
+            continue;
+        }
+        if (seen_pad || b64_sextet(c) < 0)
+            return -1;
+        sym++;
+    }
+    if (sym == 0)
+        return pad == 0 ? 0 : -1;
+    if (sym % 4 == 1)
+        return -1;
+    if (pad > 0 && (sym + pad) % 4 != 0)
+        return -1;
+    if (pad > 1 && sym % 4 != 2)
+        return -1;
+    return (sym * 3) / 4;
+}
+
+/* 编码：成功返回写入的字符数（不含 NUL），失败 -1 且不写。
+   cap 是 dst 的字节数，需要 `b64_encoded_len(len) + 1`。 */
+int b64_encode(char[:] src, char *dst, int cap)
+{
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int i = 0, o = 0, need = 0, n = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    n = (int)src.len;
+    if (!src.data)
+        n = 0;
+    need = b64_encoded_len(n);
+    if (need + 1 > cap)
+        return -1;
+    for (i = 0; i < n; i += 3) {
+        u32 v = (u32)(u8)src.data[i] << 16;
+
+        if (i + 1 < n)
+            v |= (u32)(u8)src.data[i + 1] << 8;
+        if (i + 2 < n)
+            v |= (u32)(u8)src.data[i + 2];
+        dst[o++] = tab[(v >> 18) & 63u];
+        dst[o++] = tab[(v >> 12) & 63u];
+        dst[o++] = i + 1 < n ? tab[(v >> 6) & 63u] : '=';
+        dst[o++] = i + 2 < n ? tab[v & 63u] : '=';
+    }
+    dst[o] = 0;
+    return o;
+}
+
+/* 解码：成功返回字节数，失败 -1 且不写。若还有余量会补一个 NUL。
+   先调 b64_decode_len 完整校验，第二遍才落笔。 */
+int b64_decode(char[:] src, char *dst, int cap)
+{
+    int need = 0, i = 0, o = 0, acc = 0, bits = 0;
+
+    if (!dst || cap < 0)
+        return -1;
+    need = b64_decode_len(src);
+    if (need < 0 || need > cap)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        int v = b64_sextet((int)(u8)src.data[i]);
+
+        if (v < 0)
+            continue;           /* 空白或填充：第一遍已校验过 */
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            dst[o++] = (char)((acc >> bits) & 0xff);
+        }
+    }
+    if (o != need)
+        return -1;              /* 防御：第一遍和第二遍不一致就不交付 */
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 十六进制 ---- */
+
+int hex_encoded_len(int n) { return n <= 0 ? 0 : n * 2; }
+
+/* 只校验 + 算长度：返回字节数，非法返回 -1 */
+int hex_decode_len(char[:] s)
+{
+    int i = 0;
+
+    if (!s.data || s.len <= 0)
+        return 0;
+    if (s.len % 2 != 0)
+        return -1;
+    for (i = 0; i < s.len; i++) {
+        int c = (int)(u8)s.data[i];
+
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+              || (c >= 'A' && c <= 'F')))
+            return -1;
+    }
+    return s.len / 2;
+}
+
+/* 编码：upper 非 0 用 A-F。成功返回字符数，失败 -1 且不写。 */
+int hex_encode(char[:] src, char *dst, int cap, int upper)
+{
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    int i = 0, n = 0;
+
+    if (!dst)
+        return -1;
+    n = src.data ? (int)src.len : 0;
+    if (n < 0 || n * 2 + 1 > cap)
+        return -1;
+    for (i = 0; i < n; i++) {
+        u8 b = (u8)src.data[i];
+
+        dst[i * 2] = digits[b >> 4];
+        dst[i * 2 + 1] = digits[b & 15];
+    }
+    dst[n * 2] = 0;
+    return n * 2;
+}
+
+static int hex_nibble(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 解码：成功返回字节数，失败 -1 且不写；有余量补 NUL。 */
+int hex_decode(char[:] src, char *dst, int cap)
+{
+    int need = 0, i = 0;
+
+    if (!dst || cap < 0)
+        return -1;
+    need = hex_decode_len(src);
+    if (need < 0 || need > cap)
+        return -1;
+    for (i = 0; i < need; i++) {
+        int hi = hex_nibble((int)(u8)src.data[i * 2]);
+        int lo = hex_nibble((int)(u8)src.data[i * 2 + 1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;          /* 防御：第一遍已校验 */
+        dst[i] = (char)((hi << 4) | lo);
+    }
+    if (need < cap)
+        dst[need] = 0;
+    return need;
+}
+
+/* ---- 百分号编码（RFC 3986） ---- */
+
+/* 不保留的字符集合：unreserved 之外，extra 里列出的字符也照抄（例如 "/"） */
+static int pct_safe(int c, char *extra)
+{
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+        || (c >= '0' && c <= '9'))
+        return 1;
+    if (c == '-' || c == '.' || c == '_' || c == '~')
+        return 1;
+    if (extra) {
+        char *p = extra;
+
+        for (; *p; p++)
+            if ((int)(u8)*p == c)
+                return 1;
+    }
+    return 0;
+}
+
+/* 编码后的长度；非法参数返回 -1 */
+int pct_encode_len(char[:] src, char *extra)
+{
+    int i = 0, n = 0;
+
+    if (!src.data || src.len <= 0)
+        return 0;    for (i = 0; i < src.len; i++) {
+        int c = (int)(u8)src.data[i];
+
+        n += pct_safe(c, extra) ? 1 : 3;
+    }
+    return n;
+}
+
+/* 编码：成功返回字符数，失败 -1 且不写 */
+int pct_encode(char[:] src, char *dst, int cap, char *extra)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    int need = pct_encode_len(src, extra);
+    int i = 0, o = 0, n = 0;
+
+    if (!dst || need < 0 || need + 1 > cap)
+        return -1;
+    n = src.data ? (int)src.len : 0;
+    for (i = 0; i < n; i++) {
+        int c = (int)(u8)src.data[i];
+
+        if (pct_safe(c, extra)) {
+            dst[o++] = (char)c;
+        } else {
+            dst[o++] = '%';
+            dst[o++] = digits[(c >> 4) & 15];
+            dst[o++] = digits[c & 15];
+        }
+    }
+    dst[o] = 0;
+    return o;
+}
+
+/* 解码后的长度；非法转义或截断的 `%X` 返回 -1。plus 非 0 时 '+' 当空格
+   （application/x-www-form-urlencoded 的约定）。 */
+int pct_decode_len(char[:] s, int plus)
+{
+    int i = 0, n = 0;
+
+    if (!s.data || s.len <= 0)
+        return 0;
+    for (i = 0; i < s.len; i++) {
+        int c = (int)(u8)s.data[i];
+
+        if (c == '%') {
+            if (i + 2 >= s.len)
+                return -1;
+            if (hex_nibble((int)(u8)s.data[i + 1]) < 0
+                || hex_nibble((int)(u8)s.data[i + 2]) < 0)
+                return -1;
+            i += 2;
+            n++;
+        } else if (c == '+' && plus) {
+            n++;
+        } else {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* 解码：成功返回字节数，失败 -1 且不写；有余量补 NUL。 */
+int pct_decode(char[:] s, char *dst, int cap, int plus)
+{
+    int need = pct_decode_len(s, plus);
+    int i = 0, o = 0;
+
+    if (!dst || need < 0 || need > cap)
+        return -1;
+    for (i = 0; i < s.len; i++) {
+        int c = (int)(u8)s.data[i];
+
+        if (c == '%') {
+            int hi = hex_nibble((int)(u8)s.data[i + 1]);
+            int lo = hex_nibble((int)(u8)s.data[i + 2]);
+
+            if (hi < 0 || lo < 0)
+                return -1;      /* 防御：第一遍已校验 */
+            dst[o++] = (char)((hi << 4) | lo);
+            i += 2;
+        } else if (c == '+' && plus) {
+            dst[o++] = ' ';
+        } else {
+            dst[o++] = (char)c;
+        }
+    }
+    if (o != need)
+        return -1;
+    if (need < cap)
+        dst[need] = 0;
+    return need;
+}
+
+/* ---- 自测 ---- */
+
+test "Base64 的 RFC 4648 向量" {
+    char buf[32] = { 0 };
+    char[:] cases[7] = { { (char *)"", 0 }, { (char *)"f", 1 },
+                         { (char *)"fo", 2 }, { (char *)"foo", 3 },
+                         { (char *)"foob", 4 }, { (char *)"fooba", 5 },
+                         { (char *)"foobar", 6 } };
+    char *want[7] = { (char *)"", (char *)"Zg==", (char *)"Zm8=",
+                      (char *)"Zm9v", (char *)"Zm9vYg==", (char *)"Zm9vYmE=",
+                      (char *)"Zm9vYmFy" };
+    int i = 0;
+
+    for (i = 0; i < 7; i++) {
+        int n = b64_encode(cases[i], buf, sizeof buf);
+
+        if (n != (int)strlen(want[i]))
+            return err(1, "b64_encode 长度不对");
+        if (strcmp(buf, want[i]) != 0)
+            return err(2, "b64_encode 内容不对");
+        if (b64_encoded_len(cases[i].len) != n)
+            return err(3, "b64_encoded_len 与 encode 不一致");
+    }
+}
+
+test "Base64 解码：填充、省略填充、空白" {
+    char buf[32] = { 0 };
+
+    if (b64_decode((char[:]){ (char *)"Zg==", 4 }, buf, sizeof buf) != 1
+        || strcmp(buf, "f") != 0)
+        return err(4, "带填充解码不对");
+    if (b64_decode((char[:]){ (char *)"Zg", 2 }, buf, sizeof buf) != 1
+        || strcmp(buf, "f") != 0)
+        return err(5, "省略填充解码不对");
+    if (b64_decode((char[:]){ (char *)"Zm9v\nYmFy", 9 }, buf, sizeof buf) != 6
+        || strcmp(buf, "foobar") != 0)
+        return err(6, "空白没有跳过");
+    if (b64_decode_len((char[:]){ (char *)"", 0 }) != 0)
+        return err(7, "空输入长度不是 0");
+    if (b64_decode((char[:]){ (char *)"", 0 }, buf, sizeof buf) != 0)
+        return err(8, "空输入解码不对");
+}
+
+test "Base64 拒绝非法输入" {
+    char buf[16] = { 0 };
+    char[:] bad[6] = { { (char *)"Z", 1 }, { (char *)"Zm9v!", 5 },
+                       { (char *)"Zg===", 5 }, { (char *)"=Zg=", 4 },
+                       { (char *)"Zg=", 3 }, { (char *)"Zm9vYmFy=", 9 } };
+    int i = 0;
+
+    for (i = 0; i < 6; i++) {
+        if (b64_decode_len(bad[i]) != -1)
+            return err(9, "非法输入的长度没报 -1");
+        if (b64_decode(bad[i], buf, sizeof buf) != -1)
+            return err(10, "非法输入没报 -1");
+    }
+}
+
+test "编码放不下时一个字节都不写" {
+    char buf[8] = { 0 };
+    char one = 'x';
+
+    memset(buf, 'Z', sizeof buf);
+    if (b64_encode((char[:]){ (char *)"foobar", 6 }, buf, 8) != -1)
+        return err(11, "b64_encode 应当放不下");
+    if (buf[0] != 'Z' || buf[1] != 'Z')
+        return err(12, "b64_encode 写了半截");
+    if (hex_encode((char[:]){ &one, 1 }, buf, 2, 0) != -1)
+        return err(13, "hex_encode 应当放不下");
+    if (buf[0] != 'Z')
+        return err(14, "hex_encode 写了半截");
+    if (b64_encode((char[:]){ (char *)"foobar", 6 }, buf, 0) != -1)
+        return err(15, "cap = 0 应当失败");
+}
+
+test "十六进制编解码与大小写" {
+    char buf[16] = { 0 };
+
+    if (hex_encode((char[:]){ (char *)"Hi", 2 }, buf, sizeof buf, 1) != 4
+        || strcmp(buf, "4869") != 0)
+        return err(16, "hex_encode 大写不对");
+    if (hex_encode((char[:]){ (char *)"Hi", 2 }, buf, sizeof buf, 0) != 4
+        || strcmp(buf, "4869") != 0)
+        return err(17, "hex_encode 小写不对");
+    if (hex_encode((char[:]){ (char *)"\xde\xad", 2 }, buf, sizeof buf, 0) != 4
+        || strcmp(buf, "dead") != 0)
+        return err(18, "hex_encode 字节不对");
+    if (hex_decode((char[:]){ (char *)"4869", 4 }, buf, sizeof buf) != 2
+        || buf[0] != 'H' || buf[1] != 'i')
+        return err(19, "hex_decode 不对");
+    if (hex_decode_len((char[:]){ (char *)"DeAdBeEf", 8 }) != 4)
+        return err(20, "hex_decode_len 不对");
+    {
+        char odd[3] = { 'a', 'b', 'c' };
+
+        if (hex_decode_len((char[:]){ odd, 3 }) != -1)
+            return err(21, "奇数长度应当失败");
+    }
+    if (hex_decode((char[:]){ (char *)"zz", 2 }, buf, sizeof buf) != -1)
+        return err(22, "非法 hex 没报错");
+    if (hex_decode((char[:]){ (char *)"4", 1 }, buf, sizeof buf) != -1)
+        return err(23, "截断的 hex 没报错");
+}
+
+test "百分号编码与解码" {
+    char buf[32] = { 0 };
+    char[:] s = { (char *)"a b/c?d=e", 9 };
+
+    if (pct_encode_len(s, (char *)"/") != 15)
+        return err(24, "pct_encode_len 不对");
+    if (pct_encode(s, buf, sizeof buf, (char *)"/") != 15
+        || strcmp(buf, "a%20b/c%3Fd%3De") != 0)
+        return err(25, "pct_encode 不对");
+    if (pct_decode((char[:]){ buf, 15 }, buf, sizeof buf, 0) != 9)
+        return err(26, "pct_decode 长度不对");
+    if (buf[0] != 'a' || buf[1] != ' ' || buf[2] != 'b' || buf[3] != '/')
+        return err(27, "pct_decode 内容不对");
+}
+
+test "百分号解码的 + 与非法转义" {
+    char buf[16] = { 0 };
+
+    if (pct_decode((char[:]){ (char *)"a+b", 3 }, buf, sizeof buf, 0) != 3
+        || strcmp(buf, "a+b") != 0)
+        return err(28, "+ 在 plus = 0 时不该变空格");
+    if (pct_decode((char[:]){ (char *)"a+b", 3 }, buf, sizeof buf, 1) != 3
+        || strcmp(buf, "a b") != 0)
+        return err(29, "+ 没有解成空格");
+    if (pct_decode_len((char[:]){ (char *)"%2", 2 }, 0) != -1
+        || pct_decode_len((char[:]){ (char *)"%zz", 3 }, 0) != -1
+        || pct_decode_len((char[:]){ (char *)"%", 1 }, 0) != -1)
+        return err(30, "非法转义没报 -1");
+    if (pct_decode((char[:]){ (char *)"%41%42", 6 }, buf, sizeof buf, 0) != 2
+        || strcmp(buf, "AB") != 0)
+        return err(31, "大写十六进制转义不对");
+    if (pct_decode((char[:]){ (char *)"%e4%b8%ad", 9 }, buf, sizeof buf, 0)
+        != 3)
+        return err(32, "多字节转义长度不对");
+    if ((u8)buf[0] != 0xe4 || (u8)buf[1] != 0xb8 || (u8)buf[2] != 0xad)
+        return err(33, "多字节转义内容不对");
+}

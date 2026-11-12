@@ -72,7 +72,7 @@ make check-all
 │   ├── history/        实施记录与状态：讲做到哪一步了
 │   └── stdlib.md       标准库 std/ 的设计、API 与写法约定
 ├── scripts/            bootstrap.sh，以及裸机/wasm 辅助脚本
-├── std/                标准库：一个文件一个 module（std/vec.c6 -> std.vec）
+├── std/                标准库：一个文件一个 module（std/container/vec.c6 -> std.container.vec）
 ├── tests/              c6 全部自测：test 块、编译期诊断、上游 tests2
 ├── examples/           可运行示例：每个特性一个 *_demo.c6，wordcount 是集成示例
 ├── Makefile            构建入口（make help 看全部目标）
@@ -111,43 +111,65 @@ make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后
 
 ## 标准库 `std/`
 
-标准库按「一个文件一个 module、模块名就是它的路径」组织：
+标准库按「一个文件一个 module、模块名就是它的路径」组织，再按领域分七个子目录
+（目录是模块名的一部分：`std/container/vec.c6` 就是 `std.container.vec`）：
 
 ```
-std/types.c6   std.types   定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
-std/err.c6     std.err     错误码 enum Error（OK…BUSY）+ msg()/msg_of()/is_ok()
-std/vec.c6     std.vec     会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
-std/span.c6    std.span    别人内存上的窗口 Span@T（纯值、零拷贝）
-std/map.c6     std.map     开放寻址哈希表 Map@(K,V) + Entry/Iter：put/get/get_or/set/put_new/remove
-std/str.c6     std.str     字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、to_int/to_u64、strip_prefix/suffix、fields、replace/split_once、hash
-std/fmt.c6     std.fmt     定长格式化缓冲 Buf@(N)：write_int/u64/hex/hex64/bin/bool/ptr、write_pad（共用 digits_* 原语）
-std/range.c6   std.range   能被 foreach 吃掉的区间 Range/StepRange
-std/sort.c6    std.sort    比较器驱动的排序与二分查找：sort_int/sort_bytes、find_int、lower/upper_bound
-std/mem.c6     std.mem     借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
-std/io.c6      std.io      Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代（方法名带 reader_/writer_/cfile_ 前缀）
-std/math.c6    std.math    整数 gcd/lcm/ipow/clamp/floor_div/mod + 浮点 sqrt/floor/ceil/round（不链 libm）
-std/time.c6    std.time    now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
-std/strbuf.c6  std.strbuf  会长的字符缓冲 StrBuf（托管引用）：write/write_int/write_hex、reserve/truncate/cstr
-std/utf8.c6    std.utf8   UTF-8 解码/编码/校验/计数 + Rune 迭代器（拒绝过长编码、代理区、截断）
-std/bits.c6    std.bits   popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/clear、mask/sign_extend/is_pow2
-std/hash.c6    std.hash   FNV-1a 32/64、CRC32、Adler-32 + 流式 Hasher
-std/path.c6    std.path   POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
-std/deque.c6   std.deque  环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
-std/ascii.c6   std.ascii  ASCII 判别/大小写/忽略大小写比较（收 int，EOF 与负 char 安全）
-std/num.c6     std.num    浮点格式化（固定/%e/%g）与解析（inf/nan、RANGE/PARSE 错误码）
-std/codec.c6   std.codec  Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
-std/rand.c6    std.rand   xorshift64*：可重放序列、无偏区间 below/int、f64、shuffle（方法名 random_*）
-std/fs.c6      std.fs     stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
-std/set.c6     std.set    哈希集合 Set@K + SetIter（std.map 的薄包装，add 返回新增/已存在）
-std/json.c6    std.json   JSON 解析与写出：arena 上的 DOM、json_get/json_at、json_write/pretty/escape（数字保留原文）
-std/sha256.c6  std.sha256 SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
-std/csv.c6     std.csv    RFC 4180 CSV：零分配 CsvReader（引号/跨行/CRLF）+ csv_write_row
-std/env.c6     std.env    环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
+std/core/                   基础：定宽类型、错误码、内存、数学、位运算、哈希、随机
+  std/core/bits.c6          std.core.bits          popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/clear、mask/sign_extend/is_pow2
+  std/core/err.c6           std.core.err           错误码 enum Error（OK…BUSY）+ msg()/msg_of()/is_ok()
+  std/core/hash.c6          std.core.hash          FNV-1a 32/64、CRC32、Adler-32 + 流式 Hasher
+  std/core/math.c6          std.core.math          整数 gcd/lcm/ipow/clamp/floor_div/mod + 浮点 sqrt/floor/ceil/round（不链 libm）
+  std/core/mem.c6           std.core.mem           借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
+  std/core/rand.c6          std.core.rand          xorshift64*：可重放序列、无偏区间 below/int、f64、shuffle（方法名 random_*）
+  std/core/types.c6         std.core.types         定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
+
+std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换
+  std/text/ascii.c6         std.text.ascii         ASCII 判别/大小写/忽略大小写比较（收 int，EOF 与负 char 安全）
+  std/text/fmt.c6           std.text.fmt           定长格式化缓冲 Buf@(N)：write_int/u64/hex/hex64/bin/bool/ptr、write_pad（共用 digits_* 原语）
+  std/text/num.c6           std.text.num           浮点格式化（固定/%e/%g）与解析（inf/nan、RANGE/PARSE 错误码）
+  std/text/str.c6           std.text.str           字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、to_int/to_u64、strip_prefix/suffix、fields、replace/split_once、hash
+  std/text/strbuf.c6        std.text.strbuf        会长的字符缓冲 StrBuf（托管引用）：write/write_int/write_hex、reserve/truncate/cstr
+  std/text/utf8.c6          std.text.utf8          UTF-8 解码/编码/校验/计数 + Rune 迭代器（拒绝过长编码、代理区、截断）
+
+std/container/              容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序
+  std/container/deque.c6    std.container.deque    环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
+  std/container/map.c6      std.container.map      开放寻址哈希表 Map@(K,V) + Entry/Iter：put/get/get_or/set/put_new/remove
+  std/container/pqueue.c6   std.container.pqueue   二叉堆 PQueue@T（托管容器）：push/pop/peek/push_pop/heapify/clear、count/capacity/is_empty/is_valid、init/set_cmp/set_max（比较器与 std.container.sort 的 cmp_int/cmp_str 通用）
+  std/container/range.c6    std.container.range    能被 foreach 吃掉的区间 Range/StepRange
+  std/container/set.c6      std.container.set      哈希集合 Set@K + SetIter（std.container.map 的薄包装，add 返回新增/已存在）
+  std/container/sort.c6     std.container.sort     比较器驱动的排序与二分查找：sort_int/sort_bytes、find_int、lower/upper_bound
+  std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
+  std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
+
+std/os/                     操作系统：流、文件系统、路径、环境变量、时间
+  std/os/env.c6             std.os.env             环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
+  std/os/fs.c6              std.os.fs              stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
+  std/os/io.c6              std.os.io              Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代（方法名带 reader_/writer_/cfile_ 前缀）
+  std/os/path.c6            std.os.path            POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
+  std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
+
+std/encoding/               编解码：Base64/十六进制/百分号、SHA-256、位流、UUID
+  std/encoding/base64.c6    std.encoding.base64    Base64（RFC 4648）标准表与 URL 安全表：b64_encode/b64_decode、b64url_encode/b64url_decode、显式表与填充的 b64_encode_ex/b64_decode_ex/b64_decoded_len/b64_encoded_len、b64_valid、就地 b64_decode_inplace/b64url_decode_inplace（跳过空白、严格填充、放不下不写半截）
+  std/encoding/bitbuf.c6    std.encoding.bitbuf    位级读写器（零分配、MSB 先）：bw_open/bw_put/bw_put_u64/bw_put_bit/bw_align/bw_put_bytes/bw_patch（回填不改游标）、br_open/br_get/br_get_u64/br_get_bit/br_peek/br_skip/br_align/br_get_bytes、bw_bits/bw_bytes/bw_ok/br_remaining/br_eof
+  std/encoding/codec.c6     std.encoding.codec     Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
+  std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
+  std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/uuid_v4_seeded、uuid_v7/uuid_v7_at/uuid_time_v7、uuid_v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/uuid_format/uuid_format_simple/uuid_format_upper、uuid_version/uuid_variant/uuid_eq/uuid_nil/uuid_is_nil
+
+std/data/                   数据格式：JSON、CSV、INI
+  std/data/csv.c6           std.data.csv           RFC 4180 CSV：零分配 CsvReader（引号/跨行/CRLF）+ csv_write_row
+  std/data/ini.c6           std.data.ini           INI 配置的零分配读取：ini_open/ini_next（字段都是输入上的视图）、ini_lookup/ini_has_section/ini_count、IniEntry.section/key/value/line；语法错误给行号
+  std/data/json.c6          std.data.json          JSON 解析与写出：arena 上的 DOM、json_get/json_at、json_write/pretty/escape（数字保留原文）
+
+std/net/                    网络与 Web：IP/CIDR、URL、MIME
+  std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_format、inet_parse_v4/inet_format_v4、inet_parse_v6/inet_format_v6（输出按 RFC 5952 压缩）、inet_parse_cidr/inet_cidr_contains/inet_cidr_mask/inet_v4_mask、inet_is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
+  std/net/mime.c6           std.net.mime           扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：mime_of_ext/mime_of_path/mime_ext_of/mime_ext_at/mime_type_at/mime_count、mime_is_text/is_image/is_audio/is_video/is_font、mime_charset、mime_sniff、mime_default
+  std/net/url.c6            std.net.url            URL（RFC 3986）解析与相对解析：Url 的 url_parse/url_effective_port/url_is_absolute/url_has_host、url_resolve（§5.2 全算法）、查询参数 url_next_pair/Pair、百分号 url_encode/url_encode_component/url_decode/url_decode_at/url_encoded_len/url_decoded_len
 ```
 
 ```c
-import std.vec;
-import std.fmt;
+import std.container.vec;
+import std.text.fmt;
 
 @Vect@int v = new Vect@int;                /* 托管字段 -> new 出来 */
 Buf@(32) b = { { 0 }, 0 };                 /* 纯值，栈上就够 */
@@ -157,13 +179,13 @@ b->write_int(v->count()) catch e { return 2; };
 printf("%s\n", b->cstr());
 ```
 
-`import` 只带来声明，所以模块自己的 `.c6` 文件要一起编进程序（`std/vec.c6`
-的排序内核在 `std/sort.c6` 里，sort 又依赖 str/err/types，用 vec 就得把这几个
+`import` 只带来声明，所以模块自己的 `.c6` 文件要一起编进程序（`std/container/vec.c6`
+的排序内核在 `std/container/sort.c6` 里，sort 又依赖 str/err/types，用 vec 就得把这几个
 正文都放上命令行）：
 
 ```sh
 ./tcc/c6 -B tcc -I . -o build/app app.c6 \
-    std/vec.c6 std/fmt.c6 std/types.c6 std/str.c6 std/sort.c6 std/err.c6
+    std/container/vec.c6 std/text/fmt.c6 std/core/types.c6 std/text/str.c6 std/container/sort.c6 std/core/err.c6
 make stdtest     # 跑 std/ 下全部 test 块（模块数与块数以实际输出为准）
 make std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
 make std-tour    # 编译并运行 examples/stdtour.c6（第二批模块的拼装示例）

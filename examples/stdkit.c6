@@ -7,30 +7,30 @@
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *
  *     ./tcc/c6 -B tcc -I . -o build/stdkit \
- *         examples/stdkit.c6 std/types.c6 std/err.c6 std/map.c6 \
- *         std/set.c6 std/ascii.c6 std/num.c6 std/codec.c6 \
- *         std/rand.c6 std/fs.c6
+ *         examples/stdkit.c6 std/core/types.c6 std/core/err.c6 std/container/map.c6 \
+ *         std/container/set.c6 std/text/ascii.c6 std/text/num.c6 std/encoding/codec.c6 \
+ *         std/core/rand.c6 std/os/fs.c6
  *
  * 用到的东西：
- *   std.ascii   ASCII 判别、大小写、忽略大小写比较
- *   std.num     浮点格式化（固定/%e/%g）与解析（含 inf/nan、错误码）
- *   std.codec   Base64 / 十六进制 / 百分号编码，全部写调用方缓冲
- *   std.rand    xorshift64*：可重放序列、无偏区间、shuffle
- *   std.fs      stat / mkdir_p / 目录遍历 / rename / remove
- *   std.set     哈希集合（Map 的薄包装）
+ *   std.text.ascii   ASCII 判别、大小写、忽略大小写比较
+ *   std.text.num     浮点格式化（固定/%e/%g）与解析（含 inf/nan、错误码）
+ *   std.encoding.codec   Base64 / 十六进制 / 百分号编码，全部写调用方缓冲
+ *   std.core.rand    xorshift64*：可重放序列、无偏区间、shuffle
+ *   std.os.fs      stat / mkdir_p / 目录遍历 / rename / remove
+ *   std.container.set     哈希集合（Map 的薄包装）
  */
 #include <stdio.h>
 #include <string.h>
 
-import std.types;
-import std.err;
-import std.map;
-import std.set;
-import std.ascii;
-import std.num;
-import std.codec;
-import std.rand;
-import std.fs;
+import std.core.types;
+import std.core.err;
+import std.container.map;
+import std.container.set;
+import std.text.ascii;
+import std.text.num;
+import std.encoding.codec;
+import std.core.rand;
+import std.os.fs;
 
 /* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
 #define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })

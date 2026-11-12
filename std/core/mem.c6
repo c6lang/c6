@@ -1,0 +1,408 @@
+/* std/core/mem：分配器包装与按类型的字节操作。
+ *
+ *     import std.core.mem;
+ *
+ *     u8 buf[512] = { 0 };
+ *     Arena a = arena_make(buf, sizeof(buf));   // 借用栈上的一段字节
+ *     Arena *pa = &a;
+ *     int *p = (int *)pa->arena_alloc(4, 4);          // 4 字节对齐
+ *     if (!p) return err(1, "arena 满了");
+ *
+ * 分工：
+ * - `Arena`：**借用**调用方给的内存做 bump 分配，不拥有、不释放、不调
+ *   `calloc`。适合「一个函数里的一堆小对象，函数返回就全扔」；
+ * - `alloc_new`/`dealloc`：直接包装 `libtcc1` 的 `calloc`/`free`（托管堆），
+ *   给需要明确生命周期、又不想写 `new T[n]` 的场合；
+ * - `copy`/`fill`/`copy_overlap`/`byte_eq`/`zero`：按**元素单位**的
+ *   `memcpy`/`memset` 帮手，省掉调用方的 sizeof 与 `(char *)` 强转；
+ * - `swap`/`rotate`/`reverse_bytes`/`align_up`/`is_aligned`：容器与
+ *   分配器常用的小工具。
+ *
+ * 写法约定：`Arena` 是普通（非泛型）结构体，方法只能写成文件作用域的
+ * 函数（第一个参数 `Arena *self`），调用写 `pa->arena_room()`。方法名是
+ * `arena_room`/`arena_used`/`arena_reset`/`arena_alloc`：`alloc`/`reset`
+ * 这类裸名会以弱别名发出，和同程序里别的 `alloc` 抢符号。
+ *
+ * 为什么 Arena 用纯值：它只有三个指针字段，没有托管引用，所以能按值声明、
+ * 按值传参。按值传参**复制游标**：副本各自分配，互不影响；需要共享时传
+ * `Arena *`。
+ */
+#include <string.h>
+#include <stdlib.h>
+
+module std.core.mem;
+import std.core.types;
+import std.core.err;
+
+struct Arena {
+    u8 *base;   /* 整段内存的起点 */
+    u8 *cur;    /* 下一个空闲字节 */
+    u8 *end;    /* 一过末尾 */
+};
+
+/* 小工具：2 的幂判定（对齐参数、next_pow2 类场景都用它） */
+int is_pow2_u(usize v) { return v != 0u && (v & (v - 1u)) == 0u; }
+
+/* 内存池工厂：接管 [buf, buf + n) 这段已有内存，n 为负按 0 处理 */
+Arena arena_make(void *buf, int n)
+{
+    Arena a = { 0, 0, 0 };
+
+    a.base = (u8 *)buf;
+    a.cur = (u8 *)buf;
+    a.end = (u8 *)buf + (n > 0 ? (usize)n : 0u);
+    return a;
+}
+
+/* 还剩多少字节 */
+int arena_room(Arena *self) { return (int)(self->end - self->cur); }
+
+/* 已经用掉多少字节 */
+int arena_used(Arena *self) { return (int)(self->cur - self->base); }
+
+int arena_is_empty(Arena *self) { return self->cur == self->base; }
+
+/* 把游标退回起点，整段重新可用（旧指针一律失效） */
+void arena_reset(Arena *self) { self->cur = self->base; }
+
+/* 分配 size 字节、按 align（1/2/4/8/16…）对齐；不够返回 0，**不改游标**。
+   align 为 0 或不是 2 的幂时按 1 处理。 */
+void *arena_alloc(Arena *self, int size, int align)
+{
+    usize a = align > 0 ? (usize)align : 1u;
+    usize start = 0u;
+    u8 *np = 0;
+
+    if (!is_pow2_u(a))
+        a = 1u;
+    start = (usize)self->cur;
+    np = (u8 *)((start + a - 1u) & ~(a - 1u));
+    if (size < 0 || np > self->end || (usize)(self->end - np) < (usize)size)
+        return 0;
+    self->cur = np + (usize)size;
+    return np;
+}
+
+/* 分配 n 个元素、每个 size 字节，元素大小是 2 的幂时按元素对齐 */
+void *arena_alloc_array(Arena *self, int n, int size)
+{
+    usize total = 0u;
+    usize a = size > 0 ? (usize)size : 1u;
+
+    if (n < 0 || size <= 0)
+        return 0;
+    total = a * (usize)n;
+    if (total > 0x7fffffffu)
+        return 0;
+    return arena_alloc(self, (int)total, is_pow2_u(a) ? size : 1);
+}
+
+/* 从 Arena 分配一块能放下 n 个字节 + 结尾 NUL 的内存并清零，
+   返回可当 char* 用的指针；放不下返回 0。调用方自己 memcpy 内容。 */
+char *arena_alloc_str(Arena *self, int n)
+{
+    char *p = 0;
+
+    if (n < 0)
+        return 0;
+    p = (char *)arena_alloc(self, n + 1, 1);
+    if (p == 0)
+        return 0;
+    p[n] = 0;
+    return p;
+}
+
+/* 从 Arena 复制一个 C 字符串（含 NUL）：失败返回 0 */
+char *arena_alloc_copy(Arena *self, const char *z)
+{
+    usize n = 0;
+    char *p = 0;
+
+    if (z == 0)
+        return 0;
+    n = strlen(z);
+    if (n > 0x7fffffffu)
+        return 0;
+    p = (char *)arena_alloc(self, (int)n + 1, 1);
+    if (p == 0)
+        return 0;
+    memcpy(p, z, n + 1);
+    return p;
+}
+
+/* ---- 托管堆的薄包装 ---- */
+
+/* 等价于 calloc(1, size)：清零，失败返回 0 */
+void *alloc_new(int size)
+{
+    if (size <= 0)
+        return 0;
+    return calloc(1, (usize)size);
+}
+
+/* n 个元素，清零（等价于 calloc(n, size)） */
+void *alloc_new_array(int n, int size)
+{
+    if (n <= 0 || size <= 0)
+        return 0;
+    return calloc((usize)n, (usize)size);
+}
+
+/* 释放：NULL 安全 */
+void dealloc(void *p)
+{
+    if (p)
+        free(p);
+}
+
+/* ---- 按元素单位的字节操作 ---- */
+
+/* 把 src 的前 n 个元素复制到 dst（不重叠；重叠请用 copy_overlap） */
+void copy(void *dst, const void *src, usize n, usize size)
+{
+    memcpy(dst, src, n * size);
+}
+
+/* 允许重叠的复制（memmove） */
+void copy_overlap(void *dst, const void *src, usize n, usize size)
+{
+    memmove(dst, src, n * size);
+}
+
+/* 前 n 个元素都填成 *v 指向的那 size 个字节 */
+void fill(void *dst, const void *v, usize n, usize size)
+{
+    usize i = 0;
+
+    if (size == 0)
+        return;
+    for (i = 0; i < n; i++)
+        memcpy((char *)dst + i * size, v, size);
+}
+
+/* 全部清零 */
+void zero(void *dst, usize n, usize size)
+{
+    if (size != 0)
+        memset(dst, 0, n * size);
+}
+
+/* 两个元素按字节相等（map/vec 的键比较就是这一条） */
+int byte_eq(const void *a, const void *b, usize size)
+{
+    return memcmp(a, b, size) == 0;
+}
+
+/* 元素交换：size 是元素大小，size <= 16 走栈暂存，更大时逐字节转 */
+void swap(void *a, void *b, usize size)
+{
+    u8 tmp[16] = { 0 };
+    u8 *pa = (u8 *)a;
+    u8 *pb = (u8 *)b;
+    usize i = 0;
+    u8 t = 0;
+
+    if (pa == pb)
+        return;
+    if (size <= 16) {
+        memcpy(tmp, pa, size);
+        memcpy(pa, pb, size);
+        memcpy(pb, tmp, size);
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        t = pa[i];
+        pa[i] = pb[i];
+        pb[i] = t;
+    }
+}
+
+/* 反转 n 个元素（rotate 的内核，单独也常用） */
+void reverse_bytes(void *a, usize n, usize size)
+{
+    u8 *p = (u8 *)a;
+    usize i = 0;
+
+    for (i = 0; i < n / 2; i++)
+        swap(p + i * size, p + (n - 1 - i) * size, size);
+}
+
+/* 把整段按元素向左旋转 mid 个（a[0..mid) 移到末尾）：三段反转法 */
+void rotate(void *a, usize count, usize mid, usize size)
+{
+    if (mid == 0 || mid >= count)
+        return;
+    reverse_bytes((u8 *)a, mid, size);
+    reverse_bytes((u8 *)a + mid * size, count - mid, size);
+    reverse_bytes((u8 *)a, count, size);
+}
+
+/* 把 v 向上取整到 align 的倍数：align_up(13, 8) == 16。
+   align 为 0 或不是 2 的幂时原样返回 v。 */
+usize align_up(usize v, usize align)
+{
+    if (!is_pow2_u(align))
+        return v;
+    return (v + align - 1u) & ~(align - 1u);
+}
+
+/* 往下取整到 align 的倍数 */
+usize align_down(usize v, usize align)
+{
+    if (!is_pow2_u(align))
+        return v;
+    return v & ~(align - 1u);
+}
+
+int is_aligned(const void *p, usize align)
+{
+    if (!is_pow2_u(align))
+        return 0;
+    return ((usize)p & (align - 1u)) == 0u;
+}
+
+/* ---- 自测 ---- */
+
+/* 普通结构体的方法要按指针接收者写，所以测试里先取地址用 `pa->...`。 */
+test "Arena 按对齐分配，满了返回 0 且不改游标" {
+    u8 buf[64] = { 0 };
+    Arena a = arena_make(buf, 64);
+    Arena *pa = &a;
+    int *p = 0;
+    char *c = 0;
+    int before = 0;
+
+    p = (int *)pa->arena_alloc(sizeof(int), 4);
+    if (p == 0 || !is_aligned(p, 4u))
+        return err(1, "int 分配没按 4 对齐");
+    c = (char *)pa->arena_alloc(1, 1);
+    if (c == 0)
+        return err(2, "char 分配失败");
+    *p = 7;
+    *c = 'x';
+    if (*p != 7 || *c != 'x')
+        return err(3, "分配到的内存不可写");
+    if (pa->arena_used() < 5)
+        return err(4, "used 不对");
+    before = pa->arena_used();
+    if (pa->arena_alloc(1000, 1) != 0)
+        return err(5, "超出容量没有返回 0");
+    if (pa->arena_used() != before)
+        return err(6, "分配失败时改动了游标");
+    pa->arena_reset();
+    if (pa->arena_used() != 0 || !pa->arena_is_empty())
+        return err(7, "reset 之后没有回到起点");
+    if (pa->arena_alloc(64, 1) == 0)
+        return err(8, "reset 之后应当能重新分配整段");
+}
+
+test "Arena 按值复制会复制游标，互不影响" {
+    u8 buf[32] = { 0 };
+    Arena a = arena_make(buf, 32);
+    Arena b = a;
+    Arena *pb = &b;
+
+    if ((&a)->arena_alloc(8, 1) == 0)
+        return err(9, "a 分配失败");
+    if (pb->arena_used() != 0)
+        return err(10, "副本不该看到 a 的分配");
+    if ((&a)->arena_used() != 8)
+        return err(11, "a 的 used 不对");
+}
+
+test "alloc_array 清零，dealloc 接受 NULL" {
+    int *p = (int *)alloc_new_array(4, sizeof(int));
+
+    if (p == 0)
+        return err(12, "alloc_new_array 失败");
+    if (p[0] != 0 || p[3] != 0)
+        return err(13, "alloc_new_array 没有清零");
+    dealloc(p);
+    dealloc(0);
+    if (alloc_new(0) != 0)
+        return err(14, "alloc_new(0) 应当返回 0");
+}
+
+test "copy / fill / swap / zero / byte_eq" {
+    int a[4] = { 1, 2, 3, 4 };
+    int b[4] = { 0, 0, 0, 0 };
+    int v = 9;
+
+    copy(b, a, 4, sizeof(int));
+    if (b[0] != 1 || b[3] != 4)
+        return err(15, "copy 不对");
+    fill(b, &v, 3, sizeof(int));
+    if (b[0] != 9 || b[2] != 9 || b[3] != 4)
+        return err(16, "fill 不对");
+    swap(&b[0], &b[3], sizeof(int));
+    if (b[0] != 4 || b[3] != 9)
+        return err(17, "swap 不对");
+    if (!byte_eq(&a[0], &a[0], sizeof(int)))
+        return err(18, "byte_eq 同一元素应为真");
+    if (byte_eq(&a[0], &a[1], sizeof(int)))
+        return err(19, "byte_eq 不同元素应为假");
+    zero(b, 4, sizeof(int));
+    if (b[0] != 0 || b[3] != 0)
+        return err(20, "zero 不对");
+}
+
+test "swap 对大于 16 字节的元素也正确" {
+    int a[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    int b[8] = { 9, 9, 9, 9, 9, 9, 9, 9 };
+
+    swap(a, b, sizeof(a));
+    if (b[0] != 1 || b[7] != 8 || a[0] != 9)
+        return err(21, "大元素 swap 不对");
+}
+
+test "rotate / reverse / align" {
+    int a[5] = { 1, 2, 3, 4, 5 };
+
+    rotate(a, 5, 2, sizeof(int));
+    if (a[0] != 3 || a[2] != 5 || a[3] != 1 || a[4] != 2)
+        return err(22, "rotate 不对");
+    reverse_bytes(a, 5, sizeof(int));
+    if (a[0] != 2 || a[4] != 3)
+        return err(23, "reverse 不对");
+    if (align_up(13u, 8u) != 16u || align_up(16u, 8u) != 16u)
+        return err(24, "align_up 不对");
+    if (align_down(13u, 8u) != 8u)
+        return err(25, "align_down 不对");
+    if (!is_aligned((void *)0x1000u, 16u) || is_aligned((void *)0x1001u, 16u))
+        return err(26, "is_aligned 不对");
+    if (align_up(7u, 0u) != 7u)
+        return err(27, "align 0 应当原样返回");
+    if (!is_pow2_u(64u) || is_pow2_u(0u))
+        return err(28, "is_pow2_u 不对");
+}
+
+test "Arena 分配字符串与拷贝 C 字符串" {
+    u8 buf[64] = { 0 };
+    Arena a = arena_make(buf, 64);
+    Arena *pa = &a;
+    char *s = 0;
+    char *c = 0;
+    char *big = 0;
+
+    s = pa->arena_alloc_str(5);
+    if (s == 0)
+        return err(29, "alloc_str 失败");
+    if (s[0] != 0 || s[5] != 0)
+        return err(30, "alloc_str 没有清零");
+    memcpy(s, "hello", 5);
+    if (strcmp(s, "hello") != 0)
+        return err(31, "alloc_str 的内存不可写");
+    c = pa->arena_alloc_copy((const char *)"world");
+    if (c == 0)
+        return err(32, "alloc_copy 失败");
+    if (strcmp(c, "world") != 0)
+        return err(33, "alloc_copy 内容不对");
+    if (c == s)
+        return err(34, "两次分配不该重合");
+    /* 64 字节的池子：5+1 + 5+1 之后还剩不少，但要不到 1000 字节 */
+    big = pa->arena_alloc_str(1000);
+    if (big != 0)
+        return err(35, "超出容量应当返回 0");
+    if (pa->arena_alloc_copy(0) != 0)
+        return err(36, "拷贝 NULL 应当返回 0");
+}

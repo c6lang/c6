@@ -7,26 +7,26 @@
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *
  *     ./tcc/c6 -B tcc -I . -o build/stdnet \
- *         examples/stdnet.c6 std/types.c6 std/err.c6 std/str.c6 \
- *         std/sort.c6 std/inet.c6 std/bitbuf.c6 std/pqueue.c6 std/ini.c6
+ *         examples/stdnet.c6 std/core/types.c6 std/core/err.c6 std/text/str.c6 \
+ *         std/container/sort.c6 std/net/inet.c6 std/encoding/bitbuf.c6 std/container/pqueue.c6 std/data/ini.c6
  *
  * 用到的东西：
- *   std.inet    IPv4/IPv6 解析与格式化、CIDR 判断、端口、地址分类
- *   std.bitbuf  位级读写器（MSB 先）、回填、越界诊断
- *   std.pqueue  泛型二叉堆（小顶/大顶、top-k）
- *   std.ini     INI 配置的零分配迭代读取与查找
+ *   std.net.inet    IPv4/IPv6 解析与格式化、CIDR 判断、端口、地址分类
+ *   std.encoding.bitbuf  位级读写器（MSB 先）、回填、越界诊断
+ *   std.container.pqueue  泛型二叉堆（小顶/大顶、top-k）
+ *   std.data.ini     INI 配置的零分配迭代读取与查找
  */
 #include <stdio.h>
 #include <string.h>
 
-import std.types;
-import std.err;
-import std.str;
-import std.sort;
-import std.inet;
-import std.bitbuf;
-import std.pqueue;
-import std.ini;
+import std.core.types;
+import std.core.err;
+import std.text.str;
+import std.container.sort;
+import std.net.inet;
+import std.encoding.bitbuf;
+import std.container.pqueue;
+import std.data.ini;
 
 /* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
 #define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })

@@ -1,0 +1,479 @@
+/* std/data/ini：INI 配置的零分配读取器。
+ *
+ *     import std.data.ini;
+ *
+ *     IniReader r = ini_open(S("[db]\nhost = localhost\nport = 5432\n"));
+ *     IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+ *                    { { (char *)0, 0 } }, 0 };
+ *     while (ini_next(&r, &e) == 1) {
+ *         // e.section / e.key / e.value 都是输入上的视图
+ *     }
+ *
+ *     Str host = { { (char *)0, 0 } };
+ *     ini_lookup(S("[db]\nhost = localhost\n"), S("db"), S("host"), &host);
+ *
+ * 这一层和 `std.data.csv` 同一个思路：**不分配、不复制**，每个字段都是指向输入
+ * 文本的 `Str` 视图，所以输入必须在用完之后才能释放/改写。
+ *
+ * 语法（有意做小，够读 ini/`.env`/systemd 风格的小配置）：
+ *
+ * - 行分隔是 `\n`，`\r\n` 也认（值的尾部 `\r` 会被 trim 掉）；
+ * - 空行忽略；以 `#` 或 `;` **开头**（trim 之后）的行是整行注释——
+ *   行内的 `#` 不是注释（值里可以出现 URL 片段之类）；
+ * - `[section]` 切节，节名两侧空白 trim；同名节可以出现多次（等于合并）；
+ * - `key = value` 用**第一个** `=` 分隔，两侧空白 trim，所以值里可以再出现
+ *   `=`；值可以为空（`k =`）；键不能为空；
+ * - 第一节之前的键属于「根区」，它的 `section` 是空视图；
+ * - 不合上面任何一条的非空行都是**语法错误**：`ini_next` 返回 -1，并把行号
+ *   记在 `r.err` 里（1 起）。错误之后游标停在坏行之后，可以继续读下一行。
+ *
+ * 不做的事：不做类型转换、不处理转义、不合并续行、不解析引号——需要这些就
+ * 在拿到 `Str` 之后自己处理（`std.text.str` 的 `to_int`/`trim` 等）。
+ */
+#include <string.h>
+
+module std.data.ini;
+import std.core.types;
+import std.core.err;
+import std.text.str;
+
+enum Error { OK = 0, INVAL = 1 };
+
+/* 一条键值；section 为空视图表示根区 */
+struct IniEntry {
+    Str section;
+    Str key;
+    Str value;
+    int line;           /* 1 起的行号 */
+};
+
+struct IniReader {
+    char[:] s;
+    int at;             /* 下一个要读的字节 */
+    Str section;        /* 当前节（视图） */
+    int line;           /* 已经消费的行数 */
+    int err;            /* 最近一次语法错误的行号，0 = 没出错 */
+};
+
+/* 去掉两侧空白（空格 / 制表 / \r / \n） */
+static char[:] ini_trim(char[:] v)
+{
+    int b = 0;
+    int e = v.len;
+
+    while (b < e) {
+        int c = (u8)v.data[b];
+
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+            break;
+        b++;
+    }
+    while (e > b) {
+        int c = (u8)v.data[e - 1];
+
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+            break;
+        e--;
+    }
+    return (char[:]){ v.data + b, e - b };
+}
+
+IniReader ini_open(char[:] text)
+{
+    IniReader r = { { (char *)0, 0 }, 0, { { (char *)0, 0 } }, 0, 0 };
+
+    if (text.len > 0 && text.data)
+        r.s = text;
+    return r;
+}
+
+/* 取下一对键值：1 = 有，0 = 读完了，-1 = 语法错误（行号在 r->err） */
+int ini_next(IniReader *r, IniEntry *out)
+{
+    if (!r || !out)
+        return -1;
+    for (;;) {
+        int start = 0;
+        int end = 0;
+        char[:] line = { (char *)0, 0 };
+        int eq = -1;
+        int i = 0;
+
+        if (r->at >= r->s.len)
+            return 0;
+        start = r->at;
+        end = start;
+        while (end < r->s.len && r->s.data[end] != '\n')
+            end++;
+        r->at = (end < r->s.len) ? end + 1 : end;
+        r->line++;
+        line = ini_trim((char[:]){ r->s.data + start, end - start });
+        if (line.len == 0)
+            continue;
+        if (line.data[0] == '#' || line.data[0] == ';')
+            continue;
+        if (line.data[0] == '[') {
+            if (line.len < 2 || line.data[line.len - 1] != ']') {
+                r->err = r->line;
+                return -1;
+            }
+            r->section = (Str){ ini_trim((char[:]){ line.data + 1, line.len - 2 }) };
+            continue;
+        }
+        for (i = 0; i < line.len; i++) {
+            if (line.data[i] == '=') {
+                eq = i;
+                break;
+            }
+        }
+        if (eq < 0) {
+            r->err = r->line;
+            return -1;
+        }
+        out->section = r->section;
+        out->key = (Str){ ini_trim((char[:]){ line.data, eq }) };
+        out->value = (Str){ ini_trim((char[:]){ line.data + eq + 1, line.len - eq - 1 }) };
+        out->line = r->line;
+        if (out->key.s.len == 0) {
+            r->err = r->line;
+            return -1;
+        }
+        return 1;
+    }
+}
+
+static int ini_eq(char[:] a, char[:] b)
+{
+    if (a.len != b.len)
+        return 0;
+    if (a.len <= 0)
+        return 1;
+    return memcmp(a.data, b.data, (size_t)a.len) == 0;
+}
+
+/* 在整段文本里找 section 下的 key（section 给空视图 = 根区）。
+   命中返回 1 并写 *out（键或节重复时给**最后**一个，和大多数配置文件的
+   「后写覆盖先写」一致）；没找到返回 0。 */
+int ini_lookup(char[:] text, char[:] section, char[:] key, Str *out)
+{
+    IniReader r = ini_open(text);
+    IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                   { { (char *)0, 0 } }, 0 };
+    int found = 0;
+    Str hit = { { (char *)0, 0 } };
+    int rc = 0;
+
+    if (!out || key.len <= 0)
+        return 0;
+    for (;;) {
+        rc = ini_next(&r, &e);
+        if (rc == 0)
+            break;
+        if (rc < 0)
+            return 0;               /* 坏行之后不再往下找 */
+        if (!ini_eq(e.section.s, section) || !ini_eq(e.key.s, key))
+            continue;
+        hit = e.value;
+        found = 1;
+    }
+    if (!found)
+        return 0;
+    *out = hit;
+    return 1;
+}
+
+/* 文本里有没有这一节（根区给空视图） */
+int ini_has_section(char[:] text, char[:] section)
+{
+    IniReader r = ini_open(text);
+    IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                   { { (char *)0, 0 } }, 0 };
+    int rc = 0;
+
+    for (;;) {
+        rc = ini_next(&r, &e);
+        if (rc == 0)
+            return 0;
+        if (rc < 0)
+            return 0;
+        if (ini_eq(e.section.s, section))
+            return 1;
+    }
+}
+
+/* 一节里有多少个键（同名键也算多次，和读取器看到的一致） */
+int ini_count(char[:] text, char[:] section)
+{
+    IniReader r = ini_open(text);
+    IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                   { { (char *)0, 0 } }, 0 };
+    int n = 0;
+    int rc = 0;
+
+    for (;;) {
+        rc = ini_next(&r, &e);
+        if (rc == 0)
+            return n;
+        if (rc < 0)
+            return -1;
+        if (ini_eq(e.section.s, section))
+            n++;
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int str_is(Str s, char *lit, int n)
+{
+    if (s.s.len != n)
+        return 0;
+    if (n == 0)
+        return 1;
+    return memcmp(s.s.data, lit, (size_t)n) == 0;
+}
+
+test "基本形态：根区、节、键值" {
+    char[:] text = S("name = demo\n"
+                     "\n"
+                     "[db]\n"
+                     "host = localhost\n"
+                     "port = 5432\n");
+    IniReader r = ini_open(text);
+    IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                   { { (char *)0, 0 } }, 0 };
+
+    if (ini_next(&r, &e) != 1)
+        return err(1, "第一条没读出来");
+    if (e.section.s.len != 0)
+        return err(2, "第一条应当在根区");
+    if (!str_is(e.key, "name", 4) || !str_is(e.value, "demo", 4))
+        return err(3, "第一条键值不对");
+    if (e.line != 1)
+        return err(4, "行号不对");
+    if (ini_next(&r, &e) != 1)
+        return err(5, "第二条没读出来");
+    if (!str_is(e.section, "db", 2))
+        return err(6, "第二条的节不对");
+    if (!str_is(e.key, "host", 4) || !str_is(e.value, "localhost", 9))
+        return err(7, "host 不对");
+    if (e.line != 4)
+        return err(8, "空行也该计行号");
+    if (ini_next(&r, &e) != 1)
+        return err(9, "第三条没读出来");
+    if (!str_is(e.key, "port", 4) || !str_is(e.value, "5432", 4))
+        return err(10, "port 不对");
+    if (ini_next(&r, &e) != 0)
+        return err(11, "读完之后应当返回 0");
+    /* 反复调用仍然是 0 */
+    if (ini_next(&r, &e) != 0)
+        return err(12, "读完之后再读还是 0");
+    if (r.err != 0)
+        return err(13, "正常文本不该记错误");
+}
+
+test "trim、注释、CRLF、空值、值里带等号" {
+    char[:] text = S("  # 整行注释\r\n"
+                     "; 另一种注释\r\n"
+                     "[ sec ]\r\n"
+                     "  key  =  value with space  \r\n"
+                     "empty =\r\n"
+                     "expr = a=b\r\n"
+                     "url = http://h/x#frag\r\n");
+    IniReader r = ini_open(text);
+    IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                   { { (char *)0, 0 } }, 0 };
+
+    if (ini_next(&r, &e) != 1)
+        return err(14, "第一条没读出来");
+    if (!str_is(e.section, "sec", 3))
+        return err(15, "节名两侧空白应当 trim 掉");
+    if (!str_is(e.key, "key", 3) || !str_is(e.value, "value with space", 16))
+        return err(16, "键值 trim 不对");
+    if (ini_next(&r, &e) != 1)
+        return err(17, "第二条没读出来");
+    if (!str_is(e.value, "", 0))
+        return err(18, "空值应当给空视图");
+    if (ini_next(&r, &e) != 1)
+        return err(19, "第三条没读出来");
+    if (!str_is(e.value, "a=b", 3))
+        return err(20, "值里应当能再出现等号");
+    if (ini_next(&r, &e) != 1)
+        return err(21, "第四条没读出来");
+    if (!str_is(e.value, "http://h/x#frag", 15))
+        return err(22, "行内 # 不是注释");
+    if (ini_next(&r, &e) != 0)
+        return err(23, "应当读完了");
+}
+
+test "同名节合并、根区回到空节" {
+    char[:] text = S("[a]\nx = 1\n[b]\ny = 2\n[a]\nz = 3\n");
+    IniReader r = ini_open(text);
+    IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                   { { (char *)0, 0 } }, 0 };
+    int seen_a = 0;
+
+    while (ini_next(&r, &e) == 1) {
+        if (str_is(e.section, "a", 1))
+            seen_a++;
+    }
+    if (seen_a != 2)
+        return err(24, "同名节的两条都该读出来");
+    if (r.err != 0)
+        return err(25, "不该有语法错误");
+}
+
+test "语法错误：坏节头、空键、没有等号" {
+    {
+        char[:] text = S("[sec\nk = v\n");
+        IniReader r = ini_open(text);
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != -1)
+            return err(26, "缺右括号应当报错");
+        if (r.err != 1)
+            return err(27, "错误行号应当是 1");
+        if (ini_next(&r, &e) != 1)
+            return err(28, "坏行之后应当还能继续读");
+        if (!str_is(e.section, "", 0) || !str_is(e.key, "k", 1))
+            return err(29, "坏行之后的键应当在根区");
+    }
+    {
+        char[:] text = S("= v\n");
+        IniReader r = ini_open(text);
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != -1)
+            return err(30, "空键应当报错");
+        if (r.err != 1)
+            return err(31, "空键的错误行号不对");
+    }
+    {
+        char[:] text = S("no equals here\n");
+        IniReader r = ini_open(text);
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != -1)
+            return err(32, "没有等号应当报错");
+        if (r.err != 1)
+            return err(33, "没有等号的错误行号不对");
+    }
+    {
+        char[:] text = S("[]\nk = v\n");
+        IniReader r = ini_open(text);
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != 1)
+            return err(34, "空节名应当允许");
+        if (e.section.s.len != 0)
+            return err(35, "空节名等于根区");
+    }
+}
+
+test "ini_lookup / ini_has_section / ini_count" {
+    char[:] text = S("root = 1\n"
+                     "[db]\n"
+                     "host = localhost\n"
+                     "port = 5432\n"
+                     "port = 5433\n"
+                     "[log]\n"
+                     "level = info\n");
+    Str v = { { (char *)0, 0 } };
+
+    if (!ini_lookup(text, S("db"), S("host"), &v) || !str_is(v, "localhost", 9))
+        return err(36, "lookup db.host 不对");
+    /* 重复键取最后一个 */
+    if (!ini_lookup(text, S("db"), S("port"), &v) || !str_is(v, "5433", 4))
+        return err(37, "重复键应当取最后一个");
+    if (!ini_lookup(text, S(""), S("root"), &v) || !str_is(v, "1", 1))
+        return err(38, "根区 lookup 不对");
+    if (ini_lookup(text, S("db"), S("level"), &v))
+        return err(39, "跨节不该找到");
+    if (ini_lookup(text, S("nope"), S("host"), &v))
+        return err(40, "不存在的节不该找到");
+    if (ini_lookup(text, S(""), S("host"), &v))
+        return err(41, "根区不该有 host");
+    /* 命中空值 */
+    {
+        char[:] t2 = S("[a]\nempty =\n");
+
+        if (!ini_lookup(t2, S("a"), S("empty"), &v) || v.s.len != 0)
+            return err(42, "空值也应当算命中");
+    }
+    /* 节是否存在 */
+    if (!ini_has_section(text, S("db")) || !ini_has_section(text, S("log")))
+        return err(43, "db/log 都该存在");
+    if (ini_has_section(text, S("nope")))
+        return err(44, "nope 不该存在");
+    if (!ini_has_section(text, S("")))
+        return err(45, "根区因为有 root 键所以该存在");
+    /* 计数 */
+    if (ini_count(text, S("db")) != 3)
+        return err(46, "db 下应当有 3 条（含重复键）");
+    if (ini_count(text, S("log")) != 1)
+        return err(47, "log 下应当有 1 条");
+    if (ini_count(text, S("")) != 1)
+        return err(48, "根区应当有 1 条");
+    if (ini_count(text, S("nope")) != 0)
+        return err(49, "不存在的节应当 0 条");
+}
+
+test "边界：空文本、无结尾换行、只有注释、坏行阻止 lookup" {
+    {
+        char[:] text = S("");
+        IniReader r = ini_open(text);
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != 0)
+            return err(50, "空文本应当直接返回 0");
+        if (r.err != 0)
+            return err(51, "空文本不该报错");
+    }
+    {
+        char[:] text = S("k = v");
+        IniReader r = ini_open(text);
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != 1 || !str_is(e.value, "v", 1))
+            return err(52, "没有结尾换行的最后一行也该读出来");
+        if (ini_next(&r, &e) != 0)
+            return err(53, "之后应当结束");
+    }
+    {
+        char[:] text = S("# only\n; comments\n\n");
+        IniReader r = ini_open(text);
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != 0)
+            return err(54, "只有注释应当返回 0");
+    }
+    /* 坏行在前面时 lookup 直接给 0，不假装读到了后面的键 */
+    {
+        char[:] text = S("bad line\nk = v\n");
+        Str v = { { (char *)0, 0 } };
+
+        if (ini_lookup(text, S(""), S("k"), &v))
+            return err(55, "坏行之后的键不该被 lookup 找到");
+        if (ini_has_section(text, S("")))
+            return err(56, "坏行之后不该报「有这一节」");
+        if (ini_count(text, S("")) != -1)
+            return err(57, "坏行时计数应当给 -1");
+    }
+    /* 传入的视图不能是空指针 */
+    {
+        IniReader r = ini_open((char[:]){ (char *)0, 0 });
+        IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
+                       { { (char *)0, 0 } }, 0 };
+
+        if (ini_next(&r, &e) != 0)
+            return err(58, "空指针视图应当像空文本");
+    }
+}

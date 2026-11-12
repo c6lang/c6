@@ -12687,48 +12687,50 @@ static void c6_module_dotted(const char *name, char *out, int outsz)
 
 /* The std modules are part of this repository, so their blocks live in the
    compiler: a program can never renumber them, and a new std module only
-   ever appends a line here (the numbers already handed out never change). */
+   ever appends a line here (the numbers already handed out never change).
+   The name is the module's path, so the directory split is visible here;
+   the slot numbers stayed put when the files moved into std/<group>/. */
 static const struct C6ErrStdSlot {
     const char *name;
     int slot;
 } c6_err_std_slots[] = {
-    { "std.err",   C6_ERR_SLOT_STD + 0 },
-    { "std.types", C6_ERR_SLOT_STD + 1 },
-    { "std.vec",   C6_ERR_SLOT_STD + 2 },
-    { "std.span",  C6_ERR_SLOT_STD + 3 },
-    { "std.map",   C6_ERR_SLOT_STD + 4 },
-    { "std.str",   C6_ERR_SLOT_STD + 5 },
-    { "std.fmt",   C6_ERR_SLOT_STD + 6 },
-    { "std.range", C6_ERR_SLOT_STD + 7 },
-    { "std.sort",  C6_ERR_SLOT_STD + 8 },
-    { "std.mem",   C6_ERR_SLOT_STD + 9 },
-    { "std.io",    C6_ERR_SLOT_STD + 10 },
-    { "std.math",  C6_ERR_SLOT_STD + 11 },
-    { "std.time",  C6_ERR_SLOT_STD + 12 },
-    { "std.strbuf", C6_ERR_SLOT_STD + 13 },
-    { "std.utf8",  C6_ERR_SLOT_STD + 14 },
-    { "std.bits",  C6_ERR_SLOT_STD + 15 },
-    { "std.hash",  C6_ERR_SLOT_STD + 16 },
-    { "std.path",  C6_ERR_SLOT_STD + 17 },
-    { "std.deque", C6_ERR_SLOT_STD + 18 },
-    { "std.ascii", C6_ERR_SLOT_STD + 19 },
-    { "std.num",   C6_ERR_SLOT_STD + 20 },
-    { "std.codec", C6_ERR_SLOT_STD + 21 },
-    { "std.rand",  C6_ERR_SLOT_STD + 22 },
-    { "std.fs",    C6_ERR_SLOT_STD + 23 },
-    { "std.set",   C6_ERR_SLOT_STD + 24 },
-    { "std.json",  C6_ERR_SLOT_STD + 25 },
-    { "std.sha256", C6_ERR_SLOT_STD + 26 },
-    { "std.csv",   C6_ERR_SLOT_STD + 27 },
-    { "std.env",   C6_ERR_SLOT_STD + 28 },
-    { "std.base64", C6_ERR_SLOT_STD + 29 },
-    { "std.url",   C6_ERR_SLOT_STD + 30 },
-    { "std.uuid",  C6_ERR_SLOT_STD + 31 },
-    { "std.mime",  C6_ERR_SLOT_STD + 32 },
-    { "std.inet",  C6_ERR_SLOT_STD + 33 },
-    { "std.bitbuf", C6_ERR_SLOT_STD + 34 },
-    { "std.pqueue", C6_ERR_SLOT_STD + 35 },
-    { "std.ini",   C6_ERR_SLOT_STD + 36 },
+    { "std.core.err",           C6_ERR_SLOT_STD + 0 },
+    { "std.core.types",         C6_ERR_SLOT_STD + 1 },
+    { "std.container.vec",      C6_ERR_SLOT_STD + 2 },
+    { "std.container.span",     C6_ERR_SLOT_STD + 3 },
+    { "std.container.map",      C6_ERR_SLOT_STD + 4 },
+    { "std.text.str",           C6_ERR_SLOT_STD + 5 },
+    { "std.text.fmt",           C6_ERR_SLOT_STD + 6 },
+    { "std.container.range",    C6_ERR_SLOT_STD + 7 },
+    { "std.container.sort",     C6_ERR_SLOT_STD + 8 },
+    { "std.core.mem",           C6_ERR_SLOT_STD + 9 },
+    { "std.os.io",              C6_ERR_SLOT_STD + 10 },
+    { "std.core.math",          C6_ERR_SLOT_STD + 11 },
+    { "std.os.time",            C6_ERR_SLOT_STD + 12 },
+    { "std.text.strbuf",        C6_ERR_SLOT_STD + 13 },
+    { "std.text.utf8",          C6_ERR_SLOT_STD + 14 },
+    { "std.core.bits",          C6_ERR_SLOT_STD + 15 },
+    { "std.core.hash",          C6_ERR_SLOT_STD + 16 },
+    { "std.os.path",            C6_ERR_SLOT_STD + 17 },
+    { "std.container.deque",    C6_ERR_SLOT_STD + 18 },
+    { "std.text.ascii",         C6_ERR_SLOT_STD + 19 },
+    { "std.text.num",           C6_ERR_SLOT_STD + 20 },
+    { "std.encoding.codec",     C6_ERR_SLOT_STD + 21 },
+    { "std.core.rand",          C6_ERR_SLOT_STD + 22 },
+    { "std.os.fs",              C6_ERR_SLOT_STD + 23 },
+    { "std.container.set",      C6_ERR_SLOT_STD + 24 },
+    { "std.data.json",          C6_ERR_SLOT_STD + 25 },
+    { "std.encoding.sha256",    C6_ERR_SLOT_STD + 26 },
+    { "std.data.csv",           C6_ERR_SLOT_STD + 27 },
+    { "std.os.env",             C6_ERR_SLOT_STD + 28 },
+    { "std.encoding.base64",    C6_ERR_SLOT_STD + 29 },
+    { "std.net.url",            C6_ERR_SLOT_STD + 30 },
+    { "std.encoding.uuid",      C6_ERR_SLOT_STD + 31 },
+    { "std.net.mime",           C6_ERR_SLOT_STD + 32 },
+    { "std.net.inet",           C6_ERR_SLOT_STD + 33 },
+    { "std.encoding.bitbuf",    C6_ERR_SLOT_STD + 34 },
+    { "std.container.pqueue",   C6_ERR_SLOT_STD + 35 },
+    { "std.data.ini",           C6_ERR_SLOT_STD + 36 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function
@@ -12744,7 +12746,7 @@ static unsigned c6_err_hash(const char *s)
     return h;
 }
 
-/* 'std__err__' -> 'std.err' (the spelling a module is written with) */
+/* 'std__core__err__' -> 'std.core.err' (the spelling a module is written with) */
 static void c6_err_dotted(const char *mangled, char *out, int outsz)
 {
     int n = 0;

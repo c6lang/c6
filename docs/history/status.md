@@ -497,11 +497,11 @@ ABI 方面，不超过 8 字节且只含整数/指针成员的结构体按 x86-6
 
 ### 11.11 标准库 `std/`
 
-写标准库是这一轮扩展的验收项。第一批是 `std/types`、`std/err`、`std/vec`、
-`std/span`、`std/map`、`std/str`、`std/fmt`、`std/range` 八个模块（一个文件一个
+写标准库是这一轮扩展的验收项。第一批是 `std/core/types`、`std/core/err`、`std/container/vec`、
+`std/container/span`、`std/container/map`、`std/text/str`、`std/text/fmt`、`std/container/range` 八个模块（一个文件一个
 module，模块名就是路径），加一个集成示例 `examples/wordcount.c6`
-（`make std-demo`）；第二批补了 `std/mem`、`std/io`、`std/math`、`std/time`、
-`std/strbuf`、`std/utf8`、`std/bits`、`std/hash`、`std/path`、`std/deque`，并给
+（`make std-demo`）；第二批补了 `std/core/mem`、`std/os/io`、`std/core/math`、`std/os/time`、
+`std/text/strbuf`、`std/text/utf8`、`std/core/bits`、`std/core/hash`、`std/os/path`、`std/container/deque`，并给
 `str`/`vec`/`fmt` 补了 `to_u64`/`strip_prefix`/`strip_suffix`/`fields`、
 `any`/`all`/`find_if`/`swap`、`digits_*` 原语与 `write_hex64`（见 11.12）。第三批
 之后 `make stdtest` 是 25 个模块、197 个 `test` 块，集成示例三个：`std-demo`、
@@ -515,22 +515,22 @@ module，模块名就是路径），加一个集成示例 `examples/wordcount.c6
 
 | 模块 | 定位 | 关键决定 |
 | --- | --- | --- |
-| `std.strbuf` | 长度未知的字符串拼接 | 托管引用 + 从 64 起翻倍；数字转换复用 `std.fmt` 的 `digits_u32`/`digits_u64`/`digits_hex`，两条路径格式永远一致 |
-| `std.utf8` | 解码/编码/校验/计数 | 严格模式：拒绝过长编码、代理区、`> U+10FFFF`、截断；坏字节只前进 1 字节，不会「一错到底」；编码先校验码点，失败不写任何内容 |
-| `std.bits` | 位运算 | `clz/ctz` 对 0 输入给 32/64（不返回未定义值）；旋转对移位量取模；`bit_*` 越界是 no-op |
-| `std.hash` | FNV-1a 32/64、CRC32、Adler-32 + 流式 `Hasher` | CRC32 逐位算，不建 256 项表（不占数据、不链 zlib）；已知向量钉死在 `test` 块里（`"a"`、`"123456789"`、`"Wikipedia"`） |
-| `std.path` | POSIX 路径拆装 | 只借 `Str` 这个类型、函数体不依赖 `std.str`；**全部不分配**（视图 + 调用方缓冲）；`normalize` 保留 `".."`——词法消 `..` 会穿过符号链接改变语义 |
-| `std.deque` | 双端队列 | 环形缓冲（`(head + i) % cap`），扩容后按逻辑顺序摊平；`push_front` 若包在数组上就是 O(n)，所以不包装 `Vect` |
+| `std.text.strbuf` | 长度未知的字符串拼接 | 托管引用 + 从 64 起翻倍；数字转换复用 `std.text.fmt` 的 `digits_u32`/`digits_u64`/`digits_hex`，两条路径格式永远一致 |
+| `std.text.utf8` | 解码/编码/校验/计数 | 严格模式：拒绝过长编码、代理区、`> U+10FFFF`、截断；坏字节只前进 1 字节，不会「一错到底」；编码先校验码点，失败不写任何内容 |
+| `std.core.bits` | 位运算 | `clz/ctz` 对 0 输入给 32/64（不返回未定义值）；旋转对移位量取模；`bit_*` 越界是 no-op |
+| `std.core.hash` | FNV-1a 32/64、CRC32、Adler-32 + 流式 `Hasher` | CRC32 逐位算，不建 256 项表（不占数据、不链 zlib）；已知向量钉死在 `test` 块里（`"a"`、`"123456789"`、`"Wikipedia"`） |
+| `std.os.path` | POSIX 路径拆装 | 只借 `Str` 这个类型、函数体不依赖 `std.text.str`；**全部不分配**（视图 + 调用方缓冲）；`normalize` 保留 `".."`——词法消 `..` 会穿过符号链接改变语义 |
+| `std.container.deque` | 双端队列 | 环形缓冲（`(head + i) % cap`），扩容后按逻辑顺序摊平；`push_front` 若包在数组上就是 O(n)，所以不包装 `Vect` |
 
-`std.str` 补的四个 API 都守住「不分配」：`to_u64` 先判 `(U64_MAX - d) / 10` 再乘
+`std.text.str` 补的四个 API 都守住「不分配」：`to_u64` 先判 `(U64_MAX - d) / 10` 再乘
 （不靠回绕），`strip_prefix`/`strip_suffix` 只给视图，`fields()` 是跳过空字段的
-空白分词迭代器。`std.vec` 补 `any`/`all`/`find_if`/`swap`（`all` 对空容器给 1，
-`find_if` 没命中给 -1，`swap` 越界返回 0 且不动内容）。`std.fmt` 把数字转换抽成
+空白分词迭代器。`std.container.vec` 补 `any`/`all`/`find_if`/`swap`（`all` 对空容器给 1，
+`find_if` 没命中给 -1，`swap` 越界返回 0 且不动内容）。`std.text.fmt` 把数字转换抽成
 共享原语后，`write_u64`/`write_int`/`write_hex` 只剩「先量长度、再搬字符」。
 
 三个新号段按第一批的规矩进编译器内建表（`tcc/tccgen.c` 的
-`c6_err_std_slots[]`）：`std.strbuf`=0x600d、`std.utf8`=0x600e、`std.bits`=0x600f、
-`std.hash`=0x6010、`std.path`=0x6011、`std.deque`=0x6012。`errbase.def` **不动**：
+`c6_err_std_slots[]`）：`std.text.strbuf`=0x600d、`std.text.utf8`=0x600e、`std.core.bits`=0x600f、
+`std.core.hash`=0x6010、`std.os.path`=0x6011、`std.container.deque`=0x6012。`errbase.def` **不动**：
 std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/run-errbase.sh`
 的 C126（std 槽位不许被钉号）继续成立。
 
@@ -538,13 +538,13 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
 
 1. 把 `Buf@(N)->write_hex` 的形参从 `u32` 加宽到 `u64` 会让编译器**挂住**
    （当时 `-c` 无输出直到超时，退出码 124）。这条**现在已经复现不出来**：拿当前
-   `std/fmt.c6` 的 body、旧版（`2bf18ce`）的 body、加 `(char)` 强转的变体去试，
+   `std/text/fmt.c6` 的 body、旧版（`2bf18ce`）的 body、加 `(char)` 强转的变体去试，
    都能在 1 秒内编过，`-test` 也全过，所以留着 `write_hex(u32)` 只是不想为改签名
    动 API（`write_hex64` 两个都是 `digits_hex` 的薄包装）。
 2. 切片的字段**按设计**只读：切片是 `struct { T *const data; const size_t
    len; }`，`p.len -= 1` 只给一条 `assignment of read-only location` 警告，但
    tcc 对 `const` 只警告、赋值**确实生效**。所以正确的说法不是「不能改」而是
-   「不该改」：视图要变就重建 `(char[:]){ p.data, n }`（`std/path.c6` 的
+   「不该改」：视图要变就重建 `(char[:]){ p.data, n }`（`std/os/path.c6` 的
    `strip_trailing`）。要让编译器真的拦住，得在 `verify_assign_cast()`
    （`tcc/tccgen.c:5785`）里把「目标是编译器合成的 slice/tuple 描述符」从
    warning 升级成 `tcc_error`。
@@ -570,18 +570,18 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
 
 | 模块 | 定位 | 关键决定 |
 | --- | --- | --- |
-| `std.ascii` | 字节判别、大小写、忽略大小写比较 | 参数收 `int`：`fgetc()` 的 EOF(-1) 和带符号 char 都安全；`c < 0 || c > 127` 一律判「不是」，不读表越界；只认 ASCII，不做 locale |
-| `std.num` | 浮点格式化（固定 / `%e` / `%g`）与解析 | 不链 libm；`fmt_f64`/`fmt_f64_sci`/`fmt_f64_g` 都是四舍五入（.5 远离零）、放不下不写；`fmt_f64` 限制 `|x| < 1e18`（整数部分超出 u64 就没法固定表示），大数走 `_sci`；解析最多累积 19 位有效数字，明确不是正确舍入；溢出 `RANGE`、下溢给 0 |
-| `std.codec` | Base64 / 十六进制 / 百分号 | 解码先完整校验一遍、第二遍才写，非法输入不留半截；Base64 接受省略填充与 ASCII 空白，拒绝 `% 4 == 1`、`=` 在中间；百分号的 `+` 是显式参数，默认不当空格 |
-| `std.rand` | xorshift64* 伪随机 | 同一 seed 跨平台同一串数（不依赖 libc `rand()`）、纯值可重入；`rand_below` 用拒绝采样而不是「取模偏置」；种子 0 换成非零常量（全零状态是吸收态）；明确不是密码学随机 |
-| `std.fs` | stat/lstat、mkdir_p、目录遍历、rename/remove、cwd/chdir | `std.io` 管内容、`std.fs` 管元数据；`errno` 翻译成 `std.err`（`NO_ENT`/`EXIST`/`INVAL`/`IO`）；`dir_next` 用 1/0/-1/-2 区分「取到/结束/出错/名字太长」，名字太长不截断；POSIX-only，freestanding 用不了 |
-| `std.set` | 哈希集合 `Set@K` | 不复制 Map 的开放寻址/墓碑/扩容逻辑，直接包 `@Map@(K, int)`；`add` 返回 1（新增）/0（已存在），失败 `int!error`；代价是用 Set 的程序要把 `std/map.c6` 正文一起编 |
+| `std.text.ascii` | 字节判别、大小写、忽略大小写比较 | 参数收 `int`：`fgetc()` 的 EOF(-1) 和带符号 char 都安全；`c < 0 || c > 127` 一律判「不是」，不读表越界；只认 ASCII，不做 locale |
+| `std.text.num` | 浮点格式化（固定 / `%e` / `%g`）与解析 | 不链 libm；`fmt_f64`/`fmt_f64_sci`/`fmt_f64_g` 都是四舍五入（.5 远离零）、放不下不写；`fmt_f64` 限制 `|x| < 1e18`（整数部分超出 u64 就没法固定表示），大数走 `_sci`；解析最多累积 19 位有效数字，明确不是正确舍入；溢出 `RANGE`、下溢给 0 |
+| `std.encoding.codec` | Base64 / 十六进制 / 百分号 | 解码先完整校验一遍、第二遍才写，非法输入不留半截；Base64 接受省略填充与 ASCII 空白，拒绝 `% 4 == 1`、`=` 在中间；百分号的 `+` 是显式参数，默认不当空格 |
+| `std.core.rand` | xorshift64* 伪随机 | 同一 seed 跨平台同一串数（不依赖 libc `rand()`）、纯值可重入；`rand_below` 用拒绝采样而不是「取模偏置」；种子 0 换成非零常量（全零状态是吸收态）；明确不是密码学随机 |
+| `std.os.fs` | stat/lstat、mkdir_p、目录遍历、rename/remove、cwd/chdir | `std.os.io` 管内容、`std.os.fs` 管元数据；`errno` 翻译成 `std.core.err`（`NO_ENT`/`EXIST`/`INVAL`/`IO`）；`dir_next` 用 1/0/-1/-2 区分「取到/结束/出错/名字太长」，名字太长不截断；POSIX-only，freestanding 用不了 |
+| `std.container.set` | 哈希集合 `Set@K` | 不复制 Map 的开放寻址/墓碑/扩容逻辑，直接包 `@Map@(K, int)`；`add` 返回 1（新增）/0（已存在），失败 `int!error`；代价是用 Set 的程序要把 `std/container/map.c6` 正文一起编 |
 
-**写这批时踩到并修掉的真 bug：`std/map` 扩容会复活墓碑。** `Map::reserve()`
+**写这批时踩到并修掉的真 bug：`std/container/map` 扩容会复活墓碑。** `Map::reserve()`
 重建表时写的是 `if (!of[i]) continue;`，而 `SLOT_DEAD` 的值是 2（也是「非零」），
 于是墓碑连同旧键值被搬进新表：`count` 少一、已删除的键重新出现。Map 自己的
 用例没踩到是因为删除之后没有继续插到触发扩容；`Set` 的 add/remove 组合立刻
-暴露了它。修法是把条件改成 `of[i] != SLOT_LIVE`，并在 `std/map.c6` 补了
+暴露了它。修法是把条件改成 `of[i] != SLOT_LIVE`，并在 `std/container/map.c6` 补了
 「墓碑不会在扩容时复活」用例（删一个键、继续插到 cap 32→64、验证死键不在、
 活键都在，再 reuse 那个槽位）。
 
@@ -598,12 +598,12 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
    `@Set@int` 变量上，`docs/stdlib.md` 的「写法约定 / 已知限制」记了这一条。
 
 号段继续按第一批的规矩追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：
-`std.ascii`=0x6013、`std.num`=0x6014、`std.codec`=0x6015、`std.rand`=0x6016、
-`std.fs`=0x6017、`std.set`=0x6018，`docs/reference/grammar.md` §8.1 同步。`errbase.def`
+`std.text.ascii`=0x6013、`std.text.num`=0x6014、`std.encoding.codec`=0x6015、`std.core.rand`=0x6016、
+`std.os.fs`=0x6017、`std.container.set`=0x6018，`docs/reference/grammar.md` §8.1 同步。`errbase.def`
 仍然不动：std 池是编译器常量，C126（std 槽位不许被钉号）继续成立。
 
 集成示例是 `examples/stdkit.c6`（`make std-kit`，70 条自检），六节各对应一个
-模块，并且把 `std/fs.c6` 的目录生命周期完整走一遍（mkdir_p → 写文件 → stat →
+模块，并且把 `std/os/fs.c6` 的目录生命周期完整走一遍（mkdir_p → 写文件 → stat →
 遍历 → rename → remove/rmdir）。验收：`make stdtest`（25 个模块、197 个
 `test` 块、0 failure）、`make std-kit`（70 条自检全过）、`make std-tour`、
 `make std-demo`、`make errcheck` 全绿。
@@ -618,10 +618,10 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
 
 | 模块 | 定位 | 关键决定 |
 | --- | --- | --- |
-| `std.base64` | 标准表与 URL 安全表 | `std.codec` 那份是宽容口径；这一层把**表**（`url` 参数）与**填充**（`pad` 参数）变成显式参数，因为 JWT/JWKS 与 HTTP 头的要求不一样。两张表互不混用：URL 变体下 `=` 是**非法字符**（发送方用错表的信号），标准表下 `-`/`_` 也是非法字符。`pad = 1` 时缺填充照样报错 |
-| `std.url` | RFC 3986 分解、相对解析、百分号编解码 | `remove_dot_segments` 逐条照抄 §5.2.4（不用「按段重组」），§5.4 的 23 条 normal + abnormal 用例全钉住；结果先在栈上拼好、**最后一步才写 dst**，所以「放不下」不留半截；IPv6 字面量里的冒号不算端口分隔符 |
-| `std.uuid` | v4 / v5 / v7 | `Uuid` 是 16 字节纯值；v5 的 SHA-1 在文件内部实现（不链加密库，已知向量与 Python `uuid5` 逐字节一致）；v7 前 48 位是 Unix 毫秒；随机来自时钟 + 栈地址播种的 `std.rand`，**明确不是密码学随机** |
-| `std.mime` | 扩展名 ↔ 类型、分类、魔数嗅探 | 查不到给 `application/octet-stream`（HTTP 要一个能用的值）；反向查表是多对一（`jpg`/`jpeg` 都是 `image/jpeg`），返回第一个命中；`mime_sniff` 只看魔数，纯文本返回空，不假装能猜 |
+| `std.encoding.base64` | 标准表与 URL 安全表 | `std.encoding.codec` 那份是宽容口径；这一层把**表**（`url` 参数）与**填充**（`pad` 参数）变成显式参数，因为 JWT/JWKS 与 HTTP 头的要求不一样。两张表互不混用：URL 变体下 `=` 是**非法字符**（发送方用错表的信号），标准表下 `-`/`_` 也是非法字符。`pad = 1` 时缺填充照样报错 |
+| `std.net.url` | RFC 3986 分解、相对解析、百分号编解码 | `remove_dot_segments` 逐条照抄 §5.2.4（不用「按段重组」），§5.4 的 23 条 normal + abnormal 用例全钉住；结果先在栈上拼好、**最后一步才写 dst**，所以「放不下」不留半截；IPv6 字面量里的冒号不算端口分隔符 |
+| `std.encoding.uuid` | v4 / v5 / v7 | `Uuid` 是 16 字节纯值；v5 的 SHA-1 在文件内部实现（不链加密库，已知向量与 Python `uuid5` 逐字节一致）；v7 前 48 位是 Unix 毫秒；随机来自时钟 + 栈地址播种的 `std.core.rand`，**明确不是密码学随机** |
+| `std.net.mime` | 扩展名 ↔ 类型、分类、魔数嗅探 | 查不到给 `application/octet-stream`（HTTP 要一个能用的值）；反向查表是多对一（`jpg`/`jpeg` 都是 `image/jpeg`），返回第一个命中；`mime_sniff` 只看魔数，纯文本返回空，不假装能猜 |
 
 写这一批时踩到并修掉的三个真问题：
 
@@ -637,8 +637,8 @@ std 池是编译器常量，`-emit-errbase` 照样跳过 `area == 1`，`tests/ru
    一个合法端口、`http` 的默认 80 被绕过。修法是改判 `port_str` 有没有内容，并补
    一条回归用例（`{ 0 }` 给 -1、显式 `:0` 给 0）。
 
-号段照旧追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.base64`=0x601d、
-`std.url`=0x601e、`std.uuid`=0x601f、`std.mime`=0x6020，`docs/reference/grammar.md`
+号段照旧追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.base64`=0x601d、
+`std.net.url`=0x601e、`std.encoding.uuid`=0x601f、`std.net.mime`=0x6020，`docs/reference/grammar.md`
 §8.1 同步；`errbase.def` 不动，C126 继续成立。
 
 集成示例是 `examples/stdweb.c6`（`make std-web`，58 条自检）：base64 走一遍
@@ -655,10 +655,10 @@ IPv6 → 查询参数 → 相对解析 → 百分号往返」，uuid 走「v5 �
 
 | 模块 | 定位 | 关键决定 |
 | --- | --- | --- |
-| `std.inet` | IPv4/IPv6、CIDR、端口 | IPv6 输出按 **RFC 5952** 规范化（最长零段压 `::`、同长取第一个、单组零不压、v4-mapped 写 `::ffff:a.b.c.d`），10 组输入/期望全在自测里；解析严格：前导零、两个 `::`、组数不对、内嵌 IPv4 不在末尾都拒。分类函数把 v4-mapped 折回 v4 再判 |
-| `std.bitbuf` | 位级读写器 | **MSB-first**；越界只报 `FULL`/`SHORT` 且不动游标、不写半截；`bw_patch` 在字节对齐处回填 8/16/32 位且**不移动游标**；`bw_put_bytes`/`br_get_bytes` 要求已对齐（半字节读写没有意义） |
-| `std.pqueue` | 托管二叉堆 `PQueue@T` | 比较器用 qsort 风格函数指针，与 `std.sort` 的 `cmp_int`/`cmp_str` 通用；不设比较器时按字节序（同 `sort_lex` 口径）；`push_pop` 做 top-k，`heapify` 重建，`is_valid` 给测试用 |
-| `std.ini` | INI 零分配读取 | 字段全是指向输入的 `Str` 视图；`#`/`;` 只做**整行注释**（值里可以有 `#`）；`key = value` 取**第一个** `=`；坏行返回 -1 并给准确行号；`ini_lookup` 遇坏行直接放弃，不假装读到后面的键 |
+| `std.net.inet` | IPv4/IPv6、CIDR、端口 | IPv6 输出按 **RFC 5952** 规范化（最长零段压 `::`、同长取第一个、单组零不压、v4-mapped 写 `::ffff:a.b.c.d`），10 组输入/期望全在自测里；解析严格：前导零、两个 `::`、组数不对、内嵌 IPv4 不在末尾都拒。分类函数把 v4-mapped 折回 v4 再判 |
+| `std.encoding.bitbuf` | 位级读写器 | **MSB-first**；越界只报 `FULL`/`SHORT` 且不动游标、不写半截；`bw_patch` 在字节对齐处回填 8/16/32 位且**不移动游标**；`bw_put_bytes`/`br_get_bytes` 要求已对齐（半字节读写没有意义） |
+| `std.container.pqueue` | 托管二叉堆 `PQueue@T` | 比较器用 qsort 风格函数指针，与 `std.container.sort` 的 `cmp_int`/`cmp_str` 通用；不设比较器时按字节序（同 `sort_lex` 口径）；`push_pop` 做 top-k，`heapify` 重建，`is_valid` 给测试用 |
+| `std.data.ini` | INI 零分配读取 | 字段全是指向输入的 `Str` 视图；`#`/`;` 只做**整行注释**（值里可以有 `#`）；`key = value` 取**第一个** `=`；坏行返回 -1 并给准确行号；`ini_lookup` 遇坏行直接放弃，不假装读到后面的键 |
 
 写这一批时踩到并修掉的三个真问题：
 
@@ -667,8 +667,8 @@ IPv6 → 查询参数 → 相对解析 → 百分号往返」，uuid 走「v5 �
    （读侧同样的错），所以「写进去再读出来」的往返用例反而互相抵消、看不出问题——
    直到示例里按位置断言字节才暴露。修法是先算一次 `base = bits/8` 再循环，
    循环结束后一次性加 `n*8`。
-2. **模块自己的错误码不能当 `int` 字段用。** `std.bitbuf` 的 `err` 字段记「第一个
-   错误的 id」，最初写成 `w->err = std.bitbuf.FULL;`，编译报
+2. **模块自己的错误码不能当 `int` 字段用。** `std.encoding.bitbuf` 的 `err` 字段记「第一个
+   错误的 id」，最初写成 `w->err = std.encoding.bitbuf.FULL;`，编译报
    `cannot convert 'struct __tcc_error' to 'int'`：`模块.成员` 是带 id 与消息的
    错误值（这就是 `err()` 的入参类型），赋给 int 要显式 `(int)`，比较则可以直接比。
    同一批还确认了两条语言规则：`err()` **必须两个参数**（码 + 消息），重抛没有
@@ -677,8 +677,8 @@ IPv6 → 查询参数 → 相对解析 → 百分号往返」，uuid 走「v5 �
    都跑一遍 `is_valid()`，把 `sift_down` 的「左右孩子都看完再交换」钉住——只比
    左孩子是这类实现最常见的错。
 
-号段照旧追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.inet`=0x6021、
-`std.bitbuf`=0x6022、`std.pqueue`=0x6023、`std.ini`=0x6024，
+号段照旧追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.net.inet`=0x6021、
+`std.encoding.bitbuf`=0x6022、`std.container.pqueue`=0x6023、`std.data.ini`=0x6024，
 `docs/reference/grammar.md` §8.1 同步；`errbase.def` 不动，C126 继续成立。
 
 集成示例是 `examples/stdnet.c6`（`make std-net`，47 条自检）：inet 走「v4/v6 往返、
@@ -687,3 +687,38 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 「小顶/大顶、堆顶、top-k、空堆」，ini 走「逐条读、按 (section,key) 查、值里的
 `=` 与 `#`、坏行行号」。验收：`make stdtest`（36 个模块、0 failure）、
 `make std-net`（47 条自检全过）、`make errcheck` 全绿。
+
+### 11.16 标准库分目录（平铺 → 七个领域目录）
+
+37 个模块平铺在 `std/` 下已经不好找：容器、文本、编解码、OS 原语混在一起。
+这次按领域分成 `core/`、`text/`、`container/`、`os/`、`encoding/`、`data/`、
+`net/` 七个子目录。语言规则是「模块名就是文件的路径」，所以**移动文件就是
+改模块名**，没有第二条路：
+
+| 新目录 | 模块（原名去掉目录段） |
+| --- | --- |
+| `std/core/` | `types` `err` `mem` `math` `bits` `hash` `rand` |
+| `std/text/` | `str` `strbuf` `fmt` `utf8` `ascii` `num` |
+| `std/container/` | `vec` `span` `map` `set` `deque` `pqueue` `range` `sort` |
+| `std/os/` | `io` `fs` `path` `env` `time` |
+| `std/encoding/` | `codec` `base64` `sha256` `bitbuf` `uuid` |
+| `std/data/` | `json` `csv` `ini` |
+| `std/net/` | `inet` `url` `mime` |
+
+消费侧从 `import std.vec;` 变成 `import std.container.vec;`，命名空间前缀
+从 `std__vec__` 变成 `std__container__vec__`。三处必须一起改，否则链接期
+才会暴露：
+
+1. 每个文件首行的 `module NAME;` 与文件内所有 `import`（含模块自己写头注释
+   里的示例）；
+2. `tcc/tccgen.c` 的 `c6_err_std_slots[]`：只换名字，**槽位数值不动**——
+   `std.core.err` 仍是 0x6000，`std.data.ini` 仍是 0x6024，所以
+   `tests/err_ids.c6` 断言的 `0x0e000003` 不用改数值；
+3. `Makefile` 的 `stdtest` 从 `ls std/*.c6` 改成 `find std -name '*.c6'`，
+   依赖 case 和六个集成示例的源文件清单跟着换路径。
+
+`errbase.def` 不动：std 池是编译器里的常量，`-emit-errbase` 照旧跳过
+`area == 1`，C126 继续成立。文档（README 模块表、`docs/stdlib.md` 分组表、
+`grammar.md` §8.1 号段表）同步成分组形式；`docs/stdlib.md` 的 stdtest 输出
+示例也重新按实际输出生成。验收：`make stdtest`（37 个模块全绿）、六个
+`std-*` 集成示例、`make selftest`、`make errcheck`。
