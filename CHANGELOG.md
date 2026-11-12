@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第四十六批（文本变换）**：`std.text.slug`（URL slug，UTF-8 + 去音标）、
+  `std.text.casing`（snake/kebab/camel/Pascal/title 互转）、`std.text.roman`
+  （罗马数字往返 + 标准形式校验）、`std.text.phonetic`（Soundex + 简化 Metaphone），
+  集成示例 `examples/stdwords.c6`（`make std-words`）。错误号段
+  `std.text.slug`=0x60c1 … `std.text.phonetic`=0x60c4（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第四十五批（基础数据结构）**：`std.container.fenwick`（树状数组 + 前缀
   定位）、`std.container.segtree`（迭代线段树，求和/最值）、`std.container.dsu`
   （并查集，路径减半 + 按大小合并）、`std.container.bloom`（布隆过滤器），集成

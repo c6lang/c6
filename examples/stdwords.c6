@@ -1,0 +1,135 @@
+/* examples/stdwords.c6 —— 第四十六批（文本变换）的集成示例。
+ *
+ *     make std-words
+ *
+ * 四节：slug 化标题、五种命名风格互转、罗马数字往返、发音编码（Soundex /
+ * 简化 Metaphone）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.slug;
+import std.text.casing;
+import std.text.roman;
+import std.text.phonetic;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_slug(void)
+{
+    char out[64] = { 0 };
+    int n = 0;
+
+    printf("== slug\n");
+    n = slug_make(S("Hello, World! 2025"), out, (int)sizeof out, '-');
+    printf("   \"Hello, World! 2025\" → %s（%d 字符）\n", out, n);
+    check(n == 16 && memcmp(out, "hello-world-2025", 16) == 0, "标题 slug");
+    check(slug_valid((char[:]){ out, n }) == 1, "结果应当合法");
+    n = slug_make((char[:]){ (char *)"Caf\xc3\xa9 \xc3\x80 la Carte", 17 }, out,
+                  (int)sizeof out, '-');
+    printf("   \"Café À la Carte\" → %s\n", out);
+    check(n == 15 && memcmp(out, "cafe-a-la-carte", 15) == 0, "去音标");
+    n = slug_make(S("MiXeD___Case"), out, (int)sizeof out, '_');
+    check(n == 10 && memcmp(out, "mixed_case", 10) == 0, "自定义分隔符");
+}
+
+static void do_case(void)
+{
+    char out[64] = { 0 };
+
+    printf("== casing\n");
+    case_snake(S("HTTPServerConfig"), out, (int)sizeof out);
+    printf("   snake  = %s\n", out);
+    check(memcmp(out, "http_server_config", 18) == 0, "snake");
+    case_kebab(S("HTTPServerConfig"), out, (int)sizeof out);
+    check(memcmp(out, "http-server-config", 18) == 0, "kebab");
+    case_camel(S("http_server_config"), out, (int)sizeof out);
+    printf("   camel  = %s\n", out);
+    check(memcmp(out, "httpServerConfig", 16) == 0, "camel");
+    case_pascal(S("http-server-config"), out, (int)sizeof out);
+    printf("   pascal = %s\n", out);
+    check(memcmp(out, "HttpServerConfig", 16) == 0, "pascal");
+    case_title(S("the quick brown fox"), out, (int)sizeof out);
+    check(memcmp(out, "The Quick Brown Fox", 19) == 0, "title");
+    check(case_snake(S("HelloWorld"), out, 4) == -1, "容量不够报错");
+}
+
+static void do_roman(void)
+{
+    char out[16] = { 0 };
+    int v = 0, i = 0, bad = 0;
+
+    printf("== roman\n");
+    roman_from_int(2024, out, (int)sizeof out);
+    printf("   2024 → %s\n", out);
+    check(memcmp(out, "MMXXIV", 6) == 0, "2024 的罗马数字");
+    check(roman_to_int(S("MMXXIV"), &v) == 1 && v == 2024, "MMXXIV → 2024");
+    for (i = 1; i <= 3999; i++) {
+        char buf[16] = { 0 };
+        int got = 0;
+
+        if (roman_from_int(i, buf, (int)sizeof buf) <= 0) {
+            bad++;
+            continue;
+        }
+        if (roman_to_int((char[:]){ buf, (int)strlen(buf) }, &got) != 1
+            || got != i)
+            bad++;
+    }
+    printf("   1..3999 往返失败 %d 个\n", bad);
+    check(bad == 0, "全范围往返");
+    check(roman_valid(S("MCMXCIX")) == 1, "MCMXCIX 合法");
+    check(roman_valid(S("IIII")) == 0, "IIII 非法");
+    check(roman_from_int(4000, out, (int)sizeof out) == -1, "4000 越界");
+}
+
+static void do_phonetic(void)
+{
+    char a[16] = { 0 };
+    char b[16] = { 0 };
+    char m1[32] = { 0 };
+    char m2[32] = { 0 };
+    int n1 = 0, n2 = 0;
+
+    printf("== phonetic\n");
+    soundex(S("Robert"), a);
+    soundex(S("Rupert"), b);
+    printf("   Robert=%s Rupert=%s\n", a, b);
+    check(phone_same((char[:]){ a, 4 }, (char[:]){ b, 4 }) == 1, "Robert≈Rupert");
+    soundex(S("Ashcraft"), a);
+    check(memcmp(a, "A261", 4) == 0, "Ashcraft 的 Soundex");
+    n1 = metaphone(S("Smith"), m1, (int)sizeof m1);
+    n2 = metaphone(S("Smyth"), m2, (int)sizeof m2);
+    printf("   Smith=%s Smyth=%s\n", m1, m2);
+    check(n1 > 0 && n1 == n2, "Smith 与 Smyth 同码");
+    check(phone_same((char[:]){ m1, n1 }, (char[:]){ m2, n2 }) == 1, "同码比较");
+    n1 = metaphone(S("Knight"), m1, (int)sizeof m1);
+    check(n1 > 0 && m1[0] == 'N', "KN 开端折成 N");
+    n1 = metaphone(S("Phone"), m1, (int)sizeof m1);
+    check(n1 > 0 && m1[0] == 'F', "PH 折成 F");
+    check(metaphone(S("123"), m1, (int)sizeof m1) == -1, "无字母报错");
+}
+
+int main(void)
+{
+    do_slug();
+    do_case();
+    do_roman();
+    do_phonetic();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

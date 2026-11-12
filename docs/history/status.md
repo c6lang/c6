@@ -1676,6 +1676,32 @@ FTP 的解析坑值得记一笔：`LIST` 行是定字段的「权限 链接 属�
 验收：`make stdtest`（193 个模块、0 failure）、`make std-ds`（26 条自检全过）、
 `make check-all`。
 
+### 11.58 标准库第四十六批（slug / casing / roman / phonetic）
+
+第四十六批做「文本变换」：slug 化、命名风格互转、罗马数字、发音编码。四个都只
+吃字符串、不碰 I/O，属于那种「写起来小、但每个项目都会自己抄一遍」的东西。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.slug` | URL slug | 输入按 **UTF-8** 解（先解出码点再判断），U+00C0..U+00FF 用 64 项折叠表映射到基字母；三/四字节过程序当分隔——所以 CJK 整段丢掉、但夹在字母之间仍留下**一次**分隔 |
+| `std.text.casing` | 命名风格 | 切词三条规则：非字母数字是分隔、小写/数字接大写是边界、连续大写后跟小写时最后那个大写属于新词；数字不单独切（`utf8String` 是两个词） |
+| `std.text.roman` | 罗马数字 | 转换本身很简单，难点是**校验**：先按减法规则算值，再用标准形式写回来逐字符比对，只有完全一致才算合法 |
+| `std.text.phonetic` | Soundex / Metaphone | Soundex 里 `h`/`w` 不打断同码、元音才打断；Metaphone 简化版把结果先写进本地缓冲再按 `cap` 判溢出，避免「边写边判容量」时把半截结果留在调用方缓冲里 |
+
+踩到的一个语言层面的坑：模块名不能叫 `std.text.case`（`case` 是关键字，`module`
+语句在解析点就报 `module name expected after '.'`），所以文件叫 `casing.c6`、
+模块名 `std.text.casing`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.slug`=0x60c1、
+`std.text.casing`=0x60c2、`std.text.roman`=0x60c3、`std.text.phonetic`=0x60c4；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-words` 与 `STD_WORDS_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。
+示例 `examples/stdwords.c6` 四节（23 条自检）。
+
+验收：`make stdtest`（197 个模块、0 failure）、`make std-words`（23 条自检全过）、
+`make check-all`。
+
+
 
 
 

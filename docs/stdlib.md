@@ -225,6 +225,10 @@
 | `std/container/segtree.c6` | `std.container.segtree` | 迭代线段树（2n 数组）：`seg_init` 按 `SEG_SUM`/`SEG_MIN`/`SEG_MAX` 建树，`seg_set` 点赋值、`seg_add` 点加、`seg_range` 闭区间聚合、`seg_all` 整树值 |
 | `std/container/dsu.c6` | `std.container.dsu` | 并查集：`dsu_find` 路径减半（迭代）、`dsu_union` 按大小合并（已同集合返回 -1）、`dsu_same`/`dsu_size`/`dsu_count`；`parent`/`size` 缓冲区由调用方给 |
 | `std/container/bloom.c6` | `std.container.bloom` | 布隆过滤器：FNV-1a 双哈希（`h1 + i*h2`）取模置位，`bloom_add`/`bloom_has`（1 可能在、0 一定不在），`bloom_set_bits`/`bloom_fill_ratio` 给置位统计 |
+| `std/text/slug.c6` | `std.text.slug` | URL slug：按 UTF-8 解码，ASCII 小写 + 数字保留、U+00C0..U+00FF 按去音标基字母折叠（`é`→`e`、`ñ`→`n`），其它码点（含 CJK）当分隔且连续分隔只出一个；`slug_valid` 校验合法 slug |
+| `std/text/casing.c6` | `std.text.casing` | 命名风格互转：`case_words` 按「非字母数字 / 小写接大写 / 缩略词边界」切词，`case_snake`/`case_kebab`/`case_camel`/`case_pascal`/`case_title` 输出五种风格（数字不单独切） |
+| `std/text/roman.c6` | `std.text.roman` | 罗马数字：`roman_from_int`（1..3999，标准减法记法）、`roman_to_int`（大小写都收，且要求「写回来等于原串」才算合法，`IIII`/`VX`/`MMMM` 一律 -1）、`roman_valid` |
+| `std/text/phonetic.c6` | `std.text.phonetic` | 发音编码：`soundex` 出经典 4 字符码（`h`/`w` 不打断同码），`metaphone` 是简化版（开端 `KN`/`WR`/`GN`、`PH`→F、`TH`→0、`SH`/`CH`→X、软 `C`/`G`、`X`→KS），`phone_same` 比较两个编码 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -313,6 +317,7 @@
 | `examples/stdaudio.c6` | （无模块） | 第四十三批（音频容器）的拼装示例（`make std-audio`）：MP3 标签与帧头、Ogg 页与 Opus 头、FLAC 的 STREAMINFO/VORBIS_COMMENT、MIDI 轨事件 |
 | `examples/stdproto2.c6` | （无模块） | 第四十四批（文本行协议）的拼装示例（`make std-proto2`）：SMTP 应答/命令/DATA 点填充、FTP 应答/PASV/列表行、RESP 编解码、Telnet IAC 协商与去转义 |
 | `examples/stdstruct.c6` | （无模块） | 第四十五批（基础数据结构）的拼装示例（`make std-ds`）：树状数组、线段树、并查集、布隆过滤器各跑一遍 |
+| `examples/stdwords.c6` | （无模块） | 第四十六批（文本变换）的拼装示例（`make std-words`）：slug 化、五种命名风格、罗马数字全范围往返、Soundex/Metaphone |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -387,6 +392,10 @@ std/container/fenwick.c6   2 test(s), 0 failure(s)
 std/container/segtree.c6   2 test(s), 0 failure(s)
 std/container/dsu.c6       2 test(s), 0 failure(s)
 std/container/bloom.c6     24 test(s), 0 failure(s)
+std/text/slug.c6           24 test(s), 0 failure(s)
+std/text/casing.c6         24 test(s), 0 failure(s)
+std/text/roman.c6          24 test(s), 0 failure(s)
+std/text/phonetic.c6       24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3626,6 +3635,16 @@ make std-ds
 核对集合数、集合大小与重复合并返回 -1；布隆过滤器加入三个键再验未加入的键基本
 查不到（并打印置位比例）。
 
+### 集成示例：`examples/stdwords.c6`
+
+```sh
+make std-words
+```
+
+四节：slug 把标题折成 URL（含 UTF-8 去音标）；命名风格把 `HTTPServerConfig` 转成
+蛇形、短横、驼峰与帕斯卡；罗马数字把 1..3999 全跑一遍往返；发音编码对比
+`Robert`/`Rupert` 与 `Smith`/`Smyth`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3712,6 +3731,8 @@ make std-ds
   示例（自带自检）。
 * `make std-ds`：`examples/stdstruct.c6`，第四十五批（基础数据结构）模块的拼装
   示例（自带自检）。
+* `make std-words`：`examples/stdwords.c6`，第四十六批（文本变换）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

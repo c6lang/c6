@@ -12898,6 +12898,10 @@ static const struct C6ErrStdSlot {
     { "std.container.segtree",  C6_ERR_SLOT_STD + 190 },
     { "std.container.dsu",      C6_ERR_SLOT_STD + 191 },
     { "std.container.bloom",    C6_ERR_SLOT_STD + 192 },
+    { "std.text.slug",          C6_ERR_SLOT_STD + 193 },
+    { "std.text.casing",        C6_ERR_SLOT_STD + 194 },
+    { "std.text.roman",         C6_ERR_SLOT_STD + 195 },
+    { "std.text.phonetic",      C6_ERR_SLOT_STD + 196 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

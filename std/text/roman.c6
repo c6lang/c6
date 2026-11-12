@@ -1,0 +1,185 @@
+/* std/text/roman：罗马数字与十进制互转（1..3999，标准减法记法）。
+ *
+ *     import std.text.roman;
+ *
+ *     char out[16] = { 0 };
+ *     int v = 0;
+ *     roman_from_int(1987, out, (int)sizeof out);   // "MCMLXXXVII"
+ *     roman_to_int(S("MCMLXXXVII"), &v);            // 1987
+ *
+ * 规则（只认标准形式）：
+ *
+ * - 基本符号 `I`=1、`V`=5、`X`=10、`L`=50、`C`=100、`D`=500、`M`=1000；
+ * - 允许的减法对只有 `IV`(4)、`IX`(9)、`XL`(40)、`XC`(90)、`CD`(400)、`CM`(900)；
+ * - 从左到右，若当前符号小于右边符号则做减法，否则做加法；
+ * - `roman_to_int` 只在结果「用标准形式写回来等于原串」时返回 1，所以
+ *   `IIII`、`VX`、`MMMM` 这些都会返回 -1；
+ * - 大小写都收（`mcm` 与 `MCM` 等价），但输出一律大写；
+ * - 范围 1..3999，超出返回 -1。
+ */
+#include <string.h>
+
+module std.text.roman;
+import std.core.types;
+import std.text.str;
+
+static int roman_value(char c)
+{
+    if (c == 'I' || c == 'i')
+        return 1;
+    if (c == 'V' || c == 'v')
+        return 5;
+    if (c == 'X' || c == 'x')
+        return 10;
+    if (c == 'L' || c == 'l')
+        return 50;
+    if (c == 'C' || c == 'c')
+        return 100;
+    if (c == 'D' || c == 'd')
+        return 500;
+    if (c == 'M' || c == 'm')
+        return 1000;
+    return 0;
+}
+
+int roman_from_int(int v, char *dst, int cap)
+{
+    static const int vals[13] = { 1000, 900, 500, 400, 100, 90,
+                                  50, 40, 10, 9, 5, 4, 1 };
+    static const char *syms[13] = { "M", "CM", "D", "CD", "C", "XC",
+                                    "L", "XL", "X", "IX", "V", "IV", "I" };
+    int o = 0, i = 0;
+
+    if (!dst || cap <= 0 || v <= 0 || v > 3999)
+        return -1;
+    for (i = 0; i < 13; i++) {
+        while (v >= vals[i]) {
+            int k = 0;
+
+            for (k = 0; syms[i][k]; k++) {
+                if (o + 1 >= cap)
+                    return -1;
+                dst[o++] = syms[i][k];
+            }
+            v -= vals[i];
+        }
+    }
+    dst[o] = 0;
+    return o;
+}
+
+int roman_to_int(char[:] s, int *out)
+{
+    int i = 0, n = s.len, total = 0;
+    char canon[16] = { 0 };
+    int clen = 0;
+
+    if (!s.data || s.len <= 0)
+        return -1;
+    if (n > 15)
+        return -1;
+    for (i = 0; i < n; i++) {
+        int cur = roman_value(s.data[i]);
+        int next = 0;
+
+        if (cur == 0)
+            return -1;
+        next = i + 1 < n ? roman_value(s.data[i + 1]) : 0;
+        if (cur < next)
+            total -= cur;
+        else
+            total += cur;
+    }
+    if (total <= 0 || total > 3999)
+        return -1;
+    /* 校验：标准形式写回来必须一模一样 */
+    clen = roman_from_int(total, canon, (int)sizeof canon);
+    if (clen != n)
+        return -1;
+    for (i = 0; i < n; i++) {
+        char c = s.data[i];
+
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        if (c != canon[i])
+            return -1;
+    }
+    if (out)
+        *out = total;
+    return 1;
+}
+
+int roman_valid(char[:] s)
+{
+    return roman_to_int(s, 0) == 1 ? 1 : 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "roman：整数转罗马数字" {
+    char out[16] = { 0 };
+    int n = 0;
+
+    n = roman_from_int(1, out, (int)sizeof out);
+    if (n != 1 || memcmp(out, "I", 1) != 0)
+        return err(1, "1 应该是 I");
+    n = roman_from_int(4, out, (int)sizeof out);
+    if (n != 2 || memcmp(out, "IV", 2) != 0)
+        return err(2, "4 应该是 IV");
+    n = roman_from_int(9, out, (int)sizeof out);
+    if (n != 2 || memcmp(out, "IX", 2) != 0)
+        return err(3, "9 应该是 IX");
+    n = roman_from_int(1987, out, (int)sizeof out);
+    if (n != 10 || memcmp(out, "MCMLXXXVII", 10) != 0)
+        return err(4, "1987 应该是 MCMLXXXVII");
+    n = roman_from_int(3999, out, (int)sizeof out);
+    if (n != 9 || memcmp(out, "MMMCMXCIX", 9) != 0)
+        return err(5, "3999 应该是 MMMCMXCIX");
+    if (roman_from_int(0, out, (int)sizeof out) != -1)
+        return err(6, "0 应该 -1");
+    if (roman_from_int(4000, out, (int)sizeof out) != -1)
+        return err(7, "4000 应该 -1");
+    if (roman_from_int(1987, out, 4) != -1)
+        return err(8, "容量不够应该 -1");
+}
+
+test "roman：罗马数字转整数与校验" {
+    int v = 0;
+
+    if (roman_to_int(S("MCMLXXXVII"), &v) != 1 || v != 1987)
+        return err(9, "MCMLXXXVII 应该是 1987");
+    if (roman_to_int(S("mcm"), &v) != 1 || v != 1900)
+        return err(10, "小写应该也收，mcm=1900");
+    if (roman_to_int(S("XLII"), &v) != 1 || v != 42)
+        return err(11, "XLII 应该是 42");
+    if (roman_to_int(S("MMMCMXCIX"), &v) != 1 || v != 3999)
+        return err(12, "MMMCMXCIX 应该是 3999");
+    /* 非标准写法一律拒绝 */
+    if (roman_to_int(S("IIII"), &v) != -1)
+        return err(13, "IIII 应该 -1");
+    if (roman_to_int(S("VX"), &v) != -1)
+        return err(14, "VX 应该 -1");
+    if (roman_to_int(S("MMMM"), &v) != -1)
+        return err(15, "MMMM 应该 -1");
+    if (roman_to_int(S("ABC"), &v) != -1 || roman_to_int(S(""), &v) != -1)
+        return err(16, "非罗马字符或空串应该 -1");
+    if (roman_valid(S("XIV")) != 1 || roman_valid(S("IIX")) != 0)
+        return err(17, "valid 不对");
+    /* 1..3999 全表往返 */
+    {
+        int i = 0;
+
+        for (i = 1; i <= 3999; i++) {
+            char buf[16] = { 0 };
+            int got = 0;
+
+            if (roman_from_int(i, buf, (int)sizeof buf) <= 0)
+                return err(18, "某个整数的罗马数字写不出来");
+            if (roman_to_int((char[:]){ buf, (int)strlen(buf) }, &got) != 1
+                || got != i)
+                return err(19, "全表往返不一致");
+        }
+    }
+}

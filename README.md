@@ -328,6 +328,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/container/segtree.c6 std.container.segtree 迭代线段树（2n 数组）：求和/最小/最大，点赋值与点加，闭区间聚合
   std/container/dsu.c6      std.container.dsu      并查集：迭代路径减半、按大小合并、集合数与集合大小
   std/container/bloom.c6    std.container.bloom    布隆过滤器：FNV-1a 双哈希、置位统计与填充比例
+  std/text/slug.c6          std.text.slug          URL slug：UTF-8 解码 + Latin-1 去音标，CJK 当分隔、连续分隔合一
+  std/text/casing.c6        std.text.casing        命名风格互转：切词（缩略词边界）后输出 snake/kebab/camel/Pascal/title
+  std/text/roman.c6         std.text.roman         罗马数字：1..3999 双向转换，回写比对保证只认标准写法
+  std/text/phonetic.c6      std.text.phonetic      发音编码：Soundex 4 字符码（h/w 不打断）+ 简化 Metaphone + phone_same
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -429,6 +433,7 @@ make std-transcode # 编译并运行 examples/stdtranscode.c6（第四十二批�
 make std-audio    # 编译并运行 examples/stdaudio.c6（第四十三批音频容器模块的拼装示例）
 make std-proto2   # 编译并运行 examples/stdproto2.c6（第四十四批文本行协议模块的拼装示例）
 make std-ds       # 编译并运行 examples/stdstruct.c6（第四十五批基础数据结构模块的拼装示例）
+make std-words    # 编译并运行 examples/stdwords.c6（第四十六批文本变换模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
