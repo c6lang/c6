@@ -4,9 +4,9 @@
  *
  *     u32 h = fnv1a_cstr("hello");
  *     Hasher s = hasher();
- *     update(&s, "foo", 3);
- *     update(&s, "bar", 3);
- *     u32 h2 = digest(&s);          // 与 fnv1a_cstr("foobar") 相同
+ *     (&s)->update("foo", 3);       // 就是 hasher_update(&s, ...)
+ *     (&s)->update("bar", 3);
+ *     u32 h2 = (&s)->digest();      // 与 fnv1a_cstr("foobar") 相同
  *
  * 这一层全是纯函数：不分配、不失败、不链 libm；`p == NULL` 一律当空输入
  * （n 被忽略），所以「没有数据」不需要调用方先判空。
@@ -24,7 +24,9 @@
 module std.hash;
 import std.types;
 
-/* 流式 FNV-1a 32：`update` 可以分段喂，结果与一次喂完相同 */
+/* 流式 FNV-1a 32：`update` 可以分段喂，结果与一次喂完相同。
+   方法名带 `hasher_` 前缀：体外的函数还会发一个裸名弱别名，`update`/`digest`
+   这种名字太通用，留给同一程序里的其他模块会撞符号。 */
 struct Hasher {
     u32 h;
     usize total;    /* 喂进去的字节数，方便调用方自己判空 */
@@ -37,7 +39,7 @@ Hasher hasher(void)
     return s;
 }
 
-void update(Hasher *self, const void *p, usize n)
+void hasher_update(Hasher *self, const void *p, usize n)
 {
     const u8 *b = (const u8 *)p;
     usize i = 0;
@@ -49,15 +51,15 @@ void update(Hasher *self, const void *p, usize n)
     self->total += n;
 }
 
-u32 digest(Hasher *self) { return self->h; }
+u32 hasher_digest(Hasher *self) { return self->h; }
 
 /* 一次性 FNV-1a 32 */
 u32 fnv1a_bytes(const void *p, usize n)
 {
     Hasher s = hasher();
 
-    update(&s, p, n);
-    return digest(&s);
+    hasher_update(&s, p, n);
+    return hasher_digest(&s);
 }
 
 /* C 字符串版本：NULL 当空串（空串的 FNV-1a 32 是 0x811c9dc5） */
@@ -140,23 +142,23 @@ test "流式 update 与一次性结果相同" {
     Hasher b = hasher();
     usize before = 0;
 
-    update(&a, (char *)"foobar", 6);
-    update(&b, (char *)"foo", 3);
+    hasher_update(&a, (char *)"foobar", 6);
+    hasher_update(&b, (char *)"foo", 3);
     before = b.total;
-    update(&b, (char *)"bar", 3);
+    hasher_update(&b, (char *)"bar", 3);
     if (before != 3u || b.total != 6u)
         return err(5, "total 没有累加");
-    if (digest(&a) != digest(&b))
+    if (hasher_digest(&a) != hasher_digest(&b))
         return err(6, "分段 update 与一次喂完不同");
-    if (digest(&a) != fnv1a_bytes((char *)"foobar", 6))
+    if (hasher_digest(&a) != fnv1a_bytes((char *)"foobar", 6))
         return err(7, "digest 与 fnv1a_bytes 不同");
 }
 
 test "NULL 输入被当成空输入" {
     Hasher s = hasher();
 
-    update(&s, (const void *)0, 99);
-    if (digest(&s) != 0x811c9dc5u || s.total != 0u)
+    hasher_update(&s, (const void *)0, 99);
+    if (hasher_digest(&s) != 0x811c9dc5u || s.total != 0u)
         return err(8, "NULL 输入改动了状态");
     if (fnv1a64_bytes((const void *)0, 4) != 14695981039346656037ull)
         return err(9, "NULL 输入的 FNV-1a 64 不是空值");

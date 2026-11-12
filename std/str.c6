@@ -543,6 +543,9 @@ struct Split {
     char sep;
 };
 
+/* 切分器有 `has()`/`next()` 两个方法，`foreach` 就能直接吃它。
+   普通结构体不能在体内写方法体（只认第一个形参是指针），所以照旧写在体外：
+   第一个形参是指针就自动注册成方法，`it->has()` 和 `has(&it)` 是同一个调用。 */
 int has(Split *self)
 {
     while (self->pos < self->s.len) {
@@ -566,6 +569,9 @@ Str next(Split *self)
     return r;
 }
 
+/* 切分器由 `Str` 造出来（`(&s)->split(',')`），但 `split` 的接收者必须是
+   `Str` 才能注册成 `Str` 的方法；而 `Str` 的体在上面、改不得（见文件头），
+   所以这里按「接收者就是第一个形参」的老写法留一个文件作用域函数。 */
 Split split(Str *self, char sep)
 {
     Split sp = { self->s, 0, sep };

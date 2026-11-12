@@ -35,9 +35,9 @@
 | `std/range.c6` | `std.range` | 能被 `foreach` 吃掉的区间 `Range`/`StepRange` |
 | `std/sort.c6` | `std.sort` | 比较器驱动的排序与查找：`sort_bytes`/`sort_int`/`sort_u32`/`sort_f64`（稳定归并 + 小数组插入）、`find_bytes`/`find_int`/`find_u32`、`lower_bound_int`/`upper_bound_int`、`cmp_int`/`cmp_u32`/`cmp_f64`/`cmp_int_desc`、`is_sorted_int` |
 | `std/mem.c6` | `std.mem` | 借用式内存池 `Arena`（`alloc`/`alloc_array`/`reset`/`room`/`used`）、托管堆薄包装 `alloc_new`/`alloc_new_array`/`dealloc`、按元素的 `copy`/`fill`/`zero`/`swap`/`rotate`/`reverse_bytes`、`align_up`/`align_down`/`is_aligned` |
-| `std/io.c6` | `std.io` | 文件与标准流：`Reader`（`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`）、`Writer`（`write_line`/`write_bytes`/`write_slice`/`flush`）、零分配的按行迭代 `CFile` |
+| `std/io.c6` | `std.io` | 文件与标准流：`Reader`（`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`/`close`）、`Writer`（`write_line`/`write_bytes`/`write_slice`/`flush`/`close`）、零分配的按行迭代 `CFile`（`has`/`next`）。方法名带 `reader_`/`writer_`/`cfile_` 前缀，调用照旧写 `pr->read_line(...)` |
 | `std/math.c6` | `std.math` | 整数：`min`/`max`/`clamp`/`iabs`/`gcd`/`lcm`/`ipow`/`ipow_u64`/`imul_checked`/`sat_add`/`sat_mul`/`is_pow2`/`next_pow2`/`floor_div`/`mod`；浮点（不链 libm）：`sqrt`/`floor`/`ceil`/`trunc`/`round`/`fabs`/`nearly_eq`/`clamp_f64`/`fact` |
-| `std/time.c6` | `std.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `format_duration`、`Civil` 日历换算 `civil_from_unix`/`unix_from_civil`/`format_civil`（不依赖 localtime） |
+| `std/time.c6` | `std.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `(&d)->format(buf, cap)`（`duration_format`）、`Civil` 日历换算 `civil_from_unix`/`(&c)->to_unix()`（`civil_to_unix`）/`(&c)->format(...)`（`civil_format`），不依赖 localtime |
 | `std/strbuf.c6` | `std.strbuf` | 会自己长大的字符缓冲 `StrBuf`（托管引用）：`write`/`write_cstr`/`push`、`write_int`/`write_u64`/`write_hex`、`reserve`/`truncate`/`clear`/`slice`/`cstr`（依赖 `std.fmt` 的数字原语） |
 | `std/utf8.c6` | `std.utf8` | UTF-8 解码 `utf8_decode`（返回 1..4，拒绝过长编码/代理区/超范围/截断）、编码 `utf8_encode`、`utf8_valid`/`utf8_count`、`Rune` 与 `utf8_runes()` 迭代器 |
 | `std/bits.c6` | `std.bits` | 位运算：`popcount32/64`、`parity32`、`clz32/64`、`ctz32/64`（0 输入给 32/64）、`rotl`/`rotr`、`bswap16/32/64`、`bit_get/set/clear/toggle`、`mask_low`/`mask_range`、`sign_extend`、`is_pow2_32/64` |
@@ -47,7 +47,7 @@
 | `std/ascii.c6` | `std.ascii` | ASCII 判别与转换（零分配、零依赖）：`ascii_is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_print`/`is_punct`/`is_cntrl`、`ascii_digit_value`/`hex_value`/`hex_char`、`ascii_to_lower`/`to_upper`、原地 `ascii_lower`/`upper`、`ascii_cmp_nocase`/`eq_nocase` |
 | `std/num.c6` | `std.num` | 浮点格式化与解析（不链 libm）：`fmt_f64`（固定位）、`fmt_f64_sci`（`%e`）、`fmt_f64_g`（`%g` 语义、去尾零）、`round_to`、`f64_is_nan`/`f64_is_inf`、`parse_f64`/`parse_f64_cstr`（inf/nan、`INVAL`/`PARSE`/`RANGE`） |
 | `std/codec.c6` | `std.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
-| `std/rand.c6` | `std.rand` | xorshift64* 伪随机：`rand_seed`/`rand_u64`/`rand_u32`/`rand_below`（拒绝采样）/`rand_int`/`rand_int_incl`/`rand_f64`/`rand_bool`/`rand_fill`/`rand_shuffle`/`rand_shuffle_int` |
+| `std/rand.c6` | `std.rand` | xorshift64* 伪随机：`rand_seed` + `(&r)->u64()`/`u32()`/`below()`（拒绝采样）/`int()`/`int_incl()`/`f64()`/`bool()`/`fill()`/`shuffle()`/`shuffle_int()`（方法名 `random_*`） |
 | `std/fs.c6` | `std.fs` | POSIX 文件系统元数据与目录：`StatInfo`、`fs_stat`/`fs_lstat`/`fs_exists`/`fs_is_dir`/`fs_is_file`/`fs_size`、`fs_mkdir`/`fs_mkdir_p`/`fs_remove`/`fs_rmdir`/`fs_rename`、`fs_getcwd`/`fs_chdir`、零分配 `Dir` 遍历 |
 | `std/set.c6` | `std.set` | 哈希集合 `Set@K`（`std.map` 的薄包装）与 `SetIter@K`：`add`（1 新增 / 0 已存在）/`remove`/`has`/`count`/`capacity`/`reserve`/`clear`/`iter` |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
@@ -318,6 +318,9 @@ b->count();  b->capacity();  b->room();  b->is_empty();
 b->slice();                              /* 当前内容的切片 */
 b->truncate(3);  b->clear();             /* 只改长度，容量留着 */
 b->reserve(4096) catch e { return 1; };  /* 翻倍策略写在库里 */
+
+/* 方法名是 strbuf_write / strbuf_count / strbuf_cstr …，上面这些写法都对：
+   普通结构体（体内写不了方法体）的方法按 strbuf_* 注册，符号不与别的模块抢 */
 ```
 
 和 `Buf@(N)` 的分工：上限是常量（协议头、日志行）就用 `Buf@(N)`，纯值、零
@@ -360,8 +363,8 @@ u32 c = crc32_bytes("123456789", 9);     /* 0xCBF43926 */
 u64 h64 = fnv1a64_bytes(p, n);
 
 Hasher st = hasher();                    /* 流式：分几段喂结果一样 */
-update(&st, s1.data, (usize)s1.len);
-u32 d = digest(&st);
+(&st)->update(s1.data, (usize)s1.len);   /* = hasher_update(&st, ...) */
+u32 d = (&st)->digest();                 /* = hasher_digest(&st) */
 
 popcount32(0xf0f0f0f0u);  clz32(1u);  ctz32(8u);   /* 0 输入给 32/64 */
 rotl32(v, 1);  bswap32(v);  mask_range(4, 8);
@@ -481,17 +484,17 @@ import std.rand;
 import std.time;
 
 Rand r = rand_seed(now_ns());           /* 纯值，可重放：同一个种子同一串数 */
-u64 x = rand_u64(&r);
-int d6 = rand_int_incl(&r, 1, 6);       /* [1, 6] */
-u64 b = rand_below(&r, 100);            /* [0, 100)，拒绝采样，无余数偏置 */
-f64 p = rand_f64(&r);                   /* [0, 1) */
+u64 x = (&r)->u64();                    /* = random_u64(&r) */
+int d6 = (&r)->int_incl(1, 6);          /* [1, 6] */
+u64 b = (&r)->below(100);               /* [0, 100)，拒绝采样，无余数偏置 */
+f64 p = (&r)->f64();                    /* [0, 1) */
 
 int a[10] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-rand_shuffle_int(&r, (int[:]){ a, 10 });
+(&r)->shuffle_int((int[:]){ a, 10 });
 ```
 
 算法是 xorshift64*（只用 u64 的异或/移位/乘），种子 0 换成非零常量（全零状态
-是吸收态）。**不是密码学随机数**：密钥、令牌、盐不要用它。`rand_shuffle` 按
+是吸收态）。**不是密码学随机数**：密钥、令牌、盐不要用它。`shuffle` 按
 字节交换，任意元素宽度都能用（`elem` 给 `sizeof`）。已知序列钉在
 `std/rand.c6` 的 `test` 块里。
 
@@ -613,7 +616,23 @@ fs 的 mkdir_p → 写文件 → stat → 目录遍历 → rename → 清理、s
 ## 写法约定（照着写就不会踩坑）
 
 * **普通结构体的方法就是「第一个参数是结构体指针」的文件作用域函数**：
-  `int count(Str *self)`；泛型结构体才能在 `struct` 体内写方法体。
+  `int count(Str *self)`；泛型结构体才能在 `struct` 体内写方法体
+  （`struct Split { int has() { ... } }` 会被拒：`a function cannot be defined
+  inside a struct`）。
+* **普通结构体的方法名要带「接收者前缀」**（`reader_read_line`、
+  `writer_flush`、`strbuf_write`、`arena_alloc`、`random_below`、
+  `hasher_update`、`dir_next`、`duration_format`）。原因：体内写不了方法体，
+  写在体外的函数除了 `T_方法名` 还会**按裸名发一个弱别名**给纯 C 侧链接，
+  于是 `write`、`push`、`clear`、`update`、`close`、`alloc` 这些通用名字会同时
+  出现在整个程序里，谁手写一个同名函数就互相顶掉（弱别名只指向本 TU 第一个取到
+  该名字的定义）。带前缀后调用侧读起来仍然是方法（`pr->read_line(...)`
+  就是 `reader_read_line(&pr, ...)`），但全局符号名不会撞。
+* **例外：`foreach` 的迭代器协议只认字面上的 `has()` / `next()`**
+  （`tcc/tccgen.c` 的 `c6_iter_proto_of` 用 `tok_alloc_const("has"/"next")`
+  找方法），所以 `Split`/`Lines`/`Fields`/`Range`/`StepRange`/`CFile` 之外的
+  迭代器不能把这两个方法改名；反过来，这类方法一律**不加前缀**，否则
+  `foreach` 会报「no 'has'/'next' iterator」。同名的 `has`/`next` 分属不同
+  tag 时彼此的弱别名会互相覆盖，但方法调用（`it->has()`）不受影响。
 * 值容器调方法要 `(&v)->m()`；`@T` 托管的变量直接 `v->m()`。
 * 泛型体内方法的隐式接收者叫 **`self`**（不是 `this`）。
 * 方法名不能和字段同名（`int len;` + `int len()` → `field not found`）。
