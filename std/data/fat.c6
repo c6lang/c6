@@ -1,0 +1,341 @@
+/* std/data/fat：FAT12/16/32 的 BPB（引导扇区）与目录项。
+ *
+ *     import std.data.fat;
+ *
+ *     FatInfo fi = { 0 };
+ *     FatDir de = { 0 };
+ *     if (fat_info(buf, n, &fi) == 1 && fi.fat_bits == 16)
+ *         // 目录区起点：fi.data_start_sector 之前的根目录区
+ *         fat_dir_find(buf, n, root_off, fi.root_dir_bytes, "AUTOEXEC", &de);
+ *
+ * 读的字段：`bytes_per_sector`(11)、`sec_per_cluster`(13)、`reserved`(14)、
+ * `nfats`(16)、`root_entries`(17)、`total16`(19)、`media`(21)、`fat_size16`(22)、
+ * `total32`(32)、`fat_size32`(36)、`root_cluster`(44)、`label`(43/71)。
+ *
+ * 约定：
+ *
+ * - `fat_bits` 按微软的簇数阈值定：`< 4085` 是 FAT12、`< 65525` 是 FAT16、
+ *   再往上 FAT32（不看字符串，因为格式化工具常写错）；
+ * - `root_dir_bytes = root_entries * 32`，FAT32 的根目录在簇链上，这里是 0；
+ * - `data_start_sector` 是数据区第一个扇区（保留区 + 各 FAT + 根目录区之后），
+ *   簇号 N 的首扇区 = `data_start_sector + (N-2)*sec_per_cluster`；
+ * - `fat_dir_entry` 解 32 字节短目录项：8+3 名字、属性、起始簇（高低两半拼）、
+ *   字节长度；`0xE5` 开头是已删除、`attr == 0x0F` 是长文件名项，都返回 0；
+ * - `fat_dir_find` 按 `NAME.EXT` 大写比较，最长 8+3，找不到返回 0；
+ * - 不读 FAT 表本身、不解簇链、不拼长文件名。
+ */
+#include <string.h>
+
+module std.data.fat;
+import std.core.types;
+import std.text.str;
+
+struct FatInfo {
+    int bytes_per_sector;
+    int sec_per_cluster;
+    int reserved;
+    int nfats;
+    int root_entries;
+    u32 total_sectors;
+    u32 fat_size;
+    u32 root_cluster;
+    u32 root_dir_bytes;
+    u32 data_start_sector;
+    u32 cluster_count;
+    int fat_bits;
+    char label[12];
+};
+
+struct FatDir {
+    Str name;
+    Str ext;
+    int attr;
+    u32 cluster;
+    u32 size;
+};
+
+static u32 fat_le16(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8);
+}
+
+static u32 fat_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static void fat_copy_label(char *dst, const u8 *src, int len)
+{
+    int i = 0;
+
+    for (i = 0; i < len && i < 11; i++)
+        dst[i] = (char)src[i];
+    dst[i] = 0;
+}
+
+int fat_info(const void *src, int n, FatInfo *out)
+{
+    const u8 *p = (const u8 *)src;
+    u32 total = 0, fsize = 0, root_secs = 0;
+
+    if (!src || !out || n < 512)
+        return -1;
+    if (p[0] != 0xEB && p[0] != 0xE9)
+        return -1;                      /* 跳转指令 */
+    memset(out, 0, sizeof *out);
+    out->bytes_per_sector = (int)fat_le16(p + 11);
+    out->sec_per_cluster = (int)p[13];
+    out->reserved = (int)fat_le16(p + 14);
+    out->nfats = (int)p[16];
+    out->root_entries = (int)fat_le16(p + 17);
+    total = fat_le16(p + 19);
+    if (total == 0)
+        total = fat_le32(p + 32);
+    fsize = fat_le16(p + 22);
+    if (fsize == 0)
+        fsize = fat_le32(p + 36);
+    out->total_sectors = total;
+    out->fat_size = fsize;
+    out->root_cluster = fat_le32(p + 44);
+    if (out->bytes_per_sector != 512 && out->bytes_per_sector != 1024
+        && out->bytes_per_sector != 2048 && out->bytes_per_sector != 4096)
+        return -1;
+    if (out->sec_per_cluster == 0
+        || (out->sec_per_cluster & (out->sec_per_cluster - 1)) != 0
+        || out->sec_per_cluster > 128)
+        return -1;
+    if (out->reserved == 0 || out->nfats == 0 || out->nfats > 4)
+        return -1;
+    if (total == 0 || fsize == 0)
+        return -1;
+    root_secs = ((u32)out->root_entries * 32u + (u32)out->bytes_per_sector - 1)
+                / (u32)out->bytes_per_sector;
+    out->root_dir_bytes = (u32)out->root_entries * 32u;
+    out->data_start_sector = (u32)out->reserved
+                             + (u32)out->nfats * fsize + root_secs;
+    if (out->data_start_sector >= total)
+        return -1;
+    out->cluster_count = (total - out->data_start_sector)
+                         / (u32)out->sec_per_cluster;
+    if (out->cluster_count < 4085)
+        out->fat_bits = 12;
+    else if (out->cluster_count < 65525)
+        out->fat_bits = 16;
+    else
+        out->fat_bits = 32;
+    fat_copy_label(out->label, out->fat_bits == 32 ? p + 71 : p + 43, 11);
+    return 1;
+}
+
+int fat_dir_entry(const void *src, int n, int off, FatDir *out)
+{
+    const u8 *p = (const u8 *)src;
+    const u8 *e = 0;
+    int i = 0, nlen = 0, elen = 0;
+
+    if (!src || !out || off < 0 || off + 32 > n)
+        return -1;
+    e = p + off;
+    memset(out, 0, sizeof *out);
+    if (e[0] == 0x00 || e[0] == 0xE5)
+        return 0;
+    if ((e[11] & 0x0F) == 0x0F)
+        return 0;                       /* 长文件名项 */
+    if ((e[11] & 0x08) != 0)
+        return 0;                       /* 卷标 */
+    for (i = 0; i < 8; i++) {
+        if (e[i] == ' ')
+            break;
+        nlen++;
+    }
+    for (i = 8; i < 11; i++) {
+        if (e[i] == ' ')
+            break;
+        elen++;
+    }
+    out->name.s = (char[:]){ (char *)e, nlen };
+    out->ext.s = (char[:]){ (char *)e + 8, elen };
+    out->attr = (int)e[11];
+    out->cluster = ((u32)fat_le16(e + 20) << 16) | fat_le16(e + 26);
+    out->size = fat_le32(e + 28);
+    return 1;
+}
+
+int fat_dir_find(const void *src, int n, int dir_off, int dir_bytes,
+                 const char *name, FatDir *out)
+{
+    FatDir de = { 0 };
+    char want[13] = { 0 };
+    int i = 0, wlen = (int)strlen(name);
+
+    if (!src || !name || dir_off < 0 || dir_bytes < 32)
+        return -1;
+    if (wlen <= 0 || wlen > 12)
+        return -1;
+    for (i = 0; i < wlen; i++) {
+        char c = name[i];
+
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        want[i] = c;
+    }
+    for (i = 0; i + 32 <= dir_bytes; i += 32) {
+        int r = fat_dir_entry(src, n, dir_off + i, &de);
+        int j = 0, k = 0;
+        char got[13] = { 0 };
+
+        if (r < 0)
+            return -1;
+        if (r == 0)
+            continue;
+        for (j = 0; j < de.name.s.len && k < 8; j++)
+            got[k++] = de.name.s.data[j];
+        if (de.ext.s.len > 0) {
+            got[k++] = '.';
+            for (j = 0; j < de.ext.s.len && k < 12; j++)
+                got[k++] = de.ext.s.data[j];
+        }
+        if (k == wlen && memcmp(got, want, (size_t)wlen) == 0) {
+            if (out)
+                *out = de;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+static void fat_put16(u8 *p, int v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+}
+
+static void fat_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+/* FAT16：512 字节扇区、1 扇区/簇、2 个 FAT、根目录 512 项、32768 扇区 */
+static void mk_fat16(u8 *buf)
+{
+    memset(buf, 0, 16384);
+    buf[0] = 0xEB;
+    buf[2] = 0x90;
+    memcpy(buf + 3, "MSDOS5.0", 8);
+    fat_put16(buf + 11, 512);
+    buf[13] = 1;
+    fat_put16(buf + 14, 1);
+    buf[16] = 2;
+    fat_put16(buf + 17, 512);
+    fat_put16(buf + 19, 32768);
+    buf[21] = 0xF8;
+    fat_put16(buf + 22, 32);
+    memcpy(buf + 43, "TESTVOL    ", 11);
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+}
+
+/* 目录项：8.3 名字 + 属性 + 起始簇 + 长度 */
+static void mk_dir(u8 *e, const char *name, int attr, u32 cluster, u32 size)
+{
+    int i = 0, k = 0, after_dot = 0;
+
+    memset(e, ' ', 11);
+    for (i = 0; name[i]; i++) {
+        if (name[i] == '.') {
+            after_dot = 1;
+            k = 0;
+            continue;
+        }
+        if (!after_dot) {
+            if (k < 8)
+                e[k] = (u8)name[i];
+        } else {
+            if (k < 3)
+                e[8 + k] = (u8)name[i];
+        }
+        k++;
+    }
+    e[11] = (u8)attr;
+    fat_put16(e + 20, (int)((cluster >> 16) & 0xFFFF));
+    fat_put16(e + 26, (int)(cluster & 0xFFFF));
+    fat_put32(e + 28, size);
+}
+
+test "fat：BPB 与 FAT 类型判定" {
+    static u8 buf[16384] = { 0 };
+    FatInfo fi = { 0 };
+
+    mk_fat16(buf);
+    if (fat_info(buf, (int)sizeof buf, &fi) != 1)
+        return err(1, "BPB 解析失败");
+    if (fi.bytes_per_sector != 512 || fi.sec_per_cluster != 1
+        || fi.reserved != 1 || fi.nfats != 2)
+        return err(2, "BPB 基本字段不对");
+    if (fi.root_entries != 512 || fi.total_sectors != 32768)
+        return err(3, "根目录项数或总扇区不对");
+    if (fi.fat_size != 32 || fi.root_dir_bytes != 16384)
+        return err(4, "FAT 大小或根目录字节数不对");
+    if (fi.data_start_sector != 97 || fi.cluster_count != 32768 - 97)
+        return err(5, "数据区起点或簇数不对");
+    if (fi.fat_bits != 16)
+        return err(6, "应该是 FAT16");
+    if (memcmp(fi.label, "TESTVOL    ", 11) != 0)
+        return err(7, "卷标不对");
+    /* 改成 FAT12：总扇区降到 4096 → 簇数 < 4085 */
+    fat_put16(buf + 19, 4096);
+    fat_put16(buf + 22, 12);
+    if (fat_info(buf, (int)sizeof buf, &fi) != 1)
+        return err(8, "FAT12 解析失败");
+    if (fi.fat_bits != 12)
+        return err(9, "应该是 FAT12");
+    /* 改成 FAT32：清掉 fat_size16/root_entries，填 32 位字段 */
+    memset(buf + 17, 0, 2);
+    fat_put16(buf + 19, 0);
+    fat_put16(buf + 22, 0);
+    fat_put32(buf + 32, 200000);
+    fat_put32(buf + 36, 100);
+    fat_put32(buf + 44, 2);
+    if (fat_info(buf, (int)sizeof buf, &fi) != 1)
+        return err(10, "FAT32 解析失败");
+    if (fi.fat_bits != 32 || fi.root_cluster != 2 || fi.fat_size != 100)
+        return err(11, "FAT32 字段不对");
+}
+
+test "fat：目录项与按名查找" {
+    static u8 buf[16384] = { 0 };
+    FatDir de = { 0 };
+    int off = 8192, r = 0;
+
+    mk_fat16(buf);
+    /* 第 0 项：已删除；第 1 项：长文件名；第 2 项：正常文件 */
+    buf[off] = 0xE5;
+    buf[off + 32 + 11] = 0x0F;
+    mk_dir(buf + off + 64, "AUTOEXEC.BAT", 0x20, 5, 1234);
+    mk_dir(buf + off + 96, "README.TXT", 0x20, 6, 42);
+    if (fat_dir_entry(buf, (int)sizeof buf, off, &de) != 0)
+        return err(12, "已删除项应该 0");
+    if (fat_dir_entry(buf, (int)sizeof buf, off + 32, &de) != 0)
+        return err(13, "长文件名项应该 0");
+    if (fat_dir_entry(buf, (int)sizeof buf, off + 64, &de) != 1)
+        return err(14, "正常项取不到");
+    if (de.name.s.len != 8 || memcmp(de.name.s.data, "AUTOEXEC", 8) != 0)
+        return err(15, "短名不对");
+    if (de.ext.s.len != 3 || memcmp(de.ext.s.data, "BAT", 3) != 0)
+        return err(16, "扩展名不对");
+    if (de.cluster != 5 || de.size != 1234 || de.attr != 0x20)
+        return err(17, "簇号/长度/属性不对");
+    r = fat_dir_find(buf, (int)sizeof buf, off, 512, "readme.txt", &de);
+    if (r != 1 || de.size != 42)
+        return err(18, "小写查找应该命中 README.TXT");
+    if (fat_dir_find(buf, (int)sizeof buf, off, 512, "NOPE.TXT", &de) != 0)
+        return err(19, "不存在的文件应该 0");
+    if (fat_dir_entry(buf, (int)sizeof buf, 99999, &de) != -1)
+        return err(20, "越界偏移应该 -1");
+}

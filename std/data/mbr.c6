@@ -1,0 +1,313 @@
+/* std/data/mbr：MBR 分区表与 GPT（GUID 分区表）头。
+ *
+ *     import std.data.mbr;
+ *
+ *     MbrInfo mi = { 0 };
+ *     MbrPart p = { 0 };
+ *     if (mbr_info(buf, n, &mi) == 1 && mbr_part(buf, n, 0, &p) == 1)
+ *         // p.type / p.start / p.sectors
+ *
+ * MBR：512 字节扇区，446 起 4 个 16 字节目录（状态、起始 CHS、类型、结束 CHS、
+ * 起始 LBA、扇区数，最后两项小端），偏移 510 的 `0x55AA` 是签名。
+ *
+ * GPT：第 0 扇区是保护性 MBR（类型 0xEE），LBA1 是 `EFI PART` 头：修订、
+ * 头大小、CRC、当前/备份 LBA、首个/末个可用 LBA、磁盘 GUID、分区表 LBA、
+ * 表项数、表项大小、表 CRC，随后是磁盘 GUID 与 UTF-16LE 名字。
+ *
+ * 约定：
+ *
+ * - `mbr_info` 只要求有签名，分区表项可以为空（全 0 类型）；
+ * - `mbr_part` 的序号 0..3，返回 1 / -1（坏）/ 0（该槽为空）；
+ * - `gpt_info` 要求 `buf` 至少覆盖 LBA1 的头（512 字节），校验 `EFI PART`
+ *   与 `x.hsize >= 92`，不验 CRC（要验自己算）；
+ * - `gpt_entry` 的名字是 UTF-16LE，只保留可打印 ASCII，其余替换成 `?`，
+ *   长度写进 `name_len`；`type` 是全 0 时表示该表项未使用，返回 0；
+ * - 逻辑块按 512 字节算（不认 4096 字节扇区）。
+ */
+#include <string.h>
+
+module std.data.mbr;
+import std.core.types;
+import std.text.str;
+
+struct MbrPart {
+    int status;
+    int type;
+    u32 start;
+    u32 sectors;
+};
+
+struct MbrInfo {
+    u32 disk_sig;
+    int nparts;
+    int gpt;
+};
+
+struct GptHeader {
+    int revision;
+    u32 hsize;
+    u64 current_lba;
+    u64 backup_lba;
+    u64 first_usable;
+    u64 last_usable;
+    u64 entries_lba;
+    u32 nentries;
+    u32 entry_size;
+    u32 entries_crc;
+};
+
+struct GptEntry {
+    u8 type[16];
+    u64 first_lba;
+    u64 last_lba;
+    int name_len;
+    char name[64];
+};
+
+static u32 mbr_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u64 mbr_le64(const u8 *p)
+{
+    return (u64)mbr_le32(p) | ((u64)mbr_le32(p + 4) << 32);
+}
+
+int mbr_info(const void *src, int n, MbrInfo *out)
+{
+    const u8 *p = (const u8 *)src;
+    int i = 0;
+
+    if (!src || !out || n < 512)
+        return -1;
+    if (p[510] != 0x55 || p[511] != 0xAA)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->disk_sig = mbr_le32(p + 440);
+    for (i = 0; i < 4; i++) {
+        if (p[446 + i * 16 + 4] != 0)
+            out->nparts++;
+        if (p[446 + i * 16 + 4] == 0xEE)
+            out->gpt = 1;
+    }
+    return 1;
+}
+
+int mbr_part(const void *src, int n, int idx, MbrPart *out)
+{
+    const u8 *p = (const u8 *)src;
+    const u8 *e = 0;
+
+    if (!src || !out || n < 512 || idx < 0 || idx > 3)
+        return -1;
+    if (p[510] != 0x55 || p[511] != 0xAA)
+        return -1;
+    e = p + 446 + idx * 16;
+    memset(out, 0, sizeof *out);
+    if (e[4] == 0)
+        return 0;
+    out->status = (int)e[0];
+    out->type = (int)e[4];
+    out->start = mbr_le32(e + 8);
+    out->sectors = mbr_le32(e + 12);
+    if (out->status != 0 && out->status != 0x80)
+        return -1;
+    if (out->sectors == 0)
+        return -1;
+    return 1;
+}
+
+int gpt_info(const void *src, int n, GptHeader *out)
+{
+    const u8 *p = (const u8 *)src;
+    const u8 *h = 0;
+
+    if (!src || !out || n < 1024)
+        return -1;
+    h = p + 512;
+    if (memcmp(h, "EFI PART", 8) != 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->revision = (int)mbr_le32(h + 8);
+    out->hsize = mbr_le32(h + 12);
+    out->current_lba = mbr_le64(h + 24);
+    out->backup_lba = mbr_le64(h + 32);
+    out->first_usable = mbr_le64(h + 40);
+    out->last_usable = mbr_le64(h + 48);
+    out->entries_lba = mbr_le64(h + 72);
+    out->nentries = mbr_le32(h + 80);
+    out->entry_size = mbr_le32(h + 84);
+    out->entries_crc = mbr_le32(h + 88);
+    if (out->hsize < 92 || out->hsize > 512)
+        return -1;
+    if (out->entry_size < 128 || out->entry_size > 4096)
+        return -1;
+    if (out->nentries == 0 || out->nentries > 1024)
+        return -1;
+    if (out->last_usable < out->first_usable)
+        return -1;
+    return 1;
+}
+
+int gpt_entry(const void *src, int n, const GptHeader *g, int idx,
+              GptEntry *out)
+{
+    const u8 *p = (const u8 *)src;
+    u64 off = 0;
+    const u8 *e = 0;
+    int i = 0, k = 0;
+
+    if (!src || !g || !out || idx < 0 || (u32)idx >= g->nentries)
+        return -1;
+    off = g->entries_lba * 512u + (u64)idx * (u64)g->entry_size;
+    if (off + g->entry_size > (u64)n)
+        return -1;
+    e = p + (int)off;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < 16; i++) {
+        out->type[i] = e[i];
+        if (e[i] != 0)
+            k++;
+    }
+    if (k == 0)
+        return 0;                       /* 未使用 */
+    out->first_lba = mbr_le64(e + 32);
+    out->last_lba = mbr_le64(e + 40);
+    /* 名字：UTF-16LE，最多 36 个码元 */
+    for (i = 0; i < 36 && 64 + i * 2 + 1 < (int)g->entry_size; i++) {
+        unsigned int c = (unsigned int)e[56 + i * 2]
+                         | ((unsigned int)e[57 + i * 2] << 8);
+
+        if (c == 0)
+            break;
+        out->name[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
+        out->name_len = i + 1;
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static void put_le32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void put_le64(u8 *p, u64 v)
+{
+    put_le32(p, (u32)(v & 0xFFFFFFFFu));
+    put_le32(p + 4, (u32)(v >> 32));
+}
+
+/* MBR：一个 Linux 分区（0x83），一个空槽 */
+static void mk_mbr(u8 *buf)
+{
+    memset(buf, 0, 1024);
+    put_le32(buf + 440, 0xDEADBEEFu);
+    buf[446] = 0x80;
+    buf[450] = 0x83;
+    put_le32(buf + 454, 2048);
+    put_le32(buf + 458, 4096);
+    buf[462 + 4] = 0x0C;
+    put_le32(buf + 462 + 8, 6144);
+    put_le32(buf + 462 + 12, 8192);
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+}
+
+/* 在 MBR 上叠 GPT 头：一张表项，名字 "root" */
+static void mk_gpt(u8 *buf)
+{
+    mk_mbr(buf);
+    buf[446 + 4] = 0xEE;                /* 保护性分区 */
+    buf[512] = 'E';
+    buf[513] = 'F';
+    buf[514] = 'I';
+    buf[515] = ' ';
+    buf[516] = 'P';
+    buf[517] = 'A';
+    buf[518] = 'R';
+    buf[519] = 'T';
+    put_le32(buf + 512 + 8, 0x00010000);
+    put_le32(buf + 512 + 12, 92);
+    put_le64(buf + 512 + 24, 1);
+    put_le64(buf + 512 + 32, 999);
+    put_le64(buf + 512 + 40, 34);
+    put_le64(buf + 512 + 48, 966);
+    put_le64(buf + 512 + 72, 2);        /* 表项在 LBA2 */
+    put_le32(buf + 512 + 80, 4);
+    put_le32(buf + 512 + 84, 128);
+    /* 表项 0：type GUID + 范围 + "root" */
+    buf[1024] = 0xA2;
+    buf[1024 + 1] = 0xA0;
+    put_le64(buf + 1024 + 32, 2048);
+    put_le64(buf + 1024 + 40, 4095);
+    buf[1024 + 56] = 'r';
+    buf[1024 + 58] = 'o';
+    buf[1024 + 60] = 'o';
+    buf[1024 + 62] = 't';
+}
+
+test "mbr：分区表" {
+    static u8 buf[1024] = { 0 };
+    MbrInfo mi = { 0 };
+    MbrPart p = { 0 };
+
+    mk_mbr(buf);
+    if (mbr_info(buf, 512, &mi) != 1)
+        return err(1, "MBR 解析失败");
+    if (mi.disk_sig != 0xDEADBEEFu || mi.nparts != 2 || mi.gpt != 0)
+        return err(2, "MBR 头字段不对");
+    if (mbr_part(buf, 512, 0, &p) != 1)
+        return err(3, "第 0 个分区取不到");
+    if (p.status != 0x80 || p.type != 0x83 || p.start != 2048
+        || p.sectors != 4096)
+        return err(4, "第 0 个分区字段不对");
+    if (mbr_part(buf, 512, 1, &p) != 1 || p.type != 0x0C
+        || p.start != 6144)
+        return err(5, "第 1 个分区字段不对");
+    if (mbr_part(buf, 512, 2, &p) != 0)
+        return err(6, "空槽应该 0");
+    if (mbr_part(buf, 512, 4, &p) != -1)
+        return err(7, "越界序号应该 -1");
+    if (mbr_info(buf, 511, &mi) != -1)
+        return err(8, "不足 512 字节应该 -1");
+}
+
+test "mbr：GPT 头与表项" {
+    static u8 buf[1536] = { 0 };
+    MbrInfo mi = { 0 };
+    GptHeader g = { 0 };
+    GptEntry e = { 0 };
+
+    mk_gpt(buf);
+    if (mbr_info(buf, 1536, &mi) != 1 || mi.gpt != 1)
+        return err(9, "GPT 保护分区应该被识别");
+    if (gpt_info(buf, 1536, &g) != 1)
+        return err(10, "GPT 头解析失败");
+    if (g.revision != 0x00010000 || g.hsize != 92 || g.current_lba != 1
+        || g.backup_lba != 999)
+        return err(11, "GPT 头字段不对");
+    if (g.first_usable != 34 || g.last_usable != 966 || g.entries_lba != 2
+        || g.nentries != 4 || g.entry_size != 128)
+        return err(12, "GPT 可用范围或表项参数不对");
+    if (gpt_entry(buf, 1536, &g, 0, &e) != 1)
+        return err(13, "第 0 个表项取不到");
+    if (e.type[0] != 0xA2 || e.first_lba != 2048 || e.last_lba != 4095)
+        return err(14, "表项字段不对");
+    if (e.name_len != 4 || memcmp(e.name, "root", 4) != 0)
+        return err(15, "表项名字不对");
+    if (gpt_entry(buf, 1536, &g, 1, &e) != 0)
+        return err(16, "空表项应该 0");
+    if (gpt_entry(buf, 1536, &g, 9, &e) != -1)
+        return err(17, "越界表项应该 -1");
+    /* 头大小非法 */
+    put_le32(buf + 512 + 12, 80);
+    if (gpt_info(buf, 1536, &g) != -1)
+        return err(18, "头大小 80 应该 -1");
+}

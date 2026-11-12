@@ -1550,6 +1550,32 @@ BDF 的十六进制行有个小坑：一行写奇数个 nibble 是坏数据（�
 验收：`make stdtest`（173 个模块、0 failure）、`make std-font`（24 条自检全过）、
 `make check-all`。
 
+### 11.53 标准库第四十一批（mbr / fat / iso / ext2）
+
+第四十一批做「分区与文件系统」的头解析：MBR/GPT、FAT 引导扇区、ISO 9660 主卷、
+ext2 超级块。四个都是纯读结构的活，正好把「偏移表 + 双端序 + 目录扫描」练一遍。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.mbr` | MBR + GPT | MBR 只认 `0x55AA` 签名与 4 个 16 字节目录；`0xEE` 类型视为 GPT 保护分区；GPT 头校验 `EFI PART`、`hsize` 92..512、`entry_size` 128..4096；表项名字是 UTF-16LE，非 ASCII 换成 `?` |
+| `std.data.fat` | FAT12/16/32 | FAT 类型按**簇数阈值**判（4085 / 65525），不信 BPB 里的类型字符串；`data_start_sector = reserved + nfats*fat_size + 根目录扇区`；目录项跳过 `0xE5`、`attr==0x0F`、卷标 |
+| `std.data.iso` | ISO 9660 | 主卷描述符固定在逻辑扇区 16；块大小在偏移 128 的双端序里，**大端那一半在 130**（读 128 会得到 8）；目录记录长度为 0 表示本块用尽，要跳到下一个块边界 |
+| `std.data.ext2` | ext2/3/4 | 超级块在字节偏移 1024；块大小 = `1024 << log_block_size`；块组描述符表在 `first_data_block + 1` 个块处；inode 号**从 1 起**（2 号是根目录） |
+
+两个坑：FAT 如果只清 `fat_size16` 而忘了 `total16`，簇数会按旧的 16 位总扇区算出
+来，类型判断就错成 FAT12；ISO 的双端序字段是「小端在前、大端在后」，16 位字段的
+大端副本在 +2 处，别直接读首地址。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.mbr`=0x60ad、
+`std.data.fat`=0x60ae、`std.data.iso`=0x60af、`std.data.ext2`=0x60b0；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-disk` 与 `STD_DISK_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。示例
+`examples/stddisk.c6` 四节（28 条自检）。
+
+验收：`make stdtest`（177 个模块、0 failure）、`make std-disk`（28 条自检全过）、
+`make check-all`。
+
+
 
 
 

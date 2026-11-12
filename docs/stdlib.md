@@ -205,6 +205,10 @@
 | `std/data/woff.c6` | `std.data.woff` | WOFF 1.0 容器：`woff_info` 解 44 字节头（flavor/长度/表数/`totalSfntSize`/版本/元数据与私有块），`woff_table_at`/`woff_find` 取每表的 `offset`/`compLength`/`origLength`/`origChecksum`；只解容器不解压（`comp_len < orig_len` 的表交给 zlib） |
 | `std/data/svg.c6` | `std.data.svg` | SVG 路径数据：`svg_path_count`/`svg_path_at` 把 `d` 规范化为分量绝对坐标的 `M`/`L`/`C`/`Q`/`A`/`Z`（`H`/`V` 并入 `L`，`S`/`T` 做控制点反射，隐式重复按上一命令），`svg_path_bbox` 用控制点凸包给包围盒（只大不小） |
 | `std/data/ttf.c6` | `std.data.ttf` | TrueType/OpenType 度量：`ttf_info` 读表目录与 `head`/`hhea`/`maxp`/`cmap`/`hmtx`，`ttf_glyph` 走 format 4 与 format 12 子表（找不到返回 -1），`ttf_advance` 取前进宽度（超过 `numberOfHMetrics` 用最后一个）；不解析轮廓 |
+| `std/data/mbr.c6` | `std.data.mbr` | 分区表：`mbr_info`/`mbr_part` 解 512 字节 MBR（4 个 16 字节目录、`0x55AA` 签名、类型 `0xEE` 即 GPT 保护分区），`gpt_info` 解 LBA1 的 `EFI PART` 头（修订/头大小/可用范围/表项数/表项大小），`gpt_entry` 解类型 GUID、首末 LBA 与 UTF-16LE 名字 |
+| `std/data/fat.c6` | `std.data.fat` | FAT12/16/32：`fat_info` 按簇数阈值判 FAT 类型（不看类型字符串），给出根目录字节数与数据区起点；`fat_dir_entry` 解 32 字节短目录项（跳过已删除与长文件名项），`fat_dir_find` 按 `NAME.EXT` 大写比较 |
+| `std/data/iso.c6` | `std.data.iso` | ISO 9660：`iso_volume` 解逻辑扇区 16 的主卷描述符（卷 ID、双端序的卷空间大小与块大小、根目录记录），`iso_record` 解目录记录（去掉 `;1`、`0x00`/`0x01` 还原 `.`/`..`），`iso_find` 跨逻辑块扫描目录 |
+| `std/data/ext2.c6` | `std.data.ext2` | ext2/3/4 布局：`ext2_super` 解偏移 1024 的超级块（`0xEF53`、`1024<<log_block_size`、每组块数/inode 数、卷名、挂载点），`ext2_group` 解 32 字节块组描述符，`ext2_inode` 按「1 起」的 inode 号定位（2 号是根目录） |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -288,6 +292,7 @@
 | `examples/stdhash.c6` | （无模块） | 第三十八批（哈希与校验）的拼装示例（`make std-hash`）：SHA-3-256/SHAKE128、BLAKE2s-256/128、CRC-32C、XXH32/XXH64 的已知向量与流式一致性 |
 | `examples/stdlegacy.c6` | （无模块） | 第三十九批（老图形格式）的拼装示例（`make std-legacy`）：现场拼 PCX（调色板 + RLE）、Radiance HDR（RGBE + 色调映射）、XBM、XPM 四种老格式再解析 |
 | `examples/stdfont.c6` | （无模块） | 第四十批（字体与矢量）的拼装示例（`make std-font`）：现场拼 BDF 字体、WOFF 容器、SVG 路径与最小 TrueType，各自解析一遍 |
+| `examples/stddisk.c6` | （无模块） | 第四十一批（分区与文件系统）的拼装示例（`make std-disk`）：现场拼 MBR+GPT、FAT16 BPB 与目录、ISO 9660 卷与目录记录、ext2 超级块与 inode |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -342,6 +347,10 @@ std/data/bdf.c6            24 test(s), 0 failure(s)
 std/data/woff.c6           24 test(s), 0 failure(s)
 std/data/svg.c6            24 test(s), 0 failure(s)
 std/data/ttf.c6            24 test(s), 0 failure(s)
+std/data/mbr.c6            24 test(s), 0 failure(s)
+std/data/fat.c6            24 test(s), 0 failure(s)
+std/data/iso.c6            24 test(s), 0 failure(s)
+std/data/ext2.c6           24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3527,6 +3536,17 @@ make std-font
 包围盒；TrueType 造 5 张表，用一段 `cmap` format 4 验证 `A`..`Z` 的连续映射和
 `hmtx` 的越界回退。这个目标链接要带 `-lm`（`svg` 用了 `pow`/`fabs`）。
 
+### 集成示例：`examples/stddisk.c6`
+
+```sh
+make std-disk
+```
+
+四节：MBR 先当纯 MBR 读（一个保护性分区），再叠上 GPT 头与一张表项（名字 `EFI`）；
+FAT16 走「BPB + 一条 `README.TXT` 目录项 + 小写查找」；ISO 9660 拼主卷描述符与
+根目录两条记录（`.` 与 `HELLO.TXT;1`）；ext2 拼超级块、块组描述符与 2 号 inode
+（根目录）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3603,6 +3623,8 @@ make std-font
   示例（自带自检）。
 * `make std-font`：`examples/stdfont.c6`，第四十批（字体与矢量）模块的拼装示例
   （自带自检，链接带 `-lm`）。
+* `make std-disk`：`examples/stddisk.c6`，第四十一批（分区与文件系统）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

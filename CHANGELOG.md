@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第四十一批（分区与文件系统）**：`std.data.mbr`（MBR + GPT）、
+  `std.data.fat`（FAT12/16/32 BPB 与目录项）、`std.data.iso`（ISO 9660 主卷与
+  目录记录）、`std.data.ext2`（超级块 + 块组描述符 + inode），集成示例
+  `examples/stddisk.c6`（`make std-disk`）。错误号段 `std.data.mbr`=0x60ad …
+  `std.data.ext2`=0x60b0（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十批（字体与矢量）**：`std.data.bdf`（BDF 位图字体）、
   `std.data.woff`（WOFF 1.0 容器）、`std.data.svg`（路径规范化 + 包围盒）、
   `std.data.ttf`（表目录 + cmap/hmtx 度量），集成示例 `examples/stdfont.c6`

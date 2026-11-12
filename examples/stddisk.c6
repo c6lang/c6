@@ -1,0 +1,236 @@
+/* examples/stddisk.c6 —— 第四十一批（分区与文件系统）的集成示例。
+ *
+ *     make std-disk
+ *
+ * 四节：MBR + GPT 分区表、FAT16 引导扇区与目录、ISO 9660 主卷与目录记录、
+ * ext2 超级块与 inode。四份数据都在内存里现场拼。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.mbr;
+import std.data.fat;
+import std.data.iso;
+import std.data.ext2;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void put32(u8 *p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);
+    p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void put64(u8 *p, u64 v)
+{
+    put32(p, (u32)(v & 0xFFFFFFFFu));
+    put32(p + 4, (u32)(v >> 32));
+}
+
+static void put16(u8 *p, int v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+}
+
+static void do_mbr(void)
+{
+    static u8 buf[1536] = { 0 };
+    MbrInfo mi = { 0 };
+    MbrPart p = { 0 };
+    GptHeader g = { 0 };
+    GptEntry e = { 0 };
+
+    printf("== mbr / gpt\n");
+    buf[446 + 4] = 0xEE;                /* 保护性分区 */
+    buf[446 + 8] = 1;
+    buf[446 + 12] = 0xFF;
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+    memcpy(buf + 512, "EFI PART", 8);
+    put32(buf + 512 + 12, 92);
+    put64(buf + 512 + 24, 1);
+    put64(buf + 512 + 32, 2047);
+    put64(buf + 512 + 40, 34);
+    put64(buf + 512 + 48, 2013);
+    put64(buf + 512 + 72, 2);
+    put32(buf + 512 + 80, 4);
+    put32(buf + 512 + 84, 128);
+    buf[1024] = 0xAF;                   /* type GUID 首字节 */
+    put64(buf + 1024 + 32, 2048);
+    put64(buf + 1024 + 40, 4095);
+    buf[1024 + 56] = 'E';
+    buf[1024 + 58] = 'F';
+    buf[1024 + 60] = 'I';
+    check(mbr_info(buf, 1536, &mi) == 1, "MBR 解析");
+    check(mbr_part(buf, 1536, 0, &p) == 1 && p.type == 0xEE
+          && p.sectors == 0xFF, "保护性分区");
+    printf("   MBR：%d 个分区，GPT=%d\n", mi.nparts, mi.gpt);
+    check(mi.gpt == 1 && mi.nparts == 1, "识别 GPT");
+    check(gpt_info(buf, 1536, &g) == 1, "GPT 头解析");
+    printf("   GPT：表项 %u × %u 字节，可用 %llu..%llu\n", g.nentries,
+           g.entry_size, (unsigned long long)g.first_usable,
+           (unsigned long long)g.last_usable);
+    check(g.entries_lba == 2 && g.nentries == 4 && g.entry_size == 128,
+          "GPT 表项参数");
+    check(gpt_entry(buf, 1536, &g, 0, &e) == 1, "第 0 个 GPT 表项");
+    printf("   名字 \"%s\"（%d 字节），LBA %llu..%llu\n", e.name, e.name_len,
+           (unsigned long long)e.first_lba, (unsigned long long)e.last_lba);
+    check(e.name_len == 3 && memcmp(e.name, "EFI", 3) == 0, "表项名字");
+    check(e.first_lba == 2048 && e.last_lba == 4095, "表项范围");
+    check(gpt_entry(buf, 1536, &g, 2, &e) == 0, "空表项");
+}
+
+static void do_fat(void)
+{
+    static u8 buf[16384] = { 0 };
+    FatInfo fi = { 0 };
+    FatDir de = { 0 };
+    int off = 8192;
+
+    printf("== fat\n");
+    buf[0] = 0xEB;
+    memcpy(buf + 3, "MSDOS5.0", 8);
+    put16(buf + 11, 512);
+    buf[13] = 1;
+    put16(buf + 14, 1);
+    buf[16] = 2;
+    put16(buf + 17, 512);
+    put16(buf + 19, 32768);
+    buf[21] = 0xF8;
+    put16(buf + 22, 32);
+    memcpy(buf + 43, "DEMOVOL    ", 11);
+    check(fat_info(buf, (int)sizeof buf, &fi) == 1, "BPB 解析");
+    printf("   %d 字节/扇区，%d 扇区/簇，FAT%d，%u 个簇\n", fi.bytes_per_sector,
+           fi.sec_per_cluster, fi.fat_bits, fi.cluster_count);
+    check(fi.fat_bits == 16 && fi.data_start_sector == 97, "数据区起点");
+    check(fi.root_dir_bytes == 16384 && fi.nfats == 2, "根目录与 FAT 数");
+    /* 目录项：README.TXT，簇 7，42 字节 */
+    memcpy(buf + off, "README  TXT", 11);
+    buf[off + 11] = 0x20;
+    put16(buf + off + 26, 7);
+    put32(buf + off + 28, 42);
+    check(fat_dir_find(buf, (int)sizeof buf, off, 512, "readme.txt", &de) == 1,
+          "按名查找");
+    check(de.cluster == 7 && de.size == 42, "目录项字段");
+    printf("   找到 %.*s.%.*s，簇 %u，%u 字节\n", de.name.s.len,
+           de.name.s.data, de.ext.s.len, de.ext.s.data, de.cluster, de.size);
+    check(de.ext.s.len == 3 && de.name.s.len == 6, "8.3 名字拆分");
+}
+
+static void do_iso(void)
+{
+    static u8 buf[24 * 2048] = { 0 };
+    IsoVolume v = { 0 };
+    IsoEntry e = { 0 };
+    u8 *d = buf + 16 * 2048;
+    u8 *dir = buf + 20 * 2048;
+    int off = 0;
+
+    printf("== iso9660\n");
+    d[0] = 1;
+    memcpy(d + 1, "CD001", 5);
+    d[6] = 1;
+    memcpy(d + 40, "DEMOISO", 7);
+    put32(d + 80, 1000);
+    d[128] = 0;
+    d[129] = 8;
+    d[130] = 8;
+    d[131] = 0;                         /* 2048，双端序 */
+    dir[0] = 34;
+    put32(dir + 2, 20);
+    put32(dir + 10, 2048);
+    dir[25] = 2;
+    dir[32] = 1;
+    dir[33] = 0;
+    memcpy(d + 156, dir, 34);
+    check(iso_volume(buf, (int)sizeof buf, &v) == 1, "PVD 解析");
+    printf("   卷 \"%s\"，%d 字节块 × %u 块\n", v.volume_id, v.block_size,
+           v.volume_blocks);
+    check(v.block_size == 2048 && v.volume_blocks == 1000, "块大小与块数");
+    check(v.root_lba == 20 && v.root_size == 2048, "根目录记录");
+    /* 一条文件记录：HELLO.TXT;1，LBA 21，长度 33 */
+    off = 34;
+    {
+        int len = 33 + 13;
+
+        if ((13 & 1) == 0)
+            len++;
+        dir[off] = (u8)len;
+        put32(dir + off + 2, 21);
+        put32(dir + off + 10, 33);
+        dir[off + 32] = 13;
+        memcpy(dir + off + 33, "HELLO.TXT;1", 11);
+    }
+    check(iso_find(buf, (int)sizeof buf, 20, 2048, 2048, "HELLO.TXT", &e) == 1,
+          "按名查找");
+    printf("   找到 \"%s\"，LBA %u，%u 字节\n", e.name, e.lba, e.size);
+    check(e.name_len == 9 && e.lba == 21 && e.size == 33, "记录字段");
+    check(iso_record(buf, (int)sizeof buf, 20 * 2048, &e) == 1
+          && e.name[0] == '.', "根目录自身记录");
+}
+
+static void do_ext2(void)
+{
+    static u8 buf[32768] = { 0 };
+    Ext2Super sb = { 0 };
+    Ext2Group g = { 0 };
+    Ext2Inode in = { 0 };
+    u8 *s = buf + 1024;
+
+    printf("== ext2\n");
+    put32(s + 0, 256);
+    put32(s + 4, 8192);
+    put32(s + 20, 1);
+    put32(s + 24, 0);
+    put32(s + 32, 8192);
+    put32(s + 40, 128);
+    put16(s + 56, 0xEF53);
+    put16(s + 58, 1);
+    put32(s + 76, 1);
+    put16(s + 88, 128);
+    memcpy(s + 120, "DEMOFS", 6);
+    put32(buf + 2048 + 8, 10);          /* inode 表在块 10 */
+    put16(buf + 2048 + 16, 2);
+    put16(buf + 10240 + 128, 0x41ED);   /* 2 号 inode：根目录 */
+    put32(buf + 10240 + 128 + 4, 1024);
+    put16(buf + 10240 + 128 + 26, 2);
+    put32(buf + 10240 + 128 + 40, 12);
+    check(ext2_super(buf, (int)sizeof buf, &sb) == 1, "超级块解析");
+    printf("   卷 \"%s\"，%u 个 inode，%u 块 × %u 字节\n", sb.volume_name,
+           sb.inodes_count, sb.blocks_count, sb.block_size);
+    check(sb.inodes_count == 256 && sb.block_size == 1024, "超级块字段");
+    check(sb.inode_size == 128 && sb.blocks_per_group == 8192, "每组参数");
+    check(ext2_group(buf, (int)sizeof buf, &sb, 0, &g) == 1
+          && g.inode_table == 10, "块组描述符");
+    check(ext2_inode(buf, (int)sizeof buf, &sb, 2, &in) == 1, "根目录 inode");
+    printf("   根目录：模式 0x%04X，%u 字节，首块 %u\n", in.mode, in.size,
+           in.first_block);
+    check(in.mode == 0x41ED && in.size == 1024 && in.first_block == 12,
+          "inode 字段");
+    check(ext2_inode(buf, (int)sizeof buf, &sb, 0, &in) == -1, "0 号 inode 报错");
+}
+
+int main(void)
+{
+    do_mbr();
+    do_fat();
+    do_iso();
+    do_ext2();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
