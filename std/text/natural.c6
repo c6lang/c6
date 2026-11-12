@@ -1,0 +1,556 @@
+/* std/text/natural：自然排序比较与「人类可读」的数字格式化（零分配）。
+ *
+ *     import std.text.natural;
+ *
+ *     natural_cmp(S("file2"), S("file10"));      // -1（按数字段比较，不是字典序）
+ *     humanize_bytes(1536, out);                 // "1.5 KiB"
+ *     humanize_duration(3723000, out);           // "1h 2m 3s"
+ *     humanize_int(-1234567, out);               // "-1,234,567"
+ *
+ * 三块东西，都是命令行/日志/报表里最常见的「把数字给人看」：
+ *
+ * - **自然排序** `natural_cmp`：把连续数字当成一个整数比较，所以 `file2 < file10`；
+ *   数字段相等（`01` 和 `1`）时按剩余部分继续比，最后仍相等就返回 0（不区分写法）。
+ *   `natural_cmp_ci` 是 ASCII 大小写不敏感的版本。
+ * - **字节数**：`humanize_bytes` 用 1024 进制，单位 `B/KiB/MiB/GiB/TiB`，非 B 的
+ *   单位带 1 位小数（四舍五入）；`parse_bytes` 反向解析，接受同样的单位和可选的
+ *   空格、大小写，结果是字节数（四舍五入到整数）。
+ * - **时长**：`humanize_duration` 收毫秒，输出 `1h 2m 3s` / `850ms` / `0ms` 这种
+ *   最大单位优先的写法；`parse_duration` 反向解析（`1h30m`、`500ms`、`2s`、
+ *   `1h 2m 3s`；**裸数字按秒**）。
+ * - **整数千分位** `humanize_int`。
+ *
+ * 所有格式化函数都写调用方缓冲，返回字节数；放不下返回 -1 且**不写半截**。
+ */
+#include <string.h>
+
+module std.text.natural;
+import std.core.types;
+
+static int nat_is_digit(int c)
+{
+    return c >= '0' && c <= '9';
+}
+
+static int nat_fold(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
+static int nat_space(int c)
+{
+    return c == ' ' || c == '\t';
+}
+
+/* 数字段：返回连续数字的长度（0 表示不是数字开头） */
+static int nat_run(char[:] s, int i)
+{
+    int n = 0;
+
+    while (i + n < s.len && nat_is_digit((u8)s.data[i + n]))
+        n++;
+    return n;
+}
+
+/* 比较两段数字（去掉前导 0 后比长度，再逐位比） */
+static int nat_cmp_digits(char[:] a, int ao, int an, char[:] b, int bo, int bn)
+{
+    int az = ao, bz = bo;
+
+    while (az < ao + an && a.data[az] == '0')
+        az++;
+    while (bz < bo + bn && b.data[bz] == '0')
+        bz++;
+    if (ao + an - az != bo + bn - bz)
+        return (ao + an - az) < (bo + bn - bz) ? -1 : 1;
+    while (az < ao + an) {
+        if (a.data[az] != b.data[bz])
+            return (u8)a.data[az] < (u8)b.data[bz] ? -1 : 1;
+        az++;
+        bz++;
+    }
+    return 0;
+}
+
+static int nat_cmp(char[:] a, char[:] b, int ci)
+{
+    int i = 0, j = 0;
+
+    while (i < a.len && j < b.len) {
+        int ra = nat_run(a, i);
+        int rb = nat_run(b, j);
+
+        if (ra > 0 && rb > 0) {
+            int c = nat_cmp_digits(a, i, ra, b, j, rb);
+
+            if (c != 0)
+                return c;
+            i += ra;
+            j += rb;
+            continue;
+        }
+        {
+            int ca = (u8)a.data[i], cb = (u8)b.data[j];
+
+            if (ci) {
+                ca = nat_fold(ca);
+                cb = nat_fold(cb);
+            }
+            if (ca != cb)
+                return ca < cb ? -1 : 1;
+            i++;
+            j++;
+        }
+    }
+    if (i < a.len)
+        return 1;
+    if (j < b.len)
+        return -1;
+    return 0;
+}
+
+int natural_cmp(char[:] a, char[:] b)
+{
+    return nat_cmp(a, b, 0);
+}
+
+int natural_cmp_ci(char[:] a, char[:] b)
+{
+    return nat_cmp(a, b, 1);
+}
+
+/* ---- 数字 -> 文本 ---- */
+
+static int nat_utoa(u64 v, char *tmp)
+{
+    char rev[24] = { 0 };
+    int n = 0, i = 0;
+
+    if (v == 0u) {
+        tmp[0] = '0';
+        return 1;
+    }
+    while (v > 0u && n < 24) {
+        rev[n++] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    }
+    for (i = 0; i < n; i++)
+        tmp[i] = rev[n - 1 - i];
+    return n;
+}
+
+/* 只在够放的时候整段拷贝（放不下一个字节都不写） */
+static int nat_emit(char[:] out, const char *s, int n)
+{
+    if (n < 0 || n > out.len || (n > 0 && !out.data))
+        return -1;
+    if (n > 0)
+        memcpy(out.data, s, (usize)n);
+    return n;
+}
+
+int humanize_int(i64 n, char[:] out)
+{
+    char tmp[32] = { 0 };
+    char dig[24] = { 0 };
+    u64 mag = 0;
+    int nd = 0, i = 0, di = 0, neg = 0;
+
+    if (n < 0) {
+        neg = 1;
+        mag = (u64)0 - (u64)n;
+    } else {
+        mag = (u64)n;
+    }
+    nd = nat_utoa(mag, dig);
+    if (neg)
+        tmp[di++] = '-';
+    for (i = 0; i < nd; i++) {
+        if (i > 0 && (nd - i) % 3 == 0)
+            tmp[di++] = ',';
+        tmp[di++] = dig[i];
+    }
+    return nat_emit(out, tmp, di);
+}
+
+int humanize_bytes(u64 n, char[:] out)
+{
+    static const char *units[5] = { "B", "KiB", "MiB", "GiB", "TiB" };
+    char tmp[40] = { 0 };
+    int di = 0, u = 0;
+    u64 div = 1;
+
+    while (u < 4 && n / div >= 1024u) {
+        div *= 1024u;
+        u++;
+    }
+    if (u == 0) {
+        di = nat_utoa(n, tmp);
+        tmp[di++] = ' ';
+        tmp[di++] = 'B';
+        return nat_emit(out, tmp, di);
+    }
+    {
+        /* 一位小数：round(n * 10 / div) */
+        u64 tenths = 0;
+
+        if (n / div < 1024u)
+            tenths = (n * 10u + div / 2u) / div;
+        else
+            tenths = (n / div) * 10u;
+        if (tenths == 0u)
+            tenths = 1u;
+        di = nat_utoa(tenths / 10u, tmp);
+        tmp[di++] = '.';
+        tmp[di++] = (char)('0' + (int)(tenths % 10u));
+        tmp[di++] = ' ';
+        {
+            const char *un = units[u];
+            int k = 0;
+
+            while (un[k]) {
+                tmp[di++] = un[k];
+                k++;
+            }
+        }
+    }
+    return nat_emit(out, tmp, di);
+}
+
+/* 解析字节数：<数>[空格]<单位>，单位 B/KiB/MiB/GiB/TiB（大小写不敏感），
+ * 结果四舍五入到整数字节；失败返回 0 */
+int parse_bytes(char[:] s, u64 *out)
+{
+    int i = 0, len = s.len;
+    u64 whole = 0, frac = 0, tenths = 0;
+    int nfrac = 0, scale = 1, k = 0;
+    int unit = 0;                 /* 1024 的幂 */
+
+    if (!out)
+        return 0;
+    while (i < len && nat_space((u8)s.data[i]))
+        i++;
+    if (i >= len || !nat_is_digit((u8)s.data[i]))
+        return 0;
+    while (i < len && nat_is_digit((u8)s.data[i])) {
+        if (whole > (u64)1e17)
+            return 0;
+        whole = whole * 10u + (u64)(s.data[i] - '0');
+        i++;
+    }
+    if (i < len && s.data[i] == '.') {
+        i++;
+        while (i < len && nat_is_digit((u8)s.data[i])) {
+            if (nfrac >= 6)
+                return 0;
+            frac = frac * 10u + (u64)(s.data[i] - '0');
+            nfrac++;
+            i++;
+        }
+    }
+    for (k = 0; k < nfrac; k++)
+        scale *= 10;
+    while (i < len && nat_space((u8)s.data[i]))
+        i++;
+    /* 单位：B / KiB / KB / K / MiB / MB / M …（大小写不敏感） */
+    while (i < len && nat_space((u8)s.data[i]))
+        i++;
+    if (i < len) {
+        int c = nat_fold((u8)s.data[i]);
+        int k = -1;
+
+        if (c == 'b')
+            k = 0;
+        else if (c == 'k')
+            k = 1;
+        else if (c == 'm')
+            k = 2;
+        else if (c == 'g')
+            k = 3;
+        else if (c == 't')
+            k = 4;
+        if (k < 0)
+            return 0;
+        i++;
+        if (i < len && nat_fold((u8)s.data[i]) == 'i')
+            i++;
+        if (i < len && nat_fold((u8)s.data[i]) == 'b')
+            i++;
+        unit = k;
+    }
+    while (i < len && nat_space((u8)s.data[i]))
+        i++;
+    if (i != len)
+        return 0;
+    /* whole + frac/scale，再乘 1024^unit，四舍五入 */
+    tenths = whole;
+    for (k = 0; k < 6; k++)
+        tenths *= 10u;
+    if (scale > 0)
+        tenths += frac * (1000000u / (u64)scale);
+    {
+        u64 mul = 1, div = 1000000u;
+        int u = 0;
+
+        for (u = 0; u < unit; u++)
+            mul *= 1024u;
+        /* round(tenths * mul / div) */
+        if (tenths > 0 && mul > (u64)1e18 / tenths)
+            return 0;
+        *out = (tenths * mul + div / 2u) / div;
+    }
+    return 1;
+}
+
+int humanize_duration(i64 ms, char[:] out)
+{
+    char tmp[48] = { 0 };
+    int di = 0, neg = 0;
+    u64 v = 0;
+    u64 h = 0, m = 0, s = 0, r = 0;
+
+    if (ms < 0) {
+        neg = 1;
+        v = (u64)0 - (u64)ms;
+    } else {
+        v = (u64)ms;
+    }
+    if (neg)
+        tmp[di++] = '-';
+    h = v / 3600000u;
+    m = (v % 3600000u) / 60000u;
+    s = (v % 60000u) / 1000u;
+    r = v % 1000u;
+    if (h > 0u) {
+        di += nat_utoa(h, tmp + di);
+        tmp[di++] = 'h';
+        if (m > 0u || s > 0u) {
+            tmp[di++] = ' ';
+            di += nat_utoa(m, tmp + di);
+            tmp[di++] = 'm';
+        }
+        if (s > 0u) {
+            tmp[di++] = ' ';
+            di += nat_utoa(s, tmp + di);
+            tmp[di++] = 's';
+        }
+    } else if (m > 0u) {
+        di += nat_utoa(m, tmp + di);
+        tmp[di++] = 'm';
+        if (s > 0u) {
+            tmp[di++] = ' ';
+            di += nat_utoa(s, tmp + di);
+            tmp[di++] = 's';
+        }
+    } else if (s > 0u) {
+        di += nat_utoa(s, tmp + di);
+        tmp[di++] = 's';
+    } else {
+        di += nat_utoa(r, tmp + di);
+        tmp[di++] = 'm';
+        tmp[di++] = 's';
+    }
+    return nat_emit(out, tmp, di);
+}
+
+/* 解析时长：1h30m / 500ms / 2s / 1h 2m 3s；裸数字按秒；失败返回 0 */
+int parse_duration(char[:] s, i64 *out_ms)
+{
+    int i = 0, any = 0;
+    u64 total = 0;
+
+    if (!out_ms)
+        return 0;
+    while (i < s.len) {
+        u64 v = 0;
+        int digits = 0, mult = 1000;
+
+        while (i < s.len && nat_space((u8)s.data[i]))
+            i++;
+        while (i < s.len && nat_is_digit((u8)s.data[i])) {
+            if (v > (u64)1e15)
+                return 0;
+            v = v * 10u + (u64)(s.data[i] - '0');
+            i++;
+            digits++;
+        }
+        if (digits == 0)
+            return 0;
+        if (i < s.len && (nat_fold((u8)s.data[i]) == 'h')) {
+            mult = 3600000;
+            i++;
+        } else if (i < s.len && (nat_fold((u8)s.data[i]) == 'm')) {
+            i++;
+            if (i < s.len && (nat_fold((u8)s.data[i]) == 's')) {
+                mult = 1;
+                i++;
+            } else {
+                mult = 60000;
+            }
+        } else if (i < s.len && (nat_fold((u8)s.data[i]) == 's')) {
+            mult = 1000;
+            i++;
+        } else if (i < s.len && i == 0) {
+            return 0;
+        }
+        total += v * (u64)mult;
+        if (total > 9223372036854775807ULL)
+            return 0;
+        any = 1;
+    }
+    if (!any)
+        return 0;
+    *out_ms = (i64)total;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int nat_is_str(char[:] out, int n, const char *want)
+{
+    int wl = (int)strlen(want);
+
+    return n == wl && (wl == 0 || memcmp(out.data, want, (usize)wl) == 0);
+}
+
+test "自然排序" {
+    if (natural_cmp(S("file2"), S("file10")) >= 0)
+        return err(1, "file2 < file10");
+    if (natural_cmp(S("a1b2"), S("a1b10")) >= 0)
+        return err(2, "a1b2 < a1b10");
+    if (natural_cmp(S("a"), S("b")) >= 0 || natural_cmp(S("b"), S("a")) <= 0)
+        return err(3, "普通字典序");
+    if (natural_cmp(S("abc"), S("abc")) != 0)
+        return err(4, "相等");
+    if (natural_cmp(S("01"), S("1")) != 0)
+        return err(5, "前导 0 视为相等");
+    if (natural_cmp(S("x2"), S("x02")) != 0)
+        return err(6, "数字段相等");
+    if (natural_cmp(S("x2a"), S("x02b")) >= 0)
+        return err(7, "数字段相等后比剩余部分");
+    if (natural_cmp(S(""), S("a")) >= 0 || natural_cmp(S("a"), S("")) <= 0)
+        return err(8, "空串");
+    /* 大数字段不能溢出 */
+    if (natural_cmp(S("n99999999999999999999"), S("n99999999999999999998")) <= 0)
+        return err(9, "长数字段");
+    /* 大小写：默认敏感，ci 版本不敏感 */
+    if (natural_cmp(S("A"), S("a")) >= 0)
+        return err(10, "默认大小写敏感");
+    if (natural_cmp_ci(S("A"), S("a")) != 0 || natural_cmp_ci(S("Ab2"), S("aB10")) >= 0)
+        return err(11, "大小写不敏感");
+}
+
+test "字节数格式化与解析" {
+    char buf[32] = { 0 };
+    int n = 0;
+    u64 v = 0;
+
+    n = humanize_bytes(0, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "0 B"))
+        return err(12, "0 B");
+    n = humanize_bytes(512, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "512 B"))
+        return err(13, "512 B");
+    n = humanize_bytes(1023, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1023 B"))
+        return err(14, "1023 B");
+    n = humanize_bytes(1024, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1.0 KiB"))
+        return err(15, "1.0 KiB");
+    n = humanize_bytes(1536, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1.5 KiB"))
+        return err(16, "1.5 KiB");
+    n = humanize_bytes(1048576, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1.0 MiB"))
+        return err(17, "1.0 MiB");
+    n = humanize_bytes(1099511627776ULL, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1.0 TiB"))
+        return err(18, "1.0 TiB");
+    /* 解析 */
+    if (!parse_bytes(S("1.5 KiB"), &v) || v != 1536)
+        return err(19, "解析 1.5 KiB");
+    if (!parse_bytes(S("2MiB"), &v) || v != 2097152)
+        return err(20, "解析 2MiB");
+    if (!parse_bytes(S("512"), &v) || v != 512)
+        return err(21, "解析裸数字按字节");
+    if (!parse_bytes(S("1k"), &v) || v != 1024)
+        return err(22, "解析 1k");
+    if (!parse_bytes(S("  2 kb "), &v) || v != 2048)
+        return err(23, "空格与大小写");
+    if (parse_bytes(S("abc"), &v) || parse_bytes(S("1.2.3 KiB"), &v)
+        || parse_bytes(S("1 XiB"), &v))
+        return err(24, "非法字节数");
+    /* 放不下 */
+    {
+        char small[3] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 3; i++)
+            small[i] = 'Z';
+        if (humanize_bytes(1536, (char[:]){ small, 3 }) != -1)
+            return err(25, "放不下");
+        for (i = 0; i < 3; i++)
+            if (small[i] != 'Z')
+                return err(26, "放不下时写了半截");
+    }
+}
+
+test "时长与千分位" {
+    char buf[48] = { 0 };
+    int n = 0;
+    i64 ms = 0;
+
+    n = humanize_duration(0, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "0ms"))
+        return err(27, "0ms");
+    n = humanize_duration(850, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "850ms"))
+        return err(28, "850ms");
+    n = humanize_duration(1000, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1s"))
+        return err(29, "1s");
+    n = humanize_duration(90000, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1m 30s"))
+        return err(30, "1m 30s");
+    n = humanize_duration(3723000, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1h 2m 3s"))
+        return err(31, "1h 2m 3s");
+    n = humanize_duration(3600000, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1h"))
+        return err(32, "1h");
+    n = humanize_duration(-1500, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "-1s"))
+        return err(33, "-1s");
+    /* 解析 */
+    if (!parse_duration(S("1h30m"), &ms) || ms != 5400000)
+        return err(34, "1h30m");
+    if (!parse_duration(S("500ms"), &ms) || ms != 500)
+        return err(35, "500ms");
+    if (!parse_duration(S("2s"), &ms) || ms != 2000)
+        return err(36, "2s");
+    if (!parse_duration(S("1h 2m 3s"), &ms) || ms != 3723000)
+        return err(37, "带空格的时长");
+    if (!parse_duration(S("10"), &ms) || ms != 10000)
+        return err(38, "裸数字按秒");
+    if (parse_duration(S(""), &ms) || parse_duration(S("abc"), &ms)
+        || parse_duration(S("1x"), &ms))
+        return err(39, "非法时长");
+    /* 千分位 */
+    n = humanize_int(0, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "0"))
+        return err(40, "0");
+    n = humanize_int(1234, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "1,234"))
+        return err(41, "1,234");
+    n = humanize_int(-1234567, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "-1,234,567"))
+        return err(42, "-1,234,567");
+    n = humanize_int(999, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "999"))
+        return err(43, "999");
+    n = humanize_int(-9223372036854775807LL - 1, (char[:]){ buf, (int)sizeof buf });
+    if (!nat_is_str((char[:]){ buf, n }, n, "-9,223,372,036,854,775,808"))
+        return err(44, "I64_MIN");
+}

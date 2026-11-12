@@ -178,7 +178,7 @@ std/core/                   基础：定宽类型、错误码、内存、数学�
   std/core/rational.c6      std.core.rational      精确有理数 Rat（i64 分子/分母、自动约分）：rat_make/from_i64/parse、add/sub/mul/div/inv/neg/abs、cmp（连分数比较，不经过 double）、to_i64/to_f64、format（n/d）
   std/core/types.c6         std.core.types         定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
 
-std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、glob 与显示宽度
+std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、glob、显示宽度、表格与自然排序
   std/text/ascii.c6         std.text.ascii         ASCII 判别/大小写/忽略大小写比较（收 int，EOF 与负 char 安全）
   std/text/fmt.c6           std.text.fmt           定长格式化缓冲 Buf@(N)：write_int/u64/hex/hex64/bin/bool/ptr、write_pad（共用 digits_* 原语）
   std/text/num.c6           std.text.num           浮点格式化（固定/%e/%g）与解析（inf/nan、RANGE/PARSE 错误码）
@@ -190,6 +190,8 @@ std/text/                   文本：字符串视图与缓冲、格式化、UTF-
   std/text/semver.c6        std.text.semver        语义化版本 2.0.0：semver_parse、Semver 的 compare/is_prerelease/format（严格前导零与标识校验）
   std/text/utf16.c6         std.text.utf16         UTF-16 解码/编码/计数：代理对、BMP、非法代理与截断（零分配）
   std/text/ansi.c6          std.text.ansi          ANSI 转义构造器 Ansi：SGR/基础与 256 色/清屏/光标移动/隐藏光标
+  std/text/natural.c6       std.text.natural       自然排序与人类可读化：natural_cmp/natural_cmp_ci（数字段按整数比）、humanize_bytes/parse_bytes（KiB/MiB/GiB/TiB）、humanize_duration/parse_duration（1h 2m 3s / 500ms）、humanize_int（千分位）
+  std/text/table.c6         std.text.table         对齐表格：table_make、Table 的 border/sep/pad 与 render/table_len，TBL_LEFT/RIGHT/CENTER；列宽按显示列数（CJK 2 列）
   std/text/width.c6         std.text.width         终端显示宽度（Unicode 15.0）：text_width/checked、按列 text_prefix_len/fit/pad/clip
   std/text/regex.c6         std.text.regex         回溯式正则（UTF-8 按码点）：re_compile/flags、Regex 的 find/find_from/match_at/matches/full/find_all、Match 的 span/group；字符类、分组与分支、* + ? {m,n}（含懒惰）、\d\w\s\b、锚点
   std/text/diff.c6          std.text.diff          行级差异与 unified 输出：diff_make（Hirschberg 线性空间 LCS、工作区走 Arena）、Diff 的 write_script/write_unified/script_len/unified_len/op_at 与 added/removed/same
@@ -209,11 +211,13 @@ std/container/              容器与算法：向量、位集合、跨度、映�
   std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
   std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 
-std/os/                     操作系统：流、文件系统、路径、环境变量、时间
+std/os/                     操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程
   std/os/env.c6             std.os.env             环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
   std/os/fs.c6              std.os.fs              stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
   std/os/io.c6              std.os.io              Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代，方法调用写 pr->read_line(...)
   std/os/path.c6            std.os.path            POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
+  std/os/args.c6            std.os.args            命令行选项解析（零分配）：args_open + Args.next(specs, n, &arg)、ArgSpec（长名/短名/是否带值）、Arg 的 kind/spec/name/value/index；--name=value、--name value、-n value、-- 终止、未知选项/缺值报错
+  std/os/proc.c6            std.os.proc            子进程（POSIX）：proc_run/proc_spawn/proc_wait（ProcStatus 的 exited/exit_code/signaled/signal）、proc_run_sh（/bin/sh -c）、proc_which（PATH 查找）
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
 std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、SHA-256、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
@@ -279,6 +283,7 @@ make std-text    # 编译并运行 examples/stdtext.c6（第十二批文本算�
 make std-num     # 编译并运行 examples/stdnum.c6（第十三批数值类型模块的拼装示例）
 make std-pack    # 编译并运行 examples/stdpack.c6（第十四批压缩与文本编码模块的拼装示例）
 make std-conf    # 编译并运行 examples/stdconf.c6（第十五批配置与文档格式模块的拼装示例）
+make std-cli     # 编译并运行 examples/stdcli.c6（第十六批命令行工具基础模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

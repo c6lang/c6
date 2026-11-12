@@ -12767,6 +12767,10 @@ static const struct C6ErrStdSlot {
     { "std.data.xml",           C6_ERR_SLOT_STD + 70 },
     { "std.data.query",         C6_ERR_SLOT_STD + 71 },
     { "std.text.template",      C6_ERR_SLOT_STD + 72 },
+    { "std.os.args",            C6_ERR_SLOT_STD + 73 },
+    { "std.text.table",         C6_ERR_SLOT_STD + 74 },
+    { "std.text.natural",       C6_ERR_SLOT_STD + 75 },
+    { "std.os.proc",            C6_ERR_SLOT_STD + 76 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

@@ -1,0 +1,200 @@
+/* stdcli：标准库第十六批（args / table / natural / proc）的拼装示例。
+ *
+ * 和 stdform/stdtext/stdnum/stdpack/stdconf 一样：这个文件没有 `module`（入口
+ * `main` 只能写在模块外的文件里），四节各带自检，失败打 FAIL，最后按失败数
+ * 决定退出码。
+ *
+ * 四节讲的是一个命令行工具最常见的四件事：
+ *
+ *   - args：按规格表解析 `-v --port 8080 --name=x file1 file2`；
+ *   - natural：`file2 < file10` 的自然排序，以及字节/时长/千分位的人类可读化；
+ *   - table：把「文件名 + 大小」排成对齐的表格；
+ *   - proc：跑一个子进程看退出码，并在 PATH 里找 sh。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdcli \
+ *         examples/stdcli.c6 std/core/types.c6 std/text/str.c6 \
+ *         std/text/utf8.c6 std/text/width.c6 std/os/args.c6 \
+ *         std/text/table.c6 std/text/natural.c6 std/os/proc.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.table;
+import std.text.natural;
+import std.os.args;
+import std.os.proc;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* args：开关、带值选项、位置参数 */
+static void tour_args(void)
+{
+    char *argv[9] = { (char *)"tool", (char *)"-v", (char *)"--port",
+                      (char *)"8080", (char *)"--name=demo", (char *)"a.txt",
+                      (char *)"b.txt", (char *)"--", (char *)"-x" };
+    ArgSpec specs[3] = { { { S("--verbose") }, 'v', 0 },
+                         { { S("--port") }, 'p', 1 },
+                         { { S("--name") }, 'n', 1 } };
+    Args a = args_open(9, argv);
+    Arg arg = { 0 };
+    int flags = 0, values = 0, pos = 0;
+    int port = 0, name_ok = 0;
+
+    while (a.next(specs, 3, &arg) == 1) {
+        if (arg.kind == ARG_FLAG) {
+            flags++;
+        } else if (arg.kind == ARG_VALUE) {
+            values++;
+            if (arg.spec == 1) {
+                int k = 0;
+
+                port = 0;
+                for (k = 0; k < arg.value.s.len; k++)
+                    port = port * 10 + (arg.value.s.data[k] - '0');
+            } else if (arg.spec == 2) {
+                name_ok = (arg.value.s.len == 4
+                           && memcmp(arg.value.s.data, "demo", 4) == 0);
+            }
+        } else {
+            pos++;
+        }
+    }
+    printf("args: %d 个开关、%d 个选项、%d 个位置参数（port=%d）\n", flags,
+           values, pos, port);
+    check(a.err == 0, "args: 没有错误");
+    check(flags == 1 && values == 2 && pos == 3, "args: 事件计数");
+    check(port == 8080, "args: --port 的值");
+    check(name_ok, "args: --name=demo");
+    /* 未知选项 */
+    {
+        char *bad[2] = { (char *)"tool", (char *)"--zap" };
+        Args b = args_open(2, bad);
+
+        check(b.next(specs, 3, &arg) == -1 && b.err == ARG_EUNKNOWN,
+              "args: 未知选项");
+    }
+}
+
+/* natural：自然排序 + 人类可读化 */
+static void tour_natural(void)
+{
+    char *names[4] = { (char *)"file10", (char *)"file2", (char *)"file1",
+                       (char *)"file20" };
+    int order[4] = { 0, 1, 2, 3 };
+    char buf[48] = { 0 };
+    int i = 0, j = 0, n = 0;
+
+    /* 插入排序（用 natural_cmp） */
+    for (i = 1; i < 4; i++) {
+        int key = order[i];
+
+        j = i - 1;
+        while (j >= 0
+               && natural_cmp((char[:]){ names[order[j]], (int)strlen(names[order[j]]) },
+                              (char[:]){ names[key], (int)strlen(names[key]) })
+                      > 0) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+    printf("natural: %s < %s < %s < %s\n", names[order[0]], names[order[1]],
+           names[order[2]], names[order[3]]);
+    check(strcmp(names[order[0]], "file1") == 0
+              && strcmp(names[order[1]], "file2") == 0
+              && strcmp(names[order[2]], "file10") == 0
+              && strcmp(names[order[3]], "file20") == 0,
+          "natural: 排序");
+
+    n = humanize_bytes(1536, (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    printf("natural: 1536 字节 = %s\n", buf);
+    check(n > 0 && strcmp(buf, "1.5 KiB") == 0, "natural: 字节");
+    n = humanize_duration(3723000, (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    printf("natural: 3723000ms = %s\n", buf);
+    check(strcmp(buf, "1h 2m 3s") == 0, "natural: 时长");
+    n = humanize_int(1234567, (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    check(strcmp(buf, "1,234,567") == 0, "natural: 千分位");
+    check(natural_cmp(S("v1.9"), S("v1.10")) < 0, "natural: 版本号");
+}
+
+/* table：文件名 + 大小 */
+static void tour_table(void)
+{
+    char[:] head[2] = { S("file"), S("size") };
+    char[:] cells[8] = { { (char *)0, 0 } };
+    int align[2] = { TBL_LEFT, TBL_RIGHT };
+    char size1[32] = { 0 };
+    char size2[32] = { 0 };
+    char size3[32] = { 0 };
+    int n1 = 0, n2 = 0, n3 = 0, n = 0;
+    char out[512] = { 0 };
+    Table t = table_make(2);
+
+    n1 = humanize_bytes(1536, (char[:]){ size1, (int)sizeof size1 - 1 });
+    n2 = humanize_bytes(1048576, (char[:]){ size2, (int)sizeof size2 - 1 });
+    n3 = humanize_bytes(512, (char[:]){ size3, (int)sizeof size3 - 1 });
+    cells[0] = S("file1");
+    cells[1] = (char[:]){ size1, n1 };
+    cells[2] = S("file2");
+    cells[3] = (char[:]){ size2, n2 };
+    cells[4] = S("file10");
+    cells[5] = (char[:]){ size3, n3 };
+    n = t.render(head, cells, 3, align, (char[:]){ out, (int)sizeof out - 1 });
+    out[n > 0 ? n : 0] = 0;
+    printf("table:\n%s", out);
+    check(n > 0 && n == table_len(&t, head, cells, 3, align), "table: 长度一致");
+    check(strstr(out, "| file1  | 1.5 KiB |") != 0, "table: 第一行");
+    check(strstr(out, "| file10 |   512 B |") != 0, "table: 右对齐");
+}
+
+/* proc：子进程与 PATH 查找 */
+static void tour_proc(void)
+{
+    ProcStatus st = { 0, 0, 0, 0 };
+    char path[256] = { 0 };
+    int n = 0;
+
+    check(proc_run_sh(S("exit 5"), &st) && st.exited && st.exit_code == 5,
+          "proc: exit 5");
+    printf("proc: sh -c exit 5 -> exited=%d code=%d\n", st.exited,
+           st.exit_code);
+    check(proc_run_sh(S("kill -TERM $$"), &st) && st.signaled == 1,
+          "proc: 信号终止");
+    n = proc_which(S("sh"), (char[:]){ path, (int)sizeof path - 1 });
+    path[n > 0 ? n : 0] = 0;
+    printf("proc: which sh = %s\n", path);
+    check(n > 0 && strstr(path, "sh") != 0, "proc: which sh");
+    check(proc_which(S("definitely-not-a-command-xyz"),
+                     (char[:]){ path, (int)sizeof path }) == -1,
+          "proc: which 找不到");
+}
+
+int main(void)
+{
+    printf("stdcli: 标准库第十六批（args / table / natural / proc）\n");
+    tour_args();
+    tour_natural();
+    tour_table();
+    tour_proc();
+    printf("stdcli: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

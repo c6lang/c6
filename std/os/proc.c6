@@ -1,0 +1,275 @@
+/* std/os/proc：运行子进程（POSIX fork/exec/wait，零分配）。
+ *
+ *     import std.os.proc;
+ *
+ *     char *argv[4] = { (char *)"sh", (char *)"-c", (char *)"exit 7", (char *)0 };
+ *     ProcStatus st = { 0 };
+ *     if (proc_run(3, argv, &st) && st.exited)
+ *         printf("退出码 %d\n", st.exit_code);
+ *
+ * 这一层只做最常用的事：跑一个程序、等它结束、把退出状态拆开；以及「不等待」
+ * 的 `proc_spawn` + `proc_wait`。环境变量、PATH 查找（`proc_which`）和
+ * `/bin/sh -c` 的便捷入口（`proc_run_sh`）一起提供。
+ *
+ * 语义约定：
+ *
+ * - `proc_run`/`proc_run_sh` 返回 1 表示**子进程被完整地 wait 到了**（不管它
+ *   退出码是多少）；fork 失败或 wait 失败返回 0。看退出状态用 `ProcStatus`：
+ *   `exited` + `exit_code`，或 `signaled` + `signal`。
+ * - 命令找不到时子进程按 shell 惯例 `_exit(127)`，所以你会看到 `exited` 且
+ *   `exit_code == 127`（不是本函数失败）。
+ * - `proc_run_sh` 的命令串要能放进 4KB 的栈缓冲，超了返回 0（不做堆分配）。
+ * - `proc_which` 找可执行文件：名字里带 `/` 就直接检查它，否则按 `PATH` 逐个
+ *   试；找到把路径写调用方缓冲，返回字节数；没找到/放不下返回 -1。
+ * - 不做：重定向、管道、超时、`SIGCHLD` 处理、Windows（这一层就是 POSIX）。
+ */
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+module std.os.proc;
+import std.core.types;
+
+enum ProcLimits {
+    PROC_CMD_MAX = 4096,
+    PROC_PATH_MAX = 1024,
+};
+
+struct ProcStatus {
+    int exited;              /* 1 = 正常退出 */
+    int exit_code;           /* exited 时的退出码（0..255） */
+    int signaled;            /* 1 = 被信号终止 */
+    int signal;              /* signaled 时的信号编号 */
+};
+
+/* 把 waitpid 的原始状态拆开 */
+static void proc_from_raw(int raw, ProcStatus *st)
+{
+    ProcStatus s = { 0, 0, 0, 0 };
+
+    if (WIFEXITED(raw)) {
+        s.exited = 1;
+        s.exit_code = WEXITSTATUS(raw);
+    }
+    if (WIFSIGNALED(raw)) {
+        s.signaled = 1;
+        s.signal = WTERMSIG(raw);
+    }
+    *st = s;
+}
+
+/* fork + execvp（不等待）；成功返回 1，失败 0 */
+int proc_spawn(int argc, char **argv, int *pid)
+{
+    pid_t p = 0;
+
+    if (!argv || !pid || argc <= 0)
+        return 0;
+    p = fork();
+    if (p < 0)
+        return 0;
+    if (p == 0) {
+        execvp(argv[0], argv);
+        _exit(127);                 /* exec 失败：按 shell 惯例 */
+    }
+    *pid = (int)p;
+    return 1;
+}
+
+/* 等待一个 pid；成功返回 1 */
+int proc_wait(int pid, ProcStatus *st)
+{
+    int raw = 0;
+    pid_t r = 0;
+
+    if (!st || pid <= 0)
+        return 0;
+    do {
+        r = waitpid((pid_t)pid, &raw, 0);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0)
+        return 0;
+    proc_from_raw(raw, st);
+    return 1;
+}
+
+/* 运行并等待；成功返回 1（退出状态在 *st） */
+int proc_run(int argc, char **argv, ProcStatus *st)
+{
+    int pid = 0;
+
+    if (!st)
+        return 0;
+    if (!proc_spawn(argc, argv, &pid))
+        return 0;
+    return proc_wait(pid, st);
+}
+
+/* 用 /bin/sh -c 跑一条命令（命令串最长 PROC_CMD_MAX-1） */
+int proc_run_sh(char[:] cmd, ProcStatus *st)
+{
+    char buf[PROC_CMD_MAX] = { 0 };
+    char *argv[4] = { 0 };
+
+    if (!st || cmd.len >= PROC_CMD_MAX)
+        return 0;
+    if (cmd.len > 0)
+        memcpy(buf, cmd.data, (usize)cmd.len);
+    buf[cmd.len] = 0;
+    argv[0] = (char *)"/bin/sh";
+    argv[1] = (char *)"-c";
+    argv[2] = buf;
+    argv[3] = (char *)0;
+    return proc_run(3, argv, st);
+}
+
+/* char[:] -> 栈上的 NUL 结尾拷贝；放不下返回 0 */
+static int proc_cstr(char[:] s, char *buf, int cap)
+{
+    if (s.len < 0 || s.len >= cap)
+        return 0;
+    if (s.len > 0)
+        memcpy(buf, s.data, (usize)s.len);
+    buf[s.len] = 0;
+    return 1;
+}
+
+/* 在 PATH 里找可执行文件；找到把路径写进 out，返回字节数，否则 -1 */
+int proc_which(char[:] name, char[:] out)
+{
+    char nm[PROC_PATH_MAX] = { 0 };
+    char cand[PROC_PATH_MAX] = { 0 };
+    const char *env = 0;
+    int i = 0;
+
+    if (!name.len || !proc_cstr(name, nm, PROC_PATH_MAX))
+        return -1;
+    if (memchr(nm, '/', (usize)name.len)) {
+        if (access(nm, X_OK) != 0)
+            return -1;
+        if (name.len > out.len)
+            return -1;
+        memcpy(out.data, nm, (usize)name.len);
+        return name.len;
+    }
+    env = getenv("PATH");
+    if (!env)
+        env = "/usr/local/bin:/usr/bin:/bin";
+    while (env[0]) {
+        int plen = 0;
+
+        while (env[plen] && env[plen] != ':')
+            plen++;
+        if (plen == 0) {
+            /* 空段表示当前目录（POSIX 语义） */
+            cand[0] = '.';
+            cand[1] = '/';
+            i = 2;
+        } else {
+            if (plen >= PROC_PATH_MAX - 1 - name.len)
+                return -1;
+            memcpy(cand, env, (usize)plen);
+            i = plen;
+            cand[i++] = '/';
+        }
+        if (i + name.len >= PROC_PATH_MAX)
+            return -1;
+        memcpy(cand + i, nm, (usize)name.len);
+        i += name.len;
+        cand[i] = 0;
+        if (access(cand, X_OK) == 0) {
+            if (i > out.len)
+                return -1;
+            memcpy(out.data, cand, (usize)i);
+            return i;
+        }
+        env += plen;
+        if (env[0] == ':')
+            env++;
+    }
+    return -1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "运行命令与退出码" {
+    char *t[2] = { (char *)"/bin/true", (char *)0 };
+    char *f[2] = { (char *)"/bin/false", (char *)0 };
+    char *sh[4] = { (char *)"/bin/sh", (char *)"-c", (char *)"exit 7",
+                    (char *)0 };
+    char *nope[2] = { (char *)"/nonexistent-xyz-42", (char *)0 };
+    ProcStatus st = { 0, 0, 0, 0 };
+
+    if (!proc_run(1, t, &st) || !st.exited || st.exit_code != 0)
+        return err(1, "/bin/true");
+    if (!proc_run(1, f, &st) || !st.exited || st.exit_code != 1)
+        return err(2, "/bin/false");
+    if (!proc_run(3, sh, &st) || !st.exited || st.exit_code != 7)
+        return err(3, "sh -c exit 7");
+    /* exec 失败按 127 退出 */
+    if (!proc_run(1, nope, &st) || !st.exited || st.exit_code != 127)
+        return err(4, "命令找不到");
+    /* 参数错误 */
+    if (proc_run(0, t, &st) || proc_run(1, (char **)0, &st)
+        || proc_run(1, t, (ProcStatus *)0))
+        return err(5, "参数错误");
+}
+
+test "信号、spawn 与 sh" {
+    char *term[4] = { (char *)"/bin/sh", (char *)"-c",
+                      (char *)"kill -TERM $$", (char *)0 };
+    char *sleepy[4] = { (char *)"/bin/sh", (char *)"-c", (char *)"exit 9",
+                        (char *)0 };
+    ProcStatus st = { 0, 0, 0, 0 };
+    int pid = 0;
+
+    if (!proc_run(3, term, &st) || !st.signaled || st.signal != 15)
+        return err(6, "SIGTERM");
+    /* spawn + wait */
+    if (!proc_spawn(3, sleepy, &pid) || pid <= 0)
+        return err(7, "spawn");
+    if (!proc_wait(pid, &st) || !st.exited || st.exit_code != 9)
+        return err(8, "wait");
+    if (proc_wait(0, &st) || proc_spawn(0, sleepy, &pid))
+        return err(9, "wait/spawn 参数错误");
+    /* sh 便捷入口 */
+    if (!proc_run_sh(S("exit 3"), &st) || !st.exited || st.exit_code != 3)
+        return err(10, "proc_run_sh");
+    if (!proc_run_sh(S("printf ok >/dev/null"), &st) || !st.exited
+        || st.exit_code != 0)
+        return err(11, "sh 里的重定向");
+    if (proc_run_sh(S(""), &st) != 1)
+        return err(12, "空命令");
+}
+
+test "在 PATH 里找程序" {
+    char buf[1024] = { 0 };
+    int n = 0;
+
+    n = proc_which(S("sh"), (char[:]){ buf, (int)sizeof buf });
+    if (n <= 0 || buf[n - 3] != '/' || buf[n - 2] != 's' || buf[n - 1] != 'h')
+        return err(13, "which sh");
+    n = proc_which(S("/bin/sh"), (char[:]){ buf, (int)sizeof buf });
+    if (n != 7 || memcmp(buf, "/bin/sh", 7) != 0)
+        return err(14, "which 绝对路径");
+    if (proc_which(S("definitely-not-a-command-xyz"),
+                   (char[:]){ buf, (int)sizeof buf }) != -1)
+        return err(15, "which 找不到");
+    if (proc_which(S("/nonexistent-xyz-42"), (char[:]){ buf, (int)sizeof buf }) != -1)
+        return err(16, "which 绝对路径不存在");
+    /* 放不下 */
+    if (proc_which(S("sh"), (char[:]){ buf, 4 }) != -1)
+        return err(17, "which 放不下");
+    /* 名字太长 */
+    {
+        char big[1200] = { 0 };
+
+        if (proc_which((char[:]){ big, 1100 },
+                       (char[:]){ buf, (int)sizeof buf }) != -1)
+            return err(18, "名字太长");
+    }
+}
