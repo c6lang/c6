@@ -1,0 +1,416 @@
+/* std/data/hdr：Radiance RGBE 图像（`.hdr` / `.pic`）。
+ *
+ *     import std.data.hdr;
+ *
+ *     HdrInfo info = { 0 };
+ *     if (hdr_info(buf, n, &info) == 1) {
+ *         // 调用方按 width*height*4 准备 rgbe 缓冲
+ *         hdr_decode(buf, n, rgbe, cap);
+ *         // 需要普通 RGB 时再转一次
+ *         hdr_to_rgb(rgbe, info.width * info.height, rgb, 1.0);
+ *     }
+ *
+ * 支持：`#?RADIANCE` / `#?RGBE` 头、`FORMAT=32-bit_rle_rgbe`、分辨率行
+ * `-Y h +X w`（也接受 `+Y`/`-X`，但只按绝对值取尺寸）；扫描线的新式 RLE
+ * （`2 2 hi lo` 之后四个通道各自 RLE）与老式平铺（直接 `w*4` 字节）。
+ *
+ * 约定：
+ *
+ * - `hdr_decode` 输出的每个像素 4 字节 `R G B E`，是**原始** RGBE，不做色调映射；
+ * - `hdr_to_rgb` 做 `(R,G,B) * 2^(E-128) * exposure` 再夹到 0~255，用来快速看
+ *   一眼，真正渲染请自己做色调映射；
+ * - 老式的「重复上一像素」标记（`1 1 1 count`）不处理（只在很老的软件里出现）；
+ * - 头里的 `EXPOSURE=` / `GAMMA=` 不参与计算（要的话自己乘到 exposure 上）。
+ */
+#include <math.h>
+#include <string.h>
+
+module std.data.hdr;
+import std.core.types;
+import std.text.str;
+
+struct HdrInfo {
+    int width;
+    int height;
+    int has_rle;
+    int data_off;
+};
+
+static int hdr_line(const u8 *p, int n, int *pos, char *out, int cap)
+{
+    int start = *pos, len = 0;
+
+    while (*pos < n && p[*pos] != '\n')
+        (*pos)++;
+    len = *pos - start;
+    if (*pos < n)
+        (*pos)++;
+    if (len > 0 && p[start + len - 1] == '\r')
+        len--;
+    if (len >= cap)
+        len = cap - 1;
+    memcpy(out, p + start, (size_t)len);
+    out[len] = 0;
+    return len;
+}
+
+static int hdr_parse_size(const char *line, int *w, int *h)
+{
+    /* 形如 "-Y 8 +X 16"：按空白切四段，-Y/+Y 是高度，±X 是宽度 */
+    char a[8] = { 0 }, c[8] = { 0 };
+    int hi = 0, wi = 0, i = 0, j = 0;
+
+    while (line[i] == ' ')
+        i++;
+    for (j = 0; line[i] && line[i] != ' ' && j < 7; i++)
+        a[j++] = line[i];
+    a[j] = 0;
+    while (line[i] == ' ')
+        i++;
+    hi = 0;
+    while (line[i] >= '0' && line[i] <= '9') {
+        hi = hi * 10 + (line[i] - '0');
+        i++;
+    }
+    while (line[i] == ' ')
+        i++;
+    j = 0;
+    for (; line[i] && line[i] != ' ' && j < 7; i++)
+        c[j++] = line[i];
+    c[j] = 0;
+    while (line[i] == ' ')
+        i++;
+    wi = 0;
+    while (line[i] >= '0' && line[i] <= '9') {
+        wi = wi * 10 + (line[i] - '0');
+        i++;
+    }
+    if (a[0] != '-' && a[0] != '+')
+        return -1;
+    if (c[0] != '-' && c[0] != '+')
+        return -1;
+    if (a[1] != 'Y' && a[1] != 'X')
+        return -1;
+    if (c[1] != 'X' && c[1] != 'Y')
+        return -1;
+    if (a[1] == 'Y') {
+        *h = hi;
+        *w = wi;
+    } else {
+        *w = hi;
+        *h = wi;
+    }
+    if (*w <= 0 || *h <= 0)
+        return -1;
+    return 1;
+}
+
+int hdr_info(const void *src, int n, HdrInfo *out)
+{
+    const u8 *p = (const u8 *)src;
+    int pos = 0, saw_format = 0;
+    char line[256] = { 0 };
+
+    if (!src || !out || n < 32)
+        return -1;
+    hdr_line(p, n, &pos, line, (int)sizeof line);
+    if (strncmp(line, "#?RADIANCE", 10) != 0 && strncmp(line, "#?RGBE", 6) != 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    for (;;) {
+        if (hdr_line(p, n, &pos, line, (int)sizeof line) <= 0) {
+            if (pos >= n)
+                return -1;
+            continue;                   /* 空行：头结束 */
+        }
+        if (strncmp(line, "FORMAT=", 7) == 0) {
+            if (strstr(line, "32-bit_rle_rgbe") == 0)
+                return -1;
+            saw_format = 1;
+            continue;
+        }
+        if (strncmp(line, "EXPOSURE=", 9) == 0
+            || strncmp(line, "GAMMA=", 6) == 0
+            || strncmp(line, "PRIMARIES=", 10) == 0
+            || strncmp(line, "COLORCORR=", 10) == 0
+            || strncmp(line, "SOFTWARE=", 9) == 0
+            || strncmp(line, "VIEW=", 5) == 0
+            || line[0] == '#')
+            continue;
+        if (line[0] == '-' || line[0] == '+')
+            break;
+        return -1;                      /* 认不出的头字段 */
+    }
+    if (!saw_format)
+        return -1;
+    if (hdr_parse_size(line, &out->width, &out->height) != 1)
+        return -1;
+    out->data_off = pos;
+    out->has_rle = 0;
+    if (pos + 4 <= n && p[pos] == 2 && p[pos + 1] == 2
+        && (((int)p[pos + 2] << 8) | p[pos + 3]) == out->width)
+        out->has_rle = 1;
+    return 1;
+}
+
+/* 解一条通道的 RLE，返回写入字节数 / -1 */
+static int hdr_rle_channel(const u8 *p, int n, int *pos, u8 *dst, int count)
+{
+    int got = 0;
+
+    while (got < count) {
+        int c = 0;
+
+        if (*pos >= n)
+            return -1;
+        c = p[*pos];
+        (*pos)++;
+        if (c > 128) {
+            int run = c - 128, i = 0, v = 0;
+
+            if (*pos >= n)
+                return -1;
+            v = p[*pos];
+            (*pos)++;
+            if (run > count - got)
+                return -1;
+            for (i = 0; i < run; i++)
+                dst[got++] = (u8)v;
+        } else {
+            if (c == 0 || c > count - got || *pos + c > n)
+                return -1;
+            memcpy(dst + got, p + *pos, (size_t)c);
+            got += c;
+            *pos += c;
+        }
+    }
+    return got;
+}
+
+int hdr_decode(const void *src, int n, void *dst, int cap)
+{
+    const u8 *p = (const u8 *)src;
+    u8 *out = (u8 *)dst;
+    HdrInfo info = { 0 };
+    int pos = 0, y = 0, need = 0;
+
+    if (!src || !dst)
+        return -1;
+    if (hdr_info(src, n, &info) != 1)
+        return -1;
+    need = info.width * info.height * 4;
+    if (cap < need)
+        return -1;
+    pos = info.data_off;
+    for (y = 0; y < info.height; y++) {
+        u8 *row = out + y * info.width * 4;
+        int wide = 0;
+
+        if (pos + 4 <= n && p[pos] == 2 && p[pos + 1] == 2
+            && (((int)p[pos + 2] << 8) | p[pos + 3]) == info.width) {
+            u8 chan[4][4096] = { { 0 } };
+            int c = 0;
+
+            pos += 4;
+            if (info.width > 4096)
+                return -1;
+            for (c = 0; c < 4; c++)
+                if (hdr_rle_channel(p, n, &pos, chan[c], info.width) != info.width)
+                    return -1;
+            for (c = 0; c < info.width; c++) {
+                int k = 0;
+
+                for (k = 0; k < 4; k++)
+                    row[c * 4 + k] = chan[k][c];
+            }
+            wide = 1;
+        }
+        if (!wide) {
+            /* 老式平铺；顺带把「重复上一像素」标记换成实像素
+               （有标记时一行比 width*4 短，所以这里不能预先卡长度） */
+            {
+                int c = 0;
+
+                while (c < info.width) {
+                    u8 px[4] = { 0 };
+
+                    if (pos + 4 > n)
+                        return -1;
+                    memcpy(px, p + pos, 4);
+                    pos += 4;
+                    if (px[0] == 1 && px[1] == 1 && px[2] == 1) {
+                        int run = px[3], i = 0;
+
+                        if (c == 0 || run <= 0 || c + run > info.width)
+                            return -1;
+                        for (i = 0; i < run; i++) {
+                            memcpy(row + (c + i) * 4, row + (c - 1) * 4, 4);
+                        }
+                        c += run;
+                        continue;
+                    }
+                    memcpy(row + c * 4, px, 4);
+                    c++;
+                }
+            }
+        }
+    }
+    return need;
+}
+
+int hdr_to_rgb(const void *src, int npx, void *dst, double exposure)
+{
+    const u8 *p = (const u8 *)src;
+    u8 *out = (u8 *)dst;
+    int i = 0;
+
+    if (!src || !dst || npx < 0)
+        return -1;
+    if (exposure <= 0)
+        exposure = 1.0;
+    for (i = 0; i < npx; i++) {
+        double f = 0;
+        int k = 0;
+
+        if (p[i * 4 + 3] == 0) {
+            out[i * 3] = 0;
+            out[i * 3 + 1] = 0;
+            out[i * 3 + 2] = 0;
+            continue;
+        }
+        f = ldexp(1.0, (int)p[i * 4 + 3] - 128) * exposure;
+        for (k = 0; k < 3; k++) {
+            double v = (double)p[i * 4 + k] * f;
+
+            if (v < 0)
+                v = 0;
+            if (v > 255)
+                v = 255;
+            out[i * 3 + k] = (u8)(v + 0.5);
+        }
+    }
+    return npx;
+}
+
+/* ---- 自测 ---- */
+
+static int mk_hdr_flat(char *buf)
+{
+    int off = 0;
+
+    memset(buf, 0, 512);
+    off += (int)strlen("#?RADIANCE\n");
+    memcpy(buf, "#?RADIANCE\n", (size_t)off);
+    memcpy(buf + off, "FORMAT=32-bit_rle_rgbe\n", 23);
+    off += 23;
+    buf[off++] = '\n';
+    memcpy(buf + off, "-Y 2 +X 2\n", 10);
+    off += 10;
+    /* 四个像素：两个有效、一个 E=0、一个高亮 */
+    {
+        u8 px[16] = { 128, 64, 32, 129, 1, 2, 3, 128, 0, 0, 0, 0, 255, 255, 255, 140 };
+        int i = 0;
+
+        for (i = 0; i < 16; i++)
+            buf[off++] = (char)px[i];
+    }
+    return off;
+}
+
+test "hdr：老式平铺与 RGB 转换" {
+    static char buf[512] = { 0 };
+    static u8 rgbe[16] = { 0 };
+    static u8 rgb[12] = { 0 };
+    HdrInfo info = { 0 };
+    int n = mk_hdr_flat(buf);
+
+    if (hdr_info(buf, n, &info) != 1)
+        return err(1, "头解析失败");
+    if (info.width != 2 || info.height != 2 || info.has_rle != 0)
+        return err(2, "尺寸或 RLE 标记不对");
+    if (hdr_decode(buf, n, rgbe, (int)sizeof rgbe) != 16)
+        return err(3, "解码长度不对");
+    if (rgbe[0] != 128 || rgbe[1] != 64 || rgbe[2] != 32 || rgbe[3] != 129)
+        return err(4, "第一个像素不对");
+    if (rgbe[11] != 0)
+        return err(5, "第三个像素 E 应该是 0");
+    if (hdr_to_rgb(rgbe, 4, rgb, 1.0) != 4)
+        return err(6, "转 RGB 失败");
+    /* 第一个像素：128*2^(129-128)=256 夹到 255，64*2=128，32*2=64 */
+    if (rgb[0] != 255 || rgb[1] != 128 || rgb[2] != 64)
+        return err(7, "RGB 转换不对");
+    if (rgb[6] != 0 || rgb[7] != 0 || rgb[8] != 0)
+        return err(8, "E=0 应该是黑");
+    if (rgb[9] != 255 || rgb[10] != 255 || rgb[11] != 255)
+        return err(9, "高亮应该夹到 255");
+    if (hdr_to_rgb(rgbe, 4, rgb, 0.5) != 4 || rgb[0] != 128)
+        return err(10, "exposure 0.5 不对");
+}
+
+test "hdr：新式 RLE、重复标记与坏数据" {
+    static char buf[1024] = { 0 };
+    static u8 rgbe[64] = { 0 };
+    HdrInfo info = { 0 };
+    int off = 0;
+
+    /* 1x8 宽的新式 RLE：四个通道都是「字面量 4 + 字面量 4」 */
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, "#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 8\n", 41);
+    off = 41;
+    buf[off++] = 2;
+    buf[off++] = 2;
+    buf[off++] = 0;
+    buf[off++] = 8;
+    {
+        int c = 0;
+        int i = 0;
+
+        for (c = 0; c < 4; c++) {
+            buf[off++] = 4;
+            for (i = 0; i < 4; i++)
+                buf[off++] = (char)(10 + i + c);
+            buf[off++] = 4;
+            for (i = 0; i < 4; i++)
+                buf[off++] = (char)(20 + i + c);
+        }
+    }
+    if (hdr_info(buf, off, &info) != 1)
+        return err(11, "RLE 头解析失败");
+    if (info.width != 8 || info.height != 1 || info.has_rle != 1)
+        return err(12, "RLE 尺寸不对");
+    if (hdr_decode(buf, off, rgbe, (int)sizeof rgbe) != 32)
+        return err(13, "RLE 解码长度不对");
+    if (rgbe[0] != 10 || rgbe[1] != 11 || rgbe[2] != 12 || rgbe[3] != 13)
+        return err(14, "RLE 第一个像素不对");
+    if (rgbe[16] != 20 || rgbe[19] != 23)
+        return err(15, "RLE 第五个像素不对");
+    /* 老式重复标记：1 1 1 3 → 复制上一个像素三次 */
+    {
+        static char flat[256] = { 0 };
+        int n = 0;
+
+        memcpy(flat, "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 4\n", 45);
+        n = 45;
+        flat[n++] = 10;
+        flat[n++] = 20;
+        flat[n++] = 30;
+        flat[n++] = 128;
+        flat[n++] = 1;
+        flat[n++] = 1;
+        flat[n++] = 1;
+        flat[n++] = 3;
+        if (hdr_decode(flat, n, rgbe, (int)sizeof rgbe) != 16)
+            return err(16, "重复标记解码失败");
+        if (rgbe[4] != 10 || rgbe[8] != 10 || rgbe[12] != 10 || rgbe[15] != 128)
+            return err(17, "重复标记展开不对");
+    }
+    /* 坏数据 */
+    if (hdr_info("not a hdr file at all, just text", 32, &info) != -1)
+        return err(18, "魔数不对应该 -1");
+    if (hdr_info(buf, 10, &info) != -1)
+        return err(19, "太短应该 -1");
+    if (hdr_decode(buf, off, rgbe, 4) != -1)
+        return err(20, "缓冲区不够应该 -1");
+    if (hdr_info(buf, off, 0) != -1)
+        return err(21, "空指针应该 -1");
+}

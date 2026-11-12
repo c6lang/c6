@@ -1498,6 +1498,32 @@ libc 薄封装，重点在把 errno 变成明确的 1/0/-1 语义、把结构体
 验收：`make stdtest`（165 个模块、0 failure）、`make std-hash`（17 条自检全过）、
 `make check-all`。
 
+### 11.51 标准库第三十九批（pcx / hdr / xbm / xpm）
+
+第三十九批收四种「老图形格式」：PCX、Radiance RGBE、XBM、XPM。它们都不大，
+但各有各的历史包袱，正好把「读头 + 解 RLE + 位序/调色板」这类细节吃一遍。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.pcx` | PCX | 128 字节头；RLE 只看 `0xC0` 掩码；每行按 `bytes_per_line`（含填充）读、按 width 用；8 位单平面优先用文件末尾的 `0x0C`+768 字节 VGA 调色板，没有才退回头里 16 色 |
+| `std.data.hdr` | Radiance RGBE | 头字段白名单（`FORMAT`/`EXPOSURE`/`GAMMA`…），分辨率行 `±Y h ±X w` 只取绝对值；扫描线「新式 RLE」靠 `2 2 hi lo` 自识别；老式平铺里的 `1 1 1 count` 重复标记要展开，所以**不能**预先按 `w*4` 卡行长度 |
+| `std.data.xbm` | XBM | 尺寸来自 `#define *_width` / `*_height`；花括号里的数值十进制/十六进制都收；位序按 X11（每字节低位在左） |
+| `std.data.xpm` | XPM | 第一个字符串是 `w h ncolors cpp`；颜色行按 cpp 字节键 + `c` + 颜色；像素行长度必须等于 `w*cpp`；16 位色取高字节 |
+
+坑记两个：PCX 的尺寸是 `xmax-xmin+1`，所以「1 像素高」是 `ymax==ymin`——判非法
+得用 `xmax < xmin` 而不是 `<=`；HDR 的老式行可能比 `w*4` 短，提前按长度卡会把
+带重复标记的合法文件判坏。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.pcx`=0x60a5、
+`std.data.hdr`=0x60a6、`std.data.xbm`=0x60a7、`std.data.xpm`=0x60a8；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-legacy` 与 `STD_LEGACY_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。示例
+`examples/stdlegacy.c6` 四节（24 条自检）。
+
+验收：`make stdtest`（169 个模块、0 failure）、`make std-legacy`（24 条自检全过）、
+`make check-all`。
+
+
 
 
 

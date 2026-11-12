@@ -12870,6 +12870,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.blake2s",   C6_ERR_SLOT_STD + 162 },
     { "std.encoding.crc32c",    C6_ERR_SLOT_STD + 163 },
     { "std.encoding.xxhash",    C6_ERR_SLOT_STD + 164 },
+    { "std.data.pcx",           C6_ERR_SLOT_STD + 165 },
+    { "std.data.hdr",           C6_ERR_SLOT_STD + 166 },
+    { "std.data.xbm",           C6_ERR_SLOT_STD + 167 },
+    { "std.data.xpm",           C6_ERR_SLOT_STD + 168 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

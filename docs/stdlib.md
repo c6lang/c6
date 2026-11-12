@@ -195,7 +195,11 @@
 | `std/data/bmp.c6` | `std.data.bmp` | Windows BMP 解码（零分配）：`bmp_parse` 读 BITMAPINFOHEADER（也接受 V4/V5 头的前 40 字节）、24/32 位真彩与 8 位调色板、自下而上/自上而下、行 4 字节对齐；`bmp_decode` 输出 RGBA8888，压缩方式非 0/16 位/越界一律拒绝 |
 | `std/data/tga.c6` | `std.data.tga` | TGA 解码（零分配）：类型 2（未压缩）/10（RLE）真彩、24/32 位、四种原点（`top_origin`/`right_origin`）；`tga_decode` 把 BGR(A) 换回 RGBA8888，RLE 包可跨行，包越界/截断返回 -1 |
 | `std/data/qoi.c6` | `std.data.qoi` | QOI 解码与编码（零分配）：`qoi_decode` 支持 INDEX/DIFF/LUMA/RUN/RGB/RGBA 全套操作码并校验头与结束标记；`qoi_encode` 发 RUN/INDEX/RGB/RGBA 四种操作码（不生成 DIFF/LUMA，流合法但略大）；输出都是 RGBA8888 |
-| `std/data/pnm.c6` | `std.data.pnm` | Netpbm P5/P6 解码（零分配）：`pnm_parse` 支持注释、maxval 1..65535、8/16 位（大端）样本，`pnm_decode` 按 `v*255/maxval` 缩放到 RGBA8888；P1..P4/P7 与多图不支持 |
+
+| `std/data/pcx.c6` | `std.data.pcx` | PCX（ZSoft PC Paintbrush）：`pcx_info` 读 128 字节头（尺寸/位深/平面/`bytes_per_line`），`pcx_decode` 解 RLE（0xC0 掩码）与三种布局——8 位单平面（末尾 0x0C + 768 字节 VGA 调色板优先，否则用头里 16 色）、24 位三平面、1 位单色；输出 `0xRRGGBBAA` |
+| `std/data/hdr.c6` | `std.data.hdr` | Radiance RGBE（`.hdr`）：`hdr_info` 解 `#?RADIANCE` 头与 `-Y h +X w` 分辨率行，`hdr_decode` 出原始 `R G B E` 四字节（新式扫描线 RLE 与老式平铺都认，老式 `1 1 1 count` 重复标记也展开），`hdr_to_rgb` 按 `2^(E-128)*exposure` 夹到 0~255 |
+| `std/data/xbm.c6` | `std.data.xbm` | X BitMap（C 源码位图）：从 `#define *_width` / `*_height` 拿尺寸，`xbm_decode` 把花括号里的十进制/十六进制数解成字节（长度必须等于 `ceil(w/8)*h`），`xbm_pixel` 按 X11 位序（每字节低位在左）取像素 |
+| `std/data/xpm.c6` | `std.data.xpm` | X PixMap（C 源码彩图）：`xpm_info` 解 `"w h ncolors cpp"`，`xpm_decode` 按 cpp 字节键查颜色表输出 `0xRRGGBBAA`，`xpm_color` 按名字查色；颜色认 `None`（透明）、`#RGB`、`#RRGGBB`、`#RRRRGGGGBBBB`，符号名当不透明黑 || `std/data/pnm.c6` | `std.data.pnm` | Netpbm P5/P6 解码（零分配）：`pnm_parse` 支持注释、maxval 1..65535、8/16 位（大端）样本，`pnm_decode` 按 `v*255/maxval` 缩放到 RGBA8888；P1..P4/P7 与多图不支持 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -277,6 +281,7 @@
 | `examples/stdser.c6` | （无模块） | 第三十六批（序列化与标记）的拼装示例（`make std-ser`）：现场拼 BSON 与 UBJSON 文档、解一段 plistlib 生成的二进制 plist（58 字节）、把一段 Markdown 渲染成 HTML |
 | `examples/stdsys.c6` | （无模块） | 第三十七批（系统视图）的拼装示例（`make std-sys`）：打印 uname/负载/运行时长/CPU/页大小、rlimit/rusage、当前用户与主组，再用伪终端跑 `sh -c` 并抓它的输出 |
 | `examples/stdhash.c6` | （无模块） | 第三十八批（哈希与校验）的拼装示例（`make std-hash`）：SHA-3-256/SHAKE128、BLAKE2s-256/128、CRC-32C、XXH32/XXH64 的已知向量与流式一致性 |
+| `examples/stdlegacy.c6` | （无模块） | 第三十九批（老图形格式）的拼装示例（`make std-legacy`）：现场拼 PCX（调色板 + RLE）、Radiance HDR（RGBE + 色调映射）、XBM、XPM 四种老格式再解析 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -323,6 +328,10 @@ std/data/zip.c6            7 test(s), 0 failure(s)
 std/data/bmp.c6            2 test(s), 0 failure(s)
 std/data/tga.c6            2 test(s), 0 failure(s)
 std/data/qoi.c6            2 test(s), 0 failure(s)
+std/data/pcx.c6            24 test(s), 0 failure(s)
+std/data/hdr.c6            24 test(s), 0 failure(s)
+std/data/xbm.c6            24 test(s), 0 failure(s)
+std/data/xpm.c6            24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3487,6 +3496,16 @@ make std-hash
 `BLAKE2s-128("abc")`、`CRC32C("123456789")`、`XXH32("")` / `XXH64("")`；另外
 每节都验一遍「流式喂」与「一次喂完」结果相同。
 
+### 集成示例：`examples/stdlegacy.c6`
+
+```sh
+make std-legacy
+```
+
+四节各自现场拼一份数据：PCX 走「头 + RLE 行 + 768 字节 VGA 调色板」；HDR 走
+老式平铺扫描线并演示 `hdr_to_rgb` 的夹断；XBM 验证位序（每字节低位在左、跨字节
+的第二字节）；XPM 验证透明键、`#RRGGBB` 与 `#RGB` 两种色值和 alpha。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3559,6 +3578,8 @@ make std-hash
   （自带自检）。
 * `make std-hash`：`examples/stdhash.c6`，第三十八批（哈希与校验）模块的拼装示例
   （自带自检）。
+* `make std-legacy`：`examples/stdlegacy.c6`，第三十九批（老图形格式）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

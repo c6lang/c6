@@ -1,0 +1,336 @@
+/* std/data/pcx：PCX 图像（ZSoft PC Paintbrush）。
+ *
+ *     import std.data.pcx;
+ *
+ *     PcxInfo info = { 0 };
+ *     u32 *px = malloc(w * h * 4) ... （调用方给缓冲区）
+ *     if (pcx_info(buf, n, &info) == 1)
+ *         pcx_decode(buf, n, info.width * info.height, px);
+ *
+ * 支持：8 位调色板（单平面，末尾 0x0C + 768 字节 VGA 调色板优先，否则用头里的
+ * 16 色）、24 位真彩（`planes == 3`、每平面 8 位）、1 位单色（用头里的 16 色）；
+ * 编码 1（RLE）与 0（不压缩）。
+ *
+ * 约定：
+ *
+ * - 输出一律是 `0xRRGGBBAA`（不透明 `0xFF`）的 u32 数组，调用方按 `width*height`
+ *   准备；
+ * - `pcx_info` 只读头，校验制造商 `0x0A`、编码、位深、尺寸，失败 -1；
+ * - `pcx_decode` 返回解出的像素数（= width*height），坏数据返回 -1（已经写出的
+ *   内容不保证）；
+ * - 4 位多平面、2 位、Windows 版本（version 4 之后的新头）不做；
+ * - `bytes_per_line` 是每行的填充长度，行尾填充要跳过（不是 width 直接乘）。
+ */
+#include <string.h>
+
+module std.data.pcx;
+import std.core.types;
+import std.text.str;
+
+struct PcxInfo {
+    int width;
+    int height;
+    int bpp;
+    int planes;
+    int version;
+    int encoding;
+    int bytes_per_line;
+    int has_vga_palette;
+};
+
+static u32 pcx_u16(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8);
+}
+
+int pcx_info(const void *src, int n, PcxInfo *out)
+{
+    const u8 *p = (const u8 *)src;
+    u32 xmin = 0, ymin = 0, xmax = 0, ymax = 0;
+
+    if (!src || !out || n < 128)
+        return -1;
+    if (p[0] != 0x0A)
+        return -1;
+    if (p[2] != 0 && p[2] != 1)
+        return -1;
+    xmin = pcx_u16(p + 4);
+    ymin = pcx_u16(p + 6);
+    xmax = pcx_u16(p + 8);
+    ymax = pcx_u16(p + 10);
+    if (xmax < xmin || ymax < ymin)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->width = (int)(xmax - xmin + 1);
+    out->height = (int)(ymax - ymin + 1);
+    out->bpp = p[3];
+    out->planes = p[65];
+    out->version = p[1];
+    out->encoding = p[2];
+    out->bytes_per_line = (int)pcx_u16(p + 66);
+    out->has_vga_palette = p[68] == 2;
+    if (out->width <= 0 || out->height <= 0 || out->width > 65535
+        || out->height > 65535)
+        return -1;
+    if (out->bytes_per_line <= 0)
+        return -1;
+    if (out->planes < 1 || out->planes > 4)
+        return -1;
+    if (!(out->bpp == 1 || out->bpp == 4 || out->bpp == 8))
+        return -1;
+    if (out->bpp == 1 && out->planes != 1)
+        return -1;
+    return 1;
+}
+
+/* 读一个 RLE 单元：返回 1 成功，*run 是重复次数，*val 是字节 */
+static int pcx_unit(const u8 *p, int n, int *pos, int *run, int *val)
+{
+    int c = 0;
+
+    if (*pos >= n)
+        return -1;
+    c = p[*pos];
+    (*pos)++;
+    if ((c & 0xC0) == 0xC0) {
+        *run = c & 0x3F;
+        if (*run == 0)
+            return -1;
+        if (*pos >= n)
+            return -1;
+        *val = p[*pos];
+        (*pos)++;
+        return 1;
+    }
+    *run = 1;
+    *val = c;
+    return 1;
+}
+
+/* 找 8 位调色板：文件末尾 769 字节以 0x0C 开头 */
+static int pcx_vga_palette(const u8 *p, int n, const u8 **pal)
+{
+    if (n < 769)
+        return 0;
+    if (p[n - 769] != 0x0C)
+        return 0;
+    *pal = p + n - 768;
+    return 1;
+}
+
+static u32 pcx_rgb(int r, int g, int b)
+{
+    return ((u32)r << 24) | ((u32)g << 16) | ((u32)b << 8) | 0xFFu;
+}
+
+int pcx_decode(const void *src, int n, u32 *out, int cap)
+{
+    const u8 *p = (const u8 *)src;
+    PcxInfo info = { 0 };
+    const u8 *pal = 0;
+    u32 pal16[16] = { 0 };
+    int pos = 128;
+    int x = 0, y = 0, i = 0;
+
+    if (!src || !out)
+        return -1;
+    if (pcx_info(src, n, &info) != 1)
+        return -1;
+    if (cap < info.width * info.height)
+        return -1;
+    for (i = 0; i < 16; i++)
+        pal16[i] = pcx_rgb(p[16 + 3 * i], p[17 + 3 * i], p[18 + 3 * i]);
+    if (info.bpp == 8 && info.planes == 1)
+        if (!pcx_vga_palette(p, n, &pal))
+            pal = 0;
+    for (y = 0; y < info.height; y++) {
+        int row_bytes = info.bytes_per_line * info.planes;
+        int got = 0, run = 0, val = 0;
+        u8 line[4096] = { 0 };
+
+        if (row_bytes > (int)sizeof line)
+            return -1;
+        while (got < row_bytes) {
+            if (pcx_unit(p, n, &pos, &run, &val) != 1)
+                return -1;
+            while (run-- > 0 && got < row_bytes)
+                line[got++] = (u8)val;
+        }
+        for (x = 0; x < info.width; x++) {
+            u32 rgb = 0;
+
+            if (info.bpp == 8 && info.planes == 3) {
+                int r = line[x];
+                int g = line[info.bytes_per_line + x];
+                int b = line[2 * info.bytes_per_line + x];
+
+                rgb = pcx_rgb(r, g, b);
+            } else if (info.bpp == 8 && info.planes == 1) {
+                int idx = line[x];
+
+                if (pal)
+                    rgb = pcx_rgb(pal[3 * idx], pal[3 * idx + 1],
+                                  pal[3 * idx + 2]);
+                else
+                    rgb = pal16[idx & 0x0F];
+            } else if (info.bpp == 1 && info.planes == 1) {
+                int bit = (line[x / 8] >> (7 - (x % 8))) & 1;
+
+                rgb = pal16[bit];
+            } else {
+                return -1;
+            }
+            out[y * info.width + x] = rgb;
+        }
+    }
+    return info.width * info.height;
+}
+
+/* ---- 自测 ---- */
+
+static void pcx_put16(u8 *p, int v)
+{
+    p[0] = (u8)(v & 0xFF);
+    p[1] = (u8)((v >> 8) & 0xFF);
+}
+
+/* 造一个 8 位调色板 PCX：4x3，索引来自 VGA 调色板，第 2 行用一段 RLE */
+static int mk_pcx8(u8 *buf)
+{
+    int i = 0, off = 0;
+
+    memset(buf, 0, 2048);
+    buf[0] = 0x0A;
+    buf[1] = 5;
+    buf[2] = 1;                         /* RLE */
+    buf[3] = 8;
+    pcx_put16(buf + 4, 0);
+    pcx_put16(buf + 6, 0);
+    pcx_put16(buf + 8, 3);              /* xmax → 宽 4 */
+    pcx_put16(buf + 10, 2);             /* ymax → 高 3 */
+    for (i = 0; i < 16; i++) {          /* 头里的 16 色调色板 */
+        buf[16 + 3 * i] = (u8)(i * 16);
+        buf[17 + 3 * i] = 0;
+        buf[18 + 3 * i] = 0;
+    }
+    buf[65] = 1;                        /* planes */
+    pcx_put16(buf + 66, 4);             /* bytes_per_line */
+    buf[68] = 2;                        /* 有 VGA 调色板 */
+    off = 128;
+    /* 第 0 行 1 2 3 4；第 1 行 5 5 5 5（RLE：0xC4 0x05）；第 2 行 6 7 8 9 */
+    buf[off++] = 1;
+    buf[off++] = 2;
+    buf[off++] = 3;
+    buf[off++] = 4;
+    buf[off++] = 0xC4;
+    buf[off++] = 5;
+    buf[off++] = 6;
+    buf[off++] = 7;
+    buf[off++] = 8;
+    buf[off++] = 9;
+    buf[off++] = 0x0C;                  /* 768 字节调色板标记 */
+    for (i = 0; i < 256; i++) {
+        buf[off++] = (u8)i;
+        buf[off++] = (u8)(255 - i);
+        buf[off++] = (u8)(i / 2);
+    }
+    return off;
+}
+
+test "pcx：8 位调色板与 RLE" {
+    static u8 buf[2048] = { 0 };
+    static u32 px[16] = { 0 };
+    PcxInfo info = { 0 };
+    int n = mk_pcx8(buf);
+
+    if (pcx_info(buf, n, &info) != 1)
+        return err(1, "头解析失败");
+    if (info.width != 4 || info.height != 3 || info.bpp != 8
+        || info.planes != 1 || info.bytes_per_line != 4
+        || info.has_vga_palette != 1)
+        return err(2, "头字段不对");
+    if (pcx_decode(buf, n, px, 12) != 12)
+        return err(3, "解码像素数不对");
+    /* 第 0 行：索引 1..4 → 调色板里的 (1,254,0) 等 */
+    if (px[0] != (((u32)1 << 24) | ((u32)254 << 16) | (0u << 8) | 0xFFu))
+        return err(4, "像素 (0,0) 不对");
+    if (px[3] != (((u32)4 << 24) | ((u32)251 << 16) | (2u << 8) | 0xFFu))
+        return err(5, "像素 (3,0) 不对");
+    /* 第 1 行是 RLE 的四个 5 */
+    if (px[4] != px[7] || ((px[4] >> 24) & 0xFF) != 5)
+        return err(6, "RLE 行不对");
+    if (px[8] != (((u32)6 << 24) | ((u32)249 << 16) | (3u << 8) | 0xFFu))
+        return err(7, "像素 (0,2) 不对");
+}
+
+test "pcx：24 位、1 位与坏数据" {
+    static u8 buf[512] = { 0 };
+    static u32 px[16] = { 0 };
+    PcxInfo info = { 0 };
+    int off = 128, i = 0;
+
+    /* 24 位：2x2，planes=3，bytes_per_line=2 */
+    memset(buf, 0, sizeof buf);
+    buf[0] = 0x0A;
+    buf[2] = 1;
+    buf[3] = 8;
+    pcx_put16(buf + 8, 1);
+    pcx_put16(buf + 10, 1);
+    buf[65] = 3;
+    pcx_put16(buf + 66, 2);
+    /* 行 0：R=10,11 G=20,21 B=30,31 */
+    for (i = 0; i < 2; i++) {
+        buf[off++] = (u8)(10 + i);
+    }
+    for (i = 0; i < 2; i++)
+        buf[off++] = (u8)(20 + i);
+    for (i = 0; i < 2; i++)
+        buf[off++] = (u8)(30 + i);
+    for (i = 0; i < 2; i++)
+        buf[off++] = (u8)(40 + i);
+    for (i = 0; i < 2; i++)
+        buf[off++] = (u8)(50 + i);
+    for (i = 0; i < 2; i++)
+        buf[off++] = (u8)(60 + i);
+    if (pcx_info(buf, off, &info) != 1)
+        return err(8, "24 位头解析失败");
+    if (pcx_decode(buf, off, px, 4) != 4)
+        return err(9, "24 位解码失败");
+    if (px[0] != (((u32)10 << 24) | ((u32)20 << 16) | ((u32)30 << 8) | 0xFFu))
+        return err(10, "24 位像素 (0,0) 不对");
+    if (px[1] != (((u32)11 << 24) | ((u32)21 << 16) | ((u32)31 << 8) | 0xFFu))
+        return err(11, "24 位像素 (1,0) 不对");
+    if (px[3] != (((u32)41 << 24) | ((u32)51 << 16) | ((u32)61 << 8) | 0xFFu))
+        return err(12, "24 位像素 (1,1) 不对");
+    /* 1 位：8 像素宽 1 行 */
+    memset(buf, 0, sizeof buf);
+    buf[0] = 0x0A;
+    buf[2] = 0;
+    buf[3] = 1;
+    pcx_put16(buf + 8, 7);
+    pcx_put16(buf + 10, 0);
+    buf[16 + 3] = 200;                  /* 调色板 1 → (200,0,0) */
+    buf[65] = 1;
+    pcx_put16(buf + 66, 1);
+    buf[128] = 0x81;                    /* 1000 0001 */
+    if (pcx_info(buf, 129, &info) != 1 || info.bpp != 1)
+        return err(13, "1 位头解析失败");
+    if (pcx_decode(buf, 129, px, 8) != 8)
+        return err(14, "1 位解码失败");
+    if (((px[0] >> 24) & 0xFF) != 200 || ((px[1] >> 24) & 0xFF) != 0)
+        return err(15, "1 位像素不对");
+    if (((px[7] >> 24) & 0xFF) != 200)
+        return err(16, "1 位最后一像素不对");
+    /* 坏数据 */
+    if (pcx_info("PCX", 3, &info) != -1)
+        return err(17, "太短应该 -1");
+    if (pcx_info(buf, 129, 0) != -1)
+        return err(18, "空指针应该 -1");
+    buf[0] = 0x0B;
+    if (pcx_info(buf, 129, &info) != -1)
+        return err(19, "制造商不对应该 -1");
+    buf[0] = 0x0A;
+    pcx_put16(buf + 4, 9);              /* xmin > xmax */
+    if (pcx_info(buf, 129, &info) != -1)
+        return err(20, "尺寸不合法应该 -1");
+}

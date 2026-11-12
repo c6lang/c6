@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第三十九批（老图形格式）**：`std.data.pcx`（RLE + 调色板/24 位/1 位）、
+  `std.data.hdr`（Radiance RGBE，新老两种扫描线，含 `hdr_to_rgb`）、
+  `std.data.xbm`（C 源码位图）、`std.data.xpm`（C 源码彩图 + 透明键），集成示例
+  `examples/stdlegacy.c6`（`make std-legacy`）。错误号段 `std.data.pcx`=0x60a5 …
+  `std.data.xpm`=0x60a8（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第三十八批（哈希与校验）**：`std.encoding.sha3`（SHA3-224/256/384/512 +
   SHAKE128/256）、`std.encoding.blake2s`（输出 1~32 字节）、`std.encoding.crc32c`
   （CRC-32C，含分段接口）、`std.encoding.xxhash`（XXH32/XXH64，一次性 + 流式），

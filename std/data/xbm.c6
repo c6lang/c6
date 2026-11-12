@@ -1,0 +1,254 @@
+/* std/data/xbm：X BitMap（X11 的 C 源码位图）。
+ *
+ *     import std.data.xbm;
+ *
+ *     XbmInfo info = { 0 };
+ *     if (xbm_info(src, (int)strlen(src), &info) == 1)
+ *         // info.width / info.height / info.nbytes
+ *         xbm_decode(src, (int)strlen(src), bits, cap);   // bits 按 nbytes 准备
+ *
+ * 认的是这种形状：
+ *
+ *     #define logo_width 16
+ *     #define logo_height 8
+ *     static unsigned char logo_bits[] = {
+ *        0x00, 0x01, 0xff, 0x80, ... };
+ *
+ * 约定：
+ *
+ * - 所有 `#define *_width` / `#define *_height` 都认（取第一个能解析成功的）；
+ * - `xbm_decode` 把花括号里的数值按「十六进制（0x…）或十进制」解出来写进
+ *   调用方缓冲区，返回字节数（= ((width+7)/8) * height）；不够或不匹配返回 -1；
+ * - 位序按 X11 惯例：每字节低位在左（像素 (x,y) 取 `bits[y*stride + x/8]` 的
+ *   `x%8` 位）；
+ * - 不做：多平面、`short`/`long` 变体、非 C 源码形式（`.xbm` 里嵌别的宏）。
+ */
+#include <string.h>
+
+module std.data.xbm;
+import std.core.types;
+import std.text.str;
+
+struct XbmInfo {
+    int width;
+    int height;
+    int stride;         /* 每行字节数 */
+    int nbytes;
+};
+
+static int xbm_digits(const char *p, int n, int *out)
+{
+    int v = 0, i = 0, base = 10;
+
+    if (n >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        base = 16;
+        i = 2;
+    }
+    if (i >= n)
+        return -1;
+    for (; i < n; i++) {
+        int d = 0;
+
+        if (p[i] >= '0' && p[i] <= '9')
+            d = p[i] - '0';
+        else if (base == 16 && p[i] >= 'a' && p[i] <= 'f')
+            d = p[i] - 'a' + 10;
+        else if (base == 16 && p[i] >= 'A' && p[i] <= 'F')
+            d = p[i] - 'A' + 10;
+        else
+            return -1;
+        v = v * base + d;
+        if (v > 0x7FFF)
+            return -1;
+    }
+    *out = v;
+    return 1;
+}
+
+/* 在 [from, n) 里找 "#define"，解析后面的数字到 *out */
+static int xbm_find_define(const char *s, int n, const char *suffix, int *out)
+{
+    int i = 0;
+    int slen = (int)strlen(suffix);
+
+    for (i = 0; i + 7 < n; i++) {
+        int j = 0, k = 0;
+
+        if (s[i] != '#')
+            continue;
+        if (memcmp(s + i, "#define", 7) != 0)
+            continue;
+        j = i + 7;
+        while (j < n && (s[j] == ' ' || s[j] == '\t'))
+            j++;
+        /* 名字：到空白为止，必须以 suffix 结尾 */
+        k = j;
+        while (k < n && s[k] != ' ' && s[k] != '\t' && s[k] != '\n')
+            k++;
+        if (k - j < slen || memcmp(s + k - slen, suffix, (size_t)slen) != 0)
+            continue;
+        while (k < n && (s[k] == ' ' || s[k] == '\t'))
+            k++;
+        {
+            int ds = k;
+
+            while (k < n && s[k] != '\n' && s[k] != '\r' && s[k] != ' '
+                   && s[k] != '\t')
+                k++;
+            if (xbm_digits(s + ds, k - ds, out) == 1)
+                return 1;
+        }
+    }
+    return -1;
+}
+
+int xbm_info(const void *src, int n, XbmInfo *out)
+{
+    const char *s = (const char *)src;
+    int w = 0, h = 0;
+
+    if (!src || !out || n <= 0)
+        return -1;
+    if (xbm_find_define(s, n, "_width", &w) != 1)
+        return -1;
+    if (xbm_find_define(s, n, "_height", &h) != 1)
+        return -1;
+    if (w <= 0 || h <= 0 || w > 65535 || h > 65535)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->width = w;
+    out->height = h;
+    out->stride = (w + 7) / 8;
+    out->nbytes = out->stride * h;
+    return 1;
+}
+
+int xbm_decode(const void *src, int n, void *dst, int cap)
+{
+    const char *s = (const char *)src;
+    unsigned char *out = (unsigned char *)dst;
+    XbmInfo info = { 0 };
+    int i = 0, got = 0, in_body = 0, done = 0;
+
+    if (!src || !dst)
+        return -1;
+    if (xbm_info(src, n, &info) != 1)
+        return -1;
+    if (cap < info.nbytes)
+        return -1;
+    for (i = 0; i < n && !done; i++) {
+        int ds = 0, de = 0, v = 0;
+
+        if (!in_body) {
+            if (s[i] == '{')
+                in_body = 1;
+            continue;
+        }
+        if (s[i] == '}')
+            break;
+        if (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'
+            || s[i] == ',')
+            continue;
+        ds = i;
+        while (i < n && s[i] != ',' && s[i] != '}' && s[i] != ' '
+               && s[i] != '\n' && s[i] != '\r' && s[i] != '\t')
+            i++;
+        de = i;
+        i--;                            /* 外层 for 会再 +1 */
+        if (xbm_digits(s + ds, de - ds, &v) != 1 || v > 255)
+            return -1;
+        if (got >= info.nbytes) {
+            done = 1;                   /* 多出来的数值忽略 */
+            break;
+        }
+        out[got++] = (unsigned char)v;
+    }
+    if (got != info.nbytes)
+        return -1;
+    return got;
+}
+
+/* 取像素：1 亮 / 0 暗 */
+int xbm_pixel(const void *bits, int width, int x, int y)
+{
+    const unsigned char *p = (const unsigned char *)bits;
+    int stride = (width + 7) / 8;
+
+    if (!bits || x < 0 || y < 0 || x >= width)
+        return -1;
+    return (p[y * stride + x / 8] >> (x % 8)) & 1;
+}
+
+/* ---- 自测 ---- */
+
+static const char *xbm_sample =
+    "/* XBM */\n"
+    "#define logo_width 12\n"
+    "#define logo_height 2\n"
+    "static unsigned char logo_bits[] = {\n"
+    "   0x01, 0xff,\n"
+    "   0xf0, 0x00 };\n";
+
+test "xbm：尺寸、字节与像素" {
+    static unsigned char bits[8] = { 0 };
+    XbmInfo info = { 0 };
+    int n = (int)strlen(xbm_sample);
+
+    if (xbm_info(xbm_sample, n, &info) != 1)
+        return err(1, "解析失败");
+    if (info.width != 12 || info.height != 2)
+        return err(2, "尺寸不对");
+    if (info.stride != 2 || info.nbytes != 4)
+        return err(3, "stride/nbytes 不对");
+    if (xbm_decode(xbm_sample, n, bits, (int)sizeof bits) != 4)
+        return err(4, "解码字节数不对");
+    if (bits[0] != 0x01 || bits[1] != 0xFF || bits[2] != 0xF0
+        || bits[3] != 0x00)
+        return err(5, "字节值不对");
+    /* 位序：每字节低位在左 */
+    if (xbm_pixel(bits, 12, 0, 0) != 1)
+        return err(6, "像素 (0,0) 应该是亮");
+    if (xbm_pixel(bits, 12, 1, 0) != 0)
+        return err(7, "像素 (1,0) 应该是暗");
+    if (xbm_pixel(bits, 12, 0, 1) != 0 || xbm_pixel(bits, 12, 4, 1) != 1
+        || xbm_pixel(bits, 12, 7, 1) != 1)
+        return err(8, "第二行像素不对");
+    if (xbm_pixel(bits, 12, 12, 0) != -1)
+        return err(9, "越界应该 -1");
+}
+
+test "xbm：十进制、坏数据与容量" {
+    static const char *dec =
+        "#define a_width 8\n#define a_height 1\n"
+        "static char a_bits[] = { 170 };";
+    static unsigned char bits[4] = { 0 };
+    XbmInfo info = { 0 };
+    int n = (int)strlen(dec);
+
+    if (xbm_info(dec, n, &info) != 1 || info.width != 8 || info.height != 1)
+        return err(10, "十进制样例解析失败");
+    if (xbm_decode(dec, n, bits, 1) != 1 || bits[0] != 170)
+        return err(11, "十进制值不对");
+    /* 缓冲区不够 */
+    if (xbm_decode(dec, n, bits, 0) != -1)
+        return err(12, "容量不够应该 -1");
+    /* 缺 height */
+    if (xbm_info("#define a_width 8\n", 18, &info) != -1)
+        return err(13, "缺 height 应该 -1");
+    /* 数值不够 */
+    {
+        static const char *few = "#define a_width 8\n#define a_height 2\n{ 1 };";
+
+        if (xbm_decode(few, (int)strlen(few), bits, 4) != -1)
+            return err(14, "字节数不够应该 -1");
+    }
+    /* 非法字符 */
+    {
+        static const char *bad = "#define a_width zz\n#define a_height 1\n";
+
+        if (xbm_info(bad, (int)strlen(bad), &info) != -1)
+            return err(15, "非法宽度应该 -1");
+    }
+    if (xbm_info(0, 10, &info) != -1)
+        return err(16, "空指针应该 -1");
+}

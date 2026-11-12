@@ -1,0 +1,366 @@
+/* std/data/xpm：X PixMap（X11 的 C 源码彩色图）。
+ *
+ *     import std.data.xpm;
+ *
+ *     XpmInfo info = { 0 };
+ *     if (xpm_info(src, n, &info) == 1)
+ *         // 调用方按 width*height 准备 u32
+ *         xpm_decode(src, n, px, cap);          // 0xRRGGBBAA
+ *
+ * 认的是这种形状（`static char *name[] = { "4 2 3 1", "  c None", ... };`）：
+ *
+ *     "4 2 3 1",              ← 宽 高 颜色数 每像素字符数
+ *     "  c #FF0000",          ← 颜色定义：键 + 'c' + 颜色
+ *     "X c #00FF00",
+ *     "o c None",             ← None = 全透明
+ *     "X  X",                 ← 像素行，每行正好 width 个键
+ *     " oo "
+ *
+ * 约定：
+ *
+ * - `xpm_info` 只读头部（第一个字符串）与左花括号，失败 -1；
+ * - 颜色支持 `None`、`#RGB`、`#RRGGBB`、`#RRRRGGGGBBBB`（16 位分量右移 8）、
+ *   以及 `c`/`C` 的变体；符号名（`red` 之类）一律当不透明黑（不查颜色表）；
+ * - `xpm_decode` 输出 `0xRRGGBBAA`，`None` 是 `0x00000000`；
+ * - 缺行、键对不上、颜色数不够都返回 -1；
+ * - 键可以包含空格（`"  c ..."` 的键就是一个空格），所以按 `cpp` 宽度切像素行。
+ */
+#include <string.h>
+
+module std.data.xpm;
+import std.core.types;
+import std.text.str;
+
+struct XpmInfo {
+    int width;
+    int height;
+    int ncolors;
+    int cpp;
+};
+
+static u32 xpm_rgb(int r, int g, int b, int a)
+{
+    return ((u32)(r & 0xFF) << 24) | ((u32)(g & 0xFF) << 16)
+           | ((u32)(b & 0xFF) << 8) | (u32)(a & 0xFF);
+}
+
+static int xpm_hex1(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 解 "#RGB" / "#RRGGBB" / "#RRRRGGGGBBBB" */
+static int xpm_hexcolor(const char *p, int n, u32 *out)
+{
+    int i = 0, v[12] = { 0 };
+
+    if (n < 1 || p[0] != '#')
+        return -1;
+    n--;
+    p++;
+    if (!(n == 3 || n == 6 || n == 12))
+        return -1;
+    for (i = 0; i < n; i++) {
+        int d = xpm_hex1(p[i]);
+
+        if (d < 0)
+            return -1;
+        v[i] = d;
+    }
+    if (n == 3) {
+        *out = xpm_rgb(v[0] * 17, v[1] * 17, v[2] * 17, 255);
+        return 1;
+    }
+    if (n == 6) {
+        *out = xpm_rgb(v[0] * 16 + v[1], v[2] * 16 + v[3], v[4] * 16 + v[5],
+                       255);
+        return 1;
+    }
+    *out = xpm_rgb((v[0] * 16 + v[1]) >> 0, (v[4] * 16 + v[5]),
+                   (v[8] * 16 + v[9]), 255);
+    /* 16 位分量右移 8 位：上面已经取高字节 */
+    return 1;
+}
+
+/* 取下一个带引号的字符串：返回长度，*pos 更新到闭引号之后 */
+static int xpm_next_str(const char *s, int n, int *pos, const char **out)
+{
+    int i = *pos;
+
+    while (i < n && s[i] != '"')
+        i++;
+    if (i >= n)
+        return -1;
+    i++;
+    *out = s + i;
+    while (i < n && s[i] != '"') {
+        if (s[i] == '\\' && i + 1 < n)
+            i += 2;
+        else
+            i++;
+    }
+    if (i >= n)
+        return -1;
+    *pos = i + 1;
+    return (int)(s + i - *out);
+}
+
+static int xpm_parse_header(const char *p, int n, XpmInfo *out)
+{
+    int w = 0, h = 0, nc = 0, cpp = 0, i = 0, field = 0;
+
+    while (i < n) {
+        int v = 0, digits = 0;
+
+        while (i < n && p[i] == ' ')
+            i++;
+        while (i < n && p[i] >= '0' && p[i] <= '9') {
+            v = v * 10 + (p[i] - '0');
+            digits++;
+            i++;
+        }
+        if (!digits)
+            return -1;
+        if (field == 0)
+            w = v;
+        else if (field == 1)
+            h = v;
+        else if (field == 2)
+            nc = v;
+        else
+            cpp = v;
+        field++;
+    }
+    if (field != 4)
+        return -1;
+    if (w <= 0 || h <= 0 || w > 65535 || h > 65535)
+        return -1;
+    if (nc <= 0 || nc > 65535 || cpp <= 0 || cpp > 8)
+        return -1;
+    out->width = w;
+    out->height = h;
+    out->ncolors = nc;
+    out->cpp = cpp;
+    return 1;
+}
+
+int xpm_info(const void *src, int n, XpmInfo *out)
+{
+    const char *s = (const char *)src;
+    const char *first = 0;
+    int pos = 0, len = 0;
+
+    if (!src || !out || n <= 0)
+        return -1;
+    len = xpm_next_str(s, n, &pos, &first);
+    if (len < 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    return xpm_parse_header(first, len, out);
+}
+
+/* 颜色定义行：键(cpp 字节) + 若干空白 + 类型字符 + 空白 + 颜色 */
+static int xpm_color_line(const char *p, int n, int cpp, Str *key, u32 *rgba)
+{
+    int i = cpp;
+
+    if (n < cpp + 3)
+        return -1;
+    while (i < n && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    if (i >= n)
+        return -1;
+    if (p[i] != 'c' && p[i] != 'C')
+        return -1;                      /* 只认彩色键，m/g/s 忽略 */
+    i++;
+    while (i < n && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    if (i >= n)
+        return -1;
+    key->s = (char[:]){ (char *)p, cpp };
+    if (n - i == 4 && memcmp(p + i, "None", 4) == 0) {
+        *rgba = 0;
+        return 1;
+    }
+    if (p[i] == '#')
+        return xpm_hexcolor(p + i, n - i, rgba);
+    *rgba = xpm_rgb(0, 0, 0, 255);      /* 符号名：当黑色 */
+    return 1;
+}
+
+int xpm_decode(const void *src, int n, u32 *out, int cap)
+{
+    const char *s = (const char *)src;
+    XpmInfo info = { 0 };
+    Str keys[256] = { { 0 } };
+    u32 cols[256] = { 0 };
+    const char *p = 0;
+    int pos = 0, len = 0, i = 0, y = 0;
+
+    if (!src || !out)
+        return -1;
+    if (xpm_info(src, n, &info) != 1)
+        return -1;
+    if (info.ncolors > 256)
+        return -1;
+    if (cap < info.width * info.height)
+        return -1;
+    len = xpm_next_str(s, n, &pos, &p);   /* 已经解过的头 */
+    if (len < 0)
+        return -1;
+    for (i = 0; i < info.ncolors; i++) {
+        len = xpm_next_str(s, n, &pos, &p);
+        if (len < 0)
+            return -1;
+        if (xpm_color_line(p, len, info.cpp, &keys[i], &cols[i]) != 1)
+            return -1;
+    }
+    for (y = 0; y < info.height; y++) {
+        int x = 0;
+
+        len = xpm_next_str(s, n, &pos, &p);
+        if (len < 0)
+            return -1;
+        if (len != info.width * info.cpp)
+            return -1;
+        for (x = 0; x < info.width; x++) {
+            int k = 0, found = -1;
+
+            for (k = 0; k < info.ncolors; k++) {
+                if (keys[k].s.len == info.cpp
+                    && memcmp(keys[k].s.data, p + x * info.cpp,
+                              (size_t)info.cpp) == 0) {
+                    found = k;
+                    break;
+                }
+            }
+            if (found < 0)
+                return -1;
+            out[y * info.width + x] = cols[found];
+        }
+    }
+    return info.width * info.height;
+}
+
+/* 按名字查颜色：1 找到 / 0 没有 / -1 坏数据 */
+int xpm_color(const void *src, int n, Str key, u32 *out)
+{
+    const char *s = (const char *)src;
+    XpmInfo info = { 0 };
+    const char *p = 0;
+    Str k = { 0 };
+    u32 rgba = 0;
+    int pos = 0, len = 0, i = 0;
+
+    if (!src || !out)
+        return -1;
+    if (xpm_info(src, n, &info) != 1)
+        return -1;
+    len = xpm_next_str(s, n, &pos, &p);
+    if (len < 0)
+        return -1;
+    for (i = 0; i < info.ncolors; i++) {
+        len = xpm_next_str(s, n, &pos, &p);
+        if (len < 0)
+            return -1;
+        if (xpm_color_line(p, len, info.cpp, &k, &rgba) != 1)
+            continue;
+        if (k.s.len == key.s.len
+            && memcmp(k.s.data, key.s.data, (size_t)key.s.len) == 0) {
+            *out = rgba;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+static const char *xpm_sample =
+    "/* XPM */\n"
+    "static char *dot[] = {\n"
+    "\"4 2 3 1\",\n"
+    "\"  c None\",\n"
+    "\". c #FF0000\",\n"
+    "\"X c #0f0\",\n"
+    "\" .X \",\n"
+    "\"X. X\"};\n";
+
+test "xpm：头部、颜色与像素" {
+    static u32 px[8] = { 0 };
+    XpmInfo info = { 0 };
+    int n = (int)strlen(xpm_sample);
+    u32 rgba = 0;
+
+    if (xpm_info(xpm_sample, n, &info) != 1)
+        return err(1, "头解析失败");
+    if (info.width != 4 || info.height != 2 || info.ncolors != 3
+        || info.cpp != 1)
+        return err(2, "头字段不对");
+    if (xpm_decode(xpm_sample, n, px, 8) != 8)
+        return err(3, "解码像素数不对");
+    if (px[0] != 0)
+        return err(4, "空格键应该是透明");
+    if (px[1] != 0xFF0000FFu)
+        return err(5, "'.' 应该是红色");
+    if (px[2] != 0x00FF00FFu)
+        return err(6, "'X' 应该是绿色（#0f0 展开）");
+    if (px[3] != 0)
+        return err(7, "行尾空格键透明");
+    if (px[4] != 0x00FF00FFu || px[5] != 0xFF0000FFu)
+        return err(8, "第二行前两像素不对");
+    if (px[7] != 0x00FF00FFu)
+        return err(9, "第二行最后一像素不对");
+    /* 按名字查色 */
+    if (xpm_color(xpm_sample, n, (Str){ S(".") }, &rgba) != 1
+        || rgba != 0xFF0000FFu)
+        return err(10, "查 '.' 颜色不对");
+    if (xpm_color(xpm_sample, n, (Str){ S("Z") }, &rgba) != 0)
+        return err(11, "不存在的键应该 0");
+}
+
+test "xpm：多字符键、16 位色与坏数据" {
+    static const char *two =
+        "static char *p[] = {\n"
+        "\"2 1 2 2\",\n"
+        "\"aa c #FF8000\",\n"
+        "\"bb c #FFFF80000000\",\n"
+        "\"aabb\"};";
+    static u32 px[4] = { 0 };
+    XpmInfo info = { 0 };
+    int n = (int)strlen(two);
+
+    if (xpm_info(two, n, &info) != 1)
+        return err(12, "双字符键头解析失败");
+    if (info.cpp != 2 || info.width != 2 || info.ncolors != 2)
+        return err(13, "双字符键头字段不对");
+    if (xpm_decode(two, n, px, 4) != 2)
+        return err(14, "双字符键解码失败");
+    if (px[0] != 0xFF8000FFu)
+        return err(15, "aa 颜色不对");
+    if (px[1] != 0xFF8000FFu)
+        return err(16, "16 位色取高字节不对");
+    /* 坏数据 */
+    if (xpm_info("static char *x[] = { \"4 2 1\"; }", 30, &info) != -1)
+        return err(17, "字段不够应该 -1");
+    if (xpm_info("\"0 1 1 1\"", 9, &info) != -1)
+        return err(18, "宽度 0 应该 -1");
+    if (xpm_decode(xpm_sample, (int)strlen(xpm_sample), px, 2) != -1)
+        return err(19, "容量不够应该 -1");
+    if (xpm_info(0, 10, &info) != -1)
+        return err(20, "空指针应该 -1");
+    /* 像素行长度不对 */
+    {
+        static const char *bad =
+            "\"1 1 1 1\",\n\"a c #fff\",\n\"aa\"}";
+
+        if (xpm_decode(bad, (int)strlen(bad), px, 4) != -1)
+            return err(21, "行宽不符应该 -1");
+    }
+}
