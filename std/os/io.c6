@@ -5,9 +5,9 @@
  *     Reader r = reader_open("input.txt");       // 失败时打开标记为 0
  *     Reader *pr = &r;
  *     char line[256] = { 0 };
- *     while (pr->reader_read_line(line, sizeof(line)) > 0)
+ *     while (pr->read_line(line, sizeof(line)) > 0)
  *         printf("%s\n", line);
- *     pr->reader_close();
+ *     pr->close();
  *
  * 为什么用 `FILE *` 而不是裸 fd：`libtcc1` 的弱依赖里没有 `read`/`write`，
  * 但 `fopen`/`fread`/`fwrite` 在宿主 libc 上到处都有，tcc 自己的 C 运行时
@@ -15,12 +15,11 @@
  * 拿到带缓冲的行读取，语义和 C 程序员的直觉一致。
  *
  * 设计要点：
- * - `Reader`/`Writer` 是普通结构体：方法写成文件作用域函数、接收者是指针。
- *   方法名带 `reader_`/`writer_` 前缀（`reader_read_line`、`writer_flush`），
- *   因为普通结构体不能在体内写方法体，写在体外的函数还会以裸名（`read_line`、
- *   `flush`、`close`）发一个**弱别名**到目标文件里——`write_line` 这类名字太
- *   通用，同一程序里别人（或 `std.text.strbuf` 的 `write`）手写一个同名函数就会跟它
- *   抢符号。带前缀既保住 `pr->read_line()` 这种读法，又不脏全局名字空间；
+ * - `Reader`/`Writer` 是普通结构体：方法写成文件作用域函数、接收者是指针，
+ *   调用写 `pr->read_line()`。方法名直接用 `read_line`/`write_line`/`flush`/
+ *   `close`：模块里的裸名弱别名带模块前缀，和别的模块同名方法不会互相顶掉；
+ *   同一模块里 `Reader`/`Writer` 都叫 `close`/`ok` 也没关系，编译器按接收者
+ *   选符号。标准库里请一律用方法语法，别依赖裸名别名；
  * - 所有读操作 EOF 返回 0、出错返回 -1（**不会只是 0 和 -1 混在一起**）：
  *   返回值 > 0 才是读到的字节数，调用方据此区分「读完了」和「出错了」；
  * - `read_line` 会削掉行尾的 `\n` 与 `\r`（CRLF 文本也能直接用），
@@ -42,7 +41,7 @@ struct Reader {
     FILE *f;
 };
 
-/* 打开文件读；失败返回的 Reader 的 f 为 0（用 reader_ok 查） */
+/* 打开文件读；失败返回的 Reader 的 f 为 0（用 ok 查） */
 Reader reader_open(char *path)
 {
     Reader r = { 0 };
@@ -61,13 +60,13 @@ Reader reader_wrap(FILE *f)
     return r;
 }
 
-int reader_ok(Reader *self) { return self->f != 0; }
+int ok(Reader *self) { return self->f != 0; }
 
-FILE *reader_file(Reader *self) { return self->f; }
+FILE *file(Reader *self) { return self->f; }
 
 /* 从当前 **fd** 读一段，返回读到的字节数；EOF 返回 0，出错返回 -1。
    注意：这里走 fread，所以和用同一个 FILE 的其它函数共享缓冲位置。 */
-int reader_read_bytes(Reader *self, void *buf, int n)
+int read_bytes(Reader *self, void *buf, int n)
 {
     usize got = 0;
 
@@ -84,7 +83,7 @@ int reader_read_bytes(Reader *self, void *buf, int n)
 /* 读一行到 buf（cap 含结尾 NUL）；行尾的 \n 和 \r 被削掉。
    返回读到的字节数（不含 NUL），EOF 且没读到东西返回 0，出错返回 -1。
    一行比 cap 长时：读满 cap-1 个字节就返回，剩下的下次再读。 */
-int reader_read_line(Reader *self, char *buf, int cap)
+int read_line(Reader *self, char *buf, int cap)
 {
     int n = 0;
     int c = 0;
@@ -113,7 +112,7 @@ int reader_read_line(Reader *self, char *buf, int cap)
 
 /* 一次读完整个文件到 dst（cap 含 NUL）：返回字节数，放不下返回 -1
    （不写半截）；出错返回 -1。读完后调用方自己 NUL 结尾（这里会写）。 */
-int reader_read_all(Reader *self, char *dst, int cap)
+int read_all(Reader *self, char *dst, int cap)
 {
     int total = 0;
     usize got = 0;
@@ -136,7 +135,7 @@ int reader_read_all(Reader *self, char *dst, int cap)
 }
 
 /* 跳到指定绝对偏移（成功返回 0）；只对可 seek 的流有意义 */
-int reader_seek_to(Reader *self, long off)
+int seek_to(Reader *self, long off)
 {
     if (!self->f)
         return -1;
@@ -144,19 +143,19 @@ int reader_seek_to(Reader *self, long off)
 }
 
 /* 当前绝对偏移，出错返回 -1 */
-long reader_tell(Reader *self)
+long tell(Reader *self)
 {
     if (!self->f)
         return -1;
     return ftell(self->f);
 }
 
-int reader_eof(Reader *self) { return self->f ? feof(self->f) != 0 : 1; }
+int eof(Reader *self) { return self->f ? feof(self->f) != 0 : 1; }
 
-int reader_error(Reader *self) { return self->f ? ferror(self->f) != 0 : 1; }
+int error(Reader *self) { return self->f ? ferror(self->f) != 0 : 1; }
 
 /* 关掉；已经关过（f 为 0）时什么都不做 */
-void reader_close(Reader *self)
+void close(Reader *self)
 {
     if (self->f) {
         fclose(self->f);
@@ -198,12 +197,12 @@ Writer writer_wrap(FILE *f)
     return w;
 }
 
-int writer_ok(Writer *self) { return self->f != 0; }
+int ok(Writer *self) { return self->f != 0; }
 
-FILE *writer_file(Writer *self) { return self->f; }
+FILE *file(Writer *self) { return self->f; }
 
 /* 写 n 个字节：全写成功返回 n，出错返回 -1 */
-int writer_write_bytes(Writer *self, const void *buf, int n)
+int write_bytes(Writer *self, const void *buf, int n)
 {
     usize put = 0;
 
@@ -216,43 +215,43 @@ int writer_write_bytes(Writer *self, const void *buf, int n)
 }
 
 /* 写一个字节 */
-int writer_write_char(Writer *self, char c)
+int write_char(Writer *self, char c)
 {
-    return writer_write_bytes(self, &c, 1);
+    return self->write_bytes(&c, 1);
 }
 
 /* 写一段字节视图（char[:]，含 Str 内容），不用自己给长度 */
-int writer_write_slice(Writer *self, char[:] s)
+int write_slice(Writer *self, char[:] s)
 {
     if (!s.data || s.len <= 0)
         return 0;
-    return writer_write_bytes(self, s.data, s.len);
+    return self->write_bytes(s.data, s.len);
 }
 
 /* 写一行：内容 + '\n'。返回写入的总字节数，出错 -1 */
-int writer_write_line(Writer *self, char *z)
+int write_line(Writer *self, char *z)
 {
     int n = 0;
 
     if (!self->f || !z)
         return -1;
     n = (int)strlen(z);
-    if (writer_write_bytes(self, z, n) < 0)
+    if (self->write_bytes(z, n) < 0)
         return -1;
-    if (writer_write_char(self, (char)0x0a) < 0)
+    if (self->write_char((char)0x0a) < 0)
         return -1;
     return n + 1;
 }
 
 /* 刷新缓冲区；成功返回 0 */
-int writer_flush(Writer *self)
+int flush(Writer *self)
 {
     if (!self->f)
         return -1;
     return fflush(self->f) == 0 ? 0 : -1;
 }
 
-void writer_close(Writer *self)
+void close(Writer *self)
 {
     if (self->f) {
         fclose(self->f);
@@ -283,7 +282,7 @@ CFile cfile_iter(FILE *f, char *buf, int cap)
     return it;
 }
 
-int cfile_has(CFile *self)
+int has(CFile *self)
 {
     Reader r = { 0 };
     int k = 0;
@@ -291,7 +290,7 @@ int cfile_has(CFile *self)
     if (!self->ok)
         return 0;
     r.f = self->f;
-    k = reader_read_line(&r, self->buf, self->cap);
+    k = r.read_line( self->buf, self->cap);
     if (k <= 0) {
         self->ok = 0;
         self->n = 0;
@@ -304,7 +303,7 @@ int cfile_has(CFile *self)
 /* 当前行的视图（不含 \n，指向调用方给的 buffer）。
    返回 char[:] 而不是 Str：io 这一层不依赖 std.text.str 的实体（stdtest 逐个文件
    单独链接），调用方要 Str 时自己包一层 `Str s = { line };`。 */
-char[:] cfile_next(CFile *self)
+char[:] next(CFile *self)
 {
     return (char[:]){ self->buf, self->n };
 }
@@ -323,28 +322,28 @@ test "写文件再读回来" {
     char buf[64] = { 0 };
     int n = 0;
 
-    if (!pw->writer_ok())
+    if (!pw->ok())
         return err(1, "写打开失败");
-    if (pw->writer_write_line((char *)"hello") != 6)
+    if (pw->write_line((char *)"hello") != 6)
         return err(2, "write_line 返回值不对");
-    if (pw->writer_write_bytes("world", 5) != 5)
+    if (pw->write_bytes("world", 5) != 5)
         return err(3, "write_bytes 不对");
-    if (pw->writer_flush() != 0)
+    if (pw->flush() != 0)
         return err(4, "flush 失败");
-    pw->writer_close();
+    pw->close();
 
-    if (!pr->reader_ok())
+    if (!pr->ok())
         return err(5, "读打开失败");
-    n = pr->reader_read_line(buf, sizeof(buf));
+    n = pr->read_line(buf, sizeof(buf));
     if (n != 5 || strcmp(buf, "hello") != 0)
         return err(6, "第一行不对");
-    n = pr->reader_read_all(buf, sizeof(buf));
+    n = pr->read_all(buf, sizeof(buf));
     if (n != 5 || strcmp(buf, "world") != 0)
         return err(7, "剩余内容不对");
-    if (pr->reader_read_line(buf, sizeof(buf)) != 0)
+    if (pr->read_line(buf, sizeof(buf)) != 0)
         return err(8, "EOF 应返回 0");
-    pr->reader_close();
-    pr->reader_close();   /* 关两次是安全的 */
+    pr->close();
+    pr->close();   /* 关两次是安全的 */
 }
 
 test "read_line 削掉 CRLF 的行尾" {
@@ -354,16 +353,16 @@ test "read_line 削掉 CRLF 的行尾" {
     Reader *pr = &r;
     char buf[32] = { 0 };
 
-    pw->writer_write_bytes("a\r\nb\r\n", 6);
-    pw->writer_close();
+    pw->write_bytes("a\r\nb\r\n", 6);
+    pw->close();
     pr->f = fopen(tmp_path(), "rb");
     if (!pr->f)
         return err(9, "重新打开失败");
-    if (pr->reader_read_line(buf, sizeof(buf)) != 1 || strcmp(buf, "a") != 0)
+    if (pr->read_line(buf, sizeof(buf)) != 1 || strcmp(buf, "a") != 0)
         return err(10, "CRLF 第一行没削干净");
-    if (pr->reader_read_line(buf, sizeof(buf)) != 1 || strcmp(buf, "b") != 0)
+    if (pr->read_line(buf, sizeof(buf)) != 1 || strcmp(buf, "b") != 0)
         return err(11, "CRLF 第二行没削干净");
-    pr->reader_close();
+    pr->close();
 }
 
 test "read_line 遇到超长行截断但不丢数据" {
@@ -373,29 +372,29 @@ test "read_line 遇到超长行截断但不丢数据" {
     Reader *pr = &r;
     char buf[5] = { 0 };
 
-    pw->writer_write_bytes("abcdefgh\n", 9);
-    pw->writer_close();
+    pw->write_bytes("abcdefgh\n", 9);
+    pw->close();
     pr->f = fopen(tmp_path(), "rb");
     if (!pr->f)
         return err(12, "重新打开失败");
-    if (pr->reader_read_line(buf, 5) != 4 || strcmp(buf, "abcd") != 0)
+    if (pr->read_line(buf, 5) != 4 || strcmp(buf, "abcd") != 0)
         return err(13, "截断部分不对");
-    if (pr->reader_read_line(buf, 5) != 4 || strcmp(buf, "efgh") != 0)
+    if (pr->read_line(buf, 5) != 4 || strcmp(buf, "efgh") != 0)
         return err(14, "剩余部分丢了");
-    if (pr->reader_read_line(buf, 5) != 0)
+    if (pr->read_line(buf, 5) != 0)
         return err(15, "应当已经到 EOF");
-    pr->reader_close();
+    pr->close();
 }
 
 test "打开不存在的文件不崩" {
     Reader r = reader_open((char *)"build/definitely-not-here-xyz.txt");
     Reader *pr = &r;
 
-    if (pr->reader_ok() != 0)
+    if (pr->ok() != 0)
         return err(16, "不存在的文件不该打开成功");
-    if (pr->reader_read_bytes((char *)0, 0) != 0)
+    if (pr->read_bytes((char *)0, 0) != 0)
         return err(17, "空读应当返回 0");
-    pr->reader_close();
+    pr->close();
 }
 
 test "CFile 迭代器零分配按行读" {
@@ -407,16 +406,16 @@ test "CFile 迭代器零分配按行读" {
     CFile *pit = &it;
     int lines = 0, total = 0;
 
-    pw->writer_write_line((char *)"one");
-    pw->writer_write_line((char *)"two");
-    pw->writer_write_line((char *)"three");
-    pw->writer_close();
+    pw->write_line((char *)"one");
+    pw->write_line((char *)"two");
+    pw->write_line((char *)"three");
+    pw->close();
     f = fopen(tmp_path(), "rb");
     if (!f)
         return err(18, "重新打开失败");
     it = cfile_iter(f, buf, sizeof(buf));
-    while (pit->cfile_has()) {
-        char[:] line = pit->cfile_next();
+    while (pit->has()) {
+        char[:] line = pit->next();
 
         lines++;
         total += line.len;

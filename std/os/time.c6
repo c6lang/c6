@@ -8,7 +8,7 @@
  *
  *     Duration d = duration_ms(3725);          // 3.725 秒
  *     Buf... 或 char buf[32];
- *     (&d)->format(buf, sizeof(buf));          // "1h2m5.000s"（= duration_format(&d, ...)）
+ *     (&d)->format(buf, sizeof(buf));          // "1h2m5.000s"（= d.format( ...)）
  *
  * 两个时钟：
  * - `now_ns()`：单调时钟（CLOCK_MONOTONIC），只用来算**间隔**，绝对值和
@@ -131,7 +131,7 @@ Duration duration_between(u64 a, u64 b)
 }
 
 /* 总毫秒数（方便再塞回别的接口） */
-i64 duration_total_ms(Duration *self)
+i64 total_ms(Duration *self)
 {
     return (i64)self->days * 86400000ll + (i64)self->hours * 3600000ll +
            (i64)self->mins * 60000ll + (i64)self->secs * 1000ll +
@@ -193,7 +193,7 @@ static int put_nd(char *dst, int v, int width)
 /* 格式化：<<"1d2h3m4s"、"5.250s"、"12ms"、"800us">>。
    把结果写进 dst（含 NUL），返回长度；空间不够返回 -1 且不写半截。
    规则：有天后就不再写秒的零头；不足 1 秒时按 ms / us 选单位。 */
-int duration_format(Duration *self, char *dst, int cap)
+int format(Duration *self, char *dst, int cap)
 {
     char tmp[64] = { 0 };
     int k = 0, i = 0;
@@ -291,7 +291,7 @@ Civil civil_from_unix(i64 t)
 }
 
 /* Civil -> Unix 秒（civil_from_unix 的逆） */
-i64 civil_to_unix(Civil *c)
+i64 to_unix(Civil *c)
 {
     i64 y = (i64)c->year;
     i64 m = (i64)c->month;
@@ -314,7 +314,7 @@ i64 civil_to_unix(Civil *c)
 }
 
 /* ISO 8601：<<"1970-01-02 03:04:05">>（UTC）。返回长度，放不下 -1。 */
-int civil_format(Civil *c, char *dst, int cap)
+int format(Civil *c, char *dst, int cap)
 {
     char tmp[32] = { 0 };
     int k = 0;
@@ -371,7 +371,7 @@ test "duration_ms 拆分与回转" {
         return err(6, "3725000ms 拆分不对");
     if (d.nanos != 0)
         return err(7, "整秒的 nanos 应为 0");
-    if (duration_total_ms(&d) != 3725000ll)
+    if (d.total_ms() != 3725000ll)
         return err(8, "回转不一致");
     d = duration_ms(-5);
     if (d.days != 0 || d.secs != 0)
@@ -381,7 +381,7 @@ test "duration_ms 拆分与回转" {
         return err(10, "跨天拆分不对");
 }
 
-test "duration_between 与 duration_format" {
+test "duration_between 与 format" {
     char buf[32] = { 0 };
     Duration d = duration_ms(3725000ll);
     Duration small = duration_ms(12);
@@ -389,31 +389,31 @@ test "duration_between 与 duration_format" {
     u64 a = 1000000000ull;
     u64 b = 1000000000ull + 500000000ull;
 
-    if (duration_format(&d, buf, sizeof(buf)) <= 0)
-        return err(11, "duration_format 失败");
+    if (d.format( buf, sizeof(buf)) <= 0)
+        return err(11, "format 失败");
     if (strcmp(buf, "1h2m5s") != 0)
         return err(12, "整时长格式不对");
-    if (duration_format(&small, buf, sizeof(buf)) <= 0 || strcmp(buf, "12ms") != 0)
+    if (small.format( buf, sizeof(buf)) <= 0 || strcmp(buf, "12ms") != 0)
         return err(13, "毫秒格式不对");
-    if (duration_format(&frac, buf, sizeof(buf)) <= 0 || strcmp(buf, "5.250s") != 0)
+    if (frac.format( buf, sizeof(buf)) <= 0 || strcmp(buf, "5.250s") != 0)
         return err(14, "带小数秒格式不对");
-    if (duration_format(&d, buf, 3) != -1)
+    if (d.format( buf, 3) != -1)
         return err(15, "空间不够应当返回 -1");
     if (duration_between(a, b).nanos != 500000000)
         return err(16, "duration_between 不对");
 }
 
-test "civil_from_unix / civil_to_unix 互逆" {
+test "civil_from_unix / to_unix 互逆" {
     Civil c = civil_from_unix(0);
     i64 back = 0;
     Civil e = { 2024, 2, 29, 12, 30, 45, 0 };
-    i64 t = civil_to_unix(&e);
+    i64 t = e.to_unix();
 
     if (c.year != 1970 || c.month != 1 || c.day != 1 || c.hour != 0)
         return err(17, "epoch 拆出来不对");
     if (c.wday != 4)
         return err(18, "1970-01-01 应当是周四");
-    back = civil_to_unix(&c);
+    back = c.to_unix();
     if (back != 0)
         return err(19, "epoch 回转不是 0");
     if (t != 1709209845ll)
@@ -423,19 +423,19 @@ test "civil_from_unix / civil_to_unix 互逆" {
         return err(21, "闰日回转不对");
 }
 
-test "civil_format 输出 ISO 8601" {
+test "format 输出 ISO 8601" {
     char buf[32] = { 0 };
     Civil c = civil_from_unix(0);
     Civil d = { 2024, 2, 29, 1, 2, 3, 0 };
 
-    if (civil_format(&c, buf, sizeof(buf)) != 19)
+    if (c.format( buf, sizeof(buf)) != 19)
         return err(22, "ISO 格式长度应当是 19");
     if (strcmp(buf, "1970-01-01 00:00:00") != 0)
         return err(23, "epoch 的 ISO 文本不对");
-    if (civil_format(&d, buf, sizeof(buf)) <= 0 ||
+    if (d.format( buf, sizeof(buf)) <= 0 ||
         strcmp(buf, "2024-02-29 01:02:03") != 0)
         return err(24, "闰日的 ISO 文本不对");
-    if (civil_format(&d, buf, 5) != -1)
+    if (d.format( buf, 5) != -1)
         return err(25, "空间不够应当返回 -1");
 }
 

@@ -545,7 +545,7 @@ struct Split {
 
 /* 切分器有 `has()`/`next()` 两个方法，`foreach` 就能直接吃它。
    普通结构体不能在体内写方法体（只认第一个形参是指针），所以照旧写在体外：
-   第一个形参是指针就自动注册成方法，`it->has()` 和 `has(&it)` 是同一个调用。 */
+   第一个形参是指针就自动注册成方法，`it->has()` 和 `it.has()` 是同一个调用。 */
 int has(Split *self)
 {
     while (self->pos < self->s.len) {

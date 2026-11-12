@@ -130,8 +130,8 @@ static void tour_url(void)
     check(str_is(&u.path, "/a/b"), "url: path");
     check(str_is(&u.query, "q=1&r=2"), "url: query");
     check(str_is(&u.fragment, "frag"), "url: fragment");
-    check(url_effective_port(&u) == 8443, "url: 显式端口优先");
-    check(url_effective_port(&(Url){ 0 }) == -1, "url: 空 URL 没有默认端口");
+    check(u.effective_port() == 8443, "url: 显式端口优先");
+    check(((Url){ 0 }).effective_port() == -1, "url: 空 URL 没有默认端口");
 
     /* IPv6 字面量里的冒号不是端口分隔符 */
     {
@@ -139,24 +139,24 @@ static void tour_url(void)
 
         check(v6.ok == 1 && str_is(&v6.host, "[::1]") && v6.port == 9090,
               "url: IPv6 字面量");
-        check(url_effective_port(&v6) == 9090, "url: IPv6 的端口");
+        check(v6.effective_port() == 9090, "url: IPv6 的端口");
     }
 
     /* 默认端口 */
     {
         Url h = url_parse(S("http://h/"));
 
-        check(url_effective_port(&h) == 80, "url: http 默认 80 端口");
+        check(h.effective_port() == 80, "url: http 默认 80 端口");
     }
 
     /* 查询参数逐个取出 */
-    check(url_next_pair(&u.query, &at, &p) == 1 && str_is(&p.key, "q")
+    check(u.query.next_pair(&at, &p) == 1 && str_is(&p.key, "q")
               && str_is(&p.value, "1"),
           "url: 第一个参数");
-    check(url_next_pair(&u.query, &at, &p) == 1 && str_is(&p.key, "r")
+    check(u.query.next_pair(&at, &p) == 1 && str_is(&p.key, "r")
               && str_is(&p.value, "2"),
           "url: 第二个参数");
-    check(url_next_pair(&u.query, &at, &p) == 0, "url: 参数取完");
+    check(u.query.next_pair(&at, &p) == 0, "url: 参数取完");
 
     /* 相对解析：RFC 3986 §5.4 的几条代表 */
     n = url_resolve(S("http://a/b/c/d;p?q"), S("../g"), out, sizeof out);
@@ -190,7 +190,7 @@ static void tour_url(void)
 static void tour_uuid(void)
 {
     Uuid ns = uuid_ns_dns();
-    Uuid v5 = uuid_v5(&ns, S("www.example.com"));
+    Uuid v5 = ns.v5( S("www.example.com"));
     Uuid v4 = uuid_v4();
     Rand r = rand_seed(20240101ull);
     Uuid v7a = uuid_v7_at(1700000000123ull, &r);
@@ -200,34 +200,34 @@ static void tour_uuid(void)
     char simple[40] = { 0 };
 
     /* v5 是确定的，用 Python uuid5 的结果钉住 */
-    check(uuid_format(&v5, buf, sizeof buf) == 36
+    check(v5.format( buf, sizeof buf) == 36
               && strcmp(buf, "2ed6657d-e927-568b-95e1-2665a8aea6a2") == 0,
           "uuid: v5 已知向量");
-    check(uuid_version(&v5) == 5 && uuid_variant(&v5) == 1,
+    check(v5.version() == 5 && v5.variant() == 1,
           "uuid: v5 的版本与变体");
     /* 同一输入永远同一结果 */
     {
-        Uuid again = uuid_v5(&ns, S("www.example.com"));
+        Uuid again = ns.v5( S("www.example.com"));
 
-        check(uuid_eq(&v5, &again), "uuid: v5 确定性");
+        check(v5.eq( &again), "uuid: v5 确定性");
     }
 
     /* v4：随机，版本位固定 */
-    check(uuid_version(&v4) == 4 && uuid_variant(&v4) == 1
-              && !uuid_is_nil(&v4),
+    check(v4.version() == 4 && v4.variant() == 1
+              && !v4.is_nil(),
           "uuid: v4 的版本与变体");
 
     /* v7：前 48 位是毫秒时间戳，字典序 = 时间序 */
-    check(uuid_version(&v7a) == 7 && uuid_time_v7(&v7a) == 1700000000123ull,
+    check(v7a.version() == 7 && v7a.time_v7() == 1700000000123ull,
           "uuid: v7 时间戳");
     check(memcmp(v7a.b, v7b.b, 6) < 0, "uuid: v7 前 6 字节按时间递增");
 
     /* 格式化 / 解析往返 */
-    uuid_format(&v5, buf, sizeof buf);
+    v5.format( buf, sizeof buf);
     check(uuid_parse((char[:]){ buf, (int)strlen(buf) }, &back) == 1
-              && uuid_eq(&v5, &back),
+              && v5.eq( &back),
           "uuid: 格式化再解析还原");
-    uuid_format_simple(&v5, simple, sizeof simple);
+    v5.format_simple( simple, sizeof simple);
     check(strlen(simple) == 32
               && strcmp(simple, "2ed6657de927568b95e12665a8aea6a2") == 0,
           "uuid: simple 形式");
@@ -237,7 +237,7 @@ static void tour_uuid(void)
     {
         Uuid nil = uuid_nil();
 
-        check(uuid_is_nil(&nil) && uuid_version(&nil) == 0, "uuid: nil");
+        check(nil.is_nil() && nil.version() == 0, "uuid: nil");
     }
 }
 

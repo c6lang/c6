@@ -5,7 +5,7 @@
  *     u8 buf[512] = { 0 };
  *     Arena a = arena_make(buf, sizeof(buf));   // 借用栈上的一段字节
  *     Arena *pa = &a;
- *     int *p = (int *)pa->arena_alloc(4, 4);          // 4 字节对齐
+ *     int *p = (int *)pa->alloc(4, 4);          // 4 字节对齐
  *     if (!p) return err(1, "arena 满了");
  *
  * 分工：
@@ -19,9 +19,10 @@
  *   分配器常用的小工具。
  *
  * 写法约定：`Arena` 是普通（非泛型）结构体，方法只能写成文件作用域的
- * 函数（第一个参数 `Arena *self`），调用写 `pa->arena_room()`。方法名是
- * `arena_room`/`arena_used`/`arena_reset`/`arena_alloc`：`alloc`/`reset`
- * 这类裸名会以弱别名发出，和同程序里别的 `alloc` 抢符号。
+ * 函数（第一个参数 `Arena *self`），调用写 `pa->room()`。方法名直接用
+ * `room`/`used`/`reset`/`alloc`：模块里的裸名弱别名带模块前缀，不会和
+ * 同程序里别的 `alloc` 抢符号；`alloc_array`/`alloc_str`/`alloc_copy`
+ * 是同一接收者的不同方法。
  *
  * 为什么 Arena 用纯值：它只有三个指针字段，没有托管引用，所以能按值声明、
  * 按值传参。按值传参**复制游标**：副本各自分配，互不影响；需要共享时传
@@ -55,19 +56,19 @@ Arena arena_make(void *buf, int n)
 }
 
 /* 还剩多少字节 */
-int arena_room(Arena *self) { return (int)(self->end - self->cur); }
+int room(Arena *self) { return (int)(self->end - self->cur); }
 
 /* 已经用掉多少字节 */
-int arena_used(Arena *self) { return (int)(self->cur - self->base); }
+int used(Arena *self) { return (int)(self->cur - self->base); }
 
-int arena_is_empty(Arena *self) { return self->cur == self->base; }
+int is_empty(Arena *self) { return self->cur == self->base; }
 
 /* 把游标退回起点，整段重新可用（旧指针一律失效） */
-void arena_reset(Arena *self) { self->cur = self->base; }
+void reset(Arena *self) { self->cur = self->base; }
 
 /* 分配 size 字节、按 align（1/2/4/8/16…）对齐；不够返回 0，**不改游标**。
    align 为 0 或不是 2 的幂时按 1 处理。 */
-void *arena_alloc(Arena *self, int size, int align)
+void *alloc(Arena *self, int size, int align)
 {
     usize a = align > 0 ? (usize)align : 1u;
     usize start = 0u;
@@ -84,7 +85,7 @@ void *arena_alloc(Arena *self, int size, int align)
 }
 
 /* 分配 n 个元素、每个 size 字节，元素大小是 2 的幂时按元素对齐 */
-void *arena_alloc_array(Arena *self, int n, int size)
+void *alloc_array(Arena *self, int n, int size)
 {
     usize total = 0u;
     usize a = size > 0 ? (usize)size : 1u;
@@ -94,18 +95,18 @@ void *arena_alloc_array(Arena *self, int n, int size)
     total = a * (usize)n;
     if (total > 0x7fffffffu)
         return 0;
-    return arena_alloc(self, (int)total, is_pow2_u(a) ? size : 1);
+    return self->alloc((int)total, is_pow2_u(a) ? size : 1);
 }
 
 /* 从 Arena 分配一块能放下 n 个字节 + 结尾 NUL 的内存并清零，
    返回可当 char* 用的指针；放不下返回 0。调用方自己 memcpy 内容。 */
-char *arena_alloc_str(Arena *self, int n)
+char *alloc_str(Arena *self, int n)
 {
     char *p = 0;
 
     if (n < 0)
         return 0;
-    p = (char *)arena_alloc(self, n + 1, 1);
+    p = (char *)self->alloc(n + 1, 1);
     if (p == 0)
         return 0;
     p[n] = 0;
@@ -113,7 +114,7 @@ char *arena_alloc_str(Arena *self, int n)
 }
 
 /* 从 Arena 复制一个 C 字符串（含 NUL）：失败返回 0 */
-char *arena_alloc_copy(Arena *self, const char *z)
+char *alloc_copy(Arena *self, const char *z)
 {
     usize n = 0;
     char *p = 0;
@@ -123,7 +124,7 @@ char *arena_alloc_copy(Arena *self, const char *z)
     n = strlen(z);
     if (n > 0x7fffffffu)
         return 0;
-    p = (char *)arena_alloc(self, (int)n + 1, 1);
+    p = (char *)self->alloc((int)n + 1, 1);
     if (p == 0)
         return 0;
     memcpy(p, z, n + 1);
@@ -272,27 +273,27 @@ test "Arena 按对齐分配，满了返回 0 且不改游标" {
     char *c = 0;
     int before = 0;
 
-    p = (int *)pa->arena_alloc(sizeof(int), 4);
+    p = (int *)pa->alloc(sizeof(int), 4);
     if (p == 0 || !is_aligned(p, 4u))
         return err(1, "int 分配没按 4 对齐");
-    c = (char *)pa->arena_alloc(1, 1);
+    c = (char *)pa->alloc(1, 1);
     if (c == 0)
         return err(2, "char 分配失败");
     *p = 7;
     *c = 'x';
     if (*p != 7 || *c != 'x')
         return err(3, "分配到的内存不可写");
-    if (pa->arena_used() < 5)
+    if (pa->used() < 5)
         return err(4, "used 不对");
-    before = pa->arena_used();
-    if (pa->arena_alloc(1000, 1) != 0)
+    before = pa->used();
+    if (pa->alloc(1000, 1) != 0)
         return err(5, "超出容量没有返回 0");
-    if (pa->arena_used() != before)
+    if (pa->used() != before)
         return err(6, "分配失败时改动了游标");
-    pa->arena_reset();
-    if (pa->arena_used() != 0 || !pa->arena_is_empty())
+    pa->reset();
+    if (pa->used() != 0 || !pa->is_empty())
         return err(7, "reset 之后没有回到起点");
-    if (pa->arena_alloc(64, 1) == 0)
+    if (pa->alloc(64, 1) == 0)
         return err(8, "reset 之后应当能重新分配整段");
 }
 
@@ -302,11 +303,11 @@ test "Arena 按值复制会复制游标，互不影响" {
     Arena b = a;
     Arena *pb = &b;
 
-    if ((&a)->arena_alloc(8, 1) == 0)
+    if ((&a)->alloc(8, 1) == 0)
         return err(9, "a 分配失败");
-    if (pb->arena_used() != 0)
+    if (pb->used() != 0)
         return err(10, "副本不该看到 a 的分配");
-    if ((&a)->arena_used() != 8)
+    if ((&a)->used() != 8)
         return err(11, "a 的 used 不对");
 }
 
@@ -384,7 +385,7 @@ test "Arena 分配字符串与拷贝 C 字符串" {
     char *c = 0;
     char *big = 0;
 
-    s = pa->arena_alloc_str(5);
+    s = pa->alloc_str(5);
     if (s == 0)
         return err(29, "alloc_str 失败");
     if (s[0] != 0 || s[5] != 0)
@@ -392,7 +393,7 @@ test "Arena 分配字符串与拷贝 C 字符串" {
     memcpy(s, "hello", 5);
     if (strcmp(s, "hello") != 0)
         return err(31, "alloc_str 的内存不可写");
-    c = pa->arena_alloc_copy((const char *)"world");
+    c = pa->alloc_copy((const char *)"world");
     if (c == 0)
         return err(32, "alloc_copy 失败");
     if (strcmp(c, "world") != 0)
@@ -400,9 +401,9 @@ test "Arena 分配字符串与拷贝 C 字符串" {
     if (c == s)
         return err(34, "两次分配不该重合");
     /* 64 字节的池子：5+1 + 5+1 之后还剩不少，但要不到 1000 字节 */
-    big = pa->arena_alloc_str(1000);
+    big = pa->alloc_str(1000);
     if (big != 0)
         return err(35, "超出容量应当返回 0");
-    if (pa->arena_alloc_copy(0) != 0)
+    if (pa->alloc_copy(0) != 0)
         return err(36, "拷贝 NULL 应当返回 0");
 }

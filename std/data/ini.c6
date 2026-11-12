@@ -5,7 +5,7 @@
  *     IniReader r = ini_open(S("[db]\nhost = localhost\nport = 5432\n"));
  *     IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
  *                    { { (char *)0, 0 } }, 0 };
- *     while (ini_next(&r, &e) == 1) {
+ *     while (r.next( &e) == 1) {
  *         // e.section / e.key / e.value 都是输入上的视图
  *     }
  *
@@ -24,7 +24,7 @@
  * - `key = value` 用**第一个** `=` 分隔，两侧空白 trim，所以值里可以再出现
  *   `=`；值可以为空（`k =`）；键不能为空；
  * - 第一节之前的键属于「根区」，它的 `section` 是空视图；
- * - 不合上面任何一条的非空行都是**语法错误**：`ini_next` 返回 -1，并把行号
+ * - 不合上面任何一条的非空行都是**语法错误**：`next` 返回 -1，并把行号
  *   记在 `r.err` 里（1 起）。错误之后游标停在坏行之后，可以继续读下一行。
  *
  * 不做的事：不做类型转换、不处理转义、不合并续行、不解析引号——需要这些就
@@ -88,7 +88,7 @@ IniReader ini_open(char[:] text)
 }
 
 /* 取下一对键值：1 = 有，0 = 读完了，-1 = 语法错误（行号在 r->err） */
-int ini_next(IniReader *r, IniEntry *out)
+int next(IniReader *r, IniEntry *out)
 {
     if (!r || !out)
         return -1;
@@ -166,7 +166,7 @@ int ini_lookup(char[:] text, char[:] section, char[:] key, Str *out)
     if (!out || key.len <= 0)
         return 0;
     for (;;) {
-        rc = ini_next(&r, &e);
+        rc = r.next( &e);
         if (rc == 0)
             break;
         if (rc < 0)
@@ -191,7 +191,7 @@ int ini_has_section(char[:] text, char[:] section)
     int rc = 0;
 
     for (;;) {
-        rc = ini_next(&r, &e);
+        rc = r.next( &e);
         if (rc == 0)
             return 0;
         if (rc < 0)
@@ -211,7 +211,7 @@ int ini_count(char[:] text, char[:] section)
     int rc = 0;
 
     for (;;) {
-        rc = ini_next(&r, &e);
+        rc = r.next( &e);
         if (rc == 0)
             return n;
         if (rc < 0)
@@ -244,7 +244,7 @@ test "基本形态：根区、节、键值" {
     IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                    { { (char *)0, 0 } }, 0 };
 
-    if (ini_next(&r, &e) != 1)
+    if (r.next( &e) != 1)
         return err(1, "第一条没读出来");
     if (e.section.s.len != 0)
         return err(2, "第一条应当在根区");
@@ -252,7 +252,7 @@ test "基本形态：根区、节、键值" {
         return err(3, "第一条键值不对");
     if (e.line != 1)
         return err(4, "行号不对");
-    if (ini_next(&r, &e) != 1)
+    if (r.next( &e) != 1)
         return err(5, "第二条没读出来");
     if (!str_is(e.section, "db", 2))
         return err(6, "第二条的节不对");
@@ -260,14 +260,14 @@ test "基本形态：根区、节、键值" {
         return err(7, "host 不对");
     if (e.line != 4)
         return err(8, "空行也该计行号");
-    if (ini_next(&r, &e) != 1)
+    if (r.next( &e) != 1)
         return err(9, "第三条没读出来");
     if (!str_is(e.key, "port", 4) || !str_is(e.value, "5432", 4))
         return err(10, "port 不对");
-    if (ini_next(&r, &e) != 0)
+    if (r.next( &e) != 0)
         return err(11, "读完之后应当返回 0");
     /* 反复调用仍然是 0 */
-    if (ini_next(&r, &e) != 0)
+    if (r.next( &e) != 0)
         return err(12, "读完之后再读还是 0");
     if (r.err != 0)
         return err(13, "正常文本不该记错误");
@@ -285,25 +285,25 @@ test "trim、注释、CRLF、空值、值里带等号" {
     IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                    { { (char *)0, 0 } }, 0 };
 
-    if (ini_next(&r, &e) != 1)
+    if (r.next( &e) != 1)
         return err(14, "第一条没读出来");
     if (!str_is(e.section, "sec", 3))
         return err(15, "节名两侧空白应当 trim 掉");
     if (!str_is(e.key, "key", 3) || !str_is(e.value, "value with space", 16))
         return err(16, "键值 trim 不对");
-    if (ini_next(&r, &e) != 1)
+    if (r.next( &e) != 1)
         return err(17, "第二条没读出来");
     if (!str_is(e.value, "", 0))
         return err(18, "空值应当给空视图");
-    if (ini_next(&r, &e) != 1)
+    if (r.next( &e) != 1)
         return err(19, "第三条没读出来");
     if (!str_is(e.value, "a=b", 3))
         return err(20, "值里应当能再出现等号");
-    if (ini_next(&r, &e) != 1)
+    if (r.next( &e) != 1)
         return err(21, "第四条没读出来");
     if (!str_is(e.value, "http://h/x#frag", 15))
         return err(22, "行内 # 不是注释");
-    if (ini_next(&r, &e) != 0)
+    if (r.next( &e) != 0)
         return err(23, "应当读完了");
 }
 
@@ -314,7 +314,7 @@ test "同名节合并、根区回到空节" {
                    { { (char *)0, 0 } }, 0 };
     int seen_a = 0;
 
-    while (ini_next(&r, &e) == 1) {
+    while (r.next( &e) == 1) {
         if (str_is(e.section, "a", 1))
             seen_a++;
     }
@@ -331,11 +331,11 @@ test "语法错误：坏节头、空键、没有等号" {
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != -1)
+        if (r.next( &e) != -1)
             return err(26, "缺右括号应当报错");
         if (r.err != 1)
             return err(27, "错误行号应当是 1");
-        if (ini_next(&r, &e) != 1)
+        if (r.next( &e) != 1)
             return err(28, "坏行之后应当还能继续读");
         if (!str_is(e.section, "", 0) || !str_is(e.key, "k", 1))
             return err(29, "坏行之后的键应当在根区");
@@ -346,7 +346,7 @@ test "语法错误：坏节头、空键、没有等号" {
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != -1)
+        if (r.next( &e) != -1)
             return err(30, "空键应当报错");
         if (r.err != 1)
             return err(31, "空键的错误行号不对");
@@ -357,7 +357,7 @@ test "语法错误：坏节头、空键、没有等号" {
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != -1)
+        if (r.next( &e) != -1)
             return err(32, "没有等号应当报错");
         if (r.err != 1)
             return err(33, "没有等号的错误行号不对");
@@ -368,7 +368,7 @@ test "语法错误：坏节头、空键、没有等号" {
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != 1)
+        if (r.next( &e) != 1)
             return err(34, "空节名应当允许");
         if (e.section.s.len != 0)
             return err(35, "空节名等于根区");
@@ -430,7 +430,7 @@ test "边界：空文本、无结尾换行、只有注释、坏行阻止 lookup"
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != 0)
+        if (r.next( &e) != 0)
             return err(50, "空文本应当直接返回 0");
         if (r.err != 0)
             return err(51, "空文本不该报错");
@@ -441,9 +441,9 @@ test "边界：空文本、无结尾换行、只有注释、坏行阻止 lookup"
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != 1 || !str_is(e.value, "v", 1))
+        if (r.next( &e) != 1 || !str_is(e.value, "v", 1))
             return err(52, "没有结尾换行的最后一行也该读出来");
-        if (ini_next(&r, &e) != 0)
+        if (r.next( &e) != 0)
             return err(53, "之后应当结束");
     }
     {
@@ -452,7 +452,7 @@ test "边界：空文本、无结尾换行、只有注释、坏行阻止 lookup"
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != 0)
+        if (r.next( &e) != 0)
             return err(54, "只有注释应当返回 0");
     }
     /* 坏行在前面时 lookup 直接给 0，不假装读到了后面的键 */
@@ -473,7 +473,7 @@ test "边界：空文本、无结尾换行、只有注释、坏行阻止 lookup"
         IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                        { { (char *)0, 0 } }, 0 };
 
-        if (ini_next(&r, &e) != 0)
+        if (r.next( &e) != 0)
             return err(58, "空指针视图应当像空文本");
     }
 }

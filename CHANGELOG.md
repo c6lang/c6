@@ -27,6 +27,15 @@
 
 ### 标准库
 
+- **标准库方法化**：`std/` 的普通结构体方法去掉 `reader_`/`writer_`/`cfile_`/`sha256_`/
+  `arena_`/`random_`/`uuid_`/`inet_` 之类的接收者前缀，统一成 `pr->read_line(...)`、
+  `b->write(...)`、`r.next_u64()`、`a.json_parse(...)`、`ip.is_private()`。方法符号
+  仍是 `<Tag>_<name>`；模块里的裸名弱别名带模块前缀，所以 `close`/`ok`/`next`/`format`
+  这些同名方法在不同结构体、不同模块之间可以共存，`foreach` 的 `has`/`next` 保持
+  字面名不变。工厂和一次性函数（`reader_open`/`rand_seed`/`bw_open`/`csv_reader`/
+  `ini_open`）仍是自由函数。`std/`、`examples/std*.c6`、`docs/stdlib.md`、`README.md`
+  已全部改用方法语法。
+
 - **标准库分目录**：`std/` 从平铺改成按领域分七个子目录。模块名就是路径，所以
   模块名多了一段（`std.vec` → `std.container.vec`、`std.err` → `std.core.err`）。
   分组：
@@ -48,7 +57,7 @@
   集成示例 `examples/stdnet.c6`（`make std-net`）。inet 的 IPv6 输出按 RFC 5952
   规范化（最长零段压缩、同长取第一个、v4-mapped 写点分），解析对前导零/多余冒号
   一律严格；bitbuf 是 MSB-first 的位读写器，越界只报 `FULL`/`SHORT` 而不写半截，
-  `bw_patch` 支持不移动游标的回填；pqueue 是托管二叉堆，比较器与 `std.container.sort` 通用，
+  `patch` 支持不移动游标的回填；pqueue 是托管二叉堆，比较器与 `std.container.sort` 通用，
   带 `push_pop`（top-k）与 `heapify`；ini 是零分配迭代读取器，坏行给准确行号。
   错误号段 `std.net.inet`=0x6021 … `std.data.ini`=0x6024。
 - **标准库第五批**：`std.encoding.base64` / `std.net.url` / `std.encoding.uuid` / `std.net.mime` 四个模块，

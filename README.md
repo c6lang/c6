@@ -168,7 +168,7 @@ std/core/                   基础：定宽类型、错误码、内存、数学�
   std/core/hash.c6          std.core.hash          FNV-1a 32/64、CRC32、Adler-32 + 流式 Hasher
   std/core/math.c6          std.core.math          整数 gcd/lcm/ipow/clamp/floor_div/mod + 浮点 sqrt/floor/ceil/round（不链 libm）
   std/core/mem.c6           std.core.mem           借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
-  std/core/rand.c6          std.core.rand          xorshift64*：可重放序列、无偏区间 below/int、f64、shuffle（方法名 random_*）
+  std/core/rand.c6          std.core.rand          xorshift64*：可重放序列、无偏区间 below/int_range、next_f64/next_bool、fill/shuffle
   std/core/types.c6         std.core.types         定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
 
 std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换
@@ -192,26 +192,26 @@ std/container/              容器与算法：向量、跨度、映射、集合�
 std/os/                     操作系统：流、文件系统、路径、环境变量、时间
   std/os/env.c6             std.os.env             环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
   std/os/fs.c6              std.os.fs              stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
-  std/os/io.c6              std.os.io              Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代（方法名带 reader_/writer_/cfile_ 前缀）
+  std/os/io.c6              std.os.io              Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代，方法调用写 pr->read_line(...)
   std/os/path.c6            std.os.path            POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
 std/encoding/               编解码：Base64/十六进制/百分号、SHA-256、位流、UUID
   std/encoding/base64.c6    std.encoding.base64    Base64（RFC 4648）标准表与 URL 安全表：b64_encode/b64_decode、b64url_encode/b64url_decode、显式表与填充的 b64_encode_ex/b64_decode_ex/b64_decoded_len/b64_encoded_len、b64_valid、就地 b64_decode_inplace/b64url_decode_inplace（跳过空白、严格填充、放不下不写半截）
-  std/encoding/bitbuf.c6    std.encoding.bitbuf    位级读写器（零分配、MSB 先）：bw_open/bw_put/bw_put_u64/bw_put_bit/bw_align/bw_put_bytes/bw_patch（回填不改游标）、br_open/br_get/br_get_u64/br_get_bit/br_peek/br_skip/br_align/br_get_bytes、bw_bits/bw_bytes/bw_ok/br_remaining/br_eof
+  std/encoding/bitbuf.c6    std.encoding.bitbuf    位级读写器（零分配、MSB 先）：bw_open/put/put_u64/put_bit/align/put_bytes/patch（回填不改游标）、br_open/get/get_u64/get_bit/peek/skip/align/get_bytes、bit_count/byte_count/ok/remaining/eof
   std/encoding/codec.c6     std.encoding.codec     Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
   std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
-  std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/uuid_v4_seeded、uuid_v7/uuid_v7_at/uuid_time_v7、uuid_v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/uuid_format/uuid_format_simple/uuid_format_upper、uuid_version/uuid_variant/uuid_eq/uuid_nil/uuid_is_nil
+  std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
 std/data/                   数据格式：JSON、CSV、INI
   std/data/csv.c6           std.data.csv           RFC 4180 CSV：零分配 CsvReader（引号/跨行/CRLF）+ csv_write_row
-  std/data/ini.c6           std.data.ini           INI 配置的零分配读取：ini_open/ini_next（字段都是输入上的视图）、ini_lookup/ini_has_section/ini_count、IniEntry.section/key/value/line；语法错误给行号
-  std/data/json.c6          std.data.json          JSON 解析与写出：arena 上的 DOM、json_get/json_at、json_write/pretty/escape（数字保留原文）
+  std/data/ini.c6           std.data.ini           INI 配置的零分配读取：ini_open/next（字段都是输入上的视图）、ini_lookup/ini_has_section/ini_count、IniEntry.section/key/value/line；语法错误给行号
+  std/data/json.c6          std.data.json          JSON 解析与写出：Arena 上的 DOM（a.json_parse）、Json 的 get/at、write/write_pretty/escape（数字保留原文）
 
 std/net/                    网络与 Web：IP/CIDR、URL、MIME
-  std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_format、inet_parse_v4/inet_format_v4、inet_parse_v6/inet_format_v6（输出按 RFC 5952 压缩）、inet_parse_cidr/inet_cidr_contains/inet_cidr_mask/inet_v4_mask、inet_is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
+  std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_parse_v4/inet_parse_v6，Ip/Ipv4/Ipv6 的 format（IPv6 按 RFC 5952 压缩）、inet_parse_cidr/cidr_contains/cidr_mask/inet_v4_mask、is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
   std/net/mime.c6           std.net.mime           扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：mime_of_ext/mime_of_path/mime_ext_of/mime_ext_at/mime_type_at/mime_count、mime_is_text/is_image/is_audio/is_video/is_font、mime_charset、mime_sniff、mime_default
-  std/net/url.c6            std.net.url            URL（RFC 3986）解析与相对解析：Url 的 url_parse/url_effective_port/url_is_absolute/url_has_host、url_resolve（§5.2 全算法）、查询参数 url_next_pair/Pair、百分号 url_encode/url_encode_component/url_decode/url_decode_at/url_encoded_len/url_decoded_len
+  std/net/url.c6            std.net.url            URL（RFC 3986）解析与相对解析：Url 的 url_parse/effective_port/is_absolute/has_host、url_resolve（§5.2 全算法）、查询参数 next_pair/Pair、百分号 url_encode/url_encode_component/url_decode/url_decode_at/url_encoded_len/url_decoded_len
 ```
 
 ```c

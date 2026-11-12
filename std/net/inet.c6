@@ -7,14 +7,14 @@
  *     inet_parse(S("2001:db8::1"), &a);            // 1；a.family == IP_V6
  *
  *     char buf[64] = { 0 };
- *     inet_format(&a, buf, sizeof buf);            // "2001:db8::1"
+ *     a.format( buf, sizeof buf);            // "2001:db8::1"
  *
  *     Ip net = { 0 };
  *     int prefix = 0;
  *     inet_parse_cidr(S("10.0.0.0/8"), &net, &prefix);   // 1，prefix = 8
  *     Ip host = { 0 };
  *     inet_parse(S("10.1.2.3"), &host);
- *     inet_cidr_contains(&net, prefix, &host);     // 1
+ *     net.cidr_contains( prefix, &host);     // 1
  *
  * 这一层**零分配**（`Ip`/`Ipv4`/`Ipv6` 都是纯值），语义钉在三个标准上：
  *
@@ -27,7 +27,7 @@
  *   IPv4-mapped 一律写 `::ffff:a.b.c.d`；
  * - **端口**是纯十进制 0..65535（`65536`、`-1`、` 80` 都拒）。
  *
- * 分类函数（`inet_is_private` 等）按地址族各看各的号段，v4-mapped 的 v6 地址
+ * 分类函数（`is_private` 等）按地址族各看各的号段，v4-mapped 的 v6 地址
  * 先折回 v4 再判——`::ffff:127.0.0.1` 算回环，这是调用方最可能期待的行为。
  *
  * 所有 `*_format` 都**先量长度再落笔**：放不下返回 -1 且一个字节都不写（并且在
@@ -152,7 +152,7 @@ static int inet_v4_put(Ipv4 *a, char *dst, int cap)
     return o;
 }
 
-int inet_format_v4(Ipv4 *a, char *dst, int cap)
+int format(Ipv4 *a, char *dst, int cap)
 {
     if (!a || !dst)
         return -1;
@@ -314,7 +314,7 @@ static int inet_v6_put(Ipv6 *a, char *dst, int cap)
     int o = 0;
     int i = 0;
 
-    /* 注意：IPv4-mapped 由 inet_format_v6 先接走，这里只处理普通十六进制形式 */
+    /* 注意：IPv4-mapped 由 format 先接走，这里只处理普通十六进制形式 */
     for (i = 0; i < 8; i++)
         g[i] = (u16)(((u16)a->b[i * 2] << 8) | (u16)a->b[i * 2 + 1]);
     for (i = 0; i < 8;) {
@@ -360,7 +360,7 @@ static int inet_v6_put(Ipv6 *a, char *dst, int cap)
     return o;
 }
 
-int inet_format_v6(Ipv6 *a, char *dst, int cap)
+int format(Ipv6 *a, char *dst, int cap)
 {
     char tmp[64] = { 0 };
     Ipv4 v4 = { { 0, 0, 0, 0 } };
@@ -417,7 +417,7 @@ int inet_parse(char[:] s, Ip *out)
     }
 }
 
-int inet_format(Ip *a, char *dst, int cap)
+int format(Ip *a, char *dst, int cap)
 {
     if (!a || !dst || cap <= 0)
         return -1;
@@ -425,19 +425,19 @@ int inet_format(Ip *a, char *dst, int cap)
         Ipv4 v4 = { { 0, 0, 0, 0 } };
 
         memcpy(v4.b, a->b, 4);
-        return inet_format_v4(&v4, dst, cap);
+        return v4.format( dst, cap);
     }
     if (a->family == IP_V6) {
         Ipv6 v6 = { { 0 } };
 
         memcpy(v6.b, a->b, 16);
-        return inet_format_v6(&v6, dst, cap);
+        return v6.format( dst, cap);
     }
     return -1;
 }
 
 /* 两个地址同族且逐字节相同 */
-int inet_eq(Ip *self, Ip *other)
+int eq(Ip *self, Ip *other)
 {
     if (!self || !other || self->family != other->family)
         return 0;
@@ -501,7 +501,7 @@ int inet_parse_cidr(char[:] s, Ip *net, int *prefix)
 }
 
 /* addr 的前 prefix 位是不是和 net 一样（family 必须相同） */
-int inet_cidr_contains(Ip *net, int prefix, Ip *addr)
+int cidr_contains(Ip *net, int prefix, Ip *addr)
 {
     int full = 0;
     int rest = 0;
@@ -532,7 +532,7 @@ int inet_cidr_contains(Ip *net, int prefix, Ip *addr)
 }
 
 /* 把地址的前 prefix 位以外清零（网络地址形式） */
-int inet_cidr_mask(Ip *addr, int prefix)
+int cidr_mask(Ip *addr, int prefix)
 {
     int full = 0;
     int rest = 0;
@@ -573,7 +573,7 @@ static int inet_as_v4(Ip *a, Ipv4 *out)
     }
 }
 
-int inet_is_loopback(Ip *a)
+int is_loopback(Ip *a)
 {
     Ipv4 v4 = { { 0, 0, 0, 0 } };
 
@@ -592,7 +592,7 @@ int inet_is_loopback(Ip *a)
     }
 }
 
-int inet_is_private(Ip *a)
+int is_private(Ip *a)
 {
     Ipv4 v4 = { { 0, 0, 0, 0 } };
 
@@ -613,7 +613,7 @@ int inet_is_private(Ip *a)
     return (a->b[0] & 0xfe) == 0xfc;
 }
 
-int inet_is_link_local(Ip *a)
+int is_link_local(Ip *a)
 {
     Ipv4 v4 = { { 0, 0, 0, 0 } };
 
@@ -624,7 +624,7 @@ int inet_is_link_local(Ip *a)
     return a->b[0] == 0xfe && (a->b[1] & 0xc0) == 0x80;   /* fe80::/10 */
 }
 
-int inet_is_multicast(Ip *a)
+int is_multicast(Ip *a)
 {
     Ipv4 v4 = { { 0, 0, 0, 0 } };
 
@@ -635,7 +635,7 @@ int inet_is_multicast(Ip *a)
     return a->b[0] == 0xff;                /* ff00::/8 */
 }
 
-int inet_is_unspecified(Ip *a)
+int is_unspecified(Ip *a)
 {
     int i = 0;
 
@@ -682,9 +682,9 @@ static int ip_is(Ip *a, char *lit)
 
     if (!inet_parse((char[:]){ lit, (int)strlen(lit) }, &b))
         return 0;
-    if (!inet_eq(a, &b))
+    if (!a->eq(&b))
         return 0;
-    return inet_format(a, buf, sizeof buf) > 0;
+    return a->format(buf, sizeof buf) > 0;
 }
 
 test "IPv4 解析：边界与严格性" {
@@ -700,7 +700,7 @@ test "IPv4 解析：边界与严格性" {
     if (!inet_parse_v4(S("192.168.0.1"), &v4) || v4.b[0] != 192
         || v4.b[1] != 168 || v4.b[3] != 1)
         return err(3, "常见地址解析不对");
-    if (inet_format_v4(&v4, buf, sizeof buf) != 11
+    if (v4.format( buf, sizeof buf) != 11
         || strcmp(buf, "192.168.0.1") != 0)
         return err(4, "格式化不对");
     if (!inet_parse(S("10.1.2.3"), &a) || a.family != IP_V4)
@@ -735,7 +735,7 @@ test "IPv6 解析：压缩、内嵌 IPv4、边界" {
 
     if (!inet_parse_v6(S("::"), &a))
         return err(9, "全零 :: 解析失败");
-    if (inet_format_v6(&a, buf, sizeof buf) != 2 || strcmp(buf, "::") != 0)
+    if (a.format( buf, sizeof buf) != 2 || strcmp(buf, "::") != 0)
         return err(10, ":: 格式化不对");
     if (!inet_parse_v6(S("::1"), &a) || a.b[15] != 1)
         return err(11, "::1 解析不对");
@@ -749,7 +749,7 @@ test "IPv6 解析：压缩、内嵌 IPv4、边界" {
         return err(14, "IPv4-mapped 解析失败");
     if (a.b[10] != 0xff || a.b[11] != 0xff || a.b[12] != 192 || a.b[15] != 1)
         return err(15, "IPv4-mapped 的字节不对");
-    if (inet_format_v6(&a, buf, sizeof buf) != 18
+    if (a.format( buf, sizeof buf) != 18
         || strcmp(buf, "::ffff:192.168.0.1") != 0)
         return err(16, "IPv4-mapped 格式化不对");
     if (!inet_parse_v6(S("fe80::1"), &a) || a.b[0] != 0xfe || a.b[1] != 0x80)
@@ -804,7 +804,7 @@ test "IPv6 格式化：RFC 5952 的压缩规则" {
 
         if (!inet_parse_v6((char[:]){ v[i].in, (int)strlen(v[i].in) }, &a))
             return err(21, "用例输入解析失败");
-        if (inet_format_v6(&a, buf, sizeof buf) != (int)strlen(v[i].want)
+        if (a.format( buf, sizeof buf) != (int)strlen(v[i].want)
             || strcmp(buf, v[i].want) != 0) {
             printf("case %d: got '%s' want '%s'\n", i, buf, v[i].want);
             return err(22, "RFC 5952 压缩结果不符");
@@ -816,7 +816,7 @@ test "IPv6 格式化：RFC 5952 的压缩规则" {
         char small[4] = { 'Z', 'Z', 'Z', 0 };
 
         inet_parse_v6(S("2001:db8::1"), &a);
-        if (inet_format_v6(&a, small, sizeof small) != -1 || small[0] != 'Z')
+        if (a.format( small, sizeof small) != -1 || small[0] != 'Z')
             return err(23, "放不下时应当 -1 且不写");
     }
 }
@@ -831,11 +831,11 @@ test "CIDR：解析、包含、掩码" {
         return err(24, "10.0.0.0/8 解析不对");
     if (!inet_parse(S("10.1.2.3"), &host))
         return err(25, "主机解析失败");
-    if (!inet_cidr_contains(&net, prefix, &host))
+    if (!net.cidr_contains( prefix, &host))
         return err(26, "10/8 应当包含 10.1.2.3");
     if (!inet_parse(S("11.1.2.3"), &host))
         return err(27, "主机解析失败");
-    if (inet_cidr_contains(&net, prefix, &host))
+    if (net.cidr_contains( prefix, &host))
         return err(28, "10/8 不该包含 11.1.2.3");
     /* 没有 '/' 时按主机前缀 */
     if (!inet_parse_cidr(S("192.168.0.1"), &net, &prefix) || prefix != 32)
@@ -862,13 +862,13 @@ test "CIDR：解析、包含、掩码" {
             || m.b[2] != 255 || m.b[3] != 0)
             return err(36, "/24 掩码不对");
         inet_parse(S("10.1.2.3"), &n);
-        inet_cidr_mask(&n, 8);
-        inet_format(&n, buf, sizeof buf);
+        n.cidr_mask( 8);
+        n.format( buf, sizeof buf);
         if (strcmp(buf, "10.0.0.0") != 0)
             return err(37, "按 /8 清位不对");
         inet_parse(S("10.1.2.3"), &n);
-        inet_cidr_mask(&n, 0);
-        inet_format(&n, buf, sizeof buf);
+        n.cidr_mask( 0);
+        n.format( buf, sizeof buf);
         if (strcmp(buf, "0.0.0.0") != 0)
             return err(38, "/0 应当清成全零");
     }
@@ -880,7 +880,7 @@ test "CIDR：解析、包含、掩码" {
 
         inet_parse_cidr(S("0.0.0.0/0"), &v4net, &p);
         inet_parse(S("::1"), &v6host);
-        if (inet_cidr_contains(&v4net, 0, &v6host))
+        if (v4net.cidr_contains( 0, &v6host))
             return err(39, "不同地址族不该被判为包含");
     }
 }
@@ -906,29 +906,29 @@ test "分类：私网、回环、链路本地、组播" {
     for (i = 0; i < 10; i++) {
         if (!inet_parse((char[:]){ cs[i].addr, (int)strlen(cs[i].addr) }, &a))
             return err(40, "分类用例解析失败");
-        if (inet_is_private(&a) != cs[i].priv)
+        if (a.is_private() != cs[i].priv)
             return err(41, "is_private 判错");
-        if (inet_is_loopback(&a) != cs[i].loop)
+        if (a.is_loopback() != cs[i].loop)
             return err(42, "is_loopback 判错");
-        if (inet_is_link_local(&a) != cs[i].link)
+        if (a.is_link_local() != cs[i].link)
             return err(43, "is_link_local 判错");
-        if (inet_is_multicast(&a) != cs[i].multi)
+        if (a.is_multicast() != cs[i].multi)
             return err(44, "is_multicast 判错");
     }
     /* v6 的 ULA 与组播 */
-    if (!inet_parse(S("fd00::1"), &a) || !inet_is_private(&a))
+    if (!inet_parse(S("fd00::1"), &a) || !a.is_private())
         return err(45, "fc00::/7 应当算私网");
-    if (!inet_parse(S("ff02::1"), &a) || !inet_is_multicast(&a))
+    if (!inet_parse(S("ff02::1"), &a) || !a.is_multicast())
         return err(46, "ff00::/8 应当算组播");
     /* v4-mapped 折回 v4 判 */
-    if (!inet_parse(S("::ffff:127.0.0.1"), &a) || !inet_is_loopback(&a))
+    if (!inet_parse(S("::ffff:127.0.0.1"), &a) || !a.is_loopback())
         return err(47, "::ffff:127.0.0.1 应当算回环");
-    if (!inet_parse(S("::ffff:10.0.0.1"), &a) || !inet_is_private(&a))
+    if (!inet_parse(S("::ffff:10.0.0.1"), &a) || !a.is_private())
         return err(48, "::ffff:10.0.0.1 应当算私网");
     /* 未指定地址 */
-    if (!inet_parse(S("0.0.0.0"), &a) || !inet_is_unspecified(&a))
+    if (!inet_parse(S("0.0.0.0"), &a) || !a.is_unspecified())
         return err(49, "0.0.0.0 应当是 unspecified");
-    if (!inet_parse(S("::"), &a) || !inet_is_unspecified(&a))
+    if (!inet_parse(S("::"), &a) || !a.is_unspecified())
         return err(50, ":: 应当是 unspecified");
 }
 
