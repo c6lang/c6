@@ -297,6 +297,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/gif.c6           std.data.gif           GIF87a/89a 解码：gif_info/gif_decode 按索引取帧解成 RGBA，支持全局/局部调色板、透明色、隔行扫描、多帧
   std/data/tiff.c6          std.data.tiff          基线 TIFF 解码：II/MM 字节序、STRIP、8 位、none/Deflate(zlib)/PackBits、RGB/灰度 → RGBA；LZW/16 位/分块不支持
   std/data/ico.c6           std.data.ico           Windows 图标：ico_info/ico_entry/ico_decode，DIB 1/4/8/24/32 位（AND 掩码透明）或内嵌 PNG
+  std/data/html.c6          std.data.html          HTML 分词器：html_open/next 出文本/开始/结束/注释/DOCTYPE/CDATA，html_attr 按需扫属性，html_unescape 解实体；不建 DOM
+  std/data/yaml.c6          std.data.yaml          YAML 常用子集：yaml_open/next 出 `键: 值`、`- 值`、`- 键: 值` + depth，yaml_unquote 解引号；不支持流式/锚点/块标量
+  std/data/vcf.c6           std.data.vcf           vCard：vcard_unfold 摊平折行 + vcard_parse 取 FN/N/ORG/TITLE/TEL/EMAIL/UID/URL
+  std/data/ics.c6           std.data.ics           iCalendar：ics_unfold 摊平折行 + ics_open/next 逐 VEVENT 读 UID/SUMMARY/DTSTART/DTEND/LOCATION
 
 std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
@@ -364,6 +368,7 @@ make std-bin     # 编译并运行 examples/stdbin.c6（第二十九批二进制
 make std-img     # 编译并运行 examples/stdimg.c6（第三十批图像解码模块的拼装示例）
 make std-enc     # 编译并运行 examples/stdenc.c6（第三十一批编码与凭据模块的拼装示例）
 make std-gfx     # 编译并运行 examples/stdgfx.c6（第三十二批图像与 LZW 模块的拼装示例）
+make std-doc     # 编译并运行 examples/stddoc.c6（第三十三批结构化文本格式模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

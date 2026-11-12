@@ -189,6 +189,11 @@
 | `std/data/gif.c6` | `std.data.gif` | GIF87a/89a 解码（零分配）：`gif_info` 给画布尺寸/全局调色板/帧数/背景色，`gif_frame`/`gif_decode` 按索引取帧并解成 RGBA8888；支持全局/局部调色板、图形控制扩展（透明色/延迟/处置方式）、隔行扫描（4 遍重排）、多帧；不合成画布、不处理处置方式 |
 | `std/data/tiff.c6` | `std.data.tiff` | 基线 TIFF 解码（零分配）：`tiff_info` 读 IFD（尺寸/样本数/位深/压缩/光度/条带数），`tiff_decode` 逐条带解压成 RGBA；支持 II/MM 字节序、STRIP 组织、8 位、chunky、压缩 none/Deflate(zlib)/PackBits、RGB 与 BlackIsZero/WhiteIsZero 灰度、1/3/4 样本；LZW/JPEG/16 位/分平面/分块不支持 |
 | `std/data/ico.c6` | `std.data.ico` | Windows 图标（零分配）：`ico_info`/`ico_entry` 读 ICONDIR 与目录项（宽高/位深/字节数/偏移/是否 PNG），`ico_decode` 解 32/24/8/4/1 位 DIB（自下而上 + AND 掩码透明 + 32 位 alpha 全 0 按不透明）或内嵌 PNG（交给 `png_decode`）；.cur 与 RLE/16 位 DIB 不支持 |
+| `std/data/html.c6` | `std.data.html` | HTML 分词器（零分配，不建 DOM）：`html_open`/`next` 吐文本/开始/结束/注释/DOCTYPE/CDATA 六种 token，`html_attr`/`html_attr_at` 按需扫属性区（属性区只记偏移，token 可拷），`html_unescape` 解 `&amp;` 等命名实体与 `&#nn;`/`&#xnn;` 数字实体；`script`/`style`/`textarea`/`title` 的内容按原文吐出（里面的 `<` 不算标签）；不给层级与选择器 |
+| `std/data/yaml.c6` | `std.data.yaml` | YAML 1.2 常用子集（零分配，扁平事件）：`yaml_open`/`next` 吐出 `键: 值`、`- 值`、`- 键: 值` 三种事件，`depth` 让调用方自己还原层级；支持注释、单/双引号（`yaml_unquote` 解 `\n \t \r \0 \" \\` 与 `''`）、文档分隔符；不支持流式 `{}`/`[]`、锚点、标签、块标量 `|`/`>`、制表符缩进 |
+| `std/data/vcf.c6` | `std.data.vcf` | vCard 读取（零分配，两段式）：`vcard_unfold` 去掉折行写进调用方缓冲，`vcard_parse` 取 FN/N/ORG/TITLE/TEL/EMAIL/UID/URL 与属性总数，必须成对 `BEGIN:VCARD`/`END:VCARD`；参数忽略，不做 quoted-printable/Base64 |
+| `std/data/ics.c6` | `std.data.ics` | iCalendar 的 VEVENT 读取（零分配，两段式）：`ics_unfold` 摊平折行，`ics_open`/`next` 每个 `BEGIN:VEVENT` 返回一个 `IcsEvent`（UID/SUMMARY/LOCATION/DTSTART/DTEND/DTSTAMP/DESCRIPTION），参数（`TZID`/`VALUE=DATE`）忽略、值原样给出，不做时区换算 |
+
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
 
 | 文件 | 模块 | 内容 |
@@ -247,6 +252,7 @@
 | `examples/stdimg.c6` | （无模块） | 第三十批（图像解码）的拼装示例（`make std-img`）：同一张 2x2 图分别用 BMP（24 位自下而上）、TGA（RLE）、QOI（RGB 流）、PNM（P6）解成 RGBA 后逐像素比对，再用 QOI 编码器写回解一遍 |
 | `examples/stdenc.c6` | （无模块） | 第三十一批（编码与凭据）的拼装示例（`make std-enc`）：手写 DER 逐层读 INTEGER/OID/UTF8String/UTCTime、解析一张 829 字节自签证书、HS256 令牌验签与改字节/换密钥的拒绝、RFC 4226 与 RFC 6238 的 OTP 向量与时间窗口 |
 | `examples/stdgfx.c6` | （无模块） | 第三十二批（图像与 LZW）的拼装示例（`make std-gfx`）：LZW 编码→解码往返、3x2 透明 GIF、4x3 未压缩 RGB TIFF、同一张图的 32 位 DIB 与 PNG 两个 ICO 负载（结果必须逐字节一致），最后把 ICO 里那段 PNG 单独交给 `png_decode` |
+| `examples/stddoc.c6` | （无模块） | 第三十三批（结构化文本格式）的拼装示例（`make std-doc`）：HTML 分词后数标签/取 `href`/看 `script` 原文/解实体，遍历一份 YAML 配置把缩进还原成层级并解引号，展开一张折行的 vCard，读一份含两个事件的 iCalendar |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -295,6 +301,10 @@ std/data/jwt.c6            58 test(s), 0 failure(s)
 std/data/gif.c6             5 test(s), 0 failure(s)
 std/data/tiff.c6           11 test(s), 0 failure(s)
 std/data/ico.c6            35 test(s), 0 failure(s)
+std/data/html.c6           24 test(s), 0 failure(s)
+std/data/yaml.c6           24 test(s), 0 failure(s)
+std/data/vcf.c6            24 test(s), 0 failure(s)
+std/data/ics.c6            24 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
 std/data/props.c6          4 test(s), 0 failure(s)
@@ -388,6 +398,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/gif.c6` 5 | gif 3 + lzw 2（LZW 是跨 TU 调用） |
 | `std/data/tiff.c6` 11 | tiff 3 + zlib 4 + deflate 2 + rle 2（Deflate 走 zlib、PackBits 走 rle） |
 | `std/data/ico.c6` 35 | ico 2 + png 33（PNG 负载交给 png_decode） |
+| `std/data/html.c6` 24 | html 2 + str 22 |
+| `std/data/yaml.c6` 24 | yaml 2 + str 22 |
+| `std/data/vcf.c6` 24 | vcf 2 + str 22 |
+| `std/data/ics.c6` 24 | ics 2 + str 22 |
 | `std/os/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/encoding/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
 | `std/encoding/md5.c6` 9 | md5 3 + bits 6（`rotr32` 是跨 TU 调用） |
@@ -454,7 +468,8 @@ deflate + `std/core/crc`，`tar` 只借 `Str` 类型；`std/data/png` 只借 `St
 `pnm` 自成一体；`std/data/x509` 要 asn1，`std/data/jwt` 要 base64 + sha256 +
 sha512，`std/encoding/asn1` 只借 `Str` 类型，`std/encoding/otp` 要 sha1；
 `std/data/gif` 要 lzw，`std/data/tiff` 要 zlib + rle，`std/data/ico` 要 png
-（PNG 负载），`std/encoding/lzw` 自成一体。
+（PNG 负载），`std/encoding/lzw` 自成一体；`std/data/html` / `yaml` / `vcf` /
+`ics` 四个只借 `Str`。
 
 ## 设计原则
 
@@ -3296,6 +3311,33 @@ LZW 那一节用 256 字节的周期序列把字典撑到码宽增长再解回�
 而上行序、BGRA 换序、AND 掩码和 PNG 负载的分派；最后把 ICO 里那段 PNG 单独
 交给 `png_decode`，验 IHDR 与首像素。
 
+### 集成示例：`examples/stddoc.c6`
+
+```sh
+make std-doc
+```
+
+```
+== html
+   7 个开始标签、6 个结束标签、13 段文本、1 处注释、1 个 DOCTYPE
+   实体解码 12 字节：[a < b && c A]
+== yaml
+   10 个键、2 个序列项、最深 3 层
+== vcard
+   Grace Hoppe / US Nav / 7 个属性
+== ics
+   2 个事件，第二个 SUMMARY 长 41 字节
+
+23 check(s), 0 failure(s)
+```
+
+HTML 那一节把 `PAGE` 分两遍扫：第一遍数开始/结束/文本/注释/DOCTYPE 并顺手取
+`<a>` 的 `href`（`img` 自闭合，所以开始标签比结束多一个），第二遍专门找
+`script` 里那段含 `<` 的原文；YAML 那节遍历一份 CI 配置，靠 `depth` 判断
+`branches:` 下的第二个序列项，再解开 `image` 与 `CFLAGS` 的引号；vCard 与
+iCalendar 各用一次折行（`Grace\r\n  Hopper`、`long\r\n  wrapped summary`），
+验摊平后的字节数与内容。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3356,6 +3398,8 @@ LZW 那一节用 256 字节的周期序列把字典撑到码宽增长再解回�
   （自带自检）。
 * `make std-gfx`：`examples/stdgfx.c6`，第三十二批（图像与 LZW）模块的拼装示例
   （自带自检）。
+* `make std-doc`：`examples/stddoc.c6`，第三十三批（结构化文本格式）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

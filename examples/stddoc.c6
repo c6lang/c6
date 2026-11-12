@@ -1,0 +1,254 @@
+/* examples/stddoc.c6 —— 第三十三批（结构化文本格式）的集成示例。
+ *
+ *     make std-doc
+ *
+ * 把 html / yaml / vcf / ics 四个读取器串起来用：先用 HTML 分词器数标签、
+ * 取属性、看 script 原文；再遍历一份 YAML 配置，把缩进还原成层级；然后读
+ * 一张 vCard 与一份 iCalendar，检查折行摊平后取到的字段。每一步都自检，
+ * 全部通过才算过。
+ */
+#include <stdio.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.html;
+import std.data.yaml;
+import std.data.vcf;
+import std.data.ics;
+
+static int checks = 0;
+static int fails = 0;
+
+/* 标签名/文本的大小写不敏感比较（HTML 里标签名不分大小写） */
+static int tag_is(Str s, const char *want)
+{
+    int i = 0;
+
+    for (i = 0; i < s.s.len; i++) {
+        char a = s.s.data[i], b = want[i];
+
+        if (b == 0)
+            return 0;
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+            b = (char)(b - 'A' + 'a');
+        if (a != b)
+            return 0;
+    }
+    return want[s.s.len] == 0;
+}
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static const char *PAGE =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"zh\">\n"
+    "<head><title>demo &amp; test</title></head>\n"
+    "<body>\n"
+    "<!-- 导航 -->\n"
+    "<a href=\"/docs\" class=nav>文档</a>\n"
+    "<img src=\"logo.png\" alt='logo'/>\n"
+    "<script>if (a < b) { run(); }</script>\n"
+    "</body>\n"
+    "</html>\n";
+
+static void do_html(void)
+{
+    HtmlReader r = html_open(PAGE, (int)strlen(PAGE));
+    HtmlToken t = { 0 };
+    int starts = 0, ends = 0, comments = 0, texts = 0, doctypes = 0;
+    char buf[128] = { 0 };
+    Str href = { 0 };
+    int n = 0;
+
+    printf("== html\n");
+    while (r.next(&t) == 1) {
+        if (t.kind == HTML_START) {
+            starts++;
+            if (tag_is(t.name, "a")) {
+                Str h = html_attr(&t, "href");
+
+                if (h.s.len == 5 && memcmp(h.s.data, "/docs", 5) == 0)
+                    href = h;
+            }
+        } else if (t.kind == HTML_END) {
+            ends++;
+        } else if (t.kind == HTML_COMMENT) {
+            comments++;
+        } else if (t.kind == HTML_TEXT) {
+            texts++;
+        } else if (t.kind == HTML_DOCTYPE) {
+            doctypes++;
+        }
+    }
+    printf("   %d 个开始标签、%d 个结束标签、%d 段文本、%d 处注释、%d 个 DOCTYPE\n",
+           starts, ends, texts, comments, doctypes);
+    check(doctypes == 1, "DOCTYPE 一个");
+    check(comments == 1, "注释一处");
+    check(href.s.len == 5, "取到 a 的 href");
+    check(starts == ends + 1, "img 自闭合，开始标签比结束多一个");
+    /* script 原文里的 `<` 不算标签 */
+    r = html_open(PAGE, (int)strlen(PAGE));
+    n = 0;
+    while (r.next(&t) == 1) {
+        if (t.kind == HTML_TEXT && t.text.s.len > 20) {
+            if (tag_is(t.text, "if (a < b) { run(); }"))
+                n = 1;
+        }
+    }
+    check(n == 1, "script 内容按原文吐出");
+    /* 实体 */
+    n = html_unescape((Str){ S("a &lt; b &amp;&amp; c &#65;") }, buf,
+                      (int)sizeof buf);
+    printf("   实体解码 %d 字节：[%s]\n", n, buf);
+    check(n == 12 && memcmp(buf, "a < b && c A", 12) == 0, "实体解码");
+}
+
+static const char *CONF =
+    "# CI 配置\n"
+    "name: build\n"
+    "on:\n"
+    "  push:\n"
+    "    branches:\n"
+    "      - main\n"
+    "      - \"release/*\"\n"
+    "jobs:\n"
+    "  test:\n"
+    "    runs: 3\n"
+    "    image: 'gcc:13'\n"
+    "    env:\n"
+    "      CFLAGS: \"-O2 -g\"\n";
+
+static void do_yaml(void)
+{
+    YamlReader r = yaml_open(CONF, (int)strlen(CONF));
+    YamlEntry e = { 0 };
+    char buf[64] = { 0 };
+    int depth_max = 0, items = 0, keys = 0;
+    Str image = { 0 }, branch2 = { 0 }, cflags = { 0 };
+    int prev_depth = 0, prev_item = 0;
+
+    printf("== yaml\n");
+    while (r.next(&e) == 1) {
+        if (e.depth > depth_max)
+            depth_max = e.depth;
+        if (e.kind == YAML_ITEM || e.kind == YAML_ITEM_KEY)
+            items++;
+        else
+            keys++;
+        if (e.kind == YAML_ITEM && e.depth == 3) {
+            if (prev_depth == 3 && prev_item)
+                branch2 = e.value;
+            prev_item = 1;
+        } else {
+            prev_item = 0;
+        }
+        if (e.kind == YAML_KEY && e.key.s.len == 5
+            && memcmp(e.key.s.data, "image", 5) == 0)
+            image = e.value;
+        if (e.kind == YAML_KEY && e.key.s.len == 6
+            && memcmp(e.key.s.data, "CFLAGS", 6) == 0)
+            cflags = e.value;
+        prev_depth = e.depth;
+    }
+    printf("   %d 个键、%d 个序列项、最深 %d 层\n", keys, items, depth_max);
+    check(keys == 10, "键的个数");
+    check(items == 2, "序列项个数");
+    check(depth_max == 3, "最深 3 层");
+    check(yaml_unquote(image, buf, (int)sizeof buf) == 6
+              && memcmp(buf, "gcc:13", 6) == 0,
+          "image 的引号解开");
+    check(branch2.s.len == 11
+              && memcmp(branch2.s.data, "\"release/*\"", 11) == 0,
+          "第二个分支保留引号");
+    check(yaml_unquote(cflags, buf, (int)sizeof buf) == 6
+              && memcmp(buf, "-O2 -g", 6) == 0,
+          "CFLAGS 解开");
+}
+
+static const char *CARD =
+    "BEGIN:VCARD\n"
+    "VERSION:4.0\n"
+    "FN:Grace\r\n"
+    "  Hopper\n"
+    "ORG:US Navy;Harvard\n"
+    "EMAIL;TYPE=work:grace@example.test\n"
+    "TEL;TYPE=voice:+1 555 0100\n"
+    "END:VCARD\n";
+
+static void do_vcf(void)
+{
+    char flat[1024] = { 0 };
+    int n = vcard_unfold(CARD, (int)strlen(CARD), flat, (int)sizeof flat);
+    VCard c = vcard_parse(flat, n);
+
+    printf("== vcard\n");
+    printf("   %.11s / %.6s / %d 个属性\n", c.fn.s.data, c.org.s.data, c.props);
+    check(c.valid, "vCard 有效");
+    check(c.fn.s.len == 12 && memcmp(c.fn.s.data, "Grace Hopper", 12) == 0,
+          "折行的 FN 摊平");
+    check(c.props == 7, "属性个数");
+    check(c.email.s.len == 18, "EMAIL 长度");
+    check(c.tel.s.len == 11, "TEL 长度");
+    check(!vcard_parse("FN:x\n", 5).valid, "缺 BEGIN/END 无效");
+}
+
+static const char *CAL =
+    "BEGIN:VCALENDAR\n"
+    "VERSION:2.0\n"
+    "BEGIN:VEVENT\n"
+    "UID:a@example.test\n"
+    "DTSTART;TZID=UTC:20260401T090000\n"
+    "SUMMARY:Sprint planning\n"
+    "END:VEVENT\n"
+    "BEGIN:VEVENT\n"
+    "UID:b@example.test\n"
+    "DTSTART;VALUE=DATE:20260402\n"
+    "SUMMARY:Retrospective with a long\r\n"
+    "  wrapped summary\n"
+    "END:VEVENT\n"
+    "END:VCALENDAR\n";
+
+static void do_ics(void)
+{
+    char flat[2048] = { 0 };
+    int n = ics_unfold(CAL, (int)strlen(CAL), flat, (int)sizeof flat);
+    IcsReader r = ics_open(flat, n);
+    IcsEvent a = { 0 }, b = { 0 };
+    int got = 0;
+
+    printf("== ics\n");
+    if (r.next(&a) == 1)
+        got++;
+    if (r.next(&b) == 1)
+        got++;
+    printf("   %d 个事件，第二个 SUMMARY 长 %d 字节\n", got, b.summary.s.len);
+    check(got == 2, "读到两个事件");
+    check(a.dtstart.s.len == 15
+              && memcmp(a.dtstart.s.data, "20260401T090000", 15) == 0,
+          "第一个 DTSTART");
+    check(b.dtstart.s.len == 8, "第二个 DTSTART 是日期");
+    check(b.summary.s.len == 41
+              && memcmp(b.summary.s.data,
+                        "Retrospective with a long wrapped summary", 41) == 0,
+          "折行的 SUMMARY");
+    check(r.next(&b) == 0, "读完返回 0");
+}
+
+int main(void)
+{
+    do_html();
+    do_yaml();
+    do_vcf();
+    do_ics();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

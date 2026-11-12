@@ -56,6 +56,14 @@
 
 ### 标准库
 
+- **标准库第三十三批（结构化文本格式）**：`std.data.html` / `std.data.yaml` /
+  `std.data.vcf` / `std.data.ics` 四个零分配读取器，集成示例
+  `examples/stddoc.c6`（`make std-doc`）。html 是六种 token 的分词器（属性按需
+  扫、`script` 走原文、实体解码）；yaml 是扁平事件 + `depth`，支持注释与引号
+  但不管流式与块标量；vcf/ics 都是「先摊平折行，再逐行读」。错误号段
+  `std.data.html`=0x608d … `std.data.ics`=0x6090（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第三十二批（图像与 LZW）**：`std.encoding.lzw` / `std.data.gif` /
   `std.data.tiff` / `std.data.ico` 四个零分配模块，集成示例
   `examples/stdgfx.c6`（`make std-gfx`）。lzw 是 GIF 变体（LSB 打包、clear/eoi、

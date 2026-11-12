@@ -1350,4 +1350,29 @@ sha512 + bits，otp 要 sha1 + bits。示例 `examples/stdenc.c6` 先走手写 D
 验收：`make stdtest`（141 个模块、0 failure）、`make std-gfx`（18 条自检全过）、
 `make check-all`。
 
+### 11.45 标准库第三十三批（html / yaml / vcf / ics）
+
+第三十三批把「结构化文本」这条线补齐到 Web 与个人信息格式：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.html` | HTML 分词器 | 六种 token（文本/开始/结束/注释/DOCTYPE/CDATA）；属性区只记原文偏移，`html_attr`/`html_attr_at` 按需扫，token 是可拷的小结构；`script`/`style`/`textarea`/`title` 走原文模式；`html_unescape` 只认命名实体与数字实体；不建 DOM、不给选择器 |
+| `std.data.yaml` | YAML 子集 | 扁平事件 + `depth`（缩进/2），调用方自己还原层级；注释、单/双引号、文档分隔符、`- 键: 值`；不支持流式 `{}`/`[]`、锚点、标签、块标量；制表符缩进直接 -1 |
+| `std.data.vcf` | vCard | 两段式：`vcard_unfold` 摊平折行（要写缓冲），`vcard_parse` 在摊平文本上取 FN/N/ORG/TITLE/TEL/EMAIL/UID/URL；参数忽略，必须成对 BEGIN/END |
+| `std.data.ics` | iCalendar | 同样两段式；`next` 每个 VEVENT 返回一个事件，`TZID`/`VALUE=DATE` 参数忽略、值原样给出；不做时区换算 |
+
+两个「折行」格式（vCard/iCalendar）都用「CRLF + 空白」续行，摊平必须去掉那
+一个空白但保留行分隔，所以单独给 `*_unfold`，而不是在解析器里就地处理——
+就地处理需要拼接，零分配做不到。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.html`=0x608d、
+`std.data.yaml`=0x608e、`std.data.vcf`=0x608f、`std.data.ics`=0x6090；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-doc` 与 `STD_DOC_SRCS`，`test-all`/`check-all` 都
+带上它；四个模块在 `stdtest` 里只依赖 `std/text/str.c6`。示例 `examples/stddoc.c6`
+把四个读取器串起来跑（23 条自检）。
+
+验收：`make stdtest`（145 个模块、0 failure）、`make std-doc`（23 条自检全过）、
+`make check-all`。
+
+
 

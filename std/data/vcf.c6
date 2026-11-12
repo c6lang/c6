@@ -1,0 +1,271 @@
+/* std/data/vcf：vCard（RFC 6350 / 2426）解析（零分配，两段式）。
+ *
+ *     import std.data.vcf;
+ *
+ *     char flat[4096];
+ *     int fn = vcard_unfold(data, n, flat, (int)sizeof flat);
+ *     VCard c = vcard_parse(flat, fn);
+ *     if (c.valid) {
+ *         // c.fn / c.n / c.org / c.title / c.tel / c.email / c.uid / c.url
+ *     }
+ *
+ * vCard 是「一行一个 `名字;参数:值`」，行可以用「CRLF + 空格/制表符」折行。
+ * 折行要先摊平才能当普通行读，而摊平需要写内存，所以分成两步：
+ * `vcard_unfold` 把折行去掉（写调用方的缓冲），`vcard_parse` 在摊平后的文本上
+ * 逐行解析。两步都不分配。
+ *
+ * 约定：
+ *
+ * - `vcard_unfold` 去掉 CRLF/LF 后面紧跟的空格/制表符，返回长度；
+ *   放不下返回 -1；
+ * - 名字大小写不敏感，参数（`;TYPE=...`）忽略；只取第一次出现的属性；
+ * - 只认常见的 FN/N/ORG/TITLE/TEL/EMAIL/UID/URL；其余属性跳过但计入
+ *   `props`（属性总数）；
+ * - 必须有 `BEGIN:VCARD` 和 `END:VCARD`，否则 `valid=0`；
+ * - 不做 quoted-printable / Base64 解码，也不解析 `N` 的结构（整串给 `n`）。
+ */
+#include <string.h>
+
+module std.data.vcf;
+import std.core.types;
+import std.text.str;
+
+struct VCard {
+    int valid;
+    int props;
+    Str fn;
+    Str n;
+    Str org;
+    Str title;
+    Str tel;
+    Str email;
+    Str uid;
+    Str url;
+};
+
+static VCard vcard_bad(void)
+{
+    VCard c = { 0 };
+
+    return c;
+}
+
+int vcard_unfold(const void *src, int n, char *dst, int cap)
+{
+    const char *p = (const char *)src;
+    int i = 0, o = 0;
+
+    if (!src || !dst || n < 0 || cap <= 0)
+        return -1;
+    while (i < n) {
+        char c = p[i];
+
+        if (c == '\r' || c == '\n') {
+            if (c == '\r' && i + 1 < n && p[i + 1] == '\n')
+                i += 2;
+            else
+                i++;
+            if (i < n && (p[i] == ' ' || p[i] == '\t')) {
+                i++;                    /* 折行：接上，不要换行 */
+                continue;
+            }
+            if (o >= cap - 1)
+                return -1;
+            dst[o++] = '\n';            /* 普通换行：留一个分隔符 */
+            continue;
+        }
+        if (o >= cap - 1)
+            return -1;
+        dst[o++] = c;
+        i++;
+    }
+    dst[o] = 0;
+    return o;
+}
+
+/* 名字大小写不敏感比较（长度已由调用方给） */
+static int vcard_name_is(Str name, const char *want)
+{
+    int i = 0, wl = (int)strlen(want);
+
+    if (name.s.len != wl)
+        return 0;
+    for (i = 0; i < wl; i++) {
+        char a = name.s.data[i], b = want[i];
+
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+            b = (char)(b - 'A' + 'a');
+        if (a != b)
+            return 0;
+    }
+    return 1;
+}
+
+VCard vcard_parse(const void *flat, int n)
+{
+    VCard c = { 0 };
+    const char *p = (const char *)flat;
+    int i = 0, began = 0, ended = 0;
+
+    if (!flat || n <= 0)
+        return vcard_bad();
+    while (i < n) {
+        int start = i, colon = -1, semi = -1, j = 0;
+
+        while (i < n && p[i] != '\n' && p[i] != '\r')
+            i++;
+        {
+            int line_end = i;
+
+            while (i < n && (p[i] == '\n' || p[i] == '\r'))
+                i++;
+            if (line_end <= start)
+                continue;
+            for (j = start; j < line_end; j++) {
+                if (p[j] == ':' && colon < 0) {
+                    colon = j;
+                    break;
+                }
+                if (p[j] == ';' && semi < 0)
+                    semi = j;
+            }
+            if (colon < 0)
+                continue;               /* 没有冒号的行跳过 */
+            {
+                Str name = { 0 };
+                Str value = { 0 };
+
+                if (semi >= 0 && semi < colon)
+                    name.s = (char[:]){ (char *)p + start, semi - start };
+                else
+                    name.s = (char[:]){ (char *)p + start, colon - start };
+                value.s = (char[:]){ (char *)p + colon + 1,
+                                     line_end - colon - 1 };
+                c.props++;
+                if (vcard_name_is(name, "begin")) {
+                    if (vcard_name_is(value, "vcard"))
+                        began = 1;
+                } else if (vcard_name_is(name, "end")) {
+                    if (vcard_name_is(value, "vcard"))
+                        ended = 1;
+                } else if (vcard_name_is(name, "fn")) {
+                    if (c.fn.s.len == 0)
+                        c.fn = value;
+                } else if (vcard_name_is(name, "n")) {
+                    if (c.n.s.len == 0)
+                        c.n = value;
+                } else if (vcard_name_is(name, "org")) {
+                    if (c.org.s.len == 0)
+                        c.org = value;
+                } else if (vcard_name_is(name, "title")) {
+                    if (c.title.s.len == 0)
+                        c.title = value;
+                } else if (vcard_name_is(name, "tel")) {
+                    if (c.tel.s.len == 0)
+                        c.tel = value;
+                } else if (vcard_name_is(name, "email")) {
+                    if (c.email.s.len == 0)
+                        c.email = value;
+                } else if (vcard_name_is(name, "uid")) {
+                    if (c.uid.s.len == 0)
+                        c.uid = value;
+                } else if (vcard_name_is(name, "url")) {
+                    if (c.url.s.len == 0)
+                        c.url = value;
+                }
+            }
+        }
+    }
+    c.valid = began && ended;
+    if (!c.valid)
+        return vcard_bad();
+    return c;
+}
+
+/* ---- 自测 ---- */
+
+static const char *CARD =
+    "BEGIN:VCARD\r\n"
+    "VERSION:4.0\r\n"
+    "FN:Ada Lovelace\r\n"
+    "N:Lovelace;Ada;;;\r\n"
+    "ORG:Analytical Engines Ltd.\r\n"
+    "TITLE:Mathematician\r\n"
+    "TEL;TYPE=work,voice:+44 20 7946 0958\r\n"
+    "EMAIL;TYPE=work:ada@example.test\r\n"
+    "UID:urn:uuid:12345678-1234-1234-1234-123456789abc\r\n"
+    "URL:https://example.test/ada\r\n"
+    "NOTE:first programmer\r\n"
+    "END:VCARD\r\n";
+
+static const char *CARD_FOLDED =
+    "BEGIN:VCARD\r\n"
+    "FN:Ada \r\n"
+    " Lovelace\r\n"
+    "EMAIL:ada@\r\n"
+    "\texample.test\r\n"
+    "END:VCARD\r\n";
+
+test "vCard：摊平折行并取常见属性" {
+    char flat[1024] = { 0 };
+    int fn = vcard_unfold(CARD, (int)strlen(CARD), flat, (int)sizeof flat);
+    VCard c = vcard_parse(flat, fn);
+
+    if (fn <= 0)
+        return err(1, "摊平失败");
+    if (!c.valid)
+        return err(2, "vCard 应该有效");
+    if (c.fn.s.len != 12 || memcmp(c.fn.s.data, "Ada Lovelace", 12) != 0)
+        return err(3, "FN 不对");
+    if (c.org.s.len != 23 || memcmp(c.org.s.data, "Analytical Engines Ltd.", 23) != 0)
+        return err(4, "ORG 不对");
+    if (c.title.s.len != 13 || memcmp(c.title.s.data, "Mathematician", 13) != 0)
+        return err(5, "TITLE 不对");
+    if (c.tel.s.len != 16 || memcmp(c.tel.s.data, "+44 20 7946 0958", 16) != 0)
+        return err(6, "TEL（带参数）不对");
+    if (c.email.s.len != 16 || memcmp(c.email.s.data, "ada@example.test", 16) != 0)
+        return err(7, "EMAIL 不对");
+    if (c.uid.s.len != 45 || c.url.s.len != 24)
+        return err(8, "UID/URL 不对");
+    if (c.props != 12)
+        return err(9, "属性计数不对");
+    /* 折行 */
+    memset(flat, 0, sizeof flat);
+    fn = vcard_unfold(CARD_FOLDED, (int)strlen(CARD_FOLDED), flat,
+                      (int)sizeof flat);
+    c = vcard_parse(flat, fn);
+    if (!c.valid || c.fn.s.len != 12
+        || memcmp(c.fn.s.data, "Ada Lovelace", 12) != 0)
+        return err(10, "折行的 FN 摊平不对");
+    if (c.email.s.len != 16
+        || memcmp(c.email.s.data, "ada@example.test", 16) != 0)
+        return err(11, "折行的 EMAIL 摊平不对");
+}
+
+test "vCard：坏输入与容量边界" {
+    char flat[64] = { 0 };
+    VCard c = { 0 };
+
+    if (vcard_unfold(CARD, (int)strlen(CARD), flat, (int)sizeof flat) != -1)
+        return err(12, "缓冲不够应该 -1");
+    /* 没有 BEGIN/END */
+    c = vcard_parse("FN:x\r\n", 6);
+    if (c.valid)
+        return err(13, "缺 BEGIN/END 不该有效");
+    /* 只有 BEGIN 没有 END */
+    c = vcard_parse("BEGIN:VCARD\r\nFN:x\r\n", 19);
+    if (c.valid)
+        return err(14, "缺 END 不该有效");
+    /* 空输入 */
+    if (vcard_parse(0, 10).valid || vcard_parse(flat, 0).valid)
+        return err(15, "空输入不该有效");
+    if (vcard_unfold(0, 10, flat, (int)sizeof flat) != -1
+        || vcard_unfold(CARD, 10, 0, 10) != -1)
+        return err(16, "空指针应该 -1");
+    /* 没有冒号的行被跳过 */
+    c = vcard_parse("BEGIN:VCARD\njunk\nFN:A\nEND:VCARD\n", 32);
+    if (!c.valid || c.fn.s.len != 1)
+        return err(17, "无冒号的行应该跳过");
+}
