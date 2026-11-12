@@ -9,6 +9,11 @@
 
 ### 文档
 
+- **补齐第十一批的号段与状态**：`docs/reference/grammar.md` §8.1 的 std 号段表
+  补上 `std.core.crc`=0x6035…`std.encoding.frame`=0x6038（第十一批漏更新），
+  `docs/history/status.md` 补写第十一批小节；第十二批（regex/diff/fuzzy/wrap）
+  的号段与状态一并写入。
+
 - **标准库 API 形态要求**：`docs/stdlib.md` 的写法约定增加硬性条款——能用结构体方法
   表达的 API 必须写成方法，调用侧只写 `v.m()`/`p->m()`；自由函数只保留工厂、无接收者
   算法、一次性便捷入口和 `foreach` 的 `has`/`next`。
@@ -41,6 +46,18 @@
   `docs/manual/errors.md`、`grammar.md` R22、`diagnostics.md` C9 同步。
 
 ### 标准库
+
+- **标准库第十二批（文本算法）**：`std.text.regex` / `std.text.diff` /
+  `std.text.fuzzy` / `std.text.wrap` 四个模块，集成示例
+  `examples/stdtext.c6`（`make std-text`）。regex 是回溯式正则：UTF-8 按码点
+  匹配、位置给字节，捕获组/分支/字符类/`{m,n}` 与懒惰量词都有，单字符量词和
+  「定长链 + 一层捕获组」走迭代快路径（`.*` 在 200KB 文本上是线性的），固定
+  容量在编译期报错、匹配深度 4096 防爆栈；diff 是 Hirschberg 线性空间 LCS +
+  `diff -u` 同形 hunk（先剥公共前后缀，工作区走 `Arena`，放不下不写半截）；
+  fuzzy 是编辑距离/OSA/千分比相似度/子序列打分与 `fuzzy_best`（按码点，
+  `FUZZY_MAX`=256）；wrap 按显示列折行（CJK 2 列、CJK 之间可断行、超长词硬切）
+  并带整段缩进与居中。错误号段 `std.text.regex`=0x6039 … `std.text.wrap`=0x603c
+  （`tcc/tccgen.c` 的 `c6_err_std_slots[]` 追加）。
 
 - **标准库方法化**：`std/` 的普通结构体方法去掉 `reader_`/`writer_`/`cfile_`/`sha256_`/
   `arena_`/`random_`/`uuid_`/`inet_` 之类的接收者前缀，统一成 `pr->read_line(...)`、

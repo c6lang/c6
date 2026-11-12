@@ -833,7 +833,26 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 验收：`make stdtest`（53 个模块、0 failure）、`make std-form`（26 条自检全过）、
 `make check-all`。
 
-### 11.22 `!error` 支持浮点返回类型
+### 11.22 标准库第十一批（crc / fixed / pool / frame）
+
+第十一批补的是**无 FPU、无堆的嵌入式基础**——四块只依赖 `std.core.types`、不分配、
+不链 libm 的零依赖模块：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.crc` | 嵌入式校验：CRC-8（SMBUS/1-Wire）、CRC-16（CCITT-FALSE/XMODEM/MODBUS/ARC）、CRC-32C | 全部逐位算、不建表（256 项的表在小 MCU 上就是 512 字节 .rodata）；`*_update` 是流式原语，poly 写正规形式、`refin` 控制反射，init/xorout 归调用方；另带 Fletcher-16/LRC/XOR8/sum8/sum16 |
+| `std.core.fixed` | Q16.16 定点 `Fix` 与 Q15 `Q15` | 四则饱和（溢出钳到 I32_MAX）、开方与 Taylor sin/cos（误差 < 1e-5）、Q15 饱和乘；不链 libm |
+| `std.core.pool` | 借用调用方缓冲的定长块池 `Pool` | O(1) alloc/free、块与基址 8/16 字节对齐、拒绝池外/不对齐指针；LIFO 复用；不碰堆 |
+| `std.encoding.frame` | COBS 与 SLIP（RFC 1055）分帧/转义 | 先量再写（`*_encoded_len`/`*_max_len`），坏 code 字节、截断/非法转义、负载里的分隔符都拒绝，失败时不写半截 |
+
+错误号段追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.crc`=0x6035、
+`std.core.fixed`=0x6036、`std.core.pool`=0x6037、`std.encoding.frame`=0x6038。
+`Makefile` 增加 `std-embed` 与 `STDEMBED_SRCS`，`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（57 个模块、0 failure）、`make std-embed`（30 条自检全过）、
+`make check-all`。
+
+### 11.23 `!error` 支持浮点返回类型
 
 C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要么用 `-1`
 哨兵（浮点的 `-1` 位型是 NaN），要么按聚合清零，两者都不适用。现在把浮点并进
@@ -845,3 +864,25 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`tests/run-tests.sh try`（22 条）、`tests/run-tests.sh errors/try`
 （17 个片段）、`make check-all`。
+
+### 11.24 标准库第十二批（regex / diff / fuzzy / wrap）
+
+第十二批补的是**文本算法**这一条链路：匹配（regex）、比较（fuzzy）、排版（wrap）、
+版本对比（diff）。四个模块都是零分配或「工作区由调用方给」的写法：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.regex` | 回溯式正则：字面量、`.`、字符类、`* + ? {m,n}`（含懒惰）、捕获/非捕获组、分支、锚点、`\d\w\s\b` | 按码点匹配、位置给字节（正好切 `char[:]`）；固定容量的 AST（64 节点/8 类/9 组）在编译期报错而不是越界；单字符量词与「定长链 + 一层捕获组」走迭代快路径（`.*` 在 200KB 上是线性的），分支/嵌套组才是经典回溯，深度上限 4096 防爆栈 |
+| `std.text.diff` | 行级差异 + `diff -u` 同形 hunk | Hirschberg 线性空间 LCS（O(na*nb) 时间、O(nb) 空间），先剥公共前后缀；工作区从 `Arena` 分、不 malloc；先量再写，工作区不够（`DIFF_ENOMEM`）或输出放不下时不写半截 |
+| `std.text.fuzzy` | 编辑距离/OSA/相似度/子序列打分/`fuzzy_best` | 按码点（`中文` 对 `中问` 是 1）；`lev_distance_max` 用长度差先挡一道；`FUZZY_MAX`=256 码点，超了给 -1 而不是悄悄截断；子序列打分连续 +4、词首 +6，给补全用 |
+| `std.text.wrap` | 按显示列折行、整段缩进与居中 | 宽度用 `std.text.width` 的 `cp_width`（CJK 2 列、组合符 0 列）；CJK 之间可直接断行，超长词按码点硬切；`count`/`lines` 与 `write` 共用渲染所以长度精确；不做字素簇合并（明确写进文档） |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.regex`=0x6039、
+`std.text.diff`=0x603a、`std.text.fuzzy`=0x603b、`std.text.wrap`=0x603c。
+`grammar.md` §8.1 的表同步，并补上第十一批漏更新的 0x6035–0x6038。`Makefile`
+增加 `std-text` 与 `STDTEXT_SRCS`，`stdtest` 给四个模块补依赖（regex/fuzzy →
+`std/text/utf8.c6`，wrap → `std/text/width.c6 std/text/utf8.c6`，diff →
+`std/core/mem.c6`），`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（61 个模块、0 failure）、`make std-text`（35 条自检全过）、
+`make check-all`。

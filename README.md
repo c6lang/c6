@@ -186,6 +186,10 @@ std/text/                   文本：字符串视图与缓冲、格式化、UTF-
   std/text/utf16.c6         std.text.utf16         UTF-16 解码/编码/计数：代理对、BMP、非法代理与截断（零分配）
   std/text/ansi.c6          std.text.ansi          ANSI 转义构造器 Ansi：SGR/基础与 256 色/清屏/光标移动/隐藏光标
   std/text/width.c6         std.text.width         终端显示宽度（Unicode 15.0）：text_width/checked、按列 text_prefix_len/fit/pad/clip
+  std/text/regex.c6         std.text.regex         回溯式正则（UTF-8 按码点）：re_compile/flags、Regex 的 find/find_from/match_at/matches/full/find_all、Match 的 span/group；字符类、分组与分支、* + ? {m,n}（含懒惰）、\d\w\s\b、锚点
+  std/text/diff.c6          std.text.diff          行级差异与 unified 输出：diff_make（Hirschberg 线性空间 LCS、工作区走 Arena）、Diff 的 write_script/write_unified/script_len/unified_len/op_at 与 added/removed/same
+  std/text/fuzzy.c6         std.text.fuzzy         模糊匹配：lev_distance/lev_distance_max/lev_ratio、damerau_distance（相邻换位算 1）、subsequence_match/subsequence_score、fuzzy_best（did you mean；按码点、256 上限）
+  std/text/wrap.c6          std.text.wrap          按显示列折行/缩进/居中：wrap_make/wrap_indented、Wrap 的 count/write/lines、text_indent/text_center；CJK 2 列、超长词按码点硬切、放不下不写半截
 
 std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序
   std/container/deque.c6    std.container.deque    环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
@@ -259,6 +263,7 @@ make std-tour    # 编译并运行 examples/stdtour.c6（第二批模块的拼�
 make std-kit     # 编译并运行 examples/stdkit.c6（第三批模块的拼装示例）
 make std-box     # 编译并运行 examples/stdbox.c6（第四批模块的拼装示例）
 make std-embed   # 编译并运行 examples/stdembed.c6（第十一批嵌入式模块的拼装示例）
+make std-text    # 编译并运行 examples/stdtext.c6（第十二批文本算法模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
