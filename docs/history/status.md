@@ -1252,3 +1252,28 @@ gzip（deflate+crc）、tar（str），deflate 自成一体。示例 `examples/s
 
 验收：`make stdtest`（125 个模块、0 failure）、`make std-arch`（22 条自检全过）、
 `make check-all`。
+
+### 11.41 标准库第二十九批（wav / png / elf / zip）
+
+第二十九批补的是**读别人写的二进制**：`std.data` 已经有 JSON/CSV/TOML/XML/
+Bencode/MessagePack/CBOR/PEM，但媒体容器（WAV）、图片（PNG）、可执行文件
+（ELF）、归档（ZIP）还没有。四个模块都是「零分配、只读不拷贝」，只解析结构，
+不做像素/样本/重定位解码：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.wav` | RIFF/WAVE 头 | `fmt ` 解析格式/声道/采样率/位宽/对齐，`data` 记录偏移与长度；未知块按 `size` + 奇数补齐跳过；`fmt` 必须先于 `data`（否则 `valid=0`），不做 WAVE64/RF64 |
+| `std.data.png` | PNG 块 | 8 字节签名 + 每块 `长度/类型/数据/CRC`；CRC 用 `std.core.crc` 的 IEEE 多项式；CRC 错只置 `crc_ok=0` 不中止；`png_parse` 只认第一块 IHDR（13 字节）；不做 zlib 解压/滤波 |
+| `std.data.elf` | ELF 头 + 节表 | 支持 ELF32/64、小端/大端；`shnum`/`shentsize` 决定节表范围，越界整份判无效；节名从 `shstrndx` 字符串表取（超 63 字节截断），不做程序头/符号表/重定位 |
+| `std.data.zip` | ZIP | 从尾部扫 EOCD（注释 ≤65535），按中央目录逐项读元数据，再按本地头偏移取数据；stored 拷贝、deflate 走 `std.encoding.deflate`，校验 CRC-32；ZIP64/加密/未知方法返回 -1 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.wav`=0x607d、
+`std.data.png`=0x607e、`std.data.elf`=0x607f、`std.data.zip`=0x6080；`grammar.md`
+§8.1 的表同步。`Makefile` 增加 `std-bin` 与 `STD_BIN_SRCS`，`test-all`/`check-all`
+都带上它；`stdtest` 的依赖表补上 png（crc+str）、zip（deflate+crc），wav/elf
+自成一体。示例 `examples/stdbin.c6` 嵌了四段真实字节（Python 的
+`wave`/`zlib`/`struct`/`zipfile` 生成），逐段自检并把 PNG 的 IDAT 交给
+`std.encoding.zlib` 解出像素。
+
+验收：`make stdtest`（129 个模块、0 failure）、`make std-bin`（20 条自检全过）、
+`make check-all`。

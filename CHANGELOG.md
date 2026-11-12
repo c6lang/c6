@@ -47,6 +47,17 @@
 
 ### 标准库
 
+- **标准库第二十九批（二进制文件格式）**：`std.data.wav` / `std.data.png` /
+  `std.data.elf` / `std.data.zip` 四个只读解析模块，集成示例
+  `examples/stdbin.c6`（`make std-bin`）。wav 解析 RIFF/WAVE 的 `fmt `/`data`
+  块（跳过未知块、奇数补齐、fmt 必须在 data 前）；png 遍历签名 + 块并校验
+  IEEE CRC-32（`png_parse` 直接给 IHDR 的宽/高/位深/颜色类型）；elf 支持
+  ELF32/64 与小端/大端，读头 + 节表并从 `shstrndx` 字符串表取节名；zip 从
+  EOCD 找中央目录、按本地头取数据，stored 直接拷贝、deflate 走
+  `std.encoding.deflate`，并校验 CRC-32 与大小。四个模块零分配、只读不拷贝。
+  错误号段 `std.data.wav`=0x607d … `std.data.zip`=0x6080（`c6_err_std_slots[]`
+  追加，`grammar.md` §8.1 同步）。
+
 - **标准库第二十八批（压缩与归档）**：`std.encoding.deflate` /
   `std.encoding.zlib` / `std.encoding.gzip` / `std.encoding.tar` 四个模块，
   集成示例 `examples/stdarch.c6`（`make std-arch`）。deflate 的 `inflate` 完整

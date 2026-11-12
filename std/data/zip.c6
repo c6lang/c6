@@ -1,0 +1,366 @@
+/* std/data/zip：ZIP 归档解析（中央目录 + 本地头 + stored/deflate 解压）。
+ *
+ *     import std.data.zip;
+ *
+ *     ZipReader r = zip_reader(buf, n);
+ *     ZipEntry e = { 0 };
+ *     while (r.next(&e) == 1) {
+ *         char out[4096] = { 0 };
+ *         int m = r.data(&e, out, (int)sizeof out);
+ *         // e.name / e.method / e.comp_size / e.uncomp_size / e.crc
+ *     }
+ *
+ * ZIP 的结构：每个文件一个**本地头**（`PK\3\4`）+ 压缩数据，末尾是**中央目录**
+ * （`PK\1\2` 每项一条）和 **EOCD**（`PK\5\6`）。这一层从 EOCD 反向定位中央
+ * 目录，再按条目里的本地头偏移取数据；压缩方法支持 stored（0）和 deflate（8，
+ * 走 `std.encoding.deflate`），其余返回 -1。
+ *
+ * 约定：
+ *
+ * - `zip_reader` 找不到 EOCD / 中央目录越界时 `bad = 1`；
+ * - `next`：1 取到条目 / 0 结束 / -1 结构坏（签名不对、名字太长、越界）；
+ *   名字超过 255 字节返回 -1（这一层不做长名截断）；
+ * - `data`：把条目解到调用方缓冲，返回**解压后**的字节数；CRC-32 不符、
+ *   方法不支持、缓冲不够、ZIP64（大小是 0xffffffff）都返回 -1；
+ * - 不支持加密（flag bit0）、数据描述符（flag bit3，此时中央目录里的
+ *   大小仍然可用）、多卷、ZIP64。
+ */
+#include <string.h>
+
+module std.data.zip;
+import std.core.types;
+import std.core.crc;
+import std.encoding.deflate;
+
+#define ZIP_CRC_POLY 0x04c11db7u
+
+struct ZipEntry {
+    char name[256];
+    int method;
+    int flags;
+    u32 crc;
+    u64 comp_size;
+    u64 uncomp_size;
+    u64 local_offset;
+};
+
+struct ZipReader {
+    const u8 *p;
+    int len;
+    i64 cd_off;
+    int count;
+    int pos;
+    int bad;
+};
+
+static u16 zip_rd16(const u8 *p) { return (u16)((u16)p[0] | ((u16)p[1] << 8)); }
+
+static u32 zip_rd32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u32 zip_crc(const void *p, usize n)
+{
+    return crc32_update(0xffffffffu, p, n, ZIP_CRC_POLY, 1) ^ 0xffffffffu;
+}
+
+ZipReader zip_reader(const void *p, int n)
+{
+    ZipReader r = { (const u8 *)p, n, 0, 0, 0, 0 };
+    const u8 *b = (const u8 *)p;
+    int i = 0;
+
+    if (!p || n < 22) {
+        r.bad = 1;
+        return r;
+    }
+    /* 从尾部往前找 EOCD（注释最长 65535） */
+    for (i = n - 22; i >= 0; i--) {
+        if (zip_rd32(b + i) == 0x06054b50u) {
+            r.count = (int)zip_rd16(b + i + 10);
+            r.cd_off = (i64)zip_rd32(b + i + 16);
+            break;
+        }
+    }
+    if (i < 0 || r.cd_off <= 0 || r.cd_off >= (i64)n) {
+        r.bad = 1;
+        return r;
+    }
+    r.pos = 0;
+    return r;
+}
+
+int error_at(ZipReader *self) { return self ? self->pos : -1; }
+
+/* 1 取到 / 0 结束 / -1 坏 */
+int next(ZipReader *self, ZipEntry *out)
+{
+    i64 off = 0;
+    const u8 *b = 0;
+    int name_len = 0, extra_len = 0, comment_len = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    if (self->pos >= self->count)
+        return 0;
+    off = self->cd_off;
+    {
+        int k = 0;
+
+        for (k = 0; k < self->pos; k++) {
+            if (off + 46 > (i64)self->len)
+                return -1;
+            b = self->p + off;
+            if (zip_rd32(b) != 0x02014b50u)
+                return -1;
+            name_len = (int)zip_rd16(b + 28);
+            extra_len = (int)zip_rd16(b + 30);
+            comment_len = (int)zip_rd16(b + 32);
+            off += 46 + name_len + extra_len + comment_len;
+        }
+    }
+    if (off + 46 > (i64)self->len)
+        return -1;
+    b = self->p + off;
+    if (zip_rd32(b) != 0x02014b50u)
+        return -1;
+    name_len = (int)zip_rd16(b + 28);
+    extra_len = (int)zip_rd16(b + 30);
+    comment_len = (int)zip_rd16(b + 32);
+    if (name_len <= 0 || name_len >= (int)sizeof out->name)
+        return -1;
+    if (off + 46 + name_len + extra_len + comment_len > (i64)self->len)
+        return -1;
+    memset(out, 0, sizeof *out);
+    memcpy(out->name, b + 46, (size_t)name_len);
+    out->name[name_len] = 0;
+    out->flags = (int)zip_rd16(b + 8);
+    out->method = (int)zip_rd16(b + 10);
+    out->crc = zip_rd32(b + 16);
+    out->comp_size = (u64)zip_rd32(b + 20);
+    out->uncomp_size = (u64)zip_rd32(b + 24);
+    out->local_offset = (u64)zip_rd32(b + 42);
+    if (out->comp_size == 0xffffffffull || out->uncomp_size == 0xffffffffull)
+        return -1;                      /* ZIP64 不支持 */
+    self->pos++;
+    return 1;
+}
+
+/* 解出一个条目：返回解压后的字节数 / -1 */
+int data(ZipReader *self, ZipEntry *e, void *out, int cap)
+{
+    const u8 *b = 0;
+    u64 lo = 0;
+    int name_len = 0, extra_len = 0;
+    u32 got = 0;
+
+    if (!self || self->bad || !e || !out || cap < 0)
+        return -1;
+    if (e->flags & 0x01)
+        return -1;                      /* 加密不支持 */
+    lo = e->local_offset;
+    if (lo + 30 > (u64)self->len)
+        return -1;
+    b = self->p;
+    if (zip_rd32(b + lo) != 0x04034b50u)
+        return -1;
+    name_len = (int)zip_rd16(b + lo + 26);
+    extra_len = (int)zip_rd16(b + lo + 28);
+    if (lo + 30 + (u64)name_len + (u64)extra_len + e->comp_size
+        > (u64)self->len)
+        return -1;
+    {
+        const u8 *src = b + lo + 30 + name_len + extra_len;
+        int m = 0;
+
+        if (e->method == 0) {
+            if ((u64)cap < e->comp_size)
+                return -1;
+            memcpy(out, src, (size_t)e->comp_size);
+            m = (int)e->comp_size;
+        } else if (e->method == 8) {
+            m = inflate(src, (int)e->comp_size, out, cap);
+        } else {
+            return -1;
+        }
+        if (m < 0)
+            return -1;
+        got = zip_crc(out, (usize)m);
+        if (got != e->crc)
+            return -1;
+        return m;
+    }
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+static const char *ZIP_HEX =
+    "504b0304140000000000000021588b7395ac090000000900000005000000612e"
+    "74787468656c6c6f207a6970504b030414000000080000002158244b20c11600"
+    "00003300000005000000622e7478744b494dcb492c494d5148cecf2b49cd2b51"
+    "4821280000504b01021403140000000000000021588b7395ac09000000090000"
+    "00050000000000000000000000800100000000612e747874504b010214031400"
+    "0000080000002158244b20c11600000033000000050000000000000000000000"
+    "80012c000000622e747874504b05060000000002000200660000006500000000"
+    "00";
+
+test "中央目录、名字与两种压缩方法" {
+    u8 buf[512] = { 0 };
+    int n = unhex(ZIP_HEX, buf, (int)sizeof buf);
+    ZipReader r = zip_reader(buf, n);
+    ZipEntry e = { 0 };
+    char out[256] = { 0 };
+    int count = 0, m = 0;
+
+    if (r.bad)
+        return err(1, "EOCD 应该能找到");
+    while (r.next(&e) == 1) {
+        count++;
+        if (count == 1) {
+            if (strcmp(e.name, "a.txt") != 0 || e.method != 0
+                || e.comp_size != 9 || e.uncomp_size != 9)
+                return err(2, "第一个条目的元数据不对");
+            m = r.data(&e, out, (int)sizeof out);
+            if (m != 9 || memcmp(out, "hello zip", 9) != 0)
+                return err(3, "stored 条目解压不对");
+        }
+        if (count == 2) {
+            if (strcmp(e.name, "b.txt") != 0 || e.method != 8
+                || e.uncomp_size != 51 || e.comp_size != 22)
+                return err(4, "第二个条目的元数据不对");
+            m = r.data(&e, out, (int)sizeof out);
+            if (m != 51
+                || memcmp(out,
+                          "deflated content deflated content deflated content ",
+                          51) != 0)
+                return err(5, "deflate 条目解压不对");
+        }
+    }
+    if (count != 2)
+        return err(6, "条目数不对");
+    /* 输出缓冲不够 */
+    {
+        ZipReader r2 = zip_reader(buf, n);
+        ZipEntry e2 = { 0 };
+        char small[8] = { 0 };
+
+        r2.next(&e2);
+        if (r2.data(&e2, small, (int)sizeof small) != -1)
+            return err(7, "缓冲不够应该 -1");
+    }
+    /* 改 CRC -> -1 */
+    {
+        u8 bad[512] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[35] ^= 0x01;        /* stored 数据里的一个字节（CRC 会不符） */
+        {
+            ZipReader br = zip_reader(bad, n);
+            ZipEntry be = { 0 };
+
+            if (br.next(&be) != 1)
+                return err(8, "改 CRC 之后中央目录仍然可读");
+            if (br.data(&be, out, (int)sizeof out) != -1)
+                return err(9, "CRC 不符应该 -1");
+        }
+    }
+    /* 坏 EOCD / 截断 / 空 */
+    {
+        u8 bad[512] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[n - 22] = 0;
+        if (!zip_reader(bad, n).bad)
+            return err(10, "坏 EOCD 应该 bad");
+        if (!zip_reader(buf, 10).bad)
+            return err(11, "太短应该 bad");
+        if (!zip_reader(0, 100).bad)
+            return err(12, "空指针应该 bad");
+    }
+    {
+        ZipReader tr = zip_reader(buf, n / 2);
+        ZipEntry te = { 0 };
+
+        if (!tr.bad && tr.next(&te) == 1)
+            return err(13, "截断的 zip 不该读出一半");
+    }
+}
+
+test "条目的错误路径" {
+    u8 buf[512] = { 0 };
+    int n = unhex(ZIP_HEX, buf, (int)sizeof buf);
+    ZipReader r = zip_reader(buf, n);
+    ZipEntry e = { 0 };
+
+    if (r.next(&e) != 1)
+        return err(14, "第一个条目失败");
+    /* 未知压缩方法 */
+    {
+        ZipEntry fake = e;
+
+        fake.method = 12;
+        if (r.data(&fake, buf, 16) != -1)
+            return err(15, "未知方法应该 -1");
+    }
+    /* 加密标志 */
+    {
+        ZipEntry fake = e;
+
+        fake.flags |= 0x01;
+        if (r.data(&fake, buf, 16) != -1)
+            return err(16, "加密条目应该 -1");
+    }
+    /* 本地头偏移越界 */
+    {
+        ZipEntry fake = e;
+
+        fake.local_offset = 100000;
+        if (r.data(&fake, buf, 16) != -1)
+            return err(17, "本地头越界应该 -1");
+    }
+    /* 本地头签名坏 */
+    {
+        u8 bad[512] = { 0 };
+        ZipReader br = { 0 };
+        ZipEntry be = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[0] = 0;
+        br = zip_reader(bad, n);
+        if (br.next(&be) != 1)
+            return err(18, "中央目录仍然可读");
+        if (br.data(&be, bad, 16) != -1)
+            return err(19, "本地头签名坏应该 -1");
+    }
+    if (data(0, &e, buf, 16) != -1 || r.data(0, buf, 16) != -1
+        || r.data(&e, 0, 16) != -1)
+        return err(20, "坏参数应该 -1");
+    if (next(0, &e) != -1)
+        return err(21, "空 reader 应该 -1");
+}

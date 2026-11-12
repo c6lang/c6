@@ -1,0 +1,234 @@
+/* stdbin：标准库第二十九批（二进制文件格式）的拼装示例。
+ *
+ * 这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），各节自带自检，
+ * 失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这批是**读别人写的二进制**，所以示例里嵌了四段真实字节（都是 Python 的
+ * `wave`/`zlib`/`struct`/`zipfile` 按规范生成的，不是手搓的）：
+ *
+ *   1. wav：8 位单声道 8 kHz 的 48 字节 WAV，解析 fmt/data 与帧数；
+ *   2. png：1x1 RGBA 的 70 字节 PNG，遍历三块并校验 CRC，再把 IDAT 交给
+ *      zlib 解出「滤波字节 + 一个像素」；
+ *   3. elf：ELF64 的最小头和三个节，读出 `.text` / `.shstrtab`；
+ *   4. zip：两个条目的 225 字节 ZIP（一个 stored、一个 deflate），分别解出来。
+ *
+ * 全程零分配（示例给的缓冲都在栈上）、零外部依赖、纯计算。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdbin \
+ *         examples/stdbin.c6 std/core/types.c6 std/core/crc.c6 \
+ *         std/encoding/deflate.c6 std/encoding/zlib.c6 \
+ *         std/data/wav.c6 std/data/png.c6 std/data/elf.c6 std/data/zip.c6 \
+ *         std/text/str.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.crc;
+import std.encoding.deflate;
+import std.encoding.zlib;
+import std.data.wav;
+import std.data.png;
+import std.data.elf;
+import std.data.zip;
+import std.text.str;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, unsigned char *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (unsigned char)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+/* 1) WAV：48 字节，8 位单声道 8 kHz，4 个样本 */
+static const char *WAV_HEX =
+    "524946462800000057415645666d74201000000001000100401f0000"
+    "401f0000010008006461746104000000004080c0";
+
+/* 2) PNG：1x1 RGBA 红色 */
+static const char *PNG_HEX =
+    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+    "1f15c4890000000d49444154789c63f8cfc0f01f00050001ff89993d1d"
+    "0000000049454e44ae426082";
+
+/* 3) ELF64：最小头 + .text + .shstrtab */
+static const char *ELF_HEX =
+    "7f454c4602010100000000000000000002003e00010000000000400000000000"
+    "0000000000000000800000000000000000000000400000000000400003000200"
+    "002e74657874002e736873747274616200000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0100000001000000060000000000000000004000000000000000000000000000"
+    "1000000000000000000000000000000010000000000000000000000000000000"
+    "0700000003000000000000000000000000000000000000004000000000000000"
+    "1100000000000000000000000000000001000000000000000000000000000000";
+
+/* 4) ZIP：a.txt（stored）+ b.txt（deflate） */
+static const char *ZIP_HEX =
+    "504b0304140000000000000021588b7395ac090000000900000005000000612e"
+    "74787468656c6c6f207a6970504b030414000000080000002158244b20c11600"
+    "00003300000005000000622e7478744b494dcb492c494d5148cecf2b49cd2b51"
+    "4821280000504b01021403140000000000000021588b7395ac09000000090000"
+    "00050000000000000000000000800100000000612e747874504b010214031400"
+    "0000080000002158244b20c11600000033000000050000000000000000000000"
+    "80012c000000622e747874504b05060000000002000200660000006500000000"
+    "00";
+
+static void tour_wav(void)
+{
+    unsigned char buf[128] = { 0 };
+    int n = unhex(WAV_HEX, buf, (int)sizeof buf);
+    WavInfo w = wav_parse(buf, n);
+
+    check(w.valid, "wav: 解析");
+    check(w.format == 1 && w.channels == 1 && w.sample_rate == 8000,
+          "wav: PCM/单声道/8000");
+    check(w.bits == 8 && w.block_align == 1, "wav: 8 位、一字节一帧");
+    check(w.data_offset == 44 && w.data_size == 4 && w.frames() == 4,
+          "wav: data 块与 4 帧");
+    check((unsigned char)buf[w.data_offset + 3] == 192, "wav: 最后一个样本");
+    printf("wav: %d 字节文件，%d 帧 @ %d Hz\n", n, (int)w.frames(),
+           w.sample_rate);
+}
+
+static void tour_png(void)
+{
+    unsigned char buf[128] = { 0 };
+    int n = unhex(PNG_HEX, buf, (int)sizeof buf);
+    PngInfo info = png_parse(buf, n);
+    PngReader r = png_reader(buf, n);
+    PngChunk c = { 0 };
+    int blocks = 0, ok_crc = 1, idat_len = 0;
+    unsigned char pixels[64] = { 0 };
+    char zdata[64] = { 0 };
+
+    check(info.valid && info.width == 1 && info.height == 1,
+          "png: IHDR 1x1");
+    check(info.bit_depth == 8 && info.color_type == 6, "png: 8 位 RGBA");
+    while (r.next(&c) == 1) {
+        blocks++;
+        if (!c.crc_ok)
+            ok_crc = 0;
+        if (memcmp(c.type, "IDAT", 4) == 0) {
+            Str s = r.data(&c);
+
+            idat_len = s.s.len;
+            if (s.s.len < (int)sizeof zdata)
+                memcpy(zdata, s.s.data, (size_t)s.s.len);
+        }
+    }
+    check(blocks == 3 && ok_crc, "png: 三块且 CRC 全对");
+    check(idat_len == 13 && (unsigned char)zdata[0] == 0x78,
+          "png: IDAT 是 zlib 流");
+    {
+        int m = zlib_decompress(zdata, idat_len, pixels, (int)sizeof pixels);
+
+        check(m == 5 && pixels[0] == 0 && pixels[1] == 255 && pixels[2] == 0
+                  && pixels[3] == 0 && pixels[4] == 255,
+              "png: 解出滤波字节 + 红色像素");
+        printf("png: %d 字节，IHDR/IDAT/IEND 三块，IDAT 解出 %d 字节\n", n,
+               m);
+    }
+}
+
+static void tour_elf(void)
+{
+    unsigned char buf[512] = { 0 };
+    int n = unhex(ELF_HEX, buf, (int)sizeof buf);
+    ElfInfo e = elf_parse(buf, n);
+    ElfReader r = elf_reader(buf, n);
+    ElfSection s = { 0 };
+    int saw_text = 0, saw_strtab = 0;
+
+    check(e.valid && e.is64 && e.little, "elf: ELF64 小端");
+    check(e.machine == 62 && e.entry == 0x400000ull, "elf: x86-64 / 0x400000");
+    check(e.shnum == 3 && e.shstrndx == 2, "elf: 三个节、字符串表在 2");
+    while (r.next(&s) == 1) {
+        if (strcmp(s.name, ".text") == 0) {
+            saw_text = 1;
+            check(s.type == 1 && s.size == 16, "elf: .text 是 PROGBITS 16 字节");
+        }
+        if (strcmp(s.name, ".shstrtab") == 0)
+            saw_strtab = 1;
+    }
+    check(saw_text && saw_strtab, "elf: 节名能从 shstrtab 取到");
+    printf("elf: %d 字节，machine=%d entry=0x%llx，节名表解析正常\n", n,
+           e.machine, (unsigned long long)e.entry);
+}
+
+static void tour_zip(void)
+{
+    unsigned char buf[512] = { 0 };
+    int n = unhex(ZIP_HEX, buf, (int)sizeof buf);
+    ZipReader r = zip_reader(buf, n);
+    ZipEntry e = { 0 };
+    char out[128] = { 0 };
+    int entries = 0;
+
+    if (r.bad) {
+        check(0, "zip: EOCD");
+        return;
+    }
+    while (r.next(&e) == 1) {
+        int m = r.data(&e, out, (int)sizeof out);
+
+        entries++;
+        if (entries == 1) {
+            check(strcmp(e.name, "a.txt") == 0 && e.method == 0,
+                  "zip: 第一个条目是 stored");
+            check(m == 9 && memcmp(out, "hello zip", 9) == 0,
+                  "zip: stored 内容");
+        }
+        if (entries == 2) {
+            check(strcmp(e.name, "b.txt") == 0 && e.method == 8,
+                  "zip: 第二个条目是 deflate");
+            check(m == 51 && memcmp(out, "deflated content ", 17) == 0,
+                  "zip: deflate 内容");
+        }
+    }
+    check(entries == 2, "zip: 两个条目");
+    printf("zip: %d 字节归档，2 个条目（stored + deflate）全解出\n", n);
+}
+
+int main(void)
+{
+    printf("stdbin: 标准库第二十九批（wav / png / elf / zip）\n");
+    tour_wav();
+    tour_png();
+    tour_elf();
+    tour_zip();
+    printf("stdbin: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

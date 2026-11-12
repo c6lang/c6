@@ -17,7 +17,7 @@
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、LZ4/RLE、hexdump |
-| `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM |
+| `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM、WAV、PNG、ELF、ZIP |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
 ```sh
@@ -157,7 +157,7 @@
 | `std/encoding/gzip.c6` | `std.encoding.gzip` | gzip 容器（RFC 1952）：`gzip_crc32`（IEEE 反射多项式）、`gzip_compress(in,n,out,cap,mtime)`（10 字节头 + DEFLATE + CRC-32/ISIZE 小端）、`gzip_decompress`（跳过 FEXTRA/FNAME/FCOMMENT/FHCRC 并校验页脚）、`gzip_bound`；只读单成员 |
 | `std/encoding/tar.c6` | `std.encoding.tar` | tar 归档（ustar，零分配）：`tar_reader` + `TarReader.next`（checksum 校验、prefix/name 拼接、数据视图、截断/非法八进制 -1、`error_at`）、`tar_writer` + `add_file`/`add_dir`/`finish`（八进制字段、512 对齐、结尾两个零块）；不压缩 |
 
-**`std/data/`**（数据格式：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM）
+**`std/data/`**（数据格式：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP 的读取）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -172,6 +172,10 @@
 | `std/data/msgpack.c6` | `std.data.msgpack` | MessagePack（零分配）：`mp_writer` + `MpWriter` 的 `write_nil`/`write_bool`/`write_uint`/`write_int`/`write_f64`/`write_str`/`write_bin`/`write_array`/`write_map`、`mp_reader` + `MpReader.next` 得到 `MpTag`（类型/值/视图/元素个数）；读端支持定型整数、fixstr/str8/16/32、bin8/16/32、float32/float64，扩展类型与保留码 `c1` 一律 -1 |
 | `std/data/cbor.c6` | `std.data.cbor` | CBOR（RFC 8949，零分配）：`cbor_writer` + `CborWriter` 的 `write_uint`/`write_int`/`write_bytes`/`write_text`/`write_array`/`write_map`/`write_bool`/`write_null`/`write_f64`、`cbor_reader` + `CborReader.next` 得到 `CborTag`；主类型 0..5 全支持、半/单/双精度都转 f64；不定长、标签（主类型 6）、`f7`/`f8` 一律 -1 |
 | `std/data/pem.c6` | `std.data.pem` | PEM（RFC 7468）：`pem_encode`（每行 64 列、先算长度再写）、`pem_reader` + `PemReader.next` 得到 `PemBlock`（`label` + Base64 视图、多块迭代、CRLF/前后噪声容忍）、`PemBlock.decode_der` 走 `std.encoding.base64`；标签 1..48 个可打印 ASCII（不含 `-`、首尾不能是空格） |
+| `std/data/wav.c6` | `std.data.wav` | RIFF/WAVE 头解析（零分配）：`wav_parse` 给出格式/声道/采样率/位宽/对齐/`data_offset`/`data_size`，`WavInfo.frames` 按 block_align 算帧数；跳过 LIST/JUNK 等未知块（含奇数长度补齐），fmt 必须在 data 之前，截断/坏 magic 时 `valid=0` |
+| `std/data/png.c6` | `std.data.png` | PNG 块遍历（零分配）：`png_reader` 校验 8 字节签名、`next` 切成 `PngChunk`（类型/长度/数据偏移/CRC）、`data` 给数据视图、`png_parse` 解析 IHDR（宽/高/位深/颜色类型/隔行）；CRC 按 IEEE 多项式校验，CRC 错只置 `crc_ok=0` 不中止 |
+| `std/data/elf.c6` | `std.data.elf` | ELF 头与节表（零分配）：`elf_parse` 支持 ELF32/64、小端/大端（class/data/version 校验、节表越界拒绝），`elf_reader` + `ElfSection` 的 `next` 逐节给出名字（从 `shstrndx` 字符串表取，超 63 字节截断）/类型/flags/addr/offset/size/link/info/align/entsize |
+| `std/data/zip.c6` | `std.data.zip` | ZIP 解析（零分配）：`zip_reader` 从尾部找 EOCD、`next` 走中央目录得到 `ZipEntry`（名字/方法/flags/CRC/压缩前后大小/本地头偏移）、`data` 按本地头取数据（stored 拷贝、deflate 走 `std.encoding.deflate`）并校验 CRC；ZIP64/加密/未知方法返回 -1 |
 
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
 
@@ -227,6 +231,7 @@
 | `examples/stddata.c6` | （无模块） | 第二十六批（数据格式）的拼装示例（`make std-data`）：同一份嵌套数据走 bencode/msgpack/cbor 三种编码并核对规范字节，再用 PEM 封装一段 DER 并多块拆封 |
 | `examples/stdcalc.c6` | （无模块） | 第二十七批（数值工具）的拼装示例（`make std-calc`）：Welford 统计与分位数/直方图/相关、2x2 乘法与 3x3 行列式和线性方程组、3-4-5 向量与矩形交并、lerp/remap/缓动/Catmull-Rom |
 | `examples/stdarch.c6` | （无模块） | 第二十八批（压缩与归档）的拼装示例（`make std-arch`）：deflate 的 fixed/stored 往返、zlib 头与 Adler-32、gzip 头与 CRC-32/ISIZE、tar 两个文件的读写，最后把 tar 再用 gzip 压成 `.tar.gz` 并解压重读 |
+| `examples/stdbin.c6` | （无模块） | 第二十九批（二进制文件格式）的拼装示例（`make std-bin`）：解析 48 字节 WAV、遍历 70 字节 PNG 并把 IDAT 交给 zlib 解出像素、读 320 字节 ELF64 的节名、解 225 字节 ZIP 的 stored/deflate 两个条目 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -262,6 +267,10 @@ std/data/bencode.c6        24 test(s), 0 failure(s)
 std/data/msgpack.c6        24 test(s), 0 failure(s)
 std/data/cbor.c6           24 test(s), 0 failure(s)
 std/data/pem.c6            32 test(s), 0 failure(s)
+std/data/wav.c6            2 test(s), 0 failure(s)
+std/data/png.c6           27 test(s), 0 failure(s)
+std/data/elf.c6            2 test(s), 0 failure(s)
+std/data/zip.c6            7 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
 std/data/props.c6          4 test(s), 0 failure(s)
@@ -339,6 +348,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/msgpack.c6` 24 | msgpack 2 + str 22（同上） |
 | `std/data/cbor.c6` 24 | cbor 2 + str 22（同上） |
 | `std/data/pem.c6` 32 | pem 2 + base64 8 + str 22（Base64 解码用 base64 的正文） |
+| `std/data/wav.c6` 2 | 自成一体 |
+| `std/data/png.c6` 27 | png 2 + crc 3 + str 22（CRC-32 来自 std.core.crc，`Str` 是数据视图） |
+| `std/data/elf.c6` 2 | 自成一体（名字拷贝用 memcpy，不借 str） |
+| `std/data/zip.c6` 7 | zip 2 + deflate 2 + crc 3（deflate 解条目、crc 校验内容） |
 | `std/os/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/encoding/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
 | `std/encoding/md5.c6` 9 | md5 3 + bits 6（`rotr32` 是跨 TU 调用） |
@@ -397,7 +410,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 要 `std/encoding/base64`，bencode/msgpack/cbor 只借 `Str` 类型（正文不调 str），
 `std/core/geometry`、`std/core/interp`、`std/core/stats`、`std/core/matrix` 都自成一体，
 `std/encoding/deflate` 也自成一体，`std/encoding/zlib` 要 deflate，`gzip` 要
-deflate + `std/core/crc`，`tar` 只借 `Str` 类型。
+deflate + `std/core/crc`，`tar` 只借 `Str` 类型；`std/data/png` 只借 `Str`
+类型与 `crc`，`std/data/zip` 要 deflate + crc，`wav`/`elf` 自成一体。
 
 ## 设计原则
 
@@ -3133,6 +3147,33 @@ stored 兜底也往返；zlib 套上 `78 01` 头与 Adler-32；gzip 套上 10 �
 最后把 3072 字节的 tar 用 gzip 压成 162 字节，解压后重新用 tar 读——一次
 `.tar.gz` 的完整链路。
 
+### 集成示例：`examples/stdbin.c6`
+
+```sh
+make std-bin
+```
+
+```
+stdbin: 标准库第二十九批（wav / png / elf / zip）
+wav: 48 字节文件，4 帧 @ 8000 Hz
+png: 70 字节，IHDR/IDAT/IEND 三块，IDAT 解出 5 字节
+elf: 320 字节，machine=62 entry=0x400000，节名表解析正常
+zip: 225 字节归档，2 个条目（stored + deflate）全解出
+stdbin: 20 check(s), 0 failure(s)
+```
+
+四段字节都是按规范生成的**真实文件**（Python 的 `wave`/`zlib`/`struct`/
+`zipfile`），示例只负责解析：
+
+- WAV：`fmt ` 给出 PCM/单声道/8000 Hz/8 位/1 字节对齐，`data` 在偏移 44、
+  4 字节，`frames()` 得 4；
+- PNG：签名 + IHDR（1x1、8 位、RGBA）+ IDAT + IEND，三块 CRC 全对；IDAT 的
+  13 字节交给 `zlib_decompress`，解出「滤波字节 0 + RGBA(255,0,0,255)」；
+- ELF：ELF64 小端、machine=62、entry=0x400000，三个节里能取到 `.text`
+  （PROGBITS、16 字节）与 `.shstrtab`；
+- ZIP：EOCD → 中央目录两项（`a.txt` stored 9 字节、`b.txt` deflate 51→22
+  字节），`data()` 解出并校验 CRC。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3185,6 +3226,8 @@ stored 兜底也往返；zlib 套上 `78 01` 头与 Adler-32；gzip 套上 10 �
   （自带自检）。
 * `make std-arch`：`examples/stdarch.c6`，第二十八批（压缩与归档）模块的拼装
   示例（自带自检）。
+* `make std-bin`：`examples/stdbin.c6`，第二十九批（二进制文件格式）模块的
+  拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -3255,6 +3298,14 @@ stored 兜底也往返；zlib 套上 `78 01` 头与 Adler-32；gzip 套上 10 �
   一起钉。
 * `std/encoding/gzip.c6` 的「页脚」：改 CRC、改 ISIZE、改 magic、置保留位，
   四条都必须 -1；外部 Python gzip 向量能解出原文。
+* `std/data/wav.c6` 的「跳块」：`JUNK` 块（3 字节 + 1 补齐）之后的 `fmt `
+  仍能解析；`data` 在 `fmt` 之前时整体判无效。
+* `std/data/png.c6` 的「坏 CRC」：改 IHDR 数据的一个字节后块仍能切出来，但
+  `crc_ok=0`，`png_parse` 拒绝；类型不是字母时 `next` 返回 -1。
+* `std/data/elf.c6` 的 ELF32/ELF64 双向量：32 位节头 40 字节、64 位 64 字节，
+  `.text`/`.shstrtab` 的节名与字段两边都对；`shnum` 改大必须整份判无效。
+* `std/data/zip.c6` 的「CRC 与本地头」：改 stored 数据的一个字节 → CRC 不符
+  -1；改本地头签名 → -1；中央目录的元数据仍然可读。
 * `std/encoding/tar.c6` 的「长名字」：200 字节的路径拆进 prefix/name 之后能原样
   拼回来；checksum 字段按「全空格」口径计算并与读端一致。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致

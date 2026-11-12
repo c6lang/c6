@@ -1,0 +1,316 @@
+/* std/data/png：PNG 块解析与 CRC 校验（零分配，只读不拷贝）。
+ *
+ *     import std.data.png;
+ *
+ *     PngReader r = png_reader(buf, n);
+ *     PngChunk c = { 0 };
+ *     while (r.next(&c) == 1) {
+ *         // c.type（"IHDR"/"IDAT"/"IEND"…）、c.length、c.offset、c.crc_ok
+ *     }
+ *
+ * PNG 是「8 字节签名 + 一串块」：每块是 `长度(4) 类型(4) 数据 CRC(4)`，长度和
+ * CRC 都是大端，CRC 覆盖「类型 + 数据」。这一层只做块的切分与 CRC 校验，不做
+ * zlib 解压（`std.encoding.zlib` 可以解 IDAT）、不做滤波/像素解码。
+ *
+ * 约定：
+ *
+ * - `png_reader` 校验签名，不合法时 `bad = 1`；`next` 返回 1 取到块 / 0 到
+ *   IEND 之后 / -1 结构坏（长度越界、截断、类型不是字母）；
+ * - `c.length` 是数据长度（不含类型/CRC），`c.offset` 是**数据**在输入里的
+ *   偏移，`c.crc_ok` 用 IEEE CRC-32 校验；CRC 错**不**中止遍历（让调用方决定
+ *   是忽略这块还是拒绝整个文件）；
+ * - `png_parse` 是便捷入口：校验签名 + 解析 IHDR，给出宽/高/位深/颜色类型；
+ * - 只支持标准 PNG（APNG 的 `acTL` 等块会当未知块跳过）。
+ */
+#include <string.h>
+
+module std.data.png;
+import std.core.types;
+import std.core.crc;
+import std.text.str;
+
+#define PNG_CRC_POLY 0x04c11db7u
+
+struct PngChunk {
+    char type[5];
+    i64 length;
+    i64 offset;
+    u32 crc;
+    int crc_ok;
+};
+
+struct PngReader {
+    const u8 *p;
+    int len;
+    int pos;
+    int bad;
+    int seen_iend;
+};
+
+struct PngInfo {
+    int valid;
+    int width;
+    int height;
+    int bit_depth;
+    int color_type;
+    int interlace;
+};
+
+static u32 png_le32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static u32 png_crc(const void *p, usize n)
+{
+    return crc32_update(0xffffffffu, p, n, PNG_CRC_POLY, 1) ^ 0xffffffffu;
+}
+
+static int png_type_ok(const u8 *t)
+{
+    int i = 0;
+
+    for (i = 0; i < 4; i++)
+        if (!((t[i] >= 'A' && t[i] <= 'Z') || (t[i] >= 'a' && t[i] <= 'z')))
+            return 0;
+    return 1;
+}
+
+PngReader png_reader(const void *p, int n)
+{
+    static const u8 sig[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    PngReader r = { (const u8 *)p, n, 8, 0, 0 };
+
+    if (!p || n < 8 || memcmp(p, sig, 8) != 0) {
+        r.bad = 1;
+        return r;
+    }
+    return r;
+}
+
+int error_at(PngReader *self) { return self ? self->pos : -1; }
+
+/* 1 取到 / 0 到 IEND 之后 / -1 结构坏 */
+int next(PngReader *self, PngChunk *out)
+{
+    const u8 *p = 0;
+    int len = 0;
+    u32 want = 0, got = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    if (self->seen_iend)
+        return 0;
+    if (self->pos + 12 > self->len) {
+        self->bad = 1;
+        return -1;
+    }
+    p = self->p + self->pos;
+    len = (int)png_le32(p);
+    if (len < 0 || self->pos + 12 + len > self->len)
+        return -1;
+    if (!png_type_ok(p + 4))
+        return -1;
+    memcpy(out->type, p + 4, 4);
+    out->type[4] = 0;
+    out->length = len;
+    out->offset = self->pos + 8;
+    out->crc = png_le32(p + 8 + len);
+    want = out->crc;
+    got = png_crc(p + 4, (usize)(4 + len));
+    out->crc_ok = (want == got) ? 1 : 0;
+    self->pos += 12 + len;
+    if (memcmp(out->type, "IEND", 4) == 0)
+        self->seen_iend = 1;
+    return 1;
+}
+
+/* 块的数据视图（调用方自己保证是当前块） */
+Str data(PngReader *self, PngChunk *c)
+{
+    Str s = { { (char *)0, 0 } };
+
+    if (!self || !c || c->offset < 0 || c->length < 0)
+        return s;
+    if (c->offset + c->length > self->len)
+        return s;
+    s.s = (char[:]){ (char *)self->p + c->offset, (int)c->length };
+    return s;
+}
+
+/* 便捷入口：签名 + IHDR */
+PngInfo png_parse(const void *p, int n)
+{
+    PngInfo info = { 0, 0, 0, 0, 0, 0 };
+    PngReader r = png_reader(p, n);
+    PngChunk c = { 0 };
+
+    if (r.bad || r.next(&c) != 1)
+        return info;
+    if (memcmp(c.type, "IHDR", 4) != 0 || c.length != 13 || !c.crc_ok)
+        return info;
+    {
+        const u8 *d = (const u8 *)p + c.offset;
+
+        info.width = (int)png_le32(d);
+        info.height = (int)png_le32(d + 4);
+        info.bit_depth = d[8];
+        info.color_type = d[9];
+        info.interlace = d[12];
+        info.valid = 1;
+    }
+    return info;
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+test "1x1 PNG 的块遍历与 CRC" {
+    u8 buf[128] = { 0 };
+    int n = unhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+                  "1f15c4890000000d49444154789c63f8cfc0f01f00050001ff89993d1d00"
+                  "00000049454e44ae426082",
+                  buf, (int)sizeof buf);
+    PngReader r = png_reader(buf, n);
+    PngChunk c = { 0 };
+    PngInfo info = { 0 };
+    int blocks = 0, idat = 0;
+
+    if (r.bad)
+        return err(1, "签名应该合法");
+    while (r.next(&c) == 1) {
+        blocks++;
+        if (!c.crc_ok)
+            return err(2, "每个块的 CRC 都该对");
+        if (memcmp(c.type, "IHDR", 4) == 0) {
+            if (c.length != 13)
+                return err(3, "IHDR 长度不对");
+        }
+        if (memcmp(c.type, "IDAT", 4) == 0)
+            idat = (int)c.length;
+        if (memcmp(c.type, "IEND", 4) == 0 && c.length != 0)
+            return err(4, "IEND 长度应该是 0");
+    }
+    if (blocks != 3)
+        return err(5, "应该有 IHDR/IDAT/IEND 三块");
+    if (idat != 13)
+        return err(6, "IDAT 长度不对");
+    if (r.next(&c) != 0)
+        return err(7, "IEND 之后应该返回 0");
+    info = png_parse(buf, n);
+    if (!info.valid || info.width != 1 || info.height != 1
+        || info.bit_depth != 8 || info.color_type != 6 || info.interlace != 0)
+        return err(8, "IHDR 字段不对");
+    /* IDAT 的数据视图与 zlib 流开头（78 9c） */
+    {
+        PngReader r2 = png_reader(buf, n);
+        Str s = { 0 };
+
+        r2.next(&c);
+        if (r2.next(&c) != 1)
+            return err(9, "第二个块失败");
+        s = r2.data(&c);
+        if (s.s.len != 13 || (u8)s.s.data[0] != 0x78
+            || (u8)s.s.data[1] != 0x9c)
+            return err(10, "IDAT 视图不对");
+    }
+    /* 坏 CRC：块仍然返回，但 crc_ok = 0 */
+    {
+        u8 bad[128] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[29] ^= 0x01;        /* IHDR 数据里的一个字节 */
+        {
+            PngReader br = png_reader(bad, n);
+            PngChunk bc = { 0 };
+
+            if (br.next(&bc) != 1 || memcmp(bc.type, "IHDR", 4) != 0)
+                return err(11, "坏 CRC 的块应该还能读出来");
+            if (bc.crc_ok)
+                return err(12, "改过的块 CRC 应该不对");
+            if (png_parse(bad, n).valid)
+                return err(13, "png_parse 应该拒绝坏 IHDR");
+        }
+    }
+    /* 坏签名 / 截断 */
+    {
+        u8 bad[128] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[1] = 'X';
+        if (!png_reader(bad, n).bad)
+            return err(14, "坏签名应该 bad");
+        {
+            PngReader good = png_reader(buf, n);
+
+            if (good.next(&c) != 1)
+                return err(15, "正常 reader 第一块失败");
+        }
+    }
+    {
+        PngReader tr = png_reader(buf, 20);
+
+        if (tr.next(&c) != -1)
+            return err(16, "截断的头应该 -1");
+    }
+}
+
+test "非法类型与数据视图边界" {
+    u8 buf[64] = { 0 };
+    /* 签名 + 一个类型带数字的块（长度 0） */
+    int n = unhex("89504e470d0a1a0a000000003132333400000000", buf,
+                  (int)sizeof buf);
+    PngReader r = png_reader(buf, n);
+    PngChunk c = { 0 };
+    Str s = { 0 };
+
+    if (r.next(&c) != -1)
+        return err(17, "类型不是字母应该 -1");
+    /* data() 对空块给空视图 */
+    {
+        u8 okbuf[64] = { 0 };
+        int m = unhex("89504e470d0a1a0a0000000049454e44ae426082", okbuf,
+                      (int)sizeof okbuf);
+        PngReader orr = png_reader(okbuf, m);
+
+        if (orr.next(&c) != 1 || c.length != 0)
+            return err(18, "空 IEND 解析失败");
+        s = orr.data(&c);
+        if (s.s.len != 0)
+            return err(19, "空块的数据视图应该是空");
+        if (orr.next(&c) != 0)
+            return err(20, "IEND 之后应该返回 0");
+    }
+    {
+        PngReader nul = png_reader(0, 8);
+
+        if (nul.bad == 0)
+            return err(21, "空指针应该 bad");
+    }
+    if (png_parse(buf, 20).valid)
+        return err(22, "截断的 png_parse 不该有效");
+}

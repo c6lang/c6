@@ -1,0 +1,394 @@
+/* std/data/elf：ELF 可执行/目标文件头与节表解析（零分配，只读）。
+ *
+ *     import std.data.elf;
+ *
+ *     ElfInfo e = elf_parse(buf, n);
+ *     if (e.valid) { ... e.machine / e.entry / e.shnum ... }
+ *
+ *     ElfReader r = elf_reader(buf, n);
+ *     ElfSection s = { 0 };
+ *     while (r.next(&s) == 1) {
+ *         // s.name / s.type / s.offset / s.size ...
+ *     }
+ *
+ * 支持 ELF32/ELF64、小端/大端；只解析**头 + 节表**，不做程序头映射、重定位、
+ * 符号表解码（要做的话在节表之上继续读 `.symtab` 就行）。节名从 `shstrndx`
+ * 指向的字符串表里取，超过 63 字节的节名截断。
+ *
+ * 约定：
+ *
+ * - `ElfInfo.valid == 0` 表示不是合法 ELF（magic/class/data 不对、版本不是 1、
+ *   节表越界、偏移超出缓冲）；其它字段此时不可信；
+ * - 不校验 `e_type`/`e_machine` 的取值，原样给出；
+ * - `ElfReader.next`：1 取到节 / 0 结束 / -1 坏（节表越界、名字偏移超出字符串
+ *   表）；名字拿不到时给空串，不算错；
+ * - `ElfSection` 把 `sh_flags`/`sh_addr`/`sh_offset`/`sh_size`/`sh_addralign`/
+ *   `sh_entsize` 给成 64 位（32 位 ELF 里是 32 位，读取时零扩展）。
+ */
+
+#include <string.h>
+
+module std.data.elf;
+import std.core.types;
+
+#define ELF_NAME_MAX 64
+
+struct ElfInfo {
+    int valid;
+    int is64;
+    int little;
+    int type;
+    int machine;
+    int osabi;
+    u64 entry;
+    u64 phoff;
+    u64 shoff;
+    int phentsize;
+    int phnum;
+    int shentsize;
+    int shnum;
+    int shstrndx;
+};
+
+struct ElfSection {
+    char name[ELF_NAME_MAX];
+    u32 name_off;
+    u32 type;
+    u64 flags;
+    u64 addr;
+    u64 offset;
+    u64 size;
+    u32 link;
+    u32 info;
+    u64 align;
+    u64 entsize;
+};
+
+static ElfInfo elf_bad(void)
+{
+    ElfInfo e = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    return e;
+}
+
+struct ElfReader {
+    const u8 *p;
+    int len;
+    ElfInfo info;
+    int pos;
+    int bad;
+};
+
+static u16 elf_rd16(const u8 *p, int le)
+{
+    if (le)
+        return (u16)((u16)p[0] | ((u16)p[1] << 8));
+    return (u16)(((u16)p[0] << 8) | (u16)p[1]);
+}
+
+static u32 elf_rd32(const u8 *p, int le)
+{
+    if (le)
+        return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+               | ((u32)p[3] << 24);
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static u64 elf_rd64(const u8 *p, int le)
+{
+    u64 hi = 0, lo = 0;
+
+    if (le) {
+        lo = (u64)elf_rd32(p, 1);
+        hi = (u64)elf_rd32(p + 4, 1);
+    } else {
+        hi = (u64)elf_rd32(p, 0);
+        lo = (u64)elf_rd32(p + 4, 0);
+    }
+    return (hi << 32) | lo;
+}
+
+ElfInfo elf_parse(const void *p, int n)
+{
+    ElfInfo e = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const u8 *b = (const u8 *)p;
+    int le = 1;
+
+    if (!p || n < 52)
+        return e;
+    if (b[0] != 0x7f || b[1] != 'E' || b[2] != 'L' || b[3] != 'F')
+        return e;
+    if (b[4] != 1 && b[4] != 2)
+        return e;
+    if (b[5] != 1 && b[5] != 2)
+        return e;
+    if (b[6] != 1)
+        return e;
+    e.valid = 1;
+    e.is64 = (b[4] == 2) ? 1 : 0;
+    e.little = (b[5] == 1) ? 1 : 0;
+    le = e.little;
+    e.osabi = b[7];
+    e.type = (int)elf_rd16(b + 16, le);
+    e.machine = (int)elf_rd16(b + 18, le);
+    if (e.is64) {
+        if (n < 64)
+            return elf_bad();
+        e.entry = elf_rd64(b + 24, le);
+        e.phoff = elf_rd64(b + 32, le);
+        e.shoff = elf_rd64(b + 40, le);
+        e.phentsize = (int)elf_rd16(b + 54, le);
+        e.phnum = (int)elf_rd16(b + 56, le);
+        e.shentsize = (int)elf_rd16(b + 58, le);
+        e.shnum = (int)elf_rd16(b + 60, le);
+        e.shstrndx = (int)elf_rd16(b + 62, le);
+    } else {
+        e.entry = (u64)elf_rd32(b + 24, le);
+        e.phoff = (u64)elf_rd32(b + 28, le);
+        e.shoff = (u64)elf_rd32(b + 32, le);
+        e.phentsize = (int)elf_rd16(b + 42, le);
+        e.phnum = (int)elf_rd16(b + 44, le);
+        e.shentsize = (int)elf_rd16(b + 46, le);
+        e.shnum = (int)elf_rd16(b + 48, le);
+        e.shstrndx = (int)elf_rd16(b + 50, le);
+    }
+    if (e.shnum > 0 && e.shentsize > 0) {
+        u64 end = e.shoff + (u64)e.shentsize * (u64)e.shnum;
+
+        if (end > (u64)n)
+            return elf_bad();
+    }
+    return e;
+}
+
+ElfReader elf_reader(const void *p, int n)
+{
+    ElfReader r = { (const u8 *)p, n, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+                    0, 0 };
+
+    r.info = elf_parse(p, n);
+    if (!r.info.valid)
+        r.bad = 1;
+    return r;
+}
+
+int error_at(ElfReader *self) { return self ? self->pos : -1; }
+
+/* 拿到 shstrndx 指向的字符串表的 (offset, size) */
+static int elf_strtab(ElfReader *r, u64 *off, u64 *size)
+{
+    const u8 *b = r->p;
+    int le = r->info.little;
+    u64 base = 0;
+
+    if (r->info.shstrndx < 0 || r->info.shstrndx >= r->info.shnum)
+        return 0;
+    base = r->info.shoff + (u64)r->info.shentsize * (u64)r->info.shstrndx;
+    if (base + (u64)r->info.shentsize > (u64)r->len)
+        return 0;
+    if (r->info.is64) {
+        *off = elf_rd64(b + base + 24, le);
+        *size = elf_rd64(b + base + 32, le);
+    } else {
+        *off = (u64)elf_rd32(b + base + 16, le);
+        *size = (u64)elf_rd32(b + base + 20, le);
+    }
+    if (*off + *size > (u64)r->len)
+        return 0;
+    return 1;
+}
+
+/* 1 取到 / 0 结束 / -1 坏 */
+int next(ElfReader *self, ElfSection *out)
+{
+    const u8 *b = 0;
+    u64 base = 0, str_off = 0, str_size = 0;
+    int le = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    if (self->info.shnum == 0 || self->pos >= self->info.shnum)
+        return 0;
+    le = self->info.little;
+    base = self->info.shoff + (u64)self->info.shentsize * (u64)self->pos;
+    if (base + (u64)self->info.shentsize > (u64)self->len) {
+        self->bad = 1;
+        return -1;
+    }
+    b = self->p;
+    memset(out, 0, sizeof *out);
+    out->name_off = elf_rd32(b + base, le);
+    out->type = elf_rd32(b + base + 4, le);
+    if (self->info.is64) {
+        out->flags = elf_rd64(b + base + 8, le);
+        out->addr = elf_rd64(b + base + 16, le);
+        out->offset = elf_rd64(b + base + 24, le);
+        out->size = elf_rd64(b + base + 32, le);
+        out->link = elf_rd32(b + base + 40, le);
+        out->info = elf_rd32(b + base + 44, le);
+        out->align = elf_rd64(b + base + 48, le);
+        out->entsize = elf_rd64(b + base + 56, le);
+    } else {
+        out->flags = (u64)elf_rd32(b + base + 8, le);
+        out->addr = (u64)elf_rd32(b + base + 12, le);
+        out->offset = (u64)elf_rd32(b + base + 16, le);
+        out->size = (u64)elf_rd32(b + base + 20, le);
+        out->link = elf_rd32(b + base + 24, le);
+        out->info = elf_rd32(b + base + 28, le);
+        out->align = (u64)elf_rd32(b + base + 32, le);
+        out->entsize = (u64)elf_rd32(b + base + 36, le);
+    }
+    /* 节名 */
+    out->name[0] = 0;
+    if (out->name_off != 0 && elf_strtab(self, &str_off, &str_size)) {
+        u64 p = str_off + (u64)out->name_off;
+        int i = 0;
+
+        if (p >= str_off + str_size) {
+            self->bad = 1;
+            return -1;
+        }
+        while (p + (u64)i < str_off + str_size
+               && b[p + (u64)i] != 0 && i + 1 < ELF_NAME_MAX) {
+            out->name[i] = (char)b[p + (u64)i];
+            i++;
+        }
+        out->name[i] = 0;
+    }
+    self->pos++;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+static const char *ELF64_HEX =
+    "7f454c4602010100000000000000000002003e0001000000000040000000"
+    "000000000000000000008000000000000000000000004000000000004000"
+    "03000200002e74657874002e736873747274616200000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000010000000100000006000000000000000000"
+    "400000000000000000000000000010000000000000000000000000000000"
+    "100000000000000000000000000000000700000003000000000000000000"
+    "000000000000000000004000000000000000110000000000000000000000"
+    "0000000001000000000000000000000000000000";
+
+static const char *ELF32_HEX =
+    "7f454c460101010000000000000000000200030001000000008004080000"
+    "00008000000000000000340000000000280003000200002e74657874002e"
+    "736873747274616200000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000010000000100000006000000"
+    "008004080000000010000000000000000000000010000000000000000700"
+    "000003000000000000000000000034000000110000000000000000000000"
+    "0100000000000000";
+
+test "ELF64 的头与节表" {
+    u8 buf[512] = { 0 };
+    int n = unhex(ELF64_HEX, buf, (int)sizeof buf);
+    ElfInfo e = elf_parse(buf, n);
+    ElfReader r = { 0 };
+    ElfSection s = { 0 };
+    int count = 0;
+
+    if (!e.valid || !e.is64 || !e.little)
+        return err(1, "ELF64 头不合法");
+    if (e.machine != 62 || e.type != 2 || e.entry != 0x400000ull)
+        return err(2, "machine/type/entry 不对");
+    if (e.shnum != 3 || e.shstrndx != 2 || e.shentsize != 64)
+        return err(3, "节表参数不对");
+    r = elf_reader(buf, n);
+    while (r.next(&s) == 1) {
+        count++;
+        if (count == 1 && (s.type != 0 || s.name[0] != 0))
+            return err(4, "空节不对");
+        if (count == 2) {
+            if (strcmp(s.name, ".text") != 0 || s.type != 1
+                || s.size != 16 || s.align != 16 || s.flags != 6)
+                return err(5, ".text 节不对");
+        }
+        if (count == 3) {
+            if (strcmp(s.name, ".shstrtab") != 0 || s.type != 3
+                || s.offset != 64 || s.size != 17)
+                return err(6, ".shstrtab 节不对");
+        }
+    }
+    if (count != 3)
+        return err(7, "节数不对");
+    /* 坏 magic / 截断 / 节表越界 */
+    {
+        u8 bad[512] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[0] = 'X';
+        if (elf_parse(bad, n).valid)
+            return err(8, "坏 magic 不该有效");
+        if (elf_parse(buf, 40).valid)
+            return err(9, "截断的头不该有效");
+        memcpy(bad, buf, (size_t)n);
+        bad[60] = 9;            /* shnum = 9 */
+        if (elf_parse(bad, n).valid)
+            return err(10, "节表越界不该有效");
+        {
+            ElfReader br = elf_reader(bad, n);
+
+            if (!br.bad)
+                return err(11, "坏 ELF 的 reader 应该 bad");
+        }
+    }
+}
+
+test "ELF32 的头与节表" {
+    u8 buf[512] = { 0 };
+    int n = unhex(ELF32_HEX, buf, (int)sizeof buf);
+    ElfInfo e = elf_parse(buf, n);
+    ElfReader r = { 0 };
+    ElfSection s = { 0 };
+    int count = 0;
+
+    if (!e.valid || e.is64 || !e.little)
+        return err(12, "ELF32 头不合法");
+    if (e.machine != 3 || e.entry != 0x8048000ull)
+        return err(13, "ELF32 的 machine/entry 不对");
+    if (e.shnum != 3 || e.shentsize != 40 || e.shstrndx != 2)
+        return err(14, "ELF32 节表参数不对");
+    r = elf_reader(buf, n);
+    while (r.next(&s) == 1) {
+        count++;
+        if (count == 2 && strcmp(s.name, ".text") != 0)
+            return err(15, "ELF32 .text 名字不对");
+        if (count == 2 && (s.size != 16 || s.align != 16))
+            return err(16, "ELF32 .text 字段不对");
+    }
+    if (count != 3)
+        return err(17, "ELF32 节数不对");
+    if (elf_parse(0, 64).valid || elf_reader(buf, 30).bad == 0)
+        return err(18, "坏参数应该无效");
+}

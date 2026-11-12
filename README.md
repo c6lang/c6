@@ -281,6 +281,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/msgpack.c6       std.data.msgpack      MessagePack：mp_writer 的 nil/bool/uint/int/f64/str/bin/array/map、mp_reader + next 的 MpTag；不支持扩展类型
   std/data/cbor.c6          std.data.cbor         CBOR（RFC 8949）：cbor_writer 的 uint/int/bytes/text/array/map/bool/null/f64、cbor_reader + next 的 CborTag；半/单/双精度都转 f64，不支持不定长与标签
   std/data/pem.c6           std.data.pem          PEM（RFC 7468）：pem_encode（64 列 Base64）、pem_reader + next 的多块迭代、PemBlock.decode_der；标签 1..48 个可打印 ASCII
+  std/data/wav.c6           std.data.wav           RIFF/WAVE 头解析：wav_parse 给格式/声道/采样率/位宽/对齐/data 偏移，WavInfo.frames 算帧数，跳过 LIST/JUNK 等块
+  std/data/png.c6           std.data.png           PNG 块遍历：png_reader + next 切块（类型/长度/偏移/CRC）、data 视图、png_parse 解析 IHDR；CRC 按 IEEE 校验
+  std/data/elf.c6           std.data.elf           ELF 头与节表：elf_parse 支持 ELF32/64 大小端，elf_reader + next 给出节名/类型/flags/addr/offset/size（名字取自 shstrtab）
+  std/data/zip.c6           std.data.zip           ZIP 解析：EOCD → 中央目录 → 本地头，stored/deflate 两种条目解压并校验 CRC；ZIP64/加密/未知方法 -1
 
 std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
@@ -344,6 +348,7 @@ make std-cipher  # 编译并运行 examples/stdcipher.c6（第二十五批对称
 make std-data    # 编译并运行 examples/stddata.c6（第二十六批数据格式模块的拼装示例）
 make std-calc    # 编译并运行 examples/stdcalc.c6（第二十七批数值工具模块的拼装示例）
 make std-arch    # 编译并运行 examples/stdarch.c6（第二十八批压缩与归档模块的拼装示例）
+make std-bin     # 编译并运行 examples/stdbin.c6（第二十九批二进制文件格式模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

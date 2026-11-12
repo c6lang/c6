@@ -1,0 +1,198 @@
+/* std/data/wav：RIFF/WAVE 音频头解析（零分配，只读不拷贝）。
+ *
+ *     import std.data.wav;
+ *
+ *     WavInfo w = wav_parse(buf, n);
+ *     if (w.valid) {
+ *         // w.channels / w.sample_rate / w.bits / w.data_offset / w.data_size
+ *         i64 frames = w.frames();
+ *     }
+ *
+ * WAVE 是「RIFF 容器 + fmt 块 + data 块」：`RIFF<size>WAVE` 之后是一串
+ * `<id><size><payload>`（奇数长度补一个字节），`fmt ` 描述格式，`data` 的
+ * payload 就是采样。这一层只解析头和块的边界，不做 PCM 解码、不重采样、
+ * 不处理 WAVE64/RF64。
+ *
+ * 约定：
+ *
+ * - 返回结构体的 `valid` 为 0 表示不是合法 WAVE（magic 不对、截断、缺 fmt
+ *   或 data）；其它字段此时不可信；
+ * - `format` 原样给出（1 = PCM、3 = IEEE float、0xFFFE = extensible），
+ *   `bits` 是容器位宽（8/16/24/32/64），`block_align` 是一帧字节数；
+ * - `data_offset`/`data_size` 是**输入缓冲上的位置**，调用方自己按位宽读样本；
+ * - 多个 data 块只认第一个；fmt 块之后出现的未知块（LIST/JUNK…）会被跳过。
+ */
+
+#include <string.h>
+
+module std.data.wav;
+import std.core.types;
+
+struct WavInfo {
+    int valid;
+    int format;
+    int channels;
+    int sample_rate;
+    int byte_rate;
+    int block_align;
+    int bits;
+    i64 data_offset;
+    i64 data_size;
+};
+
+static u32 wav_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static int wav_le16(const u8 *p) { return (int)p[0] | ((int)p[1] << 8); }
+
+static WavInfo wav_bad(void)
+{
+    WavInfo w = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    return w;
+}
+
+i64 frames(WavInfo *self)
+{
+    if (!self || !self->valid || self->block_align <= 0)
+        return 0;
+    return self->data_size / (i64)self->block_align;
+}
+
+WavInfo wav_parse(const void *p, int n)
+{
+    WavInfo w = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const u8 *b = (const u8 *)p;
+    int pos = 12, have_fmt = 0;
+
+    if (!p || n < 12)
+        return w;
+    if (memcmp(b, "RIFF", 4) != 0 || memcmp(b + 8, "WAVE", 4) != 0)
+        return w;
+    while (pos + 8 <= n) {
+        const u8 *id = b + pos;
+        u32 size = wav_le32(b + pos + 4);
+        int payload = pos + 8;
+        int pad = (int)(size & 1u);
+
+        if ((i64)payload + (i64)size > (i64)n)
+            return wav_bad();
+        if (memcmp(id, "fmt ", 4) == 0) {
+            if (size < 16)
+                return wav_bad();
+            w.format = wav_le16(b + payload);
+            w.channels = wav_le16(b + payload + 2);
+            w.sample_rate = (int)wav_le32(b + payload + 4);
+            w.byte_rate = (int)wav_le32(b + payload + 8);
+            w.block_align = wav_le16(b + payload + 12);
+            w.bits = wav_le16(b + payload + 14);
+            have_fmt = 1;
+        } else if (memcmp(id, "data", 4) == 0 && have_fmt) {
+            w.data_offset = (i64)payload;
+            w.data_size = (i64)size;
+            w.valid = 1;
+            return w;
+        }
+        pos = payload + (int)size + pad;
+    }
+    return w;
+}
+
+/* ---- 自测 ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexval(s[0]), lo = hexval(s[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+test "解析 8 位单声道 WAV" {
+    u8 buf[64] = { 0 };
+    int n = unhex("524946462800000057415645666d74201000000001000100401f0000"
+                  "401f0000010008006461746104000000004080c0",
+                  buf, (int)sizeof buf);
+    WavInfo w = wav_parse(buf, n);
+
+    if (!w.valid)
+        return err(1, "合法 WAV 应该能解析");
+    if (w.format != 1 || w.channels != 1 || w.sample_rate != 8000)
+        return err(2, "格式/声道/采样率不对");
+    if (w.bits != 8 || w.block_align != 1 || w.byte_rate != 8000)
+        return err(3, "位宽/对齐/字节率不对");
+    if (w.data_offset != 44 || w.data_size != 4)
+        return err(4, "data 块位置不对");
+    if (w.frames() != 4)
+        return err(5, "帧数不对");
+    if ((u8)buf[w.data_offset] != 0 || (u8)buf[w.data_offset + 3] != 192)
+        return err(6, "样本内容不对");
+    /* 截断：data 声明 4 字节但只给 2 字节 */
+    if (wav_parse(buf, (int)w.data_offset + 2).valid)
+        return err(7, "截断的 data 不该有效");
+    /* 坏 magic */
+    {
+        u8 bad[64] = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[0] = 'X';
+        if (wav_parse(bad, n).valid)
+            return err(8, "坏 RIFF magic 不该有效");
+        memcpy(bad, buf, (size_t)n);
+        bad[8] = 'X';
+        if (wav_parse(bad, n).valid)
+            return err(9, "坏 WAVE magic 不该有效");
+    }
+    /* 太短 / 空指针 */
+    if (wav_parse(buf, 8).valid || wav_parse(0, 48).valid)
+        return err(10, "短输入/空指针不该有效");
+}
+
+test "跳过未知块与只认第一个 data" {
+    /* RIFF + JUNK(3 字节，补 1) + fmt + data(2 字节) */
+    u8 buf[128] = { 0 };
+    int n = unhex(
+        "5249464632000000574156454a554e4b0300000041424300"
+        "666d7420100000000100020044ac000010b1020004001000"
+        "646174610200000001020300",
+        buf, (int)sizeof buf);
+    WavInfo w = wav_parse(buf, n);
+
+    if (!w.valid)
+        return err(11, "带 JUNK 块的 WAV 应该能解析");
+    if (w.channels != 2 || w.sample_rate != 44100 || w.bits != 16)
+        return err(12, "跳块之后的 fmt 不对");
+    if (w.data_size != 2 || w.block_align != 4)
+        return err(13, "data/对齐不对");
+    if (w.frames() != 0)
+        return err(14, "2 字节不足一帧，帧数应该是 0");
+    /* data 在 fmt 之前：应该无效（要求先见 fmt） */
+    {
+        u8 order[128] = { 0 };
+        int m = unhex("52494646240000005741564564617461020000000102"
+                      "666d74201000000001000100401f0000401f000001000800",
+                      order, (int)sizeof order);
+
+        if (wav_parse(order, m).valid)
+            return err(15, "data 在 fmt 之前不该有效");
+    }
+}
