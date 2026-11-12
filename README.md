@@ -163,7 +163,10 @@ make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后
 
 ```
 std/core/                   基础：定宽类型、错误码、内存、数学、位运算、哈希、随机
+  std/core/bignum.c6        std.core.bignum        任意精度整数（1024 位、零分配）：big_parse/parse_base/from_i64/from_u64、Big 的 add/sub/mul/div/mod/divmod/pow、cmp、to_i64/to_u64、format/format_base（2..36 进制）；超 1024 位报 err
   std/core/bits.c6          std.core.bits          popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/clear、mask/sign_extend/is_pow2
+  std/core/complex.c6       std.core.complex       复数 Complex（f64 实部/虚部）：cplx/cplx_real/cplx_i、add/sub/mul/div/neg/conj/inv/scale/normalize、abs2/abs（用 std.core.math 的 sqrt）、pow_int、eq/near/is_finite
+  std/core/decimal.c6       std.core.decimal       十进制定点 Dec（9 位小数、i64）：dec_parse/from_i64/from_f64/from_units、add/sub/mul/mul_int/div（128 位中间值、精确舍入）、round（TRUNC/HALF_UP/HALF_EVEN/FLOOR/CEIL）、to_i64/to_f64、format（恰好 N 位小数）
   std/core/crc.c6           std.core.crc           嵌入式校验：CRC-8（SMBUS/MAXIM）、CRC-16（CCITT-FALSE/XMODEM/MODBUS/ARC）、CRC-32C，逐位不带表；Fletcher-16/LRC/XOR8/sum8/sum16 与流式 crc*_update
   std/core/err.c6           std.core.err           错误码 enum Error（OK…BUSY）+ msg()/msg_of()/is_ok()
   std/core/fixed.c6         std.core.fixed         Q16.16 定点 Fix（from_int/from_frac/from_f64、to_f64/to_int/round/floor/ceil/frac、mul/div/sqrt/sin/cos/lerp/clamp、饱和加减）与 Q15（q15_from_*、mul/add_sat/sub_sat）
@@ -172,6 +175,7 @@ std/core/                   基础：定宽类型、错误码、内存、数学�
   std/core/mem.c6           std.core.mem           借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
   std/core/pool.c6          std.core.pool          定长块内存池 Pool：pool_make/init、O(1) 的 alloc/free、contains/count/capacity/used/block_size/is_empty/is_full/reset（借用调用方缓冲，不碰堆）
   std/core/rand.c6          std.core.rand          xorshift64*：可重放序列、无偏区间 below/int_range、next_f64/next_bool、fill/shuffle
+  std/core/rational.c6      std.core.rational      精确有理数 Rat（i64 分子/分母、自动约分）：rat_make/from_i64/parse、add/sub/mul/div/inv/neg/abs、cmp（连分数比较，不经过 double）、to_i64/to_f64、format（n/d）
   std/core/types.c6         std.core.types         定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
 
 std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、glob 与显示宽度
@@ -264,6 +268,7 @@ make std-kit     # 编译并运行 examples/stdkit.c6（第三批模块的拼装
 make std-box     # 编译并运行 examples/stdbox.c6（第四批模块的拼装示例）
 make std-embed   # 编译并运行 examples/stdembed.c6（第十一批嵌入式模块的拼装示例）
 make std-text    # 编译并运行 examples/stdtext.c6（第十二批文本算法模块的拼装示例）
+make std-num     # 编译并运行 examples/stdnum.c6（第十三批数值类型模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

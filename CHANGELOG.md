@@ -47,6 +47,18 @@
 
 ### 标准库
 
+- **标准库第十三批（数值类型）**：`std.core.bignum` / `std.core.decimal` /
+  `std.core.rational` / `std.core.complex` 四个模块，集成示例
+  `examples/stdnum.c6`（`make std-num`）。bignum 是 1024 位的值类型大整数
+  （加减乘、二进制长除法、u32 快速幂、2..36 进制互转，超限/除零/解析失败走
+  `err`）；decimal 是 9 位小数的十进制定点，**乘除用自带的 128 位小工具**
+  （tcc 没有 `__int128`）再按 half-up 收尾，`0.1 + 0.2` 精确等于 `0.3`，带 5
+  种舍入模式与「恰好 N 位小数」的格式化，并与 Python `decimal` 做了随机交叉
+  验证；rational 是始终最简的精确分数，`cmp` 用连分数比较（不经过 double）；
+  complex 是 f64 复数（四则/共轭/模/归一化/整数幂，除零按 IEEE）。错误号段
+  `std.core.bignum`=0x603d … `std.core.complex`=0x6040（`tcc/tccgen.c` 的
+  `c6_err_std_slots[]` 追加）。
+
 - **标准库第十二批（文本算法）**：`std.text.regex` / `std.text.diff` /
   `std.text.fuzzy` / `std.text.wrap` 四个模块，集成示例
   `examples/stdtext.c6`（`make std-text`）。regex 是回溯式正则：UTF-8 按码点

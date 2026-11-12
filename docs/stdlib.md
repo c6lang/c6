@@ -39,7 +39,10 @@
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
+| `std/core/bignum.c6` | `std.core.bignum` | 任意精度整数（1024 位、零分配）：`big_parse`/`big_parse_base`（2..36 进制）/`big_from_i64`/`big_from_u64`、`Big` 的 `add`/`sub`/`mul`/`div`/`mod`/`divmod`（截断除法）/`pow`（u32 指数）、`cmp`/`is_zero`/`is_neg`、`to_i64`/`to_u64`、`format`/`format_base`/`digits`；容量超限、除零、解析失败都给 `err` |
+| `std/core/complex.c6` | `std.core.complex` | 复数 `Complex`（f64 实部/虚部）：`cplx`/`cplx_real`/`cplx_i`、`add`/`sub`/`mul`/`div`/`neg`/`conj`/`inv`/`scale`/`normalize`、`abs2`/`abs`（用 `std.core.math` 的 `sqrt`）、`pow_int`（快速幂，负指数取倒数）、`eq`/`near`/`is_finite`/`is_zero`；除零按 IEEE 给 inf/nan |
 | `std/core/bits.c6` | `std.core.bits` | 位运算：`popcount32/64`、`parity32`、`clz32/64`、`ctz32/64`（0 输入给 32/64）、`rotl`/`rotr`、`bswap16/32/64`、`bit_get/set/clear/toggle`、`mask_low`/`mask_range`、`sign_extend`、`is_pow2_32/64` |
+| `std/core/decimal.c6` | `std.core.decimal` | 十进制定点 `Dec`（i64、单位 1e-9，范围约 ±9.22e9）：`dec_parse`/`dec_from_i64`/`dec_from_f64`/`dec_from_units`、`add`/`sub`/`mul`/`mul_int`/`div`（乘除走 128 位中间值再按 half-up 收尾，不经过 double）、`round`（`DEC_TRUNC`/`DEC_HALF_UP`/`DEC_HALF_EVEN`/`DEC_FLOOR`/`DEC_CEIL`）、`to_i64`/`to_f64`、`format`（恰好 N 位小数）；溢出/除零/解析失败给 `err` |
 | `std/core/crc.c6` | `std.core.crc` | 嵌入式校验（逐位、不带表）：CRC-8 的 `crc8_smbus`/`crc8_maxim`、CRC-16 的 `crc16_ccitt`/`crc16_xmodem`/`crc16_modbus`/`crc16_ibm`、`crc32c`；流式原语 `crc8_update`/`crc16_update`/`crc32_update`（poly 正规形式 + `refin`）；`fletcher16`/`lrc8`/`xor8`/`sum8`/`sum16` |
 | `std/core/err.c6` | `std.core.err` | 错误码 `enum Error`（`OK`…`BUSY`，16 个）与 `msg()`/`msg_of()`/`is_ok()`；号段固定在 `0x6000` |
 | `std/core/fixed.c6` | `std.core.fixed` | 定点：Q16.16 的 `Fix`（`fix_from_raw`/`fix_from_int`/`fix_from_frac`/`fix_from_f64`、`to_f64`/`to_int`/`round`/`floor`/`ceil`/`frac`/`abs`/`neg`、`add`/`sub`/`mul`/`div`/`sqrt`/`lerp`/`clamp`/`cmp`/`sin`/`cos`，溢出饱和）与 Q15 的 `Q15`（`q15_from_int`/`q15_from_f64`/`to_f64`/`mul`/`add_sat`/`sub_sat`） |
@@ -48,6 +51,7 @@
 | `std/core/mem.c6` | `std.core.mem` | 借用式内存池 `Arena`（`alloc`/`alloc_array`/`reset`/`room`/`used`）、托管堆薄包装 `alloc_new`/`alloc_new_array`/`dealloc`、按元素的 `copy`/`fill`/`zero`/`swap`/`rotate`/`reverse_bytes`、`align_up`/`align_down`/`is_aligned` |
 | `std/core/pool.c6` | `std.core.pool` | 定长块内存池 `Pool`（零分配、O(1)）：`pool_make`/`init`、`alloc`/`free`（拒绝池外/不对齐指针）、`contains`/`count`/`capacity`/`used`/`block_size`/`is_empty`/`is_full`/`reset`；块与基址按 8/16 字节对齐 |
 | `std/core/rand.c6` | `std.core.rand` | xorshift64* 伪随机：`rand_seed` + `Rand` 方法 `next_u64`/`next_u32`/`below`（拒绝采样）/`int_range`/`int_range_incl`/`next_f64`/`next_bool`/`fill`/`shuffle`/`shuffle_int` |
+| `std/core/rational.c6` | `std.core.rational` | 精确有理数 `Rat`（i64 分子/分母，始终最简、`den > 0`）：`rat_make`/`rat_from_i64`/`rat_parse`（`a/b` 或 `a`）、`add`/`sub`/`mul`/`div`/`inv`/`neg`/`abs`、`cmp`（连分数比较，交叉相乘会溢出也不经过 double）、`to_i64`/`to_f64`、`format`（`n/d`）；加减的中间分子溢出报 `err` |
 | `std/core/types.c6` | `std.core.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`（`U8_MAX`…`I32_MIN`）/`Bool` 两个枚举 |
 
 **`std/text/`**（文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换）
@@ -147,6 +151,7 @@
 | `examples/stdform.c6` | （无模块） | 第十批模块的拼装示例（`make std-form`）：props/multipart/punycode/width 各一节，自带自检 |
 | `examples/stdembed.c6` | （无模块） | 第十一批（嵌入式基础）的拼装示例（`make std-embed`）：fixed/crc/pool/frame 各一节，串成「采样 → 定点 → 分帧 → 校验 → 池」链路，自带自检 |
 | `examples/stdtext.c6` | （无模块） | 第十二批（文本算法）的拼装示例（`make std-text`）：regex 拆日志、fuzzy 命令补全、wrap 帮助折行、diff 配置对比，自带自检 |
+| `examples/stdnum.c6` | （无模块） | 第十三批（数值类型）的拼装示例（`make std-num`）：bignum 阶乘与进制、decimal 金额税额、rational 调和级数、complex 乘法与模，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -1594,6 +1599,82 @@ m = slip_decode_frame(wire, n, back, (int)sizeof back);
   再写」，缓冲不够返回 -1 且一个字节都不写；解码先扫一遍校验格式，失败时目标
   缓冲不变。
 
+### `bignum`：任意精度整数
+
+```c
+import std.core.bignum;
+
+Big a = big_parse(S("123456789012345678901234567890"));
+Big b = big_from_i64(7);
+Big q = { 0 }, r = { 0 };
+if (a.divmod(b, &q, &r)) {          /* q*7 + r == a */
+    char out[64] = { 0 };
+    q.format((char[:]){ out, (int)sizeof out });   /* 十进制 */
+}
+```
+
+* 表示是「符号 + 32 个 32 位 limb」（小端），容量 **1024 位**（十进制约 308 位）。
+  够 RSA-1024、阶乘、大数进制转换；要更大就改 `BIG_LIMBS` 重新编译（值类型，没有堆）。
+* **截断除法**：`divmod` 的商向零取整、余数同被除数符号（和 C 的 `/`、`%` 一致），
+  除数为 0 返回 0；`div`/`mod` 是它的两个便捷入口。
+* 超出 1024 位（加法最高进位、乘法结果、幂、解析的数字）一律 `err = 1`，并随结果
+  传播；`cmp` 只看值，`is_err` 要单独查。
+* 进制 2..36，输出小写、输入大小写都收；`format`/`format_base` 先写临时缓冲，
+  放不下返回 -1 且不写半截。
+
+### `decimal`：十进制定点
+
+```c
+import std.core.decimal;
+
+Dec price = dec_parse(S("19.99"));
+Dec sub = price.mul(dec_from_i64(3));          /* 59.97 */
+Dec tax = sub.mul(dec_parse(S("0.065")));      /* 3.89805 */
+tax = tax.round(2, DEC_HALF_UP);               /* 3.90 */
+```
+
+* 一个 i64，单位 1e-9：范围约 ±9.22e9、9 位小数。金额、单价、税额、汇率用它对，
+  不要拿二进制浮点凑（`0.1 + 0.2` 就是精确的 `0.3`）。
+* **乘除先算 128 位中间值再除 1e9**，最后按 half-up 收尾——tcc 没有 `__int128`，
+  模块里自带 `u128_mul`/`u128_div`（两个 64 位半宽拆开做），所以没有二进制误差。
+* `round(places, mode)` 是十进制舍位（0..9 位），`mode` 是 `DEC_TRUNC`/`DEC_HALF_UP`/
+  `DEC_HALF_EVEN`/`DEC_FLOOR`/`DEC_CEIL`；`to_i64` 用同一套模式取整。
+* `parse` 收 `[+-]digits[.digits]`，小数超过 9 位报错（不悄悄截断）；`format`
+  输出恰好 N 位小数；溢出/除零/解析失败都给 `err`。`to_f64`/`dec_from_f64` 会有
+  二进制误差，只在对外交换时用。
+
+### `rational`：精确分数
+
+```c
+import std.core.rational;
+
+Rat h = rat_zero();
+for (k = 1; k <= 10; k++)
+    h = h.add(rat_make(1, k));       /* 7381/2520 */
+```
+
+* 值总是最简形式（`den > 0`、`gcd == 1`、零是 `0/1`），所以相等的有理数表示唯一。
+* 加减乘除都先约分再乘，尽量把溢出推后；**加减的中间分子**放不进 i64 时报 `err`
+  （即使约分后结果放得下）——没有 128 位整数的代价，极端大数请用 bignum/decimal。
+* `cmp` 用连分数比较：交叉相乘会溢出的两个数（`MAX/2` 对 `MAX/1`）也能比出正确
+  结果，不经过 double。`to_i64` 向零截断，`to_f64` 是近似。
+
+### `complex`：复数
+
+```c
+import std.core.complex;
+
+Complex z = cplx(3.0, 4.0);
+f64 m = z.abs();                     /* 5 */
+Complex w = z.mul(cplx(1.0, -2.0));  /* 11 - 2i */
+```
+
+* 只做四则 + 模 + 共轭 + 归一化 + 整数幂；`abs` 用 `std.core.math` 里自实现的
+  `sqrt`，不链 libm。
+* 除零按 IEEE 给 `inf`/`nan`（和浮点一致），要判定用 `is_finite()`；`eq` 是逐位
+  精确比较，浮点运算之后请用 `near(o, eps)`。
+* **没有** `arg`/`exp`/`log`/`sin`：这些要 `atan2`/`exp`，标准库目前不提供。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -1867,6 +1948,24 @@ wrap 把中英混排的帮助文本折成 34 列（首行缩进 2、续行 6）�
 并验「放不下返回 -1」。Makefile 里显式列出八个模块正文（regex/fuzzy 依赖
 `std/text/utf8.c6`，wrap 再依赖 `std/text/width.c6`，diff 依赖 `std/core/mem.c6`）。
 
+### 集成示例：`examples/stdnum.c6`
+
+```sh
+make std-num
+```
+
+```
+stdnum: 标准库第十三批（bignum / decimal / rational / complex）
+stdnum: 21 check(s), 0 failure(s)
+```
+
+四节：「大整数」算 30!（33 位）与 2^100，用 `divmod` 验 `30! / 29! == 30`，再做
+`deadbeef` 的十六进制解析/输出与 1024 位溢出；「十进制」算 `19.99 * 3` 的小计、
+6.5% 税额按分四舍五入、合计，并钉住 `0.1 + 0.2 == 0.3` 与 `1/3` 的 9 位结果；
+「有理数」累加调和级数 `H_10 = 7381/2520`（再转 f64 复核），并比较交叉相乘会溢出的
+两个大分数；「复数」算 `(3+4i)(1-2i) = 11-2i`、`|3+4i| = 5`、`(3+4i)^2`、共轭乘积
+与除零的 IEEE 行为。Makefile 里显式列出六个模块正文（complex 依赖 `std/core/math.c6`）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1886,6 +1985,8 @@ wrap 把中英混排的帮助文本折成 34 列（首行缩进 2、续行 6）�
 * `make std-embed`：`examples/stdembed.c6`，第十一批（嵌入式基础）模块的拼装示例
   （自带自检）。
 * `make std-text`：`examples/stdtext.c6`，第十二批（文本算法）模块的拼装示例
+  （自带自检）。
+* `make std-num`：`examples/stdnum.c6`，第十三批（数值类型）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

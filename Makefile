@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text
+        std-more std-next std-node std-form std-embed std-text std-num
 
 all: build
 
@@ -139,6 +139,7 @@ stdtest: build
 	    std/text/fuzzy.c6) deps="std/text/utf8.c6" ;; \
 	    std/text/wrap.c6)  deps="std/text/width.c6 std/text/utf8.c6" ;; \
 	    std/text/diff.c6)  deps="std/core/mem.c6" ;; \
+	    std/core/complex.c6) deps="std/core/math.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -285,6 +286,19 @@ std-text: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdtext $(STDTEXT_SRCS)
 	./build/stdtext
 
+# 标准库第十三批（数值类型）：bignum / decimal / rational / complex。
+# bignum 与 decimal/rational 只依赖 std.core.types（128 位小工具各自内联），
+# complex 用 std.core.math 的 sqrt/nearly_eq。示例把四块串成
+# 「大整数阶乘 -> 金额税额 -> 调和级数 -> 复数」一条链路。
+STDNUM_SRCS := examples/stdnum.c6 std/core/types.c6 std/core/math.c6 \
+               std/core/bignum.c6 std/core/decimal.c6 std/core/rational.c6 \
+               std/core/complex.c6
+
+std-num: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdnum $(STDNUM_SRCS)
+	./build/stdnum
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -389,7 +403,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -398,13 +412,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的十三个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的十四个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text
-# 是十二批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num
+# 是十三批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -545,7 +559,7 @@ distclean:
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
-#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text）
+#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
@@ -561,6 +575,7 @@ distclean:
 #   std-form         编译并运行 examples/stdform.c6（第十批）
 #   std-embed        编译并运行 examples/stdembed.c6（第十一批，嵌入式基础）
 #   std-text         编译并运行 examples/stdtext.c6（第十二批，文本算法）
+#   std-num          编译并运行 examples/stdnum.c6（第十三批，数值类型）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

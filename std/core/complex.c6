@@ -1,0 +1,286 @@
+/* std/core/complex：复数（f64 实部/虚部，值类型，零分配）。
+ *
+ *     import std.core.complex;
+ *
+ *     Complex z = cplx(3.0, 4.0);
+ *     z.abs();                              // 5.0
+ *     z.mul(cplx(1.0, 2.0));                // (3+4i)(1+2i) = -5+10i
+ *     z.inv();                              // 0.12 - 0.16i
+ *
+ * 只做「复数域上的四则 + 模 + 共轭 + 归一化 + 整数幂」，不链 libm：`abs`
+ * 用 `std.core.math` 里那个自实现的 `sqrt`（牛顿迭代），所以 freestanding
+ * 也能用。**没有** `arg`/`exp`/`log`/`sin`：这些要 `atan2`/`exp`，标准库
+ * 目前不提供（要角度就自己按象限算 atan）。
+ *
+ * 约定：
+ *
+ * - 除以 0 不报错，按 IEEE 给 `inf`/`nan`（和浮点一致）；要判定就用
+ *   `is_finite()`。
+ * - `eq` 是**逐位精确**比较；浮点运算之后请用 `near(o, eps)`。
+ * - 归一化在 `abs() == 0` 时原样返回（不产生 nan），`inv` 在 0 时给
+ *   `inf`/`nan`（IEEE 语义），两者都写在 test 里。
+ */
+module std.core.complex;
+import std.core.types;
+import std.core.math;
+
+struct Complex {
+    f64 re;
+    f64 im;
+};
+
+/* ---- 工厂 ---- */
+
+Complex cplx(f64 re, f64 im)
+{
+    Complex z = { 0 };
+
+    z.re = re;
+    z.im = im;
+    return z;
+}
+
+Complex cplx_real(f64 re)
+{
+    return cplx(re, 0.0);
+}
+
+Complex cplx_i(void)
+{
+    return cplx(0.0, 1.0);
+}
+
+/* ---- 查询 ---- */
+
+/* |z|^2 = re^2 + im^2（比 abs 少一次开方） */
+f64 abs2(Complex *self)
+{
+    return self->re * self->re + self->im * self->im;
+}
+
+f64 abs(Complex *self)
+{
+    return sqrt(self->abs2());
+}
+
+int is_zero(Complex *self)
+{
+    return self->re == 0.0 && self->im == 0.0;
+}
+
+/* re 和 im 都是有限值（inf/nan 给 0） */
+int is_finite(Complex *self)
+{
+    if (!(self->re == self->re) || !(self->im == self->im))
+        return 0;
+    if (self->re > 1.7976931348623157e308 || self->re < -1.7976931348623157e308)
+        return 0;
+    if (self->im > 1.7976931348623157e308 || self->im < -1.7976931348623157e308)
+        return 0;
+    return 1;
+}
+
+int eq(Complex *self, Complex o)
+{
+    return self->re == o.re && self->im == o.im;
+}
+
+/* 近似相等：实部/虚部各自在 eps 之内 */
+int near(Complex *self, Complex o, f64 eps)
+{
+    return nearly_eq(self->re, o.re, eps) && nearly_eq(self->im, o.im, eps);
+}
+
+/* ---- 四则 ---- */
+
+Complex add(Complex *self, Complex o)
+{
+    return cplx(self->re + o.re, self->im + o.im);
+}
+
+Complex sub(Complex *self, Complex o)
+{
+    return cplx(self->re - o.re, self->im - o.im);
+}
+
+Complex neg(Complex *self)
+{
+    return cplx(-self->re, -self->im);
+}
+
+/* (a+bi)(c+di) = (ac-bd) + (ad+bc)i */
+Complex mul(Complex *self, Complex o)
+{
+    f64 a = self->re, b = self->im, c = o.re, d = o.im;
+
+    return cplx(a * c - b * d, a * d + b * c);
+}
+
+/* (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c^2+d^2)；0 按 IEEE 给 inf/nan */
+Complex div(Complex *self, Complex o)
+{
+    f64 a = self->re, b = self->im, c = o.re, d = o.im;
+    f64 den = c * c + d * d;
+
+    return cplx((a * c + b * d) / den, (b * c - a * d) / den);
+}
+
+/* 共轭 */
+Complex conj(Complex *self)
+{
+    return cplx(self->re, -self->im);
+}
+
+/* 倒数：conj / |z|^2 */
+Complex inv(Complex *self)
+{
+    f64 m = self->abs2();
+
+    return cplx(self->re / m, -self->im / m);
+}
+
+/* 乘实数 */
+Complex scale(Complex *self, f64 k)
+{
+    return cplx(self->re * k, self->im * k);
+}
+
+/* 单位化；z == 0 时原样返回 */
+Complex normalize(Complex *self)
+{
+    f64 m = self->abs();
+
+    if (m == 0.0)
+        return *self;
+    return cplx(self->re / m, self->im / m);
+}
+
+/* 整数幂（快速幂）；负指数先取倒数 */
+Complex pow_int(Complex *self, int n)
+{
+    Complex r = cplx(1.0, 0.0);
+    Complex base = *self;
+    u32 e = 0;
+
+    if (n < 0) {
+        base = self->inv();
+        e = (u32)0 - (u32)n;         /* 覆盖 I32_MIN */
+    } else {
+        e = (u32)n;
+    }
+    while (e > 0u) {
+        if ((e & 1u) != 0u)
+            r = r.mul(base);
+        e >>= 1;
+        if (e > 0u)
+            base = base.mul(base);
+    }
+    return r;
+}
+
+/* ---- 自测 ---- */
+
+test "构造与四则" {
+    Complex a = cplx(1.0, 2.0);
+    Complex b = cplx(3.0, 4.0);
+    Complex r = a.add(b);
+
+    if (!r.eq(cplx(4.0, 6.0)))
+        return err(1, "加法");
+    r = a.sub(b);
+    if (!r.eq(cplx(-2.0, -2.0)))
+        return err(2, "减法");
+    r = a.mul(b);
+    if (!r.eq(cplx(-5.0, 10.0)))
+        return err(3, "乘法");
+    r = cplx(1.0, 1.0).mul(cplx(1.0, 1.0));
+    if (!r.near(cplx(0.0, 2.0), 1e-12))
+        return err(4, "(1+i)^2 = 2i");
+    r = a.neg();
+    if (!r.eq(cplx(-1.0, -2.0)))
+        return err(5, "取负");
+    r = a.conj();
+    if (!r.eq(cplx(1.0, -2.0)))
+        return err(6, "共轭");
+    r = a.scale(2.0);
+    if (!r.eq(cplx(2.0, 4.0)))
+        return err(7, "乘实数");
+}
+
+test "除法与倒数" {
+    Complex a = cplx(1.0, 2.0);
+    Complex b = cplx(3.0, 4.0);
+    Complex r = a.div(b);
+
+    /* (1+2i)/(3+4i) = (11+2i)/25 */
+    if (!r.near(cplx(0.44, 0.08), 1e-12))
+        return err(8, "除法");
+    r = cplx(3.0, 4.0).inv();
+    if (!r.near(cplx(0.12, -0.16), 1e-12))
+        return err(9, "倒数");
+    /* z * z^-1 = 1 */
+    r = cplx(3.0, 4.0).mul(cplx(3.0, 4.0).inv());
+    if (!r.near(cplx(1.0, 0.0), 1e-12))
+        return err(10, "z * z^-1");
+    /* 除以 0：IEEE 语义，不是崩溃 */
+    r = cplx(1.0, 1.0).div(cplx(0.0, 0.0));
+    if (r.is_finite())
+        return err(11, "除以 0 应该是非有限值");
+    r = cplx(0.0, 0.0).inv();
+    if (r.is_finite())
+        return err(12, "0 的倒数不是有限值");
+}
+
+test "模、归一化与判定" {
+    Complex z = cplx(3.0, 4.0);
+
+    if (z.abs2() != 25.0 || z.abs() != 5.0)
+        return err(13, "|3+4i| = 5");
+    if (cplx(0.0, 0.0).abs() != 0.0)
+        return err(14, "零的模");
+    {
+        Complex u = z.normalize();
+
+        if (!u.near(cplx(0.6, 0.8), 1e-12) || u.abs() < 0.9999 || u.abs() > 1.0001)
+            return err(15, "归一化");
+    }
+    if (!cplx(0.0, 0.0).normalize().is_zero())
+        return err(16, "零归一化保持零");
+    if (!z.is_finite() || cplx(1.0, 0.0).is_zero() || !cplx(0.0, 0.0).is_zero())
+        return err(17, "is_finite / is_zero");
+    if (!z.eq(cplx(3.0, 4.0)) || z.eq(cplx(3.0, 4.0001)))
+        return err(18, "精确相等");
+    if (!z.near(cplx(3.0000001, 3.9999999), 1e-6)
+        || z.near(cplx(3.1, 4.0), 1e-6))
+        return err(19, "近似相等");
+}
+
+test "整数幂" {
+    Complex z = cplx(1.0, 1.0);
+    Complex r = z.pow_int(2);
+
+    if (!r.near(cplx(0.0, 2.0), 1e-12))
+        return err(20, "(1+i)^2");
+    r = z.pow_int(0);
+    if (!r.eq(cplx(1.0, 0.0)))
+        return err(21, "z^0 = 1");
+    r = z.pow_int(1);
+    if (!r.eq(z))
+        return err(22, "z^1 = z");
+    r = z.pow_int(4);
+    if (!r.near(cplx(-4.0, 0.0), 1e-12))
+        return err(23, "(1+i)^4 = -4");
+    r = z.pow_int(-1);
+    if (!r.near(cplx(0.5, -0.5), 1e-12))
+        return err(24, "(1+i)^-1");
+    r = z.pow_int(-2);
+    if (!r.near(cplx(0.0, -0.5), 1e-12))
+        return err(25, "(1+i)^-2");
+    /* i 的旋转性：i^2 = -1, i^4 = 1 */
+    r = cplx_i().pow_int(2);
+    if (!r.near(cplx(-1.0, 0.0), 1e-12))
+        return err(26, "i^2 = -1");
+    r = cplx_i().pow_int(4);
+    if (!r.near(cplx(1.0, 0.0), 1e-12))
+        return err(27, "i^4 = 1");
+}

@@ -886,3 +886,24 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`make stdtest`（61 个模块、0 failure）、`make std-text`（35 条自检全过）、
 `make check-all`。
+
+### 11.25 标准库第十三批（bignum / decimal / rational / complex）
+
+第十三批补的是**数值表示**这一层：任意精度整数、十进制金额、精确分数、复数。
+四个模块都只依赖 `std.core.types`（complex 另外用 `std.core.math` 的 `sqrt`），
+不分配、不链 libm：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.bignum` | 任意精度整数 `Big`（1024 位 = 32 个 32 位 limb） | 值类型、零分配；加减乘、二进制长除法（截断除法语义同 C 的 `/`、`%`）、u32 指数的快速幂、2..36 进制互转；超 1024 位/除零/解析失败都进 `err` 并随结果传播；格式化先写临时缓冲，放不下不写半截 |
+| `std.core.decimal` | 十进制定点 `Dec`（i64、单位 1e-9，范围约 ±9.22e9） | **乘除用自带的 128 位小工具**（`u128_mul`/`u128_div`，两个 64 位半宽拆开做）再除 1e9、按 half-up 收尾，所以 0.1+0.2 精确等于 0.3；5 种舍入模式、`format` 输出恰好 N 位小数；与 Python `decimal` 做了 120 组随机交叉验证 |
+| `std.core.rational` | 精确分数 `Rat`（i64 分子/分母，始终最简） | 加减乘除先约分再乘；`cmp` 用**连分数比较**（交叉相乘会溢出的两个数也能比，不经过 double）；加减的中间分子放不进 i64 时报 `err`（极端大数请用 bignum/decimal，文档写明） |
+| `std.core.complex` | 复数 `Complex`（f64 实部/虚部） | 四则 + 共轭 + 模/模方 + 归一化 + `pow_int`（快速幂、负指数取倒数，含 I32_MIN）；`abs` 用 math 的牛顿 sqrt；除零按 IEEE 给 inf/nan；没有 arg/exp/log/sin（缺 atan2/exp，文档写明） |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.bignum`=0x603d、
+`std.core.decimal`=0x603e、`std.core.rational`=0x603f、`std.core.complex`=0x6040；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-num` 与 `STDNUM_SRCS`，`stdtest`
+给 complex 补 `std/core/math.c6` 依赖，`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（65 个模块、0 failure）、`make std-num`（21 条自检全过）、
+`make check-all`。
