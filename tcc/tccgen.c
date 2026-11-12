@@ -12771,6 +12771,10 @@ static const struct C6ErrStdSlot {
     { "std.text.table",         C6_ERR_SLOT_STD + 74 },
     { "std.text.natural",       C6_ERR_SLOT_STD + 75 },
     { "std.os.proc",            C6_ERR_SLOT_STD + 76 },
+    { "std.encoding.sha1",      C6_ERR_SLOT_STD + 77 },
+    { "std.net.ws",             C6_ERR_SLOT_STD + 78 },
+    { "std.net.dns",            C6_ERR_SLOT_STD + 79 },
+    { "std.net.tcp",            C6_ERR_SLOT_STD + 80 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

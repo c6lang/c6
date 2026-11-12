@@ -47,6 +47,17 @@
 
 ### 标准库
 
+- **标准库第十七批（网络协议基础）**：`std.encoding.sha1` / `std.net.ws` /
+  `std.net.dns` / `std.net.tcp` 四个模块，集成示例 `examples/stdwire.c6`
+  （`make std-wire`）。sha1 是流式 + 一次性的 SHA-1 / HMAC-SHA1（含 RFC 2202
+  与官方 100 万字节向量，文档写明只用于协议互操作）；ws 是 RFC 6455 的握手
+  accept-key 与帧编解码（7/16/64 位长度、客户端掩码、区分「还不够」与「坏帧」）；
+  dns 是 RFC 1035 的报文解析/查询构建（压缩指针防环、A/AAAA/CNAME、`*next`
+  遍历）；tcp 是 POSIX 套接字薄封装（getaddrinfo、内核挑端口、poll 超时连接、
+  收发/超时/半关闭，方法名避开 libc 的 send/recv/close/accept）。错误号段
+  `std.encoding.sha1`=0x604d … `std.net.tcp`=0x6050（`tcc/tccgen.c` 的
+  `c6_err_std_slots[]` 追加）。
+
 - **标准库第十六批（命令行工具基础）**：`std.os.args` / `std.text.table` /
   `std.text.natural` / `std.os.proc` 四个模块，集成示例 `examples/stdcli.c6`
   （`make std-cli`）。args 是按规格表迭代的选项解析（长/短名、带值/开关、

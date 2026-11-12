@@ -969,3 +969,23 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`make stdtest`（77 个模块、0 failure）、`make std-cli`（17 条自检全过）、
 `make check-all`。
+
+### 11.29 标准库第十七批（sha1 / ws / dns / tcp）
+
+第十七批补的是**网络协议基础**：摘要、握手/分帧、DNS 报文、TCP 套接字。前三块是
+纯字节处理（零分配），tcp 是一层 POSIX 薄封装：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.sha1` | SHA-1 与 HMAC-SHA1（流式/一次性/hex/常数时间比较） | 零分配、不链加密库；RFC 2202 的 HMAC 向量与 100 万个 a 的官方向量都钉在 test 里；文档明确「只用于协议互操作，抗碰撞用 sha256」 |
+| `std.net.ws` | WebSocket 握手与帧（RFC 6455） | `ws_accept` = base64(SHA1(key+GUID))；帧支持 7/16/64 位长度与客户端掩码（u32 掩码键、大端）；`ws_parse` 区分「还不够」与「坏帧」；不做分片重组（FIN 原样给出） |
+| `std.net.dns` | DNS 报文的解析与查询构建（RFC 1035） | 压缩指针只允许向前指、最多 64 跳（防环）；名字解码写调用方缓冲并限制 255 字节；`*next` 顺序遍历；A/AAAA/CNAME 取值；不做 EDNS0/DoT/名字转义 |
+| `std.net.tcp` | TCP 套接字（监听/连接/接受/收发/超时/半关闭） | getaddrinfo 解析主机（IPv4/IPv6）；port 0 让内核挑；带超时 connect 用非阻塞 + `poll`；方法名避开 libc 的 `send`/`recv`/`close`/`accept`（用 `write_bytes`/`read_bytes`/`close_socket`/`accept_client`）；不做 TLS |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.sha1`=0x604d、
+`std.net.ws`=0x604e、`std.net.dns`=0x604f、`std.net.tcp`=0x6050；`grammar.md` §8.1
+的表同步。`Makefile` 增加 `std-wire` 与 `STDWIRE_SRCS`，`stdtest` 给 ws 补
+`sha1+base64+err` 依赖，`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（81 个模块、0 failure）、`make std-wire`（19 条自检全过）、
+`make check-all`。

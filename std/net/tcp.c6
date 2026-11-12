@@ -1,0 +1,451 @@
+/* std/net/tcp：TCP 套接字（POSIX 薄封装，阻塞/超时都支持）。
+ *
+ *     import std.net.tcp;
+ *
+ *     Tcp srv = tcp_listen("127.0.0.1", 0, 4);      // 0 = 内核挑端口
+ *     int port = srv.port();
+ *     Tcp cli = tcp_connect("127.0.0.1", port, 1000);
+ *     Tcp peer = srv.accept_client();
+ *     peer.write_all("hi", 2);
+ *     char buf[8] = { 0 };
+ *     cli.read_all(buf, 2);
+ *
+ * 这一层只包最常用的动作：监听、连接、接受、收发、超时、关闭。地址用
+ * `getaddrinfo` 解析，所以 `"127.0.0.1"`、`"::1"`、`"localhost"` 都行；
+ * 监听时 `host` 传 0 或 `""` 表示任意地址（IPv4/IPv6 都试）。
+ *
+ * 约定：
+ *
+ * - 工厂（`tcp_listen`/`tcp_connect`/`accept_client`）返回 `Tcp`，失败时 `fd = -1`，
+ *   用 `tcp_ok()`/`ok()` 判断；其它函数对 `fd = -1` 的返回值是 -1/0，不会崩。
+ * - `tcp_connect` 的 `timeout_ms >= 0` 时用非阻塞 connect + `poll` 实现超时，
+ *   超时/被拒返回失败；`< 0` 是普通阻塞 connect。
+ * - `tcp_recv` 返回 0 表示对端正常关闭（EOF），-1 表示错误或超时（用
+ *   `tcp_set_timeout` 设的 SO_RCVTIMEO 到期也是 -1）。
+ * - `tcp_send` 可能只发一部分（返回发送字节数）；要发完整用 `tcp_send_all`。
+ *   `tcp_recv_all` 读满 n 字节，途中 EOF/错误返回已读到的字节数（< n）。
+ * - 不做 TLS、不做 DNS 报文（那是 `std.net.dns`）、不做 WebSocket 分帧
+ *   （`std.net.ws`）、不处理 SIGPIPE 之外的信号。
+ */
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+
+module std.net.tcp;
+import std.core.types;
+
+struct Tcp {
+    int fd;
+};
+
+static Tcp tcp_bad(void)
+{
+    Tcp t = { -1 };
+
+    return t;
+}
+
+/* 端口号转成服务名（十进制字符串） */
+static void tcp_service(int port, char *buf, int cap)
+{
+    char rev[8] = { 0 };
+    int n = 0, i = 0;
+
+    if (port <= 0) {
+        buf[0] = '0';            /* getaddrinfo 收 "0" 表示让内核挑端口 */
+        buf[1] = 0;
+        return;
+    }
+    while (port > 0 && n < 8) {
+        rev[n++] = (char)('0' + port % 10);
+        port /= 10;
+    }
+    if (n >= cap)
+        n = cap - 1;
+    for (i = 0; i < n; i++)
+        buf[i] = rev[n - 1 - i];
+    buf[n] = 0;
+}
+
+int ok(Tcp *self) { return self && self->fd >= 0; }
+
+/* 本地端口；失败（或 fd 无效）返回 -1 */
+int port(Tcp *self)
+{
+    struct sockaddr_storage ss = { 0 };
+    socklen_t len = sizeof ss;
+
+    if (!ok(self))
+        return -1;
+    if (getsockname(self->fd, (struct sockaddr *)&ss, &len) != 0)
+        return -1;
+    if (ss.ss_family == AF_INET) {
+        struct sockaddr_in *in = (struct sockaddr_in *)&ss;
+
+        return (int)ntohs(in->sin_port);
+    }
+    if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&ss;
+
+        return (int)ntohs(in6->sin6_port);
+    }
+    return -1;
+}
+
+/* 监听：host 为 0/"" 表示任意地址；port 为 0 让内核挑；失败 fd = -1 */
+Tcp tcp_listen(const char *host, int port, int backlog)
+{
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = 0, *ai = 0;
+    char svc[8] = { 0 };
+    Tcp out = tcp_bad();
+    int one = 1;
+
+    if (backlog <= 0)
+        backlog = 8;
+    tcp_service(port, svc, (int)sizeof svc);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    if (getaddrinfo((host && host[0]) ? host : 0, svc, &hints, &res) != 0)
+        return out;
+    for (ai = res; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+
+        if (fd < 0)
+            continue;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, (socklen_t)sizeof one);
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0
+            && listen(fd, backlog) == 0) {
+            out.fd = fd;
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+/* 连接：timeout_ms >= 0 时带超时；失败 fd = -1 */
+Tcp tcp_connect(const char *host, int port, int timeout_ms)
+{
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = 0, *ai = 0;
+    char svc[8] = { 0 };
+    Tcp out = tcp_bad();
+
+    if (!host || !host[0] || port <= 0 || port > 65535)
+        return out;
+    tcp_service(port, svc, (int)sizeof svc);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, svc, &hints, &res) != 0)
+        return out;
+    for (ai = res; ai; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        int rc = 0;
+
+        if (fd < 0)
+            continue;
+        if (timeout_ms < 0) {
+            rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+            if (rc == 0) {
+                out.fd = fd;
+                break;
+            }
+            close(fd);
+            continue;
+        }
+        /* 非阻塞 connect + poll 等可写 */
+        {
+            int flags = fcntl(fd, F_GETFL, 0);
+            struct pollfd pfd = { 0 };
+            int soerr = 0;
+            socklen_t elen = sizeof soerr;
+
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+            if (rc != 0 && errno != EINPROGRESS) {
+                close(fd);
+                continue;
+            }
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            rc = poll(&pfd, 1, timeout_ms);
+            if (rc <= 0) {
+                close(fd);
+                continue;
+            }
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &elen) != 0
+                || soerr != 0) {
+                close(fd);
+                continue;
+            }
+            fcntl(fd, F_SETFL, flags);
+            out.fd = fd;
+            break;
+        }
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+/* 接受一个连接；失败 fd = -1（不会阻塞在无效 fd 上） */
+Tcp accept_client(Tcp *self)
+{
+    Tcp out = tcp_bad();
+    int fd = 0;
+
+    if (!ok(self))
+        return out;
+    do {
+        fd = accept(self->fd, (struct sockaddr *)0, (socklen_t *)0);
+    } while (fd < 0 && errno == EINTR);
+    if (fd >= 0)
+        out.fd = fd;
+    return out;
+}
+
+/* 发一段（可能只发一部分）；返回发送字节数或 -1 */
+int write_bytes(Tcp *self, const void *p, int n)
+{
+    const char *b = (const char *)p;
+    int sent = 0;
+
+    if (!ok(self) || n < 0 || (n > 0 && !p))
+        return -1;
+    while (sent < n) {
+        ssize_t k = send(self->fd, b + sent, (size_t)(n - sent), 0);
+
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return sent > 0 ? sent : -1;
+        }
+        if (k == 0)
+            break;
+        sent += (int)k;
+    }
+    return sent;
+}
+
+/* 发完整 n 字节；成功返回 n，失败 -1 */
+int write_all(Tcp *self, const void *p, int n)
+{
+    if (!ok(self) || n < 0)
+        return -1;
+    if (write_bytes(self, p, n) != n)
+        return -1;
+    return n;
+}
+
+/* 收一段：返回字节数；0 = 对端关闭；-1 = 错误/超时 */
+int read_bytes(Tcp *self, void *p, int cap)
+{
+    char *b = (char *)p;
+
+    if (!ok(self) || cap <= 0 || !p)
+        return -1;
+    for (;;) {
+        ssize_t k = recv(self->fd, b, (size_t)cap, 0);
+
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        return (int)k;
+    }
+}
+
+/* 收满 n 字节；返回实际读到的字节数（< n 表示 EOF/错误/超时） */
+int read_all(Tcp *self, void *p, int n)
+{
+    char *b = (char *)p;
+    int got = 0;
+
+    if (!ok(self) || n < 0)
+        return -1;
+    while (got < n) {
+        int k = read_bytes(self, b + got, n - got);
+
+        if (k <= 0)
+            break;
+        got += k;
+    }
+    return got;
+}
+
+/* 设置收发超时（毫秒）；0 表示取消超时 */
+int set_timeout(Tcp *self, int ms)
+{
+    struct timeval tv = { 0 };
+
+    if (!ok(self) || ms < 0)
+        return 0;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    if (setsockopt(self->fd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                   (socklen_t)sizeof tv) != 0)
+        return 0;
+    if (setsockopt(self->fd, SOL_SOCKET, SO_SNDTIMEO, &tv,
+                   (socklen_t)sizeof tv) != 0)
+        return 0;
+    return 1;
+}
+
+/* 关掉 Nagle（小包低延迟） */
+int set_nodelay(Tcp *self)
+{
+    int one = 1;
+
+    if (!ok(self))
+        return 0;
+    return setsockopt(self->fd, IPPROTO_TCP, TCP_NODELAY, &one,
+                      (socklen_t)sizeof one) == 0;
+}
+
+/* 半关闭（发 FIN），还能继续收 */
+int shutdown_write(Tcp *self)
+{
+    if (!ok(self))
+        return 0;
+    return shutdown(self->fd, SHUT_WR) == 0;
+}
+
+/* 关闭；重复调用安全（名字避开 libc 的 close） */
+void close_socket(Tcp *self)
+{
+    if (!self || self->fd < 0)
+        return;
+    close(self->fd);
+    self->fd = -1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "监听、连接与收发" {
+    Tcp srv = tcp_listen("127.0.0.1", 0, 4);
+    int p = 0;
+    Tcp cli = tcp_bad(), peer = tcp_bad();
+    char buf[32] = { 0 };
+    int n = 0;
+
+    if (!srv.ok())
+        return err(1, "监听失败");
+    p = srv.port();
+    if (p <= 0)
+        return err(2, "取端口");
+    cli = tcp_connect("127.0.0.1", p, 1000);
+    if (!cli.ok())
+        return err(3, "连接失败");
+    peer = srv.accept_client();
+    if (!peer.ok())
+        return err(4, "接受失败");
+    if (cli.write_all("hello", 5) != 5)
+        return err(5, "客户端发送");
+    n = peer.read_all(buf, 5);
+    if (n != 5 || memcmp(buf, "hello", 5) != 0)
+        return err(6, "服务端接收");
+    if (peer.write_all("world", 5) != 5)
+        return err(7, "服务端发送");
+    n = cli.read_all(buf, 5);
+    if (n != 5 || memcmp(buf, "world", 5) != 0)
+        return err(8, "客户端接收");
+    /* 对端关闭 → recv 返回 0 */
+    cli.close_socket();
+    n = peer.read_bytes(buf, (int)sizeof buf);
+    if (n != 0)
+        return err(9, "EOF");
+    peer.close_socket();
+    srv.close_socket();
+    if (srv.ok() || srv.port() != -1)
+        return err(10, "关闭之后");
+}
+
+test "超时与错误路径" {
+    Tcp srv = tcp_listen("127.0.0.1", 0, 4);
+    int p = srv.port();
+    Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+    Tcp peer = srv.accept_client();
+    char buf[8] = { 0 };
+    int n = 0;
+
+    if (!cli.ok() || !peer.ok())
+        return err(11, "建立连接");
+    if (!peer.set_timeout(100))
+        return err(12, "设置超时");
+    n = peer.read_bytes(buf, (int)sizeof buf);
+    if (n != -1)
+        return err(13, "超时应该返回 -1");
+    if (!peer.set_timeout(0))
+        return err(14, "取消超时");
+    /* 无效 fd 的各个入口 */
+    {
+        Tcp bad = tcp_bad();
+
+        if (bad.ok() || bad.port() != -1 || bad.write_bytes("x", 1) != -1
+            || bad.read_bytes(buf, 4) != -1 || bad.accept_client().ok()
+            || bad.set_timeout(10) || bad.set_nodelay()
+            || bad.shutdown_write())
+            return err(15, "无效 fd");
+        bad.close_socket();
+    }
+    /* 连接一个已经关闭的端口 */
+    {
+        Tcp tmp = tcp_listen("127.0.0.1", 0, 1);
+        int tp = tmp.port();
+
+        tmp.close_socket();
+        if (tcp_connect("127.0.0.1", tp, 500).ok())
+            return err(16, "连到关闭的端口应该失败");
+    }
+    /* 非法参数 */
+    if (tcp_connect("", p, 100).ok() || tcp_connect("127.0.0.1", 0, 100).ok()
+        || tcp_connect("127.0.0.1", 70000, 100).ok()
+        || tcp_connect("no-such-host.invalid", 80, 100).ok())
+        return err(17, "非法连接参数");
+    cli.close_socket();
+    peer.close_socket();
+    srv.close_socket();
+}
+
+test "半关闭与 NODELAY" {
+    Tcp srv = tcp_listen("127.0.0.1", 0, 4);
+    Tcp cli = tcp_connect("127.0.0.1", srv.port(), 1000);
+    Tcp peer = srv.accept_client();
+    char buf[8] = { 0 };
+
+    if (!cli.ok() || !peer.ok())
+        return err(18, "连接");
+    if (!cli.set_nodelay())
+        return err(19, "NODELAY");
+    if (!cli.write_all("abc", 3))
+        return err(20, "发送");
+    if (cli.shutdown_write() != 1)
+        return err(21, "半关闭");
+    if (peer.read_all(buf, 3) != 3 || memcmp(buf, "abc", 3) != 0)
+        return err(22, "半关闭后数据仍在");
+    if (peer.read_bytes(buf, (int)sizeof buf) != 0)
+        return err(23, "半关闭后 EOF");
+    cli.close_socket();
+    peer.close_socket();
+    srv.close_socket();
+    /* 监听 0 端口 + 任意地址 */
+    {
+        Tcp any = tcp_listen((const char *)0, 0, 2);
+
+        if (!any.ok() || any.port() <= 0)
+            return err(24, "任意地址监听");
+        any.close_socket();
+    }
+}
