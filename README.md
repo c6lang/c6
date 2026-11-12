@@ -162,7 +162,8 @@ make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后
 （目录是模块名的一部分：`std/container/vec.c6` 就是 `std.container.vec`）：
 
 ```
-std/core/                   基础：定宽类型、错误码、内存、数学、位运算、哈希、随机
+std/core/                   基础：定宽类型、错误码、内存、数学、位运算、哈希、随机、原子操作
+  std/core/atomic.c6        std.core.atomic        原子操作与自旋锁（零分配、不依赖 pthread）：Atomic(i64)/Atomic32(int) 的 load/store/add/sub/fetch_*/exchange/cas/位运算，默认 seq_cst（另有 relaxed/release 发布口）、fence 屏障、TAS 自旋锁 SpinLock（不变量：字段 v 只通过方法访问）
   std/core/bignum.c6        std.core.bignum        任意精度整数（1024 位、零分配）：big_parse/parse_base/from_i64/from_u64、Big 的 add/sub/mul/div/mod/divmod/pow、cmp、to_i64/to_u64、format/format_base（2..36 进制）；超 1024 位报 err
   std/core/bits.c6          std.core.bits          popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/clear、mask/sign_extend/is_pow2
   std/core/complex.c6       std.core.complex       复数 Complex（f64 实部/虚部）：cplx/cplx_real/cplx_i、add/sub/mul/div/neg/conj/inv/scale/normalize、abs2/abs（用 std.core.math 的 sqrt）、pow_int、eq/near/is_finite
@@ -198,8 +199,9 @@ std/text/                   文本：字符串视图与缓冲、格式化、UTF-
   std/text/fuzzy.c6         std.text.fuzzy         模糊匹配：lev_distance/lev_distance_max/lev_ratio、damerau_distance（相邻换位算 1）、subsequence_match/subsequence_score、fuzzy_best（did you mean；按码点、256 上限）
   std/text/wrap.c6          std.text.wrap          按显示列折行/缩进/居中：wrap_make/wrap_indented、Wrap 的 count/write/lines、text_indent/text_center；CJK 2 列、超长词按码点硬切、放不下不写半截
 
-std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树
+std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树、通道
   std/container/deque.c6    std.container.deque    环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
+  std/container/chan.c6     std.container.chan     有界通道（缓冲由调用方给）：chan_init(buf/cap/esize)、send/recv（满/空阻塞）、try_send/try_recv、send_ms/recv_ms（限时 1/0/-1）、close_chan（幂等）、count/capacity/is_empty/is_full/is_closed/sent_count/recv_count；元素按字节块拷贝
   std/container/map.c6      std.container.map      开放寻址哈希表 Map@(K,V) + Entry/Iter：put/get/get_or/set/put_new/remove
   std/container/pqueue.c6   std.container.pqueue   二叉堆 PQueue@T（托管容器）：push/pop/peek/push_pop/heapify/clear、count/capacity/is_empty/is_valid、init/set_cmp/set_max（比较器与 std.container.sort 的 cmp_int/cmp_str 通用）
   std/container/range.c6    std.container.range    能被 foreach 吃掉的区间 Range/StepRange
@@ -215,13 +217,15 @@ std/container/              容器与算法：向量、位集合、跨度、映�
   std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
   std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 
-std/os/                     操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程
+std/os/                     操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程、同步原语、线程池
   std/os/env.c6             std.os.env             环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
   std/os/fs.c6              std.os.fs              stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
   std/os/io.c6              std.os.io              Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代，方法调用写 pr->read_line(...)
   std/os/path.c6            std.os.path            POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
   std/os/args.c6            std.os.args            命令行选项解析（零分配）：args_open + Args.next(specs, n, &arg)、ArgSpec（长名/短名/是否带值）、Arg 的 kind/spec/name/value/index；--name=value、--name value、-n value、-- 终止、未知选项/缺值报错
   std/os/proc.c6            std.os.proc            子进程（POSIX）：proc_run/proc_spawn/proc_wait（ProcStatus 的 exited/exit_code/signaled/signal）、proc_run_sh（/bin/sh -c）、proc_which（PATH 查找）
+  std/os/sync.c6            std.os.sync            阻塞式同步原语（pthread 薄封装、值类型）：Mutex 的 init/destroy/lock/try_lock/unlock、Cond 的 wait/wait_ms/signal/broadcast、RWLock 的 rdlock/wrlock/try_*、Once 的 call(fn)、Semaphore 的 init/wait/try_wait/wait_ms/post/value、Barrier 的 init/wait（返回 1 的是串行线程）
+  std/os/thread.c6          std.os.thread          线程身份与线程池：thread_self/thread_equal、cpu_count、thread_yield、thread_set_name；ThreadPool 的 start(workers, jobs, cap)/submit（满时背压）/try_submit/wait/stop（join，幂等）、pending/running/done/workers/is_started；worker 是裸 pthread，任务 void (*fn)(void *)
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
 std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
@@ -294,6 +298,7 @@ make std-conf    # 编译并运行 examples/stdconf.c6（第十五批配置与�
 make std-cli     # 编译并运行 examples/stdcli.c6（第十六批命令行工具基础模块的拼装示例）
 make std-wire    # 编译并运行 examples/stdwire.c6（第十七批网络协议基础模块的拼装示例）
 make std-algo    # 编译并运行 examples/stdalgo.c6（第十八批算法与容器模块的拼装示例）
+make std-thread  # 编译并运行 examples/stdthread.c6（第十九批并发与同步模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

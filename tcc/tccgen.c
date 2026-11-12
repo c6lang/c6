@@ -12779,6 +12779,10 @@ static const struct C6ErrStdSlot {
     { "std.container.lru",      C6_ERR_SLOT_STD + 82 },
     { "std.container.trie",     C6_ERR_SLOT_STD + 83 },
     { "std.container.region",   C6_ERR_SLOT_STD + 84 },
+    { "std.core.atomic",        C6_ERR_SLOT_STD + 85 },
+    { "std.os.sync",            C6_ERR_SLOT_STD + 86 },
+    { "std.os.thread",          C6_ERR_SLOT_STD + 87 },
+    { "std.container.chan",     C6_ERR_SLOT_STD + 88 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

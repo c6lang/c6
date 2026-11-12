@@ -1,0 +1,474 @@
+/* std/core/atomic：原子操作与自旋锁（零分配、无锁）。
+ *
+ *     import std.core.atomic;
+ *
+ *     Atomic hits = { 0 };
+ *     hits.inc();                        // 跨线程也精确
+ *     hits.add(5);
+ *     i64 n = hits.load();
+ *
+ *     SpinLock gate = { 0 };
+ *     gate.lock();
+ *     defer gate.unlock();               // 临界区
+ *     ...
+ *
+ * 为什么要有它：语言层面的 `spawn` 起的是真 OS 线程，共享的可变状态就需要
+ * 原子读写或者锁。`Atomic`/`Atomic32` 就是「只通过原子操作访问的普通整数」，
+ * 字段 `v` 仍然是 `i64`/`int`（可以按值清零、放进别的结构里），所有操作走
+ * 编译器内建的 `__atomic_*`（GCC 语义）。
+ *
+ * 约定：
+ *
+ * - 字段 `v` 只通过方法读写。直接 `hits.v = 1` 不参与原子序，只在初始化
+ *   （`Atomic a = { 0 };`）时用。
+ * - 内存序：`load`/`store`/`add`/`cas` 这些都是 seq_cst；另有 `load_relaxed`
+ *   与 `store_release` 给「写一次、之后只读」的发布场景。更细的序用
+ *   `fence()`/`fence_acquire()`/`fence_release()` 自己摆。
+ * - `cas(expected, desired)` 相等才换，返回 1/0；`exchange` 返回**旧值**；
+ *   `add`/`sub` 返回**新值**，`fetch_add`/`fetch_sub` 返回旧值。
+ * - `SpinLock` 是 TAS 自旋锁，只适合很短、不会阻塞的临界区；临界区里要
+ *   做 IO / 可能等待，请用 `std.os.sync` 的 `Mutex`（会让出 CPU）。
+ * - 64 位原子在 32 位目标上可能落到 libatomic 的 8 字节辅助函数；这类目标
+ *   用 `Atomic32`。
+ * - 没有动态分配、没有会失败的操作，所以没有 `!error`。
+ */
+module std.core.atomic;
+import std.core.types;
+
+/* ---- 内存序（与 C11 的数值一致，直接传给 __atomic_*） ---- */
+
+#define ATOMIC_RELAXED 0
+#define ATOMIC_ACQUIRE 2
+#define ATOMIC_RELEASE 3
+#define ATOMIC_SEQ_CST 5
+
+/* ---- 64 位原子 ---- */
+
+struct Atomic {
+    i64 v;
+};
+
+/* 读（seq_cst） */
+i64 load(Atomic *self)
+{
+    i64 out = 0;
+
+    if (!self)
+        return 0;
+    __atomic_load(&self->v, &out, ATOMIC_SEQ_CST);
+    return out;
+}
+
+/* 读（relaxed）：只要值、不要同步时用 */
+i64 load_relaxed(Atomic *self)
+{
+    i64 out = 0;
+
+    if (!self)
+        return 0;
+    __atomic_load(&self->v, &out, ATOMIC_RELAXED);
+    return out;
+}
+
+/* 写（seq_cst） */
+void store(Atomic *self, i64 v)
+{
+    if (self)
+        __atomic_store(&self->v, &v, ATOMIC_SEQ_CST);
+}
+
+/* 写（release）：「把前面的写发布出去」时用 */
+void store_release(Atomic *self, i64 v)
+{
+    if (self)
+        __atomic_store(&self->v, &v, ATOMIC_RELEASE);
+}
+
+/* 加 d，返回**新值** */
+i64 add(Atomic *self, i64 d)
+{
+    if (!self)
+        return 0;
+    return __atomic_add_fetch(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+/* 减 d，返回新值 */
+i64 sub(Atomic *self, i64 d)
+{
+    if (!self)
+        return 0;
+    return __atomic_sub_fetch(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+/* 加 d，返回**旧值** */
+i64 fetch_add(Atomic *self, i64 d)
+{
+    if (!self)
+        return 0;
+    return __atomic_fetch_add(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+/* 减 d，返回旧值 */
+i64 fetch_sub(Atomic *self, i64 d)
+{
+    if (!self)
+        return 0;
+    return __atomic_fetch_sub(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+/* 换成本值，返回旧值 */
+i64 exchange(Atomic *self, i64 v)
+{
+    i64 old = 0;
+
+    if (!self)
+        return 0;
+    __atomic_exchange(&self->v, &v, &old, ATOMIC_SEQ_CST);
+    return old;
+}
+
+/* 等于 expected 才换，返回 1/0；不相等时 *expected 里是当前值（不要传 0） */
+int cas(Atomic *self, i64 *expected, i64 desired)
+{
+    if (!self || !expected)
+        return 0;
+    return __atomic_compare_exchange(&self->v, expected, &desired, 0,
+                                     ATOMIC_SEQ_CST, ATOMIC_SEQ_CST);
+}
+
+/* 位运算：返回旧值 */
+i64 and_with(Atomic *self, i64 mask)
+{
+    if (!self)
+        return 0;
+    return __atomic_fetch_and(&self->v, mask, ATOMIC_SEQ_CST);
+}
+
+i64 or_with(Atomic *self, i64 mask)
+{
+    if (!self)
+        return 0;
+    return __atomic_fetch_or(&self->v, mask, ATOMIC_SEQ_CST);
+}
+
+i64 xor_with(Atomic *self, i64 mask)
+{
+    if (!self)
+        return 0;
+    return __atomic_fetch_xor(&self->v, mask, ATOMIC_SEQ_CST);
+}
+
+/* 加一/减一，返回新值 */
+i64 inc(Atomic *self) { return add(self, 1); }
+
+i64 dec(Atomic *self) { return sub(self, 1); }
+
+/* ---- 32 位原子（32 位目标上也一定无锁） ---- */
+
+struct Atomic32 {
+    int v;
+};
+
+int load(Atomic32 *self)
+{
+    int out = 0;
+
+    if (!self)
+        return 0;
+    __atomic_load(&self->v, &out, ATOMIC_SEQ_CST);
+    return out;
+}
+
+int load_relaxed(Atomic32 *self)
+{
+    int out = 0;
+
+    if (!self)
+        return 0;
+    __atomic_load(&self->v, &out, ATOMIC_RELAXED);
+    return out;
+}
+
+void store(Atomic32 *self, int v)
+{
+    if (self)
+        __atomic_store(&self->v, &v, ATOMIC_SEQ_CST);
+}
+
+void store_release(Atomic32 *self, int v)
+{
+    if (self)
+        __atomic_store(&self->v, &v, ATOMIC_RELEASE);
+}
+
+int add(Atomic32 *self, int d)
+{
+    if (!self)
+        return 0;
+    return __atomic_add_fetch(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+int sub(Atomic32 *self, int d)
+{
+    if (!self)
+        return 0;
+    return __atomic_sub_fetch(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+int fetch_add(Atomic32 *self, int d)
+{
+    if (!self)
+        return 0;
+    return __atomic_fetch_add(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+int fetch_sub(Atomic32 *self, int d)
+{
+    if (!self)
+        return 0;
+    return __atomic_fetch_sub(&self->v, d, ATOMIC_SEQ_CST);
+}
+
+int exchange(Atomic32 *self, int v)
+{
+    int old = 0;
+
+    if (!self)
+        return 0;
+    __atomic_exchange(&self->v, &v, &old, ATOMIC_SEQ_CST);
+    return old;
+}
+
+int cas(Atomic32 *self, int *expected, int desired)
+{
+    if (!self || !expected)
+        return 0;
+    return __atomic_compare_exchange(&self->v, expected, &desired, 0,
+                                     ATOMIC_SEQ_CST, ATOMIC_SEQ_CST);
+}
+
+int inc(Atomic32 *self)
+{
+    if (!self)
+        return 0;
+    return __atomic_add_fetch(&self->v, 1, ATOMIC_SEQ_CST);
+}
+
+int dec(Atomic32 *self)
+{
+    if (!self)
+        return 0;
+    return __atomic_sub_fetch(&self->v, 1, ATOMIC_SEQ_CST);
+}
+
+/* ---- 屏障 ---- */
+
+/* 屏障用一个「只写不读」的原子格子做 seq_cst 的读-改-写：x86 上是
+   lock xchg、arm64 上是带 acq/rel 的 swap，都是真正的全屏障。tcc 目前没有
+   __atomic_thread_fence，所以用一个 RMW 等效表达。 */
+static Atomic barrier_cell;
+
+static void full_barrier(void)
+{
+    i64 zero = 0, out = 0;
+
+    __atomic_exchange(&barrier_cell.v, &zero, &out, ATOMIC_SEQ_CST);
+}
+
+/* 全屏障：本线程前面的读写与后面的读写之间不能重排 */
+void fence(void)
+{
+    full_barrier();
+}
+
+/* 只挡「后面的读」：保守实现成全屏障（比要求更强，不会更弱） */
+void fence_acquire(void)
+{
+    full_barrier();
+}
+
+/* 只挡「前面的写」：保守实现成全屏障 */
+void fence_release(void)
+{
+    full_barrier();
+}
+
+/* ---- 自旋锁 ---- */
+
+struct SpinLock {
+    Atomic held;
+};
+
+void spin_init(SpinLock *self)
+{
+    if (self)
+        self->held.store(0);
+}
+
+/* 试一次：锁到了 1，已被别人拿着 0 */
+int try_lock(SpinLock *self)
+{
+    i64 zero = 0, one = 1;
+
+    if (!self)
+        return 0;
+    return self->held.cas(&zero, one);
+}
+
+/* 自旋到锁到为止 */
+void lock(SpinLock *self)
+{
+    if (!self)
+        return;
+    while (!self->try_lock())
+        fence();
+}
+
+void unlock(SpinLock *self)
+{
+    if (self)
+        self->held.store(0);
+}
+
+int is_locked(SpinLock *self) { return self && self->held.load() != 0; }
+
+/* ==== 测试 ==== */
+
+static Atomic t_count;
+static Atomic32 t_small;
+static SpinLock t_spin;
+static i64 t_sum;
+
+static int bump_atomic(void)
+{
+    int i = 0;
+
+    for (i = 0; i < 2000; i++)
+        t_count.inc();
+    return 0;
+}
+
+static int bump_locked(void)
+{
+    int i = 0;
+
+    for (i = 0; i < 1000; i++) {
+        t_spin.lock();
+        t_sum++;
+        t_spin.unlock();
+    }
+    return 0;
+}
+
+test "64 位的读、写与算术" {
+    Atomic a = { 0 };
+    i64 exp = 0;
+
+    if (a.load() != 0 || a.load_relaxed() != 0)
+        return err(1, "初始值");
+    a.store(5);
+    if (a.load() != 5)
+        return err(2, "store");
+    if (a.add(3) != 8 || a.load() != 8)
+        return err(3, "add 返回新值");
+    if (a.sub(2) != 6 || a.load() != 6)
+        return err(4, "sub 返回新值");
+    if (a.fetch_add(4) != 6 || a.load() != 10)
+        return err(5, "fetch_add 返回旧值");
+    if (a.fetch_sub(3) != 10 || a.load() != 7)
+        return err(6, "fetch_sub 返回旧值");
+    if (a.exchange(42) != 7 || a.load() != 42)
+        return err(7, "exchange 返回旧值");
+    if (a.inc() != 43 || a.dec() != 42)
+        return err(8, "inc/dec");
+    /* cas：成功与失败 */
+    exp = 42;
+    if (!a.cas(&exp, 100) || a.load() != 100)
+        return err(9, "cas 相等应当换");
+    exp = 42;
+    if (a.cas(&exp, 7) || a.load() != 100 || exp != 100)
+        return err(10, "cas 不等应当不换并回写当前值");
+    /* 位运算 */
+    a.store(0x0f0f);
+    if (a.and_with(0x00ff) != 0x0f0f || a.load() != 0x000f)
+        return err(11, "and_with");
+    if (a.or_with(0xf000) != 0x000f || a.load() != 0xf00f)
+        return err(12, "or_with");
+    if (a.xor_with(0xffff) != 0xf00f || a.load() != 0x0ff0)
+        return err(13, "xor_with");
+    /* 发布场景 */
+    a.store_release(9);
+    if (a.load_relaxed() != 9)
+        return err(14, "store_release/load_relaxed");
+}
+
+test "32 位的读、写与算术" {
+    Atomic32 a = { 0 };
+    int exp = 0;
+
+    if (a.load() != 0)
+        return err(1, "初始值");
+    a.store(7);
+    if (a.load() != 7)
+        return err(2, "store");
+    if (a.add(3) != 10 || a.fetch_add(5) != 10 || a.load() != 15)
+        return err(3, "add/fetch_add");
+    if (a.sub(5) != 10 || a.fetch_sub(4) != 10 || a.load() != 6)
+        return err(4, "sub/fetch_sub");
+    if (a.exchange(1) != 6 || a.inc() != 2 || a.dec() != 1)
+        return err(5, "exchange/inc/dec");
+    exp = 1;
+    if (!a.cas(&exp, 2) || a.load() != 2)
+        return err(6, "cas 成功");
+    exp = 1;
+    if (a.cas(&exp, 3) || exp != 2)
+        return err(7, "cas 失败回写");
+    a.store_release(4);
+    if (a.load_relaxed() != 4)
+        return err(8, "release/relaxed");
+}
+
+test "自旋锁：互斥与 try_lock" {
+    SpinLock l = { 0 };
+
+    l.lock();
+    if (!l.is_locked())
+        return err(1, "加锁后 is_locked 应为 1");
+    if (l.try_lock())
+        return err(2, "已加锁时 try_lock 应当失败");
+    l.unlock();
+    if (l.is_locked())
+        return err(3, "解锁后 is_locked 应为 0");
+    if (!l.try_lock())
+        return err(4, "解锁后 try_lock 应当成功");
+    l.unlock();
+    spin_init(&l);
+    if (l.is_locked())
+        return err(5, "spin_init 应当清掉锁");
+}
+
+test "线程里原子累加" {
+    t_count.store(0);
+    thread h1 = spawn bump_atomic();
+    thread h2 = spawn bump_atomic();
+    thread h3 = spawn bump_atomic();
+
+    if (h1->join() || h2->join() || h3->join())
+        return err(1, "join");
+    if (t_count.load() != 6000)
+        return err(2, "三个线程各加 2000，总数不对");
+    if (t_count.load_relaxed() != 6000)
+        return err(3, "relaxed 读");
+}
+
+test "线程里自旋锁保护的累加" {
+    t_sum = 0;
+    t_spin.unlock();
+    thread h1 = spawn bump_locked();
+    thread h2 = spawn bump_locked();
+
+    if (h1->join() || h2->join())
+        return err(1, "join");
+    if (t_sum != 2000)
+        return err(2, "临界区里的自增丢了");
+}
