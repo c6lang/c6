@@ -1,0 +1,123 @@
+/* examples/stdmatch.c6 —— 第七十一批（匹配与对齐）的集成示例。
+ *
+ *     make std-match
+ *
+ * 四节：Aho-Corasick 多模式扫描、Rabin-Karp 查找、区间集合、序列比对。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.aho;
+import std.text.rabin;
+import std.container.interval;
+import std.text.align;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_aho(void)
+{
+    static AhoNode pool[128] = { { 0, 0, 0, 0, 0, 0 } };
+    Aho a = { 0 };
+    AhoHit hits[16] = { { 0, 0, 0 } };
+    Str pats[4] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } },
+                    (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } } };
+    int n = 0, i = 0;
+
+    printf("== aho\n");
+    pats[0] = (Str){ S("he") };
+    pats[1] = (Str){ S("she") };
+    pats[2] = (Str){ S("his") };
+    pats[3] = (Str){ S("hers") };
+    check(a.build(pool, 128, pats, 4) > 4, "build 4 个模式");
+    check(a.pattern_count() == 4, "pattern_count");
+    n = a.scan(S("ushers"), hits, 16);
+    printf("   ushers → %d 条命中：", n);
+    for (i = 0; i < n; i++)
+        printf("[%d]@%d ", hits[i].id, hits[i].start);
+    printf("\n");
+    check(n == 3, "ushers 应该命中 3 条");
+    check(count_id(hits, n, 1) == 1 && count_id(hits, n, 0) == 1, "she 与 he 各一条");
+    check(a.scan(S("nothing here"), hits, 16) == 1, "只有 he 一条");
+}
+
+static void do_rabin(void)
+{
+    Rk r = { 0 };
+
+    printf("== rabin\n");
+    check(r.init(S("needle")) == 6, "init needle");
+    printf("   首次出现 %d，出现 %d 次\n",
+           r.find(S("a needle in a haystack with another needle")),
+           r.count(S("a needle in a haystack with another needle")));
+    check(r.find(S("a needle in a haystack")) == 2, "位置 2");
+    check(r.count(S("needle needle needle")) == 3, "计数 3");
+    r.init(S("aa"));
+    check(r.count(S("aaaa")) == 3, "可重叠计数 3");
+    check(r.find(S("zzz")) == -1, "找不到 -1");
+}
+
+static void do_interval(void)
+{
+    static Iv buf[16] = { { 0, 0 } };
+    IntervalSet s = { 0 };
+    i64 lo = 0, hi = 0;
+
+    printf("== interval\n");
+    check(s.init(buf, 16) == 1, "init");
+    s.add(1, 5);
+    s.add(4, 9);
+    s.add(20, 25);
+    printf("   段数 %d，总长度 %lld\n", s.count(), (long long)s.length());
+    check(s.count() == 2, "两段（1-9 与 20-25）");
+    check(s.length() == 9 + 6, "总长度 15");
+    check(s.at(0, &lo, &hi) == 1 && lo == 1 && hi == 9, "第一段");
+    check(s.contains(22) == 1 && s.contains(15) == 0, "点包含");
+    check(s.overlaps(8, 21) == 1 && s.overlaps(10, 19) == 0, "区间相交");
+    s.remove(4, 7);
+    check(s.count() == 3 && s.contains(4) == 0 && s.contains(8) == 1, "挖洞");
+}
+
+static void do_align(void)
+{
+    int dp[128] = { 0 };
+    char ra[32] = { 0 }, rb[32] = { 0 };
+    Aligner al = { 0 };
+    AlignResult r = { 0 };
+
+    printf("== align\n");
+    check(al.setup(dp, 128, ra, rb, 32) == 1, "setup");
+    check(al.run(S("abc"), S("ac"), 1, -1, -1, &r) == 3, "abc/ac 长度 3");
+    printf("   abc vs ac → %s / %s（score %d）\n", ra, rb, r.score);
+    check(r.score == 1 && r.gaps == 1, "分数 1、一个空位");
+    check(al.run(S("GATTACA"), S("GCATGCU"), 1, -1, -1, &r) == 8, "经典例子长度 8");
+    printf("   GATTACA vs GCATGCU → %s / %s（score %d，匹配 %d）\n", ra, rb,
+           r.score, r.matches);
+    check(r.score == 0, "经典例子最优分数 0");
+    check(r.matches + r.mismatches + r.gaps == r.len, "列统计自洽");
+    check(al.run(S("hello"), S("hello"), 1, -1, -1, &r) == 5 && r.matches == 5,
+          "相同序列");
+}
+
+int main(void)
+{
+    do_aho();
+    do_rabin();
+    do_interval();
+    do_align();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

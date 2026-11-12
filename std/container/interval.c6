@@ -1,0 +1,310 @@
+/* std/container/interval：闭区间集合（插入即合并、点含、重叠、总长度）。
+ *
+ *     import std.container.interval;
+ *
+ *     Iv buf[16] = { { 0, 0 } };
+ *     IntervalSet s = { 0 };
+ *     s.init(buf, 16);              // 方法：init / add / contains / overlaps
+ *     s.add(1, 5); s.add(4, 9);     // → [1,9]
+ *     s.length();                   // 9（闭区间 1..9）
+ *
+ * 区间是**闭区间** `[lo, hi]`，内部按 `lo` 升序保存且互不重叠（相邻或重叠的会在
+ * `add` 时合并），所以 `contains` 可以二分查找。
+ *
+ * 约定：
+ *
+ * - `s.init(iv, cap)` 清空集合（`IntervalSet` 只是视图，缓冲区由调用方给）；
+ * - `s.add(lo, hi)` 插入并合并，`lo > hi` 时自动交换；容量不足返回 -1；
+ * - `s.contains(x)` 判断点是否被覆盖；`s.overlaps(lo, hi)` 判断区间是否与集合相交；
+ * - `s.count()` 是合并后的区间段数，`s.length()` 是总覆盖长度（闭区间 +1），
+ *   段数/长度用 `i64`；
+ * - `s.at(i, &lo, &hi)` 取第 i 段（升序）；`s.clear()` 清空；
+ * - `s.remove(lo, hi)` 从集合里挖掉一段（必要时把一段拆成两段），容量不足返回 -1。
+ */
+#include <string.h>
+
+module std.container.interval;
+import std.core.types;
+import std.text.str;
+
+struct Iv {
+    i64 lo;
+    i64 hi;
+};
+
+struct IntervalSet {
+    Iv *iv;
+    int cap;
+    int n;
+};
+
+int init(IntervalSet *s, void *buf, int cap)
+{
+    if (!s || !buf || cap <= 0)
+        return -1;
+    memset(buf, 0, sizeof(Iv) * (size_t)cap);
+    s->iv = (Iv *)buf;
+    s->cap = cap;
+    s->n = 0;
+    return 1;
+}
+
+int count(IntervalSet *s)
+{
+    return s ? s->n : 0;
+}
+
+int capacity(IntervalSet *s)
+{
+    return s ? s->cap : 0;
+}
+
+int at(IntervalSet *s, int i, i64 *lo, i64 *hi)
+{
+    if (!s || !s->iv || i < 0 || i >= s->n)
+        return 0;
+    if (lo)
+        *lo = s->iv[i].lo;
+    if (hi)
+        *hi = s->iv[i].hi;
+    return 1;
+}
+
+/* 插入一段（不合并），返回位置 */
+static int iv_insert_raw(IntervalSet *s, i64 lo, i64 hi, int pos)
+{
+    int i = 0;
+
+    if (s->n >= s->cap)
+        return -1;
+    for (i = s->n; i > pos; i--)
+        s->iv[i] = s->iv[i - 1];
+    s->iv[pos].lo = lo;
+    s->iv[pos].hi = hi;
+    s->n++;
+    return pos;
+}
+
+int add(IntervalSet *s, i64 lo, i64 hi)
+{
+    i64 a = lo, b = hi;
+    int i = 0, j = 0;
+
+    if (!s || !s->iv)
+        return -1;
+    if (a > b) {
+        i64 t = a;
+
+        a = b;
+        b = t;
+    }
+    /* 找第一个与 [a,b] 相交或相邻的段 */
+    i = 0;
+    while (i < s->n && s->iv[i].hi < a - 1)
+        i++;
+    j = i;
+    while (j < s->n && s->iv[j].lo <= b + 1) {
+        if (s->iv[j].lo < a)
+            a = s->iv[j].lo;
+        if (s->iv[j].hi > b)
+            b = s->iv[j].hi;
+        j++;
+    }
+    if (i == j)
+        return iv_insert_raw(s, a, b, i) < 0 ? -1 : 1;
+    /* 用合并结果替换第 i 段，删掉 i+1..j-1 */
+    s->iv[i].lo = a;
+    s->iv[i].hi = b;
+    {
+        int k = 0, removed = j - i - 1;
+
+        for (k = i + 1; k + removed < s->n; k++)
+            s->iv[k] = s->iv[k + removed];
+        s->n -= removed;
+    }
+    return 1;
+}
+
+int contains(IntervalSet *s, i64 x)
+{
+    int lo = 0, hi = 0;
+
+    if (!s || !s->iv)
+        return 0;
+    lo = 0;
+    hi = s->n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+
+        if (x < s->iv[mid].lo)
+            hi = mid - 1;
+        else if (x > s->iv[mid].hi)
+            lo = mid + 1;
+        else
+            return 1;
+    }
+    return 0;
+}
+
+int overlaps(IntervalSet *s, i64 lo, i64 hi)
+{
+    i64 a = lo, b = hi;
+    int i = 0;
+
+    if (!s || !s->iv)
+        return 0;
+    if (a > b) {
+        i64 t = a;
+
+        a = b;
+        b = t;
+    }
+    for (i = 0; i < s->n; i++) {
+        if (s->iv[i].lo > b)
+            break;
+        if (s->iv[i].hi >= a)
+            return 1;
+    }
+    return 0;
+}
+
+i64 length(IntervalSet *s)
+{
+    i64 total = 0;
+    int i = 0;
+
+    if (!s || !s->iv)
+        return 0;
+    for (i = 0; i < s->n; i++)
+        total += s->iv[i].hi - s->iv[i].lo + 1;
+    return total;
+}
+
+int clear(IntervalSet *s)
+{
+    if (!s || !s->iv)
+        return -1;
+    memset(s->iv, 0, sizeof(Iv) * (size_t)s->cap);
+    s->n = 0;
+    return 1;
+}
+
+int remove(IntervalSet *s, i64 lo, i64 hi)
+{
+    i64 a = lo, b = hi;
+    int i = 0;
+
+    if (!s || !s->iv)
+        return -1;
+    if (a > b) {
+        i64 t = a;
+
+        a = b;
+        b = t;
+    }
+    for (i = 0; i < s->n; i++) {
+        Iv cur = s->iv[i];
+
+        if (cur.hi < a || cur.lo > b)
+            continue;
+        if (cur.lo < a && cur.hi > b) {
+            /* 中间挖掉：拆成两段 */
+            if (iv_insert_raw(s, b + 1, cur.hi, i + 1) < 0)
+                return -1;
+            s->iv[i].hi = a - 1;
+            return 1;
+        }
+        if (cur.lo >= a && cur.hi <= b) {
+            /* 整段删除 */
+            int k = 0;
+
+            for (k = i; k + 1 < s->n; k++)
+                s->iv[k] = s->iv[k + 1];
+            s->n--;
+            i--;
+            continue;
+        }
+        if (cur.lo < a) {
+            s->iv[i].hi = a - 1;
+            continue;
+        }
+        s->iv[i].lo = b + 1;
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "interval：合并与包含" {
+    static Iv buf[8] = { { 0, 0 } };
+    IntervalSet s = { 0 };
+    i64 lo = 0, hi = 0;
+
+    if (s.init(buf, 8) != 1)
+        return err(1, "init 失败");
+    if (s.count() != 0 || s.capacity() != 8 || s.length() != 0)
+        return err(2, "初始状态不对");
+    if (s.add(1, 5) != 1 || s.count() != 1)
+        return err(3, "第一段插入失败");
+    if (s.length() != 5)
+        return err(4, "闭区间 1..5 的长度应该是 5");
+    /* 重叠合并 */
+    s.add(4, 9);
+    if (s.count() != 1 || s.at(0, &lo, &hi) != 1 || lo != 1 || hi != 9)
+        return err(5, "重叠区间应该合并成 [1,9]");
+    /* 相邻合并 */
+    s.add(10, 12);
+    if (s.count() != 1 || !s.at(0, &lo, &hi) || hi != 12)
+        return err(6, "相邻区间应该合并");
+    /* 不相邻则独立 */
+    s.add(20, 25);
+    if (s.count() != 2)
+        return err(7, "不相邻应该是两段");
+    if (!s.contains(3) || !s.contains(22) || s.contains(15) || s.contains(30))
+        return err(8, "contains 不对");
+    if (!s.overlaps(11, 11) || s.overlaps(13, 19))
+        return err(9, "overlaps 不对");
+    if (s.length() != 12 + 6)
+        return err(10, "总长度应该是 12+6=18");
+}
+
+test "interval：挖洞、乱序与容量" {
+    static Iv buf[8] = { { 0, 0 } };
+    IntervalSet s = { 0 };
+    i64 lo = 0, hi = 0;
+
+    if (s.init(buf, 8) != 1)
+        return err(11, "init 失败");
+    /* 乱序插入（lo > hi 自动交换） */
+    s.add(9, 5);
+    if (s.count() != 1 || !s.at(0, &lo, &hi) || lo != 5 || hi != 9)
+        return err(12, "lo > hi 应该自动交换");
+    s.add(1, 2);
+    s.add(4, 4);
+    if (s.count() != 2)
+        return err(13, "相邻的 4 应该并进 [5,9]（剩 1-2 与 4-9）");
+    /* 中间挖洞 */
+    if (s.remove(6, 7) != 1)
+        return err(14, "remove 失败");
+    if (s.count() != 3 || s.contains(6) || !s.contains(5) || !s.contains(8))
+        return err(15, "挖洞之后应该变成三段且 6/7 不再包含");
+    /* 整段删除 */
+    s.remove(4, 4);
+    if (s.contains(4) || s.count() != 3)
+        return err(16, "整段删除不对");
+    /* 容量上限 */
+    {
+        static Iv small[2] = { { 0, 0 } };
+        IntervalSet t = { 0 };
+
+        t.init(small, 2);
+        t.add(0, 0);
+        t.add(10, 10);
+        if (t.add(20, 20) != -1)
+            return err(17, "容量不足应该返回 -1");
+    }
+    if (s.clear() != 1 || s.count() != 0 || s.contains(5))
+        return err(18, "clear 之后应该是空集合");
+}

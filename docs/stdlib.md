@@ -325,6 +325,11 @@
 | `std/data/hosts.c6` | `std.data.hosts` | `/etc/hosts`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.lookup`/`doc.rewind`）：`地址 主机名 [别名…]`，`#` 注释与空行跳过，只有地址的行忽略；`lookup` 在所有别名里大小写不敏感查找 |
 | `std/data/resolvconf.c6` | `std.data.resolvconf` | `/etc/resolv.conf`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.nameservers`/`doc.search_list`/`doc.first_nameserver`/`doc.rewind`）：按首个词分类 `nameserver`/`search`/`domain`/`options`/其它，`#` 与 `;` 都是注释 |
 | `std/data/knownhosts.c6` | `std.data.knownhosts` | SSH `known_hosts`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.match`/`doc.hashed_count`/`doc.rewind`）：主机列表（逗号分隔）/密钥类型/base64/注释，`@cert-authority`/`@revoked` 标记拆到 `marker`，`|1|…` 哈希条目置 `hashed` 并在 `match` 时跳过 |
+| `std/text/aho.c6` | `std.text.aho` | Aho-Corasick 多模式匹配（**方法**：`a.build`/`a.scan`/`a.node_count`/`a.pattern_count`）：节点数组由调用方给（孩子+兄弟链+失败指针），一次扫描报出所有模式的**所有**出现（`hit.id`/`hit.start`/`hit.len`），兄弟链线性查找、`count_id` 按模式统计 |
+| `std/text/rabin.c6` | `std.text.rabin` | Rabin-Karp（**方法**：`r.init`/`r.find`/`r.count`/`r.hash_of`/`r.pattern_len`）：64 位溢出当模、基数 257，滑动窗口 O(n+m)，哈希相等后再逐字节确认，`count` 数可重叠出现 |
+| `std/container/interval.c6` | `std.container.interval` | 闭区间集合（**方法**：`s.init`/`s.add`/`s.contains`/`s.overlaps`/`s.count`/`s.length`/`s.at`/`s.remove`/`s.clear`）：插入即合并（重叠与相邻都并），`contains` 二分，`remove` 能挖洞拆段，段数/长度用 `i64` |
+| `std/text/align.c6` | `std.text.align` | Needleman-Wunsch 全局比对（**方法**：`al.setup`/`al.run`）：DP 表由调用方给，回溯出两条带 `-` 的等长序列，`AlignResult` 给总分与匹配/替换/空位列数；平分优先「对角→上→左」 |
+
 
 
 
@@ -452,6 +457,7 @@
 | `examples/stdmarkup.c6` | （无模块） | 第六十八批（轻量标记语言）的拼装示例（`make std-markup`）：reST 结构、Org 的 TODO/标签/链接、LaTeX 章节与转义、POD 段落与 strip |
 | `examples/stdtextan.c6` | （无模块） | 第六十九批（文本分析）的拼装示例（`make std-textan`）：切词统计、切句、字符三元组频次、Flesch 可读性与年级 |
 | `examples/stdcfg.c6` | （无模块） | 第七十批（系统配置文件）的拼装示例（`make std-cfg2`）：`.env` 取值、`hosts` 别名查找、`resolv.conf` 统计、`known_hosts` 匹配 |
+| `examples/stdmatch.c6` | （无模块） | 第七十一批（匹配与对齐）的拼装示例（`make std-match`）：多模式扫描、滚动哈希查找、区间集合合并/挖洞、GATTACA 序列比对 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -626,6 +632,10 @@ std/data/dotenv.c6         24 test(s), 0 failure(s)
 std/data/hosts.c6          24 test(s), 0 failure(s)
 std/data/resolvconf.c6     24 test(s), 0 failure(s)
 std/data/knownhosts.c6     24 test(s), 0 failure(s)
+std/text/aho.c6            24 test(s), 0 failure(s)
+std/text/rabin.c6          24 test(s), 0 failure(s)
+std/container/interval.c6  24 test(s), 0 failure(s)
+std/text/align.c6          24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4132,6 +4142,16 @@ make std-cfg2
 `first_nameserver` 取第一个地址；`KnownDoc` 用 `doc.match` 命中 IP 与大小写不同的域名，
 说明哈希条目会被跳过。
 
+### 集成示例：`examples/stdmatch.c6`
+
+```sh
+make std-match
+```
+
+四节都用方法：`Aho` 用四个 DNA 模式扫描 `ushers` 并打印 `[id]@位置`；`Rk` 找 `needle`
+的位置与次数、验证可重叠计数；`IntervalSet` 插入三段后合并成两段、打印总长度、点包含
+与挖洞；`Aligner` 对 `GATTACA`/`GCATGCU` 给出分数 0 的对齐（`G-ATTACA`/`GCA-TGCU`）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4267,6 +4287,8 @@ make std-cfg2
 * `make std-textan`：`examples/stdtextan.c6`，第六十九批（文本分析）模块的拼装示例
   （自带自检）。
 * `make std-cfg2`：`examples/stdcfg.c6`，第七十批（系统配置文件）模块的拼装示例
+  （自带自检）。
+* `make std-match`：`examples/stdmatch.c6`，第七十一批（匹配与对齐）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

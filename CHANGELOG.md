@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十一批（匹配与对齐）**：`std.text.aho`（Aho-Corasick 多模式匹配）、
+  `std.text.rabin`（Rabin-Karp 滚动哈希）、`std.container.interval`（闭区间集合）、
+  `std.text.align`（Needleman-Wunsch 全局比对），集成示例 `examples/stdmatch.c6`
+  （`make std-match`）。错误号段 `std.text.aho`=0x6125 … `std.text.align`=0x6128
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十批（系统配置文件）**：`std.data.dotenv`（`.env` 解析）、
   `std.data.hosts`（`/etc/hosts`）、`std.data.resolvconf`（`/etc/resolv.conf`）、
   `std.data.knownhosts`（SSH `known_hosts`），集成示例 `examples/stdcfg.c6`

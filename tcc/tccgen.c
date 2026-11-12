@@ -12998,6 +12998,10 @@ static const struct C6ErrStdSlot {
     { "std.data.hosts",         C6_ERR_SLOT_STD + 290 },
     { "std.data.resolvconf",    C6_ERR_SLOT_STD + 291 },
     { "std.data.knownhosts",    C6_ERR_SLOT_STD + 292 },
+    { "std.text.aho",           C6_ERR_SLOT_STD + 293 },
+    { "std.text.rabin",         C6_ERR_SLOT_STD + 294 },
+    { "std.container.interval", C6_ERR_SLOT_STD + 295 },
+    { "std.text.align",         C6_ERR_SLOT_STD + 296 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match
 
 all: build
 
@@ -333,6 +333,10 @@ stdtest: build
 	    std/data/hosts.c6) deps="std/text/str.c6" ;; \
 	    std/data/resolvconf.c6) deps="std/text/str.c6" ;; \
 	    std/data/knownhosts.c6) deps="std/text/str.c6" ;; \
+	    std/text/aho.c6) deps="std/text/str.c6" ;; \
+	    std/text/rabin.c6) deps="std/text/str.c6" ;; \
+	    std/container/interval.c6) deps="std/text/str.c6" ;; \
+	    std/text/align.c6) deps="std/text/str.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -1156,6 +1160,17 @@ std-cfg2: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdcfg $(STD_CFG2_SRCS)
 	./build/stdcfg
 
+# 标准库第七十一批（匹配与对齐）：aho / rabin / interval / align。
+# 示例把多模式扫描、滚动哈希查找、区间集合与序列比对各走一遍。
+STD_MATCH_SRCS := examples/stdmatch.c6 std/core/types.c6 std/text/str.c6 \
+                  std/text/aho.c6 std/text/rabin.c6 \
+                  std/container/interval.c6 std/text/align.c6
+
+std-match: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdmatch $(STD_MATCH_SRCS)
+	./build/stdmatch
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -1260,7 +1275,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -1269,13 +1284,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的七十个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的七十一个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
 # test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img
 # 是三十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -1490,6 +1505,7 @@ distclean:
 #   std-markup       编译并运行 examples/stdmarkup.c6（第六十八批，轻量标记语言）
 #   std-textan       编译并运行 examples/stdtextan.c6（第六十九批，文本分析）
 #   std-cfg2         编译并运行 examples/stdcfg.c6（第七十批，系统配置文件）
+#   std-match        编译并运行 examples/stdmatch.c6（第七十一批，匹配与对齐）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

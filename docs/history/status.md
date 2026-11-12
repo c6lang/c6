@@ -2329,6 +2329,31 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（293 个模块、0 failure）、`make std-cfg2`（20 条自检全过）、
 `make check-all`。
 
+### 11.83 标准库第七十一批（aho / rabin / interval / align）
+
+第七十一批做「匹配与对齐」：Aho-Corasick 多模式自动机、Rabin-Karp 滚动哈希、
+区间集合与 Needleman-Wunsch 全局比对。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.aho` | 多模式匹配 | 节点存「第一个孩子 + 兄弟链 + 失败指针 + 模式 id/长度」，内存 O(模式总长)；失败指针用队列按层算（孩子下标一定大于父，顺序扫即可）；`scan` 沿失败链收集同一结束位置的多个命中，所以 `aaaa` 里 `aa`×3 + `aaa`×2 都能报出来 |
+| `std.text.rabin` | 滚动哈希 | 64 位无符号溢出即 mod 2^64，省掉取模；`pow` 在 `init` 时预算；命中后仍逐字节 `memcmp` 确认，避免哈希碰撞误报 |
+| `std.container.interval` | 区间集合 | 闭区间（长度 +1）；`add` 把**相邻**（`hi+1 == lo`）也合并；`remove` 在中间挖洞时先插新段再改旧段尾，容量不足返回 -1 |
+| `std.text.align` | 全局比对 | DP 表与输出缓冲都由调用方给；回溯写进临时数组再翻转（避免反向复制）；平分时按「对角→上→左」保证结果稳定；`AlignResult` 的列统计满足 `matches+mismatches+gaps == len` |
+
+这一批的坑：`Aho` 的节点长度一开始想靠失败链推，写乱了两版（还留下无效代码），最后
+干脆在节点里加 `len` 字段，命中时 `start = i - len + 1` 一步到位。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.aho`=0x6125、
+`std.text.rabin`=0x6126、`std.container.interval`=0x6127、`std.text.align`=0x6128；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-match` 与 `STD_MATCH_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdmatch.c6` 四节（24 条自检）。
+
+验收：`make stdtest`（297 个模块、0 failure）、`make std-match`（24 条自检全过）、
+`make check-all`。
+
+
 
 
 

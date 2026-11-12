@@ -1,0 +1,176 @@
+/* std/text/rabin：Rabin-Karp 滚动哈希子串查找。
+ *
+ *     import std.text.rabin;
+ *
+ *     Rk r = { 0 };
+ *     r.init(S("needle"));            // 方法：init / find / count / hash_of
+ *     r.find(S("a needle in a haystack"));   // 2
+ *
+ * 用 64 位无符号溢出当模运算（等价于 mod 2^64），基数 257。每次滑动只做
+ * 「减首字符、乘基数、加尾字符」，O(n+m)；哈希相等后再逐字节比较，避免误报。
+ *
+ * 约定：
+ *
+ * - `r.init(pattern)` 记下模式与它的哈希，空模式返回 -1，成功返回模式长度；
+ * - `r.find(text)` 返回第一次出现的下标，找不到 -1；
+ * - `r.count(text)` 数**可重叠**出现次数（`aa` 在 `aaa` 里 2 次）；
+ * - `r.hash_of(text)` 给一段文本的哈希（调试/对照用）；
+ * - `r.pattern_len()` 给模式长度；
+ * - 按字节匹配，UTF-8 上安全。
+ */
+#include <string.h>
+
+module std.text.rabin;
+import std.core.types;
+import std.text.str;
+
+struct Rk {
+    Str pat;
+    u64 ph;
+    u64 pow;
+    int m;
+};
+
+static u64 rk_hash(char[:] s)
+{
+    u64 h = 0;
+    int i = 0;
+
+    for (i = 0; i < s.len; i++)
+        h = h * 257u + (u64)(unsigned char)s.data[i];
+    return h;
+}
+
+int init(Rk *r, char[:] pattern)
+{
+    int i = 0;
+
+    if (!r || !pattern.data || pattern.len <= 0)
+        return -1;
+    memset(r, 0, sizeof *r);
+    r->pat = (Str){ (char[:]){ pattern.data, pattern.len } };
+    r->m = pattern.len;
+    r->ph = rk_hash(pattern);
+    r->pow = 1;
+    for (i = 0; i < r->m - 1; i++)
+        r->pow = r->pow * 257u;
+    return r->m;
+}
+
+int pattern_len(Rk *r)
+{
+    return r ? r->m : 0;
+}
+
+u64 hash_of(Rk *r, char[:] text)
+{
+    (void)r;
+    return rk_hash(text);
+}
+
+/* 滑动窗口的下一步：h 是当前窗口 [i, i+m) 的哈希 */
+static u64 rk_next(Rk *r, u64 h, int out_ch, int in_ch)
+{
+    return (h - (u64)(unsigned char)out_ch * r->pow) * 257u
+           + (u64)(unsigned char)in_ch;
+}
+
+static int rk_match_at(Rk *r, char[:] text, int i)
+{
+    if (i + r->m > text.len)
+        return 0;
+    return memcmp(text.data + i, r->pat.s.data, (size_t)r->m) == 0;
+}
+
+int find(Rk *r, char[:] text)
+{
+    u64 h = 0;
+    int i = 0;
+
+    if (!r || !r->pat.s.data || !text.data)
+        return -1;
+    if (r->m > text.len)
+        return -1;
+    h = rk_hash((char[:]){ text.data, r->m });
+    for (i = 0;; i++) {
+        if (h == r->ph && rk_match_at(r, text, i))
+            return i;
+        if (i + r->m >= text.len)
+            break;
+        h = rk_next(r, h, text.data[i], text.data[i + r->m]);
+    }
+    return -1;
+}
+
+int count(Rk *r, char[:] text)
+{
+    u64 h = 0;
+    int i = 0, n = 0;
+
+    if (!r || !r->pat.s.data || !text.data)
+        return -1;
+    if (r->m > text.len)
+        return 0;
+    h = rk_hash((char[:]){ text.data, r->m });
+    for (i = 0;; i++) {
+        if (h == r->ph && rk_match_at(r, text, i))
+            n++;
+        if (i + r->m >= text.len)
+            break;
+        h = rk_next(r, h, text.data[i], text.data[i + r->m]);
+    }
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "rabin：查找与计数" {
+    Rk r = { 0 };
+
+    if (r.init(S("needle")) != 6)
+        return err(1, "init 失败");
+    if (r.pattern_len() != 6)
+        return err(2, "pattern_len 不对");
+    if (r.find(S("a needle in a haystack")) != 2)
+        return err(3, "第一次出现在 2");
+    if (r.find(S("needlex")) != 0)
+        return err(4, "开头出现应该 0");
+    if (r.find(S("haystack")) != -1)
+        return err(5, "找不到应该 -1");
+    if (r.find(S("need")) != -1)
+        return err(6, "文本比模式短应该 -1");
+    if (r.count(S("needle needle")) != 2)
+        return err(7, "两个 needle 应该计 2");
+    if (r.count(S("")) != 0)
+        return err(8, "空文本应该 0");
+    if (r.hash_of(S("needle")) != r.hash_of(S("needle")))
+        return err(9, "同一段的哈希应该相同");
+}
+
+test "rabin：重叠与边界" {
+    Rk r = { 0 };
+
+    if (r.init(S("aa")) != 2)
+        return err(10, "init 失败");
+    if (r.count(S("aaaa")) != 3)
+        return err(11, "aa 在 aaaa 里可重叠应该是 3 次");
+    if (r.find(S("aaaa")) != 0)
+        return err(12, "第一次出现在 0");
+    if (r.count(S("abab")) != 0)
+        return err(13, "aa 在 abab 里应该 0 次");
+    if (r.init(S("ab")) != 2)
+        return err(14, "重新 init 失败");
+    if (r.count(S("abab")) != 2)
+        return err(15, "ab 在 abab 里可重叠 2 次");
+    if (r.init(S("")) != -1)
+        return err(16, "空模式应该 -1");
+    if (init((Rk *)0, S("x")) != -1)
+        return err(17, "空结构体指针应该 -1");
+    /* 单字节模式 */
+    if (r.init(S("z")) != 1)
+        return err(18, "单字节模式 init 失败");
+    if (r.count(S("zazzz")) != 4)
+        return err(19, "单字节模式计数不对");
+}
