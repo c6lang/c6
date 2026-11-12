@@ -47,7 +47,7 @@ HOSTCC   ?= gcc
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
-        stdtest errcheck std-demo std-tour std-kit
+        stdtest errcheck std-demo std-tour std-kit std-box
 
 all: build
 
@@ -124,6 +124,10 @@ stdtest: build
 	    std/strbuf.c6) deps="std/fmt.c6" ;; \
 	    std/path.c6) deps="std/str.c6" ;; \
 	    std/set.c6)  deps="std/map.c6" ;; \
+	    std/json.c6) deps="std/mem.c6 std/str.c6 std/num.c6 std/err.c6" ;; \
+	    std/csv.c6)  deps="std/str.c6" ;; \
+	    std/env.c6)  deps="std/str.c6 std/err.c6" ;; \
+	    std/sha256.c6) deps="std/bits.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -167,6 +171,18 @@ std-kit: build
 	@mkdir -p build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdkit $(STDKIT_SRCS)
 	./build/stdkit
+
+# 标准库第四批：json / sha256 / csv / env。
+# json 的 DOM 住在 std.mem 的 Arena 上，字符串视图来自 std.str，数字格式化
+# 用 std.num；csv 也借 std.str 的 Str；env 依赖 std.str 与 std.err。
+STDBOX_SRCS := examples/stdbox.c6 std/types.c6 std/err.c6 std/str.c6 \
+               std/mem.c6 std/num.c6 std/json.c6 std/bits.c6 \
+               std/sha256.c6 std/csv.c6 std/env.c6
+
+std-box: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdbox $(STDBOX_SRCS)
+	./build/stdbox
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
@@ -272,7 +288,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -426,6 +442,8 @@ distclean:
 #   stdtest          std/ 下每个模块的 test 块
 #   std-demo         编译并运行 examples/wordcount.c6
 #   std-tour         编译并运行 examples/stdtour.c6
+#   std-kit          编译并运行 examples/stdkit.c6（第三批）
+#   std-box          编译并运行 examples/stdbox.c6（第四批）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

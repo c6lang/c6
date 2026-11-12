@@ -31,6 +31,11 @@
   `std.set` 六个模块，集成示例 `examples/stdkit.c6`（`make std-kit`）；顺手修掉
   `std/map` 扩容复活墓碑的 bug（`std/set` 的对应用例钉住）。错误号段
   `std.ascii`=0x6013 … `std.set`=0x6018。
+- **标准库第四批**：`std.json` / `std.sha256` / `std.csv` / `std.env` 四个模块，
+  集成示例 `examples/stdbox.c6`（`make std-box`）。JSON 是 arena 上的 DOM（数字保留
+  原文、严格 RFC 8259、代理对解码）；SHA-256/HMAC 的 FIPS 180-4 与 RFC 4231 向量
+  钉死在用例里；CSV 是零分配读取器 + 写调用方缓冲；env 管环境变量与 `argc/argv`。
+  错误号段 `std.json`=0x6019 … `std.env`=0x601c。
 
 ## 2026-11-11
 

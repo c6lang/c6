@@ -50,9 +50,14 @@
 | `std/rand.c6` | `std.rand` | xorshift64* 伪随机：`rand_seed`/`rand_u64`/`rand_u32`/`rand_below`（拒绝采样）/`rand_int`/`rand_int_incl`/`rand_f64`/`rand_bool`/`rand_fill`/`rand_shuffle`/`rand_shuffle_int` |
 | `std/fs.c6` | `std.fs` | POSIX 文件系统元数据与目录：`StatInfo`、`fs_stat`/`fs_lstat`/`fs_exists`/`fs_is_dir`/`fs_is_file`/`fs_size`、`fs_mkdir`/`fs_mkdir_p`/`fs_remove`/`fs_rmdir`/`fs_rename`、`fs_getcwd`/`fs_chdir`、零分配 `Dir` 遍历 |
 | `std/set.c6` | `std.set` | 哈希集合 `Set@K`（`std.map` 的薄包装）与 `SetIter@K`：`add`（1 新增 / 0 已存在）/`remove`/`has`/`count`/`capacity`/`reserve`/`clear`/`iter` |
+| `std/json.c6` | `std.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`json_parse`/`json_parse_at`、`json_get`/`json_at`/`json_count`/`json_key`、`json_get_str`/`json_get_num`/`json_get_bool`、`json_write`/`json_write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
+| `std/sha256.c6` | `std.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `sha256_init`/`sha256_update`/`sha256_final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
+| `std/csv.c6` | `std.csv` | RFC 4180 CSV（零分配）：`CsvReader` 的 `csv_reader`/`csv_next`/`csv_rewind`（引号字段可跨行、CRLF、`""` 转义）、`csv_need_quote`/`csv_write_field`/`csv_write_row`（写调用方缓冲）、`csv_count_fields`/`csv_count_rows` |
+| `std/env.c6` | `std.env` | 环境变量与命令行（POSIX）：`env_get`/`env_has`/`env_set`/`env_unset`、`env_home`/`env_tmpdir`/`env_path`/`env_user`、`env_get_int`/`env_get_u64`/`env_get_bool`、`env_args`/`env_argc`/`env_arg`/`env_prog` |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
 | `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带自检 |
 | `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`make std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带自检 |
+| `examples/stdbox.c6` | （无模块） | 第四批模块的拼装示例（`make std-box`）：json/sha256/csv/env 各一节，自带自检 |
 
 每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -63,12 +68,15 @@ std/sort.c6      30 test(s), 0 failure(s)
 std/ascii.c6      5 test(s), 0 failure(s)
 std/bits.c6       6 test(s), 0 failure(s)
 std/codec.c6      7 test(s), 0 failure(s)
+std/csv.c6       41 test(s), 0 failure(s)
 std/deque.c6      9 test(s), 0 failure(s)
+std/env.c6       39 test(s), 0 failure(s)
 std/err.c6        3 test(s), 0 failure(s)
 std/fmt.c6       10 test(s), 0 failure(s)
 std/fs.c6         7 test(s), 0 failure(s)
 std/hash.c6       7 test(s), 0 failure(s)
 std/io.c6         5 test(s), 0 failure(s)
+std/json.c6      60 test(s), 0 failure(s)
 std/map.c6        9 test(s), 0 failure(s)
 std/math.c6       6 test(s), 0 failure(s)
 std/mem.c6        7 test(s), 0 failure(s)
@@ -77,6 +85,7 @@ std/path.c6      30 test(s), 0 failure(s)
 std/rand.c6       9 test(s), 0 failure(s)
 std/range.c6      6 test(s), 0 failure(s)
 std/set.c6       17 test(s), 0 failure(s)
+std/sha256.c6    23 test(s), 0 failure(s)
 std/span.c6       6 test(s), 0 failure(s)
 std/strbuf.c6    18 test(s), 0 failure(s)
 std/time.c6       7 test(s), 0 failure(s)
@@ -95,9 +104,15 @@ std/vec.c6       42 test(s), 0 failure(s)
 | `std/path.c6` 30 | str 22 + path 8（path 只借 `Str` 这个类型，函数体不依赖 str 的代码） |
 | `std/strbuf.c6` 18 | fmt 10 + strbuf 8 |
 | `std/set.c6` 17 | map 9 + set 8 |
+| `std/json.c6` 60 | json 17 + str 22 + num 11 + mem 7 + err 3 |
+| `std/csv.c6` 41 | csv 19 + str 22（csv 只借 `Str` 类型，函数体不依赖 str 的代码） |
+| `std/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
+| `std/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
 
 `std/bits`、`std/hash`、`std/utf8`、`std/deque`、`std/ascii`、`std/num`、
-`std/codec`、`std/rand`、`std/fs` 自成一体，单独跑就是自己的块数。
+`std/codec`、`std/rand`、`std/fs` 自成一体，单独跑就是自己的块数；
+`std/csv` 只有声明依赖 `std.str`（正文不调用），`std/sha256` 的正文必须带
+`std/bits`，`std/env` 的正文必须带 `std/str`。
 
 ## 设计原则
 
@@ -537,6 +552,146 @@ foreach (int k = s->iter()) { ... }
 正文一起编**。`add` 会分配、返回 `int!error`（失败不改集合）；`remove`/`has`
 不失败；`iter()` 借用集合，改集合之前先迭代完。
 
+### `json`：arena 上的 DOM
+
+```c
+import std.json;
+import std.mem;
+import std.str;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+char pool[4096] = { 0 };                     /* DOM 住在这块内存里，不 malloc */
+Arena a = arena_make(pool, (int)sizeof pool);
+Str text = { S("{\"n\": 3, \"ok\": true}") };  /* char[:] 不会隐式转成 Str */
+Json root = json_parse(&a, text) catch e { return e.id; };
+Json *p = &root;
+
+Json *n = p->json_get("n");                  /* 找不到 / 不是对象给 0 */
+int ok = p->json_get_bool("ok", 0);
+f64 v = p->json_get_num("n", 0.0);
+char out[64] = { 0 };
+p->json_write(out, sizeof out);               /* {"n":3,"ok":true} */
+```
+
+`Json` 是纯值结构体，解析出来的整棵树都由传进去的 `Arena` 分配：`reset` 一次
+全部释放，不碰 `malloc`、不引入托管引用（所以 `std.json` 在 freestanding 目标
+也能用，只要 `std.mem` 的 alloc 还在）。字符串值解码进 arena，键和值都是指向
+arena 的 `Str` 视图；`json_parse` 失败时消息是静态描述，要定位就换
+`json_parse_at`（多一个 `int *err_pos`，写字节偏移）。
+
+语义钉死的几处：
+
+* **严格 RFC 8259**：数字只认 `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`
+  （`+1`、`.5`、`01`、`1.`、`nan` 都拒绝）；字符串里未转义的控制字符报
+  `PARSE`；`\uXXXX` 解码成 UTF-8，代理对合并、落单代理报 `PARSE`；顶层任意
+  值；允许开头一个 UTF-8 BOM；尾随垃圾报 `PARSE`。
+* **数字不丢精度**：`JNUM` 同时保留 `raw`（输入原文）与 `num`（f64）。写出时
+  优先 `raw`，所以 `9007199254740993` 原样往返；没有 `raw` 的（用户自己构造的
+  节点）用 `std.num` 的 `fmt_f64_g` 现算（有效位数按十进制指数收敛到 11–17 位，
+  `inf`/`nan` 写成 `null`，因为 JSON 没有这两个字面量）。
+* **递归上限 64 层**，超过给 `RANGE`；空输入/只有空白给 `INVAL`；arena 满给
+  `NOMEM`。
+* `json_get` 对重复键返回**最后**一个；`json_count`/`json_at`/`json_key` 只在
+  对应容器上有效。
+* 写函数都是「先算长度再写」：容量不够返回 -1 且一个字节都不写；
+  `json_write_pretty(..., indent)` 每层缩进 `indent` 个空格（`<= 0` 当 2）。
+
+### `sha256`
+
+```c
+import std.sha256;
+
+u8 dig[32] = { 0 };
+char hex[65] = { 0 };
+Sha256 st = { { 0 }, 0, { 0 }, 0 };
+
+sha256("abc", 3, dig);                       /* 一次性 */
+sha256_hex("abc", 3, hex);                   /* "ba7816bf…15ad"，小写 + NUL */
+
+sha256_init(&st);                            /* 流式：任意切分结果相同 */
+sha256_update(&st, "a", 1);
+sha256_update(&st, "bc", 2);
+sha256_final(&st, dig);
+
+hmac_sha256(key, klen, msg, mlen, dig);      /* RFC 2104 */
+sha256_eq(dig, other32);                     /* 常数时间比较，1/0 */
+```
+
+FIPS 180-4 的纯实现：只用 `memcpy`/`memset`，不分配、不链 libm、不碰宿主加密
+库。`sha256_update` 支持 1 字节一喂和任意块边界（63/64/65 都测过），
+`sha256_final` 之后想复用就再 `init`。HMAC 的 key 超过 64 字节先哈希，ipad/opad
+在栈上算。已知向量（空串、`"abc"`、两块的 NIST 串、一百万 `a`，以及 RFC 4231
+的 HMAC 用例 1/2/6）全部钉在 `std/sha256.c6` 的 `test` 块里。
+
+### `csv`
+
+```c
+import std.csv;
+import std.str;
+
+Str text = { S("name,qty\nbolt,12\n\"M6, hex\",3\n") };
+CsvReader r = csv_reader(text);               /* 纯值：按值声明、按值传 */
+CsvReader *p = &r;
+Str f = { { (char *)0, 0 } };
+
+while (csv_next(p, &f) > 0) {                 /* 1 有字段、0 结束、-1 格式错 */
+    /* f 是输入里的视图；p->row / p->col / p->at_eol 告诉你位置 */
+    if (p->at_eol)
+        putchar('\n');
+}
+if (p->error)
+    printf("csv: %d\n", p->error);             /* 本模块的码，不是 std.err 的 */
+
+char line[64] = { 0 };
+Str row[2] = { { S("M6, hex") }, { S("3") } };
+csv_write_row(row, 2, line, sizeof line, 1);  /* "M6, hex",3 + CRLF */
+```
+
+零分配读取器 + 写调用方缓冲，规则是 RFC 4180 加一点宽容：`"` 开头的字段可以
+跨行（`\n` 合法），内部的 `""` 表示一个引号；引号字段结束后只允许 `,`、行尾或
+EOF，否则 `PARSE`；行分隔符 `\n`/`\r\n`/`\r` 都认；空输入立刻结束；空行是
+**一条记录、一个空字段**（RFC 的语义），末尾换行不再多造一条记录；未加引号的
+字段里出现 `"` 按普通字节处理。
+
+视图给的是「引号内的原始字节」：`"a""b"` 给 4 字节 `a""b`，因为把 `""` 折成
+一个 `"` 要改长度、只能复制。要真值就展开到自己的缓冲（`csv_unquote`，长度先问
+`csv_unquoted_len`）；不含 `""` 的字段——绝大多数——视图就是真值。
+`csv_count_fields`/`csv_count_rows` 用同一套规则数数，格式错返回 -1。写侧只有
+「含 `,`/`"`/CR/LF」才加引号，容量不够返回 -1 且不写半截。
+
+`p->error` 里存的是**本模块**的码（`std.csv.PARSE` / `std.csv.INVAL`），不是
+`std.err` 的码，所以别直接丢给 `std.err.msg()`。
+
+### `env`：环境变量与命令行
+
+```c
+import std.env;
+
+int main(int argc, char **argv)
+{
+    env_args(argc, argv);                     /* 入口喂一次，之后都能用 */
+    printf("%d 个参数，程序名 %.*s\n", env_argc(),
+           env_prog().s.len, env_prog().s.data);
+
+    Str home = env_home();                    /* HOME，缺省 "" */
+    Str tmp = env_tmpdir();                   /* TMPDIR，缺省 "/tmp" */
+    int port = env_get_int("PORT", 8080);     /* 不存在/语法错给默认值 */
+    int debug = env_get_bool("DEBUG", 0);     /* 1/true/yes/on */
+
+    env_set("MODE", "dev") catch e { return e.id; };
+    env_unset("MODE") catch e { return e.id; };
+    ...
+}
+```
+
+`import` 只带来声明，模块拿不到真实 `argc/argv`，所以入口要调一次
+`env_args`；`env_arg(i)` 越界给空串。`env_get`/`env_home` 这些返回的是
+`environ` 里的**视图**（不复制、不分配），下一次 `env_set`/`env_unset` 之后
+就失效，要留住就自己拷走。这一层依赖 POSIX 的 `setenv`/`environ`，
+freestanding 目标用不了。数值解析是严格的十进制（可选正负号、忽略前后空白、
+溢出给默认值），布尔认 `1/true/yes/on` 与 `0/false/no/off`（大小写不敏感）。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -610,6 +765,25 @@ fs 的 mkdir_p → 写文件 → stat → 目录遍历 → rename → 清理、s
 迭代器。示例里 `set` 依赖 `std/map.c6` 的正文，所以 `STDKIT_SRCS` 把它列在
 `std/set.c6` 前面。
 
+### 集成示例：`examples/stdbox.c6`
+
+```sh
+make std-box
+```
+
+```
+stdbox: 标准库第四批一日游
+stdbox: 59 check(s), 0 failure(s)
+```
+
+第四批的四个模块各一节：env 的 set/get/unset、数值与布尔解析、`argc/argv`；
+csv 的引号字段、跨行字段、CRLF、列求和、写引号字段与整行；json 的嵌套取值、
+数组下标、`2^53+1` 的原文保真、紧凑/缩进写出、转义往返、语法错报 `PARSE`；
+sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMAC、对 JSON 文本
+求摘要。`STDBOX_SRCS` 里 `std/json.c6` 要带上 `std/mem.c6`、`std/str.c6`、
+`std/num.c6` 的正文，`std/sha256.c6` 要带上 `std/bits.c6`（`rotr32` 是跨 TU
+调用）。
+
 ## 写法约定（照着写就不会踩坑）
 
 * **普通结构体的方法就是「第一个参数是结构体指针」的文件作用域函数**：
@@ -667,5 +841,6 @@ fs 的 mkdir_p → 写文件 → stat → 目录遍历 → rename → 清理、s
 * `make std-demo`：`examples/wordcount.c6` 那个集成示例。
 * `make std-tour`：`examples/stdtour.c6`，新模块的拼装示例（自带自检）。
 * `make std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（自带自检）。
+* `make std-box`：`examples/stdbox.c6`，第四批模块的拼装示例（自带自检）。
 * `std/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，
   验证墓碑不会被搬进新表（写 `std/set` 时踩到的真实 bug）。

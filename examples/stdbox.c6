@@ -1,0 +1,310 @@
+/* stdbox：标准库第四批（json / sha256 / csv / env）的拼装示例。
+ *
+ * 和 stdtour / stdkit 一样：这个文件没有 `module`（入口 `main` 只能在不属于
+ * 任何模块的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ * 它既是演示，也是这四个模块的集成用例。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdbox \
+ *         examples/stdbox.c6 std/types.c6 std/err.c6 std/str.c6 \
+ *         std/mem.c6 std/num.c6 std/json.c6 std/sha256.c6 \
+ *         std/csv.c6 std/env.c6
+ *
+ * 用到的东西：
+ *   std.env     环境变量（set/get/unset、数值/布尔解析）与 argc/argv
+ *   std.csv     RFC 4180：零分配读取器 + 写调用方缓冲
+ *   std.json    arena 上的 DOM：解析、取值、紧凑/缩进写出、转义
+ *   std.sha256  SHA-256 与 HMAC-SHA256（已知向量 + 分片一致性）
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.types;
+import std.err;
+import std.str;
+import std.mem;
+import std.num;
+import std.json;
+import std.sha256;
+import std.csv;
+import std.env;
+
+/* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define STR(lit) ((Str){ S(lit) })
+
+static int checks = 0;
+static int fails = 0;
+
+/* 四节共用的 JSON 文本：最后一个数是 2^53 + 1，用来钉住「数字保留原文」 */
+static char *json_text =
+    "{\"name\":\"c6\",\"version\":4,\"stable\":true,"
+    "\"tags\":[\"json\",\"sha256\",\"csv\"],"
+    "\"limits\":{\"depth\":64,\"max\":9007199254740993}}";
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* ---- 把 T!error 折成普通 int 的小包装（catch 体必须以 return 结尾） ---- */
+
+static int env_put(char *name, char *value)
+{
+    env_set(name, value) catch e { return -1; };
+    return 0;
+}
+
+static int env_drop(char *name)
+{
+    env_unset(name) catch e { return -1; };
+    return 0;
+}
+
+static int str_to_int(Str s, int *out)
+{
+    *out = 0;
+    (&s)->to_int(out) catch e { return -1; };
+    return 0;
+}
+
+/* ---- 1. env ---- */
+
+static void box_env(int argc, char **argv)
+{
+    Str v = { { (char *)0, 0 } };
+    Str prog = { { (char *)0, 0 } };
+    u64 big = 0ull;
+
+    env_args(argc, argv);
+    check(env_argc() == argc, "env: argc");
+    prog = env_prog();
+    check(prog.s.len > 0 && prog.s.len == (int)strlen(argv[0]),
+          "env: prog 就是 argv[0]");
+    check(env_arg(argc + 7).s.len == 0, "env: 越界参数给空串");
+
+    check(env_put((char *)"STDBOX_MODE", (char *)"dev") == 0, "env: set");
+    check(env_has((char *)"STDBOX_MODE") == 1, "env: has");
+    v = env_get((char *)"STDBOX_MODE");
+    check((&v)->eq(S("dev")), "env: get 读回 dev");
+
+    check(env_put((char *)"STDBOX_PORT", (char *)"8080") == 0, "env: set PORT");
+    check(env_get_int((char *)"STDBOX_PORT", -1) == 8080, "env: int 解析");
+    check(env_get_int((char *)"STDBOX_NOPE", 42) == 42, "env: 缺失给默认值");
+    check(env_put((char *)"STDBOX_PORT", (char *)"80x") == 0, "env: set 坏数字");
+    check(env_get_int((char *)"STDBOX_PORT", -1) == -1, "env: 坏数字给默认值");
+
+    check(env_put((char *)"STDBOX_FLAG", (char *)"YES") == 0, "env: set FLAG");
+    check(env_get_bool((char *)"STDBOX_FLAG", 0) == 1, "env: bool YES");
+    check(env_put((char *)"STDBOX_FLAG", (char *)"maybe") == 0,
+          "env: set 坏 bool");
+    check(env_get_bool((char *)"STDBOX_FLAG", 1) == 1,
+          "env: 坏 bool 给默认值");
+
+    check(env_put((char *)"STDBOX_BIG", (char *)"4294967296") == 0,
+          "env: set BIG");
+    check(env_get_u64((char *)"STDBOX_BIG", 0ull, &big) == 1
+              && big == 4294967296ull, "env: u64 解析");
+    check(env_get_u64((char *)"STDBOX_NOPE", 0ull, &big) == 0
+              && big == 4294967296ull, "env: u64 缺失不写 out");
+
+    check(env_drop((char *)"STDBOX_MODE") == 0, "env: unset");
+    check(!env_has((char *)"STDBOX_MODE"), "env: unset 之后没有");
+    check(env_tmpdir().s.len > 0, "env: tmpdir 非空");
+}
+
+/* ---- 2. csv ---- */
+
+static void box_csv(void)
+{
+    Str text = { S("name,qty,note\nbolt,12,\"M6, hex\"\nnut,7,\"line1\nline2\"\n") };
+    Str bad_text = { S("a,\"unterminated") };
+    CsvReader r = csv_reader(text);
+    CsvReader *p = &r;
+    Str f = { { (char *)0, 0 } };
+    Str cells[2] = { { S("bolt") }, { S("12") } };
+    char buf[64] = { 0 };
+    char row[64] = { 0 };
+    int fields = 0, rows = 0, sum = 0, multiline = 0, qty = 0;
+
+    while (csv_next(p, &f) > 0) {
+        fields++;
+        if (p->col == 1 && p->row > 0 && str_to_int(f, &qty) == 0)
+            sum += qty;
+        if (p->row == 2 && p->col == 2)
+            multiline = f.s.len;
+        if (p->at_eol)
+            rows++;
+    }
+    check(fields == 9, "csv: 字段数");
+    check(rows == 3, "csv: 记录数");
+    check(sum == 19, "csv: qty 列求和");
+    check(multiline == 11, "csv: 引号字段跨行是 11 字节");
+    check(csv_count_fields(text) == 9, "csv: count_fields");
+    check(csv_count_rows(text) == 3, "csv: count_rows");
+    check(csv_need_quote(STR("M6, hex")) == 1 && csv_need_quote(STR("plain")) == 0,
+          "csv: need_quote");
+
+    check(csv_write_field(STR("M6, hex"), buf, sizeof buf) == 9
+              && strcmp(buf, "\"M6, hex\"") == 0, "csv: 写引号字段");
+    check(csv_write_row(cells, 2, row, sizeof row, 1) == 9
+              && strcmp(row, "bolt,12\r\n") == 0, "csv: 写整行 CRLF");
+    check(csv_write_field(STR("M6, hex"), buf, 4) == -1,
+          "csv: 容量不足给 -1");
+
+    r = csv_reader(bad_text);
+    while (csv_next(&r, &f) > 0)
+        ;
+    check(r.error == std.csv.PARSE, "csv: 未闭合引号报 PARSE");
+
+    {
+        /* 引号字段的视图是「引号内的原始字节」："" 要自己展开 */
+        Str qtext = { S("x,\"a\"\"b\"\n") };
+        CsvReader qr = csv_reader(qtext);
+        Str qf = { { (char *)0, 0 } };
+
+        csv_next(&qr, &qf);
+        csv_next(&qr, &qf);
+        check(qf.s.len == 4, "csv: 引号字段视图是原始 4 字节");
+        check(csv_unquote(qf, buf, sizeof buf) == 3
+                  && strcmp(buf, "a\"b") == 0, "csv: unquote 折叠双引号");
+    }
+}
+
+/* ---- 3. json ---- */
+
+static void box_json(void)
+{
+    char pool[8192] = { 0 };
+    char out[512] = { 0 };
+    char esc[64] = { 0 };
+    char back[64] = { 0 };
+    Str orig = { S("a\"b\n中") };
+    Str back_s = { { (char *)0, 0 } };
+    Arena a = arena_make(pool, (int)sizeof pool);
+    Json doc = { 0 };
+    Json *p = 0;
+    Json *name = 0;
+    Json *tags = 0;
+    Json *tag = 0;
+    Json *lim = 0;
+    Json *max = 0;
+    int err_id = 0;
+    int n = 0;
+    int elen = 0;
+    int blen = 0;
+
+    doc = json_parse(&a, str(json_text)) catch e {
+        check(0, "json: 解析失败");
+        return;
+    };
+    p = &doc;
+    check(p->kind == std.json.JOBJ, "json: 顶层是对象");
+    check(p->json_count() == 5, "json: 顶层键数");
+
+    name = p->json_get((char *)"name");
+    check(name != 0 && (&name->s)->eq(S("c6")), "json: 取字符串");
+    check(p->json_get_num((char *)"version", 0.0) == 4.0, "json: 取数字");
+    check(p->json_get_bool((char *)"stable", 0) == 1, "json: 取布尔");
+    check(p->json_get((char *)"missing") == 0, "json: 缺键给 0");
+
+    tags = p->json_get((char *)"tags");
+    check(tags != 0 && tags->json_count() == 3, "json: 数组长度");
+    tag = tags->json_at(1);
+    check(tag != 0 && (&tag->s)->eq(S("sha256")), "json: 数组下标");
+    check(tags->json_at(9) == 0, "json: 下标越界给 0");
+    check(tags->json_key(0).s.len == 0, "json: 数组没有键");
+
+    lim = p->json_get((char *)"limits");
+    max = lim ? lim->json_get((char *)"max") : 0;
+    check(max != 0 && (&max->raw)->eq(S("9007199254740993")),
+          "json: 大整数保留原文");
+    check(max != 0 && max->num == 9007199254740992.0, "json: 数值按 f64 存");
+
+    n = p->json_write(out, sizeof out);
+    check(n > 0 && (int)strlen(out) == n, "json: 紧凑写出长度");
+    check(strstr(out, "9007199254740993") != 0, "json: 写出保留原文");
+    memset(out, 0, sizeof out);
+    n = p->json_write_pretty(out, sizeof out, 2);
+    check(n > 0 && strchr(out, '\n') != 0, "json: 缩进写出有换行");
+
+    elen = json_escape(orig, esc, sizeof esc);
+    check(elen == 9, "json: 转义长度");
+    blen = json_unescape((Str){ { esc, elen } }, back, sizeof back);
+    back_s = (Str){ { back, blen } };
+    check(blen == orig.s.len
+              && (&back_s)->eq(orig.s), "json: 转义往返");
+
+    json_parse(&a, STR("{\"a\":}")) catch e {
+        err_id = e.id;
+        goto parsed;
+    };
+    err_id = 0;
+parsed:
+    check(err_id == std.json.PARSE, "json: 语法错报 PARSE");
+}
+
+/* ---- 4. sha256 ---- */
+
+static void box_sha256(void)
+{
+    u8 dig[32] = { 0 };
+    u8 dig2[32] = { 0 };
+    u8 mac[32] = { 0 };
+    char hex[65] = { 0 };
+    char mac_hex[65] = { 0 };
+    char json_hex[65] = { 0 };
+    Sha256 st = { { 0 }, 0, { 0 }, 0 };
+    int i = 0, ok = 1;
+
+    sha256_hex((void *)"", 0, hex);
+    check(strcmp(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4"
+                      "649b934ca495991b7852b855") == 0, "sha256: 空串");
+    sha256_hex((void *)"abc", 3, hex);
+    check(strcmp(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9c"
+                      "b410ff61f20015ad") == 0, "sha256: abc");
+    check((int)strlen(hex) == 64, "sha256: hex 是 64 个字符");
+
+    sha256_init(&st);
+    for (i = 0; i < 3; i++)
+        sha256_update(&st, (char *)"abc" + i, 1);
+    sha256_final(&st, dig);
+    sha256((void *)"abc", 3, dig2);
+    check(sha256_eq(dig, dig2), "sha256: 分片与一次性一致");
+
+    hmac_sha256((void *)"Jefe", 4, (void *)"what do ya want for nothing?", 28,
+                mac);
+    hmac_sha256_hex((void *)"Jefe", 4, (void *)"what do ya want for nothing?",
+                    28, mac_hex);
+    check(strcmp(mac_hex, "5bdcc146bf60754e6a042426089575c75a003f089d27398"
+                          "39dec58b964ec3843") == 0,
+          "sha256: HMAC RFC 4231 #2");
+
+    dig2[0] ^= 1;
+    check(!sha256_eq(dig, dig2), "sha256: 不同的摘要不相等");
+
+    sha256_hex(json_text, strlen(json_text), json_hex);
+    for (i = 0; i < 64; i++) {
+        char c = json_hex[i];
+
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            ok = 0;
+    }
+    check(ok && json_hex[64] == 0, "sha256: 对 JSON 文本求摘要");
+}
+
+int main(int argc, char **argv)
+{
+    printf("stdbox: 标准库第四批一日游\n");
+    box_env(argc, argv);
+    box_csv();
+    box_json();
+    box_sha256();
+    printf("stdbox: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

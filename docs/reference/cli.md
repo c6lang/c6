@@ -85,6 +85,8 @@
 | `make stdtest` | `std/` 下每个模块的 `test` 块 |
 | `make std-demo` | 编译并运行 `examples/wordcount.c6`（标准库集成示例） |
 | `make std-tour` | 编译并运行 `examples/stdtour.c6`（新模块自带自检） |
+| `make std-kit` | 编译并运行 `examples/stdkit.c6`（第三批模块的拼装示例） |
+| `make std-box` | 编译并运行 `examples/stdbox.c6`（第四批模块的拼装示例） |
 
 ### freestanding、裸机与交叉目标
 

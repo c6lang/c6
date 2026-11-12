@@ -139,6 +139,10 @@ std/codec.c6   std.codec  Base64、十六进制、百分号编解码（写调用
 std/rand.c6    std.rand   xorshift64*：可重放序列、无偏区间 rand_below、rand_f64、shuffle
 std/fs.c6      std.fs     stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
 std/set.c6     std.set    哈希集合 Set@K + SetIter（std.map 的薄包装，add 返回新增/已存在）
+std/json.c6    std.json   JSON 解析与写出：arena 上的 DOM、json_get/json_at、json_write/pretty/escape（数字保留原文）
+std/sha256.c6  std.sha256 SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
+std/csv.c6     std.csv    RFC 4180 CSV：零分配 CsvReader（引号/跨行/CRLF）+ csv_write_row
+std/env.c6     std.env    环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
 ```
 
 ```c
@@ -164,6 +168,7 @@ make stdtest     # 跑 std/ 下全部 test 块（模块数与块数以实际输�
 make std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
 make std-tour    # 编译并运行 examples/stdtour.c6（第二批模块的拼装示例）
 make std-kit     # 编译并运行 examples/stdkit.c6（第三批模块的拼装示例）
+make std-box     # 编译并运行 examples/stdbox.c6（第四批模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
