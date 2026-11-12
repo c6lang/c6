@@ -281,6 +281,11 @@
 | `std/os/fstab.c6` | `std.os.fstab` | `/etc/fstab`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.find`/`doc.rewind`）：4~6 字段、`#` 注释，省略的 dump/passno 默认 0，支持 `UUID=`/`LABEL=` 形式的设备 |
 | `std/os/osrelease.c6` | `std.os.osrelease` | `/etc/os-release`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.find`/`doc.rewind`）：`KEY=VALUE`、`#` 注释、单双引号自动剥离、键值两端去空白 |
 | `std/os/systemd.c6` | `std.os.systemd` | systemd unit 文件（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.sections`/`doc.get`/`doc.rewind`）：`[Section]` 分段 + `Key=Value`，注释 `#`/`;`，值按第一个 `=` 切分（值里可含 `=`），段名键名大小写敏感 |
+| `std/core/binio.c6` | `std.core.binio` | 整数读写游标（**方法**：`r.bind`/`r.u8`/`r.u16le`/`r.u24le`/`r.u32le`/`r.u64le`/`r.u16be`/`r.u32be`/`r.u64be`/`r.bytes`/`r.skip`/`r.seek`/`r.remaining`/`r.ok` 与 `w.bind`/`w.put_u8`/`w.put_u16le`/…/`w.put_bytes`/`w.size`/`w.capacity`/`w.ok`）：越界时置 `ok=0` 而不抛错，字节序显式指定 |
+| `std/core/bitio.c6` | `std.core.bitio` | 按位读写游标（**方法**：`br.bind`/`br.read`/`br.read1`/`br.align`/`br.remaining`/`br.position`/`br.ok` 与 `bw.bind`/`bw.write`/`bw.write1`/`bw.align`/`bw.size`/`bw.bits_written`/`bw.ok`）：高位在前（MSB-first），`align` 补零/丢弃到字节边界 |
+| `std/core/half.c6` | `std.core.half` | 半精度浮点（**方法**：`h.set`/`h.get`/`h.is_nan`/`h.is_inf`）：`double_to_half`/`half_to_double`（含次正规数、±0、±inf、NaN），`double_to_bfloat16`/`bfloat16_to_double`（按 fp32 高 16 位截断） |
+| `std/core/align.c6` | `std.core.align` | 对齐工具：`align_up`/`align_down`/`padding_for`（非 2 的幂原样返回）、`is_pow2`/`is_aligned`、`round_up`（任意倍数）、`next_pow2`（溢出返回 0）、`log2_floor` |
+
 
 
 
@@ -386,6 +391,7 @@
 | `examples/stdpkg.c6` | （无模块） | 第五十七批（目标文件与包）的拼装示例（`make std-pkg`）：ar 成员与按名查找、COFF 节、Java class 常量池与方法、RPM 头取值 |
 | `examples/stdcheck.c6` | （无模块） | 第五十八批（校验与纠错）的拼装示例（`make std-check`）：Luhn/ISBN/Verhoeff 校验位、CRC-8/16 流式与方法、汉明纠 1 位错、经典密码往返 |
 | `examples/stdlinux.c6` | （无模块） | 第五十九批（Linux 配置文本）的拼装示例（`make std-linux`）：/proc/mounts 反转义、fstab 查找、os-release 取值、unit 文件分段取值 |
+| `examples/stdbin2.c6` | （无模块） | 第六十批（二进制与数值工具）的拼装示例（`make std-bin2`）：LE/BE 读写、按位打包、fp16/bf16 转换、对齐工具；链接带 `-lm` |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -516,6 +522,10 @@ std/os/mounts.c6           24 test(s), 0 failure(s)
 std/os/fstab.c6            24 test(s), 0 failure(s)
 std/os/osrelease.c6        24 test(s), 0 failure(s)
 std/os/systemd.c6          24 test(s), 0 failure(s)
+std/core/binio.c6          24 test(s), 0 failure(s)
+std/core/bitio.c6          24 test(s), 0 failure(s)
+std/core/half.c6           24 test(s), 0 failure(s)
+std/core/align.c6          24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3902,6 +3912,17 @@ make std-linux
 `/tmp` 并验证省略的 dump/passno；os-release 用 `doc.find("PRETTY_NAME")` 取发行版名；
 unit 文件用 `doc.next` 打印 `[段] 键=值`、再用 `doc.get("Service","ExecStart")` 定位。
 
+### 集成示例：`examples/stdbin2.c6`
+
+```sh
+make std-bin2
+```
+
+四节：binio 用 `w.put_u16le`/`w.put_u32be` 写一段再 `r.u16le()`/`r.u64be()` 读回，
+并核对字节序；bitio 按 3+4+1 位打包成 `0xAE` 再逐段读回；half 验 `1.0/‑2.0/65504`
+的位型、`NaN`/`inf` 识别与 bf16 往返精度；align 演示 up/down/padding/next_pow2。
+链接带 `-lm`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4016,6 +4037,8 @@ unit 文件用 `doc.next` 打印 `[段] 键=值`、再用 `doc.get("Service","Ex
   （自带自检）。
 * `make std-linux`：`examples/stdlinux.c6`，第五十九批（Linux 配置文本）模块的拼装
   示例（自带自检）。
+* `make std-bin2`：`examples/stdbin2.c6`，第六十批（二进制与数值工具）模块的拼装
+  示例（自带自检，链接带 `-lm`）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第六十批（二进制与数值工具）**：`std.core.binio`（LE/BE 整数读写游标）、
+  `std.core.bitio`（按位读写，MSB-first）、`std.core.half`（fp16 与 bfloat16 转换）、
+  `std.core.align`（对齐/2 的幂/按倍数取整），集成示例 `examples/stdbin2.c6`
+  （`make std-bin2`，链接带 `-lm`）。错误号段 `std.core.binio`=0x60f9 …
+  `std.core.align`=0x60fc（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十九批（Linux 配置文本）**：`std.os.mounts`（/proc/mounts + 八进制
   反转义）、`std.os.fstab`（4~6 字段与默认值）、`std.os.osrelease`（键值与引号剥离）、
   `std.os.systemd`（unit 文件分段与取值），集成示例 `examples/stdlinux.c6`

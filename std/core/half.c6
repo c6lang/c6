@@ -1,0 +1,223 @@
+/* std/core/half：半精度浮点（fp16）与 bfloat16 的转换。
+ *
+ *     import std.core.half;
+ *
+ *     Half h = { 0 };
+ *     h.set(1.5);              // 方法：Half.set / Half.get / Half.is_nan
+ *     // h.bits == 0x3E00
+ *     h.get();                 // 1.5
+ *     double_to_bfloat16(3.14); // 0x4049（高 16 位截断）
+ *
+ * fp16（IEEE 754 binary16）：1 位符号 + 5 位指数（偏置 15）+ 10 位尾数，最大约
+ * 65504，最小正规数约 6.1e-5。bfloat16 是「保留 fp32 的指数、截掉尾数低 16 位」，
+ * 所以它和 fp32 的范围一致、精度只有 8 位。
+ *
+ * 约定：
+ *
+ * - `double_to_half` 对超出 fp16 范围的值返回 `±inf`，对太小的值返回 0 或次正规数；
+ * - `NaN` 一律映射成 `0x7E00`（静默 NaN），`±inf` 映射成 `0x7C00`/`0xFC00`；
+ * - `half_to_double` 正确处理次正规数（`2^-24` 步长）与 `±0`；
+ * - bfloat16 的转换是**截断**（不是四舍五入），这与多数硬件一致；
+ * - `Half` 结构只是把 16 位码包起来以便用方法，`bits` 可直接读写。
+ */
+#include <math.h>
+
+module std.core.half;
+import std.core.types;
+import std.text.str;
+
+struct Half {
+    u16 bits;
+};
+
+double half_to_double(u16 h)
+{
+    int sign = (h >> 15) & 1;
+    int exp = (h >> 10) & 0x1F;
+    int mant = h & 0x3FF;
+    double v = 0;
+
+    if (exp == 0) {
+        v = (double)mant * (1.0 / 16777216.0);      /* 2^-24 的步长 */
+    } else if (exp == 31) {
+        v = mant ? 0.0 / 0.0 : 0.0;                 /* NaN / inf */
+        if (mant)
+            return v;
+        return sign ? -(1.0 / 0.0) : (1.0 / 0.0);
+    } else {
+        v = (1.0 + (double)mant / 1024.0) * pow(2.0, (double)(exp - 15));
+    }
+    return sign ? -v : v;
+}
+
+u16 double_to_half(double d)
+{
+    int sign = 0;
+    double a = 0;
+    int e = 0;
+
+    if (d != d)                         /* NaN */
+        return (u16)0x7E00u;
+    if (d == 0.0) {
+        /* ±0：用 1/d 的符号区分（-0.0 < 0 是假） */
+        return (1.0 / d < 0) ? (u16)0x8000u : (u16)0u;
+    }
+    if (d < 0) {
+        sign = 1;
+        a = -d;
+    } else {
+        a = d;
+    }
+    if (a > 65504.0) {                  /* 超出范围 → inf */
+        return (u16)(sign ? 0xFC00u : 0x7C00u);
+    }
+    if (a >= 6.103515625e-05) {         /* 正规数 */
+        e = (int)floor(log2(a));
+        {
+            double m = a / pow(2.0, (double)e) - 1.0;
+            int mant = (int)(m * 1024.0 + 0.5);
+
+            if (mant >= 1024) {
+                mant = 0;
+                e++;
+            }
+            if (e > 15) {
+                return (u16)(sign ? 0xFC00u : 0x7C00u);
+            }
+            return (u16)((sign << 15) | ((e + 15) << 10) | (mant & 0x3FF));
+        }
+    }
+    /* 次正规数（或太小 → 0） */
+    {
+        int mant = (int)(a / 5.9604644775390625e-08 + 0.5);   /* 2^-24 */
+
+        if (mant <= 0)
+            return (u16)(sign ? 0x8000u : 0u);
+        if (mant >= 1024)
+            return (u16)((sign << 15) | (1 << 10));
+        return (u16)((sign << 15) | (mant & 0x3FF));
+    }
+}
+
+u16 double_to_bfloat16(double d)
+{
+    union {
+        float f;
+        u32 u;
+    } u = { 0 };
+
+    /* bfloat16 是 fp32 的高 16 位（截断低 16 位） */
+    u.f = (float)d;
+    return (u16)((u.u >> 16) & 0xFFFFu);
+}
+
+double bfloat16_to_double(u16 bf)
+{
+    union {
+        float f;
+        u32 u;
+    } u = { 0 };
+
+    u.u = ((u32)bf) << 16;
+    return (double)u.f;
+}
+
+/* ---- Half 方法 ---- */
+
+int set(Half *h, double v)
+{
+    if (!h)
+        return -1;
+    h->bits = double_to_half(v);
+    return 1;
+}
+
+double get(Half *h)
+{
+    return h ? half_to_double(h->bits) : 0;
+}
+
+int is_nan(Half *h)
+{
+    if (!h)
+        return 0;
+    return ((h->bits >> 10) & 0x1F) == 0x1F && (h->bits & 0x3FF) != 0;
+}
+
+int is_inf(Half *h)
+{
+    if (!h)
+        return 0;
+    return ((h->bits >> 10) & 0x1F) == 0x1F && (h->bits & 0x3FF) == 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int hnear(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+test "half：fp16 已知位型" {
+    Half h = { 0 };
+
+    if (double_to_half(0.0) != 0x0000)
+        return err(1, "+0 应该是 0x0000");
+    if (double_to_half(-0.0) != 0x8000)
+        return err(2, "-0 应该是 0x8000");
+    if (double_to_half(1.0) != 0x3C00)
+        return err(3, "1.0 应该是 0x3C00");
+    if (double_to_half(1.5) != 0x3E00)
+        return err(4, "1.5 应该是 0x3E00");
+    if (double_to_half(-2.0) != 0xC000)
+        return err(5, "-2.0 应该是 0xC000");
+    if (double_to_half(65504.0) != 0x7BFF)
+        return err(6, "65504 应该是 0x7BFF");
+    if (double_to_half(1e9) != 0x7C00)
+        return err(7, "超出范围应该是 +inf");
+    if (double_to_half(-1e9) != 0xFC00)
+        return err(8, "负的超出范围应该是 -inf");
+    if (double_to_half(1.0 / 0.0) != 0x7C00)
+        return err(9, "+inf 应该是 0x7C00");
+    h.set(0.0 / 0.0);
+    if (h.is_nan() != 1)
+        return err(10, "NaN 应该被识别");
+    if (hnear(h.get(), 0.0, 0.0) == 1 && h.get() == h.get())
+        return err(11, "NaN 自己不等于自己");
+}
+
+test "half：往返与 bfloat16" {
+    Half h = { 0 };
+    int i = 0;
+    static const double vals[6] = { 0.0, 1.0, -1.5, 0.5, 100.0, 65504.0 };
+
+    for (i = 0; i < 6; i++) {
+        h.set(vals[i]);
+        if (!hnear(h.get(), vals[i], 1e-3))
+            return err(12, "fp16 往返偏差太大");
+    }
+    /* 小值：2^-24 = 5.96e-8 */
+    if (double_to_half(5.9604644775390625e-08) != 0x0001)
+        return err(13, "最小次正规数应该是 0x0001");
+    if (!hnear(half_to_double(0x0001), 5.9604644775390625e-08, 1e-12))
+        return err(14, "0x0001 解出来不对");
+    if (!hnear(half_to_double(0x7BFF), 65504.0, 1.0))
+        return err(15, "0x7BFF 应该是 65504");
+    /* bfloat16：保留 fp32 的指数与高 7 位尾数 */
+    if (double_to_bfloat16(1.0) != 0x3F80)
+        return err(16, "1.0 的 bfloat16 应该是 0x3F80");
+    if (double_to_bfloat16(-2.0) != 0xC000)
+        return err(17, "-2.0 的 bfloat16 应该是 0xC000");
+    if (double_to_bfloat16(3.14159265358979) != 0x4049)
+        return err(18, "π 的 bfloat16 应该是 0x4049");
+    if (!hnear(bfloat16_to_double(0x3F80), 1.0, 1e-9))
+        return err(19, "0x3F80 解出来应该是 1.0");
+    if (!hnear(bfloat16_to_double(0x4049), 3.140625, 1e-6))
+        return err(20, "0x4049 解出来应该是 3.140625");
+}

@@ -1,0 +1,132 @@
+/* examples/stdbin2.c6 —— 第六十批（二进制与数值工具）的集成示例。
+ *
+ *     make std-bin2
+ *
+ * 四节：LE/BE 整数读写（binio）、按位读写（bitio）、半精度浮点（half）、
+ * 对齐工具（align）。前三个都用**方法**（`w.put_u16le(v)`、`bw.write(v,n)`、`h.set(x)`）。
+ * 链接需要 `-lm`（half 用了 pow/log2）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.binio;
+import std.core.bitio;
+import std.core.half;
+import std.core.align;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static int near(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+static void do_binio(void)
+{
+    static unsigned char buf[32] = { 0 };
+    Reader r = { 0 };
+    Writer w = { 0 };
+
+    printf("== binio\n");
+    check(w.bind(buf, (int)sizeof buf) == 1, "Writer bind");
+    w.put_u16le(0x1234);
+    w.put_u32le(0xDEADBEEFu);
+    w.put_u16be(0xABCD);
+    w.put_u64be(0x0102030405060708uLL);
+    check(w.ok() == 1 && w.size() == 16, "写入 16 字节且 ok");
+    check(buf[0] == 0x34 && buf[1] == 0x12, "小端顺序");
+    check(buf[6] == 0xAB && buf[7] == 0xCD, "大端顺序");
+    r.bind(buf, w.size());
+    printf("   u16le=0x%04X u32le=0x%08X u16be=0x%04X\n", r.u16le(),
+           r.u32le(), r.u16be());
+    check(r.u64be() == 0x0102030405060708uLL, "u64be 往返");
+    check(r.remaining() == 0 && r.ok() == 1, "读完之后 ok");
+}
+
+static void do_bitio(void)
+{
+    static unsigned char buf[8] = { 0 };
+    BitReader br = { 0 };
+    BitWriter bw = { 0 };
+
+    printf("== bitio\n");
+    check(bw.bind(buf, (int)sizeof buf) == 1, "BitWriter bind");
+    bw.write(0x5, 3);                   /* 101 */
+    bw.write(0x7, 4);                   /* 0111 */
+    bw.write1(0);
+    printf("   写入 %d 位，占 %d 字节\n", bw.bits_written(), bw.size());
+    check(bw.bits_written() == 8 && bw.size() == 1, "8 位占 1 字节");
+    check(buf[0] == 0xAE, "位序应该是高位在前（101 0111 0 → 1010 1110）");
+    br.bind(buf, bw.size());
+    check(br.read(3) == 0x5 && br.read(4) == 0x7 && br.read1() == 0,
+          "按位读回");
+    check(br.remaining() == 0 && br.ok() == 1, "读完之后 ok");
+    /* 越界 */
+    check(br.read(8) != 0 || br.ok() == 0, "越界读置 ok=0");
+}
+
+static void do_half(void)
+{
+    Half h = { 0 };
+
+    printf("== half\n");
+    check(double_to_half(1.0) == 0x3C00, "1.0 → 0x3C00");
+    check(double_to_half(-2.0) == 0xC000, "-2.0 → 0xC000");
+    check(double_to_half(65504.0) == 0x7BFF, "65504 → 0x7BFF");
+    h.set(1.5);
+    printf("   1.5 → 0x%04X → %g\n", h.bits, h.get());
+    check(h.bits == 0x3E00 && near(h.get(), 1.5, 1e-9), "1.5 往返");
+    h.set(0.0 / 0.0);
+    check(h.is_nan() == 1, "NaN 识别");
+    h.set(1.0 / 0.0);
+    check(h.is_inf() == 1, "inf 识别");
+    check(double_to_bfloat16(1.0) == 0x3F80, "1.0 的 bf16");
+    printf("   π 的 bf16 = 0x%04X（还原 %g）\n", double_to_bfloat16(3.14159265),
+           bfloat16_to_double(double_to_bfloat16(3.14159265)));
+    check(near(bfloat16_to_double(double_to_bfloat16(3.14159265)), 3.140625,
+               1e-6), "bf16 往返精度");
+}
+
+static void do_align(void)
+{
+    printf("== align\n");
+    printf("   up(13,8)=%llu down(13,8)=%llu pad=%llu next_pow2(100)=%llu\n",
+           (unsigned long long)align_up(13, 8),
+           (unsigned long long)align_down(13, 8),
+           (unsigned long long)padding_for(13, 8),
+           (unsigned long long)next_pow2(100));
+    check(align_up(13, 8) == 16 && align_down(13, 8) == 8, "对齐 up/down");
+    check(padding_for(13, 8) == 3 && padding_for(16, 8) == 0, "填充字节数");
+    check(next_pow2(100) == 128 && is_pow2(128) == 1, "2 的幂");
+    check(round_up(13, 5) == 15 && round_up(15, 5) == 15, "按倍数取整");
+    check(log2_floor(1024) == 10 && align_up(13, 12) == 13,
+          "log2 与非 2 的幂原样返回");
+}
+
+int main(void)
+{
+    do_binio();
+    do_bitio();
+    do_half();
+    do_align();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

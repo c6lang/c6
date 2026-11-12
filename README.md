@@ -384,6 +384,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/os/fstab.c6           std.os.fstab           /etc/fstab：4~6 字段、# 注释、dump/passno 默认 0、find 按挂载点查
   std/os/osrelease.c6       std.os.osrelease       /etc/os-release：KEY=VALUE、引号剥离、键值裁剪，find 按名取
   std/os/systemd.c6         std.os.systemd         systemd unit：[Section] + Key=Value，注释 #/;，get 按段+键取值
+  std/core/binio.c6         std.core.binio         整数读写游标：Reader/Writer 方法 u16le/u24le/u32be/u64…，越界只置 ok=0
+  std/core/bitio.c6         std.core.bitio         按位读写：BitReader/BitWriter 方法 read/write/align，高位在前
+  std/core/half.c6          std.core.half          fp16 与 bfloat16：Half 方法 set/get/is_nan，次正规数与 ±0/inf/NaN
+  std/core/align.c6         std.core.align         对齐工具：align_up/down、padding_for、is_pow2、round_up、next_pow2、log2_floor
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -499,6 +503,7 @@ make std-geo      # 编译并运行 examples/stdgeo.c6（第五十六批地理�
 make std-pkg      # 编译并运行 examples/stdpkg.c6（第五十七批目标文件与包模块的拼装示例）
 make std-check    # 编译并运行 examples/stdcheck.c6（第五十八批校验与纠错模块的拼装示例）
 make std-linux    # 编译并运行 examples/stdlinux.c6（第五十九批 Linux 配置文本模块的拼装示例）
+make std-bin2     # 编译并运行 examples/stdbin2.c6（第六十批二进制与数值工具模块的拼装示例，链接带 -lm）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

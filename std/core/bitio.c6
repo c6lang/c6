@@ -1,0 +1,245 @@
+/* std/core/bitio：按位读写的游标（BitReader / BitWriter）。
+ *
+ *     import std.core.bitio;
+ *
+ *     BitWriter bw = { 0 };
+ *     BitReader br = { 0 };
+ *     unsigned char buf[8] = { 0 };
+ *     bw.bind(buf, (int)sizeof buf);   // 方法：bind / write / write1 / align
+ *     bw.write(0x5, 3);
+ *     bw.write1(1);
+ *     br.bind(buf, bw.size());
+ *     br.read(3);                      // 0x5
+ *
+ * 位序是**高位在前**（MSB-first），与网络协议/压缩格式的惯例一致：第一个写入的位
+ * 落在首字节的 bit7。`align()` 把游标推到下一个字节边界（写入时补 0）。
+ *
+ * 约定：
+ *
+ * - `read(nbits)` 一次最多 32 位；越界时把 `ok` 置 0 并返回 0；
+ * - `write(v, nbits)` 只取 `v` 的低 `nbits` 位，从高位开始写；
+ * - `size()`（Writer）是已经用掉的**字节数**（向上取整），`bits_written()` 是位数；
+ * - `remaining()`（Reader）是剩余**位数**；
+ * - `align()` 会丢弃当前字节里剩下的位（读）或补零（写）；
+ * - 没有动态分配，容量由调用方给。
+ */
+#include <string.h>
+
+module std.core.bitio;
+import std.core.types;
+import std.text.str;
+
+struct BitReader {
+    const unsigned char *p;
+    int nbits;
+    int bit;
+    int okflag;
+};
+
+struct BitWriter {
+    unsigned char *p;
+    int cap_bits;
+    int bit;
+    int okflag;
+};
+
+int bind(BitReader *r, const void *src, int n)
+{
+    if (!r)
+        return -1;
+    r->p = (const unsigned char *)src;
+    r->nbits = n < 0 ? 0 : n * 8;
+    r->bit = 0;
+    r->okflag = 1;
+    return 1;
+}
+
+int remaining(BitReader *r)
+{
+    return r ? r->nbits - r->bit : 0;
+}
+
+int position(BitReader *r)
+{
+    return r ? r->bit : -1;
+}
+
+int ok(BitReader *r)
+{
+    return r ? r->okflag : 0;
+}
+
+u32 read(BitReader *r, int nbits)
+{
+    u32 v = 0;
+    int i = 0;
+
+    if (!r || nbits < 0 || nbits > 32 || !r->okflag
+        || r->bit + nbits > r->nbits) {
+        if (r)
+            r->okflag = 0;
+        return 0;
+    }
+    for (i = 0; i < nbits; i++) {
+        int pos = r->bit + i;
+        int bit = ((unsigned int)r->p[pos >> 3] >> (7 - (pos & 7))) & 1u;
+
+        v = (v << 1) | (u32)bit;
+    }
+    r->bit += nbits;
+    return v;
+}
+
+u32 read1(BitReader *r)
+{
+    return read(r, 1);
+}
+
+int align(BitReader *r)
+{
+    if (!r)
+        return -1;
+    r->bit = ((r->bit + 7) / 8) * 8;
+    if (r->bit > r->nbits) {
+        r->bit = r->nbits;
+        r->okflag = 0;
+        return -1;
+    }
+    return (r->bit / 8);
+}
+
+/* ---- Writer ---- */
+
+int bind(BitWriter *w, void *dst, int cap)
+{
+    if (!w || !dst || cap < 0)
+        return -1;
+    w->p = (unsigned char *)dst;
+    w->cap_bits = cap * 8;
+    w->bit = 0;
+    w->okflag = 1;
+    memset(dst, 0, (size_t)cap);
+    return 1;
+}
+
+int size(BitWriter *w)
+{
+    return w ? (w->bit + 7) / 8 : -1;
+}
+
+int bits_written(BitWriter *w)
+{
+    return w ? w->bit : -1;
+}
+
+int ok(BitWriter *w)
+{
+    return w ? w->okflag : 0;
+}
+
+int write(BitWriter *w, u32 v, int nbits)
+{
+    int i = 0;
+
+    if (!w || nbits < 0 || nbits > 32 || !w->okflag
+        || w->bit + nbits > w->cap_bits) {
+        if (w)
+            w->okflag = 0;
+        return -1;
+    }
+    for (i = 0; i < nbits; i++) {
+        int bit = (int)((v >> (nbits - 1 - i)) & 1u);
+        int pos = w->bit + i;
+
+        if (bit)
+            w->p[pos >> 3] = (unsigned char)(w->p[pos >> 3]
+                                             | (1u << (7 - (pos & 7))));
+    }
+    w->bit += nbits;
+    return nbits;
+}
+
+int write1(BitWriter *w, int bit)
+{
+    return write(w, (u32)(bit & 1), 1);
+}
+
+int align(BitWriter *w)
+{
+    int pad = 0;
+
+    if (!w)
+        return -1;
+    pad = (8 - (w->bit & 7)) & 7;
+    if (pad > 0 && write(w, 0, pad) != pad)
+        return -1;
+    return size(w);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "bitio：按位往返" {
+    static unsigned char buf[8] = { 0 };
+    BitReader r = { 0 };
+    BitWriter w = { 0 };
+
+    if (w.bind(buf, (int)sizeof buf) != 1)
+        return err(1, "Writer bind 失败");
+    w.write(0x5, 3);                    /* 101 */
+    w.write1(1);
+    w.write(0x2A, 8);
+    w.write(0xFFFF, 16);
+    if (w.ok() != 1)
+        return err(2, "写入应该都成功");
+    if (w.bits_written() != 3 + 1 + 8 + 16)
+        return err(3, "位数不对");
+    if (w.size() != 4)
+        return err(4, "字节数应该向上取整到 4");
+    if (buf[0] != 0xB2)                 /* 1011 0010：101+1 后接 0x2A 的高 4 位 */
+        return err(5, "首字节应该是 0xB2");
+    if (r.bind(buf, w.size()) != 1)
+        return err(6, "Reader bind 失败");
+    if (r.read(3) != 0x5)
+        return err(7, "读 3 位不对");
+    if (r.read1() != 1)
+        return err(8, "读 1 位不对");
+    if (r.read(8) != 0x2A)
+        return err(9, "读 8 位不对");
+    if (r.read(16) != 0xFFFF)
+        return err(10, "读 16 位不对");
+    if (r.ok() != 1)
+        return err(11, "读完之后 ok 应该还是 1");
+}
+
+test "bitio：对齐与越界" {
+    static unsigned char buf[4] = { 0 };
+    BitReader r = { 0 };
+    BitWriter w = { 0 };
+
+    if (w.bind(buf, (int)sizeof buf) != 1)
+        return err(12, "bind 失败");
+    w.write(0x3, 2);
+    if (w.align() != 1)
+        return err(13, "对齐后应该占 1 字节");
+    if (w.bits_written() != 8)
+        return err(14, "对齐后位数应该是 8");
+    w.write(0xFF, 8);
+    if (w.size() != 2 || buf[0] != 0xC0 || buf[1] != 0xFF)
+        return err(15, "对齐后再写的内容不对");
+    /* 越界写 */
+    if (w.write(0xFFFF, 32) != -1 || w.ok() != 0)
+        return err(16, "越界写应该 -1 并置 ok=0");
+    /* 越界读 */
+    if (r.bind(buf, 1) != 1)
+        return err(17, "bind 失败");
+    if (r.read(16) != 0 || r.ok() != 0)
+        return err(18, "越界读应该置 ok=0");
+    if (r.bind(buf, 2) != 1 || r.read(16) != 0xC0FF)
+        return err(19, "两个字节一起读应该得到 0xC0FF");
+    if (r.remaining() != 0 || r.position() != 16)
+        return err(20, "剩余与位置不对");
+    if (r.read(33) != 0 || r.ok() != 0)
+        return err(21, "超过 32 位的读应该失败");
+}

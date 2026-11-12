@@ -1,0 +1,149 @@
+/* std/core/align：对齐、2 的幂与字节填充的小工具。
+ *
+ *     import std.core.align;
+ *
+ *     align_up(13, 8);          // 16
+ *     align_down(13, 8);        // 8
+ *     padding_for(13, 8);       // 3
+ *     next_pow2(100);           // 128
+ *     is_pow2(64);              // 1
+ *
+ * 约定：
+ *
+ * - `align` 必须是 2 的幂，否则 `align_up`/`align_down`/`padding_for` 原样返回
+ *   输入（`align == 0` 也原样返回，避免除零）；
+ * - `align_up` 已经对齐时返回自身，不会多加一个 `align`；
+ * - `next_pow2` 对 `0` 返回 1；超过 2^63 时返回 0（表示溢出）；
+ * - `round_up` 是「按倍数向上取整」（倍数不要求是 2 的幂）；
+ * - `is_aligned(v, a)` 判断 `v % a == 0`；
+ * - 全部用 `u64`，不回绕到负数。
+ */
+#include <string.h>
+
+module std.core.align;
+import std.core.types;
+import std.text.str;
+
+int is_pow2(u64 v)
+{
+    return v != 0 && (v & (v - 1)) == 0 ? 1 : 0;
+}
+
+int is_aligned(u64 v, u64 align)
+{
+    if (align == 0)
+        return 0;
+    return v % align == 0 ? 1 : 0;
+}
+
+u64 align_up(u64 v, u64 align)
+{
+    u64 rem = 0;
+
+    if (align == 0 || !is_pow2(align))
+        return v;
+    rem = v % align;
+    if (rem == 0)
+        return v;
+    return v + (align - rem);
+}
+
+u64 align_down(u64 v, u64 align)
+{
+    if (align == 0 || !is_pow2(align))
+        return v;
+    return v - (v % align);
+}
+
+u64 padding_for(u64 v, u64 align)
+{
+    if (align == 0 || !is_pow2(align))
+        return 0;
+    return (align - (v % align)) % align;
+}
+
+u64 round_up(u64 v, u64 multiple)
+{
+    u64 rem = 0;
+
+    if (multiple == 0)
+        return v;
+    rem = v % multiple;
+    if (rem == 0)
+        return v;
+    return v + (multiple - rem);
+}
+
+u64 next_pow2(u64 v)
+{
+    u64 p = 1;
+
+    if (v <= 1)
+        return 1;
+    while (p < v) {
+        if (p == ((u64)1 << 63))
+            return 0;                   /* 再翻就超过 u64 了 */
+        p <<= 1;
+    }
+    return p;
+}
+
+u64 log2_floor(u64 v)
+{
+    u64 n = 0;
+
+    if (v == 0)
+        return 0;
+    while (v > 1) {
+        v >>= 1;
+        n++;
+    }
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "align：对齐与 2 的幂" {
+    if (is_pow2(1) != 1 || is_pow2(64) != 1 || is_pow2(0) != 0
+        || is_pow2(63) != 0)
+        return err(1, "is_pow2 判定不对");
+    if (align_up(0, 8) != 0 || align_up(8, 8) != 8 || align_up(13, 8) != 16)
+        return err(2, "align_up 不对");
+    if (align_down(13, 8) != 8 || align_down(8, 8) != 8
+        || align_down(15, 4) != 12)
+        return err(3, "align_down 不对");
+    if (padding_for(13, 8) != 3 || padding_for(16, 8) != 0)
+        return err(4, "padding_for 不对");
+    if (align_up(13, 12) != 13)
+        return err(5, "非 2 的幂应该原样返回");
+    if (align_up(13, 0) != 13)
+        return err(6, "align=0 应该原样返回");
+    if (is_aligned(16, 8) != 1 || is_aligned(15, 8) != 0
+        || is_aligned(8, 0) != 0)
+        return err(7, "is_aligned 不对");
+}
+
+test "align：向上取整与 log2" {
+    if (next_pow2(0) != 1 || next_pow2(1) != 1 || next_pow2(3) != 4
+        || next_pow2(100) != 128 || next_pow2(128) != 128)
+        return err(8, "next_pow2 不对");
+    if (round_up(13, 5) != 15 || round_up(15, 5) != 15
+        || round_up(0, 5) != 0)
+        return err(9, "round_up 不对");
+    if (round_up(13, 0) != 13)
+        return err(10, "倍数 0 应该原样返回");
+    if (log2_floor(0) != 0 || log2_floor(1) != 0 || log2_floor(2) != 1
+        || log2_floor(1023) != 9 || log2_floor(1024) != 10)
+        return err(11, "log2_floor 不对");
+    /* 大数：2^62 的 next_pow2 还是自己，2^63 边界返回 0 */
+    if (next_pow2(((u64)1) << 62) != (((u64)1) << 62))
+        return err(12, "2^62 的 next_pow2 不对");
+    if (next_pow2((((u64)1) << 62) + 1) != (((u64)1) << 63))
+        return err(13, "2^62+1 的 next_pow2 应该是 2^63");
+    if (next_pow2((((u64)1) << 63) + 1) != 0)
+        return err(15, "超过 2^63 应该返回 0（溢出）");
+    if (align_up(4096, 4096) != 4096 || padding_for(4096, 4096) != 0)
+        return err(14, "对齐到自身不该加一个对齐单位");
+}

@@ -2067,6 +2067,33 @@ systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，�
 验收：`make stdtest`（249 个模块、0 failure）、`make std-linux`（20 条自检全过）、
 `make check-all`。
 
+### 11.72 标准库第六十批（binio / bitio / half / align）
+
+第六十批补「二进制与数值工具」：整数读写游标、按位读写游标、半精度浮点与对齐工具。
+前三个都是**方法优先**的状态结构（`Reader`/`Writer`/`BitReader`/`BitWriter`/`Half`）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.binio` | 整数读写 | `Reader`/`Writer` 都是「指针 + 容量 + 偏移 + ok」，越界只置 `ok=0`（返回 0/-1）不抛错，调用方在序列末尾统一 `ok()`；LE/BE 各一套，字节序显式 |
+| `std.core.bitio` | 按位读写 | 高位在前（MSB-first）；`read` 一次最多 32 位；`align` 读时丢弃剩余位、写时补零 |
+| `std.core.half` | fp16 / bf16 | fp16 要处理次正规数（`2^-24` 步长）、`±0`（用 `1/d` 的符号判断）、`±inf`/`NaN`；bf16 是 **fp32** 的高 16 位（不是 double 的高 16 位，第一版写错成后者，1.0 得到 0x3FF0 而不是 0x3F80） |
+| `std.core.align` | 对齐工具 | 非 2 的幂原样返回（不报错，避免调用方到处判断）；`next_pow2` 在 `2^63` 处返回 0 表示溢出；`round_up` 支持任意倍数 |
+
+两个新踩的坑：`union` 变量在 c6 里**必须初始化**（`} u = { 0 };`）；同一模块里
+**可以同名重载**方法（`bind(Reader *)` 与 `bind(Writer *)` 并存，`r.bind()`/`w.bind()`
+按接收者类型分派），但用普通调用语法 `bind(&w, …)` 会挑错版本并报警告——所以调用
+统一写成方法形式，这也正好符合本轮的「方法优先」要求。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.binio`=0x60f9、
+`std.core.bitio`=0x60fa、`std.core.half`=0x60fb、`std.core.align`=0x60fc；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-bin2` 与 `STD_BIN2_SRCS`（带 `-lm`），
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdbin2.c6` 四节（25 条自检）。
+
+验收：`make stdtest`（253 个模块、0 failure）、`make std-bin2`（25 条自检全过）、
+`make check-all`。
+
+
 
 
 
