@@ -35,6 +35,15 @@
 
 ### 语言与编译器
 
+- **裸机引导器：payload 直接用 ATA PIO 读进 0x400000**（`examples/boot/boot.S`）。
+  原先实模式用 INT 13h 把 payload 读到 0x10000 再搬过去，目标地址受「段:偏移」
+  约 1 MiB 的限制；payload 超过 ~576 KiB 时还会压到 0xA0000 起的 VGA/ROM 空洞
+  （写进去读出来是 0xFF）。`tests/data_zero.c6`（855 KiB payload）因此在裸机上
+  3/4 失败。现在进 32 位保护模式后用 ATA PIO（主通道、28 位 LBA、轮询）一次
+  一个扇区直接写进链接地址 0x400000，不再需要中转和搬运；`make fstest-bare`,
+  `fstest-bare-tests`（38 通过 0 失败）、`fstest-bare-go`、`fstest-bare-handle`、
+  `fstest-bare-smp` 全过，`make check-all` 绿。
+
 - **`!error` 支持浮点返回类型**：`float` / `double` / `long double` 现在可以作
   `!error` 的返回类型（C9 原先直接拒绝）。失败路径的返回值仍然只承载成功路径、
   永远不可观测：整数类标量继续用 `-1` 哨兵，聚合类型和浮点标量改为清零（全零

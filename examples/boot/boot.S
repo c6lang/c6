@@ -4,15 +4,19 @@
  *   make fstest-bare        （见 examples/boot/build.sh）
  *
  * 做的事按顺序：
- *   1. 实模式：用 INT 13h 的扩展读（AH=42h）把 payload 分块读到 0x10000，
- *      每次最多 16 个扇区（8KB），避免跨 64KB 段边界；
- *   2. 打开 A20、装 GDT、进 32 位保护模式；
+ *   1. 实模式：打开 A20、装 GDT，进 32 位保护模式；
+ *   2. 保护模式：用 ATA PIO 把 payload 从 LBA 1 **直接读进链接地址
+ *      0x400000**。不用 INT 13h 是因为它的目标地址是「段:偏移」，上限约
+ *      1 MiB，而大 payload（比如 tests/data_zero.c6 有 855 KiB）既超过这个
+ *      上限、也不能先落在 0x10000——0x10000 + 855 KiB 会压到 0xA0000 起的
+ *      VGA/ROM 空洞，写进去读出来是 0xFF；
  *   3. 在 0x90000 建三个页表，把第一个 1GB 恒等映射到 0；
  *   4. 开 PAE / LME / 分页，切到 64 位；
- *   5. 把 payload 从 0x10000 拷到它的链接地址 0x400000，清零它的 .bss；
+ *   5. 清零 payload 的 .bss；
  *   6. call 进去。
  *
- * 栈在 0x80000（64 位），页表在 0x90000，都还没被别的东西占着。
+ * 栈在保护模式用 0x70000、长模式用 0x1000000，页表在 0x90000，都还没被别的
+ * 东西占着；payload 自己占 0x400000 往上。
  *
  * 这些常量由构建脚本用 --defsym 传进来：
  *   payload_sectors  要从磁盘读多少个 512 字节扇区
@@ -31,7 +35,6 @@ _start:
         movw %ax, %es
         movw %ax, %ss
         movw $0x7C00, %sp
-        movb %dl, drive                 /* BIOS 给的启动盘号 */
         sti
 
         /* --- A20（qemu 一般已经开了，顺手写一次） --- */
@@ -39,40 +42,6 @@ _start:
         orb $2, %al
         outb %al, $0x92
 
-        /* --- 把 payload 从 LBA 1 开始读到 0x1000:0000 --- */
-        movw $payload_sectors, %bx      /* 还剩多少扇区 */
-        movw $0x1000, %di               /* 目标段 */
-read_loop:
-        testw %bx, %bx
-        jz read_done
-        movw %bx, %ax
-        cmpw $16, %ax
-        jbe 1f
-        movw $16, %ax
-1:      movw %ax, dap_count
-        movw $0, dap_off
-        movw %di, dap_seg
-        movw $dap, %si
-        movb drive, %dl
-        movb $0x42, %ah
-        int $0x13
-        jc read_fail
-        movzwl dap_count, %eax          /* 这一次读了多少扇区 */
-        subl %eax, %ebx                 /* 不该为负，但 EBX 是 32 位好算 */
-        shll $5, %eax                   /* 每扇区 512 字节 = 32 个段 */
-        addw %ax, %di
-        movzwl dap_count, %eax
-        addl %eax, dap_lba
-        jmp read_loop
-
-read_fail:
-        movl $0x501, %edx               /* qemu isa-debug-exit：(code<<1)|1 */
-        movl $2, %eax
-        outb %al, %dx
-1:      hlt
-        jmp 1b
-
-read_done:
         /* --- 进 32 位保护模式 --- */
         cli
         lgdt gdt_desc
@@ -91,6 +60,14 @@ pm_entry:
         movw %ax, %ss
         movw %ax, %fs
         movw %ax, %gs
+        movl $0x70000, %esp             /* 保护模式的栈（页表在 0x90000） */
+        /* --- 用 ATA PIO 把 payload 直接读进 0x400000 --- */
+        movl $0x400000, %edi
+        movl $1, %ebx                   /* 起始 LBA */
+        movl $payload_sectors, %ecx
+        call ata_read
+        testl %eax, %eax
+        jnz read_fail32
         /* 页表：PML4[0] -> PDPT，PDPT[0] -> PD，PD = 512 个 2MB 页 */
         movl $0x90000, %edi             /* PML4 */
         xorl %eax, %eax
@@ -148,12 +125,8 @@ lm_entry:
            0x80000 这种低地址其实**落在 .bss 里面**，变量一多就会踩到栈。 */
         movq $0x01000000, %rsp
         xorq %rbp, %rbp
-        /* 把 payload 从 0x10000 拷到 0x400000 */
-        movq $0x10000, %rsi
-        movq $0x400000, %rdi
-        movl $payload_bytes, %ecx
-        rep movsb
-        /* 清零 payload 的 .bss（大小从 ELF 的 memsz - filesz 来） */
+        /* payload 已经在 0x400000（保护模式里直接读进来的）；
+           清零它的 .bss（大小从 ELF 的 memsz - filesz 来） */
         movq $0x400000, %rdi
         addq $payload_bytes, %rdi
         movl $payload_bss, %ecx
@@ -178,19 +151,94 @@ gdt_desc:
         .word gdt_end - gdt - 1
         .long gdt
 
-        .align 4
-dap:
-        .byte 0x10, 0
-dap_count:
-        .word 0
-dap_off:
-        .word 0
-dap_seg:
-        .word 0
-dap_lba:
-        .quad 1
-drive:
-        .byte 0
+        /* ---- ATA PIO 读盘（主通道，28 位 LBA，轮询，无中断） ---------------
+ *
+ *   EDI = 目标线性地址（ES 已是指向 4GB 的平坦段）
+ *   EBX = 起始 LBA（从 1 开始，LBA 0 是引导扇区）
+ *   ECX = 扇区数
+ *   返回 EAX = 0 成功 / 2 失败（超时或 ERR 置位）
+ *
+ * 端口：0x1F0 数据、0x1F2 计数、0x1F3..0x1F5 LBA 低 24 位、
+ *       0x1F6 驱动器/头 + LBA 高 4 位、0x1F7 状态/命令。
+ */
+        .code32
+ata_read:
+        pushl %ebp
+        pushl %esi
+        pushl %ebx
+        pushl %ecx
+        pushl %edx
+1:      testl %ecx, %ecx
+        jz 9f
+        /* 等 BSY 清 */
+        movl $500000, %esi
+2:      movw $0x1f7, %dx
+        inb %dx, %al
+        testb $0x80, %al
+        jz 3f
+        decl %esi
+        jnz 2b
+        jmp 8f
+3:      /* 发 READ SECTORS (0x20)，一次一个扇区 */
+        movw $0x1f2, %dx
+        movb $1, %al
+        outb %al, %dx
+        movw $0x1f3, %dx
+        movb %bl, %al
+        outb %al, %dx
+        movw $0x1f4, %dx
+        movb %bh, %al
+        outb %al, %dx
+        movw $0x1f5, %dx
+        movl %ebx, %eax
+        shrl $16, %eax
+        outb %al, %dx
+        movw $0x1f6, %dx
+        movl %ebx, %eax
+        shrl $24, %eax
+        andb $0x0f, %al
+        orb $0xe0, %al
+        outb %al, %dx
+        movw $0x1f7, %dx
+        movb $0x20, %al
+        outb %al, %dx
+        /* 等 DRQ（BSY 清且 DRQ 置；ERR 置位算失败） */
+        movl $500000, %esi
+4:      movw $0x1f7, %dx
+        inb %dx, %al
+        testb $0x80, %al
+        jnz 5f
+        testb $0x08, %al
+        jnz 6f
+        testb $0x01, %al
+        jnz 8f
+5:      decl %esi
+        jnz 4b
+        jmp 8f
+6:      movw $0x1f0, %dx
+        pushl %ecx
+        movl $256, %ecx
+        rep insw
+        popl %ecx
+        incl %ebx
+        decl %ecx
+        jmp 1b
+8:      movl $2, %eax
+        jmp 10f
+9:      xorl %eax, %eax
+10:     popl %edx
+        popl %ecx
+        popl %ebx
+        popl %esi
+        popl %ebp
+        ret
+
+read_fail32:
+        movw $0x501, %dx                /* qemu isa-debug-exit：code=2 */
+        movl $2, %eax
+        outb %al, %dx
+1:      hlt
+        jmp 1b
 
 /* 引导扇区必须以 0x55AA 结尾 */
         .org 510
