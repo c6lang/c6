@@ -1,0 +1,497 @@
+/* std/encoding/base85：Ascii85（Adobe）与 Z85（ZeroMQ）两种 4→5 编码。
+ *
+ *     import std.encoding.base85;
+ *
+ *     char buf[64] = { 0 };
+ *     int n = a85_encode(S("hello"), buf, (int)sizeof buf);   // "BOu!rDZ"
+ *     int m = a85_decode((char[:]){ buf, n }, out, (int)sizeof out);
+ *
+ * 两者都是把 4 个字节当成一个 32 位大端整数，用 85 进制写成 5 个可打印字符
+ * （85^5 = 4437053125 > 2^32，所以一定能放下）。差别在字母表和细节：
+ *
+ * - **Ascii85**（Adobe PostScript/PDF）：字母表就是 `!`..`u`（33..117）；
+ *   四个 0 字节写成 `z`；结尾不足 4 字节的部分组输出 n+1 个字符；解码跳过
+ *   空白，遇到 `~>` 就停（PDF 的结尾标记），也接受 `<~` 开头吗？——**不**：
+ *   开头的 `<~` 不是数据的一部分，调用方自己剥掉。
+ * - **Z85**（ZeroMQ RFC 32，也叫 ZeroMQ Base-85）：字母表是
+ *   `0-9a-zA-Z.-:+=^!/*?&<>()[]{}@%$#`；**长度必须是 4 的倍数**，没有 `z`
+ *   简写、没有部分组、不跳空白（严格按规范）。
+ *
+ * 约定（和 `std.encoding.codec` 一致）：写调用方缓冲，长度先算再写，放不下
+ * 返回 -1 且一个字节都不写；解码遇到非法字符/非法长度/数值溢出/放不下都
+ * 返回 -1。
+ */
+#include <string.h>
+
+module std.encoding.base85;
+import std.core.types;
+
+static const char z85_alpha[] =
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+
+static int a85_space(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+           || c == '\v';
+}
+
+/* ---- Ascii85 ---- */
+
+/* 编码后长度：每组 4 字节 5 个字符；余 1..3 字节输出余数+1 个字符 */
+int a85_encoded_len(int n)
+{
+    i64 v = 0;
+
+    if (n < 0)
+        return -1;
+    v = (i64)(n / 4) * 5 + ((n % 4) ? (n % 4) + 1 : 0);
+    if (v > (i64)I32_MAX)
+        return -1;
+    return (int)v;
+}
+
+static void a85_put5(char *dst, int *di, u32 v, int nchars)
+{
+    char tmp[5] = { 0 };
+    int k = 0;
+
+    for (k = 4; k >= 0; k--) {
+        tmp[k] = (char)(33 + (int)(v % 85u));
+        v /= 85u;
+    }
+    for (k = 0; k < nchars; k++)
+        dst[(*di)++] = tmp[k];
+}
+
+/* 编码：返回写入字节数；放不下/参数非法返回 -1（不写半截） */
+int a85_encode(char[:] src, char *dst, int cap)
+{
+    int i = 0, di = 0;
+
+    if (src.len < 0 || cap < 0)
+        return -1;
+    if (src.len > 0 && (!src.data || !dst))
+        return -1;
+    if (a85_encoded_len(src.len) > cap)
+        return -1;
+    while (i + 4 <= src.len) {
+        u32 v = ((u32)(u8)src.data[i] << 24)
+                | ((u32)(u8)src.data[i + 1] << 16)
+                | ((u32)(u8)src.data[i + 2] << 8)
+                | (u32)(u8)src.data[i + 3];
+
+        if (v == 0u) {
+            dst[di++] = 'z';
+        } else {
+            a85_put5(dst, &di, v, 5);
+        }
+        i += 4;
+    }
+    if (i < src.len) {
+        int k = src.len - i, j = 0;
+        u32 v = 0;
+
+        for (j = 0; j < 4; j++)
+            v = (v << 8) | (u32)((j < k) ? (u8)src.data[i + j] : 0);
+        a85_put5(dst, &di, v, k + 1);
+    }
+    return di;
+}
+
+/* 解码后的长度（跳过空白、处理 z 与 ~>）；坏数据返回 -1 */
+int a85_decoded_len(char[:] src)
+{
+    int i = 0, out = 0, n = 0;
+    u64 acc = 0;
+
+    if (src.len < 0)
+        return -1;
+    while (i < src.len) {
+        int c = (u8)src.data[i];
+
+        if (a85_space(c)) {
+            i++;
+            continue;
+        }
+        if (c == '~') {
+            if (i + 1 < src.len && src.data[i + 1] == '>')
+                break;
+            return -1;
+        }
+        if (c == 'z') {
+            if (n != 0)
+                return -1;
+            out += 4;
+            i++;
+            continue;
+        }
+        if (c < 33 || c > 117)
+            return -1;
+        acc = acc * 85u + (u64)(c - 33);
+        n++;
+        i++;
+        if (n == 5) {
+            if (acc > 0xffffffffu)
+                return -1;
+            out += 4;
+            n = 0;
+            acc = 0;
+        }
+    }
+    if (n == 1)
+        return -1;
+    if (n > 1)
+        out += n - 1;
+    return out;
+}
+
+int a85_valid(char[:] src)
+{
+    return a85_decoded_len(src) >= 0;
+}
+
+/* 解码：返回写入字节数；坏数据/放不下返回 -1 */
+int a85_decode(char[:] src, char *dst, int cap)
+{
+    int i = 0, di = 0, n = 0;
+    u64 acc = 0;
+
+    if (src.len < 0 || cap < 0)
+        return -1;
+    if (src.len > 0 && (!src.data || !dst))
+        return -1;
+    while (i < src.len) {
+        int c = (u8)src.data[i];
+
+        if (a85_space(c)) {
+            i++;
+            continue;
+        }
+        if (c == '~') {
+            if (i + 1 < src.len && src.data[i + 1] == '>')
+                break;
+            return -1;
+        }
+        if (c == 'z') {
+            if (n != 0 || di + 4 > cap)
+                return -1;
+            dst[di] = 0;
+            dst[di + 1] = 0;
+            dst[di + 2] = 0;
+            dst[di + 3] = 0;
+            di += 4;
+            i++;
+            continue;
+        }
+        if (c < 33 || c > 117)
+            return -1;
+        acc = acc * 85u + (u64)(c - 33);
+        n++;
+        i++;
+        if (n == 5) {
+            if (acc > 0xffffffffu)
+                return -1;
+            if (di + 4 > cap)
+                return -1;
+            dst[di++] = (char)((acc >> 24) & 0xffu);
+            dst[di++] = (char)((acc >> 16) & 0xffu);
+            dst[di++] = (char)((acc >> 8) & 0xffu);
+            dst[di++] = (char)(acc & 0xffu);
+            n = 0;
+            acc = 0;
+        }
+    }
+    if (n == 1)
+        return -1;
+    if (n > 1) {
+        int got = n - 1;
+
+        while (n < 5) {
+            acc = acc * 85u + 84u;      /* 用 'u' 补齐（标准做法） */
+            n++;
+        }
+        if (acc > 0xffffffffu || di + got > cap)
+            return -1;
+        dst[di++] = (char)((acc >> 24) & 0xffu);
+        if (got >= 2)
+            dst[di++] = (char)((acc >> 16) & 0xffu);
+        if (got >= 3)
+            dst[di++] = (char)((acc >> 8) & 0xffu);
+    }
+    return di;
+}
+
+/* ---- Z85 ---- */
+
+static int z85_digit(int c)
+{
+    int i = 0;
+
+    for (i = 0; i < 85; i++) {
+        if ((u8)z85_alpha[i] == (u8)c)
+            return i;
+    }
+    return -1;
+}
+
+/* n 必须是 4 的倍数；否则 -1 */
+int z85_encoded_len(int n)
+{
+    i64 v = 0;
+
+    if (n < 0 || (n % 4) != 0)
+        return -1;
+    v = (i64)(n / 4) * 5;
+    if (v > (i64)I32_MAX)
+        return -1;
+    return (int)v;
+}
+
+int z85_encode(char[:] src, char *dst, int cap)
+{
+    int i = 0, di = 0;
+
+    if (src.len < 0 || cap < 0 || (src.len % 4) != 0)
+        return -1;
+    if (src.len > 0 && (!src.data || !dst))
+        return -1;
+    if (z85_encoded_len(src.len) > cap)
+        return -1;
+    while (i < src.len) {
+        u32 v = ((u32)(u8)src.data[i] << 24)
+                | ((u32)(u8)src.data[i + 1] << 16)
+                | ((u32)(u8)src.data[i + 2] << 8)
+                | (u32)(u8)src.data[i + 3];
+        char tmp[5] = { 0 };
+        int k = 0;
+
+        for (k = 4; k >= 0; k--) {
+            tmp[k] = z85_alpha[v % 85u];
+            v /= 85u;
+        }
+        for (k = 0; k < 5; k++)
+            dst[di++] = tmp[k];
+        i += 4;
+    }
+    return di;
+}
+
+/* 解码后的长度：输入必须是 5 的倍数且字符合法；否则 -1 */
+int z85_decoded_len(char[:] src)
+{
+    int i = 0, n = 0;
+
+    if (src.len < 0 || (src.len % 5) != 0)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        if (z85_digit((u8)src.data[i]) < 0)
+            return -1;
+        n++;
+    }
+    return (n / 5) * 4;
+}
+
+int z85_valid(char[:] src)
+{
+    return z85_decoded_len(src) >= 0;
+}
+
+int z85_decode(char[:] src, char *dst, int cap)
+{
+    int i = 0, di = 0;
+
+    if (src.len < 0 || cap < 0 || (src.len % 5) != 0)
+        return -1;
+    if (src.len > 0 && (!src.data || !dst))
+        return -1;
+    if (z85_decoded_len(src) > cap)
+        return -1;
+    while (i < src.len) {
+        u64 acc = 0;
+        int k = 0;
+
+        for (k = 0; k < 5; k++) {
+            int d = z85_digit((u8)src.data[i + k]);
+
+            if (d < 0)
+                return -1;
+            acc = acc * 85u + (u64)d;
+        }
+        if (acc > 0xffffffffu)
+            return -1;
+        dst[di++] = (char)((acc >> 24) & 0xffu);
+        dst[di++] = (char)((acc >> 16) & 0xffu);
+        dst[di++] = (char)((acc >> 8) & 0xffu);
+        dst[di++] = (char)(acc & 0xffu);
+        i += 5;
+    }
+    return di;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int a85_is_enc(char[:] src, const char *want)
+{
+    char buf[128] = { 0 };
+    int n = a85_encode(src, buf, (int)sizeof buf - 1);
+
+    if (n < 0)
+        return 0;
+    buf[n] = 0;
+    return strcmp(buf, want) == 0;
+}
+
+static int a85_is_dec(const char *text, char[:] want)
+{
+    char buf[128] = { 0 };
+    int n = a85_decode((char[:]){ (char *)text, (int)strlen(text) }, buf,
+                       (int)sizeof buf);
+
+    if (n != want.len)
+        return 0;
+    return n == 0 || memcmp(buf, want.data, (usize)n) == 0;
+}
+
+test "Ascii85 的已知向量" {
+    if (!a85_is_enc(S(""), ""))
+        return err(1, "空串");
+    if (!a85_is_enc(S("a"), "@/") || !a85_is_enc(S("ab"), "@:B"))
+        return err(2, "部分组 1/2 字节");
+    if (!a85_is_enc(S("abc"), "@:E^") || !a85_is_enc(S("abcd"), "@:E_W"))
+        return err(3, "部分组 3 字节与整组");
+    if (!a85_is_enc(S("hello"), "BOu!rDZ"))
+        return err(4, "hello");
+    if (!a85_is_enc(S("\x00\x00\x00\x00"), "z"))
+        return err(5, "四个零字节写 z");
+    if (!a85_is_enc(S("\x00\x00\x00\x00\x00"), "z!!"))
+        return err(6, "z + 部分组");
+    if (!a85_is_enc(S("Man is distinguished"),
+                    "9jqo^BlbD-BleB1DJ+*+F(f,q"))
+        return err(7, "Man is distinguished");
+    if (a85_encoded_len(0) != 0 || a85_encoded_len(1) != 2
+        || a85_encoded_len(4) != 5 || a85_encoded_len(5) != 7)
+        return err(8, "encoded_len");
+    if (a85_encoded_len(-1) != -1)
+        return err(9, "encoded_len 负数");
+}
+
+test "Ascii85 解码与空白/终止符" {
+    if (!a85_is_dec("BOu!rDZ", S("hello")))
+        return err(10, "hello 解码");
+    if (!a85_is_dec("z", S("\x00\x00\x00\x00")))
+        return err(11, "z 解码");
+    if (!a85_is_dec("z!!", S("\x00\x00\x00\x00\x00")))
+        return err(12, "z + 部分组解码");
+    /* 空白随便插 */
+    if (!a85_is_dec("BOu! \n\t rDZ", S("hello")))
+        return err(13, "跳过空白");
+    /* ~> 之后的内容不管 */
+    if (!a85_is_dec("BOu!rDZ~>trailing", S("hello")))
+        return err(14, "~> 终止");
+    /* 部分组用 'u' 补齐 */
+    if (!a85_is_dec("@/", S("a")) || !a85_is_dec("@:B", S("ab")))
+        return err(15, "部分组解码");
+    if (a85_decoded_len(S("BOu!rDZ")) != 5 || a85_decoded_len(S("z")) != 4
+        || a85_decoded_len(S("")) != 0)
+        return err(16, "decoded_len");
+    /* 2..4 个字符是合法的部分组；只剩 1 个字符才是非法（见下面的坏输入） */
+    if (!a85_valid(S("BOu!rDZ")) || !a85_valid(S("BOu")))
+        return err(17, "valid");
+    /* 坏输入 */
+    if (a85_valid(S("BOu!rD")) || a85_valid(S("BOu!rDZx")))
+        return err(18, "非法字符/单字符余数");
+    if (a85_valid(S("BOuz!")))
+        return err(19, "z 不在组边界");
+    if (a85_valid(S("uuuuu")))
+        return err(20, "溢出 32 位的编码");
+    if (a85_valid(S("BOu~")))
+        return err(21, "孤立的 ~");
+    {
+        char small[2] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 2; i++)
+            small[i] = 'Z';
+        if (a85_decode(S("BOu!rDZ"), (char *)small, 2) != -1)
+            return err(22, "输出放不下");
+        for (i = 0; i < 2; i++)
+            if (small[i] != 'Z')
+                return err(23, "解码失败时写了半截");
+        if (a85_encode(S("hello"), (char *)small, 2) != -1 || small[0] != 'Z')
+            return err(24, "编码放不下");
+    }
+}
+
+test "Ascii85 往返" {
+    char src[128] = { 0 };
+    char enc[256] = { 0 };
+    char dec[128] = { 0 };
+    int i = 0, n = 0, m = 0;
+
+    for (i = 0; i < 100; i++) {
+        int j = 0;
+
+        for (j = 0; j < i; j++)
+            src[j] = (char)(j * 7 + i);
+        n = a85_encode((char[:]){ src, i }, enc, (int)sizeof enc);
+        if (n != a85_encoded_len(i))
+            return err(25, "编码长度不一致");
+        m = a85_decode((char[:]){ enc, n }, dec, (int)sizeof dec);
+        if (m != i || (i > 0 && memcmp(dec, src, (usize)i) != 0))
+            return err(26, "往返失败");
+        if (a85_decoded_len((char[:]){ enc, n }) != i)
+            return err(27, "decoded_len 与解码不一致");
+    }
+}
+
+test "Z85 的已知向量与往返" {
+    char buf[64] = { 0 };
+    char back[64] = { 0 };
+    const u8 vec[8] = { 0x86, 0x4f, 0xd2, 0x6f, 0xb5, 0x59, 0xf7, 0x5b };
+    char vecs[8] = { 0 };
+    int n = 0, m = 0;
+
+    {
+        int i = 0;
+
+        for (i = 0; i < 8; i++)
+            vecs[i] = (char)vec[i];
+    }
+    n = z85_encode((char[:]){ vecs, 8 }, buf, (int)sizeof buf - 1);
+    buf[n > 0 ? n : 0] = 0;
+    if (n != 10 || strcmp(buf, "HelloWorld") != 0)
+        return err(28, "Z85 的 HelloWorld 向量");
+    m = z85_decode((char[:]){ buf, n }, back, (int)sizeof back);
+    if (m != 8 || memcmp(back, vecs, 8) != 0)
+        return err(29, "Z85 往返");
+    /* 四个零字节 */
+    if (z85_encode(S("\x00\x00\x00\x00"), buf, (int)sizeof buf) != 5
+        || memcmp(buf, "00000", 5) != 0)
+        return err(30, "Z85 的 00000");
+    if (z85_encode(S("abcd"), buf, (int)sizeof buf) != 5
+        || memcmp(buf, "vpA.S", 5) != 0)
+        return err(31, "Z85 的 abcd");
+    /* 长度必须是 4 的倍数 */
+    if (z85_encode(S("abc"), buf, (int)sizeof buf) != -1
+        || z85_encoded_len(3) != -1 || z85_encoded_len(5) != -1)
+        return err(32, "Z85 编码长度约束");
+    if (!z85_valid(S("HelloWorld")) || z85_valid(S("HelloWorl"))
+        || z85_valid(S("HelloWorl_")) || z85_valid(S("HelloWorld!")))
+        return err(33, "Z85 valid");
+    if (z85_decoded_len(S("HelloWorld")) != 8 || z85_decoded_len(S("")) != 0)
+        return err(34, "Z85 decoded_len");
+    /* 放不下 */
+    {
+        char small[4] = { 0 };
+
+        if (z85_decode(S("HelloWorld"), (char *)small, 4) != -1)
+            return err(35, "Z85 输出放不下");
+        if (z85_encode((char[:]){ vecs, 8 }, (char *)small, 4) != -1)
+            return err(36, "Z85 编码放不下");
+    }
+    /* 85^5 溢出的编码 */
+    if (z85_decode(S("#$%&'"), back, (int)sizeof back) != -1)
+        return err(37, "Z85 溢出");
+}

@@ -47,6 +47,17 @@
 
 ### 标准库
 
+- **标准库第十四批（压缩与文本编码）**：`std.encoding.lz4` / `std.encoding.rle` /
+  `std.encoding.base85` / `std.encoding.hexdump` 四个模块，集成示例
+  `examples/stdpack.c6`（`make std-pack`）。lz4 是标准 LZ4 块格式的零分配实现
+  （哈希表与输出缓冲都由调用方给；手写标准向量 + 独立参考实现双向交叉验证）；
+  rle 是 PackBits 游程与一阶差分（模 256，缓变采样差分后压到 1/40）；
+  base85 是 Ascii85（Adobe，`z` 简写/部分组/`~>`）与 Z85（ZeroMQ，长度约束）
+  两套字母表，与 Python `base64.a85encode` 做了随机交叉验证；hexdump 按固定
+  布局排版并能反向解析（只把「8 位十六进制 + 空白」当偏移）。错误号段
+  `std.encoding.lz4`=0x6041 … `std.encoding.hexdump`=0x6044（`tcc/tccgen.c` 的
+  `c6_err_std_slots[]` 追加）。
+
 - **标准库第十三批（数值类型）**：`std.core.bignum` / `std.core.decimal` /
   `std.core.rational` / `std.core.complex` 四个模块，集成示例
   `examples/stdnum.c6`（`make std-num`）。bignum 是 1024 位的值类型大整数

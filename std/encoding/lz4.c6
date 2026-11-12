@@ -1,0 +1,487 @@
+/* std/encoding/lz4：LZ4 块压缩/解压（零分配、写调用方缓冲）。
+ *
+ *     import std.encoding.lz4;
+ *
+ *     int table[lz4_table_size()];
+ *     char packed[4096] = { 0 };
+ *     int n = lz4_compress(src, src_len, packed, (int)sizeof packed,
+ *                          table, lz4_table_size());
+ *     char back[4096] = { 0 };
+ *     int m = lz4_decompress(packed, n, back, (int)sizeof back);
+ *
+ * 实现的是 **LZ4 块格式**（不是 frame 格式，没有帧头/校验和/块大小）：
+ * 一串 `token + 字面量 + 2 字节偏移 + 匹配长度` 的序列，格式和上游 lz4 的
+ * `LZ4_compress_default` 兼容——本模块压出来的块能被标准 LZ4 解码器解开，
+ * 标准 LZ4 压出来的块也能在这里解开（test 块里有手写的标准块向量）。
+ *
+ * 约定：
+ *
+ * - **零分配**：哈希表是调用方给的 `int[lz4_table_size()]`（1024 项，约 4KB），
+ *   输出写调用方缓冲。压缩前先按 `lz4_compress_bound(n)` 检查容量，
+ *   放不下返回 -1 且**一个字节都不写**。
+ * - 解码是**流式校验**：偏移为 0、偏移越过已经产出的数据、扩展长度字节被
+ *   截断、输出放不下，都返回 -1；失败时目标缓冲的内容**未定义**（已经写了
+ *   一部分），要保留原内容请先解到临时缓冲。
+ * - 压缩器是贪心 + 4KB 哈希表（4 字节序列的乘法哈希），不追求最高压缩率，
+ *   但保证：最后 5 字节一定是字面量、最后一个匹配不早于结尾前 12 字节——
+ *   这两条是 LZ4 块格式对解码器的承诺，也写在 test 里。
+ * - 空输入也有输出：一个字节的 token（0x00），解码回来是 0 字节。
+ */
+#include <string.h>
+
+module std.encoding.lz4;
+import std.core.types;
+
+enum Lz4Limits {
+    LZ4_HASH_LOG = 10,
+    LZ4_HASH_SIZE = 1024,      /* 2^LZ4_HASH_LOG 个 int */
+    LZ4_MIN_MATCH = 4,         /* LZ4 的最短匹配 */
+    LZ4_MAX_OFFSET = 65535,    /* 偏移是 2 字节 */
+    LZ4_LAST_LITERALS = 5,     /* 结尾至少 5 个字节必须是字面量 */
+    LZ4_MFLIMIT = 12,          /* 最后一个匹配不能从结尾前 12 字节内开始 */
+};
+
+/* 压缩器的哈希表要多少个 int（调用方按这个开数组） */
+int lz4_table_size(void)
+{
+    return LZ4_HASH_SIZE;
+}
+
+/* 压缩输出的最坏长度（LZ4_COMPRESSBOUND 的同一个式子）；n < 0 给 -1 */
+int lz4_compress_bound(int n)
+{
+    i64 v = 0;
+
+    if (n < 0)
+        return -1;
+    v = (i64)n + (i64)n / 255 + 16;
+    if (v > (i64)I32_MAX)
+        return -1;
+    return (int)v;
+}
+
+static u32 lz4_read32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static int lz4_hash(u32 v)
+{
+    return (int)((v * 2654435761u) >> (32 - LZ4_HASH_LOG));
+}
+
+/* 写一个字节；放不下返回 0 */
+static int lz4_put(u8 *d, int *di, int cap, int b)
+{
+    if (*di >= cap)
+        return 0;
+    d[*di] = (u8)b;
+    (*di)++;
+    return 1;
+}
+
+/* 写扩展长度（255 一段，最后一段 < 255）；放不下返回 0 */
+static int lz4_putlen(u8 *d, int *di, int cap, int v)
+{
+    while (v >= 255) {
+        if (!lz4_put(d, di, cap, 255))
+            return 0;
+        v -= 255;
+    }
+    return lz4_put(d, di, cap, v);
+}
+
+/* 压缩：成功返回输出字节数；容量/参数不够返回 -1（不写半截）。
+ * table 必须是调用方给的 int[lz4_table_size()]。 */
+int lz4_compress(const void *src, int n, void *dst, int cap, int *table,
+                 int tn)
+{
+    const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)dst;
+    int di = 0, si = 0, anchor = 0, i = 0;
+    int mflimit = 0, matchlimit = 0;
+    int bound = 0;
+
+    if (n < 0 || cap < 0 || !dst || !table || tn < LZ4_HASH_SIZE)
+        return -1;
+    if (n > 0 && !src)
+        return -1;
+    bound = lz4_compress_bound(n);
+    if (bound < 0 || cap < bound)
+        return -1;
+    for (i = 0; i < LZ4_HASH_SIZE; i++)
+        table[i] = -1;
+    mflimit = n - LZ4_MFLIMIT;
+    matchlimit = n - LZ4_LAST_LITERALS;
+    while (si <= mflimit) {
+        u32 seq = lz4_read32(s + si);
+        int h = lz4_hash(seq);
+        int cand = table[h];
+        int len = 0, lit = 0, mlen = 0, tok = 0;
+
+        table[h] = si;
+        if (cand < 0 || si - cand > LZ4_MAX_OFFSET
+            || lz4_read32(s + cand) != seq) {
+            si++;
+            continue;
+        }
+        len = LZ4_MIN_MATCH;
+        while (si + len < matchlimit && s[cand + len] == s[si + len])
+            len++;
+        lit = si - anchor;
+        mlen = len - LZ4_MIN_MATCH;
+        tok = ((lit < 15 ? lit : 15) << 4) | (mlen < 15 ? mlen : 15);
+        if (!lz4_put(d, &di, cap, tok))
+            return -1;
+        if (lit >= 15 && !lz4_putlen(d, &di, cap, lit - 15))
+            return -1;
+        if (lit > 0) {
+            if (di + lit > cap)
+                return -1;
+            memcpy(d + di, s + anchor, (usize)lit);
+            di += lit;
+        }
+        if (!lz4_put(d, &di, cap, (si - cand) & 0xff)
+            || !lz4_put(d, &di, cap, ((si - cand) >> 8) & 0xff))
+            return -1;
+        if (mlen >= 15 && !lz4_putlen(d, &di, cap, mlen - 15))
+            return -1;
+        si += len;
+        anchor = si;
+    }
+    {
+        int lit = n - anchor;
+
+        if (!lz4_put(d, &di, cap, (lit < 15 ? lit : 15) << 4))
+            return -1;
+        if (lit >= 15 && !lz4_putlen(d, &di, cap, lit - 15))
+            return -1;
+        if (lit > 0) {
+            if (di + lit > cap)
+                return -1;
+            memcpy(d + di, s + anchor, (usize)lit);
+            di += lit;
+        }
+    }
+    return di;
+}
+
+/* 读扩展长度：返回 1 成功（*v 累加），0 = 截断 */
+static int lz4_getlen(const u8 *s, int n, int *si, int *v)
+{
+    int add = 0;
+
+    do {
+        if (*si >= n)
+            return 0;
+        add = s[*si];
+        (*si)++;
+        *v += add;
+    } while (add == 255);
+    return 1;
+}
+
+/* 解压：成功返回解出的字节数；坏数据/放不下返回 -1 */
+int lz4_decompress(const void *src, int n, void *dst, int cap)
+{
+    const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)dst;
+    int si = 0, di = 0;
+
+    if (n < 0 || cap < 0 || !dst)
+        return -1;
+    if (n > 0 && !src)
+        return -1;
+    while (si < n) {
+        int tok = s[si++];
+        int lit = tok >> 4;
+        int mlen = tok & 15;
+        int off = 0, k = 0;
+
+        if (lit == 15 && !lz4_getlen(s, n, &si, &lit))
+            return -1;
+        if (lit > n - si || lit > cap - di)
+            return -1;
+        for (k = 0; k < lit; k++)
+            d[di + k] = s[si + k];
+        si += lit;
+        di += lit;
+        if (si == n)
+            break;                       /* 最后一个序列只有字面量 */
+        if (si + 2 > n)
+            return -1;
+        off = s[si] | (s[si + 1] << 8);
+        si += 2;
+        if (off == 0 || off > di)
+            return -1;
+        if (mlen == 15 && !lz4_getlen(s, n, &si, &mlen))
+            return -1;
+        mlen += LZ4_MIN_MATCH;
+        if (mlen > cap - di)
+            return -1;
+        for (k = 0; k < mlen; k++)
+            d[di + k] = d[di - off + k];  /* 逐字节，允许重叠拷贝 */
+        di += mlen;
+    }
+    return di;
+}
+
+/* ---- 自测 ---- */
+
+test "空输入、短输入与往返" {
+    int table[LZ4_HASH_SIZE] = { 0 };
+    char src[64] = { 0 };
+    char packed[128] = { 0 };
+    char back[64] = { 0 };
+    int n = 0, m = 0, i = 0;
+
+    /* 空输入：一个 token 0x00，解回来 0 字节 */
+    n = lz4_compress("", 0, packed, (int)sizeof packed, table, LZ4_HASH_SIZE);
+    if (n != 1 || (u8)packed[0] != 0)
+        return err(1, "空输入的编码");
+    m = lz4_decompress(packed, n, back, (int)sizeof back);
+    if (m != 0)
+        return err(2, "空输入的解码");
+
+    for (i = 0; i < 40; i++) {
+        int j = 0;
+
+        for (j = 0; j < i; j++)
+            src[j] = (char)('A' + (j % 7));
+        n = lz4_compress(src, i, packed, (int)sizeof packed, table,
+                         LZ4_HASH_SIZE);
+        if (n < 0)
+            return err(3, "短输入压缩失败");
+        m = lz4_decompress(packed, n, back, (int)sizeof back);
+        if (m != i || memcmp(back, src, (usize)i) != 0)
+            return err(4, "短输入往返");
+    }
+}
+
+test "重复数据能压缩，随机数据能往返" {
+    int table[LZ4_HASH_SIZE] = { 0 };
+    char src[2048] = { 0 };
+    char packed[4096] = { 0 };
+    char back[2048] = { 0 };
+    int n = 0, m = 0, i = 0;
+    u32 seed = 12345u;
+
+    for (i = 0; i < (int)sizeof src; i++)
+        src[i] = 'a';
+    n = lz4_compress(src, (int)sizeof src, packed, (int)sizeof packed, table,
+                     LZ4_HASH_SIZE);
+    if (n < 0 || n > 40)
+        return err(5, "2048 个 a 应该压得很小");
+    m = lz4_decompress(packed, n, back, (int)sizeof back);
+    if (m != (int)sizeof src || memcmp(back, src, (usize)m) != 0)
+        return err(6, "重复数据的往返");
+
+    /* 伪随机（LCG）：几乎不可压，但必须逐字节往返 */
+    for (i = 0; i < (int)sizeof src; i++) {
+        seed = seed * 1103515245u + 12345u;
+        src[i] = (char)(seed >> 16);
+    }
+    n = lz4_compress(src, (int)sizeof src, packed, (int)sizeof packed, table,
+                     LZ4_HASH_SIZE);
+    if (n < (int)sizeof src)
+        return err(7, "随机数据不该变小");
+    m = lz4_decompress(packed, n, back, (int)sizeof back);
+    if (m != (int)sizeof src || memcmp(back, src, (usize)m) != 0)
+        return err(8, "随机数据的往返");
+
+    /* 全 256 种字节值都要能过 */
+    for (i = 0; i < (int)sizeof src; i++)
+        src[i] = (char)(i & 0xff);
+    n = lz4_compress(src, (int)sizeof src, packed, (int)sizeof packed, table,
+                     LZ4_HASH_SIZE);
+    m = lz4_decompress(packed, n, back, (int)sizeof back);
+    if (m != (int)sizeof src || memcmp(back, src, (usize)m) != 0)
+        return err(9, "256 种字节值的往返");
+}
+
+test "标准 LZ4 块向量" {
+    char out[64] = { 0 };
+    int m = 0;
+
+    /* {0x30,'a','b','c'}：3 个字面量 */
+    {
+        const u8 blk[4] = { 0x30, 'a', 'b', 'c' };
+
+        m = lz4_decompress(blk, 4, out, (int)sizeof out);
+        if (m != 3 || memcmp(out, "abc", 3) != 0)
+            return err(10, "3 个字面量");
+    }
+    /* {0x15,'a',0x01,0x00}：1 个字面量 + 偏移 1、长度 9 的匹配 */
+    {
+        const u8 blk[4] = { 0x15, 'a', 0x01, 0x00 };
+
+        m = lz4_decompress(blk, 4, out, (int)sizeof out);
+        if (m != 10)
+            return err(11, "匹配长度");
+        {
+            int i = 0;
+
+            for (i = 0; i < 10; i++)
+                if (out[i] != 'a')
+                    return err(12, "重叠匹配的内容");
+        }
+    }
+    /* 扩展字面量长度：token 0xF0 + 0x10（15+16=31 个字面量） */
+    {
+        u8 blk[64] = { 0 };
+
+        blk[0] = 0xf0;
+        blk[1] = 0x10;
+        m = 0;
+        {
+            int i = 0;
+
+            for (i = 0; i < 31; i++)
+                blk[2 + i] = (u8)('0' + i % 10);
+        }
+        m = lz4_decompress(blk, 33, out, (int)sizeof out);
+        if (m != 31)
+            return err(13, "扩展字面量长度");
+    }
+    /* 扩展匹配长度：'x' + 偏移 1、匹配 15+32+4 = 51 字节 */
+    {
+        u8 blk[16] = { 0 };
+
+        blk[0] = 0x1f;              /* 1 个字面量、匹配低半字节 15 */
+        blk[1] = 'x';
+        blk[2] = 0x01;
+        blk[3] = 0x00;
+        blk[4] = 0x20;              /* 15 + 32 + 4 = 51 */
+        m = lz4_decompress(blk, 5, out, (int)sizeof out);
+        if (m != 52 || out[0] != 'x' || out[51] != 'x')
+            return err(14, "扩展匹配长度");
+    }
+}
+
+test "坏数据与容量检查" {
+    int table[LZ4_HASH_SIZE] = { 0 };
+    int small[16] = { 0 };
+    char src[256] = { 0 };
+    char packed[512] = { 0 };
+    char out[16] = { 0 };
+    int n = 0, i = 0;
+
+    /* 偏移为 0 */
+    {
+        const u8 blk[4] = { 0x10, 'a', 0x00, 0x00 };
+
+        if (lz4_decompress(blk, 4, out, (int)sizeof out) != -1)
+            return err(15, "偏移 0 要拒绝");
+    }
+    /* 偏移越过已产出的数据 */
+    {
+        const u8 blk[5] = { 0x10, 'a', 0x05, 0x00, 0x00 };
+
+        if (lz4_decompress(blk, 5, out, (int)sizeof out) != -1)
+            return err(16, "越界偏移要拒绝");
+    }
+    /* 扩展长度字节被截断 */
+    {
+        const u8 blk[2] = { 0xf0, 0xff };
+
+        if (lz4_decompress(blk, 2, out, (int)sizeof out) != -1)
+            return err(17, "截断的扩展长度要拒绝");
+    }
+    /* 输出放不下 */
+    {
+        const u8 blk[4] = { 0x30, 'a', 'b', 'c' };
+
+        if (lz4_decompress(blk, 4, out, 2) != -1)
+            return err(18, "输出放不下要拒绝");
+    }
+    /* 只有偏移没有字面量：token 0x00 后面跟偏移 */
+    {
+        const u8 blk[3] = { 0x00, 0x01, 0x00 };
+
+        if (lz4_decompress(blk, 3, out, (int)sizeof out) != -1)
+            return err(19, "空匹配要拒绝");
+    }
+    /* 压缩：容量不够 / 表太小 / 空指针 */
+    for (i = 0; i < (int)sizeof src; i++)
+        src[i] = 'z';
+    if (lz4_compress(src, (int)sizeof src, packed, 8, table, LZ4_HASH_SIZE) != -1)
+        return err(20, "压缩容量不够要给 -1");
+    if (lz4_compress(src, (int)sizeof src, packed, (int)sizeof packed, small, 16) != -1)
+        return err(21, "哈希表太小要给 -1");
+    if (lz4_compress(src, (int)sizeof src, packed, (int)sizeof packed,
+                     (int *)0, LZ4_HASH_SIZE) != -1)
+        return err(22, "空哈希表要给 -1");
+    if (lz4_compress_bound(-1) != -1 || lz4_compress_bound(0) <= 0)
+        return err(23, "compress_bound 的边界");
+    /* 容量不够时一个字节都不写 */
+    for (i = 0; i < (int)sizeof packed; i++)
+        packed[i] = 'Z';
+    n = lz4_compress(src, (int)sizeof src, packed, 8, table, LZ4_HASH_SIZE);
+    if (n != -1 || packed[0] != 'Z')
+        return err(24, "容量不够时写了半截");
+}
+
+test "格式承诺：结尾 5 字节字面量、最后匹配不早于结尾前 12 字节" {
+    int table[LZ4_HASH_SIZE] = { 0 };
+    char src[300] = { 0 };
+    char packed[512] = { 0 };
+    char back[300] = { 0 };
+    int n = 0, m = 0, i = 0, si = 0, di = 0, last_lit = 0;
+
+    for (i = 0; i < (int)sizeof src; i++)
+        src[i] = (char)('a' + (i % 3));
+    n = lz4_compress(src, (int)sizeof src, packed, (int)sizeof packed, table,
+                     LZ4_HASH_SIZE);
+    if (n <= 0)
+        return err(25, "压缩失败");
+    m = lz4_decompress(packed, n, back, (int)sizeof back);
+    if (m != (int)sizeof src || memcmp(back, src, (usize)m) != 0)
+        return err(26, "往返失败");
+
+    /* 手工走一遍序列：每个匹配的起点都不能落在结尾前 12 字节内，
+       最后一个序列（只有字面量）至少 5 字节 */
+    while (si < n) {
+        int tok = (u8)packed[si++];
+        int lit = tok >> 4;
+        int mlen = tok & 15;
+        int off = 0;
+        int mstart = 0;
+
+        if (lit == 15) {
+            int add = 0;
+
+            do {
+                add = (u8)packed[si++];
+                lit += add;
+            } while (add == 255);
+        }
+        si += lit;
+        di += lit;
+        if (si == n) {
+            last_lit = lit;
+            break;
+        }
+        mstart = di;
+        off = (u8)packed[si] | ((u8)packed[si + 1] << 8);
+        si += 2;
+        if (mlen == 15) {
+            int add = 0;
+
+            do {
+                add = (u8)packed[si++];
+                mlen += add;
+            } while (add == 255);
+        }
+        mlen += 4;
+        if (off == 0 || off > di)
+            return err(27, "自己压出来的偏移不合法");
+        if (mstart > (int)sizeof src - LZ4_MFLIMIT)
+            return err(28, "匹配起点落在结尾前 12 字节内");
+        di += mlen;
+    }
+    if (di != (int)sizeof src)
+        return err(29, "序列走完的长度不对");
+    if ((int)sizeof src > LZ4_LAST_LITERALS && last_lit < LZ4_LAST_LITERALS)
+        return err(30, "结尾字面量不足 5 字节");
+}

@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num
+        std-more std-next std-node std-form std-embed std-text std-num std-pack
 
 all: build
 
@@ -299,6 +299,18 @@ std-num: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdnum $(STDNUM_SRCS)
 	./build/stdnum
 
+# 标准库第十四批（压缩与文本编码）：lz4 / rle / base85 / hexdump。
+# 四个模块都只依赖 std.core.types（lz4 的哈希表与所有输出缓冲都由调用方给）。
+# 示例把四块串成「遥测帧 LZ4 -> 采样差分 + RLE -> Ascii85/Z85 -> hexdump」。
+STDPACK_SRCS := examples/stdpack.c6 std/core/types.c6 \
+                std/encoding/lz4.c6 std/encoding/rle.c6 \
+                std/encoding/base85.c6 std/encoding/hexdump.c6
+
+std-pack: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdpack $(STDPACK_SRCS)
+	./build/stdpack
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -403,7 +415,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -412,13 +424,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的十四个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的十五个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num
-# 是十三批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack
+# 是十四批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -559,7 +571,7 @@ distclean:
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
-#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num）
+#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
@@ -576,6 +588,7 @@ distclean:
 #   std-embed        编译并运行 examples/stdembed.c6（第十一批，嵌入式基础）
 #   std-text         编译并运行 examples/stdtext.c6（第十二批，文本算法）
 #   std-num          编译并运行 examples/stdnum.c6（第十三批，数值类型）
+#   std-pack         编译并运行 examples/stdpack.c6（第十四批，压缩与文本编码）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

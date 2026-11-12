@@ -907,3 +907,23 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`make stdtest`（65 个模块、0 failure）、`make std-num`（21 条自检全过）、
 `make check-all`。
+
+### 11.26 标准库第十四批（lz4 / rle / base85 / hexdump）
+
+第十四批补的是**压缩与文本化**这一层：把二进制存下来、传出去。四个模块都只依赖
+`std.core.types`，不分配、不链 libc 的额外东西：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.lz4` | LZ4 块压缩/解压（`lz4_compress`/`lz4_decompress`/`lz4_compress_bound`/`lz4_table_size`） | 零分配：哈希表（1024 个 int）与输出缓冲都由调用方给；兼容标准 LZ4 块格式（手写标准向量 + 独立 Python 参考实现双向交叉验证）；遵守结尾 5 字节字面量/最后匹配不早于结尾前 12 字节；解码对偏移 0、越界偏移、截断的扩展长度全部拒绝 |
+| `std.encoding.rle` | PackBits 游程（`rle_encode`/`rle_decode`/`rle_bound`/`rle_encoded_len`/`rle_decoded_len`）与一阶差分（`delta_encode`/`delta_decode`） | 控制字节语义按 Apple/TIFF（0..127 字面量、129..255 重复、128 no-op、单段 ≤128）；差分模 256，和 RLE/LZ4 组合用；先量再写，坏数据/放不下返回 -1 |
+| `std.encoding.base85` | Ascii85（Adobe）与 Z85（ZeroMQ）：`a85_*` / `z85_*` 的 encode/decode/len/valid | 4→5 编码；Ascii85 有 `z` 简写、部分组 n+1 字符、跳过空白与 `~>` 终止；Z85 长度必须 4/5 的倍数、严格字母表；解码对溢出 32 位、非法字符、单字符余数都拒绝；与 Python `base64.a85encode` 做了随机交叉验证 |
+| `std.encoding.hexdump` | hexdump 文本生成与反向解析：`hex_opts`/`hexdump`/`hexdump_len`/`hexundump` | 固定布局（8 位偏移 + 分组空格 + ASCII 列），width 1..64、大小写、偏移基数可配；`hexundump` 只把「8 个十六进制数字 + 空白」当偏移（纯数据行不会被误吞），遇到 `\|` 跳过 ASCII 列 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.lz4`=0x6041、
+`std.encoding.rle`=0x6042、`std.encoding.base85`=0x6043、`std.encoding.hexdump`=0x6044；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-pack` 与 `STDPACK_SRCS`（四个模块
+都只依赖 types，stdtest 不需要额外依赖），`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（69 个模块、0 failure）、`make std-pack`（24 条自检全过）、
+`make check-all`。
