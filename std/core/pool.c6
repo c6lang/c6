@@ -15,7 +15,8 @@
  *
  * 约定：
  * - 块大小会向上对齐到 16 字节（32 位上 8 字节），`base` 也跟着对齐，
- *   所以每块都能放 `u64`/`f64`/指针；
+ *   所以每块都能放 `u64`/`f64`/指针；块起点只保证按 `align_of()` 对齐，
+ *   不保证是 `block_size()` 的整数倍（调用方要更大的对齐就自己对齐 `buf`）；
  * - 池**不拥有**内存，`buf` 必须比 Pool 活得久；`reset` 只是把空闲链表
  *   重新串一遍，不会清零块内容；
  * - `free` 会拒绝不在池里的指针（范围或对齐不对），但**不做重复释放检测**
@@ -184,9 +185,9 @@ test "块分配 / 释放 / 满与复用" {
         ptrs[i] = p.alloc();
         if (!ptrs[i] || !p.contains(ptrs[i]))
             return err(3, "alloc 给了空指针或池外指针");
-        if (((usize)ptrs[i] % (usize)p.block_size()) != 0
+        if (((usize)ptrs[i] % (usize)align_of()) != 0
             || ((usize)ptrs[i] % (usize)sizeof(void *)) != 0)
-            return err(4, "块没有按块大小对齐");
+            return err(4, "块没有按 max_align 对齐");
         if (i > 0 && ptrs[i] == ptrs[i - 1])
             return err(5, "两次 alloc 给了同一块");
     }

@@ -1496,8 +1496,9 @@ m = slip_decode_frame(wire, n, back, (int)sizeof back);
   四舍五入（.5 远离 0），溢出**饱和**；`div` 除数为 0、`sqrt` 负数都给 0。
   `sin`/`cos` 是 Taylor 到 x^9（先规约到 [-π/2, π/2]），误差 < 1e-5。Q15 的
   1.0 = 32767、-1.0 = -32768，`mul`/`add_sat`/`sub_sat` 饱和。
-* `pool`：块大小和基址向上对齐到 16 字节（32 位上 8 字节）；`free` 只做范围
-  和步长检查，**不检测重复释放**（那要 O(n) 扫链表）；坏参数得到容量 0 的池。
+* `pool`：块大小和基址向上对齐到 16 字节（32 位上 8 字节），但块起点不保证是
+  `block_size()` 的整数倍；`free` 只做范围和步长检查，**不检测重复释放**（那要
+  O(n) 扫链表）；坏参数得到容量 0 的池。
 * `frame`：`cobs_max_len(n)` 是上界、`cobs_encoded_len(src, n)` 是精确长度；
   COBS 的 0 只能当分隔符（解码时负载里出现 0 就报错）。SLIP 按 RFC 1055 转义
   `0xC0`/`0xDB`，`slip_decode_frame` 允许首尾各省略一个 END。两侧都是「先量
