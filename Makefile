@@ -47,7 +47,7 @@ HOSTCC   ?= gcc
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
-        stdtest errcheck std-demo std-tour std-kit std-box
+        stdtest errcheck std-demo std-tour std-kit std-box std-web
 
 all: build
 
@@ -128,6 +128,9 @@ stdtest: build
 	    std/csv.c6)  deps="std/str.c6" ;; \
 	    std/env.c6)  deps="std/str.c6 std/err.c6" ;; \
 	    std/sha256.c6) deps="std/bits.c6" ;; \
+	    std/url.c6)  deps="std/str.c6" ;; \
+	    std/mime.c6) deps="std/str.c6 std/path.c6" ;; \
+	    std/uuid.c6) deps="std/rand.c6 std/time.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -183,6 +186,18 @@ std-box: build
 	@mkdir -p build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdbox $(STDBOX_SRCS)
 	./build/stdbox
+
+# 标准库第五批：base64 / url / uuid / mime。
+# url 与 mime 只借 std.str 的 Str 与 std.path 的取扩展名；uuid 的 v4/v7 要
+# std.rand 的随机源、v7 还要 std.time 的墙钟；base64 自成一体。
+STD_WEB_SRCS := examples/stdweb.c6 std/types.c6 std/err.c6 std/str.c6 \
+                std/path.c6 std/base64.c6 std/url.c6 std/rand.c6 \
+                std/time.c6 std/uuid.c6 std/mime.c6
+
+std-web: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdweb $(STD_WEB_SRCS)
+	./build/stdweb
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
@@ -288,7 +303,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -297,12 +312,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box fs
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的五个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
-# 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下 29 个模块逐个跑
-# test 块，std-demo/tour/kit/box 是四批模块拼出来的集成示例。以后 test-all
-# 增删标准库目标，也不会悄悄改变 check-all 的语义。
+# 标准库的六个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web 是五批模块
+# 拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变 check-all
+# 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box
+           stdtest std-demo std-tour std-kit std-box std-web
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -443,7 +459,7 @@ distclean:
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
-#                    + 标准库的 stdtest/std-demo/std-tour/std-kit/std-box）
+#                    + 标准库的 stdtest/std-demo/tour/kit/box/web）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
@@ -451,6 +467,7 @@ distclean:
 #   std-tour         编译并运行 examples/stdtour.c6
 #   std-kit          编译并运行 examples/stdkit.c6（第三批）
 #   std-box          编译并运行 examples/stdbox.c6（第四批）
+#   std-web          编译并运行 examples/stdweb.c6（第五批）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

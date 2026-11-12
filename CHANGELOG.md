@@ -31,6 +31,12 @@
   `std.set` 六个模块，集成示例 `examples/stdkit.c6`（`make std-kit`）；顺手修掉
   `std/map` 扩容复活墓碑的 bug（`std/set` 的对应用例钉住）。错误号段
   `std.ascii`=0x6013 … `std.set`=0x6018。
+- **标准库第五批**：`std.base64` / `std.url` / `std.uuid` / `std.mime` 四个模块，
+  集成示例 `examples/stdweb.c6`（`make std-web`）。Base64 把「表」与「填充」变成显式
+  参数（标准表/URL 安全表不能混用）；URL 是 RFC 3986 §5.2 的完整相对解析（§5.4 的
+  23 条 normal + abnormal 用例钉死）；UUID 覆盖 v4（随机）/v5（SHA-1 名字派生，已知
+  向量与 Python `uuid5` 一致）/v7（48 位毫秒时间戳）；MIME 是扩展名表 + 分类 + 魔数
+  嗅探。错误号段 `std.base64`=0x601d … `std.mime`=0x6020。
 - **标准库第四批**：`std.json` / `std.sha256` / `std.csv` / `std.env` 四个模块，
   集成示例 `examples/stdbox.c6`（`make std-box`）。JSON 是 arena 上的 DOM（数字保留
   原文、严格 RFC 8259、代理对解码）；SHA-256/HMAC 的 FIPS 180-4 与 RFC 4231 向量

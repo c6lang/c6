@@ -54,10 +54,15 @@
 | `std/sha256.c6` | `std.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `sha256_init`/`sha256_update`/`sha256_final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
 | `std/csv.c6` | `std.csv` | RFC 4180 CSV（零分配）：`CsvReader` 的 `csv_reader`/`csv_next`/`csv_rewind`（引号字段可跨行、CRLF、`""` 转义）、`csv_need_quote`/`csv_write_field`/`csv_write_row`（写调用方缓冲）、`csv_count_fields`/`csv_count_rows` |
 | `std/env.c6` | `std.env` | 环境变量与命令行（POSIX）：`env_get`/`env_has`/`env_set`/`env_unset`、`env_home`/`env_tmpdir`/`env_path`/`env_user`、`env_get_int`/`env_get_u64`/`env_get_bool`、`env_args`/`env_argc`/`env_arg`/`env_prog` |
+| `std/base64.c6` | `std.base64` | Base64（RFC 4648）标准表与 URL 安全表：`b64_encode`/`b64_decode`、`b64url_encode`/`b64url_decode`、显式表与填充的 `b64_encode_ex`/`b64_decode_ex`/`b64_decoded_len`/`b64_encoded_len`、`b64_valid`、就地 `b64_decode_inplace`/`b64url_decode_inplace`（跳过空白、严格填充、放不下不写半截） |
+| `std/url.c6` | `std.url` | URL（RFC 3986）解析与相对解析：`Url` 的 `url_parse`/`url_effective_port`/`url_is_absolute`/`url_has_host`、`url_resolve`（§5.2 全算法）、查询参数 `url_next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
+| `std/uuid.c6` | `std.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`uuid_v4_seeded`、`uuid_v7`/`uuid_v7_at`/`uuid_time_v7`、`uuid_v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`/`uuid_format`/`uuid_format_simple`/`uuid_format_upper`、`uuid_version`/`uuid_variant`/`uuid_eq`/`uuid_nil`/`uuid_is_nil` |
+| `std/mime.c6` | `std.mime` | 扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：`mime_of_ext`/`mime_of_path`/`mime_ext_of`/`mime_ext_at`/`mime_type_at`/`mime_count`、`mime_is_text`/`is_image`/`is_audio`/`is_video`/`is_font`、`mime_charset`、`mime_sniff`、`mime_default` |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
 | `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带自检 |
 | `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`make std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带自检 |
 | `examples/stdbox.c6` | （无模块） | 第四批模块的拼装示例（`make std-box`）：json/sha256/csv/env 各一节，自带自检 |
+| `examples/stdweb.c6` | （无模块） | 第五批模块的拼装示例（`make std-web`）：base64/url/uuid/mime 各一节，自带自检 |
 
 每个 `std/*.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -66,6 +71,7 @@
 std/str.c6       22 test(s), 0 failure(s)
 std/sort.c6      30 test(s), 0 failure(s)
 std/ascii.c6      5 test(s), 0 failure(s)
+std/base64.c6     8 test(s), 0 failure(s)
 std/bits.c6       6 test(s), 0 failure(s)
 std/codec.c6      7 test(s), 0 failure(s)
 std/csv.c6       41 test(s), 0 failure(s)
@@ -80,6 +86,7 @@ std/json.c6      60 test(s), 0 failure(s)
 std/map.c6        9 test(s), 0 failure(s)
 std/math.c6       6 test(s), 0 failure(s)
 std/mem.c6        7 test(s), 0 failure(s)
+std/mime.c6      37 test(s), 0 failure(s)
 std/num.c6       11 test(s), 0 failure(s)
 std/path.c6      30 test(s), 0 failure(s)
 std/rand.c6       9 test(s), 0 failure(s)
@@ -90,7 +97,9 @@ std/span.c6       6 test(s), 0 failure(s)
 std/strbuf.c6    18 test(s), 0 failure(s)
 std/time.c6       7 test(s), 0 failure(s)
 std/types.c6      4 test(s), 0 failure(s)
+std/url.c6       32 test(s), 0 failure(s)
 std/utf8.c6       7 test(s), 0 failure(s)
+std/uuid.c6      24 test(s), 0 failure(s)
 std/vec.c6       42 test(s), 0 failure(s)
 ```
 
@@ -108,11 +117,15 @@ std/vec.c6       42 test(s), 0 failure(s)
 | `std/csv.c6` 41 | csv 19 + str 22（csv 只借 `Str` 类型，函数体不依赖 str 的代码） |
 | `std/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
+| `std/url.c6` 32 | url 10 + str 22（url 只借 `Str` 类型，正文不调用 str） |
+| `std/mime.c6` 37 | mime 7 + str 22 + path 8（取扩展名要 `std.path` 的正文） |
+| `std/uuid.c6` 24 | uuid 8 + rand 9 + time 7（v4/v7 要随机源，v7 要墙钟） |
 
 `std/bits`、`std/hash`、`std/utf8`、`std/deque`、`std/ascii`、`std/num`、
-`std/codec`、`std/rand`、`std/fs` 自成一体，单独跑就是自己的块数；
-`std/csv` 只有声明依赖 `std.str`（正文不调用），`std/sha256` 的正文必须带
-`std/bits`，`std/env` 的正文必须带 `std/str`。
+`std/codec`、`std/rand`、`std/fs`、`std/base64` 自成一体，单独跑就是自己的块数；
+`std/csv`、`std/url` 只有声明依赖 `std.str`（正文不调用），`std/mime` 的正文
+必须带 `std/path`，`std/sha256` 的正文必须带 `std/bits`，`std/env` 的正文必须带
+`std/str`，`std/uuid` 的正文必须带 `std/rand` 与 `std/time`。
 
 ## 设计原则
 
@@ -695,6 +708,134 @@ int main(int argc, char **argv)
 freestanding 目标用不了。数值解析是严格的十进制（可选正负号、忽略前后空白、
 溢出给默认值），布尔认 `1/true/yes/on` 与 `0/false/no/off`（大小写不敏感）。
 
+### `base64`：标准表与 URL 安全表
+
+```c
+import std.base64;
+
+char enc[64] = { 0 };
+char dec[64] = { 0 };
+
+b64_encode(S("foobar"), enc, sizeof enc);        /* 8，"Zm9vYmFy" */
+b64url_encode(S("\xfb\xff"), enc, sizeof enc);   /* 3，"-_8"（不带填充） */
+b64_decode(S("Zm9vYmFy"), dec, sizeof dec);      /* 6，"foobar" */
+b64url_decode(S("-_8"), dec, sizeof dec);        /* 2 */
+
+b64_encoded_len(6, 1);                           /* 8：先问长度再给缓冲 */
+b64_decoded_len(S("Zm9vYmFy"), 0, 1);            /* 6；非法输入给 -1 */
+```
+
+`std.codec` 里那份 Base64 是**宽容**口径（跳过空白、接受省略填充）。这一层是给
+协议实现用的，表和填充都是**显式参数**，因为 JWT/JWKS 与 HTTP 头的要求不一样：
+
+* `url` 参数：0 = 标准表（`+` `/`），1 = URL 安全表（`-` `_`）；两张表**互不混用**；
+* `pad` 参数：1 = 输出填充 / 要求填充，0 = 不输出 / 不要求。
+
+```c
+b64_encode_ex(S("f"), enc, sizeof enc, 0, 0);    /* 2，"Zg"——不带 `=` */
+b64_decode_ex(S("Zg"), dec, sizeof dec, 0, 0);   /* 1：pad = 0 时才接受省略 */
+b64_decode(S("Zg"), dec, sizeof dec);            /* -1：pad = 1 缺填充就报错 */
+b64url_decode(S("Zg=="), dec, sizeof dec);       /* -1：URL 变体下 `=` 是非法字符 */
+```
+
+**编码不写结尾 NUL**（和 `std.codec` 一致，长度就是返回值）；要当 C 字符串用就多给
+一格。`*_decode_inplace` 是例外：它在同一块内存上解码，**会补一个 NUL**（否则输入
+剩下的编码字符会留在结果尾巴上）。解码一律先完整校验再写第二遍，非法输入与「放
+不下」都不留半截结果。
+
+### `url`：RFC 3986 的分解、相对解析与百分号
+
+```c
+import std.url;
+
+Url u = url_parse(S("https://user:pw@example.com:8443/a/b?q=1&r=2#frag"));
+u.ok;  u.scheme;  u.userinfo;  u.host;  u.port;  u.path;  u.query;  u.fragment;
+url_effective_port(&u);            /* 8443；没写端口时按 scheme 给 80/443/21/23 */
+
+char out[256] = { 0 };
+url_resolve(S("http://a/b/c/d;p?q"), S("../g"), out, sizeof out);   /* "http://a/b/g" */
+
+Pair p = { { { (char *)0, 0 } }, { { (char *)0, 0 } } };
+int at = 0;
+while (url_next_pair(&u.query, &at, &p))
+    printf("%.*s = %.*s\n", p.key.s.len, p.key.s.data,
+           p.value.s.len, p.value.s.data);
+```
+
+`Url` 的每个字段都是**指向输入串的视图**（不分配），没出现的组件是 `{ 0, 0 }`。
+所以「空 query（`?`）」与「没有 query」在视图层面合并——不做 URL 规范化比较。
+
+* `url_parse` 按 §3 分解：scheme 必须字母开头且全由字母/数字/`+`-`.` 组成；
+  authority 里**最后一个** `@` 才是 userinfo 的边界；`[::1]` 里的冒号不算端口
+  分隔符；端口只认十进制且 ≤ 65535，非法时 `ok = 0` 但**保留原文**；
+* `url_resolve` 是 §5.2 的完整算法（`remove_dot_segments` 逐条照抄），RFC §5.4 的
+  23 条 normal + abnormal 用例全钉在自测里。结果先在栈上拼好，**最后一步才写
+  `dst`**，所以「放不下」返回 -1 时调用方缓冲一个字节都没动；
+* `url_encode` 保留 `/`（整条路径），`url_encode_component` 连 `/` 也编（单个参数）；
+  编码与 `url_decode` 都**不写结尾 NUL**；解码时**非法转义原样保留**（URL 里的 `%`
+  不总是转义），`+` 要不要当空格由 `url_decode_at(..., plus)` 显式指定；
+* `Url u = { 0 };` 这种全零初始化是支持的：「有没有显式端口」看 `port_str`，不看
+  `port >= 0`。
+
+### `uuid`：v4 / v5 / v7
+
+```c
+import std.uuid;
+
+Uuid a = uuid_v4();                            /* 随机 */
+Uuid b = uuid_v7();                            /* 时间排序：前 48 位是 Unix 毫秒 */
+Uuid ns = uuid_ns_dns();
+Uuid c = uuid_v5(&ns, S("www.example.com"));   /* 2ed6657d-e927-568b-95e1-2665a8aea6a2 */
+
+char buf[40] = { 0 };
+(&a)->format(buf, sizeof buf);                 /* 36 字符 + NUL */
+uuid_format_simple(&a, buf, sizeof buf);       /* 32 字符，不带连字符 */
+Uuid back = { { 0 } };
+uuid_parse(S("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), &back);   /* 1 */
+
+uuid_version(&c);      /* 5 */
+uuid_variant(&c);      /* 1 = RFC 4122 */
+uuid_time_v7(&b);      /* 版本 7 里那 48 位毫秒时间戳 */
+```
+
+`Uuid` 是 16 字节的**纯值**（`struct Uuid { u8 b[16]; }`），可放进别的结构体、按
+字节比较。三个生成器的取舍：
+
+| 生成器 | 随机源 | 用途 |
+| --- | --- | --- |
+| `uuid_v4` | 时钟 + 栈地址播种的 `std.rand` | 通用唯一标识；**不是密码学随机** |
+| `uuid_v7` | Unix 毫秒 + 随机位 | 数据库主键之类「想按时间聚簇」的场合（同毫秒内不保证严格单调） |
+| `uuid_v5` | 无（SHA-1 散列） | 同一命名空间 + 名字永远给同一个 UUID；SHA-1 只在文件内部实现，不链加密库 |
+
+要可重现的用例用 `uuid_v4_seeded(&r)` / `uuid_v7_at(ms, &r)`。`uuid_parse` 接受
+36 字符、32 字符、带 `urn:uuid:` 前缀与 `{}` 包装的形式，大小写不敏感；坏输入返回 0
+且**不动 `*out`**。
+
+### `mime`：扩展名 ↔ 类型、分类与魔数
+
+```c
+import std.mime;
+
+Str t = mime_of_path(S("site/index.HTML"));   /* "text/html"（大小写不敏感） */
+Str u = mime_of_ext(S(".png"));               /* "image/png"，带不带点都收 */
+Str d = mime_of_path(S("noext"));             /* "application/octet-stream" */
+Str e = mime_ext_of(S("image/jpeg"));         /* "jpg"（反向查表取第一个命中） */
+
+mime_is_text(t);        /* 1：text/*、JSON/XML/YAML/TOML 与 +xml/+json 后缀 */
+mime_is_image(t);       /* 1 */
+mime_charset(t);        /* "utf-8"；二进制类给空串 */
+
+Str s = mime_sniff(bytes);                    /* 按魔数给类型；认不出给空 */
+```
+
+查不到就给 `application/octet-stream`（HTTP 的 Content-Type 需要一个能用的值），
+不是空串。反向查表是**多对一**的（`jpg`/`jpeg` 都是 `image/jpeg`），所以
+`mime_ext_of` 给的是表里第一个命中的扩展名，别当「唯一规范扩展名」用。
+
+`mime_sniff` 只看**魔数**（PNG/JPEG/GIF/PDF/ZIP/gzip/xz/7z/bzip2/RIFF 的
+WEBP-WAVE-AVI/OGG/FLAC/ID3/MP4/wasm/ELF/BMP），不做全文启发式：认不出的
+（包括纯文本）返回空，要用扩展名兜底就自己接 `mime_of_path`。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -861,5 +1002,11 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
 * `make std-tour`：`examples/stdtour.c6`，新模块的拼装示例（自带自检）。
 * `make std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（自带自检）。
 * `make std-box`：`examples/stdbox.c6`，第四批模块的拼装示例（自带自检）。
+* `make std-web`：`examples/stdweb.c6`，第五批模块的拼装示例（自带自检）。
+* `std/url.c6` 的「RFC 3986 §5.4 的相对解析」：23 条 normal + abnormal 用例
+  （`../..//g`、`g;x=1/../y`、结尾 `/.` 与 `/..` 都在里面），钉住 `remove_dots`
+  的每个分支；另有「全零初始化的 `Url` 不该给出端口」的回归。
+* `std/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
+  （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，
   验证墓碑不会被搬进新表（写 `std/set` 时踩到的真实 bug）。
