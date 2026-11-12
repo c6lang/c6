@@ -47,6 +47,17 @@
 
 ### 标准库
 
+- **标准库第十五批（配置与文档格式）**：`std.data.toml` / `std.data.xml` /
+  `std.data.query` / `std.text.template` 四个模块，集成示例
+  `examples/stdconf.c6`（`make std-conf`）。toml 是事件式的 TOML 子集读取器
+  （表/表数组、注释、基本与字面量字符串、十进制/0x/0o/0b 整数、浮点、布尔、
+  跨行数组；语法错误给行号且能继续读）；xml 是零分配扫描器（START/END/SELF/TEXT、
+  按需解析属性、CDATA 当文本、跳过注释/PI/DOCTYPE、32 层标签配对校验、实体解码）；
+  query 是 form-urlencoded 的解析与构建（`+` 表空格、只按第一个 `=` 切、unreserved
+  编码）；template 是 `{{name}}` 模板（`{{{{` 转义、缺变量严格/宽松两种模式、
+  去重收集变量名）。错误号段 `std.data.toml`=0x6045 … `std.text.template`=0x6048
+  （`tcc/tccgen.c` 的 `c6_err_std_slots[]` 追加）。
+
 - **标准库第十四批（压缩与文本编码）**：`std.encoding.lz4` / `std.encoding.rle` /
   `std.encoding.base85` / `std.encoding.hexdump` 四个模块，集成示例
   `examples/stdpack.c6`（`make std-pack`）。lz4 是标准 LZ4 块格式的零分配实现

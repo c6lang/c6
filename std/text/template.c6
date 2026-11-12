@@ -1,0 +1,446 @@
+/* std/text/template：`{{name}}` 占位符的文本模板（零分配、写调用方缓冲）。
+ *
+ *     import std.text.template;
+ *
+ *     Var v[2] = { { S("name"), S("World") }, { S("n"), S("3") } };
+ *     Template t = tpl(S("Hello {{name}}, you have {{ n }} messages!"));
+ *     char out[128] = { 0 };
+ *     int n = t.render(v, 2, (char[:]){ out, (int)sizeof out });
+ *     // "Hello World, you have 3 messages!"
+ *
+ * 规则（有意做小，够生成配置/报告/邮件）：
+ *
+ * - `{{name}}`：两侧空白忽略（`{{ n }}` 等价于 `{{n}}`），名字按字节精确匹配
+ *   变量表里的名字。
+ * - `{{{{` 输出两个字面量大括号 `{{`；单独出现的 `}}` 原样输出（不需要转义）。
+ * - **找不到变量**：`render` 返回 -1（严格）；`render_opt(vars, n, out, 0)` 用空串
+ *   代替（宽松）。`render_len` 与 `render` 用同一套扫描，长度精确。
+ * - `{{` 没有配对的 `}}`、或名字为空（`{{}}`/`{{ }}`）都返回 -1。
+ * - 变量值里的内容**不再展开**（没有递归/嵌套），也不做 HTML 转义（要转义就在
+ *   值里自己转）。
+ * - `t.vars(out, cap)` 收集模板里出现过的名字（去重、按出现顺序），返回总数；
+ *   结果超过 cap 时只写前 cap 个，但返回值仍是总数（`cap = 0` 可用来量个数）。
+ * - 放不下返回 -1 且一个字节都不写（先量再写）。
+ */
+#include <string.h>
+
+module std.text.template;
+import std.core.types;
+import std.text.str;
+
+struct Template {
+    Str text;
+};
+
+struct Var {
+    Str name;
+    Str value;
+};
+
+Template tpl(Str text)
+{
+    Template t = { { { (char *)0, 0 } } };
+
+    t.text = text;
+    return t;
+}
+
+static int tt_put(char[:] out, int *di, Str s)
+{
+    if (out.data && *di + s.s.len > out.len)
+        return 0;
+    if (out.data && s.s.len > 0)
+        memcpy(out.data + *di, s.s.data, (usize)s.s.len);
+    *di += s.s.len;
+    return 1;
+}
+
+static int tt_find(Var *vars, int n, Str name, Str *val)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        if (vars[i].name.s.len == name.s.len
+            && (name.s.len == 0
+                || memcmp(vars[i].name.s.data, name.s.data, (usize)name.s.len)
+                       == 0)) {
+            *val = vars[i].value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 核心扫描：out.data 为 0 时只数长度；返回 1 成功、-1 语法错误或缺变量 */
+static int tt_core(Template *self, Var *vars, int n, char[:] out, int *need,
+                   int strict)
+{
+    int i = 0, di = 0;
+    int len = self->text.s.len;
+
+    while (i < len) {
+        int c = (u8)self->text.s.data[i];
+
+        if (c == '{' && i + 1 < len && self->text.s.data[i + 1] == '{') {
+            if (i + 3 < len && self->text.s.data[i + 2] == '{'
+                && self->text.s.data[i + 3] == '{') {
+                Str lit = { { (char *)"{{", 2 } };
+
+                if (!tt_put(out, &di, lit))
+                    return -1;
+                i += 4;
+                continue;
+            }
+            {
+                int j = i + 2, end = -1;
+                Str raw = { { (char *)0, 0 } };
+                Str nm = { { (char *)0, 0 } };
+                Str val = { { (char *)0, 0 } };
+
+                while (j + 1 < len) {
+                    if (self->text.s.data[j] == '}'
+                        && self->text.s.data[j + 1] == '}') {
+                        end = j;
+                        break;
+                    }
+                    j++;
+                }
+                if (end < 0)
+                    return -1;
+                {
+                    Str r = { { self->text.s.data + i + 2, end - (i + 2) } };
+
+                    raw = r;
+                }
+                nm = raw.trim();
+                if (nm.s.len == 0)
+                    return -1;
+                if (!tt_find(vars, n, nm, &val)) {
+                    Str empty = { { (char *)0, 0 } };
+
+                    if (strict)
+                        return -1;
+                    val = empty;
+                }
+                if (!tt_put(out, &di, val))
+                    return -1;
+                i = end + 2;
+                continue;
+            }
+        }
+        {
+            Str one = { { self->text.s.data + i, 1 } };
+
+            if (!tt_put(out, &di, one))
+                return -1;
+            i++;
+        }
+    }
+    *need = di;
+    return 1;
+}
+
+/* 渲染后长度；缺变量/语法错误返回 -1 */
+int render_len(Template *self, Var *vars, int n)
+{
+    int need = 0;
+    char[:] none = { (char *)0, 0 };
+
+    if (tt_core(self, vars, n, none, &need, 1) != 1)
+        return -1;
+    return need;
+}
+
+/* 严格渲染：缺变量返回 -1 */
+int render(Template *self, Var *vars, int n, char[:] out)
+{
+    int need = 0;
+    int rc = 0;
+
+    rc = tt_core(self, vars, n, (char[:]){ (char *)0, 0 }, &need, 1);
+    if (rc != 1)
+        return -1;
+    if (need > out.len)
+        return -1;
+    rc = tt_core(self, vars, n, out, &need, 1);
+    if (rc != 1)
+        return -1;
+    return need;
+}
+
+/* 宽松渲染：缺变量用空串代替（strict = 0） */
+int render_opt(Template *self, Var *vars, int n, char[:] out, int strict)
+{
+    int need = 0;
+    int rc = 0;
+
+    rc = tt_core(self, vars, n, (char[:]){ (char *)0, 0 }, &need, strict);
+    if (rc != 1)
+        return -1;
+    if (need > out.len)
+        return -1;
+    rc = tt_core(self, vars, n, out, &need, strict);
+    if (rc != 1)
+        return -1;
+    return need;
+}
+
+/* 两个名字是否相同（按字节） */
+static int tt_same(Str a, Str b)
+{
+    return a.s.len == b.s.len
+           && (a.s.len == 0
+               || memcmp(a.s.data, b.s.data, (usize)a.s.len) == 0);
+}
+
+/* 在模板的前 upto 个字节里找同名占位符（不依赖任何存储，O(n^2) 但模板都很短） */
+static int tt_seen_before(Template *self, int upto, Str nm)
+{
+    int i = 0;
+
+    while (i + 1 < upto) {
+        int c = (u8)self->text.s.data[i];
+
+        if (c == '{' && self->text.s.data[i + 1] == '{') {
+            int j = 0, end = -1;
+
+            if (i + 3 < upto && self->text.s.data[i + 2] == '{'
+                && self->text.s.data[i + 3] == '{') {
+                i += 4;
+                continue;
+            }
+            j = i + 2;
+            while (j + 1 < upto) {
+                if (self->text.s.data[j] == '}'
+                    && self->text.s.data[j + 1] == '}') {
+                    end = j;
+                    break;
+                }
+                j++;
+            }
+            if (end < 0)
+                return 0;
+            {
+                Str raw = { { self->text.s.data + i + 2, end - (i + 2) } };
+                Str other = raw.trim();
+
+                if (tt_same(other, nm))
+                    return 1;
+            }
+            i = end + 2;
+            continue;
+        }
+        i++;
+    }
+    return 0;
+}
+
+/* 收集占位符名字（去重、按出现顺序）；返回总数，写最多 cap 个 */
+int vars(Template *self, Var *out, int cap)
+{
+    int i = 0, len = self->text.s.len, total = 0;
+
+    while (i < len) {
+        int c = (u8)self->text.s.data[i];
+
+        if (c == '{' && i + 1 < len && self->text.s.data[i + 1] == '{') {
+            int j = i + 2, end = -1;
+
+            if (i + 3 < len && self->text.s.data[i + 2] == '{'
+                && self->text.s.data[i + 3] == '{') {
+                i += 4;
+                continue;
+            }
+            while (j + 1 < len) {
+                if (self->text.s.data[j] == '}'
+                    && self->text.s.data[j + 1] == '}') {
+                    end = j;
+                    break;
+                }
+                j++;
+            }
+            if (end < 0)
+                break;
+            {
+                Str raw = { { self->text.s.data + i + 2, end - (i + 2) } };
+                Str nm = raw.trim();
+
+                if (!tt_seen_before(self, i, nm)) {
+                    if (out && total < cap) {
+                        Str empty = { { (char *)0, 0 } };
+
+                        out[total].name = nm;
+                        out[total].value = empty;
+                    }
+                    total++;
+                }
+            }
+            i = end + 2;
+            continue;
+        }
+        i++;
+    }
+    return total;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static Str tt_str(char[:] s)
+{
+    Str r = { { (char *)0, 0 } };
+
+    r.s = s;
+    return r;
+}
+
+static int tt_render_is(const char *tpl_text, Var *vars, int n, const char *want)
+{
+    char buf[256] = { 0 };
+    Str t = { { (char *)tpl_text, (int)strlen(tpl_text) } };
+    Template tplx = tpl(t);
+    int k = render(&tplx, vars, n, (char[:]){ buf, (int)sizeof buf - 1 });
+
+    if (k < 0)
+        return 0;
+    buf[k] = 0;
+    return strcmp(buf, want) == 0 && k == render_len(&tplx, vars, n);
+}
+
+test "基本替换" {
+    Var v[2] = { { { S("name") }, { S("World") } }, { { S("n") }, { S("3") } } };
+
+    if (!tt_render_is("Hello {{name}}!", v, 2, "Hello World!"))
+        return err(1, "单个占位符");
+    if (!tt_render_is("Hello {{ name }}!", v, 2, "Hello World!"))
+        return err(2, "名字两侧空白");
+    if (!tt_render_is("{{name}} + {{name}}", v, 2, "World + World"))
+        return err(3, "重复占位符");
+    if (!tt_render_is("no placeholders", v, 2, "no placeholders"))
+        return err(4, "没有占位符");
+    if (!tt_render_is("", v, 2, ""))
+        return err(5, "空模板");
+    if (!tt_render_is("{{n}} messages for {{name}}", v, 2,
+                      "3 messages for World"))
+        return err(6, "两个变量");
+    /* 值里的内容不再展开 */
+    {
+        Var inner[1] = { { { S("x") }, { S("{{name}}") } } };
+
+        if (!tt_render_is("{{x}}", inner, 1, "{{name}}"))
+            return err(7, "值不递归展开");
+    }
+}
+
+test "字面量大括号与错误" {
+    Var v[1] = { { { S("a") }, { S("1") } } };
+    char buf[64] = { 0 };
+    Str t = { S("{{{{a}}") };
+    Template tp = tpl(t);
+    int n = 0;
+
+    /* {{{{ -> 字面量 {{，后面 a}} 是普通文本 */
+    n = render(&tp, v, 1, (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    if (n != 5 || strcmp(buf, "{{a}}") != 0)
+        return err(8, "字面量 {{");
+    /* 单独的 }} 原样 */
+    {
+        Str t2 = { S("a }} b") };
+        Template tp2 = tpl(t2);
+
+        n = render(&tp2, (Var *)0, 0, (char[:]){ buf, (int)sizeof buf - 1 });
+        buf[n > 0 ? n : 0] = 0;
+        if (n != 6 || strcmp(buf, "a }} b") != 0)
+            return err(9, "单独的 }}");
+    }
+    /* 缺变量：严格失败，宽松给空串 */
+    {
+        Str t3 = { S("x{{missing}}y") };
+        Template tp3 = tpl(t3);
+
+        if (render(&tp3, v, 1, (char[:]){ buf, (int)sizeof buf }) != -1)
+            return err(10, "严格模式缺变量");
+        if (render_len(&tp3, v, 1) != -1)
+            return err(11, "严格模式缺变量（长度）");
+        n = render_opt(&tp3, v, 1, (char[:]){ buf, (int)sizeof buf - 1 }, 0);
+        buf[n > 0 ? n : 0] = 0;
+        if (n != 2 || strcmp(buf, "xy") != 0)
+            return err(12, "宽松模式缺变量");
+    }
+    /* 未闭合、空名字 */
+    {
+        Str t4 = { S("{{unclosed") };
+        Template tp4 = tpl(t4);
+
+        if (render(&tp4, v, 1, (char[:]){ buf, (int)sizeof buf }) != -1)
+            return err(13, "未闭合");
+    }
+    {
+        Str t5 = { S("{{}}") };
+        Template tp5 = tpl(t5);
+
+        if (render(&tp5, v, 1, (char[:]){ buf, (int)sizeof buf }) != -1)
+            return err(14, "空名字");
+    }
+    {
+        Str t6 = { S("{{   }}") };
+        Template tp6 = tpl(t6);
+
+        if (render(&tp6, v, 1, (char[:]){ buf, (int)sizeof buf }) != -1)
+            return err(15, "只有空白的名字");
+    }
+    /* 放不下：不写半截 */
+    {
+        char small[4] = { 0 };
+        Str t7 = { S("hello") };
+        Template tp7 = tpl(t7);
+        int i = 0;
+
+        for (i = 0; i < 4; i++)
+            small[i] = 'Z';
+        if (render(&tp7, (Var *)0, 0, (char[:]){ small, 4 }) != -1)
+            return err(16, "放不下给 -1");
+        for (i = 0; i < 4; i++)
+            if (small[i] != 'Z')
+                return err(17, "放不下时写了半截");
+    }
+}
+
+test "收集占位符名字" {
+    Str t = { S("{{a}} {{ b }} {{a}} {{c}}") };
+    Template tp = tpl(t);
+    Var got[8] = { 0 };
+    int n = 0;
+
+    n = vars(&tp, got, 8);
+    if (n != 3)
+        return err(18, "去重后的个数");
+    if (!(got[0].name.s.len == 1 && got[0].name.s.data[0] == 'a'))
+        return err(19, "第一个名字");
+    if (!(got[1].name.s.len == 1 && got[1].name.s.data[0] == 'b'))
+        return err(20, "第二个名字");
+    if (!(got[2].name.s.len == 1 && got[2].name.s.data[0] == 'c'))
+        return err(21, "第三个名字");
+    /* cap 不够：只写前 cap 个，但返回总数 */
+    {
+        Var two[2] = { 0 };
+
+        if (vars(&tp, two, 2) != 3)
+            return err(22, "cap 不够时的总数");
+        if (!(two[1].name.s.len == 1 && two[1].name.s.data[0] == 'b'))
+            return err(23, "cap 不够时的内容");
+    }
+    /* 量个数：cap = 0 */
+    if (vars(&tp, (Var *)0, 0) != 3)
+        return err(24, "cap=0 只量个数");
+    /* 没有占位符 */
+    {
+        Str t2 = { S("plain") };
+        Template tp2 = tpl(t2);
+
+        if (vars(&tp2, got, 8) != 0)
+            return err(25, "没有占位符");
+    }
+}

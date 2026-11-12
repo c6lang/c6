@@ -12763,6 +12763,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.rle",       C6_ERR_SLOT_STD + 66 },
     { "std.encoding.base85",    C6_ERR_SLOT_STD + 67 },
     { "std.encoding.hexdump",   C6_ERR_SLOT_STD + 68 },
+    { "std.data.toml",          C6_ERR_SLOT_STD + 69 },
+    { "std.data.xml",           C6_ERR_SLOT_STD + 70 },
+    { "std.data.query",         C6_ERR_SLOT_STD + 71 },
+    { "std.text.template",      C6_ERR_SLOT_STD + 72 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

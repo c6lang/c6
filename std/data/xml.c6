@@ -1,0 +1,713 @@
+/* std/data/xml：XML 的零分配扫描器（事件式，不做 DOM）。
+ *
+ *     import std.data.xml;
+ *
+ *     XmlReader r = xml_open(S("<doc><a x=\"1\">hi</a><b/></doc>"));
+ *     XmlEvent e = { 0 };
+ *     while (r.next(&e) == 1) {
+ *         if (e.kind == XML_START) { ... e.name ... }
+ *     }
+ *
+ * 事件只有三种：开始标签（`XML_START`）、自闭合标签（`XML_SELF`）、结束标签
+ * （`XML_END`）和文本（`XML_TEXT`）。注释、处理指令（`<?xml ...?>`）、DOCTYPE
+ * 被跳过；CDATA 当作文本吐出来。所有字段都是输入上的 `Str` 视图，输入必须活得
+ * 比 reader 久。
+ *
+ * 支持与不支持：
+ *
+ * - 元素名按「字母/数字/`.`/`-`/`_`/`:` 之外都算结束」扫（不做完整的 XML Name
+ *   校验）；属性值保留两侧引号内的原文（`&amp;` 之类**不在这里解**，要解用
+ *   `xml_unescape`）。
+ * - **做**标签配对校验：reader 里有一个 32 层的名字栈，`</a>` 必须和最近的开始
+ *   标签同名，否则 `next` 返回 -1；读完还有没闭合的元素也返回 -1。
+ * - **不做**：命名空间解析、DTD/实体定义（只认 5 个预定义实体和数字字符引用）、
+ *   编码转换（输入按 UTF-8 字节处理）、属性值的规范化。
+ * - 文本事件**原样**给出（含空白与换行）；要不要 trim 由调用方决定。
+ *
+ * 出错时 `next` 返回 -1，`r.err` 记下出错位置的字节偏移 + 1（0 表示没出错）。
+ * 错误之后的位置没有定义，通常直接放弃这个文档。
+ */
+#include <string.h>
+
+module std.data.xml;
+import std.core.types;
+import std.text.str;
+
+enum XmlKind {
+    XML_START = 0,           /* <name ...> */
+    XML_END = 1,             /* </name> */
+    XML_TEXT = 2,            /* 文本（含 CDATA 内容） */
+    XML_SELF = 3,            /* <name ... /> */
+};
+
+enum XmlLimits {
+    XML_MAX_DEPTH = 32,
+};
+
+struct XmlAttr {
+    Str name;
+    Str value;               /* 引号里的原文（不含引号） */
+    int quote;               /* '"' 或 '\'' */
+};
+
+struct XmlEvent {
+    int kind;
+    int pos;                 /* 事件在输入里的起始字节 */
+    Str name;                /* START/END/SELF 的元素名 */
+    Str text;                /* TEXT 的内容 */
+    Str attrs;               /* START/SELF 的属性区原文（名字之后到 '>' 之前） */
+};
+
+struct XmlReader {
+    Str text;
+    int pos;
+    int err;                 /* 0 或出错位置 + 1 */
+    int depth;
+    Str stack[XML_MAX_DEPTH];
+};
+
+XmlReader xml_open(Str text)
+{
+    XmlReader r = { { { (char *)0, 0 } }, 0, 0, 0, { { { (char *)0, 0 } } } };
+
+    r.text = text;
+    return r;
+}
+
+static int x_at(XmlReader *r, int i)
+{
+    return (i >= 0 && i < r->text.s.len) ? (u8)r->text.s.data[i] : 0;
+}
+
+static int x_fail(XmlReader *r, int at)
+{
+    r->err = at + 1;
+    return -1;
+}
+
+static int x_is_name(int c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+           || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'
+           || c == ':' || c >= 0x80;
+}
+
+static int x_is_ws(int c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+/* 从 pos 起找一个字面量 needle，返回起点（找不到 -1） */
+static int x_find(XmlReader *r, int from, const char *needle, int n)
+{
+    int i = from;
+
+    while (i + n <= r->text.s.len) {
+        if (memcmp(r->text.s.data + i, needle, (usize)n) == 0)
+            return i;
+        i++;
+    }
+    return -1;
+}
+
+/* 读一个名字：[pos, 返回位置)，至少一个字符 */
+static int x_name(XmlReader *r, int *start, int *end)
+{
+    int s = r->pos;
+
+    while (r->pos < r->text.s.len && x_is_name(x_at(r, r->pos)))
+        r->pos++;
+    if (r->pos == s)
+        return 0;
+    *start = s;
+    *end = r->pos;
+    return 1;
+}
+
+/* 下一条事件：1 = 有，0 = 结束，-1 = 格式错误（r->err 给位置 + 1） */
+int next(XmlReader *r, XmlEvent *e)
+{
+    if (!e)
+        return 0;
+    memset(e, 0, sizeof *e);
+    for (;;) {
+        int start = 0, end = 0;
+
+        if (r->pos >= r->text.s.len) {
+            if (r->depth != 0)
+                return x_fail(r, r->text.s.len - 1);
+            return 0;
+        }
+        e->pos = r->pos;
+        if (x_at(r, r->pos) != '<') {
+            start = r->pos;
+            while (r->pos < r->text.s.len && x_at(r, r->pos) != '<')
+                r->pos++;
+            {
+                Str t = { { r->text.s.data + start, r->pos - start } };
+
+                e->kind = XML_TEXT;
+                e->text = t;
+            }
+            return 1;
+        }
+        /* '<' 开头 */
+        if (r->pos + 1 >= r->text.s.len)
+            return x_fail(r, r->pos);
+        if (x_at(r, r->pos + 1) == '!') {
+            if (r->pos + 4 <= r->text.s.len
+                && memcmp(r->text.s.data + r->pos, "<!--", 4) == 0) {
+                int k = x_find(r, r->pos + 4, "-->", 3);
+
+                if (k < 0)
+                    return x_fail(r, r->pos);
+                r->pos = k + 3;
+                continue;
+            }
+            if (r->pos + 9 <= r->text.s.len
+                && memcmp(r->text.s.data + r->pos, "<![CDATA[", 9) == 0) {
+                int k = x_find(r, r->pos + 9, "]]>", 3);
+
+                if (k < 0)
+                    return x_fail(r, r->pos);
+                {
+                    Str t = { { r->text.s.data + r->pos + 9, k - (r->pos + 9) } };
+
+                    e->kind = XML_TEXT;
+                    e->text = t;
+                }
+                r->pos = k + 3;
+                return 1;
+            }
+            /* DOCTYPE 之类：跳到下一个 '>' */
+            while (r->pos < r->text.s.len && x_at(r, r->pos) != '>')
+                r->pos++;
+            if (r->pos < r->text.s.len)
+                r->pos++;
+            continue;
+        }
+        if (x_at(r, r->pos + 1) == '?') {
+            int k = x_find(r, r->pos + 2, "?>", 2);
+
+            if (k < 0)
+                return x_fail(r, r->pos);
+            r->pos = k + 2;
+            continue;
+        }
+        if (x_at(r, r->pos + 1) == '/') {
+            /* 结束标签 */
+            r->pos += 2;
+            if (!x_name(r, &start, &end))
+                return x_fail(r, r->pos);
+            while (x_is_ws(x_at(r, r->pos)))
+                r->pos++;
+            if (x_at(r, r->pos) != '>')
+                return x_fail(r, r->pos);
+            r->pos++;
+            {
+                Str nm = { { r->text.s.data + start, end - start } };
+
+                if (r->depth == 0)
+                    return x_fail(r, start);
+                if (r->stack[r->depth - 1].s.len != nm.s.len
+                    || memcmp(r->stack[r->depth - 1].s.data, nm.s.data,
+                              (usize)nm.s.len) != 0)
+                    return x_fail(r, start);
+                r->depth--;
+                e->kind = XML_END;
+                e->name = nm;
+            }
+            return 1;
+        }
+        /* 开始标签 */
+        r->pos++;
+        if (!x_name(r, &start, &end))
+            return x_fail(r, r->pos);
+        {
+            Str nm = { { r->text.s.data + start, end - start } };
+            int attrs_start = r->pos;
+            int self_close = 0;
+
+            /* 属性区：扫到 '>'（引号里的 '>' 不算） */
+            while (r->pos < r->text.s.len) {
+                int c = x_at(r, r->pos);
+
+                if (c == '"' || c == '\'') {
+                    int q = c;
+
+                    r->pos++;
+                    while (r->pos < r->text.s.len && x_at(r, r->pos) != q)
+                        r->pos++;
+                    if (r->pos >= r->text.s.len)
+                        return x_fail(r, attrs_start);
+                    r->pos++;
+                    continue;
+                }
+                if (c == '/') {
+                    self_close = 1;
+                    r->pos++;
+                    continue;
+                }
+                if (c == '>')
+                    break;
+                r->pos++;
+            }
+            if (r->pos >= r->text.s.len)
+                return x_fail(r, attrs_start);
+            {
+                int aend = r->pos;
+
+                if (self_close && aend > attrs_start && x_at(r, aend - 1) == '/')
+                    aend--;
+                {
+                    Str at = { { r->text.s.data + attrs_start, aend - attrs_start } };
+
+                    e->attrs = at;
+                }
+            }
+            r->pos++;                    /* '>' */
+            e->name = nm;
+            if (self_close) {
+                e->kind = XML_SELF;
+                return 1;
+            }
+            if (r->depth >= XML_MAX_DEPTH)
+                return x_fail(r, start);
+            r->stack[r->depth++] = nm;
+            e->kind = XML_START;
+            return 1;
+        }
+    }
+}
+
+/* ---- 属性 ---- */
+
+/* 属性区里第 idx 个属性；成功返回 1 */
+int attr_at(XmlEvent *self, int idx, XmlAttr *out)
+{
+    int i = 0, n = 0;
+
+    if (!out || idx < 0)
+        return 0;
+    while (i < self->attrs.s.len) {
+        int ns = 0, ne = 0, q = 0, vs = 0, ve = 0;
+
+        while (i < self->attrs.s.len && x_is_ws((u8)self->attrs.s.data[i]))
+            i++;
+        if (i >= self->attrs.s.len)
+            return 0;
+        ns = i;
+        while (i < self->attrs.s.len && x_is_name((u8)self->attrs.s.data[i]))
+            i++;
+        ne = i;
+        if (ne == ns)
+            return 0;
+        while (i < self->attrs.s.len && x_is_ws((u8)self->attrs.s.data[i]))
+            i++;
+        if (i >= self->attrs.s.len || self->attrs.s.data[i] != '=')
+            return 0;
+        i++;
+        while (i < self->attrs.s.len && x_is_ws((u8)self->attrs.s.data[i]))
+            i++;
+        if (i >= self->attrs.s.len
+            || (self->attrs.s.data[i] != '"' && self->attrs.s.data[i] != '\''))
+            return 0;
+        q = (u8)self->attrs.s.data[i++];
+        vs = i;
+        while (i < self->attrs.s.len && (u8)self->attrs.s.data[i] != q)
+            i++;
+        if (i >= self->attrs.s.len)
+            return 0;
+        ve = i;
+        i++;
+        if (n == idx) {
+            Str nm = { { self->attrs.s.data + ns, ne - ns } };
+            Str vl = { { self->attrs.s.data + vs, ve - vs } };
+
+            out->name = nm;
+            out->value = vl;
+            out->quote = q;
+            return 1;
+        }
+        n++;
+    }
+    return 0;
+}
+
+/* 属性个数 */
+int attr_count(XmlEvent *self)
+{
+    int i = 0, n = 0;
+
+    {
+        XmlAttr a = { 0 };
+
+        while (attr_at(self, i, &a)) {
+            n++;
+            i++;
+        }
+    }
+    return n;
+}
+
+/* 按名字找属性（名字按字节比较）；找到返回 1 并填 *value */
+int attr(XmlEvent *self, Str name, Str *value)
+{
+    int i = 0;
+
+    {
+        XmlAttr a = { 0 };
+
+        while (attr_at(self, i, &a)) {
+            if (a.name.s.len == name.s.len
+                && memcmp(a.name.s.data, name.s.data, (usize)name.s.len) == 0) {
+                if (value)
+                    *value = a.value;
+                return 1;
+            }
+            i++;
+        }
+    }
+    return 0;
+}
+
+/* ---- 实体与字符引用 ---- */
+
+static int x_hex(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int x_put_utf8(u32 cp, char[:] out, int *di)
+{
+    if (cp > 0x10ffffu || (cp >= 0xd800u && cp <= 0xdfffu))
+        return 0;
+    if (cp < 0x80u) {
+        if (*di + 1 > out.len)
+            return 0;
+        out.data[(*di)++] = (char)cp;
+    } else if (cp < 0x800u) {
+        if (*di + 2 > out.len)
+            return 0;
+        out.data[(*di)++] = (char)(0xc0u | (cp >> 6));
+        out.data[(*di)++] = (char)(0x80u | (cp & 0x3fu));
+    } else if (cp < 0x10000u) {
+        if (*di + 3 > out.len)
+            return 0;
+        out.data[(*di)++] = (char)(0xe0u | (cp >> 12));
+        out.data[(*di)++] = (char)(0x80u | ((cp >> 6) & 0x3fu));
+        out.data[(*di)++] = (char)(0x80u | (cp & 0x3fu));
+    } else {
+        if (*di + 4 > out.len)
+            return 0;
+        out.data[(*di)++] = (char)(0xf0u | (cp >> 18));
+        out.data[(*di)++] = (char)(0x80u | ((cp >> 12) & 0x3fu));
+        out.data[(*di)++] = (char)(0x80u | ((cp >> 6) & 0x3fu));
+        out.data[(*di)++] = (char)(0x80u | (cp & 0x3fu));
+    }
+    return 1;
+}
+
+/* 解开 5 个预定义实体与 &#NNN;/&#xHH;；其它 & 原样保留；返回字节数或 -1 */
+int xml_unescape(Str raw, char[:] out)
+{
+    int i = 0, di = 0;
+
+    while (i < raw.s.len) {
+        int c = (u8)raw.s.data[i];
+
+        if (c != '&') {
+            if (di + 1 > out.len)
+                return -1;
+            out.data[di++] = (char)c;
+            i++;
+            continue;
+        }
+        /* 找 ';' */
+        {
+            int k = i + 1, cp = -1, base = 10, digits = 0;
+            u32 v = 0;
+
+            while (k < raw.s.len && k - i <= 12 && raw.s.data[k] != ';')
+                k++;
+            if (k >= raw.s.len || raw.s.data[k] != ';') {
+                if (di + 1 > out.len)
+                    return -1;
+                out.data[di++] = '&';
+                i++;
+                continue;
+            }
+            /* 命名实体 */
+            {
+                int len = k - i - 1;
+
+                if (len == 3 && memcmp(raw.s.data + i + 1, "amp", 3) == 0)
+                    cp = '&';
+                else if (len == 2 && memcmp(raw.s.data + i + 1, "lt", 2) == 0)
+                    cp = '<';
+                else if (len == 2 && memcmp(raw.s.data + i + 1, "gt", 2) == 0)
+                    cp = '>';
+                else if (len == 4 && memcmp(raw.s.data + i + 1, "quot", 4) == 0)
+                    cp = '"';
+                else if (len == 4 && memcmp(raw.s.data + i + 1, "apos", 4) == 0)
+                    cp = '\'';
+                else if (len >= 2 && raw.s.data[i + 1] == '#') {
+                    int j = i + 2;
+
+                    if (j < k && (raw.s.data[j] == 'x' || raw.s.data[j] == 'X')) {
+                        base = 16;
+                        j++;
+                    }
+                    for (; j < k; j++) {
+                        int d = (base == 16) ? x_hex((u8)raw.s.data[j])
+                                             : ((raw.s.data[j] >= '0'
+                                                 && raw.s.data[j] <= '9')
+                                                    ? raw.s.data[j] - '0' : -1);
+
+                        if (d < 0)
+                            return -1;
+                        v = v * (u32)base + (u32)d;
+                        digits++;
+                        if (v > 0x10ffffu)
+                            return -1;
+                    }
+                    if (digits == 0)
+                        return -1;
+                    cp = (int)v;
+                } else {
+                    cp = -1;
+                }
+            }
+            if (cp < 0) {
+                if (di + 1 > out.len)
+                    return -1;
+                out.data[di++] = '&';
+                i++;
+                continue;
+            }
+            if (!x_put_utf8((u32)cp, out, &di))
+                return -1;
+            i = k + 1;
+        }
+    }
+    return di;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static Str x_str(char[:] s)
+{
+    Str r = { { (char *)0, 0 } };
+
+    r.s = s;
+    return r;
+}
+
+static int x_eq(Str s, const char *want)
+{
+    int n = (int)strlen(want);
+
+    return s.s.len == n && (n == 0 || memcmp(s.s.data, want, (usize)n) == 0);
+}
+
+test "元素、属性与文本" {
+    Str doc = { S("<doc><a x=\"1\" y='2'>hi</a><b/></doc>") };
+    XmlReader r = xml_open(doc);
+    XmlEvent e = { 0 };
+    int kinds = 0, starts = 0, ends = 0, selfs = 0, texts = 0;
+    XmlAttr a = { 0 };
+    Str v = { { (char *)0, 0 } };
+
+    while (r.next(&e) == 1) {
+        kinds++;
+        if (e.kind == XML_START) {
+            starts++;
+            if (x_eq(e.name, "a")) {
+                if (e.attr_count() != 2)
+                    return err(1, "a 的属性个数");
+                if (!e.attr_at(0, &a) || !x_eq(a.name, "x") || !x_eq(a.value, "1"))
+                    return err(2, "属性 0");
+                if (!e.attr_at(1, &a) || !x_eq(a.name, "y") || !x_eq(a.value, "2"))
+                    return err(3, "属性 1");
+                if (!e.attr(x_str(S("y")), &v) || !x_eq(v, "2"))
+                    return err(4, "按名字找属性");
+                if (e.attr(x_str(S("z")), &v))
+                    return err(5, "不存在的属性");
+            }
+        } else if (e.kind == XML_END) {
+            ends++;
+        } else if (e.kind == XML_SELF) {
+            selfs++;
+            if (!x_eq(e.name, "b"))
+                return err(6, "自闭合元素");
+        } else if (e.kind == XML_TEXT) {
+            texts++;
+            if (!x_eq(e.text, "hi"))
+                return err(7, "文本内容");
+        }
+    }
+    if (r.err != 0)
+        return err(8, "不该有错误");
+    if (kinds != 6 || starts != 2 || ends != 2 || selfs != 1 || texts != 1)
+        return err(9, "事件计数");
+}
+
+test "注释、CDATA、处理指令与 DOCTYPE" {
+    Str doc = { S("<?xml version=\"1.0\"?><!DOCTYPE doc>"
+                  "<!-- 注释 --><x><![CDATA[<not a tag> & raw]]></x>") };
+    XmlReader r = xml_open(doc);
+    XmlEvent e = { 0 };
+    int texts = 0;
+
+    while (r.next(&e) == 1) {
+        if (e.kind == XML_TEXT) {
+            texts++;
+            if (!x_eq(e.text, "<not a tag> & raw"))
+                return err(10, "CDATA 内容");
+        }
+    }
+    if (r.err != 0 || texts != 1)
+        return err(11, "注释/PI/DOCTYPE 被跳过");
+    /* 只有文本的输入 */
+    {
+        Str t = { S("  plain text  ") };
+        XmlReader r2 = xml_open(t);
+
+        if (r2.next(&e) != 1 || e.kind != XML_TEXT
+            || !x_eq(e.text, "  plain text  "))
+            return err(12, "纯文本");
+        if (r2.next(&e) != 0)
+            return err(13, "纯文本结束");
+    }
+    /* 空白文本也原样给出 */
+    {
+        Str t = { S("<a> </a>") };
+        XmlReader r2 = xml_open(t);
+
+        if (r2.next(&e) != 1 || e.kind != XML_START)
+            return err(14, "空白文本：开始");
+        if (r2.next(&e) != 1 || e.kind != XML_TEXT || !x_eq(e.text, " "))
+            return err(15, "空白文本");
+    }
+}
+
+test "实体与字符引用" {
+    char buf[64] = { 0 };
+    int n = 0;
+
+    n = xml_unescape(x_str(S("&amp;&lt;&gt;&quot;&apos;")),
+                     (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    if (n != 5 || strcmp(buf, "&<>\"'") != 0)
+        return err(16, "5 个预定义实体");
+    n = xml_unescape(x_str(S("&#65;&#x4e2d;&#x1F642;")),
+                     (char[:]){ buf, (int)sizeof buf - 1 });
+    if (n != 1 + 3 + 4 || memcmp(buf, "A\xe4\xb8\xad\xf0\x9f\x99\x82", 8) != 0)
+        return err(17, "数字字符引用");
+    /* 不认识的实体：& 原样保留 */
+    n = xml_unescape(x_str(S("a &bogus; b")),
+                     (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    if (n != 11 || strcmp(buf, "a &bogus; b") != 0)
+        return err(18, "未知实体保留 &");
+    /* 没有分号的 & 原样 */
+    n = xml_unescape(x_str(S("a & b")), (char[:]){ buf, (int)sizeof buf - 1 });
+    buf[n > 0 ? n : 0] = 0;
+    if (n != 5 || strcmp(buf, "a & b") != 0)
+        return err(19, "裸 &");
+    /* 溢出/坏引用 */
+    if (xml_unescape(x_str(S("&#x110000;")), (char[:]){ buf, (int)sizeof buf })
+        != -1)
+        return err(20, "超出 Unicode");
+    if (xml_unescape(x_str(S("&#xZZ;")), (char[:]){ buf, (int)sizeof buf }) != -1)
+        return err(21, "坏的十六进制引用");
+    if (xml_unescape(x_str(S("&#65;")), (char[:]){ buf, 0 }) != -1)
+        return err(22, "放不下");
+    /* 属性值里的实体用 unescape 解 */
+    {
+        Str doc = { S("<a v=\"x &amp; y\"/>") };
+        XmlReader r = xml_open(doc);
+        XmlEvent e = { 0 };
+        XmlAttr at = { 0 };
+
+        if (r.next(&e) != 1 || e.kind != XML_SELF || !e.attr_at(0, &at))
+            return err(23, "属性实体：解析");
+        if (!x_eq(at.value, "x &amp; y"))
+            return err(24, "属性原文保留实体");
+        n = xml_unescape(at.value, (char[:]){ buf, (int)sizeof buf - 1 });
+        buf[n > 0 ? n : 0] = 0;
+        if (n != 5 || strcmp(buf, "x & y") != 0)
+            return err(25, "属性实体：解码");
+    }
+}
+
+test "格式错误" {
+    XmlEvent e = { 0 };
+
+    /* 开始标签没闭合 */
+    {
+        Str doc = { S("<a x=\"1\"") };
+        XmlReader r = xml_open(doc);
+
+        if (r.next(&e) != -1 || r.err == 0)
+            return err(26, "开始标签没闭合");
+    }
+    /* 结束标签配错 */
+    {
+        Str doc = { S("<a></b>") };
+        XmlReader r = xml_open(doc);
+
+        if (r.next(&e) != 1 || r.next(&e) != -1)
+            return err(27, "结束标签配错");
+    }
+    /* 没有开始的结束标签 */
+    {
+        Str doc = { S("</a>") };
+        XmlReader r = xml_open(doc);
+
+        if (r.next(&e) != -1)
+            return err(28, "多余的结束标签");
+    }
+    /* 读完还有未闭合的元素 */
+    {
+        Str doc = { S("<a><b></b>") };
+        XmlReader r = xml_open(doc);
+
+        if (r.next(&e) != 1 || r.next(&e) != 1 || r.next(&e) != 1)
+            return err(29, "未闭合：前缀事件");
+        if (r.next(&e) != -1)
+            return err(30, "未闭合的元素");
+    }
+    /* 注释没闭合 */
+    {
+        Str doc = { S("<!-- x") };
+        XmlReader r = xml_open(doc);
+
+        if (r.next(&e) != -1)
+            return err(31, "注释没闭合");
+    }
+    /* CDATA 没闭合 */
+    {
+        Str doc = { S("<![CDATA[x") };
+        XmlReader r = xml_open(doc);
+
+        if (r.next(&e) != -1)
+            return err(32, "CDATA 没闭合");
+    }
+    /* 空的输入 */
+    {
+        Str doc = { S("") };
+        XmlReader r = xml_open(doc);
+
+        if (r.next(&e) != 0 || r.err != 0)
+            return err(33, "空输入");
+    }
+}
