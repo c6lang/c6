@@ -493,13 +493,15 @@ task-declaration = "task" , identifier , "=" , expression ,
 ```
 
 “必须等待”就是 `await c6_io(fd, ev)` 那种挂起：它总要停一轮，即使 fd 已经
-就绪——唤醒是下一轮 `select()` 的事。`await` 一个 `async` 子任务不算等待，
+就绪——唤醒是下一轮 `epoll_wait()` 的事。`await` 一个 `async` 子任务不算等待，
 子任务能立刻往下跑就跑完了。所以完全不碰 fd 的 `co f();` 会在 `co` 语句里
 一路跑完，并**当场回收任务槽**（没人能观察到它，句柄也没人拿得到）；park
 在 fd 上的任务才留给 `__c6_co_run()`。
 
-约束见 C34–C37（`spawn` 的约束是 C38–C40，见 §3.6）；同时存活的协程最多
-64 个（含 `await` 出来的子任务）。
+约束见 C34–C37（`spawn` 的约束是 C38–C40，见 §3.6）。同时存活的协程个数
+**没有上限**（含 `await` 出来的子任务）：每个任务是一次独立分配，就绪链表和
+`epoll` 的事件数组都按需增长，只受内存约束；`fd` 也没有 1024 的描述符窗口，
+因为挂起走的是 `epoll(7)`（没有 epoll 的平台退回 `poll(2)`），不是 `select(2)`。
 `co` 出去的协程和调用方在同一线程上协作式运行；要真并发用 `spawn`（§3.6）。
 
 ### 3.6 spawn（OS 线程）
@@ -1772,7 +1774,7 @@ const struct __c6_desc __c6_desc_f =
 
 驱动方 `__c6_co_wait(task)` 反复进入 `__c6_body_f`：每次拿到的 `kind` 是
 `DONE` / `IO` / `CHILD`，为 `CHILD` 时先往子任务里钻，为 `IO` 时用
-`select()` 等 fd 就绪并把掩码放进 `wait_rev`。
+`epoll_wait()` 等 fd 就绪并把掩码放进 `wait_rev`。
 
 **R17 — `co f(a);` / `task t = f(a);`**
 
@@ -2127,7 +2129,7 @@ int main(void)
 | `spawn f();` 而 `f` 只有块作用域声明 | 约束 C38：需要文件作用域声明才能生成跳板 |
 | `task t;`（不带初始化器） | 约束 C36：句柄类型从初始化器推出 |
 | `async` 函数当方法用（`p->f()`） | 约束 C37 |
-| `await c6_io(fd, ev)` 的 `fd` 不在 `[0, 1024)` | 任务按失败回收：`__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败（不会永远 park） |
+| `await c6_io(fd, ev)` 的 `fd` 是负数 | 任务按失败回收：`__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败（不会永远 park）；非负 fd 没有上限（`epoll(7)`） |
 | 抢占式调度、把阻塞的 libc 调用（`read`/`printf`/…）自动变成让出点 | 不在本扩展范围：`co`/`__c6_co_run` 只推进协程，不 hook libc |
 | PE 目标上的 `spawn` | 还没有 PE 线程支持，运行时 trap |
 | 取消 / 强杀一个 `spawn` 出去的线程 | 不提供：线程总是被启动它的线程 join |

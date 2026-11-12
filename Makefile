@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 bench-async
 
 all: build
 
@@ -1496,6 +1496,14 @@ c99tcc-test: build
 	BACKEND=c99 C99CC=$(CURDIR)/$(TCC_DIR)/c6 \
 	    C99FLAGS="-B $(CURDIR)/$(TCC_DIR) -std=c99 -w" ./$(SELFTEST)
 
+# 六语言异步编程基准：同三项指标（create / switch / conns）在 c6、C、
+# C++20 协程、Go、Rust、Uya 上各跑一遍，打一张表。语义与口径写在
+# docs/async-comparison.md 里；脚本 bench/async/run.sh 负责编译 + 分段跑 +
+# 汇总（每个指标一个进程，RSS 增量才干净）。它不进 check-all：要 go/rustc/
+# uya，而且跑一次要几十秒（Uya 是可选依赖，缺了就自动跳过那一栏）。
+bench-async: build
+	./bench/async/run.sh
+
 # c6 语言模式自检：tcc 自己的源码也必须满足 "变量必须初始化"，所以拿 c6
 # 规则编译一遍自己的源码是这条规则最严格的回归测试（同时覆盖 C99 后端的
 # 翻译路径）；编出来的编译器还要能跑。
@@ -1705,6 +1713,12 @@ distclean:
 #   std-mesh         编译并运行 examples/stdmesh.c6（第八十一批，OBJ/STL/PLY/MTL）
 #   std-https        编译并运行 examples/stdhttps.c6（第八十二批，同步/异步 HTTPS + 性能指标）
 #   std-async5       编译并运行 examples/stdasync5.c6（第八十三批，异步框架横切面）
+#
+# 基准
+#   bench-async      六语言异步编程基准：c6 / C(epoll、pthread) / C++20 协程 /
+#                    Go goroutine / Rust(async、std::thread) / Uya(async_fn)
+#                    （要 gcc、g++ 12+、go、rustc，Uya 可选；结果写到
+#                    build/bench-async.csv）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

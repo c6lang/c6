@@ -620,6 +620,7 @@ make std-async4   # 编译并运行 examples/stdasync4.c6（第八十批语言�
 make std-mesh     # 编译并运行 examples/stdmesh.c6（第八十一批 OBJ/STL/PLY/MTL 示例）
 make std-https    # 编译并运行 examples/stdhttps.c6（第八十二批 同步/异步 HTTPS + 性能指标）
 make std-async5   # 编译并运行 examples/stdasync5.c6（第八十三批 预算/任务组/额度/取消）
+make bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

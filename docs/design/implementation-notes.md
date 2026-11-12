@@ -65,7 +65,7 @@
 | 软关键字 | `c6_soft_kw` / `c6_soft_kw_shadowed`（`block()` 与 `decl()` 两个入口） | `tcc/tccgen.c` |
 | 每线程状态 | `tcc_th()` / `tcc_th_join_children`（`pthread_key`） | `tcc/lib/libtcc1.c` |
 | `task` | `c6_task_decl` / `c6_task_check_handle` / `c6_task_defer_destroy` | `tcc/tccgen.c` |
-| 顶层调度（64 槽就绪链表 + 一次 `select()`） | `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run` | `tcc/lib/libtcc1.c` |
+| 顶层调度（就绪链表 + 一次 `epoll_wait()`，长度只受内存限制；注册集按 fd 索引 + `EPOLLONESHOT` 重装填，唤醒走下标 O(1)） | `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run` | `tcc/lib/libtcc1.c` |
 | `!error` | `c6_parse_fallible_suffix` / `c6_apply_fallible`，`FuncAttr.func_fallible` | `tcc/tccgen.c`、`tcc/tcc.h` |
 | `f".."` 切分 | `parse_fstr_string` / `fstr_lex` / `fstr_add_lit` / `fstr_unquote`，`TOK_C6_FSTR` → `TOK_C6_FSTR_BEG` … `TOK_C6_FSTR_END` | `tcc/tccpp.c`、`tcc/tcctok.h` |
 | `f".."` 下降 | `c6_fstr_expr` / `c6_fstr_lit` / `c6_fstr_piece`（`unary()` 里的 `TOK_C6_FSTR_BEG` 与 `'@'`） | `tcc/tccgen.c` |

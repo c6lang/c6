@@ -15,7 +15,9 @@
  *
  * 这一层就是 **c6 关键字的 async**：函数标上 `async`，函数体里用 `await` 挂起，
  * 调用它得到的是任务句柄（`struct NAME_task *`），由 `__c6_co_wait` / `__c6_co_run`
- * 驱动。`await c6_io(fd, ev)` 是编译器内建的挂起点（fd 必须在 `[0, 1024)`）。
+ * 驱动。`await c6_io(fd, ev)` 是编译器内建的挂起点；挂起走 `epoll(7)`（没有 epoll
+ * 的平台退回 `poll(2)`），所以 **fd 号没有 1024 那种窗口**，只要是非负 fd 就行
+ * （上限只由 `RLIMIT_NOFILE` 决定）。
  *
  * 约定：
  *
@@ -45,7 +47,7 @@ async int aio_wait(int fd, int ev)
 {
     int rev = 0;
 
-    if (fd < 0 || fd >= 1024)
+    if (fd < 0)
         return -1;
     rev = await c6_io(fd, ev);
     return rev;
@@ -242,10 +244,10 @@ test "aio：EOF、参数与事件掩码" {
         close(p2[0]);
         close(p2[1]);
     }
-    /* 非法 fd（越界）由运行时按失败回收 */
-    w = aio_wait(2000, C6_CO_EV_READ);
+    /* 负 fd 由运行时按失败回收；非负 fd 没有 1024 那种窗口（挂起用 poll） */
+    w = aio_wait(-1, C6_CO_EV_READ);
     if (__c6_co_wait(w) != 0 || w->val != -1)
-        return err(19, "越界 fd 应该返回 -1");
+        return err(19, "负 fd 应该返回 -1");
     __c6_co_destroy(w);
     r = aio_read(fds[0], buf, 0);
     if (__c6_co_wait(r) != 0 || r->val != -1)

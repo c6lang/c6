@@ -1,0 +1,74 @@
+/* c6 自测：fd 号超过 FD_SETSIZE(1024) 也能挂起
+ *
+ * 运行时的就绪等待走 epoll(7)（没有 epoll 的平台退回 poll(2)），所以 fd 号
+ * 没有 select(2) 那种 1024 的窗口。这里把管道读端 dup2 到 2000 号再挂起，
+ * co（泵路径）和 task（__c6_co_wait 路径）两条都要能跑通。
+ *
+ * 裸机（examples/boot）跳掉这个文件：那里没有 dup2/getrlimit/setrlimit。
+ *
+ * 运行（仓库根目录）：
+ *   make selftest
+ * 或单个文件：
+ *   ./tcc/tcc -B tcc -test tests/async_highfd.c6
+ */
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+
+/* 只用到这三个 libc 函数（不给 libtcc1 添依赖） */
+int pipe(int *fds);
+int read(int fd, void *buf, int len);
+int write(int fd, const void *buf, int len);
+int dup2(int oldfd, int newfd);
+
+static int high_got = 0;
+
+async int wait_high_fd(int fd)
+{
+    char c = 0;
+    int rev = 0;
+
+    rev = await c6_io(fd, C6_CO_EV_READ);
+    if (rev > 0 && read(fd, &c, 1) == 1)
+        high_got = 1;
+    return rev;
+}
+
+// BARE-SKIP: 裸机上没有 dup2/getrlimit/setrlimit
+test "fd 号超过 FD_SETSIZE（1024）也能挂起" {
+    int fds[2] = { 0, 0 };
+    struct rlimit rl = { 0, 0 };
+
+    if (pipe(fds))
+        return err(1, "pipe 失败");
+    /* 软限制默认只有 1024：先抬高到 4096，才开得出一个 2000 号的 fd */
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return err(2, "getrlimit 失败");
+    if (rl.rlim_max < 4096)
+        return 0;                   /* 硬限制太低：这个环境下没法测，跳过 */
+    if (rl.rlim_cur < 4096) {
+        rl.rlim_cur = 4096;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0)
+            return err(3, "setrlimit 失败");
+    }
+    /* 把读端挪到 2000 号：select(2) 时代这里根本挂不上 */
+    if (dup2(fds[0], 2000) < 0)
+        return err(4, "dup2 到 2000 失败");
+    high_got = 0;
+    co wait_high_fd(2000);
+    write(fds[1], "y", 1);
+    if (__c6_co_run() != 0)
+        return err(5, "高号 fd 的协程失败");
+    if (!high_got)
+        return err(6, "高号 fd 上没有读到数据");
+    /* 单任务的等待路径（__c6_co_wait 里的 poll）也要能处理 */
+    {
+        struct wait_high_fd_task *t = wait_high_fd(2000);
+
+        high_got = 0;
+        write(fds[1], "z", 1);
+        if (__c6_co_wait(t) != 0 || !high_got)
+            return err(7, "task 路径的高号 fd 失败");
+        __c6_co_destroy(t);
+    }
+}

@@ -74,7 +74,7 @@ arm、arm64、riscv64 与 C99 输出后端——都走"帧住在任务里"。）
   `__c6_co_run()`），`task` 建的任务归作用域管；
 - `co` 是**同步起点**：任务在 `co` 语句处就开始跑，跑到第一个必须等待的
   点才把控制权交回来。`await c6_io` 总要停一轮（即使 fd 已经就绪，唤醒是
-  下一轮 `select()` 的事）；`await` 子任务不算等待，所以不碰 fd 的
+  下一轮 `epoll_wait()` 的事）；`await` 子任务不算等待，所以不碰 fd 的
   `co f();` 会在 `co` 语句里跑完并当场回收槽位；
 - `co`、`spawn`、`task` 是**软关键字**：只有在语句开头、后面紧跟一个标识符
   时才是关键字。`int spawn = 1;`、`spawn = 2;`、`x = spawn;`、`spawn(x);`、
@@ -84,13 +84,18 @@ arm、arm64、riscv64 与 C99 输出后端——都走"帧住在任务里"。）
   `'go' was renamed to 'spawn'`；
 - `c6_io` 只有 `await c6_io(fd, ev)` 一种写法；`ev` 是
   `C6_CO_EV_READ` / `C6_CO_EV_WRITE`；
-- `c6_io` 的 `fd` 必须在 `[0, 1024)` 内；越界的任务按失败回收，
-  `__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败；
+- `c6_io` 的 `fd` 只有一条限制：不能是负数（负 fd 的任务按失败回收，
+  `__c6_co_wait` 返回 `-1`，`__c6_co_run` 计一次失败）。挂起用的是 `epoll(7)`（没有 epoll 的平台退回 `poll(2)`），
+  不是 `select(2)`，所以**没有 `FD_SETSIZE` 那种 1024 的描述符窗口**：
+  只要进程能打开这个 fd，就能挂上去；
+- 框架的开销与代价、以及和 C / C++ / Go / Rust 的实测对比，见
+  [async-comparison.md](../async-comparison.md)；
 - 每个任务一块内存：`struct NAME_task` + 原生帧（帧里带着自己的清理状态），按需
-  `malloc`（没有固定池、没有 4 KiB 帧上限、没有任务数上限）。后端把帧寄存器
-  直接指向这块内存，所以挂起**不拷贝**任何东西，`&local` 跨过 `await` 仍然
-  有效；`weak` 局部/形参/返回值因此在 `async` 里也合法。`__c6_co_wait` 和
-  `__c6_co_run` 都用 `select()` 等 fd，`__c6_co_run` 对顶层任务做轮转。
+  `malloc`（没有固定池、没有 4 KiB 帧上限、**没有任务数上限**：同时存活多少个
+  协程只取决于内存）。后端把帧寄存器直接指向这块内存，所以挂起**不拷贝**任何
+  东西，`&local` 跨过 `await` 仍然有效；`weak` 局部/形参/返回值因此在 `async`
+  里也合法。`__c6_co_wait` 和 `__c6_co_run` 都用 `epoll` 等 fd（一次 `epoll_wait`
+  等全部 park 住的任务，事件数组按需增长），`__c6_co_run` 对顶层任务做轮转。
   协程本身是协作式、单线程的；要真并发用 `spawn`。`-b`（边界检查）不能与
   `async` 同用。
 
