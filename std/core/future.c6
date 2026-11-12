@@ -1,0 +1,249 @@
+/* std/core/future：单线程 Future/Promise（挂起 → 就绪/失败，带完成回调与组合）。
+ *
+ *     import std.core.future;
+ *
+ *     Future f = { 0 };
+ *     f.init();                      // 方法：init / resolve / reject / state
+ *     f.then(done_cb, 0);            // 先挂回调
+ *     f.resolve(42);                 // 立刻触发回调
+ *     f.state();                     // FUT_READY
+ *     f.value();                     // 42
+ *
+ * 一个 `Future` 只有三种状态：`FUT_PENDING`（0）、`FUT_READY`（1，值有效）、
+ * `FUT_REJECTED`（2，错误码有效）。第一次 `resolve`/`reject` 决定终态，之后再调用
+ * 一律返回 0（不会覆盖）。
+ *
+ * 约定：
+ *
+ * - `f.init()` 复位成挂起；`f.resolve(v)`/`f.reject(code)` 成功返回 1；
+ * - `f.state()`/`f.is_done()`/`f.value()`/`f.code()` 查询（未就绪时 `value` 为 0）；
+ * - `f.then(cb, ctx)` 注册**一个**完成回调：未完成时挂起、完成时**立刻**调用；
+ *   回调签名 `void (*)(Future *, void *)`，返回 1 表示注册成功；
+ * - `f.all(fs, n, out)`：全部就绪时 `out` 变为就绪，值 = 完成个数；任一失败则
+ *   `out` 失败且错误码 = 第一个失败的错误码；
+ * - `f.any(fs, n, out)`：任一就绪即就绪（值 = 第一个就绪的值）；全部失败则失败；
+ * - 全是**轮询式**的：没有后台线程，组合结果在调用 `all`/`any` 时按当时状态计算；
+ * - 跨线程使用时请自己加锁（`std.os.sync` 的 `Mutex`），本模块不加锁。
+ */
+#include <string.h>
+
+module std.core.future;
+import std.core.types;
+import std.text.str;
+
+enum {
+    FUT_PENDING = 0,
+    FUT_READY = 1,
+    FUT_REJECTED = 2
+};
+
+typedef void (*FutCb)(void *self, void *ctx);
+
+struct Future {
+    int st;         /* 字段名避免与 state() 冲突 */
+    i64 val;
+    int errc;
+    FutCb cb;
+    void *ctx;
+};
+
+int init(Future *f)
+{
+    if (!f)
+        return -1;
+    memset(f, 0, sizeof *f);
+    f->st = FUT_PENDING;
+    return 1;
+}
+
+int state(Future *f)
+{
+    return f ? f->st : FUT_PENDING;
+}
+
+int is_done(Future *f)
+{
+    return f && f->st != FUT_PENDING ? 1 : 0;
+}
+
+i64 value(Future *f)
+{
+    if (!f || f->st != FUT_READY)
+        return 0;
+    return f->val;
+}
+
+int code(Future *f)
+{
+    if (!f || f->st != FUT_REJECTED)
+        return 0;
+    return f->errc;
+}
+
+int then(Future *f, FutCb cb, void *ctx)
+{
+    if (!f || !cb)
+        return -1;
+    if (f->st == FUT_PENDING) {
+        f->cb = cb;
+        f->ctx = ctx;
+        return 1;
+    }
+    cb(f, ctx);
+    return 1;
+}
+
+int resolve(Future *f, i64 v)
+{
+    if (!f || f->st != FUT_PENDING)
+        return 0;
+    f->st = FUT_READY;
+    f->val = v;
+    if (f->cb)
+        f->cb(f, f->ctx);
+    return 1;
+}
+
+int reject(Future *f, int errc)
+{
+    if (!f || f->st != FUT_PENDING)
+        return 0;
+    f->st = FUT_REJECTED;
+    f->errc = errc;
+    if (f->cb)
+        f->cb(f, f->ctx);
+    return 1;
+}
+
+/* `all`/`any` 把**接收者当作数组首元素**：`fs[0].all(n, &out)` 里的 `fs` 就是 &fs[0] */
+int all(Future *fs, int n, Future *out)
+{
+    int i = 0, ready = 0;
+    int first_err = 0;
+
+    if (!fs || n <= 0 || !out)
+        return -1;
+    init(out);
+    for (i = 0; i < n; i++) {
+        if (fs[i].st == FUT_REJECTED) {
+            first_err = fs[i].errc;
+            break;
+        }
+        if (fs[i].st == FUT_READY)
+            ready++;
+    }
+    if (first_err != 0)
+        return reject(out, first_err);
+    if (ready == n)
+        return resolve(out, (i64)n);
+    return 0;                           /* 还有挂起的 */
+}
+
+int any(Future *fs, int n, Future *out)
+{
+    int i = 0, rejected = 0;
+
+    if (!fs || n <= 0 || !out)
+        return -1;
+    init(out);
+    for (i = 0; i < n; i++) {
+        if (fs[i].st == FUT_READY)
+            return resolve(out, fs[i].val);
+        if (fs[i].st == FUT_REJECTED)
+            rejected++;
+    }
+    if (rejected == n)
+        return reject(out, -1);
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct FutureCbTest {
+    int calls;
+    i64 seen;
+    int errc;
+};
+
+static void on_done(void *self, void *ctx)
+{
+    Future *f = (Future *)self;
+    struct FutureCbTest *c = (struct FutureCbTest *)ctx;
+
+    c->calls++;
+    c->seen = f->val;
+    c->errc = f->errc;
+}
+
+test "future：状态与回调" {
+    Future f = { 0 };
+    struct FutureCbTest c = { 0, 0, 0 };
+
+    if (f.init() != 1)
+        return err(1, "init 失败");
+    if (f.state() != FUT_PENDING || f.is_done() != 0)
+        return err(2, "初始应该是挂起");
+    if (f.then(on_done, &c) != 1)
+        return err(3, "then 失败");
+    if (c.calls != 0)
+        return err(4, "未完成时不该回调");
+    if (f.resolve(42) != 1)
+        return err(5, "resolve 失败");
+    if (c.calls != 1 || c.seen != 42)
+        return err(6, "resolve 应该触发回调并带上值");
+    if (f.state() != FUT_READY || f.value() != 42 || f.is_done() != 1)
+        return err(7, "就绪状态不对");
+    if (f.resolve(7) != 0 || f.value() != 42)
+        return err(8, "重复 resolve 应该无效");
+}
+
+test "future：失败与组合" {
+    Future a = { 0 }, b = { 0 }, c = { 0 }, out = { 0 };
+    struct FutureCbTest ctx = { 0, 0, 0 };
+
+    a.init();
+    b.init();
+    c.init();
+    if (a.then(on_done, &ctx) != 1)
+        return err(9, "then 失败");
+    if (a.reject(-5) != 1)
+        return err(10, "reject 失败");
+    if (a.state() != FUT_REJECTED || a.code() != -5 || a.value() != 0)
+        return err(11, "失败状态不对");
+    if (ctx.calls != 1 || ctx.errc != -5)
+        return err(12, "失败也应该回调");
+    /* all：还有挂起 → 返回 0，out 仍挂起 */
+    if (a.all(0, &out) != -1)
+        return err(13, "n=0 应该 -1");
+    {
+        Future fs[2] = { { 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0 } };
+
+        fs[0].init();
+        fs[1].init();
+        fs[0].resolve(1);
+        if (fs[0].all(2, &out) != 0 || out.state() != FUT_PENDING)
+            return err(14, "还有挂起时 all 应该返回 0");
+        fs[1].resolve(2);
+        if (fs[0].all(2, &out) != 1 || out.value() != 2)
+            return err(15, "全部就绪时 all 的值应该是 2");
+        /* any */
+        fs[0].init();
+        fs[1].init();
+        fs[1].resolve(9);
+        if (fs[0].any(2, &out) != 1 || out.value() != 9)
+            return err(16, "any 应该取第一个就绪的值");
+        /* 全部失败 */
+        fs[0].init();
+        fs[1].init();
+        fs[0].reject(-1);
+        fs[1].reject(-2);
+        if (fs[0].any(2, &out) != 1 || out.state() != FUT_REJECTED)
+            return err(17, "全部失败时 any 应该失败");
+        if (fs[0].all(2, &out) != 1 || out.code() != -1)
+            return err(18, "all 失败时应该带第一个错误码");
+    }
+    (void)b;
+    (void)c;
+}

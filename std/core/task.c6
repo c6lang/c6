@@ -1,0 +1,249 @@
+/* std/core/task：协作式任务调度（step 函数返回「完成/继续」的轮转执行）。
+ *
+ *     import std.core.task;
+ *
+ *     TaskSlot buf[8] = { { 0, 0, 0, 0 } };
+ *     Sched s = { 0 };
+ *     s.init(buf, 8);                  // 方法：init / spawn / poll / run
+ *     s.spawn(counter_step, &state);   // 每个 tick 调用一次 step
+ *     s.run(10);                       // 最多转 10 轮，直到没有活动任务
+ *
+ * 任务就是一个 `int (*step)(void *state)`：返回 1 表示「还没完，下轮继续」，返回 0
+ * 表示完成（完成后自动从调度器里摘掉）。这是最朴素的协作式调度——没有栈切换，
+ * 状态放在 `state` 里，适合把「异步流程」写成状态机（网络读写、定时器回调）。
+ *
+ * 约定：
+ *
+ * - `s.init(buf, cap)` 绑定任务槽数组并清空；
+ * - `s.spawn(step, state)` 加入任务并返回 id，满了返回 -1，`step` 为 0 返回 -1；
+ * - `s.step_all()` 让**所有**活动任务各走一步（一轮），返回仍然活动的任务数
+ *   （名字带 `_all` 是为了避开系统 `poll(2)` 的符号）；
+ *   一轮里新 `spawn` 的任务从下一轮开始跑；
+ * - `s.run(max_rounds)` 反复 `step_all` 直到没有活动任务或转数用完，返回实际转数；
+ * - `s.cancel(id)` 摘掉一个任务（1 成功 / 0 找不到）；
+ * - `s.active()` 是活动任务数，`s.count()` 是槽位里剩余（含已完成的空位不算）任务数，
+ *   `s.rounds()` 是累计轮数；
+ * - `step` 里可以 `spawn`/`cancel`（同一轮里被取消的任务不会再被调用）。
+ */
+#include <string.h>
+
+module std.core.task;
+import std.core.types;
+import std.text.str;
+
+typedef int (*TaskStep)(void *state);
+
+struct TaskSlot {
+    TaskStep step;
+    void *state;
+    i64 id;
+    int active;
+};
+
+struct Sched {
+    TaskSlot *t;
+    int cap;
+    int nactive;
+    i64 next_id;
+    i64 round;
+};
+
+int init(Sched *s, void *buf, int cap)
+{
+    if (!s || !buf || cap <= 0)
+        return -1;
+    memset(buf, 0, sizeof(TaskSlot) * (size_t)cap);
+    s->t = (TaskSlot *)buf;
+    s->cap = cap;
+    s->nactive = 0;
+    s->next_id = 1;
+    s->round = 0;
+    return 1;
+}
+
+int capacity(Sched *s)
+{
+    return s ? s->cap : 0;
+}
+
+int active(Sched *s)
+{
+    return s ? s->nactive : 0;
+}
+
+i64 rounds(Sched *s)
+{
+    return s ? s->round : 0;
+}
+
+i64 spawn(Sched *s, TaskStep step, void *state)
+{
+    int i = 0;
+
+    if (!s || !s->t || !step)
+        return -1;
+    for (i = 0; i < s->cap; i++) {
+        if (!s->t[i].active) {
+            s->t[i].step = step;
+            s->t[i].state = state;
+            s->t[i].id = s->next_id++;
+            s->t[i].active = 1;
+            s->nactive++;
+            return s->t[i].id;
+        }
+    }
+    return -1;
+}
+
+int cancel(Sched *s, i64 id)
+{
+    int i = 0;
+
+    if (!s || !s->t)
+        return 0;
+    for (i = 0; i < s->cap; i++) {
+        if (s->t[i].active && s->t[i].id == id) {
+            s->t[i].active = 0;
+            s->t[i].step = 0;
+            s->t[i].state = 0;
+            s->nactive--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int step_all(Sched *s)
+{
+    int i = 0;
+
+    if (!s || !s->t)
+        return -1;
+    for (i = 0; i < s->cap; i++) {
+        if (!s->t[i].active)
+            continue;
+        if (s->t[i].step(s->t[i].state) == 0) {
+            s->t[i].active = 0;
+            s->t[i].step = 0;
+            s->t[i].state = 0;
+            s->nactive--;
+        }
+    }
+    s->round++;
+    return s->nactive;
+}
+
+i64 run(Sched *s, int max_rounds)
+{
+    int i = 0;
+
+    if (!s || !s->t || max_rounds <= 0)
+        return -1;
+    for (i = 0; i < max_rounds; i++) {
+        if (s->nactive <= 0)
+            break;
+        s->step_all();
+    }
+    return s->round;
+}
+
+int clear(Sched *s)
+{
+    if (!s || !s->t)
+        return -1;
+    memset(s->t, 0, sizeof(TaskSlot) * (size_t)s->cap);
+    s->nactive = 0;
+    s->round = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct TaskCounterTest {
+    int ticks;
+    int limit;
+    int done_mark;
+};
+
+static int count_step(void *state)
+{
+    struct TaskCounterTest *c = (struct TaskCounterTest *)state;
+
+    c->ticks++;
+    if (c->ticks >= c->limit) {
+        c->done_mark = 1;
+        return 0;
+    }
+    return 1;
+}
+
+test "task：轮转与完成" {
+    static TaskSlot buf[8] = { { 0, 0, 0, 0 } };
+    Sched s = { 0 };
+    struct TaskCounterTest a = { 0, 3, 0 };
+    struct TaskCounterTest b = { 0, 1, 0 };
+    i64 ida = 0, idb = 0;
+
+    if (s.init(buf, 8) != 1)
+        return err(1, "init 失败");
+    if (s.capacity() != 8 || s.active() != 0)
+        return err(2, "初始状态不对");
+    ida = s.spawn(count_step, &a);
+    idb = s.spawn(count_step, &b);
+    if (ida <= 0 || idb != ida + 1)
+        return err(3, "id 应该连续递增");
+    if (s.active() != 2)
+        return err(4, "应该有 2 个活动任务");
+    /* 第一轮：a 走一步（1/3），b 完成 */
+    if (s.step_all() != 1)
+        return err(5, "第一轮之后应该剩 1 个");
+    if (a.ticks != 1 || b.done_mark != 1)
+        return err(6, "第一轮的 tick 不对");
+    /* 再跑两轮：a 到 3 完成 */
+    s.step_all();
+    s.step_all();
+    if (s.active() != 0 || a.ticks != 3 || a.done_mark != 1)
+        return err(7, "三轮之后 a 应该完成");
+    if (s.rounds() != 3)
+        return err(8, "rounds() 应该是 3");
+}
+
+test "task：run、取消与容量" {
+    static TaskSlot buf[4] = { { 0, 0, 0, 0 } };
+    Sched s = { 0 };
+    struct TaskCounterTest a = { 0, 100, 0 };
+    struct TaskCounterTest b = { 0, 2, 0 };
+    i64 ida = 0;
+
+    s.init(buf, 4);
+    ida = s.spawn(count_step, &a);
+    s.spawn(count_step, &b);
+    if (s.run(5) != 5)
+        return err(9, "run(5) 应该跑满 5 轮（a 还没完）");
+    if (a.ticks != 5 || b.done_mark != 1)
+        return err(10, "5 轮后的 tick 不对");
+    if (s.cancel(ida) != 1)
+        return err(11, "取消失败");
+    if (s.cancel(ida) != 0)
+        return err(12, "重复取消应该返回 0");
+    if (s.active() != 0)
+        return err(13, "取消之后应该没有活动任务");
+    if (s.run(3) != s.rounds())
+        return err(14, "没有活动任务时 run 应该立刻返回");
+    if (s.spawn(0, 0) != -1)
+        return err(15, "step 为 0 应该 -1");
+    /* 容量上限 */
+    s.clear();
+    s.spawn(count_step, &a);
+    s.spawn(count_step, &a);
+    s.spawn(count_step, &a);
+    s.spawn(count_step, &a);
+    if (s.spawn(count_step, &a) != -1)
+        return err(16, "满了应该返回 -1");
+    if (s.init(buf, 0) != -1)
+        return err(17, "容量 0 应该 -1");
+    if (s.clear() != 1 || s.active() != 0)
+        return err(18, "clear 之后应该是空调度器");
+}

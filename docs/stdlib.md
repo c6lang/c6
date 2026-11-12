@@ -329,6 +329,11 @@
 | `std/text/rabin.c6` | `std.text.rabin` | Rabin-Karp（**方法**：`r.init`/`r.find`/`r.count`/`r.hash_of`/`r.pattern_len`）：64 位溢出当模、基数 257，滑动窗口 O(n+m)，哈希相等后再逐字节确认，`count` 数可重叠出现 |
 | `std/container/interval.c6` | `std.container.interval` | 闭区间集合（**方法**：`s.init`/`s.add`/`s.contains`/`s.overlaps`/`s.count`/`s.length`/`s.at`/`s.remove`/`s.clear`）：插入即合并（重叠与相邻都并），`contains` 二分，`remove` 能挖洞拆段，段数/长度用 `i64` |
 | `std/text/align.c6` | `std.text.align` | Needleman-Wunsch 全局比对（**方法**：`al.setup`/`al.run`）：DP 表由调用方给，回溯出两条带 `-` 的等长序列，`AlignResult` 给总分与匹配/替换/空位列数；平分优先「对角→上→左」 |
+| `std/core/future.c6` | `std.core.future` | 单线程 Future/Promise（**方法**：`f.init`/`f.resolve`/`f.reject`/`f.then`/`f.state`/`f.is_done`/`f.value`/`f.code`/`f.all`/`f.any`）：三态（挂起/就绪/失败）、首次 resolve 定终态、`then` 注册单个完成回调（已完成则立刻调用）、`all`/`any` 轮询式组合 |
+| `std/core/timer.c6` | `std.core.timer` | 定时器小顶堆（**方法**：`t.init`/`t.add`/`t.cancel`/`t.fire`/`t.next_deadline`/`t.count`/`t.clear`）：时间是调用方给的整数毫秒（可用假时钟测），`add` 返回递增 id，`fire(now)` 按截止时间升序触发、回调里可继续 add |
+| `std/core/task.c6` | `std.core.task` | 协作式任务调度（**方法**：`s.init`/`s.spawn`/`s.step_all`/`s.run`/`s.cancel`/`s.active`/`s.rounds`/`s.clear`）：任务即 `int step(void *)`（1 继续、0 完成），每轮各走一步，`step_all` 避开系统 `poll(2)` 符号 |
+| `std/os/reactor.c6` | `std.os.reactor` | poll 事件循环（**方法**：`r.init`/`r.on`/`r.off`/`r.after`/`r.cancel_timer`/`r.run_once`/`r.stop`/`r.resume`/`r.io_count`/`r.dispatches`）：fd 注册表 + 定时器堆，`run_once(now, max_wait)` 用最近定时器算 poll 超时，返回派发次数；单线程无锁 |
+
 
 
 
@@ -458,6 +463,7 @@
 | `examples/stdtextan.c6` | （无模块） | 第六十九批（文本分析）的拼装示例（`make std-textan`）：切词统计、切句、字符三元组频次、Flesch 可读性与年级 |
 | `examples/stdcfg.c6` | （无模块） | 第七十批（系统配置文件）的拼装示例（`make std-cfg2`）：`.env` 取值、`hosts` 别名查找、`resolv.conf` 统计、`known_hosts` 匹配 |
 | `examples/stdmatch.c6` | （无模块） | 第七十一批（匹配与对齐）的拼装示例（`make std-match`）：多模式扫描、滚动哈希查找、区间集合合并/挖洞、GATTACA 序列比对 |
+| `examples/stdasync.c6` | （无模块） | 第七十二批（异步编程基础）的拼装示例（`make std-async`）：Future 回调与 all/any、定时器堆、协作式任务、poll 事件循环 + 定时器 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -636,6 +642,10 @@ std/text/aho.c6            24 test(s), 0 failure(s)
 std/text/rabin.c6          24 test(s), 0 failure(s)
 std/container/interval.c6  24 test(s), 0 failure(s)
 std/text/align.c6          24 test(s), 0 failure(s)
+std/core/future.c6         24 test(s), 0 failure(s)
+std/core/timer.c6          24 test(s), 0 failure(s)
+std/core/task.c6           24 test(s), 0 failure(s)
+std/os/reactor.c6          31 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4152,6 +4162,18 @@ make std-match
 的位置与次数、验证可重叠计数；`IntervalSet` 插入三段后合并成两段、打印总长度、点包含
 与挖洞；`Aligner` 对 `GATTACA`/`GCATGCU` 给出分数 0 的对齐（`G-ATTACA`/`GCA-TGCU`）。
 
+### 集成示例：`examples/stdasync.c6`
+
+```sh
+make std-async
+```
+
+四节都用方法：`Future` 先挂 `then` 再 `resolve(7)`，重复 resolve 无效，并用
+`all`/`any` 组合两个 Future；`TimerHeap` 插三个定时器后按截止时间升序触发；
+`Sched.spawn` 两个 `step` 任务、`step_all`/`run` 轮转到全部完成；`Reactor` 注册
+管道读事件与 100ms 定时器，`run_once(900, 0)` 无事发生、`run_once(1100, 0)` 触发
+定时器、写入数据后被派发读事件。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4289,6 +4311,8 @@ make std-match
 * `make std-cfg2`：`examples/stdcfg.c6`，第七十批（系统配置文件）模块的拼装示例
   （自带自检）。
 * `make std-match`：`examples/stdmatch.c6`，第七十一批（匹配与对齐）模块的拼装示例
+  （自带自检）。
+* `make std-async`：`examples/stdasync.c6`，第七十二批（异步编程基础）模块的拼装示例
   （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

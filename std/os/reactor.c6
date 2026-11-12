@@ -1,0 +1,352 @@
+/* std/os/reactor：基于 poll 的事件循环（fd 读写事件 + 定时器 + 协作式轮转）。
+ *
+ *     import std.os.reactor;
+ *
+ *     PollSet ps = { 0 };
+ *     IoReg regs[8] = { { 0, 0, 0, 0, 0 } };
+ *     TimerEntry tbuf[8] = { { 0, 0, 0, 0, 0 } };
+ *     Reactor r = { 0 };
+ *     r.init(&ps, regs, 8, tbuf, 8);          // 方法：init / on / after / run_once
+ *     r.on(fd, EVENT_READ, on_readable, 0);
+ *     r.after(now_ms(), 500, on_timeout, 0);  // 500ms 后
+ *     r.run_once(now_ms(), 1000);             // 处理一波事件/超时
+ *
+ * 时间由调用方给（`std.os.time.now_ms()` 或测试里的假时钟），`run_once` 会自己把
+ * 「下一个定时器的剩余时间」当 poll 超时，所以不会空转也不会睡过头。
+ *
+ * 约定：
+ *
+ * - `r.init(ps, regs, cap, timer_buf, tcap)` 绑定 `PollSet`、注册表与定时器堆；
+ * - `r.on(fd, events, cb, ctx)` 注册/改注册（同一个 fd 第二次是更新事件与回调），
+ *   返回 1；`r.off(fd)` 取消注册；`r.io_count()` 是已注册 fd 数；
+ * - `r.after(now, delay, cb, ctx)` 是定时器语法糖（`deadline = now + delay`），
+ *   返回定时器 id（可用 `r.cancel_timer(id)` 取消）；
+ * - `r.run_once(now, max_wait_ms)` 先触发到期定时器，再按「最近定时器」和
+ *   `max_wait_ms` 的较小值等 fd 事件，最后派发就绪的 fd 回调，返回**派发次数**
+ *   （定时器触发 + fd 就绪）；无事可做时返回 0；
+ * - `r.stop()` 置停止标志并清空 `PollSet`（下一次 `run_once` 立刻返回 0）；
+ *   `r.stopped()`/`r.dispatches()` 给状态与累计派发数；
+ * - 回调里可以再 `on`/`off`/`after`（本轮已取出的就绪表不受影响）；
+ * - 线程安全：不加锁，单线程使用（多线程请自己加 `std.os.sync` 的 `Mutex`）。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.os.reactor;
+import std.core.types;
+import std.text.str;
+import std.os.poll;
+import std.core.timer;
+
+typedef void (*IoHandler)(void *ctx, int fd, int events);
+
+struct IoReg {
+    int fd;
+    int events;
+    IoHandler cb;
+    void *ctx;
+    int used;
+};
+
+struct Reactor {
+    PollSet *ps;
+    IoReg *regs;
+    int cap;
+    int used;
+    TimerHeap timers;
+    int stop_flag;
+    int ndispatch;
+};
+
+int init(Reactor *r, PollSet *ps, void *regs, int cap, void *timer_buf, int tcap)
+{
+    if (!r || !ps || !regs || cap <= 0 || !timer_buf || tcap <= 0)
+        return -1;
+    memset(r, 0, sizeof *r);
+    memset(regs, 0, sizeof(IoReg) * (size_t)cap);
+    r->ps = ps;
+    r->regs = (IoReg *)regs;
+    r->cap = cap;
+    r->used = 0;
+    r->stop_flag = 0;
+    r->ndispatch = 0;
+    memset(ps->fds, 0, sizeof(ps->fds));
+    ps->used = 0;
+    ps->nready = 0;
+    if (r->timers.init(timer_buf, tcap) != 1)
+        return -1;
+    return 1;
+}
+
+int io_count(Reactor *r)
+{
+    return r ? r->used : 0;
+}
+
+int stopped(Reactor *r)
+{
+    return r ? r->stop_flag : 1;
+}
+
+int dispatches(Reactor *r)
+{
+    return r ? r->ndispatch : 0;
+}
+
+static IoReg *re_find(Reactor *r, int fd)
+{
+    int i = 0;
+
+    for (i = 0; i < r->cap; i++) {
+        if (r->regs[i].used && r->regs[i].fd == fd)
+            return &r->regs[i];
+    }
+    return (IoReg *)0;
+}
+
+int on(Reactor *r, int fd, int events, IoHandler cb, void *ctx)
+{
+    IoReg *slot = 0;
+    int i = 0;
+
+    if (!r || !r->regs || !r->ps || !cb || fd < 0)
+        return -1;
+    slot = re_find(r, fd);
+    if (!slot) {
+        for (i = 0; i < r->cap; i++) {
+            if (!r->regs[i].used) {
+                slot = &r->regs[i];
+                break;
+            }
+        }
+        if (!slot)
+            return -1;                  /* 注册表满了 */
+        slot->used = 1;
+        slot->fd = fd;
+        r->used++;
+        if (r->ps->add(fd, events) < 0) {
+            slot->used = 0;
+            r->used--;
+            return -1;
+        }
+    } else if (r->ps->modify(fd, events) < 0) {
+        return -1;
+    }
+    slot->events = events;
+    slot->cb = cb;
+    slot->ctx = ctx;
+    return 1;
+}
+
+int off(Reactor *r, int fd)
+{
+    IoReg *slot = 0;
+
+    if (!r || !r->regs || !r->ps)
+        return 0;
+    slot = re_find(r, fd);
+    if (!slot)
+        return 0;
+    r->ps->remove_fd(fd);
+    slot->used = 0;
+    slot->cb = 0;
+    slot->ctx = 0;
+    r->used--;
+    return 1;
+}
+
+i64 after(Reactor *r, i64 now, i64 delay, TimerCb cb, void *ctx)
+{
+    if (!r || delay < 0)
+        return -1;
+    return r->timers.add(now + delay, cb, ctx);
+}
+
+int cancel_timer(Reactor *r, i64 id)
+{
+    return r ? r->timers.cancel(id) : 0;
+}
+
+int timer_count(Reactor *r)
+{
+    return r ? r->timers.count() : 0;
+}
+
+int run_once(Reactor *r, i64 now, int max_wait_ms)
+{
+    int fired = 0, ready = 0, i = 0;
+    i64 next = 0;
+    int wait = max_wait_ms;
+
+    if (!r || !r->ps || !r->regs)
+        return -1;
+    if (r->stop_flag)
+        return 0;
+    fired = r->timers.fire(now);
+    r->ndispatch += fired;
+    if (r->used <= 0 && r->timers.count() <= 0)
+        return fired;                   /* 没有 fd 也没有定时器：不睡 */
+    if (r->timers.next_deadline(&next) == 1) {
+        i64 left = next - now;
+
+        if (left < 0)
+            left = 0;
+        if (max_wait_ms < 0 || left < (i64)max_wait_ms)
+            wait = (int)left;
+    }
+    ready = r->ps->wait(wait);
+    if (ready <= 0)
+        return fired;
+    for (i = 0; i < r->ps->count(); i++) {
+        int fd = 0, ev = 0;
+        IoReg *slot = 0;
+
+        if (!r->ps->is_ready(i))
+            continue;
+        fd = r->ps->fd_at(i);
+        ev = r->ps->ready(i);
+        slot = re_find(r, fd);
+        if (slot && slot->cb) {
+            slot->cb(slot->ctx, fd, ev);
+            r->ndispatch++;
+            fired++;
+        }
+    }
+    return fired;
+}
+
+int stop(Reactor *r)
+{
+    int i = 0;
+
+    if (!r || !r->ps || !r->regs)
+        return -1;
+    r->stop_flag = 1;
+    for (i = 0; i < r->cap; i++) {
+        if (r->regs[i].used) {
+            r->ps->remove_fd(r->regs[i].fd);
+            r->regs[i].used = 0;
+        }
+    }
+    r->used = 0;
+    return 1;
+}
+
+int resume(Reactor *r)
+{
+    if (!r)
+        return -1;
+    r->stop_flag = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct EvCtx {
+    int reads;
+    int timeouts;
+    int last_fd;
+    int last_events;
+};
+
+static void on_readable(void *ctx, int fd, int events)
+{
+    struct EvCtx *c = (struct EvCtx *)ctx;
+
+    c->reads++;
+    c->last_fd = fd;
+    c->last_events = events;
+    {
+        char buf[8] = { 0 };
+
+        read(fd, buf, sizeof buf);      /* 把管道里的数据读掉 */
+    }
+}
+
+static void on_timeout(void *ctx, i64 id)
+{
+    struct EvCtx *c = (struct EvCtx *)ctx;
+
+    (void)id;
+    c->timeouts++;
+}
+
+test "reactor：定时器与 fd 事件" {
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[4] = { { 0, 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Reactor r = { 0 };
+    struct EvCtx c = { 0, 0, 0, 0 };
+    int fds[2] = { -1, -1 };
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe 失败");
+    if (r.init(&ps, regs, 4, tbuf, 4) != 1)
+        return err(2, "init 失败");
+    if (r.io_count() != 0 || r.timer_count() != 0 || r.stopped() != 0)
+        return err(3, "初始状态不对");
+    if (r.on(fds[0], EVENT_READ, on_readable, &c) != 1)
+        return err(4, "注册读事件失败");
+    if (r.io_count() != 1)
+        return err(5, "io_count 应该是 1");
+    if (r.after(1000, 100, on_timeout, &c) <= 0)
+        return err(6, "after 失败");
+    if (r.timer_count() != 1)
+        return err(7, "timer_count 应该是 1");
+    /* 900 时：没到期、没有数据（超时 0ms 立刻返回） */
+    if (r.run_once(900, 0) != 0 || c.timeouts != 0 || c.reads != 0)
+        return err(8, "900 时不该有事件");
+    /* 1100 时：定时器到期 */
+    if (r.run_once(1100, 0) != 1 || c.timeouts != 1)
+        return err(9, "1100 时应该触发定时器");
+    /* 写点数据 → 读事件 */
+    if (write(fds[1], "hi", 2) != 2)
+        return err(10, "write 失败");
+    if (r.run_once(1100, 100) != 1 || c.reads != 1)
+        return err(11, "写了数据之后应该派发读事件");
+    if (c.last_fd != fds[0])
+        return err(12, "派发的 fd 不对");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "reactor：取消、重复注册与停止" {
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[2] = { { 0, 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Reactor r = { 0 };
+    struct EvCtx c = { 0, 0, 0, 0 };
+    int fds[2] = { -1, -1 };
+    i64 tid = 0;
+
+    if (pipe(fds) != 0)
+        return err(13, "pipe 失败");
+    r.init(&ps, regs, 2, tbuf, 2);
+    if (r.on(fds[0], EVENT_READ, on_readable, &c) != 1)
+        return err(14, "注册失败");
+    /* 同一个 fd 再注册是更新，不占新槽 */
+    if (r.on(fds[0], EVENT_READ, on_readable, &c) != 1 || r.io_count() != 1)
+        return err(15, "重复注册应该只是更新");
+    if (r.off(fds[0]) != 1 || r.io_count() != 0)
+        return err(16, "取消注册失败");
+    if (r.off(fds[0]) != 0)
+        return err(17, "重复取消应该返回 0");
+    /* 定时器取消 */
+    tid = r.after(0, 50, on_timeout, &c);
+    if (r.cancel_timer(tid) != 1)
+        return err(18, "取消定时器失败");
+    if (r.run_once(1000, 0) != 0 || c.timeouts != 0)
+        return err(19, "取消之后不该触发");
+    /* 停止 */
+    r.on(fds[0], EVENT_READ, on_readable, &c);
+    if (r.stop() != 1 || r.stopped() != 1 || r.io_count() != 0)
+        return err(20, "stop 之后应该清空注册");
+    if (r.run_once(1000, 10) != 0)
+        return err(21, "停止后 run_once 应该立刻返回 0");
+    if (r.resume() != 1 || r.stopped() != 0)
+        return err(22, "resume 应该恢复");
+    close(fds[0]);
+    close(fds[1]);
+}

@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十二批（异步编程基础）**：`std.core.future`（Future/Promise 与
+  all/any 组合）、`std.core.timer`（定时器小顶堆）、`std.core.task`（协作式任务调度）、
+  `std.os.reactor`（poll + 定时器的事件循环），集成示例 `examples/stdasync.c6`
+  （`make std-async`）。错误号段 `std.core.future`=0x6129 … `std.os.reactor`=0x612c
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十一批（匹配与对齐）**：`std.text.aho`（Aho-Corasick 多模式匹配）、
   `std.text.rabin`（Rabin-Karp 滚动哈希）、`std.container.interval`（闭区间集合）、
   `std.text.align`（Needleman-Wunsch 全局比对），集成示例 `examples/stdmatch.c6`

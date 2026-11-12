@@ -2353,6 +2353,33 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（297 个模块、0 failure）、`make std-match`（24 条自检全过）、
 `make check-all`。
 
+### 11.84 标准库第七十二批（future / timer / task / reactor）
+
+第七十二批做「异步编程基础」：Future/Promise、定时器堆、协作式任务与 poll 事件循环。
+四个模块都**不读时钟、不开线程**——时间是调用方给的整数毫秒，事件由调用方驱动，
+所以全部可以写确定性测试。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.future` | Future | 三态机，第一次 `resolve`/`reject` 生效，之后再调返回 0；`then` 只挂一个回调（完成时立刻调用）；`all`/`any` 是**轮询式**（调用时才看状态），`all` 用「接收者当数组首元素」的写法：`fs[0].all(n, &out)` |
+| `std.core.timer` | 定时器 | 小顶堆按 `(deadline, id)` 排序保证触发顺序稳定；`cancel` 先线性找再「下沉+上浮」修复堆；`fire` 里回调可以再 `add`（下一轮触发） |
+| `std.core.task` | 协作式调度 | 任务就是 `int step(void*)`，返回 1 继续 / 0 完成；`poll` 被改名 `step_all`，否则与系统 `poll(2)` 的符号冲突（编译期 `redefinition of 'std__core__task__poll'`） |
+| `std.os.reactor` | 事件循环 | 复用 `std.os.poll` 的 `PollSet` 与 `std.core.timer`；`run_once(now, max_wait)` 用「最近定时器 − now」与 `max_wait` 的较小值做 poll 超时，既不会空转也不会睡过头；`stop()` 清空注册表，`resume()` 恢复 |
+
+踩到的两个坑：一是 `task` 里的 `poll()` 与 `<poll.h>` 的 `poll` 撞名；二是测试辅助
+结构（`Counter`/`CbCtx`/`HitCtx`）定义在文件作用域会进入公共命名空间，和示例里的
+同名结构撞车，统一改成 `TaskCounterTest`/`FutureCbTest`/`TimerHitTest`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.future`=0x6129、
+`std.core.timer`=0x612a、`std.core.task`=0x612b、`std.os.reactor`=0x612c；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-async` 与 `STD_ASYNC_SRCS`，`test-all`/`check-all` 都
+带上它；`future`/`timer`/`task` 在 `stdtest` 里只依赖 `std/text/str.c6`（各 24 条），
+`reactor` 依赖 str + poll + timer（31 条）。示例 `examples/stdasync.c6` 四节（25 条自检）。
+
+验收：`make stdtest`（301 个模块、0 failure）、`make std-async`（25 条自检全过）、
+`make check-all`。
+
+
 
 
 

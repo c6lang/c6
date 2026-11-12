@@ -13002,6 +13002,10 @@ static const struct C6ErrStdSlot {
     { "std.text.rabin",         C6_ERR_SLOT_STD + 294 },
     { "std.container.interval", C6_ERR_SLOT_STD + 295 },
     { "std.text.align",         C6_ERR_SLOT_STD + 296 },
+    { "std.core.future",        C6_ERR_SLOT_STD + 297 },
+    { "std.core.timer",         C6_ERR_SLOT_STD + 298 },
+    { "std.core.task",          C6_ERR_SLOT_STD + 299 },
+    { "std.os.reactor",         C6_ERR_SLOT_STD + 300 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

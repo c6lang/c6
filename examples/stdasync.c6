@@ -1,0 +1,209 @@
+/* examples/stdasync.c6 —— 第七十二批（异步编程基础）的集成示例。
+ *
+ *     make std-async
+ *
+ * 四节：Future 回调与组合、定时器堆、协作式任务、reactor（poll + 定时器）。
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.future;
+import std.core.timer;
+import std.core.task;
+import std.os.poll;
+import std.os.reactor;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+struct Fctx {
+    int calls;
+    i64 value;
+};
+
+static void fut_done(void *self, void *ctx)
+{
+    Future *f = (Future *)self;
+    struct Fctx *c = (struct Fctx *)ctx;
+
+    c->calls++;
+    c->value = f->val;
+}
+
+static void do_future(void)
+{
+    Future f = { 0 }, g = { 0 }, logs[2] = { { 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0 } };
+    Future out = { 0 };
+    struct Fctx fc = { 0, 0 };
+
+    printf("== future\n");
+    check(f.init() == 1, "init");
+    check(f.state() == FUT_PENDING, "初始挂起");
+    f.then(fut_done, &fc);
+    check(fc.calls == 0, "未完成不回调");
+    check(f.resolve(7) == 1, "resolve");
+    printf("   resolve(7) → 回调 %d 次、看到 %lld\n", fc.calls, (long long)fc.value);
+    check(fc.calls == 1 && fc.value == 7, "resolve 触发回调");
+    check(f.resolve(9) == 0 && f.value() == 7, "重复 resolve 无效");
+    /* all 组合 */
+    logs[0].init();
+    logs[1].init();
+    logs[0].resolve(1);
+    check(logs[0].all(2, &out) == 0, "还有挂起时 all 返回 0");
+    logs[1].resolve(2);
+    check(logs[0].all(2, &out) == 1 && out.value() == 2, "全部就绪 all 值为 2");
+    logs[1].init();
+    logs[1].reject(-3);
+    check(logs[0].all(2, &out) == 1 && out.code() == -3, "任一失败 all 带错误码");
+    (void)g;
+}
+
+struct Tctx {
+    int fired;
+    i64 ids[4];
+};
+
+static void t_cb(void *ctx, i64 id)
+{
+    struct Tctx *c = (struct Tctx *)ctx;
+
+    if (c->fired < 4)
+        c->ids[c->fired] = id;
+    c->fired++;
+}
+
+static void do_timer(void)
+{
+    static TimerEntry buf[8] = { { 0, 0, 0, 0, 0 } };
+    TimerHeap h = { 0 };
+    struct Tctx c = { 0, { 0, 0, 0, 0 } };
+    i64 d = 0;
+
+    printf("== timer\n");
+    check(h.init(buf, 8) == 1, "init");
+    h.add(300, t_cb, &c);
+    h.add(100, t_cb, &c);
+    h.add(200, t_cb, &c);
+    h.next_deadline(&d);
+    printf("   最早截止 %lld，此刻 150 时触发 %d 个\n", (long long)d, h.fire(150));
+    check(h.count() == 2, "触发后剩 2 个");
+    check(h.fire(500) == 2 && c.fired == 3, "500 时全部触发");
+    printf("   触发顺序：%lld → %lld → %lld\n", (long long)c.ids[0],
+           (long long)c.ids[1], (long long)c.ids[2]);
+    check(c.ids[0] == 2 && c.ids[2] == 1, "按截止时间升序");
+}
+
+struct Counter {
+    int ticks;
+    int limit;
+    int done;
+};
+
+static int step(void *state)
+{
+    struct Counter *c = (struct Counter *)state;
+
+    c->ticks++;
+    if (c->ticks >= c->limit) {
+        c->done = 1;
+        return 0;
+    }
+    return 1;
+}
+
+static void do_task(void)
+{
+    static TaskSlot buf[8] = { { 0, 0, 0, 0 } };
+    Sched s = { 0 };
+    struct Counter a = { 0, 3, 0 };
+    struct Counter b = { 0, 1, 0 };
+
+    printf("== task\n");
+    check(s.init(buf, 8) == 1, "init");
+    s.spawn(step, &a);
+    s.spawn(step, &b);
+    check(s.active() == 2, "两个活动任务");
+    check(s.step_all() == 1, "第一轮后剩 1 个");
+    s.run(5);
+    printf("   任务 a tick %d 次（完成 %d），任务 b 完成 %d，轮数 %lld\n",
+           a.ticks, a.done, b.done, (long long)s.rounds());
+    check(a.ticks == 3 && a.done == 1, "a 三轮后完成");
+    check(b.done == 1 && s.active() == 0, "b 已完成、调度器空闲");
+}
+
+struct Rctx {
+    int reads;
+    int timed_out;
+};
+
+static void r_read(void *ctx, int fd, int events)
+{
+    struct Rctx *c = (struct Rctx *)ctx;
+    char buf[16] = { 0 };
+
+    (void)events;
+    c->reads++;
+    read(fd, buf, sizeof buf);
+}
+
+static void r_timeout(void *ctx, i64 id)
+{
+    struct Rctx *c = (struct Rctx *)ctx;
+
+    (void)id;
+    c->timed_out++;
+}
+
+static void do_reactor(void)
+{
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[4] = { { 0, 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Reactor r = { 0 };
+    struct Rctx c = { 0, 0 };
+    int fds[2] = { -1, -1 };
+
+    printf("== reactor\n");
+    if (pipe(fds) != 0) {
+        check(0, "pipe 创建");
+        return;
+    }
+    check(r.init(&ps, regs, 4, tbuf, 4) == 1, "init");
+    r.on(fds[0], EVENT_READ, r_read, &c);
+    r.after(1000, 100, r_timeout, &c);
+    check(r.io_count() == 1 && r.timer_count() == 1, "注册 fd 与定时器");
+    check(r.run_once(900, 0) == 0, "900 时无事发生");
+    check(r.run_once(1100, 0) == 1 && c.timed_out == 1, "1100 时定时器触发");
+    write(fds[1], "ping", 4);
+    check(r.run_once(1100, 100) == 1 && c.reads == 1, "管道可读被派发");
+    printf("   累计派发 %d 次（读 %d、超时 %d）\n", r.dispatches(), c.reads,
+           c.timed_out);
+    check(r.stop() == 1 && r.stopped() == 1, "stop");
+    check(r.run_once(1200, 10) == 0, "停止后立刻返回");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+int main(void)
+{
+    do_future();
+    do_timer();
+    do_task();
+    do_reactor();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
