@@ -5,9 +5,9 @@
  *     SkipNode nodes[64] = { 0 };
  *     SkipList sl = { 0 };
  *     i64 old = 0;
- *     skip_init(&sl, nodes, 64);
- *     skip_put(&sl, 10, 100, &old);
- *     skip_get(&sl, 10, &v);
+ *     sl.init(nodes, 64);
+ *     sl.put(10, 100, &old);
+ *     sl.get(10, &v);
  *
  * 节点是数组下标，`next[k]` 是第 k 层的后继下标（-1 表示该层到头）。`nodes[0]`
  * 是**头哨兵**，它的 `key` 不参与比较；其余节点按 `key` 升序在各层串起来。层数
@@ -16,13 +16,13 @@
  * 约定：
  *
  * - 存储由调用方给（`nodes` 至少 `cap` 个，含头哨兵），本模块不分配；
- * - `skip_put` 返回 1 插入 / 0 更新（`*old` 给旧值）/ -1 没有空间；
- * - `skip_get` 返回 1 找到 / 0 没有；
- * - `skip_del` 返回 1 删掉 / 0 没有；
- * - `skip_first`/`skip_next` 支持从小到大遍历（`skip_next` 给**严格大于** `key`
+ * - `put` 返回 1 插入 / 0 更新（`*old` 给旧值）/ -1 没有空间；
+ * - `get` 返回 1 找到 / 0 没有；
+ * - `del` 返回 1 删掉 / 0 没有；
+ * - `first`/`next` 支持从小到大遍历（`next` 给**严格大于** `key`
  *   的下一个）；
- * - `skip_at` 取有序第 idx 个（0 起），实现是「从第 0 层往后走」，最坏 O(n)；
- * - 键唯一：重复 `skip_put` 是更新值，不新增节点。
+ * - `at` 取有序第 idx 个（0 起），实现是「从第 0 层往后走」，最坏 O(n)；
+ * - 键唯一：重复 `put` 是更新值，不新增节点。
  */
 #include <string.h>
 
@@ -67,7 +67,7 @@ static int skip_rand_level(SkipList *sl)
     return level;
 }
 
-int skip_init(SkipList *sl, SkipNode *nodes, int cap)
+int init(SkipList *sl, SkipNode *nodes, int cap)
 {
     int i = 0;
 
@@ -88,7 +88,7 @@ int skip_init(SkipList *sl, SkipNode *nodes, int cap)
     return 1;
 }
 
-int skip_size(SkipList *sl)
+int size(SkipList *sl)
 {
     return sl ? sl->n : 0;
 }
@@ -107,7 +107,7 @@ static void skip_find_preds(SkipList *sl, i64 key, int *preds)
     }
 }
 
-int skip_put(SkipList *sl, i64 key, i64 val, i64 *old)
+int put(SkipList *sl, i64 key, i64 val, i64 *old)
 {
     int preds[SKIP_LEVELS] = { 0 };
     int cur = 0, level = 0, idx = 0, i = 0;
@@ -142,7 +142,7 @@ int skip_put(SkipList *sl, i64 key, i64 val, i64 *old)
     return 1;
 }
 
-int skip_get(SkipList *sl, i64 key, i64 *out)
+int get(SkipList *sl, i64 key, i64 *out)
 {
     int preds[SKIP_LEVELS] = { 0 };
     int cur = 0;
@@ -159,7 +159,7 @@ int skip_get(SkipList *sl, i64 key, i64 *out)
     return 0;
 }
 
-int skip_del(SkipList *sl, i64 key)
+int del(SkipList *sl, i64 key)
 {
     int preds[SKIP_LEVELS] = { 0 };
     int cur = 0, i = 0;
@@ -178,7 +178,7 @@ int skip_del(SkipList *sl, i64 key)
     return 1;
 }
 
-int skip_first(SkipList *sl, i64 *key, i64 *val)
+int first(SkipList *sl, i64 *key, i64 *val)
 {
     int cur = 0;
 
@@ -194,7 +194,7 @@ int skip_first(SkipList *sl, i64 *key, i64 *val)
     return 1;
 }
 
-int skip_next(SkipList *sl, i64 key, i64 *out_key, i64 *out_val)
+int next(SkipList *sl, i64 key, i64 *out_key, i64 *out_val)
 {
     int preds[SKIP_LEVELS] = { 0 };
     int cur = 0;
@@ -212,7 +212,7 @@ int skip_next(SkipList *sl, i64 key, i64 *out_key, i64 *out_val)
     return 1;
 }
 
-int skip_at(SkipList *sl, int idx, i64 *key, i64 *val)
+int at(SkipList *sl, int idx, i64 *key, i64 *val)
 {
     int cur = 0, k = 0;
 
@@ -237,27 +237,27 @@ test "skiplist：插入、查询与删除" {
     SkipList sl = { 0 };
     i64 old = 0, v = 0;
 
-    if (skip_init(&sl, nodes, 32) != 1)
+    if (sl.init(nodes, 32) != 1)
         return err(1, "初始化失败");
-    if (skip_put(&sl, 10, 100, &old) != 1)
+    if (sl.put(10, 100, &old) != 1)
         return err(2, "插入 10 失败");
-    if (skip_put(&sl, 5, 50, &old) != 1 || skip_put(&sl, 20, 200, &old) != 1)
+    if (sl.put(5, 50, &old) != 1 || sl.put(20, 200, &old) != 1)
         return err(3, "插入失败");
-    if (skip_put(&sl, 10, 111, &old) != 0 || old != 100)
+    if (sl.put(10, 111, &old) != 0 || old != 100)
         return err(4, "更新已有键应该返回 0");
-    if (skip_size(&sl) != 3)
+    if (sl.size() != 3)
         return err(5, "元素数不对");
-    if (skip_get(&sl, 10, &v) != 1 || v != 111)
+    if (sl.get(10, &v) != 1 || v != 111)
         return err(6, "取 10 不对");
-    if (skip_get(&sl, 7, &v) != 0)
+    if (sl.get(7, &v) != 0)
         return err(7, "不存在的键应该 0");
-    if (skip_del(&sl, 5) != 1 || skip_get(&sl, 5, &v) != 0)
+    if (sl.del(5) != 1 || sl.get(5, &v) != 0)
         return err(8, "删除 5 不对");
-    if (skip_del(&sl, 5) != 0)
+    if (sl.del(5) != 0)
         return err(9, "重复删除应该 0");
-    if (skip_size(&sl) != 2)
+    if (sl.size() != 2)
         return err(10, "删除后元素数不对");
-    if (skip_put(&sl, -3, 1, &old) != 1 || skip_get(&sl, -3, &v) != 1)
+    if (sl.put(-3, 1, &old) != 1 || sl.get(-3, &v) != 1)
         return err(11, "负键应该也能插");
 }
 
@@ -268,47 +268,47 @@ test "skiplist：有序遍历" {
     int i = 0, count = 0;
     i64 prev = 0;
 
-    if (skip_init(&sl, nodes, 64) != 1)
+    if (sl.init(nodes, 64) != 1)
         return err(12, "初始化失败");
     /* 乱序插入 30 个键 */
     for (i = 0; i < 30; i++)
-        skip_put(&sl, (i64)((i * 17) % 30), (i64)i, &old);
-    if (skip_size(&sl) != 30)
+        sl.put((i64)((i * 17) % 30), (i64)i, &old);
+    if (sl.size() != 30)
         return err(13, "30 个键的元素数不对");
-    if (skip_first(&sl, &key, &val) != 1 || key != 0)
+    if (sl.first(&key, &val) != 1 || key != 0)
         return err(14, "第一个键应该是 0");
     count = 0;
     prev = -1;
-    while (skip_first(&sl, &key, &val) == 1 && count == 0) {
+    while (sl.first(&key, &val) == 1 && count == 0) {
         count++;
         prev = key;
     }
     count = 0;
     {
         i64 cur = 0;
-        int have = skip_first(&sl, &cur, &val);
+        int have = sl.first(&cur, &val);
 
         while (have) {
             if (count > 0 && cur <= prev)
                 return err(15, "遍历应该严格递增");
             prev = cur;
             count++;
-            have = skip_next(&sl, cur, &cur, &val);
+            have = sl.next(cur, &cur, &val);
         }
     }
     if (count != 30)
         return err(16, "遍历到的元素数不对");
-    if (skip_at(&sl, 0, &key, &val) != 1 || key != 0)
+    if (sl.at(0, &key, &val) != 1 || key != 0)
         return err(17, "第 0 个应该是 0");
-    if (skip_at(&sl, 29, &key, &val) != 1 || key != 29)
+    if (sl.at(29, &key, &val) != 1 || key != 29)
         return err(18, "第 29 个应该是 29");
-    if (skip_at(&sl, 30, &key, &val) != 0)
+    if (sl.at(30, &key, &val) != 0)
         return err(19, "越界应该 0");
     /* 删掉一半再遍历 */
     for (i = 0; i < 30; i += 2)
-        skip_del(&sl, (i64)i);
-    if (skip_size(&sl) != 15)
+        sl.del((i64)i);
+    if (sl.size() != 15)
         return err(20, "删掉 15 个后元素数不对");
-    if (skip_at(&sl, 0, &key, &val) != 1 || key != 1)
+    if (sl.at(0, &key, &val) != 1 || key != 1)
         return err(21, "删除后第 0 个应该是 1");
 }

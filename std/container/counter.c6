@@ -4,23 +4,23 @@
  *
  *     CounterSlot slots[64] = { 0 };
  *     Counter c = { 0 };
- *     counter_init(&c, slots, 64);
- *     counter_add(&c, S("GET"), 1);
- *     counter_get(&c, S("GET"));        // 1
+ *     c.init(slots, 64);
+ *     c.add(S("GET"), 1);
+ *     c.get(S("GET"));        // 1
  *
  * 键是**定长拷贝**（最多 23 字节，存在 `CounterSlot.key` 里），所以没有生命周期
  * 问题；表是开放寻址 + 线性探测，容量必须是 2 的幂，装到 3/4 就返回「满」。
  *
  * 约定：
  *
- * - `counter_init` 的 `cap` 必须是 2 的幂且 >= 4，否则返回 -1；
- * - `counter_add` 的 `delta` 可以是负数（用于扣减），返回新计数；
+ * - `init` 的 `cap` 必须是 2 的幂且 >= 4，否则返回 -1；
+ * - `add` 的 `delta` 可以是负数（用于扣减），返回新计数；
  *   键超长或表满返回 -1；
- * - `counter_get` 没见过的键返回 0（没法区分「计数为 0」与「不存在」，
- *   需要区分请先看 `counter_add` 的返回值）；
- * - `counter_top` 找计数最大的键（并列时返回先插入的那个）；
- * - `counter_total` 是所有增量的总和，`counter_keys` 是不同键的个数；
- * - `counter_clear` 把表清空（不释放内存）。
+ * - `get` 没见过的键返回 0（没法区分「计数为 0」与「不存在」，
+ *   需要区分请先看 `add` 的返回值）；
+ * - `top` 找计数最大的键（并列时返回先插入的那个）；
+ * - `total` 是所有增量的总和，`keys` 是不同键的个数；
+ * - `clear` 把表清空（不释放内存）。
  */
 #include <string.h>
 
@@ -58,7 +58,7 @@ static int counter_pow2(int n)
     return n > 0 && (n & (n - 1)) == 0;
 }
 
-int counter_init(Counter *c, CounterSlot *slots, int cap)
+int init(Counter *c, CounterSlot *slots, int cap)
 {
     if (!c || !slots || cap < 4 || !counter_pow2(cap))
         return -1;
@@ -70,7 +70,7 @@ int counter_init(Counter *c, CounterSlot *slots, int cap)
     return 1;
 }
 
-int counter_clear(Counter *c)
+int clear(Counter *c)
 {
     if (!c || !c->slots)
         return -1;
@@ -109,7 +109,7 @@ static int counter_find(Counter *c, char[:] key, int *found)
     return -1;
 }
 
-i64 counter_get(Counter *c, char[:] key)
+i64 get(Counter *c, char[:] key)
 {
     int found = 0, idx = 0;
 
@@ -121,7 +121,7 @@ i64 counter_get(Counter *c, char[:] key)
     return c->slots[idx].count;
 }
 
-int counter_add(Counter *c, char[:] key, i64 delta)
+int add(Counter *c, char[:] key, i64 delta)
 {
     int found = 0, idx = 0;
 
@@ -144,17 +144,17 @@ int counter_add(Counter *c, char[:] key, i64 delta)
     return (int)c->slots[idx].count;
 }
 
-int counter_keys(Counter *c)
+int keys(Counter *c)
 {
     return c ? c->used : 0;
 }
 
-i64 counter_total(Counter *c)
+i64 sum(Counter *c)
 {
     return c ? c->total : 0;
 }
 
-int counter_top(Counter *c, char *key, int cap, i64 *count)
+int top(Counter *c, char *key, int cap, i64 *count)
 {
     int i = 0, best = -1;
 
@@ -191,30 +191,30 @@ test "counter：基本计数" {
     char top[32] = { 0 };
     i64 n = 0;
 
-    if (counter_init(&c, slots, 64) != 1)
+    if (c.init(slots, 64) != 1)
         return err(1, "初始化失败");
-    if (counter_get(&c, S("GET")) != 0)
+    if (c.get(S("GET")) != 0)
         return err(2, "没见过的键应该是 0");
-    if (counter_add(&c, S("GET"), 1) != 1)
+    if (c.add(S("GET"), 1) != 1)
         return err(3, "GET 第一次计数应该是 1");
-    counter_add(&c, S("GET"), 2);
-    if (counter_get(&c, S("GET")) != 3)
+    c.add(S("GET"), 2);
+    if (c.get(S("GET")) != 3)
         return err(4, "GET 应该累加到 3");
-    counter_add(&c, S("PUT"), 1);
-    if (counter_keys(&c) != 2)
+    c.add(S("PUT"), 1);
+    if (c.keys() != 2)
         return err(5, "不同键数应该是 2");
-    if (counter_total(&c) != 4)
+    if (c.sum() != 4)
         return err(6, "总量应该是 4");
-    if (counter_top(&c, top, (int)sizeof top, &n) != 1 || n != 3
+    if (c.top(top, (int)sizeof top, &n) != 1 || n != 3
         || strcmp(top, "GET") != 0)
         return err(7, "出现最多的应该是 GET（3 次）");
-    counter_add(&c, S("GET"), -1);
-    if (counter_get(&c, S("GET")) != 2)
+    c.add(S("GET"), -1);
+    if (c.get(S("GET")) != 2)
         return err(8, "负增量应该扣减");
-    if (counter_clear(&c) != 1 || counter_keys(&c) != 0
-        || counter_total(&c) != 0)
+    if (c.clear() != 1 || c.keys() != 0
+        || c.sum() != 0)
         return err(9, "清空后应该回到初始状态");
-    if (counter_init(&c, slots, 100) != -1)
+    if (c.init(slots, 100) != -1)
         return err(10, "容量不是 2 的幂应该 -1");
 }
 
@@ -225,7 +225,7 @@ test "counter：装满、长键与冲突" {
     i64 n = 0;
     int i = 0, rc = 0;
 
-    if (counter_init(&c, slots, 8) != 1)
+    if (c.init(slots, 8) != 1)
         return err(11, "初始化失败");
     /* 8 个槽位，装到 6 个（3/4）后就不该再插新键 */
     for (i = 0; i < 6; i++) {
@@ -233,37 +233,37 @@ test "counter：装满、长键与冲突" {
 
         k[0] = 'k';
         k[1] = (char)('0' + i);
-        rc = counter_add(&c, (char[:]){ k, 2 }, 1);
+        rc = c.add((char[:]){ k, 2 }, 1);
         if (rc != 1)
             return err(12, "第 6 个键应该还能插入");
     }
-    if (counter_add(&c, S("k9"), 1) != -1)
+    if (c.add(S("k9"), 1) != -1)
         return err(13, "装到 3/4 后再插新键应该 -1");
     /* 已有键仍然可以累加 */
-    if (counter_add(&c, S("k0"), 1) != 2)
+    if (c.add(S("k0"), 1) != 2)
         return err(14, "已有键在满表时也应该能累加");
     /* 超长键 */
     memset(longkey, 'x', sizeof longkey);
-    if (counter_add(&c, (char[:]){ longkey, 30 }, 1) != -1)
+    if (c.add((char[:]){ longkey, 30 }, 1) != -1)
         return err(15, "超过 23 字节的键应该 -1");
-    if (counter_add(&c, S(""), 1) != -1)
+    if (c.add(S(""), 1) != -1)
         return err(16, "空键应该 -1");
     /* 大量短键：不同前缀不该互相覆盖 */
     {
         CounterSlot big[256] = { 0 };
         Counter b = { 0 };
 
-        counter_init(&b, big, 256);
+        b.init(big, 256);
         for (i = 0; i < 100; i++) {
             char k[8] = { 0 };
 
             k[0] = (char)('a' + i % 26);
             k[1] = (char)('0' + i / 26);
-            counter_add(&b, (char[:]){ k, 2 }, (i64)(i + 1));
+            b.add((char[:]){ k, 2 }, (i64)(i + 1));
         }
-        if (counter_keys(&b) != 100)
+        if (b.keys() != 100)
             return err(17, "100 个不同键不该发生覆盖");
-        if (counter_top(&b, longkey, (int)sizeof longkey, &n) != 1)
+        if (b.top(longkey, (int)sizeof longkey, &n) != 1)
             return err(18, "应该能选出出现最多的键");
     }
 }

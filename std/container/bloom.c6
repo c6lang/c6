@@ -4,10 +4,10 @@
  *
  *     unsigned char buf[16] = { 0 };
  *     Bloom b = { 0 };
- *     bloom_init(&b, buf, 64, 3);
- *     bloom_add(&b, (char[:]){ S("hello") });
- *     bloom_has(&b, (char[:]){ S("hello") });   // 1
- *     bloom_has(&b, (char[:]){ S("world") });   // 大概 0
+ *     b.init(buf, 64, 3);
+ *     b.add((char[:]){ S("hello") });
+ *     b.has((char[:]){ S("hello") });   // 1
+ *     b.has((char[:]){ S("world") });   // 大概 0
  *
  * 位图由调用方给（`buf` 至少 `(nbits+7)/8` 字节），哈希用 FNV-1a 的两组参数做
  * 双哈希：`h_i = h1 + i*h2`，取 `% nbits`。`nhashes` 一般取 `nbits/元素数 * 0.69`
@@ -15,11 +15,11 @@
  *
  * 约定：
  *
- * - `bloom_add` 只置位，不能删（布隆过滤器的本分）；
- * - `bloom_has` 返回 1 表示「可能在里面」、0 表示「一定不在」；
- * - `bloom_set_bits` 给已置位个数（估算误判率用），`bloom_capacity` 是位数；
+ * - `add` 只置位，不能删（布隆过滤器的本分）；
+ * - `has` 返回 1 表示「可能在里面」、0 表示「一定不在」；
+ * - `bits` 给已置位个数（估算误判率用），`capacity` 是位数；
  * - `bloom_estimate` 按 `(m/n)*ln2` 近似的公式反推元素个数时会用到置位数，
- *   这里只提供 `bloom_fill_ratio`（0..1000 的千分数），避免浮点依赖；
+ *   这里只提供 `fill_ratio`（0..1000 的千分数），避免浮点依赖；
  * - `nbits <= 0` 或 `nhashes <= 0` 的初始化返回 -1，之后的调用都当空操作。
  */
 #include <string.h>
@@ -47,7 +47,7 @@ static u32 bloom_hash(char[:] key, u32 seed)
     return h;
 }
 
-int bloom_init(Bloom *b, void *buf, int nbits, int nhashes)
+int init(Bloom *b, void *buf, int nbits, int nhashes)
 {
     int bytes = 0;
 
@@ -62,7 +62,7 @@ int bloom_init(Bloom *b, void *buf, int nbits, int nhashes)
     return 1;
 }
 
-void bloom_add(Bloom *b, char[:] key)
+void add(Bloom *b, char[:] key)
 {
     u32 h1 = 0, h2 = 0;
     int i = 0;
@@ -82,7 +82,7 @@ void bloom_add(Bloom *b, char[:] key)
     }
 }
 
-int bloom_has(Bloom *b, char[:] key)
+int has(Bloom *b, char[:] key)
 {
     u32 h1 = 0, h2 = 0;
     int i = 0;
@@ -101,17 +101,17 @@ int bloom_has(Bloom *b, char[:] key)
     return 1;
 }
 
-int bloom_set_bits(Bloom *b)
+int set_bits(Bloom *b)
 {
     return b ? b->count : 0;
 }
 
-int bloom_capacity(Bloom *b)
+int capacity(Bloom *b)
 {
     return b ? b->nbits : 0;
 }
 
-int bloom_fill_ratio(Bloom *b)
+int fill_ratio(Bloom *b)
 {
     if (!b || b->nbits <= 0)
         return 0;
@@ -126,29 +126,29 @@ test "bloom：加入与查询" {
     static u8 buf[64] = { 0 };
     Bloom b = { 0 };
 
-    if (bloom_init(&b, buf, 256, 3) != 1)
+    if (b.init(buf, 256, 3) != 1)
         return err(1, "初始化失败");
-    if (bloom_has(&b, S("hello")) != 0)
+    if (b.has(S("hello")) != 0)
         return err(2, "空过滤器应该查不到");
-    bloom_add(&b, S("hello"));
-    if (bloom_has(&b, S("hello")) != 1)
+    b.add(S("hello"));
+    if (b.has(S("hello")) != 1)
         return err(3, "加入后应该查得到");
-    if (bloom_capacity(&b) != 256)
+    if (b.capacity() != 256)
         return err(4, "位数不对");
-    if (bloom_set_bits(&b) < 1 || bloom_set_bits(&b) > 3)
+    if (b.set_bits() < 1 || b.set_bits() > 3)
         return err(5, "置位数应该在 1..3");
     /* 重复加入不增加置位数 */
     {
-        int before = bloom_set_bits(&b);
+        int before = b.set_bits();
 
-        bloom_add(&b, S("hello"));
-        if (bloom_set_bits(&b) != before)
+        b.add(S("hello"));
+        if (b.set_bits() != before)
             return err(6, "重复加入不该改变置位数");
     }
-    bloom_add(&b, S("world"));
-    if (bloom_has(&b, S("world")) != 1 || bloom_has(&b, S("hello")) != 1)
+    b.add(S("world"));
+    if (b.has(S("world")) != 1 || b.has(S("hello")) != 1)
         return err(7, "两个键都应该在");
-    if (bloom_init(&b, buf, 0, 3) != -1)
+    if (b.init(buf, 0, 3) != -1)
         return err(8, "位数 0 应该 -1");
 }
 
@@ -157,7 +157,7 @@ test "bloom：误判与填充率" {
     Bloom b = { 0 };
     int i = 0, hits = 0;
 
-    if (bloom_init(&b, buf, 32768, 3) != 1)
+    if (b.init(buf, 32768, 3) != 1)
         return err(9, "初始化失败");
     for (i = 0; i < 200; i++) {
         char key[16] = { 0 };
@@ -166,7 +166,7 @@ test "bloom：误判与填充率" {
         key[1] = (char)('a' + (i / 26) % 26);
         key[2] = (char)('0' + i % 10);
         key[3] = (char)('A' + (i / 10) % 26);
-        bloom_add(&b, (char[:]){ key, 4 });
+        b.add((char[:]){ key, 4 });
     }
     for (i = 0; i < 200; i++) {
         char key[16] = { 0 };
@@ -175,7 +175,7 @@ test "bloom：误判与填充率" {
         key[1] = (char)('a' + (i / 26) % 26);
         key[2] = (char)('0' + i % 10);
         key[3] = (char)('A' + (i / 10) % 26);
-        if (bloom_has(&b, (char[:]){ key, 4 }) != 1)
+        if (b.has((char[:]){ key, 4 }) != 1)
             return err(10, "已加入的键必须查得到");
     }
     /* 没加入的键多数应该查不到（大位图 + 200 个键，误判应当很少） */
@@ -186,13 +186,13 @@ test "bloom：误判与填充率" {
         key[1] = (char)('0' + i % 10);
         key[2] = (char)('x' + i % 3);
         key[3] = 'Z';
-        if (bloom_has(&b, (char[:]){ key, 4 }) != 0)
+        if (b.has((char[:]){ key, 4 }) != 0)
             hits++;
     }
     if (hits > 10)
         return err(11, "误判太多（大于 10%）");
-    if (bloom_fill_ratio(&b) <= 0 || bloom_fill_ratio(&b) > 1000)
+    if (b.fill_ratio() <= 0 || b.fill_ratio() > 1000)
         return err(12, "填充率应该在 0..1000 的千分数内");
-    if (bloom_set_bits(&b) > 32768)
+    if (b.set_bits() > 32768)
         return err(13, "置位数不该超过位数");
 }

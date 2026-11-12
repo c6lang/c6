@@ -1,0 +1,597 @@
+/* std/data/srt：SubRip（.srt）与 WebVTT（.vtt）字幕的解析与生成。
+ *
+ *     import std.data.srt;
+ *
+ *     SrtDoc doc = { 0 };
+ *     SrtCue cue = { 0 };
+ *     open(&doc, buf, n);              // 也可以直接 srt_parse(buf, n, 0, &cue)
+ *     while (doc.next(&cue) == 1)          // 方法用法：doc.next(&cue)
+ *         // cue.start_ms / cue.end_ms / cue.text / cue.next_off
+ *
+ * SubRip 一条 cue 长这样：
+ *
+ *     1
+ *     00:00:01,000 --> 00:00:04,500
+ *     第一行字幕
+ *     第二行字幕
+ *
+ * WebVTT 少了序号、时间用 `.` 分隔、开头有 `WEBVTT` 头，还可能有 `NOTE` 注释块与
+ * `cue-id` 行。
+ *
+ * 约定：
+ *
+ * - `srt_parse` 从 `off` 解**一条** cue：跳过空行、序号行与 `WEBVTT`/`NOTE` 头；
+ *   `text` 指向原缓冲区（多行用 `\n` 连接，末尾不带空行），`next_off` 是下一条的
+ *   起点；解析完返回 0；
+ * - `srt_time_parse` 同时接受 `,` 与 `.` 作为毫秒分隔符，也接受省略小时的
+ *   `mm:ss.mmm`；
+ * - `srt_format` 生成 SubRip 一条（序号、时间行、文本、空行），返回写入长度；
+ * - 不做 HTML 标签清理、不合并重叠 cue、不处理 WebVTT 的样式块；
+ * - 时间单位统一是**毫秒**。
+ */
+#include <string.h>
+
+module std.data.srt;
+import std.core.types;
+import std.text.str;
+
+struct SrtCue {
+    int index;
+    i64 start_ms;
+    i64 end_ms;
+    int text_off;
+    int text_len;
+    int next_off;
+    int is_vtt;
+};
+
+static int srt_digit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+/* 读一个整数，最多 maxd 位 */
+static int srt_num(const char *p, int n, int *pos, int *out, int maxd)
+{
+    int v = 0, d = 0;
+
+    while (*pos < n && d < maxd && srt_digit(p[*pos])) {
+        v = v * 10 + (p[*pos] - '0');
+        (*pos)++;
+        d++;
+    }
+    if (d == 0)
+        return -1;
+    *out = v;
+    return 1;
+}
+
+int srt_time_parse(char[:] src, i64 *ms)
+{
+    const char *p = src.data;
+    int n = src.len, pos = 0;
+    int a = 0, b = 0, c = 0, frac = 0, have_hour = 0;
+
+    if (!src.data || !ms || n <= 0)
+        return -1;
+    if (srt_num(p, n, &pos, &a, 3) != 1)
+        return -1;
+    if (pos >= n || p[pos] != ':')
+        return -1;
+    pos++;
+    if (srt_num(p, n, &pos, &b, 2) != 1)
+        return -1;
+    if (pos < n && p[pos] == ':') {
+        have_hour = 1;
+        pos++;
+        if (srt_num(p, n, &pos, &c, 2) != 1)
+            return -1;
+        /* a:b:c → 时:分:秒 */
+        {
+            int hh = a, mm = b, ss = c;
+
+            a = hh;
+            b = mm;
+            c = ss;
+        }
+    } else {
+        /* a:b → 分:秒 */
+        c = b;
+        b = a;
+        a = 0;
+    }
+    if (pos < n && (p[pos] == ',' || p[pos] == '.')) {
+        int d = 0, mul = 100;
+
+        pos++;
+        while (pos < n && d < 3 && srt_digit(p[pos])) {
+            frac += (p[pos] - '0') * mul;
+            mul /= 10;
+            d++;
+            pos++;
+        }
+        if (d == 0)
+            return -1;
+    }
+    *ms = (i64)a * 3600000 + (i64)b * 60000 + (i64)c * 1000 + frac;
+    (void)have_hour;
+    return 1;
+}
+
+int srt_time_format(i64 ms, char *dst, int cap)
+{
+    i64 v = ms < 0 ? 0 : ms;
+    int h = (int)(v / 3600000);
+    int m = (int)((v % 3600000) / 60000);
+    int s = (int)((v % 60000) / 1000);
+    int f = (int)(v % 1000);
+
+    if (!dst || cap < 13)
+        return -1;
+    dst[0] = (char)('0' + (h / 10) % 10);
+    dst[1] = (char)('0' + h % 10);
+    dst[2] = ':';
+    dst[3] = (char)('0' + m / 10);
+    dst[4] = (char)('0' + m % 10);
+    dst[5] = ':';
+    dst[6] = (char)('0' + s / 10);
+    dst[7] = (char)('0' + s % 10);
+    dst[8] = ',';
+    dst[9] = (char)('0' + f / 100);
+    dst[10] = (char)('0' + (f / 10) % 10);
+    dst[11] = (char)('0' + f % 10);
+    dst[12] = 0;
+    return 12;
+}
+
+static int srt_is_blank(const char *p, int start, int end)
+{
+    int i = 0;
+
+    for (i = start; i < end; i++) {
+        if (p[i] != ' ' && p[i] != '\t' && p[i] != '\r')
+            return 0;
+    }
+    return 1;
+}
+
+int srt_parse(const void *src, int n, int off, SrtCue *out)
+{
+    const char *p = (const char *)src;
+    int i = off, line_start = 0, line_end = 0;
+
+    if (!src || !out || off < 0)
+        return -1;
+    if (off >= n)
+        return 0;
+    memset(out, 0, sizeof *out);
+    /* 跳过空行、序号行、WEBVTT 头与 NOTE 块 */
+    for (;;) {
+        int digits = 0;
+
+        while (i < n && (p[i] == '\n' || p[i] == '\r')) {
+            i++;
+            if (i - 1 < n && p[i - 1] == '\r' && i < n && p[i] == '\n')
+                i++;
+        }
+        if (i >= n)
+            return 0;
+        line_start = i;
+        while (i < n && p[i] != '\n')
+            i++;
+        line_end = i;
+        if (i < n)
+            i++;
+        if (line_end > line_start && p[line_end - 1] == '\r')
+            line_end--;
+        if (srt_is_blank(p, line_start, line_end))
+            continue;
+        if (line_end - line_start >= 5
+            && memcmp(p + line_start, "WEBVTT", 6) == 0) {
+            out->is_vtt = 1;
+            continue;
+        }
+        if (line_end - line_start >= 4
+            && memcmp(p + line_start, "NOTE", 4) == 0) {
+            /* NOTE 块一直到空行为止 */
+            while (i < n) {
+                int s2 = i, e2 = 0;
+
+                while (i < n && p[i] != '\n')
+                    i++;
+                e2 = i;
+                if (i < n)
+                    i++;
+                if (e2 > s2 && p[e2 - 1] == '\r')
+                    e2--;
+                if (srt_is_blank(p, s2, e2))
+                    break;
+            }
+            continue;
+        }
+        /* 看这一行是不是纯数字（序号行） */
+        {
+            int k = line_start;
+
+            while (k < line_end && srt_digit(p[k])) {
+                digits++;
+                k++;
+            }
+            if (digits > 0 && k == line_end)
+                continue;               /* 序号行，继续读时间行 */
+        }
+        /* 时间行：包含 " --> "；WebVTT 允许前面多一行 cue 标识 */
+        {
+            int arrow = -1, k = 0, tries = 0;
+
+            for (tries = 0; tries < 2; tries++) {
+                arrow = -1;
+                for (k = line_start; k + 5 <= line_end; k++) {
+                    if (memcmp(p + k, " --> ", 5) == 0) {
+                        arrow = k;
+                        break;
+                    }
+                }
+                if (arrow >= 0)
+                    break;
+                /* 不是时间行：当作 cue 标识，读下一行再试 */
+                if (i >= n)
+                    return -1;
+                line_start = i;
+                while (i < n && p[i] != '\n')
+                    i++;
+                line_end = i;
+                if (i < n)
+                    i++;
+                if (line_end > line_start && p[line_end - 1] == '\r')
+                    line_end--;
+            }
+            if (arrow < 0)
+                return -1;
+            if (srt_time_parse((char[:]){ (char *)p + line_start,
+                                          arrow - line_start },
+                               &out->start_ms) != 1)
+                return -1;
+            {
+                int end_start = arrow + 5;
+                int end_end = line_end;
+                int e = end_start;
+
+                while (e < end_end && p[e] != ' ' && p[e] != '\t')
+                    e++;
+                if (srt_time_parse((char[:]){ (char *)p + end_start,
+                                              e - end_start },
+                                   &out->end_ms) != 1)
+                    return -1;
+            }
+        }
+        /* 正文：直到空行 */
+        out->text_off = i;
+        {
+            int text_end = i;
+
+            while (i < n) {
+                int s2 = i, e2 = 0;
+
+                while (i < n && p[i] != '\n')
+                    i++;
+                e2 = i;
+                if (i < n)
+                    i++;
+                if (e2 > s2 && p[e2 - 1] == '\r')
+                    e2--;
+                if (srt_is_blank(p, s2, e2))
+                    break;
+                text_end = e2;
+            }
+            out->text_len = text_end - out->text_off;
+        }
+        out->next_off = i;
+        if (out->end_ms < out->start_ms)
+            return -1;
+        return 1;
+    }
+}
+
+int srt_format(int index, i64 start_ms, i64 end_ms, char[:] text, char *dst,
+               int cap)
+{
+    char t1[16] = { 0 };
+    char t2[16] = { 0 };
+    int o = 0, i = 0;
+    char num[16] = { 0 };
+    int k = 0, v = index;
+
+    if (!dst || cap <= 0 || !text.data)
+        return -1;
+    if (srt_time_format(start_ms, t1, (int)sizeof t1) < 0
+        || srt_time_format(end_ms, t2, (int)sizeof t2) < 0)
+        return -1;
+    if (v < 0)
+        v = 0;
+    if (v == 0) {
+        num[0] = '0';
+        k = 1;
+    }
+    while (v > 0 && k < 14) {
+        num[k++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    for (i = k - 1; i >= 0; i--) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = num[i];
+    }
+    {
+        const char *rest = "\r\n";
+        int r = 0;
+
+        for (r = 0; r < 2; r++) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = rest[r];
+        }
+    }
+    for (i = 0; t1[i]; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = t1[i];
+    }
+    {
+        const char *arrow = " --> ";
+        int r = 0;
+
+        for (r = 0; arrow[r]; r++) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = arrow[r];
+        }
+    }
+    for (i = 0; t2[i]; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = t2[i];
+    }
+    for (i = 0; i < 2; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = "\r\n"[i];
+    }
+    for (i = 0; i < text.len; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = text.data[i];
+    }
+    {
+        const char *tail = "\r\n\r\n";
+        int r = 0;
+
+        for (r = 0; tail[r]; r++) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = tail[r];
+        }
+    }
+    dst[o] = 0;
+    return o;
+}
+
+/* ---- 游标（结构体方法） ---- */
+
+struct SrtDoc {
+    const char *src;
+    int n;
+    int off;
+    int ncues;          /* 字段名不能与 count() 方法冲突 */
+    int vtt;
+};
+
+int open(SrtDoc *d, const void *src, int n)
+{
+    SrtCue cue = { 0 };
+    int off = 0, count = 0;
+
+    if (!d || !src || n < 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    for (;;) {
+        int r = srt_parse(src, n, off, &cue);
+
+        if (r != 1)
+            break;
+        if (cue.is_vtt)
+            d->vtt = 1;
+        count++;
+        off = cue.next_off;
+    }
+    d->ncues = count;
+    d->off = 0;
+    return count;
+}
+
+int next(SrtDoc *d, SrtCue *out)
+{
+    int r = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    r = srt_parse(d->src, d->n, d->off, out);
+    if (r == 1) {
+        d->off = out->next_off;
+        if (out->is_vtt)
+            d->vtt = 1;
+    }
+    return r;
+}
+
+int count(SrtDoc *d)
+{
+    return d ? d->ncues : 0;
+}
+
+int is_vtt(SrtDoc *d)
+{
+    return d ? d->vtt : 0;
+}
+
+int rewind(SrtDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+/* 跳到「第一条 start_ms >= ms」的 cue（游标停在该条之前） */
+int seek(SrtDoc *d, i64 ms)
+{
+    SrtCue cue = { 0 };
+    int off = 0;
+
+    if (!d || !d->src)
+        return -1;
+    for (;;) {
+        int r = srt_parse(d->src, d->n, off, &cue);
+
+        if (r != 1) {
+            d->off = off;
+            return 0;
+        }
+        if (cue.start_ms >= ms) {
+            d->off = off;
+            return 1;
+        }
+        off = cue.next_off;
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "srt：时间解析与格式化" {
+    i64 ms = 0;
+    char out[16] = { 0 };
+
+    if (srt_time_parse(S("00:00:01,000"), &ms) != 1 || ms != 1000)
+        return err(1, "00:00:01,000 应该是 1000 毫秒");
+    if (srt_time_parse(S("01:02:03,456"), &ms) != 1 || ms != 3723456)
+        return err(2, "带小时的时间不对");
+    if (srt_time_parse(S("00:00:01.500"), &ms) != 1 || ms != 1500)
+        return err(3, "点分隔的毫秒不对");
+    if (srt_time_parse(S("01:30.250"), &ms) != 1 || ms != 90250)
+        return err(4, "省略小时的 mm:ss 不对");
+    if (srt_time_parse(S("bad"), &ms) != -1)
+        return err(5, "非法时间应该 -1");
+    if (srt_time_format(3723456, out, (int)sizeof out) != 12
+        || memcmp(out, "01:02:03,456", 12) != 0)
+        return err(6, "时间格式化不对");
+    if (srt_time_format(0, out, (int)sizeof out) != 12
+        || memcmp(out, "00:00:00,000", 12) != 0)
+        return err(7, "零时间格式化不对");
+}
+
+test "srt：多 cue 解析与生成" {
+    static const char *src =
+        "1\r\n"
+        "00:00:01,000 --> 00:00:04,500\r\n"
+        "Hello\r\n"
+        "World\r\n"
+        "\r\n"
+        "2\r\n"
+        "00:00:05,000 --> 00:00:06,000\r\n"
+        "Second\r\n"
+        "\r\n";
+    SrtCue cue = { 0 };
+    char out[128] = { 0 };
+    int off = 0, count = 0;
+
+    if (srt_parse(src, (int)strlen(src), 0, &cue) != 1)
+        return err(8, "第 1 条 cue 解析失败");
+    if (cue.start_ms != 1000 || cue.end_ms != 4500)
+        return err(9, "第 1 条的时间不对");
+    if (cue.text_len != 12
+        || memcmp((const char *)src + cue.text_off, "Hello\r\nWorld", 12) != 0)
+        return err(10, "第 1 条的文本不对");
+    off = cue.next_off;
+    if (srt_parse(src, (int)strlen(src), off, &cue) != 1)
+        return err(11, "第 2 条 cue 解析失败");
+    if (cue.start_ms != 5000 || cue.end_ms != 6000)
+        return err(12, "第 2 条的时间不对");
+    if (cue.text_len != 6 || memcmp((const char *)src + cue.text_off, "Second", 6)
+        != 0)
+        return err(13, "第 2 条的文本不对");
+    off = cue.next_off;
+    if (srt_parse(src, (int)strlen(src), off, &cue) != 0)
+        return err(14, "读完之后应该返回 0");
+    /* 生成一条再解回来 */
+    {
+        int n = srt_format(3, 1000, 4500, S("Hi there"), out, (int)sizeof out);
+
+        if (n <= 0)
+            return err(15, "生成 cue 失败");
+        if (srt_parse(out, n, 0, &cue) != 1)
+            return err(16, "生成的 cue 解析失败");
+        if (cue.start_ms != 1000 || cue.end_ms != 4500 || cue.text_len != 8)
+            return err(17, "生成后往返字段不对");
+        count++;
+    }
+    (void)count;
+}
+
+test "srt：WebVTT" {
+    static const char *vtt =
+        "WEBVTT\n"
+        "\n"
+        "NOTE 这是一个注释\n"
+        "第二行注释\n"
+        "\n"
+        "cue-1\n"
+        "00:00:01.000 --> 00:00:02.500 align:start\n"
+        "Hi\n"
+        "\n";
+    SrtCue cue = { 0 };
+
+    if (srt_parse(vtt, (int)strlen(vtt), 0, &cue) != 1)
+        return err(18, "WebVTT 解析失败");
+    if (cue.is_vtt != 1)
+        return err(19, "应该识别为 WebVTT");
+    if (cue.start_ms != 1000 || cue.end_ms != 2500)
+        return err(20, "WebVTT 时间不对");
+    if (cue.text_len != 2
+        || memcmp((const char *)vtt + cue.text_off, "Hi", 2) != 0)
+        return err(21, "WebVTT 文本不对");
+}
+
+test "srt：游标方法" {
+    static const char *src =
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.000\nA\n\n"
+        "00:00:03.000 --> 00:00:04.000\nB\n\n"
+        "00:00:05.000 --> 00:00:06.000\nC\n\n";
+    SrtDoc doc = { 0 };
+    SrtCue cue = { 0 };
+    int n = 0;
+
+    if (doc.open(src, (int)strlen(src)) != 3)
+        return err(22, "应该有 3 条 cue");
+    if (doc.count() != 3 || doc.is_vtt() != 1)
+        return err(23, "count()/is_vtt() 方法不对");
+    if (doc.seek(3000) != 1)
+        return err(24, "seek 到 3 秒失败");
+    if (doc.next(&cue) != 1 || cue.start_ms != 3000)
+        return err(25, "seek 之后的第一条应该是 3 秒那条");
+    n = 0;
+    while (doc.next(&cue) == 1)
+        n++;
+    if (n != 1)
+        return err(26, "3 秒之后应该只剩 1 条");
+    doc.rewind();
+    n = 0;
+    while (doc.next(&cue) == 1)
+        n++;
+    if (n != 3)
+        return err(27, "rewind 之后应该又能读出 3 条");
+}

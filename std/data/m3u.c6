@@ -1,0 +1,319 @@
+/* std/data/m3u：M3U / M3U8 播放列表（含 `#EXTINF` 扩展与 HLS 流判断）。
+ *
+ *     import std.data.m3u;
+ *
+ *     M3uDoc doc = { 0 };
+ *     M3uEntry e = { 0 };
+ *     doc.open(buf, n);                 // 游标方法：open / next / count
+ *     while (doc.next(&e) == 1)
+ *         // e.path / e.title / e.duration_ms
+ *
+ * 基本格式就是「一行一个路径」；扩展格式以 `#EXTM3U` 开头，每个条目前面有
+ *
+ *     #EXTINF:123,标题
+ *     song.mp3
+ *
+ * HLS 播放列表还会有 `#EXT-X-TARGETDURATION`、`#EXT-X-VERSION` 等标签，用
+ * `is_stream()` 判断（出现过 `#EXT-X-` 就算）。
+ *
+ * 约定：
+ *
+ * - `M3uDoc` 是游标：`open` 数条目并判断是否扩展/流，`next` 逐条返回，`rewind` 复位；
+ * - `#EXTINF` 的时长单位是**秒**，内部换算成毫秒（`duration_ms`）；没有 `#EXTINF`
+ *   的条目 `duration_ms` 为 -1；
+ * - 以 `#` 开头的行都是注释/标签，不产生条目；
+ * - 标题可以是空串（`#EXTINF:123,`）；路径行去掉行尾 `\r`；
+ * - `m3u_build` 生成一条扩展条目（`#EXTINF:秒,标题\n路径\n`），`duration_ms < 0`
+ *   时生成普通条目（只写路径）。
+ */
+#include <string.h>
+
+module std.data.m3u;
+import std.core.types;
+import std.text.str;
+
+struct M3uEntry {
+    i64 duration_ms;
+    Str title;
+    Str path;
+};
+
+struct M3uDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+    int extended;
+    int stream;
+};
+
+static int m3u_lineat(const char *p, int n, int *pos, int *start, int *len)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *len = i - *start;
+    if (*len > 0 && p[*start + *len - 1] == '\r')
+        (*len)--;
+    if (i < n)
+        i++;
+    *pos = i;
+    return 1;
+}
+
+int open(M3uDoc *d, const void *src, int n)
+{
+    const char *p = (const char *)src;
+    int pos = 0, start = 0, len = 0, entries = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = p;
+    d->n = n;
+    while (m3u_lineat(p, n, &pos, &start, &len)) {
+        const char *l = p + start;
+
+        if (len == 0)
+            continue;
+        if (l[0] == '#') {
+            if (len >= 7 && memcmp(l, "#EXTM3U", 7) == 0)
+                d->extended = 1;
+            if (len >= 7 && memcmp(l, "#EXT-X-", 7) == 0)
+                d->stream = 1;
+            continue;
+        }
+        entries++;
+    }
+    d->nentries = entries;
+    d->off = 0;
+    return entries;
+}
+
+int next(M3uDoc *d, M3uEntry *out)
+{
+    const char *p = 0;
+    int start = 0, len = 0;
+    i64 pending_ms = -1;
+    Str pending_title = { (char[:]){ 0, 0 } };
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    while (m3u_lineat(p, d->n, &d->off, &start, &len)) {
+        const char *l = p + start;
+
+        if (len == 0)
+            continue;
+        if (l[0] == '#') {
+            if (len >= 8 && memcmp(l, "#EXTINF:", 8) == 0) {
+                int k = 8;
+                i64 sec = 0, frac = 0, mul = 100;
+                int digits = 0, comma = -1;
+
+                while (k < len && l[k] >= '0' && l[k] <= '9') {
+                    sec = sec * 10 + (l[k] - '0');
+                    digits++;
+                    k++;
+                }
+                if (k < len && l[k] == '.') {
+                    k++;
+                    while (k < len && l[k] >= '0' && l[k] <= '9' && mul > 0) {
+                        frac += (l[k] - '0') * mul;
+                        mul /= 10;
+                        k++;
+                    }
+                }
+                for (; k < len; k++) {
+                    if (l[k] == ',') {
+                        comma = k;
+                        break;
+                    }
+                }
+                if (!digits)
+                    return -1;
+                pending_ms = sec * 1000 + frac;
+                if (comma >= 0)
+                    pending_title.s = (char[:]){ (char *)l + comma + 1,
+                                                 len - comma - 1 };
+            }
+            continue;
+        }
+        out->duration_ms = pending_ms;
+        out->title = pending_title;
+        out->path.s = (char[:]){ (char *)l, len };
+        return 1;
+    }
+    return 0;
+}
+
+int count(M3uDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int is_extended(M3uDoc *d)
+{
+    return d ? d->extended : 0;
+}
+
+int is_stream(M3uDoc *d)
+{
+    return d ? d->stream : 0;
+}
+
+int rewind(M3uDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int m3u_build(const char *path, i64 duration_ms, const char *title, char *dst,
+              int cap)
+{
+    int o = 0, i = 0;
+
+    if (!dst || cap <= 0 || !path)
+        return -1;
+    if (duration_ms >= 0) {
+        char num[24] = { 0 };
+        int k = 0;
+        i64 sec = duration_ms / 1000;
+
+        if (sec == 0) {
+            num[0] = '0';
+            k = 1;
+        }
+        while (sec > 0 && k < 22) {
+            num[k++] = (char)('0' + (int)(sec % 10));
+            sec /= 10;
+        }
+        {
+            static const char *pre = "#EXTINF:";
+            int t = 0;
+
+            for (t = 0; pre[t]; t++) {
+                if (o + 1 > cap)
+                    return -1;
+                dst[o++] = pre[t];
+            }
+        }
+        for (i = k - 1; i >= 0; i--) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = num[i];
+        }
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = ',';
+        for (i = 0; title && title[i]; i++) {
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = title[i];
+        }
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = '\n';
+    }
+    for (i = 0; path[i]; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = path[i];
+    }
+    if (o + 1 > cap)
+        return -1;
+    dst[o++] = '\n';
+    dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "m3u：简单列表与扩展条目" {
+    static const char *plain = "a.mp3\nb.mp3\nc.mp3\n";
+    static const char *ext =
+        "#EXTM3U\n"
+        "#EXTINF:123,第一首\n"
+        "a.mp3\n"
+        "#EXTINF:45,第二首\n"
+        "b.mp3\n"
+        "c.mp3\n";
+    M3uDoc d = { 0 };
+    M3uEntry e = { 0 };
+    char out[128] = { 0 };
+    int n = 0;
+
+    if (d.open(plain, (int)strlen(plain)) != 3)
+        return err(1, "简单列表应该有 3 条");
+    if (d.count() != 3 || d.is_extended() != 0 || d.is_stream() != 0)
+        return err(2, "简单列表的标记不对");
+    if (d.next(&e) != 1 || e.path.s.len != 5
+        || memcmp(e.path.s.data, "a.mp3", 5) != 0)
+        return err(3, "第一条路径不对");
+    if (e.duration_ms != -1)
+        return err(4, "没有 EXTINF 的条目时长应该是 -1");
+    if (d.open(ext, (int)strlen(ext)) != 3)
+        return err(5, "扩展列表应该有 3 条");
+    if (d.is_extended() != 1)
+        return err(6, "应该识别为扩展列表");
+    if (d.next(&e) != 1 || e.duration_ms != 123000)
+        return err(7, "第一条时长不对");
+    if (e.title.s.len != 9 || memcmp(e.title.s.data, "第一首", 9) != 0)
+        return err(8, "第一条标题不对");
+    if (d.next(&e) != 1 || e.duration_ms != 45000 || e.title.s.len != 9)
+        return err(9, "第二条时长或标题不对");
+    if (d.next(&e) != 1 || e.duration_ms != -1)
+        return err(10, "第三条没有 EXTINF");
+    if (d.next(&e) != 0)
+        return err(11, "读完应该返回 0");
+    /* 生成再解析 */
+    n = m3u_build("x.mp3", 90000, "标题", out, (int)sizeof out);
+    if (n <= 0)
+        return err(12, "生成条目失败");
+    if (d.open(out, n) != 1)
+        return err(13, "生成的列表应该只有 1 条");
+    if (d.next(&e) != 1 || e.duration_ms != 90000 || e.path.s.len != 5)
+        return err(14, "生成后往返字段不对");
+}
+
+test "m3u：HLS 与边界" {
+    static const char *hls =
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:3\n"
+        "#EXT-X-TARGETDURATION:10\n"
+        "#EXTINF:9.5,\n"
+        "seg0.ts\n"
+        "#EXTINF:9.5,\n"
+        "seg1.ts\n";
+    M3uDoc d = { 0 };
+    M3uEntry e = { 0 };
+    char out[32] = { 0 };
+
+    if (d.open(hls, (int)strlen(hls)) != 2)
+        return err(15, "HLS 应该有 2 个分片");
+    if (d.is_stream() != 1 || d.is_extended() != 1)
+        return err(16, "HLS 标记不对");
+    if (d.next(&e) != 1 || e.duration_ms != 9500)
+        return err(17, "9.5 秒应该换算成 9500 毫秒");
+    if (e.title.s.len != 0)
+        return err(18, "空标题应该是长度 0");
+    if (e.path.s.len != 7 || memcmp(e.path.s.data, "seg0.ts", 7) != 0)
+        return err(19, "分片路径不对");
+    /* 没有 EXTINF 时生成普通条目 */
+    if (m3u_build("y.mp3", -1, 0, out, (int)sizeof out) != 6
+        || memcmp(out, "y.mp3\n", 6) != 0)
+        return err(20, "普通条目生成不对");
+    if (m3u_build("y.mp3", 1000, "t", out, 4) != -1)
+        return err(21, "容量不够应该 -1");
+    d.rewind();
+    if (d.next(&e) != 1 || e.path.s.len != 7)
+        return err(22, "rewind 之后应该又能读出第一条");
+}

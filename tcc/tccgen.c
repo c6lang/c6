@@ -12930,6 +12930,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.mtf",       C6_ERR_SLOT_STD + 222 },
     { "std.encoding.delta",     C6_ERR_SLOT_STD + 223 },
     { "std.encoding.huffman",   C6_ERR_SLOT_STD + 224 },
+    { "std.data.srt",           C6_ERR_SLOT_STD + 225 },
+    { "std.data.ass",           C6_ERR_SLOT_STD + 226 },
+    { "std.data.lrc",           C6_ERR_SLOT_STD + 227 },
+    { "std.data.m3u",           C6_ERR_SLOT_STD + 228 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

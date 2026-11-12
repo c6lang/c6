@@ -37,20 +37,20 @@ static void do_treap(void)
     int i = 0;
 
     printf("== treap\n");
-    check(treap_init(&t, nodes, 32) == 1, "初始化");
+    check(t.init(nodes, 32) == 1, "初始化");
     for (i = 0; i < 10; i++)
-        treap_put(&t, (i64)(i * 3), (i64)i, &old);
-    printf("   插入 %d 个键，最小 %lld，第 5 小 ", treap_size(&t),
+        t.put((i64)(i * 3), (i64)i, &old);
+    printf("   插入 %d 个键，最小 %lld，第 5 小 ", t.size(),
            (long long)nodes[0].key);
-    treap_kth(&t, 5, &key);
+    t.kth(5, &key);
     printf("%lld\n", (long long)key);
-    check(treap_size(&t) == 10, "元素数");
-    check(treap_get(&t, 15, &key) == 1 && key == 5, "取键 15 的值");
-    check(treap_rank(&t, 15) == 5, "比 15 小的有 5 个");
-    check(treap_kth(&t, 0, &key) == 1 && key == 0, "第 0 小是 0");
-    check(treap_kth(&t, 9, &key) == 1 && key == 27, "第 9 小是 27");
-    check(treap_del(&t, 15) == 1 && treap_get(&t, 15, &key) == 0, "删除 15");
-    check(treap_kth(&t, 5, &key) == 1 && key == 18, "删除后第 5 小是 18");
+    check(t.size() == 10, "元素数");
+    check(t.get(15, &key) == 1 && key == 5, "取键 15 的值");
+    check(t.rank(15) == 5, "比 15 小的有 5 个");
+    check(t.kth(0, &key) == 1 && key == 0, "第 0 小是 0");
+    check(t.kth(9, &key) == 1 && key == 27, "第 9 小是 27");
+    check(t.del(15) == 1 && t.get(15, &key) == 0, "删除 15");
+    check(t.kth(5, &key) == 1 && key == 18, "删除后第 5 小是 18");
 }
 
 static void do_heap(void)
@@ -62,11 +62,11 @@ static void do_heap(void)
     int i = 0, top3 = 0;
 
     printf("== heap\n");
-    heap_init(&h, buf, 16, 1);
+    h.init(buf, 16, 1);
     for (i = 0; i < 8; i++)
-        heap_push(&h, vals[i]);
+        h.push(vals[i]);
     printf("   最大堆顶 = ");
-    heap_peek(&h, &v);
+    h.peek(&v);
     printf("%lld\n", (long long)v);
     check(v == 88, "最大堆顶是 88");
     /* 取前 3 大 */
@@ -74,7 +74,7 @@ static void do_heap(void)
         i64 sum = 0;
 
         for (i = 0; i < 3; i++) {
-            heap_pop(&h, &v);
+            h.pop(&v);
             sum += v;
             top3 = top3 * 10 + (int)(v % 10);
         }
@@ -86,8 +86,8 @@ static void do_heap(void)
         i64 raw[5] = { 5, 1, 4, 2, 3 };
         Heap m = { 0 };
 
-        heap_build(&m, raw, 5, 0);
-        heap_sort(&m);
+        m.build(raw, 5, 0);
+        m.sort();
         check(raw[0] == 5 && raw[4] == 1, "最小堆排序得到降序");
     }
     /* pushpop 常用在 top-k */
@@ -95,13 +95,13 @@ static void do_heap(void)
         Heap k = { 0 };
         i64 kb[4] = { 0 };
 
-        heap_init(&k, kb, 4, 0);
-        heap_push(&k, 10);
-        heap_push(&k, 20);
-        heap_push(&k, 30);
-        heap_pushpop(&k, 15, &v);
+        k.init(kb, 4, 0);
+        k.push(10);
+        k.push(20);
+        k.push(30);
+        k.pushpop(15, &v);
         check(v == 10, "最小堆 pushpop 返回 10");
-        heap_pushpop(&k, 25, &v);
+        k.pushpop(25, &v);
         check(v == 15, "再 pushpop 返回 15");
     }
 }
@@ -116,24 +116,24 @@ static void do_skiplist(void)
     int o = 0;
 
     printf("== skiplist\n");
-    check(skip_init(&sl, nodes, 32) == 1, "初始化");
+    check(sl.init(nodes, 32) == 1, "初始化");
     for (i = 0; i < 8; i++)
-        skip_put(&sl, (i64)((i * 5) % 8), (i64)(i * 100), &old);
+        sl.put((i64)((i * 5) % 8), (i64)(i * 100), &old);
     printf("   有序键：");
-    if (skip_first(&sl, &cur, &val)) {
+    if (sl.first(&cur, &val)) {
         for (;;) {
             o += snprintf(line + o, sizeof line - o, "%lld ", (long long)cur);
             count++;
-            if (!skip_next(&sl, cur, &cur, &val))
+            if (!sl.next(cur, &cur, &val))
                 break;
         }
     }
     printf("%s（%d 个）\n", line, count);
     check(count == 8, "遍历到 8 个键");
     check(strcmp(line, "0 1 2 3 4 5 6 7 ") == 0, "键是升序的 0..7");
-    check(skip_get(&sl, 3, &val) == 1 && val == 700, "键 3 的值是 700");
-    check(skip_del(&sl, 3) == 1 && skip_size(&sl) == 7, "删除键 3");
-    check(skip_at(&sl, 3, &key, &val) == 1 && key == 4, "删除后第 3 个是 4");
+    check(sl.get(3, &val) == 1 && val == 700, "键 3 的值是 700");
+    check(sl.del(3) == 1 && sl.size() == 7, "删除键 3");
+    check(sl.at(3, &key, &val) == 1 && key == 4, "删除后第 3 个是 4");
 }
 
 static void do_counter(void)
@@ -146,21 +146,21 @@ static void do_counter(void)
     int i = 0;
 
     printf("== counter\n");
-    check(counter_init(&c, slots, 256) == 1, "初始化");
+    check(c.init(slots, 256) == 1, "初始化");
     for (i = 0; i < 6; i++)
-        counter_add(&c, (char[:]){ (char *)words[i], (int)strlen(words[i]) },
+        c.add((char[:]){ (char *)words[i], (int)strlen(words[i]) },
                     1);
     printf("   GET=%lld PUT=%lld POST=%lld，不同键 %d 个\n",
-           (long long)counter_get(&c, S("GET")),
-           (long long)counter_get(&c, S("PUT")),
-           (long long)counter_get(&c, S("POST")), counter_keys(&c));
-    check(counter_get(&c, S("GET")) == 3, "GET 出现 3 次");
-    check(counter_get(&c, S("PUT")) == 2, "PUT 出现 2 次");
-    check(counter_get(&c, S("POST")) == 1, "POST 出现 1 次");
-    check(counter_keys(&c) == 3 && counter_total(&c) == 6, "键数与总量");
-    check(counter_top(&c, top, (int)sizeof top, &n) == 1 && n == 3
+           (long long)c.get(S("GET")),
+           (long long)c.get(S("PUT")),
+           (long long)c.get(S("POST")), c.keys());
+    check(c.get(S("GET")) == 3, "GET 出现 3 次");
+    check(c.get(S("PUT")) == 2, "PUT 出现 2 次");
+    check(c.get(S("POST")) == 1, "POST 出现 1 次");
+    check(c.keys() == 3 && c.sum() == 6, "键数与总量");
+    check(c.top(top, (int)sizeof top, &n) == 1 && n == 3
           && strcmp(top, "GET") == 0, "最多的是 GET");
-    check(counter_get(&c, S("DELETE")) == 0, "没见过的键是 0");
+    check(c.get(S("DELETE")) == 0, "没见过的键是 0");
 }
 
 int main(void)

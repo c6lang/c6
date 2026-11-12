@@ -56,6 +56,20 @@
 
 ### 标准库
 
+- **标准库第五十四批（字幕与播放列表）**：`std.data.srt`（SubRip + WebVTT）、
+  `std.data.ass`（ASS/SSA 脚本信息与事件）、`std.data.lrc`（LRC 歌词与元信息）、
+  `std.data.m3u`（M3U/M3U8，含 `#EXTINF` 与 HLS 判断），集成示例
+  `examples/stdsubs.c6`（`make std-subs`）。四个模块都提供**游标方法**
+  （`doc.open`/`doc.next`/`doc.count`/`doc.seek`/`doc.rewind`）。错误号段
+  `std.data.srt`=0x60e1 … `std.data.m3u`=0x60e4（`c6_err_std_slots[]` 追加）。
+
+- **标准库：状态型模块统一方法化**：`std.container.fenwick`、`segtree`、`dsu`、
+  `bloom`、`treap`、`heap`、`skiplist`、`counter` 与 `std.os.log` 的函数改为裸方法名
+  （`f.add`、`t.put`、`h.push`、`lg.dump` 等），`test` 块与
+  `examples/stdstruct.c6`、`examples/stdordered.c6`、`examples/stddb.c6` 一并改为
+  方法调用；顺带解决字段与同名方法的冲突（`Dsu.nsets`、`Bloom.set_bits`、
+  `Log.nfilt/ndrop`、`Counter.sum`）。
+
 - **标准库第五十三批（变换式压缩积木）**：`std.encoding.bwt`（Burrows-Wheeler 双向
   变换）、`std.encoding.mtf`（Move-To-Front）、`std.encoding.delta`（字节与 i64
   差分）、`std.encoding.huffman`（规范 Huffman 建表/编码/解码），集成示例

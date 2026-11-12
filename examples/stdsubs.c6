@@ -1,0 +1,157 @@
+/* examples/stdsubs.c6 —— 第五十四批（字幕与播放列表）的集成示例。
+ *
+ *     make std-subs
+ *
+ * 四节：SubRip/WebVTT 游标、ASS 事件游标、LRC 歌词游标、M3U 播放列表游标。
+ * 全部用**结构体方法**调用（`doc.open(...)` / `doc.next(&x)` / `doc.count()`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.srt;
+import std.data.ass;
+import std.data.lrc;
+import std.data.m3u;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_srt(void)
+{
+    static const char *src =
+        "1\r\n00:00:01,000 --> 00:00:02,500\r\n你好\r\n\r\n"
+        "2\r\n00:00:03,000 --> 00:00:04,000\r\n世界\r\n\r\n"
+        "3\r\n00:00:05,000 --> 00:00:06,000\r\n再见\r\n\r\n";
+    SrtDoc doc = { 0 };
+    SrtCue cue = { 0 };
+    int n = 0;
+
+    printf("== srt\n");
+    check(doc.open(src, (int)strlen(src)) == 3, "打开并计数");
+    check(doc.count() == 3, "count() 方法");
+    while (doc.next(&cue) == 1) {
+        printf("   #%d %lldms → %.*s\n", ++n, (long long)cue.start_ms,
+               cue.text_len, src + cue.text_off);
+    }
+    check(n == 3, "逐条读出 3 条");
+    check(doc.seek(3000) == 1, "seek(3000)");
+    if (doc.next(&cue) == 1) {
+        printf("   seek 后第一条：%lldms\n", (long long)cue.start_ms);
+        check(cue.start_ms == 3000, "seek 命中的是 3 秒那条");
+    } else {
+        check(0, "seek 之后应该还能读到一条");
+    }
+    doc.rewind();
+    check(doc.next(&cue) == 1 && cue.start_ms == 1000, "rewind 后回到第一条");
+    check(srt_time_parse(S("00:01:02,500"), &cue.start_ms) == 1
+          && cue.start_ms == 62500, "时间解析 62.5 秒");
+}
+
+static void do_ass(void)
+{
+    static const char *src =
+        "[Script Info]\nTitle: 演示\n\n[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第一句\n"
+        "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,第二句\n";
+    AssDoc doc = { 0 };
+    AssEvent ev = { 0 };
+    Str t = { 0 };
+
+    printf("== ass\n");
+    check(doc.open(src, (int)strlen(src)) == 2, "打开 ASS");
+    check(doc.count() == 2, "count() 方法");
+    t = doc.title();
+    printf("   标题：%.*s\n", t.s.len, t.s.data);
+    check(t.s.len == 6, "title() 方法");
+    if (doc.next(&ev) == 1) {
+        printf("   第一条：%lldms → %.*s\n", (long long)ev.start_ms,
+               ev.text.s.len, ev.text.s.data);
+        check(ev.start_ms == 1000 && ev.end_ms == 2000, "第一条时间");
+        check(ev.style.s.len == 7, "样式字段");
+    } else {
+        check(0, "ASS 第一条读不到");
+    }
+    check(doc.seek(3000) == 1 && doc.next(&ev) == 1 && ev.start_ms == 3000,
+          "seek 到 3 秒");
+}
+
+static void do_lrc(void)
+{
+    static const char *src =
+        "[ti:示例歌曲]\n[offset:+500]\n"
+        "[00:01.00]第一行\n[00:02.50]第二行\n[00:04.00]\n";
+    LrcDoc doc = { 0 };
+    LrcLine line = { 0 };
+    Str t = { 0 };
+    int n = 0;
+
+    printf("== lrc\n");
+    check(doc.open(src, (int)strlen(src)) == 3, "打开 LRC");
+    t = doc.tag("ti");
+    printf("   标题：%.*s，offset = %lldms\n", t.s.len, t.s.data,
+           (long long)doc.offset());
+    check(t.s.len == 12 && doc.offset() == 500, "tag() 与 offset()");
+    while (doc.next(&line) == 1) {
+        n++;
+        printf("   [%lldms] %.*s\n", (long long)line.time_ms, line.text.s.len,
+               line.text.s.data);
+    }
+    check(n == 3, "读出 3 行歌词");
+    doc.rewind();
+    if (doc.next(&line) == 1)
+        check(line.time_ms == 1500, "offset 500 应该把 1 秒变成 1.5 秒");
+    else
+        check(0, "rewind 后读不到");
+}
+
+static void do_m3u(void)
+{
+    static const char *src =
+        "#EXTM3U\n#EXTINF:123,第一首\na.mp3\n#EXTINF:45,第二首\nb.mp3\n"
+        "c.mp3\n";
+    M3uDoc doc = { 0 };
+    M3uEntry e = { 0 };
+    char built[64] = { 0 };
+    int n = 0;
+
+    printf("== m3u\n");
+    check(doc.open(src, (int)strlen(src)) == 3, "打开 M3U");
+    check(doc.is_extended() == 1 && doc.count() == 3, "is_extended() 与 count()");
+    while (doc.next(&e) == 1) {
+        printf("   %.*s", e.path.s.len, e.path.s.data);
+        if (e.duration_ms >= 0)
+            printf("（%lld 秒，%.*s）", (long long)(e.duration_ms / 1000),
+                   e.title.s.len, e.title.s.data);
+        printf("\n");
+        n++;
+    }
+    check(n == 3, "读出 3 个条目");
+    n = m3u_build("new.mp3", 60000, "新歌", built, (int)sizeof built);
+    check(n > 0, "生成条目");
+    check(doc.open(built, n) == 1 && doc.next(&e) == 1
+          && e.duration_ms == 60000, "生成后往返");
+}
+
+int main(void)
+{
+    do_srt();
+    do_ass();
+    do_lrc();
+    do_m3u();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

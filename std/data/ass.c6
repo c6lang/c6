@@ -1,0 +1,535 @@
+/* std/data/ass：Advanced SubStation Alpha（.ass/.ssa）字幕的脚本信息与事件解析。
+ *
+ *     import std.data.ass;
+ *
+ *     AssDoc doc = { 0 };
+ *     AssEvent ev = { 0 };
+ *     doc.open(buf, n);                    // 游标方法：open / next / count / seek
+ *     while (doc.next(&ev) == 1)
+ *         // ev.start_ms / ev.end_ms / ev.style / ev.text
+ *
+ * 文件按 `[节名]` 分段，常用两节：
+ *
+ *     [Script Info]
+ *     Title: 演示
+ *     ScriptType: v4.00+
+ *     PlayResX: 1920
+ *
+ *     [Events]
+ *     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+ *     Dialogue: 0,0:00:01.00,0:00:04.50,Default,,0,0,0,,你好，世界
+ *
+ * 时间是 `h:mm:ss.cc`（百分秒）。
+ *
+ * 约定：
+ *
+ * - `ass_info` 读 `Title`、`ScriptType`、`PlayResX`/`PlayResY`、`WrapStyle` 与
+ *   `[Events]` 的 `Format` 行，`events_off` 是 `[Events]` 之后第一条 Dialogue 的偏移；
+ * - `ass_event` 按**位置**取字段（Layer/Start/End/Style/Name/…/Text），Text 是最后
+ *   一段（可以含逗号），这与绝大多数文件的 `Format` 行一致；字段数不足返回 -1；
+ * - `ass_time_parse` 接受 `h:mm:ss.cc` 与 `h:mm:ss`；`ass_time_format` 输出百分秒；
+ * - 所有 `Str` 都是原缓冲区视图；`Dialogue`/`Comment` 都算事件；
+ * - 不解析样式节的 `Style:` 行内容，也不做 `{\\i1}` 这类覆盖标签的剥离。
+ */
+#include <string.h>
+
+module std.data.ass;
+import std.core.types;
+import std.text.str;
+
+struct AssInfo {
+    Str title;
+    Str script_type;
+    int play_res_x;
+    int play_res_y;
+    int wrap_style;
+    int n_events;
+    int events_off;
+    int has_format;
+};
+
+struct AssEvent {
+    int is_comment;
+    int layer;
+    i64 start_ms;
+    i64 end_ms;
+    Str style;
+    Str name;
+    Str text;
+};
+
+static int ass_isdigit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+int ass_time_parse(char[:] src, i64 *ms)
+{
+    const char *p = src.data;
+    int n = src.len, i = 0;
+    i64 h = 0, m = 0, s = 0, frac = 0;
+    int digits = 0, mul = 10;
+
+    if (!src.data || !ms || n <= 0)
+        return -1;
+    while (i < n && ass_isdigit(p[i])) {
+        h = h * 10 + (p[i] - '0');
+        digits++;
+        i++;
+    }
+    if (!digits || i >= n || p[i] != ':')
+        return -1;
+    i++;
+    digits = 0;
+    while (i < n && ass_isdigit(p[i])) {
+        m = m * 10 + (p[i] - '0');
+        digits++;
+        i++;
+    }
+    if (!digits || i >= n || p[i] != ':')
+        return -1;
+    i++;
+    digits = 0;
+    while (i < n && ass_isdigit(p[i])) {
+        s = s * 10 + (p[i] - '0');
+        digits++;
+        i++;
+    }
+    if (!digits)
+        return -1;
+    if (i < n && p[i] == '.') {
+        i++;
+        while (i < n && ass_isdigit(p[i]) && mul > 0) {
+            frac += (p[i] - '0') * mul;
+            mul /= 10;
+            i++;
+        }
+    }
+    *ms = h * 3600000 + m * 60000 + s * 1000 + frac * 10;
+    return 1;
+}
+
+int ass_time_format(i64 ms, char *dst, int cap)
+{
+    i64 v = ms < 0 ? 0 : ms;
+    int h = (int)(v / 3600000);
+    int m = (int)((v % 3600000) / 60000);
+    int s = (int)((v % 60000) / 1000);
+    int cs = (int)((v % 1000) / 10);
+    char buf[24] = { 0 };
+    int k = 0, i = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    /* 手写 h:mm:ss.cc，避免依赖 printf */
+    buf[k++] = (char)('0' + h % 10);
+    buf[k++] = ':';
+    buf[k++] = (char)('0' + m / 10 % 10);
+    buf[k++] = (char)('0' + m % 10);
+    buf[k++] = ':';
+    buf[k++] = (char)('0' + s / 10 % 10);
+    buf[k++] = (char)('0' + s % 10);
+    buf[k++] = '.';
+    buf[k++] = (char)('0' + cs / 10 % 10);
+    buf[k++] = (char)('0' + cs % 10);
+    if (k >= cap)
+        return -1;
+    for (i = 0; i < k; i++)
+        dst[i] = buf[i];
+    dst[k] = 0;
+    return k;
+}
+
+static int ass_line(const char *p, int n, int *pos, int *start, int *len)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *len = i - *start;
+    if (*len > 0 && p[*start + *len - 1] == '\r')
+        (*len)--;
+    if (i < n)
+        i++;
+    *pos = i;
+    return 1;
+}
+
+static int ass_starts(const char *p, int start, int len, const char *prefix)
+{
+    int plen = (int)strlen(prefix);
+
+    if (len < plen)
+        return 0;
+    return memcmp(p + start, prefix, (size_t)plen) == 0;
+}
+
+/* 从事件行里按键位取字段；返回字段起点，找不到返回 -1 */
+static int ass_field(const char *p, int start, int len, int idx, int *fstart,
+                     int *flen)
+{
+    int i = start, field = 0, fs = start;
+
+    while (i <= start + len) {
+        if (i == start + len || p[i] == ',') {
+            if (field == idx) {
+                *fstart = fs;
+                *flen = i - fs;
+                return 1;
+            }
+            field++;
+            fs = i + 1;
+        }
+        i++;
+    }
+    return -1;
+}
+
+int ass_event(const void *src, int n, const AssInfo *info, int idx,
+              AssEvent *out)
+{
+    const char *p = (const char *)src;
+    int pos = 0, start = 0, len = 0, seen = 0;
+
+    if (!src || !info || !out || idx < 0)
+        return -1;
+    pos = info->events_off;
+    while (ass_line(p, n, &pos, &start, &len)) {
+        int is_dlg = ass_starts(p, start, len, "Dialogue:");
+        int is_cmt = ass_starts(p, start, len, "Comment:");
+
+        if (!is_dlg && !is_cmt)
+            continue;
+        if (seen++ != idx)
+            continue;
+        {
+            int body = start + (is_dlg ? 9 : 8);
+            int blen = start + len - body;
+            int fs = 0, fl = 0;
+
+            memset(out, 0, sizeof *out);
+            out->is_comment = is_cmt;
+            if (ass_field(p, body, blen, 0, &fs, &fl) == 1) {
+                int k = fs, v = 0;
+
+                while (k < fs + fl && p[k] == ' ')
+                    k++;
+                while (k < fs + fl && ass_isdigit(p[k]))
+                    v = v * 10 + (p[k++] - '0');
+                out->layer = v;
+            }
+            if (ass_field(p, body, blen, 1, &fs, &fl) == 1) {
+                if (ass_time_parse((char[:]){ (char *)p + fs, fl },
+                                   &out->start_ms) != 1)
+                    return -1;
+            }
+            if (ass_field(p, body, blen, 2, &fs, &fl) == 1) {
+                if (ass_time_parse((char[:]){ (char *)p + fs, fl },
+                                   &out->end_ms) != 1)
+                    return -1;
+            }
+            if (ass_field(p, body, blen, 3, &fs, &fl) == 1)
+                out->style.s = (char[:]){ (char *)p + fs, fl };
+            if (ass_field(p, body, blen, 4, &fs, &fl) == 1)
+                out->name.s = (char[:]){ (char *)p + fs, fl };
+            if (ass_field(p, body, blen, 9, &fs, &fl) == 1) {
+                /* Text 是最后一段：取到行尾，允许里面带逗号 */
+                int rest = body + blen - fs;
+
+                out->text.s = (char[:]){ (char *)p + fs, rest };
+            } else {
+                return -1;
+            }
+            if (out->end_ms < out->start_ms)
+                return -1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int ass_info(const void *src, int n, AssInfo *out)
+{
+    const char *p = (const char *)src;
+    int pos = 0, start = 0, len = 0;
+    int in_events = 0;
+
+    if (!src || !out || n <= 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->events_off = -1;
+    while (ass_line(p, n, &pos, &start, &len)) {
+        const char *l = p + start;
+
+        if (len >= 2 && l[0] == '[') {
+            if (ass_starts(p, start, len, "[Events]")) {
+                in_events = 1;
+                out->events_off = pos;
+            } else {
+                in_events = 0;
+            }
+            continue;
+        }
+        if (ass_starts(p, start, len, "Title:")) {
+            int s2 = start + 6, e2 = start + len;
+
+            while (s2 < e2 && (p[s2] == ' ' || p[s2] == '\t'))
+                s2++;
+            while (e2 > s2 && (p[e2 - 1] == ' ' || p[e2 - 1] == '\t'))
+                e2--;
+            out->title.s = (char[:]){ (char *)p + s2, e2 - s2 };
+            continue;
+        }
+        if (ass_starts(p, start, len, "ScriptType:")) {
+            int s2 = start + 11, e2 = start + len;
+
+            while (s2 < e2 && p[s2] == ' ')
+                s2++;
+            out->script_type.s = (char[:]){ (char *)p + s2, e2 - s2 };
+            continue;
+        }
+        if (ass_starts(p, start, len, "PlayResX:")) {
+            int v = 0, k = start + 9;
+
+            while (k < start + len && p[k] == ' ')
+                k++;
+
+            while (k < start + len && ass_isdigit(p[k]))
+                v = v * 10 + (p[k++] - '0');
+            out->play_res_x = v;
+            continue;
+        }
+        if (ass_starts(p, start, len, "PlayResY:")) {
+            int v = 0, k = start + 9;
+
+            while (k < start + len && p[k] == ' ')
+                k++;
+
+            while (k < start + len && ass_isdigit(p[k]))
+                v = v * 10 + (p[k++] - '0');
+            out->play_res_y = v;
+            continue;
+        }
+        if (ass_starts(p, start, len, "WrapStyle:")) {
+            int v = 0, k = start + 10;
+
+            while (k < start + len && p[k] == ' ')
+                k++;
+            while (k < start + len && ass_isdigit(p[k]))
+                v = v * 10 + (p[k++] - '0');
+            out->wrap_style = v;
+            continue;
+        }
+        if (in_events && ass_starts(p, start, len, "Format:"))
+            out->has_format = 1;
+    }
+    if (out->events_off < 0)
+        out->events_off = 0;
+    {
+        AssEvent ev = { 0 };
+        int i = 0, count = 0;
+
+        while (ass_event(src, n, out, i, &ev) == 1) {
+            count++;
+            i++;
+        }
+        out->n_events = count;
+    }
+    return 1;
+}
+
+/* ---- 游标（结构体方法） ---- */
+
+struct AssDoc {
+    const char *src;
+    int n;
+    AssInfo info;
+    int idx;
+    int nev;
+};
+
+int open(AssDoc *d, const void *src, int n)
+{
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    if (ass_info(src, n, &d->info) != 1)
+        return -1;
+    d->nev = d->info.n_events;
+    d->idx = 0;
+    return d->nev;
+}
+
+int next(AssDoc *d, AssEvent *out)
+{
+    int r = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    r = ass_event(d->src, d->n, &d->info, d->idx, out);
+    if (r == 1)
+        d->idx++;
+    return r;
+}
+
+int count(AssDoc *d)
+{
+    return d ? d->nev : 0;
+}
+
+int rewind(AssDoc *d)
+{
+    if (!d)
+        return -1;
+    d->idx = 0;
+    return 1;
+}
+
+Str title(AssDoc *d)
+{
+    if (!d)
+        return (Str){ (char[:]){ 0, 0 } };
+    return d->info.title;
+}
+
+/* 跳到第一条 start_ms >= ms 的事件 */
+int seek(AssDoc *d, i64 ms)
+{
+    AssEvent ev = { 0 };
+    int i = 0;
+
+    if (!d || !d->src)
+        return -1;
+    for (i = 0; i < d->nev; i++) {
+        if (ass_event(d->src, d->n, &d->info, i, &ev) != 1)
+            return -1;
+        if (ev.start_ms >= ms) {
+            d->idx = i;
+            return 1;
+        }
+    }
+    d->idx = d->nev;
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "ass：时间与脚本信息" {
+    i64 ms = 0;
+    char out[24] = { 0 };
+    static const char *src =
+        "[Script Info]\r\n"
+        "Title: 演示字幕\r\n"
+        "ScriptType: v4.00+\r\n"
+        "PlayResX: 1920\r\n"
+        "PlayResY: 1080\r\n"
+        "WrapStyle: 0\r\n"
+        "\r\n"
+        "[Events]\r\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\r\n";
+    AssInfo info = { 0 };
+
+    if (ass_time_parse(S("0:00:01.00"), &ms) != 1 || ms != 1000)
+        return err(1, "0:00:01.00 应该是 1000 毫秒");
+    if (ass_time_parse(S("1:02:03.45"), &ms) != 1 || ms != 3723450)
+        return err(2, "带小时的时间不对");
+    if (ass_time_parse(S("bad"), &ms) != -1)
+        return err(3, "非法时间应该 -1");
+    if (ass_time_format(3723450, out, (int)sizeof out) != 10
+        || memcmp(out, "1:02:03.45", 10) != 0)
+        return err(4, "时间格式化不对");
+    if (ass_info(src, (int)strlen(src), &info) != 1)
+        return err(5, "脚本信息解析失败");
+    if (info.title.s.len != 12)
+        return err(6, "标题长度不对");
+    if (info.script_type.s.len != 6 || info.play_res_x != 1920
+        || info.play_res_y != 1080)
+        return err(7, "ScriptType 或分辨率不对");
+    if (info.has_format != 1 || info.n_events != 0)
+        return err(8, "Format 行或事件数不对");
+}
+
+test "ass：事件" {
+    static const char *src =
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:04.50,Default,,0,0,0,,你好，世界\n"
+        "Dialogue: 1,0:00:05.00,0:00:06.00,Fancy,Bob,0,0,0,,第二行，带逗号\n"
+        "Comment: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,注释行\n";
+    AssInfo info = { 0 };
+    AssEvent ev = { 0 };
+
+    if (ass_info(src, (int)strlen(src), &info) != 1)
+        return err(9, "解析失败");
+    if (info.n_events != 3)
+        return err(10, "应该有 3 条事件（含 Comment）");
+    if (ass_event(src, (int)strlen(src), &info, 0, &ev) != 1)
+        return err(11, "第 0 条事件取不到");
+    if (ev.start_ms != 1000 || ev.end_ms != 4500)
+        return err(12, "第 0 条时间不对");
+    if (ev.style.s.len != 7 || memcmp(ev.style.s.data, "Default", 7) != 0)
+        return err(13, "第 0 条样式不对");
+    if (ev.text.s.len != 15)
+        return err(14, "第 0 条文本长度不对（中文每字 3 字节）");
+    if (memcmp(ev.text.s.data, "你好，世界", 15) != 0)
+        return err(15, "第 0 条文本内容不对");
+    if (ass_event(src, (int)strlen(src), &info, 1, &ev) != 1)
+        return err(16, "第 1 条事件取不到");
+    if (ev.layer != 1 || ev.name.s.len != 3)
+        return err(17, "第 1 条的 layer/name 不对");
+    if (ev.text.s.len != 21 || memcmp(ev.text.s.data, "第二行，带逗号", 21) != 0)
+        return err(18, "第 1 条文本应该保留逗号");
+    if (ass_event(src, (int)strlen(src), &info, 2, &ev) != 1
+        || ev.is_comment != 1)
+        return err(19, "第 2 条应该是 Comment");
+    if (ass_event(src, (int)strlen(src), &info, 3, &ev) != 0)
+        return err(20, "越界事件应该 0");
+}
+
+test "ass：游标方法" {
+    static const char *src =
+        "[Script Info]\n"
+        "Title: 测试\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,A\n"
+        "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,B\n"
+        "Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,C\n";
+    AssDoc doc = { 0 };
+    AssEvent ev = { 0 };
+    Str t = { 0 };
+    int n = 0;
+
+    if (doc.open(src, (int)strlen(src)) != 3)
+        return err(21, "应该有 3 条事件");
+    if (doc.count() != 3)
+        return err(22, "count() 方法不对");
+    t = doc.title();
+    if (t.s.len != 6)
+        return err(23, "title() 方法不对");
+    if (doc.seek(3000) != 1)
+        return err(24, "seek 到 3 秒失败");
+    if (doc.next(&ev) != 1 || ev.start_ms != 3000)
+        return err(25, "seek 之后第一条应该是 3 秒那条");
+    n = 0;
+    while (doc.next(&ev) == 1)
+        n++;
+    if (n != 1)
+        return err(26, "3 秒之后应该只剩 1 条");
+    doc.rewind();
+    n = 0;
+    while (doc.next(&ev) == 1)
+        n++;
+    if (n != 3)
+        return err(27, "rewind 之后应该又能读出 3 条");
+}

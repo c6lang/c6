@@ -58,24 +58,24 @@ static void do_log(void)
     char out[256] = { 0 };
 
     printf("== log\n");
-    check(log_init(&lg, recs, 4, LOG_INFO) == 1, "初始化");
-    check(log_add(&lg, LOG_DEBUG, S("db"), S("connect attempt")) == 0,
+    check(lg.init(recs, 4, LOG_INFO) == 1, "初始化");
+    check(lg.add(LOG_DEBUG, S("db"), S("connect attempt")) == 0,
           "DEBUG 被过滤");
-    check(log_add(&lg, LOG_INFO, S("db"), S("connected")) == 1, "INFO 写入");
-    check(log_add(&lg, LOG_ERROR, S("db"), S("query failed")) == 1,
+    check(lg.add(LOG_INFO, S("db"), S("connected")) == 1, "INFO 写入");
+    check(lg.add(LOG_ERROR, S("db"), S("query failed")) == 1,
           "ERROR 写入");
-    check(log_filtered(&lg) == 1 && log_count(&lg) == 2, "计数");
-    r = log_at(&lg, 0);
+    check(lg.filtered() == 1 && lg.count() == 2, "计数");
+    r = lg.at(0);
     if (r)
         printf("   最新：[%s] %s: %s\n", log_level_name(r->level), r->scope,
                r->msg);
     check(r && r->level == LOG_ERROR, "最新一条是 ERROR");
-    log_add(&lg, LOG_WARN, S("io"), S("slow"));
-    log_add(&lg, LOG_WARN, S("io"), S("slower"));
-    log_add(&lg, LOG_FATAL, S("io"), S("gone"));
-    check(log_count(&lg) == 4 && log_dropped(&lg) == 1, "环形覆盖");
+    lg.add(LOG_WARN, S("io"), S("slow"));
+    lg.add(LOG_WARN, S("io"), S("slower"));
+    lg.add(LOG_FATAL, S("io"), S("gone"));
+    check(lg.count() == 4 && lg.dropped() == 1, "环形覆盖");
     {
-        int n = log_dump(&lg, out, (int)sizeof out);
+        int n = lg.dump(out, (int)sizeof out);
 
         printf("   dump（%d 字节）：\n%s", n, out);
         check(n > 0 && memcmp(out, "#1 ERROR db: query failed\n", 25) == 0,

@@ -1878,6 +1878,54 @@ Treap 那个「槽位不回收」的坑值得记：一开始用 `t->n--` 同时�
 验收：`make stdtest`（225 个模块、0 failure）、`make std-bwt`（22 条自检全过）、
 `make check-all`。
 
+### 11.66 标准库第五十四批（srt / ass / lrc / m3u）与「方法化」整理
+
+第五十四批做「字幕与播放列表」：SubRip/WebVTT、ASS、LRC、M3U。四种都是「一行一条
+记录」的文本格式，正好统一成**游标 + 方法**的用法：
+
+```c
+SrtDoc doc = { 0 };
+SrtCue cue = { 0 };
+doc.open(buf, n);                 // 打开并计数
+while (doc.next(&cue) == 1)       // 逐条
+    …
+doc.seek(3000);                   // 跳到第一条 start_ms >= 3000
+doc.rewind();                     // 复位
+```
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.srt` | SubRip / WebVTT | `srt_parse` 从任意偏移解一条（跳过序号行、`WEBVTT` 头、`NOTE` 块）；WebVTT 的 cue 标识行会让「时间行」晚一行，所以要「找不到 `-->` 就再读一行」；时间解析同时认 `,` 与 `.`，并修正了「1~2 位小数被多除一次」的老 bug |
+| `std.data.ass` | ASS/SSA | 事件字段按**位置**取，但 Text 是最后一段、要取到行尾（否则带逗号的台词会被截断）；PlayResX/Y 的数字前要跳过空格 |
+| `std.data.lrc` | LRC | `[offset:]` 会加到每条时间上；`tag()` 用「`[name:` 前缀 + 末尾 `]`」的规则取元信息；格式化分钟至少两位（`[01:02.50]`） |
+| `std.data.m3u` | M3U/M3U8 | `#EXTINF` 的秒换算成毫秒并保留标题，`#EXT-X-` 出现即视为 HLS；没有 `#EXTINF` 的条目 `duration_ms` 为 -1 |
+
+同时把前面几批的「状态型」模块统一成**方法优先**的形态（用户要求「充分使用结构体
+方法」）：`fenwick`、`segtree`、`dsu`、`bloom`、`log`、`treap`、`heap`、`skiplist`、
+`counter` 的函数都改成了裸方法名，调用统一写成 `f.add(...)`、`h.push(...)`、
+`t.put(...)`、`lg.dump(...)`，`test` 块与 `examples/stdstruct.c6`、
+`examples/stdordered.c6`、`examples/stddb.c6` 也跟着改了。
+
+c6 的方法规则这里踩了三个坑：
+
+1. **方法名就是函数名**：`push(Ring *r, …)` 才能写成 `r.push(…)`；`ring_push` 只会
+   得到 `r.ring_push(…)`。所以方法化必须真的改函数名。
+2. **字段不能与同名方法共存**：`Dsu.count`→`nsets`、`Bloom.bits`→`set_bits()`、
+   `Log.filtered/dropped`→`nfilt/ndrop`、`Counter.total`→`sum()`，都是先撞上
+   `function pointer expected`/`field not found` 才发现的。
+3. **首参是结构体指针的函数必须用方法语法调用**：留着 `count(&d)` 这种写法会报
+   `method 'count' must be called`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.srt`=0x60e1、
+`std.data.ass`=0x60e2、`std.data.lrc`=0x60e3、`std.data.m3u`=0x60e4；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-subs` 与 `STD_SUBS_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都依赖 `std/text/str.c6`（srt 26、ass 25、
+lrc 24、m3u 24 条）。示例 `examples/stdsubs.c6` 四节（22 条自检，全部方法调用）。
+
+验收：`make stdtest`（229 个模块、0 failure）、`make std-subs`（22 条自检全过）、
+`make check-all`。
+
+
 
 
 

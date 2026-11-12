@@ -221,10 +221,10 @@
 | `std/net/ftp.c6` | `std.net.ftp` | FTP：`ftp_reply` 解状态码与多行标志，`ftp_pasv` 从 `227 …(h1,h2,h3,h4,p1,p2)` 拼出地址与端口（`p1*256+p2`），`ftp_cmd` 拼命令，`ftp_list_line` 解类 Unix 长格式、`ftp_mlsd_line` 解 `type=…;size=…; name` |
 | `std/net/redis.c6` | `std.net.redis` | RESP：`resp_parse` 解 `+`/`-`/`:`/`$`/`*` 五种类型（给出内容偏移、长度、整段字节数，`$-1`/`*-1` 是 null），`resp_encode_bulk`/`resp_encode_int`/`resp_encode_array_hdr`/`resp_encode_cmd` 负责编码；数组只解头 |
 | `std/net/telnet.c6` | `std.net.telnet` | Telnet：`telnet_parse` 分别返回协商命令（WILL/WONT/DO/DONT/SB…SE）、普通数据字节、`IAC IAC` 转义的 0xFF，`telnet_reply` 按方向给应答（WILL→DO、DO→WILL），`telnet_unescape` 丢协商、还原 0xFF |
-| `std/container/fenwick.c6` | `std.container.fenwick` | 树状数组：`fenwick_add` 单点加、`fenwick_sum`/`fenwick_range` 前缀与区间和、`fenwick_lower` 按前缀和二分定位；存储由调用方给（`n+1` 个 `i64`） |
-| `std/container/segtree.c6` | `std.container.segtree` | 迭代线段树（2n 数组）：`seg_init` 按 `SEG_SUM`/`SEG_MIN`/`SEG_MAX` 建树，`seg_set` 点赋值、`seg_add` 点加、`seg_range` 闭区间聚合、`seg_all` 整树值 |
-| `std/container/dsu.c6` | `std.container.dsu` | 并查集：`dsu_find` 路径减半（迭代）、`dsu_union` 按大小合并（已同集合返回 -1）、`dsu_same`/`dsu_size`/`dsu_count`；`parent`/`size` 缓冲区由调用方给 |
-| `std/container/bloom.c6` | `std.container.bloom` | 布隆过滤器：FNV-1a 双哈希（`h1 + i*h2`）取模置位，`bloom_add`/`bloom_has`（1 可能在、0 一定不在），`bloom_set_bits`/`bloom_fill_ratio` 给置位统计 |
+| `std/container/fenwick.c6` | `std.container.fenwick` | 树状数组（**方法**：`f.init`/`f.add`/`f.sum`/`f.range`/`f.all`/`f.lower`）：单点加、前缀与区间和、按前缀和二分定位；存储由调用方给（`n+1` 个 `i64`） |
+| `std/container/segtree.c6` | `std.container.segtree` | 迭代线段树（2n 数组，**方法**：`t.init`/`t.set`/`t.add`/`t.get`/`t.range`/`t.all`）：按 `SEG_SUM`/`SEG_MIN`/`SEG_MAX` 建树，点赋值/点加/闭区间聚合 |
+| `std/container/dsu.c6` | `std.container.dsu` | 并查集（**方法**：`d.init`/`d.find`/`d.merge`/`d.same`/`d.set_size`/`d.count`）：路径减半（迭代）、按大小合并（已同集合返回 -1）；`parent`/`size` 缓冲区由调用方给 |
+| `std/container/bloom.c6` | `std.container.bloom` | 布隆过滤器（**方法**：`b.init`/`b.add`/`b.has`/`b.set_bits`/`b.capacity`/`b.fill_ratio`）：FNV-1a 双哈希（`h1 + i*h2`）取模置位，`has` 返回 1 可能在、0 一定不在 |
 | `std/text/slug.c6` | `std.text.slug` | URL slug：按 UTF-8 解码，ASCII 小写 + 数字保留、U+00C0..U+00FF 按去音标基字母折叠（`é`→`e`、`ñ`→`n`），其它码点（含 CJK）当分隔且连续分隔只出一个；`slug_valid` 校验合法 slug |
 | `std/text/casing.c6` | `std.text.casing` | 命名风格互转：`case_words` 按「非字母数字 / 小写接大写 / 缩略词边界」切词，`case_snake`/`case_kebab`/`case_camel`/`case_pascal`/`case_title` 输出五种风格（数字不单独切） |
 | `std/text/roman.c6` | `std.text.roman` | 罗马数字：`roman_from_int`（1..3999，标准减法记法）、`roman_to_int`（大小写都收，且要求「写回来等于原串」才算合法，`IIII`/`VX`/`MMMM` 一律 -1）、`roman_valid` |
@@ -241,7 +241,7 @@
 | `std/net/syslog.c6` | `std.net.syslog` | syslog：`syslog_parse` 同时认 RFC 5424（`<PRI>1 时间 主机 应用 procid msgid 结构数据 消息`）与老式 RFC 3164（`<PRI>MMM dd hh:mm:ss 主机 TAG: 消息`），`syslog_pri` 算 PRI，`syslog_build` 生成 5424 简化报文；字段都是原缓冲区的视图 |
 | `std/net/stun.c6` | `std.net.stun` | STUN（RFC 5389）：`stun_parse` 解 20 字节头（类型位交错的方法/类别、魔术字、事务 ID），`stun_attr_at`/`stun_find` 走 TLV 属性（按 4 字节补齐），`stun_xor_addr` 解 XOR-MAPPED-ADDRESS（IPv4），`stun_build`/`stun_make_type` 反向构造 |
 | `std/net/tftp.c6` | `std.net.tftp` | TFTP：`tftp_parse` 解 RRQ/WRQ（文件名 + 模式 + 选项区）、DATA（块号 + 数据）、ACK、ERROR、OACK；`tftp_build_rrq`/`tftp_build_wrq`/`tftp_build_data`/`tftp_build_ack`/`tftp_build_error` 负责构造 |
-| `std/os/log.c6` | `std.os.log` | 定长环形日志：`log_init` 给槽位数组与最高级别，`log_add` 按 `LOG_TRACE`..`LOG_FATAL` 过滤并写入（超长截断），`log_at`/`log_text`/`log_dump` 取记录与格式化，`log_count_level`/`log_dropped`/`log_filtered` 给统计 |
+| `std/os/log.c6` | `std.os.log` | 定长环形日志（**方法**：`lg.init`/`lg.add`/`lg.at`/`lg.text`/`lg.dump`/`lg.count`/`lg.count_level`/`lg.dropped`/`lg.filtered`）：按 `LOG_TRACE`..`LOG_FATAL` 过滤，槽位写满后覆盖最旧记录 |
 | `std/data/sqlite.c6` | `std.data.sqlite` | SQLite 文件：`sqlite_header` 解 100 字节文件头（页大小/格式版本/payload 分界/库页数/schema/文本编码/user_version/app_id），`sqlite_page` 解 B-tree 页头与单元数，`sqlite_cell` 解单元（payload 长度 + rowid + 本地 payload，溢出页标记），`sqlite_varint` 解 1..9 字节变长整数 |
 | `std/net/postgres.c6` | `std.net.postgres` | PostgreSQL v3：`pg_parse` 拆「1 字节类型 + 4 字节长度」的报文，`pg_startup`/`pg_startup_param` 解启动包里的 `键\0值\0` 对，`pg_error_field` 取 ErrorResponse 字段，`pg_build_msg`/`pg_build_query`/`pg_build_password`/`pg_build_startup` 负责构造 |
 | `std/net/mysql.c6` | `std.net.mysql` | MySQL：`my_parse` 拆「3 字节小端长度 + 序号 + 正文」的报文，`my_handshake` 解 HandshakeV10（服务端版本/连接 ID/能力位/字符集/20 字节挑战串），`my_lenenc` 解长度编码整数（含 `0xFB` NULL），`my_build_query`/`my_build_auth` 构造 |
@@ -249,14 +249,18 @@
 | `std/encoding/adler32.c6` | `std.encoding.adler32` | Adler-32：`adler32`（初值 1）、`adler32_update` 流式、`adler32_combine` 把两段相邻数据的校验和合成一段（`len2` 是第二段长度），内部每 5552 字节取模 |
 | `std/encoding/murmur3.c6` | `std.encoding.murmur3` | MurmurHash3：`murmur3_32(data, seed)`（x86 32 位，尾部按 3/2/1 字节 + `fmix32`）与 `murmur3_128(data, seed, &h1, &h2)`（x64 128 位，两个状态 + 两次 `fmix64`），`murmur3_32_str` 是 `seed=0` 的别名 |
 | `std/encoding/siphash.c6` | `std.encoding.siphash` | SipHash：`siphash24`/`siphash13` 一次性（16 字节密钥）、`SipHash` 流式状态（`siphash_init`/`siphash_update`/`siphash_final`，`rounds` 取 1/2）、`siphash_verify` 做定时安全比较；含官方测试向量 |
-| `std/container/treap.c6` | `std.container.treap` | 数组实现的 Treap（随机化 BST map）：`treap_put` 插入/更新、`treap_get`、`treap_del`、`treap_rank`（严格小于的键数）、`treap_kth`（第 k 小）、`treap_size`；节点用下标链接，优先级来自 xorshift |
-| `std/container/heap.c6` | `std.container.heap` | 数组二叉堆（i64）：`heap_init`（最小/最大）、`heap_push`/`heap_pop`/`heap_peek`、`heap_build` 原地 O(n) 堆化、`heap_pushpop`（top-k 常用）、`heap_sort` 原地排序 |
-| `std/container/skiplist.c6` | `std.container.skiplist` | 数组跳表（有序 map，8 层）：`skip_put`/`skip_get`/`skip_del`、`skip_first`/`skip_next` 升序遍历、`skip_at` 取第 idx 个；`nodes[0]` 是头哨兵，层数按几何分布随机 |
-| `std/container/counter.c6` | `std.container.counter` | 字符串频次计数器（开放寻址 + 线性探测）：`counter_add`（可负增量）、`counter_get`、`counter_top`（出现最多的键）、`counter_keys`/`counter_total`/`counter_clear`；键定长 23 字节，装到 3/4 返回满 |
+| `std/container/treap.c6` | `std.container.treap` | 数组实现的 Treap（随机化 BST map，**方法**：`t.init`/`t.put`/`t.get`/`t.del`/`t.rank`/`t.kth`/`t.size`）：`rank` 是严格小于的键数、`kth` 取第 k 小；节点用下标链接，优先级来自 xorshift |
+| `std/container/heap.c6` | `std.container.heap` | 数组二叉堆（i64，**方法**：`h.init`/`h.push`/`h.pop`/`h.peek`/`h.build`/`h.pushpop`/`h.sort`/`h.size`）：最小/最大堆、原地 O(n) 堆化、`pushpop` 用于 top-k、原地排序 |
+| `std/container/skiplist.c6` | `std.container.skiplist` | 数组跳表（有序 map，8 层，**方法**：`sl.init`/`sl.put`/`sl.get`/`sl.del`/`sl.first`/`sl.next`/`sl.at`/`sl.size`）：`first`+`next` 升序遍历、`at` 取第 idx 个；`nodes[0]` 是头哨兵 |
+| `std/container/counter.c6` | `std.container.counter` | 字符串频次计数器（开放寻址 + 线性探测，**方法**：`c.init`/`c.add`/`c.get`/`c.top`/`c.keys`/`c.sum`/`c.clear`）：`add` 支持负增量、`top` 取出现最多的键；键定长 23 字节，装到 3/4 返回满 |
 | `std/encoding/bwt.c6` | `std.encoding.bwt` | Burrows-Wheeler 变换：`bwt_transform` 用「倍增 + 计数排序」排循环移位（O(n log n)），输出末列与主行号；`bwt_inverse` 用 LF 映射 O(n) 还原。临时缓冲是模块静态区（上限 65536，不可重入） |
 | `std/encoding/mtf.c6` | `std.encoding.mtf` | Move-To-Front：`mtf_encode` 输出每个字节在 256 项符号表里的位置并把它移到表头，`mtf_decode` 反向；BWT 之后连续重复会变成一串 0 |
 | `std/encoding/delta.c6` | `std.encoding.delta` | 差分编码：`delta_encode`/`delta_decode` 按字节差分（模 256），`delta_encode64`/`delta_decode64` 对 `i64` 数组差分（时间戳等单调序列） |
 | `std/encoding/huffman.c6` | `std.encoding.huffman` | 规范 Huffman：`huff_lengths` 按频率建树给码长（单符号特判长度 1），`huff_codes` 用 Kraft 等式校验并按 (码长, 符号) 分配规范码，`huff_encode`/`huff_decode` 按高位在前打包与逐位解码 |
+| `std/data/srt.c6` | `std.data.srt` | SubRip / WebVTT（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.seek`/`doc.rewind`/`doc.is_vtt`）：`open` 数 cue，`next` 逐条返回 `start_ms`/`end_ms`/文本视图，另给 `srt_parse`（按偏移取一条）、`srt_time_parse`/`srt_time_format`、`srt_format`（生成一条） |
+| `std/data/ass.c6` | `std.data.ass` | ASS/SSA（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.title`/`doc.seek`/`doc.rewind`）：解析 `[Script Info]` 的 Title/ScriptType/PlayRes/WrapStyle 与 `[Events]` 的 `Dialogue:`/`Comment:`，Text 取到行尾（允许逗号），时间是 `h:mm:ss.cc` |
+| `std/data/lrc.c6` | `std.data.lrc` | LRC 歌词（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.tag`/`doc.doc_title`/`doc.offset`/`doc.rewind`）：解析 `[ti:]`/`[ar:]`/`[al:]`/`[offset:]` 元信息与 `[mm:ss.xx]文本` 歌词行，`offset` 自动加到每条时间上 |
+| `std/data/m3u.c6` | `std.data.m3u` | M3U/M3U8 播放列表（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.is_extended`/`doc.is_stream`/`doc.rewind`）：支持 `#EXTM3U`/`#EXTINF`（秒→毫秒、标题）与 `#EXT-X-` 的 HLS 判断；`m3u_build` 生成一条扩展条目 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -353,6 +357,7 @@
 | `examples/stdhash2.c6` | （无模块） | 第五十一批（非加密散列补齐）的拼装示例（`make std-hash2`）：FNV（一次性 + 流式）、Adler-32（合并）、MurmurHash3 32/128、SipHash 2-4/1-3 |
 | `examples/stdordered.c6` | （无模块） | 第五十二批（有序容器）的拼装示例（`make std-ordered`）：Treap 排名/第 k 小、堆 top-k 与排序、跳表有序遍历、频次计数器 |
 | `examples/stdcmp.c6` | （无模块） | 第五十三批（变换式压缩积木）的拼装示例（`make std-bwt`）：BWT↔逆变换、MTF、差分（字节与时间戳）、规范 Huffman 往返 |
+| `examples/stdsubs.c6` | （无模块） | 第五十四批（字幕与播放列表）的拼装示例（`make std-subs`）：四种文本格式都用游标方法（`doc.open`/`doc.next`/`doc.count`/`doc.seek`）演示 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -459,6 +464,10 @@ std/encoding/bwt.c6        24 test(s), 0 failure(s)
 std/encoding/mtf.c6        24 test(s), 0 failure(s)
 std/encoding/delta.c6      24 test(s), 0 failure(s)
 std/encoding/huffman.c6    24 test(s), 0 failure(s)
+std/data/srt.c6            26 test(s), 0 failure(s)
+std/data/ass.c6            25 test(s), 0 failure(s)
+std/data/lrc.c6            24 test(s), 0 failure(s)
+std/data/m3u.c6            24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3779,6 +3788,17 @@ make std-bwt
 相邻重复变多」并逆变换还原；MTF 核对索引序列与「200 个相同字节 → 199 个 0」；
 差分覆盖字节与时间戳两种；Huffman 用重复文本算压缩率并往返，另验单符号特判。
 
+### 集成示例：`examples/stdsubs.c6`
+
+```sh
+make std-subs
+```
+
+四节全是**方法调用**：SRT 用 `doc.open/next/count/seek/rewind` 逐条打印并跳到 3 秒；
+ASS 用 `doc.title()` 取标题、`doc.seek(3000)` 定位；LRC 用 `doc.tag("ti")` 与
+`doc.offset()` 读元信息、`doc.next(&line)` 读歌词；M3U 用 `doc.is_extended()`/`count()`
+并生成一条 `#EXTINF` 往返。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3881,6 +3901,8 @@ make std-bwt
   （自带自检）。
 * `make std-bwt`：`examples/stdcmp.c6`，第五十三批（变换式压缩积木）模块的拼装示例
   （自带自检）。
+* `make std-subs`：`examples/stdsubs.c6`，第五十四批（字幕与播放列表）模块的拼装示例
+  （自带自检，全部用结构体方法调用）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
