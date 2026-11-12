@@ -1,0 +1,299 @@
+/* std/encoding/uu：uuencode / uudecode（Usenet 的老式二进制转文本编码）。
+ *
+ *     import std.encoding.uu;
+ *
+ *     char out[128] = { 0 };
+ *     int n = uu_encode(S("Hello, uuencode!"), out, (int)sizeof out);
+ *     int m = uu_decode((char[:]){ out, n }, back, (int)sizeof back);
+ *
+ * 线路格式：
+ *
+ *     begin 644 <name>
+ *     <长度字符><4 个字符一组…>
+ *     `
+ *     end
+ *
+ * 每行最多 45 个原始字节：行首字符是 `(字节数 & 0x3F) + 0x20`，其后每 3 字节
+ * 拼成一个 24 位值、拆成 4 个 6 位组，各自 +0x20；6 位值 0 写成 `` ` ``（0x60）
+ * 以避开行首的空格。
+ *
+ * 约定：
+ *
+ * - `uu_encoded_len` 给上界（含 `begin`/`end` 行）；
+ * - `uu_encode` 输出完整块（`begin 644 data` + 数据行 + 单字符 `` ` `` 行 + `end`），
+ *   返回值不含结尾 `\0`；想要自定义文件名用 `uu_encode_named`；
+ * - `uu_encode_body` 只写数据行（不含 begin/end），每行以 `\n` 结尾；
+ * - `uu_decode` 忽略 `begin`/`end`/空行，行首长度字符为 `` ` `` 或 0x20 时视为 0
+ *   （结束），返回解出的字节数；遇到非法字符返回 -1；
+ * - 只支持 `begin` 的普通模式，不认 `begin-base64`（那是另一种格式）。
+ */
+#include <string.h>
+
+module std.encoding.uu;
+import std.core.types;
+import std.text.str;
+
+int uu_encoded_len(int n)
+{
+    int lines = 0;
+
+    if (n <= 0)
+        return 0;
+    lines = (n + 44) / 45;
+    return lines * 62 + 32;
+}
+
+static int uu_putc(char *dst, int cap, int o, char c)
+{
+    if (o >= cap)
+        return -1;
+    dst[o] = c;
+    return o + 1;
+}
+
+static int uu_putn(char *dst, int cap, int o, const char *s)
+{
+    int i = 0;
+
+    for (i = 0; s[i]; i++) {
+        o = uu_putc(dst, cap, o, s[i]);
+        if (o < 0)
+            return -1;
+    }
+    return o;
+}
+
+int uu_encode_body(char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0;
+
+    if (src.len < 0 || !dst || cap < 0)
+        return -1;
+    for (i = 0; i < src.len; i += 45) {
+        int chunk = src.len - i;
+        int j = 0;
+
+        if (chunk > 45)
+            chunk = 45;
+        o = uu_putc(dst, cap, o, (char)((chunk & 0x3F) + 0x20));
+        if (o < 0)
+            return -1;
+        for (j = 0; j < chunk; j += 3) {
+            unsigned int v = 0;
+            int k = 0;
+
+            v = (unsigned int)(unsigned char)src.data[i + j] << 16;
+            if (j + 1 < chunk)
+                v |= (unsigned int)(unsigned char)src.data[i + j + 1] << 8;
+            if (j + 2 < chunk)
+                v |= (unsigned int)(unsigned char)src.data[i + j + 2];
+            for (k = 0; k < 4; k++) {
+                int c = (int)((v >> (18 - 6 * k)) & 0x3Fu) + 0x20;
+
+                if (c == 0x20)
+                    c = 0x60;
+                o = uu_putc(dst, cap, o, (char)c);
+                if (o < 0)
+                    return -1;
+            }
+        }
+        o = uu_putc(dst, cap, o, '\n');
+        if (o < 0)
+            return -1;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int uu_encode_named(char[:] src, const char *name, char *dst, int cap)
+{
+    int o = 0, body = 0;
+
+    if (!dst || !name || cap < 0)
+        return -1;
+    o = uu_putn(dst, cap, 0, "begin 644 ");
+    if (o < 0)
+        return -1;
+    o = uu_putn(dst, cap, o, name);
+    if (o < 0)
+        return -1;
+    o = uu_putc(dst, cap, o, '\n');
+    if (o < 0)
+        return -1;
+    body = uu_encode_body(src, dst + o, cap - o);
+    if (body < 0)
+        return -1;
+    o += body;
+    o = uu_putn(dst, cap, o, "`\nend\n");
+    if (o < 0)
+        return -1;
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int uu_encode(char[:] src, char *dst, int cap)
+{
+    return uu_encode_named(src, "data", dst, cap);
+}
+
+static int uu_word(const char *s, int n, int pos, const char *kw)
+{
+    int klen = (int)strlen(kw);
+
+    if (pos + klen > n)
+        return 0;
+    if (memcmp(s + pos, kw, (size_t)klen) != 0)
+        return 0;
+    if (pos + klen < n && s[pos + klen] != ' ' && s[pos + klen] != '\n'
+        && s[pos + klen] != '\r')
+        return 0;
+    return 1;
+}
+
+int uu_decode(char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0;
+
+    if (!dst || cap < 0 || src.len < 0)
+        return -1;
+    while (i < src.len) {
+        /* 跳过空白与以 begin/end 开头的行 */
+        if (src.data[i] == '\r' || src.data[i] == '\n'
+            || src.data[i] == ' ' || src.data[i] == '\t') {
+            i++;
+            continue;
+        }
+        if (uu_word(src.data, src.len, i, "begin")
+            || uu_word(src.data, src.len, i, "end")) {
+            while (i < src.len && src.data[i] != '\n')
+                i++;
+            continue;
+        }
+        {
+            int count = ((int)(unsigned char)src.data[i] - 0x20) & 0x3F;
+            int j = 0;
+
+            if (src.data[i] == '`' || src.data[i] == ' ')
+                count = 0;
+            i++;
+            if (count == 0) {
+                while (i < src.len && src.data[i] != '\n')
+                    i++;
+                continue;
+            }
+            for (j = 0; j < count; j += 3) {
+                unsigned int v = 0;
+                int k = 0;
+
+                for (k = 0; k < 4; k++) {
+                    int c = 0;
+
+                    if (i >= src.len)
+                        return -1;
+                    c = (int)(unsigned char)src.data[i];
+                    if (c == '\n' || c == '\r')
+                        return -1;
+                    if (c == '`')
+                        c = 0x20;
+                    if (c < 0x20 || c > 0x60)
+                        return -1;
+                    v = (v << 6) | (unsigned int)((c - 0x20) & 0x3F);
+                    i++;
+                }
+                {
+                    int remain = count - j;
+
+                    if (remain > 3)
+                        remain = 3;
+                    if (o + remain > cap)
+                        return -1;
+                    dst[o++] = (char)((v >> 16) & 0xFFu);
+                    if (remain >= 2)
+                        dst[o++] = (char)((v >> 8) & 0xFFu);
+                    if (remain >= 3)
+                        dst[o++] = (char)(v & 0xFFu);
+                }
+            }
+            while (i < src.len && src.data[i] != '\n')
+                i++;
+        }
+    }
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "uuencode：编码" {
+    char out[256] = { 0 };
+    int n = 0;
+
+    n = uu_encode_body(S("Hello, uuencode!"), out, (int)sizeof out);
+    if (n != 26)
+        return err(1, "单行长度不对");
+    if (memcmp(out, "02&5L;&\\L('5U96YC;V1E(0``\n", 26) != 0)
+        return err(2, "单行内容不对");
+    n = uu_encode_body(S("abc"), out, (int)sizeof out);
+    if (n != 6 || memcmp(out, "#86)C\n", 6) != 0)
+        return err(3, "abc 的编码不对");
+    n = uu_encode(S("abc"), out, (int)sizeof out);
+    if (n != 27)
+        return err(4, "完整块长度不对");
+    if (memcmp(out, "begin 644 data\n#86)C\n`\nend\n", 27) != 0)
+        return err(5, "完整块内容不对");
+    if (uu_encode_named(S("abc"), "x.bin", out, (int)sizeof out) <= 0
+        || memcmp(out, "begin 644 x.bin\n", 16) != 0)
+        return err(6, "自定义文件名不对");
+    if (uu_encode_body(S("abc"), out, 3) != -1)
+        return err(7, "容量不够应该 -1");
+}
+
+test "uudecode：解码与往返" {
+    char out[512] = { 0 };
+    char back[256] = { 0 };
+    int n = 0, m = 0;
+    static const char *blk = "begin 644 data\n#86)C\n`\nend\n";
+
+    n = uu_decode((char[:]){ (char *)blk, (int)strlen(blk) }, out,
+                  (int)sizeof out);
+    if (n != 3 || memcmp(out, "abc", 3) != 0)
+        return err(8, "abc 解码不对");
+    n = uu_decode(S("02&5L;&\\L('5U96YC;V1E(0``\n"), out, (int)sizeof out);
+    if (n != 16 || memcmp(out, "Hello, uuencode!", 16) != 0)
+        return err(9, "单行解码不对");
+    /* 46 字节：两行 */
+    {
+        static const char *two =
+            "M>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX>'AX\n"
+            "!>```\n";
+
+        n = uu_decode((char[:]){ (char *)two, (int)strlen(two) }, out,
+                      (int)sizeof out);
+        if (n != 46)
+            return err(10, "两行解码长度不对");
+        if (out[0] != 'x' || out[45] != 'x')
+            return err(11, "两行解码内容不对");
+    }
+    /* 往返 */
+    {
+        int i = 0;
+
+        for (i = 0; i < 100; i++)
+            back[i] = (char)(i * 7 + 3);
+        n = uu_encode((char[:]){ back, 100 }, out, (int)sizeof out);
+        if (n <= 0)
+            return err(12, "往返编码失败");
+        m = uu_decode((char[:]){ out, n }, out + 300, 200);
+        if (m != 100)
+            return err(13, "往返解码长度不对");
+        if (memcmp(out + 300, back, 100) != 0)
+            return err(14, "往返内容不一致");
+    }
+    if (uu_decode(S("\x01\x02\x03"), out, (int)sizeof out) != -1)
+        return err(15, "非法字符应该 -1");
+    if (uu_decode(S(""), out, (int)sizeof out) != 0)
+        return err(16, "空输入应该 0");
+}

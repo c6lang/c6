@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第四十二批（老式文本编码）**：`std.encoding.base91`（basE91）、
+  `std.encoding.uu`（uuencode/uudecode）、`std.encoding.yenc`（yEnc 含 `=ybegin`
+  头部字段）、`std.encoding.ebcdic`（CP037 双向表），集成示例
+  `examples/stdtranscode.c6`（`make std-transcode`）。错误号段
+  `std.encoding.base91`=0x60b1 … `std.encoding.ebcdic`=0x60b4
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十一批（分区与文件系统）**：`std.data.mbr`（MBR + GPT）、
   `std.data.fat`（FAT12/16/32 BPB 与目录项）、`std.data.iso`（ISO 9660 主卷与
   目录记录）、`std.data.ext2`（超级块 + 块组描述符 + inode），集成示例

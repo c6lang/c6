@@ -209,6 +209,10 @@
 | `std/data/fat.c6` | `std.data.fat` | FAT12/16/32：`fat_info` 按簇数阈值判 FAT 类型（不看类型字符串），给出根目录字节数与数据区起点；`fat_dir_entry` 解 32 字节短目录项（跳过已删除与长文件名项），`fat_dir_find` 按 `NAME.EXT` 大写比较 |
 | `std/data/iso.c6` | `std.data.iso` | ISO 9660：`iso_volume` 解逻辑扇区 16 的主卷描述符（卷 ID、双端序的卷空间大小与块大小、根目录记录），`iso_record` 解目录记录（去掉 `;1`、`0x00`/`0x01` 还原 `.`/`..`），`iso_find` 跨逻辑块扫描目录 |
 | `std/data/ext2.c6` | `std.data.ext2` | ext2/3/4 布局：`ext2_super` 解偏移 1024 的超级块（`0xEF53`、`1024<<log_block_size`、每组块数/inode 数、卷名、挂载点），`ext2_group` 解 32 字节块组描述符，`ext2_inode` 按「1 起」的 inode 号定位（2 号是根目录） |
+| `std/encoding/base91.c6` | `std.encoding.base91` | basE91：`b91_encode`/`b91_decode` 按「13 位吐两字符、低位值 >88 才用 13 位」的规则走；`b91_valid` 检查字符表，`*_len` 给上界；解码忽略空白，表外字符 -1 |
+| `std/encoding/uu.c6` | `std.encoding.uu` | uuencode/uudecode：每行 45 字节，行首 `(n&0x3F)+0x20`，3 字节拆 4 个 6 位组（0 写成 `` ` ``）；`uu_encode` 出完整 `begin 644 …`/`end` 块，`uu_encode_named` 自定义名字，`uu_decode` 跳过头部行与换行 |
+| `std/encoding/yenc.c6` | `std.encoding.yenc` | yEnc：字节 `+42`，落在 `0x00`/`0x0A`/`0x0D`/`0x3D` 时转义成 `=` + `(值+64)`；`yenc_encode`/`yenc_decode` 走数据部分，`yenc_encode_full` 带 `=ybegin`/`=yend` 并每 128 字节折行，`yenc_field` 取头部 `name=`/`size=` |
+| `std/encoding/ebcdic.c6` | `std.encoding.ebcdic` | EBCDIC CP037 与 ASCII 互转：`ebcdic_char`/`ebcdic_ascii` 单字符双向查表（95 个可打印字符），`ebcdic_encode` 表外字符写 `0x6F`（`?`），`ebcdic_decode` 表外字节返回 -1 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -293,6 +297,7 @@
 | `examples/stdlegacy.c6` | （无模块） | 第三十九批（老图形格式）的拼装示例（`make std-legacy`）：现场拼 PCX（调色板 + RLE）、Radiance HDR（RGBE + 色调映射）、XBM、XPM 四种老格式再解析 |
 | `examples/stdfont.c6` | （无模块） | 第四十批（字体与矢量）的拼装示例（`make std-font`）：现场拼 BDF 字体、WOFF 容器、SVG 路径与最小 TrueType，各自解析一遍 |
 | `examples/stddisk.c6` | （无模块） | 第四十一批（分区与文件系统）的拼装示例（`make std-disk`）：现场拼 MBR+GPT、FAT16 BPB 与目录、ISO 9660 卷与目录记录、ext2 超级块与 inode |
+| `examples/stdtranscode.c6` | （无模块） | 第四十二批（老式文本编码）的拼装示例（`make std-transcode`）：basE91、uuencode、yEnc、EBCDIC 各编码一遍再解回原文 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -351,6 +356,10 @@ std/data/mbr.c6            24 test(s), 0 failure(s)
 std/data/fat.c6            24 test(s), 0 failure(s)
 std/data/iso.c6            24 test(s), 0 failure(s)
 std/data/ext2.c6           24 test(s), 0 failure(s)
+std/encoding/base91.c6     24 test(s), 0 failure(s)
+std/encoding/uu.c6         24 test(s), 0 failure(s)
+std/encoding/yenc.c6       24 test(s), 0 failure(s)
+std/encoding/ebcdic.c6     24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3547,6 +3556,17 @@ FAT16 走「BPB + 一条 `README.TXT` 目录项 + 小写查找」；ISO 9660 拼
 根目录两条记录（`.` 与 `HELLO.TXT;1`）；ext2 拼超级块、块组描述符与 2 号 inode
 （根目录）。
 
+### 集成示例：`examples/stdtranscode.c6`
+
+```sh
+make std-transcode
+```
+
+四节：basE91 用已知向量核字符表（对 ASCII 文本会略微膨胀，1.23 字符/字节是给
+二进制用的）；uuencode 校验完整块的 `begin 644 data` / `end` 结构与 45 字节折行；
+yEnc 校验转义、`=ybegin` 头部字段与往返；EBCDIC 校验 CP037 的码位（`A`=0xC1、
+`0`=0xF0、空格=0x40）与表外字符替换。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3625,6 +3645,8 @@ FAT16 走「BPB + 一条 `README.TXT` 目录项 + 小写查找」；ISO 9660 拼
   （自带自检，链接带 `-lm`）。
 * `make std-disk`：`examples/stddisk.c6`，第四十一批（分区与文件系统）模块的拼装
   示例（自带自检）。
+* `make std-transcode`：`examples/stdtranscode.c6`，第四十二批（老式文本编码）模块
+  的拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

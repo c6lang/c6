@@ -312,6 +312,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/fat.c6           std.data.fat           FAT12/16/32：BPB 字段（按簇数判类型）、根目录区、32 字节短目录项与按名查找
   std/data/iso.c6           std.data.iso           ISO 9660：主卷描述符（卷 ID/块大小/根目录记录）+ 目录记录 + 跨块扫描
   std/data/ext2.c6          std.data.ext2          ext2/3/4：偏移 1024 的超级块、块组描述符、按「1 起」inode 号取根目录
+  std/encoding/base91.c6    std.encoding.base91    basE91 编解码：每 13 位两字符，>88 时退回 13 位，解码按值判位宽
+  std/encoding/uu.c6        std.encoding.uu        uuencode/uudecode：45 字节/行、行首长度字符、` 代零，完整 begin/end 块
+  std/encoding/yenc.c6      std.encoding.yenc      yEnc：+42 与 = 转义（结果落在 0x00/0x0A/0x0D/0x3D），=ybegin 头与 128 折行
+  std/encoding/ebcdic.c6    std.encoding.ebcdic    EBCDIC CP037 ↔ ASCII：95 个可打印字符的双向表，表外写 ?/报错
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -409,6 +413,7 @@ make std-hash    # 编译并运行 examples/stdhash.c6（第三十八批哈希�
 make std-legacy  # 编译并运行 examples/stdlegacy.c6（第三十九批老图形格式模块的拼装示例）
 make std-font    # 编译并运行 examples/stdfont.c6（第四十批字体与矢量模块的拼装示例）
 make std-disk    # 编译并运行 examples/stddisk.c6（第四十一批分区与文件系统模块的拼装示例）
+make std-transcode # 编译并运行 examples/stdtranscode.c6（第四十二批老式文本编码模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

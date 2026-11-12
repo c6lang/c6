@@ -12882,6 +12882,10 @@ static const struct C6ErrStdSlot {
     { "std.data.fat",           C6_ERR_SLOT_STD + 174 },
     { "std.data.iso",           C6_ERR_SLOT_STD + 175 },
     { "std.data.ext2",          C6_ERR_SLOT_STD + 176 },
+    { "std.encoding.base91",    C6_ERR_SLOT_STD + 177 },
+    { "std.encoding.uu",        C6_ERR_SLOT_STD + 178 },
+    { "std.encoding.yenc",      C6_ERR_SLOT_STD + 179 },
+    { "std.encoding.ebcdic",    C6_ERR_SLOT_STD + 180 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

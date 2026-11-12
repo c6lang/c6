@@ -1575,6 +1575,32 @@ ext2 超级块。四个都是纯读结构的活，正好把「偏移表 + 双端
 验收：`make stdtest`（177 个模块、0 failure）、`make std-disk`（28 条自检全过）、
 `make check-all`。
 
+### 11.54 标准库第四十二批（base91 / uu / yenc / ebcdic）
+
+第四十二批回到文本编码，但挑的是「老式传输编码」：basE91、uuencode、yEnc 与
+EBCDIC。它们都带着上世纪的包袱，正好把「位宽不定 + 转义 + 折行」这几件事凑齐。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.base91` | basE91 | 每 13 位吐两个字符；低位 13 位的值 > 88 时只用 13 位，否则用 14 位。解码必须按「这一对的低 13 位是否 > 88」回头判断位宽，不能死按 14 位切 |
+| `std.encoding.uu` | uuencode | 每行 45 字节、行首 `(n&0x3F)+0x20`、6 位值 0 写成 `` ` ``（避开行首空格）；解码跳过 `begin`/`end` 行，长度字符 `` ` ``/空格算 0 |
+| `std.encoding.yenc` | yEnc | 字节 `+42`，若结果为 `0x00`/`0x0A`/`0x0D`/`0x3D` 则写 `=` + `(结果+64)`；解码时转义字符要**先减 64 再减 42**（等价于减 106），只减 64 会得到错误字节 |
+| `std.encoding.ebcdic` | CP037 | 95 个可打印字符的固定表；`A`..`I`/`J`..`R`/`S`..`Z` 三段不连续、数字在 `0xF0` 起；编码表外字符写 `0x6F`，解码表外字节报 -1 |
+
+几个数字记一下免得再算：basE91 的 1.23 是**字符/字节**，所以对短 ASCII 文本会膨胀；
+uuencode 的 `Hello, uuencode!` 是 **16** 字节（不是 17），行首字符因此是 `0`；
+yEnc 的转义集合是**编码后**的值，所以原始 `0xD6`/`0xE0`/`0xE3`/`0x13` 才会被转义。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.base91`=0x60b1、
+`std.encoding.uu`=0x60b2、`std.encoding.yenc`=0x60b3、`std.encoding.ebcdic`=0x60b4；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-transcode` 与 `STD_TRANSCODE_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。
+示例 `examples/stdtranscode.c6` 四节（21 条自检）。
+
+验收：`make stdtest`（181 个模块、0 failure）、`make std-transcode`（21 条自检全过）、
+`make check-all`。
+
+
 
 
 

@@ -1,0 +1,129 @@
+/* examples/stdtranscode.c6 —— 第四十二批（老式文本编码）的集成示例。
+ *
+ *     make std-transcode
+ *
+ * 四节：basE91、uuencode、yEnc、EBCDIC（CP037）。都是「二进制/字符集 ↔ 文本」
+ * 的老编码，示例里各自编码一遍再解回原文。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.encoding.base91;
+import std.encoding.uu;
+import std.encoding.yenc;
+import std.encoding.ebcdic;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_base91(void)
+{
+    static const char *msg = "Hello, basE91!";
+    char enc[64] = { 0 };
+    char back[64] = { 0 };
+    int n = 0, m = 0;
+
+    printf("== base91\n");
+    n = b91_encode((char[:]){ (char *)msg, (int)strlen(msg) }, enc,
+                   (int)sizeof enc);
+    printf("   %d 字节 → %d 字符：%s\n", (int)strlen(msg), n, enc);
+    check(n == 17 && memcmp(enc, ">OwJh>}AMfN[O081Q", 17) == 0,
+          "已知向量（base91 对 ASCII 文本会略膨胀）");
+    check(b91_valid((char[:]){ enc, n }) == 1, "编码结果都在字符表内");
+    m = b91_decode((char[:]){ enc, n }, back, (int)sizeof back);
+    check(m == (int)strlen(msg) && memcmp(back, msg, (size_t)m) == 0, "往返");
+    check(b91_encoded_len((int)strlen(msg)) >= n, "长度上界不小");
+    check(b91_decode(S("Hello-"), back, (int)sizeof back) == -1,
+          "表外字符（-）报错");
+}
+
+static void do_uu(void)
+{
+    static const char *msg = "abc";
+    char blk[128] = { 0 };
+    char back[64] = { 0 };
+    int n = 0, m = 0;
+
+    printf("== uuencode\n");
+    n = uu_encode(S("abc"), blk, (int)sizeof blk);
+    printf("   %d 字节 → %d 字节块\n", (int)strlen(msg), n);
+    check(n == 27 && memcmp(blk, "begin 644 data\n#86)C\n`\nend\n", 27) == 0,
+          "abc 的完整块");
+    m = uu_decode((char[:]){ blk, n }, back, (int)sizeof back);
+    check(m == 3 && memcmp(back, "abc", 3) == 0, "往返");
+    check(uu_encode_named(S("abc"), "x.bin", blk, (int)sizeof blk) > 0
+          && memcmp(blk, "begin 644 x.bin\n", 16) == 0, "自定义文件名");
+    check(uu_encode_body(S("Hello, uuencode!"), blk, (int)sizeof blk) == 26,
+          "单行长度");
+}
+
+static void do_yenc(void)
+{
+    static const char *msg = "Hello, yEnc!";
+    char enc[128] = { 0 };
+    char back[128] = { 0 };
+    char name[32] = { 0 };
+    int n = 0, m = 0;
+
+    printf("== yEnc\n");
+    n = yenc_encode((char[:]){ (char *)msg, (int)strlen(msg) }, enc,
+                    (int)sizeof enc);
+    printf("   %d 字节 → %d 字节\n", (int)strlen(msg), n);
+    check(n == 12, "编码长度");
+    check((unsigned char)enc[1] == 0x8F, "编码内容首字节");
+    m = yenc_decode((char[:]){ enc, n }, back, (int)sizeof back);
+    check(m == (int)strlen(msg) && memcmp(back, msg, (size_t)m) == 0, "往返");
+    /* 完整块：头部字段 + 折行 */
+    n = yenc_encode_full((char[:]){ (char *)msg, (int)strlen(msg) }, "a.txt",
+                         enc, (int)sizeof enc);
+    check(n > 0 && memcmp(enc, "=ybegin line=128 size=12 name=a.txt", 35) == 0,
+          "头部行");
+    check(yenc_field((char[:]){ enc, n }, "name", name, (int)sizeof name) == 5
+          && memcmp(name, "a.txt", 5) == 0, "取 name 字段");
+    m = yenc_decode((char[:]){ enc, n }, back, (int)sizeof back);
+    check(m == (int)strlen(msg) && memcmp(back, msg, (size_t)m) == 0,
+          "完整块往返");
+    check(yenc_decode(S("abc="), back, (int)sizeof back) == -1, "截断转义报错");
+}
+
+static void do_ebcdic(void)
+{
+    unsigned char ebc[32] = { 0 };
+    char back[32] = { 0 };
+    int n = 0;
+
+    printf("== ebcdic\n");
+    n = ebcdic_encode(S("HELLO"), ebc, (int)sizeof ebc);
+    printf("   HELLO → %02X %02X %02X %02X %02X\n", ebc[0], ebc[1], ebc[2],
+           ebc[3], ebc[4]);
+    check(n == 5 && ebc[0] == 0xC8 && ebc[4] == 0xD6, "HELLO 的码位");
+    check(ebcdic_decode(ebc, n, back, (int)sizeof back) == 5
+          && memcmp(back, "HELLO", 5) == 0, "往返");
+    check(ebcdic_char('0') == 0xF0 && ebcdic_char(' ') == 0x40, "数字与空格");
+    check(ebcdic_char('\t') == -1, "制表符不在表里");
+    check(ebcdic_encode(S("a\tb"), ebc, (int)sizeof ebc) == 3 && ebc[1] == 0x6F,
+          "表外字符写 '?'");
+}
+
+int main(void)
+{
+    do_base91();
+    do_uu();
+    do_yenc();
+    do_ebcdic();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
