@@ -2191,6 +2191,28 @@ systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，�
 验收：`make stdtest`（269 个模块、0 failure）、`make std-stats`（21 条自检全过）、
 `make check-all`。
 
+### 11.77 标准库第六十五批（kmp / bmh / suffix / wordplay）
+
+第六十五批做「字符串算法」：KMP、BMH、后缀数组与回文/异位词。前两个与后缀数组都是
+「模式/文本 + 调用方给数组」的形态，`Ana` 则是 26 字母计数指纹的小结构。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.kmp` | KMP | 失败函数由调用方给数组（容量不足返回 -1）；`count` 数**可重叠**出现（`abab` 在 `ababab` 里 2 次），`find` 不重叠语义自然成立 |
+| `std.text.bmh` | BMH | 坏字符表只填 0..m-2 的**最后**位置（`needle` → n5 e3 d2 l1），`count` 用「匹配后整体跳过 m」实现不重叠计数 |
+| `std.text.suffix` | 后缀数组 | 第一版写的倍增+计数排序有 bug（`banana` 的 `na`/`nana` 顺序反了，LCP 也跟着错），改成「插入排序直接比较后缀」后正确；`search` 二分到左边界后要**向后扫同一前缀段**并取最小起始下标，否则 `ana` 会返回 3 而不是 1 |
+| `std.text.wordplay` | 回文/异位词 | 回文判断跳过非字母数字；`longest_palindrome` 中心扩展返回**最早**的最长回文；`Ana.canonical` 输出 `e1i1l1n1s1t1` 形式的指纹 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.kmp`=0x610d、
+`std.text.bmh`=0x610e、`std.text.suffix`=0x610f、`std.text.wordplay`=0x6110；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-search` 与 `STD_SEARCH_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdsearch.c6` 四节（22 条自检）。
+
+验收：`make stdtest`（273 个模块、0 failure）、`make std-search`（22 条自检全过）、
+`make check-all`。
+
+
 
 
 

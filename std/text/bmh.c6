@@ -1,0 +1,156 @@
+/* std/text/bmh：Boyer-Moore-Horspool 子串查找（坏字符表 + 跳跃）。
+ *
+ *     import std.text.bmh;
+ *
+ *     Bh h = { 0 };
+ *     h.init(S("needle"));            // 方法：init / find / count
+ *     h.find(S("a needle in a haystack"));   // 2
+ *
+ * BMH 只用「坏字符」启发：从右往左比较，失配时按模式里该字符的**最后位置**决定
+ * 跳跃步长。平均比 KMP 快（在自然文本上接近 O(n/m)），最坏仍是 O(n·m)。
+ *
+ * 约定：
+ *
+ * - `init(pattern)` 建 256 项的坏字符表（存在 `Bh` 里，不用调用方分配），
+ *   空模式返回 -1，成功返回模式长度；
+ * - `find(text)` 返回第一次出现的下标，找不到 -1；
+ * - `count(text)` 数出现次数（**不重叠**计数用 `count`，要重叠请用 KMP）；
+ * - `skip_of(c)` 给某个字节的跳跃步长（调试/教学用）；
+ * - `pattern_len()` 给模式长度；
+ * - 按字节比较，UTF-8 上也安全。
+ */
+#include <string.h>
+
+module std.text.bmh;
+import std.core.types;
+import std.text.str;
+
+struct Bh {
+    Str pat;
+    int skip[256];
+    int m;
+};
+
+int init(Bh *h, char[:] pattern)
+{
+    int i = 0;
+
+    if (!h || !pattern.data || pattern.len <= 0)
+        return -1;
+    h->pat = (Str){ (char[:]){ pattern.data, pattern.len } };
+    h->m = pattern.len;
+    for (i = 0; i < 256; i++)
+        h->skip[i] = h->m;
+    for (i = 0; i < h->m - 1; i++)
+        h->skip[(unsigned char)pattern.data[i]] = h->m - 1 - i;
+    return h->m;
+}
+
+int pattern_len(Bh *h)
+{
+    return h ? h->m : 0;
+}
+
+int skip_of(Bh *h, int c)
+{
+    if (!h || c < 0 || c > 255)
+        return 0;
+    return h->skip[c];
+}
+
+int find(Bh *h, char[:] text)
+{
+    int i = 0, j = 0;
+
+    if (!h || !h->pat.s.data || !text.data)
+        return -1;
+    if (h->m > text.len)
+        return -1;
+    i = 0;
+    while (i <= text.len - h->m) {
+        j = h->m - 1;
+        while (j >= 0 && text.data[i + j] == h->pat.s.data[j])
+            j--;
+        if (j < 0)
+            return i;
+        i += h->skip[(unsigned char)text.data[i + h->m - 1]];
+    }
+    return -1;
+}
+
+int count(Bh *h, char[:] text)
+{
+    int i = 0, j = 0, n = 0;
+
+    if (!h || !h->pat.s.data || !text.data)
+        return -1;
+    if (h->m > text.len)
+        return 0;
+    i = 0;
+    while (i <= text.len - h->m) {
+        j = h->m - 1;
+        while (j >= 0 && text.data[i + j] == h->pat.s.data[j])
+            j--;
+        if (j < 0) {
+            n++;
+            i += h->m;                  /* 不重叠：直接跳过整个匹配 */
+        } else {
+            i += h->skip[(unsigned char)text.data[i + h->m - 1]];
+        }
+    }
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "bmh：查找与跳跃表" {
+    Bh h = { 0 };
+    int i = 0;
+
+    if (h.init(S("needle")) != 6)
+        return err(1, "init 失败");
+    if (h.pattern_len() != 6)
+        return err(2, "pattern_len 不对");
+    for (i = 0; i < 256; i++) {
+        if (h.skip_of(i) != 6)
+            break;
+    }
+    /* 坏字符表只看 0..m-2 的最后位置：needle → n5 e4 d2 l1 */
+    if (h.skip_of('n') != 5)
+        return err(3, "坏字符表里 n 的步长应该是 5");
+    if (h.skip_of('e') != 3)
+        return err(4, "坏字符表里 e 的步长应该是 3（0..m-2 的最后位置是 2）");
+    if (h.skip_of('d') != 2 || h.skip_of('l') != 1)
+        return err(5, "坏字符表里 d/l 的步长不对");
+    if (h.skip_of('z') != 6)
+        return err(5, "模式里没有的字符步长应该是模式长度");
+    if (h.find(S("a needle in a haystack")) != 2)
+        return err(6, "第一次出现在下标 2");
+    if (h.find(S("needlexx")) != 0)
+        return err(7, "开头出现应该 0");
+    if (h.find(S("haystack")) != -1)
+        return err(8, "找不到应该 -1");
+    if (h.find(S("need")) != -1)
+        return err(9, "文本比模式短应该 -1");
+}
+
+test "bmh：计数与边界" {
+    Bh h = { 0 };
+
+    if (h.init(S("ab")) != 2)
+        return err(10, "init 失败");
+    if (h.count(S("ababab")) != 3)
+        return err(11, "ab 在 ababab 里不重叠应该 3 次");
+    if (h.count(S("aabb")) != 1)
+        return err(12, "aabb 里 ab 只出现 1 次");
+    if (h.count(S("")) != 0)
+        return err(13, "空文本应该 0");
+    if (h.init(S("")) != -1)
+        return err(14, "空模式应该 -1");
+    if (h.pattern_len() != 2)
+        return err(15, "重新 init 之后长度应该是 2");
+    if (h.find(S("ab")) != 0 || h.count(S("ab")) != 1)
+        return err(16, "边界匹配不对");
+}

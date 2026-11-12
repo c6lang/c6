@@ -301,6 +301,11 @@
 | `std/core/moving.c6` | `std.core.moving` | 滑动窗口统计（**方法**：`m.init`/`m.push`/`m.sma`/`m.ema_push`/`m.ema`/`m.last`/`m.count`/`m.capacity`/`m.reset`）：环形缓冲 + 常驻 `sum` 实现 O(1) SMA，EMA 独立累加器（`alpha` 夹到 0..1，首样本即初值） |
 | `std/core/series.c6` | `std.core.series` | 序列统计（**方法**：`s.bind`/`s.mean`/`s.variance`/`s.stddev`/`s.minimum`/`s.maximum`/`s.cov`/`s.corr`/`s.summarize`/`s.count`）：样本方差（n-1），Pearson 相关，长度不等时按前 n 个**配对**（均值也只取这 n 个） |
 | `std/core/quantile.c6` | `std.core.quantile` | 分位数（**方法**：`q.compute`）：`sort_asc` 插入排序（小数据集），`quantile`/`median` 用线性插值（与 NumPy 默认一致）并**就地排序**，`Quartiles` 一次给 p25/p50/p75/iqr，`values_in` 数区间内样本 |
+| `std/text/kmp.c6` | `std.text.kmp` | KMP 子串查找（**方法**：`k.init`/`k.find`/`k.count`/`k.match_at`/`k.pattern_len`/`k.fail_len`）：失败函数由调用方给数组，`find` 返回首次出现下标，`count` 数**可重叠**出现次数，O(n+m) |
+| `std/text/bmh.c6` | `std.text.bmh` | Boyer-Moore-Horspool（**方法**：`h.init`/`h.find`/`h.count`/`h.skip_of`/`h.pattern_len`）：256 项坏字符表内嵌在结构里，`count` 按**不重叠**计，`skip_of` 便于观察跳跃步长 |
+| `std/text/suffix.c6` | `std.text.suffix` | 后缀数组（**方法**：`x.build`/`x.at`/`x.search`/`x.lcp`/`x.count`）：插入排序构造（O(n²) 最坏，适合几千字节），`search` 二分后在同一前缀段里取**最早**出现，`lcp` 用 Kasai 算法 |
+| `std/text/wordplay.c6` | `std.text.wordplay` | 文字游戏：`is_palindrome`（忽略标点与大小写）、`longest_palindrome`（中心扩展，`*start` 给起点）、`count_palindromes`、`reverse_words`；`Ana` 结构存 26 字母计数指纹（**方法**：`a.build`/`a.same`/`a.canonical`/`a.count`/`a.letters`）判异位词 |
+
 
 
 
@@ -416,6 +421,7 @@
 | `examples/stdcolor.c6` | （无模块） | 第六十二批（颜色与单位）的拼装示例（`make std-color`）：颜色 hex/HSL/混合/对比度、GIMP 调色板、命名颜色与最近匹配、单位换算 |
 | `examples/stdcontainers.c6` | （无模块） | 第六十三批（基础容器补充）的拼装示例（`make std-cont`）：栈做括号匹配、队列验回绕、槽位分配与复用、多重集合计数与最多次数 |
 | `examples/stdstats2.c6` | （无模块） | 第六十四批（统计小工具）的拼装示例（`make std-stats`）：直方图分箱与众数箱、SMA/EMA、序列均值/标准差/相关、分位数与四分位；链接带 `-lm` |
+| `examples/stdsearch.c6` | （无模块） | 第六十五批（字符串算法）的拼装示例（`make std-search`）：KMP/BMH 查找与计数、后缀数组检索与 LCP、回文与异位词 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -566,6 +572,10 @@ std/core/histogram.c6      24 test(s), 0 failure(s)
 std/core/moving.c6         24 test(s), 0 failure(s)
 std/core/series.c6         24 test(s), 0 failure(s)
 std/core/quantile.c6       24 test(s), 0 failure(s)
+std/text/kmp.c6            24 test(s), 0 failure(s)
+std/text/bmh.c6            24 test(s), 0 failure(s)
+std/text/suffix.c6         24 test(s), 0 failure(s)
+std/text/wordplay.c6       24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4006,6 +4016,17 @@ make std-stats
 `a.summarize` 一次给出均值/标准差/最值、`a.corr(&b)` 验完全相关；`q.compute` 给
 p25/p50/p75/IQR。链接带 `-lm`。
 
+### 集成示例：`examples/stdsearch.c6`
+
+```sh
+make std-search
+```
+
+四节都用方法：KMP 在「the quick brown fox…」里找 `the`（首次 0、两次）并用单字母
+模式计数；BMH 找 `needle` 并打印坏字符表步长；后缀数组对 `banana` 打印
+`5 3 1 0 4 2`、用 `x.search("ana")` 得最早出现 1、`x.lcp` 打印相邻 LCP；wordplay 验
+经典回文句、`cbbd` 的最长回文与 `listen`/`silent` 的异位词判定。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4130,6 +4151,8 @@ p25/p50/p75/IQR。链接带 `-lm`。
   示例（自带自检）。
 * `make std-stats`：`examples/stdstats2.c6`，第六十四批（统计小工具）模块的拼装示例
   （自带自检，链接带 `-lm`）。
+* `make std-search`：`examples/stdsearch.c6`，第六十五批（字符串算法）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第六十五批（字符串算法）**：`std.text.kmp`（KMP + 可重叠计数）、
+  `std.text.bmh`（Boyer-Moore-Horspool）、`std.text.suffix`（后缀数组 + 二分检索 +
+  Kasai LCP）、`std.text.wordplay`（回文/最长回文/倒序单词/异位词指纹），集成示例
+  `examples/stdsearch.c6`（`make std-search`）。错误号段 `std.text.kmp`=0x610d …
+  `std.text.wordplay`=0x6110（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十四批（统计小工具）**：`std.core.histogram`（等宽直方图与众数箱）、
   `std.core.moving`（SMA/EMA 滑动平均）、`std.core.series`（均值/方差/协方差/相关）、
   `std.core.quantile`（分位数、中位数、四分位距），集成示例

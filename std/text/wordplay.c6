@@ -1,0 +1,327 @@
+/* std/text/wordplay：回文判断、最长回文子串、倒序单词与字母异位（anagram）指纹。
+ *
+ *     import std.text.wordplay;
+ *
+ *     is_palindrome(S("A man, a plan, a canal: Panama"));   // 1
+ *     longest_palindrome(S("babad"), &start);               // 3（bab 或 aba）
+ *     reverse_words(S("the quick brown fox"), out, (int)sizeof out);
+ *     Ana a = { 0 }, b = { 0 };
+ *     a.build(S("listen"));  b.build(S("silent"));
+ *     a.same(&b);                                           // 1
+ *
+ * 回文判断忽略**非字母数字**字符并忽略大小写（`A man, a plan` 算回文）。
+ *
+ * 约定：
+ *
+ * - `is_palindrome(s)` 返回 1/0；
+ * - `longest_palindrome(s, &start)` 用「中心扩展」找最长回文子串（并列时取**最先
+ *   出现**的），返回长度，`*start` 是它在原串里的字节起点（`start` 可为 0）；
+ * - `count_palindromes(s)` 数回文**子串**个数（含长度 1 与重复），O(n²)；
+ * - `reverse_words(src, dst, cap)` 按空白切词后倒序拼接（单词内不反转，词间一个
+ *   空格），返回写入长度；
+ * - `Ana` 是 26 个小写字母的计数指纹：`a.build(text)` 统计（只算 ASCII 字母、忽略
+ *   大小写），`a.same(&b)` 判断异位词，`a.canonical(dst, cap)` 生成 `a2b1…` 形式的
+ *   字符串（只输出计数非 0 的字母），`a.count(c)`/`a.letters()` 给单项与总数。
+ */
+#include <string.h>
+
+module std.text.wordplay;
+import std.core.types;
+import std.text.str;
+
+struct Ana {
+    int cnt[26];
+    int total;
+};
+
+static int wp_is_alnum(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+           || (c >= 'A' && c <= 'Z');
+}
+
+static char wp_lower(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return (char)(c - 'A' + 'a');
+    return c;
+}
+
+int is_palindrome(char[:] s)
+{
+    int i = 0, j = 0;
+
+    if (!s.data)
+        return 1;
+    i = 0;
+    j = s.len - 1;
+    while (i < j) {
+        while (i < j && !wp_is_alnum(s.data[i]))
+            i++;
+        while (j > i && !wp_is_alnum(s.data[j]))
+            j--;
+        if (i >= j)
+            break;
+        if (wp_lower(s.data[i]) != wp_lower(s.data[j]))
+            return 0;
+        i++;
+        j--;
+    }
+    return 1;
+}
+
+int longest_palindrome(char[:] s, int *start)
+{
+    int best = 0, best_start = 0;
+    int i = 0;
+
+    if (start)
+        *start = 0;
+    if (!s.data || s.len <= 0)
+        return 0;
+    for (i = 0; i < s.len; i++) {
+        /* 奇数长度中心 i */
+        int l = i, r = i;
+
+        while (l >= 0 && r < s.len && s.data[l] == s.data[r]) {
+            if (r - l + 1 > best) {
+                best = r - l + 1;
+                best_start = l;
+            }
+            l--;
+            r++;
+        }
+        /* 偶数长度中心 i/i+1 */
+        l = i;
+        r = i + 1;
+        while (l >= 0 && r < s.len && s.data[l] == s.data[r]) {
+            if (r - l + 1 > best) {
+                best = r - l + 1;
+                best_start = l;
+            }
+            l--;
+            r++;
+        }
+    }
+    if (start)
+        *start = best_start;
+    return best;
+}
+
+int count_palindromes(char[:] s)
+{
+    int n = 0, i = 0;
+
+    if (!s.data || s.len <= 0)
+        return 0;
+    for (i = 0; i < s.len; i++) {
+        int l = i, r = i;
+
+        while (l >= 0 && r < s.len && s.data[l] == s.data[r]) {
+            n++;
+            l--;
+            r++;
+        }
+        l = i;
+        r = i + 1;
+        while (l >= 0 && r < s.len && s.data[l] == s.data[r]) {
+            n++;
+            l--;
+            r++;
+        }
+    }
+    return n;
+}
+
+static int wp_put(char *dst, int cap, int o, char c)
+{
+    if (o >= cap)
+        return -1;
+    dst[o] = c;
+    return o + 1;
+}
+
+int reverse_words(char[:] src, char *dst, int cap)
+{
+    int ends[64] = { 0 };
+    int starts[64] = { 0 };
+    int words = 0, i = 0, o = 0, w = 0;
+
+    if (!src.data || !dst || cap < 0)
+        return -1;
+    /* 切词（最多 64 个） */
+    i = 0;
+    while (i < src.len) {
+        while (i < src.len && (src.data[i] == ' ' || src.data[i] == '\t'
+                               || src.data[i] == '\n'))
+            i++;
+        if (i >= src.len)
+            break;
+        if (words >= 64)
+            return -1;
+        starts[words] = i;
+        while (i < src.len && src.data[i] != ' ' && src.data[i] != '\t'
+               && src.data[i] != '\n')
+            i++;
+        ends[words] = i;
+        words++;
+    }
+    for (w = words - 1; w >= 0; w--) {
+        int k = 0;
+
+        if (w != words - 1) {
+            o = wp_put(dst, cap, o, ' ');
+            if (o < 0)
+                return -1;
+        }
+        for (k = starts[w]; k < ends[w]; k++) {
+            o = wp_put(dst, cap, o, src.data[k]);
+            if (o < 0)
+                return -1;
+        }
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int build(Ana *a, char[:] text)
+{
+    int i = 0;
+
+    if (!a || !text.data)
+        return -1;
+    memset(a, 0, sizeof *a);
+    for (i = 0; i < text.len; i++) {
+        char c = wp_lower(text.data[i]);
+
+        if (c >= 'a' && c <= 'z') {
+            a->cnt[c - 'a']++;
+            a->total++;
+        }
+    }
+    return a->total;
+}
+
+int letters(Ana *a)
+{
+    return a ? a->total : 0;
+}
+
+int count(Ana *a, char c)
+{
+    char lc = wp_lower(c);
+
+    if (!a || lc < 'a' || lc > 'z')
+        return 0;
+    return a->cnt[lc - 'a'];
+}
+
+int same(Ana *a, Ana *b)
+{
+    int i = 0;
+
+    if (!a || !b)
+        return 0;
+    if (a->total != b->total)
+        return 0;
+    for (i = 0; i < 26; i++) {
+        if (a->cnt[i] != b->cnt[i])
+            return 0;
+    }
+    return 1;
+}
+
+int canonical(Ana *a, char *dst, int cap)
+{
+    int i = 0, o = 0;
+
+    if (!a || !dst || cap <= 0)
+        return -1;
+    for (i = 0; i < 26; i++) {
+        if (a->cnt[i] == 0)
+            continue;
+        o = wp_put(dst, cap, o, (char)('a' + i));
+        if (o < 0)
+            return -1;
+        {
+            char num[12] = { 0 };
+            int k = 0, v = a->cnt[i];
+
+            while (v > 0 && k < 10) {
+                num[k++] = (char)('0' + v % 10);
+                v /= 10;
+            }
+            for (k = k - 1; k >= 0; k--) {
+                o = wp_put(dst, cap, o, num[k]);
+                if (o < 0)
+                    return -1;
+            }
+        }
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "wordplay：回文判断" {
+    int start = 0;
+    char out[64] = { 0 };
+
+    if (is_palindrome(S("racecar")) != 1)
+        return err(1, "racecar 是回文");
+    if (is_palindrome(S("A man, a plan, a canal: Panama")) != 1)
+        return err(2, "经典回文句（忽略标点与大小写）");
+    if (is_palindrome(S("hello")) != 0)
+        return err(3, "hello 不是回文");
+    if (is_palindrome(S("")) != 1 || is_palindrome(S("!!!")) != 1)
+        return err(4, "空串与纯标点算回文");
+    if (longest_palindrome(S("babad"), &start) != 3)
+        return err(5, "babad 的最长回文长度应该是 3");
+    if (start != 0 && start != 1)
+        return err(6, "babad 的最长回文应该从 0 或 1 开始");
+    if (longest_palindrome(S("cbbd"), &start) != 2 || start != 1)
+        return err(7, "cbbd 的最长回文是 bb（从 1 开始）");
+    if (longest_palindrome(S(""), &start) != 0)
+        return err(8, "空串最长回文是 0");
+    if (reverse_words(S("the quick brown fox"), out, (int)sizeof out) != 19
+        || memcmp(out, "fox brown quick the", 19) != 0)
+        return err(9, "倒序单词不对");
+    if (reverse_words(S("  a  b "), out, (int)sizeof out) != 3
+        || memcmp(out, "b a", 3) != 0)
+        return err(10, "多余空白应该被折叠");
+}
+
+test "wordplay：回文计数与异位词" {
+    Ana a = { { 0 }, 0 };
+    Ana b = { { 0 }, 0 };
+    Ana c = { { 0 }, 0 };
+    char out[32] = { 0 };
+
+    if (count_palindromes(S("aaa")) != 6)
+        return err(11, "aaa 的回文子串应该是 6 个");
+    if (count_palindromes(S("abc")) != 3)
+        return err(12, "abc 的回文子串是 3 个单字符");
+    if (a.build(S("listen")) != 6)
+        return err(13, "build 失败");
+    if (b.build(S("silent")) != 6)
+        return err(14, "build 失败");
+    if (a.letters() != 6 || a.count('l') != 1 || a.count('z') != 0)
+        return err(15, "计数不对");
+    if (a.same(&b) != 1)
+        return err(16, "listen 与 silent 应该是异位词");
+    c.build(S("listens"));
+    if (a.same(&c) != 0)
+        return err(17, "多一个字母就不是异位词");
+    if (b.build(S("Listen!")) != 6)
+        return err(18, "标点与大小写应该被忽略");
+    if (a.same(&b) != 1)
+        return err(19, "listen 与 Listen! 应该是异位词");
+    if (b.canonical(out, (int)sizeof out) != 12
+        || memcmp(out, "e1i1l1n1s1t1", 12) != 0)
+        return err(20, "canonical 指纹不对");
+}

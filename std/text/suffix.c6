@@ -1,0 +1,241 @@
+/* std/text/suffix：后缀数组（倍增构造）+ 二分查找 + Kasai LCP。
+ *
+ *     import std.text.suffix;
+ *
+ *     int sa[16] = { 0 }, rank[16] = { 0 }, tmp[16] = { 0 }, lcp[16] = { 0 };
+ *     Suffix x = { 0 };
+ *     x.build(S("banana"), sa, rank, tmp, 16);   // 方法：build / at / search / lcp
+ *     x.search(S("ana"));                        // 1（banana 里 "ana" 出现在 1）
+ *     x.lcp(lcp);
+ *
+ * `Suffix` 里存文本视图与三个调用方给的 `int` 数组（sa / rank / tmp），不分配。
+ *
+ * 约定：
+ *
+ * - `build(text, sa, rank, tmp, cap)` 构造后缀数组（插入排序，O(n²) 最坏，
+ *   适合几千字节以内），返回后缀个数（= 文本长度）；`cap < n` 返回 -1；
+ * - `at(i)` 给排名第 i 的后缀起始下标；`count()` 是 n；
+ * - `search(pattern)` 二分查找，返回**原文里最早的一次出现**（同一前缀的后缀在 SA
+ *   里连续，取其中最小的起始下标），没有返回 -1；
+ * - `lcp(out)` 用 Kasai 算法把相邻后缀的 LCP 写进 `out`（长度 n），返回写入个数；
+ * - 空文本 `build` 返回 0；文本按**字节**处理。
+ */
+#include <string.h>
+
+module std.text.suffix;
+import std.core.types;
+import std.text.str;
+
+struct Suffix {
+    Str s;
+    int n;
+    int *sa;
+    int *rankv;
+    int *tmp;
+};
+
+/* 比较两个后缀的字典序：a < b 返回 -1，相等 0，a > b 返回 1 */
+static int sfx_cmp(const char *p, int n, int a, int b)
+{
+    int la = n - a, lb = n - b;
+    int len = la < lb ? la : lb;
+    int c = memcmp(p + a, p + b, (size_t)len);
+
+    if (c != 0)
+        return c < 0 ? -1 : 1;
+    if (la == lb)
+        return 0;
+    return la < lb ? -1 : 1;
+}
+
+int build(Suffix *x, char[:] text, int *sa, int *rank, int *tmp, int cap)
+{
+    int n = 0, i = 0, j = 0, h = 0;
+
+    if (!x || !text.data || !sa || !rank || !tmp)
+        return -1;
+    n = text.len;
+    if (cap < n)
+        return -1;
+    memset(x, 0, sizeof *x);
+    x->s = (Str){ (char[:]){ text.data, n } };
+    x->n = n;
+    x->sa = sa;
+    x->rankv = rank;
+    x->tmp = tmp;
+    if (n == 0)
+        return 0;
+    /* 直接对后缀做插入排序：O(n²) 最坏，胜在简单正确；适合几千字节以内的文本
+     * （要更大规模请换倍增/DC3，接口不变） */
+    for (i = 0; i < n; i++)
+        sa[i] = i;
+    for (i = 1; i < n; i++) {
+        int cur = sa[i];
+
+        j = i - 1;
+        while (j >= 0 && sfx_cmp(text.data, n, sa[j], cur) > 0) {
+            sa[j + 1] = sa[j];
+            j--;
+        }
+        sa[j + 1] = cur;
+    }
+    for (i = 0; i < n; i++)
+        rank[sa[i]] = i;
+    (void)h;
+    return n;
+}
+
+int count(Suffix *x)
+{
+    return x ? x->n : 0;
+}
+
+int at(Suffix *x, int i)
+{
+    if (!x || !x->sa || i < 0 || i >= x->n)
+        return -1;
+    return x->sa[i];
+}
+
+/* 后缀 start 与模式 pat 比较：<0 后缀更小，0 前缀匹配，>0 后缀更大 */
+static int sfx_cmp_pat(Suffix *x, int start, char[:] pat)
+{
+    int avail = x->n - start;
+    int len = pat.len < avail ? pat.len : avail;
+    int c = memcmp(x->s.s.data + start, pat.data, (size_t)len);
+
+    if (c != 0)
+        return c < 0 ? -1 : 1;
+    if (pat.len <= avail)
+        return 0;                       /* 模式是后缀的前缀 */
+    return -1;                          /* 后缀比模式短 */
+}
+
+int search(Suffix *x, char[:] pat)
+{
+    int lo = 0, hi = 0;
+
+    if (!x || !x->sa || !pat.data || pat.len <= 0)
+        return -1;
+    if (x->n == 0)
+        return -1;
+    lo = 0;
+    hi = x->n;
+    /* 找第一个 >= pat 的后缀 */
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+
+        if (sfx_cmp_pat(x, x->sa[mid], pat) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo >= x->n)
+        return -1;
+    if (sfx_cmp_pat(x, x->sa[lo], pat) != 0)
+        return -1;
+    /* 所有以 pat 开头的后缀在 SA 里是连续的一段：取其中最小的起始下标
+     * （也就是「第一次出现」的位置） */
+    {
+        int best = x->sa[lo];
+        int j = lo + 1;
+
+        /* 连续一段都匹配，取最小的起始下标 */
+        while (j < x->n && sfx_cmp_pat(x, x->sa[j], pat) == 0) {
+            if (x->sa[j] < best)
+                best = x->sa[j];
+            j++;
+        }
+        return best;
+    }
+}
+
+int lcp(Suffix *x, int *out)
+{
+    int i = 0, h = 0, n = 0;
+
+    if (!x || !x->sa || !x->rankv || !out)
+        return -1;
+    n = x->n;
+    for (i = 0; i < n; i++) {
+        int r = x->rankv[i];
+
+        if (r == 0) {
+            h = 0;
+            continue;
+        }
+        {
+            int j = x->sa[r - 1];
+
+            while (i + h < n && j + h < n && x->s.s.data[i + h] == x->s.s.data[j + h])
+                h++;
+            out[r] = h;
+        }
+        if (h > 0)
+            h--;
+    }
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "suffix：构造与查找" {
+    int sa[8] = { 0 }, rank[8] = { 0 }, tmp[8] = { 0 }, lcpv[8] = { 0 };
+    Suffix x = { 0 };
+
+    if (x.build(S("banana"), sa, rank, tmp, 8) != 6)
+        return err(1, "build 失败");
+    if (x.count() != 6)
+        return err(2, "count 不对");
+    /* banana 的后缀数组：5(a),3(ana),1(anana),0(banana),4(na),2(nana) */
+    if (x.at(0) != 5 || x.at(1) != 3 || x.at(2) != 1)
+        return err(3, "前三个后缀下标不对");
+    if (x.at(3) != 0 || x.at(4) != 4 || x.at(5) != 2)
+        return err(5, "后三个后缀下标不对");
+    if (x.at(6) != -1)
+        return err(6, "越界应该 -1");
+    if (x.search(S("ana")) != 1)
+        return err(7, "ana 第一次出现在 1");
+    if (x.search(S("na")) != 2)
+        return err(8, "na 第一次出现在 2");
+    if (x.search(S("ban")) != 0)
+        return err(9, "ban 出现在 0");
+    if (x.search(S("zzz")) != -1)
+        return err(10, "找不到应该 -1");
+}
+
+test "suffix：LCP 与边界" {
+    int sa[8] = { 0 }, rank[8] = { 0 }, tmp[8] = { 0 }, lcpv[8] = { 0 };
+    Suffix x = { 0 };
+    int i = 0;
+
+    if (x.build(S("banana"), sa, rank, tmp, 8) != 6)
+        return err(11, "build 失败");
+    if (x.lcp(lcpv) != 6)
+        return err(12, "lcp 返回长度不对");
+    /* 相邻后缀：a 与 ana → 1；ana 与 anana → 3；na 与 nana → 2 */
+    for (i = 0; i < 6; i++) {
+        if (lcpv[i] < 0)
+            return err(13, "LCP 不该是负数");
+    }
+    if (lcpv[1] != 1 || lcpv[2] != 3 || lcpv[5] != 2)
+        return err(14, "LCP 数值不对");
+    if (x.build(S(""), sa, rank, tmp, 8) != 0)
+        return err(15, "空文本应该返回 0");
+    if (x.build(S("abc"), sa, rank, tmp, 2) != -1)
+        return err(16, "数组太小应该 -1");
+    {
+        int sa2[4] = { 0 }, r2[4] = { 0 }, t2[4] = { 0 }, l2[4] = { 0 };
+        Suffix y = { 0 };
+
+        if (y.build(S("aaaa"), sa2, r2, t2, 4) != 4)
+            return err(17, "全同字符 build 失败");
+        if (y.at(0) != 3 || y.at(3) != 0)
+            return err(18, "全同字符的后缀顺序不对");
+        y.lcp(l2);
+        if (l2[1] != 1 || l2[3] != 3)
+            return err(19, "全同字符的 LCP 不对");
+    }
+}
