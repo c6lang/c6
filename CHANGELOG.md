@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第七十八批（co / async-await 框架）**：新目录 `std/async/`——`std.async.co`
+  （co 运行器：立即值/Future/定时器三种挂起点）、`std.async.await`（`AW_BEGIN`/`AW_SLEEP`/
+  `AW_WAIT`/`AW_YIELD`/`AW_END` 宏，把状态机藏起来写线性代码）、`std.async.scope`
+  （结构化并发：spawn/cancel/fail/join）、`std.async.limiter`（并发额度与额度转交），
+  集成示例 `examples/stdasync3.c6`（`make std-async3`）。错误号段 `std.async.co`=0x6141 …
+  `std.async.limiter`=0x6144（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十七批（图算法进阶）**：`std.container.mst`（Kruskal + Prim 最小生成树）、
   `std.container.flow`（Edmonds-Karp 最大流）、`std.container.scc`（Tarjan 强连通分量）、
   `std.container.match`（Kuhn 二分图最大匹配），集成示例 `examples/stdgraph2.c6`

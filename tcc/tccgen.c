@@ -13026,6 +13026,10 @@ static const struct C6ErrStdSlot {
     { "std.container.flow",     C6_ERR_SLOT_STD + 318 },
     { "std.container.scc",      C6_ERR_SLOT_STD + 319 },
     { "std.container.match",    C6_ERR_SLOT_STD + 320 },
+    { "std.async.co",           C6_ERR_SLOT_STD + 321 },
+    { "std.async.await",        C6_ERR_SLOT_STD + 322 },
+    { "std.async.scope",        C6_ERR_SLOT_STD + 323 },
+    { "std.async.limiter",      C6_ERR_SLOT_STD + 324 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

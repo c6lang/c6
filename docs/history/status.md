@@ -2508,6 +2508,34 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（321 个模块、0 failure）、`make std-graph2`（18 条自检全过）、
 `make check-all`。
 
+### 11.90 标准库第七十八批（co / await / scope / limiter：async-await 框架）
+
+第七十八批做「co + async/await」：把前几批的 Future/定时器/执行器组合成一套能**顺序书写
+的异步框架**（`std/async/` 新目录）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.async.co` | co 运行器 | 协程体就是 `int body(void *self, CoAwait *aw)`：返回 1 = 「我要等 `aw`」，返回 0 = 结束；三种挂起点（立即值/未来/定时器）统一走 `CoAwait` 描述；恢复通过执行器的**零延迟定时器**排队而不是递归调用，所以长链条不爆栈 |
+| `std.async.await` | async/await 宏 | protothread 写法：`AW_SLEEP(s, aw, ms)` 展开成「`s->pc = __LINE__`；返回挂起描述；`case __LINE__:`」，业务代码保持线性；本编译器**不接受** `do { … case X: } while (0)` 里的 case 标签，改成普通花括号块才行 |
+| `std.async.scope` | 结构化并发 | 子协程槽由调用方给（一次性，不复用），`on_done` 回调里减计数并结算 join；`fail(code)` = 记录第一个错误 + 取消其余子协程；`join` 在**还没 spawn** 时不结算（否则会在全空状态就 `resolve(0)`），spawn 里「立刻完成」的分支也复用同一段结算逻辑 |
+| `std.async.limiter` | 并发额度 | 只记账不调度：`acquire` 满则排队、`release` 有排队就把额度**转交**队头（`used` 不变、返回它的 token），没有排队才真正归还；计数与队列都是调用方缓冲 |
+
+踩到的坑：`Co` 的字段名一开始叫 `join`/`on_done`，与同名方法冲突（`function pointer
+expected`）；`AW_*` 宏用 `do-while` 包裹时编译器报 `';' expected`，换成花括号块后正常；
+零延迟定时器会被 `TimerHeap.fire` 的同一次循环取走，所以 `AW_YIELD` 实际上是「立刻继续」
+（一次 `tick` 跑完整条链），测试与文档都按这个语义写。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.async.co`=0x6141、
+`std.async.await`=0x6142、`std.async.scope`=0x6143、`std.async.limiter`=0x6144；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-async3` 与 `STD_ASYNC3_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 里 co 依赖 str+future+poll+timer+task+reactor+
+executor（39 条）、await/scope 依赖同一串再加 co（各 41 条）、limiter 只依赖 str（24 条）。
+示例 `examples/stdasync3.c6` 四节（24 条自检）。
+
+验收：`make stdtest`（325 个模块、0 failure）、`make std-async3`（24 条自检全过）、
+`make check-all`。
+
+
 
 
 

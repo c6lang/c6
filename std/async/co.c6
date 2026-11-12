@@ -1,0 +1,382 @@
+/* std/async/co：co 运行器（把「等待一个 Future / 定时器 / 立即值」写成挂起点）。
+ *
+ *     import std.async.co;
+ *
+ *     // 一个协程体：每次被调用都从上次挂起的地方继续（用状态机写明）
+ *     static int body(void *self, CoAwait *aw)
+ *     {
+ *         Demo *d = self;
+ *
+ *         switch (d->step++) {
+ *         case 0: return co_wait_sleep(aw, 50);       // 挂起 50ms
+ *         case 1: return co_wait_future(aw, &d->f);   // 等 Future
+ *         case 2: d->got = aw->in; return 0;          // 结束
+ *         }
+ *         return 0;
+ *     }
+ *
+ *     Co c = { 0 };
+ *     c.start(&ex, body, &demo);      // 方法：start / join / cancel / done
+ *
+ * 这是 JS 里 `co` 那一层的 C 版本：**协程体（CoBody）**自己保存进度，每次被调用
+ * 返回 1 表示「我还要等 `aw` 描述的东西」，返回 0 表示结束；运行器负责等到了再
+ * 调用一次，并把等到的值放进 `aw->in`。
+ *
+ * 约定：
+ *
+ * - `c.start(ex, body, self)` 绑定执行器、协程体与状态，立即走第一步，返回 1；
+ *   执行器、协程体为空返回 -1；重复 start 会复位（先 cancel 旧的）；
+ * - 等的东西三种：`co_wait_value(aw, v)`（下一轮立刻继续，用来让出执行权）、
+ *   `co_wait_future(aw, f)`（Future 结算后继续）、`co_wait_sleep(aw, ms)`（定时器）；
+ * - 恢复值是 `aw->in`：Future 的分支给 `f->value()`，定时器给当前时间，`value` 给原值；
+ * - 恢复通过执行器的**零延迟定时器**排队（不是递归调用），所以长链条不会爆栈；
+ *   注意零延迟定时器会被 `TimerHeap.fire` 的同一次循环取走，所以 `co_wait_value`
+ *   实际上是「立刻继续」（一条 yield 链会在一次 `tick` 里跑完）。要真正让出一轮，
+ *   用 `co_wait_sleep(aw, 1)`；
+ * - `c.join(f)` 绑一个 Future：协程正常结束时 `resolve`（值 = 恢复次数），
+ *   `c.cancel()` 取消后 `reject(-1)`；
+ * - `c.cancel()` 只置标志：下一次恢复前检查到就结束（`co_done` 为 1、
+ *   `co_cancelled` 为 1、`co_error` 为 -1）；协程体里可以自己调 `co_cancelled(c)`
+ *   提前返回 0；
+ * - `c.on_done(cb, ctx)` 注册完成回调，`cb(Co *, void *)`，结构化并发（`std.async.scope`）
+ *   靠它统计还有几个子协程在跑；
+ * - `c.done()`/`c.cancelled()`/`c.error()`/`c.resumes()`/`c.id()` 查询；
+ * - 执行器是单线程的（`std.core.executor`），所以整套东西没有锁。
+ */
+#include <string.h>
+
+module std.async.co;
+import std.core.types;
+import std.text.str;
+import std.core.future;
+import std.os.poll;
+import std.core.timer;
+import std.core.task;
+import std.os.reactor;
+import std.core.executor;
+
+enum {
+    CO_WAIT_VALUE = 0,
+    CO_WAIT_FUTURE = 1,
+    CO_WAIT_TIMER = 2
+};
+
+struct CoAwait {
+    int kind;
+    i64 in;         /* 恢复时带回来的值 */
+    i64 out;        /* CO_WAIT_VALUE：下一轮要带回的值 */
+    Future *fut;    /* CO_WAIT_FUTURE */
+    i64 delay;      /* CO_WAIT_TIMER：毫秒 */
+};
+
+typedef int (*CoBody)(void *self, CoAwait *aw);
+typedef void (*CoDone)(void *self, void *ctx);
+
+struct Co {
+    CoBody body;
+    void *state;
+    CoAwait aw;
+    Executor *ex;
+    Future *joinf;      /* 字段名避开 join()/on_done() 方法 */
+    CoDone ondone;
+    void *ondctx;
+    i64 ident;
+    int fin;        /* 已结束 */
+    int cancelflag;
+    int errc;
+    int nresume;
+};
+
+/* 供协程体使用的三个「挂起描述」构造器 */
+int co_wait_value(CoAwait *aw, i64 v)
+{
+    if (!aw)
+        return 0;
+    aw->kind = CO_WAIT_VALUE;
+    aw->out = v;
+    return 1;
+}
+
+int co_wait_future(CoAwait *aw, Future *f)
+{
+    if (!aw)
+        return 0;
+    aw->kind = CO_WAIT_FUTURE;
+    aw->fut = f;
+    return 1;
+}
+
+int co_wait_sleep(CoAwait *aw, i64 ms)
+{
+    if (!aw)
+        return 0;
+    aw->kind = CO_WAIT_TIMER;
+    aw->delay = ms < 0 ? 0 : ms;
+    return 1;
+}
+
+static void co_step(Co *c);
+
+/* 定时器到期 / 值就绪：继续走一步 */
+static void co_trampoline(void *ctx, i64 id)
+{
+    Co *c = (Co *)ctx;
+
+    (void)id;
+    co_step(c);
+}
+
+/* Future 完成回调 */
+static void co_on_future(void *self, void *ctx)
+{
+    Future *f = (Future *)self;
+    Co *c = (Co *)ctx;
+
+    c->aw.in = (f && f->state() == FUT_READY) ? f->value() : 0;
+    if (c->ex)
+        c->ex->after(0, co_trampoline, c);
+}
+
+static void co_finish(Co *c)
+{
+    c->fin = 1;
+    if (c->joinf) {
+        if (c->cancelflag)
+            c->joinf->reject(-1);
+        else
+            c->joinf->resolve((i64)c->nresume);
+    }
+    if (c->ondone)
+        c->ondone(c->state, c->ondctx);
+}
+
+static void co_step(Co *c)
+{
+    int r = 0;
+
+    if (!c || !c->body || c->fin)
+        return;
+    if (c->cancelflag) {
+        c->errc = -1;
+        co_finish(c);
+        return;
+    }
+    r = c->body(c->state, &c->aw);
+    if (r == 0) {
+        co_finish(c);
+        return;
+    }
+    c->nresume++;
+    if (!c->ex) {
+        c->errc = -2;
+        co_finish(c);
+        return;
+    }
+    if (c->aw.kind == CO_WAIT_VALUE) {
+        c->aw.in = c->aw.out;
+        c->ex->after(0, co_trampoline, c);
+    } else if (c->aw.kind == CO_WAIT_FUTURE) {
+        if (!c->aw.fut) {
+            c->aw.in = 0;
+            c->ex->after(0, co_trampoline, c);
+        } else {
+            c->aw.fut->then(co_on_future, c);
+        }
+    } else {
+        c->ex->after(c->aw.delay, co_trampoline, c);
+    }
+}
+
+int start(Co *c, Executor *ex, CoBody body, void *state)
+{
+    if (!c || !ex || !body)
+        return -1;
+    memset(c, 0, sizeof *c);
+    c->body = body;
+    c->state = state;
+    c->ex = ex;
+    co_step(c);
+    return 1;
+}
+
+int done(Co *c)
+{
+    return c ? c->fin : 1;
+}
+
+int cancelled(Co *c)
+{
+    return c ? c->cancelflag : 0;
+}
+
+int error(Co *c)
+{
+    return c ? c->errc : 0;
+}
+
+int resumes(Co *c)
+{
+    return c ? c->nresume : 0;
+}
+
+int cancel(Co *c)
+{
+    if (!c)
+        return -1;
+    c->cancelflag = 1;
+    if (!c->fin && c->ex)
+        c->ex->after(0, co_trampoline, c);
+    return 1;
+}
+
+int on_done(Co *c, CoDone cb, void *ctx)
+{
+    if (!c)
+        return -1;
+    c->ondone = cb;
+    c->ondctx = ctx;
+    return 1;
+}
+
+int join(Co *c, Future *f)
+{
+    if (!c || !f)
+        return -1;
+    c->joinf = f;
+    if (c->fin) {
+        if (c->cancelflag)
+            f->reject(-1);
+        else
+            f->resolve((i64)c->nresume);
+    }
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct CoDemo {
+    int step;
+    int n;
+    i64 got;
+    Future f;
+};
+
+static int demo_body(void *self, CoAwait *aw)
+{
+    struct CoDemo *d = (struct CoDemo *)self;
+    int s = d->step++;
+
+    if (s == 0) {
+        d->n++;
+        return co_wait_sleep(aw, 10);
+    }
+    if (s == 1) {
+        d->n++;
+        return co_wait_future(aw, &d->f);
+    }
+    if (s == 2) {
+        d->n++;
+        d->got = aw->in;
+        return co_wait_value(aw, 99);
+    }
+    return 0;
+}
+
+test "co：挂起、恢复与结束" {
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[8] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    struct CoDemo d = { 0, 0, 0, { 0, 0, 0, 0, 0 } };
+    Co c = { 0 };
+    Future j = { 0 };
+    int i = 0;
+
+    if (ex.init(&ps, regs, 4, tbuf, 8, kbuf, 4) != 1)
+        return err(1, "executor init 失败");
+    d.f.init();
+    j.init();
+    if (c.start(&ex, demo_body, &d) != 1)
+        return err(2, "start 失败");
+    if (d.n != 1 || c.done() != 0)
+        return err(3, "第一步应该跑完并挂在定时器上");
+    if (c.join(&j) != 1)
+        return err(4, "join 失败");
+    /* 定时器 10ms：推到 10 之后应该继续到第二步（等 Future） */
+    for (i = 0; i < 3; i++)
+        ex.tick(10 * (i + 1) + 10 * i, 0);
+    if (d.n != 2)
+        return err(5, "定时器到点后应该走第二步");
+    if (c.done() != 0 || d.f.state() != FUT_PENDING)
+        return err(6, "第二步应该挂在 Future 上");
+    /* Future 结算 → 第三步拿到值，再让出一次（注意 errno 变量名不能用 err） */
+    d.f.resolve(7);
+    ex.tick(100, 0);
+    if (d.n != 3 || d.got != 7)
+        return err(7, "第三步应该拿到 7");
+    /* 再推一步：协程返回 0 结束 */
+    ex.tick(101, 0);
+    if (c.done() != 1)
+        return err(8, "第四次调用应该结束");
+    if (c.resumes() != 3)
+        return err(9, "恢复次数应该是 3");
+    if (j.state() != FUT_READY || j.value() != 3)
+        return err(10, "join 的 Future 应该就绪且值是 3");
+}
+
+struct CancDemo {
+    int n;
+};
+
+static int canc_body(void *self, CoAwait *aw)
+{
+    struct CancDemo *d = (struct CancDemo *)self;
+
+    d->n++;
+    return co_wait_sleep(aw, 100);
+}
+
+static int g_done_calls = 0;
+
+static void on_co_done(void *self, void *ctx)
+{
+    (void)self;
+    (void)ctx;
+    g_done_calls++;
+}
+
+test "co：取消与完成回调" {
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[4] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[2] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    struct CancDemo d = { 0 };
+    Co c = { 0 };
+    Future j = { 0 };
+
+    ex.init(&ps, regs, 2, tbuf, 4, kbuf, 2);
+    j.init();
+    c.start(&ex, canc_body, &d);
+    if (d.n != 1)
+        return err(11, "第一步应该跑过");
+    if (c.on_done(on_co_done, 0) != 1)
+        return err(12, "on_done 失败");
+    g_done_calls = 0;
+    if (c.cancel() != 1)
+        return err(13, "cancel 失败");
+    ex.tick(1000, 0);
+    if (c.done() != 1 || c.cancelled() != 1 || c.error() != -1)
+        return err(14, "取消之后应该结束并标记 -1");
+    if (g_done_calls != 1)
+        return err(15, "完成回调应该被调用一次");
+    if (c.join(&j) != 1 || j.state() != FUT_REJECTED)
+        return err(16, "取消后绑定已经结束的协程应该 reject");
+    if (c.start(&ex, 0, &d) != -1
+        || start((Co *)0, &ex, canc_body, &d) != -1
+        || start(&c, 0, canc_body, &d) != -1)
+        return err(17, "空协程体/空执行器应该 -1");
+}

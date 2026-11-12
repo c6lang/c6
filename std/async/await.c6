@@ -1,0 +1,203 @@
+/* std/async/await：async/await 写法（把 co 的状态机藏进宏里，代码保持线性）。
+ *
+ *     import std.async.await;
+ *
+ *     struct Job { int pc; int n; i64 got; Future f; };
+ *
+ *     static int job_body(void *self, CoAwait *aw)
+ *     {
+ *         struct Job *j = (struct Job *)self;
+ *
+ *         AW_BEGIN(j)                       // switch (j->pc) { case 0:
+ *         j->n++;
+ *         AW_SLEEP(j, aw, 20);              // 挂起 20ms，醒来从这里继续
+ *         j->n++;
+ *         AW_WAIT(j, aw, &j->f);            // 等 Future
+ *         j->got = AW_IN(aw);               // 等到的值
+ *         j->n++;
+ *         AW_END(j);                        // } return 0;
+ *     }
+ *
+ *     Co c = { 0 };
+ *     c.start(&ex, job_body, &job);         // 和手写状态机完全一样地跑
+ *
+ * 原理是「protothread」那一套：`AW_SLEEP`/`AW_WAIT` 展开成
+ *
+ *     { j->pc = __LINE__; return co_wait_sleep(aw, 20); case __LINE__:; }
+ *
+ * 也就是「记下这一行号 → 返回挂起描述 → 下次恢复时用 switch 跳到这一行」（这里用的是
+ * 花括号块而不是 `do { } while (0)`：本编译器的 case 标签可以嵌在**普通块**里，但不能
+ * 嵌在 `do` 循环里）。所以
+ * 代码看起来是顺序的，实际每次恢复都从上次的挂起点继续；`j->pc` 就是协程的「程序
+ * 计数器」，重入前必须清零（`memset` 或 `j->pc = 0`）。
+ *
+ * 约定：
+ *
+ * - 协程体结构体里必须有一个 `int pc`（名字随便，但要传给宏的第一个参数）；
+ * - `AW_BEGIN(s)` 开一个 `switch`，`AW_END(s)` 收尾并 `return 0`；
+ * - `AW_SLEEP(s, aw, ms)`、`AW_WAIT(s, aw, future)`、`AW_YIELD(s, aw, v)` 是三种挂起点，
+ *   和 `co_wait_sleep`/`co_wait_future`/`co_wait_value` 一一对应；
+ * - `AW_IN(aw)` 取本次恢复带回来的值（`i64`）；
+ * - 恢复前会检查取消标志，所以 `AW_*` 之间不需要自己处理取消；要在协程体里**主动**
+ *   放弃可以写 `if (co_cancelled(...)) return 0;`（`co_cancelled` 需要 `Co *`，
+ *   所以通常由外层处理）；
+ * - 一个挂起点在宏展开里只出现一次，所以**不要在同一个函数里两次展开同一个行号**的
+ *   写法（`AW_SLEEP` 各占一行就不会冲突）；同一行写两个挂起点会编译错 `duplicate case`；
+ * - `AW_YIELD` 走的是零延迟定时器，等于「立刻继续」：一次 `tick` 里就会把后续链条跑完
+ *   （`AW_SLEEP(s, aw, 1)` 才是真正让出一轮）。
+ */
+#include <string.h>
+
+module std.async.await;
+import std.core.types;
+import std.text.str;
+import std.core.future;
+import std.async.co;
+
+#define AW_BEGIN(s) switch ((s)->pc) { case 0:
+#define AW_SLEEP(s, aw, ms)                                 \
+    {                                                       \
+        (s)->pc = __LINE__;                                 \
+        return co_wait_sleep((aw), (ms));                   \
+        case __LINE__:;                                     \
+    }
+#define AW_WAIT(s, aw, f)                                   \
+    {                                                       \
+        (s)->pc = __LINE__;                                 \
+        return co_wait_future((aw), (f));                   \
+        case __LINE__:;                                     \
+    }
+#define AW_YIELD(s, aw, v)                                  \
+    {                                                       \
+        (s)->pc = __LINE__;                                 \
+        return co_wait_value((aw), (v));                    \
+        case __LINE__:;                                     \
+    }
+#define AW_END(s) \
+    }             \
+    (void)(s);    \
+    return 0
+#define AW_IN(aw) ((aw)->in)
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct AwJobTest {
+    int pc;
+    int n;
+    i64 got;
+    i64 seq[4];
+    Future f;
+};
+
+static int aw_job_body(void *self, CoAwait *aw)
+{
+    struct AwJobTest *j = (struct AwJobTest *)self;
+
+    AW_BEGIN(j)
+    j->seq[0] = 1;
+    j->n++;
+    AW_SLEEP(j, aw, 20)
+    j->seq[1] = 2;
+    j->n++;
+    AW_WAIT(j, aw, &j->f)
+    j->got = AW_IN(aw);
+    j->seq[2] = 3;
+    j->n++;
+    AW_YIELD(j, aw, 5)
+    j->seq[3] = 4;
+    j->n++;
+    AW_END(j);
+}
+
+test "await：宏写法的挂起点" {
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[8] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    struct AwJobTest j = { 0, 0, 0, { 0, 0, 0, 0 }, { 0, 0, 0, 0, 0 } };
+    Co c = { 0 };
+    Future fin = { 0 };
+
+    if (ex.init(&ps, regs, 4, tbuf, 8, kbuf, 4) != 1)
+        return err(1, "executor init 失败");
+    j.f.init();
+    fin.init();
+    if (c.start(&ex, aw_job_body, &j) != 1)
+        return err(2, "start 失败");
+    if (j.n != 1 || j.seq[0] != 1 || c.done() != 0)
+        return err(3, "第一段应该在挂起前跑完");
+    c.join(&fin);
+    /* 20ms 定时器：推到 20 之后继续 */
+    ex.tick(20, 0);
+    if (j.n != 2 || j.seq[1] != 2 || c.done() != 0)
+        return err(4, "定时器到点后应该跑第二段");
+    /* 结算 Future → 第三段拿到值，然后让出 */
+    j.f.resolve(11);
+    ex.tick(21, 0);
+    /* 零延迟的恢复会在同一个 tick 里被 fire 循环取走，所以这里一次就跑到最后 */
+    if (j.got != 11 || j.n != 4 || j.seq[3] != 4)
+        return err(5, "应该拿到 11 并把剩下的段落跑完");
+    ex.tick(22, 0);
+    if (j.n != 4)
+        return err(6, "再推一轮不该有变化");
+    if (c.done() != 1)
+        return err(7, "协程应该结束");
+    if (fin.state() != FUT_READY)
+        return err(8, "join 的 Future 应该就绪");
+    if (c.resumes() != 3)
+        return err(9, "三次挂起 → 三次恢复");
+}
+
+struct AwLoopTest {
+    int pc;
+    int i;
+    int total;
+};
+
+static int aw_loop_body(void *self, CoAwait *aw)
+{
+    struct AwLoopTest *s = (struct AwLoopTest *)self;
+
+    AW_BEGIN(s)
+    for (s->i = 0; s->i < 4; s->i++) {
+        s->total += s->i;
+        AW_YIELD(s, aw, s->i);
+    }
+    AW_END(s);
+}
+
+test "await：循环里的挂起点" {
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[8] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[2] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    struct AwLoopTest s = { 0, 0, 0 };
+    Co c = { 0 };
+    int i = 0;
+
+    ex.init(&ps, regs, 2, tbuf, 8, kbuf, 2);
+    c.start(&ex, aw_loop_body, &s);
+    if (s.i != 0 || s.total != 0)
+        return err(10, "循环第一轮还没累加就挂在让出点上");
+    for (i = 0; i < 10; i++)
+        ex.tick(i + 1, 0);
+    if (s.total != 6)
+        return err(11, "循环累加应该是 0+1+2+3 = 6");
+    if (c.done() != 1)
+        return err(12, "循环结束后协程应该完成");
+    if (c.resumes() != 4)
+        return err(13, "四次让出 → 四次恢复");
+    /* 重新开始要复位 pc */
+    s.pc = 0;
+    s.i = 0;
+    s.total = 0;
+    c.start(&ex, aw_loop_body, &s);
+    for (i = 0; i < 10; i++)
+        ex.tick(100 + i, 0);
+    if (s.total != 6 || c.done() != 1)
+        return err(14, "复位之后应该能再跑一遍");
+}

@@ -1,0 +1,243 @@
+/* examples/stdasync3.c6 —— 第七十八批（co / async-await 框架）的集成示例。
+ *
+ *     make std-async3
+ *
+ * 四节：co 运行器（三种挂起点）、async/await 宏写法、结构化并发（scope）、并发额度
+ * （limiter）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.future;
+import std.os.poll;
+import std.core.timer;
+import std.core.task;
+import std.os.reactor;
+import std.core.executor;
+import std.async.co;
+import std.async.await;
+import std.async.scope;
+import std.async.limiter;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* ---------- 1. co：手写状态机 ---------- */
+
+struct CoJob {
+    int step;
+    i64 got;
+    Future f;
+};
+
+static int co_job(void *self, CoAwait *aw)
+{
+    struct CoJob *j = (struct CoJob *)self;
+    int s = j->step++;
+
+    if (s == 0)
+        return co_wait_sleep(aw, 30);
+    if (s == 1)
+        return co_wait_future(aw, &j->f);
+    if (s == 2) {
+        j->got = aw->in;
+        return co_wait_value(aw, 1);
+    }
+    return 0;
+}
+
+static void do_co(void)
+{
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[8] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    struct CoJob j = { 0, 0, { 0, 0, 0, 0, 0 } };
+    Co c = { 0 };
+    Future fin = { 0 };
+    int i = 0;
+
+    printf("== co\n");
+    ex.init(&ps, regs, 4, tbuf, 8, kbuf, 4);
+    j.f.init();
+    fin.init();
+    check(c.start(&ex, co_job, &j) == 1, "start");
+    c.join(&fin);
+    printf("   第一步后 step=%d、done=%d\n", j.step, c.done());
+    check(j.step == 1 && c.done() == 0, "应该挂在 30ms 定时器上");
+    for (i = 0; i < 3; i++)
+        ex.tick(10 * (i + 1), 0);
+    ex.tick(40, 0);
+    check(j.step == 2, "定时器到点后应该等 Future");
+    j.f.resolve(1234);
+    ex.tick(41, 0);
+    printf("   拿到 %lld，step=%d，恢复 %d 次，join=%lld\n", (long long)j.got, j.step,
+           c.resumes(), (long long)fin.value());
+    check(j.got == 1234, "应该拿到 1234");
+    check(c.done() == 1 && fin.state() == FUT_READY, "协程结束且 join 就绪");
+}
+
+/* ---------- 2. await：宏写成线性代码 ---------- */
+
+struct AwJob {
+    int pc;
+    int n;
+    i64 sum;
+    i64 got;
+    Future f;
+};
+
+static int aw_job(void *self, CoAwait *aw)
+{
+    struct AwJob *j = (struct AwJob *)self;
+
+    AW_BEGIN(j)
+    j->n++;
+    AW_SLEEP(j, aw, 10)
+    j->sum += 1;
+    AW_WAIT(j, aw, &j->f)
+    j->got = AW_IN(aw);
+    j->sum += j->got;
+    AW_SLEEP(j, aw, 5)
+    j->sum += 100;
+    AW_END(j);
+}
+
+static void do_await(void)
+{
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[8] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    struct AwJob j = { 0, 0, 0, 0, { 0, 0, 0, 0, 0 } };
+    Co c = { 0 };
+    int i = 0;
+
+    printf("== await\n");
+    ex.init(&ps, regs, 4, tbuf, 8, kbuf, 4);
+    j.f.init();
+    check(c.start(&ex, aw_job, &j) == 1, "start");
+    check(j.n == 1 && j.sum == 0, "第一段跑完，挂在 10ms 上");
+    ex.tick(10, 0);
+    check(j.sum == 1, "醒来累加 1，然后等 Future");
+    j.f.resolve(9);
+    for (i = 0; i < 4; i++)
+        ex.tick(20 + i * 10, 0);
+    printf("   线性代码跑完：sum=%lld、got=%lld、恢复 %d 次\n", (long long)j.sum,
+           (long long)j.got, c.resumes());
+    check(j.sum == 110, "1 + 9 + 100 = 110");
+    check(j.got == 9, "AW_IN 应该拿到 9");
+    check(c.done() == 1, "协程结束");
+}
+
+/* ---------- 3. scope：结构化并发 ---------- */
+
+struct ScJob {
+    int n;
+    i64 delay;
+};
+
+static int sc_job(void *self, CoAwait *aw)
+{
+    struct ScJob *j = (struct ScJob *)self;
+
+    j->n++;
+    if (j->n < 2)
+        return co_wait_sleep(aw, j->delay);
+    return 0;
+}
+
+static void do_scope(void)
+{
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[16] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    static Co cos[4];
+    Scope sc = { 0 };
+    struct ScJob a = { 0, 10 }, b = { 0, 20 }, c2 = { 0, 30 };
+    Future all = { 0 };
+    int i = 0, guard = 0;
+
+    printf("== scope\n");
+    ex.init(&ps, regs, 4, tbuf, 16, kbuf, 4);
+    sc.init(cos, 4, &ex);
+    all.init();
+    sc.join(&all);
+    sc.spawn(sc_job, &a);
+    sc.spawn(sc_job, &b);
+    sc.spawn(sc_job, &c2);
+    printf("   起了 %d 个，正在跑 %d 个\n", sc.spawned(), sc.running());
+    check(sc.running() == 3, "三个都在跑");
+    while (!all.is_done() && guard < 20) {
+        ex.tick(10 * (guard + 1), 0);
+        guard++;
+    }
+    printf("   收尾：completed=%d，join=%lld\n", sc.completed(),
+           (long long)all.value());
+    check(all.state() == FUT_READY && all.value() == 3, "三个子协程全部完成");
+    check(sc.running() == 0, "没有在跑的");
+    /* 失败传播 */
+    sc.reset();
+    all.init();
+    sc.join(&all);
+    {
+        struct ScJob d = { 0, 40 };
+
+        sc.spawn(sc_job, &d);
+    }
+    sc.fail(-5);
+    for (i = 0; i < 4; i++)
+        ex.tick(200 + i * 10, 0);
+    check(sc.failed() == 1 && sc.code() == -5, "失败码 -5");
+    check(all.state() == FUT_REJECTED && all.code() == -5, "join 被 reject(-5)");
+}
+
+/* ---------- 4. limiter：并发额度 ---------- */
+
+static void do_limiter(void)
+{
+    static i64 q[8] = { 0 };
+    Limiter l = { 0 };
+    i64 tok = 0;
+
+    printf("== limiter\n");
+    l.init(2, q, 8);
+    check(l.acquire(101) == 1 && l.acquire(102) == 1, "两个额度");
+    check(l.acquire(103) == 0 && l.acquire(104) == 0, "两个排队");
+    printf("   占用 %d / %d，排队 %d\n", l.used(), l.limit(), l.waiting());
+    check(l.used() == 2 && l.waiting() == 2, "占用 2、排队 2");
+    check(l.queued_at(1, &tok) == 1 && tok == 104, "队尾是 104");
+    check(l.release() == 103, "释放把额度转交 103");
+    check(l.release() == 104, "再转交 104");
+    check(l.release() == -1 && l.used() == 1, "没有排队才真正归还");
+    printf("   转交完占用 %d，累计放行 %ld、拒绝 %ld\n", l.used(), l.granted(),
+           l.denied());
+    check(l.used() == 1 && l.waiting() == 0, "最终占用 1");
+}
+
+int main(void)
+{
+    do_co();
+    do_await();
+    do_scope();
+    do_limiter();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

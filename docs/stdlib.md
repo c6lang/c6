@@ -353,6 +353,11 @@
 | `std/container/flow.c6` | `std.container.flow` | 最大流（**方法**：`f.setup`/`f.add_edge`/`f.max_flow`/`f.flow_on`/`f.residual`/`f.value`/`f.reset_flow`）：残余容量矩阵 + BFS 最短增广路（Edmonds-Karp），可反复求解、可读任意边的净流量 |
 | `std/container/scc.c6` | `std.container.scc` | 强连通分量（**方法**：`s.tarjan`/`s.comp_of`/`s.size`/`s.count`）：CSR 输入（`ptr` + `adj`），Tarjan 一次 DFS 求 `low/index` 与栈，分量编号按弹出顺序（汇在前）；递归实现，`work` 是 `5n` |
 | `std/container/match.c6` | `std.container.match` | 二分图最大匹配（**方法**：`m.setup`/`m.kuhn`/`m.pair_left`/`m.pair_right`/`m.size`/`m.perfect`/`m.left`/`m.right`）：Kuhn 增广路（DFS，允许抢已匹配右顶点），`work` 是 `nleft + 2·nright` |
+| `std/async/co.c6` | `std.async.co` | co 运行器（**方法**：`c.start`/`c.join`/`c.cancel`/`c.on_done`/`c.done`/`c.resumes`/`c.error`）：协程体 `int body(void *self, CoAwait *aw)` 返回 1 表示「等 `aw`」，三种挂起点 `co_wait_value`/`co_wait_future`/`co_wait_sleep`；恢复走执行器的零延迟定时器（不递归） |
+| `std/async/await.c6` | `std.async.await` | async/await 宏（在 co 之上）：`AW_BEGIN(s)` / `AW_SLEEP(s,aw,ms)` / `AW_WAIT(s,aw,f)` / `AW_YIELD(s,aw,v)` / `AW_END(s)` / `AW_IN(aw)`，靠 `pc` + `__LINE__` 把状态机藏进宏里，代码保持线性 |
+| `std/async/scope.c6` | `std.async.scope` | 结构化并发（**方法**：`sc.init`/`sc.spawn`/`sc.cancel`/`sc.fail`/`sc.join`/`sc.running`/`sc.completed`/`sc.spawned`/`sc.reset`）：一批子协程同生共死，`fail(code)` 立刻取消其余，最后一个收尾时 `join` 的 Future 结算（正常给完成数、失败给错误码、取消给 -1） |
+| `std/async/limiter.c6` | `std.async.limiter` | 并发额度（**方法**：`l.init`/`l.acquire`/`l.try_acquire`/`l.release`/`l.used`/`l.waiting`/`l.queued_at`/`l.granted`/`l.denied`/`l.reset`）：最多 N 个在飞，超出排队，释放时把额度**转交**给队头（占用数不变） |
+
 
 
 
@@ -494,6 +499,7 @@
 | `examples/stdlinalg.c6` | （无模块） | 第七十五批（线性代数）的拼装示例（`make std-linalg`）：LU 求解/求逆/行列式、Jacobi 特征值与幂法、8 阶 Poisson 三对角、CSR 的 SpMV 与转置 |
 | `examples/stdsearch2.c6` | （无模块） | 第七十六批（检索与关键词）的拼装示例（`make std-search2`）：倒排索引单词/AND 查询、BM25 长短文档对比、词频 Top-3、词干化五例 |
 | `examples/stdgraph2.c6` | （无模块） | 第七十七批（图算法进阶）的拼装示例（`make std-graph2`）：Kruskal/Prim 互验、CLRS 最大流、Tarjan 分量、Kuhn 匹配 |
+| `examples/stdasync3.c6` | （无模块） | 第七十八批（co / async-await 框架）的拼装示例（`make std-async3`）：三种挂起点、宏式线性 await、结构化并发（含失败传播）、并发额度转交 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -696,6 +702,10 @@ std/container/mst.c6       24 test(s), 0 failure(s)
 std/container/flow.c6      24 test(s), 0 failure(s)
 std/container/scc.c6       24 test(s), 0 failure(s)
 std/container/match.c6     24 test(s), 0 failure(s)
+std/async/co.c6            39 test(s), 0 failure(s)
+std/async/await.c6         41 test(s), 0 failure(s)
+std/async/scope.c6         41 test(s), 0 failure(s)
+std/async/limiter.c6       24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4280,6 +4290,17 @@ make std-graph2
 给出 3 个分量；`Match` 给出 3 对完美匹配，再用「三个左点只连一个右点」验证最大基数
 只有 1。
 
+### 集成示例：`examples/stdasync3.c6`
+
+```sh
+make std-async3
+```
+
+四节都用方法：`Co` 手写状态机（sleep 30ms → 等 Future → 让出一次 → 结束，打印拿到的
+1234 与恢复次数）；`AW_*` 宏把同一件事写成五行线性代码（`sum = 1 + 9 + 100`）；
+`Scope` 起三个子协程、打印 `completed=3`、再用 `fail(-5)` 演示「一个失败全体收尾」；
+`Limiter` 用 2 个额度 + 2 个排队演示额度转交。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4430,6 +4451,8 @@ make std-graph2
   （自带自检）。
 * `make std-graph2`：`examples/stdgraph2.c6`，第七十七批（图算法进阶）模块的拼装示例
   （自带自检）。
+* `make std-async3`：`examples/stdasync3.c6`，第七十八批（co / async-await 框架）模块的
+  拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

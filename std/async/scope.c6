@@ -1,0 +1,321 @@
+/* std/async/scope：结构化并发（一组协程同生共死：spawn / cancel / join）。
+ *
+ *     import std.async.scope;
+ *
+ *     static Co cos[4];               // 子协程槽（静态数组自动清零）
+ *     Scope sc = { 0 };
+ *     Future all = { 0 };
+ *     sc.init(cos, 4, &ex);            // 方法：init / spawn / cancel / join
+ *     all.init();
+ *     sc.join(&all);                   // 全部收尾时 all 就绪
+ *     sc.spawn(body_a, &sa);
+ *     sc.spawn(body_b, &sb);
+ *     while (!all.is_done())           // 由执行器推进（真实程序里是主循环）
+ *         ex.tick(now_ms(), 10);
+ *
+ * 这是 Go 的 `errgroup` / JS 的 `AbortController + Promise.all` 那一层：父作用域
+ * 管着一批子协程，任何一个出错就整体取消，最后一个结束时把 `Future` 结算掉。
+ *
+ * 约定：
+ *
+ * - `sc.init(co_buf, cap, ex)`：`co_buf` 是 `cap` 个 `Co`（子协程的槽，**不复用**，
+ *   `cap` 就是这个作用域一辈子最多能开多少个子协程）；返回 1；
+ * - `sc.spawn(body, state)` 起一个子协程，返回它的 id（>0）；槽用完或已取消返回 -1；
+ * - `sc.fail(code)` 记一次失败（记录**第一个**错误码），然后**自动取消**其余子协程
+ *   ——这就是「一个出错全体收尾」；
+ * - `sc.cancel()` 取消所有子协程（含之后 `spawn` 直接返回 -1）；
+ * - `sc.join(f)` 绑一个 Future：所有子协程结束时结算——正常 `resolve(完成数)`
+ *   （还没 spawn 过任何子协程时不会立刻结算），
+ *   有失败 `reject(错误码)`，被取消 `reject(-1)`；
+ * - `sc.running()` 还在跑的子协程数，`sc.completed()` 已完成数，`sc.spawned()` 起过
+ *   多少，`sc.failed()`/`sc.code()` 失败状态，`sc.cancelled()` 是否被取消，
+ *   `sc.reset()` 复位（`Co` 槽可以接着用，绑定的 Future 要重新 `join`）；
+ * - 作用域不会自己推进执行器：真实程序里由主循环 `tick`，测试里手动推。
+ */
+#include <string.h>
+
+module std.async.scope;
+import std.core.types;
+import std.text.str;
+import std.core.future;
+import std.os.poll;
+import std.core.timer;
+import std.core.task;
+import std.os.reactor;
+import std.core.executor;
+import std.async.co;
+
+struct Scope {
+    Executor *ex;
+    Co *cos;
+    int cap;
+    int used;
+    int running_v;
+    int done_v;
+    int spawn_v;
+    int cancelflag;
+    int nfail;
+    int errc;
+    Future *joinf;
+};
+
+/* 全部收尾时结算绑定的 Future（有失败先失败，其次取消，最后正常） */
+static void sc_settle(Scope *sc)
+{
+    if (!sc->joinf || sc->running_v > 0 || sc->spawn_v <= 0)
+        return;
+    if (sc->nfail > 0)
+        sc->joinf->reject(sc->errc);
+    else if (sc->cancelflag)
+        sc->joinf->reject(-1);
+    else
+        sc->joinf->resolve((i64)sc->done_v);
+}
+
+/* 子协程结束时的回调（co 把状态传成 self，把作用域传成 on_ctx） */
+static void sc_child_done(void *self, void *ctx)
+{
+    Scope *sc = (Scope *)ctx;
+
+    (void)self;
+    if (sc->running_v > 0)
+        sc->running_v--;
+    sc->done_v++;
+    sc_settle(sc);
+}
+
+int init(Scope *sc, void *co_buf, int cap, Executor *ex)
+{
+    if (!sc || !co_buf || cap <= 0 || !ex)
+        return -1;
+    memset(sc, 0, sizeof *sc);
+    memset(co_buf, 0, sizeof(Co) * (size_t)cap);
+    sc->cos = (Co *)co_buf;
+    sc->cap = cap;
+    sc->ex = ex;
+    return 1;
+}
+
+int running(Scope *sc)
+{
+    return sc ? sc->running_v : 0;
+}
+
+int completed(Scope *sc)
+{
+    return sc ? sc->done_v : 0;
+}
+
+int spawned(Scope *sc)
+{
+    return sc ? sc->spawn_v : 0;
+}
+
+int failed(Scope *sc)
+{
+    return sc ? sc->nfail : 0;
+}
+
+int code(Scope *sc)
+{
+    return sc && sc->nfail > 0 ? sc->errc : 0;
+}
+
+int cancelled(Scope *sc)
+{
+    return sc ? sc->cancelflag : 0;
+}
+
+int capacity(Scope *sc)
+{
+    return sc ? sc->cap : 0;
+}
+
+i64 spawn(Scope *sc, CoBody body, void *state)
+{
+    Co *c = 0;
+
+    if (!sc || !sc->cos || !body || sc->cancelflag)
+        return -1;
+    if (sc->used >= sc->cap)
+        return -1;
+    c = &sc->cos[sc->used];
+    if (c->start(sc->ex, body, state) != 1)
+        return -1;
+    sc->used++;
+    sc->spawn_v++;
+    sc->running_v++;
+    if (c->on_done(sc_child_done, sc) != 1)
+        return -1;
+    /* 子协程可能已经在 start 里跑完了（body 直接 return 0）：补一次收尾 */
+    if (c->done() == 1 && sc->running_v > 0) {
+        sc->running_v--;
+        sc->done_v++;
+        sc_settle(sc);
+    }
+    return sc->used;
+}
+
+int cancel(Scope *sc)
+{
+    int i = 0;
+
+    if (!sc || !sc->cos)
+        return -1;
+    sc->cancelflag = 1;
+    for (i = 0; i < sc->used; i++) {
+        if (!sc->cos[i].done())
+            sc->cos[i].cancel();
+    }
+    return sc->running_v;
+}
+
+int fail(Scope *sc, int errc)
+{
+    if (!sc)
+        return -1;
+    if (sc->nfail == 0) {
+        sc->nfail = 1;
+        sc->errc = errc;
+    }
+    sc->cancel();
+    return 1;
+}
+
+int join(Scope *sc, Future *f)
+{
+    if (!sc || !f)
+        return -1;
+    sc->joinf = f;
+    /* 还没 spawn 过任何子协程时不要立刻结算：那样会在「全空」状态就 resolve(0) */
+    sc_settle(sc);
+    return 1;
+}
+
+int reset(Scope *sc)
+{
+    if (!sc || !sc->cos)
+        return -1;
+    memset(sc->cos, 0, sizeof(Co) * (size_t)sc->cap);
+    sc->used = 0;
+    sc->running_v = 0;
+    sc->done_v = 0;
+    sc->spawn_v = 0;
+    sc->cancelflag = 0;
+    sc->nfail = 0;
+    sc->errc = 0;
+    sc->joinf = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct ScChild {
+    int n;
+    i64 delay;
+};
+
+static int sc_child_body(void *self, CoAwait *aw)
+{
+    struct ScChild *c = (struct ScChild *)self;
+
+    c->n++;
+    if (c->n < 2)
+        return co_wait_sleep(aw, c->delay);
+    return 0;
+}
+
+static int sc_quick_body(void *self, CoAwait *aw)
+{
+    struct ScChild *c = (struct ScChild *)self;
+
+    (void)aw;
+    c->n++;
+    return 0;
+}
+
+test "scope：三个子协程一起收尾" {
+    static IoReg regs[4] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[16] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[4] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    static Co cos[4];
+    Scope sc = { 0 };
+    struct ScChild a = { 0, 10 }, b = { 0, 20 }, q = { 0, 0 };
+    Future all = { 0 };
+    int i = 0;
+
+    if (ex.init(&ps, regs, 4, tbuf, 16, kbuf, 4) != 1)
+        return err(1, "executor init 失败");
+    if (sc.init(cos, 4, &ex) != 1)
+        return err(2, "scope init 失败");
+    all.init();
+    if (sc.join(&all) != 1)
+        return err(3, "join 失败");
+    if (sc.spawn(sc_child_body, &a) <= 0)
+        return err(4, "spawn a 失败");
+    if (sc.spawn(sc_child_body, &b) <= 0)
+        return err(5, "spawn b 失败");
+    if (sc.spawn(sc_quick_body, &q) <= 0)
+        return err(6, "spawn 快速协程失败");
+    if (sc.running() != 2 || sc.spawned() != 3)
+        return err(7, "快速协程应该已经收尾，只剩 2 个在跑");
+    if (sc.completed() != 1)
+        return err(8, "完成数应该是 1");
+    for (i = 0; i < 6; i++) {
+        ex.tick(10 * (i + 1), 0);
+        if (all.is_done())
+            break;
+    }
+    if (!all.is_done())
+        return err(9, "所有子协程结束后 join 的 Future 应该就绪");
+    if (all.state() != FUT_READY || all.value() != 3)
+        return err(10, "join 应该 resolve 3");
+    if (sc.running() != 0 || sc.completed() != 3)
+        return err(11, "收尾后 running=0、completed=3");
+    if (a.n != 2 || b.n != 2 || q.n != 1)
+        return err(12, "每个子协程的步数不对");
+}
+
+test "scope：失败传播与取消" {
+    static IoReg regs[2] = { { 0, 0, 0, 0, 0 } };
+    static TimerEntry tbuf[8] = { { 0, 0, 0, 0, 0 } };
+    static TaskSlot kbuf[2] = { { 0, 0, 0, 0 } };
+    PollSet ps = { 0 };
+    Executor ex = { 0 };
+    static Co cos[2];
+    Scope sc = { 0 };
+    struct ScChild a = { 0, 100 };
+    Future all = { 0 };
+    int i = 0;
+
+    ex.init(&ps, regs, 2, tbuf, 8, kbuf, 2);
+    sc.init(cos, 2, &ex);
+    all.init();
+    sc.join(&all);
+    sc.spawn(sc_child_body, &a);
+    if (sc.fail(-7) != 1)
+        return err(13, "fail 失败");
+    if (sc.failed() != 1 || sc.code() != -7 || sc.cancelled() != 1)
+        return err(14, "失败状态/取消标志不对");
+    if (sc.spawn(sc_child_body, &a) != -1)
+        return err(15, "取消之后不该还能 spawn");
+    for (i = 0; i < 4; i++)
+        ex.tick(10 * (i + 1), 0);
+    if (!all.is_done() || all.state() != FUT_REJECTED)
+        return err(16, "失败之后 join 的 Future 应该 reject");
+    if (all.code() != -7)
+        return err(17, "错误码应该是 -7");
+    if (sc.running() != 0)
+        return err(18, "取消之后不该有在跑的子协程");
+    /* 复位之后可以继续用 */
+    if (sc.reset() != 1 || sc.running() != 0 || sc.cancelled() != 0)
+        return err(19, "reset 之后状态应该清空");
+    if (sc.spawn(sc_quick_body, &a) <= 0)
+        return err(20, "reset 之后应该还能 spawn");
+    if (sc.init(cos, 0, &ex) != -1)
+        return err(21, "cap=0 应该 -1");
+}

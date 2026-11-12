@@ -1,0 +1,230 @@
+/* std/async/limiter：并发额度（最多 N 个在飞，超出的排队，释放时按 FIFO 唤醒）。
+ *
+ *     import std.async.limiter;
+ *
+ *     i64 q[8] = { 0 };
+ *     Limiter l = { 0 };
+ *     l.init(2, q, 8);              // 方法：init / acquire / release / used
+ *     l.acquire(101);               // 1（拿到）
+ *     l.acquire(102);               // 1（拿到）
+ *     l.acquire(103);               // 0（满了，103 进队列）
+ *     l.release();                  // 103（把额度和所有权交给队头）
+ *
+ * 异步程序里常见的「限流」：同一时刻最多 N 个请求在飞，其余排队。这里只管**记账**，
+ * 谁去真正启动请求由调用方决定（通常是一个 `std.async.scope` 或任务队列）。
+ *
+ * 约定：
+ *
+ * - `l.init(cap, queue_buf, qcap)`：`cap` 是同时允许的额度，`queue_buf` 是 `qcap` 个
+ *   `i64` 的等待队列；`cap <= 0` 或 `qcap <= 0` 返回 -1；
+ * - `l.acquire(token)`：有额度就占用并返回 1；满了就排队并返回 0（`token` 进队尾）；
+ *   队列也满了返回 -1；
+ * - `l.try_acquire()`：不排队，拿到返回 1、满返回 0；
+ * - `l.release()`：有排队就弹队头并**把额度直接转交**给它（返回它的 token，占用数不变）；
+ *   没有排队就归还额度并返回 -1；额度已经空时返回 -1 且不会变成负数；
+ * - `l.used()` 当前占用数，`l.waiting()` 排队数，`l.limit()` 额度，`l.is_full()`；
+ * - `l.queued_at(i, &tok)` 看第 i 个排队 token（0 是最前面的），`l.reset()` 清空；
+ * - `l.granted()`/`l.denied()`/`l.released()` 是累计计数（调试/统计用）；
+ * - 单线程无锁（执行器本身是单线程的）。
+ */
+#include <string.h>
+
+module std.async.limiter;
+import std.core.types;
+import std.text.str;
+
+struct Limiter {
+    int cap;
+    int used_v;
+    i64 *q;
+    int qcap;
+    int head;
+    int nwait;
+    long granted_v;
+    long denied_v;
+    long released_v;
+};
+
+int init(Limiter *l, int cap, void *queue_buf, int qcap)
+{
+    if (!l || cap <= 0 || !queue_buf || qcap <= 0)
+        return -1;
+    memset(l, 0, sizeof *l);
+    memset(queue_buf, 0, sizeof(i64) * (size_t)qcap);
+    l->cap = cap;
+    l->q = (i64 *)queue_buf;
+    l->qcap = qcap;
+    return 1;
+}
+
+int limit(Limiter *l)
+{
+    return l ? l->cap : 0;
+}
+
+int used(Limiter *l)
+{
+    return l ? l->used_v : 0;
+}
+
+int waiting(Limiter *l)
+{
+    return l ? l->nwait : 0;
+}
+
+long granted(Limiter *l)
+{
+    return l ? l->granted_v : 0;
+}
+
+long denied(Limiter *l)
+{
+    return l ? l->denied_v : 0;
+}
+
+long released(Limiter *l)
+{
+    return l ? l->released_v : 0;
+}
+
+int is_full(Limiter *l)
+{
+    if (!l)
+        return 1;
+    return l->used_v >= l->cap ? 1 : 0;
+}
+
+int acquire(Limiter *l, i64 token)
+{
+    if (!l || !l->q)
+        return -1;
+    if (l->used_v < l->cap) {
+        l->used_v++;
+        l->granted_v++;
+        return 1;
+    }
+    if (l->nwait >= l->qcap)
+        return -1;
+    l->q[(l->head + l->nwait) % l->qcap] = token;
+    l->nwait++;
+    l->denied_v++;
+    return 0;
+}
+
+int try_acquire(Limiter *l)
+{
+    if (!l)
+        return 0;
+    if (l->used_v >= l->cap)
+        return 0;
+    l->used_v++;
+    l->granted_v++;
+    return 1;
+}
+
+i64 release(Limiter *l)
+{
+    if (!l || !l->q)
+        return -1;
+    if (l->nwait > 0) {
+        i64 tok = l->q[l->head];
+
+        l->head = (l->head + 1) % l->qcap;
+        l->nwait--;
+        l->released_v++;
+        l->granted_v++;                 /* 额度转交给排队的那个 */
+        return tok;
+    }
+    if (l->used_v > 0) {
+        l->used_v--;
+        l->released_v++;
+    }
+    return -1;
+}
+
+int queued_at(Limiter *l, int i, i64 *tok)
+{
+    if (!l || !l->q || i < 0 || i >= l->nwait)
+        return 0;
+    if (tok)
+        *tok = l->q[(l->head + i) % l->qcap];
+    return 1;
+}
+
+int reset(Limiter *l)
+{
+    if (!l || !l->q)
+        return -1;
+    memset(l->q, 0, sizeof(i64) * (size_t)l->qcap);
+    l->used_v = 0;
+    l->head = 0;
+    l->nwait = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "limiter：额度、排队与转交" {
+    static i64 q[4] = { 0 };
+    Limiter l = { 0 };
+    i64 tok = 0;
+
+    if (l.init(2, q, 4) != 1)
+        return err(1, "init 失败");
+    if (l.limit() != 2 || l.used() != 0 || l.waiting() != 0 || l.is_full() != 0)
+        return err(2, "初始状态不对");
+    if (l.acquire(101) != 1 || l.acquire(102) != 1)
+        return err(3, "前两个应该拿到额度");
+    if (l.used() != 2 || l.is_full() != 1)
+        return err(4, "满了之后 used=2");
+    if (l.acquire(103) != 0)
+        return err(5, "第三个应该排队");
+    if (l.waiting() != 1 || l.queued_at(0, &tok) != 1 || tok != 103)
+        return err(6, "队列里应该是 103");
+    if (l.acquire(104) != 0 || l.waiting() != 2)
+        return err(7, "第四个也该排队");
+    /* 释放：队头拿到额度，占用数不变 */
+    if (l.release() != 103 || l.used() != 2 || l.waiting() != 1)
+        return err(8, "释放应该把额度转交给 103");
+    if (l.release() != 104 || l.waiting() != 0)
+        return err(9, "再释放应该转交给 104");
+    /* 没有排队了就真的归还 */
+    if (l.release() != -1 || l.used() != 1)
+        return err(10, "没有排队时释放应该归还额度");
+    if (l.try_acquire() != 1 || l.used() != 2)
+        return err(11, "try_acquire 应该拿到");
+    if (l.release() != -1 || l.release() != -1 || l.used() != 0)
+        return err(12, "连续释放归零");
+    if (l.release() != -1 || l.used() != 0)
+        return err(13, "空额度释放不该变负");
+    if (l.granted() != 5 || l.denied() != 2 || l.released() != 5)
+        return err(14, "累计计数不对");
+}
+
+test "limiter：队列上限、复位与边界" {
+    static i64 q[2] = { 0 };
+    Limiter l = { 0 };
+    i64 tok = 0;
+
+    l.init(1, q, 2);
+    if (l.acquire(1) != 1)
+        return err(15, "第一个应该拿到");
+    if (l.acquire(2) != 0 || l.acquire(3) != 0)
+        return err(16, "两个都应该排队");
+    if (l.acquire(4) != -1)
+        return err(17, "队列满了应该 -1");
+    if (l.waiting() != 2 || l.queued_at(1, &tok) != 1 || tok != 3)
+        return err(18, "队列顺序不对");
+    if (l.queued_at(2, &tok) != 0)
+        return err(19, "越界 queued_at 应该 0");
+    if (l.release() != 2 || l.release() != 3)
+        return err(20, "转交顺序不对");
+    if (l.used() != 1 || l.waiting() != 0)
+        return err(21, "转交之后占用数应该还是 1");
+    if (l.reset() != 1 || l.used() != 0 || l.waiting() != 0)
+        return err(22, "reset 之后应该清空");
+    if (l.init(0, q, 2) != -1 || l.init(1, q, 0) != -1)
+        return err(23, "非法参数应该 -1");
+}
