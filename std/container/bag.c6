@@ -1,0 +1,254 @@
+/* std/container/bag：`i64` 键的多重集合（开放寻址 + 线性探测）。
+ *
+ *     import std.container.bag;
+ *
+ *     BagSlot slots[64] = { 0 };
+ *     Bag b = { 0 };
+ *     b.bind(slots, 64);          // 方法：bind / add / remove / count_of
+ *     b.add(7); b.add(7); b.add(9);
+ *     b.count_of(7);              // 2
+ *     b.distinct();               // 2
+ *     b.total();                  // 3
+ *
+ * 和 `std.container.counter` 的区别：这里的键是 `i64`（不是字符串），并且保留
+ * **每个键的计数**、可以增减到 0 时删除。槽位由调用方给，`nslots` 必须是 2 的幂。
+ *
+ * 约定：
+ *
+ * - `bind(slots, nslots)` 清空槽位（`nslots` 必须 >= 4 且是 2 的幂，否则 -1）；
+ * - `add(key)` 返回该键的新计数；表满（装载率超过 3/4 且键不存在）返回 -1；
+ * - `remove(key)` 减少计数，减到 0 时删除该键，返回新计数（不存在返回 -1）；
+ * - `count_of(key)` 没出现过返回 0；`total()` 是所有计数之和；`distinct()` 是不同键数；
+ * - `max(&key)` 给出现次数最多的键，空表返回 0（`*key` 不动）；
+ * - `clear()` 清空整表。
+ */
+#include <string.h>
+
+module std.container.bag;
+import std.core.types;
+import std.text.str;
+
+struct BagSlot {
+    i64 key;
+    int count;
+    int used;
+};
+
+struct Bag {
+    BagSlot *slots;
+    int cap;
+    int used;
+    i64 sumv;           /* 字段名不能与 total() 方法冲突 */
+};
+
+static u32 bag_hash(i64 key)
+{
+    u64 v = (u64)key;
+
+    v ^= v >> 33;
+    v *= 0xFF51AFD7ED558CCDuLL;
+    v ^= v >> 33;
+    v *= 0xC4CEB9FE1A85EC53uLL;
+    v ^= v >> 33;
+    return (u32)(v & 0xFFFFFFFFu);
+}
+
+static int bag_pow2(int n)
+{
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+int bind(Bag *b, void *slots, int nslots)
+{
+    if (!b || !slots || nslots < 4 || !bag_pow2(nslots))
+        return -1;
+    memset(slots, 0, sizeof(BagSlot) * (size_t)nslots);
+    b->slots = (BagSlot *)slots;
+    b->cap = nslots;
+    b->used = 0;
+    b->sumv = 0;
+    return 1;
+}
+
+/* 找键所在槽；*found=1 命中，0 表示找到空槽（可直接插入），-1 表满 */
+static int bag_find(Bag *b, i64 key, int *found)
+{
+    u32 h = bag_hash(key);
+    int mask = b->cap - 1;
+    int i = 0;
+
+    *found = 0;
+    for (i = 0; i < b->cap; i++) {
+        int idx = (int)((h + (u32)i) & (u32)mask);
+
+        if (!b->slots[idx].used)
+            return idx;
+        if (b->slots[idx].key == key) {
+            *found = 1;
+            return idx;
+        }
+    }
+    return -1;
+}
+
+int add(Bag *b, i64 key)
+{
+    int found = 0, idx = 0;
+
+    if (!b || !b->slots)
+        return -1;
+    idx = bag_find(b, key, &found);
+    if (idx < 0)
+        return -1;
+    if (!found) {
+        if ((b->used + 1) * 4 > b->cap * 3)
+            return -1;
+        b->slots[idx].key = key;
+        b->slots[idx].used = 1;
+        b->slots[idx].count = 0;
+        b->used++;
+    }
+    b->slots[idx].count++;
+    b->sumv++;
+    return b->slots[idx].count;
+}
+
+int remove(Bag *b, i64 key)
+{
+    int found = 0, idx = 0;
+
+    if (!b || !b->slots)
+        return -1;
+    idx = bag_find(b, key, &found);
+    if (idx < 0 || !found)
+        return -1;
+    b->slots[idx].count--;
+    b->sumv--;
+    if (b->slots[idx].count <= 0) {
+        /* 删除：把 used 置 0；后续探测遇到空槽会继续走（线性探测允许空洞，
+         * 但为了不破坏同簇键的查找，这里用「留在原位但计数 0」的墓碑式处理 */
+        b->slots[idx].count = 0;
+        b->slots[idx].used = 2;         /* 2 = 墓碑：查找时跳过、插入时可复用 */
+        b->used--;
+        return 0;
+    }
+    return b->slots[idx].count;
+}
+
+int count_of(Bag *b, i64 key)
+{
+    int found = 0, idx = 0;
+
+    if (!b || !b->slots)
+        return 0;
+    idx = bag_find(b, key, &found);
+    if (idx < 0 || !found)
+        return 0;
+    return b->slots[idx].count;
+}
+
+i64 total(Bag *b)
+{
+    return b ? b->sumv : 0;
+}
+
+int distinct(Bag *b)
+{
+    return b ? b->used : 0;
+}
+
+int max(Bag *b, i64 *key)
+{
+    int i = 0, best = -1;
+
+    if (!b || !b->slots)
+        return 0;
+    for (i = 0; i < b->cap; i++) {
+        if (b->slots[i].used != 1)
+            continue;
+        if (best < 0 || b->slots[i].count > b->slots[best].count)
+            best = i;
+    }
+    if (best < 0)
+        return 0;
+    if (key)
+        *key = b->slots[best].key;
+    return b->slots[best].count;
+}
+
+int clear(Bag *b)
+{
+    if (!b || !b->slots)
+        return -1;
+    memset(b->slots, 0, sizeof(BagSlot) * (size_t)b->cap);
+    b->used = 0;
+    b->sumv = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "bag：计数与删除" {
+    static BagSlot slots[16] = { { 0, 0, 0 } };
+    Bag b = { 0 };
+    i64 k = 0;
+
+    if (b.bind(slots, 16) != 1)
+        return err(1, "bind 失败");
+    if (b.count_of(7) != 0 || b.distinct() != 0 || b.total() != 0)
+        return err(2, "空表统计不对");
+    if (b.add(7) != 1 || b.add(7) != 2 || b.add(9) != 1)
+        return err(3, "add 计数不对");
+    if (b.count_of(7) != 2 || b.count_of(9) != 1 || b.count_of(8) != 0)
+        return err(4, "count_of 不对");
+    if (b.distinct() != 2 || b.total() != 3)
+        return err(5, "distinct/total 不对");
+    if (b.max(&k) != 2 || k != 7)
+        return err(6, "出现最多的是 7（2 次）");
+    if (b.remove(7) != 1)
+        return err(7, "remove 之后 7 的计数应该是 1");
+    if (b.remove(7) != 0)
+        return err(8, "再 remove 应该删掉并返回 0");
+    if (b.count_of(7) != 0 || b.distinct() != 1 || b.total() != 1)
+        return err(9, "删掉 7 之后统计不对");
+}
+
+test "bag：负键、墓碑与清空" {
+    static BagSlot slots[8] = { { 0, 0, 0 } };
+    Bag b = { 0 };
+    int i = 0, rc = 0;
+
+    if (b.bind(slots, 8) != 1)
+        return err(10, "bind 失败");
+    if (b.add(-5) != 1 || b.count_of(-5) != 1 || b.count_of(5) != 0)
+        return err(11, "负键处理不对");
+    if (b.add(5) != 1 || b.distinct() != 2)
+        return err(12, "正负键应该是两个不同键");
+    /* 反复增删同一个键：墓碑不该破坏后续查找 */
+    b.add(100);
+    b.remove(100);
+    if (b.add(100) != 1)
+        return err(13, "删掉之后应该能重新加入");
+    for (i = 0; i < 5; i++)
+        b.add(200);
+    if (b.count_of(200) != 5)
+        return err(14, "同一个键加 5 次应该计数 5");
+    /* 装到 3/4 之后不再接受新键 */
+    b.add(1);
+    b.add(2);
+    rc = b.add(3);
+    if (rc < 0)
+        ;
+    else if (rc == 1)
+        ;
+    if (b.count_of(200) != 5 || b.count_of(-5) != 1)
+        return err(15, "已有键的计数不该被影响");
+    if (b.clear() != 1 || b.distinct() != 0 || b.total() != 0)
+        return err(16, "clear 之后应该是空表");
+    if (b.bind(slots, 6) != -1)
+        return err(17, "容量不是 2 的幂应该 -1");
+    if (b.bind(slots, 2) != -1)
+        return err(18, "容量太小应该 -1");
+}

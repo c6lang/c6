@@ -1,0 +1,156 @@
+/* std/container/stack：借用调用方数组的 `i64` 栈。
+ *
+ *     import std.container.stack;
+ *
+ *     long long buf[16] = { 0 };
+ *     Stack s = { 0 };
+ *     long long v = 0;
+ *     s.bind(buf, 16);            // 方法：bind / push / pop / peek / size
+ *     s.push(10);
+ *     s.pop(&v);                  // 10
+ *
+ * 与 `std.container.ring` 一样是**纯视图**：`Stack` 只包指针、容量与元素数，不分配
+ * 也不拥有 `buf`（它必须比 Stack 活得久）。
+ *
+ * 约定：
+ *
+ * - `bind(buf, cap)` 复位（`n = 0` 并清零缓冲区）；`cap <= 0` 返回 -1；
+ * - `push(v)` 满时返回 0（不覆盖），成功返回 1；
+ * - `pop(&out)`/`peek(&out)` 空栈返回 0（`*out` 不动），成功返回 1；
+ * - `size()`/`capacity()`/`is_empty()`/`is_full()` 给状态；
+ * - `clear()` 清空（不清零缓冲区）。
+ */
+#include <string.h>
+
+module std.container.stack;
+import std.core.types;
+import std.text.str;
+
+struct Stack {
+    i64 *buf;
+    int cap;
+    int n;
+};
+
+int bind(Stack *s, i64 *buf, int cap)
+{
+    if (!s || !buf || cap <= 0)
+        return -1;
+    memset(buf, 0, sizeof(i64) * (size_t)cap);
+    s->buf = buf;
+    s->cap = cap;
+    s->n = 0;
+    return 1;
+}
+
+int push(Stack *s, i64 v)
+{
+    if (!s || !s->buf || s->n >= s->cap)
+        return 0;
+    s->buf[s->n++] = v;
+    return 1;
+}
+
+int pop(Stack *s, i64 *out)
+{
+    if (!s || !s->buf || s->n <= 0)
+        return 0;
+    s->n--;
+    if (out)
+        *out = s->buf[s->n];
+    return 1;
+}
+
+int peek(Stack *s, i64 *out)
+{
+    if (!s || !s->buf || s->n <= 0)
+        return 0;
+    if (out)
+        *out = s->buf[s->n - 1];
+    return 1;
+}
+
+int size(Stack *s)
+{
+    return s ? s->n : 0;
+}
+
+int capacity(Stack *s)
+{
+    return s ? s->cap : 0;
+}
+
+int is_empty(Stack *s)
+{
+    return !s || s->n == 0 ? 1 : 0;
+}
+
+int is_full(Stack *s)
+{
+    return s && s->buf && s->cap > 0 && s->n >= s->cap ? 1 : 0;
+}
+
+int clear(Stack *s)
+{
+    if (!s)
+        return -1;
+    s->n = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "stack：入栈出栈" {
+    i64 buf[8] = { 0 };
+    Stack s = { 0 };
+    i64 v = 0;
+
+    if (s.bind(buf, 8) != 1)
+        return err(1, "bind 失败");
+    if (s.is_empty() != 1 || s.size() != 0 || s.capacity() != 8)
+        return err(2, "初始状态不对");
+    if (s.pop(&v) != 0 || s.peek(&v) != 0)
+        return err(3, "空栈 pop/peek 应该返回 0");
+    if (s.push(10) != 1 || s.push(20) != 1 || s.push(30) != 1)
+        return err(4, "push 失败");
+    if (s.size() != 3 || s.is_empty() != 0)
+        return err(5, "size 不对");
+    if (s.peek(&v) != 1 || v != 30)
+        return err(6, "peek 应该是栈顶 30");
+    if (s.pop(&v) != 1 || v != 30)
+        return err(7, "第一次 pop 应该是 30");
+    if (s.pop(&v) != 1 || v != 20)
+        return err(8, "第二次 pop 应该是 20");
+    if (s.size() != 1 || s.peek(&v) != 1 || v != 10)
+        return err(9, "剩下的栈顶应该是 10");
+}
+
+test "stack：满栈与清空" {
+    i64 buf[4] = { 0 };
+    Stack s = { 0 };
+    i64 v = 0;
+    int i = 0;
+
+    if (s.bind(buf, 4) != 1)
+        return err(10, "bind 失败");
+    for (i = 0; i < 4; i++) {
+        if (s.push((i64)i) != 1)
+            return err(11, "push 失败");
+    }
+    if (s.is_full() != 1)
+        return err(12, "应该满栈");
+    if (s.push(99) != 0)
+        return err(13, "满栈 push 应该返回 0（不覆盖）");
+    if (s.peek(&v) != 1 || v != 3)
+        return err(14, "满栈时栈顶不该被覆盖");
+    if (s.clear() != 1 || s.size() != 0 || s.is_empty() != 1)
+        return err(15, "clear 之后应该是空栈");
+    if (s.push(7) != 1 || s.pop(&v) != 1 || v != 7)
+        return err(16, "clear 之后还能继续用");
+    if (s.bind((i64 *)0, 4) != -1)
+        return err(17, "空缓冲区应该 -1");
+    if (s.bind(buf, 0) != -1)
+        return err(18, "容量 0 应该 -1");
+}

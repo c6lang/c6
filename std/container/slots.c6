@@ -1,0 +1,199 @@
+/* std/container/slots：位图槽位分配器（固定数量的资源「占用/释放/找空位」）。
+ *
+ *     import std.container.slots;
+ *
+ *     unsigned char bits[4] = { 0 };
+ *     Slots s = { 0 };
+ *     s.bind(bits, 32);           // 方法：bind / alloc / free / used / total
+ *     int i = s.alloc();          // 0
+ *     s.free(i);
+ *
+ * 每个槽位一个 bit（1 = 占用）。常用于「固定池里的句柄号」「文件描述符表」
+ * 「任务槽位」这类场景：不分配内存，只维护一张位图。
+ *
+ * 约定：
+ *
+ * - `bind(bits, nbits)` 把位图清零（`(nbits + 7) / 8` 字节），`nbits <= 0` 返回 -1；
+ * - `alloc()` 返回最小空闲槽位号，没有空位返回 -1；
+ * - `free(i)` 释放，越界或本来就空闲返回 0，成功返回 1；
+ * - `is_used(i)` 给占用状态（越界当占用，返回 1，避免调用方误用）；
+ * - `alloc_contig(k)` 找连续 k 个空闲槽位，返回起始槽位号，没有返回 -1；
+ * - `used()`/`total()`/`free_count()` 给统计，`clear()` 清空全部。
+ */
+#include <string.h>
+
+module std.container.slots;
+import std.core.types;
+import std.text.str;
+
+struct Slots {
+    u8 *bits;
+    int nbits;
+    int nused;
+};
+
+int bind(Slots *s, void *bits, int nbits)
+{
+    if (!s || !bits || nbits <= 0)
+        return -1;
+    memset(bits, 0, (size_t)((nbits + 7) / 8));
+    s->bits = (u8 *)bits;
+    s->nbits = nbits;
+    s->nused = 0;
+    return 1;
+}
+
+int total(Slots *s)
+{
+    return s ? s->nbits : 0;
+}
+
+int used(Slots *s)
+{
+    return s ? s->nused : 0;
+}
+
+int free_count(Slots *s)
+{
+    return s ? s->nbits - s->nused : 0;
+}
+
+int is_used(Slots *s, int i)
+{
+    if (!s || !s->bits || i < 0 || i >= s->nbits)
+        return 1;
+    return (s->bits[i >> 3] >> (i & 7)) & 1;
+}
+
+int alloc(Slots *s)
+{
+    int i = 0;
+
+    if (!s || !s->bits)
+        return -1;
+    for (i = 0; i < s->nbits; i++) {
+        if (!is_used(s, i)) {
+            s->bits[i >> 3] = (u8)(s->bits[i >> 3] | (1u << (i & 7)));
+            s->nused++;
+            return i;
+        }
+    }
+    return -1;
+}
+
+int free_slot(Slots *s, int i)
+{
+    if (!s || !s->bits || i < 0 || i >= s->nbits)
+        return 0;
+    if (!is_used(s, i))
+        return 0;
+    s->bits[i >> 3] = (u8)(s->bits[i >> 3] & ~(1u << (i & 7)));
+    s->nused--;
+    return 1;
+}
+
+int alloc_contig(Slots *s, int k)
+{
+    int i = 0, run = 0, start = 0;
+
+    if (!s || !s->bits || k <= 0 || k > s->nbits)
+        return -1;
+    for (i = 0; i < s->nbits; i++) {
+        if (is_used(s, i)) {
+            run = 0;
+            continue;
+        }
+        if (run == 0)
+            start = i;
+        run++;
+        if (run == k) {
+            int j = 0;
+
+            for (j = start; j < start + k; j++) {
+                s->bits[j >> 3] = (u8)(s->bits[j >> 3] | (1u << (j & 7)));
+                s->nused++;
+            }
+            return start;
+        }
+    }
+    return -1;
+}
+
+int clear(Slots *s)
+{
+    if (!s || !s->bits)
+        return -1;
+    memset(s->bits, 0, (size_t)((s->nbits + 7) / 8));
+    s->nused = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "slots：分配与释放" {
+    static u8 bits[4] = { 0 };
+    Slots s = { 0 };
+    int a = 0, b = 0;
+
+    if (s.bind(bits, 32) != 1)
+        return err(1, "bind 失败");
+    if (s.total() != 32 || s.used() != 0 || s.free_count() != 32)
+        return err(2, "初始统计不对");
+    a = s.alloc();
+    b = s.alloc();
+    if (a != 0 || b != 1)
+        return err(3, "头两次分配应该是 0 与 1");
+    if (s.used() != 2 || s.free_count() != 30)
+        return err(4, "分配后统计不对");
+    if (s.is_used(a) != 1 || s.is_used(2) != 0)
+        return err(5, "is_used 不对");
+    if (s.free_slot(0) != 1)
+        return err(6, "释放 0 号失败");
+    if (s.is_used(0) != 0 || s.used() != 1)
+        return err(7, "释放后状态不对");
+    if (s.free_slot(0) != 0)
+        return err(8, "重复释放应该返回 0");
+    if (s.alloc() != 0)
+        return err(9, "释放后应该能重新分配 0 号");
+    if (s.free_slot(99) != 0)
+        return err(10, "越界释放应该 0");
+    if (s.is_used(-1) != 1 || s.is_used(99) != 1)
+        return err(11, "越界 is_used 应该当占用");
+}
+
+test "slots：连续分配与清空" {
+    static u8 bits[2] = { 0 };
+    Slots s = { 0 };
+    int i = 0, start = 0;
+
+    if (s.bind(bits, 16) != 1)
+        return err(12, "bind 失败");
+    if (s.alloc_contig(4) != 0)
+        return err(13, "第一次连续分配 4 个应该是 0..3");
+    if (s.used() != 4)
+        return err(14, "连续分配后统计不对");
+    s.free_slot(1);
+    s.free_slot(2);
+    if (s.alloc_contig(2) != 1)
+        return err(15, "释放 1/2 后应该能在 1 处连续分配 2 个");
+    if (s.alloc_contig(13) != -1)
+        return err(16, "剩余空间不够连续 13 个应该 -1");
+    if (s.alloc_contig(0) != -1)
+        return err(17, "k=0 应该 -1");
+    /* 占满 16 个 */
+    for (i = 0; i < 16; i++) {
+        if (!s.is_used(i)) {
+            start = s.alloc();
+            if (start < 0)
+                return err(18, "还没满就应该能分配");
+        }
+    }
+    if (s.used() != 16 || s.free_count() != 0)
+        return err(19, "占满之后统计不对");
+    if (s.alloc() != -1)
+        return err(20, "没有空位应该 -1");
+    if (s.clear() != 1 || s.used() != 0 || s.is_used(5) != 0)
+        return err(21, "clear 之后应该全空");
+}

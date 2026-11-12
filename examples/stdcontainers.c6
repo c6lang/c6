@@ -1,0 +1,159 @@
+/* examples/stdcontainers.c6 —— 第六十三批（基础容器补充）的集成示例。
+ *
+ *     make std-cont
+ *
+ * 四节：栈（括号匹配）、队列（FIFO 回绕）、槽位分配器（句柄复用）、多重集合
+ * （计数与最多次数）。全部用**方法**（`s.push`、`q.pop`、`sl.alloc`、`b.add`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.container.stack;
+import std.container.queue;
+import std.container.slots;
+import std.container.bag;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* 用栈检查括号是否配平 */
+static int brackets_ok(char[:] s)
+{
+    i64 buf[64] = { 0 };
+    Stack st = { 0 };
+    i64 top = 0;
+    int i = 0;
+
+    st.bind(buf, 64);
+    for (i = 0; i < s.len; i++) {
+        char c = s.data[i];
+
+        if (c == '(' || c == '[' || c == '{') {
+            st.push((i64)c);
+        } else if (c == ')' || c == ']' || c == '}') {
+            if (st.pop(&top) != 1)
+                return 0;
+            if (c == ')' && top != '(')
+                return 0;
+            if (c == ']' && top != '[')
+                return 0;
+            if (c == '}' && top != '{')
+                return 0;
+        }
+    }
+    return st.is_empty();
+}
+
+static void do_stack(void)
+{
+    printf("== stack\n");
+    check(brackets_ok(S("{[()]}")) == 1, "配平的括号");
+    check(brackets_ok(S("{(})")) == 0, "错误的嵌套要能发现");
+    check(brackets_ok(S("((")) == 0, "缺少右括号要能发现");
+    check(brackets_ok(S("")) == 1, "空串算配平");
+    {
+        i64 buf[4] = { 0 };
+        Stack s = { 0 };
+        i64 v = 0;
+        int i = 0;
+
+        s.bind(buf, 4);
+        for (i = 1; i <= 4; i++)
+            s.push((i64)i);
+        printf("   压入 1..4，size=%d，满=%d\n", s.size(), s.is_full());
+        check(s.size() == 4 && s.is_full() == 1, "满栈状态");
+        check(s.push(5) == 0, "满栈再压应该拒绝");
+        check(s.pop(&v) == 1 && v == 4, "后进先出");
+    }
+}
+
+static void do_queue(void)
+{
+    printf("== queue\n");
+    {
+        i64 buf[4] = { 0 };
+        Queue q = { 0 };
+        i64 v = 0;
+        int i = 0, sum = 0;
+
+        q.bind(buf, 4);
+        for (i = 0; i < 4; i++)
+            q.push((i64)(i + 1));
+        check(q.is_full() == 1 && q.size() == 4, "满队");
+        q.pop(&v);
+        q.pop(&v);
+        q.push(10);
+        q.push(11);
+        while (q.pop(&v) == 1)
+            sum = sum * 100 + (int)v;
+        printf("   回绕后出队顺序 = %d\n", sum);
+        check(sum == 3041011, "回绕后应该是 3,4,10,11");
+        check(q.is_empty() == 1, "出完之后空队");
+    }
+}
+
+static void do_slots(void)
+{
+    static unsigned char bits[2] = { 0 };
+    Slots s = { 0 };
+    int a = 0, b = 0;
+
+    printf("== slots\n");
+    check(s.bind(bits, 16) == 1, "bind 16 个槽位");
+    a = s.alloc();
+    b = s.alloc();
+    printf("   分配：%d 与 %d，已用 %d/%d\n", a, b, s.used(), s.total());
+    check(a == 0 && b == 1 && s.used() == 2, "头两次分配");
+    s.free_slot(a);
+    check(s.is_used(a) == 0 && s.used() == 1, "释放 0 号");
+    check(s.alloc() == 0, "释放后应该能重新拿到 0 号");
+    s.clear();
+    check(s.alloc_contig(4) == 0 && s.used() == 4, "连续分配 4 个");
+    check(s.free_count() == 12, "剩余 12 个");
+}
+
+static void do_bag(void)
+{
+    static BagSlot slots[16] = { { 0, 0, 0 } };
+    Bag b = { 0 };
+    i64 k = 0;
+    int i = 0;
+
+    printf("== bag\n");
+    check(b.bind(slots, 16) == 1, "bind");
+    for (i = 0; i < 5; i++)
+        b.add(42);
+    b.add(7);
+    b.add(7);
+    b.add(99);
+    printf("   42×%d 7×%d 99×%d，不同键 %d，总数 %lld\n", b.count_of(42),
+           b.count_of(7), b.count_of(99), b.distinct(), (long long)b.total());
+    check(b.count_of(42) == 5 && b.count_of(7) == 2, "计数");
+    check(b.distinct() == 3 && b.total() == 8, "不同键与总数");
+    check(b.max(&k) == 5 && k == 42, "出现最多的是 42");
+    check(b.remove(42) == 4, "remove 一次后是 4");
+    check(b.count_of(1234) == 0, "没见过的键是 0");
+}
+
+int main(void)
+{
+    do_stack();
+    do_queue();
+    do_slots();
+    do_bag();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

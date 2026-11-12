@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第六十三批（基础容器补充）**：`std.container.stack`（i64 栈）、
+  `std.container.queue`（环形 FIFO）、`std.container.slots`（位图槽位分配器）、
+  `std.container.bag`（i64 多重集合，墓碑删除），集成示例
+  `examples/stdcontainers.c6`（`make std-cont`）。错误号段
+  `std.container.stack`=0x6105 … `std.container.bag`=0x6108
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十二批（颜色与单位）**：`std.core.color`（RGBA 与 HSL/HSV、hex 解析
   生成、混合、亮度与对比度）、`std.data.palette`（GIMP `.gpl` 与 hex 列表）、
   `std.text.colorname`（40 个 CSS 命名颜色 + 最近匹配）、`std.core.units`（长度/

@@ -2144,6 +2144,31 @@ systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，�
 验收：`make stdtest`（261 个模块、0 failure）、`make std-color`（26 条自检全过）、
 `make check-all`。
 
+### 11.75 标准库第六十三批（stack / queue / slots / bag）
+
+第六十三批补最基础的四件套：栈、环形队列、位图槽位分配器与 `i64` 多重集合。四个都是
+「调用方给缓冲区 + 方法操作状态」的形态，与 ring/deque 一脉相承。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.container.stack` | 栈 | 纯视图（`buf` 由调用方给），满时 `push` 返回 0 不覆盖；`bind` 会清零缓冲区，避免读到旧值 |
+| `std.container.queue` | 环形队列 | `(head + n) % cap` 定位尾巴，回绕之后出队顺序必须仍然是 FIFO（用例专门验证 3,4,10,11） |
+| `std.container.slots` | 槽位分配器 | 一个 bit 一个槽位；`alloc_contig(k)` 找连续空位；越界 `is_used` 返回 1（当占用）而不是 0，避免调用方把无效句柄当空闲 |
+| `std.container.bag` | 多重集合 | 开放寻址 + 线性探测；删到 0 时留**墓碑**（`used = 2`）而不是清空，否则同簇的其他键会查不到；装载率 3/4 后只允许已有键累加 |
+
+这批的坑还是字段与同名方法：`Bag.total` 与 `total()` 撞车，字段改成 `sumv`
+（`Slots`/`Stack`/`Queue` 的字段名一开始就避开了 `size`/`count`/`total` 这些方法名）。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.container.stack`=0x6105、
+`std.container.queue`=0x6106、`std.container.slots`=0x6107、`std.container.bag`=0x6108；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-cont` 与 `STD_CONT_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdcontainers.c6` 四节（22 条自检）。
+
+验收：`make stdtest`（265 个模块、0 failure）、`make std-cont`（22 条自检全过）、
+`make check-all`。
+
+
 
 
 

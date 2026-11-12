@@ -1,0 +1,174 @@
+/* std/container/queue：借用调用方数组的固定容量 FIFO 队列（环形）。
+ *
+ *     import std.container.queue;
+ *
+ *     long long buf[16] = { 0 };
+ *     Queue q = { 0 };
+ *     long long v = 0;
+ *     q.bind(buf, 16);            // 方法：bind / push / pop / peek / size
+ *     q.push(1); q.push(2);
+ *     q.pop(&v);                  // 1
+ *
+ * 纯视图：`Queue` 只包指针、容量、头下标与元素数，不分配也不拥有 `buf`。与
+ * `std.container.ring` 的区别：ring 存 `void *` 且满时返回 0；queue 存 `i64`、
+ * 同样满时拒绝入队，但接口命名按队列（`push`/`pop`/`peek`）。
+ *
+ * 约定：
+ *
+ * - `bind(buf, cap)` 复位（清空缓冲区并把 `head`/`n` 归零）；`cap <= 0` 返回 -1；
+ * - `push(v)` 满时返回 0（不覆盖旧值），成功返回 1；
+ * - `pop(&out)`/`peek(&out)` 空队列返回 0，成功返回 1；
+ * - `size()`/`capacity()`/`is_empty()`/`is_full()`/`clear()` 给状态与复位；
+ * - 元素按入队顺序出队，回绕由 `(head + n) % cap` 处理。
+ */
+#include <string.h>
+
+module std.container.queue;
+import std.core.types;
+import std.text.str;
+
+struct Queue {
+    i64 *buf;
+    int cap;
+    int head;
+    int n;
+};
+
+int bind(Queue *q, i64 *buf, int cap)
+{
+    if (!q || !buf || cap <= 0)
+        return -1;
+    memset(buf, 0, sizeof(i64) * (size_t)cap);
+    q->buf = buf;
+    q->cap = cap;
+    q->head = 0;
+    q->n = 0;
+    return 1;
+}
+
+int push(Queue *q, i64 v)
+{
+    if (!q || !q->buf || q->n >= q->cap)
+        return 0;
+    q->buf[(q->head + q->n) % q->cap] = v;
+    q->n++;
+    return 1;
+}
+
+int pop(Queue *q, i64 *out)
+{
+    if (!q || !q->buf || q->n <= 0)
+        return 0;
+    if (out)
+        *out = q->buf[q->head];
+    q->head = (q->head + 1) % q->cap;
+    q->n--;
+    return 1;
+}
+
+int peek(Queue *q, i64 *out)
+{
+    if (!q || !q->buf || q->n <= 0)
+        return 0;
+    if (out)
+        *out = q->buf[q->head];
+    return 1;
+}
+
+int size(Queue *q)
+{
+    return q ? q->n : 0;
+}
+
+int capacity(Queue *q)
+{
+    return q ? q->cap : 0;
+}
+
+int is_empty(Queue *q)
+{
+    return !q || q->n == 0 ? 1 : 0;
+}
+
+int is_full(Queue *q)
+{
+    return q && q->buf && q->cap > 0 && q->n >= q->cap ? 1 : 0;
+}
+
+int clear(Queue *q)
+{
+    if (!q)
+        return -1;
+    q->head = 0;
+    q->n = 0;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "queue：先进先出" {
+    i64 buf[8] = { 0 };
+    Queue q = { 0 };
+    i64 v = 0;
+
+    if (q.bind(buf, 8) != 1)
+        return err(1, "bind 失败");
+    if (q.is_empty() != 1 || q.size() != 0 || q.capacity() != 8)
+        return err(2, "初始状态不对");
+    if (q.pop(&v) != 0 || q.peek(&v) != 0)
+        return err(3, "空队列 pop/peek 应该返回 0");
+    if (q.push(1) != 1 || q.push(2) != 1 || q.push(3) != 1)
+        return err(4, "push 失败");
+    if (q.size() != 3)
+        return err(5, "size 不对");
+    if (q.peek(&v) != 1 || v != 1)
+        return err(6, "peek 应该是队首 1");
+    if (q.pop(&v) != 1 || v != 1)
+        return err(7, "第一次 pop 应该是 1");
+    if (q.pop(&v) != 1 || v != 2)
+        return err(8, "第二次 pop 应该是 2");
+    if (q.size() != 1 || q.peek(&v) != 1 || v != 3)
+        return err(9, "剩下的队首应该是 3");
+}
+
+test "queue：回绕与满队" {
+    i64 buf[4] = { 0 };
+    Queue q = { 0 };
+    i64 v = 0;
+    int i = 0;
+
+    if (q.bind(buf, 4) != 1)
+        return err(10, "bind 失败");
+    for (i = 0; i < 4; i++) {
+        if (q.push((i64)i) != 1)
+            return err(11, "push 失败");
+    }
+    if (q.is_full() != 1)
+        return err(12, "应该满队");
+    if (q.push(99) != 0)
+        return err(13, "满队 push 应该返回 0");
+    /* 出两个再进两个，验证回绕 */
+    if (q.pop(&v) != 1 || v != 0)
+        return err(14, "先出队的应该是 0");
+    if (q.pop(&v) != 1 || v != 1)
+        return err(15, "接着出队的应该是 1");
+    if (q.push(10) != 1 || q.push(11) != 1)
+        return err(16, "回绕后应该还能入队");
+    {
+        i64 want[4] = { 2, 3, 10, 11 };
+        int k = 0;
+
+        for (k = 0; k < 4; k++) {
+            if (q.pop(&v) != 1 || v != want[k])
+                return err(17, "回绕后出队顺序不对");
+        }
+    }
+    if (q.is_empty() != 1)
+        return err(18, "出完之后应该是空队列");
+    if (q.clear() != 1 || q.size() != 0)
+        return err(19, "clear 之后应该是空队列");
+    if (q.bind(buf, 0) != -1)
+        return err(20, "容量 0 应该 -1");
+}

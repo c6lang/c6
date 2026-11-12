@@ -12966,6 +12966,10 @@ static const struct C6ErrStdSlot {
     { "std.data.palette",       C6_ERR_SLOT_STD + 258 },
     { "std.text.colorname",     C6_ERR_SLOT_STD + 259 },
     { "std.core.units",         C6_ERR_SLOT_STD + 260 },
+    { "std.container.stack",    C6_ERR_SLOT_STD + 261 },
+    { "std.container.queue",    C6_ERR_SLOT_STD + 262 },
+    { "std.container.slots",    C6_ERR_SLOT_STD + 263 },
+    { "std.container.bag",      C6_ERR_SLOT_STD + 264 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

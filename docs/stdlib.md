@@ -293,6 +293,11 @@
 | `std/data/palette.c6` | `std.data.palette` | 调色板（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.find`/`doc.is_gpl`/`doc.rewind`）：GIMP `.gpl`（`R G B<TAB>名字`、`Name:`/`Columns:` 头、`#` 注释）与 `#RRGGBB[ 名字]` 简单列表两种格式 |
 | `std/text/colorname.c6` | `std.text.colorname` | 命名颜色：`lookup`（大小写/空格/连字符不敏感）、`name_of`（完全相等才给名）、`nearest`（RGB 距离平方最近，给名字与颜色）、`color_count`/`color_at` 遍历表；表收 40 个常用 CSS 颜色 |
 | `std/core/units.c6` | `std.core.units` | 单位换算（**方法**：`c.init`/`c.to`）：长度（m/km/cm/mm/in/ft/yd/mi/nmi）、质量（g/kg/t/lb/oz）、温度（C/F/K，走公式而非倍率）、字节（B/KB/MB/GB 与 KiB/MiB/GiB），`parse_unit` 认常见写法并区分大小写不敏感 |
+| `std/container/stack.c6` | `std.container.stack` | `i64` 栈（**方法**：`s.bind`/`s.push`/`s.pop`/`s.peek`/`s.size`/`s.capacity`/`s.is_empty`/`s.is_full`/`s.clear`）：纯视图、缓冲区由调用方给，满时 `push` 返回 0 不覆盖 |
+| `std/container/queue.c6` | `std.container.queue` | 环形 FIFO（**方法**：`q.bind`/`q.push`/`q.pop`/`q.peek`/`q.size`/`q.is_full`/`q.clear`）：`(head + n) % cap` 处理回绕，满时拒绝入队 |
+| `std/container/slots.c6` | `std.container.slots` | 位图槽位分配器（**方法**：`s.bind`/`s.alloc`/`s.free_slot`/`s.is_used`/`s.alloc_contig`/`s.used`/`s.total`/`s.free_count`/`s.clear`）：一个 bit 一个槽位，`alloc_contig(k)` 找连续空位，越界 `is_used` 当占用（防止误用） |
+| `std/container/bag.c6` | `std.container.bag` | `i64` 多重集合（**方法**：`b.bind`/`b.add`/`b.remove`/`b.count_of`/`b.total`/`b.distinct`/`b.max`/`b.clear`）：开放寻址 + 线性探测，删到 0 留墓碑（`used = 2`）不破坏同簇查找，装载率 3/4 后拒绝新键 |
+
 
 
 
@@ -404,6 +409,7 @@
 | `examples/stdbin2.c6` | （无模块） | 第六十批（二进制与数值工具）的拼装示例（`make std-bin2`）：LE/BE 读写、按位打包、fp16/bf16 转换、对齐工具；链接带 `-lm` |
 | `examples/stdclean.c6` | （无模块） | 第六十一批（文本清洗与标注）的拼装示例（`make std-clean`）：SanOpts 清洗、TabStops 展开/还原、Quoter 引用往返、NatoOpts 拼读解码 |
 | `examples/stdcolor.c6` | （无模块） | 第六十二批（颜色与单位）的拼装示例（`make std-color`）：颜色 hex/HSL/混合/对比度、GIMP 调色板、命名颜色与最近匹配、单位换算 |
+| `examples/stdcontainers.c6` | （无模块） | 第六十三批（基础容器补充）的拼装示例（`make std-cont`）：栈做括号匹配、队列验回绕、槽位分配与复用、多重集合计数与最多次数 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -546,6 +552,10 @@ std/core/color.c6          24 test(s), 0 failure(s)
 std/data/palette.c6        26 test(s), 0 failure(s)
 std/text/colorname.c6      26 test(s), 0 failure(s)
 std/core/units.c6          24 test(s), 0 failure(s)
+std/container/stack.c6     24 test(s), 0 failure(s)
+std/container/queue.c6     24 test(s), 0 failure(s)
+std/container/slots.c6     24 test(s), 0 failure(s)
+std/container/bag.c6       24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3965,6 +3975,16 @@ make std-color
 按名查找；命名颜色用 `lookup`/`name_of`/`nearest` 把 `#FE0102` 归到 `red`；单位换算用
 `convert` 与 `c.init`/`c.to` 处理方法验证公里↔米、摄氏↔华氏、MiB↔KiB。
 
+### 集成示例：`examples/stdcontainers.c6`
+
+```sh
+make std-cont
+```
+
+四节都用方法：栈拿来判括号是否配平（`{(})` 要能发现、`((` 要报缺右括号）；队列放
+1..4 后出两个、再进 10/11 验证回绕顺序；槽位分配器演示分配/释放/复用与
+`alloc_contig`；多重集合统计 `42×5 / 7×2 / 99×1` 并用 `b.max` 找出出现最多的键。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4085,6 +4105,8 @@ make std-color
   示例（自带自检）。
 * `make std-color`：`examples/stdcolor.c6`，第六十二批（颜色与单位）模块的拼装示例
   （自带自检）。
+* `make std-cont`：`examples/stdcontainers.c6`，第六十三批（基础容器补充）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
