@@ -1,0 +1,140 @@
+/* examples/stdmath3.c6 —— 第七十四批（数值方法与拟合）的集成示例。
+ *
+ *     make std-math3
+ *
+ * 四节：Solve 求根（二分/牛顿/割线）、Ode 定步长积分（RK4/中点/Euler 精度对比）、
+ * Optimize 一维极值、Fit 最小二乘拟合。
+ */
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.solve;
+import std.core.ode;
+import std.core.optimize;
+import std.core.least;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static double f_sq_demo(double x, void *ctx)
+{
+    (void)ctx;
+    return x * x - 2.0;
+}
+
+static void f_exp_demo(double t, const double *y, double *dy, int n, void *ctx)
+{
+    (void)t;
+    (void)n;
+    (void)ctx;
+    dy[0] = y[0];
+}
+
+static void do_solve(void)
+{
+    Solve s = { 0 };
+    double r = 0.0;
+
+    printf("== solve\n");
+    check(s.setup(f_sq_demo, 0, 1e-13, 200) == 1, "setup");
+    check(s.bisect(1.0, 2.0) == 1, "二分收敛");
+    r = s.root();
+    printf("   二分：√2 = %.15f（%d 次，残差 %.2e）\n", r, s.iters(), s.residual());
+    check(fabs(r - 1.4142135623730951) < 1e-9, "二分精度");
+    check(s.newton(1.0) == 1, "牛顿收敛");
+    printf("   牛顿：√2 = %.15f（%d 次）\n", s.root(), s.iters());
+    check(fabs(s.root() - 1.4142135623730951) < 1e-14, "牛顿精度");
+    check(s.secant(2.0, 1.0) == 1, "割线收敛");
+    check(fabs(s.root() - 1.4142135623730951) < 1e-12, "割线精度");
+}
+
+static void do_ode(void)
+{
+    double y[1] = { 1.0 };
+    double work[5] = { 0 };
+    Ode o = { 0 };
+    double exact = 2.718281828459045235;
+
+    printf("== ode\n");
+    check(o.setup(f_exp_demo, 0, 1, y, work) == 1, "setup");
+    check(o.integrate(0.0, 0.01, 100) > 0.99, "RK4 走到 t=1");
+    printf("   y'=y, y(0)=1 → RK4 %.12f（误差 %.2e，导函数调用 %ld 次）\n",
+           o.at(0), fabs(o.at(0) - exact), o.evaluations());
+    check(fabs(o.at(0) - exact) < 1e-9, "RK4 误差 < 1e-9");
+    check(o.steps() == 100 && o.evaluations() == 400, "步数与调用次数");
+    y[0] = 1.0;
+    o.setup(f_exp_demo, 0, 1, y, work);
+    o.integrate_with(0.0, 0.01, 100, 0);
+    printf("   同一问题 Euler 只得 %.8f（误差 %.2e）\n", o.at(0),
+           fabs(o.at(0) - exact));
+    check(fabs(o.at(0) - exact) > 1e-3, "Euler 误差应该明显更大");
+}
+
+static double obj_demo(double v, void *ctx)
+{
+    double c = *(double *)ctx;
+
+    return (v - c) * (v - c) + 3.0 * (v - c) * (v - c) * (v - c) * (v - c);
+}
+
+static void do_optimize(void)
+{
+    Optimize o = { 0 };
+    double c = 0.75;
+
+    printf("== optimize\n");
+    check(o.setup(obj_demo, &c, 300) == 1, "setup");
+    check(o.golden(-4.0, 6.0) == 1, "golden 成功");
+    printf("   黄金分割：极小点 %.12f（%d 次迭代）\n", o.best_x(), o.iters());
+    check(fabs(o.best_x() - 0.75) < 1e-8, "极小点应该在 0.75");
+    check(o.ternary(-4.0, 6.0) == 1, "ternary 成功");
+    printf("   三分法：极小点 %.12f\n", o.best_x());
+    check(fabs(o.best_x() - 0.75) < 1e-8, "三分法极小点");
+    check(o.grid(-4.0, 6.0, 11) == 1, "grid 成功");
+    check(fabs(o.best_x() - 0.75) < 1e-6, "网格细化极小点");
+}
+
+static void do_least(void)
+{
+    Fit f = { 0 };
+    double xs[5] = { 0, 1, 2, 3, 4 };
+    double ys[5] = { 3.1, 4.9, 7.2, 8.8, 11.1 };     /* 约 y = 3 + 2x + 噪声 */
+    double qx[5] = { -2, -1, 0, 1, 2 };
+    double qy[5] = { 3, 1.5, 1, 1.5, 3 };
+
+    printf("== least\n");
+    check(f.line(xs, ys, 5) == 1, "直线拟合");
+    printf("   y ≈ %.4f + %.4f x（rss %.4f，r2 %.6f）\n", f.coef(0), f.coef(1),
+           f.rss(), f.r2());
+    check(fabs(f.coef(0) - 3.0) < 0.2 && fabs(f.coef(1) - 2.0) < 0.1, "斜率/截距接近");
+    check(f.r2() > 0.99 && f.r2() <= 1.0, "r2 接近 1（噪声数据下 0.99 以上）");
+    check(f.poly(qx, qy, 5, 2) == 2, "二次拟合");
+    printf("   二次：%.4f + %.4f x + %.4f x²（r2 %.6f）\n", f.coef(0), f.coef(1),
+           f.coef(2), f.r2());
+    check(fabs(f.coef(0) - 1.0) < 1e-9 && fabs(f.coef(2) - 0.5) < 1e-9, "二次系数");
+    check(fabs(f.value_at(3.0) - 5.5) < 1e-9, "value_at(3) = 5.5");
+}
+
+int main(void)
+{
+    do_solve();
+    do_ode();
+    do_optimize();
+    do_least();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

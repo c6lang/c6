@@ -1,0 +1,286 @@
+/* std/core/ode：常微分方程组定步长积分（Euler / 中点 / 四阶 Runge-Kutta）。
+ *
+ *     import std.core.ode;
+ *
+ *     double y[1] = { 1.0 };            // 初值 y' = y, y(0) = 1
+ *     double work[5] = { 0 };
+ *     Ode o = { 0 };
+ *     o.setup(f_yesc, 0, 1, y, work);   // 方法：setup / step / integrate
+ *     o.integrate(0.0, 0.01, 100);      // 走到 t = 1.0
+ *     o.at(0);                          // ≈ e
+ *
+ * 状态（`y`）与五个工作缓冲（`work`，长度 `5n`：一个中间状态 + 四个导数）都由调用方
+ * 给，模块自己不分配内存。
+ *
+ * 约定：
+ *
+ * - `o.setup(fn, ctx, dim, y, work)`：`fn` 是 `void (*)(double t, const double *y,
+ *   double *dy, int n, void *ctx)`（把导数写进 `dy`），`y` 是初值（会被就地推进）；
+ * - `o.step(t, dt, method)` 走一步并返回新的 `t`；`method` 取 `ODE_EULER`(0)、
+ *   `ODE_MIDPOINT`(1)、`ODE_RK4`(2)，`dt` 可以为负（往回积分）；
+ * - `o.integrate(t0, dt, steps)` 连走 `steps` 步，返回终点 `t`，非法参数返回 -1；
+ * - `o.at(i)` 取第 i 个分量（越界返回 0），`o.time()` 当前 `t`，`o.dim()` 维数，
+ *   `o.steps()` 累计步数，`o.evaluations()` 累计调用导函数次数；
+ * - 精度：Euler 一阶、中点二阶、RK4 四阶（`dt` 减半误差大约降 2/4/16 倍）；
+ * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ */
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+module std.core.ode;
+import std.core.types;
+import std.text.str;
+
+enum {
+    ODE_EULER = 0,
+    ODE_MIDPOINT = 1,
+    ODE_RK4 = 2
+};
+
+typedef void (*OdeFn)(double t, const double *y, double *dy, int n, void *ctx);
+
+struct Ode {
+    OdeFn f;
+    void *ctx;
+    int n;
+    double *y;
+    double *k1;
+    double *k2;
+    double *k3;
+    double *k4;
+    double *yt;         /* 中间状态（不能和导数缓冲共用，否则耦合方程会算错） */
+    double cur_t;
+    int nsteps;
+    long neval;
+};
+
+int setup(Ode *o, OdeFn fn, void *ctx, int dim, void *y, void *work)
+{
+    if (!o || !fn || dim <= 0 || !y || !work)
+        return -1;
+    memset(o, 0, sizeof *o);
+    o->f = fn;
+    o->ctx = ctx;
+    o->n = dim;
+    o->y = (double *)y;
+    o->k1 = (double *)work;
+    o->k2 = o->k1 + dim;
+    o->k3 = o->k2 + dim;
+    o->k4 = o->k3 + dim;
+    o->yt = o->k4 + dim;
+    memset(work, 0, sizeof(double) * (size_t)(5 * dim));
+    o->cur_t = 0.0;
+    return 1;
+}
+
+int dim(Ode *o)
+{
+    return o ? o->n : 0;
+}
+
+double time_of(Ode *o)
+{
+    return o ? o->cur_t : 0.0;
+}
+
+int steps(Ode *o)
+{
+    return o ? o->nsteps : 0;
+}
+
+long evaluations(Ode *o)
+{
+    return o ? o->neval : 0;
+}
+
+double at(Ode *o, int i)
+{
+    if (!o || !o->y || i < 0 || i >= o->n)
+        return 0.0;
+    return o->y[i];
+}
+
+void set_component(Ode *o, int i, double v)
+{
+    if (!o || !o->y || i < 0 || i >= o->n)
+        return;
+    o->y[i] = v;
+}
+
+static void od_call(Ode *o, double t, double *y, double *out)
+{
+    o->f(t, y, out, o->n, o->ctx);
+    o->neval++;
+}
+
+double step(Ode *o, double t, double dt, int method)
+{
+    int i = 0;
+
+    if (!o || !o->f || !o->y)
+        return -1.0;
+    if (method == ODE_EULER) {
+        od_call(o, t, o->y, o->k1);
+        for (i = 0; i < o->n; i++)
+            o->y[i] += dt * o->k1[i];
+    } else if (method == ODE_MIDPOINT) {
+        od_call(o, t, o->y, o->k1);
+        for (i = 0; i < o->n; i++)
+            o->yt[i] = o->y[i] + 0.5 * dt * o->k1[i];
+        od_call(o, t + 0.5 * dt, o->yt, o->k2);
+        for (i = 0; i < o->n; i++)
+            o->y[i] += dt * o->k2[i];
+    } else if (method == ODE_RK4) {
+        od_call(o, t, o->y, o->k1);
+        for (i = 0; i < o->n; i++)
+            o->yt[i] = o->y[i] + 0.5 * dt * o->k1[i];
+        od_call(o, t + 0.5 * dt, o->yt, o->k2);
+        for (i = 0; i < o->n; i++)
+            o->yt[i] = o->y[i] + 0.5 * dt * o->k2[i];
+        od_call(o, t + 0.5 * dt, o->yt, o->k3);
+        for (i = 0; i < o->n; i++)
+            o->yt[i] = o->y[i] + dt * o->k3[i];
+        od_call(o, t + dt, o->yt, o->k4);
+        for (i = 0; i < o->n; i++)
+            o->y[i] += dt / 6.0
+                       * (o->k1[i] + 2.0 * o->k2[i] + 2.0 * o->k3[i] + o->k4[i]);
+    } else {
+        return -1.0;
+    }
+    o->cur_t = t + dt;
+    o->nsteps++;
+    return o->cur_t;
+}
+
+double integrate(Ode *o, double t0, double dt, int nsteps)
+{
+    int i = 0;
+    double t = t0;
+
+    if (!o || !o->f || dt == 0.0 || nsteps < 0)
+        return -1.0;
+    o->cur_t = t0;
+    for (i = 0; i < nsteps; i++) {
+        t = o->step(t, dt, ODE_RK4);
+        if (t < 0.0 && t == -1.0)
+            return -1.0;
+    }
+    return t;
+}
+
+double integrate_with(Ode *o, double t0, double dt, int nsteps, int method)
+{
+    int i = 0;
+    double t = t0;
+
+    if (!o || !o->f || dt == 0.0 || nsteps < 0)
+        return -1.0;
+    o->cur_t = t0;
+    for (i = 0; i < nsteps; i++)
+        t = o->step(t, dt, method);
+    return t;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void f_scalar(double t, const double *y, double *dy, int n, void *ctx)
+{
+    (void)t;
+    (void)n;
+    (void)ctx;
+    dy[0] = y[0];                       /* y' = y */
+}
+
+static void f_harm(double t, const double *y, double *dy, int n, void *ctx)
+{
+    (void)t;
+    (void)n;
+    (void)ctx;
+    dy[0] = y[1];                       /* y'' = -y */
+    dy[1] = -y[0];
+}
+
+static void f_lin(double t, const double *y, double *dy, int n, void *ctx)
+{
+    (void)t;
+    (void)n;
+    (void)ctx;
+    dy[0] = 1.0;                        /* y' = 1 → y = t */
+}
+
+test "ode：RK4 与误差阶" {
+    double y[1] = { 1.0 };
+    double work[5] = { 0 };
+    Ode o = { 0 };
+    double exact = 2.718281828459045235;
+    double rk4 = 0.0, mid = 0.0, eul = 0.0;
+
+    if (o.setup(f_scalar, 0, 1, y, work) != 1)
+        return err(1, "setup 失败");
+    if (o.dim() != 1 || o.at(0) != 1.0)
+        return err(2, "初始状态不对");
+    if (o.integrate(0.0, 0.01, 100) < 0.99)
+        return err(3, "integrate 应该走到 t=1");
+    rk4 = fabs(o.at(0) - exact);
+    if (rk4 > 1e-9)
+        return err(4, "RK4 误差应该很小");
+    if (o.steps() != 100 || o.evaluations() != 400)
+        return err(5, "步数/导函数调用次数不对");
+    /* 中点法（二阶）与 Euler（一阶）误差都应该更大 */
+    y[0] = 1.0;
+    o.setup(f_scalar, 0, 1, y, work);
+    o.integrate_with(0.0, 0.01, 100, 1);
+    mid = fabs(o.at(0) - exact);
+    y[0] = 1.0;
+    o.setup(f_scalar, 0, 1, y, work);
+    o.integrate_with(0.0, 0.01, 100, 0);
+    eul = fabs(o.at(0) - exact);
+    if (!(mid > rk4 && eul > mid))
+        return err(6, "精度顺序应该是 RK4 > 中点 > Euler");
+    printf("   e^(1) 误差：RK4 %.3e / 中点 %.3e / Euler %.3e\n", rk4, mid, eul);
+}
+
+test "ode：方程组、反向与边界" {
+    double y[2] = { 1.0, 0.0 };
+    double work[10] = { 0 };
+    Ode o = { 0 };
+
+    /* 简谐振子：y(0)=1, y'(0)=0 → y(t)=cos t，绕一圈回到 1 */
+    if (o.setup(f_harm, 0, 2, y, work) != 1)
+        return err(7, "方程组 setup 失败");
+    if (o.dim() != 2)
+        return err(8, "维数应该是 2");
+    o.integrate(0.0, 0.001, 6284);       /* ≈ 2π */
+    if (fabs(o.at(0) - 1.0) > 1e-3 || fabs(o.at(1)) > 1e-3)
+        return err(9, "绕一圈应该回到 (1, 0)");
+    /* 反向积分回到起点 */
+    o.integrate_with(o.time_of(), -0.001, 6284, 2);
+    if (fabs(o.at(0) - 1.0) > 1e-2)
+        return err(10, "反向积分应该回到初值附近");
+    /* 线性函数：所有方法都精确 */
+    {
+        double z[1] = { 0.0 };
+        double w[5] = { 0 };
+
+        o.setup(f_lin, 0, 1, z, w);
+        o.integrate_with(0.0, 0.5, 4, 0);
+        if (fabs(o.at(0) - 2.0) > 1e-12)
+            return err(11, "y'=1 用 Euler 也应该精确");
+        o.set_component(0, 0.0);
+        o.integrate_with(0.0, 0.5, 4, 2);
+        if (fabs(o.at(0) - 2.0) > 1e-12)
+            return err(12, "y'=1 用 RK4 也应该精确");
+        if (o.at(5) != 0.0)
+            return err(13, "越界访问应该返回 0");
+    }
+    /* 非法参数 */
+    if (o.step(0.0, 0.1, 9) != -1.0)
+        return err(14, "未知方法应该 -1");
+    if (o.integrate(0.0, 0.0, 10) != -1.0)
+        return err(15, "dt=0 应该 -1");
+    if (o.setup(f_lin, 0, 0, y, work) != -1)
+        return err(16, "维数 0 应该 -1");
+}

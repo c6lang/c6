@@ -2406,6 +2406,31 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（305 个模块、0 failure）、`make std-async2`（32 条自检全过）、
 `make check-all`。
 
+### 11.86 标准库第七十四批（solve / ode / optimize / least）
+
+第七十四批做「数值方法与拟合」：求根、定步长积分、一维极值与最小二乘。全部是
+`double`，四个模块都要 `-lm`。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.solve` | 求根 | 三种算法统一返回「1 收敛 / 0 迭代用完 / -1 参数错」，结果走 `root()`/`residual()`/`iters()`；牛顿法用中心差分数值导数（`h = 1e-7·max(1,|x|)`），不需要调用方给导数 |
+| `std.core.ode` | 积分 | 状态 + 工作缓冲都由调用方给；RK4 的**中间状态必须单独一块缓冲**——第一版把 `k2` 同时当「中间状态」和「导数」就地复用，耦合方程（简谐振子）里 `dy[0] = y[1]; dy[1] = -y[0]` 会读到被覆盖的 `y[0]`，绕一圈回不到初值；改成 `5n` 缓冲（1 个中间状态 + 4 个导数）后正常 |
+| `std.core.optimize` | 一维极小 | 黄金分割/三分法/网格细化；测试函数不要加常数偏移——`(x-c)²+1` 在极小点附近两点的函数值会因相对精度变成「相等」，区间就停在 1e-8 量级（这是测试写法的问题，不是算法的问题） |
+| `std.core.least` | 拟合 | 正规方程 + 部分主元高斯消元（奇异判据 `1e-12`）；系数最多 8 个；`rss`/`r2` 在拟合时一次算好；`y` 为常数序列时 `r2` 记 1 |
+
+清理：`poly()` 里写过一段只为「占位」的空循环，已删掉；`eval` 这个通用名改成
+`value_at`，免得和别的模块撞名。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.solve`=0x6131、
+`std.core.ode`=0x6132、`std.core.optimize`=0x6133、`std.core.least`=0x6134；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-math3` 与 `STD_MATH3_SRCS`，`test-all`/`check-all` 都带上
+它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条，另需 `-lm`）。示例
+`examples/stdmath3.c6` 四节（25 条自检）。
+
+验收：`make stdtest`（309 个模块、0 failure）、`make std-math3`（25 条自检全过）、
+`make check-all`。
+
+
 
 
 

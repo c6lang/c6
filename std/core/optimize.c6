@@ -1,0 +1,270 @@
+/* std/core/optimize：一维极值搜索（黄金分割、三分法、网格 + 细化）。
+ *
+ *     import std.core.optimize;
+ *
+ *     Optimize o = { 0 };
+ *     o.setup(obj, 0, 200);             // 方法：setup / golden / ternary / grid
+ *     o.golden(-5.0, 5.0);              // 求极小
+ *     o.best_x();                       // 极值点
+ *     o.best_value();                   // 极小值
+ *
+ * 三个算法都求**极小**（求极大请把目标函数取负）。返回 1 收敛 / 0 迭代用完 / -1 参数非法。
+ *
+ * 约定：
+ *
+ * - `o.setup(f, ctx, maxiter)`：`f` 是 `double (*)(double x, void *ctx)`，`maxiter<=0` 用 200；
+ * - `o.golden(lo, hi)` 黄金分割（区间按 0.618 收缩），只假设区间内单峰；
+ * - `o.ternary(lo, hi)` 三分法，收敛到 `1e-9` 的区间宽度（凸函数更快，但要两次取值）；
+ * - `o.grid(lo, hi, n)` 先等分 `n` 段取最小点，再在相邻格子里黄金分割细化；
+ * - `o.best_x()` 极值点、`o.best_value()` 极值、`o.iters()` 迭代次数、`o.error()`（0 正常、-1 参数）；
+ * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ */
+#include <math.h>
+#include <string.h>
+
+module std.core.optimize;
+import std.core.types;
+import std.text.str;
+
+typedef double (*ObjFn)(double x, void *ctx);
+
+struct Optimize {
+    ObjFn f;
+    void *ctx;
+    int maxiter;
+    double bx;      /* 极值点 */
+    double bf;      /* 极值 */
+    int n_it;
+    int ec;
+};
+
+int setup(Optimize *o, ObjFn fn, void *ctx, int maxiter)
+{
+    if (!o || !fn)
+        return -1;
+    memset(o, 0, sizeof *o);
+    o->f = fn;
+    o->ctx = ctx;
+    o->maxiter = maxiter > 0 ? maxiter : 200;
+    return 1;
+}
+
+double best_x(Optimize *o)
+{
+    return o ? o->bx : 0.0;
+}
+
+double best_value(Optimize *o)
+{
+    return o ? o->bf : 0.0;
+}
+
+int iters(Optimize *o)
+{
+    return o ? o->n_it : 0;
+}
+
+int error(Optimize *o)
+{
+    return o ? o->ec : -1;
+}
+
+static double op_eval(Optimize *o, double v)
+{
+    return o->f(v, o->ctx);
+}
+
+int golden(Optimize *o, double lo, double hi)
+{
+    int i = 0;
+    double a = lo, b = hi;
+    const double invphi = 0.6180339887498949;
+
+    if (!o || !o->f || !(hi > lo))
+        return -1;
+    o->ec = 0;
+    o->n_it = 0;
+    {
+        double c = b - invphi * (b - a);
+        double d = a + invphi * (b - a);
+        double fc = op_eval(o, c), fd = op_eval(o, d);
+
+        for (i = 0; i < o->maxiter; i++) {
+            o->n_it = i + 1;
+            if (fabs(b - a) <= 1e-12 * (fabs(a) > 1.0 ? fabs(a) : 1.0))
+                break;
+            if (fc < fd) {
+                b = d;
+                d = c;
+                fd = fc;
+                c = b - invphi * (b - a);
+                fc = op_eval(o, c);
+            } else {
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + invphi * (b - a);
+                fd = op_eval(o, d);
+            }
+        }
+        if (fc < fd) {
+            o->bx = c;
+            o->bf = fc;
+        } else {
+            o->bx = d;
+            o->bf = fd;
+        }
+    }
+    return 1;
+}
+
+int ternary(Optimize *o, double lo, double hi)
+{
+    int i = 0;
+    double a = lo, b = hi;
+
+    if (!o || !o->f || !(hi > lo))
+        return -1;
+    o->ec = 0;
+    o->n_it = 0;
+    for (i = 0; i < o->maxiter; i++) {
+        double m1 = a + (b - a) / 3.0;
+        double m2 = b - (b - a) / 3.0;
+        double f1 = op_eval(o, m1), f2 = op_eval(o, m2);
+
+        o->n_it = i + 1;
+        if (f1 < f2)
+            b = m2;
+        else
+            a = m1;
+        if (b - a <= 1e-12)
+            break;
+    }
+    o->bx = 0.5 * (a + b);
+    o->bf = op_eval(o, o->bx);
+    return 1;
+}
+
+int grid(Optimize *o, double lo, double hi, int n)
+{
+    int i = 0, best = 0;
+    double step = 0.0, bestx = lo, bestf = 0.0;
+
+    if (!o || !o->f || !(hi > lo) || n < 2)
+        return -1;
+    o->ec = 0;
+    o->n_it = 0;
+    step = (hi - lo) / (double)(n - 1);
+    bestx = lo;
+    bestf = op_eval(o, lo);
+    for (i = 1; i < n; i++) {
+        double v = lo + step * (double)i;
+        double fv = op_eval(o, v);
+
+        o->n_it++;
+        if (fv < bestf) {
+            bestf = fv;
+            bestx = v;
+            best = i;
+        }
+    }
+    /* 在相邻格子里细化 */
+    {
+        double a = lo + step * (double)(best > 0 ? best - 1 : 0);
+        double b = lo + step * (double)(best + 1 < n ? best + 1 : n - 1);
+
+        if (b - a > 0.0) {
+            Optimize inner = *o;
+
+            inner.maxiter = o->maxiter;
+            inner.golden(a, b);
+            if (inner.best_value() < bestf) {
+                bestx = inner.best_x();
+                bestf = inner.best_value();
+            }
+            o->n_it += inner.iters();
+        }
+    }
+    o->bx = bestx;
+    o->bf = bestf;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static double q_parab(double v, void *ctx)
+{
+    double c = *(double *)ctx;
+
+    return (v - c) * (v - c);           /* 极小点在 x = c，最小值 0 */
+}
+
+static double q_quartic(double v, void *ctx)
+{
+    (void)ctx;
+    return (v + 2.0) * (v + 2.0) * (v + 2.0) * (v + 2.0);  /* 极小 x = -2，最小值 0 */
+}
+
+static double q_neg(double v, void *ctx)
+{
+    (void)ctx;
+    return -(v - 1.0) * (v - 1.0);      /* 极大点在 1，求极小会跑到边界 */
+}
+
+test "optimize：黄金分割与三分法" {
+    Optimize o = { 0 };
+    double c = 1.5;
+
+    if (o.setup(q_parab, &c, 300) != 1)
+        return err(1, "setup 失败");
+    if (o.golden(-5.0, 5.0) != 1)
+        return err(2, "golden 应该成功");
+    if (fabs(o.best_x() - 1.5) > 1e-9)
+        return err(3, "极小点应该是 1.5");
+    if (fabs(o.best_value()) > 1e-12)
+        return err(4, "极小值应该是 0");
+    if (o.iters() <= 30)
+        return err(5, "迭代次数太少（说明没真正收缩）");
+    /* 三分法 */
+    if (o.ternary(-5.0, 5.0) != 1 || fabs(o.best_x() - 1.5) > 1e-9)
+        return err(6, "三分法极小点不对");
+    /* 四次函数 */
+    o.setup(q_quartic, 0, 300);
+    if (o.golden(-6.0, 2.0) != 1 || fabs(o.best_x() + 2.0) > 1e-8)
+        return err(7, "四次函数极小点应该是 -2");
+    if (fabs(o.best_value()) > 1e-12)
+        return err(8, "四次函数极小值应该是 0");
+    /* 非法区间 */
+    if (o.golden(1.0, 1.0) != -1 || o.ternary(2.0, 1.0) != -1)
+        return err(9, "非法区间应该 -1");
+}
+
+test "optimize：网格细化与边界" {
+    Optimize o = { 0 };
+
+    o.setup(q_quartic, 0, 200);
+    if (o.grid(-6.0, 2.0, 8) != 1)
+        return err(10, "grid 应该成功");
+    if (fabs(o.best_x() + 2.0) > 1e-6)
+        return err(11, "网格细化后应该在 -2");
+    o.setup(q_neg, 0, 100);
+    o.golden(-3.0, 3.0);
+    /* 单调/单峰都为负的情况：极小会落到边界附近 */
+    if (o.best_x() < -3.1 || o.best_x() > 3.1)
+        return err(12, "结果应该落在区间内");
+    if (o.grid(-3.0, 3.0, 1) != -1)
+        return err(13, "n<2 应该 -1");
+    if (o.setup(0, 0, 10) != -1)
+        return err(14, "空函数应该 -1");
+    /* 迭代上限生效 */
+    {
+        double cc = 1.5;
+
+        o.setup(q_parab, &cc, 5);
+    }
+    o.golden(-5.0, 5.0);
+    if (o.iters() != 5)
+        return err(15, "maxiter=5 应该只走 5 次");
+}

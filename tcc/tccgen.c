@@ -13010,6 +13010,10 @@ static const struct C6ErrStdSlot {
     { "std.os.asio",            C6_ERR_SLOT_STD + 302 },
     { "std.core.retry",         C6_ERR_SLOT_STD + 303 },
     { "std.core.awaitgroup",    C6_ERR_SLOT_STD + 304 },
+    { "std.core.solve",         C6_ERR_SLOT_STD + 305 },
+    { "std.core.ode",           C6_ERR_SLOT_STD + 306 },
+    { "std.core.optimize",      C6_ERR_SLOT_STD + 307 },
+    { "std.core.least",         C6_ERR_SLOT_STD + 308 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

@@ -1,0 +1,282 @@
+/* std/core/solve：一元方程求根（二分、牛顿、割线，带迭代次数与残差）。
+ *
+ *     import std.core.solve;
+ *
+ *     Solve s = { 0 };
+ *     s.setup(f, 0, 1e-12, 100);        // 方法：setup / bisect / newton / secant
+ *     s.bisect(1.0, 2.0);               // √2
+ *     s.root();                         // 1.414213562…
+ *     s.iters();                        // 迭代次数
+ *
+ * 三种算法都返回「1 收敛 / 0 迭代用完 / -1 参数非法」，结果通过 `s.root()` 与
+ * `s.residual()` 取。牛顿法用**数值导数**（中心差分），所以只需要给函数本身。
+ *
+ * 约定：
+ *
+ * - `s.setup(f, ctx, tol, maxiter)`：`f` 是 `double (*)(double x, void *ctx)`，
+ *   `tol` 是 |f(x)| 的收敛阈值（`<= 0` 用 1e-12），`maxiter <= 0` 用 100；
+ * - `s.bisect(a, b)` 要求 `f(a)` 与 `f(b)` **异号**（相等端点直接取端点）；
+ * - `s.newton(x0)` 数值导数 `h = 1e-7 × max(1, |x|)`，导数接近 0 视为失败（返回 0）；
+ * - `s.secant(x0, x1)` 不需要导数，两点重合返回 -1；
+ * - `s.root()` 最后一次的根，`s.residual()` 它的函数值，`s.iters()` 迭代次数，
+ *   `s.error()` 失败原因（0 正常、-1 参数、-2 导数太小、-3 区间没有异号）；
+ * - 全部是 `double`，需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ */
+#include <math.h>
+#include <string.h>
+
+module std.core.solve;
+import std.core.types;
+import std.text.str;
+
+typedef double (*SolveFn)(double x, void *ctx);
+
+struct Solve {
+    SolveFn f;
+    void *ctx;
+    double tol;
+    int maxiter;
+    double rx;      /* 根 */
+    double rfx;     /* 残差 */
+    int n_it;       /* 迭代次数 */
+    int ec;         /* 错误码 */
+};
+
+int setup(Solve *s, SolveFn fn, void *ctx, double tol, int maxiter)
+{
+    if (!s || !fn)
+        return -1;
+    memset(s, 0, sizeof *s);
+    s->f = fn;
+    s->ctx = ctx;
+    s->tol = (tol > 0.0) ? tol : 1e-12;
+    s->maxiter = (maxiter > 0) ? maxiter : 100;
+    return 1;
+}
+
+double root(Solve *s)
+{
+    return s ? s->rx : 0.0;
+}
+
+double residual(Solve *s)
+{
+    return s ? s->rfx : 0.0;
+}
+
+int iters(Solve *s)
+{
+    return s ? s->n_it : 0;
+}
+
+int error(Solve *s)
+{
+    return s ? s->ec : -1;
+}
+
+static double sv_eval(Solve *s, double x)
+{
+    return s->f(x, s->ctx);
+}
+
+int bisect(Solve *s, double a, double b)
+{
+    int i = 0;
+    double fa = 0.0, fb = 0.0;
+
+    if (!s || !s->f)
+        return -1;
+    s->ec = 0;
+    s->n_it = 0;
+    fa = sv_eval(s, a);
+    fb = sv_eval(s, b);
+    if (fa == 0.0) {
+        s->rx = a;
+        s->rfx = fa;
+        return 1;
+    }
+    if (fb == 0.0) {
+        s->rx = b;
+        s->rfx = fb;
+        return 1;
+    }
+    if ((fa > 0.0) == (fb > 0.0)) {
+        s->ec = -3;
+        s->rx = a;
+        s->rfx = fa;
+        return -1;
+    }
+    for (i = 0; i < s->maxiter; i++) {
+        double mid = 0.5 * (a + b);
+        double fm = 0.0;
+
+        fm = sv_eval(s, mid);
+        s->rx = mid;
+        s->rfx = fm;
+        s->n_it = i + 1;
+        if (fabs(fm) <= s->tol)
+            return 1;
+        if ((fm > 0.0) == (fa > 0.0)) {
+            a = mid;
+            fa = fm;
+        } else {
+            b = mid;
+            fb = fm;
+        }
+    }
+    return 0;
+}
+
+int newton(Solve *s, double x0)
+{
+    int i = 0;
+    double x = x0;
+
+    if (!s || !s->f)
+        return -1;
+    s->ec = 0;
+    s->n_it = 0;
+    for (i = 0; i < s->maxiter; i++) {
+        double fx = sv_eval(s, x);
+        double h = 1e-7 * (fabs(x) > 1.0 ? fabs(x) : 1.0);
+        double d = (sv_eval(s, x + h) - sv_eval(s, x - h)) / (2.0 * h);
+        double xn = 0.0;
+
+        s->rx = x;
+        s->rfx = fx;
+        s->n_it = i + 1;
+        if (fabs(fx) <= s->tol)
+            return 1;
+        if (fabs(d) < 1e-14) {
+            s->ec = -2;
+            return 0;
+        }
+        xn = x - fx / d;
+        if (fabs(xn - x) <= 1e-15 * (fabs(x) > 1.0 ? fabs(x) : 1.0)) {
+            s->rx = xn;
+            s->rfx = sv_eval(s, xn);
+            return fabs(s->rfx) <= s->tol ? 1 : 0;
+        }
+        x = xn;
+    }
+    return 0;
+}
+
+int secant(Solve *s, double x0, double x1)
+{
+    int i = 0;
+    double a = x0, b = x1;
+    double fa = 0.0, fb = 0.0;
+
+    if (!s || !s->f)
+        return -1;
+    s->ec = 0;
+    s->n_it = 0;
+    if (a == b)
+        return -1;
+    fa = sv_eval(s, a);
+    fb = sv_eval(s, b);
+    for (i = 0; i < s->maxiter; i++) {
+        double next = 0.0;
+
+        s->rx = b;
+        s->rfx = fb;
+        s->n_it = i + 1;
+        if (fabs(fb) <= s->tol)
+            return 1;
+        if (fb == fa) {
+            s->ec = -2;
+            return 0;
+        }
+        next = b - fb * (b - a) / (fb - fa);
+        a = b;
+        fa = fb;
+        b = next;
+        fb = sv_eval(s, b);
+    }
+    s->rx = b;
+    s->rfx = fb;
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static double f_sq(double x, void *ctx)
+{
+    (void)ctx;
+    return x * x - 2.0;
+}
+
+static double f_cos(double x, void *ctx)
+{
+    (void)ctx;
+    return cos(x) - x;
+}
+
+static double f_flat(double x, void *ctx)
+{
+    (void)ctx;
+    return x * x + 1.0;                 /* 永远为正，二分找不到根 */
+}
+
+static double f_cube(double x, void *ctx)
+{
+    (void)ctx;
+    return x * x * x - x - 2.0;         /* 导数在 0 附近为 -1，不会退化 */
+}
+
+test "solve：二分与牛顿" {
+    Solve s = { 0 };
+
+    if (s.setup(f_sq, 0, 1e-12, 200) != 1)
+        return err(1, "setup 失败");
+    if (s.bisect(1.0, 2.0) != 1)
+        return err(2, "二分应该收敛");
+    if (fabs(s.root() - 1.4142135623730951) > 1e-9)
+        return err(3, "二分根应该是 √2");
+    if (fabs(s.residual()) > 1e-9 || s.iters() <= 20)
+        return err(4, "残差或迭代次数不对");
+    /* 更宽的区间 */
+    if (s.bisect(1.0, 3.0) != 1 || fabs(s.root() - 1.4142135623730951) > 1e-9)
+        return err(5, "更宽区间二分应该仍能收敛");
+    /* 牛顿法 */
+    if (s.newton(1.0) != 1)
+        return err(6, "牛顿法应该收敛");
+    if (fabs(s.root() - 1.4142135623730951) > 1e-12)
+        return err(7, "牛顿法应该更精确");
+    /* 割线法 */
+    if (s.secant(1.0, 2.0) != 1)
+        return err(8, "割线法应该收敛");
+    if (fabs(s.root() - 1.4142135623730951) > 1e-10)
+        return err(9, "割线法精度不够");
+    if (s.iters() <= 0)
+        return err(10, "迭代次数应该为正");
+}
+
+test "solve：失败路径与其它函数" {
+    Solve s = { 0 };
+
+    s.setup(f_flat, 0, 1e-12, 50);
+    if (s.bisect(-1.0, 1.0) != -1 || s.error() != -3)
+        return err(11, "同号区间应该返回 -3");
+    s.setup(f_sq, 0, 1e-12, 10);
+    if (s.bisect(0.0, 10.0) != 0)
+        return err(12, "迭代次数不够应该返回 0");
+    /* cos(x) = x 的根 0.739085… */
+    s.setup(f_cos, 0, 1e-12, 100);
+    if (s.newton(0.5) != 1)
+        return err(13, "cos 方程应该收敛");
+    if (fabs(s.root() - 0.7390851332151607) > 1e-10)
+        return err(14, "cos 方程的根不对");
+    /* 三次方程 x³-x-2 = 0 的实根 1.5213797… */
+    s.setup(f_cube, 0, 1e-13, 100);
+    if (s.secant(1.0, 2.0) != 1 || fabs(s.root() - 1.5213797068045676) > 1e-9)
+        return err(15, "三次方程的根不对");
+    /* 参数错误 */
+    if (s.secant(2.0, 2.0) != -1)
+        return err(16, "两点重合应该 -1");
+    if (s.setup(0, 0, 1e-9, 10) != -1)
+        return err(17, "空函数应该 -1");
+}

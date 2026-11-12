@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十四批（数值方法与拟合）**：`std.core.solve`（二分/牛顿/割线求根）、
+  `std.core.ode`（Euler/中点/RK4 定步长积分）、`std.core.optimize`（黄金分割/三分/
+  网格求一维极小）、`std.core.least`（直线与多项式最小二乘），集成示例
+  `examples/stdmath3.c6`（`make std-math3`）。错误号段 `std.core.solve`=0x6131 …
+  `std.core.least`=0x6134（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十三批（async 之上再盖一层）**：`std.core.executor`（事件循环执行器）、
   `std.os.asio`（异步按行读）、`std.core.retry`（指数退避重试）、`std.core.awaitgroup`
   （完成计数组），集成示例 `examples/stdasync2.c6`（`make std-async2`）。错误号段

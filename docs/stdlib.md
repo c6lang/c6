@@ -337,6 +337,11 @@
 | `std/os/asio.c6` | `std.os.asio` | 异步按行读（**方法**：`a.init`/`a.watch`/`a.pump`/`a.next_line`/`a.drain`/`a.pending`/`a.is_eof`）：reactor 可读事件里读一次并切行交回调（`char[:]`，去掉 `\r\n`），无回调时把行留给 `next_line` |
 | `std/core/retry.c6` | `std.core.retry` | 重试退避策略（**方法**：`r.init`/`r.fail`/`r.due`/`r.next_at`/`r.delay_for`/`r.succeed`/`r.reset`/`r.attempts`/`r.gave_up`）：`base × 2^(n-1)` 封顶 `max`，`fail(now)` 返回等待毫秒并臂上下次，次数用完返回 -1 |
 | `std/core/awaitgroup.c6` | `std.core.awaitgroup` | 异步完成计数组（**方法**：`g.init`/`g.add`/`g.done`/`g.fail`/`g.bind`/`g.unbind`/`g.remaining`/`g.total`/`g.is_done`/`g.failed`/`g.code`/`g.reset`）：归零时把绑定的 `Future` 结算（值 = 总数，有失败则 reject 第一个错误码） |
+| `std/core/solve.c6` | `std.core.solve` | 一元方程求根（**方法**：`s.setup`/`s.bisect`/`s.newton`/`s.secant`/`s.root`/`s.residual`/`s.iters`/`s.error`）：二分（要异号区间）、牛顿（中心差分数值导数）、割线；返回 1 收敛 / 0 迭代用完 / -1 参数错 |
+| `std/core/ode.c6` | `std.core.ode` | 常微分方程组定步长积分（**方法**：`o.setup`/`o.step`/`o.integrate`/`o.integrate_with`/`o.at`/`o.time_of`/`o.steps`/`o.evaluations`）：Euler/中点/RK4，状态与 `5n` 工作缓冲都由调用方给 |
+| `std/core/optimize.c6` | `std.core.optimize` | 一维极小（**方法**：`o.setup`/`o.golden`/`o.ternary`/`o.grid`/`o.best_x`/`o.best_value`/`o.iters`）：黄金分割、三分法、网格扫描 + 相邻格细化 |
+| `std/core/least.c6` | `std.core.least` | 最小二乘拟合（**方法**：`f.line`/`f.poly`/`f.value_at`/`f.coef`/`f.rss`/`f.r2`/`f.degree`/`f.npoints`）：正规方程 + 部分主元高斯消元，次数 ≤ 7，给残差平方和与决定系数 |
+
 
 
 
@@ -470,6 +475,7 @@
 | `examples/stdmatch.c6` | （无模块） | 第七十一批（匹配与对齐）的拼装示例（`make std-match`）：多模式扫描、滚动哈希查找、区间集合合并/挖洞、GATTACA 序列比对 |
 | `examples/stdasync.c6` | （无模块） | 第七十二批（异步编程基础）的拼装示例（`make std-async`）：Future 回调与 all/any、定时器堆、协作式任务、poll 事件循环 + 定时器 |
 | `examples/stdasync2.c6` | （无模块） | 第七十三批（async 之上再盖一层）的拼装示例（`make std-async2`）：事件循环 tick、按行异步读、退避重试、完成计数组 |
+| `examples/stdmath3.c6` | （无模块） | 第七十四批（数值方法与拟合）的拼装示例（`make std-math3`）：三种求根、RK4/Euler 对比、黄金分割/三分/网格求极小、直线与二次最小二乘 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -656,6 +662,10 @@ std/core/executor.c6       35 test(s), 0 failure(s)
 std/os/asio.c6             33 test(s), 0 failure(s)
 std/core/retry.c6          24 test(s), 0 failure(s)
 std/core/awaitgroup.c6     26 test(s), 0 failure(s)
+std/core/solve.c6          24 test(s), 0 failure(s)
+std/core/ode.c6            24 test(s), 0 failure(s)
+std/core/optimize.c6       24 test(s), 0 failure(s)
+std/core/least.c6          24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4195,6 +4205,17 @@ make std-async2
 `gamma`；`Retry` 连失败 5 次打印 100/200/400/800/1000ms 的退避曲线；`AwaitGroup`
 三个任务收尾后把 Future 结算成 3，再用 `fail(-4)` 演示失败码。
 
+### 集成示例：`examples/stdmath3.c6`
+
+```sh
+make std-math3
+```
+
+四节都用方法：`Solve` 用二分（42 次）、牛顿（6 次）与割线分别求 √2 并打印残差；
+`Ode` 对 `y'=y` 走 100 步 RK4（误差 2.2e-10）再对比 Euler（1.3e-2）；`Optimize` 用
+黄金分割、三分法与网格细化找 `0.75` 处的极小；`Fit` 先拟合带噪直线（打印 rss/r2）
+再拟合抛物线并 `value_at(3)`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4337,6 +4358,8 @@ make std-async2
   （自带自检）。
 * `make std-async2`：`examples/stdasync2.c6`，第七十三批（async 之上再盖一层）模块的拼装
   示例（自带自检）。
+* `make std-math3`：`examples/stdmath3.c6`，第七十四批（数值方法与拟合）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
