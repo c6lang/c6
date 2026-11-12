@@ -1,0 +1,362 @@
+/* std/text/inverted：倒排索引（词 → 文档列表 + 词频，支持单词查询与 AND 查询）。
+ *
+ *     import std.text.inverted;
+ *
+ *     TermSlot terms[32] = { { { 0, 0 }, 0 } };
+ *     Posting plist[64] = { { 0, 0, 0 } };
+ *     InvIndex ix = { 0 };
+ *     ix.init(terms, 32, plist, 64);          // 方法：init / add_doc / search
+ *     ix.add_doc(1, toks, 3);                 // toks 是 char[:] 数组
+ *     int out[8] = { 0 };
+ *     ix.search(S("go"), out, 8);             // 命中的文档 id
+ *     ix.df(S("go"));                         // 出现在几个文档里
+ *
+ * 两套结构：词槽（`TermSlot`：词 + 倒排表头）和倒排项（`Posting`：文档 id、词频、
+ * 同义词的下一个倒排项），都用调用方给的数组，零分配、零拷贝（词只存 slice）。
+ *
+ * 约定：
+ *
+ * - `ix.init(term_buf, tcap, post_buf, pcap)` 清空索引；词槽/倒排项满了之后
+ *   `add_doc` 返回 -1（已经加进去的部分保留）；
+ * - `ix.add_doc(doc_id, tokens, ntokens)` 把一个文档的词逐个计入（同一个词出现多次
+ *   就累加 `tf`），返回 1；
+ * - `ix.search(term, out, outcap)` 返回命中文档数（截断到 `outcap`）；结果顺序是
+ *   **倒排表插入顺序**（也就是文档加入顺序）；
+ * - `ix.df(term)` 文档频率，`ix.tf(term, doc)` 某个词在某个文档里的词频（没有返回 0）；
+ * - `ix.and_query(terms, nterms, out, outcap)` 求交集（先挑 `df` 最小的词扫，其余词
+ *   用 `tf` 过滤），返回命中文档数；
+ * - `ix.terms()` 词槽个数、`ix.postings()` 倒排项个数、`ix.docs()` 见过的最大文档号 + 1；
+ * - `ix.clear()` 清空；`ix.slot(i)` 取第 i 个词槽（词的 slice 与表头）。
+ * - 词比较按字节（大小写敏感），需要忽略大小写请先自己归一化。
+ */
+#include <string.h>
+
+module std.text.inverted;
+import std.core.types;
+import std.text.str;
+
+struct TermSlot {
+    Str text;
+    int head;       /* 倒排表头（-1 表示没有） */
+};
+
+struct Posting {
+    int doc;
+    int tf;
+    int next;       /* 同词的下一个倒排项（-1 结束） */
+};
+
+struct InvIndex {
+    TermSlot *slots;    /* 字段名避开 terms() 方法 */
+    int tcap;
+    int nterms;
+    Posting *post;
+    int pcap;
+    int npost;
+    int ndocs;
+};
+
+int init(InvIndex *ix, void *term_buf, int tcap, void *post_buf, int pcap)
+{
+    if (!ix || !term_buf || tcap <= 0 || !post_buf || pcap <= 0)
+        return -1;
+    memset(ix, 0, sizeof *ix);
+    memset(term_buf, 0, sizeof(TermSlot) * (size_t)tcap);
+    memset(post_buf, 0, sizeof(Posting) * (size_t)pcap);
+    ix->slots = (TermSlot *)term_buf;
+    ix->tcap = tcap;
+    ix->post = (Posting *)post_buf;
+    ix->pcap = pcap;
+    return 1;
+}
+
+int clear(InvIndex *ix)
+{
+    if (!ix || !ix->slots)
+        return -1;
+    memset(ix->slots, 0, sizeof(TermSlot) * (size_t)ix->tcap);
+    memset(ix->post, 0, sizeof(Posting) * (size_t)ix->pcap);
+    ix->nterms = 0;
+    ix->npost = 0;
+    ix->ndocs = 0;
+    return 1;
+}
+
+int terms(InvIndex *ix)
+{
+    return ix ? ix->nterms : 0;
+}
+
+int postings(InvIndex *ix)
+{
+    return ix ? ix->npost : 0;
+}
+
+int docs(InvIndex *ix)
+{
+    return ix ? ix->ndocs : 0;
+}
+
+int slot(InvIndex *ix, int i, Str *out, int *head)
+{
+    if (!ix || !ix->slots || i < 0 || i >= ix->nterms)
+        return 0;
+    if (out)
+        *out = ix->slots[i].text;
+    if (head)
+        *head = ix->slots[i].head;
+    return 1;
+}
+
+static int iv_same(Str a, Str b)
+{
+    if (!a.s.data || !b.s.data || a.s.len != b.s.len)
+        return 0;
+    return memcmp(a.s.data, b.s.data, (size_t)a.s.len) == 0;
+}
+
+static int iv_find(InvIndex *ix, Str term)
+{
+    int i = 0;
+
+    for (i = 0; i < ix->nterms; i++) {
+        if (iv_same(ix->slots[i].text, term))
+            return i;
+    }
+    return -1;
+}
+
+static int iv_intern(InvIndex *ix, char[:] term)
+{
+    int i = iv_find(ix, (Str){ term });
+
+    if (i >= 0)
+        return i;
+    if (ix->nterms >= ix->tcap)
+        return -1;
+    i = ix->nterms++;
+    ix->slots[i].text = (Str){ term };
+    ix->slots[i].head = -1;
+    return i;
+}
+
+int add_doc(InvIndex *ix, int doc, Str *tokens, int ntokens)
+{
+    int i = 0;
+
+    if (!ix || !ix->slots || !tokens || ntokens < 0 || doc < 0)
+        return -1;
+    if (doc >= ix->ndocs)
+        ix->ndocs = doc + 1;
+    for (i = 0; i < ntokens; i++) {
+        int t = iv_intern(ix, (char[:]){ tokens[i].s.data, tokens[i].s.len });
+        int p = 0;
+
+        if (t < 0)
+            return -1;
+        /* 该词在本文档已有倒排项就累加 tf */
+        for (p = ix->slots[t].head; p >= 0; p = ix->post[p].next) {
+            if (ix->post[p].doc == doc) {
+                ix->post[p].tf++;
+                break;
+            }
+        }
+        if (p >= 0)
+            continue;
+        if (ix->npost >= ix->pcap)
+            return -1;
+        p = ix->npost++;
+        ix->post[p].doc = doc;
+        ix->post[p].tf = 1;
+        ix->post[p].next = ix->slots[t].head;
+        ix->slots[t].head = p;
+    }
+    return 1;
+}
+
+int df(InvIndex *ix, char[:] term)
+{
+    int t = 0, p = 0, n = 0;
+
+    if (!ix || !ix->slots)
+        return 0;
+    t = iv_find(ix, (Str){ term });
+    if (t < 0)
+        return 0;
+    for (p = ix->slots[t].head; p >= 0; p = ix->post[p].next)
+        n++;
+    return n;
+}
+
+int tf(InvIndex *ix, char[:] term, int doc)
+{
+    int t = 0, p = 0;
+
+    if (!ix || !ix->slots)
+        return 0;
+    t = iv_find(ix, (Str){ term });
+    if (t < 0)
+        return 0;
+    for (p = ix->slots[t].head; p >= 0; p = ix->post[p].next) {
+        if (ix->post[p].doc == doc)
+            return ix->post[p].tf;
+    }
+    return 0;
+}
+
+int search(InvIndex *ix, char[:] term, int *out, int outcap)
+{
+    int t = 0, p = 0, n = 0;
+
+    if (!ix || !ix->slots || !out || outcap <= 0 || !term.data)
+        return -1;
+    t = iv_find(ix, (Str){ term });
+    if (t < 0)
+        return 0;
+    for (p = ix->slots[t].head; p >= 0 && n < outcap; p = ix->post[p].next) {
+        out[n] = ix->post[p].doc;
+        n++;
+    }
+    return n;
+}
+
+int and_query(InvIndex *ix, Str *terms_n, int nterms, int *out, int outcap)
+{
+    int best = -1, bestdf = 0;
+    int t = 0, p = 0, n = 0, i = 0;
+
+    if (!ix || !ix->slots || !terms_n || nterms <= 0 || !out || outcap <= 0)
+        return -1;
+    /* 挑 df 最小的词作为驱动 */
+    for (i = 0; i < nterms; i++) {
+        int cur = iv_find(ix, terms_n[i]);
+
+        if (cur < 0)
+            return 0;                   /* 有一个词不存在 → 交集必空 */
+        {
+            int d = df(ix, (char[:]){ terms_n[i].s.data, terms_n[i].s.len });
+
+            if (best < 0 || d < bestdf) {
+                best = cur;
+                bestdf = d;
+            }
+        }
+    }
+    for (p = ix->slots[best].head; p >= 0 && n < outcap; p = ix->post[p].next) {
+        int doc = ix->post[p].doc, ok = 1;
+
+        for (i = 0; i < nterms; i++) {
+            if (tf(ix, (char[:]){ terms_n[i].s.data, terms_n[i].s.len }, doc) <= 0) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) {
+            out[n] = doc;
+            n++;
+        }
+    }
+    (void)t;
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "inverted：建索引与查询" {
+    static TermSlot terms[8] = { { { 0, 0 }, 0 } };
+    static Posting plist[16] = { { 0, 0, 0 } };
+    InvIndex ix = { 0 };
+    Str d1[3] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } },
+                  (Str){ (char[:]){ 0, 0 } } };
+    Str d2[2] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } } };
+    int out[8] = { 0 };
+
+    if (ix.init(terms, 8, plist, 16) != 1)
+        return err(1, "init 失败");
+    d1[0] = (Str){ S("go") };
+    d1[1] = (Str){ S("fast") };
+    d1[2] = (Str){ S("go") };
+    d2[0] = (Str){ S("slow") };
+    d2[1] = (Str){ S("go") };
+    if (ix.add_doc(1, d1, 3) != 1)
+        return err(2, "第一个文档失败");
+    if (ix.add_doc(2, d2, 2) != 1)
+        return err(3, "第二个文档失败");
+    if (ix.terms() != 3 || ix.docs() != 3)
+        return err(4, "词槽数/文档数不对");
+    if (ix.df(S("go")) != 2 || ix.df(S("fast")) != 1 || ix.df(S("nope")) != 0)
+        return err(5, "df 不对");
+    if (ix.tf(S("go"), 1) != 2 || ix.tf(S("go"), 2) != 1 || ix.tf(S("slow"), 1) != 0)
+        return err(6, "tf 不对");
+    if (ix.search(S("go"), out, 8) != 2)
+        return err(7, "go 应该命中 2 个文档");
+    if (ix.search(S("slow"), out, 8) != 1 || out[0] != 2)
+        return err(8, "slow 应该只命中文档 2");
+    if (ix.search(S("nope"), out, 8) != 0)
+        return err(9, "不存在的词应该 0");
+    if (ix.search(S("go"), out, 1) != 1)
+        return err(10, "outcap 应该截断结果");
+}
+
+test "inverted：AND 查询、容量与边界" {
+    static TermSlot terms[4] = { { { 0, 0 }, 0 } };
+    static Posting plist[8] = { { 0, 0, 0 } };
+    static TermSlot small_terms[2] = { { { 0, 0 }, 0 } };
+    static Posting small_post[2] = { { 0, 0, 0 } };
+    InvIndex ix = { 0 };
+    InvIndex small = { 0 };
+    Str da[2] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } } };
+    Str db[2] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } } };
+    Str dc[2] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } } };
+    Str q[2] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } } };
+    int out[8] = { 0 };
+
+    ix.init(terms, 4, plist, 8);
+    da[0] = (Str){ S("alpha") };
+    da[1] = (Str){ S("beta") };
+    db[0] = (Str){ S("alpha") };
+    db[1] = (Str){ S("gamma") };
+    dc[0] = (Str){ S("beta") };
+    dc[1] = (Str){ S("gamma") };
+    ix.add_doc(0, da, 2);
+    ix.add_doc(1, db, 2);
+    ix.add_doc(2, dc, 2);
+    q[0] = (Str){ S("alpha") };
+    q[1] = (Str){ S("beta") };
+    if (ix.and_query(q, 2, out, 8) != 1 || out[0] != 0)
+        return err(11, "alpha AND beta 应该只有文档 0");
+    q[1] = (Str){ S("gamma") };
+    if (ix.and_query(q, 2, out, 8) != 1 || out[0] != 1)
+        return err(12, "alpha AND gamma 应该只有文档 1");
+    q[1] = (Str){ S("missing") };
+    if (ix.and_query(q, 2, out, 8) != 0)
+        return err(13, "含不存在的词应该 0");
+    {
+        Str one[1] = { (Str){ (char[:]){ 0, 0 } } };
+
+        one[0] = (Str){ S("gamma") };
+        if (ix.and_query(one, 1, out, 8) != 2)
+            return err(14, "单个词的 AND 等于查询");
+    }
+    /* 容量上限 */
+    small.init(small_terms, 2, small_post, 2);
+    ix = small;
+    if (ix.add_doc(0, da, 2) != 1)
+        return err(15, "两个词两个倒排项应该刚好装下");
+    {
+        Str three[3] = { (Str){ (char[:]){ 0, 0 } }, (Str){ (char[:]){ 0, 0 } },
+                         (Str){ (char[:]){ 0, 0 } } };
+
+        three[0] = (Str){ S("x") };
+        three[1] = (Str){ S("y") };
+        three[2] = (Str){ S("z") };
+        if (ix.add_doc(1, three, 3) != -1)
+            return err(16, "词槽满了应该 -1");
+    }
+    if (ix.clear() != 1 || ix.terms() != 0 || ix.postings() != 0)
+        return err(17, "clear 之后应该为空");
+    if (ix.init(small_terms, 0, small_post, 2) != -1)
+        return err(18, "tcap=0 应该 -1");
+}

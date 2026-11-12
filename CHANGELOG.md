@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第七十六批（检索与关键词）**：`std.text.inverted`（倒排索引 + AND 查询）、
+  `std.text.bm25`（BM25 相关度打分）、`std.text.keyword`（词频 Top-N 与停用词过滤）、
+  `std.text.stem`（轻量英文词干化），集成示例 `examples/stdsearch2.c6`
+  （`make std-search2`）。错误号段 `std.text.inverted`=0x6139 … `std.text.stem`=0x613c
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第七十五批（线性代数）**：`std.core.lu`（PLU 分解，反复求解/求逆/行列式）、
   `std.core.eigen`（Jacobi 特征分解 + 幂法）、`std.core.tridiag`（Thomas 三对角求解）、
   `std.core.sparse`（CSR 稀疏矩阵 SpMV/转置），集成示例 `examples/stdlinalg.c6`

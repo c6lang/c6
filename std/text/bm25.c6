@@ -1,0 +1,221 @@
+/* std/text/bm25：BM25 相关度打分（检索排序的标准公式，参数 k1/b 可调）。
+ *
+ *     import std.text.bm25;
+ *
+ *     Bm25 m = { 0 };
+ *     m.setup(1.2, 0.75);              // 方法：setup / add_doc / finish / idf / score
+ *     m.add_doc(50); m.add_doc(150);   // 逐篇登记长度
+ *     m.finish();                      // 算平均长度
+ *     m.idf(5);                        // 某个词的 IDF
+ *     m.score(3, 120, 5);              // tf=3、文档长 120、df=5 的得分
+ *
+ * 公式（Robertson/Sparck Jones 的 BM25）：
+ *
+ *     idf   = ln(1 + (N - df + 0.5) / (df + 0.5))
+ *     score = idf · tf·(k1 + 1) / (tf + k1·(1 - b + b·dl/avgdl))
+ *
+ * 约定：
+ *
+ * - `m.setup(k1, b)`：`k1` 控制词频饱和（常用 1.2～2.0），`b` 控制长度归一
+ *   （0 不归一、1 完全归一，常用 0.75）；参数非法（k1 <= 0、b 不在 [0,1]）返回 -1；
+ * - `m.add_doc(doclen)` 逐篇登记文档长度（累加篇数与总长度），返回篇数；
+ *   `m.finish()` 算平均长度，返回篇数；`m.reset()` 清空；
+ * - `m.idf(df)` 给文档频率的 IDF（`df` 会被夹到 `[0, N]`；`N = 0` 时返回 0）；
+ * - `m.score(tf, doclen, df)` 给一篇文档对某个词的得分；`tf <= 0` 返回 0；
+ *   平均长度为 0 时按 1 处理，避免除零；
+ * - `m.docs()` 篇数，`m.avgdl()` 平均长度，`m.total_len()` 总长度，
+ *   `m.k1()`/`m.b()` 读参数；
+ * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ */
+#include <math.h>
+#include <string.h>
+
+module std.text.bm25;
+import std.core.types;
+import std.text.str;
+
+struct Bm25 {
+    int ndocs;
+    double total;
+    double avgdl_v;
+    double k1_v;
+    double b_v;
+};
+
+int setup(Bm25 *m, double k1, double b)
+{
+    if (!m || k1 <= 0.0 || b < 0.0 || b > 1.0)
+        return -1;
+    memset(m, 0, sizeof *m);
+    m->k1_v = k1;
+    m->b_v = b;
+    return 1;
+}
+
+int docs(Bm25 *m)
+{
+    return m ? m->ndocs : 0;
+}
+
+double avgdl(Bm25 *m)
+{
+    return m ? m->avgdl_v : 0.0;
+}
+
+double total_len(Bm25 *m)
+{
+    return m ? m->total : 0.0;
+}
+
+double k1(Bm25 *m)
+{
+    return m ? m->k1_v : 0.0;
+}
+
+double b(Bm25 *m)
+{
+    return m ? m->b_v : 0.0;
+}
+
+int add_doc(Bm25 *m, int doclen)
+{
+    if (!m || doclen < 0)
+        return -1;
+    m->ndocs++;
+    m->total += (double)doclen;
+    return m->ndocs;
+}
+
+int finish(Bm25 *m)
+{
+    if (!m)
+        return -1;
+    m->avgdl_v = (m->ndocs > 0) ? m->total / (double)m->ndocs : 0.0;
+    return m->ndocs;
+}
+
+int reset(Bm25 *m)
+{
+    double k = 0.0, bv = 0.0;
+
+    if (!m)
+        return -1;
+    k = m->k1_v;
+    bv = m->b_v;
+    memset(m, 0, sizeof *m);
+    m->k1_v = k;
+    m->b_v = bv;
+    return 1;
+}
+
+double idf(Bm25 *m, int df)
+{
+    double n = 0.0, d = 0.0;
+
+    if (!m)
+        return 0.0;
+    if (m->ndocs <= 0)
+        return 0.0;
+    if (df < 0)
+        df = 0;
+    if (df > m->ndocs)
+        df = m->ndocs;
+    n = (double)m->ndocs;
+    d = (double)df;
+    return log(1.0 + (n - d + 0.5) / (d + 0.5));
+}
+
+double score(Bm25 *m, int tf, int doclen, int df)
+{
+    double avg = 0.0, denom = 0.0;
+
+    if (!m || tf <= 0)
+        return 0.0;
+    avg = m->avgdl_v > 0.0 ? m->avgdl_v : 1.0;
+    denom = (double)tf
+            + m->k1_v * (1.0 - m->b_v + m->b_v * (double)doclen / avg);
+    if (denom <= 0.0)
+        return 0.0;
+    return m->idf(df) * (double)tf * (m->k1_v + 1.0) / denom;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "bm25：IDF 与打分" {
+    Bm25 m = { 0 };
+
+    if (m.setup(1.2, 0.75) != 1)
+        return err(1, "setup 失败");
+    if (m.k1() != 1.2 || m.b() != 0.75)
+        return err(2, "参数读取不对");
+    /* 还没有文档时 IDF 为 0 */
+    if (m.idf(0) != 0.0 || m.docs() != 0)
+        return err(3, "空语料的 IDF 应该是 0");
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    m.add_doc(100);
+    if (m.finish() != 10)
+        return err(4, "篇数应该是 10");
+    if (fabs(m.avgdl() - 100.0) > 1e-9 || fabs(m.total_len() - 1000.0) > 1e-9)
+        return err(5, "平均长度/总长度不对");
+    /* N=10, df=5 → idf = ln(1 + 5.5/5.5) = ln 2 */
+    if (fabs(m.idf(5) - 0.6931471805599453) > 1e-12)
+        return err(6, "df=5 的 IDF 应该是 ln2");
+    /* tf=3, dl=100=avgdl → 分母 = 3 + 1.2 = 4.2，分子 = 3*2.2 = 6.6 */
+    if (fabs(m.score(3, 100, 5) - 0.6931471805599453 * 6.6 / 4.2) > 1e-12)
+        return err(7, "score 公式不对");
+    if (m.score(0, 100, 5) != 0.0)
+        return err(8, "tf=0 应该 0 分");
+}
+
+test "bm25：单调性与边界" {
+    Bm25 m = { 0 };
+
+    m.setup(1.5, 0.75);
+    {
+        int i = 0;
+
+        for (i = 0; i < 8; i++)
+            m.add_doc(40 + i * 10);     /* 40..110，平均 75 */
+        m.finish();
+    }
+    if (fabs(m.avgdl() - 75.0) > 1e-9)
+        return err(9, "平均长度应该是 75");
+    /* IDF 随 df 增大而减小 */
+    if (!(m.idf(1) > m.idf(4) && m.idf(4) > m.idf(8)))
+        return err(10, "IDF 应该随 df 递减");
+    /* 得分随 tf 增大而增大 */
+    if (!(m.score(5, 75, 3) > m.score(2, 75, 3)))
+        return err(11, "得分应该随 tf 递增");
+    /* 同一 tf 下，长文档得分更低 */
+    if (!(m.score(3, 75, 3) > m.score(3, 150, 3)))
+        return err(12, "长文档应该得分更低");
+    /* df 越大得分越低 */
+    if (!(m.score(3, 75, 1) > m.score(3, 75, 6)))
+        return err(13, "df 越大得分越低");
+    /* b=0 时长度不影响 */
+    {
+        Bm25 n = { 0 };
+
+        n.setup(1.2, 0.0);
+        n.add_doc(50);
+        n.add_doc(150);
+        n.finish();
+        if (fabs(n.score(3, 50, 1) - n.score(3, 400, 1)) > 1e-12)
+            return err(14, "b=0 时文档长度不该影响得分");
+    }
+    /* reset 保留参数 */
+    if (m.reset() != 1 || m.docs() != 0 || m.k1() != 1.5)
+        return err(15, "reset 之后应该清空但保留参数");
+    if (m.setup(0, 0.75) != -1 || m.setup(1.2, 2.0) != -1)
+        return err(16, "非法参数应该 -1");
+}

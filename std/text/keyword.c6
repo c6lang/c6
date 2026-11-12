@@ -1,0 +1,310 @@
+/* std/text/keyword：词频关键词（过滤停用词、按出现次数排序、取 Top-N）。
+ *
+ *     import std.text.keyword;
+ *
+ *     WordSlot buf[64] = { { { 0, 0 }, 0 } };
+ *     Keyword k = { 0 };
+ *     k.init(buf, 64, 3, 1);            // 方法：init / add / add_text / top
+ *     k.add_text(S("go fast and go far"));   // "and" 是停用词、被过滤
+ *     Str out[2] = { { 0, 0 }, { 0, 0 } };
+ *     int counts[2] = { 0, 0 };
+ *     k.top(out, counts, 2);            // go(2)、fast(1)
+ *
+ * 统计模型就是「词 → 次数」的散表（线性查找，词数上百时够用），配合一个内置的
+ * 英文停用词表和最小词长过滤，适合做摘要、标签、日志高频词这类轻量统计。
+ *
+ * 约定：
+ *
+ * - `k.init(buf, cap, minlen, use_stop)`：`minlen` 是最短词长（<=0 用 1），
+ *   `use_stop` 非 0 时过滤内置停用词表；
+ * - `k.add(word)` 计入一个词（返回 1；太短/停用词返回 0；表满返回 -1）；
+ * - `k.add_text(text)` 按「非字母数字」切分并逐个 `add`，返回计入的词数；
+ * - `k.top(out, counts, n)` 取前 n 个（次数降序，同次数按**首次出现顺序**），
+ *   返回实际个数（词槽超过 256 个时返回 -1）；
+ * - `k.count_of(word)` 某个词的次数（没有返回 0），`k.unique()` 不同词数，
+ *   `k.total()` 计入的词总数，`k.word_at(i, &str, &count)` 取第 i 个词槽；
+ * - `k.reset()` 清空，`k.minlen()`/`k.use_stop()` 读配置；
+ * - 词只存 slice（不拷贝内容），调用方要保证原文活得更久。
+ */
+#include <string.h>
+
+module std.text.keyword;
+import std.core.types;
+import std.text.str;
+
+struct WordSlot {
+    Str text;
+    int cnt;
+    int first;
+};
+
+struct Keyword {
+    WordSlot *slots;
+    int cap;
+    int n;
+    int minl;       /* 字段名避开 minlen() 方法 */
+    int use_stop_v;
+    int ntotal;
+    int total_all;
+};
+
+static const char *const kw_stop[] = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are",
+    "was", "were", "be", "been", "it", "its", "this", "that", "with", "as", "at",
+    "by", "from", "but", "not", "no", "do", "does", "did", "so", "if", "than",
+    "then", "there", "here", "we", "you", "they", "he", "she", "i", "my", "our",
+    0
+};
+
+static int kw_is_stop(char[:] w)
+{
+    int i = 0;
+
+    for (i = 0; kw_stop[i]; i++) {
+        const char *s = kw_stop[i];
+        int m = (int)strlen(s);
+
+        if (m == w.len && memcmp(s, w.data, (size_t)m) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+int init(Keyword *k, void *buf, int cap, int minlen, int use_stop)
+{
+    if (!k || !buf || cap <= 0)
+        return -1;
+    memset(k, 0, sizeof *k);
+    memset(buf, 0, sizeof(WordSlot) * (size_t)cap);
+    k->slots = (WordSlot *)buf;
+    k->cap = cap;
+    k->minl = minlen > 0 ? minlen : 1;
+    k->use_stop_v = use_stop ? 1 : 0;
+    return 1;
+}
+
+int minlen(Keyword *k)
+{
+    return k ? k->minl : 0;
+}
+
+int use_stop(Keyword *k)
+{
+    return k ? k->use_stop_v : 0;
+}
+
+int unique(Keyword *k)
+{
+    return k ? k->n : 0;
+}
+
+int total(Keyword *k)
+{
+    return k ? k->ntotal : 0;
+}
+
+int reset(Keyword *k)
+{
+    if (!k || !k->slots)
+        return -1;
+    memset(k->slots, 0, sizeof(WordSlot) * (size_t)k->cap);
+    k->n = 0;
+    k->ntotal = 0;
+    return 1;
+}
+
+int word_at(Keyword *k, int i, Str *out, int *cnt)
+{
+    if (!k || !k->slots || i < 0 || i >= k->n)
+        return 0;
+    if (out)
+        *out = k->slots[i].text;
+    if (cnt)
+        *cnt = k->slots[i].cnt;
+    return 1;
+}
+
+int add(Keyword *k, char[:] word)
+{
+    int i = 0;
+
+    if (!k || !k->slots || !word.data)
+        return -1;
+    if (word.len < k->minl)
+        return 0;
+    if (k->use_stop_v && kw_is_stop(word))
+        return 0;
+    for (i = 0; i < k->n; i++) {
+        Str t = k->slots[i].text;
+
+        if (t.s.len == word.len && memcmp(t.s.data, word.data, (size_t)word.len) == 0) {
+            k->slots[i].cnt++;
+            k->ntotal++;
+            return 1;
+        }
+    }
+    if (k->n >= k->cap)
+        return -1;
+    k->slots[k->n].text = (Str){ word };
+    k->slots[k->n].cnt = 1;
+    k->slots[k->n].first = k->ntotal;
+    k->n++;
+    k->ntotal++;
+    return 1;
+}
+
+static int kw_isalnum(char c)
+{
+    if (c >= 'a' && c <= 'z')
+        return 1;
+    if (c >= 'A' && c <= 'Z')
+        return 1;
+    if (c >= '0' && c <= '9')
+        return 1;
+    return 0;
+}
+
+int add_text(Keyword *k, char[:] text)
+{
+    int i = 0, start = -1, added = 0;
+
+    if (!k || !text.data)
+        return -1;
+    for (i = 0; i <= text.len; i++) {
+        int in = (i < text.len) ? kw_isalnum(text.data[i]) : 0;
+
+        if (in) {
+            if (start < 0)
+                start = i;
+        } else if (start >= 0) {
+            char[:] w = (char[:]){ text.data + start, i - start };
+
+            if (k->add(w) == 1)
+                added++;
+            start = -1;
+        }
+    }
+    return added;
+}
+
+int count_of(Keyword *k, char[:] word)
+{
+    int i = 0;
+
+    if (!k || !k->slots || !word.data)
+        return 0;
+    for (i = 0; i < k->n; i++) {
+        Str t = k->slots[i].text;
+
+        if (t.s.len == word.len && memcmp(t.s.data, word.data, (size_t)word.len) == 0)
+            return k->slots[i].cnt;
+    }
+    return 0;
+}
+
+int top(Keyword *k, Str *out, int *counts, int n)
+{
+    int *idx = 0;
+    int picked = 0, i = 0, j = 0;
+    static int order[256];
+
+    if (!k || !k->slots || !out || n <= 0)
+        return -1;
+    if (k->n > 256)
+        return -1;
+    for (i = 0; i < k->n; i++)
+        order[i] = i;
+    /* 按 (次数降序, 首次出现升序) 做插入排序 */
+    for (i = 1; i < k->n; i++) {
+        int cur = order[i];
+
+        for (j = i - 1; j >= 0; j--) {
+            int a = order[j];
+            int better = 0;
+
+            if (k->slots[cur].cnt > k->slots[a].cnt)
+                better = 1;
+            else if (k->slots[cur].cnt == k->slots[a].cnt
+                     && k->slots[cur].first < k->slots[a].first)
+                better = 1;
+            if (!better)
+                break;
+            order[j + 1] = a;
+        }
+        order[j + 1] = cur;
+    }
+    picked = k->n < n ? k->n : n;
+    for (i = 0; i < picked; i++) {
+        out[i] = k->slots[order[i]].text;
+        if (counts)
+            counts[i] = k->slots[order[i]].cnt;
+    }
+    (void)idx;
+    return picked;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "keyword：计数与 Top-N" {
+    static WordSlot buf[16] = { { { 0, 0 }, 0, 0 } };
+    Keyword k = { 0 };
+    Str out[3] = { { (char[:]){ 0, 0 } }, { (char[:]){ 0, 0 } },
+                   { (char[:]){ 0, 0 } } };
+    int counts[3] = { 0, 0, 0 };
+
+    if (k.init(buf, 16, 2, 1) != 1)
+        return err(1, "init 失败");
+    if (k.add_text(S("go fast and go far to the go")) != 5)
+        return err(2, "8 个词里 3 个停用词，应该计入 5 个");
+    if (k.unique() != 3 || k.total() != 5)
+        return err(3, "不同词数/总词数不对");
+    if (k.count_of(S("go")) != 3 || k.count_of(S("and")) != 0)
+        return err(4, "go 应该 3 次、停用词不该进入");
+    if (k.count_of(S("fa")) != 0)
+        return err(5, "不完整的词不该命中");
+    if (k.top(out, counts, 3) != 3)
+        return err(6, "top 应该返回 3 个");
+    if (counts[0] != 3 || out[0].s.len != 2 || memcmp(out[0].s.data, "go", 2) != 0)
+        return err(7, "第一名应该是 go(3)");
+    if (counts[1] != 1 || memcmp(out[1].s.data, "fast", 4) != 0)
+        return err(8, "同次数按首次出现顺序：fast 在前");
+    if (k.top(out, counts, 1) != 1)
+        return err(9, "top(1) 应该只返回 1 个");
+    if (k.reset() != 1 || k.unique() != 0 || k.total() != 0)
+        return err(10, "reset 之后应该清空");
+}
+
+test "keyword：最小词长、容量与直接 add" {
+    static WordSlot buf[3] = { { { 0, 0 }, 0, 0 } };
+    Keyword k = { 0 };
+    Str out[8] = { { (char[:]){ 0, 0 } } };
+    int counts[8] = { 0 };
+    Str w = { (char[:]){ 0, 0 } };
+    int c = 0;
+
+    if (k.init(buf, 3, 4, 0) != 1)
+        return err(11, "init 失败");
+    if (k.minlen() != 4 || k.use_stop() != 0)
+        return err(12, "配置读取不对");
+    /* 短词被过滤，停用词不过滤（use_stop=0） */
+    if (k.add(S("the")) != 0)
+        return err(13, "the 长度 3 < minlen 4 应该 0");
+    if (k.add(S("alpha")) != 1)
+        return err(14, "alpha 应该计入");
+    if (k.add(S("beta")) != 1 || k.add(S("gamma")) != 1)
+        return err(15, "beta/gamma 应该计入");
+    if (k.add(S("delta")) != -1)
+        return err(16, "表满了应该 -1");
+    if (k.word_at(0, &w, &c) != 1 || c != 1 || w.s.len != 5)
+        return err(17, "word_at 不对");
+    if (k.word_at(9, &w, &c) != 0)
+        return err(18, "越界 word_at 应该 0");
+    if (k.init(buf, 0, 1, 0) != -1)
+        return err(19, "cap=0 应该 -1");
+    if (add((Keyword *)0, S("x")) != -1)
+        return err(20, "空结构体指针应该 -1");
+    (void)out;
+    (void)counts;
+}

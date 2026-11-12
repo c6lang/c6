@@ -1,0 +1,246 @@
+/* std/text/stem：轻量英文词干化（复数、-ed/-ing、-ly、-ness/-ment、-er/-est）。
+ *
+ *     import std.text.stem;
+ *
+ *     char buf[32] = { 0 };
+ *     Stem s = { 0 };
+ *     s.init(buf, 32);                // 方法：init / stem / result / rules
+ *     s.stem(S("running"));           // 词干 "run" 写进 buf
+ *     s.result();                     // Str 视图
+ *
+ * 这是 Porter 词干算法的**简化版**：只处理检索里最常见的那几类后缀，规则少、可预测，
+ * 不追求语言学上的正确（比如不处理 -ational/-ization 这类组合后缀）。
+ *
+ * 约定：
+ *
+ * - `s.init(buf, cap)` 绑定输出缓冲（原词最多 `cap - 1` 字节）；
+ * - `s.stem(word)` 把词干写进缓冲并以 NUL 结尾，返回词干长度；超长返回 -1；
+ * - `s.result()` 返回缓冲的 `Str` 视图，`s.rules()` 累计应用过多少条规则（调试用）；
+ * - 规则顺序：复数 → `-ed`/`-ing` → `-ly` → `-ness`/`-ment`/`-ful`/`-less` →
+ *   `-er`/`-est` → 词尾 `-e`（`-ee` 结尾如 `agree` 不动）；只有剩余部分**含元音**时才去掉后缀，避免把
+ *   `fly`/`try` 这类短词削成空；长度 ≤ 3 的词原样返回；
+ * - `-ed`/`-ing` 去掉后若以双辅音结尾（bb/dd/ff/gg/mm/nn/pp/rr/tt）就并成一个；
+ * - 按字节处理，只对 ASCII 字母有意义。
+ */
+#include <string.h>
+
+module std.text.stem;
+import std.core.types;
+import std.text.str;
+
+struct Stem {
+    char *out;
+    int cap;
+    int nrule;
+};
+
+int init(Stem *s, void *buf, int cap)
+{
+    if (!s || !buf || cap < 2)
+        return -1;
+    memset(s, 0, sizeof *s);
+    memset(buf, 0, (size_t)cap);
+    s->out = (char *)buf;
+    s->cap = cap;
+    return 1;
+}
+
+int rules(Stem *s)
+{
+    return s ? s->nrule : 0;
+}
+
+Str result(Stem *s)
+{
+    if (!s || !s->out)
+        return (Str){ (char[:]){ 0, 0 } };
+    return (Str){ (char[:]){ s->out, (int)strlen(s->out) } };
+}
+
+static int st_is_vowel(char c)
+{
+    return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
+}
+
+static int st_has_vowel(const char *w, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        if (st_is_vowel(w[i]))
+            return 1;
+    }
+    return 0;
+}
+
+static int st_ends(const char *w, int n, const char *suf)
+{
+    int m = (int)strlen(suf);
+
+    if (m > n)
+        return 0;
+    return memcmp(w + n - m, suf, (size_t)m) == 0;
+}
+
+int stem(Stem *s, char[:] word)
+{
+    int n = 0;
+
+    if (!s || !s->out || !word.data || word.len <= 0)
+        return -1;
+    if (word.len >= s->cap)
+        return -1;
+    s->nrule = 0;
+    memcpy(s->out, word.data, (size_t)word.len);
+    s->out[word.len] = 0;
+    n = word.len;
+    if (n <= 3)
+        return n;
+    /* 复数 */
+    if (st_ends(s->out, n, "sses")) {
+        n -= 2;
+        s->nrule++;
+    } else if (st_ends(s->out, n, "ies")) {
+        n -= 2;
+        s->out[n - 1] = 'i';
+        s->nrule++;
+    } else if (st_ends(s->out, n, "ss")) {
+        /* 保持 */
+    } else if (st_ends(s->out, n, "s") && n > 3) {
+        n -= 1;
+        s->nrule++;
+    }
+    s->out[n] = 0;
+    /* -ed / -ing（要求剩余部分含元音） */
+    if (st_ends(s->out, n, "eed") && n > 4) {
+        n -= 1;
+        s->nrule++;
+    } else if (st_ends(s->out, n, "ed") && n > 4 && st_has_vowel(s->out, n - 2)) {
+        n -= 2;
+        s->nrule++;
+        if (n >= 2 && s->out[n - 1] == s->out[n - 2]
+            && !st_is_vowel(s->out[n - 1])
+            && strchr("bdfgmnprt", s->out[n - 1]) != 0)
+            n--;
+    } else if (st_ends(s->out, n, "ing") && n > 5 && st_has_vowel(s->out, n - 3)) {
+        n -= 3;
+        s->nrule++;
+        if (n >= 2 && s->out[n - 1] == s->out[n - 2]
+            && !st_is_vowel(s->out[n - 1])
+            && strchr("bdfgmnprt", s->out[n - 1]) != 0)
+            n--;
+    }
+    s->out[n] = 0;
+    /* -ly */
+    if (st_ends(s->out, n, "ly") && n > 4) {
+        n -= 2;
+        s->nrule++;
+    }
+    /* 名词/形容词后缀 */
+    if (st_ends(s->out, n, "ness") && n > 5) {
+        n -= 4;
+        s->nrule++;
+    } else if (st_ends(s->out, n, "ment") && n > 5) {
+        n -= 4;
+        s->nrule++;
+    } else if (st_ends(s->out, n, "ful") && n > 5) {
+        n -= 3;
+        s->nrule++;
+    } else if (st_ends(s->out, n, "less") && n > 6) {
+        n -= 4;
+        s->nrule++;
+    }
+    s->out[n] = 0;
+    /* -er / -est */
+    if (st_ends(s->out, n, "est") && n > 5 && st_has_vowel(s->out, n - 3)) {
+        n -= 3;
+        s->nrule++;
+    } else if (st_ends(s->out, n, "er") && n > 4 && st_has_vowel(s->out, n - 2)) {
+        n -= 2;
+        s->nrule++;
+    }
+    s->out[n] = 0;
+    /* 词尾 -e */
+    if (n > 4 && s->out[n - 1] == 'e' && s->out[n - 2] != 'e') {
+        n--;
+        s->nrule++;
+    }
+    s->out[n] = 0;
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+struct StemCase {
+    const char *in;
+    const char *want;
+};
+
+static int st_check(Stem *s, struct StemCase *c, int idx)
+{
+    Str r = { (char[:]){ 0, 0 } };
+
+    if (s->stem((char[:]){ (char *)c->in, (int)strlen(c->in) }) < 0)
+        return idx;
+    r = s->result();
+    if (r.s.len != (int)strlen(c->want))
+        return idx;
+    if (memcmp(r.s.data, c->want, (size_t)r.s.len) != 0)
+        return idx;
+    return 0;
+}
+
+test "stem：复数与 -ing/-ed" {
+    char buf[32] = { 0 };
+    Stem s = { 0 };
+    struct StemCase cases[6] = { { "caresses", "caress" }, { "ponies", "poni" },
+                                 { "cats", "cat" }, { "running", "run" },
+                                 { "jumped", "jump" }, { "agreed", "agree" } };
+    int i = 0, bad = 0;
+
+    if (s.init(buf, 32) != 1)
+        return err(1, "init 失败");
+    for (i = 0; i < 6; i++) {
+        bad = st_check(&s, &cases[i], i + 2);
+
+        if (bad != 0)
+            return err(bad, cases[i].in);
+    }
+    if (s.rules() <= 0)
+        return err(9, "应该应用过规则");
+    if (s.result().s.len > 31)
+        return err(10, "结果不该超过缓冲");
+}
+
+test "stem：-ly/-ness/-er 与边界" {
+    char buf[32] = { 0 };
+    Stem s = { 0 };
+    struct StemCase cases[6] = { { "quickly", "quick" }, { "happiness", "happi" },
+                                 { "movement", "move" }, { "faster", "fast" },
+                                 { "careless", "care" }, { "fly", "fly" } };
+    int i = 0, bad = 0;
+
+    s.init(buf, 32);
+    for (i = 0; i < 6; i++) {
+        bad = st_check(&s, &cases[i], i + 11);
+
+        if (bad != 0)
+            return err(bad, cases[i].in);
+    }
+    /* 短词原样返回 */
+    if (s.stem(S("is")) != 2 || memcmp(buf, "is", 2) != 0)
+        return err(17, "两字母词不该变");
+    /* 输出缓冲太小 */
+    {
+        char tiny[4] = { 0 };
+        Stem t = { 0 };
+
+        t.init(tiny, 4);
+        if (t.stem(S("running")) != -1)
+            return err(18, "超长应该 -1");
+    }
+    if (s.stem(S("")) != -1)
+        return err(19, "空词应该 -1");
+}

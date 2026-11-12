@@ -2458,6 +2458,32 @@ Gopher 与 WHOIS 是游标（`open`/`next`/`count`/`find`/`rewind`），IRC 与 
 验收：`make stdtest`（313 个模块、0 failure）、`make std-linalg`（31 条自检全过）、
 `make check-all`。
 
+### 11.88 标准库第七十六批（inverted / bm25 / keyword / stem）
+
+第七十六批做「检索与关键词」：倒排索引、BM25 打分、词频 Top-N 与轻量词干化。
+四个模块都只依赖 `std.text.str`（bm25 另需 `-lm`）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.inverted` | 倒排索引 | 词槽（词 slice + 表头）+ 倒排项（doc/tf/next）都用调用方数组；**头插**所以查询结果是「后加入的文档在前」；`add_doc` 里同一个词重复出现就累加 `tf`，不新增倒排项；`and_query` 挑 `df` 最小的词驱动、其余词用 `tf` 过滤，比集合归并简单且够用 |
+| `std.text.bm25` | 打分 | 只用「篇数 / 平均长度 / df」三样统计，`add_doc(doclen)` 边走边累加、`finish()` 算平均；`df` 夹到 `[0, N]`、`avgdl` 为 0 时按 1 处理避免除零；测试覆盖了三条单调性（tf↑、dl↑、df↑） |
+| `std.text.keyword` | 词频关键词 | 内置 40 多个英文停用词；`add_text` 按非字母数字切分；`top` 用插入排序按「次数降序 + 首次出现序号升序」，所以同频词顺序稳定（`fast` 排在 `far` 前） |
+| `std.text.stem` | 词干化 | Porter 的简化版，规则少、可预测；每条后缀都要求「剩余部分含元音」，避免 `fly`/`try` 被削空；`-ee` 结尾（`agree`）不吃词尾 `-e`——第一版把 `agreed` 削成了 `agre`，测试立刻抓到 |
+
+踩到的坑：`InvIndex.terms` 字段和 `terms()` 方法同名（`function pointer expected`），
+改成 `slots`；`Keyword.minlen` 字段和 `minlen()` 方法同名，改成 `minl`；`bm25`/`keyword`
+的测试里 `fabs` 又要 `-lm`/`<math.h>`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.inverted`=0x6139、
+`std.text.bm25`=0x613a、`std.text.keyword`=0x613b、`std.text.stem`=0x613c；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-search2` 与 `STD_SEARCH2_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里各 24 条用例。示例 `examples/stdsearch2.c6` 四节
+（25 条自检）。
+
+验收：`make stdtest`（317 个模块、0 failure）、`make std-search2`（25 条自检全过）、
+`make check-all`。
+
+
 
 
 

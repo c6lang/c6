@@ -13018,6 +13018,10 @@ static const struct C6ErrStdSlot {
     { "std.core.eigen",         C6_ERR_SLOT_STD + 310 },
     { "std.core.tridiag",       C6_ERR_SLOT_STD + 311 },
     { "std.core.sparse",        C6_ERR_SLOT_STD + 312 },
+    { "std.text.inverted",      C6_ERR_SLOT_STD + 313 },
+    { "std.text.bm25",          C6_ERR_SLOT_STD + 314 },
+    { "std.text.keyword",       C6_ERR_SLOT_STD + 315 },
+    { "std.text.stem",          C6_ERR_SLOT_STD + 316 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

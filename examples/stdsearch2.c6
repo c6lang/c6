@@ -1,0 +1,136 @@
+/* examples/stdsearch2.c6 —— 第七十六批（检索与关键词）的集成示例。
+ *
+ *     make std-search2
+ *
+ * 四节：倒排索引（单词/AND 查询）、BM25 打分、词频关键词 Top-N、轻量词干化。
+ */
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.inverted;
+import std.text.bm25;
+import std.text.keyword;
+import std.text.stem;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_inverted(void)
+{
+    static TermSlot terms[16] = { { { 0, 0 }, 0 } };
+    static Posting plist[32] = { { 0, 0, 0 } };
+    InvIndex ix = { 0 };
+    Str d0[3] = { (Str){ S("go") }, (Str){ S("fast") }, (Str){ S("car") } };
+    Str d1[2] = { (Str){ S("go") }, (Str){ S("slow") } };
+    Str d2[2] = { (Str){ S("fast") }, (Str){ S("car") } };
+    Str q[2] = { (Str){ S("fast") }, (Str){ S("car") } };
+    int out[8] = { 0 };
+    int n = 0;
+
+    printf("== inverted\n");
+    check(ix.init(terms, 16, plist, 32) == 1, "init");
+    ix.add_doc(0, d0, 3);
+    ix.add_doc(1, d1, 2);
+    ix.add_doc(2, d2, 2);
+    printf("   词槽 %d、倒排项 %d、文档 %d\n", ix.terms(), ix.postings(), ix.docs());
+    check(ix.terms() == 4 && ix.postings() == 7 && ix.docs() == 3, "统计");
+    check(ix.df(S("go")) == 2 && ix.tf(S("go"), 0) == 1, "df/tf");
+    n = ix.search(S("fast"), out, 8);
+    printf("   fast → %d 篇：%d %d\n", n, out[0], out[1]);
+    /* 倒排表是头插，结果的顺序是「后加入的文档在前」 */
+    check(n == 2 && ((out[0] == 0 && out[1] == 2) || (out[0] == 2 && out[1] == 0)),
+          "fast 命中 0 与 2");
+    n = ix.and_query(q, 2, out, 8);
+    printf("   fast AND car → %d 篇：%d %d\n", n, out[0], out[1]);
+    check(n == 2, "文档 0 与 2 都同时含 fast 和 car");
+}
+
+static void do_bm25(void)
+{
+    Bm25 m = { 0 };
+    double s1 = 0.0, s2 = 0.0;
+
+    printf("== bm25\n");
+    check(m.setup(1.2, 0.75) == 1, "setup");
+    m.add_doc(60);
+    m.add_doc(120);
+    m.add_doc(180);
+    check(m.finish() == 3, "三篇文档");
+    printf("   平均长度 %.1f，df=1 的 IDF %.4f\n", m.avgdl(), m.idf(1));
+    check(fabs(m.avgdl() - 120.0) < 1e-9, "平均长度 120");
+    s1 = m.score(3, 60, 1);
+    s2 = m.score(3, 180, 1);
+    printf("   同样 tf=3：短文档 %.4f > 长文档 %.4f\n", s1, s2);
+    check(s1 > s2, "短文档得分更高");
+    check(m.score(5, 60, 1) > m.score(2, 60, 1), "tf 越大得分越高");
+    check(m.idf(1) > m.idf(3), "df 越大 IDF 越小");
+}
+
+static void do_keyword(void)
+{
+    static WordSlot buf[32] = { { { 0, 0 }, 0, 0 } };
+    Keyword k = { 0 };
+    Str out[3] = { { (char[:]){ 0, 0 } }, { (char[:]){ 0, 0 } },
+                   { (char[:]){ 0, 0 } } };
+    int counts[3] = { 0, 0, 0 };
+    int i = 0;
+
+    printf("== keyword\n");
+    check(k.init(buf, 32, 3, 1) == 1, "init");
+    check(k.add_text(S("the quick brown fox jumps over the lazy dog and the fox"))
+              == 8,
+          "12 个词去掉 3 个停用词后计入 8 个");
+    check(k.unique() == 7 && k.total() == 8, "不同词 7、总词 8");
+    check(k.count_of(S("fox")) == 2 && k.count_of(S("the")) == 0, "fox 两次、停用词不进");
+    check(k.top(out, counts, 3) == 3, "Top-3");
+    for (i = 0; i < 3; i++)
+        printf("   %d. %.*s ×%d\n", i + 1, out[i].s.len, out[i].s.data, counts[i]);
+    check(counts[0] == 2, "第一名 2 次（fox 或 the 的替代词）");
+    check(out[0].s.len == 3, "第一名是 fox");
+}
+
+static void do_stem(void)
+{
+    char buf[32] = { 0 };
+    Stem s = { 0 };
+    const char *words[5] = { "running", "caresses", "quickly", "happiness", "cats" };
+    const char *want[5] = { "run", "caress", "quick", "happi", "cat" };
+    Str r = { (char[:]){ 0, 0 } };
+    int i = 0;
+
+    printf("== stem\n");
+    check(s.init(buf, 32) == 1, "init");
+    for (i = 0; i < 5; i++) {
+        s.stem((char[:]){ (char *)words[i], (int)strlen(words[i]) });
+        r = s.result();
+        printf("   %-10s → %.*s\n", words[i], r.s.len, r.s.data);
+        check(r.s.len == (int)strlen(want[i])
+                  && memcmp(r.s.data, want[i], (size_t)r.s.len) == 0,
+              words[i]);
+    }
+    check(s.rules() > 0, "应用过规则");
+}
+
+int main(void)
+{
+    do_inverted();
+    do_bm25();
+    do_keyword();
+    do_stem();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
