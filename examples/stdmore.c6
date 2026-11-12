@@ -1,0 +1,173 @@
+/* stdmore：标准库第七批（bitset / glob / base32 / http）的拼装示例。
+ *
+ * 和 stdtour/stdkit 一样：这个文件没有 `module`（入口 `main` 只能在不属于
+ * 任何模块的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ * 它既是演示，也是这四个模块的集成用例。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdmore \
+ *         examples/stdmore.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/text/str.c6 std/core/bits.c6 std/container/bitset.c6 \
+ *         std/text/glob.c6 std/encoding/base32.c6 std/net/http.c6
+ *
+ * 用到的东西：
+ *   std.container.bitset  借用调用方 u64 缓冲的位集合：置位/计数/遍历/集合运算
+ *   std.text.glob         shell 风格 glob：* ? [] 字符类、转义、路径模式
+ *   std.encoding.base32   RFC 4648 Base32 / base32hex，写调用方缓冲
+ *   std.net.http          HTTP/1.x 请求/响应解析，零分配、字段都是输入上的视图
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.err;
+import std.text.str;
+import std.core.bits;
+import std.container.bitset;
+import std.text.glob;
+import std.encoding.base32;
+import std.net.http;
+
+/* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static Str hs(const char *s)
+{
+    return (Str){ (char[:]){ (char *)s, (int)strlen(s) } };
+}
+
+/* ---- bitset ---- */
+
+static void tour_bitset(void)
+{
+    u64 words[2] = { 0 };
+    Bitset b = bitset_make(words, 70);
+    int p = 0;
+    int got[4] = { 0 };
+    int n = 0;
+
+    b.set(0) catch e { check(0, "bitset: set 失败"); return; };
+    b.set(63) catch e { check(0, "bitset: set 失败"); return; };
+    b.set(69) catch e { check(0, "bitset: set 失败"); return; };
+    check(b.size() == 70 && b.count() == 3, "bitset: 置位与计数");
+    check(b.bit(0) && b.bit(63) && b.bit(69) && !b.bit(64),
+          "bitset: 单 bit 查询");
+    check(b.first_set() == 0 && b.next_set(1) == 63 && b.next_set(64) == 69,
+          "bitset: 按位遍历");
+    p = b.first_set();
+    while (p >= 0 && n < 4) {
+        got[n++] = p;
+        p = b.next_set(p + 1);
+    }
+    check(n == 3 && got[0] == 0 && got[1] == 63 && got[2] == 69,
+          "bitset: 遍历顺序");
+
+    b.toggle(64) catch e { check(0, "bitset: toggle 失败"); return; };
+    check(b.bit(64) && b.count() == 4, "bitset: toggle");
+    b.clear_all();
+    check(b.count() == 0 && b.none_set(), "bitset: clear_all");
+
+    b.set_all();
+    check(b.all_set() && b.count() == 70 && words[1] == 0x3f,
+          "bitset: set_all 与末字掩码");
+}
+
+/* ---- glob ---- */
+
+static void tour_glob(void)
+{
+    Glob g = glob(hs("src/*.c6"));
+    Glob lit = glob(hs("README.md"));
+
+    check(g.has_magic() && !lit.has_magic(), "glob: has_magic");
+    check(g.match(hs("src/main.c6")) && !g.match(hs("src/main.c")),
+          "glob: * 匹配");
+    check(!g.match_path(hs("src/sub/main.c6")), "glob: 路径模式不跨 /");
+    check(glob_match(hs("a?c"), hs("abc")) && !glob_match(hs("a?c"), hs("ac")),
+          "glob: ?");
+    check(glob_match(hs("[a-z][0-9]"), hs("q7"))
+              && !glob_match(hs("[!a-z][0-9]"), hs("q7")),
+          "glob: 字符类与取反");
+    check(glob_match(hs("a\\*b"), hs("a*b")), "glob: 转义");
+    check(lit.match(hs("README.md")), "glob: 重复使用同一 pattern");
+}
+
+/* ---- base32 ---- */
+
+static void tour_base32(void)
+{
+    char out[32] = { 0 };
+    char back[32] = { 0 };
+    int n = 0;
+
+    n = b32_encode(S("foobar"), out, sizeof out);
+    check(n == 16 && strcmp(out, "MZXW6YTBOI======") == 0,
+          "base32: foobar 编码");
+    n = b32_decode(S("MZXW6YTBOI"), back, sizeof back);
+    check(n == 6 && memcmp(back, "foobar", 6) == 0, "base32: 省略填充解码");
+    n = b32hex_encode(S("foo"), out, sizeof out);
+    check(n == 8 && memcmp(out, "CPNMU===", 8) == 0, "base32hex: foo 编码");
+    n = b32_decode(S("MZXW6YTB!"), back, sizeof back);
+    check(n == -1, "base32: 非法字符");
+    check(b32_valid(S("MY======"), 0, 1) && !b32_valid(S("MZ"), 0, 0),
+          "base32: valid");
+}
+
+/* ---- http ---- */
+
+static void tour_http(void)
+{
+    Str raw = hs("POST /api?q=1 HTTP/1.1\r\nHost: example.com\r\n"
+                 "Content-Length: 2\r\n\r\nhi");
+    HttpMessage req = http_parse_request(raw);
+    HttpMessage res = http_parse_response(hs("HTTP/1.1 201 Created\r\n"
+                                             "Server: c6\r\n\r\n"));
+    Str host = hs("HOST");
+    Str body = req.body();
+
+    check(req.ok && req.is_request() && !req.is_response(),
+          "http: 请求解析");
+    check(req.method.s.len == 4 && memcmp(req.method.s.data, "POST", 4) == 0,
+          "http: method");
+    check(req.target.s.len == 8 && memcmp(req.target.s.data, "/api?q=1", 8) == 0,
+          "http: target");
+    check(req.header(host).s.len == 11
+              && memcmp(req.header(host).s.data, "example.com", 11) == 0,
+          "http: 头字段大小写不敏感");
+    check(req.header_count() == 2 && req.content_length() == 2,
+          "http: 头字段个数与 Content-Length");
+    check(body.s.len == 2 && memcmp(body.s.data, "hi", 2) == 0, "http: body");
+
+    check(res.ok && res.is_response() && res.code == 201
+              && res.reason.s.len == 7,
+          "http: 响应解析");
+    check(strcmp(http_status_text(404), "Not Found") == 0
+              && strcmp(http_status_text(599), "Unknown") == 0,
+          "http: status_text");
+    check(!http_parse_request(hs("GET / HTTP/1.1\r\nBad Header\r\n\r\n")).ok,
+          "http: 坏头字段");
+}
+
+int main(void)
+{
+    printf("stdmore: 标准库第七批（bitset / glob / base32 / http）\n");
+    tour_bitset();
+    tour_glob();
+    tour_base32();
+    tour_http();
+    printf("stdmore: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

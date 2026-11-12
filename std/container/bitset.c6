@@ -1,0 +1,413 @@
+/* std/container/bitset：借用调用方内存的位集合视图。
+ *
+ *     import std.container.bitset;
+ *
+ *     u64 words[2] = { 0 };
+ *     Bitset b = bitset_make(words, 70);   // 70 位，占 2 个 u64
+ *     b.set(0) catch e { return e.id; };
+ *     b.set(69) catch e { return e.id; };
+ *     b.count();                           // 2
+ *     b.bit(69);                           // 1
+ *
+ * 和 `Span` 一样是**纯值视图**：Bitset 只包一个 `u64 *` 和位数，不分配、不拥有
+ * 内存；`words` 必须比 Bitset 活得久。位编号从 0 起，最后一个 u64 里超出
+ * `size()` 的位始终保持 0，所以 `count()`、`equals()`、集合运算都不需要再掩码。
+ *
+ * 越界策略分两种：
+ * - 读操作（`bit`/`next_set`/`first_set`）越界给 0 / -1，不报错；
+ * - 写操作（`set`/`clear`/`toggle`）越界返回 `INVAL`，不改任何位。
+ * 空指针按同样的规则处理：读给 0，写给 `INVAL`。
+ */
+#include <string.h>
+
+module std.container.bitset;
+import std.core.types;
+import std.core.bits;
+import std.core.err;
+
+enum Error { OK = 0, INVAL = 1 };
+
+struct Bitset {
+    u64 *w;
+    int n;       /* 位数 */
+    int nw;      /* u64 字数，等于 (n + 63) / 64 */
+};
+
+/* 借用 buf 的前 (nbits + 63) / 64 个 u64；buf 为 0 或 nbits <= 0 时给空视图 */
+Bitset bitset_make(u64 *buf, int nbits)
+{
+    Bitset b = { 0 };
+
+    if (!buf || nbits <= 0)
+        return b;
+    b.w = buf;
+    b.n = nbits;
+    b.nw = (nbits + 63) / 64;
+    return b;
+}
+
+/* 最后一个字里有效位的掩码；n 为 64 的倍数时是整字 */
+static u64 bitset_last_mask(int n)
+{
+    int r = n & 63;
+
+    return r ? ((1ull << r) - 1) : ~0ull;
+}
+
+int size(Bitset *self) { return self ? self->n : 0; }
+
+int bit(Bitset *self, int i)
+{
+    if (!self || i < 0 || i >= self->n)
+        return 0;
+    return (int)((self->w[i >> 6] >> (i & 63)) & 1ull);
+}
+
+int!error set(Bitset *self, int i)
+{
+    if (!self || i < 0 || i >= self->n)
+        return err(INVAL, "bitset: set index out of range");
+    self->w[i >> 6] |= 1ull << (i & 63);
+    return 1;
+}
+
+int!error clear(Bitset *self, int i)
+{
+    if (!self || i < 0 || i >= self->n)
+        return err(INVAL, "bitset: clear index out of range");
+    self->w[i >> 6] &= ~(1ull << (i & 63));
+    return 1;
+}
+
+int!error toggle(Bitset *self, int i)
+{
+    if (!self || i < 0 || i >= self->n)
+        return err(INVAL, "bitset: toggle index out of range");
+    self->w[i >> 6] ^= 1ull << (i & 63);
+    return 1;
+}
+
+/* 置位个数 */
+int count(Bitset *self)
+{
+    int i = 0;
+    int n = 0;
+
+    if (!self)
+        return 0;
+    for (i = 0; i < self->nw; i++)
+        n += popcount64(self->w[i]);
+    return n;
+}
+
+int is_empty(Bitset *self) { return self->count() == 0; }
+
+int any_set(Bitset *self)
+{
+    int i = 0;
+
+    if (!self)
+        return 0;
+    for (i = 0; i < self->nw; i++)
+        if (self->w[i])
+            return 1;
+    return 0;
+}
+
+int all_set(Bitset *self)
+{
+    return self && self->n > 0 && self->count() == self->n;
+}
+
+int none_set(Bitset *self) { return self->count() == 0; }
+
+/* 第一个置位；没有给 -1 */
+int next_set(Bitset *self, int from);
+
+int first_set(Bitset *self) { return self->next_set(0); }
+
+/* 从 from（含）起第一个置位；没有给 -1。from < 0 当 0，from >= n 给 -1。 */
+int next_set(Bitset *self, int from)
+{
+    int wi = 0;
+    int bit = 0;
+    u64 w = 0;
+
+    if (!self || self->n <= 0 || from >= self->n)
+        return -1;
+    if (from < 0)
+        from = 0;
+    wi = from >> 6;
+    w = self->w[wi] & (~0ull << (from & 63));
+    while (1) {
+        if (w) {
+            bit = wi * 64 + ctz64(w);
+            return bit < self->n ? bit : -1;
+        }
+        wi++;
+        if (wi >= self->nw)
+            return -1;
+        w = self->w[wi];
+    }
+}
+
+void set_all(Bitset *self)
+{
+    int i = 0;
+
+    if (!self || self->nw <= 0)
+        return;
+    for (i = 0; i < self->nw; i++)
+        self->w[i] = ~0ull;
+    self->w[self->nw - 1] &= bitset_last_mask(self->n);
+}
+
+void clear_all(Bitset *self)
+{
+    int i = 0;
+
+    if (!self || self->nw <= 0)
+        return;
+    for (i = 0; i < self->nw; i++)
+        self->w[i] = 0;
+}
+
+/* 复制 other 的位；位数必须相同，失败时不改 self */
+int!error copy_from(Bitset *self, Bitset *other)
+{
+    int i = 0;
+
+    if (!self || !other || self->n != other->n)
+        return err(INVAL, "bitset: copy size mismatch");
+    if (self == other)
+        return 1;
+    for (i = 0; i < self->nw; i++)
+        self->w[i] = other->w[i];
+    return 1;
+}
+
+int equals(Bitset *self, Bitset *other)
+{
+    int i = 0;
+
+    if (!self || !other)
+        return self == other;
+    if (self->n != other->n)
+        return 0;
+    for (i = 0; i < self->nw; i++)
+        if (self->w[i] != other->w[i])
+            return 0;
+    return 1;
+}
+
+int!error union_with(Bitset *self, Bitset *other)
+{
+    int i = 0;
+
+    if (!self || !other || self->n != other->n)
+        return err(INVAL, "bitset: union size mismatch");
+    for (i = 0; i < self->nw; i++)
+        self->w[i] |= other->w[i];
+    return 1;
+}
+
+int!error intersect_with(Bitset *self, Bitset *other)
+{
+    int i = 0;
+
+    if (!self || !other || self->n != other->n)
+        return err(INVAL, "bitset: intersect size mismatch");
+    if (self->nw <= 0)          /* 两个空视图：no-op */
+        return 1;
+    for (i = 0; i < self->nw; i++)
+        self->w[i] &= other->w[i];
+    self->w[self->nw - 1] &= bitset_last_mask(self->n);
+    return 1;
+}
+
+int!error difference_with(Bitset *self, Bitset *other)
+{
+    int i = 0;
+
+    if (!self || !other || self->n != other->n)
+        return err(INVAL, "bitset: difference size mismatch");
+    if (self->nw <= 0)          /* 两个空视图：no-op */
+        return 1;
+    for (i = 0; i < self->nw; i++)
+        self->w[i] &= ~other->w[i];
+    self->w[self->nw - 1] &= bitset_last_mask(self->n);
+    return 1;
+}
+
+int!error toggle_with(Bitset *self, Bitset *other)
+{
+    int i = 0;
+
+    if (!self || !other || self->n != other->n)
+        return err(INVAL, "bitset: toggle size mismatch");
+    if (self->nw <= 0)          /* 两个空视图：no-op */
+        return 1;
+    for (i = 0; i < self->nw; i++)
+        self->w[i] ^= other->w[i];
+    self->w[self->nw - 1] &= bitset_last_mask(self->n);
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static int set_rc(Bitset *b, int i)
+{
+    b->set(i) catch e { return e.id; };
+    return 0;
+}
+
+static int copy_rc(Bitset *a, Bitset *b)
+{
+    a->copy_from(b) catch e { return e.id; };
+    return 0;
+}
+
+static int union_rc(Bitset *a, Bitset *b)
+{
+    a->union_with(b) catch e { return e.id; };
+    return 0;
+}
+
+static int intersect_rc(Bitset *a, Bitset *b)
+{
+    a->intersect_with(b) catch e { return e.id; };
+    return 0;
+}
+
+static int difference_rc(Bitset *a, Bitset *b)
+{
+    a->difference_with(b) catch e { return e.id; };
+    return 0;
+}
+
+static int toggle_rc(Bitset *a, Bitset *b)
+{
+    a->toggle_with(b) catch e { return e.id; };
+    return 0;
+}
+
+test "置位 / 清位 / 翻转与越界" {
+    u64 words[2] = { 0 };
+    Bitset b = bitset_make(words, 70);
+
+    if (b.size() != 70)
+        return err(1, "size 不是 70");
+    if (set_rc(&b, 0) != 0 || set_rc(&b, 63) != 0
+        || set_rc(&b, 64) != 0 || set_rc(&b, 69) != 0)
+        return err(2, "合法下标置位失败");
+    if (b.count() != 4 || !b.bit(0) || !b.bit(63) || !b.bit(64) || !b.bit(69))
+        return err(3, "置位结果不对");
+    if (b.bit(70) != 0 || b.bit(-1) != 0)
+        return err(4, "越界读不是 0");
+    if (set_rc(&b, -1) != INVAL || set_rc(&b, 70) != INVAL)
+        return err(5, "越界写没有报 INVAL");
+    if (b.count() != 4)
+        return err(6, "越界写改了内容");
+
+    b.clear(63) catch e { return err(7, "clear 失败"); };
+    if (b.bit(63) || b.count() != 3)
+        return err(8, "clear 不对");
+    b.toggle(64) catch e { return err(9, "toggle 失败"); };
+    if (b.bit(64) || b.count() != 2)
+        return err(10, "toggle 没有清位");
+    b.toggle(64) catch e { return err(11, "toggle 失败"); };
+    if (!b.bit(64) || b.count() != 3)
+        return err(12, "toggle 没有置位");
+}
+
+test "first_set / next_set 按位遍历" {
+    u64 words[2] = { 0 };
+    Bitset b = bitset_make(words, 70);
+    int got[4] = { 0 };
+    int n = 0;
+    int p = 0;
+
+    if (b.first_set() != -1)
+        return err(13, "空集合的 first_set 不是 -1");
+    b.set(3) catch e { return err(14, "set 失败"); };
+    b.set(64) catch e { return err(15, "set 失败"); };
+    b.set(69) catch e { return err(16, "set 失败"); };
+    if (b.first_set() != 3)
+        return err(17, "first_set 不是 3");
+    p = b.next_set(0);
+    while (p >= 0 && n < 4) {
+        got[n++] = p;
+        p = b.next_set(p + 1);
+    }
+    if (n != 3 || got[0] != 3 || got[1] != 64 || got[2] != 69)
+        return err(18, "next_set 遍历顺序不对");
+    if (b.next_set(70) != -1 || b.next_set(-5) != 3)
+        return err(19, "next_set 边界不对");
+}
+
+test "all / any / none / set_all / clear_all" {
+    u64 words[2] = { 0 };
+    Bitset b = bitset_make(words, 70);
+
+    if (!b.is_empty() || b.any_set() || !b.none_set() || b.all_set())
+        return err(20, "空集合状态不对");
+    b.set_all();
+    if (!b.all_set() || b.count() != 70 || b.is_empty())
+        return err(21, "set_all 没有填满 70 位");
+    if (words[1] != 0x3f)
+        return err(22, "最后一个字的多余位没有清掉");
+    b.clear_all();
+    if (b.count() != 0 || b.any_set() || !b.is_empty())
+        return err(23, "clear_all 没有清干净");
+}
+
+test "集合运算与 equals" {
+    u64 aw[2] = { 0 };
+    u64 bw[2] = { 0 };
+    Bitset a = bitset_make(aw, 70);
+    Bitset b = bitset_make(bw, 70);
+
+    a.set(1) catch e { return err(24, "set 失败"); };
+    a.set(64) catch e { return err(25, "set 失败"); };
+    b.set(1) catch e { return err(26, "set 失败"); };
+    b.set(65) catch e { return err(27, "set 失败"); };
+    if (a.equals(&b))
+        return err(28, "不同集合 equals 给了 1");
+    if (copy_rc(&a, &b) != 0 || !a.equals(&b))
+        return err(29, "copy_from 不对");
+    if (union_rc(&a, &b) != 0 || a.count() != 2)
+        return err(30, "union_with 不对");
+    if (intersect_rc(&a, &b) != 0 || a.count() != 2)
+        return err(31, "intersect_with 不对");
+    if (difference_rc(&a, &b) != 0 || a.count() != 0)
+        return err(32, "difference_with 不对");
+    if (toggle_rc(&a, &b) != 0 || a.count() != 2 || !a.bit(65))
+        return err(33, "toggle_with 不对");
+}
+
+test "空指针与位数不匹配" {
+    u64 aw[1] = { 0 };
+    u64 bw[2] = { 0 };
+    Bitset a = bitset_make(aw, 64);
+    Bitset b = bitset_make(bw, 70);
+
+    Bitset empty = bitset_make(0, 64);
+    Bitset zero = bitset_make(aw, 0);
+
+    if (empty.size() != 0 || zero.size() != 0)
+        return err(34, "空工厂不是空视图");
+    if (set_rc(&a, 0) != 0)
+        return err(35, "set 失败");
+    if (copy_rc(&a, &b) != INVAL)
+        return err(36, "位数不同 copy_from 没有报 INVAL");
+    if (union_rc(&a, &b) != INVAL)
+        return err(37, "位数不同 union_with 没有报 INVAL");
+
+    Bitset e1 = bitset_make(0, 0);
+    Bitset e2 = bitset_make(0, 0);
+    e1.set_all();
+    e1.clear_all();
+    if (intersect_rc(&e1, &e2) != 0 || difference_rc(&e1, &e2) != 0
+        || toggle_rc(&e1, &e2) != 0 || e1.count() != 0)
+        return err(38, "空视图的集合运算不对");
+}

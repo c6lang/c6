@@ -57,6 +57,7 @@
 | `std/text/str.c6` | `std.text.str` | 字符串视图 `Str`（`char[:]` 的包装，不分配）与字面量宏 `S()`：切分 `split`/`lines`/`join`、查找 `find`/`last_find`/`contains`/`count_char`/`count_sub`、裁剪 `trim`/`trim_left`/`trim_right`、转换 `to_int`/`to_base`/`copy_upper`/`copy_lower`、`cmp`/`cmp_str`/`cmp_cstr`、`replace`/`split_once`、`hash` |
 | `std/text/strbuf.c6` | `std.text.strbuf` | 会自己长大的字符缓冲 `StrBuf`（托管引用）：`write`/`write_cstr`/`push`、`write_int`/`write_u64`/`write_hex`、`reserve`/`truncate`/`clear`/`slice`/`cstr`（依赖 `std.text.fmt` 的数字原语） |
 | `std/text/utf8.c6` | `std.text.utf8` | UTF-8 解码 `utf8_decode`（返回 1..4，拒绝过长编码/代理区/超范围/截断）、编码 `utf8_encode`、`utf8_valid`/`utf8_count`、`Rune` 与 `utf8_runes()` 迭代器 |
+| `std/text/glob.c6` | `std.text.glob` | shell 风格 glob（零分配）：`Glob` 的 `match`/`match_path`/`has_magic`、`glob` 工厂、`*`/`?`/`[a-z]`/`[!…]`/`\` 转义；`match_path` 的 `*`/`?` 不跨 `/` |
 
 **`std/container/`**（容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序）
 
@@ -68,6 +69,7 @@
 | `std/container/range.c6` | `std.container.range` | 能被 `foreach` 吃掉的区间 `Range`/`StepRange` |
 | `std/container/set.c6` | `std.container.set` | 哈希集合 `Set@K`（`std.container.map` 的薄包装）与 `SetIter@K`：`add`（1 新增 / 0 已存在）/`remove`/`has`/`count`/`capacity`/`reserve`/`clear`/`iter` |
 | `std/container/sort.c6` | `std.container.sort` | 比较器驱动的排序与查找：`sort_bytes`/`sort_int`/`sort_u32`/`sort_f64`（稳定归并 + 小数组插入）、`find_bytes`/`find_int`/`find_u32`、`lower_bound_int`/`upper_bound_int`、`cmp_int`/`cmp_u32`/`cmp_f64`/`cmp_int_desc`、`is_sorted_int` |
+| `std/container/bitset.c6` | `std.container.bitset` | 借用调用方 `u64` 缓冲的位集合 `Bitset`：`set`/`clear`/`toggle`/`bit`/`count`/`first_set`/`next_set`、`set_all`/`clear_all`、`union_with`/`intersect_with`/`difference_with`/`toggle_with`/`equals`/`copy_from` |
 | `std/container/span.c6` | `std.container.span` | 别人内存上的窗口 `Span@T`（纯值，零拷贝） |
 | `std/container/vec.c6` | `std.container.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T`：`push`/`pop`、`insert`/`remove_at`/`truncate`、`first`/`last`、`index_of`/`contains`、`reverse`、`slice`/`extend`、`sort`/`sort_lex`、`each`/`filter`/`fold` |
 
@@ -86,6 +88,7 @@
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
 | `std/encoding/base64.c6` | `std.encoding.base64` | Base64（RFC 4648）标准表与 URL 安全表：`b64_encode`/`b64_decode`、`b64url_encode`/`b64url_decode`、显式表与填充的 `b64_encode_ex`/`b64_decode_ex`/`b64_decoded_len`/`b64_encoded_len`、`b64_valid`、就地 `b64_decode_inplace`/`b64url_decode_inplace`（跳过空白、严格填充、放不下不写半截） |
+| `std/encoding/base32.c6` | `std.encoding.base32` | Base32（RFC 4648）：`b32_encode`/`b32_decode`/`b32hex_encode`/`b32hex_decode`、`b32_encode_ex`/`b32_decode_ex`（显式表与填充策略）、`b32_encoded_len`/`b32_decoded_len`/`b32_valid`；解码跳过空白、接受省略填充与小写，拒绝非零填充位 |
 | `std/encoding/bitbuf.c6` | `std.encoding.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`put`/`put_u64`/`put_bit`/`align`/`put_bytes`/`patch`（回填不改游标）、`br_open`/`get`/`get_u64`/`get_bit`/`peek`/`skip`/`align`/`get_bytes`、`bit_count`/`byte_count`/`ok`/`remaining`/`eof` |
 | `std/encoding/codec.c6` | `std.encoding.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
@@ -105,6 +108,7 @@
 | --- | --- | --- |
 | `std/net/inet.c6` | `std.net.inet` | IP 地址与 CIDR（零分配）：`inet_parse`/`inet_parse_v4`/`inet_parse_v6`，`Ip`/`Ipv4`/`Ipv6` 的 `format`（IPv6 按 RFC 5952 压缩）、`inet_parse_cidr`/`cidr_contains`/`cidr_mask`/`inet_v4_mask`、`is_private`/`is_loopback`/`is_link_local`/`is_multicast`/`is_unspecified`、`inet_parse_port` |
 | `std/net/mime.c6` | `std.net.mime` | 扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：`mime_of_ext`/`mime_of_path`/`mime_ext_of`/`mime_ext_at`/`mime_type_at`/`mime_count`、`mime_is_text`/`is_image`/`is_audio`/`is_video`/`is_font`、`mime_charset`、`mime_sniff`、`mime_default` |
+| `std/net/http.c6` | `std.net.http` | HTTP/1.x 零分配解析：`http_parse_request`/`http_parse_response` 得到 `HttpMessage`，`HttpMessage` 的 `header`/`header_at`/`header_count`/`body`/`content_length`/`is_request`/`is_response`，`http_status_text`；头字段名大小写不敏感，不接受 obs-fold |
 | `std/net/url.c6` | `std.net.url` | URL（RFC 3986）解析与相对解析：`url_parse` 工厂 + `Url` 的 `effective_port`/`is_absolute`/`has_host`、`url_resolve`（§5.2 全算法）、查询参数 `next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
 
 **集成示例**（`main` 只能写在模块外的文件里）
@@ -117,11 +121,13 @@
 | `examples/stdbox.c6` | （无模块） | 第四批模块的拼装示例（`make std-box`）：json/sha256/csv/env 各一节，自带自检 |
 | `examples/stdweb.c6` | （无模块） | 第五批模块的拼装示例（`make std-web`）：base64/url/uuid/mime 各一节，自带自检 |
 | `examples/stdnet.c6` | （无模块） | 第六批模块的拼装示例（`make std-net`）：inet/bitbuf/pqueue/ini 各一节，自带自检 |
+| `examples/stdmore.c6` | （无模块） | 第七批模块的拼装示例（`make std-more`）：bitset/glob/base32/http 各一节，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
 
 ```
+std/container/bitset.c6    11 test(s), 0 failure(s)
 std/container/deque.c6     9 test(s), 0 failure(s)
 std/container/map.c6       9 test(s), 0 failure(s)
 std/container/pqueue.c6    38 test(s), 0 failure(s)
@@ -140,11 +146,13 @@ std/core/types.c6          4 test(s), 0 failure(s)
 std/data/csv.c6            41 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
+std/encoding/base32.c6     5 test(s), 0 failure(s)
 std/encoding/base64.c6     8 test(s), 0 failure(s)
 std/encoding/bitbuf.c6     7 test(s), 0 failure(s)
 std/encoding/codec.c6      7 test(s), 0 failure(s)
 std/encoding/sha256.c6     23 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
+std/net/http.c6            5 test(s), 0 failure(s)
 std/net/inet.c6            8 test(s), 0 failure(s)
 std/net/mime.c6            37 test(s), 0 failure(s)
 std/net/url.c6             32 test(s), 0 failure(s)
@@ -155,6 +163,7 @@ std/os/path.c6             30 test(s), 0 failure(s)
 std/os/time.c6             7 test(s), 0 failure(s)
 std/text/ascii.c6          5 test(s), 0 failure(s)
 std/text/fmt.c6            10 test(s), 0 failure(s)
+std/text/glob.c6           6 test(s), 0 failure(s)
 std/text/num.c6            11 test(s), 0 failure(s)
 std/text/strbuf.c6         18 test(s), 0 failure(s)
 std/text/str.c6            22 test(s), 0 failure(s)
@@ -179,9 +188,10 @@ std/text/utf8.c6           7 test(s), 0 failure(s)
 | `std/net/mime.c6` 37 | mime 7 + str 22 + path 8（取扩展名要 `std.os.path` 的正文） |
 | `std/encoding/uuid.c6` 24 | uuid 8 + rand 9 + time 7（v4/v7 要随机源，v7 要墙钟） |
 | `std/container/pqueue.c6` 38 | pqueue 8 + sort 30（比较器来自 `std.container.sort`；`cmp_str` 又拉上 `std.text.str`，但那样跑才有 str 的块参与） |
+| `std/container/bitset.c6` 11 | bitset 5 + bits 6（`popcount64`/`ctz64` 是跨 TU 调用） |
 
 `std/core/bits`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
-`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/net/inet`、`std/encoding/bitbuf`
+`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`
 自成一体，单独跑就是自己的块数；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
 `std.text.str`（正文不调用），`std/net/mime` 的正文必须带 `std/os/path`，`std/encoding/sha256` 的正文
 必须带 `std/core/bits`，`std/os/env` 的正文必须带 `std/text/str`，`std/encoding/uuid` 的正文必须带
@@ -280,6 +290,29 @@ printf("%d\n", (&t)->at(0));
 `Span` 是纯值（一个切片），所以能按值声明；但方法接收者是指针，
 值容器调用写 `(&s)->m()`。`sub()`/`drop()`/`take()` 只调整边界，零拷贝。
 
+### `Bitset`：借用 `u64` 缓冲的位集合
+
+```c
+import std.container.bitset;
+
+u64 words[2] = { 0 };                    /* 70 位只需要 2 个 u64 */
+Bitset b = bitset_make(words, 70);       /* 不分配，视图借用 words */
+b.set(0) catch e { return e.id; };
+b.set(69) catch e { return e.id; };
+
+b.count();          /* 2 */
+b.bit(69);          /* 1 */
+b.first_set();      /* 0 */
+b.next_set(1);      /* 69 */
+b.set_all();  b.clear_all();
+b.union_with(&other) catch e { return e.id; };
+```
+
+`Bitset` 只包一个 `u64 *` 和位数，和 `Span` 一样是纯值视图：`words` 必须比它活得久。
+写操作（`set`/`clear`/`toggle`）越界返回 `INVAL`，读操作（`bit`/`next_set`/`first_set`）
+越界给 0 / -1；最后一个字里超出 `size()` 的位始终是 0，所以 `count()`、`equals()` 和
+集合运算都不需要再掩码。集合运算要求两边 `size()` 相同，失败时不改接收者。
+
 ### `Map@(K, V)`：开放寻址哈希表
 
 ```c
@@ -363,6 +396,26 @@ foreach (Str w = p->fields()) { ... }                 /* 按空白切分，连�
 `to_u64` 先判 `(U64_MAX - d) / 10` 再乘，所以溢出不会悄悄回绕；`-1` 报码 2
 （无符号不接受负号），`+` 前缀可以。`fields()` 跳过空字段，`"  a  b "` 给
 `a`、`b`。
+
+### `glob`：shell 风格模式匹配
+
+```c
+import std.text.glob;
+
+Str pat = { S("src/*.c6") };
+Str path = { S("src/main.c6") };
+Glob g = glob(pat);
+
+g.match(path);        /* 1：* 可以跨 / */
+g.match_path(path);   /* 1：* 和 ? 不跨 / */
+g.has_magic();        /* 1 */
+glob_match(pat, path);   /* 一次性入口 */
+```
+
+支持 `*`、`?`、`[abc]`、`[a-z]`、`[!a-z]`（`^` 同义）和 `\` 转义；大小写敏感，
+不做 locale。没有 `**` 的特殊语义，两个星号等价于一个。坏字符类（没有结尾 `]`）
+退回字面量 `[`，不报错——glob 是匹配器，不是语法检查器；要判断有没有通配符用
+`has_magic()`。
 
 ### `Buf@(N)`：定长格式化
 
@@ -803,6 +856,24 @@ b64url_decode(S("Zg=="), dec, sizeof dec);       /* -1：URL 变体下 `=` 是�
 剩下的编码字符会留在结果尾巴上）。解码一律先完整校验再写第二遍，非法输入与「放
 不下」都不留半截结果。
 
+### `base32`：标准表与 base32hex
+
+```c
+import std.encoding.base32;
+
+char out[32] = { 0 };
+char back[32] = { 0 };
+
+b32_encode(S("foobar"), out, sizeof out);          /* 16, "MZXW6YTBOI======" */
+b32_decode(S("MZXW6YTBOI"), back, sizeof back);    /* 6, "foobar"：默认宽容 */
+b32hex_encode(S("foo"), out, sizeof out);          /* 8, "CPNMU===" */
+b32_decode_ex(S("MY"), back, sizeof back, 0, 1);   /* -1：严格要求填充 */
+```
+
+和 `base64` 同一口径：不分配，写调用方缓冲，放不下返回 -1 且不写半截；解码先完整
+校验再写第二遍。`pad = 1` 编码补 `=`、解码要求填充；`pad = 0` 编码不补、解码两种
+都收。解码一律跳过 ASCII 空白，接受小写，拒绝非零填充位和凑不出整字节的长度。
+
 ### `url`：RFC 3986 的分解、相对解析与百分号
 
 ```c
@@ -836,6 +907,32 @@ while (u.query.next_pair(&at, &p))
   不总是转义），`+` 要不要当空格由 `url_decode_at(..., plus)` 显式指定；
 * `Url u = { 0 };` 这种全零初始化是支持的：「有没有显式端口」看 `port_str`，不看
   `port >= 0`。
+
+### `http`：HTTP/1.x 请求与响应解析
+
+```c
+import std.net.http;
+
+Str raw = { S("POST /api HTTP/1.1\r\nHost: example.com\r\n"
+              "Content-Length: 2\r\n\r\nhi") };
+Str host = { S("host") };
+HttpMessage req = http_parse_request(raw);
+
+req.ok;                 /* 1 */
+req.method;             /* "POST" */
+req.target;             /* "/api" */
+req.header(host);       /* "example.com"，名字大小写不敏感 */
+req.header_count();     /* 2 */
+req.content_length();   /* 2 */
+req.body();             /* "hi" 的视图 */
+```
+
+解析是**零分配**的：起始行、每个头字段和 body 都是输入上的视图；只处理已经收完的
+字节，不碰 socket。起始行和头字段接受 CRLF 也接受裸 LF；请求行是
+`METHOD SP target SP HTTP/x.y`，状态行是 `HTTP/x.y SP 3 位状态码 SP reason`。
+头字段名必须是 token，值去掉首尾 SP/HTAB，不接受 obs-fold（以空格/HTAB 开头的
+续行）。失败时 `ok == 0`，`err` 是 `PARSE` 或 `INVAL`。`content_length()` 只做
+十进制语法解析，不按它截断 `body()`。
 
 ### `uuid`：v4 / v5 / v7
 
@@ -1213,6 +1310,21 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
 这些限制在 `docs/reference/grammar.md`（约束表 C1xx）和 `docs/design/plan.md` 里有对应的
 条目；标准库的写法就是它们当前的「推荐用法」。
 
+### 集成示例：`examples/stdmore.c6`
+
+```sh
+make std-more
+```
+
+```
+stdmore: 标准库第七批（bitset / glob / base32 / http）
+stdmore: 28 check(s), 0 failure(s)
+```
+
+四个模块各一节：bitset 的置位/计数/按位遍历/末字掩码、glob 的 `*`/`?` 与路径
+模式、base32 的 RFC 向量与非法输入、http 的请求/响应/头字段/body。它和
+`stdtest` 一样，把「模块正文要单独列在命令行上」这件事钉在 Makefile 里。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1225,6 +1337,7 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
 * `make std-box`：`examples/stdbox.c6`，第四批模块的拼装示例（自带自检）。
 * `make std-web`：`examples/stdweb.c6`，第五批模块的拼装示例（自带自检）。
 * `make std-net`：`examples/stdnet.c6`，第六批模块的拼装示例（自带自检）。
+* `make std-more`：`examples/stdmore.c6`，第七批模块的拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

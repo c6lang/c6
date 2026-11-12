@@ -12731,6 +12731,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.bitbuf",    C6_ERR_SLOT_STD + 34 },
     { "std.container.pqueue",   C6_ERR_SLOT_STD + 35 },
     { "std.data.ini",           C6_ERR_SLOT_STD + 36 },
+    { "std.container.bitset",   C6_ERR_SLOT_STD + 37 },
+    { "std.text.glob",          C6_ERR_SLOT_STD + 38 },
+    { "std.encoding.base32",    C6_ERR_SLOT_STD + 39 },
+    { "std.net.http",           C6_ERR_SLOT_STD + 40 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

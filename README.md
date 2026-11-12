@@ -171,21 +171,23 @@ std/core/                   基础：定宽类型、错误码、内存、数学�
   std/core/rand.c6          std.core.rand          xorshift64*：可重放序列、无偏区间 below/int_range、next_f64/next_bool、fill/shuffle
   std/core/types.c6         std.core.types         定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
 
-std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换
+std/text/                   文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点与 glob
   std/text/ascii.c6         std.text.ascii         ASCII 判别/大小写/忽略大小写比较（收 int，EOF 与负 char 安全）
   std/text/fmt.c6           std.text.fmt           定长格式化缓冲 Buf@(N)：write_int/u64/hex/hex64/bin/bool/ptr、write_pad（共用 digits_* 原语）
   std/text/num.c6           std.text.num           浮点格式化（固定/%e/%g）与解析（inf/nan、RANGE/PARSE 错误码）
   std/text/str.c6           std.text.str           字符串视图 Str + 零成本字面量宏 S()：split/lines/join、find/last_find、trim、to_int/to_u64、strip_prefix/suffix、fields、replace/split_once、hash
   std/text/strbuf.c6        std.text.strbuf        会长的字符缓冲 StrBuf（托管引用）：write/write_int/write_hex、reserve/truncate/cstr
   std/text/utf8.c6          std.text.utf8          UTF-8 解码/编码/校验/计数 + Rune 迭代器（拒绝过长编码、代理区、截断）
+  std/text/glob.c6          std.text.glob          shell 风格 glob（零分配）：Glob 的 match/match_path/has_magic、* ? [] 字符类与转义
 
-std/container/              容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序
+std/container/              容器与算法：向量、位集合、跨度、映射、集合、双端队列、优先队列、区间、排序
   std/container/deque.c6    std.container.deque    环形缓冲双端队列 Deque@T + DIter：push/pop 两端 O(1)、first/last/at/get/set
   std/container/map.c6      std.container.map      开放寻址哈希表 Map@(K,V) + Entry/Iter：put/get/get_or/set/put_new/remove
   std/container/pqueue.c6   std.container.pqueue   二叉堆 PQueue@T（托管容器）：push/pop/peek/push_pop/heapify/clear、count/capacity/is_empty/is_valid、init/set_cmp/set_max（比较器与 std.container.sort 的 cmp_int/cmp_str 通用）
   std/container/range.c6    std.container.range    能被 foreach 吃掉的区间 Range/StepRange
   std/container/set.c6      std.container.set      哈希集合 Set@K + SetIter（std.container.map 的薄包装，add 返回新增/已存在）
   std/container/sort.c6     std.container.sort     比较器驱动的排序与二分查找：sort_int/sort_bytes、find_int、lower/upper_bound
+  std/container/bitset.c6   std.container.bitset   借用 u64 缓冲的位集合 Bitset：set/clear/toggle/bit/count/next_set、集合运算
   std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
   std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 
@@ -196,7 +198,8 @@ std/os/                     操作系统：流、文件系统、路径、环境�
   std/os/path.c6            std.os.path            POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
-std/encoding/               编解码：Base64/十六进制/百分号、SHA-256、位流、UUID
+std/encoding/               编解码：Base32/Base64/十六进制/百分号、SHA-256、位流、UUID
+  std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base64.c6    std.encoding.base64    Base64（RFC 4648）标准表与 URL 安全表：b64_encode/b64_decode、b64url_encode/b64url_decode、显式表与填充的 b64_encode_ex/b64_decode_ex/b64_decoded_len/b64_encoded_len、b64_valid、就地 b64_decode_inplace/b64url_decode_inplace（跳过空白、严格填充、放不下不写半截）
   std/encoding/bitbuf.c6    std.encoding.bitbuf    位级读写器（零分配、MSB 先）：bw_open/put/put_u64/put_bit/align/put_bytes/patch（回填不改游标）、br_open/get/get_u64/get_bit/peek/skip/align/get_bytes、bit_count/byte_count/ok/remaining/eof
   std/encoding/codec.c6     std.encoding.codec     Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
@@ -208,7 +211,8 @@ std/data/                   数据格式：JSON、CSV、INI
   std/data/ini.c6           std.data.ini           INI 配置的零分配读取：ini_open/next（字段都是输入上的视图）、ini_lookup/ini_has_section/ini_count、IniEntry.section/key/value/line；语法错误给行号
   std/data/json.c6          std.data.json          JSON 解析与写出：Arena 上的 DOM（a.json_parse）、Json 的 get/at、write/write_pretty/escape（数字保留原文）
 
-std/net/                    网络与 Web：IP/CIDR、URL、MIME
+std/net/                    网络与 Web：IP/CIDR、URL、MIME、HTTP/1.x
+  std/net/http.c6           std.net.http           HTTP/1.x 零分配解析：http_parse_request/response、HttpMessage 的 header/header_at/body/content_length、http_status_text
   std/net/inet.c6           std.net.inet           IP 地址与 CIDR（零分配）：inet_parse/inet_parse_v4/inet_parse_v6，Ip/Ipv4/Ipv6 的 format（IPv6 按 RFC 5952 压缩）、inet_parse_cidr/cidr_contains/cidr_mask/inet_v4_mask、is_private/is_loopback/is_link_local/is_multicast/is_unspecified、inet_parse_port
   std/net/mime.c6           std.net.mime           扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：mime_of_ext/mime_of_path/mime_ext_of/mime_ext_at/mime_type_at/mime_count、mime_is_text/is_image/is_audio/is_video/is_font、mime_charset、mime_sniff、mime_default
   std/net/url.c6            std.net.url            URL（RFC 3986）解析与相对解析：Url 的 url_parse/effective_port/is_absolute/has_host、url_resolve（§5.2 全算法）、查询参数 next_pair/Pair、百分号 url_encode/url_encode_component/url_decode/url_decode_at/url_encoded_len/url_decoded_len

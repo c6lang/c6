@@ -1,0 +1,261 @@
+/* std/text/glob：shell 风格的 glob 匹配（零分配）。
+ *
+ *     import std.text.glob;
+ *
+ *     Glob g = glob(S("src/*.?"));
+ *     g.match(S("src/main.c"));        // 1
+ *     g.match_path(S("src/main.c"));   // 1；`*` 不跨 `/`
+ *
+ * 支持 `*`、`?`、`[abc]`、`[a-z]`、`[!a-z]`（`^` 同义）和 `\` 转义。
+ * 大小写敏感，不做 locale。`match` 里 `*` 可以跨 `/`；`match_path` 里
+ * `*`/`?` 不跨 `/`，适合匹配路径的一段。没有 `**` 的特殊语义：两个星号
+ * 等价于一个星号。
+ *
+ * 坏字符类（没有结尾 `]`）退回字面量 `[`，不报错——glob 是匹配器，不是
+ * 语法检查器；要预先判断有没有通配符用 `has_magic()`。
+ */
+#include <string.h>
+
+module std.text.glob;
+import std.core.types;
+import std.text.str;
+
+struct Glob {
+    Str pat;
+};
+
+Glob glob(Str pattern)
+{
+    Glob g = { pattern };
+
+    return g;
+}
+
+/* 字符类匹配：pat[*pi] 是 '['。合法时把 *pi 移到 ']' 之后并返回 1，
+   非法（没有结尾）返回 0，*pi 不动，让调用方把 '[' 当字面量。 */
+static int glob_class(Str pat, int *pi, int ch, int *matched)
+{
+    int i = *pi + 1;
+    int neg = 0;
+    int first = 1;
+    int hit = 0;
+    int start = 0;
+    int end = 0;
+    int lo = 0;
+    int hi = 0;
+
+    if (i < pat.s.len && (pat.s.data[i] == '!' || pat.s.data[i] == '^')) {
+        neg = 1;
+        i++;
+    }
+    while (i < pat.s.len) {
+        if (pat.s.data[i] == ']' && !first) {
+            *pi = i + 1;
+            *matched = neg ? !hit : hit;
+            return 1;
+        }
+        first = 0;
+        if (pat.s.data[i] == '\\' && i + 1 < pat.s.len) {
+            start = (unsigned char)pat.s.data[i + 1];
+            i += 2;
+        } else {
+            start = (unsigned char)pat.s.data[i++];
+        }
+        if (i + 1 < pat.s.len && pat.s.data[i] == '-'
+            && pat.s.data[i + 1] != ']') {
+            i++;
+            if (pat.s.data[i] == '\\' && i + 1 < pat.s.len) {
+                end = (unsigned char)pat.s.data[i + 1];
+                i += 2;
+            } else {
+                end = (unsigned char)pat.s.data[i++];
+            }
+            lo = start < end ? start : end;
+            hi = start < end ? end : start;
+            if (ch >= lo && ch <= hi)
+                hit = 1;
+        } else if (ch == start) {
+            hit = 1;
+        }
+    }
+    return 0;
+}
+
+static int glob_at(Str pat, int pi, Str text, int ti, int path)
+{
+    int c = 0;
+    int k = 0;
+    int matched = 0;
+    int next = 0;
+
+    while (pi < pat.s.len) {
+        c = (unsigned char)pat.s.data[pi];
+        if (c == '*') {
+            while (pi < pat.s.len && pat.s.data[pi] == '*')
+                pi++;
+            for (k = ti; k <= text.s.len; k++) {
+                if (glob_at(pat, pi, text, k, path))
+                    return 1;
+                if (path && k < text.s.len && text.s.data[k] == '/')
+                    break;
+            }
+            return 0;
+        }
+        if (c == '?') {
+            if (ti >= text.s.len)
+                return 0;
+            if (path && text.s.data[ti] == '/')
+                return 0;
+            pi++;
+            ti++;
+            continue;
+        }
+        if (c == '[') {
+            next = pi;
+            if (glob_class(pat, &next, ti < text.s.len ? (unsigned char)text.s.data[ti] : 0,
+                           &matched)) {
+                if (ti >= text.s.len || !matched)
+                    return 0;
+                pi = next;
+                ti++;
+                continue;
+            }
+            /* 非法字符类：把 '[' 当普通字符 */
+        }
+        if (ti >= text.s.len)
+            return 0;
+        if (c == '\\' && pi + 1 < pat.s.len) {
+            pi++;
+            c = (unsigned char)pat.s.data[pi];
+        }
+        if ((unsigned char)text.s.data[ti] != c)
+            return 0;
+        pi++;
+        ti++;
+    }
+    return ti == text.s.len;
+}
+
+int match(Glob *self, Str text)
+{
+    if (!self)
+        return 0;
+    return glob_at(self->pat, 0, text, 0, 0);
+}
+
+int match_path(Glob *self, Str text)
+{
+    if (!self)
+        return 0;
+    return glob_at(self->pat, 0, text, 0, 1);
+}
+
+int has_magic(Glob *self)
+{
+    int i = 0;
+
+    if (!self)
+        return 0;
+    for (i = 0; i < self->pat.s.len; i++)
+        if (self->pat.s.data[i] == '*' || self->pat.s.data[i] == '?'
+            || self->pat.s.data[i] == '[')
+            return 1;
+    return 0;
+}
+
+/* 一次性便捷入口；要反复匹配同一 pattern 时用 Glob 对象，省一次解析。 */
+int glob_match(Str pattern, Str text)
+{
+    Glob g = glob(pattern);
+
+    return g.match(text);
+}
+
+int glob_match_path(Str pattern, Str text)
+{
+    Glob g = glob(pattern);
+
+    return g.match_path(text);
+}
+
+/* ---- 自测 ---- */
+
+static Str gstr(const char *s)
+{
+    return (Str){ (char[:]){ (char *)s, (int)strlen(s) } };
+}
+
+static int gm(const char *pat, const char *txt)
+{
+    return glob_match(gstr(pat), gstr(txt));
+}
+
+static int gmp(const char *pat, const char *txt)
+{
+    return glob_match_path(gstr(pat), gstr(txt));
+}
+
+test "字面量与 ?" {
+    if (!gm("abc", "abc") || gm("abc", "abd") || gm("abc", "ab"))
+        return err(1, "字面量匹配不对");
+    if (!gm("a?c", "abc") || gm("a?c", "ac") || gm("a?c", "abbc"))
+        return err(2, "? 匹配不对");
+    if (!gm("", "") || gm("", "x"))
+        return err(3, "空 pattern 不对");
+}
+
+test "* 的零个、多个与回溯" {
+    if (!gm("*", "") || !gm("*", "abc") || !gm("a*", "a")
+        || !gm("a*", "abc") || !gm("*c", "abc"))
+        return err(4, "基本 * 不对");
+    if (gm("a*", "ba") || gm("*c", "ab"))
+        return err(5, "* 匹配了不该匹配的");
+    if (!gm("a*b*c", "aXXbYYc") || !gm("a*b*c", "abc")
+        || gm("a*b*c", "acb"))
+        return err(6, "* 回溯不对");
+    if (!gm("*.c6", "std/text/glob.c6"))
+        return err(7, "* 不能跨 /");
+}
+
+test "字符类、范围与取反" {
+    if (!gm("[abc]", "b") || gm("[abc]", "d"))
+        return err(8, "字符类不对");
+    if (!gm("[a-z]", "q") || gm("[a-z]", "Q"))
+        return err(9, "范围不对");
+    if (!gm("[!0-9]", "x") || gm("[!0-9]", "7") || !gm("[^0-9]", "x"))
+        return err(10, "取反不对");
+    if (!gm("[]]", "]") || !gm("[-a]", "-") || !gm("[a-]", "-"))
+        return err(11, "特殊位置的 ] 与 - 不对");
+    if (!gm("x[0-9]y", "x5y") || gm("x[0-9]y", "xay"))
+        return err(12, "字符类嵌在中间不对");
+}
+
+test "转义与坏字符类" {
+    if (!gm("a\\*b", "a*b") || gm("a\\*b", "axb"))
+        return err(13, "转义 * 不对");
+    if (!gm("a\\?b", "a?b") || gm("a\\?b", "axb"))
+        return err(14, "转义 ? 不对");
+    if (!gm("a[b", "a[b") || !gm("[abc", "[abc"))
+        return err(15, "坏字符类没有退回字面量");
+}
+
+test "match_path 不跨 /，match 跨 /" {
+    if (!gm("a/*", "a/b/c") || !gmp("a/*", "a/b"))
+        return err(16, "匹配模式不对");
+    if (gmp("a/*", "a/b/c") || gmp("*", "a/b"))
+        return err(17, "match_path 跨过了 /");
+    if (!gmp("a/?", "a/b") || gmp("a/?", "a//"))
+        return err(18, "match_path 的 ? 不对");
+}
+
+test "has_magic 与重复使用同一个 Glob" {
+    Glob g = glob(gstr("src/*.c"));
+    Glob lit = glob(gstr("README.md"));
+
+    if (!g.has_magic() || lit.has_magic())
+        return err(19, "has_magic 不对");
+    if (!g.match(gstr("src/a.c")) || g.match(gstr("src/a.h")))
+        return err(20, "Glob 对象重复使用不对");
+    if (!lit.match(gstr("README.md")))
+        return err(21, "无通配符的 Glob 不对");
+}
