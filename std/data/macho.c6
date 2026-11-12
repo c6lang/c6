@@ -1,0 +1,524 @@
+/* std/data/macho：Mach-O 映像头解析（零分配）。
+ *
+ *     import std.data.macho;
+ *
+ *     MachoInfo info = macho_info(data, n);
+ *     if (info.valid && !info.fat) {
+ *         // info.is64 / info.cputype / info.filetype / info.entry_off
+ *         MachoSection s = { 0 };
+ *         for (int i = 0; i < info.nsections; i++)
+ *             macho_section(data, n, &info, i, &s);
+ *     }
+ *
+ * 认 thin 的 32/64 位小端映像（`FEEDFACE` / `FEEDFACF`），以及 universal
+ * （fat，`CAFEBABE`）的外壳——fat 只报有几个架构、每个架构的偏移与大小，
+ * 具体内容由调用方按偏移再解析一遍。
+ *
+ * 约定：
+ *
+ * - 大端映像（PowerPC 时代的 `FEEDFACE` 反过来写）不支持，返回 `valid=0`；
+ * - `macho_info` 解析头部与 `LC_SEGMENT*`/`LC_UUID`/`LC_MAIN`，其余 load
+ *   command 只按 `cmdsize` 跳过；`cmdsize` 非法（<8 或越过 `sizeofcmds`）
+ *   返回 `valid=0`；
+ * - `macho_section` 的 `sectname`/`segname` 是 16 字节定长、不一定 NUL 结尾，
+ *   视图按最后一个 NUL 裁；
+ * - `entry_off` 只在有 `LC_MAIN` 时有意义，是文件偏移（不是虚拟地址）；
+ * - `macho_arch` 只在 fat 映像上有效。
+ */
+#include <string.h>
+
+module std.data.macho;
+import std.core.types;
+import std.text.str;
+
+enum MachoConst {
+    MACHO_MAGIC32 = 0xFEEDFACE,
+    MACHO_MAGIC64 = 0xFEEDFACF,
+    MACHO_FAT = 0xCAFEBABE,
+    MACHO_LC_SEGMENT = 0x1,
+    MACHO_LC_SEGMENT_64 = 0x19,
+    MACHO_LC_UUID = 0x1B,
+    MACHO_LC_MAIN = 0x80000028,
+    MACHO_CPU_X86 = 7,
+    MACHO_CPU_X86_64 = 0x01000007,
+    MACHO_CPU_ARM = 12,
+    MACHO_CPU_ARM64 = 0x0100000C,
+    MACHO_FILETYPE_EXECUTE = 2,
+    MACHO_FILETYPE_DYLIB = 6,
+    MACHO_FILETYPE_BUNDLE = 8,
+};
+
+struct MachoInfo {
+    int valid;
+    int is64;
+    int fat;
+    int nfat;
+    int cputype;
+    int cpusubtype;
+    int filetype;
+    int ncmds;
+    int flags;
+    int nsections;
+    int has_uuid;
+    int has_entry;
+    u64 entry_off;
+    u8 uuid[16];
+    int lc_off;         /* load command 区开始 */
+    int lc_size;        /* sizeofcmds */
+    int hdr_size;
+};
+
+struct MachoArch {
+    int cputype;
+    int cpusubtype;
+    u32 offset;
+    u32 size;
+    u32 align;
+};
+
+struct MachoSection {
+    Str sectname;
+    Str segname;
+    u64 addr;
+    u64 size;
+    u32 offset;
+    u32 flags;
+};
+
+static u32 macho_u32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u64 macho_u64(const u8 *p)
+{
+    return (u64)macho_u32(p) | ((u64)macho_u32(p + 4) << 32);
+}
+
+static u32 macho_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static int macho_namelen(const u8 *p, int max)
+{
+    int n = max;
+
+    while (n > 0 && p[n - 1] == 0)
+        n--;
+    return n;
+}
+
+MachoInfo macho_info(const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    MachoInfo info = { 0 };
+    u32 magic = 0;
+    int i = 0, off = 0, end = 0;
+
+    if (!src || n < 8)
+        return info;
+    magic = macho_u32(p);
+    if (macho_be32(p) == MACHO_FAT) {   /* fat 头是大端 */
+        u32 nfat = macho_be32(p + 4);
+
+        if (nfat == 0 || nfat > 32)
+            return info;
+        info.valid = 1;
+        info.fat = 1;
+        info.nfat = (int)nfat;
+        if (8 + (int)nfat * 20 > n)
+            info.valid = 0;
+        return info;
+    }
+    if (magic == MACHO_MAGIC64) {
+        info.is64 = 1;
+        info.hdr_size = 32;
+    } else if (magic == MACHO_MAGIC32) {
+        info.is64 = 0;
+        info.hdr_size = 28;
+    } else {
+        return info;
+    }
+    if (n < info.hdr_size)
+        return info;
+    info.cputype = (int)macho_u32(p + 4);
+    info.cpusubtype = (int)macho_u32(p + 8);
+    info.filetype = (int)macho_u32(p + 12);
+    info.ncmds = (int)macho_u32(p + 16);
+    info.lc_size = (int)macho_u32(p + 20);
+    info.flags = (int)macho_u32(p + 24);
+    info.lc_off = info.hdr_size;
+    if (info.ncmds <= 0 || info.lc_size <= 0
+        || (u64)info.lc_off + (u64)info.lc_size > (u64)n)
+        return info;
+    off = info.lc_off;
+    end = info.lc_off + info.lc_size;
+    for (i = 0; i < info.ncmds; i++) {
+        u32 cmd = 0, size = 0;
+
+        if (off + 8 > end)
+            return info;
+        cmd = macho_u32(p + off);
+        size = macho_u32(p + off + 4);
+        if (size < 8 || (u64)off + (u64)size > (u64)end)
+            return info;
+        if (cmd == MACHO_LC_SEGMENT || cmd == MACHO_LC_SEGMENT_64) {
+            int is64 = cmd == MACHO_LC_SEGMENT_64;
+            int base = off + 8;
+            int min = is64 ? 72 : 56;
+
+            if ((int)size < min)
+                return info;
+            info.nsections += (int)macho_u32(p + off + 8 + (is64 ? 56 : 40));
+        } else if (cmd == MACHO_LC_UUID && size >= 24) {
+            memcpy(info.uuid, p + off + 8, 16);
+            info.has_uuid = 1;
+        } else if (cmd == MACHO_LC_MAIN && size >= 24) {
+            info.entry_off = macho_u64(p + off + 8);
+            info.has_entry = 1;
+        }
+        off += (int)size;
+    }
+    info.valid = 1;
+    return info;
+}
+
+int macho_arch(const void *src, int n, const MachoInfo *info, int idx,
+               MachoArch *out)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 0;
+
+    if (!src || !info || !out || !info->fat)
+        return -1;
+    if (idx < 0 || idx >= info->nfat)
+        return 0;
+    off = 8 + idx * 20;
+    if (off + 20 > n)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->cputype = (int)macho_be32(p + off);
+    out->cpusubtype = (int)macho_be32(p + off + 4);
+    out->offset = macho_be32(p + off + 8);
+    out->size = macho_be32(p + off + 12);
+    out->align = macho_be32(p + off + 16);
+    return 1;
+}
+
+/* 第 idx 个节（把各 segment 的节按顺序摊平）：1 / 0 越界 / -1 结构坏 */
+int macho_section(const void *src, int n, const MachoInfo *info, int idx,
+                  MachoSection *out)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 0, end = 0, i = 0, seen = 0;
+
+    if (!src || !info || !out || !info->valid || info->fat)
+        return -1;
+    if (idx < 0 || idx >= info->nsections)
+        return 0;
+    off = info->lc_off;
+    end = info->lc_off + info->lc_size;
+    for (i = 0; i < info->ncmds; i++) {
+        u32 cmd = 0, size = 0;
+
+        if (off + 8 > end)
+            return -1;
+        cmd = macho_u32(p + off);
+        size = macho_u32(p + off + 4);
+        if (size < 8 || (u64)off + (u64)size > (u64)end)
+            return -1;
+        if (cmd == MACHO_LC_SEGMENT || cmd == MACHO_LC_SEGMENT_64) {
+            int is64 = cmd == MACHO_LC_SEGMENT_64;
+            int base = off + 8 + (is64 ? 64 : 48);
+            int sec_size = is64 ? 80 : 68;
+            u32 nsects = macho_u32(p + off + 8 + (is64 ? 56 : 40));
+            u32 k = 0;
+
+            for (k = 0; k < nsects; k++) {
+                int so = base + (int)k * sec_size;
+
+                if (so + sec_size > end)
+                    return -1;
+                if (seen == idx) {
+                    memset(out, 0, sizeof *out);
+                    out->sectname.s = (char[:]){ (char *)p + so,
+                                                 macho_namelen(p + so, 16) };
+                    out->segname.s = (char[:]){ (char *)p + so + 16,
+                                                macho_namelen(p + so + 16, 16) };
+                    if (is64) {
+                        out->addr = macho_u64(p + so + 32);
+                        out->size = macho_u64(p + so + 40);
+                        out->offset = macho_u32(p + so + 48);
+                        out->flags = macho_u32(p + so + 64);
+                    } else {
+                        out->addr = macho_u32(p + so + 32);
+                        out->size = macho_u32(p + so + 36);
+                        out->offset = macho_u32(p + so + 40);
+                        out->flags = macho_u32(p + so + 56);
+                    }
+                    return 1;
+                }
+                seen++;
+            }
+        }
+        off += (int)size;
+    }
+    return 0;
+}
+
+const char *macho_cpu_name(int cputype)
+{
+    switch (cputype) {
+    case MACHO_CPU_X86: return "x86";
+    case MACHO_CPU_X86_64: return "x86_64";
+    case MACHO_CPU_ARM: return "arm";
+    case MACHO_CPU_ARM64: return "arm64";
+    default: return "unknown";
+    }
+}
+
+const char *macho_filetype_name(int filetype)
+{
+    switch (filetype) {
+    case MACHO_FILETYPE_EXECUTE: return "exec";
+    case MACHO_FILETYPE_DYLIB: return "dylib";
+    case MACHO_FILETYPE_BUNDLE: return "bundle";
+    default: return "other";
+    }
+}
+
+/* ---- 自测 ---- */
+
+static void mw32(char *p, u32 v)
+{
+    p[0] = (char)(v & 0xFF);
+    p[1] = (char)((v >> 8) & 0xFF);
+    p[2] = (char)((v >> 16) & 0xFF);
+    p[3] = (char)((v >> 24) & 0xFF);
+}
+
+static void mw64(char *p, u64 v)
+{
+    mw32(p, (u32)(v & 0xFFFFFFFFu));
+    mw32(p + 4, (u32)(v >> 32));
+}
+
+/* 造一个 64 位 thin 映像：
+ *   LC_SEGMENT_64("__TEXT", 两个节 __text / __const)
+ *   LC_SEGMENT_64("__DATA", 零个节)
+ *   LC_UUID
+ *   LC_MAIN
+ */
+static int mk_macho(char *buf)
+{
+    int hdr = 32;
+    int lc = hdr;
+    int seg1 = lc;
+    int seg1_size = 72 + 2 * 80;
+    int seg2 = seg1 + seg1_size;
+    int seg2_size = 72;
+    int uuid = seg2 + seg2_size;
+    int mainc = uuid + 24;
+    int total = mainc + 24;
+    int sec = 0;
+
+    memset(buf, 0, 1024);
+    mw32(buf, MACHO_MAGIC64);
+    mw32(buf + 4, MACHO_CPU_ARM64);
+    mw32(buf + 8, 0);
+    mw32(buf + 12, MACHO_FILETYPE_EXECUTE);
+    mw32(buf + 16, 4);                       /* ncmds */
+    mw32(buf + 20, (u32)(total - hdr));
+    mw32(buf + 24, 0x00200085);
+    mw32(buf + 28, 0);
+    /* __TEXT */
+    mw32(buf + seg1, MACHO_LC_SEGMENT_64);
+    mw32(buf + seg1 + 4, (u32)seg1_size);
+    memcpy(buf + seg1 + 8, "__TEXT", 6);
+    mw64(buf + seg1 + 24, 0x100000000ULL);   /* vmaddr */
+    mw64(buf + seg1 + 32, 0x4000);           /* vmsize */
+    mw64(buf + seg1 + 40, 0);                /* fileoff */
+    mw64(buf + seg1 + 48, 0x4000);           /* filesize */
+    mw32(buf + seg1 + 64, 2);                /* nsects（命令内偏移 64） */
+    /* 节 0：__text */
+    sec = seg1 + 72;
+    memcpy(buf + sec, "__text", 6);
+    memcpy(buf + sec + 16, "__TEXT", 6);
+    mw64(buf + sec + 32, 0x100001000ULL);
+    mw64(buf + sec + 40, 0x200);
+    mw32(buf + sec + 48, 0x1000);
+    mw32(buf + sec + 64, 0x80000400);
+    /* 节 1：__const */
+    sec += 80;
+    memcpy(buf + sec, "__const", 7);
+    memcpy(buf + sec + 16, "__TEXT", 6);
+    mw64(buf + sec + 32, 0x100002000ULL);
+    mw64(buf + sec + 40, 0x100);
+    mw32(buf + sec + 48, 0x1200);
+    mw32(buf + sec + 64, 0);
+    /* __DATA（零个节） */
+    mw32(buf + seg2, MACHO_LC_SEGMENT_64);
+    mw32(buf + seg2 + 4, (u32)seg2_size);
+    memcpy(buf + seg2 + 8, "__DATA", 6);
+    mw64(buf + seg2 + 24, 0x100004000ULL);
+    mw64(buf + seg2 + 32, 0x1000);
+    mw64(buf + seg2 + 40, 0x2000);
+    mw64(buf + seg2 + 48, 0x1000);
+    mw32(buf + seg2 + 64, 0);
+    /* LC_UUID */
+    mw32(buf + uuid, MACHO_LC_UUID);
+    mw32(buf + uuid + 4, 24);
+    {
+        int i = 0;
+
+        for (i = 0; i < 16; i++)
+            buf[uuid + 8 + i] = (char)(0x10 + i);
+    }
+    /* LC_MAIN */
+    mw32(buf + mainc, MACHO_LC_MAIN);
+    mw32(buf + mainc + 4, 24);
+    mw64(buf + mainc + 8, 0x1000);           /* entryoff */
+    mw64(buf + mainc + 16, 0);               /* stacksize */
+    return total;
+}
+
+test "Mach-O：64 位 thin 映像" {
+    static char img[1024] = { 0 };
+    int n = mk_macho(img);
+    MachoInfo info = macho_info(img, n);
+    MachoSection s = { 0 };
+    int i = 0;
+
+    if (!info.valid || info.fat || !info.is64)
+        return err(1, "64 位 thin 映像应该有效");
+    if (info.cputype != MACHO_CPU_ARM64 || info.filetype != MACHO_FILETYPE_EXECUTE)
+        return err(2, "CPU 或文件类型不对");
+    if (info.ncmds != 4 || info.nsections != 2)
+        return err(3, "命令数或节数不对");
+    if (!info.has_uuid || info.uuid[0] != 0x10 || info.uuid[15] != 0x1F)
+        return err(4, "LC_UUID 不对");
+    if (!info.has_entry || info.entry_off != 0x1000)
+        return err(5, "LC_MAIN 不对");
+    if (macho_section(img, n, &info, 0, &s) != 1)
+        return err(6, "第一个节没读到");
+    if (s.sectname.s.len != 6 || memcmp(s.sectname.s.data, "__text", 6) != 0)
+        return err(7, "__text 名字不对");
+    if (s.segname.s.len != 6 || s.addr != 0x100001000ULL || s.size != 0x200
+        || s.offset != 0x1000 || s.flags != 0x80000400u)
+        return err(8, "__text 字段不对");
+    if (macho_section(img, n, &info, 1, &s) != 1
+        || s.sectname.s.len != 7 || memcmp(s.sectname.s.data, "__const", 7) != 0)
+        return err(9, "__const 不对");
+    if (macho_section(img, n, &info, 2, &s) != 0)
+        return err(10, "越界下标应该 0");
+    if (strcmp(macho_cpu_name(info.cputype), "arm64") != 0
+        || strcmp(macho_filetype_name(info.filetype), "exec") != 0)
+        return err(11, "名字表不对");
+    /* 每个节都能单独取到，且顺序与段内顺序一致 */
+    {
+        char firsts[8] = { 0 };
+
+        for (i = 0; i < info.nsections; i++) {
+            if (macho_section(img, n, &info, i, &s) != 1)
+                return err(12, "遍历节失败");
+            firsts[i] = s.sectname.s.data[2];
+        }
+        if (firsts[0] != 't' || firsts[1] != 'c')
+            return err(13, "节的顺序不对");
+    }
+}
+
+test "Mach-O：32 位、fat 与坏头" {
+    static char img[1024] = { 0 };
+    static char fat[64] = { 0 };
+    MachoInfo info = { 0 };
+    MachoArch arch = { 0 };
+    int n = 0;
+
+    /* 32 位：头 28 字节，一个 LC_SEGMENT（56 字节）+ 一个节（68 字节） */
+    memset(img, 0, sizeof img);
+    mw32(img, MACHO_MAGIC32);
+    mw32(img + 4, MACHO_CPU_X86);
+    mw32(img + 8, 3);
+    mw32(img + 12, MACHO_FILETYPE_DYLIB);
+    mw32(img + 16, 1);
+    mw32(img + 20, 56 + 68);
+    mw32(img + 28, MACHO_LC_SEGMENT);
+    mw32(img + 32, 56 + 68);
+    memcpy(img + 36, "__TEXT", 6);
+    mw32(img + 76, 1);                       /* nsects（off+48） */
+    memcpy(img + 84, "__cstring", 9);        /* 第一个节从 off+56 开始 */
+    memcpy(img + 84 + 16, "__TEXT", 6);
+    mw32(img + 84 + 32, 0x2000);
+    mw32(img + 84 + 36, 0x40);
+    mw32(img + 84 + 40, 0x800);
+    n = 28 + 56 + 68;
+    info = macho_info(img, n);
+    if (!info.valid || info.is64 || info.nsections != 1)
+        return err(14, "32 位映像解析不对");
+    {
+        MachoSection s = { 0 };
+
+        if (macho_section(img, n, &info, 0, &s) != 1 || s.addr != 0x2000
+            || s.size != 0x40 || s.offset != 0x800)
+            return err(15, "32 位节字段不对");
+    }
+    /* fat：两个架构 */
+    fat[0] = (char)0xCA;
+    fat[1] = (char)0xFE;
+    fat[2] = (char)0xBA;
+    fat[3] = (char)0xBE;
+    fat[4] = 0;
+    fat[5] = 0;
+    fat[6] = 0;
+    fat[7] = 2;
+    /* arch 0：x86_64 @0x1000 大小 0x2000 */
+    {
+        int o = 8;
+
+        fat[o] = 0x01;                        /* 0x01000007 大端 */
+        fat[o + 3] = 0x07;
+        fat[o + 7] = 0x03;                    /* cpusubtype 3 */
+        fat[o + 10] = 0x10;                   /* offset 0x1000 */
+        fat[o + 14] = 0x20;                   /* size 0x2000 */
+        o += 20;
+        fat[o] = 0x01;                        /* 0x0100000C arm64 */
+        fat[o + 3] = 0x0C;
+        fat[o + 7] = 0x02;
+        fat[o + 10] = 0x30;                   /* offset 0x3000 */
+        fat[o + 14] = 0x40;
+    }
+    info = macho_info(fat, 48);
+    if (!info.valid || !info.fat || info.nfat != 2)
+        return err(16, "fat 外壳解析不对");
+    if (macho_arch(fat, 48, &info, 0, &arch) != 1
+        || arch.cputype != MACHO_CPU_X86_64 || arch.cpusubtype != 3
+        || arch.offset != 0x1000 || arch.size != 0x2000)
+        return err(17, "第一个架构不对");
+    if (macho_arch(fat, 48, &info, 1, &arch) != 1
+        || arch.cputype != MACHO_CPU_ARM64 || arch.offset != 0x3000)
+        return err(18, "第二个架构不对");
+    if (macho_arch(fat, 48, &info, 2, &arch) != 0)
+        return err(19, "越界架构应该 0");
+    /* 坏头 */
+    if (macho_info("a", 1).valid || macho_info(0, 100).valid)
+        return err(20, "空指针/太短不该有效");
+    {
+        static char bad[128] = { 0 };
+
+        mw32(bad, 0x12345678);
+        if (macho_info(bad, 64).valid)
+            return err(21, "magic 不对不该有效");
+        mk_macho(bad);
+        mw32(bad + 20, 4);                    /* sizeofcmds 太小 */
+        if (macho_info(bad, 1024).valid)
+            return err(22, "sizeofcmds 太小不该有效");
+        mk_macho(bad);
+        mw32(bad + 4 + 32, 4);                /* 第一条命令 cmdsize=4 */
+        if (macho_info(bad, 1024).valid)
+            return err(23, "cmdsize 非法不该有效");
+    }
+}

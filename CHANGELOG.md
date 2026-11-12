@@ -56,6 +56,14 @@
 
 ### 标准库
 
+- **标准库第三十五批（二进制容器格式）**：`std.data.cpio` / `std.data.pe` /
+  `std.data.macho` / `std.data.wasm` 四个零分配结构解析模块，集成示例
+  `examples/stdexec.c6`（`make std-exec`）。cpio 认 newc/crc；pe 走 DOS 头到节表
+  并做 RVA→文件偏移映射（PE32/PE32+ 分开处理）；macho 认 thin 32/64 位与 fat
+  外壳，抓 `LC_UUID`/`LC_MAIN`；wasm 逐节遍历并解导出表。错误号段
+  `std.data.cpio`=0x6095 … `std.data.wasm`=0x6098（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第三十四批（网络协议编解码）**：`std.net.sse` / `std.net.socks5` /
   `std.net.mqtt` / `std.encoding.snappy` 四个零分配字节层编解码模块，集成示例
   `examples/stdproto.c6`（`make std-proto`）。sse 按空行派发事件、多行 data 拼进

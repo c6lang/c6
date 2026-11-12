@@ -1,0 +1,381 @@
+/* std/data/pe：Windows PE / COFF 映像头解析（零分配）。
+ *
+ *     import std.data.pe;
+ *
+ *     PeInfo info = pe_info(data, n);
+ *     if (info.valid) {
+ *         // info.machine / info.pe32plus / info.entry_rva / info.image_base
+ *         // info.subsystem / info.nsections / info.is_dll
+ *         PeSection s = { 0 };
+ *         for (int i = 0; i < info.nsections; i++)
+ *             if (pe_section(data, n, &info, i, &s) == 1) ...
+ *     }
+ *
+ * 走的是 DOS 头 → `e_lfanew` → `PE\0\0` → COFF 头 → 可选头 → 节表这条线。
+ * PE32（`0x10B`）与 PE32+（`0x20B`）都认，字段偏移不同处单独处理。
+ *
+ * 约定：
+ *
+ * - `pe_info` 只做头部校验，不检查节表是否落在缓冲内（`pe_section` 才查），
+ *   头本身越界就返回 `valid=0`；
+ * - `pe_section` 返回 1 取到 / 0 下标越界 / -1 节表越界；
+ * - 节名是 8 字节定长、不一定 NUL 结尾，`PeSection.name` 是按最后一个 NUL
+ *   （没有就 8 字节）裁出来的视图；
+ * - `pe_rva_to_off` 按节的 `VirtualAddress..VirtualAddress+VirtualSize` 映射，
+ *   落在节的原始数据之外返回 0（很多 RVA 在 `.bss` 里，没有文件偏移）；
+ * - `pe_machine_name` 只覆盖常见的 i386/amd64/arm/arm64/ia64/riscv。
+ */
+#include <string.h>
+
+module std.data.pe;
+import std.core.types;
+import std.text.str;
+
+enum PeConst {
+    PE_MACHINE_I386 = 0x014C,
+    PE_MACHINE_AMD64 = 0x8664,
+    PE_MACHINE_ARM = 0x01C0,
+    PE_MACHINE_ARM64 = 0xAA64,
+    PE_MACHINE_IA64 = 0x0200,
+    PE_MACHINE_RISCV32 = 0x5032,
+    PE_MACHINE_RISCV64 = 0x5064,
+    PE_SUBSYS_NATIVE = 1,
+    PE_SUBSYS_WINDOWS_GUI = 2,
+    PE_SUBSYS_WINDOWS_CUI = 3,
+    PE_SUBSYS_EFI_APP = 10,
+};
+
+struct PeInfo {
+    int valid;
+    int pe32plus;
+    int machine;
+    int nsections;
+    int subsystem;
+    int characteristics;
+    int is_dll;
+    u32 timestamp;
+    u32 entry_rva;
+    u32 image_size;
+    u64 image_base;
+    int opt_off;        /* 可选头偏移（0 表示没有） */
+    int sec_off;        /* 节表偏移 */
+};
+
+static u16 pe_u16(const u8 *p)
+{
+    return (u16)((u16)p[0] | ((u16)p[1] << 8));
+}
+
+static u32 pe_u32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u64 pe_u64(const u8 *p)
+{
+    return (u64)pe_u32(p) | ((u64)pe_u32(p + 4) << 32);
+}
+
+PeInfo pe_info(const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    PeInfo info = { 0 };
+    int lfanew = 0, coff = 0, opt = 0, opt_size = 0;
+
+    if (!src || n < 64)
+        return info;
+    if (p[0] != 'M' || p[1] != 'Z')
+        return info;
+    {
+        u64 lf = (u64)pe_u32(p + 0x3C);
+
+        if (lf < 64 || lf + 24 > (u64)n)
+            return info;
+        lfanew = (int)lf;
+    }
+    if (memcmp(p + lfanew, "PE\0\0", 4) != 0)
+        return info;
+    coff = lfanew + 4;
+    info.machine = pe_u16(p + coff);
+    info.nsections = pe_u16(p + coff + 2);
+    info.timestamp = pe_u32(p + coff + 4);
+    opt_size = pe_u16(p + coff + 16);
+    info.characteristics = pe_u16(p + coff + 18);
+    info.is_dll = (info.characteristics & 0x2000) ? 1 : 0;
+    opt = coff + 20;
+    info.opt_off = opt_size > 0 ? opt : 0;
+    if (opt_size > 0) {
+        int magic = 0;
+
+        if (opt + 2 > n)
+            return info;
+        magic = pe_u16(p + opt);
+        if (magic == 0x10B) {
+            if (opt + 96 > n)
+                return info;
+            info.pe32plus = 0;
+            info.entry_rva = pe_u32(p + opt + 16);
+            info.image_base = pe_u32(p + opt + 28);
+            info.image_size = pe_u32(p + opt + 56);
+            info.subsystem = pe_u16(p + opt + 68);
+        } else if (magic == 0x20B) {
+            if (opt + 112 > n)
+                return info;
+            info.pe32plus = 1;
+            info.entry_rva = pe_u32(p + opt + 16);
+            info.image_base = pe_u64(p + opt + 24);
+            info.image_size = pe_u32(p + opt + 56);
+            info.subsystem = pe_u16(p + opt + 68);
+        } else {
+            return info;
+        }
+    }
+    info.sec_off = opt + opt_size;
+    info.valid = info.nsections > 0 || opt_size > 0;
+    return info;
+}
+
+struct PeSection {
+    Str name;
+    u32 vsize;
+    u32 vaddr;
+    u32 raw_size;
+    u32 raw_off;
+    u32 flags;
+};
+
+int pe_section(const void *src, int n, const PeInfo *info, int idx,
+               PeSection *out)
+{
+    const u8 *p = (const u8 *)src;
+    int off = 0, name_len = 8;
+
+    if (!src || !info || !info->valid || !out)
+        return -1;
+    if (idx < 0 || idx >= info->nsections)
+        return 0;
+    off = info->sec_off + idx * 40;
+    if (off + 40 > n)
+        return -1;
+    memset(out, 0, sizeof *out);
+    while (name_len > 0 && p[off + name_len - 1] == 0)
+        name_len--;
+    out->name.s = (char[:]){ (char *)p + off, name_len };
+    out->vsize = pe_u32(p + off + 8);
+    out->vaddr = pe_u32(p + off + 12);
+    out->raw_size = pe_u32(p + off + 16);
+    out->raw_off = pe_u32(p + off + 20);
+    out->flags = pe_u32(p + off + 36);
+    return 1;
+}
+
+/* RVA → 文件偏移：返回 1 成功、0 不在任何节的文件数据里 */
+int pe_rva_to_off(const void *src, int n, const PeInfo *info, u32 rva,
+                  int *off)
+{
+    int i = 0;
+
+    if (!src || !info || !info->valid || !off)
+        return 0;
+    for (i = 0; i < info->nsections; i++) {
+        PeSection s = { 0 };
+        u32 span = 0;
+
+        if (pe_section(src, n, info, i, &s) != 1)
+            return 0;
+        span = s.vsize > s.raw_size ? s.vsize : s.raw_size;
+        if (rva >= s.vaddr && rva < s.vaddr + span) {
+            u32 delta = rva - s.vaddr;
+
+            if (delta >= s.raw_size)
+                return 0;               /* 在 .bss 那种只有虚拟大小的区里 */
+            if ((u64)s.raw_off + delta + 1 > (u64)n)
+                return 0;
+            *off = (int)(s.raw_off + delta);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+const char *pe_machine_name(int machine)
+{
+    switch (machine) {
+    case PE_MACHINE_I386: return "i386";
+    case PE_MACHINE_AMD64: return "amd64";
+    case PE_MACHINE_ARM: return "arm";
+    case PE_MACHINE_ARM64: return "arm64";
+    case PE_MACHINE_IA64: return "ia64";
+    case PE_MACHINE_RISCV32: return "riscv32";
+    case PE_MACHINE_RISCV64: return "riscv64";
+    default: return "unknown";
+    }
+}
+
+const char *pe_subsystem_name(int subsystem)
+{
+    switch (subsystem) {
+    case PE_SUBSYS_NATIVE: return "native";
+    case PE_SUBSYS_WINDOWS_GUI: return "windows";
+    case PE_SUBSYS_WINDOWS_CUI: return "console";
+    case PE_SUBSYS_EFI_APP: return "efi";
+    default: return "unknown";
+    }
+}
+
+/* ---- 自测 ---- */
+
+static void pe_put16(char *p, u32 v)
+{
+    p[0] = (char)(v & 0xFF);
+    p[1] = (char)((v >> 8) & 0xFF);
+}
+
+static void pe_put32(char *p, u32 v)
+{
+    p[0] = (char)(v & 0xFF);
+    p[1] = (char)((v >> 8) & 0xFF);
+    p[2] = (char)((v >> 16) & 0xFF);
+    p[3] = (char)((v >> 24) & 0xFF);
+}
+
+/* 造一个 PE32+ 映像：两个节（.text 在文件中，.bss 只有虚拟大小） */
+static int mk_pe(char *buf, int pe32plus)
+{
+    int lfanew = 0x80;
+    int coff = lfanew + 4;
+    int opt = coff + 20;
+    int opt_size = pe32plus ? 240 : 224;
+    int sec = opt + opt_size;
+    int i = 0;
+
+    memset(buf, 0, 1024);
+    buf[0] = 'M';
+    buf[1] = 'Z';
+    pe_put32(buf + 0x3C, (u32)lfanew);
+    memcpy(buf + lfanew, "PE\0\0", 4);
+    pe_put16(buf + coff, 0x8664);            /* amd64 */
+    pe_put16(buf + coff + 2, 2);             /* 两个节 */
+    pe_put32(buf + coff + 4, 0x66000000u);
+    pe_put16(buf + coff + 16, (u32)opt_size);
+    pe_put16(buf + coff + 18, 0x0022);       /* EXECUTABLE_IMAGE | LARGE_ADDRESS */
+    if (pe32plus) {
+        pe_put16(buf + opt, 0x20B);
+        pe_put32(buf + opt + 16, 0x1000);    /* entry RVA */
+        pe_put32(buf + opt + 24, 0x140000000u & 0xFFFFFFFFu);
+        pe_put32(buf + opt + 28, 0x1);
+        pe_put32(buf + opt + 56, 0x4000);    /* image size */
+        pe_put16(buf + opt + 68, PE_SUBSYS_WINDOWS_CUI);
+    } else {
+        pe_put16(buf + opt, 0x10B);
+        pe_put32(buf + opt + 16, 0x1000);
+        pe_put32(buf + opt + 28, 0x400000);
+        pe_put32(buf + opt + 56, 0x4000);
+        pe_put16(buf + opt + 68, PE_SUBSYS_WINDOWS_GUI);
+    }
+    /* .text：虚拟 0x1000、大小 0x200、文件偏移 0x400、raw 0x200 */
+    memcpy(buf + sec, ".text\0\0\0", 8);
+    pe_put32(buf + sec + 8, 0x180);
+    pe_put32(buf + sec + 12, 0x1000);
+    pe_put32(buf + sec + 16, 0x200);
+    pe_put32(buf + sec + 20, 0x400);
+    pe_put32(buf + sec + 36, 0x60000020);
+    /* .bss：虚拟 0x2000、大小 0x1000、raw 0 —— 只有虚拟大小 */
+    memcpy(buf + sec + 40, ".bss\0\0\0\0", 8);
+    pe_put32(buf + sec + 40 + 8, 0x1000);
+    pe_put32(buf + sec + 40 + 12, 0x2000);
+    pe_put32(buf + sec + 40 + 16, 0);
+    pe_put32(buf + sec + 40 + 20, 0);
+    pe_put32(buf + sec + 40 + 36, 0xC0000080);
+    for (i = 0; i < 0x200; i++)
+        buf[0x400 + i] = (char)(i & 0xFF);
+    return 0x600;
+}
+
+test "PE：PE32+ 头、节表与 RVA 映射" {
+    static char img[1024] = { 0 };
+    int n = mk_pe(img, 1);
+    PeInfo info = pe_info(img, n);
+    PeSection s = { 0 };
+    int off = 0;
+
+    if (!info.valid)
+        return err(1, "PE32+ 头应该有效");
+    if (info.machine != PE_MACHINE_AMD64 || info.pe32plus != 1)
+        return err(2, "机器或 PE32+ 标志不对");
+    if (info.entry_rva != 0x1000 || info.image_size != 0x4000)
+        return err(3, "入口或映像大小不对");
+    if (info.image_base != 0x140000000ULL)
+        return err(4, "PE32+ 的 ImageBase 是 64 位");
+    if (info.subsystem != PE_SUBSYS_WINDOWS_CUI || info.is_dll)
+        return err(5, "子系统或 DLL 标志不对");
+    if (info.nsections != 2)
+        return err(6, "节数不对");
+    if (pe_section(img, n, &info, 0, &s) != 1)
+        return err(7, "第一个节没读到");
+    if (s.name.s.len != 5 || memcmp(s.name.s.data, ".text", 5) != 0)
+        return err(8, "节名裁剪不对");
+    if (s.vaddr != 0x1000 || s.raw_off != 0x400 || s.raw_size != 0x200)
+        return err(9, "节字段不对");
+    if (pe_section(img, n, &info, 1, &s) != 1 || s.name.s.len != 4
+        || memcmp(s.name.s.data, ".bss", 4) != 0)
+        return err(10, "第二个节不对");
+    if (pe_section(img, n, &info, 2, &s) != 0)
+        return err(11, "越界下标应该 0");
+    /* RVA 映射：.text 里能落到文件，.bss 里不能 */
+    if (pe_rva_to_off(img, n, &info, 0x1000, &off) != 1 || off != 0x400)
+        return err(12, "text 起点映射不对");
+    if (pe_rva_to_off(img, n, &info, 0x10FF, &off) != 1 || off != 0x4FF)
+        return err(13, "text 偏移映射不对");
+    if (pe_rva_to_off(img, n, &info, 0x1200, &off) != 0)
+        return err(14, "越过 raw_size 应该失败");
+    if (pe_rva_to_off(img, n, &info, 0x2000, &off) != 0)
+        return err(15, "只有虚拟大小的 .bss 应该失败");
+    if (pe_rva_to_off(img, n, &info, 0x9000, &off) != 0)
+        return err(16, "不在任何节应该失败");
+    if (memcmp(img + 0x400, "\x00\x01\x02", 3) != 0)
+        return err(17, "节数据应该在 raw_off 上");
+    if (strcmp(pe_machine_name(info.machine), "amd64") != 0
+        || strcmp(pe_subsystem_name(info.subsystem), "console") != 0)
+        return err(18, "名字表不对");
+}
+
+test "PE：PE32 与坏头" {
+    static char img[1024] = { 0 };
+    int n = mk_pe(img, 0);
+    PeInfo info = pe_info(img, n);
+
+    if (!info.valid || info.pe32plus != 0)
+        return err(19, "PE32 应该有效且不是 PE32+");
+    if (info.image_base != 0x400000)
+        return err(20, "PE32 的 ImageBase 是 32 位");
+    if (info.subsystem != PE_SUBSYS_WINDOWS_GUI || info.nsections != 2)
+        return err(21, "PE32 的子系统或节数不对");
+    /* 不是 MZ */
+    if (pe_info("XX", 2).valid)
+        return err(22, "没有 MZ 不该有效");
+    if (pe_info(img, 32).valid)
+        return err(23, "太短不该有效");
+    if (pe_info(0, 200).valid)
+        return err(24, "空指针不该有效");
+    /* e_lfanew 指到缓冲外 */
+    pe_put32(img + 0x3C, 0x7FFFFFF0u);
+    if (pe_info(img, n).valid)
+        return err(25, "e_lfanew 越界不该有效");
+    /* 签名不对 */
+    {
+        static char bad[1024] = { 0 };
+        int m = mk_pe(bad, 1);
+
+        bad[0x80] = 'X';
+        if (pe_info(bad, m).valid)
+            return err(26, "PE 签名不对不该有效");
+        bad[0x80] = 'P';
+        /* 可选头 magic 坏 */
+        mk_pe(bad, 1);
+        pe_put16(bad + 0x80 + 4 + 20, 0x107);
+        if (pe_info(bad, m).valid)
+            return err(27, "magic 不对不该有效");
+    }
+}

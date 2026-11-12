@@ -1399,6 +1399,31 @@ socks5 还要 `std/net/inet.c6`，snappy 自成一体。示例 `examples/stdprot
 验收：`make stdtest`（149 个模块、0 failure）、`make std-proto`（21 条自检全过）、
 `make check-all`。
 
+### 11.47 标准库第三十五批（cpio / pe / macho / wasm）
+
+第三十五批看二进制容器：归档格式与三种可执行/字节码格式，都只解析结构。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.cpio` | cpio 归档 | 只认 newc（`070701`）与 crc（`070702`）：110 字节 ASCII 十六进制头 + NUL 结尾的名字 + 4 字节对齐的数据；`TRAILER!!!` 返回 0；odc 与旧二进制格式不支持（现实里 rpms/initramfs 都是 newc） |
+| `std.data.pe` | PE / COFF | DOS 头 → `e_lfanew` → `PE\0\0` → COFF → 可选头，PE32 与 PE32+ 的 `ImageBase` 宽度分开处理；节表按 40 字节遍历；`pe_rva_to_off` 只在节的**原始数据**范围内给偏移（`.bss` 那种只有虚拟大小的段落返回 0，这点最容易写错） |
+| `std.data.macho` | Mach-O | thin 32/64 位小端 + fat 外壳；`LC_SEGMENT`/`LC_SEGMENT_64` 的固定部分 56/64 字节、节 68/80 字节，`nsects` 在命令内偏移 48/64；抓 `LC_UUID` 与 `LC_MAIN`；大端映像不支持 |
+| `std.data.wasm` | WebAssembly | 只做「模块 → 节 → 计数/导出项」，u32 LEB128 上限 5 字节；`wasm_count` 只对以元素个数开头的节有效；不解析函数体 |
+
+两个坑值得记一笔：PE 的 `e_lfanew` 是 u32，`(int)lf + 24` 会溢出成负数绕过越界
+检查（现在用 u64 算），以及 Mach-O 的 `nsects` 在段命令里是 `off+48`（32 位）/
+`off+64`（64 位），不是「命令末尾减去 flags」——按后者算会把 `flags` 当成节数。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.cpio`=0x6095、
+`std.data.pe`=0x6096、`std.data.macho`=0x6097、`std.data.wasm`=0x6098；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-exec` 与 `STD_EXEC_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。示例
+`examples/stdexec.c6` 在内存里拼出四种容器再解析（15 条自检）。
+
+验收：`make stdtest`（153 个模块、0 failure）、`make std-exec`（15 条自检全过）、
+`make check-all`。
+
+
 
 
 

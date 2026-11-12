@@ -12854,6 +12854,10 @@ static const struct C6ErrStdSlot {
     { "std.net.socks5",         C6_ERR_SLOT_STD + 146 },
     { "std.net.mqtt",           C6_ERR_SLOT_STD + 147 },
     { "std.encoding.snappy",    C6_ERR_SLOT_STD + 148 },
+    { "std.data.cpio",          C6_ERR_SLOT_STD + 149 },
+    { "std.data.pe",            C6_ERR_SLOT_STD + 150 },
+    { "std.data.macho",         C6_ERR_SLOT_STD + 151 },
+    { "std.data.wasm",          C6_ERR_SLOT_STD + 152 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

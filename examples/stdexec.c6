@@ -1,0 +1,308 @@
+/* examples/stdexec.c6 —— 第三十五批（二进制容器格式）的集成示例。
+ *
+ *     make std-exec
+ *
+ * 四个模块都只看容器结构。示例在内存里现场拼出四种容器再解析：
+ * cpio 归档（文件 + 目录 + 收尾）、PE32+ 映像（节表与 RVA）、Mach-O 64 位
+ * 映像（段/节 + LC_MAIN）、wasm 模块（导出表）。每节自检。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.cpio;
+import std.data.pe;
+import std.data.macho;
+import std.data.wasm;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void w16(char *p, u32 v)
+{
+    p[0] = (char)(v & 0xFF);
+    p[1] = (char)((v >> 8) & 0xFF);
+}
+
+static void w32(char *p, u32 v)
+{
+    p[0] = (char)(v & 0xFF);
+    p[1] = (char)((v >> 8) & 0xFF);
+    p[2] = (char)((v >> 16) & 0xFF);
+    p[3] = (char)((v >> 24) & 0xFF);
+}
+
+static void w64(char *p, u64 v)
+{
+    w32(p, (u32)(v & 0xFFFFFFFFu));
+    w32(p + 4, (u32)(v >> 32));
+}
+
+static void put_hex8(char *p, u32 v)
+{
+    static const char *d = "0123456789ABCDEF";
+    int i = 0;
+
+    for (i = 0; i < 8; i++)
+        p[i] = d[(v >> (28 - 4 * i)) & 0xF];
+}
+
+/* ---- cpio ---- */
+static int mk_cpio_entry(char *buf, int off, const char *name, u32 mode,
+                         const char *data, int size)
+{
+    int nl = (int)strlen(name) + 1;
+
+    memcpy(buf + off, "070701", 6);
+    put_hex8(buf + off + 6, 1);
+    put_hex8(buf + off + 14, mode);
+    put_hex8(buf + off + 22, 0);
+    put_hex8(buf + off + 30, 0);
+    put_hex8(buf + off + 38, 1);
+    put_hex8(buf + off + 46, 0);
+    put_hex8(buf + off + 54, (u32)size);
+    put_hex8(buf + off + 62, 0);
+    put_hex8(buf + off + 70, 0);
+    put_hex8(buf + off + 78, 0);
+    put_hex8(buf + off + 86, 0);
+    put_hex8(buf + off + 94, (u32)nl);
+    put_hex8(buf + off + 102, 0);
+    off += 110;
+    memcpy(buf + off, name, (size_t)nl);
+    off += nl;
+    while (off % 4)
+        buf[off++] = 0;
+    if (size > 0) {
+        memcpy(buf + off, data, (size_t)size);
+        off += size;
+        while (off % 4)
+            buf[off++] = 0;
+    }
+    return off;
+}
+
+static void do_cpio(void)
+{
+    static char arc[512] = { 0 };
+    int off = 0;
+    CpioReader r = { 0 };
+    CpioEntry e = { 0 };
+    int files = 0, dirs = 0;
+
+    printf("== cpio\n");
+    off = mk_cpio_entry(arc, off, "bin/", 0040755, 0, 0);
+    off = mk_cpio_entry(arc, off, "bin/hello", 0100755, "echo hi\n", 8);
+    off = mk_cpio_entry(arc, off, "TRAILER!!!", 0, 0, 0);
+    r = cpio_open(arc, off);
+    while (r.next(&e) == 1) {
+        if (e.is_dir)
+            dirs++;
+        if (e.is_regular)
+            files++;
+        if (e.is_regular)
+            printf("   %.*s：%d 字节，数据在 %d\n", e.name.s.len, e.name.s.data,
+                   (int)e.size, e.data_off);
+    }
+    check(dirs == 1 && files == 1, "归档里一目录一文件");
+    check(cpio_find(arc, off, "bin/hello", &e) == 1 && e.size == 8, "按名字找文件");
+    check(memcmp(arc + e.data_off, "echo hi\n", 8) == 0, "文件数据");
+}
+
+/* ---- PE ---- */
+static int mk_pe(char *buf)
+{
+    int lfanew = 0x80, coff = lfanew + 4, opt = coff + 20;
+    int opt_size = 240, sec = opt + opt_size;
+
+    memset(buf, 0, 1024);
+    buf[0] = 'M';
+    buf[1] = 'Z';
+    w32(buf + 0x3C, (u32)lfanew);
+    memcpy(buf + lfanew, "PE\0\0", 4);
+    w16(buf + coff, PE_MACHINE_AMD64);
+    w16(buf + coff + 2, 1);
+    w16(buf + coff + 16, (u32)opt_size);
+    w16(buf + coff + 18, 0x0022);
+    w16(buf + opt, 0x20B);
+    w32(buf + opt + 16, 0x1000);
+    w32(buf + opt + 24, 0x140000000u & 0xFFFFFFFFu);
+    w32(buf + opt + 28, 1);
+    w32(buf + opt + 56, 0x3000);
+    w16(buf + opt + 68, PE_SUBSYS_WINDOWS_CUI);
+    memcpy(buf + sec, ".text\0\0\0", 8);
+    w32(buf + sec + 8, 0x180);
+    w32(buf + sec + 12, 0x1000);
+    w32(buf + sec + 16, 0x200);
+    w32(buf + sec + 20, 0x400);
+    w32(buf + sec + 36, 0x60000020);
+    buf[0x400] = (char)0x48;            /* 假装一条指令 */
+    return 0x600;
+}
+
+static void do_pe(void)
+{
+    static char img[1024] = { 0 };
+    int n = mk_pe(img);
+    PeInfo info = pe_info(img, n);
+    PeSection s = { 0 };
+    int off = 0;
+
+    printf("== pe\n");
+    printf("   %s，%d 个节，入口 RVA 0x%x，镜像基址 0x%llx\n",
+           pe_machine_name(info.machine), info.nsections, info.entry_rva,
+           (unsigned long long)info.image_base);
+    check(info.valid && info.pe32plus == 1, "PE32+ 有效");
+    check(info.entry_rva == 0x1000 && info.nsections == 1, "入口与节数");
+    check(pe_section(img, n, &info, 0, &s) == 1
+              && s.name.s.len == 5 && memcmp(s.name.s.data, ".text", 5) == 0,
+          "节名");
+    check(pe_rva_to_off(img, n, &info, 0x1000, &off) == 1 && off == 0x400
+              && (u8)img[off] == 0x48,
+          "RVA 映射到文件偏移");
+    check(pe_info("MZ", 2).valid == 0, "坏头无效");
+}
+
+/* ---- Mach-O ---- */
+static int mk_macho(char *buf)
+{
+    int hdr = 32, seg = hdr;
+    int seg_size = 72 + 80;
+    int mainc = seg + seg_size;
+    int total = mainc + 24;
+    int sec = seg + 72;
+
+    memset(buf, 0, 1024);
+    w32(buf, MACHO_MAGIC64);
+    w32(buf + 4, MACHO_CPU_ARM64);
+    w32(buf + 12, MACHO_FILETYPE_EXECUTE);
+    w32(buf + 16, 2);
+    w32(buf + 20, (u32)(total - hdr));
+    w32(buf + seg, MACHO_LC_SEGMENT_64);
+    w32(buf + seg + 4, (u32)seg_size);
+    memcpy(buf + seg + 8, "__TEXT", 6);
+    w64(buf + seg + 24, 0x100000000ULL);
+    w64(buf + seg + 32, 0x4000);
+    w64(buf + seg + 48, 0x4000);
+    w32(buf + seg + 64, 1);             /* nsects */
+    memcpy(buf + sec, "__text", 6);
+    memcpy(buf + sec + 16, "__TEXT", 6);
+    w64(buf + sec + 32, 0x100001000ULL);
+    w64(buf + sec + 40, 0x200);
+    w32(buf + sec + 48, 0x1000);
+    w32(buf + mainc, MACHO_LC_MAIN);
+    w32(buf + mainc + 4, 24);
+    w64(buf + mainc + 8, 0x1000);
+    return total;
+}
+
+static void do_macho(void)
+{
+    static char img[1024] = { 0 };
+    int n = mk_macho(img);
+    MachoInfo info = macho_info(img, n);
+    MachoSection s = { 0 };
+
+    printf("== macho\n");
+    printf("   %s，%s，%d 个节，入口偏移 0x%llx\n",
+           macho_cpu_name(info.cputype), macho_filetype_name(info.filetype),
+           info.nsections, (unsigned long long)info.entry_off);
+    check(info.valid && info.is64 && !info.fat, "64 位 thin 有效");
+    check(info.nsections == 1 && info.has_entry && info.entry_off == 0x1000,
+          "节数与入口");
+    check(macho_section(img, n, &info, 0, &s) == 1
+              && s.sectname.s.len == 6
+              && memcmp(s.sectname.s.data, "__text", 6) == 0,
+          "__text 节");
+    check(s.addr == 0x100001000ULL && s.size == 0x200 && s.offset == 0x1000,
+          "节地址与偏移");
+}
+
+/* ---- wasm ---- */
+static int wleb(char *b, int off, u32 v)
+{
+    while (v >= 0x80) {
+        b[off++] = (char)((v & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    b[off++] = (char)v;
+    return off;
+}
+
+static int mk_wasm(char *buf)
+{
+    int off = 8, sl = 0;
+    static char sec[64] = { 0 };
+
+    memcpy(buf, "\0asm", 4);
+    buf[4] = 1;
+    /* export：1 项 "start"(func 0) */
+    sl = 0;
+    sl = wleb(sec, sl, 1);
+    sl = wleb(sec, sl, 5);
+    memcpy(sec + sl, "start", 5);
+    sl += 5;
+    sec[sl++] = 0x00;
+    sl = wleb(sec, sl, 0);
+    buf[off++] = (char)WASM_SEC_EXPORT;
+    off = wleb(buf, off, (u32)sl);
+    memcpy(buf + off, sec, (size_t)sl);
+    off += sl;
+    /* code：1 个空函数体 */
+    sl = 0;
+    sl = wleb(sec, sl, 1);
+    sl = wleb(sec, sl, 2);
+    sl = wleb(sec, sl, 0);
+    sec[sl++] = 0x0B;
+    buf[off++] = (char)WASM_SEC_CODE;
+    off = wleb(buf, off, (u32)sl);
+    memcpy(buf + off, sec, (size_t)sl);
+    return off + sl;
+}
+
+static void do_wasm(void)
+{
+    static char mod[256] = { 0 };
+    int n = mk_wasm(mod);
+    WasmModule m = wasm_open(mod, n);
+    WasmReader r = wasm_reader(mod, n);
+    WasmSection s = { 0 };
+    Str nm = { 0 };
+    int kind = 0, count = 0;
+    u32 index = 0;
+
+    printf("== wasm\n");
+    check(m.valid && m.nsections == 2, "模块有效、两个节");
+    while (r.next(&s) == 1) {
+        if (s.id == WASM_SEC_EXPORT) {
+            if (wasm_count(mod, n, &s, &count) != 1 || count != 1)
+                return (void)check(0, "导出计数");
+            if (wasm_export_at(mod, n, &s, 0, &nm, &kind, &index) != 1)
+                return (void)check(0, "导出项");
+            printf("   导出 %.*s（kind=%d index=%d）\n", nm.s.len, nm.s.data,
+                   kind, (int)index);
+        }
+    }
+    check(nm.s.len == 5 && memcmp(nm.s.data, "start", 5) == 0 && kind == 0,
+          "导出名字与种类");
+    check(strcmp(wasm_section_name(WASM_SEC_CODE), "code") == 0, "节名表");
+}
+
+int main(void)
+{
+    do_cpio();
+    do_pe();
+    do_macho();
+    do_wasm();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

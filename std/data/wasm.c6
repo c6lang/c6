@@ -1,0 +1,483 @@
+/* std/data/wasm：WebAssembly 二进制模块的结构解析（零分配）。
+ *
+ *     import std.data.wasm;
+ *
+ *     WasmModule m = wasm_open(data, n);
+ *     WasmReader r = wasm_reader(data, n);
+ *     WasmSection s = { 0 };
+ *     while (r.next(&s) == 1) {
+ *         if (s.id == WASM_SEC_EXPORT) {
+ *             Str name = { 0 };
+ *             int kind = 0;
+ *             u32 index = 0;
+ *             for (int i = 0; wasm_export_at(&s, i, &name, &kind, &index) == 1; i++)
+ *                 ...
+ *         }
+ *     }
+ *
+ * 只做「模块 → 节 → 节内计数/导出项」这一层：不解析函数体、不做类型检查、
+ * 不验证导入导出是否配套。够用来列导出、数函数、找自定义节（`name` 段）。
+ *
+ * 约定：
+ *
+ * - 头是 `\0asm` + 版本 1（小端 u32），别的都当无效；
+ * - 节大小是 u32 LEB128；节数据越界、LEB128 超过 5 字节、版本不是 1 → 无效；
+ * - `wasm_count(mod, n, &sec, &count)` 对 import/function/export/global/table/
+ *   memory/code/data 这些以元素个数开头的节返回 1 并写计数；其余节返回 0
+ *   （没有统一计数）；
+ * - `wasm_export_at(mod, n, &sec, idx, &name, &kind, &index)` 依次给 `name` /
+ *   `kind`（0 函数、1 表、2 内存、3 全局）/ `index`，越界返回 0、结构坏返回 -1；
+ * - `wasm_section_name` 给节 id 的标准名字，自定义节是 "custom"。
+ */
+#include <string.h>
+
+module std.data.wasm;
+import std.core.types;
+import std.text.str;
+
+enum WasmSectionId {
+    WASM_SEC_CUSTOM = 0,
+    WASM_SEC_TYPE = 1,
+    WASM_SEC_IMPORT = 2,
+    WASM_SEC_FUNCTION = 3,
+    WASM_SEC_TABLE = 4,
+    WASM_SEC_MEMORY = 5,
+    WASM_SEC_GLOBAL = 6,
+    WASM_SEC_EXPORT = 7,
+    WASM_SEC_START = 8,
+    WASM_SEC_ELEMENT = 9,
+    WASM_SEC_CODE = 10,
+    WASM_SEC_DATA = 11,
+    WASM_SEC_DATACOUNT = 12,
+};
+
+struct WasmModule {
+    int valid;
+    int version;
+    int nsections;
+    int bad;
+};
+
+struct WasmSection {
+    int id;
+    int off;            /* 节数据在模块里的偏移 */
+    int size;           /* 节数据长度 */
+};
+
+struct WasmReader {
+    const u8 *p;
+    int n;
+    int pos;
+    int bad;
+    int count;
+};
+
+/* u32 LEB128：返回消耗字节数 / 0 数据不够 / -1 超过 5 字节 */
+int wasm_leb_u32(const void *src, int n, u32 *out)
+{
+    const u8 *p = (const u8 *)src;
+    u32 v = 0;
+    int i = 0;
+
+    if (!src || n <= 0 || !out)
+        return -1;
+    for (i = 0; i < 5; i++) {
+        u8 b = 0;
+
+        if (i >= n)
+            return 0;
+        b = p[i];
+        v |= (u32)(b & 0x7F) << (7 * i);
+        if ((b & 0x80) == 0) {
+            *out = v;
+            return i + 1;
+        }
+    }
+    return -1;
+}
+
+int next(WasmReader *self, WasmSection *out)
+{
+    int used = 0;
+    u32 size = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (self->pos >= self->n)
+        return 0;
+    if (self->pos + 1 > self->n) {
+        self->bad = 1;
+        return -1;
+    }
+    out->id = self->p[self->pos];
+    if (out->id > WASM_SEC_DATACOUNT) {
+        self->bad = 1;
+        return -1;
+    }
+    used = wasm_leb_u32(self->p + self->pos + 1, self->n - self->pos - 1,
+                        &size);
+    if (used <= 0) {
+        self->bad = 1;
+        return -1;
+    }
+    out->off = self->pos + 1 + used;
+    out->size = (int)size;
+    if ((u64)out->off + (u64)size > (u64)self->n) {
+        self->bad = 1;
+        return -1;
+    }
+    self->pos = out->off + out->size;
+    self->count++;
+    return 1;
+}
+
+WasmModule wasm_open(const void *src, int n)
+{
+    const u8 *p = (const u8 *)src;
+    WasmModule m = { 0 };
+
+    if (!src || n < 8)
+        return m;
+    if (memcmp(p, "\0asm", 4) != 0)
+        return m;
+    m.version = (int)((u32)p[4] | ((u32)p[5] << 8) | ((u32)p[6] << 16)
+                      | ((u32)p[7] << 24));
+    if (m.version != 1)
+        return m;
+    m.valid = 1;
+    {
+        WasmReader r = { 0 };
+        WasmSection s = { 0 };
+
+        r.p = p;
+        r.n = n;
+        r.pos = 8;
+        while (r.next(&s) == 1)
+            m.nsections++;
+        if (r.bad)
+            m.valid = 0;
+    }
+    return m;
+}
+
+WasmReader wasm_reader(const void *src, int n)
+{
+    WasmReader r = { 0 };
+
+    if (!src || n < 8 || memcmp(src, "\0asm", 4) != 0) {
+        r.bad = 1;
+        return r;
+    }
+    r.p = (const u8 *)src;
+    r.n = n;
+    r.pos = 8;
+    return r;
+}
+
+/* 以元素个数开头的节：import/function/export/global/table/memory/code/data */
+int wasm_count(const void *mod, int n, const WasmSection *sec, int *count)
+{
+    const u8 *p = (const u8 *)mod;
+    u32 v = 0;
+    int used = 0;
+
+    if (!mod || !sec || !count || n <= 0)
+        return -1;
+    switch (sec->id) {
+    case WASM_SEC_IMPORT:
+    case WASM_SEC_FUNCTION:
+    case WASM_SEC_EXPORT:
+    case WASM_SEC_GLOBAL:
+    case WASM_SEC_TABLE:
+    case WASM_SEC_MEMORY:
+    case WASM_SEC_CODE:
+    case WASM_SEC_DATA:
+        break;
+    default:
+        return 0;                       /* 这些节没有统一的「个数」前缀 */
+    }
+    if (sec->size <= 0 || (u64)sec->off + (u64)sec->size > (u64)n)
+        return -1;
+    used = wasm_leb_u32(p + sec->off, sec->size, &v);
+    if (used <= 0)
+        return -1;
+    *count = (int)v;
+    return 1;
+}
+
+/* 第 idx 个导出项：1 成功 / 0 越界 / -1 坏 */
+int wasm_export_at(const void *mod, int n, const WasmSection *sec, int idx,
+                   Str *name, int *kind, u32 *index)
+{
+    const u8 *p = (const u8 *)mod;
+    u32 count = 0, v = 0;
+    int used = 0, off = 0, end = 0, i = 0;
+
+    if (!mod || !sec || n <= 0)
+        return -1;
+    if (sec->id != WASM_SEC_EXPORT || sec->size <= 0
+        || (u64)sec->off + (u64)sec->size > (u64)n)
+        return -1;
+    off = sec->off;
+    end = sec->off + sec->size;
+    used = wasm_leb_u32(p + off, end - off, &count);
+    if (used <= 0)
+        return -1;
+    off += used;
+    for (i = 0; i < (int)count; i++) {
+        u32 len = 0;
+        int kb = 0, koff = 0;
+
+        used = wasm_leb_u32(p + off, end - off, &len);
+        if (used <= 0)
+            return -1;
+        off += used;
+        if ((u64)off + (u64)len + 2 > (u64)end)
+            return -1;
+        kb = off;
+        off += (int)len;
+        koff = (int)p[off];
+        off++;
+        used = wasm_leb_u32(p + off, end - off, &v);
+        if (used <= 0)
+            return -1;
+        off += used;
+        if (i == idx) {
+            if (name)
+                name->s = (char[:]){ (char *)p + kb, (int)len };
+            if (kind)
+                *kind = koff;
+            if (index)
+                *index = v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+const char *wasm_section_name(int id)
+{
+    switch (id) {
+    case WASM_SEC_CUSTOM: return "custom";
+    case WASM_SEC_TYPE: return "type";
+    case WASM_SEC_IMPORT: return "import";
+    case WASM_SEC_FUNCTION: return "function";
+    case WASM_SEC_TABLE: return "table";
+    case WASM_SEC_MEMORY: return "memory";
+    case WASM_SEC_GLOBAL: return "global";
+    case WASM_SEC_EXPORT: return "export";
+    case WASM_SEC_START: return "start";
+    case WASM_SEC_ELEMENT: return "element";
+    case WASM_SEC_CODE: return "code";
+    case WASM_SEC_DATA: return "data";
+    case WASM_SEC_DATACOUNT: return "datacount";
+    default: return "unknown";
+    }
+}
+
+/* ---- 自测 ---- */
+
+static int wleb(char *buf, int off, u32 v)
+{
+    while (v >= 0x80) {
+        buf[off++] = (char)((v & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    buf[off++] = (char)v;
+    return off;
+}
+
+static int wsec(char *buf, int off, int id, const char *payload, int len)
+{
+    buf[off++] = (char)id;
+    off = wleb(buf, off, (u32)len);
+    memcpy(buf + off, payload, (size_t)len);
+    return off + len;
+}
+
+/* 造一个模块：type / import / function / export(2) / code / custom */
+static int mk_wasm(char *buf)
+{
+    int off = 0;
+    char sec[128] = { 0 };
+    int sl = 0;
+
+    memcpy(buf, "\0asm", 4);
+    buf[4] = 1;
+    buf[5] = 0;
+    buf[6] = 0;
+    buf[7] = 0;
+    off = 8;
+    /* type：1 个 func () -> () */
+    sl = 0;
+    sl = wleb(sec, sl, 1);
+    sec[sl++] = 0x60;
+    sl = wleb(sec, sl, 0);              /* 无参数 */
+    sl = wleb(sec, sl, 0);              /* 无返回值 */
+    off = wsec(buf, off, WASM_SEC_TYPE, sec, sl);
+    /* import：1 个 "env" "log" func 0 */
+    sl = 0;
+    sl = wleb(sec, sl, 1);
+    sl = wleb(sec, sl, 3);
+    memcpy(sec + sl, "env", 3);
+    sl += 3;
+    sl = wleb(sec, sl, 3);
+    memcpy(sec + sl, "log", 3);
+    sl += 3;
+    sec[sl++] = 0x00;                   /* kind: func */
+    sl = wleb(sec, sl, 0);              /* type 0 */
+    off = wsec(buf, off, WASM_SEC_IMPORT, sec, sl);
+    /* function：1 个函数，type 0 */
+    sl = 0;
+    sl = wleb(sec, sl, 1);
+    sl = wleb(sec, sl, 0);
+    off = wsec(buf, off, WASM_SEC_FUNCTION, sec, sl);
+    /* export：2 项，add(func 1) / mem(memory 0) */
+    sl = 0;
+    sl = wleb(sec, sl, 2);
+    sl = wleb(sec, sl, 3);
+    memcpy(sec + sl, "add", 3);
+    sl += 3;
+    sec[sl++] = 0x00;
+    sl = wleb(sec, sl, 1);
+    sl = wleb(sec, sl, 3);
+    memcpy(sec + sl, "mem", 3);
+    sl += 3;
+    sec[sl++] = 0x02;
+    sl = wleb(sec, sl, 0);
+    off = wsec(buf, off, WASM_SEC_EXPORT, sec, sl);
+    /* code：1 个空函数体 */
+    sl = 0;
+    sl = wleb(sec, sl, 1);
+    sl = wleb(sec, sl, 2);              /* 体长 2 */
+    sl = wleb(sec, sl, 0);              /* 局部变量 0 个 */
+    sec[sl++] = 0x0B;                   /* end */
+    off = wsec(buf, off, WASM_SEC_CODE, sec, sl);
+    /* custom："name" 段 */
+    sl = 0;
+    sl = wleb(sec, sl, 4);
+    memcpy(sec + sl, "name", 4);
+    sl += 4;
+    sec[sl++] = 1;
+    sec[sl++] = 2;
+    off = wsec(buf, off, WASM_SEC_CUSTOM, sec, sl);
+    return off;
+}
+
+test "wasm：节遍历、计数与导出项" {
+    static char mod[512] = { 0 };
+    int n = mk_wasm(mod);
+    WasmModule m = wasm_open(mod, n);
+    WasmReader r = wasm_reader(mod, n);
+    WasmSection s = { 0 };
+    int ids[8] = { 0 }, count = 0, total = 0;
+
+    if (!m.valid || m.version != 1)
+        return err(1, "模块应该有效");
+    if (m.nsections != 6)
+        return err(2, "节数不对");
+    while (r.next(&s) == 1) {
+        if (total < 8)
+            ids[total] = s.id;
+        total++;
+        if (s.id == WASM_SEC_IMPORT) {
+            if (wasm_count(mod, n, &s, &count) != 1 || count != 1)
+                return err(3, "import 计数不对");
+        }
+        if (s.id == WASM_SEC_FUNCTION) {
+            if (wasm_count(mod, n, &s, &count) != 1 || count != 1)
+                return err(4, "function 计数不对");
+        }
+        if (s.id == WASM_SEC_EXPORT) {
+            Str nm = { 0 };
+            int kind = 0;
+            u32 idx = 0;
+
+            if (wasm_count(mod, n, &s, &count) != 1 || count != 2)
+                return err(5, "export 计数不对");
+            if (wasm_export_at(mod, n, &s, 0, &nm, &kind, &idx) != 1)
+                return err(6, "第一个导出没读到");
+            if (nm.s.len != 3 || memcmp(nm.s.data, "add", 3) != 0
+                || kind != 0 || idx != 1)
+                return err(7, "add 导出不对");
+            if (wasm_export_at(mod, n, &s, 1, &nm, &kind, &idx) != 1
+                || nm.s.len != 3 || memcmp(nm.s.data, "mem", 3) != 0
+                || kind != 2 || idx != 0)
+                return err(8, "mem 导出不对");
+            if (wasm_export_at(mod, n, &s, 2, &nm, &kind, &idx) != 0)
+                return err(9, "越界导出应该 0");
+        }
+        if (s.id == WASM_SEC_TYPE) {
+            if (wasm_count(mod, n, &s, &count) != 0)
+                return err(10, "type 节没有统一计数");
+            if (strcmp(wasm_section_name(s.id), "type") != 0)
+                return err(11, "节名不对");
+        }
+    }
+    if (total != 6)
+        return err(12, "遍历到的节数不对");
+    if (ids[0] != WASM_SEC_TYPE || ids[1] != WASM_SEC_IMPORT
+        || ids[2] != WASM_SEC_FUNCTION || ids[3] != WASM_SEC_EXPORT
+        || ids[4] != WASM_SEC_CODE || ids[5] != WASM_SEC_CUSTOM)
+        return err(13, "节的顺序不对");
+    if (r.next(&s) != 0)
+        return err(14, "读完应该是 0");
+    /* LEB128 边界 */
+    {
+        static char leb[8] = { (char)0xE5, (char)0x8E, (char)0x26, 0 };
+        static char longleb[5] = { (char)0x80, (char)0x80, (char)0x80,
+                                   (char)0x80, (char)0x80 };
+        static char shortleb[1] = { (char)0x80 };
+        u32 v = 0;
+
+        if (wasm_leb_u32(leb, 3, &v) != 3 || v != 624485)
+            return err(15, "LEB128 值不对");
+        if (wasm_leb_u32(longleb, 5, &v) != -1)
+            return err(16, "五字节以上应该 -1");
+        if (wasm_leb_u32(shortleb, 1, &v) != 0)
+            return err(17, "半截 LEB128 应该 0");
+        if (wasm_leb_u32(0, 4, &v) != -1)
+            return err(18, "空指针应该 -1");
+    }
+}
+
+test "wasm：坏头、截断与坏节号" {
+    static char mod[512] = { 0 };
+    int n = mk_wasm(mod);
+
+    if (wasm_open("nope", 4).valid)
+        return err(19, "magic 不对不该有效");
+    if (wasm_open(mod, 4).valid)
+        return err(20, "太短不该有效");
+    if (wasm_open(0, 100).valid)
+        return err(21, "空指针不该有效");
+    {
+        static char bad[512] = { 0 };
+
+        memcpy(bad, mod, (size_t)n);
+        bad[4] = 2;                     /* 版本 2 */
+        if (wasm_open(bad, n).valid)
+            return err(22, "版本不是 1 不该有效");
+        memcpy(bad, mod, (size_t)n);
+        bad[8] = 13;                    /* 未知节 id */
+        if (wasm_open(bad, n).valid)
+            return err(23, "未知节 id 不该有效");
+        memcpy(bad, mod, (size_t)n);
+        bad[9] = 0x7F;                  /* 节长度变得很大 */
+        if (wasm_open(bad, n).valid)
+            return err(24, "节长度越界不该有效");
+        /* 截断到一半 */
+        if (wasm_open(mod, 40).valid)
+            return err(25, "截断的模块不该有效");
+    }
+    {
+        static WasmSection dummy = { 0 };
+        WasmReader r = wasm_reader(mod, 4);
+
+        if (r.bad == 0)
+            return err(26, "reader 对坏头应该 bad");
+        if (next(0, &dummy) != -1 || next(&r, 0) != -1 || next(&r, &dummy) != -1)
+            return err(27, "空指针应该 -1");
+    }
+}

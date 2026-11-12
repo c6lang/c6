@@ -195,6 +195,10 @@
 | `std/data/vcf.c6` | `std.data.vcf` | vCard 读取（零分配，两段式）：`vcard_unfold` 去掉折行写进调用方缓冲，`vcard_parse` 取 FN/N/ORG/TITLE/TEL/EMAIL/UID/URL 与属性总数，必须成对 `BEGIN:VCARD`/`END:VCARD`；参数忽略，不做 quoted-printable/Base64 |
 | `std/data/ics.c6` | `std.data.ics` | iCalendar 的 VEVENT 读取（零分配，两段式）：`ics_unfold` 摊平折行，`ics_open`/`next` 每个 `BEGIN:VEVENT` 返回一个 `IcsEvent`（UID/SUMMARY/LOCATION/DTSTART/DTEND/DTSTAMP/DESCRIPTION），参数（`TZID`/`VALUE=DATE`）忽略、值原样给出，不做时区换算 |
 
+| `std/data/cpio.c6` | `std.data.cpio` | cpio 归档读取（newc `070701` / crc `070702`，零分配）：110 字节 ASCII 十六进制头 + 名字 + 数据，`cpio_open`/`next` 逐项给 `mode`/`size`/`name`/`data_off`，`cpio_find` 按名字线性找；`TRAILER!!!` 返回 0；odc 与旧二进制格式不支持 |
+| `std/data/pe.c6` | `std.data.pe` | Windows PE/COFF 头（零分配）：`pe_info` 走 DOS 头 → `e_lfanew` → `PE\0\0` → COFF → 可选头，认 PE32 与 PE32+（`image_base` 宽度不同）；`pe_section` 给节名/虚拟地址/大小/文件偏移/标志，`pe_rva_to_off` 按节做 RVA 映射（只有虚拟大小的 `.bss` 返回 0），`pe_machine_name`/`pe_subsystem_name` 给常见名字 |
+| `std/data/macho.c6` | `std.data.macho` | Mach-O 头（零分配）：thin 的 32/64 位小端映像（`FEEDFACE`/`FEEDFACF`）与 universal（`CAFEBABE`）外壳；`macho_info` 解 CPU/文件类型/命令数/节数并抓 `LC_UUID` 与 `LC_MAIN` 入口偏移，`macho_section` 把各段里的节摊平按序号取，`macho_arch` 给 fat 的每个架构偏移/大小；大端映像不支持 |
+| `std/data/wasm.c6` | `std.data.wasm` | WebAssembly 二进制结构（零分配）：`wasm_open` 校验 `\0asm` 与版本 1，`wasm_reader`/`next` 逐节给 id/偏移/长度；`wasm_leb_u32` 解 u32 LEB128，`wasm_count` 给 import/function/export/code 等节的元素个数，`wasm_export_at` 按序号取导出项（名字/种类/索引），`wasm_section_name` 给节名；不解析函数体、不做类型检查 |
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、SSE/SOCKS5/MQTT 报文、HTTP 客户端与服务端）
 
 | 文件 | 模块 | 内容 |
@@ -257,6 +261,7 @@
 | `examples/stdgfx.c6` | （无模块） | 第三十二批（图像与 LZW）的拼装示例（`make std-gfx`）：LZW 编码→解码往返、3x2 透明 GIF、4x3 未压缩 RGB TIFF、同一张图的 32 位 DIB 与 PNG 两个 ICO 负载（结果必须逐字节一致），最后把 ICO 里那段 PNG 单独交给 `png_decode` |
 | `examples/stddoc.c6` | （无模块） | 第三十三批（结构化文本格式）的拼装示例（`make std-doc`）：HTML 分词后数标签/取 `href`/看 `script` 原文/解实体，遍历一份 YAML 配置把缩进还原成层级并解引号，展开一张折行的 vCard，读一份含两个事件的 iCalendar |
 | `examples/stdproto.c6` | （无模块） | 第三十四批（网络协议编解码）的拼装示例（`make std-proto`）：解析 SSE 事件流（含多行 data）、构造 SOCKS5 问候与域名 CONNECT 并解应答、构造/解析 MQTT CONNECT 与 PUBLISH 并做主题通配、Snappy 压缩往返 |
+| `examples/stdexec.c6` | （无模块） | 第三十五批（二进制容器格式）的拼装示例（`make std-exec`）：内存里现场拼出 cpio 归档（目录+文件+收尾）、PE32+ 映像（节表 + RVA 映射）、Mach-O 64 位映像（`LC_SEGMENT_64` + `LC_MAIN`）与 wasm 模块（导出表），再逐个解析 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -305,6 +310,10 @@ std/data/jwt.c6            58 test(s), 0 failure(s)
 std/data/gif.c6             5 test(s), 0 failure(s)
 std/data/tiff.c6           11 test(s), 0 failure(s)
 std/data/ico.c6            35 test(s), 0 failure(s)
+std/data/cpio.c6           24 test(s), 0 failure(s)
+std/data/pe.c6             24 test(s), 0 failure(s)
+std/data/macho.c6          24 test(s), 0 failure(s)
+std/data/wasm.c6           24 test(s), 0 failure(s)
 std/data/html.c6           24 test(s), 0 failure(s)
 std/data/yaml.c6           24 test(s), 0 failure(s)
 std/data/vcf.c6            24 test(s), 0 failure(s)
@@ -406,6 +415,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/gif.c6` 5 | gif 3 + lzw 2（LZW 是跨 TU 调用） |
 | `std/data/tiff.c6` 11 | tiff 3 + zlib 4 + deflate 2 + rle 2（Deflate 走 zlib、PackBits 走 rle） |
 | `std/data/ico.c6` 35 | ico 2 + png 33（PNG 负载交给 png_decode） |
+| `std/data/cpio.c6` 24 | cpio 2 + str 22 |
+| `std/data/pe.c6` 24 | pe 2 + str 22 |
+| `std/data/macho.c6` 24 | macho 2 + str 22 |
+| `std/data/wasm.c6` 24 | wasm 2 + str 22 |
 | `std/data/html.c6` 24 | html 2 + str 22 |
 | `std/data/yaml.c6` 24 | yaml 2 + str 22 |
 | `std/data/vcf.c6` 24 | vcf 2 + str 22 |
@@ -481,7 +494,7 @@ deflate + `std/core/crc`，`tar` 只借 `Str` 类型；`std/data/png` 只借 `St
 sha512，`std/encoding/asn1` 只借 `Str` 类型，`std/encoding/otp` 要 sha1；
 `std/data/gif` 要 lzw，`std/data/tiff` 要 zlib + rle，`std/data/ico` 要 png
 （PNG 负载），`std/encoding/lzw` 自成一体；`std/data/html` / `yaml` / `vcf` /
-`ics` 四个只借 `Str`。
+`ics` / `cpio` / `pe` / `macho` / `wasm` 这几个只借 `Str`。
 
 ## 设计原则
 
@@ -3379,6 +3392,31 @@ make std-proto
 PUBLISH，解出包号/载荷并跑 `home/+` 与 `factory/#` 两条通配；Snappy 把 108 字节
 压到 58 字节再解回来，另跑一遍「不给哈希表」的字面量模式。
 
+### 集成示例：`examples/stdexec.c6`
+
+```sh
+make std-exec
+```
+
+```
+== cpio
+   bin/hello：8 字节，数据在 236
+== pe
+   amd64，1 个节，入口 RVA 0x1000，镜像基址 0x140000000
+== macho
+   arm64，exec，1 个节，入口偏移 0x1000
+== wasm
+   导出 start（kind=0 index=0）
+
+15 check(s), 0 failure(s)
+```
+
+四个容器都是「在内存里拼出来再解析」，所以示例不依赖任何外部文件：cpio 用
+同一个构建器写「目录 + 8 字节文件 + `TRAILER!!!`」；PE 只写一个 `.text` 节并
+把 RVA `0x1000` 映回文件偏移 `0x400`（顺便验了 PE32+ 的 64 位 `ImageBase`）；
+Mach-O 只写一个 `LC_SEGMENT_64`（一个 `__text` 节）加一条 `LC_MAIN`；wasm 只写
+`export` 与 `code` 两个节，解出 `start` 这个名字。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3443,6 +3481,8 @@ PUBLISH，解出包号/载荷并跑 `home/+` 与 `factory/#` 两条通配；Snap
   示例（自带自检）。
 * `make std-proto`：`examples/stdproto.c6`，第三十四批（网络协议编解码）模块的
   拼装示例（自带自检）。
+* `make std-exec`：`examples/stdexec.c6`，第三十五批（二进制容器格式）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

@@ -1,0 +1,362 @@
+/* std/data/cpio：cpio 归档读取（newc / crc 两种格式，零分配）。
+ *
+ *     import std.data.cpio;
+ *
+ *     CpioReader r = cpio_open(data, n);
+ *     CpioEntry e = { 0 };
+ *     while (r.next(&e) == 1) {
+ *         // e.name / e.size / e.mode / e.data_off
+ *     }
+ *
+ * newc（`070701`）与 crc（`070702`，多了校验和字段，这里照样跳过）都是
+ * 「110 字节 ASCII 十六进制头 + 名字（NUL 结尾、补齐到 4 字节）+ 数据
+ * （补齐到 4 字节）」。旧式二进制与 odc（`070707`）格式不支持。
+ *
+ * 约定：
+ *
+ * - `next` 返回 1 取到一项 / 0 遇到 `TRAILER!!!` 或读完 / -1 结构坏
+ *   （magic 不对、十六进制字段有非十六进制字符、名字越界、数据越界）；
+ * - `name` 是原文视图（去掉结尾 NUL），`data_off` 是文件数据在缓冲里的偏移；
+ * - `is_dir`/`is_symlink`/`is_regular` 按 `mode` 的最高 4 位判断；
+ * - `chksum` 只在 crc 格式里有意义，newc 恒为 0；
+ * - 名字长度上限 `CPIO_MAX_NAME`（4096），超过按坏归档处理。
+ */
+#include <string.h>
+
+module std.data.cpio;
+import std.core.types;
+import std.text.str;
+
+#define CPIO_MAX_NAME 4096
+#define CPIO_HDR 110
+
+struct CpioEntry {
+    int format;         /* 0x070701 或 0x070702 */
+    u32 ino;
+    u32 mode;
+    u32 uid;
+    u32 gid;
+    u32 nlink;
+    u32 mtime;
+    u32 size;
+    u32 chksum;
+    Str name;
+    int data_off;
+    int next_off;
+    int is_dir;
+    int is_symlink;
+    int is_regular;
+};
+
+struct CpioReader {
+    const char *p;
+    int n;
+    int pos;
+    int bad;
+    int done;
+};
+
+CpioReader cpio_open(const void *src, int n)
+{
+    CpioReader r = { 0 };
+
+    if (!src || n <= 0) {
+        r.bad = 1;
+        return r;
+    }
+    r.p = (const char *)src;
+    r.n = n;
+    return r;
+}
+
+static int cpio_hex(const char *p, int len, u32 *out)
+{
+    u32 v = 0;
+    int i = 0;
+
+    for (i = 0; i < len; i++) {
+        int c = (unsigned char)p[i];
+
+        if (c >= '0' && c <= '9')
+            c -= '0';
+        else if (c >= 'a' && c <= 'f')
+            c = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F')
+            c = c - 'A' + 10;
+        else
+            return -1;
+        v = (v << 4) | (u32)c;
+    }
+    *out = v;
+    return 0;
+}
+
+static int cpio_pad4(int v)
+{
+    return (v + 3) & ~3;
+}
+
+int next(CpioReader *self, CpioEntry *out)
+{
+    const char *p = 0;
+    int pos = 0, name_len = 0, data_off = 0, next_off = 0;
+    u32 f[8] = { 0 };
+    CpioEntry e = { 0 };
+
+    if (!self || self->bad || !out)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (self->done)
+        return 0;
+    p = self->p;
+    pos = self->pos;
+    if (pos + CPIO_HDR > self->n) {
+        self->bad = 1;
+        return -1;
+    }
+    if (memcmp(p + pos, "070701", 6) == 0)
+        e.format = 0x070701;
+    else if (memcmp(p + pos, "070702", 6) == 0)
+        e.format = 0x070702;
+    else {
+        self->bad = 1;
+        return -1;
+    }
+    /* 13 个 8 位十六进制字段，从偏移 6 开始 */
+    if (cpio_hex(p + pos + 6, 8, &f[0]) < 0
+        || cpio_hex(p + pos + 14, 8, &f[1]) < 0
+        || cpio_hex(p + pos + 22, 8, &f[2]) < 0
+        || cpio_hex(p + pos + 30, 8, &f[3]) < 0
+        || cpio_hex(p + pos + 38, 8, &f[4]) < 0
+        || cpio_hex(p + pos + 46, 8, &f[5]) < 0
+        || cpio_hex(p + pos + 54, 8, &f[6]) < 0
+        || cpio_hex(p + pos + 62, 8, &f[7]) < 0) {
+        self->bad = 1;
+        return -1;
+    }
+    {
+        u32 rdevmaj = 0, rdevmin = 0, namesize = 0, chksum = 0;
+
+        if (cpio_hex(p + pos + 78, 8, &rdevmaj) < 0
+            || cpio_hex(p + pos + 86, 8, &rdevmin) < 0
+            || cpio_hex(p + pos + 94, 8, &namesize) < 0
+            || cpio_hex(p + pos + 102, 8, &chksum) < 0) {
+            self->bad = 1;
+            return -1;
+        }
+        e.ino = f[0];
+        e.mode = f[1];
+        e.uid = f[2];
+        e.gid = f[3];
+        e.nlink = f[4];
+        e.mtime = f[5];
+        e.size = f[6];
+        e.chksum = chksum;
+        name_len = (int)namesize;
+        if (name_len <= 0 || name_len > CPIO_MAX_NAME) {
+            self->bad = 1;
+            return -1;
+        }
+        data_off = cpio_pad4(pos + CPIO_HDR + name_len);
+        if (pos + CPIO_HDR + name_len > self->n || data_off > self->n) {
+            self->bad = 1;
+            return -1;
+        }
+        if (p[pos + CPIO_HDR + name_len - 1] != 0) {
+            self->bad = 1;
+            return -1;
+        }
+        e.name.s = (char[:]){ (char *)p + pos + CPIO_HDR, name_len - 1 };
+        next_off = cpio_pad4(data_off + (int)e.size);
+        if (data_off + (int)e.size > self->n || next_off > self->n) {
+            self->bad = 1;
+            return -1;
+        }
+        (void)rdevmaj;
+        (void)rdevmin;
+    }
+    /* TRAILER!!! 收尾 */
+    if (e.name.s.len == 10
+        && memcmp(e.name.s.data, "TRAILER!!!", 10) == 0) {
+        self->done = 1;
+        return 0;
+    }
+    e.data_off = data_off;
+    e.next_off = next_off;
+    e.is_dir = (e.mode & 0170000) == 0040000;
+    e.is_symlink = (e.mode & 0170000) == 0120000;
+    e.is_regular = (e.mode & 0170000) == 0100000;
+    self->pos = next_off;
+    *out = e;
+    return 1;
+}
+
+/* 按名字找一项（线性扫，从头开始）；找到返回 1 并填 out，否则 0 */
+int cpio_find(const void *src, int n, const char *name, CpioEntry *out)
+{
+    CpioReader r = cpio_open(src, n);
+    CpioEntry e = { 0 };
+    int want = name ? (int)strlen(name) : 0;
+
+    if (!name)
+        return 0;
+    while (r.next(&e) == 1) {
+        if (e.name.s.len == want && memcmp(e.name.s.data, name, (size_t)want) == 0) {
+            if (out)
+                *out = e;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+/* 把 8 位十六进制写进 buf（不写 NUL） */
+static void put_hex8(char *buf, u32 v)
+{
+    static const char *digits = "0123456789ABCDEF";
+    int i = 0;
+
+    for (i = 0; i < 8; i++)
+        buf[i] = digits[(v >> (28 - 4 * i)) & 0xF];
+}
+
+/* 追加一项 newc；返回新的偏移 */
+static int mk_entry(char *buf, int off, const char *name, u32 mode,
+                    const char *data, int size)
+{
+    int name_len = (int)strlen(name) + 1;
+    int i = 0;
+
+    memcpy(buf + off, "070701", 6);
+    put_hex8(buf + off + 6, (u32)(off / 4 + 1));      /* ino，随便但唯一 */
+    put_hex8(buf + off + 14, mode);
+    put_hex8(buf + off + 22, 1000);
+    put_hex8(buf + off + 30, 1000);
+    put_hex8(buf + off + 38, 1);
+    put_hex8(buf + off + 46, 0x66000000u);
+    put_hex8(buf + off + 54, (u32)size);
+    put_hex8(buf + off + 62, 0);
+    put_hex8(buf + off + 70, 0);
+    put_hex8(buf + off + 78, 0);
+    put_hex8(buf + off + 86, 0);
+    put_hex8(buf + off + 94, (u32)name_len);
+    put_hex8(buf + off + 102, 0);
+    off += CPIO_HDR;
+    memcpy(buf + off, name, (size_t)name_len);
+    off += name_len;
+    while (off % 4)
+        buf[off++] = 0;
+    if (size > 0) {
+        memcpy(buf + off, data, (size_t)size);
+        off += size;
+        while (off % 4)
+            buf[off++] = 0;
+    }
+    (void)i;
+    return off;
+}
+
+static int mk_archive(char *buf)
+{
+    int off = 0;
+
+    off = mk_entry(buf, off, "etc/", 0040755, 0, 0);
+    off = mk_entry(buf, off, "etc/hosts", 0100644, "a b\nc", 5);
+    off = mk_entry(buf, off, "link", 0120777, "etc", 3);
+    off = mk_entry(buf, off, "TRAILER!!!", 0, 0, 0);
+    return off;
+}
+
+test "cpio：目录、普通文件与符号链接" {
+    static char arc[512] = { 0 };
+    int len = mk_archive(arc);
+    CpioReader r = cpio_open(arc, len);
+    CpioEntry e = { 0 };
+
+    if (r.next(&e) != 1)
+        return err(1, "第一项没读到");
+    if (e.name.s.len != 4 || memcmp(e.name.s.data, "etc/", 4) != 0)
+        return err(2, "目录名不对");
+    if (!e.is_dir || e.is_regular || e.size != 0)
+        return err(3, "目录标志不对");
+    if (e.mode != 0040755)
+        return err(4, "目录 mode 不对");
+    if (r.next(&e) != 1)
+        return err(5, "第二项没读到");
+    if (e.name.s.len != 9 || memcmp(e.name.s.data, "etc/hosts", 9) != 0)
+        return err(6, "文件名不对");
+    if (!e.is_regular || e.size != 5 || e.uid != 1000 || e.nlink != 1)
+        return err(7, "文件属性不对");
+    if (e.data_off + 5 > len
+        || memcmp(arc + e.data_off, "a b\nc", 5) != 0)
+        return err(8, "文件数据偏移不对");
+    if (r.next(&e) != 1 || !e.is_symlink || e.size != 3)
+        return err(9, "符号链接项不对");
+    if (memcmp(arc + e.data_off, "etc", 3) != 0)
+        return err(10, "链接目标不对");
+    if (r.next(&e) != 0 || r.done != 1)
+        return err(11, "TRAILER 应该结束");
+    if (r.next(&e) != 0)
+        return err(12, "结束之后还是 0");
+    /* 按名字找 */
+    if (cpio_find(arc, len, "etc/hosts", &e) != 1 || e.size != 5)
+        return err(13, "cpio_find 没找到");
+    if (cpio_find(arc, len, "nope", &e) != 0)
+        return err(14, "cpio_find 不该找到");
+}
+
+test "cpio：坏 magic、截断与字段错误" {
+    CpioReader r = cpio_open("070707" "000000", 12);
+    CpioEntry e = { 0 };
+    static char arc2[512] = { 0 };
+    static char hexbad[512] = { 0 };
+    static char nonul[512] = { 0 };
+    int len2 = mk_archive(arc2);
+
+    if (r.next(&e) != -1)
+        return err(15, "odc magic 应该 -1");
+    r = cpio_open(arc2, 60);
+    if (r.next(&e) != -1)
+        return err(16, "截断的头应该 -1");
+    if (cpio_open(0, 8).bad == 0)
+        return err(17, "空指针应该 bad");
+    if (next(0, &e) != -1)
+        return err(18, "空 reader 应该 -1");
+    /* 十六进制字段里塞 'g' */
+    memcpy(hexbad, arc2, (size_t)len2);
+    hexbad[6] = 'g';
+    r = cpio_open(hexbad, CPIO_HDR);
+    if (r.next(&e) != -1)
+        return err(19, "非十六进制字段应该 -1");
+    (void)len2;
+    /* 名字结尾没有 NUL */
+    memcpy(nonul, arc2, (size_t)len2);
+    nonul[CPIO_HDR + 4] = 'x';          /* "etc/" 的 NUL 被改掉 */
+    {
+        CpioReader r2 = cpio_open(nonul, len2);
+
+        if (r2.next(&e) != -1)
+            return err(20, "名字没有 NUL 应该 -1");
+    }
+    /* 数据越界：把 filesize 改成很大 */
+    {
+        static char big[512] = { 0 };
+        int len3 = mk_archive(big);
+
+        /* 第二个头的 filesize 在第二项头 +54，改成 000FFFFF */
+        {
+            int second = CPIO_HDR + 4;   /* "etc/" 名字 4 + NUL = 5 → 补到 8 */
+
+            while (second % 4)
+                second++;
+            put_hex8(big + second + 54, 0x000FFFFF);
+        }
+        r = cpio_open(big, len3);
+        if (r.next(&e) != 1)
+            return err(21, "第一项应该仍然可读");
+        if (r.next(&e) != -1)
+            return err(22, "数据越界应该 -1");
+    }
+}

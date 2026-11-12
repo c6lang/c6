@@ -302,6 +302,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/yaml.c6          std.data.yaml          YAML 常用子集：yaml_open/next 出 `键: 值`、`- 值`、`- 键: 值` + depth，yaml_unquote 解引号；不支持流式/锚点/块标量
   std/data/vcf.c6           std.data.vcf           vCard：vcard_unfold 摊平折行 + vcard_parse 取 FN/N/ORG/TITLE/TEL/EMAIL/UID/URL
   std/data/ics.c6           std.data.ics           iCalendar：ics_unfold 摊平折行 + ics_open/next 逐 VEVENT 读 UID/SUMMARY/DTSTART/DTEND/LOCATION
+  std/data/cpio.c6          std.data.cpio          cpio 归档（newc 070701 / crc 070702）：cpio_open/next 逐项给 mode/size/name/data_off，cpio_find 按名字找
+  std/data/pe.c6            std.data.pe            PE/COFF 头：pe_info（DOS→e_lfanew→PE→COFF→可选头，PE32/PE32+）、pe_section、pe_rva_to_off、machine/subsystem 名字
+  std/data/macho.c6         std.data.macho         Mach-O 头：thin 32/64 位与 fat 外壳，macho_info 抓 LC_UUID/LC_MAIN，macho_section 摊平各段节表，macho_arch 列架构
+  std/data/wasm.c6          std.data.wasm          WebAssembly 结构：wasm_open/wasm_reader/next 逐节、wasm_leb_u32、wasm_count、wasm_export_at
 
 std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
@@ -374,6 +378,7 @@ make std-enc     # 编译并运行 examples/stdenc.c6（第三十一批编码与
 make std-gfx     # 编译并运行 examples/stdgfx.c6（第三十二批图像与 LZW 模块的拼装示例）
 make std-doc     # 编译并运行 examples/stddoc.c6（第三十三批结构化文本格式模块的拼装示例）
 make std-proto   # 编译并运行 examples/stdproto.c6（第三十四批网络协议编解码模块的拼装示例）
+make std-exec    # 编译并运行 examples/stdexec.c6（第三十五批二进制容器格式模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
