@@ -7,29 +7,29 @@
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *
  *     ./tcc/c6 -B tcc -I . -o build/stdweb \
- *         examples/stdweb.c6 std/types.c6 std/err.c6 std/str.c6 \
- *         std/path.c6 std/base64.c6 std/url.c6 std/rand.c6 \
- *         std/time.c6 std/uuid.c6 std/mime.c6
+ *         examples/stdweb.c6 std/core/types.c6 std/core/err.c6 std/text/str.c6 \
+ *         std/os/path.c6 std/encoding/base64.c6 std/net/url.c6 std/core/rand.c6 \
+ *         std/os/time.c6 std/encoding/uuid.c6 std/net/mime.c6
  *
  * 用到的东西：
- *   std.base64  标准表/URL 安全表、严格填充、就地解码
- *   std.url     RFC 3986 分解、相对解析、查询参数、百分号编解码
- *   std.uuid    v4/v5/v7、解析与格式化、版本/变体
- *   std.mime    扩展名 ↔ 类型、分类、魔数嗅探
+ *   std.encoding.base64  标准表/URL 安全表、严格填充、就地解码
+ *   std.net.url     RFC 3986 分解、相对解析、查询参数、百分号编解码
+ *   std.encoding.uuid    v4/v5/v7、解析与格式化、版本/变体
+ *   std.net.mime    扩展名 ↔ 类型、分类、魔数嗅探
  */
 #include <stdio.h>
 #include <string.h>
 
-import std.types;
-import std.err;
-import std.str;
-import std.path;
-import std.base64;
-import std.url;
-import std.rand;
-import std.time;
-import std.uuid;
-import std.mime;
+import std.core.types;
+import std.core.err;
+import std.text.str;
+import std.os.path;
+import std.encoding.base64;
+import std.net.url;
+import std.core.rand;
+import std.os.time;
+import std.encoding.uuid;
+import std.net.mime;
 
 /* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
 #define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })

@@ -457,7 +457,7 @@ void f(Vect@int *v) {
    `test_chain_depth` 片段（告警 + 一个真错误，两样都要出现在 stderr）。
 3. **模板实例的 `drop` 方法**：`|T| void drop(Vect@T *self)` 每实例一份，GC 描述符
    按实例指针填；与 `gc-design.md` 的环检测配合需要在实例化后重跑一次环检。
-4. **`module` 前缀**：模板名与实例 mangle 名都要带模块前缀（`std__vec__Vect_int`），
+4. **`module` 前缀**：模板名与实例 mangle 名都要带模块前缀（`std__container__vec__Vect_int`），
    冒号点号形式的解析复用 `c6_pkg_name` / `c6_mangle_tok`。
 5. **体内成员函数（V3）**：允许在模板体内直接写方法定义：
 

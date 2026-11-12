@@ -106,33 +106,32 @@ selftest: build
 errcheck: build
 	./$(ERRBASE)
 
-# std/：标准库。每个文件一个 module（模块名就是路径：std/vec.c6 -> std.vec），
-# 每个文件自带 test 块，逐个跑。
+# std/：标准库。按领域分目录，一个文件一个 module，模块名就是路径
+# （std/container/vec.c6 -> std.container.vec），每个文件自带 test 块，逐个跑。
 #
-# 模块之间可以互相 import（`std/vec.c6` 的 sort 就用 `std/sort.c6` 的内核），
-# 而 import 只带来**声明**：被依赖模块的 .c6 正文也要放上命令行。所以下面
-# 先跑被依赖的 `std/sort.c6`，其余模块按文件逐个跑，需要额外依赖的在 case
-# 里列出。没列出来的模块自成一体，单独跑。
+# 模块之间可以互相 import（`std/container/vec.c6` 的 sort 就用
+# `std/container/sort.c6` 的内核），而 import 只带来**声明**：被依赖模块的
+# .c6 正文也要放上命令行。下面按路径顺序遍历 std/ 下所有 .c6，需要额外依赖
+# 的在 case 里列出；没列出来的模块自成一体，单独跑（顺序不影响结果）。
 
 stdtest: build
-	@mkdir -p build   # std/io.c6 的用例要往 build/ 写临时文件，干净树上得先有目录
-	@fail=0; for f in std/str.c6 std/sort.c6 \
-	         $$(ls std/*.c6 | grep -vE '/(str|sort)\.c6$$'); do \
-	    printf '%-16s ' "$$f"; \
+	@mkdir -p build   # std/os/io.c6 的用例要往 build/ 写临时文件，干净树上得先有目录
+	@fail=0; for f in $$(find std -name '*.c6' | sort); do \
+	    printf '%-26s ' "$$f"; \
 	    case $$f in \
-	    std/sort.c6) deps="std/str.c6" ;; \
-	    std/vec.c6)  deps="std/sort.c6 std/str.c6" ;; \
-	    std/strbuf.c6) deps="std/fmt.c6" ;; \
-	    std/path.c6) deps="std/str.c6" ;; \
-	    std/set.c6)  deps="std/map.c6" ;; \
-	    std/json.c6) deps="std/mem.c6 std/str.c6 std/num.c6 std/err.c6" ;; \
-	    std/csv.c6)  deps="std/str.c6" ;; \
-	    std/env.c6)  deps="std/str.c6 std/err.c6" ;; \
-	    std/sha256.c6) deps="std/bits.c6" ;; \
-	    std/url.c6)  deps="std/str.c6" ;; \
-	    std/mime.c6) deps="std/str.c6 std/path.c6" ;; \
-	    std/uuid.c6) deps="std/rand.c6 std/time.c6" ;; \
-	    std/pqueue.c6) deps="std/sort.c6 std/str.c6" ;; \
+	    std/container/sort.c6) deps="std/text/str.c6" ;; \
+	    std/container/vec.c6)  deps="std/container/sort.c6 std/text/str.c6" ;; \
+	    std/text/strbuf.c6) deps="std/text/fmt.c6" ;; \
+	    std/os/path.c6) deps="std/text/str.c6" ;; \
+	    std/container/set.c6)  deps="std/container/map.c6" ;; \
+	    std/data/json.c6) deps="std/core/mem.c6 std/text/str.c6 std/text/num.c6 std/core/err.c6" ;; \
+	    std/data/csv.c6)  deps="std/text/str.c6" ;; \
+	    std/os/env.c6)  deps="std/text/str.c6 std/core/err.c6" ;; \
+	    std/encoding/sha256.c6) deps="std/core/bits.c6" ;; \
+	    std/net/url.c6)  deps="std/text/str.c6" ;; \
+	    std/net/mime.c6) deps="std/text/str.c6 std/os/path.c6" ;; \
+	    std/encoding/uuid.c6) deps="std/core/rand.c6 std/os/time.c6" ;; \
+	    std/container/pqueue.c6) deps="std/container/sort.c6 std/text/str.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -141,12 +140,12 @@ stdtest: build
 	test $$fail -eq 0
 
 # std-demo 的源文件清单：示例两个文件 + 用到的模块正文。清单必须覆盖被
-# import 模块的正文（import 只带来声明）——`std/vec.c6` 的排序内核在
-# `std/sort.c6` 里，sort 自己又依赖 std/str.c6、std/err.c6、std/types.c6。
+# import 模块的正文（import 只带来声明）——`std/container/vec.c6` 的排序内核在
+# `std/container/sort.c6` 里，sort 自己又依赖 std/text/str.c6、std/core/err.c6、std/core/types.c6。
 # 改动 std/ 里的 import 时，这里和上面 stdtest 的 case 要一起更新。
 STDDEMO_SRCS := examples/wordcount.c6 examples/wordcount/text.c6 \
-                std/types.c6 std/err.c6 std/str.c6 std/sort.c6 \
-                std/vec.c6 std/span.c6 std/fmt.c6 std/range.c6
+                std/core/types.c6 std/core/err.c6 std/text/str.c6 std/container/sort.c6 \
+                std/container/vec.c6 std/container/span.c6 std/text/fmt.c6 std/container/range.c6
 
 # 标准库的拼装示例：模块正文要单独编进程序（import 只带来声明），
 # 模块搜索路径靠 -I 给出（import wordcount.text 找 examples/wordcount/text.c6）。
@@ -157,9 +156,9 @@ std-demo: build
 
 # 标准库一日游：把新加的模块（strbuf/utf8/bits/hash/path/deque）串成一个
 # 程序，顺带当它们的集成用例。模块正文照样要一个个列出来。
-STDTOUR_SRCS := examples/stdtour.c6 std/types.c6 std/err.c6 std/str.c6 \
-                std/span.c6 std/fmt.c6 std/strbuf.c6 std/utf8.c6 \
-                std/bits.c6 std/hash.c6 std/path.c6 std/deque.c6
+STDTOUR_SRCS := examples/stdtour.c6 std/core/types.c6 std/core/err.c6 std/text/str.c6 \
+                std/container/span.c6 std/text/fmt.c6 std/text/strbuf.c6 std/text/utf8.c6 \
+                std/core/bits.c6 std/core/hash.c6 std/os/path.c6 std/container/deque.c6
 
 std-tour: build
 	@mkdir -p build
@@ -168,9 +167,9 @@ std-tour: build
 
 # 标准库第三批的一日游：ascii / num / codec / rand / fs / set。
 # set 是 map 的薄包装，所以 map 的正文也要在命令行上。
-STDKIT_SRCS := examples/stdkit.c6 std/types.c6 std/err.c6 std/map.c6 \
-               std/set.c6 std/ascii.c6 std/num.c6 std/codec.c6 \
-               std/rand.c6 std/fs.c6
+STDKIT_SRCS := examples/stdkit.c6 std/core/types.c6 std/core/err.c6 std/container/map.c6 \
+               std/container/set.c6 std/text/ascii.c6 std/text/num.c6 std/encoding/codec.c6 \
+               std/core/rand.c6 std/os/fs.c6
 
 std-kit: build
 	@mkdir -p build
@@ -178,11 +177,11 @@ std-kit: build
 	./build/stdkit
 
 # 标准库第四批：json / sha256 / csv / env。
-# json 的 DOM 住在 std.mem 的 Arena 上，字符串视图来自 std.str，数字格式化
-# 用 std.num；csv 也借 std.str 的 Str；env 依赖 std.str 与 std.err。
-STDBOX_SRCS := examples/stdbox.c6 std/types.c6 std/err.c6 std/str.c6 \
-               std/mem.c6 std/num.c6 std/json.c6 std/bits.c6 \
-               std/sha256.c6 std/csv.c6 std/env.c6
+# json 的 DOM 住在 std.core.mem 的 Arena 上，字符串视图来自 std.text.str，数字格式化
+# 用 std.text.num；csv 也借 std.text.str 的 Str；env 依赖 std.text.str 与 std.core.err。
+STDBOX_SRCS := examples/stdbox.c6 std/core/types.c6 std/core/err.c6 std/text/str.c6 \
+               std/core/mem.c6 std/text/num.c6 std/data/json.c6 std/core/bits.c6 \
+               std/encoding/sha256.c6 std/data/csv.c6 std/os/env.c6
 
 std-box: build
 	@mkdir -p build
@@ -190,11 +189,11 @@ std-box: build
 	./build/stdbox
 
 # 标准库第五批：base64 / url / uuid / mime。
-# url 与 mime 只借 std.str 的 Str 与 std.path 的取扩展名；uuid 的 v4/v7 要
-# std.rand 的随机源、v7 还要 std.time 的墙钟；base64 自成一体。
-STD_WEB_SRCS := examples/stdweb.c6 std/types.c6 std/err.c6 std/str.c6 \
-                std/path.c6 std/base64.c6 std/url.c6 std/rand.c6 \
-                std/time.c6 std/uuid.c6 std/mime.c6
+# url 与 mime 只借 std.text.str 的 Str 与 std.os.path 的取扩展名；uuid 的 v4/v7 要
+# std.core.rand 的随机源、v7 还要 std.os.time 的墙钟；base64 自成一体。
+STD_WEB_SRCS := examples/stdweb.c6 std/core/types.c6 std/core/err.c6 std/text/str.c6 \
+                std/os/path.c6 std/encoding/base64.c6 std/net/url.c6 std/core/rand.c6 \
+                std/os/time.c6 std/encoding/uuid.c6 std/net/mime.c6
 
 std-web: build
 	@mkdir -p build
@@ -202,11 +201,11 @@ std-web: build
 	./build/stdweb
 
 # 标准库第六批：inet / bitbuf / pqueue / ini。
-# inet 与 bitbuf 自成一体（只用 std.types 的定宽整数与 err() 内建）；
-# pqueue 要 std.sort 的比较器（cmp_str 又拉上 std.str）；ini 借 std.str 的 Str。
-STD_NET_SRCS := examples/stdnet.c6 std/types.c6 std/err.c6 std/str.c6 \
-                std/sort.c6 std/inet.c6 std/bitbuf.c6 std/pqueue.c6 \
-                std/ini.c6
+# inet 与 bitbuf 自成一体（只用 std.core.types 的定宽整数与 err() 内建）；
+# pqueue 要 std.container.sort 的比较器（cmp_str 又拉上 std.text.str）；ini 借 std.text.str 的 Str。
+STD_NET_SRCS := examples/stdnet.c6 std/core/types.c6 std/core/err.c6 std/text/str.c6 \
+                std/container/sort.c6 std/net/inet.c6 std/encoding/bitbuf.c6 std/container/pqueue.c6 \
+                std/data/ini.c6
 
 std-net: build
 	@mkdir -p build

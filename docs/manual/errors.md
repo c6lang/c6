@@ -89,7 +89,7 @@ id = (area << 27) | (slot << 12) | code
 |---|---|
 | `slot 0` | 不属于任何模块的文件（`main` 的 TU、`tests`）：`return err(1, "x")` 仍是 `1` |
 | `slot 1..0x5FFF` | 自动池：`1 + fnv1a32(模块名) % 0x5FFF`，号是名字的纯函数 |
-| `slot 0x6000..0x60FF` | std 内置池（`std.err`=0x6000，见 [docs/stdlib.md](../stdlib.md)） |
+| `slot 0x6000..0x60FF` | std 内置池（`std.core.err`=0x6000，见 [docs/stdlib.md](../stdlib.md)） |
 | `slot 0x6100..0x7FFF` | 钉号池：项目根 `errbase.def` 里的行 |
 
 项目根有一个 `errbase.def`（一次 `-emit-errbase` 就生成，**建议进版本库**）：

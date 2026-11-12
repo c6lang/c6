@@ -1,0 +1,567 @@
+/* std/net/mime：扩展名 ↔ MIME 类型、类型分类与魔数嗅探。
+ *
+ *     import std.net.mime;
+ *
+ *     Str t = mime_of_path(S("index.html"));    // "text/html"
+ *     Str u = mime_of_ext(S(".PNG"));           // "image/png"（大小写不敏感）
+ *     Str d = mime_of_path(S("noext"));         // "application/octet-stream"
+ *
+ * 输入一律收 `char[:]` 视图（和 `std.text.str` 的比较函数一致），所以 `S("...")`
+ * 直接能用；手上是 `Str` 时传 `s.s`。
+ *
+ *     mime_is_text(t);                          // 1
+ *     mime_charset(t);                          // "utf-8"
+ *     mime_ext_of(S("image/png"));              // "png"（反向查表，第一个命中）
+ *
+ *     Str s = mime_sniff(bytes);                // 按魔数给 "image/png" 等；认不出给空
+ *
+ * 这一层**零分配、零状态**：表是文件作用域的 `static` 数组，查出来的 `Str`
+ * 都指向表里的字面量（可以一直用到程序结束），扩展名视图指向调用方的路径。
+ *
+ * 约定：
+ * - 扩展名比较**大小写不敏感**，带不带前导 `.` 都收（`.PNG`、`png` 一样）；
+ * - 查不到就是 `application/octet-stream`（不是空串）——HTTP 的 Content-Type
+ *   要一个能用的值；
+ * - `mime_ext_of` 是**多对一**的反向查表（"jpg"/"jpeg" 都给 `image/jpeg`），
+ *   返回表里第一个命中的扩展名，别拿它做「唯一规范扩展名」的假设；
+ * - `mime_charset` 只对文本类（`text/*`、JSON/XML/JS 及 `+xml`/`+json` 后缀）
+ *   给 `utf-8`，二进制类给空串；
+ * - `mime_sniff` 只看**魔数**，不做全文启发式：认不出的（包括纯文本）返回空，
+ *   要「远端给了个怪类型」时用扩展名兜底就自己接上 `mime_of_ext`。
+ *
+ * 依赖 `std.os.path`（取扩展名）与 `std.text.str`（`Str` 类型），两者都零分配。
+ */
+#include <string.h>
+
+module std.net.mime;
+import std.text.str;
+import std.os.path;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+/* 表按「常见程度」粗排，不用排序：反向查表取第一个命中，顺序就是优先级 */
+struct MimeEntry {
+    char *ext;
+    char *type;
+};
+
+static MimeEntry mime_tab[] = {
+    { (char *)"html", (char *)"text/html" },
+    { (char *)"htm", (char *)"text/html" },
+    { (char *)"css", (char *)"text/css" },
+    { (char *)"js", (char *)"text/javascript" },
+    { (char *)"mjs", (char *)"text/javascript" },
+    { (char *)"json", (char *)"application/json" },
+    { (char *)"xml", (char *)"application/xml" },
+    { (char *)"txt", (char *)"text/plain" },
+    { (char *)"md", (char *)"text/markdown" },
+    { (char *)"csv", (char *)"text/csv" },
+    { (char *)"tsv", (char *)"text/tab-separated-values" },
+    { (char *)"c", (char *)"text/x-c" },
+    { (char *)"h", (char *)"text/x-c" },
+    { (char *)"c6", (char *)"text/x-c" },
+    { (char *)"sh", (char *)"application/x-sh" },
+    { (char *)"yaml", (char *)"application/yaml" },
+    { (char *)"yml", (char *)"application/yaml" },
+    { (char *)"toml", (char *)"application/toml" },
+    { (char *)"pdf", (char *)"application/pdf" },
+    { (char *)"zip", (char *)"application/zip" },
+    { (char *)"gz", (char *)"application/gzip" },
+    { (char *)"tar", (char *)"application/x-tar" },
+    { (char *)"bz2", (char *)"application/x-bzip2" },
+    { (char *)"xz", (char *)"application/x-xz" },
+    { (char *)"7z", (char *)"application/x-7z-compressed" },
+    { (char *)"wasm", (char *)"application/wasm" },
+    { (char *)"png", (char *)"image/png" },
+    { (char *)"jpg", (char *)"image/jpeg" },
+    { (char *)"jpeg", (char *)"image/jpeg" },
+    { (char *)"gif", (char *)"image/gif" },
+    { (char *)"webp", (char *)"image/webp" },
+    { (char *)"bmp", (char *)"image/bmp" },
+    { (char *)"ico", (char *)"image/x-icon" },
+    { (char *)"svg", (char *)"image/svg+xml" },
+    { (char *)"tif", (char *)"image/tiff" },
+    { (char *)"tiff", (char *)"image/tiff" },
+    { (char *)"avif", (char *)"image/avif" },
+    { (char *)"mp3", (char *)"audio/mpeg" },
+    { (char *)"wav", (char *)"audio/wav" },
+    { (char *)"ogg", (char *)"audio/ogg" },
+    { (char *)"flac", (char *)"audio/flac" },
+    { (char *)"m4a", (char *)"audio/mp4" },
+    { (char *)"mp4", (char *)"video/mp4" },
+    { (char *)"webm", (char *)"video/webm" },
+    { (char *)"mkv", (char *)"video/x-matroska" },
+    { (char *)"mov", (char *)"video/quicktime" },
+    { (char *)"avi", (char *)"video/x-msvideo" },
+    { (char *)"woff", (char *)"font/woff" },
+    { (char *)"woff2", (char *)"font/woff2" },
+    { (char *)"ttf", (char *)"font/ttf" },
+    { (char *)"otf", (char *)"font/otf" },
+};
+
+static int mime_n(void) { return (int)(sizeof mime_tab / sizeof mime_tab[0]); }
+
+/* ASCII 小写 */
+static int mime_lower(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A' + 'a';
+    return c;
+}
+
+/* 忽略大小写比较 [a] 与 NUL 结尾的 b */
+static int mime_ieq_z(char[:] a, char *b)
+{
+    int i = 0;
+
+    while (i < a.len && b[i]) {
+        if (mime_lower((u8)a.data[i]) != mime_lower((u8)b[i]))
+            return 0;
+        i++;
+    }
+    return i == a.len && b[i] == 0;
+}
+
+/* 忽略大小写比较两段视图 */
+static int mime_ieq(char[:] a, char[:] b)
+{
+    int i = 0;
+
+    if (a.len != b.len)
+        return 0;
+    for (i = 0; i < a.len; i++)
+        if (mime_lower((u8)a.data[i]) != mime_lower((u8)b.data[i]))
+            return 0;
+    return 1;
+}
+
+/* 有没有前缀 "text/" 之类（忽略大小写） */
+static int mime_has_prefix(char[:] s, char *p)
+{
+    int n = (int)strlen(p);
+
+    if (s.len < n)
+        return 0;
+    return mime_ieq_z((char[:]){ s.data, n }, p);
+}
+
+/* 有没有后缀（忽略大小写） */
+static int mime_has_suffix(char[:] s, char *p)
+{
+    int n = (int)strlen(p);
+
+    if (s.len < n)
+        return 0;
+    return mime_ieq_z((char[:]){ s.data + s.len - n, n }, p);
+}
+
+Str mime_default(void)
+{
+    Str r = { S("application/octet-stream") };
+
+    return r;
+}
+
+/* 扩展名 -> 类型；带不带前导 '.' 都收；查不到给 default */
+Str mime_of_ext(char[:] ext)
+{
+    char[:] e = ext;
+    int i = 0;
+
+    if (e.len > 0 && e.data[0] == '.')
+        e = (char[:]){ e.data + 1, e.len - 1 };
+    for (i = 0; i < mime_n(); i++) {
+        if (mime_ieq_z(e, mime_tab[i].ext)) {
+            Str r = { { (char *)mime_tab[i].type,
+                        (int)strlen(mime_tab[i].type) } };
+
+            return r;
+        }
+    }
+    return mime_default();
+}
+
+/* 路径 -> 类型：取扩展名（`std.os.path` 的规则）再查表 */
+Str mime_of_path(char[:] path)
+{
+    Str e = path_ext(path);
+
+    if (e.s.len == 0)
+        return mime_default();
+    return mime_of_ext(e.s);
+}
+
+/* 按扩展名下标枚举（给「列全部」的场合；越界给空视图） */
+Str mime_ext_at(int i)
+{
+    if (i < 0 || i >= mime_n()) {
+        Str empty = { { (char *)0, 0 } };
+
+        return empty;
+    }
+    {
+        Str r = { { mime_tab[i].ext, (int)strlen(mime_tab[i].ext) } };
+
+        return r;
+    }
+}
+
+Str mime_type_at(int i)
+{
+    if (i < 0 || i >= mime_n()) {
+        Str empty = { { (char *)0, 0 } };
+
+        return empty;
+    }
+    {
+        Str r = { { mime_tab[i].type, (int)strlen(mime_tab[i].type) } };
+
+        return r;
+    }
+}
+
+int mime_count(void) { return mime_n(); }
+
+/* 反向查表：返回第一个把类型登记成 type 的扩展名（不带点）；查不到给空 */
+Str mime_ext_of(char[:] type)
+{
+    int i = 0;
+
+    for (i = 0; i < mime_n(); i++) {
+        if (mime_ieq_z(type, mime_tab[i].type)) {
+            Str r = { { mime_tab[i].ext, (int)strlen(mime_tab[i].ext) } };
+
+            return r;
+        }
+    }
+    {
+        Str empty = { { (char *)0, 0 } };
+
+        return empty;
+    }
+}
+
+/* ---- 分类 ---- */
+
+int mime_is_text(char[:] type)
+{
+    if (mime_has_prefix(type, "text/"))
+        return 1;
+    if (mime_ieq_z(type, "application/json"))
+        return 1;
+    if (mime_ieq_z(type, "application/xml"))
+        return 1;
+    if (mime_ieq_z(type, "application/yaml"))
+        return 1;
+    if (mime_ieq_z(type, "application/toml"))
+        return 1;
+    if (mime_has_suffix(type, "+xml") || mime_has_suffix(type, "+json"))
+        return 1;
+    return 0;
+}
+
+int mime_is_image(char[:] type) { return mime_has_prefix(type, "image/"); }
+
+int mime_is_audio(char[:] type) { return mime_has_prefix(type, "audio/"); }
+
+int mime_is_video(char[:] type) { return mime_has_prefix(type, "video/"); }
+
+int mime_is_font(char[:] type) { return mime_has_prefix(type, "font/"); }
+
+/* 文本类给 "utf-8"，其余给空。参数里带 "; charset=..." 也照旧判前缀。 */
+Str mime_charset(char[:] type)
+{
+    if (mime_is_text(type)) {
+        Str u = { S("utf-8") };
+
+        return u;
+    }
+    {
+        Str empty = { { (char *)0, 0 } };
+
+        return empty;
+    }
+}
+
+/* ---- 魔数嗅探 ---- */
+
+/* 前 n 字节是不是这串魔数 */
+static int mime_magic(char[:] d, int at, char *m, int n)
+{
+    if (at < 0 || at + n > d.len)
+        return 0;
+    return memcmp(d.data + at, m, (size_t)n) == 0;
+}
+
+Str mime_sniff(char[:] data)
+{
+    Str empty = { { (char *)0, 0 } };
+
+    if (data.len <= 0 || data.data == 0)
+        return empty;
+    /* PNG 的完整签名 */
+    if (mime_magic(data, 0, (char *)"\x89PNG\r\n\x1a\n", 8)) {
+        Str r = { S("image/png") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"\xff\xd8\xff", 3)) {
+        Str r = { S("image/jpeg") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"GIF87a", 6)
+        || mime_magic(data, 0, (char *)"GIF89a", 6)) {
+        Str r = { S("image/gif") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"%PDF-", 5)) {
+        Str r = { S("application/pdf") };
+
+        return r;
+    }
+    /* ZIP：本地头 / 空归档 / 跨卷 */
+    if (mime_magic(data, 0, (char *)"PK\x03\x04", 4)
+        || mime_magic(data, 0, (char *)"PK\x05\x06", 4)
+        || mime_magic(data, 0, (char *)"PK\x07\x08", 4)) {
+        Str r = { S("application/zip") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"\x1f\x8b", 2)) {
+        Str r = { S("application/gzip") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"\xfd7zXZ\x00", 6)) {
+        Str r = { S("application/x-xz") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"7z\xbc\xaf\x27\x1c", 6)) {
+        Str r = { S("application/x-7z-compressed") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"BZh", 3)) {
+        Str r = { S("application/x-bzip2") };
+
+        return r;
+    }
+    /* RIFF 容器：看第 8 字节起的小标签 */
+    if (mime_magic(data, 0, (char *)"RIFF", 4)) {
+        if (mime_magic(data, 8, (char *)"WEBP", 4)) {
+            Str r = { S("image/webp") };
+
+            return r;
+        }
+        if (mime_magic(data, 8, (char *)"WAVE", 4)) {
+            Str r = { S("audio/wav") };
+
+            return r;
+        }
+        if (mime_magic(data, 8, (char *)"AVI ", 4)) {
+            Str r = { S("video/x-msvideo") };
+
+            return r;
+        }
+    }
+    if (mime_magic(data, 0, (char *)"OggS", 4)) {
+        Str r = { S("audio/ogg") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"fLaC", 4)) {
+        Str r = { S("audio/flac") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"ID3", 3)) {
+        Str r = { S("audio/mpeg") };
+
+        return r;
+    }
+    /* MP4：第 4 字节起是 "ftyp" */
+    if (mime_magic(data, 4, (char *)"ftyp", 4)) {
+        Str r = { S("video/mp4") };
+
+        return r;
+    }
+    /* wasm：\0asm + 版本 1 */
+    if (mime_magic(data, 0, (char *)"\x00" "asm", 4)) {
+        Str r = { S("application/wasm") };
+
+        return r;
+    }
+    if (mime_magic(data, 0, (char *)"\x7f" "ELF", 4)) {
+        Str r = { S("application/x-elf") };
+
+        return r;
+    }
+    /* BMP："BM" 太弱（文本也能以 BM 开头），要求后面保留字段为 0 */
+    if (mime_magic(data, 0, (char *)"BM", 2) && data.len >= 6
+        && data.data[6] == 0 && data.data[7] == 0) {
+        Str r = { S("image/bmp") };
+
+        return r;
+    }
+    return empty;
+}
+
+/* ---- 自测 ---- */
+
+test "扩展名查表：常见类型" {
+    if (!mime_ieq_z(mime_of_ext(S("html")).s, "text/html"))
+        return err(1, "html 不对");
+    if (!mime_ieq_z(mime_of_ext(S("css")).s, "text/css"))
+        return err(2, "css 不对");
+    if (!mime_ieq_z(mime_of_ext(S("json")).s, "application/json"))
+        return err(3, "json 不对");
+    if (!mime_ieq_z(mime_of_ext(S("png")).s, "image/png"))
+        return err(4, "png 不对");
+    if (!mime_ieq_z(mime_of_ext(S("woff2")).s, "font/woff2"))
+        return err(5, "woff2 不对");
+    if (!mime_ieq_z(mime_of_ext(S("c6")).s, "text/x-c"))
+        return err(6, "c6 不对");
+}
+
+test "扩展名：带点、大小写、查不到" {
+    if (!mime_ieq_z(mime_of_ext(S(".png")).s, "image/png"))
+        return err(7, "带点的扩展名不对");
+    if (!mime_ieq_z(mime_of_ext(S(".PNG")).s, "image/png"))
+        return err(8, "大写扩展名不对");
+    if (!mime_ieq_z(mime_of_ext(S("PnG")).s, "image/png"))
+        return err(9, "混写扩展名不对");
+    if (!mime_ieq_z(mime_of_ext(S("nope")).s, "application/octet-stream"))
+        return err(10, "未知扩展名应当给 octet-stream");
+    if (!mime_ieq_z(mime_of_ext(S("")).s, "application/octet-stream"))
+        return err(11, "空扩展名应当给 octet-stream");
+    if (!mime_ieq_z(mime_of_ext(S(".")).s, "application/octet-stream"))
+        return err(12, "只有一个点应当给 octet-stream");
+}
+
+test "路径查表：取扩展名，含隐藏文件与无扩展名" {
+    if (!mime_ieq_z(mime_of_path(S("index.html")).s, "text/html"))
+        return err(13, "path 的 html 不对");
+    if (!mime_ieq_z(mime_of_path(S("a/b/c.PNG")).s, "image/png"))
+        return err(14, "path 的大写扩展名不对");
+    if (!mime_ieq_z(mime_of_path(S("a/b/c.tar.gz")).s, "application/gzip"))
+        return err(15, "多重扩展名应当取最后一段");
+    if (!mime_ieq_z(mime_of_path(S("a/.bashrc")).s, "application/octet-stream"))
+        return err(16, "隐藏文件不该有扩展名");
+    if (!mime_ieq_z(mime_of_path(S("noext")).s, "application/octet-stream"))
+        return err(17, "无扩展名应当给 octet-stream");
+    if (!mime_ieq_z(mime_of_path(S("a.b/plain")).s, "application/octet-stream"))
+        return err(18, "目录里的点不该当扩展名");
+}
+
+test "反向查表与枚举" {
+    if (!mime_ieq_z(mime_ext_of(S("image/png")).s, "png"))
+        return err(19, "png 反查不对");
+    if (!mime_ieq_z(mime_ext_of(S("image/jpeg")).s, "jpg"))
+        return err(20, "jpeg 反查应当给表里第一个（jpg）");
+    if (!mime_ieq_z(mime_ext_of(S("IMAGE/PNG")).s, "png"))
+        return err(21, "反查应当大小写不敏感");
+    if (mime_ext_of(S("application/x-nope")).s.len != 0)
+        return err(22, "未知类型反查应当给空");
+    if (mime_count() <= 40)
+        return err(23, "表太小");
+    if (!mime_ieq_z(mime_ext_at(0).s, "html"))
+        return err(24, "第 0 项应当是 html");
+    if (!mime_ieq_z(mime_type_at(0).s, "text/html"))
+        return err(25, "第 0 项类型不对");
+    if (mime_ext_at(-1).s.len != 0 || mime_ext_at(mime_count()).s.len != 0)
+        return err(26, "越界枚举应当给空视图");
+}
+
+test "分类与字符集" {
+    char[:] json = S("application/json");
+    char[:] svg = S("image/svg+xml");
+    char[:] png = S("image/png");
+    char[:] mp3 = S("audio/mpeg");
+    char[:] woff = S("font/woff2");
+
+    if (!mime_is_text(S("text/html")) || !mime_is_text(json)
+        || !mime_is_text(svg))
+        return err(27, "文本判定漏了 JSON/SVG");
+    if (mime_is_text(png) || mime_is_text(mp3))
+        return err(28, "二进制被当成了文本");
+    if (!mime_is_image(png) || !mime_is_image(svg))
+        return err(29, "image/ 判定不对");
+    if (!mime_is_audio(mp3) || mime_is_audio(png))
+        return err(30, "audio/ 判定不对");
+    if (!mime_is_video(S("video/mp4")) || mime_is_video(mp3))
+        return err(31, "video/ 判定不对");
+    if (!mime_is_font(woff) || mime_is_font(png))
+        return err(32, "font/ 判定不对");
+    if (!mime_ieq_z(mime_charset(S("text/plain")).s, "utf-8"))
+        return err(33, "文本类型应当给 utf-8");
+    if (!mime_ieq_z(mime_charset(json).s, "utf-8"))
+        return err(34, "JSON 应当给 utf-8");
+    if (mime_charset(png).s.len != 0)
+        return err(35, "二进制类型不该给字符集");
+}
+
+test "魔数嗅探：图片与压缩/文档" {
+    char png[16] = { (char)0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    char jpg[8] = { (char)0xff, (char)0xd8, (char)0xff, (char)0xe0 };
+    char gif[8] = { 'G', 'I', 'F', '8', '9', 'a' };
+    char pdf[8] = { '%', 'P', 'D', 'F', '-' };
+    char zip[8] = { 'P', 'K', 3, 4 };
+    char gz[4] = { (char)0x1f, (char)0x8b, 8, 0 };
+    char elf[8] = { (char)0x7f, 'E', 'L', 'F', 2, 1 };
+
+    if (!mime_ieq_z(mime_sniff((char[:]){ png, 8 }).s, "image/png"))
+        return err(36, "PNG 魔数没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ jpg, 4 }).s, "image/jpeg"))
+        return err(37, "JPEG 魔数没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ gif, 6 }).s, "image/gif"))
+        return err(38, "GIF 魔数没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ pdf, 5 }).s, "application/pdf"))
+        return err(39, "PDF 魔数没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ zip, 4 }).s, "application/zip"))
+        return err(40, "ZIP 魔数没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ gz, 3 }).s, "application/gzip"))
+        return err(41, "gzip 魔数没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ elf, 5 }).s, "application/x-elf"))
+        return err(42, "ELF 魔数没认出来");
+}
+
+test "魔数嗅探：RIFF 容器、MP4、wasm 与认不出" {
+    char webp[16] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P' };
+    char wav[16] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E' };
+    char mp4[16] = { 0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm' };
+    char wasm[8] = { 0, 'a', 's', 'm', 1, 0, 0, 0 };
+    char txt[8] = { 'h', 'e', 'l', 'l', 'o', '\n' };
+
+    if (!mime_ieq_z(mime_sniff((char[:]){ webp, 12 }).s, "image/webp"))
+        return err(43, "WEBP 没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ wav, 12 }).s, "audio/wav"))
+        return err(44, "WAVE 没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ mp4, 12 }).s, "video/mp4"))
+        return err(45, "MP4 没认出来");
+    if (!mime_ieq_z(mime_sniff((char[:]){ wasm, 8 }).s, "application/wasm"))
+        return err(46, "wasm 没认出来");
+    if (mime_sniff((char[:]){ txt, 6 }).s.len != 0)
+        return err(47, "纯文本不该被嗅探出类型");
+    if (mime_sniff(S("")).s.len != 0)
+        return err(48, "空输入应当给空");
+    {
+        Str empty = { { (char *)0, 0 } };
+
+        if (mime_sniff(empty.s).s.len != 0)
+            return err(49, "空视图应当给空");
+    }
+    /* 截断的魔数不能越界读 */
+    {
+        char part[8] = { (char)0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+
+        if (mime_sniff((char[:]){ part, 3 }).s.len != 0)
+            return err(50, "只有 3 字节的输入不该认出 PNG");
+        if (mime_sniff((char[:]){ part, 7 }).s.len != 0)
+            return err(51, "差一个字节的签名不该认出 PNG");
+        if (!mime_ieq_z(mime_sniff((char[:]){ part, 8 }).s, "image/png"))
+            return err(52, "完整 8 字节签名应当认出 PNG");
+    }
+}

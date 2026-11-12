@@ -1,0 +1,676 @@
+/* std/encoding/uuid：UUID（RFC 9562/4122）的生成、解析与格式化。
+ *
+ *     import std.encoding.uuid;
+ *
+ *     Uuid a = uuid_v4();                  // 随机（版本 4）
+ *     Uuid b = uuid_v7();                  // 按时间排序（版本 7）
+ *     Uuid ns = uuid_ns_dns();
+ *     Uuid c = uuid_v5(&ns, S("example.com"));   // 名字派生（版本 5，SHA-1）
+ *
+ *     char buf[40] = { 0 };
+ *     (&a)->format(buf, sizeof buf);       // 36 字符 + NUL
+ *     Uuid back = { { 0 } };
+ *     uuid_parse(S("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), &back);   // 1
+ *
+ * `Uuid` 是 16 字节的**纯值**（`struct Uuid { u8 b[16]; }`），可以按值声明、
+ * 按值传参、放进别的结构体、比较字节。按 RFC 4122 的字段排布（大端序）：
+ *
+ *   - 第 7 字节的高 4 位是**版本**（`uuid_version`）；
+ *   - 第 9 字节的高 2..3 位是**变体**（`uuid_variant`：0 = NCS、1 = RFC 4122、
+ *     2 = Microsoft、3 = 保留）。
+ *
+ * 三个生成器：
+ *   - `uuid_v4`：全部随机位（除版本/变体）。**不是密码学随机**——种子来自
+ *     时钟与一个栈地址，`std.core.rand` 是 xorshift64*。要不可预测的随机自行提供
+ *     熵源，用 `uuid_v4_seeded`；
+ *   - `uuid_v7`：前 48 位是 Unix 毫秒时间戳，其余随机；同毫秒内按随机位排，
+ *     不是严格单调（RFC 9562 允许这样，"monotonic random" 是可选项）；
+ *   - `uuid_v5`：SHA-1(命名空间字节 || 名字)，取前 16 字节。SHA-1 在这里只是
+ *     **散列**用途（不涉及抗碰撞安全），实现在本文件内部，不链外部加密库。
+ *
+ * 名字派生是确定的：同一命名空间 + 同一名字永远给同一个 UUID，所以 `uuid_v5`
+ * 可以直接用作用例里的已知向量（RFC 4122 附录 / Python `uuid5` 的结果）。
+ */
+#include <string.h>
+
+module std.encoding.uuid;
+import std.core.types;
+import std.core.err;
+import std.core.rand;
+import std.os.time;
+
+enum Error { OK = 0, INVAL = 1, RANGE = 2, PARSE = 3 };
+
+/* RFC 4122 的四个预定义命名空间 */
+enum Variant { VARIANT_NCS = 0, VARIANT_RFC4122 = 1, VARIANT_MS = 2,
+               VARIANT_FUTURE = 3 };
+
+struct Uuid {
+    u8 b[16];
+};
+
+/* ---- SHA-1（只在文件名派生里用；不对外声明） ---- */
+
+struct Sha1 {
+    u32 h[5];
+    u64 len;        /* 已喂入的字节数 */
+    u8 buf[64];
+    int n;          /* buf 里攒了几个字节 */
+};
+
+static u32 sha1_rotl(u32 v, int k) { return (v << k) | (v >> (32 - k)); }
+
+static void sha1_block(Sha1 *c, u8 *p)
+{
+    u32 w[80] = { 0 };
+    u32 a = 0, b = 0, cc = 0, d = 0, e = 0;
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        w[i] = ((u32)p[i * 4] << 24) | ((u32)p[i * 4 + 1] << 16)
+               | ((u32)p[i * 4 + 2] << 8) | (u32)p[i * 4 + 3];
+    for (i = 16; i < 80; i++)
+        w[i] = sha1_rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    a = c->h[0];
+    b = c->h[1];
+    cc = c->h[2];
+    d = c->h[3];
+    e = c->h[4];
+    for (i = 0; i < 80; i++) {
+        u32 f = 0;
+        u32 k = 0;
+        u32 t = 0;
+
+        if (i < 20) {
+            f = (b & cc) | (~b & d);
+            k = 0x5a827999u;
+        } else if (i < 40) {
+            f = b ^ cc ^ d;
+            k = 0x6ed9eba1u;
+        } else if (i < 60) {
+            f = (b & cc) | (b & d) | (cc & d);
+            k = 0x8f1bbcdcu;
+        } else {
+            f = b ^ cc ^ d;
+            k = 0xca62c1d6u;
+        }
+        t = sha1_rotl(a, 5) + f + e + k + w[i];
+        e = d;
+        d = cc;
+        cc = sha1_rotl(b, 30);
+        b = a;
+        a = t;
+    }
+    c->h[0] += a;
+    c->h[1] += b;
+    c->h[2] += cc;
+    c->h[3] += d;
+    c->h[4] += e;
+}
+
+static void sha1_init(Sha1 *c)
+{
+    c->h[0] = 0x67452301u;
+    c->h[1] = 0xefcdab89u;
+    c->h[2] = 0x98badcfeu;
+    c->h[3] = 0x10325476u;
+    c->h[4] = 0xc3d2e1f0u;
+    c->len = 0ull;
+    c->n = 0;
+}
+
+static void sha1_update(Sha1 *c, u8 *p, int n)
+{
+    int i = 0;
+
+    if (n <= 0 || p == 0)
+        return;
+    c->len += (u64)n;
+    for (i = 0; i < n; i++) {
+        c->buf[c->n] = p[i];
+        c->n += 1;
+        if (c->n == 64) {
+            sha1_block(c, c->buf);
+            c->n = 0;
+        }
+    }
+}
+
+static void sha1_final(Sha1 *c, u8 out[20])
+{
+    u64 bits = c->len * 8ull;
+    u8 pad = 0x80;
+    u8 zero = 0;
+    int i = 0;
+
+    sha1_update(c, &pad, 1);
+    while (c->n != 56) {
+        sha1_update(c, &zero, 1);
+        if (c->len > (1ull << 40))      /* 防御：不该发生 */
+            break;
+    }
+    for (i = 7; i >= 0; i--) {
+        u8 byte = (u8)((bits >> (i * 8)) & 0xff);
+
+        sha1_update(c, &byte, 1);
+    }
+    for (i = 0; i < 5; i++) {
+        out[i * 4] = (u8)(c->h[i] >> 24);
+        out[i * 4 + 1] = (u8)(c->h[i] >> 16);
+        out[i * 4 + 2] = (u8)(c->h[i] >> 8);
+        out[i * 4 + 3] = (u8)c->h[i];
+    }
+}
+
+/* ---- 构造与查询 ---- */
+
+Uuid uuid_nil(void)
+{
+    Uuid u = { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+
+    return u;
+}
+
+int uuid_is_nil(Uuid *self)
+{
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        if (self->b[i] != 0)
+            return 0;
+    return 1;
+}
+
+int uuid_eq(Uuid *self, Uuid *other)
+{
+    return memcmp(self->b, other->b, 16) == 0;
+}
+
+/* 版本号：第 7 字节的高 4 位（uuid_nil 给 0） */
+int uuid_version(Uuid *self) { return (self->b[6] >> 4) & 0x0f; }
+
+/* 变体：见文件头（0 NCS / 1 RFC 4122 / 2 Microsoft / 3 保留） */
+int uuid_variant(Uuid *self)
+{
+    if ((self->b[8] & 0x80) == 0)
+        return VARIANT_NCS;
+    if ((self->b[8] & 0xc0) == 0x80)
+        return VARIANT_RFC4122;
+    if ((self->b[8] & 0xe0) == 0xc0)
+        return VARIANT_MS;
+    return VARIANT_FUTURE;
+}
+
+/* 版本 7 里的 Unix 毫秒时间戳（48 位） */
+u64 uuid_time_v7(Uuid *self)
+{
+    u64 t = 0ull;
+    int i = 0;
+
+    for (i = 0; i < 6; i++)
+        t = (t << 8) | (u64)self->b[i];
+    return t;
+}
+
+/* 内部：给版本与变体位打标记（版本 4/5/7 共用） */
+static void uuid_stamp(Uuid *u, int ver)
+{
+    u->b[6] = (u8)((u->b[6] & 0x0f) | ((ver & 0x0f) << 4));
+    u->b[8] = (u8)((u->b[8] & 0x3f) | 0x80);
+}
+
+/* ---- 生成 ---- */
+
+/* 种一个 Rand：时钟 + 栈地址。**不是密码学熵源**，够用来避免两台机器
+   在同一毫秒内撞出同一个 UUID。 */
+static Rand uuid_seed_rand(void)
+{
+    u64 tick = (u64)now_ns();
+    u64 wall = (u64)now_unix_ms();
+    int local = 0;
+    u64 addr = (u64)(usize)&local;
+
+    return rand_seed(tick ^ (wall << 17) ^ addr);
+}
+
+/* 版本 4：指定随机源（同一 seed 给同一串 UUID，便于用例） */
+Uuid uuid_v4_seeded(Rand *r)
+{
+    Uuid u = { { 0 } };
+
+    random_fill(r, u.b, 16);
+    uuid_stamp(&u, 4);
+    return u;
+}
+
+Uuid uuid_v4(void)
+{
+    Rand r = uuid_seed_rand();
+
+    return uuid_v4_seeded(&r);
+}
+
+/* 版本 7：前 6 字节 = Unix 毫秒，其余随机；指定毫秒与随机源（可重现） */
+Uuid uuid_v7_at(u64 unix_ms, Rand *r)
+{
+    Uuid u = { { 0 } };
+
+    random_fill(r, u.b, 16);
+    u.b[0] = (u8)((unix_ms >> 40) & 0xff);
+    u.b[1] = (u8)((unix_ms >> 32) & 0xff);
+    u.b[2] = (u8)((unix_ms >> 24) & 0xff);
+    u.b[3] = (u8)((unix_ms >> 16) & 0xff);
+    u.b[4] = (u8)((unix_ms >> 8) & 0xff);
+    u.b[5] = (u8)(unix_ms & 0xff);
+    uuid_stamp(&u, 7);
+    return u;
+}
+
+Uuid uuid_v7(void)
+{
+    Rand r = uuid_seed_rand();
+    i64 ms = now_unix_ms();
+
+    return uuid_v7_at(ms < 0 ? 0ull : (u64)ms, &r);
+}
+
+/* 版本 5：SHA-1(namespace || name) 的前 16 字节 */
+Uuid uuid_v5(Uuid *ns, char[:] name)
+{
+    Sha1 c = { { 0 }, 0ull, { 0 }, 0 };
+    u8 dig[20] = { 0 };
+    Uuid u = { { 0 } };
+
+    sha1_init(&c);
+    sha1_update(&c, ns->b, 16);
+    if (name.len > 0 && name.data)
+        sha1_update(&c, (u8 *)name.data, name.len);
+    sha1_final(&c, dig);
+    memcpy(u.b, dig, 16);
+    uuid_stamp(&u, 5);
+    return u;
+}
+
+/* RFC 4122 的四个预定义命名空间（逐字节，免得依赖解析器） */
+Uuid uuid_ns_dns(void)
+{
+    Uuid u = { { 0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
+                 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8 } };
+
+    return u;
+}
+
+Uuid uuid_ns_url(void)
+{
+    Uuid u = { { 0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+                 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8 } };
+
+    return u;
+}
+
+Uuid uuid_ns_oid(void)
+{
+    Uuid u = { { 0x6b, 0xa7, 0xb8, 0x12, 0x9d, 0xad, 0x11, 0xd1,
+                 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8 } };
+
+    return u;
+}
+
+Uuid uuid_ns_x500(void)
+{
+    Uuid u = { { 0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
+                 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8 } };
+
+    return u;
+}
+
+/* ---- 解析与格式化 ---- */
+
+static int uuid_hex(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 解析：接受 "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"（36）、32 个十六进制字符
+ * （无连字符），以及可选的 "urn:uuid:" 前缀与两侧的 `{}`。成功返回 1 并写
+ * `*out`；格式不对返回 0，`*out` 不动。 */
+int uuid_parse(char[:] s, Uuid *out)
+{
+    u8 t[16] = { 0 };
+    int digits = 0;
+    int i = 0;
+    int seen_dash = 0;
+    int hi = 0;
+
+    if (!out || s.len <= 0)
+        return 0;
+    /* 前缀与包装 */
+    if (s.len >= 9 && !memcmp(s.data, "urn:uuid:", 9)) {
+        s = (char[:]){ s.data + 9, s.len - 9 };
+    }
+    if (s.len >= 2 && s.data[0] == '{' && s.data[s.len - 1] == '}') {
+        s = (char[:]){ s.data + 1, s.len - 2 };
+    }
+    if (s.len != 32 && s.len != 36)
+        return 0;
+    for (i = 0; i < s.len; i++) {
+        int c = (u8)s.data[i];
+        int v = 0;
+
+        if (c == '-') {
+            /* 只允许 36 长度下的 4 个连字符，位置必须对 */
+            if (s.len != 36)
+                return 0;
+            if (digits != 8 && digits != 12 && digits != 16 && digits != 20)
+                return 0;
+            seen_dash++;
+            if (seen_dash > 4)
+                return 0;
+            continue;
+        }
+        v = uuid_hex(c);
+        if (v < 0 || digits >= 32)
+            return 0;
+        if ((digits & 1) == 0)
+            hi = v;
+        else
+            t[digits / 2] = (u8)((hi << 4) | v);
+        digits++;
+    }
+    if (digits != 32)
+        return 0;
+    if (s.len == 36 && seen_dash != 4)
+        return 0;
+    memcpy(out->b, t, 16);
+    return 1;
+}
+
+/* 写 36 字符 + 结尾 NUL（cap 至少 37）。放不下返回 -1 且不写。 */
+int uuid_format(Uuid *self, char *dst, int cap)
+{
+    char *hex = (char *)"0123456789abcdef";
+    int o = 0;
+    int i = 0;
+
+    if (!dst || cap < 37)
+        return -1;
+    for (i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10)
+            dst[o++] = '-';
+        dst[o++] = hex[(self->b[i] >> 4) & 0x0f];
+        dst[o++] = hex[self->b[i] & 0x0f];
+    }
+    dst[o] = 0;
+    return 36;
+}
+
+/* 大写形式 */
+int uuid_format_upper(Uuid *self, char *dst, int cap)
+{
+    int n = uuid_format(self, dst, cap);
+    int i = 0;
+
+    if (n < 0)
+        return -1;
+    for (i = 0; i < n; i++)
+        if (dst[i] >= 'a' && dst[i] <= 'f')
+            dst[i] = (char)(dst[i] - 'a' + 'A');
+    return n;
+}
+
+/* 不带连字符的 32 字符 + NUL（cap 至少 33） */
+int uuid_format_simple(Uuid *self, char *dst, int cap)
+{
+    char *hex = (char *)"0123456789abcdef";
+    int o = 0;
+    int i = 0;
+
+    if (!dst || cap < 33)
+        return -1;
+    for (i = 0; i < 16; i++) {
+        dst[o++] = hex[(self->b[i] >> 4) & 0x0f];
+        dst[o++] = hex[self->b[i] & 0x0f];
+    }
+    dst[o] = 0;
+    return 32;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "预定义命名空间就是 RFC 4122 的那四个" {
+    Uuid d = uuid_ns_dns();
+    Uuid u = uuid_ns_url();
+    Uuid o = uuid_ns_oid();
+    Uuid x = uuid_ns_x500();
+    char buf[40] = { 0 };
+
+    if (uuid_format(&d, buf, sizeof buf) != 36
+        || strcmp(buf, "6ba7b810-9dad-11d1-80b4-00c04fd430c8") != 0)
+        return err(1, "DNS 命名空间不对");
+    if (uuid_format(&u, buf, sizeof buf) != 36
+        || strcmp(buf, "6ba7b811-9dad-11d1-80b4-00c04fd430c8") != 0)
+        return err(2, "URL 命名空间不对");
+    if (uuid_format(&o, buf, sizeof buf) != 36
+        || strcmp(buf, "6ba7b812-9dad-11d1-80b4-00c04fd430c8") != 0)
+        return err(3, "OID 命名空间不对");
+    if (uuid_format(&x, buf, sizeof buf) != 36
+        || strcmp(buf, "6ba7b814-9dad-11d1-80b4-00c04fd430c8") != 0)
+        return err(4, "X500 命名空间不对");
+    if (uuid_version(&d) != 1 || uuid_variant(&d) != VARIANT_RFC4122)
+        return err(5, "命名空间应当是 v1 + RFC 4122 变体");
+}
+
+test "版本 5：已知向量（Python uuid5 / RFC 4122 附录）" {
+    Uuid ns = uuid_ns_dns();
+    Uuid a = uuid_v5(&ns, S("www.example.com"));
+    Uuid b = uuid_v5(&ns, S("python.org"));
+    Uuid c = uuid_v5(&ns, S("www.widgets.com"));
+    char buf[40] = { 0 };
+
+    if (uuid_format(&a, buf, sizeof buf) != 36
+        || strcmp(buf, "2ed6657d-e927-568b-95e1-2665a8aea6a2") != 0)
+        return err(6, "www.example.com 的 v5 不对");
+    if (uuid_format(&b, buf, sizeof buf) != 36
+        || strcmp(buf, "886313e1-3b8a-5372-9b90-0c9aee199e5d") != 0)
+        return err(7, "python.org 的 v5 不对");
+    if (uuid_format(&c, buf, sizeof buf) != 36
+        || strcmp(buf, "21f7f8de-8051-5b89-8680-0195ef798b6a") != 0)
+        return err(8, "www.widgets.com 的 v5 不对");
+    if (uuid_version(&a) != 5 || uuid_variant(&a) != VARIANT_RFC4122)
+        return err(9, "v5 的版本/变体位不对");
+    /* 确定性：同样输入给同样结果 */
+    if (!uuid_eq(&a, &a))
+        return err(10, "自反比较不是相等");
+    {
+        Uuid again = uuid_v5(&ns, S("www.example.com"));
+
+        if (!uuid_eq(&a, &again))
+            return err(11, "v5 不确定");
+    }
+    /* 换个命名空间结果就不同 */
+    {
+        Uuid nsurl = uuid_ns_url();
+        Uuid other = uuid_v5(&nsurl, S("www.example.com"));
+
+        if (uuid_eq(&a, &other))
+            return err(12, "换命名空间结果没变");
+    }
+    /* 空名字也是确定的 */
+    {
+        Uuid e = uuid_v5(&ns, S(""));
+
+        if (uuid_version(&e) != 5)
+            return err(13, "空名字的 v5 版本不对");
+    }
+}
+
+test "版本 4：随机位、版本位、同种子可重现" {
+    Rand r1 = rand_seed(12345ull);
+    Rand r2 = rand_seed(12345ull);
+    Uuid a = uuid_v4_seeded(&r1);
+    Uuid b = uuid_v4_seeded(&r2);
+    Uuid c = uuid_v4_seeded(&r1);       /* r1 已经前进过 */
+    int i = 0;
+
+    if (!uuid_eq(&a, &b))
+        return err(14, "同种子没给同一串 UUID");
+    if (uuid_eq(&a, &c))
+        return err(15, "第二个 UUID 与第一个相同");
+    if (uuid_version(&a) != 4 || uuid_variant(&a) != VARIANT_RFC4122)
+        return err(16, "v4 的版本/变体位不对");
+    if (uuid_is_nil(&a))
+        return err(17, "v4 不该是 nil");
+    /* 版本/变体位以外的位不该被固定：连生成 8 个，至少有一处不同的非固定位 */
+    {
+        int diff = 0;
+        Uuid prev = a;
+
+        for (i = 0; i < 8; i++) {
+            Uuid n = uuid_v4_seeded(&r1);
+
+            if (memcmp(n.b, prev.b, 16) != 0)
+                diff = 1;
+            prev = n;
+        }
+        if (!diff)
+            return err(18, "连续生成的 v4 全都一样");
+    }
+    /* 真随机入口也要能跑通（不测具体值） */
+    {
+        Uuid d = uuid_v4();
+
+        if (uuid_version(&d) != 4 || uuid_variant(&d) != VARIANT_RFC4122)
+            return err(19, "uuid_v4() 的版本/变体位不对");
+    }
+}
+
+test "版本 7：前 48 位是毫秒时间戳" {
+    Rand r = rand_seed(999ull);
+    Uuid a = uuid_v7_at(1700000000123ull, &r);
+    Uuid b = uuid_v7_at(1700000000124ull, &r);
+    char buf[40] = { 0 };
+
+    if (uuid_version(&a) != 7 || uuid_variant(&a) != VARIANT_RFC4122)
+        return err(20, "v7 的版本/变体位不对");
+    if (uuid_time_v7(&a) != 1700000000123ull)
+        return err(21, "v7 的时间戳没写进去");
+    if (uuid_time_v7(&b) != 1700000000124ull)
+        return err(22, "第二个 v7 的时间戳不对");
+    /* 时间戳在前 6 字节：字典序 = 时间序 */
+    if (memcmp(a.b, b.b, 6) >= 0)
+        return err(23, "v7 的前 6 字节没有按时间递增");
+    uuid_format(&a, buf, sizeof buf);
+    if (buf[14] != '7')
+        return err(24, "格式化后第 15 个字符应当是版本 7");
+    /* 真时间入口 */
+    {
+        Uuid t = uuid_v7();
+
+        if (uuid_version(&t) != 7)
+            return err(25, "uuid_v7() 的版本位不对");
+        if (uuid_time_v7(&t) < 1700000000000ull)
+            return err(26, "uuid_v7() 的时间戳明显不在 2023 年之后");
+    }
+}
+
+test "解析：带连字符、不带、大写、urn 与花括号" {
+    Uuid u = { { 0 } };
+    char buf[40] = { 0 };
+
+    if (!uuid_parse(S("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), &u))
+        return err(27, "带连字符的解析失败");
+    if (uuid_version(&u) != 1)
+        return err(28, "解析后版本不对");
+    uuid_format(&u, buf, sizeof buf);
+    if (strcmp(buf, "6ba7b810-9dad-11d1-80b4-00c04fd430c8") != 0)
+        return err(29, "解析再格式化没还原");
+    if (!uuid_parse(S("6BA7B8109DAD11D180B400C04FD430C8"), &u))
+        return err(30, "无连字符大写的解析失败");
+    uuid_format(&u, buf, sizeof buf);
+    if (strcmp(buf, "6ba7b810-9dad-11d1-80b4-00c04fd430c8") != 0)
+        return err(31, "大写解析结果不对");
+    if (!uuid_parse(S("urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8"), &u))
+        return err(32, "urn:uuid: 前缀的解析失败");
+    if (!uuid_parse(S("{6ba7b810-9dad-11d1-80b4-00c04fd430c8}"), &u))
+        return err(33, "花括号形式的解析失败");
+    uuid_format(&u, buf, sizeof buf);
+    if (strcmp(buf, "6ba7b810-9dad-11d1-80b4-00c04fd430c8") != 0)
+        return err(34, "urn/花括号解析结果不对");
+}
+
+test "解析拒绝坏输入且不写 out" {
+    char *bad[9] = {
+        (char *)"",
+        (char *)"6ba7b810-9dad-11d1-80b4-00c04fd430c",      /* 少一位 */
+        (char *)"6ba7b810-9dad-11d1-80b4-00c04fd430c88",    /* 多一位 */
+        (char *)"6ba7b810-9dad-11d1-80b4-00c04fd430cg",     /* 非法字符 */
+        (char *)"6ba7b8109dad11d180b400c04fd430c8x",        /* 32 长度下带尾巴 */
+        (char *)"6ba7b810-9dad-11d1-80b400c04fd430c8",      /* 少一个连字符 */
+        (char *)"-6ba7b810-9dad-11d1-80b4-00c04fd430c",     /* 位置不对 */
+        (char *)"6ba7b810_9dad_11d1_80b4_00c04fd430c8",     /* 下划线 */
+        (char *)"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-",         /* 全非法 */
+    };
+    Uuid keep = { { 0 } };
+    int i = 0;
+
+    memset(keep.b, 0xab, 16);
+    for (i = 0; i < 9; i++) {
+        Uuid u = keep;
+
+        if (uuid_parse((char[:]){ bad[i], (int)strlen(bad[i]) }, &u))
+            return err(35, "坏输入被当成合法 UUID");
+        if (memcmp(u.b, keep.b, 16) != 0)
+            return err(36, "解析失败却改了 out");
+    }
+    {
+        Uuid u = keep;
+
+        if (uuid_parse(S("00000000-0000-0000-0000-000000000000"), &u) != 1
+            || !uuid_is_nil(&u))
+            return err(37, "全零 UUID 应当解析成 nil");
+    }
+}
+
+test "格式化：长度、cap、simple 与 upper" {
+    Uuid d = uuid_ns_dns();
+    char buf[40] = { 0 };
+    char small[36] = { 'Z' };
+    int n = 0;
+
+    n = uuid_format(&d, buf, sizeof buf);
+    if (n != 36)
+        return err(38, "format 应当返回 36");
+    if (strlen(buf) != 36)
+        return err(39, "format 没有写结尾 NUL");
+    if (uuid_format(&d, small, sizeof small) != -1 || small[0] != 'Z')
+        return err(40, "cap 不足时应当 -1 且不写");
+    n = uuid_format_simple(&d, buf, sizeof buf);
+    if (n != 32 || strcmp(buf, "6ba7b8109dad11d180b400c04fd430c8") != 0)
+        return err(41, "simple 形式不对");
+    n = uuid_format_upper(&d, buf, sizeof buf);
+    if (n != 36 || strcmp(buf, "6BA7B810-9DAD-11D1-80B4-00C04FD430C8") != 0)
+        return err(42, "大写形式不对");
+}
+
+test "nil 与比较" {
+    Uuid a = uuid_nil();
+    Uuid b = uuid_nil();
+    Uuid c = uuid_ns_dns();
+
+    if (!uuid_is_nil(&a) || uuid_version(&a) != 0)
+        return err(43, "nil 判定不对");
+    if (!uuid_eq(&a, &b))
+        return err(44, "两个 nil 不相等");
+    if (uuid_eq(&a, &c))
+        return err(45, "nil 与 DNS 命名空间相等了");
+    if (uuid_variant(&a) != VARIANT_NCS)
+        return err(46, "全零的变体应当是 NCS");
+}

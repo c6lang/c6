@@ -856,7 +856,7 @@ typedef struct C6HeaderDecl {
 /* one module's error id block: a module's 'enum Error' members live in its
    own block of 4096 codes (see c6_err_slot in tccgen.c) */
 typedef struct C6ErrMod {
-    char *name;             /* dotted module name, e.g. "std.err" */
+    char *name;             /* dotted module name, e.g. "std.core.err" */
     int area;               /* 0 = application, 1 = standard library */
     int slot;               /* the block inside the area */
     unsigned char pinned;   /* the slot comes from errbase.def */

@@ -1,0 +1,108 @@
+/* std/core/err：标准错误码与消息。
+ *
+ * c6 的 `T!error` 只带一个 int id 和一条消息（见 README 的 err/try/catch）。
+ * 模块里的 `enum Error` 就是它的错误码表：编译器把每个成员放进本模块的
+ * 号段（`(area<<27) | (slot<<12) | code`，见 docs/reference/grammar.md），所以
+ * `NOMEM` 实际是 `0x0E000003` —— 0 仍是「没有错误」，跨模块可以互相识别：
+ *
+ *     import std.core.err;
+ *
+ *     int!error parse(char *s) {
+ *         if (s == 0)
+ *             err(std.core.err.INVAL, std.core.err.msg(std.core.err.INVAL));
+ *         ...
+ *     }
+ *
+ * 只用到 id 的代码可以不链接 std/core/err.c6（枚举是纯声明）；调用 msg() 时才
+ * 需要把 std/core/err.c6 放上命令行。
+ */
+#include <string.h>
+
+module std.core.err;
+
+enum Error {
+    OK       = 0,
+    INVAL    = 1,   /* 参数不合法 */
+    RANGE    = 2,   /* 越界 */
+    NOMEM    = 3,   /* 分配失败 */
+    IO       = 4,   /* 读写出错 */
+    AGAIN    = 5,   /* 暂时不可用，重试 */
+    NO_DATA  = 6,   /* 输入结束，没有更多数据 */
+    PARSE    = 7,   /* 格式不对 */
+    STATE    = 8,   /* 对象状态不允许这个操作 */
+    TIMEOUT  = 9,
+    UNSUPP   = 10,  /* 不支持的操作 */
+    EXIST    = 11,  /* 已经存在 */
+    NO_ENT   = 12,  /* 不存在 */
+    FULL     = 13,  /* 容器满 */
+    EMPTY    = 14,  /* 容器空 */
+    BUSY     = 15,  /* 被占用 */
+};
+
+/* 错误码的英文短名，用 err() 直接转出来即可。 */
+const char *msg(int code)
+{
+    switch (code) {
+    case OK:      return "ok";
+    case INVAL:   return "invalid argument";
+    case RANGE:   return "out of range";
+    case NOMEM:   return "out of memory";
+    case IO:      return "i/o error";
+    case AGAIN:   return "try again";
+    case NO_DATA: return "no data";
+    case PARSE:   return "parse error";
+    case STATE:   return "wrong state";
+    case TIMEOUT: return "timed out";
+    case UNSUPP:  return "unsupported";
+    case EXIST:   return "already exists";
+    case NO_ENT:  return "not found";
+    case FULL:    return "full";
+    case EMPTY:   return "empty";
+    case BUSY:    return "busy";
+    default:      return "unknown error";
+    }
+}
+
+int is_ok(int code) { return code == OK; }
+
+/* 把某个错误码包装成一条消息，调用方可以 err(rc, std.core.err.msg(rc)) 之后
+   再把这个函数当作「统一出口」。 */
+const char *const msg_of(int code) { return msg(code); }
+
+test "错误码从 0 开始且互不相同" {
+    if (OK != 0)
+        return err(1, "OK 不是 0");
+    if (is_ok(OK) != 1 || is_ok(INVAL) != 0)
+        return err(2, "is_ok 不对");
+    if (INVAL == RANGE || RANGE == NOMEM || FULL == EMPTY)
+        return err(3, "错误码重复");
+}
+
+test "消息表覆盖所有已知错误码" {
+    if (strcmp(msg(OK), "ok") != 0)
+        return err(4, "OK 的消息不对");
+    if (strcmp(msg(RANGE), "out of range") != 0)
+        return err(5, "RANGE 的消息不对");
+    if (strcmp(msg(FULL), "full") != 0)
+        return err(6, "FULL 的消息不对");
+    if (strcmp(msg(12345), "unknown error") != 0)
+        return err(7, "未知错误码没有兜底消息");
+}
+
+/* 把 std.core.err 的 id 当作 !error 的载荷传出去，再按 id 分辨 */
+int!error boom(void) { return err(RANGE, msg(RANGE)); }
+
+/* 成功时返回 0，失败时把错误 id 原样带出来 */
+int boom_id(void)
+{
+    boom() catch e { return e.id; };
+    return 0;
+}
+
+test "错误码可以跨模块识别" {
+    int rc = boom_id();
+    if (rc != RANGE)
+        return err(8, "catch 拿到的 id 不是 RANGE");
+    if (strcmp(msg(rc), "out of range") != 0)
+        return err(9, "按 id 取消息不对");
+}

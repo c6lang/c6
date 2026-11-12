@@ -133,7 +133,7 @@ expect_ok() {
 }
 
 printf 'app.a 0x6100\n'        > "$TMP/good.def"
-printf 'std.err 0x6100\n'      > "$TMP/std.def"
+printf 'std.core.err 0x6100\n'      > "$TMP/std.def"
 printf 'app.a 0x1000\n'        > "$TMP/low.def"
 printf 'app.a 0x6100\napp.b 0x6100\n' > "$TMP/dup.def"
 printf 'app.a 0x6100\napp.a 0x6101\n' > "$TMP/twice.def"

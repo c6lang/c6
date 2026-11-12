@@ -7,28 +7,28 @@
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *
  *     ./tcc/c6 -B tcc -I . -o build/stdbox \
- *         examples/stdbox.c6 std/types.c6 std/err.c6 std/str.c6 \
- *         std/mem.c6 std/num.c6 std/json.c6 std/sha256.c6 \
- *         std/csv.c6 std/env.c6
+ *         examples/stdbox.c6 std/core/types.c6 std/core/err.c6 std/text/str.c6 \
+ *         std/core/mem.c6 std/text/num.c6 std/data/json.c6 std/encoding/sha256.c6 \
+ *         std/data/csv.c6 std/os/env.c6
  *
  * 用到的东西：
- *   std.env     环境变量（set/get/unset、数值/布尔解析）与 argc/argv
- *   std.csv     RFC 4180：零分配读取器 + 写调用方缓冲
- *   std.json    arena 上的 DOM：解析、取值、紧凑/缩进写出、转义
- *   std.sha256  SHA-256 与 HMAC-SHA256（已知向量 + 分片一致性）
+ *   std.os.env     环境变量（set/get/unset、数值/布尔解析）与 argc/argv
+ *   std.data.csv     RFC 4180：零分配读取器 + 写调用方缓冲
+ *   std.data.json    arena 上的 DOM：解析、取值、紧凑/缩进写出、转义
+ *   std.encoding.sha256  SHA-256 与 HMAC-SHA256（已知向量 + 分片一致性）
  */
 #include <stdio.h>
 #include <string.h>
 
-import std.types;
-import std.err;
-import std.str;
-import std.mem;
-import std.num;
-import std.json;
-import std.sha256;
-import std.csv;
-import std.env;
+import std.core.types;
+import std.core.err;
+import std.text.str;
+import std.core.mem;
+import std.text.num;
+import std.data.json;
+import std.encoding.sha256;
+import std.data.csv;
+import std.os.env;
 
 /* 宏不随 import 传递：谁的代码里用，谁自己定义一次 */
 #define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
@@ -160,7 +160,7 @@ static void box_csv(void)
     r = csv_reader(bad_text);
     while (csv_next(&r, &f) > 0)
         ;
-    check(r.error == std.csv.PARSE, "csv: 未闭合引号报 PARSE");
+    check(r.error == std.data.csv.PARSE, "csv: 未闭合引号报 PARSE");
 
     {
         /* 引号字段的视图是「引号内的原始字节」："" 要自己展开 */
@@ -204,7 +204,7 @@ static void box_json(void)
         return;
     };
     p = &doc;
-    check(p->kind == std.json.JOBJ, "json: 顶层是对象");
+    check(p->kind == std.data.json.JOBJ, "json: 顶层是对象");
     check(p->json_count() == 5, "json: 顶层键数");
 
     name = p->json_get((char *)"name");
@@ -246,7 +246,7 @@ static void box_json(void)
     };
     err_id = 0;
 parsed:
-    check(err_id == std.json.PARSE, "json: 语法错报 PARSE");
+    check(err_id == std.data.json.PARSE, "json: 语法错报 PARSE");
 }
 
 /* ---- 4. sha256 ---- */

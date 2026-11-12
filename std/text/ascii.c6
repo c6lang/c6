@@ -1,0 +1,269 @@
+/* std/text/ascii：ASCII 字节的判别与大小写转换。
+ *
+ *     import std.text.ascii;
+ *
+ *     ascii_is_digit('7');        // 1
+ *     ascii_hex_value('F');       // 15
+ *     ascii_to_lower('Q');        // 'q'
+ *     ascii_cmp_nocase(S("Hello"), S("hello"));   // 0
+ *
+ * 这一层全是**纯函数、零分配、零依赖**：参数收 `int` 而不是 `char`，所以
+ * `fgetc()` 的 EOF(-1) 和带符号 char 的负值都安全——任何 `c < 0 || c > 127`
+ * 的输入一律判为「不是」，转换函数原样返回，不会读表越界。
+ *
+ * 只处理 ASCII，不做 locale：`std.text.utf8` 负责多字节，这里刻意不碰。
+ *
+ * `ascii_upper` / `ascii_lower` 原地改调用方缓冲（长度由调用方给），是这一层
+ * 唯一「写」的函数；要「不改原内存」的版本用 `std.text.str` 的 `copy_upper`。
+ */
+module std.text.ascii;
+import std.core.types;
+
+/* ---- 判别：0 / 1 ---- */
+
+int ascii_is_ascii(int c) { return c >= 0 && c < 128; }
+
+int ascii_is_digit(int c) { return c >= '0' && c <= '9'; }
+
+int ascii_is_upper(int c) { return c >= 'A' && c <= 'Z'; }
+
+int ascii_is_lower(int c) { return c >= 'a' && c <= 'z'; }
+
+int ascii_is_alpha(int c) { return ascii_is_upper(c) || ascii_is_lower(c); }
+
+int ascii_is_alnum(int c) { return ascii_is_alpha(c) || ascii_is_digit(c); }
+
+/* C 的 isspace 全集：空格、\t、\n、\v、\f、\r */
+int ascii_is_space(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f'
+        || c == '\r';
+}
+
+/* 空白里只有空格和 \t（"blank"），不跨行 */
+int ascii_is_blank(int c) { return c == ' ' || c == '\t'; }
+
+/* 可打印：0x20..0x7e（含空格）。DEL(0x7f) 不算。 */
+int ascii_is_print(int c) { return c >= 0x20 && c <= 0x7e; }
+
+/* 图形字符：可打印且不是空格 */
+int ascii_is_graph(int c) { return c >= 0x21 && c <= 0x7e; }
+
+/* 控制字符：0x00..0x1f 与 0x7f */
+int ascii_is_cntrl(int c) { return (c >= 0 && c < 0x20) || c == 0x7f; }
+
+/* 标点：可打印、非字母数字、非空格（C 的 ispunct 口径） */
+int ascii_is_punct(int c) { return ascii_is_graph(c) && !ascii_is_alnum(c); }
+
+/* 前置声明：判别函数放在取值函数之前，和 C 的声明顺序要求一致 */
+int ascii_hex_value(int c);
+
+int ascii_is_xdigit(int c) { return ascii_hex_value(c) >= 0; }
+
+/* ---- 取值 ---- */
+
+/* '0'..'9' -> 0..9，其它 -1 */
+int ascii_digit_value(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    return -1;
+}
+
+/* 十六进制位 -> 0..15，其它 -1；大小写都收 */
+int ascii_hex_value(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 0..15 -> '0'..'F'（upper 非 0）或 '0'..'f'；越界 -1 */
+int ascii_hex_char(int v, int upper)
+{
+    if (v < 0 || v > 15)
+        return -1;
+    if (v < 10)
+        return '0' + v;
+    return (upper ? 'A' : 'a') + (v - 10);
+}
+
+/* ---- 转换 ---- */
+
+int ascii_to_lower(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c + ('a' - 'A');
+    return c;
+}
+
+int ascii_to_upper(int c)
+{
+    if (c >= 'a' && c <= 'z')
+        return c - ('a' - 'A');
+    return c;
+}
+
+/* 原地小写/大写：非字母的字节原样不动，NUL 也照旧（长度由调用方给） */
+void ascii_lower(char *p, int n)
+{
+    int i = 0;
+
+    if (!p || n <= 0)
+        return;
+    for (i = 0; i < n; i++)
+        p[i] = (char)ascii_to_lower((int)(u8)p[i]);
+}
+
+void ascii_upper(char *p, int n)
+{
+    int i = 0;
+
+    if (!p || n <= 0)
+        return;
+    for (i = 0; i < n; i++)
+        p[i] = (char)ascii_to_upper((int)(u8)p[i]);
+}
+
+/* 忽略大小写比较：-1 / 0 / 1，语义与 std.text.str 的 cmp 一致；只折叠 ASCII */
+int ascii_cmp_nocase(char[:] a, char[:] b)
+{
+    int i = 0;
+    int n = a.len < b.len ? a.len : b.len;
+
+    for (i = 0; i < n; i++) {
+        int x = ascii_to_lower((int)(u8)a.data[i]);
+        int y = ascii_to_lower((int)(u8)b.data[i]);
+
+        if (x != y)
+            return x < y ? -1 : 1;
+    }
+    if (a.len == b.len)
+        return 0;
+    return a.len < b.len ? -1 : 1;
+}
+
+/* 忽略大小写判断「相等」，比 cmp 少一次三态判断 */
+int ascii_eq_nocase(char[:] a, char[:] b)
+{
+    return ascii_cmp_nocase(a, b) == 0;
+}
+
+/* ---- 自测 ---- */
+
+test "判别函数覆盖 ASCII 的边界" {
+    int c = 0;
+
+    if (!ascii_is_ascii(0) || !ascii_is_ascii(127) || ascii_is_ascii(128)
+        || ascii_is_ascii(-1))
+        return err(1, "is_ascii 边界不对");
+    if (!ascii_is_digit('0') || !ascii_is_digit('9') || ascii_is_digit('/')
+        || ascii_is_digit(':') || ascii_is_digit(-1))
+        return err(2, "is_digit 边界不对");
+    if (!ascii_is_upper('A') || !ascii_is_upper('Z') || ascii_is_upper('a')
+        || ascii_is_upper('0'))
+        return err(3, "is_upper 边界不对");
+    if (!ascii_is_lower('a') || !ascii_is_lower('z') || ascii_is_lower('A'))
+        return err(4, "is_lower 边界不对");
+    if (!ascii_is_alpha('A') || !ascii_is_alpha('z') || ascii_is_alpha('_'))
+        return err(5, "is_alpha 不对");
+    for (c = 0; c < 128; c++) {
+        if (ascii_is_alnum(c) != (ascii_is_alpha(c) || ascii_is_digit(c)))
+            return err(6, "is_alnum 与 alpha/digit 不一致");
+        if (ascii_is_graph(c) != (ascii_is_print(c) && c != ' '))
+            return err(7, "is_graph 与 is_print 不一致");
+        if (ascii_is_punct(c) != (ascii_is_graph(c) && !ascii_is_alnum(c)))
+            return err(8, "is_punct 不一致");
+        if (ascii_is_cntrl(c) != (c < 0x20 || c == 0x7f))
+            return err(9, "is_cntrl 不一致");
+    }
+}
+
+test "空白与控制字符" {
+    if (!ascii_is_space(' ') || !ascii_is_space('\t') || !ascii_is_space('\n')
+        || !ascii_is_space('\v') || !ascii_is_space('\f')
+        || !ascii_is_space('\r'))
+        return err(10, "is_space 漏了字符");
+    if (ascii_is_space('a') || ascii_is_space(0) || ascii_is_space(0xa0))
+        return err(11, "is_space 误判");
+    if (!ascii_is_blank(' ') || !ascii_is_blank('\t')
+        || ascii_is_blank('\n'))
+        return err(12, "is_blank 不对");
+    if (ascii_is_print('\n') || ascii_is_print(0x7f)
+        || !ascii_is_print(' ') || !ascii_is_print('~'))
+        return err(13, "is_print 边界不对");
+    if (!ascii_is_cntrl(0) || !ascii_is_cntrl(0x1f) || !ascii_is_cntrl(0x7f)
+        || ascii_is_cntrl(' '))
+        return err(14, "is_cntrl 边界不对");
+}
+
+test "取值与进制字符" {
+    if (ascii_digit_value('0') != 0 || ascii_digit_value('9') != 9
+        || ascii_digit_value('a') != -1 || ascii_digit_value(-1) != -1)
+        return err(15, "digit_value 不对");
+    if (ascii_hex_value('0') != 0 || ascii_hex_value('9') != 9
+        || ascii_hex_value('a') != 10 || ascii_hex_value('F') != 15
+        || ascii_hex_value('g') != -1)
+        return err(16, "hex_value 不对");
+    if (ascii_hex_char(0, 0) != '0' || ascii_hex_char(10, 0) != 'a'
+        || ascii_hex_char(10, 1) != 'A' || ascii_hex_char(15, 1) != 'F'
+        || ascii_hex_char(-1, 1) != -1 || ascii_hex_char(16, 1) != -1)
+        return err(17, "hex_char 不对");
+    if (!ascii_is_xdigit('f') || !ascii_is_xdigit('A')
+        || ascii_is_xdigit('g') || ascii_is_xdigit(' '))
+        return err(18, "is_xdigit 不对");
+}
+
+test "大小写转换只碰字母" {
+    if (ascii_to_lower('A') != 'a' || ascii_to_lower('Z') != 'z'
+        || ascii_to_lower('a') != 'a' || ascii_to_lower('0') != '0'
+        || ascii_to_lower('@') != '@')
+        return err(19, "to_lower 不对");
+    if (ascii_to_upper('a') != 'A' || ascii_to_upper('z') != 'Z'
+        || ascii_to_upper('A') != 'A' || ascii_to_upper('9') != '9')
+        return err(20, "to_upper 不对");
+
+    {
+        char buf[8] = { 'a', 'B', '3', '-', 0, 0, 0, 0 };
+
+        ascii_upper(buf, 4);
+        if (buf[0] != 'A' || buf[1] != 'B' || buf[2] != '3' || buf[3] != '-')
+            return err(21, "原地大写不对");
+        if (buf[4] != 0)
+            return err(22, "原地大写越界写了");
+        ascii_lower(buf, 2);
+        if (buf[0] != 'a' || buf[1] != 'b')
+            return err(23, "原地小写不对");
+    }
+    {
+        char buf[4] = { 'X', 'Y', 'Z', 0 };
+
+        ascii_upper(buf, 0);            /* n = 0：什么都不做 */
+        ascii_lower(buf, -3);           /* 负长度：什么都不做 */
+        if (buf[0] != 'X' || buf[1] != 'Y' || buf[2] != 'Z')
+            return err(24, "n <= 0 时不该改内容");
+    }
+}
+
+test "忽略大小写比较" {
+    char[:] a = { (char *)"Hello", 5 };
+    char[:] b = { (char *)"hello", 5 };
+    char[:] c = { (char *)"HELLO", 5 };
+    char[:] d = { (char *)"hell", 4 };
+    char[:] e = { (char *)"hellp", 5 };
+
+    if (ascii_cmp_nocase(a, b) != 0 || ascii_cmp_nocase(a, c) != 0)
+        return err(25, "相等比较不对");
+    if (ascii_eq_nocase(a, d) != 0 || ascii_eq_nocase(a, e) != 0)
+        return err(26, "eq_nocase 误判");
+    if (ascii_cmp_nocase(d, a) != -1 || ascii_cmp_nocase(a, d) != 1)
+        return err(27, "长度比较符号不对");
+    if (ascii_cmp_nocase(b, e) != -1)
+        return err(28, "内容比较符号不对");
+    if (ascii_cmp_nocase(a, a) != 0)
+        return err(29, "自反比较不是 0");
+}

@@ -82,7 +82,7 @@
 
 | 目标 | 作用 |
 |---|---|
-| `make stdtest` | `std/` 下每个模块的 `test` 块 |
+| `make stdtest` | 遍历 `std/` 下七个子目录，跑每个模块的 `test` 块 |
 | `make std-demo` | 编译并运行 `examples/wordcount.c6`（标准库集成示例） |
 | `make std-tour` | 编译并运行 `examples/stdtour.c6`（新模块自带自检） |
 | `make std-kit` | 编译并运行 `examples/stdkit.c6`（第三批模块的拼装示例） |

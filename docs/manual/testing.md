@@ -149,7 +149,7 @@ make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
 make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
 make errcheck      # errbase.def：钉号表本身和 C126/C127/C128 真的会报错
-make stdtest       # 标准库 std/ 的 test 块
+make stdtest       # 标准库 std/（七个子目录）每个模块的 test 块
 make std-demo      # 标准库集成示例（examples/wordcount.c6）
 make std-tour      # 新模块集成示例（examples/stdtour.c6，自带自检）
 ```
