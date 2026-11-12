@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第六十二批（颜色与单位）**：`std.core.color`（RGBA 与 HSL/HSV、hex 解析
+  生成、混合、亮度与对比度）、`std.data.palette`（GIMP `.gpl` 与 hex 列表）、
+  `std.text.colorname`（40 个 CSS 命名颜色 + 最近匹配）、`std.core.units`（长度/
+  质量/温度/字节换算），集成示例 `examples/stdcolor.c6`（`make std-color`）。
+  错误号段 `std.core.color`=0x6101 … `std.core.units`=0x6104
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十一批（文本清洗与标注）**：`std.text.sanitize`（四项开关的清洗器）、
   `std.text.tabs`（制表符展开/还原）、`std.text.quote`（shell 引用与去引用）、
   `std.text.nato`（NATO/ICAO 拼读与解码），集成示例 `examples/stdclean.c6`

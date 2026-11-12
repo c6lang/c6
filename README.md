@@ -392,6 +392,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/text/tabs.c6          std.text.tabs         制表符展开与还原：按制表位补空格，还原只动行首空白
   std/text/quote.c6         std.text.quote        shell 引用：单引号包裹 + 内部  转义，unquote 认引号与反斜杠
   std/text/nato.c6          std.text.nato         NATO/ICAO 拼读：字母与数字拼成单词，decode 大小写不敏感
+  std/core/color.c6         std.core.color         颜色：RGBA/HSL/HSV 互转、#hex 解析生成、混合、亮度与对比度
+  std/data/palette.c6       std.data.palette       调色板：GIMP .gpl 与 #RRGGBB 列表两种格式，游标 open/next/find
+  std/text/colorname.c6     std.text.colorname     命名颜色：40 个 CSS 名字的 lookup/name_of/nearest
+  std/core/units.c6         std.core.units         单位换算：长度/质量/温度/字节，Conv 方法 init/to，parse_unit
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -509,6 +513,7 @@ make std-check    # 编译并运行 examples/stdcheck.c6（第五十八批校验
 make std-linux    # 编译并运行 examples/stdlinux.c6（第五十九批 Linux 配置文本模块的拼装示例）
 make std-bin2     # 编译并运行 examples/stdbin2.c6（第六十批二进制与数值工具模块的拼装示例，链接带 -lm）
 make std-clean    # 编译并运行 examples/stdclean.c6（第六十一批文本清洗与标注模块的拼装示例）
+make std-color    # 编译并运行 examples/stdcolor.c6（第六十二批颜色与单位模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

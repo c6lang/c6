@@ -1,0 +1,292 @@
+/* std/data/palette：调色板文件（GIMP `.gpl` 与简单的 hex 列表）的解析。
+ *
+ *     import std.data.palette;
+ *
+ *     PaletteDoc doc = { 0 };
+ *     PaletteEntry e = { 0 };
+ *     doc.open(buf, n);                    // 游标：open / next / count / find
+ *     while (doc.next(&e) == 1)
+ *         // e.name / e.color
+ *     doc.find("Black", &e);
+ *
+ * 认两种格式：
+ *
+ * - GIMP 调色板：首行 `GIMP Palette`，随后可有 `Name:`/`Columns:`/`#` 注释，
+ *   数据行是 `R G B<TAB>名字`（RGB 是 0..255 的十进制）；
+ * - 简单列表：每行 `#RRGGBB[ 名字]`（`#` 开头但后面是 6 位十六进制的行算颜色，
+ *   不是注释）。
+ *
+ * 约定：
+ *
+ * - `PaletteDoc` 是游标：`open` 数颜色条目，`next` 逐条返回，`rewind` 复位；
+ * - 名字是原缓冲区视图（GPL 里名字可省略 → 长度为 0）；`#` 开头的注释行跳过；
+ * - `find(name)` 按名字**精确**比较（大小写敏感）；
+ * - `is_gpl` 告诉你文件是不是 GIMP 格式；
+ * - 依赖 `std.core.color` 的 `Color`/`from_hex`。
+ */
+#include <string.h>
+
+module std.data.palette;
+import std.core.types;
+import std.text.str;
+import std.core.color;
+
+struct PaletteEntry {
+    Str name;
+    Color color;
+};
+
+struct PaletteDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+    int gpl;
+};
+
+static int pal_line(const char *p, int n, int *pos, int *start, int *len)
+{
+    int i = *pos;
+
+    if (i >= n)
+        return 0;
+    *start = i;
+    while (i < n && p[i] != '\n')
+        i++;
+    *len = i - *start;
+    if (*len > 0 && p[*start + *len - 1] == '\r')
+        (*len)--;
+    if (i < n)
+        i++;
+    *pos = i;
+    return 1;
+}
+
+static int pal_isdigit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+/* 从行首读一个 0..255 的整数，跳过空格；返回 1 成功 */
+static int pal_num(const char *p, int end, int *pos, int *out)
+{
+    int i = *pos, v = 0, digits = 0;
+
+    while (i < end && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    while (i < end && pal_isdigit(p[i])) {
+        v = v * 10 + (p[i] - '0');
+        digits++;
+        i++;
+        if (v > 255)
+            return -1;
+    }
+    if (!digits)
+        return -1;
+    *pos = i;
+    *out = v;
+    return 1;
+}
+
+int next(PaletteDoc *d, PaletteEntry *out)
+{
+    const char *p = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    while (d->off < d->n) {
+        int start = d->off, i = d->off, end = 0;
+
+        while (i < d->n && p[i] != '\n')
+            i++;
+        end = i;
+        if (end > start && p[end - 1] == '\r')
+            end--;
+        if (i < d->n)
+            i++;
+        d->off = i;
+        while (start < end && (p[start] == ' ' || p[start] == '\t'))
+            start++;
+        if (start >= end)
+            continue;
+        if (end - start >= 12 && memcmp(p + start, "GIMP Palette", 12) == 0)
+            continue;
+        if (d->gpl) {
+            int r = 0, g = 0, b = 0, pos = start;
+
+            if (p[pos] == '#') {
+                /* GPL 里的注释行 */
+                while (pos < end && p[pos] != ' ')
+                    pos++;
+                continue;
+            }
+            if (pal_num(p, end, &pos, &r) != 1)
+                continue;               /* Name:/Columns: 之类的行 */
+            if (pal_num(p, end, &pos, &g) != 1)
+                return -1;
+            if (pal_num(p, end, &pos, &b) != 1)
+                return -1;
+            memset(out, 0, sizeof *out);
+            out->color = color_rgb((u8)r, (u8)g, (u8)b);
+            while (pos < end && (p[pos] == ' ' || p[pos] == '\t'))
+                pos++;
+            out->name.s = (char[:]){ (char *)p + pos, end - pos };
+            return 1;
+        }
+        /* 简单格式：#RRGGBB[ 名字]；`#` 后面不是十六进制数字就当注释 */
+        if (p[start] == '#' && end - start >= 7
+            && ((p[start + 1] >= '0' && p[start + 1] <= '9')
+                || (p[start + 1] >= 'a' && p[start + 1] <= 'f')
+                || (p[start + 1] >= 'A' && p[start + 1] <= 'F'))) {
+            Color c = { 0 };
+
+            if (from_hex(&c, (char[:]){ (char *)p + start,
+                                        end - start < 9 ? end - start : 9 })
+                != 1)
+                return -1;
+            memset(out, 0, sizeof *out);
+            out->color = c;
+            {
+                int k = start + 7;
+
+                while (k < end && (p[k] == ' ' || p[k] == '\t'))
+                    k++;
+                out->name.s = (char[:]){ (char *)p + k, end - k };
+            }
+            return 1;
+        }
+        continue;                       /* 其它行（如 Name:）跳过 */
+    }
+    return 0;
+}
+
+int count(PaletteDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int is_gpl(PaletteDoc *d)
+{
+    return d ? d->gpl : 0;
+}
+
+int rewind(PaletteDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int find(PaletteDoc *d, const char *name, PaletteEntry *out)
+{
+    PaletteEntry e = { 0 };
+    int nlen = 0;
+
+    if (!d || !name || !out)
+        return -1;
+    nlen = (int)strlen(name);
+    rewind(d);
+    while (next(d, &e) == 1) {
+        if (e.name.s.len == nlen
+            && memcmp(e.name.s.data, name, (size_t)nlen) == 0) {
+            *out = e;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int open(PaletteDoc *d, const void *src, int n)
+{
+    PaletteEntry e = { 0 };
+    int count = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    d->gpl = (n >= 12 && memcmp(src, "GIMP Palette", 12) == 0) ? 1 : 0;
+    {
+        PaletteDoc tmp = { 0 };
+
+        tmp.src = d->src;
+        tmp.n = n;
+        tmp.gpl = d->gpl;
+        while (next(&tmp, &e) == 1)
+            count++;
+    }
+    d->nentries = count;
+    d->off = 0;
+    return count;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "palette：GIMP 格式" {
+    static const char *src =
+        "GIMP Palette\n"
+        "Name: Demo\n"
+        "Columns: 16\n"
+        "#\n"
+        "  0   0   0\tBlack\n"
+        "255 255 255\tWhite\n"
+        " 51 102 204\tBlue\n";
+    PaletteDoc d = { 0 };
+    PaletteEntry e = { 0 };
+    int n = 0;
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(1, "应该有 3 个颜色");
+    if (d.count() != 3 || d.is_gpl() != 1)
+        return err(2, "count()/is_gpl() 不对");
+    if (d.next(&e) != 1 || e.color.r != 0 || e.color.a != 255)
+        return err(3, "第一个颜色不对");
+    if (e.name.s.len != 5 || memcmp(e.name.s.data, "Black", 5) != 0)
+        return err(4, "第一个名字不对");
+    if (d.next(&e) != 1 || e.color.r != 255 || e.color.g != 255)
+        return err(5, "第二个颜色不对");
+    if (d.next(&e) != 1 || e.color.r != 51 || e.color.b != 204)
+        return err(6, "第三个颜色不对");
+    if (d.next(&e) != 0)
+        return err(7, "读完应该返回 0");
+    if (d.find("Blue", &e) != 1 || e.color.g != 102)
+        return err(8, "find(Blue) 不对");
+    if (d.find("black", &e) != 0)
+        return err(9, "名字大小写敏感，找不到应该 0");
+    n = 0;
+    d.rewind();
+    while (d.next(&e) == 1)
+        n++;
+    if (n != 3)
+        return err(10, "rewind 之后应该又能读出 3 条");
+}
+
+test "palette：hex 列表" {
+    static const char *src =
+        "# 注释行\n"
+        "#FF0000 Red\n"
+        "#00ff00\tGreen\n"
+        "#0000FF80 HalfBlue\n";
+    PaletteDoc d = { 0 };
+    PaletteEntry e = { 0 };
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(11, "应该识别出 3 个颜色（# 注释不算）");
+    if (d.is_gpl() != 0)
+        return err(12, "不该是 GPL");
+    if (d.next(&e) != 1 || e.color.r != 255 || e.color.g != 0)
+        return err(13, "第一个 hex 颜色不对");
+    if (e.name.s.len != 3 || memcmp(e.name.s.data, "Red", 3) != 0)
+        return err(14, "第一个名字不对");
+    if (d.next(&e) != 1 || e.color.g != 255)
+        return err(15, "第二个 hex 颜色不对");
+    if (d.next(&e) != 1 || e.color.a != 0x80)
+        return err(16, "带 alpha 的 hex 不对");
+    if (d.find("Green", &e) != 1 || e.color.g != 255)
+        return err(17, "find(Green) 不对");
+}

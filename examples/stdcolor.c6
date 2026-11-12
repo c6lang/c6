@@ -1,0 +1,144 @@
+/* examples/stdcolor.c6 —— 第六十二批（颜色与单位）的集成示例。
+ *
+ *     make std-color
+ *
+ * 四节：颜色转换（Color 方法）、调色板文件、命名颜色（含最近匹配）、单位换算
+ * （Conv 方法）。链接需要 `-lm`？不需要——color 刻意不用 libm。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.color;
+import std.data.palette;
+import std.text.colorname;
+import std.core.units;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static int near(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+static void do_color(void)
+{
+    Color c = { 0 };
+    Color white = { 0 };
+    Color half = { 0 };
+    char hex[16] = { 0 };
+    double h = 0, s = 0, l = 0;
+
+    printf("== color\n");
+    check(from_hex(&c, S("#3366CC")) == 1, "解析 #3366CC");
+    c.hex(hex, (int)sizeof hex, 0);
+    c.hsl(&h, &s, &l);
+    printf("   #3366CC → %s，HSL(%.1f, %.2f, %.2f)\n", hex, h, s, l);
+    check(memcmp(hex, "#3366CC", 7) == 0, "hex 往返");
+    check(near(h, 219.5, 1.0) && near(s, 0.6, 0.02), "HSL 数值");
+    white = color_rgb(255, 255, 255);
+    half = c.lerp(white, 0.5);
+    printf("   与白色各半 → #%02X%02X%02X，对比度 %.1f\n", half.r, half.g,
+           half.b, c.contrast(&white));
+    check(half.r == 153 && half.g == 179, "混合结果（#99B3E6）");
+    check(c.contrast(&white) > 5.0, "蓝白对比度应该大于 5");
+    check(near(white.luminance(), 1.0, 0.02), "白色亮度约 1");
+    from_rgba(&half, 0x11223344u);
+    check(half.a == 0x44 && half.r == 0x11, "RGBA 解包");
+}
+
+static void do_palette(void)
+{
+    static const char *src =
+        "GIMP Palette\n"
+        "Name: Demo\n"
+        "#\n"
+        "  0   0   0\tBlack\n"
+        "255 255 255\tWhite\n"
+        " 51 102 204\tBlue\n";
+    PaletteDoc doc = { 0 };
+    PaletteEntry e = { 0 };
+    int n = 0;
+
+    printf("== palette\n");
+    check(doc.open(src, (int)strlen(src)) == 3, "open 计数");
+    check(doc.is_gpl() == 1, "is_gpl() 方法");
+    while (doc.next(&e) == 1) {
+        printf("   %.*s → #%02X%02X%02X\n", e.name.s.len, e.name.s.data,
+               e.color.r, e.color.g, e.color.b);
+        n++;
+    }
+    check(n == 3, "逐条读出 3 个颜色");
+    check(doc.find("Blue", &e) == 1 && e.color.b == 204, "按名查找");
+    check(doc.find("blue", &e) == 0, "名字大小写敏感");
+}
+
+static void do_names(void)
+{
+    Color c = { 0 };
+    Color got = { 0 };
+    char name[32] = { 0 };
+
+    printf("== 命名颜色\n");
+    check(lookup(S("rebeccapurple"), &c) == 1, "lookup(rebeccapurple)");
+    check(c.r == 0x66 && c.b == 0x99, "rebeccapurple 的通道");
+    check(lookup(S("alice blue"), &c) == 1, "带空格的名字");
+    from_rgba(&c, 0xFF0000FFu);
+    check(name_of(&c, name, (int)sizeof name) == 3 && memcmp(name, "red", 3) == 0,
+          "反查红色");
+    from_rgba(&c, 0xFE0102FFu);
+    nearest(&c, name, (int)sizeof name, &got);
+    printf("   #FE0102 最接近 %s\n", name);
+    check(memcmp(name, "red", 3) == 0 && got.r == 255, "最近颜色");
+    check(color_count() == 40, "表大小");
+}
+
+static void do_units(void)
+{
+    Conv c = { 0 };
+    int kind = 0, code = 0;
+
+    printf("== units\n");
+    printf("   1.5 km = %.0f m，100°C = %.0f°F，1 MiB = %.0f KiB\n",
+           convert(UNIT_LENGTH, LEN_KM, LEN_M, 1.5),
+           convert(UNIT_TEMP, TEMP_C, TEMP_F, 100),
+           convert(UNIT_SIZE, SIZE_MIB, SIZE_KIB, 1));
+    check(near(convert(UNIT_LENGTH, LEN_KM, LEN_M, 1.5), 1500, 1e-9), "公里→米");
+    check(near(convert(UNIT_TEMP, TEMP_C, TEMP_F, 100), 212, 1e-9), "摄氏→华氏");
+    check(near(convert(UNIT_MASS, MASS_LB, MASS_KG, 1), 0.45359237, 1e-9),
+          "磅→千克");
+    check(near(convert(UNIT_SIZE, SIZE_MIB, SIZE_KIB, 1), 1024, 1e-9),
+          "MiB→KiB");
+    check(c.init(UNIT_LENGTH, LEN_MI) == 1, "Conv.init 方法");
+    check(near(c.to(LEN_KM, 1), 1.609344, 1e-9), "Conv.to 方法");
+    check(parse_unit(S("GiB"), &kind, &code) == 1 && code == SIZE_GIB,
+          "parse_unit");
+    check(strcmp(unit_name(UNIT_TEMP, TEMP_C), "°C") == 0, "unit_name");
+}
+
+int main(void)
+{
+    do_color();
+    do_palette();
+    do_names();
+    do_units();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

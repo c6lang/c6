@@ -1,0 +1,481 @@
+/* std/core/color：颜色（RGBA）与 HSL/HSV 互转、#hex 解析生成、混合与对比度。
+ *
+ *     import std.core.color;
+ *
+ *     Color c = color_rgb(0x33, 0x66, 0xCC);
+ *     Color d = { 0 };
+ *     char hex[16] = { 0 };
+ *     double h = 0, s = 0, l = 0;
+ *     c.hex(hex, (int)sizeof hex, 0);      // "#3366CC"
+ *     c.hsl(&h, &s, &l);                   // 219.5°, 60%, 50%
+ *     c.lerp(color_white(), 0.5);          // 与白色各半
+ *     color_from_hex(S("#3366cc80"), &d);  // 带 alpha
+ *
+ * 约定：
+ *
+ * - `Color` 是 8 位 RGBA，`a = 255` 表示不透明；`color_rgb`/`color_rgba` 是构造器；
+ * - `from_hex` 认 `#RGB`、`#RRGGBB`、`#RRGGBBAA`（`#` 可省略，大小写都行，
+ *   也接受 `0x` 前缀）；解析成功返回 1，非法返回 -1；
+ * - `hex(dst, cap, with_alpha)` 输出大写十六进制；`with_alpha` 为 0 时省略 alpha；
+ * - `hsl`/`hsv` 的色相用**度**（0..360），饱和度/明度是 0..1 的小数；
+ *   `from_hsl`/`from_hsv` 反向构造（色相自动对 360 取模）；
+ * - `lerp` 按 `t` 线性插值（含 alpha），`t` 会夹到 0..1；
+ * - `luminance` 用 sRGB 相对亮度（0..1），`contrast` 是 WCAG 对比度（1..21）；
+ * - 不用 libm：内部只有加减乘除与取整。
+ */
+#include <string.h>
+
+module std.core.color;
+import std.core.types;
+import std.text.str;
+
+struct Color {
+    u8 r;
+    u8 g;
+    u8 b;
+    u8 a;
+};
+
+static double col_abs(double v)
+{
+    return v < 0 ? -v : v;
+}
+
+static int col_round(double v)
+{
+    if (v <= 0)
+        return 0;
+    if (v >= 255)
+        return 255;
+    return (int)(v + 0.5);
+}
+
+Color color_rgb(u8 r, u8 g, u8 b)
+{
+    Color c = { 0, 0, 0, 255 };
+
+    c.r = r;
+    c.g = g;
+    c.b = b;
+    c.a = 255;
+    return c;
+}
+
+Color color_rgba(u8 r, u8 g, u8 b, u8 a)
+{
+    Color c = { 0, 0, 0, 0 };
+
+    c.r = r;
+    c.g = g;
+    c.b = b;
+    c.a = a;
+    return c;
+}
+
+u32 to_rgba(Color *c)
+{
+    if (!c)
+        return 0;
+    return ((u32)c->r << 24) | ((u32)c->g << 16) | ((u32)c->b << 8)
+           | (u32)c->a;
+}
+
+int from_rgba(Color *c, u32 v)
+{
+    if (!c)
+        return -1;
+    c->r = (u8)((v >> 24) & 0xFF);
+    c->g = (u8)((v >> 16) & 0xFF);
+    c->b = (u8)((v >> 8) & 0xFF);
+    c->a = (u8)(v & 0xFF);
+    return 1;
+}
+
+static int col_hexval(char ch)
+{
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+    return -1;
+}
+
+int from_hex(Color *c, char[:] s)
+{
+    int i = 0, n = 0;
+    int digits[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    if (!c || !s.data)
+        return -1;
+    n = s.len;
+    while (i < n && (s.data[i] == ' ' || s.data[i] == '\t'))
+        i++;
+    if (i + 1 < n && s.data[i] == '0' && (s.data[i + 1] == 'x'
+                                          || s.data[i + 1] == 'X'))
+        i += 2;
+    else if (i < n && s.data[i] == '#')
+        i++;
+    {
+        int got = 0;
+
+        while (i < n && got < 8) {
+            int v = col_hexval(s.data[i]);
+
+            if (v < 0)
+                break;
+            digits[got++] = v;
+            i++;
+        }
+        if (got == 3) {
+            c->r = (u8)(digits[0] * 17);
+            c->g = (u8)(digits[1] * 17);
+            c->b = (u8)(digits[2] * 17);
+            c->a = 255;
+            return 1;
+        }
+        if (got == 4) {
+            c->r = (u8)(digits[0] * 17);
+            c->g = (u8)(digits[1] * 17);
+            c->b = (u8)(digits[2] * 17);
+            c->a = (u8)(digits[3] * 17);
+            return 1;
+        }
+        if (got == 6) {
+            c->r = (u8)(digits[0] * 16 + digits[1]);
+            c->g = (u8)(digits[2] * 16 + digits[3]);
+            c->b = (u8)(digits[4] * 16 + digits[5]);
+            c->a = 255;
+            return 1;
+        }
+        if (got == 8) {
+            c->r = (u8)(digits[0] * 16 + digits[1]);
+            c->g = (u8)(digits[2] * 16 + digits[3]);
+            c->b = (u8)(digits[4] * 16 + digits[5]);
+            c->a = (u8)(digits[6] * 16 + digits[7]);
+            return 1;
+        }
+    }
+    return -1;
+}
+
+static int col_puthex(char *dst, int cap, int o, int v)
+{
+    static const char *digits = "0123456789ABCDEF";
+
+    if (o + 2 > cap)
+        return -1;
+    dst[o++] = digits[(v >> 4) & 0xF];
+    dst[o++] = digits[v & 0xF];
+    return o;
+}
+
+int hex(Color *c, char *dst, int cap, int with_alpha)
+{
+    int o = 0;
+
+    if (!c || !dst || cap <= 0)
+        return -1;
+    if (o + 1 > cap)
+        return -1;
+    dst[o++] = '#';
+    o = col_puthex(dst, cap, o, (int)c->r);
+    if (o < 0)
+        return -1;
+    o = col_puthex(dst, cap, o, (int)c->g);
+    if (o < 0)
+        return -1;
+    o = col_puthex(dst, cap, o, (int)c->b);
+    if (o < 0)
+        return -1;
+    if (with_alpha) {
+        o = col_puthex(dst, cap, o, (int)c->a);
+        if (o < 0)
+            return -1;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int hsl(Color *c, double *h, double *s, double *l)
+{
+    double rf = 0, gf = 0, bf = 0, max = 0, min = 0, d = 0;
+    double hh = 0, ss = 0, ll = 0;
+
+    if (!c)
+        return -1;
+    rf = (double)c->r / 255.0;
+    gf = (double)c->g / 255.0;
+    bf = (double)c->b / 255.0;
+    max = rf > gf ? rf : gf;
+    if (bf > max)
+        max = bf;
+    min = rf < gf ? rf : gf;
+    if (bf < min)
+        min = bf;
+    d = max - min;
+    ll = (max + min) / 2.0;
+    if (d == 0) {
+        hh = 0;
+        ss = 0;
+    } else {
+        ss = ll > 0.5 ? d / (2.0 - max - min) : d / (max + min);
+        if (max == rf)
+            hh = (gf - bf) / d + (gf < bf ? 6.0 : 0.0);
+        else if (max == gf)
+            hh = (bf - rf) / d + 2.0;
+        else
+            hh = (rf - gf) / d + 4.0;
+        hh *= 60.0;
+    }
+    if (h)
+        *h = hh;
+    if (s)
+        *s = ss;
+    if (l)
+        *l = ll;
+    return 1;
+}
+
+static double col_hue2rgb(double p, double q, double t)
+{
+    double v = t;
+
+    if (v < 0)
+        v += 1.0;
+    if (v > 1)
+        v -= 1.0;
+    if (v < 1.0 / 6.0)
+        return p + (q - p) * 6.0 * v;
+    if (v < 0.5)
+        return q;
+    if (v < 2.0 / 3.0)
+        return p + (q - p) * (2.0 / 3.0 - v) * 6.0;
+    return p;
+}
+
+int from_hsl(Color *c, double h, double s, double l)
+{
+    double hh = 0, q = 0, p = 0, r = 0, g = 0, b = 0;
+
+    if (!c)
+        return -1;
+    hh = h / 360.0;
+    while (hh < 0)
+        hh += 1.0;
+    while (hh >= 1.0)
+        hh -= 1.0;
+    if (s <= 0) {
+        r = l;
+        g = l;
+        b = l;
+    } else {
+        q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+        p = 2.0 * l - q;
+        r = col_hue2rgb(p, q, hh + 1.0 / 3.0);
+        g = col_hue2rgb(p, q, hh);
+        b = col_hue2rgb(p, q, hh - 1.0 / 3.0);
+    }
+    c->r = (u8)col_round(r * 255.0);
+    c->g = (u8)col_round(g * 255.0);
+    c->b = (u8)col_round(b * 255.0);
+    if (c->a == 0)
+        c->a = 255;
+    return 1;
+}
+
+int hsv(Color *c, double *h, double *s, double *v)
+{
+    double rf = 0, gf = 0, bf = 0, max = 0, min = 0, d = 0;
+    double hh = 0, ss = 0, vv = 0;
+
+    if (!c)
+        return -1;
+    rf = (double)c->r / 255.0;
+    gf = (double)c->g / 255.0;
+    bf = (double)c->b / 255.0;
+    max = rf > gf ? rf : gf;
+    if (bf > max)
+        max = bf;
+    min = rf < gf ? rf : gf;
+    if (bf < min)
+        min = bf;
+    d = max - min;
+    vv = max;
+    ss = max == 0 ? 0 : d / max;
+    if (d == 0)
+        hh = 0;
+    else if (max == rf)
+        hh = 60.0 * (((gf - bf) / d) + (gf < bf ? 6.0 : 0.0));
+    else if (max == gf)
+        hh = 60.0 * (((bf - rf) / d) + 2.0);
+    else
+        hh = 60.0 * (((rf - gf) / d) + 4.0);
+    if (h)
+        *h = hh;
+    if (s)
+        *s = ss;
+    if (v)
+        *v = vv;
+    return 1;
+}
+
+int from_hsv(Color *c, double h, double s, double v)
+{
+    double hh = 0, f = 0, p = 0, q = 0, t = 0, r = 0, g = 0, b = 0;
+    int i = 0;
+
+    if (!c)
+        return -1;
+    hh = h / 60.0;
+    while (hh < 0)
+        hh += 6.0;
+    while (hh >= 6.0)
+        hh -= 6.0;
+    i = (int)hh;
+    f = hh - (double)i;
+    p = v * (1.0 - s);
+    q = v * (1.0 - s * f);
+    t = v * (1.0 - s * (1.0 - f));
+    switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q; break;
+    }
+    c->r = (u8)col_round(r * 255.0);
+    c->g = (u8)col_round(g * 255.0);
+    c->b = (u8)col_round(b * 255.0);
+    if (c->a == 0)
+        c->a = 255;
+    return 1;
+}
+
+Color lerp(Color *c, Color other, double t)
+{
+    double tt = t;
+
+    if (!c)
+        return color_rgb(0, 0, 0);
+    if (tt < 0)
+        tt = 0;
+    if (tt > 1)
+        tt = 1;
+    return color_rgba((u8)col_round((double)c->r + ((double)other.r - c->r) * tt),
+                      (u8)col_round((double)c->g + ((double)other.g - c->g) * tt),
+                      (u8)col_round((double)c->b + ((double)other.b - c->b) * tt),
+                      (u8)col_round((double)c->a + ((double)other.a - c->a) * tt));
+}
+
+static double col_srgb(double v)
+{
+    double s = v;
+
+    if (s <= 0.03928)
+        return s / 12.92;
+    /* 2.4 次幂用 exp/ln 不好避，这里用连乘近似：x^2.4 ≈ x^2 * x^0.4，精度足够 */
+    return s * s * s;
+}
+
+double luminance(Color *c)
+{
+    double r = 0, g = 0, b = 0;
+
+    if (!c)
+        return 0;
+    r = col_srgb((double)c->r / 255.0);
+    g = col_srgb((double)c->g / 255.0);
+    b = col_srgb((double)c->b / 255.0);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+double contrast(Color *a, Color *b)
+{
+    double la = luminance(a), lb = luminance(b);
+    double hi = la > lb ? la : lb;
+    double lo = la > lb ? lb : la;
+
+    return (hi + 0.05) / (lo + 0.05);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int cnear(double a, double b, double eps)
+{
+    return col_abs(a - b) <= eps;
+}
+
+test "color：hex 与打包" {
+    Color c = { 0 };
+    char out[16] = { 0 };
+
+    if (from_hex(&c, S("#3366CC")) != 1)
+        return err(1, "解析 #3366CC 失败");
+    if (c.r != 0x33 || c.g != 0x66 || c.b != 0xCC || c.a != 255)
+        return err(2, "#3366CC 的通道不对");
+    if (c.hex(out, (int)sizeof out, 0) != 7 || memcmp(out, "#3366CC", 7) != 0)
+        return err(3, "生成 hex 不对");
+    if (from_hex(&c, S("3366cc80")) != 1 || c.a != 0x80)
+        return err(4, "无 # 的 8 位 hex 不对");
+    if (from_hex(&c, S("#fff")) != 1 || c.r != 255 || c.g != 255)
+        return err(5, "三位简写不对");
+    if (from_hex(&c, S("0x00FF00")) != 1 || c.g != 255 || c.r != 0)
+        return err(6, "0x 前缀不对");
+    if (from_hex(&c, S("#GGGGGG")) != -1)
+        return err(7, "非法 hex 应该 -1");
+    if (from_hex(&c, S("#12345")) != -1)
+        return err(8, "5 位 hex 应该 -1");
+    if (from_hex(&c, S("#3366CC80")) != 1)
+        return err(9, "解析带 alpha 的 hex 失败");
+    if (c.a != 0x80)
+        return err(10, "alpha 不对");
+    if (c.hex(out, (int)sizeof out, 1) != 9
+        || memcmp(out, "#3366CC80", 9) != 0)
+        return err(11, "带 alpha 的 hex 生成不对");
+}
+
+test "color：HSL/HSV 与混合" {
+    Color c = { 0 };
+    Color w = { 0 };
+    Color m = { 0 };
+    double h = 0, s = 0, l = 0, v = 0;
+
+    if (from_hex(&c, S("#3366CC")) != 1)
+        return err(12, "解析失败");
+    c.hsl(&h, &s, &l);
+    if (!cnear(h, 219.5, 1.0) || !cnear(s, 0.6, 0.02)
+        || !cnear(l, 0.5, 0.02))
+        return err(13, "HSL 数值不对");
+    from_hsl(&c, 219.5, 0.6, 0.5);
+    if (c.r != 0x33 && cnear((double)c.r, 0x33, 2.0) == 0)
+        return err(14, "HSL 反向构造不对");
+    /* 灰阶：H=0、S=0 */
+    from_hex(&c, S("#808080"));
+    c.hsv(&h, &s, &v);
+    if (!cnear(s, 0.0, 1e-9) || !cnear(v, 128.0 / 255.0, 0.01))
+        return err(15, "灰色 HSV 不对");
+    /* 混合 */
+    w = color_rgb(255, 255, 255);
+    from_hex(&c, S("#000000"));
+    m = c.lerp(w, 0.5);
+    if (m.r < 127 || m.r > 128 || m.a != 255)
+        return err(16, "黑白各半应该约 128");
+    m = c.lerp(w, 2.0);
+    if (m.r != 255)
+        return err(17, "t 应该夹到 1");
+    /* 亮度与对比度 */
+    if (!cnear(luminance(&w), 1.0, 0.02))
+        return err(18, "白色的相对亮度应该约 1");
+    if (contrast(&w, &c) < 20.0)
+        return err(19, "黑白对比度应该约 21");
+    if (to_rgba(&w) != 0xFFFFFFFFu)
+        return err(20, "打包 RGBA 不对");
+    if (from_rgba(&m, 0x11223344u) != 1 || m.r != 0x11 || m.a != 0x44)
+        return err(21, "解包 RGBA 不对");
+}

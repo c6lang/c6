@@ -2118,6 +2118,33 @@ systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，�
 验收：`make stdtest`（257 个模块、0 failure）、`make std-clean`（21 条自检全过）、
 `make check-all`。
 
+### 11.74 标准库第六十二批（color / palette / colorname / units）
+
+第六十二批做「颜色与单位」：颜色值与 HSL/HSV 互转、GIMP 调色板、CSS 命名颜色与常用
+单位换算。`Color` 与 `Conv` 都是方法优先的小结构。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.color` | 颜色 | `from_hex` 认 `#RGB`/`#RRGGBB`/`#RRGGBBAA`、`0x` 前缀与无前缀；HSL/HSV 都做成双向；`luminance` 用 sRGB 近似的 `x^3`（不用 libm）算相对亮度，`contrast` 给 WCAG 比值；`lerp` 把 `t` 夹到 0..1 |
+| `std.data.palette` | 调色板 | GIMP `.gpl` 的 `Name:`/`Columns:` 行要**跳过而不是报错**（第一版当成坏数据直接返回 -1）；简单格式里 `#` 后面不是十六进制数字就当注释 |
+| `std.text.colorname` | 命名颜色 | 名字比较忽略大小写与空格/连字符（`alice blue` = `AliceBlue`）；`nearest` 用 RGB 差的平方和；表里**不能有重复颜色**，否则「反查自己」会命中前一个（cyan/aqua、magenta/fuchsia 都踩过，改成 darkcyan/seagreen） |
+| `std.core.units` | 单位换算 | 长度/质量/字节走「基准单位倍率」，温度走单独公式（C↔F↔K）；`parse_unit` 大小写不敏感；类别与单位码不匹配返回 -1 |
+
+一个跨模块的命名坑：`std.text.colorname` 里的 `count()` 与 `std.text.str` 的
+`count(Str *)` 在同时 import 时冲突（编译报 `too few arguments`），改名为
+`color_count()`/`color_at()` 后解决——**导出到公共命名空间的自由函数要用模块前缀**。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.color`=0x6101、
+`std.data.palette`=0x6102、`std.text.colorname`=0x6103、`std.core.units`=0x6104；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-color` 与 `STD_COLOR_SRCS`，
+`test-all`/`check-all` 都带上它；`palette`/`colorname` 在 `stdtest` 里依赖
+`std/text/str.c6` + `std/core/color.c6`（各 26 条），`color`/`units` 依赖 str（各 24 条）。
+示例 `examples/stdcolor.c6` 四节（26 条自检）。
+
+验收：`make stdtest`（261 个模块、0 failure）、`make std-color`（26 条自检全过）、
+`make check-all`。
+
+
 
 
 

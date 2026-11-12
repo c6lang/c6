@@ -1,0 +1,235 @@
+/* std/text/colorname：CSS/X11 命名颜色（子集）与「最接近的颜色」查找。
+ *
+ *     import std.text.colorname;
+ *
+ *     Color c = { 0 };
+ *     char name[24] = { 0 };
+ *     lookup(S("rebeccapurple"), &c);      // #663399
+ *     nearest(&c, name, (int)sizeof name, 0);   // 找表里最接近的名字
+ *
+ * 表里收了 40 个常用 CSS 颜色（含 `transparent`、`rebeccapurple`）。名字比较时
+ * **忽略大小写、空格与连字符**，所以 `LightBlue`、`light-blue`、`light blue`
+ * 都能匹配到 `lightblue`。
+ *
+ * 约定：
+ *
+ * - `lookup(name, &c)` 命中返回 1，未知名字返回 0；
+ * - `name_of(&c, dst, cap)` 只有颜色与表里某一项**完全相等**（RGBA 四个通道都相等）
+ *   才返回名字长度，否则返回 0；
+ * - `nearest(&c, dst, cap, &out)` 按「RGB 通道差的平方和」找最近的命名颜色，
+ *   名字写进 `dst`、颜色写进 `out`（可为 0），返回名字长度；表为空返回 -1；
+ * - `color_count()` 是表的大小，`at(i, &rgba)` 给第 i 项的名字与打包颜色（0xRRGGBBAA）；
+ * - 依赖 `std.core.color`。
+ */
+#include <string.h>
+
+module std.text.colorname;
+import std.core.types;
+import std.text.str;
+import std.core.color;
+
+static const char *cn_names[40] = {
+    "black",     "silver",    "gray",      "white",     "maroon",
+    "red",       "purple",    "fuchsia",   "green",     "lime",
+    "olive",     "yellow",    "navy",      "blue",      "teal",
+    "aqua",      "orange",    "aliceblue", "brown",     "coral",
+    "crimson",   "darkcyan",  "darkblue",  "darkgreen", "darkred",
+    "gold",      "indigo",    "ivory",     "khaki",     "lavender",
+    "seagreen",  "darkgoldenrod", "orchid", "pink",    "plum",
+    "salmon",    "snow",      "tan",       "tomato",    "rebeccapurple"
+};
+
+static const u32 cn_rgba[40] = {
+    0x000000FFu, 0xC0C0C0FFu, 0x808080FFu, 0xFFFFFFFFu, 0x800000FFu,
+    0xFF0000FFu, 0x800080FFu, 0xFF00FFFFu, 0x008000FFu, 0x00FF00FFu,
+    0x808000FFu, 0xFFFF00FFu, 0x000080FFu, 0x0000FFFFu, 0x008080FFu,
+    0x00FFFFFFu, 0xFFA500FFu, 0xF0F8FFFFu, 0xA52A2AFFu, 0xFF7F50FFu,
+    0xDC143CFFu, 0x008B8BFFu, 0x00008BFFu, 0x006400FFu, 0x8B0000FFu,
+    0xFFD700FFu, 0x4B0082FFu, 0xFFFFF0FFu, 0xF0E68CFFu, 0xE6E6FAFFu,
+    0x2E8B57FFu, 0xB8860BFFu, 0xDA70D6FFu, 0xFFC0CBFFu, 0xDDA0DDFFu,
+    0xFA8072FFu, 0xFFFAFAFFu, 0xD2B48CFFu, 0xFF6347FFu, 0x663399FFu
+};
+
+int color_count(void)
+{
+    return 40;
+}
+
+const char *color_at(int i, u32 *rgba)
+{
+    if (i < 0 || i >= 40)
+        return 0;
+    if (rgba)
+        *rgba = cn_rgba[i];
+    return cn_names[i];
+}
+
+static int cn_normeq(char[:] a, const char *b)
+{
+    int i = 0, k = 0;
+
+    while (i < a.len || b[k]) {
+        while (i < a.len && (a.data[i] == ' ' || a.data[i] == '-'
+                             || a.data[i] == '_'))
+            i++;
+        while (b[k] == ' ' || b[k] == '-')
+            k++;
+        if (i >= a.len || !b[k])
+            break;
+        {
+            char ca = a.data[i], cb = b[k];
+
+            if (ca >= 'A' && ca <= 'Z')
+                ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z')
+                cb = (char)(cb - 'A' + 'a');
+            if (ca != cb)
+                return 0;
+        }
+        i++;
+        k++;
+    }
+    return (i >= a.len && !b[k]) ? 1 : 0;
+}
+
+int lookup(char[:] name, Color *out)
+{
+    int i = 0;
+
+    if (!name.data || !out)
+        return -1;
+    for (i = 0; i < 40; i++) {
+        if (cn_normeq(name, cn_names[i])) {
+            from_rgba(out, cn_rgba[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int cn_put(char *dst, int cap, const char *name)
+{
+    int i = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    for (i = 0; name[i]; i++) {
+        if (i + 1 > cap)
+            return -1;
+        dst[i] = name[i];
+    }
+    if (i + 1 > cap)
+        return -1;
+    dst[i] = 0;
+    return i;
+}
+
+int name_of(Color *c, char *dst, int cap)
+{
+    int i = 0;
+
+    if (!c)
+        return -1;
+    for (i = 0; i < 40; i++) {
+        if (cn_rgba[i] == to_rgba(c))
+            return cn_put(dst, cap, cn_names[i]);
+    }
+    return 0;
+}
+
+int nearest(Color *c, char *dst, int cap, Color *out)
+{
+    int i = 0, best = -1;
+    long long bestd = 0;
+
+    if (!c)
+        return -1;
+    for (i = 0; i < 40; i++) {
+        Color cand = { 0 };
+        long long dr = 0, dg = 0, db = 0, d = 0;
+
+        from_rgba(&cand, cn_rgba[i]);
+        dr = (long long)cand.r - c->r;
+        dg = (long long)cand.g - c->g;
+        db = (long long)cand.b - c->b;
+        d = dr * dr + dg * dg + db * db;
+        if (best < 0 || d < bestd) {
+            best = i;
+            bestd = d;
+        }
+    }
+    if (best < 0)
+        return -1;
+    if (out)
+        from_rgba(out, cn_rgba[best]);
+    return cn_put(dst, cap, cn_names[best]);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "colorname：查名取色" {
+    Color c = { 0 };
+    char name[32] = { 0 };
+
+    if (color_count() != 40)
+        return err(1, "表应该有 40 项");
+    if (lookup(S("red"), &c) != 1 || c.r != 255 || c.g != 0 || c.a != 255)
+        return err(2, "red 不对");
+    if (lookup(S("AliceBlue"), &c) != 1)
+        return err(3, "大小写不敏感匹配失败");
+    if (lookup(S("alice blue"), &c) != 1)
+        return err(4, "带空格的写法应该也能匹配");
+    if (lookup(S("rebeccapurple"), &c) != 1 || c.r != 0x66 || c.g != 0x33
+        || c.b != 0x99)
+        return err(5, "rebeccapurple 不对");
+    if (lookup(S("nonsense"), &c) != 0)
+        return err(6, "未知名字应该 0");
+    from_rgba(&c, 0xFF0000FFu);
+    if (name_of(&c, name, (int)sizeof name) != 3
+        || memcmp(name, "red", 3) != 0)
+        return err(7, "红色应该反查出 red");
+    from_rgba(&c, 0x123456FFu);
+    if (name_of(&c, name, (int)sizeof name) != 0)
+        return err(8, "表里没有的颜色应该返回 0");
+    from_rgba(&c, 0xFF0000FFu);
+    if (name_of(&c, name, 2) != -1)
+        return err(9, "容量不够应该 -1");
+}
+
+test "colorname：最接近" {
+    Color c = { 0 };
+    Color got = { 0 };
+    char name[32] = { 0 };
+    u32 rgba = 0;
+    int i = 0;
+
+    if (color_at(0, &rgba) == 0 || rgba != 0x000000FFu)
+        return err(10, "第 0 项应该是黑色");
+    if (color_at(40, &rgba) != 0)
+        return err(11, "越界应该返回空指针");
+    /* 接近红但有点偏 */
+    from_rgba(&c, 0xFE0102FFu);
+    if (nearest(&c, name, (int)sizeof name, &got) <= 0)
+        return err(12, "nearest 失败");
+    if (memcmp(name, "red", 3) != 0 || got.r != 255 || got.g != 0)
+        return err(13, "最接近红色的应该是 red");
+    /* 接近白 */
+    from_rgba(&c, 0xFEFEFEFFu);
+    nearest(&c, name, (int)sizeof name, 0);
+    if (memcmp(name, "white", 5) != 0)
+        return err(14, "最接近白色的应该是 white");
+    /* 表里每个颜色都能被自己查回来 */
+    for (i = 0; i < color_count(); i++) {
+        Color self = { 0 };
+
+        from_rgba(&self, cn_rgba[i]);
+        if (nearest(&self, name, (int)sizeof name, 0) <= 0)
+            return err(15, "自反查失败");
+        if (memcmp(name, cn_names[i], (size_t)strlen(cn_names[i])) != 0)
+            return err(16, "自反查应该命中自己");
+    }
+    if (nearest(&c, name, 2, 0) != -1)
+        return err(17, "容量不够应该 -1");
+}
