@@ -306,6 +306,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/pe.c6            std.data.pe            PE/COFF 头：pe_info（DOS→e_lfanew→PE→COFF→可选头，PE32/PE32+）、pe_section、pe_rva_to_off、machine/subsystem 名字
   std/data/macho.c6         std.data.macho         Mach-O 头：thin 32/64 位与 fat 外壳，macho_info 抓 LC_UUID/LC_MAIN，macho_section 摊平各段节表，macho_arch 列架构
   std/data/wasm.c6          std.data.wasm          WebAssembly 结构：wasm_open/wasm_reader/next 逐节、wasm_leb_u32、wasm_count、wasm_export_at
+  std/data/bson.c6          std.data.bson          BSON 文档：bson_open/next 逐元素，bson_string/int64/double/bool/binary/objectid，bson_subdoc 进子文档与数组，bson_find 按名字找
+  std/data/ubjson.c6        std.data.ubjson        UBJSON：ubj_open/next 事件流（标量 + ARRAY/OBJECT/KEY/END），支持 $ 统一类型与 # 计数优化容器
+  std/data/plist.c6         std.data.plist         Apple 二进制 plist（bplist00）：plist_open/root/count/at/key/get + 各标量访问器，走偏移表与引用号
+  std/text/markdown.c6      std.text.markdown      Markdown 常用子集 → HTML：markdown_render（标题/段落/围栏代码/引用/列表/分隔线）与 markdown_inline（代码/粗斜体/链接/转义）
 
 std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
@@ -379,6 +383,7 @@ make std-gfx     # 编译并运行 examples/stdgfx.c6（第三十二批图像与
 make std-doc     # 编译并运行 examples/stddoc.c6（第三十三批结构化文本格式模块的拼装示例）
 make std-proto   # 编译并运行 examples/stdproto.c6（第三十四批网络协议编解码模块的拼装示例）
 make std-exec    # 编译并运行 examples/stdexec.c6（第三十五批二进制容器格式模块的拼装示例）
+make std-ser     # 编译并运行 examples/stdser.c6（第三十六批序列化与标记模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

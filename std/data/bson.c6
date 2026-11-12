@@ -1,0 +1,571 @@
+/* std/data/bson：BSON（MongoDB 的二进制 JSON）文档解析（零分配）。
+ *
+ *     import std.data.bson;
+ *
+ *     BsonReader r = { 0 };
+ *     BsonElem e = { 0 };
+ *     if (bson_open(data, n, &r) == 1) {
+ *         while (r.next(&e) == 1) {
+ *             // e.type / e.name / e.raw
+ *             if (e.type == BSON_STRING && bson_string(&e, &s) == 1) ...
+ *         }
+ *     }
+ *
+ * 文档 = int32 总长度 + 一串元素 + 结尾 `0x00`；元素 = 类型字节 + cstring 名字 +
+ * 值。数组就是名字为 "0"、"1"…的文档（按 cstring 名字读出来即可，序号自己排）。
+ *
+ * 约定：
+ *
+ * - `bson_open` 校验总长度与结尾 `0x00`，失败返回 -1（`reader.bad` 置 1）；
+ * - `next` 返回 1 有元素 / 0 到文档尾 / -1 结构坏（元素越界、cstring 没有
+ *   终止符、类型未知、字符串长度不符）；
+ * - `e.raw` 是值字节的视图（不含类型与名字），`e.namelen` 是名字长度；
+ * - 访问器都在 `raw` 上工作：`bson_string` 去掉结尾 NUL，`bson_int64` 兼容
+ *   int32/int64，`bson_double` 只认 0x01，类型不符返回 -1；
+ * - 子文档/数组用 `bson_subdoc` 得到新的 reader；
+ * - 支持 0x01 double / 0x02 string / 0x03 doc / 0x04 array / 0x05 binary /
+ *   0x07 objectid / 0x08 bool / 0x09 datetime / 0x0A null / 0x10 int32 /
+ *   0x11 timestamp / 0x12 int64；0x06 undefined、0x0B regex、0x0D code、
+ *   0x0E symbol、0x0F code_w_scope、0x13 decimal128 一律当未知类型（-1）。
+ */
+#include <string.h>
+
+module std.data.bson;
+import std.core.types;
+import std.text.str;
+
+enum BsonType {
+    BSON_DOUBLE = 0x01,
+    BSON_STRING = 0x02,
+    BSON_DOC = 0x03,
+    BSON_ARRAY = 0x04,
+    BSON_BINARY = 0x05,
+    BSON_OBJECTID = 0x07,
+    BSON_BOOL = 0x08,
+    BSON_DATETIME = 0x09,
+    BSON_NULL = 0x0A,
+    BSON_INT32 = 0x10,
+    BSON_TIMESTAMP = 0x11,
+    BSON_INT64 = 0x12,
+};
+
+struct BsonReader {
+    const u8 *p;
+    int n;
+    int pos;            /* 下一个元素的位置 */
+    int end;            /* 文档结尾 `0x00` 的位置 */
+    int bad;
+};
+
+struct BsonElem {
+    int type;
+    Str name;
+    Str raw;            /* 值字节（不含类型与名字） */
+};
+
+static u32 bson_u32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u64 bson_u64(const u8 *p)
+{
+    return (u64)bson_u32(p) | ((u64)bson_u32(p + 4) << 32);
+}
+
+/* 打开一个文档（也用于子文档/数组）：1 成功 / -1 坏 */
+int bson_open(const void *src, int n, BsonReader *out)
+{
+    const u8 *p = (const u8 *)src;
+    u32 len = 0;
+
+    if (!src || !out || n < 5)
+        return -1;
+    len = bson_u32(p);
+    if (len < 5 || (int)len > n)
+        return -1;
+    if (p[len - 1] != 0)
+        return -1;
+    out->p = p;
+    out->n = n;
+    out->pos = 4;
+    out->end = (int)len - 1;
+    out->bad = 0;
+    return 1;
+}
+
+/* 元素值占用的字节数：返回 >=0 / -1 坏 */
+static int bson_value_len(const u8 *p, int pos, int end, int type)
+{
+    switch (type) {
+    case BSON_DOUBLE:
+        return pos + 8 <= end ? 8 : -1;
+    case BSON_STRING: {
+        u32 len = 0;
+
+        if (pos + 4 > end)
+            return -1;
+        len = bson_u32(p + pos);
+        /* 字符串长度不含这 4 字节自己，但要含结尾 NUL */
+        if (len < 1 || (u64)pos + 4 + (u64)len > (u64)end)
+            return -1;
+        if (p[pos + 4 + (int)len - 1] != 0)
+            return -1;
+        return 4 + (int)len;
+    }
+    case BSON_DOC:
+    case BSON_ARRAY: {
+        u32 len = 0;
+
+        if (pos + 4 > end)
+            return -1;
+        len = bson_u32(p + pos);
+        /* 子文档/数组的长度含自己的长度字段与结尾 0 */
+        if (len < 5 || (u64)pos + (u64)len > (u64)end)
+            return -1;
+        if (p[pos + (int)len - 1] != 0)
+            return -1;
+        return (int)len;
+    }
+    case BSON_BINARY: {
+        u32 len = 0;
+
+        if (pos + 5 > end)
+            return -1;
+        len = bson_u32(p + pos);
+        if ((int)len > end - pos - 5)
+            return -1;
+        return 5 + (int)len;
+    }
+    case BSON_OBJECTID:
+        return pos + 12 <= end ? 12 : -1;
+    case BSON_BOOL:
+        return pos + 1 <= end ? 1 : -1;
+    case BSON_DATETIME:
+    case BSON_TIMESTAMP:
+    case BSON_INT64:
+        return pos + 8 <= end ? 8 : -1;
+    case BSON_NULL:
+        return 0;
+    case BSON_INT32:
+        return pos + 4 <= end ? 4 : -1;
+    default:
+        return -1;
+    }
+}
+
+int next(BsonReader *self, BsonElem *out)
+{
+    const u8 *p = 0;
+    int pos = 0, name_start = 0, name_len = 0, vlen = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (self->pos >= self->end)
+        return 0;
+    p = self->p;
+    pos = self->pos;
+    out->type = p[pos];
+    pos++;
+    name_start = pos;
+    while (pos < self->end && p[pos] != 0)
+        pos++;
+    if (pos >= self->end) {
+        self->bad = 1;
+        return -1;
+    }
+    name_len = pos - name_start;
+    pos++;                              /* 跳过 cstring 的 NUL */
+    vlen = bson_value_len(p, pos, self->end, out->type);
+    if (vlen < 0) {
+        self->bad = 1;
+        return -1;
+    }
+    out->name.s = (char[:]){ (char *)p + name_start, name_len };
+    out->raw.s = (char[:]){ (char *)p + pos, vlen };
+    self->pos = pos + vlen;
+    return 1;
+}
+
+/* 子文档/数组的 reader */
+int bson_subdoc(const BsonElem *e, BsonReader *out)
+{
+    if (!e || !out)
+        return -1;
+    if (e->type != BSON_DOC && e->type != BSON_ARRAY)
+        return -1;
+    return bson_open(e->raw.s.data, e->raw.s.len, out);
+}
+
+/* 在文档里按名字找第一个元素（从头开始）：1 找到 / 0 没有 / -1 坏 */
+int bson_find(const void *src, int n, const char *name, BsonElem *out)
+{
+    BsonReader r = { 0 };
+    BsonElem e = { 0 };
+    int want = name ? (int)strlen(name) : 0;
+
+    if (!name || bson_open(src, n, &r) != 1)
+        return -1;
+    while (r.next(&e) == 1) {
+        if (e.name.s.len == want
+            && memcmp(e.name.s.data, name, (size_t)want) == 0) {
+            if (out)
+                *out = e;
+            return 1;
+        }
+    }
+    return r.bad ? -1 : 0;
+}
+
+/* 字符串值（去掉结尾 NUL）：1 / -1 */
+int bson_string(const BsonElem *e, Str *out)
+{
+    if (!e || !out || e->type != BSON_STRING || e->raw.s.len < 2)
+        return -1;
+    out->s = (char[:]){ e->raw.s.data + 4, e->raw.s.len - 5 };
+    return 1;
+}
+
+/* int32/int64/timestamp 一律按 int64 给（timestamp 是高 32 位秒 + 低 32 位序号） */
+int bson_int64(const BsonElem *e, long long *out)
+{
+    if (!e || !out)
+        return -1;
+    if (e->type == BSON_INT32 && e->raw.s.len == 4) {
+        long long v = (long long)bson_u32((const u8 *)e->raw.s.data);
+
+        if ((u32)(v & 0xFFFFFFFFu) & 0x80000000u)
+            v = v - 0x100000000LL;
+        *out = v;
+        return 1;
+    }
+    if ((e->type == BSON_INT64 || e->type == BSON_TIMESTAMP
+         || e->type == BSON_DATETIME)
+        && e->raw.s.len == 8) {
+        *out = (long long)bson_u64((const u8 *)e->raw.s.data);
+        return 1;
+    }
+    return -1;
+}
+
+int bson_double(const BsonElem *e, double *out)
+{
+    if (!e || !out || e->type != BSON_DOUBLE || e->raw.s.len != 8)
+        return -1;
+    {
+        u64 bits = bson_u64((const u8 *)e->raw.s.data);
+        double d = 0;
+
+        memcpy(&d, &bits, 8);
+        *out = d;
+    }
+    return 1;
+}
+
+int bson_bool(const BsonElem *e, int *out)
+{
+    if (!e || !out || e->type != BSON_BOOL || e->raw.s.len != 1)
+        return -1;
+    *out = e->raw.s.data[0] != 0;
+    return 1;
+}
+
+/* binary：subtype 出子类型，out 出数据视图 */
+int bson_binary(const BsonElem *e, int *subtype, Str *out)
+{
+    if (!e || e->type != BSON_BINARY || e->raw.s.len < 5)
+        return -1;
+    if (subtype)
+        *subtype = (int)(unsigned char)e->raw.s.data[4];
+    if (out)
+        out->s = (char[:]){ e->raw.s.data + 5, e->raw.s.len - 5 };
+    return 1;
+}
+
+/* objectid 的 12 字节 */
+int bson_objectid(const BsonElem *e, void *out12)
+{
+    if (!e || !out12 || e->type != BSON_OBJECTID || e->raw.s.len != 12)
+        return -1;
+    memcpy(out12, e->raw.s.data, 12);
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static void bw32(char *p, u32 v)
+{
+    p[0] = (char)(v & 0xFF);
+    p[1] = (char)((v >> 8) & 0xFF);
+    p[2] = (char)((v >> 16) & 0xFF);
+    p[3] = (char)((v >> 24) & 0xFF);
+}
+
+static void bw64(char *p, u64 v)
+{
+    bw32(p, (u32)(v & 0xFFFFFFFFu));
+    bw32(p + 4, (u32)(v >> 32));
+}
+
+/* 造一个文档：包含各类型元素 */
+static int mk_bson(char *buf)
+{
+    int off = 0, doc_start = 0, i = 0;
+    int sub_start = 0, arr_start = 0;
+
+    bw32(buf + 4, 0);                   /* 长度稍后填 */
+    off = 4;
+    /* "s": "hi" */
+    buf[off++] = BSON_STRING;
+    buf[off++] = 's';
+    buf[off++] = 0;
+    bw32(buf + off, 3);
+    off += 4;
+    buf[off++] = 'h';
+    buf[off++] = 'i';
+    buf[off++] = 0;
+    /* "i32": -2 */
+    buf[off++] = BSON_INT32;
+    buf[off++] = 'i';
+    buf[off++] = '3';
+    buf[off++] = '2';
+    buf[off++] = 0;
+    bw32(buf + off, 0xFFFFFFFEu);
+    off += 4;
+    /* "i64": 5000000000 */
+    buf[off++] = BSON_INT64;
+    buf[off++] = 'i';
+    buf[off++] = '6';
+    buf[off++] = '4';
+    buf[off++] = 0;
+    bw64(buf + off, 5000000000ULL);
+    off += 8;
+    /* "d": 2.5 */
+    buf[off++] = BSON_DOUBLE;
+    buf[off++] = 'd';
+    buf[off++] = 0;
+    {
+        u64 bits = 0x4004000000000000ULL;   /* 2.5 */
+
+        bw64(buf + off, bits);
+        off += 8;
+    }
+    /* "b": true */
+    buf[off++] = BSON_BOOL;
+    buf[off++] = 'b';
+    buf[off++] = 0;
+    buf[off++] = 1;
+    /* "n": null */
+    buf[off++] = BSON_NULL;
+    buf[off++] = 'n';
+    buf[off++] = 0;
+    /* "oid": 12 字节 */
+    buf[off++] = BSON_OBJECTID;
+    buf[off++] = 'o';
+    buf[off++] = 'i';
+    buf[off++] = 'd';
+    buf[off++] = 0;
+    for (i = 0; i < 12; i++)
+        buf[off++] = (char)(0xA0 + i);
+    /* "bin": binary subtype 0，3 字节 */
+    buf[off++] = BSON_BINARY;
+    buf[off++] = 'b';
+    buf[off++] = 'i';
+    buf[off++] = 'n';
+    buf[off++] = 0;
+    bw32(buf + off, 3);
+    off += 4;
+    buf[off++] = 0;
+    buf[off++] = 'x';
+    buf[off++] = 'y';
+    buf[off++] = 'z';
+    /* "sub": { "k": 7 } */
+    buf[off++] = BSON_DOC;
+    buf[off++] = 's';
+    buf[off++] = 'u';
+    buf[off++] = 'b';
+    buf[off++] = 0;
+    sub_start = off;
+    bw32(buf + sub_start, 12);
+    off += 4;
+    buf[off++] = BSON_INT32;
+    buf[off++] = 'k';
+    buf[off++] = 0;
+    bw32(buf + off, 7);
+    off += 4;
+    buf[off++] = 0;
+    /* "arr": [ "a", "b" ] */
+    buf[off++] = BSON_ARRAY;
+    buf[off++] = 'a';
+    buf[off++] = 'r';
+    buf[off++] = 'r';
+    buf[off++] = 0;
+    arr_start = off;
+    bw32(buf + arr_start, 0);           /* 长度稍后填 */
+    off += 4;
+    buf[off++] = BSON_STRING;
+    buf[off++] = '0';
+    buf[off++] = 0;
+    bw32(buf + off, 2);
+    off += 4;
+    buf[off++] = 'a';
+    buf[off++] = 0;
+    buf[off++] = BSON_STRING;
+    buf[off++] = '1';
+    buf[off++] = 0;
+    bw32(buf + off, 2);
+    off += 4;
+    buf[off++] = 'b';
+    buf[off++] = 0;
+    buf[off++] = 0;
+    bw32(buf + arr_start, (u32)(off - arr_start));
+    buf[off++] = 0;                     /* 文档结尾 */
+    doc_start = 0;
+    bw32(buf + doc_start, (u32)off);
+    return off;
+}
+
+test "BSON：各类型元素与访问器" {
+    static char doc[512] = { 0 };
+    int n = mk_bson(doc);
+    BsonReader r = { 0 };
+    BsonElem e = { 0 };
+    Str s = { 0 };
+    long long iv = 0;
+    double d = 0;
+    int b = 0, count = 0;
+
+    if (bson_open(doc, n, &r) != 1)
+        return err(1, "文档应该能打开");
+    while (r.next(&e) == 1) {
+        count++;
+        if (e.name.s.len == 1 && e.name.s.data[0] == 's') {
+            if (bson_string(&e, &s) != 1 || s.s.len != 2
+                || memcmp(s.s.data, "hi", 2) != 0)
+                return err(2, "字符串不对");
+        } else if (e.name.s.len == 3 && memcmp(e.name.s.data, "i32", 3) == 0) {
+            if (bson_int64(&e, &iv) != 1 || iv != -2)
+                return err(3, "int32 无符号扩展不对");
+        } else if (e.name.s.len == 3 && memcmp(e.name.s.data, "i64", 3) == 0) {
+            if (bson_int64(&e, &iv) != 1 || iv != 5000000000LL)
+                return err(4, "int64 不对");
+        } else if (e.name.s.len == 1 && e.name.s.data[0] == 'd') {
+            if (bson_double(&e, &d) != 1 || d != 2.5)
+                return err(5, "double 不对");
+        } else if (e.name.s.len == 1 && e.name.s.data[0] == 'b') {
+            if (bson_bool(&e, &b) != 1 || b != 1)
+                return err(6, "bool 不对");
+        } else if (e.name.s.len == 3 && memcmp(e.name.s.data, "oid", 3) == 0) {
+            u8 oid[12] = { 0 };
+
+            if (bson_objectid(&e, oid) != 1 || (u8)oid[0] != 0xA0
+                || (u8)oid[11] != 0xAB)
+                return err(7, "objectid 不对");
+        } else if (e.name.s.len == 3 && memcmp(e.name.s.data, "bin", 3) == 0) {
+            int sub = -1;
+
+            if (bson_binary(&e, &sub, &s) != 1 || sub != 0 || s.s.len != 3
+                || memcmp(s.s.data, "xyz", 3) != 0)
+                return err(8, "binary 不对");
+        }
+    }
+    if (count != 10)
+        return err(9, "元素个数不对");
+    if (r.bad)
+        return err(10, "不该坏");
+    /* 子文档 */
+    if (bson_find(doc, n, "sub", &e) != 1)
+        return err(11, "没找到 sub");
+    {
+        BsonReader sub = { 0 };
+        BsonElem ke = { 0 };
+
+        if (bson_subdoc(&e, &sub) != 1)
+            return err(12, "子文档打不开");
+        if (sub.next(&ke) != 1 || ke.name.s.len != 1
+            || bson_int64(&ke, &iv) != 1 || iv != 7)
+            return err(13, "子文档里的 k 不对");
+        if (sub.next(&ke) != 0)
+            return err(14, "子文档应该只有一个元素");
+    }
+    /* 数组 */
+    if (bson_find(doc, n, "arr", &e) != 1)
+        return err(15, "没找到 arr");
+    {
+        BsonReader arr = { 0 };
+        BsonElem ae = { 0 };
+        Str a = { 0 };
+
+        if (bson_subdoc(&e, &arr) != 1)
+            return err(16, "数组打不开");
+        if (arr.next(&ae) != 1 || ae.name.s.data[0] != '0'
+            || bson_string(&ae, &a) != 1 || a.s.len != 1 || a.s.data[0] != 'a')
+            return err(17, "数组第 0 项不对");
+        if (arr.next(&ae) != 1 || ae.name.s.data[0] != '1'
+            || bson_string(&ae, &a) != 1 || a.s.data[0] != 'b')
+            return err(18, "数组第 1 项不对");
+    }
+    /* 类型不符的访问器 */
+    if (bson_find(doc, n, "i32", &e) != 1 || bson_string(&e, &s) != -1)
+        return err(19, "类型不符应该 -1");
+    if (bson_find(doc, n, "nope", &e) != 0)
+        return err(20, "不存在的名字应该 0");
+}
+
+test "BSON：长度不符、截断与未知类型" {
+    static char doc[512] = { 0 };
+    int n = mk_bson(doc);
+    BsonReader r = { 0 };
+    BsonElem e = { 0 };
+
+    if (bson_open(doc, 4, &r) != -1)
+        return err(21, "太短应该 -1");
+    if (bson_open(0, 100, &r) != -1)
+        return err(22, "空指针应该 -1");
+    /* 长度字段大于实际 */
+    bw32(doc, (u32)(n + 10));
+    if (bson_open(doc, n, &r) != -1)
+        return err(23, "长度越界应该 -1");
+    /* 长度字段小于实际（合法，只读前缀） */
+    bw32(doc, (u32)n);
+    if (bson_open(doc, n, &r) != 1)
+        return err(24, "恢复后应该能打开");
+    /* 结尾不是 0 */
+    doc[n - 1] = 'X';
+    if (bson_open(doc, n, &r) != -1)
+        return err(25, "结尾不是 0 应该 -1");
+    doc[n - 1] = 0;
+    /* 未知类型 */
+    {
+        static char bad[32] = { 0 };
+
+        bw32(bad, 12);
+        bad[4] = (char)0x13;            /* decimal128，未支持 */
+        bad[5] = 'x';
+        bad[6] = 0;
+        bw32(bad + 7, 0);
+        bad[11] = 0;
+        if (bson_open(bad, 12, &r) != 1)
+            return err(26, "未知类型本身不影响打开");
+        if (r.next(&e) != -1 || r.bad == 0)
+            return err(27, "未知类型应该 -1 并置 bad");
+    }
+    /* 名字没有 NUL 终止 */
+    {
+        static char nonul[32] = { 0 };
+
+        bw32(nonul, 8);
+        nonul[4] = (char)BSON_NULL;
+        nonul[5] = 'a';
+        nonul[6] = 'b';
+        nonul[7] = 0;                   /* 这是文档结尾，名字没终止 */
+        if (bson_open(nonul, 8, &r) != 1)
+            return err(28, "打开应该成功");
+        if (r.next(&e) != -1)
+            return err(29, "名字没有终止符应该 -1");
+    }
+    if (bson_find(0, 10, "x", &e) != -1)
+        return err(30, "空文档应该 -1");
+}

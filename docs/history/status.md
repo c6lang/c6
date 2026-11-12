@@ -1423,6 +1423,33 @@ socks5 还要 `std/net/inet.c6`，snappy 自成一体。示例 `examples/stdprot
 验收：`make stdtest`（153 个模块、0 failure）、`make std-exec`（15 条自检全过）、
 `make check-all`。
 
+### 11.48 标准库第三十六批（bson / ubjson / plist / markdown）
+
+第三十六批补序列化与标记：两种二进制 JSON（BSON / UBJSON）、Apple 的二进制
+属性列表，以及一个 Markdown → HTML 渲染器。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.bson` | BSON | 文档 = int32 总长度 + 元素 + `0x00`；元素 = 类型 + cstring 名 + 值；`next` 只切视图，访问器才解码；int32 要**手动符号扩展**；子文档/数组共用 `bson_open` |
+| `std.data.ubjson` | UBJSON | 事件流 + 容器栈：`$`（统一类型）与 `#`（计数）两个优化标记让后续元素**不带类型标记**，是最容易写错的地方；计数读满自动补 `UBJ_END`；深度上限 16 |
+| `std.data.plist` | 二进制 plist | 32 字节尾部给 `offset_size`/`ref_size`/对象数/根/偏移表；对象之间用引用号相连，所以访问器都要 `(buf, n, info)`；`0x0F` 长度走「后面跟一个整数对象」；UTF-16 串不转码 |
+| `std.text.markdown` | Markdown → HTML | 流式渲染，零分配；列表项**延迟**写 `</li>`，好让后续正文行并进同一项；行内渲染递归处理嵌套强调；未配对的 `*`/`**` 原样输出（两侧带空格不认作强调） |
+
+三个坑：BSON 的字符串长度**不含**自己那 4 字节（子文档长度**含**），一开始把
+两者当成一回事会让整个字符串被切掉；UBJSON 的 `$` 之后长度**仍带标记**（只有值
+不带），测试向量写成 `Sia` 是对的、写成 `ia` 才对应 `$S`；Markdown 的
+段落合并要在行内渲染里把换行变成空格，否则 `<p>` 里会出现真换行。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.bson`=0x6099、
+`std.data.ubjson`=0x609a、`std.data.plist`=0x609b、`std.text.markdown`=0x609c；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-ser` 与 `STD_SER_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`。
+示例 `examples/stdser.c6` 四种格式各一节（14 条自检）。
+
+验收：`make stdtest`（157 个模块、0 failure）、`make std-ser`（14 条自检全过）、
+`make check-all`。
+
+
 
 
 

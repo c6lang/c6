@@ -262,7 +262,12 @@
 | `examples/stddoc.c6` | （无模块） | 第三十三批（结构化文本格式）的拼装示例（`make std-doc`）：HTML 分词后数标签/取 `href`/看 `script` 原文/解实体，遍历一份 YAML 配置把缩进还原成层级并解引号，展开一张折行的 vCard，读一份含两个事件的 iCalendar |
 | `examples/stdproto.c6` | （无模块） | 第三十四批（网络协议编解码）的拼装示例（`make std-proto`）：解析 SSE 事件流（含多行 data）、构造 SOCKS5 问候与域名 CONNECT 并解应答、构造/解析 MQTT CONNECT 与 PUBLISH 并做主题通配、Snappy 压缩往返 |
 | `examples/stdexec.c6` | （无模块） | 第三十五批（二进制容器格式）的拼装示例（`make std-exec`）：内存里现场拼出 cpio 归档（目录+文件+收尾）、PE32+ 映像（节表 + RVA 映射）、Mach-O 64 位映像（`LC_SEGMENT_64` + `LC_MAIN`）与 wasm 模块（导出表），再逐个解析 |
+| `examples/stdser.c6` | （无模块） | 第三十六批（序列化与标记）的拼装示例（`make std-ser`）：现场拼 BSON 与 UBJSON 文档、解一段 plistlib 生成的二进制 plist（58 字节）、把一段 Markdown 渲染成 HTML |
 
+| `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
+| `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
+| `std/data/plist.c6` | `std.data.plist` | Apple **二进制**属性列表 `bplist00`（零分配）：`plist_open` 读 32 字节尾部（`offset_size`/`ref_size`/对象数/根/偏移表），`plist_root`/`plist_count`/`plist_at`/`plist_key`/`plist_get` 走引用号；标量 `plist_string`/`plist_int`/`plist_double`/`plist_bool`/`plist_data`/`plist_date`/`plist_utf16`/`plist_uid`。文本（XML）plist 请用 `std.data.xml` |
+| `std/text/markdown.c6` | `std.text.markdown` | Markdown（CommonMark 常用子集）→ HTML，零分配，结果写调用方缓冲区：`markdown_render` 支持 ATX 标题、段落、围栏代码（带语言名给 `class="language-xx"`）、引用、无序/有序列表、分隔线；`markdown_inline` 支持 `` `code` ``、粗体、斜体、`[文字](链接)`、`<http://…>` 自动链接、反斜杠转义，正文 `& < > "` 会转义；不做嵌套列表/表格/HTML 透传 |
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
 
@@ -314,6 +319,10 @@ std/data/cpio.c6           24 test(s), 0 failure(s)
 std/data/pe.c6             24 test(s), 0 failure(s)
 std/data/macho.c6          24 test(s), 0 failure(s)
 std/data/wasm.c6           24 test(s), 0 failure(s)
+std/data/bson.c6           24 test(s), 0 failure(s)
+std/data/ubjson.c6         24 test(s), 0 failure(s)
+std/data/plist.c6          24 test(s), 0 failure(s)
+std/text/markdown.c6       25 test(s), 0 failure(s)
 std/data/html.c6           24 test(s), 0 failure(s)
 std/data/yaml.c6           24 test(s), 0 failure(s)
 std/data/vcf.c6            24 test(s), 0 failure(s)
@@ -419,6 +428,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/data/pe.c6` 24 | pe 2 + str 22 |
 | `std/data/macho.c6` 24 | macho 2 + str 22 |
 | `std/data/wasm.c6` 24 | wasm 2 + str 22 |
+| `std/data/bson.c6` 24 | bson 2 + str 22 |
+| `std/data/ubjson.c6` 24 | ubjson 2 + str 22 |
+| `std/data/plist.c6` 24 | plist 2 + str 22 |
+| `std/text/markdown.c6` 25 | markdown 3 + str 22 |
 | `std/data/html.c6` 24 | html 2 + str 22 |
 | `std/data/yaml.c6` 24 | yaml 2 + str 22 |
 | `std/data/vcf.c6` 24 | vcf 2 + str 22 |
@@ -3417,6 +3430,16 @@ make std-exec
 Mach-O 只写一个 `LC_SEGMENT_64`（一个 `__text` 节）加一条 `LC_MAIN`；wasm 只写
 `export` 与 `code` 两个节，解出 `start` 这个名字。
 
+### 集成示例：`examples/stdser.c6`
+
+```sh
+make std-ser
+```
+
+四种格式各一节：BSON 现场拼 `{svc:"api", port:8080, tags:["a","b"]}`、UBJSON
+现场拼同样形状的文档（含 `#` 计数数组）、plist 解一段 58 字节的 `bplist00`、
+Markdown 把一段带标题/列表/代码块的文档渲染成 HTML。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3483,6 +3506,8 @@ Mach-O 只写一个 `LC_SEGMENT_64`（一个 `__text` 节）加一条 `LC_MAIN`�
   拼装示例（自带自检）。
 * `make std-exec`：`examples/stdexec.c6`，第三十五批（二进制容器格式）模块的拼装
   示例（自带自检）。
+* `make std-ser`：`examples/stdser.c6`，第三十六批（序列化与标记）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

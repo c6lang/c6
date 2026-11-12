@@ -1,0 +1,660 @@
+/* std/text/markdown：Markdown（CommonMark 的常用子集）→ HTML。
+ *
+ *     import std.text.markdown;
+ *
+ *     char out[8192] = { 0 };
+ *     int n = markdown_render(text, (int)strlen(text), out, sizeof out);
+ *
+ * 支持：ATX 标题（`#`~`######`）、段落、空行、围栏代码块（``` / ~~~，带语言
+ * 名时给 `class="language-xx"`）、引用（`>`，一层）、无序列表（`-` `*` `+`）、
+ * 有序列表（`1.`）、分隔线（`---` / `***` / `___`）；行内支持 `` `code` ``、
+ * `**粗**` / `__粗__`、`*斜*` / `_斜_`、`[文字](链接)`、`<http://…>` 自动链接、
+ * 反斜杠转义。正文里的 `&` `<` `>` `"` 会被转义。
+ *
+ * 约定：
+ *
+ * - 零分配，输出写到调用方缓冲区，返回写入字节数（不含结尾 NUL）；缓冲区不够
+ *   返回 -1（已经写出的内容不保证可用）；
+ * - 不做：嵌套列表、表格、引用嵌套、HTML 原样透传、脚注、任务列表、setext
+ *   标题、标题锚点、链接引用式定义；
+ * - 连续的正文行合成一个段落，行之间用一个空格连接；
+ * - 列表项后面直接接正文行时，该行算作前一项的延续（不新开 `<li>`）；
+ * - 行尾 `\r` 会被吃掉（兼容 CRLF）。
+ */
+#include <string.h>
+
+module std.text.markdown;
+import std.core.types;
+import std.text.str;
+
+#define MD_MAX_FENCE 16
+
+struct MdOut {
+    char *p;
+    int cap;
+    int len;
+    int over;
+};
+
+static void md_raw(MdOut *o, const char *s, int n)
+{
+    if (o->over || n <= 0)
+        return;
+    if (o->len + n >= o->cap) {
+        o->over = 1;
+        return;
+    }
+    memcpy(o->p + o->len, s, (size_t)n);
+    o->len += n;
+    o->p[o->len] = 0;
+}
+
+static void md_puts(MdOut *o, const char *s)
+{
+    md_raw(o, s, (int)strlen(s));
+}
+
+static void md_esc(MdOut *o, const char *s, int n)
+{
+    int i = 0, start = 0;
+
+    for (i = 0; i < n; i++) {
+        const char *rep = 0;
+
+        if (s[i] == '&')
+            rep = "&amp;";
+        else if (s[i] == '<')
+            rep = "&lt;";
+        else if (s[i] == '>')
+            rep = "&gt;";
+        else if (s[i] == '"')
+            rep = "&quot;";
+        if (!rep)
+            continue;
+        md_raw(o, s + start, i - start);
+        md_puts(o, rep);
+        start = i + 1;
+    }
+    md_raw(o, s + start, n - start);
+}
+
+/* 找 s[i..n) 里第一次出现的字符 c */
+static int md_find(const char *s, int i, int n, char c)
+{
+    for (; i < n; i++)
+        if (s[i] == c)
+            return i;
+    return -1;
+}
+
+/* 行内渲染 */
+int markdown_inline(Str src, char *dst, int cap)
+{
+    MdOut o = { 0 };
+    const char *s = src.s.data;
+    int n = src.s.len;
+    int i = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    o.p = dst;
+    o.cap = cap;
+    o.len = 0;
+    o.p[0] = 0;
+    if (n > 0 && !s)
+        return -1;
+    while (i < n) {
+        char c = s[i];
+
+        /* 段落里的换行当空格 */
+        if (c == '\n') {
+            md_raw(&o, " ", 1);
+            i++;
+            continue;
+        }
+        /* 反斜杠转义 */
+        if (c == '\\' && i + 1 < n) {
+            md_esc(&o, s + i + 1, 1);
+            i += 2;
+            continue;
+        }
+        /* `code` */
+        if (c == '`') {
+            int run = 1, close = -1;
+
+            while (i + run < n && s[i + run] == '`')
+                run++;
+            close = md_find(s, i + run, n, '`');
+            if (close >= 0) {
+                md_puts(&o, "<code>");
+                md_esc(&o, s + i + run, close - i - run);
+                md_puts(&o, "</code>");
+                i = close + run;
+                continue;
+            }
+            md_raw(&o, s + i, run);
+            i += run;
+            continue;
+        }
+        /* **粗** / __粗__ */
+        if ((c == '*' || c == '_') && i + 1 < n && s[i + 1] == c) {
+            int save = i, close = -1;
+
+            i += 2;
+            for (; i + 1 < n; i++)
+                if (s[i] == c && s[i + 1] == c) {
+                    close = i;
+                    break;
+                }
+            if (close > save + 2 && s[save + 2] != ' ' && s[close - 1] != ' ') {
+                md_puts(&o, "<strong>");
+                markdown_inline((Str){ (char[:]){ (char *)s + save + 2,
+                                                 close - save - 2 } },
+                                o.p + o.len, o.cap - o.len);
+                o.len = (int)strlen(o.p);
+                md_puts(&o, "</strong>");
+                i = close + 2;
+                continue;
+            }
+            i = save;
+            md_raw(&o, s + i, 2);
+            i += 2;
+            continue;
+        }
+        /* *斜* / _斜_ */
+        if (c == '*' || c == '_') {
+            int save = i, close = -1;
+
+            i++;
+            close = md_find(s, i, n, c);
+            if (close > save + 1 && s[save + 1] != ' ' && s[close - 1] != ' ') {
+                md_puts(&o, "<em>");
+                markdown_inline((Str){ (char[:]){ (char *)s + save + 1,
+                                                 close - save - 1 } },
+                                o.p + o.len, o.cap - o.len);
+                o.len = (int)strlen(o.p);
+                md_puts(&o, "</em>");
+                i = close + 1;
+                continue;
+            }
+            i = save;
+            md_raw(&o, s + i, 1);
+            i++;
+            continue;
+        }
+        /* [文字](链接) */
+        if (c == '[') {
+            int rb = md_find(s, i + 1, n, ']');
+
+            if (rb > 0 && rb + 1 < n && s[rb + 1] == '(') {
+                int rp = md_find(s, rb + 2, n, ')');
+
+                if (rp > 0) {
+                    md_puts(&o, "<a href=\"");
+                    md_esc(&o, s + rb + 2, rp - rb - 2);
+                    md_puts(&o, "\">");
+                    markdown_inline((Str){ (char[:]){ (char *)s + i + 1,
+                                                     rb - i - 1 } },
+                                    o.p + o.len, o.cap - o.len);
+                    o.len = (int)strlen(o.p);
+                    md_puts(&o, "</a>");
+                    i = rp + 1;
+                    continue;
+                }
+            }
+            md_esc(&o, s + i, 1);
+            i++;
+            continue;
+        }
+        /* <http://…> 自动链接 */
+        if (c == '<') {
+            int gt = md_find(s, i + 1, n, '>');
+
+            if (gt > i + 1 && (s[i + 1] == 'h' || s[i + 1] == 'm')) {
+                md_puts(&o, "<a href=\"");
+                md_esc(&o, s + i + 1, gt - i - 1);
+                md_puts(&o, "\">");
+                md_esc(&o, s + i + 1, gt - i - 1);
+                md_puts(&o, "</a>");
+                i = gt + 1;
+                continue;
+            }
+        }
+        md_esc(&o, s + i, 1);
+        i++;
+    }
+    if (o.over)
+        return -1;
+    return o.len;
+}
+
+/* 行分类 */
+#define MDL_BLANK 0
+#define MDL_FENCE 1
+#define MDL_HEADING 2
+#define MDL_HR 3
+#define MDL_QUOTE 4
+#define MDL_UL 5
+#define MDL_OL 6
+#define MDL_TEXT 7
+
+static int md_is_blank(const char *s, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++)
+        if (s[i] != ' ' && s[i] != '\t')
+            return 0;
+    return 1;
+}
+
+static int md_heading(const char *s, int n, int *level, int *body_off)
+{
+    int i = 0;
+
+    while (i < n && i < 3 && s[i] == ' ')
+        i++;
+    if (i >= n || s[i] != '#')
+        return 0;
+    *level = 0;
+    while (i < n && s[i] == '#') {
+        (*level)++;
+        i++;
+    }
+    if (*level > 6)
+        return 0;
+    if (i < n && s[i] != ' ')
+        return 0;
+    while (i < n && s[i] == ' ')
+        i++;
+    *body_off = i;
+    return 1;
+}
+
+static int md_hr(const char *s, int n)
+{
+    int i = 0, count = 0;
+    char c = 0;
+
+    while (i < n && s[i] == ' ')
+        i++;
+    if (i >= n)
+        return 0;
+    c = s[i];
+    if (c != '-' && c != '*' && c != '_')
+        return 0;
+    for (; i < n; i++) {
+        if (s[i] == c)
+            count++;
+        else if (s[i] != ' ')
+            return 0;
+    }
+    return count >= 3;
+}
+
+static int md_fence(const char *s, int n, char *fc, int *flen, const char **info,
+                    int *info_len)
+{
+    int i = 0;
+
+    while (i < n && i < 3 && s[i] == ' ')
+        i++;
+    if (i >= n || (s[i] != '`' && s[i] != '~'))
+        return 0;
+    *fc = s[i];
+    *flen = 0;
+    while (i < n && s[i] == *fc) {
+        (*flen)++;
+        i++;
+    }
+    if (*flen < 3)
+        return 0;
+    while (i < n && s[i] == ' ')
+        i++;
+    *info = s + i;
+    *info_len = n - i;
+    return 1;
+}
+
+static int md_list_item(const char *s, int n, int *ol, int *body_off)
+{
+    int i = 0;
+
+    while (i < n && i < 3 && s[i] == ' ')
+        i++;
+    if (i >= n)
+        return 0;
+    if (s[i] == '-' || s[i] == '*' || s[i] == '+') {
+        if (i + 1 < n && s[i + 1] == ' ') {
+            *ol = 0;
+            *body_off = i + 2;
+            return 1;
+        }
+        return 0;
+    }
+    {
+        int j = i, digits = 0;
+
+        while (j < n && s[j] >= '0' && s[j] <= '9') {
+            digits++;
+            j++;
+        }
+        if (digits > 0 && digits <= 9 && j < n && s[j] == '.'
+            && j + 1 < n && s[j + 1] == ' ') {
+            *ol = 1;
+            *body_off = j + 2;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int markdown_render(Str src, char *dst, int cap)
+{
+    MdOut o = { 0 };
+    const char *s = src.s.data;
+    int n = src.s.len;
+    int i = 0;
+    int state = 0;          /* 0 无、1 段落、2 ul、3 ol */
+    int para_start = 0, para_len = 0;
+    int li_open = 0;
+
+    if (!dst || cap <= 0 || n < 0)
+        return -1;
+    o.p = dst;
+    o.cap = cap;
+    o.p[0] = 0;
+    while (i <= n) {
+        int ls = i, le = i, kind = MDL_TEXT, level = 0, body = 0;
+        int ol = 0, flen = 0, info_len = 0;
+        const char *info = 0;
+        char fc = 0;
+
+        /* 取一行（吃掉 \r） */
+        while (le < n && s[le] != '\n')
+            le++;
+        if (le > ls && s[le - 1] == '\r')
+            le--;
+        i = le < n ? le + 1 : n + 1;
+        if (md_is_blank(s + ls, le - ls))
+            kind = MDL_BLANK;
+        else if (md_fence(s + ls, le - ls, &fc, &flen, &info, &info_len))
+            kind = MDL_FENCE;
+        else if (md_heading(s + ls, le - ls, &level, &body))
+            kind = MDL_HEADING;
+        else if (md_hr(s + ls, le - ls))
+            kind = MDL_HR;
+        else if (s[ls] == '>' || (ls + 1 < le && s[ls] == ' ' && s[ls + 1] == '>'))
+            kind = MDL_QUOTE;
+        else if (md_list_item(s + ls, le - ls, &ol, &body))
+            kind = ol ? MDL_OL : MDL_UL;
+
+        /* 段落延续 */
+        if (kind == MDL_TEXT && state == 1) {
+            para_len = le - para_start;
+            continue;
+        }
+        if (kind == MDL_TEXT && (state == 2 || state == 3)) {
+            md_puts(&o, " ");
+            markdown_inline((Str){ (char[:]){ (char *)s + ls, le - ls } },
+                            o.p + o.len, o.cap - o.len);
+            o.len = (int)strlen(o.p);
+            continue;
+        }
+        /* 关掉前面的块（同一层列表的连续项不算换块） */
+        if (state == 1) {
+            md_puts(&o, "<p>");
+            markdown_inline((Str){ (char[:]){ (char *)s + para_start, para_len } },
+                            o.p + o.len, o.cap - o.len);
+            o.len = (int)strlen(o.p);
+            md_puts(&o, "</p>\n");
+            state = 0;
+        }
+        if ((state == 2 || state == 3)
+            && !((kind == MDL_UL && state == 2)
+                 || (kind == MDL_OL && state == 3))) {
+            if (li_open) {
+                md_puts(&o, "</li>\n");
+                li_open = 0;
+            }
+            md_puts(&o, state == 2 ? "</ul>\n" : "</ol>\n");
+            state = 0;
+        }
+        /* 开新的块 */
+        if (kind == MDL_BLANK)
+            continue;
+        if (kind == MDL_TEXT) {
+            state = 1;
+            para_start = ls;
+            para_len = le - ls;
+            continue;
+        }
+        if (kind == MDL_HR) {
+            md_puts(&o, "<hr>\n");
+            continue;
+        }
+        if (kind == MDL_HEADING) {
+            char tag[4] = { 'h', 0, 0, 0 };
+
+            tag[1] = (char)('0' + level);
+            md_puts(&o, "<");
+            md_puts(&o, tag);
+            md_puts(&o, ">");
+            markdown_inline((Str){ (char[:]){ (char *)s + ls + body,
+                                             le - ls - body } },
+                            o.p + o.len, o.cap - o.len);
+            o.len = (int)strlen(o.p);
+            md_puts(&o, "</");
+            md_puts(&o, tag);
+            md_puts(&o, ">\n");
+            continue;
+        }
+        if (kind == MDL_QUOTE) {
+            int off = ls + 1;
+
+            if (s[ls] == ' ') {
+                off = ls + 2;
+                if (off < le && s[off] == ' ')
+                    off++;
+            } else if (off < le && s[off] == ' ') {
+                off++;
+            }
+            md_puts(&o, "<blockquote>");
+            markdown_inline((Str){ (char[:]){ (char *)s + off, le - off } },
+                            o.p + o.len, o.cap - o.len);
+            o.len = (int)strlen(o.p);
+            md_puts(&o, "</blockquote>\n");
+            continue;
+        }
+        if (kind == MDL_UL || kind == MDL_OL) {
+            if (!(kind == MDL_UL && state == 2) && !(kind == MDL_OL && state == 3))
+                md_puts(&o, kind == MDL_UL ? "<ul>\n" : "<ol>\n");
+            state = kind == MDL_UL ? 2 : 3;
+            if (li_open) {
+                md_puts(&o, "</li>\n");
+                li_open = 0;
+            }
+            md_puts(&o, "<li>");
+            li_open = 1;
+            markdown_inline((Str){ (char[:]){ (char *)s + ls + body,
+                                             le - ls - body } },
+                            o.p + o.len, o.cap - o.len);
+            o.len = (int)strlen(o.p);
+            continue;
+        }
+        if (kind == MDL_FENCE) {
+            /* 收集到配对的围栏 */
+            int fl = flen;
+
+            md_puts(&o, "<pre><code");
+            if (info_len > 0) {
+                int j = 0;
+
+                while (j < info_len && info[j] != ' ')
+                    j++;
+                md_puts(&o, " class=\"language-");
+                md_esc(&o, info, j);
+                md_puts(&o, "\"");
+            }
+            md_puts(&o, ">");
+            for (;;) {
+                int cs = i, ce = i, cflen = 0, cinfo = 0;
+                const char *ci = 0;
+                char cc = 0;
+
+                if (cs >= n) {
+                    i = n + 1;
+                    break;
+                }
+                while (ce < n && s[ce] != '\n')
+                    ce++;
+                if (ce > cs && s[ce - 1] == '\r')
+                    ce--;
+                i = ce < n ? ce + 1 : n + 1;
+                if (md_fence(s + cs, ce - cs, &cc, &cflen, &ci, &cinfo)
+                    && cc == fc && cflen >= fl && cinfo == 0)
+                    break;
+                md_esc(&o, s + cs, ce - cs);
+                md_puts(&o, "\n");
+            }
+            md_puts(&o, "</code></pre>\n");
+            continue;
+        }
+    }
+    if (state == 1) {
+        md_puts(&o, "<p>");
+        markdown_inline((Str){ (char[:]){ (char *)s + para_start, para_len } },
+                        o.p + o.len, o.cap - o.len);
+        o.len = (int)strlen(o.p);
+        md_puts(&o, "</p>\n");
+    }
+    if (li_open)
+        md_puts(&o, "</li>\n");
+    if (state == 2 || state == 3)
+        md_puts(&o, state == 2 ? "</ul>\n" : "</ol>\n");
+    if (o.over)
+        return -1;
+    return o.len;
+}
+
+/* ---- 自测 ---- */
+
+static int md_eq(Str src, const char *want)
+{
+    static char buf[4096] = { 0 };
+    int n = markdown_render(src, buf, (int)sizeof buf);
+
+    if (n < 0)
+        return -1;
+    if ((int)strlen(want) != n)
+        return -2;
+    return memcmp(buf, want, (size_t)n) == 0 ? 1 : 0;
+}
+
+test "markdown：块级元素" {
+    Str t = { 0 };
+
+    t = (Str){ S("# 标题\n") };
+    if (md_eq(t, "<h1>标题</h1>\n") != 1)
+        return err(1, "h1 不对");
+    t = (Str){ S("### 三级\n") };
+    if (md_eq(t, "<h3>三级</h3>\n") != 1)
+        return err(2, "h3 不对");
+    t = (Str){ S("####### 七个\n") };
+    if (md_eq(t, "<p>####### 七个</p>\n") != 1)
+        return err(3, "七个 # 应该是段落");
+    t = (Str){ S("第一行\n第二行\n") };
+    if (md_eq(t, "<p>第一行 第二行</p>\n") != 1)
+        return err(4, "段落合并不对");
+    t = (Str){ S("---\n") };
+    if (md_eq(t, "<hr>\n") != 1)
+        return err(5, "分隔线不对");
+    t = (Str){ S("- 一\n- 二\n") };
+    if (md_eq(t, "<ul>\n<li>一</li>\n<li>二</li>\n</ul>\n") != 1)
+        return err(6, "无序列表不对");
+    t = (Str){ S("1. 一\n2. 二\n") };
+    if (md_eq(t, "<ol>\n<li>一</li>\n<li>二</li>\n</ol>\n") != 1)
+        return err(7, "有序列表不对");
+    t = (Str){ S("> 引用\n") };
+    if (md_eq(t, "<blockquote>引用</blockquote>\n") != 1)
+        return err(8, "引用不对");
+    t = (Str){ S("```c\nint x = 1 < 2;\n```\n") };
+    if (md_eq(t, "<pre><code class=\"language-c\">int x = 1 &lt; 2;\n</code></pre>\n") != 1)
+        return err(9, "围栏代码不对");
+    t = (Str){ S("```\na\nb\n```\n") };
+    if (md_eq(t, "<pre><code>a\nb\n</code></pre>\n") != 1)
+        return err(10, "无语言围栏不对");
+    t = (Str){ S("\n\n") };
+    if (md_eq(t, "") != 1)
+        return err(11, "全空应该是空输出");
+}
+
+test "markdown：行内元素与转义" {
+    char buf[1024] = { 0 };
+    Str t = { 0 };
+    int n = 0;
+
+    t = (Str){ S("**粗** 和 *斜*") };
+    n = markdown_inline(t, buf, (int)sizeof buf);
+    if (n < 0 || strcmp(buf, "<strong>粗</strong> 和 <em>斜</em>") != 0)
+        return err(12, "粗斜不对");
+    t = (Str){ S("看 `a<b` 与 [文](http://x/y)") };
+    n = markdown_inline(t, buf, (int)sizeof buf);
+    if (n < 0
+        || strcmp(buf,
+                  "看 <code>a&lt;b</code> 与 <a href=\"http://x/y\">文</a>")
+               != 0)
+        return err(13, "行内代码/链接不对");
+    t = (Str){ S("<http://a.b>") };
+    n = markdown_inline(t, buf, (int)sizeof buf);
+    if (n < 0 || strcmp(buf, "<a href=\"http://a.b\">http://a.b</a>") != 0)
+        return err(14, "自动链接不对");
+    t = (Str){ S("a & b < c \\*x\\*") };
+    n = markdown_inline(t, buf, (int)sizeof buf);
+    if (n < 0 || strcmp(buf, "a &amp; b &lt; c *x*") != 0)
+        return err(15, "转义不对");
+    t = (Str){ S("孤立的 * 号与 ** 号") };
+    n = markdown_inline(t, buf, (int)sizeof buf);
+    if (n < 0 || strcmp(buf, "孤立的 * 号与 ** 号") != 0)
+        return err(16, "未配对应原样输出");
+    /* 缓冲区不够 */
+    {
+        char small[8] = { 0 };
+        Str big = { S("**一二三四五六七八**") };
+
+        if (markdown_inline(big, small, (int)sizeof small) != -1)
+            return err(17, "缓冲区不够应该 -1");
+    }
+}
+
+test "markdown：混合文档与边界" {
+    Str t = { 0 };
+
+    t = (Str){ S("# 标题\n\n正文 **粗**。\n\n- 甲\n- 乙\n\n```sh\necho hi\n```\n") };
+    if (md_eq(t,
+              "<h1>标题</h1>\n<p>正文 <strong>粗</strong>。</p>\n"
+              "<ul>\n<li>甲</li>\n<li>乙</li>\n</ul>\n"
+              "<pre><code class=\"language-sh\">echo hi\n</code></pre>\n")
+        != 1)
+        return err(18, "混合文档不对");
+    /* 列表项后接正文行 → 并到上一项 */
+    t = (Str){ S("- 一\n续行\n") };
+    if (md_eq(t, "<ul>\n<li>一 续行</li>\n</ul>\n") != 1)
+        return err(19, "列表延续不对");
+    /* CRLF */
+    t = (Str){ S("# 标题\r\n正文\r\n") };
+    if (md_eq(t, "<h1>标题</h1>\n<p>正文</p>\n") != 1)
+        return err(20, "CRLF 不对");
+    /* 围栏没闭合 → 吃到文末 */
+    t = (Str){ S("```\nx\n") };
+    if (md_eq(t, "<pre><code>x\n</code></pre>\n") != 1)
+        return err(21, "未闭合围栏不对");
+    if (markdown_render((Str){ S("# x\n") }, 0, 10) != -1)
+        return err(22, "空缓冲区应该 -1");
+    {
+        char tiny[4] = { 0 };
+
+        if (markdown_render((Str){ S("# 标题\n") }, tiny, (int)sizeof tiny) != -1)
+            return err(23, "缓冲区太小应该 -1");
+    }
+}

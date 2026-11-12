@@ -1,0 +1,236 @@
+/* examples/stdser.c6 —— 第三十六批（序列化与标记）的集成示例。
+ *
+ *     make std-ser
+ *
+ * 四节：BSON 文档（现场拼）、UBJSON 文档（现场拼）、二进制 plist（plistlib
+ * 生成的 58 字节向量）、Markdown → HTML。每节自检。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.bson;
+import std.data.ubjson;
+import std.data.plist;
+import std.text.markdown;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void w32(char *p, unsigned v)
+{
+    p[0] = (char)(v & 0xFF);
+    p[1] = (char)((v >> 8) & 0xFF);
+    p[2] = (char)((v >> 16) & 0xFF);
+    p[3] = (char)((v >> 24) & 0xFF);
+}
+
+/* ---- BSON ---- */
+static void do_bson(void)
+{
+    static char doc[128] = { 0 };
+    int off = 4;
+    BsonReader r = { 0 };
+    BsonElem e = { 0 };
+    Str s = { 0 };
+    long long iv = 0;
+    int seen = 0;
+
+    printf("== bson\n");
+    /* { "svc": "api", "port": 8080, "tags": [ "a", "b" ] } */
+    doc[off++] = (char)BSON_STRING;
+    memcpy(doc + off, "svc", 4);
+    off += 4;
+    w32(doc + off, 4);
+    off += 4;
+    memcpy(doc + off, "api", 4);
+    off += 4;
+    doc[off++] = (char)BSON_INT32;
+    memcpy(doc + off, "port", 5);
+    off += 5;
+    w32(doc + off, 8080);
+    off += 4;
+    doc[off++] = (char)BSON_ARRAY;
+    memcpy(doc + off, "tags", 5);
+    off += 5;
+    w32(doc + off, 23);                 /* 子文档长度 */
+    off += 4;
+    doc[off++] = (char)BSON_STRING;
+    doc[off++] = '0';
+    doc[off++] = 0;
+    w32(doc + off, 2);
+    off += 4;
+    doc[off++] = 'a';
+    doc[off++] = 0;
+    doc[off++] = (char)BSON_STRING;
+    doc[off++] = '1';
+    doc[off++] = 0;
+    w32(doc + off, 2);
+    off += 4;
+    doc[off++] = 'b';
+    doc[off++] = 0;
+    doc[off++] = 0;
+    doc[off++] = 0;                     /* 文档结尾 */
+    w32(doc, (unsigned)off);
+    if (bson_open(doc, off, &r) != 1) {
+        check(0, "BSON 打不开");
+        return;
+    }
+    while (r.next(&e) == 1) {
+        seen++;
+        if (e.type == BSON_STRING && bson_string(&e, &s) == 1)
+            printf("   %.*s = \"%.*s\"\n", e.name.s.len, e.name.s.data,
+                   s.s.len, s.s.data);
+        else if (e.type == BSON_INT32 && bson_int64(&e, &iv) == 1)
+            printf("   %.*s = %lld\n", e.name.s.len, e.name.s.data, iv);
+        else if (e.type == BSON_ARRAY)
+            printf("   %.*s = 数组\n", e.name.s.len, e.name.s.data);
+    }
+    check(seen == 3, "三个元素");
+    if (bson_find(doc, off, "port", &e) == 1 && bson_int64(&e, &iv) == 1)
+        check(iv == 8080, "port 是 8080");
+    else
+        check(0, "找不到 port");
+    if (bson_find(doc, off, "tags", &e) == 1) {
+        BsonReader arr = { 0 };
+        BsonElem ae = { 0 };
+
+        if (bson_subdoc(&e, &arr) == 1) {
+            check(arr.next(&ae) == 1 && bson_string(&ae, &s) == 1
+                      && s.s.len == 1 && s.s.data[0] == 'a',
+                  "tags[0] 是 a");
+            check(arr.next(&ae) == 1 && bson_string(&ae, &s) == 1
+                      && s.s.data[0] == 'b',
+                  "tags[1] 是 b");
+        } else
+            check(0, "tags 不是数组");
+    } else
+        check(0, "找不到 tags");
+}
+
+/* ---- UBJSON ---- */
+static void do_ubjson(void)
+{
+    static const char *doc = "{Si\x03" "svc" "Si\x03" "api" "Si\x04" "port" "U\x7e"
+                             "Si\x04" "tags" "[#i\x02" "Si\x01" "a" "Si\x01" "b"
+                             "}";
+    UbjReader r = { 0 };
+    UbjValue v = { 0 };
+    int keys = 0, depth = 0;
+
+    printf("== ubjson\n");
+    if (ubj_open(doc, (int)strlen(doc), &r) != 1) {
+        check(0, "UBJSON 打不开");
+        return;
+    }
+    while (r.next(&v) == 1) {
+        if (v.type == UBJ_KEY) {
+            keys++;
+            printf("   %-5.*s", v.s.s.len, v.s.s.data);
+        } else if (v.type == UBJ_STRING) {
+            if (depth > 0)
+                printf("     \"%.*s\"\n", v.s.s.len, v.s.s.data);
+            else
+                printf(" = \"%.*s\"\n", v.s.s.len, v.s.s.data);
+        } else if (v.type == UBJ_INT) {
+            if (depth > 0)
+                printf("     %lld\n", v.i);
+            else
+                printf(" = %lld\n", v.i);
+        } else if (v.type == UBJ_ARRAY) {
+            printf(" = 数组[");
+            depth++;
+        } else if (v.type == UBJ_END && depth > 0) {
+            printf("]\n");
+            depth--;
+        }
+    }
+    check(keys == 3, "三个键");
+    check(!r.bad, "没读到坏数据");
+}
+
+/* ---- plist ---- */
+static const unsigned char plist_vec[58] = {
+    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0xd2, 0x01, 0x02,
+    0x03, 0x04, 0x51, 0x6b, 0x51, 0x6e, 0x51, 0x76, 0x10, 0x05, 0x08,
+    0x0d, 0x0f, 0x11, 0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x15
+};
+
+static void do_plist(void)
+{
+    PlistInfo info = { 0 };
+    PlistObj root = { 0 }, v = { 0 };
+    Str s = { 0 };
+    long long iv = 0;
+
+    printf("== plist\n");
+    if (plist_open(plist_vec, 58, &info) != 1) {
+        check(0, "plist 打不开");
+        return;
+    }
+    if (plist_root(plist_vec, 58, &info, &root) != 1) {
+        check(0, "根取不到");
+        return;
+    }
+    printf("   根：%d 个键\n", plist_count(&root));
+    check(plist_count(&root) == 2, "根有两个键");
+    if (plist_get(plist_vec, 58, &info, &root, "k", &v) == 1
+        && plist_string(&v, &s) == 1) {
+        printf("   k = \"%.*s\"\n", s.s.len, s.s.data);
+        check(s.s.len == 1 && s.s.data[0] == 'v', "k 是 v");
+    } else
+        check(0, "k 取不到");
+    if (plist_get(plist_vec, 58, &info, &root, "n", &v) == 1
+        && plist_int(&v, &iv) == 1) {
+        printf("   n = %lld\n", iv);
+        check(iv == 5, "n 是 5");
+    } else
+        check(0, "n 取不到");
+}
+
+/* ---- markdown ---- */
+static void do_markdown(void)
+{
+    static const char *md = "# 记录\n\n一共 **3** 项：\n\n- `port` 8080\n- `tags` 数组\n\n"
+                            "```c\nif (a < b) x++;\n```\n";
+    static char html[4096] = { 0 };
+    int n = 0;
+
+    printf("== markdown\n");
+    n = markdown_render((Str){ (char[:]){ (char *)md, (int)strlen(md) } }, html,
+                        (int)sizeof html);
+    if (n < 0) {
+        check(0, "渲染失败");
+        return;
+    }
+    printf("%s", html);
+    check(strstr(html, "<h1>记录</h1>") != 0, "标题");
+    check(strstr(html, "<strong>3</strong>") != 0, "粗体");
+    check(strstr(html, "<li><code>port</code> 8080</li>") != 0, "列表项");
+    check(strstr(html, "language-c") != 0 && strstr(html, "a &lt; b") != 0,
+          "代码块与转义");
+    check((int)strlen(html) == n, "返回值是长度");
+}
+
+int main(void)
+{
+    do_bson();
+    do_ubjson();
+    do_plist();
+    do_markdown();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

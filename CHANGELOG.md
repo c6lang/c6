@@ -56,6 +56,15 @@
 
 ### 标准库
 
+- **标准库第三十六批（序列化与标记）**：`std.data.bson` / `std.data.ubjson` /
+  `std.data.plist` / `std.text.markdown` 四个零分配模块，集成示例
+  `examples/stdser.c6`（`make std-ser`）。BSON 逐元素切视图并做 int32 符号扩展；
+  UBJSON 走事件流 + 容器栈，支持 `$`/`#` 优化容器；plist 解 `bplist00` 的偏移表
+  与引用号（支持 null/bool/int/real/date/data/ASCII/UTF-16/array/dict/uid）；
+  markdown 把常用子集渲染成 HTML（标题/段落/围栏代码/引用/列表/分隔线 +
+  行内代码、粗斜体、链接、自动链接）。错误号段 `std.data.bson`=0x6099 …
+  `std.text.markdown`=0x609c（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第三十五批（二进制容器格式）**：`std.data.cpio` / `std.data.pe` /
   `std.data.macho` / `std.data.wasm` 四个零分配结构解析模块，集成示例
   `examples/stdexec.c6`（`make std-exec`）。cpio 认 newc/crc；pe 走 DOS 头到节表
