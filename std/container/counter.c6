@@ -1,0 +1,269 @@
+/* std/container/counter：字符串频次计数器（开放寻址，键有长度上限）。
+ *
+ *     import std.container.counter;
+ *
+ *     CounterSlot slots[64] = { 0 };
+ *     Counter c = { 0 };
+ *     counter_init(&c, slots, 64);
+ *     counter_add(&c, S("GET"), 1);
+ *     counter_get(&c, S("GET"));        // 1
+ *
+ * 键是**定长拷贝**（最多 23 字节，存在 `CounterSlot.key` 里），所以没有生命周期
+ * 问题；表是开放寻址 + 线性探测，容量必须是 2 的幂，装到 3/4 就返回「满」。
+ *
+ * 约定：
+ *
+ * - `counter_init` 的 `cap` 必须是 2 的幂且 >= 4，否则返回 -1；
+ * - `counter_add` 的 `delta` 可以是负数（用于扣减），返回新计数；
+ *   键超长或表满返回 -1；
+ * - `counter_get` 没见过的键返回 0（没法区分「计数为 0」与「不存在」，
+ *   需要区分请先看 `counter_add` 的返回值）；
+ * - `counter_top` 找计数最大的键（并列时返回先插入的那个）；
+ * - `counter_total` 是所有增量的总和，`counter_keys` 是不同键的个数；
+ * - `counter_clear` 把表清空（不释放内存）。
+ */
+#include <string.h>
+
+module std.container.counter;
+import std.core.types;
+import std.text.str;
+
+struct CounterSlot {
+    char key[24];
+    int klen;
+    i64 count;
+};
+
+struct Counter {
+    CounterSlot *slots;
+    int cap;
+    int used;
+    i64 total;
+};
+
+static u32 counter_hash(char[:] key)
+{
+    u32 h = 0x811C9DC5u;
+    int i = 0;
+
+    for (i = 0; i < key.len; i++) {
+        h ^= (u32)(unsigned char)key.data[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+static int counter_pow2(int n)
+{
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+int counter_init(Counter *c, CounterSlot *slots, int cap)
+{
+    if (!c || !slots || cap < 4 || !counter_pow2(cap))
+        return -1;
+    memset(slots, 0, sizeof(CounterSlot) * (size_t)cap);
+    c->slots = slots;
+    c->cap = cap;
+    c->used = 0;
+    c->total = 0;
+    return 1;
+}
+
+int counter_clear(Counter *c)
+{
+    if (!c || !c->slots)
+        return -1;
+    memset(c->slots, 0, sizeof(CounterSlot) * (size_t)c->cap);
+    c->used = 0;
+    c->total = 0;
+    return 1;
+}
+
+static int counter_slot_eq(CounterSlot *s, char[:] key)
+{
+    return s->klen == key.len
+           && memcmp(s->key, key.data, (size_t)key.len) == 0;
+}
+
+/* 找键所在槽位；*found 置 1/0。表满且键不存在时返回 -1 */
+static int counter_find(Counter *c, char[:] key, int *found)
+{
+    u32 h = counter_hash(key);
+    int mask = c->cap - 1;
+    int i = 0;
+
+    *found = 0;
+    for (i = 0; i < c->cap; i++) {
+        int idx = (int)((h + (u32)i) & (u32)mask);
+        CounterSlot *s = &c->slots[idx];
+
+        if (s->klen == 0) {
+            return idx;
+        }
+        if (counter_slot_eq(s, key)) {
+            *found = 1;
+            return idx;
+        }
+    }
+    return -1;
+}
+
+i64 counter_get(Counter *c, char[:] key)
+{
+    int found = 0, idx = 0;
+
+    if (!c || !c->slots || !key.data || key.len <= 0 || key.len > 23)
+        return 0;
+    idx = counter_find(c, key, &found);
+    if (idx < 0 || !found)
+        return 0;
+    return c->slots[idx].count;
+}
+
+int counter_add(Counter *c, char[:] key, i64 delta)
+{
+    int found = 0, idx = 0;
+
+    if (!c || !c->slots || !key.data || key.len <= 0 || key.len > 23)
+        return -1;
+    idx = counter_find(c, key, &found);
+    if (idx < 0)
+        return -1;
+    if (!found) {
+        /* 装到 3/4 就不再插新键了（没有扩容能力） */
+        if ((c->used + 1) * 4 > c->cap * 3)
+            return -1;
+        memcpy(c->slots[idx].key, key.data, (size_t)key.len);
+        c->slots[idx].klen = key.len;
+        c->slots[idx].count = 0;
+        c->used++;
+    }
+    c->slots[idx].count += delta;
+    c->total += delta;
+    return (int)c->slots[idx].count;
+}
+
+int counter_keys(Counter *c)
+{
+    return c ? c->used : 0;
+}
+
+i64 counter_total(Counter *c)
+{
+    return c ? c->total : 0;
+}
+
+int counter_top(Counter *c, char *key, int cap, i64 *count)
+{
+    int i = 0, best = -1;
+
+    if (!c || !c->slots)
+        return 0;
+    for (i = 0; i < c->cap; i++) {
+        if (c->slots[i].klen == 0)
+            continue;
+        if (best < 0 || c->slots[i].count > c->slots[best].count)
+            best = i;
+    }
+    if (best < 0)
+        return 0;
+    if (key && cap > 0) {
+        int n = c->slots[best].klen;
+
+        if (n > cap - 1)
+            n = cap - 1;
+        memcpy(key, c->slots[best].key, (size_t)n);
+        key[n] = 0;
+    }
+    if (count)
+        *count = c->slots[best].count;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "counter：基本计数" {
+    CounterSlot slots[64] = { 0 };
+    Counter c = { 0 };
+    char top[32] = { 0 };
+    i64 n = 0;
+
+    if (counter_init(&c, slots, 64) != 1)
+        return err(1, "初始化失败");
+    if (counter_get(&c, S("GET")) != 0)
+        return err(2, "没见过的键应该是 0");
+    if (counter_add(&c, S("GET"), 1) != 1)
+        return err(3, "GET 第一次计数应该是 1");
+    counter_add(&c, S("GET"), 2);
+    if (counter_get(&c, S("GET")) != 3)
+        return err(4, "GET 应该累加到 3");
+    counter_add(&c, S("PUT"), 1);
+    if (counter_keys(&c) != 2)
+        return err(5, "不同键数应该是 2");
+    if (counter_total(&c) != 4)
+        return err(6, "总量应该是 4");
+    if (counter_top(&c, top, (int)sizeof top, &n) != 1 || n != 3
+        || strcmp(top, "GET") != 0)
+        return err(7, "出现最多的应该是 GET（3 次）");
+    counter_add(&c, S("GET"), -1);
+    if (counter_get(&c, S("GET")) != 2)
+        return err(8, "负增量应该扣减");
+    if (counter_clear(&c) != 1 || counter_keys(&c) != 0
+        || counter_total(&c) != 0)
+        return err(9, "清空后应该回到初始状态");
+    if (counter_init(&c, slots, 100) != -1)
+        return err(10, "容量不是 2 的幂应该 -1");
+}
+
+test "counter：装满、长键与冲突" {
+    CounterSlot slots[8] = { 0 };
+    Counter c = { 0 };
+    char longkey[40] = { 0 };
+    i64 n = 0;
+    int i = 0, rc = 0;
+
+    if (counter_init(&c, slots, 8) != 1)
+        return err(11, "初始化失败");
+    /* 8 个槽位，装到 6 个（3/4）后就不该再插新键 */
+    for (i = 0; i < 6; i++) {
+        char k[8] = { 0 };
+
+        k[0] = 'k';
+        k[1] = (char)('0' + i);
+        rc = counter_add(&c, (char[:]){ k, 2 }, 1);
+        if (rc != 1)
+            return err(12, "第 6 个键应该还能插入");
+    }
+    if (counter_add(&c, S("k9"), 1) != -1)
+        return err(13, "装到 3/4 后再插新键应该 -1");
+    /* 已有键仍然可以累加 */
+    if (counter_add(&c, S("k0"), 1) != 2)
+        return err(14, "已有键在满表时也应该能累加");
+    /* 超长键 */
+    memset(longkey, 'x', sizeof longkey);
+    if (counter_add(&c, (char[:]){ longkey, 30 }, 1) != -1)
+        return err(15, "超过 23 字节的键应该 -1");
+    if (counter_add(&c, S(""), 1) != -1)
+        return err(16, "空键应该 -1");
+    /* 大量短键：不同前缀不该互相覆盖 */
+    {
+        CounterSlot big[256] = { 0 };
+        Counter b = { 0 };
+
+        counter_init(&b, big, 256);
+        for (i = 0; i < 100; i++) {
+            char k[8] = { 0 };
+
+            k[0] = (char)('a' + i % 26);
+            k[1] = (char)('0' + i / 26);
+            counter_add(&b, (char[:]){ k, 2 }, (i64)(i + 1));
+        }
+        if (counter_keys(&b) != 100)
+            return err(17, "100 个不同键不该发生覆盖");
+        if (counter_top(&b, longkey, (int)sizeof longkey, &n) != 1)
+            return err(18, "应该能选出出现最多的键");
+    }
+}

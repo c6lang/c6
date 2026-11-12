@@ -1,0 +1,314 @@
+/* std/container/skiplist：数组实现的跳表（有序 map，i64 键与值）。
+ *
+ *     import std.container.skiplist;
+ *
+ *     SkipNode nodes[64] = { 0 };
+ *     SkipList sl = { 0 };
+ *     i64 old = 0;
+ *     skip_init(&sl, nodes, 64);
+ *     skip_put(&sl, 10, 100, &old);
+ *     skip_get(&sl, 10, &v);
+ *
+ * 节点是数组下标，`next[k]` 是第 k 层的后继下标（-1 表示该层到头）。`nodes[0]`
+ * 是**头哨兵**，它的 `key` 不参与比较；其余节点按 `key` 升序在各层串起来。层数
+ * 随机（几何分布，最高 8 层），由 `SkipList.seed` 的 xorshift 决定。
+ *
+ * 约定：
+ *
+ * - 存储由调用方给（`nodes` 至少 `cap` 个，含头哨兵），本模块不分配；
+ * - `skip_put` 返回 1 插入 / 0 更新（`*old` 给旧值）/ -1 没有空间；
+ * - `skip_get` 返回 1 找到 / 0 没有；
+ * - `skip_del` 返回 1 删掉 / 0 没有；
+ * - `skip_first`/`skip_next` 支持从小到大遍历（`skip_next` 给**严格大于** `key`
+ *   的下一个）；
+ * - `skip_at` 取有序第 idx 个（0 起），实现是「从第 0 层往后走」，最坏 O(n)；
+ * - 键唯一：重复 `skip_put` 是更新值，不新增节点。
+ */
+#include <string.h>
+
+module std.container.skiplist;
+import std.core.types;
+
+#define SKIP_LEVELS 8
+
+struct SkipNode {
+    i64 key;
+    i64 val;
+    int next[SKIP_LEVELS];
+};
+
+struct SkipList {
+    SkipNode *nodes;
+    int cap;
+    int used;
+    int n;
+    int head;
+    int levels;
+    u32 seed;
+};
+
+static u32 skip_rand(SkipList *sl)
+{
+    u32 x = sl->seed;
+
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    sl->seed = x;
+    return x;
+}
+
+static int skip_rand_level(SkipList *sl)
+{
+    int level = 1;
+
+    while (level < SKIP_LEVELS && (skip_rand(sl) & 3u) == 0)
+        level++;
+    return level;
+}
+
+int skip_init(SkipList *sl, SkipNode *nodes, int cap)
+{
+    int i = 0;
+
+    if (!sl || !nodes || cap < 2)
+        return -1;
+    memset(nodes, 0, sizeof(SkipNode) * (size_t)cap);
+    for (i = 0; i < SKIP_LEVELS; i++)
+        nodes[0].next[i] = -1;
+    nodes[0].key = 0;
+    nodes[0].val = 0;
+    sl->nodes = nodes;
+    sl->cap = cap;
+    sl->used = 1;                       /* 0 号是头哨兵 */
+    sl->n = 0;
+    sl->head = 0;
+    sl->levels = 1;
+    sl->seed = 0x1234567u;
+    return 1;
+}
+
+int skip_size(SkipList *sl)
+{
+    return sl ? sl->n : 0;
+}
+
+/* 找到每层最后一个 key < target 的节点 */
+static void skip_find_preds(SkipList *sl, i64 key, int *preds)
+{
+    int i = 0;
+    int cur = sl->head;
+
+    for (i = SKIP_LEVELS - 1; i >= 0; i--) {
+        while (sl->nodes[cur].next[i] >= 0
+               && sl->nodes[sl->nodes[cur].next[i]].key < key)
+            cur = sl->nodes[cur].next[i];
+        preds[i] = cur;
+    }
+}
+
+int skip_put(SkipList *sl, i64 key, i64 val, i64 *old)
+{
+    int preds[SKIP_LEVELS] = { 0 };
+    int cur = 0, level = 0, idx = 0, i = 0;
+
+    if (!sl || !sl->nodes)
+        return -1;
+    skip_find_preds(sl, key, preds);
+    cur = sl->nodes[preds[0]].next[0];
+    if (cur >= 0 && sl->nodes[cur].key == key) {
+        if (old)
+            *old = sl->nodes[cur].val;
+        sl->nodes[cur].val = val;
+        return 0;
+    }
+    if (sl->used >= sl->cap)
+        return -1;
+    idx = sl->used++;
+    sl->nodes[idx].key = key;
+    sl->nodes[idx].val = val;
+    for (i = 0; i < SKIP_LEVELS; i++)
+        sl->nodes[idx].next[i] = -1;
+    level = skip_rand_level(sl);
+    if (level > sl->levels)
+        sl->levels = level;
+    for (i = 0; i < level; i++) {
+        sl->nodes[idx].next[i] = sl->nodes[preds[i]].next[i];
+        sl->nodes[preds[i]].next[i] = idx;
+    }
+    sl->n++;
+    if (old)
+        *old = 0;
+    return 1;
+}
+
+int skip_get(SkipList *sl, i64 key, i64 *out)
+{
+    int preds[SKIP_LEVELS] = { 0 };
+    int cur = 0;
+
+    if (!sl || !sl->nodes)
+        return 0;
+    skip_find_preds(sl, key, preds);
+    cur = sl->nodes[preds[0]].next[0];
+    if (cur >= 0 && sl->nodes[cur].key == key) {
+        if (out)
+            *out = sl->nodes[cur].val;
+        return 1;
+    }
+    return 0;
+}
+
+int skip_del(SkipList *sl, i64 key)
+{
+    int preds[SKIP_LEVELS] = { 0 };
+    int cur = 0, i = 0;
+
+    if (!sl || !sl->nodes)
+        return 0;
+    skip_find_preds(sl, key, preds);
+    cur = sl->nodes[preds[0]].next[0];
+    if (cur < 0 || sl->nodes[cur].key != key)
+        return 0;
+    for (i = 0; i < SKIP_LEVELS; i++) {
+        if (sl->nodes[preds[i]].next[i] == cur)
+            sl->nodes[preds[i]].next[i] = sl->nodes[cur].next[i];
+    }
+    sl->n--;
+    return 1;
+}
+
+int skip_first(SkipList *sl, i64 *key, i64 *val)
+{
+    int cur = 0;
+
+    if (!sl || !sl->nodes)
+        return 0;
+    cur = sl->nodes[sl->head].next[0];
+    if (cur < 0)
+        return 0;
+    if (key)
+        *key = sl->nodes[cur].key;
+    if (val)
+        *val = sl->nodes[cur].val;
+    return 1;
+}
+
+int skip_next(SkipList *sl, i64 key, i64 *out_key, i64 *out_val)
+{
+    int preds[SKIP_LEVELS] = { 0 };
+    int cur = 0;
+
+    if (!sl || !sl->nodes)
+        return 0;
+    skip_find_preds(sl, key + 1, preds);
+    cur = sl->nodes[preds[0]].next[0];
+    if (cur < 0)
+        return 0;
+    if (out_key)
+        *out_key = sl->nodes[cur].key;
+    if (out_val)
+        *out_val = sl->nodes[cur].val;
+    return 1;
+}
+
+int skip_at(SkipList *sl, int idx, i64 *key, i64 *val)
+{
+    int cur = 0, k = 0;
+
+    if (!sl || !sl->nodes || idx < 0 || idx >= sl->n)
+        return 0;
+    cur = sl->nodes[sl->head].next[0];
+    for (k = 0; k < idx && cur >= 0; k++)
+        cur = sl->nodes[cur].next[0];
+    if (cur < 0)
+        return 0;
+    if (key)
+        *key = sl->nodes[cur].key;
+    if (val)
+        *val = sl->nodes[cur].val;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "skiplist：插入、查询与删除" {
+    SkipNode nodes[32] = { 0 };
+    SkipList sl = { 0 };
+    i64 old = 0, v = 0;
+
+    if (skip_init(&sl, nodes, 32) != 1)
+        return err(1, "初始化失败");
+    if (skip_put(&sl, 10, 100, &old) != 1)
+        return err(2, "插入 10 失败");
+    if (skip_put(&sl, 5, 50, &old) != 1 || skip_put(&sl, 20, 200, &old) != 1)
+        return err(3, "插入失败");
+    if (skip_put(&sl, 10, 111, &old) != 0 || old != 100)
+        return err(4, "更新已有键应该返回 0");
+    if (skip_size(&sl) != 3)
+        return err(5, "元素数不对");
+    if (skip_get(&sl, 10, &v) != 1 || v != 111)
+        return err(6, "取 10 不对");
+    if (skip_get(&sl, 7, &v) != 0)
+        return err(7, "不存在的键应该 0");
+    if (skip_del(&sl, 5) != 1 || skip_get(&sl, 5, &v) != 0)
+        return err(8, "删除 5 不对");
+    if (skip_del(&sl, 5) != 0)
+        return err(9, "重复删除应该 0");
+    if (skip_size(&sl) != 2)
+        return err(10, "删除后元素数不对");
+    if (skip_put(&sl, -3, 1, &old) != 1 || skip_get(&sl, -3, &v) != 1)
+        return err(11, "负键应该也能插");
+}
+
+test "skiplist：有序遍历" {
+    SkipNode nodes[64] = { 0 };
+    SkipList sl = { 0 };
+    i64 key = 0, val = 0, old = 0;
+    int i = 0, count = 0;
+    i64 prev = 0;
+
+    if (skip_init(&sl, nodes, 64) != 1)
+        return err(12, "初始化失败");
+    /* 乱序插入 30 个键 */
+    for (i = 0; i < 30; i++)
+        skip_put(&sl, (i64)((i * 17) % 30), (i64)i, &old);
+    if (skip_size(&sl) != 30)
+        return err(13, "30 个键的元素数不对");
+    if (skip_first(&sl, &key, &val) != 1 || key != 0)
+        return err(14, "第一个键应该是 0");
+    count = 0;
+    prev = -1;
+    while (skip_first(&sl, &key, &val) == 1 && count == 0) {
+        count++;
+        prev = key;
+    }
+    count = 0;
+    {
+        i64 cur = 0;
+        int have = skip_first(&sl, &cur, &val);
+
+        while (have) {
+            if (count > 0 && cur <= prev)
+                return err(15, "遍历应该严格递增");
+            prev = cur;
+            count++;
+            have = skip_next(&sl, cur, &cur, &val);
+        }
+    }
+    if (count != 30)
+        return err(16, "遍历到的元素数不对");
+    if (skip_at(&sl, 0, &key, &val) != 1 || key != 0)
+        return err(17, "第 0 个应该是 0");
+    if (skip_at(&sl, 29, &key, &val) != 1 || key != 29)
+        return err(18, "第 29 个应该是 29");
+    if (skip_at(&sl, 30, &key, &val) != 0)
+        return err(19, "越界应该 0");
+    /* 删掉一半再遍历 */
+    for (i = 0; i < 30; i += 2)
+        skip_del(&sl, (i64)i);
+    if (skip_size(&sl) != 15)
+        return err(20, "删掉 15 个后元素数不对");
+    if (skip_at(&sl, 0, &key, &val) != 1 || key != 1)
+        return err(21, "删除后第 0 个应该是 1");
+}

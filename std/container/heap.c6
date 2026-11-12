@@ -1,0 +1,254 @@
+/* std/container/heap：数组二叉堆（最小堆 / 最大堆，i64 键）。
+ *
+ *     import std.container.heap;
+ *
+ *     i64 buf[64] = { 0 };
+ *     Heap h = { 0 };
+ *     i64 v = 0;
+ *     heap_init(&h, buf, 64, 0);       // 0 = 最小堆
+ *     heap_push(&h, 5);
+ *     heap_pop(&h, &v);                // 拿到最小值
+ *
+ * 存储就是调用方给的 `i64` 数组，堆序按完全二叉树的下标关系维护：
+ * 父 `(i-1)/2`、左子 `2i+1`、右子 `2i+2`。
+ *
+ * 约定：
+ *
+ * - `is_max` 为 0 是最小堆、非 0 是最大堆；
+ * - `heap_push` 返回新元素个数，满了返回 -1；
+ * - `heap_pop` 取堆顶并下沉调整，空堆返回 0；
+ * - `heap_peek` 只看堆顶不移除；
+ * - `heap_build` 把已有数组**原地**堆化（O(n)），返回元素个数，`is_max` 与
+ *   当前堆不同则重新建堆；
+ * - `heap_pushpop` 是「弹出堆顶再压入一个」的单次 O(log n) 操作（常用于 top-k）；
+ * - `heap_sort` 把缓冲区原地排成升序（最小堆）或降序（最大堆）。
+ */
+#include <string.h>
+
+module std.container.heap;
+import std.core.types;
+
+struct Heap {
+    i64 *keys;
+    int cap;
+    int n;
+    int is_max;
+};
+
+static int heap_better(Heap *h, i64 a, i64 b)
+{
+    return h->is_max ? a > b : a < b;
+}
+
+int heap_init(Heap *h, i64 *buf, int cap, int is_max)
+{
+    if (!h || !buf || cap <= 0)
+        return -1;
+    memset(buf, 0, sizeof(i64) * (size_t)cap);
+    h->keys = buf;
+    h->cap = cap;
+    h->n = 0;
+    h->is_max = is_max ? 1 : 0;
+    return 1;
+}
+
+int heap_size(Heap *h)
+{
+    return h ? h->n : 0;
+}
+
+static void heap_up(Heap *h, int i)
+{
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+
+        if (!heap_better(h, h->keys[i], h->keys[parent]))
+            break;
+        {
+            i64 t = h->keys[i];
+
+            h->keys[i] = h->keys[parent];
+            h->keys[parent] = t;
+        }
+        i = parent;
+    }
+}
+
+static void heap_down(Heap *h, int i)
+{
+    for (;;) {
+        int l = i * 2 + 1, r = i * 2 + 2, best = i;
+
+        if (l < h->n && heap_better(h, h->keys[l], h->keys[best]))
+            best = l;
+        if (r < h->n && heap_better(h, h->keys[r], h->keys[best]))
+            best = r;
+        if (best == i)
+            return;
+        {
+            i64 t = h->keys[i];
+
+            h->keys[i] = h->keys[best];
+            h->keys[best] = t;
+        }
+        i = best;
+    }
+}
+
+int heap_push(Heap *h, i64 v)
+{
+    if (!h || !h->keys || h->n >= h->cap)
+        return -1;
+    h->keys[h->n] = v;
+    heap_up(h, h->n);
+    h->n++;
+    return h->n;
+}
+
+int heap_pop(Heap *h, i64 *out)
+{
+    if (!h || !h->keys || h->n <= 0)
+        return 0;
+    if (out)
+        *out = h->keys[0];
+    h->n--;
+    if (h->n > 0) {
+        h->keys[0] = h->keys[h->n];
+        heap_down(h, 0);
+    }
+    return 1;
+}
+
+int heap_peek(Heap *h, i64 *out)
+{
+    if (!h || !h->keys || h->n <= 0)
+        return 0;
+    if (out)
+        *out = h->keys[0];
+    return 1;
+}
+
+int heap_build(Heap *h, i64 *buf, int n, int is_max)
+{
+    int i = 0;
+
+    if (!h || !buf || n < 0)
+        return -1;
+    h->keys = buf;
+    h->cap = n;
+    h->n = n;
+    h->is_max = is_max ? 1 : 0;
+    for (i = n / 2 - 1; i >= 0; i--)
+        heap_down(h, i);
+    return n;
+}
+
+int heap_pushpop(Heap *h, i64 v, i64 *out)
+{
+    if (!h || !h->keys || h->n <= 0)
+        return 0;
+    if (heap_better(h, v, h->keys[0])) {
+        if (out)
+            *out = v;                   /* v 比堆顶更优先，压入后立刻被弹出 */
+        return 1;
+    }
+    if (out)
+        *out = h->keys[0];
+    h->keys[0] = v;
+    heap_down(h, 0);
+    return 1;
+}
+
+int heap_sort(Heap *h)
+{
+    int saved = 0;
+
+    if (!h || !h->keys)
+        return -1;
+    saved = h->n;
+    while (h->n > 0) {
+        i64 t = h->keys[0];
+
+        h->keys[0] = h->keys[h->n - 1];
+        h->keys[h->n - 1] = t;
+        h->n--;
+        heap_down(h, 0);
+    }
+    h->n = saved;
+    return saved;
+}
+
+/* ---- 自测 ---- */
+
+test "heap：最小堆" {
+    i64 buf[16] = { 0 };
+    Heap h = { 0 };
+    i64 v = 0;
+    static const i64 vals[7] = { 5, 3, 8, 1, 9, 2, 7 };
+    int i = 0;
+
+    if (heap_init(&h, buf, 16, 0) != 1)
+        return err(1, "初始化失败");
+    for (i = 0; i < 7; i++)
+        heap_push(&h, vals[i]);
+    if (heap_size(&h) != 7)
+        return err(2, "元素数不对");
+    if (heap_peek(&h, &v) != 1 || v != 1)
+        return err(3, "最小堆堆顶应该是 1");
+    if (heap_pop(&h, &v) != 1 || v != 1)
+        return err(4, "弹出最小值不对");
+    if (heap_pop(&h, &v) != 1 || v != 2)
+        return err(5, "第二个最小值应该是 2");
+    if (heap_push(&h, 0) != 6)
+        return err(6, "压入后元素数不对");
+    if (heap_peek(&h, &v) != 1 || v != 0)
+        return err(7, "新压入的 0 应该在堆顶");
+    /* 依次弹出应当是升序 */
+    {
+        i64 prev = -1;
+
+        while (heap_pop(&h, &v) == 1) {
+            if (v < prev)
+                return err(8, "弹出顺序应该非递减");
+            prev = v;
+        }
+    }
+    if (heap_pop(&h, &v) != 0)
+        return err(9, "空堆弹出应该 0");
+}
+
+test "heap：最大堆、堆化与排序" {
+    i64 buf[16] = { 0 };
+    Heap h = { 0 };
+    i64 v = 0;
+    static const i64 vals[8] = { 4, 9, 2, 7, 5, 1, 8, 3 };
+    int i = 0;
+
+    if (heap_init(&h, buf, 16, 1) != 1)
+        return err(10, "初始化失败");
+    for (i = 0; i < 8; i++)
+        heap_push(&h, vals[i]);
+    if (heap_peek(&h, &v) != 1 || v != 9)
+        return err(11, "最大堆堆顶应该是 9");
+    if (heap_pushpop(&h, 100, &v) != 1 || v != 100)
+        return err(12, "pushpop 应该返回较大的 100");
+    if (heap_peek(&h, &v) != 1 || v != 9)
+        return err(13, "pushpop 之后堆顶应该还是 9");
+    if (heap_pushpop(&h, 0, &v) != 1 || v != 9)
+        return err(14, "pushpop 小的值应该返回原堆顶");
+    /* 原地堆化 */
+    {
+        i64 raw[6] = { 3, 1, 4, 1, 5, 9 };
+
+        if (heap_build(&h, raw, 6, 0) != 6)
+            return err(15, "堆化失败");
+        if (heap_peek(&h, &v) != 1 || v != 1)
+            return err(16, "堆化后堆顶应该是 1");
+        if (heap_sort(&h) != 6)
+            return err(17, "排序失败");
+        if (raw[0] != 9 || raw[5] != 1)
+            return err(18, "最小堆排序应该得到降序");
+    }
+    if (heap_push(&h, 0) != -1)
+        return err(19, "容量已满应该 -1");
+}

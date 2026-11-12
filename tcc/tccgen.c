@@ -12922,6 +12922,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.adler32",   C6_ERR_SLOT_STD + 214 },
     { "std.encoding.murmur3",   C6_ERR_SLOT_STD + 215 },
     { "std.encoding.siphash",   C6_ERR_SLOT_STD + 216 },
+    { "std.container.treap",    C6_ERR_SLOT_STD + 217 },
+    { "std.container.heap",     C6_ERR_SLOT_STD + 218 },
+    { "std.container.skiplist", C6_ERR_SLOT_STD + 219 },
+    { "std.container.counter",  C6_ERR_SLOT_STD + 220 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

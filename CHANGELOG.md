@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第五十二批（有序容器）**：`std.container.treap`（随机化 BST + 排名/第 k
+  小）、`std.container.heap`（二叉堆，含 pushpop 与原地堆化）、
+  `std.container.skiplist`（8 层跳表 + 有序遍历）、`std.container.counter`（字符串
+  频次计数），集成示例 `examples/stdordered.c6`（`make std-ordered`）。错误号段
+  `std.container.treap`=0x60d9 … `std.container.counter`=0x60dc
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十一批（非加密散列补齐）**：`std.encoding.fnv`（FNV-1/1a 32/64 位 +
   流式）、`std.encoding.adler32`（流式 + 合并）、`std.encoding.murmur3`
   （32 位与 x64 128 位）、`std.encoding.siphash`（2-4 / 1-3，带官方向量），集成

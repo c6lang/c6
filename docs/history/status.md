@@ -1828,6 +1828,32 @@ MySQL 的前端报文。数据库这三个都只做**报文/页结构**，不连
 验收：`make stdtest`（217 个模块、0 failure）、`make std-hash2`（20 条自检全过）、
 `make check-all`。
 
+### 11.64 标准库第五十二批（treap / heap / skiplist / counter）
+
+第五十二批补「有序容器」：Treap、二叉堆、跳表、频次计数器。四个都是调用方给数组、
+模块只管算法的形态，与前面 fenwick/segtree/dsu 一致。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.container.treap` | 随机化 BST | 用 `split`/`merge` 实现插入删除；`size` 字段顺带支持 `rank`（严格小于）与 `kth`（第 k 小）；节点槽位**不回收**（`used` 与 `n` 分开），否则删掉的槽位会被新节点复用、把老树指针踩坏 |
+| `std.container.heap` | 二叉堆 | 最小/最大共用一套 `heap_better`；`heap_build` 从 `n/2-1` 往下沉是 O(n)；`heap_pushpop` 的语义是「压入后立刻弹出」，所以 `v` 更优先时返回 `v` 自己、堆不变 |
+| `std.container.skiplist` | 跳表 | `nodes[0]` 是头哨兵；每层找前驱后统一改链；层数按 `(rand & 3) == 0` 几何增长、上限 8 层；`skip_next` 用「key+1 的前驱」实现严格大于 |
+| `std.container.counter` | 频次计数 | 键定长 23 字节（拷贝进槽位，没有生命周期问题）；开放寻址 + 线性探测，装到 3/4 返回满；`counter_top` 是线性扫一遍（没有维护堆，够用且简单） |
+
+Treap 那个「槽位不回收」的坑值得记：一开始用 `t->n--` 同时表示「元素数减少」，结果
+新插入会覆盖 `nodes[n]`——而那个节点可能还挂在树上，`rank`/`kth` 立刻算错。把
+「分配游标 `used`」和「元素数 `n`」拆成两个字段就解决了。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.container.treap`=0x60d9、
+`std.container.heap`=0x60da、`std.container.skiplist`=0x60db、`std.container.counter`=0x60dc；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-ordered` 与 `STD_ORDERED_SRCS`，
+`test-all`/`check-all` 都带上它；`counter` 依赖 `std/text/str.c6`（24 条用例），其余
+三个无依赖（各 2 条）。示例 `examples/stdordered.c6` 四节（26 条自检）。
+
+验收：`make stdtest`（221 个模块、0 failure）、`make std-ordered`（26 条自检全过）、
+`make check-all`。
+
+
 
 
 

@@ -1,0 +1,346 @@
+/* std/container/treap：用数组实现的 Treap（随机化 BST），带「第 k 小」与「排名」。
+ *
+ *     import std.container.treap;
+ *
+ *     TreapNode nodes[64] = { 0 };
+ *     Treap t = { 0 };
+ *     i64 old = 0;
+ *     treap_init(&t, nodes, 64);
+ *     treap_put(&t, 42, 100, &old);       // 键 42、值 100
+ *     treap_rank(&t, 42);                 // 比 42 小的键有几个
+ *     treap_kth(&t, 0, &key);             // 第 0 小的键
+ *
+ * 节点是**数组下标**而不是指针：`left`/`right` 是下标，`-1` 表示空。优先级由
+ * 一个 xorshift 随机数发生器给（同一个 `Treap.seed` 决定整棵树的形状，换 seed
+ * 就是另一棵等价的树）。
+ *
+ * 约定：
+ *
+ * - 存储由调用方给（`nodes` 至少 `cap` 个），本模块不分配；`cap` 用完时
+ *   `treap_put` 返回 -1；
+ * - `treap_put` 返回 1 表示新插入、0 表示更新了已有键、-1 表示没有空间；
+ * - `treap_get` 返回 1 找到 / 0 没有；
+ * - `treap_rank(t, key)` 是「严格小于 key 的键数」（0 起）；
+ * - `treap_kth(t, k, &key)` 取第 k 小的键（0 起），越界返回 0；
+ * - `treap_del` 返回 1 删掉 / 0 没有这个键；
+ * - 所有递归都以「期望 O(log n)」的树高为前提，故意用递增键插入也不会退化
+ *   （优先级是随机的）。
+ */
+#include <string.h>
+
+module std.container.treap;
+import std.core.types;
+
+struct TreapNode {
+    i64 key;
+    i64 val;
+    int left;
+    int right;
+    int size;
+    u32 prio;
+};
+
+struct Treap {
+    TreapNode *nodes;
+    int cap;
+    int used;           /* 已分配过的槽位数（不回收） */
+    int n;              /* 当前元素个数 */
+    int root;
+    u32 seed;
+};
+
+static u32 treap_rand(Treap *t)
+{
+    u32 x = t->seed;
+
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    t->seed = x;
+    return x;
+}
+
+static int treap_new(Treap *t, i64 key, i64 val)
+{
+    TreapNode *nd = 0;
+    int idx = 0;
+
+    if (t->used >= t->cap)
+        return -1;
+    idx = t->used++;
+    nd = &t->nodes[idx];
+    nd->key = key;
+    nd->val = val;
+    nd->left = -1;
+    nd->right = -1;
+    nd->size = 1;
+    nd->prio = treap_rand(t);
+    return idx;
+}
+
+static int treap_size_of(Treap *t, int idx)
+{
+    return idx < 0 ? 0 : t->nodes[idx].size;
+}
+
+static void treap_fix(Treap *t, int idx)
+{
+    if (idx < 0)
+        return;
+    t->nodes[idx].size = 1 + treap_size_of(t, t->nodes[idx].left)
+                         + treap_size_of(t, t->nodes[idx].right);
+}
+
+/* 把子树 idx 按 key 分成两半：返回 (<=key, >key) */
+static void treap_split(Treap *t, int idx, i64 key, int *a, int *b)
+{
+    if (idx < 0) {
+        *a = -1;
+        *b = -1;
+        return;
+    }
+    if (t->nodes[idx].key <= key) {
+        int l = 0, r = 0;
+
+        treap_split(t, t->nodes[idx].right, key, &l, &r);
+        t->nodes[idx].right = l;
+        treap_fix(t, idx);
+        *a = idx;
+        *b = r;
+    } else {
+        int l = 0, r = 0;
+
+        treap_split(t, t->nodes[idx].left, key, &l, &r);
+        t->nodes[idx].left = r;
+        treap_fix(t, idx);
+        *a = l;
+        *b = idx;
+    }
+}
+
+/* 把两棵子树按优先级合并（a 的键都小于 b） */
+static int treap_merge(Treap *t, int a, int b)
+{
+    if (a < 0)
+        return b;
+    if (b < 0)
+        return a;
+    if (t->nodes[a].prio > t->nodes[b].prio) {
+        t->nodes[a].right = treap_merge(t, t->nodes[a].right, b);
+        treap_fix(t, a);
+        return a;
+    }
+    t->nodes[b].left = treap_merge(t, a, t->nodes[b].left);
+    treap_fix(t, b);
+    return b;
+}
+
+int treap_init(Treap *t, TreapNode *nodes, int cap)
+{
+    if (!t || !nodes || cap <= 0)
+        return -1;
+    memset(nodes, 0, sizeof(TreapNode) * (size_t)cap);
+    t->nodes = nodes;
+    t->cap = cap;
+    t->used = 0;
+    t->n = 0;
+    t->root = -1;
+    t->seed = 0x9E3779B9u;
+    return 1;
+}
+
+int treap_size(Treap *t)
+{
+    return t ? t->n : 0;
+}
+
+int treap_put(Treap *t, i64 key, i64 val, i64 *old)
+{
+    int cur = 0;
+
+    if (!t || !t->nodes)
+        return -1;
+    /* 先找：已存在就只改值 */
+    cur = t->root;
+    while (cur >= 0) {
+        if (t->nodes[cur].key == key) {
+            if (old)
+                *old = t->nodes[cur].val;
+            t->nodes[cur].val = val;
+            return 0;
+        }
+        cur = key < t->nodes[cur].key ? t->nodes[cur].left
+                                      : t->nodes[cur].right;
+    }
+    {
+        int idx = treap_new(t, key, val);
+        int a = 0, b = 0;
+
+        if (idx < 0)
+            return -1;
+        /* 新节点单独成树，与现有树合并（键唯一，不会重复） */
+        treap_split(t, t->root, key, &a, &b);
+        t->root = treap_merge(t, treap_merge(t, a, idx), b);
+        t->n++;
+        if (old)
+            *old = 0;
+        return 1;
+    }
+}
+
+int treap_get(Treap *t, i64 key, i64 *out)
+{
+    int cur = 0;
+
+    if (!t || !t->nodes)
+        return 0;
+    cur = t->root;
+    while (cur >= 0) {
+        if (t->nodes[cur].key == key) {
+            if (out)
+                *out = t->nodes[cur].val;
+            return 1;
+        }
+        cur = key < t->nodes[cur].key ? t->nodes[cur].left
+                                      : t->nodes[cur].right;
+    }
+    return 0;
+}
+
+int treap_del(Treap *t, i64 key)
+{
+    int a = 0, b = 0, c = 0, mid = 0;
+
+    if (!t || !t->nodes || t->root < 0)
+        return 0;
+    /* 找到该键：先按 key 切，再按 key-1 切（键是整数，偏移一格即可） */
+    treap_split(t, t->root, key - 1, &a, &mid);
+    treap_split(t, mid, key, &mid, &b);
+    if (mid < 0) {
+        t->root = treap_merge(t, a, b);
+        return 0;
+    }
+    (void)c;
+    t->root = treap_merge(t, a, b);
+    t->n--;                             /* 元素数减少（数组槽位不复用） */
+    return 1;
+}
+
+int treap_rank(Treap *t, i64 key)
+{
+    int cur = 0, rank = 0;
+
+    if (!t || !t->nodes)
+        return 0;
+    cur = t->root;
+    while (cur >= 0) {
+        if (t->nodes[cur].key < key) {
+            rank += treap_size_of(t, t->nodes[cur].left) + 1;
+            cur = t->nodes[cur].right;
+        } else {
+            cur = t->nodes[cur].left;
+        }
+    }
+    return rank;
+}
+
+int treap_kth(Treap *t, int k, i64 *key)
+{
+    int cur = 0;
+
+    if (!t || !t->nodes || k < 0 || k >= t->n)
+        return 0;
+    cur = t->root;
+    while (cur >= 0) {
+        int left = treap_size_of(t, t->nodes[cur].left);
+
+        if (k < left) {
+            cur = t->nodes[cur].left;
+        } else if (k == left) {
+            if (key)
+                *key = t->nodes[cur].key;
+            return 1;
+        } else {
+            k -= left + 1;
+            cur = t->nodes[cur].right;
+        }
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+test "treap：插入与查询" {
+    TreapNode nodes[32] = { 0 };
+    Treap t = { 0 };
+    i64 old = 0, v = 0;
+
+    if (treap_init(&t, nodes, 32) != 1)
+        return err(1, "初始化失败");
+    if (treap_put(&t, 5, 50, &old) != 1)
+        return err(2, "插入 5 失败");
+    if (treap_put(&t, 3, 30, &old) != 1 || treap_put(&t, 8, 80, &old) != 1)
+        return err(3, "插入失败");
+    if (treap_put(&t, 5, 55, &old) != 0 || old != 50)
+        return err(4, "更新已有键应该返回 0 并给出旧值");
+    if (treap_get(&t, 5, &v) != 1 || v != 55)
+        return err(5, "取 5 的值不对");
+    if (treap_get(&t, 7, &v) != 0)
+        return err(6, "不存在的键应该 0");
+    if (treap_size(&t) != 3)
+        return err(7, "元素数不对");
+    if (treap_del(&t, 3) != 1 || treap_get(&t, 3, &v) != 0)
+        return err(8, "删除 3 不对");
+    if (treap_del(&t, 3) != 0)
+        return err(9, "重复删除应该 0");
+    if (treap_size(&t) != 2)
+        return err(10, "删除后元素数不对");
+}
+
+test "treap：排名与第 k 小" {
+    TreapNode nodes[64] = { 0 };
+    Treap t = { 0 };
+    i64 key = 0, old = 0;
+    int i = 0;
+
+    if (treap_init(&t, nodes, 64) != 1)
+        return err(11, "初始化失败");
+    /* 故意按递增顺序插入，验证随机优先级不会退化 */
+    for (i = 0; i < 40; i++)
+        treap_put(&t, (i64)i * 2, (i64)i, &old);
+    if (treap_size(&t) != 40)
+        return err(12, "插入 40 个后元素数不对");
+    if (treap_rank(&t, 0) != 0)
+        return err(13, "比 0 小的键个数应该是 0");
+    if (treap_rank(&t, 10) != 5)
+        return err(14, "比 10 小的键应该是 0,2,4,6,8 共 5 个");
+    if (treap_rank(&t, 1000) != 40)
+        return err(15, "比最大值还大时排名应该等于元素数");
+    if (treap_kth(&t, 0, &key) != 1 || key != 0)
+        return err(16, "第 0 小应该是 0");
+    if (treap_kth(&t, 5, &key) != 1 || key != 10)
+        return err(17, "第 5 小应该是 10");
+    if (treap_kth(&t, 39, &key) != 1 || key != 78)
+        return err(18, "第 39 小应该是 78");
+    if (treap_kth(&t, 40, &key) != 0)
+        return err(19, "越界应该 0");
+    /* 删掉中间一些再查 */
+    treap_del(&t, 10);
+    if (treap_size(&t) != 39 || treap_rank(&t, 10) != 5)
+        return err(20, "删除 10 后的排名应该是 5");
+    if (treap_kth(&t, 5, &key) != 1 || key != 12)
+        return err(21, "删除后第 5 小应该是 12");
+    /* 容量用尽 */
+    {
+        TreapNode small[4] = { 0 };
+        Treap s = { 0 };
+        int k = 0, rc = 0;
+
+        treap_init(&s, small, 4);
+        for (k = 0; k < 4; k++)
+            treap_put(&s, (i64)k, 0, &old);
+        rc = treap_put(&s, 99, 0, &old);
+        if (rc != -1)
+            return err(22, "容量用尽应该 -1");
+    }
+}

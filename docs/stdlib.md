@@ -249,6 +249,10 @@
 | `std/encoding/adler32.c6` | `std.encoding.adler32` | Adler-32：`adler32`（初值 1）、`adler32_update` 流式、`adler32_combine` 把两段相邻数据的校验和合成一段（`len2` 是第二段长度），内部每 5552 字节取模 |
 | `std/encoding/murmur3.c6` | `std.encoding.murmur3` | MurmurHash3：`murmur3_32(data, seed)`（x86 32 位，尾部按 3/2/1 字节 + `fmix32`）与 `murmur3_128(data, seed, &h1, &h2)`（x64 128 位，两个状态 + 两次 `fmix64`），`murmur3_32_str` 是 `seed=0` 的别名 |
 | `std/encoding/siphash.c6` | `std.encoding.siphash` | SipHash：`siphash24`/`siphash13` 一次性（16 字节密钥）、`SipHash` 流式状态（`siphash_init`/`siphash_update`/`siphash_final`，`rounds` 取 1/2）、`siphash_verify` 做定时安全比较；含官方测试向量 |
+| `std/container/treap.c6` | `std.container.treap` | 数组实现的 Treap（随机化 BST map）：`treap_put` 插入/更新、`treap_get`、`treap_del`、`treap_rank`（严格小于的键数）、`treap_kth`（第 k 小）、`treap_size`；节点用下标链接，优先级来自 xorshift |
+| `std/container/heap.c6` | `std.container.heap` | 数组二叉堆（i64）：`heap_init`（最小/最大）、`heap_push`/`heap_pop`/`heap_peek`、`heap_build` 原地 O(n) 堆化、`heap_pushpop`（top-k 常用）、`heap_sort` 原地排序 |
+| `std/container/skiplist.c6` | `std.container.skiplist` | 数组跳表（有序 map，8 层）：`skip_put`/`skip_get`/`skip_del`、`skip_first`/`skip_next` 升序遍历、`skip_at` 取第 idx 个；`nodes[0]` 是头哨兵，层数按几何分布随机 |
+| `std/container/counter.c6` | `std.container.counter` | 字符串频次计数器（开放寻址 + 线性探测）：`counter_add`（可负增量）、`counter_get`、`counter_top`（出现最多的键）、`counter_keys`/`counter_total`/`counter_clear`；键定长 23 字节，装到 3/4 返回满 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -343,6 +347,7 @@
 | `examples/stdpacket.c6` | （无模块） | 第四十九批（网络报文）的拼装示例（`make std-packet`）：NTP 时间戳与偏移、syslog 两种 RFC、STUN 属性与 XOR 地址、TFTP 四种报文 |
 | `examples/stddb.c6` | （无模块） | 第五十批（日志与数据库）的拼装示例（`make std-db`）：环形日志过滤与 dump、SQLite 文件头/页/单元、PostgreSQL 报文与启动包、MySQL 握手与 COM_QUERY |
 | `examples/stdhash2.c6` | （无模块） | 第五十一批（非加密散列补齐）的拼装示例（`make std-hash2`）：FNV（一次性 + 流式）、Adler-32（合并）、MurmurHash3 32/128、SipHash 2-4/1-3 |
+| `examples/stdordered.c6` | （无模块） | 第五十二批（有序容器）的拼装示例（`make std-ordered`）：Treap 排名/第 k 小、堆 top-k 与排序、跳表有序遍历、频次计数器 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -441,6 +446,10 @@ std/encoding/fnv.c6        24 test(s), 0 failure(s)
 std/encoding/adler32.c6    24 test(s), 0 failure(s)
 std/encoding/murmur3.c6    24 test(s), 0 failure(s)
 std/encoding/siphash.c6    24 test(s), 0 failure(s)
+std/container/treap.c6     2 test(s), 0 failure(s)
+std/container/heap.c6      2 test(s), 0 failure(s)
+std/container/skiplist.c6  2 test(s), 0 failure(s)
+std/container/counter.c6   24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3741,6 +3750,16 @@ make std-hash2
 `adler32_combine` 与整体值对照；MurmurHash3 验 32 位向量与 128 位的两个 64 位半
 （含跨块的 20 字节用例）；SipHash 用官方向量（空串、15 字节）并演示定时安全比较。
 
+### 集成示例：`examples/stdordered.c6`
+
+```sh
+make std-ordered
+```
+
+四节：Treap 插 10 个键后查排名、第 k 小与删除后的第 k 小；堆用 8 个乱序值取前 3 大、
+再用最小堆演示「排序得降序」与 `pushpop` 的 top-k 用法；跳表乱序插 8 个键后按
+`skip_first`/`skip_next` 遍历并核对升序；计数器统计 HTTP 方法频次并取最多的键。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3839,6 +3858,8 @@ make std-hash2
   （自带自检）。
 * `make std-hash2`：`examples/stdhash2.c6`，第五十一批（非加密散列补齐）模块的拼装
   示例（自带自检）。
+* `make std-ordered`：`examples/stdordered.c6`，第五十二批（有序容器）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
