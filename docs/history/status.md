@@ -1726,6 +1726,32 @@ FTP 的解析坑值得记一笔：`LIST` 行是定字段的「权限 链接 属�
 验收：`make stdtest`（201 个模块、0 failure）、`make std-math2`（23 条自检全过）、
 `make check-all`。
 
+### 11.60 标准库第四十八批（calendar / iso8601 / duration / cron）
+
+第四十八批做时间：历法换算、ISO 8601、时长串与 cron。这批的共同点是「字符串/
+数字 ↔ 时刻」的边界特别多，测试全用固定 epoch 钉死，不碰 `time(0)`。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.os.calendar` | 历法换算 | 用 Hinnant 的 `days_from_civil`（把 3 月当一年开头的移位纪年），没有循环、对 1970 前的负数天数也成立；`iso_week` 用「本周的周四」定年份，所以 2023-01-01 会算成 2022-W52 |
+| `std.os.iso8601` | ISO 8601 | 解析分三段：日期 → 时间 → 时区；小数秒只保留到毫秒；`iso_to_epoch` 要把 `offset_min` **减掉**（东八区的 08:00 等于 UTC 的 00:00） |
+| `std.os.duration` | 时长串 | 单位只在数字后出现，纯数字按秒；小数按单位换算后四舍五入到毫秒；`dur_format` 只输出最大的两个单位，所以 `125000` 是 `2m5s` 而不是 `2m5s0ms` |
+| `std.os.cron` | cron | 位图表示（分钟 60 位、小时 24 位、日 32 位、月 13 位、周 8 位）；「日/周都受限时取或」是 cron 的老规矩；`cron_next` 逐分钟扫、上限 6 年，2017 年后不存在的 2 月 30 日会正常返回 0 |
+
+踩到的坑是注释里的 `*/`：文档注释里写 `*/15` 会**提前结束块注释**，编译报
+`declaration expected`。改成 `0,15,30,45` 或在注释里用反引号把 `*` 与 `/n` 分开写。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.os.calendar`=0x60c9、
+`std.os.iso8601`=0x60ca、`std.os.duration`=0x60cb、`std.os.cron`=0x60cc；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-time` 与 `STD_TIME_SRCS`，`test-all`/`check-all` 都
+带上它；`iso8601` 与 `cron` 在 `stdtest` 里依赖 `std/text/str.c6` + `std/os/calendar.c6`
+（各 26 条用例），`calendar`/`duration` 无依赖（各 2 条）。示例 `examples/stdtime.c6`
+四节（27 条自检）。
+
+验收：`make stdtest`（205 个模块、0 failure）、`make std-time`（27 条自检全过）、
+`make check-all`。
+
+
 
 
 

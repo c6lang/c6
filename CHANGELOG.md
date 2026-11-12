@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第四十八批（时间工具）**：`std.os.calendar`（历法换算 / 星期 / ISO 周）、
+  `std.os.iso8601`（解析与格式化，带偏移换算）、`std.os.duration`（时长串解析与
+  格式化）、`std.os.cron`（五字段表达式 + 下次运行时间），集成示例
+  `examples/stdtime.c6`（`make std-time`）。错误号段 `std.os.calendar`=0x60c9 …
+  `std.os.cron`=0x60cc（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十七批（数值工具）**：`std.core.vector`（Vec2/Vec3 运算）、
   `std.core.polynomial`（求值/求导/加减乘/二次求根）、`std.core.fft`（基 2 迭代
   FFT，正逆变换）、`std.core.spline`（贝塞尔/Hermite/Catmull-Rom），集成示例

@@ -233,6 +233,10 @@
 | `std/core/polynomial.c6` | `std.core.polynomial` | 多项式（系数升幂）：`poly_eval`/`poly_eval_deriv` 走 Horner，`poly_add`/`poly_sub`/`poly_mul`/`poly_deriv` 写到调用方缓冲并去尾零，`poly_roots2` 返回 0/1/2 个实根（`a=0` 退化成一次） |
 | `std/core/fft.c6` | `std.core.fft` | 基 2 迭代 FFT：`fft(re, im, n, inverse)` 原地做位反转 + 蝶形，正变换 `exp(-2πik/n)`、逆变换带 `1/n` 归一所以能原样还原；`fft_magnitude`/`fft_power` 出幅度与功率谱，`fft_ok` 判 2 的幂 |
 | `std/core/spline.c6` | `std.core.spline` | 曲线插值（标量，逐分量调用）：`bezier2`/`bezier3`/`bezier3_deriv`、`hermite`（两端切线）、`catmull_rom`（过中间两点，切线取 `(p2-p0)/2`）、`spline_segments` 按最大段长算采样段数 |
+| `std/os/calendar.c6` | `std.os.calendar` | 公历换算：`days_from_civil`/`civil_from_days`（Hinnant 的移位纪年，含负数天数）、`is_leap`/`days_in_month`、`weekday`（0=周日）、`day_of_year`、`iso_week`（周一为首、含 1 月 4 日那周为第 1 周，可跨年） |
+| `std/os/iso8601.c6` | `std.os.iso8601` | ISO 8601：`iso_parse` 认日期/日期时间/小数秒/`Z`/`±HH:MM`/`±HHMM`，`iso_to_epoch` 与 `iso_from_epoch` 按偏移换算 Unix 秒，`iso_format`/`iso_date_format` 负责输出（UTC 出 `Z`） |
+| `std/os/duration.c6` | `std.os.duration` | 时长（毫秒）：`dur_parse` 认 `d`/`h`/`m`/`s`/`ms` 连写与小数（`1.5h`）、纯数字按秒、负号；`dur_parse_clock` 认 `H:MM:SS`/`M:SS`；`dur_format` 只输出最大的两个单位 |
+| `std/os/cron.c6` | `std.os.cron` | cron 五字段：`cron_parse` 支持 `*`、`*/n`、`a`、`a-b`、`a-b/n`、`n/a`、逗号列表与 `sun`..`sat`，`cron_match` 按「日/周都受限时取或」的惯例判断，`cron_next` 从下一整分钟起最多找 6 年（UTC） |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -323,6 +327,7 @@
 | `examples/stdstruct.c6` | （无模块） | 第四十五批（基础数据结构）的拼装示例（`make std-ds`）：树状数组、线段树、并查集、布隆过滤器各跑一遍 |
 | `examples/stdwords.c6` | （无模块） | 第四十六批（文本变换）的拼装示例（`make std-words`）：slug 化、五种命名风格、罗马数字全范围往返、Soundex/Metaphone |
 | `examples/stdnumeric.c6` | （无模块） | 第四十七批（数值工具）的拼装示例（`make std-math2`）：矢量运算、多项式求值/求导/求根、FFT 往返与单频频谱、样条采样；链接带 `-lm` |
+| `examples/stdtime.c6` | （无模块） | 第四十八批（时间工具）的拼装示例（`make std-time`）：日历换算、ISO 8601 解析/格式化、时长解析/格式化、cron 匹配与下次运行 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -405,6 +410,10 @@ std/core/vector.c6         2 test(s), 0 failure(s)
 std/core/polynomial.c6     2 test(s), 0 failure(s)
 std/core/fft.c6            2 test(s), 0 failure(s)
 std/core/spline.c6         2 test(s), 0 failure(s)
+std/os/calendar.c6         2 test(s), 0 failure(s)
+std/os/iso8601.c6          26 test(s), 0 failure(s)
+std/os/duration.c6         2 test(s), 0 failure(s)
+std/os/cron.c6             26 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3664,6 +3673,16 @@ make std-math2
 FFT 用 16 点单频余弦验证「第 2 与第 14 频点幅度 = n/2」并做正逆往返还原；样条用
 等距四点采样验证单调与端点。这个目标链接要带 `-lm`。
 
+### 集成示例：`examples/stdtime.c6`
+
+```sh
+make std-time
+```
+
+四节：日历算「2024-02-29 是第几天/星期几/第几周」并反解 epoch 起点；ISO 8601 解析
+`Z` 与 `+08:00` 两种写法核对同一时刻、再格式化回去；时长把 `1h30m` 转成毫秒再转回
+字符串；cron 验证工作时段表达式与「每天 03:30」的下次运行时间。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3754,6 +3773,8 @@ FFT 用 16 点单频余弦验证「第 2 与第 14 频点幅度 = n/2」并做�
   （自带自检）。
 * `make std-math2`：`examples/stdnumeric.c6`，第四十七批（数值工具）模块的拼装示例
   （自带自检，链接带 `-lm`）。
+* `make std-time`：`examples/stdtime.c6`，第四十八批（时间工具）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

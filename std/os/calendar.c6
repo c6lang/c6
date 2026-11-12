@@ -1,0 +1,179 @@
+/* std/os/calendar：公历日期与「自 1970-01-01 起的天数」互转、星期与 ISO 周。
+ *
+ *     import std.os.calendar;
+ *
+ *     long long z = days_from_civil(2024, 2, 29);   // 19782
+ *     int y = 0, m = 0, d = 0;
+ *     civil_from_days(z, &y, &m, &d);               // 2024, 2, 29
+ *
+ * 算法是 Howard Hinnant 的 `days_from_civil`（把 3 月当一年开头的「移位纪年」），
+ * 对 1970 前后（含负数天数）都成立，没有循环。
+ *
+ * 约定：
+ *
+ * - 天数 `z` 是从 1970-01-01 起的**整数天**（负数表示更早）；
+ * - `weekday_from_days(z)` 返回 0=周日 … 6=周六；
+ * - `iso_week` 按 ISO 8601：周一是一周第一天，含 1 月 4 日的那周是第 1 周，
+ *   所以年初年末可能跨年（返回的 `iso_year` 可能与传入的年份不同）；
+ * - `is_leap`/`days_in_month` 只认公历（格里高利历），不处理 1582 年前的儒略历；
+ * - 月份/日期越界由调用方负责，函数本身不做范围检查（`days_from_civil` 会照算）。
+ */
+#include <string.h>
+
+module std.os.calendar;
+import std.core.types;
+
+int is_leap(int y)
+{
+    if (y % 4 != 0)
+        return 0;
+    if (y % 100 != 0)
+        return 1;
+    return y % 400 == 0 ? 1 : 0;
+}
+
+int days_in_month(int y, int m)
+{
+    static const int dim[12] = { 31, 28, 31, 30, 31, 30,
+                                 31, 31, 30, 31, 30, 31 };
+
+    if (m < 1 || m > 12)
+        return -1;
+    if (m == 2 && is_leap(y))
+        return 29;
+    return dim[m - 1];
+}
+
+/* 公历 → 天数（1970-01-01 为 0） */
+i64 days_from_civil(int y, int m, int d)
+{
+    i64 yy = (i64)y - (m <= 2 ? 1 : 0);
+    i64 era = 0;
+    i64 yoe = 0, doy = 0, doe = 0;
+
+    era = (yy >= 0 ? yy : yy - 399) / 400;
+    yoe = yy - era * 400;                       /* [0, 399] */
+    doy = (153 * (i64)(m > 2 ? m - 3 : m + 9) + 2) / 5 + (i64)d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+void civil_from_days(i64 z, int *y, int *m, int *d)
+{
+    i64 zz = z + 719468;
+    i64 era = (zz >= 0 ? zz : zz - 146096) / 146097;
+    i64 doe = zz - era * 146097;
+    i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    i64 yy = yoe + era * 400;
+    i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    i64 mp = (5 * doy + 2) / 153;
+    i64 dd = doy - (153 * mp + 2) / 5 + 1;
+    i64 mm = mp < 10 ? mp + 3 : mp - 9;
+
+    if (y)
+        *y = (int)(yy + (mm <= 2 ? 1 : 0));
+    if (m)
+        *m = (int)mm;
+    if (d)
+        *d = (int)dd;
+}
+
+int weekday_from_days(i64 z)
+{
+    /* 1970-01-01 是周四（4） */
+    i64 r = (z + 4) % 7;
+
+    if (r < 0)
+        r += 7;
+    return (int)r;
+}
+
+int weekday(int y, int m, int d)
+{
+    return weekday_from_days(days_from_civil(y, m, d));
+}
+
+int day_of_year(int y, int m, int d)
+{
+    return (int)(days_from_civil(y, m, d) - days_from_civil(y, 1, 1)) + 1;
+}
+
+/* ISO 8601 周：返回 1..53，iso_year 给所属年份 */
+int iso_week(int y, int m, int d, int *iso_year, int *week)
+{
+    i64 z = days_from_civil(y, m, d);
+    int w = weekday_from_days(z);               /* 0=周日 */
+    int iso_wd = w == 0 ? 7 : w;                /* 1=周一 … 7=周日 */
+    i64 thursday = z - (iso_wd - 1) + 3;        /* 本周的周四 */
+    int iy = 0, im = 0, id = 0;
+    i64 jan4 = 0, week1_thursday = 0;
+
+    civil_from_days(thursday, &iy, &im, &id);
+    jan4 = days_from_civil(iy, 1, 4);
+    {
+        int w4 = weekday_from_days(jan4);
+        int iso_w4 = w4 == 0 ? 7 : w4;
+
+        week1_thursday = jan4 - (iso_w4 - 1) + 3;
+    }
+    if (iso_year)
+        *iso_year = iy;
+    if (week)
+        *week = (int)((thursday - week1_thursday) / 7) + 1;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "calendar：日期与天数互转" {
+    int y = 0, m = 0, d = 0;
+
+    if (days_from_civil(1970, 1, 1) != 0)
+        return err(1, "1970-01-01 应该是第 0 天");
+    if (days_from_civil(1969, 12, 31) != -1)
+        return err(2, "1969-12-31 应该是 -1");
+    if (days_from_civil(2024, 2, 29) != 19782)
+        return err(3, "2024-02-29 的天数不对");
+    civil_from_days(19782, &y, &m, &d);
+    if (y != 2024 || m != 2 || d != 29)
+        return err(4, "反解 19782 不对");
+    civil_from_days(0, &y, &m, &d);
+    if (y != 1970 || m != 1 || d != 1)
+        return err(5, "反解 0 不对");
+    civil_from_days(-1, &y, &m, &d);
+    if (y != 1969 || m != 12 || d != 31)
+        return err(6, "反解 -1 不对");
+    /* 2000-03-01 是著名的闰年边界 */
+    if (days_from_civil(2000, 3, 1) != 11017)
+        return err(7, "2000-03-01 的天数不对");
+}
+
+test "calendar：闰年、星期与 ISO 周" {
+    int iy = 0, wk = 0;
+
+    if (is_leap(2000) != 1 || is_leap(1900) != 0 || is_leap(2024) != 1
+        || is_leap(2023) != 0)
+        return err(8, "闰年判定不对");
+    if (days_in_month(2024, 2) != 29 || days_in_month(2023, 2) != 28)
+        return err(9, "二月天数不对");
+    if (days_in_month(2024, 4) != 30 || days_in_month(2024, 13) != -1)
+        return err(10, "四月天数或非法月份不对");
+    /* 1970-01-01 是周四 = 4 */
+    if (weekday(1970, 1, 1) != 4)
+        return err(11, "1970-01-01 应该是周四");
+    if (weekday(2024, 2, 29) != 4)
+        return err(12, "2024-02-29 应该是周四");
+    if (weekday(2000, 1, 1) != 6)
+        return err(13, "2000-01-01 应该是周六");
+    if (day_of_year(2024, 12, 31) != 366 || day_of_year(2023, 12, 31) != 365)
+        return err(14, "一年中的第几天不对");
+    iso_week(2024, 1, 1, &iy, &wk);
+    if (iy != 2024 || wk != 1)
+        return err(15, "2024-01-01 应该是 2024 年第 1 周");
+    iso_week(2023, 1, 1, &iy, &wk);
+    if (iy != 2022 || wk != 52)
+        return err(16, "2023-01-01 应该属于 2022 年第 52 周");
+    iso_week(2024, 12, 30, &iy, &wk);
+    if (iy != 2025 || wk != 1)
+        return err(17, "2024-12-30 应该属于 2025 年第 1 周");
+}

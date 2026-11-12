@@ -1,0 +1,130 @@
+/* examples/stdtime.c6 —— 第四十八批（时间工具）的集成示例。
+ *
+ *     make std-time
+ *
+ * 四节：日历（天数/星期/ISO 周）、ISO 8601 日期时间解析与格式化、时长解析与
+ * 格式化、cron 表达式的匹配与「下次运行」。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.os.calendar;
+import std.os.iso8601;
+import std.os.duration;
+import std.os.cron;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_calendar(void)
+{
+    int y = 0, m = 0, d = 0, iy = 0, wk = 0;
+
+    printf("== calendar\n");
+    printf("   2024-02-29 = 第 %lld 天，星期 %d，ISO 周 ", (long long)days_from_civil(2024, 2, 29),
+           weekday(2024, 2, 29));
+    iso_week(2024, 2, 29, &iy, &wk);
+    printf("%d-W%02d\n", iy, wk);
+    check(days_from_civil(2024, 2, 29) == 19782, "2024-02-29 的天数");
+    civil_from_days(0, &y, &m, &d);
+    check(y == 1970 && m == 1 && d == 1, "反解第 0 天");
+    check(weekday(1970, 1, 1) == 4, "1970-01-01 是周四");
+    check(day_of_year(2024, 12, 31) == 366, "2024 有 366 天");
+    check(is_leap(2000) == 1 && is_leap(1900) == 0, "闰年判定");
+    check(iy == 2024 && wk == 9, "2024-02-29 是第 9 周");
+}
+
+static void do_iso(void)
+{
+    IsoTime t = { 0 };
+    char out[32] = { 0 };
+    i64 e = 0;
+
+    printf("== iso8601\n");
+    check(iso_parse(S("2024-01-01T00:00:00Z"), &t) == 1, "解析 UTC 时间");
+    e = iso_to_epoch(&t);
+    printf("   2024-01-01T00:00:00Z = %lld\n", (long long)e);
+    check(e == 1704067200, "epoch 数值");
+    iso_format(e, 480, out, (int)sizeof out);
+    printf("   东八区表示：%s\n", out);
+    check(strcmp(out, "2024-01-01T08:00:00+08:00") == 0, "东八区格式化");
+    iso_format(e, 0, out, (int)sizeof out);
+    check(strcmp(out, "2024-01-01T00:00:00Z") == 0, "UTC 格式化");
+    check(iso_parse(S("2024-01-01T08:00:00+08:00"), &t) == 1
+          && iso_to_epoch(&t) == e, "带偏移的同一时刻");
+    check(iso_parse(S("2024-02-30"), &t) == -1, "非法日期报错");
+    iso_date_format(19782, out, (int)sizeof out);
+    check(strcmp(out, "2024-02-29") == 0, "日期格式化");
+}
+
+static void do_duration(void)
+{
+    char out[32] = { 0 };
+    int ok = 0;
+    i64 ms = 0;
+
+    printf("== duration\n");
+    ms = dur_parse(S("1h30m"), &ok);
+    printf("   \"1h30m\" = %lld ms → ", (long long)ms);
+    dur_format(ms, out, (int)sizeof out);
+    printf("\"%s\"\n", out);
+    check(ok == 1 && ms == 5400000, "1h30m 的毫秒数");
+    check(strcmp(out, "1h30m") == 0, "格式化回 1h30m");
+    check(dur_parse(S("42"), &ok) == 42000, "纯数字按秒");
+    check(dur_parse(S("1.5h"), &ok) == 5400000, "小数小时");
+    check(dur_parse(S("zzz"), &ok) == 0 && ok == 0, "非法输入");
+    check(dur_parse_clock(S("1:30"), &ok) == 90000, "时钟写法 1:30");
+    check(dur_format(125000, out, (int)sizeof out) == 4
+          && strcmp(out, "2m5s") == 0, "格式化 2m5s");
+}
+
+static void do_cron(void)
+{
+    Cron c = { 0 };
+    i64 next = 0;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0;
+
+    printf("== cron\n");
+    check(cron_parse(S("0,15,30,45 9-17 * * 1-5"), &c) == 1, "工作日每 15 分钟");
+    check(cron_match(&c, 2024, 1, 2, 9, 15) == 1, "周二 09:15 命中");
+    check(cron_match(&c, 2024, 1, 2, 9, 10) == 0, "09:10 不命中");
+    check(cron_match(&c, 2024, 1, 2, 8, 15) == 0, "08:15 不在时段");
+    check(cron_match(&c, 2024, 1, 6, 9, 15) == 0, "周六不命中");
+    if (cron_parse(S("30 3 * * *"), &c) == 1
+        && cron_next(&c, 1704067200, &next) == 1) {
+        civil_from_days(next / 86400, &y, &mo, &d);
+        h = (int)((next % 86400) / 3600);
+        mi = (int)(((next % 86400) % 3600) / 60);
+        printf("   \"30 3 * * *\" 的下一次：%04d-%02d-%02d %02d:%02d\n", y, mo,
+               d, h, mi);
+        check(y == 2024 && mo == 1 && d == 1 && h == 3 && mi == 30,
+              "下次运行时间");
+    } else {
+        check(0, "cron 下次运行计算失败");
+    }
+    check(cron_parse(S("0 0 30 2 *"), &c) == 1
+          && cron_next(&c, 1704067200, &next) == 0, "2 月 30 日永远不匹配");
+}
+
+int main(void)
+{
+    do_calendar();
+    do_iso();
+    do_duration();
+    do_cron();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

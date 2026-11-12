@@ -1,0 +1,367 @@
+/* std/os/iso8601：ISO 8601 日期时间的解析、格式化与 epoch 互转。
+ *
+ *     import std.os.iso8601;
+ *
+ *     IsoTime t = { 0 };
+ *     char out[32] = { 0 };
+ *     if (iso_parse(S("2024-02-29T12:34:56Z"), &t) == 1)
+ *         // t.y=2024 … t.offset_min=0
+ *     iso_format(iso_to_epoch(&t), 0, out, (int)sizeof out);
+ *
+ * 接受的写法：
+ *
+ *     YYYY-MM-DD
+ *     YYYY-MM-DDTHH:MM
+ *     YYYY-MM-DDTHH:MM:SS
+ *     … 后面可跟 Z、+HH:MM、-HH:MM、+HHMM、-HHMM，或什么都不跟（当作「本地」）
+ *
+ * 约定：
+ *
+ * - `iso_parse` 成功返回 1，格式不对返回 -1；`has_zone` 表示是否给了时区偏移，
+ *   `offset_min` 是相对 UTC 的分钟数（东八区是 +480）；
+ * - 小数秒（`.123`）会被接受但只保留到 `frac_ms`（毫秒），不参与 epoch 计算；
+ * - `iso_to_epoch` 把时间按给定偏移换算成 Unix 秒（`offset_min` 从时间里减掉）；
+ * - `iso_format` 输出 `YYYY-MM-DDTHH:MM:SS+HH:MM`（UTC 输出 `Z`），
+ *   `iso_date_format` 只输出日期；
+ * - 依赖 `std.os.calendar` 做日期与天数互转；
+ * - 不处理闰秒、不处理 1582 年前的历法、不解析周日期（`2024-W09-4`）。
+ */
+#include <string.h>
+
+module std.os.iso8601;
+import std.core.types;
+import std.text.str;
+import std.os.calendar;
+
+struct IsoTime {
+    int y;
+    int mo;
+    int d;
+    int h;
+    int mi;
+    int s;
+    int frac_ms;
+    int offset_min;
+    int has_zone;
+    int date_only;
+};
+
+static int iso_digits(const char *p, int n, int *out)
+{
+    int i = 0, v = 0, cnt = 0;
+
+    for (i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9')
+            return -1;
+        v = v * 10 + (p[i] - '0');
+        cnt++;
+    }
+    if (cnt != n)
+        return -1;
+    *out = v;
+    return 1;
+}
+
+int iso_parse(char[:] src, IsoTime *out)
+{
+    const char *p = src.data;
+    int n = src.len, i = 0;
+    int v = 0;
+
+    if (!src.data || !out || n < 10)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (iso_digits(p, 4, &out->y) != 1 || p[4] != '-')
+        return -1;
+    if (iso_digits(p + 5, 2, &out->mo) != 1 || p[7] != '-')
+        return -1;
+    if (iso_digits(p + 8, 2, &out->d) != 1)
+        return -1;
+    if (out->mo < 1 || out->mo > 12 || out->d < 1
+        || out->d > days_in_month(out->y, out->mo))
+        return -1;
+    i = 10;
+    if (i >= n) {
+        out->date_only = 1;
+        return 1;
+    }
+    if (p[i] != 'T' && p[i] != 't' && p[i] != ' ')
+        return -1;
+    i++;
+    if (i + 5 > n)
+        return -1;
+    if (iso_digits(p + i, 2, &out->h) != 1 || p[i + 2] != ':')
+        return -1;
+    if (iso_digits(p + i + 3, 2, &out->mi) != 1)
+        return -1;
+    i += 5;
+    if (out->h > 23 || out->mi > 59)
+        return -1;
+    if (i < n && p[i] == ':') {
+        if (i + 3 > n || iso_digits(p + i + 1, 2, &out->s) != 1)
+            return -1;
+        if (out->s > 60)
+            return -1;
+        i += 3;
+    }
+    if (i < n && (p[i] == '.' || p[i] == ',')) {
+        int scale = 100, got = 0;
+
+        i++;
+        while (i < n && p[i] >= '0' && p[i] <= '9') {
+            if (scale > 0) {
+                out->frac_ms += (p[i] - '0') * scale;
+                scale /= 10;
+            }
+            got++;
+            i++;
+        }
+        if (!got)
+            return -1;
+    }
+    if (i >= n)
+        return 1;
+    if (p[i] == 'Z' || p[i] == 'z') {
+        out->has_zone = 1;
+        out->offset_min = 0;
+        i++;
+    } else if (p[i] == '+' || p[i] == '-') {
+        int sign = p[i] == '-' ? -1 : 1;
+        int oh = 0, om = 0;
+
+        i++;
+        if (i + 2 > n || iso_digits(p + i, 2, &oh) != 1)
+            return -1;
+        i += 2;
+        if (i < n && p[i] == ':')
+            i++;
+        if (i + 2 <= n && iso_digits(p + i, 2, &om) == 1)
+            i += 2;
+        else
+            om = 0;
+        if (oh > 23 || om > 59)
+            return -1;
+        out->has_zone = 1;
+        out->offset_min = sign * (oh * 60 + om);
+    }
+    (void)v;
+    return 1;
+}
+
+i64 iso_to_epoch(const IsoTime *t)
+{
+    i64 days = 0;
+
+    if (!t)
+        return 0;
+    days = days_from_civil(t->y, t->mo, t->d);
+    return days * 86400 + (i64)t->h * 3600 + (i64)t->mi * 60 + (i64)t->s
+           - (i64)t->offset_min * 60;
+}
+
+int iso_from_epoch(i64 epoch, int offset_min, IsoTime *out)
+{
+    i64 local = 0, days = 0, rem = 0;
+
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof *out);
+    local = epoch + (i64)offset_min * 60;
+    days = local / 86400;
+    rem = local % 86400;
+    if (rem < 0) {
+        rem += 86400;
+        days--;
+    }
+    civil_from_days(days, &out->y, &out->mo, &out->d);
+    out->h = (int)(rem / 3600);
+    out->mi = (int)((rem % 3600) / 60);
+    out->s = (int)(rem % 60);
+    out->offset_min = offset_min;
+    out->has_zone = 1;
+    return 1;
+}
+
+static int iso_put(char *dst, int cap, int o, const char *s)
+{
+    int i = 0;
+
+    for (i = 0; s[i]; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = s[i];
+    }
+    return o;
+}
+
+static int iso_put2(char *dst, int cap, int o, int v)
+{
+    char buf[3] = { 0 };
+
+    buf[0] = (char)('0' + (v / 10) % 10);
+    buf[1] = (char)('0' + v % 10);
+    return iso_put(dst, cap, o, buf);
+}
+
+static int iso_put4(char *dst, int cap, int o, int v)
+{
+    char buf[5] = { 0 };
+
+    buf[0] = (char)('0' + (v / 1000) % 10);
+    buf[1] = (char)('0' + (v / 100) % 10);
+    buf[2] = (char)('0' + (v / 10) % 10);
+    buf[3] = (char)('0' + v % 10);
+    return iso_put(dst, cap, o, buf);
+}
+
+int iso_date_format(i64 days, char *dst, int cap)
+{
+    int y = 0, m = 0, d = 0, o = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    civil_from_days(days, &y, &m, &d);
+    o = iso_put4(dst, cap, 0, y);
+    if (o < 0)
+        return -1;
+    o = iso_put(dst, cap, o, "-");
+    if (o < 0)
+        return -1;
+    o = iso_put2(dst, cap, o, m);
+    if (o < 0)
+        return -1;
+    o = iso_put(dst, cap, o, "-");
+    if (o < 0)
+        return -1;
+    o = iso_put2(dst, cap, o, d);
+    if (o < 0)
+        return -1;
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int iso_format(i64 epoch, int offset_min, char *dst, int cap)
+{
+    IsoTime t = { 0 };
+    int o = 0, m = 0;
+
+    if (!dst || cap <= 0)
+        return -1;
+    if (iso_from_epoch(epoch, offset_min, &t) != 1)
+        return -1;
+    o = iso_put4(dst, cap, 0, t.y);
+    if (o < 0)
+        return -1;
+    o = iso_put(dst, cap, o, "-");
+    if (o < 0)
+        return -1;
+    o = iso_put2(dst, cap, o, t.mo);
+    if (o < 0)
+        return -1;
+    o = iso_put(dst, cap, o, "-");
+    if (o < 0)
+        return -1;
+    o = iso_put2(dst, cap, o, t.d);
+    if (o < 0)
+        return -1;
+    o = iso_put(dst, cap, o, "T");
+    if (o < 0)
+        return -1;
+    o = iso_put2(dst, cap, o, t.h);
+    if (o < 0)
+        return -1;
+    o = iso_put(dst, cap, o, ":");
+    if (o < 0)
+        return -1;
+    o = iso_put2(dst, cap, o, t.mi);
+    if (o < 0)
+        return -1;
+    o = iso_put(dst, cap, o, ":");
+    if (o < 0)
+        return -1;
+    o = iso_put2(dst, cap, o, t.s);
+    if (o < 0)
+        return -1;
+    if (offset_min == 0) {
+        o = iso_put(dst, cap, o, "Z");
+    } else {
+        m = offset_min < 0 ? -offset_min : offset_min;
+        o = iso_put(dst, cap, o, offset_min < 0 ? "-" : "+");
+        if (o < 0)
+            return -1;
+        o = iso_put2(dst, cap, o, m / 60);
+        if (o < 0)
+            return -1;
+        o = iso_put(dst, cap, o, ":");
+        if (o < 0)
+            return -1;
+        o = iso_put2(dst, cap, o, m % 60);
+    }
+    if (o < 0)
+        return -1;
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "iso8601：解析" {
+    IsoTime t = { 0 };
+
+    if (iso_parse(S("2024-02-29"), &t) != 1)
+        return err(1, "纯日期解析失败");
+    if (t.y != 2024 || t.mo != 2 || t.d != 29 || t.date_only != 1)
+        return err(2, "纯日期字段不对");
+    if (iso_parse(S("2024-02-29T12:34:56Z"), &t) != 1)
+        return err(3, "带 Z 的时间解析失败");
+    if (t.h != 12 || t.mi != 34 || t.s != 56 || t.offset_min != 0
+        || t.has_zone != 1)
+        return err(4, "带 Z 的时间字段不对");
+    if (iso_parse(S("2024-02-29T12:34:56+08:00"), &t) != 1
+        || t.offset_min != 480)
+        return err(5, "东八区偏移不对");
+    if (iso_parse(S("2024-02-29T12:34:56-0530"), &t) != 1
+        || t.offset_min != -330)
+        return err(6, "-0530 偏移不对");
+    if (iso_parse(S("2024-02-29 12:34"), &t) != 1 || t.s != 0)
+        return err(7, "无秒的空格分隔不对");
+    if (iso_parse(S("2024-02-29T12:34:56.789Z"), &t) != 1 || t.frac_ms != 789)
+        return err(8, "小数秒不对");
+    if (iso_parse(S("2023-02-29"), &t) != -1)
+        return err(9, "2023-02-29 应该 -1");
+    if (iso_parse(S("2024-13-01"), &t) != -1 || iso_parse(S("2024-01-01T25:00"), &t) != -1)
+        return err(10, "非法月/小时应该 -1");
+}
+
+test "iso8601：epoch 与格式化" {
+    IsoTime t = { 0 };
+    char out[32] = { 0 };
+    i64 e = 0;
+
+    if (iso_parse(S("1970-01-01T00:00:00Z"), &t) != 1
+        || iso_to_epoch(&t) != 0)
+        return err(11, "epoch 起点不对");
+    if (iso_parse(S("2024-01-01T00:00:00Z"), &t) != 1)
+        return err(12, "解析失败");
+    e = iso_to_epoch(&t);
+    if (e != 1704067200)
+        return err(13, "2024-01-01 的 epoch 不对");
+    if (iso_parse(S("2024-01-01T08:00:00+08:00"), &t) != 1
+        || iso_to_epoch(&t) != 1704067200)
+        return err(14, "东八区同一时刻的 epoch 应该相等");
+    if (iso_format(1704067200, 0, out, (int)sizeof out) != 20
+        || memcmp(out, "2024-01-01T00:00:00Z", 20) != 0)
+        return err(15, "UTC 格式化不对");
+    if (iso_format(1704067200, 480, out, (int)sizeof out) != 25
+        || memcmp(out, "2024-01-01T08:00:00+08:00", 25) != 0)
+        return err(16, "东八区格式化不对");
+    if (iso_date_format(19782, out, (int)sizeof out) != 10
+        || memcmp(out, "2024-02-29", 10) != 0)
+        return err(17, "日期格式化不对");
+    if (iso_format(1704067200, 0, out, 5) != -1)
+        return err(18, "容量不够应该 -1");
+}

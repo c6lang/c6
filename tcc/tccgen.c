@@ -12906,6 +12906,10 @@ static const struct C6ErrStdSlot {
     { "std.core.polynomial",    C6_ERR_SLOT_STD + 198 },
     { "std.core.fft",           C6_ERR_SLOT_STD + 199 },
     { "std.core.spline",        C6_ERR_SLOT_STD + 200 },
+    { "std.os.calendar",        C6_ERR_SLOT_STD + 201 },
+    { "std.os.iso8601",         C6_ERR_SLOT_STD + 202 },
+    { "std.os.duration",        C6_ERR_SLOT_STD + 203 },
+    { "std.os.cron",            C6_ERR_SLOT_STD + 204 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

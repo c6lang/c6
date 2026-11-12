@@ -1,0 +1,351 @@
+/* std/os/cron：cron 表达式（5 字段）的解析、匹配与「下次运行时间」。
+ *
+ *     import std.os.cron;
+ *
+ *     Cron c = { 0 };
+ *     long long next = 0;
+ *     if (cron_parse(S("0,15,30,45 9-17 * * 1-5"), &c) == 1
+ *         && cron_next(&c, now_epoch, &next) == 1)
+ *         // next 是下一个满足条件的整分钟（UTC）
+ *
+ * 支持的标准写法（每字段一个逗号列表）：
+ *
+ *     `*`      任意
+ *     `*` `/n` 每隔 n（星号后跟斜杠与步长）
+ *     `a`      单值
+ *     `a-b`    区间
+ *     `a-b/n`  区间内每隔 n
+ *     `n/a`    从 n 开始每隔 a（等价于 n-最大值/a）
+ *
+ * 字段顺序：分 时 日 月 周（周日 = 0，也接受 7）。周字段还认 `sun`..`sat`
+ * 和 `mon-fri` 这样的三字母名。
+ *
+ * 约定：
+ *
+ * - 位图表示：分钟 60 位、小时 24 位、日 32 位、月 13 位、周 8 位；
+ * - `dom_star`/`dow_star` 记录字段是否写成 `*`：两者都受限时按 cron 惯例做**或**
+ *   （日期或星期任一匹配即可），否则按**与**；
+ * - `cron_next` 从 `from_epoch` 的**下一整分钟**开始找，最多往后找 6 年，
+ *   找不到返回 0；时间按 UTC 处理（不要拿本地时间直接喂）；
+ * - 不处理 `@daily`/`@reboot` 这类别名，也不处理秒字段与 `L`/`W`/`#` 扩展。
+ */
+#include <string.h>
+
+module std.os.cron;
+import std.core.types;
+import std.text.str;
+import std.os.calendar;
+
+struct Cron {
+    u64 minute;
+    u64 hour;
+    u64 dom;
+    u64 month;
+    u64 dow;
+    int dom_star;
+    int dow_star;
+};
+
+static int cron_lower(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A' + 'a';
+    return c;
+}
+
+/* 三字母星期名 → 0..6 */
+static int cron_dow_name(const char *p, int n)
+{
+    static const char *names[7] = { "sun", "mon", "tue", "wed", "thu", "fri",
+                                    "sat" };
+    int i = 0;
+
+    if (n != 3)
+        return -1;
+    for (i = 0; i < 7; i++) {
+        if (cron_lower(p[0]) == names[i][0] && cron_lower(p[1]) == names[i][1]
+            && cron_lower(p[2]) == names[i][2])
+            return i;
+    }
+    return -1;
+}
+
+/* 解一个数值或星期名 */
+static int cron_value(const char *p, int n, int is_dow, int *out)
+{
+    int v = 0, i = 0;
+
+    if (n <= 0)
+        return -1;
+    if (is_dow && n == 3) {
+        int w = cron_dow_name(p, n);
+
+        if (w >= 0) {
+            *out = w;
+            return 1;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9')
+            return -1;
+        v = v * 10 + (p[i] - '0');
+        if (v > 1000)
+            return -1;
+    }
+    *out = v;
+    return 1;
+}
+
+/* 解析一个字段；lo/hi 是取值范围，index 是字段序号（0..4） */
+static int cron_field(const char *p, int n, int lo, int hi, int is_dow,
+                      u64 *bits, int *is_star)
+{
+    int i = 0;
+
+    *bits = 0;
+    if (is_star)
+        *is_star = 0;
+    if (n <= 0)
+        return -1;
+    while (i < n) {
+        int start = i, dash = -1, slash = -1, k = 0;
+        int a = 0, b = 0, step = 1;
+
+        while (i < n && p[i] != ',')
+            i++;
+        for (k = start; k < i; k++) {
+            if (p[k] == '-' && dash < 0)
+                dash = k;
+            if (p[k] == '/' && slash < 0)
+                slash = k;
+        }
+        {
+            int end = slash >= 0 ? slash : i;
+            int range_start = start;
+            int range_end = end;
+
+            if (dash >= 0) {
+                range_end = dash;
+            }
+            /* 星号 */
+            if (range_end - range_start == 1 && p[range_start] == '*') {
+                a = lo;
+                b = hi;
+                if (is_star)
+                    *is_star = 1;
+            } else if (dash >= 0) {
+                if (cron_value(p + range_start, dash - range_start, is_dow, &a)
+                    != 1)
+                    return -1;
+                if (cron_value(p + dash + 1, end - dash - 1, is_dow, &b) != 1)
+                    return -1;
+            } else {
+                if (cron_value(p + range_start, range_end - range_start, is_dow,
+                               &a) != 1)
+                    return -1;
+                b = slash >= 0 ? hi : a;
+            }
+            if (slash >= 0) {
+                if (cron_value(p + slash + 1, i - slash - 1, 0, &step) != 1)
+                    return -1;
+                if (step <= 0)
+                    return -1;
+            }
+            if (is_dow) {
+                if (a == 7)
+                    a = 0;
+                if (b == 7)
+                    b = 0;
+            }
+            if (a < lo || a > hi || b < lo || b > hi || b < a)
+                return -1;
+            for (k = a; k <= b; k += step)
+                *bits |= (u64)1 << k;
+        }
+        if (i < n && p[i] == ',')
+            i++;
+    }
+    return 1;
+}
+
+int cron_parse(char[:] expr, Cron *out)
+{
+    const char *p = expr.data;
+    int n = expr.len, i = 0, f = 0;
+    int lo[5] = { 0, 0, 1, 1, 0 };
+    int hi[5] = { 59, 23, 31, 12, 6 };
+
+    if (!expr.data || !out || n <= 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    while (f < 5) {
+        int start = 0, len = 0;
+
+        while (i < n && (p[i] == ' ' || p[i] == '\t'))
+            i++;
+        if (i >= n)
+            return -1;
+        start = i;
+        while (i < n && p[i] != ' ' && p[i] != '\t')
+            i++;
+        len = i - start;
+        {
+            u64 bits = 0;
+            int star = 0;
+            int r = cron_field(p + start, len, lo[f], hi[f], f == 4, &bits,
+                               &star);
+
+            if (r != 1)
+                return -1;
+            if (f == 0)
+                out->minute = bits;
+            else if (f == 1)
+                out->hour = bits;
+            else if (f == 2) {
+                out->dom = bits;
+                out->dom_star = star;
+            } else if (f == 3)
+                out->month = bits;
+            else {
+                out->dow = bits;
+                out->dow_star = star;
+            }
+        }
+        f++;
+    }
+    if (out->minute == 0 || out->hour == 0 || out->dom == 0
+        || out->month == 0 || out->dow == 0)
+        return -1;
+    return 1;
+}
+
+int cron_match(const Cron *c, int y, int mo, int d, int h, int mi)
+{
+    int wd = 0;
+    int day_ok = 0;
+
+    if (!c)
+        return 0;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0
+        || mi > 59)
+        return 0;
+    if ((c->month & ((u64)1 << mo)) == 0)
+        return 0;
+    if ((c->hour & ((u64)1 << h)) == 0)
+        return 0;
+    if ((c->minute & ((u64)1 << mi)) == 0)
+        return 0;
+    wd = weekday(y, mo, d);
+    {
+        int dom_ok = (c->dom & ((u64)1 << d)) != 0;
+        int dow_ok = (c->dow & ((u64)1 << wd)) != 0;
+
+        if (c->dom_star && c->dow_star)
+            day_ok = 1;
+        else if (c->dom_star)
+            day_ok = dow_ok;
+        else if (c->dow_star)
+            day_ok = dom_ok;
+        else
+            day_ok = dom_ok || dow_ok;
+    }
+    return day_ok ? 1 : 0;
+}
+
+int cron_next(const Cron *c, i64 from_epoch, i64 *out)
+{
+    i64 t = 0, limit = 0;
+
+    if (!c || !out)
+        return -1;
+    t = (from_epoch / 60) * 60 + 60;
+    limit = from_epoch + (i64)86400 * 366 * 6;
+    while (t <= limit) {
+        i64 day = t / 86400;
+        i64 rem = t % 86400;
+        int y = 0, mo = 0, d = 0, h = 0, mi = 0;
+
+        if (rem < 0) {
+            rem += 86400;
+            day--;
+        }
+        civil_from_days(day, &y, &mo, &d);
+        h = (int)(rem / 3600);
+        mi = (int)((rem % 3600) / 60);
+        if (cron_match(c, y, mo, d, h, mi)) {
+            *out = day * 86400 + (i64)h * 3600 + (i64)mi * 60;
+            return 1;
+        }
+        /* 跳到下一分钟的整点 */
+        t += 60;
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "cron：解析与匹配" {
+    Cron c = { 0 };
+
+    if (cron_parse(S("*/15 9-17 * * 1-5"), &c) != 1)
+        return err(1, "表达式解析失败");
+    if ((c.minute & 1) == 0 || (c.minute & (1 << 15)) == 0
+        || (c.minute & (1 << 14)) != 0)
+        return err(2, "分钟位图不对");
+    if ((c.hour & (1 << 9)) == 0 || (c.hour & (1 << 8)) != 0
+        || (c.hour & (1 << 17)) == 0)
+        return err(3, "小时位图不对");
+    if (c.dom_star != 1 || c.dow_star != 0)
+        return err(4, "星号标记不对");
+    if (cron_parse(S("0 0 1 1 0"), &c) != 1 || c.minute != 1)
+        return err(5, "0 分应该只有第 0 位");
+    if (cron_parse(S("0 0 1 1 sun"), &c) != 1 || (c.dow & 1) == 0)
+        return err(6, "周日名不对");
+    if (cron_parse(S("0 0 1 1 7"), &c) != 1 || (c.dow & 1) == 0)
+        return err(7, "7 应该等价于周日");
+    if (cron_parse(S("0 0 1 1 9"), &c) != -1)
+        return err(8, "星期 9 应该 -1");
+    if (cron_parse(S("60 * * * *"), &c) != -1)
+        return err(9, "分钟 60 应该 -1");
+    if (cron_parse(S("* * * *"), &c) != -1)
+        return err(10, "只有四个字段应该 -1");
+    if (cron_parse(S("*/0 * * * *"), &c) != -1)
+        return err(11, "步长 0 应该 -1");
+}
+
+test "cron：下次运行时间" {
+    Cron c = { 0 };
+    i64 next = 0;
+    int iy = 0, im = 0, id = 0, ih = 0, in = 0;
+
+    /* 每分钟 → 下一分钟 */
+    if (cron_parse(S("* * * * *"), &c) != 1)
+        return err(12, "解析失败");
+    if (cron_next(&c, 1704067200 /* 2024-01-01T00:00:00Z */, &next) != 1)
+        return err(13, "应该找得到下一次");
+    if (next != 1704067260)
+        return err(14, "应该是下一分钟");
+    /* 每天 03:30 → 从 00:00 起算应该是 03:30 */
+    if (cron_parse(S("30 3 * * *"), &c) != 1
+        || cron_next(&c, 1704067200, &next) != 1)
+        return err(15, "每天 03:30 找不到");
+    civil_from_days(next / 86400, &iy, &im, &id);
+    ih = (int)((next % 86400) / 3600);
+    in = (int)(((next % 86400) % 3600) / 60);
+    if (iy != 2024 || im != 1 || id != 1 || ih != 3 || in != 30)
+        return err(16, "每天 03:30 的时间不对");
+    /* 只在周一：2024-01-01 是周一，从它往后一分钟起算应该是下一个周一 */
+    if (cron_parse(S("0 0 * * 1"), &c) != 1
+        || cron_next(&c, 1704067260, &next) != 1)
+        return err(17, "每周一找不到");
+    civil_from_days(next / 86400, &iy, &im, &id);
+    if (iy != 2024 || im != 1 || id != 8)
+        return err(18, "下一个周一应该是 2024-01-08");
+    /* 2 月 30 日永远不会到 → 6 年内找不到 */
+    if (cron_parse(S("0 0 30 2 *"), &c) != 1)
+        return err(19, "解析失败");
+    if (cron_next(&c, 1704067200, &next) != 0)
+        return err(20, "2 月 30 日应该找不到");
+}
