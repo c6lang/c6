@@ -92,6 +92,7 @@
 | `make std-more` | 编译并运行 `examples/stdmore.c6`（第七批模块的拼装示例） |
 | `make std-next` | 编译并运行 `examples/stdnext.c6`（第八批模块的拼装示例） |
 | `make std-node` | 编译并运行 `examples/stdnode.c6`（第九批模块的拼装示例） |
+| `make std-form` | 编译并运行 `examples/stdform.c6`（第十批模块的拼装示例） |
 
 ### freestanding、裸机与交叉目标
 

@@ -1,0 +1,586 @@
+/* std/data/props：`.properties` / `.env` 风格配置的零分配读取器。
+ *
+ *     import std.data.props;
+ *
+ *     PropsReader r = props_open(S("name = demo\nexport PORT=8080\n"));
+ *     PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+ *     while (r.next(&e) == 1) {
+ *         // e.key / e.value 都是输入上的视图（转义未解）
+ *         char buf[128] = { 0 };
+ *         int n = e.decode((char[:]){ buf, (int)sizeof buf });
+ *     }
+ *
+ * 和 `std.data.ini` 同一个思路：**不分配、不复制**，`key`/`value` 都是指向输入
+ * 文本的 `Str` 视图，输入必须比视图活得久。这一层只认**原始写法**（转义还是
+ * `\n` 两个字），要真正的字符就调 `props_decode` / `e.decode(buf)`，解码结果写
+ * 调用方缓冲（返回值是长度，不写结尾 NUL）。
+ *
+ * 语法（`.properties` 的常用子集 + `.env` 的 `export` 前缀）：
+ *
+ * - 行分隔是 `\n`，`\r\n` 也认（`\r` 会被 trim 掉）；
+ * - 空行忽略；trim 之后以 `#` 或 `!` **开头**的行是整行注释（行内 `#` 不是注释）；
+ * - 键在**第一个**未转义的 `=`、`:` 或空白处结束；空白之后可以再跟一个
+ *   `=`/`:`。所以 `a=1`、`a:1`、`a 1`、`a = 1` 都是 `a` → `1`；
+ * - 值可以为空（`k=`、`k` 都算空值）；键不能为空（`=v` 是语法错误）；
+ * - 键前的 `export ` 会被跳过（`.env` 习惯），`export=1` 的键仍是 `export`；
+ * - **续行**：物理行末尾有奇数个反斜杠时，下一物理行属于同一条逻辑行；
+ *   `value` 的视图会跨过这段原始区间（里面保留 `\` 和换行），解码时把它们
+ *   连同续行开头的空白一起去掉；
+ * - 不合上面任何一条的非空行（例如没有键的 `=` 开头）是语法错误：`next`
+ *   返回 -1 并把行号记在 `r.err`（1 起），之后可以继续读下一行。
+ *
+ * 解码规则（`props_decode`）：`\n` `\r` `\t` `\f` `\\` `\:` `\=` `\#` `\!` `\ `
+ * 给对应字符；未知转义保留字符本身（丢掉反斜杠，和 Java 一致）；`\uXXXX` 解
+ * 成 UTF-8，代理对（`\uD83D\uDE00`）合并，落单代理或坏十六进制返回 -1。行尾
+ * 的 `\<换行>` 是续行：两者都丢掉，并跳过下一行开头的空格/制表。
+ */
+#include <string.h>
+
+module std.data.props;
+import std.core.types;
+import std.text.str;
+
+enum Error { OK = 0, INVAL = 1, RANGE = 2 };
+
+/* 一条键值；key/value 是原始写法（转义未解） */
+struct PropEntry {
+    Str key;
+    Str value;
+    int line;           /* 逻辑行第一行的行号（1 起） */
+};
+
+struct PropsReader {
+    char[:] s;
+    int at;             /* 下一个要读的字节 */
+    int line;           /* 已经消费的物理行数 */
+    int err;            /* 最近一次语法错误的行号，0 = 没出错 */
+};
+
+static int p_blank(int c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f';
+}
+
+static char[:] p_trim(char[:] v)
+{
+    int b = 0;
+    int e = v.len;
+
+    while (b < e && p_blank((u8)v.data[b]))
+        b++;
+    while (e > b && p_blank((u8)v.data[e - 1]))
+        e--;
+    return (char[:]){ v.data + b, e - b };
+}
+
+static int p_eq(char[:] a, char[:] b)
+{
+    if (a.len != b.len)
+        return 0;
+    if (a.len <= 0)
+        return 1;
+    return memcmp(a.data, b.data, (size_t)a.len) == 0;
+}
+
+/* trim 过的行尾有奇数个反斜杠 = 续行 */
+static int p_open_end(char[:] line)
+{
+    int n = 0;
+    int i = line.len;
+
+    while (i > 0 && line.data[i - 1] == '\\') {
+        n++;
+        i--;
+    }
+    return n % 2;
+}
+
+static int p_hex(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int p_uesc4(char[:] s, int i, u32 *out)
+{
+    int k = 0;
+    u32 v = 0;
+
+    if (i + 5 > s.len || s.data[i] != '\\' || s.data[i + 1] != 'u')
+        return 0;
+    for (k = 0; k < 4; k++) {
+        int h = p_hex((u8)s.data[i + 2 + k]);
+
+        if (h < 0)
+            return 0;
+        v = (v << 4) | (u32)h;
+    }
+    *out = v;
+    return 1;
+}
+
+/* `\uXXXX`（必要时带低代理）；返回消耗的字节数，非法 -1 */
+static int p_uesc(char[:] s, int i, u32 *out)
+{
+    u32 hi = 0;
+    u32 lo = 0;
+
+    if (!p_uesc4(s, i, &hi))
+        return -1;
+    if (hi >= 0xd800 && hi <= 0xdbff) {
+        if (!p_uesc4(s, i + 6, &lo) || lo < 0xdc00 || lo > 0xdfff)
+            return -1;
+        *out = 0x10000u + ((hi - 0xd800u) << 10) + (lo - 0xdc00u);
+        return 12;
+    }
+    if (hi >= 0xdc00 && hi <= 0xdfff)
+        return -1;
+    *out = hi;
+    return 6;
+}
+
+static int p_utf8_len(u32 cp)
+{
+    if (cp <= 0x7f)
+        return 1;
+    if (cp <= 0x7ff)
+        return 2;
+    if (cp < 0xd800 || (cp > 0xdfff && cp <= 0xffff))
+        return 3;
+    if (cp >= 0x10000 && cp <= 0x10ffff)
+        return 4;
+    return 0;
+}
+
+static void p_utf8_put(char *dst, u32 cp, int n)
+{
+    if (n == 1) {
+        dst[0] = (char)cp;
+    } else if (n == 2) {
+        dst[0] = (char)(0xc0 | (cp >> 6));
+        dst[1] = (char)(0x80 | (cp & 0x3f));
+    } else if (n == 3) {
+        dst[0] = (char)(0xe0 | (cp >> 12));
+        dst[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        dst[2] = (char)(0x80 | (cp & 0x3f));
+    } else {
+        dst[0] = (char)(0xf0 | (cp >> 18));
+        dst[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+        dst[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        dst[3] = (char)(0x80 | (cp & 0x3f));
+    }
+}
+
+/* 解码内核：dst 为 0 时只统计长度（同时校验）；返回长度 / -1。 */
+static int p_dec(char[:] s, char *dst, int cap)
+{
+    int i = 0;
+    int o = 0;
+
+    while (i < s.len) {
+        int c = (u8)s.data[i];
+        int n = 0;
+        u32 cp = 0;
+        int used = 0;
+        int need = 0;
+
+        if (c != '\\') {
+            if (dst && o < cap)
+                dst[o] = (char)c;
+            o++;
+            i++;
+            continue;
+        }
+        if (i + 1 >= s.len) {           /* 行尾孤立反斜杠：丢掉 */
+            i++;
+            continue;
+        }
+        n = (u8)s.data[i + 1];
+        if (n == '\n' || n == '\r') {   /* 续行：反斜杠 + 换行 + 下一行前导空白 */
+            i += 2;
+            if (n == '\r' && i < s.len && s.data[i] == '\n')
+                i++;
+            while (i < s.len && (s.data[i] == ' ' || s.data[i] == '\t'))
+                i++;
+            continue;
+        }
+        if (n == 'u') {
+            used = p_uesc(s, i, &cp);
+            if (used < 0)
+                return -1;
+            need = p_utf8_len(cp);
+            if (need == 0)
+                return -1;
+            if (dst && o + need <= cap)
+                p_utf8_put(dst + o, cp, need);
+            o += need;
+            i += used;
+            continue;
+        }
+        switch (n) {
+        case 'n': c = '\n'; break;
+        case 'r': c = '\r'; break;
+        case 't': c = '\t'; break;
+        case 'f': c = '\f'; break;
+        default:  c = n;    break;      /* 未知转义：丢掉反斜杠 */
+        }
+        if (dst && o < cap)
+            dst[o] = (char)c;
+        o++;
+        i += 2;
+    }
+    return o;
+}
+
+/* 解码后的长度；`\u` 非法返回 -1。 */
+int props_decoded_len(char[:] raw)
+{
+    return p_dec(raw, (char *)0, 0);
+}
+
+/* 把原始写法解到调用方缓冲：返回长度，放不下或 `\u` 非法返回 -1（一个字节都不写）。 */
+int props_decode(char[:] raw, char[:] out)
+{
+    int need = p_dec(raw, (char *)0, 0);
+
+    if (need < 0 || out.len < need)
+        return -1;
+    p_dec(raw, out.data, out.len);
+    return need;
+}
+
+/* 一条 entry 的值解码（等价于 props_decode(e->value, out)） */
+int decode(PropEntry *self, char[:] out)
+{
+    if (!self)
+        return -1;
+    return props_decode(self->value.s, out);
+}
+
+PropsReader props_open(char[:] text)
+{
+    PropsReader r = { { (char *)0, 0 }, 0, 0, 0 };
+
+    if (text.len > 0 && text.data)
+        r.s = text;
+    return r;
+}
+
+/* 取下一条键值：1 = 有，0 = 读完了，-1 = 语法错误（行号在 r->err） */
+int next(PropsReader *r, PropEntry *out)
+{
+    if (!r || !out)
+        return -1;
+    for (;;) {
+        int start = 0;
+        int end = 0;
+        int raw_end = 0;
+        int line_no = 0;
+        char[:] first = { (char *)0, 0 };
+        char[:] key = { (char *)0, 0 };
+        char[:] raw = { (char *)0, 0 };
+        int sep = -1;
+        int seplen = 0;
+        int vstart = 0;
+        int off = 0;
+        int i = 0;
+
+        if (r->at >= r->s.len)
+            return 0;
+        /* 一条物理行 */
+        start = r->at;
+        end = start;
+        while (end < r->s.len && r->s.data[end] != '\n')
+            end++;
+        r->at = (end < r->s.len) ? end + 1 : end;
+        r->line++;
+        line_no = r->line;
+        raw_end = end;
+        if (raw_end > start && r->s.data[raw_end - 1] == '\r')
+            raw_end--;
+        first = p_trim((char[:]){ r->s.data + start, raw_end - start });
+        if (first.len == 0)
+            continue;
+        if (first.data[0] == '#' || first.data[0] == '!')
+            continue;
+        /* 续行：把后面物理行并进同一条逻辑行的原始区间 */
+        while (p_open_end(p_trim((char[:]){ r->s.data + start, raw_end - start }))) {
+            int ns = 0;
+            int ne = 0;
+
+            if (r->at >= r->s.len)
+                break;
+            ns = r->at;
+            ne = ns;
+            while (ne < r->s.len && r->s.data[ne] != '\n')
+                ne++;
+            r->at = (ne < r->s.len) ? ne + 1 : ne;
+            r->line++;
+            raw_end = ne;
+            if (raw_end > ns && r->s.data[raw_end - 1] == '\r')
+                raw_end--;
+        }
+        raw = p_trim((char[:]){ r->s.data + start, raw_end - start });
+        /* `.env` 的 export 前缀（后面必须跟空白） */
+        key = first;
+        if (key.len > 7 && memcmp(key.data, "export", 6) == 0
+            && (key.data[6] == ' ' || key.data[6] == '\t'))
+            key = p_trim((char[:]){ key.data + 6, key.len - 6 });
+        /* 键终止符：第一个未转义的 '='、':' 或空白 */
+        for (i = 0; i < key.len; i++) {
+            int c = (u8)key.data[i];
+
+            if (c == '\\') {
+                i++;
+                continue;
+            }
+            if (c == '=' || c == ':') {
+                sep = i;
+                seplen = 1;
+                break;
+            }
+            if (c == ' ' || c == '\t' || c == '\f') {
+                sep = i;
+                seplen = 0;
+                break;
+            }
+        }
+        if (sep < 0) {
+            /* 键单独一行 = 空值；有续行时值也按空处理（文档里写明） */
+            out->key = (Str){ key };
+            out->value = (Str){ { (char *)0, 0 } };
+            out->line = line_no;
+            return 1;
+        }
+        if (sep == 0) {
+            r->err = line_no;
+            return -1;
+        }
+        out->key = (Str){ p_trim((char[:]){ key.data, sep }) };
+        if (out->key.s.len == 0) {
+            r->err = line_no;
+            return -1;
+        }
+        /* 值起点：分隔符之后，跳空白；空白分隔时再认一个 '='/':' */
+        vstart = sep + seplen;
+        while (vstart < key.len
+               && (key.data[vstart] == ' ' || key.data[vstart] == '\t'))
+            vstart++;
+        if (seplen == 0 && vstart < key.len
+            && (key.data[vstart] == '=' || key.data[vstart] == ':')) {
+            vstart++;
+            while (vstart < key.len
+                   && (key.data[vstart] == ' ' || key.data[vstart] == '\t'))
+                vstart++;
+        }
+        off = (int)(key.data - r->s.data) + vstart;
+        if (off > raw_end)
+            off = raw_end;
+        out->value = (Str){ p_trim((char[:]){ r->s.data + off, raw_end - off }) };
+        out->line = line_no;
+        return 1;
+    }
+}
+
+/* 在整段文本里找 key（**原始写法**比较，重复时取最后一个，后写覆盖先写）。
+   命中返回 1 并写 *out（原始值视图）；没找到、参数错或有语法错误返回 0。 */
+int props_lookup(char[:] text, char[:] key, Str *out)
+{
+    PropsReader r = props_open(text);
+    PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+    Str hit = { { (char *)0, 0 } };
+    int found = 0;
+    int rc = 0;
+
+    if (!out || key.len <= 0)
+        return 0;
+    for (;;) {
+        rc = r.next(&e);
+        if (rc == 0)
+            break;
+        if (rc < 0)
+            return 0;
+        if (!p_eq(e.key.s, key))
+            continue;
+        hit = e.value;
+        found = 1;
+    }
+    if (!found)
+        return 0;
+    *out = hit;
+    return 1;
+}
+
+int props_has(char[:] text, char[:] key)
+{
+    Str v = { { (char *)0, 0 } };
+
+    return props_lookup(text, key, &v);
+}
+
+/* 有多少条键值（同名也算多次，和读取器看到的一致）；语法错误返回 -1。 */
+int props_count(char[:] text)
+{
+    PropsReader r = props_open(text);
+    PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+    int n = 0;
+    int rc = 0;
+
+    for (;;) {
+        rc = r.next(&e);
+        if (rc == 0)
+            return n;
+        if (rc < 0)
+            return -1;
+        n++;
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int str_is(Str s, char *lit, int n)
+{
+    if (s.s.len != n)
+        return 0;
+    if (n == 0)
+        return 1;
+    return memcmp(s.s.data, lit, (size_t)n) == 0;
+}
+
+test "基本形态：三种分隔符、空值、export、注释" {
+    char[:] text = S("# 注释\n"
+                     "! 也是注释\n"
+                     "\n"
+                     "name = demo\n"
+                     "host:localhost\n"
+                     "port 8080\n"
+                     "empty=\n"
+                     "export TOKEN=abc\n"
+                     "export=1\n");
+
+    PropsReader r = props_open(text);
+    PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+
+    if (r.next(&e) != 1 || e.line != 4)
+        return err(1, "第一条应当是第 4 行");
+    if (!str_is(e.key, "name", 4) || !str_is(e.value, "demo", 4))
+        return err(2, "a=1 形态不对");
+    if (r.next(&e) != 1 || !str_is(e.key, "host", 4)
+        || !str_is(e.value, "localhost", 9) || e.line != 5)
+        return err(3, "冒号分隔不对");
+    if (r.next(&e) != 1 || !str_is(e.key, "port", 4)
+        || !str_is(e.value, "8080", 4))
+        return err(4, "空白分隔不对");
+    if (r.next(&e) != 1 || !str_is(e.key, "empty", 5) || e.value.s.len != 0)
+        return err(5, "空值不对");
+    if (r.next(&e) != 1 || !str_is(e.key, "TOKEN", 5)
+        || !str_is(e.value, "abc", 3))
+        return err(6, "export 前缀不对");
+    if (r.next(&e) != 1 || !str_is(e.key, "export", 6)
+        || !str_is(e.value, "1", 1))
+        return err(7, "export=1 的键不该被吃掉");
+    if (r.next(&e) != 0)
+        return err(8, "应当读完了");
+}
+
+test "转义解码：控制字符、反斜杠、\\u 与代理对" {
+    char[:] text = S("a=one\\ntwo\\tthree\\\\four\n"
+                     "b=\\u4e2d\\u6587\n"
+                     "c=\\ud83d\\ude00\n"
+                     "d=\\:= \\#\n");
+    PropsReader r = props_open(text);
+    PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+    char buf[64] = { 0 };
+    int n = 0;
+
+    r.next(&e);
+    n = e.decode((char[:]){ buf, (int)sizeof buf });
+    if (n != 18)
+        return err(10, "控制字符解码长度不对");
+    if (memcmp(buf, "one\ntwo\tthree\\four", 18) != 0)
+        return err(11, "控制字符解码内容不对");
+    n = props_decoded_len(e.value.s);
+    if (n != 18)
+        return err(12, "decoded_len 和 decode 不一致");
+    r.next(&e);
+    n = e.decode((char[:]){ buf, (int)sizeof buf });
+    if (n != 6 || memcmp(buf, "\xe4\xb8\xad\xe6\x96\x87", 6) != 0)
+        return err(13, "\\u4e2d\\u6587 没有解成 UTF-8");
+    r.next(&e);
+    n = e.decode((char[:]){ buf, (int)sizeof buf });
+    if (n != 4 || memcmp(buf, "\xf0\x9f\x98\x80", 4) != 0)
+        return err(14, "代理对没有合并");
+    r.next(&e);
+    n = e.decode((char[:]){ buf, (int)sizeof buf });
+    if (n != 4 || memcmp(buf, ":= #", 4) != 0)
+        return err(15, "转义的分隔符/井号不对");
+    if (r.next(&e) != 0)
+        return err(16, "应当读完了");
+}
+
+test "续行：反斜杠 + 换行，下一行前导空白丢掉" {
+    char[:] text = S("greet=hello, \\\n"
+                     "      world\n"
+                     "path=a\\\\\n"
+                     "b=1\n");
+    PropsReader r = props_open(text);
+    PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+    char buf[64] = { 0 };
+    int n = 0;
+
+    if (r.next(&e) != 1 || !str_is(e.key, "greet", 5) || e.line != 1)
+        return err(20, "续行的第一条不对");
+    n = e.decode((char[:]){ buf, (int)sizeof buf });
+    if (n != 12 || memcmp(buf, "hello, world", 12) != 0)
+        return err(21, "续行没有拼成一行");
+    if (r.next(&e) != 1 || !str_is(e.key, "path", 4))
+        return err(22, "第二条不对");
+    n = e.decode((char[:]){ buf, (int)sizeof buf });
+    if (n != 2 || memcmp(buf, "a\\", 2) != 0)
+        return err(23, "偶数个反斜杠不该续行");
+    if (r.next(&e) != 1 || !str_is(e.key, "b", 1)
+        || !str_is(e.value, "1", 1) || e.line != 4)
+        return err(24, "续行之后的行号/内容不对");
+    if (r.next(&e) != 0)
+        return err(25, "应当读完了");
+}
+
+test "错误：空键、坏 \\u、缓冲不够" {
+    PropsReader bad = props_open(S("=v\n"));
+    PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+    PropsReader bad2 = props_open(S("x=1\n"
+                                    "\\u12=2\n"));
+    char out[2] = { 0 };
+    Str v = { { (char *)0, 0 } };
+
+    if (bad.next(&e) != -1 || bad.err != 1)
+        return err(30, "空键没有报错");
+    if (bad2.next(&e) != 1)
+        return err(31, "第一条应当正常");
+    if (props_decode(S("\\u12"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(32, "坏的 \\u 应当返回 -1");
+    if (props_decode(S("\\ud83d"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(33, "落单高代理应当返回 -1");
+    if (props_decode(S("\\ude00"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(34, "落单低代理应当返回 -1");
+    if (props_decode(S("\\u4e2d"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(35, "缓冲放不下应当返回 -1");
+    if (props_decoded_len(S("\\q")) != 1)
+        return err(36, "未知转义应当只留字符");
+    if (props_has(S("a=1\nb=2\n"), S("b")) != 1
+        || props_has(S("a=1\n"), S("z")) != 0)
+        return err(37, "props_has 不对");
+    if (props_lookup(S("a=1\na=2\n"), S("a"), &v) != 1 || !str_is(v, "2", 1))
+        return err(38, "重复键应当后写覆盖");
+    if (props_count(S("a=1\n#c\nb=2\n")) != 2)
+        return err(39, "props_count 不对");
+    if (props_count(S("=bad\n")) != -1)
+        return err(40, "props_count 应当把语法错误报成 -1");
+}

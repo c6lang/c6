@@ -39,6 +39,16 @@
   `ini_open`）仍是自由函数。`std/`、`examples/std*.c6`、`docs/stdlib.md`、`README.md`
   已全部改用方法语法。
 
+- **标准库第十批**：`std.data.props` / `std.net.multipart` / `std.encoding.punycode` /
+  `std.text.width` 四个模块，集成示例 `examples/stdform.c6`（`make std-form`）。
+  props 读 `.properties`/`.env`（三种分隔符、`export`、续行、`\uXXXX` 与代理对、
+  语法错误给行号，值视图保留转义原文、`decode` 才解）；multipart 零分配解析
+  `multipart/form-data`（boundary 引号、伪分隔符当 preamble、无头 part、CRLF/LF）；
+  punycode 覆盖 RFC 3492 与 IDNA 的 `xn--` 层（纯 ASCII 带结尾 `-`、63/255 字节
+  上限、解码溢出检查）；width 用 Unicode 15.0 的 EastAsianWidth/通用类别表算
+  终端列数并做裁剪/补齐（不做字素簇合并）。错误号段
+  `std.data.props`=0x6031 … `std.text.width`=0x6034。
+
 - **标准库第九批**：`std.container.list` / `std.container.ring` / `std.text.utf16` /
   `std.text.ansi` 四个模块，集成示例 `examples/stdnode.c6`（`make std-node`）。
   侵入式双向链表不拥有节点、remove 先确认归属；环形队列借用调用方数组、满时不

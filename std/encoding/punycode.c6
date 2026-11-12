@@ -1,0 +1,752 @@
+/* std/encoding/punycode：Punycode（RFC 3492）与 IDNA 的 `xn--` 层。
+ *
+ *     import std.encoding.punycode;
+ *
+ *     char out[64] = { 0 };
+ *     punycode_encode(S("münchen"), (char[:]){ out, (int)sizeof out });   // 10, "mnchen-3ya"
+ *     idna_encode(S("中文.cn"), (char[:]){ out, (int)sizeof out });        // 15, "xn--fiq228c.cn"
+ *
+ * 两层是分开的：
+ *
+ * - `punycode_encode`/`punycode_decode` 只做 RFC 3492 的 Bootstring（参数
+ *   base=36 / tmin=1 / tmax=26 / skew=38 / damp=700 / initial_bias=72 /
+ *   initial_n=128），输入/输出都是 UTF-8；纯 ASCII 输入也会带上结尾的 `-`
+ *   （RFC 的例子 `abc` → `abc-`），这是协议原文，不是 bug。
+ * - `idna_encode`/`idna_decode` 按 `.` 切标签（也认 U+3002/U+FF0E/U+FF61 三个
+ *   Unicode 句点），只把**含非 ASCII**的标签编成 `xn--...`，纯 ASCII 标签原样
+ *   拷贝；标签 63 字节、整条域名 255 字节的上限在这里检查。
+ *
+ * 和 base64/base32 一样：写调用方缓冲，放不下返回 -1 且**一个字节都不写**；
+ * `*_len` 给出精确长度（不是上界），所以「先问长度再给缓冲」是一条正常路径。
+ * 不分配、不做 Unicode 归一化/大小写折叠（没有大小写表）：`MÜNCHEN.de` 不会
+ * 变成 `münchen.de` 的编码，要 IDNA2003 的映射请先把输入归一。
+ *
+ * 解码侧的合法性：基本码点必须 < 0x80、数字只认 `a-z`/`0-9`、插入的码点拒绝
+ * 代理区与 > U+10FFFF、delta/w 的乘加都做溢出检查；不合法一律 -1。
+ */
+#include <string.h>
+
+module std.encoding.punycode;
+import std.core.types;
+import std.core.err;
+import std.text.utf8;
+
+enum Error { OK = 0, INVAL = 1, RANGE = 2, PARSE = 3 };
+
+/* RFC 3492 §5 的 Bootstring 参数 */
+#define PUNY_BASE 36
+#define PUNY_TMIN 1
+#define PUNY_TMAX 26
+#define PUNY_SKEW 38
+#define PUNY_DAMP 700
+#define PUNY_INITIAL_BIAS 72
+#define PUNY_INITIAL_N 128
+#define PUNY_MAX 0x7fffffffu
+
+static u64 puny_t(u64 k, u64 bias)
+{
+    if (k <= bias)
+        return PUNY_TMIN;
+    if (k >= bias + PUNY_TMAX)
+        return PUNY_TMAX;
+    return k - bias;
+}
+
+/* RFC 3492 §6.1 的 adapt */
+static int puny_adapt(u64 delta, int numpoints, int first)
+{
+    u64 k = 0;
+
+    delta = first ? delta / PUNY_DAMP : delta / 2;
+    delta += delta / (u64)numpoints;
+    while (delta > ((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX) / 2) {
+        delta /= PUNY_BASE - PUNY_TMIN;
+        k += PUNY_BASE;
+    }
+    return (int)(k + (PUNY_BASE - PUNY_TMIN + 1) * delta / (delta + PUNY_SKEW));
+}
+
+static char puny_digit(int d)
+{
+    return (char)(d < 26 ? 'a' + d : '0' + d - 26);
+}
+
+static int puny_digit_val(int c)
+{
+    if (c >= 'a' && c <= 'z')
+        return c - 'a';
+    if (c >= '0' && c <= '9')
+        return c - '0' + 26;
+    return -1;
+}
+
+static void puny_put(char *dst, int cap, int *o, int c)
+{
+    if (dst && *o < cap)
+        dst[*o] = (char)c;
+    (*o)++;
+}
+
+/* 编码内核：dst 为 0 时只算长度。返回字节数 / -1。 */
+static int puny_enc_core(char[:] in, char *dst, int cap)
+{
+    int o = 0;
+    int b = 0;
+    int h = 0;
+    int total = 0;
+    int i = 0;
+    u64 n = PUNY_INITIAL_N;
+    u64 delta = 0;
+    u64 bias = PUNY_INITIAL_BIAS;
+
+    /* 第一遍：基本码点先原样输出，顺带数总码点数 */
+    while (i < in.len) {
+        u32 cp = 0;
+        int sz = utf8_decode(in, i, &cp);
+
+        if (sz <= 0)
+            return -1;
+        total++;
+        if (cp < 0x80u) {
+            puny_put(dst, cap, &o, (int)cp);
+            b++;
+        }
+        i += sz;
+    }
+    h = b;
+    if (b > 0)
+        puny_put(dst, cap, &o, '-');
+    while (h < total) {
+        u64 m = PUNY_MAX;
+        u64 k = PUNY_BASE;
+
+        i = 0;
+        while (i < in.len) {
+            u32 cp = 0;
+            int sz = utf8_decode(in, i, &cp);
+
+            if ((u64)cp >= n && (u64)cp < m)
+                m = (u64)cp;
+            i += sz;
+        }
+        if (m > 0x10ffffu)
+            return -1;
+        if ((m - n) > (PUNY_MAX - delta) / (u64)(h + 1))
+            return -1;
+        delta += (m - n) * (u64)(h + 1);
+        n = m;
+        i = 0;
+        while (i < in.len) {
+            u32 cp = 0;
+            int sz = utf8_decode(in, i, &cp);
+
+            if ((u64)cp < n) {
+                if (delta >= PUNY_MAX)
+                    return -1;
+                delta++;
+            } else if ((u64)cp == n) {
+                u64 q = delta;
+
+                k = PUNY_BASE;
+                for (;;) {
+                    u64 t = puny_t(k, bias);
+
+                    if (q < t)
+                        break;
+                    puny_put(dst, cap, &o,
+                             puny_digit((int)(t + (q - t) % (PUNY_BASE - t))));
+                    q = (q - t) / (PUNY_BASE - t);
+                    k += PUNY_BASE;
+                }
+                puny_put(dst, cap, &o, puny_digit((int)q));
+                bias = (u64)puny_adapt(delta, h + 1, h == b);
+                delta = 0;
+                h++;
+            }
+            i += sz;
+        }
+        delta++;
+        n++;
+    }
+    return o;
+}
+
+static int puny_u8len(int b)
+{
+    if (b < 0x80)
+        return 1;
+    if (b >= 0xf0)
+        return 4;
+    if (b >= 0xe0)
+        return 3;
+    return 2;
+}
+
+/* 往 dst 写一个已经校验过的码点，返回字节数 */
+static int puny_cp_bytes(u32 cp, char *dst)
+{
+    if (cp < 0x80u) {
+        if (dst)
+            dst[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800u) {
+        if (dst) {
+            dst[0] = (char)(0xc0u | (cp >> 6));
+            dst[1] = (char)(0x80u | (cp & 0x3fu));
+        }
+        return 2;
+    }
+    if (cp < 0x10000u) {
+        if (dst) {
+            dst[0] = (char)(0xe0u | (cp >> 12));
+            dst[1] = (char)(0x80u | ((cp >> 6) & 0x3fu));
+            dst[2] = (char)(0x80u | (cp & 0x3fu));
+        }
+        return 3;
+    }
+    if (dst) {
+        dst[0] = (char)(0xf0u | (cp >> 18));
+        dst[1] = (char)(0x80u | ((cp >> 12) & 0x3fu));
+        dst[2] = (char)(0x80u | ((cp >> 6) & 0x3fu));
+        dst[3] = (char)(0x80u | (cp & 0x3fu));
+    }
+    return 4;
+}
+
+/* 第 cp_index 个码点在 dst 里的字节偏移（dst 必须已经是合法 UTF-8） */
+static int puny_off_of(char *dst, int olen, int cp_index)
+{
+    int off = 0;
+    int k = 0;
+
+    while (k < cp_index && off < olen) {
+        off += puny_u8len((u8)dst[off]);
+        k++;
+    }
+    return off;
+}
+
+/* 解码内核：dst 为 0 时只算长度。返回字节数 / -1。 */
+static int puny_dec_core(char[:] in, char *dst, int cap)
+{
+    int olen = 0;
+    int ocount = 0;
+    int delim = -1;
+    int pos = 0;
+    int k = 0;
+    u64 n = PUNY_INITIAL_N;
+    u64 delta = 0;
+    u64 bias = PUNY_INITIAL_BIAS;
+
+    /* 最后一个 '-' 之前的都是基本码点 */
+    for (k = 0; k < in.len; k++)
+        if (in.data[k] == '-')
+            delim = k;
+    for (k = 0; k < (delim >= 0 ? delim : 0); k++) {
+        if ((u8)in.data[k] >= 0x80)
+            return -1;
+        if (dst && olen < cap)
+            dst[olen] = in.data[k];
+        olen++;
+        ocount++;
+    }
+    pos = (delim >= 0) ? delim + 1 : 0;
+    while (pos < in.len) {
+        u64 oldi = delta;
+        u64 w = 1;
+        u64 kk = PUNY_BASE;
+
+        for (;;) {
+            int digit = 0;
+
+            if (pos >= in.len)
+                return -1;          /* 数字串被截断 */
+            digit = puny_digit_val((u8)in.data[pos++]);
+            if (digit < 0)
+                return -1;
+            if ((u64)digit > (PUNY_MAX - delta) / w)
+                return -1;
+            delta += (u64)digit * w;
+            {
+                u64 t = puny_t(kk, bias);
+
+                if ((u64)digit < t)
+                    break;
+                if (w > PUNY_MAX / (PUNY_BASE - t))
+                    return -1;
+                w *= (PUNY_BASE - t);
+                kk += PUNY_BASE;
+            }
+        }
+        bias = (u64)puny_adapt(delta - oldi, ocount + 1, oldi == 0);
+        if (n > 0x10ffffu)
+            return -1;
+        if ((delta / (u64)(ocount + 1)) > (u64)(0x10ffffu - n))
+            return -1;
+        n += delta / (u64)(ocount + 1);
+        delta = delta % (u64)(ocount + 1);
+        if (n > 0x10ffffu || (n >= 0xd800u && n <= 0xdfffu))
+            return -1;
+        {
+            int need = puny_cp_bytes((u32)n, (char *)0);
+
+            if (dst) {
+                int off = puny_off_of(dst, olen, (int)delta);
+
+                memmove(dst + off + need, dst + off, (size_t)(olen - off));
+                puny_cp_bytes((u32)n, dst + off);
+            }
+            olen += need;
+            ocount++;
+        }
+        delta++;
+    }
+    return olen;
+}
+
+/* ---- 公开接口：Punycode ---- */
+
+/* 编码后的精确长度（纯 ASCII 也会含结尾的 '-'）；输入非法返回 -1。 */
+int punycode_encoded_len(char[:] in)
+{
+    return puny_enc_core(in, (char *)0, 0);
+}
+
+/* 编码：返回长度；放不下或输入非法返回 -1（一个字节都不写）。 */
+int punycode_encode(char[:] in, char[:] out)
+{
+    int need = puny_enc_core(in, (char *)0, 0);
+
+    if (need < 0 || need > out.len)
+        return -1;
+    puny_enc_core(in, out.data, out.len);
+    return need;
+}
+
+/* 解码后的精确 UTF-8 字节数；输入不是合法 punycode 返回 -1。 */
+int punycode_decoded_len(char[:] in)
+{
+    return puny_dec_core(in, (char *)0, 0);
+}
+
+/* 解码：返回 UTF-8 字节数；放不下或输入非法返回 -1。 */
+int punycode_decode(char[:] in, char[:] out)
+{
+    int need = puny_dec_core(in, (char *)0, 0);
+
+    if (need < 0 || need > out.len)
+        return -1;
+    puny_dec_core(in, out.data, out.len);
+    return need;
+}
+
+/* ---- IDNA ---- */
+
+/* 标签分隔符：ASCII '.'、U+3002、U+FF0E、U+FF61；返回字节数，0 = 不是 */
+static int idna_sep(char[:] d, int i)
+{
+    int c = (u8)d.data[i];
+
+    if (c == '.')
+        return 1;
+    if (c == 0xe3 && i + 2 < d.len && (u8)d.data[i + 1] == 0x80
+        && (u8)d.data[i + 2] == 0x82)
+        return 3;
+    if (c == 0xef && i + 2 < d.len && (u8)d.data[i + 1] == 0xbc
+        && (u8)d.data[i + 2] == 0x8e)
+        return 3;
+    if (c == 0xef && i + 2 < d.len && (u8)d.data[i + 1] == 0xbd
+        && (u8)d.data[i + 2] == 0xa1)
+        return 3;
+    return 0;
+}
+
+static int idna_ieq4(char[:] v, char *lit)
+{
+    int i = 0;
+
+    if (v.len < 4)
+        return 0;
+    for (i = 0; i < 4; i++) {
+        int a = (u8)v.data[i];
+        int b = (u8)lit[i];
+
+        if (a >= 'A' && a <= 'Z')
+            a = a - 'A' + 'a';
+        if (a != b)
+            return 0;
+    }
+    return 1;
+}
+
+/* 一个标签的 A-label：纯 ASCII 原样、否则 xn-- + punycode；标签上限 63 字节 */
+static int idna_enc_label(char[:] label, char *dst, int cap)
+{
+    int ascii = 1;
+    int i = 0;
+    int need = 0;
+
+    for (i = 0; i < label.len; i++)
+        if ((u8)label.data[i] >= 0x80)
+            ascii = 0;
+    if (ascii) {
+        if (label.len <= 0 || label.len > 63)
+            return -1;
+        if (dst)
+            memcpy(dst, label.data, (size_t)label.len);
+        return label.len;
+    }
+    need = puny_enc_core(label, (char *)0, 0);
+    if (need < 0 || 4 + need > 63)
+        return -1;
+    if (dst) {
+        memcpy(dst, "xn--", 4);
+        puny_enc_core(label, dst + 4, cap - 4);
+    }
+    return 4 + need;
+}
+
+static int idna_enc_core(char[:] d, char *dst, int cap)
+{
+    int o = 0;
+    int start = 0;
+    int i = 0;
+
+    if (!d.data || d.len <= 0)
+        return 0;
+    while (i < d.len) {
+        int sep = idna_sep(d, i);
+        int need = 0;
+
+        if (sep <= 0) {
+            i++;
+            continue;
+        }
+        if (i == start)
+            return -1;              /* 空标签：开头或连续分隔符 */
+        need = idna_enc_label((char[:]){ d.data + start, i - start },
+                             dst ? dst + o : (char *)0, cap - o);
+        if (need < 0)
+            return -1;
+        o += need;
+        if (dst)
+            puny_put(dst, cap, &o, '.');
+        else
+            o++;
+        i += sep;
+        start = i;
+    }
+    if (start < d.len) {
+        int need = idna_enc_label((char[:]){ d.data + start, d.len - start },
+                                  dst ? dst + o : (char *)0, cap - o);
+
+        if (need < 0)
+            return -1;
+        o += need;
+    }
+    if (o > 255)
+        return -1;                  /* DNS 域名上限 */
+    return o;
+}
+
+/* 一个 A-label 解回 UTF-8：xn-- 前缀走 punycode，其余按 ASCII 原样 */
+static int idna_dec_label(char[:] label, char *dst, int cap)
+{
+    int i = 0;
+
+    if (label.len <= 0 || label.len > 63)
+        return -1;
+    if (idna_ieq4(label, (char *)"xn--")) {
+        char[:] rest = { label.data + 4, label.len - 4 };
+        int need = puny_dec_core(rest, (char *)0, 0);
+
+        if (need <= 0)
+            return -1;              /* 空的 A-label 不算域名 */
+        if (dst)
+            puny_dec_core(rest, dst, cap);
+        return need;
+    }
+    for (i = 0; i < label.len; i++)
+        if ((u8)label.data[i] >= 0x80)
+            return -1;              /* 输入应当是 A-label（ASCII） */
+    if (dst)
+        memcpy(dst, label.data, (size_t)label.len);
+    return label.len;
+}
+
+static int idna_dec_core(char[:] d, char *dst, int cap)
+{
+    int o = 0;
+    int start = 0;
+    int i = 0;
+
+    if (!d.data || d.len <= 0)
+        return 0;
+    while (i < d.len) {
+        int need = 0;
+
+        if ((u8)d.data[i] != '.') {
+            i++;
+            continue;
+        }
+        if (i == start)
+            return -1;
+        need = idna_dec_label((char[:]){ d.data + start, i - start },
+                              dst ? dst + o : (char *)0, cap - o);
+        if (need < 0)
+            return -1;
+        o += need;
+        if (dst)
+            puny_put(dst, cap, &o, '.');
+        else
+            o++;
+        i++;
+        start = i;
+    }
+    if (start < d.len) {
+        int need = idna_dec_label((char[:]){ d.data + start, d.len - start },
+                                  dst ? dst + o : (char *)0, cap - o);
+
+        if (need < 0)
+            return -1;
+        o += need;
+    }
+    if (o > 255)
+        return -1;
+    return o;
+}
+
+/* 域名 -> A-label 形式的精确长度；非法返回 -1。 */
+int idna_encoded_len(char[:] d)
+{
+    return idna_enc_core(d, (char *)0, 0);
+}
+
+/* 域名 -> A-label（`münchen.de` -> `xn--mnchen-3ya.de`）；放不下返回 -1。 */
+int idna_encode(char[:] d, char[:] out)
+{
+    int need = idna_enc_core(d, (char *)0, 0);
+
+    if (need < 0 || need > out.len)
+        return -1;
+    idna_enc_core(d, out.data, out.len);
+    return need;
+}
+
+/* A-label -> UTF-8 域名的精确长度；非法返回 -1。 */
+int idna_decoded_len(char[:] d)
+{
+    return idna_dec_core(d, (char *)0, 0);
+}
+
+/* A-label -> UTF-8 域名（`xn--fiq228c.cn` -> `中文.cn`）；放不下返回 -1。 */
+int idna_decode(char[:] d, char[:] out)
+{
+    int need = idna_dec_core(d, (char *)0, 0);
+
+    if (need < 0 || need > out.len)
+        return -1;
+    idna_dec_core(d, out.data, out.len);
+    return need;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int bytes_are(char[:] v, char *lit, int n)
+{
+    if (v.len < n)
+        return 0;
+    if (n == 0)
+        return 1;
+    return memcmp(v.data, lit, (size_t)n) == 0;
+}
+
+test "RFC 3492 编码向量与纯 ASCII 的结尾 '-'" {
+    char out[64] = { 0 };
+    int n = 0;
+    char *cases[8] = {
+        (char *)"m\xc3\xbcnchen",
+        (char *)"\xe4\xb8\xad\xe6\x96\x87",
+        (char *)"\xe4\xbb\x96\xe4\xbb\xac\xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88\xe4\xb8\x8d\xe8\xaf\xb4\xe4\xb8\xad\xe6\x96\x87",
+        (char *)"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e",
+        (char *)"\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4",
+        (char *)"\xd0\xbf\xd1\x80\xd0\xb8\xd0\xbc\xd0\xb5\xd1\x80",
+        (char *)"\xf0\x9f\x98\x80",
+        (char *)"abc",
+    };
+    char *want[8] = {
+        (char *)"mnchen-3ya",
+        (char *)"fiq228c",
+        (char *)"ihqwcrb4cv8a8dqg056pqjye",
+        (char *)"wgv71a119e",
+        (char *)"3e0bk47br7k",
+        (char *)"e1afmkfd",
+        (char *)"e28h",
+        (char *)"abc-",
+    };
+    int lens[8] = { 10, 7, 24, 10, 11, 8, 4, 4 };
+    int i = 0;
+
+    for (i = 0; i < 8; i++) {
+        int len = (int)strlen(cases[i]);
+
+        n = punycode_encode((char[:]){ cases[i], len },
+                            (char[:]){ out, (int)sizeof out });
+        if (n != lens[i] || !bytes_are((char[:]){ out, n }, want[i], lens[i]))
+            return err(1 + i, "编码向量不对");
+        if (punycode_encoded_len((char[:]){ cases[i], len }) != lens[i])
+            return err(20 + i, "encoded_len 和 encode 不一致");
+    }
+    if (punycode_encoded_len(S("")) != 0
+        || punycode_encode(S(""), (char[:]){ out, (int)sizeof out }) != 0)
+        return err(30, "空输入应当编成空");
+}
+
+test "解码：往返、基本码点、结束位置与非法输入" {
+    char out[64] = { 0 };
+    char *enc[6] = {
+        (char *)"mnchen-3ya",
+        (char *)"fiq228c",
+        (char *)"ihqwcrb4cv8a8dqg056pqjye",
+        (char *)"wgv71a119e",
+        (char *)"3e0bk47br7k",
+        (char *)"e28h",
+    };
+    char *want[6] = {
+        (char *)"m\xc3\xbcnchen",
+        (char *)"\xe4\xb8\xad\xe6\x96\x87",
+        (char *)"\xe4\xbb\x96\xe4\xbb\xac\xe4\xb8\xba\xe4\xbb\x80\xe4\xb9\x88\xe4\xb8\x8d\xe8\xaf\xb4\xe4\xb8\xad\xe6\x96\x87",
+        (char *)"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e",
+        (char *)"\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4",
+        (char *)"\xf0\x9f\x98\x80",
+    };
+    int i = 0;
+
+    for (i = 0; i < 6; i++) {
+        int elen = (int)strlen(enc[i]);
+        int wlen = (int)strlen(want[i]);
+        int n = punycode_decode((char[:]){ enc[i], elen },
+                                (char[:]){ out, (int)sizeof out });
+
+        if (n != wlen || !bytes_are((char[:]){ out, n }, want[i], wlen))
+            return err(40 + i, "解码向量不对");
+        if (punycode_decoded_len((char[:]){ enc[i], elen }) != wlen)
+            return err(50 + i, "decoded_len 和 decode 不一致");
+    }
+    if (punycode_decode(S("abc-"), (char[:]){ out, (int)sizeof out }) != 3
+        || !bytes_are((char[:]){ out, 3 }, "abc", 3))
+        return err(60, "基本码点 + 结尾 '-' 的解码不对");
+    if (punycode_decode(S(""), (char[:]){ out, (int)sizeof out }) != 0)
+        return err(61, "空输入应当解成空");
+    if (punycode_decode(S("mnchen-3yA"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(62, "大写数字应当被拒");
+    if (punycode_decode(S("mnchen-3"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(63, "截断的数字串应当被拒");
+    if (punycode_decode(S("\xc3\xbc-"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(64, "非 ASCII 的基本码点应当被拒");
+    if (punycode_decode(S("99999999999999999999"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(65, "溢出的 delta 应当被拒");
+}
+
+test "IDNA：编码/解码与标签边界" {
+    char out[128] = { 0 };
+    int n = 0;
+
+    n = idna_encode(S("m\xc3\xbcnchen.de"), (char[:]){ out, (int)sizeof out });
+    if (n != 17 || !bytes_are((char[:]){ out, n }, "xn--mnchen-3ya.de", 17))
+        return err(70, "münchen.de 的 A-label 不对");
+    if (idna_encoded_len(S("m\xc3\xbcnchen.de")) != 17)
+        return err(71, "idna_encoded_len 不一致");
+    n = idna_encode(S("\xe4\xb8\xad\xe6\x96\x87.cn"), (char[:]){ out, (int)sizeof out });
+    if (n != 14 || !bytes_are((char[:]){ out, n }, "xn--fiq228c.cn", 14))
+        return err(72, "中文.cn 的 A-label 不对");
+    n = idna_encode(S("\xd0\xbf\xd1\x80\xd0\xb8\xd0\xbc\xd0\xb5\xd1\x80.\xd1\x80\xd1\x84"),
+                    (char[:]){ out, (int)sizeof out });
+    if (n != 21 || !bytes_are((char[:]){ out, n }, "xn--e1afmkfd.xn--p1ai", 21))
+        return err(73, "пример.рф 的 A-label 不对");
+    n = idna_encode(S("Example.COM"), (char[:]){ out, (int)sizeof out });
+    if (n != 11 || !bytes_are((char[:]){ out, n }, "Example.COM", 11))
+        return err(74, "纯 ASCII 标签应当原样拷贝");
+    n = idna_encode(S("m\xc3\xbcnchen.de."), (char[:]){ out, (int)sizeof out });
+    if (n != 18 || out[17] != '.')
+        return err(75, "结尾的点应当保留");
+    n = idna_decode(S("xn--mnchen-3ya.de"), (char[:]){ out, (int)sizeof out });
+    if (n != 11 || !bytes_are((char[:]){ out, n }, "m\xc3\xbcnchen.de", 11))
+        return err(76, "idna_decode 往返不对");
+    n = idna_decode(S("xn--fiq228c.cn"), (char[:]){ out, (int)sizeof out });
+    if (n != 9 || !bytes_are((char[:]){ out, n }, "\xe4\xb8\xad\xe6\x96\x87.cn", 9))
+        return err(77, "中文 A-label 解码不对");
+    if (idna_decoded_len(S("xn--e1afmkfd.xn--p1ai")) != 17)
+        return err(78, "idna_decoded_len 不一致");
+    n = idna_decode(S("example.com"), (char[:]){ out, (int)sizeof out });
+    if (n != 11 || !bytes_are((char[:]){ out, n }, "example.com", 11))
+        return err(79, "普通域名解码应当原样");
+    if (idna_encode(S("a..b"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(80, "连续分隔符应当被拒");
+    if (idna_encode(S(".ab"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(81, "开头的分隔符应当被拒");
+    if (idna_decode(S("xn--"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(82, "空的 A-label 应当被拒");
+    if (idna_decode(S("xn--a!!"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(83, "坏 punycode 应当被拒");
+    if (idna_decode(S("\xe4\xb8\xad.cn"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(84, "idna_decode 只接受 ASCII 输入");
+    if (idna_encode(S("aaaa..."), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(85, "空标签应当被拒");
+}
+
+test "IDNA：Unicode 句点、63 字节标签上限与缓冲边界" {
+    char out[256] = { 0 };
+    char tiny[4] = { 0 };
+    char label[70] = { 0 };
+    char dom[80] = { 0 };
+    int i = 0;
+    int n = 0;
+
+    n = idna_encode(S("\xe4\xb8\xad\xe6\x96\x87\xe3\x80\x82" "cn"),
+                    (char[:]){ out, (int)sizeof out });
+    if (n != 14 || !bytes_are((char[:]){ out, n }, "xn--fiq228c.cn", 14))
+        return err(90, "U+3002 应当当分隔符");
+    for (i = 0; i < 64; i++) {
+        label[i] = 'a';
+        dom[i] = 'a';
+    }
+    label[64] = 0;
+    dom[64] = 0;
+    if (idna_encode((char[:]){ label, 64 }, (char[:]){ out, (int)sizeof out }) != -1)
+        return err(91, "64 字节的标签应当被拒");
+    if (idna_encode((char[:]){ label, 63 }, (char[:]){ out, (int)sizeof out }) != 63)
+        return err(92, "63 字节的标签应当收下");
+    if (idna_encode(S("m\xc3\xbcnchen.de"), (char[:]){ tiny, (int)sizeof tiny }) != -1)
+        return err(93, "缓冲不够应当 -1");
+    if (punycode_encode(S("m\xc3\xbcnchen"), (char[:]){ tiny, (int)sizeof tiny }) != -1)
+        return err(94, "punycode 缓冲不够应当 -1");
+    if (punycode_encode(S("\xff\xfe"), (char[:]){ out, (int)sizeof out }) != -1)
+        return err(95, "坏 UTF-8 应当 -1");
+    if (punycode_encode(S("abc"), (char[:]){ out, 3 }) != -1)
+        return err(96, "abc- 需要 4 格，3 格应当 -1");
+    /* 255 字节上限：4 段 63 字节 + 3 个点 = 255 刚好收下，5 段就超了 */
+    (void)dom;
+    {
+        char big[400] = { 0 };
+        int k = 0;
+        int j = 0;
+
+        for (i = 0; i < 4; i++) {
+            for (j = 0; j < 63; j++)
+                big[k++] = 'a';
+            if (i < 3)
+                big[k++] = '.';
+        }
+        if (idna_encode((char[:]){ big, k }, (char[:]){ out, (int)sizeof out }) != 255)
+            return err(97, "255 字节的域名应当收下");
+        big[k++] = '.';
+        for (j = 0; j < 63; j++)
+            big[k++] = 'a';
+        if (idna_encode((char[:]){ big, k }, (char[:]){ out, (int)sizeof out }) != -1)
+            return err(98, "超过 255 字节的域名应当被拒");
+    }
+}

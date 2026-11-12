@@ -1,0 +1,563 @@
+/* std/net/multipart：`multipart/form-data` 的零分配解析（RFC 7578 / 2046）。
+ *
+ *     import std.net.multipart;
+ *
+ *     Str ct = { S("multipart/form-data; boundary=----X") };
+ *     Multipart m = mp_open(body, ct);          // body 是整段请求体
+ *     Part p = { 0 };
+ *     while (m.next(&p) == 1) {
+ *         // p.name / p.filename / p.content_type 都是从输入里取出的视图
+ *         // p.body 是正文切片（不含分隔符两侧的 CRLF）
+ *     }
+ *
+ * 和 `std.net.http` 一样**不分配、不复制**：`Part` 的每个字段都是指向 `body`
+ * 的 `Str`/切片视图，所以 `body` 必须比它们活得久。这一层只做语法切分——
+ * 文件内容不落盘、不做 URL 解码、不做 `Content-Transfer-Encoding` 解码（RFC 7578
+ * 本来就禁用 base64/QP），需要就把 `p.body` 交给上层。
+ *
+ * 认的语法：
+ *
+ * - 分隔符是 `--` + boundary；它必须出现在 body 开头或某个 `\n` 之后
+ *   （所以分隔符前面有 CRLF 时正文不含那两个字节）；
+ * - 第一个分隔符之前的内容是 preamble，最后一个 `--boundary--` 之后的内容是
+ *   epilogue，两者都跳过；
+ * - 每个 part 的头块到**空行**为止（`\r\n\r\n` 或 `\n\n` 都认），头字段名
+ *   大小写不敏感；头块缺失（分隔符后直接是正文）时 `headers` 是空视图；
+ * - `Content-Disposition` / `Content-Type` 的值里的 `; name="..."` 参数由
+ *   `mp_param` 取，参数名大小写不敏感，引号里的 `;` 不算分隔符，去掉外层引号
+ *   （**不**解 `\"` 转义，原样保留）；
+ * - 正文到下一个分隔符之前的 CRLF/LF 为止，行尾换行不算正文。
+ *
+ * 不做的事：不校验 `boundary` 的字符集（只要求非空）、不限制 part 大小、
+ * 不处理嵌套 multipart（`multipart/mixed` 的正文会原样给出，需要时递归调用
+ * `mp_open`）。`mp_param` / `mp_header` 也可以单独用来解析任何
+ * `a; k=v; k2="v2"` 形状的头字段。
+ */
+#include <string.h>
+
+module std.net.multipart;
+import std.core.types;
+import std.core.err;
+import std.text.str;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2 };
+
+/* 一个 part；字段全是输入上的视图 */
+struct Part {
+    Str headers;        /* 整个头块（不含结尾空行；没有头时是空视图） */
+    Str disposition;    /* Content-Disposition 的值（没有就是空视图） */
+    Str name;           /* disposition 里的 name 参数 */
+    Str filename;       /* disposition 里的 filename 参数 */
+    Str content_type;   /* Content-Type 的值 */
+    char[:] body;       /* 正文切片 */
+    int index;          /* 1 起的序号 */
+};
+
+struct Multipart {
+    char[:] body;
+    Str boundary;
+    int at;             /* 下一个要扫的字节 */
+    int state;          /* 0 = 还没找第一个分隔符，1 = 在 part 起点，2 = 停在分隔符上，3 = 结束 */
+    int n;              /* 已经产出的 part 个数（给 index） */
+    int err;            /* 出错时停在的字节位置，0 = 没出错 */
+    int ok;             /* boundary 可用？ */
+};
+
+/* ---- 小工具 ---- */
+
+static int mp_blank(int c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f';
+}
+
+static char[:] mp_trim(char[:] v)
+{
+    int b = 0;
+    int e = v.len;
+
+    while (b < e && mp_blank((u8)v.data[b]))
+        b++;
+    while (e > b && mp_blank((u8)v.data[e - 1]))
+        e--;
+    return (char[:]){ v.data + b, e - b };
+}
+
+static int mp_lower(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c + 32;
+    return c;
+}
+
+/* 头字段名/参数名比较：大小写不敏感 */
+static int mp_ieq(char[:] a, char[:] b)
+{
+    int i = 0;
+
+    if (a.len != b.len)
+        return 0;
+    for (i = 0; i < a.len; i++)
+        if (mp_lower((u8)a.data[i]) != mp_lower((u8)b.data[i]))
+            return 0;
+    return 1;
+}
+
+/* 在 hay 里从 from 找 needle，返回下标或 -1 */
+static int mp_find(char[:] hay, int from, char[:] needle)
+{
+    int i = 0;
+
+    if (needle.len <= 0 || from < 0)
+        return -1;
+    for (i = from; i + needle.len <= hay.len; i++)
+        if (memcmp(hay.data + i, needle.data, (size_t)needle.len) == 0)
+            return i;
+    return -1;
+}
+
+/* 在头值 `value` 里找参数 `name`（`a; k=v; k2="v2"` 形状）：命中返回 1 并写
+   *out（去掉外层引号、两侧空白）；没有返回 0。*/
+int mp_param(Str value, Str name, Str *out)
+{
+    int i = 0;
+    int seg_start = 0;
+    int in_q = 0;
+
+    if (!out || name.s.len <= 0)
+        return 0;
+    while (i <= value.s.len) {
+        int c = (i < value.s.len) ? (u8)value.s.data[i] : ';';
+
+        if (in_q) {
+            if (c == '\\' && i + 1 < value.s.len) {
+                i += 2;
+                continue;
+            }
+            if (c == '"')
+                in_q = 0;
+            i++;
+            continue;
+        }
+        if (c == '"') {
+            in_q = 1;
+            i++;
+            continue;
+        }
+        if (c != ';') {
+            i++;
+            continue;
+        }
+        /* [seg_start, i) 是一段：Name = Value */
+        {
+            char[:] seg = mp_trim((char[:]){ value.s.data + seg_start, i - seg_start });
+            int eq = mp_find(seg, 0, (char[:]){ (char *)"=", 1 });
+
+            if (eq >= 0) {
+                char[:] pname = mp_trim((char[:]){ seg.data, eq });
+                char[:] pval = mp_trim((char[:]){ seg.data + eq + 1, seg.len - eq - 1 });
+
+                if (mp_ieq(pname, name.s)) {
+                    if (pval.len >= 2 && pval.data[0] == '"'
+                        && pval.data[pval.len - 1] == '"')
+                        pval = (char[:]){ pval.data + 1, pval.len - 2 };
+                    *out = (Str){ pval };
+                    return 1;
+                }
+            }
+        }
+        i++;
+        seg_start = i;
+    }
+    return 0;
+}
+
+/* 在 part 的头块里找头字段 name（大小写不敏感）：命中返回 1 并写 *out */
+int mp_header(Part *self, Str name, Str *out)
+{
+    int at = 0;
+
+    if (!self || !out)
+        return 0;
+    while (at < self->headers.s.len) {
+        int start = at;
+        int end = at;
+        int colon = -1;
+        char[:] line = { (char *)0, 0 };
+
+        while (end < self->headers.s.len && self->headers.s.data[end] != '\n')
+            end++;
+        at = (end < self->headers.s.len) ? end + 1 : end;
+        if (end > start && self->headers.s.data[end - 1] == '\r')
+            end--;
+        line = mp_trim((char[:]){ self->headers.s.data + start, end - start });
+        if (line.len == 0)
+            continue;
+        colon = mp_find(line, 0, (char[:]){ (char *)":", 1 });
+        if (colon < 0)
+            continue;
+        if (!mp_ieq(mp_trim((char[:]){ line.data, colon }), name.s))
+            continue;
+        *out = (Str){ mp_trim((char[:]){ line.data + colon + 1, line.len - colon - 1 }) };
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- 分隔符 ---- */
+
+/* body[from..] 里下一个「行首的 --boundary」的下标，没有给 -1 */
+static int mp_find_delim(char[:] body, int from, Str boundary)
+{
+    int i = from;
+    int dl = 2 + boundary.s.len;
+
+    if (boundary.s.len <= 0)
+        return -1;
+    while (i + dl <= body.len) {
+        int p = mp_find(body, i, (char[:]){ (char *)"--", 2 });
+
+        if (p < 0)
+            return -1;
+        if ((p == 0 || body.data[p - 1] == '\n') && p + dl <= body.len
+            && memcmp(body.data + p + 2, boundary.s.data,
+                      (size_t)boundary.s.len) == 0) {
+            int q = p + dl;
+
+            /* 分隔符这一行必须到这里结束（CRLF / 结束的 "--"），
+               否则只是 preamble 里的伪分隔符（如 boundary 是 b、正文写 --bX） */
+            if (q == body.len || body.data[q] == '-' || body.data[q] == '\r'
+                || body.data[q] == '\n')
+                return p;
+        }
+        i = p + 2;
+    }
+    return -1;
+}
+
+/* 在 p 处认一个分隔符：1 = 后面还有 part（*after 是 part 起点），
+   2 = 结束标记 `--boundary--`，-1 = 这里根本不是分隔符/后面是垃圾。 */
+static int mp_take_delim(Multipart *self, int p, int *after)
+{
+    int dl = 2 + self->boundary.s.len;
+    int q = p + dl;
+
+    if (self->boundary.s.len <= 0 || p < 0 || p + dl > self->body.len)
+        return -1;
+    if (memcmp(self->body.data + p, "--", 2) != 0
+        || memcmp(self->body.data + p + 2, self->boundary.s.data,
+                  (size_t)self->boundary.s.len) != 0)
+        return -1;
+    if (q + 2 <= self->body.len && self->body.data[q] == '-'
+        && self->body.data[q + 1] == '-') {
+        *after = q + 2;
+        return 2;
+    }
+    if (q < self->body.len && self->body.data[q] == '\r')
+        q++;
+    if (q < self->body.len && self->body.data[q] == '\n') {
+        *after = q + 1;
+        return 1;
+    }
+    return -1;
+}
+
+/* 拿 body 和 Content-Type：从 `; boundary=...` 取出分隔符 */
+Multipart mp_open(char[:] body, Str content_type)
+{
+    Multipart m = { { (char *)0, 0 }, { { (char *)0, 0 } }, 0, 0, 0, 0, 0 };
+    Str b = { { (char *)0, 0 } };
+
+    if (!body.data || body.len <= 0)
+        return m;
+    if (!mp_param(content_type, (Str){ { (char *)"boundary", 8 } }, &b))
+        return m;
+    if (b.s.len <= 0 || b.s.len > 200)
+        return m;
+    m.body = body;
+    m.boundary = b;
+    m.ok = 1;
+    return m;
+}
+
+/* 已经知道 boundary 时用它开一个；boundary 不含前面的 `--`。 */
+Multipart mp_open_boundary(char[:] body, Str boundary)
+{
+    Multipart m = { { (char *)0, 0 }, { { (char *)0, 0 } }, 0, 0, 0, 0, 0 };
+
+    if (!body.data || body.len <= 0 || boundary.s.len <= 0 || boundary.s.len > 200)
+        return m;
+    m.body = body;
+    m.boundary = boundary;
+    m.ok = 1;
+    return m;
+}
+
+/* 取下一个 part：1 = 有，0 = 读完了（含只有结束标记），-1 = 语法错误（位置在 m->err） */
+int next(Multipart *m, Part *out)
+{
+    int region_start = 0;
+    int region_end = 0;
+    int next_delim = 0;
+    int after = 0;
+    int hdr_end = -1;
+    int body_start = 0;
+    int rc = 0;
+
+    if (!m || !out || !m->ok)
+        return -1;
+    if (m->state == 3)
+        return 0;
+    if (m->state == 0) {
+        /* 跳过 preamble，认第一个分隔符 */
+        int p = mp_find_delim(m->body, 0, m->boundary);
+
+        if (p < 0) {
+            m->err = 1;
+            return -1;
+        }
+        rc = mp_take_delim(m, p, &after);
+        if (rc < 0) {
+            m->err = p + 1;
+            return -1;
+        }
+        if (rc == 2) {
+            m->state = 3;
+            return 0;
+        }
+        m->at = after;
+        m->state = 1;
+    } else if (m->state == 2) {
+        /* 上一个 part 停在分隔符上，先消费它 */
+        rc = mp_take_delim(m, m->at, &after);
+        if (rc < 0) {
+            m->err = m->at + 1;
+            return -1;
+        }
+        if (rc == 2) {
+            m->state = 3;
+            return 0;
+        }
+        m->at = after;
+        m->state = 1;
+    }
+    /* 现在 m->at 是一个 part 的起点 */
+    region_start = m->at;
+    region_end = m->body.len;
+    next_delim = mp_find_delim(m->body, region_start, m->boundary);
+    if (next_delim >= 0) {
+        region_end = next_delim;
+        /* 分隔符前面的 CRLF/LF 不属于正文 */
+        if (region_end > region_start && m->body.data[region_end - 1] == '\n') {
+            region_end--;
+            if (region_end > region_start && m->body.data[region_end - 1] == '\r')
+                region_end--;
+        }
+    }
+    /* 头块到空行为止：优先认 \r\n\r\n，再认 \n\n */
+    {
+        char[:] reg = { m->body.data + region_start, region_end - region_start };
+        int a = mp_find(reg, 0, (char[:]){ (char *)"\r\n\r\n", 4 });
+        int b = mp_find(reg, 0, (char[:]){ (char *)"\n\n", 2 });
+
+        if (a >= 0 && (b < 0 || a <= b)) {
+            hdr_end = region_start + a;
+            body_start = region_start + a + 4;
+        } else if (b >= 0) {
+            hdr_end = region_start + b;
+            body_start = region_start + b + 2;
+        }
+    }
+    out->name = (Str){ { (char *)0, 0 } };
+    out->filename = (Str){ { (char *)0, 0 } };
+    out->disposition = (Str){ { (char *)0, 0 } };
+    out->content_type = (Str){ { (char *)0, 0 } };
+    if (hdr_end >= 0) {
+        out->headers = (Str){ mp_trim((char[:]){ m->body.data + region_start,
+                                                 hdr_end - region_start }) };
+        out->body = (char[:]){ m->body.data + body_start,
+                               region_end - body_start };
+    } else {
+        /* 没有头块：分隔符后面那个空行（如果有）仍然不算正文 */
+        out->headers = (Str){ { (char *)0, 0 } };
+        body_start = region_start;
+        if (body_start + 1 < region_end && m->body.data[body_start] == '\r'
+            && m->body.data[body_start + 1] == '\n')
+            body_start += 2;
+        else if (body_start < region_end && m->body.data[body_start] == '\n')
+            body_start += 1;
+        out->body = (char[:]){ m->body.data + body_start,
+                               region_end - body_start };
+    }
+    out->index = 0;
+    {
+        Str disp = { { (char *)0, 0 } };
+        Str ct = { { (char *)0, 0 } };
+
+        if (mp_header(out, (Str){ { (char *)"Content-Disposition", 19 } }, &disp)) {
+            out->disposition = disp;
+            mp_param(disp, (Str){ { (char *)"name", 4 } }, &out->name);
+            mp_param(disp, (Str){ { (char *)"filename", 8 } }, &out->filename);
+        }
+        if (mp_header(out, (Str){ { (char *)"Content-Type", 12 } }, &ct))
+            out->content_type = ct;
+    }
+    m->n++;
+    out->index = m->n;
+    if (next_delim >= 0) {
+        m->at = next_delim;
+        m->state = 2;
+    } else {
+        m->state = 3;
+        m->at = m->body.len;
+    }
+    return 1;
+}
+
+/* 有多少个 part（不改变解析器状态）；语法错误返回 -1。 */
+int count(Multipart *self)
+{
+    Multipart m = { { (char *)0, 0 }, { { (char *)0, 0 } }, 0, 0, 0, 0, 0 };
+    Part p = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, { { (char *)0, 0 } },
+               { { (char *)0, 0 } }, { { (char *)0, 0 } }, { (char *)0, 0 }, 0 };
+    int n = 0;
+    int rc = 0;
+
+    if (!self)
+        return -1;
+    m.body = self->body;
+    m.boundary = self->boundary;
+    m.ok = self->ok;
+    for (;;) {
+        rc = next(&m, &p);
+        if (rc == 0)
+            return n;
+        if (rc < 0)
+            return -1;
+        n++;
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int view_is(char[:] v, char *lit, int n)
+{
+    if (v.len != n)
+        return 0;
+    if (n == 0)
+        return 1;
+    return memcmp(v.data, lit, (size_t)n) == 0;
+}
+
+test "两个 part：文本字段与文件字段" {
+    char[:] body = S("------X\r\n"
+                     "Content-Disposition: form-data; name=\"title\"\r\n"
+                     "\r\n"
+                     "hello\r\n"
+                     "------X\r\n"
+                     "content-disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "\r\n"
+                     "line1\r\nline2\r\n"
+                     "------X--\r\n");
+    Multipart m = mp_open(body, SS("multipart/form-data; boundary=----X"));
+    Part p = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, { { (char *)0, 0 } },
+               { { (char *)0, 0 } }, { { (char *)0, 0 } }, { (char *)0, 0 }, 0 };
+    Str v = { { (char *)0, 0 } };
+
+    if (!m.ok || m.count() != 2)
+        return err(1, "应当认出 2 个 part");
+    if (m.next(&p) != 1 || p.index != 1)
+        return err(2, "第一个 part 没读出来");
+    if (!view_is(p.name.s, "title", 5) || p.filename.s.len != 0)
+        return err(3, "第一个 part 的 name 不对");
+    if (!view_is(p.body, "hello", 5))
+        return err(4, "第一个 part 的正文不对（不该含 CRLF）");
+    if (p.content_type.s.len != 0)
+        return err(5, "第一个 part 不该有 Content-Type");
+    if (mp_header(&p, SS("CONTENT-DISPOSITION"), &v) != 1
+        || !view_is(v.s, "form-data; name=\"title\"", 23))
+        return err(6, "头字段名应当大小写不敏感");
+    if (m.next(&p) != 1 || p.index != 2)
+        return err(7, "第二个 part 没读出来");
+    if (!view_is(p.name.s, "file", 4) || !view_is(p.filename.s, "a.txt", 5))
+        return err(8, "文件字段的 name/filename 不对");
+    if (!view_is(p.content_type.s, "text/plain", 10))
+        return err(9, "文件字段的 Content-Type 不对");
+    if (!view_is(p.body, "line1\r\nline2", 12))
+        return err(10, "多行正文不对");
+    if (m.next(&p) != 0 || m.count() != 2)
+        return err(11, "读完之后的 count 应当还是 2");
+}
+
+test "preamble / epilogue、LF 行尾与无头 part" {
+    char[:] body = S("preamble\r\n"
+                     "--b\r\n"
+                     "\r\n"
+                     "bare body\r\n"
+                     "--b--\r\n"
+                     "epilogue\r\n");
+    Multipart m = mp_open(body, SS("multipart/form-data; boundary=b"));
+    Part p = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, { { (char *)0, 0 } },
+               { { (char *)0, 0 } }, { { (char *)0, 0 } }, { (char *)0, 0 }, 0 };
+
+    if (m.count() != 1 || m.next(&p) != 1)
+        return err(20, "preamble/epilogue 下应当只有 1 个 part");
+    if (p.headers.s.len != 0)
+        return err(21, "无头 part 的 headers 应当是空视图");
+    if (!view_is(p.body, "bare body", 9))
+        return err(22, "无头 part 的正文不对");
+    if (m.next(&p) != 0)
+        return err(23, "epilogue 不该产生 part");
+}
+
+test "引号里的分号、mp_param 单独使用、LF 行尾" {
+    Str disp = { S("form-data; name=\"a;b\"; filename=\"x.txt\"") };
+    Str v = { { (char *)0, 0 } };
+    char[:] body = S("--q\n"
+                     "Content-Disposition: form-data; name=\"f\"\n"
+                     "\n"
+                     "v\n"
+                     "--q--\n");
+    Multipart m = mp_open(body, SS("multipart/form-data; boundary=q"));
+    Part p = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, { { (char *)0, 0 } },
+               { { (char *)0, 0 } }, { { (char *)0, 0 } }, { (char *)0, 0 }, 0 };
+
+    if (mp_param(disp, SS("name"), &v) != 1 || !view_is(v.s, "a;b", 3))
+        return err(30, "引号里的分号不该切断参数");
+    if (mp_param(disp, SS("FILENAME"), &v) != 1 || !view_is(v.s, "x.txt", 5))
+        return err(31, "参数名应当大小写不敏感");
+    if (mp_param(disp, SS("nope"), &v) != 0)
+        return err(32, "不存在的参数不该命中");
+    if (m.next(&p) != 1 || !view_is(p.name.s, "f", 1) || !view_is(p.body, "v", 1))
+        return err(33, "LF 行尾的 part 不对");
+}
+
+test "boundary 缺失与坏分隔符" {
+    char[:] body = S("--b\r\n\r\nx\r\n--b--\r\n");
+    Multipart no = mp_open(body, SS("multipart/form-data"));
+    Multipart bad = mp_open(S("nothing here"), SS("multipart/form-data; boundary=b"));
+    Multipart junk = mp_open(S("--bX\r\n\r\nx\r\n--b--\r\n"), SS("multipart/form-data; boundary=b"));
+    Part p = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, { { (char *)0, 0 } },
+               { { (char *)0, 0 } }, { { (char *)0, 0 } }, { (char *)0, 0 }, 0 };
+
+    if (no.ok != 0 || no.count() != -1 || no.next(&p) != -1)
+        return err(40, "没有 boundary 应当 ok=0 且 next 报错");
+    if (mp_open_boundary(S(""), SS("b")).ok != 0)
+        return err(41, "空 body 应当 ok=0");
+    if (mp_open_boundary(S("--b--\r\n"), SS("b")).count() != 0)
+        return err(42, "只有结束标记应当 0 个 part");
+    if (bad.ok != 1 || bad.next(&p) != -1)
+        return err(43, "找不到分隔符应当报错");
+    if (junk.ok != 1 || junk.next(&p) != 0 || junk.count() != 0)
+        return err(44, "preamble 里的伪分隔符应当跳过");
+    {
+        Multipart pre = mp_open(S("--bX junk\r\n--b\r\n\r\nv\r\n--b--\r\n"),
+                                SS("multipart/form-data; boundary=b"));
+
+        if (pre.count() != 1 || pre.next(&p) != 1 || !view_is(p.body, "v", 1))
+            return err(45, "跳过伪分隔符之后应当还能读到真 part");
+    }
+}
