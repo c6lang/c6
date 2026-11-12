@@ -1,0 +1,159 @@
+/* examples/stdproto.c6 —— 第三十四批（网络协议编解码）的集成示例。
+ *
+ *     make std-proto
+ *
+ * 四个模块都只做字节层：sse 解析事件流，socks5 构造/解析握手报文，mqtt 构造
+ * 与解析报文并做主题通配，snappy 压一段重复文本再解回来。每节自检。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.net.sse;
+import std.net.socks5;
+import std.net.mqtt;
+import std.encoding.snappy;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static const char *SSE =
+    ": 每条连接先来一句注释\n"
+    "retry: 5000\n"
+    "\n"
+    "event: build\n"
+    "id: 42\n"
+    "data: {\"status\":\"ok\"}\n"
+    "\n"
+    "event: log\n"
+    "data: line 1\n"
+    "data: line 2\n"
+    "\n";
+
+static void do_sse(void)
+{
+    SseReader r = sse_open(SSE, (int)strlen(SSE));
+    SseEvent e = { 0 };
+    char buf[256] = { 0 };
+    int events = 0, got_build = 0, got_log = 0;
+
+    printf("== sse\n");
+    while (r.next(&e, buf, (int)sizeof buf) == 1) {
+        events++;
+        if (e.type.s.len == 5 && memcmp(e.type.s.data, "build", 5) == 0) {
+            got_build = (e.id.s.len == 2 && e.data.s.len == 15);
+        }
+        if (e.type.s.len == 3 && memcmp(e.type.s.data, "log", 3) == 0) {
+            got_log = (e.data.s.len == 13
+                       && memcmp(e.data.s.data, "line 1\nline 2", 13) == 0);
+        }
+    }
+    printf("   %d 个事件，最后一段 data 拼成 %d 字节\n", events, 13);
+    check(events == 2, "只有带 data 的事件才派发");
+    check(got_build, "build 事件的 id 与 data");
+    check(got_log, "多行 data 用换行拼起来");
+}
+
+static void do_socks5(void)
+{
+    char buf[128] = { 0 };
+    u8 methods[1] = { SOCKS5_AUTH_NONE };
+    static u8 resp[10] = { 5, 0, 0, 1, 198, 51, 100, 9, 0x1F, 0x90 };
+    Socks5Addr a = { 0 }, bound = { 0 };
+    int n = 0, rep = 0, used = 0;
+
+    printf("== socks5\n");
+    n = socks5_greeting(buf, (int)sizeof buf, methods, 1);
+    printf("   问候 %d 字节：%02x %02x %02x\n", n, (u8)buf[0], (u8)buf[1],
+           (u8)buf[2]);
+    check(n == 3 && (u8)buf[0] == 5 && (u8)buf[2] == 0, "问候报文");
+    a = socks5_addr_host("api.example.test", 443);
+    n = socks5_request(buf, (int)sizeof buf, SOCKS5_CMD_CONNECT, &a);
+    printf("   CONNECT 域名 %d 字节（域名 %d 字节）\n", n, a.domain.s.len);
+    check(n == 4 + 1 + 16 + 2, "域名 CONNECT 长度");
+    check((u8)buf[3] == SOCKS5_ATYP_DOMAIN && (u8)buf[4] == 16, "ATYP 与域名长度");
+    check((u8)buf[n - 2] == 0x01 && (u8)buf[n - 1] == 0xBB, "端口大端");
+    n = socks5_parse_reply(resp, 10, &rep, &bound, &used);
+    printf("   应答 %d 字节：rep=%d 绑定 %d.%d.%d.%d:%d\n", n, rep,
+           bound.b[0], bound.b[1], bound.b[2], bound.b[3], bound.port);
+    check(n == 10 && used == 10 && rep == 0, "应答解析");
+    check(bound.port == 8080 && bound.b[0] == 198, "绑定地址");
+    check(socks5_parse_reply(resp, 6, &rep, &bound, 0) == 0, "半包返回 0");
+}
+
+static void do_mqtt(void)
+{
+    char buf[256] = { 0 };
+    MqttConnectOpts o = { 0 };
+    MqttPacket pk = { 0 };
+    MqttPublish pub = { 0 };
+    int n = 0, sp = 0, rc = 0;
+    static char connack[4] = { 0x20, 0x02, 0x00, 0x00 };
+
+    printf("== mqtt\n");
+    o.client_id = (Str){ S("demo-1") };
+    o.keepalive = 30;
+    o.clean_session = 1;
+    n = mqtt_build_connect(buf, (int)sizeof buf, &o);
+    printf("   CONNECT %d 字节、keepalive %d\n", n, o.keepalive);
+    check(n == 20 && (u8)buf[0] == 0x10, "CONNECT 报文");
+    check(mqtt_parse_header(connack, 4, &pk) == 4
+              && mqtt_parse_connack(&pk, &sp, &rc) == 1 && rc == 0,
+          "CONNACK 解析");
+    n = mqtt_build_publish(buf, (int)sizeof buf, (Str){ S("home/temp") }, 1, 0,
+                           0, 11, (Str){ S("21.5") });
+    printf("   PUBLISH %d 字节\n", n);
+    check(n == 19 && mqtt_parse_header(buf, n, &pk) == n
+              && mqtt_parse_publish(&pk, &pub) == 1,
+          "PUBLISH 报头与解析");
+    check(pub.packet_id == 11 && pub.qos == 1 && pub.payload.s.len == 4, "PUBLISH 字段");
+    check(mqtt_topic_matches((Str){ S("home/+") }, (Str){ S("home/temp") }) == 1,
+          "`+` 通配");
+    check(mqtt_topic_matches((Str){ S("factory/#") }, (Str){ S("home/temp") }) == 0,
+          "不匹配的过滤器");
+    check(mqtt_parse_header(buf, 4, &pk) == 0, "半包返回 0");
+}
+
+static const char *TEXT =
+    "SuperC std.encoding.snappy: SuperC std.encoding.snappy: "
+    "SuperC std.encoding.snappy: 需要压的重复文本";
+
+static void do_snappy(void)
+{
+    char enc[256] = { 0 };
+    char dec[256] = { 0 };
+    SnappyScratch scratch = { 0 };
+    int n = (int)strlen(TEXT), e = 0, d = 0;
+
+    printf("== snappy\n");
+    e = snappy_encode(TEXT, n, enc, (int)sizeof enc, &scratch);
+    d = snappy_decode(enc, e, dec, (int)sizeof dec);
+    printf("   %d 字节压成 %d 字节，解回来 %d 字节\n", n, e, d);
+    check(e > 0 && e < n, "重复文本能压");
+    check(d == n && memcmp(dec, TEXT, (size_t)n) == 0, "往返一致");
+    check(snappy_max_encoded(n) >= e, "上界够用");
+    /* 字面量模式（不给哈希表）也必须是合法流 */
+    e = snappy_encode(TEXT, n, enc, (int)sizeof enc, 0);
+    d = snappy_decode(enc, e, dec, (int)sizeof dec);
+    check(d == n && memcmp(dec, TEXT, (size_t)n) == 0, "字面量模式往返");
+}
+
+int main(void)
+{
+    do_sse();
+    do_socks5();
+    do_mqtt();
+    do_snappy();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

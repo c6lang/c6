@@ -240,7 +240,7 @@ std/os/                     操作系统：流、文件系统与目录树、路�
   std/os/lock.c6            std.os.lock            文件建议锁（fcntl）：lock_open、FileLock 的 acquire(exclusive, wait_ms)/try_acquire/release/is_held/close_file；wait_ms<0 阻塞、0 只试一次、>0 重试到超时，整文件锁按进程合并
   std/os/mmap.c6            std.os.mmap            文件/匿名映射：map_file(path, writable)（可写 MAP_SHARED、只读 MAP_PRIVATE，空文件是坏映射）、map_anon（清零）、Map 的 data/size/sync/read_at/write_at/unmap；read_at/write_at 带边界检查
 
-std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump、DER/ASN.1、HOTP/TOTP、GIF 的 LZW
+std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、DEFLATE/zlib/gzip/tar、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE/Snappy、hexdump、DER/ASN.1、HOTP/TOTP、GIF 的 LZW
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base85.c6    std.encoding.base85    Ascii85（Adobe）与 Z85（ZeroMQ）：a85_encode/decode、a85_encoded_len/decoded_len/valid（`z` 简写、部分组、跳过空白、`~>` 终止），z85_encode/decode/valid（长度必须 4/5 的倍数、严格字母表）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
@@ -269,6 +269,7 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/asn1.c6      std.encoding.asn1      DER/ASN.1 读取器：asn1/asn1_sub + next/peek 切 Asn1Tag（多字节 tag、0x81..0x84 长度、拒绝不定长/越界）、asn1_int/asn1_oid/asn1_bits/asn1_time/asn1_string
   std/encoding/otp.c6       std.encoding.otp       HOTP（RFC 4226）/TOTP（RFC 6238）：hotp/totp/otp_format、otp_verify_totp（前后各 window 步）；HMAC-SHA-1 动态截断，位数 4..9
   std/encoding/lzw.c6       std.encoding.lzw       GIF 变体 LZW：lzw_gif_decode（LSB、clear/eoi、码宽 2..12）/lzw_gif_encode（贪心最长匹配），坏流/越界/放不下返回 -1
+  std/encoding/snappy.c6    std.encoding.snappy    Snappy 块格式：snappy_decode 严格校验、snappy_encode 用调用方 16 KB 哈希表贪心匹配（传 0 退化为字面量）
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
@@ -320,6 +321,9 @@ std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字�
   std/net/router.c6         std.net.router         方法与路径路由表（固定 32 条）：Router 的 add/match/count/clear、Match 的 param/has/rest/wildcard/id；:name 段参数、*/*name 尾段通配、方法大小写不敏感、先注册先赢、按 / 严格切段
   std/net/assets.c6         std.net.assets         静态资源：assets_root、Assets 的 resolve（1/0/-1）/serve（200/403/404/500，流式）/set_index/set_follow_links、content_type_of；解码后拒 .. 与 NUL、归一后必须在 root 下、默认拒符号链接
   std/net/session.c6        std.net.session        内存会话（16 槽）：session_store/session_store_ttl、Store 的 create/find/destroy/destroy_all/expire/cookie/from_cookie、Session 的 id/get/set/has/remove/clear/valid；cookie 名 sid，id 来自 std.core.rand（非密码学）
+  std/net/sse.c6            std.net.sse            Server-Sent Events：sse_open/next 按空行派发事件，多行 data 拼进调用方缓冲；注释/BOM/三种行结束符
+  std/net/socks5.c6         std.net.socks5         SOCKS5 报文：问候/用户名口令/请求构建 + 方法/认证/应答/地址解析，IPv4/IPv6/域名
+  std/net/mqtt.c6           std.net.mqtt           MQTT 3.1.1 报文：固定头与变长剩余长度、CONNECT/PUBLISH/SUBSCRIBE 构建解析、+ / # 主题通配
 ```
 
 ```c
@@ -369,6 +373,7 @@ make std-img     # 编译并运行 examples/stdimg.c6（第三十批图像解码
 make std-enc     # 编译并运行 examples/stdenc.c6（第三十一批编码与凭据模块的拼装示例）
 make std-gfx     # 编译并运行 examples/stdgfx.c6（第三十二批图像与 LZW 模块的拼装示例）
 make std-doc     # 编译并运行 examples/stddoc.c6（第三十三批结构化文本格式模块的拼装示例）
+make std-proto   # 编译并运行 examples/stdproto.c6（第三十四批网络协议编解码模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

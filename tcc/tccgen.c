@@ -12850,6 +12850,10 @@ static const struct C6ErrStdSlot {
     { "std.data.yaml",          C6_ERR_SLOT_STD + 142 },
     { "std.data.vcf",           C6_ERR_SLOT_STD + 143 },
     { "std.data.ics",           C6_ERR_SLOT_STD + 144 },
+    { "std.net.sse",            C6_ERR_SLOT_STD + 145 },
+    { "std.net.socks5",         C6_ERR_SLOT_STD + 146 },
+    { "std.net.mqtt",           C6_ERR_SLOT_STD + 147 },
+    { "std.encoding.snappy",    C6_ERR_SLOT_STD + 148 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

@@ -56,6 +56,15 @@
 
 ### 标准库
 
+- **标准库第三十四批（网络协议编解码）**：`std.net.sse` / `std.net.socks5` /
+  `std.net.mqtt` / `std.encoding.snappy` 四个零分配字节层编解码模块，集成示例
+  `examples/stdproto.c6`（`make std-proto`）。sse 按空行派发事件、多行 data 拼进
+  调用方缓冲；socks5 构建问候/认证/请求并解析应答（IPv4/IPv6/域名）；
+  mqtt 处理 3.1.1 的固定头与变长剩余长度、CONNECT/PUBLISH/SUBSCRIBE 与主题
+  通配；snappy 实现块格式编解码（重叠复制、哈希表贪心匹配）。错误号段
+  `std.net.sse`=0x6091 … `std.encoding.snappy`=0x6094（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第三十三批（结构化文本格式）**：`std.data.html` / `std.data.yaml` /
   `std.data.vcf` / `std.data.ics` 四个零分配读取器，集成示例
   `examples/stddoc.c6`（`make std-doc`）。html 是六种 token 的分词器（属性按需

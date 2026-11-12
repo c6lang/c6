@@ -159,8 +159,9 @@
 | `std/encoding/asn1.c6` | `std.encoding.asn1` | DER/ASN.1 读取器（零分配）：`asn1`/`asn1_sub` 造读取器，`next`/`peek` 切出 `Asn1Tag`（class/constructed/tag/内容偏移/长度），支持多字节 tag 号与 0x81..0x84 长长度、拒绝不定长与越界；`view`/`asn1_string` 给内容视图，`asn1_int`（1..8 字节二补码）/`asn1_oid`（点分十进制）/`asn1_bits`（跳过 unused 字节）/`asn1_time`（UTCTime/GeneralizedTime 归一成 6 个整数） |
 | `std/encoding/otp.c6` | `std.encoding.otp` | 一次性口令（RFC 4226 / 6238，零分配）：`hotp(secret, slen, counter, digits)`、`totp(secret, slen, unix_time, step, digits)`、`otp_format`（定宽补零）、`otp_verify_totp`（前后各 `window` 步、常量时间比较）；HMAC-SHA-1 动态截断，位数 4..9，密钥是原始字节（Base32 先走 `std.encoding.base32`） |
 | `std/encoding/lzw.c6` | `std.encoding.lzw` | GIF 变体的 LZW（零分配）：`lzw_gif_decode(src, n, out, cap, min_code)`（LSB 先、clear/eoi、码宽 2..12 位、码值越界/截断/放不下返回 -1）与 `lzw_gif_encode`（贪心最长匹配 + 线性扫字典，字典满时发 clear）；不处理 TIFF/Unix compress 的 MSB 变体 |
+| `std/encoding/snappy.c6` | `std.encoding.snappy` | Snappy 块格式（零分配）：`snappy_decode` 认全部四种元素（字面量、三种复制，含重叠复制），严格校验长度前缀/越界/截断；`snappy_encode` 用调用方给的 16 KB 哈希表做贪心匹配（传 0 则退化成整块字面量，仍是合法流）——一次匹配最长 64 字节，够快不追求最好；`snappy_max_encoded` 给 `32 + n + n/6` 上界；不做 framed 分帧与 CRC-32C |
 
-**`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP、X.509 证书与 JWT，以及 BMP/TGA/QOI/PNM/GIF/TIFF/ICO 图像解码）
+**`std/data/`**（数据格式与媒体：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM、WAV/PNG/ELF/ZIP、X.509 证书与 JWT，以及 BMP/TGA/QOI/PNM/GIF/TIFF/ICO 图像解码、Snappy 压缩）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -194,7 +195,7 @@
 | `std/data/vcf.c6` | `std.data.vcf` | vCard 读取（零分配，两段式）：`vcard_unfold` 去掉折行写进调用方缓冲，`vcard_parse` 取 FN/N/ORG/TITLE/TEL/EMAIL/UID/URL 与属性总数，必须成对 `BEGIN:VCARD`/`END:VCARD`；参数忽略，不做 quoted-printable/Base64 |
 | `std/data/ics.c6` | `std.data.ics` | iCalendar 的 VEVENT 读取（零分配，两段式）：`ics_unfold` 摊平折行，`ics_open`/`next` 每个 `BEGIN:VEVENT` 返回一个 `IcsEvent`（UID/SUMMARY/LOCATION/DTSTART/DTEND/DTSTAMP/DESCRIPTION），参数（`TZID`/`VALUE=DATE`）忽略、值原样给出，不做时区换算 |
 
-**`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
+**`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、SSE/SOCKS5/MQTT 报文、HTTP 客户端与服务端）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -215,7 +216,9 @@
 | `std/net/router.c6` | `std.net.router` | 方法与路径路由表（零分配、固定 32 条）：`Router` 的 `add(method, pattern, id)`/`match`/`count`/`clear` + `Match` 的 `param`/`has`/`rest`/`wildcard`/`id`；`:name` 捕获一段（最多 4 个参数）、`*`/`*name` 捕获剩余全部且只能在末尾、方法大小写不敏感且 `"*"` 匹配任意方法、先注册先赢、按 `/` 严格切段（`/a/` 不等于 `/a`） |
 | `std/net/assets.c6` | `std.net.assets` | 静态资源（在 `std.net.httpd` + `std.net.mime` 之上，零分配）：`assets_root(dir)` 工厂 + `Assets` 的 `resolve`（1 找到/0 不存在/-1 拒绝）/`serve`（200/403/404/500，8 KiB 流式写出）/`set_index`/`set_follow_links`/`ok`、`content_type_of`；先百分号解码再拒绝 `..` 段与 NUL，归一后必须仍在 root 下，默认 `lstat` 拒符号链接 |
 | `std/net/session.c6` | `std.net.session` | 内存会话（零分配、固定 16 槽）：`session_store`/`session_store_ttl` 工厂 + `Store` 的 `create`/`find`/`destroy`/`destroy_all`/`expire`/`cookie`/`from_cookie` + `Session` 的 `id`/`get`/`set`/`has`/`remove`/`clear`/`valid`；32 位十六进制 id 来自 `std.core.rand`（非密码学）、数据是 256 字节里的 `key=value\n` 行、cookie 名固定 `sid`（`Path=/; HttpOnly; SameSite=Lax; Max-Age=...`） |
-
+| `std/net/sse.c6` | `std.net.sse` | Server-Sent Events 流解析（零分配）：`sse_open`/`next` 按空行派发事件，`event`/`data`/`id`/`retry` 四个字段，多行 `data` 用 `\n` 拼进调用方缓冲；注释行忽略、BOM 跳过、`\n`/`\r\n`/`\r` 都认；EOF 前没空行收尾的半截事件按规范丢弃 |
+| `std/net/socks5.c6` | `std.net.socks5` | SOCKS5（RFC 1928/1929）报文编解码（零分配，不含套接字）：`socks5_greeting`/`socks5_userpass`/`socks5_request` 造报文（`Socks5Addr` 支持 IPv4/IPv6/域名），`socks5_parse_method`/`socks5_parse_userpass`/`socks5_parse_reply`/`socks5_parse_addr` 解析，半包返回 0、坏包 -1；不做域名解析与 UDP 封装 |
+| `std/net/mqtt.c6` | `std.net.mqtt` | MQTT 3.1.1 报文编解码（零分配，不含套接字）：`mqtt_parse_header` 给整包长度与视图（半包 0、坏包 -1），`mqtt_build_connect`/`mqtt_build_publish`/`mqtt_build_subscribe`/`mqtt_build_id`/`mqtt_build_empty` 造报文，`mqtt_parse_publish`/`mqtt_parse_connack`/`mqtt_parse_suback`/`mqtt_parse_id` 解析，`mqtt_topic_matches` 做 `+`/`#` 通配；`mqtt_varint`/`mqtt_varint_len` 处理剩余长度变长整数 |
 **集成示例**（`main` 只能写在模块外的文件里）
 
 | 文件 | 模块 | 内容 |
@@ -253,6 +256,7 @@
 | `examples/stdenc.c6` | （无模块） | 第三十一批（编码与凭据）的拼装示例（`make std-enc`）：手写 DER 逐层读 INTEGER/OID/UTF8String/UTCTime、解析一张 829 字节自签证书、HS256 令牌验签与改字节/换密钥的拒绝、RFC 4226 与 RFC 6238 的 OTP 向量与时间窗口 |
 | `examples/stdgfx.c6` | （无模块） | 第三十二批（图像与 LZW）的拼装示例（`make std-gfx`）：LZW 编码→解码往返、3x2 透明 GIF、4x3 未压缩 RGB TIFF、同一张图的 32 位 DIB 与 PNG 两个 ICO 负载（结果必须逐字节一致），最后把 ICO 里那段 PNG 单独交给 `png_decode` |
 | `examples/stddoc.c6` | （无模块） | 第三十三批（结构化文本格式）的拼装示例（`make std-doc`）：HTML 分词后数标签/取 `href`/看 `script` 原文/解实体，遍历一份 YAML 配置把缩进还原成层级并解引号，展开一张折行的 vCard，读一份含两个事件的 iCalendar |
+| `examples/stdproto.c6` | （无模块） | 第三十四批（网络协议编解码）的拼装示例（`make std-proto`）：解析 SSE 事件流（含多行 data）、构造 SOCKS5 问候与域名 CONNECT 并解应答、构造/解析 MQTT CONNECT 与 PUBLISH 并做主题通配、Snappy 压缩往返 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -331,6 +335,7 @@ std/encoding/tar.c6        24 test(s), 0 failure(s)
 std/encoding/asn1.c6       24 test(s), 0 failure(s)
 std/encoding/otp.c6        13 test(s), 0 failure(s)
 std/encoding/lzw.c6         2 test(s), 0 failure(s)
+std/encoding/snappy.c6      2 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
 std/net/cookie.c6          4 test(s), 0 failure(s)
@@ -347,6 +352,9 @@ std/net/httpd.c6         33 test(s), 0 failure(s)
 std/net/router.c6         3 test(s), 0 failure(s)
 std/net/assets.c6        75 test(s), 0 failure(s)
 std/net/session.c6       45 test(s), 0 failure(s)
+std/net/sse.c6           24 test(s), 0 failure(s)
+std/net/socks5.c6        35 test(s), 0 failure(s)
+std/net/mqtt.c6          25 test(s), 0 failure(s)
 std/os/env.c6              39 test(s), 0 failure(s)
 std/os/fs.c6               7 test(s), 0 failure(s)
 std/os/io.c6               5 test(s), 0 failure(s)
@@ -416,6 +424,7 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/encoding/asn1.c6` 24 | asn1 2 + str 22 |
 | `std/encoding/otp.c6` 13 | otp 3 + sha1 6 + bits 6（HMAC-SHA-1 是跨 TU 调用） |
 | `std/encoding/lzw.c6` 2 | 自成一体 |
+| `std/encoding/snappy.c6` 2 | 自成一体 |
 | `std/encoding/aes.c6` 2 | 自成一体（S 盒直接写在模块里） |
 | `std/encoding/poly1305.c6` 2 | 自成一体（130 位模运算只用 u64） |
 | `std/encoding/random.c6` 3 | 自成一体（只读 /dev/urandom） |
@@ -440,6 +449,9 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/net/httpd.c6` 33 | httpd 3 + http 5 + tcp 3 + str 22（报文解析来自 http、连接来自 tcp） |
 | `std/net/assets.c6` 75 | assets 2 + httpd 33 + mime 37 + url 10 + fs 7 + io 5 + path 30 + str 22 + err 3（拼起来跑，块数会重复计） |
 | `std/net/session.c6` 45 | session 3 + rand 9 + time 7 + cookie 4 + str 22（id 用 rand、过期用 time、cookie 用 cookie） |
+| `std/net/sse.c6` 24 | sse 2 + str 22 |
+| `std/net/socks5.c6` 35 | socks5 2 + inet 8 + str 22 + err 3（地址构造走 inet_parse） |
+| `std/net/mqtt.c6` 25 | mqtt 3 + str 22 |
 
 `std/core/bits`、`std/core/crc`、`std/core/fixed`、`std/core/pool`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
 `std/encoding/codec`、`std/encoding/frame`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
@@ -3338,6 +3350,35 @@ HTML 那一节把 `PAGE` 分两遍扫：第一遍数开始/结束/文本/注释/
 iCalendar 各用一次折行（`Grace\r\n  Hopper`、`long\r\n  wrapped summary`），
 验摊平后的字节数与内容。
 
+### 集成示例：`examples/stdproto.c6`
+
+```sh
+make std-proto
+```
+
+```
+== sse
+   2 个事件，最后一段 data 拼成 13 字节
+== socks5
+   问候 3 字节：05 01 00
+   CONNECT 域名 23 字节（域名 16 字节）
+   应答 10 字节：rep=0 绑定 198.51.100.9:8080
+== mqtt
+   CONNECT 20 字节、keepalive 30
+   PUBLISH 19 字节
+== snappy
+   108 字节压成 58 字节，解回来 108 字节
+
+21 check(s), 0 failure(s)
+```
+
+四个模块都是纯字节层，所以示例不带套接字：SSE 用一段带注释、`retry` 和两条
+多行 `data` 的流验「只有出现过 data 才派发」；SOCKS5 造 3 字节问候与 23 字节
+域名 CONNECT（`ATYP=3`、域名长度、端口 `0x01BB`），再把一段 10 字节应答解出
+绑定地址与 `rep=0`，并用 6 字节前缀验半包返回 0；MQTT 造 CONNECT 与 QoS1
+PUBLISH，解出包号/载荷并跑 `home/+` 与 `factory/#` 两条通配；Snappy 把 108 字节
+压到 58 字节再解回来，另跑一遍「不给哈希表」的字面量模式。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3400,6 +3441,8 @@ iCalendar 各用一次折行（`Grace\r\n  Hopper`、`long\r\n  wrapped summary`
   （自带自检）。
 * `make std-doc`：`examples/stddoc.c6`，第三十三批（结构化文本格式）模块的拼装
   示例（自带自检）。
+* `make std-proto`：`examples/stdproto.c6`，第三十四批（网络协议编解码）模块的
+  拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

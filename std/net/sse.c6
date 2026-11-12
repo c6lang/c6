@@ -1,0 +1,287 @@
+/* std/net/sse：Server-Sent Events 流解析（RFC 8895 之前的 WHATWG 规范，零分配）。
+ *
+ *     import std.net.sse;
+ *
+ *     SseReader r = sse_open(body, n);
+ *     SseEvent e = { 0 };
+ *     char data[1024];
+ *     while (r.next(&e, data, (int)sizeof data) == 1) {
+ *         // e.type / e.id / e.data（就是 data 里的拼接结果）
+ *     }
+ *
+ * 一行一个 `字段: 值`，空行把攒下来的字段派发成一个事件。`data` 可以出现多次，
+ * 每行之间补一个 `\n`；拼接要写内存，所以目标缓冲由调用方给。
+ *
+ * 约定：
+ *
+ * - 行结束符 `\n`、`\r\n`、落单的 `\r` 都认；
+ * - 值前面**一个**空格会被吃掉（`data: x` → `x`，`data:  x` → ` x`）；
+ * - `:` 开头是注释行，忽略；没有冒号的行整行当字段名、值为空；
+ * - 认 `event` / `data` / `id` / `retry` 四个字段，其余忽略；`retry` 只接受
+ *   纯数字，非数字忽略；
+ * - 空行派发：`data` 为空（没出现过 data 行）时不派发，直接继续；
+ * - 流开头的一个 UTF-8 BOM（`EF BB BF`）被跳过；
+ * - 到 EOF 时不派发未完成的半截事件（规范要求丢弃），返回 0；
+ * - 一行超过 `SSE_MAX_LINE`（8192）字节返回 -1 并置 `bad`，防止坏流吃光内存；
+ * - 数据缓冲放不下返回 -1 并置 `bad`。
+ */
+#include <string.h>
+
+module std.net.sse;
+import std.core.types;
+import std.text.str;
+
+#define SSE_MAX_LINE 8192
+
+struct SseEvent {
+    Str type;           /* event: 的值，没有就是空 */
+    Str id;             /* id: 的值 */
+    Str data;           /* 拼接结果，指向调用方给的缓冲 */
+    int retry;          /* retry: 的毫秒数 */
+    int has_retry;
+};
+
+struct SseReader {
+    const char *p;
+    int n;
+    int pos;
+    int bad;
+    int dispatched;
+};
+
+SseReader sse_open(const void *src, int n)
+{
+    SseReader r = { 0 };
+
+    if (!src || n <= 0) {
+        r.bad = 1;
+        return r;
+    }
+    r.p = (const char *)src;
+    r.n = n;
+    if (n >= 3 && (unsigned char)r.p[0] == 0xEF
+        && (unsigned char)r.p[1] == 0xBB && (unsigned char)r.p[2] == 0xBF)
+        r.pos = 3;
+    return r;
+}
+
+/* 读一行，返回 1 有行 / 0 EOF / -1 太长。start/end 不含行结束符。 */
+static int sse_line(SseReader *self, int *start, int *end)
+{
+    int i = self->pos, s = 0, e = 0;
+
+    if (i >= self->n)
+        return 0;
+    s = i;
+    while (i < self->n && self->p[i] != '\n' && self->p[i] != '\r')
+        i++;
+    e = i;
+    if (e - s > SSE_MAX_LINE) {
+        self->bad = 1;
+        return -1;
+    }
+    if (i < self->n) {
+        if (self->p[i] == '\r' && i + 1 < self->n && self->p[i + 1] == '\n')
+            i += 2;
+        else
+            i++;
+    }
+    self->pos = i;
+    *start = s;
+    *end = e;
+    return 1;
+}
+
+int next(SseReader *self, SseEvent *out, char *data, int dcap)
+{
+    int type_b = -1, type_e = -1, id_b = -1, id_e = -1;
+    int doff = 0, have_data = 0, retry = 0, has_retry = 0;
+
+    if (!self || self->bad || !out || !data || dcap <= 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    for (;;) {
+        int start = 0, end = 0, k = 0, colon = -1, vb = 0, ve = 0;
+        int rc = sse_line(self, &start, &end);
+
+        if (rc < 0) {
+            self->bad = 1;
+            return -1;
+        }
+        if (rc == 0)
+            return 0;                   /* EOF：半截事件丢弃 */
+        /* 空行：派发 */
+        if (end == start) {
+            if (!have_data)
+                continue;
+            out->data.s = (char[:]){ data, doff };
+            out->retry = retry;
+            out->has_retry = has_retry;
+            if (type_b >= 0)
+                out->type.s = (char[:]){ (char *)self->p + type_b,
+                                         type_e - type_b };
+            if (id_b >= 0)
+                out->id.s = (char[:]){ (char *)self->p + id_b,
+                                       id_e - id_b };
+            self->dispatched++;
+            return 1;
+        }
+        if (self->p[start] == ':')
+            continue;                   /* 注释 */
+        for (k = start; k < end; k++) {
+            if (self->p[k] == ':') {
+                colon = k;
+                break;
+            }
+        }
+        if (colon < 0) {
+            vb = end;
+            ve = end;                   /* 只有字段名 */
+        } else {
+            vb = colon + 1;
+            ve = end;
+            if (vb < ve && self->p[vb] == ' ')
+                vb++;
+        }
+        {
+            int nb = start, ne = colon < 0 ? end : colon;
+
+            if (ne - nb == 4 && memcmp(self->p + nb, "data", 4) == 0) {
+                if (doff > 0) {
+                    if (doff >= dcap - 1) {
+                        self->bad = 1;
+                        return -1;
+                    }
+                    data[doff++] = '\n';
+                }
+                if (doff + (ve - vb) >= dcap) {
+                    self->bad = 1;
+                    return -1;
+                }
+                memcpy(data + doff, self->p + vb, (size_t)(ve - vb));
+                doff += ve - vb;
+                data[doff] = 0;
+                have_data = 1;
+                continue;
+            }
+            if (ne - nb == 5 && memcmp(self->p + nb, "event", 5) == 0) {
+                type_b = vb;
+                type_e = ve;
+                continue;
+            }
+            if (ne - nb == 2 && memcmp(self->p + nb, "id", 2) == 0) {
+                id_b = vb;
+                id_e = ve;
+                continue;
+            }
+            if (ne - nb == 5 && memcmp(self->p + nb, "retry", 5) == 0) {
+                int v = 0, ok = 1, j = 0;
+
+                if (ve == vb)
+                    continue;
+                for (j = vb; j < ve; j++) {
+                    if (self->p[j] < '0' || self->p[j] > '9') {
+                        ok = 0;
+                        break;
+                    }
+                    v = v * 10 + (self->p[j] - '0');
+                }
+                if (ok) {
+                    retry = v;
+                    has_retry = 1;
+                }
+                continue;
+            }
+            /* 其余字段忽略 */
+        }
+    }
+}
+
+/* ---- 自测 ---- */
+
+static const char *STREAM =
+    "\xEF\xBB\xBF: 注释行\n"
+    "retry: 3000\n"
+    "\n"
+    "event: tick\n"
+    "id: 7\n"
+    "data: line one\n"
+    "data:line two\n"
+    "\n"
+    "data:  two spaces\n"
+    "\n"
+    ": keepalive\n"
+    "data: partial\n";
+
+test "SSE：多行 data、事件类型与 retry" {
+    SseReader r = sse_open(STREAM, (int)strlen(STREAM));
+    SseEvent e = { 0 };
+    char buf[256] = { 0 };
+
+    /* 第一条只有 retry，没有 data → 不派发；所以第一个事件是 tick */
+    if (r.next(&e, buf, (int)sizeof buf) != 1)
+        return err(1, "第一个事件没读到");
+    if (e.type.s.len != 4 || memcmp(e.type.s.data, "tick", 4) != 0)
+        return err(2, "event 字段不对");
+    if (e.id.s.len != 1 || e.id.s.data[0] != '7')
+        return err(3, "id 字段不对");
+    if (e.data.s.len != 17
+        || memcmp(e.data.s.data, "line one\nline two", 17) != 0)
+        return err(4, "多行 data 拼接不对");
+    if (e.data.s.data != buf)
+        return err(5, "data 应该指向调用方的缓冲");
+    /* 第二个事件：值前的空格只吃一个 */
+    if (r.next(&e, buf, (int)sizeof buf) != 1)
+        return err(6, "第二个事件没读到");
+    if (e.data.s.len != 11 || memcmp(e.data.s.data, " two spaces", 11) != 0)
+        return err(7, "只吃一个空格");
+    if (e.type.s.len != 0 || e.id.s.len != 0)
+        return err(8, "第二个事件不该有 type/id");
+    if (e.has_retry)
+        return err(9, "第二个事件不该带 retry");
+    /* 剩下的 data: partial 没有空行收尾 → 丢弃 */
+    if (r.next(&e, buf, (int)sizeof buf) != 0)
+        return err(10, "EOF 前的半截事件应该丢弃");
+    if (r.dispatched != 2)
+        return err(11, "派发次数不对");
+}
+
+test "SSE：retry、CRLF 与坏输入" {
+    static const char *crlf = "retry: 500\r\ndata: a\r\n\r\ndata: b\n\n";
+    SseReader r = sse_open(crlf, (int)strlen(crlf));
+    SseEvent e = { 0 };
+    char buf[64] = { 0 };
+
+    if (r.next(&e, buf, (int)sizeof buf) != 1)
+        return err(12, "CRLF 流没读到事件");
+    if (!e.has_retry || e.retry != 500)
+        return err(13, "retry 不对");
+    if (e.data.s.len != 1 || e.data.s.data[0] != 'a')
+        return err(14, "CRLF 的 data 不对");
+    if (r.next(&e, buf, (int)sizeof buf) != 1 || e.data.s.len != 1
+        || e.data.s.data[0] != 'b')
+        return err(15, "第二个事件不对");
+    if (e.has_retry)
+        return err(16, "retry 不该延续到下一个事件");
+    if (r.next(&e, buf, (int)sizeof buf) != 0)
+        return err(17, "应该读完");
+    /* 缓冲不够 */
+    r = sse_open("data: abcdef\n\n", 14);
+    if (r.next(&e, buf, 4) != -1 || r.bad == 0)
+        return err(18, "数据放不下应该 -1");
+    /* 空指针 / 空输入 */
+    if (sse_open(0, 4).bad == 0)
+        return err(19, "空指针应该 bad");
+    r = sse_open(STREAM, (int)strlen(STREAM));
+    if (next(0, &e, buf, 8) != -1 || next(&r, 0, buf, 8) != -1
+        || next(&r, &e, 0, 8) != -1)
+        return err(20, "空指针应该 -1");
+    /* 没有冒号的行当字段名为空值 */
+    r = sse_open("data\n\n", 6);
+    if (r.next(&e, buf, (int)sizeof buf) != 1 || e.data.s.len != 0)
+        return err(21, "裸 data 行应该派发空 data");
+    /* retry 非数字忽略 */
+    r = sse_open("retry: abc\ndata: x\n\n", 20);
+    if (r.next(&e, buf, (int)sizeof buf) != 1 || e.has_retry)
+        return err(22, "非数字 retry 应该忽略");
+}

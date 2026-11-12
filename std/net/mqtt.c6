@@ -1,0 +1,612 @@
+/* std/net/mqtt：MQTT 3.1.1（v4）报文编解码（零分配，不含套接字）。
+ *
+ *     import std.net.mqtt;
+ *
+ *     MqttPacket pk = { 0 };
+ *     int n = mqtt_parse_header(buf, rn, &pk);     // >0 整包长度，0 要再读
+ *     if (n > 0 && pk.type == MQTT_PUBLISH) {
+ *         MqttPublish pub = { 0 };
+ *         if (mqtt_parse_publish(&pk, &pub) > 0)
+ *             // pub.topic / pub.payload 都是指向 buf 的视图
+ *     }
+ *
+ * 只做字节层：怎么收发由 `std.net.tcp` 或调用方决定。所有 `parse_*` 的视图都
+ * 指向传进来的缓冲，调用方要保证它活着。
+ *
+ * 约定：
+ *
+ * - `mqtt_parse_header` 返回**整包**字节数（固定头 + 剩余长度）；数据不够返回
+ *   0，格式坏（剩余长度 >4 字节、长度超出 268435455）返回 -1；它不检查包里
+ *   的内容，那交给各自的 `parse_*`；
+ * - 剩余长度是变长整数（每字节 7 位，最高位续位），最多 4 字节；
+ * - 字符串是「u16 大端长度 + 字节」，构建函数里超过 65535 一律 -1；
+ * - 支持 CONNECT / CONNACK / PUBLISH / PUBACK / PUBREC / PUBREL / PUBCOMP /
+ *   SUBSCRIBE / SUBACK / UNSUBSCRIBE / UNSUBACK / PINGREQ / PINGRESP /
+ *   DISCONNECT 的类型常量与常用构建/解析；不做 TLS、不做重传与遗嘱触发；
+ * - `mqtt_topic_matches` 实现 `+` / `#` 通配（订阅过滤器匹配主题）。
+ */
+#include <string.h>
+
+module std.net.mqtt;
+import std.core.types;
+import std.text.str;
+
+enum MqttType {
+    MQTT_CONNECT = 1,
+    MQTT_CONNACK = 2,
+    MQTT_PUBLISH = 3,
+    MQTT_PUBACK = 4,
+    MQTT_PUBREC = 5,
+    MQTT_PUBREL = 6,
+    MQTT_PUBCOMP = 7,
+    MQTT_SUBSCRIBE = 8,
+    MQTT_SUBACK = 9,
+    MQTT_UNSUBSCRIBE = 10,
+    MQTT_UNSUBACK = 11,
+    MQTT_PINGREQ = 12,
+    MQTT_PINGRESP = 13,
+    MQTT_DISCONNECT = 14,
+};
+
+struct MqttPacket {
+    int type;
+    int flags;
+    int remaining;      /* 剩余长度 */
+    int header_len;     /* 固定头字节数 */
+    int total;          /* 固定头 + 剩余长度 */
+    const u8 *body;     /* 可变头 + 载荷 */
+};
+
+struct MqttPublish {
+    Str topic;
+    Str payload;
+    int qos;
+    int packet_id;
+    int retain;
+    int dup;
+};
+
+struct MqttConnectOpts {
+    Str client_id;
+    Str will_topic;
+    Str will_payload;
+    Str username;
+    Str password;
+    int keepalive;
+    int clean_session;
+    int will_qos;
+    int will_retain;
+};
+
+/* 变长整数的字节数（1..4） */
+int mqtt_varint_len(int value)
+{
+    if (value < 0 || value > 268435455)
+        return -1;
+    if (value < 128)
+        return 1;
+    if (value < 16384)
+        return 2;
+    if (value < 2097152)
+        return 3;
+    return 4;
+}
+
+/* 读变长整数：返回消耗字节数 / 0 数据不够 / -1 坏 */
+int mqtt_varint(const void *src, int n, int *value)
+{
+    const u8 *p = (const u8 *)src;
+    int v = 0, shift = 0, i = 0;
+
+    if (!src || n <= 0 || !value)
+        return -1;
+    for (i = 0; i < 4; i++) {
+        u8 b = 0;
+
+        if (i >= n)
+            return 0;
+        b = p[i];
+        v |= (int)(b & 0x7F) << shift;
+        shift += 7;
+        if ((b & 0x80) == 0) {
+            *value = v;
+            return i + 1;
+        }
+    }
+    return -1;                          /* 超过 4 字节 */
+}
+
+static int mqtt_put_varint(char *out, int cap, int off, int value)
+{
+    int need = mqtt_varint_len(value);
+
+    if (need < 0 || off + need > cap)
+        return -1;
+    while (value >= 128) {
+        out[off++] = (char)((value & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    out[off++] = (char)value;
+    return off;
+}
+
+/* 返回整包长度 / 0 不够 / -1 坏 */
+int mqtt_parse_header(const void *src, int n, MqttPacket *out)
+{
+    const u8 *p = (const u8 *)src;
+    int used = 0, remaining = 0;
+
+    if (!src || n <= 0 || !out)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (n < 2)
+        return 0;
+    out->type = p[0] >> 4;
+    out->flags = p[0] & 0x0F;
+    if (out->type == 0 || out->type > 14 || out->type == 15)
+        return -1;
+    used = mqtt_varint(p + 1, n - 1, &remaining);
+    if (used == 0)
+        return 0;
+    if (used < 0)
+        return -1;
+    out->remaining = remaining;
+    out->header_len = 1 + used;
+    out->total = out->header_len + remaining;
+    if (out->total > n)
+        return 0;
+    out->body = p + out->header_len;
+    return out->total;
+}
+
+/* u16 长度前缀字符串：返回新偏移 / -1 */
+static int mqtt_put_str(char *out, int cap, int off, Str s)
+{
+    if (s.s.len < 0 || s.s.len > 65535)
+        return -1;
+    if (off + 2 + s.s.len > cap)
+        return -1;
+    out[off] = (char)((s.s.len >> 8) & 0xFF);
+    out[off + 1] = (char)(s.s.len & 0xFF);
+    if (s.s.len > 0)
+        memcpy(out + off + 2, s.s.data, (size_t)s.s.len);
+    return off + 2 + s.s.len;
+}
+
+/* 读 u16 长度前缀字符串：返回消耗字节数 / 0 不够 / -1 坏 */
+int mqtt_get_str(const void *src, int n, Str *out)
+{
+    const u8 *p = (const u8 *)src;
+    int len = 0;
+
+    if (!src || n < 2 || !out)
+        return src ? 0 : -1;
+    len = ((int)p[0] << 8) | (int)p[1];
+    if (2 + len > n)
+        return 0;
+    out->s = (char[:]){ (char *)p + 2, len };
+    return 2 + len;
+}
+
+/* CONNECT：返回整包长度 / -1 放不下或参数坏 */
+int mqtt_build_connect(char *out, int cap, const MqttConnectOpts *o)
+{
+    int flags = 0, off = 0, rem = 0, need = 0;
+
+    if (!out || !o || o->will_qos < 0 || o->will_qos > 2)
+        return -1;
+    flags = o->clean_session ? 0x02 : 0;
+    if (o->will_topic.s.len > 0) {
+        flags |= 0x04;
+        flags |= (o->will_qos & 3) << 3;
+        if (o->will_retain)
+            flags |= 0x20;
+    }
+    if (o->password.s.len > 0)
+        flags |= 0x40;
+    if (o->username.s.len > 0)
+        flags |= 0x80;
+    /* 剩余长度：10 字节可变头 + 各字符串 */
+    rem = 10 + 2 + o->client_id.s.len;
+    if (o->will_topic.s.len > 0)
+        rem += 2 + o->will_topic.s.len + 2 + o->will_payload.s.len;
+    if (o->username.s.len > 0)
+        rem += 2 + o->username.s.len;
+    if (o->password.s.len > 0)
+        rem += 2 + o->password.s.len;
+    need = 1 + mqtt_varint_len(rem) + rem;
+    if (cap < need || mqtt_varint_len(rem) < 0)
+        return -1;
+    off = mqtt_put_varint(out, cap, 1, rem);
+    if (off < 0)
+        return -1;
+    out[0] = (char)(MQTT_CONNECT << 4);
+    /* 可变头 */
+    if (off + 10 > cap)
+        return -1;
+    out[off++] = 0;
+    out[off++] = 4;                     /* 协议名长度 */
+    out[off++] = 'M';
+    out[off++] = 'Q';
+    out[off++] = 'T';
+    out[off++] = 'T';
+    out[off++] = 4;                     /* 协议级别 3.1.1 */
+    out[off++] = (char)flags;
+    out[off++] = (char)((o->keepalive >> 8) & 0xFF);
+    out[off++] = (char)(o->keepalive & 0xFF);
+    off = mqtt_put_str(out, cap, off, o->client_id);
+    if (off < 0)
+        return -1;
+    if (o->will_topic.s.len > 0) {
+        off = mqtt_put_str(out, cap, off, o->will_topic);
+        if (off < 0)
+            return -1;
+        off = mqtt_put_str(out, cap, off, o->will_payload);
+        if (off < 0)
+            return -1;
+    }
+    if (o->username.s.len > 0) {
+        off = mqtt_put_str(out, cap, off, o->username);
+        if (off < 0)
+            return -1;
+    }
+    if (o->password.s.len > 0) {
+        off = mqtt_put_str(out, cap, off, o->password);
+        if (off < 0)
+            return -1;
+    }
+    return off;
+}
+
+/* PUBLISH：qos>0 时包里有 packet_id；QoS3 非法 */
+int mqtt_build_publish(char *out, int cap, Str topic, int qos, int retain,
+                       int dup, int packet_id, Str payload)
+{
+    int rem = 0, off = 0, need = 0, flags = 0;
+
+    if (!out || qos < 0 || qos > 2 || topic.s.len <= 0)
+        return -1;
+    if (qos > 0 && (packet_id <= 0 || packet_id > 65535))
+        return -1;
+    flags = (dup ? 0x08 : 0) | ((qos & 3) << 1) | (retain ? 1 : 0);
+    rem = 2 + topic.s.len + (qos > 0 ? 2 : 0) + payload.s.len;
+    need = 1 + mqtt_varint_len(rem) + rem;
+    if (mqtt_varint_len(rem) < 0 || cap < need)
+        return -1;
+    out[0] = (char)((MQTT_PUBLISH << 4) | flags);
+    off = mqtt_put_varint(out, cap, 1, rem);
+    if (off < 0)
+        return -1;
+    off = mqtt_put_str(out, cap, off, topic);
+    if (off < 0)
+        return -1;
+    if (qos > 0) {
+        out[off++] = (char)((packet_id >> 8) & 0xFF);
+        out[off++] = (char)(packet_id & 0xFF);
+    }
+    if (payload.s.len > 0) {
+        if (off + payload.s.len > cap)
+            return -1;
+        memcpy(out + off, payload.s.data, (size_t)payload.s.len);
+        off += payload.s.len;
+    }
+    return off;
+}
+
+/* 只带 packet_id 的报文（PUBACK/PUBREC/PUBREL/PUBCOMP/UNSUBACK） */
+int mqtt_build_id(char *out, int cap, int type, int packet_id)
+{
+    if (!out || packet_id <= 0 || packet_id > 65535)
+        return -1;
+    if (type != MQTT_PUBACK && type != MQTT_PUBREC && type != MQTT_PUBREL
+        && type != MQTT_PUBCOMP && type != MQTT_UNSUBACK)
+        return -1;
+    if (cap < 4)
+        return -1;
+    out[0] = (char)((type << 4) | (type == MQTT_PUBREL ? 2 : 0));
+    out[1] = 2;
+    out[2] = (char)((packet_id >> 8) & 0xFF);
+    out[3] = (char)(packet_id & 0xFF);
+    return 4;
+}
+
+/* 无载荷的控制报文（PINGREQ/PINGRESP/DISCONNECT） */
+int mqtt_build_empty(char *out, int cap, int type)
+{
+    if (!out || cap < 2)
+        return -1;
+    if (type != MQTT_PINGREQ && type != MQTT_PINGRESP && type != MQTT_DISCONNECT)
+        return -1;
+    out[0] = (char)(type << 4);
+    out[1] = 0;
+    return 2;
+}
+
+/* SUBSCRIBE：单个过滤器 + 请求 QoS */
+int mqtt_build_subscribe(char *out, int cap, int packet_id, Str filter, int qos)
+{
+    int rem = 0, off = 0, need = 0;
+
+    if (!out || packet_id <= 0 || packet_id > 65535 || filter.s.len <= 0
+        || qos < 0 || qos > 2)
+        return -1;
+    rem = 2 + 2 + filter.s.len + 1;
+    need = 1 + mqtt_varint_len(rem) + rem;
+    if (mqtt_varint_len(rem) < 0 || cap < need)
+        return -1;
+    out[0] = (char)((MQTT_SUBSCRIBE << 4) | 2);   /* flags 必须是 0010 */
+    off = mqtt_put_varint(out, cap, 1, rem);
+    if (off < 0)
+        return -1;
+    out[off++] = (char)((packet_id >> 8) & 0xFF);
+    out[off++] = (char)(packet_id & 0xFF);
+    off = mqtt_put_str(out, cap, off, filter);
+    if (off < 0)
+        return -1;
+    out[off++] = (char)qos;
+    return off;
+}
+
+/* 解析 PUBLISH（可变头 + 载荷）：1 成功 / -1 坏 */
+int mqtt_parse_publish(const MqttPacket *pk, MqttPublish *out)
+{
+    int used = 0, off = 0;
+
+    if (!pk || !out || pk->type != MQTT_PUBLISH)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->qos = (pk->flags >> 1) & 3;
+    out->retain = pk->flags & 1;
+    out->dup = (pk->flags >> 3) & 1;
+    if (out->qos == 3)
+        return -1;
+    used = mqtt_get_str(pk->body, pk->remaining, &out->topic);
+    if (used <= 0)
+        return -1;
+    off = used;
+    if (out->qos > 0) {
+        if (off + 2 > pk->remaining)
+            return -1;
+        out->packet_id = ((int)pk->body[off] << 8) | (int)pk->body[off + 1];
+        off += 2;
+        if (out->packet_id == 0)
+            return -1;
+    }
+    out->payload.s = (char[:]){ (char *)pk->body + off, pk->remaining - off };
+    return 1;
+}
+
+/* CONNACK：返回 1 成功 / -1 坏 */
+int mqtt_parse_connack(const MqttPacket *pk, int *session_present, int *rc)
+{
+    if (!pk || pk->type != MQTT_CONNACK || pk->remaining < 2)
+        return -1;
+    if (session_present)
+        *session_present = pk->body[0] & 1;
+    if (rc)
+        *rc = pk->body[1];
+    return 1;
+}
+
+/* SUBACK：把返回码写进 rcs[]，返回个数 / -1 坏 */
+int mqtt_parse_suback(const MqttPacket *pk, int *packet_id, int *rcs, int cap)
+{
+    int n = 0, i = 0;
+
+    if (!pk || pk->type != MQTT_SUBACK || pk->remaining < 2)
+        return -1;
+    if (packet_id)
+        *packet_id = ((int)pk->body[0] << 8) | (int)pk->body[1];
+    n = pk->remaining - 2;
+    for (i = 0; i < n && i < cap; i++)
+        rcs[i] = pk->body[2 + i];
+    return n;
+}
+
+/* 带 packet_id 的确认类报文：返回 id / -1 坏 */
+int mqtt_parse_id(const MqttPacket *pk, int *packet_id)
+{
+    if (!pk || pk->remaining < 2)
+        return -1;
+    if (packet_id)
+        *packet_id = ((int)pk->body[0] << 8) | (int)pk->body[1];
+    return 1;
+}
+
+/* 订阅过滤器匹配主题：`+` 一层、`#` 其后全部；过滤器非法返回 0 */
+int mqtt_topic_matches(Str filter, Str topic)
+{
+    int fi = 0, ti = 0;
+
+    if (filter.s.len <= 0 || topic.s.len <= 0)
+        return 0;
+    for (;;) {
+        int fb = fi, tb = ti, fl = 0, tl = 0, hash = 0;
+
+        while (fi < filter.s.len && filter.s.data[fi] != '/')
+            fi++;
+        fl = fi - fb;
+        while (ti < topic.s.len && topic.s.data[ti] != '/')
+            ti++;
+        tl = ti - tb;
+        hash = fl == 1 && filter.s.data[fb] == '#';
+        if (hash) {
+            /* `#` 只能吃「整层」：必须是最后一层 */
+            if (fi != filter.s.len)
+                return 0;
+            return 1;
+        }
+        if (!(fl == 1 && filter.s.data[fb] == '+')) {
+            if (fl != tl || memcmp(filter.s.data + fb, topic.s.data + tb,
+                                   (size_t)fl) != 0)
+                return 0;
+        }
+        if (fi >= filter.s.len && ti >= topic.s.len)
+            return 1;
+        if (fi >= filter.s.len || ti >= topic.s.len)
+            return 0;
+        fi++;                           /* 跳过 '/' */
+        ti++;
+    }
+}
+
+/* ---- 自测 ---- */
+
+test "MQTT：变长整数与固定头" {
+    char buf[8] = { 0 };
+    int v = 0, n = 0;
+    MqttPacket pk = { 0 };
+    static char enc[4] = { (char)0xFF, (char)0xFF, (char)0xFF, (char)0x7F };
+    static char two[2] = { (char)0x80, 0x01 };
+    static char bad[5] = { (char)0x80, (char)0x80, (char)0x80, (char)0x80, 0x01 };
+    static char ping[2] = { 0xC0, 0x00 };
+    static char badtype[2] = { (char)0xF0, 0 };
+
+    if (mqtt_varint_len(0) != 1 || mqtt_varint_len(127) != 1
+        || mqtt_varint_len(128) != 2 || mqtt_varint_len(16383) != 2
+        || mqtt_varint_len(16384) != 3 || mqtt_varint_len(2097152) != 4)
+        return err(1, "varint 长度不对");
+    if (mqtt_varint_len(268435456) != -1)
+        return err(2, "超范围应该 -1");
+    if (mqtt_varint(enc, 4, &v) != 4 || v != 268435455)
+        return err(3, "最大值编码不对");
+    if (mqtt_varint(two, 2, &v) != 2 || v != 128)
+        return err(4, "两字节编码不对");
+    if (mqtt_varint(bad, 5, &v) != -1)
+        return err(5, "五字节变长整数应该 -1");
+    if (mqtt_varint(two, 1, &v) != 0)
+        return err(6, "半包应该 0");
+    if (mqtt_varint(0, 2, &v) != -1)
+        return err(7, "空指针应该 -1");
+    n = mqtt_parse_header(ping, 2, &pk);
+    if (n != 2 || pk.type != MQTT_PINGREQ || pk.remaining != 0
+        || pk.header_len != 2)
+        return err(8, "PINGREQ 头不对");
+    if (mqtt_parse_header(ping, 1, &pk) != 0)
+        return err(9, "只有一个字节应该 0");
+    if (mqtt_parse_header(badtype, 2, &pk) != -1)
+        return err(10, "类型 15 应该 -1");
+    (void)buf;
+}
+
+test "MQTT：CONNECT / PUBLISH / SUBSCRIBE 构建" {
+    char buf[256] = { 0 };
+    MqttConnectOpts o = { 0 };
+    MqttPacket pk = { 0 };
+    MqttPublish pub = { 0 };
+    int n = 0, rem = 0, used = 0;
+    Str id = { S("cli-1") };
+    Str topic = { S("sensors/temp") };
+    Str payload = { S("21.5") };
+
+    o.client_id = id;
+    o.keepalive = 60;
+    o.clean_session = 1;
+    n = mqtt_build_connect(buf, (int)sizeof buf, &o);
+    if (n != 19)
+        return err(11, "CONNECT 长度不对");
+    if ((u8)buf[0] != 0x10)
+        return err(12, "CONNECT 固定头不对");
+    used = mqtt_varint(buf + 1, n - 1, &rem);
+    if (used != 1 || rem != n - 2)
+        return err(13, "CONNECT 剩余长度不对");
+    if (memcmp(buf + 2, "\x00\x04MQTT", 6) != 0 || (u8)buf[8] != 4
+        || (u8)buf[9] != 0x02)
+        return err(14, "CONNECT 可变头不对");
+    if ((u8)buf[10] != 0 || (u8)buf[11] != 60)
+        return err(15, "keepalive 不对");
+    /* 带遗嘱与账号 */
+    o.will_topic = (Str){ S("cli/1/status") };
+    o.will_payload = (Str){ S("offline") };
+    o.will_qos = 1;
+    o.will_retain = 1;
+    o.username = (Str){ S("u") };
+    o.password = (Str){ S("p") };
+    n = mqtt_build_connect(buf, (int)sizeof buf, &o);
+    if (n != 48)
+        return err(16, "带遗嘱的 CONNECT 长度不对");
+    if ((u8)buf[9] != (0x02 | 0x04 | (1 << 3) | 0x20 | 0x40 | 0x80))
+        return err(17, "CONNECT 标志不对");
+    /* PUBLISH QoS1 */
+    n = mqtt_build_publish(buf, (int)sizeof buf, topic, 1, 1, 0, 7, payload);
+    if (n != 22)
+        return err(18, "PUBLISH 长度不对");
+    if (mqtt_parse_header(buf, n, &pk) != n)
+        return err(19, "PUBLISH 头解析不对");
+    if (mqtt_parse_publish(&pk, &pub) != 1)
+        return err(20, "PUBLISH 解析失败");
+    if (pub.qos != 1 || pub.retain != 1 || pub.dup != 0
+        || pub.packet_id != 7)
+        return err(21, "PUBLISH 标志/包号不对");
+    if (pub.topic.s.len != 12 || pub.payload.s.len != 4
+        || memcmp(pub.payload.s.data, "21.5", 4) != 0)
+        return err(22, "PUBLISH 主题/载荷不对");
+    /* QoS0 不带包号 */
+    n = mqtt_build_publish(buf, (int)sizeof buf, topic, 0, 0, 0, 0, payload);
+    if (n != 20)
+        return err(23, "QoS0 PUBLISH 长度不对");
+    if (mqtt_parse_header(buf, n, &pk) != n || mqtt_parse_publish(&pk, &pub) != 1
+        || pub.packet_id != 0 || pub.payload.s.len != 4)
+        return err(24, "QoS0 PUBLISH 解析不对");
+    if (mqtt_build_publish(buf, (int)sizeof buf, topic, 3, 0, 0, 0, payload) != -1)
+        return err(25, "QoS3 应该 -1");
+    if (mqtt_build_publish(buf, (int)sizeof buf, topic, 1, 0, 0, 0, payload) != -1)
+        return err(26, "QoS1 无包号应该 -1");
+    /* SUBSCRIBE */
+    n = mqtt_build_subscribe(buf, (int)sizeof buf, 3, (Str){ S("a/+/c") }, 2);
+    if (n != 12 || (u8)buf[0] != 0x82)
+        return err(27, "SUBSCRIBE 长度或固定头不对");
+    if (mqtt_parse_header(buf, n, &pk) != n || pk.type != MQTT_SUBSCRIBE)
+        return err(28, "SUBSCRIBE 头不对");
+    /* 控制报文与确认报文 */
+    if (mqtt_build_empty(buf, (int)sizeof buf, MQTT_DISCONNECT) != 2
+        || (u8)buf[0] != 0xE0)
+        return err(29, "DISCONNECT 不对");
+    if (mqtt_build_id(buf, (int)sizeof buf, MQTT_PUBACK, 300) != 4
+        || (u8)buf[0] != 0x40 || (u8)buf[2] != 1 || (u8)buf[3] != 44)
+        return err(30, "PUBACK 不对");
+    if (mqtt_build_id(buf, (int)sizeof buf, MQTT_PUBREL, 300) != 4
+        || (u8)buf[0] != 0x62)
+        return err(31, "PUBREL 的低 4 位必须是 0010");
+    if (mqtt_build_id(buf, (int)sizeof buf, MQTT_PINGREQ, 1) != -1)
+        return err(32, "PINGREQ 不该带包号");
+}
+
+test "MQTT：应答解析与主题通配" {
+    static char connack[4] = { 0x20, 0x02, 0x01, 0x00 };
+    static char suback[5] = { (char)0x90, 0x03, 0x00, 0x05, 0x02 };
+    static char puback[4] = { 0x40, 0x02, 0x01, 0x2C };
+    MqttPacket pk = { 0 };
+    int sp = 0, rc = 0, pid = 0, rcs[4] = { 0 };
+
+    if (mqtt_parse_header(connack, 4, &pk) != 4)
+        return err(33, "CONNACK 头不对");
+    if (mqtt_parse_connack(&pk, &sp, &rc) != 1 || sp != 1 || rc != 0)
+        return err(34, "CONNACK 解析不对");
+    if (mqtt_parse_header(suback, 5, &pk) != 5)
+        return err(35, "SUBACK 头不对");
+    if (mqtt_parse_suback(&pk, &pid, rcs, 4) != 1 || pid != 5 || rcs[0] != 2)
+        return err(36, "SUBACK 解析不对");
+    if (mqtt_parse_header(puback, 4, &pk) != 4
+        || mqtt_parse_id(&pk, &pid) != 1 || pid != 300)
+        return err(37, "PUBACK 解析不对");
+    if (mqtt_topic_matches((Str){ S("a/+/c") }, (Str){ S("a/b/c") }) != 1)
+        return err(38, "`+` 应该匹配一层");
+    if (mqtt_topic_matches((Str){ S("a/+/c") }, (Str){ S("a/b/d") }) != 0)
+        return err(39, "末层不同不该匹配");
+    if (mqtt_topic_matches((Str){ S("a/+") }, (Str){ S("a/b/c") }) != 0)
+        return err(40, "`+` 不吃两层");
+    if (mqtt_topic_matches((Str){ S("sensors/#") }, (Str){ S("sensors/temp/1") })
+        != 1)
+        return err(41, "`#` 应该匹配其后全部");
+    if (mqtt_topic_matches((Str){ S("#") }, (Str){ S("anything") }) != 1)
+        return err(42, "单独的 `#` 匹配一切");
+    if (mqtt_topic_matches((Str){ S("a/#/b") }, (Str){ S("a/x/b") }) != 0)
+        return err(43, "`#` 不是最后一层应该非法");
+    if (mqtt_topic_matches((Str){ S("a/b") }, (Str){ S("a/b/c") }) != 0)
+        return err(44, "长度不同不该匹配");
+    if (mqtt_topic_matches((Str){ S("a/b") }, (Str){ S("a/b") }) != 1)
+        return err(45, "完全相同应该匹配");
+    if (mqtt_parse_publish(&pk, (MqttPublish *)0) != -1)
+        return err(46, "空指针应该 -1");
+}

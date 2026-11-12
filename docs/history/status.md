@@ -1374,5 +1374,31 @@ sha512 + bits，otp 要 sha1 + bits。示例 `examples/stdenc.c6` 先走手写 D
 验收：`make stdtest`（145 个模块、0 failure）、`make std-doc`（23 条自检全过）、
 `make check-all`。
 
+### 11.46 标准库第三十四批（sse / socks5 / mqtt / snappy）
+
+第三十四批全是「字节层编解码」：只填缓冲、只解析缓冲，套接字留给
+`std.net.tcp` 或调用方。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.net.sse` | Server-Sent Events 流 | 空行派发、四个字段、多行 `data` 拼进调用方缓冲（零分配做不到拼接）；注释忽略、BOM 跳过、三种行结束符都认；EOF 前没空行收尾的半截事件按规范丢弃；单行上限 8 KB |
+| `std.net.socks5` | SOCKS5 报文 | 问候/用户名口令/请求三种构建 + 方法/认证/应答/地址四种解析；`Socks5Addr` 支持 IPv4/IPv6/域名，域名用 `inet_parse` 试探（失败才当域名）；半包返回 0、坏包 -1 |
+| `std.net.mqtt` | MQTT 3.1.1 报文 | 固定头 + 剩余长度变长整数；CONNECT（含遗嘱与账号）/PUBLISH（QoS 0/1/2）/SUBSCRIBE/各类确认的构建与解析，`mqtt_topic_matches` 做 `+`/`#` 通配；不做 TLS、重传与遗嘱触发 |
+| `std.encoding.snappy` | Snappy 块格式 | 解码认四种元素并严格校验（重叠复制逐字节搬）；编码用调用方给的 16 KB 哈希表做贪心匹配，单次匹配封顶 64 字节；不给哈希表就退化成整块字面量（仍是合法流）；不做 framed 与 CRC-32C |
+
+「半包返回 0、坏包返回 -1」是这四个模块统一的返回值约定，网络读到一半的常见
+情况不用靠 `errno` 表达，调用方 `while ((n = next(...)) == 0) read_more();` 就行。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.net.sse`=0x6091、
+`std.net.socks5`=0x6092、`std.net.mqtt`=0x6093、`std.encoding.snappy`=0x6094；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-proto` 与 `STD_PROTO_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 里 sse/mqtt 只依赖 `std/text/str.c6`，
+socks5 还要 `std/net/inet.c6`，snappy 自成一体。示例 `examples/stdproto.c6` 把四个
+编解码器串起来跑（21 条自检）。
+
+验收：`make stdtest`（149 个模块、0 failure）、`make std-proto`（21 条自检全过）、
+`make check-all`。
+
+
 
 
