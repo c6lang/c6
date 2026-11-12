@@ -1,0 +1,429 @@
+/* std/os/thread：线程身份、调度让步与固定线程池。
+ *
+ *     import std.os.thread;
+ *
+ *     printf("cpu=%d self=%llu\n", cpu_count(), (unsigned long long)thread_self());
+ *
+ *     ThreadJob jobs[16] = { 0 };
+ *     ThreadPool pool = { 0 };
+ *     pool.start(4, jobs, 16);          // 4 个 worker、队列容量 16
+ *     pool.submit(&work, &data);         // 队列满了会等
+ *     pool.wait();                       // 等队列清空、worker 全闲下来
+ *     pool.stop();
+ *
+ * 语言层面的 `spawn f(a);` 是「起一个线程跑这一次调用」，适合少量、一次性
+ * 的并发；要反复投递同一批小任务（HTTP 请求、文件处理、批算）时，每个任务
+ * 都 `pthread_create` 太贵，用这里的 `ThreadPool`：worker 只创建一次，任务
+ * 从环形队列里取。
+ *
+ * 约定：
+ *
+ * - `thread_self()` 是当前线程的 `pthread_t`（转成 `u64`），只用于比较和
+ *   打日志；`thread_equal(a, b)` 比较两个 id。
+ * - `cpu_count()` 读 `sysconf(_SC_NPROCESSORS_ONLN)`，取不到给 1。
+ * - `thread_yield()` 让出 CPU 给同优先级的线程（自旋等待时用）；返回 1/0。
+ * - `thread_set_name(name)` 只对当前线程生效，Linux 上最多 15 字节（长名字
+ *   被截断但调用成功），返回 1/0。
+ * - 线程池的 worker 个数最多 `POOL_MAX`（32）；任务队列由调用方给（`ThreadJob`
+ *   数组 + 容量），池本身不分配内存。
+ * - `submit` 在队列满时**阻塞**（背压）；不想阻塞用 `try_submit`，满了返回 0。
+ * - `wait()` 只保证「现在闲」，之后还可以继续 `submit`；`stop()` 之后不再
+ *   接受任务，并 join 掉所有 worker（重复调用安全）。
+ * - 任务函数是 `void (*fn)(void *)`，`arg` 原样传给它；任务里可以放心用
+ *   `err`/`f"..."`（c6 运行时的每线程状态在第一次用到时按需分配）。
+ * - 池里的 worker 是用 `pthread_create` 起的**裸线程**，不经过 `spawn`；
+ *   所以它们不参与调用方的 `spawn` 回收链，`stop()` 必须自己 join。
+ */
+#define _GNU_SOURCE 1
+
+#include <pthread.h>
+#include <sched.h>
+#include <string.h>
+#include <unistd.h>
+
+module std.os.thread;
+import std.core.types;
+
+/* 一个池里最多多少个 worker（`ThreadPool` 里的 tid 数组是定长的） */
+#define POOL_MAX 32
+
+/* ---- 线程身份与调度 ---- */
+
+/* 当前线程的 id（`pthread_t` 转成 u64，只用于比较/日志） */
+u64 thread_self(void)
+{
+    return (u64)pthread_self();
+}
+
+/* 两个 id 是不是同一个线程 */
+int thread_equal(u64 a, u64 b)
+{
+    return pthread_equal((pthread_t)a, (pthread_t)b) != 0;
+}
+
+/* 可用的 CPU 个数，最少给 1 */
+int cpu_count(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+
+    return n < 1 ? 1 : (int)n;
+}
+
+/* 让出 CPU；返回 1/0 */
+int thread_yield(void)
+{
+    return sched_yield() == 0;
+}
+
+/* 给当前线程起个名字（Linux：最多 15 字节）；返回 1/0 */
+int thread_set_name(const char *name)
+{
+    if (!name)
+        return 0;
+    return pthread_setname_np(pthread_self(), name) == 0;
+}
+
+/* ---- 线程池 ---- */
+
+struct ThreadJob {
+    void (*fn)(void *);
+    void *arg;
+};
+
+struct ThreadPool {
+    pthread_mutex_t m;
+    pthread_cond_t work;         /* worker 等活干 */
+    pthread_cond_t space;        /* submit 等队列有空位 */
+    pthread_cond_t idle;         /* wait 等所有人闲下来 */
+    pthread_t tids[POOL_MAX];
+    ThreadJob *jobs;             /* 调用方给的环形队列 */
+    int cap;
+    int head;
+    int tail;
+    int count;                   /* 队列里的任务数 */
+    int nworkers;
+    int busy;                    /* 正在跑任务的 worker 数 */
+    int ndone;                   /* 已完成的任务数 */
+    int stopping;                /* 收到 stop */
+    int started;
+};
+
+/* 取一个任务；没有就等到有（或等到 stop）。拿到返回 1 */
+static int pool_take(ThreadPool *self, ThreadJob *out)
+{
+    pthread_mutex_lock(&self->m);
+    while (self->count == 0 && !self->stopping)
+        pthread_cond_wait(&self->work, &self->m);
+    if (self->count == 0) {          /* stop 且队列空了：收工 */
+        pthread_mutex_unlock(&self->m);
+        return 0;
+    }
+    *out = self->jobs[self->head];
+    self->head = (self->head + 1) % self->cap;
+    self->count = self->count - 1;
+    self->busy = self->busy + 1;
+    pthread_cond_signal(&self->space);      /* 队列空出一个位置 */
+    pthread_mutex_unlock(&self->m);
+    return 1;
+}
+
+/* 一个任务跑完：busy 减一，全闲下来就唤醒 wait */
+static void pool_finish(ThreadPool *self)
+{
+    pthread_mutex_lock(&self->m);
+    self->busy = self->busy - 1;
+    self->ndone = self->ndone + 1;
+    if (self->busy == 0 && self->count == 0)
+        pthread_cond_broadcast(&self->idle);
+    pthread_mutex_unlock(&self->m);
+}
+
+/* worker 主循环：拿任务、跑、记完成，直到 stop 且队列空 */
+static void *pool_worker(void *p)
+{
+    ThreadPool *self = (ThreadPool *)p;
+    ThreadJob job = { 0 };
+
+    while (pool_take(self, &job)) {
+        if (job.fn)
+            job.fn(job.arg);
+        pool_finish(self);
+    }
+    return (void *)0;
+}
+
+/* 起 nworkers 个 worker；任务队列是调用方给的 jobs[cap]。失败返回 0 */
+int start(ThreadPool *self, int workers, ThreadJob *jobs, int cap)
+{
+    int i = 0, made = 0;
+
+    if (!self || !jobs || cap < 1 || workers < 1 || workers > POOL_MAX)
+        return 0;
+    memset(self, 0, sizeof(*self));
+    self->jobs = jobs;
+    self->cap = cap;
+    self->nworkers = workers;
+    if (pthread_mutex_init(&self->m, 0) != 0)
+        return 0;
+    if (pthread_cond_init(&self->work, 0) != 0)
+        return 0;
+    if (pthread_cond_init(&self->space, 0) != 0)
+        return 0;
+    if (pthread_cond_init(&self->idle, 0) != 0)
+        return 0;
+    for (i = 0; i < workers; i++) {
+        if (pthread_create(&self->tids[i], 0, pool_worker, self) != 0) {
+            /* 起了一半：让已经起来的 worker 收工，再返回失败 */
+            pthread_mutex_lock(&self->m);
+            self->stopping = 1;
+            pthread_cond_broadcast(&self->work);
+            pthread_mutex_unlock(&self->m);
+            while (made > 0) {
+                made--;
+                pthread_join(self->tids[made], (void *)0);
+            }
+            return 0;
+        }
+        made++;
+    }
+    self->started = 1;
+    return 1;
+}
+
+int is_started(ThreadPool *self) { return self && self->started; }
+
+int workers(ThreadPool *self) { return self ? self->nworkers : 0; }
+
+/* 队列里还没被取走的任务数 */
+int pending(ThreadPool *self)
+{
+    int n = 0;
+
+    if (!self || !self->started)
+        return 0;
+    pthread_mutex_lock(&self->m);
+    n = self->count;
+    pthread_mutex_unlock(&self->m);
+    return n;
+}
+
+/* 正在跑任务的 worker 数 */
+int running(ThreadPool *self)
+{
+    int n = 0;
+
+    if (!self || !self->started)
+        return 0;
+    pthread_mutex_lock(&self->m);
+    n = self->busy;
+    pthread_mutex_unlock(&self->m);
+    return n;
+}
+
+/* 已经跑完的任务数 */
+int done(ThreadPool *self)
+{
+    int n = 0;
+
+    if (!self || !self->started)
+        return 0;
+    pthread_mutex_lock(&self->m);
+    n = self->ndone;
+    pthread_mutex_unlock(&self->m);
+    return n;
+}
+
+/* 投一个任务：队列满时阻塞。成功 1，池没起/已停 0 */
+int submit(ThreadPool *self, void (*fn)(void *), void *arg)
+{
+    if (!self || !self->started || !fn)
+        return 0;
+    pthread_mutex_lock(&self->m);
+    while (self->count == self->cap && !self->stopping)
+        pthread_cond_wait(&self->space, &self->m);
+    if (self->stopping || self->count == self->cap) {
+        pthread_mutex_unlock(&self->m);
+        return 0;
+    }
+    self->jobs[self->tail].fn = fn;
+    self->jobs[self->tail].arg = arg;
+    self->tail = (self->tail + 1) % self->cap;
+    self->count = self->count + 1;
+    pthread_cond_signal(&self->work);
+    pthread_mutex_unlock(&self->m);
+    return 1;
+}
+
+/* 不阻塞的投递：队列满了返回 0（任务没进去） */
+int try_submit(ThreadPool *self, void (*fn)(void *), void *arg)
+{
+    if (!self || !self->started || !fn)
+        return 0;
+    pthread_mutex_lock(&self->m);
+    if (self->stopping || self->count == self->cap) {
+        pthread_mutex_unlock(&self->m);
+        return 0;
+    }
+    self->jobs[self->tail].fn = fn;
+    self->jobs[self->tail].arg = arg;
+    self->tail = (self->tail + 1) % self->cap;
+    self->count = self->count + 1;
+    pthread_cond_signal(&self->work);
+    pthread_mutex_unlock(&self->m);
+    return 1;
+}
+
+/* 等队列清空、worker 全闲下来（之后还能继续 submit） */
+void wait(ThreadPool *self)
+{
+    if (!self || !self->started)
+        return;
+    pthread_mutex_lock(&self->m);
+    while (self->count > 0 || self->busy > 0)
+        pthread_cond_wait(&self->idle, &self->m);
+    pthread_mutex_unlock(&self->m);
+}
+
+/* 停：不再接新任务，join 掉所有 worker。重复调用安全，返回 1/0 */
+int stop(ThreadPool *self)
+{
+    int i = 0;
+
+    if (!self || !self->started)
+        return 0;
+    pthread_mutex_lock(&self->m);
+    self->stopping = 1;
+    pthread_cond_broadcast(&self->work);
+    pthread_cond_broadcast(&self->space);
+    pthread_mutex_unlock(&self->m);
+    for (i = 0; i < self->nworkers; i++)
+        pthread_join(self->tids[i], (void *)0);
+    self->started = 0;
+    return 1;
+}
+
+/* ==== 测试 ==== */
+
+static int t_slots[8];
+static int t_slow[2];
+static volatile int t_release = 0;
+
+static void fill_slot(void *p)
+{
+    int *v = (int *)p;
+
+    *v = *v + 1;
+}
+
+static void set_slot(void *p)
+{
+    int *v = (int *)p;
+
+    *v = 42;
+}
+
+static void slow_job(void *p)
+{
+    int *v = (int *)p;
+
+    while (!t_release)
+        thread_yield();
+    *v = 7;
+}
+
+test "线程身份、CPU 个数与让步" {
+    u64 a = thread_self();
+    u64 b = thread_self();
+
+    if (a == 0)
+        return err(1, "thread_self 应当是有效 id");
+    if (!thread_equal(a, b))
+        return err(2, "同一个线程的两个 id 应当相等");
+    if (thread_equal(a, a + 1))
+        return err(3, "不同 id 应当不相等");
+    if (cpu_count() < 1)
+        return err(4, "cpu_count 至少是 1");
+    if (!thread_yield())
+        return err(5, "thread_yield");
+    if (!thread_set_name("c6-test"))
+        return err(6, "thread_set_name");
+    if (thread_set_name(0))
+        return err(7, "空名字应当失败");
+}
+
+test "线程池：起停、忙闲与完成计数" {
+    ThreadJob jobs[8] = { 0 };
+    ThreadPool pool = { 0 };
+    int i = 0;
+
+    if (!pool.start(4, jobs, 8))
+        return err(1, "start");
+    if (!pool.is_started() || pool.workers() != 4)
+        return err(2, "起的 worker 数不对");
+    if (pool.pending() != 0 || pool.running() != 0 || pool.done() != 0)
+        return err(3, "刚起来应当全闲");
+    for (i = 0; i < 8; i++)
+        t_slots[i] = 0;
+    for (i = 0; i < 8; i++)
+        if (!pool.submit(&fill_slot, &t_slots[i]))
+            return err(4, "submit");
+    pool.wait();
+    for (i = 0; i < 8; i++)
+        if (t_slots[i] != 1)
+            return err(5, "有任务没跑");
+    if (pool.done() != 8 || pool.pending() != 0 || pool.running() != 0)
+        return err(6, "跑完之后计数不对");
+    if (!pool.stop())
+        return err(7, "stop");
+    if (pool.is_started())
+        return err(8, "stop 之后 is_started 应为 0");
+    if (pool.submit(&fill_slot, &t_slots[0]))
+        return err(9, "停了之后不该再接任务");
+    if (pool.stop())
+        return err(10, "重复 stop 应当返回 0");
+}
+
+test "线程池：参数校验与 try_submit" {
+    ThreadJob jobs[2] = { 0 };
+    ThreadPool pool = { 0 };
+
+    if (pool.start(0, jobs, 2) || pool.start(4, 0, 2) || pool.start(4, jobs, 0))
+        return err(1, "非法参数应当拒绝");
+    if (pool.start(POOL_MAX + 1, jobs, 2))
+        return err(2, "worker 数超过 POOL_MAX 应当拒绝");
+    if (!pool.start(1, jobs, 1))
+        return err(3, "start");
+    t_slow[0] = 0;
+    t_release = 0;
+    if (!pool.try_submit(&slow_job, &t_slow[0]))
+        return err(4, "第一个任务");
+    /* 容量 1、worker 1 个：第二个任务进不去 */
+    if (pool.try_submit(&slow_job, &t_slow[1]))
+        return err(5, "队列满了 try_submit 应当失败");
+    t_release = 1;
+    pool.wait();
+    if (t_slow[0] != 7)
+        return err(6, "慢任务没跑完");
+    if (!pool.stop())
+        return err(7, "stop");
+}
+
+test "线程池：任务按值拿到自己的参数" {
+    ThreadJob jobs[4] = { 0 };
+    ThreadPool pool = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 4; i++)
+        t_slots[i] = 0;
+    if (!pool.start(2, jobs, 4))
+        return err(1, "start");
+    for (i = 0; i < 4; i++)
+        if (!pool.submit(&set_slot, &t_slots[i]))
+            return err(2, "submit");
+    pool.wait();
+    for (i = 0; i < 4; i++)
+        if (t_slots[i] != 42)
+            return err(3, "任务的 arg 没传对");
+    if (!pool.stop())
+        return err(4, "stop");
+}

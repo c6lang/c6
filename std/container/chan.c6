@@ -1,0 +1,423 @@
+/* std/container/chan：有界通道（CSP 风格的队列，跨线程收发）。
+ *
+ *     import std.container.chan;
+ *
+ *     char buf[16 * sizeof(int)] = { 0 };       // 缓冲由调用方给
+ *     Chan ch = { 0 };
+ *     chan_init(&ch, buf, 16, sizeof(int));
+ *
+ *     ch.send(&v);                              // 满了就等
+ *     ch.recv(&out);                            // 空了就等
+ *     ch.close_chan();                          // 收完剩下的之后 recv 返回 0
+ *
+ * 通道是「固定容量 + 环形缓冲 + 一把锁 + 两个条件变量」：`send` 在满时阻塞、
+ * `recv` 在空时阻塞，`close_chan()` 让等待中的收发都醒过来。元素是**字节块**
+ * （`esize` 指定一个元素多少字节，`send`/`recv` 各收一个指针），所以 `int`、
+ * 指针、结构体都能直接过通道，拷进去的是**值**，不是引用。
+ *
+ * 约定：
+ *
+ * - `chan_init(self, buf, cap, esize)`：`buf` 至少 `cap * esize` 字节、`cap >= 1`、
+ *   `esize >= 1`，返回 1/0。模块自己不分配内存。
+ * - `send(elem)`：满了就**阻塞**；通道已关返回 0（元素没进去）。
+ * - `try_send(elem)`：不阻塞，满了/已关返回 0。
+ * - `send_ms(elem, ms)`：1 进去了、0 超时、-1 已关。
+ * - `recv(out)`：空了就阻塞；**已关且空**返回 0（表示不会再有数据），其它返回 1。
+ * - `try_recv(out)`：空/已关且空返回 0。
+ * - `recv_ms(out, ms)`：1 拿到了、0 超时、-1 已关且空。
+ * - `close_chan()`：幂等；等待中的 sender 立刻拿到 0，receiver 把缓冲里剩下
+ *   的元素取完之后拿到 0。关闭之后 `send`/`try_send` 都失败。
+ * - `count`/`capacity`/`is_empty`/`is_full`/`is_closed` 是状态查询，
+ *   `sent_count`/`recv_count` 是累计统计（都上锁读，能跨线程用）。
+ * - 收发都在锁内做 `memcpy`，元素大于一个指针时也一样安全；`elem`/`out`
+ *   的生命周期由调用方保证（调用返回后就可以复用）。
+ */
+#include <string.h>
+
+module std.container.chan;
+import std.core.types;
+import std.os.sync;
+
+struct Chan {
+    Mutex m;
+    Cond not_empty;
+    Cond not_full;
+    char *buf;
+    int cap;                     /* 槽数 */
+    int esize;                   /* 一个元素的字节数 */
+    int head;
+    int tail;
+    int n;                       /* 当前元素数 */
+    int closed;
+    int sent;
+    int recvd;
+};
+
+/* 初始化：buf 至少 cap*esize 字节 */
+int chan_init(Chan *self, char *buf, int cap, int esize)
+{
+    if (!self || !buf || cap < 1 || esize < 1)
+        return 0;
+    memset(self, 0, sizeof(*self));
+    self->buf = buf;
+    self->cap = cap;
+    self->esize = esize;
+    if (!self->m.init())
+        return 0;
+    if (!self->not_empty.init())
+        return 0;
+    if (!self->not_full.init())
+        return 0;
+    return 1;
+}
+
+int count(Chan *self)
+{
+    int n = 0;
+
+    if (!self || !self->buf)
+        return 0;
+    self->m.lock();
+    n = self->n;
+    self->m.unlock();
+    return n;
+}
+
+int capacity(Chan *self) { return self && self->buf ? self->cap : 0; }
+
+int is_empty(Chan *self) { return count(self) == 0; }
+
+int is_full(Chan *self)
+{
+    int full = 0;
+
+    if (!self || !self->buf)
+        return 0;
+    self->m.lock();
+    full = self->n == self->cap;
+    self->m.unlock();
+    return full;
+}
+
+int is_closed(Chan *self)
+{
+    int c = 0;
+
+    if (!self || !self->buf)
+        return 0;
+    self->m.lock();
+    c = self->closed;
+    self->m.unlock();
+    return c;
+}
+
+int sent_count(Chan *self)
+{
+    int n = 0;
+
+    if (!self || !self->buf)
+        return 0;
+    self->m.lock();
+    n = self->sent;
+    self->m.unlock();
+    return n;
+}
+
+int recv_count(Chan *self)
+{
+    int n = 0;
+
+    if (!self || !self->buf)
+        return 0;
+    self->m.lock();
+    n = self->recvd;
+    self->m.unlock();
+    return n;
+}
+
+/* 锁内入队一格（调用方已加锁且确认有空位）；elem 非空 */
+static void chan_put(Chan *self, const void *elem)
+{
+    memcpy(self->buf + self->tail * self->esize, elem, (unsigned long)self->esize);
+    self->tail = (self->tail + 1) % self->cap;
+    self->n = self->n + 1;
+    self->sent = self->sent + 1;
+}
+
+/* 锁内出队一格（调用方已加锁且确认有元素） */
+static void chan_take(Chan *self, void *out)
+{
+    memcpy(out, self->buf + self->head * self->esize, (unsigned long)self->esize);
+    self->head = (self->head + 1) % self->cap;
+    self->n = self->n - 1;
+    self->recvd = self->recvd + 1;
+}
+
+/* 发一个元素：满了阻塞。成功 1，通道已关 0 */
+int send(Chan *self, const void *elem)
+{
+    if (!self || !self->buf || !elem)
+        return 0;
+    self->m.lock();
+    while (self->n == self->cap && !self->closed)
+        self->not_full.wait(&self->m);
+    if (self->closed) {
+        self->m.unlock();
+        return 0;
+    }
+    chan_put(self, elem);
+    self->not_empty.signal();
+    self->m.unlock();
+    return 1;
+}
+
+/* 不阻塞的 send：满了/已关返回 0 */
+int try_send(Chan *self, const void *elem)
+{
+    if (!self || !self->buf || !elem)
+        return 0;
+    self->m.lock();
+    if (self->closed || self->n == self->cap) {
+        self->m.unlock();
+        return 0;
+    }
+    chan_put(self, elem);
+    self->not_empty.signal();
+    self->m.unlock();
+    return 1;
+}
+
+/* 限时 send：1 进去了、0 超时、-1 已关 */
+int send_ms(Chan *self, const void *elem, int ms)
+{
+    if (!self || !self->buf || !elem || ms < 0)
+        return -1;
+    self->m.lock();
+    while (self->n == self->cap && !self->closed) {
+        if (self->not_full.wait_ms(&self->m, ms) != 1)
+            break;
+    }
+    if (self->closed) {
+        self->m.unlock();
+        return -1;
+    }
+    if (self->n == self->cap) {
+        self->m.unlock();
+        return 0;
+    }
+    chan_put(self, elem);
+    self->not_empty.signal();
+    self->m.unlock();
+    return 1;
+}
+
+/* 收一个元素：空了阻塞。拿到 1；已关且空返回 0 */
+int recv(Chan *self, void *out)
+{
+    if (!self || !self->buf || !out)
+        return 0;
+    self->m.lock();
+    while (self->n == 0 && !self->closed)
+        self->not_empty.wait(&self->m);
+    if (self->n == 0) {          /* 已关且空：不会再有数据 */
+        self->m.unlock();
+        return 0;
+    }
+    chan_take(self, out);
+    self->not_full.signal();
+    self->m.unlock();
+    return 1;
+}
+
+/* 不阻塞的 recv：空/已关且空返回 0 */
+int try_recv(Chan *self, void *out)
+{
+    if (!self || !self->buf || !out)
+        return 0;
+    self->m.lock();
+    if (self->n == 0) {
+        self->m.unlock();
+        return 0;
+    }
+    chan_take(self, out);
+    self->not_full.signal();
+    self->m.unlock();
+    return 1;
+}
+
+/* 限时 recv：1 拿到了、0 超时、-1 已关且空 */
+int recv_ms(Chan *self, void *out, int ms)
+{
+    if (!self || !self->buf || !out || ms < 0)
+        return -1;
+    self->m.lock();
+    while (self->n == 0 && !self->closed) {
+        if (self->not_empty.wait_ms(&self->m, ms) != 1)
+            break;
+    }
+    if (self->n == 0) {
+        int was_closed = self->closed;
+
+        self->m.unlock();
+        return was_closed ? -1 : 0;
+    }
+    chan_take(self, out);
+    self->not_full.signal();
+    self->m.unlock();
+    return 1;
+}
+
+/* 关掉通道：幂等。等着的收/发都会醒过来 */
+int close_chan(Chan *self)
+{
+    if (!self || !self->buf)
+        return 0;
+    self->m.lock();
+    self->closed = 1;
+    self->not_empty.broadcast();
+    self->not_full.broadcast();
+    self->m.unlock();
+    return 1;
+}
+
+/* ==== 测试 ==== */
+
+static Chan t_chan;
+static i64 t_total;
+
+struct Pair {
+    int a;
+    int b;
+};
+
+static int producer(void)
+{
+    int i = 0;
+
+    for (i = 1; i <= 100; i++)
+        if (!t_chan.send(&i))
+            return 0;
+    return 0;
+}
+
+static int consumer(void)
+{
+    int v = 0;
+
+    t_total = 0;
+    while (t_chan.recv(&v))
+        t_total += v;
+    return 0;
+}
+
+test "单线程：入队、出队与状态" {
+    char buf[4 * sizeof(int)] = { 0 };
+    Chan c = { 0 };
+    int i = 0, v = 0;
+
+    if (!chan_init(&c, buf, 4, sizeof(int)))
+        return err(1, "chan_init");
+    if (!c.is_empty() || c.is_full() || c.count() != 0 || c.capacity() != 4)
+        return err(2, "空通道的状态");
+    for (i = 1; i <= 3; i++)
+        if (!c.send(&i))
+            return err(3, "send");
+    if (c.count() != 3 || c.is_empty() || c.is_full())
+        return err(4, "三个元素之后的状态");
+    if (c.sent_count() != 3)
+        return err(5, "sent_count");
+    /* FIFO */
+    for (i = 1; i <= 3; i++) {
+        if (!c.recv(&v) || v != i)
+            return err(6, "顺序不对");
+    }
+    if (c.count() != 0 || c.recv_count() != 3)
+        return err(7, "出队之后的状态");
+    if (c.try_recv(&v))
+        return err(8, "空时 try_recv 应当失败");
+    if (c.recv_ms(&v, 5) != 0)
+        return err(9, "空时 recv_ms 应当超时");
+    /* 结构体元素：拷进去的是值 */
+    struct Pair p = { 7, 9 };
+    struct Pair q = { 0, 0 };
+
+    if (!chan_init(&c, buf, 1, sizeof(struct Pair)))
+        return err(10, "重新按 Pair 初始化");
+    if (!c.send(&p))
+        return err(11, "发 Pair");
+    p.a = 0;                     /* 改原文不影响通道里的副本 */
+    if (!c.recv(&q) || q.a != 7 || q.b != 9)
+        return err(12, "Pair 没按值传过去");
+}
+
+test "满/关：try_send、send_ms 与关闭后的行为" {
+    char buf[2 * sizeof(int)] = { 0 };
+    Chan c = { 0 };
+    int i = 0, v = 0;
+
+    if (!chan_init(&c, buf, 2, sizeof(int)))
+        return err(1, "chan_init");
+    for (i = 1; i <= 2; i++)
+        if (!c.try_send(&i))
+            return err(2, "try_send");
+    if (!c.is_full())
+        return err(3, "应当满了");
+    if (c.try_send(&i) || c.try_recv(&v) == 0)
+        return err(4, "满时 try_send 失败、try_recv 成功");
+    if (!c.try_send(&i))
+        return err(5, "空出一个位置后 try_send 应当成功");
+    if (c.send_ms(&i, 5) != 0)
+        return err(6, "满时 send_ms 应当超时");
+    /* 关掉：剩下两个还能取出来，取完之后 recv 返回 0 */
+    if (!c.close_chan() || !c.is_closed())
+        return err(7, "close_chan");
+    if (c.close_chan() != 1)
+        return err(8, "close_chan 应当幂等");
+    if (c.send(&i) || c.try_send(&i) || c.send_ms(&i, 1) != -1)
+        return err(9, "关闭之后不该再能发");
+    if (!c.recv(&v) || !c.try_recv(&v))
+        return err(10, "关闭后缓冲里的元素还能取");
+    if (c.recv(&v) || c.try_recv(&v) || c.recv_ms(&v, 5) != -1)
+        return err(11, "关闭且空之后 recv 应当返回 0/-1");
+}
+
+test "两个生产者一个消费者：全部元素都过一遍" {
+    char buf[4 * sizeof(int)] = { 0 };
+
+    t_total = -1;
+    if (!chan_init(&t_chan, buf, 4, sizeof(int)))
+        return err(1, "chan_init");
+    thread cons = spawn consumer();
+    thread p1 = spawn producer();
+    thread p2 = spawn producer();
+    if (p1->join() || p2->join())
+        return err(2, "生产者 join");
+    t_chan.close_chan();
+    if (cons->join())
+        return err(3, "消费者 join");
+    /* 1..100 两遍，和是 2*5050 */
+    if (t_total != 10100)
+        return err(4, "有元素丢了或重复");
+    if (t_chan.sent_count() != 200 || t_chan.recv_count() != 200)
+        return err(5, "收发计数不对");
+    if (t_chan.count() != 0 || !t_chan.is_closed())
+        return err(6, "收完应当空且已关");
+}
+
+test "限时收发与容量 1 的通道" {
+    char buf[sizeof(int)] = { 0 };
+    Chan c = { 0 };
+    int v = 0;
+    int one = 1;
+
+    if (!chan_init(&c, buf, 1, sizeof(int)))
+        return err(1, "chan_init");
+    if (c.send_ms(&one, 5) != 1)
+        return err(2, "空通道 send_ms 应当立刻成功");
+    if (c.send_ms(&one, 5) != 0)
+        return err(3, "满了 send_ms 应当超时");
+    if (c.recv_ms(&v, 5) != 1 || v != 1)
+        return err(4, "recv_ms 应当拿到");
+    if (c.recv_ms(&v, 5) != 0)
+        return err(5, "空时 recv_ms 应当超时");
+}

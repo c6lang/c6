@@ -1009,3 +1009,25 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`make stdtest`（85 个模块、0 failure）、`make std-algo`（26 条自检全过）、
 `make check-all`。
+
+### 11.31 标准库第十九批（atomic / sync / thread / chan）
+
+第十九批补的是**并发与同步**：语言层面的 `spawn` 早就能起真 OS 线程，但库里
+一直没有原子操作、锁和跨线程通信。四个模块分两层——atomic 走编译器的
+`__atomic_*` 内建（零依赖、不碰 pthread），sync 是 pthread 的值类型薄封装，
+thread 在 sync 之上给出线程池，chan 又在 sync 之上给出通道：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.atomic` | 原子读写与读改写（`Atomic`/`Atomic32` + `SpinLock`） | 字段是普通 i64/int，只通过方法访问；默认 seq_cst，另给 `load_relaxed`/`store_release` 发布口；`cas` 收 expected 指针并在失败时回写当前值；屏障用一个 seq_cst 的 RMW 表达（tcc 还没有 `__atomic_thread_fence`）；64 位原子在 32 位目标上可能落到 libatomic 的辅助函数，这类目标用 `Atomic32` |
+| `std.os.sync` | Mutex / RWLock / Cond / Once / Semaphore / Barrier | 类型是值（`{ 0 }` 就是 Linux 上的静态初始化器）；`init`/`destroy` 按接收者重载；`try_*` 不阻塞；限时等待统一 1（等到）/0（超时）/-1（出错）；`Cond.wait` 返回时重新持有锁，条件必须用 `while` 再查一遍 |
+| `std.os.thread` | 线程身份/CPU 数/让步/改名 + `ThreadPool` | 池里 worker 用 `pthread_create` 起裸线程（不走 `spawn` 的回收链，`stop` 自己 join）；任务队列由调用方给，满时 `submit` 背压、`try_submit` 不阻塞；`wait` 只保证「现在闲」，之后还能继续投 |
+| `std.container.chan` | 有界通道 | 元素按字节块拷贝（`esize`），所以 int/指针/结构体都能过；阻塞收发 + `try_*`/限时；`close_chan` 幂等，关闭后 sender 立刻失败、receiver 取完缓冲里剩下的再失败 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.atomic`=0x6055、
+`std.os.sync`=0x6056、`std.os.thread`=0x6057、`std.container.chan`=0x6058；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-thread` 与 `STDTHREAD_SRCS`，
+`stdtest` 给 chan 补 `sync` 依赖，`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（89 个模块、0 failure）、`make std-thread`（29 条自检全过）、
+`make check-all`。

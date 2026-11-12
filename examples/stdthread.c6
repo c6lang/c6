@@ -1,0 +1,273 @@
+/* stdthread：标准库第十九批（atomic / sync / thread / chan）的拼装示例。
+ *
+ * 和前面几批的示例一样：这个文件没有 `module`（入口 `main` 只能写在模块外的
+ * 文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是一条「并发」链路：
+ *
+ *   - atomic：多线程累加不丢数、自旋锁把临界区护住；
+ *   - sync：互斥锁 + 条件变量做握手，读写锁、信号量；
+ *   - thread：固定线程池跑一批任务，忙/闲/完成计数；
+ *   - chan：有界通道，生产者发、消费者收，关掉通道收尾。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdthread \
+ *         examples/stdthread.c6 std/core/types.c6 std/core/atomic.c6 \
+ *         std/os/sync.c6 std/os/thread.c6 std/container/chan.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.atomic;
+import std.os.sync;
+import std.os.thread;
+import std.container.chan;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* ---- atomic：多线程累加 + 自旋锁 ---- */
+
+static Atomic a_counter;
+static SpinLock a_lock;
+static i64 a_sum;
+
+static int a_bump(void)
+{
+    int i = 0;
+
+    for (i = 0; i < 5000; i++)
+        a_counter.inc();
+    return 0;
+}
+
+static int a_locked(void)
+{
+    int i = 0;
+
+    for (i = 0; i < 1000; i++) {
+        a_lock.lock();
+        a_sum++;
+        a_lock.unlock();
+    }
+    return 0;
+}
+
+static void tour_atomic(void)
+{
+    int i = 0;
+
+    a_counter.store(0);
+    thread h1 = spawn a_bump();
+    thread h2 = spawn a_bump();
+    thread h3 = spawn a_bump();
+    thread h4 = spawn a_bump();
+    h1->join();
+    h2->join();
+    h3->join();
+    h4->join();
+    check(a_counter.load() == 20000, "atomic: 四个线程各 5000 次，一次不少");
+    /* cas：换掉一个已知值（用另一个格子，别动上面的计数） */
+    Atomic probe = { 0 };
+    i64 want = 0;
+
+    probe.store(20000);
+    want = 20000;
+    check(probe.cas(&want, 1) == 1 && probe.load() == 1, "atomic: cas");
+    /* 自旋锁护住普通变量 */
+    a_sum = 0;
+    spin_init(&a_lock);
+    thread l1 = spawn a_locked();
+    thread l2 = spawn a_locked();
+    l1->join();
+    l2->join();
+    check(a_sum == 2000, "atomic: 自旋锁里的自增不丢");
+    printf("atomic: 计数=%lld，自旋锁求和=%lld\n",
+           (long long)a_counter.load(), (long long)a_sum);
+}
+
+/* ---- sync：互斥锁、条件变量、读写锁、信号量 ---- */
+
+static Mutex s_mutex;
+static Cond s_cond;
+static Cond s_ready;
+static RWLock s_rw;
+static Semaphore s_sema;
+static int s_counter = 0;
+static int s_ready_flag = 0;
+static int s_go = 0;
+
+static int s_bump(void)
+{
+    int i = 0;
+
+    for (i = 0; i < 500; i++) {
+        s_mutex.lock();
+        s_counter++;
+        s_mutex.unlock();
+    }
+    return 0;
+}
+
+static int s_wait_go(void)
+{
+    s_mutex.lock();
+    s_ready_flag = 1;
+    s_ready.signal();
+    while (!s_go)
+        s_cond.wait(&s_mutex);
+    s_counter = s_counter + 1000;
+    s_mutex.unlock();
+    return 0;
+}
+
+static void tour_sync(void)
+{
+    s_mutex.init();
+    s_cond.init();
+    s_ready.init();
+    s_counter = 0;
+    thread h1 = spawn s_bump();
+    thread h2 = spawn s_bump();
+    h1->join();
+    h2->join();
+    check(s_counter == 1000, "sync: 互斥锁保护的计数");
+
+    s_ready_flag = 0;
+    s_go = 0;
+    thread h = spawn s_wait_go();
+    s_mutex.lock();
+    while (!s_ready_flag)
+        s_ready.wait(&s_mutex);
+    s_go = 1;
+    s_cond.signal();
+    s_mutex.unlock();
+    h->join();
+    check(s_counter == 2000, "sync: 条件变量握手后继续干活");
+
+    s_rw.init();
+    check(s_rw.rdlock() == 1 && s_rw.try_wrlock() == 0, "sync: 有读者时写锁拿不到");
+    s_rw.unlock();
+    check(s_rw.wrlock() == 1 && s_rw.unlock() == 1, "sync: 写锁");
+
+    s_sema.init(1);
+    check(s_sema.wait() == 1 && s_sema.value() == 0, "sync: 信号量 P");
+    check(s_sema.try_wait() == 0, "sync: 计数为 0 时 try_wait 失败");
+    check(s_sema.post() == 1 && s_sema.value() == 1, "sync: 信号量 V");
+    printf("sync: 计数=%d，信号量=%d\n", s_counter, s_sema.value());
+}
+
+/* ---- thread：线程池 ---- */
+
+struct Job {
+    int lo;
+    int hi;
+    long long sum;
+};
+
+static ThreadJob t_jobs[8];
+
+static void job_sum(void *p)
+{
+    struct Job *j = (struct Job *)p;
+    int i = 0;
+
+    j->sum = 0;
+    for (i = j->lo; i <= j->hi; i++)
+        j->sum = j->sum + i;
+}
+
+static void tour_thread(void)
+{
+    ThreadPool pool = { 0 };
+    struct Job work[4] = { 0 };
+    int i = 0;
+    long long total = 0;
+
+    for (i = 0; i < 4; i++) {
+        work[i].lo = i * 100 + 1;
+        work[i].hi = (i + 1) * 100;
+        work[i].sum = 0;
+    }
+
+    check(cpu_count() >= 1, "thread: cpu_count");
+    check(thread_self() != 0, "thread: thread_self");
+    check(thread_set_name("stdthread") == 1, "thread: set_name");
+    check(pool.start(4, t_jobs, 8) == 1, "thread: 起 4 个 worker");
+    check(pool.workers() == 4 && pool.is_started(), "thread: worker 数");
+    for (i = 0; i < 4; i++)
+        check(pool.submit(&job_sum, &work[i]) == 1, "thread: 投递任务");
+    pool.wait();
+    for (i = 0; i < 4; i++)
+        total = total + work[i].sum;
+    check(total == 80200, "thread: 1..400 的和");
+    check(pool.done() == 4 && pool.pending() == 0, "thread: 完成/排队计数");
+    check(pool.stop() == 1, "thread: stop");
+    check(pool.is_started() == 0, "thread: stop 之后不再接活");
+    printf("thread: %d 个 worker 跑完 %d 个任务，1..400 的和=%lld\n",
+           pool.workers(), 4, total);
+}
+
+/* ---- chan：生产者 / 消费者 ---- */
+
+static char ch_buf[4 * sizeof(int)];
+static Chan ch;
+static i64 ch_sum = 0;
+
+static int ch_producer(void)
+{
+    int i = 0;
+
+    for (i = 1; i <= 100; i++)
+        if (!ch.send(&i))
+            return 0;
+    return 0;
+}
+
+static int ch_consumer(void)
+{
+    int v = 0;
+
+    ch_sum = 0;
+    while (ch.recv(&v))
+        ch_sum = ch_sum + v;
+    return 0;
+}
+
+static void tour_chan(void)
+{
+    ch_sum = -1;
+    check(chan_init(&ch, ch_buf, 4, sizeof(int)) == 1, "chan: 初始化");
+    check(ch.capacity() == 4 && ch.is_empty(), "chan: 容量/空");
+    thread cons = spawn ch_consumer();
+    thread prod = spawn ch_producer();
+    prod->join();
+    check(ch.close_chan() == 1, "chan: 关闭");
+    cons->join();
+    check(ch_sum == 5050, "chan: 1..100 的和");
+    check(ch.sent_count() == 100 && ch.recv_count() == 100, "chan: 收发计数");
+    check(ch.count() == 0 && ch.is_closed(), "chan: 收完为空");
+    printf("chan: 100 个元素全部过通道，和=%lld\n", (long long)ch_sum);
+}
+
+int main(void)
+{
+    printf("stdthread: 标准库第十九批（atomic / sync / thread / chan）\n");
+    tour_atomic();
+    tour_sync();
+    tour_thread();
+    tour_chan();
+    printf("stdthread: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

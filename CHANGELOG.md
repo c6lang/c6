@@ -47,6 +47,19 @@
 
 ### 标准库
 
+- **标准库第十九批（并发与同步）**：`std.core.atomic` / `std.os.sync` /
+  `std.os.thread` / `std.container.chan` 四个模块，集成示例
+  `examples/stdthread.c6`（`make std-thread`）。atomic 是 `Atomic`/`Atomic32`
+  的原子读写与读改写（默认 seq_cst，另有 `load_relaxed`/`store_release`
+  发布口）、屏障与 TAS 自旋锁 `SpinLock`，走编译器的 `__atomic_*` 内建、
+  不依赖 pthread；sync 是 pthread 薄封装的值类型 `Mutex`/`Cond`/`RWLock`/
+  `Once`/`Semaphore`/`Barrier`（`init`/`destroy` 方法、`try_*`、限时等待）；
+  thread 是线程身份/`cpu_count`/让步/改名与固定 worker 的 `ThreadPool`
+  （任务队列由调用方给，`submit` 满时背压、`wait` 等空闲、`stop` join）；
+  chan 是建在 Mutex/Cond 上的有界通道（元素按字节块拷贝，阻塞收发 +
+  `try_*`/限时，`close_chan` 收尾）。错误号段 `std.core.atomic`=0x6055 …
+  `std.container.chan`=0x6058（`tcc/tccgen.c` 的 `c6_err_std_slots[]` 追加）。
+
 - **标准库第十八批（算法与容器）**：`std.container.graph` / `std.container.lru` /
   `std.container.trie` / `std.container.region` 四个模块，集成示例
   `examples/stdalgo.c6`（`make std-algo`）。graph 是前向星表示的图算法（BFS 无权

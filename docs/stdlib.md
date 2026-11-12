@@ -39,6 +39,7 @@
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
+| `std/core/atomic.c6` | `std.core.atomic` | 原子操作与自旋锁（零分配、不依赖 pthread）：`Atomic`（i64）/`Atomic32`（int）的 `load`/`load_relaxed`、`store`/`store_release`、`add`/`sub`（新值）、`fetch_add`/`fetch_sub`（旧值）、`exchange`、`cas`（相等才换，失败回写当前值）、`and_with`/`or_with`/`xor_with`、`inc`/`dec`；屏障 `fence`/`fence_acquire`/`fence_release`；TAS 自旋锁 `SpinLock` 的 `spin_init`/`lock`/`try_lock`/`unlock`/`is_locked` |
 | `std/core/bignum.c6` | `std.core.bignum` | 任意精度整数（1024 位、零分配）：`big_parse`/`big_parse_base`（2..36 进制）/`big_from_i64`/`big_from_u64`、`Big` 的 `add`/`sub`/`mul`/`div`/`mod`/`divmod`（截断除法）/`pow`（u32 指数）、`cmp`/`is_zero`/`is_neg`、`to_i64`/`to_u64`、`format`/`format_base`/`digits`；容量超限、除零、解析失败都给 `err` |
 | `std/core/complex.c6` | `std.core.complex` | 复数 `Complex`（f64 实部/虚部）：`cplx`/`cplx_real`/`cplx_i`、`add`/`sub`/`mul`/`div`/`neg`/`conj`/`inv`/`scale`/`normalize`、`abs2`/`abs`（用 `std.core.math` 的 `sqrt`）、`pow_int`（快速幂，负指数取倒数）、`eq`/`near`/`is_finite`/`is_zero`；除零按 IEEE 给 inf/nan |
 | `std/core/bits.c6` | `std.core.bits` | 位运算：`popcount32/64`、`parity32`、`clz32/64`、`ctz32/64`（0 输入给 32/64）、`rotl`/`rotr`、`bswap16/32/64`、`bit_get/set/clear/toggle`、`mask_low`/`mask_range`、`sign_extend`、`is_pow2_32/64` |
@@ -82,6 +83,7 @@
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
 | `std/container/deque.c6` | `std.container.deque` | 环形缓冲双端队列 `Deque@T`（托管引用）与 `DIter@T`：`push_back`/`push_front`/`pop_back`/`pop_front`、`first`/`last`/`at`/`get`/`set`/`reserve`/`clear` |
+| `std/container/chan.c6` | `std.container.chan` | 有界通道（CSP 风格，缓冲由调用方给）：`chan_init`（`buf`/`cap`/`esize`）、`send`/`recv`（满/空阻塞）、`try_send`/`try_recv`（不阻塞）、`send_ms`/`recv_ms`（限时，1/0/-1）、`close_chan`（幂等，关后 sender 立刻失败、receiver 取完剩余再失败）、`count`/`capacity`/`is_empty`/`is_full`/`is_closed`/`sent_count`/`recv_count`；元素按字节块拷贝（`esize`），int/指针/结构体都能过；正文依赖 `std.os.sync` |
 | `std/container/map.c6` | `std.container.map` | 开放寻址哈希表 `Map@(K, V)`、`Entry@(K, V)`、`Iter@(K, V)`：`put`/`get`/`get_or`/`set`/`put_new`/`remove`/`clear` |
 | `std/container/pqueue.c6` | `std.container.pqueue` | 二叉堆 `PQueue@T`（托管容器）：`push`/`pop`/`peek`/`push_pop`/`heapify`/`clear`、`count`/`capacity`/`is_empty`/`is_valid`、`init`/`set_cmp`/`set_max`（比较器与 `std.container.sort` 的 `cmp_int`/`cmp_str` 通用） |
 | `std/container/range.c6` | `std.container.range` | 能被 `foreach` 吃掉的区间 `Range`/`StepRange` |
@@ -107,6 +109,8 @@
 | `std/os/path.c6` | `std.os.path` | POSIX 路径：`path_base`/`path_dir`/`path_ext`/`path_stem`/`path_is_abs`/`path_has_ext`/`path_split`、`path_join`/`path_normalize`（写调用方缓冲，放不下返回 -1 且不写半截） |
 | `std/os/args.c6` | `std.os.args` | 命令行选项解析（零分配、按规格表迭代）：`args_open` + `Args.next(specs, n, &arg)`、`ArgSpec`（长名/短名/`has_value`）、`Arg` 的 `kind`/`spec`/`name`/`value`/`index`、`args_find`、`Args.positional_count`；`--name=value`、`--name value`、`-n value`、`-n=value` 都认，`--` 之后全按位置参数，未知选项/开关带值/缺值分别报 `ARG_EUNKNOWN`/`ARG_EMISSING` |
 | `std/os/proc.c6` | `std.os.proc` | 子进程（POSIX、零分配）：`proc_run`（fork+execvp+wait）、`proc_spawn`/`proc_wait`、`proc_run_sh`（`/bin/sh -c`，命令串 4KB 上限）、`proc_which`（带 `/` 直接查，否则按 `PATH`）；`ProcStatus` 拆出 `exited`/`exit_code`/`signaled`/`signal`，命令找不到按 shell 惯例退出码 127 |
+| `std/os/sync.c6` | `std.os.sync` | 阻塞式同步原语（pthread 薄封装，值类型）：`Mutex`（`init`/`destroy`/`lock`/`try_lock`/`unlock`）、`Cond`（`wait`/`wait_ms`/`signal`/`broadcast`）、`RWLock`（`rdlock`/`try_rdlock`/`wrlock`/`try_wrlock`/`unlock`）、`Once`（`call(fn)` 只跑一次）、`Semaphore`（`init(v)`/`wait`/`try_wait`/`wait_ms`/`post`/`value`）、`Barrier`（`init(n)`/`wait`）；会失败返回 1/0，限时等待 1/0/-1 |
+| `std/os/thread.c6` | `std.os.thread` | 线程身份与线程池：`thread_self`/`thread_equal`、`cpu_count`、`thread_yield`、`thread_set_name`；`ThreadPool` 的 `start(workers, jobs, cap)`（worker 上限 `POOL_MAX`=32）、`submit`（满时背压）/`try_submit`、`wait`（等空闲，之后还能继续投）、`stop`（join 全部 worker、幂等）、`pending`/`running`/`done`/`workers`/`is_started`；任务函数 `void (*fn)(void *)`，worker 是裸 pthread |
 | `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `d.format(buf, cap)`、`Civil` 日历换算 `civil_from_unix`/`c.to_unix()`/`c.format(...)`，不依赖 localtime |
 
 **`std/encoding/`**（编解码：Base64/十六进制/百分号、SHA-256、位流、UUID）
@@ -177,6 +181,7 @@
 | `examples/stdcli.c6` | （无模块） | 第十六批（命令行工具基础）的拼装示例（`make std-cli`）：args 解析参数、natural 排序与人类可读化、table 排版、proc 跑子进程，自带自检 |
 | `examples/stdwire.c6` | （无模块） | 第十七批（网络协议基础）的拼装示例（`make std-wire`）：sha1 向量、ws 握手/分帧、dns 查询与响应、loopback TCP 往返，自带自检 |
 | `examples/stdalgo.c6` | （无模块） | 第十八批（算法与容器）的拼装示例（`make std-algo`）：依赖拓扑排序 + 最短路、LRU 缓存、命令前缀树、地址区间，自带自检 |
+| `examples/stdthread.c6` | （无模块） | 第十九批（并发与同步）的拼装示例（`make std-thread`）：原子计数 + 自旋锁、互斥锁 + 条件变量握手、线程池跑任务、通道收发，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -262,6 +267,7 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/container/bitset.c6` 11 | bitset 5 + bits 6（`popcount64`/`ctz64` 是跨 TU 调用） |
 | `std/text/width.c6` 10 | utf8 7 + width 3（判宽要 `utf8_decode`） |
 | `std/encoding/punycode.c6` 11 | utf8 7 + punycode 4（编码/解码都走 `utf8_decode`） |
+| `std/container/chan.c6` 10 | chan 4 + sync 6（Mutex/Cond 的正文来自 `std.os.sync`） |
 
 `std/core/bits`、`std/core/crc`、`std/core/fixed`、`std/core/pool`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
 `std/encoding/codec`、`std/encoding/frame`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
@@ -2147,6 +2153,113 @@ r.contains(19);                 /* 1；contains(20) 是 0 */
   位置（带 `from + len` 溢出保护）。
 * 坐标是 i64、允许负数；`total` 是所有段长度之和。
 
+### `atomic`：原子操作与自旋锁
+
+```c
+import std.core.atomic;
+
+Atomic hits = { 0 };
+hits.inc();
+i64 n = hits.load();
+i64 old = hits.exchange(0);
+i64 want = 0;
+hits.cas(&want, 1);              /* 等于 want 才换 */
+
+SpinLock gate = { 0 };
+gate.lock();
+defer gate.unlock();
+```
+
+* `Atomic`（i64）与 `Atomic32`（int）方法相同：`load`/`load_relaxed`、`store`/`store_release`、
+  `add`/`sub`（返回**新值**）、`fetch_add`/`fetch_sub`（返回**旧值**）、`exchange`（旧值）、
+  `cas(expected*, desired)`（相等才换，1/0，失败时把当前值回写到 `*expected`）、
+  `and_with`/`or_with`/`xor_with`、`inc`/`dec`。
+* 默认内存序是 seq_cst；`fence()`/`fence_acquire()`/`fence_release()` 是显式屏障
+  （保守实现成全屏障，tcc 还没有 `__atomic_thread_fence`，库用一个 seq_cst 的 RMW 表达）。
+* 字段 `v` 是普通整数，只通过方法读写（`{ 0 }` 清零）；直接赋值不参与原子序。
+* `SpinLock` 是 TAS 自旋锁：只适合很短、不会阻塞的临界区；长临界区用
+  `std.os.sync` 的 `Mutex`（会让出 CPU）。
+* 走编译器内建，不依赖 pthread；32 位目标上的 64 位原子可能落到 libatomic，
+  这类目标用 `Atomic32`。
+
+### `sync`：互斥锁、条件变量与信号量
+
+```c
+import std.os.sync;
+
+Mutex m = { 0 };
+m.lock();
+defer m.unlock();
+
+Cond cv = { 0 };
+m.lock();
+while (!ready)                   /* 被唤醒不等于条件成立 */
+    cv.wait(&m);
+m.unlock();
+```
+
+* `Mutex`：`init`/`destroy`、`lock`/`try_lock`/`unlock`。`{ 0 }` 在 Linux 上就是
+  `PTHREAD_MUTEX_INITIALIZER`，`init()` 是显式（可移植）写法。
+* `Cond`：`wait(&m)`（进来时 `m` 必须已加锁，返回时重新持有）、`wait_ms(&m, ms)`
+  （1 等到 / 0 超时 / -1 出错）、`signal`/`broadcast`。
+* `RWLock`：`rdlock`/`try_rdlock`/`wrlock`/`try_wrlock`/`unlock`（读锁写锁都用 `unlock`）。
+* `Once`：`init()` + `call(fn)`：只有第一个线程跑 `fn`，其余等它跑完；
+  `pthread_once` 不能重置，`init` 只能在 `call` 之前用一次。
+* `Semaphore`：`init(v)`、`wait`/`try_wait`/`wait_ms`、`post`、`value`。
+* `Barrier`：`init(n)` + `wait()`：返回 1 的那个线程是「串行的那个」，其余 0。
+* 会失败的操作返回 1/0；老系统链接要加 `-lpthread`，无 libc 的 freestanding
+  目标不能用这个模块。
+
+### `thread`：线程身份与线程池
+
+```c
+import std.os.thread;
+
+printf("cpu=%d\n", cpu_count());
+thread_set_name("worker");
+
+ThreadJob jobs[16] = { 0 };
+ThreadPool pool = { 0 };
+pool.start(4, jobs, 16);         /* 4 个 worker、队列容量 16 */
+pool.submit(&work, &data);       /* 队列满了会等 */
+pool.wait();                     /* 等队列清空、worker 全闲 */
+pool.stop();
+```
+
+* `thread_self()` 是当前线程的 id（`pthread_t` 转 u64，只用于比较/日志）、
+  `thread_equal(a, b)`、`cpu_count()`（取不到给 1）、`thread_yield()`、
+  `thread_set_name(name)`（Linux 上最多 15 字节，只对当前线程生效）。
+* `ThreadPool`：`start(workers, jobs, cap)`（`workers` 上限 `POOL_MAX`=32，任务队列
+  由调用方给）、`submit`（满时阻塞，背压）/`try_submit`（满返回 0）、
+  `wait()`（只保证「现在闲」，之后还能继续投）、`stop()`（不再接任务并 join
+  全部 worker，重复调用安全）、`pending`/`running`/`done`/`workers`/`is_started`。
+* 任务函数是 `void (*fn)(void *)`，`arg` 原样传给它；worker 是 `pthread_create`
+  起的裸线程，**不走** `spawn` 的回收链，所以 `stop()` 必须自己 join。
+
+### `chan`：有界通道
+
+```c
+import std.container.chan;
+
+char buf[16 * sizeof(int)] = { 0 };
+Chan ch = { 0 };
+chan_init(&ch, buf, 16, sizeof(int));
+
+ch.send(&v);                     /* 满了就等 */
+ch.recv(&out);                   /* 空了就等 */
+ch.close_chan();                 /* 收完剩下的之后 recv 返回 0 */
+```
+
+* 元素是**字节块**（`esize` 指定一个元素多少字节），`send`/`recv` 各拿一个指针，
+  拷进去的是值；`int`、指针、结构体都能过通道。
+* `send` 满则阻塞、`recv` 空则阻塞；`try_send`/`try_recv` 不阻塞；`send_ms`/
+  `recv_ms` 限时（1 成功 / 0 超时 / -1 已关）。
+* `close_chan()` 幂等：关闭后 sender 立刻拿到 0（`send_ms` 是 -1），receiver 把
+  缓冲里剩下的取完之后 `recv` 返回 0（`recv_ms` 是 -1）。
+* 状态查询 `count`/`capacity`/`is_empty`/`is_full`/`is_closed`，累计统计
+  `sent_count`/`recv_count`。
+* 正文依赖 `std.os.sync`（Mutex + 两个 Cond），编程序时那份 `.c6` 也要在命令行上。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -2565,6 +2678,29 @@ stdalgo: 26 check(s), 0 failure(s)
 两段桥接成一段。Makefile 里显式列出六个模块正文（四个模块都只依赖
 `std/core/types.c6`）。
 
+### 集成示例：`examples/stdthread.c6`
+
+```sh
+make std-thread
+```
+
+```
+stdthread: 标准库第十九批（atomic / sync / thread / chan）
+atomic: 计数=20000，自旋锁求和=2000
+sync: 计数=2000，信号量=1
+thread: 4 个 worker 跑完 4 个任务，1..400 的和=80200
+chan: 100 个元素全部过通道，和=5050
+stdthread: 29 check(s), 0 failure(s)
+```
+
+四节：「原子」四个线程各 `inc` 5000 次（必须正好 20000），再用 `SpinLock` 护住
+普通变量做 2000 次自增；「同步」两把锁保护计数、条件变量握手（worker 先在锁里
+置 ready 并 signal，主线程等到之后置 go 再 signal 让它继续）、读写锁的
+「有读者时拿不到写锁」、信号量的 P/V 计数；「线程池」4 个 worker 分四段算
+1..400 的和（80200），查完成计数与 `stop` 之后不再接活；「通道」容量 4 的通道
+上一个生产者发 1..100、一个消费者求和（5050），关掉通道后消费者退出。
+Makefile 里显式列出六个模块正文（chan 依赖 sync，其余各自只依赖 types）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2596,6 +2732,8 @@ stdalgo: 26 check(s), 0 failure(s)
 * `make std-wire`：`examples/stdwire.c6`，第十七批（网络协议基础）模块的拼装
   示例（自带自检）。
 * `make std-algo`：`examples/stdalgo.c6`，第十八批（算法与容器）模块的拼装
+  示例（自带自检）。
+* `make std-thread`：`examples/stdthread.c6`，第十九批（并发与同步）模块的拼装
   示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
