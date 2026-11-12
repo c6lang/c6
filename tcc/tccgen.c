@@ -12747,6 +12747,10 @@ static const struct C6ErrStdSlot {
     { "std.net.multipart",      C6_ERR_SLOT_STD + 50 },
     { "std.encoding.punycode",  C6_ERR_SLOT_STD + 51 },
     { "std.text.width",         C6_ERR_SLOT_STD + 52 },
+    { "std.core.crc",           C6_ERR_SLOT_STD + 53 },
+    { "std.core.fixed",         C6_ERR_SLOT_STD + 54 },
+    { "std.core.pool",          C6_ERR_SLOT_STD + 55 },
+    { "std.encoding.frame",     C6_ERR_SLOT_STD + 56 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

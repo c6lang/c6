@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form
+        std-more std-next std-node std-form std-embed
 
 all: build
 
@@ -256,6 +256,18 @@ std-form: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdform $(STDFORM_SRCS)
 	./build/stdform
 
+# 标准库第十一批（嵌入式基础）：crc / fixed / pool / frame。
+# 四个模块都只依赖 std.core.types，frame 的 COBS/SLIP 与 crc 的校验和都
+# 是零分配原语；示例把它们拼成一条「采样 -> 定点 -> 分帧 -> 校验 -> 池」链路。
+STDEMBED_SRCS := examples/stdembed.c6 std/core/types.c6 std/core/err.c6 \
+                 std/core/crc.c6 std/core/fixed.c6 std/core/pool.c6 \
+                 std/encoding/frame.c6
+
+std-embed: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdembed $(STDEMBED_SRCS)
+	./build/stdembed
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -360,7 +372,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -369,13 +381,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的十一个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的十二个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form
-# 是十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed
+# 是十一批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -529,6 +541,8 @@ distclean:
 #   std-more         编译并运行 examples/stdmore.c6（第七批）
 #   std-next         编译并运行 examples/stdnext.c6（第八批）
 #   std-node         编译并运行 examples/stdnode.c6（第九批）
+#   std-form         编译并运行 examples/stdform.c6（第十批）
+#   std-embed        编译并运行 examples/stdembed.c6（第十一批，嵌入式基础）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

@@ -40,10 +40,13 @@
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
 | `std/core/bits.c6` | `std.core.bits` | 位运算：`popcount32/64`、`parity32`、`clz32/64`、`ctz32/64`（0 输入给 32/64）、`rotl`/`rotr`、`bswap16/32/64`、`bit_get/set/clear/toggle`、`mask_low`/`mask_range`、`sign_extend`、`is_pow2_32/64` |
+| `std/core/crc.c6` | `std.core.crc` | 嵌入式校验（逐位、不带表）：CRC-8 的 `crc8_smbus`/`crc8_maxim`、CRC-16 的 `crc16_ccitt`/`crc16_xmodem`/`crc16_modbus`/`crc16_ibm`、`crc32c`；流式原语 `crc8_update`/`crc16_update`/`crc32_update`（poly 正规形式 + `refin`）；`fletcher16`/`lrc8`/`xor8`/`sum8`/`sum16` |
 | `std/core/err.c6` | `std.core.err` | 错误码 `enum Error`（`OK`…`BUSY`，16 个）与 `msg()`/`msg_of()`/`is_ok()`；号段固定在 `0x6000` |
+| `std/core/fixed.c6` | `std.core.fixed` | 定点：Q16.16 的 `Fix`（`fix_from_raw`/`fix_from_int`/`fix_from_frac`/`fix_from_f64`、`to_f64`/`to_int`/`round`/`floor`/`ceil`/`frac`/`abs`/`neg`、`add`/`sub`/`mul`/`div`/`sqrt`/`lerp`/`clamp`/`cmp`/`sin`/`cos`，溢出饱和）与 Q15 的 `Q15`（`q15_from_int`/`q15_from_f64`/`to_f64`/`mul`/`add_sat`/`sub_sat`） |
 | `std/core/hash.c6` | `std.core.hash` | 哈希：FNV-1a 32/64（`fnv1a_bytes`/`fnv1a_cstr`/`fnv1a64_bytes`）、`crc32_bytes`、`adler32_bytes`，以及流式 `Hasher`（`hasher`/`update`/`digest`） |
 | `std/core/math.c6` | `std.core.math` | 整数：`min`/`max`/`clamp`/`iabs`/`gcd`/`lcm`/`ipow`/`ipow_u64`/`imul_checked`/`sat_add`/`sat_mul`/`is_pow2`/`next_pow2`/`floor_div`/`mod`；浮点（不链 libm）：`sqrt`/`floor`/`ceil`/`trunc`/`round`/`fabs`/`nearly_eq`/`clamp_f64`/`fact` |
 | `std/core/mem.c6` | `std.core.mem` | 借用式内存池 `Arena`（`alloc`/`alloc_array`/`reset`/`room`/`used`）、托管堆薄包装 `alloc_new`/`alloc_new_array`/`dealloc`、按元素的 `copy`/`fill`/`zero`/`swap`/`rotate`/`reverse_bytes`、`align_up`/`align_down`/`is_aligned` |
+| `std/core/pool.c6` | `std.core.pool` | 定长块内存池 `Pool`（零分配、O(1)）：`pool_make`/`init`、`alloc`/`free`（拒绝池外/不对齐指针）、`contains`/`count`/`capacity`/`used`/`block_size`/`is_empty`/`is_full`/`reset`；块与基址按 8/16 字节对齐 |
 | `std/core/rand.c6` | `std.core.rand` | xorshift64* 伪随机：`rand_seed` + `Rand` 方法 `next_u64`/`next_u32`/`below`（拒绝采样）/`int_range`/`int_range_incl`/`next_f64`/`next_bool`/`fill`/`shuffle`/`shuffle_int` |
 | `std/core/types.c6` | `std.core.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`（`U8_MAX`…`I32_MIN`）/`Bool` 两个枚举 |
 
@@ -99,6 +102,7 @@
 | `std/encoding/varint.c6` | `std.encoding.varint` | LEB128：`uvarint_encode`/`uvarint_decode`、`svarint_encode`/`svarint_decode`、`zigzag_encode`/`zigzag_decode`、`*_encoded_len`；解码返回 1/0/-1（成功/截断/非法） |
 | `std/encoding/bitbuf.c6` | `std.encoding.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`put`/`put_u64`/`put_bit`/`align`/`put_bytes`/`patch`（回填不改游标）、`br_open`/`get`/`get_u64`/`get_bit`/`peek`/`skip`/`align`/`get_bytes`、`bit_count`/`byte_count`/`ok`/`remaining`/`eof` |
 | `std/encoding/codec.c6` | `std.encoding.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
+| `std/encoding/frame.c6` | `std.encoding.frame` | 串行分帧（零分配，写调用方缓冲）：COBS 的 `cobs_max_len`（上界）/`cobs_encoded_len`（精确）/`cobs_encode`/`cobs_decode`/`cobs_encode_frame`/`cobs_decode_frame`，SLIP（RFC 1055）的 `slip_encoded_len`/`slip_encode`/`slip_decode`/`slip_encode_frame`/`slip_decode_frame`；坏 code 字节、截断/非法转义、负载里的分隔符都拒绝，失败时不写半截 |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
 | `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
@@ -137,6 +141,7 @@
 | `examples/stdnext.c6` | （无模块） | 第八批模块的拼装示例（`make std-next`）：base58/varint/semver/cookie 各一节，自带自检 |
 | `examples/stdnode.c6` | （无模块） | 第九批模块的拼装示例（`make std-node`）：list/ring/utf16/ansi 各一节，自带自检 |
 | `examples/stdform.c6` | （无模块） | 第十批模块的拼装示例（`make std-form`）：props/multipart/punycode/width 各一节，自带自检 |
+| `examples/stdembed.c6` | （无模块） | 第十一批（嵌入式基础）的拼装示例（`make std-embed`）：fixed/crc/pool/frame 各一节，串成「采样 → 定点 → 分帧 → 校验 → 池」链路，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -154,10 +159,13 @@ std/container/sort.c6      30 test(s), 0 failure(s)
 std/container/span.c6      6 test(s), 0 failure(s)
 std/container/vec.c6       42 test(s), 0 failure(s)
 std/core/bits.c6           6 test(s), 0 failure(s)
+std/core/crc.c6            3 test(s), 0 failure(s)
 std/core/err.c6            3 test(s), 0 failure(s)
+std/core/fixed.c6          4 test(s), 0 failure(s)
 std/core/hash.c6           7 test(s), 0 failure(s)
 std/core/math.c6           6 test(s), 0 failure(s)
 std/core/mem.c6            7 test(s), 0 failure(s)
+std/core/pool.c6           2 test(s), 0 failure(s)
 std/core/rand.c6           9 test(s), 0 failure(s)
 std/core/types.c6          4 test(s), 0 failure(s)
 std/data/csv.c6            41 test(s), 0 failure(s)
@@ -169,6 +177,7 @@ std/encoding/base58.c6     3 test(s), 0 failure(s)
 std/encoding/base64.c6     8 test(s), 0 failure(s)
 std/encoding/bitbuf.c6     7 test(s), 0 failure(s)
 std/encoding/codec.c6      7 test(s), 0 failure(s)
+std/encoding/frame.c6      4 test(s), 0 failure(s)
 std/encoding/punycode.c6   11 test(s), 0 failure(s)
 std/encoding/sha256.c6     23 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
@@ -219,8 +228,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/text/width.c6` 10 | utf8 7 + width 3（判宽要 `utf8_decode`） |
 | `std/encoding/punycode.c6` 11 | utf8 7 + punycode 4（编码/解码都走 `utf8_decode`） |
 
-`std/core/bits`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
-`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
+`std/core/bits`、`std/core/crc`、`std/core/fixed`、`std/core/pool`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
+`std/encoding/codec`、`std/encoding/frame`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
 `std/data/props`、`std/net/multipart`
 自成一体，单独跑就是自己的块数（props/multipart 只借 `Str` 这个类型）；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
 `std.text.str`（正文不调用），`std/net/mime` 的正文必须带 `std/os/path`，`std/encoding/sha256` 的正文
@@ -1432,6 +1441,69 @@ int bytes = text_prefix_len(S("a中b"), 2);                             /* 1, �
   半个 UTF-8 序列；`text_pad` 宽了先截、窄了补空格到恰好 N 列，`text_clip` 截断时
   补 `...`（总宽度仍 ≤ N）。都写调用方缓冲，放不下返回 -1 且不写。
 
+### 嵌入式基础：`crc` / `fixed` / `pool` / `frame`
+
+四个模块都只依赖 `std.core.types`，不分配、不链 libm、不碰 `pthread`，所以
+freestanding / 裸机程序可以直接用（见 [manual/freestanding.md](manual/freestanding.md)）。
+它们对应无 FPU、无堆、只有一条 UART 的板子上最常见的四件事：校验、定点、固定块
+内存、串行分帧。
+
+```c
+import std.core.crc;
+import std.core.fixed;
+import std.core.pool;
+import std.encoding.frame;
+
+struct Sample { int id; Fix temp; };
+
+u8 req[8] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x0a };
+u16 c = crc16_modbus(req, 6);               /* 0xcdc5：线上低字节先发 */
+u8 rom[8] = { 0x28, 0xff, 0x64, 0x1e, 0x5d, 0x16, 0x04, 0x27 };
+u8 romcrc = crc8_maxim(rom, 7);             /* 0x27：1-Wire ROM 的 CRC */
+u16 f = fletcher16("abcde", 5);             /* 0xc8f0 */
+u8 l = lrc8(req, 6);                        /* 0xf2：Modbus ASCII 的尾字节 */
+
+Fix t = fix_from_frac(235, 10);             /* 23.5 */
+Fix doubled = t.mul(fix_from_int(2));       /* 47.0 */
+int rounded = t.round();                    /* 24 */
+Fix two = fix_from_int(2);
+Fix root = two.sqrt();                      /* 1.4142… */
+Fix half = fix_from_frac(1, 2);
+Fix s = half.sin();                         /* 0.4794… */
+Q15 q = q15_from_f64(0.5);
+Q15 sq = q.mul(q);                          /* 0.25 */
+
+u8 store[256] = { 0 };
+Pool p = pool_make(store, (int)sizeof store, (int)sizeof(struct Sample));
+struct Sample *s0 = p.alloc();              /* 块里直接放结构体 */
+p.free(s0);                                 /* O(1)，按 LIFO 复用 */
+p.reset();                                  /* 整池收回 */
+
+u8 payload[7] = { 0x11, 0x00, 0xc0, 0xdb, 0x41, 0x00, 0x7f };
+u8 wire[32] = { 0 };
+u8 back[16] = { 0 };
+int n = cobs_encode_frame(payload, 7, wire, (int)sizeof wire);   /* 结尾补 0 */
+int m = cobs_decode_frame(wire, n, back, (int)sizeof back);
+n = slip_encode_frame(payload, 7, wire, (int)sizeof wire);       /* END…END */
+m = slip_decode_frame(wire, n, back, (int)sizeof back);
+```
+
+* `crc`：CRC 目录里的 check 值（`"123456789"`）钉在 `test` 块里；`poly` 一律写
+  正规形式，`refin` 决定内部是否反射，init/xorout 由具名包装加。CRC-32/IEEE
+  仍在 `std.core.hash` 的 `crc32_bytes`，这里补的是嵌入式链路上的短校验。逐位
+  算、不建 256 项表——小 MCU 上省 512 字节 `.rodata` 比省这点 CPU 值钱。
+* `fixed`：Q16.16 的 `raw` 字段可以直接读写/比较；乘除法的中间结果走 `i64`，
+  四舍五入（.5 远离 0），溢出**饱和**；`div` 除数为 0、`sqrt` 负数都给 0。
+  `sin`/`cos` 是 Taylor 到 x^9（先规约到 [-π/2, π/2]），误差 < 1e-5。Q15 的
+  1.0 = 32767、-1.0 = -32768，`mul`/`add_sat`/`sub_sat` 饱和。
+* `pool`：块大小和基址向上对齐到 16 字节（32 位上 8 字节）；`free` 只做范围
+  和步长检查，**不检测重复释放**（那要 O(n) 扫链表）；坏参数得到容量 0 的池。
+* `frame`：`cobs_max_len(n)` 是上界、`cobs_encoded_len(src, n)` 是精确长度；
+  COBS 的 0 只能当分隔符（解码时负载里出现 0 就报错）。SLIP 按 RFC 1055 转义
+  `0xC0`/`0xDB`，`slip_decode_frame` 允许首尾各省略一个 END。两侧都是「先量
+  再写」，缓冲不够返回 -1 且一个字节都不写；解码先扫一遍校验格式，失败时目标
+  缓冲不变。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -1667,6 +1739,24 @@ punycode 把 `münchen.de`/`中文.cn` 转成 A-label 再转回来 → width 按
 `std/text/utf8.c6`（width/punycode 用它的 `utf8_decode`；`Str` 类型只靠 `import`
 带来的声明，不需要 str 的正文）。
 
+### 集成示例：`examples/stdembed.c6`
+
+```sh
+make std-embed
+```
+
+```
+stdembed: 标准库第十一批（crc / fixed / pool / frame）
+stdembed: 30 check(s), 0 failure(s)
+```
+
+四节串成一条遥测链路：fixed 把采样值变成 Q16.16/Q15（乘除、开方、sin、饱和）→
+crc 算 Modbus 请求的 CRC-16、1-Wire ROM 的 CRC-8、CRC-32C 与 Fletcher/LRC/NMEA
+异或 → pool 用固定块收样本（结构体直接放进块、释放后按 LIFO 复用）→ frame 把
+负载编码成 COBS 帧和 SLIP 帧再解回来（含「输出缓冲不够时一个字节都不写」与
+「负载里未转义的 END 要报错」）。Makefile 里显式列出四个模块正文，它们都只
+依赖 `std/core/types.c6`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1683,6 +1773,8 @@ punycode 把 `münchen.de`/`中文.cn` 转成 A-label 再转回来 → width 按
 * `make std-next`：`examples/stdnext.c6`，第八批模块的拼装示例（自带自检）。
 * `make std-node`：`examples/stdnode.c6`，第九批模块的拼装示例（自带自检）。
 * `make std-form`：`examples/stdform.c6`，第十批模块的拼装示例（自带自检）。
+* `make std-embed`：`examples/stdembed.c6`，第十一批（嵌入式基础）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -1713,3 +1805,17 @@ punycode 把 `münchen.de`/`中文.cn` 转成 A-label 再转回来 → width 按
 * `std/text/width.c6` 的判宽表：`中`/`Ａ`/`🙂` = 2 列、`U+0301` 组合符与
   `U+1160` 谚文中声 = 0 列、控制字符 0 列（严格版 -1）、非法字节 1 列；
   `text_prefix_len` 不切半个 UTF-8 序列。
+* `std/core/crc.c6` 的 check 值：CRC-8/SMBUS `0xf4`、CRC-8/MAXIM `0xa1`、
+  CRC-16/CCITT-FALSE `0x29b1`、XMODEM `0x31c3`、MODBUS `0x4b37`、ARC `0xbb3d`、
+  CRC-32C `0xe3069283`，CRC-32/IEEE 的裸寄存器值 `0x340bc6d9`（xorout 前）；
+  另有「分三段喂 == 一次喂完」「空输入给 init」「Fletcher-16 的空输入是 0」。
+* `std/encoding/frame.c6` 的 COBS 边界：254 个非零字节必须编成 256 字节
+  （`0xff` 后跟一个空组），`cobs_encoded_len` 对含 0 的 300 字节输入给出精确
+  长度而不是上界；坏输入（`0x00` code、截断的 code、负载里的 0）与坏 SLIP
+  转义/负载里的 END 都要失败，且失败时目标缓冲保持原样。
+* `std/core/pool.c6` 的「未对齐缓冲」：`base` 必须向上对齐后才能发块，块大小
+  向上取整（20 → 32）；`free` 拒绝池外/不对齐指针，`reset` 之后从第一块重新
+  开始发；坏参数得到容量 0、`alloc` 永远返回 0 的池。
+* `std/core/fixed.c6` 的边界：Q16.16 的 `round`/`floor`/`ceil`/`frac` 对负数
+  的语义、`mul`/`add` 的饱和（`30000 * 2` → `I32_MAX`）、`sqrt(4)` 精确为 2、
+  Q15 的 `(-1.0) * (-1.0)` 饱和到 32767；`sin`/`cos` 在 π/2 的整数倍处取精确值。

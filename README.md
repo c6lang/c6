@@ -164,10 +164,13 @@ make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后
 ```
 std/core/                   基础：定宽类型、错误码、内存、数学、位运算、哈希、随机
   std/core/bits.c6          std.core.bits          popcount/clz/ctz、rotl/rotr、bswap、bit_get/set/clear、mask/sign_extend/is_pow2
+  std/core/crc.c6           std.core.crc           嵌入式校验：CRC-8（SMBUS/MAXIM）、CRC-16（CCITT-FALSE/XMODEM/MODBUS/ARC）、CRC-32C，逐位不带表；Fletcher-16/LRC/XOR8/sum8/sum16 与流式 crc*_update
   std/core/err.c6           std.core.err           错误码 enum Error（OK…BUSY）+ msg()/msg_of()/is_ok()
+  std/core/fixed.c6         std.core.fixed         Q16.16 定点 Fix（from_int/from_frac/from_f64、to_f64/to_int/round/floor/ceil/frac、mul/div/sqrt/sin/cos/lerp/clamp、饱和加减）与 Q15（q15_from_*、mul/add_sat/sub_sat）
   std/core/hash.c6          std.core.hash          FNV-1a 32/64、CRC32、Adler-32 + 流式 Hasher
   std/core/math.c6          std.core.math          整数 gcd/lcm/ipow/clamp/floor_div/mod + 浮点 sqrt/floor/ceil/round（不链 libm）
   std/core/mem.c6           std.core.mem           借用式内存池 Arena、托管堆包装 alloc_new/dealloc、按元素的 copy/fill/swap/rotate/align
+  std/core/pool.c6          std.core.pool          定长块内存池 Pool：pool_make/init、O(1) 的 alloc/free、contains/count/capacity/used/block_size/is_empty/is_full/reset（借用调用方缓冲，不碰堆）
   std/core/rand.c6          std.core.rand          xorshift64*：可重放序列、无偏区间 below/int_range、next_f64/next_bool、fill/shuffle
   std/core/types.c6         std.core.types         定宽类型 u8/i32/u64…、usize、f32/f64、Limits/Bool
 
@@ -204,13 +207,14 @@ std/os/                     操作系统：流、文件系统、路径、环境�
   std/os/path.c6            std.os.path            POSIX 路径拆装：base/dir/ext/stem、join/normalize（写调用方缓冲，不分配）
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
-std/encoding/               编解码：Base32/Base64/十六进制/百分号、SHA-256、位流、UUID、Punycode/IDNA
+std/encoding/               编解码：Base32/Base64/十六进制/百分号、SHA-256、位流、UUID、Punycode/IDNA、串行分帧
   std/encoding/base32.c6    std.encoding.base32    Base32（RFC 4648）：b32_encode/b32_decode/b32hex_encode/b32hex_decode、显式表与填充策略、b32_valid（跳过空白、接受省略填充与小写）
   std/encoding/base58.c6    std.encoding.base58    Bitcoin Base58：b58_encode/b58_decode、b58_encoded_len（上界）/b58_valid（前导零写 1）
   std/encoding/varint.c6    std.encoding.varint    LEB128：uvarint/svarint 编解码、zigzag、*_encoded_len（解码返回 1/0/-1）
   std/encoding/base64.c6    std.encoding.base64    Base64（RFC 4648）标准表与 URL 安全表：b64_encode/b64_decode、b64url_encode/b64url_decode、显式表与填充的 b64_encode_ex/b64_decode_ex/b64_decoded_len/b64_encoded_len、b64_valid、就地 b64_decode_inplace/b64url_decode_inplace（跳过空白、严格填充、放不下不写半截）
   std/encoding/bitbuf.c6    std.encoding.bitbuf    位级读写器（零分配、MSB 先）：bw_open/put/put_u64/put_bit/align/put_bytes/patch（回填不改游标）、br_open/get/get_u64/get_bit/peek/skip/align/get_bytes、bit_count/byte_count/ok/remaining/eof
   std/encoding/codec.c6     std.encoding.codec     Base64、十六进制、百分号编解码（写调用方缓冲，放不下一个字节都不写）
+  std/encoding/frame.c6     std.encoding.frame     串行分帧（零分配）：COBS 的 cobs_max_len/cobs_encoded_len/cobs_encode/cobs_decode/cobs_encode_frame/cobs_decode_frame 与 SLIP（RFC 1055）的 slip_encoded_len/slip_encode/slip_decode/slip_encode_frame/slip_decode_frame；坏格式/放不下都不写半截
   std/encoding/sha256.c6    std.encoding.sha256    SHA-256 与 HMAC-SHA256：流式 init/update/final、一次性 sha256_hex、常数时间比较
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
@@ -254,6 +258,7 @@ make std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
 make std-tour    # 编译并运行 examples/stdtour.c6（第二批模块的拼装示例）
 make std-kit     # 编译并运行 examples/stdkit.c6（第三批模块的拼装示例）
 make std-box     # 编译并运行 examples/stdbox.c6（第四批模块的拼装示例）
+make std-embed   # 编译并运行 examples/stdembed.c6（第十一批嵌入式模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

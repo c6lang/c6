@@ -1,0 +1,201 @@
+/* stdembed：标准库第十一批（crc / fixed / pool / frame）的拼装示例。
+ *
+ * 和 stdform/stdnode 一样：这个文件没有 `module`（入口 `main` 只能写在模块
+ * 外的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是一条遥测链路：采样值先变成定点（fixed）→ 打包成一帧（frame 的
+ * COBS）→ 算校验（crc 的 CRC-16/MODBUS）→ 接收侧用固定块内存池（pool）收下
+ * 来再解帧。模块之间没有依赖关系，正好演示「没有堆、没有 libm」时这四块怎么
+ * 拼在一起。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdembed \
+ *         examples/stdembed.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/core/crc.c6 std/core/fixed.c6 std/core/pool.c6 \
+ *         std/encoding/frame.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.err;
+import std.core.crc;
+import std.core.fixed;
+import std.core.pool;
+import std.encoding.frame;
+
+/* 池里收的样本：id + 定点温度 + 定点湿度 */
+struct Sample {
+    int id;
+    Fix temp;
+    Fix humi;
+};
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int near_f(f64 v, f64 want, f64 eps)
+{
+    f64 d = v - want;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+/* 定点：Q16.16 的换算/乘除/开方/三角，以及 Q15 的饱和乘法 */
+static void tour_fixed(void)
+{
+    Fix t = fix_from_frac(235, 10);            /* 23.5 */
+    Fix two = fix_from_int(2);
+    Fix doubled = t.mul(two);                  /* 47.0 */
+    Fix root = two.sqrt();                     /* 1.4142… */
+    Fix half = fix_from_frac(1, 2);
+    Fix s = half.sin();                        /* 0.4794… */
+    Fix big = fix_from_int(30000);
+    Q15 q = q15_from_f64(0.5);
+    Q15 sq = q.mul(q);                         /* 0.25 */
+    Q15 nine = q15_from_f64(0.9);
+    Q15 loud = nine.add_sat(nine);
+    f64 rv = root.to_f64();
+    f64 sv = s.to_f64();
+    f64 qv = sq.to_f64();
+    int ti = t.to_int();
+    int tr = t.round();
+    Fix neg = fix_from_f64(-2.25);
+    Fix f = neg.frac();
+
+    check(t.raw == 1540096 && ti == 23 && tr == 24,
+          "fixed: 23.5 的 raw / to_int / round");
+    check(doubled.raw == 47 * FIX_ONE, "fixed: 23.5 * 2");
+    check(near_f(rv, 1.41421, 1e-4), "fixed: sqrt(2)");
+    check(near_f(sv, 0.47943, 1e-4), "fixed: sin(0.5)");
+    check(f.raw == -16384, "fixed: -2.25 的小数部分");
+    check(big.add(big).raw == I32_MAX, "fixed: 加法饱和");
+    check(near_f(qv, 0.25, 1e-9), "fixed: Q15 0.5 * 0.5");
+    check(loud.raw == 32767, "fixed: Q15 0.9 + 0.9 饱和");
+}
+
+/* 校验：Modbus 请求的 CRC、1-Wire ROM 的 CRC、Fletcher 与 LRC */
+static void tour_crc(void)
+{
+    u8 req[8] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00 };
+    u8 rom[8] = { 0x28, 0xff, 0x64, 0x1e, 0x5d, 0x16, 0x04, 0x00 };
+    u16 c = 0;
+    u32 c32 = 0;
+    u8 romcrc = 0;
+
+    c = crc16_modbus(req, 6);
+    check(c == 0xcdc5u, "crc: Modbus 请求的 CRC");
+    /* 线上低字节先发：C5 CD */
+    check((u8)(c & 0xff) == 0xc5 && (u8)(c >> 8) == 0xcd,
+          "crc: Modbus 的字节序");
+    romcrc = crc8_maxim(rom, 7);
+    rom[7] = romcrc;
+    check(romcrc == 0x27 && crc8_maxim(rom, 8) == 0,
+          "crc: 1-Wire ROM CRC（8 字节整体为 0）");
+    c32 = crc32c("123456789", 9);
+    check(c32 == 0xe3069283u, "crc: CRC-32C 的 check 值");
+    check(fletcher16("abcde", 5) == 0xc8f0u, "crc: Fletcher-16");
+    check(lrc8(req, 6) == 0xf2 && xor8("$GPGGA", 6) == 0x72,
+          "crc: LRC 与 NMEA 异或");
+}
+
+/* 内存池：固定块收样本，释放后按 LIFO 复用 */
+static void tour_pool(void)
+{
+    u8 store[256] = { 0 };
+    Pool p = pool_make(store, (int)sizeof store, (int)sizeof(struct Sample));
+    struct Sample *s0 = 0;
+    struct Sample *s1 = 0;
+    struct Sample *s2 = 0;
+    void *got = 0;
+    int cap = p.capacity();
+
+    check(cap >= 3 && p.block_size() >= (int)sizeof(struct Sample),
+          "pool: 容量与块大小");
+    s0 = p.alloc();
+    s1 = p.alloc();
+    s2 = p.alloc();
+    check(s0 && s1 && s2 && s0 != s1 && s0 != s2,
+          "pool: 三块互不相同");
+    s0->id = 7;
+    s0->temp = fix_from_frac(215, 10);
+    s0->humi = fix_from_frac(455, 10);
+    check(s0->id == 7 && s0->temp.to_int() == 21 && s0->humi.to_int() == 45,
+          "pool: 块里能放结构体");
+    check(p.used() == 3 && p.count() == cap - 3, "pool: used / count");
+    check(!p.free(0), "pool: 空指针");
+    check(p.free(s1) && !p.contains(store + 1), "pool: 释放 + 越界检查");
+    got = p.alloc();
+    check(got == s1, "pool: 释放的块被复用");
+    check(p.free(got) && p.free(s2), "pool: 再释放两块");
+    p.reset();
+    check(p.is_empty() && p.count() == cap, "pool: reset 收回整池");
+}
+
+/* 分帧：COBS 与 SLIP 各发一遍，再解回来 */
+static void tour_frame(void)
+{
+    u8 payload[7] = { 0x11, 0x00, 0xc0, 0xdb, 0x41, 0x00, 0x7f };
+    u8 wire[32] = { 0 };
+    u8 back[16] = { 0 };
+    u8 dirty[8] = { 0 };
+    u16 c = 0;
+    int n = 0;
+    int m = 0;
+    int i = 0;
+
+    n = cobs_encode_frame(payload, (int)sizeof payload, wire, (int)sizeof wire);
+    check(n == cobs_encoded_len(payload, (int)sizeof payload) + 1
+              && wire[n - 1] == 0
+              && n - 1 <= cobs_max_len((int)sizeof payload),
+          "frame: COBS 帧长度/结尾 0/上界");
+    c = crc16_ccitt(wire, n);
+    check(c == 0x6eb6u, "frame: 整帧的 CRC-16/CCITT");
+    m = cobs_decode_frame(wire, n, back, (int)sizeof back);
+    check(m == (int)sizeof payload
+              && memcmp(back, payload, (size_t)m) == 0,
+          "frame: COBS 往返");
+
+    /* 接收缓冲不够时不许写半截 */
+    for (i = 0; i < 8; i++)
+        dirty[i] = 0xaa;
+    check(cobs_decode_frame(wire, n, dirty, 4) == -1 && dirty[0] == 0xaa,
+          "frame: 输出放不下时不写");
+
+    n = slip_encode_frame(payload, (int)sizeof payload, wire, (int)sizeof wire);
+    check(n == slip_encoded_len(payload, (int)sizeof payload) + 2
+              && wire[0] == 0xc0 && wire[n - 1] == 0xc0,
+          "frame: SLIP 帧长度与 END");
+    m = slip_decode_frame(wire, n, back, (int)sizeof back);
+    check(m == (int)sizeof payload
+              && memcmp(back, payload, (size_t)m) == 0,
+          "frame: SLIP 往返");
+    {
+        u8 bad[5] = { 0xc0, 0x41, 0xc0, 0x42, 0xc0 };
+        check(slip_decode_frame(bad, 5, back, (int)sizeof back) == -1,
+              "frame: 负载里未转义的 0xc0 要报错");
+    }
+}
+
+int main(void)
+{
+    printf("stdembed: 标准库第十一批（crc / fixed / pool / frame）\n");
+    tour_fixed();
+    tour_crc();
+    tour_pool();
+    tour_frame();
+    printf("stdembed: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

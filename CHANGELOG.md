@@ -51,6 +51,18 @@
   `ini_open`）仍是自由函数。`std/`、`examples/std*.c6`、`docs/stdlib.md`、`README.md`
   已全部改用方法语法。
 
+- **标准库第十一批（嵌入式基础）**：`std.core.crc` / `std.core.fixed` /
+  `std.core.pool` / `std.encoding.frame` 四个模块，集成示例
+  `examples/stdembed.c6`（`make std-embed`）。crc 补 CRC-8（SMBUS/1-Wire）、
+  CRC-16（CCITT-FALSE/XMODEM/MODBUS/ARC）、CRC-32C 与 Fletcher-16/LRC/XOR/
+  sum8/sum16，全部逐位不带表并带流式 `*_update`；fixed 提供 Q16.16 的 `Fix`
+  （饱和四则、开方、Taylor sin/cos，误差 < 1e-5）与 Q15 的 `Q15`（饱和乘法）；
+  pool 是借用调用方缓冲的定长块分配器（O(1) alloc/free、块对齐、坏指针拒绝）；
+  frame 是 COBS 与 SLIP（RFC 1055）的零分配分帧/转义（先量再写，坏格式不写
+  半截）。四个模块都只依赖 `std.core.types`，不链 libc/libm、不分配，可以直接
+  用在 freestanding/裸机程序里。错误号段 `std.core.crc`=0x6035 …
+  `std.encoding.frame`=0x6038（`tcc/tccgen.c` 的 `c6_err_std_slots[]` 追加）。
+
 - **标准库第十批**：`std.data.props` / `std.net.multipart` / `std.encoding.punycode` /
   `std.text.width` 四个模块，集成示例 `examples/stdform.c6`（`make std-form`）。
   props 读 `.properties`/`.env`（三种分隔符、`export`、续行、`\uXXXX` 与代理对、

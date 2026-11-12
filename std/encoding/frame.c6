@@ -1,0 +1,511 @@
+/* std/encoding/frame：串行链路上的分帧与转义（COBS / SLIP）。
+ *
+ *     import std.encoding.frame;
+ *
+ *     char buf[128] = { 0 };
+ *     int n = cobs_encode_frame(payload, len, buf, sizeof buf);   // 含结尾 0
+ *     ...
+ *     int m = cobs_decode_frame(buf, n, out, sizeof out);
+ *
+ * 这是 UART / CAN / RS-485 上最常见的两种「把任意字节装进一条帧」的办法：
+ *
+ * - **COBS**（Consistent Overhead Byte Stuffing）：用 0x00 当帧分隔符，负载里
+ *   的 0 换成一个「到下一个 0 的距离」字节，所以编码后的负载里不会出现 0；
+ *   开销固定为每 254 字节最多 1 字节。`cobs_encode_frame` 在末尾补一个 0，
+ *   接收侧按 0 切帧后交给 `cobs_decode_frame`。
+ * - **SLIP**（RFC 1055）：0xC0 是帧结束，负载里的 0xC0/0xDB 分别转义成
+ *   `DB DC` / `DB DD`。`slip_encode_frame` 写 `END + 负载 + END`。
+ *
+ * 全部**零分配**：结果写调用方缓冲，长度先算出来再写；缓冲不够时返回 -1 且
+ * 一个字节都不写（和 `std.encoding.codec` 的约定一致）。解码侧会先扫一遍
+ * 校验格式（坏的 code 字节、截断的转义、负载里的分隔符），再写输出，所以
+ * 失败时目标缓冲不会被改脏。
+ *
+ * 长度约定：`cobs_max_len(n)` 是**上界**（`n + n/254 + 1`），拿来开缓冲最省心；
+ * `cobs_encoded_len(src, n)` / `slip_encoded_len(src, n)` 是扫一遍得到的**精确**
+ * 长度。`cobs_encode`/`slip_encode` 返回写入的字节数，失败返回 -1。
+ */
+module std.encoding.frame;
+import std.core.types;
+
+enum SlipByte {
+    SLIP_END     = 0xc0,
+    SLIP_ESC     = 0xdb,
+    SLIP_ESC_END = 0xdc,
+    SLIP_ESC_ESC = 0xdd,
+};
+
+/* ---- COBS ---- */
+
+/* 编码后的长度上界：每 254 个连续非零字节多一个 code 字节，再加开头那个。
+ * n < 0（或结果装不下 int）给 -1。开缓冲时按这个值算不会小。 */
+int cobs_max_len(int n)
+{
+    i64 v = 0;
+
+    if (n < 0)
+        return -1;
+    v = (i64)n + (i64)n / 254 + 1;
+    if (v > (i64)I32_MAX)
+        return -1;
+    return (int)v;
+}
+
+/* 精确长度：0 会吃掉一个数据字节、换来一个 code 字节，所以长度和内容有关
+ * （上界只有在一长串非零字节时才会达到）。n < 0 或 src 为空（n > 0）给 -1。 */
+int cobs_encoded_len(const void *src, int n)
+{
+    const u8 *s = (const u8 *)src;
+    i64 zeros = 0;
+    i64 groups = 1;
+    i64 v = 0;
+    int run = 0;
+    int i = 0;
+
+    if (n < 0 || (n > 0 && !src))
+        return -1;
+    for (i = 0; i < n; i++) {
+        if (s[i] == 0) {
+            zeros++;
+            run = 0;
+            groups++;
+        } else {
+            run++;
+            if (run == 254) {
+                groups++;
+                run = 0;
+            }
+        }
+    }
+    v = (i64)n - zeros + groups;
+    if (v > (i64)I32_MAX)
+        return -1;
+    return (int)v;
+}
+
+/* 编码：不含结尾的 0。返回编码长度，失败 -1（且不写 dst）。 */
+int cobs_encode(const void *src, int n, void *dst, int cap)
+{
+    const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)dst;
+    int need = cobs_encoded_len(src, n);
+    int i = 0;
+    int pos = 0;
+    int len = 0;
+    int code = 1;
+
+    if (need < 0 || (n > 0 && !src) || !dst || need > cap)
+        return -1;
+    d[0] = 1;
+    pos = 0;
+    len = 1;
+    for (i = 0; i < n; i++) {
+        u8 b = s[i];
+
+        if (b == 0) {
+            d[pos] = (u8)code;
+            pos = len++;
+            d[pos] = 1;
+            code = 1;
+        } else {
+            d[len++] = b;
+            code++;
+            if (code == 255) {
+                d[pos] = (u8)code;
+                pos = len++;
+                d[pos] = 1;
+                code = 1;
+            }
+        }
+    }
+    d[pos] = (u8)code;
+    return len;
+}
+
+/* 扫一遍：格式合法返回 1 并写 *out_len，否则 0。 */
+static int cobs_scan(const u8 *s, int n, int *out_len)
+{
+    int i = 0;
+    int out = 0;
+
+    while (i < n) {
+        int c = s[i++];
+        int cnt = 0;
+        int k = 0;
+
+        if (c == 0)
+            return 0;
+        cnt = c - 1;
+        if (cnt > n - i)
+            return 0;
+        for (k = 0; k < cnt; k++)
+            if (s[i + k] == 0)
+                return 0;           /* 0 只能当分隔符，不能出现在负载里 */
+        out += cnt;
+        i += cnt;
+        if (c < 255) {
+            if (i < n)
+                out++;
+            else
+                break;
+        }
+    }
+    *out_len = out;
+    return 1;
+}
+
+/* 解码不含分隔符的 COBS 负载；返回长度，失败 -1（且不写 dst）。 */
+int cobs_decode(const void *src, int n, void *dst, int cap)
+{
+    const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)dst;
+    int len = 0;
+    int i = 0;
+    int o = 0;
+
+    if (n < 0 || (n > 0 && !src) || !dst)
+        return -1;
+    if (!cobs_scan(s, n, &len))
+        return -1;
+    if (len > cap)
+        return -1;
+    while (i < n) {
+        int c = s[i++];
+        int cnt = c - 1;
+        int k = 0;
+
+        for (k = 0; k < cnt; k++)
+            d[o++] = s[i++];
+        if (c < 255) {
+            if (i < n)
+                d[o++] = 0;
+            else
+                break;
+        }
+    }
+    return o;
+}
+
+/* 编码 + 结尾 0（帧）。返回含分隔符的长度，失败 -1。 */
+int cobs_encode_frame(const void *src, int n, void *dst, int cap)
+{
+    int need = cobs_encoded_len(src, n);
+    int len = 0;
+
+    if (need < 0 || (i64)need + 1 > (i64)cap || !dst)
+        return -1;
+    len = cobs_encode(src, n, dst, cap - 1);
+    if (len < 0)
+        return -1;
+    ((u8 *)dst)[len] = 0;
+    return len + 1;
+}
+
+/* 解帧：结尾的 0 可有可无；负载里出现 0 当格式错误。 */
+int cobs_decode_frame(const void *src, int n, void *dst, int cap)
+{
+    if (n < 0 || (n > 0 && !src) || !dst)
+        return -1;
+    if (n > 0 && ((const u8 *)src)[n - 1] == 0)
+        n--;
+    return cobs_decode(src, n, dst, cap);
+}
+
+/* ---- SLIP（RFC 1055） ---- */
+
+/* 转义后的精确长度（不含 END）：0xC0/0xDB 各占两字节。 */
+int slip_encoded_len(const void *src, int n)
+{
+    const u8 *s = (const u8 *)src;
+    int len = 0;
+    int i = 0;
+
+    if (n < 0 || (n > 0 && !src) || n > I32_MAX / 2)
+        return -1;
+    for (i = 0; i < n; i++)
+        len += (s[i] == SLIP_END || s[i] == SLIP_ESC) ? 2 : 1;
+    return len;
+}
+
+/* 转义负载，不写 END；返回长度，失败 -1（且不写 dst）。 */
+int slip_encode(const void *src, int n, void *dst, int cap)
+{
+    const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)dst;
+    int need = slip_encoded_len(src, n);
+    int i = 0;
+    int o = 0;
+
+    if (need < 0 || !dst || need > cap)
+        return -1;
+    for (i = 0; i < n; i++) {
+        u8 b = s[i];
+
+        if (b == SLIP_END) {
+            d[o++] = SLIP_ESC;
+            d[o++] = SLIP_ESC_END;
+        } else if (b == SLIP_ESC) {
+            d[o++] = SLIP_ESC;
+            d[o++] = SLIP_ESC_ESC;
+        } else {
+            d[o++] = b;
+        }
+    }
+    return o;
+}
+
+/* 扫一遍：截断的转义、非法转义、负载里的 END 都算错。 */
+static int slip_scan(const u8 *s, int n, int *out_len)
+{
+    int i = 0;
+    int out = 0;
+
+    while (i < n) {
+        u8 b = s[i++];
+
+        if (b == SLIP_END)
+            return 0;
+        if (b == SLIP_ESC) {
+            u8 e = 0;
+
+            if (i >= n)
+                return 0;
+            e = s[i++];
+            if (e != SLIP_ESC_END && e != SLIP_ESC_ESC)
+                return 0;
+        }
+        out++;
+    }
+    *out_len = out;
+    return 1;
+}
+
+/* 解转义（输入不含 END）；返回长度，失败 -1（且不写 dst）。 */
+int slip_decode(const void *src, int n, void *dst, int cap)
+{
+    const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)dst;
+    int len = 0;
+    int i = 0;
+    int o = 0;
+
+    if (n < 0 || (n > 0 && !src) || !dst)
+        return -1;
+    if (!slip_scan(s, n, &len))
+        return -1;
+    if (len > cap)
+        return -1;
+    while (i < n) {
+        u8 b = s[i++];
+
+        if (b == SLIP_ESC) {
+            u8 e = s[i++];
+
+            b = (e == SLIP_ESC_END) ? (u8)SLIP_END : (u8)SLIP_ESC;
+        }
+        d[o++] = b;
+    }
+    return o;
+}
+
+/* 整帧：END + 转义负载 + END；返回总长度，失败 -1。 */
+int slip_encode_frame(const void *src, int n, void *dst, int cap)
+{
+    u8 *d = (u8 *)dst;
+    int need = slip_encoded_len(src, n);
+    int len = 0;
+
+    if (need < 0 || !d || (i64)need + 2 > (i64)cap)
+        return -1;
+    d[0] = SLIP_END;
+    len = slip_encode(src, n, d + 1, cap - 2);
+    if (len < 0)
+        return -1;
+    d[1 + len] = SLIP_END;
+    return len + 2;
+}
+
+/* 解整帧：首尾各最多一个 END（可省略），返回负载长度，失败 -1。 */
+int slip_decode_frame(const void *src, int n, void *dst, int cap)
+{
+    const u8 *s = (const u8 *)src;
+
+    if (n < 0 || (n > 0 && !src) || !dst)
+        return -1;
+    if (n > 0 && s[0] == SLIP_END) {
+        s++;
+        n--;
+    }
+    if (n > 0 && s[n - 1] == SLIP_END)
+        n--;
+    return slip_decode(s, n, dst, cap);
+}
+
+/* ---- 自测 ---- */
+
+static int bytes_eq(const void *a, const void *b, int n)
+{
+    const u8 *x = (const u8 *)a;
+    const u8 *y = (const u8 *)b;
+    int i = 0;
+
+    for (i = 0; i < n; i++)
+        if (x[i] != y[i])
+            return 0;
+    return 1;
+}
+
+test "COBS 的已知向量与长度" {
+    u8 in1[1] = { 0x00 };
+    u8 out1[4] = { 0 };
+    u8 out2[4] = { 0 };
+    u8 in3[4] = { 0x11, 0x22, 0x00, 0x33 };
+    u8 out3[8] = { 0 };
+    u8 in4[4] = { 0x11, 0x22, 0x33, 0x44 };
+    u8 out4[8] = { 0 };
+    u8 empty[2] = { 0 };
+    u8 want3[5] = { 0x03, 0x11, 0x22, 0x02, 0x33 };
+    int n = 0;
+
+    if (cobs_max_len(0) != 1 || cobs_max_len(254) != 256
+        || cobs_max_len(255) != 257 || cobs_max_len(-1) != -1)
+        return err(1, "cobs_max_len 不对");
+    if (cobs_encoded_len(in1, 1) != 2 || cobs_encoded_len(empty, 0) != 1
+        || cobs_encoded_len(in3, 4) != 5 || cobs_encoded_len(in4, 4) != 5
+        || cobs_encoded_len(0, 1) != -1 || cobs_encoded_len(in1, -1) != -1)
+        return err(30, "cobs_encoded_len 不对");
+
+    n = cobs_encode(in1, 1, out1, (int)sizeof out1);
+    if (n != 2 || out1[0] != 1 || out1[1] != 1)
+        return err(2, "单个 0 的编码不对");
+    n = cobs_encode(in1, 1, out2, 1);
+    if (n != -1)
+        return err(3, "放不下时没有失败");
+    n = cobs_encode(empty, 0, out2, (int)sizeof out2);
+    if (n != 1 || out2[0] != 1)
+        return err(4, "空输入的编码不对");
+    n = cobs_encode(in3, 4, out3, (int)sizeof out3);
+    if (n != 5 || !bytes_eq(out3, want3, 5))
+        return err(5, "COBS 向量不对");
+    n = cobs_encode(in4, 4, out4, (int)sizeof out4);
+    if (n != 5 || out4[0] != 5 || !bytes_eq(out4 + 1, in4, 4))
+        return err(6, "无 0 输入的编码不对");
+}
+
+test "COBS 往返、254 边界与格式错误" {
+    u8 in[300] = { 0 };
+    u8 enc[320] = { 0 };
+    u8 dec[300] = { 0 };
+    u8 bad1[1] = { 0x00 };
+    u8 bad2[2] = { 0x05, 0x11 };
+    u8 bad3[2] = { 0x02, 0x00 };
+    u8 dirty[8] = { 0 };
+    int n = 0;
+    int m = 0;
+    int i = 0;
+
+    for (i = 0; i < (int)sizeof in; i++)
+        in[i] = (u8)(i % 7 == 0 ? 0 : i);
+    n = cobs_encode(in, (int)sizeof in, enc, (int)sizeof enc);
+    if (n != cobs_encoded_len(in, (int)sizeof in))
+        return err(7, "编码长度与 encoded_len 不一致");
+    m = cobs_decode(enc, n, dec, (int)sizeof dec);
+    if (m != (int)sizeof in || !bytes_eq(dec, in, m))
+        return err(8, "COBS 往返不一致");
+
+    /* 254 个非零字节正好触发 code 255 的刷新，后面还要补一个空组 */
+    for (i = 0; i < 254; i++)
+        in[i] = 0x55;
+    n = cobs_encode(in, 254, enc, (int)sizeof enc);
+    if (n != 256 || enc[0] != 255 || enc[255] != 1)
+        return err(9, "254 字节边界的编码不对");
+    m = cobs_decode(enc, n, dec, (int)sizeof dec);
+    if (m != 254 || !bytes_eq(dec, in, 254))
+        return err(10, "254 字节边界的解码不对");
+
+    for (i = 0; i < 8; i++)
+        dirty[i] = 0xaa;
+    if (cobs_decode(bad1, 1, dirty, (int)sizeof dirty) != -1
+        || cobs_decode(bad2, 2, dirty, (int)sizeof dirty) != -1
+        || cobs_decode(bad3, 2, dirty, (int)sizeof dirty) != -1)
+        return err(11, "非法 COBS 没有失败");
+    if (dirty[0] != 0xaa)
+        return err(12, "解码失败时写了目标缓冲");
+
+    if (cobs_decode(enc, n, dec, 10) != -1)
+        return err(13, "输出缓冲不足时没有失败");
+}
+
+test "COBS 帧与 SLIP 帧" {
+    u8 in[4] = { 0x11, 0x00, 0xc0, 0xdb };
+    u8 frame[32] = { 0 };
+    u8 dec[8] = { 0 };
+    u8 slip_enc[16] = { 0 };
+    u8 slip_dec[8] = { 0 };
+    int n = 0;
+    int m = 0;
+
+    n = cobs_encode_frame(in, 2, frame, (int)sizeof frame);
+    if (n != 4 || frame[0] != 2 || frame[1] != 0x11 || frame[2] != 1
+        || frame[3] != 0)
+        return err(14, "COBS 帧的字节不对");
+    m = cobs_decode_frame(frame, n, dec, (int)sizeof dec);
+    if (m != 2 || dec[0] != 0x11 || dec[1] != 0)
+        return err(15, "COBS 帧解码不对");
+    m = cobs_decode_frame(frame, n - 1, dec, (int)sizeof dec);
+    if (m != 2 || dec[1] != 0)
+        return err(16, "没有结尾 0 的 COBS 帧解不了");
+
+    if (slip_encoded_len(in, 4) != 6)
+        return err(17, "SLIP 长度不对");
+    n = slip_encode(in, 4, slip_enc, (int)sizeof slip_enc);
+    if (n != 6 || slip_enc[0] != 0x11 || slip_enc[1] != 0x00
+        || slip_enc[2] != 0xdb || slip_enc[3] != 0xdc
+        || slip_enc[4] != 0xdb || slip_enc[5] != 0xdd)
+        return err(18, "SLIP 转义字节不对");
+    m = slip_decode(slip_enc, n, slip_dec, (int)sizeof slip_dec);
+    if (m != 4 || !bytes_eq(slip_dec, in, 4))
+        return err(19, "SLIP 往返不一致");
+
+    n = slip_encode_frame(in, 4, frame, (int)sizeof frame);
+    if (n != 8 || frame[0] != 0xc0 || frame[7] != 0xc0)
+        return err(20, "SLIP 帧的边界不对");
+    m = slip_decode_frame(frame, n, slip_dec, (int)sizeof slip_dec);
+    if (m != 4 || !bytes_eq(slip_dec, in, 4))
+        return err(21, "SLIP 帧解码不对");
+    if (slip_decode_frame(frame + 1, n - 1, slip_dec, (int)sizeof slip_dec) != 4)
+        return err(22, "省略两端 END 的 SLIP 帧解不了");
+}
+
+test "SLIP / COBS 的坏输入与不写半截" {
+    u8 esc_end[1] = { 0xdb };
+    u8 bad_esc[2] = { 0xdb, 0x00 };
+    u8 end_inside[3] = { 0x41, 0xc0, 0x42 };
+    u8 dirty[8] = { 0 };
+    u8 src[4] = { 0x41, 0xc0, 0x42, 0x43 };
+    u8 dst[16] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 8; i++)
+        dirty[i] = 0xaa;
+    if (slip_decode(esc_end, 1, dirty, (int)sizeof dirty) != -1
+        || slip_decode(bad_esc, 2, dirty, (int)sizeof dirty) != -1
+        || slip_decode(end_inside, 3, dirty, (int)sizeof dirty) != -1)
+        return err(23, "非法 SLIP 没有失败");
+    if (dirty[0] != 0xaa)
+        return err(24, "SLIP 失败时写了目标缓冲");
+
+    for (i = 0; i < 16; i++)
+        dst[i] = 0xaa;
+    if (slip_encode(src, 4, dst, 4) != -1 || dst[0] != 0xaa)
+        return err(25, "SLIP 编码放不下时写了半截");
+    if (slip_encode_frame(src, 4, dst, 6) != -1 || dst[0] != 0xaa)
+        return err(26, "SLIP 帧放不下时写了半截");
+    if (cobs_encode_frame(src, 4, dst, 4) != -1 || dst[0] != 0xaa)
+        return err(27, "COBS 帧放不下时写了半截");
+
+    if (slip_decode(0, 0, dst, 0) != 0 || slip_decode_frame(0, 0, dst, 0) != 0)
+        return err(28, "空指针 / 空帧的约定不对");
+    if (cobs_decode(0, 0, dst, 0) != 0)
+        return err(29, "空 COBS 输入没有解成空");
+}

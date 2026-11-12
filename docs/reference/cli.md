@@ -93,6 +93,7 @@
 | `make std-next` | 编译并运行 `examples/stdnext.c6`（第八批模块的拼装示例） |
 | `make std-node` | 编译并运行 `examples/stdnode.c6`（第九批模块的拼装示例） |
 | `make std-form` | 编译并运行 `examples/stdform.c6`（第十批模块的拼装示例） |
+| `make std-embed` | 编译并运行 `examples/stdembed.c6`（第十一批：crc/fixed/pool/frame 嵌入式基础） |
 
 ### freestanding、裸机与交叉目标
 
