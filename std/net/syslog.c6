@@ -1,0 +1,347 @@
+/* std/net/syslog：syslog 报文（RFC 5424 与老的 RFC 3164）的解析与构造。
+ *
+ *     import std.net.syslog;
+ *
+ *     SyslogMsg m = { 0 };
+ *     if (syslog_parse(buf, n, &m) == 1)
+ *         // m.facility / m.severity / m.host / m.app / m.msg
+ *
+ * RFC 5424 格式：
+ *
+ *     <PRI>VERSION SP TIMESTAMP SP HOSTNAME SP APP-NAME SP PROCID SP MSGID
+ *     SP STRUCTURED-DATA [SP MSG]
+ *
+ * RFC 3164（BSD syslog）格式：
+ *
+ *     <PRI>MMM dd hh:mm:ss HOSTNAME TAG[pid]: MSG
+ *
+ * 约定：
+ *
+ * - `severity = PRI % 8`、`facility = PRI / 8`；
+ * - 5424 的 `version` 一般是 1，3164 的 `version` 是 0 且 `rfc3164` 置 1；
+ * - 所有字段都是**指向原缓冲区的视图**（`Str`），不拷贝；
+ * - 5424 里写成 `-` 的 NIC 字段（hostname/app/procid/msgid）长度为 0；
+ * - 结构化数据以 `-` 表示没有，否则 `sd` 是 `[…]…` 的原文（多条时含中间的 `][`）；
+ * - `syslog_build` 生成 5424 的简化形式：`<PRI>1 - host app - - - msg`
+ *   （时间戳留 `-`，由转发方补）；
+ * - 不做消息转义（`]`、`"`、`\` 的处理）、不拆结构化数据里的参数。
+ */
+#include <string.h>
+
+module std.net.syslog;
+import std.core.types;
+import std.text.str;
+
+struct SyslogMsg {
+    int facility;
+    int severity;
+    int pri;
+    int version;
+    int rfc3164;
+    Str timestamp;
+    Str host;
+    Str app;
+    Str procid;
+    Str msgid;
+    Str sd;
+    Str msg;
+};
+
+static int sysl_digit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+int syslog_pri(int facility, int severity)
+{
+    if (facility < 0 || facility > 23 || severity < 0 || severity > 7)
+        return -1;
+    return facility * 8 + severity;
+}
+
+/* 5424 里单独的 "-" 表示「没有这个字段」 */
+static void sysl_nil(Str *f)
+{
+    if (f->s.len == 1 && f->s.data[0] == '-')
+        f->s = (char[:]){ 0, 0 };
+}
+
+/* 取下一个以空格分隔的字段；到结尾时返回 0 */
+static int sysl_field(const char *p, int n, int *i, Str *out)
+{
+    int start = 0;
+
+    if (*i >= n)
+        return 0;
+    start = *i;
+    while (*i < n && p[*i] != ' ' && p[*i] != '\n' && p[*i] != '\r')
+        (*i)++;
+    out->s = (char[:]){ (char *)p + start, *i - start };
+    if (*i < n && p[*i] == ' ')
+        (*i)++;
+    return 1;
+}
+
+int syslog_parse(const void *src, int n, SyslogMsg *out)
+{
+    const char *p = (const char *)src;
+    int i = 0, pri = 0, digits = 0;
+
+    if (!src || !out || n < 5)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (p[0] != '<')
+        return -1;
+    i = 1;
+    while (i < n && sysl_digit(p[i])) {
+        pri = pri * 10 + (p[i] - '0');
+        digits++;
+        i++;
+        if (pri > 999)
+            return -1;
+    }
+    if (!digits || i >= n || p[i] != '>')
+        return -1;
+    i++;
+    out->pri = pri;
+    out->facility = pri / 8;
+    out->severity = pri % 8;
+    /* 紧跟着数字的是 5424 的 VERSION；否则按 3164 处理 */
+    if (i < n && sysl_digit(p[i])) {
+        int ver = 0;
+
+        while (i < n && sysl_digit(p[i])) {
+            ver = ver * 10 + (p[i] - '0');
+            i++;
+        }
+        if (i >= n || p[i] != ' ')
+            return -1;
+        i++;
+        out->version = ver;
+        if (sysl_field(p, n, &i, &out->timestamp) != 1)
+            return -1;
+        if (sysl_field(p, n, &i, &out->host) != 1)
+            return -1;
+        if (sysl_field(p, n, &i, &out->app) != 1)
+            return -1;
+        if (sysl_field(p, n, &i, &out->procid) != 1)
+            return -1;
+        if (sysl_field(p, n, &i, &out->msgid) != 1)
+            return -1;
+        sysl_nil(&out->host);
+        sysl_nil(&out->app);
+        sysl_nil(&out->procid);
+        sysl_nil(&out->msgid);
+        /* 结构化数据：'-' 或 '[...]'（可能连着写多条） */
+        if (i < n && p[i] == '-') {
+            i++;
+            if (i < n && p[i] == ' ')
+                i++;
+        } else if (i < n && p[i] == '[') {
+            int start = i, depth = 0;
+
+            while (i < n) {
+                if (p[i] == '[')
+                    depth++;
+                else if (p[i] == ']') {
+                    depth--;
+                    if (depth == 0) {
+                        i++;
+                        break;
+                    }
+                }
+                i++;
+            }
+            out->sd.s = (char[:]){ (char *)p + start, i - start };
+            if (i < n && p[i] == ' ')
+                i++;
+        } else {
+            return -1;
+        }
+        if (i < n)
+            out->msg.s = (char[:]){ (char *)p + i, n - i };
+        (void)sysl_field;
+        return 1;
+    }
+    /* RFC 3164：MMM dd hh:mm:ss HOST TAG: MSG */
+    out->rfc3164 = 1;
+    out->version = 0;
+    {
+        int start = i;
+
+        /* 时间戳有三个字段（月份 日期 时间），合起来当 timestamp */
+        {
+            Str a = { 0 }, b = { 0 }, c = { 0 };
+
+            if (sysl_field(p, n, &i, &a) != 1)
+                return -1;
+            if (sysl_field(p, n, &i, &b) != 1)
+                return -1;
+            if (sysl_field(p, n, &i, &c) != 1)
+                return -1;
+        }
+        out->timestamp.s = (char[:]){ (char *)p + start, i - start - 1 };
+        if (i >= n)
+            return -1;
+        if (sysl_field(p, n, &i, &out->host) != 1)
+            return -1;
+    }
+    if (i >= n)
+        return -1;
+    /* 剩下的都是消息（TAG: MSG 形式，TAG 与 MSG 之间用 ": " 分） */
+    out->msg.s = (char[:]){ (char *)p + i, n - i };
+    {
+        int k = 0, colon = -1;
+
+        for (k = 0; k < out->msg.s.len; k++) {
+            if (out->msg.s.data[k] == ':') {
+                colon = k;
+                break;
+            }
+        }
+        if (colon > 0) {
+            out->app.s = (char[:]){ out->msg.s.data, colon };
+            {
+                int mstart = colon + 1;
+
+                while (mstart < out->msg.s.len && out->msg.s.data[mstart] == ' ')
+                    mstart++;
+                out->msg.s = (char[:]){ out->msg.s.data + mstart,
+                                        out->msg.s.len - mstart };
+            }
+        }
+    }
+    return 1;
+}
+
+int syslog_build(int facility, int severity, const char *host, const char *app,
+                 const char *msg, char *dst, int cap)
+{
+    int pri = syslog_pri(facility, severity);
+    int o = 0, i = 0;
+    char num[8] = { 0 };
+    int k = 0, v = 0;
+
+    if (pri < 0 || !dst || cap <= 0 || !host || !app)
+        return -1;
+    v = pri;
+    if (v == 0) {
+        num[0] = '0';
+        k = 1;
+    }
+    while (v > 0 && k < 6) {
+        num[k++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    if (o + 1 >= cap)
+        return -1;
+    dst[o++] = '<';
+    for (i = k - 1; i >= 0; i--) {
+        if (o + 1 >= cap)
+            return -1;
+        dst[o++] = num[i];
+    }
+    {
+        static const char *tail = ">1 - ";
+        int t = 0;
+
+        for (t = 0; tail[t]; t++) {
+            if (o + 1 >= cap)
+                return -1;
+            dst[o++] = tail[t];
+        }
+    }
+    for (i = 0; host[i]; i++) {
+        if (o + 1 >= cap)
+            return -1;
+        dst[o++] = host[i];
+    }
+    if (o + 1 >= cap)
+        return -1;
+    dst[o++] = ' ';
+    for (i = 0; app[i]; i++) {
+        if (o + 1 >= cap)
+            return -1;
+        dst[o++] = app[i];
+    }
+    {
+        static const char *mid = " - - - ";
+        int t = 0;
+
+        for (t = 0; mid[t]; t++) {
+            if (o + 1 >= cap)
+                return -1;
+            dst[o++] = mid[t];
+        }
+    }
+    for (i = 0; msg && msg[i]; i++) {
+        if (o + 1 >= cap)
+            return -1;
+        dst[o++] = msg[i];
+    }
+    dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "syslog：RFC 5424" {
+    static const char *line =
+        "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 "
+        "- 'su root' failed for lonvick on /dev/pts/8";
+    SyslogMsg m = { 0 };
+    int n = (int)strlen(line);
+
+    if (syslog_parse(line, n, &m) != 1)
+        return err(1, "5424 解析失败");
+    if (m.pri != 34 || m.facility != 4 || m.severity != 2)
+        return err(2, "PRI/设施/级别不对");
+    if (m.version != 1 || m.rfc3164 != 0)
+        return err(3, "版本不对");
+    if (m.timestamp.s.len != 24
+        || memcmp(m.timestamp.s.data, "2003-10-11T22:14:15.003Z", 24) != 0)
+        return err(4, "时间戳不对");
+    if (m.host.s.len != 21
+        || memcmp(m.host.s.data, "mymachine.example.com", 21) != 0)
+        return err(5, "主机名不对");
+    if (m.app.s.len != 2 || memcmp(m.app.s.data, "su", 2) != 0)
+        return err(6, "应用名不对");
+    if (m.procid.s.len != 0 || m.msgid.s.len != 4
+        || memcmp(m.msgid.s.data, "ID47", 4) != 0)
+        return err(7, "NIC 字段不对");
+    if (memcmp(m.msg.s.data, "'su root' failed", 16) != 0)
+        return err(8, "消息内容不对");
+    if (syslog_parse("<13>x 1", 7, &m) != -1)
+        return err(9, "缺少字段应该 -1");
+    if (syslog_parse("no pri", 6, &m) != -1)
+        return err(10, "没有 PRI 应该 -1");
+}
+
+test "syslog：RFC 3164 与构造" {
+    static const char *line = "<34>Oct 11 22:14:15 mymachine su: 'su root' failed";
+    SyslogMsg m = { 0 };
+    char out[128] = { 0 };
+    int n = (int)strlen(line);
+
+    if (syslog_parse(line, n, &m) != 1)
+        return err(11, "3164 解析失败");
+    if (m.rfc3164 != 1 || m.version != 0)
+        return err(12, "3164 标记不对");
+    if (m.facility != 4 || m.severity != 2)
+        return err(13, "3164 的 PRI 不对");
+    if (m.host.s.len != 9 || memcmp(m.host.s.data, "mymachine", 9) != 0)
+        return err(14, "3164 主机名不对");
+    if (m.app.s.len != 2 || memcmp(m.app.s.data, "su", 2) != 0)
+        return err(15, "3164 的 TAG 不对");
+    if (memcmp(m.msg.s.data, "'su root' failed", 16) != 0)
+        return err(16, "3164 消息内容不对");
+    if (syslog_pri(4, 2) != 34 || syslog_pri(24, 0) != -1)
+        return err(17, "PRI 计算不对");
+    n = syslog_build(4, 2, "host1", "app1", "hello", out, (int)sizeof out);
+    if (n != 30 || memcmp(out, "<34>1 - host1 app1 - - - hello", 30) != 0)
+        return err(18, "构造的 5424 报文不对");
+    if (syslog_build(4, 2, "host1", "app1", "hello", out, 8) != -1)
+        return err(19, "容量不够应该 -1");
+}

@@ -1,0 +1,176 @@
+/* examples/stdpacket.c6 —— 第四十九批（网络报文）的集成示例。
+ *
+ *     make std-packet
+ *
+ * 四节：NTP（报文头 + 时间戳换算 + 偏移估计）、syslog（5424 与 3164 解析、
+ * 5424 构造）、STUN（构造/解析 + XOR-MAPPED-ADDRESS）、TFTP（RRQ/DATA/ACK）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.net.ntp;
+import std.net.syslog;
+import std.net.stun;
+import std.net.tftp;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+static void put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+static void put64(u8 *p, u64 v)
+{
+    put32(p, (u32)(v >> 32));
+    put32(p + 4, (u32)(v & 0xFFFFFFFFu));
+}
+
+static void do_ntp(void)
+{
+    static u8 buf[64] = { 0 };
+    NtpPacket pk = { 0 };
+    u64 t1 = unix_to_ntp(1000), t4 = unix_to_ntp(1003);
+
+    printf("== ntp\n");
+    buf[0] = (u8)((4 << 3) | 4);
+    buf[1] = 2;
+    buf[12] = 'G';
+    buf[13] = 'P';
+    buf[14] = 'S';
+    put64(buf + 16, unix_to_ntp(1704067200));
+    put64(buf + 24, t1);
+    put64(buf + 32, unix_to_ntp(1006));
+    put64(buf + 40, unix_to_ntp(1007));
+    check(ntp_parse(buf, 48, &pk) == 1, "报文解析");
+    printf("   VN=%d Mode=%d Stratum=%d RefID=0x%08X\n", pk.version, pk.mode,
+           pk.stratum, pk.ref_id);
+    check(pk.version == 4 && pk.mode == 4 && pk.stratum == 2, "头字段");
+    check(pk.ref_id == 0x47505300u, "Reference ID = GPS");
+    check(ntp_to_unix(pk.ref_ts) == 1704067200, "参考时间戳");
+    {
+        /* 先按服务器时间戳算偏移（t2 = 1006、t3 = 1007） */
+        u64 t2 = pk.recv_ts, t3 = pk.trans_ts;
+        double off = ntp_offset(t1, t2, t3, t4);
+
+        printf("   偏移估计 = %g 秒\n", off);
+        check(off > 4 && off < 6, "偏移在 5 秒附近");
+    }
+    check(ntp_build(unix_to_ntp(42), buf, (int)sizeof buf) == 48, "请求构造");
+    check(ntp_parse(buf, 48, &pk) == 1 && ntp_to_unix(pk.trans_ts) == 42,
+          "请求往返");
+}
+
+static void do_syslog(void)
+{
+    SyslogMsg m = { 0 };
+    char out[128] = { 0 };
+    static const char *l5424 =
+        "<165>1 2024-01-01T00:00:00Z host1 myapp 123 MSGID - hello world";
+    static const char *l3164 = "<34>Oct 11 22:14:15 mymachine su: failed";
+    int n = 0;
+
+    printf("== syslog\n");
+    check(syslog_parse(l5424, (int)strlen(l5424), &m) == 1, "5424 解析");
+    printf("   pri=%d facility=%d severity=%d app=", m.pri, m.facility,
+           m.severity);
+    printf("%.*s\n", m.app.s.len, m.app.s.data);
+    check(m.pri == 165 && m.facility == 20 && m.severity == 5, "PRI 拆分");
+    check(m.version == 1 && m.procid.s.len == 3, "版本与 procid");
+    check(m.msg.s.len == 11 && memcmp(m.msg.s.data, "hello world", 11) == 0,
+          "消息内容");
+    check(syslog_parse(l3164, (int)strlen(l3164), &m) == 1 && m.rfc3164 == 1,
+          "3164 解析");
+    check(m.app.s.len == 2 && memcmp(m.app.s.data, "su", 2) == 0, "3164 TAG");
+    n = syslog_build(20, 5, "host1", "myapp", "hi", out, (int)sizeof out);
+    printf("   构造：%s（%d 字节）\n", out, n);
+    check(n == 29 && memcmp(out, "<165>1 - host1 myapp - - - hi", 29) == 0,
+          "5424 构造");
+    check(syslog_pri(20, 5) == 165, "PRI 计算");
+}
+
+static void do_stun(void)
+{
+    static u8 buf[128] = { 0 };
+    StunMsg m = { 0 };
+    StunAttr a = { 0 };
+    char ip[64] = { 0 };
+    int port = 0;
+    u8 txid[12] = { 0 };
+
+    printf("== stun\n");
+    check(stun_build(0x0101, txid, buf, (int)sizeof buf) == 20, "构造成功应答");
+    put16(buf + 2, 12);
+    put16(buf + 20, STUN_ATTR_XOR_MAPPED);
+    put16(buf + 22, 8);
+    buf[24] = 0;
+    buf[25] = 0x01;
+    put16(buf + 26, 32853 ^ 0x2112);
+    put32(buf + 28, 0xC0000201u ^ 0x2112A442u);
+    check(stun_parse(buf, 40, &m) == 1, "解析");
+    printf("   type=0x%04X method=%d class=%d\n", m.type, m.method, m.class_);
+    check(m.method == 1 && m.class_ == 2, "方法与类别");
+    check(stun_find(buf, 40, &m, STUN_ATTR_XOR_MAPPED, &a) == 1, "找属性");
+    check(stun_xor_addr(buf, 40, &m, &a, ip, (int)sizeof ip, &port) == 1,
+          "解 XOR 地址");
+    printf("   映射地址 = %s:%d\n", ip, port);
+    check(strcmp(ip, "192.0.2.1") == 0 && port == 32853, "地址与端口");
+    check(stun_make_type(1, 3) == 0x0111, "错误应答类型");
+}
+
+static void do_tftp(void)
+{
+    static u8 buf[64] = { 0 };
+    TftpMsg m = { 0 };
+    int n = 0;
+
+    printf("== tftp\n");
+    n = tftp_build_rrq("boot.img", buf, (int)sizeof buf);
+    check(n == 2 + 8 + 1 + 5 + 1, "RRQ 长度");
+    check(tftp_parse(buf, n, &m) == 1 && m.opcode == TFTP_RRQ, "RRQ 解析");
+    printf("   RRQ：%.*s（模式 %.*s）\n", m.filename.s.len, m.filename.s.data,
+           m.mode.s.len, m.mode.s.data);
+    check(m.filename.s.len == 8 && m.mode.s.len == 5, "RRQ 字段");
+    n = tftp_build_data(1, "payload", 7, buf, (int)sizeof buf);
+    check(tftp_parse(buf, n, &m) == 1 && m.block == 1 && m.data_len == 7,
+          "DATA 往返");
+    check(memcmp(buf + m.data_off, "payload", 7) == 0, "DATA 内容");
+    check(tftp_build_ack(1, buf, (int)sizeof buf) == 4
+          && tftp_parse(buf, 4, &m) == 1 && m.block == 1, "ACK 往返");
+    n = tftp_build_error(2, "denied", buf, (int)sizeof buf);
+    check(tftp_parse(buf, n, &m) == 1 && m.errcode == 2
+          && m.errmsg.s.len == 6, "ERROR 往返");
+}
+
+int main(void)
+{
+    do_ntp();
+    do_syslog();
+    do_stun();
+    do_tftp();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

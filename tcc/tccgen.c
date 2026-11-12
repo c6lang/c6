@@ -12910,6 +12910,10 @@ static const struct C6ErrStdSlot {
     { "std.os.iso8601",         C6_ERR_SLOT_STD + 202 },
     { "std.os.duration",        C6_ERR_SLOT_STD + 203 },
     { "std.os.cron",            C6_ERR_SLOT_STD + 204 },
+    { "std.net.ntp",            C6_ERR_SLOT_STD + 205 },
+    { "std.net.syslog",         C6_ERR_SLOT_STD + 206 },
+    { "std.net.stun",           C6_ERR_SLOT_STD + 207 },
+    { "std.net.tftp",           C6_ERR_SLOT_STD + 208 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

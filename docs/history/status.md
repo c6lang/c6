@@ -1751,6 +1751,32 @@ FTP 的解析坑值得记一笔：`LIST` 行是定字段的「权限 链接 属�
 验收：`make stdtest`（205 个模块、0 failure）、`make std-time`（27 条自检全过）、
 `make check-all`。
 
+### 11.61 标准库第四十九批（ntp / syslog / stun / tftp）
+
+第四十九批做网络报文：NTP、syslog、STUN、TFTP。四个都是「二进制或半文本报文 +
+少量状态」，与前面 ws/mqtt/socks5 的做法一致，只解报文、不做 I/O。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.net.ntp` | NTPv4 | 时间戳是 1900 纪元的 32.32 定点数，与 Unix 差 2208988800 秒；`ntp_offset` 用 RFC 5905 的 `((t2-t1)+(t3-t4))/2`，测试里用「服务器快 5 秒、单程 1 秒」的对称模型钉死 |
+| `std.net.syslog` | RFC 5424 / 3164 | 先用 `<PRI>` 后的第一个字节区分：数字是 5424 的 VERSION，字母是 3164 的月份；5424 的 `-` 表示「没有这个字段」，要归一成长度 0；3164 的 `TAG: MSG` 再把 TAG 拆出来 |
+| `std.net.stun` | RFC 5389 | 类型字段是**位交错**的（方法位与类别位穿插），用 `stun_make_type` 统一算；属性按 4 字节补齐，遍历时步进是 `4 + ((len+3)&~3)`；XOR-MAPPED 的端口异或魔术字高 16 位、IPv4 地址异或整个魔术字 |
+| `std.net.tftp` | RFC 1350 | 前 2 字节是操作码，其后按操作码分支；RRQ/WRQ 是一串 ` ` 结尾的串（文件名、模式、选项对），DATA 是「块号 + 裸数据」，所以 `data_off` 恒为 4 |
+
+两个小坑：`str` 的切片字段 `len` 是只读的（`f->s.len = 0` 会报警告
+`assignment of read-only location`），要清空就把整个切片赋成零长；测试里别把变量
+命名成 `err`（它是内置的错误构造），`static const u8 err[...]` 会直接编译失败。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.net.ntp`=0x60cd、
+`std.net.syslog`=0x60ce、`std.net.stun`=0x60cf、`std.net.tftp`=0x60d0；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-packet` 与 `STD_PACKET_SRCS`，`test-all`/`check-all`
+都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条用例）。示例
+`examples/stdpacket.c6` 四节（29 条自检）。
+
+验收：`make stdtest`（209 个模块、0 failure）、`make std-packet`（29 条自检全过）、
+`make check-all`。
+
+
 
 
 

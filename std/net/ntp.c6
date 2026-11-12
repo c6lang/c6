@@ -1,0 +1,221 @@
+/* std/net/ntp：NTPv4 报文（48 字节头）的解析、构造与时间戳换算。
+ *
+ *     import std.net.ntp;
+ *
+ *     NtpPacket p = { 0 };
+ *     if (ntp_parse(buf, n, &p) == 1)
+ *         // p.stratum / p.mode / p.tx_ts（NTP 时间戳，单位 1/2^32 秒）
+ *
+ * 报文头：LI(2 位) + VN(3 位) + Mode(3 位) + Stratum(8) + Poll(8) + Precision(8) +
+ * Root Delay(32 定点) + Root Dispersion(32 定点) + Reference ID(32) + 四个 64 位
+ * 时间戳（Reference / Origin / Receive / Transmit）。
+ *
+ * 时间戳是「自 1900-01-01 起的秒数，高 32 位整数、低 32 位小数」。NTP 纪元与
+ * Unix 纪元差 `2208988800` 秒。
+ *
+ * 约定：
+ *
+ * - `ntp_parse` 要求至少 48 字节，只读头部（扩展字段与认证码不管）；
+ * - `ntp_build` 生成 48 字节请求：`li=0`、`vn=4`、`mode=3`（客户端），
+ *   时间戳按传入值写；
+ * - `ntp_to_unix(ts)` 把 64 位时间戳换成 Unix 秒（向下取整），
+ *   `unix_to_ntp(sec)` 反向；
+ * - `ntp_offset(t1, t2, t3, t4)` 按 `((t2-t1)+(t3-t4))/2` 算客户端与服务器的
+ *   时钟差（RFC 5905 的公式，单位秒），`ntp_delay` 算往返时延；
+ * - 不做闰秒修正，也不处理 2036 年的纪元回绕（当成 64 位无符号直接算）。
+ */
+#include <string.h>
+
+module std.net.ntp;
+import std.core.types;
+import std.text.str;
+
+#define NTP_UNIX_DELTA 2208988800LL
+
+struct NtpPacket {
+    int leap;
+    int version;
+    int mode;
+    int stratum;
+    int poll;
+    int precision;
+    u32 root_delay;
+    u32 root_dispersion;
+    u32 ref_id;
+    u64 ref_ts;
+    u64 orig_ts;
+    u64 recv_ts;
+    u64 trans_ts;
+};
+
+static u32 ntp_be32(const u8 *p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8)
+           | (u32)p[3];
+}
+
+static u64 ntp_be64(const u8 *p)
+{
+    return ((u64)ntp_be32(p) << 32) | (u64)ntp_be32(p + 4);
+}
+
+static void ntp_put32(u8 *p, u32 v)
+{
+    p[0] = (u8)((v >> 24) & 0xFF);
+    p[1] = (u8)((v >> 16) & 0xFF);
+    p[2] = (u8)((v >> 8) & 0xFF);
+    p[3] = (u8)(v & 0xFF);
+}
+
+static void ntp_put64(u8 *p, u64 v)
+{
+    ntp_put32(p, (u32)(v >> 32));
+    ntp_put32(p + 4, (u32)(v & 0xFFFFFFFFu));
+}
+
+int ntp_parse(const void *src, int n, NtpPacket *out)
+{
+    const u8 *p = (const u8 *)src;
+
+    if (!src || !out || n < 48)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->leap = (int)((p[0] >> 6) & 0x03);
+    out->version = (int)((p[0] >> 3) & 0x07);
+    out->mode = (int)(p[0] & 0x07);
+    out->stratum = (int)p[1];
+    out->poll = (int)(signed char)p[2];
+    out->precision = (int)(signed char)p[3];
+    out->root_delay = ntp_be32(p + 4);
+    out->root_dispersion = ntp_be32(p + 8);
+    out->ref_id = ntp_be32(p + 12);
+    out->ref_ts = ntp_be64(p + 16);
+    out->orig_ts = ntp_be64(p + 24);
+    out->recv_ts = ntp_be64(p + 32);
+    out->trans_ts = ntp_be64(p + 40);
+    if (out->mode < 1 || out->mode > 6)
+        return -1;
+    return 1;
+}
+
+int ntp_build(u64 trans_ts, void *dst, int cap)
+{
+    u8 *p = (u8 *)dst;
+
+    if (!dst || cap < 48)
+        return -1;
+    memset(p, 0, 48);
+    p[0] = (u8)((0 << 6) | (4 << 3) | 3);       /* LI=0, VN=4, Mode=3 */
+    p[1] = 0;                                   /* Stratum 0（未同步） */
+    p[2] = 6;                                   /* Poll = 64 秒 */
+    p[3] = (u8)(-20 & 0xFF);                    /* Precision = 2^-20 */
+    ntp_put64(p + 40, trans_ts);
+    return 48;
+}
+
+i64 ntp_to_unix(u64 ts)
+{
+    u32 secs = (u32)(ts >> 32);
+
+    return (i64)secs - NTP_UNIX_DELTA;
+}
+
+u64 unix_to_ntp(i64 sec)
+{
+    return (u64)(sec + NTP_UNIX_DELTA) << 32;
+}
+
+double ntp_offset(u64 t1, u64 t2, u64 t3, u64 t4)
+{
+    double a = ((double)(u32)(t2 >> 32) + (double)(u32)(t2 & 0xFFFFFFFFu) / 4294967296.0)
+               - ((double)(u32)(t1 >> 32) + (double)(u32)(t1 & 0xFFFFFFFFu) / 4294967296.0);
+    double b = ((double)(u32)(t3 >> 32) + (double)(u32)(t3 & 0xFFFFFFFFu) / 4294967296.0)
+               - ((double)(u32)(t4 >> 32) + (double)(u32)(t4 & 0xFFFFFFFFu) / 4294967296.0);
+
+    return (a + b) / 2.0;
+}
+
+double ntp_delay(u64 t1, u64 t2, u64 t3, u64 t4)
+{
+    double a = ((double)(u32)(t4 >> 32) + (double)(u32)(t4 & 0xFFFFFFFFu) / 4294967296.0)
+               - ((double)(u32)(t1 >> 32) + (double)(u32)(t1 & 0xFFFFFFFFu) / 4294967296.0);
+    double b = ((double)(u32)(t3 >> 32) + (double)(u32)(t3 & 0xFFFFFFFFu) / 4294967296.0)
+               - ((double)(u32)(t2 >> 32) + (double)(u32)(t2 & 0xFFFFFFFFu) / 4294967296.0);
+
+    return a - b;
+}
+
+/* ---- 自测 ---- */
+
+static int nnear(double a, double b)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d < 1e-6;
+}
+
+test "ntp：报文解析与构造" {
+    static u8 buf[64] = { 0 };
+    NtpPacket p = { 0 };
+
+    /* 手工拼一个服务器应答 */
+    buf[0] = (u8)((0 << 6) | (4 << 3) | 4);     /* LI=0, VN=4, Mode=4 */
+    buf[1] = 2;                                 /* Stratum 2 */
+    buf[2] = 6;
+    buf[3] = (u8)(-20 & 0xFF);
+    ntp_put32(buf + 4, 0x00001000);
+    ntp_put32(buf + 8, 0x00002000);
+    buf[12] = 'G';
+    buf[13] = 'P';
+    buf[14] = 'S';
+    buf[15] = 0;
+    ntp_put64(buf + 16, unix_to_ntp(1704067200));
+    ntp_put64(buf + 40, unix_to_ntp(1704067201));
+    if (ntp_parse(buf, 48, &p) != 1)
+        return err(1, "报文解析失败");
+    if (p.leap != 0 || p.version != 4 || p.mode != 4)
+        return err(2, "LI/VN/Mode 不对");
+    if (p.stratum != 2 || p.poll != 6 || p.precision != -20)
+        return err(3, "Stratum/Poll/Precision 不对");
+    if (p.root_delay != 0x1000 || p.root_dispersion != 0x2000)
+        return err(4, "Root Delay/Dispersion 不对");
+    if (p.ref_id != 0x47505300u)
+        return err(5, "Reference ID 不对");
+    if (ntp_to_unix(p.ref_ts) != 1704067200)
+        return err(6, "Reference 时间戳换算不对");
+    if (ntp_to_unix(p.trans_ts) != 1704067201)
+        return err(7, "Transmit 时间戳换算不对");
+    if (ntp_parse(buf, 40, &p) != -1)
+        return err(8, "不足 48 字节应该 -1");
+    /* 构造请求 */
+    if (ntp_build(unix_to_ntp(1704067200), buf, (int)sizeof buf) != 48)
+        return err(9, "构造失败");
+    if (ntp_parse(buf, 48, &p) != 1 || p.mode != 3 || p.version != 4)
+        return err(10, "构造出来的请求字段不对");
+    if (ntp_to_unix(p.trans_ts) != 1704067200)
+        return err(11, "构造的发送时间戳不对");
+    if (ntp_build(0, buf, 40) != -1)
+        return err(12, "容量不够应该 -1");
+}
+
+test "ntp：时间戳与偏移" {
+    u64 t1 = unix_to_ntp(1000), t2 = unix_to_ntp(1001);
+    u64 t3 = unix_to_ntp(1002), t4 = unix_to_ntp(1003);
+
+    if (ntp_to_unix(unix_to_ntp(0)) != 0)
+        return err(13, "Unix 0 秒的往返不对");
+    if (ntp_to_unix(unix_to_ntp(1704067200)) != 1704067200)
+        return err(14, "时间戳往返不对");
+    if (ntp_to_unix((u64)NTP_UNIX_DELTA << 32) != 0)
+        return err(15, "NTP 纪元应该对应 Unix 0");
+    /* 对称往返：偏移 0、时延 2 秒 */
+    if (!nnear(ntp_offset(t1, t2, t3, t4), 0))
+        return err(16, "对称往返的偏移应该是 0");
+    if (!nnear(ntp_delay(t1, t2, t3, t4), 2))
+        return err(17, "对称往返的时延应该是 2 秒");
+    /* 服务器快 5 秒（单程 1 秒、处理 1 秒）：t2 = 1006, t3 = 1007 */
+    if (!nnear(ntp_offset(t1, unix_to_ntp(1006), unix_to_ntp(1007), t4), 5))
+        return err(18, "服务器快 5 秒时偏移应该是 5");
+}

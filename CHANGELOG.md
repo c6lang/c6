@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第四十九批（网络报文）**：`std.net.ntp`（NTPv4 报文与时间戳换算）、
+  `std.net.syslog`（RFC 5424 / 3164 解析与构造）、`std.net.stun`（STUN 头/属性/
+  XOR-MAPPED-ADDRESS）、`std.net.tftp`（RRQ/WRQ/DATA/ACK/ERROR/OACK），集成示例
+  `examples/stdpacket.c6`（`make std-packet`）。错误号段 `std.net.ntp`=0x60cd …
+  `std.net.tftp`=0x60d0（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第四十八批（时间工具）**：`std.os.calendar`（历法换算 / 星期 / ISO 周）、
   `std.os.iso8601`（解析与格式化，带偏移换算）、`std.os.duration`（时长串解析与
   格式化）、`std.os.cron`（五字段表达式 + 下次运行时间），集成示例

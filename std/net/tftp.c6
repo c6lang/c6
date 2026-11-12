@@ -1,0 +1,285 @@
+/* std/net/tftp：TFTP（RFC 1350 + 选项扩展）报文的解析与构造。
+ *
+ *     import std.net.tftp;
+ *
+ *     TftpMsg m = { 0 };
+ *     if (tftp_parse(buf, n, &m) == 1)
+ *         // m.opcode == TFTP_DATA、m.block、m.data_off/m.data_len
+ *
+ * 操作码（前 2 字节，大端）：
+ *
+ *     1 RRQ 读请求：文件名\0 模式\0 [选项\0 值\0]…
+ *     2 WRQ 写请求：同上
+ *     3 DATA 数据：块号(2) + 最多 512（或协商后的）字节
+ *     4 ACK  确认：块号(2)
+ *     5 ERROR 错误：错误码(2) + 消息\0
+ *     6 OACK 选项确认：选项\0 值\0 …
+ *
+ * 约定：
+ *
+ * - 所有字段是指向原缓冲区的视图（`Str`），不拷贝；
+ * - RRQ/WRQ 的模式一般是 `octet` 或 `netascii`；选项区从 `options` 起，
+ *   到报文末尾（含所有 `名称\0值\0` 对）；
+ * - `tftp_parse` 对 DATA 只切出数据区（`data_off`/`data_len`），不判块号连续性；
+ * - 构造函数：`tftp_build_rrq`/`tftp_build_wrq`（带 `octet` 模式）、
+ *   `tftp_build_data`、`tftp_build_ack`、`tftp_build_error`；
+ * - 容量不够一律返回 -1；不处理 TFTP 的重传与超时（那是调用方的事）。
+ */
+#include <string.h>
+
+module std.net.tftp;
+import std.core.types;
+import std.text.str;
+
+enum {
+    TFTP_RRQ = 1,
+    TFTP_WRQ = 2,
+    TFTP_DATA = 3,
+    TFTP_ACK = 4,
+    TFTP_ERROR = 5,
+    TFTP_OACK = 6
+};
+
+struct TftpMsg {
+    int opcode;
+    Str filename;
+    Str mode;
+    Str options;
+    int block;
+    int errcode;
+    Str errmsg;
+    int data_off;
+    int data_len;
+};
+
+static int tftp_be16(const u8 *p)
+{
+    return (int)(((u32)p[0] << 8) | (u32)p[1]);
+}
+
+static void tftp_put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xFF);
+    p[1] = (u8)(v & 0xFF);
+}
+
+/* 从 off 起找一个以 0 结尾的串；返回长度，*next 指向下一个字节 */
+static int tftp_str(const u8 *p, int n, int off, Str *out, int *next)
+{
+    int start = off, i = off;
+
+    while (i < n && p[i] != 0)
+        i++;
+    if (i >= n)
+        return -1;
+    out->s = (char[:]){ (char *)p + start, i - start };
+    *next = i + 1;
+    return 1;
+}
+
+int tftp_parse(const void *src, int n, TftpMsg *out)
+{
+    const u8 *p = (const u8 *)src;
+    int op = 0, next = 0;
+
+    if (!src || !out || n < 2)
+        return -1;
+    op = tftp_be16(p);
+    memset(out, 0, sizeof *out);
+    out->opcode = op;
+    if (op == TFTP_RRQ || op == TFTP_WRQ) {
+        if (tftp_str(p, n, 2, &out->filename, &next) != 1)
+            return -1;
+        if (tftp_str(p, n, next, &out->mode, &next) != 1)
+            return -1;
+        if (out->filename.s.len == 0 || out->mode.s.len == 0)
+            return -1;
+        if (next < n)
+            out->options.s = (char[:]){ (char *)p + next, n - next };
+        return 1;
+    }
+    if (op == TFTP_DATA) {
+        if (n < 4)
+            return -1;
+        out->block = tftp_be16(p + 2);
+        out->data_off = 4;
+        out->data_len = n - 4;
+        return 1;
+    }
+    if (op == TFTP_ACK) {
+        if (n != 4)
+            return -1;
+        out->block = tftp_be16(p + 2);
+        return 1;
+    }
+    if (op == TFTP_ERROR) {
+        if (n < 5)
+            return -1;
+        out->errcode = tftp_be16(p + 2);
+        if (tftp_str(p, n, 4, &out->errmsg, &next) != 1)
+            return -1;
+        return 1;
+    }
+    if (op == TFTP_OACK) {
+        if (n < 4)
+            return -1;
+        out->options.s = (char[:]){ (char *)p + 2, n - 2 };
+        return 1;
+    }
+    return -1;
+}
+
+int tftp_build_rrq(const char *name, void *dst, int cap)
+{
+    u8 *p = (u8 *)dst;
+    int o = 0, i = 0;
+
+    if (!name || !dst || cap < 4)
+        return -1;
+    if (2 + (int)strlen(name) + 1 + 5 + 1 > cap)
+        return -1;
+    tftp_put16(p, TFTP_RRQ);
+    o = 2;
+    for (i = 0; name[i]; i++)
+        p[o++] = (u8)name[i];
+    p[o++] = 0;
+    {
+        static const char *mode = "octet";
+
+        for (i = 0; mode[i]; i++)
+            p[o++] = (u8)mode[i];
+        p[o++] = 0;
+    }
+    return o;
+}
+
+int tftp_build_wrq(const char *name, void *dst, int cap)
+{
+    int n = tftp_build_rrq(name, dst, cap);
+
+    if (n <= 0)
+        return -1;
+    tftp_put16((u8 *)dst, TFTP_WRQ);
+    return n;
+}
+
+int tftp_build_data(int block, const void *data, int len, void *dst, int cap)
+{
+    if (!dst || len < 0 || block < 0 || block > 65535 || cap < 4 + len)
+        return -1;
+    if (len > 0 && !data)
+        return -1;
+    tftp_put16((u8 *)dst, TFTP_DATA);
+    tftp_put16((u8 *)dst + 2, block);
+    if (len > 0)
+        memcpy((u8 *)dst + 4, data, (size_t)len);
+    return 4 + len;
+}
+
+int tftp_build_ack(int block, void *dst, int cap)
+{
+    if (!dst || cap < 4 || block < 0 || block > 65535)
+        return -1;
+    tftp_put16((u8 *)dst, TFTP_ACK);
+    tftp_put16((u8 *)dst + 2, block);
+    return 4;
+}
+
+int tftp_build_error(int code, const char *msg, void *dst, int cap)
+{
+    u8 *p = (u8 *)dst;
+    int o = 4, i = 0;
+
+    if (!dst || code < 0 || code > 65535 || !msg)
+        return -1;
+    if (4 + (int)strlen(msg) + 1 > cap)
+        return -1;
+    tftp_put16(p, TFTP_ERROR);
+    tftp_put16(p + 2, code);
+    for (i = 0; msg[i]; i++)
+        p[o++] = (u8)msg[i];
+    p[o++] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "tftp：解析四种报文" {
+    TftpMsg m = { 0 };
+    static const char *rrq = "\x00\x01" "file.txt\x00" "octet\x00";
+
+    if (tftp_parse(rrq, 2 + 8 + 1 + 5 + 1, &m) != 1)
+        return err(1, "RRQ 解析失败");
+    if (m.opcode != TFTP_RRQ || m.filename.s.len != 8)
+        return err(2, "RRQ 文件名不对");
+    if (memcmp(m.filename.s.data, "file.txt", 8) != 0)
+        return err(3, "RRQ 文件名内容不对");
+    if (m.mode.s.len != 5 || memcmp(m.mode.s.data, "octet", 5) != 0)
+        return err(4, "RRQ 模式不对");
+    if (m.options.s.len != 0)
+        return err(5, "RRQ 不该有选项");
+    /* 带选项的 WRQ */
+    {
+        static const char *wrq =
+            "\x00\x02" "a.bin\x00" "octet\x00" "blksize\x00" "1024\x00";
+
+        if (tftp_parse(wrq, 2 + 5 + 1 + 5 + 1 + 7 + 1 + 4 + 1, &m) != 1)
+            return err(6, "WRQ 解析失败");
+        if (m.opcode != TFTP_WRQ || m.options.s.len != 13)
+            return err(7, "WRQ 选项区不对");
+    }
+    /* DATA：块 1，数据 "hello" */
+    {
+        static const u8 data_msg[9] = { 0, 3, 0, 1, 'h', 'e', 'l', 'l', 'o' };
+
+        if (tftp_parse(data_msg, 9, &m) != 1)
+            return err(8, "DATA 解析失败");
+        if (m.block != 1 || m.data_off != 4 || m.data_len != 5)
+            return err(9, "DATA 字段不对");
+        if (memcmp((const u8 *)data_msg + m.data_off, "hello", 5) != 0)
+            return err(10, "DATA 内容不对");
+    }
+    /* ACK 与 ERROR */
+    {
+        static const u8 ack[4] = { 0, 4, 0, 7 };
+        static const u8 errbuf[10] = { 0, 5, 0, 1, 'n', 'o', 'p', 'e', 0, 0 };
+
+        if (tftp_parse(ack, 4, &m) != 1 || m.block != 7)
+            return err(11, "ACK 不对");
+        if (tftp_parse(errbuf, 9, &m) != 1 || m.errcode != 1)
+            return err(12, "ERROR 不对");
+        if (m.errmsg.s.len != 4 || memcmp(m.errmsg.s.data, "nope", 4) != 0)
+            return err(13, "ERROR 消息不对");
+    }
+    if (tftp_parse("\x00\x09", 2, &m) != -1)
+        return err(14, "未知操作码应该 -1");
+    if (tftp_parse("\x00\x04\x00", 3, &m) != -1)
+        return err(15, "截断的 ACK 应该 -1");
+}
+
+test "tftp：构造" {
+    static u8 buf[64] = { 0 };
+    TftpMsg m = { 0 };
+    int n = 0;
+
+    n = tftp_build_rrq("file.txt", buf, (int)sizeof buf);
+    if (n != 17)
+        return err(16, "RRQ 长度不对");
+    if (tftp_parse(buf, n, &m) != 1 || m.opcode != TFTP_RRQ
+        || memcmp(m.filename.s.data, "file.txt", 8) != 0)
+        return err(17, "RRQ 往返不一致");
+    n = tftp_build_data(3, "abc", 3, buf, (int)sizeof buf);
+    if (n != 7 || tftp_parse(buf, n, &m) != 1 || m.block != 3
+        || m.data_len != 3)
+        return err(18, "DATA 构造不对");
+    if (tftp_build_ack(9, buf, (int)sizeof buf) != 4
+        || tftp_parse(buf, 4, &m) != 1 || m.block != 9)
+        return err(19, "ACK 构造不对");
+    n = tftp_build_error(2, "access violation", buf, (int)sizeof buf);
+    if (n != 4 + 17 || tftp_parse(buf, n, &m) != 1 || m.errcode != 2)
+        return err(20, "ERROR 构造不对");
+    if (tftp_build_rrq("x", buf, 8) != -1)
+        return err(21, "容量不够应该 -1");
+}

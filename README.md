@@ -340,6 +340,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/os/iso8601.c6         std.os.iso8601         ISO 8601：解析（Z/±HH:MM/小数秒）与格式化、epoch 互转
   std/os/duration.c6        std.os.duration        时长：1h30m / 500ms / 1.5h / H:MM:SS 解析与格式化（毫秒）
   std/os/cron.c6            std.os.cron            cron 五字段：*、*/n、a-b/n、列表、星期名，匹配与下次运行时间
+  std/net/ntp.c6            std.net.ntp            NTPv4：48 字节头、1900 纪元时间戳换算、RFC 5905 偏移/时延估计
+  std/net/syslog.c6         std.net.syslog         syslog：RFC 5424 与 RFC 3164 解析（PRI/设施/级别/结构化数据）、5424 构造
+  std/net/stun.c6           std.net.stun           STUN：位交错类型字段、TLV 属性、XOR-MAPPED-ADDRESS 解码与构造
+  std/net/tftp.c6           std.net.tftp           TFTP：RRQ/WRQ/DATA/ACK/ERROR/OACK 解析与构造
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -444,6 +448,7 @@ make std-ds       # 编译并运行 examples/stdstruct.c6（第四十五批基�
 make std-words    # 编译并运行 examples/stdwords.c6（第四十六批文本变换模块的拼装示例）
 make std-math2    # 编译并运行 examples/stdnumeric.c6（第四十七批数值工具模块的拼装示例，链接带 -lm）
 make std-time     # 编译并运行 examples/stdtime.c6（第四十八批时间工具模块的拼装示例）
+make std-packet   # 编译并运行 examples/stdpacket.c6（第四十九批网络报文模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在
