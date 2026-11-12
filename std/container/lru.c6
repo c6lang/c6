@@ -1,0 +1,432 @@
+/* std/container/lru：LRU 缓存（借用调用方数组，O(1) get/put，零分配）。
+ *
+ *     import std.container.lru;
+ *
+ *     u64 keys[4]; int vals[4], prev[4], next[4], hnext[4], ht[8];
+ *     Lru l = { 0 };
+ *     lru_init(&l, 4, 8, keys, vals, prev, next, hnext, ht);
+ *     l.put(42, 7);
+ *     int v = 0;
+ *     if (l.get(42, &v)) { // v == 7 }
+ *
+ * 结构是教科书上的那套：哈希表（链式，桶数必须是 2 的幂）+ 双向链表（头是最新、
+ * 尾是最旧）。`get` 命中把条目挪到头部；`put` 满了就淘汰尾部。所有数组都由
+ * 调用方给：
+ *
+ * | 数组 | 长度 | 用途 |
+ * | --- | --- | --- |
+ * | `keys` | cap | 键（u64） |
+ * | `vals` | cap | 值（int） |
+ * | `prev`/`next` | cap | LRU 双向链表 |
+ * | `hnext` | cap | 哈希桶里的链 |
+ * | `ht` | htsize | 桶头（槽位下标，-1 空） |
+ *
+ * 约定：
+ *
+ * - `lru_init` 要求 `cap >= 1`、`htsize` 是 2 的幂且 `htsize >= 2*cap`（冲突率
+ *   合适）；不满足返回 0。
+ * - `get` 命中返回 1 并写 `*out`，未命中返回 0（`misses` 加一）；`peek` 只看
+ *   不动 LRU 顺序、也不计命中。
+ * - `put` 新键返回 1、覆盖已有键返回 0、参数非法返回 -1；满了先淘汰最旧的
+ *   （`evicts` 加一）。
+ * - `remove` 删除键（1/0）；槽位回收后可以复用。`size`/`capacity`/`is_empty` 看状态。
+ * - 统计字段 `hits`/`misses`/`evicts` 直接读；`clear` 清空但不改容量。
+ * - 键是 u64（字符串键先自己哈希），值是 int（要放指针就转一下）。
+ */
+#include <string.h>
+
+module std.container.lru;
+import std.core.types;
+
+struct Lru {
+    int cap;
+    int count;
+    int htsize;
+    u32 mask;
+    int free;                    /* 空闲槽位链的头（用 next 串起来） */
+    int head;                    /* LRU 头（最新） */
+    int tail;                    /* LRU 尾（最旧） */
+    u64 *keys;
+    int *vals;
+    int *prev;
+    int *next;
+    int *hnext;
+    int *ht;
+    int hits;
+    int misses;
+    int evicts;
+};
+
+static u64 lru_mix(u64 x)
+{
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+/* 初始化；参数非法返回 0 */
+int lru_init(Lru *self, int cap, int htsize, u64 *keys, int *vals, int *prev,
+             int *next, int *hnext, int *ht)
+{
+    int i = 0;
+
+    if (!self || cap < 1 || htsize < 2 || !keys || !vals || !prev || !next
+        || !hnext || !ht)
+        return 0;
+    if ((htsize & (htsize - 1)) != 0 || htsize < cap * 2)
+        return 0;
+    memset(self, 0, sizeof *self);
+    self->cap = cap;
+    self->htsize = htsize;
+    self->mask = (u32)(htsize - 1);
+    self->keys = keys;
+    self->vals = vals;
+    self->prev = prev;
+    self->next = next;
+    self->hnext = hnext;
+    self->ht = ht;
+    self->head = -1;
+    self->tail = -1;
+    self->free = -1;
+    for (i = 0; i < htsize; i++)
+        ht[i] = -1;
+    /* 空闲链：0 -> 1 -> ... -> cap-1 */
+    for (i = cap - 1; i >= 0; i--) {
+        next[i] = self->free;
+        prev[i] = -1;
+        hnext[i] = -1;
+        self->free = i;
+    }
+    return 1;
+}
+
+int size(Lru *self) { return self ? self->count : 0; }
+
+int capacity(Lru *self) { return self ? self->cap : 0; }
+
+int is_empty(Lru *self) { return !self || self->count == 0; }
+
+/* 找槽位；没有返回 -1 */
+static int lru_slot(Lru *self, u64 key)
+{
+    int b = 0;
+    int s = 0;
+
+    if (!self || !self->ht || self->cap <= 0)
+        return -1;
+    b = (int)(lru_mix(key) & (u64)self->mask);
+    s = self->ht[b];
+
+    while (s >= 0) {
+        if (self->keys[s] == key)
+            return s;
+        s = self->hnext[s];
+    }
+    return -1;
+}
+
+static void lru_list_unlink(Lru *self, int s)
+{
+    int p = self->prev[s], n = self->next[s];
+
+    if (p >= 0)
+        self->next[p] = n;
+    else
+        self->head = n;
+    if (n >= 0)
+        self->prev[n] = p;
+    else
+        self->tail = p;
+    self->prev[s] = -1;
+    self->next[s] = -1;
+}
+
+static void lru_list_front(Lru *self, int s)
+{
+    self->prev[s] = -1;
+    self->next[s] = self->head;
+    if (self->head >= 0)
+        self->prev[self->head] = s;
+    self->head = s;
+    if (self->tail < 0)
+        self->tail = s;
+}
+
+static void lru_hash_remove(Lru *self, int s)
+{
+    int b = (int)(lru_mix(self->keys[s]) & (u64)self->mask);
+    int cur = self->ht[b], pre = -1;
+
+    while (cur >= 0) {
+        if (cur == s) {
+            if (pre < 0)
+                self->ht[b] = self->hnext[cur];
+            else
+                self->hnext[pre] = self->hnext[cur];
+            self->hnext[s] = -1;
+            return;
+        }
+        pre = cur;
+        cur = self->hnext[cur];
+    }
+}
+
+static void lru_hash_add(Lru *self, int s)
+{
+    int b = (int)(lru_mix(self->keys[s]) & (u64)self->mask);
+
+    self->hnext[s] = self->ht[b];
+    self->ht[b] = s;
+}
+
+/* 命中返回 1 并写 *out；未命中 0 */
+int get(Lru *self, u64 key, int *out)
+{
+    int s = 0;
+
+    if (!self || !out || !self->ht || self->cap <= 0)
+        return 0;
+    s = lru_slot(self, key);
+    if (s < 0) {
+        self->misses++;
+        return 0;
+    }
+    self->hits++;
+    if (self->head != s) {
+        lru_list_unlink(self, s);
+        lru_list_front(self, s);
+    }
+    *out = self->vals[s];
+    return 1;
+}
+
+/* 只看不挪；命中返回 1 并写 *out */
+int peek(Lru *self, u64 key, int *out)
+{
+    int s = 0;
+
+    if (!self || !out || !self->ht || self->cap <= 0)
+        return 0;
+    s = lru_slot(self, key);
+    if (s < 0)
+        return 0;
+    *out = self->vals[s];
+    return 1;
+}
+
+/* 新键返回 1，覆盖返回 0，参数非法 -1 */
+int put(Lru *self, u64 key, int val)
+{
+    int s = 0;
+
+    if (!self || !self->ht || !self->keys || self->cap <= 0)
+        return -1;
+    s = lru_slot(self, key);
+    if (s >= 0) {
+        self->vals[s] = val;
+        lru_list_unlink(self, s);
+        lru_list_front(self, s);
+        return 0;
+    }
+    if (self->count >= self->cap) {
+        /* 淘汰最旧的槽位并复用 */
+        int victim = self->tail;
+
+        lru_list_unlink(self, victim);
+        lru_hash_remove(self, victim);
+        self->keys[victim] = key;
+        self->vals[victim] = val;
+        lru_hash_add(self, victim);
+        lru_list_front(self, victim);
+        self->evicts++;
+        return 1;
+    }
+    s = self->free;
+    if (s < 0)
+        return -1;               /* 理论上不会：count < cap 时一定有空槽 */
+    self->free = self->next[s];
+    self->keys[s] = key;
+    self->vals[s] = val;
+    self->hnext[s] = -1;
+    lru_hash_add(self, s);
+    lru_list_front(self, s);
+    self->count++;
+    return 1;
+}
+
+/* 删除：1 = 删了，0 = 没有 */
+int remove(Lru *self, u64 key)
+{
+    int s = 0;
+
+    if (!self || !self->ht || self->cap <= 0)
+        return 0;
+    s = lru_slot(self, key);
+    if (s < 0)
+        return 0;
+    lru_list_unlink(self, s);
+    lru_hash_remove(self, s);
+    self->next[s] = self->free;
+    self->free = s;
+    self->count--;
+    return 1;
+}
+
+/* 清空（容量和统计保留） */
+void clear(Lru *self)
+{
+    int i = 0;
+
+    if (!self)
+        return;
+    for (i = 0; i < self->htsize; i++)
+        self->ht[i] = -1;
+    self->head = -1;
+    self->tail = -1;
+    self->free = -1;
+    self->count = 0;
+    for (i = self->cap - 1; i >= 0; i--) {
+        self->next[i] = self->free;
+        self->prev[i] = -1;
+        self->hnext[i] = -1;
+        self->free = i;
+    }
+}
+
+/* ---- 自测 ---- */
+
+struct LTest {
+    Lru l;
+    u64 keys[4];
+    int vals[4];
+    int prev[4];
+    int next[4];
+    int hnext[4];
+    int ht[8];
+};
+
+static int lt_init(struct LTest *t, int cap, int hs)
+{
+    memset(t, 0, sizeof *t);
+    return lru_init(&t->l, cap, hs, t->keys, t->vals, t->prev, t->next,
+                    t->hnext, t->ht);
+}
+
+test "基本 get/put 与 LRU 顺序" {
+    struct LTest t = { 0 };
+    int v = 0;
+
+    if (!lt_init(&t, 2, 8))
+        return err(1, "初始化");
+    if (t.l.put(1, 10) != 1 || t.l.put(2, 20) != 1)
+        return err(2, "插入");
+    if (t.l.size() != 2 || t.l.capacity() != 2)
+        return err(3, "计数");
+    /* 命中 1，把它变成最新 */
+    if (!t.l.get(1, &v) || v != 10)
+        return err(4, "命中 1");
+    /* 插入 3 时应该淘汰 2（最旧） */
+    if (t.l.put(3, 30) != 1 || t.l.evicts != 1)
+        return err(5, "淘汰");
+    if (t.l.get(2, &v))
+        return err(6, "2 已被淘汰");
+    if (!t.l.get(1, &v) || v != 10 || !t.l.get(3, &v) || v != 30)
+        return err(7, "留下的两个");
+    if (t.l.hits != 3 || t.l.misses != 1)
+        return err(8, "命中统计");
+    /* 覆盖已有键：返回值 0，不增加计数 */
+    if (t.l.put(1, 11) != 0 || t.l.size() != 2)
+        return err(9, "覆盖");
+    if (!t.l.get(1, &v) || v != 11)
+        return err(10, "覆盖后的值");
+}
+
+test "peek / remove / clear" {
+    struct LTest t = { 0 };
+    int v = 0;
+
+    if (!lt_init(&t, 2, 8))
+        return err(11, "初始化");
+    t.l.put(1, 10);
+    t.l.put(2, 20);
+    /* peek 不改变顺序：1 仍是最旧，插入 3 会淘汰 1 */
+    if (!t.l.peek(1, &v) || v != 10)
+        return err(12, "peek");
+    if (t.l.hits != 0)
+        return err(13, "peek 不计命中");
+    t.l.put(3, 30);
+    if (t.l.get(1, &v))
+        return err(14, "peek 之后 1 仍被淘汰");
+    /* remove */
+    if (!t.l.remove(3) || t.l.size() != 1)
+        return err(15, "remove");
+    if (t.l.remove(3) != 0)
+        return err(16, "重复 remove");
+    /* 删除后槽位可复用 */
+    if (t.l.put(4, 40) != 1 || !t.l.get(4, &v) || v != 40)
+        return err(17, "槽位复用");
+    /* clear */
+    t.l.clear();
+    if (t.l.size() != 0 || t.l.get(2, &v))
+        return err(18, "clear");
+    if (t.l.put(5, 50) != 1)
+        return err(19, "clear 后插入");
+}
+
+test "参数与冲突" {
+    struct LTest t = { 0 };
+
+    /* 非法初始化 */
+    if (lt_init(&t, 0, 8))
+        return err(20, "cap 0");
+    if (lt_init(&t, 2, 3))
+        return err(21, "htsize 不是 2 的幂");
+    if (lt_init(&t, 2, 2))
+        return err(22, "htsize 太小");
+    {
+        Lru bad = { 0 };
+
+        if (lru_init((Lru *)0, 2, 8, t.keys, t.vals, t.prev, t.next, t.hnext,
+                     t.ht))
+            return err(23, "空指针");
+        if (bad.get(1, (int *)0) || bad.put(1, 1) != -1)
+            return err(24, "未初始化的对象");
+    }
+    /* 小哈希表 + 连续键：强制冲突后依旧正确 */
+    {
+        struct LTest c = { 0 };
+
+        if (!lt_init(&c, 4, 8))
+            return err(25, "冲突用初始化");
+        {
+            u64 k = 0;
+            int v = 0;
+
+            for (k = 0; k < 4; k++)
+                c.l.put(k * 8, (int)k);
+            for (k = 0; k < 4; k++) {
+                if (!c.l.get(k * 8, &v) || v != (int)k)
+                    return err(26, "冲突下的查找");
+            }
+        }
+    }
+    /* 单槽容量：每次插入都淘汰 */
+    {
+        struct LTest s = { 0 };
+
+        if (!lt_init(&s, 1, 8))
+            return err(27, "cap 1");
+        s.l.put(1, 1);
+        if (s.l.put(2, 2) != 1 || s.l.evicts != 1 || s.l.size() != 1)
+            return err(28, "cap 1 的淘汰");
+        {
+            int v = 0;
+
+            if (s.l.get(1, &v))
+                return err(29, "cap 1 旧键不在");
+        }
+    }
+}

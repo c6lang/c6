@@ -14,7 +14,7 @@
 | --- | --- |
 | `std/core/` | 基础：定宽类型、错误码、内存、数学、位运算、哈希、随机 |
 | `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
-| `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序 |
+| `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
@@ -91,6 +91,10 @@
 | `std/container/list.c6` | `std.container.list` | 侵入式双向链表 `List`/`ListNode`：`init`/`push_back`/`push_front`/`pop_front`/`pop_back`/`remove`/`clear`/`contains`、`ListIter` 的 `has`/`next` |
 | `std/container/ring.c6` | `std.container.ring` | 借用调用方数组的固定容量环形队列 `Ring`：`ring_make`、`push`（满不覆盖）/`pop`/`peek`/`at`/`clear`、`count`/`capacity`/`is_empty`/`is_full` |
 | `std/container/span.c6` | `std.container.span` | 别人内存上的窗口 `Span@T`（纯值，零拷贝） |
+| `std/container/graph.c6` | `std.container.graph` | 邻接表图（前向星，借用调用方数组）：`graph_init`/`add_edge`、`Graph` 的 `bfs`（无权最短路）/`dfs`（迭代前序，显式栈）/`toposort`（Kahn，有环返回 0）/`components`（并查集弱连通分量）/`dijkstra`（非负权 + `prev` 回溯链）；队列/栈/工作区都由调用方给 |
+| `std/container/lru.c6` | `std.container.lru` | LRU 缓存（链式哈希表 + 双向链表，O(1)）：`lru_init`、`Lru` 的 `get`（命中挪到头部）/`peek`（不动顺序）/`put`（满了淘汰尾部）/`remove`/`clear`/`size`/`capacity`/`is_empty`；`hits`/`misses`/`evicts` 统计；数组全由调用方给 |
+| `std/container/region.c6` | `std.container.region` | 半开区间 `[lo, hi)` 集合：`region_init`、`Region` 的 `add`（重叠与相邻合并、失败不改内容）/`contains`（二分）/`overlaps`（相邻不算）/`find_gap`（第一个够长的空隙，带溢出保护）/`total`/`count_region`/`clear`；i64 坐标、允许负数 |
+| `std/container/trie.c6` | `std.container.trie` | 字节前缀树（节点池由调用方给）：`trie_init`、`Trie` 的 `put`（新键 1/覆盖 0/池满 -1）/`get`/`has_prefix`/`remove`（只清词尾标记）/`clear`/`size`/`node_count`；键是任意字节序列（含 `\0`，长度显式传） |
 | `std/container/vec.c6` | `std.container.vec` | 会长的数组 `Vect@T`（托管引用，`new` 出来）与 `Iter@T`：`push`/`pop`、`insert`/`remove_at`/`truncate`、`first`/`last`、`index_of`/`contains`、`reverse`、`slice`/`extend`、`sort`/`sort_lex`、`each`/`filter`/`fold` |
 
 **`std/os/`**（操作系统：流、文件系统、路径、环境变量、时间）
@@ -172,6 +176,7 @@
 | `examples/stdconf.c6` | （无模块） | 第十五批（配置与文档格式）的拼装示例（`make std-conf`）：toml 读配置、xml 扫文档、query 解析/构建查询串、template 生成报告，自带自检 |
 | `examples/stdcli.c6` | （无模块） | 第十六批（命令行工具基础）的拼装示例（`make std-cli`）：args 解析参数、natural 排序与人类可读化、table 排版、proc 跑子进程，自带自检 |
 | `examples/stdwire.c6` | （无模块） | 第十七批（网络协议基础）的拼装示例（`make std-wire`）：sha1 向量、ws 握手/分帧、dns 查询与响应、loopback TCP 往返，自带自检 |
+| `examples/stdalgo.c6` | （无模块） | 第十八批（算法与容器）的拼装示例（`make std-algo`）：依赖拓扑排序 + 最短路、LRU 缓存、命令前缀树、地址区间，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -2061,6 +2066,87 @@ cli.close_socket();
 * 名字避开 libc 的 `send`/`recv`/`close`/`accept`（同名会与系统头冲突）。
 * 不做 TLS；DNS 报文用 `std.net.dns`，WebSocket 分帧用 `std.net.ws`。
 
+### `graph`：邻接表图算法
+
+```c
+import std.container.graph;
+
+int head[5] = { 0 }, next[8] = { 0 }, to[8] = { 0 }, w[8] = { 0 };
+Graph g = { 0 };
+graph_init(&g, 5, head, next, to, w, 8);
+g.add_edge(0, 1, 4);
+
+int dist[5] = { 0 }, prev[5] = { 0 }, heap[5] = { 0 }, pos[5] = { 0 };
+g.dijkstra(0, dist, heap, pos, prev);
+```
+
+* 表示是**前向星**：每个顶点一条边的链表（`head[u]` → `next[e]`），`add_edge`
+  是 O(1)，遍历邻居顺着链表走。所有数组都由调用方给。
+* `bfs`：无权最短路（每条边算 1），不可达是 `GRAPH_INF`；`dfs`：迭代前序
+  （显式栈，避免深图递归爆栈）。
+* `toposort`：Kahn 算法，有环返回 0；`components`：并查集算弱连通分量。
+* `dijkstra`：非负权最短路 + `prev` 回溯链（负权返回 -1）；堆和 `pos` 是
+  调用方给的 n 个 int 工作区。
+* 队列/栈/工作区放不下时返回 -1。
+
+### `lru`：LRU 缓存
+
+```c
+import std.container.lru;
+
+u64 keys[4]; int vals[4], prev[4], next[4], hnext[4], ht[8];
+Lru l = { 0 };
+lru_init(&l, 4, 8, keys, vals, prev, next, hnext, ht);
+l.put(42, 7);
+int v = 0;
+l.get(42, &v);          /* 命中，顺手挪到最近使用 */
+```
+
+* 哈希表（链式）+ 双向链表：`get`/`put`/`remove` 都是 O(1)；`put` 满了淘汰
+  最旧的（`evicts` 加一）。
+* `peek` 只看不动顺序、也不计命中；`get` 未命中 `misses` 加一。
+* `lru_init` 要求 `cap >= 1`、`htsize` 是 2 的幂且 `htsize >= 2*cap`。
+* 统计字段 `hits`/`misses`/`evicts` 直接读；键是 u64、值是 int。
+
+### `trie`：字节前缀树
+
+```c
+import std.container.trie;
+
+TrieNode pool[64] = { 0 };
+Trie t = { 0 };
+trie_init(&t, pool, 64);
+t.put("git", 3, 1);
+t.put("git add", 7, 2);
+t.has_prefix("git ", 4);        /* 1 */
+```
+
+* 节点是「边上的字节 + 子节点链（first/next 兄弟）」，键可以是任意字节序列
+  （含 `\0`，长度显式传），所以也能当二进制前缀索引用。
+* `put`：新键 1、覆盖 0、节点池满 -1（不写坏已有结构）；`remove` 只清词尾标记，
+  不回收共享节点；`has_prefix` 判「有没有以它开头的键」。
+* `size` 是不同键数、`node_count` 是已用节点数。
+
+### `region`：区间集合
+
+```c
+import std.container.region;
+
+i64 lo[8] = { 0 }, hi[8] = { 0 };
+Region r = { 0 };
+region_init(&r, lo, hi, 8);
+r.add(0, 10);
+r.add(10, 20);                  /* 相邻，合并成 [0, 20) */
+r.contains(19);                 /* 1；contains(20) 是 0 */
+```
+
+* 按 `lo` 升序保存**互不重叠**的半开区间；`add` 会合并重叠与相邻的段，失败
+  （放不下/`hi <= lo`）不改动已有内容。
+* `contains` 二分查找；`overlaps` 只看真正相交（相邻不算）。
+* `find_gap(from, len)` 找第一个 `[g, g+len)` 完全落在空隙里且 `g >= from` 的
+  位置（带 `from + len` 溢出保护）。
+* 坐标是 i64、允许负数；`total` 是所有段长度之和。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -2456,6 +2542,29 @@ RFC 6455 的 `Sec-WebSocket-Accept` 向量，再编码一帧带掩码的文本�
 返回 0。Makefile 里显式列出八个模块正文（ws 依赖 sha1+base64+err，其余只依赖
 types）。
 
+### 集成示例：`examples/stdalgo.c6`
+
+```sh
+make std-algo
+```
+
+```
+stdalgo: 标准库第十八批（graph / lru / trie / region）
+graph: 拓扑序 0 2 1 3 4
+graph: 到 1/2/3 的最短距离 = 3/1/4（经 2,1）
+lru: size=3 hits=4 misses=2 evicts=1
+trie: 5 个命令、18 个节点；"git " 前缀命中
+region: 1 段、共 0x3000 字节，空隙在 0x2000
+stdalgo: 26 check(s), 0 failure(s)
+```
+
+四节：「图」给一条构建依赖链做拓扑排序（并验每条边都满足顺序），再在带权图上
+跑 Dijkstra（距离 3/1/4 与前驱链）；「LRU」容量 3，命中/未命中/淘汰后检查统计；
+「前缀树」放 5 条命令，查 `git`/`git commit` 与 `"git "` 前缀，再删 `go` 确认
+`gofmt` 还在；「区间」加两段地址、查半开区间的边界、找 0x2000 处的空隙，再把
+两段桥接成一段。Makefile 里显式列出六个模块正文（四个模块都只依赖
+`std/core/types.c6`）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2485,6 +2594,8 @@ types）。
 * `make std-cli`：`examples/stdcli.c6`，第十六批（命令行工具基础）模块的拼装
   示例（自带自检）。
 * `make std-wire`：`examples/stdwire.c6`，第十七批（网络协议基础）模块的拼装
+  示例（自带自检）。
+* `make std-algo`：`examples/stdalgo.c6`，第十八批（算法与容器）模块的拼装
   示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
