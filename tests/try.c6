@@ -232,6 +232,34 @@ static int!error tdefer(int n)
     return n;
 }
 
+/* 浮点返回类型的 T!error：失败路径写回全零（+0.0），不占 '-1' 哨兵 */
+static double!error dfetch(int n)
+{
+    if (n < 0)
+        return err(210, "negative double");
+    return n * 1.5;
+}
+
+static double!error dpropagate(int n)
+{
+    double v = (try dfetch(n));
+    return v + 1.0;
+}
+
+static float!error ffetch(int n)
+{
+    if (n != 0)
+        return err(211, "bad float");
+    return 1.5f;
+}
+
+static long double!error ldfetch(int n)
+{
+    if (n != 0)
+        return err(212, "bad long double");
+    return 3.5L;
+}
+
 /* ==== 单点语义断言 ==== */
 
 test "try 在成功路径上原样传出返回值" {
@@ -431,6 +459,55 @@ test "声明符后的 !error 标记与原型一致" {
     if (call_propagates(3) != 31) return err(1, "原型标记后的成功路径返回值不是 31");
     if ((try fetch2(4)) != 5) return err(2, "fetch2(4) 的返回值不是 5");
     if (__tcc_err_flag_get()) return err(3, "成功路径不应置错误标记");
+}
+
+/* 浮点返回类型不再被 C9 拒绝：成功值、错误码、消息都按普通 T!error 走 */
+test "double!error 支持成功与错误路径" {
+    __tcc_err_clear();
+    double d = dfetch(2) catch e { return err(1, "成功路径不该失败"); };
+    if (d != 3.0) return err(2, "double 成功路径的值不对");
+    if (__tcc_err_flag_get()) return err(3, "成功路径不应置错误标记");
+    dfetch(-1) catch e {
+        if (e.id != 210) return err(4, "double 的错误码不对");
+        if (strcmp(e.msg, "negative double")) return err(5, "double 的错误消息不对");
+        return 0;
+    };
+    return err(6, "double 的错误路径没有进入 catch");
+}
+
+test "try 在 double!error 里传播错误" {
+    __tcc_err_clear();
+    if ((try dpropagate(4)) != 7.0) return err(1, "传播后的成功值不对");
+    dpropagate(-2) catch e {
+        if (e.id != 210) return err(2, "传播后的错误码不对");
+        if (strcmp(e.msg, "negative double")) return err(3, "传播后的错误消息不对");
+        return 0;
+    };
+    return err(4, "double 的 try 没有把错误传出来");
+}
+
+test "float!error 也能用" {
+    __tcc_err_clear();
+    float f = ffetch(0) catch e { return err(1, "float 的成功路径失败了"); };
+    if (f != 1.5f) return err(2, "float 成功路径的值不对");
+    ffetch(1) catch e {
+        if (e.id != 211) return err(3, "float 的错误码不对");
+        if (strcmp(e.msg, "bad float")) return err(4, "float 的错误消息不对");
+        return 0;
+    };
+    return err(5, "float 的错误路径没有进入 catch");
+}
+
+test "long double!error 也能用" {
+    __tcc_err_clear();
+    long double ld = ldfetch(0) catch e { return err(1, "long double 的成功路径失败了"); };
+    if (ld != 3.5L) return err(2, "long double 成功路径的值不对");
+    ldfetch(1) catch e {
+        if (e.id != 212) return err(3, "long double 的错误码不对");
+        if (strcmp(e.msg, "bad long double")) return err(4, "long double 的错误消息不对");
+        return 0;
+    };
+    return err(5, "long double 的错误路径没有进入 catch");
 }
 
 /* 对应 9 flag=0 id=0 / final flag=0 */

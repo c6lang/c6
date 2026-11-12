@@ -16354,9 +16354,11 @@ static void c6_errdefer_parse(void)
 /* Emit the error-path exit of the current function: build the sentinel
    value of the declared return type, run this frame's errdefer/defer in
    reverse order and return the sentinel.  Used by 'err()' and by 'try'. */
-/* 'memset(local + OFF, 0, SIZE)'.  An aggregate 'T!error' value cannot be
-   '-1', and it does not need to be: the error is reported through the error
-   slot, so the value itself is never observed. */
+/* 'memset(local + OFF, 0, SIZE)'.  An aggregate or floating-point 'T!error'
+   value cannot be '-1', and it does not need to be: the error is reported
+   through the error slot, so the value itself is never observed.  All-zero
+   bits are +0.0 for every IEEE float format, so the same memset serves both
+   aggregates and 'float' / 'double' / 'long double'. */
 static void c6_zero_local(int off, int size)
 {
     vpush_helper_func(TOK_memset);
@@ -16390,7 +16392,7 @@ static void c6_emit_propagate(void)
         loc = (loc - size) & -align;
         ret_off = loc;
         ret_saved = 1;
-        if ((func_vt.t & VT_BTYPE) == VT_STRUCT) {
+        if ((func_vt.t & VT_BTYPE) == VT_STRUCT || is_float(func_vt.t)) {
             c6_zero_local(ret_off, size);
         } else {
             vpushi(TCC_ERR_SENTINEL);
@@ -19771,7 +19773,7 @@ static void c6_async_propagate(void)
     CType vt = c6_async_ftype.ref->type;
 
     if ((vt.t & VT_BTYPE) != VT_VOID) {
-        if ((vt.t & VT_BTYPE) == VT_STRUCT) {
+        if ((vt.t & VT_BTYPE) == VT_STRUCT || is_float(vt.t)) {
             int align = 0, size = type_size(&vt, &align), off = 0;
             int saved = c6_value_fallible;
             c6_async_push_field(c6_async_name, "val", 0);
@@ -23370,14 +23372,18 @@ static void c6_apply_fallible(CType *type)
     if ((ft->t & VT_BTYPE) != VT_FUNC || !ft->ref)
         tcc_error("'!error' requires a function declarator");
     bt = ft->ref->type.t & VT_BTYPE;
-    /* a scalar carries the '-1' sentinel, an aggregate is zeroed: what a
-       'T!error' function reports is the error slot, never the value, so the
-       error value of an aggregate is never observed.  Only types that cannot
-       be built at all are rejected. */
-    if (!(bt == VT_VOID || bt == VT_PTR || bt == VT_BOOL
-          || (bt >= VT_BYTE && bt <= VT_LLONG)
-          || bt == VT_STRUCT
-          || IS_ENUM(ft->ref->type.t))) {
+    /* What a 'T!error' function reports is the error slot, never the value:
+       integer-like scalars carry the '-1' sentinel, aggregates and
+       floating-point scalars are zeroed (all-zero bits are +0.0).  Every type
+       C lets a function return by value is accepted; arrays are not a return
+       type in C, and letting one through would take the scalar sentinel path
+       with an aggregate-sized object. */
+    if ((ft->ref->type.t & VT_ARRAY)
+        || !(bt == VT_VOID || bt == VT_PTR || bt == VT_BOOL
+             || (bt >= VT_BYTE && bt <= VT_LLONG)
+             || bt == VT_STRUCT
+             || IS_ENUM(ft->ref->type.t)
+             || is_float(ft->ref->type.t))) {
         char ebuf[256] = {0};
         type_to_str(ebuf, sizeof ebuf, &ft->ref->type, NULL);
         tcc_error("'!error' does not support a '%s' return type", ebuf);

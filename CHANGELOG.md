@@ -28,6 +28,18 @@
 - **修正过期状态**：`gc-design.md` 的「设计定稿待编码」改为已落地（P0–P8）。
 - **`make help`** 从打印 20 行注释改为打印完整目标清单（37 个目标，按用途分组）。
 
+### 语言与编译器
+
+- **`!error` 支持浮点返回类型**：`float` / `double` / `long double` 现在可以作
+  `!error` 的返回类型（C9 原先直接拒绝）。失败路径的返回值仍然只承载成功路径、
+  永远不可观测：整数类标量继续用 `-1` 哨兵，聚合类型和浮点标量改为清零（全零
+  位型对 IEEE 浮点就是 `+0.0`），native 与 C99 后端、普通函数与 `async` 体走
+  同一条规则。数组不是 C 的返回类型，`A!error f(void)` 仍在声明处报
+  `'!error' does not support a 'int [3]' return type`。`tests/try.c6` 加了
+  double / float / long double 的成功、失败与 `try` 传播用例，
+  `tests/errors/try.c6` 把原来的 float 拒绝用例换成数组拒绝用例；
+  `docs/manual/errors.md`、`grammar.md` R22、`diagnostics.md` C9 同步。
+
 ### 标准库
 
 - **标准库方法化**：`std/` 的普通结构体方法去掉 `reader_`/`writer_`/`cfile_`/`sha256_`/
