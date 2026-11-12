@@ -1,0 +1,538 @@
+/* std/core/fixed：没有 FPU 时用的定点数（Q16.16 与 Q15）。
+ *
+ *     import std.core.fixed;
+ *
+ *     Fix a = fix_from_int(3);
+ *     Fix b = fix_from_frac(1, 2);          // 0.5
+ *     Fix c = a.mul(b);                     // 1.5
+ *     int i = c.to_int();                   // 1
+ *     Fix s = fix_from_int(2).sqrt();       // 1.4142…（raw 92681 / 92682）
+ *     Q15 q = q15_from_f64(0.5);
+ *     Q15 r = q.mul(q);                     // 0.25
+ *
+ * Q16.16 把 `i32` 当成「高 16 位整数、低 16 位小数」：范围 ±32768，分辨率
+ * 1/65536 ≈ 1.5e-5。乘除法的中间结果走 `i64`，结果四舍五入（.5 远离 0），
+ * 溢出时**饱和**到 `I32_MAX`/`I32_MIN` 而不是回绕——控制环里回绕一次就是
+ * 反向满舵。`div` 除数为 0 返回 0，`sqrt` 负数返回 0（都不设错误槽，和
+ * `std.core.math` 的浮点版一样按「无意义输入给 0」处理）。
+ *
+ * `sin`/`cos` 是 Taylor 到 x^9 的定点实现（先规约到 [-π/2, π/2] 再按象限
+ * 还原），误差 < 1e-5，不查表、不链 libm；π/2 的整数倍是精确值。需要更高
+ * 精度就自己上 CORDIC 或查表，这里的目标是「小 MCU 上能跑」。
+ *
+ * Q15 是 DSP 里更常见的 `i16` 定点：1.0 = 32767、-1.0 = -32768，乘法的
+ * 中间结果是 `i32`，同样饱和。`Q15` 和 `Fix` 的方法同名（`mul`/`add_sat`/
+ * `sub_sat`），按接收者区分，互不影响。
+ */
+module std.core.fixed;
+import std.core.types;
+
+enum FixConst {
+    FIX_ONE     = 65536,    /* 1.0 的 raw */
+    FIX_HALF    = 32768,    /* 0.5 的 raw，也是四舍五入的偏移 */
+    FIX_PI      = 205887,   /* π * 65536，四舍五入 */
+    FIX_HALF_PI = 102944,   /* π/2 * 65536，四舍五入 */
+    FIX_TWO_PI  = 411775,   /* 2π * 65536，四舍五入 */
+};
+
+/* 把 64 位中间结果夹回 i32（所有溢出路径都走这里）。 */
+static i32 sat_i64(i64 v)
+{
+    if (v > (i64)I32_MAX)
+        return I32_MAX;
+    if (v < (i64)I32_MIN)
+        return I32_MIN;
+    return (i32)v;
+}
+
+/* a * b（都是 Q16.16）：先算 64 位积，再四舍五入右移 16。 */
+static i32 fmul(i32 a, i32 b)
+{
+    i64 p = (i64)a * (i64)b;
+
+    if (p >= 0)
+        p = (p + FIX_HALF) >> 16;
+    else
+        p = -((-p + FIX_HALF) >> 16);
+    return sat_i64(p);
+}
+
+/* 整数平方根（二进制恢复法，不链 libm）：isqrt64(4) == 2。 */
+static u64 isqrt64(u64 v)
+{
+    u64 r = 0;
+    u64 bit = 1ull << 62;
+
+    while (bit > v)
+        bit >>= 2;
+    while (bit != 0ull) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    return r;
+}
+
+struct Fix {
+    i32 raw;                /* 高 16 位整数、低 16 位小数 */
+};
+
+Fix fix_from_raw(i32 raw)
+{
+    Fix f = { 0 };
+
+    f.raw = raw;
+    return f;
+}
+
+Fix fix_from_int(int v)
+{
+    Fix f = { 0 };
+
+    f.raw = sat_i64((i64)v * FIX_ONE);
+    return f;
+}
+
+/* num / den：den 为 0 给 0；结果向零截断。 */
+Fix fix_from_frac(int num, int den)
+{
+    Fix f = { 0 };
+
+    if (den == 0)
+        return f;
+    f.raw = sat_i64(((i64)num << 16) / (i64)den);
+    return f;
+}
+
+/* 浮点转定点：四舍五入（.5 远离 0）、NaN 给 0、超出范围饱和。 */
+Fix fix_from_f64(f64 v)
+{
+    Fix f = { 0 };
+    f64 s = 0;
+
+    if (v != v)
+        return f;
+    s = v * (f64)FIX_ONE;
+    if (s >= 2147483647.0) {
+        f.raw = I32_MAX;
+        return f;
+    }
+    if (s <= -2147483648.0) {
+        f.raw = I32_MIN;
+        return f;
+    }
+    f.raw = (i32)(s >= 0 ? s + 0.5 : s - 0.5);
+    return f;
+}
+
+f64 to_f64(Fix *self) { return (f64)self->raw / (f64)FIX_ONE; }
+
+/* 向零截断的整数部分（等价于 C 的 (int) 转换）。 */
+int to_int(Fix *self) { return (int)(self->raw / FIX_ONE); }
+
+/* 四舍五入到最近整数（.5 远离 0）。 */
+int round(Fix *self)
+{
+    i64 r = (i64)self->raw;
+
+    if (r >= 0)
+        return (int)((r + FIX_HALF) / FIX_ONE);
+    return -(int)((-r + FIX_HALF) / FIX_ONE);
+}
+
+/* 向下取整（-2.1 给 -3）。 */
+int floor(Fix *self)
+{
+    i64 r = (i64)self->raw;
+    int q = (int)(r / FIX_ONE);
+
+    if (r < 0 && r % FIX_ONE != 0)
+        q--;
+    return q;
+}
+
+/* 向上取整（-2.1 给 -2）。 */
+int ceil(Fix *self)
+{
+    i64 r = (i64)self->raw;
+    int q = (int)(r / FIX_ONE);
+
+    if (r > 0 && r % FIX_ONE != 0)
+        q++;
+    return q;
+}
+
+/* 小数部分：符号跟着原值（-2.25 给 -0.25）。 */
+Fix frac(Fix *self)
+{
+    Fix f = { 0 };
+
+    f.raw = self->raw % FIX_ONE;
+    return f;
+}
+
+Fix abs(Fix *self)
+{
+    Fix f = { 0 };
+    i64 r = (i64)self->raw;
+
+    if (r < 0)
+        r = -r;
+    f.raw = sat_i64(r);
+    return f;
+}
+
+Fix neg(Fix *self)
+{
+    Fix f = { 0 };
+
+    f.raw = sat_i64(-(i64)self->raw);
+    return f;
+}
+
+/* 加/减：溢出饱和。 */
+Fix add(Fix *self, Fix b)
+{
+    Fix f = { 0 };
+
+    f.raw = sat_i64((i64)self->raw + (i64)b.raw);
+    return f;
+}
+
+Fix sub(Fix *self, Fix b)
+{
+    Fix f = { 0 };
+
+    f.raw = sat_i64((i64)self->raw - (i64)b.raw);
+    return f;
+}
+
+Fix mul(Fix *self, Fix b)
+{
+    Fix f = { 0 };
+
+    f.raw = fmul(self->raw, b.raw);
+    return f;
+}
+
+/* 除以 b：b 为 0 给 0；结果向零截断。 */
+Fix div(Fix *self, Fix b)
+{
+    Fix f = { 0 };
+
+    if (b.raw == 0)
+        return f;
+    f.raw = sat_i64(((i64)self->raw << 16) / (i64)b.raw);
+    return f;
+}
+
+/* 平方根：负数给 0；sqrt(4) 精确等于 2。 */
+Fix sqrt(Fix *self)
+{
+    Fix f = { 0 };
+
+    if (self->raw <= 0)
+        return f;
+    f.raw = sat_i64((i64)isqrt64((u64)self->raw << 16));
+    return f;
+}
+
+/* 线性插值：self + (b - self) * t，t 用 Q16.16 表示（0.5 是一半）。 */
+Fix lerp(Fix *self, Fix b, Fix t)
+{
+    i64 d = (i64)b.raw - (i64)self->raw;
+    i64 p = d * (i64)t.raw;
+
+    if (p >= 0)
+        p = (p + FIX_HALF) >> 16;
+    else
+        p = -((-p + FIX_HALF) >> 16);
+    return fix_from_raw(sat_i64((i64)self->raw + p));
+}
+
+/* 夹到 [lo, hi]；lo > hi 时自动交换。 */
+Fix clamp(Fix *self, Fix lo, Fix hi)
+{
+    Fix t = { 0 };
+
+    if (lo.raw > hi.raw) {
+        t = lo;
+        lo = hi;
+        hi = t;
+    }
+    if (self->raw < lo.raw)
+        return lo;
+    if (self->raw > hi.raw)
+        return hi;
+    return *self;
+}
+
+int cmp(Fix *self, Fix b)
+{
+    if (self->raw < b.raw)
+        return -1;
+    if (self->raw > b.raw)
+        return 1;
+    return 0;
+}
+
+/* sin(x)，x 是 Q16.16 弧度：Taylor 展开到 x^9，先按象限规约。 */
+static i32 sin_raw(i32 raw)
+{
+    i64 x = (i64)raw % FIX_TWO_PI;
+    i64 x2 = 0;
+    i64 p = 0;
+    i64 t = 0;
+
+    if (x > FIX_PI)
+        x -= FIX_TWO_PI;
+    else if (x < -FIX_PI)
+        x += FIX_TWO_PI;
+    if (x > FIX_HALF_PI)
+        x = FIX_PI - x;
+    else if (x < -FIX_HALF_PI)
+        x = -FIX_PI - x;
+
+    x2 = fmul((i32)x, (i32)x);
+    t = x;
+    p = fmul((i32)x, (i32)x2);          /* x^3 */
+    t -= p / 6;
+    p = fmul((i32)p, (i32)x2);          /* x^5 */
+    t += p / 120;
+    p = fmul((i32)p, (i32)x2);          /* x^7 */
+    t -= p / 5040;
+    p = fmul((i32)p, (i32)x2);          /* x^9 */
+    t += p / 362880;
+    return sat_i64(t);
+}
+
+Fix sin(Fix *self)
+{
+    Fix f = { 0 };
+
+    f.raw = sin_raw(self->raw);
+    return f;
+}
+
+/* cos(x) = sin(x + π/2)：先加再规约，避免另一套展开。 */
+Fix cos(Fix *self)
+{
+    Fix f = { 0 };
+    i64 x = (i64)self->raw + FIX_HALF_PI;
+
+    f.raw = sin_raw(sat_i64(x % FIX_TWO_PI));
+    return f;
+}
+
+/* ---- Q15：i16 的 1.15 定点，DSP 里最常见的那种 ---- */
+
+struct Q15 {
+    i16 raw;                /* 1.0 = 32767，-1.0 = -32768 */
+};
+
+static i16 sat_q15(i32 v)
+{
+    if (v > 32767)
+        return 32767;
+    if (v < -32768)
+        return -32768;
+    return (i16)v;
+}
+
+/* 整数转 Q15：1 -> 32767、-1 -> -32768，其它值饱和。 */
+Q15 q15_from_int(int v)
+{
+    Q15 q = { 0 };
+
+    if (v > 1)
+        q.raw = 32767;
+    else if (v < -1)
+        q.raw = -32768;
+    else if (v > 0)
+        q.raw = 32767;
+    else if (v < 0)
+        q.raw = -32768;
+    return q;
+}
+
+Q15 q15_from_f64(f64 v)
+{
+    Q15 q = { 0 };
+    f64 s = 0;
+
+    if (v != v)
+        return q;
+    s = v * 32768.0;
+    if (s >= 32767.0) {
+        q.raw = 32767;
+        return q;
+    }
+    if (s <= -32768.0) {
+        q.raw = -32768;
+        return q;
+    }
+    q.raw = (i16)(s >= 0 ? s + 0.5 : s - 0.5);
+    return q;
+}
+
+f64 to_f64(Q15 *self) { return (f64)self->raw / 32768.0; }
+
+/* (a * b) >> 15，四舍五入并饱和：(-1.0) * (-1.0) 给 32767。 */
+Q15 mul(Q15 *self, Q15 b)
+{
+    Q15 q = { 0 };
+    i32 p = (i32)self->raw * (i32)b.raw;
+
+    p += 16384;
+    p >>= 15;
+    q.raw = sat_q15(p);
+    return q;
+}
+
+Q15 add_sat(Q15 *self, Q15 b)
+{
+    Q15 q = { 0 };
+
+    q.raw = sat_q15((i32)self->raw + (i32)b.raw);
+    return q;
+}
+
+Q15 sub_sat(Q15 *self, Q15 b)
+{
+    Q15 q = { 0 };
+
+    q.raw = sat_q15((i32)self->raw - (i32)b.raw);
+    return q;
+}
+
+/* ---- 自测 ---- */
+
+static int near_f(Fix *self, f64 want, f64 eps)
+{
+    f64 v = self->to_f64();
+    f64 d = v - want;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+test "Q16.16 的换算与取整" {
+    Fix a = fix_from_int(3);
+    Fix h = fix_from_frac(1, 2);
+    Fix p = fix_from_f64(1.25);
+    Fix n = fix_from_f64(-1.25);
+    Fix f = { 0 };
+
+    if (a.raw != 3 * FIX_ONE)
+        return err(1, "fix_from_int 不对");
+    if (h.raw != FIX_HALF || !h.near_f(0.5, 1e-9))
+        return err(2, "fix_from_frac 不对");
+    if (p.raw != 81920 || n.raw != -81920)
+        return err(3, "fix_from_f64 不对");
+    if (a.to_int() != 3 || h.to_int() != 0)
+        return err(4, "to_int 没有向零截断");
+    if (fix_from_int(1).div(fix_from_int(3)).to_f64() < 0.3333
+        || fix_from_int(1).div(fix_from_int(3)).to_f64() > 0.3334)
+        return err(5, "1/3 的精度不对");
+
+    if (fix_from_f64(2.7).round() != 3 || fix_from_f64(-2.7).round() != -3
+        || fix_from_f64(2.5).round() != 3 || fix_from_f64(-2.5).round() != -3)
+        return err(6, "round 不是四舍五入远离 0");
+    if (fix_from_f64(-2.1).floor() != -3 || fix_from_f64(2.1).floor() != 2
+        || fix_from_f64(-2.1).ceil() != -2 || fix_from_f64(2.1).ceil() != 3)
+        return err(7, "floor / ceil 不对");
+    f = fix_from_f64(-2.25).frac();
+    if (f.raw != -16384 || !f.near_f(-0.25, 1e-9))
+        return err(8, "frac 的符号不对");
+    if (fix_from_f64(2.25).frac().raw != 16384)
+        return err(9, "正数 frac 不对");
+}
+
+test "Q16.16 的四则、饱和与比较" {
+    Fix two = fix_from_int(2);
+    Fix three = fix_from_int(3);
+    Fix mthree = fix_from_int(-3);
+    Fix big = fix_from_int(30000);
+
+    if (three.mul(two).raw != 6 * FIX_ONE)
+        return err(10, "3 * 2 不对");
+    if (mthree.mul(two).raw != -6 * FIX_ONE)
+        return err(11, "-3 * 2 不对");
+    if (three.add(two).raw != 5 * FIX_ONE || three.sub(two).raw != FIX_ONE)
+        return err(12, "加/减不对");
+    if (mthree.abs().raw != 3 * FIX_ONE || three.neg().raw != -3 * FIX_ONE)
+        return err(13, "abs / neg 不对");
+    if (big.add(big).raw != I32_MAX || big.sub(big.neg()).raw != I32_MAX)
+        return err(14, "加法没有饱和");
+    if (big.mul(two).raw != I32_MAX)
+        return err(15, "乘法没有饱和");
+    if (three.div(fix_from_int(0)).raw != 0)
+        return err(16, "除以 0 没有给 0");
+    if (three.cmp(two) != 1 || two.cmp(three) != -1 || two.cmp(two) != 0)
+        return err(17, "cmp 不对");
+
+    if (fix_from_int(4).sqrt().raw != 2 * FIX_ONE)
+        return err(18, "sqrt(4) 不是精确的 2");
+    if (!fix_from_int(2).sqrt().near_f(1.41421, 1e-4)
+        || fix_from_int(-1).sqrt().raw != 0)
+        return err(19, "sqrt 不对");
+    if (!fix_from_int(0).lerp(fix_from_int(10), fix_from_frac(1, 4))
+             .near_f(2.5, 1e-9))
+        return err(20, "lerp 不对");
+    if (fix_from_int(9).clamp(fix_from_int(0), fix_from_int(5)).raw != 5 * FIX_ONE
+        || fix_from_int(-2).clamp(fix_from_int(0), fix_from_int(5)).raw != 0)
+        return err(21, "clamp 不对");
+    if (fix_from_int(1).clamp(fix_from_int(5), fix_from_int(0)).raw != FIX_ONE)
+        return err(22, "clamp 的 lo > hi 没有自动交换");
+}
+
+test "sin / cos 的象限与精度" {
+    Fix one = fix_from_int(1);
+    Fix half_pi = fix_from_frac(FIX_HALF_PI, FIX_ONE);
+    Fix pi = fix_from_frac(FIX_PI, FIX_ONE);
+
+    if (!one.sin().near_f(0.84147, 1e-4)
+        || !one.cos().near_f(0.54030, 1e-4))
+        return err(23, "sin/cos(1) 不对");
+    if (!half_pi.sin().near_f(1.0, 1e-4)
+        || !half_pi.cos().near_f(0.0, 1e-4))
+        return err(24, "sin/cos(pi/2) 不对");
+    if (!pi.sin().near_f(0.0, 1e-4) || !pi.cos().near_f(-1.0, 1e-4))
+        return err(25, "sin/cos(pi) 不对");
+    if (!fix_from_f64(2.5).sin().near_f(0.59847, 1e-4)
+        || !fix_from_f64(-2.5).sin().near_f(-0.59847, 1e-4))
+        return err(26, "sin 的负数/第二象限不对");
+    if (!fix_from_f64(10.0).cos().near_f(-0.83907, 1e-4))
+        return err(27, "大角度的规约不对");
+}
+
+test "Q15 的乘法与饱和" {
+    Q15 half = q15_from_f64(0.5);
+    Q15 max = q15_from_f64(1.0);
+    Q15 min = q15_from_f64(-1.0);
+    Q15 q = half.mul(half);
+    f64 qv = q.to_f64();
+    f64 nv = q15_from_f64(0.9).mul(q15_from_f64(0.9)).to_f64();
+
+    if (half.to_f64() != 0.5)
+        return err(28, "Q15 0.5 的 raw 不对");
+    if (qv < 0.2499 || qv > 0.2501)
+        return err(29, "0.5 * 0.5 不是 0.25");
+    if (max.raw != 32767 || min.raw != -32768)
+        return err(30, "Q15 的 1.0 端点不对");
+    if (max.mul(max).raw != 32766 || min.mul(min).raw != 32767)
+        return err(31, "Q15 乘法的端点不对");
+    if (nv < 0.8098 || nv > 0.8100)
+        return err(32, "Q15 乘法的舍入不对");
+    if (q15_from_f64(0.9).add_sat(q15_from_f64(0.9)).raw != 32767
+        || q15_from_f64(-0.9).sub_sat(q15_from_f64(0.9)).raw != -32768)
+        return err(33, "Q15 加减没有饱和");
+    if (q15_from_int(1).raw != 32767 || q15_from_int(-1).raw != -32768
+        || q15_from_int(7).raw != 32767)
+        return err(34, "q15_from_int 的端点不对");
+}

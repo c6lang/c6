@@ -1,0 +1,257 @@
+/* std/core/pool：固定块内存池（O(1) 分配/释放，不碰堆）。
+ *
+ *     import std.core.pool;
+ *
+ *     u8 buf[512] = { 0 };
+ *     Pool p = pool_make(buf, (int)sizeof buf, 24);   // 每块 24 字节
+ *     void *a = p.alloc();
+ *     void *b = p.alloc();
+ *     p.free(a);                                      // 还回去，O(1)
+ *
+ * 和 `Arena` 的分工：Arena 是 bump 分配器，只借不还；Pool 把一整段调用方
+ * 内存切成等大的块，空闲块用块内前 8 字节串成链表，所以 `alloc`/`free`
+ * 都是常数时间、没有碎片、也不产生任何元数据分配。适合「固定上限的一批
+ * 对象」（网络连接槽、DMA 描述符、任务控制块）。
+ *
+ * 约定：
+ * - 块大小会向上对齐到 16 字节（32 位上 8 字节），`base` 也跟着对齐，
+ *   所以每块都能放 `u64`/`f64`/指针；
+ * - 池**不拥有**内存，`buf` 必须比 Pool 活得久；`reset` 只是把空闲链表
+ *   重新串一遍，不会清零块内容；
+ * - `free` 会拒绝不在池里的指针（范围或对齐不对），但**不做重复释放检测**
+ *   ——那需要 O(n) 扫链表，破坏常数时间。重复释放一块已经空闲的块会把它
+ *   在链表里挂两次；调试时用 `contains` 先确认，或者自己加一层哨兵；
+ * - 参数不合法（空缓冲、负长度、块大小 <= 0、缓冲装不下一块）时得到一个
+ *   `capacity() == 0` 的池，`alloc` 永远返回 0，其它方法按空池回答。
+ */
+module std.core.pool;
+import std.core.types;
+
+struct Pool {
+    u8 *base;               /* 对齐后的块区起点 */
+    u8 *end;                /* 一过末尾 */
+    void *freelist;         /* 空闲链表头（指针存在空闲块里） */
+    int blk;                /* 对齐后的块大小 */
+    int cap;                /* 总块数 */
+    int n;                  /* 当前空闲块数 */
+};
+
+/* 块对齐：32 位上是 8、64 位上是 16，够放指针、u64、f64。 */
+static int align_of(void) { return (int)sizeof(void *) * 2; }
+
+int init(Pool *self, void *buf, int bytes, int blk)
+{
+    u8 *p = 0;
+    u8 *end = 0;
+    int a = 0;
+    int b = 0;
+    int n = 0;
+    int i = 0;
+
+    if (!self)
+        return 0;
+    self->base = 0;
+    self->end = 0;
+    self->freelist = 0;
+    self->blk = 0;
+    self->cap = 0;
+    self->n = 0;
+    if (!buf || bytes <= 0 || blk <= 0)
+        return 0;
+
+    a = align_of();
+    if (blk > I32_MAX - a)
+        return 0;
+    b = (blk + a - 1) / a * a;
+    if (b <= 0)
+        return 0;
+
+    p = (u8 *)buf;
+    end = p + bytes;
+    p += (a - (int)((usize)p % (usize)a)) % a;
+    if (p >= end)
+        return 0;
+    n = (int)((usize)(end - p) / (usize)b);
+    if (n <= 0)
+        return 0;
+
+    self->base = p;
+    self->end = end;
+    self->blk = b;
+    self->cap = n;
+    self->n = n;
+    for (i = n - 1; i >= 0; i--) {
+        void *q = (void *)(p + (usize)i * (usize)b);
+        *(void **)q = self->freelist;
+        self->freelist = q;
+    }
+    return n;
+}
+
+Pool pool_make(void *buf, int bytes, int blk)
+{
+    Pool p = { 0 };
+
+    p.init(buf, bytes, blk);
+    return p;
+}
+
+/* 取一块；池空（或坏池）返回 0。 */
+void *alloc(Pool *self)
+{
+    void *p = 0;
+
+    if (!self || !self->freelist)
+        return 0;
+    p = self->freelist;
+    self->freelist = *(void **)p;
+    self->n--;
+    return p;
+}
+
+/* p 是不是一块的起点（只做范围和步长检查，不查它是否已经空闲）。 */
+int contains(Pool *self, void *p)
+{
+    u8 *q = 0;
+
+    if (!self || !self->base || !p)
+        return 0;
+    q = (u8 *)p;
+    if (q < self->base || q >= self->end)
+        return 0;
+    return ((usize)(q - self->base) % (usize)self->blk) == 0;
+}
+
+/* 还一块：指针不在池里（范围/对齐不对）返回 0，成功返回 1。 */
+int free(Pool *self, void *p)
+{
+    if (!self || !p || !contains(self, p))
+        return 0;
+    *(void **)p = self->freelist;
+    self->freelist = p;
+    self->n++;
+    return 1;
+}
+
+/* 把整池重新变成空闲（不清块内容）。 */
+void reset(Pool *self)
+{
+    int i = 0;
+
+    if (!self || !self->base || self->cap <= 0)
+        return;
+    self->freelist = 0;
+    self->n = self->cap;
+    for (i = self->cap - 1; i >= 0; i--) {
+        void *q = (void *)(self->base + (usize)i * (usize)self->blk);
+        *(void **)q = self->freelist;
+        self->freelist = q;
+    }
+}
+
+int count(Pool *self) { return self ? self->n : 0; }
+
+int capacity(Pool *self) { return self ? self->cap : 0; }
+
+int used(Pool *self) { return self ? self->cap - self->n : 0; }
+
+int block_size(Pool *self) { return self ? self->blk : 0; }
+
+/* 一块都没分出去；坏池也按「空」回答。 */
+int is_empty(Pool *self) { return !self || self->cap <= 0 || self->n >= self->cap; }
+
+/* 没有空闲块了；坏池不算满（和 Ring 的约定一致）。 */
+int is_full(Pool *self) { return self && self->cap > 0 && self->n <= 0; }
+
+/* ---- 自测 ---- */
+
+test "块分配 / 释放 / 满与复用" {
+    u8 buf[256] = { 0 };
+    Pool p = pool_make(buf, (int)sizeof buf, 20);
+    void *ptrs[16] = { 0 };
+    int n = 0;
+    int i = 0;
+    void *a = 0;
+    int *ip = 0;
+
+    n = p.capacity();
+    if (n < 4 || p.block_size() != 32)
+        return err(1, "对齐后的块大小/容量不对");
+    if (!p.is_empty() || p.count() != n || p.used() != 0 || p.is_full())
+        return err(2, "初始状态不对");
+
+    for (i = 0; i < n; i++) {
+        ptrs[i] = p.alloc();
+        if (!ptrs[i] || !p.contains(ptrs[i]))
+            return err(3, "alloc 给了空指针或池外指针");
+        if (((usize)ptrs[i] % (usize)p.block_size()) != 0
+            || ((usize)ptrs[i] % (usize)sizeof(void *)) != 0)
+            return err(4, "块没有按块大小对齐");
+        if (i > 0 && ptrs[i] == ptrs[i - 1])
+            return err(5, "两次 alloc 给了同一块");
+    }
+    if (p.count() != 0 || p.used() != n || !p.is_full() || p.is_empty())
+        return err(6, "分完之后的状态不对");
+    if (p.alloc() != 0)
+        return err(7, "满了还 alloc 成功");
+
+    /* 块内可以正常读写：alloc 给的是可用内存 */
+    ip = (int *)ptrs[0];
+    *ip = 1234;
+    if (*ip != 1234)
+        return err(8, "块内容写不进去");
+
+    /* 释放后立刻再取，应该拿回同一块（LIFO） */
+    if (!p.free(ptrs[3]))
+        return err(9, "free 失败");
+    a = p.alloc();
+    if (a != ptrs[3] || p.count() != 0)
+        return err(10, "空闲块没有复用");
+    if (!p.free(a))
+        return err(11, "再次 free 失败");
+
+    /* 池外 / 不对齐 / 空指针都拒绝 */
+    if (p.free(0) || p.free(buf + 1) || p.free(buf + (int)sizeof buf)
+        || p.free(ptrs) || !p.contains(ptrs[0]) || p.contains(buf + 1))
+        return err(12, "free/contains 没有拒绝坏指针");
+
+    p.reset();
+    if (!p.is_empty() || p.count() != n || p.used() != 0)
+        return err(13, "reset 没有恢复整池");
+    if (p.alloc() != ptrs[0])
+        return err(14, "reset 之后没有从第一块开始发");
+}
+
+test "未对齐的缓冲、坏参数与自定义块大小" {
+    u8 raw[192] = { 0 };
+    Pool p = pool_make(raw + 1, 160, 16);
+    void *a = 0;
+    void *b = 0;
+
+    a = p.alloc();
+    b = p.alloc();
+    if (!a || !b || a == b)
+        return err(15, "未对齐缓冲上的分配失败");
+    if (((usize)a % 16) != 0 || ((usize)b % 16) != 0)
+        return err(16, "base 没有向上对齐");
+    if ((u8 *)a < raw + 1 || (u8 *)b >= raw + 1 + 160)
+        return err(17, "分配跑出了调用方缓冲");
+
+    {
+        Pool z = pool_make(0, 160, 16);
+        Pool z2 = pool_make(raw, 0, 16);
+        Pool z3 = pool_make(raw, 160, 0);
+        Pool z4 = pool_make(raw, 8, 32);
+
+        if (z.capacity() || z2.capacity() || z3.capacity() || z4.capacity())
+            return err(18, "坏参数没有变成空池");
+        if (z.alloc() || z2.alloc() || z3.alloc() || z4.alloc())
+            return err(19, "空池还能分配");
+        if (!z.is_empty() || z.is_full() || z.count() || z.used()
+            || z.block_size() || z.contains(raw) || z.free(raw))
+            return err(20, "空池的状态回答不对");
+        z.reset();
+        if (z.capacity() != 0)
+            return err(21, "空池 reset 之后还是空");
+    }
+}

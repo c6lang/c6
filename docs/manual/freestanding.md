@@ -88,6 +88,13 @@ join 这里有个坑值得记下来：「还活着」的标志不能直接靠 `C
 | `select` | 只有 `async` / `c6_io` 用；不用 async 就永远碰不到 |
 | 输出、退出、复位 | 程序自己的事：把 `write` 换成 UART/MMIO 写、`exit` 换成 `while (1)`，入口符号交给链接脚本和向量表 |
 
+板上常做的四件事在 `std/` 里有现成的零依赖实现：`std.core.crc`（CRC-8/16/32C
+与 Fletcher/LRC/XOR/累加和）、`std.core.fixed`（Q16.16 与 Q15 定点、带 sin/cos）、
+`std.core.pool`（借用一段 `.bss` 的定长块分配器）、`std.encoding.frame`（COBS /
+SLIP 串行分帧）。它们只依赖 `std.core.types`，不分配、不链 libc/libm、不碰
+`pthread`，把 `.c6` 正文列进裸机 payload 的命令行即可（用法见
+[stdlib.md](../stdlib.md#嵌入式基础crc--fixed--pool--frame)）。
+
 [examples/freestanding_noos.c6](../../examples/freestanding_noos.c6)（`make fstest-noos`）
 就是这么一份：里面**一个 syscall 都没有**，插值、格式说明、`defer`、`err` +
 `catch`、`@T` 全在内存里做完，最后用 `ud2`（全过，退出码 132）或往 0 地址写
