@@ -1133,6 +1133,25 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
 
 ## 写法约定（照着写就不会踩坑）
 
+### 标准库 API 形态：硬性要求
+
+新增或改造 `std/` 模块时，**能用结构体方法表达的 API 必须写成方法**：
+
+1. 第一个参数是 `T *`（或 `T` 值）、语义上在操作 `T` 的函数，一律按方法注册；
+   调用侧只写 `v.m(...)` / `p->m(...)`，不写 `m(&v, ...)` / `m(p, ...)`。
+2. 方法名用裸动词，不加 `reader_`/`writer_`/`json_`/`inet_` 之类的接收者前缀；
+   同名由接收者 tag 区分（`Reader.close` / `Writer.close`、`BitWriter.align` /
+   `BitReader.align`）。
+3. 只有下面这些情况保留自由函数：
+   - 工厂/构造：`reader_open`、`arena_make`、`csv_reader`、`ini_open`、`bw_open`；
+   - 没有接收者的算法/编解码：`path_join`、`b64_encode`、`fnv1a_bytes`、`sort_int`；
+   - 一次性便捷入口：`sha256`、`sha256_hex`、`hmac_sha256`；
+   - 接收者不是第一个参数，或需要显式多态的：`uuid_v7_at(ms, r)`。
+4. `foreach` 迭代器的 `has`/`next` 是语言协议，必须保留字面名，不受第 2 条影响。
+5. 新增/修改的 `test` 块、`examples/std*.c6` 和 `docs/stdlib.md` 示例必须用方法
+   语法；评审时把 `m(&v, ...)`、带接收者前缀的方法名、文档里的函数式调用视为
+   不合格。
+
 * **普通结构体的方法就是「第一个参数是结构体指针」的文件作用域函数**：
   `int count(Str *self)`；泛型结构体才能在 `struct` 体内写方法体
   （`struct Split { int has() { ... } }` 会被拒：`a function cannot be defined
