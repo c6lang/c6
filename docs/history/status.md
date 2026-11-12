@@ -1182,3 +1182,26 @@ aes/poly1305/random 自成一体。示例 `examples/stdcipher.c6` 前半段逐�
 
 验收：`make stdtest`（113 个模块、0 failure）、`make std-cipher`（27 条自检全过）、
 `make check-all`。
+
+### 11.38 标准库第二十六批（bencode / msgpack / cbor / pem）
+
+第二十六批补的是**数据格式**：`std.data` 已经有 JSON/CSV/INI/TOML/XML，但
+「BitTorrent 的元信息」「两种紧凑二进制」「证书/密钥的 PEM 封装」还缺。四个
+模块都是纯函数、零分配，写端写调用方缓冲、读端给输入上的视图：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.bencode` | 整数/字节串/列表/字典 | 读端给**标记流**（LIST/DICT/END），由调用方按自己的结构递归消费，不在库里建树；整数和长度都拒绝前导零，溢出返回 -1；字典键的字节序排序交给调用方（库不替它排） |
+| `std.data.msgpack` | MessagePack | 写端对非负整数走无符号编码（和主流实现一致）；读端把 fixint/定型整数、fixstr/str8/16/32、bin8/16/32、float32/float64 都覆盖，扩展类型（`c7..c9`/`d4..d8`）与保留码 `c1` 一律 -1；float32 转 f64，Inf/NaN 当 0 |
+| `std.data.cbor` | CBOR（RFC 8949 的确定长度子集） | 头是「主类型 + 附加信息」，`<24` 内联、24/25/26/27 跟 1/2/4/8 字节；读端支持主类型 0..5 与 `f4..f6`/`f9`/`fa`/`fb`，不定长（ai=31）、标签（主类型 6）、`f7`/`f8` 一律 -1——只做够覆盖配置/遥测的确定长度子集 |
+| `std.data.pem` | PEM 封装 | 编码按 48 字节一块（正好 64 个 Base64 字符）逐行写，先算总长再落笔（放不下不写半截）；解码器容忍 CRLF、行首空白与前后噪声，标签必须首尾一致；不解析 DER 内部，只负责封装/拆封 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.msgpack`=0x6071、
+`std.data.cbor`=0x6072、`std.data.bencode`=0x6073、`std.data.pem`=0x6074；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-data` 与 `STDDATA_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 的依赖表补上 bencode/msgpack/cbor
+（只借 `Str` 类型）与 pem（base64 + str）。示例 `examples/stddata.c6` 用同一份
+带嵌套的小数据走四种格式，期望字节全部写在代码里。
+
+验收：`make stdtest`（117 个模块、0 failure）、`make std-data`（15 条自检全过）、
+`make check-all`。

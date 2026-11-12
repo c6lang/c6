@@ -1,0 +1,848 @@
+/* std/data/msgpack：MessagePack 编解码（零分配，调用方给缓冲）。
+ *
+ *     import std.data.msgpack;
+ *
+ *     char buf[256] = { 0 };
+ *     MpWriter w = mp_writer(buf, (int)sizeof buf);
+ *     w.write_map(1);
+ *     w.write_str(SS("name"));
+ *     w.write_str(SS("demo"));
+ *     if (!w.ok()) return 1;
+ *
+ *     MpReader r = mp_reader(buf, w.len());
+ *     MpTag t = { 0 };
+ *     while (r.next(&t) == 1) {
+ *         if (t.type == MP_STR) ... t.s ...
+ *         if (t.type == MP_MAP) ... t.count ...
+ *     }
+ *
+ * MessagePack 是「JSON 的二进制版」：整数/浮点/字符串/二进制/数组/映射各有
+ * 紧凑编码，容器只带元素个数（`count`），由调用方按自己的结构递归消费——
+ * 所以这一层不建树、不分配，读到的字符串/二进制是输入缓冲上的视图。
+ *
+ * 约定：
+ *
+ * - 写：缓冲满了置 `ok = 0` 并忽略后续写入；`len()` 只反映已写入部分；
+ *   `write_int` 对非负数走无符号编码（和主流实现一致），负数用 `d0..d3`；
+ *   `write_f64` 固定写 float64（`cb`），不自动降成 float32；
+ * - 读：`next` 返回 1 取到一个标记 / 0 输入结束 / -1 格式错（不认识的扩展
+ *   类型 `c7..c9`/`d4..d8` 一律 -1；保留码 `c1` 也是错）；float32 会转成
+ *   f64，Inf/NaN 不支持（当 0）；`count` 只给 ARRAY/MAP，表示元素个数（map 是
+ *   键值对个数，总标记数是它的两倍）；
+ * - 长度都按规范的上限检查（str/bin ≤ 2^32-1、array/map ≤ 2^32-1），但实际可用
+ *   长度还受调用方缓冲限制；
+ * - 不支持时间戳扩展（`d6`/`d7` 的 timestamp），那是扩展类型。
+ */
+#include <string.h>
+
+module std.data.msgpack;
+import std.core.types;
+import std.text.str;
+
+enum MpType {
+    MP_NIL = 0,
+    MP_BOOL = 1,
+    MP_UINT = 2,
+    MP_INT = 3,
+    MP_F64 = 4,
+    MP_STR = 5,
+    MP_BIN = 6,
+    MP_ARRAY = 7,
+    MP_MAP = 8,
+};
+
+struct MpWriter {
+    u8 *buf;
+    int cap;
+    int used;
+    int bad;
+};
+
+struct MpTag {
+    int type;
+    int flag;       /* BOOL 的真假 */
+    u64 u;
+    i64 i;
+    f64 f;
+    Str s;          /* STR/BIN 的视图 */
+    int count;      /* ARRAY/MAP 的元素个数 */
+};
+
+struct MpReader {
+    const u8 *p;
+    int len;
+    int pos;
+    int bad;
+};
+
+MpWriter mp_writer(void *buf, int cap)
+{
+    MpWriter w = { (u8 *)buf, cap, 0, 0 };
+
+    if (!buf || cap <= 0)
+        w.bad = 1;
+    return w;
+}
+
+int ok(MpWriter *self) { return self && !self->bad; }
+
+int len(MpWriter *self) { return self ? self->used : 0; }
+
+static void mw_byte(MpWriter *w, int b)
+{
+    if (w->bad)
+        return;
+    if (w->used + 1 > w->cap) {
+        w->bad = 1;
+        return;
+    }
+    w->buf[w->used++] = (u8)b;
+}
+
+static void mw_bytes(MpWriter *w, const void *p, int n)
+{
+    if (w->bad || n < 0)
+        return;
+    if (w->used + n > w->cap) {
+        w->bad = 1;
+        return;
+    }
+    if (n > 0)
+        memcpy(w->buf + w->used, p, (size_t)n);
+    w->used += n;
+}
+
+static void mw_be16(MpWriter *w, u32 v)
+{
+    mw_byte(w, (int)((v >> 8) & 0xff));
+    mw_byte(w, (int)(v & 0xff));
+}
+
+static void mw_be32(MpWriter *w, u32 v)
+{
+    mw_byte(w, (int)((v >> 24) & 0xff));
+    mw_byte(w, (int)((v >> 16) & 0xff));
+    mw_byte(w, (int)((v >> 8) & 0xff));
+    mw_byte(w, (int)(v & 0xff));
+}
+
+static void mw_be64(MpWriter *w, u64 v)
+{
+    mw_be32(w, (u32)(v >> 32));
+    mw_be32(w, (u32)(v & 0xffffffffu));
+}
+
+void write_nil(MpWriter *self) { mw_byte(self, 0xc0); }
+
+void write_bool(MpWriter *self, int v) { mw_byte(self, v ? 0xc3 : 0xc2); }
+
+void write_uint(MpWriter *self, u64 v)
+{
+    if (!self || self->bad)
+        return;
+    if (v <= 0x7full) {
+        mw_byte(self, (int)v);
+    } else if (v <= 0xffull) {
+        mw_byte(self, 0xcc);
+        mw_byte(self, (int)v);
+    } else if (v <= 0xffffull) {
+        mw_byte(self, 0xcd);
+        mw_be16(self, (u32)v);
+    } else if (v <= 0xffffffffull) {
+        mw_byte(self, 0xce);
+        mw_be32(self, (u32)v);
+    } else {
+        mw_byte(self, 0xcf);
+        mw_be64(self, v);
+    }
+}
+
+void write_int(MpWriter *self, i64 v)
+{
+    if (!self || self->bad)
+        return;
+    if (v >= 0) {
+        write_uint(self, (u64)v);
+        return;
+    }
+    if (v >= -32) {
+        mw_byte(self, (int)(0xe0 | (int)(v + 32)));
+    } else if (v >= -128) {
+        mw_byte(self, 0xd0);
+        mw_byte(self, (int)(v & 0xff));
+    } else if (v >= -32768) {
+        mw_byte(self, 0xd1);
+        mw_be16(self, (u32)(v & 0xffff));
+    } else if (v >= -2147483648ll) {
+        mw_byte(self, 0xd2);
+        mw_be32(self, (u32)(v & 0xffffffffll));
+    } else {
+        mw_byte(self, 0xd3);
+        mw_be64(self, (u64)v);
+    }
+}
+
+void write_f64(MpWriter *self, f64 v)
+{
+    u64 bits = 0;
+
+    if (!self || self->bad)
+        return;
+    memcpy(&bits, &v, sizeof bits);
+    mw_byte(self, 0xcb);
+    mw_be64(self, bits);
+}
+
+void write_str(MpWriter *self, Str s)
+{
+    int n = 0;
+
+    if (!self || self->bad)
+        return;
+    n = s.s.len;
+    if (n < 0 || (n > 0 && !s.s.data)) {
+        self->bad = 1;
+        return;
+    }
+    if (n <= 31) {
+        mw_byte(self, 0xa0 | n);
+    } else if (n <= 0xff) {
+        mw_byte(self, 0xd9);
+        mw_byte(self, n);
+    } else if (n <= 0xffff) {
+        mw_byte(self, 0xda);
+        mw_be16(self, (u32)n);
+    } else {
+        mw_byte(self, 0xdb);
+        mw_be32(self, (u32)n);
+    }
+    mw_bytes(self, s.s.data, n);
+}
+
+void write_bin(MpWriter *self, const void *p, int n)
+{
+    if (!self || self->bad || n < 0 || (n > 0 && !p)) {
+        if (self)
+            self->bad = 1;
+        return;
+    }
+    if (n <= 0xff) {
+        mw_byte(self, 0xc4);
+        mw_byte(self, n);
+    } else if (n <= 0xffff) {
+        mw_byte(self, 0xc5);
+        mw_be16(self, (u32)n);
+    } else {
+        mw_byte(self, 0xc6);
+        mw_be32(self, (u32)n);
+    }
+    mw_bytes(self, p, n);
+}
+
+void write_array(MpWriter *self, int n)
+{
+    if (!self || self->bad || n < 0) {
+        if (self)
+            self->bad = 1;
+        return;
+    }
+    if (n <= 15) {
+        mw_byte(self, 0x90 | n);
+    } else if (n <= 0xffff) {
+        mw_byte(self, 0xdc);
+        mw_be16(self, (u32)n);
+    } else {
+        mw_byte(self, 0xdd);
+        mw_be32(self, (u32)n);
+    }
+}
+
+void write_map(MpWriter *self, int n)
+{
+    if (!self || self->bad || n < 0) {
+        if (self)
+            self->bad = 1;
+        return;
+    }
+    if (n <= 15) {
+        mw_byte(self, 0x80 | n);
+    } else if (n <= 0xffff) {
+        mw_byte(self, 0xde);
+        mw_be16(self, (u32)n);
+    } else {
+        mw_byte(self, 0xdf);
+        mw_be32(self, (u32)n);
+    }
+}
+
+MpReader mp_reader(const void *p, int n)
+{
+    MpReader r = { (const u8 *)p, n, 0, 0 };
+
+    if (!p || n < 0)
+        r.bad = 1;
+    return r;
+}
+
+int error_at(MpReader *self) { return self ? self->pos : -1; }
+
+static int mr_byte(MpReader *r)
+{
+    if (r->pos >= r->len) {
+        r->bad = 1;
+        return -1;
+    }
+    return (int)r->p[r->pos++];
+}
+
+static u32 mr_be16(MpReader *r)
+{
+    u32 a = (u32)mr_byte(r), b = (u32)mr_byte(r);
+
+    return (a << 8) | b;
+}
+
+static u32 mr_be32(MpReader *r)
+{
+    u32 a = mr_be16(r), b = mr_be16(r);
+
+    return (a << 16) | b;
+}
+
+static u64 mr_be64(MpReader *r)
+{
+    u64 a = (u64)mr_be32(r), b = (u64)mr_be32(r);
+
+    return (a << 32) | b;
+}
+
+/* float32 -> f64（不支持 Inf/NaN，当 0） */
+static f64 mr_f32(u32 b)
+{
+    int sign = (int)(b >> 31) & 1;
+    int exp = (int)((b >> 23) & 0xff);
+    u32 frac = b & 0x7fffffu;
+    f64 v = 0.0;
+
+    if (exp == 0xff)
+        return 0.0;
+    if (exp == 0) {
+        v = (f64)frac / 8388608.0;
+        v = v * 0.000000000000000000000000000000000000011754943508222875; /* 2^-126 */
+    } else {
+        v = 1.0 + (f64)frac / 8388608.0;
+        while (exp > 127) {
+            v = v * 2.0;
+            exp--;
+        }
+        while (exp < 127) {
+            v = v / 2.0;
+            exp++;
+        }
+    }
+    return sign ? -v : v;
+}
+
+static int mr_need(MpReader *r, u64 n)
+{
+    if (n > (u64)(r->len - r->pos)) {
+        r->bad = 1;
+        return 0;
+    }
+    return 1;
+}
+
+/* 1 取到标记 / 0 结束 / -1 格式错 */
+int next(MpReader *self, MpTag *out)
+{
+    int c = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    if (self->pos >= self->len)
+        return 0;
+    c = mr_byte(self);
+    if (c < 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    if (c <= 0x7f) {
+        out->type = MP_UINT;
+        out->u = (u64)c;
+        return 1;
+    }
+    if (c >= 0xe0) {
+        out->type = MP_INT;
+        out->i = (i64)(i8)c;
+        return 1;
+    }
+    if (c >= 0x80 && c <= 0x8f) {
+        out->type = MP_MAP;
+        out->count = c & 0x0f;
+        return 1;
+    }
+    if (c >= 0x90 && c <= 0x9f) {
+        out->type = MP_ARRAY;
+        out->count = c & 0x0f;
+        return 1;
+    }
+    if (c >= 0xa0 && c <= 0xbf) {
+        int n = c & 0x1f;
+
+        if (!mr_need(self, (u64)n))
+            return -1;
+        out->type = MP_STR;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, n } };
+        self->pos += n;
+        return 1;
+    }
+    switch (c) {
+    case 0xc0:
+        out->type = MP_NIL;
+        return 1;
+    case 0xc1:
+        self->bad = 1;
+        return -1;              /* 保留码 */
+    case 0xc2:
+        out->type = MP_BOOL;
+        out->flag = 0;
+        return 1;
+    case 0xc3:
+        out->type = MP_BOOL;
+        out->flag = 1;
+        return 1;
+    case 0xc4: {
+        int n = mr_byte(self);
+
+        if (n < 0 || !mr_need(self, (u64)n))
+            return -1;
+        out->type = MP_BIN;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, n } };
+        self->pos += n;
+        return 1;
+    }
+    case 0xc5: {
+        u32 n = mr_be16(self);
+
+        if (self->bad || !mr_need(self, n))
+            return -1;
+        out->type = MP_BIN;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, (int)n } };
+        self->pos += (int)n;
+        return 1;
+    }
+    case 0xc6: {
+        u32 n = mr_be32(self);
+
+        if (self->bad || !mr_need(self, n))
+            return -1;
+        out->type = MP_BIN;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, (int)n } };
+        self->pos += (int)n;
+        return 1;
+    }
+    case 0xc7:
+    case 0xc8:
+    case 0xc9:
+    case 0xd4:
+    case 0xd5:
+    case 0xd6:
+    case 0xd7:
+    case 0xd8:
+        self->bad = 1;
+        return -1;              /* 扩展类型不支持 */
+    case 0xca: {
+        u32 bits = mr_be32(self);
+        f64 v = 0;
+
+        if (self->bad)
+            return -1;
+        v = mr_f32(bits);
+        out->type = MP_F64;
+        out->f = v;
+        return 1;
+    }
+    case 0xcb: {
+        u64 bits = mr_be64(self);
+        f64 v = 0;
+
+        if (self->bad)
+            return -1;
+        memcpy(&v, &bits, sizeof v);
+        out->type = MP_F64;
+        out->f = v;
+        return 1;
+    }
+    case 0xcc: {
+        int n = mr_byte(self);
+
+        if (n < 0)
+            return -1;
+        out->type = MP_UINT;
+        out->u = (u64)n;
+        return 1;
+    }
+    case 0xcd: {
+        u32 n = mr_be16(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_UINT;
+        out->u = (u64)n;
+        return 1;
+    }
+    case 0xce: {
+        u32 n = mr_be32(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_UINT;
+        out->u = (u64)n;
+        return 1;
+    }
+    case 0xcf: {
+        u64 n = mr_be64(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_UINT;
+        out->u = n;
+        return 1;
+    }
+    case 0xd0: {
+        int n = mr_byte(self);
+
+        if (n < 0)
+            return -1;
+        out->type = MP_INT;
+        out->i = (i64)(i8)n;
+        return 1;
+    }
+    case 0xd1: {
+        u32 n = mr_be16(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_INT;
+        out->i = (i64)(i16)n;
+        return 1;
+    }
+    case 0xd2: {
+        u32 n = mr_be32(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_INT;
+        out->i = (i64)(i32)n;
+        return 1;
+    }
+    case 0xd3: {
+        u64 n = mr_be64(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_INT;
+        out->i = (i64)n;
+        return 1;
+    }
+    case 0xd9: {
+        int n = mr_byte(self);
+
+        if (n < 0 || !mr_need(self, (u64)n))
+            return -1;
+        out->type = MP_STR;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, n } };
+        self->pos += n;
+        return 1;
+    }
+    case 0xda: {
+        u32 n = mr_be16(self);
+
+        if (self->bad || !mr_need(self, n))
+            return -1;
+        out->type = MP_STR;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, (int)n } };
+        self->pos += (int)n;
+        return 1;
+    }
+    case 0xdb: {
+        u32 n = mr_be32(self);
+
+        if (self->bad || !mr_need(self, n))
+            return -1;
+        out->type = MP_STR;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, (int)n } };
+        self->pos += (int)n;
+        return 1;
+    }
+    case 0xdc: {
+        u32 n = mr_be16(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_ARRAY;
+        out->count = (int)n;
+        return 1;
+    }
+    case 0xdd: {
+        u32 n = mr_be32(self);
+
+        if (self->bad || n > 0x7fffffffu)
+            return -1;
+        out->type = MP_ARRAY;
+        out->count = (int)n;
+        return 1;
+    }
+    case 0xde: {
+        u32 n = mr_be16(self);
+
+        if (self->bad)
+            return -1;
+        out->type = MP_MAP;
+        out->count = (int)n;
+        return 1;
+    }
+    case 0xdf: {
+        u32 n = mr_be32(self);
+
+        if (self->bad || n > 0x7fffffffu)
+            return -1;
+        out->type = MP_MAP;
+        out->count = (int)n;
+        return 1;
+    }
+    default:
+        self->bad = 1;
+        return -1;
+    }
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int bytes_are(MpWriter *w, void *buf, const u8 *want, int n)
+{
+    if (!w->ok() || w->len() != n)
+        return 0;
+    return memcmp(buf, want, (size_t)n) == 0;
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0, i = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = -1, lo = -1;
+
+        for (i = 0; i < 16; i++) {
+            if ("0123456789abcdef"[i] == s[0])
+                hi = i;
+            if ("0123456789abcdef"[i] == s[1])
+                lo = i;
+        }
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+test "整数、字符串、容器的规范编码" {
+    char buf[64] = { 0 };
+    MpWriter w = mp_writer(buf, (int)sizeof buf);
+    u8 want[64] = { 0 };
+    struct {
+        u64 v;
+        char *hex;
+    } cases[8] = {
+        { 0ull, (char *)"00" },
+        { 127ull, (char *)"7f" },
+        { 128ull, (char *)"cc80" },
+        { 255ull, (char *)"ccff" },
+        { 256ull, (char *)"cd0100" },
+        { 65535ull, (char *)"cdffff" },
+        { 65536ull, (char *)"ce00010000" },
+        { 4294967296ull, (char *)"cf0000000100000000" },
+    };
+    int i = 0, n = 0;
+
+    for (i = 0; i < 8; i++) {
+        int want_n = unhex(cases[i].hex, want, (int)sizeof want);
+
+        w = mp_writer(buf, (int)sizeof buf);
+        w.write_uint(cases[i].v);
+        if (!bytes_are(&w, buf, want, want_n))
+            return err(1, "无符号整数的编码不对");
+    }
+    /* 负数：-1 -> ff；-32 -> e0；-33 -> d0df；-129 -> d1ff7f */
+    {
+        struct {
+            i64 v;
+            char *hex;
+        } neg[4] = {
+            { -1ll, (char *)"ff" },
+            { -32ll, (char *)"e0" },
+            { -33ll, (char *)"d0df" },
+            { -129ll, (char *)"d1ff7f" },
+        };
+
+        for (i = 0; i < 4; i++) {
+            int want_n = unhex(neg[i].hex, want, (int)sizeof want);
+
+            w = mp_writer(buf, (int)sizeof buf);
+            w.write_int(neg[i].v);
+            if (!bytes_are(&w, buf, want, want_n))
+                return err(2, "负数的编码不对");
+        }
+    }
+    /* 字符串：fixstr 与 str8 */
+    w = mp_writer(buf, (int)sizeof buf);
+    w.write_str(SS("hello"));
+    n = unhex("a568656c6c6f", want, (int)sizeof want);
+    if (!bytes_are(&w, buf, want, n))
+        return err(3, "短字符串的编码不对");
+    {
+        char big[40] = { 0 };
+
+        memset(big, 'x', sizeof big);
+        w = mp_writer(buf, (int)sizeof buf);
+        w.write_str((Str){ (char[:]){ big, 32 } });
+        if (!w.ok() || w.len() != 34 || buf[0] != (char)0xd9 || buf[1] != 32)
+            return err(4, "32 字节字符串应该用 str8");
+    }
+    /* 数组 / 映射 / nil / bool / f64 */
+    w = mp_writer(buf, (int)sizeof buf);
+    w.write_array(2);
+    w.write_uint(1);
+    w.write_uint(2);
+    n = unhex("920102", want, (int)sizeof want);
+    if (!bytes_are(&w, buf, want, n))
+        return err(5, "数组的编码不对");
+    w = mp_writer(buf, (int)sizeof buf);
+    w.write_map(1);
+    w.write_str(SS("a"));
+    w.write_uint(1);
+    n = unhex("81a16101", want, (int)sizeof want);
+    if (!bytes_are(&w, buf, want, n))
+        return err(6, "映射的编码不对");
+    w = mp_writer(buf, (int)sizeof buf);
+    w.write_nil();
+    w.write_bool(1);
+    w.write_bool(0);
+    n = unhex("c0c3c2", want, (int)sizeof want);
+    if (!bytes_are(&w, buf, want, n))
+        return err(7, "nil/bool 的编码不对");
+    w = mp_writer(buf, (int)sizeof buf);
+    w.write_f64(1.5);
+    n = unhex("cb3ff8000000000000", want, (int)sizeof want);
+    if (!bytes_are(&w, buf, want, n))
+        return err(8, "f64 的编码不对");
+    /* bin */
+    w = mp_writer(buf, (int)sizeof buf);
+    w.write_bin("abc", 3);
+    n = unhex("c403616263", want, (int)sizeof want);
+    if (!bytes_are(&w, buf, want, n))
+        return err(9, "bin 的编码不对");
+}
+
+test "解码：标记、roundtrip 与坏输入" {
+    char buf[256] = { 0 };
+    MpWriter w = mp_writer(buf, (int)sizeof buf);
+    MpReader r = { 0 };
+    MpTag t = { 0 };
+    int n = 0;
+
+    w.write_map(2);
+    w.write_str(SS("name"));
+    w.write_str(SS("demo"));
+    w.write_str(SS("count"));
+    w.write_int(-7);
+    if (!w.ok())
+        return err(10, "编码失败");
+    r = mp_reader(buf, w.len());
+    if (r.next(&t) != 1 || t.type != MP_MAP || t.count != 2)
+        return err(11, "map 标记不对");
+    if (r.next(&t) != 1 || t.type != MP_STR || t.s.s.len != 4)
+        return err(12, "键不对");
+    if (r.next(&t) != 1 || t.type != MP_STR || t.s.s.len != 4
+        || memcmp(t.s.s.data, "demo", 4) != 0)
+        return err(13, "值不对");
+    if (r.next(&t) != 1 || t.type != MP_STR || t.s.s.len != 5)
+        return err(14, "第二个键不对");
+    if (r.next(&t) != 1 || t.type != MP_INT || t.i != -7)
+        return err(15, "负数解码不对");
+    if (r.next(&t) != 0)
+        return err(16, "读完之后应该返回 0");
+    /* uint64 / int64 边界、bool、nil、float */
+    {
+        u8 enc[128] = { 0 };
+        int k = 0;
+
+        k = unhex("cf0000000000000001", enc, (int)sizeof enc);
+        r = mp_reader(enc, k);
+        if (r.next(&t) != 1 || t.type != MP_UINT || t.u != 1ull)
+            return err(17, "uint64 解码不对");
+        k = unhex("d38000000000000000", enc, (int)sizeof enc);
+        r = mp_reader(enc, k);
+        if (r.next(&t) != 1 || t.type != MP_INT
+            || t.i != -9223372036854775807ll - 1)
+            return err(18, "int64 下限解码不对");
+        k = unhex("c3c2c0", enc, (int)sizeof enc);
+        r = mp_reader(enc, k);
+        if (r.next(&t) != 1 || t.type != MP_BOOL || t.flag != 1)
+            return err(19, "true 解码不对");
+        if (r.next(&t) != 1 || t.type != MP_BOOL || t.flag != 0)
+            return err(20, "false 解码不对");
+        if (r.next(&t) != 1 || t.type != MP_NIL)
+            return err(21, "nil 解码不对");
+        /* float32 1.5 = 3fc00000 */
+        k = unhex("ca3fc00000", enc, (int)sizeof enc);
+        r = mp_reader(enc, k);
+        if (r.next(&t) != 1 || t.type != MP_F64 || t.f != 1.5)
+            return err(22, "float32 解码不对");
+    }
+    /* 坏输入：截断、保留码、扩展类型、长度越界 */
+    {
+        u8 enc[64] = { 0 };
+        int k = 0;
+
+        k = unhex("a5ab", enc, (int)sizeof enc);      /* fixstr 声明 5 只剩 1 */
+        r = mp_reader(enc, k);
+        if (r.next(&t) != -1)
+            return err(23, "截断的字符串应该失败");
+        k = unhex("c1", enc, (int)sizeof enc);
+        r = mp_reader(enc, k);
+        if (r.next(&t) != -1)
+            return err(24, "保留码 c1 应该失败");
+        k = unhex("d40100", enc, (int)sizeof enc);
+        r = mp_reader(enc, k);
+        if (r.next(&t) != -1)
+            return err(25, "扩展类型应该失败");
+        k = unhex("d9ff00", enc, (int)sizeof enc);    /* str8 声明 255 */
+        r = mp_reader(enc, k);
+        if (r.next(&t) != -1)
+            return err(26, "长度越界应该失败");
+        {
+            MpReader bad = mp_reader(0, 1);
+
+            if (!bad.bad)
+                return err(27, "空指针应该是坏 reader");
+        }
+    }
+    /* 空输入 */
+    r = mp_reader("", 0);
+    if (r.bad || r.next(&t) != 0)
+        return err(28, "空输入应该返回 0");
+    /* 写缓冲不够 */
+    {
+        char small[2] = { 0 };
+        MpWriter sw = mp_writer(small, (int)sizeof small);
+
+        sw.write_str(SS("hello"));
+        if (sw.ok() || sw.len() > 2)
+            return err(29, "缓冲不够应该置 ok=0");
+    }
+    (void)n;
+}

@@ -17,7 +17,7 @@
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序、图、LRU、前缀树 |
 | `std/os/` | 操作系统：流、文件系统与目录树、路径、环境变量、时间、命令行参数、子进程、临时文件、文件锁、内存映射 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、MD5/SHA-1/SHA-256/SHA-512、HKDF/PBKDF2、AES/ChaCha20/Poly1305、安全随机、位流、UUID、LZ4/RLE、hexdump |
-| `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
+| `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM |
 | `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
 ```sh
@@ -149,7 +149,7 @@
 | `std/encoding/poly1305.c6` | `std.encoding.poly1305` | Poly1305 一次性 MAC（RFC 8439 §2.5）：`poly1305_init(key32)` 工厂 + `Poly1305` 的 `ok`/`update`/`final`、一次性 `poly1305_mac`；5×26 位肢体做 130 位模运算（u64 乘积、无 128 位整数），key clamp 折进掩码；**同一把 key 只能用一次** |
 | `std/encoding/random.c6` | `std.encoding.random` | 操作系统安全随机（`/dev/urandom`）：`rand_bytes`/`rand_u64`/`rand_below(bound, out)`（掩码 + 拒绝采样，不用取模）/`rand_hex(out, bytes)`；每次调用 open/close 设备、不缓存 fd，返回 1/0 |
 
-**`std/data/`**（数据格式：JSON、CSV、INI）
+**`std/data/`**（数据格式：JSON、CSV、INI、TOML、XML、Bencode、MessagePack、CBOR、PEM）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -160,6 +160,10 @@
 | `std/data/toml.c6` | `std.data.toml` | TOML 子集零分配读取（事件式）：`toml_open` + `TomlReader.next`（`TOML_TABLE`/`TOML_ARRAY_TABLE`/`TOML_KEY`）、`TomlEntry` 的 `kind`/`section`/`key`/`raw`/`line` 与 `decode`（基本字符串转义与 `\uXXXX`）、`toml_int`（十进制/0x/0o/0b/`_`/符号）、`toml_float`（委托 `std.text.num` 的 `parse_f64`，含 inf/nan）、`toml_bool`、`toml_array_len`/`toml_array_at`；语法错误给行号且能继续读 |
 | `std/data/xml.c6` | `std.data.xml` | XML 零分配扫描（事件式，不做 DOM）：`xml_open` + `XmlReader.next`（`XML_START`/`XML_END`/`XML_SELF`/`XML_TEXT`）、`XmlEvent` 的 `name`/`text`/`attrs` 与 `attr_count`/`attr_at`/`attr`、`xml_unescape`（`&amp;` 等 5 个预定义实体 + `&#NNN;`/`&#xHH;`）；跳过注释/处理指令/DOCTYPE，CDATA 当文本，32 层标签配对校验，出错给字节位置 |
 | `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`Arena` 的 `json_parse`/`json_parse_at`、`Json` 的 `get`/`at`/`count`/`key`、`get_str`/`get_num`/`get_bool`、`write`/`write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
+| `std/data/bencode.c6` | `std.data.bencode` | Bencode（BEP 3，零分配）：`benc_writer` + `BencWriter` 的 `write_int`/`write_str`/`write_list`/`write_dict`/`write_end`、`benc_reader` + `BencReader.next` 的标记流（`BENC_INT`/`BENC_STR`/`BENC_LIST`/`BENC_DICT`/`BENC_END`）、`error_at`；整数/长度拒绝前导零与溢出，字典键排序交给调用方 |
+| `std/data/msgpack.c6` | `std.data.msgpack` | MessagePack（零分配）：`mp_writer` + `MpWriter` 的 `write_nil`/`write_bool`/`write_uint`/`write_int`/`write_f64`/`write_str`/`write_bin`/`write_array`/`write_map`、`mp_reader` + `MpReader.next` 得到 `MpTag`（类型/值/视图/元素个数）；读端支持定型整数、fixstr/str8/16/32、bin8/16/32、float32/float64，扩展类型与保留码 `c1` 一律 -1 |
+| `std/data/cbor.c6` | `std.data.cbor` | CBOR（RFC 8949，零分配）：`cbor_writer` + `CborWriter` 的 `write_uint`/`write_int`/`write_bytes`/`write_text`/`write_array`/`write_map`/`write_bool`/`write_null`/`write_f64`、`cbor_reader` + `CborReader.next` 得到 `CborTag`；主类型 0..5 全支持、半/单/双精度都转 f64；不定长、标签（主类型 6）、`f7`/`f8` 一律 -1 |
+| `std/data/pem.c6` | `std.data.pem` | PEM（RFC 7468）：`pem_encode`（每行 64 列、先算长度再写）、`pem_reader` + `PemReader.next` 得到 `PemBlock`（`label` + Base64 视图、多块迭代、CRLF/前后噪声容忍）、`PemBlock.decode_der` 走 `std.encoding.base64`；标签 1..48 个可打印 ASCII（不含 `-`、首尾不能是空格） |
 
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
 
@@ -212,6 +216,7 @@
 | `examples/stdcrypto.c6` | （无模块） | 第二十三批（消息摘要与密钥派生）的拼装示例（`make std-crypto`）：md5 的 RFC 1321 向量与流式喂入、sha512/sha384 与 HMAC-SHA-512、HKDF 的 RFC 5869 用例、PBKDF2 的 RFC 6070 用例，最后用 HMAC-SHA-256 演示 token 签发/篡改检测，自带自检 |
 | `examples/stdfsx.c6` | （无模块） | 第二十四批（文件系统进阶）的拼装示例（`make std-fsx`）：临时文件/目录、匿名与文件映射（改字节后 sync 回盘）、目录树统计与删树、跨进程抢锁与超时等待，自带自检 |
 | `examples/stdcipher.c6` | （无模块） | 第二十五批（对称加密基础）的拼装示例（`make std-cipher`）：AES 的 FIPS 197 三组向量与 SP 800-38A CTR、ChaCha20 的 RFC 8439 块/加密向量、Poly1305 的 RFC 向量与流式喂入、`/dev/urandom` 随机，最后做一次 ChaCha20+Poly1305 的 encrypt-then-MAC 与篡改检测 |
+| `examples/stddata.c6` | （无模块） | 第二十六批（数据格式）的拼装示例（`make std-data`）：同一份嵌套数据走 bencode/msgpack/cbor 三种编码并核对规范字节，再用 PEM 封装一段 DER 并多块拆封 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -239,6 +244,10 @@ std/core/pool.c6           2 test(s), 0 failure(s)
 std/core/rand.c6           9 test(s), 0 failure(s)
 std/core/types.c6          4 test(s), 0 failure(s)
 std/data/csv.c6            41 test(s), 0 failure(s)
+std/data/bencode.c6        24 test(s), 0 failure(s)
+std/data/msgpack.c6        24 test(s), 0 failure(s)
+std/data/cbor.c6           24 test(s), 0 failure(s)
+std/data/pem.c6            32 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
 std/data/props.c6          4 test(s), 0 failure(s)
@@ -308,6 +317,10 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/container/set.c6` 17 | map 9 + set 8 |
 | `std/data/json.c6` 60 | json 17 + str 22 + num 11 + mem 7 + err 3 |
 | `std/data/csv.c6` 41 | csv 19 + str 22（csv 只借 `Str` 类型，函数体不依赖 str 的代码） |
+| `std/data/bencode.c6` 24 | bencode 2 + str 22（只借 `Str` 类型，正文不调用 str） |
+| `std/data/msgpack.c6` 24 | msgpack 2 + str 22（同上） |
+| `std/data/cbor.c6` 24 | cbor 2 + str 22（同上） |
+| `std/data/pem.c6` 32 | pem 2 + base64 8 + str 22（Base64 解码用 base64 的正文） |
 | `std/os/env.c6` 39 | env 14 + str 22 + err 3（env 用到 `str()`） |
 | `std/encoding/sha256.c6` 23 | sha256 17 + bits 6（`rotr32` 是跨 TU 调用） |
 | `std/encoding/md5.c6` 9 | md5 3 + bits 6（`rotr32` 是跨 TU 调用） |
@@ -354,7 +367,8 @@ std/text/width.c6          10 test(s), 0 failure(s)
 `std/os/fs`、`std/os/path`、`std/text/str`、`std/core/err`，`std/os/lock` 要
 `std/os/time`，`std/os/temp` 与 `std/os/mmap` 自成一体（temp 只借 `Str` 类型），
 `std/encoding/aes`、`std/encoding/poly1305`、`std/encoding/random` 也自成一体，
-`std/encoding/chacha20` 的正文必须带 `std/core/bits`（`rotl32`）。
+`std/encoding/chacha20` 的正文必须带 `std/core/bits`（`rotl32`），`std/data/pem`
+要 `std/encoding/base64`，bencode/msgpack/cbor 只借 `Str` 类型（正文不调 str）。
 
 ## 设计原则
 
@@ -3024,6 +3038,27 @@ Gentlemen..."），并解密还原；「Poly1305」验 RFC 8439 §2.5.2 的 tag�
 和 nonce，ChaCha20 加密、Poly1305 对密文打 MAC，收方先验 MAC 再解密，改一个
 密文字节之后 MAC 必须变。期望值全部来自 FIPS/NIST/RFC 向量，不联网。
 
+### 集成示例：`examples/stddata.c6`
+
+```sh
+make std-data
+```
+
+```
+stddata: 标准库第二十六批（bencode / msgpack / cbor / pem）
+bencode: d4:name4:demo3:idsli1ei2eee 编解码都对
+msgpack: map/str/int 编解码都对
+cbor: a1616101 / 3903e7 / 半精度 1.5 都对
+pem: PUBLIC KEY 封装/拆封与多块迭代都对
+stddata: 15 check(s), 0 failure(s)
+```
+
+四节用同一份「带嵌套的小字典」走四种格式：bencode 编出
+`d4:name4:demo3:idsli1ei2eee` 并逐个读标记；msgpack 编一个两键的 map
+（`name`/`n=-7`）再解回来，另验 `128` 的 `cc80`；cbor 验 `a1616101`、
+`-1000` 的 `3903e7` 和半精度 `f93e00` → 1.5；pem 把 48 字节「假 DER」封装成
+`PUBLIC KEY` 块再拆封回原字节，最后把两块拼起来确认迭代器能读 2 块。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3070,6 +3105,8 @@ Gentlemen..."），并解密还原；「Poly1305」验 RFC 8439 §2.5.2 的 tag�
   示例（自带自检）。
 * `make std-cipher`：`examples/stdcipher.c6`，第二十五批（对称加密基础）模块的
   拼装示例（自带自检）。
+* `make std-data`：`examples/stddata.c6`，第二十六批（数据格式）模块的拼装示例
+  （自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -3114,6 +3151,14 @@ Gentlemen..."），并解密还原；「Poly1305」验 RFC 8439 §2.5.2 的 tag�
   `final` 里 `h + s` 的收尾和 padding 的边界）。
 * `std/encoding/random.c6` 的 `rand_below` 分布冒烟：300 次取 `[0,10)` 至少出现
   5 种值（挡住「掩码写错导致只出 0」这类 bug），并检查大 bound 不越界。
+* `std/data/bencode.c6` 的「坏输入」：`i03e`（前导零）、`i-0e`、`i12x`、
+  `5:abc`（长度超过剩余）都要 -1，且 `error_at` 给出偏移。
+* `std/data/msgpack.c6` 的边界值：`0/127/128/255/256/65535/65536/2^32` 的宽度
+  选择，以及 int64 下限 `d3 8000000000000000` 的解码。
+* `std/data/cbor.c6` 的「附加信息」分支：`17`/`1818`/`1903e8`/`1a...`/`1b...`
+  逐个钉住 0/1/2/4/8 字节的长度编码，另验 `f9` 半精度转 f64。
+* `std/data/pem.c6` 的「100 字节 DER」：Base64 正好 3 行（64/64/8）、最宽 64，
+  且容量不够时不写半截。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，

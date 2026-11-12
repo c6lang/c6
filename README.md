@@ -261,7 +261,7 @@ std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进�
   std/encoding/punycode.c6  std.encoding.punycode  Punycode（RFC 3492）+ IDNA：punycode_encode/decode、idna_encode/decode（xn--、Unicode 句点、63/255 字节上限）
   std/encoding/uuid.c6      std.encoding.uuid      UUID（RFC 9562/4122）：uuid_v4/Rand.v4_seeded、uuid_v7/uuid_v7_at/time_v7、v5 与四个预定义命名空间 uuid_ns_dns/uuid_ns_url/uuid_ns_oid/uuid_ns_x500、uuid_parse/format/format_simple/format_upper、version/variant/eq/uuid_nil/is_nil
 
-std/data/                   数据格式：JSON、CSV、INI、.properties/.env、TOML、XML、查询串/表单
+std/data/                   数据格式：JSON、CSV、INI、.properties/.env、TOML、XML、查询串/表单、Bencode、MessagePack、CBOR、PEM
   std/data/csv.c6           std.data.csv           RFC 4180 CSV：零分配 CsvReader（引号/跨行/CRLF）+ csv_write_row
   std/data/ini.c6           std.data.ini           INI 配置的零分配读取：ini_open/next（字段都是输入上的视图）、ini_lookup/ini_has_section/ini_count、IniEntry.section/key/value/line；语法错误给行号
   std/data/json.c6          std.data.json          JSON 解析与写出：Arena 上的 DOM（a.json_parse）、Json 的 get/at、write/write_pretty/escape（数字保留原文）
@@ -269,6 +269,10 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/toml.c6          std.data.toml          TOML 子集零分配读取：toml_open + TomlReader.next、TomlEntry 的 kind/section/key/raw 与 decode、toml_int/toml_float/toml_bool、toml_array_len/toml_array_at；表/表数组、注释、基本与字面量字符串、数组、语法错误给行号
   std/data/xml.c6           std.data.xml           XML 零分配扫描：xml_open + XmlReader.next（START/END/SELF/TEXT）、XmlEvent 的 name/text/attrs 与 attr_count/attr_at/attr、xml_unescape（5 个预定义实体 + 数字引用）；跳过注释/PI/DOCTYPE，CDATA 当文本，32 层标签配对校验
   std/data/props.c6         std.data.props         .properties/.env 零分配读取：props_open/next、e.decode(buf)、props_lookup/has/count（\n/\uXXXX/代理对/续行）
+  std/data/bencode.c6       std.data.bencode      Bencode（BitTorrent）：benc_writer 的 write_int/write_str/write_list/write_dict/write_end、benc_reader + next 的标记流；拒绝前导零与溢出
+  std/data/msgpack.c6       std.data.msgpack      MessagePack：mp_writer 的 nil/bool/uint/int/f64/str/bin/array/map、mp_reader + next 的 MpTag；不支持扩展类型
+  std/data/cbor.c6          std.data.cbor         CBOR（RFC 8949）：cbor_writer 的 uint/int/bytes/text/array/map/bool/null/f64、cbor_reader + next 的 CborTag；半/单/双精度都转 f64，不支持不定长与标签
+  std/data/pem.c6           std.data.pem          PEM（RFC 7468）：pem_encode（64 列 Base64）、pem_reader + next 的多块迭代、PemBlock.decode_der；标签 1..48 个可打印 ASCII
 
 std/net/                    网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP/1.x 解析、客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME、multipart
   std/net/cookie.c6         std.net.cookie         Cookie/Set-Cookie 零分配解析：cookie_parse_set/pair、Cookie 的 attribute/path/domain/max_age/is_secure、cookie_write_pair
@@ -329,6 +333,7 @@ make std-serve   # 编译并运行 examples/stdserve.c6（第二十二批 Web �
 make std-crypto  # 编译并运行 examples/stdcrypto.c6（第二十三批摘要与密钥派生模块的拼装示例）
 make std-fsx     # 编译并运行 examples/stdfsx.c6（第二十四批文件系统进阶模块的拼装示例）
 make std-cipher  # 编译并运行 examples/stdcipher.c6（第二十五批对称加密基础模块的拼装示例）
+make std-data    # 编译并运行 examples/stddata.c6（第二十六批数据格式模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

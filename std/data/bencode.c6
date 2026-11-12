@@ -1,0 +1,446 @@
+/* std/data/bencode：Bencode 编解码（BitTorrent 的元信息格式，BEP 3）。
+ *
+ *     import std.data.bencode;
+ *
+ *     char buf[256] = { 0 };
+ *     BencWriter w = benc_writer(buf, (int)sizeof buf);
+ *     w.write_dict();
+ *     w.write_str(SS("name"));
+ *     w.write_str(SS("demo"));
+ *     w.write_end();
+ *     // buf = "d4:name4:demoe"
+ *
+ *     BencReader r = benc_reader(buf, w.len());
+ *     BencTag t = { 0 };
+ *     while (r.next(&t) == 1) {
+ *         if (t.type == BENC_STR) ... t.s ...
+ *     }
+ *
+ * 格式只有四种值：整数 `i<十进制>e`、字节串 `<长度>:<字节>`、列表 `l…e`、
+ * 字典 `d<键><值>…e`（键必须是字节串且**按字节序升序**，这一层不替你排序）。
+ * 读取器把 `l`/`d` 当「开始」标记交出来，`e` 当 `BENC_END`，由调用方按自己的
+ * 结构递归消费——这样不用在库里建树、不用分配。
+ *
+ * 约定：
+ *
+ * - 写调用方缓冲：`BencWriter` 满了置 `ok = 0` 并忽略后续写入，`len()` 只反映
+ *   已经写进去的部分；调用方写完查 `ok()` 再决定用不用；
+ * - 整数写 `i64`；解码拒绝前导零（`i03e`）、`i-0e`、空数字和溢出（返回 -1）；
+ * - 字节串长度是十进制且不能有前导零（`0:` 合法表示空串）；长度超过 `int`
+ *   或超过剩余输入都算错；
+ * - `next`：1 取到一个标记 / 0 输入结束 / -1 格式错（`BencReader` 的 `pos`
+ *   停在出错位置附近，调用方可以从 `error_at()` 拿到偏移）；
+ * - 字典键的排序、重复键、schema 都是调用方的事，这一层只保证字节级正确。
+ */
+#include <string.h>
+
+module std.data.bencode;
+import std.core.types;
+import std.text.str;
+
+enum BencType {
+    BENC_END = 0,
+    BENC_INT = 1,
+    BENC_STR = 2,
+    BENC_LIST = 3,
+    BENC_DICT = 4,
+};
+
+struct BencWriter {
+    char *buf;
+    int cap;
+    int used;
+    int bad;
+};
+
+struct BencTag {
+    int type;
+    i64 i;
+    Str s;
+};
+
+struct BencReader {
+    const char *p;
+    int len;
+    int pos;
+    int bad;
+};
+
+BencWriter benc_writer(void *buf, int cap)
+{
+    BencWriter w = { (char *)buf, cap, 0, 0 };
+
+    if (!buf || cap <= 0)
+        w.bad = 1;
+    return w;
+}
+
+int ok(BencWriter *self) { return self && !self->bad; }
+
+int len(BencWriter *self) { return self ? self->used : 0; }
+
+static void bw_bytes(BencWriter *w, const void *p, int n)
+{
+    if (w->bad || n < 0)
+        return;
+    if (w->used + n > w->cap) {
+        w->bad = 1;
+        return;
+    }
+    if (n > 0)
+        memcpy(w->buf + w->used, p, (size_t)n);
+    w->used += n;
+}
+
+static void bw_char(BencWriter *w, int c)
+{
+    char ch = (char)c;
+
+    bw_bytes(w, &ch, 1);
+}
+
+/* 十进制 i64（含负号），不经过 printf */
+static void bw_i64(BencWriter *w, i64 v)
+{
+    char tmp[24] = { 0 };
+    int n = 0, i = 0;
+    u64 u = 0;
+
+    if (v < 0) {
+        bw_char(w, '-');
+        u = (u64)(-(v + 1)) + 1ull;
+    } else {
+        u = (u64)v;
+    }
+    do {
+        tmp[n++] = (char)('0' + (int)(u % 10ull));
+        u /= 10ull;
+    } while (u > 0 && n < (int)sizeof tmp);
+    for (i = n - 1; i >= 0; i--)
+        bw_char(w, tmp[i]);
+}
+
+void write_int(BencWriter *self, i64 v)
+{
+    if (!self || self->bad)
+        return;
+    bw_char(self, 'i');
+    bw_i64(self, v);
+    bw_char(self, 'e');
+}
+
+/* 字节串：`<长度>:<原始字节>` */
+void write_str(BencWriter *self, Str s)
+{
+    if (!self || self->bad)
+        return;
+    if (!s.s.data && s.s.len > 0) {
+        self->bad = 1;
+        return;
+    }
+    bw_i64(self, (i64)s.s.len);
+    bw_char(self, ':');
+    if (s.s.len > 0)
+        bw_bytes(self, s.s.data, s.s.len);
+}
+
+void write_list(BencWriter *self)
+{
+    if (self && !self->bad)
+        bw_char(self, 'l');
+}
+
+void write_dict(BencWriter *self)
+{
+    if (self && !self->bad)
+        bw_char(self, 'd');
+}
+
+/* 结束当前的列表/字典 */
+void write_end(BencWriter *self)
+{
+    if (self && !self->bad)
+        bw_char(self, 'e');
+}
+
+BencReader benc_reader(const void *p, int n)
+{
+    BencReader r = { (const char *)p, n, 0, 0 };
+
+    if (!p || n < 0)
+        r.bad = 1;
+    return r;
+}
+
+int error_at(BencReader *self) { return self ? self->pos : -1; }
+
+static int br_eof(BencReader *r) { return r->pos >= r->len; }
+
+static int br_peek(BencReader *r)
+{
+    if (br_eof(r))
+        return -1;
+    return (int)(u8)r->p[r->pos];
+}
+
+static int br_next_char(BencReader *r)
+{
+    if (br_eof(r))
+        return -1;
+    return (int)(u8)r->p[r->pos++];
+}
+
+static int br_digit(int c) { return c >= '0' && c <= '9'; }
+
+/* 十进制长度/整数：[0-9]+，禁止前导零；溢出返回 -1 */
+static int br_number(BencReader *r, i64 *out)
+{
+    u64 m = 0, limit = 0;
+    int c = 0, neg = 0;
+
+    if (br_peek(r) == '-') {
+        neg = 1;
+        r->pos++;
+    }
+    c = br_peek(r);
+    if (!br_digit(c))
+        return -1;
+    if (c == '0') {
+        r->pos++;
+        if (br_digit(br_peek(r)))
+            return -1;              /* 前导零 */
+        if (neg)
+            return -1;              /* i-0e 不合法 */
+        *out = 0;
+        return 0;
+    }
+    /* 负数允许到 2^63（i64 的最小值），正数到 2^63-1 */
+    limit = neg ? 9223372036854775808ull : 9223372036854775807ull;
+    while (br_digit(br_peek(r))) {
+        u64 d = (u64)(br_next_char(r) - '0');
+
+        if (m > (limit - d) / 10ull)
+            return -1;
+        m = m * 10ull + d;
+    }
+    if (neg)
+        *out = (m == 9223372036854775808ull)
+                   ? (-9223372036854775807ll - 1)
+                   : -(i64)m;
+    else
+        *out = (i64)m;
+    return 0;
+}
+
+/* 1 取到 / 0 结束 / -1 格式错 */
+int next(BencReader *self, BencTag *out)
+{
+    int c = 0;
+
+    if (!self || self->bad || !out)
+        return -1;
+    if (br_eof(self))
+        return 0;
+    c = br_peek(self);
+    if (c == 'e') {
+        self->pos++;
+        out->type = BENC_END;
+        return 1;
+    }
+    if (c == 'i') {
+        i64 v = 0;
+
+        self->pos++;
+        if (br_number(self, &v) != 0 || br_peek(self) != 'e') {
+            self->bad = 1;
+            return -1;
+        }
+        self->pos++;
+        out->type = BENC_INT;
+        out->i = v;
+        out->s = (Str){ { (char *)0, 0 } };
+        return 1;
+    }
+    if (c == 'l') {
+        self->pos++;
+        out->type = BENC_LIST;
+        return 1;
+    }
+    if (c == 'd') {
+        self->pos++;
+        out->type = BENC_DICT;
+        return 1;
+    }
+    if (br_digit(c)) {
+        i64 n = 0;
+
+        if (br_number(self, &n) != 0 || n < 0 || br_peek(self) != ':') {
+            self->bad = 1;
+            return -1;
+        }
+        self->pos++;
+        if (n > (i64)(self->len - self->pos)) {
+            self->bad = 1;
+            return -1;
+        }
+        out->type = BENC_STR;
+        out->i = 0;
+        out->s = (Str){ (char[:]){ (char *)self->p + self->pos, (int)n } };
+        self->pos += (int)n;
+        return 1;
+    }
+    self->bad = 1;
+    return -1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int buf_is(BencWriter *w, void *buf, char *want)
+{
+    if (!w->ok())
+        return 0;
+    if (w->len() != (int)strlen(want))
+        return 0;
+    return memcmp(buf, want, (size_t)w->len()) == 0;
+}
+
+test "编码：整数、字节串、列表、字典" {
+    char buf[128] = { 0 };
+    BencWriter w = benc_writer(buf, (int)sizeof buf);
+
+    w.write_int(0);
+    if (!buf_is(&w, buf, "i0e"))
+        return err(1, "0 的编码不对");
+    w = benc_writer(buf, (int)sizeof buf);
+    w.write_int(-42);
+    if (!buf_is(&w, buf, "i-42e"))
+        return err(2, "负数的编码不对");
+    w = benc_writer(buf, (int)sizeof buf);
+    w.write_int(9223372036854775807ll);
+    if (!buf_is(&w, buf, "i9223372036854775807e"))
+        return err(3, "i64 上限的编码不对");
+    w = benc_writer(buf, (int)sizeof buf);
+    w.write_str(SS("spam"));
+    if (!buf_is(&w, buf, "4:spam"))
+        return err(4, "字节串编码不对");
+    w = benc_writer(buf, (int)sizeof buf);
+    w.write_str(SS(""));
+    if (!buf_is(&w, buf, "0:"))
+        return err(5, "空字节串编码不对");
+    /* 列表 li1e1:ae */
+    w = benc_writer(buf, (int)sizeof buf);
+    w.write_list();
+    w.write_int(1);
+    w.write_str(SS("a"));
+    w.write_end();
+    if (!buf_is(&w, buf, "li1e1:ae"))
+        return err(6, "列表编码不对");
+    /* 字典 d1:ai1ee */
+    w = benc_writer(buf, (int)sizeof buf);
+    w.write_dict();
+    w.write_str(SS("a"));
+    w.write_int(1);
+    w.write_end();
+    if (!buf_is(&w, buf, "d1:ai1ee"))
+        return err(7, "字典编码不对");
+    /* 容量不够：ok 变 0，不写半截 */
+    {
+        char small[4] = { 0 };
+
+        w = benc_writer(small, (int)sizeof small);
+        w.write_str(SS("abcdef"));
+        if (w.ok())
+            return err(8, "放不下应该置 ok=0");
+        if (w.len() > 4)
+            return err(9, "len 不该超过容量");
+    }
+    /* 坏参数 */
+    if (benc_writer(0, 10).ok() || benc_writer(buf, 0).ok())
+        return err(10, "空缓冲应该无效");
+    w = benc_writer(buf, (int)sizeof buf);
+    w.write_str((Str){ { (char *)0, 3 } });
+    if (w.ok())
+        return err(11, "空指针 + 非零长度应该失败");
+}
+
+test "解码：标记流、嵌套与坏输入" {
+    char buf[128] = { 0 };
+    BencWriter w = benc_writer(buf, (int)sizeof buf);
+    BencReader r = { 0 };
+    BencTag t = { 0 };
+    int n = 0;
+
+    /* d4:name4:demol1:xi2eee */
+    w.write_dict();
+    w.write_str(SS("name"));
+    w.write_str(SS("demo"));
+    w.write_list();
+    w.write_str(SS("x"));
+    w.write_int(2);
+    w.write_end();
+    w.write_end();
+    if (!w.ok())
+        return err(12, "编码嵌套失败");
+    r = benc_reader(buf, w.len());
+    if (r.next(&t) != 1 || t.type != BENC_DICT)
+        return err(13, "字典开始标记不对");
+    if (r.next(&t) != 1 || t.type != BENC_STR || t.s.s.len != 4
+        || memcmp(t.s.s.data, "name", 4) != 0)
+        return err(14, "键不对");
+    if (r.next(&t) != 1 || t.type != BENC_STR || t.s.s.len != 4
+        || memcmp(t.s.s.data, "demo", 4) != 0)
+        return err(15, "值不对");
+    if (r.next(&t) != 1 || t.type != BENC_LIST)
+        return err(16, "列表开始标记不对");
+    if (r.next(&t) != 1 || t.type != BENC_STR || t.s.s.data[0] != 'x')
+        return err(17, "列表元素不对");
+    if (r.next(&t) != 1 || t.type != BENC_INT || t.i != 2)
+        return err(18, "列表里的整数不对");
+    if (r.next(&t) != 1 || t.type != BENC_END)
+        return err(19, "列表结束标记不对");
+    if (r.next(&t) != 1 || t.type != BENC_END)
+        return err(20, "字典结束标记不对");
+    if (r.next(&t) != 0)
+        return err(21, "读完之后应该返回 0");
+    /* 空字节串与负数 */
+    r = benc_reader("0:i-7e", 6);
+    if (r.next(&t) != 1 || t.type != BENC_STR || t.s.s.len != 0)
+        return err(22, "空字节串解码不对");
+    if (r.next(&t) != 1 || t.type != BENC_INT || t.i != -7)
+        return err(23, "负数解码不对");
+    /* 坏输入 */
+    {
+        char *bad[] = { (char *)"i03e", (char *)"i-0e", (char *)"i12x",
+                        (char *)"5:abc", (char *)"x", (char *)"i-e",
+                        (char *)"99999999999999999999e" };
+        int i = 0;
+
+        for (i = 0; i < 7; i++) {
+            BencReader br = benc_reader(bad[i], (int)strlen(bad[i]));
+
+            if (br.next(&t) != -1)
+                return err(24, "坏输入应该返回 -1");
+            if (br.error_at() < 0)
+                return err(25, "error_at 应该给偏移");
+        }
+    }
+    /* 截断的字节串长度：声明 10 但只剩 2 */
+    {
+        BencReader br = benc_reader("10:ab", 5);
+
+        if (br.next(&t) != -1)
+            return err(26, "长度超过剩余输入应该失败");
+    }
+    {
+        BencReader empty = benc_reader("", 0);
+
+        if (empty.bad || empty.next(&t) != 0)
+            return err(27, "空输入应该是合法空");
+        if (!benc_reader(0, 1).bad)
+            return err(28, "空指针应该无效");
+    }
+    (void)n;
+}

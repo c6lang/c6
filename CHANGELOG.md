@@ -47,6 +47,18 @@
 
 ### 标准库
 
+- **标准库第二十六批（数据格式）**：`std.data.bencode` / `std.data.msgpack` /
+  `std.data.cbor` / `std.data.pem` 四个模块，集成示例 `examples/stddata.c6`
+  （`make std-data`）。bencode 是 BitTorrent 的元信息格式（写整数/字节串/
+  列表/字典，读端给标记流，拒绝前导零与溢出）；msgpack 与 cbor 是两种紧凑
+  二进制（写端覆盖 nil/bool/整数/浮点/字符串/二进制/数组/映射，读端给
+  `MpTag`/`CborTag`；msgpack 拒绝扩展类型与保留码，cbor 拒绝不定长、标签与
+  `f7`/`f8`，半/单精度都转 f64）；pem 是 RFC 7468 的 BEGIN/END + Base64 封装
+  （`pem_encode` 每行 64 列、`pem_reader` 多块迭代、`decode_der` 走
+  `std.encoding.base64`）。四个模块都是纯函数、零分配、调用方给缓冲。错误号段
+  `std.data.msgpack`=0x6071 … `std.data.pem`=0x6074（`c6_err_std_slots[]` 追加，
+  `grammar.md` §8.1 同步）。
+
 - **标准库第二十五批（对称加密基础）**：`std.encoding.aes` /
   `std.encoding.chacha20` / `std.encoding.poly1305` / `std.encoding.random`
   四个模块，集成示例 `examples/stdcipher.c6`（`make std-cipher`）。aes 是

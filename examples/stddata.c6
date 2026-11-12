@@ -1,0 +1,219 @@
+/* stddata：标准库第二十六批（bencode / msgpack / cbor / pem）的拼装示例。
+ *
+ * 和前面几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 各节自带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这批是**数据格式**：四种「把结构化数据变成字节」的东西，全是纯函数、
+ * 零分配、调用方给缓冲。示例用同一份小数据（一个带嵌套的字典）走一遍四种格式，
+ * 再演示 PEM 的封装/拆封：
+ *
+ *   1. bencode：BitTorrent 元信息格式（`d4:name4:demol...e`）；
+ *   2. msgpack：MessagePack 的紧凑二进制；
+ *   3. cbor：CBOR 的「主类型 + 附加信息」编码，顺带解一个半精度浮点；
+ *   4. pem：`-----BEGIN ...-----` 封装（接 Base64），多块迭代。
+ *
+ * 所有期望字节都写在代码里（来自规范），不联网。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stddata \
+ *         examples/stddata.c6 std/core/types.c6 std/text/str.c6 \
+ *         std/data/bencode.c6 std/data/msgpack.c6 std/data/cbor.c6 \
+ *         std/data/pem.c6 std/encoding/base64.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.data.bencode;
+import std.data.msgpack;
+import std.data.cbor;
+import std.data.pem;
+import std.encoding.base64;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int unhex(const char *s, u8 *dst, int cap)
+{
+    int n = 0, i = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = -1, lo = -1;
+
+        for (i = 0; i < 16; i++) {
+            if ("0123456789abcdef"[i] == s[0])
+                hi = i;
+            if ("0123456789abcdef"[i] == s[1])
+                lo = i;
+        }
+        if (hi < 0 || lo < 0)
+            return -1;
+        dst[n++] = (u8)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+static int bytes_are(void *p, int n, const char *hex)
+{
+    u8 want[128] = { 0 };
+    int m = unhex(hex, want, (int)sizeof want);
+
+    if (m != n)
+        return 0;
+    return memcmp(p, want, (size_t)n) == 0;
+}
+
+/* 1) bencode：嵌套字典 + 列表 */
+static void tour_bencode(void)
+{
+    char buf[256] = { 0 };
+    BencWriter w = benc_writer(buf, (int)sizeof buf);
+    BencReader r = { 0 };
+    BencTag t = { 0 };
+    int saw_name = 0, saw_list = 0, items = 0;
+
+    w.write_dict();
+    w.write_str(SS("name"));
+    w.write_str(SS("demo"));
+    w.write_str(SS("ids"));
+    w.write_list();
+    w.write_int(1);
+    w.write_int(2);
+    w.write_end();
+    w.write_end();
+    check(w.ok(), "bencode: 编码");
+    check(bytes_are(buf, w.len(), "64343a6e616d65343a64656d6f333a6964736c6931656932656565"),
+          "bencode: 字节与规范一致");
+    r = benc_reader(buf, w.len());
+    while (r.next(&t) == 1) {
+        if (t.type == BENC_STR && t.s.s.len == 4
+            && memcmp(t.s.s.data, "name", 4) == 0)
+            saw_name = 1;
+        if (t.type == BENC_LIST)
+            saw_list = 1;
+        if (t.type == BENC_INT)
+            items++;
+    }
+    check(saw_name && saw_list && items == 2, "bencode: 标记流");
+    printf("bencode: d4:name4:demo3:idsli1ei2eee 编解码都对\n");
+}
+
+/* 2) msgpack：同一份数据 */
+static void tour_msgpack(void)
+{
+    char buf[256] = { 0 };
+    MpWriter w = mp_writer(buf, (int)sizeof buf);
+    MpReader r = { 0 };
+    MpTag t = { 0 };
+    int keys = 0, ints = 0;
+
+    w.write_map(2);
+    w.write_str(SS("name"));
+    w.write_str(SS("demo"));
+    w.write_str(SS("n"));
+    w.write_int(-7);
+    check(w.ok(), "msgpack: 编码");
+    r = mp_reader(buf, w.len());
+    if (r.next(&t) != 1 || t.type != MP_MAP || t.count != 2)
+        check(0, "msgpack: map 头");
+    while (r.next(&t) == 1) {
+        if (t.type == MP_STR)
+            keys++;
+        if (t.type == MP_INT && t.i == -7)
+            ints++;
+    }
+    check(keys == 3 && ints == 1, "msgpack: 解码标记");
+    /* 单个值：128 -> cc80 */
+    w = mp_writer(buf, (int)sizeof buf);
+    w.write_uint(128);
+    check(bytes_are(buf, w.len(), "cc80"), "msgpack: 128 的编码");
+    printf("msgpack: map/str/int 编解码都对\n");
+}
+
+/* 3) cbor：规范字节 + 半精度浮点 */
+static void tour_cbor(void)
+{
+    char buf[64] = { 0 };
+    CborWriter w = cbor_writer(buf, (int)sizeof buf);
+    CborReader r = { 0 };
+    CborTag t = { 0 };
+    u8 enc[16] = { 0 };
+    int n = 0;
+
+    w.write_map(1);
+    w.write_text(SS("a"));
+    w.write_uint(1);
+    check(w.ok() && bytes_are(buf, w.len(), "a1616101"), "cbor: 映射编码");
+    w = cbor_writer(buf, (int)sizeof buf);
+    w.write_int(-1000);
+    check(bytes_are(buf, w.len(), "3903e7"), "cbor: -1000 的编码");
+    /* 半精度 1.5 = f93e00 */
+    n = unhex("f93e00", enc, (int)sizeof enc);
+    r = cbor_reader(enc, n);
+    check(r.next(&t) == 1 && t.type == CB_F64 && t.f == 1.5,
+          "cbor: 半精度解码");
+    printf("cbor: a1616101 / 3903e7 / 半精度 1.5 都对\n");
+}
+
+/* 4) pem：封装一段假 DER，再拆封 + 多块迭代 */
+static void tour_pem(void)
+{
+    u8 der[48] = { 0 }, back[128] = { 0 };
+    char pem[512] = { 0 }, pem2[512] = { 0 };
+    char multi[1024] = { 0 };
+    PemReader r = { 0 };
+    PemBlock b = { 0 };
+    int n = 0, m = 0, i = 0, blocks = 0;
+
+    for (i = 0; i < (int)sizeof der; i++)
+        der[i] = (u8)(i + 1);
+    n = pem_encode(SS("PUBLIC KEY"), der, (int)sizeof der, pem,
+                   (int)sizeof pem);
+    check(n > 0, "pem: 编码");
+    check(strncmp(pem, "-----BEGIN PUBLIC KEY-----\n", 27) == 0,
+          "pem: BEGIN 行");
+    check(strstr(pem, "-----END PUBLIC KEY-----\n") != 0, "pem: END 行");
+    r = pem_reader((Str){ (char[:]){ pem, n } });
+    check(r.next(&b) == 1 && strcmp(b.label, "PUBLIC KEY") == 0,
+          "pem: 读出标签");
+    m = b.decode_der(back, (int)sizeof back);
+    check(m == (int)sizeof der && memcmp(back, der, sizeof der) == 0,
+          "pem: DER 往返");
+    /* 两块拼在一起 */
+    n = pem_encode(SS("A"), "abc", 3, pem, (int)sizeof pem);
+    m = pem_encode(SS("B"), "xyz", 3, pem2, (int)sizeof pem2);
+    memcpy(multi, pem, (size_t)n);
+    memcpy(multi + n, pem2, (size_t)m);
+    r = pem_reader((Str){ (char[:]){ multi, n + m } });
+    blocks = 0;
+    while (r.next(&b) == 1)
+        blocks++;
+    check(blocks == 2, "pem: 多块迭代");
+    printf("pem: PUBLIC KEY 封装/拆封与多块迭代都对\n");
+}
+
+int main(void)
+{
+    printf("stddata: 标准库第二十六批（bencode / msgpack / cbor / pem）\n");
+    tour_bencode();
+    tour_msgpack();
+    tour_cbor();
+    tour_pem();
+    printf("stddata: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

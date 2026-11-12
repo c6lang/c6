@@ -1,0 +1,393 @@
+/* std/data/pem：PEM 封装（RFC 7468）与 DER 取出。
+ *
+ *     import std.data.pem;
+ *
+ *     char pem[512] = { 0 };
+ *     int n = pem_encode(SS("CERTIFICATE"), der, der_len, pem, (int)sizeof pem);
+ *
+ *     PemReader r = pem_reader((Str){ S(pem) });
+ *     PemBlock b = { 0 };
+ *     while (r.next(&b) == 1) {
+ *         char der2[256] = { 0 };
+ *         int m = b.decode_der(der2, (int)sizeof der2);   // -1 = base64 坏/放不下
+ *         ...
+ *     }
+ *
+ * PEM 就是「`-----BEGIN <label>-----` + 每行 64 字符的 Base64 + `-----END
+ * <label>-----`」。这一层不解析 DER 内部结构（那要靠具体格式的模块），只负责
+ * 封装/拆封：编码时按 48 字节一块（正好 64 个 Base64 字符）逐行写，解码时
+ * 把行内空白交给 Base64 解码器跳过，标签必须首尾一致。
+ *
+ * 约定：
+ *
+ * - `pem_encode`：label 1..48 个可打印 ASCII（不能有空白/`-`），DER 传 0 且
+ *   `n == 0` 表示空体；输出以 `\n` 结尾；返回写入长度，放不下返回 -1 且不写
+ *   半截（先算长度再写）；
+ * - `PemReader.next`：跳过不是 `-----BEGIN` 的文本，找到一个块就给 1（`label`
+ *   和 `base64` 都是输入上的视图），输入读完给 0，结构坏（没有 END、标签不
+ *   一致）给 -1；
+ * - `PemBlock.decode_der`：Base64 解码到调用方缓冲，返回字节数或 -1；这一层
+ *   不校验 DER 的 TLV 结构；
+ * - 行尾 `\r\n` 和行首的空白都容忍（MIME/邮件里常见），标签大小写敏感。
+ */
+#include <stdio.h>
+#include <string.h>
+
+module std.data.pem;
+import std.core.types;
+import std.encoding.base64;
+import std.text.str;
+
+#define PEM_LABEL_MAX 64
+#define PEM_WRAP 64
+
+struct PemReader {
+    Str text;
+    int pos;
+};
+
+struct PemBlock {
+    char label[PEM_LABEL_MAX];
+    Str base64;     /* BEGIN 与 END 之间的原始文本（含换行） */
+};
+
+static Str str_empty(void)
+{
+    Str s = { { (char *)0, 0 } };
+
+    return s;
+}
+
+static int pem_label_ok(Str label)
+{
+    int i = 0;
+
+    if (label.s.len <= 0 || label.s.len >= 48 || !label.s.data)
+        return 0;
+    if (label.s.data[0] == ' ' || label.s.data[label.s.len - 1] == ' ')
+        return 0;
+    for (i = 0; i < label.s.len; i++) {
+        int c = (int)(u8)label.s.data[i];
+
+        if (c < 0x20 || c > 0x7e || c == '-')
+            return 0;
+    }
+    return 1;
+}
+
+/* 以 '\n' 切一行（保留行内内容，去掉行尾 \r）；1 取到 / 0 结束 */
+static int pem_line(Str text, int *pos, Str *line)
+{
+    int start = 0, end = 0;
+
+    if (*pos >= text.s.len)
+        return 0;
+    start = *pos;
+    for (end = start; end < text.s.len && text.s.data[end] != '\n'; end++)
+        ;
+    if (end > start && text.s.data[end - 1] == '\r')
+        *line = (Str){ (char[:]){ text.s.data + start, end - start - 1 } };
+    else
+        *line = (Str){ (char[:]){ text.s.data + start, end - start } };
+    *pos = (end < text.s.len) ? end + 1 : text.s.len;
+    return 1;
+}
+
+/* "-----BEGIN <label>-----" -> label；不是 BEGIN 行给 0 */
+static int pem_begin(Str line, Str *label)
+{
+    char *p = 0;
+    int n = 0, i = 0, b = 0;
+
+    if (line.s.len < 16)
+        return 0;
+    p = line.s.data;
+    n = line.s.len;
+    /* 允许行首空白 */
+    while (b < n && (p[b] == ' ' || p[b] == '\t'))
+        b++;
+    if (b + 11 > n || memcmp(p + b, "-----BEGIN ", 11) != 0)
+        return 0;
+    for (i = b + 11; i + 5 <= n; i++)
+        if (memcmp(p + i, "-----", 5) == 0)
+            break;
+    if (i + 5 != n || i <= b + 11)
+        return 0;
+    *label = (Str){ (char[:]){ p + b + 11, i - (b + 11) } };
+    return 1;
+}
+
+/* "-----END <label>-----" 是否和给定标签一致（行首空白容忍） */
+static int pem_end(Str line, Str label)
+{
+    char *p = line.s.data;
+    int n = line.s.len, b = 0, i = 0;
+
+    while (b < n && (p[b] == ' ' || p[b] == '\t'))
+        b++;
+    if (b + 9 > n || memcmp(p + b, "-----END ", 9) != 0)
+        return 0;
+    if (b + 9 + label.s.len + 5 != n)
+        return 0;
+    if (memcmp(p + b + 9, label.s.data, (size_t)label.s.len) != 0)
+        return 0;
+    return memcmp(p + b + 9 + label.s.len, "-----", 5) == 0;
+}
+
+PemReader pem_reader(Str text)
+{
+    PemReader r = { { { (char *)0, 0 } }, 0 };
+
+    r.text = text;
+    return r;
+}
+
+/* 1 找到一个块 / 0 结束 / -1 坏 */
+int next(PemReader *self, PemBlock *out)
+{
+    Str line = { 0 }, label = { 0 };
+
+    if (!self || !out)
+        return -1;
+    if (!self->text.s.data || self->text.s.len <= 0)
+        return 0;
+    out->label[0] = 0;
+    out->base64 = str_empty();
+    while (pem_line(self->text, &self->pos, &line)) {
+        if (!pem_begin(line, &label))
+            continue;
+        if (!pem_label_ok(label) || label.s.len >= PEM_LABEL_MAX)
+            return -1;
+        /* 收集到 END 行之前的所有文本 */
+        {
+            int body_start = self->pos, body_end = self->pos, found = 0;
+
+            while (pem_line(self->text, &self->pos, &line)) {
+                if (pem_end(line, label)) {
+                    found = 1;
+                    break;
+                }
+                body_end = self->pos;
+            }
+            if (!found)
+                return -1;
+            memcpy(out->label, label.s.data, (size_t)label.s.len);
+            out->label[label.s.len] = 0;
+            out->base64 = (Str){ (char[:]){ self->text.s.data + body_start,
+                                            body_end - body_start } };
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Base64 解码这个块：返回 DER 字节数 / -1 */
+int decode_der(PemBlock *self, void *dst, int cap)
+{
+    if (!self || !dst || cap <= 0)
+        return -1;
+    return b64_decode(self->base64.s, (char *)dst, cap);
+}
+
+/* 编码：先算长度再写；-1 = 参数/容量不合法 */
+static int pem_len(Str label, int n)
+{
+    int b64 = ((n + 2) / 3) * 4;
+    int lines = (b64 + PEM_WRAP - 1) / PEM_WRAP;
+    int body = b64 + lines;         /* 每行一个 '\n' */
+
+    if (n == 0)
+        body = 0;
+    return 11 + label.s.len + 5 + 1 + body + 9 + label.s.len + 5 + 1;
+}
+
+int pem_encode(Str label, const void *der, int n, char *out, int cap)
+{
+    char head[PEM_LABEL_MAX + 16] = { 0 };
+    char foot[PEM_LABEL_MAX + 16] = { 0 };
+    const u8 *src = (const u8 *)der;
+    int total = 0, used = 0, off = 0;
+
+    if (!out || cap <= 0 || !pem_label_ok(label) || n < 0)
+        return -1;
+    if (n > 0 && !src)
+        return -1;
+    total = pem_len(label, n);
+    if (total + 1 > cap)
+        return -1;
+    used = snprintf(head, sizeof head, "-----BEGIN %.*s-----\n", label.s.len,
+                    label.s.data);
+    memcpy(out, head, (size_t)used);
+    /* 每 48 字节 -> 64 个 Base64 字符 */
+    while (off < n) {
+        char chunk[68] = { 0 };
+        int take = n - off;
+        int last = 0;
+
+        if (take > 48)
+            take = 48;
+        last = (off + take >= n);
+        {
+            int got = b64_encode_ex((char[:]){ (char *)src + off, take }, chunk,
+                                    (int)sizeof chunk, 0, last ? 1 : 0);
+
+            if (got < 0)
+                return -1;
+            memcpy(out + used, chunk, (size_t)got);
+            used += got;
+        }
+        out[used++] = '\n';
+        off += take;
+    }
+    {
+        int flen = snprintf(foot, sizeof foot, "-----END %.*s-----\n",
+                            label.s.len, label.s.data);
+
+        memcpy(out + used, foot, (size_t)flen);
+        used += flen;
+    }
+    out[used] = 0;
+    return used;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+test "编码的行宽、标签与尾部" {
+    u8 der[100] = { 0 };
+    char pem[512] = { 0 };
+    char small[32] = { 0 };
+    int n = 0, i = 0;
+    Str text = { 0 };
+    int lines = 0, maxw = 0, pos = 0;
+    Str line = { 0 };
+
+    for (i = 0; i < (int)sizeof der; i++)
+        der[i] = (u8)(i * 3);
+    n = pem_encode(SS("TEST DATA"), der, (int)sizeof der, pem, (int)sizeof pem);
+    if (n <= 0)
+        return err(1, "pem_encode 失败");
+    text = (Str){ (char[:]){ pem, n } };
+    if (strncmp(pem, "-----BEGIN TEST DATA-----\n", 26) != 0)
+        return err(2, "BEGIN 行不对");
+    if (n < 26 || memcmp(pem + n - 24, "-----END TEST DATA-----\n", 24) != 0)
+        return err(3, "END 行不对");
+    /* 中间每行 64 列，最后一行可以更短 */
+    pos = 26;
+    while (pem_line(text, &pos, &line)) {
+        if (line.s.len >= 9 && memcmp(line.s.data, "-----END ", 9) == 0)
+            break;
+        if (line.s.len == 0)
+            continue;
+        if (line.s.len > PEM_WRAP)
+            return err(4, "行宽超过 64");
+        if (line.s.len > maxw)
+            maxw = line.s.len;
+        lines++;
+    }
+    if (maxw != 64 || lines != 3)
+        return err(5, "100 字节的 DER 应该是 3 行、最宽 64");
+    /* 容量不够：不写半截、返回 -1 */
+    if (pem_encode(SS("X"), der, 10, small, (int)sizeof small) != -1)
+        return err(6, "容量不够应该 -1");
+    if (small[0] != 0)
+        return err(7, "容量不够不该写半截");
+    /* 空 DER */
+    n = pem_encode(SS("EMPTY"), 0, 0, pem, (int)sizeof pem);
+    if (n <= 0 || strstr(pem, "-----BEGIN EMPTY-----\n-----END EMPTY-----") == 0)
+        return err(8, "空 DER 的封装不对");
+    /* 坏标签 */
+    if (pem_encode(SS(""), der, 4, pem, (int)sizeof pem) != -1
+        || pem_encode(SS(" A"), der, 4, pem, (int)sizeof pem) != -1
+        || pem_encode(SS("A-B"), der, 4, pem, (int)sizeof pem) != -1)
+        return err(9, "非法标签应该 -1");
+}
+
+test "解码：单块、多块、CRLF 与坏输入" {
+    u8 der[100] = { 0 }, back[200] = { 0 };
+    char pem[512] = { 0 };
+    PemReader r = { 0 };
+    PemBlock b = { 0 };
+    int n = 0, i = 0, m = 0, blocks = 0;
+
+    for (i = 0; i < (int)sizeof der; i++)
+        der[i] = (u8)(255 - i);
+    n = pem_encode(SS("KEY"), der, (int)sizeof der, pem, (int)sizeof pem);
+    if (n <= 0)
+        return err(10, "编码失败");
+    r = pem_reader((Str){ (char[:]){ pem, n } });
+    if (r.next(&b) != 1 || strcmp(b.label, "KEY") != 0)
+        return err(11, "读块失败");
+    m = b.decode_der(back, (int)sizeof back);
+    if (m != (int)sizeof der || memcmp(back, der, sizeof der) != 0)
+        return err(12, "roundtrip 失败");
+    if (r.next(&b) != 0)
+        return err(13, "读完之后应该返回 0");
+    /* 多块 + CRLF + 前后噪声 */
+    {
+        char multi[1024] = { 0 };
+        char one[256] = { 0 };
+        char two[256] = { 0 };
+        int a = 0, c = 0;
+
+        a = pem_encode(SS("ONE"), "abc", 3, one, (int)sizeof one);
+        c = pem_encode(SS("TWO"), "xyz", 3, two, (int)sizeof two);
+        if (a <= 0 || c <= 0)
+            return err(14, "两块编码失败");
+        memcpy(multi, "noise before\r\n", 14);
+        memcpy(multi + 14, one, (size_t)a);
+        memcpy(multi + 14 + a, "\r\nnoise between\r\n",
+               strlen("\r\nnoise between\r\n"));
+        memcpy(multi + 14 + a + strlen("\r\nnoise between\r\n"), two,
+               (size_t)c);
+        r = pem_reader((Str){ (char[:]){ multi,
+                                         14 + a
+                                             + (int)strlen("\r\nnoise between\r\n")
+                                             + c } });
+        blocks = 0;
+        while (r.next(&b) == 1) {
+            blocks++;
+            if (blocks == 1 && strcmp(b.label, "ONE") != 0)
+                return err(15, "第一个标签不对");
+            if (blocks == 2 && strcmp(b.label, "TWO") != 0)
+                return err(16, "第二个标签不对");
+            m = b.decode_der(back, (int)sizeof back);
+            if (m != 3)
+                return err(17, "小块的 DER 长度不对");
+        }
+        if (blocks != 2)
+            return err(18, "应该读到 2 个块");
+    }
+    /* 坏输入：缺 END、标签不一致、base64 坏 */
+    {
+        char *bad1 = (char *)"-----BEGIN A-----\nAAAA\n";
+        char *bad2 = (char *)"-----BEGIN A-----\nAAAA\n-----END B-----\n";
+        char *bad3 = (char *)"-----BEGIN A-----\n!!!!!!!!\n-----END A-----\n";
+        PemReader br = pem_reader(
+            (Str){ (char[:]){ bad1, (int)strlen(bad1) } });
+
+        if (br.next(&b) != -1)
+            return err(19, "缺 END 应该 -1");
+        br = pem_reader((Str){ (char[:]){ bad2, (int)strlen(bad2) } });
+        if (br.next(&b) != -1)
+            return err(20, "标签不一致应该 -1");
+        br = pem_reader((Str){ (char[:]){ bad3, (int)strlen(bad3) } });
+        if (br.next(&b) != 1 || b.decode_der(back, (int)sizeof back) != -1)
+            return err(21, "坏 base64 应该解码失败");
+    }
+    /* 参数 */
+    {
+        PemBlock empty = { { 0 }, { { (char *)0, 0 } } };
+
+        if (empty.decode_der(0, 4) != -1 || empty.decode_der(back, 0) != -1)
+            return err(22, "坏参数应该 -1");
+        {
+            PemReader er = pem_reader((Str){ { (char *)0, 0 } });
+
+            if (er.next(&b) != 0)
+                return err(23, "空输入应该返回 0");
+        }
+    }
+}
