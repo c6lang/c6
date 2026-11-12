@@ -1,0 +1,211 @@
+/* stdnum：标准库第十三批（bignum / decimal / rational / complex）的拼装示例。
+ *
+ * 和 stdform/stdtext 一样：这个文件没有 `module`（入口 `main` 只能写在模块
+ * 外的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是「数值」这条链路上的四种表示：
+ *
+ *   - bignum：任意精度整数（1024 位）——阶乘、2 的幂、进制互转；
+ *   - decimal：十进制定点（9 位小数）——金额、税额、按分舍入；
+ *   - rational：精确分数——调和级数 1/1+…+1/10 = 7381/2520；
+ *   - complex：复数——(3+4i)(1-2i) = 11-2i、模、整数幂。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdnum \
+ *         examples/stdnum.c6 std/core/types.c6 std/core/math.c6 \
+ *         std/core/bignum.c6 std/core/decimal.c6 std/core/rational.c6 \
+ *         std/core/complex.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.math;
+import std.core.bignum;
+import std.core.decimal;
+import std.core.rational;
+import std.core.complex;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* 大整数：阶乘、幂、进制、除法 */
+static void tour_bignum(void)
+{
+    Big f = big_from_i64(1);
+    Big i = { 0 };
+    Big q = { 0 }, r = { 0 }, t = { 0 }, p = { 0 };
+    Big two = big_from_i64(2);
+    char buf[128] = { 0 };
+    int n = 0, k = 0;
+
+    for (k = 1; k <= 30; k++) {
+        i = big_from_i64((i64)k);
+        f = f.mul(i);
+    }
+    n = f.format((char[:]){ buf, (int)sizeof buf });
+    buf[n > 0 ? n : 0] = 0;
+    printf("bignum: 30! = %s\n", buf);
+    check(n == 33
+              && strcmp(buf, "265252859812191058636308480000000") == 0,
+          "bignum: 30! 的 33 位");
+
+    p = two.pow(100);
+    n = p.format((char[:]){ buf, (int)sizeof buf });
+    buf[n > 0 ? n : 0] = 0;
+    check(strcmp(buf, "1267650600228229401496703205376") == 0,
+          "bignum: 2^100");
+
+    /* 30! / 29! == 30（余 0）：t = 30! / 30 = 29! */
+    t = f.div(big_from_i64(30));
+    if (f.divmod(t, &q, &r)) {
+        n = q.format((char[:]){ buf, (int)sizeof buf });
+        buf[n > 0 ? n : 0] = 0;
+        check(r.is_zero() && n == 2 && strcmp(buf, "30") == 0,
+              "bignum: 30! / 29! = 30");
+    }
+
+    n = big_from_i64(255).format_base((char[:]){ buf, (int)sizeof buf }, 16);
+    buf[n > 0 ? n : 0] = 0;
+    check(n == 2 && strcmp(buf, "ff") == 0, "bignum: 255 = 0xff");
+
+    t = big_parse_base(S("deadbeef"), 16);
+    n = t.format((char[:]){ buf, (int)sizeof buf });
+    buf[n > 0 ? n : 0] = 0;
+    check(n == 10 && strcmp(buf, "3735928559") == 0, "bignum: deadbeef");
+
+    /* 1024 位上限：2^1023 * 2 溢出 */
+    p = two.pow(1023);
+    t = p.mul(two);
+    check(t.is_err(), "bignum: 溢出要报错");
+}
+
+/* 十进制：金额、税额、按分舍入 */
+static void tour_decimal(void)
+{
+    Dec price = dec_parse(S("19.99"));
+    Dec qty = dec_from_i64(3);
+    Dec rate = dec_parse(S("0.065"));
+    Dec sub = price.mul(qty);
+    Dec tax = sub.mul(rate);
+    Dec total = { 0 };
+    Dec tenth = dec_parse(S("0.1"));
+    Dec fifth = dec_parse(S("0.2"));
+    Dec sum = { 0 };
+    Dec one = dec_from_i64(1);
+    Dec three = dec_from_i64(3);
+    Dec third = { 0 };
+    char buf[64] = { 0 };
+    int n = 0;
+
+    tax = tax.round(2, DEC_HALF_UP);
+    total = sub.add(tax);
+
+    n = sub.format((char[:]){ buf, (int)sizeof buf }, 2);
+    buf[n > 0 ? n : 0] = 0;
+    printf("decimal: 19.99 * 3 = %s\n", buf);
+    check(strcmp(buf, "59.97") == 0, "decimal: 小计");
+
+    n = tax.format((char[:]){ buf, (int)sizeof buf }, 2);
+    buf[n > 0 ? n : 0] = 0;
+    printf("decimal: 税额 6.5%% = %s\n", buf);
+    check(strcmp(buf, "3.90") == 0, "decimal: 税额按分四舍五入");
+
+    n = total.format((char[:]){ buf, (int)sizeof buf }, 2);
+    buf[n > 0 ? n : 0] = 0;
+    printf("decimal: 合计 = %s\n", buf);
+    check(strcmp(buf, "63.87") == 0, "decimal: 合计");
+
+    /* 十进制精确：0.1 + 0.2 就是 0.3 */
+    sum = tenth.add(fifth);
+    check(sum.v == 300000000LL, "decimal: 0.1 + 0.2");
+    /* 1/3 保留 9 位 */
+    third = one.div(three);
+    check(third.v == 333333333LL, "decimal: 1/3");
+}
+
+/* 有理数：调和级数，精确分数 */
+static void tour_rational(void)
+{
+    Rat h = rat_zero();
+    Rat t = { 0 };
+    Rat lhs = { 0 };
+    Rat rhs = { 0 };
+    Rat big1 = { 0 };
+    Rat big2 = { 0 };
+    char buf[64] = { 0 };
+    int n = 0, k = 0;
+
+    for (k = 1; k <= 10; k++) {
+        t = rat_make(1, (i64)k);
+        h = h.add(t);
+    }
+    n = h.format((char[:]){ buf, (int)sizeof buf });
+    buf[n > 0 ? n : 0] = 0;
+    printf("rational: H_10 = %s\n", buf);
+    check(strcmp(buf, "7381/2520") == 0, "rational: 调和级数");
+    {
+        f64 f = 0;
+
+        check(h.to_f64(&f) && f > 2.928968 && f < 2.928969,
+              "rational: H_10 ≈ 2.928968");
+    }
+    /* 1/3 + 1/6 = 1/2，和 decimal 的 0.5 对得上 */
+    lhs = rat_make(1, 3).add(rat_make(1, 6));
+    rhs = rat_make(1, 2);
+    check(lhs.cmp(rhs) == 0, "rational: 1/3 + 1/6 = 1/2");
+    /* 交叉相乘会溢出的两个数也能比 */
+    big1 = rat_make(9223372036854775807LL, 2);
+    big2 = rat_make(9223372036854775807LL, 1);
+    check(big1.cmp(big2) < 0, "rational: 大数比较不过 double");
+}
+
+/* 复数：乘法、模、整数幂 */
+static void tour_complex(void)
+{
+    Complex a = cplx(3.0, 4.0);
+    Complex b = cplx(1.0, -2.0);
+    Complex p = a.mul(b);
+    Complex sq = { 0 };
+    Complex cj = { 0 };
+    Complex zc = { 0 };
+    Complex u = { 0 };
+    f64 m = a.abs();
+
+    printf("complex: (3+4i)(1-2i) = %.0f%+.0fi\n", p.re, p.im);
+    check(p.near(cplx(11.0, -2.0), 1e-12), "complex: 乘法");
+    check(m == 5.0, "complex: |3+4i| = 5");
+    sq = a.pow_int(2);
+    check(sq.near(cplx(-7.0, 24.0), 1e-12), "complex: (3+4i)^2");
+    cj = a.conj();
+    zc = cj.mul(a);
+    check(zc.near(cplx(25.0, 0.0), 1e-12), "complex: z * conj(z) = |z|^2");
+    zc = a.div(cplx(0.0, 0.0));
+    check(!zc.is_finite(), "complex: 除零给 inf/nan");
+    u = a.normalize();
+    check(nearly_eq(u.abs(), 1.0, 1e-12) && u.near(cplx(0.6, 0.8), 1e-12),
+          "complex: 归一化");
+}
+
+int main(void)
+{
+    printf("stdnum: 标准库第十三批（bignum / decimal / rational / complex）\n");
+    tour_bignum();
+    tour_decimal();
+    tour_rational();
+    tour_complex();
+    printf("stdnum: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

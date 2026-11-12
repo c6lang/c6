@@ -1,0 +1,696 @@
+/* std/core/decimal：十进制定点（9 位小数，值类型，零分配）。
+ *
+ *     import std.core.decimal;
+ *
+ *     Dec a = dec_parse(S("123.45"));
+ *     Dec b = dec_parse(S("0.005"));
+ *     char out[32] = { 0 };
+ *     a.add(b).format((char[:]){ out, (int)sizeof out }, 2);   // "123.46"
+ *
+ * 表示：一个 i64，单位是 1e-9，也就是 `值 = v / 1000000000`。范围约
+ * ±9.22e9（±92 亿），9 位小数——金额、单价、税额、汇率这类「必须按十进制
+ * 舍入」的场景用它对，不要拿二进制浮点凑。
+ *
+ * 与 `std.core.fixed`（Q16.16 二进制定点）的分工：fixed 是给没有 FPU 的
+ * 板子算物理量用的（快、但有二进制误差）；decimal 是给「人看的十进制数」
+ * 用的（慢一点、每一步都按十进制精确算）。
+ *
+ * 关键约定：
+ *
+ * - **加减精确**；**乘除先算 128 位中间值再除 1e9**，最后按「四舍五入」
+ *   （half-up，远离零）收尾——不是先转 double，所以没有二进制误差。
+ * - 溢出（结果超出 i64 能表示的范围）、除零、解析失败都置 `err = 1`，
+ *   结果不可用；`err` 会随结果传播。
+ * - `round(places, mode)` 是**十进制舍位**：`places` 是保留几位小数
+ *   （0..9），`mode` 取 `DEC_TRUNC`/`DEC_HALF_UP`/`DEC_HALF_EVEN`/
+ *   `DEC_FLOOR`/`DEC_CEIL`。`to_i64` 用同一套模式取整。
+ * - `parse` 收 `[+-]digits[.digits]`，小数超过 9 位就报错（不悄悄截断）；
+ *   `format` 输出恰好 N 位小数（含结尾 0），放不下返回 -1 且不写半截。
+ * - `to_f64`/`dec_from_f64` 会有二进制误差（f64 只有 53 位尾数），只在
+ *   与外部接口交换时用。
+ */
+#include <string.h>
+
+module std.core.decimal;
+import std.core.types;
+
+enum DecLimits {
+    DEC_PLACES = 9,           /* 小数位数 */
+    DEC_SCALE = 1000000000,   /* 10^DEC_PLACES */
+};
+
+/* 舍入模式 */
+enum DecRound {
+    DEC_TRUNC = 0,            /* 向零截断 */
+    DEC_HALF_UP = 1,          /* 四舍五入（.5 远离零） */
+    DEC_HALF_EVEN = 2,        /* 银行家舍入（.5 取偶） */
+    DEC_FLOOR = 3,            /* 向下（-2.1 -> -3） */
+    DEC_CEIL = 4,             /* 向上（-2.1 -> -2） */
+};
+
+/* 十进制定点：值 = v / 1e9 */
+struct Dec {
+    i64 v;
+    int err;
+};
+
+/* ---- 128 位小工具（tcc 没有 __int128） ---- */
+
+/* 64x64 -> 128（无符号） */
+static void u128_mul(u64 a, u64 b, u64 *hi, u64 *lo)
+{
+    u64 a0 = a & 0xffffffffu, a1 = a >> 32;
+    u64 b0 = b & 0xffffffffu, b1 = b >> 32;
+    u64 p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    u64 mid = (p00 >> 32) + (p01 & 0xffffffffu) + (p10 & 0xffffffffu);
+
+    *lo = (p00 & 0xffffffffu) | (mid << 32);
+    *hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
+/* 128 / 64：商必须放得进 u64（hi >= d 视为溢出），返回 0 表示溢出/除零 */
+static int u128_div(u64 hi, u64 lo, u64 d, u64 *q, u64 *r)
+{
+    u64 rem = 0, quo = 0;
+    int i = 0;
+
+    if (d == 0u || hi >= d)
+        return 0;
+    rem = hi;
+    for (i = 63; i >= 0; i--) {
+        rem = (rem << 1) | ((lo >> i) & 1u);
+        quo <<= 1;
+        if (rem >= d) {
+            rem -= d;
+            quo |= 1u;
+        }
+    }
+    *q = quo;
+    *r = rem;
+    return 1;
+}
+
+static u64 dec_mag(i64 v)
+{
+    return (v < 0) ? (u64)(0 - v) : (u64)v;
+}
+
+static i64 dec_apply_sign(u64 m, int neg)
+{
+    return neg ? (i64)(0u - m) : (i64)m;
+}
+
+/* ---- 工厂 ---- */
+
+Dec dec_zero(void)
+{
+    Dec r = { 0 };
+
+    return r;
+}
+
+/* 从原始单位（1e-9）构造 */
+Dec dec_from_units(i64 units)
+{
+    Dec r = { 0 };
+
+    r.v = units;
+    return r;
+}
+
+/* 从整数构造：|x| > I64_MAX / 1e9 时 err */
+Dec dec_from_i64(i64 x)
+{
+    Dec r = { 0 };
+    u64 m = dec_mag(x);
+    u64 hi = 0, lo = 0;
+
+    u128_mul(m, (u64)DEC_SCALE, &hi, &lo);
+    if (hi != 0u || lo > 9223372036854775807ULL) {
+        r.err = 1;
+        return r;
+    }
+    r.v = dec_apply_sign(lo, x < 0);
+    return r;
+}
+
+/* 从 f64：乘 1e9 后四舍五入；非有限值/超范围时 err */
+Dec dec_from_f64(f64 x)
+{
+    Dec r = { 0 };
+    f64 scaled = x * 1000000000.0;
+
+    if (!(scaled > -9223372036854775808.0 && scaled < 9223372036854775808.0)) {
+        r.err = 1;
+        return r;
+    }
+    if (scaled >= 0.0)
+        r.v = (i64)(scaled + 0.5);
+    else
+        r.v = (i64)(scaled - 0.5);
+    return r;
+}
+
+/* 十进制解析：[+-]digits[.digits]，小数最多 9 位；空串/非法/溢出 -> err */
+Dec dec_parse(char[:] s)
+{
+    Dec r = { 0 };
+    int i = 0, neg = 0, nf = 0, seen = 0;
+    u64 whole = 0, frac = 0;
+    u64 m = 0;
+    int k = 0;
+
+    if (s.len > 0 && (s.data[0] == '-' || s.data[0] == '+')) {
+        neg = (s.data[0] == '-');
+        i = 1;
+    }
+    for (; i < s.len && s.data[i] >= '0' && s.data[i] <= '9'; i++) {
+        whole = whole * 10u + (u64)(s.data[i] - '0');
+        seen = 1;
+        if (whole > 9223372036854775807ULL / (u64)DEC_SCALE) {
+            r.err = 1;
+            return r;
+        }
+    }
+    if (i < s.len && s.data[i] == '.') {
+        i++;
+        for (; i < s.len && s.data[i] >= '0' && s.data[i] <= '9'; i++) {
+            if (nf >= DEC_PLACES) {
+                r.err = 1;       /* 超过 9 位小数：报错，不截断 */
+                return r;
+            }
+            frac = frac * 10u + (u64)(s.data[i] - '0');
+            nf++;
+            seen = 1;
+        }
+    }
+    if (!seen || i != s.len) {
+        r.err = 1;
+        return r;
+    }
+    /* 把小数补到 9 位 */
+    for (k = nf; k < DEC_PLACES; k++) {
+        if (frac > 9223372036854775807ULL / 10u) {
+            r.err = 1;
+            return r;
+        }
+        frac *= 10u;
+    }
+    if (whole > 9223372036854775807ULL / (u64)DEC_SCALE) {
+        r.err = 1;
+        return r;
+    }
+    m = whole * (u64)DEC_SCALE + frac;
+    if (m > 9223372036854775807ULL) {
+        r.err = 1;
+        return r;
+    }
+    r.v = dec_apply_sign(m, neg);
+    return r;
+}
+
+/* ---- 查询 ---- */
+
+int is_zero(Dec *self) { return self->err == 0 && self->v == 0; }
+
+int is_err(Dec *self) { return self->err != 0; }
+
+int cmp(Dec *self, Dec o)
+{
+    if (self->v == o.v)
+        return 0;
+    return self->v < o.v ? -1 : 1;
+}
+
+/* ---- 四则 ---- */
+
+Dec neg(Dec *self)
+{
+    Dec r = *self;
+
+    if (r.v == (-9223372036854775807LL - 1))
+        r.err = 1;
+    else
+        r.v = -r.v;
+    return r;
+}
+
+Dec abs(Dec *self)
+{
+    Dec r = *self;
+
+    if (r.v < 0)
+        r.v = -r.v;
+    return r;
+}
+
+Dec add(Dec *self, Dec o)
+{
+    Dec r = { 0 };
+
+    if (self->err || o.err) {
+        r.err = 1;
+        return r;
+    }
+    if ((o.v > 0 && self->v > 9223372036854775807LL - o.v)
+        || (o.v < 0 && self->v < (-9223372036854775807LL - 1) - o.v)) {
+        r.err = 1;
+        return r;
+    }
+    r.v = self->v + o.v;
+    return r;
+}
+
+Dec sub(Dec *self, Dec o)
+{
+    Dec n = o;
+
+    if (n.v != (-9223372036854775807LL - 1))
+        n.v = -n.v;
+    else
+        n.err = 1;
+    return self->add(n);
+}
+
+/* 乘法：|a|*|b| 走 128 位，再除 1e9 并按 half-up 收尾（不经过 double） */
+Dec mul(Dec *self, Dec o)
+{
+    Dec r = { 0 };
+    u64 hi = 0, lo = 0, q = 0, rem = 0;
+    int neg = 0;
+
+    if (self->err || o.err) {
+        r.err = 1;
+        return r;
+    }
+    neg = ((self->v < 0) != (o.v < 0));
+    u128_mul(dec_mag(self->v), dec_mag(o.v), &hi, &lo);
+    if (!u128_div(hi, lo, (u64)DEC_SCALE, &q, &rem)) {
+        r.err = 1;
+        return r;
+    }
+    if (rem >= ((u64)DEC_SCALE + 1u) / 2u)   /* half-up */
+        q++;
+    if (q > 9223372036854775807ULL) {
+        r.err = 1;
+        return r;
+    }
+    r.v = dec_apply_sign(q, neg);
+    return r;
+}
+
+/* 乘以整数（精确，不经过 128 位除法） */
+Dec mul_int(Dec *self, i64 k)
+{
+    Dec r = { 0 };
+    u64 hi = 0, lo = 0;
+    int neg = ((self->v < 0) != (k < 0));
+
+    if (self->err) {
+        r.err = 1;
+        return r;
+    }
+    u128_mul(dec_mag(self->v), dec_mag(k), &hi, &lo);
+    if (hi != 0u || lo > 9223372036854775807ULL) {
+        r.err = 1;
+        return r;
+    }
+    r.v = dec_apply_sign(lo, neg);
+    return r;
+}
+
+/* 除法：(a * 1e9) / b，128 位中间值 + half-up；除零/溢出 -> err */
+Dec div(Dec *self, Dec o)
+{
+    Dec r = { 0 };
+    u64 hi = 0, lo = 0, q = 0, rem = 0, b = 0;
+    int neg = 0;
+
+    if (self->err || o.err || o.v == 0) {
+        r.err = 1;
+        return r;
+    }
+    neg = ((self->v < 0) != (o.v < 0));
+    b = dec_mag(o.v);
+    u128_mul(dec_mag(self->v), (u64)DEC_SCALE, &hi, &lo);
+    if (!u128_div(hi, lo, b, &q, &rem)) {
+        r.err = 1;
+        return r;
+    }
+    if (rem >= (b + 1u) / 2u)               /* half-up，避免 rem*2 溢出 */
+        q++;
+    if (q > 9223372036854775807ULL) {
+        r.err = 1;
+        return r;
+    }
+    r.v = dec_apply_sign(q, neg);
+    return r;
+}
+
+/* ---- 舍入 ---- */
+
+/* 10^(DEC_PLACES - places)；places 越界给 0 */
+static i64 dec_shift(int places)
+{
+    i64 d = 1;
+    int i = 0;
+
+    if (places < 0 || places > DEC_PLACES)
+        return 0;
+    for (i = places; i < DEC_PLACES; i++)
+        d *= 10;
+    return d;
+}
+
+/* 按模式把商 q 和余数 rem（rem 带 v 的符号）调成舍入后的商 */
+static i64 dec_round_q(i64 q, i64 rem, i64 d, int mode)
+{
+    u64 ar = dec_mag(rem);
+    u64 half = ((u64)d + 1u) / 2u;
+
+    if (rem == 0)
+        return q;
+    switch (mode) {
+    case DEC_TRUNC:
+        break;
+    case DEC_HALF_UP:
+        if (ar >= half)
+            q += (rem > 0) ? 1 : -1;
+        break;
+    case DEC_HALF_EVEN:
+        if (ar > half || (ar == half && (q & 1) != 0))
+            q += (rem > 0) ? 1 : -1;
+        break;
+    case DEC_FLOOR:
+        if (rem < 0)
+            q--;
+        break;
+    case DEC_CEIL:
+        if (rem > 0)
+            q++;
+        break;
+    default:
+        break;
+    }
+    return q;
+}
+
+/* 保留 places 位小数（0..9），mode 见 DecRound */
+Dec round(Dec *self, int places, int mode)
+{
+    Dec r = { 0 };
+    i64 d = dec_shift(places);
+    i64 q = 0, rem = 0;
+
+    if (self->err || d == 0 || mode < DEC_TRUNC || mode > DEC_CEIL) {
+        r.err = 1;
+        return r;
+    }
+    q = self->v / d;
+    rem = self->v % d;
+    q = dec_round_q(q, rem, d, mode);
+    if (q > 9223372036854775807LL / d || q < (-9223372036854775807LL - 1) / d) {
+        r.err = 1;
+        return r;
+    }
+    r.v = q * d;
+    return r;
+}
+
+/* 取整成 i64（按 mode）；结果放不下给 0 */
+int to_i64(Dec *self, int mode, i64 *out)
+{
+    i64 q = 0, rem = 0;
+
+    if (!out || self->err || mode < DEC_TRUNC || mode > DEC_CEIL)
+        return 0;
+    q = self->v / (i64)DEC_SCALE;
+    rem = self->v % (i64)DEC_SCALE;
+    q = dec_round_q(q, rem, (i64)DEC_SCALE, mode);
+    if (q > 9223372036854775807LL || q < (-9223372036854775807LL - 1))
+        return 0;
+    *out = q;
+    return 1;
+}
+
+int to_f64(Dec *self, f64 *out)
+{
+    if (!out || self->err)
+        return 0;
+    *out = (f64)self->v / 1000000000.0;
+    return 1;
+}
+
+/* ---- 格式化 ---- */
+
+/* 把 u64 写成十进制，返回位数（写到 tmp，小端序不保证；这里是正常顺序） */
+static int dec_utoa(u64 v, char *tmp)
+{
+    char rev[24] = { 0 };
+    int n = 0, i = 0;
+
+    if (v == 0u) {
+        tmp[0] = '0';
+        return 1;
+    }
+    while (v > 0u && n < 24) {
+        rev[n++] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    }
+    for (i = 0; i < n; i++)
+        tmp[i] = rev[n - 1 - i];
+    return n;
+}
+
+/* 输出恰好 places 位小数；放不下返回 -1（不写半截）；places 0..9 */
+int format(Dec *self, char[:] out, int places)
+{
+    char tmp[48] = { 0 };
+    i64 d = dec_shift(places);
+    i64 q = 0, rem = 0, frac = 0;
+    u64 mag = 0, ip = 0, fp = 0;
+    int n = 0, i = 0, len = 0, neg = 0;
+
+    if (self->err || d == 0)
+        return -1;
+    q = self->v / d;
+    rem = self->v % d;
+    q = dec_round_q(q, rem, d, DEC_HALF_UP);
+    /* 舍入后的值 = q * d（单位 1e-9）；拆成整数部分与小数部分 */
+    if (q > 9223372036854775807LL / d || q < (-9223372036854775807LL - 1) / d)
+        return -1;
+    frac = q * d;                        /* 单位 1e-9，可能溢出检查过 */
+    neg = (frac < 0);
+    mag = dec_mag(frac);
+    ip = mag / (u64)DEC_SCALE;
+    fp = (mag % (u64)DEC_SCALE) / (u64)d;   /* 小数点后 places 位 */
+    if (neg) {
+        if (n >= (int)sizeof tmp)
+            return -1;
+        tmp[n++] = '-';
+    }
+    n += dec_utoa(ip, tmp + n);
+    if (places > 0) {
+        char fbuf[12] = { 0 };
+        int fdigits = 0, pad = 0;
+
+        fdigits = dec_utoa(fp, fbuf);
+        pad = places - fdigits;
+        if (n >= (int)sizeof tmp)
+            return -1;
+        tmp[n++] = '.';
+        for (i = 0; i < pad; i++)
+            tmp[n++] = '0';
+        for (i = 0; i < fdigits; i++)
+            tmp[n++] = fbuf[i];
+    }
+    len = n;
+    if (len > out.len)
+        return -1;
+    for (i = 0; i < len; i++)
+        out.data[i] = tmp[i];
+    return len;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int dec_is(Dec a, const char *want, int places)
+{
+    char tmp[48] = { 0 };
+    int n = a.format((char[:]){ tmp, (int)sizeof tmp }, places);
+
+    if (n < 0)
+        return 0;
+    tmp[n] = 0;
+    return strcmp(tmp, want) == 0;
+}
+
+test "解析与格式化" {
+    Dec a = dec_parse(S("123.45"));
+
+    if (a.err || a.v != 123450000000LL)
+        return err(1, "123.45 的内部表示");
+    if (!dec_is(a, "123.45", 2) || !dec_is(a, "123.450", 3))
+        return err(2, "格式化");
+    if (!dec_is(a, "123.450000000", 9) || !dec_is(a, "123", 0))
+        return err(3, "0/9 位小数");
+    a = dec_parse(S("-0.5"));
+    if (!dec_is(a, "-0.500", 3))
+        return err(4, "负数");
+    a = dec_parse(S(".5"));
+    if (!dec_is(a, "0.5", 1))
+        return err(5, "省略整数部分");
+    a = dec_parse(S("7."));
+    if (!dec_is(a, "7.0", 1))
+        return err(6, "省略小数部分");
+    a = dec_parse(S("+3"));
+    if (!dec_is(a, "3", 0))
+        return err(7, "正号");
+    /* 超过 9 位小数报错，不悄悄截断 */
+    if (!dec_parse(S("1.1234567890")).is_err())
+        return err(8, "10 位小数");
+    if (!dec_parse(S("")).is_err() || !dec_parse(S("-")).is_err()
+        || !dec_parse(S("1x")).is_err() || !dec_parse(S("1.2.3")).is_err())
+        return err(9, "非法输入");
+    /* 放不下不写半截 */
+    {
+        Dec big = dec_parse(S("123456789.123456789"));
+        char small[4] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 4; i++)
+            small[i] = 'Z';
+        if (big.format((char[:]){ small, 4 }, 3) != -1)
+            return err(10, "放不下要给 -1");
+        for (i = 0; i < 4; i++)
+            if (small[i] != 'Z')
+                return err(11, "放不下时写了半截");
+    }
+}
+
+test "加减法与比较" {
+    Dec a = dec_parse(S("0.1"));
+    Dec b = dec_parse(S("0.2"));
+    Dec c = a.add(b);
+
+    /* 十进制精确：0.1 + 0.2 == 0.3，不是 0.30000000000000004 */
+    if (!dec_is(c, "0.3", 1))
+        return err(12, "0.1 + 0.2");
+    if (!dec_is(dec_parse(S("1.05")).sub(dec_parse(S("0.05"))), "1.00", 2))
+        return err(13, "减法");
+    if (!dec_is(dec_parse(S("-1.5")).add(dec_parse(S("1.5"))), "0", 0))
+        return err(14, "相反数");
+    if (a.cmp(b) >= 0 || b.cmp(a) <= 0 || a.cmp(a) != 0)
+        return err(15, "比较");
+    if (dec_parse(S("-2")).cmp(dec_parse(S("-1"))) >= 0)
+        return err(16, "负数比较");
+    if (!dec_zero().is_zero() || dec_parse(S("0.000000001")).is_zero())
+        return err(17, "零判定");
+}
+
+test "乘法与除法" {
+    Dec a = dec_parse(S("1.5"));
+    Dec b = dec_parse(S("2.5"));
+
+    if (!dec_is(a.mul(b), "3.75", 2))
+        return err(18, "1.5 * 2.5");
+    if (!dec_is(dec_parse(S("-1.5")).mul(b), "-3.75", 2))
+        return err(19, "负乘法");
+    if (!dec_is(dec_parse(S("0.1")).mul(dec_parse(S("0.1"))), "0.01", 2))
+        return err(20, "0.1 * 0.1");
+    /* 1/3 = 0.333...，9 位小数 half-up */
+    if (!dec_is(dec_from_i64(1).div(dec_from_i64(3)), "0.333333333", 9))
+        return err(21, "1/3");
+    if (!dec_is(dec_from_i64(2).div(dec_from_i64(3)), "0.666666667", 9))
+        return err(22, "2/3 的进位");
+    if (!dec_is(dec_from_i64(1).div(dec_from_i64(8)), "0.125", 3))
+        return err(23, "1/8");
+    if (!dec_from_i64(1).div(dec_zero()).is_err())
+        return err(24, "除零");
+    if (!dec_is(dec_parse(S("10")).mul_int(3), "30", 0))
+        return err(25, "mul_int");
+    if (!dec_is(dec_parse(S("1.25")).mul_int(-2), "-2.50", 2))
+        return err(27, "mul_int 负数结果");
+    /* 大数相乘不溢出：1234567.89 * 2 = 2469135.78 */
+    if (!dec_is(dec_parse(S("1234567.89")).mul_int(2), "2469135.78", 2))
+        return err(28, "大数乘法");
+}
+
+test "舍入模式" {
+    Dec half = dec_parse(S("2.5"));
+    Dec neg = dec_parse(S("-2.5"));
+
+    if (!dec_is(half.round(0, DEC_HALF_UP), "3", 0))
+        return err(29, "2.5 half-up");
+    if (!dec_is(neg.round(0, DEC_HALF_UP), "-3", 0))
+        return err(30, "-2.5 half-up");
+    if (!dec_is(half.round(0, DEC_HALF_EVEN), "2", 0))
+        return err(31, "2.5 half-even");
+    if (!dec_is(neg.round(0, DEC_HALF_EVEN), "-2", 0))
+        return err(32, "-2.5 half-even");
+    if (!dec_is(dec_parse(S("3.5")).round(0, DEC_HALF_EVEN), "4", 0))
+        return err(33, "3.5 half-even");
+    if (!dec_is(dec_parse(S("-2.9")).round(0, DEC_TRUNC), "-2", 0))
+        return err(34, "trunc");
+    if (!dec_is(dec_parse(S("-2.1")).round(0, DEC_FLOOR), "-3", 0))
+        return err(35, "floor");
+    if (!dec_is(dec_parse(S("-2.1")).round(0, DEC_CEIL), "-2", 0))
+        return err(36, "ceil");
+    if (!dec_is(dec_parse(S("1.2345")).round(2, DEC_HALF_UP), "1.23", 2))
+        return err(37, "保留 2 位");
+    if (!dec_is(dec_parse(S("1.2355")).round(3, DEC_HALF_UP), "1.236", 3))
+        return err(38, "保留 3 位");
+    if (!dec_parse(S("1.5")).round(10, DEC_HALF_UP).is_err())
+        return err(39, "places 越界");
+    {
+        i64 iv = 0;
+
+        if (!dec_parse(S("2.5")).to_i64(DEC_HALF_UP, &iv) || iv != 3)
+            return err(40, "to_i64 half-up");
+        if (!dec_parse(S("-2.5")).to_i64(DEC_HALF_EVEN, &iv) || iv != -2)
+            return err(41, "to_i64 half-even");
+        if (!dec_parse(S("-2.9")).to_i64(DEC_TRUNC, &iv) || iv != -2)
+            return err(42, "to_i64 trunc");
+    }
+    /* format 的舍入也是 half-up */
+    if (!dec_is(dec_parse(S("1.005")), "1.01", 2))
+        return err(43, "format 的 half-up");
+}
+
+test "范围、转换与 err 传播" {
+    Dec big = dec_from_i64(9223372036854775807LL);
+
+    if (!big.is_err())
+        return err(44, "i64 最大值乘 1e9 要溢出");
+    if (!dec_from_i64(0).is_zero() || dec_from_i64(-5).v != -5000000000LL)
+        return err(45, "dec_from_i64");
+    {
+        f64 f = 0;
+
+        if (!dec_parse(S("1.5")).to_f64(&f) || f < 1.4999 || f > 1.5001)
+            return err(46, "to_f64");
+        if (!dec_from_f64(1.5).format((char[:]){ (char *)0, 0 }, 0) == -1)
+            return err(47, "dec_from_f64 的格式");
+        if (!dec_is(dec_from_f64(1.5), "1.5", 1))
+            return err(48, "dec_from_f64");
+        if (!dec_from_f64(1e30).is_err())
+            return err(49, "f64 超范围");
+    }
+    /* err 传播 */
+    {
+        Dec bad = dec_zero();
+        Dec sum = { 0 };
+
+        bad.err = 1;
+        sum = bad.add(dec_from_i64(1));
+        if (!sum.is_err())
+            return err(50, "err 没传播");
+        if (!bad.mul(dec_from_i64(2)).is_err())
+            return err(51, "mul 的 err 传播");
+    }
+    /* 加法溢出 */
+    if (!dec_from_i64(9000000000LL).add(dec_from_i64(9000000000LL)).is_err())
+        return err(52, "加法溢出");
+}

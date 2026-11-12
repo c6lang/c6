@@ -1,0 +1,558 @@
+/* std/core/rational：精确有理数（i64 分子/分母，自动约分，零分配）。
+ *
+ *     import std.core.rational;
+ *
+ *     Rat a = rat_make(1, 3);
+ *     Rat b = rat_make(1, 6);
+ *     char out[32] = { 0 };
+ *     a.add(b).format((char[:]){ out, (int)sizeof out });   // "1/2"
+ *
+ * 值总是规范形式：`den > 0`、`gcd(|num|, den) == 1`、零是 `0/1`。所以
+ * 相等的有理数**表示唯一**，`cmp` 可以直接比。加减乘除都先约分再乘，尽量
+ * 把溢出推后；真的超出 i64 就 `err = 1`（不静默取模）。
+ *
+ * 和 `std.core.decimal` 的分工：decimal 是「有限位十进制、按位舍入」，
+ * rational 是「精确分数」——`1/3` 就是三分之一，转成十进制才丢精度。
+ *
+ * 约定：
+ *
+ * - `rat_make(num, den)`：分母 0、或规范化后分母放不进 i64（只在
+ *   `den == I64_MIN` 时发生）→ err。
+ * - 四则与比较都是精确的；`cmp` 用连分数比较（交叉相乘会溢出的两对数
+ *   也能比出正确结果，不经过 double）。
+ * - 加减法的**中间分子**放不进 i64 就报溢出（即使约分后结果放得下）——没有
+ *   128 位整数的代价；极端大数请用 `std.core.bignum` / `std.core.decimal`。
+ * - `to_i64` 向零截断；`to_f64` 是近似（只在对外交换时用）。
+ * - `format` 输出 `num/den`，分母 1 时只输出整数；放不下返回 -1 且不写半截。
+ */
+#include <string.h>
+
+module std.core.rational;
+import std.core.types;
+
+/* 有理数：始终是最简形式，den > 0 */
+struct Rat {
+    i64 num;
+    i64 den;
+    int err;
+};
+
+#define RAT_I64_MAX 9223372036854775807LL
+#define RAT_I64_MIN (-9223372036854775807LL - 1)
+
+static u64 rat_mag(i64 v)
+{
+    return (v < 0) ? (u64)(0 - v) : (u64)v;
+}
+
+static i64 rat_sign(u64 m, int neg)
+{
+    return neg ? (i64)(0u - m) : (i64)m;
+}
+
+static u64 rat_ugcd(u64 a, u64 b)
+{
+    while (b != 0u) {
+        u64 t = a % b;
+
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+/* 精确加减的溢出检查 */
+static int rat_add_i64(i64 a, i64 b, i64 *out)
+{
+    if ((b > 0 && a > RAT_I64_MAX - b) || (b < 0 && a < RAT_I64_MIN - b))
+        return 0;
+    *out = a + b;
+    return 1;
+}
+
+/* 精确乘法的溢出检查（结果允许到 I64_MIN 的量级） */
+static int rat_mul_i64(i64 a, i64 b, i64 *out)
+{
+    u64 x = rat_mag(a), y = rat_mag(b);
+    int neg = ((a < 0) != (b < 0));
+    u64 lim = neg ? 9223372036854775808ULL : 9223372036854775807ULL;
+
+    if (y != 0u && x > lim / y)
+        return 0;
+    *out = rat_sign(x * y, neg);
+    return 1;
+}
+
+/* ---- 工厂 ---- */
+
+Rat rat_zero(void)
+{
+    Rat r = { 0, 1, 0 };
+
+    return r;
+}
+
+Rat rat_from_i64(i64 v)
+{
+    Rat r = { 0 };
+
+    r.num = v;
+    r.den = 1;
+    return r;
+}
+
+/* 约分并规范化符号；分母 0（或 -I64_MIN）→ err */
+Rat rat_make(i64 num, i64 den)
+{
+    Rat r = { 0 };
+    u64 un = 0, ud = 0, g = 0;
+
+    r.den = 1;
+    if (den == 0) {
+        r.err = 1;
+        return r;
+    }
+    un = rat_mag(num);
+    ud = rat_mag(den);
+    g = rat_ugcd(un, ud);
+    if (g > 1u) {
+        un /= g;
+        ud /= g;
+    }
+    if (ud > 9223372036854775807ULL) {
+        r.err = 1;
+        return r;
+    }
+    r.num = rat_sign(un, ((num < 0) != (den < 0)));
+    r.den = (i64)ud;
+    if (r.num == 0)
+        r.den = 1;
+    return r;
+}
+
+/* 解析 "a/b" 或 "a"（都是十进制、可带符号）；语法错误 -> err */
+Rat rat_parse(char[:] s)
+{
+    Rat r = { 0 };
+    int i = 0, negn = 0, negd = 0, anyn = 0, anyd = 0;
+    u64 un = 0, ud = 1;
+
+    if (s.len > 0 && (s.data[0] == '-' || s.data[0] == '+')) {
+        negn = (s.data[0] == '-');
+        i = 1;
+    }
+    for (; i < s.len && s.data[i] >= '0' && s.data[i] <= '9'; i++) {
+        un = un * 10u + (u64)(s.data[i] - '0');
+        anyn = 1;
+        if (un > 9223372036854775807ULL) {
+            r.err = 1;
+            return r;
+        }
+    }
+    if (!anyn) {
+        r.err = 1;
+        return r;
+    }
+    if (i < s.len && s.data[i] == '/') {
+        i++;
+        if (i < s.len && (s.data[i] == '-' || s.data[i] == '+')) {
+            negd = (s.data[i] == '-');
+            i++;
+        }
+        ud = 0;
+        for (; i < s.len && s.data[i] >= '0' && s.data[i] <= '9'; i++) {
+            ud = ud * 10u + (u64)(s.data[i] - '0');
+            anyd = 1;
+            if (ud > 9223372036854775807ULL) {
+                r.err = 1;
+                return r;
+            }
+        }
+        if (!anyd) {
+            r.err = 1;
+            return r;
+        }
+    }
+    if (i != s.len) {
+        r.err = 1;
+        return r;
+    }
+    return rat_make(rat_sign(un, negn), (i64)ud * (negd ? -1 : 1));
+}
+
+/* ---- 查询 ---- */
+
+int is_zero(Rat *self) { return self->err == 0 && self->num == 0; }
+
+int is_err(Rat *self) { return self->err != 0; }
+
+int is_neg(Rat *self) { return self->num < 0; }
+
+/* 正数的连分数比较：a/b 与 c/d（b、d 都 > 0），避免交叉相乘溢出 */
+static int rat_cmp_mag(u64 a, u64 b, u64 c, u64 d)
+{
+    int flip = 0;
+
+    for (;;) {
+        u64 q1 = a / b, q2 = c / d;
+        u64 r1 = 0, r2 = 0;
+        int c2 = 0;
+
+        if (q1 != q2)
+            return flip ? (q1 > q2 ? -1 : 1) : (q1 < q2 ? -1 : 1);
+        r1 = a % b;
+        r2 = c % d;
+        if (r1 == 0u || r2 == 0u) {
+            if (r1 == 0u && r2 == 0u)
+                return 0;
+            c2 = (r1 == 0u) ? -1 : 1;
+            return flip ? -c2 : c2;
+        }
+        a = b;
+        b = r1;
+        c = d;
+        d = r2;
+        flip = !flip;
+    }
+}
+
+int cmp(Rat *self, Rat o)
+{
+    int sn = self->num < 0, on = o.num < 0;
+    int c = 0;
+
+    if (self->num == 0 && o.num == 0)
+        return 0;
+    if (self->num == 0)
+        return on ? 1 : -1;
+    if (o.num == 0)
+        return sn ? -1 : 1;
+    if (sn != on)
+        return sn ? -1 : 1;
+    c = rat_cmp_mag(rat_mag(self->num), (u64)self->den,
+                    rat_mag(o.num), (u64)o.den);
+    return sn ? -c : c;
+}
+
+/* ---- 四则 ---- */
+
+Rat neg(Rat *self)
+{
+    Rat r = *self;
+
+    if (r.num == RAT_I64_MIN)
+        r.err = 1;
+    else
+        r.num = -r.num;
+    return r;
+}
+
+Rat abs(Rat *self)
+{
+    Rat r = *self;
+
+    if (r.num == RAT_I64_MIN)
+        r.err = 1;
+    else if (r.num < 0)
+        r.num = -r.num;
+    return r;
+}
+
+Rat add(Rat *self, Rat o)
+{
+    Rat r = { 0 };
+    i64 g = 0, bl = 0, dl = 0, n1 = 0, n2 = 0, num = 0, den = 0;
+
+    if (self->err || o.err) {
+        r.err = 1;
+        return r;
+    }
+    g = (i64)rat_ugcd((u64)self->den, (u64)o.den);
+    bl = self->den / g;
+    dl = o.den / g;
+    if (!rat_mul_i64(self->num, dl, &n1) || !rat_mul_i64(o.num, bl, &n2)
+        || !rat_add_i64(n1, n2, &num)) {
+        r.err = 1;
+        return r;
+    }
+    if (num == 0)
+        return rat_zero();
+    if (!rat_mul_i64(bl, o.den, &den)) {
+        r.err = 1;
+        return r;
+    }
+    return rat_make(num, den);
+}
+
+Rat sub(Rat *self, Rat o)
+{
+    Rat n = o;
+
+    if (n.num == RAT_I64_MIN) {
+        n.err = 1;
+        return n;
+    }
+    n.num = -n.num;
+    return self->add(n);
+}
+
+Rat mul(Rat *self, Rat o)
+{
+    i64 a = self->num, b = self->den, c = o.num, d = o.den;
+    i64 g1 = 0, g2 = 0, num = 0, den = 0;
+    Rat r = { 0 };
+
+    if (self->err || o.err) {
+        r.err = 1;
+        return r;
+    }
+    /* 交叉约分，把溢出的可能降到最低 */
+    g1 = (i64)rat_ugcd(rat_mag(a), (u64)d);
+    g2 = (i64)rat_ugcd(rat_mag(c), (u64)b);
+    if (g1 > 1) {
+        a /= g1;
+        d /= g1;
+    }
+    if (g2 > 1) {
+        c /= g2;
+        b /= g2;
+    }
+    if (!rat_mul_i64(a, c, &num) || !rat_mul_i64(b, d, &den)) {
+        r.err = 1;
+        return r;
+    }
+    return rat_make(num, den);
+}
+
+Rat inv(Rat *self)
+{
+    Rat r = { 0 };
+
+    if (self->err || self->num == 0) {
+        r.err = 1;
+        return r;
+    }
+    return rat_make(self->den, self->num);
+}
+
+Rat div(Rat *self, Rat o)
+{
+    Rat r = { 0 };
+
+    if (self->err || o.err || o.num == 0) {
+        r.err = 1;
+        return r;
+    }
+    r = o.inv();
+    if (r.err)
+        return r;
+    return self->mul(r);
+}
+
+/* ---- 转换与输出 ---- */
+
+int to_i64(Rat *self, i64 *out)
+{
+    if (!out || self->err)
+        return 0;
+    *out = self->num / self->den;
+    return 1;
+}
+
+int to_f64(Rat *self, f64 *out)
+{
+    if (!out || self->err)
+        return 0;
+    *out = (f64)self->num / (f64)self->den;
+    return 1;
+}
+
+static int rat_utoa(u64 v, char *tmp)
+{
+    char rev[24] = { 0 };
+    int n = 0, i = 0;
+
+    if (v == 0u) {
+        tmp[0] = '0';
+        return 1;
+    }
+    while (v > 0u && n < 24) {
+        rev[n++] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    }
+    for (i = 0; i < n; i++)
+        tmp[i] = rev[n - 1 - i];
+    return n;
+}
+
+/* 输出 "num/den"（分母 1 时只有整数）；放不下返回 -1，不写半截 */
+int format(Rat *self, char[:] out)
+{
+    char tmp[56] = { 0 };
+    int n = 0, len = 0, i = 0;
+
+    if (self->err)
+        return -1;
+    if (self->num < 0) {
+        tmp[n++] = '-';
+        n += rat_utoa(rat_mag(self->num), tmp + n);
+    } else {
+        n += rat_utoa((u64)self->num, tmp + n);
+    }
+    if (self->den != 1) {
+        tmp[n++] = '/';
+        n += rat_utoa((u64)self->den, tmp + n);
+    }
+    len = n;
+    if (len > out.len)
+        return -1;
+    for (i = 0; i < len; i++)
+        out.data[i] = tmp[i];
+    return len;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int rat_is(Rat a, const char *want)
+{
+    char tmp[56] = { 0 };
+    int n = a.format((char[:]){ tmp, (int)sizeof tmp });
+
+    if (n < 0)
+        return 0;
+    tmp[n] = 0;
+    return strcmp(tmp, want) == 0;
+}
+
+test "规范化与解析" {
+    if (!rat_is(rat_make(6, 8), "3/4") || !rat_is(rat_make(-6, 8), "-3/4"))
+        return err(1, "约分");
+    if (!rat_is(rat_make(6, -8), "-3/4") || !rat_is(rat_make(-6, -8), "3/4"))
+        return err(2, "分母的符号");
+    if (!rat_is(rat_make(0, 5), "0") || !rat_is(rat_make(5, 1), "5"))
+        return err(3, "零/整数");
+    if (!rat_make(1, 0).is_err())
+        return err(4, "分母 0");
+    if (!rat_is(rat_parse(S("-6/8")), "-3/4") || !rat_is(rat_parse(S("7")), "7"))
+        return err(5, "解析");
+    if (!rat_is(rat_parse(S("+3/-6")), "-1/2"))
+        return err(6, "解析带符号分母");
+    if (!rat_parse(S("")).is_err() || !rat_parse(S("1/")).is_err()
+        || !rat_parse(S("x/2")).is_err() || !rat_parse(S("1/2/3")).is_err())
+        return err(7, "非法解析");
+    if (!rat_zero().is_zero() || rat_make(1, 3).is_zero())
+        return err(8, "零判定");
+    if (!rat_make(-1, 3).is_neg() || rat_make(1, 3).is_neg())
+        return err(9, "符号判定");
+}
+
+test "加减法" {
+    Rat a = rat_make(1, 2);
+    Rat b = rat_make(1, 3);
+
+    if (!rat_is(a.add(b), "5/6"))
+        return err(10, "1/2 + 1/3");
+    if (!rat_is(a.sub(b), "1/6"))
+        return err(11, "1/2 - 1/3");
+    if (!rat_is(a.add(a), "1"))
+        return err(12, "1/2 + 1/2");
+    if (!rat_is(rat_make(2, 3).add(rat_make(1, 6)), "5/6"))
+        return err(13, "2/3 + 1/6");
+    if (!rat_is(rat_make(-1, 2).add(rat_make(1, 2)), "0"))
+        return err(14, "相反数相加");
+    if (!rat_is(a.sub(a), "0") || !rat_is(a.neg(), "-1/2"))
+        return err(15, "sub/neg");
+    if (!rat_is(rat_make(-3, 4).abs(), "3/4"))
+        return err(16, "abs");
+    /* 溢出要报错 */
+    if (!rat_from_i64(RAT_I64_MAX).add(rat_from_i64(RAT_I64_MAX)).is_err())
+        return err(17, "加法溢出");
+    /* 约分后再加，能放下的不误报 */
+    if (!rat_is(rat_make(RAT_I64_MAX - 1, 2).add(rat_make(1, 2)), "9223372036854775807/2"))
+        return err(18, "约分后再加");
+}
+
+test "乘除与倒数" {
+    Rat a = rat_make(2, 3);
+    Rat b = rat_make(3, 4);
+
+    if (!rat_is(a.mul(b), "1/2"))
+        return err(19, "2/3 * 3/4");
+    if (!rat_is(rat_make(1, 2).div(rat_make(1, 4)), "2"))
+        return err(20, "1/2 ÷ 1/4");
+    if (!rat_is(rat_make(2, 3).div(rat_make(2, 3)), "1"))
+        return err(21, "自己除自己");
+    if (!rat_make(1, 3).div(rat_zero()).is_err())
+        return err(22, "除零");
+    if (!rat_zero().inv().is_err())
+        return err(23, "零没有倒数");
+    if (!rat_is(rat_make(-2, 3).inv(), "-3/2"))
+        return err(24, "负数倒数");
+    if (!rat_is(rat_make(-2, 3).mul(rat_make(-3, 2)), "1"))
+        return err(25, "负负得正");
+    if (!rat_make(RAT_I64_MAX, 1).mul(rat_make(2, 1)).is_err())
+        return err(26, "乘法溢出");
+    /* 交叉约分后不溢出：I64_MAX/1 * 2/I64_MAX = 2 */
+    if (!rat_is(rat_make(RAT_I64_MAX, 1).mul(rat_make(2, RAT_I64_MAX)), "2"))
+        return err(27, "交叉约分");
+}
+
+test "比较不经过 double" {
+    if (rat_make(1, 3).cmp(rat_make(1, 2)) >= 0)
+        return err(28, "1/3 < 1/2");
+    if (rat_make(-1, 2).cmp(rat_make(1, 3)) >= 0)
+        return err(29, "负数小于正数");
+    if (rat_make(2, 4).cmp(rat_make(1, 2)) != 0)
+        return err(30, "2/4 == 1/2");
+    if (rat_make(-3, 4).cmp(rat_make(-2, 3)) >= 0)
+        return err(31, "-3/4 < -2/3");
+    /* 交叉相乘会溢出的两对数，连分数比较仍然正确 */
+    if (rat_make(RAT_I64_MAX, 2).cmp(rat_make(RAT_I64_MAX, 1)) >= 0)
+        return err(32, "MAX/2 < MAX/1");
+    if (rat_make(RAT_I64_MAX, 2).cmp(rat_make(RAT_I64_MAX - 1, 2)) <= 0)
+        return err(33, "MAX/2 > (MAX-1)/2");
+    if (rat_make(1, RAT_I64_MAX).cmp(rat_make(1, RAT_I64_MAX - 1)) >= 0)
+        return err(34, "1/MAX < 1/(MAX-1)");
+    if (rat_make(1, 3).cmp(rat_make(1, 3)) != 0 || rat_make(0, 1).cmp(rat_make(0, 5)) != 0)
+        return err(35, "相等");
+}
+
+test "转换与输出" {
+    i64 iv = 0;
+    f64 f = 0;
+
+    if (!rat_make(7, 2).to_i64(&iv) || iv != 3)
+        return err(36, "7/2 截断");
+    if (!rat_make(-7, 2).to_i64(&iv) || iv != -3)
+        return err(37, "-7/2 截断");
+    if (!rat_make(1, 4).to_f64(&f) || f < 0.2499 || f > 0.2501)
+        return err(38, "1/4 的 f64");
+    if (!rat_make(1, 3).to_f64(&f) || f < 0.3333 || f > 0.3334)
+        return err(39, "1/3 的 f64");
+    if (!rat_is(rat_make(-1, 3), "-1/3") || !rat_is(rat_make(0, 7), "0"))
+        return err(40, "负号/零的格式");
+    {
+        char small[3] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 3; i++)
+            small[i] = 'Z';
+        if (rat_make(-100000, 3).format((char[:]){ small, 3 }) != -1)
+            return err(41, "放不下给 -1");
+        for (i = 0; i < 3; i++)
+            if (small[i] != 'Z')
+                return err(42, "放不下时写了半截");
+    }
+    /* err 传播 */
+    {
+        Rat bad = rat_zero();
+        Rat sum = { 0 };
+
+        bad.err = 1;
+        sum = bad.add(rat_from_i64(1));
+        if (!sum.is_err())
+            return err(43, "err 没传播");
+    }
+}
