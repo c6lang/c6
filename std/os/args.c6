@@ -1,0 +1,440 @@
+/* std/os/args：命令行选项解析（getopt 风格、零分配、按规格表迭代）。
+ *
+ *     import std.os.args;
+ *
+ *     ArgSpec specs[2] = { { { S("--verbose") }, 'v', 0 },
+ *                          { { S("--port") },    'p', 1 } };
+ *     Args a = args_open(argc, argv);
+ *     Arg arg = { 0 };
+ *     while (a.next(specs, 2, &arg) == 1) {
+ *         if (arg.kind == ARG_VALUE) { ... arg.value ... }
+ *     }
+ *
+ * 为什么要有规格表：`--port 8080` 和 `--flag file` 在字面上分不清哪个选项吃值，
+ * 所以调用方先声明每个选项「带不带值」，解析器按声明消费参数。规则：
+ *
+ * - 长选项 `--name` / `--name=value`；短选项 `-n` / `-n=value`（**不支持**
+ *   `-abc` 这种合并写法，`-abc` 会被当成不认识的选项）。
+ * - 带值选项：`--name=value`、`--name value`、`-n=value`、`-n value` 都认；
+ *   缺值报 `ARG_EMISSING`。
+ * - 开关：`--flag`、`-f`；写成 `--flag=x` 报 `ARG_EUNKNOWN`。
+ * - `--` 之后所有参数都按位置参数处理（包括 `-x` 和 `--y`）；单个 `-` 也是
+ *   位置参数（stdin 的惯例）。
+ * - 不认识的选项报 `ARG_EUNKNOWN`；选项和位置参数可以任意穿插（GNU 风格）。
+ * - `arg.name` 是**实际写的形式**（`-p` 或 `--port`），`arg.spec` 是规格表下标
+ *   （位置参数是 -1），用哪个都行；`arg.index` 是它在 argv 里的下标。
+ *
+ * 迭代器只在 `args_open` 给的 `argc/argv` 上走，不复制、不分配。错误之后
+ * `a.err` 保留错误码，游标停在出错的位置（可以自己恢复或直接退出）。
+ */
+#include <string.h>
+
+module std.os.args;
+import std.core.types;
+import std.text.str;
+
+enum ArgKind {
+    ARG_VALUE = 0,           /* 带值选项 */
+    ARG_FLAG = 1,            /* 开关 */
+    ARG_POSITIONAL = 2,      /* 位置参数 */
+};
+
+enum ArgErr {
+    ARG_OK = 0,
+    ARG_EUNKNOWN = 1,        /* 不认识这个选项（或给开关带了值） */
+    ARG_EMISSING = 2,        /* 带值选项缺值 */
+};
+
+struct ArgSpec {
+    Str long_name;           /* 例如 "--port"（含 --）；空视图 = 没有长名 */
+    int short_name;          /* 例如 'p'；0 = 没有短名 */
+    int has_value;           /* 1 = 需要值 */
+};
+
+struct Args {
+    int argc;
+    char **argv;
+    int i;                   /* 下一个要看的 argv 下标（从 1 起） */
+    int no_more_opts;        /* 遇到过 "--" */
+    int err;
+};
+
+struct Arg {
+    int kind;
+    int spec;                /* 规格表下标；位置参数是 -1 */
+    Str name;                /* 实际写的形式（含 -/--）或位置参数本身 */
+    Str value;               /* ARG_VALUE 的值 */
+    int index;               /* argv 下标 */
+};
+
+static Str args_cstr(char *z)
+{
+    int n = 0;
+
+    while (z && z[n])
+        n++;
+    {
+        Str s = { ((char[:]){ z, n }) };
+
+        return s;
+    }
+}
+
+Args args_open(int argc, char **argv)
+{
+    Args a = { 0, (char **)0, 1, 0, ARG_OK };
+
+    a.argc = argc;
+    a.argv = argv;
+    return a;
+}
+
+/* 在规格表里按名字找：--long 或 -s；找不到返回 -1 */
+int args_find(ArgSpec *specs, int nspecs, Str name)
+{
+    int i = 0;
+
+    if (!specs || nspecs <= 0)
+        return -1;
+    for (i = 0; i < nspecs; i++) {
+        if (name.s.len > 0 && specs[i].long_name.s.len == name.s.len
+            && memcmp(specs[i].long_name.s.data, name.s.data,
+                      (usize)name.s.len) == 0)
+            return i;
+        if (name.s.len == 2 && name.s.data[0] == '-'
+            && specs[i].short_name != 0
+            && (u8)name.s.data[1] == (u8)specs[i].short_name)
+            return i;
+    }
+    return -1;
+}
+
+/* 下一条：1 = 有，0 = 结束，-1 = 错误（err 是 ArgErr） */
+int next(Args *self, ArgSpec *specs, int nspecs, Arg *out)
+{
+    if (!out)
+        return 0;
+    memset(out, 0, sizeof *out);
+    out->spec = -1;
+    while (self->i < self->argc) {
+        char *a = self->argv[self->i];
+        int len = 0;
+
+        if (!a) {
+            self->i++;
+            continue;
+        }
+        len = (int)strlen(a);
+        /* "--" 终止选项解析 */
+        if (!self->no_more_opts && len == 2 && a[0] == '-' && a[1] == '-') {
+            self->no_more_opts = 1;
+            self->i++;
+            continue;
+        }
+        if (!self->no_more_opts && len > 2 && a[0] == '-' && a[1] == '-') {
+            char *eq = strchr(a, '=');
+            Str nm = { ((char[:]){ a, eq ? (int)(eq - a) : len }) };
+            int idx = args_find(specs, nspecs, nm);
+
+            if (idx < 0) {
+                self->err = ARG_EUNKNOWN;
+                return -1;
+            }
+            out->spec = idx;
+            out->name = nm;
+            out->index = self->i;
+            if (specs[idx].has_value) {
+                if (eq) {
+                    out->value = args_cstr(eq + 1);
+                    self->i++;
+                } else if (self->i + 1 < self->argc) {
+                    out->value = args_cstr(self->argv[self->i + 1]);
+                    self->i += 2;
+                } else {
+                    self->err = ARG_EMISSING;
+                    return -1;
+                }
+                out->kind = ARG_VALUE;
+            } else {
+                if (eq) {
+                    self->err = ARG_EUNKNOWN;
+                    return -1;
+                }
+                out->kind = ARG_FLAG;
+                self->i++;
+            }
+            return 1;
+        }
+        if (!self->no_more_opts && len > 1 && a[0] == '-' && a[1] != '-') {
+            Str nm = { ((char[:]){ a, 2 }) };
+            int idx = args_find(specs, nspecs, nm);
+
+            if (idx < 0) {
+                self->err = ARG_EUNKNOWN;
+                return -1;
+            }
+            out->spec = idx;
+            out->name = nm;
+            out->index = self->i;
+            if (specs[idx].has_value) {
+                if (len > 2 && a[2] == '=') {
+                    out->value = args_cstr(a + 3);
+                    self->i++;
+                } else if (len == 2) {
+                    if (self->i + 1 >= self->argc) {
+                        self->err = ARG_EMISSING;
+                        return -1;
+                    }
+                    out->value = args_cstr(self->argv[self->i + 1]);
+                    self->i += 2;
+                } else {
+                    self->err = ARG_EUNKNOWN;       /* -pfoo 不认 */
+                    return -1;
+                }
+                out->kind = ARG_VALUE;
+            } else {
+                if (len > 2) {
+                    self->err = ARG_EUNKNOWN;       /* -abc 不认 */
+                    return -1;
+                }
+                out->kind = ARG_FLAG;
+                self->i++;
+            }
+            return 1;
+        }
+        /* 位置参数（含单个 "-" 和 "--" 之后的全部） */
+        out->kind = ARG_POSITIONAL;
+        out->name = args_cstr(a);
+        out->index = self->i;
+        self->i++;
+        return 1;
+    }
+    return 0;
+}
+
+/* 剩余的位置参数个数（不移动游标；遇到错误返回已数到的个数） */
+int positional_count(Args *self, ArgSpec *specs, int nspecs)
+{
+    Args save = *self;
+    Arg a = { 0 };
+    int n = 0;
+
+    while (next(self, specs, nspecs, &a) == 1) {
+        if (a.kind == ARG_POSITIONAL)
+            n++;
+    }
+    *self = save;
+    return n;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static Str a_str(char[:] s)
+{
+    Str r = { { (char *)0, 0 } };
+
+    r.s = s;
+    return r;
+}
+
+test "长选项、短选项与位置参数" {
+    char *argv[11] = { (char *)"prog", (char *)"-v", (char *)"--port",
+                       (char *)"8080", (char *)"--name=x", (char *)"file1",
+                       (char *)"file2", (char *)"--", (char *)"-notopt",
+                       (char *)"--verbose", (char *)0 };
+    ArgSpec specs[3] = { { { S("--verbose") }, 'v', 0 },
+                         { { S("--port") }, 'p', 1 },
+                         { { S("--name") }, 'n', 1 } };
+    Args a = args_open(10, argv);
+    Arg arg = { 0 };
+    int n = 0, flags = 0, values = 0, pos = 0;
+
+    while (a.next(specs, 3, &arg) == 1) {
+        n++;
+        if (arg.kind == ARG_FLAG) {
+            flags++;
+            if (arg.spec != 0 && arg.spec != -1)
+                return err(1, "开关的 spec");
+        } else if (arg.kind == ARG_VALUE) {
+            values++;
+            if (arg.spec == 1) {
+                if (arg.value.s.len != 4 || memcmp(arg.value.s.data, "8080", 4) != 0)
+                    return err(2, "--port 的值");
+                if (arg.index != 2)
+                    return err(3, "--port 的下标");
+            } else if (arg.spec == 2) {
+                if (arg.value.s.len != 1 || arg.value.s.data[0] != 'x')
+                    return err(4, "--name=x 的值");
+            } else {
+                return err(5, "值的 spec");
+            }
+        } else {
+            pos++;
+            if (pos == 1 && !(arg.name.s.len == 5
+                              && memcmp(arg.name.s.data, "file1", 5) == 0))
+                return err(6, "第一个位置参数");
+            if (pos == 3 && !(arg.name.s.len == 7
+                              && memcmp(arg.name.s.data, "-notopt", 7) == 0))
+                return err(7, "-- 之后的位置参数");
+            if (arg.spec != -1)
+                return err(8, "位置参数的 spec");
+        }
+    }
+    if (a.err != 0)
+        return err(9, "不该有错误");
+    /* -v 是唯一的开关；--verbose 在 -- 之后，按位置参数算 */
+    if (n != 7 || flags != 1 || values != 2 || pos != 4)
+        return err(10, "事件计数");
+    /* 计数辅助 */
+    {
+        Args b = args_open(10, argv);
+
+        if (b.positional_count(specs, 3) != 4)
+            return err(11, "positional_count");
+        if (b.i != 1)
+            return err(12, "positional_count 不该移动游标");
+    }
+}
+
+test "等号、缺值与未知选项" {
+    ArgSpec specs[2] = { { { S("--port") }, 'p', 1 },
+                         { { S("--flag") }, 'f', 0 } };
+
+    /* 短选项 -p=8080 */
+    {
+        char *argv[3] = { (char *)"prog", (char *)"-p=8080", (char *)0 };
+        Args a = args_open(2, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 2, &arg) != 1 || arg.kind != ARG_VALUE
+            || arg.value.s.len != 4
+            || memcmp(arg.value.s.data, "8080", 4) != 0)
+            return err(13, "-p=8080");
+    }
+    /* 短选项 -p 8080 */
+    {
+        char *argv[3] = { (char *)"prog", (char *)"-p", (char *)"9" };
+        Args a = args_open(3, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 2, &arg) != 1 || arg.kind != ARG_VALUE
+            || arg.value.s.len != 1 || arg.value.s.data[0] != '9')
+            return err(14, "-p 9");
+    }
+    /* 缺值 */
+    {
+        char *argv[2] = { (char *)"prog", (char *)"--port" };
+        Args a = args_open(2, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 2, &arg) != -1 || a.err != ARG_EMISSING)
+            return err(15, "缺值");
+    }
+    /* 未知长选项 / 未知短选项 */
+    {
+        char *argv[2] = { (char *)"prog", (char *)"--zap" };
+        Args a = args_open(2, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 2, &arg) != -1 || a.err != ARG_EUNKNOWN)
+            return err(16, "未知长选项");
+    }
+    {
+        char *argv[2] = { (char *)"prog", (char *)"-z" };
+        Args a = args_open(2, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 2, &arg) != -1 || a.err != ARG_EUNKNOWN)
+            return err(17, "未知短选项");
+    }
+    /* 开关带值 */
+    {
+        char *argv[2] = { (char *)"prog", (char *)"--flag=1" };
+        Args a = args_open(2, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 2, &arg) != -1 || a.err != ARG_EUNKNOWN)
+            return err(18, "开关带值");
+    }
+    /* 合并短选项不认 */
+    {
+        char *argv[2] = { (char *)"prog", (char *)"-fp" };
+        Args a = args_open(2, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 2, &arg) != -1 || a.err != ARG_EUNKNOWN)
+            return err(19, "-fp 不认");
+    }
+}
+
+test "边界" {
+    ArgSpec specs[1] = { { { S("--flag") }, 'f', 0 } };
+
+    /* 没有参数 */
+    {
+        char *argv[1] = { (char *)"prog" };
+        Args a = args_open(1, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 1, &arg) != 0)
+            return err(20, "没有参数");
+    }
+    /* 单个 "-" 是位置参数 */
+    {
+        char *argv[2] = { (char *)"prog", (char *)"-" };
+        Args a = args_open(2, argv);
+        Arg arg = { 0 };
+
+        if (a.next(specs, 1, &arg) != 1 || arg.kind != ARG_POSITIONAL
+            || arg.name.s.len != 1 || arg.name.s.data[0] != '-')
+            return err(21, "单个 -");
+    }
+    /* "--" 之后全是位置参数 */
+    {
+        char *argv[4] = { (char *)"prog", (char *)"--", (char *)"--flag",
+                          (char *)"-f" };
+        Args a = args_open(4, argv);
+        Arg arg = { 0 };
+        int n = 0;
+
+        while (a.next(specs, 1, &arg) == 1) {
+            if (arg.kind != ARG_POSITIONAL)
+                return err(22, "-- 之后不该有选项");
+            n++;
+        }
+        if (n != 2)
+            return err(23, "-- 之后的个数");
+    }
+    /* args_find 直接查 */
+    {
+        Str ln = { S("--flag") };
+        Str sh = { S("-f") };
+        Str bad = { S("--nope") };
+        Str one = { S("-x") };
+
+        if (args_find(specs, 1, ln) != 0 || args_find(specs, 1, sh) != 0)
+            return err(24, "args_find 命中");
+        if (args_find(specs, 1, bad) != -1 || args_find(specs, 1, one) != -1)
+            return err(25, "args_find 未命中");
+        if (args_find((ArgSpec *)0, 0, ln) != -1)
+            return err(26, "空规格表");
+    }
+    /* 只有长名/只有短名的规格 */
+    {
+        ArgSpec only[2] = { { { S("--long") }, 0, 0 },
+                            { { { (char *)0, 0 } }, 's', 0 } };
+        char *argv[3] = { (char *)"prog", (char *)"--long", (char *)"-s" };
+
+        {
+            Args a = args_open(3, argv);
+            Arg arg = { 0 };
+
+            if (a.next(only, 2, &arg) != 1 || arg.spec != 0)
+                return err(27, "只有长名");
+            if (a.next(only, 2, &arg) != 1 || arg.spec != 1)
+                return err(28, "只有短名");
+        }
+    }
+}

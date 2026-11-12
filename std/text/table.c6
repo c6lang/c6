@@ -1,0 +1,444 @@
+/* std/text/table：按显示列宽对齐的表格渲染（零分配、写调用方缓冲）。
+ *
+ *     import std.text.table;
+ *
+ *     char[:] head[2] = { S("name"), S("qty") };
+ *     char[:] cells[4] = { S("a"), S("12"), S("bb"), S("3") };
+ *     int align[2] = { TBL_LEFT, TBL_RIGHT };
+ *     Table t = table_make(2);
+ *     char out[256] = { 0 };
+ *     t.render(head, cells, 2, align, (char[:]){ out, (int)sizeof out });
+ *
+ * 输出是 ASCII 框线 + 空格对齐，列宽按**显示列数**（`std.text.width`，CJK 算 2 列、
+ * 组合符 0 列）算，所以中英混排也能对齐：
+ *
+ *     +------+-----+
+ *     | name | qty |
+ *     +------+-----+
+ *     | a    |  12 |
+ *     | bb   |   3 |
+ *     +------+-----+
+ *
+ * 选项（`Table` 字段）：
+ *
+ * - `border`（默认 1）：画外框、表头分隔线和底线；0 时只画数据行。
+ * - `sep`（默认 1）：列之间画 `|`；0 时用两个空格分隔（没有外框时更像纯文本）。
+ * - `pad`（默认 1）：每个格子左右各留的空格数（0 = 紧贴）。
+ *
+ * 约定：`headers` 可以是 0（无表头，也就不画表头分隔线）；`cells` 是
+ * `nrows * ncols` 个切片（行优先）；`aligns` 可以是 0（全左对齐）或 ncols 个
+ * `TBL_LEFT`/`TBL_RIGHT`/`TBL_CENTER`。`table_len` 和 `render` 用同一套逻辑，
+ * 长度精确；放不下返回 -1 且一个字节都不写。
+ */
+#include <string.h>
+
+module std.text.table;
+import std.core.types;
+import std.text.utf8;
+import std.text.width;
+
+enum TableAlign {
+    TBL_LEFT = 0,
+    TBL_RIGHT = 1,
+    TBL_CENTER = 2,
+};
+
+enum TableLimits {
+    TBL_MAX_COLS = 32,
+};
+
+struct Table {
+    int ncols;
+    int border;
+    int sep;
+    int pad;
+};
+
+Table table_make(int ncols)
+{
+    Table t = { 0, 1, 1, 1 };
+
+    t.ncols = ncols;
+    return t;
+}
+
+/* 输出缓冲计数/写入器：buf 为 0 时只计数 */
+struct TOut {
+    char *buf;
+    int cap;
+    int n;
+};
+
+static void tbl_put(TOut *o, char[:] s)
+{
+    if (o->buf && o->n + s.len <= o->cap && s.len > 0)
+        memcpy(o->buf + o->n, s.data, (usize)s.len);
+    o->n += s.len;
+}
+
+static void tbl_char(TOut *o, char c, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        if (o->buf && o->n < o->cap)
+            o->buf[o->n] = c;
+        o->n++;
+    }
+}
+
+static void tbl_nl(TOut *o)
+{
+    tbl_char(o, '\n', 1);
+}
+
+/* 第 c 列的显示宽度（表头与所有单元格取最大） */
+static int tbl_colw(Table *t, char[:] *headers, char[:] *cells, int nrows,
+                    int c)
+{
+    int w = 0, r = 0;
+
+    if (headers) {
+        w = text_width(headers[c]);
+    }
+    for (r = 0; r < nrows; r++) {
+        int cw = text_width(cells[r * t->ncols + c]);
+
+        if (cw > w)
+            w = cw;
+    }
+    return w;
+}
+
+/* 写一个格子：左补齐 + 内容 + 右补齐 */
+static void tbl_cell(TOut *o, char[:] s, int w, int align)
+{
+    int sw = text_width(s);
+    int left = 0, right = 0;
+
+    if (sw > w)
+        sw = w;
+    if (align == TBL_RIGHT)
+        left = w - sw;
+    else if (align == TBL_CENTER)
+        left = (w - sw) / 2;
+    right = w - sw - left;
+    tbl_char(o, ' ', left);
+    tbl_put(o, s);
+    tbl_char(o, ' ', right);
+}
+
+static void tbl_sep_line(Table *t, int *widths, TOut *o)
+{
+    int c = 0;
+
+    tbl_char(o, '+', 1);
+    for (c = 0; c < t->ncols; c++) {
+        tbl_char(o, '-', widths[c] + t->pad * 2);
+        tbl_char(o, '+', 1);
+    }
+    tbl_nl(o);
+}
+
+static void tbl_row(Table *t, char[:] *cells, int row, int *widths, int *aligns,
+                    TOut *o)
+{
+    int c = 0;
+
+    if (t->border)
+        tbl_char(o, '|', 1);
+    for (c = 0; c < t->ncols; c++) {
+        int al = aligns ? aligns[c] : TBL_LEFT;
+
+        if (t->border)
+            tbl_char(o, ' ', t->pad);
+        tbl_cell(o, cells[row * t->ncols + c], widths[c], al);
+        if (t->border)
+            tbl_char(o, ' ', t->pad);
+        if (c + 1 < t->ncols) {
+            if (t->border) {
+                if (t->sep)
+                    tbl_char(o, '|', 1);
+                else
+                    tbl_char(o, ' ', 2);
+            } else if (t->sep) {
+                tbl_char(o, ' ', 1);
+                tbl_char(o, '|', 1);
+                tbl_char(o, ' ', 1);
+            } else {
+                tbl_char(o, ' ', 2);
+            }
+        } else if (t->border) {
+            tbl_char(o, '|', 1);
+        }
+    }
+    tbl_nl(o);
+}
+
+static void tbl_head_row(Table *t, char[:] *headers, int *widths, int *aligns,
+                         TOut *o)
+{
+    int c = 0;
+
+    if (t->border)
+        tbl_char(o, '|', 1);
+    for (c = 0; c < t->ncols; c++) {
+        int al = aligns ? aligns[c] : TBL_LEFT;
+
+        if (t->border)
+            tbl_char(o, ' ', t->pad);
+        tbl_cell(o, headers[c], widths[c], al);
+        if (t->border)
+            tbl_char(o, ' ', t->pad);
+        if (c + 1 < t->ncols) {
+            if (t->border) {
+                if (t->sep)
+                    tbl_char(o, '|', 1);
+                else
+                    tbl_char(o, ' ', 2);
+            } else if (t->sep) {
+                tbl_char(o, ' ', 1);
+                tbl_char(o, '|', 1);
+                tbl_char(o, ' ', 1);
+            } else {
+                tbl_char(o, ' ', 2);
+            }
+        } else if (t->border) {
+            tbl_char(o, '|', 1);
+        }
+    }
+    tbl_nl(o);
+}
+
+static int tbl_draw(Table *t, char[:] *headers, char[:] *cells, int nrows,
+                    int *aligns, char[:] out, int count_only)
+{
+    int widths[TBL_MAX_COLS] = { 0 };
+    TOut o = { (char *)0, 0, 0 };
+    int c = 0, r = 0;
+
+    if (!t || t->ncols < 0 || t->ncols > TBL_MAX_COLS || nrows < 0)
+        return -1;
+    if (nrows > 0 && !cells)
+        return -1;
+    if (t->ncols == 0)
+        return 0;
+    if (!count_only) {
+        o.buf = out.data;
+        o.cap = out.len;
+    }
+    for (c = 0; c < t->ncols; c++)
+        widths[c] = tbl_colw(t, headers, cells, nrows, c);
+    if (t->border)
+        tbl_sep_line(t, widths, &o);
+    if (headers)
+        tbl_head_row(t, headers, widths, aligns, &o);
+    if (t->border && headers)
+        tbl_sep_line(t, widths, &o);
+    for (r = 0; r < nrows; r++)
+        tbl_row(t, cells, r, widths, aligns, &o);
+    if (t->border)
+        tbl_sep_line(t, widths, &o);
+    return o.n;
+}
+
+/* 渲染需要多少字节；参数非法给 -1 */
+int table_len(Table *self, char[:] *headers, char[:] *cells, int nrows,
+              int *aligns)
+{
+    return tbl_draw(self, headers, cells, nrows, aligns, (char[:]){ (char *)0, 0 },
+                    1);
+}
+
+/* 渲染：返回写入字节数；放不下/参数非法返回 -1（不写半截） */
+int render(Table *self, char[:] *headers, char[:] *cells, int nrows,
+           int *aligns, char[:] out)
+{
+    int need = table_len(self, headers, cells, nrows, aligns);
+
+    if (need < 0 || need > out.len)
+        return -1;
+    return tbl_draw(self, headers, cells, nrows, aligns, out, 0);
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int tbl_is(Table *t, char[:] *head, char[:] *cells, int nrows, int *al,
+                  const char *want)
+{
+    char buf[1024] = { 0 };
+    int n = t->render(head, cells, nrows, al, (char[:]){ buf, (int)sizeof buf - 1 });
+
+    if (n < 0)
+        return 0;
+    buf[n] = 0;
+    return strcmp(buf, want) == 0 && n == table_len(t, head, cells, nrows, al);
+}
+
+test "基本表格" {
+    char[:] head[2] = { S("name"), S("qty") };
+    char[:] cells[4] = { S("a"), S("12"), S("bb"), S("3") };
+    int align[2] = { TBL_LEFT, TBL_RIGHT };
+    Table t = table_make(2);
+
+    if (!tbl_is(&t, head, cells, 2, align,
+                "+------+-----+\n"
+                "| name | qty |\n"
+                "+------+-----+\n"
+                "| a    |  12 |\n"
+                "| bb   |   3 |\n"
+                "+------+-----+\n"))
+        return err(1, "基本表格");
+    /* 无表头 */
+    if (!tbl_is(&t, (char[:] *)0, cells, 2, align,
+                "+----+----+\n"
+                "| a  | 12 |\n"
+                "| bb |  3 |\n"
+                "+----+----+\n"))
+        return err(2, "无表头");
+    /* 只有表头、没有数据行 */
+    if (!tbl_is(&t, head, (char[:] *)0, 0, align,
+                "+------+-----+\n"
+                "| name | qty |\n"
+                "+------+-----+\n"
+                "+------+-----+\n"))
+        return err(3, "只有表头");
+    /* 空表 */
+    t = table_make(0);
+    if (t.render((char[:] *)0, (char[:] *)0, 0, (int *)0, (char[:]){ (char *)0, 0 }) != 0)
+        return err(4, "0 列");
+}
+
+test "对齐与选项" {
+    char[:] head[3] = { S("l"), S("c"), S("r") };
+    char[:] cells[3] = { S("a"), S("b"), S("c") };
+    int align[3] = { TBL_LEFT, TBL_CENTER, TBL_RIGHT };
+    Table t = table_make(3);
+    char[:] one[1] = { S("x") };
+    char[:] onecell[1] = { S("y") };
+    int a1[1] = { TBL_LEFT };
+
+    if (!tbl_is(&t, head, cells, 1, align,
+                "+---+---+---+\n"
+                "| l | c | r |\n"
+                "+---+---+---+\n"
+                "| a | b | c |\n"
+                "+---+---+---+\n"))
+        return err(5, "对齐（等宽时看不出差别）");
+    /* 宽度不同时看对齐（ncols=2 要用自己的 Table） */
+    {
+        Table t2 = table_make(2);
+        char[:] h2[2] = { S("k"), S("v") };
+        char[:] c2[4] = { S("aaaa"), S("1"), S("b"), S("2222") };
+        int al2[2] = { TBL_LEFT, TBL_RIGHT };
+        char[:] h3[2] = { S("k"), S("v") };
+        int al3[2] = { TBL_LEFT, TBL_CENTER };
+
+        if (!tbl_is(&t2, h2, c2, 2, al2,
+                    "+------+------+\n"
+                    "| k    |    v |\n"
+                    "+------+------+\n"
+                    "| aaaa |    1 |\n"
+                    "| b    | 2222 |\n"
+                    "+------+------+\n"))
+            return err(6, "右对齐");
+        if (!tbl_is(&t2, h3, c2, 2, al3,
+                    "+------+------+\n"
+                    "| k    |  v   |\n"
+                    "+------+------+\n"
+                    "| aaaa |  1   |\n"
+                    "| b    | 2222 |\n"
+                    "+------+------+\n"))
+            return err(7, "居中");
+    }
+    /* 无边框、无竖线：两空格分隔 */
+    t = table_make(2);
+    t.border = 0;
+    t.sep = 0;
+    {
+        char[:] h[2] = { S("a"), S("b") };
+        char[:] c[2] = { S("1"), S("2") };
+
+        if (!tbl_is(&t, h, c, 1, (int *)0,
+                    "a  b\n"
+                    "1  2\n"))
+            return err(8, "无边框无竖线");
+    }
+    /* 无边框、有竖线 */
+    t.border = 0;
+    t.sep = 1;
+    {
+        char[:] h[2] = { S("a"), S("b") };
+        char[:] c[2] = { S("1"), S("2") };
+
+        if (!tbl_is(&t, h, c, 1, (int *)0,
+                    "a | b\n"
+                    "1 | 2\n"))
+            return err(9, "无边框有竖线");
+    }
+    /* pad = 0 紧贴 */
+    t = table_make(2);
+    t.pad = 0;
+    {
+        char[:] h[2] = { S("a"), S("bb") };
+        char[:] c[2] = { S("11"), S("2") };
+
+        if (!tbl_is(&t, h, c, 1, (int *)0,
+                    "+--+--+\n"
+                    "|a |bb|\n"
+                    "+--+--+\n"
+                    "|11|2 |\n"
+                    "+--+--+\n"))
+            return err(10, "pad=0");
+    }
+    /* 单单元格（注意 ncols 要和数组长度一致） */
+    {
+        Table t1 = table_make(1);
+
+        if (!tbl_is(&t1, one, onecell, 1, a1,
+                    "+---+\n"
+                    "| x |\n"
+                    "+---+\n"
+                    "| y |\n"
+                    "+---+\n"))
+            return err(11, "单列");
+    }
+}
+
+test "CJK 与容量" {
+    char[:] head[2] = { S("列"), S("值") };
+    char[:] cells[4] = { S("中文"), S("1"), S("a"), S("22") };
+    Table t = table_make(2);
+
+    if (!tbl_is(&t, head, cells, 2, (int *)0,
+                "+------+----+\n"
+                "| 列   | 值 |\n"
+                "+------+----+\n"
+                "| 中文 | 1  |\n"
+                "| a    | 22 |\n"
+                "+------+----+\n"))
+        return err(12, "CJK 宽度");
+    /* 放不下：不写半截 */
+    {
+        char small[8] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 8; i++)
+            small[i] = 'Z';
+        if (t.render(head, cells, 2, (int *)0, (char[:]){ small, 8 }) != -1)
+            return err(13, "放不下给 -1");
+        for (i = 0; i < 8; i++)
+            if (small[i] != 'Z')
+                return err(14, "放不下时写了半截");
+    }
+    /* 列数越界 */
+    t = table_make(33);
+    if (table_len(&t, (char[:] *)0, (char[:] *)0, 0, (int *)0) != -1)
+        return err(15, "列数越界");
+    /* nrows < 0 */
+    t = table_make(1);
+    if (table_len(&t, (char[:] *)0, (char[:] *)0, -1, (int *)0) != -1)
+        return err(16, "nrows 负数");
+}

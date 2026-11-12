@@ -47,6 +47,16 @@
 
 ### 标准库
 
+- **标准库第十六批（命令行工具基础）**：`std.os.args` / `std.text.table` /
+  `std.text.natural` / `std.os.proc` 四个模块，集成示例 `examples/stdcli.c6`
+  （`make std-cli`）。args 是按规格表迭代的选项解析（长/短名、带值/开关、
+  `--name=value`、`--` 终止、位置参数任意穿插，未知选项/缺值报错）；table 是按
+  显示列宽对齐的表格（CJK 2 列、边框/竖线/内边距可关、左/右/居中）；natural 是
+  自然排序（`file2 < file10`）与人类可读化（KiB/MiB、`1h 2m 3s`、千分位，且能
+  反向解析）；proc 是 POSIX 子进程封装（fork+execvp+waitpid、退出码/信号、
+  `/bin/sh -c`、PATH 查找）。错误号段 `std.os.args`=0x6049 … `std.os.proc`=0x604c
+  （`tcc/tccgen.c` 的 `c6_err_std_slots[]` 追加）。
+
 - **标准库第十五批（配置与文档格式）**：`std.data.toml` / `std.data.xml` /
   `std.data.query` / `std.text.template` 四个模块，集成示例
   `examples/stdconf.c6`（`make std-conf`）。toml 是事件式的 TOML 子集读取器

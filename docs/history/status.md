@@ -949,3 +949,23 @@ C9 原先在声明处拒绝 `float` / `double` / `long double`：失败路径要
 
 验收：`make stdtest`（73 个模块、0 failure）、`make std-conf`（19 条自检全过）、
 `make check-all`。
+
+### 11.28 标准库第十六批（args / table / natural / proc）
+
+第十六批补的是**命令行工具的基础件**：解析参数、把结果排成表格、把数字写成人看的
+样子、跑子进程。前三个是纯计算（零分配），proc 是一层 POSIX 薄封装：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.os.args` | 命令行选项解析（`args_open`/`Args.next`/`ArgSpec`/`Arg`/`args_find`/`positional_count`） | 按规格表决定谁吃值（`--name=value`/`--name value`/`-n value`/`-n=value`）；`--` 之后全按位置参数；合并短选项不认；未知选项/开关带值/缺值分别报错；选项与位置参数可任意穿插 |
+| `std.text.table` | 按显示列宽对齐的表格（`table_make`/`Table.render`/`table_len`） | 列宽用 `std.text.width`（CJK 2 列）；`border`/`sep`/`pad` 可关；`TBL_LEFT`/`TBL_RIGHT`/`TBL_CENTER`；无表头/无边框/紧贴都支持；先量再写 |
+| `std.text.natural` | 自然排序与人类可读化（`natural_cmp`/`humanize_bytes`/`parse_bytes`/`humanize_duration`/`parse_duration`/`humanize_int`） | 数字段按整数比、前导 0 视为相等、超长数字段不溢出；字节数 1024 进制一位小数并可反解；时长最大单位优先、裸数字按秒；千分位含 I64_MIN；都先量再写 |
+| `std.os.proc` | 子进程（`proc_run`/`proc_spawn`/`proc_wait`/`proc_run_sh`/`proc_which` + `ProcStatus`） | fork+execvp+waitpid（EINTR 重试）；`ProcStatus` 拆出正常退出/信号；命令找不到按 shell 惯例 `_exit(127)`；`proc_run_sh` 命令串 4KB 栈缓冲；`proc_which` 支持带 `/` 直接查与 PATH 逐段试 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.os.args`=0x6049、
+`std.text.table`=0x604a、`std.text.natural`=0x604b、`std.os.proc`=0x604c；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-cli` 与 `STDCLI_SRCS`，`stdtest`
+给 args 补 `str` 依赖、给 table 补 `width+utf8`，`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（77 个模块、0 failure）、`make std-cli`（17 条自检全过）、
+`make check-all`。

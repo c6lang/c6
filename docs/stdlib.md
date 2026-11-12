@@ -13,9 +13,9 @@
 | 目录 | 领域 |
 | --- | --- |
 | `std/core/` | 基础：定宽类型、错误码、内存、数学、位运算、哈希、随机 |
-| `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换 |
+| `std/text/` | 文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点、表格与自然排序 |
 | `std/container/` | 容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序 |
-| `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间 |
+| `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-256、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
 | `std/net/` | 网络与 Web：IP/CIDR、URL、MIME |
@@ -69,6 +69,8 @@
 | `std/text/semver.c6` | `std.text.semver` | 语义化版本 2.0.0：`semver_parse` 工厂、`Semver` 的 `compare`/`is_prerelease`/`format`；严格前导零/标识校验，构建标识不参与优先级 |
 | `std/text/utf16.c6` | `std.text.utf16` | UTF-16 解码/编码/计数：`Utf16` 的 `decode`/`valid`/`count`、`utf16_encode`/`utf16_encoded_len`；代理对、BMP、非法代理与截断（零分配） |
 | `std/text/ansi.c6` | `std.text.ansi` | ANSI 转义构造器 `Ansi`：`reset`/`bold`/`fg_basic`/`bg_basic`/`fg`/`bg`/`move`/`up`/`down`/`clear_screen`/`clear_line`/`hide_cursor`/`show_cursor`，满了置 `ok=0` |
+| `std/text/natural.c6` | `std.text.natural` | 自然排序与人类可读化：`natural_cmp`/`natural_cmp_ci`（连续数字段按整数比较，前导 0 视为相等，超长数字段不溢出）、`humanize_bytes`/`parse_bytes`（1024 进制 `B/KiB/MiB/GiB/TiB`，一位小数、四舍五入）、`humanize_duration`/`parse_duration`（`1h 2m 3s`/`850ms`/裸数字按秒）、`humanize_int`（千分位，含 I64_MIN）；都写调用方缓冲、放不下不写半截 |
+| `std/text/table.c6` | `std.text.table` | 按显示列宽对齐的表格：`table_make`、`Table` 的 `border`/`sep`/`pad` 与 `render`/`table_len`、`TBL_LEFT`/`TBL_RIGHT`/`TBL_CENTER`；列宽用 `std.text.width`（CJK 2 列），无表头/无边框/无竖线/紧贴都支持，先量再写 |
 | `std/text/width.c6` | `std.text.width` | 终端显示宽度（Unicode 15.0）：`cp_width`、`text_width`/`text_width_checked`、按列裁剪补齐 `text_prefix_len`/`text_fit`/`text_pad`/`text_clip`；W/F 算 2 列、组合符/格式符 0 列、只在码点边界切 |
 | `std/text/regex.c6` | `std.text.regex` | 回溯式正则（零分配、按码点）：`re_compile`/`re_compile_flags`（`RE_ICASE`/`RE_DOTALL`/`RE_MULTILINE`）、`Regex` 的 `find`/`find_from`/`match_at`/`matches`/`full`/`find_all`/`groups`/`is_valid`/`error_pos`、`Match` 的 `span`/`group`；`*`/`+`/`?`/`{m,n}`（懒惰后缀）、捕获与非捕获组、分支、字符类、`\d\w\s\b`、锚点；位置是字节、匹配按码点，容量上限见枚举 |
 | `std/text/diff.c6` | `std.text.diff` | 行级差异：`diff_make`（Hirschberg LCS，时间 O(na*nb)、空间 O(nb)，工作区从 `Arena` 分）、`Diff` 的 `write_script`/`write_unified`/`script_len`/`unified_len`/`op_at` 与 `added`/`removed`/`same`；先剥公共前后缀，hunk 按 ctx 合并，放不下不写半截 |
@@ -99,6 +101,8 @@
 | `std/os/fs.c6` | `std.os.fs` | POSIX 文件系统元数据与目录：`StatInfo`、`fs_stat`/`fs_lstat`/`fs_exists`/`fs_is_dir`/`fs_is_file`/`fs_size`、`fs_mkdir`/`fs_mkdir_p`/`fs_remove`/`fs_rmdir`/`fs_rename`、`fs_getcwd`/`fs_chdir`、零分配 `Dir` 遍历 |
 | `std/os/io.c6` | `std.os.io` | 文件与标准流：`Reader`（`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`/`close`）、`Writer`（`write_line`/`write_bytes`/`write_slice`/`flush`/`close`）、零分配的按行迭代 `CFile`（`has`/`next`）；调用一律写 `pr->read_line(...)` |
 | `std/os/path.c6` | `std.os.path` | POSIX 路径：`path_base`/`path_dir`/`path_ext`/`path_stem`/`path_is_abs`/`path_has_ext`/`path_split`、`path_join`/`path_normalize`（写调用方缓冲，放不下返回 -1 且不写半截） |
+| `std/os/args.c6` | `std.os.args` | 命令行选项解析（零分配、按规格表迭代）：`args_open` + `Args.next(specs, n, &arg)`、`ArgSpec`（长名/短名/`has_value`）、`Arg` 的 `kind`/`spec`/`name`/`value`/`index`、`args_find`、`Args.positional_count`；`--name=value`、`--name value`、`-n value`、`-n=value` 都认，`--` 之后全按位置参数，未知选项/开关带值/缺值分别报 `ARG_EUNKNOWN`/`ARG_EMISSING` |
+| `std/os/proc.c6` | `std.os.proc` | 子进程（POSIX、零分配）：`proc_run`（fork+execvp+wait）、`proc_spawn`/`proc_wait`、`proc_run_sh`（`/bin/sh -c`，命令串 4KB 上限）、`proc_which`（带 `/` 直接查，否则按 `PATH`）；`ProcStatus` 拆出 `exited`/`exit_code`/`signaled`/`signal`，命令找不到按 shell 惯例退出码 127 |
 | `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `d.format(buf, cap)`、`Civil` 日历换算 `civil_from_unix`/`c.to_unix()`/`c.format(...)`，不依赖 localtime |
 
 **`std/encoding/`**（编解码：Base64/十六进制/百分号、SHA-256、位流、UUID）
@@ -162,6 +166,7 @@
 | `examples/stdnum.c6` | （无模块） | 第十三批（数值类型）的拼装示例（`make std-num`）：bignum 阶乘与进制、decimal 金额税额、rational 调和级数、complex 乘法与模，自带自检 |
 | `examples/stdpack.c6` | （无模块） | 第十四批（压缩与文本编码）的拼装示例（`make std-pack`）：lz4 压缩遥测帧、rle+delta 压采样、base85 转文本、hexdump 文本化，自带自检 |
 | `examples/stdconf.c6` | （无模块） | 第十五批（配置与文档格式）的拼装示例（`make std-conf`）：toml 读配置、xml 扫文档、query 解析/构建查询串、template 生成报告，自带自检 |
+| `examples/stdcli.c6` | （无模块） | 第十六批（命令行工具基础）的拼装示例（`make std-cli`）：args 解析参数、natural 排序与人类可读化、table 排版、proc 跑子进程，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -1859,6 +1864,101 @@ int n = t.render(v, 2, (char[:]){ out, (int)sizeof out });
   返回总数，`cap = 0` 可用来量个数。
 * 先量再写，放不下返回 -1 且不写半截。
 
+### `args`：命令行选项解析
+
+```c
+import std.os.args;
+
+ArgSpec specs[2] = { { { S("--verbose") }, 'v', 0 },
+                     { { S("--port") },    'p', 1 } };
+Args a = args_open(argc, argv);
+Arg arg = { 0 };
+while (a.next(specs, 2, &arg) == 1) {
+    if (arg.kind == ARG_VALUE)   /* arg.value（Str）是值 */
+        ;
+    else if (arg.kind == ARG_FLAG)
+        ;
+    else                         /* ARG_POSITIONAL：arg.name 是参数本身 */
+        ;
+}
+```
+
+* 为什么要有规格表：`--port 8080` 和 `--flag file` 字面上分不清谁吃值，所以
+  先声明 `has_value`，解析器按声明消费。
+* `--name=value`、`--name value`、`-n value`、`-n=value` 都认；`-abc` 合并写法
+  **不支持**（报 `ARG_EUNKNOWN`）；`--` 之后全部按位置参数；单个 `-` 也是位置参数。
+* `arg.name` 是实际写的形式（`-p` 或 `--port`），`arg.spec` 是规格表下标（位置
+  参数是 -1），`arg.index` 是 argv 下标。
+* 选项与位置参数可以任意穿插（GNU 风格）；错误码 `ARG_EUNKNOWN`/`ARG_EMISSING`
+  在 `a.err` 里，游标停在出错位置。
+
+### `table`：对齐表格
+
+```c
+import std.text.table;
+
+char[:] head[2] = { S("name"), S("qty") };
+char[:] cells[4] = { S("a"), S("12"), S("bb"), S("3") };
+int align[2] = { TBL_LEFT, TBL_RIGHT };
+Table t = table_make(2);
+char out[256] = { 0 };
+t.render(head, cells, 2, align, (char[:]){ out, (int)sizeof out });
+```
+
+```
++------+-----+
+| name | qty |
++------+-----+
+| a    |  12 |
+| bb   |   3 |
++------+-----+
+```
+
+* 列宽按**显示列数**（`std.text.width`：CJK 2 列、组合符 0 列），中英混排能对齐。
+* `Table` 字段：`border`（外框与横线，默认 1）、`sep`（列间 `|`，默认 1）、
+  `pad`（格子左右空格数，默认 1；只在有边框时生效）。
+* `headers` 可为 0（无表头）；`cells` 是 `nrows*ncols` 个切片（行优先）；
+  `aligns` 可为 0（全左对齐）或 ncols 个 `TBL_LEFT`/`TBL_RIGHT`/`TBL_CENTER`。
+* `table_len` 与 `render` 同一套逻辑，先量再写；放不下返回 -1 且不写半截。
+
+### `natural`：自然排序与人类可读化
+
+```c
+import std.text.natural;
+
+natural_cmp(S("file2"), S("file10"));      /* -1：数字段按整数比 */
+humanize_bytes(1536, out);                 /* "1.5 KiB" */
+humanize_duration(3723000, out);           /* "1h 2m 3s" */
+humanize_int(-1234567, out);               /* "-1,234,567" */
+```
+
+* `natural_cmp` 把连续数字当成整数比较（前导 0 不改变大小），数字段相等就继续
+  比剩余部分；`natural_cmp_ci` 是 ASCII 大小写不敏感版。
+* 字节数用 1024 进制、单位 `B/KiB/MiB/GiB/TiB`，非 B 带一位小数（四舍五入）；
+  `parse_bytes` 反向解析（`1.5 KiB`、`2MiB`、`512`、`1k`，大小写不敏感）。
+* 时长收毫秒，输出 `1h 2m 3s` / `850ms` / `0ms` / `-1s`；`parse_duration` 收
+  `1h30m`、`500ms`、`2s`、`1h 2m 3s`，**裸数字按秒**。
+* 所有格式化函数都写调用方缓冲、放不下返回 -1 且不写半截。
+
+### `proc`：子进程
+
+```c
+import std.os.proc;
+
+char *argv[3] = { (char *)"sh", (char *)"-c", (char *)"exit 7" };
+ProcStatus st = { 0 };
+if (proc_run(3, argv, &st) && st.exited)
+    printf("%d\n", st.exit_code);         /* 7 */
+```
+
+* `proc_run`/`proc_run_sh` 返回 1 表示子进程被完整 wait 到（不管退出码多少）；
+  fork/wait 失败返回 0。退出状态在 `ProcStatus`：`exited`+`exit_code` 或
+  `signaled`+`signal`。
+* 命令找不到时子进程 `_exit(127)`，所以看到的是 `exited` 且 `exit_code == 127`。
+* `proc_spawn` + `proc_wait` 是「不等待」的拆开版；`proc_which` 在 `PATH` 里找
+  可执行文件（名字带 `/` 就直接检查），找到把路径写调用方缓冲。
+* 不做重定向/管道/超时/Windows；`proc_run_sh` 的命令串上限 4KB（栈缓冲，不分配）。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -2198,6 +2298,38 @@ stdconf: 19 check(s), 0 failure(s)
 `[{{title}}] {{host}}:{{port}} (debug={{debug}})`，并验严格/宽松两种缺变量行为。
 Makefile 里显式列出九个模块正文（toml 依赖 str+num+err，其余只依赖 str）。
 
+### 集成示例：`examples/stdcli.c6`
+
+```sh
+make std-cli
+```
+
+```
+stdcli: 标准库第十六批（args / table / natural / proc）
+args: 1 个开关、2 个选项、3 个位置参数（port=8080）
+natural: file1 < file2 < file10 < file20
+natural: 1536 字节 = 1.5 KiB
+natural: 3723000ms = 1h 2m 3s
+table:
++--------+---------+
+| file   |    size |
++--------+---------+
+| file1  | 1.5 KiB |
+| file2  | 1.0 MiB |
+| file10 |   512 B |
++--------+---------+
+proc: sh -c exit 5 -> exited=1 code=5
+proc: which sh = /usr/bin/sh
+stdcli: 17 check(s), 0 failure(s)
+```
+
+四节：「参数」用规格表解析 `-v --port 8080 --name=demo a.txt b.txt -- -x`（并验
+未知选项报错）；「自然」用 `natural_cmp` 给 file1/file2/file10/file20 排序，再把
+1536 字节、3723000ms、1234567 格式化成人类可读；「表格」把文件名与大小排成对齐的
+两列表（右对齐），并验长度与内容；「子进程」跑 `sh -c "exit 5"` 看退出码、验
+`kill -TERM $$` 的信号终止，最后在 PATH 里找 `sh`。Makefile 里显式列出九个模块
+正文（args 依赖 str、table 依赖 width+utf8，natural 与 proc 只依赖 types）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2223,6 +2355,8 @@ Makefile 里显式列出九个模块正文（toml 依赖 str+num+err，其余只
 * `make std-pack`：`examples/stdpack.c6`，第十四批（压缩与文本编码）模块的拼装
   示例（自带自检）。
 * `make std-conf`：`examples/stdconf.c6`，第十五批（配置与文档格式）模块的拼装
+  示例（自带自检）。
+* `make std-cli`：`examples/stdcli.c6`，第十六批（命令行工具基础）模块的拼装
   示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
