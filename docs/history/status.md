@@ -1960,6 +1960,33 @@ blk.get(buf, n, "user", &user);        // 块内取键（大小写不敏感）
 验收：`make stdtest`（233 个模块、0 failure）、`make std-creds`（20 条自检全过）、
 `make check-all`。
 
+### 11.68 标准库第五十六批（geo / geohash / maidenhead / dms）
+
+第五十六批做「地理编码」：球面几何、Geohash、Maidenhead 网格与度分秒。这批开始用
+`libm`（`sin/cos/asin/atan2/sqrt`），所以拼装示例的链接行要带 `-lm`。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.core.geo` | 球面几何 | 距离用 haversine、方位用 `atan2` 初始方位、目的地用球面正解；`geo_bbox` 用「半径 / 地球半径」换纬度差、再除以 `cos(lat)` 换经度差，跨 ±180 时 `min_lon > max_lon`（`GeoBox.contains` 内部按跨日界线判断） |
+| `std.data.geohash` | Geohash | 编码时位从**经度**开始交替；解码用「逐位二分」重建格子；`neighbor` 是「解出中心 + 按格子大小平移 + 重新编码」，跨日界线靠 `geo_point` 归一化 |
+| `std.data.maidenhead` | Maidenhead | 四级（20°×10° → 2°×1° → 5′×2.5′ → 0.5′×0.25′），字符级与数字级交替，所以 `precision` 必须成对（2/4/6/8） |
+| `std.data.dms` | 度分秒 | 解析用一个「分隔符 + 可选方向字母 + 数字」的循环，遇到第一个带小数的数就直接按十进制度处理；`format` 的度符号写成 UTF-8 的两字节 `0xC2 0xB0` |
+
+一个容易忽略的点：`grid_valid` 最初按「字符位置奇偶」判字母/数字，结果 `FN31pr`
+被拒——正确的是按**第几对**判（第 0/2 对是字母、第 1/3 对是数字）。另外 geohash
+的「北京 6 位」是 `wx4g0b`（不是常被记成的 `wx4g0e`），测试向量按参考实现重算过。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.core.geo`=0x60e9、
+`std.data.geohash`=0x60ea、`std.data.maidenhead`=0x60eb、`std.data.dms`=0x60ec；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-geo` 与 `STD_GEO_SRCS`（带 `-lm`），
+`test-all`/`check-all` 都带上它；`geohash`/`maidenhead` 在 `stdtest` 里依赖
+`std/text/str.c6` + `std/core/geo.c6`（各 26 条），`dms` 依赖 str（24 条），`geo`
+无依赖（2 条）。示例 `examples/stdgeo.c6` 四节（30 条自检）。
+
+验收：`make stdtest`（237 个模块、0 failure）、`make std-geo`（30 条自检全过）、
+`make check-all`。
+
+
 
 
 

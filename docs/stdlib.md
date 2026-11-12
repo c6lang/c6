@@ -265,6 +265,10 @@
 | `std/data/sshconfig.c6` | `std.data.sshconfig` | OpenSSH 配置（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.match`/`doc.lookup`/`blk.get`/`doc.rewind`）：`Host` 分块 + 键值行，`match` 支持空格分隔的多模式与 `!` 排除、`*`/`?` 通配（`glob_match`），`get`/`lookup` 键名大小写不敏感并去行尾注释 |
 | `std/data/keys.c6` | `std.data.keys` | `authorized_keys`/`known_hosts` 行（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.rewind`）：解析选项（含双引号内的空格）、类型、base64 blob 与注释，`key_type_bits` 按类型给粗略位数 |
 | `std/data/crontab.c6` | `std.data.crontab` | crontab（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.next_var`/`doc.var`/`doc.var_count`/`doc.rewind`）：五段式定时行（字段原样给出）、`@reboot` 等别名（`alias` 置 1）与 `NAME=value` 环境变量（独立游标） |
+| `std/core/geo.c6` | `std.core.geo` | 球面坐标（**方法**：`box.contains`/`box.expand`/`box.width`/`box.height`）：`geo_distance` 用 haversine（平均半径 6371008.8 米）、`geo_bearing` 给初始方位角、`geo_destination` 球面正解、`geo_bbox` 给半径包围盒（跨 ±180 时 `min_lon > max_lon`）、`geo_normalize_lon` 折经度 |
+| `std/data/geohash.c6` | `std.data.geohash` | Geohash：`geohash_encode`（1..12 位，base32，位从经度开始交替）、`geohash_decode`（格子中心）、`geohash_bbox`（`GeoBox` 边界）、`geohash_neighbor`（按格子大小平移后重编码，跨日界线自动折回）、`geohash_valid`；依赖 `std.core.geo` |
+| `std/data/maidenhead.c6` | `std.data.maidenhead` | Maidenhead 网格：`grid_encode`（2/4/6/8 位，字母→数字→小写字母→数字四级）、`grid_decode`（`GeoBox`）、`grid_center`、`grid_valid`；第 1 级 20°×10°、第 3 级 5′×2.5′ |
+| `std/data/dms.c6` | `std.data.dms` | 度分秒（**方法**：`d.to_deg`/`d.from_deg`/`d.format`）：`dms_parse` 认 `°`/`'`/`"`、空格、冒号分隔与前后置方向字母，纯十进制也收；`format` 输出 `40°26'46.0"N`（`lat=0` 时输出 E/W） |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -363,6 +367,7 @@
 | `examples/stdcmp.c6` | （无模块） | 第五十三批（变换式压缩积木）的拼装示例（`make std-bwt`）：BWT↔逆变换、MTF、差分（字节与时间戳）、规范 Huffman 往返 |
 | `examples/stdsubs.c6` | （无模块） | 第五十四批（字幕与播放列表）的拼装示例（`make std-subs`）：四种文本格式都用游标方法（`doc.open`/`doc.next`/`doc.count`/`doc.seek`）演示 |
 | `examples/stdcreds.c6` | （无模块） | 第五十五批（凭据与配置）的拼装示例（`make std-creds`）：netrc 查找、ssh 主机匹配与选项、公钥行、crontab 定时行与环境变量，全部方法调用 |
+| `examples/stdgeo.c6` | （无模块） | 第五十六批（地理编码）的拼装示例（`make std-geo`）：球面距离/方位/包围盒（方法）、Geohash、Maidenhead 网格、度分秒格式化；链接带 `-lm` |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -477,6 +482,10 @@ std/data/netrc.c6          24 test(s), 0 failure(s)
 std/data/sshconfig.c6      24 test(s), 0 failure(s)
 std/data/keys.c6           24 test(s), 0 failure(s)
 std/data/crontab.c6        24 test(s), 0 failure(s)
+std/core/geo.c6            2 test(s), 0 failure(s)
+std/data/geohash.c6        26 test(s), 0 failure(s)
+std/data/maidenhead.c6     26 test(s), 0 failure(s)
+std/data/dms.c6            24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3819,6 +3828,17 @@ make std-creds
 `Host *` 兜底；公钥行打印类型与位数提示；crontab 用 `doc.var("PATH", &v)` 读变量、
 `doc.next(&line)` 读定时行（含 `@reboot`）。
 
+### 集成示例：`examples/stdgeo.c6`
+
+```sh
+make std-geo
+```
+
+四节：geo 算北京→上海的距离与方位、10 公里目的地、5 公里包围盒并用
+`box.contains(p)`/`box.expand(p)` 验证；geohash 打印北京的 `wx4g0b` 并取东邻居；
+Maidenhead 把 `(41.714, -72.727)` 编成 `FN31pr` 再解出格子与中心；dms 解析
+`39°54'15"N` 并用方法 `d.to_deg()`/`d.from_deg()`/`d.format()` 往返。链接带 `-lm`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3925,6 +3945,8 @@ make std-creds
   （自带自检，全部用结构体方法调用）。
 * `make std-creds`：`examples/stdcreds.c6`，第五十五批（凭据与配置）模块的拼装示例
   （自带自检，全部用结构体方法调用）。
+* `make std-geo`：`examples/stdgeo.c6`，第五十六批（地理编码）模块的拼装示例
+  （自带自检，链接带 `-lm`）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

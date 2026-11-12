@@ -1,0 +1,234 @@
+/* std/data/maidenhead：Maidenhead 网格定位（业余无线电的 `FN31pr` 那种格子）。
+ *
+ *     import std.data.maidenhead;
+ *
+ *     char g[16] = { 0 };
+ *     grid_encode(geo_point(41.714, -72.727), 6, g, (int)sizeof g);  // "FN31pr"
+ *     grid_decode(S("FN31pr"), &box);        // 格子边界
+ *
+ * 每两级字符把格子缩小一次：
+ *
+ *     第 1 级（2 个字母 A-R）：经度 20°、纬度 10°
+ *     第 2 级（2 个数字 0-9）：经度 2°、纬度 1°
+ *     第 3 级（2 个字母 a-x）：经度 5′、纬度 2.5′
+ *     第 4 级（2 个数字 0-9）：经度 0.5′、纬度 0.25′
+ *
+ * 约定：
+ *
+ * - `grid_encode(p, precision, dst, cap)` 的 `precision` 必须是 **2/4/6/8**
+ *   （成对出现），返回写入长度；`grid_decode` 返回 `GeoBox` 边界；
+ * - 字母大小写都收，输出统一大写（第 3 级的字母例外，是小写 a-x）；
+ * - 超出 `[-90,90]`/`[-180,180]` 的点返回 -1；
+ * - 依赖 `std.core.geo` 的 `GeoPoint`/`GeoBox`。
+ */
+#include <string.h>
+
+module std.data.maidenhead;
+import std.core.types;
+import std.text.str;
+import std.core.geo;
+
+static int mh_upper(char c)
+{
+    if (c >= 'a' && c <= 'z')
+        return c - 'a' + 'A';
+    return c;
+}
+
+int grid_valid(char[:] grid)
+{
+    int i = 0;
+
+    if (!grid.data)
+        return 0;
+    if (grid.len != 2 && grid.len != 4 && grid.len != 6 && grid.len != 8)
+        return 0;
+    for (i = 0; i < grid.len; i += 2) {
+        int level = i / 2;
+        int a = mh_upper(grid.data[i]);
+        int b = mh_upper(grid.data[i + 1]);
+
+        if (level % 2 == 0) {
+            /* 字母级：第 0 级 A-R（18 个），第 2 级 A-X（24 个） */
+            int hi = level == 0 ? 'R' : 'X';
+
+            if (a < 'A' || a > hi || b < 'A' || b > hi)
+                return 0;
+        } else {
+            /* 数字级 */
+            if (grid.data[i] < '0' || grid.data[i] > '9')
+                return 0;
+            if (grid.data[i + 1] < '0' || grid.data[i + 1] > '9')
+                return 0;
+        }
+    }
+    return 1;
+}
+
+int grid_encode(GeoPoint p, int precision, char *dst, int cap)
+{
+    int i = 0;
+    double lon = p.lon + 180.0;
+    double lat = p.lat + 90.0;
+    static const char *letters = "ABCDEFGHIJKLMNOPQRSTUVWX";
+
+    if (!dst || precision < 2 || precision > 8 || (precision % 2) != 0
+        || cap < precision + 1)
+        return -1;
+    if (p.lat < -90 || p.lat > 90)
+        return -1;
+    for (i = 0; i < precision; i += 2) {
+        int level = i / 2;
+        int a = 0, b = 0;
+        double lon_step = 0, lat_step = 0;
+
+        if (level == 0) {
+            lon_step = 20.0;
+            lat_step = 10.0;
+        } else if (level == 1) {
+            lon_step = 2.0;
+            lat_step = 1.0;
+        } else if (level == 2) {
+            lon_step = 5.0 / 60.0;
+            lat_step = 2.5 / 60.0;
+        } else {
+            lon_step = 0.5 / 60.0;
+            lat_step = 0.25 / 60.0;
+        }
+        a = (int)(lon / lon_step);
+        b = (int)(lat / lat_step);
+        lon -= (double)a * lon_step;
+        lat -= (double)b * lat_step;
+        if (level == 1 || level == 3) {
+            if (a < 0 || a > 9 || b < 0 || b > 9)
+                return -1;
+            dst[i] = (char)('0' + a);
+            dst[i + 1] = (char)('0' + b);
+        } else {
+            if (a < 0 || a > 23 || b < 0 || b > 23)
+                return -1;
+            if (level == 0) {
+                dst[i] = letters[a];
+                dst[i + 1] = letters[b];
+            } else {
+                dst[i] = (char)('a' + a);
+                dst[i + 1] = (char)('a' + b);
+            }
+        }
+    }
+    dst[precision] = 0;
+    return precision;
+}
+
+int grid_decode(char[:] grid, GeoBox *out)
+{
+    double lon_min = -180.0, lat_min = -90.0;
+    double lon_step = 20.0, lat_step = 10.0;
+    int i = 0;
+
+    if (!out || !grid_valid(grid))
+        return -1;
+    for (i = 0; i < grid.len; i += 2) {
+        int level = i / 2;
+        int a = 0, b = 0;
+
+        if (level == 0) {
+            lon_step = 20.0;
+            lat_step = 10.0;
+        } else if (level == 1) {
+            lon_step = 2.0;
+            lat_step = 1.0;
+        } else if (level == 2) {
+            lon_step = 5.0 / 60.0;
+            lat_step = 2.5 / 60.0;
+        } else {
+            lon_step = 0.5 / 60.0;
+            lat_step = 0.25 / 60.0;
+        }
+        if (level == 1 || level == 3) {
+            a = (int)(grid.data[i] - '0');
+            b = (int)(grid.data[i + 1] - '0');
+        } else {
+            a = mh_upper(grid.data[i]) - 'A';
+            b = mh_upper(grid.data[i + 1]) - 'A';
+        }
+        lon_min += (double)a * lon_step;
+        lat_min += (double)b * lat_step;
+    }
+    out->min_lon = lon_min;
+    out->min_lat = lat_min;
+    out->max_lon = lon_min + lon_step;
+    out->max_lat = lat_min + lat_step;
+    return 1;
+}
+
+int grid_center(char[:] grid, GeoPoint *out)
+{
+    GeoBox b = { 0 };
+
+    if (!out || grid_decode(grid, &b) != 1)
+        return -1;
+    out->lat = (b.min_lat + b.max_lat) / 2;
+    out->lon = (b.min_lon + b.max_lon) / 2;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int mhnear(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+test "maidenhead：编码与已知向量" {
+    char g[16] = { 0 };
+    GeoPoint p = geo_point(41.714, -72.727);
+
+    if (grid_encode(p, 4, g, (int)sizeof g) != 4)
+        return err(1, "4 位编码长度不对");
+    if (memcmp(g, "FN31", 4) != 0)
+        return err(2, "4 位网格应该是 FN31");
+    if (grid_encode(p, 6, g, (int)sizeof g) != 6)
+        return err(3, "6 位编码长度不对");
+    if (memcmp(g, "FN31pr", 6) != 0)
+        return err(4, "6 位网格应该是 FN31pr");
+    if (grid_encode(p, 8, g, (int)sizeof g) != 8)
+        return err(5, "8 位编码长度不对");
+    if (memcmp(g, "FN31pr", 6) != 0)
+        return err(6, "8 位编码的前 6 位应该一致");
+    if (grid_encode(p, 3, g, (int)sizeof g) != -1)
+        return err(7, "奇数精度应该 -1");
+    if (grid_encode(geo_point(95, 0), 4, g, (int)sizeof g) != -1)
+        return err(8, "纬度越界应该 -1");
+    if (grid_valid(S("FN31pr")) != 1 || grid_valid(S("ZZ99")) != 0)
+        return err(9, "valid 判定不对");
+}
+
+test "maidenhead：解码与中心" {
+    GeoBox b = { 0 };
+    GeoPoint c = { 0, 0 };
+
+    if (grid_decode(S("FN31pr"), &b) != 1)
+        return err(10, "解码失败");
+    if (!mhnear(b.min_lat, 41.70833, 0.002)
+        || !mhnear(b.max_lat, 41.75, 0.002))
+        return err(11, "6 位格子的纬度范围不对");
+    if (!mhnear(b.max_lat - b.min_lat, 2.5 / 60.0, 1e-9))
+        return err(12, "6 位格子的纬度高度应该是 2.5 分");
+    if (grid_center(S("FN31pr"), &c) != 1)
+        return err(13, "取中心失败");
+    if (!mhnear(c.lat, 41.72917, 0.002) || !mhnear(c.lon, -72.70833, 0.003))
+        return err(14, "10 位中心点不对");
+    if (grid_decode(S("FN31pr"), &b) != 1 || !(b.min_lon < b.max_lon))
+        return err(15, "经度范围应该递增");
+    /* 4 位格子更大 */
+    if (grid_decode(S("FN31"), &b) != 1
+        || !mhnear(b.max_lat - b.min_lat, 1.0, 1e-9))
+        return err(16, "4 位格子的纬度高度应该是 1 度");
+}

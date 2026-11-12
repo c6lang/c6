@@ -1,0 +1,246 @@
+/* std/core/geo：球面坐标的距离、方位、目的地与包围盒（WGS84 近似）。
+ *
+ *     import std.core.geo;
+ *
+ *     GeoPoint a = geo_point(39.9042, 116.4074);   // 北京
+ *     GeoPoint b = geo_point(31.2304, 121.4737);   // 上海
+ *     double m = geo_distance(a, b);               // 约 1067 km
+ *     GeoBox box = geo_bbox(a, 5000);
+ *     box.contains(b);
+ *
+ * 用的是「球面模型 + 平均半径 6371008.8 米」：距离用 haversine，方位用
+ * `atan2` 的初始方位角，目的地用球面正解公式。对导航以外的用途误差在 0.5% 以内；
+ * 要更高精度请用椭球模型的 Vincenty/Karney。
+ *
+ * 约定：
+ *
+ * - 纬度单位度（-90..90）、经度单位度（会被折到 -180..180）；
+ * - `geo_bearing` 返回 0..360（正北 0、顺时针）；
+ * - `geo_bbox` 给「以某点为圆心、半径 r 米」的经纬度包围盒；跨 ±180 经线时
+ *   `min_lon > max_lon`，调用方要按「跨日界线」处理；
+ * - `GeoBox` 的方法：`box.contains(p)`、`box.expand(p)`、`box.width()`/`height()`；
+ *   `GeoPoint` 是值类型，按值传给这些方法；
+ * - 不做高度、不做地图投影。
+ */
+#include <math.h>
+
+module std.core.geo;
+import std.core.types;
+
+#define GEO_R 6371008.8
+#define GEO_PI 3.14159265358979323846
+
+struct GeoPoint {
+    double lat;
+    double lon;
+};
+
+struct GeoBox {
+    double min_lat;
+    double min_lon;
+    double max_lat;
+    double max_lon;
+};
+
+static double geo_rad(double deg)
+{
+    return deg * GEO_PI / 180.0;
+}
+
+static double geo_deg(double rad)
+{
+    return rad * 180.0 / GEO_PI;
+}
+
+double geo_normalize_lon(double lon)
+{
+    double v = lon;
+
+    while (v > 180.0)
+        v -= 360.0;
+    while (v < -180.0)
+        v += 360.0;
+    return v;
+}
+
+GeoPoint geo_point(double lat, double lon)
+{
+    GeoPoint p = { 0, 0 };
+
+    p.lat = lat;
+    p.lon = geo_normalize_lon(lon);
+    return p;
+}
+
+double geo_distance(GeoPoint a, GeoPoint b)
+{
+    double la1 = geo_rad(a.lat), la2 = geo_rad(b.lat);
+    double dla = la2 - la1;
+    double dlo = geo_rad(b.lon - a.lon);
+    double s1 = sin(dla / 2), s2 = sin(dlo / 2);
+    double h = s1 * s1 + cos(la1) * cos(la2) * s2 * s2;
+
+    if (h < 0)
+        h = 0;
+    if (h > 1)
+        h = 1;
+    return 2 * GEO_R * asin(sqrt(h));
+}
+
+double geo_bearing(GeoPoint a, GeoPoint b)
+{
+    double la1 = geo_rad(a.lat), la2 = geo_rad(b.lat);
+    double dlo = geo_rad(b.lon - a.lon);
+    double y = sin(dlo) * cos(la2);
+    double x = cos(la1) * sin(la2) - sin(la1) * cos(la2) * cos(dlo);
+    double d = geo_deg(atan2(y, x));
+
+    while (d < 0)
+        d += 360.0;
+    while (d >= 360.0)
+        d -= 360.0;
+    return d;
+}
+
+GeoPoint geo_destination(GeoPoint a, double bearing_deg, double dist_m)
+{
+    double la1 = geo_rad(a.lat);
+    double lo1 = geo_rad(a.lon);
+    double br = geo_rad(bearing_deg);
+    double d = dist_m / GEO_R;
+    double la2 = asin(sin(la1) * cos(d) + cos(la1) * sin(d) * cos(br));
+    double lo2 = lo1 + atan2(sin(br) * sin(d) * cos(la1),
+                             cos(d) - sin(la1) * sin(la2));
+
+    return geo_point(geo_deg(la2), geo_deg(lo2));
+}
+
+GeoBox geo_bbox(GeoPoint a, double radius_m)
+{
+    double dlat = geo_deg(radius_m / GEO_R);
+    double coslat = cos(geo_rad(a.lat));
+    double dlon = 0;
+    GeoBox b = { 0, 0, 0, 0 };
+
+    if (coslat < 1e-12)
+        dlon = 180.0;                   /* 极点附近：整圈经度 */
+    else
+        dlon = geo_deg(radius_m / (GEO_R * coslat));
+    b.min_lat = a.lat - dlat;
+    b.max_lat = a.lat + dlat;
+    b.min_lon = geo_normalize_lon(a.lon - dlon);
+    b.max_lon = geo_normalize_lon(a.lon + dlon);
+    if (b.min_lat < -90)
+        b.min_lat = -90;
+    if (b.max_lat > 90)
+        b.max_lat = 90;
+    return b;
+}
+
+int contains(GeoBox *b, GeoPoint p)
+{
+    int ok_lat = 0, ok_lon = 0;
+
+    if (!b)
+        return 0;
+    ok_lat = p.lat >= b->min_lat && p.lat <= b->max_lat;
+    if (b->min_lon <= b->max_lon)
+        ok_lon = p.lon >= b->min_lon && p.lon <= b->max_lon;
+    else
+        ok_lon = p.lon >= b->min_lon || p.lon <= b->max_lon;  /* 跨日界线 */
+    return ok_lat && ok_lon;
+}
+
+int expand(GeoBox *b, GeoPoint p)
+{
+    if (!b)
+        return -1;
+    if (p.lat < b->min_lat)
+        b->min_lat = p.lat;
+    if (p.lat > b->max_lat)
+        b->max_lat = p.lat;
+    if (p.lon < b->min_lon)
+        b->min_lon = p.lon;
+    if (p.lon > b->max_lon)
+        b->max_lon = p.lon;
+    return 1;
+}
+
+double width(GeoBox *b)
+{
+    double w = 0;
+
+    if (!b)
+        return 0;
+    w = b->max_lon - b->min_lon;
+    if (w < 0)
+        w += 360.0;                     /* 跨日界线 */
+    return w;
+}
+
+double height(GeoBox *b)
+{
+    return b ? b->max_lat - b->min_lat : 0;
+}
+
+/* ---- 自测 ---- */
+
+static int gnear(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+test "geo：距离与方位" {
+    GeoPoint bj = geo_point(39.9042, 116.4074);
+    GeoPoint sh = geo_point(31.2304, 121.4737);
+    GeoPoint eq1 = geo_point(0, 0);
+    GeoPoint eq2 = geo_point(0, 1);
+
+    if (!gnear(geo_distance(bj, sh), 1067000.0, 15000.0))
+        return err(1, "北京到上海应该约 1067 公里");
+    if (!gnear(geo_distance(bj, bj), 0.0, 1e-6))
+        return err(2, "同一点距离应该是 0");
+    if (!gnear(geo_distance(eq1, eq2), 111195.0, 200.0))
+        return err(3, "赤道上 1 度经度应该约 111.2 公里");
+    if (!gnear(geo_bearing(geo_point(0, 0), geo_point(1, 0)), 0.0, 0.01))
+        return err(4, "正北的方位应该是 0");
+    if (!gnear(geo_bearing(geo_point(0, 0), geo_point(0, 1)), 90.0, 0.01))
+        return err(5, "正东的方位应该是 90");
+    if (!gnear(geo_bearing(geo_point(0, 0), geo_point(-1, 0)), 180.0, 0.01))
+        return err(6, "正南的方位应该是 180");
+    if (!gnear(geo_bearing(bj, sh), 150.0, 20.0))
+        return err(7, "北京到上海应该大致东南偏南");
+}
+
+test "geo：目的地与包围盒" {
+    GeoPoint bj = geo_point(39.9042, 116.4074);
+    GeoPoint north = geo_destination(bj, 0, 10000);
+    GeoPoint east = geo_destination(bj, 90, 10000);
+    GeoBox box = geo_bbox(bj, 10000);
+    GeoPoint farp = geo_point(0, 0);
+
+    if (!gnear(north.lat - bj.lat, 0.0899, 0.002))
+        return err(8, "向北 10 公里应该约 0.09 度");
+    if (east.lon <= bj.lon)
+        return err(9, "向东走经度应该变大");
+    if (!box.contains(bj))
+        return err(10, "包围盒应该包含圆心");
+    if (!box.contains(north) || !box.contains(east))
+        return err(11, "包围盒应该包含 10 公里内的点");
+    if (box.contains(farp))
+        return err(12, "包围盒不该包含赤道原点");
+    if (!gnear(box.width(), 0.234, 0.02))
+        return err(13, "10 公里的东西宽度应该约 0.23 度（北纬 40 度）");
+    if (!gnear(box.height(), 0.1798, 0.002))
+        return err(14, "10 公里的南北高度应该约 0.18 度");
+    box.expand(farp);
+    if (!box.contains(farp))
+        return err(15, "expand 之后应该包含新点");
+    if (!gnear(geo_normalize_lon(190), -170, 1e-9)
+        || !gnear(geo_normalize_lon(-190), 170, 1e-9))
+        return err(16, "经度折返不对");
+}

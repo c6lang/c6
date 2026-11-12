@@ -56,6 +56,13 @@
 
 ### 标准库
 
+- **标准库第五十六批（地理编码）**：`std.core.geo`（haversine 距离、方位、目的地、
+  半径包围盒）、`std.data.geohash`（编码/解码/边界/邻居）、`std.data.maidenhead`
+  （2/4/6/8 位网格）、`std.data.dms`（度分秒解析与格式化，带 `to_deg`/`from_deg`/
+  `format` 方法），集成示例 `examples/stdgeo.c6`（`make std-geo`，链接带 `-lm`）。
+  错误号段 `std.core.geo`=0x60e9 … `std.data.dms`=0x60ec（`c6_err_std_slots[]`
+  追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十五批（凭据与配置）**：`std.data.netrc`（`.netrc` 凭据 + `find` 兜底）、
   `std.data.sshconfig`（`Host` 分块、`*`/`?` 与 `!` 匹配、块内取键）、
   `std.data.keys`（`authorized_keys` 行，含引号选项）、`std.data.crontab`（定时行 +

@@ -1,0 +1,141 @@
+/* examples/stdgeo.c6 —— 第五十六批（地理编码）的集成示例。
+ *
+ *     make std-geo
+ *
+ * 四节：球面距离/方位/包围盒（geo）、Geohash、Maidenhead 网格、度分秒。
+ * 链接需要 `-lm`。包围盒与 DMS 都用**结构体方法**（`box.contains(p)`、`d.to_deg()`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.core.geo;
+import std.data.geohash;
+import std.data.maidenhead;
+import std.data.dms;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static int near(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+static void do_geo(void)
+{
+    GeoPoint bj = geo_point(39.9042, 116.4074);
+    GeoPoint sh = geo_point(31.2304, 121.4737);
+    GeoBox box = geo_bbox(bj, 5000);
+    GeoPoint dest = { 0, 0 };
+
+    printf("== geo\n");
+    printf("   北京 → 上海：%.1f km，方位 %.1f°\n",
+           geo_distance(bj, sh) / 1000.0, geo_bearing(bj, sh));
+    check(near(geo_distance(bj, sh), 1067000, 15000), "北京到上海约 1067 公里");
+    check(geo_bearing(bj, sh) > 140 && geo_bearing(bj, sh) < 170,
+          "方位在东南方向");
+    dest = geo_destination(bj, 90, 10000);
+    check(dest.lon > bj.lon && near(dest.lat, bj.lat, 0.001), "向东 10 公里");
+    printf("   5 公里包围盒：%.4f..%.4f / %.4f..%.4f\n", box.min_lat,
+           box.max_lat, box.min_lon, box.max_lon);
+    check(box.contains(bj) == 1, "包围盒包含圆心");
+    check(box.contains(sh) == 0, "包围盒不包含上海");
+    check(box.contains(dest) == 0, "10 公里外的点不在 5 公里盒里");
+    check(near(box.width(), 0.117, 0.01), "5 公里盒的东西宽度");
+    box.expand(sh);
+    check(box.contains(sh) == 1, "expand 后包含上海");
+}
+
+static void do_geohash(void)
+{
+    char h[16] = { 0 };
+    char nb[16] = { 0 };
+    GeoHashBox c = { 0 };
+    GeoBox b = { 0 };
+    GeoPoint bj = geo_point(39.9042, 116.4074);
+
+    printf("== geohash\n");
+    check(geohash_encode(bj, 6, h, (int)sizeof h) == 6, "编码长度");
+    printf("   北京 6 位：%s，", h);
+    check(memcmp(h, "wx4g0b", 6) == 0, "北京的 geohash");
+    check(geohash_decode((char[:]){ h, 6 }, &c) == 1, "解码中心");
+    printf("中心 (%.4f, %.4f)", c.lat, c.lon);
+    check(near(c.lat, 39.9042, 0.02), "中心纬度接近");
+    check(geohash_bbox((char[:]){ h, 6 }, &b) == 1
+          && b.max_lat - b.min_lat < 0.01, "格子高度小于 0.01 度");
+    check(geohash_neighbor((char[:]){ h, 6 }, 1, 0, nb, (int)sizeof nb) == 1,
+          "取东邻居");
+    printf("，东邻居 %s\n", nb);
+    check(memcmp(nb, h, 6) != 0, "邻居应该不同");
+    check(geohash_valid((char[:]){ nb, 6 }) == 1, "邻居也是合法 geohash");
+}
+
+static void do_maidenhead(void)
+{
+    char g[16] = { 0 };
+    GeoBox b = { 0 };
+    GeoPoint c = { 0, 0 };
+    GeoPoint p = geo_point(41.714, -72.727);
+
+    printf("== maidenhead\n");
+    check(grid_encode(p, 6, g, (int)sizeof g) == 6, "编码长度");
+    printf("   (41.714, -72.727) → %s，", g);
+    check(memcmp(g, "FN31pr", 6) == 0, "6 位网格");
+    check(grid_decode((char[:]){ g, 6 }, &b) == 1, "解码边界");
+    check(grid_center((char[:]){ g, 6 }, &c) == 1, "取中心");
+    printf("中心 (%.4f, %.4f)\n", c.lat, c.lon);
+    check(b.max_lat - b.min_lat < 0.05, "6 位格子高度小于 0.05 度");
+    check(near(c.lat, 41.729, 0.01), "中心纬度");
+    check(grid_valid(S("FN31pr")) == 1 && grid_valid(S("AA00aa00")) == 1,
+          "合法网格");
+    check(grid_valid(S("ZZ99")) == 0, "非法 4 位网格");
+}
+
+static void do_dms(void)
+{
+    Dms d = { 0 };
+    char out[40] = { 0 };
+
+    printf("== dms\n");
+    check(dms_parse(S("39\xc2\xb0" "54'15\"N"), &d) == 1, "解析 39°54'15\"N");
+    printf("   39°54'15\"N = %.5f，", d.to_deg());
+    check(near(d.to_deg(), 39.904167, 1e-4), "to_deg() 数值");
+    d.from_deg(-72.7273);
+    d.lat = 0;
+    d.format(out, (int)sizeof out);
+    printf("经度 -72.7273 → %s\n", out);
+    check(memcmp(out, "72\xc2\xb0" "43'38.3\"W", 13) == 0, "经度格式化");
+    d.from_deg(31.2304);
+    d.format(out, (int)sizeof out);
+    check(memcmp(out, "31\xc2\xb0" "13'49.4\"N", 13) == 0, "纬度格式化");
+    check(dms_parse(S("40 26 46 S"), &d) == 1 && near(d.to_deg(), -40.446111, 1e-4),
+          "空格分隔的南纬");
+    check(dms_parse(S("abc"), &d) == -1, "非法输入");
+}
+
+int main(void)
+{
+    do_geo();
+    do_geohash();
+    do_maidenhead();
+    do_dms();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

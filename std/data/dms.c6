@@ -1,0 +1,286 @@
+/* std/data/dms：度分秒（DMS）与十进制度的互转，以及 `40°26'46"N` 这种写法的解析。
+ *
+ *     import std.data.dms;
+ *
+ *     Dms d = { 0 };
+ *     char out[32] = { 0 };
+ *     dms_parse(S("40°26'46\"N"), &d);      // 也收 40 26 46 N / -40.446 / N40:26:46
+ *     d.to_deg();                            // 40.4461…
+ *     d.from_deg(-72.7273);                  // 变成 72°43'38.3"W
+ *     d.format(out, (int)sizeof out);        // "72°43'38.3\"W"
+ *
+ * 约定：
+ *
+ * - `Dms` 的 `deg`/`min`/`sec` 都是**绝对值**，方向由 `neg`（0=正/北/东、
+ *   1=负/南/西）表示；
+ * - `from_deg` 方法把十进制度拆成度分秒（秒保留 0.1 位），`to_deg` 方法合回去；
+ * - `format` 方法输出 `度°分'秒"` 加方向字母（纬度用 N/S、经度用 E/W，
+ *   由 `is_lat` 决定，默认按纬度处理；要输出经度请先设 `d.lat = 0`）；
+ * - `dms_parse` 认 `°`/`'`/`"`、空格、冒号作分隔，方向字母可以前置或后置，
+ *   也可以只给十进制数（此时 `min`/`sec` 为 0）；
+ * - 秒保留到 0.1 秒（内部是 `double`，不做取整到整秒）；
+ * - 不做范围校验（纬度超出 ±90 也不会报错，由调用方检查）。
+ */
+#include <string.h>
+
+module std.data.dms;
+import std.core.types;
+import std.text.str;
+
+struct Dms {
+    int deg;
+    int min;
+    double sec;
+    int neg;
+    int lat;            /* 1 = 纬度（输出 N/S），0 = 经度（输出 E/W） */
+};
+
+static int dms_isdigit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+static int dms_sign_from(char c)
+{
+    if (c == 'N' || c == 'n' || c == 'E' || c == 'e')
+        return 0;
+    if (c == 'S' || c == 's' || c == 'W' || c == 'w')
+        return 1;
+    return -1;
+}
+
+static int dms_is_sep(char c)
+{
+    return c == ' ' || c == '\t' || c == '\'' || c == '"' || c == ':'
+           || c == ',' || c == '\xc2' || c == '\xb0' || c == '`';
+}
+
+int dms_parse(char[:] src, Dms *out)
+{
+    const char *p = src.data;
+    int n = src.len, i = 0;
+    int parts = 0;
+    double vals[3] = { 0, 0, 0 };
+    int sign = -1;
+
+    if (!src.data || !out || n <= 0)
+        return -1;
+    memset(out, 0, sizeof *out);
+    out->lat = 1;
+    while (i < n) {
+        if (dms_is_sep(p[i])) {
+            i++;
+            continue;
+        }
+        {
+            int s = dms_sign_from(p[i]);
+
+            if (s >= 0 && !dms_isdigit(p[i])) {
+                sign = s;
+                i++;
+                continue;
+            }
+        }
+        if (p[i] == '+' || p[i] == '-') {
+            if (p[i] == '-')
+                sign = 1;
+            else if (sign < 0)
+                sign = 0;
+            i++;
+            continue;
+        }
+        if (!dms_isdigit(p[i]))
+            return -1;
+        if (parts >= 3)
+            return -1;
+        {
+            double v = 0, scale = 0.1;
+            int digits = 0, dot = 0;
+
+            while (i < n && (dms_isdigit(p[i]) || (!dot && p[i] == '.'))) {
+                if (p[i] == '.') {
+                    dot = 1;
+                    i++;
+                    continue;
+                }
+                if (dot) {
+                    v += (p[i] - '0') * scale;
+                    scale /= 10;
+                    i++;
+                } else {
+                    v = v * 10 + (p[i] - '0');
+                    i++;
+                }
+                digits++;
+            }
+            if (!digits)
+                return -1;
+            vals[parts++] = v;
+            /* 只有第一个数带小数时，说明它本身就是十进制度 */
+            if (dot && parts == 1) {
+                out->neg = sign == 1;
+                {
+                    double a = vals[0];
+                    int d = (int)a;
+
+                    out->deg = d;
+                    out->min = (int)((a - d) * 60.0);
+                    out->sec = ((a - d) * 60.0 - out->min) * 60.0;
+                }
+                return 1;
+            }
+        }
+    }
+    if (parts == 0)
+        return -1;
+    out->neg = sign == 1;
+    out->deg = (int)vals[0];
+    out->min = parts > 1 ? (int)vals[1] : 0;
+    out->sec = parts > 2 ? vals[2] : 0;
+    return 1;
+}
+
+double to_deg(Dms *d)
+{
+    double v = 0;
+
+    if (!d)
+        return 0;
+    v = (double)d->deg + (double)d->min / 60.0 + d->sec / 3600.0;
+    return d->neg ? -v : v;
+}
+
+int from_deg(Dms *d, double v)
+{
+    double a = v < 0 ? -v : v;
+    int deg = 0, min = 0;
+    double rem = 0;
+
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->neg = v < 0 ? 1 : 0;
+    deg = (int)a;
+    rem = (a - (double)deg) * 60.0;
+    min = (int)rem;
+    d->deg = deg;
+    d->min = min;
+    d->sec = (rem - (double)min) * 60.0;
+    d->lat = 1;
+    return 1;
+}
+
+int format(Dms *d, char *dst, int cap)
+{
+    char buf[40] = { 0 };
+    int o = 0, i = 0;
+    char num[16] = { 0 };
+    int k = 0;
+    int sec10 = 0;
+
+    if (!d || !dst || cap <= 0)
+        return -1;
+    /* 度 */
+    {
+        int v = d->deg;
+
+        if (v == 0) {
+            num[k++] = '0';
+        }
+        while (v > 0 && k < 12) {
+            num[k++] = (char)('0' + v % 10);
+            v /= 10;
+        }
+        for (i = k - 1; i >= 0; i--)
+            buf[o++] = num[i];
+    }
+    buf[o++] = '\xc2';                  /* ° 的 UTF-8 编码 */
+    buf[o++] = '\xb0';
+    buf[o++] = (char)('0' + d->min / 10 % 10);
+    buf[o++] = (char)('0' + d->min % 10);
+    buf[o++] = '\'';
+    sec10 = (int)(d->sec * 10.0 + 0.5);
+    if (sec10 >= 600)
+        sec10 = 599;
+    buf[o++] = (char)('0' + sec10 / 100 % 10);
+    buf[o++] = (char)('0' + sec10 / 10 % 10);
+    buf[o++] = '.';
+    buf[o++] = (char)('0' + sec10 % 10);
+    buf[o++] = '"';
+    buf[o++] = d->neg ? (d->lat ? 'S' : 'W') : (d->lat ? 'N' : 'E');
+    if (o + 1 > cap)
+        return -1;
+    for (i = 0; i < o; i++)
+        dst[i] = buf[i];
+    dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int dnear(double a, double b, double eps)
+{
+    double d = a - b;
+
+    if (d < 0)
+        d = -d;
+    return d <= eps;
+}
+
+test "dms：解析各种写法" {
+    Dms d = { 0 };
+
+    if (dms_parse(S("40\xc2\xb0" "26'46\"N"), &d) != 1)
+        return err(1, "带符号的 DMS 解析失败");
+    if (d.deg != 40 || d.min != 26 || !dnear(d.sec, 46, 1e-9) || d.neg != 0)
+        return err(2, "40°26'46\"N 的字段不对");
+    if (!dnear(d.to_deg(), 40.446111, 1e-4))
+        return err(3, "to_deg() 不对");
+    if (dms_parse(S("40 26 46 S"), &d) != 1 || d.neg != 1)
+        return err(4, "空格分隔 + 南纬解析失败");
+    if (!dnear(d.to_deg(), -40.446111, 1e-4))
+        return err(5, "南纬应该是负数");
+    if (dms_parse(S("-72.7273"), &d) != 1 || d.neg != 1)
+        return err(6, "十进制负数解析失败");
+    if (!dnear(d.to_deg(), -72.7273, 1e-6))
+        return err(7, "十进制数往返不对");
+    if (dms_parse(S("N40:26:46"), &d) != 1 || d.neg != 0)
+        return err(8, "方向前置 + 冒号分隔解析失败");
+    if (dms_parse(S("40"), &d) != 1 || d.deg != 40 || d.min != 0)
+        return err(9, "只有度也应该可以");
+    if (dms_parse(S("bad"), &d) != -1)
+        return err(10, "乱写应该 -1");
+}
+
+test "dms：格式化与往返" {
+    Dms d = { 0 };
+    char out[40] = { 0 };
+    int n = 0;
+
+    if (d.from_deg(40.446111) != 1)
+        return err(11, "from_deg 失败");
+    if (d.deg != 40 || d.min != 26 || !dnear(d.sec, 46.0, 0.2))
+        return err(12, "40.446111 拆分不对");
+    n = d.format(out, (int)sizeof out);
+    if (n <= 0)
+        return err(13, "format 失败");
+    if (memcmp(out, "40\xc2\xb0" "26'46.0\"N", (size_t)n) != 0)
+        return err(14, "格式化内容不对");
+    /* 负纬度 + 经度方向 */
+    d.from_deg(-72.7273);
+    d.lat = 0;
+    n = d.format(out, (int)sizeof out);
+    if (memcmp(out, "72\xc2\xb0" "43'38.3\"W", (size_t)n) != 0)
+        return err(15, "经度格式化不对");
+    /* 往返：格式化后再解析回来 */
+    d.from_deg(-33.8688);
+    n = d.format(out, (int)sizeof out);
+    if (dms_parse((char[:]){ out, n }, &d) != 1)
+        return err(16, "格式化结果解析失败");
+    if (!dnear(d.to_deg(), -33.8688, 0.001))
+        return err(17, "往返精度不对");
+    if (d.format(out, 4) != -1)
+        return err(18, "容量不够应该 -1");
+}
