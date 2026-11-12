@@ -47,7 +47,8 @@ HOSTCC   ?= gcc
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
-        stdtest errcheck std-demo std-tour std-kit std-box std-web
+        stdtest errcheck std-demo std-tour std-kit std-box std-web \
+        std-net
 
 all: build
 
@@ -131,6 +132,7 @@ stdtest: build
 	    std/url.c6)  deps="std/str.c6" ;; \
 	    std/mime.c6) deps="std/str.c6 std/path.c6" ;; \
 	    std/uuid.c6) deps="std/rand.c6 std/time.c6" ;; \
+	    std/pqueue.c6) deps="std/sort.c6 std/str.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -198,6 +200,18 @@ std-web: build
 	@mkdir -p build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdweb $(STD_WEB_SRCS)
 	./build/stdweb
+
+# 标准库第六批：inet / bitbuf / pqueue / ini。
+# inet 与 bitbuf 自成一体（只用 std.types 的定宽整数与 err() 内建）；
+# pqueue 要 std.sort 的比较器（cmp_str 又拉上 std.str）；ini 借 std.str 的 Str。
+STD_NET_SRCS := examples/stdnet.c6 std/types.c6 std/err.c6 std/str.c6 \
+                std/sort.c6 std/inet.c6 std/bitbuf.c6 std/pqueue.c6 \
+                std/ini.c6
+
+std-net: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdnet $(STD_NET_SRCS)
+	./build/stdnet
 
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
@@ -303,7 +317,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -312,13 +326,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的六个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的七个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web 是五批模块
-# 拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变 check-all
-# 的语义。
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net 是六批
+# 模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
+# check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web
+           stdtest std-demo std-tour std-kit std-box std-web std-net
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -459,7 +473,7 @@ distclean:
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
-#                    + 标准库的 stdtest/std-demo/tour/kit/box/web）
+#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
@@ -468,6 +482,7 @@ distclean:
 #   std-kit          编译并运行 examples/stdkit.c6（第三批）
 #   std-box          编译并运行 examples/stdbox.c6（第四批）
 #   std-web          编译并运行 examples/stdweb.c6（第五批）
+#   std-net          编译并运行 examples/stdnet.c6（第六批）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）
