@@ -61,6 +61,7 @@
 | `std/text/semver.c6` | `std.text.semver` | 语义化版本 2.0.0：`semver_parse` 工厂、`Semver` 的 `compare`/`is_prerelease`/`format`；严格前导零/标识校验，构建标识不参与优先级 |
 | `std/text/utf16.c6` | `std.text.utf16` | UTF-16 解码/编码/计数：`Utf16` 的 `decode`/`valid`/`count`、`utf16_encode`/`utf16_encoded_len`；代理对、BMP、非法代理与截断（零分配） |
 | `std/text/ansi.c6` | `std.text.ansi` | ANSI 转义构造器 `Ansi`：`reset`/`bold`/`fg_basic`/`bg_basic`/`fg`/`bg`/`move`/`up`/`down`/`clear_screen`/`clear_line`/`hide_cursor`/`show_cursor`，满了置 `ok=0` |
+| `std/text/width.c6` | `std.text.width` | 终端显示宽度（Unicode 15.0）：`cp_width`、`text_width`/`text_width_checked`、按列裁剪补齐 `text_prefix_len`/`text_fit`/`text_pad`/`text_clip`；W/F 算 2 列、组合符/格式符 0 列、只在码点边界切 |
 
 **`std/container/`**（容器与算法：向量、跨度、映射、集合、双端队列、优先队列、区间、排序）
 
@@ -99,6 +100,7 @@
 | `std/encoding/bitbuf.c6` | `std.encoding.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`put`/`put_u64`/`put_bit`/`align`/`put_bytes`/`patch`（回填不改游标）、`br_open`/`get`/`get_u64`/`get_bit`/`peek`/`skip`/`align`/`get_bytes`、`bit_count`/`byte_count`/`ok`/`remaining`/`eof` |
 | `std/encoding/codec.c6` | `std.encoding.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
 | `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
+| `std/encoding/punycode.c6` | `std.encoding.punycode` | Punycode（RFC 3492）：`punycode_encode`/`punycode_decode`/`punycode_encoded_len`/`punycode_decoded_len`；IDNA 的 A-label 层 `idna_encode`/`idna_decode`/`idna_encoded_len`/`idna_decoded_len`（`xn--`、Unicode 句点、63/255 字节上限） |
 | `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
 
 **`std/data/`**（数据格式：JSON、CSV、INI）
@@ -107,6 +109,7 @@
 | --- | --- | --- |
 | `std/data/csv.c6` | `std.data.csv` | RFC 4180 CSV（零分配）：`CsvReader` 的 `csv_reader`/`next`/`rewind`（引号字段可跨行、CRLF、`""` 转义）、`csv_need_quote`/`csv_write_field`/`csv_write_row`（写调用方缓冲）、`csv_count_fields`/`csv_count_rows` |
 | `std/data/ini.c6` | `std.data.ini` | INI 配置的零分配读取：`ini_open`/`next`（字段都是输入上的视图）、`ini_lookup`/`ini_has_section`/`ini_count`、`IniEntry.section`/`key`/`value`/`line`；语法错误给行号 |
+| `std/data/props.c6` | `std.data.props` | `.properties` / `.env` 的零分配读取：`props_open` 工厂 + `PropsReader` 的 `next`、`PropEntry` 的 `decode`、`props_decode`/`props_decoded_len`（`\n`/`\uXXXX`/代理对/续行）、`props_lookup`/`props_has`/`props_count`；空键给行号 |
 | `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`Arena` 的 `json_parse`/`json_parse_at`、`Json` 的 `get`/`at`/`count`/`key`、`get_str`/`get_num`/`get_bool`、`write`/`write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
 
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME）
@@ -117,6 +120,7 @@
 | `std/net/mime.c6` | `std.net.mime` | 扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：`mime_of_ext`/`mime_of_path`/`mime_ext_of`/`mime_ext_at`/`mime_type_at`/`mime_count`、`mime_is_text`/`is_image`/`is_audio`/`is_video`/`is_font`、`mime_charset`、`mime_sniff`、`mime_default` |
 | `std/net/http.c6` | `std.net.http` | HTTP/1.x 零分配解析：`http_parse_request`/`http_parse_response` 得到 `HttpMessage`，`HttpMessage` 的 `header`/`header_at`/`header_count`/`body`/`content_length`/`is_request`/`is_response`，`http_status_text`；头字段名大小写不敏感，不接受 obs-fold |
 | `std/net/cookie.c6` | `std.net.cookie` | Cookie / Set-Cookie 零分配解析：`cookie_parse_set`/`cookie_parse_pair` 得到 `Cookie`，`Cookie` 的 `attribute`/`has_attribute`/`path`/`domain`/`expires`/`same_site`/`max_age`/`is_secure`/`is_http_only`、`cookie_write_pair` |
+| `std/net/multipart.c6` | `std.net.multipart` | `multipart/form-data` 零分配解析（RFC 7578）：`mp_open`/`mp_open_boundary` 工厂 + `Multipart` 的 `next`/`count`、`Part` 的 `headers`/`disposition`/`name`/`filename`/`content_type`/`body`/`index`、`mp_header`/`mp_param`；伪分隔符当 preamble、无头 part、CRLF/LF 都认 |
 | `std/net/url.c6` | `std.net.url` | URL（RFC 3986）解析与相对解析：`url_parse` 工厂 + `Url` 的 `effective_port`/`is_absolute`/`has_host`、`url_resolve`（§5.2 全算法）、查询参数 `next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
 
 **集成示例**（`main` 只能写在模块外的文件里）
@@ -132,6 +136,7 @@
 | `examples/stdmore.c6` | （无模块） | 第七批模块的拼装示例（`make std-more`）：bitset/glob/base32/http 各一节，自带自检 |
 | `examples/stdnext.c6` | （无模块） | 第八批模块的拼装示例（`make std-next`）：base58/varint/semver/cookie 各一节，自带自检 |
 | `examples/stdnode.c6` | （无模块） | 第九批模块的拼装示例（`make std-node`）：list/ring/utf16/ansi 各一节，自带自检 |
+| `examples/stdform.c6` | （无模块） | 第十批模块的拼装示例（`make std-form`）：props/multipart/punycode/width 各一节，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -158,11 +163,13 @@ std/core/types.c6          4 test(s), 0 failure(s)
 std/data/csv.c6            41 test(s), 0 failure(s)
 std/data/ini.c6            6 test(s), 0 failure(s)
 std/data/json.c6           60 test(s), 0 failure(s)
+std/data/props.c6          4 test(s), 0 failure(s)
 std/encoding/base32.c6     5 test(s), 0 failure(s)
 std/encoding/base58.c6     3 test(s), 0 failure(s)
 std/encoding/base64.c6     8 test(s), 0 failure(s)
 std/encoding/bitbuf.c6     7 test(s), 0 failure(s)
 std/encoding/codec.c6      7 test(s), 0 failure(s)
+std/encoding/punycode.c6   11 test(s), 0 failure(s)
 std/encoding/sha256.c6     23 test(s), 0 failure(s)
 std/encoding/uuid.c6       24 test(s), 0 failure(s)
 std/encoding/varint.c6     4 test(s), 0 failure(s)
@@ -170,6 +177,7 @@ std/net/cookie.c6          4 test(s), 0 failure(s)
 std/net/http.c6            5 test(s), 0 failure(s)
 std/net/inet.c6            8 test(s), 0 failure(s)
 std/net/mime.c6            37 test(s), 0 failure(s)
+std/net/multipart.c6       4 test(s), 0 failure(s)
 std/net/url.c6             32 test(s), 0 failure(s)
 std/os/env.c6              39 test(s), 0 failure(s)
 std/os/fs.c6               7 test(s), 0 failure(s)
@@ -186,6 +194,7 @@ std/text/strbuf.c6         18 test(s), 0 failure(s)
 std/text/str.c6            22 test(s), 0 failure(s)
 std/text/utf16.c6          4 test(s), 0 failure(s)
 std/text/utf8.c6           7 test(s), 0 failure(s)
+std/text/width.c6          10 test(s), 0 failure(s)
 ```
 
 `-test` 的计数是命令行上**所有 TU** 的 `test` 块之和，所以带依赖跑的行会把自己
@@ -207,13 +216,17 @@ std/text/utf8.c6           7 test(s), 0 failure(s)
 | `std/encoding/uuid.c6` 24 | uuid 8 + rand 9 + time 7（v4/v7 要随机源，v7 要墙钟） |
 | `std/container/pqueue.c6` 38 | pqueue 8 + sort 30（比较器来自 `std.container.sort`；`cmp_str` 又拉上 `std.text.str`，但那样跑才有 str 的块参与） |
 | `std/container/bitset.c6` 11 | bitset 5 + bits 6（`popcount64`/`ctz64` 是跨 TU 调用） |
+| `std/text/width.c6` 10 | utf8 7 + width 3（判宽要 `utf8_decode`） |
+| `std/encoding/punycode.c6` 11 | utf8 7 + punycode 4（编码/解码都走 `utf8_decode`） |
 
 `std/core/bits`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
-`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`
-自成一体，单独跑就是自己的块数；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
+`std/encoding/codec`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
+`std/data/props`、`std/net/multipart`
+自成一体，单独跑就是自己的块数（props/multipart 只借 `Str` 这个类型）；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
 `std.text.str`（正文不调用），`std/net/mime` 的正文必须带 `std/os/path`，`std/encoding/sha256` 的正文
 必须带 `std/core/bits`，`std/os/env` 的正文必须带 `std/text/str`，`std/encoding/uuid` 的正文必须带
-`std/core/rand` 与 `std/os/time`，`std/container/pqueue` 的正文必须带 `std/container/sort`。
+`std/core/rand` 与 `std/os/time`，`std/container/pqueue` 的正文必须带 `std/container/sort`，`std/text/width` 与
+`std/encoding/punycode` 的正文必须带 `std/text/utf8`。
 
 ## 设计原则
 
@@ -1319,6 +1332,106 @@ ini_lookup(t, S("db"), S("host"), &host);      /* 1 */
 不做类型转换、不处理转义、不合并续行、不解析引号——拿到 `Str` 之后用
 `std.text.str` 的 `to_int`/`trim` 等自己处理。
 
+### `props`：`.properties` / `.env` 配置
+
+```c
+import std.data.props;
+
+PropsReader r = props_open(S("name = demo\nexport PORT=8080\npaths = a:b\\\n        c\n"));
+PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+while (r.next(&e) == 1) {
+    char buf[64] = { 0 };
+    int n = e.decode((char[:]){ buf, (int)sizeof buf });   /* 转义在这一步才解 */
+}
+
+Str v = { { (char *)0, 0 } };
+props_lookup(S("PORT = 8080\n"), S("PORT"), &v);   /* 原始值视图；重复键给最后一个 */
+```
+
+* 分隔符认 `=`、`:`、空白三种（`a=1`、`a: 1`、`a 1` 都是 `a` → `1`）；键前的
+  `export ` 跳过；trim 之后以 `#`/`!` 开头的行是注释；值可以为空，键不能为空。
+* `key`/`value` 都是输入上的视图，**转义保持原样**：`\n` `\r` `\t` `\f` `\\`
+  `\:` `\=` `\#` `\!` `\ `、`\uXXXX`（代理对合并）、行尾 `\<换行>` 续行，全在
+  `props_decode` / `e.decode(buf)` 里处理。未知转义丢掉反斜杠（和 Java 一致），
+  坏的 `\u` 给 -1，缓冲放不下一个字节都不写。
+* 续行的 `value` 视图跨过 `\` 与换行（原始区间），解码时连同续行开头的空白一起
+  去掉；所以整段输入必须活到用完。
+* 语法错误（空键、`=v`）让 `next` 返回 -1，行号在 `r.err`（1 起），之后可以继续
+  读下一行；`props_lookup`/`props_count` 遇到坏行给 0/-1。
+
+### `multipart`：`multipart/form-data`
+
+```c
+import std.net.multipart;
+
+Multipart m = mp_open(body, http_msg.header(S("Content-Type")));
+/* 或者已经有 boundary：mp_open_boundary(body, S("----X")) */
+Part p = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, { { (char *)0, 0 } },
+           { { (char *)0, 0 } }, { { (char *)0, 0 } }, { (char *)0, 0 }, 0 };
+while (m.next(&p) == 1) {
+    /* p.name / p.filename / p.content_type 是视图；p.body 是 char[:] */
+}
+m.count();          /* 不改变解析器状态 */
+```
+
+* `boundary` 从 Content-Type 的 `; boundary=...` 取（`mp_param` 认引号，引号里的
+  `;` 不切）；`ok = 0` 表示没有可用 boundary，`next`/`count` 返回 -1。
+* 第一个分隔符之前的 preamble、`--boundary--` 之后的 epilogue 都跳过；分隔符必须
+  在 body 开头或 `\n` 之后，且后面只能跟 CRLF/LF 或 `--`——`--bX` 这种伪分隔符
+  当普通 preamble 内容，不会让解析失败。
+* 头块到空行为止（`\r\n\r\n` 或 `\n\n`），头字段名大小写不敏感；头块缺失时正文
+  从分隔符后开始（紧邻的那个空行仍然不算正文）；正文到下一个分隔符前的 CRLF/LF
+  为止。
+* 零分配：不做 URL 解码、不落盘、不处理嵌套 multipart（`multipart/mixed` 的正文
+  原样给出，需要时递归 `mp_open`）。`mp_param`/`mp_header` 可以单独用来解析任何
+  `a; k=v; k2="v2"` 形状的头字段。
+
+### `punycode`：Punycode 与 IDNA 的 `xn--`
+
+```c
+import std.encoding.punycode;
+
+char out[64] = { 0 };
+punycode_encode(S("münchen"), (char[:]){ out, (int)sizeof out });     /* 10, "mnchen-3ya" */
+idna_encode(S("中文.cn"), (char[:]){ out, (int)sizeof out });          /* 14, "xn--fiq228c.cn" */
+idna_decode(S("xn--fiq228c.cn"), (char[:]){ out, (int)sizeof out });   /* 9, "中文.cn" */
+```
+
+* 两层分开：`punycode_*` 是 RFC 3492 的 Bootstring，纯 ASCII 输入也带结尾的 `-`
+  （`abc` → `abc-`，协议原文）；`idna_*` 按 `.`（也认 U+3002/U+FF0E/U+FF61）切
+  标签，只把含非 ASCII 的标签编成 `xn--...`，纯 ASCII 标签原样拷贝，并检查标签
+  63 字节 / 整条域名 255 字节的上限。
+* `*_len` 给**精确**长度（不是上界）；写调用方缓冲，放不下返回 -1 且一个字节都
+  不写。
+* 不做 Unicode 归一化、不做大小写折叠（没有大小写表）：`MÜNCHEN.de` 不会得到
+  `münchen.de` 的编码，要 IDNA2003 的映射请先把输入归一。
+* 解码严格：基本码点必须 < 0x80、数字只认 `a-z`/`0-9`、拒绝代理区与
+  > U+10FFFF 的码点，delta/w 的乘加都做溢出检查。`idna_decode` 只接受 ASCII 的
+  A-label 输入。
+
+### `width`：终端显示宽度
+
+```c
+import std.text.width;
+
+text_width(S("中文🙂"));        /* 2 + 2 + 2 = 6 列 */
+char cell[16] = { 0 };
+text_pad(S("abc"), (char[:]){ cell, (int)sizeof cell }, 5);            /* 5, "abc  " */
+text_clip(S("中文字符"), (char[:]){ cell, (int)sizeof cell }, 5);       /* 6, "中..." */
+int bytes = text_prefix_len(S("a中b"), 2);                             /* 1, 只留 'a' */
+```
+
+* 判据是 Unicode 15.0 的 EastAsianWidth（W/F 算 2 列）与通用类别（Mn/Me/Cf 算
+  0 列，另加谚文中/终声 U+1160..U+11FF）；两张有序区间表二分查找，零分配。
+* Ambiguous（A）按 1 列算（非 CJK locale 的惯例）。**不做字素簇/ZWJ 序列合并**，
+  逐码点相加：常见情形是对的，但 emoji 家庭这类序列在终端里可能更窄，精确排版
+  别只靠它。
+* `text_width` 从不失败：非法 UTF-8 字节按 1 列、控制字符 0 列；要严格判定用
+  `text_width_checked`（两种情况都报 -1）。
+* `text_prefix_len`/`text_fit`/`text_pad`/`text_clip` 只在码点边界切，不会留下
+  半个 UTF-8 序列；`text_pad` 宽了先截、窄了补空格到恰好 N 列，`text_clip` 截断时
+  补 `...`（总宽度仍 ≤ N）。都写调用方缓冲，放不下返回 -1 且不写。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -1536,6 +1649,24 @@ stdnode: 17 check(s), 0 failure(s)
 四节分别是侵入式链表的 push/迭代/remove、环形队列的回绕、UTF-16 代理对与非法
 代理、ANSI SGR/256 色/光标移动。Makefile 里照旧显式列出四个模块正文。
 
+### 集成示例：`examples/stdform.c6`
+
+```sh
+make std-form
+```
+
+```
+stdform: 标准库第十批（props / multipart / punycode / width）
+stdform: 26 check(s), 0 failure(s)
+```
+
+四节讲同一条链路：props 读 `.env` 配置（三种分隔符、`export`、续行、`\u` 解码、
+空键报错）→ multipart 收表单（文本字段与文件字段、头字段名大小写不敏感）→
+punycode 把 `münchen.de`/`中文.cn` 转成 A-label 再转回来 → width 按列宽裁剪、
+补齐、做宽字符列对齐。Makefile 里照旧显式列出四个模块正文，外加
+`std/text/utf8.c6`（width/punycode 用它的 `utf8_decode`；`Str` 类型只靠 `import`
+带来的声明，不需要 str 的正文）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -1551,6 +1682,7 @@ stdnode: 17 check(s), 0 failure(s)
 * `make std-more`：`examples/stdmore.c6`，第七批模块的拼装示例（自带自检）。
 * `make std-next`：`examples/stdnext.c6`，第八批模块的拼装示例（自带自检）。
 * `make std-node`：`examples/stdnode.c6`，第九批模块的拼装示例（自带自检）。
+* `make std-form`：`examples/stdform.c6`，第十批模块的拼装示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -1566,3 +1698,18 @@ stdnode: 17 check(s), 0 failure(s)
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，
   验证墓碑不会被搬进新表（写 `std/container/set` 时踩到的真实 bug）。
+
+* `std/encoding/punycode.c6` 的向量：RFC 3492 的德语/中文/日语/韩语/俄语/阿拉伯语
+  样本逐字节对过 Python `str.encode('punycode')`，IDNA 的
+  `münchen.de`/`中文.cn`/`пример.рф` 与 `idna` 编解码一致；另有「纯 ASCII 带
+  结尾 `-`」「63/255 字节上限」「空标签/坏 punycode 被拒」的回归。
+* `std/net/multipart.c6` 的「伪分隔符」用例：`--bX` 这种不是分隔符的行要当
+  preamble 跳过（boundary 是另一个分隔符的前缀时最容易踩），钉住
+  `mp_find_delim` 的行尾判定；另有「无头 part」「preamble/epilogue」「LF 行尾」
+  三条。
+* `std/data/props.c6` 的「续行」用例：行尾奇数个反斜杠才续行（偶数个是字面
+  反斜杠），`value` 视图跨过原始 `\`+换行，解码时合并；另钉住 `\u` 代理对与
+  落单代理的 -1。
+* `std/text/width.c6` 的判宽表：`中`/`Ａ`/`🙂` = 2 列、`U+0301` 组合符与
+  `U+1160` 谚文中声 = 0 列、控制字符 0 列（严格版 -1）、非法字节 1 列；
+  `text_prefix_len` 不切半个 UTF-8 序列。

@@ -813,3 +813,22 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 
 验收：`make stdtest`（49 个模块、0 failure）、`make std-node`（17 条自检全过）、
 `make check-all`。
+
+### 11.21 标准库第十批（props / multipart / punycode / width）
+
+第十批补的是**配置、表单、IDN 与终端排版**这一条链路上的四块：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.data.props` | `.properties` / `.env` 零分配读取 | 值视图保留转义原文，`props_decode` / `e.decode` 才解；续行让 value 跨过 `\`+换行；未知转义丢反斜杠、坏 `\u` 给 -1；空键是在 `r.err` 里给行号 |
+| `std.net.multipart` | `multipart/form-data` 零分配解析 | boundary 从 Content-Type 里取（引号里的 `;` 不切）；分隔符必须在行首且后面只跟 CRLF/LF 或 `--`，伪分隔符当 preamble；无头 part 也认；正文不含分隔符前的 CRLF |
+| `std.encoding.punycode` | RFC 3492 Punycode + IDNA `xn--` | Bootstring 与 A-label 两层分开；纯 ASCII 也带结尾 `-`；`*_len` 给精确长度；不做 Unicode 归一化/大小写折叠；解码做溢出与代理区检查 |
+| `std.text.width` | 终端显示宽度（Unicode 15.0 表） | W/F 2 列、Mn/Me/Cf 与谚文中/终声 0 列、Ambiguous 1 列；不做字素簇合并；裁剪只在码点边界切，`text_width` 从不失败 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.data.props`=0x6031、
+`std.net.multipart`=0x6032、`std.encoding.punycode`=0x6033、`std.text.width`=0x6034；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-form` 与 `STDFORM_SRCS`，
+`test-all`/`check-all` 都带上它。
+
+验收：`make stdtest`（53 个模块、0 failure）、`make std-form`（26 条自检全过）、
+`make check-all`。

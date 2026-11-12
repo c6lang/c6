@@ -1,0 +1,189 @@
+/* stdform：标准库第十批（props / multipart / punycode / width）的拼装示例。
+ *
+ * 和 stdnode/stdnext/stdmore 一样：这个文件没有 `module`（入口 `main` 只能
+ * 写在模块外的文件里），四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是同一条链路上的四件事：读配置（props）→ 收表单（multipart）→
+ * 把用户填的域名转成 A-label（punycode/IDNA）→ 按终端列宽排版输出（width）。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdform \
+ *         examples/stdform.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/text/utf8.c6 std/data/props.c6 \
+ *         std/net/multipart.c6 std/encoding/punycode.c6 std/text/width.c6
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.core.err;
+import std.text.str;
+import std.text.utf8;
+import std.text.width;
+import std.data.props;
+import std.net.multipart;
+import std.encoding.punycode;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+static int s_is(Str s, char *lit, int n)
+{
+    if (s.s.len != n)
+        return 0;
+    if (n == 0)
+        return 1;
+    return memcmp(s.s.data, lit, (size_t)n) == 0;
+}
+
+static int b_is(char[:] v, char *lit, int n)
+{
+    if (v.len != n)
+        return 0;
+    if (n == 0)
+        return 1;
+    return memcmp(v.data, lit, (size_t)n) == 0;
+}
+
+/* 配置：`=` / `:` / 空白三种分隔、export 前缀、续行、`\u` 解码 */
+static void tour_props(void)
+{
+    char[:] cfg = S("name = demo\n"
+                    "export PORT=8080\n"
+                    "paths = a:b\\\n"
+                    "        c\n"
+                    "greet = \\u4e2d\\u6587\n");
+    PropsReader r = props_open(cfg);
+    PropEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, 0 };
+    PropsReader bad = props_open(S("=nokey\n"));
+    char buf[64] = { 0 };
+    Str v = { { (char *)0, 0 } };
+    int keys = 0;
+    int n = 0;
+
+    while (r.next(&e) == 1)
+        keys++;
+    check(keys == 4, "props: 四条键值");
+    check(props_lookup(cfg, S("PORT"), &v) && s_is(v, "8080", 4),
+          "props: export 前缀与 lookup");
+    check(props_lookup(cfg, S("paths"), &v)
+              && props_decode(v.s, (char[:]){ buf, (int)sizeof buf }) == 4
+              && memcmp(buf, "a:bc", 4) == 0,
+          "props: 续行解码");
+    check(props_lookup(cfg, S("greet"), &v)
+              && props_decode(v.s, (char[:]){ buf, (int)sizeof buf }) == 6
+              && memcmp(buf, "\xe4\xb8\xad\xe6\x96\x87", 6) == 0,
+          "props: \\u 解码");
+    check(bad.next(&e) == -1 && bad.err == 1, "props: 空键报错");
+    check(props_count(cfg) == 4 && props_has(cfg, S("name")) == 1
+              && props_has(cfg, S("nope")) == 0,
+          "props: count / has");
+    n = props_decoded_len(S("\\u4e2d"));
+    check(n == 3, "props: decoded_len");
+}
+
+/* 表单：multipart/form-data 的边界、头和正文视图 */
+static void tour_multipart(void)
+{
+    char[:] body = S("--f\r\n"
+                     "Content-Disposition: form-data; name=\"user\"\r\n"
+                     "\r\n"
+                     "ada\r\n"
+                     "--f\r\n"
+                     "Content-Disposition: form-data; name=\"up\"; filename=\"a.txt\"\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "\r\n"
+                     "hello\r\n"
+                     "--f--\r\n");
+    Multipart m = mp_open(body, SS("multipart/form-data; boundary=f"));
+    Part p = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, { { (char *)0, 0 } },
+               { { (char *)0, 0 } }, { { (char *)0, 0 } }, { (char *)0, 0 }, 0 };
+    Str v = { { (char *)0, 0 } };
+
+    check(m.ok && m.count() == 2, "multipart: 两个 part");
+    check(m.next(&p) == 1 && p.index == 1 && s_is(p.name, "user", 4)
+              && b_is(p.body, "ada", 3),
+          "multipart: 文本字段");
+    check(mp_header(&p, SS("CONTENT-DISPOSITION"), &v) == 1
+              && s_is(v, "form-data; name=\"user\"", 22),
+          "multipart: 头字段名大小写不敏感");
+    check(m.next(&p) == 1 && p.index == 2 && s_is(p.filename, "a.txt", 5)
+              && s_is(p.content_type, "text/plain", 10)
+              && b_is(p.body, "hello", 5),
+          "multipart: 文件字段");
+    check(m.next(&p) == 0, "multipart: 读到结束");
+}
+
+/* 域名：Unicode -> A-label（xn--）再转回来 */
+static void tour_punycode(void)
+{
+    char out[128] = { 0 };
+    char back[128] = { 0 };
+    int n = 0;
+
+    n = idna_encode(S("m\xc3\xbcnchen.de"), (char[:]){ out, (int)sizeof out });
+    check(n == 17 && memcmp(out, "xn--mnchen-3ya.de", 17) == 0,
+          "punycode: münchen.de -> A-label");
+    n = idna_decode(S("xn--fiq228c.cn"), (char[:]){ back, (int)sizeof back });
+    check(n == 9 && memcmp(back, "\xe4\xb8\xad\xe6\x96\x87.cn", 9) == 0,
+          "punycode: A-label -> 中文.cn");
+    n = punycode_encode(S("abc"), (char[:]){ out, (int)sizeof out });
+    check(n == 4 && memcmp(out, "abc-", 4) == 0,
+          "punycode: 纯 ASCII 带结尾 '-'");
+    check(idna_encode(S("a..b"), (char[:]){ out, (int)sizeof out }) == -1,
+          "punycode: 空标签被拒");
+    check(punycode_decoded_len(S("mnchen-3ya")) == 8
+              && idna_encoded_len(S("m\xc3\xbcnchen.de")) == 17,
+          "punycode: *_len 与 encode/decode 一致");
+}
+
+/* 排版：按终端列宽裁剪/补齐 */
+static void tour_width(void)
+{
+    char cell[32] = { 0 };
+    char row[64] = { 0 };
+    int n = 0;
+
+    check(text_width(S("\xe4\xb8\xad\xe6\x96\x87")) == 4, "width: 中文 4 列");
+    check(text_width(S("e\xcc\x81")) == 1, "width: 组合符不多占列");
+    check(text_width(S("a\tb")) == 2, "width: 控制字符 0 列");
+    check(text_width_checked(S("a\tb")) == -1, "width: 严格版拒绝控制字符");
+    n = text_pad(S("abc"), (char[:]){ cell, (int)sizeof cell }, 5);
+    check(n == 5 && memcmp(cell, "abc  ", 5) == 0, "width: 补齐");
+    n = text_pad(S("\xe4\xb8\xad\xe6\x96\x87"), (char[:]){ cell, (int)sizeof cell }, 3);
+    check(n == 4 && memcmp(cell, "\xe4\xb8\xad ", 4) == 0, "width: 宽字符裁剪再补齐");
+    n = text_clip(S("\xe4\xb8\xad\xe6\x96\x87\xe5\xad\x97\xe7\xac\xa6"), (char[:]){ cell, (int)sizeof cell }, 5);
+    check(n == 6 && memcmp(cell, "\xe4\xb8\xad...", 6) == 0,
+          "width: 省略号裁剪");
+    check(text_prefix_len(S("a\xe4\xb8\xad" "b"), 2) == 1,
+          "width: 前缀不切半个字符");
+    /* 两列排版：第一列补齐到 8 列（含宽字符） */
+    n = text_pad(S("\xe5\x90\x8d\xe5\xad\x97"), (char[:]){ row, (int)sizeof row }, 8);
+    memcpy(row + n, "OK", 2);
+    check(n == 10 && text_width((char[:]){ row, n + 2 }) == 10,
+          "width: 宽字符列对齐");
+}
+
+int main(void)
+{
+    printf("stdform: 标准库第十批（props / multipart / punycode / width）\n");
+    tour_props();
+    tour_multipart();
+    tour_punycode();
+    tour_width();
+    printf("stdform: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}
