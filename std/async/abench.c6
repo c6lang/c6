@@ -1,0 +1,381 @@
+/* std/async/abench：语言级异步框架的**性能指标**（任务创建/驱动、挂起/恢复、co 批量）。
+ *
+ *     import std.async.abench;
+ *
+ *     Bench b = { 0 };
+ *     b.run_null(2000);                       // 方法：方法内部自带 begin/end
+ *     char line[160] = { 0 };
+ *     b.report(line, sizeof line);            // "async 任务创建+驱动: 2000 ops / … us → … ops/s"
+ *     b.ns_per_op();                          // 每次操作多少纳秒
+ *
+ * 这里量的都是**框架本身**的开销，不是业务逻辑：
+ *
+ * - `b.run_null(iters)`：`async` 函数建任务、`__c6_co_wait` 跑到完成、`__c6_co_destroy`
+ *   释放——测的是「任务对象的创建/入队/出队/回收」；
+ * - `b.run_io(iters, rfd, wfd)`：每次往管道写 1 字节再建一个读任务，任务在
+ *   `await c6_io` 上挂起、由 `select()` 唤醒——测的是**一次挂起 + 一次恢复**（含两次
+ *   系统调用）；
+ * - `b.run_co(iters, rfd, wfd)`：用 `co` 关键字批量撒任务，再一次性 `__c6_co_run()`
+ *   跑完——测的是顶层调度循环的摊销成本。
+ *
+ * 计时用 `std.os.time` 的 `now_ns()`（`CLOCK_MONOTONIC`，纳秒）。所有指标都是
+ * 「本机 + 本次运行」的实测值，报告里只给整数，单位统一成 us / ops/s / ns。
+ *
+ * 约定：
+ *
+ * - `b.begin(name)` 起表、`b.add(n)` 记操作数、`b.finish()` 停表；
+ * - `b.ops()`/`b.elapsed_ns()`/`b.ns_per_op()`/`b.ops_per_sec()` 读数；
+ *   `b.ns_per_op()` 在没操作数时返回 -1；
+ * - `b.fail(n)` 记失败次数，`b.fail_count()` 读它（`run_*` 里任务返回非 0 就记一次）；
+ * - `b.report(out, cap)` 写一行摘要（不换行），`cap` 不够返回 -1；
+ * - `b.is_running()` 是否在计时中；重复 `begin` 会把上一次冲掉。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.async.abench;
+import std.core.types;
+import std.text.str;
+import std.os.time;
+
+struct Bench {
+    char name[48];
+    u64 t0;
+    u64 t1;
+    long nops;
+    long nfail;
+    int running;
+};
+
+/* 空 async 函数：测任务创建 + 驱动 + 回收 */
+async int ab_null(int v)
+{
+    return v + 1;
+}
+
+/* 一次挂起/恢复：await 可读，然后读 1 字节 */
+async int ab_tick(int fd)
+{
+    char c = 0;
+    int rev = 0;
+    int n = 0;
+
+    rev = await c6_io(fd, C6_CO_EV_READ);
+    if (rev < 0)
+        return -1;
+    n = (int)read(fd, &c, 1);
+    return n;
+}
+
+int begin(Bench *b, const char *name)
+{
+    int i = 0;
+
+    if (!b || !name)
+        return -1;
+    memset(b->name, 0, sizeof b->name);
+    for (i = 0; name[i] && i < (int)sizeof b->name - 1; i++)
+        b->name[i] = name[i];
+    b->t0 = now_ns();
+    b->t1 = 0;
+    b->nops = 0;
+    b->nfail = 0;
+    b->running = 1;
+    return 1;
+}
+
+long add(Bench *b, long n)
+{
+    if (!b || n < 0)
+        return -1;
+    b->nops += n;
+    return b->nops;
+}
+
+int fail(Bench *b, long n)
+{
+    if (!b)
+        return -1;
+    b->nfail += n < 0 ? 1 : n;
+    return 1;
+}
+
+int finish(Bench *b)
+{
+    if (!b || !b->running)
+        return -1;
+    b->t1 = now_ns();
+    b->running = 0;
+    return 1;
+}
+
+long ops(Bench *b)
+{
+    return b ? b->nops : 0;
+}
+
+long fail_count(Bench *b)
+{
+    return b ? b->nfail : 0;
+}
+
+u64 elapsed_ns(Bench *b)
+{
+    if (!b)
+        return 0;
+    if (b->running)
+        return now_ns() - b->t0;
+    return b->t1 > b->t0 ? b->t1 - b->t0 : 0;
+}
+
+long ns_per_op(Bench *b)
+{
+    u64 el = 0;
+
+    if (!b || b->nops <= 0)
+        return -1;
+    el = elapsed_ns(b);
+    if (el == 0)
+        return 0;
+    return (long)(el / (u64)b->nops);
+}
+
+long ops_per_sec(Bench *b)
+{
+    u64 el = 0;
+
+    if (!b || b->nops <= 0)
+        return -1;
+    el = elapsed_ns(b);
+    if (el == 0)
+        return 0;
+    return (long)(((u64)b->nops * 1000000000ULL) / el);
+}
+
+int is_running(Bench *b)
+{
+    return b ? b->running : 0;
+}
+
+/* ---- 三个测量入口（都是方法，内部自带 begin/finish） ---- */
+
+int run_null(Bench *b, int iters)
+{
+    int i = 0;
+
+    if (!b || iters <= 0)
+        return -1;
+    begin(b, "async 任务创建+驱动+回收");
+    for (i = 0; i < iters; i++) {
+        struct ab_null_task *t = ab_null(i);
+        int rc = 0;
+
+        if (!t) {
+            b->nfail++;
+            continue;
+        }
+        rc = __c6_co_wait(t);
+        if (rc != 0 || t->val != i + 1)
+            b->nfail++;
+        __c6_co_destroy(t);
+    }
+    add(b, iters);
+    finish(b);
+    return 1;
+}
+
+int run_io(Bench *b, int iters, int rfd, int wfd)
+{
+    int i = 0;
+
+    if (!b || iters <= 0 || rfd < 0 || wfd < 0)
+        return -1;
+    begin(b, "async 一次挂起+恢复（await c6_io）");
+    for (i = 0; i < iters; i++) {
+        struct ab_tick_task *t = 0;
+        char one = 'x';
+
+        if (write(wfd, &one, 1) != 1) {
+            b->nfail++;
+            break;
+        }
+        t = ab_tick(rfd);
+        if (!t) {
+            b->nfail++;
+            break;
+        }
+        if (__c6_co_wait(t) != 0 || t->val != 1)
+            b->nfail++;
+        __c6_co_destroy(t);
+    }
+    add(b, i);
+    finish(b);
+    return 1;
+}
+
+int run_co(Bench *b, int iters, int rfd, int wfd)
+{
+    int i = 0;
+    int fail_n = 0;
+    char chunk[256] = { 0 };
+
+    if (!b || iters <= 0 || rfd < 0 || wfd < 0)
+        return -1;
+    begin(b, "co 顶层任务批跑（__c6_co_run）");
+    /* 先把数据灌进管道，任务才有得读 */
+    memset(chunk, 'y', sizeof chunk);
+    {
+        int left = iters;
+
+        while (left > 0) {
+            int take = left < (int)sizeof chunk ? left : (int)sizeof chunk;
+            int k = (int)write(wfd, chunk, (size_t)take);
+
+            if (k <= 0) {
+                b->nfail++;
+                break;
+            }
+            left -= k;
+        }
+    }
+    for (i = 0; i < iters; i++)
+        co ab_tick(rfd);
+    fail_n = __c6_co_run();
+    if (fail_n < 0)
+        b->nfail++;
+    else
+        b->nfail += (long)fail_n;
+    add(b, iters);
+    finish(b);
+    return 1;
+}
+
+/* ---- 报告：手搓整数格式化，不依赖 printf ---- */
+
+static int bench_put_u64(char *out, int cap, int at, u64 v)
+{
+    char tmp[24] = { 0 };
+    int n = 0;
+    int i = 0;
+
+    if (v == 0)
+        tmp[n++] = '0';
+    while (v > 0 && n < (int)sizeof tmp) {
+        tmp[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    }
+    for (i = n - 1; i >= 0 && at < cap - 1; i--)
+        out[at++] = tmp[i];
+    return at;
+}
+
+static int bench_put_str(char *out, int cap, int at, const char *s)
+{
+    int i = 0;
+
+    while (s[i] && at < cap - 1)
+        out[at++] = s[i++];
+    return at;
+}
+
+int report(Bench *b, char *out, int cap)
+{
+    int at = 0;
+    u64 el = 0;
+
+    if (!b || !out || cap < 16)
+        return -1;
+    el = elapsed_ns(b);
+    at = bench_put_str(out, cap, at, b->name);
+    at = bench_put_str(out, cap, at, ": ");
+    at = bench_put_u64(out, cap, at, (u64)b->nops);
+    at = bench_put_str(out, cap, at, " ops / ");
+    at = bench_put_u64(out, cap, at, el / 1000ULL);
+    at = bench_put_str(out, cap, at, " us -> ");
+    at = bench_put_u64(out, cap, at, (u64)(ops_per_sec(b) < 0 ? 0 : ops_per_sec(b)));
+    at = bench_put_str(out, cap, at, " ops/s (");
+    at = bench_put_u64(out, cap, at, (u64)(ns_per_op(b) < 0 ? 0 : ns_per_op(b)));
+    at = bench_put_str(out, cap, at, " ns/op");
+    if (b->nfail > 0) {
+        at = bench_put_str(out, cap, at, ", fail ");
+        at = bench_put_u64(out, cap, at, (u64)b->nfail);
+    }
+    at = bench_put_str(out, cap, at, ")");
+    out[at < cap ? at : cap - 1] = '\0';
+    return at;
+}
+
+/* ---- 自测 ---- */
+
+test "abench：任务开销与指标读数" {
+    Bench b = { { 0 }, 0, 0, 0, 0, 0 };
+    char line[192] = { 0 };
+
+    if (b.ns_per_op() != -1 || b.ops_per_sec() != -1)
+        return err(1, "没有操作数时应该 -1");
+    if (b.finish() != -1)
+        return err(2, "没 begin 就 finish 应该 -1");
+    if (b.run_null(0) != -1)
+        return err(3, "iters=0 应该 -1");
+    if (b.run_null(200) != 1)
+        return err(4, "run_null 失败");
+    if (b.ops() != 200)
+        return err(5, "操作数不对");
+    if (b.fail_count() != 0)
+        return err(6, "不该有失败");
+    if (b.elapsed_ns() == 0 || b.is_running())
+        return err(7, "计时状态不对");
+    if (b.ns_per_op() < 0 || b.ops_per_sec() <= 0)
+        return err(8, "指标读数不对");
+    if (b.report(line, (int)sizeof line) <= 0)
+        return err(9, "report 失败");
+    if (strstr(line, "ops/s") == 0)
+        return err(10, "报告里应该有 ops/s");
+    if (strstr(line, "async") == 0)
+        return err(11, "报告里应该有测项名");
+    /* 记录失败与重复 begin */
+    b.fail(3);
+    if (b.fail_count() != 3)
+        return err(12, "fail 记账不对");
+    b.begin("again");
+    if (b.ops() != 0 || b.fail_count() != 0 || !b.is_running())
+        return err(13, "begin 应该重置计数");
+    b.add(10);
+    b.finish();
+    if (b.ops() != 10)
+        return err(14, "add 之后读数不对");
+    if (b.report(line, 8) != -1)
+        return err(15, "cap 太小应该 -1");
+}
+
+test "abench：挂起/恢复与 co 批量" {
+    Bench b = { { 0 }, 0, 0, 0, 0, 0 };
+    int fds[2] = { -1, -1 };
+    char line[192] = { 0 };
+
+    if (pipe(fds) != 0)
+        return err(16, "pipe 失败");
+    if (b.run_io(50, -1, fds[1]) != -1)
+        return err(17, "非法 fd 应该 -1");
+    if (b.run_io(100, fds[0], fds[1]) != 1)
+        return err(18, "run_io 失败");
+    if (b.ops() != 100 || b.fail_count() != 0)
+        return err(19, "run_io 记账不对");
+    if (b.ns_per_op() <= 0)
+        return err(20, "单次挂起恢复耗时应为正");
+    b.report(line, (int)sizeof line);
+    if (strstr(line, "c6_io") == 0)
+        return err(21, "run_io 的报告名不对");
+    if (b.run_co(100, fds[0], fds[1]) != 1)
+        return err(22, "run_co 失败");
+    if (b.ops() != 100 || b.fail_count() != 0)
+        return err(23, "run_co 记账不对");
+    b.report(line, (int)sizeof line);
+    if (strstr(line, "co") == 0)
+        return err(24, "run_co 的报告名不对");
+    /* 数据被读光之后再 co 跑会挂住，所以只验证参数检查 */
+    if (b.run_co(10, -1, fds[1]) != -1)
+        return err(25, "非法 fd 应该 -1");
+    close(fds[0]);
+    close(fds[1]);
+}

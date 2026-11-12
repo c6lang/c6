@@ -472,6 +472,11 @@ std/data/                   数据格式：JSON、CSV、INI、.properties/.env�
   std/data/stl.c6             std.data.stl           STL 三角网格：二进制/ASCII 自动识别、面积/体积
   std/data/ply.c6             std.data.ply           ASCII PLY：头解析、x/y/z 列号、list 面
   std/data/mtl.c6             std.data.mtl           MTL 材质库：游标取块 + 按名字查
+  std/net/tlskdf.c6           std.net.tlskdf         TLS 1.3 密钥调度：Expand-Label/Derive-Secret/traffic key+iv/verify_data
+  std/net/tlsrec.c6           std.net.tlsrec         TLS 1.3 记录层：ChaCha20-Poly1305、序号 nonce、内层 type
+  std/net/https.c6            std.net.https          **同步** HTTP/1.1(S) 客户端：attach/request/status/header/body
+  std/net/httpsa.c6           std.net.httpsa         **异步** HTTP/1.1(S)：await c6_io + task/co 批量挂起
+  std/async/abench.c6         std.async.abench       语言级 async 性能指标：任务开销/挂起恢复/co 批量
   std/data/pnm.c6           std.data.pnm           Netpbm P5/P6 解码：注释、maxval 1..65535、8/16 位大端样本按 v*255/maxval 缩放到 RGBA
   std/data/x509.c6          std.data.x509          X.509 v3 证书解析：x509_parse 给出版本/序列号/签名 OID/issuer·subject 的 CN·O·C/有效期/SPKI/RSA 公钥位数/签名视图；不验签、不验链、不处理 PEM
   std/data/jwt.c6           std.data.jwt           JWS 紧凑格式（JWT）验签：jwt_verify 解头/载荷，HS256/HS384/HS512 常量时间比较签名；alg=none 与非 HMAC 拒绝，不解析 JSON
@@ -609,6 +614,7 @@ make std-async3   # 编译并运行 examples/stdasync3.c6（第七十八批 co /
 make std-geo2     # 编译并运行 examples/stdgeo2.c6（第七十九批计算几何模块的拼装示例）
 make std-async4   # 编译并运行 examples/stdasync4.c6（第八十批语言级 async 示例）
 make std-mesh     # 编译并运行 examples/stdmesh.c6（第八十一批 OBJ/STL/PLY/MTL 示例）
+make std-https    # 编译并运行 examples/stdhttps.c6（第八十二批 同步/异步 HTTPS + 性能指标）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

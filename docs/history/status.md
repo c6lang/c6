@@ -2615,6 +2615,43 @@ initialized`）；`ply` 的 `face(i)` 只重置了 `vidx` 没重置 `vpos`，重
 验收：`make stdtest`（337 个模块、0 failure）、`make std-mesh`（24 条自检全过）、
 `make check-all`。
 
+### 11.94 标准库第八十二批（同步/异步 HTTPS + 语言级 async 性能指标）
+
+第八十二批补齐「HTTPS 的同步与异步两条路」，并把**语言级 async 框架**（`async`/`await`/
+`co`/`task`/`c6_io`）的开销做成可测量的指标。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.net.tlskdf` | TLS 1.3 密钥调度 | `expand_label` 里手拼 `HkdfLabel`（`uint16(length) \| u8(len("tls13 "+label)) \| label \| u8(ctx_len) \| ctx`）；自测向量的期望值是用 Python `hmac`/`hashlib` 独立算出来的，其中 `early_secret` 与 RFC 8448 的 `33ad0a1c…` 逐字节相同，等于双向对齐了规范 |
+| `std.net.tlsrec` | TLS 1.3 记录层 | AEAD 严格按 RFC 8439：Poly1305 一次性密钥取 `chacha20_block(key,nonce,0)[0..32]`、密文用 `counter=1`；明文（payload‖type）先落到输出位置再**原地**异或，省掉一块 16 KiB 缓冲；tag 校验失败时不推进序号 |
+| `std.net.https` | 同步 HTTPS | fd + 响应缓冲都由调用方给，模块只管组请求、解头、按 `Content-Length` 读满；`use_tls` 之后请求按 23 号记录发出，响应记录解出来喂同一个解析器 |
+| `std.net.httpsa` | 异步 HTTPS | 与同步版同一个解析器，只把读写点换成 `await c6_io(fd, ev)`；async 函数不能是方法，所以句柄统一 `void *`；`co` 批量挂起多路，测试里两路同时挂在 `select()` 上 |
+| `std.async.abench` | async 性能指标 | 计时用 `now_ns()`（`CLOCK_MONOTONIC`）；三个入口分别量「建/跑/销毁任务」「一次挂起+恢复」「co 批量调度」；报告用手搓整数格式化，不依赖 printf |
+
+实测（本机 x86-64 + TCC 后端，`make std-https` 最后三行）：
+
+```
+async 任务创建+驱动+回收: 3000 ops / 521 us -> 5754115 ops/s (173 ns/op)
+async 一次挂起+恢复（await c6_io）: 500 ops / 1293 us -> 386592 ops/s (2586 ns/op)
+co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 ns/op)
+```
+
+踩到的坑：`shared` 是 c6 的保留字（`@shared` 的所有权修饰），参数名得改；`TlsRec`
+的字段 `records` 与 `records()` 方法撞名（`function pointer expected`）；`Https`/`HAsync`
+的字段 `secure` 与 `secure()` 同样撞名（改 `tls_on`）；`abench` 的 `fails()` 会与调用方
+文件里的同名静态变量在同一个符号空间里冲突（`incompatible types for redefinition of
+'std__async__abench__fails'`），改名 `fail_count()`；示例里把「响应缓冲」和「body 输出
+缓冲」用成同一块，`memcpy` 区域重叠导致 body 读出来是空的。
+
+错误号段继续追加：`std.net.tlskdf`=0x6151、`std.net.tlsrec`=0x6152、
+`std.net.https`=0x6153、`std.net.httpsa`=0x6154、`std.async.abench`=0x6155
+（`grammar.md` §8.1 同步）。`Makefile` 增加 `std-https` 与 `STD_HTTPS_SRCS`；五个模块在
+`stdtest` 里分别 49/34/36/36/31 条。示例 `examples/stdhttps.c6` 25 条自检 + 三行指标。
+
+验收：`make stdtest`（342 个模块、0 failure）、`make std-https`（25 条自检全过）、
+`make check-all`。
+
+
 
 
 

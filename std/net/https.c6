@@ -1,0 +1,626 @@
+/* std/net/https：**同步** HTTP/1.1 客户端（可选 TLS 1.3 记录层，fd 可插拔）。
+ *
+ *     import std.net.https;
+ *
+ *     Https h = { 0 };
+ *     char rbuf[4096] = { 0 };
+ *     h.attach(wfd, rfd, 0, rbuf, sizeof rbuf);      // 0 = 明文；1 = 走 TLS 记录
+ *     if (h.request("GET", "example.com", "/", "", 0, 0) > 0) {
+ *         int st = h.status();                        // 200
+ *         char cl[32] = { 0 };
+ *         h.header("Content-Length", cl, sizeof cl);
+ *         int n = h.body(buf, sizeof buf);            // → body 长度
+ *     }
+ *
+ * 这是「同步」的那一半：读写都是阻塞的 `read`/`write`，调用方线程被卡住直到响应完整。
+ * 想要不阻塞的版本用 `std.async.httpsa`（那套是 `async`/`await` + `c6_io`）。
+ *
+ * TLS 那层只做**记录层**（加密/解密 + 序号），握手与证书校验不在这里：
+ *
+ * - `h.use_tls(out_key, out_iv, in_key, in_iv)` 打开加密模式，
+ *   密钥/IV 通常来自 `std.net.tlskdf`（`Tls13` 的 `client_key`/`client_iv`）；
+ * - 加密模式下请求按 23 号记录（application_data）发出，响应记录解出来喂给同一个解析器；
+ * - 明文模式（`secure = 0`）与 `http://` 完全一致，方便在管道/自环上离线测试。
+ *
+ * 约定：
+ *
+ * - `h.attach(wfd, rfd, secure, rbuf, rcap)`：写/读两个 fd + 响应缓冲（缓冲要能装下
+ *   响应头 + 整个 body），`secure` 非 0 时先 `use_tls` 再 `attach`；
+ * - `h.request(method, host, path, extra_headers, body, blen)` 发请求并读到响应完整，
+ *   返回 body 长度（-1 表示出错）；`extra_headers` 是要原样追加的头（含 `\r\n`），
+ *   可以给 0；`Connection: close` 由本模块自动加上；
+ * - `h.status()` 状态码，`h.header("Name", out, cap)` 取头（大小写不敏感，找不到 -1），
+ *   `h.body(out, cap)` 取 body，`h.body_len()` body 长度；
+ * - `h.close_conn()` 关掉 fd；`h.requests()` 成功请求数；`h.secure()` 是否加密；
+ * - 只支持 HTTP/1.1 的定长 body：有 `Content-Length` 就按它读，没有就读到对端关闭；
+ *   `chunked` 与非 2xx 的处理留给调用方（本模块照样把 body 交出去）。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.net.https;
+import std.core.types;
+import std.text.str;
+import std.net.tlsrec;
+
+#define HTTPS_REQ_MAX 1200
+#define HTTPS_REC_MAX 16384
+
+struct Https {
+    int wfd;
+    int rfd;
+    int tls_on;     /* 字段名避开 secure() 方法 */
+    int timeout_ms;
+    int nreq;
+    int status_code;
+    int hdr_end;
+    int body_off;
+    int body_size;
+    int blen;
+    int bcap;
+    char *rbuf;
+    TlsRec tx;
+    TlsRec rx;
+};
+
+int attach(Https *h, int wfd, int rfd, int secure, char *rbuf, int rcap)
+{
+    if (!h || wfd < 0 || rfd < 0 || !rbuf || rcap <= 0)
+        return -1;
+    memset(h, 0, sizeof *h);
+    h->wfd = wfd;
+    h->rfd = rfd;
+    h->tls_on = secure ? 1 : 0;
+    h->rbuf = rbuf;
+    h->bcap = rcap;
+    h->timeout_ms = 0;
+    h->status_code = 0;
+    h->tx.init();
+    h->rx.init();
+    return 1;
+}
+
+int use_tls(Https *h, const void *out_key, const void *out_iv,
+            const void *in_key, const void *in_iv)
+{
+    if (!h || !out_key || !out_iv || !in_key || !in_iv)
+        return -1;
+    if (h->tx.set_key(out_key, out_iv) != 1 || h->rx.set_key(in_key, in_iv) != 1)
+        return -1;
+    h->tls_on = 1;
+    return 1;
+}
+
+int secure(Https *h)
+{
+    return h ? h->tls_on : 0;
+}
+
+int status(Https *h)
+{
+    return h ? h->status_code : 0;
+}
+
+int body_len(Https *h)
+{
+    return h ? h->body_size : 0;
+}
+
+long requests(Https *h)
+{
+    return h ? (long)h->nreq : 0;
+}
+
+/* ---- 底层读写：明文直接走 fd，加密走一条记录 ---- */
+
+static int https_write_all(Https *h, const char *p, int n)
+{
+    static u8 rec[HTTPS_REC_MAX + 64] = { 0 };
+    int off = 0;
+
+    if (!h->tls_on) {
+        while (off < n) {
+            int k = (int)write(h->wfd, p + off, (size_t)(n - off));
+
+            if (k <= 0)
+                return -1;
+            off += k;
+        }
+        return n;
+    }
+    while (off < n) {
+        int take = n - off;
+        int rn = 0;
+
+        if (take > HTTPS_REC_MAX)
+            take = HTTPS_REC_MAX;
+        rn = h->tx.encode(TLSREC_CT_APPDATA, p + off, take, rec, (int)sizeof rec);
+        if (rn <= 0)
+            return -1;
+        {
+            int w = 0;
+
+            while (w < rn) {
+                int k = (int)write(h->wfd, rec + w, (size_t)(rn - w));
+
+                if (k <= 0)
+                    return -1;
+                w += k;
+            }
+        }
+        off += take;
+    }
+    return n;
+}
+
+/* 读一条记录（加密模式）或一段字节（明文），把明文追加到 h->rbuf */
+static int https_read_more(Https *h)
+{
+    static u8 wire[HTTPS_REC_MAX + 64] = { 0 };
+
+    if (h->blen >= h->bcap - 1)
+        return -1;
+    if (!h->tls_on) {
+        int k = (int)read(h->rfd, h->rbuf + h->blen,
+                          (size_t)(h->bcap - 1 - h->blen));
+
+        if (k < 0)
+            return -1;
+        h->blen += k;
+        return k;
+    }
+    {
+        int got = 0;
+        int body = 0;
+        int plain = 0;
+        int type = 0;
+
+        while (got < 5) {
+            int k = (int)read(h->rfd, wire + got, (size_t)(5 - got));
+
+            if (k < 0)
+                return -1;
+            if (k == 0)
+                return 0;
+            got += k;
+        }
+        body = ((int)wire[3] << 8) | (int)wire[4];
+        if (body < 0 || body > HTTPS_REC_MAX)
+            return -1;
+        while (got < 5 + body) {
+            int k = (int)read(h->rfd, wire + got, (size_t)(5 + body - got));
+
+            if (k <= 0)
+                return -1;
+            got += k;
+        }
+        plain = h->rx.decode(wire, 5 + body, h->rbuf + h->blen,
+                             h->bcap - 1 - h->blen, &type);
+        if (plain < 0)
+            return -1;
+        h->blen += plain;
+        return plain;
+    }
+}
+
+static int https_ci_find(const char *hay, int hlen, const char *needle)
+{
+    int n = (int)strlen(needle);
+    int i = 0;
+
+    for (i = 0; i + n <= hlen; i++) {
+        int k = 0;
+
+        for (k = 0; k < n; k++) {
+            char a = hay[i + k], b = needle[k];
+
+            if (a >= 'A' && a <= 'Z')
+                a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z')
+                b = (char)(b - 'A' + 'a');
+            if (a != b)
+                break;
+        }
+        if (k == n)
+            return i;
+    }
+    return -1;
+}
+
+/* 头里找 "name: value"，返回 value 起点相对位置，value 长度写进 *vlen */
+static int https_find_header(Https *h, const char *name, int *vlen)
+{
+    int limit = h->hdr_end > 0 ? h->hdr_end : h->blen;
+    int nlen = (int)strlen(name);
+    int at = 0;
+
+    while (at < limit) {
+        int line_end = at;
+
+        while (line_end < limit && !(h->rbuf[line_end] == '\r'
+                                     && h->rbuf[line_end + 1] == '\n'))
+            line_end++;
+        /* 行首是不是 name + ':' */
+        if (line_end - at > nlen && h->rbuf[at + nlen] == ':') {
+            int k = 0;
+            int hit = 1;
+
+            for (k = 0; k < nlen; k++) {
+                char a = h->rbuf[at + k], b = name[k];
+
+                if (a >= 'A' && a <= 'Z')
+                    a = (char)(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z')
+                    b = (char)(b - 'A' + 'a');
+                if (a != b) {
+                    hit = 0;
+                    break;
+                }
+            }
+            if (hit) {
+                int v = at + nlen + 1;
+
+                while (v < line_end && (h->rbuf[v] == ' ' || h->rbuf[v] == '\t'))
+                    v++;
+                if (vlen)
+                    *vlen = line_end - v;
+                return v;
+            }
+        }
+        at = line_end + 2;
+    }
+    return -1;
+}
+
+int header(Https *h, const char *name, char *out, int cap)
+{
+    int vlen = 0;
+    int at = 0;
+
+    if (!h || !name || !out || cap <= 0)
+        return -1;
+    at = https_find_header(h, name, &vlen);
+    if (at < 0)
+        return -1;
+    if (vlen > cap - 1)
+        vlen = cap - 1;
+    memcpy(out, h->rbuf + at, (size_t)vlen);
+    out[vlen] = '\0';
+    return vlen;
+}
+
+int body(Https *h, char *out, int cap)
+{
+    if (!h || !out || cap < 0)
+        return -1;
+    if (h->body_size > cap)
+        return -1;
+    if (h->body_size > 0)
+        memcpy(out, h->rbuf + h->body_off, (size_t)h->body_size);
+    return h->body_size;
+}
+
+/* 解析状态行与头，返回 1 表示头完整 */
+static int https_parse_head(Https *h)
+{
+    int i = 0;
+    int at = 0;
+
+    h->hdr_end = 0;
+    for (i = 0; i + 3 < h->blen; i++) {
+        if (h->rbuf[i] == '\r' && h->rbuf[i + 1] == '\n'
+            && h->rbuf[i + 2] == '\r' && h->rbuf[i + 3] == '\n') {
+            h->hdr_end = i + 4;
+            break;
+        }
+    }
+    if (h->hdr_end == 0)
+        return 0;
+    /* 状态行 "HTTP/1.1 200 OK" */
+    h->status_code = 0;
+    for (i = 0; i < h->hdr_end && h->rbuf[i] != '\n'; i++) {
+        if (h->rbuf[i] == ' ' && i + 1 < h->hdr_end) {
+            int k = i + 1;
+            int code = 0;
+
+            while (k < h->hdr_end && h->rbuf[k] >= '0' && h->rbuf[k] <= '9') {
+                code = code * 10 + (h->rbuf[k] - '0');
+                k++;
+            }
+            if (k > i + 1) {
+                h->status_code = code;
+                break;
+            }
+        }
+    }
+    h->body_off = h->hdr_end;
+    at = https_find_header(h, "Content-Length", &i);
+    if (at >= 0) {
+        int len = 0;
+
+        while (at < h->hdr_end && h->rbuf[at] >= '0' && h->rbuf[at] <= '9') {
+            len = len * 10 + (h->rbuf[at] - '0');
+            at++;
+        }
+        h->body_size = len;
+    } else {
+        h->body_size = -1;              /* 没有长度：读到对端关闭 */
+    }
+    return 1;
+}
+
+int request(Https *h, const char *method, const char *host, const char *path,
+            const char *extra, const void *bdy, int blen)
+{
+    char req[HTTPS_REQ_MAX] = { 0 };
+    int n = 0;
+    int i = 0;
+
+    if (!h || !method || !host || !path || blen < 0)
+        return -1;
+    if (blen > 0 && !bdy)
+        return -1;
+    /* 组请求行 + 必要的头；体可能很长，所以头与体分两次写 */
+    for (i = 0; method[i] && n < (int)sizeof req - 1; i++)
+        req[n++] = method[i];
+    req[n++] = ' ';
+    for (i = 0; path[i] && n < (int)sizeof req - 200; i++)
+        req[n++] = path[i];
+    req[n++] = ' ';
+    req[n++] = 'H';
+    req[n++] = 'T';
+    req[n++] = 'T';
+    req[n++] = 'P';
+    req[n++] = '/';
+    req[n++] = '1';
+    req[n++] = '.';
+    req[n++] = '1';
+    req[n++] = '\r';
+    req[n++] = '\n';
+    {
+        static const char *k_host = "Host: ";
+        static const char *k_close = "Connection: close\r\n";
+
+        for (i = 0; k_host[i]; i++)
+            req[n++] = k_host[i];
+        for (i = 0; host[i] && n < (int)sizeof req - 120; i++)
+            req[n++] = host[i];
+        req[n++] = '\r';
+        req[n++] = '\n';
+        if (blen > 0) {
+            char num[16] = { 0 };
+            int v = blen;
+            int k = 0;
+
+            while (v > 0 && k < (int)sizeof num) {
+                num[k++] = (char)('0' + v % 10);
+                v /= 10;
+            }
+            {
+                static const char *k_cl = "Content-Length: ";
+                static const char *k_type = "Content-Type: application/octet-stream\r\n";
+
+                for (i = 0; k_cl[i]; i++)
+                    req[n++] = k_cl[i];
+                while (k > 0)
+                    req[n++] = num[--k];
+                req[n++] = '\r';
+                req[n++] = '\n';
+                for (i = 0; k_type[i] && n < (int)sizeof req - 8; i++)
+                    req[n++] = k_type[i];
+            }
+        }
+        if (extra) {
+            for (i = 0; extra[i] && n < (int)sizeof req - 1; i++)
+                req[n++] = extra[i];
+        }
+        for (i = 0; k_close[i] && n < (int)sizeof req - 1; i++)
+            req[n++] = k_close[i];
+        req[n++] = '\r';
+        req[n++] = '\n';
+    }
+    if (https_write_all(h, req, n) != n)
+        return -1;
+    if (blen > 0 && https_write_all(h, (const char *)bdy, blen) != blen)
+        return -1;
+    /* 读响应 */
+    h->blen = 0;
+    h->hdr_end = 0;
+    h->body_size = 0;
+    h->status_code = 0;
+    for (;;) {
+        int need = 0;
+
+        if (h->blen > 0 && h->hdr_end == 0)
+            https_parse_head(h);
+        if (h->hdr_end > 0) {
+            need = h->body_size >= 0 ? h->body_size : -1;
+            if (need >= 0 && h->blen >= h->hdr_end + need)
+                break;
+        }
+        {
+            int k = https_read_more(h);
+
+            if (k < 0)
+                return -1;
+            if (k == 0 && h->hdr_end == 0)
+                return -1;              /* 对端先关了，还没拿到头 */
+            if (k == 0 && need < 0) {
+                h->body_size = h->blen - h->hdr_end;
+                break;                  /* 没长度：读到关闭为止 */
+            }
+        }
+        if (h->blen >= h->bcap - 1)
+            return -1;                  /* 缓冲满了 */
+    }
+    if (h->body_size < 0)
+        h->body_size = h->blen - h->hdr_end;
+    h->nreq++;
+    return h->body_size;
+}
+
+int close_conn(Https *h)
+{
+    if (!h)
+        return -1;
+    if (h->wfd >= 0)
+        close(h->wfd);
+    if (h->rfd >= 0 && h->rfd != h->wfd)
+        close(h->rfd);
+    h->wfd = -1;
+    h->rfd = -1;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static const char *https_fake_resp =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 11\r\n"
+    "Content-Type: text/plain\r\n"
+    "Server: c6\r\n"
+    "\r\n"
+    "hello world";
+
+test "https：同步请求、状态码与头" {
+    int req[2] = { -1, -1 };
+    int resp[2] = { -1, -1 };
+    char rbuf[512] = { 0 };
+    char out[64] = { 0 };
+    Https h = { 0 };
+    char seen[512] = { 0 };
+    int n = 0;
+
+    if (pipe(req) != 0 || pipe(resp) != 0)
+        return err(1, "pipe 失败");
+    if (h.attach(req[1], resp[0], 0, rbuf, (int)sizeof rbuf) != 1)
+        return err(2, "attach 失败");
+    if (h.secure() || h.status() != 0)
+        return err(3, "初始状态不对");
+    write(resp[1], https_fake_resp, (int)strlen(https_fake_resp));
+    n = h.request("GET", "example.com", "/index.html", "Accept: */*\r\n", 0, 0);
+    if (n != 11)
+        return err(4, "body 长度应该是 11");
+    if (h.status() != 200)
+        return err(5, "状态码应该是 200");
+    if (h.header("Content-Type", out, (int)sizeof out) != 10
+        || strcmp(out, "text/plain") != 0)
+        return err(6, "Content-Type 不对");
+    /* 大小写不敏感 */
+    if (h.header("server", out, (int)sizeof out) != 2 || strcmp(out, "c6") != 0)
+        return err(7, "头名应该大小写不敏感");
+    if (h.header("X-Missing", out, (int)sizeof out) != -1)
+        return err(8, "不存在的头应该 -1");
+    if (h.body(out, (int)sizeof out) != 11 || memcmp(out, "hello world", 11) != 0)
+        return err(9, "body 内容不对");
+    if (h.body_len() != 11 || h.requests() != 1)
+        return err(10, "body_len/requests 不对");
+    /* 请求行确实发出去了 */
+    {
+        int got = (int)read(req[0], seen, sizeof seen);
+
+        if (got <= 0)
+            return err(11, "请求没发出来");
+        if (seen[0] != 'G' || seen[1] != 'E' || seen[2] != 'T')
+            return err(12, "请求行应该以 GET 开头");
+        seen[got < (int)sizeof seen ? got : (int)sizeof seen - 1] = '\0';
+        if (strstr(seen, "Host: example.com") == 0)
+            return err(13, "缺 Host 头");
+        if (strstr(seen, "Connection: close") == 0)
+            return err(14, "缺 Connection: close");
+    }
+    h.close_conn();
+    close(req[0]);
+    close(resp[1]);
+}
+
+test "https：TLS 记录层加解密往返与 POST" {
+    int req[2] = { -1, -1 };
+    int resp[2] = { -1, -1 };
+    char rbuf[1024] = { 0 };
+    char out[64] = { 0 };
+    Https h = { 0 };
+    TlsRec srv_rx = { 0 };
+    TlsRec srv_tx = { 0 };
+    u8 ckey[32] = { 0 }, ckeys[32] = { 0 };
+    u8 civ[12] = { 0 }, siv[12] = { 0 };
+    u8 wire[1024] = { 0 };
+    u8 plain[1024] = { 0 };
+    int i = 0;
+    int rn = 0;
+    int pn = 0;
+    int type = 0;
+
+    for (i = 0; i < 32; i++) {
+        ckey[i] = (u8)(i + 1);
+        ckeys[i] = (u8)(0x80 + i);
+    }
+    for (i = 0; i < 12; i++) {
+        civ[i] = (u8)(0x10 + i);
+        siv[i] = (u8)(0x40 + i);
+    }
+    if (pipe(req) != 0 || pipe(resp) != 0)
+        return err(15, "pipe 失败");
+    srv_rx.init();
+    srv_tx.init();
+    /* 服务端：用 client 的 key 解请求、用自己的 key 加密响应 */
+    srv_rx.set_key(ckey, civ);
+    srv_tx.set_key(ckeys, siv);
+    /* 先把加密响应塞进 resp 管道 */
+    {
+        static const char *body = "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
+
+        rn = srv_tx.encode(TLSREC_CT_APPDATA, body, (int)strlen(body), wire,
+                           (int)sizeof wire);
+        if (rn <= 0)
+            return err(16, "服务端加密失败");
+        if (write(resp[1], wire, (size_t)rn) != rn)
+            return err(17, "响应写不进去");
+    }
+    if (h.attach(req[1], resp[0], 1, rbuf, (int)sizeof rbuf) != 1)
+        return err(18, "attach(secure) 失败");
+    if (h.use_tls(ckey, civ, ckeys, siv) != 1 || !h.secure())
+        return err(19, "use_tls 失败");
+    if (h.request("POST", "api.example", "/v1", "", "data!", 5) != 2)
+        return err(20, "加密响应解析失败");
+    if (h.status() != 201)
+        return err(21, "状态码应该是 201");
+    if (h.body(out, (int)sizeof out) != 2 || memcmp(out, "ok", 2) != 0)
+        return err(22, "加密响应 body 不对");
+    /* 服务端解出请求：必须是两条记录（头 + 体）或一条，反正要能解干净 */
+    {
+        int total = 0;
+
+        while (total < (int)sizeof plain) {
+            int got = 0;
+            int body = 0;
+
+            if (read(req[0], wire + got, 5) != 5)
+                break;
+            body = ((int)wire[3] << 8) | (int)wire[4];
+            got = 5;
+            while (got < 5 + body) {
+                int k = (int)read(req[0], wire + got, (size_t)(5 + body - got));
+
+                if (k <= 0)
+                    break;
+                got += k;
+            }
+            pn = srv_rx.decode(wire, 5 + body, plain + total,
+                               (int)sizeof plain - total, &type);
+            if (pn < 0)
+                return err(23, "服务端解不开请求记录");
+            total += pn;
+            if (strstr((char *)plain, "data!") != 0 || total > 200)
+                break;
+        }
+        plain[total < (int)sizeof plain ? total : (int)sizeof plain - 1] = 0;
+        if (strstr((char *)plain, "POST /v1 HTTP/1.1") == 0)
+            return err(24, "请求行没解出来");
+        if (strstr((char *)plain, "data!") == 0)
+            return err(25, "请求体没解出来");
+    }
+    h.close_conn();
+    close(req[0]);
+    close(resp[1]);
+}

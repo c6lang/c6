@@ -1,0 +1,587 @@
+/* std/net/httpsa：**异步** HTTP/1.1(S) 客户端（语言级 `async`/`await`/`c6_io`，可选 TLS 记录层）。
+ *
+ *     import std.net.httpsa;
+ *
+ *     HAsync h = { 0 };
+ *     char rbuf[4096] = { 0 };
+ *     h.attach(wfd, rfd, 0, rbuf, sizeof rbuf);        // 方法：attach / use_tls / status
+ *     task t = httpsa_get(&h, "example.com", "/");     // 建任务，不阻塞
+ *     co httpsa_get(&h, "example.com", "/health");     // 顶层任务，交给 __c6_co_run()
+ *     __c6_co_wait(t);                                 // 驱动到完成
+ *     int n = t->val;                                  // body 长度
+ *
+ * 与 `std.net.https`（同步版）是一对：**同一个** 解析器与记录层，区别只在读写点——
+ * 同步版直接 `read`/`write` 把线程卡住；这里每个读写点都是
+ *
+ *     await c6_io(fd, C6_CO_EV_READ);   /   await c6_io(fd, C6_CO_EV_WRITE);
+ *
+ * 于是挂起的是**任务**而不是线程：一个线程可以同时挂着成百上千条连接，谁就绪谁继续。
+ * 编译器的 `co` / `task` / `__c6_co_run()` 就是驱动方，`await` 的恢复点由编译器生成。
+ *
+ * 约定（为什么是 `void *` 句柄）：
+ *
+ * - c6 的编译器**不允许 async 函数当方法**（`'async' functions cannot be methods`），
+ *   所以 async 函数统一把 `HAsync *` 收成 `void *` 第一参数：`httpsa_get(&h, …)`；
+ *   非 async 的辅助函数仍然是方法（`h.attach(…)`、`h.status()`、`h.use_tls(…)`）；
+ * - `h.attach(wfd, rfd, secure, rbuf, rcap)`：写/读两个 fd + 响应缓冲；`secure` 非 0 时
+ *   先 `h.use_tls(out_key, out_iv, in_key, in_iv)` 再 attach（密钥来自 `std.net.tlskdf`）；
+ * - `await httpsa_get(&h, host, path)` / `await httpsa_request(&h, method, host, path,
+ *   extra, body, blen)`：发出请求并读到响应完整，返回 body 长度（-1 出错）；
+ * - `await httpsa_send(&h, p, n)` / `await httpsa_recv(&h)` 是更低一层的两个原语：
+ *   一个写完整段（加密模式自动切记录），一个读一步（返回新增明文字节数，0 = EOF）；
+ * - 结果查询都是普通方法：`h.status()` / `h.header(…)` / `h.body(…)` / `h.body_len()`；
+ * - 同一个 `HAsync` 不要并发跑两个请求（解析状态在句柄里），要并发就用多个句柄 +
+ *   多个 `task`，这才是这套东西的用法。
+ */
+#include <string.h>
+#include <unistd.h>
+
+module std.net.httpsa;
+import std.core.types;
+import std.text.str;
+import std.net.tlsrec;
+
+#define HTTPSA_REQ_MAX 1200
+#define HTTPSA_CHUNK 1024
+
+struct HAsync {
+    int wfd;
+    int rfd;
+    int tls_on;
+    char *rbuf;
+    int bcap;
+    int blen;
+    int status_code;
+    int hdr_end;
+    int body_off;
+    int body_size;
+    int nreq;
+    TlsRec tx;
+    TlsRec rx;
+};
+
+int attach(HAsync *h, int wfd, int rfd, int secure, char *rbuf, int rcap)
+{
+    if (!h || wfd < 0 || rfd < 0 || !rbuf || rcap <= 0)
+        return -1;
+    memset(h, 0, sizeof *h);
+    h->wfd = wfd;
+    h->rfd = rfd;
+    h->tls_on = secure ? 1 : 0;
+    h->rbuf = rbuf;
+    h->bcap = rcap;
+    h->tx.init();
+    h->rx.init();
+    return 1;
+}
+
+int use_tls(HAsync *h, const void *out_key, const void *out_iv,
+            const void *in_key, const void *in_iv)
+{
+    if (!h || !out_key || !out_iv || !in_key || !in_iv)
+        return -1;
+    if (h->tx.set_key(out_key, out_iv) != 1 || h->rx.set_key(in_key, in_iv) != 1)
+        return -1;
+    h->tls_on = 1;
+    return 1;
+}
+
+int secure(HAsync *h)
+{
+    return h ? h->tls_on : 0;
+}
+
+int status(HAsync *h)
+{
+    return h ? h->status_code : 0;
+}
+
+int body_len(HAsync *h)
+{
+    return h ? h->body_size : 0;
+}
+
+long requests(HAsync *h)
+{
+    return h ? (long)h->nreq : 0;
+}
+
+static int httpsa_ci_find(const char *hay, int hlen, const char *needle)
+{
+    int n = (int)strlen(needle);
+    int i = 0;
+
+    for (i = 0; i + n <= hlen; i++) {
+        int k = 0;
+
+        for (k = 0; k < n; k++) {
+            char a = hay[i + k], b = needle[k];
+
+            if (a >= 'A' && a <= 'Z')
+                a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z')
+                b = (char)(b - 'A' + 'a');
+            if (a != b)
+                break;
+        }
+        if (k == n)
+            return i;
+    }
+    return -1;
+}
+
+static int httpsa_find_header(HAsync *h, const char *name, int *vlen)
+{
+    int limit = h->hdr_end > 0 ? h->hdr_end : h->blen;
+    int nlen = (int)strlen(name);
+    int at = 0;
+
+    while (at < limit) {
+        int line_end = at;
+
+        while (line_end < limit && !(h->rbuf[line_end] == '\r'
+                                     && h->rbuf[line_end + 1] == '\n'))
+            line_end++;
+        if (line_end - at > nlen && h->rbuf[at + nlen] == ':') {
+            int k = 0;
+            int hit = 1;
+
+            for (k = 0; k < nlen; k++) {
+                char a = h->rbuf[at + k], b = name[k];
+
+                if (a >= 'A' && a <= 'Z')
+                    a = (char)(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z')
+                    b = (char)(b - 'A' + 'a');
+                if (a != b) {
+                    hit = 0;
+                    break;
+                }
+            }
+            if (hit) {
+                int v = at + nlen + 1;
+
+                while (v < line_end && (h->rbuf[v] == ' ' || h->rbuf[v] == '\t'))
+                    v++;
+                if (vlen)
+                    *vlen = line_end - v;
+                return v;
+            }
+        }
+        at = line_end + 2;
+    }
+    return -1;
+}
+
+int header(HAsync *h, const char *name, char *out, int cap)
+{
+    int vlen = 0;
+    int at = 0;
+
+    if (!h || !name || !out || cap <= 0)
+        return -1;
+    at = httpsa_find_header(h, name, &vlen);
+    if (at < 0)
+        return -1;
+    if (vlen > cap - 1)
+        vlen = cap - 1;
+    memcpy(out, h->rbuf + at, (size_t)vlen);
+    out[vlen] = '\0';
+    return vlen;
+}
+
+int body(HAsync *h, char *out, int cap)
+{
+    if (!h || !out || cap < 0)
+        return -1;
+    if (h->body_size > cap)
+        return -1;
+    if (h->body_size > 0)
+        memcpy(out, h->rbuf + h->body_off, (size_t)h->body_size);
+    return h->body_size;
+}
+
+static int httpsa_parse_head(HAsync *h)
+{
+    int i = 0;
+    int at = 0;
+    int vlen = 0;
+
+    h->hdr_end = 0;
+    for (i = 0; i + 3 < h->blen; i++) {
+        if (h->rbuf[i] == '\r' && h->rbuf[i + 1] == '\n'
+            && h->rbuf[i + 2] == '\r' && h->rbuf[i + 3] == '\n') {
+            h->hdr_end = i + 4;
+            break;
+        }
+    }
+    if (h->hdr_end == 0)
+        return 0;
+    h->status_code = 0;
+    for (i = 0; i < h->hdr_end && h->rbuf[i] != '\n'; i++) {
+        if (h->rbuf[i] == ' ' && i + 1 < h->hdr_end) {
+            int k = i + 1;
+            int code = 0;
+
+            while (k < h->hdr_end && h->rbuf[k] >= '0' && h->rbuf[k] <= '9') {
+                code = code * 10 + (h->rbuf[k] - '0');
+                k++;
+            }
+            if (k > i + 1) {
+                h->status_code = code;
+                break;
+            }
+        }
+    }
+    h->body_off = h->hdr_end;
+    at = httpsa_find_header(h, "Content-Length", &vlen);
+    if (at >= 0) {
+        int len = 0;
+
+        while (at < h->hdr_end && h->rbuf[at] >= '0' && h->rbuf[at] <= '9') {
+            len = len * 10 + (h->rbuf[at] - '0');
+            at++;
+        }
+        h->body_size = len;
+    } else {
+        h->body_size = -1;
+    }
+    return 1;
+}
+
+/* ---- 三个 async 原语 ---- */
+
+/* 写完整段；加密模式下按记录切块 */
+async int httpsa_send(void *hp, const void *p, int n)
+{
+    HAsync *h = (HAsync *)hp;
+    const char *src = (const char *)p;
+    u8 wire[HTTPSA_CHUNK + 64] = { 0 };
+    int off = 0;
+
+    if (!h || !p || n < 0)
+        return -1;
+    if (!h->tls_on) {
+        while (off < n) {
+            int k = 0;
+
+            await c6_io(h->wfd, C6_CO_EV_WRITE);
+            k = (int)write(h->wfd, src + off, (size_t)(n - off));
+            if (k <= 0)
+                return -1;
+            off += k;
+        }
+        return n;
+    }
+    while (off < n) {
+        int take = n - off;
+        int rn = 0;
+        int w = 0;
+
+        if (take > HTTPSA_CHUNK)
+            take = HTTPSA_CHUNK;
+        rn = h->tx.encode(TLSREC_CT_APPDATA, src + off, take, wire,
+                          (int)sizeof wire);
+        if (rn <= 0)
+            return -1;
+        while (w < rn) {
+            int k = 0;
+
+            await c6_io(h->wfd, C6_CO_EV_WRITE);
+            k = (int)write(h->wfd, wire + w, (size_t)(rn - w));
+            if (k <= 0)
+                return -1;
+            w += k;
+        }
+        off += take;
+    }
+    return n;
+}
+
+/* 读一步：返回新增的明文字节数，0 = 对端关闭，-1 = 出错 */
+async int httpsa_recv(void *hp)
+{
+    HAsync *h = (HAsync *)hp;
+    u8 wire[HTTPSA_CHUNK + 64] = { 0 };
+
+    if (!h)
+        return -1;
+    if (h->blen >= h->bcap - 1)
+        return -1;
+    if (!h->tls_on) {
+        int k = 0;
+
+        await c6_io(h->rfd, C6_CO_EV_READ);
+        k = (int)read(h->rfd, h->rbuf + h->blen,
+                      (size_t)(h->bcap - 1 - h->blen));
+        if (k < 0)
+            return -1;
+        h->blen += k;
+        return k;
+    }
+    {
+        int got = 0;
+        int body = 0;
+        int plain = 0;
+        int type = 0;
+
+        while (got < 5) {
+            int k = 0;
+
+            await c6_io(h->rfd, C6_CO_EV_READ);
+            k = (int)read(h->rfd, wire + got, (size_t)(5 - got));
+            if (k < 0)
+                return -1;
+            if (k == 0)
+                return 0;
+            got += k;
+        }
+        body = ((int)wire[3] << 8) | (int)wire[4];
+        if (body < 0 || body > HTTPSA_CHUNK + 32)
+            return -1;
+        while (got < 5 + body) {
+            int k = 0;
+
+            await c6_io(h->rfd, C6_CO_EV_READ);
+            k = (int)read(h->rfd, wire + got, (size_t)(5 + body - got));
+            if (k <= 0)
+                return -1;
+            got += k;
+        }
+        plain = h->rx.decode(wire, 5 + body, h->rbuf + h->blen,
+                             h->bcap - 1 - h->blen, &type);
+        if (plain < 0)
+            return -1;
+        h->blen += plain;
+        return plain;
+    }
+}
+
+/* 组请求：请求行 + Host + Content-Length + 额外头 + Connection: close */
+async int httpsa_request(void *hp, const char *method, const char *host,
+                         const char *path, const char *extra, const void *bdy,
+                         int blen)
+{
+    HAsync *h = (HAsync *)hp;
+    char req[HTTPSA_REQ_MAX] = { 0 };
+    int n = 0;
+    int i = 0;
+
+    if (!h || !method || !host || !path || blen < 0)
+        return -1;
+    if (blen > 0 && !bdy)
+        return -1;
+    for (i = 0; method[i] && n < (int)sizeof req - 300; i++)
+        req[n++] = method[i];
+    req[n++] = ' ';
+    for (i = 0; path[i] && n < (int)sizeof req - 280; i++)
+        req[n++] = path[i];
+    req[n++] = ' ';
+    for (i = 0; "HTTP/1.1\r\n"[i]; i++)
+        req[n++] = "HTTP/1.1\r\n"[i];
+    for (i = 0; "Host: "[i]; i++)
+        req[n++] = "Host: "[i];
+    for (i = 0; host[i] && n < (int)sizeof req - 180; i++)
+        req[n++] = host[i];
+    req[n++] = '\r';
+    req[n++] = '\n';
+    if (blen > 0) {
+        char num[16] = { 0 };
+        int v = blen;
+        int k = 0;
+
+        while (v > 0 && k < (int)sizeof num) {
+            num[k++] = (char)('0' + v % 10);
+            v /= 10;
+        }
+        for (i = 0; "Content-Length: "[i]; i++)
+            req[n++] = "Content-Length: "[i];
+        while (k > 0)
+            req[n++] = num[--k];
+        req[n++] = '\r';
+        req[n++] = '\n';
+    }
+    if (extra) {
+        for (i = 0; extra[i] && n < (int)sizeof req - 40; i++)
+            req[n++] = extra[i];
+    }
+    for (i = 0; "Connection: close\r\n\r\n"[i]; i++)
+        req[n++] = "Connection: close\r\n\r\n"[i];
+    if (await httpsa_send(h, req, n) != n)
+        return -1;
+    if (blen > 0 && await httpsa_send(h, bdy, blen) != blen)
+        return -1;
+    h->blen = 0;
+    h->hdr_end = 0;
+    h->body_size = 0;
+    h->status_code = 0;
+    for (;;) {
+        int need = 0;
+        int k = 0;
+
+        if (h->blen > 0 && h->hdr_end == 0)
+            httpsa_parse_head(h);
+        if (h->hdr_end > 0) {
+            need = h->body_size;
+            if (need >= 0 && h->blen >= h->hdr_end + need)
+                break;
+        }
+        k = await httpsa_recv(h);
+        if (k < 0)
+            return -1;
+        if (k == 0) {
+            if (h->hdr_end == 0)
+                return -1;
+            h->body_size = h->blen - h->hdr_end;
+            break;
+        }
+        if (h->blen >= h->bcap - 1)
+            return -1;
+    }
+    if (h->body_size < 0)
+        h->body_size = h->blen - h->hdr_end;
+    h->nreq++;
+    return h->body_size;
+}
+
+async int httpsa_get(void *hp, const char *host, const char *path)
+{
+    return await httpsa_request(hp, "GET", host, path, 0, 0, 0);
+}
+
+async int httpsa_post(void *hp, const char *host, const char *path,
+                      const void *bdy, int blen)
+{
+    return await httpsa_request(hp, "POST", host, path, 0, bdy, blen);
+}
+
+int close_conn(HAsync *h)
+{
+    if (!h)
+        return -1;
+    if (h->wfd >= 0)
+        close(h->wfd);
+    if (h->rfd >= 0 && h->rfd != h->wfd)
+        close(h->rfd);
+    h->wfd = -1;
+    h->rfd = -1;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static const char *httpsa_fake_resp =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 5\r\n"
+    "X-Mode: async\r\n"
+    "\r\n"
+    "async";
+
+test "httpsa：task 句柄驱动一次 GET" {
+    int req[2] = { -1, -1 };
+    int resp[2] = { -1, -1 };
+    char rbuf[512] = { 0 };
+    char out[64] = { 0 };
+    HAsync h = { 0 };
+    struct httpsa_get_task *t = 0;
+
+    if (pipe(req) != 0 || pipe(resp) != 0)
+        return err(1, "pipe 失败");
+    if (h.attach(req[1], resp[0], 0, rbuf, (int)sizeof rbuf) != 1)
+        return err(2, "attach 失败");
+    write(resp[1], httpsa_fake_resp, (int)strlen(httpsa_fake_resp));
+    t = httpsa_get(&h, "example.com", "/a");
+    /* 建任务时还没跑：状态是挂起值 */
+    if (t == 0)
+        return err(3, "建任务失败");
+    if (__c6_co_wait(t) != 0)
+        return err(4, "驱动任务失败");
+    if (t->val != 5)
+        return err(5, "body 长度应该是 5");
+    __c6_co_destroy(t);
+    if (h.status() != 200 || h.body_len() != 5)
+        return err(6, "状态码/body_len 不对");
+    if (h.header("X-Mode", out, (int)sizeof out) != 5
+        || strcmp(out, "async") != 0)
+        return err(7, "X-Mode 头不对");
+    if (h.body(out, (int)sizeof out) != 5 || memcmp(out, "async", 5) != 0)
+        return err(8, "body 内容不对");
+    if (h.requests() != 1 || h.secure() != 0)
+        return err(9, "requests/secure 不对");
+    h.close_conn();
+    close(req[0]);
+    close(resp[1]);
+}
+
+test "httpsa：co 顶层任务 + TLS 记录层 + POST" {
+    int req[2] = { -1, -1 };
+    int resp[2] = { -1, -1 };
+    char rbuf[1024] = { 0 };
+    HAsync h = { 0 };
+    HAsync h2 = { 0 };
+    TlsRec srv_tx = { 0 };
+    u8 ckey[32] = { 0 }, skey[32] = { 0 };
+    u8 civ[12] = { 0 }, siv[12] = { 0 };
+    u8 wire[512] = { 0 };
+    int i = 0;
+    int rn = 0;
+
+    for (i = 0; i < 32; i++) {
+        ckey[i] = (u8)(i * 3 + 1);
+        skey[i] = (u8)(0xf0 - i);
+    }
+    for (i = 0; i < 12; i++) {
+        civ[i] = (u8)(i + 1);
+        siv[i] = (u8)(0x30 + i);
+    }
+    /* 明文：用 co 关键字发起的顶层任务 */
+    {
+        static const char *resp_plain =
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+        char buf2[256] = { 0 };
+
+        if (pipe(req) != 0 || pipe(resp) != 0)
+            return err(10, "pipe 失败");
+        h2.attach(req[1], resp[0], 0, buf2, (int)sizeof buf2);
+        write(resp[1], resp_plain, (int)strlen(resp_plain));
+        co httpsa_get(&h2, "h", "/");
+        if (__c6_co_run() != 0)
+            return err(11, "co 任务失败");
+        if (h2.status() != 204 || h2.body_len() != 0)
+            return err(12, "204 响应不对");
+        h2.close_conn();
+        close(req[0]);
+        close(resp[1]);
+    }
+    /* 加密：POST 请求按记录层发出，响应也是记录 */
+    {
+        static const char *body = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nrecv";
+        struct httpsa_post_task *t = 0;
+        char out[8] = { 0 };
+
+        if (pipe(req) != 0 || pipe(resp) != 0)
+            return err(13, "pipe 失败");
+        srv_tx.init();
+        srv_tx.set_key(skey, siv);
+        rn = srv_tx.encode(TLSREC_CT_APPDATA, body, (int)strlen(body), wire,
+                           (int)sizeof wire);
+        if (rn <= 0)
+            return err(14, "服务端加密失败");
+        if (write(resp[1], wire, (size_t)rn) != rn)
+            return err(15, "响应写不进去");
+        h.attach(req[1], resp[0], 1, rbuf, (int)sizeof rbuf);
+        if (h.use_tls(ckey, civ, skey, siv) != 1 || !h.secure())
+            return err(16, "use_tls 失败");
+        t = httpsa_post(&h, "api", "/v1", "pay", 3);
+        if (__c6_co_wait(t) != 0 || t->val != 4)
+            return err(17, "加密 POST 失败");
+        __c6_co_destroy(t);
+        if (h.status() != 200)
+            return err(18, "状态码不对");
+        if (h.body(out, (int)sizeof out) != 4 || memcmp(out, "recv", 4) != 0)
+            return err(19, "加密响应的 body 不对");
+        h.close_conn();
+        close(req[0]);
+        close(resp[1]);
+    }
+}

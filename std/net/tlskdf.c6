@@ -1,0 +1,413 @@
+/* std/net/tlskdf：TLS 1.3 的密钥调度（RFC 8446 §7.1，SHA-256 套件）。
+ *
+ *     import std.net.tlskdf;
+ *
+ *     Tls13 ks = { 0 };
+ *     ks.handshake(ecdhe, 32, transcript_hash, 32);   // 方法：一次算完
+ *     u8 key[32] = { 0 }, iv[12] = { 0 };
+ *     ks.client_key(key);                              // 握手期 client 写密钥
+ *     ks.client_iv(iv);
+ *     ks.app_client_key(key);                          // 应用期
+ *     ks.verify_data(0, thash, 32, out32);             // Finished 的 verify_data
+ *
+ * 派生链（与 RFC 8446 §7.1 一致，`Hash` 固定 SHA-256）：
+ *
+ *     early_secret      = HKDF-Extract(0, 0)
+ *     derived           = Derive-Secret(early_secret, "derived", "")
+ *     handshake_secret  = HKDF-Extract(derived, ECDHE 共享密钥)
+ *     c hs traffic      = Derive-Secret(handshake_secret, "c hs traffic", TH)
+ *     s hs traffic      = Derive-Secret(handshake_secret, "s hs traffic", TH)
+ *     derived2          = Derive-Secret(handshake_secret, "derived", "")
+ *     master_secret     = HKDF-Extract(derived2, 0)
+ *     c ap traffic      = Derive-Secret(master_secret, "c ap traffic", TH)
+ *     s ap traffic      = Derive-Secret(master_secret, "s ap traffic", TH)
+ *
+ * 其中 `TH` 是握手记录的 transcript hash。密钥/IV/Finished 都用
+ * `HKDF-Expand-Label`（label 前缀 `tls13 `）从 traffic secret 里取：
+ * `key`(32)、`iv`(12)、`finished`(32)；`verify_data = HMAC(finished_key, TH)`。
+ *
+ * 约定：
+ *
+ * - `expand_label(label, secret, secret_len, ctx, ctx_len, out, out_len)` 与
+ *   `derive_secret(...)`、`traffic_key(secret, out32)`、`traffic_iv(secret, out12)`
+ *   是自由函数（首参不是结构体）；
+ * - `ks.handshake(ecdhe, ecdhe_len, thash, thash_len)` 只算密钥调度，**不做** ECDHE
+ *   与证书校验；`ecdhe` 由调用方（X25519 / P-256）给出；
+ * - `ks.*_key(…)`/`ks.*_iv(…)` 没调过 `handshake` 返回 -1；
+ * - `ks.verify_data(server, thash, thash_len, out32)`：`server` 非 0 表示用服务端
+ *   握手 secret 的 finished key；
+ * - 服务端视角就是把 client/server 两组互换，本模块只管派生，不区分角色。
+ */
+#include <string.h>
+
+module std.net.tlskdf;
+import std.core.types;
+import std.text.str;
+import std.encoding.sha256;
+import std.encoding.hkdf;
+
+#define TLS13_HASH_LEN 32
+#define TLS13_KEY_LEN 32
+#define TLS13_IV_LEN 12
+
+struct Tls13 {
+    u8 early[32];
+    u8 hs_secret[32];
+    u8 c_hs[32];
+    u8 s_hs[32];
+    u8 master[32];
+    u8 c_ap[32];
+    u8 s_ap[32];
+    int ready;
+};
+
+/* HKDF-Expand-Label：uint16(length) | u8(len("tls13 "+label)) | "tls13 "+label
+ *                   | u8(ctx_len) | ctx */
+int expand_label(const char *label, const void *secret, int secret_len,
+                 const void *ctx, int ctx_len, void *out, int out_len)
+{
+    u8 info[300] = { 0 };
+    int off = 0;
+    int i = 0;
+    int n = 0;
+
+    if (!label || !secret || !out || out_len <= 0 || secret_len <= 0)
+        return -1;
+    if (ctx_len < 0 || ctx_len > 255 || out_len > 65535)
+        return -1;
+    if (ctx_len > 0 && !ctx)
+        return -1;
+    info[0] = (u8)((out_len >> 8) & 0xff);
+    info[1] = (u8)(out_len & 0xff);
+    info[2] = 6 + (u8)strlen(label);        /* "tls13 " + label 的长度 */
+    memcpy(info + 3, "tls13 ", 6);
+    for (i = 0; label[i]; i++)
+        info[9 + i] = (u8)label[i];
+    off = 9 + i;
+    info[off++] = (u8)ctx_len;
+    for (i = 0; i < ctx_len; i++)
+        info[off++] = ((const u8 *)ctx)[i];
+    n = hkdf_expand(secret, (usize)secret_len, info, (usize)off, (u8 *)out,
+                    (usize)out_len);
+    memset(info, 0, sizeof info);
+    return n == 0 ? 1 : -1;
+}
+
+int derive_secret(const void *secret, int secret_len, const char *label,
+                  const void *thash, int thash_len, void *out32)
+{
+    if (!out32)
+        return -1;
+    return expand_label(label, secret, secret_len, thash, thash_len, out32,
+                        TLS13_HASH_LEN);
+}
+
+int traffic_key(const void *secret32, void *out32)
+{
+    return expand_label("key", secret32, TLS13_HASH_LEN, 0, 0, out32,
+                        TLS13_KEY_LEN);
+}
+
+int traffic_iv(const void *secret32, void *out12)
+{
+    return expand_label("iv", secret32, TLS13_HASH_LEN, 0, 0, out12,
+                        TLS13_IV_LEN);
+}
+
+/* 空串的 SHA-256（Derive-Secret(…, "derived", "") 里的 transcript hash） */
+static int tls13_zero_hash(void *out32)
+{
+    u8 empty[1] = { 0 };
+
+    if (!out32)
+        return -1;
+    sha256(empty, 0, (u8 *)out32);
+    return 0;
+}
+
+int handshake(Tls13 *t, const void *ecdhe, int ecdhe_len, const void *thash,
+              int thash_len)
+{
+    u8 zero[32] = { 0 };
+    u8 empty_hash[32] = { 0 };
+    u8 derived[32] = { 0 };
+
+    if (!t || !ecdhe || ecdhe_len <= 0 || !thash || thash_len != TLS13_HASH_LEN)
+        return -1;
+    memset(t, 0, sizeof *t);
+    /* early_secret = HKDF-Extract(0, 0) */
+    if (hkdf_extract(0, 0, zero, (usize)sizeof zero, t->early) != 0)
+        return -1;
+    /* derived = Derive-Secret(early_secret, "derived", "") */
+    if (tls13_zero_hash(empty_hash) != 0)
+        return -1;
+    if (derive_secret(t->early, sizeof t->early, "derived", empty_hash,
+                      sizeof empty_hash, derived) != 1)
+        return -1;
+    /* handshake_secret = HKDF-Extract(derived, ecdhe) */
+    if (hkdf_extract(derived, (usize)sizeof derived, ecdhe, (usize)ecdhe_len,
+                     t->hs_secret) != 0)
+        return -1;
+    if (derive_secret(t->hs_secret, sizeof t->hs_secret, "c hs traffic", thash,
+                      thash_len, t->c_hs) != 1)
+        return -1;
+    if (derive_secret(t->hs_secret, sizeof t->hs_secret, "s hs traffic", thash,
+                      thash_len, t->s_hs) != 1)
+        return -1;
+    /* master_secret = HKDF-Extract(Derive-Secret(hs, "derived", ""), 0) */
+    memset(derived, 0, sizeof derived);
+    if (derive_secret(t->hs_secret, sizeof t->hs_secret, "derived", empty_hash,
+                      sizeof empty_hash, derived) != 1)
+        return -1;
+    if (hkdf_extract(derived, (usize)sizeof derived, zero, (usize)sizeof zero,
+                     t->master) != 0)
+        return -1;
+    if (derive_secret(t->master, sizeof t->master, "c ap traffic", thash,
+                      thash_len, t->c_ap) != 1)
+        return -1;
+    if (derive_secret(t->master, sizeof t->master, "s ap traffic", thash,
+                      thash_len, t->s_ap) != 1)
+        return -1;
+    t->ready = 1;
+    memset(zero, 0, sizeof zero);
+    memset(derived, 0, sizeof derived);
+    return 1;
+}
+
+int is_ready(Tls13 *t)
+{
+    return t ? t->ready : 0;
+}
+
+static int tls13_key_of(Tls13 *t, const u8 *secret, void *out32)
+{
+    if (!t || !t->ready || !out32)
+        return -1;
+    return traffic_key(secret, out32);
+}
+
+static int tls13_iv_of(Tls13 *t, const u8 *secret, void *out12)
+{
+    if (!t || !t->ready || !out12)
+        return -1;
+    return traffic_iv(secret, out12);
+}
+
+int client_key(Tls13 *t, void *out32)
+{
+    return tls13_key_of(t, t ? t->c_hs : 0, out32);
+}
+
+int client_iv(Tls13 *t, void *out12)
+{
+    return tls13_iv_of(t, t ? t->c_hs : 0, out12);
+}
+
+int server_key(Tls13 *t, void *out32)
+{
+    return tls13_key_of(t, t ? t->s_hs : 0, out32);
+}
+
+int server_iv(Tls13 *t, void *out12)
+{
+    return tls13_iv_of(t, t ? t->s_hs : 0, out12);
+}
+
+int app_client_key(Tls13 *t, void *out32)
+{
+    return tls13_key_of(t, t ? t->c_ap : 0, out32);
+}
+
+int app_client_iv(Tls13 *t, void *out12)
+{
+    return tls13_iv_of(t, t ? t->c_ap : 0, out12);
+}
+
+int app_server_key(Tls13 *t, void *out32)
+{
+    return tls13_key_of(t, t ? t->s_ap : 0, out32);
+}
+
+int app_server_iv(Tls13 *t, void *out12)
+{
+    return tls13_iv_of(t, t ? t->s_ap : 0, out12);
+}
+
+int client_secret(Tls13 *t, void *out32)
+{
+    if (!t || !t->ready || !out32)
+        return -1;
+    memcpy(out32, t->c_hs, 32);
+    return 1;
+}
+
+int finished_key(Tls13 *t, int server, void *out32)
+{
+    const u8 *secret = 0;
+
+    if (!t || !t->ready || !out32)
+        return -1;
+    secret = server ? t->s_hs : t->c_hs;
+    return expand_label("finished", secret, TLS13_HASH_LEN, 0, 0, out32,
+                        TLS13_KEY_LEN);
+}
+
+int verify_data(Tls13 *t, int server, const void *thash, int thash_len,
+                void *out32)
+{
+    u8 fk[32] = { 0 };
+
+    if (!thash || thash_len != TLS13_HASH_LEN || !out32)
+        return -1;
+    if (finished_key(t, server, fk) != 1)
+        return -1;
+    hmac_sha256(fk, (usize)sizeof fk, thash, (usize)thash_len, (u8 *)out32);
+    memset(fk, 0, sizeof fk);
+    return 1;
+}
+
+int early_secret(Tls13 *t, void *out32)
+{
+    if (!t || !out32)
+        return -1;
+    memcpy(out32, t->early, 32);
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static int tls13_from_hex(const char *s, u8 *dst, int cap)
+{
+    int n = 0;
+
+    while (s[0] && s[1] && n < cap) {
+        int hi = 0, lo = 0;
+        char a = s[0], b = s[1];
+
+        if (a >= '0' && a <= '9')
+            hi = a - '0';
+        else if (a >= 'a' && a <= 'f')
+            hi = a - 'a' + 10;
+        else
+            return -1;
+        if (b >= '0' && b <= '9')
+            lo = b - '0';
+        else if (b >= 'a' && b <= 'f')
+            lo = b - 'a' + 10;
+        else
+            return -1;
+        dst[n++] = (u8)((hi << 4) | lo);
+        s += 2;
+    }
+    return n;
+}
+
+static int tls13_eq_hex(const u8 *got, int n, const char *want)
+{
+    u8 buf[64] = { 0 };
+    int wn = tls13_from_hex(want, buf, (int)sizeof buf);
+
+    if (wn != n)
+        return 0;
+    return memcmp(got, buf, (size_t)n) == 0;
+}
+
+test "tlskdf：与 RFC 8446 参考实现逐字节一致" {
+    Tls13 ks = { 0 };
+    u8 ecdhe[32] = { 0 };
+    u8 thash[32] = { 0 };
+    u8 out[32] = { 0 };
+    u8 iv[12] = { 0 };
+    int i = 0;
+
+    /* ecdhe = 0x00..0x1f，transcript hash = 0x20..0x3f（固定向量） */
+    for (i = 0; i < 32; i++)
+        ecdhe[i] = (u8)i;
+    for (i = 0; i < 32; i++)
+        thash[i] = (u8)(32 + i);
+    if (ks.handshake(ecdhe, 32, thash, 32) != 1)
+        return err(1, "handshake 派生失败");
+    if (!ks.is_ready())
+        return err(2, "ready 标记不对");
+    if (ks.early_secret(out) != 1
+        || !tls13_eq_hex(out, 32,
+                         "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"))
+        return err(3, "early_secret 与参考值不一致");
+    /* 握手期 client 密钥与 IV */
+    if (ks.client_key(out) != 1
+        || !tls13_eq_hex(out, 32,
+                         "0fabd170ea08d019d8cec0e58016c0355f5c33f4efdfc926bf9fff0174e2f536"))
+        return err(4, "握手 client key 不一致");
+    if (ks.client_iv(iv) != 1
+        || !tls13_eq_hex(iv, 12, "cdeea3d1478c70679075af02"))
+        return err(5, "握手 client iv 不一致");
+    /* 应用期 client 密钥与 IV */
+    if (ks.app_client_key(out) != 1
+        || !tls13_eq_hex(out, 32,
+                         "ab2bc3f3f7fdb5edd249cac3ca41ac45cd52f7876405a26a0446d295c460af97"))
+        return err(6, "应用 client key 不一致");
+    if (ks.app_client_iv(iv) != 1
+        || !tls13_eq_hex(iv, 12, "54fece4ca0ad632f4c7ba800"))
+        return err(7, "应用 client iv 不一致");
+    /* Finished 的 verify_data */
+    if (ks.verify_data(0, thash, 32, out) != 1
+        || !tls13_eq_hex(out, 32,
+                         "46a40cdf48afe9cddf59babe5adb01312a0f7e87cd262d0fd57776e8230fde91"))
+        return err(8, "client verify_data 不一致");
+}
+
+test "tlskdf：双向 secret、敏感性与边界" {
+    Tls13 a = { 0 };
+    Tls13 b = { 0 };
+    u8 ecdhe[32] = { 0 };
+    u8 ecdhe2[32] = { 0 };
+    u8 thash[32] = { 0 };
+    u8 out[32] = { 0 };
+    u8 out2[32] = { 0 };
+    u8 iv[12] = { 0 };
+
+    memset(ecdhe, 7, sizeof ecdhe);
+    memset(ecdhe2, 8, sizeof ecdhe2);
+    memset(thash, 9, sizeof thash);
+    /* 没派生之前拿密钥应该失败 */
+    if (a.client_key(out) != -1 || a.client_iv(iv) != -1 || a.is_ready())
+        return err(9, "未派生时应该 -1");
+    if (a.handshake(ecdhe, 0, thash, 32) != -1)
+        return err(10, "ecdhe 为 0 长度应该 -1");
+    if (a.handshake(ecdhe, 32, thash, 16) != -1)
+        return err(11, "transcript hash 长度不对应该 -1");
+    if (a.handshake(ecdhe, 32, thash, 32) != 1)
+        return err(12, "正常派生失败");
+    /* client 与 server 两组必须不同 */
+    if (a.client_key(out) != 1 || a.server_key(out2) != 1)
+        return err(13, "拿双向密钥失败");
+    if (memcmp(out, out2, 32) == 0)
+        return err(14, "client 与 server 的密钥不该相同");
+    /* 换共享密钥 → 密钥全变 */
+    b.handshake(ecdhe2, 32, thash, 32);
+    if (b.client_key(out2) != 1)
+        return err(15, "第二组密钥失败");
+    if (memcmp(out, out2, 32) == 0)
+        return err(16, "换共享密钥后密钥应该不同");
+    /* 同一输入必须可复算（无状态） */
+    {
+        Tls13 c = { 0 };
+
+        c.handshake(ecdhe, 32, thash, 32);
+        c.client_key(out2);
+        if (memcmp(out, out2, 32) != 0)
+            return err(17, "同样输入派生结果应该一样");
+    }
+    /* 服务端 verify_data 与客户端不同 */
+    {
+        u8 v1[32] = { 0 }, v2[32] = { 0 };
+
+        if (a.verify_data(0, thash, 32, v1) != 1
+            || a.verify_data(1, thash, 32, v2) != 1)
+            return err(18, "verify_data 失败");
+        if (memcmp(v1, v2, 32) == 0)
+            return err(19, "两端 verify_data 不该相同");
+        if (a.verify_data(0, thash, 16, v1) != -1)
+            return err(20, "transcript 长度不对应该 -1");
+    }
+}

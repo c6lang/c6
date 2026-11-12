@@ -369,6 +369,12 @@
 | `std/data/stl.c6` | `std.data.stl` | STL 三角网格（**方法**：`s.load`/`s.next`/`s.triangle`/`s.restart`/`s.count`/`s.is_binary`/`s.bbox`/`s.volume`/`s.area`）：二进制（80 字节头 + 50 字节/面）与 ASCII 自动识别，`StlTri` 给法向 + 三个顶点，体积用散度定理 |
 | `std/data/ply.c6` | `std.data.ply` | ASCII PLY 网格（**方法**：`d.load`/`d.next_vertex`/`d.next_face`/`d.vertex`/`d.face`/`d.restart`/`d.count_vertices`/`d.count_faces`/`d.prop_count`/`d.xyz_columns`/`d.is_ascii`）：头里的 `element`/`property` 真解析，`x`/`y`/`z` 可以不在前三列，面是「先个数再下标」的 list |
 | `std/data/mtl.c6` | `std.data.mtl` | Wavefront MTL 材质库（**方法**：`m.load`/`m.next`/`m.find`/`m.restart`/`m.count`/`m.index_of`）：`MtlMat` 收 `Kd`/`Ks`/`Ke`/`Ns`/`Ni`/`d`/`map_Kd`，没写的键给默认值，`find` 按名字查 |
+| `std/net/tlskdf.c6` | `std.net.tlskdf` | **TLS 1.3 密钥调度**（SHA-256，RFC 8446 §7.1）：自由函数 `expand_label`/`derive_secret`/`traffic_key`/`traffic_iv` + `Tls13` 方法（`ks.handshake`/`ks.client_key`/`ks.client_iv`/`ks.server_key`/`ks.server_iv`/`ks.app_client_key`/`ks.app_client_iv`/`ks.app_server_key`/`ks.app_server_iv`/`ks.verify_data`/`ks.is_ready`）；自测对照独立参考实现算出的向量（`early_secret` 与 RFC 8448 一致） |
+| `std/net/tlsrec.c6` | `std.net.tlsrec` | **TLS 1.3 记录层**（`TLS_CHACHA20_POLY1305_SHA256`）：`TlsRec` 方法 `init`/`set_key`/`clear_key`/`encode`/`decode`/`reset_seq`/`seq_of`/`records`/`is_keyed`；外层 type 恒 23、内层 type 贴在明文尾，nonce = iv ⊕ seq，AAD = 5 字节记录头，tag 不对不推进序号 |
+| `std/net/https.c6` | `std.net.https` | **同步 HTTP/1.1(S) 客户端**：`Https` 方法 `attach`/`use_tls`/`request`/`status`/`header`/`body`/`body_len`/`close_conn`/`secure`/`requests`；读写阻塞在 `read`/`write`，加密模式自动按记录切块 |
+| `std/net/httpsa.c6` | `std.net.httpsa` | **异步 HTTP/1.1(S) 客户端**（语言级 `async`/`await`/`c6_io`）：`HAsync` 方法 `attach`/`use_tls`/`status`/`header`/`body`/`body_len`/`close_conn`/`secure`/`requests` + async 函数 `httpsa_get`/`httpsa_post`/`httpsa_request`/`httpsa_send`/`httpsa_recv`（句柄参数 `void *`，因为 async 不能当方法）；`co` 可批量挂起多路 |
+| `std/async/abench.c6` | `std.async.abench` | **语言级 async 的性能指标**：`Bench` 方法 `begin`/`add`/`fail`/`finish`/`ops`/`fail_count`/`elapsed_ns`/`ns_per_op`/`ops_per_sec`/`report`/`is_running` + 三个测量入口 `b.run_null(iters)`（任务创建+驱动+回收）/`b.run_io(iters, rfd, wfd)`（一次挂起+恢复）/`b.run_co(iters, rfd, wfd)`（co 批量调度） |
+
 
 
 
@@ -518,6 +524,7 @@
 | `examples/stdgeo2.c6` | （无模块） | 第七十九批（计算几何）的拼装示例（`make std-geo2`）：凸包面积/周长/点内、凹多边形形心与边游标、线段相交/共线重叠/投影、最近点对分治 vs 暴力 |
 | `examples/stdasync4.c6` | （无模块） | 第八十批（语言级 async）的拼装示例（`make std-async4`）：`async`/`await` 的行读写、`AChan` 收发、`apump_fd` 转发、`Rt.wait`/`Rt.run` 驱动 |
 | `examples/stdmesh.c6` | （无模块） | 第八十一批（三维网格）的拼装示例（`make std-mesh`）：OBJ 四面体（顶点/面游标 + 包围盒）、STL ASCII 与二进制（面积）、PLY 四边形面、MTL 材质查表 |
+| `examples/stdhttps.c6` | （无模块） | 第八十二批的拼装示例（`make std-https`）：密钥调度对参考值、同步/异步 HTTPS 明文与加密往返、以及 async 框架开销指标 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -736,6 +743,11 @@ std/data/obj.c6            25 test(s), 0 failure(s)
 std/data/stl.c6            24 test(s), 0 failure(s)
 std/data/ply.c6            24 test(s), 0 failure(s)
 std/data/mtl.c6            24 test(s), 0 failure(s)
+std/net/tlskdf.c6          49 test(s), 0 failure(s)
+std/net/tlsrec.c6          34 test(s), 0 failure(s)
+std/net/https.c6           36 test(s), 0 failure(s)
+std/net/httpsa.c6          36 test(s), 0 failure(s)
+std/async/abench.c6        31 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -4374,6 +4386,28 @@ make std-mesh
 浮点读出来的顶点是 (2,0,0) 与 (0,2,0)；PLY 的四边形面报出 4 个顶点、前三个 0/1/2；
 MTL 先遍历两块材质，再 `find("red")` 取 `Kd`/`Ns`/`map_Kd`，`find("steel")` 取 `Ni`。
 
+### 集成示例：`examples/stdhttps.c6`
+
+```sh
+make std-https
+```
+
+四节：`Tls13.handshake()` 派生出的握手 client key 前四字节与参考值一致；同步 `Https`
+先跑明文往返（`200 hello, https!`）再用 `tlskdf` 的密钥走一遍 TLS 记录层；
+异步 `Httpsa` 用 `task` 句柄驱动一次、再用两个 `co` 顶层任务同时挂两路（`a=one b=two`）；
+最后 `abench` 打三行实测指标（本机 x86-64，TCC 后端）：
+
+```
+async 任务创建+驱动+回收: 3000 ops / 521 us -> 5754115 ops/s (173 ns/op)
+async 一次挂起+恢复（await c6_io）: 500 ops / 1293 us -> 386592 ops/s (2586 ns/op)
+co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 ns/op)
+```
+
+读法：**建/跑/销毁一个任务 ≈ 173 ns**（纯用户态，无 syscall）；**一次真正的挂起+恢复
+≈ 2.6 us**（含 `select()` + `read()` 两次系统调用）；`co` 批量时单任务摊销 ≈ 2.1 us，
+比逐个 `task` 略省一点（少了每轮的 `__c6_co_wait` 调用与 destroy）。所以这套框架的
+会话成本基本等于「一次 `select()`」——一线程挂几千路连接时，摊到每路上就是这点开销。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4532,6 +4566,8 @@ MTL 先遍历两块材质，再 `find("red")` 取 `Kd`/`Ns`/`map_Kd`，`find("st
   （自带自检）。
 * `make std-mesh`：`examples/stdmesh.c6`，第八十一批（OBJ/STL/PLY/MTL）模块的拼装示例
   （自带自检）。
+* `make std-https`：`examples/stdhttps.c6`，第八十二批（同步/异步 HTTPS + 性能指标）
+  模块的拼装示例（自带自检与实测指标）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

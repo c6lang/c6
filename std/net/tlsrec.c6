@@ -1,0 +1,360 @@
+/* std/net/tlsrec：TLS 1.3 记录层（RFC 8446 §5.1/§5.2 的帧 + ChaCha20-Poly1305 保护）。
+ *
+ *     import std.net.tlsrec;
+ *
+ *     TlsRec rec = { 0 };
+ *     rec.init();                                   // 明文模式
+ *     rec.set_key(key32, iv12);                      // 换成加密模式
+ *     u8 wire[256] = { 0 };
+ *     int n = rec.encode(23, payload, plen, wire, sizeof wire);   // 一条记录
+ *     int type = 0;
+ *     int m = rec.decode(wire, n, out, sizeof out, &type);        // 拆回来
+ *
+ * 记录格式：`type(1) | legacy_version(2)=0x0303 | length(2) | body`。加密模式下 body 是
+ * `ciphertext(明文 + 1 字节内层 type) | tag(16)`，外层 type 一律 23（application_data），
+ * 真正的类型藏在明文最后那个字节里——这正是 TLS 1.3 的做法。
+ *
+ * AEAD 用的是 `TLS_CHACHA20_POLY1305_SHA256`（RFC 8439 的 IETF 构造）：
+ *
+ * - nonce = `iv` 与 64 位序号按大端异或（`iv` 12 字节，异或最后 8 字节）；
+ * - Poly1305 的一次性密钥 = `chacha20_block(key, nonce, 0)` 的前 32 字节；
+ * - 密文 = `chacha20_xor(key, nonce, counter=1, 明文 || type)`；
+ * - tag = Poly1305(一次性密钥, `aad || 密文`)，`aad` 就是 5 字节记录头。
+ *
+ * 约定：
+ *
+ * - `rec.init()` 明文模式；`rec.set_key(key32, iv12)` 进加密模式并把序号清零；
+ *   `rec.clear_key()` 退回明文；
+ * - `rec.encode(type, payload, len, out, cap)` 返回写出字节数；`cap` 不够、`type`
+ *   不在 20..24、`len > 16384` 都返回 -1；
+ * - `rec.decode(rec, reclen, out, cap, &type)` 返回明文长度与内层类型；`reclen` 必须
+ *   正好是 `5 + 头里的长度`；tag 不对返回 -1 且**不推进序号**；
+ * - 每次成功的 `encode`/`decode` 推进序号（收发各用一个 `TlsRec`，序号是单向的）；
+ * - `rec.seq_of()`/`rec.reset_seq()`/`rec.records()`/`rec.is_keyed()` 是状态查询。
+ */
+#include <string.h>
+
+module std.net.tlsrec;
+import std.core.types;
+import std.text.str;
+import std.encoding.chacha20;
+import std.encoding.poly1305;
+
+#define TLSREC_HDR 5
+#define TLSREC_TAG 16
+#define TLSREC_MAX 16384
+
+#define TLSREC_CT_ALERT 21
+#define TLSREC_CT_HANDSHAKE 22
+#define TLSREC_CT_APPDATA 23
+
+struct TlsRec {
+    u8 key[32];
+    u8 iv[12];
+    u64 seq;
+    int keyed;
+    int nrec;       /* 字段名避开 records() 方法 */
+};
+
+int init(TlsRec *r)
+{
+    if (!r)
+        return -1;
+    memset(r, 0, sizeof *r);
+    return 1;
+}
+
+int set_key(TlsRec *r, const void *key32, const void *iv12)
+{
+    if (!r || !key32 || !iv12)
+        return -1;
+    memcpy(r->key, key32, sizeof r->key);
+    memcpy(r->iv, iv12, sizeof r->iv);
+    r->keyed = 1;
+    r->seq = 0;
+    return 1;
+}
+
+int clear_key(TlsRec *r)
+{
+    if (!r)
+        return -1;
+    memset(r->key, 0, sizeof r->key);
+    memset(r->iv, 0, sizeof r->iv);
+    r->keyed = 0;
+    r->seq = 0;
+    return 1;
+}
+
+int is_keyed(TlsRec *r)
+{
+    return r ? r->keyed : 0;
+}
+
+void reset_seq(TlsRec *r)
+{
+    if (r)
+        r->seq = 0;
+}
+
+u64 seq_of(TlsRec *r)
+{
+    return r ? r->seq : 0;
+}
+
+int records(TlsRec *r)
+{
+    return r ? r->nrec : 0;
+}
+
+/* nonce = iv XOR seq（seq 按大端放最后 8 字节） */
+static void tlsrec_nonce(TlsRec *r, u8 *nonce12)
+{
+    int i = 0;
+
+    memcpy(nonce12, r->iv, 12);
+    for (i = 0; i < 8; i++)
+        nonce12[11 - i] ^= (u8)((r->seq >> (8 * i)) & 0xff);
+}
+
+static void tlsrec_poly_key(const u8 *key, const u8 *nonce12, u8 *out32)
+{
+    u8 block[64] = { 0 };
+
+    chacha20_block(key, nonce12, 0, block);
+    memcpy(out32, block, 32);
+    memset(block, 0, sizeof block);
+}
+
+static void tlsrec_put16(u8 *p, int v)
+{
+    p[0] = (u8)((v >> 8) & 0xff);
+    p[1] = (u8)(v & 0xff);
+}
+
+static int tlsrec_get16(const u8 *p)
+{
+    return ((int)p[0] << 8) | (int)p[1];
+}
+
+int encode(TlsRec *r, int type, const void *payload, int len, void *out, int cap)
+{
+    u8 *dst = (u8 *)out;
+    u8 nonce[12] = { 0 };
+    u8 pk[32] = { 0 };
+    u8 mac[16] = { 0 };
+    u8 aad[TLSREC_HDR] = { 0 };
+    Poly1305 st = { 0 };
+    int body = 0;
+
+    if (!r || !out || len < 0 || len > TLSREC_MAX)
+        return -1;
+    if (len > 0 && !payload)
+        return -1;
+    if (type < 20 || type > 24)
+        return -1;
+    body = r->keyed ? len + 1 + TLSREC_TAG : len;
+    if (cap < TLSREC_HDR + body)
+        return -1;
+    dst[0] = (u8)(r->keyed ? TLSREC_CT_APPDATA : type);
+    tlsrec_put16(dst + 1, 0x0303);
+    tlsrec_put16(dst + 3, body);
+    if (!r->keyed) {
+        if (len > 0)
+            memcpy(dst + TLSREC_HDR, payload, (size_t)len);
+        r->nrec++;
+        return TLSREC_HDR + body;
+    }
+    memcpy(aad, dst, TLSREC_HDR);
+    tlsrec_nonce(r, nonce);
+    tlsrec_poly_key(r->key, nonce, pk);
+    /* 明文（payload || type）先落到输出位置，再原地加密，省一块大缓冲 */
+    if (len > 0)
+        memcpy(dst + TLSREC_HDR, payload, (size_t)len);
+    dst[TLSREC_HDR + len] = (u8)type;
+    chacha20_xor(r->key, nonce, 1, dst + TLSREC_HDR, (usize)(len + 1),
+                 dst + TLSREC_HDR);
+    /* tag = Poly1305(pk, aad || ciphertext)：流式喂，不拼大缓冲 */
+    st = poly1305_init(pk);
+    st.update(aad, (usize)TLSREC_HDR);
+    st.update(dst + TLSREC_HDR, (usize)(len + 1));
+    if (!st.final(mac))
+        return -1;
+    memcpy(dst + TLSREC_HDR + len + 1, mac, TLSREC_TAG);
+    r->seq++;
+    r->nrec++;
+    memset(nonce, 0, sizeof nonce);
+    memset(pk, 0, sizeof pk);
+    memset(&st, 0, sizeof st);
+    return TLSREC_HDR + body;
+}
+
+int decode(TlsRec *r, const void *rec, int reclen, void *out, int cap, int *type)
+{
+    const u8 *src = (const u8 *)rec;
+    u8 *dst = (u8 *)out;
+    u8 nonce[12] = { 0 };
+    u8 pk[32] = { 0 };
+    u8 mac[16] = { 0 };
+    Poly1305 st = { 0 };
+    int body = 0;
+    int plain = 0;
+
+    if (!r || !rec || !out || reclen < TLSREC_HDR)
+        return -1;
+    body = tlsrec_get16(src + 3);
+    if (reclen != TLSREC_HDR + body)
+        return -1;
+    if (!r->keyed) {
+        if (body > cap)
+            return -1;
+        if (type)
+            *type = src[0];
+        if (body > 0)
+            memcpy(dst, src + TLSREC_HDR, (size_t)body);
+        r->nrec++;
+        return body;
+    }
+    if (src[0] != TLSREC_CT_APPDATA || body < 1 + TLSREC_TAG)
+        return -1;
+    plain = body - TLSREC_TAG;              /* 含内层 type */
+    if (plain - 1 > cap)
+        return -1;
+    tlsrec_nonce(r, nonce);
+    tlsrec_poly_key(r->key, nonce, pk);
+    st = poly1305_init(pk);
+    st.update(src, (usize)TLSREC_HDR);
+    st.update(src + TLSREC_HDR, (usize)plain);
+    if (!st.final(mac)) {
+        memset(&st, 0, sizeof st);
+        return -1;
+    }
+    if (memcmp(mac, src + TLSREC_HDR + plain, TLSREC_TAG) != 0) {
+        memset(&st, 0, sizeof st);
+        return -1;                          /* tag 不对：这条记录丢掉，序号不动 */
+    }
+    chacha20_xor(r->key, nonce, 1, src + TLSREC_HDR, (usize)plain, dst);
+    if (type)
+        *type = dst[plain - 1];
+    r->seq++;
+    r->nrec++;
+    memset(&st, 0, sizeof st);
+    memset(nonce, 0, sizeof nonce);
+    memset(pk, 0, sizeof pk);
+    return plain - 1;
+}
+
+/* ---- 自测 ---- */
+
+test "tlsrec：明文记录与头格式" {
+    TlsRec r = { 0 };
+    u8 wire[64] = { 0 };
+    u8 out[64] = { 0 };
+    int type = 0;
+    int n = 0;
+
+    if (r.init() != 1 || r.is_keyed())
+        return err(1, "init 之后应该是明文模式");
+    n = r.encode(TLSREC_CT_HANDSHAKE, "abc", 3, wire, (int)sizeof wire);
+    if (n != 8)
+        return err(2, "明文记录总长应该是 5 + 3");
+    if (wire[0] != 22 || wire[1] != 0x03 || wire[2] != 0x03)
+        return err(3, "记录头不对");
+    if (wire[3] != 0 || wire[4] != 3)
+        return err(4, "长度字段应该是 3");
+    if (r.decode(wire, n, out, (int)sizeof out, &type) != 3)
+        return err(5, "解出来的长度不对");
+    if (type != 22 || memcmp(out, "abc", 3) != 0)
+        return err(6, "类型或内容不对");
+    if (r.records() != 2)
+        return err(7, "records 计数不对");
+    if (r.decode(wire, n - 1, out, (int)sizeof out, &type) != -1)
+        return err(8, "长度不符应该 -1");
+    if (r.encode(19, "x", 1, wire, (int)sizeof wire) != -1)
+        return err(9, "类型 19 应该 -1");
+    if (r.encode(23, "x", 1, wire, 5) != -1)
+        return err(10, "cap 不够应该 -1");
+    if (r.encode(23, wire, TLSREC_MAX + 1, wire, (int)sizeof wire) != -1)
+        return err(11, "超长应该 -1");
+}
+
+test "tlsrec：ChaCha20-Poly1305 加解密" {
+    TlsRec enc = { 0 };
+    TlsRec dec = { 0 };
+    u8 key[32] = { 0 };
+    u8 iv[12] = { 0 };
+    u8 wire[512] = { 0 };
+    u8 out[512] = { 0 };
+    u8 payload[256] = { 0 };
+    int type = 0;
+    int n = 0;
+    int i = 0;
+
+    for (i = 0; i < 32; i++)
+        key[i] = (u8)(i * 7 + 1);
+    for (i = 0; i < 12; i++)
+        iv[i] = (u8)(0xa0 + i);
+    for (i = 0; i < 256; i++)
+        payload[i] = (u8)(i * 3 + 5);
+    enc.init();
+    dec.init();
+    if (enc.set_key(key, iv) != 1 || !enc.is_keyed())
+        return err(12, "set_key 失败");
+    dec.set_key(key, iv);
+    /* 四种长度：0、1、64（ChaCha 分组边界）、200 */
+    {
+        static const int lens[4] = { 0, 1, 64, 200 };
+        int k = 0;
+
+        for (k = 0; k < 4; k++) {
+            int len = lens[k];
+
+            n = enc.encode(TLSREC_CT_APPDATA, payload, len, wire,
+                           (int)sizeof wire);
+            if (n != TLSREC_HDR + len + 1 + TLSREC_TAG)
+                return err(13, "加密记录长度不对");
+            if (wire[0] != 23)
+                return err(14, "外层类型应该是 application_data");
+            if (dec.decode(wire, n, out, (int)sizeof out, &type) != len)
+                return err(15, "解密长度不对");
+            if (type != TLSREC_CT_APPDATA)
+                return err(16, "内层类型不对");
+            if (len > 0 && memcmp(out, payload, (size_t)len) != 0)
+                return err(17, "解密内容不对");
+        }
+    }
+    /* 序号推进：同样明文两次，密文必须不同 */
+    {
+        u8 w1[64] = { 0 }, w2[64] = { 0 };
+
+        enc.encode(TLSREC_CT_HANDSHAKE, "same", 4, w1, (int)sizeof w1);
+        enc.encode(TLSREC_CT_HANDSHAKE, "same", 4, w2, (int)sizeof w2);
+        if (memcmp(w1, w2, 5 + 4 + 1) == 0)
+            return err(18, "序号不同，密文不该相同");
+        if (dec.decode(w1, 5 + 4 + 1 + 16, out, (int)sizeof out, &type) != 4)
+            return err(19, "第一条解密失败");
+        if (dec.decode(w2, 5 + 4 + 1 + 16, out, (int)sizeof out, &type) != 4)
+            return err(20, "第二条解密失败");
+        if (type != TLSREC_CT_HANDSHAKE)
+            return err(21, "内层类型不对（handshake）");
+    }
+    /* 篡改密文一个字节 → tag 校验失败，且序号不推进 */
+    {
+        u8 w[64] = { 0 };
+        u64 before = dec.seq_of();
+
+        enc.encode(TLSREC_CT_APPDATA, "secret", 6, w, (int)sizeof w);
+        w[7] ^= 0x01;
+        if (dec.decode(w, 5 + 6 + 1 + 16, out, (int)sizeof out, &type) != -1)
+            return err(22, "篡改后应该校验失败");
+        if (dec.seq_of() != before)
+            return err(23, "校验失败时不该推进序号");
+    }
+    if (dec.seq_of() != 6)
+        return err(24, "序号推进次数不对");
+    dec.reset_seq();
+    if (dec.seq_of() != 0)
+        return err(25, "reset_seq 失败");
+    if (dec.clear_key() != 1 || dec.is_keyed())
+        return err(26, "clear_key 之后应该回到明文模式");
+}

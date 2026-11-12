@@ -56,6 +56,15 @@
 
 ### 标准库
 
+- **标准库第八十二批（同步/异步 HTTPS + async 性能指标）**：`std.net.tlskdf`
+  （TLS 1.3 密钥调度：`expand_label`/`derive_secret`/`traffic_key`/`traffic_iv` 与
+  `Tls13` 的方法，向量对齐 RFC 8446）、`std.net.tlsrec`（TLS 1.3 记录层 +
+  `TLS_CHACHA20_POLY1305_SHA256`）、`std.net.https`（**同步** HTTP/1.1(S) 客户端）、
+  `std.net.httpsa`（**异步**版本，语言级 `async`/`await`/`c6_io` + `co` 批量）、
+  `std.async.abench`（async 框架开销指标：`run_null`/`run_io`/`run_co` + `report`），
+  示例 `examples/stdhttps.c6`（`make std-https`）。错误号段
+  `std.net.tlskdf`=0x6151 … `std.async.abench`=0x6155。
+
 - **标准库第八十一批（三维网格与材质）**：`std.data.obj`（Wavefront OBJ 游标解析：
   顶点/法向/纹理/面，负数索引）、`std.data.stl`（二进制与 ASCII 自动识别，面积/体积）、
   `std.data.ply`（ASCII PLY 头解析 + 顶点列号 + list 面）、`std.data.mtl`
