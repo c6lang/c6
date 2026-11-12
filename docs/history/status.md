@@ -1084,3 +1084,29 @@ import `std.os.io` 的 TU 也能编过。
 
 验收：`make stdtest`（97 个模块、0 failure）、`make std-client`（36 条自检全过）、
 `make check-all`。
+
+### 11.34 标准库第二十二批（httpd / router / assets / session）
+
+第二十二批把上一批的客户端接成了**服务端**：`std.net.http` 会解析报文、
+`std.net.tcp` 会搬字节，但「怎么循环接受连接」「怎么按路径分发」「怎么安全地
+把文件发出去」「怎么在无状态协议上记一次登录」这一层还空着。四个模块仍然零
+分配：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.net.httpd` | 接受连接、收一个请求、写响应、关连接 | 一次连接一个请求（响应一律 `Connection: close`）——keep-alive 要维护连接状态机，不在这一层做；`read_request` 用 1/0/-1 区分「完整/对端直接关/坏请求」，body 只按 `Content-Length` 收，chunked 请求与 absolute-form 直接 400；`begin` 只写头、`send_body` 写 body，给静态文件流式发送留出口；处理器回调返回 0 时由 `serve_once` 回 404 |
+| `std.net.router` | 方法与路径模式匹配 | 表是固定 32 条的数组、模式拷贝进结构体，参数值是从路径上切的视图（`Match` 不能活得比路径缓冲久）；`/` 严格切段，空段也参与比较，所以 `/a/`、`/a//b` 不会被悄悄归一；`*` 只能最后一段，`..` 不特殊——是否放行由 assets 决定 |
+| `std.net.assets` | root 下的静态文件 | 安全边界都放在 `resolve`：先百分号解码（`%2e%2e` 也认），出现 NUL 或任何一段是 `..` 直接拒；`path_normalize` 按设计**保留** `..`，所以这一层选择「先拒再拼」，而不是拼完再猜；归一结果必须等于 root 或以 `root/` 开头；默认 `lstat` 拒符号链接，`set_follow_links(1)` 才跟随（跟随之后不保证链接指向哪儿）；8 KiB 流式写、不占堆 |
+| `std.net.session` | 内存会话 + cookie | 16 个槽、id 是 16 字节随机数的 32 位十六进制（`std.core.rand`，明确**不是**密码学安全的）；数据是 256 字节里的 `key=value\n` 行，键不能含 `=`/空白/换行；`find` 顺手回收过期槽，`expire(now)` 把时钟当参数传进来所以测试不用 `sleep`；cookie 名固定 `sid`，`from_cookie` 认分号分隔的 Cookie 头、忽略属性 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.net.httpd`=0x6061、
+`std.net.router`=0x6062、`std.net.assets`=0x6063、`std.net.session`=0x6064；
+`grammar.md` §8.1 的表同步。`Makefile` 增加 `std-serve` 与 `STDSERVE_SRCS`，
+`test-all`/`check-all` 都带上它；`stdtest` 的依赖表补上 httpd（http/tcp/str）、
+assets（httpd/http/tcp/mime/url/fs/io/path/str/err）、session（rand/time/cookie/
+str），router 只借 `Str` 类型所以不用额外正文。示例 `examples/stdserve.c6` 用
+`fork` 起一个本地服务端子进程连跑 7 个请求，客户端用第二十一批的
+`std.net.httpc` 打回去，客户端与服务端在同一份示例里互相验证。
+
+验收：`make stdtest`（101 个模块、0 failure）、`make std-serve`（28 条自检全过）、
+`make check-all`。

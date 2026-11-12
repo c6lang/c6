@@ -1,0 +1,296 @@
+/* stdserve：标准库第二十二批（httpd / router / assets / session）的拼装示例。
+ *
+ * 和前面几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 各节自带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 这一批是**服务端**：`std.net.httpd` 收请求/写响应，`std.net.router` 按方法和
+ * 路径分发，`std.net.assets` 把 root 下的文件当静态资源发出去，`std.net.session`
+ * 管内存会话与 Cookie。示例把四者拼成一个小应用：
+ *
+ *     GET /hello/:name          -> 200 "hello, <name>"
+ *     GET /files/*path          -> root 下的静态文件（越界 403）
+ *     GET /login                -> 建会话，Set-Cookie: sid=...
+ *     GET /me                   -> 用 Cookie 找回会话，回 "user=ada"（没有就 401）
+ *
+ * 服务端用 `fork` 起在 127.0.0.1 上（子进程连跑 7 个请求就退出），客户端用
+ * 第二十一批的 `std.net.httpc` 打回去——所以 `make std-serve` 不联网也能跑。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdserve \
+ *         examples/stdserve.c6 std/core/types.c6 std/core/err.c6 \
+ *         std/net/httpd.c6 std/net/http.c6 std/net/tcp.c6 std/net/router.c6 \
+ *         std/net/assets.c6 std/net/mime.c6 std/net/url.c6 std/os/fs.c6 \
+ *         std/os/io.c6 std/os/path.c6 std/text/str.c6 std/net/session.c6 \
+ *         std/core/rand.c6 std/os/time.c6 std/net/cookie.c6 std/net/httpc.c6
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+import std.core.types;
+import std.net.httpd;
+import std.net.router;
+import std.net.assets;
+import std.net.session;
+import std.net.tcp;
+import std.os.fs;
+import std.net.httpc;
+import std.text.str;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+#define REQUESTS 7
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+struct App {
+    Router router;
+    Assets files;
+    Store store;
+};
+
+/* 路由处理器：返回 1 = 已写响应，0 = 没处理（httpd 回 404） */
+static int handle(Request *req, Conn *conn, void *ud)
+{
+    struct App *app = ud;
+    Match m = { 0 };
+    char body[256] = { 0 };
+
+    if (!app->router.match(req->method, req->path, &m))
+        return 0;
+    if (m.id == 1)
+        return conn->respond_text(200, "welcome\n") == 1 ? 1 : -1;
+    if (m.id == 2) {
+        Str name = m.param(SS("name"));
+        int n = snprintf(body, sizeof body, "hello, %.*s\n", name.s.len,
+                         name.s.data);
+
+        return conn->respond(200, SS("text/plain; charset=utf-8"),
+                             (Str){ (char[:]){ body, n } }) == 1
+                   ? 1
+                   : -1;
+    }
+    if (m.id == 3) {
+        app->files.serve(conn, m.rest);
+        return 1;
+    }
+    if (m.id == 4) {
+        Session *s = 0;
+        char cookie[SESSION_COOKIE_MAX] = { 0 };
+        char extra[SESSION_COOKIE_MAX + 24] = { 0 };
+
+        if (!app->store.create(&s))
+            return conn->respond_text(503, "session table full\n") == 1 ? 1 : -1;
+        if (!s->set(SS("user"), SS("ada")))
+            return conn->respond_text(500, "cannot store session\n") == 1 ? 1 : -1;
+        if (app->store.cookie(s, cookie, (int)sizeof cookie) <= 0)
+            return -1;
+        snprintf(extra, sizeof extra, "Set-Cookie: %s\r\n", cookie);
+        if (conn->begin(200, SS("text/plain; charset=utf-8"), 3,
+                        (Str){ (char[:]){ extra, (int)strlen(extra) } })
+            != 1)
+            return -1;
+        return conn->send_body(SS("ok\n")) == 1 ? 1 : -1;
+    }
+    if (m.id == 5) {
+        Session *s = 0;
+        Str user = { 0 };
+        int n = 0;
+
+        if (!app->store.from_cookie(req->header(SS("Cookie")), &s))
+            return conn->respond_text(401, "no session\n") == 1 ? 1 : -1;
+        user = s->get(SS("user"));
+        n = snprintf(body, sizeof body, "user=%.*s\n", user.s.len, user.s.data);
+        return conn->respond(200, SS("text/plain; charset=utf-8"),
+                             (Str){ (char[:]){ body, n } }) == 1
+                   ? 1
+                   : -1;
+    }
+    return 0;
+}
+
+/* 子进程：连续处理 count 个请求就退出 */
+static void serve_child(Server *srv, struct App *app, int count)
+{
+    char buf[4096] = { 0 };
+    int i = 0;
+
+    srv->set_timeout(5000);
+    for (i = 0; i < count; i++)
+        if (srv->serve_once(buf, (int)sizeof buf, handle, app) != 1)
+            _exit(1);
+    srv->close_socket();
+    _exit(0);
+}
+
+/* 文件准备：build/stdserve-root/{a.txt,index.html} */
+static void prepare_root(void)
+{
+    FILE *f = 0;
+
+    mkdir("build", 0755);
+    mkdir("build/stdserve-root", 0755);
+    f = fopen("build/stdserve-root/a.txt", "wb");
+    if (f) {
+        fwrite("static text", 1, 11, f);
+        fclose(f);
+    }
+    f = fopen("build/stdserve-root/index.html", "wb");
+    if (f) {
+        fwrite("<html>root</html>", 1, 17, f);
+        fclose(f);
+    }
+}
+
+/* 发一个 GET；成功返回 1，响应放在 *res（body 是响应缓冲上的视图） */
+static int do_get(int port, char *path, char *cookie, char *raw, char *body,
+               Response *res)
+{
+    char url[128] = { 0 };
+    char hdrs[200] = { 0 };
+    Str h = SS("");
+
+    snprintf(url, sizeof url, "http://127.0.0.1:%d%s", port, path);
+    if (cookie && *cookie) {
+        snprintf(hdrs, sizeof hdrs, "Cookie: %s\r\n", cookie);
+        h = (Str){ (char[:]){ hdrs, (int)strlen(hdrs) } };
+    }
+    return fetch(SS("GET"), (Str){ (char[:]){ url, (int)strlen(url) } }, h,
+                 SS(""), 3000, raw, 8192, res, body, 8192);
+}
+
+/* Set-Cookie 里 "sid=..." 那一段（到 ';' 为止） */
+static void take_sid(Response *res, char *out, int cap)
+{
+    Str sc = res->header(SS("Set-Cookie"));
+    int n = 0;
+
+    out[0] = 0;
+    while (n < sc.s.len && sc.s.data[n] != ';')
+        n++;
+    if (n > 0 && n < cap)
+        memcpy(out, sc.s.data, (size_t)n);
+    out[n < cap ? n : cap - 1] = 0;
+}
+
+int main(void)
+{
+    Server srv = { 0 };
+    struct App app = { 0 };
+    char raw[8192] = { 0 }, body[8192] = { 0 };
+    char sid[160] = { 0 };
+    Response res = { 0 };
+    int p = 0, pid = 0, st = 0;
+
+    printf("stdserve: 标准库第二十二批（httpd / router / assets / session）\n");
+    prepare_root();
+
+    app.router = (Router){ 0 };
+    app.files = assets_root("build/stdserve-root");
+    app.store = session_store();
+    check(app.router.add("GET", "/", 1) == 1, "router: 注册 /");
+    check(app.router.add("GET", "/hello/:name", 2) == 1,
+          "router: 注册 /hello/:name");
+    check(app.router.add("GET", "/files/*path", 3) == 1,
+          "router: 注册 /files/*path");
+    check(app.router.add("GET", "/login", 4) == 1, "router: 注册 /login");
+    check(app.router.add("GET", "/me", 5) == 1, "router: 注册 /me");
+    check(app.router.count() == 5, "router: 五条路由");
+    check(app.files.ok(), "assets: root 可用");
+
+    /* 纯函数自检：分发与静态路径安全（不经过 socket） */
+    {
+        Match m = { 0 };
+        StatInfo info = { 0 };
+        char path[ASSET_ROOT_MAX] = { 0 };
+
+        check(app.router.match(SS("GET"), SS("/hello/ada"), &m) && m.id == 2
+                  && m.param(SS("name")).s.len == 3,
+              "router: /hello/ada 命中");
+        check(app.router.match(SS("POST"), SS("/hello/ada"), &m) == 0,
+              "router: 方法不匹配");
+        check(app.router.match(SS("GET"), SS("/files/a.txt"), &m) && m.id == 3
+                  && m.rest.s.len == 5,
+              "router: /files/a.txt 命中");
+        check(app.files.resolve(SS("/a.txt"), path, (int)sizeof path, &info) == 1
+                  && info.size == 11,
+              "assets: /a.txt 可解析");
+        check(app.files.resolve(SS("/../etc/passwd"), path, (int)sizeof path,
+                                &info)
+                  == -1,
+              "assets: .. 越界被拒");
+        check(app.files.resolve(SS("/nope"), path, (int)sizeof path, &info) == 0,
+              "assets: 不存在给 0");
+    }
+
+    srv = httpd_listen("127.0.0.1", 0, 8);
+    p = srv.port();
+    check(srv.ok() && p > 0, "httpd: 监听");
+    pid = fork();
+    if (pid == 0)
+        serve_child(&srv, &app, REQUESTS);
+    check(pid > 0, "httpd: fork 服务端");
+
+    /* 1) 参数路由 */
+    check(do_get(p, "/hello/ada", 0, raw, body, &res) == 1 && res.status == 200,
+          "httpd: /hello/ada 200");
+    check(res.body.s.len == 11
+              && memcmp(res.body.s.data, "hello, ada\n", 11) == 0,
+          "router: 参数替换");
+    /* 2) 静态文件 + Content-Type */
+    check(do_get(p, "/files/a.txt", 0, raw, body, &res) == 1 && res.status == 200,
+          "assets: /files/a.txt 200");
+    check(res.body.s.len == 11
+              && memcmp(res.body.s.data, "static text", 11) == 0,
+          "assets: 文件内容");
+    check(res.header(SS("Content-Type")).s.len == 10
+              && memcmp(res.header(SS("Content-Type")).s.data, "text/plain", 10)
+                     == 0,
+          "assets: Content-Type");
+    /* 3) 目录落到 index.html */
+    check(do_get(p, "/files/", 0, raw, body, &res) == 1 && res.status == 200
+              && res.body.s.len == 17,
+          "assets: 目录 index.html");
+    /* 4) 编码过的越界 -> 403 */
+    check(do_get(p, "/files/..%2f..%2fetc%2fpasswd", 0, raw, body, &res) == 1
+              && res.status == 403,
+          "assets: 编码越界 403");
+    /* 5) 登录：拿 Set-Cookie */
+    check(do_get(p, "/login", 0, raw, body, &res) == 1 && res.status == 200,
+          "session: /login 200");
+    take_sid(&res, sid, (int)sizeof sid);
+    check(sid[0] != 0 && strncmp(sid, "sid=", 4) == 0,
+          "session: Set-Cookie 带 sid");
+    /* 6) 带 Cookie 找回会话 */
+    check(do_get(p, "/me", sid, raw, body, &res) == 1 && res.status == 200,
+          "session: /me 200");
+    check(res.body.s.len == 9
+              && memcmp(res.body.s.data, "user=ada\n", 9) == 0,
+          "session: 找回 user=ada");
+    /* 7) 没有 Cookie 时 401 */
+    check(do_get(p, "/me", 0, raw, body, &res) == 1 && res.status == 401,
+          "session: 无 Cookie 401");
+
+    if (pid > 0) {
+        waitpid(pid, &st, 0);
+        check(st == 0, "httpd: 子进程正常退出");
+    }
+    srv.close_socket();
+    printf("stdserve: 5 条路由 / 静态文件（含 403）/ 会话 Cookie 都通了\n");
+    printf("stdserve: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

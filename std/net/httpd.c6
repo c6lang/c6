@@ -1,0 +1,581 @@
+/* std/net/httpd：HTTP/1.1 服务端的最小骨架（在 std.net.http + std.net.tcp 之上）。
+ *
+ *     import std.net.httpd;
+ *
+ *     Server srv = httpd_listen("127.0.0.1", 8080, 16);
+ *     char buf[8192] = { 0 };
+ *     for (;;) {
+ *         Request req = { 0 };
+ *         Conn c = srv.accept_conn();
+ *         if (!c.ok())
+ *             break;
+ *         if (c.read_request(buf, (int)sizeof buf, &req) == 1)
+ *             c.respond_text(200, "hello\n");
+ *         c.close_socket();
+ *     }
+ *
+ * `std.net.http` 负责**解析**已经收完的报文，`std.net.tcp` 负责搬运字节；
+ * 这一层把「接受连接 → 收一个请求 → 写一个响应 → 关连接」串起来。仍然零分配：
+ * 请求缓冲由调用方给，响应头写进 512 字节的栈上缓冲，body 直接写 socket。
+ *
+ * 约定：
+ *
+ * - **一次连接一个请求**：响应一律带 `Connection: close`，写完就关（keep-alive
+ *   要维护连接状态机，不在这一层做）。要长连接请自己用 `std.net.tcp`。
+ * - `read_request` 返回 1（拿到完整请求）/ 0（对端一个字节都没发就关了）/
+ *   -1（坏请求、超时、太大；原因在 `req->why`）。body 只按 `Content-Length`
+ *   收，`Transfer-Encoding: chunked` 的请求直接回 400（这一层不支持）。
+ * - 只接受 origin-form（`GET /path?q=1 HTTP/1.1`）和 `OPTIONS *`；absolute-form
+ *   （`GET http://host/path`）和 HTTP/2 preface 都算坏请求。
+ * - 响应：`begin` 写状态行 + `Content-Type` + `Content-Length` + `Connection` +
+ *   `extra` 里的头 + 空行，`send_body` 写 body；`respond`/`respond_text` 是
+ *   「一次写完」的便捷入口。`extra` 约定是 `Name: value\r\n` 序列（末尾缺
+ *   CRLF 时自动补）。
+ * - 处理器签名 `int (*)(Request *, Conn *, void *)`：返回 1 = 已经写过响应，
+ *   0 = 没处理（`serve_once` 回 404），-1 当作已处理（响应由处理器自己写）。
+ * - `serve_once` 在坏请求时回 400 并返回 1；没有连接进来返回 0；监听 socket
+ *   本身失效返回 -1。
+ */
+#include <stdio.h>
+#include <string.h>
+
+module std.net.httpd;
+import std.core.types;
+import std.net.http;
+import std.net.tcp;
+import std.text.str;
+
+/* 字面量 -> 视图（宏不随 import 传递，每个模块自己定义一次） */
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+#define HTTPD_HEAD_CAP 512
+
+struct Server {
+    Tcp listener;
+    int bound_port;
+    int timeout_ms;     /* -1 = 不设超时；accept 到的连接继承它 */
+};
+
+struct Conn {
+    Tcp sock;
+};
+
+struct Request {
+    HttpMessage msg;    /* std.net.http 的解析结果（值拷贝） */
+    Str method;
+    Str target;
+    Str path;           /* target 里 '?' 之前的部分 */
+    Str query;          /* '?' 之后的部分（没有就为空视图） */
+    Str version;
+    Str body;           /* 视图，指向调用方给的请求缓冲 */
+    int ok;
+    const char *why;    /* read_request 失败时的静态原因 */
+};
+
+static Str str_empty(void)
+{
+    Str s = { { (char *)0, 0 } };
+
+    return s;
+}
+
+Server httpd_listen(char *host, int port, int backlog)
+{
+    Server s = { { -1 }, 0, -1 };
+
+    s.listener = tcp_listen(host, port, backlog);
+    s.bound_port = s.listener.port();
+    return s;
+}
+
+int ok(Server *self) { return self && self->listener.ok(); }
+
+int port(Server *self) { return self ? self->bound_port : 0; }
+
+/* 设置 accept 之后的连接超时；顺手也给监听 socket 设上 */
+int set_timeout(Server *self, int ms)
+{
+    if (!self || !self->listener.ok() || ms < 0)
+        return 0;
+    self->timeout_ms = ms;
+    self->listener.set_timeout(ms);
+    return 1;
+}
+
+void close_socket(Server *self)
+{
+    if (self)
+        self->listener.close_socket();
+}
+
+Conn accept_conn(Server *self)
+{
+    Conn c = { { -1 } };
+
+    if (self && self->listener.ok())
+        c.sock = self->listener.accept_client();
+    return c;
+}
+
+int ok(Conn *self) { return self && self->sock.ok(); }
+
+int set_timeout(Conn *self, int ms)
+{
+    if (!self || !self->sock.ok() || ms < 0)
+        return 0;
+    return self->sock.set_timeout(ms);
+}
+
+void close_socket(Conn *self)
+{
+    if (self)
+        self->sock.close_socket();
+}
+
+/* 头块结束的位置（空行之后）：0 = 还没见到空行 */
+static int head_complete(char *p, int n)
+{
+    int i = 0;
+
+    for (i = 0; i + 1 < n; i++) {
+        if (p[i] != '\n')
+            continue;
+        if (p[i + 1] == '\n')
+            return i + 2;
+        if (i + 2 < n && p[i + 1] == '\r' && p[i + 2] == '\n')
+            return i + 3;
+    }
+    return 0;
+}
+
+/* 解析成功后把 HttpMessage 摊平成 Request（path/query/body 都是视图） */
+static void fill_request(Request *out, HttpMessage *m, char *buf, int body_len)
+{
+    int q = -1, i = 0;
+
+    for (i = 0; i < m->target.s.len; i++) {
+        if (m->target.s.data[i] == '?') {
+            q = i;
+            break;
+        }
+    }
+    out->msg = *m;
+    out->method = m->method;
+    out->target = m->target;
+    out->version = m->version;
+    out->ok = 1;
+    out->why = "ok";
+    if (q < 0) {
+        out->path = m->target;
+        out->query = str_empty();
+    } else {
+        out->path = (Str){ (char[:]){ m->target.s.data, q } };
+        out->query = (Str){ (char[:]){ m->target.s.data + q + 1,
+                                       m->target.s.len - q - 1 } };
+    }
+    if (body_len > 0)
+        out->body = (Str){ (char[:]){ buf + m->head_end, body_len } };
+    else
+        out->body = str_empty();
+}
+
+/* 收一个完整请求：1 成功 / 0 对端直接关了 / -1 失败（out->why 给原因） */
+int read_request(Conn *self, char *buf, int cap, Request *out)
+{
+    int len = 0, rc = 0;
+
+    if (!self || !buf || cap < 2 || !out)
+        return -1;
+    out->ok = 0;
+    out->why = "bad argument";
+    if (!self->sock.ok())
+        return -1;
+    buf[0] = 0;
+    out->why = "read failed";
+    for (;;) {
+        HttpMessage m = http_parse_request((Str){ (char[:]){ buf, len } });
+
+        if (m.ok) {
+            int cl = m.content_length();
+            Str te = m.header(SS("Transfer-Encoding"));
+
+            if (te.s.len > 0) {
+                out->why = "unsupported transfer-encoding";
+                return -1;
+            }
+            if (cl < 0)
+                cl = 0;
+            if (len - m.head_end >= cl) {
+                if (m.target.s.len <= 0
+                    || (m.target.s.data[0] != '/'
+                        && !(m.target.s.len == 1 && m.target.s.data[0] == '*'))) {
+                    out->why = "unsupported request target";
+                    return -1;
+                }
+                fill_request(out, &m, buf, cl);
+                return 1;
+            }
+        } else if (head_complete(buf, len) > 0) {
+            out->why = "malformed request";
+            return -1;
+        }
+        if (len >= cap - 1) {
+            out->why = "request too large";
+            return -1;
+        }
+        rc = self->sock.read_bytes(buf + len, cap - 1 - len);
+        if (rc < 0) {
+            out->why = "read failed";
+            return -1;
+        }
+        if (rc == 0) {
+            if (len == 0)
+                return 0;
+            out->why = "incomplete request";
+            return -1;
+        }
+        len += rc;
+        buf[len] = 0;
+    }
+}
+
+/* 请求头（大小写不敏感）；解析失败给空视图 */
+Str header(Request *self, Str name)
+{
+    if (!self || !self->ok)
+        return str_empty();
+    return self->msg.header(name);
+}
+
+/* 写响应头，body 由 send_body 接着写：1 成功 / -1 失败 */
+int begin(Conn *self, int status, Str content_type, i64 length, Str extra)
+{
+    char head[HTTPD_HEAD_CAP] = { 0 };
+    int n = 0, used = 0;
+
+    if (!self || !self->sock.ok() || status < 100 || status > 599
+        || length < 0)
+        return -1;
+    n = snprintf(head, sizeof head,
+                 "HTTP/1.1 %d %s\r\n"
+                 "Content-Type: %.*s\r\n"
+                 "Content-Length: %lld\r\n"
+                 "Connection: close\r\n",
+                 status, http_status_text(status),
+                 content_type.s.len, content_type.s.data,
+                 (long long)length);
+    if (n <= 0 || n >= (int)sizeof head)
+        return -1;
+    used = n;
+    if (extra.s.len > 0) {
+        if (used + extra.s.len + 3 >= (int)sizeof head)
+            return -1;
+        memcpy(head + used, extra.s.data, (size_t)extra.s.len);
+        used += extra.s.len;
+        if (head[used - 1] != '\n') {
+            head[used++] = '\r';
+            head[used++] = '\n';
+        }
+    }
+    head[used++] = '\r';
+    head[used++] = '\n';
+    if (self->sock.write_all(head, used) != used)
+        return -1;
+    return 1;
+}
+
+int send_body(Conn *self, Str body)
+{
+    if (!self || !self->sock.ok())
+        return -1;
+    if (body.s.len <= 0)
+        return 1;
+    return self->sock.write_all(body.s.data, body.s.len) == body.s.len ? 1 : -1;
+}
+
+/* 一步写完：状态行 + Content-Type/Length + body */
+int respond(Conn *self, int status, Str content_type, Str body)
+{
+    if (!self || !self->sock.ok() || !body.s.data)
+        body = str_empty();
+    if (begin(self, status, content_type, body.s.len, str_empty()) != 1)
+        return -1;
+    return send_body(self, body);
+}
+
+/* 纯文本快捷入口（Content-Type: text/plain; charset=utf-8） */
+int respond_text(Conn *self, int status, char *text)
+{
+    Str ct = SS("text/plain; charset=utf-8");
+    int n = text ? (int)strlen(text) : 0;
+
+    if (n <= 0)
+        return respond(self, status, ct, str_empty());
+    return respond(self, status, ct, (Str){ (char[:]){ text, n } });
+}
+
+/* 接受一个连接、收一个请求、交给处理器；返回值见文件头注释 */
+int serve_once(Server *self, char *buf, int cap,
+               int (*handler)(Request *, Conn *, void *), void *ud)
+{
+    Conn c = { { -1 } };
+    Request req = { 0 };
+    int rc = 0;
+
+    if (!self || !self->listener.ok())
+        return -1;
+    c.sock = self->listener.accept_client();
+    if (!c.sock.ok())
+        return 0;
+    if (self->timeout_ms > 0)
+        c.set_timeout(self->timeout_ms);
+    rc = c.read_request(buf, cap, &req);
+    if (rc == 1) {
+        if (!handler || handler(&req, &c, ud) == 0)
+            c.respond_text(404, "not found\n");
+        rc = 1;
+    } else if (rc == 0) {
+        rc = 0;
+    } else {
+        c.respond_text(400, "bad request\n");
+        rc = 1;
+    }
+    c.close_socket();
+    return rc;
+}
+
+/* ---- 自测 ---- */
+
+/* 小工具：确认空参数被挡住（写在函数里避免测试块里太多分支） */
+static int c_read_null(void)
+{
+    Request r = { 0 };
+
+    if (read_request(0, 0, 0, &r) != -1)
+        return 1;
+    return 0;
+}
+
+#define REQ_GET "GET /a/b?q=1&x=2 HTTP/1.1\r\nHost: h\r\n\r\n"
+#define REQ_POST \
+    "POST /submit HTTP/1.1\r\n" \
+    "Host: h\r\n" \
+    "Content-Length: 5\r\n" \
+    "\r\n" \
+    "hello"
+
+/* serve_once 的测试处理器：/hello 回 200，其余交给 404 */
+static int httpd_test_handler(Request *req, Conn *conn, void *ud)
+{
+    int *hits = ud;
+
+    if (hits)
+        (*hits)++;
+    if (req->path.s.len == 6 && memcmp(req->path.s.data, "/hello", 6) == 0)
+        return conn->respond_text(200, "hi\n") == 1 ? 1 : -1;
+    return 0;
+}
+
+/* 读客户端收到的全部字节（响应写完对端就关） */
+static int drain(Tcp *s, char *dst, int cap)
+{
+    int n = 0, k = 0;
+
+    while (n < cap - 1) {
+        k = s->read_bytes(dst + n, cap - 1 - n);
+        if (k <= 0)
+            break;
+        n += k;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+test "监听、读请求与写响应" {
+    Server srv = httpd_listen("127.0.0.1", 0, 4);
+    Conn c = { { -1 } };
+    Tcp cli = { -1 };
+    char req[1024] = { 0 }, rsp[1024] = { 0 };
+    Request r = { 0 };
+    int p = 0, n = 0;
+
+    if (!srv.ok() || (p = srv.port()) <= 0)
+        return err(1, "监听失败");
+    cli = tcp_connect("127.0.0.1", p, 1000);
+    c = srv.accept_conn();
+    if (!cli.ok() || !c.ok())
+        return err(2, "连接/接受失败");
+    if (cli.write_all(REQ_GET, (int)sizeof REQ_GET - 1) != (int)sizeof REQ_GET - 1)
+        return err(3, "请求发不出去");
+    if (c.read_request(req, (int)sizeof req, &r) != 1 || !r.ok)
+        return err(4, "请求没解出来");
+    if (r.method.s.len != 3 || memcmp(r.method.s.data, "GET", 3) != 0)
+        return err(5, "method 不对");
+    if (r.path.s.len != 4 || memcmp(r.path.s.data, "/a/b", 4) != 0)
+        return err(6, "path 不对");
+    if (r.query.s.len != 7 || memcmp(r.query.s.data, "q=1&x=2", 7) != 0)
+        return err(7, "query 不对");
+    if (r.target.s.len != 12)
+        return err(8, "target 不对");
+    if (r.body.s.len != 0)
+        return err(9, "GET 的 body 应该是空");
+    if (r.header(SS("host")).s.len != 1
+        || memcmp(r.header(SS("HOST")).s.data, "h", 1) != 0)
+        return err(10, "头字段委派不对");
+    if (c.respond_text(200, "hi") != 1)
+        return err(11, "写响应失败");
+    c.close_socket();
+    n = drain(&cli, rsp, (int)sizeof rsp);
+    if (n <= 0 || strstr(rsp, "HTTP/1.1 200 OK\r\n") != rsp)
+        return err(12, "状态行不对");
+    if (!strstr(rsp, "Content-Length: 2\r\n")
+        || !strstr(rsp, "Connection: close\r\n"))
+        return err(13, "响应头不对");
+    if (!strstr(rsp, "\r\n\r\nhi"))
+        return err(14, "响应 body 不对");
+    cli.close_socket();
+    srv.close_socket();
+}
+
+test "POST body、坏请求与上限" {
+    Server srv = httpd_listen("127.0.0.1", 0, 4);
+    char buf[1024] = { 0 }, tiny[16] = { 0 };
+    Request r = { 0 };
+    int p = srv.port(), rc = 0;
+
+    if (p <= 0)
+        return err(15, "监听失败");
+    /* POST：body 是请求缓冲上的视图 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+        int n = (int)sizeof REQ_POST - 1;
+
+        if (!cli.ok() || cli.write_all(REQ_POST, n) != n)
+            return err(16, "POST 发不出去");
+        if (c.read_request(buf, (int)sizeof buf, &r) != 1)
+            return err(17, "POST 没解出来");
+        if (r.body.s.len != 5 || memcmp(r.body.s.data, "hello", 5) != 0)
+            return err(18, "POST body 不对");
+        if (r.path.s.len != 7 || memcmp(r.path.s.data, "/submit", 7) != 0)
+            return err(19, "POST path 不对");
+        c.close_socket();
+        cli.close_socket();
+    }
+    /* 坏请求行：头块完整但解析失败 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+        char *bad = "NOPE\r\n\r\n";
+
+        cli.write_all(bad, (int)strlen(bad));
+        rc = c.read_request(buf, (int)sizeof buf, &r);
+        if (rc != -1 || r.why == 0)
+            return err(20, "坏请求应该失败");
+        c.close_socket();
+        cli.close_socket();
+    }
+    /* chunked 请求：这一层不支持 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+        char *ch = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+
+        cli.write_all(ch, (int)strlen(ch));
+        if (c.read_request(buf, (int)sizeof buf, &r) != -1)
+            return err(21, "chunked 请求应该被拒绝");
+        c.close_socket();
+        cli.close_socket();
+    }
+    /* 头没写完对端就关：不完整 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+        char *part = "GET / HTTP/1.1\r\nHost: h\r\n";
+
+        cli.write_all(part, (int)strlen(part));
+        cli.shutdown_write();
+        if (c.read_request(buf, (int)sizeof buf, &r) != -1)
+            return err(22, "不完整请求应该失败");
+        c.close_socket();
+        cli.close_socket();
+    }
+    /* 缓冲太小：请求太大 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+
+        cli.write_all(REQ_GET, (int)sizeof REQ_GET - 1);
+        if (c.read_request(tiny, (int)sizeof tiny, &r) != -1
+            || r.why == 0 || strcmp(r.why, "request too large") != 0)
+            return err(23, "太小的缓冲应该是 request too large");
+        c.close_socket();
+        cli.close_socket();
+    }
+    /* 参数检查 */
+    if (c_read_null() != 0)
+        return err(24, "unreachable");
+    srv.close_socket();
+}
+
+test "serve_once 的 200 / 404 / 400 / EOF" {
+    Server srv = httpd_listen("127.0.0.1", 0, 8);
+    char buf[1024] = { 0 }, rsp[1024] = { 0 };
+    int p = srv.port(), hits = 0;
+
+    if (p <= 0)
+        return err(25, "监听失败");
+    /* 200：处理器自己写 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+
+        cli.write_all("GET /hello HTTP/1.1\r\nHost: h\r\n\r\n",
+                      (int)strlen("GET /hello HTTP/1.1\r\nHost: h\r\n\r\n"));
+        if (srv.serve_once(buf, (int)sizeof buf, httpd_test_handler, &hits) != 1)
+            return err(26, "serve_once 应该返回 1");
+        drain(&cli, rsp, (int)sizeof rsp);
+        if (strstr(rsp, "HTTP/1.1 200 OK") == 0 || !strstr(rsp, "\r\n\r\nhi\n"))
+            return err(27, "200 响应不对");
+        cli.close_socket();
+    }
+    /* 404：处理器返回 0 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+
+        cli.write_all("GET /nope HTTP/1.1\r\nHost: h\r\n\r\n",
+                      (int)strlen("GET /nope HTTP/1.1\r\nHost: h\r\n\r\n"));
+        if (srv.serve_once(buf, (int)sizeof buf, httpd_test_handler, &hits) != 1)
+            return err(28, "serve_once 应该返回 1");
+        drain(&cli, rsp, (int)sizeof rsp);
+        if (strstr(rsp, "HTTP/1.1 404 Not Found") == 0)
+            return err(29, "404 响应不对");
+        cli.close_socket();
+    }
+    /* 400：坏请求 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+
+        cli.write_all("BAD\r\n\r\n", 7);
+        if (srv.serve_once(buf, (int)sizeof buf, httpd_test_handler, &hits) != 1)
+            return err(30, "坏请求也算处理过");
+        drain(&cli, rsp, (int)sizeof rsp);
+        if (strstr(rsp, "HTTP/1.1 400 Bad Request") == 0)
+            return err(31, "400 响应不对");
+        cli.close_socket();
+    }
+    /* EOF：连上就关，没有请求 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+
+        cli.close_socket();
+        if (srv.serve_once(buf, (int)sizeof buf, httpd_test_handler, &hits) != 0)
+            return err(32, "空连接应该返回 0");
+    }
+    if (hits != 2)
+        return err(33, "200/404 各调用一次处理器");
+    /* 监听 socket 关掉之后 serve_once 立刻返回 -1（不会卡在 accept 上） */
+    srv.close_socket();
+    if (srv.serve_once(buf, (int)sizeof buf, httpd_test_handler, &hits) != -1)
+        return err(34, "关掉的监听 socket 应该返回 -1");
+}

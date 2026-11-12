@@ -1,0 +1,416 @@
+/* std/net/assets：把 root 目录下的文件当静态资源发出去（在 httpd + mime 之上）。
+ *
+ *     import std.net.static;
+ *
+ *     Assets files = assets_root("public");
+ *     files.serve(&conn, req.path);        // 200 / 403 / 404 / 500
+ *
+ * 这一层只做三件事：**把 URL 路径变成 root 下的真实路径**、**判断能不能给**、
+ * **流式写出**。零分配：路径拼在 512 字节的栈上缓冲里，文件按 8 KiB 一块边读
+ * 边写，多大文件都不占堆。
+ *
+ * 安全边界（这是这一层最要紧的部分）：
+ *
+ * - 先百分号解码（`%2e%2e` 也认），解码结果里出现 NUL 或长度对不上就拒；
+ * - 任何一段是 `..` 就**直接拒**（不做「先拼再归一」的猜测：`path_normalize`
+ *   按设计保留 `..`，词法消 `..` 会改变符号链接语义；这一层选择保守）；
+ * - 拼成 `root + 相对路径` 之后归一，归一结果必须等于 root 或以 `root/` 开头；
+ * - 默认用 `lstat`，**符号链接一律拒绝**（`set_follow_links(1)` 才跟随；
+ *   跟随之后链接指向哪儿这一层不再保证，调用方自己确认 root 里没有外链）。
+ *
+ * 状态码：`resolve` 1 找到 / 0 不存在 / -1 拒绝（越界、符号链接、名字非法）；
+ * `serve` 返回 200/403/404/500，传输失败返回 -1。目录请求用 `index`（默认
+ * `index.html`）收尾；`set_index("")` 之后目录请求按 404 处理。`serve` 不处理
+ * `Range`/`If-Modified-Since`/压缩，也不做目录列表。
+ */
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+module std.net.assets;
+import std.core.types;
+import std.core.err;
+import std.net.httpd;
+import std.net.mime;
+import std.net.url;
+import std.os.fs;
+import std.os.io;
+import std.os.path;
+import std.text.str;
+
+#define ASSET_ROOT_MAX 512
+#define ASSET_INDEX_MAX 32
+#define ASSET_IO_CHUNK 8192
+
+struct Assets {
+    char root[ASSET_ROOT_MAX];     /* 归一之后的 root（失败时为空串） */
+    char index[ASSET_INDEX_MAX];
+    int follow_links;
+};
+
+static Str str_empty(void)
+{
+    Str s = { { (char *)0, 0 } };
+
+    return s;
+}
+
+Assets assets_root(char *dir)
+{
+    Assets f = { { 0 }, { 0 }, 0 };
+    char norm[ASSET_ROOT_MAX] = { 0 };
+    int n = 0;
+
+    memcpy(f.index, "index.html", sizeof "index.html");
+    if (!dir || !*dir)
+        return f;
+    n = path_normalize((char[:]){ dir, (int)strlen(dir) }, norm,
+                       (int)sizeof norm);
+    if (n <= 0)
+        return f;
+    memcpy(f.root, norm, (size_t)n + 1);
+    return f;
+}
+
+int ok(Assets *self)
+{
+    return self && self->root[0] != 0;
+}
+
+int set_index(Assets *self, char *name)
+{
+    int n = 0;
+
+    if (!self || !name)
+        return 0;
+    n = (int)strlen(name);
+    if (n >= ASSET_INDEX_MAX)
+        return 0;
+    memcpy(self->index, name, (size_t)n + 1);
+    return 1;
+}
+
+int set_follow_links(Assets *self, int on)
+{
+    if (!self)
+        return 0;
+    self->follow_links = on ? 1 : 0;
+    return 1;
+}
+
+/* 有没有一段正好是 ".."（解码之后再看） */
+static int has_dotdot(char *p, int n)
+{
+    int i = 0, start = 0;
+
+    for (i = 0; i <= n; i++) {
+        if (i == n || p[i] == '/') {
+            if (i - start == 2 && p[start] == '.' && p[start + 1] == '.')
+                return 1;
+            start = i + 1;
+        }
+    }
+    return 0;
+}
+
+/* 把 index 接到目录路径后面：1 成功 / 0 放不下 */
+static int append_index(Assets *self, char *path, int cap)
+{
+    int n = (int)strlen(path);
+    int m = (int)strlen(self->index);
+
+    if (n + m + 2 > cap)
+        return 0;
+    if (n > 0 && path[n - 1] != '/')
+        path[n++] = '/';
+    memcpy(path + n, self->index, (size_t)m + 1);
+    return 1;
+}
+
+/* URL 路径 -> root 下的真实路径：1 找到 / 0 不存在 / -1 拒绝 */
+int resolve(Assets *self, Str url_path, char *out, int cap, StatInfo *st)
+{
+    char dec[ASSET_ROOT_MAX] = { 0 };
+    char joined[ASSET_ROOT_MAX] = { 0 };
+    char root[ASSET_ROOT_MAX] = { 0 };
+    StatInfo si = { 0 };
+    int dl = 0, rl = 0, rel = 0, n = 0;
+
+    if (!self || !out || cap <= 0 || !st)
+        return -1;
+    if (!ok(self))
+        return -1;
+    dl = url_decoded_len(url_path.s);
+    if (dl < 0 || dl >= (int)sizeof dec)
+        return -1;
+    if (url_decode(url_path.s, dec, (int)sizeof dec) != dl)
+        return -1;
+    if ((int)strlen(dec) != dl)
+        return -1;                      /* 解码出 NUL：名字不合法 */
+    if (has_dotdot(dec, dl))
+        return -1;
+    /* 去掉开头的 '/'，path_join 见到绝对路径会丢掉 root */
+    rel = 0;
+    while (rel < dl && dec[rel] == '/')
+        rel++;
+    n = path_join((char[:]){ self->root, (int)strlen(self->root) },
+                  (char[:]){ dec + rel, dl - rel }, joined,
+                  (int)sizeof joined);
+    if (n < 0)
+        return -1;
+    if (path_normalize((char[:]){ joined, n }, out, cap) < 0)
+        return -1;
+    rl = path_normalize((char[:]){ self->root, (int)strlen(self->root) }, root,
+                        (int)sizeof root);
+    if (rl < 0)
+        return -1;
+    if (strncmp(out, root, (size_t)rl) != 0
+        || (out[rl] != 0 && out[rl] != '/'))
+        return -1;
+    if (self->follow_links) {
+        fs_stat(out, &si) catch e {
+            return e.id == std.core.err.NO_ENT ? 0 : -1;
+        };
+    } else {
+        fs_lstat(out, &si) catch e {
+            return e.id == std.core.err.NO_ENT ? 0 : -1;
+        };
+        if (si.is_link)
+            return -1;                  /* 默认不跟随符号链接 */
+    }
+    if (si.is_dir) {
+        if (self->index[0] == 0)
+            return 0;
+        if (!append_index(self, out, cap))
+            return -1;
+        if (self->follow_links)
+            fs_stat(out, &si) catch e { return e.id == std.core.err.NO_ENT ? 0 : -1; };
+        else
+            fs_lstat(out, &si) catch e { return e.id == std.core.err.NO_ENT ? 0 : -1; };
+    }
+    if (!si.is_file)
+        return 0;
+    *st = si;
+    return 1;
+}
+
+/* 扩展名 -> Content-Type（mime 表没有就给 application/octet-stream） */
+Str content_type_of(Str path)
+{
+    return mime_of_path(path.s);
+}
+
+/* 发一个静态文件：返回 HTTP 状态码，传输失败 -1 */
+int serve(Assets *self, Conn *conn, Str url_path)
+{
+    char path[ASSET_ROOT_MAX] = { 0 };
+    char buf[ASSET_IO_CHUNK] = { 0 };
+    StatInfo st = { 0 };
+    Str empty = { { (char *)0, 0 } };
+    Reader r = { 0 };
+    int rc = 0;
+
+    if (!self || !conn)
+        return -1;
+    rc = resolve(self, url_path, path, (int)sizeof path, &st);
+    if (rc == 0) {
+        conn->respond_text(404, "not found\n");
+        return 404;
+    }
+    if (rc < 0) {
+        conn->respond_text(403, "forbidden\n");
+        return 403;
+    }
+    r = reader_open(path);
+    if (!r.ok()) {
+        conn->respond_text(500, "cannot open file\n");
+        return 500;
+    }
+    if (conn->begin(200, content_type_of((Str){ (char[:]){ path,
+                                                           (int)strlen(path) } }),
+                    st.size, empty) != 1) {
+        r.close();
+        return -1;
+    }
+    for (;;) {
+        int n = r.read_bytes(buf, (int)sizeof buf);
+
+        if (n < 0) {
+            r.close();
+            return -1;
+        }
+        if (n == 0)
+            break;
+        if (conn->send_body((Str){ (char[:]){ buf, n } }) != 1) {
+            r.close();
+            return -1;
+        }
+    }
+    r.close();
+    return 200;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+static void touch(char *path, char *text)
+{
+    Writer w = writer_open(path);
+
+    if (w.ok()) {
+        w.write_bytes(text, (int)strlen(text));
+        w.close();
+    }
+}
+
+static int read_all_text(Tcp *s, char *dst, int cap)
+{
+    int n = 0, k = 0;
+
+    while (n < cap - 1) {
+        k = s->read_bytes(dst + n, cap - 1 - n);
+        if (k <= 0)
+            break;
+        n += k;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+test "root、resolve 与路径安全" {
+    Assets f = { 0 };
+    StatInfo st = { 0 };
+    char path[ASSET_ROOT_MAX] = { 0 };
+
+    mkdir("build", 0755);
+    mkdir("build/std-static", 0755);
+    mkdir("build/std-static/sub", 0755);
+    touch("build/std-static/a.txt", "hello");
+    touch("build/std-static/index.html", "<html>home</html>");
+    touch("build/std-static/sub/b.js", "var x = 1;");
+    unlink("build/std-static/link");
+
+    f = assets_root("build/std-static");
+    if (!f.ok())
+        return err(1, "assets_root 失败");
+    if (f.resolve(SS("/a.txt"), path, (int)sizeof path, &st) != 1)
+        return err(2, "/a.txt 没解析出来");
+    if (st.size != 5 || !st.is_file || st.is_dir)
+        return err(3, "a.txt 的元数据不对");
+    if (strstr(path, "build/std-static/a.txt") == 0)
+        return err(4, "路径没拼对");
+    if (f.resolve(SS("/"), path, (int)sizeof path, &st) != 1
+        || strstr(path, "index.html") == 0 || st.size != 17)
+        return err(5, "/ 应该落到 index.html");
+    if (f.resolve(SS("/sub/b.js"), path, (int)sizeof path, &st) != 1
+        || st.size != 10)
+        return err(6, "/sub/b.js 没解析出来");
+    if (f.resolve(SS("/nope"), path, (int)sizeof path, &st) != 0)
+        return err(7, "不存在的文件应该是 0");
+    if (f.resolve(SS("/../etc/passwd"), path, (int)sizeof path, &st) != -1)
+        return err(8, ".. 越界应该被拒");
+    if (f.resolve(SS("/sub/../../etc/passwd"), path, (int)sizeof path, &st) != -1)
+        return err(9, "中间的 .. 也应该被拒");
+    if (f.resolve(SS("/%2e%2e/%2e%2e/etc/passwd"), path, (int)sizeof path, &st)
+        != -1)
+        return err(10, "编码过的 .. 也应该被拒");
+    if (f.resolve(SS("/a%00.txt"), path, (int)sizeof path, &st) != -1)
+        return err(11, "解码出的 NUL 应该被拒");
+    if (f.resolve(SS("/./a.txt"), path, (int)sizeof path, &st) != 1)
+        return err(12, "\".\" 成分应该被归一掉");
+    if (f.resolve(SS("//a.txt"), path, (int)sizeof path, &st) != 1)
+        return err(13, "重复的 / 应该被归一");
+    /* 没有 index 时目录按 404 */
+    if (!f.set_index(""))
+        return err(14, "set_index 失败");
+    if (f.resolve(SS("/"), path, (int)sizeof path, &st) != 0)
+        return err(15, "没有 index 时目录应该是 0");
+    f.set_index("index.html");
+    /* 符号链接默认拒绝 */
+    if (symlink("/etc/passwd", "build/std-static/link") == 0) {
+        if (f.resolve(SS("/link"), path, (int)sizeof path, &st) != -1)
+            return err(16, "默认不该跟随符号链接");
+        f.set_follow_links(1);
+        if (f.resolve(SS("/link"), path, (int)sizeof path, &st) != 1)
+            return err(17, "打开 follow_links 之后应该能解析");
+        f.set_follow_links(0);
+        unlink("build/std-static/link");
+    }
+    /* 空参数 */
+    {
+        Assets bad = assets_root(0);
+
+        if (bad.ok())
+            return err(18, "空 root 应该无效");
+    }
+    if (resolve(0, SS("/a.txt"), path, (int)sizeof path, &st) != -1)
+        return err(19, "空 self 应该被拒");
+}
+
+test "serve 的 200 / 404 / 403 与 Content-Type" {
+    Assets f = assets_root("build/std-static");
+    Server srv = httpd_listen("127.0.0.1", 0, 4);
+    char rsp[8192] = { 0 };
+    int p = srv.port();
+
+    if (!f.ok() || p <= 0)
+        return err(20, "准备失败");
+    /* 200：文本文件，Content-Type 来自扩展名 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+
+        if (f.serve(&c, SS("/a.txt")) != 200)
+            return err(21, "serve a.txt 应该是 200");
+        c.close_socket();
+        read_all_text(&cli, rsp, (int)sizeof rsp);
+        if (strstr(rsp, "HTTP/1.1 200 OK") == 0)
+            return err(22, "状态行不对");
+        if (strstr(rsp, "Content-Type: text/plain") == 0)
+            return err(23, "Content-Type 不对");
+        if (strstr(rsp, "Content-Length: 5\r\n") == 0)
+            return err(24, "Content-Length 不对");
+        if (strstr(rsp, "\r\n\r\nhello") == 0)
+            return err(25, "body 不对");
+        cli.close_socket();
+    }
+    /* 目录请求落到 index.html，类型是 text/html */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+
+        if (f.serve(&c, SS("/")) != 200)
+            return err(26, "serve / 应该是 200");
+        c.close_socket();
+        read_all_text(&cli, rsp, (int)sizeof rsp);
+        if (strstr(rsp, "Content-Type: text/html") == 0
+            || strstr(rsp, "<html>home</html>") == 0)
+            return err(27, "index.html 的响应不对");
+        cli.close_socket();
+    }
+    /* 404 / 403 */
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+
+        if (f.serve(&c, SS("/nope")) != 404)
+            return err(28, "不存在的文件应该是 404");
+        c.close_socket();
+        cli.close_socket();
+    }
+    {
+        Tcp cli = tcp_connect("127.0.0.1", p, 1000);
+        Conn c = srv.accept_conn();
+
+        if (f.serve(&c, SS("/../etc/passwd")) != 403)
+            return err(29, "越界应该是 403");
+        c.close_socket();
+        read_all_text(&cli, rsp, (int)sizeof rsp);
+        if (strstr(rsp, "HTTP/1.1 403 Forbidden") == 0)
+            return err(30, "403 响应不对");
+        cli.close_socket();
+    }
+    srv.close_socket();
+}

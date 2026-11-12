@@ -1,0 +1,549 @@
+/* std/net/session：固定容量的内存会话表 + 会话 cookie（零分配）。
+ *
+ *     import std.net.session;
+ *
+ *     Store store = session_store();          // 默认 30 分钟
+ *     Session *s = 0;
+ *     if (store.create(&s)) {
+ *         s->set(SS("user"), SS("ada"));
+ *         char cookie[160] = { 0 };
+ *         store.cookie(s, cookie, (int)sizeof cookie);   // Set-Cookie 的值
+ *     }
+ *
+ *     // 下一个请求：从 Cookie 头里找回会话
+ *     Session *back = 0;
+ *     if (store.from_cookie(req.header(SS("Cookie")), &back))
+ *         Str user = back->get(SS("user"));
+ *
+ * 这一层不依赖 socket：`std.net.httpd` 的处理器里把 `Request` 的头交进来、
+ * 把 `cookie` 的返回值塞进响应的 `extra` 头即可。仍然零分配：表是 16 个槽，
+ * 每个会话的键值对存成 256 字节里的 `key=value\n` 行。
+ *
+ * 约定：
+ *
+ * - 会话 id 是 16 字节随机数的 32 位十六进制；随机源是 `std.core.rand`
+ *   （**不是密码学安全**的，别拿它当令牌用；这一层的定位是「本地/内网里的
+ *   会话粘性」）。要真安全请自己换 id 生成器。
+ * - `create` 先找空槽，没有就回收已经过期的；表满返回 0。`find` 顺手丢弃
+ *   过期会话；`destroy`/`destroy_all` 显式清。
+ * - 数据行的键不能为空、不能含 `=`/`\n`，值不能含 `\n`；`get` 对不存在的键给
+ *   空视图（所以空值和不存在分不开——要区分用 `has`）。
+ * - cookie 名固定是 `sid`；`cookie` 输出的是**值**（`sid=...; Path=/; ...`），
+ *   调用方自己加 `Set-Cookie: ` 前缀；`from_cookie` 认 `a=b; sid=x` 这种
+ *   分号分隔的头，属性（`$Path` 等）忽略。
+ * - `Store` 是值类型但**按指针用**：`Session *` 指向表里的槽，`Store` 被复制
+ *   （或槽被回收）之后指针就失效。
+ */
+#include <stdio.h>
+#include <string.h>
+
+module std.net.session;
+import std.core.types;
+import std.core.rand;
+import std.net.cookie;
+import std.os.time;
+import std.text.str;
+
+#define SESSION_MAX 16
+#define SESSION_TTL_MS 1800000
+#define SESSION_ID_LEN 32
+#define SESSION_DATA_MAX 256
+#define SESSION_COOKIE_MAX 160
+
+struct Session {
+    char sid[SESSION_ID_LEN + 1];
+    char data[SESSION_DATA_MAX];
+    i64 expires_ms;
+    int used;
+};
+
+struct Store {
+    Session slots[SESSION_MAX];
+    int ttl_ms;
+    Rand rng;
+};
+
+static Str str_empty(void)
+{
+    Str s = { { (char *)0, 0 } };
+
+    return s;
+}
+
+static Str str_view(char *p, int n)
+{
+    Str s = { { p, n } };
+
+    return s;
+}
+
+Store session_store_ttl(int ttl_ms)
+{
+    Store st = { 0 };
+
+    st.ttl_ms = ttl_ms > 0 ? ttl_ms : SESSION_TTL_MS;
+    st.rng = rand_seed(now_ns() ^ (u64)now_ms());
+    return st;
+}
+
+Store session_store(void) { return session_store_ttl(SESSION_TTL_MS); }
+
+int valid(Session *self) { return self && self->used; }
+
+/* 会话 id（视图，指向槽里） */
+Str id(Session *self)
+{
+    if (!self || !self->used)
+        return str_empty();
+    return str_view(self->sid, (int)strlen(self->sid));
+}
+
+void clear(Session *self)
+{
+    if (!self)
+        return;
+    memset(self->data, 0, sizeof self->data);
+}
+
+static int key_ok(Str key)
+{
+    int i = 0;
+
+    if (key.s.len <= 0)
+        return 0;
+    for (i = 0; i < key.s.len; i++)
+        if (key.s.data[i] == '=' || key.s.data[i] == '\n'
+            || key.s.data[i] == ' ' || key.s.data[i] == '\t')
+            return 0;
+    return 1;
+}
+
+static int value_ok(Str value)
+{
+    int i = 0;
+
+    for (i = 0; i < value.s.len; i++)
+        if (value.s.data[i] == '\n')
+            return 0;
+    return 1;
+}
+
+int has(Session *self, Str key)
+{
+    int pos = 0, len = 0;
+
+    if (!self || !key_ok(key))
+        return 0;
+    len = (int)strlen(self->data);
+    while (pos < len) {
+        int eol = pos, eq = pos;
+
+        while (eol < len && self->data[eol] != '\n')
+            eol++;
+        while (eq < eol && self->data[eq] != '=')
+            eq++;
+        if (eq < eol && eq - pos == key.s.len
+            && memcmp(self->data + pos, key.s.data, (size_t)key.s.len) == 0)
+            return 1;
+        pos = eol + 1;
+    }
+    return 0;
+}
+
+Str get(Session *self, Str key)
+{
+    int pos = 0, len = 0;
+
+    if (!self || !key_ok(key))
+        return str_empty();
+    len = (int)strlen(self->data);
+    while (pos < len) {
+        int eol = pos, eq = pos;
+
+        while (eol < len && self->data[eol] != '\n')
+            eol++;
+        while (eq < eol && self->data[eq] != '=')
+            eq++;
+        if (eq < eol && eq - pos == key.s.len
+            && memcmp(self->data + pos, key.s.data, (size_t)key.s.len) == 0)
+            return str_view(self->data + eq + 1, eol - eq - 1);
+        pos = eol + 1;
+    }
+    return str_empty();
+}
+
+/* 重写整张表：保留其它键，目标键换成新值（新键追加在末尾） */
+int set(Session *self, Str key, Str value)
+{
+    char tmp[SESSION_DATA_MAX] = { 0 };
+    int pos = 0, len = 0, out = 0;
+
+    if (!self || !key_ok(key) || !value_ok(value))
+        return 0;
+    len = (int)strlen(self->data);
+    while (pos < len) {
+        int eol = pos, eq = pos;
+
+        while (eol < len && self->data[eol] != '\n')
+            eol++;
+        while (eq < eol && self->data[eq] != '=')
+            eq++;
+        if (!(eq < eol && eq - pos == key.s.len
+              && memcmp(self->data + pos, key.s.data, (size_t)key.s.len) == 0)) {
+            if (out + (eol - pos) + 1 >= SESSION_DATA_MAX)
+                return 0;
+            memcpy(tmp + out, self->data + pos, (size_t)(eol - pos));
+            out += eol - pos;
+            tmp[out++] = '\n';
+        }
+        pos = eol + 1;
+    }
+    if (out + key.s.len + value.s.len + 2 >= SESSION_DATA_MAX)
+        return 0;
+    memcpy(tmp + out, key.s.data, (size_t)key.s.len);
+    out += key.s.len;
+    tmp[out++] = '=';
+    memcpy(tmp + out, value.s.data, (size_t)value.s.len);
+    out += value.s.len;
+    tmp[out++] = '\n';
+    tmp[out] = 0;
+    memcpy(self->data, tmp, (size_t)out + 1);
+    return 1;
+}
+
+/* 删掉一个键：1 删了 / 0 没有 */
+int remove(Session *self, Str key)
+{
+    char tmp[SESSION_DATA_MAX] = { 0 };
+    int pos = 0, len = 0, out = 0, hit = 0;
+
+    if (!self || !key_ok(key))
+        return 0;
+    len = (int)strlen(self->data);
+    while (pos < len) {
+        int eol = pos, eq = pos;
+
+        while (eol < len && self->data[eol] != '\n')
+            eol++;
+        while (eq < eol && self->data[eq] != '=')
+            eq++;
+        if (eq < eol && eq - pos == key.s.len
+            && memcmp(self->data + pos, key.s.data, (size_t)key.s.len) == 0) {
+            hit = 1;
+        } else {
+            memcpy(tmp + out, self->data + pos, (size_t)(eol - pos));
+            out += eol - pos;
+            tmp[out++] = '\n';
+        }
+        pos = eol + 1;
+    }
+    tmp[out] = 0;
+    memcpy(self->data, tmp, (size_t)out + 1);
+    return hit;
+}
+
+static void mint_id(Store *self, char *dst)
+{
+    u8 raw[16] = { 0 };
+    char hex[] = "0123456789abcdef";
+    int i = 0;
+
+    self->rng.fill(raw, sizeof raw);
+    for (i = 0; i < (int)sizeof raw; i++) {
+        dst[i * 2] = hex[raw[i] >> 4];
+        dst[i * 2 + 1] = hex[raw[i] & 15];
+    }
+    dst[SESSION_ID_LEN] = 0;
+}
+
+/* 新建会话：1 成功（*out 指向槽）/ 0 表满 */
+int create(Store *self, Session **out)
+{
+    i64 now = 0;
+    int i = 0, slot = -1;
+
+    if (!self || !out)
+        return 0;
+    *out = 0;
+    now = (i64)now_ms();
+    for (i = 0; i < SESSION_MAX; i++) {
+        if (!self->slots[i].used) {
+            slot = i;
+            break;
+        }
+        if (self->slots[i].expires_ms <= now && slot < 0)
+            slot = i;           /* 记下第一个过期的，继续找空槽 */
+    }
+    if (slot < 0)
+        return 0;
+    memset(&self->slots[slot], 0, sizeof self->slots[slot]);
+    self->slots[slot].used = 1;
+    self->slots[slot].expires_ms = now + (i64)self->ttl_ms;
+    mint_id(self, self->slots[slot].sid);
+    *out = &self->slots[slot];
+    return 1;
+}
+
+/* 按 id 找会话：找不到或已过期给 0（过期顺手回收） */
+Session *find(Store *self, Str sid)
+{
+    i64 now = 0;
+    int i = 0;
+
+    if (!self || !sid.s.data || sid.s.len != SESSION_ID_LEN)
+        return 0;
+    now = (i64)now_ms();
+    for (i = 0; i < SESSION_MAX; i++) {
+        Session *s = &self->slots[i];
+
+        if (!s->used)
+            continue;
+        if (strlen(s->sid) != (size_t)sid.s.len
+            || memcmp(s->sid, sid.s.data, (size_t)sid.s.len) != 0)
+            continue;
+        if (s->expires_ms <= now) {
+            s->used = 0;
+            return 0;
+        }
+        return s;
+    }
+    return 0;
+}
+
+int destroy(Store *self, Str sid)
+{
+    Session *s = find(self, sid);
+
+    if (!s)
+        return 0;
+    s->used = 0;
+    return 1;
+}
+
+int destroy_all(Store *self)
+{
+    int i = 0, n = 0;
+
+    if (!self)
+        return 0;
+    for (i = 0; i < SESSION_MAX; i++) {
+        if (self->slots[i].used) {
+            self->slots[i].used = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* 回收 expires_ms <= now 的会话，返回清掉的个数（测试里不用等时钟） */
+int expire(Store *self, i64 now)
+{
+    int i = 0, n = 0;
+
+    if (!self)
+        return 0;
+    for (i = 0; i < SESSION_MAX; i++) {
+        if (self->slots[i].used && self->slots[i].expires_ms <= now) {
+            self->slots[i].used = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* 写 Set-Cookie 的值：长度 / -1（放不下或没会话） */
+int cookie(Store *self, Session *s, char *out, int cap)
+{
+    int n = 0, max_age = 0;
+
+    if (!self || !valid(s) || !out || cap <= 0)
+        return -1;
+    max_age = self->ttl_ms / 1000;
+    n = snprintf(out, (size_t)cap,
+                 "sid=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax", s->sid,
+                 max_age);
+    if (n <= 0 || n >= cap)
+        return -1;
+    return n;
+}
+
+static Str trim_view(char *p, int n)
+{
+    int a = 0, b = n;
+
+    while (a < b && (p[a] == ' ' || p[a] == '\t' || p[a] == '\r'))
+        a++;
+    while (b > a && (p[b - 1] == ' ' || p[b - 1] == '\t' || p[b - 1] == '\r'))
+        b--;
+    return str_view(p + a, b - a);
+}
+
+/* 从 Cookie 头里找 sid：1 找到（*out 指向槽）/ 0 没有 */
+int from_cookie(Store *self, Str header, Session **out)
+{
+    int pos = 0, len = 0;
+
+    if (!self || !out)
+        return 0;
+    *out = 0;
+    if (!header.s.data || header.s.len <= 0)
+        return 0;
+    len = header.s.len;
+    while (pos < len) {
+        int eol = pos;
+        Str pair = { 0 }, name = { 0 }, value = { 0 };
+        Session *s = 0;
+
+        while (eol < len && header.s.data[eol] != ';')
+            eol++;
+        pair = trim_view(header.s.data + pos, eol - pos);
+        if (pair.s.len > 0 && cookie_parse_pair(pair, &name, &value)
+            && name.s.len == 3 && memcmp(name.s.data, "sid", 3) == 0) {
+            s = find(self, value);
+            if (s) {
+                *out = s;
+                return 1;
+            }
+        }
+        pos = eol + 1;
+    }
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+#define SS(lit) ((Str){ S(lit) })
+
+test "创建、查找、键值与过期" {
+    Store st = session_store();
+    Session *a = 0, *b = 0, *c = 0;
+    char big[300] = { 0 };
+
+    if (!st.create(&a) || !a || !a->valid())
+        return err(1, "建会话失败");
+    if (!st.create(&b) || !b || b == a)
+        return err(2, "第二个会话应该占不同槽");
+    if (a->id().s.len != SESSION_ID_LEN || b->id().s.len != SESSION_ID_LEN)
+        return err(3, "id 长度不对");
+    if (memcmp(a->id().s.data, b->id().s.data, SESSION_ID_LEN) == 0)
+        return err(4, "两个 id 不该相同");
+    if (st.find(a->id()) != a)
+        return err(5, "find 应该找回同一个槽");
+    if (st.find(SS("xxxx")) != 0)
+        return err(6, "短 id 不该命中");
+    if (st.find(SS("0123456789abcdef0123456789abcdef")) != 0)
+        return err(7, "不存在的 id 不该命中");
+    /* 键值：set / get / has / remove */
+    if (!a->set(SS("user"), SS("ada")) || !a->set(SS("role"), SS("admin")))
+        return err(8, "set 失败");
+    if (a->get(SS("user")).s.len != 3
+        || memcmp(a->get(SS("user")).s.data, "ada", 3) != 0)
+        return err(9, "get 不对");
+    if (!a->has(SS("role")) || a->has(SS("nope")))
+        return err(10, "has 不对");
+    if (a->get(SS("nope")).s.len != 0)
+        return err(11, "不存在的键应该给空视图");
+    if (!a->set(SS("user"), SS("grace")) || a->get(SS("user")).s.len != 5)
+        return err(12, "覆盖同名键失败");
+    if (strcmp(a->data, "role=admin\nuser=grace\n") != 0)
+        return err(13, "覆盖之后的行顺序不对");
+    if (!a->remove(SS("role")) || a->has(SS("role")))
+        return err(14, "remove 失败");
+    if (a->remove(SS("role")) != 0)
+        return err(15, "重复 remove 应该是 0");
+    if (!a->set(SS("k"), SS("")))
+        return err(16, "空值应该允许");
+    if (!a->has(SS("k")) || a->get(SS("k")).s.len != 0)
+        return err(17, "空值也占一个键");
+    /* 键/值校验 */
+    if (a->set(SS(""), SS("v")) || a->set(SS("a=b"), SS("v"))
+        || a->set(SS("a b"), SS("v")) || a->set(SS("k"), SS("a\nb")))
+        return err(18, "非法键值应该被拒");
+    /* 空间上限 */
+    memset(big, 'x', sizeof big - 1);
+    if (a->set(SS("big"), (Str){ (char[:]){ big, (int)sizeof big - 1 } }))
+        return err(19, "放不下的值应该被拒");
+    /* 清空数据但不回收槽 */
+    a->clear();
+    if (a->has(SS("k")) || !a->valid())
+        return err(20, "clear 只清数据");
+    /* 显式过期 */
+    if (st.expire((i64)now_ms() + SESSION_TTL_MS + 1) != 2)
+        return err(21, "expire 应该清掉两个");
+    if (st.find(b->id()) != 0)
+        return err(22, "过期之后 find 应该是 0");
+    /* create 会回收过期槽 */
+    if (!st.create(&c) || !c)
+        return err(23, "过期之后应该能再建");
+    if (st.destroy(c->id()) != 1 || st.find(c->id()) != 0)
+        return err(24, "destroy 不对");
+    if (st.destroy(c->id()) != 0)
+        return err(25, "重复 destroy 应该是 0");
+}
+
+test "容量、全部销毁与 ttl 到期" {
+    Store st = session_store_ttl(1);
+    Session *s = 0;
+    int i = 0;
+
+    for (i = 0; i < SESSION_MAX; i++)
+        if (!st.create(&s))
+            return err(26, "填满会话表失败");
+    if (st.create(&s) != 0 || s != 0)
+        return err(27, "满了应该返回 0");
+    if (st.destroy_all() != SESSION_MAX)
+        return err(28, "destroy_all 数目不对");
+    if (!st.create(&s))
+        return err(29, "清空之后应该能建");
+    sleep_ms(5);
+    if (st.find(s->id()) != 0)
+        return err(30, "ttl 到期之后应该找不到");
+    if (st.create(&s) != 1)
+        return err(31, "过期槽应该被回收");
+    if (st.ttl_ms != 1)
+        return err(32, "ttl 应该保留");
+}
+
+test "cookie 的写与读" {
+    Store st = session_store();
+    Session *s = 0, *back = 0;
+    char buf[SESSION_COOKIE_MAX] = { 0 };
+    char hdr[SESSION_COOKIE_MAX + 32] = { 0 };
+    int n = 0;
+
+    if (!st.create(&s))
+        return err(33, "建会话失败");
+    s->set(SS("user"), SS("ada"));
+    n = st.cookie(s, buf, (int)sizeof buf);
+    if (n <= 0)
+        return err(34, "cookie 写失败");
+    if (strncmp(buf, "sid=", 4) != 0 || strstr(buf, "; Path=/") == 0
+        || strstr(buf, "; HttpOnly") == 0 || strstr(buf, "; SameSite=Lax") == 0)
+        return err(35, "cookie 属性不对");
+    if (strstr(buf, "Max-Age=1800") == 0)
+        return err(36, "Max-Age 不对");
+    if (st.cookie(s, buf, 8) != -1)
+        return err(37, "缓冲太小应该给 -1");
+    /* 从 Cookie 头里找回来 */
+    snprintf(hdr, sizeof hdr, "theme=dark; sid=%s; lang=zh", s->sid);
+    if (!st.from_cookie((Str){ (char[:]){ hdr, (int)strlen(hdr) } }, &back)
+        || back != s)
+        return err(38, "from_cookie 没找回会话");
+    if (back->get(SS("user")).s.len != 3)
+        return err(39, "找回的会话数据不对");
+    if (st.from_cookie(SS("theme=dark; lang=zh"), &back) != 0)
+        return err(40, "没有 sid 不该命中");
+    if (st.from_cookie(SS("sid=deadbeef"), &back) != 0)
+        return err(41, "坏 id 不该命中");
+    if (st.from_cookie(SS(""), &back) != 0)
+        return err(42, "空头不该命中");
+    if (st.from_cookie(SS("sid="), &back) != 0)
+        return err(43, "空值不该命中");
+    if (cookie(0, s, buf, (int)sizeof buf) != -1)
+        return err(44, "空 store 应该给 -1");
+    if (cookie(&st, 0, buf, (int)sizeof buf) != -1)
+        return err(45, "空会话应该给 -1");
+    if (cookie(&st, s, 0, 0) != -1)
+        return err(46, "空输出应该给 -1");
+}

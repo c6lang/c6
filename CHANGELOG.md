@@ -47,6 +47,21 @@
 
 ### 标准库
 
+- **标准库第二十二批（Web 服务端）**：`std.net.httpd` / `std.net.router` /
+  `std.net.assets` / `std.net.session` 四个模块，集成示例
+  `examples/stdserve.c6`（`make std-serve`）。httpd 把 `std.net.http` 的解析和
+  `std.net.tcp` 的收发接成服务端骨架（`httpd_listen`/`accept_conn`、`Conn` 的
+  `read_request` 三态与 `begin`/`send_body`/`respond`/`respond_text`、
+  `Server.serve_once` 的处理器回调；一次连接一个请求，chunked 请求直接 400）；
+  router 是固定 32 条的路由表（`:name` 段参数、`*`/`*name` 尾段通配、方法
+  大小写不敏感、`"*"` 任意方法、先注册先赢、按 `/` 严格切段）；assets 把一个
+  root 目录当静态资源发（百分号解码后拒绝 `..`/NUL、归一后必须仍在 root 下、
+  默认 `lstat` 拒符号链接、8 KiB 流式写出、Content-Type 走 `std.net.mime`）；
+  session 是 16 槽的内存会话表（`create`/`find`/`destroy`/`expire`、
+  `key=value\n` 数据行、`sid` cookie、id 来自 `std.core.rand` 且明确非密码学）。
+  错误号段 `std.net.httpd`=0x6061 … `std.net.session`=0x6064（`c6_err_std_slots[]`
+  追加，`grammar.md` §8.1 同步）。
+
 - **标准库第二十一批（网络客户端）**：`std.net.udp` / `std.net.uds` /
   `std.net.resolver` / `std.net.httpc` 四个模块，集成示例
   `examples/stdclient.c6`（`make std-client`）。udp 是数据报薄封装

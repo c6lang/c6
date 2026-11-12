@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve
 
 all: build
 
@@ -150,6 +150,10 @@ stdtest: build
 	    std/container/chan.c6) deps="std/os/sync.c6" ;; \
 	    std/net/resolver.c6) deps="std/net/dns.c6 std/net/udp.c6 std/os/io.c6 std/text/str.c6" ;; \
 	    std/net/httpc.c6) deps="std/net/tcp.c6 std/net/url.c6 std/text/str.c6" ;; \
+	    std/net/httpd.c6) deps="std/net/http.c6 std/net/tcp.c6 std/text/str.c6" ;; \
+	    std/net/router.c6) deps="" ;; \
+	    std/net/assets.c6) deps="std/net/httpd.c6 std/net/http.c6 std/net/tcp.c6 std/net/mime.c6 std/net/url.c6 std/os/fs.c6 std/os/io.c6 std/os/path.c6 std/text/str.c6 std/core/err.c6" ;; \
+	    std/net/session.c6) deps="std/core/rand.c6 std/os/time.c6 std/net/cookie.c6 std/text/str.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -409,6 +413,22 @@ std-client: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdclient $(STDCLIENT_SRCS)
 	./build/stdclient
 
+# 标准库第二十二批（Web 服务端）：httpd / router / assets / session。
+# httpd 在 http+tcp 上收请求写响应；router 做方法与路径模式匹配；assets 把
+# root 下的文件当静态资源发（带路径越界防护）；session 管内存会话与 Cookie。
+# 示例 fork 一个本地服务端、再用第二十一批的 httpc 打回去，离线可跑。
+STDSERVE_SRCS := examples/stdserve.c6 std/core/types.c6 std/core/err.c6 \
+                 std/net/httpd.c6 std/net/http.c6 std/net/tcp.c6 \
+                 std/net/router.c6 std/net/assets.c6 std/net/mime.c6 \
+                 std/net/url.c6 std/os/fs.c6 std/os/io.c6 std/os/path.c6 \
+                 std/text/str.c6 std/net/session.c6 std/core/rand.c6 \
+                 std/os/time.c6 std/net/cookie.c6 std/net/httpc.c6
+
+std-serve: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdserve $(STDSERVE_SRCS)
+	./build/stdserve
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -513,7 +533,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -522,13 +542,13 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的二十一个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
+# 标准库的二十二个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
 # 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client
-# 是二十一批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
+# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve
+# 是二十二批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -669,7 +689,7 @@ distclean:
 #   errcheck         errbase.def 本身与 C126–C128 的检查
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
-#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client）
+#                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve）
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
@@ -694,6 +714,7 @@ distclean:
 #   std-thread       编译并运行 examples/stdthread.c6（第十九批，并发与同步）
 #   std-term         编译并运行 examples/stdterm.c6（第二十批，终端与进程控制）
 #   std-client       编译并运行 examples/stdclient.c6（第二十一批，网络客户端）
+#   std-serve        编译并运行 examples/stdserve.c6（第二十二批，Web 服务端）
 #
 # freestanding、裸机与交叉目标
 #   fstest                   无 libc 冒烟（不链接 crt/libc，入口 _start）

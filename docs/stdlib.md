@@ -18,7 +18,7 @@
 | `std/os/` | 操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程 |
 | `std/encoding/` | 编解码与压缩：Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、LZ4/RLE、hexdump |
 | `std/data/` | 数据格式：JSON、CSV、INI、TOML、XML、查询串/表单 |
-| `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端、WebSocket 帧、IP/CIDR、URL、MIME |
+| `std/net/` | 网络与 Web：TCP/UDP 套接字、本地套接字、DNS 报文与查询、HTTP 客户端与服务端骨架、路由、静态资源、会话、WebSocket 帧、IP/CIDR、URL、MIME |
 
 ```sh
 ./tcc/c6 -B tcc -I . -I examples -o build/wordcount \
@@ -149,7 +149,7 @@
 | `std/data/xml.c6` | `std.data.xml` | XML 零分配扫描（事件式，不做 DOM）：`xml_open` + `XmlReader.next`（`XML_START`/`XML_END`/`XML_SELF`/`XML_TEXT`）、`XmlEvent` 的 `name`/`text`/`attrs` 与 `attr_count`/`attr_at`/`attr`、`xml_unescape`（`&amp;` 等 5 个预定义实体 + `&#NNN;`/`&#xHH;`）；跳过注释/处理指令/DOCTYPE，CDATA 当文本，32 层标签配对校验，出错给字节位置 |
 | `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`Arena` 的 `json_parse`/`json_parse_at`、`Json` 的 `get`/`at`/`count`/`key`、`get_str`/`get_num`/`get_bool`、`write`/`write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
 
-**`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端）
+**`std/net/`**（网络与 Web：IP/CIDR、URL、MIME、UDP/本地套接字、DNS 查询、HTTP 客户端与服务端）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
@@ -166,6 +166,10 @@
 | `std/net/uds.c6` | `std.net.uds` | AF_UNIX 本地套接字：`uds_pair`（`socketpair`）/`uds_listen(path, backlog)`/`uds_connect(path, timeout_ms)` 工厂 + `Uds` 的 `write_bytes`/`write_all`/`read_bytes`/`read_all`/`set_timeout`/`shutdown_write`/`close_socket`/`ok`、`UdsPair` 的 `ok_pair`/`close_pair`；`read_*` 到对端关闭返回 0；超时长连接沿用 `std.net.tcp` 的非阻塞 connect + `poll`；路径 socket 的 `unlink` 交给调用方 |
 | `std/net/resolver.c6` | `std.net.resolver` | DNS 查询客户端（在 `std.net.dns` 报文层与 `std.net.udp` 传输层之上，零分配）：`resolver_open`（读 `/etc/resolv.conf`，没有就用 127.0.0.1:53）/`resolver_from_server` 工厂 + `Resolver` 的 `resolve_a`/`resolve_aaaa`/`resolve_ip`/`set_timeout`/`ok`、`parse_reply`（校验 id/TC/rcode 并提取 A/AAAA）；`resolver_conf_parse`/`resolver_conf_file` 单独暴露（能解内存里的 conf 文本），`ipv4_format`/`ipv6_format` 输出点分/压缩形式；一次一查，不做重试、EDNS0、DoT |
 | `std/net/httpc.c6` | `std.net.httpc` | HTTP/1.1 客户端（在 `std.net.tcp`/`std.net.url` 之上，零分配）：`build_request`（先量再写，容量不够返回 -1 且 `dst` 一个字节不动）、`fetch`（连接、发送、收到完整响应、解析一次到位）、`parse_response`（1 完整 / 0 还不够 / -1 坏报文）、`Response` 的 `is_ok`/`header`/`header_int` 与字段 `status`/`reason`/`body`/`chunked`/`content_length`/`needs_close`；请求自动补 `Host`/`User-Agent`/`Accept`/`Connection: close`/`Content-Length`（调用方自己给了就不重复），响应支持 chunked 解码（含扩展与 trailer）；只做 `http://`，不跟重定向、不做 100-continue |
+| `std/net/httpd.c6` | `std.net.httpd` | HTTP/1.1 服务端骨架（`std.net.http` + `std.net.tcp`，零分配）：`httpd_listen`/`accept_conn` 工厂 + `Server` 的 `port`/`set_timeout`/`close_socket`/`serve_once(handler, ud)`、`Conn` 的 `read_request`（1/0/-1，body 只按 `Content-Length`）/`begin`/`send_body`/`respond`/`respond_text`、`Request` 的 `method`/`target`/`path`/`query`/`body`/`header`；一次连接一个请求（响应带 `Connection: close`），chunked 请求与 absolute-form 一律 400，处理器返回 0 时回 404 |
+| `std/net/router.c6` | `std.net.router` | 方法与路径路由表（零分配、固定 32 条）：`Router` 的 `add(method, pattern, id)`/`match`/`count`/`clear` + `Match` 的 `param`/`has`/`rest`/`wildcard`/`id`；`:name` 捕获一段（最多 4 个参数）、`*`/`*name` 捕获剩余全部且只能在末尾、方法大小写不敏感且 `"*"` 匹配任意方法、先注册先赢、按 `/` 严格切段（`/a/` 不等于 `/a`） |
+| `std/net/assets.c6` | `std.net.assets` | 静态资源（在 `std.net.httpd` + `std.net.mime` 之上，零分配）：`assets_root(dir)` 工厂 + `Assets` 的 `resolve`（1 找到/0 不存在/-1 拒绝）/`serve`（200/403/404/500，8 KiB 流式写出）/`set_index`/`set_follow_links`/`ok`、`content_type_of`；先百分号解码再拒绝 `..` 段与 NUL，归一后必须仍在 root 下，默认 `lstat` 拒符号链接 |
+| `std/net/session.c6` | `std.net.session` | 内存会话（零分配、固定 16 槽）：`session_store`/`session_store_ttl` 工厂 + `Store` 的 `create`/`find`/`destroy`/`destroy_all`/`expire`/`cookie`/`from_cookie` + `Session` 的 `id`/`get`/`set`/`has`/`remove`/`clear`/`valid`；32 位十六进制 id 来自 `std.core.rand`（非密码学）、数据是 256 字节里的 `key=value\n` 行、cookie 名固定 `sid`（`Path=/; HttpOnly; SameSite=Lax; Max-Age=...`） |
 
 **集成示例**（`main` 只能写在模块外的文件里）
 
@@ -192,6 +196,7 @@
 | `examples/stdthread.c6` | （无模块） | 第十九批（并发与同步）的拼装示例（`make std-thread`）：原子计数 + 自旋锁、互斥锁 + 条件变量握手、线程池跑任务、通道收发，自带自检 |
 | `examples/stdterm.c6` | （无模块） | 第二十批（终端与进程控制）的拼装示例（`make std-term`）：伪终端检测/窗口大小/原始模式、信号处理与屏蔽、管道读写与 EOF、poll 多路等待，自带自检 |
 | `examples/stdclient.c6` | （无模块） | 第二十一批（网络客户端）的拼装示例（`make std-client`）：UDP 绑定/连接/空报文/超时、UDS socketpair 与路径 socket、resolv.conf 解析 + 本地 DNS 子进程上的一次 A 查询、本地 HTTP 子进程上的一次 chunked GET，自带自检 |
+| `examples/stdserve.c6` | （无模块） | 第二十二批（Web 服务端）的拼装示例（`make std-serve`）：httpd 收请求、router 分发（参数/通配符）、assets 发静态文件（含 403 越界）、session 的 Set-Cookie 往返，客户端用 `std.net.httpc` 打回本地服务端子进程，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -242,6 +247,10 @@ std/net/udp.c6             3 test(s), 0 failure(s)
 std/net/uds.c6             2 test(s), 0 failure(s)
 std/net/resolver.c6       36 test(s), 0 failure(s)
 std/net/httpc.c6          39 test(s), 0 failure(s)
+std/net/httpd.c6         33 test(s), 0 failure(s)
+std/net/router.c6         3 test(s), 0 failure(s)
+std/net/assets.c6        75 test(s), 0 failure(s)
+std/net/session.c6       45 test(s), 0 failure(s)
 std/os/env.c6              39 test(s), 0 failure(s)
 std/os/fs.c6               7 test(s), 0 failure(s)
 std/os/io.c6               5 test(s), 0 failure(s)
@@ -284,17 +293,23 @@ std/text/width.c6          10 test(s), 0 failure(s)
 | `std/container/chan.c6` 10 | chan 4 + sync 6（Mutex/Cond 的正文来自 `std.os.sync`） |
 | `std/net/resolver.c6` 36 | resolver 3 + dns 3 + udp 3 + io 5 + str 22（报文格式来自 dns、收发来自 udp，conf 读文件要 io） |
 | `std/net/httpc.c6` 39 | httpc 4 + tcp 3 + url 10 + str 22（连接用 tcp、拆 URL 用 url） |
+| `std/net/httpd.c6` 33 | httpd 3 + http 5 + tcp 3 + str 22（报文解析来自 http、连接来自 tcp） |
+| `std/net/assets.c6` 75 | assets 2 + httpd 33 + mime 37 + url 10 + fs 7 + io 5 + path 30 + str 22 + err 3（拼起来跑，块数会重复计） |
+| `std/net/session.c6` 45 | session 3 + rand 9 + time 7 + cookie 4 + str 22（id 用 rand、过期用 time、cookie 用 cookie） |
 
 `std/core/bits`、`std/core/crc`、`std/core/fixed`、`std/core/pool`、`std/core/hash`、`std/text/utf8`、`std/container/deque`、`std/text/ascii`、`std/text/num`、
 `std/encoding/codec`、`std/encoding/frame`、`std/core/rand`、`std/os/fs`、`std/encoding/base64`、`std/text/glob`、`std/encoding/base32`、`std/encoding/base58`、`std/encoding/varint`、`std/text/semver`、`std/net/cookie`、`std/net/inet`、`std/net/http`、`std/encoding/bitbuf`、`std/container/list`、`std/container/ring`、`std/text/utf16`、`std/text/ansi`、
-`std/data/props`、`std/net/multipart`、`std/net/udp`、`std/net/uds`
+`std/data/props`、`std/net/multipart`、`std/net/udp`、`std/net/uds`、`std/net/router`
 自成一体，单独跑就是自己的块数（props/multipart 只借 `Str` 这个类型）；`std/data/csv`、`std/net/url`、`std/data/ini` 只有声明依赖
 `std.text.str`（正文不调用），`std/net/mime` 的正文必须带 `std/os/path`，`std/encoding/sha256` 的正文
 必须带 `std/core/bits`，`std/os/env` 的正文必须带 `std/text/str`，`std/encoding/uuid` 的正文必须带
 `std/core/rand` 与 `std/os/time`，`std/container/pqueue` 的正文必须带 `std/container/sort`，`std/text/width` 与
 `std/encoding/punycode` 的正文必须带 `std/text/utf8`，`std/net/resolver` 的正文必须带
 `std/net/dns`、`std/net/udp`、`std/os/io`、`std/text/str`，`std/net/httpc` 的正文必须带
-`std/net/tcp`、`std/net/url`、`std/text/str`。
+`std/net/tcp`、`std/net/url`、`std/text/str`，`std/net/httpd` 的正文必须带
+`std/net/http`、`std/net/tcp`、`std/text/str`，`std/net/assets` 还要 `std/net/mime`、
+`std/net/url`、`std/os/fs`、`std/os/io`、`std/os/path`、`std/core/err`，`std/net/session`
+要 `std/core/rand`、`std/os/time`、`std/net/cookie`。
 
 ## 设计原则
 
@@ -2868,6 +2883,28 @@ stdclient: 36 check(s), 0 failure(s)
 示例离线可跑；Makefile 里显式列出十二个模块正文（udp/uds 只依赖
 `std/core/types.c6`，resolver 要 dns/udp/io/str，httpc 要 tcp/url/str）。
 
+### 集成示例：`examples/stdserve.c6`
+
+```sh
+make std-serve
+```
+
+```
+stdserve: 标准库第二十二批（httpd / router / assets / session）
+stdserve: 5 条路由 / 静态文件（含 403）/ 会话 Cookie 都通了
+stdserve: 28 check(s), 0 failure(s)
+```
+
+四节拼成一个小应用：`Router` 注册 `/`、`/hello/:name`、`/files/*path`、`/login`、
+`/me` 五条路由，`Assets` 指向 `build/stdserve-root`，`Store` 是默认 30 分钟的
+会话表；`fork` 出来的子进程连跑 7 个请求就退出，父进程用 `std.net.httpc` 依次
+发：参数路由（`hello, ada`）、`a.txt`（`Content-Type: text/plain`）、目录
+（落到 `index.html`）、`..%2f` 编码越界（403）、`/login`（拿到 `Set-Cookie:
+sid=...`）、带 Cookie 的 `/me`（`user=ada`）、不带 Cookie 的 `/me`（401）。
+所以这一批的客户端和服务端在同一个示例里互相验证，`make std-serve` 不联网。
+Makefile 里显式列出十九个模块正文（httpd 要 http/tcp，assets 还要
+mime/url/fs/io/path/err，session 要 rand/time/cookie，客户端要 httpc）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2906,6 +2943,8 @@ stdclient: 36 check(s), 0 failure(s)
   示例（自带自检）。
 * `make std-client`：`examples/stdclient.c6`，第二十一批（网络客户端）模块的拼装
   示例（自带自检）。
+* `make std-serve`：`examples/stdserve.c6`，第二十二批（Web 服务端）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
@@ -2923,6 +2962,13 @@ stdclient: 36 check(s), 0 failure(s)
   数据不够（返回 0 + `incomplete`）、body 缓冲太小、chunk 数据后缺 CRLF 都钉住。
 * `std/net/resolver.c6` 的 `parse_reply` 用例：id 不匹配、TC 置位、rcode 非 0、
   RR 被截断都返回 0/-1；`a`/`a16` 传 0 时不提取记录（只做校验）。
+* `std/net/assets.c6` 的「路径安全」用例：`/../etc/passwd`、`/sub/../../...`、
+  `%2e%2e` 编码、`%00` 解码、`//a.txt` 与 `/./a.txt` 都钉住（默认还拒符号链接）。
+* `std/net/session.c6` 的「过期与容量」用例：`expire(now)` 是按传入时钟回收（不
+  依赖 `sleep`）、ttl 到期后 `find` 给 0、16 槽满了之后 `create` 给 0、`destroy_all`
+  的计数。
+* `std/net/httpd.c6` 的「三态」用例：`read_request` 的 1/0/-1、chunked 请求与
+  不完整请求、`serve_once` 的 200/404/400 与空连接 0。
 * `std/encoding/uuid.c6` 的 v5 已知向量：与 Python `uuid.uuid5` 逐字节一致
   （`www.example.com` / `python.org` / `www.widgets.com`）。
 * `std/container/map.c6` 的「墓碑不会在扩容时复活」：删除留下墓碑后继续插入触发扩容，
