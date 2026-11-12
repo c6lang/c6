@@ -132,7 +132,7 @@ static void box_csv(void)
     char row[64] = { 0 };
     int fields = 0, rows = 0, sum = 0, multiline = 0, qty = 0;
 
-    while (csv_next(p, &f) > 0) {
+    while (p->next(&f) > 0) {
         fields++;
         if (p->col == 1 && p->row > 0 && str_to_int(f, &qty) == 0)
             sum += qty;
@@ -158,7 +158,7 @@ static void box_csv(void)
           "csv: 容量不足给 -1");
 
     r = csv_reader(bad_text);
-    while (csv_next(&r, &f) > 0)
+    while (r.next( &f) > 0)
         ;
     check(r.error == std.data.csv.PARSE, "csv: 未闭合引号报 PARSE");
 
@@ -168,8 +168,8 @@ static void box_csv(void)
         CsvReader qr = csv_reader(qtext);
         Str qf = { { (char *)0, 0 } };
 
-        csv_next(&qr, &qf);
-        csv_next(&qr, &qf);
+        qr.next( &qf);
+        qr.next( &qf);
         check(qf.s.len == 4, "csv: 引号字段视图是原始 4 字节");
         check(csv_unquote(qf, buf, sizeof buf) == 3
                   && strcmp(buf, "a\"b") == 0, "csv: unquote 折叠双引号");
@@ -199,38 +199,38 @@ static void box_json(void)
     int elen = 0;
     int blen = 0;
 
-    doc = json_parse(&a, str(json_text)) catch e {
+    doc = a.json_parse(str(json_text)) catch e {
         check(0, "json: 解析失败");
         return;
     };
     p = &doc;
     check(p->kind == std.data.json.JOBJ, "json: 顶层是对象");
-    check(p->json_count() == 5, "json: 顶层键数");
+    check(p->count() == 5, "json: 顶层键数");
 
-    name = p->json_get((char *)"name");
+    name = p->get((char *)"name");
     check(name != 0 && (&name->s)->eq(S("c6")), "json: 取字符串");
-    check(p->json_get_num((char *)"version", 0.0) == 4.0, "json: 取数字");
-    check(p->json_get_bool((char *)"stable", 0) == 1, "json: 取布尔");
-    check(p->json_get((char *)"missing") == 0, "json: 缺键给 0");
+    check(p->get_num((char *)"version", 0.0) == 4.0, "json: 取数字");
+    check(p->get_bool((char *)"stable", 0) == 1, "json: 取布尔");
+    check(p->get((char *)"missing") == 0, "json: 缺键给 0");
 
-    tags = p->json_get((char *)"tags");
-    check(tags != 0 && tags->json_count() == 3, "json: 数组长度");
-    tag = tags->json_at(1);
+    tags = p->get((char *)"tags");
+    check(tags != 0 && tags->count() == 3, "json: 数组长度");
+    tag = tags->at(1);
     check(tag != 0 && (&tag->s)->eq(S("sha256")), "json: 数组下标");
-    check(tags->json_at(9) == 0, "json: 下标越界给 0");
-    check(tags->json_key(0).s.len == 0, "json: 数组没有键");
+    check(tags->at(9) == 0, "json: 下标越界给 0");
+    check(tags->key(0).s.len == 0, "json: 数组没有键");
 
-    lim = p->json_get((char *)"limits");
-    max = lim ? lim->json_get((char *)"max") : 0;
+    lim = p->get((char *)"limits");
+    max = lim ? lim->get((char *)"max") : 0;
     check(max != 0 && (&max->raw)->eq(S("9007199254740993")),
           "json: 大整数保留原文");
     check(max != 0 && max->num == 9007199254740992.0, "json: 数值按 f64 存");
 
-    n = p->json_write(out, sizeof out);
+    n = p->write(out, sizeof out);
     check(n > 0 && (int)strlen(out) == n, "json: 紧凑写出长度");
     check(strstr(out, "9007199254740993") != 0, "json: 写出保留原文");
     memset(out, 0, sizeof out);
-    n = p->json_write_pretty(out, sizeof out, 2);
+    n = p->write_pretty(out, sizeof out, 2);
     check(n > 0 && strchr(out, '\n') != 0, "json: 缩进写出有换行");
 
     elen = json_escape(orig, esc, sizeof esc);
@@ -240,7 +240,7 @@ static void box_json(void)
     check(blen == orig.s.len
               && (&back_s)->eq(orig.s), "json: 转义往返");
 
-    json_parse(&a, STR("{\"a\":}")) catch e {
+    a.json_parse(STR("{\"a\":}")) catch e {
         err_id = e.id;
         goto parsed;
     };
@@ -270,10 +270,10 @@ static void box_sha256(void)
                       "b410ff61f20015ad") == 0, "sha256: abc");
     check((int)strlen(hex) == 64, "sha256: hex 是 64 个字符");
 
-    sha256_init(&st);
+    st.init();
     for (i = 0; i < 3; i++)
-        sha256_update(&st, (char *)"abc" + i, 1);
-    sha256_final(&st, dig);
+        st.update( (char *)"abc" + i, 1);
+    st.final( dig);
     sha256((void *)"abc", 3, dig2);
     check(sha256_eq(dig, dig2), "sha256: 分片与一次性一致");
 

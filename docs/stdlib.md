@@ -44,7 +44,7 @@
 | `std/core/hash.c6` | `std.core.hash` | 哈希：FNV-1a 32/64（`fnv1a_bytes`/`fnv1a_cstr`/`fnv1a64_bytes`）、`crc32_bytes`、`adler32_bytes`，以及流式 `Hasher`（`hasher`/`update`/`digest`） |
 | `std/core/math.c6` | `std.core.math` | 整数：`min`/`max`/`clamp`/`iabs`/`gcd`/`lcm`/`ipow`/`ipow_u64`/`imul_checked`/`sat_add`/`sat_mul`/`is_pow2`/`next_pow2`/`floor_div`/`mod`；浮点（不链 libm）：`sqrt`/`floor`/`ceil`/`trunc`/`round`/`fabs`/`nearly_eq`/`clamp_f64`/`fact` |
 | `std/core/mem.c6` | `std.core.mem` | 借用式内存池 `Arena`（`alloc`/`alloc_array`/`reset`/`room`/`used`）、托管堆薄包装 `alloc_new`/`alloc_new_array`/`dealloc`、按元素的 `copy`/`fill`/`zero`/`swap`/`rotate`/`reverse_bytes`、`align_up`/`align_down`/`is_aligned` |
-| `std/core/rand.c6` | `std.core.rand` | xorshift64* 伪随机：`rand_seed` + `(&r)->u64()`/`u32()`/`below()`（拒绝采样）/`int()`/`int_incl()`/`f64()`/`bool()`/`fill()`/`shuffle()`/`shuffle_int()`（方法名 `random_*`） |
+| `std/core/rand.c6` | `std.core.rand` | xorshift64* 伪随机：`rand_seed` + `Rand` 方法 `next_u64`/`next_u32`/`below`（拒绝采样）/`int_range`/`int_range_incl`/`next_f64`/`next_bool`/`fill`/`shuffle`/`shuffle_int` |
 | `std/core/types.c6` | `std.core.types` | 定宽类型 `u8…u64`/`i8…i64`、`usize`/`isize`、`f32`/`f64`、`byte`、`bool`，以及 `Limits`（`U8_MAX`…`I32_MIN`）/`Bool` 两个枚举 |
 
 **`std/text/`**（文本：字符串视图与缓冲、格式化、UTF-8、ASCII、浮点转换）
@@ -77,35 +77,35 @@
 | --- | --- | --- |
 | `std/os/env.c6` | `std.os.env` | 环境变量与命令行（POSIX）：`env_get`/`env_has`/`env_set`/`env_unset`、`env_home`/`env_tmpdir`/`env_path`/`env_user`、`env_get_int`/`env_get_u64`/`env_get_bool`、`env_args`/`env_argc`/`env_arg`/`env_prog` |
 | `std/os/fs.c6` | `std.os.fs` | POSIX 文件系统元数据与目录：`StatInfo`、`fs_stat`/`fs_lstat`/`fs_exists`/`fs_is_dir`/`fs_is_file`/`fs_size`、`fs_mkdir`/`fs_mkdir_p`/`fs_remove`/`fs_rmdir`/`fs_rename`、`fs_getcwd`/`fs_chdir`、零分配 `Dir` 遍历 |
-| `std/os/io.c6` | `std.os.io` | 文件与标准流：`Reader`（`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`/`close`）、`Writer`（`write_line`/`write_bytes`/`write_slice`/`flush`/`close`）、零分配的按行迭代 `CFile`（`has`/`next`）。方法名带 `reader_`/`writer_`/`cfile_` 前缀，调用照旧写 `pr->read_line(...)` |
+| `std/os/io.c6` | `std.os.io` | 文件与标准流：`Reader`（`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`/`close`）、`Writer`（`write_line`/`write_bytes`/`write_slice`/`flush`/`close`）、零分配的按行迭代 `CFile`（`has`/`next`）；调用一律写 `pr->read_line(...)` |
 | `std/os/path.c6` | `std.os.path` | POSIX 路径：`path_base`/`path_dir`/`path_ext`/`path_stem`/`path_is_abs`/`path_has_ext`/`path_split`、`path_join`/`path_normalize`（写调用方缓冲，放不下返回 -1 且不写半截） |
-| `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `(&d)->format(buf, cap)`（`duration_format`）、`Civil` 日历换算 `civil_from_unix`/`(&c)->to_unix()`（`civil_to_unix`）/`(&c)->format(...)`（`civil_format`），不依赖 localtime |
+| `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `d.format(buf, cap)`、`Civil` 日历换算 `civil_from_unix`/`c.to_unix()`/`c.format(...)`，不依赖 localtime |
 
 **`std/encoding/`**（编解码：Base64/十六进制/百分号、SHA-256、位流、UUID）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
 | `std/encoding/base64.c6` | `std.encoding.base64` | Base64（RFC 4648）标准表与 URL 安全表：`b64_encode`/`b64_decode`、`b64url_encode`/`b64url_decode`、显式表与填充的 `b64_encode_ex`/`b64_decode_ex`/`b64_decoded_len`/`b64_encoded_len`、`b64_valid`、就地 `b64_decode_inplace`/`b64url_decode_inplace`（跳过空白、严格填充、放不下不写半截） |
-| `std/encoding/bitbuf.c6` | `std.encoding.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`bw_put`/`bw_put_u64`/`bw_put_bit`/`bw_align`/`bw_put_bytes`/`bw_patch`（回填不改游标）、`br_open`/`br_get`/`br_get_u64`/`br_get_bit`/`br_peek`/`br_skip`/`br_align`/`br_get_bytes`、`bw_bits`/`bw_bytes`/`bw_ok`/`br_remaining`/`br_eof` |
+| `std/encoding/bitbuf.c6` | `std.encoding.bitbuf` | 位级读写器（零分配、MSB 先）：`bw_open`/`put`/`put_u64`/`put_bit`/`align`/`put_bytes`/`patch`（回填不改游标）、`br_open`/`get`/`get_u64`/`get_bit`/`peek`/`skip`/`align`/`get_bytes`、`bit_count`/`byte_count`/`ok`/`remaining`/`eof` |
 | `std/encoding/codec.c6` | `std.encoding.codec` | 文本编码（写调用方缓冲）：Base64 `b64_encode`/`b64_decode`/`*_len`（接受省略填充与空白）、十六进制 `hex_encode`/`hex_decode`/`*_len`、百分号 `pct_encode`/`pct_decode`/`*_len`（`+` 可选） |
-| `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `sha256_init`/`sha256_update`/`sha256_final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
-| `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`uuid_v4_seeded`、`uuid_v7`/`uuid_v7_at`/`uuid_time_v7`、`uuid_v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`/`uuid_format`/`uuid_format_simple`/`uuid_format_upper`、`uuid_version`/`uuid_variant`/`uuid_eq`/`uuid_nil`/`uuid_is_nil` |
+| `std/encoding/sha256.c6` | `std.encoding.sha256` | SHA-256 与 HMAC-SHA256（FIPS 180-4 / RFC 2104）：`Sha256` 的 `init`/`update`/`final`、一次性 `sha256`/`sha256_hex`、`hmac_sha256`/`hmac_sha256_hex`、常数时间 `sha256_eq` |
+| `std/encoding/uuid.c6` | `std.encoding.uuid` | UUID（RFC 9562/4122）：`uuid_v4`/`Rand` 的 `v4_seeded`、`uuid_v7`/`uuid_v7_at`/`time_v7`、`v5` 与四个预定义命名空间 `uuid_ns_dns`/`uuid_ns_url`/`uuid_ns_oid`/`uuid_ns_x500`、`uuid_parse`、`Uuid` 的 `format`/`format_simple`/`format_upper`、`version`/`variant`/`eq`/`uuid_nil`/`is_nil` |
 
 **`std/data/`**（数据格式：JSON、CSV、INI）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
-| `std/data/csv.c6` | `std.data.csv` | RFC 4180 CSV（零分配）：`CsvReader` 的 `csv_reader`/`csv_next`/`csv_rewind`（引号字段可跨行、CRLF、`""` 转义）、`csv_need_quote`/`csv_write_field`/`csv_write_row`（写调用方缓冲）、`csv_count_fields`/`csv_count_rows` |
-| `std/data/ini.c6` | `std.data.ini` | INI 配置的零分配读取：`ini_open`/`ini_next`（字段都是输入上的视图）、`ini_lookup`/`ini_has_section`/`ini_count`、`IniEntry.section`/`key`/`value`/`line`；语法错误给行号 |
-| `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`json_parse`/`json_parse_at`、`json_get`/`json_at`/`json_count`/`json_key`、`json_get_str`/`json_get_num`/`json_get_bool`、`json_write`/`json_write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
+| `std/data/csv.c6` | `std.data.csv` | RFC 4180 CSV（零分配）：`CsvReader` 的 `csv_reader`/`next`/`rewind`（引号字段可跨行、CRLF、`""` 转义）、`csv_need_quote`/`csv_write_field`/`csv_write_row`（写调用方缓冲）、`csv_count_fields`/`csv_count_rows` |
+| `std/data/ini.c6` | `std.data.ini` | INI 配置的零分配读取：`ini_open`/`next`（字段都是输入上的视图）、`ini_lookup`/`ini_has_section`/`ini_count`、`IniEntry.section`/`key`/`value`/`line`；语法错误给行号 |
+| `std/data/json.c6` | `std.data.json` | JSON（RFC 8259）解析与写出，DOM 住在 `std.core.mem` 的 `Arena` 上：`Json`（`JNULL`/`JBOOL`/`JNUM`/`JSTR`/`JARR`/`JOBJ`）、`Arena` 的 `json_parse`/`json_parse_at`、`Json` 的 `get`/`at`/`count`/`key`、`get_str`/`get_num`/`get_bool`、`write`/`write_pretty`/`json_escape`/`json_unescape`（数字保留原文、`\uXXXX` 与代理对解码、深度上限 64） |
 
 **`std/net/`**（网络与 Web：IP/CIDR、URL、MIME）
 
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
-| `std/net/inet.c6` | `std.net.inet` | IP 地址与 CIDR（零分配）：`inet_parse`/`inet_format`、`inet_parse_v4`/`inet_format_v4`、`inet_parse_v6`/`inet_format_v6`（输出按 RFC 5952 压缩）、`inet_parse_cidr`/`inet_cidr_contains`/`inet_cidr_mask`/`inet_v4_mask`、`inet_is_private`/`is_loopback`/`is_link_local`/`is_multicast`/`is_unspecified`、`inet_parse_port` |
+| `std/net/inet.c6` | `std.net.inet` | IP 地址与 CIDR（零分配）：`inet_parse`/`inet_parse_v4`/`inet_parse_v6`，`Ip`/`Ipv4`/`Ipv6` 的 `format`（IPv6 按 RFC 5952 压缩）、`inet_parse_cidr`/`cidr_contains`/`cidr_mask`/`inet_v4_mask`、`is_private`/`is_loopback`/`is_link_local`/`is_multicast`/`is_unspecified`、`inet_parse_port` |
 | `std/net/mime.c6` | `std.net.mime` | 扩展名 ↔ MIME 类型、分类与魔数嗅探（零分配）：`mime_of_ext`/`mime_of_path`/`mime_ext_of`/`mime_ext_at`/`mime_type_at`/`mime_count`、`mime_is_text`/`is_image`/`is_audio`/`is_video`/`is_font`、`mime_charset`、`mime_sniff`、`mime_default` |
-| `std/net/url.c6` | `std.net.url` | URL（RFC 3986）解析与相对解析：`Url` 的 `url_parse`/`url_effective_port`/`url_is_absolute`/`url_has_host`、`url_resolve`（§5.2 全算法）、查询参数 `url_next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
+| `std/net/url.c6` | `std.net.url` | URL（RFC 3986）解析与相对解析：`url_parse` 工厂 + `Url` 的 `effective_port`/`is_absolute`/`has_host`、`url_resolve`（§5.2 全算法）、查询参数 `next_pair`/`Pair`、百分号 `url_encode`/`url_encode_component`/`url_decode`/`url_decode_at`/`url_encoded_len`/`url_decoded_len` |
 
 **集成示例**（`main` 只能写在模块外的文件里）
 
@@ -407,8 +407,8 @@ b->slice();                              /* 当前内容的切片 */
 b->truncate(3);  b->clear();             /* 只改长度，容量留着 */
 b->reserve(4096) catch e { return 1; };  /* 翻倍策略写在库里 */
 
-/* 方法名是 strbuf_write / strbuf_count / strbuf_cstr …，上面这些写法都对：
-   普通结构体（体内写不了方法体）的方法按 strbuf_* 注册，符号不与别的模块抢 */
+/* 方法名就是 write / count / cstr …；普通结构体（体内写不了方法体）的方法
+   写在体外，模块里的裸名弱别名带模块前缀，不会和别的模块抢符号 */
 ```
 
 和 `Buf@(N)` 的分工：上限是常量（协议头、日志行）就用 `Buf@(N)`，纯值、零
@@ -451,8 +451,8 @@ u32 c = crc32_bytes("123456789", 9);     /* 0xCBF43926 */
 u64 h64 = fnv1a64_bytes(p, n);
 
 Hasher st = hasher();                    /* 流式：分几段喂结果一样 */
-(&st)->update(s1.data, (usize)s1.len);   /* = hasher_update(&st, ...) */
-u32 d = (&st)->digest();                 /* = hasher_digest(&st) */
+st.update(s1.data, (usize)s1.len);
+u32 d = st.digest();
 
 popcount32(0xf0f0f0f0u);  clz32(1u);  ctz32(8u);   /* 0 输入给 32/64 */
 rotl32(v, 1);  bswap32(v);  mask_range(4, 8);
@@ -572,13 +572,13 @@ import std.core.rand;
 import std.os.time;
 
 Rand r = rand_seed(now_ns());           /* 纯值，可重放：同一个种子同一串数 */
-u64 x = (&r)->u64();                    /* = random_u64(&r) */
-int d6 = (&r)->int_incl(1, 6);          /* [1, 6] */
-u64 b = (&r)->below(100);               /* [0, 100)，拒绝采样，无余数偏置 */
-f64 p = (&r)->f64();                    /* [0, 1) */
+u64 x = r.next_u64();                   /* 下一个 64 位 */
+int d6 = r.int_range_incl(1, 6);        /* [1, 6] */
+u64 b = r.below(100);                   /* [0, 100)，拒绝采样，无余数偏置 */
+f64 p = r.next_f64();                   /* [0, 1) */
 
 int a[10] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-(&r)->shuffle_int((int[:]){ a, 10 });
+r.shuffle_int((int[:]){ a, 10 });
 ```
 
 算法是 xorshift64*（只用 u64 的异或/移位/乘），种子 0 换成非零常量（全零状态
@@ -601,13 +601,13 @@ Dir d = dir_open("std");
 Dir *pd = &d;
 char name[256] = { 0 };
 int is_dir = 0;
-while (pd->dir_next(name, sizeof name, &is_dir) > 0) { ... }
-pd->dir_close();
+while (pd->next(name, sizeof name, &is_dir) > 0) { ... }
+pd->close();
 ```
 
 `std.os.io` 管内容、`std.os.fs` 管元数据和目录。`errno` 被翻译成 `std.core.err` 的码：
 不存在 → `NO_ENT`、已存在 → `EXIST`、参数/不是目录/没权限 → `INVAL`、其余 →
-`IO`。`dir_next` 返回 1 取到、0 结束、-1 出错、**-2 名字比 cap 长**（不截断，
+`IO`。`next` 返回 1 取到、0 结束、-1 出错、**-2 名字比 cap 长**（不截断，
 让调用方加大 buffer）；"."/".." 照常返回。`is_dir` 取自 `dirent.d_type`，
 `DT_UNKNOWN` 时给 0。这一层依赖 POSIX，freestanding 目标用不了（io 至少只要
 stdio）。
@@ -640,21 +640,21 @@ import std.text.str;
 char pool[4096] = { 0 };                     /* DOM 住在这块内存里，不 malloc */
 Arena a = arena_make(pool, (int)sizeof pool);
 Str text = { S("{\"n\": 3, \"ok\": true}") };  /* char[:] 不会隐式转成 Str */
-Json root = json_parse(&a, text) catch e { return e.id; };
+Json root = a.json_parse(text) catch e { return e.id; };
 Json *p = &root;
 
-Json *n = p->json_get("n");                  /* 找不到 / 不是对象给 0 */
-int ok = p->json_get_bool("ok", 0);
-f64 v = p->json_get_num("n", 0.0);
+Json *n = p->get("n");                  /* 找不到 / 不是对象给 0 */
+int ok = p->get_bool("ok", 0);
+f64 v = p->get_num("n", 0.0);
 char out[64] = { 0 };
-p->json_write(out, sizeof out);               /* {"n":3,"ok":true} */
+p->write(out, sizeof out);               /* {"n":3,"ok":true} */
 ```
 
 `Json` 是纯值结构体，解析出来的整棵树都由传进去的 `Arena` 分配：`reset` 一次
 全部释放，不碰 `malloc`、不引入托管引用（所以 `std.data.json` 在 freestanding 目标
 也能用，只要 `std.core.mem` 的 alloc 还在）。字符串值解码进 arena，键和值都是指向
 arena 的 `Str` 视图；`json_parse` 失败时消息是静态描述，要定位就换
-`json_parse_at`（多一个 `int *err_pos`，写字节偏移）。
+`a.json_parse_at(text, &pos)`（多一个 `int *err_pos`，写字节偏移）。
 
 语义钉死的几处：
 
@@ -668,10 +668,10 @@ arena 的 `Str` 视图；`json_parse` 失败时消息是静态描述，要定位
   `inf`/`nan` 写成 `null`，因为 JSON 没有这两个字面量）。
 * **递归上限 64 层**，超过给 `RANGE`；空输入/只有空白给 `INVAL`；arena 满给
   `NOMEM`。
-* `json_get` 对重复键返回**最后**一个；`json_count`/`json_at`/`json_key` 只在
+* `get` 对重复键返回**最后**一个；`count`/`at`/`key` 只在
   对应容器上有效。
 * 写函数都是「先算长度再写」：容量不够返回 -1 且一个字节都不写；
-  `json_write_pretty(..., indent)` 每层缩进 `indent` 个空格（`<= 0` 当 2）。
+  `write_pretty(..., indent)` 每层缩进 `indent` 个空格（`<= 0` 当 2）。
 
 ### `sha256`
 
@@ -685,18 +685,18 @@ Sha256 st = { { 0 }, 0, { 0 }, 0 };
 sha256("abc", 3, dig);                       /* 一次性 */
 sha256_hex("abc", 3, hex);                   /* "ba7816bf…15ad"，小写 + NUL */
 
-sha256_init(&st);                            /* 流式：任意切分结果相同 */
-sha256_update(&st, "a", 1);
-sha256_update(&st, "bc", 2);
-sha256_final(&st, dig);
+st.init();                            /* 流式：任意切分结果相同 */
+st.update("a", 1);
+st.update("bc", 2);
+st.final(dig);
 
 hmac_sha256(key, klen, msg, mlen, dig);      /* RFC 2104 */
 sha256_eq(dig, other32);                     /* 常数时间比较，1/0 */
 ```
 
 FIPS 180-4 的纯实现：只用 `memcpy`/`memset`，不分配、不链 libm、不碰宿主加密
-库。`sha256_update` 支持 1 字节一喂和任意块边界（63/64/65 都测过），
-`sha256_final` 之后想复用就再 `init`。HMAC 的 key 超过 64 字节先哈希，ipad/opad
+库。`update` 支持 1 字节一喂和任意块边界（63/64/65 都测过），
+`final` 之后想复用就再 `init`。HMAC 的 key 超过 64 字节先哈希，ipad/opad
 在栈上算。已知向量（空串、`"abc"`、两块的 NIST 串、一百万 `a`，以及 RFC 4231
 的 HMAC 用例 1/2/6）全部钉在 `std/encoding/sha256.c6` 的 `test` 块里。
 
@@ -711,7 +711,7 @@ CsvReader r = csv_reader(text);               /* 纯值：按值声明、按值�
 CsvReader *p = &r;
 Str f = { { (char *)0, 0 } };
 
-while (csv_next(p, &f) > 0) {                 /* 1 有字段、0 结束、-1 格式错 */
+while (p->next(&f) > 0) {                 /* 1 有字段、0 结束、-1 格式错 */
     /* f 是输入里的视图；p->row / p->col / p->at_eol 告诉你位置 */
     if (p->at_eol)
         putchar('\n');
@@ -810,14 +810,14 @@ import std.net.url;
 
 Url u = url_parse(S("https://user:pw@example.com:8443/a/b?q=1&r=2#frag"));
 u.ok;  u.scheme;  u.userinfo;  u.host;  u.port;  u.path;  u.query;  u.fragment;
-url_effective_port(&u);            /* 8443；没写端口时按 scheme 给 80/443/21/23 */
+u.effective_port();            /* 8443；没写端口时按 scheme 给 80/443/21/23 */
 
 char out[256] = { 0 };
 url_resolve(S("http://a/b/c/d;p?q"), S("../g"), out, sizeof out);   /* "http://a/b/g" */
 
 Pair p = { { { (char *)0, 0 } }, { { (char *)0, 0 } } };
 int at = 0;
-while (url_next_pair(&u.query, &at, &p))
+while (u.query.next_pair(&at, &p))
     printf("%.*s = %.*s\n", p.key.s.len, p.key.s.data,
            p.value.s.len, p.value.s.data);
 ```
@@ -845,17 +845,17 @@ import std.encoding.uuid;
 Uuid a = uuid_v4();                            /* 随机 */
 Uuid b = uuid_v7();                            /* 时间排序：前 48 位是 Unix 毫秒 */
 Uuid ns = uuid_ns_dns();
-Uuid c = uuid_v5(&ns, S("www.example.com"));   /* 2ed6657d-e927-568b-95e1-2665a8aea6a2 */
+Uuid c = ns.v5(S("www.example.com"));   /* 2ed6657d-e927-568b-95e1-2665a8aea6a2 */
 
 char buf[40] = { 0 };
-(&a)->format(buf, sizeof buf);                 /* 36 字符 + NUL */
-uuid_format_simple(&a, buf, sizeof buf);       /* 32 字符，不带连字符 */
+a.format(buf, sizeof buf);                 /* 36 字符 + NUL */
+a.format_simple(buf, sizeof buf);       /* 32 字符，不带连字符 */
 Uuid back = { { 0 } };
 uuid_parse(S("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), &back);   /* 1 */
 
-uuid_version(&c);      /* 5 */
-uuid_variant(&c);      /* 1 = RFC 4122 */
-uuid_time_v7(&b);      /* 版本 7 里那 48 位毫秒时间戳 */
+c.version();      /* 5 */
+c.variant();      /* 1 = RFC 4122 */
+b.time_v7();      /* 版本 7 里那 48 位毫秒时间戳 */
 ```
 
 `Uuid` 是 16 字节的**纯值**（`struct Uuid { u8 b[16]; }`），可放进别的结构体、按
@@ -865,9 +865,9 @@ uuid_time_v7(&b);      /* 版本 7 里那 48 位毫秒时间戳 */
 | --- | --- | --- |
 | `uuid_v4` | 时钟 + 栈地址播种的 `std.core.rand` | 通用唯一标识；**不是密码学随机** |
 | `uuid_v7` | Unix 毫秒 + 随机位 | 数据库主键之类「想按时间聚簇」的场合（同毫秒内不保证严格单调） |
-| `uuid_v5` | 无（SHA-1 散列） | 同一命名空间 + 名字永远给同一个 UUID；SHA-1 只在文件内部实现，不链加密库 |
+| `v5` | 无（SHA-1 散列） | 同一命名空间 + 名字永远给同一个 UUID；SHA-1 只在文件内部实现，不链加密库 |
 
-要可重现的用例用 `uuid_v4_seeded(&r)` / `uuid_v7_at(ms, &r)`。`uuid_parse` 接受
+要可重现的用例用 `r.v4_seeded()` / `uuid_v7_at(ms, &r)`。`uuid_parse` 接受
 36 字符、32 字符、带 `urn:uuid:` 前缀与 `{}` 包装的形式，大小写不敏感；坏输入返回 0
 且**不动 `*out`**。
 
@@ -906,7 +906,7 @@ char buf[64] = { 0 };
 
 inet_parse(S("192.168.0.1"), &a);          /* 1；a.family = IP_V4 */
 inet_parse(S("2001:db8::1"), &a);          /* 1；a.family = IP_V6 */
-inet_format(&a, buf, sizeof buf);          /* "2001:db8::1" */
+a.format(buf, sizeof buf);          /* "2001:db8::1" */
 
 Ip net = { 0 };
 int prefix = 0;
@@ -914,14 +914,14 @@ Ip host = { 0 };
 
 inet_parse_cidr(S("10.0.0.0/8"), &net, &prefix);      /* 1，prefix = 8 */
 inet_parse(S("10.1.2.3"), &host);
-inet_cidr_contains(&net, prefix, &host);              /* 1 */
+net.cidr_contains(prefix, &host);              /* 1 */
 
 u16 port = 0;
 inet_parse_port(S("8443"), &port);                    /* 1 */
 ```
 
 `Ip` 是纯值（`int family` + 16 字节），v4 用前 4 字节，所以同一个类型能装两种
-地址、也能互相比较（`inet_eq` 要求族相同）。
+地址、也能互相比较（`eq` 要求族相同）。
 
 解析的严格性是**刻意的**，为的是让「看起来像地址但其实不是」的东西尽早露出来：
 
@@ -945,15 +945,15 @@ import std.encoding.bitbuf;
 char buf[16] = { 0 };
 BitWriter w = bw_open(buf, (int)sizeof buf);
 
-bw_put(&w, 2, 3)   catch e { return e.id; };   /* 版本 3 位 */
-bw_put(&w, 0x1f, 5) catch e { return e.id; };  /* 标志 5 位 */
-bw_put(&w, 300, 16) catch e { return e.id; };  /* 长度 16 位 */
-bw_put_bytes(&w, S("hi")) catch e { return e.id; };
-bw_bits(&w);                                   /* 40 */
+w.put(2, 3)   catch e { return e.id; };   /* 版本 3 位 */
+w.put(0x1f, 5) catch e { return e.id; };  /* 标志 5 位 */
+w.put(300, 16) catch e { return e.id; };  /* 长度 16 位 */
+w.put_bytes(S("hi")) catch e { return e.id; };
+w.bit_count();                                   /* 40 */
 
-BitReader r = br_open((char[:]){ buf, bw_bytes(&w) });
+BitReader r = br_open((char[:]){ buf, w.byte_count() });
 u32 ver = 0;
-br_get(&r, 3, &ver) catch e { return e.id; };  /* ver = 2 */
+r.get(3, &ver) catch e { return e.id; };  /* ver = 2 */
 ```
 
 * **位序是 MSB-first**（同一字节里先出现的是高位）——Deflate/JPEG 之外的格式
@@ -962,13 +962,13 @@ br_get(&r, 3, &ver) catch e { return e.id; };  /* ver = 2 */
   清 0，所以没写到的地方保持原样；
 * **越界是错误而不是截断**：写侧 `FULL`、读侧 `SHORT`，两种情况都**不动游标**、
   也不写半截（一次调用要么整段成功要么整段失败）；
-* `bw_patch(w, at, v, n)` 在字节对齐处回填 8/16/32 位**且不移动游标**，
-  用于「长度先留空、写完再补」；`bw_align`/`br_align` 补/跳 0 到字节边界；
-* `bw_put_bytes`/`br_get_bytes` 要求已经在字节边界上，否则 `INVAL`（半个字节的
+* `w->patch(at, v, n)` 在字节对齐处回填 8/16/32 位**且不移动游标**，
+  用于「长度先留空、写完再补」；`align`/`align` 补/跳 0 到字节边界；
+* `put_bytes`/`get_bytes` 要求已经在字节边界上，否则 `INVAL`（半个字节的
   读写在协议里没有意义）；
 * `n == 0` 是合法空操作，`n` 超过 32/64 是 `INVAL`。
 
-错误码记在 `w.err`/`r.err` 里（第一个错误的 id），`bw_ok`/`r.err` 可以事后查。
+错误码记在 `w.err`/`r.err` 里（第一个错误的 id），`ok`/`r.err` 可以事后查。
 
 ### `pqueue`：二叉堆
 
@@ -1014,7 +1014,7 @@ char[:] t = { text, (int)strlen(text) };
 IniReader r = ini_open(t);
 IniEntry e = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                { { (char *)0, 0 } }, 0 };
-while (ini_next(&r, &e) == 1) {
+while (r.next(&e) == 1) {
     /* e.section / e.key / e.value 都是输入上的视图，e.line 是行号 */
 }
 
@@ -1031,7 +1031,7 @@ ini_lookup(t, S("db"), S("host"), &host);      /* 1 */
   （`section` 是空视图）；
 * `key = value` 用**第一个** `=` 分隔，两侧 trim，所以值里可以再出现 `=`；
   值可以为空（`k =`），键不能为空；
-* 其它非空行都是**语法错误**：`ini_next` 返回 -1，行号在 `r.err`（1 起），
+* 其它非空行都是**语法错误**：`next` 返回 -1，行号在 `r.err`（1 起），
   之后可以继续读下一行；`ini_lookup`/`ini_has_section`/`ini_count` 遇到坏行
   直接放弃（`ini_count` 给 -1），不假装读到了后面的键；
 * 键或节重复时 `ini_lookup` 给**最后一个**（「后写覆盖先写」）。
@@ -1137,21 +1137,20 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
   `int count(Str *self)`；泛型结构体才能在 `struct` 体内写方法体
   （`struct Split { int has() { ... } }` 会被拒：`a function cannot be defined
   inside a struct`）。
-* **普通结构体的方法名要带「接收者前缀」**（`reader_read_line`、
-  `writer_flush`、`strbuf_write`、`arena_alloc`、`random_below`、
-  `hasher_update`、`dir_next`、`duration_format`）。原因：体内写不了方法体，
-  写在体外的函数除了 `T_方法名` 还会**按裸名发一个弱别名**给纯 C 侧链接，
-  于是 `write`、`push`、`clear`、`update`、`close`、`alloc` 这些通用名字会同时
-  出现在整个程序里，谁手写一个同名函数就互相顶掉（弱别名只指向本 TU 第一个取到
-  该名字的定义）。带前缀后调用侧读起来仍然是方法（`pr->read_line(...)`
-  就是 `reader_read_line(&pr, ...)`），但全局符号名不会撞。
+* **普通结构体的方法名直接用动词，不加接收者前缀**（`read_line`、`flush`、
+  `write`、`alloc`、`below`、`update`、`next`、`format`）。体内写不了方法体，
+  方法写成体外函数；`std` 的每个文件都是 module，裸名弱别名带模块前缀，不会
+  进全局命名空间，同一模块里不同结构体的同名方法也按 `<Tag>_<name>` 区分
+  （`Reader.close` 与 `Writer.close` 可以共存）。调用侧统一写
+  `pr->read_line(...)` / `v.write(...)`；工厂和一次性函数仍是自由函数
+  （`reader_open`、`rand_seed`、`bw_open`）。
 * **例外：`foreach` 的迭代器协议只认字面上的 `has()` / `next()`**
   （`tcc/tccgen.c` 的 `c6_iter_proto_of` 用 `tok_alloc_const("has"/"next")`
   找方法），所以 `Split`/`Lines`/`Fields`/`Range`/`StepRange`/`CFile` 之外的
-  迭代器不能把这两个方法改名；反过来，这类方法一律**不加前缀**，否则
+  迭代器不能把这两个方法改名；名字必须是字面上的 `has`/`next`，否则
   `foreach` 会报「no 'has'/'next' iterator」。同名的 `has`/`next` 分属不同
-  tag 时彼此的弱别名会互相覆盖，但方法调用（`it->has()`）不受影响。
-* 值容器调方法要 `(&v)->m()`；`@T` 托管的变量直接 `v->m()`。
+  tag 时弱别名只保留一个，但方法调用（`it->has()`）按接收者解析，不受影响。
+* 值容器调方法写 `v.m()`（或 `(&v)->m()`）；`@T` 托管的变量直接 `v->m()`。
 * 泛型体内方法的隐式接收者叫 **`self`**（不是 `this`）。
 * 方法名不能和字段同名（`int len;` + `int len()` → `field not found`）。
 * `S()` 这类宏**不随 `import` 传递**：谁的代码里用，谁自己定义一次。
@@ -1187,7 +1186,7 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
 | --- | --- |
 | 模板体内方法不能返回**多参数泛型实例**或**元组**（`Entry@(K,V) next()`、`(K,V) next()` → `declaration expected`） | 返回单参数类型或标量，多出来的东西走 `cur` 字段（`Map` 的迭代器就是这么做的），或者干脆不提供工厂方法 |
 | 泛型**值形参**的模板写 `struct Buf@(int N)`、实例写 `Buf@(8)`（`Buf@(int, 8)` 会被当成两个实参） | 记住「声明带类型和名字，实例只给值」 |
-| **普通**（非泛型）结构体不能在 `struct` 体内写方法体（`a function cannot be defined inside a struct`） | 方法写成「第一个参数是结构体指针」的文件作用域函数，调用写 `(&v)->m()` |
+| **普通**（非泛型）结构体不能在 `struct` 体内写方法体（`a function cannot be defined inside a struct`） | 方法写成「第一个参数是结构体指针」的文件作用域函数，调用写 `v.m()`（或 `(&v)->m()`） |
 | 文件作用域里写「参数/返回类型带实例类型」的辅助函数，会让**导入这个模块的每个 TU** 都提前实例化该类型 | 别这么写；需要时把逻辑放进 `test` 块或用标量参数（`std/text/fmt.c6` 的测试用 `goto` 取错误码）。在导入方写 `static int f(Set@int *s)` 再调 `s->has()` 还会得到 pointer/integer 警告（返回值类型没解析对），见上面「写法约定」 |
 | ~~往 `Buf@(N)` 里加若干形状相同的方法会挂~~（曾经的 `skip(')')` → `end_macro()` 死循环） | **已消失**：同形状方法（`char tmp[16]` + 进/移位 + `(char)` 强转）加到五个也编得过、跑得通，`std/text/fmt` 的 `write_u64`/`write_hex`/`write_bin`/`write_bool`/`write_ptr` 就是照这个形状补的（`tccpp.c` 的宏重放改写之后不再复现） |
 | ~~把 `Buf@(N)` 的 `write_hex` 形参从 `u32` 加宽到 `u64` 会**挂住编译器**~~（当时 `-c` 无输出直到超时，退出码 124） | **现在复现不出来**：当前 `std/text/fmt.c6` 的 body、旧版 body、带 `(char)` 强转的写法都在 1 秒内编过，`-test` 也是 10 个块全过。`write_hex(u32)`/`write_hex64(u64)` 双入口保留只是为了不动 API |
@@ -1211,7 +1210,7 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。
 * `std/encoding/bitbuf.c6` 的「整段字节」用例：写/读两侧共用一套边界，钉住
-  `bw_put_bytes`/`br_get_bytes` 的起始下标（曾经在循环里用增长中的游标当下标，
+  `put_bytes`/`get_bytes` 的起始下标（曾经在循环里用增长中的游标当下标，
   第二字节写到了下一格）。
 * `std/container/pqueue.c6` 的「交错 push/pop」：100 次混合操作，每步都跑 `is_valid()`，
   钉住 sift_up/sift_down 的四种交换方向。

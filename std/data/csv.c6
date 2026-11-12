@@ -6,7 +6,7 @@
  *     CsvReader r = csv_reader(text);       // 纯值：可以按值传、可以 rewind 重跑
  *     Str f = { { (char *)0, 0 } };
  *     for (;;) {
- *         int rc = csv_next(&r, &f);
+ *         int rc = r.next( &f);
  *         if (rc <= 0)
  *             break;                        // 0 结束，-1 格式错（看 r.error）
  *         ...                                // f 是输入里的视图，不复制
@@ -20,7 +20,7 @@
  *
  * 读取器只持有「输入视图 + 游标」，**一个字节都不分配、也不复制输入**，所以字段
  * 是输入里的视图（`Str`），多长都不截断。代价是引号字段里成对的 `""` 没法在
- * 视图里折成一个 `"`（折叠会改变长度，只能复制）：`csv_next` 返回的是**引号内
+ * 视图里折成一个 `"`（折叠会改变长度，只能复制）：`next` 返回的是**引号内
  * 的原始字节**，要真值再调 `csv_unquote(f, buf, cap)` 展开到自己的缓冲里
  * （长度先用 `csv_unquoted_len`）。不含 `""` 的字段——绝大多数——视图就是真值。
  *
@@ -34,7 +34,7 @@
  *   - 空输入立刻返回 0，`error` 保持 0；末尾换行不产生额外空记录；真的空行才
  *     是一条记录一个空字段（`"a,b\n\n"` → 2 条记录 3 个字段）；
  *   - 停在一个 `,` 之后直到 EOF，还有一个收尾空字段（`"a,b,"` → 3 个字段）；
- *   - 开头 UTF-8 BOM 在 `csv_reader`/`csv_rewind` 里跳过；
+ *   - 开头 UTF-8 BOM 在 `csv_reader`/`rewind` 里跳过；
  *   - 返回 1 之后 `row`/`col` 指向**刚返回的字段**，`at_eol` 说明它是不是本记录
  *     最后一个；`error` 一旦非 0，后面的调用一律返回 -1；
  *   - 每次调用先清空 `*out`，所以返回 0 / -1 时它是空视图（不留上一次的旧值）。
@@ -162,7 +162,7 @@ CsvReader csv_reader(Str text)
 }
 
 /* 回到开头重跑一遍：保留 text，游标/计数器/错误全部复位 */
-void csv_rewind(CsvReader *self)
+void rewind(CsvReader *self)
 {
     if (!self)
         return;
@@ -175,7 +175,7 @@ void csv_rewind(CsvReader *self)
 
 /* 下一个字段：1 有字段（*out 是输入里的视图），0 结束，-1 格式错。
    `self == 0` 当作没有数据（0）；`*out == 0` 报 INVAL 并给 -1。 */
-int csv_next(CsvReader *self, Str *out)
+int next(CsvReader *self, Str *out)
 {
     int n = 0, b = 0, fs = 0, end = 0, row = 0, col = 0;
 
@@ -279,7 +279,7 @@ int csv_next(CsvReader *self, Str *out)
 }
 
 /* 把 `""` 展开成 `"` 写进调用方缓冲：成功返回字节数（不含结尾 NUL），放不下
-   返回 -1 且一个字节都不写。只对引号字段有意义（`csv_next` 给的是原始字节）。 */
+   返回 -1 且一个字节都不写。只对引号字段有意义（`next` 给的是原始字节）。 */
 int csv_unquote(Str field, char *dst, int cap)
 {
     int i = 0, n = csv_len(field), o = 0;
@@ -382,7 +382,7 @@ int csv_count_fields(Str text)
     int rc = 0, k = 0;
 
     for (;;) {
-        rc = csv_next(&r, &f);
+        rc = r.next( &f);
         if (rc < 0)
             return -1;
         if (rc == 0)
@@ -399,7 +399,7 @@ int csv_count_rows(Str text)
     int rc = 0, k = 0;
 
     for (;;) {
-        rc = csv_next(&r, &f);
+        rc = r.next( &f);
         if (rc < 0)
             return -1;
         if (rc == 0)
@@ -416,19 +416,19 @@ test "简单记录 a,b,c 按逗号切分" {
     CsvReader r = csv_reader(t);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != 1 || !EQ(f, "a"))
+    if (r.next( &f) != 1 || !EQ(f, "a"))
         return err(1, "第一个字段不是 a");
     if (r.row != 0 || r.col != 0 || r.at_eol != 0)
         return err(2, "第一个字段的 row/col/at_eol 不对");
-    if (csv_next(&r, &f) != 1 || !EQ(f, "b") || r.col != 1)
+    if (r.next( &f) != 1 || !EQ(f, "b") || r.col != 1)
         return err(3, "第二个字段不对");
-    if (csv_next(&r, &f) != 1 || !EQ(f, "c"))
+    if (r.next( &f) != 1 || !EQ(f, "c"))
         return err(4, "第三个字段不对");
     if (r.row != 0 || r.col != 2 || r.at_eol != 1)
         return err(5, "最后一个字段应当 at_eol 且 col == 2");
-    if (csv_next(&r, &f) != 0)
+    if (r.next( &f) != 0)
         return err(6, "读完应当返回 0");
-    if (csv_next(&r, &f) != 0)
+    if (r.next( &f) != 0)
         return err(7, "结束之后再读还是 0");
     if (r.error != 0)
         return err(8, "正常读完不该有 error");
@@ -439,7 +439,7 @@ test "空输入立刻结束" {
     CsvReader r = csv_reader(t);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != 0 || f.s.len != 0)
+    if (r.next( &f) != 0 || f.s.len != 0)
         return err(9, "空输入应当返回 0 和一个空视图");
     if (r.error != 0)
         return err(10, "空输入不该报错");
@@ -452,9 +452,9 @@ test "单字段没有逗号" {
     CsvReader r = csv_reader(t);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != 1 || !EQ(f, "abc") || r.at_eol != 1)
+    if (r.next( &f) != 1 || !EQ(f, "abc") || r.at_eol != 1)
         return err(12, "单字段应当原样给出且 at_eol");
-    if (csv_next(&r, &f) != 0)
+    if (r.next( &f) != 0)
         return err(13, "单字段之后应当结束");
     if (csv_count_fields(t) != 1 || csv_count_rows(t) != 1)
         return err(14, "单字段的计数应当是 1/1");
@@ -467,22 +467,22 @@ test "空字段 a,,c 与末尾空字段 a,b," {
     CsvReader r2 = csv_reader(tail);
     Str f = { S("") };
 
-    if (csv_next(&r1, &f) != 1 || !EQ(f, "a"))
+    if (r1.next( &f) != 1 || !EQ(f, "a"))
         return err(15, "a,,c 的第一个字段不对");
-    if (csv_next(&r1, &f) != 1 || f.s.len != 0 || r1.col != 1)
+    if (r1.next( &f) != 1 || f.s.len != 0 || r1.col != 1)
         return err(16, "中间的空字段没读出来");
-    if (csv_next(&r1, &f) != 1 || !EQ(f, "c") || r1.col != 2)
+    if (r1.next( &f) != 1 || !EQ(f, "c") || r1.col != 2)
         return err(17, "a,,c 的第三个字段不对");
     if (csv_count_fields(mid) != 3 || csv_count_rows(mid) != 1)
         return err(18, "a,,c 的计数不对");
 
-    if (csv_next(&r2, &f) != 1 || !EQ(f, "a") || r2.at_eol != 0)
+    if (r2.next( &f) != 1 || !EQ(f, "a") || r2.at_eol != 0)
         return err(19, "a,b, 的第一个字段不对");
-    if (csv_next(&r2, &f) != 1 || !EQ(f, "b"))
+    if (r2.next( &f) != 1 || !EQ(f, "b"))
         return err(20, "a,b, 的第二个字段不对");
-    if (csv_next(&r2, &f) != 1 || f.s.len != 0 || r2.col != 2 || r2.at_eol != 1)
+    if (r2.next( &f) != 1 || f.s.len != 0 || r2.col != 2 || r2.at_eol != 1)
         return err(21, "末尾空字段没读出来");
-    if (csv_next(&r2, &f) != 0)
+    if (r2.next( &f) != 0)
         return err(22, "末尾空字段之后应当结束");
     if (csv_count_fields(tail) != 3 || csv_count_rows(tail) != 1)
         return err(23, "a,b, 应当是 3 个字段 1 条记录");
@@ -495,7 +495,7 @@ test "CRLF 与孤立 CR 都是记录分隔" {
     int fields = 0, rows = 0, rc = 0;
 
     for (;;) {
-        rc = csv_next(&r, &f);
+        rc = r.next( &f);
         if (rc < 0)
             return err(24, "合法的 CRLF/CR 输入不该报错");
         if (rc == 0)
@@ -525,16 +525,16 @@ test "引号字段里的逗号与换行" {
     CsvReader rm = csv_reader(m);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != 1 || !EQ(f, "a,b"))
+    if (r.next( &f) != 1 || !EQ(f, "a,b"))
         return err(30, "引号里的逗号没保住");
     if (r.at_eol != 0)
         return err(31, "引号字段后面还有字段，不该 at_eol");
-    if (csv_next(&r, &f) != 1 || !EQ(f, "c"))
+    if (r.next( &f) != 1 || !EQ(f, "c"))
         return err(32, "引号字段之后的字段不对");
     if (csv_count_fields(t) != 2 || csv_count_rows(t) != 1)
         return err(33, "引号内逗号的计数不对");
 
-    if (csv_next(&rm, &f) != 1 || !EQ(f, "x\ny"))
+    if (rm.next( &f) != 1 || !EQ(f, "x\ny"))
         return err(34, "引号里的换行没保住");
     if (csv_count_fields(m) != 2 || csv_count_rows(m) != 1)
         return err(35, "引号内换行不该切出新记录");
@@ -545,9 +545,9 @@ test "引号字段：最后一个字段 at_eol，且只有引号本身" {
     CsvReader r = csv_reader(t);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != 1 || !EQ(f, "a,b") || r.at_eol != 1)
+    if (r.next( &f) != 1 || !EQ(f, "a,b") || r.at_eol != 1)
         return err(36, "只有引号字段时应当 at_eol");
-    if (csv_next(&r, &f) != 0 || r.error != 0)
+    if (r.next( &f) != 0 || r.error != 0)
         return err(37, "引号字段读完应当正常结束");
 }
 
@@ -558,7 +558,7 @@ test "引号内的双引号：视图是原始字节，展开靠 unquote" {
     char buf[8] = { 0 };
     char tight[3] = { 0 };
 
-    if (csv_next(&r, &f) != 1)
+    if (r.next( &f) != 1)
         return err(38, "带转义的引号字段读失败");
     if (f.s.len != 4 || memcmp(f.s.data, "a\"\"b", 4) != 0)
         return err(39, "视图应当是引号内的原始字节（4 字节）");
@@ -570,7 +570,7 @@ test "引号内的双引号：视图是原始字节，展开靠 unquote" {
         return err(42, "容量不够应当返回 -1");
     if (tight[0] != 0 || tight[1] != 0 || tight[2] != 0)
         return err(43, "容量不够时不该写缓冲");
-    if (csv_next(&r, &f) != 1 || !EQ(f, "c"))
+    if (r.next( &f) != 1 || !EQ(f, "c"))
         return err(44, "转义引号后面的字段不对");
 }
 
@@ -581,13 +581,13 @@ test "引号字段后跟垃圾报 PARSE" {
     CsvReader rs = csv_reader(sp);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != -1)
+    if (r.next( &f) != -1)
         return err(45, "关闭引号后的垃圾应当报错");
     if (r.error != PARSE)
         return err(46, "错误码应当是 PARSE");
-    if (csv_next(&r, &f) != -1)
+    if (r.next( &f) != -1)
         return err(47, "报错之后应当一直是 -1");
-    if (csv_next(&rs, &f) != -1 || rs.error != PARSE)
+    if (rs.next( &f) != -1 || rs.error != PARSE)
         return err(48, "关闭引号后的空白也算垃圾");
     if (csv_count_fields(t) != -1 || csv_count_rows(t) != -1)
         return err(49, "格式错的计数应当返回 -1");
@@ -600,11 +600,11 @@ test "未闭合引号报 PARSE" {
     CsvReader rq = csv_reader(q);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != -1 || r.error != PARSE)
+    if (r.next( &f) != -1 || r.error != PARSE)
         return err(50, "未闭合引号应当报 PARSE");
-    if (csv_next(&rq, &f) != 1 || !EQ(f, "a"))
+    if (rq.next( &f) != 1 || !EQ(f, "a"))
         return err(51, "未闭合引号之前的字段应当读出来");
-    if (csv_next(&rq, &f) != -1 || rq.error != PARSE)
+    if (rq.next( &f) != -1 || rq.error != PARSE)
         return err(52, "第二行的未闭合引号没报错");
 }
 
@@ -613,15 +613,15 @@ test "a,b\\n\\n 的空行是一条记录一个空字段" {
     CsvReader r = csv_reader(t);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != 1 || !EQ(f, "a"))
+    if (r.next( &f) != 1 || !EQ(f, "a"))
         return err(53, "第一个字段不对");
-    if (csv_next(&r, &f) != 1 || !EQ(f, "b") || r.at_eol != 1)
+    if (r.next( &f) != 1 || !EQ(f, "b") || r.at_eol != 1)
         return err(54, "第二个字段不对");
-    if (csv_next(&r, &f) != 1 || f.s.len != 0)
+    if (r.next( &f) != 1 || f.s.len != 0)
         return err(55, "空行应当给一个空字段");
     if (r.row != 1 || r.col != 0 || r.at_eol != 1)
         return err(56, "空行的 row/col/at_eol 不对");
-    if (csv_next(&r, &f) != 0)
+    if (r.next( &f) != 0)
         return err(57, "末尾换行不该再产生记录");
     if (csv_count_fields(t) != 3 || csv_count_rows(t) != 2)
         return err(58, "a,b\\n\\n 应当是 3 个字段 2 条记录");
@@ -748,19 +748,19 @@ test "rewind 之后能重跑一遍" {
     int n = 0, rc = 0;
 
     for (;;) {
-        rc = csv_next(&r, &f);
+        rc = r.next( &f);
         if (rc != 1)
             break;
         n++;
     }
     if (n != 4 || rc != 0)
         return err(86, "第一遍应当读到 4 个字段");
-    csv_rewind(&r);
+    r.rewind();
     if (r.pos != 0 || r.row != 0 || r.col != 0 || r.at_eol != 0 || r.error != 0)
         return err(87, "rewind 没把状态复位");
     n = 0;
     for (;;) {
-        rc = csv_next(&r, &f);
+        rc = r.next( &f);
         if (rc != 1)
             break;
         n++;
@@ -778,7 +778,7 @@ test "开头 BOM 被跳过" {
     CsvReader r = csv_reader(t);
     Str f = { S("") };
 
-    if (csv_next(&r, &f) != 1 || !EQ(f, "a"))
+    if (r.next( &f) != 1 || !EQ(f, "a"))
         return err(90, "BOM 之后的第一个字段不对");
     if (r.row != 0 || r.col != 0)
         return err(91, "BOM 不该算进字段或记录号");
@@ -791,11 +791,11 @@ test "null 参数安全" {
     CsvReader r = csv_reader(t);
     Str f = { S("") };
     Str nul = { (char[:]){ (char *)0, 0 } };
-    if (csv_next((CsvReader *)0, &f) != 0)
+    if (((CsvReader *)0)->next(&f) != 0)
         return err(93, "self == 0 应当当作没有数据");
-    if (csv_next(&r, (Str *)0) != -1 || r.error != INVAL)
+    if (r.next( (Str *)0) != -1 || r.error != INVAL)
         return err(94, "out == 0 应当报 INVAL");
-    csv_rewind((CsvReader *)0);
+    ((CsvReader *)0)->rewind();
     if (csv_unquote(nul, (char *)0, 8) != -1)
         return err(95, "unquote 的 dst 为空应当返回 -1");
     if (csv_write_row((Str *)0, 0, (char *)0, 16, 0) != -1)

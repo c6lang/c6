@@ -8,21 +8,21 @@
  *     Arena a = arena_make(buf, sizeof buf);
  *     Arena *pa = &a;
  *     Str text = { S("{\"a\":[1,2],\"b\":\"x\"}") };   // S() 来自 std.text.str
- *     Json doc = try json_parse(pa, text);
+ *     Json doc = try pa->json_parse(text);
  *     Json *pd = &doc;
  *
- *     Json *arr = json_get(pd, "a");           // 不是对象 / 没有这个键 -> 0
- *     f64 first = json_at(arr, 0)->num;        // 不是数组 / 越界 -> 崩溃源，先判空
- *     Str name = json_get_str(pd, "b", "?");   // 类型不符就给默认值
+ *     Json *arr = pd->get("a");           // 不是对象 / 没有这个键 -> 0
+ *     f64 first = arr->at(0)->num;        // 不是数组 / 越界 -> 崩溃源，先判空
+ *     Str name = pd->get_str("b", "?");   // 类型不符就给默认值
  *
  *     char out[256] = { 0 };
- *     int n = json_write(pd, out, sizeof out); // 紧凑，返回字节数（不含 NUL）
+ *     int n = pd->write(out, sizeof out); // 紧凑，返回字节数（不含 NUL）
  *
  * 设计与取舍：
  * - **DOM 在 Arena 上**：节点、键数组、解码后的字符串全部走
- *   `arena->arena_alloc` / `arena_alloc_array` / `arena_alloc_str`，一次都
+ *   `arena->alloc` / `alloc_array` / `alloc_str`，一次都
  *   不 malloc。解析出来的 `Json` 树和输入文本一样，生命周期由调用方给的
- *   arena 决定；`pa->arena_reset()` 一把全扔。
+ *   arena 决定；`pa->reset()` 一把全扔。
  * - **数字保留原文**：`Json.raw` 是输入里的那段文本（**视图，不复制**），
  *   `num` 是解析出来的 f64。写回时优先用 `raw`，所以
  *   `9007199254740993` 这种超过 f64 精度的整数写出还是原样；`raw` 为空
@@ -33,7 +33,7 @@
  *   控制字符（< 0x20）报 PARSE；`\uXXXX` 解码成 UTF-8，代理对合并，落单的
  *   代理报 PARSE。
  * - **重复键全部保留**（`n` 就是成员个数，`keys` / `kids` 一一对应），
- *   `json_get` 返回**最后**一个——后写的覆盖先写的，和大多数实现一致。
+ *   `get` 返回**最后**一个——后写的覆盖先写的，和大多数实现一致。
  * - **嵌套深度上限 64 层**，超过报 RANGE，递归不会爆栈。
  * - **零依赖 libm**：只用到 `std.text.num` 的 `fmt_f64_g` / `parse_f64`。
  *
@@ -41,7 +41,7 @@
  * 语法错（含未闭合、尾随垃圾、非法转义）→ `PARSE`；深度超限 → `RANGE`；
  * arena 放不下 → `NOMEM`；`arena` 指针为空 → `INVAL`。消息是静态中文描述。
  *
- * 写出（`json_write` / `json_write_pretty` / `json_escape` / `json_unescape`）
+ * 写出（`write` / `write_pretty` / `json_escape` / `json_unescape`）
  * 一律**先量长度再落笔**：容量不够返回 -1，且一个字节都不写（缓冲区原样保留）。
  * 容量按 C 字符串算，即 `cap` 包含结尾 NUL，返回的长度不含 NUL。
  * `json_escape` 只转义内容不加引号（`"` `\` 与 < 0x20 的控制字符，
@@ -348,7 +348,7 @@ static int jp_read_string(Jp *ps, Str *out)
     rc = jp_scan_string(ps, &start, &len);
     if (rc)
         return rc;
-    buf = ps->a->arena_alloc_str(len);   /* len + 1 字节，结尾有 NUL */
+    buf = ps->a->alloc_str(len);   /* len + 1 字节，结尾有 NUL */
     if (!buf)
         return jp_fail(ps, NOMEM, "arena 放不下解码后的字符串");
     jp_decode(buf, ps->p + start, ps->i - start);
@@ -511,7 +511,7 @@ static int jp_array(Jp *ps, Json *out)
     if (ps->depth + 1 > JSON_MAX_DEPTH)
         return jp_fail(ps, RANGE, "嵌套深度超过 64 层");
     if (cnt > 0) {
-        kids = (Json *)ps->a->arena_alloc(cnt * (int)sizeof(Json), 8);
+        kids = (Json *)ps->a->alloc(cnt * (int)sizeof(Json), 8);
         if (!kids)
             return jp_fail(ps, NOMEM, "arena 放不下数组");
         memset(kids, 0, (size_t)cnt * sizeof(Json));
@@ -550,8 +550,8 @@ static int jp_object(Jp *ps, Json *out)
     if (ps->depth + 1 > JSON_MAX_DEPTH)
         return jp_fail(ps, RANGE, "嵌套深度超过 64 层");
     if (cnt > 0) {
-        kids = (Json *)ps->a->arena_alloc(cnt * (int)sizeof(Json), 8);
-        keys = (Str *)ps->a->arena_alloc(cnt * (int)sizeof(Str), 8);
+        kids = (Json *)ps->a->alloc(cnt * (int)sizeof(Json), 8);
+        keys = (Str *)ps->a->alloc(cnt * (int)sizeof(Str), 8);
         if (!kids || !keys)
             return jp_fail(ps, NOMEM, "arena 放不下对象");
         memset(kids, 0, (size_t)cnt * sizeof(Json));
@@ -657,14 +657,14 @@ Json!error json_parse(Arena *a, Str text)
 {
     Json v = { 0 };
 
-    v = try json_parse_at(a, text, 0);
+    v = try a->json_parse_at(text, 0);
     return v;
 }
 
 /* ---- 访问 ---- */
 
 /* 对象取键：重复键返回**最后**一个；找不到 / 不是对象给 0 */
-Json *json_get(Json *self, char *key)
+Json *get(Json *self, char *key)
 {
     int i = 0;
 
@@ -677,7 +677,7 @@ Json *json_get(Json *self, char *key)
 }
 
 /* 数组取下标：越界 / 不是数组给 0 */
-Json *json_at(Json *self, int i)
+Json *at(Json *self, int i)
 {
     if (!self || self->kind != JARR || !self->kids)
         return 0;
@@ -687,7 +687,7 @@ Json *json_at(Json *self, int i)
 }
 
 /* 容器的元素个数，其他给 0 */
-int json_count(Json *self)
+int count(Json *self)
 {
     if (!self)
         return 0;
@@ -697,7 +697,7 @@ int json_count(Json *self)
 }
 
 /* 对象第 i 个键，非法给空串 */
-Str json_key(Json *self, int i)
+Str key(Json *self, int i)
 {
     Str empty = { (char[:]){ (char *)0, 0 } };
 
@@ -708,27 +708,27 @@ Str json_key(Json *self, int i)
     return self->keys[i];
 }
 
-Str json_get_str(Json *self, char *key, char *def)
+Str get_str(Json *self, char *key, char *def)
 {
-    Json *v = json_get(self, key);
+    Json *v = self->get(key);
 
     if (v && v->kind == JSTR)
         return v->s;
     return str(def);
 }
 
-f64 json_get_num(Json *self, char *key, f64 def)
+f64 get_num(Json *self, char *key, f64 def)
 {
-    Json *v = json_get(self, key);
+    Json *v = self->get(key);
 
     if (v && v->kind == JNUM)
         return v->num;
     return def;
 }
 
-int json_get_bool(Json *self, char *key, int def)
+int get_bool(Json *self, char *key, int def)
 {
-    Json *v = json_get(self, key);
+    Json *v = self->get(key);
 
     if (v && v->kind == JBOOL)
         return v->b ? 1 : 0;
@@ -1143,13 +1143,13 @@ static int jw_render(Json *self, char *dst, int cap, int indent)
 }
 
 /* 紧凑输出：返回字节数（不含 NUL），放不下 -1 */
-int json_write(Json *self, char *dst, int cap)
+int write(Json *self, char *dst, int cap)
 {
     return jw_render(self, dst, cap, 0);
 }
 
 /* 美化输出：每层缩进 indent 个空格，indent <= 0 当 2 */
-int json_write_pretty(Json *self, char *dst, int cap, int indent)
+int write_pretty(Json *self, char *dst, int cap, int indent)
 {
     return jw_render(self, dst, cap, indent > 0 ? indent : 2);
 }
@@ -1200,44 +1200,44 @@ test "解析基本对象、数组与嵌套" {
     u8 buf[4096] = { 0 };
     Arena a = arena_make(buf, sizeof buf);
     Arena *pa = &a;
-    Json doc = try json_parse(pa, SS("{\"a\":1,\"b\":[true,false,null],\"c\":{\"d\":\"x\"}}"));
+    Json doc = try pa->json_parse(SS("{\"a\":1,\"b\":[true,false,null],\"c\":{\"d\":\"x\"}}"));
     Json *p = &doc;
 
-    if (doc.kind != JOBJ || json_count(p) != 3)
+    if (doc.kind != JOBJ || p->count() != 3)
         return err(1, "顶层应当是有 3 个键的对象");
-    if (json_get_num(p, "a", -1.0) != 1.0)
+    if (p->get_num("a", -1.0) != 1.0)
         return err(2, "a 不是 1");
-    if (json_get_bool(p, "a", 0) != 0 || json_get_bool(p, "b", 0) != 0)
+    if (p->get_bool("a", 0) != 0 || p->get_bool("b", 0) != 0)
         return err(3, "非 bool 不该当 true");
     {
-        Json *arr = json_get(p, "b");
+        Json *arr = p->get("b");
 
-        if (!arr || arr->kind != JARR || json_count(arr) != 3)
+        if (!arr || arr->kind != JARR || arr->count() != 3)
             return err(4, "b 应当是 3 元素数组");
-        if (!json_at(arr, 0) || json_at(arr, 0)->kind != JBOOL
-            || json_at(arr, 0)->b != 1)
+        if (!arr->at(0) || arr->at(0)->kind != JBOOL
+            || arr->at(0)->b != 1)
             return err(5, "b[0] 应当是 true");
-        if (json_at(arr, 1)->kind != JBOOL || json_at(arr, 1)->b != 0)
+        if (arr->at(1)->kind != JBOOL || arr->at(1)->b != 0)
             return err(6, "b[1] 应当是 false");
-        if (json_at(arr, 2)->kind != JNULL)
+        if (arr->at(2)->kind != JNULL)
             return err(7, "b[2] 应当是 null");
-        if (json_at(arr, 3) != 0 || json_at(arr, -1) != 0)
+        if (arr->at(3) != 0 || arr->at(-1) != 0)
             return err(8, "数组越界应当给 0");
     }
     {
-        Json *c = json_get(p, "c");
-        Str s = json_get_str(c, "d", "?");
+        Json *c = p->get("c");
+        Str s = c->get_str("d", "?");
 
         if (s.s.len != 1 || s.s.data[0] != 'x')
             return err(9, "c.d 不是 \"x\"");
-        if (json_count(c) != 1)
+        if (c->count() != 1)
             return err(10, "c 应当有 1 个键");
-        if (json_key(c, 0).s.len != 1 || json_key(c, 0).s.data[0] != 'd')
+        if (c->key(0).s.len != 1 || c->key(0).s.data[0] != 'd')
             return err(11, "c 的第一个键不是 d");
     }
-    if (json_get(p, "nope") != 0)
+    if (p->get("nope") != 0)
         return err(12, "缺失的键应当给 0");
-    if (json_get(p, 0) != 0)
+    if (p->get(0) != 0)
         return err(13, "key 为 0 应当给 0");
 }
 
@@ -1247,34 +1247,34 @@ test "顶层可以是任意值，空白只认四种" {
     Arena *pa = &a;
 
     {
-        Json d = try json_parse(pa, SS("42"));
+        Json d = try pa->json_parse(SS("42"));
 
         if (d.kind != JNUM || d.num != 42.0)
             return err(20, "顶层裸数字不对");
     }
     {
-        Json d = try json_parse(pa, SS(" \"x\" "));
+        Json d = try pa->json_parse(SS(" \"x\" "));
 
         if (d.kind != JSTR || d.s.s.len != 1 || d.s.s.data[0] != 'x')
             return err(21, "顶层裸字符串不对");
     }
     {
-        Json d = try json_parse(pa, SS("null"));
+        Json d = try pa->json_parse(SS("null"));
 
         if (d.kind != JNULL)
             return err(22, "顶层 null 不对");
     }
     {
-        Json d = try json_parse(pa, SS("\ttrue\r\n"));
+        Json d = try pa->json_parse(SS("\ttrue\r\n"));
 
         if (d.kind != JBOOL || d.b != 1)
             return err(23, "顶层 true 不对");
     }
     {
-        Json d = try json_parse(pa, SS(" { \"a\" : [ 1 , 2 ] } "));
-        Json *arr = json_get(&d, "a");
+        Json d = try pa->json_parse(SS(" { \"a\" : [ 1 , 2 ] } "));
+        Json *arr = d.get( "a");
 
-        if (!arr || json_count(arr) != 2 || json_at(arr, 1)->num != 2.0)
+        if (!arr || arr->count() != 2 || arr->at(1)->num != 2.0)
             return err(24, "空白容忍不对");
     }
 }
@@ -1289,18 +1289,18 @@ test "解析开头允许一个 UTF-8 BOM" {
     int id = 0;
 
     {
-        Json d = try json_parse(pa, (Str){ (char[:]){ bom_obj, 5 } });
+        Json d = try pa->json_parse((Str){ (char[:]){ bom_obj, 5 } });
 
-        if (d.kind != JOBJ || json_count(&d) != 0)
+        if (d.kind != JOBJ || d.count() != 0)
             return err(25, "带 BOM 的空对象解析不对");
     }
     {
-        Json d = try json_parse(pa, (Str){ (char[:]){ bom_arr, 6 } });
+        Json d = try pa->json_parse((Str){ (char[:]){ bom_arr, 6 } });
 
-        if (d.kind != JARR || json_count(&d) != 1)
+        if (d.kind != JARR || d.count() != 1)
             return err(26, "带 BOM 的数组解析不对");
     }
-    json_parse(pa, (Str){ (char[:]){ bom_only, 3 } }) catch e {
+    pa->json_parse((Str){ (char[:]){ bom_only, 3 } }) catch e {
         id = e.id;
         goto bom_is_inval;
     };
@@ -1314,20 +1314,20 @@ test "数字：raw 保真与解析值" {
     u8 buf[4096] = { 0 };
     Arena a = arena_make(buf, sizeof buf);
     Arena *pa = &a;
-    Json doc = try json_parse(pa, SS("[0,-0,1.5,-2.25e3,1e-2,9007199254740993]"));
+    Json doc = try pa->json_parse(SS("[0,-0,1.5,-2.25e3,1e-2,9007199254740993]"));
     Json *p = &doc;
     char out[128] = { 0 };
     int n = 0;
 
-    if (json_count(p) != 6)
+    if (p->count() != 6)
         return err(30, "应当是 6 个数字");
-    if (json_at(p, 0)->num != 0.0 || json_at(p, 2)->num != 1.5)
+    if (p->at(0)->num != 0.0 || p->at(2)->num != 1.5)
         return err(31, "0 / 1.5 解出来不对");
-    if (json_at(p, 3)->num != -2250.0 || json_at(p, 4)->num != 0.01)
+    if (p->at(3)->num != -2250.0 || p->at(4)->num != 0.01)
         return err(32, "-2.25e3 / 1e-2 解出来不对");
-    if (json_at(p, 5)->raw.s.len != 16)
+    if (p->at(5)->raw.s.len != 16)
         return err(33, "大整数的原文长度不对");
-    n = json_write(p, out, sizeof out);
+    n = p->write(out, sizeof out);
     if (n != 40 || (int)strlen(out) != n)
         return err(34, "写出的长度不对");
     if (strcmp(out, "[0,-0,1.5,-2.25e3,1e-2,9007199254740993]") != 0)
@@ -1346,7 +1346,7 @@ test "数字文法：逐条拒绝非法写法" {
     for (i = 0; i < 9; i++) {
         int id = 0;
 
-        json_parse(pa, str(bad[i])) catch e {
+        pa->json_parse(str(bad[i])) catch e {
             id = e.id;
             goto next;
         };
@@ -1354,13 +1354,13 @@ test "数字文法：逐条拒绝非法写法" {
 next:
         if (id != PARSE)
             return err(60 + i, "非法数字的错误码不是 PARSE");
-        pa->arena_reset();
+        pa->reset();
     }
     /* 数组里同样拒绝 */
     {
         int id = 0;
 
-        json_parse(pa, SS("[01]")) catch e {
+        pa->json_parse(SS("[01]")) catch e {
             id = e.id;
             goto in_arr;
         };
@@ -1375,26 +1375,25 @@ test "字符串转义解码（含 \\u 与代理对）" {
     u8 buf[4096] = { 0 };
     Arena a = arena_make(buf, sizeof buf);
     Arena *pa = &a;
-    Json doc = try json_parse(pa,
-        SS("[\"a\\\"b\\\\c\\/d\\b\\f\\n\\r\\t\",\"\\u4e2d\\u6587\",\"\\ud83d\\ude00\"]"));
+    Json doc = try pa->json_parse(SS("[\"a\\\"b\\\\c\\/d\\b\\f\\n\\r\\t\",\"\\u4e2d\\u6587\",\"\\ud83d\\ude00\"]"));
     char want[12] = { 'a', '"', 'b', '\\', 'c', '/', 'd', 8, 12, 10, 13, 9 };
     char zh[6] = { (char)0xe4, (char)0xb8, (char)0xad,
                    (char)0xe6, (char)0x96, (char)0x87 };
     char emoji[4] = { (char)0xf0, (char)0x9f, (char)0x98, (char)0x80 };
 
-    if (json_count(&doc) != 3)
+    if (doc.count() != 3)
         return err(80, "应当是 3 个字符串");
-    if (json_at(&doc, 0)->s.s.len != 12
-        || memcmp(json_at(&doc, 0)->s.s.data, want, 12) != 0)
+    if (doc.at( 0)->s.s.len != 12
+        || memcmp(doc.at( 0)->s.s.data, want, 12) != 0)
         return err(81, "短转义解码不对");
-    if (json_at(&doc, 1)->s.s.len != 6
-        || memcmp(json_at(&doc, 1)->s.s.data, zh, 6) != 0)
+    if (doc.at( 1)->s.s.len != 6
+        || memcmp(doc.at( 1)->s.s.data, zh, 6) != 0)
         return err(82, "\\u4e2d\\u6587 没有解成 UTF-8");
-    if (json_at(&doc, 2)->s.s.len != 4
-        || memcmp(json_at(&doc, 2)->s.s.data, emoji, 4) != 0)
+    if (doc.at( 2)->s.s.len != 4
+        || memcmp(doc.at( 2)->s.s.data, emoji, 4) != 0)
         return err(83, "代理对没有合并成 F0 9F 98 80");
     /* 解码后的字符串在 arena 里、结尾有 NUL */
-    if (json_at(&doc, 2)->s.s.data[4] != 0)
+    if (doc.at( 2)->s.s.data[4] != 0)
         return err(84, "解码后的字符串没有 NUL 结尾");
 }
 
@@ -1408,7 +1407,7 @@ test "未转义控制字符、非法转义与落单代理都报 PARSE" {
                      (char *)"[\"a\\\"]" };
     int id = 0, i = 0;
 
-    json_parse(pa, (Str){ (char[:]){ ctl, 3 } }) catch e {
+    pa->json_parse((Str){ (char[:]){ ctl, 3 } }) catch e {
         id = e.id;
         goto ctl_done;
     };
@@ -1420,7 +1419,7 @@ ctl_done:
     for (i = 0; i < 5; i++) {
         int id2 = 0;
 
-        json_parse(pa, str(bad[i])) catch e {
+        pa->json_parse(str(bad[i])) catch e {
             id2 = e.id;
             goto next;
         };
@@ -1428,7 +1427,7 @@ ctl_done:
 next:
         if (id2 != PARSE)
             return err(100 + i, "非法转义的错误码不是 PARSE");
-        pa->arena_reset();
+        pa->reset();
     }
 }
 
@@ -1445,7 +1444,7 @@ test "未闭合、尾随垃圾与空输入" {
     for (i = 0; i < 3; i++) {
         int id2 = 0;
 
-        json_parse(pa, str(empty[i])) catch e {
+        pa->json_parse(str(empty[i])) catch e {
             id2 = e.id;
             goto empty_done;
         };
@@ -1457,7 +1456,7 @@ empty_done:
     for (i = 0; i < 7; i++) {
         int id2 = 0;
 
-        json_parse(pa, str(bad[i])) catch e {
+        pa->json_parse(str(bad[i])) catch e {
             id2 = e.id;
             goto bad_done;
         };
@@ -1465,14 +1464,14 @@ empty_done:
 bad_done:
         if (id2 != PARSE)
             return err(130 + i, "坏输入的错误码不是 PARSE");
-        pa->arena_reset();
+        pa->reset();
     }
     /* 未转义的 NUL 字节是控制字符 */
     {
         char raw[5] = { '"', 'a', 0, 'b', '"' };
         int id3 = 0;
 
-        json_parse(pa, (Str){ (char[:]){ raw, 5 } }) catch e {
+        pa->json_parse((Str){ (char[:]){ raw, 5 } }) catch e {
             id3 = e.id;
             goto nul_done;
         };
@@ -1489,7 +1488,7 @@ test "json_parse_at 给出出错字节偏移" {
     Arena *pa = &a;
     int pos = -99, id = 0;
 
-    json_parse_at(pa, SS("{\"a\":1,}"), &pos) catch e {
+    pa->json_parse_at(SS("{\"a\":1,}"), &pos) catch e {
         id = e.id;
         goto trailing_comma;
     };
@@ -1501,7 +1500,7 @@ trailing_comma:
         return err(152, "拖尾逗号的出错偏移不对");
 
     pos = -99;
-    json_parse_at(pa, SS("[1 2]"), &pos) catch e {
+    pa->json_parse_at(SS("[1 2]"), &pos) catch e {
         id = e.id;
         goto missing_comma;
     };
@@ -1512,13 +1511,13 @@ missing_comma:
 
     pos = -99;
     {
-        Json d = try json_parse_at(pa, SS(" [1] "), &pos);
+        Json d = try pa->json_parse_at(SS(" [1] "), &pos);
 
         if (pos != -1 || d.kind != JARR)
             return err(155, "成功时 err_pos 应当给 -1");
     }
     /* err_pos 可以为 0 */
-    json_parse_at(pa, SS("x"), 0) catch e {
+    pa->json_parse_at(SS("x"), 0) catch e {
         id = e.id;
         goto no_pos;
     };
@@ -1540,22 +1539,22 @@ test "嵌套深度上限 64：64 层可以，65 层报 RANGE" {
     for (i = 0; i < 64; i++)
         text[64 + i] = ']';
     {
-        Json d = try json_parse(pa, (Str){ (char[:]){ text, 128 } });
+        Json d = try pa->json_parse((Str){ (char[:]){ text, 128 } });
         Json *p = &d;
 
         for (i = 0; i < 63; i++) {
-            p = json_at(p, 0);
+            p = p->at(0);
             if (!p)
                 return err(160, "64 层解析出来的结构不对");
         }
-        if (json_count(p) != 0)
+        if (p->count() != 0)
             return err(161, "最里层应当是空数组");
     }
-    pa->arena_reset();
+    pa->reset();
     text[64] = '[';
     for (i = 0; i < 65; i++)
         text[65 + i] = ']';
-    json_parse(pa, (Str){ (char[:]){ text, 130 } }) catch e {
+    pa->json_parse((Str){ (char[:]){ text, 130 } }) catch e {
         id = e.id;
         goto too_deep;
     };
@@ -1570,7 +1569,7 @@ test "arena 不够给 NOMEM，arena 为空给 INVAL" {
     Arena a = arena_make(tiny, sizeof tiny);
     int id = 0;
 
-    json_parse(&a, SS("{\"a\":1}")) catch e {
+    a.json_parse(SS("{\"a\":1}")) catch e {
         id = e.id;
         goto obj_nomem;
     };
@@ -1580,7 +1579,7 @@ obj_nomem:
         return err(171, "对象放不下的错误码不是 NOMEM");
 
     id = 0;
-    json_parse(&a, SS("\"aaaaaaaaaaaaaaaaaaaa\"")) catch e {
+    a.json_parse(SS("\"aaaaaaaaaaaaaaaaaaaa\"")) catch e {
         id = e.id;
         goto str_nomem;
     };
@@ -1590,7 +1589,7 @@ str_nomem:
         return err(173, "字符串放不下的错误码不是 NOMEM");
 
     id = 0;
-    json_parse(0, SS("{}")) catch e {
+    ((Arena *)0)->json_parse(SS("{}")) catch e {
         id = e.id;
         goto no_arena;
     };
@@ -1600,15 +1599,15 @@ no_arena:
         return err(175, "空 arena 的错误码不是 INVAL");
 }
 
-test "json_write：紧凑输出与容量不足一个字节都不写" {
+test "write：紧凑输出与容量不足一个字节都不写" {
     u8 buf[4096] = { 0 };
     Arena a = arena_make(buf, sizeof buf);
     Arena *pa = &a;
-    Json doc = try json_parse(pa, SS("{\"a\":[1,2],\"b\":{\"c\":\"x y\"}}"));
+    Json doc = try pa->json_parse(SS("{\"a\":[1,2],\"b\":{\"c\":\"x y\"}}"));
     char out[128] = { 0 };
     int n = 0;
 
-    n = json_write(&doc, out, sizeof out);
+    n = doc.write( out, sizeof out);
     if (n != 27 || (int)strlen(out) != n)
         return err(180, "紧凑输出的长度不对");
     if (strcmp(out, "{\"a\":[1,2],\"b\":{\"c\":\"x y\"}}") != 0)
@@ -1620,46 +1619,46 @@ test "json_write：紧凑输出与容量不足一个字节都不写" {
 
         small[0] = 'Z';
         small[1] = 'Z';
-        if (json_write(&doc, small, n) != -1)
+        if (doc.write( small, n) != -1)
             return err(182, "cap 不够应当返回 -1");
         if (small[0] != 'Z' || small[1] != 'Z')
             return err(183, "cap 不够时动了缓冲区");
-        if (json_write(&doc, small, 1) != -1)
+        if (doc.write( small, 1) != -1)
             return err(184, "cap 1 应当返回 -1");
         if (small[0] != 'Z')
             return err(185, "cap 1 时动了缓冲区");
     }
-    if (json_write(&doc, 0, 128) != -1)
+    if (doc.write( 0, 128) != -1)
         return err(186, "dst 为 0 应当给 -1");
-    if (json_write(&doc, out, 0) != -1 || json_write(&doc, out, -5) != -1)
+    if (doc.write( out, 0) != -1 || doc.write( out, -5) != -1)
         return err(187, "cap <= 0 应当给 -1");
     /* self 为 0 写 null，不崩 */
-    if (json_write(0, out, sizeof out) != 4 || strcmp(out, "null") != 0)
+    if (((Json *)0)->write(out, sizeof out) != 4 || strcmp(out, "null") != 0)
         return err(188, "self 为 0 应当写 null");
     /* 手写的容器（kids 为空指针）也不崩 */
     {
         Json fake = { 0 };
 
         fake.kind = JARR;
-        if (json_write(&fake, out, sizeof out) != 2 || strcmp(out, "[]") != 0)
+        if (fake.write( out, sizeof out) != 2 || strcmp(out, "[]") != 0)
             return err(189, "空数组应当写 []");
         fake.kind = JOBJ;
-        if (json_write(&fake, out, sizeof out) != 2 || strcmp(out, "{}") != 0)
+        if (fake.write( out, sizeof out) != 2 || strcmp(out, "{}") != 0)
             return err(190, "空对象应当写 {}");
     }
 }
 
-test "json_write_pretty：缩进与固定小 cap" {
+test "write_pretty：缩进与固定小 cap" {
     u8 buf[4096] = { 0 };
     Arena a = arena_make(buf, sizeof buf);
     Arena *pa = &a;
-    Json doc = try json_parse(pa, SS("{\"a\":[1,2],\"b\":\"x\"}"));
+    Json doc = try pa->json_parse(SS("{\"a\":[1,2],\"b\":\"x\"}"));
     char out[256] = { 0 };
     char out2[256] = { 0 };
     char want[128] = { 0 };
     int n = 0, n2 = 0;
 
-    n = json_write_pretty(&doc, out, sizeof out, 2);
+    n = doc.write_pretty( out, sizeof out, 2);
     memcpy(want, "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": \"x\"\n}",
            strlen("{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": \"x\"\n}") + 1);
     if (n != (int)strlen(want))
@@ -1667,86 +1666,85 @@ test "json_write_pretty：缩进与固定小 cap" {
     if (strcmp(out, want) != 0)
         return err(201, "pretty 输出的内容不对");
     /* indent <= 0 当 2 */
-    n2 = json_write_pretty(&doc, out2, sizeof out2, 0);
+    n2 = doc.write_pretty( out2, sizeof out2, 0);
     if (n2 != n || strcmp(out, out2) != 0)
         return err(202, "indent <= 0 没有按 2 处理");
-    if (json_write_pretty(&doc, out2, sizeof out2, -3) != n)
+    if (doc.write_pretty( out2, sizeof out2, -3) != n)
         return err(203, "indent 为负没有按 2 处理");
     /* 固定小 cap：-1 且一个字节都不写 */
     {
         char small[8] = { 0 };
 
         small[0] = 'Q';
-        if (json_write_pretty(&doc, small, sizeof small, 2) != -1)
+        if (doc.write_pretty( small, sizeof small, 2) != -1)
             return err(204, "pretty 小 cap 应当返回 -1");
         if (small[0] != 'Q')
             return err(205, "pretty 小 cap 动了缓冲区");
     }
     /* 空容器的 pretty 不产生多余换行 */
     {
-        Json empty = try json_parse(pa, SS("[[],{}]"));
+        Json empty = try pa->json_parse(SS("[[],{}]"));
 
-        n = json_write_pretty(&empty, out, sizeof out, 4);
+        n = empty.write_pretty( out, sizeof out, 4);
         if (n != 18 || strcmp(out, "[\n    [],\n    {}\n]") != 0)
             return err(206, "空容器的 pretty 不对");
     }
 }
 
-test "json_get / json_at / json_count / json_key 的缺失与类型不符" {
+test "get / at / count / key 的缺失与类型不符" {
     u8 buf[4096] = { 0 };
     Arena a = arena_make(buf, sizeof buf);
     Arena *pa = &a;
-    Json doc = try json_parse(pa,
-        SS("{\"s\":\"v\",\"n\":3.5,\"b\":true,\"arr\":[10,20],\"o\":{}}"));
+    Json doc = try pa->json_parse(SS("{\"s\":\"v\",\"n\":3.5,\"b\":true,\"arr\":[10,20],\"o\":{}}"));
     Json *p = &doc;
 
-    if (json_get(json_get(p, "arr"), "x") != 0)
+    if (p->get("arr")->get("x") != 0)
         return err(210, "对数组取键应当给 0");
-    if (json_at(p, 0) != 0)
+    if (p->at(0) != 0)
         return err(211, "对对象取下标应当给 0");
-    if (json_count(json_get(p, "s")) != 0)
+    if (p->get("s")->count() != 0)
         return err(212, "字符串的元素个数应当是 0");
-    if (json_count(0) != 0 || json_at(0, 0) != 0 || json_get(0, "a") != 0)
+    if (((Json *)0)->count() != 0 || ((Json *)0)->at(0) != 0 || ((Json *)0)->get("a") != 0)
         return err(213, "self 为 0 应当给 0");
-    if (json_key(p, 99).s.len != 0 || json_key(p, -1).s.len != 0)
+    if (p->key(99).s.len != 0 || p->key(-1).s.len != 0)
         return err(214, "越界的键应当给空串");
-    if (json_key(json_get(p, "arr"), 0).s.len != 0)
+    if (p->get("arr")->key(0).s.len != 0)
         return err(215, "对数组取键名应当给空串");
-    if (json_key(p, 0).s.len != 1 || json_key(p, 4).s.data[0] != 'o')
+    if (p->key(0).s.len != 1 || p->key(4).s.data[0] != 'o')
         return err(216, "键的顺序不对");
     /* 类型不符给默认值 */
-    if (json_get_num(p, "s", 7.0) != 7.0)
+    if (p->get_num("s", 7.0) != 7.0)
         return err(217, "字符串取数字应当给默认值");
-    if (json_get_num(p, "nope", -2.5) != -2.5)
+    if (p->get_num("nope", -2.5) != -2.5)
         return err(218, "缺失键取数字应当给默认值");
-    if (json_get_bool(p, "n", 1) != 1 || json_get_bool(p, "b", 0) != 1)
+    if (p->get_bool("n", 1) != 1 || p->get_bool("b", 0) != 1)
         return err(219, "取 bool 不对");
-    if (json_get_str(p, "n", "d").s.len != 1)
+    if (p->get_str("n", "d").s.len != 1)
         return err(220, "非字符串取字符串应当给默认值");
-    if (json_get_num(0, "x", 9.0) != 9.0)
+    if (((Json *)0)->get_num("x", 9.0) != 9.0)
         return err(221, "self 为 0 取数字应当给默认值");
-    if (json_get_str(0, "x", "dd").s.len != 2)
+    if (((Json *)0)->get_str("x", "dd").s.len != 2)
         return err(222, "self 为 0 取字符串应当给默认值");
-    if (json_get_str(p, "zz", 0).s.len != 0)
+    if (p->get_str("zz", 0).s.len != 0)
         return err(223, "默认值为 0 时应当给空串");
-    if (json_get_bool(p, "b", 0) != 1 || json_get_bool(p, "o", 3) != 3)
+    if (p->get_bool("b", 0) != 1 || p->get_bool("o", 3) != 3)
         return err(224, "取 bool 的默认值不对");
 }
 
-test "重复键全部保留，json_get 取最后一个" {
+test "重复键全部保留，get 取最后一个" {
     u8 buf[4096] = { 0 };
     Arena a = arena_make(buf, sizeof buf);
     Arena *pa = &a;
-    Json doc = try json_parse(pa, SS("{\"k\":1,\"k\":2,\"j\":3}"));
-    Json *last = json_get(&doc, "k");
+    Json doc = try pa->json_parse(SS("{\"k\":1,\"k\":2,\"j\":3}"));
+    Json *last = doc.get( "k");
 
-    if (json_count(&doc) != 3)
+    if (doc.count() != 3)
         return err(230, "重复键应当全部保留");
     if (!last || last->num != 2.0)
         return err(231, "重复键应当取最后一个");
     if (doc.kids[0].num != 1.0 || doc.kids[1].num != 2.0)
         return err(232, "两个同名键的顺序不对");
-    if (json_key(&doc, 0).s.data[0] != 'k' || json_key(&doc, 2).s.data[0] != 'j')
+    if (doc.key( 0).s.data[0] != 'k' || doc.key( 2).s.data[0] != 'j')
         return err(233, "重复键的键名顺序不对");
 }
 
@@ -1760,15 +1758,15 @@ test "数字：手写节点的写出仍然是合法 JSON" {
 
     v.kind = JNUM;
     v.num = 1.5;
-    if (json_write(&v, out, sizeof out) != 3 || strcmp(out, "1.5") != 0)
+    if (v.write( out, sizeof out) != 3 || strcmp(out, "1.5") != 0)
         return err(240, "手写的 1.5 写出不对");
 
     /* 不能精确表示的数值：写出来的位数受 fmt_f64_g 限制，要求相对误差很小 */
     v.num = 1.0 / 3.0;
-    if (json_write(&v, out, sizeof out) <= 0)
+    if (v.write( out, sizeof out) <= 0)
         return err(241, "1/3 写出失败");
     {
-        Json back = try json_parse(pa, str(out));
+        Json back = try pa->json_parse(str(out));
         f64 got = back.num;
 
         if (back.kind != JNUM || back.raw.s.len != (int)strlen(out))
@@ -1788,9 +1786,9 @@ test "数字：手写节点的写出仍然是合法 JSON" {
             Json back = { 0 };
 
             v.num = exact[i];
-            if (json_write(&v, out, sizeof out) <= 0)
+            if (v.write( out, sizeof out) <= 0)
                 return err(244, "精确值写出失败");
-            back = try json_parse(pa, str(out));
+            back = try pa->json_parse(str(out));
             if (back.kind != JNUM || back.num != exact[i])
                 return err(245, "精确值写出后解析不回来");
         }
@@ -1798,15 +1796,15 @@ test "数字：手写节点的写出仍然是合法 JSON" {
     /* 非有限数：JSON 没有表示，写 null */
     inf = inf * 10.0;
     v.num = inf;
-    if (json_write(&v, out, sizeof out) != 4 || strcmp(out, "null") != 0)
+    if (v.write( out, sizeof out) != 4 || strcmp(out, "null") != 0)
         return err(246, "inf 应当写成 null");
     v.num = inf - inf;   /* inf - inf 是 nan */
-    if (json_write(&v, out, sizeof out) != 4 || strcmp(out, "null") != 0)
+    if (v.write( out, sizeof out) != 4 || strcmp(out, "null") != 0)
         return err(247, "nan 应当写成 null");
     /* 字符串节点按 JSON 要求转义 */
     v.kind = JSTR;
     v.s = SS("a\"b\\c\nd");
-    if (json_write(&v, out, sizeof out) != 12
+    if (v.write( out, sizeof out) != 12
         || strcmp(out, "\"a\\\"b\\\\c\\nd\"") != 0)
         return err(248, "字符串节点的转义不对");
 }
@@ -1887,8 +1885,8 @@ test "json_escape / json_unescape 往返" {
 
         u8 rbuf[1024] = { 0 };
         Arena ra = arena_make(rbuf, sizeof rbuf);
-        Json d = try json_parse(&ra, str(text));
-        Str raw = json_at(&d, 0)->raw;
+        Json d = try ra.json_parse(str(text));
+        Str raw = d.at( 0)->raw;
 
         if (raw.s.data != text + 1 || raw.s.len != 5)
             return err(270, "raw 不是输入的视图");

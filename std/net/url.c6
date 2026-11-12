@@ -219,17 +219,17 @@ Url url_parse(char[:] s)
 }
 
 /* 有 scheme 且是绝对引用 */
-int url_is_absolute(Url *self) { return self->is_abs; }
+int is_absolute(Url *self) { return self->is_abs; }
 
 /* 有 scheme 且 authority 为空（如 "mailto:" / "file:"） */
-int url_has_host(Url *self) { return self->host.s.len > 0; }
+int has_host(Url *self) { return self->host.s.len > 0; }
 
 /* 有效端口：没有显式端口时按 scheme 给默认值，未知 scheme 给 -1。
  *
  * 判据是 `port_str` 有没有内容，不是 `port >= 0`：`Url u = { 0 };` 这种全零
  * 初始化是 C 里的自然写法，它的 `port` 是 0、看起来像个显式端口，只有
  * `port_str` 空着才说明「没给端口」。 */
-int url_effective_port(Url *self)
+int effective_port(Url *self)
 {
     char[:] sc = self->scheme.s;
 
@@ -254,7 +254,7 @@ struct Pair {
 
 /* 在 query 里按 '&' 切出下一个参数；返回 1 取到、0 结束。
    `at` 是调用方的游标（从 0 开始）。没有 '=' 时 value 是空视图。 */
-int url_next_pair(Str *query, int *at, Pair *out)
+int next_pair(Str *query, int *at, Pair *out)
 {
     int i = *at;
     int start = 0;
@@ -683,7 +683,7 @@ test "RFC 3986 第 1.1.2 节的示例 URL 分解" {
         || u.port != 8042 || !url_eq(&u.path, "/over/there")
         || !url_eq(&u.query, "name=ferret") || !url_eq(&u.fragment, "nose"))
         return err(1, "foo:// 那个例子分解不对");
-    if (!url_is_absolute(&u) || !url_has_host(&u))
+    if (!u.is_absolute() || !u.has_host())
         return err(2, "foo:// 应当是绝对引用且有主机");
     /* urn: 有 scheme、没有 authority */
     if (!v.ok || !url_eq(&v.scheme, "urn") || v.has_authority
@@ -754,23 +754,23 @@ test "默认端口按 scheme 给" {
     Url e = url_parse(S("ws://h/"));
     Url f = url_parse(S("http://h:81/"));
 
-    if (url_effective_port(&a) != 80 || url_effective_port(&b) != 443)
+    if (a.effective_port() != 80 || b.effective_port() != 443)
         return err(18, "http/https 默认端口不对");
-    if (url_effective_port(&c) != 21 || url_effective_port(&d) != 23)
+    if (c.effective_port() != 21 || d.effective_port() != 23)
         return err(19, "ftp/telnet 默认端口不对");
-    if (url_effective_port(&e) != -1)
+    if (e.effective_port() != -1)
         return err(20, "未知 scheme 应当给 -1");
-    if (url_effective_port(&f) != 81)
+    if (f.effective_port() != 81)
         return err(21, "显式端口应当优先");
     /* 全零初始化（C 的自然写法）不能被当成「显式端口 0」 */
     {
         Url z = { 0 };
 
-        if (url_effective_port(&z) != -1)
+        if (z.effective_port() != -1)
             return err(22, "全零初始化的 URL 不该给出端口");
         Url z0 = url_parse(S("http://h:0/"));
 
-        if (z0.port != 0 || url_effective_port(&z0) != 0)
+        if (z0.port != 0 || z0.effective_port() != 0)
             return err(23, "显式 :0 应当就是 0 端口");
     }
 }
@@ -781,23 +781,23 @@ test "查询参数逐个取出" {
     int at = 0;
     int n = 0;
 
-    if (!url_next_pair(&q, &at, &p) || !url_eq(&p.key, "a")
+    if (!q.next_pair( &at, &p) || !url_eq(&p.key, "a")
         || !url_eq(&p.value, "1"))
         return err(22, "第一个参数不对");
     n++;
-    if (!url_next_pair(&q, &at, &p) || !url_eq(&p.key, "b")
+    if (!q.next_pair( &at, &p) || !url_eq(&p.key, "b")
         || !url_eq(&p.value, "2"))
         return err(23, "第二个参数不对");
     n++;
-    if (!url_next_pair(&q, &at, &p) || !url_eq(&p.key, "novalue")
+    if (!q.next_pair( &at, &p) || !url_eq(&p.key, "novalue")
         || p.value.s.len != 0)
         return err(24, "没有 = 的参数应当给空值");
     n++;
-    if (!url_next_pair(&q, &at, &p) || !url_eq(&p.key, "c")
+    if (!q.next_pair( &at, &p) || !url_eq(&p.key, "c")
         || p.value.s.len != 0)
         return err(25, "空值参数不对");
     n++;
-    if (url_next_pair(&q, &at, &p))
+    if (q.next_pair( &at, &p))
         return err(26, "参数取完之后应当返回 0");
     if (n != 4)
         return err(27, "参数个数不对");

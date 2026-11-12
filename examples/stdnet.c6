@@ -66,19 +66,19 @@ static void tour_inet(void)
     /* v4：解析 → 格式化往返 */
     check(inet_parse(S("192.168.0.1"), &a) == 1, "inet: 解析 v4");
     check(a.family == IP_V4, "inet: 家族是 V4");
-    check(inet_format(&a, buf, sizeof buf) == 11
+    check(a.format( buf, sizeof buf) == 11
           && strcmp(buf, "192.168.0.1") == 0, "inet: v4 格式化往返");
 
     /* v6：RFC 5952 压缩（输入是展开形式） */
     check(inet_parse(S("2001:0db8:0000:0000:0000:ff00:0042:8329"), &a) == 1,
           "inet: 解析展开的 v6");
-    check(inet_format(&a, buf, sizeof buf) == 22
+    check(a.format( buf, sizeof buf) == 22
           && strcmp(buf, "2001:db8::ff00:42:8329") == 0,
           "inet: v6 按 RFC 5952 压缩");
-    check(inet_parse(S("::1"), &a) == 1 && inet_is_loopback(&a) == 1,
+    check(inet_parse(S("::1"), &a) == 1 && a.is_loopback() == 1,
           "inet: ::1 是回环");
     check(inet_parse(S("::ffff:10.0.0.1"), &a) == 1
-          && inet_is_private(&a) == 1, "inet: v4-mapped 折回 v4 判私网");
+          && a.is_private() == 1, "inet: v4-mapped 折回 v4 判私网");
 
     /* 坏输入 */
     check(inet_parse(S("256.1.1.1"), &a) == 0, "inet: 256 不合法");
@@ -88,15 +88,15 @@ static void tour_inet(void)
     check(inet_parse_cidr(S("10.0.0.0/8"), &net, &prefix) == 1
           && prefix == 8, "inet: 解析 CIDR");
     check(inet_parse(S("10.1.2.3"), &a) == 1
-          && inet_cidr_contains(&net, prefix, &a) == 1,
+          && net.cidr_contains( prefix, &a) == 1,
           "inet: 10.1.2.3 在 10/8 里");
     check(inet_parse(S("11.1.2.3"), &a) == 1
-          && inet_cidr_contains(&net, prefix, &a) == 0,
+          && net.cidr_contains( prefix, &a) == 0,
           "inet: 11.1.2.3 不在 10/8 里");
     /* 网络地址形式 */
     check(inet_parse(S("10.1.2.3"), &a) == 1, "inet: 再解析一次");
-    inet_cidr_mask(&a, 8);
-    check(inet_format(&a, buf, sizeof buf) == 8
+    a.cidr_mask( 8);
+    check(a.format( buf, sizeof buf) == 8
           && strcmp(buf, "10.0.0.0") == 0, "inet: 清位成网络地址");
 
     /* 端口 */
@@ -111,7 +111,7 @@ static void tour_inet(void)
 /* 把 !error 调用折成布尔：出错就记一条 FAIL 并返回 0（错误本身已被消耗） */
 static int bb_put(BitWriter *w, u32 v, int n)
 {
-    bw_put(w, v, n) catch e {
+    w->put(v, n) catch e {
         check(0, "bitbuf: 写失败");
         return 0;
     };
@@ -120,7 +120,7 @@ static int bb_put(BitWriter *w, u32 v, int n)
 
 static int bb_put_bytes(BitWriter *w, char[:] b)
 {
-    bw_put_bytes(w, b) catch e {
+    w->put_bytes(b) catch e {
         check(0, "bitbuf: 写整段失败");
         return 0;
     };
@@ -129,7 +129,7 @@ static int bb_put_bytes(BitWriter *w, char[:] b)
 
 static int bb_patch(BitWriter *w, int at, u32 v, int n)
 {
-    bw_patch(w, at, v, n) catch e {
+    w->patch(at, v, n) catch e {
         check(0, "bitbuf: 回填失败");
         return 0;
     };
@@ -138,7 +138,7 @@ static int bb_patch(BitWriter *w, int at, u32 v, int n)
 
 static int bb_get(BitReader *r, int n, u32 *out)
 {
-    br_get(r, n, out) catch e {
+    r->get(n, out) catch e {
         check(0, "bitbuf: 读失败");
         return 0;
     };
@@ -147,7 +147,7 @@ static int bb_get(BitReader *r, int n, u32 *out)
 
 static int bb_get_bytes(BitReader *r, char *dst, int n)
 {
-    br_get_bytes(r, dst, n) catch e {
+    r->get_bytes(dst, n) catch e {
         check(0, "bitbuf: 读整段失败");
         return 0;
     };
@@ -156,7 +156,7 @@ static int bb_get_bytes(BitReader *r, char *dst, int n)
 
 static int bb_peek(BitReader *r, int n, u32 *out)
 {
-    br_peek(r, n, out) catch e {
+    r->peek(n, out) catch e {
         check(0, "bitbuf: peek 失败");
         return 0;
     };
@@ -177,12 +177,12 @@ static void tour_bitbuf(void)
     bb_put(&w, 2, 3);
     bb_put(&w, 0x1f, 5);
     bb_put(&w, 300, 16);
-    check(bw_bits(&w) == 24, "bitbuf: 头正好 24 位");
+    check(w.bit_count() == 24, "bitbuf: 头正好 24 位");
     bb_put_bytes(&w, S("hi"));
-    check(bw_bytes(&w) == 5, "bitbuf: 用完 5 字节");
+    check(w.byte_count() == 5, "bitbuf: 用完 5 字节");
 
     /* 读回：位宽与顺序必须完全一致 */
-    r = br_open((char[:]){ buf, bw_bytes(&w) });
+    r = br_open((char[:]){ buf, w.byte_count() });
     bb_get(&r, 3, &ver);
     bb_get(&r, 5, &flags);
     bb_get(&r, 16, &len);
@@ -195,22 +195,22 @@ static void tour_bitbuf(void)
         bb_get_bytes(&r, body, 2);
         check(body[0] == 'h' && body[1] == 'i', "bitbuf: 正文读回");
     }
-    check(br_eof(&r) == 1, "bitbuf: 正好读完");
+    check(r.eof() == 1, "bitbuf: 正好读完");
 
     /* peek 不动游标 */
     r = br_open((char[:]){ buf, 1 });
     bb_peek(&r, 3, &v);
-    check(v == 2 && br_bits(&r) == 0, "bitbuf: peek 不推进");
+    check(v == 2 && r.bit_count() == 0, "bitbuf: peek 不推进");
 
     /* 越界是错误而不是截断 */
     {
         BitWriter small = bw_open(buf, 1);
 
         bb_put(&small, 0xff, 8);
-        bw_put(&small, 1, 1) catch e { goto full_seen; };
+        small.put( 1, 1) catch e { goto full_seen; };
         check(0, "bitbuf: 第 9 位应当报 FULL");
 full_seen:;
-        check(bw_ok(&small) == 0 && bw_bits(&small) == 8,
+        check(small.ok() == 0 && small.bit_count() == 8,
               "bitbuf: FULL 之后游标不动");
     }
     /* 回填：长度先留空、写完再补 */
@@ -220,7 +220,7 @@ full_seen:;
         bb_put(&p, 0, 16);
         bb_put(&p, 0xabc, 16);
         bb_patch(&p, 0, 2, 16);
-        check(bw_bits(&p) == 32, "bitbuf: 回填不动游标");
+        check(p.bit_count() == 32, "bitbuf: 回填不动游标");
         check((u8)buf[1] == 2, "bitbuf: 回填的值落在大端低位");
     }
 }
@@ -306,7 +306,7 @@ static void tour_ini(void)
     int n = 0;
 
     /* 逐条读：section / key / value 都是输入上的视图 */
-    while (ini_next(&r, &e) == 1)
+    while (r.next( &e) == 1)
         n++;
     check(n == 5, "ini: 五条键值（注释和空行不算）");
     check(r.err == 0, "ini: 没有语法错误");
@@ -338,7 +338,7 @@ static void tour_ini(void)
         IniEntry be = { { { (char *)0, 0 } }, { { (char *)0, 0 } }, \
                         { { (char *)0, 0 } }, 0 };
 
-        check(ini_next(&br, &be) == -1, "ini: 坏节头报错");
+        check(br.next( &be) == -1, "ini: 坏节头报错");
         check(br.err == 1, "ini: 错误行号是 1");
         check(ini_lookup(bt, S(""), S("k"), &v) == 0,
               "ini: 有坏行时 lookup 直接给 0");

@@ -52,25 +52,25 @@ static void check(int cond, char *what)
 /* StrBuf 的方法会分配、返回 int!error；演示里把它折成 -1 方便连续判断 */
 static int append(StrBuf *b, char[:] s)
 {
-    b->strbuf_write(s) catch e { return -1; };
+    b->write(s) catch e { return -1; };
     return 0;
 }
 
 static int put_int(StrBuf *b, int v)
 {
-    b->strbuf_write_int(v) catch e { return -1; };
+    b->write_int(v) catch e { return -1; };
     return 0;
 }
 
 static int put_hex(StrBuf *b, u64 v)
 {
-    b->strbuf_write_hex(v) catch e { return -1; };
+    b->write_hex(v) catch e { return -1; };
     return 0;
 }
 
 static int put_cstr(StrBuf *b, char *z)
 {
-    b->strbuf_write_cstr(z) catch e { return -1; };
+    b->write_cstr(z) catch e { return -1; };
     return 0;
 }
 
@@ -110,25 +110,25 @@ static void tour_strbuf(void)
             check(append(list, S(", ")) == 0, "strbuf: 追加分隔符");
         check(append(list, mod_at(i)) == 0, "strbuf: 追加模块名");
     }
-    check(list->strbuf_count() == 58, "strbuf: 拼接长度");
-    check(strcmp(list->strbuf_cstr(), "std/container/vec.c6, std/container/map.c6, std/os/path.c6") == 0,
+    check(list->count() == 58, "strbuf: 拼接长度");
+    check(strcmp(list->cstr(), "std/container/vec.c6, std/container/map.c6, std/os/path.c6") == 0,
           "strbuf: 拼接内容");
-    check(!list->strbuf_is_empty() && list->strbuf_capacity() >= list->strbuf_count(),
+    check(!list->is_empty() && list->capacity() >= list->count(),
           "strbuf: capacity 覆盖 count");
 
     check(put_int(nums, -42) == 0, "strbuf: write_int 失败");
     check(put_cstr(nums, " ") == 0, "strbuf: write_cstr 失败");
     check(put_hex(nums, 0xdeadbeefu) == 0, "strbuf: write_hex 失败");
-    check(strcmp(nums->strbuf_cstr(), "-42 deadbeef") == 0, "strbuf: 数字格式");
+    check(strcmp(nums->cstr(), "-42 deadbeef") == 0, "strbuf: 数字格式");
 
     /* 截断只改 n，不动容量：再往里追加还能用（20 = 第一个模块路径的长度） */
-    list->strbuf_truncate(20);
-    check(list->strbuf_count() == 20 && strcmp(list->strbuf_cstr(), "std/container/vec.c6") == 0,
+    list->truncate(20);
+    check(list->count() == 20 && strcmp(list->cstr(), "std/container/vec.c6") == 0,
           "strbuf: truncate(20)");
-    check(append(list, S(" ...")) == 0 && strcmp(list->strbuf_cstr(), "std/container/vec.c6 ...") == 0,
+    check(append(list, S(" ...")) == 0 && strcmp(list->cstr(), "std/container/vec.c6 ...") == 0,
           "strbuf: truncate 之后继续追加");
 
-    printf("strbuf  %-24s %s\n", nums->strbuf_cstr(), list->strbuf_cstr());
+    printf("strbuf  %-24s %s\n", nums->cstr(), list->cstr());
 }
 
 /* ---- 2. path ---- */
@@ -186,9 +186,9 @@ static void tour_hash(void)
     one = fnv1a_bytes(p.s.data, (usize)p.s.len);
     check(one == fnv1a_cstr("docs/stdlib.md"), "hash: bytes 与 cstr 一致");
     check(one == (&p)->hash(), "hash: std.core.hash 与 Str::hash 同算法");
-    hasher_update(&hs, p.s.data, (usize)5);
-    hasher_update(&hs, p.s.data + 5, (usize)(p.s.len - 5));
-    split = hasher_digest(&hs);
+    hs.update( p.s.data, (usize)5);
+    hs.update( p.s.data + 5, (usize)(p.s.len - 5));
+    split = hs.digest();
     check(split == one, "hash: 分两段喂 == 一次喂");
     h64 = fnv1a64_bytes(p.s.data, (usize)p.s.len);
     check(h64 != (u64)one, "hash: 32 位和 64 位不是同一个值");

@@ -4,9 +4,9 @@
  *     import std.os.time;
  *
  *     Rand r = rand_seed(now_ns());        // 纯值：可以按值传、放进结构体
- *     u64 x = (&r)->u64();                 // 就是 random_u64(&r, ...)
- *     int d6 = (&r)->int(1, 7);            // 1..6（半开区间 [1, 7)）
- *     f64 p = (&r)->f64();                 // [0, 1)
+ *     u64 x = r.next_u64();                // 下一个 64 位
+ *     int d6 = r.int_range(1, 7);          // 1..6（半开区间 [1, 7)）
+ *     f64 p = r.next_f64();                // [0, 1)
  *
  * 为什么是 xorshift64* 而不是 libc 的 `rand()`：`rand()` 的序列依赖宿主实现、
  * 全局状态不可重入，标准库要给的是「同一个种子在任何平台给出同一串数」。
@@ -15,12 +15,14 @@
  * **不是密码学随机数**：不要用它生成密钥、令牌、盐。这一层明确不假装安全。
  *
  * 种子 0 会被换成 xorshift 的非零常量（全零状态是吸收态，会一直输出 0）。
- * 区间函数先做拒绝采样再取模（`random_below`），所以不是「余数偏置」的版本；
- * `random_int` 是半开区间 [lo, hi)，`random_int_incl` 是闭区间 [lo, hi]。
+ * 区间函数先做拒绝采样再取模（`below`），所以不是「余数偏置」的版本；
+ * `int_range` 是半开区间 [lo, hi)，`int_range_incl` 是闭区间 [lo, hi]。
  *
- * 方法名是 `random_*` 而不是 `rand_*`：`Rand` 是普通结构体（体内写不了方法体），
- * 方法写在体外会同时发一个裸名弱别名，`rand_u64`/`rand_int` 这些名字和 libc
- * 的 `rand` 家族太像，留给窄作用域更安全——调用侧照旧写 `(&r)->u64()`。
+ * 方法名是 `next_u64`/`next_u32`/`next_f64`/`next_bool`/`below`/
+ * `int_range`/`int_range_incl`/`fill`/`shuffle`/`shuffle_int`：
+ * `u64`/`int`/`f64`/`bool` 是类型名或关键字，不能当方法名；`next_*`
+ * 也避免和 libc 的 `rand` 家族混淆。模块里的裸名弱别名带模块前缀，
+ * 不会污染全局名字空间。
  */
 #include <string.h>
 
@@ -44,7 +46,7 @@ Rand rand_seed(u64 seed)
 }
 
 /* 下一个 64 位：状态推进与输出混合在同一步（xorshift64*） */
-u64 random_u64(Rand *self)
+u64 next_u64(Rand *self)
 {
     u64 x = self->s;
 
@@ -56,11 +58,11 @@ u64 random_u64(Rand *self)
 }
 
 /* 取高 32 位：低位的周期性质不如高位，给小范围使用时先取高位更稳 */
-u32 random_u32(Rand *self) { return (u32)(random_u64(self) >> 32); }
+u32 next_u32(Rand *self) { return (u32)(self->next_u64() >> 32); }
 
 /* [0, bound) 的无偏整数；bound == 0 或 1 返回 0。
    拒绝采样：丢掉落在 [0, 2^64 % bound) 的数，剩下的取模才均匀。 */
-u64 random_below(Rand *self, u64 bound)
+u64 below(Rand *self, u64 bound)
 {
     u64 threshold = 0ull;
 
@@ -68,7 +70,7 @@ u64 random_below(Rand *self, u64 bound)
         return 0ull;
     threshold = (0ull - bound) % bound;
     for (;;) {
-        u64 r = random_u64(self);
+        u64 r = self->next_u64();
 
         if (r >= threshold)
             return r % bound;
@@ -76,37 +78,37 @@ u64 random_below(Rand *self, u64 bound)
 }
 
 /* 半开区间 [lo, hi)：hi <= lo 时返回 lo（不消耗随机数） */
-int random_int(Rand *self, int lo, int hi)
+int int_range(Rand *self, int lo, int hi)
 {
     i64 span = 0;
 
     if (hi <= lo)
         return lo;
     span = (i64)hi - (i64)lo;
-    return (int)((i64)lo + (i64)random_below(self, (u64)span));
+    return (int)((i64)lo + (i64)self->below((u64)span));
 }
 
 /* 闭区间 [lo, hi]：hi < lo 时返回 lo */
-int random_int_incl(Rand *self, int lo, int hi)
+int int_range_incl(Rand *self, int lo, int hi)
 {
     i64 span = 0;
 
     if (hi < lo)
         return lo;
     span = (i64)hi - (i64)lo + 1;
-    return (int)((i64)lo + (i64)random_below(self, (u64)span));
+    return (int)((i64)lo + (i64)self->below((u64)span));
 }
 
 /* [0, 1) 的浮点：取 53 位尾数（double 的精度上限） */
-f64 random_f64(Rand *self)
+f64 next_f64(Rand *self)
 {
-    return (f64)(random_u64(self) >> 11) * (1.0 / 9007199254740992.0);
+    return (f64)(self->next_u64() >> 11) * (1.0 / 9007199254740992.0);
 }
 
-int random_bool(Rand *self) { return (int)(random_u64(self) & 1ull); }
+int next_bool(Rand *self) { return (int)(self->next_u64() & 1ull); }
 
 /* 填满一段字节（不要求对齐） */
-void random_fill(Rand *self, void *p, usize n)
+void fill(Rand *self, void *p, usize n)
 {
     u8 *b = (u8 *)p;
     usize i = 0;
@@ -114,12 +116,12 @@ void random_fill(Rand *self, void *p, usize n)
     if (!b)
         return;
     for (i = 0; i + 8 <= n; i += 8) {
-        u64 v = random_u64(self);
+        u64 v = self->next_u64();
 
         memcpy(b + i, &v, 8);
     }
     if (i < n) {
-        u64 v = random_u64(self);
+        u64 v = self->next_u64();
         usize k = 0;
 
         for (k = 0; i + k < n; k++)
@@ -129,7 +131,7 @@ void random_fill(Rand *self, void *p, usize n)
 
 /* Fisher-Yates：任意元素宽度（字节交换），不分配。
    base 为 0 或 n <= 1 时什么都不做。 */
-void random_shuffle(Rand *self, void *base, int n, int elem)
+void shuffle(Rand *self, void *base, int n, int elem)
 {
     u8 *p = (u8 *)base;
     int i = 0;
@@ -137,7 +139,7 @@ void random_shuffle(Rand *self, void *base, int n, int elem)
     if (!p || n <= 1 || elem <= 0)
         return;
     for (i = n - 1; i > 0; i--) {
-        int j = random_int_incl(self, 0, i);
+        int j = self->int_range_incl(0, i);
         int k = 0;
 
         if (j == i)
@@ -152,9 +154,9 @@ void random_shuffle(Rand *self, void *base, int n, int elem)
 }
 
 /* int 数组的快捷方式 */
-void random_shuffle_int(Rand *self, int[:] a)
+void shuffle_int(Rand *self, int[:] a)
 {
-    random_shuffle(self, a.data, a.len, (int)sizeof(int));
+    self->shuffle(a.data, a.len, (int)sizeof(int));
 }
 
 /* ---- 自测 ---- */
@@ -165,13 +167,13 @@ test "同一种子的序列可重放" {
     int i = 0;
 
     for (i = 0; i < 100; i++) {
-        u64 x = random_u64(&a);
-        u64 y = random_u64(&b);
+        u64 x = a.next_u64();
+        u64 y = b.next_u64();
 
         if (x != y)
             return err(1, "同一种子给出了不同序列");
     }
-    if (random_u64(&a) != random_u64(&b))
+    if (a.next_u64() != b.next_u64())
         return err(2, "推进 100 次之后两个同种子实例不同步");
 }
 
@@ -181,7 +183,7 @@ test "种子 0 被换成非零常量，不会卡在吸收态" {
     int i = 0;
 
     for (i = 0; i < 10; i++) {
-        if (random_u64(&a) != random_u64(&b))
+        if (a.next_u64() != b.next_u64())
             return err(3, "种子 0 没有按常量处理");
     }
     if (a.s == 0ull)
@@ -190,9 +192,9 @@ test "种子 0 被换成非零常量，不会卡在吸收态" {
 
 test "已知序列钉死算法" {
     Rand r = rand_seed(1);
-    u64 x0 = random_u64(&r);
-    u64 x1 = random_u64(&r);
-    u64 x2 = random_u64(&r);
+    u64 x0 = r.next_u64();
+    u64 x1 = r.next_u64();
+    u64 x2 = r.next_u64();
 
     if (x0 != 0x47e4ce4b896cdd1dull)
         return err(5, "第一个输出了变了");
@@ -204,16 +206,16 @@ test "已知序列钉死算法" {
         return err(8, "状态被清零了");
 }
 
-test "random_below 的边界与均匀范围" {
+test "below 的边界与均匀范围" {
     Rand r = rand_seed(7);
     int i = 0;
 
-    if (random_below(&r, 0) != 0ull || random_below(&r, 1) != 0ull)
+    if (r.below( 0) != 0ull || r.below( 1) != 0ull)
         return err(9, "bound <= 1 应当给 0");
-    if (random_below(&r, 2) > 1ull)
+    if (r.below( 2) > 1ull)
         return err(10, "bound 2 越界");
     for (i = 0; i < 2000; i++) {
-        u64 v = random_below(&r, 1000);
+        u64 v = r.below( 1000);
 
         if (v >= 1000ull)
             return err(11, "rand_below 越界");
@@ -222,32 +224,32 @@ test "random_below 的边界与均匀范围" {
         u64 hits[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
         for (i = 0; i < 5000; i++)
-            hits[random_below(&r, 10)]++;
+            hits[r.below( 10)]++;
         for (i = 0; i < 10; i++)
             if (hits[i] < 400 || hits[i] > 600)
                 return err(12, "10 个桶的分布明显偏了");
     }
 }
 
-test "random_int / rand_int_incl 的区间" {
+test "int_range / int_range_incl 的区间" {
     Rand r = rand_seed(99);
     int i = 0, seen = 0;
 
-    if (random_int(&r, 5, 5) != 5 || random_int(&r, 5, 4) != 5)
+    if (r.int_range( 5, 5) != 5 || r.int_range( 5, 4) != 5)
         return err(13, "空区间应当返回 lo");
-    if (random_int_incl(&r, 9, 8) != 9)
+    if (r.int_range_incl( 9, 8) != 9)
         return err(14, "反向闭区间应当返回 lo");
     for (i = 0; i < 1000; i++) {
-        int v = random_int(&r, -3, 4);
+        int v = r.int_range( -3, 4);
 
         if (v < -3 || v > 3)
-            return err(15, "rand_int 越界");
+            return err(15, "int_range 越界");
     }
     for (i = 0; i < 1000; i++) {
-        int v = random_int_incl(&r, 1, 6);
+        int v = r.int_range_incl( 1, 6);
 
         if (v < 1 || v > 6)
-            return err(16, "rand_int_incl 越界");
+            return err(16, "int_range_incl 越界");
         seen |= 1 << v;
     }
     if ((seen & 0x7e) != 0x7e)
@@ -260,7 +262,7 @@ test "rand_f64 落在 [0, 1) 且均值接近 0.5" {
     int i = 0;
 
     for (i = 0; i < 10000; i++) {
-        f64 x = random_f64(&r);
+        f64 x = r.next_f64();
 
         if (x < 0.0 || x >= 1.0)
             return err(18, "rand_f64 越界");
@@ -276,8 +278,8 @@ test "rand_fill 填满且不是常量" {
     u8 buf2[37] = { 0 };
     int i = 0, diff = 0;
 
-    random_fill(&r, buf, sizeof buf);
-    random_fill(&r, buf2, sizeof buf2);
+    r.fill(buf, sizeof buf);
+    r.fill(buf2, sizeof buf2);
     for (i = 0; i < (int)sizeof buf; i++) {
         if (buf[i] != buf2[i])
             diff++;
@@ -294,7 +296,7 @@ test "rand_shuffle 保序集合并打乱" {
     int seen[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     int i = 0, sum = 0, sorted = 1;
 
-    random_shuffle_int(&r, (int[:]){ a, 10 });
+    r.shuffle_int( (int[:]){ a, 10 });
     for (i = 0; i < 10; i++) {
         if (a[i] < 0 || a[i] > 9)
             return err(22, "shuffle 后越界");
@@ -323,7 +325,7 @@ test "rand_shuffle 对任意元素宽度也成立" {
     struct RandPair p[4] = { { 1, 10 }, { 2, 20 }, { 3, 30 }, { 4, 40 } };
     int i = 0, n = 0;
 
-    random_shuffle(&r, p, 4, (int)sizeof(struct RandPair));
+    r.shuffle( p, 4, (int)sizeof(struct RandPair));
     for (i = 0; i < 4; i++) {
         if (p[i].b != p[i].a * 10)
             return err(26, "元素内部被拆散了（elem 宽度不对？）");
@@ -331,7 +333,7 @@ test "rand_shuffle 对任意元素宽度也成立" {
     }
     if (n != 10)
         return err(27, "元素集合丢了");
-    random_shuffle(&r, (void *)0, 4, 4);
-    random_shuffle(&r, p, 0, 4);
-    random_shuffle(&r, p, 4, 0);
+    r.shuffle( (void *)0, 4, 4);
+    r.shuffle( p, 0, 4);
+    r.shuffle( p, 4, 0);
 }

@@ -4,14 +4,14 @@
  *
  *     char buf[16] = { 0 };
  *     BitWriter w = bw_open(buf, (int)sizeof buf);
- *     bw_put(&w, 3, 3)  catch e { return err(1, "写失败"); };   // 101
- *     bw_put(&w, 12, 5) catch e { return err(2, "写失败"); };   // 01100
- *     bw_align(&w)      catch e { return err(3, "对齐失败"); }; // 补 0
+ *     w.put( 3, 3)  catch e { return err(1, "写失败"); };   // 101
+ *     w.put( 12, 5) catch e { return err(2, "写失败"); };   // 01100
+ *     w.align()      catch e { return err(3, "对齐失败"); }; // 补 0
  *     w.bits;                       // 8
  *
  *     BitReader r = br_open((char[:]){ buf, 1 });
  *     u32 v = 0;
- *     br_get(&r, 3, &v) catch e { return err(4, "读失败"); };    // v = 5
+ *     r.get( 3, &v) catch e { return err(4, "读失败"); };    // v = 5
  *
  * 约定：
  *
@@ -24,7 +24,7 @@
  *   两种情况都**不动**游标，也不写半截（一次调用要么整段成功要么整段失败）。
  * - `n == 0` 是合法的空操作（返回 0 位），`n` 超出 32/64 是 `INVAL`。
  *
- * 典型用法是「先写头再回填长度」：写完记录 `bw_bits(&w)`，回头用 `bw_patch`
+ * 典型用法是「先写头再回填长度」：写完记录 `w.bit_count()`，回头用 `patch`
  * 在字节对齐处改 8/16/32 位——它不移动游标。
  */
 #include <string.h>
@@ -69,57 +69,57 @@ BitReader br_open(char[:] src)
     return r;
 }
 
-int bw_bits(BitWriter *w)
+int bit_count(BitWriter *w)
 {
     return w ? w->bits : 0;
 }
 
 /* 已经用掉的字节数（含只写了一半的那个字节） */
-int bw_bytes(BitWriter *w)
+int byte_count(BitWriter *w)
 {
     if (!w)
         return 0;
     return (w->bits + 7) / 8;
 }
 
-int bw_ok(BitWriter *w)
+int ok(BitWriter *w)
 {
     return w ? w->err == 0 : 0;
 }
 
-int br_remaining(BitReader *r)
+int remaining(BitReader *r)
 {
     if (!r)
         return 0;
     return r->len_bits - r->bits;
 }
 
-int br_eof(BitReader *r)
+int eof(BitReader *r)
 {
-    return br_remaining(r) <= 0;
+    return r->remaining() <= 0;
 }
 
-int br_bits(BitReader *r)
+int bit_count(BitReader *r)
 {
     return r ? r->bits : 0;
 }
 
 /* 写 n 位（n <= 32），v 的低 n 位、MSB 先写 */
-int!error bw_put(BitWriter *w, u32 v, int n)
+int!error put(BitWriter *w, u32 v, int n)
 {
     int i = 0;
     int need = 0;
 
     if (!w)
-        return err(std.encoding.bitbuf.INVAL, "bw_put: null writer");
+        return err(std.encoding.bitbuf.INVAL, "put: null writer");
     if (n < 0 || n > 32)
-        return err(std.encoding.bitbuf.INVAL, "bw_put: bit count out of 0..32");
+        return err(std.encoding.bitbuf.INVAL, "put: bit count out of 0..32");
     if (n == 0)
         return 1;
     need = (w->bits + n + 7) / 8;
     if (need > w->cap) {
         w->err = (int)std.encoding.bitbuf.FULL;
-        return err(std.encoding.bitbuf.FULL, "bw_put: buffer full");
+        return err(std.encoding.bitbuf.FULL, "put: buffer full");
     }
     for (i = 0; i < n; i++) {
         int bit = (int)((v >> (n - 1 - i)) & 1);
@@ -135,63 +135,63 @@ int!error bw_put(BitWriter *w, u32 v, int n)
     return 1;
 }
 
-int!error bw_put_bit(BitWriter *w, int bit)
+int!error put_bit(BitWriter *w, int bit)
 {
-    try bw_put(w, bit ? 1 : 0, 1);
+    try w->put( bit ? 1 : 0, 1);
     return 1;
 }
 
 /* 写 n 位（n <= 64） */
-int!error bw_put_u64(BitWriter *w, u64 v, int n)
+int!error put_u64(BitWriter *w, u64 v, int n)
 {
     if (!w)
-        return err(std.encoding.bitbuf.INVAL, "bw_put_u64: null writer");
+        return err(std.encoding.bitbuf.INVAL, "put_u64: null writer");
     if (n < 0 || n > 64)
-        return err(std.encoding.bitbuf.INVAL, "bw_put_u64: bit count out of 0..64");
+        return err(std.encoding.bitbuf.INVAL, "put_u64: bit count out of 0..64");
     if (n <= 32) {
-        try bw_put(w, (u32)(v & 0xffffffffu), n);
+        try w->put( (u32)(v & 0xffffffffu), n);
         return 1;
     }
     /* 先高 32 位再低 32 位 */
-    try bw_put(w, (u32)(v >> 32), n - 32);
-    try bw_put(w, (u32)(v & 0xffffffffu), 32);
+    try w->put( (u32)(v >> 32), n - 32);
+    try w->put( (u32)(v & 0xffffffffu), 32);
     return 1;
 }
 
 /* 补 0 到字节边界；返回补了几位（0..7） */
-int!error bw_align(BitWriter *w)
+int!error align(BitWriter *w)
 {
     int pad = 0;
     int need = 0;
 
     if (!w)
-        return err(std.encoding.bitbuf.INVAL, "bw_align: null writer");
+        return err(std.encoding.bitbuf.INVAL, "align: null writer");
     pad = (8 - (w->bits & 7)) & 7;
     if (pad == 0)
         return 0;
     need = (w->bits + pad + 7) / 8;
     if (need > w->cap) {
         w->err = (int)std.encoding.bitbuf.FULL;
-        return err(std.encoding.bitbuf.FULL, "bw_align: buffer full");
+        return err(std.encoding.bitbuf.FULL, "align: buffer full");
     }
-    /* 把当前字节的剩余位写成 0（字节本身可能是刚开的，已在 bw_put 里清过） */
-    try bw_put(w, 0, pad);
+    /* 把当前字节的剩余位写成 0（字节本身可能是刚开的，已在 put 里清过） */
+    try w->put( 0, pad);
     return pad;
 }
 
 /* 写一整段字节；要求已经在字节边界上（否则 INVAL，避免半个字节的歧义） */
-int!error bw_put_bytes(BitWriter *w, char[:] bytes)
+int!error put_bytes(BitWriter *w, char[:] bytes)
 {
     int i = 0;
     int base = 0;
 
     if (!w || bytes.len < 0)
-        return err(std.encoding.bitbuf.INVAL, "bw_put_bytes: null writer or negative length");
+        return err(std.encoding.bitbuf.INVAL, "put_bytes: null writer or negative length");
     if ((w->bits & 7) != 0)
-        return err(std.encoding.bitbuf.INVAL, "bw_put_bytes: not byte-aligned");
+        return err(std.encoding.bitbuf.INVAL, "put_bytes: not byte-aligned");
     if (w->bits / 8 + bytes.len > w->cap) {
         w->err = (int)std.encoding.bitbuf.FULL;
-        return err(std.encoding.bitbuf.FULL, "bw_put_bytes: buffer full");
+        return err(std.encoding.bitbuf.FULL, "put_bytes: buffer full");
     }
     base = w->bits / 8;
     for (i = 0; i < bytes.len; i++)
@@ -202,18 +202,18 @@ int!error bw_put_bytes(BitWriter *w, char[:] bytes)
 
 /* 回填：在字节对齐的位偏移 at 处写 n 位（8/16/32），**不移动游标**。
    用来写「长度先留空、写完再补」这类头字段。 */
-int!error bw_patch(BitWriter *w, int at, u32 v, int n)
+int!error patch(BitWriter *w, int at, u32 v, int n)
 {
     int i = 0;
 
     if (!w)
-        return err(std.encoding.bitbuf.INVAL, "bw_patch: null writer");
+        return err(std.encoding.bitbuf.INVAL, "patch: null writer");
     if (n < 0 || n > 32 || (n != 8 && n != 16 && n != 32))
-        return err(std.encoding.bitbuf.INVAL, "bw_patch: width must be 8, 16 or 32");
+        return err(std.encoding.bitbuf.INVAL, "patch: width must be 8, 16 or 32");
     if (at < 0 || (at & 7) != 0)
-        return err(std.encoding.bitbuf.INVAL, "bw_patch: at must be byte-aligned");
+        return err(std.encoding.bitbuf.INVAL, "patch: at must be byte-aligned");
     if ((at + n + 7) / 8 > w->cap || at + n > w->bits + 7)
-        return err(std.encoding.bitbuf.INVAL, "bw_patch: outside the written range");
+        return err(std.encoding.bitbuf.INVAL, "patch: outside the written range");
     for (i = 0; i < n; i++) {
         int bit = (int)((v >> (n - 1 - i)) & 1);
         int pos = at + i;
@@ -229,22 +229,22 @@ int!error bw_patch(BitWriter *w, int at, u32 v, int n)
 }
 
 /* 读 n 位（n <= 32）到 *out */
-int!error br_get(BitReader *r, int n, u32 *out)
+int!error get(BitReader *r, int n, u32 *out)
 {
     u32 v = 0;
     int i = 0;
 
     if (!r || !out)
-        return err(std.encoding.bitbuf.INVAL, "br_get: null reader or output");
+        return err(std.encoding.bitbuf.INVAL, "get: null reader or output");
     if (n < 0 || n > 32)
-        return err(std.encoding.bitbuf.INVAL, "br_get: bit count out of 0..32");
+        return err(std.encoding.bitbuf.INVAL, "get: bit count out of 0..32");
     if (n == 0) {
         *out = 0;
         return 1;
     }
     if (r->bits + n > r->len_bits) {
         r->err = (int)std.encoding.bitbuf.SHORT;
-        return err(std.encoding.bitbuf.SHORT, "br_get: not enough bits left");
+        return err(std.encoding.bitbuf.SHORT, "get: not enough bits left");
     }
     for (i = 0; i < n; i++) {
         int at = r->bits >> 3;
@@ -258,84 +258,84 @@ int!error br_get(BitReader *r, int n, u32 *out)
     return 1;
 }
 
-int!error br_get_bit(BitReader *r, int *out)
+int!error get_bit(BitReader *r, int *out)
 {
     u32 v = 0;
 
     if (!out)
-        return err(std.encoding.bitbuf.INVAL, "br_get_bit: null output");
-    try br_get(r, 1, &v);
+        return err(std.encoding.bitbuf.INVAL, "get_bit: null output");
+    try r->get( 1, &v);
     *out = (int)v;
     return 1;
 }
 
 /* 读 n 位（n <= 64）到 *out */
-int!error br_get_u64(BitReader *r, int n, u64 *out)
+int!error get_u64(BitReader *r, int n, u64 *out)
 {
     u32 hi = 0;
     u32 lo = 0;
 
     if (!r || !out)
-        return err(std.encoding.bitbuf.INVAL, "br_get_u64: null reader or output");
+        return err(std.encoding.bitbuf.INVAL, "get_u64: null reader or output");
     if (n < 0 || n > 64)
-        return err(std.encoding.bitbuf.INVAL, "br_get_u64: bit count out of 0..64");
+        return err(std.encoding.bitbuf.INVAL, "get_u64: bit count out of 0..64");
     if (n <= 32) {
-        try br_get(r, n, &lo);
+        try r->get( n, &lo);
         *out = (u64)lo;
         return 1;
     }
-    try br_get(r, n - 32, &hi);
-    try br_get(r, 32, &lo);
+    try r->get( n - 32, &hi);
+    try r->get( 32, &lo);
     *out = ((u64)hi << 32) | (u64)lo;
     return 1;
 }
 
 /* 看一眼接下来 n 位，不动游标 */
-int!error br_peek(BitReader *r, int n, u32 *out)
+int!error peek(BitReader *r, int n, u32 *out)
 {
     int save = 0;
 
     if (!r || !out)
-        return err(std.encoding.bitbuf.INVAL, "br_peek: null reader or output");
+        return err(std.encoding.bitbuf.INVAL, "peek: null reader or output");
     save = r->bits;
-    br_get(r, n, out) catch e {
+    r->get(n, out) catch e {
         r->bits = save;
-        return err(std.encoding.bitbuf.SHORT, "br_peek: not enough bits left");
+        return err(std.encoding.bitbuf.SHORT, "peek: not enough bits left");
     };
     r->bits = save;
     return 1;
 }
 
-int!error br_skip(BitReader *r, int n)
+int!error skip(BitReader *r, int n)
 {
     if (!r)
-        return err(std.encoding.bitbuf.INVAL, "br_skip: null reader");
+        return err(std.encoding.bitbuf.INVAL, "skip: null reader");
     if (n < 0)
-        return err(std.encoding.bitbuf.INVAL, "br_skip: negative count");
+        return err(std.encoding.bitbuf.INVAL, "skip: negative count");
     if (r->bits + n > r->len_bits) {
         r->err = (int)std.encoding.bitbuf.SHORT;
-        return err(std.encoding.bitbuf.SHORT, "br_skip: not enough bits left");
+        return err(std.encoding.bitbuf.SHORT, "skip: not enough bits left");
     }
     r->bits += n;
     return 1;
 }
 
 /* 读一整段字节；要求已经在字节边界上 */
-int!error br_get_bytes(BitReader *r, char *dst, int n)
+int!error get_bytes(BitReader *r, char *dst, int n)
 {
     int i = 0;
     int base = 0;
 
     if (!r || n < 0)
-        return err(std.encoding.bitbuf.INVAL, "br_get_bytes: null reader or negative length");
+        return err(std.encoding.bitbuf.INVAL, "get_bytes: null reader or negative length");
     if ((r->bits & 7) != 0)
-        return err(std.encoding.bitbuf.INVAL, "br_get_bytes: not byte-aligned");
+        return err(std.encoding.bitbuf.INVAL, "get_bytes: not byte-aligned");
     if (r->bits + n * 8 > r->len_bits) {
         r->err = (int)std.encoding.bitbuf.SHORT;
-        return err(std.encoding.bitbuf.SHORT, "br_get_bytes: not enough bytes left");
+        return err(std.encoding.bitbuf.SHORT, "get_bytes: not enough bytes left");
     }
     if (n > 0 && !dst)
-        return err(std.encoding.bitbuf.INVAL, "br_get_bytes: null destination");
+        return err(std.encoding.bitbuf.INVAL, "get_bytes: null destination");
     base = r->bits / 8;
     for (i = 0; i < n; i++)
         dst[i] = r->src.data[base + i];
@@ -344,14 +344,14 @@ int!error br_get_bytes(BitReader *r, char *dst, int n)
 }
 
 /* 跳到下一个字节边界；返回跳了几位 */
-int!error br_align(BitReader *r)
+int!error align(BitReader *r)
 {
     int pad = 0;
 
     if (!r)
-        return err(std.encoding.bitbuf.INVAL, "br_align: null reader");
+        return err(std.encoding.bitbuf.INVAL, "align: null reader");
     pad = (8 - (r->bits & 7)) & 7;
-    try br_skip(r, pad);
+    try r->skip(pad);
     return pad;
 }
 
@@ -363,24 +363,24 @@ test "写：位序是 MSB 先、跨字节连续" {
     char buf[8] = { 0 };
     BitWriter w = bw_open(buf, (int)sizeof buf);
 
-    bw_put(&w, 5, 3) catch e { return err(1, "写 3 位失败"); };    /* 101 */
-    bw_put(&w, 12, 5) catch e { return err(2, "写 5 位失败"); };   /* 01100 */
-    if (bw_bits(&w) != 8 || bw_bytes(&w) != 1)
+    w.put( 5, 3) catch e { return err(1, "写 3 位失败"); };    /* 101 */
+    w.put( 12, 5) catch e { return err(2, "写 5 位失败"); };   /* 01100 */
+    if (w.bit_count() != 8 || w.byte_count() != 1)
         return err(3, "游标不对");
     if ((u8)buf[0] != 0xac)
         return err(4, "101+01100 应当拼成 0xac");
     /* 跨字节：12 位 0xabc → ab c0 */
     w = bw_open(buf, (int)sizeof buf);
-    bw_put(&w, 0xabc, 12) catch e { return err(5, "写 12 位失败"); };
+    w.put( 0xabc, 12) catch e { return err(5, "写 12 位失败"); };
     if ((u8)buf[0] != 0xab || (u8)buf[1] != 0xc0)
         return err(6, "12 位跨字节结果不对");
     /* 单 bit */
     w = bw_open(buf, (int)sizeof buf);
-    bw_put_bit(&w, 1) catch e { return err(7, "写 1 位失败"); };
-    bw_put_bit(&w, 0) catch e { return err(8, "写 1 位失败"); };
+    w.put_bit( 1) catch e { return err(7, "写 1 位失败"); };
+    w.put_bit( 0) catch e { return err(8, "写 1 位失败"); };
     if ((u8)buf[0] != 0x80)
         return err(9, "10 应当写成 0x80");
-    if (!bw_ok(&w))
+    if (!w.ok())
         return err(10, "成功路径上不该置 err");
 }
 
@@ -390,56 +390,56 @@ test "写：对齐、64 位、整段字节、放不下" {
     int pad = 0;
     int rc = 0;
 
-    bw_put(&w, 5, 3) catch e { return err(11, "写失败"); };   /* 101 */
-    pad = (try bw_align(&w));
+    w.put( 5, 3) catch e { return err(11, "写失败"); };   /* 101 */
+    pad = (try w.align());
     if (pad != 5)
         return err(12, "3 位之后应当补 5 位");
-    if (bw_bits(&w) != 8)
+    if (w.bit_count() != 8)
         return err(13, "对齐后应当正好 1 字节");
     if ((u8)buf[0] != 0xa0)
         return err(14, "100+00000 应当是 0xa0");
-    if ((try bw_align(&w)) != 0)
+    if ((try w.align()) != 0)
         return err(15, "已对齐不该再补");
 
     /* 64 位 */
     w = bw_open(buf, (int)sizeof buf);
-    bw_put_u64(&w, 0x0123456789abcdefULL, 64)
+    w.put_u64( 0x0123456789abcdefULL, 64)
         catch e { return err(16, "写 64 位失败"); };
     if ((u8)buf[0] != 0x01 || (u8)buf[7] != 0xef)
         return err(17, "64 位按 MSB 写的结果不对");
-    bw_put_u64(&w, 0xffff, 65) catch e { goto bad_width; };
+    w.put_u64( 0xffff, 65) catch e { goto bad_width; };
     return err(18, "65 位应当 INVAL");
 bad_width:;
 
     /* 整段字节 */
     w = bw_open(buf, (int)sizeof buf);
-    bw_put(&w, 7, 3) catch e { return err(19, "写失败"); };
-    bw_put_bytes(&w, S("ab")) catch e { goto unaligned_ok; };
+    w.put( 7, 3) catch e { return err(19, "写失败"); };
+    w.put_bytes( S("ab")) catch e { goto unaligned_ok; };
     return err(20, "未对齐时写整段应当 INVAL");
 unaligned_ok:;
-    bw_align(&w) catch e { return err(21, "对齐失败"); };
-    bw_put_bytes(&w, S("ab")) catch e { return err(22, "对齐后应当能写整段"); };
+    w.align() catch e { return err(21, "对齐失败"); };
+    w.put_bytes( S("ab")) catch e { return err(22, "对齐后应当能写整段"); };
     if (buf[1] != 'a' || buf[2] != 'b')
         return err(23, "整段字节写的位置不对");
 
     /* 放不下：整段失败，且不动已有内容 */
     w = bw_open(buf, 1);
-    bw_put(&w, 0xff, 8) catch e { return err(24, "写满 1 字节应当成功"); };
-    bw_put(&w, 1, 1) catch e {
+    w.put( 0xff, 8) catch e { return err(24, "写满 1 字节应当成功"); };
+    w.put( 1, 1) catch e {
         if (e.id != (int)std.encoding.bitbuf.FULL)
             return err(25, "越界应当是 FULL");
         goto full_ok;
     };
     return err(26, "第 9 位应当 FULL");
 full_ok:;
-    if (bw_bits(&w) != 8 || bw_ok(&w))
+    if (w.bit_count() != 8 || w.ok())
         return err(27, "FULL 之后游标不该动、err 该置位");
     if ((u8)buf[0] != 0xff)
         return err(28, "失败不该改已写好的字节");
     /* 一次调用整段失败：容量 1、一开始就写 9 位，字节都不该动 */
     buf[0] = 0x5a;
     w = bw_open(buf, 1);
-    bw_put(&w, 0x1ff, 9) catch e { goto no_partial; };
+    w.put( 0x1ff, 9) catch e { goto no_partial; };
     return err(29, "9 位放进 1 字节应当 FULL");
 no_partial:;
     if ((u8)buf[0] != 0x5a)
@@ -448,29 +448,29 @@ no_partial:;
     (void)rc;
 }
 
-test "回填：bw_patch 不改游标" {
+test "回填：patch 不改游标" {
     char buf[8] = { 0 };
     BitWriter w = bw_open(buf, (int)sizeof buf);
 
-    bw_put(&w, 0, 8) catch e { return err(31, "占位失败"); };
-    bw_put(&w, 0xbeef, 16) catch e { return err(32, "写正文失败"); };
-    bw_patch(&w, 0, 0x42, 8) catch e { return err(33, "回填失败"); };
+    w.put( 0, 8) catch e { return err(31, "占位失败"); };
+    w.put( 0xbeef, 16) catch e { return err(32, "写正文失败"); };
+    w.patch( 0, 0x42, 8) catch e { return err(33, "回填失败"); };
     if ((u8)buf[0] != 0x42)
         return err(34, "回填的字节不对");
-    if (bw_bits(&w) != 24)
+    if (w.bit_count() != 24)
         return err(35, "回填不该移动游标");
     /* 回填 0 能把位清掉 */
-    bw_patch(&w, 0, 0, 8) catch e { return err(36, "回填 0 失败"); };
+    w.patch( 0, 0, 8) catch e { return err(36, "回填 0 失败"); };
     if ((u8)buf[0] != 0)
         return err(37, "回填 0 应当清位");
     /* 非法参数 */
-    bw_patch(&w, 1, 1, 8) catch e { goto misaligned; };
+    w.patch( 1, 1, 8) catch e { goto misaligned; };
     return err(38, "未对齐位置应当 INVAL");
 misaligned:;
-    bw_patch(&w, 0, 1, 7) catch e { goto bad_bits; };
+    w.patch( 0, 1, 7) catch e { goto bad_bits; };
     return err(39, "非 8/16/32 位宽应当 INVAL");
 bad_bits:;
-    bw_patch(&w, 0, 1, 8) catch e { return err(40, "对齐回填应当合法"); };
+    w.patch( 0, 1, 8) catch e { return err(40, "对齐回填应当合法"); };
     if ((u8)buf[0] != 1)
         return err(41, "回填值不对");
 }
@@ -482,48 +482,48 @@ test "读：取值、peek 不动游标、越界不动游标" {
     u32 v = 0;
     u64 got = 0;
 
-    bw_put(&w, 5, 3) catch e { return err(42, "写失败"); };
-    bw_put(&w, 12, 5) catch e { return err(43, "写失败"); };
-    bw_put_u64(&w, 0x1122334455667788ULL, 64)
+    w.put( 5, 3) catch e { return err(42, "写失败"); };
+    w.put( 12, 5) catch e { return err(43, "写失败"); };
+    w.put_u64( 0x1122334455667788ULL, 64)
         catch e { return err(44, "写失败"); };
-    r = br_open((char[:]){ buf, bw_bytes(&w) });
-    if (br_remaining(&r) != 72)
+    r = br_open((char[:]){ buf, w.byte_count() });
+    if (r.remaining() != 72)
         return err(45, "剩余位数不对");
-    br_get(&r, 3, &v) catch e { return err(46, "读 3 位失败"); };
+    r.get( 3, &v) catch e { return err(46, "读 3 位失败"); };
     if (v != 5)
         return err(47, "读回的高 3 位不对");
-    br_get(&r, 5, &v) catch e { return err(48, "读 5 位失败"); };
+    r.get( 5, &v) catch e { return err(48, "读 5 位失败"); };
     if (v != 12)
         return err(49, "读回的低 5 位不对");
     /* peek 不推进 */
-    br_peek(&r, 8, &v) catch e { return err(50, "peek 失败"); };
-    if (v != 0x11 || br_bits(&r) != 8)
+    r.peek( 8, &v) catch e { return err(50, "peek 失败"); };
+    if (v != 0x11 || r.bit_count() != 8)
         return err(51, "peek 的值或游标不对");
-    br_get_u64(&r, 64, &got) catch e { return err(52, "读 64 位失败"); };
+    get_u64(&r, 64, &got) catch e { return err(52, "读 64 位失败"); };
     if (got != 0x1122334455667788ULL)
         return err(53, "64 位读回不对");
-    if (!br_eof(&r))
+    if (!r.eof())
         return err(54, "读完了应当 eof");
     /* 越界：SHORT，且游标不动 */
     {
         BitReader s = br_open((char[:]){ buf, 1 });
 
-        br_get(&s, 9, &v) catch e {
+        s.get( 9, &v) catch e {
             if (e.id != (int)std.encoding.bitbuf.SHORT)
                 return err(55, "越界应当是 SHORT");
             goto short_ok;
         };
         return err(56, "1 字节里读 9 位应当 SHORT");
 short_ok:;
-        if (br_bits(&s) != 0 || s.err != (int)std.encoding.bitbuf.SHORT)
+        if (s.bit_count() != 0 || s.err != (int)std.encoding.bitbuf.SHORT)
             return err(57, "SHORT 之后游标不该动、err 该置位");
-        br_skip(&s, 9) catch e { goto skip_bad; };
+        s.skip( 9) catch e { goto skip_bad; };
         return err(58, "skip 越界应当失败");
 skip_bad:;
-        if (br_bits(&s) != 0)
+        if (s.bit_count() != 0)
             return err(59, "skip 越界不该动游标");
-        br_get(&s, 8, &v) catch e { return err(60, "读 8 位应当成功"); };
-        br_skip(&s, 1) catch e { goto skip_end; };
+        s.get( 8, &v) catch e { return err(60, "读 8 位应当成功"); };
+        s.skip( 1) catch e { goto skip_end; };
         return err(61, "skip 越过尾巴应当失败");
 skip_end:;
     }
@@ -531,10 +531,10 @@ skip_end:;
     {
         BitReader s = br_open((char[:]){ buf, 1 });
 
-        br_peek(&s, 9, &v) catch e { goto peek_bad; };
+        s.peek( 9, &v) catch e { goto peek_bad; };
         return err(62, "peek 越界应当失败");
 peek_bad:;
-        if (br_bits(&s) != 0)
+        if (s.bit_count() != 0)
             return err(63, "peek 越界不该动游标");
     }
 }
@@ -546,22 +546,22 @@ test "读：整段字节与对齐" {
     BitReader r = br_open((char[:]){ buf, 0 });
     u32 v = 0;
 
-    bw_put(&w, 0xa, 4) catch e { return err(64, "写失败"); };
-    bw_align(&w) catch e { return err(65, "对齐失败"); };
-    bw_put_bytes(&w, S("hi")) catch e { return err(66, "写整段失败"); };
-    r = br_open((char[:]){ buf, bw_bytes(&w) });
-    br_get(&r, 4, &v) catch e { return err(67, "读 4 位失败"); };
+    w.put( 0xa, 4) catch e { return err(64, "写失败"); };
+    w.align() catch e { return err(65, "对齐失败"); };
+    w.put_bytes( S("hi")) catch e { return err(66, "写整段失败"); };
+    r = br_open((char[:]){ buf, w.byte_count() });
+    r.get( 4, &v) catch e { return err(67, "读 4 位失败"); };
     if (v != 0xa)
         return err(68, "高 4 位不对");
-    br_get_bytes(&r, out, 2) catch e { goto need_align; };
+    r.get_bytes( out, 2) catch e { goto need_align; };
     return err(69, "未对齐时读整段应当 INVAL");
 need_align:;
-    if ((try br_align(&r)) != 4)
+    if ((try r.align()) != 4)
         return err(70, "应当跳过 4 位对齐");
-    br_get_bytes(&r, out, 2) catch e { return err(71, "对齐后读整段失败"); };
+    r.get_bytes( out, 2) catch e { return err(71, "对齐后读整段失败"); };
     if (out[0] != 'h' || out[1] != 'i')
         return err(72, "整段字节读回不对");
-    if (!br_eof(&r))
+    if (!r.eof())
         return err(73, "应当读完");
 }
 
@@ -571,36 +571,36 @@ test "空操作与非法参数" {
     BitReader r = br_open((char[:]){ buf, 1 });
     u32 v = 9;
 
-    bw_put(&w, 123, 0) catch e { return err(74, "写 0 位应当是空操作"); };
-    if (bw_bits(&w) != 0)
+    w.put( 123, 0) catch e { return err(74, "写 0 位应当是空操作"); };
+    if (w.bit_count() != 0)
         return err(75, "写 0 位不该动游标");
-    bw_put(&w, 1, 33) catch e { goto w33; };
+    w.put( 1, 33) catch e { goto w33; };
     return err(76, "写 33 位应当 INVAL");
 w33:;
-    bw_put(&w, 1, -1) catch e { goto wneg; };
+    w.put( 1, -1) catch e { goto wneg; };
     return err(77, "写 -1 位应当 INVAL");
 wneg:;
-    br_get(&r, 0, &v) catch e { return err(78, "读 0 位应当是空操作"); };
-    if (v != 0 || br_bits(&r) != 0)
+    r.get( 0, &v) catch e { return err(78, "读 0 位应当是空操作"); };
+    if (v != 0 || r.bit_count() != 0)
         return err(79, "读 0 位不该动游标、值该是 0");
-    br_get(&r, 33, &v) catch e { goto r33; };
+    r.get( 33, &v) catch e { goto r33; };
     return err(80, "读 33 位应当 INVAL");
 r33:;
     /* 空视图 */
     {
         BitReader e = br_open((char[:]){ (char *)0, 0 });
 
-        if (!br_eof(&e) || br_remaining(&e) != 0)
+        if (!e.eof() || e.remaining() != 0)
             return err(81, "空视图应当立刻 eof");
-        br_get(&e, 1, &v) catch e2 { goto empty_bad; };
+        e.get( 1, &v) catch e2 { goto empty_bad; };
         return err(82, "空视图读 1 位应当失败");
 empty_bad:;
     }
     /* 位宽正好用满 */
     w = bw_open(buf, 8);
-    bw_put_u64(&w, 0xffffffffffffffffULL, 64)
+    w.put_u64( 0xffffffffffffffffULL, 64)
         catch e { return err(83, "64 位填满 8 字节应当成功"); };
-    bw_put(&w, 0, 1) catch e { goto exactly_full; };
+    w.put( 0, 1) catch e { goto exactly_full; };
     return err(84, "再多一位应当 FULL");
 exactly_full:;
 }
@@ -617,17 +617,17 @@ test "往返：混合位宽序列" {
         u32 mask = (1u << widths[i]) - 1;
 
         vals[i] = ((u32)(i * 2654435761u)) & mask;
-        bw_put(&w, vals[i], widths[i]) catch e { return err(85, "写失败"); };
+        w.put( vals[i], widths[i]) catch e { return err(85, "写失败"); };
     }
-    bw_align(&w) catch e { return err(86, "对齐失败"); };
-    r = br_open((char[:]){ buf, bw_bytes(&w) });
+    w.align() catch e { return err(86, "对齐失败"); };
+    r = br_open((char[:]){ buf, w.byte_count() });
     for (i = 0; i < 16; i++) {
         u32 got = 0;
 
-        br_get(&r, widths[i], &got) catch e { return err(87, "读失败"); };
+        r.get( widths[i], &got) catch e { return err(87, "读失败"); };
         if (got != vals[i])
             return err(88, "往返值不一致");
     }
-    if (!br_eof(&r))
+    if (!r.eof())
         return err(89, "应当正好读完");
 }

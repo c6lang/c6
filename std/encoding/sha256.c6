@@ -8,10 +8,10 @@
  *     sha256_hex("abc", 3, hex);            // 64 个小写十六进制 + NUL
  *
  *     Sha256 st = { { 0 }, 0, { 0 }, 0 };   // 流式：任意切分得到同一个结果
- *     sha256_init(&st);
- *     sha256_update(&st, "a", 1);
- *     sha256_update(&st, "bc", 2);
- *     sha256_final(&st, d);                 // 之后状态失效，要再 init 才能复用
+ *     st.init();
+ *     st.update( "a", 1);
+ *     st.update( "bc", 2);
+ *     st.final( d);                 // 之后状态失效，要再 init 才能复用
  *
  *     u8 mac[32] = { 0 };                   // HMAC-SHA-256
  *     hmac_sha256(key, klen, msg, mlen, mac);
@@ -45,7 +45,7 @@ struct Sha256 {
     u32 used;     /* buf 里已有多少字节 */
 };
 
-/* 流式 hex 输出的便捷句柄：喂完之后 sha256hex_final 交出 out（65 字节） */
+/* 流式 hex 输出的便捷句柄：喂完之后 final 交出 out（65 字节） */
 struct Sha256Hex {
     Sha256 st;
     char out[65];
@@ -124,7 +124,7 @@ static void sha256_block(Sha256 *self, const u8 *p)
 }
 
 /* 复位到一个新的哈希（同一个结构体可以反复用） */
-void sha256_init(Sha256 *self)
+void init(Sha256 *self)
 {
     /* §5.3.3：前 8 个素数平方根小数部分的前 32 位 */
     static const u32 iv[8] = {
@@ -143,7 +143,7 @@ void sha256_init(Sha256 *self)
 }
 
 /* 喂数据：任意切分（1 字节一喂、63/64/65 跨块）都给同一个结果 */
-void sha256_update(Sha256 *self, const void *p, usize n)
+void update(Sha256 *self, const void *p, usize n)
 {
     const u8 *b = (const u8 *)p;
     usize i = 0;
@@ -170,7 +170,7 @@ void sha256_update(Sha256 *self, const void *p, usize n)
 }
 
 /* 收尾：0x80 填充 + 比特长度大端追加，交出 32 字节摘要 */
-void sha256_final(Sha256 *self, u8 *out32)
+void final(Sha256 *self, u8 *out32)
 {
     u64 bits = 0ull;
     int i = 0;
@@ -197,7 +197,7 @@ void sha256_final(Sha256 *self, u8 *out32)
         out32[i * 4 + 2] = (u8)(self->h[i] >> 8);
         out32[i * 4 + 3] = (u8)self->h[i];
     }
-    /* 中间状态和密钥材料一样敏感：用完就抹掉，要再用请 sha256_init */
+    /* 中间状态和密钥材料一样敏感：用完就抹掉，要再用请 init */
     memset(self, 0, sizeof(Sha256));
 }
 
@@ -208,9 +208,9 @@ void sha256(const void *p, usize n, u8 *out32)
 
     if (!out32)
         return;
-    sha256_init(&st);
-    sha256_update(&st, p, n);
-    sha256_final(&st, out32);
+    st.init();
+    st.update( p, n);
+    st.final( out32);
 }
 
 static const char sha256_hex_digits[] = "0123456789abcdef";
@@ -259,16 +259,16 @@ void hmac_sha256(const void *key, usize klen, const void *msg, usize mlen,
     }
     for (i = 0; i < 64; i++)
         pad[i] = (u8)(kblock[i] ^ 0x36);
-    sha256_init(&st);
-    sha256_update(&st, pad, sizeof pad);
-    sha256_update(&st, msg, mlen);
-    sha256_final(&st, inner);
+    st.init();
+    st.update( pad, sizeof pad);
+    st.update( msg, mlen);
+    st.final( inner);
     for (i = 0; i < 64; i++)
         pad[i] = (u8)(kblock[i] ^ 0x5c);
-    sha256_init(&st);
-    sha256_update(&st, pad, sizeof pad);
-    sha256_update(&st, inner, sizeof inner);
-    sha256_final(&st, out32);
+    st.init();
+    st.update( pad, sizeof pad);
+    st.update( inner, sizeof inner);
+    st.final( out32);
     memset(kblock, 0, sizeof kblock);
     memset(pad, 0, sizeof pad);
     memset(inner, 0, sizeof inner);
@@ -302,29 +302,29 @@ int sha256_eq(const u8 *a, const u8 *b)
 
 /* ---- 流式 hex 句柄 ---- */
 
-void sha256hex_init(Sha256Hex *self)
+void init(Sha256Hex *self)
 {
     if (!self)
         return;
-    sha256_init(&self->st);
+    self->st.init();
     self->out[0] = 0;
 }
 
-void sha256hex_update(Sha256Hex *self, const void *p, usize n)
+void update(Sha256Hex *self, const void *p, usize n)
 {
     if (!self)
         return;
-    sha256_update(&self->st, p, n);
+    self->st.update(p, n);
 }
 
 /* 收尾并返回内部 65 字节缓冲（空句柄给 NULL） */
-const char *sha256hex_final(Sha256Hex *self)
+const char *final(Sha256Hex *self)
 {
     u8 d[32] = { 0 };
 
     if (!self)
         return (const char *)0;
-    sha256_final(&self->st, d);
+    self->st.final(d);
     sha256_to_hex(d, self->out);
     memset(d, 0, sizeof d);
     return self->out;
@@ -382,10 +382,10 @@ test "一百万个小写 a" {
     int i = 0;
 
     memset(chunk, 'a', sizeof chunk);
-    sha256hex_init(&hx);
+    hx.init();
     for (i = 0; i < 1000; i++)
-        sha256hex_update(&hx, chunk, sizeof chunk);
-    if (strcmp(sha256hex_final(&hx),
+        hx.update( chunk, sizeof chunk);
+    if (strcmp(hx.final(),
                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0") != 0)
         return err(8, "一百万 a 的摘要不对");
 }
@@ -404,16 +404,16 @@ test "分片喂入与一次喂完结果一致" {
         u8 got[32] = { 0 };
         usize off = 0;
 
-        sha256_init(&st);
+        st.init();
         while (off < sizeof data) {
             usize take = cuts[j];
 
             if (take > sizeof data - off)
                 take = sizeof data - off;
-            sha256_update(&st, data + off, take);
+            st.update( data + off, take);
             off += take;
         }
-        sha256_final(&st, got);
+        st.final( got);
         if (!sha256_eq(got, want))
             return err(9, "切分大小不同就给了不同摘要");
     }
@@ -424,17 +424,17 @@ test "init 之后直接 final 等于空串，final 之后状态失效" {
     u8 d[32] = { 0 };
     char hex[65] = { 0 };
 
-    sha256_init(&st);
-    sha256_final(&st, d);
+    st.init();
+    st.final( d);
     sha256_to_hex(d, hex);
     if (strcmp(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") != 0)
         return err(10, "空输入的流式摘要不对");
     if (st.n != 0ull || st.used != 0u || st.h[3] != 0u || st.h[7] != 0u)
         return err(11, "final 之后状态没有被抹掉");
     /* 再 init 一次应当完全复位 */
-    sha256_init(&st);
-    sha256_update(&st, "abc", 3);
-    sha256_final(&st, d);
+    st.init();
+    st.update( "abc", 3);
+    st.final( d);
     sha256_to_hex(d, hex);
     if (strcmp(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") != 0)
         return err(12, "同一个结构体二次使用结果不对");
@@ -481,11 +481,11 @@ test "空指针当空输入，输出指针为空直接返回" {
     Sha256 st = { 0 };
     char hex[65] = { 0 };
 
-    sha256_init(&st);
-    sha256_update(&st, (const void *)0, 0);
-    sha256_update(&st, (const void *)0, 77);    /* n 被忽略 */
-    sha256_update(&st, "", 0);
-    sha256_final(&st, (u8 *)0);                 /* 应当什么都不做 */
+    st.init();
+    st.update( (const void *)0, 0);
+    st.update( (const void *)0, 77);    /* n 被忽略 */
+    st.update( "", 0);
+    st.final( (u8 *)0);                 /* 应当什么都不做 */
     sha256_hex((const void *)0, 123, hex);      /* 只喂了 0 字节 */
     if (strcmp(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") != 0)
         return err(20, "空指针改动了摘要");
@@ -500,18 +500,18 @@ test "Sha256Hex 句柄可以分段喂、可以复位" {
     Sha256Hex hx = { { 0 }, { 0 } };
     const char *r = (const char *)0;
 
-    sha256hex_init(&hx);
-    sha256hex_update(&hx, "ab", 2);
-    sha256hex_update(&hx, "c", 1);
-    if (strcmp(sha256hex_final(&hx),
+    hx.init();
+    hx.update( "ab", 2);
+    hx.update( "c", 1);
+    if (strcmp(hx.final(),
                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") != 0)
         return err(21, "句柄分段喂 abc 的摘要不对");
-    sha256hex_init(&hx);
-    if (strcmp(sha256hex_final(&hx),
+    hx.init();
+    if (strcmp(hx.final(),
                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") != 0)
         return err(22, "句柄复位后不是空串摘要");
-    sha256hex_update((Sha256Hex *)0, "x", 1);
-    r = sha256hex_final((Sha256Hex *)0);
+    ((Sha256Hex *)0)->update("x", 1);
+    r = ((Sha256Hex *)0)->final();
     if (r != (const char *)0)
         return err(23, "空句柄应当返回 NULL");
 }

@@ -722,3 +722,35 @@ RFC 5952 压缩、坏输入、CIDR 归属、清位成网络地址、端口边界
 `grammar.md` §8.1 号段表）同步成分组形式；`docs/stdlib.md` 的 stdtest 输出
 示例也重新按实际输出生成。验收：`make stdtest`（37 个模块全绿）、六个
 `std-*` 集成示例、`make selftest`、`make errcheck`。
+
+### 11.17 标准库方法化（去掉接收者前缀）
+
+`std/` 的普通结构体方法一直写成「第一个参数是结构体指针」的文件作用域函数，但名字
+带了接收者前缀：`reader_read_line`、`writer_write`、`arena_alloc`、`random_u64`、
+`sha256_update`、`json_get`、`inet_is_private`……文档里写的 `pr->read_line(...)` 实际
+编不过，必须写 `reader_read_line(pr, ...)`。这次把方法名统一成裸动词，调用侧一律用
+方法语法：
+
+- `Reader`/`Writer`：`ok`/`read_line`/`read_all`/`read_bytes`/`seek_to`/`tell`/`eof`/
+  `close`，`write`/`write_line`/`write_bytes`/`write_slice`/`flush`/`close`；
+- `Arena`：`room`/`used`/`is_empty`/`reset`/`alloc`/`alloc_array`/`alloc_str`/`alloc_copy`；
+- `Rand`：`next_u64`/`next_u32`/`below`/`int_range`/`int_range_incl`/`next_f64`/
+  `next_bool`/`fill`/`shuffle`/`shuffle_int`（`u64`/`int`/`f64` 是类型名，不能当方法名）；
+- `Hasher`、`StrBuf`、`Sha256`/`Sha256Hex`、`Uuid`、`Json`、`CsvReader`、`IniReader`、
+  `Dir`、`CFile`、`BitWriter`/`BitReader`、`Duration`/`Civil`、`Ipv4`/`Ipv6`/`Ip`、
+  `Url` 同样去掉了各自的前缀；`BitWriter.align` 与 `BitReader.align`、`close`/`ok`/
+  `format`/`next` 这些重名方法按接收者 tag 区分。
+
+能这样重名的原因是符号规则没有变：方法符号是 `<Tag>_<name>`，模块里的裸名弱别名是
+`<module>__<name>`，不会进全局命名空间；同一模块里不同结构体的同名方法也不会互相
+顶掉。普通 C 文件（不是 module）里的方法仍建议加接收者前缀，因为那里的裸名弱别名
+是全局的。`foreach` 的迭代器协议仍然只认字面上的 `has()`/`next()`，所以 `Split`/
+`Lines`/`Fields`/`Range`/`StepRange`/`CFile` 的这两个方法名不动。工厂和一次性函数
+（`reader_open`/`rand_seed`/`bw_open`/`br_open`/`csv_reader`/`ini_open`/`arena_make`/
+`url_parse`/`uuid_parse`）仍是自由函数；泛型模板体内的方法（`Vect.push` 等）也不变。
+
+改动覆盖 37 个 `std/` 模块、六个 `std-*` 集成示例、`docs/stdlib.md` 与 README 的模块表/
+示例/写法约定；原来的 `name(&v, ...)` 调用统一改成 `v.name(...)` / `v->name(...)`。
+验收：`make stdtest`（37 个模块、0 failure）、`make std-demo`、`make std-tour`、
+`make std-kit`、`make std-box`、`make std-web`、`make std-net`、`make selftest`、
+`make errcheck`。
