@@ -1,0 +1,275 @@
+/* std/os/systemd：systemd unit 文件（`.service`/`.socket`/`.timer`）的解析。
+ *
+ *     import std.os.systemd;
+ *
+ *     SdDoc doc = { 0 };
+ *     SdEntry e = { 0 };
+ *     Str v = { 0 };
+ *     doc.open(buf, n);                       // 游标：open / next / count / sections
+ *     while (doc.next(&e) == 1)
+ *         // e.section / e.key / e.value
+ *     doc.get("Service", "ExecStart", &v);
+ *
+ * 语法：`[Section]` 分段，段内是 `Key=Value`；`#` 或 `;` 开头的行是注释；空行忽略。
+ *
+ * 约定：
+ *
+ * - `SdDoc` 是游标：`open` 数条目与段数，`next` 逐条返回（带所属段名），
+ *   `rewind` 复位，`count()` 是条目数，`sections()` 是段数；
+ * - `get(section, key, &value)` 按段名 + 键名精确匹配第一个（systemd 的段名与键名
+ *   都是**大小写敏感**的）；
+ * - `value` 两个端点的空白会被去掉，但**不**去掉引号（systemd 的引号由它自己的
+ *   词法处理，很多值确实带引号，保留更忠实）；
+ * - 行尾的 `\` 续行**不支持**（会原样保留反斜杠，值随行结束）；
+ * - 键名与值都允许含 `=`（只按第一个 `=` 切分）。
+ */
+#include <string.h>
+
+module std.os.systemd;
+import std.core.types;
+import std.text.str;
+
+struct SdEntry {
+    Str section;
+    Str key;
+    Str value;
+};
+
+struct SdDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+    int nsections;
+    Str section;
+};
+
+static Str sd_trim(Str s)
+{
+    int a = 0, b = s.s.len;
+    Str r = { (char[:]){ 0, 0 } };
+
+    if (!s.s.data)
+        return r;
+    while (a < b && (s.s.data[a] == ' ' || s.s.data[a] == '\t'))
+        a++;
+    while (b > a && (s.s.data[b - 1] == ' ' || s.s.data[b - 1] == '\t'))
+        b--;
+    r.s = (char[:]){ s.s.data + a, b - a };
+    return r;
+}
+
+int next(SdDoc *d, SdEntry *out)
+{
+    const char *p = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    while (d->off < d->n) {
+        int start = d->off, i = d->off, end = 0, eq = -1;
+
+        while (i < d->n && p[i] != '\n')
+            i++;
+        end = i;
+        if (end > start && p[end - 1] == '\r')
+            end--;
+        if (i < d->n)
+            i++;
+        d->off = i;
+        while (start < end && (p[start] == ' ' || p[start] == '\t'))
+            start++;
+        if (start >= end)
+            continue;
+        if (p[start] == '#' || p[start] == ';')
+            continue;
+        if (p[start] == '[') {
+            int close = -1, k = 0;
+
+            for (k = start; k < end; k++) {
+                if (p[k] == ']') {
+                    close = k;
+                    break;
+                }
+            }
+            if (close < 0)
+                return -1;
+            d->section = sd_trim((Str){ (char[:]){ (char *)p + start + 1,
+                                                 close - start - 1 } });
+            d->nsections++;
+            continue;
+        }
+        {
+            int k = start;
+
+            for (; k < end; k++) {
+                if (p[k] == '=') {
+                    eq = k;
+                    break;
+                }
+            }
+        }
+        if (eq < 0)
+            continue;                   /* 没有等号：跳过（systemd 也忽略） */
+        memset(out, 0, sizeof *out);
+        out->section = d->section;
+        out->key = sd_trim((Str){ (char[:]){ (char *)p + start,
+                                            eq - start } });
+        out->value = sd_trim((Str){ (char[:]){ (char *)p + eq + 1,
+                                              end - eq - 1 } });
+        if (out->key.s.len == 0)
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+int count(SdDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int sections(SdDoc *d)
+{
+    return d ? d->nsections : 0;
+}
+
+int rewind(SdDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    d->nsections = 0;
+    d->section = (Str){ (char[:]){ 0, 0 } };
+    return 1;
+}
+
+int get(SdDoc *d, const char *section, const char *key, Str *value)
+{
+    SdEntry e = { 0 };
+    int slen = 0, klen = 0;
+
+    if (!d || !section || !key || !value)
+        return -1;
+    slen = (int)strlen(section);
+    klen = (int)strlen(key);
+    rewind(d);
+    while (next(d, &e) == 1) {
+        if (e.section.s.len == slen
+            && memcmp(e.section.s.data, section, (size_t)slen) == 0
+            && e.key.s.len == klen
+            && memcmp(e.key.s.data, key, (size_t)klen) == 0) {
+            *value = e.value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int open(SdDoc *d, const void *src, int n)
+{
+    SdEntry e = { 0 };
+    int count = 0, secs = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    {
+        SdDoc tmp = { 0 };
+
+        tmp.src = d->src;
+        tmp.n = n;
+        while (next(&tmp, &e) == 1)
+            count++;
+        secs = tmp.nsections;
+    }
+    d->nentries = count;
+    d->nsections = secs;
+    d->off = 0;
+    d->section = (Str){ (char[:]){ 0, 0 } };
+    return count;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "systemd：段与键值" {
+    static const char *src =
+        "# 测试 unit\n"
+        "[Unit]\n"
+        "Description=Test service\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/bin/true --verbose\n"
+        "Environment=FOO=bar\n"
+        "; 分号也是注释\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n";
+    SdDoc d = { 0 };
+    SdEntry e = { 0 };
+    Str v = { 0 };
+    int n = 0;
+
+    if (d.open(src, (int)strlen(src)) != 6)
+        return err(1, "应该有 6 个键值条目");
+    if (d.count() != 6 || d.sections() != 3)
+        return err(2, "count()/sections() 不对");
+    if (d.next(&e) != 1)
+        return err(3, "第 1 条读不到");
+    if (e.section.s.len != 4 || memcmp(e.section.s.data, "Unit", 4) != 0)
+        return err(4, "第 1 条的段名不对");
+    if (e.key.s.len != 11 || memcmp(e.key.s.data, "Description", 11) != 0)
+        return err(5, "第 1 条的键名不对");
+    if (e.value.s.len != 12 || memcmp(e.value.s.data, "Test service", 12) != 0)
+        return err(6, "第 1 条的值不对");
+    if (d.get("Service", "ExecStart", &v) != 1 || v.s.len != 19)
+        return err(7, "get(ExecStart) 不对");
+    if (memcmp(v.s.data, "/bin/true --verbose", 19) != 0)
+        return err(8, "ExecStart 的值不对");
+    if (d.get("Service", "Type", &v) != 1 || v.s.len != 6)
+        return err(9, "get(Type) 不对");
+    if (d.get("Unit", "ExecStart", &v) != 0)
+        return err(10, "段不匹配应该 0");
+    n = 0;
+    d.rewind();
+    while (d.next(&e) == 1)
+        n++;
+    if (n != 6)
+        return err(11, "rewind 之后应该又能读出 6 条");
+}
+
+test "systemd：含等号的值与边界" {
+    static const char *src =
+        "[Service]\n"
+        "Environment=A=1 B=2\n"
+        "[Unit]\n"
+        "Description = spaced \n"
+        "[Service]\n"
+        "ExecStop=/bin/kill -TERM $MAINPID\n";
+    SdDoc d = { 0 };
+    SdEntry e = { 0 };
+    Str v = { 0 };
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(12, "应该有 3 个条目（同名段算两次）");
+    if (d.sections() != 3)
+        return err(13, "同名段也要计数");
+    if (d.get("Service", "Environment", &v) != 1 || v.s.len != 7)
+        return err(14, "含多个 = 的值应该完整保留");
+    if (memcmp(v.s.data, "A=1 B=2", 7) != 0)
+        return err(15, "Environment 的值不对");
+    if (d.get("Unit", "Description", &v) != 1 || v.s.len != 6
+        || memcmp(v.s.data, "spaced", 6) != 0)
+        return err(16, "值两端空白应该被去掉");
+    if (d.get("Service", "ExecStop", &v) != 1 || v.s.len != 24)
+        return err(17, "带 $ 的值能读");
+    if (d.get("Nope", "Description", &v) != 0)
+        return err(18, "不存在的段应该 0");
+    if (d.open("", 0) != -1)
+        return err(19, "空输入应该 -1");
+}

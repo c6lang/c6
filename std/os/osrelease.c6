@@ -1,0 +1,231 @@
+/* std/os/osrelease：`/etc/os-release`（与 `lsb-release`）的键值解析。
+ *
+ *     import std.os.osrelease;
+ *
+ *     OsReleaseDoc doc = { 0 };
+ *     Str v = { 0 };
+ *     doc.open(buf, n);                     // 游标：open / next / count / find
+ *     doc.find("PRETTY_NAME", &v);          // → "Debian GNU/Linux 12 (bookworm)"
+ *
+ * 每行 `KEY=VALUE`；`#` 开头的行是注释；值可以带单/双引号（会被去掉），也可以为空。
+ *
+ * 约定：
+ *
+ * - `OsReleaseDoc` 是游标：`open` 数键、`next` 逐条、`rewind` 复位；
+ * - `find(key, &value)` 按**大小写敏感**的键名找第一个（os-release 的键约定大写）；
+ * - 值两侧的 `"` 或 `'` 成对出现时去掉；引号内的 `#` 不当注释；
+ * - 键或值两侧的空格会被去掉；没有 `=` 的行跳过（不算坏数据，因为真实文件里偶尔
+ *   会有空行或占位）；
+ * - 所有 `Str` 都是原缓冲区视图。
+ */
+#include <string.h>
+
+module std.os.osrelease;
+import std.core.types;
+import std.text.str;
+
+struct OsRelease {
+    Str key;
+    Str value;
+};
+
+struct OsReleaseDoc {
+    const char *src;
+    int n;
+    int off;
+    int nkeys;
+};
+
+/* 两端去空白：返回新的 Str（切片字段只读，不能原地改） */
+static Str osr_trim(Str s)
+{
+    int a = 0, b = s.s.len;
+    Str r = { (char[:]){ 0, 0 } };
+
+    if (!s.s.data)
+        return r;
+    while (a < b && (s.s.data[a] == ' ' || s.s.data[a] == '\t'))
+        a++;
+    while (b > a && (s.s.data[b - 1] == ' ' || s.s.data[b - 1] == '\t'))
+        b--;
+    r.s = (char[:]){ s.s.data + a, b - a };
+    return r;
+}
+
+int next(OsReleaseDoc *d, OsRelease *out)
+{
+    const char *p = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    while (d->off < d->n) {
+        int start = d->off, i = d->off, end = 0, eq = -1;
+
+        while (i < d->n && p[i] != '\n')
+            i++;
+        end = i;
+        if (end > start && p[end - 1] == '\r')
+            end--;
+        if (i < d->n)
+            i++;
+        d->off = i;
+        while (start < end && (p[start] == ' ' || p[start] == '\t'))
+            start++;
+        if (start >= end)
+            continue;
+        if (p[start] == '#')
+            continue;
+        {
+            int k = start;
+
+            for (; k < end; k++) {
+                if (p[k] == '=') {
+                    eq = k;
+                    break;
+                }
+            }
+        }
+        if (eq <= start)
+            continue;
+        out->key = osr_trim((Str){ (char[:]){ (char *)p + start,
+                                            eq - start } });
+        out->value = osr_trim((Str){ (char[:]){ (char *)p + eq + 1,
+                                               end - eq - 1 } });
+        if (out->value.s.len >= 2
+            && ((out->value.s.data[0] == '"'
+                 && out->value.s.data[out->value.s.len - 1] == '"')
+                || (out->value.s.data[0] == '\''
+                    && out->value.s.data[out->value.s.len - 1] == '\''))) {
+            out->value.s = (char[:]){ out->value.s.data + 1,
+                                      out->value.s.len - 2 };
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int count(OsReleaseDoc *d)
+{
+    return d ? d->nkeys : 0;
+}
+
+int rewind(OsReleaseDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int find(OsReleaseDoc *d, const char *key, Str *value)
+{
+    OsRelease e = { 0 };
+    int klen = 0;
+
+    if (!d || !key || !value)
+        return -1;
+    klen = (int)strlen(key);
+    rewind(d);
+    while (next(d, &e) == 1) {
+        if (e.key.s.len == klen
+            && memcmp(e.key.s.data, key, (size_t)klen) == 0) {
+            *value = e.value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int open(OsReleaseDoc *d, const void *src, int n)
+{
+    OsRelease e = { 0 };
+    int count = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    {
+        OsReleaseDoc tmp = { 0 };
+
+        tmp.src = d->src;
+        tmp.n = n;
+        while (next(&tmp, &e) == 1)
+            count++;
+    }
+    d->nkeys = count;
+    d->off = 0;
+    return count;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "osrelease：键值与游标" {
+    static const char *src =
+        "# /etc/os-release\n"
+        "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n"
+        "NAME=\"Debian\"\n"
+        "VERSION_ID=\"12\"\n"
+        "ID=debian\n"
+        "HOME_URL=\"https://www.debian.org/\"\n";
+    OsReleaseDoc d = { 0 };
+    OsRelease e = { 0 };
+    Str v = { 0 };
+    int n = 0;
+
+    if (d.open(src, (int)strlen(src)) != 5)
+        return err(1, "应该有 5 个键");
+    if (d.count() != 5)
+        return err(2, "count() 不对");
+    if (d.next(&e) != 1 || e.key.s.len != 11)
+        return err(3, "第 1 个键名长度不对");
+    if (memcmp(e.key.s.data, "PRETTY_NAME", 11) != 0)
+        return err(4, "第 1 个键名不对");
+    if (e.value.s.len != 30 || e.value.s.data[0] != 'D')
+        return err(5, "第 1 个值应该去掉引号");
+    if (d.find("NAME", &v) != 1 || v.s.len != 6)
+        return err(6, "find(NAME) 不对");
+    if (memcmp(v.s.data, "Debian", 6) != 0)
+        return err(7, "NAME 的值不对");
+    if (d.find("ID", &v) != 1 || v.s.len != 6
+        || memcmp(v.s.data, "debian", 6) != 0)
+        return err(8, "无引号的值不对");
+    if (d.find("NOPE", &v) != 0)
+        return err(9, "不存在的键应该 0");
+    n = 0;
+    d.rewind();
+    while (d.next(&e) == 1)
+        n++;
+    if (n != 5)
+        return err(10, "rewind 之后应该又能读出 5 个键");
+}
+
+test "osrelease：引号与空格" {
+    static const char *src =
+        "  NAME = 'Spaced Name'  \n"
+        "EMPTY=\n"
+        "NOEQUALS\n"
+        "#ID=hidden\n"
+        "HOME=\"#not-a-comment\"\n";
+    OsReleaseDoc d = { 0 };
+    OsRelease e = { 0 };
+    Str v = { 0 };
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(11, "应该有 3 个键（跳过 NOEQUALS 与注释）");
+    d.rewind();
+    if (d.next(&e) != 1 || e.key.s.len != 4)
+        return err(12, "带空格的键名应该被裁剪");
+    if (e.value.s.len != 11 || memcmp(e.value.s.data, "Spaced Name", 11) != 0)
+        return err(13, "单引号值应该去掉引号");
+    if (d.next(&e) != 1 || e.value.s.len != 0)
+        return err(14, "空值应该是长度 0");
+    if (d.next(&e) != 1 || e.value.s.len != 14)
+        return err(15, "引号里的 # 不该当注释");
+    if (d.find("ID", &v) != 0)
+        return err(16, "被注释掉的 ID 不该被读到");
+}

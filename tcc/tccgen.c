@@ -12950,6 +12950,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.crc16",     C6_ERR_SLOT_STD + 242 },
     { "std.encoding.hamming",   C6_ERR_SLOT_STD + 243 },
     { "std.encoding.classic",   C6_ERR_SLOT_STD + 244 },
+    { "std.os.mounts",          C6_ERR_SLOT_STD + 245 },
+    { "std.os.fstab",           C6_ERR_SLOT_STD + 246 },
+    { "std.os.osrelease",       C6_ERR_SLOT_STD + 247 },
+    { "std.os.systemd",         C6_ERR_SLOT_STD + 248 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

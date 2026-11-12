@@ -1,0 +1,251 @@
+/* std/os/fstab：`/etc/fstab` 的解析（6 字段挂载表）。
+ *
+ *     import std.os.fstab;
+ *
+ *     FstabDoc doc = { 0 };
+ *     FstabEntry e = { 0 };
+ *     doc.open(buf, n);                    // 游标：open / next / count / find
+ *     while (doc.next(&e) == 1)
+ *         // e.dev / e.path / e.fstype / e.opts / e.dump / e.passno
+ *
+ * 每行 4~6 个空格/制表符分隔的字段：设备、挂载点、类型、选项、`dump`、`passno`。
+ * 后两个可以省略（默认 0）。`#` 开头的行与空行跳过。
+ *
+ * 约定：
+ *
+ * - `FstabDoc` 是游标：`open` 数行、`next` 逐条、`rewind` 复位；
+ * - 字段是原缓冲区视图；设备可以是 `UUID=…`/`LABEL=…`（不做解析）；
+ * - `find(path, &e)` 按挂载点精确比较；
+ * - 字段少于 4 个视为坏数据返回 -1；多于 6 个的部分忽略；
+ * - 与 `std.os.mounts` 的区别：fstab 是「配置」（可省略 dump/passno、允许注释），
+ *   mounts 是「内核现状」（固定 6 字段、八进制转义）。
+ */
+#include <string.h>
+
+module std.os.fstab;
+import std.core.types;
+import std.text.str;
+
+struct FstabEntry {
+    Str dev;
+    Str path;
+    Str fstype;
+    Str opts;
+    int dump;
+    int passno;
+};
+
+struct FstabDoc {
+    const char *src;
+    int n;
+    int off;
+    int nentries;
+};
+
+static int fs_field(const char *p, int end, int *pos, Str *out)
+{
+    int i = *pos, start = 0;
+
+    while (i < end && (p[i] == ' ' || p[i] == '\t'))
+        i++;
+    if (i >= end)
+        return 0;
+    start = i;
+    while (i < end && p[i] != ' ' && p[i] != '\t')
+        i++;
+    out->s = (char[:]){ (char *)p + start, i - start };
+    *pos = i;
+    return 1;
+}
+
+static int fs_int(Str s, int *out)
+{
+    int i = 0, v = 0;
+
+    if (s.s.len == 0) {
+        *out = 0;
+        return 1;
+    }
+    for (i = 0; i < s.s.len; i++) {
+        if (s.s.data[i] < '0' || s.s.data[i] > '9')
+            return 0;
+        v = v * 10 + (s.s.data[i] - '0');
+    }
+    *out = v;
+    return 1;
+}
+
+int next(FstabDoc *d, FstabEntry *out)
+{
+    const char *p = 0;
+
+    if (!d || !d->src || !out)
+        return -1;
+    p = d->src;
+    while (d->off < d->n) {
+        int line_start = d->off, i = d->off, end = 0;
+        Str f[6] = { { (char[:]){ 0, 0 } }, { (char[:]){ 0, 0 } },
+                     { (char[:]){ 0, 0 } }, { (char[:]){ 0, 0 } },
+                     { (char[:]){ 0, 0 } }, { (char[:]){ 0, 0 } } };
+        int k = 0, got = 0;
+
+        while (i < d->n && p[i] != '\n')
+            i++;
+        end = i;
+        if (end > line_start && p[end - 1] == '\r')
+            end--;
+        if (i < d->n)
+            i++;
+        d->off = i;
+        if (end == line_start)
+            continue;
+        if (p[line_start] == '#')
+            continue;
+        i = line_start;
+        for (k = 0; k < 6; k++) {
+            if (fs_field(p, end, &i, &f[k]) != 1)
+                break;
+            got++;
+        }
+        if (got < 4)
+            return -1;
+        memset(out, 0, sizeof *out);
+        out->dev = f[0];
+        out->path = f[1];
+        out->fstype = f[2];
+        out->opts = f[3];
+        if (got >= 5 && fs_int(f[4], &out->dump) != 1)
+            return -1;
+        if (got >= 6 && fs_int(f[5], &out->passno) != 1)
+            return -1;
+        return 1;
+    }
+    return 0;
+}
+
+int count(FstabDoc *d)
+{
+    return d ? d->nentries : 0;
+}
+
+int rewind(FstabDoc *d)
+{
+    if (!d)
+        return -1;
+    d->off = 0;
+    return 1;
+}
+
+int find(FstabDoc *d, char[:] path, FstabEntry *out)
+{
+    FstabEntry e = { 0 };
+
+    if (!d || !out || !path.data)
+        return -1;
+    rewind(d);
+    while (next(d, &e) == 1) {
+        if (e.path.s.len == path.len
+            && memcmp(e.path.s.data, path.data, (size_t)path.len) == 0) {
+            *out = e;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int open(FstabDoc *d, const void *src, int n)
+{
+    FstabEntry e = { 0 };
+    int count = 0;
+
+    if (!d || !src || n <= 0)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->src = (const char *)src;
+    d->n = n;
+    {
+        FstabDoc tmp = { 0 };
+
+        tmp.src = d->src;
+        tmp.n = n;
+        while (next(&tmp, &e) == 1)
+            count++;
+    }
+    d->nentries = count;
+    d->off = 0;
+    return count;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "fstab：条目与游标" {
+    static const char *src =
+        "# /etc/fstab\n"
+        "UUID=abcd-1234 / ext4 defaults 0 1\n"
+        "tmpfs /tmp tmpfs defaults,noatime\n"
+        "/dev/sdb1 /data xfs rw,nofail 0 2\n";
+    FstabDoc d = { 0 };
+    FstabEntry e = { 0 };
+    int n = 0;
+
+    if (d.open(src, (int)strlen(src)) != 3)
+        return err(1, "应该有 3 条记录");
+    if (d.count() != 3)
+        return err(2, "count() 不对");
+    if (d.next(&e) != 1)
+        return err(3, "第 1 条读不到");
+    if (e.dev.s.len != 14 || memcmp(e.dev.s.data, "UUID=abcd-1234", 14) != 0)
+        return err(4, "第 1 条设备不对");
+    if (e.fstype.s.len != 4 || e.dump != 0 || e.passno != 1)
+        return err(5, "第 1 条类型或 dump/passno 不对");
+    if (d.next(&e) != 1)
+        return err(6, "第 2 条读不到");
+    if (e.path.s.len != 4 || memcmp(e.path.s.data, "/tmp", 4) != 0)
+        return err(7, "第 2 条挂载点不对");
+    if (e.dump != 0 || e.passno != 0)
+        return err(8, "省略的 dump/passno 应该默认 0");
+    if (d.next(&e) != 1 || e.passno != 2)
+        return err(9, "第 3 条 passno 不对");
+    if (d.next(&e) != 0)
+        return err(10, "读完应该返回 0");
+    n = 0;
+    d.rewind();
+    while (d.next(&e) == 1)
+        n++;
+    if (n != 3)
+        return err(11, "rewind 之后应该又能读出 3 条");
+}
+
+test "fstab：查找与坏数据" {
+    static const char *src =
+        "/dev/sda1 / ext4 defaults 0 1\n"
+        "/dev/sdb1 /data xfs rw 0 2\n";
+    FstabDoc d = { 0 };
+    FstabEntry e = { 0 };
+
+    if (d.open(src, (int)strlen(src)) != 2)
+        return err(12, "open 失败");
+    if (d.find(S("/data"), &e) != 1 || e.fstype.s.len != 3)
+        return err(13, "find(/data) 不对");
+    if (d.find(S("/nope"), &e) != 0)
+        return err(14, "找不到应该 0");
+    {
+        FstabDoc bad = { 0 };
+
+        if (bad.open("dev / ext4\n", 12) != 0)
+            return err(15, "字段不足应该计 0 条");
+        if (bad.next(&e) != -1)
+            return err(16, "字段不足应该 -1");
+    }
+    /* 多于 6 个字段：多余部分忽略 */
+    {
+        FstabDoc extra = { 0 };
+
+        if (extra.open("/dev/x /y ext4 rw 0 1 junk\n", 27) != 1)
+            return err(17, "多余字段不该导致失败");
+        if (extra.next(&e) != 1 || e.passno != 1)
+            return err(18, "多余字段的条目读不出来");
+    }
+}

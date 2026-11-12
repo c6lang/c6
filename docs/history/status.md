@@ -2041,6 +2041,33 @@ expected`），把字段全改成带后缀的名字（`wbits`/`initv`/`polyn`/`r
 验收：`make stdtest`（245 个模块、0 failure）、`make std-check`（28 条自检全过）、
 `make check-all`。
 
+### 11.71 标准库第五十九批（mounts / fstab / osrelease / systemd）
+
+第五十九批做「Linux 配置文本」：`/proc/mounts`、`/etc/fstab`、`/etc/os-release` 与
+systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，统一成游标方法。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.os.mounts` | /proc/mounts | 固定 6 字段；挂载点里的空格写成 `\040`，所以提供 `unescape`（`\040`/`\011`/`\012`/`\134`）；字段是原串视图，要「人能读」的路径得自己转 |
+| `std.os.fstab` | /etc/fstab | 4~6 字段（dump/passno 可省，默认 0）；`#` 注释与空行跳过；设备可以是 `UUID=`/`LABEL=`；多于 6 个字段的部分忽略 |
+| `std.os.osrelease` | os-release | `KEY=VALUE`，值两侧引号成对时剥离，`#` 注释只在行首生效（引号里的 `#` 是值的一部分）；没有 `=` 的行跳过而不是报错 |
+| `std.os.systemd` | unit 文件 | `[Section]` 与 `Key=Value`；只按**第一个** `=` 切分（`Environment=A=1 B=2` 的值要完整）；注释支持 `#` 与 `;`；同名段出现两次会各计一次 |
+
+这批又踩了两次同类坑，值得记进「套路」：一是**游标推进**——`next` 里凡是 `continue`
+的分支都必须保证 `d->off` 已经前进（mounts 第一版在注释行上原地打转，表现为测试
+挂死）；二是**切片字段只读**——`osr_trim(Str *s)` 里改 `s->s.data`/`s->s.len` 只会
+拿到 `assignment of read-only location` 警告且不生效，正确做法是返回一个新的 `Str`。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.os.mounts`=0x60f5、
+`std.os.fstab`=0x60f6、`std.os.osrelease`=0x60f7、`std.os.systemd`=0x60f8；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-linux` 与 `STD_LINUX_SRCS`，`test-all`/`check-all` 都
+带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条用例）。示例
+`examples/stdlinux.c6` 四节（20 条自检）。
+
+验收：`make stdtest`（249 个模块、0 failure）、`make std-linux`（20 条自检全过）、
+`make check-all`。
+
+
 
 
 

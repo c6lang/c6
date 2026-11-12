@@ -277,6 +277,11 @@
 | `std/encoding/crc16.c6` | `std.encoding.crc16` | CRC-8 与 CRC-16（**方法**：`c.init`/`c.update`/`c.final`/`c.reset`/`c.bits`）：支持 `CRC8`(0xF4)、`CRC16_CCITT`(0x29B1)、`CRC16_XMODEM`(0x31C3)、`CRC16_MODBUS`(0x4B37)、`CRC16_ARC`(0xBB3D) 五种参数，反射在内部处理，另有一次性接口 |
 | `std/encoding/hamming.c6` | `std.encoding.hamming` | 汉明码 (7,4)（**方法**：`b.encode`/`b.syndrome`/`b.fix`/`b.decode`）：4 位数据 → 7 位码，校验子指出出错位置并纠正 1 位；`hamming_encode`/`hamming_decode` 按字节数组处理（每字节两块）并统计纠正位数 |
 | `std/encoding/classic.c6` | `std.encoding.classic` | 经典密码：`caesar`（可负位移）、`rot13`、`atbash`、`vigenere`（`decrypt` 开关，key 只取字母）、`xor_cipher`（自逆）、`railfence`/`railfence_decode`；只动 ASCII 字母，其余原样 |
+| `std/os/mounts.c6` | `std.os.mounts` | `/proc/mounts` 解析（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.find`/`doc.rewind`）：六字段（设备/挂载点/类型/选项/dump/passno），`unescape` 反转义 `\040` 这类八进制转义 |
+| `std/os/fstab.c6` | `std.os.fstab` | `/etc/fstab`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.find`/`doc.rewind`）：4~6 字段、`#` 注释，省略的 dump/passno 默认 0，支持 `UUID=`/`LABEL=` 形式的设备 |
+| `std/os/osrelease.c6` | `std.os.osrelease` | `/etc/os-release`（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.find`/`doc.rewind`）：`KEY=VALUE`、`#` 注释、单双引号自动剥离、键值两端去空白 |
+| `std/os/systemd.c6` | `std.os.systemd` | systemd unit 文件（**方法**：`doc.open`/`doc.next`/`doc.count`/`doc.sections`/`doc.get`/`doc.rewind`）：`[Section]` 分段 + `Key=Value`，注释 `#`/`;`，值按第一个 `=` 切分（值里可含 `=`），段名键名大小写敏感 |
+
 
 
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
@@ -380,6 +385,7 @@
 | `examples/stdgeo.c6` | （无模块） | 第五十六批（地理编码）的拼装示例（`make std-geo`）：球面距离/方位/包围盒（方法）、Geohash、Maidenhead 网格、度分秒格式化；链接带 `-lm` |
 | `examples/stdpkg.c6` | （无模块） | 第五十七批（目标文件与包）的拼装示例（`make std-pkg`）：ar 成员与按名查找、COFF 节、Java class 常量池与方法、RPM 头取值 |
 | `examples/stdcheck.c6` | （无模块） | 第五十八批（校验与纠错）的拼装示例（`make std-check`）：Luhn/ISBN/Verhoeff 校验位、CRC-8/16 流式与方法、汉明纠 1 位错、经典密码往返 |
+| `examples/stdlinux.c6` | （无模块） | 第五十九批（Linux 配置文本）的拼装示例（`make std-linux`）：/proc/mounts 反转义、fstab 查找、os-release 取值、unit 文件分段取值 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -506,6 +512,10 @@ std/encoding/luhn.c6       24 test(s), 0 failure(s)
 std/encoding/crc16.c6      24 test(s), 0 failure(s)
 std/encoding/hamming.c6    24 test(s), 0 failure(s)
 std/encoding/classic.c6    24 test(s), 0 failure(s)
+std/os/mounts.c6           24 test(s), 0 failure(s)
+std/os/fstab.c6            24 test(s), 0 failure(s)
+std/os/osrelease.c6        24 test(s), 0 failure(s)
+std/os/systemd.c6          24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3882,6 +3892,16 @@ make std-check
 `b.syndrome()`/`b.fix()` 纠正；经典密码把凯撒/ROT13/Atbash/维吉尼亚/异或/栅栏都跑
 一遍往返。
 
+### 集成示例：`examples/stdlinux.c6`
+
+```sh
+make std-linux
+```
+
+四节：mounts 逐条打印并用 `unescape` 还原 `/mnt/my\040disk`；fstab 用 `doc.find` 查
+`/tmp` 并验证省略的 dump/passno；os-release 用 `doc.find("PRETTY_NAME")` 取发行版名；
+unit 文件用 `doc.next` 打印 `[段] 键=值`、再用 `doc.get("Service","ExecStart")` 定位。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3994,6 +4014,8 @@ make std-check
   （自带自检，全部用结构体方法调用）。
 * `make std-check`：`examples/stdcheck.c6`，第五十八批（校验与纠错）模块的拼装示例
   （自带自检）。
+* `make std-linux`：`examples/stdlinux.c6`，第五十九批（Linux 配置文本）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

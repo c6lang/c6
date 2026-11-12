@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第五十九批（Linux 配置文本）**：`std.os.mounts`（/proc/mounts + 八进制
+  反转义）、`std.os.fstab`（4~6 字段与默认值）、`std.os.osrelease`（键值与引号剥离）、
+  `std.os.systemd`（unit 文件分段与取值），集成示例 `examples/stdlinux.c6`
+  （`make std-linux`）。错误号段 `std.os.mounts`=0x60f5 … `std.os.systemd`=0x60f8
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十八批（校验与纠错）**：`std.encoding.luhn`（Luhn/ISBN-10/ISBN-13/
   Verhoeff 校验位）、`std.encoding.crc16`（CRC-8 与四种 CRC-16，流式方法）、
   `std.encoding.hamming`（汉明 (7,4) 编解码与纠 1 位错）、`std.encoding.classic`

@@ -1,0 +1,138 @@
+/* examples/stdlinux.c6 —— 第五十九批（Linux 配置文本）的集成示例。
+ *
+ *     make std-linux
+ *
+ * 四节：`/proc/mounts`、`/etc/fstab`、`/etc/os-release`、systemd unit 文件。
+ * 全部用游标方法（`doc.open` / `doc.next` / `doc.find` / `doc.get`）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.os.mounts;
+import std.os.fstab;
+import std.os.osrelease;
+import std.os.systemd;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_mounts(void)
+{
+    static const char *src =
+        "# 内核挂载表\n"
+        "/dev/sda1 / ext4 rw,relatime 0 1\n"
+        "proc /proc proc rw,nosuid 0 0\n"
+        "/dev/sdb1 /mnt/my\\040disk xfs rw 0 2\n";
+    MountDoc doc = { 0 };
+    MountEntry e = { 0 };
+    char path[64] = { 0 };
+    int n = 0;
+
+    printf("== /proc/mounts\n");
+    check(doc.open(src, (int)strlen(src)) == 3, "open 计数");
+    while (doc.next(&e) == 1) {
+        unescape((char[:]){ e.path.s.data, e.path.s.len }, path,
+                 (int)sizeof path);
+        printf("   %.*s → %s（%.*s，%d/%d）\n", e.dev.s.len, e.dev.s.data, path,
+               e.fstype.s.len, e.fstype.s.data, e.freq, e.passno);
+        n++;
+    }
+    check(n == 3, "逐条读出 3 条");
+    check(doc.find(S("/proc"), &e) == 1 && e.fstype.s.len == 4, "find(/proc)");
+    doc.rewind();
+    check(doc.next(&e) == 1 && e.path.s.len == 1, "rewind 后回到第一条");
+}
+
+static void do_fstab(void)
+{
+    static const char *src =
+        "# /etc/fstab\n"
+        "UUID=abcd-1234 / ext4 defaults 0 1\n"
+        "tmpfs /tmp tmpfs defaults,noatime\n";
+    FstabDoc doc = { 0 };
+    FstabEntry e = { 0 };
+
+    printf("== fstab\n");
+    check(doc.open(src, (int)strlen(src)) == 2, "open 计数");
+    check(doc.find(S("/tmp"), &e) == 1, "find(/tmp)");
+    printf("   /tmp → %.*s（dump=%d passno=%d）\n", e.fstype.s.len,
+           e.fstype.s.data, e.dump, e.passno);
+    check(e.dump == 0 && e.passno == 0, "省略的 dump/passno 默认 0");
+    check(doc.find(S("/"), &e) == 1 && e.passno == 1, "find(/)");
+    check(doc.find(S("/nope"), &e) == 0, "找不到返回 0");
+}
+
+static void do_osrelease(void)
+{
+    static const char *src =
+        "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n"
+        "ID=debian\n"
+        "VERSION_ID=\"12\"\n";
+    OsReleaseDoc doc = { 0 };
+    OsRelease e = { 0 };
+    Str v = { 0 };
+
+    printf("== /etc/os-release\n");
+    check(doc.open(src, (int)strlen(src)) == 3, "open 计数");
+    if (doc.find("PRETTY_NAME", &v) == 1)
+        printf("   %.*s\n", v.s.len, v.s.data);
+    check(v.s.len == 30, "PRETTY_NAME 长度");
+    check(doc.find("ID", &v) == 1 && v.s.len == 6, "ID 值");
+    doc.rewind();
+    check(doc.next(&e) == 1 && e.key.s.len == 11, "rewind 后第一条");
+    check(doc.find("NOPE", &v) == 0, "不存在的键");
+}
+
+static void do_systemd(void)
+{
+    static const char *src =
+        "[Unit]\n"
+        "Description=Demo service\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/usr/bin/demo --serve\n";
+    SdDoc doc = { 0 };
+    SdEntry e = { 0 };
+    Str v = { 0 };
+    int n = 0;
+
+    printf("== systemd unit\n");
+    check(doc.open(src, (int)strlen(src)) == 4, "open 计数");
+    check(doc.sections() == 2, "sections() 方法");
+    while (doc.next(&e) == 1) {
+        printf("   [%.*s] %.*s=%.*s\n", e.section.s.len, e.section.s.data,
+               e.key.s.len, e.key.s.data, e.value.s.len, e.value.s.data);
+        n++;
+    }
+    check(n == 4, "逐条读出 4 条");
+    check(doc.get("Service", "ExecStart", &v) == 1 && v.s.len == 21,
+          "get(ExecStart)");
+    check(doc.get("Unit", "Description", &v) == 1 && v.s.len == 12,
+          "get(Description)");
+    check(doc.get("Unit", "ExecStart", &v) == 0, "段不匹配返回 0");
+}
+
+int main(void)
+{
+    do_mounts();
+    do_fstab();
+    do_osrelease();
+    do_systemd();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
