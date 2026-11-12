@@ -2547,6 +2547,10 @@ static int l_mem_intrinsic(SValue *callee, int nb_args)
     return 1;
 }
 
+struct LlvmCallProto;
+static void l_note_proto(const char *name, const char *ret, const char *args);
+static struct LlvmCallProto *l_find_proto(const char *name);
+
 ST_FUNC void gfunc_call(int nb_args)
 {
     SValue *callee = &vtop[-nb_args];
@@ -2557,8 +2561,9 @@ ST_FUNC void gfunc_call(int nb_args)
     int i, na = 0, is_indirect, ret_struct, small_sret = 0, hidden_sret;
     int srt_align = 0, srt_regsize = 0;
     int is_helper = 0;
-    LBuf args;
+    LBuf args, dargs;
     char rty[1024], tb[1024], fty[4096];
+    int vararg = 0, ndecl = 0;
     const char *cop;
     int n = 0;
 
@@ -2596,6 +2601,7 @@ ST_FUNC void gfunc_call(int nb_args)
     }
 
     memset(&args, 0, sizeof args);
+    memset(&dargs, 0, sizeof dargs);
     ps = fsym->next;
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[-nb_args + 1 + i];
@@ -2605,12 +2611,18 @@ ST_FUNC void gfunc_call(int nb_args)
             l_type(tb, sizeof tb, ret);
             lb_printf(&args, "%sptr sret(%s) align 8 %s", na++ ? ", " : "",
                       tb, l_addr(sv));
+            /* 声明里也要 sret 属性，否则 verify 认为 call 与 declare 不一致 */
+            lb_printf(&dargs, "%sptr sret(%s) align 8", ndecl++ ? ", " : "",
+                      tb);
             continue;
         }
         if (ps) {
             pcopy = ps->type;
             pt = &pcopy;
             ps = ps->next;
+        } else if (i > 0 || !hidden_sret) {
+            /* 原型里没有这个参数了：这是可变参数部分 */
+            vararg = 1;
         }
         if (pt && (pt->t & VT_ARRAY)) {
             pt->t = (pt->t & ~(VT_BTYPE | VT_ARRAY)) | VT_PTR;
@@ -2618,6 +2630,27 @@ ST_FUNC void gfunc_call(int nb_args)
         }
         l_arg(&args, na == 0, sv, pt);
         na++;
+        if (pt) {
+            CType cpt = *pt;
+            int cls;
+
+            if (cpt.t & VT_ARRAY) {
+                cpt.t = (cpt.t & ~(VT_BTYPE | VT_ARRAY)) | VT_PTR;
+                cpt.ref = NULL;
+            }
+            l_type(tb, sizeof tb, &cpt);
+            cls = (cpt.t & VT_BTYPE) == VT_STRUCT ? l_classify(&cpt)
+                                                  : L_CL_INTEGER;
+            if (cls == L_CL_INTEGER || cls == L_CL_SSE)
+                lb_printf(&dargs, "%s%s", ndecl++ ? ", " : "", tb);
+            else if ((cpt.t & VT_BTYPE) == VT_STRUCT)
+                /* MEMORY 类的结构体走 byval：声明里也要写，否则 call 与
+                   declare 的属性不一致 */
+                lb_printf(&dargs, "%sptr byval(%s) align %d",
+                          ndecl++ ? ", " : "", tb, l_align(&cpt));
+            else
+                lb_printf(&dargs, "%sptr", ndecl++ ? ", " : "");
+        }
     }
 
     /* the callee */
@@ -2667,6 +2700,9 @@ ST_FUNC void gfunc_call(int nb_args)
         fty[0] = 0;
     }
 
+    if (fsym->f.func_type == FUNC_ELLIPSIS)
+        vararg = 1;
+
     /* the return type of the call */
     if (hidden_sret || (ret->t & VT_BTYPE) == VT_VOID)
         snprintf(rty, sizeof rty, "void");
@@ -2674,6 +2710,34 @@ ST_FUNC void gfunc_call(int nb_args)
         l_type(rty, sizeof rty, &srt);
     else
         l_type(rty, sizeof rty, ret);
+
+    if (!is_indirect && !is_helper) {
+        const char *nm = l_token_name(callee->sym);
+
+        if (nm) {
+            char dbuf[4096];
+
+            if (vararg)
+                snprintf(dbuf, sizeof dbuf, "%s%s...",
+                         dargs.data && dargs.data[0] ? dargs.data : "",
+                         dargs.data && dargs.data[0] ? ", " : "");
+            else
+                snprintf(dbuf, sizeof dbuf, "%s", dargs.data ? dargs.data : "");
+            l_note_proto(nm, rty, dbuf);
+            if (vararg) {
+                /* 可变参数调用必须显式给出被调函数类型 */
+                char fbuf[4096];
+
+                if (dargs.data && dargs.data[0])
+                    snprintf(fbuf, sizeof fbuf, "(%s, ...) ", dargs.data);
+                else
+                    snprintf(fbuf, sizeof fbuf, "(...) ");
+                fty[0] = 0;
+                memcpy(fty, fbuf, sizeof fty);
+                fty[sizeof fty - 1] = 0;
+            }
+        }
+    }
 
     {
         const char *res = strcmp(rty, "void") ? l_tmp() : NULL;
@@ -2690,6 +2754,7 @@ ST_FUNC void gfunc_call(int nb_args)
         }
     }
     tcc_free(args.data);
+    tcc_free(dargs.data);
     vtop -= nb_args + 1;
 }
 
@@ -2845,6 +2910,47 @@ static void l_note_fn(const char *name)
         l_extfn = tcc_realloc(l_extfn, l_fncap * sizeof *l_extfn);
     }
     l_extfn[l_nextfn++] = tcc_strdup(name);
+}
+
+/* 一个外部函数在调用点上的原型。declare 与 call 必须一致：x86-64 靠参数
+   寄存器共享容忍不一致，wasm-ld 会在运行时按签名检查并 trap，所以原型从调用
+   点记下来，输出 declare 时用同一份类型。 */
+struct LlvmCallProto {
+    char *name;
+    char ret[1024];
+    char args[4096];
+};
+
+static struct LlvmCallProto *l_protos;
+static int l_nprotos, l_protocap;
+
+static void l_note_proto(const char *name, const char *ret, const char *args)
+{
+    int i;
+
+    if (!name || !*name)
+        return;
+    for (i = 0; i < l_nprotos; i++)
+        if (!strcmp(l_protos[i].name, name))
+            return;                 /* 先到的那份最可信 */
+    if (l_nprotos >= l_protocap) {
+        l_protocap = l_protocap ? l_protocap * 2 : 16;
+        l_protos = tcc_realloc(l_protos, l_protocap * sizeof *l_protos);
+    }
+    l_protos[l_nprotos].name = tcc_strdup(name);
+    snprintf(l_protos[l_nprotos].ret, sizeof l_protos[0].ret, "%s", ret);
+    snprintf(l_protos[l_nprotos].args, sizeof l_protos[0].args, "%s", args);
+    l_nprotos++;
+}
+
+static struct LlvmCallProto *l_find_proto(const char *name)
+{
+    int i;
+
+    for (i = 0; i < l_nprotos; i++)
+        if (!strcmp(l_protos[i].name, name))
+            return &l_protos[i];
+    return NULL;
 }
 
 static int l_has_fn(const char *name)
@@ -3113,6 +3219,7 @@ ST_FUNC void llvm_reset(void)
     tcc_free(l_extfn);
     l_extfn = NULL;
     l_nextfn = l_fncap = 0;
+    l_nprotos = l_protocap = 0;
     for (i = 0; i < l_nctors; i++)
         tcc_free(l_ctors[i]);
     tcc_free(l_ctors);
@@ -3402,7 +3509,6 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
     nsec = s1->symtab->data_offset / sizeof(ElfSym);
     for (i = 1; i < nsec; i++) {
         ElfSym *e = l_esym(i);
-        Section *sec;
         long long size;
 
         if (!l_sym_extern_visible(i) || !l_name_ok(l_esym_name(i)))
@@ -3419,7 +3525,6 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
             if (dup)
                 continue;
         }
-        sec = s1->sections[e->st_shndx];
         size = e->st_size > 0 ? e->st_size : 1;
         fprintf(f, "@%s = %salias [%lld x i8], ptr getelementptr inbounds "
                    "(i8, ptr @__llvm_d%d, i64 %lld)\n",
@@ -3467,8 +3572,12 @@ ST_FUNC int llvm_output_file(TCCState *s1, const char *filename)
     }
     for (i = 0; i < l_nextfn; i++) {
         const struct LlvmProto *p = l_ext_proto(l_extfn[i]);
+        struct LlvmCallProto *cp = l_find_proto(l_extfn[i]);
 
-        if (p)
+        if (cp)
+            fprintf(f, "declare %s @%s(%s)\n", cp->ret, l_q(l_extfn[i]),
+                    cp->args);
+        else if (p)
             fprintf(f, "declare %s @%s(%s)\n", p->ret, l_q(l_extfn[i]),
                     p->args);
         else

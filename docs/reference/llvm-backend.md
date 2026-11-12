@@ -330,3 +330,21 @@ BACKEND=llvm LLVMCC=/usr/lib/llvm-19/bin/clang ./tests/run-tests.sh
 | `scripts/build-wasm-runtime.sh` | 交叉编 `tcc/libtcc1-<arch>.a` |
 | `scripts/wasm-smoke.sh` | `--target` 的端到端冒烟（`make wasmtest`） |
 | `tests/run-tests.sh` | `BACKEND=llvm` 分支 |
+
+### 外部函数的声明
+
+`declare` 的类型来自调用点：`gfunc_call` 把被调函数的返回类型和参数类型
+（含 `sret`/`byval` 属性）记进 `l_note_proto`，输出时用同一份类型写
+`declare`。这样 `call` 与 `declare` 不会互相矛盾——x86-64 只靠参数寄存器
+共享容忍矛盾，wasm-ld 会按签名检查并在运行时 trap。
+
+- 有原型的外部函数：`declare i32 @c_add(i32, i32)`、`declare double @c_half(double)`。
+- 可变参数：`declare i32 @printf(ptr, ...)`，调用点写成
+  `call i32 (ptr, ...) @printf(...)`。
+- 只由一个名称引用、从未被调用（或没有原型）的符号仍退回 `declare i64 @f(...)`；
+  `libtcc1` 里的运行时助手在 `l_ext_protos[]` 里有手工维护的原型，优先于前两者。
+
+已知限制：按值传**不超过 8 字节**的小结构体时，IR 里的值类型是 `%sN`
+（结构体本身），LLVM 后端会把它拆成多个 i32 传递，而 C 的 SysV ABI 要求压进
+一个寄存器——这类调用与 C 不兼容（`struct {int x, y;}` 作参数会丢字段）。
+绕过办法：传指针，或让结构体大于 16 字节（那样走 `byval`/`ptr`，与 C 一致）。
