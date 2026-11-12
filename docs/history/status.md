@@ -2093,6 +2093,32 @@ systemd unit 文件。四个都是「一行一条记录 + 注释」的文本，�
 验收：`make stdtest`（253 个模块、0 failure）、`make std-bin2`（25 条自检全过）、
 `make check-all`。
 
+### 11.73 标准库第六十一批（sanitize / tabs / quote / nato）
+
+第六十一批收尾「文本清洗与标注」：清洗器、制表符展开、shell 引用与 NATO 拼读。
+四个模块都提供了带开关的结构体，并用方法暴露（`o.apply`、`t.expand`、`q.quote`、
+`o.spell`）。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.text.sanitize` | 清洗 | 四项开关独立：去控制符、CRLF→LF、折叠空格/制表符、去两端空白。折叠**不跨行**（换行保留），否则会把多行文本压成一行；`is_clean` 用逐字节规则判断，和 `apply` 的默认规则保持一致 |
+| `std.text.tabs` | 制表符 | 展开按「下一个制表位」补空格、换行清零列号；还原只在**行首空白**处替换（不做 `unexpand -a`），避免把单词之间的对齐空格误变成 tab |
+| `std.text.quote` | shell 引用 | 单引号包裹 + 内部 `'` 展开成 `'\''`；`unquote` 里单引号内的反斜杠保持字面，双引号外 `\x` 一律解成 `x`（第一版只认几个特定字符，`a\ b` 解不回来） |
+| `std.text.nato` | 拼读 | 26 个词 + 数字表；`decode` 大小写不敏感、允许 `Xray` 与 `X-ray` 两种写法（比较时跳过连字符），无法识别的词跳过而不是报错 |
+
+这一批的坑还是「字段与同名方法」：`TabStops.width` 与 `width()` 撞车，字段改名 `w`；
+另外 `SanOpts` 的默认值用 `set_defaults()` 方法给，避免结构体字段顺序写错。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.text.sanitize`=0x60fd、
+`std.text.tabs`=0x60fe、`std.text.quote`=0x60ff、`std.text.nato`=0x6100；`grammar.md`
+§8.1 同步。`Makefile` 增加 `std-clean` 与 `STD_CLEAN_SRCS`，`test-all`/`check-all` 都
+带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`（各 24 条用例）。示例
+`examples/stdclean.c6` 四节（21 条自检）。
+
+验收：`make stdtest`（257 个模块、0 failure）、`make std-clean`（21 条自检全过）、
+`make check-all`。
+
+
 
 
 

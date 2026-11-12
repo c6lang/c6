@@ -285,6 +285,11 @@
 | `std/core/bitio.c6` | `std.core.bitio` | 按位读写游标（**方法**：`br.bind`/`br.read`/`br.read1`/`br.align`/`br.remaining`/`br.position`/`br.ok` 与 `bw.bind`/`bw.write`/`bw.write1`/`bw.align`/`bw.size`/`bw.bits_written`/`bw.ok`）：高位在前（MSB-first），`align` 补零/丢弃到字节边界 |
 | `std/core/half.c6` | `std.core.half` | 半精度浮点（**方法**：`h.set`/`h.get`/`h.is_nan`/`h.is_inf`）：`double_to_half`/`half_to_double`（含次正规数、±0、±inf、NaN），`double_to_bfloat16`/`bfloat16_to_double`（按 fp32 高 16 位截断） |
 | `std/core/align.c6` | `std.core.align` | 对齐工具：`align_up`/`align_down`/`padding_for`（非 2 的幂原样返回）、`is_pow2`/`is_aligned`、`round_up`（任意倍数）、`next_pow2`（溢出返回 0）、`log2_floor` |
+| `std/text/sanitize.c6` | `std.text.sanitize` | 文本清洗（**方法**：`o.set_defaults`/`o.apply`）：`SanOpts` 四项开关（去控制符、CRLF→LF、折叠空白、去两端空白），`apply` 返回写入长度；`sanitize` 是默认规则的便捷封装，`is_clean` 判断是否已干净 |
+| `std/text/tabs.c6` | `std.text.tabs` | 制表符展开/还原（**方法**：`t.init`/`t.expand`/`t.unexpand`/`t.width`/`t.column`）：按制表位补空格（`w - col%w`），换行清零列号；还原只在行首空白处替换，避免动到单词中间的空格 |
+| `std/text/quote.c6` | `std.text.quote` | shell 风格引用（**方法**：`q.init`/`q.quote`/`q.unquote`）：需要时用单引号包裹、内部 `'` 写成 `'\''`，`style=1` 无条件加引号；`needs` 判断是否需要引用，`unquote` 认单/双引号与反斜杠转义 |
+| `std/text/nato.c6` | `std.text.nato` | NATO/ICAO 拼读（**方法**：`o.set_defaults`/`o.spell`/`o.decode`）：字母表 26 词 + 数字（`digits=1` 时拼），`decode` 大小写不敏感、`Xray`/`X-ray` 都认，无法识别的词跳过；`word`/`lookup` 给单词级接口 |
+
 
 
 
@@ -392,6 +397,7 @@
 | `examples/stdcheck.c6` | （无模块） | 第五十八批（校验与纠错）的拼装示例（`make std-check`）：Luhn/ISBN/Verhoeff 校验位、CRC-8/16 流式与方法、汉明纠 1 位错、经典密码往返 |
 | `examples/stdlinux.c6` | （无模块） | 第五十九批（Linux 配置文本）的拼装示例（`make std-linux`）：/proc/mounts 反转义、fstab 查找、os-release 取值、unit 文件分段取值 |
 | `examples/stdbin2.c6` | （无模块） | 第六十批（二进制与数值工具）的拼装示例（`make std-bin2`）：LE/BE 读写、按位打包、fp16/bf16 转换、对齐工具；链接带 `-lm` |
+| `examples/stdclean.c6` | （无模块） | 第六十一批（文本清洗与标注）的拼装示例（`make std-clean`）：SanOpts 清洗、TabStops 展开/还原、Quoter 引用往返、NatoOpts 拼读解码 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -526,6 +532,10 @@ std/core/binio.c6          24 test(s), 0 failure(s)
 std/core/bitio.c6          24 test(s), 0 failure(s)
 std/core/half.c6           24 test(s), 0 failure(s)
 std/core/align.c6          24 test(s), 0 failure(s)
+std/text/sanitize.c6       24 test(s), 0 failure(s)
+std/text/tabs.c6           24 test(s), 0 failure(s)
+std/text/quote.c6          24 test(s), 0 failure(s)
+std/text/nato.c6           24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3923,6 +3933,17 @@ make std-bin2
 的位型、`NaN`/`inf` 识别与 bf16 往返精度；align 演示 up/down/padding/next_pow2。
 链接带 `-lm`。
 
+### 集成示例：`examples/stdclean.c6`
+
+```sh
+make std-clean
+```
+
+四节都用方法：`o.apply` 把 `"  hello\t\tworld\r\n  "` 洗成 `hello world`、再用
+`is_clean` 判定干净串；`t.expand`/`t.unexpand` 把行首 4 个空格与 `\t` 互转；
+`q.quote` 把 `it's a test` 引用成 `'it'\''s a test'` 再 `q.unquote` 还原；
+`o.spell`/`o.decode` 把 `c6` 拼成 `Charlie Six` 再解回 `C6`。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4039,6 +4060,8 @@ make std-bin2
   示例（自带自检）。
 * `make std-bin2`：`examples/stdbin2.c6`，第六十批（二进制与数值工具）模块的拼装
   示例（自带自检，链接带 `-lm`）。
+* `make std-clean`：`examples/stdclean.c6`，第六十一批（文本清洗与标注）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

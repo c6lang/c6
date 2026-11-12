@@ -1,0 +1,218 @@
+/* std/text/tabs：制表符展开与还原（按可配置的 tab 宽度）。
+ *
+ *     import std.text.tabs;
+ *
+ *     TabStops t = { 0 };
+ *     char out[64] = { 0 };
+ *     t.init(4);                        // 方法：init / expand / unexpand / column
+ *     t.expand(S("a\tb"), out, (int)sizeof out);   // "a   b"
+ *
+ * `expand` 按「下一个制表位」补空格：当前列 `c` 时补 `width - (c % width)` 个空格；
+ * 换行把列号清零。`unexpand` 反过来：遇到连续空格时，如果能正好走到一个制表位就
+ * 输出 `\t`，否则原样输出空格。
+ *
+ * 约定：
+ *
+ * - `init(width)` 的 `width` 取 1..16，非法值返回 -1（结构体里保留 8）；
+ * - `expand`/`unexpand` 返回写入长度，容量不够返回 -1；
+ * - `column(src)` 给「按当前宽度展开后最后一行的列号」；
+ * - 只处理 `\t`/`\n`/`\r`，其它字节原样拷贝；
+ * - `unexpand` 只在**行首到首个非空白字符**之间、以及空白串上做替换，不会把
+ *   单词中间的空格变成制表符（与 `unexpand -a` 的行为不同，这里更保守）。
+ */
+#include <string.h>
+
+module std.text.tabs;
+import std.core.types;
+import std.text.str;
+
+struct TabStops {
+    int w;              /* 字段名不能与 width() 方法冲突 */
+};
+
+int init(TabStops *t, int width)
+{
+    if (!t)
+        return -1;
+    if (width < 1 || width > 16)
+        return -1;
+    t->w = width;
+    return 1;
+}
+
+int width(TabStops *t)
+{
+    return t ? t->w : 0;
+}
+
+int column(TabStops *t, char[:] src)
+{
+    int i = 0, col = 0, w = 4;
+
+    if (!t || !src.data)
+        return 0;
+    w = t->w > 0 ? t->w : 8;
+    for (i = 0; i < src.len; i++) {
+        char c = src.data[i];
+
+        if (c == '\t')
+            col += w - (col % w);
+        else if (c == '\n' || c == '\r')
+            col = 0;
+        else
+            col++;
+    }
+    return col;
+}
+
+int expand(TabStops *t, char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0, col = 0, w = 4;
+
+    if (!t || !src.data || !dst || cap < 0)
+        return -1;
+    w = t->w > 0 ? t->w : 8;
+    for (i = 0; i < src.len; i++) {
+        char c = src.data[i];
+
+        if (c == '\t') {
+            int pad = w - (col % w);
+
+            while (pad-- > 0) {
+                if (o >= cap)
+                    return -1;
+                dst[o++] = ' ';
+                col++;
+            }
+            continue;
+        }
+        if (o >= cap)
+            return -1;
+        dst[o++] = c;
+        if (c == '\n' || c == '\r')
+            col = 0;
+        else
+            col++;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int unexpand(TabStops *t, char[:] src, char *dst, int cap)
+{
+    int i = 0, o = 0, col = 0, w = 4;
+    int at_line_start = 1;
+
+    if (!t || !src.data || !dst || cap < 0)
+        return -1;
+    w = t->w > 0 ? t->w : 8;
+    while (i < src.len) {
+        char c = src.data[i];
+
+        if (c == '\n' || c == '\r') {
+            if (o >= cap)
+                return -1;
+            dst[o++] = c;
+            col = 0;
+            at_line_start = 1;
+            i++;
+            continue;
+        }
+        if (c == ' ') {
+            /* 数一段空格 */
+            int start = i;
+
+            while (i < src.len && src.data[i] == ' ')
+                i++;
+            {
+                int count = i - start;
+                int run = 0;
+
+                while (run < count) {
+                    int to_stop = w - (col % w);
+
+                    if (at_line_start && (count - run) >= to_stop) {
+                        if (o >= cap)
+                            return -1;
+                        dst[o++] = '\t';
+                        col += to_stop;
+                        run += to_stop;
+                    } else {
+                        if (o >= cap)
+                            return -1;
+                        dst[o++] = ' ';
+                        col++;
+                        run++;
+                    }
+                }
+            }
+            continue;
+        }
+        if (o >= cap)
+            return -1;
+        dst[o++] = c;
+        col++;
+        at_line_start = 0;
+        i++;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "tabs：展开" {
+    TabStops t = { 0 };
+    char out[64] = { 0 };
+
+    if (t.init(4) != 1 || t.width() != 4)
+        return err(1, "init/width 不对");
+    if (t.expand(S("a\tb"), out, (int)sizeof out) != 5
+        || memcmp(out, "a   b", 5) != 0)
+        return err(2, "宽度 4 时 a\\tb 应该是 a+3 空格+b");
+    if (t.expand(S("\tx"), out, (int)sizeof out) != 5
+        || memcmp(out, "    x", 5) != 0)
+        return err(3, "行首 tab 应该补满 4 个空格");
+    if (t.init(8) != 1)
+        return err(4, "init(8) 失败");
+    if (t.expand(S("ab\tc"), out, (int)sizeof out) != 9
+        || memcmp(out, "ab      c", 9) != 0)
+        return err(5, "宽度 8 时 ab\\tc 应该补 6 个空格");
+    if (t.expand(S("a\tb\nc\td"), out, (int)sizeof out) != 19)
+        return err(6, "多行展开长度不对");
+    if (t.column(S("ab\tc")) != 9)
+        return err(7, "column 不对");
+    if (t.init(0) != -1 || t.init(99) != -1)
+        return err(8, "非法宽度应该 -1");
+}
+
+test "tabs：还原与往返" {
+    TabStops t = { 0 };
+    char squeezed[64] = { 0 };
+    char back[64] = { 0 };
+
+    if (t.init(4) != 1)
+        return err(9, "init(4) 失败");
+    if (t.unexpand(S("a   b"), squeezed, (int)sizeof squeezed) != 5)
+        return err(10, "单词里的空格不该被替换");
+    if (memcmp(squeezed, "a   b", 5) != 0)
+        return err(11, "单词中间的空格应该原样保留");
+    if (t.unexpand(S("    x"), squeezed, (int)sizeof squeezed) != 2
+        || squeezed[0] != '\t' || squeezed[1] != 'x')
+        return err(12, "行首 4 个空格应该还原成 tab");
+    if (t.expand((char[:]){ squeezed, 2 }, back, (int)sizeof back) != 5
+        || memcmp(back, "    x", 5) != 0)
+        return err(13, "tab 与 4 空格应该等价");
+    /* 两行都还原 */
+    if (t.unexpand(S("    a\n    b"), squeezed, (int)sizeof squeezed) != 5
+        || squeezed[0] != '\t' || squeezed[1] != 'a' || squeezed[2] != '\n'
+        || squeezed[3] != '\t' || squeezed[4] != 'b')
+        return err(14, "多行的行首空格都应该还原");
+    if (t.unexpand(S("  x"), squeezed, (int)sizeof squeezed) != 3
+        || squeezed[0] != ' ')
+        return err(15, "不足一个制表位时应该保留空格");
+}

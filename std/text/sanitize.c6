@@ -1,0 +1,211 @@
+/* std/text/sanitize：文本清洗（去控制字符、折叠空白、换行归一、修剪两端）。
+ *
+ *     import std.text.sanitize;
+ *
+ *     SanOpts o = { 0 };
+ *     char out[64] = { 0 };
+ *     o.set_defaults();                 // 方法：set_defaults / apply / is_plain
+ *     o.apply(S("  a\t\tb\r\nc  "), out, (int)sizeof out);
+ *     // "a b c"
+ *
+ * 规则（可组合）：
+ *
+ * - `strip_control`：去掉除 `\t`/`\n`/`\r` 之外的 C0 控制符与 `0x7F`；
+ * - `crlf_to_lf`：把 `\r\n` 与孤立的 `\r` 统一成 `\n`；
+ * - `collapse_spaces`：连续空格/制表符折成一个空格（换行不受影响，仍是换行）；
+ * - `trim`：去掉首尾空白（含换行）。
+ *
+ * 约定：
+ *
+ * - `set_defaults()` 打开全部四项规则；想只做某几项就自己填结构体字段；
+ * - `apply(src, dst, cap)` 返回写入长度，容量不够返回 -1（不会写半截）；
+ * - `sanitize(src, dst, cap)` 是「默认规则 + apply」的便捷封装；
+ * - `is_clean(src)` 判断是否已经符合默认规则（不需要清洗）；
+ * - 只处理 ASCII 空白与控制符，不碰多字节序列（UTF-8 的 0x80+ 原样保留）。
+ */
+#include <string.h>
+
+module std.text.sanitize;
+import std.core.types;
+import std.text.str;
+
+struct SanOpts {
+    int strip_control;
+    int crlf_to_lf;
+    int collapse_spaces;
+    int trim;
+};
+
+int set_defaults(SanOpts *o)
+{
+    if (!o)
+        return -1;
+    o->strip_control = 1;
+    o->crlf_to_lf = 1;
+    o->collapse_spaces = 1;
+    o->trim = 1;
+    return 1;
+}
+
+static int san_is_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+int apply(SanOpts *o, char[:] src, char *dst, int cap)
+{
+    int i = 0, k = 0;
+    SanOpts def = { 1, 1, 1, 1 };
+
+    if (!o || !dst || !src.data || cap < 0)
+        return -1;
+    (void)def;
+    for (i = 0; i < src.len; i++) {
+        char c = src.data[i];
+
+        if (o->crlf_to_lf) {
+            if (c == '\r') {
+                if (i + 1 < src.len && src.data[i + 1] == '\n')
+                    continue;           /* 交给后面的 \n 处理 */
+                c = '\n';
+            }
+        }
+        if (o->strip_control) {
+            unsigned char u = (unsigned char)c;
+
+            if ((u < 0x20 && c != '\t' && c != '\n' && c != '\r')
+                || u == 0x7F)
+                continue;
+        }
+        if (o->collapse_spaces && (c == ' ' || c == '\t')) {
+            /* 前一个输出是空白就不重复写（行首的空白最后交给 trim） */
+            if (k > 0 && (dst[k - 1] == ' ' || dst[k - 1] == '\n'))
+                continue;
+            c = ' ';
+        }
+        if (k >= cap)
+            return -1;
+        dst[k++] = c;
+    }
+    if (o->trim) {
+        int a = 0, b = k;
+
+        while (a < b && san_is_space(dst[a]))
+            a++;
+        while (b > a && san_is_space(dst[b - 1]))
+            b--;
+        if (a > 0) {
+            int j = 0;
+
+            for (j = 0; j < b - a; j++)
+                dst[j] = dst[a + j];
+        }
+        k = b - a;
+    }
+    if (k < cap)
+        dst[k] = 0;
+    return k;
+}
+
+int sanitize(char[:] src, char *dst, int cap)
+{
+    SanOpts o = { 0 };
+
+    set_defaults(&o);
+    return apply(&o, src, dst, cap);
+}
+
+int is_clean(char[:] src)
+{
+    char tmp[2] = { 0 };
+
+    if (!src.data)
+        return 1;
+    if (src.len == 0)
+        return 1;
+    /* 已经干净 ⇔ 清洗后长度与内容都不变（用一个小缓冲逐字节比） */
+    {
+        int i = 0, k = 0;
+
+        for (i = 0; i < src.len; i++) {
+            char c = src.data[i];
+            unsigned char u = (unsigned char)c;
+
+            if (u < 0x20 && c != '\t' && c != '\n')
+                return 0;
+            if (u == 0x7F || c == '\r')
+                return 0;
+            if ((c == ' ' || c == '\t') && k == 0)
+                return 0;               /* 行首空白 */
+            if (c == '\t')
+                return 0;
+            if ((c == ' ' || c == '\n') && k > 0
+                && (src.data[i - 1] == ' ' || src.data[i - 1] == '\n'))
+                return 0;
+            k++;
+        }
+    }
+    if (san_is_space(src.data[src.len - 1]))
+        return 0;
+    (void)tmp;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "sanitize：默认规则" {
+    char out[64] = { 0 };
+    int n = 0;
+
+    n = sanitize(S("  a\t\tb\r\nc  "), out, (int)sizeof out);
+    if (n != 5 || memcmp(out, "a b\nc", 5) != 0)
+        return err(1, "默认清洗应该得到 a b<换行>c（换行保留）");
+    n = sanitize(S("line1\r\nline2\r\n"), out, (int)sizeof out);
+    if (n != 11 || memcmp(out, "line1\nline2", 11) != 0)
+        return err(2, "CRLF 应该归一成 LF 并去掉尾部换行");
+    n = sanitize(S("a\x01\x02" "b"), out, (int)sizeof out);
+    if (n != 2 || memcmp(out, "ab", 2) != 0)
+        return err(3, "控制符应该被去掉");
+    n = sanitize(S(""), out, (int)sizeof out);
+    if (n != 0)
+        return err(4, "空输入应该 0");
+    n = sanitize(S("   "), out, (int)sizeof out);
+    if (n != 0)
+        return err(5, "全空白应该得到空串");
+    if (sanitize(S("abc"), out, 2) != -1)
+        return err(6, "容量不够应该 -1");
+}
+
+test "sanitize：选项组合" {
+    SanOpts o = { 0 };
+    char out[64] = { 0 };
+
+    /* 只折叠空白，不 trim、不归一换行 */
+    o.strip_control = 0;
+    o.crlf_to_lf = 0;
+    o.collapse_spaces = 1;
+    o.trim = 0;
+    if (o.apply(S("  a\t\tb  "), out, (int)sizeof out) != 5
+        || memcmp(out, " a b ", 5) != 0)
+        return err(7, "只折叠空白时应该保留两端（共 5 字节）");
+    /* 全部关掉：原样拷贝 */
+    o.strip_control = 0;
+    o.crlf_to_lf = 0;
+    o.collapse_spaces = 0;
+    o.trim = 0;
+    if (o.apply(S("a\t b"), out, (int)sizeof out) != 4
+        || memcmp(out, "a\t b", 4) != 0)
+        return err(8, "全关掉应该原样拷贝");
+    /* is_clean */
+    if (sanitize(S("a b"), out, (int)sizeof out) != 3)
+        return err(9, "清洗简单串失败");
+    if (is_clean(S("a b")) != 1)
+        return err(10, "干净的串应该被识别");
+    if (is_clean(S("  a")) != 0 || is_clean(S("a\tb")) != 0
+        || is_clean(S("a  b")) != 0 || is_clean(S("a\r\nb")) != 0)
+        return err(11, "不干净的串应该被识别");
+    if (sanitize(S("中文 文本"), out, (int)sizeof out) != 13)
+        return err(12, "UTF-8 内容不该被破坏");
+}

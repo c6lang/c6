@@ -1,0 +1,279 @@
+/* std/text/nato：把字母拼成 NATO/ICAO 字母表词（无线电拼读），以及反向解码。
+ *
+ *     import std.text.nato;
+ *
+ *     NatoOpts o = { 0 };
+ *     char out[128] = { 0 };
+ *     o.set_defaults();                        // 方法：set_defaults / spell / decode
+ *     o.spell(S("ab1"), out, (int)sizeof out); // "Alpha Bravo One"
+ *     o.decode(S("Alpha Bravo One"), back, (int)sizeof back);   // "ab1"
+ *
+ * 字母表：`Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliett Kilo
+ * Lima Mike November Oscar Papa Quebec Romeo Sierra Tango Uniform Victor Whiskey
+ * X-ray Yankee Zulu`；数字是 `Zero One Two … Nine`（`digits = 1` 时才拼）。
+ *
+ * 约定：
+ *
+ * - `spell` 用小写输入也行，输出词首字母大写；字母以外的字符在 `digits = 0` 时被
+ *   跳过、`digits = 1` 时数字拼成单词，其它符号一律跳过；
+ * - 词与词之间用**一个空格**分隔，`spell` 不写结尾空格；
+ * - `decode` 按空格切词、大小写不敏感，无法识别的词跳过（不报错）；
+ * - `word(c, dst, cap)` 给单个字符的词（未知返回 -1，`cap` 太小也 -1）；
+ * - `lookup(s)` 给词对应的字符（未知返回 -1）；
+ * - 容量不够时 `spell`/`decode` 返回 -1。
+ */
+#include <string.h>
+
+module std.text.nato;
+import std.core.types;
+import std.text.str;
+
+struct NatoOpts {
+    int digits;
+};
+
+static const char *nato_letters[26] = {
+    "Alpha",   "Bravo",   "Charlie", "Delta",   "Echo",    "Foxtrot",
+    "Golf",    "Hotel",   "India",   "Juliett", "Kilo",    "Lima",
+    "Mike",    "November", "Oscar",  "Papa",    "Quebec",  "Romeo",
+    "Sierra",  "Tango",   "Uniform", "Victor",  "Whiskey", "X-ray",
+    "Yankee",  "Zulu"
+};
+
+static const char *nato_digits[10] = { "Zero", "One", "Two",   "Three", "Four",
+                                       "Five", "Six", "Seven", "Eight", "Nine" };
+
+int set_defaults(NatoOpts *o)
+{
+    if (!o)
+        return -1;
+    o->digits = 1;
+    return 1;
+}
+
+static int nato_upper(int c)
+{
+    if (c >= 'a' && c <= 'z')
+        return c - 'a' + 'A';
+    return c;
+}
+
+static int nato_lower(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A' + 'a';
+    return c;
+}
+
+int word(char c, char *dst, int cap)
+{
+    const char *w = 0;
+    int i = 0;
+    int u = nato_upper((int)(unsigned char)c);
+
+    if (!dst || cap <= 0)
+        return -1;
+    if (u >= 'A' && u <= 'Z')
+        w = nato_letters[u - 'A'];
+    else if (c >= '0' && c <= '9')
+        w = nato_digits[c - '0'];
+    else
+        return -1;
+    for (i = 0; w[i]; i++) {
+        if (i + 1 > cap)
+            return -1;
+        dst[i] = w[i];
+    }
+    if (i + 1 > cap)
+        return -1;
+    dst[i] = 0;
+    return i;
+}
+
+/* 词比较（大小写不敏感，允许连字符/空格差异：X-ray 与 Xray 都认） */
+static int nato_eq(const char *a, int alen, const char *b)
+{
+    int i = 0, k = 0;
+
+    while (i < alen || b[k]) {
+        int ca = 0, cb = 0;
+
+        while (i < alen && a[i] == '-')
+            i++;
+        while (b[k] == '-')
+            k++;
+        if (i >= alen || !b[k])
+            break;
+        ca = nato_lower((int)(unsigned char)a[i]);
+        cb = nato_lower((int)(unsigned char)b[k]);
+        if (ca != cb)
+            return 0;
+        i++;
+        k++;
+    }
+    return i >= alen && !b[k] ? 1 : 0;
+}
+
+int lookup(char[:] w)
+{
+    int i = 0;
+
+    if (!w.data || w.len <= 0)
+        return -1;
+    for (i = 0; i < 26; i++) {
+        if (nato_eq(w.data, w.len, nato_letters[i]))
+            return 'A' + i;
+    }
+    for (i = 0; i < 10; i++) {
+        if (nato_eq(w.data, w.len, nato_digits[i]))
+            return '0' + i;
+    }
+    return -1;
+}
+
+static int nato_puts(char *dst, int cap, int o, const char *s)
+{
+    int i = 0;
+
+    for (i = 0; s[i]; i++) {
+        if (o + 1 > cap)
+            return -1;
+        dst[o++] = s[i];
+    }
+    return o;
+}
+
+int spell(NatoOpts *o, char[:] src, char *dst, int cap)
+{
+    int i = 0, out = 0, first = 1;
+    int digits = o ? o->digits : 0;
+
+    if (!dst || !src.data || cap < 0)
+        return -1;
+    for (i = 0; i < src.len; i++) {
+        char c = src.data[i];
+        const char *w = 0;
+        int u = nato_upper((int)(unsigned char)c);
+
+        if (u >= 'A' && u <= 'Z') {
+            w = nato_letters[u - 'A'];
+        } else if (digits && c >= '0' && c <= '9') {
+            w = nato_digits[c - '0'];
+        } else {
+            continue;
+        }
+        if (!first) {
+            out = nato_puts(dst, cap, out, " ");
+            if (out < 0)
+                return -1;
+        }
+        first = 0;
+        out = nato_puts(dst, cap, out, w);
+        if (out < 0)
+            return -1;
+    }
+    if (out < cap)
+        dst[out] = 0;
+    return out;
+}
+
+int decode(NatoOpts *o, char[:] src, char *dst, int cap)
+{
+    int i = 0, out = 0;
+
+    (void)o;
+    if (!dst || !src.data || cap < 0)
+        return -1;
+    while (i < src.len) {
+        int start = 0, len = 0;
+        int c = 0;
+
+        while (i < src.len && (src.data[i] == ' ' || src.data[i] == '\t'
+                               || src.data[i] == '\n'))
+            i++;
+        if (i >= src.len)
+            break;
+        start = i;
+        while (i < src.len && src.data[i] != ' ' && src.data[i] != '\t'
+               && src.data[i] != '\n')
+            i++;
+        len = i - start;
+        c = lookup((char[:]){ src.data + start, len });
+        if (c < 0)
+            continue;
+        if (out + 1 > cap)
+            return -1;
+        dst[out++] = (char)c;
+    }
+    if (out < cap)
+        dst[out] = 0;
+    return out;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "nato：拼读" {
+    NatoOpts o = { 0 };
+    char out[128] = { 0 };
+
+    if (o.set_defaults() != 1)
+        return err(1, "set_defaults 失败");
+    if (o.spell(S("ab"), out, (int)sizeof out) != 11
+        || memcmp(out, "Alpha Bravo", 11) != 0)
+        return err(2, "ab 应该拼成 Alpha Bravo");
+    if (o.spell(S("Ab9"), out, (int)sizeof out) != 16
+        || memcmp(out, "Alpha Bravo Nine", 16) != 0)
+        return err(3, "带数字的拼读不对");
+    if (o.spell(S("x"), out, (int)sizeof out) != 5
+        || memcmp(out, "X-ray", 5) != 0)
+        return err(4, "x 应该拼成 X-ray");
+    if (o.spell(S("a-b"), out, (int)sizeof out) != 11)
+        return err(5, "非字母数字应该被跳过");
+    o.digits = 0;
+    if (o.spell(S("a1"), out, (int)sizeof out) != 5)
+        return err(6, "digits=0 时数字应该被跳过");
+    if (o.spell(S("abc"), out, 4) != -1)
+        return err(7, "容量不够应该 -1");
+    if (word('q', out, (int)sizeof out) != 6 || memcmp(out, "Quebec", 6) != 0)
+        return err(8, "word('q') 不对");
+    if (word('#', out, (int)sizeof out) != -1)
+        return err(9, "未知字符应该 -1");
+}
+
+test "nato：反向解码" {
+    NatoOpts o = { 0 };
+    char out[64] = { 0 };
+
+    if (o.set_defaults() != 1)
+        return err(10, "set_defaults 失败");
+    if (o.decode(S("Alpha Bravo"), out, (int)sizeof out) != 2
+        || memcmp(out, "AB", 2) != 0)
+        return err(11, "解码 Alpha Bravo 不对");
+    if (o.decode(S("alpha bravo nine"), out, (int)sizeof out) != 3
+        || memcmp(out, "AB9", 3) != 0)
+        return err(12, "小写解码应该也行");
+    if (o.decode(S("X-ray Yankee Zulu"), out, (int)sizeof out) != 3
+        || memcmp(out, "XYZ", 3) != 0)
+        return err(13, "X-ray 解码不对");
+    if (o.decode(S("Xray"), out, (int)sizeof out) != 1 || out[0] != 'X')
+        return err(14, "没有连字符的 Xray 也该认");
+    /* 无法识别的词跳过 */
+    if (o.decode(S("Alpha nonsense Bravo"), out, (int)sizeof out) != 2)
+        return err(15, "未知词应该被跳过");
+    /* 拼读 + 解码往返 */
+    {
+        char spelled[128] = { 0 };
+        int n = o.spell(S("hello9"), spelled, (int)sizeof spelled);
+
+        if (n <= 0)
+            return err(16, "拼读失败");
+        if (o.decode((char[:]){ spelled, n }, out, (int)sizeof out) != 6)
+            return err(17, "往返长度不对");
+        if (memcmp(out, "HELLO9", 6) != 0)
+            return err(18, "往返内容不对（解码统一大写）");
+    }
+    if (lookup(S("Juliett")) != 'J' || lookup(S("nope")) != -1)
+        return err(19, "lookup 不对");
+}

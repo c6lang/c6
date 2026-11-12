@@ -1,0 +1,133 @@
+/* examples/stdclean.c6 —— 第六十一批（文本清洗与标注）的集成示例。
+ *
+ *     make std-clean
+ *
+ * 四节：文本清洗（SanOpts 方法）、制表符展开/还原（TabStops 方法）、
+ * shell 引用（Quoter 方法）、NATO 拼读（NatoOpts 方法）。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.str;
+import std.text.sanitize;
+import std.text.tabs;
+import std.text.quote;
+import std.text.nato;
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+static void do_sanitize(void)
+{
+    SanOpts o = { 0 };
+    char out[64] = { 0 };
+    int n = 0;
+
+    printf("== sanitize\n");
+    check(o.set_defaults() == 1, "set_defaults() 方法");
+    n = o.apply(S("  hello\t\tworld\r\n  "), out, (int)sizeof out);
+    printf("   清洗后（%d 字节）：\"%s\"\n", n, out);
+    check(n == 11 && memcmp(out, "hello world", 11) == 0, "默认清洗");
+    check(o.apply(S("a\x01" "b"), out, (int)sizeof out) == 2, "去控制符");
+    check(is_clean(S("hello world")) == 1, "is_clean 识别干净串");
+    check(is_clean(S("  hello")) == 0, "is_clean 识别脏串");
+    /* 只折叠空白 */
+    o.strip_control = 0;
+    o.crlf_to_lf = 0;
+    o.trim = 0;
+    n = o.apply(S(" a   b "), out, (int)sizeof out);
+    check(n == 5 && memcmp(out, " a b ", 5) == 0, "只折叠空白");
+}
+
+static void do_tabs(void)
+{
+    TabStops t = { 0 };
+    char expanded[64] = { 0 };
+    char squeezed[64] = { 0 };
+    char back[64] = { 0 };
+    int n = 0, m = 0;
+
+    printf("== tabs\n");
+    check(t.init(4) == 1 && t.width() == 4, "init(4)");
+    n = t.expand(S("    x"), expanded, (int)sizeof expanded);
+    expanded[n] = 0;
+    printf("   \"\\t x\" 宽度 4 → \"%s\"（%d 字节）\n", expanded, n);
+    check(n == 5 && memcmp(expanded, "    x", 5) == 0, "展开");
+    m = t.unexpand((char[:]){ expanded, n }, squeezed, (int)sizeof squeezed);
+    squeezed[m] = 0;
+    printf("   还原 → %d 字节（首字节是否 tab：%d）\n", m,
+           (int)(squeezed[0] == '\t'));
+    check(m == 2 && squeezed[0] == '\t' && squeezed[1] == 'x', "还原成 tab");
+    check(t.expand((char[:]){ squeezed, m }, back, (int)sizeof back) == n,
+          "再次展开长度一致");
+    check(t.column(S("ab\tc")) == 5, "column() 方法");
+}
+
+static void do_quote(void)
+{
+    Quoter q = { 0 };
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+    int n = 0;
+
+    printf("== quote\n");
+    check(q.init(0) == 1, "init(0)");
+    n = q.quote(S("it's a test"), out, (int)sizeof out);
+    out[n] = 0;
+    printf("   引用：%s\n", out);
+    check(n == 16 && memcmp(out, "'it'\\''s a test'", 16) == 0,
+          "含单引号的引用");
+    if (q.unquote((char[:]){ out, n }, back, (int)sizeof back) == 11) {
+        back[11] = 0;
+        printf("   去引用：%s\n", back);
+        check(memcmp(back, "it's a test", 11) == 0, "去引用还原");
+    } else {
+        check(0, "去引用失败");
+    }
+    check(q.quote(S("plain"), out, (int)sizeof out) == 5, "不需要引用");
+    check(needs(S("a b")) == 1 && needs(S("ab")) == 0, "needs 判定");
+}
+
+static void do_nato(void)
+{
+    NatoOpts o = { 0 };
+    char out[128] = { 0 };
+    char back[32] = { 0 };
+    int n = 0;
+
+    printf("== nato\n");
+    check(o.set_defaults() == 1, "set_defaults()");
+    n = o.spell(S("c6"), out, (int)sizeof out);
+    out[n] = 0;
+    printf("   \"c6\" → %s\n", out);
+    check(n == 11 && memcmp(out, "Charlie Six", 11) == 0, "拼读");
+    n = o.decode(S("Charlie Six"), back, (int)sizeof back);
+    back[n] = 0;
+    printf("   解码 → %s\n", back);
+    check(n == 2 && memcmp(back, "C6", 2) == 0, "解码（统一大写）");
+    check(o.decode(S("X-ray Yankee Zulu"), back, (int)sizeof back) == 3,
+          "X-ray 解码");
+    check(word('q', out, (int)sizeof out) == 6, "word() 辅助函数");
+}
+
+int main(void)
+{
+    do_sanitize();
+    do_tabs();
+    do_quote();
+    do_nato();
+    printf("\n%d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

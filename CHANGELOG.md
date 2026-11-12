@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第六十一批（文本清洗与标注）**：`std.text.sanitize`（四项开关的清洗器）、
+  `std.text.tabs`（制表符展开/还原）、`std.text.quote`（shell 引用与去引用）、
+  `std.text.nato`（NATO/ICAO 拼读与解码），集成示例 `examples/stdclean.c6`
+  （`make std-clean`）。错误号段 `std.text.sanitize`=0x60fd … `std.text.nato`=0x6100
+  （`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第六十批（二进制与数值工具）**：`std.core.binio`（LE/BE 整数读写游标）、
   `std.core.bitio`（按位读写，MSB-first）、`std.core.half`（fp16 与 bfloat16 转换）、
   `std.core.align`（对齐/2 的幂/按倍数取整），集成示例 `examples/stdbin2.c6`

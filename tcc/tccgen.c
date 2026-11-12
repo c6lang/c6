@@ -12958,6 +12958,10 @@ static const struct C6ErrStdSlot {
     { "std.core.bitio",         C6_ERR_SLOT_STD + 250 },
     { "std.core.half",          C6_ERR_SLOT_STD + 251 },
     { "std.core.align",         C6_ERR_SLOT_STD + 252 },
+    { "std.text.sanitize",      C6_ERR_SLOT_STD + 253 },
+    { "std.text.tabs",          C6_ERR_SLOT_STD + 254 },
+    { "std.text.quote",         C6_ERR_SLOT_STD + 255 },
+    { "std.text.nato",          C6_ERR_SLOT_STD + 256 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

@@ -1,0 +1,227 @@
+/* std/text/quote：shell 风格的引用（加引号 / 去引号）。
+ *
+ *     import std.text.quote;
+ *
+ *     Quoter q = { 0 };
+ *     char out[64] = { 0 };
+ *     q.init(0);                       // 方法：init / quote / unquote / needs
+ *     q.quote(S("it's here"), out, (int)sizeof out);   // 'it'\''s here'
+ *     q.unquote((char[:]){ out, ... }, back, (int)sizeof back);
+ *
+ * 规则与 POSIX shell 一致：
+ *
+ * - 需要引用的情况：空串、含空格/制表符/换行、含 `'`、`"`、`\`、`$`、`` ` ``、
+ *   `*`、`?`、`[`、`]`、`(`、`)`、`;`、`&`、`|`、`<`、`>`、`#`、`~`、`!` 等元字符；
+ * - 加引号用**单引号**，内部的 `'` 写成 `'\''`（先关、再转义、再开）；
+ * - `unquote` 认单引号、双引号与反斜杠转义（单引号内的反斜杠保持原样，其它地方
+ *   `\\x` 一律解成 `x`）；
+ * - `style = 1` 时无条件加引号（便于生成稳定的脚本）；`style = 0` 时只在需要时才加。
+ *
+ * 约定：`quote`/`unquote` 返回写入长度，容量不够返回 -1；`needs` 只看「是否需要
+ * 引用」，返回 1/0；`unquote` 对没有引号的串原样拷贝。
+ */
+#include <string.h>
+
+module std.text.quote;
+import std.core.types;
+import std.text.str;
+
+struct Quoter {
+    int style;
+};
+
+int init(Quoter *q, int style)
+{
+    if (!q)
+        return -1;
+    if (style != 0 && style != 1)
+        return -1;
+    q->style = style;
+    return 1;
+}
+
+int needs(char[:] s)
+{
+    int i = 0;
+
+    if (!s.data || s.len == 0)
+        return 1;
+    for (i = 0; i < s.len; i++) {
+        char c = s.data[i];
+
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\''
+            || c == '"' || c == '\\' || c == '$' || c == '`' || c == '*'
+            || c == '?' || c == '[' || c == ']' || c == '(' || c == ')'
+            || c == ';' || c == '&' || c == '|' || c == '<' || c == '>'
+            || c == '#' || c == '~' || c == '!' || c == '{' || c == '}')
+            return 1;
+    }
+    return 0;
+}
+
+static int qput(char *dst, int cap, int o, char c)
+{
+    if (o >= cap)
+        return -1;
+    dst[o] = c;
+    return o + 1;
+}
+
+int quote(Quoter *q, char[:] s, char *dst, int cap)
+{
+    int i = 0, o = 0;
+    int need = 1;
+    int style = 0;
+
+    if (!q || !dst || !s.data || cap < 0)
+        return -1;
+    style = q->style;
+    need = needs(s);
+    if (style == 0 && !need) {
+        if (cap < s.len)
+            return -1;
+        memcpy(dst, s.data, (size_t)s.len);
+        if (s.len < cap)
+            dst[s.len] = 0;
+        return s.len;
+    }
+    o = qput(dst, cap, o, '\'');
+    if (o < 0)
+        return -1;
+    for (i = 0; i < s.len; i++) {
+        if (s.data[i] == '\'') {
+            o = qput(dst, cap, o, '\'');
+            if (o < 0)
+                return -1;
+            o = qput(dst, cap, o, '\\');
+            if (o < 0)
+                return -1;
+            o = qput(dst, cap, o, '\'');
+            if (o < 0)
+                return -1;
+            o = qput(dst, cap, o, '\'');
+            if (o < 0)
+                return -1;
+            continue;
+        }
+        o = qput(dst, cap, o, s.data[i]);
+        if (o < 0)
+            return -1;
+    }
+    o = qput(dst, cap, o, '\'');
+    if (o < 0)
+        return -1;
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+int unquote(Quoter *q, char[:] s, char *dst, int cap)
+{
+    int i = 0, o = 0;
+    char quote_char = 0;
+
+    if (!q || !dst || !s.data || cap < 0)
+        return -1;
+    while (i < s.len) {
+        char c = s.data[i];
+
+        if (quote_char == 0 && (c == '\'' || c == '"')) {
+            quote_char = c;
+            i++;
+            continue;
+        }
+        if (quote_char != 0 && c == quote_char) {
+            quote_char = 0;
+            i++;
+            continue;
+        }
+        if (c == '\\' && i + 1 < s.len) {
+            char n = s.data[i + 1];
+
+            if (quote_char == '\'' ) {
+                /* 单引号里反斜杠没有特殊含义 */
+                o = qput(dst, cap, o, c);
+                if (o < 0)
+                    return -1;
+                i++;
+                continue;
+            }
+            /* 双引号外：反斜杠转义下一个字符（shell 的通用规则） */
+            o = qput(dst, cap, o, n);
+            if (o < 0)
+                return -1;
+            i += 2;
+            continue;
+        }
+        o = qput(dst, cap, o, c);
+        if (o < 0)
+            return -1;
+        i++;
+    }
+    if (o < cap)
+        dst[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "quote：需要引用与加引号" {
+    Quoter q = { 0 };
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+    int n = 0;
+
+    if (q.init(0) != 1)
+        return err(1, "init 失败");
+    if (needs(S("plain")) != 0 || needs(S("has space")) != 1
+        || needs(S("")) != 1 || needs(S("dollar$")) != 1
+        || needs(S("star*")) != 1)
+        return err(2, "needs 判定不对");
+    n = q.quote(S("plain"), out, (int)sizeof out);
+    if (n != 5 || memcmp(out, "plain", 5) != 0)
+        return err(3, "不需要引用时应该原样输出");
+    n = q.quote(S("has space"), out, (int)sizeof out);
+    if (n != 11 || memcmp(out, "'has space'", 11) != 0)
+        return err(4, "含空格应该加单引号");
+    n = q.quote(S("it's"), out, (int)sizeof out);
+    if (n != 9 || memcmp(out, "'it'\\''s'", 9) != 0)
+        return err(5, "单引号应该转义成 '\\''");
+    /* 往返 */
+    n = q.quote(S("a b'c\"d$e"), out, (int)sizeof out);
+    if (n <= 0)
+        return err(6, "复杂串引用失败");
+    if (q.unquote((char[:]){ out, n }, back, (int)sizeof back) != 9
+        || memcmp(back, "a b'c\"d$e", 9) != 0)
+        return err(7, "引用后去引用应该还原");
+}
+
+test "quote：无条件引用与去引用" {
+    Quoter q = { 0 };
+    char out[64] = { 0 };
+    char back[64] = { 0 };
+
+    if (q.init(1) != 1)
+        return err(8, "init(1) 失败");
+    if (q.quote(S("plain"), out, (int)sizeof out) != 7
+        || memcmp(out, "'plain'", 7) != 0)
+        return err(9, "style=1 应该无条件加引号");
+    if (q.init(2) != -1)
+        return err(10, "非法 style 应该 -1");
+    /* 去引用：双引号与反斜杠 */
+    if (q.init(0) != 1)
+        return err(11, "init(0) 失败");
+    if (q.unquote(S("\"a b\""), back, (int)sizeof back) != 3
+        || memcmp(back, "a b", 3) != 0)
+        return err(12, "双引号去引用不对");
+    if (q.unquote(S("a\\ b"), back, (int)sizeof back) != 3
+        || memcmp(back, "a b", 3) != 0)
+        return err(13, "反斜杠转义空格不对");
+    if (q.unquote(S("'a\\b'"), back, (int)sizeof back) != 3
+        || memcmp(back, "a\\b", 3) != 0)
+        return err(14, "单引号内的反斜杠应该原样保留");
+    if (q.quote(S("x"), out, 0) != -1)
+        return err(15, "容量不够应该 -1");
+}
