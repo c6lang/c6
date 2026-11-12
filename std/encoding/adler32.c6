@@ -1,0 +1,151 @@
+/* std/encoding/adler32：Adler-32 校验和（zlib 用的那个），含流式更新与合并。
+ *
+ *     import std.encoding.adler32;
+ *
+ *     u32 s = adler32(S("Wikipedia"));      // 0x11E60398
+ *     s = adler32_update(s, S("!"));        // 接着算
+ *
+ * 算法：`a = 1`、`b = 0`，每字节 `a += byte; b += a;`，最后 `(b << 16) | a`；
+ * 模数是 65521（小于 2^16 的最大质数）。
+ *
+ * 约定：
+ *
+ * - `adler32` 的初值是 1（空输入的校验和也是 1）；
+ * - `adler32_update` 的第一个参数是**上次的校验和**，直接接着算；
+ * - 内部每 5552 字节取一次模，避免 `b` 溢出（5552 是 65521 下的经典分块值）；
+ * - `adler32_combine(a1, a2, len2)` 把「两段相邻数据的校验和」合成一段的，
+ *   `len2` 是第二段的字节数；
+ * - `adler32_str` 是 `adler32` 的别名（保持与其它模块的 `*_str` 命名一致）；
+ * - 这是校验和，不是散列：碰撞很容易构造。
+ */
+#include <string.h>
+
+module std.encoding.adler32;
+import std.core.types;
+import std.text.str;
+
+#define ADLER_MOD 65521u
+#define ADLER_NMAX 5552
+
+u32 adler32_update(u32 state, char[:] data)
+{
+    u32 a = state & 0xFFFFu;
+    u32 b = (state >> 16) & 0xFFFFu;
+    int off = 0, n = data.len;
+
+    if (!data.data || n <= 0)
+        return state;
+    while (off < n) {
+        int chunk = n - off < ADLER_NMAX ? n - off : ADLER_NMAX;
+        int i = 0;
+
+        for (i = 0; i < chunk; i++) {
+            a += (u32)(unsigned char)data.data[off + i];
+            b += a;
+        }
+        a %= ADLER_MOD;
+        b %= ADLER_MOD;
+        off += chunk;
+    }
+    return (b << 16) | a;
+}
+
+u32 adler32(char[:] data)
+{
+    return adler32_update(1, data);
+}
+
+u32 adler32_str(char[:] data)
+{
+    return adler32(data);
+}
+
+u32 adler32_combine(u32 a1, u32 a2, i64 len2)
+{
+    u32 sum1 = a1 & 0xFFFFu, sum2 = (a1 >> 16) & 0xFFFFu;
+    u32 sum1_2 = a2 & 0xFFFFu, sum2_2 = (a2 >> 16) & 0xFFFFu;
+    u64 n = (u64)len2;
+    u64 a = 0, b = 0;
+
+    if (len2 < 0)
+        return a1;
+    /* a = sum1 + sum1_2 - 1；b = sum2 + sum2_2 + len2*sum1 - len2 */
+    a = (u64)sum1 + (u64)sum1_2 - 1u;
+    b = (u64)sum2 + (u64)sum2_2;
+    {
+        u64 term = ((u64)sum1 * n) % (u64)ADLER_MOD;
+
+        b += term;
+        if (b >= (u64)ADLER_MOD * (u64)ADLER_MOD)
+            b %= (u64)ADLER_MOD;
+        b -= n % (u64)ADLER_MOD;
+    }
+    a %= (u64)ADLER_MOD;
+    b %= (u64)ADLER_MOD;
+    return ((u32)b << 16) | (u32)a;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "adler32：已知向量" {
+    char big[6000] = { 0 };
+
+    if (adler32(S("")) != 1)
+        return err(1, "空输入的校验和应该是 1");
+    if (adler32(S("abc")) != 0x024D0127u)
+        return err(2, "abc 的校验和不对");
+    if (adler32(S("Wikipedia")) != 0x11E60398u)
+        return err(3, "Wikipedia 的校验和不对");
+    if (adler32_str(S("abc")) != adler32(S("abc")))
+        return err(4, "adler32_str 应该等价");
+    /* 超过 5552 字节的分块路径：全 0 的 6000 字节 */
+    memset(big, 0, sizeof big);
+    if (adler32((char[:]){ big, 6000 }) != adler32_update(
+            adler32((char[:]){ big, 3000 }),
+            (char[:]){ big + 3000, 3000 }))
+        return err(5, "分块与整体应当一致");
+    if (adler32_update(1, S("")) != 1)
+        return err(6, "空分片不该改变校验和");
+}
+
+test "adler32：流式与合并" {
+    u32 s1 = 0, s2 = 0, both = 0;
+
+    s1 = adler32(S("hello "));
+    s2 = adler32_update(s1, S("world"));
+    if (s2 != adler32(S("hello world")))
+        return err(7, "流式更新结果不对");
+    /* 合并：两段相邻数据 */
+    s1 = adler32(S("hello "));
+    s2 = adler32(S("world"));
+    both = adler32(S("hello world"));
+    if (adler32_combine(s1, s2, 5) != both)
+        return err(8, "合并 hello + world 不对");
+    s1 = adler32(S(""));
+    s2 = adler32(S("abc"));
+    if (adler32_combine(s1, s2, 3) != s2)
+        return err(9, "与空段合并不该改变结果");
+    s1 = adler32(S("abc"));
+    s2 = adler32(S(""));
+    if (adler32_combine(s1, s2, 0) != s1)
+        return err(10, "合并空段不该改变结果");
+    /* 长数据合并：100 + 200 字节 */
+    {
+        char buf[300] = { 0 };
+        int i = 0;
+
+        for (i = 0; i < 300; i++)
+            buf[i] = (char)(i * 7 + 1);
+        s1 = adler32((char[:]){ buf, 100 });
+        s2 = adler32((char[:]){ buf + 100, 200 });
+        both = adler32((char[:]){ buf, 300 });
+        if (adler32_combine(s1, s2, 200) != both)
+            return err(11, "长数据合并不对");
+    }
+    if (adler32_combine(s1, s2, -1) != s1)
+        return err(12, "负长度应该原样返回第一段");
+    if (adler32_update(1, S("a")) == adler32_update(1, S("b")))
+        return err(13, "不同输入不该得到同一校验和");
+}

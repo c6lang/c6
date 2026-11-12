@@ -245,6 +245,10 @@
 | `std/data/sqlite.c6` | `std.data.sqlite` | SQLite 文件：`sqlite_header` 解 100 字节文件头（页大小/格式版本/payload 分界/库页数/schema/文本编码/user_version/app_id），`sqlite_page` 解 B-tree 页头与单元数，`sqlite_cell` 解单元（payload 长度 + rowid + 本地 payload，溢出页标记），`sqlite_varint` 解 1..9 字节变长整数 |
 | `std/net/postgres.c6` | `std.net.postgres` | PostgreSQL v3：`pg_parse` 拆「1 字节类型 + 4 字节长度」的报文，`pg_startup`/`pg_startup_param` 解启动包里的 `键\0值\0` 对，`pg_error_field` 取 ErrorResponse 字段，`pg_build_msg`/`pg_build_query`/`pg_build_password`/`pg_build_startup` 负责构造 |
 | `std/net/mysql.c6` | `std.net.mysql` | MySQL：`my_parse` 拆「3 字节小端长度 + 序号 + 正文」的报文，`my_handshake` 解 HandshakeV10（服务端版本/连接 ID/能力位/字符集/20 字节挑战串），`my_lenenc` 解长度编码整数（含 `0xFB` NULL），`my_build_query`/`my_build_auth` 构造 |
+| `std/encoding/fnv.c6` | `std.encoding.fnv` | FNV-1/FNV-1a（32/64 位）：一次性接口 `fnv1a32`/`fnv1_32`/`fnv1a64`/`fnv1_64`，流式 `Fnv` 状态 `fnv32_init`/`fnv64_init`/`fnv_update`/`fnv32_digest`/`fnv64_digest`；空输入返回偏移基数 |
+| `std/encoding/adler32.c6` | `std.encoding.adler32` | Adler-32：`adler32`（初值 1）、`adler32_update` 流式、`adler32_combine` 把两段相邻数据的校验和合成一段（`len2` 是第二段长度），内部每 5552 字节取模 |
+| `std/encoding/murmur3.c6` | `std.encoding.murmur3` | MurmurHash3：`murmur3_32(data, seed)`（x86 32 位，尾部按 3/2/1 字节 + `fmix32`）与 `murmur3_128(data, seed, &h1, &h2)`（x64 128 位，两个状态 + 两次 `fmix64`），`murmur3_32_str` 是 `seed=0` 的别名 |
+| `std/encoding/siphash.c6` | `std.encoding.siphash` | SipHash：`siphash24`/`siphash13` 一次性（16 字节密钥）、`SipHash` 流式状态（`siphash_init`/`siphash_update`/`siphash_final`，`rounds` 取 1/2）、`siphash_verify` 做定时安全比较；含官方测试向量 |
 | `std/data/x509.c6` | `std.data.x509` | X.509 v3 证书解析（零分配，只读）：`x509_parse` 借 `std.encoding.asn1` 拆 `tbsCertificate`/`signatureAlgorithm`/`signatureValue`，给出 `version`/`serial`（十六进制）/`sig_alg`（点分 OID）/`issuer` 与 `subject` 的 CN·O·C/`not_before`·`not_after`（6 个整数）/`spki` 视图/`key_bits`（RSA 模数位数）/`sig` 视图；不验签、不验链、不处理 PEM，坏结构返回 `valid=0` |
 | `std/data/jwt.c6` | `std.data.jwt` | JWS 紧凑格式（JWT）解析与 HMAC 验签（零分配）：`jwt_verify(token, n, key, klen, hdrbuf, hcap, paybuf, pcap)` 解出 `Jwt`（`header`/`payload` 视图 + `alg`），支持 HS256/HS384/HS512，签名按常量时间比较；`alg=none`、RS/ES/PS 与签名长度不符一律拒绝；不解析 JSON、不校验 `exp`/`nbf` |
 
@@ -338,6 +342,7 @@
 | `examples/stdtime.c6` | （无模块） | 第四十八批（时间工具）的拼装示例（`make std-time`）：日历换算、ISO 8601 解析/格式化、时长解析/格式化、cron 匹配与下次运行 |
 | `examples/stdpacket.c6` | （无模块） | 第四十九批（网络报文）的拼装示例（`make std-packet`）：NTP 时间戳与偏移、syslog 两种 RFC、STUN 属性与 XOR 地址、TFTP 四种报文 |
 | `examples/stddb.c6` | （无模块） | 第五十批（日志与数据库）的拼装示例（`make std-db`）：环形日志过滤与 dump、SQLite 文件头/页/单元、PostgreSQL 报文与启动包、MySQL 握手与 COM_QUERY |
+| `examples/stdhash2.c6` | （无模块） | 第五十一批（非加密散列补齐）的拼装示例（`make std-hash2`）：FNV（一次性 + 流式）、Adler-32（合并）、MurmurHash3 32/128、SipHash 2-4/1-3 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -432,6 +437,10 @@ std/os/log.c6              24 test(s), 0 failure(s)
 std/data/sqlite.c6         25 test(s), 0 failure(s)
 std/net/postgres.c6        24 test(s), 0 failure(s)
 std/net/mysql.c6           24 test(s), 0 failure(s)
+std/encoding/fnv.c6        24 test(s), 0 failure(s)
+std/encoding/adler32.c6    24 test(s), 0 failure(s)
+std/encoding/murmur3.c6    24 test(s), 0 failure(s)
+std/encoding/siphash.c6    24 test(s), 0 failure(s)
 std/data/pnm.c6            2 test(s), 0 failure(s)
 std/data/x509.c6          26 test(s), 0 failure(s)
 std/data/jwt.c6            58 test(s), 0 failure(s)
@@ -3722,6 +3731,16 @@ make std-db
 构造并拆 `Q` 报文与启动包、按名取 `user`/`database`；MySQL 拆 `COM_QUERY` 并解析
 一个最小 HandshakeV10。
 
+### 集成示例：`examples/stdhash2.c6`
+
+```sh
+make std-hash2
+```
+
+四节：FNV 打一遍一次性与流式（确认分片结果一致）；Adler-32 校验已知向量并用
+`adler32_combine` 与整体值对照；MurmurHash3 验 32 位向量与 128 位的两个 64 位半
+（含跨块的 20 字节用例）；SipHash 用官方向量（空串、15 字节）并演示定时安全比较。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -3818,6 +3837,8 @@ make std-db
   （自带自检）。
 * `make std-db`：`examples/stddb.c6`，第五十批（日志与数据库）模块的拼装示例
   （自带自检）。
+* `make std-hash2`：`examples/stdhash2.c6`，第五十一批（非加密散列补齐）模块的拼装
+  示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
   单组零不压（`2001:db8:0:1:1:1:1:1`）与只有单零段的 `0:0:1::`。

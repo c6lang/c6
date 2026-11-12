@@ -1,0 +1,227 @@
+/* std/encoding/murmur3：MurmurHash3（x86 32 位与 x64 128 位）。
+ *
+ *     import std.encoding.murmur3;
+ *
+ *     u32 h = murmur3_32(S("hello"), 0);          // 0x248BFA47
+ *     u64 h1 = 0, h2 = 0;
+ *     murmur3_128(S("hello"), 0, &h1, &h2);       // 128 位版本给两个 64 位半
+ *
+ * 32 位版本（MurmurHash3_x86_32）：4 字节一组、`c1=0xCC9E2D51`、`c2=0x1B873593`，
+ * 尾部按 3/2/1 字节处理，最后做 `fmix32`。
+ *
+ * 128 位版本（MurmurHash3_x64_128）：16 字节一组、两个状态与两个常量
+ * `0x87C37B91114253D5`/`0x4CF5AD432745937F`，收尾两次「相加再 `fmix64`」；
+ * `h1` 在前、`h2` 在后，与参考实现的输出顺序一致。
+ *
+ * 约定：
+ *
+ * - `seed` 参与初始状态，同一个串不同 seed 结果不同；
+ * - 空输入返回 0（两种版本都是：所有状态等于 seed、长度 0）；
+ * - `murmur3_128` 的两个输出指针必须非空，否则返回 -1；
+ * - `murmur3_32_str` 是 `murmur3_32(data, 0)` 的别名；
+ * - 这是**非加密**散列（可被碰撞构造），不要用于签名。
+ */
+#include <string.h>
+
+module std.encoding.murmur3;
+import std.core.types;
+import std.text.str;
+
+static u32 mm3_rotl32(u32 x, int r)
+{
+    return (x << r) | (x >> (32 - r));
+}
+
+static u64 mm3_rotl64(u64 x, int r)
+{
+    return (x << r) | (x >> (64 - r));
+}
+
+static u32 mm3_le32(const u8 *p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+           | ((u32)p[3] << 24);
+}
+
+static u64 mm3_le64(const u8 *p)
+{
+    return (u64)mm3_le32(p) | ((u64)mm3_le32(p + 4) << 32);
+}
+
+static u32 mm3_fmix32(u32 h)
+{
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return h;
+}
+
+static u64 mm3_fmix64(u64 k)
+{
+    k ^= k >> 33;
+    k *= 0xFF51AFD7ED558CCDuLL;
+    k ^= k >> 33;
+    k *= 0xC4CEB9FE1A85EC53uLL;
+    k ^= k >> 33;
+    return k;
+}
+
+u32 murmur3_32(char[:] data, u32 seed)
+{
+    const u8 *p = (const u8 *)data.data;
+    u32 h = seed;
+    int len = data.len, i = 0, nblocks = 0;
+    u32 k = 0;
+
+    if (!data.data)
+        return 0;
+    nblocks = len / 4;
+    for (i = 0; i < nblocks; i++) {
+        k = mm3_le32(p + i * 4);
+        k *= 0xCC9E2D51u;
+        k = mm3_rotl32(k, 15);
+        k *= 0x1B873593u;
+        h ^= k;
+        h = mm3_rotl32(h, 13);
+        h = h * 5 + 0xE6546B64u;
+    }
+    k = 0;
+    {
+        int tail = nblocks * 4;
+
+        if (len - tail >= 3)
+            k ^= (u32)p[tail + 2] << 16;
+        if (len - tail >= 2)
+            k ^= (u32)p[tail + 1] << 8;
+        if (len - tail >= 1) {
+            k ^= (u32)p[tail];
+            k *= 0xCC9E2D51u;
+            k = mm3_rotl32(k, 15);
+            k *= 0x1B873593u;
+            h ^= k;
+        }
+    }
+    h ^= (u32)len;
+    h = mm3_fmix32(h);
+    return h;
+}
+
+u32 murmur3_32_str(char[:] data)
+{
+    return murmur3_32(data, 0);
+}
+
+int murmur3_128(char[:] data, u32 seed, u64 *h1, u64 *h2)
+{
+    const u8 *p = (const u8 *)data.data;
+    u64 a1 = seed, a2 = seed;
+    int len = data.len, i = 0, nblocks = 0, tail = 0, rem = 0;
+    u64 k1 = 0, k2 = 0;
+
+    if (!h1 || !h2 || !data.data)
+        return -1;
+    nblocks = len / 16;
+    for (i = 0; i < nblocks; i++) {
+        k1 = mm3_le64(p + i * 16);
+        k2 = mm3_le64(p + i * 16 + 8);
+        k1 *= 0x87C37B91114253D5uLL;
+        k1 = mm3_rotl64(k1, 31);
+        k1 *= 0x4CF5AD432745937FuLL;
+        a1 ^= k1;
+        a1 = mm3_rotl64(a1, 27);
+        a1 += a2;
+        a1 = a1 * 5 + 0x52DCE729u;
+        k2 *= 0x4CF5AD432745937FuLL;
+        k2 = mm3_rotl64(k2, 33);
+        k2 *= 0x87C37B91114253D5uLL;
+        a2 ^= k2;
+        a2 = mm3_rotl64(a2, 31);
+        a2 += a1;
+        a2 = a2 * 5 + 0x38495AB5u;
+    }
+    tail = nblocks * 16;
+    rem = len - tail;
+    k1 = 0;
+    k2 = 0;
+    if (rem > 8) {
+        int j = 0;
+
+        for (j = rem - 1; j >= 8; j--)
+            k2 = (k2 << 8) | (u64)p[tail + j];
+        k2 *= 0x4CF5AD432745937FuLL;
+        k2 = mm3_rotl64(k2, 33);
+        k2 *= 0x87C37B91114253D5uLL;
+        a2 ^= k2;
+    }
+    if (rem > 0) {
+        int j = 0, lim = rem < 8 ? rem : 8;
+
+        for (j = lim - 1; j >= 0; j--)
+            k1 = (k1 << 8) | (u64)p[tail + j];
+        k1 *= 0x87C37B91114253D5uLL;
+        k1 = mm3_rotl64(k1, 31);
+        k1 *= 0x4CF5AD432745937FuLL;
+        a1 ^= k1;
+    }
+    a1 ^= (u64)len;
+    a2 ^= (u64)len;
+    a1 += a2;
+    a2 += a1;
+    a1 = mm3_fmix64(a1);
+    a2 = mm3_fmix64(a2);
+    a1 += a2;
+    a2 += a1;
+    *h1 = a1;
+    *h2 = a2;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "murmur3：32 位" {
+    if (murmur3_32(S(""), 0) != 0)
+        return err(1, "空输入应该是 0");
+    if (murmur3_32(S("hello"), 0) != 0x248BFA47u)
+        return err(2, "hello 的 32 位散列不对");
+    if (murmur3_32(S("foobar"), 0) != 0xA4C4D4BDu)
+        return err(3, "foobar 的 32 位散列不对");
+    if (murmur3_32(S("abc"), 0) != 0xB3DD93FAu)
+        return err(4, "abc 的 32 位散列不对");
+    if (murmur3_32(S("hello"), 1) == murmur3_32(S("hello"), 0))
+        return err(5, "不同 seed 应该不同");
+    if (murmur3_32_str(S("hello")) != murmur3_32(S("hello"), 0))
+        return err(6, "murmur3_32_str 应该等价 seed=0");
+    if (murmur3_32((char[:]){ 0, 0 }, 0) != 0
+        || murmur3_32((char[:]){ 0, 0 }, 7) != 0)
+        return err(7, "空指针应该返回 0");
+}
+
+test "murmur3：128 位" {
+    u64 h1 = 0, h2 = 0;
+
+    if (murmur3_128(S(""), 0, &h1, &h2) != 1 || h1 != 0 || h2 != 0)
+        return err(8, "空输入应该是两个 0");
+    if (murmur3_128(S("hello"), 0, &h1, &h2) != 1)
+        return err(9, "128 位计算失败");
+    if (h1 != 0xCBD8A7B341BD9B02uLL || h2 != 0x5B1E906A48AE1D19uLL)
+        return err(10, "hello 的 128 位散列不对");
+    if (murmur3_128(S("foobar"), 0, &h1, &h2) != 1
+        || h1 != 0xBDD2AE7116C85A45uLL || h2 != 0x74A255E0BAF8D6AFuLL)
+        return err(11, "foobar 的 128 位散列不对");
+    if (murmur3_128(S("hello"), 0, 0, &h2) != -1)
+        return err(12, "空输出指针应该 -1");
+    /* 20 字节（跨过一个 16 字节块 + 4 字节尾巴） */
+    {
+        static const u8 data[20] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                                     10, 11, 12, 13, 14, 15, 16, 17, 18, 19 };
+
+        if (murmur3_128((char[:]){ (char *)data, 20 }, 0, &h1, &h2) != 1)
+            return err(13, "20 字节计算失败");
+        if (h1 != 0xA3D253705736954BuLL || h2 != 0x5A1F06256C7B9C7AuLL)
+            return err(14, "20 字节的 128 位散列不对");
+    }
+}

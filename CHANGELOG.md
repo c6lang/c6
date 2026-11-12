@@ -56,6 +56,12 @@
 
 ### 标准库
 
+- **标准库第五十一批（非加密散列补齐）**：`std.encoding.fnv`（FNV-1/1a 32/64 位 +
+  流式）、`std.encoding.adler32`（流式 + 合并）、`std.encoding.murmur3`
+  （32 位与 x64 128 位）、`std.encoding.siphash`（2-4 / 1-3，带官方向量），集成
+  示例 `examples/stdhash2.c6`（`make std-hash2`）。错误号段 `std.encoding.fnv`=0x60d5 …
+  `std.encoding.siphash`=0x60d8（`c6_err_std_slots[]` 追加，`grammar.md` §8.1 同步）。
+
 - **标准库第五十批（日志与数据库）**：`std.os.log`（定长环形日志，级别过滤）、
   `std.data.sqlite`（文件头 + B-tree 页 + 单元 + 变长整数）、`std.net.postgres`
   （v3 报文、启动包、错误字段）、`std.net.mysql`（报文拆帧、HandshakeV10、

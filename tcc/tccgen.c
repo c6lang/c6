@@ -12918,6 +12918,10 @@ static const struct C6ErrStdSlot {
     { "std.data.sqlite",        C6_ERR_SLOT_STD + 210 },
     { "std.net.postgres",       C6_ERR_SLOT_STD + 211 },
     { "std.net.mysql",          C6_ERR_SLOT_STD + 212 },
+    { "std.encoding.fnv",       C6_ERR_SLOT_STD + 213 },
+    { "std.encoding.adler32",   C6_ERR_SLOT_STD + 214 },
+    { "std.encoding.murmur3",   C6_ERR_SLOT_STD + 215 },
+    { "std.encoding.siphash",   C6_ERR_SLOT_STD + 216 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

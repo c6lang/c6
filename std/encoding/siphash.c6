@@ -1,0 +1,243 @@
+/* std/encoding/siphash：SipHash-2-4 与 SipHash-1-3（带密钥的散列，可当短 MAC）。
+ *
+ *     import std.encoding.siphash;
+ *
+ *     unsigned char key[16] = { 0, 1, 2, … };   // 共享密钥
+ *     u64 h = siphash24((char[:]){ key, 16 }, S("hello"));
+ *
+ * 算法：四个 64 位状态 `v0..v3` 由密钥与固定常量异或得到，每 8 字节一个块做
+ * **c 轮**「SipRound」再异或，收尾把剩余字节（含长度）作为一个块再做 c 轮，
+ * 最后 `v2 ^= 0xFF` 做 d 轮取 `v0^v1^v2^v3`。SipHash-2-4 是 c=2、d=4，
+ * SipHash-1-3 是 c=1、d=3（更快、安全性略低）。
+ *
+ * 官方测试向量（密钥 `00 01 02 … 0f`）：
+ *
+ *     空串          → 0x726FDB47DD0E0E31
+ *     `00..0e`（15）→ 0xA129CA6149BE45E5
+ *
+ * 约定：
+ *
+ * - 密钥固定 16 字节（`char[:]`，长度不足 16 返回 0 散列）；
+ * - `siphash24`/`siphash13` 是一次性接口，`SipHash` 是流式状态
+ *   （`siphash_init`/`siphash_update`/`siphash_final`，`rounds` 取 1/2）；
+ * - `siphash_verify` 用**定时安全**比较两个 64 位值（不做短路），适合校验短 MAC；
+ * - 输出是 `u64`；要 128 位就换用别的东西（SipHash 本身只给 64 位）。
+ */
+#include <string.h>
+
+module std.encoding.siphash;
+import std.core.types;
+import std.text.str;
+
+struct SipHash {
+    u64 v0;
+    u64 v1;
+    u64 v2;
+    u64 v3;
+    u64 buf;
+    int buf_len;
+    i64 total;
+    int rounds;
+    int finalized;
+};
+
+static u64 sip_le64(const u8 *p)
+{
+    return (u64)p[0] | ((u64)p[1] << 8) | ((u64)p[2] << 16)
+           | ((u64)p[3] << 24) | ((u64)p[4] << 32) | ((u64)p[5] << 40)
+           | ((u64)p[6] << 48) | ((u64)p[7] << 56);
+}
+
+static u64 sip_rotl(u64 x, int r)
+{
+    return (x << r) | (x >> (64 - r));
+}
+
+#define SIP_ROUND(s)                                                         \
+    do {                                                                     \
+        (s)->v0 += (s)->v1;                                                  \
+        (s)->v1 = sip_rotl((s)->v1, 13);                                     \
+        (s)->v1 ^= (s)->v0;                                                  \
+        (s)->v0 = sip_rotl((s)->v0, 32);                                     \
+        (s)->v2 += (s)->v3;                                                  \
+        (s)->v3 = sip_rotl((s)->v3, 16);                                     \
+        (s)->v3 ^= (s)->v2;                                                  \
+        (s)->v0 += (s)->v3;                                                  \
+        (s)->v3 = sip_rotl((s)->v3, 21);                                     \
+        (s)->v3 ^= (s)->v0;                                                  \
+        (s)->v2 += (s)->v1;                                                  \
+        (s)->v1 = sip_rotl((s)->v1, 17);                                     \
+        (s)->v1 ^= (s)->v2;                                                  \
+        (s)->v2 = sip_rotl((s)->v2, 32);                                     \
+    } while (0)
+
+int siphash_init(SipHash *s, char[:] key, int rounds)
+{
+    u64 k0 = 0, k1 = 0;
+
+    if (!s || !key.data || key.len < 16)
+        return -1;
+    if (rounds != 1 && rounds != 2)
+        return -1;
+    k0 = sip_le64((const u8 *)key.data);
+    k1 = sip_le64((const u8 *)key.data + 8);
+    s->v0 = 0x736F6D6570736575uLL ^ k0;
+    s->v1 = 0x646F72616E646F6DuLL ^ k1;
+    s->v2 = 0x6C7967656E657261uLL ^ k0;
+    s->v3 = 0x7465646279746573uLL ^ k1;
+    s->buf = 0;
+    s->buf_len = 0;
+    s->total = 0;
+    s->rounds = rounds;
+    s->finalized = 0;
+    return 1;
+}
+
+void siphash_update(SipHash *s, char[:] data)
+{
+    int i = 0;
+
+    if (!s || !data.data || s->finalized)
+        return;
+    for (i = 0; i < data.len; i++) {
+        s->buf |= (u64)(unsigned char)data.data[i]
+                  << (8 * (s->buf_len & 7));
+        s->buf_len++;
+        s->total++;
+        if (s->buf_len == 8) {
+            int r = 0;
+
+            s->v3 ^= s->buf;
+            for (r = 0; r < s->rounds; r++)
+                SIP_ROUND(s);
+            s->v0 ^= s->buf;
+            s->buf = 0;
+            s->buf_len = 0;
+        }
+    }
+}
+
+u64 siphash_final(SipHash *s)
+{
+    int r = 0;
+
+    if (!s || s->finalized)
+        return 0;
+    s->buf |= (u64)(s->total & 0xFF) << 56;
+    s->v3 ^= s->buf;
+    for (r = 0; r < s->rounds; r++)
+        SIP_ROUND(s);
+    s->v0 ^= s->buf;
+    s->v2 ^= 0xFF;
+    for (r = 0; r < 4; r++)
+        SIP_ROUND(s);
+    s->finalized = 1;
+    return s->v0 ^ s->v1 ^ s->v2 ^ s->v3;
+}
+
+u64 siphash(char[:] key, char[:] data, int rounds)
+{
+    SipHash s = { 0 };
+
+    if (siphash_init(&s, key, rounds) != 1)
+        return 0;
+    siphash_update(&s, data);
+    return siphash_final(&s);
+}
+
+u64 siphash24(char[:] key, char[:] data)
+{
+    return siphash(key, data, 2);
+}
+
+u64 siphash13(char[:] key, char[:] data)
+{
+    return siphash(key, data, 1);
+}
+
+int siphash_verify(u64 got, u64 want)
+{
+    u64 diff = got ^ want;
+    int i = 0;
+
+    /* 定时安全：固定 64 次比较，不提前返回 */
+    for (i = 0; i < 64; i++)
+        diff |= (diff >> 1) & 1u;
+    return (diff & 1u) == 0 ? 1 : 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+static void sip_key(u8 *key)
+{
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        key[i] = (u8)i;
+}
+
+test "siphash：官方测试向量" {
+    u8 key[16] = { 0 };
+    u8 fifteen[15] = { 0 };
+    int i = 0;
+
+    sip_key(key);
+    for (i = 0; i < 15; i++)
+        fifteen[i] = (u8)i;
+    if (siphash24((char[:]){ (char *)key, 16 }, S("")) != 0x726FDB47DD0E0E31uLL)
+        return err(1, "空串的 SipHash-2-4 不对");
+    if (siphash24((char[:]){ (char *)key, 16 }, (char[:]){ (char *)fifteen, 15 })
+        != 0xA129CA6149BE45E5uLL)
+        return err(2, "15 字节的 SipHash-2-4 不对");
+    if (siphash24((char[:]){ (char *)key, 16 }, S("hello"))
+        == siphash13((char[:]){ (char *)key, 16 }, S("hello")))
+        return err(3, "2-4 与 1-3 的结果应该不同");
+    if (siphash((char[:]){ 0, 0 }, S("x"), 2) != 0)
+        return err(4, "空密钥应该返回 0");
+    if (siphash_init(0, (char[:]){ (char *)key, 16 }, 2) != -1)
+        return err(5, "空状态指针应该 -1");
+}
+
+test "siphash：流式与校验" {
+    u8 key[16] = { 0 };
+    u8 k2[16] = { 0 };
+    SipHash s = { 0 };
+    u64 whole = 0, split = 0;
+
+    sip_key(key);
+    sip_key(k2);
+    whole = siphash24((char[:]){ (char *)key, 16 }, S("hello world"));
+    if (siphash_init(&s, (char[:]){ (char *)key, 16 }, 2) != 1)
+        return err(6, "初始化失败");
+    siphash_update(&s, S("hello "));
+    siphash_update(&s, S("world"));
+    split = siphash_final(&s);
+    if (split != whole)
+        return err(7, "分片与整体应该一致");
+    /* 再来一次同样的数据：final 之后不该再改变 */
+    if (siphash_final(&s) != 0)
+        return err(8, "重复 final 应该返回 0");
+    /* 密钥不同 → 结果不同 */
+    k2[0] = 0xFF;
+    if (siphash24((char[:]){ (char *)k2, 16 }, S("hello world")) == whole)
+        return err(9, "不同密钥应该得到不同结果");
+    if (siphash_verify(whole, whole) != 1 || siphash_verify(whole, whole ^ 1) != 0)
+        return err(10, "定时安全比较不对");
+    /* 长度字段参与运算：1..8 字节都算一遍，两两不同 */
+    {
+        u64 seen[8] = { 0 };
+        int i = 0, j = 0;
+        u8 buf[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+        for (i = 0; i < 8; i++) {
+            seen[i] = siphash24((char[:]){ (char *)key, 16 },
+                                (char[:]){ (char *)buf, i + 1 });
+            for (j = 0; j < i; j++) {
+                if (seen[j] == seen[i])
+                    return err(11, "不同长度的散列不该相同");
+            }
+        }
+    }
+}

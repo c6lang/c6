@@ -1802,6 +1802,33 @@ MySQL 的前端报文。数据库这三个都只做**报文/页结构**，不连
 验收：`make stdtest`（213 个模块、0 failure）、`make std-db`（30 条自检全过）、
 `make check-all`。
 
+### 11.63 标准库第五十一批（fnv / adler32 / murmur3 / siphash）
+
+第五十一批把「非加密散列」补齐：FNV、Adler-32、MurmurHash3（32/128）、SipHash。
+与已有的 sha 家族、blake2s、crc32c、xxhash 一起，散列这块基本齐了。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.encoding.fnv` | FNV-1/FNV-1a | 两种变体只差「先异或再乘」还是「先乘再异或」；`Fnv.bits` 用 32/33、64/65 编码变体，`fnv_update` 按它分派；空输入就是偏移基数 |
+| `std.encoding.adler32` | Adler-32 | 每 5552 字节取一次模（65521 下的经典分块值，避免 `b` 溢出）；`adler32_combine` 用 `b = b1 + b2 + len2*a1 - len2` 的公式，合并结果与整体一致 |
+| `std.encoding.murmur3` | MurmurHash3 | 32 位是 x86 变体（尾部 3/2/1 字节）、128 位是 **x64 变体**（两个 64 位状态、两个常量），别把两者的常量搞混——x86_128 的四个 32 位常量是另一套 |
+| `std.encoding.siphash` | SipHash | 官方测试向量必须过：密钥 `00..0f`、空串 `0x726FDB47DD0E0E31`、15 字节 `0xA129CA6149BE45E5`；流式状态把「不满 8 字节的尾巴」存在 `buf` + `buf_len` 里，长度字节在收尾时按 `total & 0xFF` 塞进最高位 |
+
+写这批时踩了两个 c6 的坑：**注释里不能再出现 `*/`**（`unsigned char key[16] = {…};
+/* 共享密钥 */` 会把块注释提前结束，报 `declaration expected`）；`slice` 的 `.data`
+是只读的，`data.data += chunk` 会警告 `assignment of read-only location`，要改成
+索引偏移。
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.encoding.fnv`=0x60d5、
+`std.encoding.adler32`=0x60d6、`std.encoding.murmur3`=0x60d7、`std.encoding.siphash`=0x60d8；
+`grammar.md` §8.1 同步。`Makefile` 增加 `std-hash2` 与 `STD_HASH2_SRCS`，
+`test-all`/`check-all` 都带上它；四个模块在 `stdtest` 里都只依赖 `std/text/str.c6`
+（各 24 条用例）。示例 `examples/stdhash2.c6` 四节（20 条自检）。
+
+验收：`make stdtest`（217 个模块、0 failure）、`make std-hash2`（20 条自检全过）、
+`make check-all`。
+
+
 
 
 

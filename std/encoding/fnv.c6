@@ -1,0 +1,201 @@
+/* std/encoding/fnv：FNV-1 与 FNV-1a 散列（32/64 位，含流式接口）。
+ *
+ *     import std.encoding.fnv;
+ *
+ *     u32 a = fnv1a32(S("foobar"));      // 0xBF9CF968
+ *     u64 b = fnv1a64(S("foobar"));      // 0x85944171F73967E8
+ *
+ * FNV-1a 是「先异或再乘」，FNV-1 是「先乘再异或」，两者的偏移基数相同
+ * （32 位 `0x811C9DC5`、64 位 `0xCBF29CE484222325`），质数分别是 `0x01000193`
+ * 与 `0x100000001B3`。
+ *
+ * 约定：
+ *
+ * - `fnv1a32`/`fnv1_32`/`fnv1a64`/`fnv1_64` 是一次性接口；
+ * - `Fnv` 是流式状态：`fnv32_init`/`fnv32_update`/`fnv32_digest`（64 位同理），
+ *   可以在分片数据上累计；
+ * - 空输入返回偏移基数（32 位是 `0x811C9DC5`）；
+ * - 不做大小端转换：FNV 按**字节序列**算，与平台字节序无关；
+ * - 这是非加密散列，不能当 MAC 用（要 MAC 用 `std.encoding.siphash`）。
+ */
+#include <string.h>
+
+module std.encoding.fnv;
+import std.core.types;
+import std.text.str;
+
+struct Fnv {
+    u64 h;
+    int bits;
+};
+
+u32 fnv1a32(char[:] data)
+{
+    u32 h = 0x811C9DC5u;
+    int i = 0;
+
+    for (i = 0; i < data.len; i++) {
+        h ^= (u32)(unsigned char)data.data[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+u32 fnv1_32(char[:] data)
+{
+    u32 h = 0x811C9DC5u;
+    int i = 0;
+
+    for (i = 0; i < data.len; i++) {
+        h *= 0x01000193u;
+        h ^= (u32)(unsigned char)data.data[i];
+    }
+    return h;
+}
+
+u64 fnv1a64(char[:] data)
+{
+    u64 h = 0xCBF29CE484222325uLL;
+    int i = 0;
+
+    for (i = 0; i < data.len; i++) {
+        h ^= (u64)(unsigned char)data.data[i];
+        h *= 0x100000001B3uLL;
+    }
+    return h;
+}
+
+u64 fnv1_64(char[:] data)
+{
+    u64 h = 0xCBF29CE484222325uLL;
+    int i = 0;
+
+    for (i = 0; i < data.len; i++) {
+        h *= 0x100000001B3uLL;
+        h ^= (u64)(unsigned char)data.data[i];
+    }
+    return h;
+}
+
+void fnv32_init(Fnv *f, int variant)
+{
+    if (!f)
+        return;
+    f->h = 0x811C9DC5u;
+    f->bits = variant == 0 ? 32 : 33;   /* 32 = FNV-1a，33 = FNV-1 */
+}
+
+void fnv64_init(Fnv *f, int variant)
+{
+    if (!f)
+        return;
+    f->h = 0xCBF29CE484222325uLL;
+    f->bits = variant == 0 ? 64 : 65;
+}
+
+void fnv_update(Fnv *f, char[:] data)
+{
+    int i = 0;
+
+    if (!f || !data.data)
+        return;
+    if (f->bits == 32) {
+        u32 h = (u32)f->h;
+
+        for (i = 0; i < data.len; i++) {
+            h ^= (u32)(unsigned char)data.data[i];
+            h *= 0x01000193u;
+        }
+        f->h = h;
+    } else if (f->bits == 33) {
+        u32 h = (u32)f->h;
+
+        for (i = 0; i < data.len; i++) {
+            h *= 0x01000193u;
+            h ^= (u32)(unsigned char)data.data[i];
+        }
+        f->h = h;
+    } else if (f->bits == 64) {
+        u64 h = f->h;
+
+        for (i = 0; i < data.len; i++) {
+            h ^= (u64)(unsigned char)data.data[i];
+            h *= 0x100000001B3uLL;
+        }
+        f->h = h;
+    } else if (f->bits == 65) {
+        u64 h = f->h;
+
+        for (i = 0; i < data.len; i++) {
+            h *= 0x100000001B3uLL;
+            h ^= (u64)(unsigned char)data.data[i];
+        }
+        f->h = h;
+    }
+}
+
+u32 fnv32_digest(Fnv *f)
+{
+    return f ? (u32)f->h : 0;
+}
+
+u64 fnv64_digest(Fnv *f)
+{
+    return f ? f->h : 0;
+}
+
+/* ---- 自测 ---- */
+
+#define S(lit) ((char[:]){ (char *)(lit), (int)(sizeof(lit) - 1) })
+
+test "fnv：一次性接口" {
+    if (fnv1a32(S("")) != 0x811C9DC5u)
+        return err(1, "空输入的 FNV-1a 32 应该是偏移基数");
+    if (fnv1a32(S("a")) != 0xE40C292Cu)
+        return err(2, "a 的 FNV-1a 32 不对");
+    if (fnv1a32(S("foobar")) != 0xBF9CF968u)
+        return err(3, "foobar 的 FNV-1a 32 不对");
+    if (fnv1_32(S("a")) != 0x050C5D7Eu)
+        return err(4, "a 的 FNV-1 32 不对");
+    if (fnv1_32(S("foobar")) != 0x31F0B262u)
+        return err(5, "foobar 的 FNV-1 32 不对");
+    if (fnv1a64(S("")) != 0xCBF29CE484222325uLL)
+        return err(6, "空输入的 FNV-1a 64 应该是偏移基数");
+    if (fnv1a64(S("foobar")) != 0x85944171F73967E8uLL)
+        return err(7, "foobar 的 FNV-1a 64 不对");
+    /* 两种变体在非空输入上应当不同 */
+    if (fnv1a32(S("abc")) == fnv1_32(S("abc")))
+        return err(8, "FNV-1 与 FNV-1a 应该不同");
+}
+
+test "fnv：流式接口" {
+    Fnv f = { 0 };
+
+    fnv32_init(&f, 0);
+    fnv_update(&f, S("foo"));
+    fnv_update(&f, S("bar"));
+    if (fnv32_digest(&f) != 0xBF9CF968u)
+        return err(9, "分片算 FNV-1a 32 应该与一次性一致");
+    fnv32_init(&f, 1);
+    fnv_update(&f, S("foo"));
+    fnv_update(&f, S("bar"));
+    if (fnv32_digest(&f) != 0x31F0B262u)
+        return err(10, "分片算 FNV-1 32 不一致");
+    fnv64_init(&f, 0);
+    fnv_update(&f, S("foo"));
+    fnv_update(&f, S("bar"));
+    if (fnv64_digest(&f) != 0x85944171F73967E8uLL)
+        return err(11, "分片算 FNV-1a 64 不一致");
+    fnv64_init(&f, 0);
+    if (fnv64_digest(&f) != 0xCBF29CE484222325uLL)
+        return err(12, "没喂数据的摘要应该是偏移基数");
+    /* 空分片不影响结果 */
+    fnv32_init(&f, 0);
+    fnv_update(&f, S("foobar"));
+    fnv_update(&f, S(""));
+    if (fnv32_digest(&f) != fnv1a32(S("foobar")))
+        return err(13, "空分片不该改变摘要");
+    fnv_update(0, S("x"));
+    if (fnv32_digest(0) != 0 || fnv64_digest(0) != 0)
+        return err(14, "空状态指针应该返回 0");
+}
