@@ -217,7 +217,7 @@ std/container/              容器与算法：向量、位集合、跨度、映�
   std/container/span.c6     std.container.span     别人内存上的窗口 Span@T（纯值、零拷贝）
   std/container/vec.c6      std.container.vec      会长的数组 Vect@T（托管引用）+ Iter@T：push/pop、insert/remove_at、index_of、slice/extend、sort/each/filter/fold、any/all/find_if/swap
 
-std/os/                     操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程、同步原语、线程池
+std/os/                     操作系统：流、文件系统、路径、环境变量、时间、命令行参数、子进程、同步原语、线程池、终端、信号、管道、多路复用
   std/os/env.c6             std.os.env             环境变量与命令行：env_get/set/unset、env_get_int/bool、env_args/env_arg
   std/os/fs.c6              std.os.fs              stat/lstat、mkdir_p、目录遍历 Dir、rename/remove、getcwd/chdir
   std/os/io.c6              std.os.io              Reader/Writer（文件与标准流）：read_line/read_all、write_line/flush、零分配 CFile 迭代，方法调用写 pr->read_line(...)
@@ -226,6 +226,10 @@ std/os/                     操作系统：流、文件系统、路径、环境�
   std/os/proc.c6            std.os.proc            子进程（POSIX）：proc_run/proc_spawn/proc_wait（ProcStatus 的 exited/exit_code/signaled/signal）、proc_run_sh（/bin/sh -c）、proc_which（PATH 查找）
   std/os/sync.c6            std.os.sync            阻塞式同步原语（pthread 薄封装、值类型）：Mutex 的 init/destroy/lock/try_lock/unlock、Cond 的 wait/wait_ms/signal/broadcast、RWLock 的 rdlock/wrlock/try_*、Once 的 call(fn)、Semaphore 的 init/wait/try_wait/wait_ms/post/value、Barrier 的 init/wait（返回 1 的是串行线程）
   std/os/thread.c6          std.os.thread          线程身份与线程池：thread_self/thread_equal、cpu_count、thread_yield、thread_set_name；ThreadPool 的 start(workers, jobs, cap)/submit（满时背压）/try_submit/wait/stop（join，幂等）、pending/running/done/workers/is_started；worker 是裸 pthread，任务 void (*fn)(void *)
+  std/os/tty.c6             std.os.tty             终端（termios 薄封装）：is_tty、size/width/height（TIOCGWINSZ）、set_size（TIOCSWINSZ）、TtyMode 的 raw(fd)/restore/is_active（对非终端 raw 返回 0；恢复幂等）
+  std/os/signal.c6          std.os.signal          信号（sigaction/sigprocmask 薄封装）：install（SA_RESTART）、ignore/reset、block/unblock/is_blocked/is_pending、send_self（raise）/send_to（kill）、signal_name/signal_number（带不带 SIG 前缀都认）
+  std/os/pipe.c6            std.os.pipe            匿名管道（零分配）：init/init_nonblock、read_bytes（0=EOF）/read_exact、write_bytes（返回实际字节数）、set_nonblock、close_read/close_write/close_all、would_block；重试 EINTR、fd 带 FD_CLOEXEC
+  std/os/poll.c6            std.os.poll            多路等待（poll(2)）：PollSet（32 槽、零分配）的 add/modify/remove_fd/find/count/wait（返回就绪个数）/is_ready/ready/fd_at，单 fd 的 wait_readable/wait_writable/wait_any（1/0/-1）；EVENT_READ/WRITE/HUP/ERROR
   std/os/time.c6            std.os.time            now_ns/now_ms/now_unix、sleep_ms、Duration 格式化、UTC 日历换算（不依赖 localtime）
 
 std/encoding/               编解码与压缩：Base32/Base64/Base85/十六进制/百分号、SHA-1/SHA-256、位流、UUID、Punycode/IDNA、分帧、LZ4/RLE、hexdump
@@ -299,6 +303,7 @@ make std-cli     # 编译并运行 examples/stdcli.c6（第十六批命令行工
 make std-wire    # 编译并运行 examples/stdwire.c6（第十七批网络协议基础模块的拼装示例）
 make std-algo    # 编译并运行 examples/stdalgo.c6（第十八批算法与容器模块的拼装示例）
 make std-thread  # 编译并运行 examples/stdthread.c6（第十九批并发与同步模块的拼装示例）
+make std-term    # 编译并运行 examples/stdterm.c6（第二十批终端与进程控制模块的拼装示例）
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

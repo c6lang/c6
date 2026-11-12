@@ -111,6 +111,10 @@
 | `std/os/proc.c6` | `std.os.proc` | 子进程（POSIX、零分配）：`proc_run`（fork+execvp+wait）、`proc_spawn`/`proc_wait`、`proc_run_sh`（`/bin/sh -c`，命令串 4KB 上限）、`proc_which`（带 `/` 直接查，否则按 `PATH`）；`ProcStatus` 拆出 `exited`/`exit_code`/`signaled`/`signal`，命令找不到按 shell 惯例退出码 127 |
 | `std/os/sync.c6` | `std.os.sync` | 阻塞式同步原语（pthread 薄封装，值类型）：`Mutex`（`init`/`destroy`/`lock`/`try_lock`/`unlock`）、`Cond`（`wait`/`wait_ms`/`signal`/`broadcast`）、`RWLock`（`rdlock`/`try_rdlock`/`wrlock`/`try_wrlock`/`unlock`）、`Once`（`call(fn)` 只跑一次）、`Semaphore`（`init(v)`/`wait`/`try_wait`/`wait_ms`/`post`/`value`）、`Barrier`（`init(n)`/`wait`）；会失败返回 1/0，限时等待 1/0/-1 |
 | `std/os/thread.c6` | `std.os.thread` | 线程身份与线程池：`thread_self`/`thread_equal`、`cpu_count`、`thread_yield`、`thread_set_name`；`ThreadPool` 的 `start(workers, jobs, cap)`（worker 上限 `POOL_MAX`=32）、`submit`（满时背压）/`try_submit`、`wait`（等空闲，之后还能继续投）、`stop`（join 全部 worker、幂等）、`pending`/`running`/`done`/`workers`/`is_started`；任务函数 `void (*fn)(void *)`，worker 是裸 pthread |
+| `std/os/tty.c6` | `std.os.tty` | 终端（termios 薄封装，零分配）：`is_tty(fd)`、`size(fd, &rows, &cols)`/`width`/`height`/`set_size`（`TIOCGWINSZ`/`TIOCSWINSZ`）、`TtyMode`（`raw(fd)` 进原始模式、`restore()` 恢复、`is_active()`）；对非终端 `raw` 返回 0，失败不动输出参数 |
+| `std/os/signal.c6` | `std.os.signal` | 信号（POSIX 薄封装）：`install(sig, handler)`（`sigaction` + `SA_RESTART`）、`ignore`/`reset`、`block`/`unblock`/`is_blocked`/`is_pending`（`sigprocmask`/`sigpending`）、`send_self`（`raise`）/`send_to`（`kill`）、`signal_name`/`signal_number`（20 个常用信号，带不带 `SIG` 前缀都认）；名字统一成动词，避免和 libc 的 `signal`/`raise`/`kill` 撞名 |
+| `std/os/pipe.c6` | `std.os.pipe` | 匿名管道（`pipe(2)`）：`Pipe` 的 `init`/`init_nonblock`、`read_bytes`（`0`=EOF、`-1`=错误）、`read_exact`、`write_bytes`（返回实际字节数）、`set_nonblock`、`close_read`/`close_write`/`close_all`、`read_fd`/`write_fd`/`is_open`、`would_block()`；读写都重试 `EINTR`，fd 带 `FD_CLOEXEC` |
+| `std/os/poll.c6` | `std.os.poll` | 多路等待（`poll(2)`）：`PollSet`（`POLL_MAX`=32 个槽，零分配）的 `init`/`add`（同 fd 改事件）/`modify`/`remove_fd`/`find`/`count`/`wait`（`<0` 永远等、`0` 立刻、`>0` 毫秒；返回就绪个数）/`is_ready`/`ready`/`fd_at`/`clear_ready`，单 fd 的 `wait_readable`/`wait_writable`/`wait_any`（1/0/-1）；事件位 `EVENT_READ`/`EVENT_WRITE`/`EVENT_ERROR`/`EVENT_HUP`/`EVENT_INVALID` |
 | `std/os/time.c6` | `std.os.time` | `now_ns`/`now_ms`/`now_unix`/`now_unix_ms`、`sleep_ms`/`sleep_ns`、`Duration` 拆分与 `d.format(buf, cap)`、`Civil` 日历换算 `civil_from_unix`/`c.to_unix()`/`c.format(...)`，不依赖 localtime |
 
 **`std/encoding/`**（编解码：Base64/十六进制/百分号、SHA-256、位流、UUID）
@@ -182,6 +186,7 @@
 | `examples/stdwire.c6` | （无模块） | 第十七批（网络协议基础）的拼装示例（`make std-wire`）：sha1 向量、ws 握手/分帧、dns 查询与响应、loopback TCP 往返，自带自检 |
 | `examples/stdalgo.c6` | （无模块） | 第十八批（算法与容器）的拼装示例（`make std-algo`）：依赖拓扑排序 + 最短路、LRU 缓存、命令前缀树、地址区间，自带自检 |
 | `examples/stdthread.c6` | （无模块） | 第十九批（并发与同步）的拼装示例（`make std-thread`）：原子计数 + 自旋锁、互斥锁 + 条件变量握手、线程池跑任务、通道收发，自带自检 |
+| `examples/stdterm.c6` | （无模块） | 第二十批（终端与进程控制）的拼装示例（`make std-term`）：伪终端检测/窗口大小/原始模式、信号处理与屏蔽、管道读写与 EOF、poll 多路等待，自带自检 |
 
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
@@ -2260,6 +2265,100 @@ ch.close_chan();                 /* 收完剩下的之后 recv 返回 0 */
   `sent_count`/`recv_count`。
 * 正文依赖 `std.os.sync`（Mutex + 两个 Cond），编程序时那份 `.c6` 也要在命令行上。
 
+### `tty`：终端检测、窗口大小与原始模式
+
+```c
+import std.os.tty;
+
+if (is_tty(0)) {
+    int rows = 0, cols = 0;
+    size(0, &rows, &cols);           /* TIOCGWINSZ */
+}
+
+TtyMode mode = { 0 };
+mode.raw(0);                         /* 关掉行缓冲/回显/信号键 */
+defer mode.restore();
+```
+
+* `is_tty(fd)`（`isatty`）；`size(fd, &rows, &cols)`/`width`/`height`（取不到给 0，
+  失败不动输出参数）；`set_size(fd, rows, cols)` 用 `TIOCSWINSZ`（伪终端/测试）。
+* `TtyMode`：`raw(fd)` 保存整个 `termios` 再 `cfmakeraw` + `tcsetattr`，返回 1/0；
+  `restore()` 恢复（重复恢复返回 0）；`is_active()`。对非终端 `raw` 失败且不改状态。
+* 进程被信号打断时终端不会自动恢复：`raw` 之后请 `defer restore()`；装了信号
+  处理的话在 `errdefer` 里也恢复一次。
+* 只做本地终端；伪终端分配（`posix_openpt` 等）直接调 libc。
+
+### `signal`：处理函数、屏蔽与发送
+
+```c
+import std.os.signal;
+
+install(SIGINT, &on_ctrl_c);         /* SA_RESTART */
+ignore(SIGPIPE);
+block(SIGUSR1);
+unblock(SIGUSR1);
+send_self(SIGUSR1);                  /* raise */
+```
+
+* `install(sig, fn)`（`sigaction` + `SA_RESTART`：慢系统调用自动重来）、`ignore`、
+  `reset`（恢复默认动作——**之后再收到就按系统默认处理**）。
+* `block`/`unblock`/`is_blocked`/`is_pending` 改/查**当前线程**的屏蔽字：屏蔽期间
+  发的信号挂起，解除时补投。
+* `send_self(sig)` 是 `raise`、`send_to(pid, sig)` 是 `kill`（`pid>0` 单个、`0`
+  同进程组、`-1` 所有有权限的）。
+* `signal_name(sig)`/`signal_number("SIGTERM")` 名字↔编号，带不带 `SIG` 都认，
+  未知给 0。
+* 处理函数里只做异步信号安全的事：置 `volatile` 标志，不 `printf`、不分配、不加锁。
+
+### `pipe`：匿名管道
+
+```c
+import std.os.pipe;
+
+Pipe p = { 0 };
+p.init();                            /* init_nonblock() 非阻塞 */
+p.write_bytes("hello", 5);
+p.close_write();                     /* 读端取完之后看到 EOF */
+char buf[32] = { 0 };
+int n = p.read_bytes(buf, sizeof(buf));
+p.close_all();
+```
+
+* `read_bytes`：`>0` 字节数、`0` EOF、`-1` 错误（非阻塞下紧跟 `would_block()`
+  判断是不是 EAGAIN）；`read_exact` 读满 `len` 或到 EOF。
+* `write_bytes` 返回实际写进去的字节数（管道满/非阻塞时可能小于 `len`），`-1`
+  一个都没写进去；管道缓冲（Linux 64 KiB）满了写端会阻塞。
+* `close_read`/`close_write`/`close_all`，重复关返回 0；**写端不关，read 永远
+  等不到 EOF**。`read_fd`/`write_fd`/`is_open` 查状态。
+* 管道没有消息边界；要边界用 `std.container.chan` 或自己加长度前缀。
+
+### `poll`：同时等多个 fd
+
+```c
+import std.os.poll;
+
+if (wait_readable(fd, 1000))         /* 1 就绪 / 0 超时 / -1 出错 */
+    ;
+
+PollSet set = { 0 };
+set.add(fd_a, EVENT_READ);
+set.add(fd_b, EVENT_READ | EVENT_HUP);
+if (set.wait(500) > 0) {
+    int i = 0;
+    for (i = 0; i < set.count(); i++)
+        if (set.is_ready(i)) { ... }
+}
+```
+
+* `PollSet` 里是 `POLL_MAX`（32）个 `struct pollfd`，不分配；`add` 同一个 fd 第二次
+  是改事件（返回原槽位），满了返回 -1；`modify`/`remove_fd`/`find`/`count`/`fd_at`。
+* `wait(timeout_ms)`：`<0` 永远等、`0` 立刻、`>0` 毫秒；返回就绪个数（0 超时、
+  -1 出错），被信号打断会重试；`is_ready(i)`/`ready(i)` 看结果，`clear_ready()` 清。
+* `EVENT_HUP`/`EVENT_ERROR` 也算就绪：对端关掉时给 `EVENT_HUP`（还有数据会同时给
+  `EVENT_READ`），接着 `read` 就是 EOF。
+* 单 fd：`wait_readable`/`wait_writable`/`wait_any(fd, events, ms)` 返回 1/0/-1。
+* 只等不读写：就绪之后该 `read`/`write`（`std.os.io`、`std.os.pipe`、`std.net.tcp`）。
+
 ### `Range`：能被 `foreach` 吃掉
 
 ```c
@@ -2701,6 +2800,31 @@ stdthread: 29 check(s), 0 failure(s)
 上一个生产者发 1..100、一个消费者求和（5050），关掉通道后消费者退出。
 Makefile 里显式列出六个模块正文（chan 依赖 sync，其余各自只依赖 types）。
 
+### 集成示例：`examples/stdterm.c6`
+
+```sh
+make std-term
+```
+
+```
+stdterm: 标准库第二十批（tty / signal / pipe / poll）
+tty: 伪终端 40x120，原始模式写入/读取/恢复都对
+signal: SIGUSR1 收到 2 次，屏蔽期间挂起后补投
+pipe: 5 字节往返、EOF、非阻塞 EAGAIN 都对
+poll: 2 个 fd 里第 2 个先就绪，单 fd 超时正常
+stdterm: 45 check(s), 0 failure(s)
+```
+
+四节：「终端」`posix_openpt` 开一对伪终端，`set_size(40, 120)` 之后读回、`width`/
+`height` 对得上，`raw` 之后从主端写两个字节、从端立刻读到，再 `restore`（环境
+没有 `/dev/pts` 时只跳过这一节，管道不是终端那两条照样跑）；「信号」装上
+`SIGUSR1` 处理函数收一次、`ignore(SIGUSR2)` 不跑处理函数、屏蔽 `SIGUSR1` 之后
+发信号只挂起不投递、`unblock` 补投一次、名字↔编号互转；「管道」写 5 字节读回来、
+关写端读到 EOF、非阻塞下 `EAGAIN`；「轮询」两个管道 fd 都没数据时 `wait(0)`
+返回 0，往第二个写一个字节之后 `wait(200)` 只有一个就绪、`ready(1)` 带
+`EVENT_READ`，单 fd 的 `wait_readable` 超时/就绪都对。Makefile 里显式列出六个
+模块正文（tty/signal/pipe/poll 都只依赖 `std/core/types.c6`）。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -2734,6 +2858,8 @@ Makefile 里显式列出六个模块正文（chan 依赖 sync，其余各自只�
 * `make std-algo`：`examples/stdalgo.c6`，第十八批（算法与容器）模块的拼装
   示例（自带自检）。
 * `make std-thread`：`examples/stdthread.c6`，第十九批（并发与同步）模块的拼装
+  示例（自带自检）。
+* `make std-term`：`examples/stdterm.c6`，第二十批（终端与进程控制）模块的拼装
   示例（自带自检）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

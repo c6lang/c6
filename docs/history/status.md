@@ -1031,3 +1031,28 @@ thread 在 sync 之上给出线程池，chan 又在 sync 之上给出通道：
 
 验收：`make stdtest`（89 个模块、0 failure）、`make std-thread`（29 条自检全过）、
 `make check-all`。
+
+### 11.32 标准库第二十批（tty / signal / pipe / poll）
+
+第二十批补的是**终端与进程控制**：前面几批有了进程（`std.os.proc`）、套接字
+（`std.net.tcp`）和流抽象（`std.os.io`），但「这是不是终端、窗口多大、怎么进
+原始模式」、「怎么接信号」、「怎么用字节流把两个执行流接起来」、「怎么同时等
+一堆 fd」这一层还空着。四个模块都是 POSIX 的薄封装，全部零分配：
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.os.tty` | `is_tty`、窗口大小、原始模式 | `size` 失败不动输出参数（调用方的默认值不被踩）；`TtyMode` 保存整个 `termios`，`raw` 对非终端返回 0 且不改状态；`restore` 幂等（重复调用返回 0、无副作用）；只做本地终端，伪终端分配留给调用方直接调 libc |
+| `std.os.signal` | `install`/`ignore`/`reset`、屏蔽、发送、名字↔编号 | 名字统一成动词，避开 libc 的 `signal`/`raise`/`kill`（同 TU 同名声明会打架）；`install` 带 `SA_RESTART`；`block`/`unblock` 改的是当前线程的屏蔽字，`is_pending` 查挂起集合；20 个常用信号的名字表，带不带 `SIG` 前缀都认 |
+| `std.os.pipe` | 匿名管道 | 结构里带 `opened` 标记——`{ 0 }` 之后两个 fd 都是 0（stdin），不能靠 fd 判断是否打开；读/写都自己重试 `EINTR`，非阻塞用 `would_block()` 而不是让调用方比较 `errno`；`write_bytes` 返回实际字节数（可能部分写）；fd 带 `FD_CLOEXEC` |
+| `std.os.poll` | 多路等待 | `PollSet` 是固定 32 槽的 `struct pollfd` 数组（不分配、不跨界）；`add` 同一个 fd 第二次是改事件，不会重复占槽；`wait` 返回就绪个数，`EVENT_HUP`/`EVENT_ERROR` 也算就绪；单 fd 的 `wait_readable`/`wait_writable` 是 1/0/-1 的便捷入口 |
+
+错误号段继续追加（`tcc/tccgen.c` 的 `c6_err_std_slots[]`）：`std.os.tty`=0x6059、
+`std.os.signal`=0x605a、`std.os.pipe`=0x605b、`std.os.poll`=0x605c；`grammar.md`
+§8.1 的表同步。`Makefile` 增加 `std-term` 与 `STDTERM_SRCS`（四个模块都只依赖
+`std/core/types.c6`，所以 `stdtest` 不需要额外依赖），`test-all`/`check-all` 都
+带上它。示例 `examples/stdterm.c6` 用 `posix_openpt` 开一对伪终端做 tty 那节
+（环境没有 `/dev/pts` 时只跳过这一节），其余三节只依赖管道，所以整份示例在任何
+POSIX 环境里都能跑。
+
+验收：`make stdtest`（93 个模块、0 failure）、`make std-term`（45 条自检全过）、
+`make check-all`。

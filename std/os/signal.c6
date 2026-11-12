@@ -1,0 +1,289 @@
+/* std/os/signal：信号处理、屏蔽与发送（POSIX sigaction 的薄封装）。
+ *
+ *     import std.os.signal;
+ *
+ *     install(SIGINT, &on_ctrl_c);      // 自己的处理函数（SA_RESTART）
+ *     ignore(SIGPIPE);                  // 写断掉的 socket 不要杀进程
+ *     block(SIGUSR1);                   // 临界区里先屏蔽
+ *     unblock(SIGUSR1);
+ *     send_self(SIGUSR1);               // raise：给自己发一个
+ *
+ * 这一层只做四件事：**装处理函数**、**忽略/恢复默认**、**屏蔽/解除屏蔽**、
+ * **发信号**。名字统一成动词，避免和 libc 的 `signal`/`raise`/`kill` 撞名
+ * （同名声明在同一个 TU 里会打架）。
+ *
+ * 约定：
+ *
+ * - `install(sig, handler)` 用 `sigaction` 装，带 `SA_RESTART`：被信号打断的
+ *   `read`/`write` 会自动重来，处理函数返回后继续跑。返回 1/0。
+ * - `ignore(sig)` 装 `SIG_IGN`；`reset(sig)` 装 `SIG_DFL`（**恢复默认之后
+ *   再收到这个信号就按系统默认动作处理**，比如 SIGUSR1 会杀掉进程）。
+ * - `block(sig)`/`unblock(sig)` 改的是**当前线程**的屏蔽字（`sigprocmask`），
+ *   屏蔽期间发的信号挂起，解除后立刻投递；`is_blocked`/`is_pending` 查询。
+ * - `send_self(sig)` 是 `raise`、`send_to(pid, sig)` 是 `kill`（`pid > 0` 发给
+ *   进程、`0` 发给同进程组、`-1` 发给所有有权限的进程）。成功 1/0。
+ * - `signal_name(sig)`/`signal_number("SIGTERM")` 在名字和编号之间转，名字带
+ *   不带 `SIG` 前缀都认；未知的给 0。
+ * - 处理函数里只该做「置一个 `volatile` 标志」这类异步信号安全的事：不要
+ *   `printf`、不要分配、不要加锁。
+ */
+#define _GNU_SOURCE 1
+
+#include <errno.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+
+module std.os.signal;
+import std.core.types;
+
+/* 装处理函数（SA_RESTART：被信号打断的慢系统调用自动重来） */
+int install(int sig, void (*handler)(int))
+{
+    struct sigaction sa = { 0 };
+
+    if (sig <= 0 || !handler)
+        return 0;
+    sa.sa_handler = handler;
+    if (sigemptyset(&sa.sa_mask) != 0)
+        return 0;
+    sa.sa_flags = SA_RESTART;
+    return sigaction(sig, &sa, 0) == 0;
+}
+
+/* 忽略这个信号 */
+int ignore(int sig)
+{
+    struct sigaction sa = { 0 };
+
+    if (sig <= 0)
+        return 0;
+    sa.sa_handler = SIG_IGN;
+    if (sigemptyset(&sa.sa_mask) != 0)
+        return 0;
+    return sigaction(sig, &sa, 0) == 0;
+}
+
+/* 恢复系统默认动作 */
+int reset(int sig)
+{
+    struct sigaction sa = { 0 };
+
+    if (sig <= 0)
+        return 0;
+    sa.sa_handler = SIG_DFL;
+    if (sigemptyset(&sa.sa_mask) != 0)
+        return 0;
+    return sigaction(sig, &sa, 0) == 0;
+}
+
+/* 改当前线程屏蔽字的公共部分 */
+static int mask_change(int sig, int how)
+{
+    sigset_t set = { 0 };
+
+    if (sig <= 0)
+        return 0;
+    if (sigemptyset(&set) != 0)
+        return 0;
+    if (sigaddset(&set, sig) != 0)
+        return 0;
+    return sigprocmask(how, &set, 0) == 0;
+}
+
+/* 屏蔽：信号挂起，不投递 */
+int block(int sig) { return mask_change(sig, SIG_BLOCK); }
+
+/* 解除屏蔽：挂起的信号在这里投递 */
+int unblock(int sig) { return mask_change(sig, SIG_UNBLOCK); }
+
+/* 屏蔽字里有这个信号？ */
+int is_blocked(int sig)
+{
+    sigset_t cur = { 0 };
+
+    if (sig <= 0)
+        return 0;
+    if (sigprocmask(SIG_BLOCK, 0, &cur) != 0)
+        return 0;
+    return sigismember(&cur, sig) == 1;
+}
+
+/* 有没有挂起的这个信号？ */
+int is_pending(int sig)
+{
+    sigset_t pend = { 0 };
+
+    if (sig <= 0)
+        return 0;
+    if (sigpending(&pend) != 0)
+        return 0;
+    return sigismember(&pend, sig) == 1;
+}
+
+/* 给自己发一个（raise） */
+int send_self(int sig)
+{
+    if (sig <= 0)
+        return 0;
+    return raise(sig) == 0;
+}
+
+/* 发给别的进程（kill）：pid > 0 单个进程、0 同进程组、-1 所有有权限的 */
+int send_to(int pid, int sig)
+{
+    if (sig <= 0)
+        return 0;
+    return kill(pid, sig) == 0;
+}
+
+/* 信号编号 → 名字；未知返回 0 */
+const char *signal_name(int sig)
+{
+    switch (sig) {
+    case SIGHUP:    return "SIGHUP";
+    case SIGINT:    return "SIGINT";
+    case SIGQUIT:   return "SIGQUIT";
+    case SIGILL:    return "SIGILL";
+    case SIGABRT:   return "SIGABRT";
+    case SIGFPE:    return "SIGFPE";
+    case SIGKILL:   return "SIGKILL";
+    case SIGSEGV:   return "SIGSEGV";
+    case SIGPIPE:   return "SIGPIPE";
+    case SIGALRM:   return "SIGALRM";
+    case SIGTERM:   return "SIGTERM";
+    case SIGUSR1:   return "SIGUSR1";
+    case SIGUSR2:   return "SIGUSR2";
+    case SIGCHLD:   return "SIGCHLD";
+    case SIGCONT:   return "SIGCONT";
+    case SIGSTOP:   return "SIGSTOP";
+    case SIGTSTP:   return "SIGTSTP";
+    case SIGTTIN:   return "SIGTTIN";
+    case SIGTTOU:   return "SIGTTOU";
+    case SIGWINCH:  return "SIGWINCH";
+    }
+    return 0;
+}
+
+/* 名字 → 编号（带不带 SIG 前缀都认）；未知返回 0 */
+int signal_number(const char *name)
+{
+    int i = 0;
+    /* 常用信号表：解析名字时逐个比，省得手写一串 if */
+    static const int ids[] = { SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGABRT,
+                               SIGFPE, SIGKILL, SIGSEGV, SIGPIPE, SIGALRM,
+                               SIGTERM, SIGUSR1, SIGUSR2, SIGCHLD, SIGCONT,
+                               SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGWINCH };
+
+    if (!name)
+        return 0;
+    for (i = 0; i < (int)(sizeof(ids) / sizeof(ids[0])); i++) {
+        const char *want = signal_name(ids[i]);
+
+        if (!want)
+            continue;
+        if (!strcmp(name, want))
+            return ids[i];
+        if (strncmp(name, "SIG", 3) != 0 && !strcmp(name, want + 3))
+            return ids[i];
+    }
+    return 0;
+}
+
+/* ==== 测试 ==== */
+
+static volatile int t_hits;
+static volatile int t_other;
+
+static void on_usr1(int sig)
+{
+    (void)sig;
+    t_hits = t_hits + 1;
+}
+
+static void on_usr2(int sig)
+{
+    (void)sig;
+    t_other = t_other + 1;
+}
+
+test "装处理函数：收到信号时跑自己的函数" {
+    t_hits = 0;
+    if (!install(SIGUSR1, &on_usr1))
+        return err(1, "install");
+    if (!send_self(SIGUSR1))
+        return err(2, "send_self");
+    if (t_hits != 1)
+        return err(3, "处理函数没有跑");
+    /* 再装一次（覆盖）仍然工作 */
+    if (!install(SIGUSR1, &on_usr1))
+        return err(4, "重复 install");
+    if (!send_self(SIGUSR1) || t_hits != 2)
+        return err(5, "第二次没有跑");
+    /* 参数检查 */
+    if (install(0, &on_usr1) || install(SIGUSR1, 0) || send_self(0))
+        return err(6, "非法参数应当失败");
+}
+
+test "忽略与默认：SIG_IGN 不跑处理函数" {
+    t_other = 0;
+    if (!ignore(SIGUSR2))
+        return err(1, "ignore");
+    if (!send_self(SIGUSR2))
+        return err(2, "发了 SIG_IGN 的信号应当照样成功");
+    if (t_other != 0)
+        return err(3, "SIG_IGN 不该叫处理函数");
+    /* 换回自己的处理函数，确认还能收到 */
+    if (!install(SIGUSR2, &on_usr2))
+        return err(4, "install");
+    if (!send_self(SIGUSR2) || t_other != 1)
+        return err(5, "换回处理函数之后应当收到");
+    /* reset 只改设置：这里不发送，免得按默认动作把测试进程杀掉 */
+    if (!reset(SIGUSR2))
+        return err(6, "reset");
+}
+
+test "屏蔽与挂起：解除屏蔽时才投递" {
+    int before = 0;
+    int i = 0;
+
+    t_hits = 0;
+    if (!install(SIGUSR1, &on_usr1))
+        return err(1, "install");
+    if (!block(SIGUSR1) || !is_blocked(SIGUSR1))
+        return err(2, "block");
+    before = t_hits;
+    if (!send_self(SIGUSR1))
+        return err(3, "send_self");
+    if (t_hits != before)
+        return err(4, "屏蔽期间不该投递");
+    if (!is_pending(SIGUSR1))
+        return err(5, "信号应当在挂起集合里");
+    if (!unblock(SIGUSR1) || is_blocked(SIGUSR1))
+        return err(6, "unblock");
+    /* 解除屏蔽之后立刻投递；给调度留一点余地再断言 */
+    for (i = 0; i < 1000 && t_hits == before; i++)
+        ;
+    if (t_hits != before + 1)
+        return err(7, "解除屏蔽后应当补投一次");
+    if (is_pending(SIGUSR1))
+        return err(8, "投递之后不该还挂起");
+}
+
+test "名字与编号互转" {
+    if (!signal_name(SIGINT) || strcmp(signal_name(SIGINT), "SIGINT") != 0)
+        return err(1, "signal_name(SIGINT)");
+    if (!signal_name(SIGTERM) || strcmp(signal_name(SIGTERM), "SIGTERM") != 0)
+        return err(2, "signal_name(SIGTERM)");
+    if (signal_name(0) != 0 || signal_name(12345) != 0)
+        return err(3, "未知信号应当是 0");
+    if (signal_number("SIGUSR1") != SIGUSR1)
+        return err(4, "带前缀");
+    if (signal_number("USR1") != SIGUSR1)
+        return err(5, "不带前缀");
+    if (signal_number("SIGWINCH") != SIGWINCH)
+        return err(6, "SIGWINCH");
+    if (signal_number("SIG") != 0 || signal_number("") != 0
+        || signal_number(0) != 0 || signal_number("SIGBOGUS") != 0)
+        return err(7, "未知名字应当是 0");
+}

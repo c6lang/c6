@@ -1,0 +1,191 @@
+/* stdterm：标准库第二十批（tty / signal / pipe / poll）的拼装示例。
+ *
+ * 和前几批一样：这个文件没有 `module`（入口 `main` 只能写在模块外的文件里），
+ * 四节各带自检，失败打 FAIL，最后按失败数决定退出码。
+ *
+ * 四节讲的是一条「进程外围」链路：
+ *
+ *   - tty：拿一个伪终端，问它多大、进原始模式读两个字节、再恢复；
+ *   - signal：装处理函数、忽略、屏蔽→挂起→补投；
+ *   - pipe：写进去读出来、写端关掉读到 EOF、非阻塞下 EAGAIN；
+ *   - poll：同时等两个 fd，看谁先就绪；单个 fd 的超时等待。
+ *
+ * 编译（import 只带来声明，模块正文要单独列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdterm \
+ *         examples/stdterm.c6 std/core/types.c6 std/os/tty.c6 \
+ *         std/os/signal.c6 std/os/pipe.c6 std/os/poll.c6
+ */
+#define _GNU_SOURCE 1
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+import std.core.types;
+import std.os.tty;
+import std.os.signal;
+import std.os.pipe;
+import std.os.poll;
+
+static int checks = 0;
+static int fails = 0;
+
+static void check(int cond, char *what)
+{
+    checks++;
+    if (!cond) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+/* ---- tty：伪终端、窗口大小、原始模式 ---- */
+static void tour_tty(void)
+{
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    int slave = -1;
+    char *name = 0;
+    int rows = 0, cols = 0;
+    TtyMode mode = { 0 };
+    char buf[4] = { 0 };
+
+    if (master < 0) {
+        printf("tty: 环境里没有 /dev/pts，跳过伪终端部分\n");
+    } else {
+        if (grantpt(master) == 0 && unlockpt(master) == 0)
+            name = ptsname(master);
+        if (name)
+            slave = open(name, O_RDWR | O_NOCTTY);
+        check(slave >= 0, "tty: 打开伪终端从端");
+        check(is_tty(slave) == 1, "tty: 从端是终端");
+        check(is_tty(-1) == 0, "tty: 无效 fd 不是终端");
+        check(set_size(slave, 40, 120) == 1, "tty: 设置窗口大小");
+        check(size(slave, &rows, &cols) == 1 && rows == 40 && cols == 120,
+              "tty: 读回窗口大小");
+        check(width(slave) == 120 && height(slave) == 40, "tty: width/height");
+        check(mode.raw(slave) == 1 && mode.is_active() == 1, "tty: 进原始模式");
+        check(write(master, "ab", 2) == 2, "tty: 主端写两个字节");
+        check(read(slave, buf, 2) == 2 && buf[0] == 'a' && buf[1] == 'b',
+              "tty: 原始模式下立刻读到");
+        check(mode.restore() == 1 && mode.is_active() == 0, "tty: 恢复终端");
+        if (slave >= 0)
+            close(slave);
+        close(master);
+        printf("tty: 伪终端 40x120，原始模式写入/读取/恢复都对\n");
+    }
+    /* 管道不是终端：这条不依赖环境 */
+    {
+        int fds[2] = { -1, -1 };
+
+        if (pipe(fds) == 0) {
+            check(is_tty(fds[0]) == 0, "tty: 管道不是终端");
+            check(size(fds[0], &rows, &cols) == 0, "tty: 管道没有窗口大小");
+            close(fds[0]);
+            close(fds[1]);
+        }
+    }
+}
+
+/* ---- signal：处理函数、忽略、屏蔽与补投 ---- */
+static volatile int sig_hits;
+
+static void on_usr1(int sig)
+{
+    (void)sig;
+    sig_hits = sig_hits + 1;
+}
+
+static void tour_signal(void)
+{
+    int before = 0;
+    int i = 0;
+
+    sig_hits = 0;
+    check(install(SIGUSR1, &on_usr1) == 1, "signal: 装 SIGUSR1 处理函数");
+    check(send_self(SIGUSR1) == 1 && sig_hits == 1, "signal: 收到 SIGUSR1");
+    check(ignore(SIGUSR2) == 1, "signal: 忽略 SIGUSR2");
+    check(send_self(SIGUSR2) == 1 && sig_hits == 1,
+          "signal: 忽略之后不跑处理函数");
+    check(block(SIGUSR1) == 1 && is_blocked(SIGUSR1) == 1, "signal: 屏蔽 SIGUSR1");
+    before = sig_hits;
+    check(send_self(SIGUSR1) == 1 && sig_hits == before, "signal: 屏蔽期间不投递");
+    check(is_pending(SIGUSR1) == 1, "signal: 信号挂在挂起集合里");
+    check(unblock(SIGUSR1) == 1 && is_blocked(SIGUSR1) == 0, "signal: 解除屏蔽");
+    for (i = 0; i < 1000 && sig_hits == before; i++)
+        ;
+    check(sig_hits == before + 1, "signal: 解除屏蔽后补投一次");
+    check(signal_name(SIGTERM) != 0 && strcmp(signal_name(SIGTERM), "SIGTERM") == 0,
+          "signal: SIGTERM 的名字");
+    check(signal_number("USR1") == SIGUSR1 && signal_number("NOPE") == 0,
+          "signal: 名字转编号");
+    printf("signal: SIGUSR1 收到 %d 次，屏蔽期间挂起后补投\n", sig_hits);
+}
+
+/* ---- pipe：写、读、EOF、非阻塞 ---- */
+static void tour_pipe(void)
+{
+    Pipe p = { 0 };
+    Pipe nb = { 0 };
+    char buf[16] = { 0 };
+
+    check(p.init() == 1 && p.is_open(), "pipe: 打开");
+    check(p.write_bytes("hello", 5) == 5, "pipe: 写 5 字节");
+    check(p.read_bytes(buf, sizeof(buf)) == 5 && strncmp(buf, "hello", 5) == 0,
+          "pipe: 读回来");
+    check(p.close_write() == 1, "pipe: 关写端");
+    check(p.read_bytes(buf, sizeof(buf)) == 0, "pipe: 写端关掉之后是 EOF");
+    check(p.close_all() == 1 && !p.is_open(), "pipe: 关掉两端");
+
+    check(nb.init_nonblock() == 1, "pipe: 非阻塞打开");
+    check(nb.read_bytes(buf, sizeof(buf)) == -1 && would_block() == 1,
+          "pipe: 非阻塞没数据是 EAGAIN");
+    check(nb.write_bytes("x", 1) == 1, "pipe: 非阻塞写");
+    check(nb.read_bytes(buf, sizeof(buf)) == 1 && buf[0] == 'x', "pipe: 读到那一个字节");
+    nb.close_all();
+    printf("pipe: 5 字节往返、EOF、非阻塞 EAGAIN 都对\n");
+}
+
+/* ---- poll：多个 fd 谁先就绪、单 fd 超时 ---- */
+static void tour_poll(void)
+{
+    int a[2] = { -1, -1 };
+    int b[2] = { -1, -1 };
+    char c = 'b';
+    PollSet set = { 0 };
+
+    if (pipe(a) != 0 || pipe(b) != 0) {
+        printf("poll: 管道开不出来，跳过\n");
+        return;
+    }
+    check(set.init() == 1 && set.count() == 0, "poll: 集合初始化");
+    check(set.add(a[0], EVENT_READ) == 0, "poll: 加第一个 fd");
+    check(set.add(b[0], EVENT_READ) == 1, "poll: 加第二个 fd");
+    check(set.count() == 2, "poll: 两个 fd");
+    check(set.wait(0) == 0, "poll: 都没数据时立刻返回 0");
+    check(wait_readable(a[0], 20) == 0, "poll: 单 fd 等 20ms 超时");
+    check(write(b[1], &c, 1) == 1, "poll: 往第二个 fd 写");
+    check(set.wait(200) == 1, "poll: 只有一个就绪");
+    check(set.is_ready(0) == 0 && set.is_ready(1) == 1, "poll: 就绪的是第二个");
+    check((set.ready(1) & EVENT_READ) != 0, "poll: 第二个可读");
+    check(set.fd_at(1) == b[0], "poll: fd_at");
+    check(wait_readable(b[0], 0) == 1 && wait_writable(b[1], 0) == 1,
+          "poll: 单 fd 可读可写");
+    close(a[0]); close(a[1]);
+    close(b[0]); close(b[1]);
+    printf("poll: 2 个 fd 里第 2 个先就绪，单 fd 超时正常\n");
+}
+
+int main(void)
+{
+    printf("stdterm: 标准库第二十批（tty / signal / pipe / poll）\n");
+    tour_tty();
+    tour_signal();
+    tour_pipe();
+    tour_poll();
+    printf("stdterm: %d check(s), %d failure(s)\n", checks, fails);
+    return fails ? 1 : 0;
+}

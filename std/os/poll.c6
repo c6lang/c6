@@ -1,0 +1,357 @@
+/* std/os/poll：同时等多个 fd（`poll(2)` 的薄封装）。
+ *
+ *     import std.os.poll;
+ *
+ *     int fds[2] = { -1, -1 };
+ *     pipe(fds);
+ *     if (wait_readable(fds[0], 1000))    // 1 就绪 / 0 超时 / -1 出错
+ *         ;
+ *
+ *     PollSet set = { 0 };
+ *     set.add(fds[0], EVENT_READ | EVENT_HUP);
+ *     set.add(sock, EVENT_READ);
+ *     if (set.wait(500) > 0) {            // 就绪的 fd 个数
+ *         int i = 0;
+ *         for (i = 0; i < set.count(); i++) {
+ *             if (set.is_ready(i))
+ *                 ;                       // 处理 set.fd_at(i)
+ *         }
+ *     }
+ *
+ * 为什么要有它：`read` 会阻塞，要「哪个先来就读哪个」只能同时等一堆 fd。
+ * `wait_readable`/`wait_writable` 是单个 fd 的超时等待（超时返回 0，不阻塞
+ * 永远），`PollSet` 是多个 fd 的集合。两者都不分配内存：`PollSet` 里就是
+ * `POLL_MAX`（32）个 `struct pollfd`，超了 `add` 返回 -1。
+ *
+ * 约定：
+ *
+ * - 事件位直接用系统常量：`EVENT_READ`/`EVENT_WRITE`/`EVENT_ERROR`/`EVENT_HUP`/
+ *   `EVENT_INVALID`（就是 `POLLIN`/`POLLOUT`/…），可以按位或。
+ * - `wait(timeout_ms)`：`timeout_ms < 0` 永远等、`0` 立刻返回、`> 0` 最多等
+ *   这么多毫秒；返回**就绪个数**（0 是超时，-1 是出错），被信号打断会重试。
+ * - 判断就绪用 `is_ready(i)`（`revents != 0`）或 `ready(i)` 拿原始位；`EVENT_HUP`
+ *   和 `EVENT_ERROR` 也算就绪——对端关掉时给 `EVENT_HUP`（管道里还有数据时
+ *   会同时给 `EVENT_READ`），接着 `read` 就是 EOF，所以「还有数据」和「对端
+ *   走了」要分开处理。
+ * - `add(fd, events)` 同一个 fd 加第二次是**改事件**（返回原来的槽位），不会
+ *   重复占槽；`remove_fd` 删掉并把后面的往前挪；`modify(fd, events)` 改事件；
+ *   `find(fd)` 找槽位，没有 -1；`count()` 是当前 fd 个数。
+ * - `wait_readable`/`wait_writable`/`wait_any` 只等一个 fd，返回 1/0/-1；
+ *   它们不等 `EVENT_HUP` 也想知道的场景请直接用 `PollSet`。
+ * - 这是等待层，不读不写：等到就绪之后该 `read`/`write`（`std.os.io`、管道、
+ *   `std.net.tcp`）还是你的事；非阻塞 fd 配 `poll` 是标准组合。
+ */
+#define _GNU_SOURCE 1
+
+#include <errno.h>
+#include <poll.h>
+#include <string.h>
+#include <unistd.h>
+
+module std.os.poll;
+import std.core.types;
+
+/* 一次最多等多少个 fd */
+#define POLL_MAX 32
+
+/* 事件位：就是 poll(2) 的常量，按位或 */
+#define EVENT_READ    POLLIN
+#define EVENT_WRITE   POLLOUT
+#define EVENT_ERROR   POLLERR
+#define EVENT_HUP     POLLHUP
+#define EVENT_INVALID POLLNVAL
+
+/* 一个 fd 集合：固定 32 个槽，不分配 */
+struct PollSet {
+    struct pollfd fds[POLL_MAX];
+    int used;
+    int nready;
+};
+
+/* 清空集合（结构体 `{ 0 }` 之后也可以直接 add） */
+int init(PollSet *self)
+{
+    if (!self)
+        return 0;
+    memset(self->fds, 0, sizeof(self->fds));
+    self->used = 0;
+    self->nready = 0;
+    return 1;
+}
+
+/* 找 fd 的槽位；没有 -1 */
+int find(PollSet *self, int fd)
+{
+    int i = 0;
+
+    if (!self || fd < 0)
+        return -1;
+    for (i = 0; i < self->used; i++) {
+        if (self->fds[i].fd == fd)
+            return i;
+    }
+    return -1;
+}
+
+/* 加一个 fd；同一个 fd 再加就是改事件。返回槽位，满了/参数错 -1 */
+int add(PollSet *self, int fd, int events)
+{
+    int i = 0;
+
+    if (!self || fd < 0)
+        return -1;
+    i = find(self, fd);
+    if (i >= 0) {
+        self->fds[i].events = (short)events;
+        self->fds[i].revents = 0;
+        return i;
+    }
+    if (self->used >= POLL_MAX)
+        return -1;
+    i = self->used;
+    self->fds[i].fd = fd;
+    self->fds[i].events = (short)events;
+    self->fds[i].revents = 0;
+    self->used = self->used + 1;
+    return i;
+}
+
+/* 改事件；fd 不在集合里返回 0 */
+int modify(PollSet *self, int fd, int events)
+{
+    int i = find(self, fd);
+
+    if (i < 0)
+        return 0;
+    self->fds[i].events = (short)events;
+    self->fds[i].revents = 0;
+    return 1;
+}
+
+/* 删掉一个 fd（后面的往前挪）；不在集合里返回 0 */
+int remove_fd(PollSet *self, int fd)
+{
+    int i = find(self, fd);
+    int j = 0;
+
+    if (i < 0)
+        return 0;
+    for (j = i + 1; j < self->used; j++)
+        self->fds[j - 1] = self->fds[j];
+    self->used = self->used - 1;
+    if (self->used >= 0 && self->used < POLL_MAX) {
+        self->fds[self->used].fd = 0;
+        self->fds[self->used].events = 0;
+        self->fds[self->used].revents = 0;
+    }
+    return 1;
+}
+
+int count(PollSet *self) { return self ? self->used : 0; }
+
+int fd_at(PollSet *self, int i)
+{
+    if (!self || i < 0 || i >= self->used)
+        return -1;
+    return self->fds[i].fd;
+}
+
+/* 槽 i 的原始 revents */
+int ready(PollSet *self, int i)
+{
+    if (!self || i < 0 || i >= self->used)
+        return 0;
+    return (int)self->fds[i].revents;
+}
+
+/* 槽 i 就绪了吗（含 HUP/ERR） */
+int is_ready(PollSet *self, int i)
+{
+    return ready(self, i) != 0;
+}
+
+/* 清掉所有 revents，fd 和事件保留 */
+int clear_ready(PollSet *self)
+{
+    int i = 0;
+
+    if (!self)
+        return 0;
+    for (i = 0; i < self->used; i++)
+        self->fds[i].revents = 0;
+    self->nready = 0;
+    return 1;
+}
+
+/* 等就绪：>0 就绪个数、0 超时、-1 出错；timeout_ms < 0 永远等 */
+int wait(PollSet *self, int timeout_ms)
+{
+    int n = 0;
+
+    if (!self || self->used < 0 || self->used > POLL_MAX)
+        return -1;
+    self->nready = 0;
+    for (;;) {
+        n = (int)poll(self->fds, (nfds_t)self->used, timeout_ms);
+        if (n >= 0)
+            break;
+        if (errno != EINTR)
+            return -1;
+    }
+    self->nready = n;
+    return n;
+}
+
+/* 等一个 fd 上的某些事件：1 就绪、0 超时、-1 出错 */
+int wait_any(int fd, int events, int timeout_ms)
+{
+    struct pollfd pfd = { 0 };
+    int n = 0;
+
+    if (fd < 0)
+        return -1;
+    pfd.fd = fd;
+    pfd.events = (short)events;
+    for (;;) {
+        n = (int)poll(&pfd, 1, timeout_ms);
+        if (n >= 0)
+            break;
+        if (errno != EINTR)
+            return -1;
+    }
+    return n > 0 ? 1 : 0;
+}
+
+/* 等可读（含对端关掉/出错）：1/0/-1 */
+int wait_readable(int fd, int timeout_ms)
+{
+    return wait_any(fd, EVENT_READ, timeout_ms);
+}
+
+/* 等可写：1/0/-1 */
+int wait_writable(int fd, int timeout_ms)
+{
+    return wait_any(fd, EVENT_WRITE, timeout_ms);
+}
+
+/* ==== 测试 ==== */
+
+test "单 fd：可读、可写与超时" {
+    int fds[2] = { -1, -1 };
+    char c = 'a';
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe");
+    /* 空管道：不可读、可写；只等 30ms 就会超时 */
+    if (wait_readable(fds[0], 0) != 0)
+        return err(2, "空管道不该可读");
+    if (wait_readable(fds[0], 30) != 0)
+        return err(3, "等 30ms 应当超时");
+    if (wait_writable(fds[1], 0) != 1)
+        return err(4, "空管道可写");
+    if (wait_any(fds[0], EVENT_READ | EVENT_WRITE, 0) != 0)
+        return err(5, "读端不可写");
+    if (write(fds[1], &c, 1) != 1)
+        return err(6, "写");
+    if (wait_readable(fds[0], 100) != 1)
+        return err(7, "写了之后就可读");
+    if (wait_any(-1, EVENT_READ, 0) != -1 || wait_any(fds[0], EVENT_READ, 0) != 1)
+        return err(8, "参数检查");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "PollSet：多个 fd 谁先就绪" {
+    int a[2] = { -1, -1 };
+    int b[2] = { -1, -1 };
+    char c = 'b';
+    PollSet set = { 0 };
+
+    if (pipe(a) != 0 || pipe(b) != 0)
+        return err(1, "pipe");
+    if (!set.init() || set.count() != 0)
+        return err(2, "init");
+    if (set.add(a[0], EVENT_READ) != 0)
+        return err(3, "add a");
+    if (set.add(b[0], EVENT_READ) != 1)
+        return err(4, "add b");
+    if (set.count() != 2)
+        return err(5, "count");
+    if (set.wait(0) != 0)
+        return err(6, "都没数据时不该就绪");
+    if (write(b[1], &c, 1) != 1)
+        return err(7, "往 b 写");
+    if (set.wait(200) != 1)
+        return err(8, "应当只有一个就绪");
+    if (set.is_ready(0) || !set.is_ready(1))
+        return err(9, "就绪的应当是第二个");
+    if ((set.ready(1) & EVENT_READ) == 0)
+        return err(10, "第二个应当是可读");
+    if (set.fd_at(1) != b[0] || set.fd_at(0) != a[0])
+        return err(11, "fd_at");
+    if (!set.clear_ready() || set.is_ready(1))
+        return err(12, "clear_ready");
+    close(a[0]); close(a[1]);
+    close(b[0]); close(b[1]);
+}
+
+test "对端关掉：HUP 也算就绪，接着读到 EOF" {
+    int fds[2] = { -1, -1 };
+    char buf[4] = { 0 };
+    PollSet set = { 0 };
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe");
+    close(fds[1]);                      /* 写端马上关掉 */
+    if (set.add(fds[0], EVENT_READ) != 0)
+        return err(2, "add");
+    if (set.wait(200) != 1)
+        return err(3, "对端关掉时应当立刻就绪");
+    if ((set.ready(0) & EVENT_HUP) == 0)
+        return err(4, "应当给 EVENT_HUP");
+    if (read(fds[0], buf, sizeof(buf)) != 0)
+        return err(5, "读到 EOF");
+    close(fds[0]);
+}
+
+test "增删改查：同一个 fd 不重复占槽、满了报 -1" {
+    int fds[2] = { -1, -1 };
+    PollSet set = { 0 };
+    int i = 0;
+
+    if (pipe(fds) != 0)
+        return err(1, "pipe");
+    if (set.add(fds[0], EVENT_READ) != 0 || set.count() != 1)
+        return err(2, "add");
+    /* 同一个 fd 再加一次：改事件，槽位不变 */
+    if (set.add(fds[0], EVENT_WRITE) != 0 || set.count() != 1)
+        return err(3, "重复 add 应当改事件");
+    if (!set.modify(fds[0], EVENT_READ) || set.find(fds[0]) != 0)
+        return err(4, "modify/find");
+    if (set.find(fds[1]) != -1)
+        return err(5, "没加过的 fd 找不到");
+    if (!set.remove_fd(fds[0]) || set.count() != 0 || set.remove_fd(fds[0]))
+        return err(6, "remove_fd");
+    /* 装满 32 个之后再加应当失败 */
+    for (i = 0; i < POLL_MAX; i++) {
+        if (set.add(1000 + i, EVENT_READ) != i)
+            return err(7, "填满集合");
+    }
+    if (set.count() != POLL_MAX || set.add(9999, EVENT_READ) != -1)
+        return err(8, "满了应当是 -1");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+test "空集合：只睡 timeout" {
+    PollSet set = { 0 };
+
+    if (!set.init())
+        return err(1, "init");
+    if (set.wait(10) != 0)
+        return err(2, "空集合等 10ms 应当返回 0");
+    if (set.wait(0) != 0)
+        return err(3, "空集合等 0 应当立刻返回 0");
+    if (set.add(-1, EVENT_READ) != -1)
+        return err(4, "非法 fd 应当加不进去");
+}
