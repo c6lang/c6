@@ -41,12 +41,19 @@ if(NOT "${C6_TCC_CONFIG_VARS}" STREQUAL "")
   set(TCC_EXTRA_CONFIG_VARS "${C6_TCC_CONFIG_VARS}")
 endif()
 
+# c6 自己的发布版本（根目录 VERSION）传给 tcc 侧，由 config.h 的 C6_VERSION
+# 宏带进编译期，`c6 -v` 打印的就是它；tcc/VERSION 仍只当上游兼容版本。
+set(C6_RELEASE_VERSION "${C6_VERSION_RAW}")
+
 add_subdirectory("${C6_TCC_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tcc")
 
 # 产物路径只通过 tcc::c6 / tcc::libtcc 暴露；这里只把父项目后续模块仍要
 # 用到的少量语义变量改名成 C6_*，不再在父子作用域之间散落 TCC_* 全局量。
+# C6_VERSION_RAW 不在这里赋值：它由顶层 CMakeLists.txt 按根目录 VERSION 设好，
+# 是 c6 的发布版本；tcc/VERSION 读回的 TCC_VERSION 只能当兼容版本用。
 
-set(C6_VERSION_RAW "${TCC_VERSION}")
+set(C6_TCC_VERSION "${TCC_VERSION}")
+set(C6_TCC_VERSION_NUMERIC "${TCC_VERSION_NUMERIC}")
 set(C6_VERSION_NUMERIC "${PROJECT_VERSION}")
 set(C6_LIBTCC_FILENAME "${TCC_LIBTCC_FILENAME}")
 set(C6_LIBTCC_KIND "${TCC_LIBTCC_KIND}")

@@ -27,6 +27,19 @@ file(READ "${TCC_SOURCE_DIR}/VERSION" TCC_VERSION)
 string(STRIP "${TCC_VERSION}" TCC_VERSION)
 string(REGEX MATCH "^[0-9]+(\\.[0-9]+)+" TCC_VERSION_NUMERIC "${TCC_VERSION}")
 
+# 可选的 c6 发布版本：父项目（仓库根 CMakeLists.txt）按根目录 VERSION 传入，
+# 写进 config.h 的 C6_VERSION，由 `c6 -v` 打印。这里刻意不读 tcc/VERSION ——
+# 那是内嵌上游 TinyCC 的兼容版本，跟 c6 自己的发布号是两件事。
+# 独立构建 tcc/ 时没有这个变量，config.h 里也就没有 C6_VERSION 宏。
+if(NOT DEFINED C6_RELEASE_VERSION)
+  set(C6_RELEASE_VERSION "")
+endif()
+if(C6_RELEASE_VERSION)
+  set(TCC_C6_VERSION_DEFINE "#define C6_VERSION \"${C6_RELEASE_VERSION}\"")
+else()
+  set(TCC_C6_VERSION_DEFINE "")
+endif()
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   project(tcc VERSION "${TCC_VERSION_NUMERIC}" LANGUAGES C
           DESCRIPTION "TinyCC/c6 compiler" HOMEPAGE_URL "https://github.com/c6lang/c6")

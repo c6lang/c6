@@ -2,6 +2,10 @@
 
 #define TCC_VERSION "@TCC_VERSION@"
 
+/* c6 自己的发布版本（仓库根 VERSION）；只有 c6 的 CMake 包装层会定义它，
+   独立构建 tcc/ 时为空，`c6 -v` 也就不打印这一行。 */
+@TCC_C6_VERSION_DEFINE@
+
 #define CC_NAME CC_@TCC_CC_NAME@
 #define GCC_MAJOR @TCC_GCC_MAJOR@
 #define GCC_MINOR @TCC_GCC_MINOR@
