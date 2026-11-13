@@ -7,6 +7,25 @@
 
 ## 未发布
 
+### 构建标志变了就全量重编（修 `tcc: error: no input files`）
+
+- `tcc/` 里的目标文件现在都依赖一份标志记录 `tcc/.c6-flags`（`CC` / `CFLAGS` /
+  `DEFINES` / `LDFLAGS` / `LIBS`）。标志一不同，下一次 `make` 就把对象全部重编，
+  **不管 make 是怎么被调起来的**。起因是 `make check-all` 在共享检出里挂在第一步：
+  `make -C tcc/lib` 用 `tcc/c6` 编 `libtcc1.c`，每个文件都只回一句
+  `tcc: error: no input files`。根因不是源码，而是产物混编：`-DC6_EXT` 会在
+  `tcc.h` 里给 `struct TCCState` 加字段（就在 `files` / `nb_files` 前面），有人用
+  不带 `EXTRA-DEFS` 的裸 `make -C tcc` 重编了 `tcc.o`（`config.mak` 的
+  `-Wall -O2`，没有 `-g`），其余对象还是 `make build` 的扩展构型；两边链接没意见，
+  驱动读 `s->nb_files` 读到了错位的槽位，于是所有输入都被当成「没有输入文件」。
+- `tcc/.c6-flags` 进 `.gitignore`，`make -C tcc clean` 一并删掉。
+- 顺带修掉上游模式（不定义 `C6_EXT`）真正的编译回归：`tccpp.c` 里
+  `s->c6_role` / `C6_ROLE_EXPR` 和 `hbody` / `wbody` 的声明、`tccgen.c` 里
+  `TOK_C6_ERR` 那个 `case` 漏了 `#ifdef C6_EXT`，`make build-plain` 根本编不过。
+  裸 `make -C tcc` 走的就是这条路线，所以现在两种构型都能自洽地编出来。
+- README、[docs/reference/cli.md](docs/reference/cli.md#构建) 各记一句：别手工删一部分
+  产物来「加快」构建，`make clean` 才是那个开关。
+
 ### `make check-all` 改成并发跑（共享路径的那组串行）
 
 - 完整验收里只有**共享 `build/` 下固定临时路径**的那一组（`stdtest` 和八十多个

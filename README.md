@@ -154,6 +154,11 @@ make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后
                   # CHECK_JOBS=1 make check-all 则整轮串行
 ```
 
+构建标志（`-DC6_EXT`、`CFLAGS`）记在 `tcc/.c6-flags` 里，所有目标文件都依赖它：
+切模式或换 `CFLAGS` 后下一次 `make` 自动全量重编。别手工删一部分产物——`C6_EXT`
+会改 `struct TCCState` 的布局，混编出来的 `c6` 能链接，但任何输入都报
+`tcc: error: no input files`（详见 [docs/reference/cli.md](docs/reference/cli.md#构建)）。
+
 每个目标的含义、自举三条路线怎么比对、`make help` 的完整目标表，见
 [docs/reference/cli.md](docs/reference/cli.md)；测试怎么组织、诊断用例怎么写，见
 [docs/manual/testing.md](docs/manual/testing.md)。

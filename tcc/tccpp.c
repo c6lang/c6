@@ -3833,7 +3833,9 @@ static int *macro_arg_subst(Sym **nested_list, const int *macro_str, Sym *args)
                     /* an 'expr' parameter stands for a value: put its
                        tokens in parentheses so that an operator inside the
                        argument cannot bind across the substitution */
+#ifdef C6_EXT
                     paren = s->c6_role == C6_ROLE_EXPR;
+#endif
                 }
                 if (paren)
                     tok_str_add(&str, '(');
@@ -4007,8 +4009,10 @@ static int macro_subst_tok(
         int *jstr = 0;
         Sym *sa = 0;
         int ret = 0;
-#ifdef C6_EXT
+        /* both stay NULL without C6_EXT: the frees below then match what the
+           upstream code did ('jstr != mstr', 'mstr != s->d') */
         int *hbody = NULL, *wbody = NULL;
+#ifdef C6_EXT
         if (s->type.t & MACRO_C6_LOCAL)
             mstr = hbody = c6_hygiene_body(v, mstr, s->next);
 #endif
