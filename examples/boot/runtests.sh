@@ -5,6 +5,7 @@
 #
 #   make fstest-bare-tests          # 有 KVM 用 KVM
 #   NO_KVM=1 make fstest-bare-tests # 纯软件模拟
+#   BARE_BUILD=build/bare/tests examples/boot/runtests.sh  # 换产物目录（默认 build/）
 #
 # 跳过的几个：它们要的东西裸机上真没有（不是运行时不行，是测试自己要用）
 #   gc_drop gc_thread thread thread_handle tuple_thread    spawn -> pthread_create
@@ -18,7 +19,7 @@ set -e
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-build=build
+build=${BARE_BUILD:-build}
 mkdir -p "$build"
 
 skip=" gc_drop gc_thread thread thread_handle tuple_thread defer_thread method async_highfd "
@@ -60,7 +61,8 @@ for src in tests/*.c6; do
         block_skipped="$block_skipped $name:$nblock"
     fi
 
-    if out=$(ONE_TU=$one examples/boot/build.sh "$src" $tu examples/boot/shim.plain.c \
+    if out=$(ONE_TU=$one BARE_BUILD="$build" \
+             examples/boot/build.sh "$src" $tu examples/boot/shim.plain.c \
              examples/boot/io.c "$build/harness_$name.c" 2>&1); then
         line=$(echo "$out" | grep 'test(s),' | tail -1)
         pass=$((pass + 1))

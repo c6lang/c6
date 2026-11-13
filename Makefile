@@ -7,7 +7,8 @@
 #   make test        跑 tests2 上游全量测试（扩展模式）
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量 + c6selfcheck + freestanding/裸机
-#   make check-all   test-all + C99 后端用例 + 三条自举路线 + 标准库（发布前跑这一条）
+#   make check-all   test-all + C99 后端用例 + 三条自举路线 + 标准库
+#                    （发布前跑这一条；五条车道并发，CHECK_SERIAL=1 则串行）
 #   make c99         C99 输出后端已内置在 tcc/c6（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
 #   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
@@ -35,6 +36,10 @@ SELFHOST     := build/selfhost
 SELFHOST_C6  := $(SELFHOST)/c6
 SELFHOST_C99 := $(SELFHOST)/c99
 SELFHOST_C99TCC := $(SELFHOST)/c99tcc
+# 裸机用例的产物目录：build.sh 默认写 build/{payload.*,boot.*,bare.img}，
+# 五条裸机用例（boot / tests / go / handle / smp）同时跑就会互相盖掉，
+# 所以每条各给一个目录（examples/boot/build.sh 认 BARE_BUILD）。
+BARE     := build/bare
 # 自举时编译 tcc 自己用的定义：ONE_SOURCE 把整个编译器塞进一个编译单元，
 # C6_EXT 打开 c6 扩展（与 make build 的 EXTRA-DEFS 一致）
 SELFHOST_DEFS := -DONE_SOURCE=1 -DC6_EXT
@@ -1506,7 +1511,9 @@ fstest-noos: build
 
 # 再用 qemu 的用户态模拟器跑一遍：不用本机的加载器，也不用 libc
 # （qemu-x86_64 自己实现 syscall；装了 qemu-user 才有这个命令）
-fstest-qemu: build
+# 跑的是上面三条编出来的程序：依赖得写明，否则 check-all 并发跑时
+# 会赶在 fstest/fstest-go/fstest-noos 产出之前启动。
+fstest-qemu: fstest fstest-go fstest-noos
 	@command -v qemu-x86_64 >/dev/null || { \
 	     echo "fstest-qemu: 没有 qemu-x86_64，跳过"; exit 0; }
 	qemu-x86_64 ./build/freestanding_fstr
@@ -1527,7 +1534,7 @@ fstest-bare: build
 	     echo "fstest-bare: 没有 qemu-system-x86_64，跳过"; exit 0; }
 	@command -v as >/dev/null || { \
 	     echo "fstest-bare: 没有 binutils，跳过"; exit 0; }
-	./examples/boot/build.sh
+	BARE_BUILD=$(BARE)/boot ./examples/boot/build.sh
 
 # 把 tests/*.c6 里的 test 块搬上裸机：每个文件配一层 libc 替身 + 自动生成的
 # 入口，跑在同一个 512 字节引导器上（见 examples/boot/runtests.sh）
@@ -1536,7 +1543,7 @@ fstest-bare-tests: build
 	     echo "fstest-bare-tests: 没有 qemu-system-x86_64，跳过"; exit 0; }
 	@command -v as >/dev/null || { \
 	     echo "fstest-bare-tests: 没有 binutils，跳过"; exit 0; }
-	./examples/boot/runtests.sh
+	BARE_BUILD=$(BARE)/tests ./examples/boot/runtests.sh
 
 # 裸机上的 go：自己写的抢占式调度器（8259A + 8254 + 中断里的上下文切换），
 # 两个没有让出语句的任务靠时钟抢占交错推进（examples/boot/{sched.plain.c,go_bare.c}）
@@ -1545,7 +1552,8 @@ fstest-bare-go: build
 	     echo "fstest-bare-go: 没有 qemu-system-x86_64，跳过"; exit 0; }
 	@command -v as >/dev/null || { \
 	     echo "fstest-bare-go: 没有 binutils，跳过"; exit 0; }
-	./examples/boot/build.sh examples/boot/go_bare.c6 examples/boot/sched.plain.c \
+	BARE_BUILD=$(BARE)/go ./examples/boot/build.sh \
+	    examples/boot/go_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
 # 裸机上的 spawn 句柄：h->join() 等到任务结束、h->value() 拿到返回值。
@@ -1555,38 +1563,66 @@ fstest-bare-handle: build
 	     echo "fstest-bare-handle: 没有 qemu-system-x86_64，跳过"; exit 0; }
 	@command -v as >/dev/null || { \
 	     echo "fstest-bare-handle: 没有 binutils，跳过"; exit 0; }
-	SMP=1 ./examples/boot/build.sh examples/boot/handle_bare.c6 \
-	    examples/boot/sched.plain.c examples/boot/shim.plain.c \
-	    examples/boot/io.c
+	BARE_BUILD=$(BARE)/handle SMP=1 ./examples/boot/build.sh \
+	    examples/boot/handle_bare.c6 examples/boot/sched.plain.c \
+	    examples/boot/shim.plain.c examples/boot/io.c
 
 fstest-bare-smp: build
 	@command -v qemu-system-x86_64 >/dev/null || { \
 	     echo "fstest-bare-smp: 没有 qemu-system-x86_64，跳过"; exit 0; }
 	@command -v as >/dev/null || { \
 	     echo "fstest-bare-smp: 没有 binutils，跳过"; exit 0; }
-	@SMP=2 EXTRA_CFLAGS=-DC6_SMP_CPUS=2 ./examples/boot/build.sh \
+	@BARE_BUILD=$(BARE)/smp2 SMP=2 EXTRA_CFLAGS=-DC6_SMP_CPUS=2 \
+	    ./examples/boot/build.sh \
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
-	@SMP=1 EXTRA_CFLAGS=-DC6_SMP_CPUS=1 ./examples/boot/build.sh \
+	@BARE_BUILD=$(BARE)/smp1 SMP=1 EXTRA_CFLAGS=-DC6_SMP_CPUS=1 \
+	    ./examples/boot/build.sh \
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util fstest fstest-go \
+# 标准库那一组目标：stdtest 把 std/ 下每个模块的 test 块逐个跑一遍，std-demo
+# 到 std-util 是三十批模块拼出来的集成示例。列成变量是因为 check-all 把整组
+# 当成一条「车道」串行跑（标准库的用例会往 build/ 下的固定路径写临时文件，
+# 见 scripts/check-all.sh），test-all 则把它们当普通的并列前置目标。
+STD_TARGETS := stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util
+
+test-all: selftest test c6selfcheck $(STD_TARGETS) fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
+
+# check-all 把完整验收拆成五条「车道」：车道之间并发跑，车道内部串行
+# （调度器是 scripts/check-all.sh，目标列表仍然写在这里）。
+#   tests     tests/ 下的用例（native + C99 两套宿主）和错误码号段表
+#   tests2    上游 tests2 全量
+#   selfhost  三条自举路线 + c6 源代码自检
+#   std       标准库（stdtest + 全部 std-* 示例）
+#   bare      freestanding / 裸机 / qemu 那一组
+# 之所以按车道并发而不是直接 make -j：std 家族的用例会往 build/ 下的固定
+# 路径写临时文件，裸机五连过去共用 build/bare.img，都只能串行；车道之间
+# 互不相干，才是能并发的那一刀。
+CHECK_LANE_TESTS    := selftest errcheck c99test c99tcc-test
+CHECK_LANE_TESTS2   := test
+CHECK_LANE_SELFHOST := c6selfcheck selfhost c99selfhost c99selfhost-tcc
+CHECK_LANE_BARE     := fstest fstest-go fstest-noos fstest-qemu \
+                       fstest-bare fstest-bare-tests fstest-bare-go \
+                       fstest-bare-handle fstest-bare-smp
 
 # 完整验收：test-all 之外还有 C99 后端的两套用例（96 组各跑一遍）和三条
 # 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 标准库的八十三个目标在这里显式列出（它们已经在 test-all 里，列出来是为了让
-# 「发布前这一条」的覆盖面一眼可见）：stdtest 是 std/ 下每个模块逐个跑
-# test 块（个数以 stdtest 的输出为准），std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img
-# 是三十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
-# check-all 的语义。
-check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util
+# 覆盖面没变，只是从「一条条串行排队」改成「五条车道并发」：跑完会打一张
+# 每车道的结果表，失败的用例照样带 [车道名] 前缀逐行打出来。
+# 想按老样子一条跑完再跑下一条：CHECK_SERIAL=1 make check-all。
+check-all: build
+	@CHECK_LANE_TESTS="$(CHECK_LANE_TESTS)" \
+	 CHECK_LANE_TESTS2="$(CHECK_LANE_TESTS2)" \
+	 CHECK_LANE_SELFHOST="$(CHECK_LANE_SELFHOST)" \
+	 CHECK_LANE_STD="$(STD_TARGETS)" \
+	 CHECK_LANE_BARE="$(CHECK_LANE_BARE)" \
+	 ./scripts/check-all.sh
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -1706,6 +1742,7 @@ c99selfhost-tcc: build
 
 clean:
 	rm -rf $(SELFHOST)
+	rm -rf $(BARE)
 	rm -f $(TCC_DIR)/libtcc1-*.a
 	@test -d $(TCC_DIR) && $(MAKE) -C $(TCC_DIR) clean || true
 
@@ -1736,6 +1773,8 @@ distclean:
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
 #                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img）
+#                    五条车道并发跑（tests / tests2 / selfhost / std / bare），
+#                    CHECK_SERIAL=1 则按车道顺序一条跑完再跑下一条
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
