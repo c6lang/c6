@@ -576,10 +576,10 @@ static int c6_ub_quote(char *dst, int cap, const char *a)
 
 static int c6_run_ub(int argc, char **argv)
 {
-    char cmd[8192];
-    char one[2048];
+    char cmd[8192] = { 0 };
+    char one[2048] = { 0 };
     const char *env = getenv("C6_STDUB");
-    const char *cand[3];
+    const char *cand[3] = { 0, 0, 0 };
     int k = 0, i = 0, ret = 0, nfiles = 0;
 
     for (i = 0; i < argc; i++)
