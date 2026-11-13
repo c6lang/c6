@@ -1,0 +1,497 @@
+/* std/data/mbox：mbox 分卷读取器（Unix mailbox）——按 `From ` 行切消息 + 头部游标。
+ *
+ *     import std.data.mbox;
+ *
+ *     MboxDoc d = { 0 };
+ *     MboxMsg m = { 0 };
+ *     d.open(text, len);                 // 游标：open / next / count / reset
+ *     while (d.next(&m)) {               // 1 = 一条消息，0 = 读完
+ *         MboxHdrDoc hd = { 0 };
+ *         MboxHdr h = { 0 };
+ *         hd.open_headers(&m, text);      // 头部游标：open_headers / next_header / get_header
+ *         while (hd.next_header(&h))     // h.name_off / h.name_len / h.val_off / h.val_len
+ *             ;
+ *         if (hd.get_header("Subject", &h))   // 名字大小写不敏感
+ *             ...
+ *         // m.body_off / m.body_len 是正文（含结尾空行）
+ *     }
+ *
+ * mbox 的规矩就两条，但都得守：
+ *
+ * - 一条消息从**行首**的 `From ` 开始（后面通常是发件人和日期，且没有冒号，
+ *   这是和 `From:` 头的区别）；
+ * - 下一条 `From ` 行就是上一条的结束；正文里出现的 `>From ` 是转义过的原文，
+ *   **不能**当分隔符。
+ *
+ * 头部区到第一个空行为止；以空格或制表符开头的行是上一行的续行（折叠头），
+ * `MboxHdr` 只给单行的值，`header_value()` 会把续行拼起来（折叠成单个空格）。
+ *
+ * 注意：头部游标的方法**故意不叫** `next`/`count`/`reset`——同名字、不同参数
+ * 类型的两个方法在同一个模块里会绑错（编译器按先定义的那个解析），所以这里
+ * 用 `next_header`/`header_count`/`reset_headers` 区分。
+ */
+#include <string.h>
+
+module std.data.mbox;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+struct MboxMsg {
+    int idx;
+    int from_off;               /* "From " 行的起点 */
+    int from_len;               /* 到行尾（不含换行） */
+    int hdr_off;
+    int hdr_end;
+    int body_off;
+    int body_len;
+    int nhdr;
+};
+
+struct MboxHdr {
+    int name_off;
+    int name_len;
+    int val_off;
+    int val_len;
+    int line;
+};
+
+struct MboxDoc {
+    const char *p;
+    int len;
+    int pos;
+    int seen;
+    int bad;
+};
+
+struct MboxHdrDoc {
+    const char *p;
+    int pos;
+    int end;
+    int start;
+    int seen;
+    int bad;
+};
+
+static int mbox_line(const char *p, int len, int pos, int *next)
+{
+    int end = pos;
+
+    while (end < len && p[end] != '\n')
+        end++;
+    *next = (end < len) ? end + 1 : end;
+    {
+        int n = end - pos;
+
+        if (n > 0 && p[pos + n - 1] == '\r')
+            n--;
+        return n;
+    }
+}
+
+static int mbox_is_from_line(const char *p, int len, int pos)
+{
+    return pos + 5 <= len && memcmp(p + pos, "From ", 5) == 0;
+}
+
+int open(MboxDoc *d, const char *text, int len)
+{
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->p = text;
+    d->len = text ? len : 0;
+    if (!text || len <= 0)
+        return -1;
+    return 0;
+}
+
+int count(MboxDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(MboxDoc *d)
+{
+    if (!d || !d->p)
+        return;
+    d->pos = 0;
+    d->seen = 0;
+    d->bad = 0;
+}
+
+/* 取下一条消息；1 = 有，0 = 读完，-1 = 结构坏（没有以 From 开头）。 */
+int next(MboxDoc *d, MboxMsg *m)
+{
+    int next_pos = 0;
+    int n = 0;
+    int hdr_first = 0;
+    int hdr_end = 0;
+    int body_start = 0;
+    int body_end = 0;
+    int nhdr = 0;
+
+    if (!d || !m || d->bad)
+        return -1;
+    memset(m, 0, sizeof *m);
+    /* 跳到下一条 From 行 */
+    while (d->pos < d->len) {
+        if (mbox_is_from_line(d->p, d->len, d->pos))
+            break;
+        n = mbox_line(d->p, d->len, d->pos, &next_pos);
+        (void)n;
+        d->pos = next_pos;
+    }
+    if (d->pos >= d->len)
+        return 0;
+    m->from_off = d->pos;
+    n = mbox_line(d->p, d->len, d->pos, &next_pos);
+    m->from_len = n;
+    d->pos = next_pos;
+    /* 头部区：直到空行 */
+    hdr_first = d->pos;
+    hdr_end = d->pos;
+    while (d->pos < d->len) {
+        int nn = 0;
+        int ln = mbox_line(d->p, d->len, d->pos, &nn);
+
+        if (ln == 0)
+            break;              /* 空行：头部结束 */
+        if (mbox_is_from_line(d->p, d->len, d->pos))
+            break;              /* 没有正文就直接下一条消息 */
+        /* 续行不算新的头 */
+        if (d->p[d->pos] != ' ' && d->p[d->pos] != '\t')
+            nhdr++;
+        hdr_end = d->pos + ln;
+        d->pos = nn;
+    }
+    m->hdr_off = hdr_first;
+    m->hdr_end = hdr_end;
+    m->nhdr = nhdr;
+    /* 正文：跳过那一个空行，直到下一条 From 行 */
+    if (d->pos < d->len) {
+        int nn = 0;
+        int ln = mbox_line(d->p, d->len, d->pos, &nn);
+
+        if (ln == 0)
+            d->pos = nn;
+    }
+    body_start = d->pos;
+    body_end = d->pos;
+    while (d->pos < d->len) {
+        int nn = 0;
+        int ln = mbox_line(d->p, d->len, d->pos, &nn);
+
+        if (mbox_is_from_line(d->p, d->len, d->pos))
+            break;
+        body_end = d->pos + ln;
+        d->pos = nn;
+    }
+    m->body_off = body_start;
+    m->body_len = body_end > body_start ? body_end - body_start : 0;
+    m->idx = d->seen;
+    d->seen++;
+    return 1;
+}
+
+/* ---- 头部游标 ---- */
+
+int open_headers(MboxHdrDoc *hd, const MboxMsg *m, const char *text)
+{
+    if (!hd || !m || !text)
+        return -1;
+    hd->p = text;
+    hd->start = m->hdr_off;
+    hd->pos = m->hdr_off;
+    hd->end = m->hdr_end;
+    hd->seen = 0;
+    hd->bad = 0;
+    return 0;
+}
+
+static void mbox_split_hdr(const char *p, int pos, int line_end, MboxHdr *out)
+{
+    int k = line_end;
+    int colon = -1;
+    int v = 0;
+
+    if (k > pos && p[k - 1] == '\r')
+        k--;
+    for (int i = pos; i < k; i++)
+        if (p[i] == ':') {
+            colon = i;
+            break;
+        }
+    out->name_off = pos;
+    out->name_len = (colon > pos) ? colon - pos : k - pos;
+    while (out->name_len > 0
+           && (p[out->name_off + out->name_len - 1] == ' '
+               || p[out->name_off + out->name_len - 1] == '\t'))
+        out->name_len--;
+    if (colon < 0) {
+        out->val_off = k;
+        out->val_len = 0;
+        return;
+    }
+    v = colon + 1;
+    while (v < k && (p[v] == ' ' || p[v] == '\t'))
+        v++;
+    out->val_off = v;
+    out->val_len = k - v;
+}
+
+int next_header(MboxHdrDoc *hd, MboxHdr *out)
+{
+    while (hd && !hd->bad && hd->pos < hd->end) {
+        int nn = 0;
+        int ln = mbox_line(hd->p, hd->end, hd->pos, &nn);
+
+        if (ln == 0)
+            return 0;
+        if (hd->p[hd->pos] == ' ' || hd->p[hd->pos] == '\t') {
+            hd->pos = nn;       /* 续行：由 get_value 拼接，游标跳过 */
+            continue;
+        }
+        if (out)
+            mbox_split_hdr(hd->p, hd->pos, hd->pos + ln, out);
+        hd->pos = nn;
+        hd->seen++;
+        return 1;
+    }
+    return 0;
+}
+
+int header_count(MboxHdrDoc *hd)
+{
+    return hd ? hd->seen : -1;
+}
+
+void reset_headers(MboxHdrDoc *hd)
+{
+    if (!hd || !hd->p)
+        return;
+    hd->pos = hd->start;
+    hd->seen = 0;
+    hd->bad = 0;
+}
+
+static int mbox_name_eq(const char *p, int off, int len, const char *want)
+{
+    int n = (int)strlen(want);
+
+    if (len != n)
+        return 0;
+    for (int i = 0; i < n; i++) {
+        int a = (int)(unsigned char)p[off + i];
+        int b = (int)(unsigned char)want[i];
+
+        if (a >= 'A' && a <= 'Z')
+            a = a - 'A' + 'a';
+        if (b >= 'A' && b <= 'Z')
+            b = b - 'A' + 'a';
+        if (a != b)
+            return 0;
+    }
+    return 1;
+}
+
+/* 按名字找（大小写不敏感）；找到返回 1。 */
+int get_header(MboxHdrDoc *hd, const char *name, MboxHdr *out)
+{
+    int saved = 0;
+    int saved_seen = 0;
+    MboxHdr tmp = { 0, 0, 0, 0, 0 };
+
+    if (!hd || !hd->p)
+        return 0;
+    saved = hd->pos;
+    saved_seen = hd->seen;
+    hd->pos = hd->start;
+    hd->bad = 0;
+    while (next_header(hd, &tmp))
+        if (mbox_name_eq(hd->p, tmp.name_off, tmp.name_len, name)) {
+            if (out)
+                *out = tmp;
+            hd->pos = saved;
+            hd->seen = saved_seen;
+            return 1;
+        }
+    hd->pos = saved;
+    hd->seen = saved_seen;
+    return 0;
+}
+
+/* 取值并拼续行（折叠成一个空格）；返回长度，没有这个头返回 -1。 */
+int header_value(MboxHdrDoc *hd, const char *name, char *out, int cap)
+{
+    MboxHdr h = { 0, 0, 0, 0, 0 };
+    int o = 0;
+    int pos = 0;
+
+    if (!hd || !hd->p || !out)
+        return -1;
+    if (!get_header(hd, name, &h))
+        return -1;
+    if (h.val_len + 1 > cap)
+        return -1;
+    memcpy(out, hd->p + h.val_off, (size_t)h.val_len);
+    o = h.val_len;
+    /* 续行：紧跟在 h 之后、以空白开头的行（先跳到下一行开头） */
+    pos = h.val_off + h.val_len;
+    while (pos < hd->end && (hd->p[pos] == '\r' || hd->p[pos] == '\n'))
+        pos++;
+    while (pos < hd->end) {
+        int nn = 0;
+        int ln = mbox_line(hd->p, hd->end, pos, &nn);
+
+        if (ln == 0)
+            break;
+        if (hd->p[pos] != ' ' && hd->p[pos] != '\t')
+            break;
+        {
+            int s = pos;
+            int e = pos + ln;
+
+            while (s < e && (hd->p[s] == ' ' || hd->p[s] == '\t'))
+                s++;
+            if (e > s) {
+                if (o + 1 + (e - s) + 1 > cap)
+                    return -1;
+                out[o++] = ' ';
+                memcpy(out + o, hd->p + s, (size_t)(e - s));
+                o += e - s;
+            }
+        }
+        pos = nn;
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+test "mbox：两条消息、正文边界与 >From 转义" {
+    const char *text = "From alice@example.com Sat Jan  1 00:00:00 2024\n"
+                       "From: alice@example.com\n"
+                       "Subject: hello\n"
+                       "To: bob@example.com\n"
+                       "\n"
+                       "line one\n"
+                       ">From quoted line\n"
+                       "line three\n"
+                       "\n"
+                       "From bob@example.com Sun Jan  2 00:00:00 2024\n"
+                       "From: bob@example.com\n"
+                       "Subject: re: hello\n"
+                       "X-Long: first part\n"
+                       "   second part\n"
+                       "\n"
+                       "reply body\n";
+    MboxDoc d = { 0 };
+    MboxMsg m = { 0 };
+    MboxHdrDoc hd = { 0 };
+    MboxHdr h = { 0, 0, 0, 0, 0 };
+    char buf[128] = { 0 };
+
+    if (d.open(text, (int)strlen(text)) != 0)
+        return err(1, "open 失败");
+    if (d.next(&m) != 1)
+        return err(2, "第一条消息没取到");
+    if (m.from_len != 47 || memcmp(text + m.from_off, "From alice@example.com", 22) != 0)
+        return err(3, "From 行不对");
+    if (m.nhdr != 3)
+        return err(4, "第一条应有 3 个头");
+    /* 正文里含 >From 行，且不该在它那里断 */
+    if (m.body_len == 0)
+        return err(5, "正文不该为空");
+    if (memcmp(text + m.body_off, "line one\n>From quoted line\nline three", 37) != 0)
+        return err(6, "正文应包含 >From 行");
+    /* 第二条 */
+    if (d.next(&m) != 1)
+        return err(7, "第二条消息没取到");
+    if (m.nhdr != 3)
+        return err(8, "第二条应有 3 个头（续行不算新头）");
+    hd.open_headers(&m, text);
+    if (hd.get_header("subject", &h) != 1)
+        return err(9, "第二条的 Subject 没找到");
+    if (memcmp(text + h.val_off, "re: hello", 9) != 0)
+        return err(10, "Subject 值不对");
+    if (hd.get_header("X-Long", &h) != 1 || h.val_len != 10)
+        return err(11, "X-Long 头不对");
+    if (hd.header_value("x-long", buf, sizeof buf) != 22
+        || strcmp(buf, "first part second part") != 0)
+        return err(12, "续行应折叠成一个空格");
+    if (d.next(&m) != 0 || d.count() != 2)
+        return err(13, "应恰好两条");
+    d.reset();
+    if (d.next(&m) != 1 || m.idx != 0)
+        return err(14, "reset 后应从头");
+}
+
+test "mbox：头部游标、计数与坏文件" {
+    const char *text = "From x@y Mon Jan  3 00:00:00 2024\n"
+                       "A: 1\n"
+                       "b: 2\n"
+                       "C:   3\n"
+                       "\n"
+                       "body\n";
+    MboxDoc d = { 0 };
+    MboxMsg m = { 0 };
+    MboxHdrDoc hd = { 0 };
+    MboxHdr h = { 0, 0, 0, 0, 0 };
+    char buf[64] = { 0 };
+
+    d.open(text, (int)strlen(text));
+    if (d.next(&m) != 1)
+        return err(1, "消息没取到");
+    hd.open_headers(&m, text);
+    if (hd.next_header(&h) != 1 || h.name_len != 1 || h.val_len != 1)
+        return err(2, "第一个头不对");
+    if (hd.next_header(&h) != 1 || !mbox_name_eq(text, h.name_off, h.name_len, "B"))
+        return err(3, "第二个头应能大小写不敏感匹配");
+    if (hd.next_header(&h) != 1 || h.val_len != 1)
+        return err(4, "第三个头应去掉前导空白");
+    if (hd.next_header(&h) != 0 || hd.header_count() != 3)
+        return err(5, "应恰好三个头");
+    if (hd.header_value("A", buf, sizeof buf) != 1 || strcmp(buf, "1") != 0)
+        return err(6, "get_value 基本用法不对");
+    if (hd.header_value("nope", buf, sizeof buf) != -1)
+        return err(7, "不存在的头应返回 -1");
+    hd.reset_headers();
+    if (hd.next_header(&h) != 1 || hd.header_count() != 1)
+        return err(8, "reset 后应从头");
+    /* 没有头也没有正文的消息 */
+    {
+        const char *tiny = "From a@b Tue Jan  4 00:00:00 2024\n";
+        MboxDoc td = { 0 };
+        MboxMsg tm = { 0 };
+
+        td.open(tiny, (int)strlen(tiny));
+        if (td.next(&tm) != 1)
+            return err(9, "只有 From 行的消息应能取到");
+        if (tm.nhdr != 0 || tm.body_len != 0)
+            return err(10, "没有头也没有正文");
+    }
+    /* 前面有垃圾行：跳过直到 From 行 */
+    {
+        const char *junk = "garbage\nmore garbage\n"
+                           "From a@b Wed Jan  5 00:00:00 2024\n"
+                           "S: 1\n\nx\n";
+        MboxDoc jd = { 0 };
+        MboxMsg jm = { 0 };
+
+        jd.open(junk, (int)strlen(junk));
+        if (jd.next(&jm) != 1 || jm.nhdr != 1)
+            return err(11, "应跳过垃圾行找到消息");
+    }
+    /* 完全没有 From 行 */
+    {
+        const char *none = "no messages here\n";
+        MboxDoc nd = { 0 };
+        MboxMsg nm = { 0 };
+
+        nd.open(none, (int)strlen(none));
+        if (nd.next(&nm) != 0 || nd.count() != 0)
+            return err(12, "没有 From 行应读完返回 0");
+    }
+}

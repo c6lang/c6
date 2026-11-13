@@ -2939,3 +2939,23 @@ err 号段补 `std.text.translit`=0x6165、`std.net.coap`=0x6166、`std.net.dhcp
 err 号段补 `std.net.netflow`=0x6169、`std.net.wol`=0x616a、`std.data.vtt`=0x616b、
 `std.data.zone`=0x616c。`std/` 现在 365 个 `.c6` 文件；四个模块的 test 块逐个跑过
 （各 2 条，0 failure）。
+
+### 11.103 标准库第八十九批（文档与邮件）
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/text/plural.c6` | 英文单复数：不规则表（person/child/mouse…）、不可数表、`-es/-ies/-ves` 规则、计数短语；可自定义增补 | 2 | `Plural.init/of/count_str/count_str_with/add_irregular/add_uncountable` |
+| `std/data/mbox.c6` | Unix mailbox：行首 `From ` 切消息、头部区到空行、`>From` 不作分隔、续行折叠 | 2 | `MboxDoc.open/next/count/reset`；`MboxHdrDoc.open_headers/next_header/get_header/header_value/header_count/reset_headers` |
+| `std/data/kdl.c6` | KDL v1：节点/参数/属性、嵌套花括号、行注释与块注释、`/-` 软注释、引号转义 | 2 | `KdlDoc.open/next/count/reset`；`KdlArgDoc.open_args/next_arg/arg_count/reset_args` |
+| `std/data/rtf.c6` | RTF 纯文本提取：控制字剥离、`\{ \} \\ \'hh` 转义、`\uN`→UTF-8、忽略 `fonttbl`/`info`/`\*` 目标 | 2 | `RtfDoc.open/next_text/plain_text/count/reset` |
+
+**又一条踩坑记录**：`mbox` 的头部游标最初也叫 `next`/`count`/`reset`，与消息游标
+同名但参数类型不同 → 编译器按先定义的那个解析，运行时把 `MboxMsg` 的结构写进了
+`MboxHdr`，测试直接挂死（无限循环）。改成 `next_header`/`header_count`/`reset_headers`
+后正常，原因与结论写进了模块头注释。
+
+集成示例 `examples/stddocs.c6`（`make std-docs`）48 条检查。`Makefile` 增加
+`STD_DOCS_SRCS` / `std-docs`（`.PHONY`、help、`test-all`、`check-all` 同步）；
+err 号段补 `std.text.plural`=0x616d、`std.data.mbox`=0x616e、`std.data.kdl`=0x616f、
+`std.data.rtf`=0x6170。`std/` 现在 369 个 `.c6` 文件；四个模块的 test 块逐个跑过
+（各 2 条，0 failure）。

@@ -7,6 +7,19 @@
 
 ## 未发布
 
+### 标准库第八十九批：文档与邮件
+
+- **`std/text/plural.c6`**：英文单复数——不规则表（person/child/mouse…）、不可数表、
+  `-es/-ies/-ves` 规则，`count_str` 直接给「3 files」这种短语，可自定义增补。
+- **`std/data/mbox.c6`**：Unix mailbox 分卷（行首 `From ` 切分、`>From` 不作分隔、
+  续行折叠），消息游标 + 头部游标（`next_header`/`get_header`/`header_value`）。
+- **`std/data/kdl.c6`**：KDL v1 文档——节点/参数/属性、嵌套、行/块注释、`/-` 软注释、
+  引号转义，两个游标（`next` 给节点、`next_arg` 给参数）。
+- **`std/data/rtf.c6`**：RTF 纯文本提取——控制字剥离、`\{ \} \\ \'hh` 转义、
+  `\uN` → UTF-8、整组忽略 `fonttbl`/`info`/`pict`/`\*` 目标。
+- 集成示例 `examples/stddocs.c6`（`make std-docs`，48 条检查）+ `STD_DOCS_SRCS` +
+  err 号段 0x616d…0x6170；`std/` 到 **369** 个模块。
+
 ### 标准库第八十八批：网络运维与媒体清单
 
 - **`std/net/netflow.c6`**：NetFlow v5（24 字节头 + N×48 记录），版本与长度校验，

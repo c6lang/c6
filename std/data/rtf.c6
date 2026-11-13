@@ -1,0 +1,472 @@
+/* std/data/rtf：RTF 纯文本提取（RTF 1.x 的一个务实子集）。
+ *
+ *     import std.data.rtf;
+ *
+ *     RtfDoc d = { 0 };
+ *     char out[256] = { 0 };
+ *     d.open(text, len);                  // 必须以 {\rtf 开头
+ *     d.plain_text(out, sizeof out);      // 整篇提取：控制字去掉、正文留下
+ *
+ *     // 或者流式：一段一段取
+ *     RtfDoc s = { 0 };
+ *     s.open(text, len);
+ *     while (1) {
+ *         int n = s.next_text(chunk, sizeof chunk);   // 0 = 读完，-1 = 坏输入
+ *         if (n <= 0)
+ *             break;
+ *         fwrite(chunk, 1, (size_t)n, stdout);
+ *     }
+ *
+ * 处理的东西（够把 Word/WordPad 存的 RTF 抽成纯文本）：
+ *
+ * - 组 `{ ... }`、转义 `\\` `\{` `\}`、`\'hh`（按字节原样输出，通常是 Latin-1/CP1252）；
+ * - `\uN`（Unicode 码点，后面那个替代字符按 RTF 规矩是 `?`，这里直接跳过）；
+ * - `\par` → 换行、`\line` → 换行、`\tab` → 制表符、`\emdash`/`\endash` → `-`；
+ * - **忽略**整组：`\*` 开头的可忽略目标，以及 `fonttbl`、`colortbl`、`stylesheet`、
+ *   `info`、`pict`、`object`、`header`/`footer`（这些里面没有正文）；
+ * - 未知控制字直接丢（连同它的数字参数）。
+ *
+ * 不做：样式、表格结构、图片、字符集转码（`\'hh` 原样输出字节）。
+ * 遇到未闭合的组、或文件不以 `{\rtf` 开头，`next_text` 返回 -1 并置 bad。
+ */
+#include <string.h>
+
+module std.data.rtf;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+struct RtfDoc {
+    const char *p;
+    int len;
+    int pos;
+    int depth;
+    int skip_depth;             /* > 0 表示当前在要忽略的组里 */
+    int seen;
+    int bad;
+    int started;
+};
+
+static int rtf_at(RtfDoc *d, int i)
+{
+    return (i >= 0 && i < d->len) ? (int)(unsigned char)d->p[i] : 0;
+}
+
+static int rtf_is_alpha(int c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static int rtf_is_digit(int c)
+{
+    return c >= '0' && c <= '9';
+}
+
+/* 这些目标组里没有正文。 */
+static int rtf_is_dest_skip(const char *name, int len)
+{
+    static const char *const skip[] = {
+        "fonttbl", "colortbl", "stylesheet", "info", "pict", "object",
+        "header", "footer", "headerl", "headerr", "footerl", "footerr",
+        "listtable", "listoverridetable", "rsidtbl", "generator", "themedata",
+        "colorschememapping", "latentstyles", "datastore", "xmlnstbl",
+    };
+
+    for (int i = 0; i < (int)(sizeof skip / sizeof skip[0]); i++) {
+        int sl = (int)strlen(skip[i]);
+
+        if (sl == len && memcmp(name, skip[i], (size_t)len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+int open(RtfDoc *d, const char *text, int len)
+{
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->p = text;
+    d->len = text ? len : 0;
+    if (!text || len < 6)
+        return -1;
+    if (!(text[0] == '{' && len >= 6 && memcmp(text + 1, "\\rtf", 4) == 0))
+        return -1;
+    d->started = 1;
+    d->pos = 0;
+    d->depth = 0;
+    return 0;
+}
+
+int count(RtfDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(RtfDoc *d)
+{
+    if (!d || !d->p)
+        return;
+    d->pos = 0;
+    d->depth = 0;
+    d->skip_depth = 0;
+    d->seen = 0;
+    d->bad = 0;
+}
+
+/* 写一个 UTF-8 码点；返回写入字节数。 */
+static int rtf_put_utf8(char *out, int cap, int cp)
+{
+    if (cp < 0x80) {
+        if (cap < 1)
+            return -1;
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        if (cap < 2)
+            return -1;
+        out[0] = (char)(0xc0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3f));
+        return 2;
+    }
+    if (cap < 3)
+        return -1;
+    out[0] = (char)(0xe0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    out[2] = (char)(0x80 | (cp & 0x3f));
+    return 3;
+}
+
+/* 取下一段正文；>0 字节数，0 读完，-1 坏输入。 */
+int next_text(RtfDoc *d, char *out, int cap)
+{
+    int o = 0;
+
+    if (!d || !out || cap <= 0 || d->bad)
+        return -1;
+    while (d->pos < d->len) {
+        int c = rtf_at(d, d->pos);
+
+        if (c == '{') {
+            d->depth++;
+            d->pos++;
+            /* \* 或要忽略的目标：整组跳过 */
+            {
+                int save = d->pos;
+
+                while (d->pos < d->len && rtf_at(d, d->pos) == ' ')
+                    d->pos++;
+                if (rtf_at(d, d->pos) == '\\') {
+                    int s = d->pos + 1;
+                    int e = s;
+                    int skip = 0;
+
+                    if (rtf_at(d, s) == '*') {
+                        skip = 1;
+                        d->pos += 2;
+                    } else {
+                        while (e < d->len && rtf_is_alpha(rtf_at(d, e)))
+                            e++;
+                        if (e > s && rtf_is_dest_skip(d->p + s, e - s)) {
+                            skip = 1;
+                            d->pos = e;
+                        }
+                    }
+                    if (skip) {
+                        int depth = 1;
+
+                        while (d->pos < d->len && depth > 0) {
+                            int k = rtf_at(d, d->pos);
+
+                            if (k == '{')
+                                depth++;
+                            else if (k == '}')
+                                depth--;
+                            else if (k == '\\')
+                                d->pos++;
+                            d->pos++;
+                        }
+                        d->depth--;     /* 已经把这个组的 { 和 } 都吃掉了 */
+                        if (depth > 0) {
+                            d->bad = 1;
+                            return -1;
+                        }
+                        continue;
+                    }
+                    d->pos = save;
+                    continue;
+                }
+                d->pos = save;
+                continue;
+            }
+        }
+        if (c == '}') {
+            if (d->depth == 0) {
+                d->bad = 1;
+                return -1;
+            }
+            d->depth--;
+            d->pos++;
+            continue;
+        }
+        if (c == '\\') {
+            int k = rtf_at(d, d->pos + 1);
+
+            if (k == '\\' || k == '{' || k == '}') {
+                if (o + 1 > cap)
+                    return o;
+                out[o++] = (char)k;
+                d->pos += 2;
+                continue;
+            }
+            if (k == '\'') {
+                int hi = rtf_at(d, d->pos + 2);
+                int lo = rtf_at(d, d->pos + 3);
+                int v = 0;
+
+                if (!((hi >= '0' && hi <= '9') || (hi >= 'a' && hi <= 'f')
+                      || (hi >= 'A' && hi <= 'F'))
+                    || !((lo >= '0' && lo <= '9') || (lo >= 'a' && lo <= 'f')
+                         || (lo >= 'A' && lo <= 'F'))) {
+                    d->bad = 1;
+                    return -1;
+                }
+                if (hi >= 'a')
+                    hi = hi - 'a' + 10;
+                else if (hi >= 'A')
+                    hi = hi - 'A' + 10;
+                else
+                    hi = hi - '0';
+                if (lo >= 'a')
+                    lo = lo - 'a' + 10;
+                else if (lo >= 'A')
+                    lo = lo - 'A' + 10;
+                else
+                    lo = lo - '0';
+                v = (hi << 4) | lo;
+                if (o + 1 > cap)
+                    return o;
+                out[o++] = (char)v;
+                d->pos += 4;
+                continue;
+            }
+            if (k == '*') {     /* 落单的 \*：跳过 */
+                d->pos += 2;
+                continue;
+            }
+            if (rtf_is_alpha(k)) {
+                int s = d->pos + 1;
+                int e = s;
+                int neg = 0;
+                long arg = 0;
+                int has_arg = 0;
+
+                while (e < d->len && rtf_is_alpha(rtf_at(d, e)))
+                    e++;
+                /* 可选数字参数 */
+                if (rtf_at(d, e) == '-') {
+                    neg = 1;
+                    e++;
+                }
+                while (e < d->len && rtf_is_digit(rtf_at(d, e))) {
+                    arg = arg * 10 + (rtf_at(d, e) - '0');
+                    e++;
+                    has_arg = 1;
+                }
+                if (rtf_at(d, e) == ' ')
+                    e++;
+                /* 处理有意义的控制字 */
+                {
+                    const char *name = d->p + s;
+                    int nl = (e - (d->pos + 1));
+                    int name_len = nl;
+
+                    /* 名字长度不含数字/负号/空格 */
+                    name_len = 0;
+                    while (name_len < nl && rtf_is_alpha(name[name_len]))
+                        name_len++;
+                    if (name_len == 3 && memcmp(name, "par", 3) == 0) {
+                        if (o + 1 > cap)
+                            return o;
+                        out[o++] = '\n';
+                    } else if (name_len == 4 && memcmp(name, "line", 4) == 0) {
+                        if (o + 1 > cap)
+                            return o;
+                        out[o++] = '\n';
+                    } else if (name_len == 3 && memcmp(name, "tab", 3) == 0) {
+                        if (o + 1 > cap)
+                            return o;
+                        out[o++] = '\t';
+                    } else if (name_len == 6 && memcmp(name, "emdash", 6) == 0) {
+                        if (o + 1 > cap)
+                            return o;
+                        out[o++] = '-';
+                    } else if (name_len == 6 && memcmp(name, "endash", 6) == 0) {
+                        if (o + 1 > cap)
+                            return o;
+                        out[o++] = '-';
+                    } else if (name_len == 1 && name[0] == 'u' && has_arg) {
+                        int cp = (int)arg;
+                        int written = 0;
+
+                        if (neg)
+                            cp = 65536 + cp;
+                        if (cp < 0)
+                            cp = '?';
+                        written = rtf_put_utf8(out + o, cap - o, cp);
+                        if (written < 0)
+                            return o;
+                        o += written;
+                        /* RTF 的 \uN 后面那个替代字符（通常是 '?'）要跳过 */
+                        if (e < d->len && d->p[e] == '?')
+                            e++;
+                    }
+                }
+                d->pos = e;
+                continue;
+            }
+            d->pos++;           /* 落单的反斜杠：丢 */
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            d->pos++;
+            continue;
+        }
+        /* 普通字符 */
+        if (o + 1 > cap)
+            return o;
+        out[o++] = (char)c;
+        d->pos++;
+    }
+    if (d->depth != 0) {
+        d->bad = 1;
+        return -1;              /* 组没闭合 */
+    }
+    d->seen++;
+    return o;
+}
+
+/* 整篇提取；返回总字节数，坏输入 -1。 */
+int plain_text(RtfDoc *d, char *out, int cap)
+{
+    int total = 0;
+
+    if (!d || !out)
+        return -1;
+    for (;;) {
+        int n = next_text(d, out + total, cap - total);
+
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            break;
+        total += n;
+    }
+    if (total < cap)
+        out[total] = 0;
+    return total;
+}
+
+/* ---- 自测 ---- */
+
+static char[:] rsl(const char *s)
+{
+    return (char[:]){ (char *)s, (int)strlen(s) };
+}
+
+test "RTF：正文提取、转义与段落" {
+    const char *text = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Times;}}"
+                       "Hello \\b bold\\b0  world\\par "
+                       "brace: \\{ \\} backslash: \\\\ tab:\\tab end\\par}";
+    RtfDoc d = { 0 };
+    char out[256] = { 0 };
+    char chunk[64] = { 0 };
+    int n = 0;
+
+    if (d.open(text, (int)strlen(text)) != 0)
+        return err(1, "open 失败");
+    n = d.plain_text(out, sizeof out);
+    if (n < 0)
+        return err(2, "plain_text 失败");
+    if (strstr(out, "Hello bold world") == 0)
+        return err(3, "正文没提出来");
+    if (strstr(out, "brace: { } backslash: \\ tab:\t") == 0)
+        return err(4, "转义没处理对");
+    if (strstr(out, "Times") != 0)
+        return err(5, "fonttbl 的内容不该出现在正文里");
+    /* 流式取出应与整篇一致 */
+    {
+        char all[256] = { 0 };
+        int total = 0;
+
+        d.reset();
+        for (;;) {
+            int k = d.next_text(chunk, sizeof chunk);
+
+            if (k < 0)
+                return err(6, "流式提取失败");
+            if (k == 0)
+                break;
+            if (total + k < (int)sizeof all) {
+                memcpy(all + total, chunk, (size_t)k);
+                total += k;
+            }
+        }
+        if (memcmp(all, out, (size_t)total) != 0)
+            return err(7, "流式与整篇不一致");
+        if (all[total] != 0 && total < (int)sizeof all - 1)
+            return err(8, "流式结果应以 NUL 结尾");
+    }
+}
+
+test "RTF：忽略目标组、\\uN 与坏输入" {
+    const char *text = "{\\rtf1\\ansi{\\info{\\title 秘密标题}}"
+                       "visible{\\*\\generator Foo;} text\\par"
+                       "unicode: \\u20320?\\u22909?  done\\par}";
+    RtfDoc d = { 0 };
+    char out[256] = { 0 };
+    int n = 0;
+
+    n = d.open(text, (int)strlen(text)) == 0 ? d.plain_text(out, sizeof out) : -1;
+    if (n < 0)
+        return err(1, "提取失败");
+    if (strstr(out, "visible") == 0 || strstr(out, "text") == 0)
+        return err(2, "正文丢了");
+    if (strstr(out, "秘密标题") != 0)
+        return err(3, "info 组的内容不该出现");
+    if (strstr(out, "generator") != 0)
+        return err(4, "\\* 可忽略目标不该出现");
+    /* \u20320? 应变成 UTF-8 的「你」= e4 bd a0 */
+    if (memmem(out, (size_t)n, "\xe4\xbd\xa0", 3) == 0)
+        return err(5, "\\u20320 没转成 UTF-8");
+    if (memmem(out, (size_t)n, "\xe5\xa5\xbd", 3) == 0)
+        return err(6, "\\u22909 没转成 UTF-8");
+    /* 坏输入 */
+    {
+        const char *bad = "not rtf at all";
+        RtfDoc bd = { 0 };
+
+        if (bd.open(bad, (int)strlen(bad)) != -1)
+            return err(7, "不以 {\\rtf 开头应失败");
+    }
+    {
+        const char *bad = "{\\rtf1 unclosed { group";
+        RtfDoc bd = { 0 };
+        char tmp[64] = { 0 };
+
+        if (bd.open(bad, (int)strlen(bad)) != 0)
+            return err(8, "开头合法应能打开");
+        if (bd.plain_text(tmp, sizeof tmp) != -1)
+            return err(9, "组没闭合应失败");
+    }
+    {
+        const char *bad = "{\\rtf1 bad escape \\'zz}";
+        RtfDoc bd = { 0 };
+        char tmp[64] = { 0 };
+
+        bd.open(bad, (int)strlen(bad));
+        if (bd.plain_text(tmp, sizeof tmp) != -1)
+            return err(10, "坏的 \\'hh 应失败");
+    }
+}

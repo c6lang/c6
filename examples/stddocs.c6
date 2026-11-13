@@ -1,0 +1,226 @@
+/* examples/stddocs.c6 —— 第八十九批（文档与邮件：单复数 / mbox / KDL / RTF）。
+ *
+ *     make std-docs
+ *
+ * 五节，全部方法调用（`p.count_str(...)`、`d.next(&m)`、`hd.get_header(...)`）：
+ *   1. plural：计数短语（1 file / 3 files / 2 children）；
+ *   2. mbox：两条消息、头部游标、续行折叠、正文里的 >From；
+ *   3. KDL：嵌套节点 + 参数/属性游标；
+ *   4. RTF：控制字剥离、转义、\uN → UTF-8；
+ *   5. 串联：从 KDL 读输出目录、从 mbox 取一封邮件的主题、用 plural 生成数量、
+ *      把 RTF 正文抽成纯文本。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.text.plural;
+import std.data.mbox;
+import std.data.kdl;
+import std.data.rtf;
+
+static int checks = 0;
+static int nfail = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        nfail++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* 1. 单复数 */
+static void do_plural(void)
+{
+    Plural p = { { { { 0 } } }, 0, { { 0 } }, 0 };
+    char out[64] = { 0 };
+
+    printf("== plural（单复数与计数短语）\n");
+    p.init();
+    check(p.of("file", out, sizeof out) == 5 && strcmp(out, "files") == 0, "file → files");
+    check(p.of("box", out, sizeof out) == 5 && strcmp(out, "boxes") == 0, "box → boxes");
+    check(p.of("city", out, sizeof out) == 6 && strcmp(out, "cities") == 0, "city → cities");
+    check(p.of("leaf", out, sizeof out) == 6 && strcmp(out, "leaves") == 0, "leaf → leaves");
+    check(p.of("child", out, sizeof out) == 8 && strcmp(out, "children") == 0,
+          "child → children");
+    check(p.of("information", out, sizeof out) == 11
+          && strcmp(out, "information") == 0, "information 不可数");
+    check(p.count_str(1, "file", out, sizeof out) == 6
+          && strcmp(out, "1 file") == 0, "1 file");
+    check(p.count_str(3, "file", out, sizeof out) == 7
+          && strcmp(out, "3 files") == 0, "3 files");
+    check(p.count_str(2, "child", out, sizeof out) == 10
+          && strcmp(out, "2 children") == 0, "2 children");
+    check(p.add_irregular("cactus", "cacti") == 0
+          && p.of("cactus", out, sizeof out) == 5, "自定义不规则");
+}
+
+/* 2. mbox */
+static void do_mbox(void)
+{
+    const char *text = "From alice@example.com Sat Jan  1 00:00:00 2024\n"
+                       "From: alice@example.com\n"
+                       "Subject: hello\n"
+                       "X-Long: first part\n"
+                       "  second part\n"
+                       "\n"
+                       "line one\n"
+                       ">From quoted\n"
+                       "\n"
+                       "From bob@example.com Sun Jan  2 00:00:00 2024\n"
+                       "From: bob@example.com\n"
+                       "Subject: re: hello\n"
+                       "\n"
+                       "reply\n";
+    MboxDoc d = { 0 };
+    MboxMsg m = { 0 };
+    MboxHdrDoc hd = { 0 };
+    MboxHdr h = { 0, 0, 0, 0, 0 };
+    char buf[128] = { 0 };
+
+    printf("== mbox（Unix mailbox 分卷）\n");
+    check(d.open(text, (int)strlen(text)) == 0, "open");
+    check(d.next(&m) == 1 && m.nhdr == 3, "第一条消息 + 3 个头");
+    if (hd.open_headers(&m, text) != 0)
+        check(0, "open_headers");
+    check(hd.get_header("subject", &h) == 1
+          && memcmp(text + h.val_off, "hello", 5) == 0, "Subject 大小写不敏感查找");
+    check(hd.header_value("x-long", buf, sizeof buf) == 22
+          && strcmp(buf, "first part second part") == 0, "续行折叠");
+    check(m.body_len > 0 && memcmp(text + m.body_off, "line one", 8) == 0, "正文起点");
+    check(d.next(&m) == 1 && m.nhdr == 2, "第二条消息 + 2 个头");
+    check(d.next(&m) == 0 && d.count() == 2, "恰好两条");
+    d.reset();
+    check(d.next(&m) == 1 && d.count() == 1, "reset 后从头");
+}
+
+/* 3. KDL */
+static void do_kdl(void)
+{
+    const char *text = "report \"weekly\" count=3\n"
+                       "output {\n"
+                       "    dir \"/tmp/reports\"\n"
+                       "    format csv\n"
+                       "}\n"
+                       "// 末尾注释\n";
+    KdlDoc d = { 0 };
+    KdlNode n = { 0 };
+    KdlArgDoc ad = { 0 };
+    KdlArg a = { 0 };
+    char dir[64] = { 0 };
+    int fmt_len = 0;
+
+    printf("== kdl（KDL 文档）\n");
+    check(d.open(text, (int)strlen(text)) == 0, "open");
+    check(d.next(&n) == 1 && n.depth == 0 && n.name_len == 6, "第一个节点 report");
+    ad.open_args(&n, text);
+    check(ad.next_arg(&a) == 1 && a.is_string && a.val_len == 6
+          && memcmp(text + a.val_off, "weekly", 6) == 0, "参数 weekly（值落在引号内）");
+    check(ad.next_arg(&a) == 1 && a.is_prop && a.name_len == 5
+          && memcmp(text + a.name_off, "count", 5) == 0, "属性 count");
+    check(memcmp(text + a.val_off, "3", 1) == 0, "count=3");
+    check(ad.next_arg(&a) == 0, "report 只有两个参数");
+    check(d.next(&n) == 1 && n.has_children && n.name_len == 6, "output 带子节点");
+    check(d.next(&n) == 1 && n.depth == 1 && n.name_len == 3, "子节点 dir");
+    ad.open_args(&n, text);
+    if (ad.next_arg(&a) == 1) {
+        memcpy(dir, text + a.val_off, (size_t)a.val_len);
+        dir[a.val_len] = 0;
+    }
+    check(strcmp(dir, "/tmp/reports") == 0, "dir 的值");
+    check(d.next(&n) == 1 && n.depth == 1 && n.name_len == 6, "子节点 format");
+    ad.open_args(&n, text);
+    fmt_len = ad.next_arg(&a) == 1 ? a.val_len : 0;
+    check(fmt_len == 3 && memcmp(text + a.val_off, "csv", 3) == 0, "format = csv");
+    check(d.next(&n) == 0, "读完了");
+}
+
+/* 4. RTF */
+static void do_rtf(void)
+{
+    const char *text = "{\\rtf1\\ansi{\\fonttbl{\\f0 Times;}}"
+                       "Weekly report\\par "
+                       "3 files changed.\\par "
+                       "unicode: \\u20320?\\par}";
+    RtfDoc d = { 0 };
+    char out[256] = { 0 };
+    int n = 0;
+
+    printf("== rtf（RTF 纯文本提取）\n");
+    check(d.open(text, (int)strlen(text)) == 0, "open");
+    n = d.plain_text(out, sizeof out);
+    check(n > 0, "提取成功");
+    check(strstr(out, "Weekly report") != 0, "正文第一行");
+    check(strstr(out, "3 files changed.") != 0, "正文第二行");
+    check(strstr(out, "Times") == 0, "fonttbl 不该出现");
+    check(strstr(out, "\n") != 0, "\\par 应变成换行");
+    check(memcmp(out + n - 4, "\xe4\xbd\xa0\n", 4) == 0, "\\u20320 应转成 UTF-8 的「你」");
+}
+
+/* 5. 串联：KDL 配置 + mbox 主题 + plural 数量 + RTF 正文 */
+static void do_pipeline(void)
+{
+    const char *kdl_text = "output {\n    dir \"/tmp/reports\"\n}\n";
+    const char *mbox_text = "From ci@example.com Mon Jan  3 00:00:00 2024\n"
+                            "Subject: build finished\n"
+                            "\n"
+                            "see attachment\n";
+    const char *rtf_text = "{\\rtf1\\ansi 2 files changed\\par}";
+    KdlDoc kd = { 0 };
+    KdlNode kn = { 0 };
+    KdlArgDoc kad = { 0 };
+    KdlArg ka = { 0 };
+    MboxDoc md = { 0 };
+    MboxMsg mm = { 0 };
+    MboxHdrDoc mh = { 0 };
+    MboxHdr mhd = { 0, 0, 0, 0, 0 };
+    RtfDoc rd = { 0 };
+    Plural p = { { { { 0 } } }, 0, { { 0 } }, 0 };
+    char dir[64] = { 0 };
+    char subject[64] = { 0 };
+    char files[32] = { 0 };
+    char body[128] = { 0 };
+
+    printf("== 串联：配置 + 邮件 + 数量 + 正文\n");
+    /* 1) KDL 里读输出目录 */
+    check(kd.open(kdl_text, (int)strlen(kdl_text)) == 0, "1) 打开 KDL");
+    check(kd.next(&kn) == 1 && kn.has_children, "2) output 节点");
+    check(kd.next(&kn) == 1 && kn.name_len == 3, "3) dir 子节点");
+    kad.open_args(&kn, kdl_text);
+    if (kad.next_arg(&ka) == 1) {
+        memcpy(dir, kdl_text + ka.val_off, (size_t)ka.val_len);
+        dir[ka.val_len] = 0;
+    }
+    check(strcmp(dir, "/tmp/reports") == 0, "4) 目录 = /tmp/reports");
+    /* 2) mbox 主题 */
+    check(md.open(mbox_text, (int)strlen(mbox_text)) == 0, "5) 打开 mbox");
+    check(md.next(&mm) == 1 && mm.nhdr == 1, "6) 一条消息");
+    mh.open_headers(&mm, mbox_text);
+    if (mh.get_header("Subject", &mhd) == 1) {
+        memcpy(subject, mbox_text + mhd.val_off, (size_t)mhd.val_len);
+        subject[mhd.val_len] = 0;
+    }
+    check(strcmp(subject, "build finished") == 0, "7) 主题 = build finished");
+    /* 3) plural 生成数量短语 */
+    p.init();
+    check(p.count_str(2, "file", files, sizeof files) == 7
+          && strcmp(files, "2 files") == 0, "8) 2 files");
+    /* 4) RTF 正文 */
+    check(rd.open(rtf_text, (int)strlen(rtf_text)) == 0, "9) 打开 RTF");
+    check(rd.plain_text(body, sizeof body) > 0, "10) 提取正文");
+    check(strstr(body, "2 files changed") != 0, "11) 正文与数量一致");
+    printf("   %s: %s (%s)\n", subject, body, dir);
+}
+
+int main(void)
+{
+    do_plural();
+    do_mbox();
+    do_kdl();
+    do_rtf();
+    do_pipeline();
+    printf("\n%d check(s), %d failure(s)\n", checks, nfail);
+    return nfail == 0 ? 0 : 1;
+}

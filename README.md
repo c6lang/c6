@@ -625,6 +625,7 @@ make std-sec      # 编译并运行 examples/stdsec.c6（第八十五批 密钥�
 make std-mw       # 编译并运行 examples/stdmw.c6（第八十六批 限流/缓存/邮件编码/模糊匹配）
 make std-proto4   # 编译并运行 examples/stdproto4.c6（第八十七批 CoAP/DHCP/SSDP + 文本折叠）
 make std-ops      # 编译并运行 examples/stdops.c6（第八十八批 NetFlow/WoL/WebVTT/DNS 区域）
+make std-docs     # 编译并运行 examples/stddocs.c6（第八十九批 单复数/mbox/KDL/RTF）
 make bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```
 

@@ -536,6 +536,7 @@
 | `examples/stdmw.c6` | （无模块） | 第八十六批（服务端中间件语义）的拼装示例（`make std-mw`）：限流、缓存、邮件编码、模糊匹配各一节，最后串成「限流 → 缓存 → 回源」的请求路径（60 条检查） |
 | `examples/stdproto4.c6` | （无模块） | 第八十七批（发现与配置协议）的拼装示例（`make std-proto4`）：CoAP/DHCP/SSDP 三个报文层各一节 + 文本折叠，最后串成「发现 → 取数 → 写日志」（56 条检查） |
 | `examples/stdops.c6` | （无模块） | 第八十八批（网络运维 + 媒体清单）的拼装示例（`make std-ops`）：NetFlow/WoL/WebVTT/DNS 区域各一节，最后串成「找主机 → 唤醒 → 记流 → 出字幕」（62 条检查） |
+| `examples/stddocs.c6` | （无模块） | 第八十九批（文档与邮件）的拼装示例（`make std-docs`）：单复数 / mbox / KDL / RTF 各一节，最后串成「配置 + 邮件 + 数量 + 正文」（48 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4787,6 +4788,76 @@ make std-ops
 WebVTT 两条字幕（带 id / 带 settings，NOTE 跳过）；DNS 区域文件的 `$TTL`、
 `$ORIGIN`、跨行 SOA、继承 owner 的 NS、两条 A 记录；最后串成「区域文件找主机 →
 发 WoL → 记一条 NetFlow → 出一条 VTT 通知」（62 条检查）。
+
+### 第八十九批：文档与邮件（`plural` / `mbox` / `kdl` / `rtf`）
+
+**`std/text/plural.c6`**——英文单复数与计数短语：
+
+```c
+Plural p = { { { { 0 } } }, 0, { { 0 } }, 0 };
+p.init();
+p.of("city", out, sizeof out);             // "cities"
+p.of("child", out, sizeof out);            // "children"（不规则表）
+p.of("information", out, sizeof out);      // 原样（不可数表）
+p.count_str(3, "file", out, sizeof out);   // "3 files"
+p.add_irregular("cactus", "cacti");        // 自定义
+p.add_uncountable("feedback");
+```
+
+**`std/data/mbox.c6`**——Unix mailbox 分卷 + 头部游标：
+
+```c
+MboxDoc d = { 0 }; MboxMsg m = { 0 };
+d.open(text, len);                         // 游标：open / next / count / reset
+while (d.next(&m)) {                       // 按行首 "From " 切分
+    MboxHdrDoc hd = { 0 }; MboxHdr h = { 0 };
+    hd.open_headers(&m, text);             // 头部游标：open_headers / next_header / get_header
+    hd.get_header("subject", &h);          // 名字大小写不敏感
+    hd.header_value("x-long", buf, sizeof buf);   // 续行折叠成一个空格
+    /* m.body_off / m.body_len：正文里的 ">From " 不算分隔符 */
+}
+```
+
+*游标方法故意不叫 `next`/`count`/`reset`*：同名但参数类型不同的两个方法在同一
+模块里会绑错（编译器按先定义的那个解析），这里用 `next_header` / `header_count` /
+`reset_headers` 区分——这条已经写进模块头注释。
+
+**`std/data/kdl.c6`**——KDL 文档（kdl.dev v1）的节点与参数游标：
+
+```c
+KdlDoc d = { 0 }; KdlNode n = { 0 };
+d.open(text, len);                         // 深度优先、文档顺序
+while (d.next(&n)) {
+    n.depth; n.name_off; n.name_len; n.is_string; n.has_children;
+    KdlArgDoc ad = { 0 }; KdlArg a = { 0 };
+    ad.open_args(&n, text);                // 参数游标：open_args / next_arg / arg_count
+    while (ad.next_arg(&a))
+        ;                                  // a.is_prop / a.name_* / a.val_* / a.is_string
+}
+```
+
+**`std/data/rtf.c6`**——RTF 纯文本提取（控制字剥离、转义、`\uN` → UTF-8）：
+
+```c
+RtfDoc d = { 0 };
+char out[256] = { 0 };
+d.open(text, len);                         // 必须以 {\rtf 开头
+d.plain_text(out, sizeof out);             // 整篇
+// 或流式：while ((n = d.next_text(chunk, sizeof chunk)) > 0) ...
+```
+
+忽略整组：`\*` 可忽略目标与 `fonttbl`/`colortbl`/`stylesheet`/`info`/`pict` 等；
+`\par`/`\line` → 换行、`\tab` → 制表符、`\'hh` → 原字节。
+
+### 集成示例：`examples/stddocs.c6`
+
+```sh
+make std-docs
+```
+
+五节：单复数与计数短语；mbox 两条消息（头部游标、续行折叠、`>From`）；KDL 嵌套
+节点与参数/属性游标；RTF 抽取（`fonttbl` 跳过、`\u20320` → 「你」）；最后串成
+「KDL 读输出目录 + mbox 取主题 + plural 生成数量 + RTF 抽正文」（48 条检查）。
 
 ## 相关回归用例
 

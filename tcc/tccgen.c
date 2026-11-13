@@ -13070,6 +13070,10 @@ static const struct C6ErrStdSlot {
     { "std.net.wol",            C6_ERR_SLOT_STD + 362 },
     { "std.data.vtt",           C6_ERR_SLOT_STD + 363 },
     { "std.data.zone",          C6_ERR_SLOT_STD + 364 },
+    { "std.text.plural",        C6_ERR_SLOT_STD + 365 },
+    { "std.data.mbox",          C6_ERR_SLOT_STD + 366 },
+    { "std.data.kdl",           C6_ERR_SLOT_STD + 367 },
+    { "std.data.rtf",           C6_ERR_SLOT_STD + 368 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

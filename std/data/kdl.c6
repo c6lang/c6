@@ -1,0 +1,655 @@
+/* std/data/kdl：KDL 文档（kdl.dev v1）——节点游标 + 参数/属性游标。
+ *
+ *     import std.data.kdl;
+ *
+ *     KdlDoc d = { 0 };
+ *     KdlNode n = { 0 };
+ *     d.open(text, len);                 // 游标：open / next / count / reset
+ *     while (d.next(&n)) {               // 深度优先、文档顺序
+ *         printf("%*s%s\n", n.depth * 2, "", text + n.name_off);
+ *         KdlArgDoc ad = { 0 };
+ *         KdlArg a = { 0 };
+ *         ad.open_args(&n, text);        // 参数游标：open_args / next_arg / arg_count
+ *         while (ad.next_arg(&a)) {
+ *             if (a.is_prop)             // a.name_off / a.name_len 是属性名
+ *                 ;
+ *             // a.val_off / a.val_len / a.is_string
+ *         }
+ *     }
+ *
+ * 覆盖 KDL v1 的常用部分：
+ *
+ * - 节点名是裸词（bareword）或带引号的字符串，引号里支持反斜杠转义；
+ * - 节点后面可以有任意多个参数（值与属性），属性写成 name=value；
+ * - 花括号里是子节点区，可嵌套；depth 从 0 开始；
+ * - 行注释是两个斜杠；块注释以斜杠星号开始、星号斜杠结束（可跨行）；
+ * - 斜杠加连字符是「划掉下一个节点/参数」（KDL 的软注释），解析时直接跳过；
+ * - 换行结束一条节点的参数区，除非紧接着花括号开子节点区。
+ *
+ * 只做**读取**（不做序列化）：KdlNode / KdlArg 都是原文本里的偏移，不分配。
+ * 注意游标方法故意不重名（next 给节点、next_arg 给参数），因为同名字、不同
+ * 参数类型的两个方法在同一模块里会绑错。
+ */
+#include <string.h>
+
+module std.data.kdl;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+struct KdlNode {
+    int depth;
+    int name_off;
+    int name_len;
+    int is_string;
+    int line;
+    int args_off;               /* 参数区起点（名字之后） */
+    int args_end;               /* 参数区终点（行尾 / '{' 之前） */
+    int has_children;
+    int idx;
+};
+
+struct KdlArg {
+    int is_prop;
+    int name_off;               /* 属性名（is_prop = 0 时为 0/0） */
+    int name_len;
+    int val_off;
+    int val_len;
+    int is_string;
+};
+
+struct KdlDoc {
+    const char *p;
+    int len;
+    int pos;
+    int depth;
+    int line;
+    int seen;
+    int bad;
+    int opened;                 /* 已经进过子节点区 */
+};
+
+struct KdlArgDoc {
+    const char *p;
+    int pos;
+    int end;
+    int seen;
+    int bad;
+};
+
+static int kdl_at(KdlDoc *d, int i)
+{
+    return (i >= 0 && i < d->len) ? (int)(unsigned char)d->p[i] : 0;
+}
+
+static int kdl_is_space(int c)
+{
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+/* 跳过空白与注释；返回 0 成功，-1 词法错误。 */
+static int kdl_skip(KdlDoc *d, int stop_at_newline, int *saw_newline)
+{
+    if (saw_newline)
+        *saw_newline = 0;
+    while (d->pos < d->len) {
+        int c = kdl_at(d, d->pos);
+
+        if (kdl_is_space(c)) {
+            d->pos++;
+            continue;
+        }
+        if (c == '\n') {
+            if (stop_at_newline) {
+                if (saw_newline)
+                    *saw_newline = 1;
+                return 0;
+            }
+            d->pos++;
+            d->line++;
+            continue;
+        }
+        if (c == '/' && kdl_at(d, d->pos + 1) == '/') {
+            while (d->pos < d->len && kdl_at(d, d->pos) != '\n')
+                d->pos++;
+            continue;
+        }
+        if (c == '/' && kdl_at(d, d->pos + 1) == '*') {
+            d->pos += 2;
+            while (d->pos + 1 < d->len
+                   && !(kdl_at(d, d->pos) == '*' && kdl_at(d, d->pos + 1) == '/')) {
+                if (kdl_at(d, d->pos) == '\n')
+                    d->line++;
+                d->pos++;
+            }
+            if (d->pos + 1 >= d->len)
+                return -1;      /* 块注释没闭合 */
+            d->pos += 2;
+            continue;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+/* 读一个值或名字：裸词或引号串。返回 1 有、0 没有、-1 坏。 */
+static int kdl_token(KdlDoc *d, int *off, int *len, int *is_string)
+{
+    int c = kdl_at(d, d->pos);
+
+    *off = d->pos;
+    *len = 0;
+    *is_string = 0;
+    if (c == '"') {
+        d->pos++;
+        *off = d->pos;
+        while (d->pos < d->len) {
+            int k = kdl_at(d, d->pos);
+
+            if (k == '\\') {
+                d->pos += 2;
+                continue;
+            }
+            if (k == '"')
+                break;
+            if (k == '\n')
+                return -1;      /* 引号串不能跨行 */
+            d->pos++;
+        }
+        if (d->pos >= d->len || kdl_at(d, d->pos) != '"')
+            return -1;
+        *len = d->pos - *off;
+        *is_string = 1;
+        d->pos++;
+        return 1;
+    }
+    while (d->pos < d->len) {
+        int k = kdl_at(d, d->pos);
+
+        if (kdl_is_space(k) || k == '\n' || k == '{' || k == '}' || k == ';'
+            || k == '=')
+            break;
+        if (k == '/' && (kdl_at(d, d->pos + 1) == '/' || kdl_at(d, d->pos + 1) == '*'))
+            break;
+        d->pos++;
+    }
+    *len = d->pos - *off;
+    return *len > 0 ? 1 : 0;
+}
+
+int open(KdlDoc *d, const char *text, int len)
+{
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->p = text;
+    d->len = text ? len : 0;
+    d->line = 1;
+    if (!text || len <= 0)
+        return -1;
+    return 0;
+}
+
+int count(KdlDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(KdlDoc *d)
+{
+    if (!d || !d->p)
+        return;
+    d->pos = 0;
+    d->depth = 0;
+    d->line = 1;
+    d->seen = 0;
+    d->bad = 0;
+    d->opened = 0;
+}
+
+/* 取下一个节点；1 = 有，0 = 读完，-1 = 词法错误。 */
+int next(KdlDoc *d, KdlNode *n)
+{
+    int off = 0;
+    int len = 0;
+    int is_string = 0;
+    int rc = 0;
+    int newline = 0;
+
+    if (!d || !n || d->bad)
+        return -1;
+    memset(n, 0, sizeof *n);
+    for (;;) {
+        /* 处理 '{' / '}' / ';' 这些结构字符 */
+        if (kdl_skip(d, 0, 0) < 0) {
+            d->bad = 1;
+            return -1;
+        }
+        if (d->pos >= d->len)
+            return 0;
+        {
+            int c = kdl_at(d, d->pos);
+
+            if (c == '}') {
+                if (d->depth == 0) {
+                    d->bad = 1;
+                    return -1;  /* 多余的 '}' */
+                }
+                d->depth--;
+                d->pos++;
+                continue;
+            }
+            if (c == ';') {
+                d->pos++;
+                continue;
+            }
+            if (c == '{') {     /* 上个节点的子节点区 */
+                d->depth++;
+                d->pos++;
+                d->opened = 1;
+                continue;
+            }
+            if (c == '/' && kdl_at(d, d->pos + 1) == '-') {
+                /* 软注释：跳过下一个节点（含其子节点区） */
+                int skip_depth = 0;
+
+                d->pos += 2;
+                while (d->pos < d->len) {
+                    int k = kdl_at(d, d->pos);
+
+                    if (k == '{') {
+                        skip_depth++;
+                        d->pos++;
+                        continue;
+                    }
+                    if (k == '}') {
+                        d->pos++;
+                        if (skip_depth > 0)
+                            skip_depth--;
+                        else
+                            break;
+                        if (skip_depth == 0)
+                            break;
+                        continue;
+                    }
+                    if (k == '\n' && skip_depth == 0)
+                        break;
+                    if (k == '\n')
+                        d->line++;
+                    d->pos++;
+                }
+                continue;
+            }
+        }
+        break;
+    }
+    /* 节点名 */
+    rc = kdl_token(d, &off, &len, &is_string);
+    if (rc <= 0) {
+        d->bad = 1;
+        return -1;
+    }
+    n->name_off = off;
+    n->name_len = len;
+    n->is_string = is_string;
+    n->depth = d->depth;
+    n->line = d->line;
+    n->args_off = d->pos;
+    /* 参数区：到行尾或 '{' 为止 */
+    {
+        int start = d->pos;
+        int end = d->pos;
+
+        while (d->pos < d->len) {
+            int c = kdl_at(d, d->pos);
+
+            if (c == '\n' || c == '{' || c == '}' || c == ';')
+                break;
+            if (c == '/' && (kdl_at(d, d->pos + 1) == '/'
+                             || kdl_at(d, d->pos + 1) == '*')) {
+                if (kdl_skip(d, 0, &newline) < 0) {
+                    d->bad = 1;
+                    return -1;
+                }
+                end = d->pos;
+                continue;
+            }
+            d->pos++;
+            if (!kdl_is_space(c))
+                end = d->pos;
+        }
+        n->args_off = start;
+        n->args_end = end;
+    }
+    n->has_children = (kdl_at(d, d->pos) == '{');
+    n->idx = d->seen;
+    d->seen++;
+    if (!n->has_children && kdl_at(d, d->pos) == '\n')
+        d->pos++;
+    return 1;
+}
+
+/* ---- 参数/属性游标 ---- */
+
+int open_args(KdlArgDoc *ad, const KdlNode *n, const char *text)
+{
+    if (!ad || !n || !text)
+        return -1;
+    ad->p = text;
+    ad->pos = n->args_off;
+    ad->end = n->args_end;
+    ad->seen = 0;
+    ad->bad = 0;
+    return 0;
+}
+
+static int kdl_arg_at(KdlArgDoc *ad, int i)
+{
+    return (i >= 0 && i < ad->end) ? (int)(unsigned char)ad->p[i] : 0;
+}
+
+int next_arg(KdlArgDoc *ad, KdlArg *out)
+{
+    int off = 0;
+    int len = 0;
+    int is_string = 0;
+
+    if (!ad || ad->bad)
+        return -1;
+    while (ad->pos < ad->end) {
+        int c = kdl_arg_at(ad, ad->pos);
+
+        if (kdl_is_space(c) || c == '\n') {
+            ad->pos++;
+            continue;
+        }
+        break;
+    }
+    if (ad->pos >= ad->end)
+        return 0;
+    /* 软注释：跳过下一个参数 */
+    if (kdl_arg_at(ad, ad->pos) == '/' && kdl_arg_at(ad, ad->pos + 1) == '-') {
+        ad->pos += 2;
+        while (ad->pos < ad->end && !kdl_is_space(kdl_arg_at(ad, ad->pos)))
+            ad->pos++;
+        return next_arg(ad, out);
+    }
+    /* 先看是不是属性：name=... */
+    {
+        int save = ad->pos;
+        int c = kdl_arg_at(ad, ad->pos);
+
+        if (c == '"') {
+            ad->pos++;
+            while (ad->pos < ad->end && kdl_arg_at(ad, ad->pos) != '"') {
+                if (kdl_arg_at(ad, ad->pos) == '\\')
+                    ad->pos++;
+                ad->pos++;
+            }
+            if (ad->pos >= ad->end || kdl_arg_at(ad, ad->pos) != '"') {
+                ad->bad = 1;
+                return -1;
+            }
+            ad->pos++;
+            if (kdl_arg_at(ad, ad->pos) == '=') {
+                if (out) {
+                    out->is_prop = 1;
+                    out->name_off = save + 1;
+                    out->name_len = ad->pos - save - 2;
+                }
+                ad->pos++;
+            } else {
+                if (out) {
+                    out->is_prop = 0;
+                    out->name_off = 0;
+                    out->name_len = 0;
+                    out->val_off = save + 1;
+                    out->val_len = ad->pos - save - 2;
+                    out->is_string = 1;
+                }
+                ad->seen++;
+                return 1;
+            }
+        } else {
+            int s = ad->pos;
+
+            while (ad->pos < ad->end) {
+                int k = kdl_arg_at(ad, ad->pos);
+
+                if (k == '=' || kdl_is_space(k) || k == '\n')
+                    break;
+                ad->pos++;
+            }
+            if (kdl_arg_at(ad, ad->pos) == '=') {
+                if (out) {
+                    out->is_prop = 1;
+                    out->name_off = s;
+                    out->name_len = ad->pos - s;
+                }
+                ad->pos++;
+            } else {
+                if (out) {
+                    out->is_prop = 0;
+                    out->name_off = 0;
+                    out->name_len = 0;
+                    out->val_off = s;
+                    out->val_len = ad->pos - s;
+                    out->is_string = 0;
+                }
+                ad->seen++;
+                return 1;
+            }
+        }
+    }
+    /* 属性值 */
+    {
+        int c = kdl_arg_at(ad, ad->pos);
+
+        if (c == '"') {
+            ad->pos++;
+            off = ad->pos;
+            while (ad->pos < ad->end && kdl_arg_at(ad, ad->pos) != '"') {
+                if (kdl_arg_at(ad, ad->pos) == '\\')
+                    ad->pos++;
+                ad->pos++;
+            }
+            if (ad->pos >= ad->end || kdl_arg_at(ad, ad->pos) != '"') {
+                ad->bad = 1;
+                return -1;
+            }
+            len = ad->pos - off;
+            ad->pos++;
+            is_string = 1;
+        } else {
+            off = ad->pos;
+            while (ad->pos < ad->end) {
+                int k = kdl_arg_at(ad, ad->pos);
+
+                if (kdl_is_space(k) || k == '\n')
+                    break;
+                ad->pos++;
+            }
+            len = ad->pos - off;
+        }
+        if (out) {
+            out->val_off = off;
+            out->val_len = len;
+            out->is_string = is_string;
+        }
+    }
+    ad->seen++;
+    return 1;
+}
+
+int arg_count(KdlArgDoc *ad)
+{
+    return ad ? ad->seen : -1;
+}
+
+void reset_args(KdlArgDoc *ad)
+{
+    if (!ad || !ad->p)
+        return;
+    ad->pos = 0;                /* 由 open_args 重置起点见下 */
+    ad->seen = 0;
+    ad->bad = 0;
+}
+
+/* ---- 自测 ---- */
+
+test "KDL：节点、参数与嵌套" {
+    const char *text = "// 顶部注释\n"
+                       "title \"Hello\" 1 2 key=val\n"
+                       "server {\n"
+                       "    host \"example.com\"\n"
+                       "    port 8080\n"
+                       "    tls {\n"
+                       "        enabled #true\n"
+                       "    }\n"
+                       "}\n"
+                       "logs {\n"
+                       "    /* 块注释 */\n"
+                       "    -/tmp/ignored.log\n"
+                       "    /- debug.log\n"
+                       "    /var/log/app.log\n"
+                       "}\n";
+    KdlDoc d = { 0 };
+    KdlNode n = { 0 };
+    KdlArgDoc ad = { 0 };
+    KdlArg a = { 0 };
+
+    if (d.open(text, (int)strlen(text)) != 0)
+        return err(1, "open 失败");
+    /* title */
+    if (d.next(&n) != 1 || n.depth != 0 || n.name_len != 5
+        || memcmp(text + n.name_off, "title", 5) != 0)
+        return err(2, "第一个节点应是 title");
+    if (n.has_children)
+        return err(3, "title 不该有子节点");
+    ad.open_args(&n, text);
+    if (ad.next_arg(&a) != 1 || !a.is_string || a.val_len != 5
+        || memcmp(text + a.val_off, "Hello", 5) != 0)
+        return err(4, "第一个参数应是字符串 Hello");
+    if (ad.next_arg(&a) != 1 || a.is_prop || a.val_len != 1
+        || memcmp(text + a.val_off, "1", 1) != 0)
+        return err(5, "第二个参数应是 1");
+    if (ad.next_arg(&a) != 1 || a.is_prop || a.val_len != 1)
+        return err(6, "第三个参数不取到");
+    if (ad.next_arg(&a) != 1 || !a.is_prop || a.name_len != 3
+        || memcmp(text + a.name_off, "key", 3) != 0)
+        return err(7, "第四个是属性 key");
+    if (memcmp(text + a.val_off, "val", 3) != 0)
+        return err(8, "属性值应是 val");
+    if (ad.next_arg(&a) != 0 || ad.arg_count() != 4)
+        return err(9, "应恰好四个参数");
+    /* server（有子节点） */
+    if (d.next(&n) != 1 || n.name_len != 6 || !n.has_children || n.depth != 0)
+        return err(10, "第二个节点应是 server（带子节点）");
+    if (d.next(&n) != 1 || n.depth != 1 || n.name_len != 4)
+        return err(11, "server 的子节点应是 host，深度 1");
+    if (d.next(&n) != 1 || n.name_len != 4 || n.depth != 1)
+        return err(12, "接着是 port");
+    if (d.next(&n) != 1 || n.name_len != 3 || n.depth != 1 || !n.has_children)
+        return err(13, "接着是 tls（带子节点）");
+    if (d.next(&n) != 1 || n.depth != 2 || n.name_len != 7)
+        return err(14, "tls 的子节点应是 enabled，深度 2");
+    /* 回到第 0 层 */
+    if (d.next(&n) != 1 || n.name_len != 4 || n.depth != 0 || !n.has_children)
+        return err(15, "接着应是 logs（深度 0）");
+    /* logs 的子节点里：/- 跳过 debug.log，剩下两条 */
+    if (d.next(&n) != 1 || n.depth != 1
+        || memcmp(text + n.name_off, "-/tmp/ignored.log", 17) != 0)
+        return err(16, "logs 的第一个子节点应是 -/tmp/ignored.log");
+    if (d.next(&n) != 1 || n.depth != 1
+        || memcmp(text + n.name_off, "/var/log/app.log", 16) != 0)
+        return err(17, "debug.log 应被软注释跳过");
+    if (d.next(&n) != 0)
+        return err(18, "logs 之后应读完");
+}
+
+test "KDL：引号转义、坏输入与计数" {
+    const char *text = "a \"x\\\"y\" b \"tab\\there\"\n"
+                       "c {\n"
+                       "}\n"
+                       "d\n";
+    KdlDoc d = { 0 };
+    KdlNode n = { 0 };
+    KdlArgDoc ad = { 0 };
+    KdlArg a = { 0 };
+    int count = 0;
+
+    d.open(text, (int)strlen(text));
+    if (d.next(&n) != 1 || n.name_len != 1)
+        return err(1, "节点 a 没取到");
+    ad.open_args(&n, text);
+    if (ad.next_arg(&a) != 1 || !a.is_string || a.val_len != 4)
+        return err(2, "转义引号参数长度不对");
+    if (memcmp(text + a.val_off, "x\\\"y", 4) != 0)
+        return err(3, "转义内容应原样保留");
+    if (ad.next_arg(&a) != 1 || a.is_string || a.val_len != 1)
+        return err(4, "第二个参数应是裸词 b");
+    if (ad.next_arg(&a) != 1 || !a.is_string
+        || memcmp(text + a.val_off, "tab\\there", 9) != 0)
+        return err(14, "制表符转义应原样保留");
+    /* 空子节点区 + 之后的节点 */
+    if (d.next(&n) != 1 || n.name_len != 1 || !n.has_children)
+        return err(5, "节点 c 应带空子节点区");
+    if (d.next(&n) != 1 || n.name_len != 1 || n.depth != 0)
+        return err(6, "节点 d 应在第 0 层");
+    if (d.next(&n) != 0)
+        return err(7, "应读完");
+    count = d.count();
+    if (count != 3)
+        return err(8, "应恰好三个节点");
+    d.reset();
+    if (d.next(&n) != 1 || d.count() != 1)
+        return err(9, "reset 后应从头");
+    /* 坏输入：多余的 '}'、未闭合的块注释、未闭合的引号、未闭合的子节点区 */
+    {
+        const char *bad1 = "}\n";
+        KdlDoc bd = { 0 };
+        KdlNode bn = { 0 };
+
+        bd.open(bad1, (int)strlen(bad1));
+        if (bd.next(&bn) != -1)
+            return err(10, "多余的 } 应失败");
+    }
+    {
+        const char *bad2 = "a /* 没闭合\n";
+        KdlDoc bd = { 0 };
+        KdlNode bn = { 0 };
+
+        bd.open(bad2, (int)strlen(bad2));
+        if (bd.next(&bn) != -1)
+            return err(11, "未闭合块注释应失败");
+    }
+    {
+        const char *bad3 = "a \"没闭合\n";
+        KdlDoc bd = { 0 };
+        KdlNode bn = { 0 };
+
+        KdlArgDoc bad_ad = { 0 };
+        KdlArg bad_a = { 0 };
+
+        bd.open(bad3, (int)strlen(bad3));
+        /* 节点名本身是合法裸词 a；未闭合的是参数里的引号串，
+           所以错误要在参数游标上才暴露 */
+        if (bd.next(&bn) != 1)
+            return err(12, "节点 a 本身应能读出来");
+        bad_ad.open_args(&bn, bad3);
+        if (bad_ad.next_arg(&bad_a) != -1)
+            return err(15, "未闭合引号应失败");
+    }
+    {
+        const char *unfinished = "a {\n b\n";
+        KdlDoc bd = { 0 };
+        KdlNode bn = { 0 };
+        int got = 0;
+
+        bd.open(unfinished, (int)strlen(unfinished));
+        while (bd.next(&bn) == 1)
+            got++;
+        if (got != 2)
+            return err(13, "未闭合的子节点区应先给出已读到的节点");
+    }
+}

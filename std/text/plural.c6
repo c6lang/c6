@@ -1,0 +1,375 @@
+/* std/text/plural：英文单复数——规则化复数 + 不规则/不可数表 + 计数短语。
+ *
+ *     import std.text.plural;
+ *
+ *     Plural p = { 0 };
+ *     p.init();
+ *     char out[64] = { 0 };
+ *     p.of("box", out, sizeof out);            // "boxes"
+ *     p.of("city", out, sizeof out);           // "cities"
+ *     p.count_str(3, "file", out, sizeof out); // "3 files"
+ *     p.count_str(1, "file", out, sizeof out); // "1 file"
+ *     p.count_str(2, "child", out, sizeof out);// "2 children"
+ *
+ * 规则按「常见程度」从具体到一般判：
+ *
+ * - 不规则表优先（`person→people`、`child→children`、`mouse→mice`…）；
+ * - 不可数表原样返回（`information`、`sheep`、`fish`、`news`…）；
+ * - `-s/-x/-z/-ch/-sh` → `+es`；辅音 + `y` → `-y+ies`；元音 + `y` → `+s`；
+ * - `-f/-fe` → `-ves`（`leaf→leaves`、`knife→knives`；`roof` 这类进不规则表）；
+ * - 其余 `+s`。
+ *
+ * 不纠大小写：`Box` → `Boxes`（首字母大写照原样），这与自然语言里的用法一致。
+ * 自定义不规则/不可数用方法加：`p.add_irregular("cactus", "cacti")`、
+ * `p.add_uncountable("feedback")`。
+ */
+#include <string.h>
+
+module std.text.plural;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define PLURAL_WORD 24
+#define PLURAL_TABLE 24
+
+struct PluralPair {
+    char one[PLURAL_WORD];
+    char many[PLURAL_WORD];
+};
+
+struct Plural {
+    PluralPair irregular[PLURAL_TABLE];
+    int n_irregular;
+    char uncountable[PLURAL_TABLE][PLURAL_WORD];
+    int n_uncountable;
+};
+
+static const char *const plural_irregular_builtin[][2] = {
+    { "person", "people" },
+    { "man", "men" },
+    { "woman", "women" },
+    { "child", "children" },
+    { "foot", "feet" },
+    { "tooth", "teeth" },
+    { "goose", "geese" },
+    { "mouse", "mice" },
+    { "ox", "oxen" },
+    { "datum", "data" },
+    { "index", "indices" },
+    { "matrix", "matrices" },
+    { "analysis", "analyses" },
+    { "crisis", "crises" },
+    { "roof", "roofs" },
+    { "belief", "beliefs" },
+    { "chief", "chiefs" },
+};
+
+static const char *const plural_uncountable_builtin[] = {
+    "information", "equipment", "software", "hardware", "money", "news",
+    "series", "species", "sheep", "fish", "deer", "rice", "furniture",
+};
+
+int add_irregular(Plural *p, const char *one, const char *many);
+int add_uncountable(Plural *p, const char *word);
+
+void init(Plural *p)
+{
+    if (!p)
+        return;
+    memset(p, 0, sizeof *p);
+    for (int i = 0; i < (int)(sizeof plural_irregular_builtin
+                             / sizeof plural_irregular_builtin[0]); i++)
+        add_irregular(p, plural_irregular_builtin[i][0],
+                      plural_irregular_builtin[i][1]);
+    for (int i = 0; i < (int)(sizeof plural_uncountable_builtin
+                             / sizeof plural_uncountable_builtin[0]); i++)
+        add_uncountable(p, plural_uncountable_builtin[i]);
+}
+
+int add_irregular(Plural *p, const char *one, const char *many)
+{
+    int lo = 0;
+
+    if (!p || !one || !many)
+        return -1;
+    lo = (int)strlen(one);
+    if (lo <= 0 || lo >= PLURAL_WORD || (int)strlen(many) >= PLURAL_WORD)
+        return -1;
+    if (p->n_irregular >= PLURAL_TABLE)
+        return -1;
+    memcpy(p->irregular[p->n_irregular].one, one, (size_t)lo + 1);
+    memcpy(p->irregular[p->n_irregular].many, many, strlen(many) + 1);
+    p->n_irregular++;
+    return 0;
+}
+
+int add_uncountable(Plural *p, const char *word)
+{
+    int lo = 0;
+
+    if (!p || !word)
+        return -1;
+    lo = (int)strlen(word);
+    if (lo <= 0 || lo >= PLURAL_WORD)
+        return -1;
+    if (p->n_uncountable >= PLURAL_TABLE)
+        return -1;
+    memcpy(p->uncountable[p->n_uncountable], word, (size_t)lo + 1);
+    p->n_uncountable++;
+    return 0;
+}
+
+static int plural_low(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+static int plural_is(const char *a, const char *b)
+{
+    for (int i = 0;; i++) {
+        if (plural_low((int)(unsigned char)a[i]) != plural_low((int)(unsigned char)b[i]))
+            return 0;
+        if (!a[i])
+            return 1;
+    }
+}
+
+static int plural_ends(const char *w, const char *suffix)
+{
+    int wl = (int)strlen(w);
+    int sl = (int)strlen(suffix);
+
+    if (sl > wl)
+        return 0;
+    for (int i = 0; i < sl; i++)
+        if (plural_low((int)(unsigned char)w[wl - sl + i])
+            != plural_low((int)(unsigned char)suffix[i]))
+            return 0;
+    return 1;
+}
+
+static int plural_is_vowel(int c)
+{
+    int l = plural_low(c);
+
+    return l == 'a' || l == 'e' || l == 'i' || l == 'o' || l == 'u';
+}
+
+/* 复数形式写到 out；返回长度，失败 -1。 */
+int of(Plural *p, const char *word, char *out, int cap)
+{
+    int wl = 0;
+
+    if (!p || !word || !out || cap < 3)
+        return -1;
+    wl = (int)strlen(word);
+    if (wl <= 0)
+        return -1;
+    /* 不规则 */
+    for (int i = 0; i < p->n_irregular; i++)
+        if (plural_is(word, p->irregular[i].one)) {
+            int n = (int)strlen(p->irregular[i].many);
+
+            if (n + 1 > cap)
+                return -1;
+            memcpy(out, p->irregular[i].many, (size_t)n + 1);
+            return n;
+        }
+    /* 不可数 */
+    for (int i = 0; i < p->n_uncountable; i++)
+        if (plural_is(word, p->uncountable[i])) {
+            if (wl + 1 > cap)
+                return -1;
+            memcpy(out, word, (size_t)wl + 1);
+            return wl;
+        }
+    /* 规则 */
+    if (plural_ends(word, "ch") || plural_ends(word, "sh")
+        || plural_ends(word, "s") || plural_ends(word, "x")
+        || plural_ends(word, "z")) {
+        if (wl + 3 > cap)
+            return -1;
+        memcpy(out, word, (size_t)wl);
+        memcpy(out + wl, "es", 3);
+        return wl + 2;
+    }
+    if (plural_ends(word, "y") && wl >= 2 && !plural_is_vowel(word[wl - 2])) {
+        if (wl + 3 > cap)
+            return -1;
+        memcpy(out, word, (size_t)wl - 1);
+        memcpy(out + wl - 1, "ies", 4);
+        return wl + 2;
+    }
+    if (plural_ends(word, "fe")) {
+        if (wl + 2 > cap)
+            return -1;
+        memcpy(out, word, (size_t)wl - 2);
+        memcpy(out + wl - 2, "ves", 4);
+        return wl + 1;
+    }
+    if (plural_ends(word, "f") && !plural_ends(word, "ff")) {
+        if (wl + 2 > cap)
+            return -1;
+        memcpy(out, word, (size_t)wl - 1);
+        memcpy(out + wl - 1, "ves", 4);
+        return wl + 2;
+    }
+    if (wl + 2 > cap)
+        return -1;
+    memcpy(out, word, (size_t)wl);
+    memcpy(out + wl, "s", 2);
+    return wl + 1;
+}
+
+/* 把 long 写成十进制；返回长度。 */
+static int plural_long(long n, char *out, int cap)
+{
+    char tmp[24] = { 0 };
+    int k = 0;
+    long v = n;
+    int i = 0;
+
+    if (v < 0) {
+        if (cap < 2)
+            return -1;
+        out[i++] = '-';
+        v = -v;
+    }
+    do {
+        tmp[k++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    } while (v > 0 && k < 23);
+    if (i + k + 1 > cap)
+        return -1;
+    for (int j = k - 1; j >= 0; j--)
+        out[i++] = tmp[j];
+    out[i] = 0;
+    return i;
+}
+
+/* "3 files" / "1 file" / "2 children"。 */
+int count_str(Plural *p, long n, const char *word, char *out, int cap)
+{
+    char form[PLURAL_WORD * 2] = { 0 };
+    int k = 0;
+    int f = 0;
+
+    if (!p || !word || !out)
+        return -1;
+    if (n == 1) {
+        f = (int)strlen(word);
+        if (f >= (int)sizeof form)
+            return -1;
+        memcpy(form, word, (size_t)f + 1);
+    } else {
+        f = p->of(word, form, (int)sizeof form);
+        if (f < 0)
+            return -1;
+    }
+    k = plural_long(n, out, cap);
+    if (k < 0 || k + 1 + f + 1 > cap)
+        return -1;
+    out[k] = ' ';
+    memcpy(out + k + 1, form, (size_t)f + 1);
+    return k + 1 + f;
+}
+
+/* 显式给单复数两个词（不可数就传同一个词）。 */
+int count_str_with(Plural *p, long n, const char *one, const char *many,
+                   char *out, int cap)
+{
+    const char *form = 0;
+    int k = 0;
+    int f = 0;
+
+    (void)p;
+    if (!one || !many || !out)
+        return -1;
+    form = (n == 1) ? one : many;
+    f = (int)strlen(form);
+    k = plural_long(n, out, cap);
+    if (k < 0 || k + 1 + f + 1 > cap)
+        return -1;
+    out[k] = ' ';
+    memcpy(out + k + 1, form, (size_t)f + 1);
+    return k + 1 + f;
+}
+
+/* ---- 自测 ---- */
+
+test "plural：规则复数" {
+    Plural p = { { { { 0 } } }, 0, { { 0 } }, 0 };
+    char out[64] = { 0 };
+
+    p.init();
+    if (p.of("file", out, sizeof out) != 5 || strcmp(out, "files") != 0)
+        return err(1, "file → files");
+    if (p.of("box", out, sizeof out) != 5 || strcmp(out, "boxes") != 0)
+        return err(2, "box → boxes");
+    if (p.of("bus", out, sizeof out) != 5 || strcmp(out, "buses") != 0)
+        return err(3, "bus → buses");
+    if (p.of("watch", out, sizeof out) != 7 || strcmp(out, "watches") != 0)
+        return err(4, "watch → watches");
+    if (p.of("dish", out, sizeof out) != 6 || strcmp(out, "dishes") != 0)
+        return err(5, "dish → dishes");
+    if (p.of("city", out, sizeof out) != 6 || strcmp(out, "cities") != 0)
+        return err(6, "city → cities");
+    if (p.of("day", out, sizeof out) != 4 || strcmp(out, "days") != 0)
+        return err(7, "day → days（元音 + y 只加 s）");
+    if (p.of("leaf", out, sizeof out) != 6 || strcmp(out, "leaves") != 0)
+        return err(8, "leaf → leaves");
+    if (p.of("knife", out, sizeof out) != 6 || strcmp(out, "knives") != 0)
+        return err(9, "knife → knives");
+    if (p.of("Box", out, sizeof out) != 5 || strcmp(out, "Boxes") != 0)
+        return err(10, "首字母大写照原样");
+}
+
+test "plural：不规则、不可数、计数短语" {
+    Plural p = { { { { 0 } } }, 0, { { 0 } }, 0 };
+    char out[64] = { 0 };
+
+    p.init();
+    if (p.of("child", out, sizeof out) != 8 || strcmp(out, "children") != 0)
+        return err(1, "child → children");
+    if (p.of("person", out, sizeof out) != 6 || strcmp(out, "people") != 0)
+        return err(2, "person → people");
+    if (p.of("mouse", out, sizeof out) != 4 || strcmp(out, "mice") != 0)
+        return err(3, "mouse → mice");
+    if (p.of("roof", out, sizeof out) != 5 || strcmp(out, "roofs") != 0)
+        return err(4, "roof → roofs（不规则表里覆盖）");
+    /* 不可数 */
+    if (p.of("information", out, sizeof out) != 11
+        || strcmp(out, "information") != 0)
+        return err(5, "information 不可数");
+    if (p.of("sheep", out, sizeof out) != 5 || strcmp(out, "sheep") != 0)
+        return err(6, "sheep 单复数同形");
+    /* 自定义 */
+    if (p.add_irregular("cactus", "cacti") != 0)
+        return err(7, "add_irregular 失败");
+    if (p.of("cactus", out, sizeof out) != 5 || strcmp(out, "cacti") != 0)
+        return err(8, "自定义不规则没生效");
+    if (p.add_uncountable("feedback") != 0)
+        return err(9, "add_uncountable 失败");
+    if (p.of("feedback", out, sizeof out) != 8 || strcmp(out, "feedback") != 0)
+        return err(10, "自定义不可数没生效");
+    /* 计数短语 */
+    if (p.count_str(1, "file", out, sizeof out) != 6 || strcmp(out, "1 file") != 0)
+        return err(11, "1 file");
+    if (p.count_str(3, "file", out, sizeof out) != 7 || strcmp(out, "3 files") != 0)
+        return err(12, "3 files");
+    if (p.count_str(0, "file", out, sizeof out) != 7 || strcmp(out, "0 files") != 0)
+        return err(13, "0 files（只有 1 才用单数）");
+    if (p.count_str(2, "child", out, sizeof out) != 10
+        || strcmp(out, "2 children") != 0)
+        return err(14, "2 children");
+    if (p.count_str(-1, "box", out, sizeof out) != 8 || strcmp(out, "-1 boxes") != 0)
+        return err(15, "负数也用复数");
+    /* 坏参数 */
+    if (p.of("x", out, 2) != -1)
+        return err(16, "容量不足应失败");
+    if (p.count_str(2, "file", out, 4) != -1)
+        return err(17, "计数容量不足应失败");
+    if (p.add_irregular("", "x") != -1)
+        return err(18, "空词应拒绝");
+}
