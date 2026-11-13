@@ -13078,6 +13078,10 @@ static const struct C6ErrStdSlot {
     { "std.net.gemini",         C6_ERR_SLOT_STD + 370 },
     { "std.net.snmp",           C6_ERR_SLOT_STD + 371 },
     { "std.net.nntp",           C6_ERR_SLOT_STD + 372 },
+    { "std.net.cidr",           C6_ERR_SLOT_STD + 373 },
+    { "std.core.endian",        C6_ERR_SLOT_STD + 374 },
+    { "std.text.collate",       C6_ERR_SLOT_STD + 375 },
+    { "std.text.hyphen",        C6_ERR_SLOT_STD + 376 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

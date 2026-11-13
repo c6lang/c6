@@ -2991,3 +2991,18 @@ BSER 这套只做「短格式 + 长格式长度」，不追求通用 ASN.1：SNM
 err 号段补 `std.net.prometheus`=0x6171、`std.net.gemini`=0x6172、
 `std.net.snmp`=0x6173、`std.net.nntp`=0x6174。`std/` 现在 373 个 `.c6` 文件；
 四个模块的 test 块逐个跑过（各 2 条，0 failure）。
+
+### 11.105 标准库第九十一批（网段 / 字节序 / 排序键 / 断词）
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/net/cidr.c6` | IPv4/IPv6 CIDR：解析（主机位清零）、包含判断、网络/广播地址、可用主机数、子网划分游标 | 2 | `Cidr.parse/contains_text/network_str/broadcast_str/host_count/prefix_of/family_of`；`SubnetDoc.open/next/count/reset`；`Subnet.net_str` |
+| `std/core/endian.c6` | 字节序读写游标（不依赖 libc）：u8/16/32/64、按位宽读、seek/skip、越界即失败；写入游标 + 换序工具 | 2 | `EndianReader.init/read_u8..u64/uint_le/skip/seek/remaining/ok`；`EndianWriter.init_writer/put8..put64/put_bytes/length/writer_ok/bytes`；`bswap*/host_is_little` |
+| `std/text/collate.c6` | 排序键：大小写折叠、忽略标点、数字感知（按数值比），键可直接 `strcmp` | 2 | `Collator.init/key/compare/equal/flags_of` |
+| `std/text/hyphen.c6` | 断词（VCCV 启发式 + 常见前后缀 + 最小前后缀约束），明确不是 TeX 字典 | 2 | `Hyphenator.init/breaks/hyphenate/config` |
+
+集成示例 `examples/stdutil.c6`（`make std-util`）45 条检查。`Makefile` 增加
+`STD_UTIL_SRCS` / `std-util`（`.PHONY`、help、`test-all`、`check-all` 同步）；
+err 号段补 `std.net.cidr`=0x6175、`std.core.endian`=0x6176、
+`std.text.collate`=0x6177、`std.text.hyphen`=0x6178。`std/` 现在 377 个 `.c6` 文件；
+四个模块的 test 块逐个跑过（各 2 条，0 failure）。

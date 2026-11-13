@@ -7,6 +7,20 @@
 
 ## 未发布
 
+### 标准库第九十一批：网段、字节序、排序键、断词
+
+- **`std/net/cidr.c6`**：IPv4/IPv6 CIDR。解析后主机位清零，`contains_text` 判归属，
+  `network_str`/`broadcast_str`/`host_count` 给网段信息；`SubnetDoc` 把网段拆成更小
+  前缀的子网（带 `next`/`count`/`reset` 游标，最多一次展开 2^20 个）。
+- **`std/core/endian.c6`**：字节序读写游标。大端/小端都支持 u8/16/32/64 与按位宽读，
+  越界立即进入失败态；写入游标 + `bswap16/32/64` + `host_is_little`，不依赖 libc。
+- **`std/text/collate.c6`**：排序键。大小写折叠、忽略标点、数字按数值比，
+  键是字节串可直接 `strcmp`，排序一堆字符串时先算键缓存即可。
+- **`std/text/hyphen.c6`**：断词（VCCV 启发式 + 常见前后缀 + 最小前后缀约束），
+  给出断点下标或直接插入连字符；明确不是 TeX 断词字典。
+- 集成示例 `examples/stdutil.c6`（`make std-util`，45 条检查）+ `STD_UTIL_SRCS` +
+  err 号段 0x6175…0x6178；`std/` 到 **377** 个模块。
+
 ### 标准库第九十批：网络管理与可观测
 
 - **`std/net/prometheus.c6`**：Prometheus 文本暴露格式（语法层）。样本/`# HELP`/

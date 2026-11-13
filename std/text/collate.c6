@@ -1,0 +1,224 @@
+/* std/text/collate：排序键（collation key）——让 `memcmp` 等于「人想要的顺序」。
+ *
+ *     import std.text.collate;
+ *
+ *     Collator c = { 0 };
+ *     c.init(COLLATE_CASELESS | COLLATE_NUMERIC);
+ *     char ka[64] = { 0 }, kb[64] = { 0 };
+ *     c.key("File10", 6, ka, sizeof ka);
+ *     c.key("file9", 5, kb, sizeof kb);
+ *     if (strcmp(ka, kb) > 0) ...        // "File10" 排在 "file9" 后面（数字按数值比）
+ *
+ *     c.compare("a-b", 3, "ab", 2);      // 忽略标点时相等 ⇒ 0
+ *
+ * 为什么要有它：`strcmp` 是按字节比，"A" < "a"；直接比大小写混合的文件名/用户名，
+ * 结果和人眼看到的顺序不一样；再看 "file10" < "file9" 这种数字串，字节序肯定错。
+ *
+ * 键的构造（都能一眼看懂，方便调试）：
+ *
+ * - 每个字符先折叠（`COLLATE_CASELESS` 时大写→小写），非 ASCII 字节按原样保留
+ *   （要更彻底就用 `std.text.translit` 先折一道）；
+ * - `COLLATE_IGNORE_PUNCT` 时丢掉标点与空白；
+ * - `COLLATE_NUMERIC` 时数字串编成 `0x01` + 一位长度 + 数字（长度先比，再比数值），
+ *   这样 "2" < "10"，且不同位数不会互相干扰；
+ * - 其余字节原样追加，最后补 `0x00` 作为终止符（键是字节串，可以用 `strcmp`）。
+ *
+ * `compare()` 直接算键再比，适合一次性比较；要排序一堆字符串就先算好键缓存起来。
+ */
+#include <string.h>
+
+module std.text.collate;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define COLLATE_CASELESS 1
+#define COLLATE_IGNORE_PUNCT 2
+#define COLLATE_NUMERIC 4
+
+#define COLLATE_KEY_MAX 256
+
+struct Collator {
+    int flags;
+};
+
+static int col_low(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+static int col_is_punct(int c)
+{
+    if (c >= '0' && c <= '9')
+        return 0;
+    if (c >= 'a' && c <= 'z')
+        return 0;
+    if (c >= 'A' && c <= 'Z')
+        return 0;
+    if (c >= 0x80)
+        return 0;
+    return 1;                   /* ASCII 里非字母数字的都可当标点/空白 */
+}
+
+void init(Collator *c, int flags)
+{
+    if (!c)
+        return;
+    c->flags = flags;
+}
+
+int flags_of(Collator *c)
+{
+    return c ? c->flags : -1;
+}
+
+/* 生成排序键；返回键长（不含终止符），失败 -1。 */
+int key(Collator *c, const char *s, int len, char *out, int cap)
+{
+    int i = 0;
+    int o = 0;
+
+    if (!c || !s || len < 0 || !out || cap < 2)
+        return -1;
+    while (i < len) {
+        int ch = (int)(unsigned char)s[i];
+
+        if ((c->flags & COLLATE_IGNORE_PUNCT) && col_is_punct(ch)) {
+            i++;
+            continue;
+        }
+        if ((c->flags & COLLATE_NUMERIC) && ch >= '0' && ch <= '9') {
+            int j = i;
+            int digits = 0;
+
+            while (j < len && s[j] >= '0' && s[j] <= '9') {
+                j++;
+                digits++;
+            }
+            if (o + 2 + digits + 1 > cap)
+                return -1;
+            out[o++] = 0x01;
+            out[o++] = (char)(digits & 0xff);
+            for (int k = i; k < j; k++)
+                out[o++] = (char)(s[k] - '0');      /* 存数值 0..9，比字符更好比 */
+            i = j;
+            continue;
+        }
+        if (c->flags & COLLATE_CASELESS)
+            ch = col_low(ch);
+        if (o + 1 + 1 > cap)
+            return -1;
+        out[o++] = (char)ch;
+        i++;
+    }
+    out[o] = 0;
+    return o;
+}
+
+int key_len(Collator *c)
+{
+    return c ? COLLATE_KEY_MAX : -1;
+}
+
+/* 按排序规则比较；<0 / 0 / >0。 */
+int compare(Collator *c, const char *a, int alen, const char *b, int blen)
+{
+    char ka[COLLATE_KEY_MAX] = { 0 };
+    char kb[COLLATE_KEY_MAX] = { 0 };
+    int na = key(c, a, alen, ka, (int)sizeof ka);
+    int nb = key(c, b, blen, kb, (int)sizeof kb);
+
+    if (na < 0 || nb < 0)
+        return 0;
+    return strcmp(ka, kb);
+}
+
+/* 排序键相等（忽略大小写/标点/数字写法）。 */
+int equal(Collator *c, const char *a, int alen, const char *b, int blen)
+{
+    return compare(c, a, alen, b, blen) == 0;
+}
+
+/* ---- 自测 ---- */
+
+test "collate：大小写与标点折叠" {
+    Collator c = { 0 };
+    Collator ci = { 0 };
+    char ka[64] = { 0 };
+    char kb[64] = { 0 };
+
+    c.init(0);
+    /* 默认（不折叠）：大写字母键比小写小 */
+    if (c.compare("Apple", 5, "apple", 5) >= 0)
+        return err(1, "默认应区分大小写");
+    ci.init(COLLATE_CASELESS);
+    if (ci.compare("Apple", 5, "apple", 5) != 0)
+        return err(2, "忽略大小写后应相等");
+    if (ci.compare("APPLE", 5, "apricot", 7) >= 0)
+        return err(3, "忽略大小写后 apple < apricot");
+    /* 标点 */
+    {
+        Collator cp = { 0 };
+
+        cp.init(COLLATE_CASELESS | COLLATE_IGNORE_PUNCT);
+        if (cp.compare("a-b", 3, "ab", 2) != 0)
+            return err(4, "忽略标点后 a-b == ab");
+        if (cp.compare("a b", 3, "Ab", 2) != 0)
+            return err(5, "忽略标点+大小写后 a b == Ab");
+        if (cp.compare("a-c", 3, "ac", 2) != 0)
+            return err(6, "a-c == ac（都折成 ac）");
+    }
+    /* 键本身可用 strcmp 比 */
+    c.init(COLLATE_CASELESS);
+    if (c.key("abc", 3, ka, sizeof ka) != 3 || strcmp(ka, "abc") != 0)
+        return err(7, "键应是小写原样");
+    if (c.key("Abc", 3, kb, sizeof kb) != 3 || strcmp(ka, kb) != 0)
+        return err(8, "两个键应相同");
+}
+
+test "collate：数字感知与边界" {
+    Collator c = { 0 };
+    Collator text = { 0 };
+    char ka[64] = { 0 };
+    char kb[64] = { 0 };
+
+    c.init(COLLATE_CASELESS | COLLATE_NUMERIC);
+    /* 数字按数值比：file2 < file10 */
+    if (c.compare("file2", 5, "file10", 6) >= 0)
+        return err(1, "file2 应排在 file10 前面");
+    if (c.compare("file10", 6, "file9", 5) <= 0)
+        return err(2, "file10 应排在 file9 后面");
+    if (c.compare("file10", 6, "file10", 6) != 0)
+        return err(3, "相同字符串应相等");
+    /* 数字串长度不同不会互相干扰 */
+    if (c.compare("v1.9", 4, "v1.10", 5) >= 0)
+        return err(4, "v1.9 应排在 v1.10 前面");
+    /* 不带 NUMERIC 时就是字节序（"10" < "9"） */
+    text.init(COLLATE_CASELESS);
+    if (text.compare("file10", 6, "file9", 5) >= 0)
+        return err(5, "不带 NUMERIC 时应按字节序（10 < 9）");
+    /* 键里数字段的形状 */
+    if (c.key("a12", 3, ka, sizeof ka) != 5)
+        return err(6, "a12 的键应为 'a' + 标记 + 长度 + 2 位 = 5 字节");
+    if ((unsigned char)ka[0] != 'a' || (unsigned char)ka[1] != 0x01
+        || (unsigned char)ka[2] != 2)
+        return err(7, "数字段标记/长度不对");
+    if ((unsigned char)ka[3] != 1 || (unsigned char)ka[4] != 2)
+        return err(8, "数字段应存数值 1 2");
+    /* 空串与容量 */
+    if (c.key("", 0, ka, sizeof ka) != 0 || ka[0] != 0)
+        return err(9, "空串的键应为空");
+    if (c.key("abc", 3, ka, 2) != -1)
+        return err(10, "容量不足应失败");
+    if (c.compare("", 0, "", 0) != 0)
+        return err(11, "两个空串应相等");
+    /* 非 ASCII 字节原样保留（不折叠） */
+    {
+        char kb2[64] = { 0 };
+
+        c.init(COLLATE_CASELESS);
+        if (c.key("\xc3\x89", 2, kb2, sizeof kb2) != 2
+            || (unsigned char)kb2[0] != 0xc3)
+            return err(12, "非 ASCII 应原样保留");
+    }
+}

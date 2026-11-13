@@ -1,0 +1,656 @@
+/* std/net/cidr：IPv4 / IPv6 的 CIDR —— 解析、包含判断、网段信息、子网划分游标。
+ *
+ *     import std.net.cidr;
+ *
+ *     Cidr c = { 0 };
+ *     c.parse("192.168.0.0/16");            // 0 = 合法（主机位会被清零）
+ *     c.contains_text("192.168.7.9");       // 1
+ *     c.network_str(buf, sizeof buf);       // "192.168.0.0"
+ *     c.broadcast_str(buf, sizeof buf);     // "192.168.255.255"（仅 v4）
+ *     c.host_count();                       // 65534（去掉网络号与广播，v6 给 -1）
+ *
+ *     SubnetDoc d = { 0 };
+ *     Subnet sn = { 0 };
+ *     d.open(&c, 24);                       // 方法：open / next / count / reset
+ *     while (d.next(&sn))                   // 把 /16 拆成 /24 逐个给出
+ *         sn.net_str(buf, sizeof buf);
+ *
+ * 两条规矩要记住：
+ *
+ * - 解析后**主机位一律清零**（`192.168.7.9/16` 的 network 是 `192.168.0.0`），
+ *   原始输入不保留——判断网段归属时这是唯一正确的语义；
+ * - IPv6 的 `/128` 是单主机，`/0` 是全部；`host_count()` 对 v6 返回 -1（2^64 以上
+ *   的数没有意义），需要的话用 `prefix` 自己算。
+ */
+#include <string.h>
+
+module std.net.cidr;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define CIDR_V4 4
+#define CIDR_V6 6
+
+struct Cidr {
+    int ok;
+    int family;                 /* 4 或 6 */
+    int prefix;                 /* 0..32 / 0..128 */
+    unsigned char addr[16];     /* 已按 prefix 清零主机位的网络地址 */
+};
+
+struct Subnet {
+    int family;
+    int prefix;
+    unsigned char addr[16];
+    int idx;
+};
+
+struct SubnetDoc {
+    Cidr net;
+    int new_prefix;
+    unsigned long long total;
+    unsigned long long idx;
+};
+
+static int cidr_hex(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* 严格十进制 0..max；返回 -1 表示不是数字。 */
+static int cidr_dec(const char *s, int len, int max)
+{
+    int v = 0;
+
+    if (len <= 0 || len > 3)
+        return -1;
+    for (int i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return -1;
+        v = v * 10 + (s[i] - '0');
+    }
+    return v <= max ? v : -1;
+}
+
+/* IPv4 文本 → 4 字节；0 成功。 */
+int parse_v4(const char *s, int len, unsigned char *out)
+{
+    int part = 0;
+    int i = 0;
+
+    if (!s || !out || len <= 0)
+        return -1;
+    while (i < len && part < 4) {
+        int start = i;
+
+        while (i < len && s[i] >= '0' && s[i] <= '9')
+            i++;
+        {
+            int v = cidr_dec(s + start, i - start, 255);
+
+            if (v < 0)
+                return -1;
+            out[part++] = (unsigned char)v;
+        }
+        if (part < 4) {
+            if (i >= len || s[i] != '.')
+                return -1;
+            i++;
+        }
+    }
+    return (part == 4 && i == len) ? 0 : -1;
+}
+
+/* IPv6 文本 → 16 字节（支持 "::" 压缩与末段 IPv4 写法）；0 成功。 */
+int parse_v6(const char *s, int len, unsigned char *out)
+{
+    int groups[8] = { 0 };
+    int ng = 0;
+    int dcolon = -1;
+    int i = 0;
+
+    if (!s || !out || len <= 0)
+        return -1;
+    memset(out, 0, 16);
+    if (len >= 2 && s[0] == ':' && s[1] == ':') {
+        dcolon = 0;
+        i = 2;
+    }
+    while (i < len) {
+        if (s[i] == ':') {
+            if (dcolon >= 0)
+                return -1;
+            dcolon = ng;
+            i++;
+            if (i < len && s[i] == ':')
+                return -1;
+            continue;
+        }
+        /* 末段的 IPv4 写法 */
+        {
+            int j = i;
+            int dots = 0;
+
+            while (j < len && (s[j] == '.' || (s[j] >= '0' && s[j] <= '9')
+                               || (s[j] >= 'a' && s[j] <= 'f')
+                               || (s[j] >= 'A' && s[j] <= 'F')))
+                j++;
+            for (int k = i; k < j; k++)
+                if (s[k] == '.')
+                    dots++;
+            if (dots == 3) {
+                unsigned char v4[4] = { 0 };
+
+                if (parse_v4(s + i, j - i, v4) != 0)
+                    return -1;
+                if (ng > 6)
+                    return -1;
+                groups[ng++] = (v4[0] << 8) | v4[1];
+                groups[ng++] = (v4[2] << 8) | v4[3];
+                i = j;
+                continue;
+            }
+        }
+        {
+            int start = i;
+            int v = 0;
+            int digits = 0;
+
+            while (i < len && i - start < 4) {
+                int h = cidr_hex((int)(unsigned char)s[i]);
+
+                if (h < 0)
+                    break;
+                v = (v << 4) | h;
+                i++;
+                digits++;
+            }
+            if (digits == 0 || ng >= 8)
+                return -1;
+            groups[ng++] = v;
+        }
+        if (i < len && s[i] == ':') {
+            i++;
+            if (i < len && s[i] == ':') {
+                if (dcolon >= 0)
+                    return -1;
+                dcolon = ng;
+                i++;
+            }
+            continue;
+        }
+        if (i < len)
+            return -1;
+    }
+    if (dcolon >= 0) {
+        int tail = ng - dcolon;
+
+        if (ng >= 8 && tail > 0)
+            return -1;
+        for (int k = 0; k < tail; k++)
+            groups[7 - k] = groups[ng - 1 - k];
+        for (int k = dcolon; k < 8 - tail; k++)
+            groups[k] = 0;
+        ng = 8;
+    }
+    if (ng != 8)
+        return -1;
+    for (int k = 0; k < 8; k++) {
+        out[k * 2] = (unsigned char)((groups[k] >> 8) & 0xff);
+        out[k * 2 + 1] = (unsigned char)(groups[k] & 0xff);
+    }
+    return 0;
+}
+
+/* 按 prefix 清零主机位。 */
+static void cidr_mask(Cidr *c)
+{
+    int bits = c->prefix;
+    int nbytes = (c->family == CIDR_V4) ? 4 : 16;
+
+    for (int i = 0; i < nbytes; i++) {
+        int keep = bits - i * 8;
+
+        if (keep >= 8)
+            continue;
+        if (keep <= 0)
+            c->addr[i] = 0;
+        else
+            c->addr[i] &= (unsigned char)(0xff << (8 - keep));
+    }
+}
+
+/* 解析 "addr/prefix"；prefix 可省（按主机路由 /128 或 /32）。0 = 合法。 */
+int parse(Cidr *c, const char *text, int len)
+{
+    int slash = -1;
+    int prefix = -1;
+
+    if (!c)
+        return -1;
+    memset(c, 0, sizeof *c);
+    if (!text || len <= 0)
+        return -1;
+    for (int i = 0; i < len; i++)
+        if (text[i] == '/') {
+            slash = i;
+            break;
+        }
+    {
+        int alen = (slash >= 0) ? slash : len;
+
+        /* 有冒号就是 v6，否则先试 v4 */
+        {
+            int is_v6 = 0;
+
+            for (int i = 0; i < alen; i++)
+                if (text[i] == ':')
+                    is_v6 = 1;
+            if (is_v6) {
+                if (parse_v6(text, alen, c->addr) != 0)
+                    return -1;
+                c->family = CIDR_V6;
+                c->prefix = 128;
+            } else {
+                if (parse_v4(text, alen, c->addr) != 0)
+                    return -1;
+                c->family = CIDR_V4;
+                c->prefix = 32;
+            }
+        }
+    }
+    if (slash >= 0) {
+        int v = cidr_dec(text + slash + 1, len - slash - 1, 128);
+
+        if (v < 0)
+            return -1;
+        prefix = v;
+        if (c->family == CIDR_V4 && prefix > 32)
+            return -1;
+        c->prefix = prefix;
+    }
+    cidr_mask(c);
+    c->ok = 1;
+    return 0;
+}
+
+int prefix_of(Cidr *c)
+{
+    return c && c->ok ? c->prefix : -1;
+}
+
+int family_of(Cidr *c)
+{
+    return c && c->ok ? c->family : -1;
+}
+
+/* 文本形式的网络地址（不含 /prefix）。 */
+int network_str(Cidr *c, char *out, int cap)
+{
+    int o = 0;
+
+    if (!c || !c->ok || !out)
+        return -1;
+    if (c->family == CIDR_V4) {
+        if (cap < 16)
+            return -1;
+        for (int i = 0; i < 4; i++) {
+            int v = c->addr[i];
+            char tmp[3] = { 0 };
+            int k = 0;
+
+            if (v >= 100)
+                tmp[k++] = (char)('0' + v / 100);
+            if (v >= 10)
+                tmp[k++] = (char)('0' + (v / 10) % 10);
+            tmp[k++] = (char)('0' + v % 10);
+            memcpy(out + o, tmp, (size_t)k);
+            o += k;
+            if (i < 3)
+                out[o++] = '.';
+        }
+        out[o] = 0;
+        return o;
+    }
+    /* v6：按最长零串压缩 */
+    {
+        int groups[8] = { 0 };
+        int best = -1;
+        int bestlen = 0;
+
+        for (int i = 0; i < 8; i++)
+            groups[i] = (c->addr[i * 2] << 8) | c->addr[i * 2 + 1];
+        for (int i = 0; i < 8; i++) {
+            int k = 0;
+
+            while (i + k < 8 && groups[i + k] == 0)
+                k++;
+            if (k > bestlen) {
+                bestlen = k;
+                best = i;
+            }
+            i += k;
+        }
+        if (bestlen < 2)
+            best = -1;
+        for (int i = 0; i < 8; i++) {
+            static const char *hex = "0123456789abcdef";
+            char tmp[4] = { 0 };
+            int k = 0;
+            int v = groups[i];
+
+            if (i == best) {
+                if (o + 1 > cap)
+                    return -1;
+                out[o++] = ':';
+                out[o++] = ':';
+                i += bestlen - 1;
+                continue;
+            }
+            if (v == 0) {
+                tmp[k++] = '0';
+            } else {
+                while (v > 0 && k < 4) {
+                    tmp[k++] = hex[v & 0xf];
+                    v >>= 4;
+                }
+            }
+            if (o + k + 1 + (i < 7 ? 1 : 0) > cap)
+                return -1;
+            for (int j = k - 1; j >= 0; j--)
+                out[o++] = tmp[j];
+            if (i < 7 && !(best >= 0 && i == best - 1))
+                out[o++] = ':';
+            else if (i < 7 && best >= 0 && i == best - 1) {
+                /* "::" 已经在下一轮写 */
+            }
+        }
+        out[o] = 0;
+        return o;
+    }
+}
+
+/* 广播地址（仅 v4）；返回 0 成功。 */
+int broadcast_str(Cidr *c, char *out, int cap)
+{
+    Cidr b = { 0 };
+
+    if (!c || !c->ok || c->family != CIDR_V4)
+        return -1;
+    b = *c;
+    for (int i = 0; i < 4; i++) {
+        int keep = b.prefix - i * 8;
+
+        if (keep >= 8)
+            continue;
+        if (keep <= 0)
+            b.addr[i] = 0xff;
+        else
+            b.addr[i] |= (unsigned char)(0xff >> keep);
+    }
+    return network_str(&b, out, cap);
+}
+
+/* 可用主机数（v4 去掉网络号与广播；v6 给 -1）。 */
+long host_count(Cidr *c)
+{
+    long total = 0;
+
+    if (!c || !c->ok || c->family != CIDR_V4)
+        return -1;
+    if (c->prefix >= 31)
+        return (c->prefix == 32) ? 1 : 2;
+    total = 1L << (32 - c->prefix);
+    return total - 2;
+}
+
+static int cidr_same(const unsigned char *a, const unsigned char *b, int nbytes,
+                     int prefix)
+{
+    int bits = prefix;
+
+    for (int i = 0; i < nbytes; i++) {
+        int keep = bits - i * 8;
+
+        if (keep >= 8) {
+            if (a[i] != b[i])
+                return 0;
+            continue;
+        }
+        if (keep <= 0)
+            return 1;
+        return ((a[i] ^ b[i]) & (unsigned char)(0xff << (8 - keep))) == 0;
+    }
+    return 1;
+}
+
+int contains_text(Cidr *c, const char *addr)
+{
+    Cidr other = { 0 };
+
+    if (!c || !c->ok || !addr)
+        return 0;
+    if (parse(&other, addr, (int)strlen(addr)) != 0)
+        return 0;
+    if (other.family != c->family)
+        return 0;
+    return cidr_same(c->addr, other.addr, c->family == CIDR_V4 ? 4 : 16, c->prefix);
+}
+
+/* ---- 子网划分游标 ---- */
+
+int open(SubnetDoc *d, Cidr *net, int new_prefix)
+{
+    int maxp = 0;
+
+    if (!d || !net || !net->ok)
+        return -1;
+    maxp = (net->family == CIDR_V4) ? 32 : 128;
+    if (new_prefix < net->prefix || new_prefix > maxp || new_prefix - net->prefix > 20)
+        return -1;              /* 最多一次展开 2^20 个子网 */
+    memset(d, 0, sizeof *d);
+    d->net = *net;
+    d->new_prefix = new_prefix;
+    d->total = 1ULL << (new_prefix - net->prefix);
+    d->idx = 0;
+    return 0;
+}
+
+/* 取下一个子网；1 = 有，0 = 取完。 */
+int next(SubnetDoc *d, Subnet *out)
+{
+    int nbytes = 0;
+    int bits = 0;
+
+    if (!d || !d->net.ok)
+        return -1;
+    if (d->idx >= d->total)
+        return 0;
+    nbytes = (d->net.family == CIDR_V4) ? 4 : 16;
+    if (out) {
+        out->family = d->net.family;
+        out->prefix = d->new_prefix;
+        memcpy(out->addr, d->net.addr, (size_t)nbytes);
+        /* 把 idx 写进新多出来的那几位 */
+        {
+            unsigned long long v = d->idx << (nbytes * 8 - d->new_prefix);
+
+            for (int i = 0; i < nbytes; i++) {
+                int shift = (nbytes - 1 - i) * 8;
+
+                out->addr[i] = (unsigned char)(d->net.addr[i]
+                                               | ((v >> shift) & 0xff));
+            }
+        }
+        out->idx = (int)d->idx;
+    }
+    d->idx++;
+    bits = d->idx >= d->total ? 1 : 0;
+    (void)bits;
+    return 1;
+}
+
+int count(SubnetDoc *d)
+{
+    return d ? (int)d->idx : -1;
+}
+
+void reset(SubnetDoc *d)
+{
+    if (!d)
+        return;
+    d->idx = 0;
+}
+
+int net_str(Subnet *s, char *out, int cap)
+{
+    Cidr tmp = { 0 };
+
+    if (!s || !out)
+        return -1;
+    memcpy(tmp.addr, s->addr, 16);
+    tmp.family = s->family;
+    tmp.prefix = s->prefix;
+    tmp.ok = 1;
+    return network_str(&tmp, out, cap);
+}
+
+/* ---- 自测 ---- */
+
+test "CIDR：IPv4 解析、包含与网段信息" {
+    Cidr c = { 0 };
+    char buf[64] = { 0 };
+
+    if (c.parse("192.168.7.9/16", (int)strlen("192.168.7.9/16")) != 0 || !c.ok)
+        return err(1, "解析 CIDR 失败");
+    if (c.family != CIDR_V4 || c.prefix != 16)
+        return err(2, "family/prefix 不对");
+    if (c.network_str(buf, sizeof buf) != 11
+        || strcmp(buf, "192.168.0.0") != 0)
+        return err(3, "主机位应被清零");
+    if (c.broadcast_str(buf, sizeof buf) != 15
+        || strcmp(buf, "192.168.255.255") != 0)
+        return err(4, "广播地址不对");
+    if (c.host_count() != 65534)
+        return err(5, "/16 可用主机数应为 65534");
+    if (!c.contains_text("192.168.7.9") || !c.contains_text("192.168.255.254"))
+        return err(6, "网内地址应命中");
+    if (c.contains_text("192.169.0.1") || c.contains_text("10.0.0.1"))
+        return err(7, "网外地址不该命中");
+    /* 单主机与 /0 */
+    {
+        Cidr one = { 0 };
+        Cidr all = { 0 };
+
+        if (one.parse("10.1.2.3", (int)strlen("10.1.2.3")) != 0 || one.prefix != 32)
+            return err(8, "省略 prefix 应按 /32");
+        if (one.host_count() != 1)
+            return err(9, "/32 可用主机数应为 1");
+        if (all.parse("0.0.0.0/0", (int)strlen("0.0.0.0/0")) != 0 || all.prefix != 0)
+            return err(10, "/0 解析失败");
+        if (!all.contains_text("8.8.8.8"))
+            return err(11, "/0 应包含一切");
+        if (all.host_count() != 4294967294L)
+            return err(12, "/0 可用主机数不对");
+    }
+    /* /31 的两个地址都可用 */
+    {
+        Cidr p31 = { 0 };
+
+        p31.parse("10.0.0.0/31", (int)strlen("10.0.0.0/31"));
+        if (p31.host_count() != 2)
+            return err(13, "/31 应为 2");
+    }
+    /* 坏输入 */
+    {
+        Cidr bad = { 0 };
+
+        if (bad.parse("192.168.0.256/24", (int)strlen("192.168.0.256/24")) != -1)
+            return err(14, "越界字节应失败");
+        if (bad.parse("192.168.0.0/33", (int)strlen("192.168.0.0/33")) != -1)
+            return err(15, "v4 prefix 超 32 应失败");
+        if (bad.parse("1.2.3/24", (int)strlen("1.2.3/24")) != -1)
+            return err(16, "段数不足应失败");
+    }
+}
+
+test "CIDR：IPv6、子网游标与坏输入" {
+    Cidr v6 = { 0 };
+    Cidr v4 = { 0 };
+    SubnetDoc d = { 0 };
+    Subnet sn = { 0 };
+    char buf[64] = { 0 };
+    int n = 0;
+
+    if (v6.parse("2001:db8::/32", (int)strlen("2001:db8::/32")) != 0 || v6.family != CIDR_V6)
+        return err(1, "v6 解析失败");
+    if (v6.network_str(buf, sizeof buf) != 10
+        || strcmp(buf, "2001:db8::") != 0)
+        return err(2, "v6 网络地址不对");
+    if (!v6.contains_text("2001:db8:1::1"))
+        return err(3, "v6 网内地址应命中");
+    if (v6.contains_text("2001:db9::1"))
+        return err(4, "v6 网外地址不该命中");
+    if (v6.host_count() != -1)
+        return err(5, "v6 的 host_count 应给 -1");
+    /* ::1 与全零 */
+    {
+        Cidr loop = { 0 };
+
+        if (loop.parse("::1/128", (int)strlen("::1/128")) != 0 || loop.family != CIDR_V6)
+            return err(6, "::1 解析失败");
+        if (loop.network_str(buf, sizeof buf) != 3 || strcmp(buf, "::1") != 0)
+            return err(7, "::1 输出不对");
+    }
+    /* 子网划分：10.0.0.0/8 → /10 共 4 个 */
+    if (v4.parse("10.0.0.0/8", (int)strlen("10.0.0.0/8")) != 0)
+        return err(8, "/8 解析失败");
+    if (d.open(&v4, 10) != 0)
+        return err(9, "open 子网游标失败");
+    if (d.next(&sn) != 1 || sn.prefix != 10)
+        return err(10, "第一个子网没取到");
+    if (sn.net_str(buf, sizeof buf) <= 0 || strcmp(buf, "10.0.0.0") != 0)
+        return err(11, "第一个子网地址应是 10.0.0.0");
+    n = 1;
+    while (d.next(&sn) == 1)
+        n++;
+    if (n != 4 || d.count() != 4)
+        return err(12, "/8 拆 /10 应有 4 个子网");
+    d.reset();
+    if (d.next(&sn) != 1 || sn.idx != 0)
+        return err(13, "reset 后应从头");
+    /* 最后一个子网是 10.192.0.0 */
+    {
+        int last = 0;
+
+        d.reset();
+        while (d.next(&sn) == 1)
+            last = 1;
+        if (!last || sn.net_str(buf, sizeof buf) <= 0
+            || strcmp(buf, "10.192.0.0") != 0)
+            return err(14, "最后一个子网应是 10.192.0.0");
+    }
+    /* 非法划分：新前缀小于原前缀、跨度太大 */
+    if (d.open(&v4, 4) != -1)
+        return err(15, "新前缀小于原前缀应失败");
+    if (d.open(&v4, 30) != -1)
+        return err(16, "跨度过大（>2^20）应失败");
+    /* v6 子网划分 */
+    {
+        SubnetDoc v6d = { 0 };
+
+        if (v6d.open(&v6, 34) != 0)
+            return err(17, "v6 子网游标失败");
+        if (v6d.next(&sn) != 1 || sn.family != CIDR_V6)
+            return err(18, "v6 子网取失败");
+        if (sn.prefix != 34 || sn.net_str(buf, sizeof buf) <= 0)
+            return err(19, "v6 子网前缀/地址不对");
+    }
+}

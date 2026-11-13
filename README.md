@@ -627,6 +627,7 @@ make std-proto4   # 编译并运行 examples/stdproto4.c6（第八十七批 CoAP
 make std-ops      # 编译并运行 examples/stdops.c6（第八十八批 NetFlow/WoL/WebVTT/DNS 区域）
 make std-docs     # 编译并运行 examples/stddocs.c6（第八十九批 单复数/mbox/KDL/RTF）
 make std-mgmt     # 编译并运行 examples/stdmgmt.c6（第九十批 Prometheus/Gemini/SNMP/NNTP）
+make std-util     # 编译并运行 examples/stdutil.c6（第九十一批 CIDR/字节序/排序键/断词）
 make bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```
 

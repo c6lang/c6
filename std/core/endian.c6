@@ -1,0 +1,429 @@
+/* std/core/endian：字节序读写——大端/小端游标 + 换序工具。
+ *
+ *     import std.core.endian;
+ *
+ *     EndianReader r = { 0 };
+ *     r.init(buf, len, 0);              // 0 = 大端（网络序），1 = 小端
+ *     u32 magic = r.read_u32();              // 读 4 字节
+ *     u16 flags = r.read_u16();
+ *     r.skip(2);
+ *     r.remaining();                    // 还剩多少字节
+ *
+ *     EndianWriter w = { 0 };
+ *     w.init(out, sizeof out, 1);       // 小端
+ *     w.put32(0x12345678);
+ *     w.put16(0x00ff);
+ *     w.length() / w.ok() / w.bytes()
+ *
+ * 为什么不用 `htons` 家族：它们只处理 16/32 位、而且要 `<arpa/inet.h>`；标准库的
+ * 二进制格式（WAV/PNG/ELF/IP 头）到处是 64 位与混合字节序，统一成这两个游标
+ * 更好读，也方便在 freestanding 目标上用（不依赖 libc）。
+ *
+ * 读越界时游标进入失败状态：后续读取一律返回 0，`ok()` 变假——这样调用方可以在
+ * 读完整个结构后再统一检查一次。
+ */
+#include <string.h>
+
+module std.core.endian;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+struct EndianReader {
+    const unsigned char *p;
+    int len;
+    int off;
+    int little;                 /* 1 = 小端 */
+    int good;                   /* 字段名避开方法 ok() */
+};
+
+struct EndianWriter {
+    unsigned char *p;
+    int cap;
+    int n;
+    int little;
+    int ok;
+};
+
+/* ---- 换序 ---- */
+
+u16 bswap16(u16 v)
+{
+    return (u16)((v >> 8) | (v << 8));
+}
+
+u32 bswap32(u32 v)
+{
+    return ((v >> 24) & 0xffu) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u)
+         | ((v << 24) & 0xff000000u);
+}
+
+u64 bswap64(u64 v)
+{
+    u64 hi = bswap32((u32)(v >> 32));
+    u64 lo = bswap32((u32)(v & 0xffffffffu));
+
+    return (lo << 32) | hi;
+}
+
+/* 本机是不是小端（运行期判断一次，编译器会把常量折掉）。 */
+int host_is_little(void)
+{
+    u32 probe = 0x01020304u;
+    unsigned char b[4] = { 0 };
+
+    memcpy(b, &probe, 4);
+    return b[0] == 0x04;
+}
+
+/* ---- 读游标 ---- */
+
+void init(EndianReader *r, const unsigned char *p, int len, int little)
+{
+    if (!r)
+        return;
+    memset(r, 0, sizeof *r);
+    r->p = p;
+    r->len = (p && len > 0) ? len : 0;
+    r->little = little ? 1 : 0;
+    r->good = (p != 0 && len >= 0) ? 1 : 0;
+}
+
+int remaining(EndianReader *r)
+{
+    return r && r->good ? r->len - r->off : -1;
+}
+
+int position(EndianReader *r)
+{
+    return r ? r->off : -1;
+}
+
+int ok(EndianReader *r)
+{
+    return r && r->good;
+}
+
+int seek(EndianReader *r, int off)
+{
+    if (!r || !r->good || off < 0 || off > r->len)
+        return -1;
+    r->off = off;
+    return 0;
+}
+
+int skip(EndianReader *r, int n)
+{
+    if (!r || !r->good || n < 0 || r->off + n > r->len) {
+        if (r)
+            r->good = 0;
+        return -1;
+    }
+    r->off += n;
+    return 0;
+}
+
+u8 read_u8(EndianReader *r)
+{
+    u8 v = 0;
+
+    if (!r || !r->good || r->off + 1 > r->len) {
+        if (r)
+            r->good = 0;
+        return 0;
+    }
+    v = r->p[r->off];
+    r->off += 1;
+    return v;
+}
+
+u16 read_u16(EndianReader *r)
+{
+    u16 v = 0;
+
+    if (!r || !r->good || r->off + 2 > r->len) {
+        if (r)
+            r->good = 0;
+        return 0;
+    }
+    if (r->little)
+        v = (u16)(r->p[r->off] | ((u16)r->p[r->off + 1] << 8));
+    else
+        v = (u16)(((u16)r->p[r->off] << 8) | r->p[r->off + 1]);
+    r->off += 2;
+    return v;
+}
+
+u32 read_u32(EndianReader *r)
+{
+    u32 v = 0;
+
+    if (!r || !r->good || r->off + 4 > r->len) {
+        if (r)
+            r->good = 0;
+        return 0;
+    }
+    if (r->little)
+        v = (u32)r->p[r->off] | ((u32)r->p[r->off + 1] << 8)
+          | ((u32)r->p[r->off + 2] << 16) | ((u32)r->p[r->off + 3] << 24);
+    else
+        v = ((u32)r->p[r->off] << 24) | ((u32)r->p[r->off + 1] << 16)
+          | ((u32)r->p[r->off + 2] << 8) | (u32)r->p[r->off + 3];
+    r->off += 4;
+    return v;
+}
+
+u64 read_u64(EndianReader *r)
+{
+    u64 v = 0;
+
+    if (!r || !r->good || r->off + 8 > r->len) {
+        if (r)
+            r->good = 0;
+        return 0;
+    }
+    if (r->little) {
+        v = (u64)r->p[r->off] | ((u64)r->p[r->off + 1] << 8)
+          | ((u64)r->p[r->off + 2] << 16) | ((u64)r->p[r->off + 3] << 24)
+          | ((u64)r->p[r->off + 4] << 32) | ((u64)r->p[r->off + 5] << 40)
+          | ((u64)r->p[r->off + 6] << 48) | ((u64)r->p[r->off + 7] << 56);
+    } else {
+        v = ((u64)r->p[r->off] << 56) | ((u64)r->p[r->off + 1] << 48)
+          | ((u64)r->p[r->off + 2] << 40) | ((u64)r->p[r->off + 3] << 32)
+          | ((u64)r->p[r->off + 4] << 24) | ((u64)r->p[r->off + 5] << 16)
+          | ((u64)r->p[r->off + 6] << 8) | (u64)r->p[r->off + 7];
+    }
+    r->off += 8;
+    return v;
+}
+
+/* 读 n 字节（n ≤ 8）成一个整数；用于「按位宽读」的场景。 */
+u64 uint_le(EndianReader *r, int n)
+{
+    u64 v = 0;
+    int i = 0;
+
+    if (!r || !r->good || n <= 0 || n > 8 || r->off + n > r->len) {
+        if (r)
+            r->good = 0;
+        return 0;
+    }
+    if (r->little) {
+        for (i = n - 1; i >= 0; i--)
+            v = (v << 8) | (u64)r->p[r->off + i];
+    } else {
+        for (i = 0; i < n; i++)
+            v = (v << 8) | (u64)r->p[r->off + i];
+    }
+    r->off += n;
+    return v;
+}
+
+/* ---- 写游标 ---- */
+
+void init_writer(EndianWriter *w, unsigned char *p, int cap, int little)
+{
+    if (!w)
+        return;
+    memset(w, 0, sizeof *w);
+    w->p = p;
+    w->cap = cap;
+    w->little = little ? 1 : 0;
+    w->ok = (p != 0 && cap >= 0) ? 1 : 0;
+}
+
+int length(EndianWriter *w)
+{
+    return w ? w->n : -1;
+}
+
+int writer_ok(EndianWriter *w)
+{
+    return w && w->ok;
+}
+
+unsigned char *bytes(EndianWriter *w)
+{
+    return w ? w->p : 0;
+}
+
+void put8(EndianWriter *w, u8 v)
+{
+    if (!w || !w->ok)
+        return;
+    if (w->n + 1 > w->cap) {
+        w->ok = 0;
+        return;
+    }
+    w->p[w->n++] = v;
+}
+
+void put16(EndianWriter *w, u16 v)
+{
+    if (!w || !w->ok)
+        return;
+    if (w->n + 2 > w->cap) {
+        w->ok = 0;
+        return;
+    }
+    if (w->little) {
+        w->p[w->n++] = (unsigned char)(v & 0xff);
+        w->p[w->n++] = (unsigned char)((v >> 8) & 0xff);
+    } else {
+        w->p[w->n++] = (unsigned char)((v >> 8) & 0xff);
+        w->p[w->n++] = (unsigned char)(v & 0xff);
+    }
+}
+
+void put32(EndianWriter *w, u32 v)
+{
+    if (!w || !w->ok)
+        return;
+    if (w->n + 4 > w->cap) {
+        w->ok = 0;
+        return;
+    }
+    if (w->little) {
+        w->p[w->n++] = (unsigned char)(v & 0xff);
+        w->p[w->n++] = (unsigned char)((v >> 8) & 0xff);
+        w->p[w->n++] = (unsigned char)((v >> 16) & 0xff);
+        w->p[w->n++] = (unsigned char)((v >> 24) & 0xff);
+    } else {
+        w->p[w->n++] = (unsigned char)((v >> 24) & 0xff);
+        w->p[w->n++] = (unsigned char)((v >> 16) & 0xff);
+        w->p[w->n++] = (unsigned char)((v >> 8) & 0xff);
+        w->p[w->n++] = (unsigned char)(v & 0xff);
+    }
+}
+
+void put64(EndianWriter *w, u64 v)
+{
+    if (!w || !w->ok)
+        return;
+    if (w->n + 8 > w->cap) {
+        w->ok = 0;
+        return;
+    }
+    if (w->little) {
+        for (int i = 0; i < 8; i++)
+            w->p[w->n++] = (unsigned char)((v >> (i * 8)) & 0xff);
+    } else {
+        for (int i = 7; i >= 0; i--)
+            w->p[w->n++] = (unsigned char)((v >> (i * 8)) & 0xff);
+    }
+}
+
+/* 追加原始字节。 */
+void put_bytes(EndianWriter *w, const unsigned char *src, int n)
+{
+    if (!w || !w->ok || n < 0 || (n > 0 && !src))
+        return;
+    if (w->n + n > w->cap) {
+        w->ok = 0;
+        return;
+    }
+    if (n > 0)
+        memcpy(w->p + w->n, src, (size_t)n);
+    w->n += n;
+}
+
+/* ---- 自测 ---- */
+
+test "endian：读写游标（大端 / 小端）" {
+    unsigned char buf[16] = { 0 };
+    EndianWriter w = { 0 };
+    EndianReader r = { 0 };
+
+    /* 大端写 */
+    init_writer(&w, buf, sizeof buf, 0);
+    put16(&w, 0x1234);
+    put32(&w, 0x89abcdefu);
+    put8(&w, 0x7f);
+    put64(&w, 0x0102030405060708ull);
+    if (!writer_ok(&w) || length(&w) != 15)
+        return err(1, "大端写失败");
+    if (buf[0] != 0x12 || buf[1] != 0x34 || buf[2] != 0x89 || buf[5] != 0xef)
+        return err(2, "大端字节序不对");
+    if (buf[6] != 0x7f || buf[7] != 0x01 || buf[14] != 0x08)
+        return err(3, "大端 8/64 位不对");
+    /* 读回来 */
+    init(&r, buf, 15, 0);
+    if (r.read_u16() != 0x1234)
+        return err(4, "读 u16 不对");
+    if (r.read_u32() != 0x89abcdefu)
+        return err(5, "读 u32 不对");
+    if (r.read_u8() != 0x7f)
+        return err(6, "读 u8 不对");
+    if (r.read_u64() != 0x0102030405060708ull)
+        return err(7, "读 u64 不对");
+    if (!r.ok() || r.remaining() != 0)
+        return err(8, "读完应正好剩 0");
+    /* 小端写 */
+    init_writer(&w, buf, sizeof buf, 1);
+    put32(&w, 0x89abcdefu);
+    put16(&w, 0x1234);
+    if (!writer_ok(&w) || length(&w) != 6)
+        return err(9, "小端写失败");
+    if (buf[0] != 0xef || buf[1] != 0xcd || buf[4] != 0x34 || buf[5] != 0x12)
+        return err(10, "小端字节序不对");
+    init(&r, buf, 6, 1);
+    if (r.read_u32() != 0x89abcdefu || r.read_u16() != 0x1234)
+        return err(11, "小端读不对");
+}
+
+test "endian：越界、按位宽读、换序与 seek" {
+    unsigned char buf[8] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    EndianReader r = { 0 };
+    EndianWriter w = { 0 };
+    unsigned char small[2] = { 0 };
+
+    /* 按位宽读（3 字节小端 / 大端） */
+    init(&r, buf, 8, 1);
+    if (r.uint_le(3) != 0x030201ull)
+        return err(1, "小端 3 字节读不对");
+    init(&r, buf, 8, 0);
+    if (r.uint_le(3) != 0x010203ull)
+        return err(2, "大端 3 字节读不对");
+    /* seek / skip / position */
+    init(&r, buf, 8, 0);
+    if (r.skip(2) != 0 || r.position() != 2)
+        return err(3, "skip 不对");
+    if (r.read_u16() != 0x0304)
+        return err(4, "skip 后读不对");
+    if (r.seek(0) != 0 || r.read_u8() != 0x01)
+        return err(5, "seek 不对");
+    if (r.seek(9) != -1)
+        return err(6, "seek 越界应失败");
+    /* 越界读：进入失败状态，后续读取给 0 */
+    init(&r, buf, 2, 0);
+    if (r.read_u32() != 0 || r.ok())
+        return err(7, "越界读应失败并置 ok = 0");
+    if (r.read_u8() != 0 || r.remaining() != -1)
+        return err(8, "失败后 remaining 应为 -1");
+    /* 写越界 */
+    init_writer(&w, small, sizeof small, 0);
+    put32(&w, 1);
+    if (writer_ok(&w))
+        return err(9, "写越界应置 ok = 0");
+    /* 换序 */
+    if (bswap16(0x1234) != 0x3412)
+        return err(10, "bswap16 不对");
+    if (bswap32(0x12345678u) != 0x78563412u)
+        return err(11, "bswap32 不对");
+    if (bswap64(0x0102030405060708ull) != 0x0807060504030201ull)
+        return err(12, "bswap64 不对");
+    if (bswap16(bswap16(0xabcd)) != 0xabcd)
+        return err(13, "bswap16 两次应还原");
+    /* 本机字节序探测（两种情况都只是 0/1） */
+    {
+        int little = host_is_little();
+
+        if (little != 0 && little != 1)
+            return err(14, "host_is_little 应返回 0/1");
+    }
+    /* 写原始字节 */
+    init_writer(&w, buf, sizeof buf, 0);
+    put_bytes(&w, (const unsigned char *)"ab", 2);
+    if (length(&w) != 2 || memcmp(bytes(&w), "ab", 2) != 0)
+        return err(15, "put_bytes 不对");
+}

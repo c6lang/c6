@@ -1,0 +1,194 @@
+/* examples/stdutil.c6 —— 第九十一批（网段 / 字节序 / 排序键 / 断词）。
+ *
+ *     make std-util
+ *
+ * 五节，全部方法调用（`c.parse(...)`、`r.read_u32()`、`col.key(...)`、`h.breaks(...)`）：
+ *   1. CIDR：解析、包含判断、网段信息、子网划分游标；
+ *   2. 字节序：大端/小端读写游标、按位宽读、换序；
+ *   3. 排序键：大小写/标点折叠 + 数字感知排序；
+ *   4. 断词：VCCV 启发式断点与连字符插入；
+ *   5. 串联：把一份「主机清单」按网段归组、按人眼顺序排序、再按宽度折行。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.net.cidr;
+import std.core.endian;
+import std.text.collate;
+import std.text.hyphen;
+
+static int checks = 0;
+static int nfail = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        nfail++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* 1. CIDR */
+static void do_cidr(void)
+{
+    Cidr net = { 0 };
+    Cidr host = { 0 };
+    SubnetDoc d = { 0 };
+    Subnet sn = { 0 };
+    char buf[64] = { 0 };
+    int n = 0;
+
+    printf("== cidr（网段与子网划分）\n");
+    check(net.parse("192.168.7.9/16", (int)strlen("192.168.7.9/16")) == 0, "解析 /16");
+    check(net.prefix_of() == 16 && net.family_of() == 4, "前缀/族");
+    check(net.network_str(buf, sizeof buf) == 11
+          && strcmp(buf, "192.168.0.0") == 0, "网络地址（主机位清零）");
+    check(net.broadcast_str(buf, sizeof buf) == 15
+          && strcmp(buf, "192.168.255.255") == 0, "广播地址");
+    check(net.host_count() == 65534, "可用主机数");
+    check(net.contains_text("192.168.7.9") == 1, "网内地址");
+    check(net.contains_text("10.0.0.1") == 0, "网外地址");
+    check(host.parse("10.1.2.3/24", (int)strlen("10.1.2.3/24")) == 0
+          && host.prefix_of() == 24, "另一网段");
+    check(net.contains_text("10.1.2.3") == 0, "不应包含 10/24 的地址");
+    /* 子网划分 */
+    check(d.open(&net, 18) == 0, "拆成 /18");
+    n = 0;
+    while (d.next(&sn) == 1)
+        n++;
+    check(n == 4, "/16 拆 /18 应有 4 个");
+    d.reset();
+    check(d.next(&sn) == 1 && sn.prefix == 18, "reset 后从头");
+    check(sn.net_str(buf, sizeof buf) > 0 && strcmp(buf, "192.168.0.0") == 0,
+          "第一个子网地址");
+}
+
+/* 2. 字节序 */
+static void do_endian(void)
+{
+    unsigned char buf[16] = { 0 };
+    EndianWriter w = { 0 };
+    EndianReader r = { 0 };
+
+    printf("== endian（字节序读写）\n");
+    init_writer(&w, buf, sizeof buf, 0);
+    put16(&w, 0x1234);
+    put32(&w, 0x89abcdefu);
+    put64(&w, 0x0102030405060708ull);
+    check(writer_ok(&w) && length(&w) == 14, "大端写 14 字节");
+    check(buf[0] == 0x12 && buf[1] == 0x34, "u16 大端");
+    check(buf[2] == 0x89 && buf[5] == 0xef, "u32 大端");
+    init(&r, buf, 14, 0);
+    check(r.read_u16() == 0x1234, "读回 u16");
+    check(r.read_u32() == 0x89abcdefu, "读回 u32");
+    check(r.read_u64() == 0x0102030405060708ull, "读回 u64");
+    check(r.ok() && r.remaining() == 0, "读完");
+    /* 小端 + 按位宽 */
+    init(&r, buf, 14, 1);
+    check(r.uint_le(2) == 0x3412, "小端按位宽读 2 字节");
+    check(bswap16(0x1234) == 0x3412 && bswap32(0x12345678u) == 0x78563412u,
+          "换序");
+    /* 越界 */
+    init(&r, buf, 2, 0);
+    check(r.read_u32() == 0 && !r.ok(), "越界读应失败");
+}
+
+/* 3. 排序键 */
+static void do_collate(void)
+{
+    Collator c = { 0 };
+    char ka[64] = { 0 };
+    char kb[64] = { 0 };
+
+    printf("== collate（排序键）\n");
+    c.init(COLLATE_CASELESS);
+    check(c.compare("Apple", 5, "apple", 5) == 0, "忽略大小写相等");
+    c.init(COLLATE_CASELESS | COLLATE_IGNORE_PUNCT);
+    check(c.compare("a-b", 3, "ab", 2) == 0, "忽略标点相等");
+    c.init(COLLATE_CASELESS | COLLATE_NUMERIC);
+    check(c.compare("file2", 5, "file10", 6) < 0, "file2 < file10");
+    check(c.compare("v1.9", 4, "v1.10", 5) < 0, "v1.9 < v1.10");
+    check(c.key("abc", 3, ka, sizeof ka) == 3, "键长度");
+    check(c.key("abc", 3, kb, sizeof kb) == 3 && strcmp(ka, kb) == 0, "键确定");
+}
+
+/* 4. 断词 */
+static void do_hyphen(void)
+{
+    Hyphenator h = { 0 };
+    char out[64] = { 0 };
+    int pos[8] = { 0 };
+    int n = 0;
+
+    printf("== hyphen（断词）\n");
+    h.init(5, 2, 3);
+    check(h.breaks("cat", 3, pos, 8) == 0, "短词不断");
+    n = h.breaks("computer", 8, pos, 8);
+    check(n > 0, "computer 有断点");
+    check(h.hyphenate("hyphenation", 11, '-', out, sizeof out) > 0, "插入连字符");
+    check(strchr(out, '-') != 0, "输出含连字符");
+    check(h.breaks("abc123", 6, pos, 8) == 0, "含数字不猜");
+}
+
+/* 5. 串联：主机清单 -> 按网段归组 -> 人眼排序 -> 折行 */
+static void do_pipeline(void)
+{
+    const char *hosts[4] = { "web10", "web2", "DB1", "db2" };
+    Collator col = { 0 };
+    Hyphenator hy = { 0 };
+    Cidr net = { 0 };
+    Cidr member = { 0 };
+    char keys[4][64] = { { 0 } };
+    char out[64] = { 0 };
+    int order[4] = { 0, 1, 2, 3 };
+    int inside = 0;
+
+    printf("== 串联：清单 -> 归组 -> 排序 -> 折行\n");
+    /* 1) 网段归属：4 台主机里 2 台在 10.0.0.0/24 */
+    check(net.parse("10.0.0.0/24", (int)strlen("10.0.0.0/24")) == 0, "1) 网段");
+    {
+        const char *ips[4] = { "10.0.0.5", "10.0.1.5", "10.0.0.9", "192.168.1.1" };
+
+        for (int i = 0; i < 4; i++)
+            if (net.contains_text(ips[i]))
+                inside++;
+    }
+    check(inside == 2, "2) 两台在网段内");
+    /* 3) 排序键：忽略大小写 + 数字感知 */
+    col.init(COLLATE_CASELESS | COLLATE_NUMERIC);
+    for (int i = 0; i < 4; i++)
+        check(col.key(hosts[i], (int)strlen(hosts[i]), keys[i], 64) > 0, "3) 算键");
+    /* 简单选择排序（键是字节串） */
+    for (int i = 0; i < 4; i++)
+        for (int j = i + 1; j < 4; j++)
+            if (strcmp(keys[order[i]], keys[order[j]]) > 0) {
+                int t = order[i];
+
+                order[i] = order[j];
+                order[j] = t;
+            }
+    check(strcmp(hosts[order[0]], "DB1") == 0, "4) 第一个是 DB1");
+    check(strcmp(hosts[order[1]], "db2") == 0, "5) 第二个是 db2");
+    check(strcmp(hosts[order[2]], "web2") == 0, "6) 第三个是 web2（web2 < web10）");
+    check(strcmp(hosts[order[3]], "web10") == 0, "7) 最后是 web10");
+    /* 8) 折行 */
+    hy.init(5, 2, 3);
+    check(hy.hyphenate("hyphenation", 11, '-', out, sizeof out) > 0, "8) 折词");
+    printf("   排序后: %s %s %s %s\n", hosts[order[0]], hosts[order[1]],
+           hosts[order[2]], hosts[order[3]]);
+    printf("   折词:   %s\n", out);
+    (void)member;
+}
+
+int main(void)
+{
+    do_cidr();
+    do_endian();
+    do_collate();
+    do_hyphen();
+    do_pipeline();
+    printf("\n%d check(s), %d failure(s)\n", checks, nfail);
+    return nfail == 0 ? 0 : 1;
+}

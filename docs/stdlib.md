@@ -538,6 +538,7 @@
 | `examples/stdops.c6` | （无模块） | 第八十八批（网络运维 + 媒体清单）的拼装示例（`make std-ops`）：NetFlow/WoL/WebVTT/DNS 区域各一节，最后串成「找主机 → 唤醒 → 记流 → 出字幕」（62 条检查） |
 | `examples/stddocs.c6` | （无模块） | 第八十九批（文档与邮件）的拼装示例（`make std-docs`）：单复数 / mbox / KDL / RTF 各一节，最后串成「配置 + 邮件 + 数量 + 正文」（48 条检查） |
 | `examples/stdmgmt.c6` | （无模块） | 第九十批（网络管理与可观测）的拼装示例（`make std-mgmt`）：Prometheus / Gemini / SNMP / NNTP 各一节，最后串成健康检查并输出暴露格式（53 条检查） |
+| `examples/stdutil.c6` | （无模块） | 第九十一批（网段/字节序/排序键/断词）的拼装示例（`make std-util`）：四个模块各一节，最后串成「主机清单 → 归组 → 排序 → 折行」（45 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4936,6 +4937,71 @@ make std-mgmt
 五节：Prometheus 构造/解析；Gemini 请求行与响应状态；SNMP Response（sysDescr +
 sysUpTime）构造与解析；NNTP 命令行、多行正文与去点双写；最后串成「健康检查 →
 输出 Prometheus 暴露格式」（53 条检查）。
+
+### 第九十一批：网段、字节序、排序键、断词（`cidr` / `endian` / `collate` / `hyphen`）
+
+**`std/net/cidr.c6`**——IPv4/IPv6 的 CIDR 与子网划分：
+
+```c
+Cidr c = { 0 };
+c.parse("192.168.7.9/16", 15);        // 主机位清零（network = 192.168.0.0）
+c.contains_text("192.168.7.9");       // 1
+c.network_str(buf, sizeof buf);       // "192.168.0.0"
+c.broadcast_str(buf, sizeof buf);     // "192.168.255.255"（仅 v4）
+c.host_count();                       // 65534（v6 给 -1）
+
+SubnetDoc d = { 0 }; Subnet sn = { 0 };
+d.open(&c, 18);                       // 游标：open / next / count / reset
+while (d.next(&sn))
+    sn.net_str(buf, sizeof buf);
+```
+
+**`std/core/endian.c6`**——字节序读写游标（不依赖 libc）：
+
+```c
+EndianReader r = { 0 };
+r.init(buf, len, 0);                  // 0 = 大端，1 = 小端
+r.read_u32() / read_u16() / read_u64() / read_u8();   // 越界后 ok() 变假
+r.uint_le(3);                         // 按位宽读（3 字节）
+r.skip(2) / seek(0) / position() / remaining() / ok();
+
+EndianWriter w = { 0 };
+w.init_writer? -> init_writer(&w, out, cap, 1);
+w.put32(0x12345678) / put16 / put64 / put8 / put_bytes;
+w.length() / writer_ok() / bytes();
+bswap16/bswap32/bswap64 / host_is_little();
+```
+
+**`std/text/collate.c6`**——排序键，让 `memcmp` 等于人眼顺序：
+
+```c
+Collator c = { 0 };
+c.init(COLLATE_CASELESS | COLLATE_IGNORE_PUNCT | COLLATE_NUMERIC);
+c.key("File10", 6, out, sizeof out);   // 折叠后的字节串
+c.compare("file2", 5, "file10", 6);    // <0（数字按数值比）
+c.equal("a-b", 3, "ab", 2);            // 忽略标点后相等
+```
+
+**`std/text/hyphen.c6`**——断词（VCCV 启发式 + 常见前后缀，明确不是 TeX 字典）：
+
+```c
+Hyphenator h = { 0 };
+h.init(5, 2, 3);                       // 最短 5；头 2 尾 3 不动
+int pos[8] = { 0 };
+h.breaks("computer", 8, pos, 8);       // 断点下标
+h.hyphenate("hyphenation", 11, '-', out, sizeof out);   // "hyp-hena-tion"
+h.config(&min_len, &min_head, &min_tail);
+```
+
+### 集成示例：`examples/stdutil.c6`
+
+```sh
+make std-util
+```
+
+五节：CIDR 解析/包含/子网划分；大端小端读写与换序；排序键（大小写/标点/数字）；
+断词与连字符插入；最后串成「主机清单 → 按网段归组 → 按人眼顺序排序 → 折行」
+（45 条检查）。
 
 ## 相关回归用例
 
