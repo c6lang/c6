@@ -1,0 +1,24 @@
+# c6 IMPORTED targets（由 c6/CMakeLists.txt 生成，请勿手改）
+# 由 c6Config.cmake include；C6_EXECUTABLE / C6_LIBTCC_LIBRARY 等在那里定义。
+
+if(NOT DEFINED C6_LIBTCC_LIBRARY)
+  message(FATAL_ERROR
+    "c6Targets.cmake 必须由 find_package(c6) 通过 c6Config.cmake 引入")
+endif()
+
+if(NOT TARGET c6::compiler)
+  add_executable(c6::compiler IMPORTED)
+  set_target_properties(c6::compiler PROPERTIES
+    IMPORTED_LOCATION "${C6_EXECUTABLE}")
+endif()
+
+if(NOT TARGET c6::libtcc)
+  add_library(c6::libtcc @C6_LIBTCC_KIND@ IMPORTED)
+  set_target_properties(c6::libtcc PROPERTIES
+    IMPORTED_LOCATION "${C6_LIBTCC_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${C6_INCLUDE_DIR}"
+    INTERFACE_LINK_LIBRARIES "@C6_INTERFACE_LINK_LIBS@")
+endif()
+
+set(c6_LIBRARIES c6::libtcc)
+set(c6_INCLUDE_DIRS "${C6_INCLUDE_DIR}")
