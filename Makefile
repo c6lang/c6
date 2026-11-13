@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 bench-async
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub bench-async
 
 all: build
 
@@ -386,6 +386,9 @@ stdtest: build
 	    std/async/agroup.c6) deps="std/text/str.c6 std/async/aio.c6" ;; \
 	    std/async/apool.c6) deps="std/text/str.c6 std/async/aio.c6" ;; \
 	    std/async/acancel.c6) deps="std/text/str.c6" ;; \
+	    std/analysis/lex.c6)   deps="std/text/str.c6" ;; \
+	    std/analysis/parse.c6) deps="std/analysis/lex.c6 std/core/mem.c6 std/text/str.c6" ;; \
+	    std/analysis/ub.c6)    deps="std/analysis/parse.c6 std/analysis/lex.c6 std/core/mem.c6 std/text/str.c6" ;; \
 	    *)           deps="" ;; \
 	    esac; \
 	    out=$$(./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -test $$f $$deps 2>&1) || fail=1; \
@@ -1358,6 +1361,19 @@ std-async5: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdasync5 $(STD_ASYNC5_SRCS)
 	./build/stdasync5
 
+# 标准库第八十四批（静态分析三件套）：
+# lex（分词）/ parse（务实 AST）/ ub（未定义行为检查 + 修复建议），
+# stdub 是它们的命令行：不带参数时分析内置的演示样例。
+STD_UB_SRCS := examples/stdub.c6 std/analysis/ub.c6 std/analysis/parse.c6 \
+               std/analysis/lex.c6 std/core/mem.c6 std/core/types.c6 \
+               std/text/str.c6
+
+std-ub: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdub $(STD_UB_SRCS)
+	@# 演示样例本来就带 9 处 UB，退出码 1（有「一定」级发现）属于正常
+	@./build/stdub; test $$? -le 1
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -1462,7 +1478,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -1477,7 +1493,7 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 是三十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -1713,6 +1729,7 @@ distclean:
 #   std-mesh         编译并运行 examples/stdmesh.c6（第八十一批，OBJ/STL/PLY/MTL）
 #   std-https        编译并运行 examples/stdhttps.c6（第八十二批，同步/异步 HTTPS + 性能指标）
 #   std-async5       编译并运行 examples/stdasync5.c6（第八十三批，异步框架横切面）
+#   std-ub           编译并运行 examples/stdub.c6（第八十四批，静态分析三件套）
 #
 # 基准
 #   bench-async      六语言异步编程基准：c6 / C(epoll、pthread) / C++20 协程 /

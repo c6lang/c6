@@ -83,6 +83,18 @@
 
 ### 标准库
 
+- **标准库第八十四批（用 c6 分析 c6：静态分析三件套）**：`std.analysis.lex`（流式
+  分词器，`Lexer` 是纯值、整结构体赋值即快照，零分配）、`std.analysis.parse`
+  （务实递归下降解析器，AST 全放调用方 `Arena`，**认不出的构造只记账不中断**：
+  `Program.nerr` + 前 32 处 `errl/errc`）、`std.analysis.ub`（13 类未定义行为检查，
+  每条带「一定/可能」两档可信度与一个 `Fix{shape,line,text,code}` —— 修法给到
+  「改哪行、怎么说、可直接粘贴的整行代码」，说不出具体改法的问题不报；支持
+  `/// c6ub-ignore [UB-XXX]` 抑制），示例 `examples/stdub.c6`（`make std-ub`，
+  `文件:行:列: 一定|可能 [UB-XXX] 标题` + 源码 + `修法 |` + `代码 |`，退出码 0/1/2），
+  新增文档 [docs/ubcheck.md](docs/ubcheck.md)（检查清单、可信度口径、抑制写法、
+  三件套 API、诚实限制清单）。错误号段 `std.analysis.lex`=0x615a、
+  `std.analysis.parse`=0x615b、`std.analysis.ub`=0x615c。
+
 - **标准库第八十三批（异步框架横切面）**：`std.async.abudget`（时间预算 +
   `await ayield()`/`aspin`）、`std.async.agroup`（任务组 `g.add`/`g.join`）、
   `std.async.apool`（并发额度 `p.acquire`/`p.release`）、`std.async.acancel`（协作取消 +

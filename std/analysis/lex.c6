@@ -1,0 +1,793 @@
+/* std/analysis/lex：C6 词法器（零分配，纯值 Lexer）。
+ *
+ *     import std.analysis.lex;
+ *
+ *     Lexer lx = lx_open(S("int main(void) { return 0; }"));
+ *     Token t = lx_next(&lx);
+ *
+ * 为什么是**流式**而不是先把整份 token 数组建出来：`.c6` 里的一个函数可能很长，
+ * 而分析器只需要「往前看一个 token」和「偶尔退回几个 token」（`(T)x` 与
+ * `(x)` 的分歧、声明与表达式的分歧）。`Lexer` 只有源码视图和一个游标，没有
+ * 指针字段，所以**拷一份结构体就是一份独立的回溯点**：
+ *
+ *     Lexer save = *self;
+ *     ... 试探性地读 ...
+ *     *self = save;                 // 回到试探前，代价是三次赋值
+ *
+ * 认得的词：
+ *
+ * - 标识符、整数字面量（十进制 / `0x` / `0b` / 前导 `0` 的八进制，后缀 `u`/`l`）、
+ *   浮点字面量（含 `1.5e3`、`0x1p3`）、字符字面量与字符串字面量（转义原样保留在
+ *   `text` 里，`ival` 是解出来的码点）；
+ * - `f"..{expr}.."` 整体当一个字符串字面量（插值表达式**不**再切词：UB 检查器
+ *   不分析插值内部的表达式，见 `docs/ubcheck.md` 的「不做什么」）；
+ * - 注释（行注释与块注释）、预处理行 `#...`（含 `\` 续行）一律跳过；
+ * - 多字符运算符按最长匹配（`<<=` 不是一个 `<` 加一个 `<<`）。
+ *
+ * 词法错误不抛异常：`nerr` 累加，坏字节当成一个单字符标点跳过，把「能不能读完」
+ * 和「读得对不对」分开，调用方（解析器）才不会因为一个坏注释整份放弃。
+ */
+#include <string.h>
+#include <stdlib.h>
+
+module std.analysis.lex;
+import std.core.types;
+import std.text.str;
+
+enum TokKind {
+    TK_EOF = 0,
+    TK_IDENT,                /* 标识符 */
+    TK_KEYWORD,              /* 关键字，见 kw */
+    TK_NUM,                  /* 整数字面量：ival / base / uns / nlong */
+    TK_FLOAT,                /* 浮点字面量（只保留原文，不解析数值） */
+    TK_STR,                  /* 字符串字面量：text 含两边的引号 */
+    TK_CHAR,                 /* 字符字面量：ival 是码点 */
+    TK_PUNCT,                /* 运算符与分隔符：text 是最长匹配 */
+};
+
+/* 关键字编号。类型名与语句关键字分开编号，解析器只看需要的那些。 */
+enum KwId {
+    KW_NONE = 0,
+    KW_IF = 1, KW_ELSE, KW_WHILE, KW_FOR, KW_DO, KW_SWITCH, KW_CASE, KW_DEFAULT,
+    KW_RETURN, KW_BREAK, KW_CONTINUE, KW_GOTO, KW_SIZEOF,
+    KW_STRUCT, KW_UNION, KW_ENUM, KW_TYPEDEF, KW_STATIC, KW_EXTERN, KW_CONST,
+    KW_VOLATILE, KW_REGISTER, KW_INLINE, KW_RESTRICT, KW_AUTO,
+    KW_VOID, KW_CHAR, KW_SHORT, KW_INT, KW_LONG, KW_FLOAT, KW_DOUBLE,
+    KW_SIGNED, KW_UNSIGNED, KW_BOOL,
+    KW_DEFER, KW_ERRDEFER, KW_TRY, KW_CATCH, KW_FOREACH, KW_TEST, KW_ASM,
+    KW_MODULE, KW_IMPORT, KW_INTERFACE, KW_ASYNC, KW_AWAIT, KW_SPAWN, KW_CLOSURE,
+};
+
+struct Token {
+    int kind;
+    int kw;                  /* TK_KEYWORD: KwId；其它为 0 */
+    int line;                /* 1 起 */
+    int col;                 /* 1 起 */
+    Str text;                /* 源码切片（标识符 / 数字 / 字符串原文 / 标点） */
+    i64 ival;                /* TK_NUM / TK_CHAR 的值（无符号按位放在 i64 里） */
+    int base;                /* TK_NUM: 2 / 8 / 10 / 16 */
+    int uns;                 /* 有 u/U 后缀 */
+    int nlong;               /* l/L 后缀个数（0..2） */
+};
+
+struct Lexer {
+    Str src;
+    int pos;
+    int line;
+    int col;
+    int nerr;                /* 词法错误个数 */
+};
+
+/* ---- 小工具 ---- */
+
+static Str lx_lit(const char *z)
+{
+    return (Str){ (char[:]){ (char *)z, (int)strlen(z) } };
+}
+
+/* 两个视图相等？（长度相等且逐字节相同） */
+int str_eq(Str a, Str b)
+{
+    int i = 0;
+
+    if (a.s.len != b.s.len)
+        return 0;
+    for (i = 0; i < a.s.len; i++)
+        if (a.s.data[i] != b.s.data[i])
+            return 0;
+    return 1;
+}
+
+/* 视图与 C 字符串相等？ */
+int str_is(Str a, const char *z)
+{
+    return str_eq(a, lx_lit(z));
+}
+
+/* 视图是不是以 C 字符串开头？ */
+int str_starts(Str a, const char *z)
+{
+    int n = (int)strlen(z);
+    int i = 0;
+
+    if (a.s.len < n)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (a.s.data[i] != z[i])
+            return 0;
+    return 1;
+}
+
+/* 第 1 行的源码切片（不含行尾换行），用来给诊断带上下文；行号越界给空视图。 */
+Str line_at(Str src, int lineno)
+{
+    int i = 0;
+    int line = 1;
+    int start = 0;
+    Str out = { (char[:]){ 0, 0 } };
+
+    if (lineno < 1)
+        return out;
+    for (i = 0; i <= src.s.len; i++) {
+        if (i == src.s.len || src.s.data[i] == '\n') {
+            if (line == lineno) {
+                out.s = (char[:]){ src.s.data + start, i - start };
+                if (out.s.len > 0 && out.s.data[out.s.len - 1] == '\r')
+                    out.s = (char[:]){ out.s.data, out.s.len - 1 };
+                return out;
+            }
+            line++;
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+/* ---- 词法表 ---- */
+
+static const struct { char *text; int kw; } lx_kw[] = {
+    { "if", KW_IF }, { "else", KW_ELSE }, { "while", KW_WHILE },
+    { "for", KW_FOR }, { "do", KW_DO }, { "switch", KW_SWITCH },
+    { "case", KW_CASE }, { "default", KW_DEFAULT }, { "return", KW_RETURN },
+    { "break", KW_BREAK }, { "continue", KW_CONTINUE }, { "goto", KW_GOTO },
+    { "sizeof", KW_SIZEOF }, { "struct", KW_STRUCT }, { "union", KW_UNION },
+    { "enum", KW_ENUM }, { "typedef", KW_TYPEDEF }, { "static", KW_STATIC },
+    { "extern", KW_EXTERN }, { "const", KW_CONST }, { "volatile", KW_VOLATILE },
+    { "register", KW_REGISTER }, { "inline", KW_INLINE },
+    { "restrict", KW_RESTRICT }, { "auto", KW_AUTO }, { "void", KW_VOID },
+    { "char", KW_CHAR }, { "short", KW_SHORT }, { "int", KW_INT },
+    { "long", KW_LONG }, { "float", KW_FLOAT }, { "double", KW_DOUBLE },
+    { "signed", KW_SIGNED }, { "unsigned", KW_UNSIGNED }, { "_Bool", KW_BOOL },
+    { "bool", KW_BOOL }, { "defer", KW_DEFER }, { "errdefer", KW_ERRDEFER },
+    { "try", KW_TRY }, { "catch", KW_CATCH }, { "foreach", KW_FOREACH },
+    { "test", KW_TEST }, { "asm", KW_ASM }, { "__asm__", KW_ASM },
+    { "module", KW_MODULE }, { "import", KW_IMPORT },
+    { "interface", KW_INTERFACE }, { "async", KW_ASYNC }, { "await", KW_AWAIT },
+    { "spawn", KW_SPAWN }, { "closure", KW_CLOSURE },
+};
+
+/* 标点按长度分组，最长优先：三字符 → 两字符 → 单字符。 */
+static const char *lx_punct3[] = { "<<=", ">>=", "...", 0 };
+static const char *lx_punct2[] = {
+    "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||",
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::", "##",
+    "##", 0
+};
+static const char *lx_punct1 = "+-*/%&|^~!<>=?:;,.()[]{}#@";
+
+/* ---- 打开 / 前进 ---- */
+
+Lexer lx_open(Str src)
+{
+    Lexer l = { src, 0, 1, 1, 0 };
+
+    return l;
+}
+
+Lexer lx_open_cstr(const char *z) { return lx_open(lx_lit(z)); }
+
+int lx_done(Lexer *self) { return self->pos >= self->src.s.len; }
+
+/* 当前字节；越界给 0（不区分真正的 NUL，源码里本来也不该有） */
+int lx_byte(Lexer *self, int off)
+{
+    int i = self->pos + off;
+
+    if (i < 0 || i >= self->src.s.len)
+        return 0;
+    return (unsigned char)self->src.s.data[i];
+}
+
+/* 走一个字节，维护行号列号 */
+static void lx_adv(Lexer *self)
+{
+    if (self->pos >= self->src.s.len)
+        return;
+    if (self->src.s.data[self->pos] == '\n') {
+        self->line++;
+        self->col = 1;
+    } else {
+        self->col++;
+    }
+    self->pos++;
+}
+
+/* 匹配一组标点里最长的一个（表按长度分好，逐个前缀比） */
+static int lx_try_punct(Lexer *self, const char *pat)
+{
+    int n = (int)strlen(pat);
+    int i = 0;
+
+    if (self->pos + n > self->src.s.len)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (self->src.s.data[self->pos + i] != pat[i])
+            return 0;
+    for (i = 0; i < n; i++)
+        lx_adv(self);
+    return 1;
+}
+
+/* 跳过空白、注释、预处理行。预处理行按 C 的规则吞掉续行反斜杠。 */
+static void lx_skip(Lexer *self)
+{
+    int c = 0;
+    int keep = 0;
+
+    for (;;) {
+        c = lx_byte(self, 0);
+        if (c == 0 && lx_done(self))
+            return;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f'
+            || c == '\v') {
+            lx_adv(self);
+            continue;
+        }
+        if (c == '/' && lx_byte(self, 1) == '/') {
+            while (!lx_done(self) && lx_byte(self, 0) != '\n')
+                lx_adv(self);
+            continue;
+        }
+        if (c == '/' && lx_byte(self, 1) == '*') {
+            lx_adv(self);
+            lx_adv(self);
+            while (!lx_done(self)
+                   && !(lx_byte(self, 0) == '*' && lx_byte(self, 1) == '/'))
+                lx_adv(self);
+            if (!lx_done(self)) {
+                lx_adv(self);
+                lx_adv(self);
+            } else {
+                self->nerr++;
+            }
+            continue;
+        }
+        if (c == '#') {
+            /* 预处理行：一直吃到行尾；行尾的反斜杠把下一行也连进来 */
+            while (!lx_done(self)) {
+                if (lx_byte(self, 0) == '\\' && lx_byte(self, 1) == '\n') {
+                    lx_adv(self);
+                    lx_adv(self);
+                    continue;
+                }
+                if (lx_byte(self, 0) == '\\' && lx_byte(self, 1) == '\r'
+                    && lx_byte(self, 2) == '\n') {
+                    lx_adv(self);
+                    lx_adv(self);
+                    lx_adv(self);
+                    continue;
+                }
+                if (lx_byte(self, 0) == '\n') {
+                    lx_adv(self);
+                    break;
+                }
+                lx_adv(self);
+            }
+            continue;
+        }
+        if (c == '\\' && lx_byte(self, 1) == '\n') {
+            /* 行尾续行符（宏之外的漏网情况）：当空白 */
+            lx_adv(self);
+            lx_adv(self);
+            continue;
+        }
+        return;
+    }
+}
+
+/* 关键字查表；找不到给 KW_NONE */
+static int lx_keyword(Str text)
+{
+    int i = 0;
+    int n = (int)(sizeof lx_kw / sizeof *lx_kw);
+
+    for (i = 0; i < n; i++)
+        if (str_is(text, lx_kw[i].text))
+            return lx_kw[i].kw;
+    return KW_NONE;
+}
+
+static Token lx_make(Lexer *self, int kind, int line, int col, int start)
+{
+    Token t = { kind, 0, line, col, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+
+    t.text.s = (char[:]){ self->src.s.data + start, self->pos - start };
+    return t;
+}
+
+/* 标识符（含 `f".."` 这种插值字符串的整体识别） */
+static Token lx_ident(Lexer *self)
+{
+    int line = self->line;
+    int col = self->col;
+    int start = self->pos;
+    Token t = { TK_IDENT, 0, line, col, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    Str text = { (char[:]){ 0, 0 } };
+
+    while (lx_byte(self, 0) == '_' || lx_byte(self, 0) == '$'
+           || (lx_byte(self, 0) >= 'a' && lx_byte(self, 0) <= 'z')
+           || (lx_byte(self, 0) >= 'A' && lx_byte(self, 0) <= 'Z')
+           || (lx_byte(self, 0) >= '0' && lx_byte(self, 0) <= '9'))
+        lx_adv(self);
+    t.text.s = (char[:]){ self->src.s.data + start, self->pos - start };
+    text = t.text;
+    /* f"..."：把插值字符串整个当一个字符串字面量，插值里的表达式不切词 */
+    if (text.s.len == 1 && text.s.data[0] == 'f' && lx_byte(self, 0) == '"') {
+        t.kind = TK_STR;
+        lx_adv(self);
+        while (!lx_done(self)) {
+            if (lx_byte(self, 0) == '\\') {
+                lx_adv(self);
+                lx_adv(self);
+                continue;
+            }
+            if (lx_byte(self, 0) == '"') {
+                lx_adv(self);
+                break;
+            }
+            lx_adv(self);
+        }
+        t.text.s = (char[:]){ self->src.s.data + start, self->pos - start };
+        return t;
+    }
+    t.kw = lx_keyword(t.text);
+    if (t.kw != KW_NONE)
+        t.kind = TK_KEYWORD;
+    return t;
+}
+
+/* 数字：基数、值、后缀 */
+static Token lx_number(Lexer *self)
+{
+    int line = self->line;
+    int col = self->col;
+    int start = self->pos;
+    Token t = { TK_NUM, 0, line, col, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    u64 v = 0;
+    int base = 10;
+    int isfloat = 0;
+    int digits = 0;
+    int d = 0;
+
+    if (lx_byte(self, 0) == '0' && (lx_byte(self, 1) == 'x' || lx_byte(self, 1) == 'X')) {
+        base = 16;
+        lx_adv(self);
+        lx_adv(self);
+    } else if (lx_byte(self, 0) == '0' && (lx_byte(self, 1) == 'b' || lx_byte(self, 1) == 'B')) {
+        base = 2;
+        lx_adv(self);
+        lx_adv(self);
+    } else if (lx_byte(self, 0) == '0') {
+        base = 8;
+    }
+    for (;;) {
+        int c = lx_byte(self, 0);
+
+        d = -1;
+        if (c >= '0' && c <= '9')
+            d = c - '0';
+        else if (c >= 'a' && c <= 'f')
+            d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F')
+            d = c - 'A' + 10;
+        if (d < 0 || d >= base)
+            break;
+        v = v * (u64)base + (u64)d;
+        digits++;
+        lx_adv(self);
+    }
+    if (digits == 0 && base != 8) {
+        /* `0x` 后面没有十六进制数字：记为词法错误，标点照旧往前走 */
+        self->nerr++;
+    }
+    /* 浮点：小数点、指数（十六进制只认 p/P，否则 0xE 会被当指数） */
+    if (base == 16) {
+        if (lx_byte(self, 0) == '.' || lx_byte(self, 0) == 'p'
+            || lx_byte(self, 0) == 'P')
+            isfloat = 1;
+    } else if (lx_byte(self, 0) == '.'
+               || ((lx_byte(self, 0) == 'e' || lx_byte(self, 0) == 'E')
+                   && (base == 10))) {
+        isfloat = 1;
+    }
+    if (isfloat) {
+        while (lx_byte(self, 0) == '.' || lx_byte(self, 0) == 'e'
+               || lx_byte(self, 0) == 'E' || lx_byte(self, 0) == 'p'
+               || lx_byte(self, 0) == 'P' || lx_byte(self, 0) == '+'
+               || lx_byte(self, 0) == '-'
+               || (lx_byte(self, 0) >= '0' && lx_byte(self, 0) <= '9')
+               || (lx_byte(self, 0) >= 'a' && lx_byte(self, 0) <= 'f')
+               || (lx_byte(self, 0) >= 'A' && lx_byte(self, 0) <= 'F'))
+            lx_adv(self);
+        if (lx_byte(self, 0) == 'f' || lx_byte(self, 0) == 'F'
+            || lx_byte(self, 0) == 'l' || lx_byte(self, 0) == 'L')
+            lx_adv(self);
+        t.kind = TK_FLOAT;
+    } else {
+        /* 整数后缀 */
+        for (;;) {
+            int c = lx_byte(self, 0);
+
+            if (c == 'u' || c == 'U') {
+                t.uns = 1;
+                lx_adv(self);
+            } else if (c == 'l' || c == 'L') {
+                t.nlong++;
+                lx_adv(self);
+            } else {
+                break;
+            }
+        }
+    }
+    t.base = base;
+    t.ival = (i64)v;
+    t.text.s = (char[:]){ self->src.s.data + start, self->pos - start };
+    return t;
+}
+
+/* 转义序列解成一个码点；调用时 pos 指在反斜杠上 */
+static i64 lx_escape(Lexer *self)
+{
+    int c = 0;
+    int v = 0;
+    int i = 0;
+
+    lx_adv(self);                /* '\\' */
+    c = lx_byte(self, 0);
+    lx_adv(self);
+    switch (c) {
+    case 'n': return '\n';
+    case 't': return '\t';
+    case 'r': return '\r';
+    case '0': case '1': case '2': case '3':
+    case '4': case '5': case '6': case '7':
+        /* 八进制，最多三位 */
+        v = c - '0';
+        for (i = 0; i < 2; i++) {
+            int d = lx_byte(self, 0);
+            if (d < '0' || d > '7')
+                break;
+            v = v * 8 + (d - '0');
+            lx_adv(self);
+        }
+        return v;
+    case 'x':
+        v = 0;
+        for (i = 0; i < 2; i++) {
+            int d = lx_byte(self, 0);
+            int h = -1;
+            if (d >= '0' && d <= '9')
+                h = d - '0';
+            else if (d >= 'a' && d <= 'f')
+                h = d - 'a' + 10;
+            else if (d >= 'A' && d <= 'F')
+                h = d - 'A' + 10;
+            if (h < 0)
+                break;
+            v = v * 16 + h;
+            lx_adv(self);
+        }
+        return v;
+    case 'a': return 7;
+    case 'b': return 8;
+    case 'f': return 12;
+    case 'v': return 11;
+    case '\\': return '\\';
+    case '\'': return '\'';
+    case '"': return '"';
+    case '?': return '?';
+    case '\n': return 0;
+    default: return c;
+    }
+}
+
+static Token lx_char(Lexer *self)
+{
+    int line = self->line;
+    int col = self->col;
+    int start = self->pos;
+    Token t = { TK_CHAR, 0, line, col, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+
+    lx_adv(self);                /* 开引号 */
+    if (lx_byte(self, 0) == '\\') {
+        t.ival = lx_escape(self);
+    } else if (!lx_done(self) && lx_byte(self, 0) != '\'') {
+        t.ival = lx_byte(self, 0);
+        lx_adv(self);
+    } else {
+        self->nerr++;
+    }
+    while (!lx_done(self) && lx_byte(self, 0) != '\'')
+        lx_adv(self);            /* 多字符字面量：剩下的丢掉 */
+    if (!lx_done(self))
+        lx_adv(self);
+    else
+        self->nerr++;
+    t.text.s = (char[:]){ self->src.s.data + start, self->pos - start };
+    return t;
+}
+
+static Token lx_string(Lexer *self)
+{
+    int line = self->line;
+    int col = self->col;
+    int start = self->pos;
+    Token t = { TK_STR, 0, line, col, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+
+    lx_adv(self);                /* 开引号 */
+    while (!lx_done(self)) {
+        if (lx_byte(self, 0) == '\\') {
+            lx_adv(self);
+            lx_adv(self);
+            continue;
+        }
+        if (lx_byte(self, 0) == '"') {
+            lx_adv(self);
+            break;
+        }
+        lx_adv(self);
+    }
+    if (lx_done(self) && (self->src.s.len == 0
+                          || self->src.s.data[self->src.s.len - 1] != '"'))
+        self->nerr++;
+    t.text.s = (char[:]){ self->src.s.data + start, self->pos - start };
+    return t;
+}
+
+/* 标点：最长匹配，认不出就把当前字节当单字符标点（并记一个错误） */
+static Token lx_punct(Lexer *self)
+{
+    int line = self->line;
+    int col = self->col;
+    int start = self->pos;
+    int i = 0;
+    Token t = { TK_PUNCT, 0, line, col, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    int hit = 0;
+
+    for (i = 0; lx_punct3[i]; i++)
+        if (lx_try_punct(self, lx_punct3[i])) {
+            hit = 1;
+            break;
+        }
+    if (!hit) {
+        for (i = 0; lx_punct2[i]; i++)
+            if (lx_try_punct(self, lx_punct2[i])) {
+                hit = 1;
+                break;
+            }
+    }
+    if (!hit) {
+        int c = lx_byte(self, 0);
+
+        if (c && strchr(lx_punct1, c))
+            hit = 1;
+        if (hit)
+            lx_adv(self);
+    }
+    if (!hit) {
+        self->nerr++;
+        lx_adv(self);
+    }
+    t.text.s = (char[:]){ self->src.s.data + start, self->pos - start };
+    return t;
+}
+
+/* 下一个 token。返回 TK_EOF 之后重复调用仍然是 TK_EOF。 */
+Token lx_next(Lexer *self)
+{
+    Token eof = { TK_EOF, 0, self->line, self->col, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    int c = 0;
+
+    lx_skip(self);
+    if (lx_done(self))
+        return eof;
+    c = lx_byte(self, 0);
+    if (c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+        return lx_ident(self);
+    if (c >= '0' && c <= '9')
+        return lx_number(self);
+    if (c == '.') {
+        int d = lx_byte(self, 1);
+        if (d >= '0' && d <= '9')
+            return lx_number(self);
+    }
+    if (c == '\'')
+        return lx_char(self);
+    if (c == '"')
+        return lx_string(self);
+    return lx_punct(self);
+}
+
+/* 从当前位置跳过 n 个 token，返回那之后的 token；不改变 self。 */
+Token lx_peek(Lexer *self, int n)
+{
+    Lexer copy = *self;
+    Token t = { TK_EOF, 0, 0, 0, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    int i = 0;
+
+    for (i = 0; i <= n; i++)
+        t = lx_next(&copy);
+    return t;
+}
+
+int tok_is(Token *t, const char *z)
+{
+    return t->kind != TK_EOF && t->kind != TK_STR && str_is(t->text, z);
+}
+
+int tok_is_kw(Token *t, int kw) { return t->kind == TK_KEYWORD && t->kw == kw; }
+
+/* 字符串字面量的内容（去掉两边的引号） */
+Str tok_str_body(Token *t)
+{
+    Str out = { (char[:]){ 0, 0 } };
+
+    if (t->kind != TK_STR || t->text.s.len < 2)
+        return out;
+    out.s = (char[:]){ t->text.s.data + 1, t->text.s.len - 2 };
+    return out;
+}
+
+/* ---- 自测 ---- */
+
+static Token first_of(const char *src)
+{
+    Lexer l = lx_open(lx_lit(src));
+
+    return lx_next(&l);
+}
+
+test "标识符、关键字与 EOF" {
+    Token t = first_of("int foo");
+    Lexer l = lx_open(lx_lit("int foo"));
+
+    if (t.kind != TK_KEYWORD || t.kw != KW_INT || t.line != 1 || t.col != 1)
+        return err(1, "int 不是关键字");
+    t = lx_next(&l);
+    t = lx_next(&l);
+    if (t.kind != TK_IDENT || !str_is(t.text, "foo") || t.col != 5)
+        return err(2, "标识符位置不对");
+    t = lx_next(&l);
+    if (t.kind != TK_EOF)
+        return err(3, "没读到 EOF");
+    t = lx_next(&l);
+    if (t.kind != TK_EOF)
+        return err(4, "EOF 之后还有 token");
+}
+
+test "整数字面量的基数与后缀" {
+    Token t = first_of("0x1f");
+    if (t.kind != TK_NUM || t.base != 16 || t.ival != 31)
+        return err(1, "十六进制不对");
+    t = first_of("0b1010");
+    if (t.base != 2 || t.ival != 10)
+        return err(2, "二进制不对");
+    t = first_of("0755");
+    if (t.base != 8 || t.ival != 493)
+        return err(3, "八进制不对");
+    t = first_of("42u");
+    if (t.ival != 42 || !t.uns || t.nlong != 0)
+        return err(4, "u 后缀不对");
+    t = first_of("1ULL");
+    if (t.ival != 1 || !t.uns || t.nlong != 2)
+        return err(5, "ULL 后缀不对");
+    t = first_of("0");
+    if (t.ival != 0 || t.base != 8)
+        return err(6, "单独的 0 不对");
+    t = first_of("1.5");
+    if (t.kind != TK_FLOAT)
+        return err(7, "1.5 不是浮点");
+    t = first_of(".5f");
+    if (t.kind != TK_FLOAT)
+        return err(8, ".5f 不是浮点");
+    t = first_of("1e10");
+    if (t.kind != TK_FLOAT)
+        return err(9, "1e10 不是浮点");
+    t = first_of("0xE");
+    if (t.kind != TK_NUM || t.ival != 14)
+        return err(10, "0xE 被当成浮点了");
+}
+
+test "字符与字符串字面量" {
+    Token t = first_of("'a'");
+    if (t.kind != TK_CHAR || t.ival != 97)
+        return err(1, "'a' 不对");
+    t = first_of("'\\n'");
+    if (t.ival != 10)
+        return err(2, "转义换行不对");
+    t = first_of("'\\x41'");
+    if (t.ival != 65)
+        return err(3, "\\x 转义不对");
+    t = first_of("'\\101'");
+    if (t.ival != 65)
+        return err(4, "八进制转义不对");
+    t = first_of("\"a\\\"b\"");
+    if (t.kind != TK_STR || t.text.s.len != 6)
+        return err(5, "字符串转义后的长度不对");
+    if (!str_is(tok_str_body(&t), "a\\\"b"))
+        return err(6, "字符串正文不对");
+    t = first_of("f\"x={n}\"");
+    if (t.kind != TK_STR || t.text.s.len != 8)
+        return err(7, "f 字符串没有被整体识别");
+}
+
+test "注释、预处理行与续行" {
+    Lexer l = lx_open(lx_lit("a // b\nc /* d\ne */ f"));
+    Token t = lx_next(&l);
+
+    if (!str_is(t.text, "a") || t.line != 1)
+        return err(1, "第一个标识符不对");
+    t = lx_next(&l);
+    if (!str_is(t.text, "c") || t.line != 2)
+        return err(2, "行注释吃掉了下一行");
+    t = lx_next(&l);
+    if (!str_is(t.text, "f") || t.line != 3)
+        return err(3, "块注释不跨行或行号不对");
+    l = lx_open(lx_lit("#include <stdio.h>\nint x;\n#define A(x) \\\n  ((x)+1)\ny"));
+    t = lx_next(&l);
+    if (!str_is(t.text, "int") || t.line != 2)
+        return err(4, "预处理行没被跳过");
+    t = lx_next(&l);           /* x */
+    t = lx_next(&l);           /* ; */
+    t = lx_next(&l);           /* y */
+    if (!str_is(t.text, "y") || t.line != 5)
+        return err(5, "续行没被吞掉");
+}
+
+test "多字符运算符最长匹配与回溯" {
+    Lexer l = lx_open(lx_lit("a<<=b->c...d"));
+    Token t = lx_next(&l);
+    Lexer save = l;
+    Token u = { TK_EOF, 0, 0, 0, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+
+    t = lx_next(&l);
+    u = lx_next(&l);
+    if (!str_is(t.text, "<<=") || !str_is(u.text, "b"))
+        return err(1, "<<= 没有最长匹配");
+    t = lx_next(&l);
+    if (!str_is(t.text, "->"))
+        return err(2, "-> 不对");
+    /* 回溯：拷贝出去再改，回来必须一模一样 */
+    l = save;
+    t = lx_next(&l);
+    if (!str_is(t.text, "<<=") || l.pos != save.pos + 3)
+        return err(3, "回溯点没有恢复");
+    /* lx_peek 不改原 lexer */
+    t = lx_peek(&l, 0);
+    if (!str_is(t.text, "b") || l.pos != save.pos + 3)
+        return err(4, "lx_peek 改动了 lexer");
+}
+
+test "line_at 取源码行" {
+    Str src = { (char[:]){ (char *)"one\ntwo\r\nthree", 14 } };
+    Str s = line_at(src, 2);
+
+    if (!str_is(s, "two"))
+        return err(1, "第二行不对");
+    s = line_at(src, 3);
+    if (!str_is(s, "three"))
+        return err(2, "第三行不对");
+    s = line_at(src, 9);
+    if (s.s.len != 0)
+        return err(3, "越界行不是空视图");
+}

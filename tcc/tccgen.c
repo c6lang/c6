@@ -13051,6 +13051,9 @@ static const struct C6ErrStdSlot {
     { "std.async.agroup",       C6_ERR_SLOT_STD + 343 },
     { "std.async.apool",        C6_ERR_SLOT_STD + 344 },
     { "std.async.acancel",      C6_ERR_SLOT_STD + 345 },
+    { "std.analysis.lex",       C6_ERR_SLOT_STD + 346 },
+    { "std.analysis.parse",     C6_ERR_SLOT_STD + 347 },
+    { "std.analysis.ub",        C6_ERR_SLOT_STD + 348 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

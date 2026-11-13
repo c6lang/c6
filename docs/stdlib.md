@@ -531,15 +531,22 @@
 | `examples/stdmesh.c6` | （无模块） | 第八十一批（三维网格）的拼装示例（`make std-mesh`）：OBJ 四面体（顶点/面游标 + 包围盒）、STL ASCII 与二进制（面积）、PLY 四边形面、MTL 材质查表 |
 | `examples/stdhttps.c6` | （无模块） | 第八十二批的拼装示例（`make std-https`）：密钥调度对参考值、同步/异步 HTTPS 明文与加密往返、以及 async 框架开销指标 |
 | `examples/stdasync5.c6` | （无模块） | 第八十三批的拼装示例（`make std-async5`）：额度、任务组、预算、协作取消四个横切面各一节，最后打框架开销指标 |
+| `examples/stdub.c6` | （无模块） | 第八十四批（静态分析三件套）的拼装示例（`make std-ub`）：用 lex/parse/ub 分析一段 9 处 UB 的演示源码，按 `文件:行:列: 一定/可能 [UB-XXX] 标题` 打印，每条附「修法」与可直接粘贴的「代码」 |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
 | `std/data/plist.c6` | `std.data.plist` | Apple **二进制**属性列表 `bplist00`（零分配）：`plist_open` 读 32 字节尾部（`offset_size`/`ref_size`/对象数/根/偏移表），`plist_root`/`plist_count`/`plist_at`/`plist_key`/`plist_get` 走引用号；标量 `plist_string`/`plist_int`/`plist_double`/`plist_bool`/`plist_data`/`plist_date`/`plist_utf16`/`plist_uid`。文本（XML）plist 请用 `std.data.xml` |
+| `std/analysis/lex.c6` | `std.analysis.lex` | 流式 C6 分词器（零分配、可回溯）：`lx_open`/`lx_open_cstr` 建 `Lexer`（**纯值**，整个结构体赋值就是快照/回滚），`lx_next` 依次给 `IDENT`/`KEYWORD`/`NUM`/`FLOAT`/`STR`/`CHAR`/`PUNCT`/`EOF`，`lx_peek(n)` 前瞻；`Token` 带 `line`/`col`/`ival`/`base`/`uns`/`nlong`，关键字单独编号（`kw`）避免逐字串比；`tok_is`/`tok_is_kw`/`tok_str_body` 做判断，坏字符只记 `nerr` 不中断 |
+| `std/analysis/parse.c6` | `std.analysis.parse` | 务实的递归下降解析器（AST 全放调用方 `Arena`）：`parse_program(a, src)` 给 `Program`（函数表/符号表/`nerr`），认函数、参数、局部声明、赋值/二元/三元/调用/下标/成员、`if`/`while`/`for`/`do`/`switch`/`return`/`break`/`continue`/`defer`/`errdefer`/`try`/`catch`/`foreach`/`test`/元组解构/复合字面量/强转/`sizeof`/`new T`；**认不出来的构造只记账不炸**（`Program.nerr` + `errl/errc` 前 32 条），调用方据此报「这块没检查」 |
+| `std/analysis/ub.c6` | `std.analysis.ub` | 未定义行为检查引擎：`ub_open`/`ub_set_program`/`ub_run`/`ub_findings`，13 类检查（除零、`INT_MIN/-1`、常量溢出、移位、数组与堆越界、空指针解引用、释放后使用/重复释放、返回局部地址、读未初始化堆、零长数组、`memcpy` 重叠、空指针实参），每条给「一定/可能」两档可信度与**具体修法**（`Fix.text` + 可直接粘贴的 `Fix.code`），支持 `// c6ub-ignore` 抑制，同一行同类只报一遍 |
 | `std/text/markdown.c6` | `std.text.markdown` | Markdown（CommonMark 常用子集）→ HTML，零分配，结果写调用方缓冲区：`markdown_render` 支持 ATX 标题、段落、围栏代码（带语言名给 `class="language-xx"`）、引用、无序/有序列表、分隔线；`markdown_inline` 支持 `` `code` ``、粗体、斜体、`[文字](链接)`、`<http://…>` 自动链接、反斜杠转义，正文 `& < > "` 会转义；不做嵌套列表/表格/HTML 透传 |
 `std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
 
 ```
+std/analysis/lex.c6         6 test(s), 0 failure(s)
+std/analysis/parse.c6      47 test(s), 0 failure(s)
+std/analysis/ub.c6         63 test(s), 0 failure(s)
 std/container/bitset.c6    11 test(s), 0 failure(s)
 std/container/deque.c6     9 test(s), 0 failure(s)
 std/container/list.c6      4 test(s), 0 failure(s)
@@ -4439,6 +4446,31 @@ co 顶层任务批跑（__c6_co_run）: 300 ops / 486 us -> 616687 ops/s (1621 n
 和 C / C++ / Go / Rust / Uya 的横向对比（同一件事的写法 + 实测数据）见
 [async-comparison.md](async-comparison.md)，跑一次就是 `make bench-async`。
 
+### 集成示例：`examples/stdub.c6`
+
+```sh
+make std-ub                 # 不带参数：分析内置的演示源码
+./build/stdub 你的文件.c6    # 带参数：分析真实文件
+```
+
+`stdub` 是 lex/parse/ub 三件套的命令行：先 `read_file` 读进内存，`parse_program`
+建 AST 并报告「没认出来的构造」，再 `ub_run` 跑检查，最后按下面的形状打印——
+**每一条都带具体修法和一整行可直接粘回源码的代码**：
+
+```
+demo.c6:11:12: 一定 [UB-DIV0] 除以常量 0
+   11 |     return x / 0;
+        | 除数是字面量 0：整数除零没有结果，x86 上直接 #DE 崩掉，编译器也可能顺手把它折叠成任意值
+   修法 | 换成非 0 的常量（例如 1），或者先判断除数再除
+   代码 | x / 1;
+
+stdub: 演示样例共 9 条（一定 8、可能 1）
+```
+
+退出码：`0` 干净、`1` 有「一定」级问题、`2` 用法/读文件错误（「可能」级不改变退出码，
+适合放进 CI 的 `-Werror` 位置）。检查项、可信度口径、抑制写法（`// c6ub-ignore`
+或 `// c6ub-ignore UB-DIV0`）和全部限制见 [ubcheck.md](ubcheck.md)。
+
 ## 相关回归用例
 
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
@@ -4600,6 +4632,7 @@ co 顶层任务批跑（__c6_co_run）: 300 ops / 486 us -> 616687 ops/s (1621 n
 * `make std-https`：`examples/stdhttps.c6`，第八十二批（同步/异步 HTTPS + 性能指标）
   模块的拼装示例（自带自检与实测指标）。
 * `make std-async5`：`examples/stdasync5.c6`，第八十三批（预算/任务组/额度/取消）
+* `make std-ub`：`examples/stdub.c6`，第八十四批（lex/parse/ub 静态分析三件套）
   四个横切面的拼装示例（自带自检与实测指标）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、
