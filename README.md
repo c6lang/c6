@@ -106,6 +106,38 @@ make check-all
 “重新同步工作树”这回事，手改不会被覆盖。`make distclean` 清理构建产物和 configure 结果，
 不会删源码。
 
+### 源码编译安装
+
+```sh
+# 1. 配置安装位置
+pushd tcc >/dev/null 
+./configure \
+    --prefix=/usr \
+    --docdir=/usr/share/doc/tcc \
+    --disable-static
+popd >/dev/null
+
+# 2. 编译
+make build
+
+# 3. 测试
+export LD_LIBRARY_PATH="${srcdir}/${pkgname%-git}/tcc${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" 
+make test
+
+# 4. 安装到系统
+cd tcc
+make install
+ln -sf /usr/bin/c6 /usr/bin/tcc
+```
+
+### Arch Linux 安装
+
+通过 [AUR 仓库](https://aur.archlinux.org/packages/c6-git)或[自建源](https://github.com/taotieren/aur-repo)安装
+
+```sh
+yay -Syu c6
+```
+
 ## 目录结构
 
 ```
