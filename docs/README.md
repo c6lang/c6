@@ -11,6 +11,7 @@
 1. [README 的快速开始](../README.md#快速开始) —— 构建、跑第一个 `.c6`。
 2. [manual/](manual/) —— 按特性查用法；每篇都是「一句话定位 → 例子 → 速查 → 陷阱」。
 3. [stdlib.md](stdlib.md) —— 标准库 `std/` 的 API 与写法约定。
+   - 覆盖面： [stdlib-coverage.md](stdlib-coverage.md) —— 逐族盘点「还缺什么」与「什么时候到头」。
    - 异步： [async-framework.md](async-framework.md) —— 语言级 `async`/`await`/`co` 框架整体与本机实测开销；
      [async-comparison.md](async-comparison.md) —— 六种语言（c6/C/C++/Go/Rust/Uya）的异步写法与实测对比。
    - 静态分析： [ubcheck.md](ubcheck.md) —— 用 c6 写的 c6 分析工具链（lex/parse/ub）与 `stdub` 命令行：13 类 UB 检查、一定/可能口径、每条附具体修法与整行代码。

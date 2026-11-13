@@ -7,6 +7,13 @@
 
 ## 未发布
 
+### 标准库收尾：覆盖面盘点
+
+- 新增 [docs/stdlib-coverage.md](docs/stdlib-coverage.md)：377 个模块的规模分布、
+  逐族覆盖矩阵（完整 / 部分 / 不做）、**明确「不做」清单及理由**（QUIC、TLS 1.3
+  完整握手、SNMP v3、LDAP/RADIUS/SIP、Office/Parquet/7z、GPX/KML/GeoJSON、
+  base36/62 变体、词典级断词/排序），以及「什么时候到头」的三条判定标准与结论。
+
 ### 标准库第九十一批：网段、字节序、排序键、断词
 
 - **`std/net/cidr.c6`**：IPv4/IPv6 CIDR。解析后主机位清零，`contains_text` 判归属，

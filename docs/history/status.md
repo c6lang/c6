@@ -3006,3 +3006,22 @@ err 号段补 `std.net.prometheus`=0x6171、`std.net.gemini`=0x6172、
 err 号段补 `std.net.cidr`=0x6175、`std.core.endian`=0x6176、
 `std.text.collate`=0x6177、`std.text.hyphen`=0x6178。`std/` 现在 377 个 `.c6` 文件；
 四个模块的 test 块逐个跑过（各 2 条，0 failure）。
+
+### 11.106 标准库收尾：覆盖面盘点（`docs/stdlib-coverage.md`）
+
+九十一批、**377 个模块**之后，把「还缺什么、什么时候到头」写成可核对的矩阵
+`docs/stdlib-coverage.md`：
+
+- 规模与分布表（core 53 / data 85 / encoding 53 / net 53 / text 52 / container 33 /
+  os 32 / async 13 / analysis 3）；
+- 逐族覆盖矩阵（每个族列代表模块与状态：完整 / 部分 / 不做）；
+- **明确「不做」清单**：QUIC/HTTP3、TLS 1.3 完整握手、SNMP v3、LDAP/RADIUS/SIP、
+  Office/Parquet/7z、GPX/KML/GeoJSON、base36/62 变体、词典级断词/排序——每条都给了
+  理由（体量、外部数据、与「判断型/编解码型」定位不符）；
+- 判定「到头」的三条标准：① 族清单无空缺 ② 新模块只能是变体 ③ 不引入外部数据或
+  大运行时。按这三条，当前 ① ② 成立，因此**本轮收尾**；
+- 「以后真要再加」的五步节奏与两条硬约束（跨模块同名方法 vs 自由函数）。
+
+验收状态：`make stdtest` 377/377 通过（0 failure），每个批次的集成示例各自全绿
+（`std-mw` 60、`std-proto4` 56、`std-ops` 62、`std-docs` 48、`std-mgmt` 53、
+`std-util` 45 条检查）。
