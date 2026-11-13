@@ -146,6 +146,7 @@ struct Var {
     i64 size;                /* 堆块字节数；-1 未知 */
     int line;                /* 进入当前状态的行号；0 未知 */
     Str alias;               /* `q = p`：q 指向 p 那一块（顺着链找到根） */
+    int thread_uses;         /* 这个对象的地址交给过几个线程入口 */
     int has_range;           /* 循环变量的常量范围已知吗 */
     i64 lo;                  /* 能取到的最小值 */
     i64 hi;                  /* 能取到的最大值 */
@@ -442,6 +443,7 @@ static Var *var_get(Ctx *c, Str name, Type *type)
     v->size = -1;
     v->line = 0;
     v->alias = (Str){ (char[:]){ 0, 0 } };
+    v->thread_uses = 0;
     v->has_range = 0;
     v->lo = 0;
     v->hi = 0;
@@ -1537,6 +1539,19 @@ static void apply_free_sum(Ctx *c, Node *n, Str name)
     }
 }
 
+/* 哪些调用算「起一个新线程」（只有这些才谈得上跨线程共享） */
+static int is_thread_entry_api(Str name)
+{
+    if (str_is(name, "pthread_create") || str_is(name, "thread_create")
+        || str_is(name, "thread_spawn") || str_is(name, "thread_start")
+        || str_is(name, "thread_new") || str_is(name, "spawn_thread")
+        || str_is(name, "mt_spawn") || str_is(name, "thr_spawn"))
+        return 1;
+    if (str_has(name, "thread") && (str_has(name, "spawn") || str_has(name, "create")))
+        return 1;
+    return 0;
+}
+
 static void chk_call(Ctx *c, Node *n)
 {
     Ub *u = c->u;
@@ -1613,7 +1628,7 @@ static void chk_call(Ctx *c, Node *n)
             var_set(c, name, ident_type(c, name), VS_FREED, -1, n->line);
         return;
     }
-    if (str_has(name, "thread") || str_has(name, "pthread")) {
+    if (is_thread_entry_api(name)) {
         Node *ta = n->b;
 
         for (; ta; ta = ta->next) {
@@ -1625,8 +1640,37 @@ static void chk_call(Ctx *c, Node *n)
                 inner = ta->a;
             if (inner->kind != ND_IDENT || !ident_of(inner, &gname))
                 continue;
-            if (!prog_find(u->prog, gname, SYM_GLOBAL))
-                continue;            /* 只认全局/静态：局部变量进不了别的线程 */
+            if (!prog_find(u->prog, gname, SYM_GLOBAL)) {
+                /* 局部变量：地址交给两个线程就是共享可写状态（堆块同理） */
+                Var *lv = var_resolve(c, var_find(c, gname));
+
+                if (lv) {
+                    lv->thread_uses++;
+                    if (lv->thread_uses > 1) {
+                        Sb *b2 = sb_open(u->a, 220);
+                        Str msg = { (char[:]){ 0, 0 } };
+                        Str text = { (char[:]){ 0, 0 } };
+                        Str code = { (char[:]){ 0, 0 } };
+
+                        sb_s(b2, gname);
+                        sb_cs(b2, " 的地址已经交给过 ");
+                        sb_i(b2, lv->thread_uses);
+                        sb_cs(b2, " 个线程入口：多个线程同时读写同一块内存就是数据竞争");
+                        msg = sb_close(b2);
+                        text = ub_cat3(u->a, ub_s(u->a, "让每个线程用自己的缓冲区（各自的 "),
+                                       gname,
+                                       ub_s(u->a, "），或者用锁把访问串行化"));
+                        b2 = sb_open(u->a, 220);
+                        sb_cs(b2, "/* 分片：每线程一份 */\n");
+                        sb_s(b2, gname);
+                        sb_cs(b2, "_t = malloc(n / nthreads);   // 或者用 Mutex 包住共享访问");
+                        code = sb_close(b2);
+                        ub_emit(u, UB_RACE, CONF_POSSIBLE, n->line, n->col, snip, msg,
+                                ub_fix(FIX_NOTE, n->line, text, code));
+                    }
+                }
+                continue;
+            }
             {
                 Sb *b = sb_open(u->a, 220);
                 Str msg = { (char[:]){ 0, 0 } };
@@ -2779,4 +2823,24 @@ test "覆盖率账本：说不准的访问点要能数出来" {
         return err(2, "两处下标访问都要记进账本");
     if (ub_count(u) != 0)
         return err(3, "这两处都不该报问题");
+}
+
+test "同一个缓冲区交给两个线程：共享可写状态要报" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "int worker(void *arg) { return 0; }\n"
+                 "void f(void) {\n"
+                 "    char *b = malloc(64);\n"
+                 "    thread_spawn(worker, b);\n"
+                 "    thread_spawn(worker, b);\n"
+                 "}", UB_RACE);
+    Finding *f = first(u, UB_RACE);
+
+    if (!f)
+        return err(1, "同一个堆块进两个线程应该报");
+    if (!str_has(f->msg, "数据竞争"))
+        return err(2, "消息里要点出数据竞争");
+    if (ub_count(u) != 1)
+        return err(3, "只交过一次或只交一个线程都不该报");
 }

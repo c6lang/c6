@@ -98,7 +98,7 @@ demo.c6:2:44: 一定 [UB-OOB] 常量下标越界
 | `UB-OVERLAP` | `memcpy` 源与目标重叠 | 两个实参是同一个对象（同名标识符） | 换成 `memmove` |
 | `UB-NULLARG` | `memcpy`/`memset` 等传常量 0 指针 | 实参是字面量 0/`NULL`，且该位置必须非空 | 传真实缓冲区，或加空指针守卫 |
 | `UB-BADFREE` | `free(&局部变量)` | free 的实参是栈上变量的地址 | 删掉这次 free（栈内存自动回收） |
-| `UB-RACE` | 跨线程共享可写状态 | 全局/静态变量的地址被交给线程入口（`*thread*` 系列 API） | 用 `std.os.sync` 的锁或 `std.core.atomic` 的原子量包住（原话给到代码行） |
+| `UB-RACE` | 跨线程共享可写状态 | 地址被交给**起线程**的 API（`thread_spawn` / `thread_create` / `pthread_create` …）的全局/静态变量；或者同一个局部变量/堆块交给过**两个**线程入口 | 用 `std.os.sync` 的锁或 `std.core.atomic` 的原子量包住；共享缓冲区改成每线程一份（都给到代码行） |
 
 ## 4. 能追到多远（分析能力清单）
 
