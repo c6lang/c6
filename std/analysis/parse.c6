@@ -122,6 +122,7 @@ struct Node {
     Str text;                /* 这个表达式在源码里的原文（诊断引用的就是它） */
     i64 ival;
     int is_unsigned;
+    int bits;                /* 字面量的位宽：32 / 64（`1u`=32、`1ull`=64） */
     Type *type;
 };
 
@@ -324,6 +325,7 @@ static Node *nd_new(Parser *self, int kind)
     n->text = (Str){ (char[:]){ 0, 0 } };
     n->ival = 0;
     n->is_unsigned = 0;
+    n->bits = 0;
     n->type = 0;
     return n;
 }
@@ -894,8 +896,16 @@ static Type *ps_typespec(Parser *self)
         s = prog_find(self->prog, name, 0);
         if (s && (s->kind == SYM_TYPEDEF || s->kind == SYM_TAG))
             out = s->type;
-        if (!out)
+        if (!out) {
+            int i = 0;
+
             out = ty_new(self, TY_UNKNOWN, -1);   /* 不透明类型：检查器跳过 */
+            /* 名字留着：`u64`/`size_t` 这种没在本文件里定义的，位宽还能靠名字认 */
+            out->name = self->arena->alloc_str(name.s.len + 1);
+            for (i = 0; i < name.s.len; i++)
+                out->name[i] = name.s.data[i];
+            out->name[name.s.len] = 0;
+        }
         return ps_post_type(self, out);
     }
     ps_err(self, "expected a type");
@@ -1126,12 +1136,14 @@ static Node *ps_primary(Parser *self)
         n = nd_new(self, ND_NUM);
         n->ival = self->tok.ival;
         n->is_unsigned = self->tok.uns;
+        n->bits = self->tok.nlong > 0 ? 64 : 32;
         ps_adv(self);
         while (self->tok.kind == TK_STR)      /* 相邻字面量拼接 */
             ps_adv(self);
     } else if (self->tok.kind == TK_CHAR) {
         n = nd_new(self, ND_CHAR);
         n->ival = self->tok.ival;
+        n->bits = 32;                    /* 字符常量按 int 参与运算 */
         ps_adv(self);
         while (self->tok.kind == TK_STR)
             ps_adv(self);

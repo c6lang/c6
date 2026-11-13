@@ -36,14 +36,24 @@
  * | UB-VLA | 数组长度为 0（`int a[0]`、`int a[N-N]`） | 一定 |
  * | UB-OVERLAP | `memcpy` 源与目标同一个对象 | 一定 |
  * | UB-NULLARG | `memcpy`/`memset` 传常量 0 指针 | 一定 |
+ * | UB-BADFREE | `free(&局部变量)`：释放的不是堆指针 | 一定 |
  *
  * 抑制：在出问题的行（或上一行）写 `/// c6ub-ignore`，那一行的所有发现都跳过；
  * 写 `/// c6ub-ignore UB-OOB` 只跳过这一个检查。被压掉的条数在
  * `ub_suppressed()` 里。
  *
- * 已知边界（文档里也写了）：不跨函数、不做别名分析、不认 `realloc` 之后的旧指针、
- * 堆块大小只认常量长度；`int` 按 32 位、指针按 8 字节。追不到就降级成「可能」
- * 或者干脆不报。
+ * 追得了的范围（比第一版宽）：
+ *   - 别名：`q = p` 之后 free(p)，用 q 也算 use-after-free（顺拷贝链找根对象）；
+ *   - 跨函数：被调函数无条件 free 掉的实参，调用点之后就算已释放（一层的摘要）；
+ *   - 范围：`for (i = 0; i < N; i++) a[i]` 按 i 的常量范围判越界；
+ *   - 守卫：`if (p)` / `p && …` / `!p || …` / `if (!p) return;` 之后 p 视为非空，
+ *     分支汇合时两边状态不一致就退回「未知」，不硬报；
+ *   - 字符串：`strcpy(dst, "字面量")` 长度算得出来就判 dst 装不装得下；
+ *   - 指针算术：`*(a + k)` 等价于 `a[k]`，一起判越界。
+ *
+ * 已知边界（文档里也写了）：跨函数只有「释放了哪个参数」这一种摘要，不做全程序
+ * 数据流、不认 `realloc` 之后的旧指针、堆块大小只认常量长度；位宽靠类型名认
+ * （`u64`/`size_t` 等），说不准就按「不知道」处理，不硬报。
  */
 #include <string.h>
 #include <stdlib.h>
@@ -72,6 +82,7 @@ enum UbCheck {
     UB_VLA_LEN,
     UB_OVERLAP_COPY,
     UB_NULL_ARG,
+    UB_FREE_NONHEAP,
 };
 
 /* 置信度 */
@@ -132,7 +143,18 @@ struct Var {
     int is_static;
     i64 size;                /* 堆块字节数；-1 未知 */
     int line;                /* 进入当前状态的行号；0 未知 */
+    Str alias;               /* `q = p`：q 指向 p 那一块（顺着链找到根） */
+    int has_range;           /* 循环变量的常量范围已知吗 */
+    i64 lo;                  /* 能取到的最小值 */
+    i64 hi;                  /* 能取到的最大值 */
     Var *next;
+};
+
+/* 函数的「无条件释放了哪几个参数」摘要：跨函数追 use-after-free 用 */
+struct FreeSum {
+    Str fn;
+    int mask;                /* 第 i 位 = 第 i 个参数被无条件释放 */
+    FreeSum *next;
 };
 
 struct Ub {
@@ -145,18 +167,22 @@ struct Ub {
     Finding **tail;
     int n;
     int nsuppressed;
+    FreeSum *fsum;
 };
 
 struct Ctx {
     Ub *u;
     Func *fn;
     Var *vars;
+    int in_callee;           /* 正在分析 `x->m(...)` 里的 `x->m`：c6 的方法就是
+                              * 自由函数，self 可以显式为 0，不在这报空指针 */
 };
 
 /* ---- 前向声明 ---- */
 
 static void ub_expr(Ctx *c, Node *n, int wr);
 static void ub_stmt(Ctx *c, Stmt *s);
+static void for_range(Ctx *c, Stmt *s);
 
 /* ---- 字符串小工具（全部落在 Arena 上，不释放） ---- */
 
@@ -341,6 +367,7 @@ const char *ub_check_name(int check)
     case UB_VLA_LEN: return "UB-VLA";
     case UB_OVERLAP_COPY: return "UB-OVERLAP";
     case UB_NULL_ARG: return "UB-NULLARG";
+    case UB_FREE_NONHEAP: return "UB-BADFREE";
     default: return "UB-?";
     }
 }
@@ -361,6 +388,7 @@ const char *ub_check_title(int check)
     case UB_VLA_LEN: return "数组长度不是正数";
     case UB_OVERLAP_COPY: return "memcpy 区间重叠";
     case UB_NULL_ARG: return "内存函数收到空指针";
+    case UB_FREE_NONHEAP: return "释放的不是堆指针";
     default: return "未分类";
     }
 }
@@ -407,6 +435,10 @@ static Var *var_get(Ctx *c, Str name, Type *type)
     v->is_static = 0;
     v->size = -1;
     v->line = 0;
+    v->alias = (Str){ (char[:]){ 0, 0 } };
+    v->has_range = 0;
+    v->lo = 0;
+    v->hi = 0;
     v->next = c->vars;
     c->vars = v;
     return v;
@@ -419,6 +451,67 @@ static void var_set(Ctx *c, Str name, Type *type, int state, i64 size, int line)
     v->state = state;
     v->size = size;
     v->line = line;
+    v->alias = (Str){ (char[:]){ 0, 0 } };   /* 换过值就不再是别名 */
+}
+
+static Var *vars_clone_from(Ctx *c, Var *snap);
+
+/* 变量表的深拷贝：分支两边的状态各自演进，汇合时再合并 */
+static Var *vars_clone(Ctx *c)
+{
+    Var *src = c->vars;
+    Var *head = 0;
+    Var **tail = &head;
+
+    for (; src; src = src->next) {
+        Var *v = (Var *)c->u->a->alloc(sizeof(Var), 8);
+
+        *v = *src;
+        v->next = 0;
+        *tail = v;
+        tail = &v->next;
+    }
+    return head;
+}
+
+static void vars_restore(Ctx *c, Var *snap) { c->vars = vars_clone_from(c, snap); }
+
+static Var *vars_clone_from(Ctx *c, Var *snap)
+{
+    Var *head = 0;
+    Var **tail = &head;
+
+    for (; snap; snap = snap->next) {
+        Var *v = (Var *)c->u->a->alloc(sizeof(Var), 8);
+
+        *v = *snap;
+        v->next = 0;
+        *tail = v;
+        tail = &v->next;
+    }
+    return head;
+}
+
+/* 两边状态一样才留：不一样就当成「未知」，不拿它下结论 */
+static void vars_merge(Ctx *c, Var *a, Var *b)
+{
+    Var *v = 0;
+
+    c->vars = vars_clone_from(c, a);
+    for (v = c->vars; v; v = v->next) {
+        Var *o = 0;
+
+        for (o = b; o; o = o->next)
+            if (str_eq(o->name, v->name))
+                break;
+        if (!o || o->state != v->state || o->size != v->size) {
+            v->state = VS_UNKNOWN;
+            v->size = -1;
+            v->line = 0;
+            v->has_range = 0;
+            v->alias = (Str){ (char[:]){ 0, 0 } };
+        }
+    }
 }
 
 static void var_forget(Ctx *c, Str name, Type *type)
@@ -428,6 +521,35 @@ static void var_forget(Ctx *c, Str name, Type *type)
     v->state = VS_UNKNOWN;
     v->size = -1;
     v->line = 0;
+    v->alias = (Str){ (char[:]){ 0, 0 } };
+    v->has_range = 0;
+}
+
+/* 顺着 `q = p; r = q` 的拷贝链找到真正的堆对象（最多 8 跳，防环） */
+static Var *var_resolve(Ctx *c, Var *v)
+{
+    int guard = 0;
+
+    for (; v && v->alias.s.len > 0 && guard < 8; guard++) {
+        Var *nx = var_find(c, v->alias);
+
+        if (!nx || nx == v)
+            break;
+        v = nx;
+    }
+    return v;
+}
+
+/* `q = p`：记下别名，并继承 p 的堆状态——free(p) 之后 q 也不能用 */
+static void var_alias(Ctx *c, Str dst, Str src, Type *type)
+{
+    Var *d = var_get(c, dst, type);
+    Var *s = var_resolve(c, var_get(c, src, 0));
+
+    d->alias = src;
+    d->state = s->state;
+    d->size = s->size;
+    d->line = s->line;
 }
 
 /* 名字的类型：先查函数里的表，再查全局符号表 */
@@ -625,19 +747,44 @@ static int deref_check(Ctx *c, Node *target, Node *site, int wr)
     col = site && site->col > 0 ? site->col : target->col;
     snip = ub_snip(u, site, line);
     if (target->kind == ND_IDENT) {
+        Var *root = 0;
+
         name = target->name;
         v = var_find(c, name);
-        if (v && v->state == VS_FREED) {
-            Str msg = ub_cat3(u->a, ub_s(u->a, ""), name,
-                              ub_cat3(u->a, ub_s(u->a, " 在第 "), ub_i(u->a, v->line),
-                                      ub_s(u->a, " 行已经释放，这里又用了")));
-            Str text = ub_cat3(u->a, ub_s(u->a, "把第 "), ub_i(u->a, v->line),
+        root = var_resolve(c, v);
+        if (root && root->state == VS_FREED) {
+            Str msg = { (char[:]){ 0, 0 } };
+            Str text = ub_cat3(u->a, ub_s(u->a, "把第 "), ub_i(u->a, root->line),
                                ub_s(u->a, " 行的 free 挪到这个作用域的末尾（defer free），或者删掉这次使用"));
-            Str code = ub_cat3(u->a, ub_s(u->a, "defer free("), name,
+            Str code = ub_cat3(u->a, ub_s(u->a, "defer free("), root->name,
                                ub_s(u->a, ");   // 放到函数开头，让释放发生在最后一次使用之后"));
 
+            {
+                Sb *b = sb_open(u->a, 160);
+
+                if (str_eq(root->name, name)) {
+                    sb_s(b, name);
+                    sb_cs(b, " 在第 ");
+                    sb_i(b, root->line);
+                    sb_cs(b, " 行已经释放，这里又用了");
+                } else {
+                    sb_s(b, name);
+                    sb_cs(b, " 和 ");
+                    sb_s(b, root->name);
+                    sb_cs(b, " 指向同一块（");
+                    sb_s(b, name);
+                    sb_cs(b, " = ");
+                    sb_s(b, root->name);
+                    sb_cs(b, "），");
+                    sb_s(b, root->name);
+                    sb_cs(b, " 在第 ");
+                    sb_i(b, root->line);
+                    sb_cs(b, " 行已经释放，这里又用了");
+                }
+                msg = sb_close(b);
+            }
             ub_emit(u, UB_USE_AFTER_FREE, CONF_CERTAIN, line, col, snip, msg,
-                    ub_fix(FIX_NOTE, v->line, text, code));
+                    ub_fix(FIX_NOTE, root->line, text, code));
             return 1;
         }
         if (v && v->state == VS_NULL) {
@@ -675,6 +822,127 @@ static int deref_check(Ctx *c, Node *target, Node *site, int wr)
                 ub_fix(FIX_GUARD, line, text, code));
         return 1;
     }
+    return 0;
+}
+
+/* `!p` / `p == 0` / `NULL == p` 这种「p 是空」的形状 */
+static int null_test(Node *n, Str *out)
+{
+    if (!n)
+        return 0;
+    if (n->kind == ND_UN && str_is(n->name, "!") && n->a && n->a->kind == ND_IDENT) {
+        *out = n->a->name;
+        return 1;
+    }
+    if (n->kind == ND_BIN && (n->op == OP_EQ)
+        && n->a && n->a->kind == ND_IDENT && n->b
+        && (n->b->kind == ND_NUM || n->b->kind == ND_CHAR) && n->b->ival == 0) {
+        *out = n->a->name;
+        return 1;
+    }
+    if (n->kind == ND_BIN && (n->op == OP_EQ)
+        && n->b && n->b->kind == ND_IDENT && n->a
+        && (n->a->kind == ND_NUM || n->a->kind == ND_CHAR) && n->a->ival == 0) {
+        *out = n->b->name;
+        return 1;
+    }
+    return 0;
+}
+
+/* `p` / `p != 0`：p 非空 */
+static int nonnull_test(Node *n, Str *out)
+{
+    if (!n)
+        return 0;
+    if (n->kind == ND_IDENT) {
+        *out = n->name;
+        return 1;
+    }
+    if (n->kind == ND_BIN && (n->op == OP_NE)
+        && n->a && n->a->kind == ND_IDENT && n->b
+        && (n->b->kind == ND_NUM || n->b->kind == ND_CHAR) && n->b->ival == 0) {
+        *out = n->a->name;
+        return 1;
+    }
+    if (n->kind == ND_BIN && (n->op == OP_ANDAND)) {
+        if (nonnull_test(n->a, out))
+            return 1;                /* `p && p->f` */
+        if (nonnull_test(n->b, out))
+            return 1;                /* `f() && p`：右边为真时 p 非空 */
+        return 0;
+    }
+    return 0;
+}
+
+static void mark_nonnull(Ctx *c, Str name)
+{
+    var_set(c, name, ident_type(c, name), VS_UNKNOWN, -1, 0);
+}
+
+/* 类型有多少位：解析器不认识的 typedef（u64/size_t…）按名字认 */
+static int type_bits(Type *t)
+{
+    if (!t)
+        return 0;
+    if (t->bits > 0)
+        return t->bits;
+    if (t->kind == TY_PTR)
+        return 64;
+    if (t->name) {
+        Str nm = ub_lit(t->name);
+
+        if (str_is(nm, "u64") || str_is(nm, "i64") || str_is(nm, "size_t")
+            || str_is(nm, "usize") || str_is(nm, "isize") || str_is(nm, "long")
+            || str_is(nm, "uintptr_t") || str_is(nm, "intptr_t")
+            || str_is(nm, "ptrdiff_t"))
+            return 64;
+        if (str_is(nm, "u16") || str_is(nm, "i16"))
+            return 16;
+        if (str_is(nm, "u8") || str_is(nm, "i8"))
+            return 8;
+        if (str_is(nm, "u32") || str_is(nm, "i32") || str_is(nm, "int")
+            || str_is(nm, "unsigned"))
+            return 32;
+    }
+    return 0;
+}
+
+/* 一个表达式有多少位：移位/溢出的判定都要按它来，别一律按 32 位 */
+/* 返回 0 = 说不准（这种情况不拿「一定」的语气报） */
+static int op_bits(Ctx *c, Node *n)
+{
+    Type *t = 0;
+    Str name = { (char[:]){ 0, 0 } };
+
+    if (!n)
+        return 0;
+    if (n->kind == ND_NUM || n->kind == ND_CHAR)
+        return n->bits > 0 ? n->bits : 32;
+    if (n->kind == ND_CAST) {
+        t = n->type;
+        if (t && t->kind == TY_PTR)
+            return 64;
+        return type_bits(t);
+    }
+    if (n->kind == ND_IDENT) {
+        name = n->name;
+        t = ident_type(c, name);
+        if (t && t->kind == TY_PTR)
+            return 64;
+        return type_bits(t);
+    }
+    if (n->kind == ND_BIN) {
+        int ba = op_bits(c, n->a);
+        int bb = op_bits(c, n->b);
+
+        if (ba <= 0)
+            return bb;
+        if (bb <= 0)
+            return ba;
+        return ba > bb ? ba : bb;    /* 混合宽度按宽的算 */
+    }
+    if (n->type)
+        return type_bits(n->type);
     return 0;
 }
 
@@ -738,6 +1006,10 @@ static void chk_bin(Ctx *c, Node *n)
             hx = 0;
         if (n->b && n->b->is_unsigned)
             hy = 0;
+        if (op_bits(c, n->a) != 32 || op_bits(c, n->b) != 32) {
+            hx = 0;                  /* 不是纯 int 运算（64 位 / 说不准）：不判 */
+            hy = 0;
+        }
         if (n->op == OP_ADD) { r = x + y; opname = ub_s(u->a, "+"); }
         if (n->op == OP_SUB) { r = x - y; opname = ub_s(u->a, "-"); }
         if (n->op == OP_MUL) { r = x * y; opname = ub_s(u->a, "*"); }
@@ -758,21 +1030,94 @@ static void chk_bin(Ctx *c, Node *n)
         }
     }
     if ((n->op == OP_SHL || n->op == OP_SHR) && hy) {
-        if (y < 0 || y >= 32) {
+        int bits = op_bits(c, n->a);
+
+        if (bits <= 0)
+            return;                  /* 左边多宽说不准：宁可不说，也不猜 */
+        if (bits < 32)
+            bits = 32;               /* u8/u16 会整型提升到 int */
+        if (y < 0 || y >= bits) {
             Str msg = ub_cat4(u->a, ub_s(u->a, "移位量是 "), ub_i(u->a, y),
-                              ub_s(u->a, "，int 只有 32 位，"),
-                              ub_s(u->a, "移位量必须落在 0..31 才是定义好的行为"));
-            Str text = ub_cat3(u->a, ub_s(u->a, "把移位量夹到 0..31：对变量用 & 31，常量就直接改成 "),
-                               ub_i(u->a, y < 0 ? 0 : 31), ub_s(u->a, " 以内的值"));
-            Str code = ub_cat3(u->a, ub_snip(u, n->a, n->line),
+                              ub_cat3(u->a, ub_s(u->a, "，左边只有 "), ub_i(u->a, bits),
+                                      ub_s(u->a, " 位，")),
+                              ub_s(u->a, "移位量必须落在 0..(宽度-1) 才是定义好的行为"));
+            Str text = ub_cat4(u->a, ub_s(u->a, "把移位量夹到 0.."),
+                               ub_i(u->a, bits - 1),
+                               ub_s(u->a, "：对变量用 & "),
+                               ub_cat3(u->a, ub_i(u->a, bits - 1),
+                                       ub_s(u->a, "，常量就直接改成 "),
+                                       ub_cat(u->a, ub_i(u->a, y < 0 ? 0 : bits - 1),
+                                              ub_s(u->a, " 以内的值"))));
+            Str code = ub_cat4(u->a, ub_snip(u, n->a, n->line),
                                ub_s(u->a, " << ("),
-                               ub_cat(u->a, ub_snip(u, n->b, n->line),
-                                      ub_s(u->a, " & 31)")));
+                               ub_snip(u, n->b, n->line),
+                               ub_cat3(u->a, ub_s(u->a, " & "), ub_i(u->a, bits - 1),
+                                       ub_s(u->a, ")")));
 
             ub_emit(u, UB_SHIFT, CONF_CERTAIN, n->line, n->col, snip, msg,
                     ub_fix(FIX_REPLACE, n->line, text, code));
         }
     }
+}
+
+/* 非字面量下标：循环变量带常量范围时能判死（`for (i = 0; i < 7; i++) a[i]`） */
+static int chk_index_range(Ctx *c, Node *n, Type *t, Var *base)
+{
+    Ub *u = c->u;
+    Var *iv = 0;
+    i64 n_elem = 0;
+    Str snip = ub_snip(u, n, n->line);
+
+    if (!n->b || n->b->kind != ND_IDENT)
+        return 0;
+    iv = var_resolve(c, var_find(c, n->b->name));
+    if (!iv || !iv->has_range)
+        return 0;
+    if (t && t->kind == TY_ARRAY && t->n_known)
+        n_elem = t->n_elem;
+    else if (t && t->kind == TY_PTR && base && base->size >= 0 && t->elem
+             && t->elem->size > 0)
+        n_elem = base->size / t->elem->size;
+    else
+        return 0;
+    if (iv->lo >= 0 && iv->hi < n_elem)
+        return 0;                    /* 全在界内 */
+    {
+        Sb *b = sb_open(u->a, 200);
+        Str msg = { (char[:]){ 0, 0 } };
+        Str text = { (char[:]){ 0, 0 } };
+        Str code = { (char[:]){ 0, 0 } };
+
+        sb_s(b, iv->name);
+        sb_cs(b, " 在循环里能取到 ");
+        sb_i(b, iv->lo);
+        sb_cs(b, "..");
+        sb_i(b, iv->hi);
+        sb_cs(b, "，这里只有 ");
+        sb_i(b, n_elem);
+        sb_cs(b, " 个元素（合法下标 0..");
+        sb_i(b, n_elem - 1);
+        sb_cs(b, "）");
+        msg = sb_close(b);
+        b = sb_open(u->a, 200);
+        sb_cs(b, "把循环上界收到 ");
+        sb_i(b, n_elem);
+        sb_cs(b, " 以内（");
+        sb_s(b, iv->name);
+        sb_cs(b, " < ");
+        sb_i(b, n_elem);
+        sb_cs(b, "），或者让这块内存至少放得下 ");
+        sb_i(b, iv->hi + 1);
+        sb_cs(b, " 个元素");
+        text = sb_close(b);
+        code = ub_cat4(u->a, ub_s(u->a, "int "), n->a->name,
+                       ub_s(u->a, "["),
+                       ub_cat(u->a, ub_i(u->a, iv->hi + 1),
+                              ub_s(u->a, "];   // 让循环里每个下标都落在数组里")));
+        ub_emit(u, UB_ARRAY_OOB, CONF_CERTAIN, n->line, n->col, snip, msg,
+                ub_fix(FIX_REPLACE, n->line, text, code));
+    }
+    return 1;
 }
 
 static void chk_index(Ctx *c, Node *n, int wr)
@@ -795,7 +1140,11 @@ static void chk_index(Ctx *c, Node *n, int wr)
     v = var_find(c, name);
     t = ident_type(c, name);
     hx = node_const_int(u->prog, n->b, &idx);
-    if (!hx || !t)
+    if (!hx) {
+        chk_index_range(c, n, t, v);   /* 循环变量：用常量范围判 */
+        return;
+    }
+    if (!t)
         return;
     if (t->kind == TY_ARRAY && t->n_known) {
         if (idx < 0 || idx >= t->n_elem) {
@@ -870,11 +1219,28 @@ static void chk_index(Ctx *c, Node *n, int wr)
     }
 }
 
+/* `(T *)0`：方法调用的「显式空 self」惯用法，不是解引用 */
+static int cast_null_ptr(Node *n)
+{
+    i64 v = 0;
+
+    if (!n || n->kind != ND_CAST || !n->a)
+        return 0;
+    if (n->a->kind != ND_NUM && n->a->kind != ND_CHAR)
+        return 0;
+    v = n->a->ival;
+    return v == 0;
+}
+
 static void chk_member(Ctx *c, Node *n, int wr)
 {
     Ub *u = c->u;
 
     if (n->op == OP_PTR) {
+        if (cast_null_ptr(n->a))
+            return;                  /* `((T *)0)->m()`：self 就是 0，交给方法自己判 */
+        if (c->in_callee > 0)
+            return;                  /* `p->m()` 的 self 可以显式给 0：方法自己判空 */
         if (deref_check(c, n->a, n, wr))
             return;
         /* `p->f = v` 也算写过这块内存 */
@@ -888,11 +1254,41 @@ static void chk_member(Ctx *c, Node *n, int wr)
     (void)u;
 }
 
+/* `*(a + k)` / `*(k + a)`：就是 `a[k]`，借下标检查判越界 */
+static int chk_ptr_arith(Ctx *c, Node *n, int wr)
+{
+    Node *sum = n->a;
+    Node *base = 0;
+    Node *off = 0;
+    Node idx = { ND_INDEX, OP_NONE, 0, 0, 0, 0, 0, 0, { (char[:]){ 0, 0 } },
+                 { (char[:]){ 0, 0 } }, 0, 0, 0 };
+
+    if (!sum || sum->kind != ND_BIN || sum->op != OP_ADD)
+        return 0;
+    if (sum->a && sum->a->kind == ND_IDENT) {
+        base = sum->a;
+        off = sum->b;
+    } else if (sum->b && sum->b->kind == ND_IDENT) {
+        base = sum->b;
+        off = sum->a;
+    } else {
+        return 0;
+    }
+    idx.a = base;
+    idx.b = off;
+    idx.line = n->line;
+    idx.col = n->col;
+    chk_index(c, &idx, wr);
+    return 1;
+}
+
 static void chk_un(Ctx *c, Node *n, int wr)
 {
     if (!str_is(n->name, "*")) {
         return;
     }
+    if (chk_ptr_arith(c, n, wr))
+        return;
     deref_check(c, n->a, n, wr);
 }
 
@@ -901,6 +1297,59 @@ static void chk_un(Ctx *c, Node *n, int wr)
  * MASK 的第 K 位表示「第 K+1 个参数是指针」——`memset(p, 0, n)` 的第二个参数
  * 是填充字节、`memcpy(d, s, n)` 的第三个是长度，都不是指针，不能当成空指针报。
  * SKEL 是这类调用的正确写法，直接写进「代码」栏。 */
+/* `strcpy(dst, "字面量")` / `strcat(dst, "字面量")`：长度能算出来就能判死 */
+static void chk_strcpy_lit(Ctx *c, Node *n, const char *fn)
+{
+    Ub *u = c->u;
+    Node *dst = n->b;
+    Node *src = dst ? dst->next : 0;
+    Str name = { (char[:]){ 0, 0 } };
+    Type *t = 0;
+    int need = 0;
+
+    if (!dst || !src || !ident_of(dst, &name) || src->kind != ND_STR)
+        return;
+    t = ident_type(c, name);
+    if (!t || t->kind != TY_ARRAY || !t->n_known || t->n_elem <= 0)
+        return;
+    need = src->name.s.len + 1;      /* 含结尾的 0 */
+    if (need <= t->n_elem)
+        return;
+    {
+        Sb *b = sb_open(u->a, 220);
+        Str msg = { (char[:]){ 0, 0 } };
+        Str text = { (char[:]){ 0, 0 } };
+        Str code = { (char[:]){ 0, 0 } };
+
+        sb_s(b, name);
+        sb_cs(b, " 只有 ");
+        sb_i(b, t->n_elem);
+        sb_cs(b, " 字节，");
+        sb_cs(b, fn);
+        sb_cs(b, " 过来的字符串加结尾的 0 要 ");
+        sb_i(b, need);
+        sb_cs(b, " 字节：这是栈上的就地溢出");
+        msg = sb_close(b);
+        b = sb_open(u->a, 220);
+        sb_cs(b, "把 ");
+        sb_s(b, name);
+        sb_cs(b, " 的长度从 ");
+        sb_i(b, t->n_elem);
+        sb_cs(b, " 改到 ");
+        sb_i(b, need);
+        sb_cs(b, "（字符串 ");
+        sb_i(b, src->name.s.len);
+        sb_cs(b, " 字节 + 结尾的 0）");
+        text = sb_close(b);
+        code = ub_cat4(u->a, ub_s(u->a, "char "), name, ub_s(u->a, "["),
+                       ub_cat(u->a, ub_i(u->a, need),
+                              ub_s(u->a, "] = { 0 };   // 放得下整串再加结尾的 0")));
+        ub_emit(u, UB_ARRAY_OOB, CONF_CERTAIN, n->line, n->col,
+                ub_snip(u, n, n->line), msg,
+                ub_fix(FIX_REPLACE, n->line, text, code));
+    }
+}
+
 static void chk_null_args(Ctx *c, Node *n, const char *fname, int mask,
                           const char *skel)
 {
@@ -929,6 +1378,121 @@ static void chk_null_args(Ctx *c, Node *n, const char *fname, int mask,
     }
 }
 
+/* 这个表达式是不是 `free(name)` */
+static int node_is_free_call(Node *n, Str name)
+{
+    if (!n || n->kind != ND_CALL || !n->a || n->a->kind != ND_IDENT)
+        return 0;
+    if (!str_is(n->a->name, "free"))
+        return 0;
+    return n->b && n->b->kind == ND_IDENT && str_eq(n->b->name, name);
+}
+
+/* 语句序列里有没有**无条件**释放 name（含 defer free）；
+ * if/while/for 里的不算——那只是可能释放，不当成事实 */
+static int seq_frees(Stmt *s, Str name)
+{
+    for (; s; s = s->next) {
+        if (s->kind == ST_BLOCK) {
+            if (seq_frees(s->body, name))
+                return 1;
+            continue;
+        }
+        if (s->kind == ST_EXPR && node_is_free_call(s->cond, name))
+            return 1;
+        if ((s->kind == ST_DEFER || s->kind == ST_ERRDEFER)
+            && node_is_free_call(s->cond, name))
+            return 1;
+    }
+    return 0;
+}
+
+static void build_free_sums(Ub *u)
+{
+    Func *f = 0;
+
+    u->fsum = 0;
+    if (!u->prog)
+        return;
+    for (f = u->prog->funcs; f; f = f->next) {
+        Sym *p = 0;
+        int i = 0;
+        int mask = 0;
+
+        if (!f->body)
+            continue;
+        for (p = f->params; p && i < 32; p = p->next, i++)
+            if (p->name.s.len > 0 && seq_frees(f->body, p->name))
+                mask = mask | (1 << i);
+        if (mask) {
+            FreeSum *x = (FreeSum *)u->a->alloc(sizeof(FreeSum), 8);
+
+            x->fn = f->name;
+            x->mask = mask;
+            x->next = u->fsum;
+            u->fsum = x;
+        }
+    }
+}
+
+static int free_sum_of(Ub *u, Str fn)
+{
+    FreeSum *x = u->fsum;
+
+    for (; x; x = x->next)
+        if (str_eq(x->fn, fn))
+            return x->mask;
+    return 0;
+}
+
+/* 调用一个会把实参释放掉的函数：把实参标成已释放（跨函数 UAF 的来源） */
+static void apply_free_sum(Ctx *c, Node *n, Str name)
+{
+    Ub *u = c->u;
+    int mask = free_sum_of(u, name);
+    Node *a = 0;
+    int i = 0;
+
+    if (!mask)
+        return;
+    for (a = n->b; a && i < 32; a = a->next, i++) {
+        Str an = { (char[:]){ 0, 0 } };
+        Var *av = 0;
+
+        if (!(mask & (1 << i)) || !ident_of(a, &an))
+            continue;
+        av = var_resolve(c, var_find(c, an));
+        if (!av)
+            continue;
+        if (av->state == VS_FREED) {
+            Sb *b = sb_open(u->a, 160);
+            Str msg = { (char[:]){ 0, 0 } };
+            Str text = { (char[:]){ 0, 0 } };
+            Str code = { (char[:]){ 0, 0 } };
+
+            sb_s(b, av->name);
+            sb_cs(b, " 在第 ");
+            sb_i(b, av->line);
+            sb_cs(b, " 行已经释放，");
+            sb_s(b, name);
+            sb_cs(b, "(...) 里又会释放一次");
+            msg = sb_close(b);
+            text = ub_cat3(u->a, ub_s(u->a, "把第 "), ub_i(u->a, av->line),
+                           ub_s(u->a, " 行的 free 删掉，或者别把这个指针再传进会释放它的函数"));
+            code = ub_cat4(u->a, ub_s(u->a, "defer free("), av->name,
+                           ub_s(u->a, ");   // 释放只留一处（第 "),
+                           ub_cat(u->a, ub_i(u->a, n->line), ub_s(u->a, " 行这句去掉)")));
+            ub_emit(u, UB_DOUBLE_FREE, CONF_CERTAIN, n->line, n->col,
+                    ub_snip(u, n, n->line), msg,
+                    ub_fix(FIX_NOTE, av->line, text, code));
+            continue;
+        }
+        if (av->state == VS_HEAP || av->state == VS_HEAP_ZERO
+            || av->state == VS_HEAP_INIT)
+            var_set(c, av->name, av->type, VS_FREED, -1, n->line);
+    }
+}
+
 static void chk_call(Ctx *c, Node *n)
 {
     Ub *u = c->u;
@@ -939,12 +1503,25 @@ static void chk_call(Ctx *c, Node *n)
     if (!n->a || n->a->kind != ND_IDENT)
         return;
     name = n->a->name;
+    apply_free_sum(c, n, name);
     if (str_is(name, "free")) {
         Var *v = 0;
 
-        if (!ident_of(arg, &name) || is_nullish(c, arg))
+        if (is_nullish(c, arg))
             return;                  /* free(NULL) 是合法的 */
-        v = var_find(c, name);
+        if (arg && arg->kind == ND_UN && str_is(arg->name, "&")) {
+            Str msg = ub_s(u->a, "free 收到的是局部变量的地址，不是堆指针：这块内存不在堆上，"
+                                 "free 它会把堆管理器写坏");
+            Str text = ub_s(u->a, "别 free 栈上的地址：只有 malloc/calloc/realloc 拿到的指针才 free");
+            Str code = ub_s(u->a, "/* 栈上的变量自动回收：删掉这次 free */");
+
+            ub_emit(u, UB_FREE_NONHEAP, CONF_CERTAIN, n->line, n->col, snip, msg,
+                    ub_fix(FIX_REPLACE, n->line, text, code));
+            return;
+        }
+        if (!ident_of(arg, &name))
+            return;
+        v = var_resolve(c, var_find(c, name));
         if (v && v->state == VS_FREED_DEFER) {
             Str msg = ub_cat3(u->a, name, ub_s(u->a, " 在第 "),
                               ub_cat3(u->a, ub_i(u->a, v->line),
@@ -973,7 +1550,7 @@ static void chk_call(Ctx *c, Node *n)
             return;
         }
         if (v)
-            var_set(c, name, v->type, VS_FREED, -1, n->line);
+            var_set(c, v->name, v->type, VS_FREED, -1, n->line);
         else
             var_set(c, name, ident_type(c, name), VS_FREED, -1, n->line);
         return;
@@ -1007,12 +1584,50 @@ static void chk_call(Ctx *c, Node *n)
         return;
     }
     if (str_is(name, "strcpy")) {
+        chk_strcpy_lit(c, n, "strcpy");
         chk_null_args(c, n, "strcpy", 0x3, "strcpy(dst, src);");
+        return;
+    }
+    if (str_is(name, "strcat")) {
+        chk_strcpy_lit(c, n, "strcat");
+        chk_null_args(c, n, "strcat", 0x3, "strcat(dst, src);");
         return;
     }
     if (str_is(name, "strncpy")) {
         chk_null_args(c, n, "strncpy", 0x3, "strncpy(dst, src, n);");
     }
+}
+
+/* `for (int i = 0; i < N; i++)`：给 i 记下常量范围 [0, N-1]。
+ * 只认最简单的形状——初始化是常量、条件是 `i < 常量` 或 `i <= 常量`。 */
+static void for_range(Ctx *c, Stmt *s)
+{
+    Sym *y = 0;
+    Node *cond = s->cond;
+    Str name = { (char[:]){ 0, 0 } };
+    i64 lo = 0;
+    i64 hi = 0;
+    Var *v = 0;
+
+    if (!s->init || s->init->kind != ST_DECL || !s->init->sym)
+        return;
+    y = s->init->sym;
+    if (!y->init || !node_const_int(c->u->prog, y->init, &lo))
+        return;
+    if (!cond || cond->kind != ND_BIN || !ident_of(cond->a, &name))
+        return;
+    if (!str_eq(name, y->name))
+        return;
+    if (!node_const_int(c->u->prog, cond->b, &hi))
+        return;
+    if (cond->op == OP_LT)
+        hi = hi - 1;
+    else if (cond->op != OP_LE)
+        return;
+    v = var_get(c, name, y->type);
+    v->has_range = 1;
+    v->lo = lo;
+    v->hi = hi;
 }
 
 static void ub_assign(Ctx *c, Node *n)
@@ -1028,6 +1643,8 @@ static void ub_assign(Ctx *c, Node *n)
                     zeroed ? VS_HEAP_ZERO : VS_HEAP, size, n->line);
         } else if (n->op == OP_ASSIGN && is_nullish(c, n->b)) {
             var_set(c, name, ident_type(c, name), VS_NULL, -1, n->line);
+        } else if (n->op == OP_ASSIGN && n->b && n->b->kind == ND_IDENT) {
+            var_alias(c, name, n->b->name, ident_type(c, name));
         } else {
             var_forget(c, name, ident_type(c, name));
         }
@@ -1050,11 +1667,18 @@ static void ub_expr(Ctx *c, Node *n, int wr)
     if (!n)
         return;
     switch (n->kind) {
-    case ND_BIN:
+    case ND_BIN: {
+        Str guard = { (char[:]){ 0, 0 } };
+
         chk_bin(c, n);
         ub_expr(c, n->a, 0);
+        if (n->op == OP_OROR && null_test(n->a, &guard))
+            mark_nonnull(c, guard);  /* `!p || p->f`：右边 p 一定非空 */
+        else if (n->op == OP_ANDAND && nonnull_test(n->a, &guard))
+            mark_nonnull(c, guard);  /* `p && p->f`：右边 p 一定非空 */
         ub_expr(c, n->b, 0);
         break;
+    }
     case ND_UN:
         chk_un(c, n, wr);
         ub_expr(c, n->a, 0);
@@ -1071,9 +1695,19 @@ static void ub_expr(Ctx *c, Node *n, int wr)
         Node *arg = n->b;
 
         chk_call(c, n);
-        for (; arg; arg = arg->next)
+        for (; arg; arg = arg->next) {
+            /* `f(&x)`：x 可能被写，别拿旧状态下结论 */
+            if (arg && arg->kind == ND_UN && str_is(arg->name, "&") && arg->a
+                && arg->a->kind == ND_IDENT) {
+                var_forget(c, arg->a->name, ident_type(c, arg->a->name));
+                ub_expr(c, arg->a, 1);
+                continue;
+            }
             ub_expr(c, arg, 0);
+        }
+        c->in_callee++;
         ub_expr(c, n->a, 0);
+        c->in_callee--;
         break;
     }
     case ND_INDEX:
@@ -1177,6 +1811,7 @@ static void ub_decl(Ctx *c, Stmt *s)
         }
         chk_string_init(c, y);
         v = var_get(c, y->name, y->type);
+        v->type = y->type;               /* 同名再声明：以本次的类型为准 */
         v->is_static = y->is_static;
         if (y->init) {
             if (heap_of(c, y->init, &size, &zeroed)) {
@@ -1187,6 +1822,8 @@ static void ub_decl(Ctx *c, Stmt *s)
                 v->state = VS_NULL;
                 v->size = -1;
                 v->line = y->line;
+            } else if (y->init->kind == ND_IDENT) {
+                var_alias(c, y->name, y->init->name, y->type);
             }
             ub_expr(c, y->init, 0);
         }
@@ -1250,25 +1887,57 @@ static void ub_stmt(Ctx *c, Stmt *s)
         case ST_EXPR:
             ub_expr(c, s->cond, 0);
             break;
-        case ST_IF:
+        case ST_IF: {
+            Var *before = 0;
+            Var *then_state = 0;
+            Var *else_state = 0;
+            Str g = { (char[:]){ 0, 0 } };
+
             ub_expr(c, s->cond, 0);
+            before = vars_clone(c);
+            if (nonnull_test(s->cond, &g))
+                mark_nonnull(c, g);  /* `if (p)` 里面 p 一定非空 */
             ub_stmt(c, s->body);
-            ub_stmt(c, s->els);
+            then_state = vars_clone(c);
+            vars_restore(c, before);
+            if (s->els) {
+                if (null_test(s->cond, &g))
+                    mark_nonnull(c, g);   /* `if (!p) ... else { p 非空 }` */
+                ub_stmt(c, s->els);
+            }
+            else_state = vars_clone(c);
+            vars_merge(c, then_state, else_state);
+            if (!s->els && null_test(s->cond, &g)
+                && (s->body && (s->body->kind == ST_RETURN || s->body->kind == ST_BREAK
+                                || s->body->kind == ST_CONTINUE)))
+                mark_nonnull(c, g);  /* `if (!p) return;` 之后 p 一定非空 */
             break;
-        case ST_WHILE:
+        }
+        case ST_WHILE: {
+            Str g = { (char[:]){ 0, 0 } };
+
             ub_expr(c, s->cond, 0);
+            if (nonnull_test(s->cond, &g))
+                mark_nonnull(c, g);
             ub_stmt(c, s->body);
             break;
+        }
         case ST_DO:
             ub_stmt(c, s->body);
             ub_expr(c, s->cond, 0);
             break;
-        case ST_FOR:
+        case ST_FOR: {
+            Str g = { (char[:]){ 0, 0 } };
+
             ub_stmt(c, s->init);
+            for_range(c, s);            /* for (i = 0; i < N; i++)：记下 i 的范围 */
             ub_expr(c, s->cond, 0);
+            if (nonnull_test(s->cond, &g))
+                mark_nonnull(c, g);     /* `for (…; ai; …)` 体内 ai 非空 */
             ub_stmt(c, s->body);
             ub_stmt(c, s->step);
             break;
+        }
         case ST_SWITCH:
             ub_expr(c, s->cond, 0);
             ub_stmt(c, s->body);
@@ -1320,7 +1989,7 @@ static void ub_stmt(Ctx *c, Stmt *s)
 
 static void ub_func(Ub *u, Func *f)
 {
-    Ctx ctx = { u, f, 0 };
+    Ctx ctx = { u, f, 0, 0 };
     Ctx *c = &ctx;
     Sym *p = f->params;
     Var *v = 0;
@@ -1354,6 +2023,7 @@ Ub *ub_open(Arena *a, Str file, Str src, UbOpts opts)
     u->tail = &u->list;
     u->n = 0;
     u->nsuppressed = 0;
+    u->fsum = 0;
     return u;
 }
 
@@ -1366,6 +2036,7 @@ int ub_run(Ub *u)
 
     if (!u->prog)
         u->prog = parse_program(u->a, u->src);
+    build_free_sums(u);
     for (f = u->prog->funcs; f; f = f->next)
         if (f->body)
             ub_func(u, f);
@@ -1771,4 +2442,136 @@ test "干净的程序一条都不报" {
     }
     if (ub_not_analyzed(u) != 0)
         return err(3, "干净的源码不该有「没看懂」的区域");
+}
+
+test "别名：q = p 之后 free(p)，q 也不能再用" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void f(void) {\n"
+                 "    char *p = malloc(8);\n"
+                 "    p[0] = 1;\n"
+                 "    char *q = p;\n"
+                 "    free(p);\n"
+                 "    q[1] = 2;\n"
+                 "}", UB_USE_AFTER_FREE);
+    Finding *f = first(u, UB_USE_AFTER_FREE);
+
+    if (!f)
+        return err(1, "别名用-after-free 应该报");
+    if (!str_has(f->msg, "指向同一块"))
+        return err(2, "消息里应该点出这是别名");
+}
+
+test "跨函数：被调函数里 free 掉的实参，回来再用要报" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void drop(char *p) { free(p); }\n"
+                 "void f(void) {\n"
+                 "    char *p = malloc(8);\n"
+                 "    p[0] = 1;\n"
+                 "    drop(p);\n"
+                 "    p[1] = 2;\n"
+                 "}", UB_USE_AFTER_FREE);
+    Finding *f = first(u, UB_USE_AFTER_FREE);
+
+    if (!f)
+        return err(1, "跨函数 use-after-free 应该报");
+    if (f->line != 6)
+        return err(2, "应该落在再用它的那一行");
+}
+
+test "跨函数：同一个指针传进会释放它的函数两次要报重复释放" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void drop(char *p) { free(p); }\n"
+                 "void f(void) {\n"
+                 "    char *p = malloc(8);\n"
+                 "    drop(p);\n"
+                 "    drop(p);\n"
+                 "}", UB_DOUBLE_FREE);
+
+    if (!first(u, UB_DOUBLE_FREE))
+        return err(1, "第二次传给会释放的函数应该报重复释放");
+}
+
+test "循环变量的常量范围：上界越过数组要报，没越过不报" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "int bad(void) {\n"
+                 "    int a[4] = { 1, 2, 3, 4 };\n"
+                 "    int s = 0;\n"
+                 "    for (int i = 0; i < 7; i++)\n"
+                 "        s += a[i];\n"
+                 "    return s;\n"
+                 "}\n"
+                 "int good(void) {\n"
+                 "    int a[4] = { 1, 2, 3, 4 };\n"
+                 "    int s = 0;\n"
+                 "    for (int i = 0; i < 4; i++)\n"
+                 "        s += a[i];\n"
+                 "    return s;\n"
+                 "}", UB_ARRAY_OOB);
+    Finding *f = first(u, UB_ARRAY_OOB);
+
+    if (!f)
+        return err(1, "循环上界 7 配 4 个元素应该报");
+    if (f->line != 5)
+        return err(2, "应该报在 a[i] 那一行");
+    if (!str_has(f->msg, "0..6"))
+        return err(3, "消息里应该给出循环变量的范围");
+    if (!str_has(f->fix.code, "[7]"))
+        return err(4, "修法里应该给放得下 7 个元素的声明");
+    if (ub_count(u) != 1)
+        return err(5, "界内的那个循环不该报");
+}
+
+test "strcpy 塞不进目标数组：字面量长度能算出来" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void bad(void) {\n"
+                 "    char b[4];\n"
+                 "    strcpy(b, \"hello\");\n"
+                 "}", UB_ARRAY_OOB);
+    Finding *f = first(u, UB_ARRAY_OOB);
+
+    if (!f)
+        return err(1, "4 字节装不下 \"hello\"+0，应该报");
+    if (!str_has(f->msg, "栈上的就地溢出"))
+        return err(2, "消息里应该说清这是栈上溢出");
+    if (!str_has(f->fix.code, "[6]"))
+        return err(3, "修法里应该给 char b[6]");
+}
+
+test "指针算术下标：*(a + 6) 等价于 a[6]" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "int f(void) {\n"
+                 "    int a[4] = { 1, 2, 3, 4 };\n"
+                 "    return *(a + 6);\n"
+                 "}", UB_ARRAY_OOB);
+
+    if (!first(u, UB_ARRAY_OOB))
+        return err(1, "*(a + 6) 越界应该报");
+}
+
+test "free 栈上的地址：不是堆指针" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void f(void) {\n"
+                 "    int x = 1;\n"
+                 "    free(&x);\n"
+                 "}", UB_FREE_NONHEAP);
+    Finding *f = first(u, UB_FREE_NONHEAP);
+
+    if (!f)
+        return err(1, "free(&x) 应该报");
+    if (!str_has(f->fix.code, "删掉这次 free"))
+        return err(2, "修法应该是删掉这次 free");
 }

@@ -113,6 +113,15 @@
 
 ### 标准库
 
+- **静态检查加固：别名 / 跨函数 / 范围 / 安全门**：`std.analysis.ub` 从「函数内常量
+  判定」扩到「一层函数摘要 + 别名链 + 循环范围 + 守卫识别」——`q = p` 之后 `free(p)`
+  再用 q、`drop(p)` 里释放回来再用、`for (i = 0; i < 7; i++) a[i]`、`strcpy(b, "hello")`
+  塞不进 `char b[4]`、`*(a + 6)`、`free(&x)` 现在都能报（新增 `UB-BADFREE`，共 14 类）；
+  位宽按类型名认（`u64`/`size_t`），说不准就不报。`examples/stdub.c6` 增 `-W/--strict`
+  安全门（「可能」级与「没看懂」的构造都算失败），`Makefile` 增 `make ubcheck`：
+  用严格模式把整个 `std/` 过一遍，349 个模块全通过、0 条误报。见
+  [docs/ubcheck.md](docs/ubcheck.md) §4（分析能力）与 §8（安全级别与 Rust 级的差距）。
+
 - **标准库第八十四批（用 c6 分析 c6：静态分析三件套）**：`std.analysis.lex`（流式
   分词器，`Lexer` 是纯值、整结构体赋值即快照，零分配）、`std.analysis.parse`
   （务实递归下降解析器，AST 全放调用方 `Arena`，**认不出的构造只记账不中断**：

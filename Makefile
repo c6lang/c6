@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw bench-async
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw bench-async ubcheck
 
 all: build
 
@@ -1373,6 +1373,18 @@ std-ub: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdub $(STD_UB_SRCS)
 	@# 演示样例本来就带 9 处 UB，退出码 1（有「一定」级发现）属于正常
 	@./build/stdub; test $$? -le 1
+
+# 安全检查门：--strict 把整个 std/ 过一遍（「可能」级和「没看懂」的构造都算失败）。
+# 这是第八十四批「全代码检查」的入口：只放行「十四类可判定 UB 一条都没有、
+# 且没有被漏看的构造」的源码；运行时那一层由 c6 -b 兜（见 docs/ubcheck.md §8）。
+ubcheck: std-ub
+	@fail=0; for f in $$(find std -name '*.c6' | sort); do \
+	    if ! ./build/stdub -W $$f > /tmp/ub.$$$$ 2>&1; then \
+	        echo "$$f:"; cat /tmp/ub.$$$$; fail=1; \
+	    fi; \
+	done; rm -f /tmp/ub.$$$$; \
+	if [ $$fail -ne 0 ]; then echo "ubcheck: 有文件没通过安全检查"; exit 1; fi; \
+	echo "ubcheck: std/ 全部通过（十四类可判定 UB 0 条、无「没看懂」构造）"
 # 标准库第八十五批（密钥交换 + 传输安全策略 + 抓取许可 + 45 进制）：
 # x25519（Curve25519 密钥交换）/ hsts（RFC 6797 策略库）/ robots（RFC 9309
 # 抓取许可）/ base45（RFC 9285 编解码 + 流式编码器）。
@@ -1752,6 +1764,7 @@ distclean:
 #   std-https        编译并运行 examples/stdhttps.c6（第八十二批，同步/异步 HTTPS + 性能指标）
 #   std-async5       编译并运行 examples/stdasync5.c6（第八十三批，异步框架横切面）
 #   std-ub           编译并运行 examples/stdub.c6（第八十四批，静态分析三件套）
+#   ubcheck          用 stdub --strict 把整个 std/ 过一遍（安全检查门）
 #   std-sec          编译并运行 examples/stdsec.c6（第八十五批，密钥交换 + 安全策略）
 #   std-mw           编译并运行 examples/stdmw.c6（第八十六批，限流/缓存/邮件编码/模糊匹配）
 #
