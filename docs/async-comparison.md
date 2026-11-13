@@ -4,7 +4,7 @@
 不同，代价也差一到两个数量级。这份文档给出机制对照、代码形态对照和本机实测
 数据，最后说明每个数字的口径与陷阱。
 
-数据由 `make bench-async`（脚本 `bench/async/run.sh`，源码 `bench/async/`）
+数据由 `cmake --build build --target bench-async`（脚本 `bench/async/run.sh`，源码 `bench/async/`）
 产生，每个指标单独跑一个进程，结果同时写进 `build/bench-async.csv`。
 
 实测环境：Linux x86_64，gcc/g++ 12.3、clang 19、go 1.2x、rustc 1.81、
@@ -155,7 +155,7 @@ b.read(&mut buf).await?;
 
 ## 3. 性能：四项指标
 
-`make bench-async` 在本机的输出（数字随机器波动，看数量级）：
+`cmake --build build --target bench-async` 在本机的输出（数字随机器波动，看数量级）：
 
 | 语言 / 机制 | create (ns/任务) | switch (ns/往返) | conns (µs/连接) | RSS (B/挂起任务) |
 |---|---:|---:|---:|---:|
@@ -281,7 +281,7 @@ tokio 不是「语言的异步」，而是**一个具体实现**：它有自己�
 | 团队不想碰内存管理、要快速迭代 | **Go** | 阻塞写法 + 运行时调度，2.5 KB/goroutine 换来心智负担最低 |
 | 在用 Uya 生态、要 `@async_fn` 的写法 | **Uya**（`@async_fn` + `scheduler_run_*`） | 写法和 c6 同档；单线程多路等待要显式上任务队列 |
 | 只有几十上百路并发、逻辑是「请求-响应」 | **线程**（C pthread / Rust thread） | 写起来最直白，8.5 KB/线程在这种规模完全无所谓 |
-| 硬实时、无堆、无 libc | **c6（freestanding）** | `async` 运行时不要 libc，裸机也能跑（`make fstest-bare-*`） |
+| 硬实时、无堆、无 libc | **c6（freestanding）** | `async` 运行时不要 libc，裸机也能跑（`cmake --build build --target fstest-bare` 等目标） |
 
 c6 的位置很清楚：**C 的成本结构，Go 的写法**。它没有 GC、没有运行时线程、
 不依赖 libc（裸机上照样能 `await`），但写起来是 `async`/`await` 关键字而不是
@@ -293,7 +293,7 @@ c6 的位置很清楚：**C 的成本结构，Go 的写法**。它没有 GC、�
 ## 5. 复现
 
 ```sh
-make bench-async            # 编译各语言目标 + 打表，明细在 build/bench-async.csv
+cmake --build build --target bench-async            # 编译各语言目标 + 打表，明细在 build/bench-async.csv
 
 # 只跑某一个语言 / 某一段
 ./tcc/c6 -B tcc -I . -o build/bench_c6 bench/async/bench.c6 std/os/time.c6

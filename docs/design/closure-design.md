@@ -1186,9 +1186,9 @@ V1 的 C80（「不能捕获」）在 V2 下拆成：
 
 **零影响与全量回归**
 
-33. `make test-plain`（关掉 `C6_EXT`）：闭包代码全部在 `#ifdef C6_EXT` 内；
-34. `make selftest`、`BACKEND=c99 tests/run-tests.sh`、`make selfhost`、
-    `make c99selfhost` 全绿；
+33. `cmake --build build --target test-plain`（关掉 `C6_EXT`）：闭包代码全部在 `#ifdef C6_EXT` 内；
+34. `cmake --build build --target selftest`、`BACKEND=c99 tests/run-tests.sh`、`cmake --build build --target selfhost`、
+    `cmake --build build --target c99selfhost` 全绿；
 35. 现有 `tests/fn_lit.c6`、`tests/errors/fn_lit.c6`、`tests/abi/fn_lit*`
     一行不改仍通过（V1 兼容是硬约束）。
 

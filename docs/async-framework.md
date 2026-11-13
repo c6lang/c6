@@ -77,7 +77,7 @@ m.run_null(1000); m.run_io(500, rfd, wfd); m.run_co(500, rfd, wfd);
 char line[192] = {0}; m.report(line, sizeof line); printf("%s\n", line);
 ```
 
-## 4. 实测开销（x86-64 + TCC 后端，`make std-https` / `make std-async5`）
+## 4. 实测开销（x86-64 + TCC 后端，`cmake --build build --target std-https` / `cmake --build build --target std-async5`）
 
 | 场景 | 吞吐 | 单次 |
 | --- | --- | --- |
@@ -90,7 +90,7 @@ char line[192] = {0}; m.report(line, sizeof line); printf("%s\n", line);
 摊到每路上的成本就是一次 `epoll_wait` 的摊销，而不是每路一个栈（无栈协程的栈按需分配、
 任务帧就是一次 `malloc`）。
 
-复现：`make std-https`（HTTPS 三行指标）、`make std-async5`（框架横切面 + 三行指标）。
+复现：`cmake --build build --target std-https`（HTTPS 三行指标）、`cmake --build build --target std-async5`（框架横切面 + 三行指标）。
 
 ## 5. 这套框架**没有**做的事（诚实清单）
 

@@ -4,7 +4,7 @@
 >
 > 扩展不依赖 libc 也能跑：运行库的外部依赖全是 weak，缺 `malloc` / `pthread_*` / `select` 时自己顶上，一直到 512 字节引导扇区进长模式。
 >
-> 相关：示例 `examples/freestanding_*.c6`、`examples/boot/`；目标 `make fstest*` / `make fstest-bare*`
+> 相关：示例 `examples/freestanding_*.c6`、`examples/boot/`；目标 `cmake --build build --target fstest*` / `cmake --build build --target fstest-bare*`
 
 ---
 
@@ -25,7 +25,7 @@
 
 ```sh
 ./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
-    examples/freestanding_fstr.c6 tcc/libtcc1.a   # 或 make fstest
+    examples/freestanding_fstr.c6 tcc/libtcc1.a   # 或 cmake --build build --target fstest
 ./build/freestanding_fstr
 ```
 
@@ -58,7 +58,7 @@ weak 的，程序给了就切回“每线程一块状态”：
 `%fs:0`（`arch_prctl`），栈和控制块用 `mmap`，线程退出用 `SYS_exit`，join 用
 `CLONE_CHILD_CLEARTID` 加 futex；它还顺带给了一份线程安全的 `calloc`/`free`
 （每次 `mmap`，不用锁）。[examples/freestanding_go.c6](../../examples/freestanding_go.c6)
-用它跑两个真线程（一个等另一个置位，只有真并发才会通过），`make fstest-go`
+用它跑两个真线程（一个等另一个置位，只有真并发才会通过），`cmake --build build --target fstest-go`
 编译并运行，200 次连跑没有失败。
 
 join 这里有个坑值得记下来：「还活着」的标志不能直接靠 `CLONE_CHILD_SETTID` 写
@@ -95,7 +95,7 @@ SLIP 串行分帧）。它们只依赖 `std.core.types`，不分配、不链 lib
 `pthread`，把 `.c6` 正文列进裸机 payload 的命令行即可（用法见
 [stdlib.md](../stdlib.md#嵌入式基础crc--fixed--pool--frame)）。
 
-[examples/freestanding_noos.c6](../../examples/freestanding_noos.c6)（`make fstest-noos`）
+[examples/freestanding_noos.c6](../../examples/freestanding_noos.c6)（`cmake --build build --target fstest-noos`）
 就是这么一份：里面**一个 syscall 都没有**，插值、格式说明、`defer`、`err` +
 `catch`、`@T` 全在内存里做完，最后用 `ud2`（全过，退出码 132）或往 0 地址写
 （某个断言失败）报信 —— 这两个「报信」在裸机上就是你的异常向量。
@@ -103,13 +103,13 @@ SLIP 串行分帧）。它们只依赖 `std.core.types`，不分配、不链 lib
 注意：编译器自己还是得在别的地方跑（宿主上的 `tcc` 产出静态 ELF，再交给引导
 程序/烧写工具）；`tcc -run` 那套 JIT 与裸机无关。
 
-`make fstest-qemu` 会把这三个产物再用 `qemu-x86_64`（qemu 的用户态模拟器）跑
+`cmake --build build --target fstest-qemu` 会把这三个产物再用 `qemu-x86_64`（qemu 的用户态模拟器）跑
 一遍：它不用本机的加载器，也不需要 libc —— syscall 由 qemu 自己实现，等于换了
 一套内核接口实现来验证同一份二进制。这仍然不是裸机（qemu 在里面扮演内核）。
 
 #### 真裸机：自己写的 512 字节引导器
 
-`make fstest-bare` 走的才是没有内核那条路：qemu 只提供一台**空机器**，
+`cmake --build build --target fstest-bare` 走的才是没有内核那条路：qemu 只提供一台**空机器**，
 BIOS 把 512 字节引导扇区读到 `0x7C00` 就撒手，剩下全是自己的代码。
 
 ```
@@ -124,7 +124,7 @@ BIOS → 引导扇区（examples/boot/boot.S，512 字节）
 结果（调试口 `0xE9` 是这台机器上唯一的输出设备）：
 
 ```
-$ make fstest-bare
+$ cmake --build build --target fstest-bare
 n=42 hex=002a pi=3.142
 s=bare p=42 managed=<42>
 bare metal: ok
@@ -161,7 +161,7 @@ fstest-bare: ok（裸机启动，全部断言通过；KVM）
 
 #### 把 tests/ 也搬上裸机
 
-`make fstest-bare-tests` 把 `tests/*.c6` 里的 test 块搬到裸机上跑：**35 个测试
+`cmake --build build --target fstest-bare-tests` 把 `tests/*.c6` 里的 test 块搬到裸机上跑：**35 个测试
 文件、全部 test 块，0 失败**，每个文件一个镜像，一共十几秒。
 
 ```
@@ -218,8 +218,8 @@ C99 输出后端不在这个范围：它生成的 C 文件依赖宿主 libc（`<
 
 #### 裸机上的 spawn 是真并发：自己写一个抢占式调度器
 
-`spawn` 在别的地方落到 `pthread_create` 上。裸机上没有内核，所以 `make
-fstest-bare-go` 干脆自己写那一层：
+`spawn` 在别的地方落到 `pthread_create` 上。裸机上没有内核，所以
+`cmake --build build --target fstest-bare-go` 干脆自己写那一层：
 [examples/boot/sched.plain.c](../../examples/boot/sched.plain.c) 就是最小内核 ——
 8259A 重映射到 `0x20`、8254 每 10ms 一次时钟、中断进来换到调度器自己的栈、
 把现场摆成一块 160 字节的 `struct Frame`，换任务就是换块 Frame。新任务的
@@ -240,7 +240,7 @@ spawn: 是并发 —— 两个任务在同一个 CPU 上被时钟抢占着交错
 
 #### 多核：两个核同时在跑
 
-`make fstest-bare-smp` 起两个核（`-smp 2`）跑
+`cmake --build build --target fstest-bare-smp` 起两个核（`-smp 2`）跑
 [examples/boot/smp_bare.c6](../../examples/boot/smp_bare.c6)，再用 `SMP=1` 跑一遍做
 负对照。AP 是 `examples/boot/ap.S` 那个 16 位实模式跳板拉起来的（`as --32`
 + `ld -Ttext 0x8000`，222 字节，`build.sh` 用 `objcopy -I binary` 链进

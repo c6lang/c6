@@ -2,7 +2,7 @@
 
 > **状态**：现行规范（`C6_EXT` + `.c6` 后缀） · **索引**：[文档索引](../README.md) · **实现状态**：[status.md](../history/status.md)
 >
-> `test "描述" { ... }` 是语言内建的测试块，`-test` 跑；诊断用 `// EXPECT` 语料；提交前跑 `make check-all`。
+> `test "描述" { ... }` 是语言内建的测试块，`-test` 跑；诊断用 `// EXPECT` 语料；提交前跑 `cmake --build build --target check-all`。
 >
 > 相关：用例目录 `tests/`；运行器 `tests/run-tests.sh`、`tests/run-errbase.sh`
 
@@ -27,7 +27,7 @@ test "add works" {
 
 ## 测试
 
-提交前只跑一条命令就够：`make check-all`（= `test-all` + `errcheck` + C99 后端
+提交前只跑一条命令就够：`cmake --build build --target check-all`（= `test-all` + `errcheck` + C99 后端
 两套用例 + 三条自举路线），拆开看是下面「完整回归」里那些目标。
 
 这条命令并发跑：`tests/` 的两套宿主用例、`errcheck`、C99 后端两套、三条自举
@@ -35,17 +35,17 @@ test "add works" {
 **共享 `build/` 下固定路径**的那一组（`stdtest` 和八十多个 `std-*` 示例）整组
 串行 —— 它们的用例会往 `build/fs-test/`、`build/std-static/`、
 `build/mmap-test.bin`、`build/echo.sock` 这些固定路径写临时文件。输出按目标
-成块（`--output-sync=target`），不会混成一团；`CHECK_JOBS=1 make check-all`
+成块（`--output-sync=target`），不会混成一团；`cmake -S . -B build -DC6_CHECK_JOBS=1 && cmake --build build --target check-all`
 可以退回整轮串行。目标列表写在 `Makefile` 的 `STD_TARGETS`（共享路径，串行）
-和 `CHECK_PARALLEL`（其余，并发）里，那条串行由 `check-std-serial` 的递归
-`make -j1` 负责。
+和 `CHECK_PARALLEL`（其余，并发）里；CMake 的 `check-std-serial` 目标递归调用
+`make -j1` 把这一组串行跑完，CMake 是唯一入口，Makefile 只保存用例定义。
 
 c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 
 ```
 tests/
-├── run-tests.sh      运行器（make selftest 调它）
-├── run-errbase.sh    errbase.def 的检查（make errcheck 调它）
+├── run-tests.sh      运行器（cmake --build build --target selftest 调它）
+├── run-errbase.sh    errbase.def 的检查（cmake --build build --target errcheck 调它）
 ├── defer.c6           defer 的时机、顺序与作用域
 ├── defer_scope.c6     defer 与块作用域、goto 跨作用域的清理
 ├── defer_reent.c6     递归/重入时的 defer 链
@@ -98,7 +98,7 @@ tests/
 ```
 
 ```sh
-make selftest                       # 跑全部
+cmake --build build --target selftest                       # 跑全部
 tests/run-tests.sh                  # 同上
 tests/run-tests.sh slice module     # 只跑这几个
 tests/run-tests.sh --list           # 列出会跑的文件
@@ -153,35 +153,35 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 ## 完整回归
 
 ```sh
-make check-all     # 提交/发布前跑这一条：test-all + errcheck + C99 后端两套用例 + 三条自举路线
+cmake --build build --target check-all     # 提交/发布前跑这一条：test-all + errcheck + C99 后端两套用例 + 三条自举路线
                    # （除共享 build/ 路径的 std 家族整组串行外都并发；CHECK_JOBS=1 整轮串行）
-make test-all      # check-all 的第一段：selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
-make test          # 扩展模式：上游 tests2 全量
-make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
-make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
-make errcheck      # errbase.def：钉号表本身和 C126/C127/C128 真的会报错
-make stdtest       # 标准库 std/（七个子目录）每个模块的 test 块
-make std-demo      # 标准库集成示例（examples/wordcount.c6）
-make std-tour      # 新模块集成示例（examples/stdtour.c6，自带自检）
+cmake --build build --target test-all      # check-all 的第一段：selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
+ctest --test-dir build -R c6-tests2          # 扩展模式：上游 tests2 全量
+cmake --build build --target test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
+cmake --build build --target c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
+cmake --build build --target errcheck      # errbase.def：钉号表本身和 C126/C127/C128 真的会报错
+cmake --build build --target stdtest       # 标准库 std/（七个子目录）每个模块的 test 块
+cmake --build build --target std-demo      # 标准库集成示例（examples/wordcount.c6）
+cmake --build build --target std-tour      # 新模块集成示例（examples/stdtour.c6，自带自检）
 ```
 
-自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：
+自举（编译器编译自己，产物在 `build/selfhost/`，`cmake --build build --target c6-clean` 会一起删掉）：
 
 ```sh
-make selfhost          # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
-make c99selfhost       # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
-make c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条链不需要 gcc）
+cmake --build build --target selfhost          # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
+cmake --build build --target c99selfhost       # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
+cmake --build build --target c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条链不需要 gcc）
 ```
 
 三条路线都会把两次编译得到的目标文件 `cmp` 一遍（bootstrap fixpoint），
 再用最终的 stage2/stage3 编译并运行一个小程序：只有目标文件逐字节相同、
 编出来的编译器真能编程序，自举才算通过。
 
-`make c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
+`cmake --build build --target c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
 的源码也要满足它，所以把 `tcc/tcc.c` 拷成 `build/selfhost/c6/selfcheck.c6`
 后用 `-DC6_EXT` 编译一遍（原生目标文件 + C99 后端产物；带 `C6_EXT` 才会把
 扩展实现那半边也纳入检查），再把编出来的编译器连起来跑 `-v`。两步编译都
 不许有诊断输出，出现警告即失败。
 
-> 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
+> 切换模式会先 `cmake --build build --target c6-clean` 重建，因为 `C6_EXT` 是编译期开关。
 > 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。

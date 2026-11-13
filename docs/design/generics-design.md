@@ -450,7 +450,7 @@ void f(Vect@int *v) {
    倾向前者（可读、`-emit-header` 稳定），实现时在 `decl()` 里查实例表即可。
    当前实现**没有做这个检查**：手写 `struct Vect_int` 会和 `Vect@int` 的实例撞名
    （谁先谁赢），见 §9 阶段 2 的第 11 条。
-2. **`-Wgeneric-depth` 的阈值与是否进 `make test`**：已按建议实现——默认关闭，
+2. **`-Wgeneric-depth` 的阈值与是否进 `ctest --test-dir build -R c6-tests2`**：已按建议实现——默认关闭，
    `-Wall` 打开，**写出**的应用链深于 2 层时告警。测试不需要额外开关：
    `tests/run-tests.sh` 的诊断组支持文件内的 `// FLAGS …` 行，
    `tests/errors/generic.c6` 用 `// FLAGS -Wgeneric-depth` 加一个
@@ -528,4 +528,4 @@ void f(Vect@int *v) {
 泛型无关的既有后端限制，所以 `tests/abi/generic.c6` 里按值过边界的只有 8 字节
 的 `Pair@(int, int)`，`Vect@int` 一律走指针。
 
-验收：`make test`、`make c99test`、`make selfhost`、`make c99selfhost` 全绿。
+验收：`ctest --test-dir build -R c6-tests2`、`cmake --build build --target c99test`、`cmake --build build --target selfhost`、`cmake --build build --target c99selfhost` 全绿。
