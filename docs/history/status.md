@@ -2801,7 +2801,7 @@ Go 的写法**：同一个 1000 路循环，c6 版 40 行，C 状态机版 260 �
 
 错误号段继续追加：`std.analysis.lex`=0x615a、`std.analysis.parse`=0x615b、
 `std.analysis.ub`=0x615c。`Makefile` 增加 `std-ub` 与 `STD_UB_SRCS`；三个模块在
-`stdtest` 里分别 6/47/63 条。`examples/stdub.c6` 的演示源码覆盖 9 条发现
+`stdtest` 里分别 28/43/60 条（各自连带依赖模块的 test 块）。`examples/stdub.c6` 的演示源码覆盖 9 条发现
 （一定 8、可能 1）。
 
 验收：`make build`、`make stdtest`（349 个模块、0 failure）、`make std-ub`

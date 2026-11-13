@@ -627,7 +627,7 @@ static int deref_check(Ctx *c, Node *target, Node *site, int wr)
     if (target->kind == ND_IDENT) {
         name = target->name;
         v = var_find(c, name);
-        if (v && (v->state == VS_FREED || v->state == VS_FREED_DEFER)) {
+        if (v && v->state == VS_FREED) {
             Str msg = ub_cat3(u->a, ub_s(u->a, ""), name,
                               ub_cat3(u->a, ub_s(u->a, " 在第 "), ub_i(u->a, v->line),
                                       ub_s(u->a, " 行已经释放，这里又用了")));
@@ -945,7 +945,21 @@ static void chk_call(Ctx *c, Node *n)
         if (!ident_of(arg, &name) || is_nullish(c, arg))
             return;                  /* free(NULL) 是合法的 */
         v = var_find(c, name);
-        if (v && (v->state == VS_FREED || v->state == VS_FREED_DEFER)) {
+        if (v && v->state == VS_FREED_DEFER) {
+            Str msg = ub_cat3(u->a, name, ub_s(u->a, " 在第 "),
+                              ub_cat3(u->a, ub_i(u->a, v->line),
+                                      ub_s(u->a, " 行已经排了 defer free，这里再 free 一次，"),
+                                      ub_s(u->a, "退出作用域时还会再释放一遍")));
+            Str text = ub_cat3(u->a, ub_s(u->a, "第 "), ub_i(u->a, v->line),
+                               ub_s(u->a, " 行的 defer free 和这里的 free 只留一个"));
+            Str code = ub_cat3(u->a, ub_s(u->a, ""), name,
+                               ub_s(u->a, " = NULL;   // 释放后立刻置空，重复 free 就是 free(NULL)，安全"));
+
+            ub_emit(u, UB_DOUBLE_FREE, CONF_CERTAIN, n->line, n->col, snip, msg,
+                    ub_fix(FIX_REPLACE, n->line, text, code));
+            return;
+        }
+        if (v && v->state == VS_FREED) {
             Str msg = ub_cat3(u->a, name, ub_s(u->a, " 在第 "),
                               ub_cat(u->a, ub_i(u->a, v->line),
                                      ub_s(u->a, " 行已经释放过，再 free 一次是 double free")));
@@ -1270,6 +1284,7 @@ static void ub_stmt(Ctx *c, Stmt *s)
         case ST_ERRDEFER:
             /* `defer free(p);`：把 p 标成「作用域末尾释放」，
                之后再 free 一次就是 double free */
+            ub_expr(c, s->cond, 0);   /* 先走一遍表达式：这时的 free 还不算执行过 */
             if (s->cond && s->cond->kind == ND_CALL && s->cond->a
                 && s->cond->a->kind == ND_IDENT
                 && str_is(s->cond->a->name, "free")) {
@@ -1279,7 +1294,6 @@ static void ub_stmt(Ctx *c, Stmt *s)
                     var_set(c, name, ident_type(c, name), VS_FREED_DEFER, -1,
                             s->line);
             }
-            ub_expr(c, s->cond, 0);
             ub_stmt(c, s->body);
             break;
         case ST_TRY:
@@ -1536,6 +1550,25 @@ test "defer free 撞上显式 free：也算 double free" {
 
     if (!first(u, UB_DOUBLE_FREE))
         return err(1, "defer free + free 应该报");
+}
+
+test "defer free 之后再用是合法的：defer 在作用域末尾才跑" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void twice(char *b) {\n"
+                 "    char *p = malloc(8);\n"
+                 "    p[0] = 1;\n"
+                 "    defer free(p);\n"
+                 "    p[1] = 2;\n"
+                 "}", UB_NONE);
+
+    if (first(u, UB_USE_AFTER_FREE))
+        return err(1, "defer free 之后的使用不该报 use-after-free");
+    if (first(u, UB_DOUBLE_FREE))
+        return err(2, "只排了一次 defer free，不该报 double free");
+    if (ub_count(u) != 0)
+        return err(3, "defer free 之后再用：一条都不该报");
 }
 
 test "空指针解引用：赋过 0 的变量和字面量都要报" {

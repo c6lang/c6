@@ -92,7 +92,8 @@
   `/// c6ub-ignore [UB-XXX]` 抑制），示例 `examples/stdub.c6`（`make std-ub`，
   `文件:行:列: 一定|可能 [UB-XXX] 标题` + 源码 + `修法 |` + `代码 |`，退出码 0/1/2），
   新增文档 [docs/ubcheck.md](docs/ubcheck.md)（检查清单、可信度口径、抑制写法、
-  三件套 API、诚实限制清单）。错误号段 `std.analysis.lex`=0x615a、
+  三件套 API、诚实限制清单）。`defer free(p)` 只算「排队释放」，它之后的使用不报
+  use-after-free，只有与显式 `free` 撞车才算重复释放。错误号段 `std.analysis.lex`=0x615a、
   `std.analysis.parse`=0x615b、`std.analysis.ub`=0x615c。
 
 - **标准库第八十三批（异步框架横切面）**：`std.async.abudget`（时间预算 +

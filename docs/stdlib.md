@@ -544,9 +544,9 @@
 以实际输出为准）：
 
 ```
-std/analysis/lex.c6         6 test(s), 0 failure(s)
-std/analysis/parse.c6      47 test(s), 0 failure(s)
-std/analysis/ub.c6         63 test(s), 0 failure(s)
+std/analysis/lex.c6        28 test(s), 0 failure(s)
+std/analysis/parse.c6      43 test(s), 0 failure(s)
+std/analysis/ub.c6         60 test(s), 0 failure(s)
 std/container/bitset.c6    11 test(s), 0 failure(s)
 std/container/deque.c6     9 test(s), 0 failure(s)
 std/container/list.c6      4 test(s), 0 failure(s)

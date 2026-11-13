@@ -72,7 +72,7 @@ demo.c6:2:44: 一定 [UB-OOB] 常量下标越界
 | `UB-SHIFT` | 移位量 `< 0` 或 `>= 32` | 移位量是常量 / 常量折出来 | 常量 → 换成 0..31；变量 → `x & 31` |
 | `UB-OOB` | 数组、堆块常量下标越界 | 下标能折成常量，且落在 `0..n-1` 外 | 换成合法下标；确实要这个下标就把数组声明改大（给 `int a[5];`） |
 | `UB-NULL` | 解引用空指针 | 指针是 `NULL` / 赋过 0 的字面量 | `if (!p) { … return …; }` 守卫 |
-| `UB-UAF` | `free` 之后再读/再写 | 同函数内直线追到 `VS_FREED` | 把 `free` 挪到作用域末尾（`defer free(p);`）或删掉这次使用 |
+| `UB-UAF` | `free` 之后再读/再写 | 同函数内直线追到「已经释放」；`defer free(p)` 只是**排队**，它之后的使用仍然合法 | 把 `free` 挪到作用域末尾（`defer free(p);`）或删掉这次使用 |
 | `UB-DFREE` | 同一指针 `free` 两次 | 第二次 `free` 前状态已是 `VS_FREED`（含 `defer free` + `free` 撞车） | 删掉重复的那次 `free`；或释放后立刻 `p = NULL;` |
 | `UB-ESCAPE` | `return &局部变量`、`return 局部数组` | 返回表达式直接取局部地址 | 改成调用方传缓冲区进来（给函数签名），或按值返回 |
 | `UB-UNINIT` | 读 `malloc` 出来没写过的内存 | 堆块状态是 `VS_HEAP`（没写过） | 先写一遍，或把 `malloc` 换成 `calloc`（给整行） |
@@ -172,7 +172,7 @@ for (Finding *f = ub_findings(u); f; f = f->next)
 
 ```sh
 make std-ub      # 编译并跑 examples/stdub.c6（演示 9 条：一定 8、可能 1）
-make stdtest     # lex 6 / parse 47 / ub 63 条用例，全绿
+make stdtest     # 三个模块的 test 块全绿（349 个模块、0 failure）
 ```
 
 `std/analysis/ub.c6` 自己的用例覆盖了每类检查的正例和反例，也包括「只报一遍」
