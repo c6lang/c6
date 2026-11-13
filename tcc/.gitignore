@@ -71,3 +71,5 @@ libtcc.dylib
 
 # c6: build-mode marker written by the wrapper Makefile
 .c6-mode
+# c6: stamp of the DEFINES/CFLAGS the objects in this directory were built with
+.c6-flags

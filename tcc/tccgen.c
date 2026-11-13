@@ -11218,6 +11218,7 @@ special_math_val:
         break;
 #endif
 
+#ifdef C6_EXT
     case TOK_C6_ERR:
         /* err() produces the value of the 'error' channel; the only
            consumer is a 'return', so anywhere else it is an error.  In a
@@ -11225,6 +11226,7 @@ special_math_val:
         if (tcc_state->c6_ext)
             tcc_error("'err' can only be used as 'return err(id, msg)'");
         goto tok_identifier;
+#endif
 
     default:
     tok_identifier:

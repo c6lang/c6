@@ -68,6 +68,14 @@
 | `make mode-ext` / `mode-plain` | 切换构建模式（会自动清理旧产物） |
 | `make clean` / `distclean` | 清理构建产物 / 连 `configure` 结果一起清理（不删源码） |
 
+`tcc/` 里的目标文件全部依赖一份标志记录 `tcc/.c6-flags`（内容是本轮编译用的
+`CC` / `CFLAGS` / `DEFINES` / `LDFLAGS` / `LIBS`）。标志一变（切换 `build` /
+`build-plain`、换一份 `CFLAGS`、直接 `make -C tcc`），下一次 `make` 就把所有目标
+文件重编一遍。这不是洁癖：`-DC6_EXT` 会改 `struct TCCState` 在 `tcc.h` 里的布局，
+一半对象带它、一半不带，链接照样通过，但驱动读到的 `files` / `nb_files` 是错位的
+槽位 —— 典型症状是任何输入都报 `tcc: error: no input files`。所以别手工删一部分
+产物来「加快」构建，`make clean` 才是那个开关。
+
 ### 测试与回归
 
 | 目标 | 作用 |

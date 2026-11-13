@@ -267,8 +267,28 @@ endif
 c2str.exe : conftest.c
 	$S$(CC) -DC2STR $< -o $@
 
+# Every compiler object must be built with the same DEFINES/CFLAGS, and make
+# cannot see a change of -D: tcc.h opens structs on -DC6_EXT (struct TCCState
+# grows fields before 'files'/'nb_files'), so a tcc.o compiled without it links
+# fine against a libtcc.a compiled with it and then reads the wrong slots -
+# every input file is lost ('tcc: error: no input files' for -c and -run).
+# That is what a bare 'make -C tcc' (no EXTRA-DEFS, config.mak CFLAGS) used to
+# leave next to the objects of 'make build'.  Stamp the flags into a file and
+# depend on it: when they change, everything is rebuilt, however make was run.
+#
+# Native build only: tcc/lib and the cross compilers include this makefile with
+# a different DEFINES and would flip the stamp back and forth.
+ifndef CROSS_TARGET
+ifeq ($(TOP),.)
+C6FLAGS_STAMP = .c6-flags
+C6FLAGS_NOW = $(CC) $(CFLAGS) $(DEFINES) $(LDFLAGS) $(LIBS)
+$(shell printf '%s\n' '$(C6FLAGS_NOW)' | cmp -s - $(C6FLAGS_STAMP) 2>/dev/null \
+	|| printf '%s\n' '$(C6FLAGS_NOW)' > $(C6FLAGS_STAMP))
+endif
+endif
+
 # target specific object rule
-$(X)%.o : %.c $(LIBTCC_INC)
+$(X)%.o : %.c $(LIBTCC_INC) $(C6FLAGS_STAMP)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
 # additional dependencies
@@ -493,7 +513,7 @@ test-install: $(TCCDEFS_H)
 clean:
 	@rm -f c6 *-tcc tcc_p tcc_c tcc_s
 	@rm -f tags ETAGS *.o *.a *.so* *.out *.log lib*.def *.exe *.dll
-	@rm -f a.out *.dylib *_.h *.pod *.tcov
+	@rm -f a.out *.dylib *_.h *.pod *.tcov .c6-flags
 	@$(MAKE) -s -C lib $@
 	@$(MAKE) -s -C tests $@
 
