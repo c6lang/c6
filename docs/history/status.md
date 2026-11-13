@@ -2836,8 +2836,18 @@ Go 的写法**：同一个 1000 路循环，c6 版 40 行，C 状态机版 260 �
 一张表）、§8「通过检查 = 什么级别的安全」（L0–L5 梯子、与 Rust 级的差距、三层叠加
 的用法：`stdub -W` + `c6 -b` + 测试）。
 
-验收：`make build`、`make ubcheck`（349 个模块全通过）、`make stdtest`（357 个模块、
-0 failure，`std/analysis/ub.c6` 67 条用例）、`make std-ub`。
+随后补上两个能判定的口子：`q = realloc(p, n)` 之后**旧指针作废**（`UB-UAF`；原地
+`p = realloc(p, n)` 不算），以及**全局变量地址交给线程入口**（`UB-RACE`，可能级，修法
+指向 `std.os.sync` 的锁 / `std.core.atomic` 的原子量）。共 15 类。
+
+运行时那一层也落成了目标：`make safegate = ubcheck + c6 -b`。第二半跑
+`tests/ubsmoke.c6`——那处越界下标来自函数参数，静态按「说不准就不说」放过，`-b`
+必须当场抓出 `BCHECK: … is outside of the region` 并让进程非 0 退出；抓不住就说明
+运行时层没生效，门不放行。
+
+验收：`make build`、`make ubcheck`（361 个模块全通过、0 条误报、0 处没看懂）、
+`make safegate`（静态 + 运行时两层都过）、`make stdtest`（361 个模块、0 failure，
+`std/analysis/ub.c6` 70 条用例）、`make std-ub`。
 
 ### 11.99 标准库第八十五批（密钥交换 + 传输安全策略 + 抓取许可 + 45 进制）
 

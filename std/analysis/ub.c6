@@ -83,6 +83,7 @@ enum UbCheck {
     UB_OVERLAP_COPY,
     UB_NULL_ARG,
     UB_FREE_NONHEAP,
+    UB_RACE,
 };
 
 /* 置信度 */
@@ -134,6 +135,7 @@ enum VarState {
     VS_FREED,                /* free 过了 */
     VS_FREED_DEFER,          /* defer free：作用域末尾释放 */
     VS_NULL,                 /* 显式赋成 0 / NULL */
+    VS_REALLOC,              /* 被 realloc 接手：旧指针失效 */
 };
 
 struct Var {
@@ -368,6 +370,7 @@ const char *ub_check_name(int check)
     case UB_OVERLAP_COPY: return "UB-OVERLAP";
     case UB_NULL_ARG: return "UB-NULLARG";
     case UB_FREE_NONHEAP: return "UB-BADFREE";
+    case UB_RACE: return "UB-RACE";
     default: return "UB-?";
     }
 }
@@ -389,6 +392,7 @@ const char *ub_check_title(int check)
     case UB_OVERLAP_COPY: return "memcpy 区间重叠";
     case UB_NULL_ARG: return "内存函数收到空指针";
     case UB_FREE_NONHEAP: return "释放的不是堆指针";
+    case UB_RACE: return "跨线程共享可变状态";
     default: return "未分类";
     }
 }
@@ -752,6 +756,28 @@ static int deref_check(Ctx *c, Node *target, Node *site, int wr)
         name = target->name;
         v = var_find(c, name);
         root = var_resolve(c, v);
+        if (root && root->state == VS_REALLOC) {
+            Str msg = { (char[:]){ 0, 0 } };
+            Str text = { (char[:]){ 0, 0 } };
+            Str code = ub_cat4(u->a, ub_s(u->a, "/* 用 realloc 的返回值：") , name,
+                               ub_s(u->a, " = realloc("),
+                               ub_cat3(u->a, name, ub_s(u->a, ", n);  */"),
+                                       ub_s(u->a, "")));
+            Sb *b = sb_open(u->a, 180);
+
+            sb_s(b, name);
+            sb_cs(b, " 在第 ");
+            sb_i(b, root->line);
+            sb_cs(b, " 行已经被 realloc 接手：realloc 可能把整块搬到别处，旧指针不能再解引用");
+            msg = sb_close(b);
+            text = ub_cat3(u->a, ub_s(u->a, "改用 realloc 返回的新指针："), name,
+                           ub_s(u->a, " = realloc("));
+            code = ub_cat4(u->a, name, ub_s(u->a, " = realloc("), name,
+                           ub_s(u->a, ", n);   // 只用返回值，旧指针作废"));
+            ub_emit(u, UB_USE_AFTER_FREE, CONF_CERTAIN, line, col, snip, msg,
+                    ub_fix(FIX_NOTE, root->line, text, code));
+            return 1;
+        }
         if (root && root->state == VS_FREED) {
             Str msg = { (char[:]){ 0, 0 } };
             Str text = ub_cat3(u->a, ub_s(u->a, "把第 "), ub_i(u->a, root->line),
@@ -1536,6 +1562,20 @@ static void chk_call(Ctx *c, Node *n)
                     ub_fix(FIX_REPLACE, n->line, text, code));
             return;
         }
+        if (v && v->state == VS_REALLOC) {
+            Str msg = ub_cat3(u->a, v->name, ub_s(u->a, " 在第 "),
+                              ub_cat3(u->a, ub_i(u->a, v->line),
+                                      ub_s(u->a, " 行已经被 realloc 接手，旧指针既不能用也不能 free"),
+                                      ub_s(u->a, "")));
+            Str text = ub_s(u->a, "只有 realloc 返回的那个指针能 free；旧指针交给 realloc 之后就作废了");
+            Str code = ub_cat4(u->a, ub_s(u->a, "free("), v->name,
+                               ub_s(u->a, ");   // 删掉：free realloc 之后的新指针就行"),
+                               ub_s(u->a, ""));
+
+            ub_emit(u, UB_DOUBLE_FREE, CONF_CERTAIN, n->line, n->col, snip, msg,
+                    ub_fix(FIX_REPLACE, n->line, text, code));
+            return;
+        }
         if (v && v->state == VS_FREED) {
             Str msg = ub_cat3(u->a, name, ub_s(u->a, " 在第 "),
                               ub_cat(u->a, ub_i(u->a, v->line),
@@ -1553,6 +1593,46 @@ static void chk_call(Ctx *c, Node *n)
             var_set(c, v->name, v->type, VS_FREED, -1, n->line);
         else
             var_set(c, name, ident_type(c, name), VS_FREED, -1, n->line);
+        return;
+    }
+    if (str_has(name, "thread") || str_has(name, "pthread")) {
+        Node *ta = n->b;
+
+        for (; ta; ta = ta->next) {
+            Str gname = { (char[:]){ 0, 0 } };
+            Node *inner = ta;
+
+            if (ta->kind == ND_UN && str_is(ta->name, "&") && ta->a
+                && ta->a->kind == ND_IDENT)
+                inner = ta->a;
+            if (inner->kind != ND_IDENT || !ident_of(inner, &gname))
+                continue;
+            if (!prog_find(u->prog, gname, SYM_GLOBAL))
+                continue;            /* 只认全局/静态：局部变量进不了别的线程 */
+            {
+                Sb *b = sb_open(u->a, 220);
+                Str msg = { (char[:]){ 0, 0 } };
+                Str text = { (char[:]){ 0, 0 } };
+                Str code = { (char[:]){ 0, 0 } };
+
+                sb_s(b, gname);
+                sb_cs(b, " 是全局变量，它的地址被交给了 ");
+                sb_s(b, name);
+                sb_cs(b, "：一旦有第二个线程，读写它就是数据竞争（C6 里是未定义行为）");
+                msg = sb_close(b);
+                b = sb_open(u->a, 220);
+                sb_cs(b, "用 std.os.sync 的锁或 std.core.atomic 的原子量把对 ");
+                sb_s(b, gname);
+                sb_cs(b, " 的访问包起来；或者给每个线程一份自己的状态，别共享可写全局");
+                text = sb_close(b);
+                code = ub_cat4(u->a, ub_s(u->a, "static Mutex m = { 0 };\n"),
+                               ub_s(u->a, "if (m.lock() == 0) { /* 读写 "),
+                               gname,
+                               ub_s(u->a, " */ m.unlock(); }"));
+                ub_emit(u, UB_RACE, CONF_POSSIBLE, n->line, n->col, snip, msg,
+                        ub_fix(FIX_GUARD, n->line, text, code));
+            }
+        }
         return;
     }
     if (str_is(name, "memcpy")) {
@@ -1630,6 +1710,20 @@ static void for_range(Ctx *c, Stmt *s)
     v->hi = hi;
 }
 
+/* `q = realloc(p, n)`：p 可能被搬走 —— 除非 q 就是 p 本身，否则 p 作废 */
+static void realloc_takeover(Ctx *c, Str lhs, Node *rhs, int line)
+{
+    if (!rhs || rhs->kind != ND_CALL || !rhs->a || rhs->a->kind != ND_IDENT)
+        return;
+    if (!str_is(rhs->a->name, "realloc"))
+        return;
+    if (!rhs->b || rhs->b->kind != ND_IDENT)
+        return;
+    if (str_eq(rhs->b->name, lhs))
+        return;                      /* p = realloc(p, n)：原地接手 */
+    var_set(c, rhs->b->name, ident_type(c, rhs->b->name), VS_REALLOC, -1, line);
+}
+
 static void ub_assign(Ctx *c, Node *n)
 {
     Node *lhs = n->a;
@@ -1641,6 +1735,7 @@ static void ub_assign(Ctx *c, Node *n)
         if (n->op == OP_ASSIGN && heap_of(c, n->b, &size, &zeroed)) {
             var_set(c, name, ident_type(c, name),
                     zeroed ? VS_HEAP_ZERO : VS_HEAP, size, n->line);
+            realloc_takeover(c, name, n->b, n->line);
         } else if (n->op == OP_ASSIGN && is_nullish(c, n->b)) {
             var_set(c, name, ident_type(c, name), VS_NULL, -1, n->line);
         } else if (n->op == OP_ASSIGN && n->b && n->b->kind == ND_IDENT) {
@@ -1818,6 +1913,7 @@ static void ub_decl(Ctx *c, Stmt *s)
                 v->state = zeroed ? VS_HEAP_ZERO : VS_HEAP;
                 v->size = size;
                 v->line = y->line;
+                realloc_takeover(c, y->name, y->init, y->line);
             } else if (is_nullish(c, y->init)) {
                 v->state = VS_NULL;
                 v->size = -1;
@@ -2574,4 +2670,61 @@ test "free 栈上的地址：不是堆指针" {
         return err(1, "free(&x) 应该报");
     if (!str_has(f->fix.code, "删掉这次 free"))
         return err(2, "修法应该是删掉这次 free");
+}
+
+test "realloc 接手之后旧指针不能再用" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void f(void) {\n"
+                 "    char *p = malloc(8);\n"
+                 "    p[0] = 1;\n"
+                 "    char *q = realloc(p, 32);\n"
+                 "    q[0] = 2;\n"
+                 "    p[1] = 3;\n"
+                 "}", UB_USE_AFTER_FREE);
+    Finding *f = first(u, UB_USE_AFTER_FREE);
+
+    if (!f)
+        return err(1, "realloc 之后的旧指针再用要报");
+    if (!str_has(f->msg, "realloc"))
+        return err(2, "消息里要点出是 realloc 接手的");
+    if (!str_has(f->fix.code, "realloc("))
+        return err(3, "修法要给出用返回值的写法");
+}
+
+test "realloc 原地接手（p = realloc(p, n)）不算错" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "void f(void) {\n"
+                 "    char *p = malloc(8);\n"
+                 "    p[0] = 1;\n"
+                 "    p = realloc(p, 32);\n"
+                 "    p[1] = 2;\n"
+                 "}", UB_NONE);
+
+    if (ub_count(u) != 0)
+        return err(1, "原地 realloc 不该报");
+}
+
+test "全局变量的地址交给线程：可能的数据竞争" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "int counter = 0;\n"
+                 "int worker(void *arg) { counter = counter + 1; return 0; }\n"
+                 "void f(void) {\n"
+                 "    thread_spawn(worker, &counter);\n"
+                 "}", UB_RACE);
+    Finding *f = first(u, UB_RACE);
+
+    if (!f)
+        return err(1, "全局变量地址进线程入口应该报");
+    if (f->conf != CONF_POSSIBLE)
+        return err(2, "数据竞争只能是「可能」");
+    if (!str_has(f->fix.text, "锁") && !str_has(f->fix.text, "atomic"))
+        return err(3, "修法要指向锁或原子量");
+    if (!str_has(f->fix.code, "lock"))
+        return err(4, "修法代码要给出加锁的写法");
 }

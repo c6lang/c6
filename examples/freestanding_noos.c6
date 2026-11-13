@@ -86,7 +86,7 @@ void _start(void)
 
     /* 唯一的“平台”动作：正常就用 ud2，失败就踩空 */
     if (bad)
-        *(volatile int *)0 = bad;
+        *(volatile int *)0 = bad;   /// c6ub-ignore UB-NULL：故意的「踩空」陷阱
     __asm__ __volatile__("ud2");
     for (;;)
         ;

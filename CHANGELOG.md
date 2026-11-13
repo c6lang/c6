@@ -139,6 +139,10 @@
   安全门（「可能」级与「没看懂」的构造都算失败），`Makefile` 增 `make ubcheck`：
   用严格模式把整个 `std/` 过一遍，349 个模块全通过、0 条误报。见
   [docs/ubcheck.md](docs/ubcheck.md) §4（分析能力）与 §8（安全级别与 Rust 级的差距）。
+  再补两个可判定项：`q = realloc(p, n)` 之后旧指针作废（`UB-UAF`，原地 `p = realloc(p, n)`
+  不算）、全局变量地址进线程入口 → `UB-RACE`（可能级，修法指向锁/原子量），共 15 类。
+  运行时层落地成 `make safegate`：`ubcheck` 之外再用 `c6 -b` 跑 `tests/ubsmoke.c6`
+  （下标来自参数、静态判不出的越界），必须被 `-b` 当场抓住才算通过。
 
 - **标准库第八十四批（用 c6 分析 c6：静态分析三件套）**：`std.analysis.lex`（流式
   分词器，`Lexer` 是纯值、整结构体赋值即快照，零分配）、`std.analysis.parse`
