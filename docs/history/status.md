@@ -2860,6 +2860,10 @@ align / err / geometry / spline / types / vector），其余 356 个共 **15 380
 为了不组合爆炸，展开有三条硬限制：深度 3、单次函数分析最多 200 次、只展开 ≤48 条语句
 的小函数，递归立刻停；展开不了退回一层摘要。效果：`drop2(p) → drop1(p)` 两层传递、
 `take(p, 9)` 在调用方知情下的越界、`release(&p)` 里的 `free(*slot)` 全都能追到。
+`stdub` 同时支持**目录递归**（给目录就往下钻，只收 `*.c6`，不跟随符号链接，最多 8192 个
+文件），`c6 --ub DIR` 一样能用；`make ubcheck` 于是简化成 `./build/stdub -W std`——369 个
+模块扫一遍约 6 秒。
+
 顺手补了谓词/返回值契约（`if (!ok(self)) return;`、`r = peek(self,t); if (r == 1)` 之后
 self 非空）和「写过 `*out` 就让调用方状态作废」，把误报压回 0（`std/` + `examples/` +
 `tests/` 全扫一遍 0 条）。`std/analysis/ub.c6` 用例 82 条。

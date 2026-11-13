@@ -1,6 +1,7 @@
 /* stdub：用 std.analysis.ub 检查 c6 源码里的未定义行为。
  *
  *     make build && ./tcc/c6 -B tcc -run examples/stdub.c6 文件.c6
+ *     ./tcc/c6 -B tcc -run examples/stdub.c6 std               # 目录递归扫 *.c6
  *     ./tcc/c6 -B tcc -run examples/stdub.c6 -q 文件.c6      # 只报「一定」
  *     ./tcc/c6 -B tcc -run examples/stdub.c6                 # 自带的演示样例
  *
@@ -24,6 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+import std.os.fs;
+import std.os.walk;
 
 import std.core.types;
 import std.analysis.ub;
@@ -151,6 +156,61 @@ static char *read_file(const char *path, int *out_len)
     return buf;
 }
 
+/* ---- 文件清单：命令行给的 + 目录递归收集的 ---- */
+
+#define UB_MAX_FILES 8192
+
+static char *g_files[UB_MAX_FILES] = { 0 };
+static int g_nfiles = 0;
+
+static void push_file(const char *path)
+{
+    int n = 0;
+    char *copy = 0;
+
+    if (g_nfiles >= UB_MAX_FILES) {
+        fprintf(stderr, "stdub: 文件太多（最多 %d 个），后面的跳过了\n", UB_MAX_FILES);
+        return;
+    }
+    n = (int)strlen(path);
+    copy = (char *)malloc((size_t)n + 1);
+    if (!copy)
+        return;
+    memcpy(copy, path, (size_t)n);
+    copy[n] = 0;
+    g_files[g_nfiles] = copy;
+    g_nfiles++;
+}
+
+/* walk() 的回调：只收普通文件、后缀 .c6 */
+static int collect_cb(char *path, StatInfo *si, int depth, void *ud)
+{
+    int n = 0;
+
+    (void)depth;
+    (void)ud;
+    if (!path || !si || !si->is_file)
+        return 1;
+    n = (int)strlen(path);
+    if (n <= 3 || strcmp(path + n - 3, ".c6") != 0)
+        return 1;
+    push_file(path);
+    return 1;
+}
+
+/* 一个目录参数：递归收 *.c6 收进清单 */
+static int push_dir(const char *dir)
+{
+    WalkOpts o = walk_default();
+    int rc = walk((char *)dir, o, collect_cb, 0);
+
+    if (rc < 0) {
+        fprintf(stderr, "stdub: 目录走不下去：%s\n", dir);
+        return 0;
+    }
+    return 1;
+}
+
 /* 分析一份源码，打印所有发现，计数累加到 ST */
 static void analyze(const char *name, char *src_text, int len, UbOpts opts, Stats *st)
 {
@@ -229,7 +289,7 @@ static void analyze(const char *name, char *src_text, int len, UbOpts opts, Stat
 int main(int argc, char **argv)
 {
     UbOpts opts = ub_opts_default();
-    const char *files[64] = { 0 };
+    char **files = g_files;
     int nfiles = 0;
     int i = 0;
     int bad = 0;
@@ -271,14 +331,20 @@ int main(int argc, char **argv)
             usage(stderr);
             return 2;
         }
-        if (nfiles >= 64) {
-            fprintf(stderr, "stdub: 文件太多（最多 64 个）\n");
-            return 2;
+        {
+            struct stat st = { 0 };
+
+            if (stat(z, &st) == 0 && S_ISDIR(st.st_mode)) {
+                if (!push_dir(z))
+                    bad = 1;      /* 目录打不开也算出错，但不中断其它目标 */
+                continue;
+            }
         }
-        files[nfiles] = z;
+        push_file(z);
         nfiles++;
     }
 
+    nfiles = g_nfiles;
     if (nfiles == 0) {
         printf("（没给文件，分析内置的演示样例）\n\n");
         analyze("demo.c6", (char *)demo_src, (int)strlen(demo_src), opts, &st);

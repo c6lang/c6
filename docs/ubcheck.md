@@ -19,6 +19,7 @@
 ```sh
 make std-ub                   # 先编出检查器（build/stdub），并跑内置演示样例
 ./build/stdub 你的文件.c6      # 真实文件，可以给多个
+./build/stdub std             # 给目录就**递归**扫里面所有 *.c6（子目录一起）
 ./tcc/c6 --ub 你的文件.c6      # 同一个检查器，从编译器入口调（等价于上面这条）
 ./build/stdub -q 你的文件.c6   # --quiet-uncertain：只报「一定」
 ./build/stdub -W 你的文件.c6   # --strict：安全门模式（见下）
@@ -250,6 +251,10 @@ c6 -b -I . -o app src/*.c6         # 2. 运行时门：-b 给每次访问加边�
 ```sh
 make safegate     # ubcheck（静态，整个 std/）+ c6 -b 探针（证明运行时层是活的）
 ```
+
+给目录时会用 `std.os.walk` 往下钻：只收普通文件、后缀 `.c6`，符号链接不跟随，
+一层最多 8192 个文件、目录深度 32（`std.os.walk` 的上限）；整个 `std/`（369 个模块）
+扫一遍约 6 秒。
 
 `stdub` 的汇总行会给出「另有 N 处访问说不准」——这就是**静态层的边界**，它对应
 `ub_unproven()`（`ub_accesses()` 是访问点总数）。`--strict` 会把这行打到 stderr，

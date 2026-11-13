@@ -1366,7 +1366,7 @@ std-async5: build
 # stdub 是它们的命令行：不带参数时分析内置的演示样例。
 STD_UB_SRCS := examples/stdub.c6 std/analysis/ub.c6 std/analysis/parse.c6 \
                std/analysis/lex.c6 std/core/mem.c6 std/core/types.c6 \
-               std/text/str.c6
+               std/text/str.c6 std/os/fs.c6 std/os/walk.c6 std/os/path.c6
 
 std-ub: build
 	@mkdir -p build
@@ -1378,12 +1378,9 @@ std-ub: build
 # 这是第八十四批「全代码检查」的入口：只放行「十五类可判定 UB 一条都没有、
 # 且没有被漏看的构造」的源码；运行时那一层由 c6 -b 兜（见 docs/ubcheck.md §8）。
 ubcheck: std-ub
-	@fail=0; for f in $$(find std -name '*.c6' | sort); do \
-	    if ! ./build/stdub -W $$f > /tmp/ub.$$$$ 2>&1; then \
-	        echo "$$f:"; cat /tmp/ub.$$$$; fail=1; \
-	    fi; \
-	done; rm -f /tmp/ub.$$$$; \
-	if [ $$fail -ne 0 ]; then echo "ubcheck: 有文件没通过安全检查"; exit 1; fi; \
+	@./build/stdub -W std > /tmp/ub.out 2>/tmp/ub.err; rc=$$?; \
+	cat /tmp/ub.out; cat /tmp/ub.err; \
+	if [ $$rc -ne 0 ]; then echo "ubcheck: std/ 没通过安全检查（退出码 $$rc）"; exit 1; fi; \
 	echo "ubcheck: std/ 全部通过（十五类可判定 UB 0 条、无「没看懂」构造）"
 
 # 安全检查门（静态 + 运行时两层）：静态层用 stdub --strict，运行时层用 c6 -b。
