@@ -1,0 +1,18 @@
+prefix=@C6_PC_PREFIX@
+exec_prefix=${prefix}
+bindir=${prefix}/@C6_BINDIR_REL@
+libdir=${prefix}/@C6_LIBDIR_REL@
+includedir=${prefix}/@C6_INCLUDEDIR_REL@
+tccdir=${prefix}/@C6_TCCDIR_REL@
+
+Name: @C6_PC_NAME@
+Description: @C6_PC_DESCRIPTION@
+URL: https://github.com/c6lang/c6
+Version: @C6_VERSION_RAW@
+Libs: -L${libdir} -ltcc
+Libs.private: @C6_PC_PRIVATE_LIBS@
+Cflags: -I${includedir}
+
+# 变量：pkgconf --variable=c6 c6 / pkgconf --variable=tccdir c6
+c6=${bindir}/c6@C6_TCC_EXESUF@
+libtcc1=${tccdir}/libtcc1.a

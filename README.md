@@ -82,7 +82,7 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 
 ## 快速开始
 
-依赖：`git`、`make`、C 编译器（gcc/clang）、`binutils`。
+依赖：`git`、`make`、C 编译器（gcc/clang）、`binutils`；用 CMake 构建时还需要 `cmake`（≥ 3.18）。
 
 ```sh
 # 1. 配置（只有第一次需要；tcc/ 源码就在仓库里，不用联网拉取）
@@ -98,6 +98,13 @@ make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
 make check-all
 ```
 
+构建与安装也可以全程走 CMake（推荐，见[使用 CMake 构建与安装](#使用-cmake-构建与安装推荐)）：
+
+```sh
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build --parallel
+```
+
 `make build` / `make selftest` / `make test-all` / `make check-all` 都会先跑 `bootstrap`：
 `tcc/` 已经配置过（有 `config.mak`）就直接跳过，没有才跑一次 `./configure`。
 
@@ -106,7 +113,70 @@ make check-all
 “重新同步工作树”这回事，手改不会被覆盖。`make distclean` 清理构建产物和 configure 结果，
 不会删源码。
 
-### 源码编译安装
+### 使用 CMake 构建与安装（推荐）
+
+CMake 是构建入口：`tcc/` 里的 `configure` 与 `Makefile` 一行都没改，所有编译参数都从
+c6 侧传进去（configure 的安装目录与开关、make 的 `EXTRA-DEFS` / `CFLAGS` / `VAR=...`）。
+`tcc/` 里唯一新增的是 configure 自己生成的 `config.mak`、`config.h` 及构建产物，
+本来就在 `tcc/.gitignore` 里。
+
+```sh
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 DESTDIR
+```
+
+注意：`tcc/configure` 会把 `--tccdir` 等绝对路径编进 `config.h`（`CONFIG_TCCDIR`），
+共享库还会烤入 rpath。`cmake --install --prefix=...` 只改变文件落点，改不了二进制里的
+路径；要换安装前缀，得重新 `cmake -S . -B build -DCMAKE_INSTALL_PREFIX=...` 再
+`cmake --build build`。生成的 `c6Config.cmake` / `c6.pc` 本身是可重定位的。
+
+可从 c6 侧传入的参数（都不用改 `tcc/`）：
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `C6_ENABLE_EXT` | `ON` | 传 `EXTRA-DEFS=-DC6_EXT`；`OFF` 等价于 `make build-plain` |
+| `C6_EXTRA_DEFS` | 空 | 追加宏，例如 `-DC6_FOO` |
+| `C6_TCC_CFLAGS` | `-g -O0 -Wall -Wno-unused-result` | `tcc/Makefile` 的 `CFLAGS` |
+| `C6_TCC_CC` | `CMAKE_C_COMPILER` | `configure --cc` |
+| `C6_TCC_SHARED_LIBTCC` | `OFF` | `configure --disable-static`，产出 `libtcc.so` |
+| `C6_TCC_CONFIGURE_ARGS` | 空 | 追加 configure 参数，分号分隔，最后传入可覆盖默认值 |
+| `C6_TCC_MAKE_ARGS` | 空 | 追加 make 变量，分号分隔，如 `ONE_SOURCE=yes;SILENT=yes` |
+| `C6_TCC_JOBS` | CPU 核数 | 子 make 的 `-j` |
+| `C6_INSTALL_TCCDIR` | `<libdir>/tcc` | 运行时库（`libtcc1.a`）目录 |
+| `C6_INSTALL_DOCDIR` | `<datarootdir>/doc/tcc` | 文档目录 |
+| `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
+
+`tcc/` 是树内构建，同一时间只有一套配置生效：换了 `configure` 参数（或另建一个
+参数不同的构建目录）时，CMake 会先清掉 `tcc/` 的旧目标文件再全量重编，避免
+`libtcc.a` / `libtcc.so` 混用非 `-fPIC` 的目标文件。
+
+`cmake --build build --target build-plain` 是上游模式；`--target bootstrap` 重新跑
+configure；`--target tcc-distclean` 清掉 configure 结果（之后要重新 `cmake -S . -B build`）。
+完整回归矩阵（`std-*`、`freestanding`、自举）仍由旧 Makefile 驱动，CMake 侧用
+`cmake --build build --target check-all` 桥接。
+
+安装后同时提供两套库配置，供下游工程直接消费 `libtcc`：
+
+```cmake
+find_package(c6 0.9 REQUIRED COMPONENTS libtcc compiler)
+target_link_libraries(app PRIVATE c6::libtcc)  # 自动带上 -lm -ldl -lpthread
+# c6::compiler 是 c6 可执行文件的 IMPORTED target
+```
+
+可用变量：`C6_EXECUTABLE`、`C6_LIBTCC_LIBRARY`、`C6_INCLUDE_DIR`、`C6_TCCDIR`、
+`C6_VERSION`。`c6.pc`（另有 `libtcc.pc` 兼容名）给 pkgconf 用：
+
+```sh
+pkgconf --cflags --libs c6
+pkgconf --static --libs c6
+cc $(pkgconf --cflags --libs c6) app.c -o app
+```
+
+`c6.pc` 的 `prefix` 由 `${pcfiledir}` 反推，装到 `DESTDIR` 暂存目录里再搬走也照样能用。
+
+### 源码编译安装（旧 Makefile 流程）
 
 ```sh
 # 1. 配置安装位置
@@ -154,8 +224,10 @@ yay -Syu c6
 ├── std/                标准库：一个文件一个 module（std/container/vec.c6 -> std.container.vec）
 ├── tests/              c6 全部自测：test 块、编译期诊断、上游 tests2
 ├── examples/           可运行示例：每个特性一个 *_demo.c6，wordcount 是集成示例
-├── Makefile            构建入口（make help 看全部目标）
-└── tcc/                TCC 源码树：上游基线 + 每个 c6 补丁一个提交
+├── CMakeLists.txt      CMake 构建入口：编译/安装/测试 + 生成库配置
+├── cmake/              c6Config / c6Targets / c6.pc 模板与安装期脚本
+├── Makefile            旧构建入口（完整测试矩阵，make help 看全部目标）
+└── tcc/                TCC 源码树：上游基线 + 每个 c6 补丁一个提交（不改动）
 ```
 
 ## 文档地图
@@ -184,6 +256,16 @@ make test-all     # selftest + tests2 + c6selfcheck + 标准库 + freestanding/�
 make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后端 + 三条自举路线
                   # 共享 build/ 下固定路径的 std 家族整组串行，其余目标并发跑；
                   # CHECK_JOBS=1 make check-all 则整轮串行
+```
+
+对应的 CMake 命令：
+
+```sh
+cmake -S . -B build
+cmake --build build --parallel          # 等于 make build
+cmake --build build --target build-plain
+cmake --build build --target check-all  # 桥接旧 Makefile 的完整回归
+ctest --test-dir build --output-on-failure
 ```
 
 构建标志（`-DC6_EXT`、`CFLAGS`）记在 `tcc/.c6-flags` 里，所有目标文件都依赖它：

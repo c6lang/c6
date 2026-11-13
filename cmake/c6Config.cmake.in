@@ -1,0 +1,40 @@
+# c6 CMake 包配置（由 c6/CMakeLists.txt 生成，请勿手改）
+#
+#   find_package(c6 0.9 REQUIRED COMPONENTS libtcc)
+#   target_link_libraries(app PRIVATE c6::libtcc)
+#   add_custom_command(... COMMAND c6::compiler ...)
+#
+# libtcc 由 tcc/Makefile 编译，不是 CMake 原生 target，所以这里以 IMPORTED
+# target 描述已经安装的文件。@PACKAGE_*@ 在 find_package 时按实际安装前缀
+# 重定位，因此 DESTDIR 暂存过的安装树搬走后依然可用。
+
+@PACKAGE_INIT@
+
+set(C6_VERSION "@C6_VERSION_RAW@")
+set(C6_EXT_ENABLED @C6_ENABLE_EXT@)
+set(C6_STATIC_LIBTCC @C6_TCC_STATIC@)
+set(C6_LIBTCC_FILENAME "@C6_LIBTCC_FILENAME@")
+
+set_and_check(C6_BINDIR "@PACKAGE_C6_BINDIR@")
+set_and_check(C6_LIBDIR "@PACKAGE_C6_LIBDIR@")
+set_and_check(C6_INCLUDE_DIR "@PACKAGE_C6_INCLUDEDIR@")
+set_and_check(C6_TCCDIR "@PACKAGE_C6_TCCDIR@")
+
+set(C6_EXECUTABLE "${C6_BINDIR}/c6@C6_TCC_EXESUF@")
+set(C6_LIBTCC_LIBRARY "${C6_LIBDIR}/@C6_LIBTCC_FILENAME@")
+set(C6_LIBRARIES "${C6_LIBTCC_LIBRARY}")
+set(C6_INCLUDE_DIRS "${C6_INCLUDE_DIR}")
+
+include("${CMAKE_CURRENT_LIST_DIR}/c6Targets.cmake")
+
+foreach(_c6_comp IN LISTS c6_FIND_COMPONENTS)
+  if(_c6_comp STREQUAL "libtcc" AND EXISTS "${C6_LIBTCC_LIBRARY}")
+    set(c6_libtcc_FOUND TRUE)
+  elseif(_c6_comp STREQUAL "compiler" AND EXISTS "${C6_EXECUTABLE}")
+    set(c6_compiler_FOUND TRUE)
+  else()
+    set(c6_${_c6_comp}_FOUND FALSE)
+  endif()
+endforeach()
+
+check_required_components(c6)
