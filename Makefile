@@ -1375,7 +1375,7 @@ std-ub: build
 	@./build/stdub; test $$? -le 1
 
 # 安全检查门：--strict 把整个 std/ 过一遍（「可能」级和「没看懂」的构造都算失败）。
-# 这是第八十四批「全代码检查」的入口：只放行「十四类可判定 UB 一条都没有、
+# 这是第八十四批「全代码检查」的入口：只放行「十五类可判定 UB 一条都没有、
 # 且没有被漏看的构造」的源码；运行时那一层由 c6 -b 兜（见 docs/ubcheck.md §8）。
 ubcheck: std-ub
 	@fail=0; for f in $$(find std -name '*.c6' | sort); do \
@@ -1384,7 +1384,7 @@ ubcheck: std-ub
 	    fi; \
 	done; rm -f /tmp/ub.$$$$; \
 	if [ $$fail -ne 0 ]; then echo "ubcheck: 有文件没通过安全检查"; exit 1; fi; \
-	echo "ubcheck: std/ 全部通过（十四类可判定 UB 0 条、无「没看懂」构造）"
+	echo "ubcheck: std/ 全部通过（十五类可判定 UB 0 条、无「没看懂」构造）"
 
 # 安全检查门（静态 + 运行时两层）：静态层用 stdub --strict，运行时层用 c6 -b。
 # tests/ub/ubsmoke.c6 里那处越界的下标来自函数参数 —— 静态层按「说不准就不说」放过，
