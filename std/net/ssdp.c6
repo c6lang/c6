@@ -1,0 +1,520 @@
+/* std/net/ssdp：SSDP（UPnP 发现协议）报文编解码——解析器 + 头部游标 + 构造器。
+ *
+ *     import std.net.ssdp;
+ *
+ *     SsdpMsg m = { 0 };
+ *     m.parse(buf, n);               // 0 = 合法
+ *     m.is_search() / m.is_notify() / m.is_response();
+ *
+ *     SsdpDoc d = { 0 };
+ *     SsdpHdr h = { 0 };
+ *     d.open(&m, buf, n);                   // 游标：open / next / get / count / reset
+ *     while (d.next(&h))                    // 头部名字大小写不敏感
+ *         printf("%.*s: %.*s\n", h.name_len, buf + h.name_off, h.val_len, buf + h.val_off);
+ *     if (d.get("ST", &h))                  // 大小写不敏感查找
+ *         ...
+ *
+ *     SsdpBuilder b = { 0 };
+ *     b.init(out, sizeof out);
+ *     b.start(SSDP_M_SEARCH, "*");          // 方法：start / header / finish
+ *     b.header("MAN", "\"ssdp:discover\"");
+ *     b.header("MX", "2");
+ *     b.header("ST", "ssdp:all");
+ *     b.finish();                           // 自动补 HOST 与结尾空行
+ *
+ * SSDP 就是 HTTP/1.1 的「一行起始行 + 若干头 + 空行」，所以这里也用同一套做法：
+ *
+ * - 起始行三种：`M-SEARCH * HTTP/1.1`（搜索）、`NOTIFY * HTTP/1.1`（通告）、
+ *   `HTTP/1.1 200 OK`（应答）；`kind` 记这三种，`ok` 表示解析成功；
+ * - 头部值可能带引号（`MAN: "ssdp:discover"`），**这里不剥**——调用方要什么就
+ *   自己按需处理，库只负责定位；
+ * - 头部名字比较大小写不敏感（RFC 7230 的规矩），`get()` 就是这么找的；
+ * - 构造器 `start()` 自动写 `HOST: 239.255.255.250:1900`（多播地址，唯一必填头），
+ *   `finish()` 补空行；调用方再写一遍 HOST 会失败（重复）。
+ */
+#include <string.h>
+
+module std.net.ssdp;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define SSDP_M_SEARCH 1
+#define SSDP_NOTIFY 2
+#define SSDP_RESPONSE 3
+
+#define SSDP_MULTICAST "239.255.255.250:1900"
+
+struct SsdpMsg {
+    int ok;
+    int kind;
+    int start_line_len;         /* 起始行长度（不含 CRLF） */
+    int hdr_off;                /* 头部区起点 */
+    int hdr_end;                /* 头部区终点（空行位置） */
+    int nhdr;
+};
+
+struct SsdpHdr {
+    int name_off;
+    int name_len;
+    int val_off;
+    int val_len;
+};
+
+struct SsdpDoc {
+    const char *buf;
+    int len;
+    int start;
+    int pos;
+    int end;
+    int seen;
+    int bad;
+};
+
+struct SsdpBuilder {
+    char *buf;
+    int cap;
+    int n;
+    int ok;
+    int started;
+    int host_written;
+};
+
+static int ssdp_low(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+/* 在 [off, off+len) 上做大小写不敏感的等值比较。 */
+int name_eq(const char *buf, int off, int len, const char *want)
+{
+    int n = (int)strlen(want);
+
+    if (!buf || len != n)
+        return 0;
+    for (int i = 0; i < n; i++)
+        if (ssdp_low((int)(unsigned char)buf[off + i])
+            != ssdp_low((int)(unsigned char)want[i]))
+            return 0;
+    return 1;
+}
+
+/* 找一行结束位置（\r\n 或 \n）；找不到给 -1。 */
+static int ssdp_line_end(const char *buf, int len, int from)
+{
+    for (int i = from; i < len; i++) {
+        if (buf[i] == '\n')
+            return i;
+        if (buf[i] == '\r' && i + 1 < len && buf[i + 1] == '\n')
+            return i;
+    }
+    return -1;
+}
+
+int parse(SsdpMsg *m, const char *buf, int len)
+{
+    int eol = 0;
+    int pos = 0;
+    int cnt = 0;
+
+    if (!m)
+        return -1;
+    memset(m, 0, sizeof *m);
+    if (!buf || len < 16)
+        return -1;
+    eol = ssdp_line_end(buf, len, 0);
+    if (eol < 0)
+        return -1;
+    m->start_line_len = eol;
+    if (eol >= 8 && memcmp(buf, "M-SEARCH", 8) == 0)
+        m->kind = SSDP_M_SEARCH;
+    else if (eol >= 6 && memcmp(buf, "NOTIFY", 6) == 0)
+        m->kind = SSDP_NOTIFY;
+    else if (eol >= 5 && memcmp(buf, "HTTP/", 5) == 0)
+        m->kind = SSDP_RESPONSE;
+    else
+        return -1;
+    m->hdr_off = eol + ((buf[eol] == '\r') ? 2 : 1);
+    pos = m->hdr_off;
+    /* 逐行直到空行 */
+    while (pos < len) {
+        int end = ssdp_line_end(buf, len, pos);
+        int line_end = 0;
+
+        if (end < 0)
+            return -1;
+        line_end = end;
+        if (line_end == pos) {          /* 空行：头部区结束 */
+            m->hdr_end = pos;
+            m->ok = 1;
+            m->nhdr = cnt;
+            return 0;
+        }
+        /* 必须有冒号 */
+        {
+            int colon = -1;
+            int k = line_end;
+
+            if (k > pos && buf[k - 1] == '\r')
+                k--;
+            for (int i = pos; i < k; i++)
+                if (buf[i] == ':') {
+                    colon = i;
+                    break;
+                }
+            if (colon < 0 || colon == pos)
+                return -1;
+        }
+        cnt++;
+        pos = end + ((buf[end] == '\r') ? 2 : 1);
+    }
+    /* 没有空行收尾：SSDP 报文必须空行结束 */
+    return -1;
+}
+
+int is_search(SsdpMsg *m)
+{
+    return m && m->ok && m->kind == SSDP_M_SEARCH;
+}
+
+int is_notify(SsdpMsg *m)
+{
+    return m && m->ok && m->kind == SSDP_NOTIFY;
+}
+
+int is_response(SsdpMsg *m)
+{
+    return m && m->ok && m->kind == SSDP_RESPONSE;
+}
+
+/* ---- 头部游标 ---- */
+
+int open(SsdpDoc *d, const SsdpMsg *m, const char *buf, int len)
+{
+    if (!d || !m || !m->ok || !buf)
+        return -1;
+    d->buf = buf;
+    d->len = len;
+    d->start = m->hdr_off;
+    d->pos = m->hdr_off;
+    d->end = m->hdr_end;
+    d->seen = 0;
+    d->bad = 0;
+    return 0;
+}
+
+static void ssdp_split(SsdpDoc *d, int pos, int line_end, SsdpHdr *out)
+{
+    int k = line_end;
+    int colon = -1;
+    int v = 0;
+
+    if (k > pos && d->buf[k - 1] == '\r')
+        k--;
+    for (int i = pos; i < k; i++)
+        if (d->buf[i] == ':') {
+            colon = i;
+            break;
+        }
+    out->name_off = pos;
+    out->name_len = colon - pos;
+    /* 去掉名字尾部的空白 */
+    while (out->name_len > 0
+           && (d->buf[out->name_off + out->name_len - 1] == ' '
+               || d->buf[out->name_off + out->name_len - 1] == '\t'))
+        out->name_len--;
+    v = colon + 1;
+    while (v < k && (d->buf[v] == ' ' || d->buf[v] == '\t'))
+        v++;
+    out->val_off = v;
+    out->val_len = k - v;
+}
+
+int next(SsdpDoc *d, SsdpHdr *out)
+{
+    while (d && !d->bad && d->pos < d->end) {
+        int end = ssdp_line_end(d->buf, d->len, d->pos);
+
+        if (end < 0 || end > d->end) {
+            d->bad = 1;
+            return 0;
+        }
+        if (end == d->pos) {
+            d->pos = d->end;
+            return 0;
+        }
+        if (out)
+            ssdp_split(d, d->pos, end, out);
+        d->pos = end + ((d->buf[end] == '\r') ? 2 : 1);
+        d->seen++;
+        return 1;
+    }
+    return 0;
+}
+
+int count(SsdpDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(SsdpDoc *d)
+{
+    if (!d || !d->buf)
+        return;
+    d->pos = d->start;
+    d->seen = 0;
+    d->bad = 0;
+}
+
+/* 按名字找（大小写不敏感）；找到返回 1。 */
+int get(SsdpDoc *d, const char *name, SsdpHdr *out)
+{
+    int saved = 0;
+    int saved_seen = 0;
+    SsdpHdr tmp = { 0, 0, 0, 0 };
+
+    if (!d || !d->buf)
+        return 0;
+    saved = d->pos;
+    saved_seen = d->seen;
+    d->pos = d->start;
+    d->bad = 0;
+    while (next(d, &tmp))
+        if (name_eq(d->buf, tmp.name_off, tmp.name_len, name)) {
+            if (out)
+                *out = tmp;
+            d->pos = saved;
+            d->seen = saved_seen;
+            d->bad = 0;
+            return 1;
+        }
+    d->pos = saved;
+    d->seen = saved_seen;
+    d->bad = 0;
+    return 0;
+}
+
+/* ---- 构造器 ---- */
+
+void init(SsdpBuilder *b, char *buf, int cap)
+{
+    if (!b)
+        return;
+    memset(b, 0, sizeof *b);
+    b->buf = buf;
+    b->cap = cap;
+    b->ok = (buf == 0 || cap < 48) ? 0 : 1;
+}
+
+int start(SsdpBuilder *b, int kind, const char *target)
+{
+    const char *line = 0;
+
+    if (!b || !b->ok || b->started)
+        return -1;
+    if (!target)
+        target = "*";
+    if (kind == SSDP_M_SEARCH)
+        line = "M-SEARCH * HTTP/1.1\r\n";
+    else if (kind == SSDP_NOTIFY)
+        line = "NOTIFY * HTTP/1.1\r\n";
+    else if (kind == SSDP_RESPONSE)
+        line = "HTTP/1.1 200 OK\r\n";
+    else
+        return -1;
+    {
+        int n = (int)strlen(line);
+
+        if (b->n + n > b->cap)
+            return -1;
+        memcpy(b->buf + b->n, line, (size_t)n);
+        b->n += n;
+    }
+    if (kind != SSDP_RESPONSE) {
+        /* 搜索/通告的目标是 "*"，target 只是给调用方记语义用 */
+        (void)target;
+    }
+    /* HOST 是唯一必填头 */
+    {
+        const char *host = "HOST: " SSDP_MULTICAST "\r\n";
+        int n = (int)strlen(host);
+
+        if (b->n + n > b->cap)
+            return -1;
+        memcpy(b->buf + b->n, host, (size_t)n);
+        b->n += n;
+    }
+    b->host_written = 1;
+    b->started = 1;
+    return 0;
+}
+
+int header(SsdpBuilder *b, const char *name, const char *value)
+{
+    int nl = 0;
+    int vl = 0;
+
+    if (!b || !b->ok || !b->started || !name || !value)
+        return -1;
+    if (name_eq(name, 0, (int)strlen(name), "host")) {
+        /* HOST 已经自动写过，重复写会得到两个 HOST，直接拒绝 */
+        return -1;
+    }
+    nl = (int)strlen(name);
+    vl = (int)strlen(value);
+    if (nl <= 0 || nl > 64)
+        return -1;
+    if (b->n + nl + 2 + vl + 2 > b->cap)
+        return -1;
+    memcpy(b->buf + b->n, name, (size_t)nl);
+    b->n += nl;
+    b->buf[b->n++] = ':';
+    b->buf[b->n++] = ' ';
+    memcpy(b->buf + b->n, value, (size_t)vl);
+    b->n += vl;
+    b->buf[b->n++] = '\r';
+    b->buf[b->n++] = '\n';
+    return 0;
+}
+
+int finish(SsdpBuilder *b)
+{
+    if (!b || !b->ok || !b->started)
+        return -1;
+    if (b->n + 2 > b->cap)
+        return -1;
+    b->buf[b->n++] = '\r';
+    b->buf[b->n++] = '\n';
+    return b->n;
+}
+
+int length(SsdpBuilder *b)
+{
+    return b ? b->n : -1;
+}
+
+int ok(SsdpBuilder *b)
+{
+    return b && b->ok && b->started;
+}
+
+/* ---- 自测 ---- */
+
+test "SSDP：M-SEARCH 解析与头部游标" {
+    const char *txt = "M-SEARCH * HTTP/1.1\r\n"
+                      "HOST: 239.255.255.250:1900\r\n"
+                      "MAN: \"ssdp:discover\"\r\n"
+                      "MX: 2\r\n"
+                      "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"
+                      "\r\n";
+    int len = (int)strlen(txt);
+    SsdpMsg m = { 0 };
+    SsdpDoc d = { 0 };
+    SsdpHdr h = { 0, 0, 0, 0 };
+
+    if (m.parse(txt, len) != 0 || !m.ok)
+        return err(1, "解析 M-SEARCH 失败");
+    if (!m.is_search() || m.kind != SSDP_M_SEARCH)
+        return err(2, "应识别为 M-SEARCH");
+    if (m.nhdr != 4)
+        return err(3, "应有 4 个头");
+    d.open(&m, txt, len);
+    if (d.next(&h) != 1 || !name_eq(txt, h.name_off, h.name_len, "HOST"))
+        return err(4, "第一个头应是 HOST");
+    if (h.val_len != 20 || memcmp(txt + h.val_off, "239.255.255.250:1900", 20) != 0)
+        return err(5, "HOST 值不对");
+    if (d.next(&h) != 1 || !name_eq(txt, h.name_off, h.name_len, "man"))
+        return err(6, "第二个头应是 MAN（名字比较应大小写不敏感）");
+    if (h.val_len != 15 || memcmp(txt + h.val_off, "\"ssdp:discover\"", 15) != 0)
+        return err(7, "MAN 值应保留引号");
+    if (d.next(&h) != 1 || !name_eq(txt, h.name_off, h.name_len, "MX") || h.val_len != 1)
+        return err(8, "第三个头应是 MX");
+    if (d.next(&h) != 1 || !name_eq(txt, h.name_off, h.name_len, "ST"))
+        return err(9, "第四个头应是 ST");
+    if (d.next(&h) != 0 || d.count() != 4)
+        return err(10, "应恰好四个头");
+    /* get 不改游标进度 */
+    d.reset();
+    if (d.get("st", &h) != 1 || h.val_len != 43)
+        return err(11, "get 应按名字找到 ST");
+    if (d.get("LOCATION", &h) != 0)
+        return err(12, "不存在的头应返回 0");
+    if (d.count() != 0)
+        return err(13, "get 不该推进游标");
+}
+
+test "SSDP：NOTIFY / 应答解析、构造器与坏报文" {
+    const char *notify = "NOTIFY * HTTP/1.1\r\n"
+                         "HOST: 239.255.255.250:1900\r\n"
+                         "NT: upnp:rootdevice\r\n"
+                         "NTS: ssdp:alive\r\n"
+                         "USN: uuid:2fac1234-31f8-11b4-a222-08002b34c003::upnp:rootdevice\r\n"
+                         "CACHE-CONTROL: max-age=1800\r\n"
+                         "\r\n";
+    const char *resp = "HTTP/1.1 200 OK\r\n"
+                       "ST: upnp:rootdevice\r\n"
+                       "\r\n";
+    SsdpMsg m = { 0 };
+    SsdpDoc d = { 0 };
+    SsdpHdr h = { 0, 0, 0, 0 };
+    char out[256] = { 0 };
+    SsdpBuilder b = { 0 };
+    int n = 0;
+
+    if (m.parse(notify, (int)strlen(notify)) != 0 || !m.is_notify())
+        return err(1, "NOTIFY 解析失败");
+    if (m.nhdr != 5)
+        return err(2, "NOTIFY 应有 5 个头");
+    d.open(&m, notify, (int)strlen(notify));
+    if (d.get("NTS", &h) != 1 || memcmp(notify + h.val_off, "ssdp:alive", 10) != 0)
+        return err(3, "NTS 值不对");
+    if (m.parse(resp, (int)strlen(resp)) != 0 || !m.is_response())
+        return err(4, "应答解析失败");
+    if (m.nhdr != 1)
+        return err(5, "应答应有 1 个头");
+    /* 构造器 */
+    b.init(out, sizeof out);
+    if (b.start(SSDP_M_SEARCH, "*") != 0)
+        return err(6, "start 失败");
+    if (b.header("HOST", "1.2.3.4") != -1)
+        return err(7, "重复写 HOST 应被拒绝");
+    if (b.header("MAN", "\"ssdp:discover\"") != 0)
+        return err(8, "写 MAN 失败");
+    if (b.header("MX", "2") != 0)
+        return err(9, "写 MX 失败");
+    if (b.header("ST", "ssdp:all") != 0)
+        return err(10, "写 ST 失败");
+    n = b.finish();
+    if (n <= 0)
+        return err(11, "finish 失败");
+    if (m.parse(out, n) != 0 || !m.is_search())
+        return err(12, "构造的报文应能解析回来");
+    if (m.nhdr != 4)
+        return err(13, "构造的报文应有 4 个头（HOST + 3）");
+    d.open(&m, out, n);
+    if (d.get("host", &h) != 1
+        || memcmp(out + h.val_off, SSDP_MULTICAST, 20) != 0)
+        return err(14, "自动写入的 HOST 应是多播地址");
+    /* 坏报文 */
+    {
+        SsdpMsg bm = { 0 };
+
+        if (bm.parse("GET / HTTP/1.1\r\n\r\n", 18) != -1)
+            return err(15, "不是 SSDP 起始行应失败");
+        if (bm.parse("M-SEARCH * HTTP/1.1\r\nX-No-Colon\r\n\r\n", 38) != -1)
+            return err(16, "没有冒号的头应失败");
+        if (bm.parse("M-SEARCH * HTTP/1.1\r\nHOST: x\r\n", 30) != -1)
+            return err(17, "没有空行收尾应失败");
+        if (bm.parse("short", 5) != -1)
+            return err(18, "太短应失败");
+    }
+    /* 容量不足 */
+    {
+        char small[32] = { 0 };
+        SsdpBuilder s = { 0 };
+
+        s.init(small, sizeof small);
+        if (s.start(SSDP_M_SEARCH, "*") != -1)
+            return err(19, "容量不足应拒绝");
+    }
+}

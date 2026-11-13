@@ -534,6 +534,7 @@
 | `examples/stdub.c6` | （无模块） | 第八十四批（静态分析三件套）的拼装示例（`make std-ub`）：用 lex/parse/ub 分析一段 9 处 UB 的演示源码，按 `文件:行:列: 一定/可能 [UB-XXX] 标题` 打印，每条附「修法」与可直接粘贴的「代码」 |
 | `examples/stdsec.c6` | （无模块） | 第八十五批（密钥交换 + 安全策略）的拼装示例（`make std-sec`）：X25519 握手、HSTS 策略库、robots 许可、base45 指纹各一节，最后串成一条「响应头 → 策略 → 许可 → 指纹」的流水线（75 条检查） |
 | `examples/stdmw.c6` | （无模块） | 第八十六批（服务端中间件语义）的拼装示例（`make std-mw`）：限流、缓存、邮件编码、模糊匹配各一节，最后串成「限流 → 缓存 → 回源」的请求路径（60 条检查） |
+| `examples/stdproto4.c6` | （无模块） | 第八十七批（发现与配置协议）的拼装示例（`make std-proto4`）：CoAP/DHCP/SSDP 三个报文层各一节 + 文本折叠，最后串成「发现 → 取数 → 写日志」（56 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -3179,6 +3180,12 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
   （`Reader.close` 与 `Writer.close` 可以共存）。调用侧统一写
   `pr->read_line(...)` / `v.write(...)`；工厂和一次性函数仍是自由函数
   （`reader_open`、`rand_seed`、`bw_open`）。
+* **跨模块同名函数会真撞车（踩过一次）**：方法（首参是结构体指针）编成
+  `<Tag>_<name>` 的弱符号，两个模块都叫 `close` 也没事；但**首参不是结构体指针
+  的自由函数是普通全局符号**——两个模块都导出 `parse(buf, len, &msg)` 时，
+  链接器只留先到的那一个，调用处顶多给一句 `incompatible pointer type` 警告，
+  跑起来就是错的。所以要么把首参改成结构体指针（也就是做成方法，推荐），要么
+  名字带模块前缀（`b64_encode`、`ip4_str`）。
 * **例外：`foreach` 的迭代器协议只认字面上的 `has()` / `next()`**
   （`tcc/tccgen.c` 的 `c6_iter_proto_of` 用 `tok_alloc_const("has"/"next")`
   找方法），所以 `Split`/`Lines`/`Fields`/`Range`/`StepRange`/`CFile` 之外的
@@ -4611,6 +4618,91 @@ make std-mw
 边界、ETag 弱/强比较、缓存槽淘汰与游标；QP 的一次性/流式一致与行尾空白编码；
 编辑距离/Jaro-Winkler/最佳匹配器；最后串成一条「限流 → 缓存 → 回源 → 模糊找资源」
 的请求路径（8 个请求里 4 个被限流、1 个回源、3 个命中缓存）。
+
+### 第八十七批：发现与配置协议（`coap` / `dhcp` / `ssdp` / `translit`）
+
+三个协议模块都是「4 字节头 / 固定头 + TLV 选项 + 游标」，接口形状刻意统一：
+`m.parse(buf, len)` 解析、`d.open(&m, buf, len)` 开游标、`d.next(&o)` 逐条取、
+`b.init/start/option/finish` 构造。**parse 也做成了方法**（首参结构体指针），
+这样三个模块可以有同名方法而不撞车（见上文「跨模块同名」那条）。
+
+**`std/net/coap.c6`**（RFC 7252）：
+
+```c
+CoapMsg m = { 0 };
+m.parse(buf, n);                        // 0 = 合法（版本必须是 1、token ≤ 8）
+m.code_str(line, sizeof line);           // 端点码点：0.01 / 2.05
+CoapDoc d = { 0 }; CoapOpt o = { 0 };
+d.open(&m, buf, n);                      // 游标：open / next / count / reset
+while (d.next(&o)) { /* o.num / o.len / o.off */ }
+
+CoapBuilder b = { 0 };
+b.init(out, sizeof out);
+b.start(COAP_CON, COAP_GET, 0x4242);     // 方法：start / token / option / payload / finish
+b.token(tok, 2);
+b.option(COAP_OPT_URI_PATH, (const unsigned char *)"temp", 4);
+```
+
+**`std/net/dhcp.c6`**（RFC 2131 / 2132）：
+
+```c
+DhcpMsg m = { 0 };
+m.parse(buf, n);                         // 校验 236 头 + magic cookie
+m.xid / m.chaddr / m.hlen
+DhcpDoc d = { 0 }; DhcpOpt o = { 0 };
+d.open(&m, buf, n);
+d.find(DHCP_OPT_MSG_TYPE, &o);           // 按编号找，不影响游标进度
+ip4_str(buf + o.off, ip, sizeof ip);     // "192.168.7.42"
+ip4_parse("10.0.0.1", a4);
+
+DhcpBuilder b = { 0 };
+b.init(out, sizeof out);                 // 至少 300 字节
+b.header(DHCP_BOOTREQUEST, xid, mac, 6);
+b.option(DHCP_OPT_MSG_TYPE, "\x01", 1);
+b.finish();                              // 补 END 并填充到 300 字节
+```
+
+**`std/net/ssdp.c6`**（UPnP 发现）：
+
+```c
+SsdpMsg m = { 0 };
+m.parse(buf, n);
+m.is_search() / m.is_notify() / m.is_response();
+SsdpDoc d = { 0 }; SsdpHdr h = { 0 };
+d.open(&m, buf, n);
+d.get("ST", &h);                          // 头部名大小写不敏感
+name_eq(buf, h.name_off, h.name_len, "HOST");
+
+SsdpBuilder b = { 0 };
+b.init(out, sizeof out);
+b.start(SSDP_M_SEARCH, "*");              // 自动写 HOST: 239.255.255.250:1900
+b.header("MAN", "\"ssdp:discover\"");
+b.finish();                               // 补空行
+```
+
+**`std/text/translit.c6`**——UTF-8 → 近似 ASCII（拉丁去音符、常见符号换 ASCII、
+全角转半角、组合符号丢弃），带标志位与流式句柄：
+
+```c
+translit("Café Zürich", 13, out, sizeof out, TR_DEFAULT);   // "Cafe Zurich"
+translit_len("Café", 5, TR_DEFAULT);                        // 4：先量后写
+Translit t = { 0 };
+t.init(buf, sizeof buf, TR_FOLD_CASE | TR_REPLACE_UNKNOWN);
+t.put(chunk, len);     // 方法：init / put / finish / length / ok / dropped
+t.finish();
+```
+
+### 集成示例：`examples/stdproto4.c6`
+
+```sh
+make std-proto4
+```
+
+五节：CoAP 构造 GET /temp 并解析回来（选项游标 + 码点格式化）；DHCP 构造
+DISCOVER/REQUEST、往返解析、`find` 取消息类型与请求 IP、IPv4 格式化；SSDP 构造
+M-SEARCH（自动 HOST）、解析 NOTIFY 与设备应答；translit 折叠变音符/全角/大小写
+得到 slug；最后串成「SSDP 发现 → 从 LOCATION 抠主机 → CoAP GET → 折叠写日志」
+（56 条检查）。
 
 ## 相关回归用例
 

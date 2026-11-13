@@ -623,6 +623,7 @@ make std-async5   # 编译并运行 examples/stdasync5.c6（第八十三批 预�
 make std-ub       # 编译并运行 examples/stdub.c6（第八十四批 lex/parse/ub 静态分析三件套）
 make std-sec      # 编译并运行 examples/stdsec.c6（第八十五批 密钥交换 + 安全策略）
 make std-mw       # 编译并运行 examples/stdmw.c6（第八十六批 限流/缓存/邮件编码/模糊匹配）
+make std-proto4   # 编译并运行 examples/stdproto4.c6（第八十七批 CoAP/DHCP/SSDP + 文本折叠）
 make bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```
 

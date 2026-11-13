@@ -2880,3 +2880,27 @@ err 号段补 `std.net.ratelimit`=0x6161、`std.net.httpcache`=0x6162、
 
 `std/` 现在 357 个 `.c6` 文件。各模块 test 块：ratelimit 4、httpcache 3、
 quotedprintable 3、strdist 3，逐个跑过 0 failure；`make std-mw` 60 checks / 0 failures。
+
+### 11.101 标准库第八十七批（发现与配置协议 + 文本折叠）
+
+三个协议模块的接口形状刻意统一：`m.parse(buf, len)` 解析、`d.open(&m, buf, len)`
+开游标、`d.next(&o)` 逐条取、`b.init/start/option/finish` 构造。
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/net/coap.c6` | RFC 7252 报文层：4 字节头 + token（≤8）+ 选项串（delta/length 的 13/14 扩展）+ `0xFF` payload；构造器自动算 delta 并校验递增 | 2 | `CoapMsg.parse/code_str`；`CoapDoc.open/next/count/reset`；`CoapBuilder.init/start/token/option/payload/finish` |
+| `std/net/dhcp.c6` | RFC 2131/2132 报文层：236 字节头 + magic cookie + TLV 选项（pad/end）+ 300 字节填充；`find` 按编号查而不动游标 | 2 | `DhcpMsg.parse`；`DhcpDoc.open/next/find/count/reset`；`DhcpBuilder.init/header/option/finish`；`ip4_str/ip4_parse` |
+| `std/net/ssdp.c6` | UPnP 发现：`M-SEARCH`/`NOTIFY`/应答三种起始行、头部名大小写不敏感、构造器自动写多播 `HOST` | 2 | `SsdpMsg.parse/is_search/is_notify/is_response`；`SsdpDoc.open/next/get/count/reset`；`SsdpBuilder.init/start/header/finish` |
+| `std/text/translit.c6` | UTF-8 → 近似 ASCII：拉丁去音符（含 `ß→ss`、`Æ→AE`）、常见符号换 ASCII、全角转半角、组合符号丢弃；`tr_len` 先量后写 | 2 | `Translit.init/put/finish/length/ok/dropped`；`translit/translit_len/decode_cp/map_cp` |
+
+**踩到并写进文档的坑**：`parse` 最初写成「首参是缓冲区」的自由函数，coap 和 dhcp
+各一个 `parse` → 链接期被静默合并，调用处只给一句 `incompatible pointer type`
+警告，运行结果全错。改成首参结构体指针（`CoapMsg.parse` / `DhcpMsg.parse` /
+`SsdpMsg.parse`）后按接收者 tag 编名字，三个模块可以同名共存。这条已写进
+`docs/stdlib.md` 的「写法约定」。
+
+集成示例 `examples/stdproto4.c6`（`make std-proto4`）56 条检查。`Makefile` 增加
+`STD_PROTO4_SRCS` / `std-proto4`（`.PHONY`、help、`test-all`、`check-all` 同步）；
+err 号段补 `std.text.translit`=0x6165、`std.net.coap`=0x6166、`std.net.dhcp`=0x6167、
+`std.net.ssdp`=0x6168。`std/` 现在 361 个 `.c6` 文件；四个模块的 test 块逐个跑过
+（各 2 条，0 failure），`make std-proto4` 56 checks / 0 failures。

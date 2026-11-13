@@ -1,0 +1,588 @@
+/* std/net/dhcp：DHCPv4 报文编解码（RFC 2131 / 2132）——解析器 + 选项游标 + 构造器。
+ *
+ *     import std.net.dhcp;
+ *
+ *     DhcpMsg m = { 0 };
+ *     m.parse(buf, n);                    // 0 = 合法（236 + magic cookie 校验过）
+ *     m.op / m.xid / m.chaddr / m.yiaddr
+ *
+ *     DhcpDoc d = { 0 };
+ *     DhcpOpt o = { 0 };
+ *     d.open(&m, buf, n);                   // 游标：open / next / find / count / reset
+ *     while (d.next(&o))
+ *         printf("%d (%d 字节)\n", o.code, o.len);
+ *     if (d.find(53, &o) == 1 && o.len == 1)  // 53 = DHCP Message Type
+ *         kind = buf[o.off];
+ *
+ *     DhcpBuilder b = { 0 };
+ *     b.init(out, sizeof out);
+ *     b.header(DHCP_REQUEST, 0x12345678, mac, 6);   // 方法：header / option / finish
+ *     b.option(53, "\x03", 1);                      // REQUEST
+ *     b.option(50, ip, 4);                          // Requested IP
+ *     b.finish();                                   // 补 END 并填充到 300 字节
+ *
+ * 只做报文层：不重传、不选服务器、不做租约状态机——这些属于调用方的策略。
+ *
+ * 字段与格式的坑都处理了：
+ *
+ * - 固定头 236 字节，后面必须是 magic cookie `0x63 0x82 0x53 0x63`；
+ * - 选项是 TLV：`0` = pad（凑对齐）、`255` = end（后面可以继续填充 0）；
+ * - `hlen` 决定 `chaddr` 里几个字节有效（6 = Ethernet），其余是 0；
+ * - `xid`/`secs`/`flags` 是大端；
+ * - 构造时 `finish()` 会补 `255` 并填充到 300 字节（BOOTP 报文的最小长度，
+ *   很多中继/交换机按这个长度收）。
+ */
+#include <string.h>
+
+module std.net.dhcp;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define DHCP_BOOTREQUEST 1
+#define DHCP_BOOTREPLY 2
+
+#define DHCP_DISCOVER 1
+#define DHCP_OFFER 2
+#define DHCP_REQUEST 3
+#define DHCP_DECLINE 4
+#define DHCP_ACK 5
+#define DHCP_NAK 6
+#define DHCP_RELEASE 7
+#define DHCP_INFORM 8
+
+#define DHCP_OPT_PAD 0
+#define DHCP_OPT_SUBNET_MASK 1
+#define DHCP_OPT_ROUTER 3
+#define DHCP_OPT_DNS 6
+#define DHCP_OPT_HOSTNAME 12
+#define DHCP_OPT_REQUESTED_IP 50
+#define DHCP_OPT_LEASE_TIME 51
+#define DHCP_OPT_MSG_TYPE 53
+#define DHCP_OPT_SERVER_ID 54
+#define DHCP_OPT_PARAM_LIST 55
+#define DHCP_OPT_CLIENT_ID 61
+#define DHCP_OPT_END 255
+
+#define DHCP_FIXED 236
+#define DHCP_MIN_LEN 300
+
+struct DhcpMsg {
+    int ok;
+    int op;
+    int htype;
+    int hlen;
+    int hops;
+    unsigned long xid;
+    int secs;
+    int flags;
+    unsigned char ciaddr[4];
+    unsigned char yiaddr[4];
+    unsigned char siaddr[4];
+    unsigned char giaddr[4];
+    unsigned char chaddr[16];
+    int nopts;
+    int opts_off;               /* 选项串在缓冲里的起点 */
+};
+
+struct DhcpOpt {
+    int code;
+    int len;
+    int off;                    /* 值在缓冲里的偏移 */
+};
+
+struct DhcpDoc {
+    const unsigned char *buf;
+    int len;
+    int start;
+    int pos;
+    int seen;
+    int bad;
+};
+
+struct DhcpBuilder {
+    unsigned char *buf;
+    int cap;
+    int n;
+    int ok;
+    int hdr_done;
+};
+
+/* ---- 小工具 ---- */
+
+int ip4_str(const unsigned char *a, char *out, int cap)
+{
+    int n = 0;
+
+    if (!a || !out || cap < 8)
+        return -1;
+    for (int i = 0; i < 4; i++) {
+        int v = a[i];
+        int digits[3] = { 0 };
+        int k = 0;
+
+        if (v >= 100)
+            digits[k++] = v / 100;
+        if (v >= 10)
+            digits[k++] = (v / 10) % 10;
+        digits[k++] = v % 10;
+        if (n + k + (i < 3 ? 1 : 0) + 1 > cap)
+            return -1;
+        for (int j = 0; j < k; j++)
+            out[n++] = (char)('0' + digits[j]);
+        if (i < 3)
+            out[n++] = '.';
+    }
+    out[n] = 0;
+    return n;
+}
+
+int ip4_parse(const char *s, unsigned char *out)
+{
+    int part = 0;
+    int val = 0;
+    int digits = 0;
+
+    if (!s || !out)
+        return -1;
+    memset(out, 0, 4);
+    for (const char *p = s;; p++) {
+        if (*p >= '0' && *p <= '9') {
+            val = val * 10 + (*p - '0');
+            digits++;
+            if (digits > 3 || val > 255)
+                return -1;
+            continue;
+        }
+        if (*p == '.' || *p == 0) {
+            if (digits == 0 || part > 3)
+                return -1;
+            out[part++] = (unsigned char)val;
+            val = 0;
+            digits = 0;
+            if (*p == 0)
+                break;
+            continue;
+        }
+        return -1;
+    }
+    return part == 4 ? 0 : -1;
+}
+
+/* ---- 解析 ---- */
+
+int parse(DhcpMsg *m, const unsigned char *buf, int len)
+{
+    static const unsigned char cookie[4] = { 0x63, 0x82, 0x53, 0x63 };
+    int pos = DHCP_FIXED + 4;
+    int cnt = 0;
+
+    if (!m)
+        return -1;
+    memset(m, 0, sizeof *m);
+    if (!buf || len < DHCP_FIXED + 4)
+        return -1;
+    if (memcmp(buf + DHCP_FIXED, cookie, 4) != 0)
+        return -1;
+    m->op = buf[0];
+    m->htype = buf[1];
+    m->hlen = buf[2];
+    m->hops = buf[3];
+    m->xid = ((unsigned long)buf[4] << 24) | ((unsigned long)buf[5] << 16)
+           | ((unsigned long)buf[6] << 8) | (unsigned long)buf[7];
+    m->secs = (buf[8] << 8) | buf[9];
+    m->flags = (buf[10] << 8) | buf[11];
+    memcpy(m->ciaddr, buf + 12, 4);
+    memcpy(m->yiaddr, buf + 16, 4);
+    memcpy(m->siaddr, buf + 20, 4);
+    memcpy(m->giaddr, buf + 24, 4);
+    memcpy(m->chaddr, buf + 28, 16);
+    if (m->hlen > 16)
+        return -1;
+    m->opts_off = pos;
+    /* 扫一遍选项：数个数、顺便校验长度不越界 */
+    while (pos < len) {
+        int code = buf[pos];
+
+        if (code == DHCP_OPT_PAD) {
+            pos++;
+            continue;
+        }
+        if (code == DHCP_OPT_END) {
+            pos++;
+            break;
+        }
+        if (pos + 2 > len)
+            return -1;
+        {
+            int olen = buf[pos + 1];
+
+            if (pos + 2 + olen > len)
+                return -1;
+            pos += 2 + olen;
+            cnt++;
+        }
+    }
+    m->nopts = cnt;
+    m->ok = 1;
+    return 0;
+}
+
+/* ---- 选项游标 ---- */
+
+int open(DhcpDoc *d, const DhcpMsg *m, const unsigned char *buf, int len)
+{
+    if (!d || !m || !m->ok || !buf)
+        return -1;
+    d->buf = buf;
+    d->len = len;
+    d->start = m->opts_off;
+    d->pos = m->opts_off;
+    d->seen = 0;
+    d->bad = 0;
+    return 0;
+}
+
+int next(DhcpDoc *d, DhcpOpt *out)
+{
+    while (d && !d->bad && d->pos < d->len) {
+        int code = (int)d->buf[d->pos];
+        int olen = 0;
+
+        if (code == DHCP_OPT_PAD) {
+            d->pos++;
+            continue;
+        }
+        if (code == DHCP_OPT_END)
+            return 0;
+        if (d->pos + 2 > d->len) {
+            d->bad = 1;
+            return 0;
+        }
+        olen = (int)d->buf[d->pos + 1];
+        if (d->pos + 2 + olen > d->len) {
+            d->bad = 1;
+            return 0;
+        }
+        if (out) {
+            out->code = code;
+            out->len = olen;
+            out->off = d->pos + 2;
+        }
+        d->pos += 2 + olen;
+        d->seen++;
+        return 1;
+    }
+    return 0;
+}
+
+int count(DhcpDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(DhcpDoc *d)
+{
+    if (!d || !d->buf)
+        return;
+    d->pos = d->start;
+    d->seen = 0;
+    d->bad = 0;
+}
+
+/* 按编号找第一个匹配的选项（会从头扫，不影响游标进度以外的东西）。 */
+int find(DhcpDoc *d, int code, DhcpOpt *out)
+{
+    int saved = 0;
+    int saved_seen = 0;
+    DhcpOpt tmp = { 0 };
+
+    if (!d || !d->buf)
+        return -1;
+    saved = d->pos;
+    saved_seen = d->seen;
+    d->pos = d->start;
+    d->bad = 0;
+    while (next(d, &tmp))
+        if (tmp.code == code) {
+            if (out)
+                *out = tmp;
+            d->pos = saved;
+            d->seen = saved_seen;
+            return 1;
+        }
+    d->pos = saved;
+    d->seen = saved_seen;
+    d->bad = 0;
+    return 0;
+}
+
+/* ---- 构造器 ---- */
+
+void init(DhcpBuilder *b, unsigned char *buf, int cap)
+{
+    if (!b)
+        return;
+    memset(b, 0, sizeof *b);
+    b->buf = buf;
+    b->cap = cap;
+    b->ok = (buf == 0 || cap < DHCP_MIN_LEN) ? 0 : 1;
+}
+
+int header(DhcpBuilder *b, int op, unsigned long xid, const unsigned char *mac,
+           int maclen)
+{
+    static const unsigned char cookie[4] = { 0x63, 0x82, 0x53, 0x63 };
+
+    if (!b || !b->ok || b->hdr_done)
+        return -1;
+    if (!mac || maclen <= 0 || maclen > 16)
+        return -1;
+    if (b->cap < DHCP_FIXED + 4)
+        return -1;
+    memset(b->buf, 0, DHCP_FIXED + 4);
+    b->buf[0] = (unsigned char)op;
+    b->buf[1] = 1;              /* htype: Ethernet */
+    b->buf[2] = (unsigned char)maclen;
+    b->buf[3] = 0;              /* hops */
+    b->buf[4] = (unsigned char)((xid >> 24) & 0xff);
+    b->buf[5] = (unsigned char)((xid >> 16) & 0xff);
+    b->buf[6] = (unsigned char)((xid >> 8) & 0xff);
+    b->buf[7] = (unsigned char)(xid & 0xff);
+    /* secs / flags 由调用方按需改：这里保持 0（广播、无秒数） */
+    memcpy(b->buf + 28, mac, (size_t)maclen);
+    memcpy(b->buf + DHCP_FIXED, cookie, 4);
+    b->n = DHCP_FIXED + 4;
+    b->hdr_done = 1;
+    return 0;
+}
+
+int option(DhcpBuilder *b, int code, const unsigned char *val, int vlen)
+{
+    if (!b || !b->ok || !b->hdr_done || vlen < 0 || (vlen > 0 && !val))
+        return -1;
+    if (code <= 0 || code >= 255 || vlen > 255)
+        return -1;
+    if (b->n + 2 + vlen > b->cap)
+        return -1;
+    b->buf[b->n++] = (unsigned char)code;
+    b->buf[b->n++] = (unsigned char)vlen;
+    if (vlen > 0) {
+        memcpy(b->buf + b->n, val, (size_t)vlen);
+        b->n += vlen;
+    }
+    return 0;
+}
+
+/* 收尾：补 END，并填充到 300 字节（够了就不填）。 */
+int finish(DhcpBuilder *b)
+{
+    int target = DHCP_MIN_LEN;
+
+    if (!b || !b->ok || !b->hdr_done)
+        return -1;
+    if (b->n + 1 > b->cap)
+        return -1;
+    b->buf[b->n++] = DHCP_OPT_END;
+    if (b->n < target && target <= b->cap) {
+        memset(b->buf + b->n, 0, (size_t)(target - b->n));
+        b->n = target;
+    }
+    return b->n;
+}
+
+int length(DhcpBuilder *b)
+{
+    return b ? b->n : -1;
+}
+
+int ok(DhcpBuilder *b)
+{
+    return b && b->ok && b->hdr_done;
+}
+
+/* ---- 自测 ---- */
+
+/* 手搓一个 DISCOVER：236 头 + cookie + 53(1) + 55(3) + 12("pi") + END */
+static int mk_discover(unsigned char *buf, int cap)
+{
+    static const unsigned char cookie[4] = { 0x63, 0x82, 0x53, 0x63 };
+    static const unsigned char mac[6] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+
+    if (cap < 300)
+        return -1;
+    memset(buf, 0, (size_t)cap);
+    buf[0] = DHCP_BOOTREQUEST;
+    buf[1] = 1;
+    buf[2] = 6;
+    buf[4] = 0x12;
+    buf[5] = 0x34;
+    buf[6] = 0x56;
+    buf[7] = 0x78;
+    memcpy(buf + 28, mac, 6);
+    memcpy(buf + DHCP_FIXED, cookie, 4);
+    {
+        int n = DHCP_FIXED + 4;
+
+        buf[n++] = DHCP_OPT_MSG_TYPE;
+        buf[n++] = 1;
+        buf[n++] = DHCP_DISCOVER;
+        buf[n++] = DHCP_OPT_PARAM_LIST;
+        buf[n++] = 3;
+        buf[n++] = DHCP_OPT_SUBNET_MASK;
+        buf[n++] = DHCP_OPT_ROUTER;
+        buf[n++] = DHCP_OPT_DNS;
+        buf[n++] = DHCP_OPT_HOSTNAME;
+        buf[n++] = 2;
+        buf[n++] = 'p';
+        buf[n++] = 'i';
+        buf[n++] = DHCP_OPT_END;
+        return n;
+    }
+}
+
+test "DHCP：报文解析与选项游标" {
+    unsigned char buf[300] = { 0 };
+    int n = 0;
+    DhcpMsg m = { 0 };
+    DhcpDoc d = { 0 };
+    DhcpOpt o = { 0 };
+    char ip[20] = { 0 };
+
+    n = mk_discover(buf, sizeof buf);
+    if (n < 0)
+        return err(1, "构造样例失败");
+    if (m.parse(buf, n) != 0 || !m.ok)
+        return err(2, "解析 DISCOVER 失败");
+    if (m.op != DHCP_BOOTREQUEST || m.htype != 1 || m.hlen != 6)
+        return err(3, "头部 op/htype/hlen 不对");
+    if (m.xid != 0x12345678UL)
+        return err(4, "xid 大端解析不对");
+    if (m.chaddr[0] != 0x00 || m.chaddr[5] != 0x55)
+        return err(5, "chaddr 不对");
+    if (m.nopts != 3)
+        return err(6, "应扫出 3 个选项");
+    /* 游标 */
+    d.open(&m, buf, n);
+    if (d.next(&o) != 1 || o.code != DHCP_OPT_MSG_TYPE || o.len != 1)
+        return err(7, "第一条应是消息类型");
+    if (buf[o.off] != DHCP_DISCOVER)
+        return err(8, "消息类型应为 DISCOVER");
+    if (d.next(&o) != 1 || o.code != DHCP_OPT_PARAM_LIST || o.len != 3)
+        return err(9, "第二条应是参数请求表");
+    if (d.next(&o) != 1 || o.code != DHCP_OPT_HOSTNAME || o.len != 2)
+        return err(10, "第三条应是主机名");
+    if (memcmp(buf + o.off, "pi", 2) != 0)
+        return err(11, "主机名值不对");
+    if (d.next(&o) != 0 || d.count() != 3)
+        return err(12, "应恰好三条");
+    d.reset();
+    if (d.next(&o) != 1 || d.count() != 1)
+        return err(13, "reset 后应从头开始");
+    /* find 不影响游标进度 */
+    if (d.next(&o) != 1)
+        return err(14, "游标继续失败");
+    if (d.find(DHCP_OPT_HOSTNAME, &o) != 1 || o.len != 2)
+        return err(15, "find 应找到主机名");
+    if (d.count() != 2)
+        return err(16, "find 不该改变游标计数");
+    if (d.next(&o) != 1 || o.code != DHCP_OPT_HOSTNAME)
+        return err(17, "find 之后游标应继续（停在主机名上）");
+    if (d.find(DHCP_OPT_SERVER_ID, &o) != 0)
+        return err(18, "找不到应返回 0");
+    /* IP 地址格式化/解析 */
+    {
+        unsigned char a[4] = { 192, 168, 1, 10 };
+        unsigned char b[4] = { 0, 0, 0, 0 };
+
+        if (ip4_str(a, ip, sizeof ip) != 12 || strcmp(ip, "192.168.1.10") != 0)
+            return err(19, "ip4_str 不对");
+        if (ip4_parse("10.0.0.1", b) != 0 || b[0] != 10 || b[3] != 1)
+            return err(20, "ip4_parse 不对");
+        if (ip4_parse("10.0.0", b) != -1 || ip4_parse("10.0.0.256", b) != -1)
+            return err(21, "非法 IPv4 应失败");
+    }
+}
+
+test "DHCP：构造器（REQUEST）与坏报文" {
+    unsigned char buf[400] = { 0 };
+    unsigned char mac[6] = { 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    unsigned char req_ip[4] = { 192, 168, 1, 50 };
+    unsigned char want[4] = { 3 };      /* REQUEST */
+    DhcpBuilder b = { 0 };
+    DhcpMsg m = { 0 };
+    DhcpDoc d = { 0 };
+    DhcpOpt o = { 0 };
+    int n = 0;
+
+    b.init(buf, sizeof buf);
+    if (b.header(DHCP_BOOTREQUEST, 0xdeadbeefUL, mac, 6) != 0)
+        return err(1, "header 失败");
+    if (b.option(DHCP_OPT_MSG_TYPE, want, 1) != 0)
+        return err(2, "option 53 失败");
+    if (b.option(DHCP_OPT_REQUESTED_IP, req_ip, 4) != 0)
+        return err(3, "option 50 失败");
+    n = b.finish();
+    if (n != DHCP_MIN_LEN)
+        return err(4, "finish 应填充到 300 字节");
+    if (m.parse(buf, n) != 0)
+        return err(5, "往返解析失败");
+    if (m.xid != 0xdeadbeefUL || m.chaddr[0] != 0xaa || m.hlen != 6)
+        return err(6, "往返头部不一致");
+    d.open(&m, buf, n);
+    if (d.next(&o) != 1 || o.code != DHCP_OPT_MSG_TYPE || buf[o.off] != 3)
+        return err(7, "消息类型应是 REQUEST(3)");
+    if (d.next(&o) != 1 || o.code != DHCP_OPT_REQUESTED_IP || o.len != 4)
+        return err(8, "请求 IP 选项不对");
+    if (memcmp(buf + o.off, req_ip, 4) != 0)
+        return err(9, "请求 IP 值不对");
+    /* END 之后的填充不该被当成选项 */
+    if (d.next(&o) != 0 || m.nopts != 2)
+        return err(10, "END 之后应停止，且只有 2 个选项");
+    /* 坏报文：cookie 不对、太短、hlen 越界 */
+    {
+        unsigned char bad[300] = { 0 };
+        DhcpMsg bm = { 0 };
+
+        memcpy(bad, buf, (size_t)n);
+        bad[DHCP_FIXED] = 0x00;
+        if (bm.parse(bad, n) != -1)
+            return err(11, "magic cookie 不对应失败");
+        if (bm.parse(buf, 100) != -1)
+            return err(12, "太短应失败");
+        memcpy(bad, buf, (size_t)n);
+        bad[2] = 20;            /* hlen > 16 */
+        if (bm.parse(bad, n) != -1)
+            return err(13, "hlen 越界应失败");
+        /* 选项长度越界 */
+        memcpy(bad, buf, (size_t)n);
+        bad[DHCP_FIXED + 4] = 12;       /* hostname */
+        bad[DHCP_FIXED + 5] = 200;      /* 超出缓冲 */
+        if (bm.parse(bad, 260) != -1)
+            return err(14, "选项长度越界应失败");
+    }
+    /* 容量不足：init 要求至少 300 字节 */
+    {
+        unsigned char small[100] = { 0 };
+        DhcpBuilder s = { 0 };
+
+        s.init(small, sizeof small);
+        if (s.header(DHCP_BOOTREQUEST, 1, mac, 6) != -1)
+            return err(15, "小于 300 字节应拒绝");
+    }
+    /* 选项越界 / 坏编号 */
+    b.init(buf, sizeof buf);
+    b.header(DHCP_BOOTREQUEST, 1, mac, 6);
+    if (b.option(0, want, 1) != -1 || b.option(255, want, 1) != -1)
+        return err(16, "保留编号应拒绝");
+    {
+        unsigned char many[256] = { 0 };
+        DhcpBuilder s = { 0 };
+
+        memset(many, 'x', sizeof many);
+        s.init(buf, sizeof buf);
+        s.header(DHCP_BOOTREQUEST, 1, mac, 6);
+        if (s.option(DHCP_OPT_HOSTNAME, many, 256) != -1)
+            return err(17, "单选项超过 255 字节应拒绝");
+    }
+}

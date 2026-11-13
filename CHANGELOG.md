@@ -7,6 +7,24 @@
 
 ## 未发布
 
+### 标准库第八十七批：发现与配置协议 + 文本折叠
+
+- **`std/net/coap.c6`**（RFC 7252）：4 字节头 + token + 选项串（13/14 扩展
+  delta/length）+ `0xFF` payload；`CoapMsg.parse` 解析、`CoapDoc` 游标逐条走选项、
+  `CoapBuilder` 自动算 delta 并强制递增。
+- **`std/net/dhcp.c6`**（RFC 2131/2132）：236 字节头 + magic cookie + TLV 选项，
+  `find` 按编号查不影响游标；构造器补 END 并填充到 300 字节；`ip4_str/ip4_parse`。
+- **`std/net/ssdp.c6`**（UPnP 发现）：`M-SEARCH`/`NOTIFY`/应答三种起始行，头部名
+  大小写不敏感（`get`），构造器自动写多播 `HOST` 并补空行。
+- **`std/text/translit.c6`**：UTF-8 → 近似 ASCII（拉丁去音符、符号换 ASCII、全角
+  转半角、组合符号丢弃），标志位 `TR_REPLACE_UNKNOWN`/`TR_FOLD_CASE`，流式句柄
+  `Translit.put/finish/dropped`。
+- 集成示例 `examples/stdproto4.c6`（`make std-proto4`，56 条检查）+ `STD_PROTO4_SRCS`
+  + err 号段 0x6165…0x6168；`std/` 到 **361** 个模块。
+- **文档补一条硬约束**：跨模块同名的方法（首参结构体指针）编成 `<Tag>_<name>`
+  不会撞，但首参不是结构体指针的自由函数是普通全局符号——两个模块都导出同名
+  函数时会被静默合并，必须做成方法或加模块前缀。
+
 ### 标准库第八十六批：服务端中间件语义（限流 / 缓存 / 邮件编码 / 模糊匹配）
 
 - **`std/net/ratelimit.c6`**：令牌桶（`Bucket.take/take_n/retry_after`，整数毫秒

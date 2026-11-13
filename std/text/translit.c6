@@ -1,0 +1,477 @@
+/* std/text/translit：把 UTF-8 文本折成近似 ASCII（音译 / 折叠 / 全角转半角）。
+ *
+ *     import std.text.translit;
+ *
+ *     char out[64] = { 0 };
+ *     int n = translit("Café Zürich", 12, out, sizeof out, TR_DEFAULT);
+ *     // n = 11, out = "Cafe Zurich"
+ *     translit_len("Café", 5, TR_DEFAULT);      // 4：先量后写（放不下就一个字节都不写）
+ *
+ *     Translit t = { 0 };
+ *     t.init(buf, sizeof buf, TR_FOLD_CASE | TR_REPLACE_UNKNOWN);
+ *     t.put(chunk, len);          // 方法：init / put / finish / length / ok / dropped
+ *     t.finish();
+ *
+ * 为什么不用「大表」：表驱动的做法要么把几十 KB 的映射塞进 .rodata，要么依赖
+ * ICU。这里只要「看起来像 ASCII」——拉丁字母去变音符、常见排版符号换成 ASCII
+ * 替代、全角转半角，其余（CJK、emoji）按标志位丢弃或换成 `?`。够用在
+ * slug/文件名/排序键/日志这些场景。
+ *
+ * 标志位：
+ *
+ * - `TR_DEFAULT`：保留原样，未知字符**丢弃**；
+ * - `TR_REPLACE_UNKNOWN`：未知字符换成 `?`；
+ * - `TR_FOLD_CASE`：ASCII 大写折成小写（配合前面的丢弃，得到 slug 友好的键）；
+ * - `TR_KEEP_SPACE`：把各种空白（含 NBSP、全角空格）统一成普通空格。
+ *
+ * 非法 UTF-8（截断序列、超长编码、代理区）按「未知字符」处理，不崩。
+ */
+#include <string.h>
+
+module std.text.translit;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define TR_DEFAULT 0
+#define TR_REPLACE_UNKNOWN 1
+#define TR_FOLD_CASE 2
+#define TR_KEEP_SPACE 4
+
+struct Translit {
+    char *out;
+    int cap;
+    int n;
+    int flags;
+    int bad;
+    int n_drop;                 /* 被丢掉的码点个数 */
+};
+
+/* ---- UTF-8 ---- */
+
+/* 解一个码点；非法返回 -1，*used 置为「跳过几个字节」（至少 1）。 */
+int decode_cp(const char *s, int len, int *used)
+{
+    unsigned char c0 = 0;
+    int cp = 0;
+    int need = 0;
+
+    if (used)
+        *used = 1;
+    if (!s || len <= 0)
+        return -1;
+    c0 = (unsigned char)s[0];
+    if (c0 < 0x80)
+        return (int)c0;
+    if ((c0 & 0xe0) == 0xc0) {
+        cp = c0 & 0x1f;
+        need = 1;
+        if (cp == 0)
+            return -1;          /* 超长编码 */
+    } else if ((c0 & 0xf0) == 0xe0) {
+        cp = c0 & 0x0f;
+        need = 2;
+    } else if ((c0 & 0xf8) == 0xf0) {
+        cp = c0 & 0x07;
+        need = 3;
+    } else {
+        return -1;
+    }
+    if (len < need + 1)
+        return -1;
+    for (int i = 1; i <= need; i++) {
+        unsigned char c = (unsigned char)s[i];
+
+        if ((c & 0xc0) != 0x80)
+            return -1;
+        cp = (cp << 6) | (c & 0x3f);
+    }
+    /* 超长 / 越界 / 代理区 */
+    if ((need == 2 && cp < 0x800) || (need == 3 && cp < 0x10000))
+        return -1;
+    if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+        return -1;
+    if (used)
+        *used = need + 1;
+    return cp;
+}
+
+/* ---- 映射 ---- */
+
+static const char *tr_latin1(int cp)
+{
+    switch (cp) {
+    case 0xc0: case 0xc1: case 0xc2: case 0xc3: case 0xc4: case 0xc5: return "A";
+    case 0xc8: case 0xc9: case 0xca: case 0xcb: return "E";
+    case 0xcc: case 0xcd: case 0xce: case 0xcf: return "I";
+    case 0xd1: return "N";
+    case 0xd2: case 0xd3: case 0xd4: case 0xd5: case 0xd6: case 0xd8: return "O";
+    case 0xd9: case 0xda: case 0xdb: case 0xdc: return "U";
+    case 0xdd: return "Y";
+    case 0xe0: case 0xe1: case 0xe2: case 0xe3: case 0xe4: case 0xe5: return "a";
+    case 0xe8: case 0xe9: case 0xea: case 0xeb: return "e";
+    case 0xec: case 0xed: case 0xee: case 0xef: return "i";
+    case 0xf1: return "n";
+    case 0xf2: case 0xf3: case 0xf4: case 0xf5: case 0xf6: case 0xf8: return "o";
+    case 0xf9: case 0xfa: case 0xfb: case 0xfc: return "u";
+    case 0xfd: case 0xff: return "y";
+    case 0xc6: return "AE";
+    case 0xe6: return "ae";
+    case 0xd0: return "D";
+    case 0xf0: return "d";
+    case 0xde: return "TH";
+    case 0xfe: return "th";
+    case 0xdf: return "ss";
+    case 0xc7: return "C";
+    case 0xe7: return "c";
+    case 0xd7: return "x";
+    case 0xf7: return "/";
+    default: return 0;
+    }
+}
+
+static const char *tr_punct(int cp)
+{
+    switch (cp) {
+    case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014:
+    case 0x2015: case 0x2212:
+        return "-";
+    case 0x2018: case 0x2019: case 0x201a: case 0x201b: case 0x2032:
+        return "'";
+    case 0x201c: case 0x201d: case 0x201e: case 0x201f: case 0x2033:
+        return "\"";
+    case 0x2026: return "...";
+    case 0x2022: case 0x00b7: return "*";
+    case 0x00a9: return "(c)";
+    case 0x00ae: return "(r)";
+    case 0x2122: return "(tm)";
+    case 0x00b0: return "deg";
+    case 0x2030: return "%";
+    case 0x20ac: return "EUR";
+    case 0x00a3: return "GBP";
+    case 0x00a5: return "JPY";
+    case 0x2190: return "<-";
+    case 0x2192: return "->";
+    case 0x2194: return "<->";
+    default: return 0;
+    }
+}
+
+/* 把一个码点映射到 ASCII 片段；返回字节数（0 = 丢弃，-1 = 未知）。 */
+int map_cp(int cp, char *out, int cap)
+{
+    const char *rep = 0;
+    int len = 0;
+
+    if (!out || cap <= 0)
+        return -1;
+    /* ASCII 原样 */
+    if (cp >= 0x20 && cp <= 0x7e) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    /* 控制字符 / 制表符 / 换行 */
+    if (cp == '\t' || cp == '\n' || cp == '\r') {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x20 || cp == 0x7f)
+        return 0;
+    /* 空白统一成空格 */
+    if (cp == 0xa0 || cp == 0x2007 || cp == 0x202f || cp == 0x3000
+        || (cp >= 0x2000 && cp <= 0x200a)) {
+        out[0] = ' ';
+        return 1;
+    }
+    /* 组合变音符号：丢掉（等价于去音符） */
+    if (cp >= 0x0300 && cp <= 0x036f)
+        return 0;
+    /* 全角 ASCII → 半角 */
+    if (cp >= 0xff01 && cp <= 0xff5e) {
+        out[0] = (char)(cp - 0xfee0);
+        return 1;
+    }
+    if (cp == 0xff61)
+        out[0] = '.';
+    rep = tr_latin1(cp);
+    if (!rep)
+        rep = tr_punct(cp);
+    if (!rep)
+        return -1;
+    len = (int)strlen(rep);
+    if (len > cap)
+        return -1;
+    memcpy(out, rep, (size_t)len);
+    return len;
+}
+
+/* ---- 一次性转写 ---- */
+
+/* 转写后的字节数（只计数，不写）；非法参数返回 -1。 */
+int translit_len(const char *s, int len, int flags)
+{
+    int i = 0;
+    int o = 0;
+
+    if (!s || len < 0)
+        return -1;
+    while (i < len) {
+        int used = 1;
+        int cp = decode_cp(s + i, len - i, &used);
+        char buf[8] = { 0 };
+        int n = 0;
+
+        if (cp < 0) {
+            if (flags & TR_REPLACE_UNKNOWN)
+                o++;
+            i += used > 0 ? used : 1;
+            continue;
+        }
+        n = map_cp(cp, buf, (int)sizeof buf);
+        if (n < 0) {
+            if (flags & TR_REPLACE_UNKNOWN)
+                o++;
+        } else {
+            o += n;
+        }
+        i += used;
+    }
+    return o;
+}
+
+int translit(const char *s, int len, char *out, int cap, int flags)
+{
+    int i = 0;
+    int o = 0;
+    int need = 0;
+
+    if (!s || len < 0 || cap < 0 || (cap > 0 && !out))
+        return -1;
+    need = translit_len(s, len, flags);
+    if (need < 0 || need > cap)
+        return -1;              /* 先量后写：放不下就一个字节都不写 */
+    while (i < len) {
+        int used = 1;
+        int cp = decode_cp(s + i, len - i, &used);
+        char buf[8] = { 0 };
+        int n = 0;
+
+        if (cp < 0) {
+            /* 非法序列：按未知字符处理，跳过 1 字节 */
+            if (flags & TR_REPLACE_UNKNOWN) {
+                if (o + 1 > cap)
+                    return -1;
+                out[o++] = '?';
+            }
+            i += used > 0 ? used : 1;
+            continue;
+        }
+        n = map_cp(cp, buf, (int)sizeof buf);
+        if (n < 0) {
+            if (flags & TR_REPLACE_UNKNOWN) {
+                if (o + 1 > cap)
+                    return -1;
+                out[o++] = '?';
+            }
+        } else {
+            if (o + n > cap)
+                return -1;
+            if ((flags & TR_FOLD_CASE) && n == 1 && buf[0] >= 'A' && buf[0] <= 'Z')
+                buf[0] = (char)(buf[0] - 'A' + 'a');
+            memcpy(out + o, buf, (size_t)n);
+            o += n;
+        }
+        i += used;
+    }
+    return o;
+}
+
+/* ---- 流式句柄 ---- */
+
+void init(Translit *t, char *out, int cap, int flags)
+{
+    if (!t)
+        return;
+    memset(t, 0, sizeof *t);
+    t->out = out;
+    t->cap = cap;
+    t->flags = flags;
+    t->bad = (out == 0 || cap < 0) ? 1 : 0;
+}
+
+/* 喂一段字节；返回累计写入的字节数，失败后恒为 -1。 */
+int put(Translit *t, const char *s, int len)
+{
+    int i = 0;
+
+    if (!t || t->bad)
+        return -1;
+    if (!s || len < 0) {
+        t->bad = 1;
+        return -1;
+    }
+    while (i < len) {
+        int used = 1;
+        int cp = decode_cp(s + i, len - i, &used);
+        char buf[8] = { 0 };
+        int n = 0;
+
+        if (cp < 0) {
+            if (t->flags & TR_REPLACE_UNKNOWN) {
+                if (t->n + 1 > t->cap) {
+                    t->bad = 1;
+                    return -1;
+                }
+                t->out[t->n++] = '?';
+            }
+            t->n_drop++;
+            i += used > 0 ? used : 1;
+            continue;
+        }
+        n = map_cp(cp, buf, (int)sizeof buf);
+        if (n < 0) {
+            if (t->flags & TR_REPLACE_UNKNOWN) {
+                if (t->n + 1 > t->cap) {
+                    t->bad = 1;
+                    return -1;
+                }
+                t->out[t->n++] = '?';
+            }
+            t->n_drop++;
+        } else if (n > 0) {
+            if (t->n + n > t->cap) {
+                t->bad = 1;
+                return -1;
+            }
+            if ((t->flags & TR_FOLD_CASE) && n == 1 && buf[0] >= 'A'
+                && buf[0] <= 'Z')
+                buf[0] = (char)(buf[0] - 'A' + 'a');
+            memcpy(t->out + t->n, buf, (size_t)n);
+            t->n += n;
+        }
+        i += used;
+    }
+    return t->bad ? -1 : t->n;
+}
+
+int finish(Translit *t)
+{
+    return t ? (t->bad ? -1 : t->n) : -1;
+}
+
+int length(Translit *t)
+{
+    return t ? (t->bad ? -1 : t->n) : -1;
+}
+
+int ok(Translit *t)
+{
+    return t && !t->bad;
+}
+
+int dropped(Translit *t)
+{
+    return t ? t->n_drop : -1;
+}
+
+/* ---- 自测 ---- */
+
+test "translit：映射表（拉丁 / 标点 / 全角 / 组合符号）" {
+    char out[96] = { 0 };
+    int n = 0;
+
+    /* 拉丁变音符 */
+    n = translit("Caf\xc3\xa9 Z\xc3\xbcrich", 13, out, sizeof out, TR_DEFAULT);
+    if (n != 11 || memcmp(out, "Cafe Zurich", 11) != 0)
+        return err(1, "é/ü 应折成 e/u");
+    /* 多字符展开 */
+    n = translit("stra\xc3\x9f""e", 7, out, sizeof out, TR_DEFAULT);
+    if (n != 7 || memcmp(out, "strasse", 7) != 0)
+        return err(2, "ß 应展开成 ss");
+    n = translit("\xc3\x86s\xc3\xb8", 5, out, sizeof out, TR_DEFAULT);
+    if (n != 4 || memcmp(out, "AEso", 4) != 0)
+        return err(3, "Æ/ø 应折成 AE/o");
+    /* 标点与符号 */
+    n = translit("a\xe2\x80\x94""b \xe2\x80\x9c""q\xe2\x80\x9d", 8 + 3,
+                 out, sizeof out, TR_DEFAULT);
+    if (n != 6 || memcmp(out, "a-b \"q\"", 6) != 0)
+        return err(4, "破折号/弯引号应换成 ASCII");
+    n = translit("\xe2\x82\xac""9", 4, out, sizeof out, TR_DEFAULT);
+    if (n != 4 || memcmp(out, "EUR9", 4) != 0)
+        return err(5, "€ 应展开成 EUR");
+    /* 全角转半角 */
+    n = translit("\xef\xbc\xa1\xef\xbc\xa2", 6, out, sizeof out, TR_DEFAULT);
+    if (n != 2 || memcmp(out, "AB", 2) != 0)
+        return err(6, "全角 ＡＢ 应转成 AB");
+    /* 组合符号（e + U+0301）折成 e */
+    n = translit("e\xcc\x81", 3, out, sizeof out, TR_DEFAULT);
+    if (n != 1 || out[0] != 'e')
+        return err(7, "组合变音符号应丢掉");
+    /* 未知字符默认丢弃，未知 + REPLACE 换成 ? */
+    n = translit("\xe4\xb8\xad""x", 4, out, sizeof out, TR_DEFAULT);
+    if (n != 1 || out[0] != 'x')
+        return err(8, "CJK 默认应丢弃");
+    n = translit("\xe4\xb8\xad""x", 4, out, sizeof out, TR_REPLACE_UNKNOWN);
+    if (n != 2 || memcmp(out, "?x", 2) != 0)
+        return err(9, "REPLACE_UNKNOWN 应换成 ?");
+}
+
+test "translit：流式句柄、标志位与坏输入" {
+    Translit t = { 0 };
+    char one[64] = { 0 };
+    char two[64] = { 0 };
+    int n1 = 0;
+
+    /* 一次性 vs 流式（分三片） */
+    n1 = translit("Caf\xc3\xa9 \xe2\x80\x94 ok", 13, one, sizeof one,
+                  TR_DEFAULT);
+    if (n1 <= 0)
+        return err(1, "一次性转写失败");
+    t.init(two, sizeof two, TR_DEFAULT);
+    if (t.put("Caf\xc3\xa9 ", 6) < 0 || t.put("\xe2\x80\x94 ", 4) < 0
+        || t.put("ok", 2) < 0)
+        return err(2, "分片喂失败");
+    if (t.finish() != n1 || !t.ok())
+        return err(3, "流式长度与一次性不一致");
+    if (memcmp(one, two, (size_t)n1) != 0)
+        return err(4, "流式输出与一次性不一致");
+    if (t.dropped() != 0)
+        return err(5, "没有该丢的字符");
+    /* TR_FOLD_CASE */
+    t.init(two, sizeof two, TR_FOLD_CASE);
+    if (t.put("HELLO World", 11) < 0 || t.finish() != 11)
+        return err(6, "折大小写失败");
+    if (memcmp(two, "hello world", 11) != 0)
+        return err(7, "TR_FOLD_CASE 应把大写折成小写");
+    /* dropped 计数 */
+    t.init(two, sizeof two, TR_DEFAULT);
+    if (t.put("\xe4\xb8\xad\xe6\x96\x87", 6) < 0)
+        return err(8, "喂 CJK 失败");
+    if (t.finish() != 0 || t.dropped() != 2)
+        return err(9, "两个 CJK 字符都应计入 dropped");
+    /* 非法 UTF-8：截断序列 / 裸延续字节 */
+    t.init(two, sizeof two, TR_REPLACE_UNKNOWN);
+    if (t.put("\xc3", 1) < 0 || t.put("\x80", 1) < 0)
+        return err(10, "非法序列不该让句柄失败");
+    if (t.finish() != 2 || memcmp(two, "??", 2) != 0)
+        return err(11, "两个非法字节各换成一个 ?");
+    /* 容量不足 */
+    t.init(two, 2, TR_DEFAULT);
+    if (t.put("abcdef", 6) >= 0 || t.ok() || t.length() != -1)
+        return err(12, "容量不足应报错");
+    /* 一次性调用的容量不足也不写 */
+    memset(two, 'y', sizeof two);
+    if (translit("abcdef", 6, two, 2, TR_DEFAULT) != -1 || two[0] != 'y')
+        return err(13, "一次性容量不足应返回 -1 且不写");
+    /* decode_cp 的边界 */
+    {
+        int used = 0;
+
+        if (decode_cp("A", 1, &used) != 'A' || used != 1)
+            return err(14, "ASCII 解码不对");
+        if (decode_cp("\xe4\xb8\xad", 3, &used) != 0x4e2d || used != 3)
+            return err(15, "CJK 解码不对");
+        if (decode_cp("\xed\xa0\x80", 3, &used) != -1)
+            return err(16, "代理区应判非法");
+    }
+}

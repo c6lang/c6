@@ -1,0 +1,238 @@
+/* examples/stdproto4.c6 —— 第八十七批（发现与配置协议：SSDP / DHCP / CoAP + 文本折叠）。
+ *
+ *     make std-proto4
+ *
+ * 五节，全部走方法调用（`b.start(...)`、`d.next(&o)`、`t.put(...)`）：
+ *   1. CoAP：构造 GET /temp、解析回来、选项游标与码点格式化；
+ *   2. DHCP：构造 DISCOVER/REQUEST、解析回来、选项查找与 IPv4 格式化；
+ *   3. SSDP：构造 M-SEARCH、解析 NOTIFY 与应答、头部游标查找；
+ *   4. translit：把带变音符的主机名/日志折成 ASCII（slug 友好）；
+ *   5. 串联：SSDP 发现 -> CoAP 取数 -> 用 translit 折叠主机名写日志。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.net.coap;
+import std.net.dhcp;
+import std.net.ssdp;
+import std.text.translit;
+
+static int checks = 0;
+static int nfail = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        nfail++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* 1. CoAP */
+static void do_coap(void)
+{
+    unsigned char buf[128] = { 0 };
+    unsigned char tok[2] = { 0x01, 0x02 };
+    CoapBuilder b = { 0 };
+    CoapMsg m = { 0 };
+    CoapDoc d = { 0 };
+    CoapOpt o = { 0 };
+    char line[8] = { 0 };
+    int n = 0;
+
+    printf("== coap（RFC 7252 报文层）\n");
+    b.init(buf, sizeof buf);
+    check(b.start(COAP_CON, COAP_GET, 0x4242) == 0, "start(CON GET)");
+    check(b.token(tok, 2) == 0, "token 2 字节");
+    check(b.option(COAP_OPT_URI_PATH, (const unsigned char *)"temp", 4) == 0,
+          "Uri-Path=temp");
+    check(b.option(COAP_OPT_CONTENT_FORMAT, 0, 0) == 0, "Content-Format=0（长度 0）");
+    n = b.finish();
+    check(n == 4 + 2 + 5 + 1, "报文长度 = 头4 + token2 + 选项5 + 选项1");
+
+    check(m.parse(buf, n) == 0, "解析回来");
+    check(m.ver == 1 && m.type == COAP_CON && m.tkl == 2, "头部字段");
+    check(m.mid == 0x4242 && m.token[1] == 0x02, "mid/token");
+    check(code_str(m.code, line, sizeof line) == 4 && strcmp(line, "0.01") == 0,
+          "码点格式化 0.01");
+    check(code_str(code_of(2, 5), line, sizeof line) == 4
+          && strcmp(line, "2.05") == 0, "2.05 格式化");
+
+    d.open(&m, buf, n);
+    check(d.next(&o) == 1 && o.num == COAP_OPT_URI_PATH && o.len == 4, "第一条 Uri-Path");
+    check(memcmp(buf + o.off, "temp", 4) == 0, "Uri-Path 值");
+    check(d.next(&o) == 1 && o.num == COAP_OPT_CONTENT_FORMAT && o.len == 0,
+          "第二条 Content-Format");
+    check(d.next(&o) == 0 && d.count() == 2, "恰好两条");
+    d.reset();
+    check(d.next(&o) == 1 && d.count() == 1, "reset 后从头");
+}
+
+/* 2. DHCP */
+static void do_dhcp(void)
+{
+    unsigned char buf[400] = { 0 };
+    unsigned char mac[6] = { 0x02, 0x00, 0x5a, 0x1b, 0x2c, 0x3d };
+    unsigned char kind[1] = { DHCP_DISCOVER };
+    unsigned char req[4] = { 192, 168, 7, 42 };
+    DhcpBuilder b = { 0 };
+    DhcpMsg m = { 0 };
+    DhcpDoc d = { 0 };
+    DhcpOpt o = { 0 };
+    char ip[20] = { 0 };
+    unsigned char parsed[4] = { 0 };
+    int n = 0;
+
+    printf("== dhcp（RFC 2131 报文层）\n");
+    b.init(buf, sizeof buf);
+    check(b.header(DHCP_BOOTREQUEST, 0xcafe1234UL, mac, 6) == 0, "header(DISCOVER)");
+    check(b.option(DHCP_OPT_MSG_TYPE, kind, 1) == 0, "option 53");
+    check(b.option(DHCP_OPT_REQUESTED_IP, req, 4) == 0, "option 50");
+    n = b.finish();
+    check(n == DHCP_MIN_LEN, "finish 填充到 300 字节");
+
+    check(m.parse(buf, n) == 0 && m.ok, "解析回来");
+    check(m.xid == 0xcafe1234UL && m.hlen == 6, "xid/hton");
+    check(m.chaddr[0] == 0x02 && m.chaddr[5] == 0x3d, "chaddr");
+    d.open(&m, buf, n);
+    check(d.find(DHCP_OPT_MSG_TYPE, &o) == 1 && o.len == 1 && buf[o.off] == DHCP_DISCOVER,
+          "找到消息类型 = DISCOVER");
+    check(d.find(DHCP_OPT_REQUESTED_IP, &o) == 1 && o.len == 4, "找到请求 IP");
+    check(ip4_str(buf + o.off, ip, sizeof ip) == 12 && strcmp(ip, "192.168.7.42") == 0,
+          "IPv4 格式化");
+    check(ip4_parse("10.1.2.3", parsed) == 0 && parsed[1] == 1 && parsed[3] == 3,
+          "IPv4 解析");
+    check(d.find(DHCP_OPT_HOSTNAME, &o) == 0, "没有主机名选项");
+}
+
+/* 3. SSDP */
+static void do_ssdp(void)
+{
+    const char *notify = "NOTIFY * HTTP/1.1\r\n"
+                         "HOST: 239.255.255.250:1900\r\n"
+                         "NT: upnp:rootdevice\r\n"
+                         "NTS: ssdp:alive\r\n"
+                         "USN: uuid:abc::upnp:rootdevice\r\n"
+                         "LOCATION: http://192.168.7.9:49152/desc.xml\r\n"
+                         "\r\n";
+    char out[256] = { 0 };
+    SsdpBuilder b = { 0 };
+    SsdpMsg m = { 0 };
+    SsdpDoc d = { 0 };
+    SsdpHdr h = { 0, 0, 0, 0 };
+    int n = 0;
+
+    printf("== ssdp（UPnP 发现）\n");
+    b.init(out, sizeof out);
+    check(b.start(SSDP_M_SEARCH, "*") == 0, "start(M-SEARCH)");
+    check(b.header("MAN", "\"ssdp:discover\"") == 0, "MAN");
+    check(b.header("MX", "2") == 0, "MX");
+    check(b.header("ST", "ssdp:all") == 0, "ST");
+    n = b.finish();
+    check(n > 0, "finish");
+    check(m.parse(out, n) == 0 && m.is_search(), "构造的 M-SEARCH 可解析");
+    d.open(&m, out, n);
+    check(d.get("host", &h) == 1, "自动写了 HOST（大小写不敏感）");
+    check(h.val_len == 20 && memcmp(out + h.val_off, "239.255.255.250:1900", 20) == 0,
+          "HOST 是多播地址");
+    check(d.get("ST", &h) == 1 && memcmp(out + h.val_off, "ssdp:all", 8) == 0, "ST 值");
+
+    check(m.parse(notify, (int)strlen(notify)) == 0 && m.is_notify(),
+          "解析 NOTIFY");
+    check(m.nhdr == 5, "NOTIFY 有 5 个头");
+    d.open(&m, notify, (int)strlen(notify));
+    check(d.get("location", &h) == 1
+          && memcmp(notify + h.val_off, "http://192.168.7.9:49152/desc.xml", 33) == 0,
+          "LOCATION 值");
+    check(d.get("NTS", &h) == 1 && memcmp(notify + h.val_off, "ssdp:alive", 10) == 0,
+          "NTS = ssdp:alive");
+}
+
+/* 4. translit */
+static void do_translit(void)
+{
+    char out[64] = { 0 };
+    Translit t = { 0 };
+    int n = 0;
+
+    printf("== translit（折叠成 ASCII）\n");
+    n = translit("Café Zürich", 13, out, sizeof out, TR_DEFAULT);
+    check(n == 11 && memcmp(out, "Cafe Zurich", 11) == 0, "变音符折叠");
+    n = translit("Straße 42", 10, out, sizeof out, TR_DEFAULT);
+    check(n == 10 && memcmp(out, "Strasse 42", 10) == 0, "ß 展开");
+    n = translit("ＡＢＣ", 9, out, sizeof out, TR_DEFAULT);
+    check(n == 3 && memcmp(out, "ABC", 3) == 0, "全角转半角");
+    check(translit_len("Café", 5, TR_DEFAULT) == 4, "translit_len 先量");
+
+    t.init(out, sizeof out, TR_FOLD_CASE);
+    check(t.put("Mesh-Node-Ünïcode", 19) >= 0, "流式折叠大写");
+    check(t.finish() == 17 && memcmp(out, "mesh-node-unicode", 17) == 0,
+          "得到 slug 友好的键");
+    check(t.dropped() == 0, "没有丢弃");
+}
+
+/* 5. 串联：发现 -> 取数 -> 折叠写日志 */
+static void do_pipeline(void)
+{
+    const char *desc = "HTTP/1.1 200 OK\r\n"
+                       "ST: upnp:rootdevice\r\n"
+                       "LOCATION: http://192.168.7.9:49152/desc.xml\r\n"
+                       "\r\n";
+    char log[128] = { 0 };
+    char host[32] = { 0 };
+    unsigned char coap[64] = { 0 };
+    SsdpMsg sm = { 0 };
+    SsdpDoc sd = { 0 };
+    SsdpHdr sh = { 0, 0, 0, 0 };
+    CoapBuilder cb = { 0 };
+    CoapMsg cm = { 0 };
+    Translit t = { 0 };
+    int n = 0;
+
+    printf("== 串联：SSDP 发现 -> CoAP 取数 -> 折叠日志\n");
+    check(sm.parse(desc, (int)strlen(desc)) == 0 && sm.is_response(),
+          "1) 解析设备应答");
+    sd.open(&sm, desc, (int)strlen(desc));
+    check(sd.get("LOCATION", &sh) == 1, "2) 取到 LOCATION");
+    /* 从 URL 里抠出主机名（跳过 scheme 与端口） */
+    {
+        const char *v = desc + sh.val_off;
+        int i = 0;
+
+        while (i < sh.val_len && v[i] != ':' )
+            i++;
+        if (i < sh.val_len) {
+            int j = i + 3;          /* 跳过 "://" */
+            int k = 0;
+
+            while (j < sh.val_len && v[j] != ':' && k < (int)sizeof host - 1)
+                host[k++] = v[j++];
+            host[k] = 0;
+        }
+    }
+    check(strcmp(host, "192.168.7.9") == 0, "3) 抠出主机 192.168.7.9");
+    /* 用主机名 + 路径构造 CoAP GET /status */
+    cb.init(coap, sizeof coap);
+    check(cb.start(COAP_CON, COAP_GET, 0x0001) == 0, "4) 构造 CoAP GET");
+    check(cb.option(COAP_OPT_URI_PATH, (const unsigned char *)"status", 6) == 0, "5) Uri-Path");
+    n = cb.finish();
+    check(n > 0 && cm.parse(coap, n) == 0 && cm.code == COAP_GET, "6) 报文可用");
+    /* 写日志：主机名折叠成 ASCII */
+    t.init(log, sizeof log, TR_FOLD_CASE);
+    check(t.put("Gerät-", 7) >= 0 && t.put(host, (int)strlen(host)) >= 0, "7) 写日志");
+    check(t.finish() > 0, "8) 日志写完");
+    check(memcmp(log, "gerat-192.168.7.9", 18) == 0, "9) 日志内容是折叠后的主机");
+}
+
+int main(void)
+{
+    do_coap();
+    do_dhcp();
+    do_ssdp();
+    do_translit();
+    do_pipeline();
+    printf("\n%d check(s), %d failure(s)\n", checks, nfail);
+    return nfail == 0 ? 0 : 1;
+}
