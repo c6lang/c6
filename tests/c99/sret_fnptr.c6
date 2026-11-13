@@ -11,7 +11,7 @@
  * 直接调用一致。
  *
  * 运行（仓库根目录）：
- *   make c99test
+ *   cmake --build build --target c99test
  */
 
 // EXIT 0

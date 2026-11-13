@@ -1,7 +1,7 @@
 /* async / await 用法演示：一个 HTTP 请求
  *
  * 编译运行（在仓库根目录）：
- *   make build
+ *   cmake --build build
  *   ./tcc/tcc -B tcc -run examples/async_demo.c6
  *
  * 真实客户端里 connect / send / recv 都会阻塞。这里把"等 fd 就绪"抽成

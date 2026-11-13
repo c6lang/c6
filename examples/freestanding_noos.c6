@@ -1,6 +1,6 @@
 /* 完全没有操作系统的样子：c6 运行时一个外部符号都不需要
  *
- *   make fstest-noos
+ *   cmake --build build --target fstest-noos
  *
  * 这个程序里没有一个 syscall：不写文件、不退出、不申请内存。字符串插值、
  * 格式说明、defer、err + catch、@T、托管缓冲全在内存里做完，结果靠最后

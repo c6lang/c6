@@ -1,6 +1,6 @@
 /* examples/stdaudio.c6 —— 第四十三批（音频容器）的集成示例。
  *
- *     make std-audio
+ *     cmake --build build --target std-audio
  *
  * 四节：MP3（ID3v1 + 帧头）、Ogg（页头 + Opus/Vorbis 识别）、FLAC（STREAMINFO +
  * VORBIS_COMMENT）、MIDI（头块 + 轨块 + 事件）。都在内存里现场拼。

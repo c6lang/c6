@@ -1,6 +1,6 @@
 /* examples/stddoc.c6 —— 第三十三批（结构化文本格式）的集成示例。
  *
- *     make std-doc
+ *     cmake --build build --target std-doc
  *
  * 把 html / yaml / vcf / ics 四个读取器串起来用：先用 HTML 分词器数标签、
  * 取属性、看 script 原文；再遍历一份 YAML 配置，把缩进还原成层级；然后读

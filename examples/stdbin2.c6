@@ -1,6 +1,6 @@
 /* examples/stdbin2.c6 —— 第六十批（二进制与数值工具）的集成示例。
  *
- *     make std-bin2
+ *     cmake --build build --target std-bin2
  *
  * 四节：LE/BE 整数读写（binio）、按位读写（bitio）、半精度浮点（half）、
  * 对齐工具（align）。前三个都用**方法**（`w.put_u16le(v)`、`bw.write(v,n)`、`h.set(x)`）。

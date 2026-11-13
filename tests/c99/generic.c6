@@ -4,7 +4,7 @@
  * 结果一样，gcc 能编、行为一致。
  *
  * 运行（仓库根目录）：
- *   make c99test
+ *   cmake --build build --target c99test
  */
 // EXIT 0
 // OUTPUT 6 30

@@ -92,78 +92,111 @@ cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
 # 2. 构建（打开扩展：EXTRA-DEFS=-DC6_EXT，产物 tcc/c6）
 cmake --build build --parallel
 
-# 3. 跑测试
-ctest --test-dir build --output-on-failure
+# 3. 跑日常测试（不加 -L 会连完整回归与 aux 一起跑）
+ctest --test-dir build -L daily --output-on-failure
 
 # 4. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
 ./tcc/c6 -B tcc -run hello.c6   # c6 代码放在 .c6 文件里，后缀就是开关
 
-# 5. 提交前验证：一条命令跑完整回归（最慢的一条，见「构建与验证」）
-cmake --build build --target check-all
+# 5. 提交前验证：完整回归矩阵（排除 aux 辅助用例），并发度由 -j 指定
+ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure
 ```
 
-`cmake -S . -B build` 取代了原来的 `scripts/bootstrap.sh`：它在 `tcc/` 里跑一次
-`configure`，把安装目录与编译开关全部从 c6 侧传进去，并把参数记进签名戳；参数变化
-时先清掉旧目标文件再重配。`tcc/` 里的 `configure` 与 `Makefile` 一行都没改。
+`cmake -S . -B build` 通过 `add_subdirectory(tcc)` 直接使用 `tcc/CMakeLists.txt`：它按上游
+`tcc/configure` 的规则在构建目录生成 `config.mak` / `config.h` / `config.texi`，把安装目录
+与编译开关全部从 c6 侧传进去。配置阶段对源码树零写入；构建阶段的 `tcc-config`
+目标每次比对生成目录与 `tcc/` 的配置，发现变化（包括被另一个构建目录覆盖）才
+同步并清掉旧目标文件。旧的 `scripts/bootstrap.sh` 已移除，`tcc/configure` 与
+`tcc/Makefile` 源码一行都没改。
 
 ### 构建、测试与安装
 
-CMake 是仓库唯一的构建入口。根 `Makefile` 不再是构建系统，它只定义完整回归矩阵
-（130+ 个 `std-*`、freestanding、自举等用例）：配置阶段 CMake 会扫描它，为其中每个
-目标生成同名的 CMake target，先构建好 `tcc/c6` 再让 make 只负责跑用例。
-`scripts/` 里的 wasm 脚本由 CMake 直接调用，`bootstrap.sh` 仅作为兼容脚本保留。
+CMake 是仓库唯一的构建入口，CTest 是唯一的测试调度器，根 `Makefile` 已移除。
+完整回归矩阵（91 个 `std-*`、freestanding、自举等用例）的实现放在
+`tests/regression.sh`（纯 shell，没有 make 语法）：配置阶段 CMake 扫描脚本里的用例
+分支，注册为同名 CTest 测试，标签、超时、并发互斥、日志和失败重跑都由 CTest
+负责；同名构建目标仍然保留，但只是转发给 `ctest -R` 的兼容入口。也可以直接
+`./tests/regression.sh std-demo` 单独跑一个用例。
+`scripts/` 里的 wasm 脚本由 CMake 直接调用；原先的 `bootstrap.sh` 已移除。
 
-所有编译参数都从 c6 侧传进去（configure 的安装目录与开关、make 的 `EXTRA-DEFS` /
-`CFLAGS` / `VAR=...`）。`tcc/` 里唯一新增的是 configure 自己生成的 `config.mak`、
-`config.h` 及构建产物，本来就在 `tcc/.gitignore` 里。
+CTest 常用命令：
+
+```sh
+ctest --test-dir build -L daily --output-on-failure              # 日常 5 个
+ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure # 完整回归门禁
+ctest --test-dir build -L aux --output-on-failure               # 4 个辅助用例
+ctest --test-dir build -R '^std-demo$' --output-on-failure      # 单个用例
+ctest --test-dir build --rerun-failed --output-on-failure       # 只重跑失败项
+```
+
+标签：`daily`、`regression`、`core`、`std`、`parallel`、`aux`、`source-tree`、
+`selfhost`、`freestanding`、`backend`、`tests2`。`aux` 的 4 个用例
+（`check-tcc` / `ubcheck` / `safegate` / `bench-async`）不属于任何分组清单，
+不进 `check-all` / `test-all`，用 `check-aux` 单独跑。日志在
+`build/Testing/Temporary/`。
+
+所有编译参数都从 c6 侧传进去（安装目录与 `CONFIG_x=y` 开关、`EXTRA-DEFS` /
+`CFLAGS` / `VAR=...`）。`tcc/` 里新增的是 `tcc/CMakeLists.txt` 与 `tcc/cmake/` 下的
+两个模板（配置层），以及由它们生成的 `config.mak` / `config.h` / `config.texi` 和
+构建产物；生成文件本来就在 `tcc/.gitignore` 里。
 
 ```sh
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -L daily --output-on-failure
 DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 DESTDIR
 ```
 
-注意：`tcc/configure` 会把 `--tccdir` 等绝对路径编进 `config.h`（`CONFIG_TCCDIR`），
-共享库还会烤入 rpath。`cmake --install --prefix=...` 只改变文件落点，改不了二进制里的
-路径；要换安装前缀，得重新 `cmake -S . -B build -DCMAKE_INSTALL_PREFIX=...` 再
-`cmake --build build`。生成的 `c6Config.cmake` / `c6.pc` 本身是可重定位的。
+注意：配置阶段会把 `TCC_INSTALL_TCCDIR` 等绝对路径写进 `config.h`
+（`CONFIG_TCCDIR`），共享库还会烤入 rpath。`cmake --install --prefix=...` 只改变文件
+落点，改不了二进制里的路径；要换安装前缀，得重新
+`cmake -S . -B build -DCMAKE_INSTALL_PREFIX=...` 再 `cmake --build build`。生成的
+`c6Config.cmake` / `c6.pc` 本身是可重定位的。
 
-可从 c6 侧传入的参数（都不用改 `tcc/`）：
+可从 c6 侧传入的参数（都不用改 `tcc/` 的 `configure` / `Makefile`）：
 
 | 参数 | 默认 | 作用 |
 | --- | --- | --- |
 | `C6_ENABLE_EXT` | `ON` | 传 `EXTRA-DEFS=-DC6_EXT`；`OFF` 等价于 `cmake --build build --target build-plain` |
 | `C6_EXTRA_DEFS` | 空 | 追加宏，例如 `-DC6_FOO` |
 | `C6_TCC_CFLAGS` | `-g -O0 -Wall -Wno-unused-result` | `tcc/Makefile` 的 `CFLAGS` |
-| `C6_TCC_CC` | `CMAKE_C_COMPILER` | `configure --cc` |
-| `C6_TCC_SHARED_LIBTCC` | `OFF` | `configure --disable-static`，产出 `libtcc.so` |
-| `C6_TCC_CONFIGURE_ARGS` | 空 | 追加 configure 参数，分号分隔，最后传入可覆盖默认值 |
+| `C6_TCC_CC` | `CMAKE_C_COMPILER` | 写进 `config.mak` 的 `CC` |
+| `C6_TCC_SHARED_LIBTCC` | `OFF` | 写进 `CONFIG_static=no`，产出 `libtcc.so` |
+| `C6_TCC_CONFIG_VARS` | 空 | 追加 `CONFIG_x=y` 配置变量，分号分隔，写进 `config.mak` |
 | `C6_TCC_MAKE_ARGS` | 空 | 追加 make 变量，分号分隔，如 `ONE_SOURCE=yes;SILENT=yes` |
-| `C6_TCC_JOBS` | CPU 核数 | 子 make 的 `-j` |
+| `C6_TCC_JOBS` | CPU 核数 | 非 Makefile 生成器下子 make 的 `-j`；Makefile 生成器用 `$(MAKE)` 继承 jobserver |
 | `C6_INSTALL_TCCDIR` | `<libdir>/tcc` | 运行时库（`libtcc1.a`）目录 |
 | `C6_INSTALL_DOCDIR` | `<datarootdir>/doc/tcc` | 文档目录 |
 | `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
 | `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
-| `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 转发给回归矩阵的原 `HOSTCC` / `SELFTEST` / `ERRBASE` |
-| `C6_CHECK_JOBS` / `C6_LEGACY_MAKE_VARS` | 空 | `check-all` 并发数；额外转发给回归矩阵的 `VAR=值` |
+| `BUILD_TESTING` | `ON` | 是否注册 CTest 测试；打包构建可设 `OFF` |
+| `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 注入回归用例脚本的宿主编译器与测试脚本路径 |
+| `C6_CHECK_JOBS` | 空（= `C6_TCC_JOBS`） | `check-all` / `test-all` 的 CTest `-j` 并发度 |
 | `C6_LLVMCC` / `C6_LLVMAR` / `C6_NODE` / `C6_WASM_TRIPLE` | 空 | wasm 目标的工具链与 triple（留空交给脚本探测） |
 | `C6_PACKAGE_RELEASE` / `C6_PACKAGE_PRERELEASE` | `1` / 自动 | DEB/RPM 的 Release 与预发布标记 |
 
-`tcc/` 是树内构建，同一时间只有一套配置生效：换了 `configure` 参数（或另建一个
-参数不同的构建目录）时，CMake 会先清掉 `tcc/` 的旧目标文件再全量重编，避免
-`libtcc.a` / `libtcc.so` 混用非 `-fPIC` 的目标文件。
+`tcc/` 是树内构建，同一时间只应有一个 CMake 构建目录：`tcc-config` 在每次
+构建时比对生成目录与 `tcc/` 里的 `config.mak` / `config.h` / `config.texi`，
+并用 `config.sig`（覆盖只走 make 命令行的 `EXTRA-DEFS` / `CFLAGS` 等参数）
+记录上次应用的签名；任一变化就同步配置并清掉旧目标文件，避免 `libtcc.a` /
+`libtcc.so` 混用非 `-fPIC` 的目标文件。`config.mak` 里的 `# c6-build-dir:`
+让第二个构建目录在配置阶段就收到警告，构建期也会自动把配置同步回来。
+配置期仍对源码树零写入、不需要手写哈希戳。
 
-`cmake --build build --target build-plain` 是上游模式；`--target bootstrap` 重新跑
-configure；`--target c6-clean` 清构建产物，`--target clean-all` 连 configure 结果一起清
-（之后再重新 `cmake -S . -B build`）。`--target c6-help` 打印常用命令与用例清单，
-`--target help` 列出全部 CMake target。
+`cmake --build build --target build-plain` 是上游模式；配置参数变化只需重跑
+`cmake -S . -B build`（没有单独的重新配置目标）。`--target c6-clean` 清构建产物，
+`--target clean-all` 连生成的 `config.mak` / `config.h` 一起清（之后再重新
+`cmake -S . -B build`）。`--target c6-help` 打印常用命令与用例清单，`--target help`
+列出全部 CMake target。
 
-回归矩阵的每个用例都有同名 CMake target，例如
-`cmake --build build --target std-util`、`--target fstest-bare-smp`、
-`--target check-all`。这些目标用 `make -o build` 跳过重编，直接复用 CMake 构建好的
-编译器；clang / node / qemu 这类可选工具缺失时，对应用例会跳过或明确报错，不会
-自动安装。
+回归矩阵的每个用例都是同名 CTest 测试，例如
+`ctest --test-dir build -R '^std-util$'`、`-R '^fstest-bare-smp$'`，聚合门禁用
+`-L regression -LE aux -j N`（4 个 aux 用例由 `check-aux` 单独跑）。同名 CMake
+target 仍保留为兼容薄壳。每个用例有独立的 `build/tests/<用例>/` 输出目录，
+因此整组可以并发；只有三组用 CTest 的 `RESOURCE_LOCK` 互斥：fstest（内部递归
+调用）、tests2（写源码树临时产物）、source-tree（5 个被测程序写死相对 CWD 的
+`build/...` 路径）。clang / node / qemu 这类可选工具缺失时，对应用例会跳过或
+明确报错，不会自动安装。
 
 安装后同时提供两套库配置，供下游工程直接消费 `libtcc`：
 
@@ -195,12 +228,14 @@ cpack --config build/CPackConfig.cmake -G RPM -B packages  # 需要 rpmbuild
 ```
 
 `cmake --build build --target check-install` 会把安装树装进
-`build/check-install/stage`，再用其中的 `c6Config.cmake` 编译运行一个
-`find_package(c6)` 消费方，并用 `pkgconf` 校验 `c6.pc`；CI 每次构建都会跑这一条。
+`build/check-install/stage`，逐项核对安装清单，用装出去的 `c6 -B` 编译运行程序，
+再用其中的 `c6Config.cmake` 编译运行一个 `find_package(c6)` 消费方（含版本负例），
+并用 `pkgconf` 校验 `c6.pc` 的 prefix 随 DESTDIR 重定位；CI 每次构建都会跑这一条。
 
 GitHub Actions（`.github/workflows/ci.yml`）在 push / PR 上做两版 Ubuntu × 静态/共享
-`libtcc` 的编译、CTest 与安装校验，并产出三种包；手动触发 `full_regression` 时额外
-跑 `check-all`；打 `v*` tag 时把包与 `SHA256SUMS` 发布到 GitHub Release。
+`libtcc` 的编译、CTest daily 与安装校验，并产出三种包；手动触发 `full_regression`
+或打 `v*` tag 时跑完整回归（CI 补齐 qemu/clang/go 依赖，避免用例静默跳过）。
+发布 job 的 `needs` 包含 `regression`，回归不通过不会发 Release。
 
 ### Arch Linux 安装
 
@@ -222,15 +257,20 @@ yay -Syu c6
 │   ├── design/         设计文档与实现说明：讲为什么这么做
 │   ├── history/        实施记录与状态：讲做到哪一步了
 │   └── stdlib.md       标准库 std/ 的设计、API 与写法约定
-├── scripts/            wasm 辅助脚本；bootstrap.sh 仅作兼容脚本（功能已并入 CMake）
+├── scripts/            wasm 辅助脚本（build-wasm-runtime.sh / wasm-smoke.sh）
 ├── std/                标准库：一个文件一个 module（std/container/vec.c6 -> std.container.vec）
-├── tests/              c6 全部自测：test 块、编译期诊断、上游 tests2
+├── tests/              c6 全部自测：test 块、编译期诊断、上游 tests2；
+│                       regression.sh 是回归用例实现，调度交给 CTest
 ├── examples/           可运行示例：每个特性一个 *_demo.c6，wordcount 是集成示例
-├── CMakeLists.txt      CMake 唯一构建入口：配置/编译/安装/测试/回归/打包
-├── cmake/              c6Config / c6Targets / c6.pc / CPack 与安装期脚本
+├── CMakeLists.txt      构建入口：只按顺序 include cmake/ 下的模块
+├── cmake/              C6Options / C6Tcc / C6Build / C6Install /
+│                       C6LibraryConfig / C6Wasm / C6UtilityTargets /
+│                       C6CheckInstall / C6Testing / C6Packaging，
+│                       以及 c6Config / c6Targets / c6.pc 模板与 C6Help.txt
 ├── .github/workflows/  GitHub Actions：编译测试、DEB/RPM/TGZ 打包与发布
-├── Makefile            回归矩阵定义（不再是构建入口；同名目标由 CMake 自动生成）
-└── tcc/                TCC 源码树：上游基线 + 每个 c6 补丁一个提交（不改动）
+└── tcc/                TCC 源码树：上游基线 + 每个 c6 补丁一个提交；
+                        CMakeLists.txt 与 cmake/ 模板是新增的配置层，
+                        导出 tcc::c6 / tcc::libtcc；configure / Makefile 源码不改动
 ```
 
 ## 文档地图
@@ -255,18 +295,20 @@ yay -Syu c6
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build --parallel                  # 扩展模式（EXTRA-DEFS=-DC6_EXT）
 cmake --build build --target build-plain       # 上游模式（不定义 C6_EXT）
-ctest --test-dir build --output-on-failure     # 5 个 CTest 用例
+ctest --test-dir build -L daily --output-on-failure # 只跑 5 个日常用例
 cmake --build build --target test-all          # selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
-cmake --build build --target check-all         # 再加 errcheck、C99 后端、三条自举路线（发布前跑这一条）
+cmake --build build --target check-all         # 全部回归门禁用例（发布前跑这一条）
 cmake -S . -B build -DC6_CHECK_JOBS=1 && cmake --build build --target check-all  # 整轮串行
+cmake --build build --target check-aux         # 4 个 aux 用例
 cmake --build build --target check-install     # 校验装出去的 CMake / pkgconf 库配置
 cmake --build build --target c6-help           # 常用命令与用例清单
 ```
 
-`ctest` 的 5 个用例是 `c6-selftest`、`c6-errcheck`、`c6-tests2`、
-`c6-c99-selftest`、`c6-c99tcc-selftest`；只想跑上游 tests2 用
-`ctest --test-dir build -R c6-tests2`。`cmake --build build --target check-all` 里共享
-`build/` 固定路径的 `std-*` 家族整组串行，其余目标并发跑。完整目标清单用
+`ctest --test-dir build -L daily` 的 5 个用例是 `c6-selftest`、`c6-errcheck`、
+`c6-tests2`、`c6-c99-selftest`、`c6-c99tcc-selftest`；只想跑上游 tests2 用
+`ctest --test-dir build -R c6-tests2`。不加 `-L` 会连 114 个回归用例（含 4 个
+`aux`）一起跑。`check-all` 排除 `aux`，并让 fstest / tests2 / source-tree 三组
+用例按 `RESOURCE_LOCK` 串行，其余全并发。完整目标清单用
 `cmake --build build --target help` 查看。
 
 构建标志（`-DC6_EXT`、`CFLAGS`）记在 `tcc/.c6-flags` 里，所有目标文件都依赖它：

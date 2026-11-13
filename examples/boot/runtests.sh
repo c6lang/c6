@@ -3,8 +3,8 @@
 # 入口（harness.py）、一层 libc 替身（shim.c）和两个 outb（io.c），由
 # boot.S 那个 512 字节引导器拉起来，qemu-system-x86_64 当空机器。
 #
-#   make fstest-bare-tests          # 有 KVM 用 KVM
-#   NO_KVM=1 make fstest-bare-tests # 纯软件模拟
+#   cmake --build build --target fstest-bare-tests          # 有 KVM 用 KVM
+#   NO_KVM=1 cmake --build build --target fstest-bare-tests # 纯软件模拟
 #   BARE_BUILD=build/bare/tests examples/boot/runtests.sh  # 换产物目录（默认 build/）
 #
 # 跳过的几个：它们要的东西裸机上真没有（不是运行时不行，是测试自己要用）

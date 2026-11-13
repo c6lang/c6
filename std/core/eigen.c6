@@ -28,7 +28,7 @@
  *   所以「先 jacobi 再 power」应该另建一个 `Eigen` 实例（`init` 会重新拷贝原矩阵），
  *   否则等于在对角阵上迭代，只会得到某个对角元的绝对值；
  * - `e.sweeps()` 扫掠次数，`e.dim()` 阶数，`e.converged()`；
- * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <string.h>

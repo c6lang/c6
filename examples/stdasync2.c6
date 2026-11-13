@@ -1,6 +1,6 @@
 /* examples/stdasync2.c6 —— 第七十三批（基于 async 再往上盖一层）的集成示例。
  *
- *     make std-async2
+ *     cmake --build build --target std-async2
  *
  * 四节：Executor 主循环、Asio 按行异步读、Retry 退避、AwaitGroup 完成计数。
  */

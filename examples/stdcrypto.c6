@@ -5,7 +5,7 @@
  *
  * 这批是**纯计算**：没有 socket、没有文件、没有时钟依赖，所有期望值都来自
  * RFC 向量（RFC 1321 / FIPS 180-4 / RFC 4231 / RFC 5869 / RFC 6070），所以
- * `make std-crypto` 在任何平台都给出同一串输出。
+ * `cmake --build build --target std-crypto` 在任何平台都给出同一串输出。
  *
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *

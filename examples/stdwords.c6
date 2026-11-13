@@ -1,6 +1,6 @@
 /* examples/stdwords.c6 —— 第四十六批（文本变换）的集成示例。
  *
- *     make std-words
+ *     cmake --build build --target std-words
  *
  * 四节：slug 化标题、五种命名风格互转、罗马数字往返、发音编码（Soundex /
  * 简化 Metaphone）。

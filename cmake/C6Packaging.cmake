@@ -1,6 +1,8 @@
-# CPack：c6 的 TGZ / DEB / RPM 打包配置。
+# C6Packaging：c6 的 TGZ / DEB / RPM 打包配置。
 # 由 CMakeLists.txt 在 install() 规则之后 include；CPack 会复用同一套
 # install() 清单，所以包内容与 `cmake --install` / AUR PKGBUILD 完全一致。
+# 文件名刻意不叫 CPack.cmake：避免与 CMake 内置的 CPack 模块同名，在
+# CMAKE_MODULE_PATH 包含本目录时造成 include(CPack) 的歧义。
 #
 #   cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
 #   cmake --build build --parallel
@@ -47,20 +49,35 @@ string(CONCAT CPACK_PACKAGE_DESCRIPTION
 set(CPACK_RESOURCE_FILE_LICENSE "${C6_TCC_DIR}/COPYING")
 set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
 
-# install() 用的是相对 prefix 的路径，包内一律以 /usr 为根。
-set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+# install() 用的是相对 prefix 的路径，包内根必须与配置时一致，否则
+# DESTDIR / CPack 会把文件装到与 c6Config.cmake 记录的不同前缀下。
+set(CPACK_PACKAGING_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
+
+# 把 prerelease 与 Release 编入公共文件名：TGZ 直接拿它当最终产物名，
+# DEB / RPM 则用它命名各自的 staging 目录，三种生成器互不覆盖，CI 注入的
+# 构建号也能在产物名上区分。
+set(_c6_pkg_tag "${CPACK_PACKAGE_VERSION}")
+if(C6_PACKAGE_PRERELEASE)
+  string(APPEND _c6_pkg_tag "~${C6_PACKAGE_PRERELEASE}")
+endif()
 set(CPACK_PACKAGE_FILE_NAME
-    "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_PROCESSOR}")
+    "${CPACK_PACKAGE_NAME}-${_c6_pkg_tag}-${C6_PACKAGE_RELEASE}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_PACKAGE_CHECKSUM "SHA256")
 
 # 默认只开 TGZ，避免本机没有 rpmbuild/dpkg-shlibdeps 时 `cpack` 直接失败；
 # CI 用 `cpack -G DEB` / `-G RPM` 显式覆盖。
 set(CPACK_GENERATOR "TGZ" CACHE STRING "cpack 默认生成器，分号分隔")
 set(CPACK_SOURCE_GENERATOR "TGZ")
+# 源码包不能带上一次构建留下的产物：除了 config.*，还要排除 tcc/Makefile
+# 生成的 c6 / libtcc* / libtcc1.a / 文档 / .o 以及测试留下的 core dump。
 set(CPACK_SOURCE_IGNORE_FILES
     "/\\\\.git/" "/build/" "/build-.*/" "/packages/" "/stage/"
     "/tcc/config\\\\.mak$" "/tcc/config\\\\.h$" "/tcc/\\\\.c6-"
-    "/\\\\.o$" "/\\\\.a$" "/\\\\.so" "/\\\\.dylib$" "/\\\\.exe$")
+    "/tcc/c6$" "/tcc/libtcc\\\\.(a|so|dylib)" "/tcc/libtcc1.*\\\\.a$"
+    "/tcc/config\\\\.texi$" "/tcc/tcc\\\\.1$"
+    "/tcc/tcc-doc\\\\.(info|html)$"
+    "/\\\\.o$" "/\\\\.a$" "/\\\\.so" "/\\\\.dylib$" "/\\\\.exe$"
+    "/\\\\.core$" "/bench/async/.*/target/")
 
 # ---------------------------------------------------------------------------
 # DEB
@@ -73,6 +90,9 @@ else()
 endif()
 set(CPACK_DEBIAN_PACKAGE_VERSION "${_c6_deb_version}")
 set(CPACK_DEBIAN_PACKAGE_RELEASE "${C6_PACKAGE_RELEASE}")
+# 用 CPack 的规范命名（<name>_<version>-<release>_<arch>.deb），而不是
+# 复用给 TGZ 用的 CPACK_PACKAGE_FILE_NAME。
+set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "taotieren <admin@taotieren.com>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
@@ -107,6 +127,8 @@ else()
   set(_c6_rpm_release "${C6_PACKAGE_RELEASE}")
 endif()
 set(CPACK_RPM_PACKAGE_RELEASE "${_c6_rpm_release}")
+# 同样交给 CPack 生成 <name>-<version>-<release>.<arch>.rpm。
+set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 set(CPACK_RPM_PACKAGE_LICENSE "LGPL-2.1-or-later")
 set(CPACK_RPM_PACKAGE_GROUP "Development/Tools")
 set(CPACK_RPM_PACKAGE_URL "${CPACK_PACKAGE_HOMEPAGE_URL}")

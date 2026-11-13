@@ -1,6 +1,6 @@
 /* examples/stddocs.c6 —— 第八十九批（文档与邮件：单复数 / mbox / KDL / RTF）。
  *
- *     make std-docs
+ *     cmake --build build --target std-docs
  *
  * 五节，全部方法调用（`p.count_str(...)`、`d.next(&m)`、`hd.get_header(...)`）：
  *   1. plural：计数短语（1 file / 3 files / 2 children）；

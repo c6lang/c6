@@ -1,6 +1,6 @@
 /* examples/stdproto4.c6 —— 第八十七批（发现与配置协议：SSDP / DHCP / CoAP + 文本折叠）。
  *
- *     make std-proto4
+ *     cmake --build build --target std-proto4
  *
  * 五节，全部走方法调用（`b.start(...)`、`d.next(&o)`、`t.put(...)`）：
  *   1. CoAP：构造 GET /temp、解析回来、选项游标与码点格式化；

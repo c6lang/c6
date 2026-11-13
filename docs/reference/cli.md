@@ -2,7 +2,7 @@
 
 > **状态**：现行参考 · **索引**：[文档索引](../README.md) · **测试细节**：[manual/testing.md](../manual/testing.md) · **C99 后端**：[c99-backend.md](c99-backend.md)
 >
-> 一句话：编译器 `tcc/c6` 的选项速查 + `Makefile` 全部目标。**语言开关不是选项**，
+> 一句话：编译器 `tcc/c6` 的选项速查 + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
 > 是源文件后缀 `.c6`；`-std=c6` 已删除，传了会直接报错。
 
 ## 编译器选项
@@ -53,21 +53,30 @@
 ./tcc/c6 -B tcc -o out.c prog.c6 && cc -std=c99 -o prog out.c   # C99 后端
 ```
 
-## CMake 构建目标
+## CMake 构建目标与 CTest 用例
 
-`cmake --build build --target c6-help` 打印常用命令与这份用例清单；`--target help`
-列出全部 CMake target。回归矩阵的每个用例都有同名 target，分组按「你此刻想干什么」。
+`cmake --build build --target c6-help` 打印常用命令；`--target help` 列出全部
+CMake target。测试由 CTest 统一调度：每个回归用例注册为同名 CTest 测试，用
+`ctest --test-dir build -R '^<用例名>$' --output-on-failure` 跑单个，用
+`-L daily` / `-L regression -LE aux -j N` / `-L std -j 1` 跑聚合。标签、超时、
+并发互斥、日志与失败重跑都由 CTest 负责；同名 CMake target 仍保留，但只是
+转发给 `ctest -R` 的兼容薄壳，语义与直接跑 CTest 完全一致（`BUILD_TESTING=OFF`
+时同名目标改为打印提示）。**只有回归用例能换成 `ctest -R`**：`build-plain`、
+`test-plain`、`c6-clean` 这类构建/清理动作没有对应的 CTest 用例，`test` 也是
+CMake 内置目标。
+
+分组按「你此刻想干什么」。
 
 ### 构建
 
 | 目标 | 作用 |
 |---|---|
-| `cmake -S . -B build` | 首次配置 `tcc/`（参数变化才重跑 configure，不联网） |
+| `cmake -S . -B build` | 在构建目录生成 `config.mak` / `config.h` / `config.texi`（配置期对源码树零写入；构建期 `tcc-config` 每次比对并按需同步、清理旧目标文件，不联网） |
 | `cmake --build build` | 扩展模式构建（`EXTRA-DEFS=-DC6_EXT`），产物 `tcc/c6` |
 | `cmake --build build --target build-plain` | 上游模式构建（不定义 `C6_EXT`），用来验证「扩展关闭零行为变化」 |
 | `cmake --build build --target check-tcc` | 检查 `tcc/` 源码是否完整 |
 | `cmake --build build --target c6-clean` | 清理构建产物与自举产物 |
-| `cmake --build build --target clean-all` | 连 `configure` 结果一起清理（不删源码，之后要重新 configure） |
+| `cmake --build build --target clean-all` | 连生成的 `config.mak` / `config.h` 一起清理（不删源码，之后要重新 `cmake -S . -B build`） |
 
 模式由 `-DC6_ENABLE_EXT=ON/OFF` 决定；`mode-ext` / `mode-plain` 这两个同名目标现在
 只打印重新配置的提示，不再往 `tcc/` 写 `.c6-mode` 并清理产物。
@@ -80,6 +89,13 @@
 槽位 —— 典型症状是任何输入都报 `tcc: error: no input files`。所以别手工删一部分
 产物来「加快」构建，`cmake --build build --target c6-clean` 才是正确的清理方式。
 
+此外 `tcc/CMakeLists.txt` 在构建目录生成 `tcc/generated/config.sig`，记录
+`EXTRA-DEFS` / `CFLAGS` / 额外 make 变量与 `CONFIG_*`：`tcc-config` 每次构建
+拿它和 `config.applied` 比较，这些只走 make 命令行、不写进 `config.mak` 的
+参数一变也会清掉旧目标文件。`config.mak` 里的 `# c6-build-dir:` 记录所属
+构建目录；检测到别的构建目录留下的配置时，配置阶段给出警告、构建阶段比对
+后自动同步回来（产物落在源码树，不能并行共用）。
+
 ### 测试与回归
 
 | 目标 | 作用 |
@@ -88,8 +104,9 @@
 | `cmake --build build --target test-plain` | 关闭扩展重建后跑同一套上游测试 |
 | `cmake --build build --target selftest` | `tests/` 下全部 c6 自测（test 块 + 编译期诊断） |
 | `cmake --build build --target errcheck` | `errbase.def` 本身与 C126–C128 的检查 |
-| `cmake --build build --target test-all` | `selftest` + `test` + `c6selfcheck` + 标准库 + freestanding/裸机 |
-| `cmake --build build --target check-all` | **提交/发布前跑这一条**：`test-all` + `errcheck` + C99 后端两套 + 三条自举路线；只把共享 `build/` 下固定临时路径的 std 家族整组串行（`check-std-serial`），其余目标并发跑。`-DC6_CHECK_JOBS=1` 则整轮串行 |
+| `cmake --build build --target test-all` | `selftest` + `test` + `c6selfcheck` + 标准库 + freestanding/裸机（等价于 `ctest --test-dir build -L core -j N`） |
+| `cmake --build build --target check-all` | **提交/发布前跑这一条**：全部回归门禁用例（等价于 `ctest --test-dir build -L regression -LE aux -j N`）；每用例独占 `build/tests/<用例>/`，整组并发，fstest / tests2 / source-tree 三组用 `RESOURCE_LOCK` 互斥。`-DC6_CHECK_JOBS=1` 则整轮串行 |
+| `cmake --build build --target check-aux` | 单独跑 4 个 `aux` 用例（`check-tcc` / `ubcheck` / `safegate` / `bench-async`）；`bench-async` 需要 g++/rustc/go |
 
 ### 标准库
 
@@ -142,16 +159,32 @@
 | `cmake --build build --target c99selfhost-tcc` | 同上，但生成的 C 也由 tcc 自己编（不需要 gcc） |
 
 三条自举路线都会做 bootstrap fixpoint 比对，再用最终编译器编并运行一个小程序；
-产物在 `build/selfhost/`（`cmake --build build --target c6-clean` 一起删）。
+产物在各自的 `build/tests/<用例>/selfhost/`（`cmake --build build --target c6-clean`
+一起删）。
 
 ## 环境变量
 
+构建期的并行度、CFLAGS、宿主编译器都是 `cmake -S . -B build -D...` 的 cache
+参数，完整清单见 README 的参数表；常用的几个：
+
+| CMake 参数 | 默认 | 作用 |
+|---|---|---|
+| `C6_TCC_JOBS` | CPU 核数 | 非 Makefile 生成器下子 make 的 `-j` |
+| `C6_TCC_CFLAGS` | `-g -O0 -Wall -Wno-unused-result` | 构建 tcc 的 `CFLAGS` |
+| `C6_HOSTCC` | `gcc` | 自举 / `c6selfcheck` 的宿主编译器 |
+| `C6_CHECK_JOBS` | 空（= `C6_TCC_JOBS`） | `check-all` / `test-all` 的 CTest `-j` |
+| `C6_LLVMCC` / `C6_LLVMAR` / `C6_NODE` / `C6_WASM_TRIPLE` | 空 | wasm 目标的工具链与 triple |
+
+运行时变量由 `cmake/C6Testing.cmake` 通过 CTest 的 `ENVIRONMENT` 注入；脚本里
+都有同名默认值，单独运行 `tests/regression.sh <用例>` 也能工作：
+
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `JOBS` | `nproc` | 并行构建的作业数 |
-| `CFLAGS` | `-g -O0 -Wall -Wno-unused-result` | 构建 tcc 的 CFLAGS |
-| `HOSTCC` | `gcc` | 宿主 C 编译器 |
-| `C99CC` | `gcc` | `cmake --build build --target c99test` 用的宿主编译器（`C99CC=clang` 也行；`cmake --build build --target c99tcc-test` 用 `tcc/c6`） |
+| `C6_CASE_OUT` | 单独运行时 `build/` | 每用例独立输出目录（`build/tests/<用例>/`） |
+| `C6_TCC_DIR` / `C6_MAKE` | `tcc` / `make` | 编译器目录与 make 可执行文件 |
+| `C6_SELFHOST` / `C6_BARE` / `C6_TMP` | `<C6_CASE_OUT>/{selfhost,bare,tmp}` | 自举、裸机与临时产物目录 |
+| `TCC` / `C99TCC` | `tcc/c6` | `tests/run-tests.sh` 用的编译器 |
+| `BACKEND` | `native` | `native` / `c99` / `llvm` |
+| `C99CC` | `gcc` | C99 后端的宿主编译器（`clang` 也行） |
 | `C99FLAGS` | gcc 的一整套严格开关 | 编译生成 C 的开关（换成 tcc 时自动去掉 gcc 专有开关） |
-| `LLVMCC` | `clang` | `wasmrt` / `wasmtest` / 交叉目标用的 LLVM 编译器 |
-| `WASM_TRIPLE` | `wasm32-unknown-unknown` | 交叉目标三元组 |
+| `LLVMCC` / `LLVMFLAGS` | `clang` / `-fuse-ld=lld` | LLVM 后端的编译器与链接开关 |

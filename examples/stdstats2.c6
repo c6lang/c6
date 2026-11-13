@@ -1,6 +1,6 @@
 /* examples/stdstats2.c6 —— 第六十四批（统计小工具）的集成示例。
  *
- *     make std-stats
+ *     cmake --build build --target std-stats
  *
  * 四节：直方图分箱、滑动平均（SMA/EMA）、序列统计（均值/标准差/相关）、
  * 分位数与四分位。全部用**方法**（`h.add`、`m.push`、`a.mean`、`q.compute`）。

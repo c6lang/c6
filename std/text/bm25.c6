@@ -25,7 +25,7 @@
  *   平均长度为 0 时按 1 处理，避免除零；
  * - `m.docs()` 篇数，`m.avgdl()` 平均长度，`m.total_len()` 总长度，
  *   `m.k1()`/`m.b()` 读参数；
- * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <string.h>

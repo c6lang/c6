@@ -1,7 +1,7 @@
 /* 托管引用（引用计数 GC）用法演示
  *
  * 编译运行（在仓库根目录）：
- *   make build
+ *   cmake --build build
  *   ./tcc/tcc -B tcc -run examples/gc_demo.c6
  *
  * 四种限定符：

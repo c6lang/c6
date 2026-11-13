@@ -1,6 +1,6 @@
 /* examples/stdcreds.c6 —— 第五十五批（凭据与配置）的集成示例。
  *
- *     make std-creds
+ *     cmake --build build --target std-creds
  *
  * 四节：netrc 凭据、ssh config（主机匹配 + 选项）、公钥行、crontab。
  * 全部用**结构体方法**调用（`doc.open(...)` / `doc.next(&x)` / `doc.match(...)`）。

@@ -12,7 +12,7 @@
  *   - httpc：本地 TCP「HTTP 服务器」（子进程）上的一次 chunked 响应。
  *
  * 两个子进程都用 `fork` 起（示例是 POSIX 程序），不联外网、不依赖 DNS 服务器：
- * 所有流量都在 127.0.0.1 上，所以 `make std-client` 在离线环境里也能跑。
+ * 所有流量都在 127.0.0.1 上，所以 `cmake --build build --target std-client` 在离线环境里也能跑。
  *
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *
