@@ -1,6 +1,6 @@
 /* examples/stdgraph2.c6 —— 第七十七批（图算法进阶）的集成示例。
  *
- *     make std-graph2
+ *     cmake --build build --target std-graph2
  *
  * 四节：最小生成树（Kruskal 与 Prim 互验）、最大流（Edmonds-Karp）、强连通分量
  * （Tarjan）、二分图最大匹配（Kuhn）。

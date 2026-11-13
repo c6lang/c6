@@ -597,7 +597,7 @@ freestanding 那一套（`libtcc1` 的外部依赖全是 weak，缺 `calloc`/`me
 摊平 payload；`objcopy -O binary` 以最低**节**地址为基准，会让镜像整体错位
 0x498 字节）、`main.c6`（c6 程序本体，输出就是两条 `outb`）。
 
-`make fstest-bare` 在 `qemu-system-x86_64` 上空机器启动（有 `/dev/kvm` 就
+`cmake --build build --target fstest-bare` 在 `qemu-system-x86_64` 上空机器启动（有 `/dev/kvm` 就
 KVM，否则 TCG），断言全过时 payload 往 0x501 写 0，qemu 退出码 1；失败时
 打印 `bare metal: FAILED`、退出码非 1。踩过的坑：长模式下不开 `CR4.OSFXSR`
 的话 payload 第一条 `movq %xmm0` 就 `#UD`；引导扇区必须正好 512 字节且以
@@ -610,7 +610,7 @@ KVM，否则 TCG），断言全过时 payload 往 0x501 写 0，qemu 退出码 1
 `__c6_co_run()` 返回 -1（不会链接失败）。`examples/boot/main.c6` 的裸机用例
 覆盖了交错的两个顶层 `co`、循环里的 `await`、失败任务计数和 `c6_io` 的失败路径。
 
-`make fstest-bare-tests` 把 `tests/*.c6` 的 test 块搬上裸机：35 个文件、全部
+`cmake --build build --target fstest-bare-tests` 把 `tests/*.c6` 的 test 块搬上裸机：35 个文件、全部
 test 块、0 失败，每个文件一个镜像（`examples/boot/runtests.sh`）。test 块到
 `__tcc_test_<n>` 的对应表只存在编译器状态里，二进制里没有，所以由
 `examples/boot/harness.py` 按源码顺序扫出来生成入口；libc 那层由
@@ -631,7 +631,7 @@ arena 不够（给 calloc/free/realloc 就好）；`select` 要把 0/1/2 当永�
 中断进来先换到调度器自己的栈（`istack`），把现场摆成一块 160 字节的
 `struct Frame`（15 个通用寄存器 + `rip/cs/rflags/rsp/ss`），换任务 = 换块
 Frame；新任务的帧是编出来的，第一次被调度时 `iretq` 直接落进 `task_entry`。
-对 `libtcc1` 暴露的就那 8 个 `pthread_*` 弱符号。`make fstest-bare-go` 里
+对 `libtcc1` 暴露的就那 8 个 `pthread_*` 弱符号。`cmake --build build --target fstest-bare-go` 里
 两个**没有让出语句**的任务互相等 flag，空转 400 万次（上限 2 亿）就看到对方
 立起来的 flag —— 顺序执行得把 2 亿次跑完，所以这是真的被时钟抢占交错了。
 
@@ -644,7 +644,7 @@ CPU 压了几个得看机器 —— 这台（KVM）压五个，被打断的 `rsp
 `0x80000` 其实落在 payload 的 `.bss` 里面，变量一多就踩栈（这次踩到的是
 中断栈和堆），已挪到 16MB。
 
-**SMP：两个核真的在同时跑。** 现在 `make fstest-bare-smp` 会做两件事 ——
+**SMP：两个核真的在同时跑。** 现在 `cmake --build build --target fstest-bare-smp` 会做两件事 ——
 `SMP=2` 起两个核、`SMP=1` 起一个核做负对照。两台都要打同样的判定：
 
 - 每个任务自己报"我在哪个核"，核号从 LAPIC 的 ID 寄存器（`0xFEE00020`）读；

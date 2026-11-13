@@ -13,7 +13,7 @@
  * 一回事：后者只等那一个 OS 线程。
  *
  * 运行（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  * 或单个文件：
  *   ./tcc/tcc -B tcc -test tests/task_method.c6
  */

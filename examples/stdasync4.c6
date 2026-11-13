@@ -1,6 +1,6 @@
 /* examples/stdasync4.c6 —— 第八十批（语言级 async 关键字的库支持）的集成示例。
  *
- *     make std-async4
+ *     cmake --build build --target std-async4
  *
  * 四节：aio（async 读写）、achan（async 通道）、apump（流式转发）、art（运行时驱动）。
  * 全部用 c6 的 `async` / `await` / `task` / `co` 关键字，任务句柄交给 `__c6_co_wait`

@@ -1,0 +1,35 @@
+# 由 c6/CMakeLists.txt 生成：安装 --enable-cross 的交叉编译器与运行库。
+# 这些是构建期产物，只能在安装阶段用 file(GLOB) 枚举；不用
+# install(DIRECTORY tcc/)，避免把源码树的空目录一并搬进安装树。
+# file(INSTALL) 自己处理 DESTDIR，这里不要重复拼 $ENV{DESTDIR}。
+
+file(GLOB _c6_cross_libs "@C6_TCC_DIR@/*-libtcc1.a")
+file(GLOB _c6_cross_bins "@C6_TCC_DIR@/*-tcc")
+file(GLOB _c6_win_libs "@C6_TCC_DIR@/*-win32-libtcc1.a"
+                       "@C6_TCC_DIR@/*-wince-libtcc1.a")
+if(_c6_win_libs)
+  list(REMOVE_ITEM _c6_cross_libs ${_c6_win_libs})
+endif()
+
+if(_c6_cross_libs)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/@C6_TCCDIR_REL@"
+       TYPE FILE FILES ${_c6_cross_libs})
+endif()
+if(_c6_cross_bins)
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/@C6_BINDIR_REL@"
+       TYPE PROGRAM FILES ${_c6_cross_bins})
+endif()
+
+# win32 目标按 tcc/Makefile 的 install-unx 放到 tccdir/win32/{lib,include}
+if(_c6_win_libs)
+  file(GLOB _c6_defs "@C6_TCC_DIR@/win32/lib/*.def")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/@C6_TCCDIR_REL@/win32/lib"
+       TYPE FILE FILES ${_c6_win_libs} ${_c6_defs})
+  file(GLOB _c6_hdrs "@C6_TCC_DIR@/include/*.h")
+  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/@C6_TCCDIR_REL@/win32/include"
+       TYPE FILE FILES ${_c6_hdrs} "@C6_TCC_DIR@/tcclib.h")
+  if(EXISTS "@C6_TCC_DIR@/win32/include")
+    file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/@C6_TCCDIR_REL@/win32"
+         TYPE DIRECTORY FILES "@C6_TCC_DIR@/win32/include")
+  endif()
+endif()

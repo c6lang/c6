@@ -1,6 +1,6 @@
 /* examples/stdtextan.c6 —— 第六十九批（文本分析）的集成示例。
  *
- *     make std-textan
+ *     cmake --build build --target std-textan
  *
  * 四节：切词、切句、字符 n-gram、可读性统计。都用**游标方法**（`doc.next`）。
  */

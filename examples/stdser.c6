@@ -1,6 +1,6 @@
 /* examples/stdser.c6 —— 第三十六批（序列化与标记）的集成示例。
  *
- *     make std-ser
+ *     cmake --build build --target std-ser
  *
  * 四节：BSON 文档（现场拼）、UBJSON 文档（现场拼）、二进制 plist（plistlib
  * 生成的 58 字节向量）、Markdown → HTML。每节自检。

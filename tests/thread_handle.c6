@@ -12,7 +12,7 @@
  * 作用域退出时自动还回去（没 join 也不漏）。
  *
  * 运行（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  * 或单个文件：
  *   ./tcc/tcc -B tcc -test tests/thread_handle.c6
  */

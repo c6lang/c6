@@ -18,7 +18,7 @@
  *      emitted as byte arrays and __c99_init() patches the pointer slots
  *      from the relocation records
  *
- *  Build:  make build                   (仓库根目录；和 x86 后端一起进 tcc/tcc)
+ *  Build:  cmake --build build                   (仓库根目录；和 x86 后端一起进 tcc/tcc)
  *  Use:    tcc -B. -o out.c in.c        (-o *.c / -o <dir> 自动选 C 输出)
  */
 

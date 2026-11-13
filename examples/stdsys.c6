@@ -1,6 +1,6 @@
 /* examples/stdsys.c6 —— 第三十七批（系统视图）的集成示例。
  *
- *     make std-sys
+ *     cmake --build build --target std-sys
  *
  * 四节：sysinfo（uname / 负载 / 运行时长 / CPU / 页大小）、resource（rlimit 与
  * getrusage）、user（当前用户与主组）、pty（跑一个子进程并抓它的输出）。

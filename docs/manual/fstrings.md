@@ -135,5 +135,5 @@ f"[{s;-10.3}]"      /* 左对齐、最多 3 个字节 */
 ./tcc/c6 -B tcc -run examples/fstr_demo.c6
 ```
 
-回归用例见 [tests/fstr.c6](../../tests/fstr.c6)（`make selftest` 里跑），编译期诊断见
+回归用例见 [tests/fstr.c6](../../tests/fstr.c6)（`cmake --build build --target selftest` 里跑），编译期诊断见
 [tests/errors/fstr.c6](../../tests/errors/fstr.c6)。

@@ -6,7 +6,7 @@
  * 结果记在自己的计数器里，最后逐个核对。
  *
  * 运行（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  * 或单个文件：
  *   ./tcc/tcc -B tcc -test tests/defer_thread.c6
  */

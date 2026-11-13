@@ -24,7 +24,7 @@
  * - `p.is_convex()` 是否凸（严格：共线顶点算不凸），`p.contains(x, y)` 射线法判断点
  *   是否在内部或边界上；
  * - `p.centroid(&cx, &cy)` 面积加权形心（退化多边形按顶点平均），`p.bbox(...)` 包围盒；
- * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <string.h>

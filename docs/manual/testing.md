@@ -2,7 +2,7 @@
 
 > **状态**：现行规范（`C6_EXT` + `.c6` 后缀） · **索引**：[文档索引](../README.md) · **实现状态**：[status.md](../history/status.md)
 >
-> `test "描述" { ... }` 是语言内建的测试块，`-test` 跑；诊断用 `// EXPECT` 语料；提交前跑 `make check-all`。
+> `test "描述" { ... }` 是语言内建的测试块，`-test` 跑；诊断用 `// EXPECT` 语料；提交前跑 `cmake --build build --target check-all`。
 >
 > 相关：用例目录 `tests/`；运行器 `tests/run-tests.sh`、`tests/run-errbase.sh`
 
@@ -27,25 +27,31 @@ test "add works" {
 
 ## 测试
 
-提交前只跑一条命令就够：`make check-all`（= `test-all` + `errcheck` + C99 后端
-两套用例 + 三条自举路线），拆开看是下面「完整回归」里那些目标。
+提交前只跑一条命令就够：`cmake --build build --target check-all`
+（等价于 `ctest --test-dir build -L regression -LE aux -j N`），拆开看是下面
+「完整回归」里那些目标。
 
-这条命令并发跑：`tests/` 的两套宿主用例、`errcheck`、C99 后端两套、三条自举
-路线、`tests2` 全量、freestanding/裸机那一组互不相干，交给 make 一起跑；只有
-**共享 `build/` 下固定路径**的那一组（`stdtest` 和八十多个 `std-*` 示例）整组
-串行 —— 它们的用例会往 `build/fs-test/`、`build/std-static/`、
-`build/mmap-test.bin`、`build/echo.sock` 这些固定路径写临时文件。输出按目标
-成块（`--output-sync=target`），不会混成一团；`CHECK_JOBS=1 make check-all`
-可以退回整轮串行。目标列表写在 `Makefile` 的 `STD_TARGETS`（共享路径，串行）
-和 `CHECK_PARALLEL`（其余，并发）里，那条串行由 `check-std-serial` 的递归
-`make -j1` 负责。
+每个用例由 CTest 注入独立的 `C6_CASE_OUT`（`build/tests/<用例>/`），编译产物、
+自举文件与临时文件都落在自己的目录里，因此整个回归矩阵可以 `ctest -j N`
+全并发，不再需要按输出路径分组串行。仍保留 `RESOURCE_LOCK` 的只有三组：
+`fstest*`（`fstest-qemu` 会递归调用其它 fstest 用例，继承同一输出目录）、
+`test` / `tests2`（上游 make 会往源码树写临时产物），以及 `source-tree`
+（`stdtest`、`std-kit`、`std-client`、`std-serve`、`std-fsx`：被测 c6 程序
+内部写死了相对 CWD 的 `build/...`，`C6_CASE_OUT` 覆盖不了）。并发度用
+`-DC6_CHECK_JOBS=N`（或 `ctest -j 1`）调整。日志、超时、失败重跑都由 CTest
+负责（`build/Testing/Temporary/`、`--output-on-failure`、`--rerun-failed`）。
+标签分组写在 `tests/regression.sh` 的 `C6_STD_TARGETS`、`C6_CHECK_PARALLEL`
+和 `C6_TEST_ALL` 三行里；`cmake/C6Testing.cmake` 把它们注册成原生 CTest 测试
+（`C6_CHECK_PARALLEL` 同时是 `parallel` 标签与清单一致性校验），并把
+`check-tcc` / `ubcheck` / `safegate` / `bench-async` 标成 `aux` 排除出聚合
+门禁——它们不属于任何分组，可用 `check-aux` 单独跑。CMake 是唯一构建入口。
 
 c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 
 ```
 tests/
-├── run-tests.sh      运行器（make selftest 调它）
-├── run-errbase.sh    errbase.def 的检查（make errcheck 调它）
+├── run-tests.sh      运行器（cmake --build build --target selftest 调它）
+├── run-errbase.sh    errbase.def 的检查（cmake --build build --target errcheck 调它）
 ├── defer.c6           defer 的时机、顺序与作用域
 ├── defer_scope.c6     defer 与块作用域、goto 跨作用域的清理
 ├── defer_reent.c6     递归/重入时的 defer 链
@@ -98,7 +104,7 @@ tests/
 ```
 
 ```sh
-make selftest                       # 跑全部
+cmake --build build --target selftest                       # 跑全部
 tests/run-tests.sh                  # 同上
 tests/run-tests.sh slice module     # 只跑这几个
 tests/run-tests.sh --list           # 列出会跑的文件
@@ -152,36 +158,52 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 
 ## 完整回归
 
+测试由 CTest 统一调度：每个用例注册为同名测试，标签、超时、`RESOURCE_LOCK`
+互斥、日志与 `--rerun-failed` 都由 CTest 负责。下面的 `cmake --build ... --target`
+是转发给 `ctest -R` 的兼容入口，语义完全相同；新代码直接用：
+
 ```sh
-make check-all     # 提交/发布前跑这一条：test-all + errcheck + C99 后端两套用例 + 三条自举路线
-                   # （除共享 build/ 路径的 std 家族整组串行外都并发；CHECK_JOBS=1 整轮串行）
-make test-all      # check-all 的第一段：selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
-make test          # 扩展模式：上游 tests2 全量
-make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
-make c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
-make errcheck      # errbase.def：钉号表本身和 C126/C127/C128 真的会报错
-make stdtest       # 标准库 std/（七个子目录）每个模块的 test 块
-make std-demo      # 标准库集成示例（examples/wordcount.c6）
-make std-tour      # 新模块集成示例（examples/stdtour.c6，自带自检）
+ctest --test-dir build -L daily --output-on-failure
+ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure
+ctest --test-dir build -L aux --output-on-failure
+ctest --test-dir build -R '^std-demo$' --output-on-failure
 ```
 
-自举（编译器编译自己，产物在 `build/selfhost/`，`make clean` 会一起删掉）：
+```sh
+cmake --build build --target check-all     # 提交/发布前跑这一条：等价于 ctest -L regression -LE aux -j N
+                   # （三组 RESOURCE_LOCK 串行，其余并发；-DC6_CHECK_JOBS=1 整轮串行）
+cmake --build build --target check-aux     # 4 个 aux 用例，串行
+cmake --build build --target test-all      # check-all 的第一段：selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
+ctest --test-dir build -R c6-tests2          # 扩展模式：上游 tests2 全量
+cmake --build build --target test-plain    # 关闭 C6_EXT 重建后跑 tests2；会替换编译器，勿与 ctest 并发
+cmake --build build --target c6selfcheck   # 把 tcc 自己的源码拷成 .c6，用 c6 规则编译，编出可运行的编译器
+cmake --build build --target errcheck      # errbase.def：钉号表本身和 C126/C127/C128 真的会报错
+cmake --build build --target stdtest       # 标准库 std/（七个子目录）每个模块的 test 块
+cmake --build build --target std-demo      # 标准库集成示例（examples/wordcount.c6）
+cmake --build build --target std-tour      # 新模块集成示例（examples/stdtour.c6，自带自检）
+```
+
+自举（编译器编译自己，产物在各用例的 `build/tests/<用例>/selfhost/`，
+`cmake --build build --target c6-clean` 会一起删掉）：
 
 ```sh
-make selfhost          # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
-make c99selfhost       # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
-make c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条链不需要 gcc）
+cmake --build build --target selfhost          # c6 路线：tcc 编译 tcc.c -> stage1，stage1 再编一次 -> stage2
+cmake --build build --target c99selfhost       # C99 后端路线：tcc 生成 C -> 宿主 gcc 编出 stage2 -> stage3
+cmake --build build --target c99selfhost-tcc   # 同上，但生成的 C 也由 tcc 自己编（整条链不需要 gcc）
 ```
 
 三条路线都会把两次编译得到的目标文件 `cmp` 一遍（bootstrap fixpoint），
 再用最终的 stage2/stage3 编译并运行一个小程序：只有目标文件逐字节相同、
 编出来的编译器真能编程序，自举才算通过。
 
-`make c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
-的源码也要满足它，所以把 `tcc/tcc.c` 拷成 `build/selfhost/c6/selfcheck.c6`
+`cmake --build build --target c6selfcheck` 是"变量必须初始化"那条规则最严格的回归测试：tcc 自己
+的源码也要满足它，所以把 `tcc/tcc.c` 拷成
+`build/tests/c6selfcheck/selfhost/c6/selfcheck.c6`
 后用 `-DC6_EXT` 编译一遍（原生目标文件 + C99 后端产物；带 `C6_EXT` 才会把
 扩展实现那半边也纳入检查），再把编出来的编译器连起来跑 `-v`。两步编译都
 不许有诊断输出，出现警告即失败。
 
-> 切换模式会先 `make clean` 重建，因为 `C6_EXT` 是编译期开关。
-> 三个目标都会先跑 `bootstrap`，只在 `tcc/` 还没配置时执行一次 `./configure`。
+> 切换模式（`-DC6_ENABLE_EXT=ON/OFF`）请重新 `cmake -S . -B build` 再构建：
+> `C6_EXT` 是编译期开关，`config.sig` 变化会让 `tcc-config` 比对后清掉旧目标文件。
+> 三条自举路线都复用配置阶段由 `tcc/CMakeLists.txt` 生成的配置，构建时不会再跑
+> `./configure`。

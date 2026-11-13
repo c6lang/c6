@@ -311,7 +311,7 @@ char[:] next(CFile *self)
 /* ---- 自测 ---- */
 
 /* 临时文件：写到系统的临时目录，跑完删掉。测试里只用标准 C 的 tmpfile
-   会拿不到路径，所以这里固定用 build/ 下的名字（make stdtest 之前会建）。 */
+   会拿不到路径，所以这里固定用 build/ 下的名字（`stdtest` 用例执行前会建好）。 */
 static char *tmp_path(void) { return (char *)"build/std-io-test.txt"; }
 
 test "写文件再读回来" {

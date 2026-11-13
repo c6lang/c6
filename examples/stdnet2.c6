@@ -1,6 +1,6 @@
 /* examples/stdnet2.c6 —— 第六十七批（小型文本协议）的集成示例。
  *
- *     make std-proto3
+ *     cmake --build build --target std-proto3
  *
  * 四节：IRC 消息解析/构造、Gopher 菜单遍历、WHOIS 字段、ident 查询/应答。
  * 全部用**方法**（`doc.next`、`doc.find`、`doc.get`）。

@@ -1,6 +1,6 @@
 /* examples/stdcontainers.c6 —— 第六十三批（基础容器补充）的集成示例。
  *
- *     make std-cont
+ *     cmake --build build --target std-cont
  *
  * 四节：栈（括号匹配）、队列（FIFO 回绕）、槽位分配器（句柄复用）、多重集合
  * （计数与最多次数）。全部用**方法**（`s.push`、`q.pop`、`sl.alloc`、`b.add`）。

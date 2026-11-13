@@ -1,6 +1,6 @@
 /* examples/stdmgmt.c6 —— 第九十批（网络管理与可观测：Prometheus / Gemini / SNMP / NNTP）。
  *
- *     make std-mgmt
+ *     cmake --build build --target std-mgmt
  *
  * 五节，全部方法调用（`d.next(&s)`、`r.parse(...)`、`b.varbind(...)`）：
  *   1. Prometheus 文本格式：构造指标、解析回来、逐条取样；

@@ -23,7 +23,7 @@
  *   `work` 长度 3n），返回 1/-1；
  * - `f.dim()` 阶数，`f.sign()` 置换符号（+1/-1），`f.pivots(i)` 第 i 步选的主元行，
  *   `f.lu(i, j)` 读分解后的元素（0 基），`f.singular()`；
- * - 全部 `double`，需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 全部 `double`，需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <string.h>

@@ -28,7 +28,7 @@
  *      written, because a tentative definition can still move to another
  *      section until then
  *
- *  Build:  make build                    (仓库根目录；和 x86 后端一起进 tcc/tcc)
+ *  Build:  cmake --build build                    (仓库根目录；和 x86 后端一起进 tcc/tcc)
  *  Use:    tcc -B. -llvm -o out.ll in.c  (-o *.ll 自动选 LLVM 输出)
  *          clang -o out out.ll           (运行时来自 libtcc1.a)
  */

@@ -12,7 +12,7 @@
  *   3. walk：在临时目录里搭一棵树，统计文件/目录/字节，再 remove_tree；
  *   4. lock：fork 一个子进程持锁，父进程先试（忙）再等（拿到）。
  *
- * 全程只碰系统临时目录和 `build/`，所以 `make std-fsx` 不依赖外部输入。
+ * 全程只碰系统临时目录和 `build/`，所以 `cmake --build build --target std-fsx` 不依赖外部输入。
  *
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *

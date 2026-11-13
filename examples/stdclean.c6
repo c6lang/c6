@@ -1,6 +1,6 @@
 /* examples/stdclean.c6 —— 第六十一批（文本清洗与标注）的集成示例。
  *
- *     make std-clean
+ *     cmake --build build --target std-clean
  *
  * 四节：文本清洗（SanOpts 方法）、制表符展开/还原（TabStops 方法）、
  * shell 引用（Quoter 方法）、NATO 拼读（NatoOpts 方法）。

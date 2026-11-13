@@ -1,6 +1,6 @@
 /* examples/stdsubs.c6 —— 第五十四批（字幕与播放列表）的集成示例。
  *
- *     make std-subs
+ *     cmake --build build --target std-subs
  *
  * 四节：SubRip/WebVTT 游标、ASS 事件游标、LRC 歌词游标、M3U 播放列表游标。
  * 全部用**结构体方法**调用（`doc.open(...)` / `doc.next(&x)` / `doc.count()`）。

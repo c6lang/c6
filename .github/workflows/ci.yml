@@ -1,0 +1,213 @@
+name: build, test and package
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      full_regression:
+        description: '额外跑完整回归矩阵 check-all（较慢，需要 node/clang/qemu）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_INSTALL_PREFIX: /usr
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 编译 + 测试：两种 libtcc 形态（静态 / 共享）、两个 Ubuntu LTS。
+  # -------------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }}, shared=${{ matrix.shared }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        shared: [ON, OFF]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make gcc binutils texinfo perl pkgconf
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_TCC_SHARED_LIBTCC=${{ matrix.shared }} \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Test (CTest daily)
+        run: ctest --test-dir build -L daily --output-on-failure
+
+      # 校验 DESTDIR 安装树里的 CMake 包配置与 pkgconf 元数据：
+      # check-install 会 staged install、configure 一个消费方工程、链接并运行。
+      - name: Verify installed library config
+        run: |
+          cmake --build build --target check-install
+          PKG_CONFIG_PATH="$PWD/build/check-install/stage/usr/lib/pkgconfig" \
+            pkgconf --modversion c6
+          PKG_CONFIG_PATH="$PWD/build/check-install/stage/usr/lib/pkgconfig" \
+            pkgconf --cflags --libs c6
+          PKG_CONFIG_PATH="$PWD/build/check-install/stage/usr/lib/pkgconfig" \
+            pkgconf --static --libs c6
+          LD_LIBRARY_PATH="$PWD/build/check-install/stage/usr/lib" \
+            ./build/check-install/stage/usr/bin/c6 -v
+
+  # -------------------------------------------------------------------------
+  # 完整回归矩阵（91 个 std-*、自举、freestanding、tests2 等）。
+  # 手动触发或 v* tag 发布时运行；release 依赖本 job，tag 上不会被跳过。
+  # -------------------------------------------------------------------------
+  regression:
+    name: full regression (CTest -L regression)
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full_regression) || startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # 缺工具链时 bare/wasm/c99 用例会静默跳过，门禁形同虚设：
+      # qemu-system-x86 给 fstest-qemu，clang 给 C99/wasm，golang-go 给
+      # fstest-go / fstest-bare-go，qemu-user 给交叉运行。
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make gcc binutils texinfo perl pkgconf \
+            qemu-user qemu-system-x86 clang golang-go nodejs
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TESTING=ON
+          cmake --build build --parallel "$(nproc)"
+      # aux（check-tcc / ubcheck / safegate / bench-async）不属于回归门禁；
+      # bench-async 需要 g++/rustc/go/uya，用 check-aux 在完整环境里单独跑。
+      - name: Full regression matrix
+        run: ctest --test-dir build -L regression -LE aux -j "$(nproc)" --output-on-failure
+      - name: Lightweight auxiliary checks
+        run: ctest --test-dir build -L aux -E '^bench-async$' --output-on-failure
+
+  # -------------------------------------------------------------------------
+  # 打包：DEB / RPM / TGZ，全部复用同一份 install() 清单。
+  # -------------------------------------------------------------------------
+  package:
+    name: package (${{ matrix.generator }})
+    needs: [test]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        generator: [DEB, RPM, TGZ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make gcc binutils texinfo perl dpkg-dev rpm
+
+      - name: Package release metadata
+        id: meta
+        run: |
+          echo "release=${GITHUB_RUN_NUMBER}.$(git rev-parse --short=7 HEAD)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-pkg \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DC6_TCC_SHARED_LIBTCC=ON \
+            -DBUILD_TESTING=OFF \
+            -DC6_PACKAGE_RELEASE="${{ steps.meta.outputs.release }}"
+
+      - name: Build
+        run: cmake --build build-pkg --parallel "$(nproc)"
+
+      - name: Package (${{ matrix.generator }})
+        run: |
+          mkdir -p packages
+          cpack --config build-pkg/CPackConfig.cmake \
+            -G "${{ matrix.generator }}" -B packages
+
+      - name: Inspect package
+        run: |
+          # CPack 的中间目录不能进 artifact/release：否则 sha256sum * 会碰到目录
+          rm -rf packages/_CPack_Packages
+          ls -lh packages/
+          case "${{ matrix.generator }}" in
+            DEB)
+              dpkg-deb --info packages/*.deb
+              dpkg-deb --contents packages/*.deb | head -40
+              dpkg-deb --contents packages/*.deb | grep -q 'usr/share/doc/c6/docs/README.md'
+              ;;
+            RPM)
+              rpm -qip packages/*.rpm
+              rpm -qlp packages/*.rpm | head -40
+              rpm -qlp packages/*.rpm | grep -q 'usr/share/doc/c6/docs/README.md'
+              ;;
+            TGZ)
+              tar tzf packages/*.tar.gz | head -40
+              tar tzf packages/*.tar.gz | grep -q 'usr/share/doc/c6/docs/README.md'
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.generator }}
+          path: packages/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # 发布：仅在 v* tag 上，把三种包 + 校验和发到 GitHub Release。
+  # -------------------------------------------------------------------------
+  release:
+    name: publish release
+    # always() 让被跳过的 needs 不阻塞发布，但仍要挡住任何失败/取消；
+    # regression 在 v* tag 上一定会运行（见上面 if），所以发布必然等它。
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    needs: [test, package, regression]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          ls -lh
+          sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

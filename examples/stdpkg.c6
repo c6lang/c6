@@ -1,6 +1,6 @@
 /* examples/stdpkg.c6 —— 第五十七批（目标文件与包）的集成示例。
  *
- *     make std-pkg
+ *     cmake --build build --target std-pkg
  *
  * 四节：`ar` 归档、COFF 目标文件、Java `.class`、RPM 包头。
  * 全部用**结构体方法**（`doc.open` / `doc.next` / `doc.section` / `doc.get`）。

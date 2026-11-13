@@ -11,7 +11,7 @@
  *   3. geometry：3-4-5 向量、单位化、矩形包含/交集/并集；
  *   4. interp：lerp/remap/smoothstep/缓动曲线/Catmull-Rom。
  *
- * 全程纯计算，不依赖外部输入，所以 `make std-calc` 输出与平台无关。
+ * 全程纯计算，不依赖外部输入，所以 `cmake --build build --target std-calc` 输出与平台无关。
  *
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *

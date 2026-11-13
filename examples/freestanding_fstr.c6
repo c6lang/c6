@@ -1,6 +1,6 @@
 /* 无 libc（freestanding）下的 c6 运行时与字符串插值
  *
- *   make fstest
+ *   cmake --build build --target fstest
  *   # 等价于：
  *   ./tcc/tcc -B tcc -static -nostdlib -o build/freestanding_fstr \
  *       examples/freestanding_fstr.c6 tcc/libtcc1.a

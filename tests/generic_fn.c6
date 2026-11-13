@@ -16,7 +16,7 @@
  * 运行（仓库根目录）：
  *   ./tcc/tcc -B tcc -test tests/generic_fn.c6
  * 或：
- *   make selftest
+ *   cmake --build build --target selftest
  */
 #include <stdio.h>
 #include <string.h>

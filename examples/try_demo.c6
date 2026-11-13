@@ -1,7 +1,7 @@
 /* T!error + try + catch 用法演示
  *
  * 编译运行（在仓库根目录）：
- *   make build
+ *   cmake --build build
  *   ./tcc/tcc -B tcc -run examples/try_demo.c6
  */
 #include <stdio.h>

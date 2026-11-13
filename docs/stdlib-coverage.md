@@ -2,7 +2,7 @@
 
 这份文档回答一个问题：**「继续扩 `std/`，什么时候才算到头？」**
 
-结论先给：到目前为止（377 个模块、九十一批、`make stdtest` 377/377 全绿），
+结论先给：到目前为止（377 个模块、九十一批、`cmake --build build --target stdtest` 377/377 全绿），
 **按族覆盖已经没有空缺**，新增模块只能在同一族里造变体，或者必须引入外部数据
 （词典）与大运行时（QUIC/TLS 1.3 完整栈）。所以本轮的收尾动作是：把覆盖面写成
 这份可核对的矩阵，而不是继续堆数量。
@@ -144,11 +144,12 @@
 1. 选 4 个同主题、能写成方法 + 游标/句柄的模块；
 2. 每个模块 2 个 `test` 块（真实规范向量 + 坏输入），API 一律「首参结构体指针 ⇒
    方法」，状态型模块补 `XxxDoc`（`open/next/count/reset`）；
-3. 一个集成示例 `examples/std*.c6` + Makefile 目标（`STD_*_SRCS` 与 `.PHONY`、
-   help、`STD_TARGETS` 两处同步 —— `test-all` 与 `check-all` 用的是同一份目标表）
+3. 一个集成示例 `examples/std*.c6` + `tests/regression.sh` 的用例分支
+   （用例名同时加进 `C6_TEST_ALL` / `C6_STD_TARGETS` 两处 —— `test-all` 与
+   `check-all` 用的是同一份目标表）
    + err 号段（`tcc/tccgen.c` 与 `docs/reference/grammar.md` §8.1）+ 五处文档
    （`stdlib.md`、`history/status.md`、`README.md`、`CHANGELOG.md`、本文件的矩阵）；
-4. 验收：`make stdtest`、对应示例、`make check-all`；
+4. 验收：`cmake --build build --target stdtest`、对应示例、`cmake --build build --target check-all`；
 5. 提交并 ff 并入 main。
 
 两条已经踩过、写进 `docs/stdlib.md` 的硬约束再强调一次：
