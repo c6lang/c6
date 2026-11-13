@@ -145,9 +145,9 @@
 2. 每个模块 2 个 `test` 块（真实规范向量 + 坏输入），API 一律「首参结构体指针 ⇒
    方法」，状态型模块补 `XxxDoc`（`open/next/count/reset`）；
 3. 一个集成示例 `examples/std*.c6` + Makefile 目标（`STD_*_SRCS` 与 `.PHONY`、
-   help、`test-all`、`check-all` 四处同步）+ err 号段（`tcc/tccgen.c` 与
-   `docs/reference/grammar.md` §8.1）+ 五处文档（`stdlib.md`、`history/status.md`、
-   `README.md`、`CHANGELOG.md`、本文件的矩阵）；
+   help、`STD_TARGETS` 两处同步 —— `test-all` 与 `check-all` 用的是同一份目标表）
+   + err 号段（`tcc/tccgen.c` 与 `docs/reference/grammar.md` §8.1）+ 五处文档
+   （`stdlib.md`、`history/status.md`、`README.md`、`CHANGELOG.md`、本文件的矩阵）；
 4. 验收：`make stdtest`、对应示例、`make check-all`；
 5. 提交并 ff 并入 main。
 

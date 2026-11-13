@@ -7,8 +7,12 @@
 #                                             # （语言看后缀：.c6 是 c6，.c/.plain.c 是普通 C）
 #   NO_KVM=1 examples/boot/build.sh           # 强制用 TCG（纯软件模拟）
 #   SMP=2 examples/boot/build.sh 源文件...    # 多核（-smp 2，并 -DC6_SMP_CPUS=2）
+#   BARE_BUILD=build/bare/go examples/boot/build.sh 源文件...
+#                                             # 换产物目录（默认 build/）。并发跑
+#                                             # 不同裸机用例时每条各用一份，否则
+#                                             # 会互相盖掉 payload/boot.img。
 #
-# 产物：
+# 产物（目录由 BARE_BUILD 决定，下同）：
 #   build/payload.elf / .bin   c6 程序（tcc 链接在 0x400000）
 #   build/boot.bin             512 字节引导扇区
 #   build/bare.img             引导扇区 + payload，qemu 当硬盘启动
@@ -19,7 +23,7 @@ export LC_ALL=C
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-build=build
+build=${BARE_BUILD:-build}
 mkdir -p "$build"
 
 payload_src="examples/boot/main.c6 examples/boot/io.c"

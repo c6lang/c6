@@ -7,6 +7,21 @@
 
 ## 未发布
 
+### `make check-all` 改成五条车道并发跑
+
+- 完整验收拆成 `tests` / `tests2` / `selfhost` / `std` / `bare` 五条**车道**：
+  车道之间并发、车道内部仍然串行（调度器是 `scripts/check-all.sh`）。同一台
+  44 核机器上，一轮验收从 122s 降到 50s。
+- 并发顺手暴露并修掉两个真问题：裸机五连（boot / tests / go / handle / smp）
+  过去共用 `build/{payload.*,boot.*,bare.img}`，同时跑会互相盖掉（报
+  `_start not defined`、qemu 退出码 5）——现在每条一个目录
+  （`examples/boot/build.sh` 认 `BARE_BUILD`）；`fstest-qemu` 跑的是 `fstest` /
+  `fstest-go` / `fstest-noos` 编出来的程序，却没写依赖，并发时会赶在产出之前启动。
+- 标准库那一组目标合并成一个变量 `STD_TARGETS`（`test-all` 与 `check-all` 共用），
+  以后加模块少一处要同步。
+- 每条车道的输出带 `[车道名]` 前缀，跑完打一张结果表；`CHECK_SERIAL=1 make
+  check-all` 退回「一条跑完再跑下一条」。
+
 ### 标准库收尾：覆盖面盘点
 
 - 新增 [docs/stdlib-coverage.md](docs/stdlib-coverage.md)：377 个模块的规模分布、

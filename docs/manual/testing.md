@@ -30,6 +30,15 @@ test "add works" {
 提交前只跑一条命令就够：`make check-all`（= `test-all` + `errcheck` + C99 后端
 两套用例 + 三条自举路线），拆开看是下面「完整回归」里那些目标。
 
+这条命令先把验收拆成五条「车道」并发跑：`tests`（`tests/` 下的用例，native 与
+C99 两套宿主）、`tests2`（上游全量）、`selfhost`（三条自举 + 源代码自检）、`std`
+（标准库的 `stdtest` 和八十多个示例）、`bare`（freestanding / 裸机 / qemu）。
+车道之间并发，车道内部仍然串行 —— 标准库的用例会往 `build/` 下的固定路径写
+临时文件、裸机五连共用过同一个 `bare.img`，都不能同时跑。每条车道的输出带
+`[车道名]` 前缀，跑完打一张结果表；`CHECK_SERIAL=1 make check-all` 可以退回
+一条跑完再跑下一条。调度器是 `scripts/check-all.sh`，目标列表写在 `Makefile`
+的 `STD_TARGETS` / `CHECK_LANE_*` 里。
+
 c6 的测试全部在 `tests/` 下，都用 c6 自己的 `test` 块写：
 
 ```
@@ -144,6 +153,7 @@ int main(void) { return 0; }      /* 不带 -D 时必须编译并运行通过 */
 
 ```sh
 make check-all     # 提交/发布前跑这一条：test-all + errcheck + C99 后端两套用例 + 三条自举路线
+                   # （五条车道并发；CHECK_SERIAL=1 则按车道顺序串行，见本节开头）
 make test-all      # check-all 的第一段：selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
 make test          # 扩展模式：上游 tests2 全量
 make test-plain    # 关闭 C6_EXT 重建后再跑一遍，验证“扩展关闭零行为变化”
