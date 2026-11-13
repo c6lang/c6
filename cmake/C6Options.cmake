@@ -23,10 +23,13 @@ option(C6_INSTALL_CMAKE_PACKAGE "安装 c6Config.cmake / c6Targets.cmake" ON)
 option(C6_INSTALL_PKGCONF "安装 c6.pc" ON)
 option(C6_INSTALL_LIBTCC_PC "额外安装 libtcc.pc 兼容名" ON)
 option(C6_INSTALL_TCC_SYMLINK "安装 bindir/tcc -> c6 兼容软链" ON)
+option(C6_INSTALL_DOCS "安装 c6 的 docs/、README、CHANGELOG 与 license" ON)
 set(C6_INSTALL_TCCDIR "" CACHE STRING
     "运行时库目录；留空 = <CMAKE_INSTALL_FULL_LIBDIR>/tcc；相对值按安装前缀解析")
 set(C6_INSTALL_DOCDIR "" CACHE STRING
-    "文档目录；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/tcc；相对值按安装前缀解析")
+    "上游 tcc 文档目录（tcc-doc.html）；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/tcc；相对值按安装前缀解析")
+set(C6_INSTALL_C6_DOCDIR "" CACHE STRING
+    "c6 自己的文档目录；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/c6；相对值按安装前缀解析")
 
 ProcessorCount(_c6_ncpu)
 if(_c6_ncpu EQUAL 0)
@@ -76,7 +79,9 @@ endfunction()
 set(_c6_tccdir_doc
     "运行时库目录；留空 = <CMAKE_INSTALL_FULL_LIBDIR>/tcc；相对值按安装前缀解析")
 set(_c6_docdir_doc
-    "文档目录；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/tcc；相对值按安装前缀解析")
+    "上游 tcc 文档目录（tcc-doc.html）；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/tcc；相对值按安装前缀解析")
+set(_c6_c6docdir_doc
+    "c6 自己的文档目录；留空 = <CMAKE_INSTALL_FULL_DATAROOTDIR>/doc/c6；相对值按安装前缀解析")
 if(NOT C6_INSTALL_TCCDIR)
   set(C6_INSTALL_TCCDIR "${CMAKE_INSTALL_FULL_LIBDIR}/tcc"
       CACHE STRING "${_c6_tccdir_doc}" FORCE)
@@ -91,11 +96,18 @@ elseif(NOT IS_ABSOLUTE "${C6_INSTALL_DOCDIR}")
   set(C6_INSTALL_DOCDIR "${CMAKE_INSTALL_PREFIX}/${C6_INSTALL_DOCDIR}"
       CACHE STRING "${_c6_docdir_doc}" FORCE)
 endif()
+if(NOT C6_INSTALL_C6_DOCDIR)
+  set(C6_INSTALL_C6_DOCDIR "${CMAKE_INSTALL_FULL_DATAROOTDIR}/doc/c6"
+      CACHE STRING "${_c6_c6docdir_doc}" FORCE)
+elseif(NOT IS_ABSOLUTE "${C6_INSTALL_C6_DOCDIR}")
+  set(C6_INSTALL_C6_DOCDIR "${CMAKE_INSTALL_PREFIX}/${C6_INSTALL_C6_DOCDIR}"
+      CACHE STRING "${_c6_c6docdir_doc}" FORCE)
+endif()
 
 # install(DESTINATION) 与 configure_package_config_file(PATH_VARS) 都以
 # 「目录位于 CMAKE_INSTALL_PREFIX 内」为前提；prefix 外的绝对路径会让
 # DESTDIR / CPack 的内容落到前缀之外，c6Config.cmake 也无法重定位。
-foreach(_c6_dir IN ITEMS C6_INSTALL_TCCDIR C6_INSTALL_DOCDIR)
+foreach(_c6_dir IN ITEMS C6_INSTALL_TCCDIR C6_INSTALL_DOCDIR C6_INSTALL_C6_DOCDIR)
   file(RELATIVE_PATH _c6_dir_rel "${CMAKE_INSTALL_PREFIX}" "${${_c6_dir}}")
   if(_c6_dir_rel MATCHES "^\\.\\./" OR IS_ABSOLUTE "${_c6_dir_rel}")
     message(FATAL_ERROR
@@ -110,6 +122,7 @@ c6_prefix_relative(C6_LIBDIR_REL "${CMAKE_INSTALL_FULL_LIBDIR}")
 c6_prefix_relative(C6_INCLUDEDIR_REL "${CMAKE_INSTALL_FULL_INCLUDEDIR}")
 c6_prefix_relative(C6_TCCDIR_REL "${C6_INSTALL_TCCDIR}")
 c6_prefix_relative(C6_DOCDIR_REL "${C6_INSTALL_DOCDIR}")
+c6_prefix_relative(C6_C6_DOCDIR_REL "${C6_INSTALL_C6_DOCDIR}")
 c6_prefix_relative(C6_MANDIR_REL "${CMAKE_INSTALL_FULL_MANDIR}")
 c6_prefix_relative(C6_INFODIR_REL "${CMAKE_INSTALL_FULL_INFODIR}")
 c6_prefix_relative(C6_PKGCONFIG_DIR_REL "${C6_PKGCONFIG_DIR}")

@@ -44,5 +44,8 @@ tcc-config 会自动把配置同步回当前构建目录并清理旧目标文件
   c6-clean / clean-all / distclean（CMake 自带 clean 只清构建目录）
   wasmrt / wasmtest（由 CMake 直调 scripts/ 下两个脚本）
 
+c6 文档（docs/、README、CHANGELOG、copyright）随 install() / CPack 装到
+<datarootdir>/doc/c6/，与上游 tcc 文档分开；-DC6_INSTALL_DOCS=OFF 可关闭。
+
 每个用例的含义、自举三条路线怎么比对，见 docs/reference/cli.md 与
 docs/manual/testing.md；测试怎么组织、诊断用例怎么写，见后者。

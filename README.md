@@ -166,7 +166,9 @@ DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 D
 | `C6_TCC_MAKE_ARGS` | 空 | 追加 make 变量，分号分隔，如 `ONE_SOURCE=yes;SILENT=yes` |
 | `C6_TCC_JOBS` | CPU 核数 | 非 Makefile 生成器下子 make 的 `-j`；Makefile 生成器用 `$(MAKE)` 继承 jobserver |
 | `C6_INSTALL_TCCDIR` | `<libdir>/tcc` | 运行时库（`libtcc1.a`）目录 |
-| `C6_INSTALL_DOCDIR` | `<datarootdir>/doc/tcc` | 文档目录 |
+| `C6_INSTALL_DOCDIR` | `<datarootdir>/doc/tcc` | 上游 tcc 文档目录（`tcc-doc.html`） |
+| `C6_INSTALL_DOCS` | `ON` | 安装 c6 的 `docs/`、`README.md`、`CHANGELOG.md` 与 `copyright` |
+| `C6_INSTALL_C6_DOCDIR` | `<datarootdir>/doc/c6` | c6 文档目录（默认 `/usr/share/doc/c6`） |
 | `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
 | `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
 | `BUILD_TESTING` | `ON` | 是否注册 CTest 测试；打包构建可设 `OFF` |
@@ -219,7 +221,11 @@ cc $(pkgconf --cflags --libs c6) app.c -o app
 
 ### 打包与发布
 
-CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM：
+CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM。包里除编译器与
+`libtcc` 外还带上 c6 自己的文档：`docs/` 的 33 篇文档（保留子目录结构）与
+`README.md` / `CHANGELOG.md` / `copyright` 装在 `/usr/share/doc/c6/`，上游
+tcc 的 `tcc-doc.html` 仍装在 `<datarootdir>/doc/tcc/`。用
+`-DC6_INSTALL_DOCS=OFF` 可关闭，`-DC6_INSTALL_C6_DOCDIR=...` 可改位置。
 
 ```sh
 cpack --config build/CPackConfig.cmake -G TGZ -B packages
@@ -251,7 +257,7 @@ yay -Syu c6
 .
 ├── README.md           本文件：落地页与总索引
 ├── CHANGELOG.md        版本与特性变更史
-├── docs/               文档（入口：docs/README.md）
+├── docs/               文档（入口：docs/README.md；随包装到 /usr/share/doc/c6/docs/）
 │   ├── manual/         语言手册：一个特性一篇，讲怎么用
 │   ├── reference/      规范与参考：语法、诊断码、命令行、后端
 │   ├── design/         设计文档与实现说明：讲为什么这么做
