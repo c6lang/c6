@@ -1,6 +1,6 @@
 /* examples/stdasync3.c6 —— 第七十八批（co / async-await 框架）的集成示例。
  *
- *     make std-async3
+ *     cmake --build build --target std-async3
  *
  * 四节：co 运行器（三种挂起点）、async/await 宏写法、结构化并发（scope）、并发额度
  * （limiter）。

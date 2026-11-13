@@ -23,7 +23,7 @@
  * - `t.det()` 行列式（= 前代主元之积），`t.diag_at(i)` 读原始主对角线元素；
  * - `t.dim()` 阶数，`t.degenerate()` 是否退化；
  * - 一次 `init` 可以反复 `solve`（前代系数只算一次）；
- * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <string.h>

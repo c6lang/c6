@@ -6,7 +6,7 @@
  * 回收。
  *
  * 运行（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  * 或单个文件：
  *   ./tcc/tcc -B tcc -test tests/async.c6
  */

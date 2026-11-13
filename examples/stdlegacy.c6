@@ -1,6 +1,6 @@
 /* examples/stdlegacy.c6 —— 第三十九批（老图形格式）的集成示例。
  *
- *     make std-legacy
+ *     cmake --build build --target std-legacy
  *
  * 四节：PCX（8 位调色板 + RLE）、Radiance HDR（RGBE）、XBM（C 源码位图）、
  * XPM（C 源码彩图）。四种数据都在内存里现场拼，不依赖外部文件。

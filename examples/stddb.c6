@@ -1,6 +1,6 @@
 /* examples/stddb.c6 —— 第五十批（日志与数据库）的集成示例。
  *
- *     make std-db
+ *     cmake --build build --target std-db
  *
  * 四节：环形日志（级别过滤 + dump）、SQLite 文件头与 B-tree 页、PostgreSQL 报文
  * 拆帧/启动包、MySQL 握手包与 COM_QUERY。

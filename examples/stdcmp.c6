@@ -1,6 +1,6 @@
 /* examples/stdcmp.c6 —— 第五十三批（变换式压缩积木）的集成示例。
  *
- *     make std-bwt
+ *     cmake --build build --target std-bwt
  *
  * 四节：BWT（含逆变换）、MTF、差分、规范 Huffman。前三节刚好是 bzip2 的前半段：
  *     BWT → MTF → 熵编码

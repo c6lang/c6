@@ -2,7 +2,7 @@
  * 再用系统 gcc 编译、运行，检查生成的后端产物真的能工作。
  *
  * 运行（仓库根目录）：
- *   make c99test
+ *   cmake --build build --target c99test
  * 或分步手工跑：
  *   ./tcc/tcc -B tcc -test tests/c99/c99test.c6
  *   ./tcc/tcc -B tcc -o /tmp/c99test.c tests/c99/c99test.c6

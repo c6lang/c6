@@ -1,6 +1,6 @@
 /* examples/stdmatch.c6 —— 第七十一批（匹配与对齐）的集成示例。
  *
- *     make std-match
+ *     cmake --build build --target std-match
  *
  * 四节：Aho-Corasick 多模式扫描、Rabin-Karp 查找、区间集合、序列比对。
  */

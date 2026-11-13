@@ -1,7 +1,7 @@
 /* c6 自测：async 的帧住在任务里（阶段 P7，A3 "frame in task"）
  *
  * 运行（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  * 或单个文件：
  *   ./tcc/tcc -B tcc -test tests/async_frame.c6
  *

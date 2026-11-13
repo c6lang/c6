@@ -1,6 +1,6 @@
 /* examples/stdcfg.c6 —— 第七十批（系统配置文件）的集成示例。
  *
- *     make std-cfg2
+ *     cmake --build build --target std-cfg2
  *
  * 四节：`.env`、`/etc/hosts`、`/etc/resolv.conf`、`known_hosts`。
  * 全部用游标方法（`doc.next`、`doc.get`、`doc.match`）。

@@ -1,6 +1,6 @@
 /* examples/stdlinalg.c6 —— 第七十五批（线性代数）的集成示例。
  *
- *     make std-linalg
+ *     cmake --build build --target std-linalg
  *
  * 四节：LU 分解求解/求逆/行列式、Jacobi 特征分解与幂法、三对角 Thomas 求解、
  * CSR 稀疏矩阵的 SpMV 与转置。

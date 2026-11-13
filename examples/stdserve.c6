@@ -13,7 +13,7 @@
  *     GET /me                   -> 用 Cookie 找回会话，回 "user=ada"（没有就 401）
  *
  * 服务端用 `fork` 起在 127.0.0.1 上（子进程连跑 7 个请求就退出），客户端用
- * 第二十一批的 `std.net.httpc` 打回去——所以 `make std-serve` 不联网也能跑。
+ * 第二十一批的 `std.net.httpc` 打回去——所以 `cmake --build build --target std-serve` 不联网也能跑。
  *
  * 编译（import 只带来声明，模块正文要单独列出来）：
  *

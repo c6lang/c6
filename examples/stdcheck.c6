@@ -1,6 +1,6 @@
 /* examples/stdcheck.c6 —— 第五十八批（校验与纠错）的集成示例。
  *
- *     make std-check
+ *     cmake --build build --target std-check
  *
  * 四节：校验位（Luhn/ISBN/Verhoeff）、CRC-8/16（流式）、汉明码纠 1 位错、
  * 经典密码往返。Crc 与 HammingBlock 都用**方法**调用。

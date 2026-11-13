@@ -1,6 +1,6 @@
 /* freestanding 下的 spawn / thread：程序自己实现 pthread（真线程）
  *
- *   make fstest-spawn
+ *   cmake --build build --target fstest-spawn
  *
  * examples/freestanding_pthread.c 用 clone + futex 实现那 8 个入口（普通 C，
  * 不是 c6），这里只写 c6：spawn、thread 句柄、h->join()、h->value()，以及在线程

@@ -1,10 +1,13 @@
 # check-install：由 c6/CMakeLists.txt 生成，通过 `cmake -P` 执行。
 #
 # 把 install() 结果装进 DESTDIR 暂存树，然后：
-#   1. 检查编译器 / libtcc / 头文件是否都在；
-#   2. 用暂存树里的 c6Config.cmake 配置、编译并运行一个 find_package(c6)
-#      消费方（真的链接 c6::libtcc，而不只是检查文件存在）；
-#   3. 用暂存树里的 c6.pc 跑一遍 pkgconf 的三个典型查询。
+#   1. 按 install() 清单核对编译器 / libtcc / 公共头 / libtcc1.a / 内置
+#      include / tcc 兼容软链；
+#   2. 用装出去的 c6 加 -B 真的编译并运行一个程序；
+#   3. 用暂存树里的 c6Config.cmake 配置、编译并运行一个 find_package(c6)
+#      消费方（真的链接 c6::libtcc），再验证不存在的版本会被拒绝；
+#   4. 用暂存树里的 c6.pc 跑 pkgconf 典型查询，并校验 prefix 随 DESTDIR
+#      重定位。
 # 生成的目录都在 CMake 构建目录里，不会污染源码树。
 
 set(_c6_bin "@CMAKE_CURRENT_BINARY_DIR@")
@@ -17,6 +20,9 @@ set(_c6_pkgconfig "@C6_PKGCONFIG_DIR_REL@")
 set(_c6_packagedir "@C6_PACKAGE_DIR@")
 set(_c6_have_cmake_pkg "@C6_INSTALL_CMAKE_PACKAGE@")
 set(_c6_have_pc "@C6_INSTALL_PKGCONF@")
+set(_c6_have_libtcc_pc "@C6_INSTALL_LIBTCC_PC@")
+set(_c6_symlink "@C6_INSTALL_TCC_SYMLINK@")
+set(_c6_tccdir "@C6_TCCDIR_REL@")
 set(_c6_exe_suf "@C6_TCC_EXESUF@")
 set(_c6_lib "@C6_LIBTCC_FILENAME@")
 set(_c6_cc "@CMAKE_C_COMPILER@")
@@ -36,14 +42,22 @@ if(NOT _r EQUAL 0)
 endif()
 
 set(_c6_root "${_c6_stage}/${_c6_prefix_rel}")
+# 不只是「几个关键文件」：编译器、embeddable 库、公共头、运行时库、内置
+# include、兼容软链逐一按 install() 清单核对。
 foreach(_f IN ITEMS
     "${_c6_root}/${_c6_bindir}/c6${_c6_exe_suf}"
     "${_c6_root}/${_c6_libdir}/${_c6_lib}"
-    "${_c6_root}/${_c6_includedir}/libtcc.h")
+    "${_c6_root}/${_c6_includedir}/libtcc.h"
+    "${_c6_root}/${_c6_tccdir}/libtcc1.a"
+    "${_c6_root}/${_c6_tccdir}/include/tcclib.h"
+    "${_c6_root}/${_c6_tccdir}/include/stdarg.h")
   if(NOT EXISTS "${_f}")
     message(FATAL_ERROR "check-install: 安装树里缺 ${_f}")
   endif()
 endforeach()
+if(_c6_symlink STREQUAL "ON" AND NOT EXISTS "${_c6_root}/${_c6_bindir}/tcc")
+  message(FATAL_ERROR "check-install: 安装树里缺 bindir/tcc -> c6 兼容软链")
+endif()
 
 # 共享 libtcc 时，c6 可执行文件在暂存树里也要能找到库。
 set(_c6_run_env "${_c6_cmake}" -E env
@@ -56,10 +70,36 @@ if(NOT _r EQUAL 0)
 endif()
 message(STATUS "check-install: c6 -v -> ${_out}")
 
+# 真的用装出去的 c6 编译并运行一个程序：-B 显式指到暂存树，验证
+# libtcc1.a 与内置 include 在包内自洽，而不只是 c6 -v 能启动。
+file(WRITE "${_c6_consumer}/hello.c"
+"#include <stdio.h>\nint main(void) { puts(\"c6 -B ok\"); return 0; }\n")
+execute_process(
+  COMMAND ${_c6_run_env} "${_c6_root}/${_c6_bindir}/c6${_c6_exe_suf}"
+          -B "${_c6_root}/${_c6_tccdir}"
+          -o "${_c6_consumer}/hello" "${_c6_consumer}/hello.c"
+  RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _r EQUAL 0)
+  message(FATAL_ERROR
+    "check-install: c6 -B 编译失败 (${_r})\n${_out}\n${_err}")
+endif()
+execute_process(
+  COMMAND "${_c6_consumer}/hello"
+  RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _r EQUAL 0 OR NOT _out MATCHES "c6 -B ok")
+  message(FATAL_ERROR
+    "check-install: -B 编译产物运行失败 (${_r})\n${_out}\n${_err}")
+endif()
+message(STATUS "check-install: c6 -B 编译运行 -> ${_out}")
+
 if(_c6_have_pc)
   set(_c6_pc_dir "${_c6_root}/${_c6_pkgconfig}")
   if(NOT EXISTS "${_c6_pc_dir}/c6.pc")
     message(FATAL_ERROR "check-install: 安装树里缺 ${_c6_pc_dir}/c6.pc")
+  endif()
+  if(_c6_have_libtcc_pc STREQUAL "ON"
+     AND NOT EXISTS "${_c6_pc_dir}/libtcc.pc")
+    message(FATAL_ERROR "check-install: 安装树里缺 ${_c6_pc_dir}/libtcc.pc")
   endif()
   find_program(_c6_pkgconf NAMES pkgconf pkg-config)
   if(_c6_pkgconf)
@@ -77,6 +117,25 @@ if(_c6_have_pc)
       endif()
       message(STATUS "check-install: pkgconf ${_c6_pc_args} -> ${_out}")
     endforeach()
+    # .pc 的 prefix 用 ${pcfiledir} 反推，必须指到 DESTDIR 里的暂存根，
+    # 否则包被搬到别的前缀后会去找打包机上的绝对路径。
+    execute_process(
+      COMMAND "${_c6_cmake}" -E env "PKG_CONFIG_PATH=${_c6_pc_dir}"
+              "${_c6_pkgconf}" --variable=prefix c6
+      RESULT_VARIABLE _r OUTPUT_VARIABLE _pc_prefix
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_VARIABLE _err)
+    if(NOT _r EQUAL 0)
+      message(FATAL_ERROR
+        "check-install: pkgconf --variable=prefix 失败 (${_r})\n${_err}")
+    endif()
+    get_filename_component(_pc_prefix "${_pc_prefix}" ABSOLUTE)
+    get_filename_component(_c6_root_abs "${_c6_root}" ABSOLUTE)
+    if(NOT _pc_prefix STREQUAL _c6_root_abs)
+      message(FATAL_ERROR
+        "check-install: pkgconf prefix 未随 DESTDIR 重定位："
+        "${_pc_prefix} != ${_c6_root_abs}")
+    endif()
+    message(STATUS "check-install: pkgconf prefix -> ${_pc_prefix}")
   else()
     message(STATUS "check-install: 没找到 pkgconf，跳过 .pc 运行时校验")
   endif()
@@ -135,6 +194,24 @@ int main(void)
     message(FATAL_ERROR "check-install: 消费方运行失败 (${_r})\n${_out}\n${_err}")
   endif()
   message(STATUS "check-install: find_package(c6) 消费方运行 -> ${_out}")
+
+  # 负例：一个明显不存在的版本必须被 c6ConfigVersion.cmake 拒绝，否则
+  # 版本文件没有真正生效。
+  file(MAKE_DIRECTORY "${_c6_consumer}/negative")
+  file(WRITE "${_c6_consumer}/negative/CMakeLists.txt"
+"cmake_minimum_required(VERSION 3.18)
+project(c6-negative LANGUAGES NONE)
+find_package(c6 999.0 REQUIRED)
+")
+  execute_process(
+    COMMAND "${_c6_cmake}" -S "${_c6_consumer}/negative"
+            -B "${_c6_consumer}/negative/build" "-Dc6_DIR=${_c6_config_dir}"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(_r EQUAL 0)
+    message(FATAL_ERROR
+      "check-install: find_package(c6 999.0) 竟然通过，版本文件没生效")
+  endif()
+  message(STATUS "check-install: find_package(c6 999.0) 按预期被拒绝")
 endif()
 
 message(STATUS "check-install: 通过（stage=${_c6_stage}）")

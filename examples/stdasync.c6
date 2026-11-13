@@ -1,6 +1,6 @@
 /* examples/stdasync.c6 —— 第七十二批（异步编程基础）的集成示例。
  *
- *     make std-async
+ *     cmake --build build --target std-async
  *
  * 四节：Future 回调与组合、定时器堆、协作式任务、reactor（poll + 定时器）。
  */

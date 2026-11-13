@@ -1,0 +1,48 @@
+c6 —— CMake 是唯一构建入口，CTest 是唯一测试调度器（根 Makefile 已移除）
+
+  配置    cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
+  构建    cmake --build build --parallel
+  日常    ctest --test-dir build -L daily --output-on-failure
+  全量    ctest --test-dir build -L regression -LE aux -j 8 --output-on-failure
+  单个    ctest --test-dir build -R '^std-demo$' --output-on-failure
+  重跑    ctest --test-dir build --rerun-failed --output-on-failure
+  验收    cmake --build build --target check-all   （= ctest -L regression -LE aux -j N）
+  辅助    cmake --build build --target check-aux  （4 个 aux 用例，串行）
+  安装    DESTDIR=$PWD/pkg cmake --install build
+  校验    cmake --build build --target check-install
+  打包    cpack --config build/CPackConfig.cmake -G DEB -B packages
+  全部    cmake --build build --target help
+
+CTest 标签：
+
+  daily         日常 5 个用例：selftest / errcheck / tests2 / C99 两套
+  regression    完整回归矩阵（实现在 tests/regression.sh）
+  core          test-all 的等价集合
+  std           标准库集成用例（每用例独立 build/tests/<用例>/）
+  parallel      C6_CHECK_PARALLEL 白名单，历史上验证过可并发
+  aux           不进聚合门禁：check-tcc / ubcheck / safegate / bench-async
+  source-tree   被测程序写死源码树 build/ 的 5 个用例
+  selfhost / freestanding / backend / tests2   其它分组
+
+三组 RESOURCE_LOCK 互斥：fstest（递归调用）、tests2（写源码树）、
+source-tree（stdtest / std-kit / std-client / std-serve / std-fsx 会写
+源码树里固定的 build/... 路径）。其余用例全并发。
+
+同名构建目标仍保留，但只是转发给 ctest -R 的兼容薄壳；BUILD_TESTING=OFF
+时同名目标改为打印提示而不是消失。日志在 build/Testing/Temporary/，
+check-all 的 -j 由 -DC6_CHECK_JOBS=N 控制。
+
+tcc/Makefile 的产物落在 tcc/ 源码树，同一时间只应有一个构建目录：
+配置阶段会检测其它构建目录留下的 config.mak 并给出警告，构建阶段的
+tcc-config 会自动把配置同步回当前构建目录并清理旧目标文件。
+
+构建/清理：
+
+  build / build-plain / mode-ext / mode-plain / c99（后端已内置，只打印说明）
+  test-plain（上游模式重建后跑 tests2，不是 CTest 用例；会替换编译器，
+             不要与 ctest 并发运行）
+  c6-clean / clean-all / distclean（CMake 自带 clean 只清构建目录）
+  wasmrt / wasmtest（由 CMake 直调 scripts/ 下两个脚本）
+
+每个用例的含义、自举三条路线怎么比对，见 docs/reference/cli.md 与
+docs/manual/testing.md；测试怎么组织、诊断用例怎么写，见后者。

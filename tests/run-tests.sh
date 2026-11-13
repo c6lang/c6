@@ -22,7 +22,7 @@
 #   LLVMFLAGS 交给 LLVMCC 的参数（默认 -fuse-ld=lld，见 docs/reference/llvm-backend.md）
 #   C99FLAGS  交给 C99CC 的参数（默认 ISO C99 + 严格告警）；把 C99CC 换成
 #             tcc 时用它去掉 gcc 专有的开关，例如 "-B <仓库>/tcc -std=c99 -w"
-#             （见 make c99tcc-test）
+#             （见 cmake --build build --target c99tcc-test）
 #
 # 测试分组（所有 c6 代码都在 .c6 文件里：后缀是唯一的开关，命令行没有
 # -std=c6 这个选项）：
@@ -73,12 +73,12 @@ llvm) ;;
 esac
 
 if [ "$BACKEND" = native ] && [ ! -x "$TCC" ]; then
-    echo "run-tests: 找不到 $TCC，先执行 'make build'" >&2
+    echo "run-tests: 找不到 $TCC，先执行 'cmake --build build'" >&2
     exit 1
 fi
 if [ "$BACKEND" = c99 ]; then
     if [ ! -x "$C99TCC" ]; then
-        echo "run-tests: 找不到 $C99TCC，先执行 'make build'" >&2
+        echo "run-tests: 找不到 $C99TCC，先执行 'cmake --build build'" >&2
         exit 1
     fi
     if ! command -v "$C99CC" >/dev/null 2>&1; then
@@ -88,7 +88,7 @@ if [ "$BACKEND" = c99 ]; then
 fi
 if [ "$BACKEND" = llvm ]; then
     if [ ! -x "$C99TCC" ]; then
-        echo "run-tests: 找不到 $C99TCC，先执行 'make build'" >&2
+        echo "run-tests: 找不到 $C99TCC，先执行 'cmake --build build'" >&2
         exit 1
     fi
     if ! command -v "$LLVMCC" >/dev/null 2>&1        && [ ! -x "/usr/lib/llvm-19/bin/$LLVMCC" ]; then
@@ -104,7 +104,7 @@ if [ "$BACKEND" = llvm ]; then
         ;;
     esac
     if [ ! -f "$ROOT/tcc/libtcc1.a" ]; then
-        echo "run-tests: 找不到 $ROOT/tcc/libtcc1.a，先执行 'make build'" >&2
+        echo "run-tests: 找不到 $ROOT/tcc/libtcc1.a，先执行 'cmake --build build'" >&2
         exit 1
     fi
 fi
@@ -725,7 +725,7 @@ for src in "$ROOT"/tests/c99/*.c6; do
     is_wanted "$name" || continue
 
     if [ ! -x "$C99TCC" ]; then
-        fail "$name" "找不到 $C99TCC（先执行 make build）"
+        fail "$name" "找不到 $C99TCC（先执行 cmake --build build）"
         continue
     fi
     if ! command -v "$C99CC" >/dev/null 2>&1; then

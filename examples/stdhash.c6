@@ -1,6 +1,6 @@
 /* examples/stdhash.c6 —— 第三十八批（哈希与校验）的集成示例。
  *
- *     make std-hash
+ *     cmake --build build --target std-hash
  *
  * 四节：SHA-3-256 / SHAKE128、BLAKE2s-256、CRC-32C、XXH32/XXH64。每节都拿已知
  * 向量对一遍，再演示一次流式与一次性的结果相同。

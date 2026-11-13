@@ -6,6 +6,7 @@
 *.o
 *.a
 *.exe
+*.core
 
 # 自举产物（cmake --build build --target selfhost / c99selfhost）
 /build/

@@ -1,6 +1,6 @@
 /* examples/stdpacket.c6 —— 第四十九批（网络报文）的集成示例。
  *
- *     make std-packet
+ *     cmake --build build --target std-packet
  *
  * 四节：NTP（报文头 + 时间戳换算 + 偏移估计）、syslog（5424 与 3164 解析、
  * 5424 构造）、STUN（构造/解析 + XOR-MAPPED-ADDRESS）、TFTP（RRQ/DATA/ACK）。

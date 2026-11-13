@@ -1,6 +1,6 @@
 /* examples/stdmesh.c6 —— 第八十一批（三维网格与材质）的集成示例。
  *
- *     make std-mesh
+ *     cmake --build build --target std-mesh
  *
  * 四节：OBJ（顶点/面游标 + 包围盒）、STL（二进制与 ASCII）、PLY（头解析 + 面）、
  * MTL（材质块游标 + 按名字查）。

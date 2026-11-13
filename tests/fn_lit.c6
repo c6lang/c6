@@ -21,7 +21,7 @@
  * tests/errors/fn_lit.c6），需要那些值时把它们作为参数传进来。
  *
  * 运行（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  * 或单个文件：
  *   ./tcc/tcc -B tcc -test tests/fn_lit.c6
  */

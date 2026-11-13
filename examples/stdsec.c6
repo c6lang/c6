@@ -1,6 +1,6 @@
 /* examples/stdsec.c6 —— 第八十五批（密钥交换 + 传输安全策略 + 抓取许可 + 45 进制）。
  *
- *     make std-sec
+ *     cmake --build build --target std-sec
  *
  * 五节，每节都按方法风格调用（`alice.init(...)`、`st.add(...)`、`d.next(&e)`）：
  *   1. X25519：双方各算一次公钥、交换后共享密钥一致，非法公钥被拒；

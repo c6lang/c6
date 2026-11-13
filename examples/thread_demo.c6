@@ -1,7 +1,7 @@
 /* spawn 用法演示：OS 线程
  *
  * 编译运行（在仓库根目录）：
- *   make build
+ *   cmake --build build
  *   ./tcc/tcc -B tcc -run examples/thread_demo.c6
  *
  * 'spawn f(a);' 是一句普通语句：参数在这里求值、复制到堆上的参数块，然后

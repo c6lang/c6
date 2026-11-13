@@ -1,6 +1,6 @@
 /* examples/stdgeo2.c6 —— 第七十九批（计算几何）的集成示例。
  *
- *     make std-geo2
+ *     cmake --build build --target std-geo2
  *
  * 四节：凸包（面积/周长/点内）、多边形（凹形、形心、边游标）、线段（相交/距离）、
  * 最近点对（分治与暴力对拍）。

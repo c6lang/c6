@@ -1,6 +1,6 @@
 /* examples/stdtime.c6 —— 第四十八批（时间工具）的集成示例。
  *
- *     make std-time
+ *     cmake --build build --target std-time
  *
  * 四节：日历（天数/星期/ISO 周）、ISO 8601 日期时间解析与格式化、时长解析与
  * 格式化、cron 表达式的匹配与「下次运行」。

@@ -17,7 +17,7 @@
  *   7. 同一个作用域里超过 32 个清理点（位图跨字）
  *
  * 运行（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  * 或单个文件：
  *   ./tcc/tcc -B tcc -test tests/defer_scope.c6
  */

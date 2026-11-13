@@ -17,7 +17,7 @@
  * - `o.ternary(lo, hi)` 三分法，收敛到 `1e-9` 的区间宽度（凸函数更快，但要两次取值）；
  * - `o.grid(lo, hi, n)` 先等分 `n` 段取最小点，再在相邻格子里黄金分割细化；
  * - `o.best_x()` 极值点、`o.best_value()` 极值、`o.iters()` 迭代次数、`o.error()`（0 正常、-1 参数）；
- * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <string.h>

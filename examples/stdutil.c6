@@ -1,6 +1,6 @@
 /* examples/stdutil.c6 —— 第九十一批（网段 / 字节序 / 排序键 / 断词）。
  *
- *     make std-util
+ *     cmake --build build --target std-util
  *
  * 五节，全部方法调用（`c.parse(...)`、`r.read_u32()`、`col.key(...)`、`h.breaks(...)`）：
  *   1. CIDR：解析、包含判断、网段信息、子网划分游标；

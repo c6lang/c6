@@ -3253,7 +3253,7 @@ stdmore: 28 check(s), 0 failure(s)
 
 四个模块各一节：bitset 的置位/计数/按位遍历/末字掩码、glob 的 `*`/`?` 与路径
 模式、base32 的 RFC 向量与非法输入、http 的请求/响应/头字段/body。它和
-`stdtest` 一样，把「模块正文要单独列在命令行上」这件事钉在 Makefile 里。
+`stdtest` 一样，把「模块正文要单独列在命令行上」这件事钉在回归脚本的用例里。
 
 ### 集成示例：`examples/stdnext.c6`
 
@@ -3267,7 +3267,7 @@ stdnext: 23 check(s), 0 failure(s)
 ```
 
 四节分别是 base58 的已知向量/前导零、varint 的 300/负数往返、semver 的经典优先级
-序列、cookie 的属性与 Max-Age。和 `stdmore` 一样，Makefile 里显式列出模块正文。
+序列、cookie 的属性与 Max-Age。和 `stdmore` 一样，回归脚本里显式列出模块正文。
 
 ### 集成示例：`examples/stdnode.c6`
 
@@ -3281,7 +3281,7 @@ stdnode: 17 check(s), 0 failure(s)
 ```
 
 四节分别是侵入式链表的 push/迭代/remove、环形队列的回绕、UTF-16 代理对与非法
-代理、ANSI SGR/256 色/光标移动。Makefile 里照旧显式列出四个模块正文。
+代理、ANSI SGR/256 色/光标移动。回归脚本里照旧显式列出四个模块正文。
 
 ### 集成示例：`examples/stdform.c6`
 
@@ -3297,7 +3297,7 @@ stdform: 26 check(s), 0 failure(s)
 四节讲同一条链路：props 读 `.env` 配置（三种分隔符、`export`、续行、`\u` 解码、
 空键报错）→ multipart 收表单（文本字段与文件字段、头字段名大小写不敏感）→
 punycode 把 `münchen.de`/`中文.cn` 转成 A-label 再转回来 → width 按列宽裁剪、
-补齐、做宽字符列对齐。Makefile 里照旧显式列出四个模块正文，外加
+补齐、做宽字符列对齐。回归脚本里照旧显式列出四个模块正文，外加
 `std/text/utf8.c6`（width/punycode 用它的 `utf8_decode`；`Str` 类型只靠 `import`
 带来的声明，不需要 str 的正文）。
 
@@ -3316,7 +3316,7 @@ stdembed: 30 check(s), 0 failure(s)
 crc 算 Modbus 请求的 CRC-16、1-Wire ROM 的 CRC-8、CRC-32C 与 Fletcher/LRC/NMEA
 异或 → pool 用固定块收样本（结构体直接放进块、释放后按 LIFO 复用）→ frame 把
 负载编码成 COBS 帧和 SLIP 帧再解回来（含「输出缓冲不够时一个字节都不写」与
-「负载里未转义的 END 要报错」）。Makefile 里显式列出四个模块正文，它们都只
+「负载里未转义的 END 要报错」）。回归脚本里显式列出四个模块正文，它们都只
 依赖 `std/core/types.c6`。
 
 ### 集成示例：`examples/stdtext.c6`
@@ -3336,7 +3336,7 @@ stdtext: 35 check(s), 0 failure(s)
 kitten/sitting 的编辑距离、换位距离、千分比与子序列打分（`updt` 最像 `update`）；
 wrap 把中英混排的帮助文本折成 34 列（首行缩进 2、续行 6），逐行验宽度 ≤ 34，
 再用 `text_center` 居中标题；diff 给两份 4 行配置的 `@@ -1,4 +1,4 @@`（ctx=1），
-并验「放不下返回 -1」。Makefile 里显式列出八个模块正文（regex/fuzzy 依赖
+并验「放不下返回 -1」。回归脚本里显式列出八个模块正文（regex/fuzzy 依赖
 `std/text/utf8.c6`，wrap 再依赖 `std/text/width.c6`，diff 依赖 `std/core/mem.c6`）。
 
 ### 集成示例：`examples/stdnum.c6`
@@ -3355,7 +3355,7 @@ stdnum: 21 check(s), 0 failure(s)
 6.5% 税额按分四舍五入、合计，并钉住 `0.1 + 0.2 == 0.3` 与 `1/3` 的 9 位结果；
 「有理数」累加调和级数 `H_10 = 7381/2520`（再转 f64 复核），并比较交叉相乘会溢出的
 两个大分数；「复数」算 `(3+4i)(1-2i) = 11-2i`、`|3+4i| = 5`、`(3+4i)^2`、共轭乘积
-与除零的 IEEE 行为。Makefile 里显式列出六个模块正文（complex 依赖 `std/core/math.c6`）。
+与除零的 IEEE 行为。回归脚本里显式列出六个模块正文（complex 依赖 `std/core/math.c6`）。
 
 ### 集成示例：`examples/stdpack.c6`
 
@@ -3378,7 +3378,7 @@ stdpack: 24 check(s), 0 failure(s)
 拒绝）；「游程」对 256 个缓变采样先差分再 RLE（6 字节），再解回原采样（并验截断
 的字面量被拒绝）；「文本编码」钉住 Ascii85 的 `hello → BOu!rDZ` 与 Z85 的标准向量
 `HelloWorld`，再做 37 字节任意二进制的往返；「十六进制」按 8 字节一行、偏移从
-0x1000 起排版并反向解析，另验纯 hex 输入与大写/无 ASCII 列。Makefile 里显式列出
+0x1000 起排版并反向解析，另验纯 hex 输入与大写/无 ASCII 列。回归脚本里显式列出
 六个模块正文（四个模块都只依赖 `std/core/types.c6`）。
 
 ### 集成示例：`examples/stdconf.c6`
@@ -3403,7 +3403,7 @@ stdconf: 19 check(s), 0 failure(s)
 「查询串」从 `q=hello+world&page=2&tag=%E4%B8%AD` 里取解码后的值，再把两个参数重新
 构建成 `q=hello+world&page=3`；「模板」把前面拿到的值填进
 `[{{title}}] {{host}}:{{port}} (debug={{debug}})`，并验严格/宽松两种缺变量行为。
-Makefile 里显式列出九个模块正文（toml 依赖 str+num+err，其余只依赖 str）。
+回归脚本里显式列出九个模块正文（toml 依赖 str+num+err，其余只依赖 str）。
 
 ### 集成示例：`examples/stdcli.c6`
 
@@ -3434,7 +3434,7 @@ stdcli: 17 check(s), 0 failure(s)
 未知选项报错）；「自然」用 `natural_cmp` 给 file1/file2/file10/file20 排序，再把
 1536 字节、3723000ms、1234567 格式化成人类可读；「表格」把文件名与大小排成对齐的
 两列表（右对齐），并验长度与内容；「子进程」跑 `sh -c "exit 5"` 看退出码、验
-`kill -TERM $$` 的信号终止，最后在 PATH 里找 `sh`。Makefile 里显式列出九个模块
+`kill -TERM $$` 的信号终止，最后在 PATH 里找 `sh`。回归脚本里显式列出九个模块
 正文（args 依赖 str、table 依赖 width+utf8，natural 与 proc 只依赖 types）。
 
 ### 集成示例：`examples/stdwire.c6`
@@ -3458,7 +3458,7 @@ stdwire: 19 check(s), 0 failure(s)
 RFC 6455 的 `Sec-WebSocket-Accept` 向量，再编码一帧带掩码的文本并解回来；
 「DNS」构建 example.com 的 A 查询，再解一段带压缩指针的响应（地址、TTL）；
 「TCP」在 127.0.0.1:0 上监听、连接、接受、双向收发，并验超时返回 -1、对端关闭
-返回 0。Makefile 里显式列出八个模块正文（ws 依赖 sha1+base64+err，其余只依赖
+返回 0。回归脚本里显式列出八个模块正文（ws 依赖 sha1+base64+err，其余只依赖
 types）。
 
 ### 集成示例：`examples/stdalgo.c6`
@@ -3481,7 +3481,7 @@ stdalgo: 26 check(s), 0 failure(s)
 跑 Dijkstra（距离 3/1/4 与前驱链）；「LRU」容量 3，命中/未命中/淘汰后检查统计；
 「前缀树」放 5 条命令，查 `git`/`git commit` 与 `"git "` 前缀，再删 `go` 确认
 `gofmt` 还在；「区间」加两段地址、查半开区间的边界、找 0x2000 处的空隙，再把
-两段桥接成一段。Makefile 里显式列出六个模块正文（四个模块都只依赖
+两段桥接成一段。回归脚本里显式列出六个模块正文（四个模块都只依赖
 `std/core/types.c6`）。
 
 ### 集成示例：`examples/stdthread.c6`
@@ -3505,7 +3505,7 @@ stdthread: 29 check(s), 0 failure(s)
 「有读者时拿不到写锁」、信号量的 P/V 计数；「线程池」4 个 worker 分四段算
 1..400 的和（80200），查完成计数与 `stop` 之后不再接活；「通道」容量 4 的通道
 上一个生产者发 1..100、一个消费者求和（5050），关掉通道后消费者退出。
-Makefile 里显式列出六个模块正文（chan 依赖 sync，其余各自只依赖 types）。
+回归脚本里显式列出六个模块正文（chan 依赖 sync，其余各自只依赖 types）。
 
 ### 集成示例：`examples/stdterm.c6`
 
@@ -3529,7 +3529,7 @@ stdterm: 45 check(s), 0 failure(s)
 发信号只挂起不投递、`unblock` 补投一次、名字↔编号互转；「管道」写 5 字节读回来、
 关写端读到 EOF、非阻塞下 `EAGAIN`；「轮询」两个管道 fd 都没数据时 `wait(0)`
 返回 0，往第二个写一个字节之后 `wait(200)` 只有一个就绪、`ready(1)` 带
-`EVENT_READ`，单 fd 的 `wait_readable` 超时/就绪都对。Makefile 里显式列出六个
+`EVENT_READ`，单 fd 的 `wait_readable` 超时/就绪都对。回归脚本里显式列出六个
 模块正文（tty/signal/pipe/poll 都只依赖 `std/core/types.c6`）。
 
 ### 集成示例：`examples/stdclient.c6`
@@ -3559,7 +3559,7 @@ stdclient: 36 check(s), 0 failure(s)
 当本地 HTTP 服务器（读一个请求、回一段 chunked 响应），父进程用 `fetch` 发
 `GET /hello`，检查状态码、`res.chunked`、body 拼接结果、头字段大小写不敏感和
 「chunked 响应没有 `Content-Length`」。两个子进程都在 127.0.0.1 上，所以整份
-示例离线可跑；Makefile 里显式列出十二个模块正文（udp/uds 只依赖
+示例离线可跑；回归脚本里显式列出十二个模块正文（udp/uds 只依赖
 `std/core/types.c6`，resolver 要 dns/udp/io/str，httpc 要 tcp/url/str）。
 
 ### 集成示例：`examples/stdserve.c6`
@@ -3581,7 +3581,7 @@ stdserve: 28 check(s), 0 failure(s)
 （落到 `index.html`）、`..%2f` 编码越界（403）、`/login`（拿到 `Set-Cookie:
 sid=...`）、带 Cookie 的 `/me`（`user=ada`）、不带 Cookie 的 `/me`（401）。
 所以这一批的客户端和服务端在同一个示例里互相验证，`cmake --build build --target std-serve` 不联网。
-Makefile 里显式列出十九个模块正文（httpd 要 http/tcp，assets 还要
+回归脚本里显式列出十九个模块正文（httpd 要 http/tcp，assets 还要
 mime/url/fs/io/path/err，session 要 rand/time/cookie，客户端要 httpc）。
 
 ### 集成示例：`examples/stdcrypto.c6`
@@ -3605,7 +3605,7 @@ stdcrypto: 28 check(s), 0 failure(s)
 case 1 的 extract+expand 并核对 8160 字节上限；pbkdf2 用 RFC 6070 的 4096 次
 SHA-1 向量和 SHA-256 的 64 字节向量。最后用 HMAC-SHA-256 拼一个「签名 token」：
 签发、用 `sha256_eq` 常数时间校验、改一个字节后拒绝。期望值都来自 RFC，所以
-输出与平台无关。Makefile 里显式列出十一个模块正文（md5/sha512 要 bits，
+输出与平台无关。回归脚本里显式列出十一个模块正文（md5/sha512 要 bits，
 hkdf 要 sha256，pbkdf2 要 sha1+sha256）。
 
 ### 集成示例：`examples/stdfsx.c6`
@@ -3630,7 +3630,7 @@ stdfsx: 33 check(s), 0 failure(s)
 `walk_stat` 数出 2 文件 1 目录 7 字节，`max_depth = 1` 只看直属条目，
 最后 `remove_tree` 删干净；「lock」`fork` 一个子进程持排他锁 250ms，父进程
 先 `try_acquire` 拿到 0（忙）、`acquire(…, 60)` 超时、`acquire(…, 2000)` 等到
-子进程退出后拿到。Makefile 里显式列出十一个模块正文（walk 要 fs/path/str/err，
+子进程退出后拿到。回归脚本里显式列出十一个模块正文（walk 要 fs/path/str/err，
 lock 要 time，temp 只借 Str 类型）。
 
 ### 集成示例：`examples/stdcipher.c6`

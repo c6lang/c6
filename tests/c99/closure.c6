@@ -6,7 +6,7 @@
  * `gcc -std=c99 -pedantic -Wall -Wextra -Werror` 且零告警。
  *
  * 运行（仓库根目录）：
- *   make c99test
+ *   cmake --build build --target c99test
  */
 // EXIT 0
 // OUTPUT add 7

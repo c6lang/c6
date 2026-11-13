@@ -57,8 +57,8 @@ jobs:
       - name: Build
         run: cmake --build build --parallel "$(nproc)"
 
-      - name: Test (CTest)
-        run: ctest --test-dir build --output-on-failure
+      - name: Test (CTest daily)
+        run: ctest --test-dir build -L daily --output-on-failure
 
       # 校验 DESTDIR 安装树里的 CMake 包配置与 pkgconf 元数据：
       # check-install 会 staged install、configure 一个消费方工程、链接并运行。
@@ -75,28 +75,37 @@ jobs:
             ./build/check-install/stage/usr/bin/c6 -v
 
   # -------------------------------------------------------------------------
-  # 完整回归矩阵（91 个 std-*、自举、freestanding、tests2 等），默认不跑。
+  # 完整回归矩阵（91 个 std-*、自举、freestanding、tests2 等）。
+  # 手动触发或 v* tag 发布时运行；release 依赖本 job，tag 上不会被跳过。
   # -------------------------------------------------------------------------
   regression:
-    name: full regression (check-all)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_regression }}
+    name: full regression (CTest -L regression)
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full_regression) || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # 缺工具链时 bare/wasm/c99 用例会静默跳过，门禁形同虚设：
+      # qemu-system-x86 给 fstest-qemu，clang 给 C99/wasm，golang-go 给
+      # fstest-go / fstest-bare-go，qemu-user 给交叉运行。
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake make gcc binutils texinfo perl pkgconf qemu-user nodejs
+            cmake make gcc binutils texinfo perl pkgconf \
+            qemu-user qemu-system-x86 clang golang-go nodejs
       - name: Configure and build
         run: |
           cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr \
-            -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TESTING=OFF
+            -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TESTING=ON
           cmake --build build --parallel "$(nproc)"
+      # aux（check-tcc / ubcheck / safegate / bench-async）不属于回归门禁；
+      # bench-async 需要 g++/rustc/go/uya，用 check-aux 在完整环境里单独跑。
       - name: Full regression matrix
-        run: cmake --build build --target check-all
+        run: ctest --test-dir build -L regression -LE aux -j "$(nproc)" --output-on-failure
+      - name: Lightweight auxiliary checks
+        run: ctest --test-dir build -L aux -E '^bench-async$' --output-on-failure
 
   # -------------------------------------------------------------------------
   # 打包：DEB / RPM / TGZ，全部复用同一份 install() 清单。
@@ -174,8 +183,10 @@ jobs:
   # -------------------------------------------------------------------------
   release:
     name: publish release
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    needs: [test, package]
+    # always() 让被跳过的 needs 不阻塞发布，但仍要挡住任何失败/取消；
+    # regression 在 v* tag 上一定会运行（见上面 if），所以发布必然等它。
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    needs: [test, package, regression]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

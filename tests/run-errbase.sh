@@ -1,5 +1,5 @@
 #!/bin/sh
-# c6 错误码号段表（errbase.def）的检查：`make errcheck` 调用。
+# c6 错误码号段表（errbase.def）的检查：`cmake --build build --target errcheck` 调用。
 #
 # 这个脚本守两件事：
 #   1. 仓库根目录的 errbase.def 与「现在 --emit-errbase 会产出的东西」一致：
@@ -29,7 +29,7 @@ pass() { npass=$((npass + 1)); echo "ok   $1"; }
 fail() { nfail=$((nfail + 1)); echo "FAIL: $1" >&2; shift; [ $# -eq 0 ] || printf '%s\n' "$@" | sed 's/^/      /' >&2; }
 
 if [ ! -x "$TCC" ]; then
-    echo "run-errbase: 找不到 $TCC，先执行 'make build'" >&2
+    echo "run-errbase: 找不到 $TCC，先执行 'cmake --build build'" >&2
     exit 1
 fi
 

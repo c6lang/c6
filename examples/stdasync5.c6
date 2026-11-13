@@ -1,6 +1,6 @@
 /* examples/stdasync5.c6 —— 第八十三批（完整的语言级异步框架：预算/任务组/额度/取消）。
  *
- *     make std-async5
+ *     cmake --build build --target std-async5
  *
  * 五节，每一节对应框架的一个横切面：
  *   1. 额度（APool）：最多 N 个任务同时在跑；

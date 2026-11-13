@@ -1,6 +1,6 @@
 /* examples/stdordered.c6 —— 第五十二批（有序容器）的集成示例。
  *
- *     make std-ordered
+ *     cmake --build build --target std-ordered
  *
  * 四节：Treap（按排名 / 第 k 小）、二叉堆（top-k 与堆排序）、跳表（有序遍历）、
  * 频次计数器（最多出现的键）。

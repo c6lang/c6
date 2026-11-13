@@ -1,6 +1,6 @@
 /* examples/stdops.c6 —— 第八十八批（网络运维 + 媒体清单）。
  *
- *     make std-ops
+ *     cmake --build build --target std-ops
  *
  * 五节，全部方法调用（`h.parse(...)`、`d.next(&f)`、`w.build()`、`c.start_str(...)`）：
  *   1. NetFlow v5：构造两条流记录、解析回来、算平均字节与持续时长；
