@@ -356,6 +356,7 @@ static void c6_rt_end(const char *name, int nargs);
 static Sym *c6_env_base_tag(void);
 static CType c6_type_global_copy(CType *type);
 static void c6_decl_tokens(TokenString *ts);
+static void c6_decl_tokens_keep(TokenString *ts);
 static Sym *external_sym(int v, CType *type, int r, AttributeDef *ad);
 static Sym *c6_async_params(CType *ft);
 static void sym_link(Sym *s, int yes);
@@ -7267,7 +7268,7 @@ static CType c6_gen_instance(C6Gen *g, CType *args, long *vals, int nargs)
                inside a member function body, whose 'self' (and the other
                parameters) are on the stack with the same scope number */
             local_scope = save_scope + 1;
-            c6_decl_tokens(proto);      /* the signature, so a call works */
+            c6_decl_tokens_keep(proto); /* the signature, so a call works */
             local_scope = save_scope;
             c6_gen_record_sym = save_rec;
             if (!c6_gen_last_sym)
@@ -8110,7 +8111,7 @@ static int c6_gen_flush(void)
         /* the signature may have gone with a temporary scope: declare it
            again here, where the unit's file scope is being finished */
         c6_gen_record_sym = 1;
-        c6_decl_tokens(q->proto);
+        c6_decl_tokens_keep(q->proto);
         c6_gen_record_sym = save_rec;
         if (c6_gen_last_sym) {
             /* weak for the same reason as the function queue above */
@@ -8118,13 +8119,24 @@ static int c6_gen_flush(void)
             begin_macro(q->body, 1);
             next();
             gen_function(c6_gen_last_sym);
-            end_macro();
+            end_macro();            /* consumes q->body */
+            q->body = NULL;
             c6_gen_last_sym = NULL;
+        } else if (q->body) {
+            /* no symbol to compile into: drop the saved body here, the
+               queue entry goes away with q below */
+            tok_str_free(q->body);
+            q->body = NULL;
         }
         c6_gen_self_tag = save_self;
         c6_gen_unbind(bound, q->inst->nargs);
         c6_sym_global = save_global;
         local_scope = save_scope;
+        /* q->proto is owned by the queue entry: c6_decl_tokens_keep() only
+           ever consumes a copy, so this is its one and only free.  Entries
+           left in the queue on an error path are freed by c6_gen_reset(). */
+        if (q->proto)
+            tok_str_free(q->proto);
         tcc_free(q);
         n++;
     }
@@ -14704,7 +14716,7 @@ static void c6_gen_sig_flush(void)
         local_stack = NULL;
         c6_gen_self_tag = q->inst->tag;
         c6_gen_record_sym = 1;
-        c6_decl_tokens(q->proto);
+        c6_decl_tokens_keep(q->proto);
         c6_gen_record_sym = save_rec;
         if (c6_gen_last_sym && c6_gen_last_sym->v == q->sym_tok) {
             c6_sticky_add(c6_gen_last_sym);
@@ -14988,6 +15000,20 @@ static void c6_decl_tokens(TokenString *ts)
     end_macro_under(ts);
     tcc_state->warn_none = warn_none;
     tok = save_tok, tokc = save_val;
+}
+
+/* c6_decl_tokens() consumes TS: end_macro() tok_str_free()s the replay.  Some
+   synthetic token strings (a method's q->proto) are replayed more than once:
+   at instantiation, in c6_gen_sig_flush() and in c6_gen_flush().  Replaying
+   the same TokenString freed it a second time, which made tal_free_impl()
+   drop the arena's nb_allocs to zero and reset the whole 256K block while
+   other token strings (a template's g->body) were still live.  The next
+   tok_str_add() then wrote tokens over that struct, and the per-TU reset
+   finally called tok_str_free() on a pointer whose 'str' field was junk.
+   Hand the replay a disposable copy so the caller keeps ownership. */
+static void c6_decl_tokens_keep(TokenString *ts)
+{
+    c6_decl_tokens(c6_gen_tok_copy(ts));
 }
 
 static void c6_interface_parse(void)
