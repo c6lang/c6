@@ -121,7 +121,7 @@ popd >/dev/null
 make build
 
 # 3. 测试
-export LD_LIBRARY_PATH="${srcdir}/${pkgname%-git}/tcc${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" 
+export LD_LIBRARY_PATH="tcc${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" 
 make test
 
 # 4. 安装到系统
