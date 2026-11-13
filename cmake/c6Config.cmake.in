@@ -1,6 +1,6 @@
 # c6 CMake 包配置（由 c6/CMakeLists.txt 生成，请勿手改）
 #
-#   find_package(c6 0.9 REQUIRED COMPONENTS libtcc)
+#   find_package(c6 0.1 REQUIRED COMPONENTS libtcc)
 #   target_link_libraries(app PRIVATE c6::libtcc)
 #   add_custom_command(... COMMAND c6::compiler ...)
 #

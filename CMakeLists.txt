@@ -28,9 +28,13 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-# 版本以 tcc/VERSION 为唯一来源；CMake 的 project(VERSION) 只接受数值段，
-# rc 之类的预发布后缀仍由 C6_VERSION_RAW 保留给打包用。
-file(READ "${CMAKE_CURRENT_LIST_DIR}/tcc/VERSION" _c6_version_raw)
+# 版本以根目录 VERSION 为唯一来源：那是 c6 自己的发布版本（打包、pkgconf、
+# c6Config.cmake、`c6 -v` 都用它）。tcc/VERSION 是内嵌上游 TinyCC 的兼容
+# 版本，只影响 tcc 侧（TCC_VERSION 宏、libtcc 命名、tcc 文档），因为 c6 的
+# 发布节奏跟上游 tcc 无关。
+# CMake 的 project(VERSION) 只接受数值段，rc 之类的预发布后缀仍由
+# C6_VERSION_RAW 保留给打包用。
+file(READ "${CMAKE_CURRENT_LIST_DIR}/VERSION" _c6_version_raw)
 string(STRIP "${_c6_version_raw}" _c6_version_raw)
 string(REGEX MATCH "^[0-9]+(\\.[0-9]+)+" _c6_version_numeric "${_c6_version_raw}")
 project(c6
@@ -38,6 +42,7 @@ project(c6
   DESCRIPTION "c6 - TinyCC with language extensions"
   HOMEPAGE_URL "https://github.com/c6lang/c6"
   LANGUAGES C)
+set(C6_VERSION_RAW "${_c6_version_raw}")
 
 if(NOT UNIX)
   message(FATAL_ERROR

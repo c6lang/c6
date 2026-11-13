@@ -5,7 +5,26 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
-## 未发布
+## 0.1.0 — 2026-11-13
+
+第一个正式发布号。此前 c6 的「版本」只有 `tcc/VERSION`（内嵌上游 TinyCC 的
+`0.9.28rc`）这一个来源：`c6 -v`、`pkgconf --modversion c6`、DEB/RPM/TGZ 包名
+全都印的是上游版本，c6 自己的发布号无处可写。
+
+### 版本源拆成两个：根 `VERSION` = c6 发布版本，`tcc/VERSION` = 上游兼容版本
+
+- 新增仓库根 `VERSION`（= `0.1.0`）。`CMakeLists.txt` 的 `project(c6 VERSION)`
+  改读它并设 `C6_VERSION_RAW`；`cmake/C6Tcc.cmake` 不再拿 `TCC_VERSION` 覆盖
+  `C6_VERSION_RAW`，`tcc/VERSION` 读回的值只当兼容版本（`C6_TCC_VERSION`）。
+- 影响面：`c6 -v` 多打一行 `c6 0.1.0 (TinyCC 0.9.28rc)`（让 c6 侧把
+  `C6_RELEASE_VERSION` 传进 `tcc/CMakeLists.txt`，生成 `config.h` 里的
+  `C6_VERSION` 宏；独立构建 `tcc/` 时没有这个宏，输出与以前逐字一致）；
+  `c6.pc` / `libtcc.pc` 的 `Version`、`c6Config.cmake` 的 `C6_VERSION`、CPack 的
+  `CPACK_PACKAGE_VERSION` 与产物名（`c6-0.1.0-<release>-<arch>`）全部跟着走。
+- 发布链路不变：push 一个 `v*` tag，`.github/workflows/ci.yml` 的 release job
+  会跑完整回归、打 DEB/RPM/TGZ 三个包并附到 GitHub Release；发布号与 tag 现在
+  都来自根 `VERSION`，两者不会再对不上（`package` job 新增一步校验
+  `tag == v$(cat VERSION)`，不一致就直接失败，不会出现 tag 与包版本错位）。
 
 ### 修 CI：GNU make 4.3 上 `tccdefs_.h: No such file or directory`
 

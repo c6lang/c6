@@ -232,6 +232,11 @@ static const char help2[] =
     ;
 
 static const char version[] =
+#ifdef C6_VERSION
+    /* c6 的发布版本（仓库根 VERSION，由 c6 的 CMake 包装层传进来）；
+       独立构建 tcc/ 时没有这个宏，`-v` 就只剩下面那行上游格式。 */
+    "c6 " C6_VERSION " (TinyCC " TCC_VERSION ")\n"
+#endif
     "tcc version "TCC_VERSION
 #ifdef TCC_GITHASH
     " "TCC_GITHASH

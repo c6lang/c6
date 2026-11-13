@@ -129,6 +129,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake make gcc binutils texinfo perl dpkg-dev rpm
 
+      - name: Check tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # 包名里的版本来自根 VERSION，tag 只是触发器：两者不一致就会发出
+          # 「v0.2.0 的 Release 里躺着 0.1.0 的包」，这里直接挡住。
+          _ver="v$(tr -d '\n' < VERSION)"
+          if [ "$_ver" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 VERSION 文件（${_ver}）不一致"
+            exit 1
+          fi
+
       - name: Package release metadata
         id: meta
         run: |

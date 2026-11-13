@@ -5,6 +5,20 @@
 > 一句话：编译器 `tcc/c6` 的选项速查 + `tests/regression.sh` 全部回归用例。**语言开关不是选项**，
 > 是源文件后缀 `.c6`；`-std=c6` 已删除，传了会直接报错。
 
+## 版本与发布号
+
+两个版本文件各管一件事，不要混用：
+
+| 来源 | 是什么 | 谁在用 |
+|---|---|---|
+| `VERSION`（仓库根） | **c6 自己的发布版本**，唯一来源（当前 `0.1.0`） | `c6 -v` 第一行、`pkgconf --modversion c6`、`find_package(c6 X.Y)`、DEB/RPM/TGZ 包名（`c6-<version>-<release>-<arch>`）、`project(c6 VERSION)` |
+| `tcc/VERSION` | 内嵌上游 TinyCC 的**兼容版本**（`0.9.28rc`），跟着上游走 | `TCC_VERSION` 宏、`-dumpversion`、`c6 -v` 第二行、libtcc 命名与上游文档 |
+
+- 改 c6 的发布号只改根 `VERSION` 一行。带预发布后缀时（如 `0.2.0-rc1`），deb 的
+  `Version` 是 `0.2.0~rc1`、rpm 的 `Release` 是 `0.<release>.rc1`，排序才是对的。
+- 发布：push 一个 `v*` tag（如 `v0.1.0`），CI 的 release job 会跑完整回归、打
+  DEB/RPM/TGZ 三个包并附到 GitHub Release。tag 名应与根 `VERSION` 一致。
+
 ## 编译器选项
 
 ### c6 专用（只在 `C6_EXT` 构建里存在）

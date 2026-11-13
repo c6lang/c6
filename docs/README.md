@@ -45,7 +45,7 @@
 | [stdlib.md](stdlib.md) | 标准库设计与 API | 现行 | 用 `std/` |
 | [reference/grammar.md](reference/grammar.md) | 语法规范（EBNF + 重写规则） | 现行 | 查精确语法 |
 | [reference/diagnostics.md](reference/diagnostics.md) | 诊断码 C1–C134 | 现行 | 查报错、加检查 |
-| [reference/cli.md](reference/cli.md) | 编译器选项 + CMake 构建目标 | 现行 | 构建、跑测试 |
+| [reference/cli.md](reference/cli.md) | 编译器选项 + CMake 构建目标 + 版本号来源 | 现行 | 构建、跑测试、发版 |
 | [reference/c99-backend.md](reference/c99-backend.md) | C99 输出后端 | 现行 | 跨平台、自举 |
 | [reference/llvm-backend.md](reference/llvm-backend.md) | LLVM IR 后端 | 现行 | 交叉编译 |
 | [design/plan.md](design/plan.md) | 语言设计总方案 | 现行 | 改语义前 |

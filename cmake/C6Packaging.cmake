@@ -10,9 +10,11 @@
 #   cpack --config build/CPackConfig.cmake -G RPM -B packages
 
 # ---------------------------------------------------------------------------
-# 版本：tcc/VERSION 是 0.9.28rc，rc 后缀不能直接当 deb/rpm 的正式版本。
-# 用数值段 0.9.28 做 Version，预发布标记放进 deb 的 ~rc 与 rpm 的 Release，
-# 这样 deb 的排序（0.9.28~rc < 0.9.28）才是正确的。
+# 版本：C6_VERSION_RAW 来自仓库根目录 VERSION，是 c6 自己的发布版本
+# （tcc/VERSION 只是内嵌上游 TinyCC 的兼容版本，不参与打包号）。
+# 版本串带预发布后缀时（例如 0.2.0rc1），后缀不能直接当 deb/rpm 的正式
+# 版本：数值段 0.2.0 做 Version，预发布标记放进 deb 的 ~rc1 与 rpm 的
+# Release，这样 deb 的排序（0.2.0~rc1 < 0.2.0）才是正确的。
 # ---------------------------------------------------------------------------
 
 set(C6_PACKAGE_RELEASE "1" CACHE STRING
@@ -21,9 +23,13 @@ set(C6_PACKAGE_PRERELEASE "" CACHE STRING
     "预发布标记（如 rc）；留空则从 C6_VERSION_RAW 自动推断")
 
 if(NOT C6_PACKAGE_PRERELEASE)
-  string(REGEX MATCH "^[0-9]+(\\.[0-9]+)+(.+)$" _c6_ver_match "${C6_VERSION_RAW}")
-  if(_c6_ver_match)
-    set(C6_PACKAGE_PRERELEASE "${CMAKE_MATCH_2}")
+  # 去掉开头的数值版本段（0.1.0 / 0.2.0.1 …），剩下的才是预发布标记。
+  # 不能用「^[0-9]+(\.[0-9]+)+(.+)$」那种带捕获组的写法：正则回溯会把
+  # 干净的 0.1.0 拆成「0.1 + .0」，于是 deb 版本变成 0.1.0~.0。
+  string(REGEX REPLACE "^[0-9]+(\\.[0-9]+)*" "" _c6_ver_suffix "${C6_VERSION_RAW}")
+  string(REGEX REPLACE "^[-._~+]+" "" _c6_ver_suffix "${_c6_ver_suffix}")
+  if(_c6_ver_suffix)
+    set(C6_PACKAGE_PRERELEASE "${_c6_ver_suffix}")
   endif()
 endif()
 
