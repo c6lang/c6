@@ -2681,6 +2681,50 @@ co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 
 验收：`make stdtest`（346 个模块、0 failure）、`make std-async5`（34 条自检全过）、
 `make check-all`。
 
+### 11.96 标准库第八十四批（静态分析三件套：lex / parse / ub）
+
+前八十三批都是「向外」的库（编码、协议、格式、异步）；这一批向内：**用 c6 写一个
+分析 c6 的工具**。三段流水线，分三个模块，`examples/stdub.c6` 是命令行。
+
+| 模块 | 内容 | 关键取舍 |
+| --- | --- | --- |
+| `std.analysis.lex` | 流式分词器 | `Lexer` 是**纯值**（`src`/`pos`/`line`/`col`/`nerr`），整个结构体赋值就是快照，解析器回滚写 `*self = save` 即可，不需要「保存/恢复 token 流」的 API；token 全是原源码的切片，零分配。关键字单独编号（`kw`）而不是逐次 `str_eq` |
+| `std.analysis.parse` | 务实递归下降 | **目标不是完整性，是不中断**：认不出的构造记 `nerr` 并 `ps_resync` 到下一个 `;`/`}`，前 32 处 `(line,col)` 留在 `errl/errc`，让上层能说「这几处没检查」。AST 全放调用方 `Arena`，`Program` 里是函数表/符号表/`nfunc`/`nstmt` |
+| `std.analysis.ub` | 13 类 UB 检查 | 每条 `Finding` 带 `Fix{shape,line,text,code}`：`code` 是**可直接粘回源码的整行**（具体变量名/下标/常量，不留占位符）。说不出具体改法的问题**根本不生成**——「可能有风险」对用户没价值。可信度固定两档：常量能折出来/状态能沿直线追出来 = 一定，其余 = 可能 |
+
+**「准确修复建议」是这一批的验收线**，不是附带品：`a[4]` 越界给 `a[3]` 并说明
+「非要这个下标就把数组声明成 `int a[5];`」；`free` 后再用给
+`defer free(p);   // 放到函数开头…`；`memcpy` 自重叠给 `memmove`；读未初始化堆给
+`p = calloc(8, 1);`。
+
+写解析器时踩到的 c6 硬约束（都进了实现，回头看也值得记）：
+
+1. **每个变量定义都要初始化**，工厂函数只能返回「整个已初始化的结构体」——
+   于是有 `static Parser ps_open(Arena *, Str)`，`parse_program` 里
+   `Parser p = ps_open(a, src); Parser *self = &p;`。
+2. **切片字段是 `const`**，只能整片赋值：`s->text = (char[:]){ p, n }`，
+   不能 `s->text.ptr = p`。
+3. **试探性解析必须有「安静模式」**：`ps_is_typename` 靠「往后猜一眼」判断
+   `(T)x` 还是 `(expr)`，猜错不能污染错误账，于是 `Parser.quiet` 计数，
+   `ps_err` 在 `quiet > 0` 时直接返回。
+4. **`sizeof(*self)` 这类不是类型**：`sizeof` 分支先试类型、失败就当普通表达式，
+   否则 `std/container/chan.c6` 一行报 4 个错。
+
+**覆盖率**：把 `std/` 下全部 `.c6` 和绝大多数 `examples/*.c6` 喂给解析器，
+`nerr` 全为 0（只有两个 freestanding 例子里带冒号的 `__asm__(… : … : …)` 还
+认不出来——走「没认出来」这条路，报告里点名，不猜）。为此补的语法：async 函数的
+修饰符、`T[:]`/`T!error` 后缀、结构体成员默认值、`new T`、元组返回/参数/声明、
+`shared`、`f"…"`、`Buf@(96)` 泛型实例、`interface` 块、声明语句里的 `catch`、
+`foreach ((T a, U b) = x)`。
+
+错误号段继续追加：`std.analysis.lex`=0x615a、`std.analysis.parse`=0x615b、
+`std.analysis.ub`=0x615c。`Makefile` 增加 `std-ub` 与 `STD_UB_SRCS`；三个模块在
+`stdtest` 里分别 6/47/63 条。`examples/stdub.c6` 的演示源码覆盖 9 条发现
+（一定 8、可能 1）。
+
+验收：`make build`、`make stdtest`（349 个模块、0 failure）、`make std-ub`
+（9 条发现、退出码 1）、`make errcheck`（15 通过）、`make selftest`。
+
 
 
 

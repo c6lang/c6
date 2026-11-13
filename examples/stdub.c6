@@ -1,0 +1,281 @@
+/* stdub：用 std.analysis.ub 检查 c6 源码里的未定义行为。
+ *
+ *     make build && ./tcc/c6 -B tcc -run examples/stdub.c6 文件.c6
+ *     ./tcc/c6 -B tcc -run examples/stdub.c6 -q 文件.c6      # 只报「一定」
+ *     ./tcc/c6 -B tcc -run examples/stdub.c6                 # 自带的演示样例
+ *
+ * 每条发现都是这个形状——问题、原文、**怎么改**、可直接粘回去的代码：
+ *
+ *     demo.c6:2:40: 一定 [UB-OOB] 常量下标越界
+ *         2 | int oob(void) { int a[4] = { 0 }; return a[4]; }
+ *           | a 只有 4 个元素（合法下标 0..3），这里用了下标 4
+ *        修法 | 把下标 4 改成 3 以内；……
+ *        代码 | if (4 >= 4) { /* 越界：报错或夹回 0..上限 *\/ }
+ *
+ * 退出码：0 = 没发现问题，1 = 有发现，2 = 用法 / 读文件出错。
+ * 检查不到的区域（解析器没看懂的构造）会单独提示，**不算干净**。
+ *
+ * 编译（import 只带声明，模块正文要一起列出来）：
+ *
+ *     ./tcc/c6 -B tcc -I . -o build/stdub examples/stdub.c6 \
+ *         std/analysis/ub.c6 std/analysis/parse.c6 std/analysis/lex.c6 \
+ *         std/core/mem.c6 std/core/types.c6 std/text/str.c6
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+import std.core.types;
+import std.analysis.ub;
+import std.analysis.parse;
+import std.analysis.lex;
+import std.core.mem;
+import std.text.str;
+
+/* 自带的演示样例：几乎每一行都是一个真会出事的地方 */
+static const char *demo_src =
+    "int div_zero(int a) { return a / 0; }\n"
+    "int oob(void) { int a[4] = { 0 }; return a[4]; }\n"
+    "int uaf(void) {\n"
+    "    int *p = malloc(16);\n"
+    "    free(p);\n"
+    "    p[0] = 1;\n"
+    "    free(p);\n"
+    "    return 0;\n"
+    "}\n"
+    "int *escape(void) { int x = 1; return &x; }\n"
+    "int uninit(void) { int *p = malloc(8); return p[0]; }\n"
+    "void overlap(char *b) { memcpy(b, b, 4); }\n"
+    "int shift(void) { return 1 << 32; }\n"
+    "int ovfl(void) { return 2000000000 + 2000000000; }\n"
+    "int clean(int a, int b) { return a + b; }\n";
+
+/* 汇总计数 */
+struct Stats {
+    int total;
+    int certain;
+    int possible;
+    int suppressed;
+    int not_analyzed;
+};
+
+static void usage(FILE *out)
+{
+    fprintf(out,
+            "用法: stdub [选项] [文件.c6 ...]\n"
+            "\n"
+            "  -q, --quiet-uncertain   只报「一定」的发现\n"
+            "  -n N                    最多报 N 条（0 = 不限）\n"
+            "  -h, --help              这份帮助\n"
+            "\n"
+            "不给文件时分析内置的演示样例。检查编号：\n"
+            "  UB-DIV0 UB-INTMIN UB-OVFL UB-SHIFT UB-OOB UB-NULL\n"
+            "  UB-UAF UB-DFREE UB-ESCAPE UB-UNINIT UB-VLA UB-OVERLAP UB-NULLARG\n"
+            "\n"
+            "在某一行（或上一行）写 `/// c6ub-ignore` 可以跳过该行的发现，\n"
+            "写 `/// c6ub-ignore UB-OOB` 只跳过这一个检查。\n");
+}
+
+/* 打印一个 Str（不带结尾 NUL） */
+static void put_str(Str s)
+{
+    if (s.s.len > 0 && s.s.data)
+        printf("%.*s", s.s.len, s.s.data);
+}
+
+/* 多行文本按行打印：第一行用 FIRST，后面的行用 CONT（对齐用） */
+static void put_block(Str code, const char *first, const char *cont)
+{
+    int i = 0;
+    int start = 0;
+    int line = 0;
+
+    if (code.s.len <= 0) {
+        printf("%s（无）\n", first);
+        return;
+    }
+    for (i = 0; i <= code.s.len; i++) {
+        if (i == code.s.len || code.s.data[i] == '\n') {
+            printf("%s", line == 0 ? first : cont);
+            if (i > start)
+                printf("%.*s", i - start, code.s.data + start);
+            printf("\n");
+            start = i + 1;
+            line++;
+        }
+    }
+}
+
+static char *read_file(const char *path, int *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    long n = 0;
+    char *buf = 0;
+
+    *out_len = 0;
+    if (!f)
+        return 0;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0;
+    }
+    n = ftell(f);
+    if (n < 0 || n > (long)(1 << 24)) {
+        fclose(f);
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(f);
+        return 0;
+    }
+    if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        fclose(f);
+        return 0;
+    }
+    buf[n] = 0;
+    *out_len = (int)n;
+    fclose(f);
+    return buf;
+}
+
+/* 分析一份源码，打印所有发现，计数累加到 ST */
+static void analyze(const char *name, char *src_text, int len, UbOpts opts, Stats *st)
+{
+    int cap = 1 << 22;
+    u8 *arena_buf = (u8 *)malloc((size_t)cap);
+    Str file = { (char[:]){ (char *)name, (int)strlen(name) } };
+    Str src = { (char[:]){ src_text, len } };
+    Arena a = { 0, 0, 0 };
+    Ub *u = 0;
+    Finding *f = 0;
+
+    if (!arena_buf) {
+        fprintf(stderr, "stdub: 内存不够\n");
+        return;
+    }
+    a = arena_make(arena_buf, cap);
+    u = ub_open(&a, file, src, opts);
+    ub_run(u);
+    for (f = ub_findings(u); f; f = f->next) {
+        Str line = line_at(src, f->line);
+
+        st->total++;
+        if (f->conf == CONF_CERTAIN)
+            st->certain++;
+        else
+            st->possible++;
+        printf("%s:%d:%d: %s [%s] %s\n", name, f->line, f->col,
+               ub_conf_name(f->conf), ub_check_name(f->check),
+               ub_check_title(f->check));
+        printf("%5d | ", f->line);
+        put_str(line.s.len > 0 ? line : f->snippet);
+        printf("\n        | ");
+        put_str(f->msg);
+        printf("\n   修法 | ");
+        put_str(f->fix.text);
+        printf("\n");
+        printf("   代码 | ");
+        put_block(f->fix.code, "", "        | ");
+        printf("\n");
+    }
+    st->suppressed += ub_suppressed(u);
+    st->not_analyzed += ub_not_analyzed(u);
+    if (ub_not_analyzed(u) > 0) {
+        Program *p = ub_program(u);
+        int k = 0;
+
+        fprintf(stderr, "%s: 有 %d 处构造没认出来，这些区域**没有**检查",
+                name, ub_not_analyzed(u));
+        if (p) {
+            int show = p->nerrl < 8 ? p->nerrl : 8;
+
+            for (k = 0; k < show; k++)
+                fprintf(stderr, "%s%d:%d", k == 0 ? "：" : "、", p->errl[k],
+                        p->errc[k]);
+            if (p->nerrl < ub_not_analyzed(u))
+                fprintf(stderr, " 等");
+        }
+        fprintf(stderr, "\n");
+    }
+    free(arena_buf);
+}
+
+int main(int argc, char **argv)
+{
+    UbOpts opts = ub_opts_default();
+    const char *files[64] = { 0 };
+    int nfiles = 0;
+    int i = 0;
+    int bad = 0;
+    Stats st = { 0, 0, 0, 0, 0 };
+
+    for (i = 1; i < argc; i++) {
+        const char *z = argv[i];
+
+        if (strcmp(z, "-h") == 0 || strcmp(z, "--help") == 0) {
+            usage(stdout);
+            return 0;
+        }
+        if (strcmp(z, "-q") == 0 || strcmp(z, "--quiet-uncertain") == 0) {
+            opts.quiet_uncertain = 1;
+            continue;
+        }
+        if (strcmp(z, "-n") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "stdub: -n 需要一个数字\n");
+                return 2;
+            }
+            opts.max = atoi(argv[++i]);
+            continue;
+        }
+        if (z[0] == '-' && z[1] != 0) {
+            fprintf(stderr, "stdub: 不认识的选项 %s\n", z);
+            usage(stderr);
+            return 2;
+        }
+        if (nfiles >= 64) {
+            fprintf(stderr, "stdub: 文件太多（最多 64 个）\n");
+            return 2;
+        }
+        files[nfiles] = z;
+        nfiles++;
+    }
+
+    if (nfiles == 0) {
+        printf("（没给文件，分析内置的演示样例）\n\n");
+        analyze("demo.c6", (char *)demo_src, (int)strlen(demo_src), opts, &st);
+        printf("stdub: 演示样例共 %d 条（一定 %d、可能 %d）\n", st.total, st.certain,
+               st.possible);
+        return st.certain > 0 ? 1 : 0;   /* 「可能」不改变退出码 */
+    }
+
+    for (i = 0; i < nfiles; i++) {
+        int len = 0;
+        char *src = read_file(files[i], &len);
+
+        if (!src) {
+            fprintf(stderr, "stdub: 读不了 %s\n", files[i]);
+            bad = 1;
+            continue;
+        }
+        analyze(files[i], src, len, opts, &st);
+        free(src);
+    }
+    if (bad && st.total == 0) {
+        fprintf(stderr, "stdub: 没有可分析的文件\n");
+        return 2;
+    }
+    printf("stdub: %d 条发现（一定 %d、可能 %d）", st.total, st.certain, st.possible);
+    if (st.suppressed > 0)
+        printf("，压掉 %d 条", st.suppressed);
+    if (st.not_analyzed > 0)
+        printf("，%d 处没看懂（未检查）", st.not_analyzed);
+    printf("\n");
+    return st.certain > 0 ? 1 : 0;   /* 有「一定」才拦构建 */
+}

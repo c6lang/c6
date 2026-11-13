@@ -1,0 +1,2387 @@
+/* std/analysis/parse：C6 语法的**务实**解析器，产出 UB 检查用的 AST。
+ *
+ *     import std.analysis.parse;
+ *
+ *     u8 buf[1 << 20] = { 0 };
+ *     Arena a = arena_make(buf, sizeof buf);
+ *     Program *p = parse_program(&a, src);
+ *     if (parse_errors(p)) ...            // 有多少处没认出来
+ *
+ * 目标不是「C6 编译器的第二份前端」，而是「够 UB 检查器用的一张结构图」：
+ * 函数、块、语句、表达式、声明里的数组长度与元素类型。所以：
+ *
+ * - **认不出来就重同步**：宏、函数字面量、`interface`、`async` 这类对 UB
+ *   检查没有直接贡献的构造，解析器整段跳过并把计数记到 `parse_errors()`。
+ *   检查器据此知道「这段没看懂」，不会当成「这段没问题」；
+ * - **只建够用的语义**：类型只有大小、位宽、有无符号、元素类型、数组长度这些
+ *   字段，够算越界与溢出；不做重载、不做隐式转换；
+ * - **每个表达式都带原文**（`Node.text` 是源码切片）：诊断里要引用
+ *   `a[i + 1]` 这样的原始写法，修复建议才能指名道姓；
+ * - **节点都分配在调用方给的 Arena 上**，解析一份源码只申请、不释放。
+ *
+ * `import` 只记名字（`Program.imports`）：被导入模块的 `typedef` 不在本文件的
+ * 符号表里，调用方（CLI）可以按这张表把依赖先解析一遍，类型就能认全。
+ *
+ * 覆盖到的语法（其余靠重同步兜住）：
+ *
+ * - 文件作用域：`module` / `import` / `typedef` / `struct` / `union` / `enum`
+ *   （含 `struct Vect@T` 模板与体内的内联方法）/ 全局变量 / 函数定义与原型 /
+ *   `test "..." { ... }`；
+ * - 类型：基本类型与组合（`unsigned long long`）、省略 `struct` 的 tag、`@T`
+ *   托管引用（按指针看）、`T[:]` 切片（写在类型后面）、`T[N]` 数组、函数指针
+ *   （按指针看）、`T!error` 返回类型、泛型实参 `Vect@int`；
+ * - 语句：块、`if`/`else`、`while`、`do`、`for`、`switch`/`case`/`default`、
+ *   `return`/`break`/`continue`/`goto`/标签、`defer`/`errdefer`、`try`/`catch`、
+ *   `foreach`、声明（含元组解构 `(int q, int r) = f();` 与逗号声明多个）；
+ * - 表达式：C 的全套优先级、赋值（右结合）、`?:`、`sizeof`、强转、复合字面量、
+ *   `{}` 初始化列表、`->` 与 `.`、下标与区间下标、调用、前后缀自增。
+ */
+#include <string.h>
+#include <stdlib.h>
+
+module std.analysis.parse;
+import std.core.types;
+import std.analysis.lex;
+import std.core.mem;
+import std.text.str;
+
+/* ---- 类型 ---- */
+
+enum TyKind {
+    TY_UNKNOWN = 0,
+    TY_VOID,
+    TY_BOOL,
+    TY_INT,                  /* 整数：见 bits / is_unsigned */
+    TY_FLOAT,
+    TY_PTR,
+    TY_ARRAY,
+    TY_SLICE,                /* T[:]，两个机器字 */
+    TY_STRUCT,
+    TY_UNION,
+    TY_ENUM,
+    TY_FUNC,
+};
+
+struct Type {
+    int kind;
+    int size;                /* 字节；未知 -1 */
+    int bits;                /* TY_INT 的位宽 */
+    int is_unsigned;
+    Type *elem;              /* 指针 / 数组 / 切片的元素类型 */
+    int n_elem;              /* TY_ARRAY 的长度；n_known 为 0 时无意义 */
+    int n_known;             /* 长度是常量吗（`int a[N]` 折出来才算） */
+    char *name;              /* 结构体 / 联合体 tag（可为 0） */
+};
+
+/* ---- 运算符 ---- */
+
+enum OpId {
+    OP_NONE = 0,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_SHL, OP_SHR,
+    OP_LT, OP_GT, OP_LE, OP_GE, OP_EQ, OP_NE, OP_ANDAND, OP_OROR,
+    OP_AND, OP_OR, OP_XOR,
+    OP_NEG, OP_POS, OP_NOT, OP_BNOT, OP_INC, OP_DEC,
+    OP_ASSIGN, OP_ADDEQ, OP_SUBEQ, OP_MULEQ, OP_DIVEQ, OP_MODEQ,
+    OP_ANDEQ, OP_OREQ, OP_XOREQ, OP_SHLEQ, OP_SHREQ,
+    OP_PTR,                  /* `->` 成员访问 */
+    OP_RANGE,                /* `a[lo:hi]` 区间下标 */
+};
+
+/* ---- 表达式节点 ---- */
+
+enum NodeKind {
+    ND_UNKNOWN = 0,
+    ND_NUM,                  /* 整数字面量 */
+    ND_FLOAT,
+    ND_CHAR,
+    ND_STR,
+    ND_IDENT,
+    ND_BIN,                  /* a op b */
+    ND_UN,                   /* op a；`&x` / `*p` 用 name 里的 "&" / "*" 区分 */
+    ND_ASSIGN,               /* a = b */
+    ND_COND,                 /* a ? b : c */
+    ND_CALL,                 /* a(args) */
+    ND_INDEX,                /* a[b]；区间下标见 op == OP_RANGE，b/c 是两端 */
+    ND_MEMBER,               /* a.name（OP_NONE）/ a->name（OP_PTR） */
+    ND_CAST,                 /* (type)a；复合字面量 (type){...} 也是它 */
+    ND_SIZEOF,               /* sizeof(type) 用 type；sizeof expr 用 a */
+    ND_COMMA,
+    ND_INIT,                 /* { ... } 初始化列表，a 是第一个元素 */
+    ND_POSTFIX,              /* a++ / a-- */
+};
+
+struct Node {
+    int kind;
+    int op;
+    int line, col;
+    Node *a;
+    Node *b;
+    Node *c;
+    Node *next;              /* 参数 / 初始化元素 / 逗号链 */
+    Str name;                /* ND_IDENT 的名字、ND_MEMBER 的字段名 */
+    Str text;                /* 这个表达式在源码里的原文（诊断引用的就是它） */
+    i64 ival;
+    int is_unsigned;
+    Type *type;
+};
+
+/* ---- 符号 ---- */
+
+enum SymKind {
+    SYM_LOCAL = 1,
+    SYM_PARAM,
+    SYM_GLOBAL,
+    SYM_FUNC,
+    SYM_TYPEDEF,
+    SYM_TAG,
+    SYM_ENUMCONST,
+};
+
+struct Sym {
+    Str name;
+    int kind;
+    int line, col;
+    int is_static;
+    i64 cval;                /* SYM_ENUMCONST 的值 */
+    Type *type;
+    Node *init;              /* 声明点的初始化器（可为 0） */
+    Sym *next;               /* 声明链 / 参数链 */
+};
+
+/* ---- 语句 ---- */
+
+enum StmtKind {
+    ST_UNKNOWN = 0,
+    ST_BLOCK,
+    ST_DECL,
+    ST_EXPR,
+    ST_IF,
+    ST_WHILE,
+    ST_DO,
+    ST_FOR,
+    ST_SWITCH,
+    ST_CASE,
+    ST_DEFAULT,
+    ST_RETURN,
+    ST_BREAK,
+    ST_CONTINUE,
+    ST_GOTO,
+    ST_LABEL,
+    ST_DEFER,
+    ST_ERRDEFER,
+    ST_TRY,
+    ST_FOREACH,
+};
+
+struct Stmt {
+    int kind;
+    int line, col;
+    Stmt *next;              /* 同一块里的下一条 */
+    Stmt *body;              /* 块的孩子 / 循环与 switch 的体 */
+    Stmt *els;               /* else 分支 */
+    Stmt *init;              /* for 的初始化 */
+    Stmt *step;              /* for 的步进 */
+    Node *cond;              /* 条件 / 返回值 / defer 的表达式 / 迭代对象 */
+    Node *cond2;             /* foreach 区间上界 */
+    Sym *sym;                /* ST_DECL 的符号链 */
+};
+
+struct Func {
+    Str name;
+    Type *ret;
+    Sym *params;
+    Stmt *body;              /* 原型为 0 */
+    int line, col;
+    Func *next;
+};
+
+struct Program {
+    Func *funcs;
+    Func *ftail;             /* 尾指针：函数按源码顺序串起来，诊断也按顺序出 */
+    Sym *syms;
+    int nerr;                /* 没认出来的构造个数（含词法错误） */
+    int nfunc;               /* 带函数体的函数个数 */
+    int nstmt;               /* 语句总数 */
+    int first_err_line;
+    int first_err_col;
+    const char *first_err;
+    int errl[32];            /* 前 32 处「没看懂」的行号（CLI 用来说明覆盖率） */
+    int errc[32];
+    int nerrl;
+    Str imports[64];         /* `import a.b;` 记下的模块名（按源码顺序） */
+    int nimports;
+};
+
+/* ---- 解析器 ---- */
+
+struct Parser {
+    Lexer lx;
+    Token tok;
+    Arena *arena;
+    Program *prog;
+    int depth;               /* 递归深度，防跑飞 */
+    int static_seen;         /* 刚刚吃掉的声明里有 static / extern */
+    int last_end;            /* 上一个消费掉的 token 的结束偏移 */
+    int quiet;               /* > 0 时是「试解析」：出错不记账、不回退报错 */
+};
+
+/* ---- 前向声明 ---- */
+
+static Node *ps_expr(Parser *self);
+static Node *ps_assign(Parser *self);
+static Node *ps_cond(Parser *self);
+static Node *ps_unary(Parser *self);
+static Node *ps_init(Parser *self);
+static Node *ps_comma_expr(Parser *self);
+static Type *ps_typespec(Parser *self);
+static Type *ps_post_type(Parser *self, Type *t);
+static Type *ps_decl_base(Parser *self);
+static void ps_decl(Parser *self, Type *base, Str *name, Type **type, Sym **params);
+static Stmt *ps_stmt(Parser *self);
+static Stmt *ps_block(Parser *self);
+static void ps_resync(Parser *self);
+static void ps_skip_braces(Parser *self);
+static void ps_skip_parens(Parser *self);
+static int ps_is_typename(Parser *self);
+
+/* ---- 小工具 ---- */
+
+static Str ps_str(const char *z)
+{
+    return (Str){ (char[:]){ (char *)z, (int)strlen(z) } };
+}
+
+static void *ps_alloc(Parser *self, int size)
+{
+    return self->arena->alloc(size, 8);
+}
+
+static Type *ty_new(Parser *self, int kind, int size)
+{
+    Type *t = (Type *)ps_alloc(self, sizeof(Type));
+
+    t->kind = kind;
+    t->size = size;
+    t->bits = 0;
+    t->is_unsigned = 0;
+    t->elem = 0;
+    t->n_elem = -1;
+    t->n_known = 0;
+    t->name = 0;
+    return t;
+}
+
+static Type *ty_int(Parser *self, int bits, int uns, int size)
+{
+    Type *t = ty_new(self, TY_INT, size);
+
+    t->bits = bits;
+    t->is_unsigned = uns;
+    return t;
+}
+
+static Type *ty_ptr(Parser *self, Type *base)
+{
+    Type *t = ty_new(self, TY_PTR, 8);
+
+    t->elem = base;
+    return t;
+}
+
+static Type *ty_array(Parser *self, Type *elem, int n, int known)
+{
+    Type *t = ty_new(self, TY_ARRAY, -1);
+
+    t->elem = elem;
+    t->n_elem = n;
+    t->n_known = known;
+    if (elem && elem->size >= 0 && known && n > 0)
+        t->size = elem->size * n;
+    return t;
+}
+
+static Type *ty_slice(Parser *self, Type *elem)
+{
+    Type *t = ty_new(self, TY_SLICE, 16);
+
+    t->elem = elem;
+    return t;
+}
+
+static Node *nd_new(Parser *self, int kind)
+{
+    Node *n = (Node *)ps_alloc(self, sizeof(Node));
+
+    n->kind = kind;
+    n->op = OP_NONE;
+    n->line = self->tok.line;
+    n->col = self->tok.col;
+    n->a = 0;
+    n->b = 0;
+    n->c = 0;
+    n->next = 0;
+    n->name = (Str){ (char[:]){ 0, 0 } };
+    n->text = (Str){ (char[:]){ 0, 0 } };
+    n->ival = 0;
+    n->is_unsigned = 0;
+    n->type = 0;
+    return n;
+}
+
+static Stmt *st_new(Parser *self, int kind)
+{
+    Stmt *s = (Stmt *)ps_alloc(self, sizeof(Stmt));
+
+    s->kind = kind;
+    s->line = self->tok.line;
+    s->col = self->tok.col;
+    s->next = 0;
+    s->body = 0;
+    s->els = 0;
+    s->init = 0;
+    s->step = 0;
+    s->cond = 0;
+    s->cond2 = 0;
+    s->sym = 0;
+    return s;
+}
+
+static Func *fn_new(Parser *self)
+{
+    Func *f = (Func *)ps_alloc(self, sizeof(Func));
+
+    f->name = (Str){ (char[:]){ 0, 0 } };
+    f->ret = 0;
+    f->params = 0;
+    f->body = 0;
+    f->line = 0;
+    f->col = 0;
+    f->next = 0;
+    return f;
+}
+
+static Sym *sym_new(Parser *self, Str name, int kind, Type *type)
+{
+    Sym *s = (Sym *)ps_alloc(self, sizeof(Sym));
+
+    s->name = name;
+    s->kind = kind;
+    s->line = self->tok.line;
+    s->col = self->tok.col;
+    s->is_static = 0;
+    s->cval = 0;
+    s->type = type;
+    s->init = 0;
+    s->next = 0;
+    return s;
+}
+
+static void prog_add(Parser *self, Sym *s)
+{
+    s->next = self->prog->syms;
+    self->prog->syms = s;
+}
+
+/* 在程序符号表里找名字：KIND 为 0 表示任意种类；找不到给 0 */
+Sym *prog_find(Program *p, Str name, int kind)
+{
+    Sym *s = p->syms;
+
+    for (; s; s = s->next) {
+        if (kind && s->kind != kind)
+            continue;
+        if (str_eq(s->name, name))
+            return s;
+    }
+    return 0;
+}
+
+int prog_is_typename(Program *p, Str name)
+{
+    Sym *s = p->syms;
+
+    for (; s; s = s->next)
+        if ((s->kind == SYM_TYPEDEF || s->kind == SYM_TAG) && str_eq(s->name, name))
+            return 1;
+    return 0;
+}
+
+/* ---- 游标与错误 ---- */
+
+static void ps_err(Parser *self, const char *msg)
+{
+    if (self->quiet > 0)
+        return;                  /* 试解析（猜类型名之类）失败不算错 */
+    self->prog->nerr++;
+    if (self->prog->nerr == 1) {
+        self->prog->first_err_line = self->tok.line;
+        self->prog->first_err_col = self->tok.col;
+        self->prog->first_err = msg;
+    }
+    if (self->prog->nerrl < 32) {
+        self->prog->errl[self->prog->nerrl] = self->tok.line;
+        self->prog->errc[self->prog->nerrl] = self->tok.col;
+        self->prog->nerrl++;
+    }
+}
+
+/* token 在源码里的起止偏移（token 的 text 就是源码切片） */
+static int ps_tok_start(Parser *self)
+{
+    if (!self->tok.text.s.data)
+        return self->lx.pos;
+    return (int)(self->tok.text.s.data - self->lx.src.s.data);
+}
+
+static int ps_tok_end(Parser *self)
+{
+    if (!self->tok.text.s.data)
+        return self->last_end;
+    return (int)(self->tok.text.s.data - self->lx.src.s.data) + self->tok.text.s.len;
+}
+
+/* 从 START 到「刚消费完的那个 token」的源码切片 */
+static Str ps_span(Parser *self, int start)
+{
+    Str out = { (char[:]){ 0, 0 } };
+
+    if (start < 0 || self->last_end <= start)
+        return out;
+    out.s = (char[:]){ self->lx.src.s.data + start, self->last_end - start };
+    return out;
+}
+
+static void ps_adv(Parser *self)
+{
+    self->last_end = ps_tok_end(self);
+    self->tok = lx_next(&self->lx);
+}
+
+static int ps_at(Parser *self, const char *z) { return tok_is(&self->tok, z); }
+
+static int ps_at_kw(Parser *self, int kw) { return tok_is_kw(&self->tok, kw); }
+
+static int ps_accept(Parser *self, const char *z)
+{
+    if (!ps_at(self, z))
+        return 0;
+    ps_adv(self);
+    return 1;
+}
+
+static int ps_accept_kw(Parser *self, int kw)
+{
+    if (!ps_at_kw(self, kw))
+        return 0;
+    ps_adv(self);
+    return 1;
+}
+
+static int ps_expect(Parser *self, const char *z)
+{
+    if (ps_accept(self, z))
+        return 1;
+    ps_err(self, "expected a punctuator");
+    return 0;
+}
+
+static int ps_expect_kw(Parser *self, int kw)
+{
+    if (ps_accept_kw(self, kw))
+        return 1;
+    ps_err(self, "expected a keyword");
+    return 0;
+}
+
+/* 当前是 '{'：跳过配对的 '}'（含嵌套） */
+static void ps_skip_braces(Parser *self)
+{
+    int depth = 0;
+
+    if (!ps_at(self, "{"))
+        return;
+    while (!(self->tok.kind == TK_EOF)) {
+        if (ps_at(self, "{")) {
+            depth++;
+        } else if (ps_at(self, "}")) {
+            depth--;
+            ps_adv(self);
+            if (depth <= 0)
+                return;
+            continue;
+        }
+        ps_adv(self);
+    }
+}
+
+static void ps_skip_parens(Parser *self)
+{
+    int depth = 0;
+
+    if (!ps_at(self, "("))
+        return;
+    while (!(self->tok.kind == TK_EOF)) {
+        if (ps_at(self, "(")) {
+            depth++;
+        } else if (ps_at(self, ")")) {
+            depth--;
+            ps_adv(self);
+            if (depth <= 0)
+                return;
+            continue;
+        }
+        ps_adv(self);
+    }
+}
+
+/* 出错后重同步：吃到 ';'（吃掉），或在块的 '}' 前停下（不吃） */
+static void ps_resync(Parser *self)
+{
+    int depth = 0;
+
+    while (!(self->tok.kind == TK_EOF)) {
+        if (ps_at(self, ";")) {
+            ps_adv(self);
+            return;
+        }
+        if (ps_at(self, "}")) {
+            if (depth == 0)
+                return;
+            depth--;
+            ps_adv(self);
+            continue;
+        }
+        if (ps_at(self, "{"))
+            depth++;
+        ps_adv(self);
+    }
+}
+
+/* ---- 常量折叠（数组长度、enum 值、case 值） ---- */
+
+static int ps_const_int(Program *p, Node *n, i64 *out)
+{
+    i64 x = 0;
+    i64 y = 0;
+
+    if (!n)
+        return 0;
+    switch (n->kind) {
+    case ND_NUM:
+    case ND_CHAR:
+        *out = n->ival;
+        return 1;
+    case ND_IDENT: {
+        Sym *s = prog_find(p, n->name, 0);
+
+        if (!s || s->kind != SYM_ENUMCONST)
+            return 0;
+        *out = s->cval;
+        return 1;
+    }
+    case ND_UN:
+        if (!ps_const_int(p, n->a, &x))
+            return 0;
+        if (n->op == OP_NEG) {
+            *out = -x;
+            return 1;
+        }
+        if (n->op == OP_POS) {
+            *out = x;
+            return 1;
+        }
+        if (n->op == OP_BNOT) {
+            *out = ~x;
+            return 1;
+        }
+        if (n->op == OP_NOT) {
+            *out = x == 0;
+            return 1;
+        }
+        return 0;
+    case ND_CAST:
+        return ps_const_int(p, n->a, out);
+    case ND_BIN:
+        if (!ps_const_int(p, n->a, &x) || !ps_const_int(p, n->b, &y))
+            return 0;
+        switch (n->op) {
+        case OP_ADD: *out = x + y; return 1;
+        case OP_SUB: *out = x - y; return 1;
+        case OP_MUL: *out = x * y; return 1;
+        case OP_DIV: if (y == 0) return 0; *out = x / y; return 1;
+        case OP_MOD: if (y == 0) return 0; *out = x % y; return 1;
+        case OP_SHL: *out = x << (y & 63); return 1;
+        case OP_SHR: *out = x >> (y & 63); return 1;
+        case OP_AND: *out = x & y; return 1;
+        case OP_OR: *out = x | y; return 1;
+        case OP_XOR: *out = x ^ y; return 1;
+        case OP_LT: *out = x < y; return 1;
+        case OP_GT: *out = x > y; return 1;
+        case OP_LE: *out = x <= y; return 1;
+        case OP_GE: *out = x >= y; return 1;
+        case OP_EQ: *out = x == y; return 1;
+        case OP_NE: *out = x != y; return 1;
+        case OP_ANDAND: *out = (x != 0 && y != 0); return 1;
+        case OP_OROR: *out = (x != 0 || y != 0); return 1;
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
+/* 把常量表达式折成一个整数：能给检查器直接用（除数为 0、下标越界、移位超宽
+ * 都靠它判）。认不出常量就给 0 返回。 */
+int node_const_int(Program *p, Node *n, i64 *out)
+{
+    return ps_const_int(p, n, out);
+}
+
+/* ---- 类型 ---- */
+
+/* struct / union：支持模板形参 `@T`、`@(K, V)` 与体内的内联方法 */
+static Type *ps_struct(Parser *self, int is_union)
+{
+    Str tag = { (char[:]){ 0, 0 } };
+    Type *t = ty_new(self, is_union ? TY_UNION : TY_STRUCT, -1);
+    int off = 0;
+    int align = 1;
+    int unknown = 0;
+    int i = 0;
+
+    ps_adv(self);                /* 吃掉 struct / union */
+    if (self->tok.kind == TK_IDENT) {
+        tag = self->tok.text;
+        ps_adv(self);
+        if (ps_at(self, "@")) {  /* 模板形参表 */
+            ps_adv(self);
+            if (ps_at(self, "("))
+                ps_skip_parens(self);
+            else if (self->tok.kind == TK_IDENT || self->tok.kind == TK_KEYWORD)
+                ps_adv(self);
+        }
+        t->name = self->arena->alloc_str(tag.s.len + 1);
+        for (i = 0; i < tag.s.len; i++)
+            t->name[i] = tag.s.data[i];
+        t->name[tag.s.len] = 0;
+        /* 先登记再看定义体：`struct Node { Node *next; }` 的自引用才找得到 */
+        prog_add(self, sym_new(self, tag, SYM_TAG, t));
+        if (!ps_at(self, "{"))
+            return t;
+    } else if (!ps_at(self, "{")) {
+        ps_err(self, "expected a struct tag or '{'");
+        return t;
+    }
+    ps_adv(self);                /* '{' */
+    while (!(self->tok.kind == TK_EOF) && !ps_at(self, "}")) {
+        Type *base = ps_typespec(self);
+        int guard = 0;
+
+        for (guard = 0; guard < 64; guard++) {
+            Str fname = { (char[:]){ 0, 0 } };
+            Type *ftype = 0;
+            Sym *fparams = 0;
+            int a = 1;
+
+            ps_decl(self, base, &fname, &ftype, &fparams);
+            if (!ftype)
+                ftype = base;
+            if (ps_accept(self, "="))
+                ps_init(self);           /* 成员可以有默认值 */
+            if (ftype->size < 0) {
+                unknown = 1;
+            } else if (ftype->size > 0) {
+                a = ftype->size > 8 ? 8 : ftype->size;
+                if (a > align)
+                    align = a;
+                if (is_union) {
+                    if (ftype->size > off)
+                        off = ftype->size;
+                } else {
+                    if (off % a)
+                        off += a - off % a;
+                    off += ftype->size;
+                }
+            }
+            if (!ps_accept(self, ","))
+                break;
+        }
+        if (ps_at(self, "{")) {
+            /* 模板 / 结构体里的内联方法：体跳过去，不影响大小 */
+            ps_skip_braces(self);
+            continue;
+        }
+        if (!ps_accept(self, ";")) {
+            ps_err(self, "expected ';' after a struct member");
+            ps_resync(self);
+            break;
+        }
+    }
+    ps_accept(self, "}");
+    if (unknown) {
+        t->size = -1;
+        return t;
+    }
+    if (!is_union && off > 0 && off % align)
+        off += align - off % align;
+    t->size = off;
+    return t;
+}
+
+static Type *ps_enum(Parser *self)
+{
+    Type *t = ty_int(self, 32, 0, 4);
+    i64 next = 0;
+
+    ps_adv(self);                /* 吃掉 enum */
+    if (self->tok.kind == TK_IDENT)
+        ps_adv(self);            /* tag 名不参与检查 */
+    if (!ps_accept(self, "{"))
+        return t;
+    while (!(self->tok.kind == TK_EOF) && !ps_at(self, "}")) {
+        Str name = { (char[:]){ 0, 0 } };
+        Sym *s = 0;
+
+        if (self->tok.kind != TK_IDENT) {
+            ps_err(self, "expected an enumerator");
+            ps_resync(self);
+            break;
+        }
+        name = self->tok.text;
+        ps_adv(self);
+        if (ps_accept(self, ".")) {          /* `Color.RED` 的限定写法 */
+            if (self->tok.kind == TK_IDENT) {
+                name = self->tok.text;
+                ps_adv(self);
+            }
+        }
+        if (ps_accept(self, "=")) {
+            Node *e = ps_cond(self);
+            i64 v = 0;
+
+            if (ps_const_int(self->prog, e, &v))
+                next = v;
+        }
+        s = sym_new(self, name, SYM_ENUMCONST, t);
+        s->cval = next;
+        prog_add(self, s);
+        next++;
+        if (!ps_accept(self, ","))
+            break;
+    }
+    ps_expect(self, "}");
+    return t;
+}
+
+/* 类型名后面的后缀：`T!error`（错误联合）与 `T[:]`（切片）。
+ *
+ * c6 把切片写在类型后面、变量名前面（`int[:] s`），所以两处都要过一遍：
+ * 关键字类型（`int[:]`）和 ident 类型（`Str[:]`、模板参数 `T[:]`）。 */
+static Type *ps_post_type(Parser *self, Type *t)
+{
+    /* `T!error`：`!` 后面跟 error */
+    if (ps_at(self, "!") && lx_peek(&self->lx, 0).kind == TK_IDENT
+        && str_is(lx_peek(&self->lx, 0).text, "error")) {
+        ps_adv(self);
+        ps_adv(self);
+    }
+    /* `int[:]`：切片后缀写在类型后面、名字前面（c6 的写法） */
+    while (ps_at(self, "[")) {
+        Parser save = *self;
+
+        ps_adv(self);
+        if (!ps_at(self, ":")) {
+            *self = save;        /* `int a[3]` 的 `[3]` 属于声明符 */
+            break;
+        }
+        ps_adv(self);
+        ps_accept(self, "]");
+        t = ty_slice(self, t);
+    }
+    return t;
+}
+
+/* 基本类型 + 限定符 + `@T` + `T[:]` + `T!error` */
+static Type *ps_typespec(Parser *self)
+{
+    Type *t = 0;
+    int uns = 0;
+    int nlong = 0;
+    int nshort = 0;
+    int seen_int = 0;
+    int seen_char = 0;
+    int seen_float = 0;
+    int seen_double = 0;
+    int seen_void = 0;
+    int seen_signed = 0;
+    int guard = 0;
+
+    for (guard = 0; guard < 64; guard++) {
+        if (ps_at_kw(self, KW_CONST) || ps_at_kw(self, KW_VOLATILE)
+            || ps_at_kw(self, KW_RESTRICT) || ps_at_kw(self, KW_REGISTER)
+            || ps_at_kw(self, KW_INLINE) || ps_at_kw(self, KW_AUTO)
+            || ps_at_kw(self, KW_CLOSURE) || ps_at_kw(self, KW_ASYNC)) {
+            ps_adv(self);
+            continue;
+        }
+        if (ps_at_kw(self, KW_STATIC) || ps_at_kw(self, KW_EXTERN)) {
+            self->static_seen = 1;
+            ps_adv(self);
+            continue;
+        }
+        if (ps_at(self, "@")) {
+            Type *inner = 0;
+
+            ps_adv(self);
+            inner = ps_typespec(self);
+            return ty_ptr(self, inner);
+        }
+        if (self->tok.kind == TK_IDENT && str_is(self->tok.text, "shared")) {
+            ps_adv(self);            /* c6 的共享变量修饰符 */
+            continue;
+        }
+        if (ps_at_kw(self, KW_UNSIGNED)) { uns = 1; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_SIGNED)) { seen_signed = 1; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_SHORT)) { nshort++; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_LONG)) { nlong++; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_INT)) { seen_int = 1; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_CHAR)) { seen_char = 1; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_FLOAT)) { seen_float = 1; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_DOUBLE)) { seen_double = 1; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_VOID)) { seen_void = 1; ps_adv(self); continue; }
+        if (ps_at_kw(self, KW_BOOL)) {
+            ps_adv(self);
+            return ty_new(self, TY_BOOL, 1);
+        }
+        break;
+    }
+    if (seen_void)
+        t = ty_new(self, TY_VOID, 0);
+    else if (seen_char)
+        t = ty_int(self, 8, uns, 1);
+    else if (seen_float)
+        t = ty_new(self, TY_FLOAT, 4);
+    else if (seen_double)
+        t = ty_new(self, TY_FLOAT, 8);
+    else if (nshort)
+        t = ty_int(self, 16, uns, 2);
+    else if (nlong)
+        t = ty_int(self, 64, uns, 8);
+    else if (seen_int || uns || seen_signed)
+        t = ty_int(self, 32, uns, 4);
+    if (t)
+        return ps_post_type(self, t);
+    if (ps_at_kw(self, KW_STRUCT))
+        return ps_post_type(self, ps_struct(self, 0));
+    if (ps_at_kw(self, KW_UNION))
+        return ps_post_type(self, ps_struct(self, 1));
+    if (ps_at_kw(self, KW_ENUM))
+        return ps_post_type(self, ps_enum(self));
+    if (self->tok.kind == TK_IDENT) {
+        Str name = self->tok.text;
+        Sym *s = 0;
+        Type *out = 0;
+
+        ps_adv(self);
+        /* 泛型实例 `Vect@int` / `Map@(K, V)`：只取外层名字 */
+        if (ps_at(self, "@")) {
+            ps_adv(self);
+            if (ps_at(self, "("))
+                ps_skip_parens(self);
+            else if (self->tok.kind == TK_IDENT || self->tok.kind == TK_KEYWORD)
+                ps_adv(self);
+        }
+        s = prog_find(self->prog, name, 0);
+        if (s && (s->kind == SYM_TYPEDEF || s->kind == SYM_TAG))
+            out = s->type;
+        if (!out)
+            out = ty_new(self, TY_UNKNOWN, -1);   /* 不透明类型：检查器跳过 */
+        return ps_post_type(self, out);
+    }
+    ps_err(self, "expected a type");
+    return ty_new(self, TY_UNKNOWN, -1);
+}
+
+/* 声明符：指针、名字、数组 / 切片 / 参数后缀；抽象声明符（没有名字）也吃 */
+static void ps_decl(Parser *self, Type *base, Str *name, Type **type, Sym **params)
+{
+    Type *t = base;
+    int guard = 0;
+
+    *name = (Str){ (char[:]){ 0, 0 } };
+    *params = 0;
+    for (guard = 0; guard < 64; guard++) {
+        if (ps_at(self, "*") || ps_at(self, "@")) {
+            ps_adv(self);
+            t = ty_ptr(self, t);
+            continue;
+        }
+        if (ps_at_kw(self, KW_CONST) || ps_at_kw(self, KW_VOLATILE)
+            || ps_at_kw(self, KW_RESTRICT)) {
+            ps_adv(self);
+            continue;
+        }
+        break;
+    }
+    if (ps_at(self, "(")) {
+        /* `(*f)(...)` 这类嵌套声明符：进去再解析一遍 */
+        Str inner = { (char[:]){ 0, 0 } };
+        Type *itype = 0;
+        Sym *iparams = 0;
+
+        ps_adv(self);
+        ps_decl(self, t, &inner, &itype, &iparams);
+        ps_accept(self, ")");
+        if (inner.s.len)
+            *name = inner;
+        if (itype)
+            t = itype;
+        *params = iparams;
+    } else if (self->tok.kind == TK_IDENT) {
+        *name = self->tok.text;
+        ps_adv(self);
+    }
+    for (guard = 0; guard < 64; guard++) {
+        if (ps_at(self, "[")) {
+            ps_adv(self);
+            if (ps_at(self, ":")) {
+                ps_adv(self);
+                ps_accept(self, "]");
+                t = ty_slice(self, t);
+                continue;
+            }
+            if (ps_at(self, "]")) {
+                ps_adv(self);
+                t = ty_array(self, t, -1, 0);
+                continue;
+            }
+            {
+                Node *e = ps_cond(self);
+                i64 v = 0;
+                int ok = 0;
+
+                ok = ps_const_int(self->prog, e, &v);
+                ps_accept(self, "]");
+                t = ty_array(self, t,
+                             ok && v > -0x7fffffff && v < 0x7fffffff ? (int)v : 0,
+                             ok);
+            }
+            continue;
+        }
+        if (ps_at(self, "(")) {
+            Sym *head = 0;
+            Sym **tail = &head;
+
+            ps_adv(self);
+            if (ps_at_kw(self, KW_VOID) && tok_is(&lx_peek(&self->lx, 0), ")"))
+                ps_adv(self);
+            while (!(self->tok.kind == TK_EOF) && !ps_at(self, ")")) {
+                Type *base2 = 0;
+
+                if (ps_at(self, "(")) {
+                    /* 元组参数 `((int, int) t)`：类型整段跳过 */
+                    ps_skip_parens(self);
+                    base2 = ty_new(self, TY_UNKNOWN, -1);
+                } else {
+                    base2 = ps_typespec(self);
+                }
+                Str pname = { (char[:]){ 0, 0 } };
+                Type *ptype = 0;
+                Sym *pparams = 0;
+                Sym *s = 0;
+
+                if (ps_at(self, "...")) {
+                    ps_adv(self);
+                    break;
+                }
+                ps_decl(self, base2, &pname, &ptype, &pparams);
+                if (!ptype)
+                    ptype = base2;
+                s = sym_new(self, pname, SYM_PARAM, ptype);
+                *tail = s;
+                tail = &s->next;
+                if (!ps_accept(self, ","))
+                    break;
+            }
+            ps_expect(self, ")");
+            *params = head;
+            t = ty_new(self, TY_FUNC, 8);
+            t->elem = base;
+            continue;
+        }
+        break;
+    }
+    *type = t;
+}
+
+/* ---- 表达式 ---- */
+
+static const struct { char *text; int op; int prec; } ps_binops[] = {
+    { "||", OP_OROR, 1 }, { "&&", OP_ANDAND, 2 }, { "|", OP_OR, 3 },
+    { "^", OP_XOR, 4 }, { "&", OP_AND, 5 },
+    { "==", OP_EQ, 6 }, { "!=", OP_NE, 6 },
+    { "<", OP_LT, 7 }, { ">", OP_GT, 7 }, { "<=", OP_LE, 7 }, { ">=", OP_GE, 7 },
+    { "<<", OP_SHL, 8 }, { ">>", OP_SHR, 8 },
+    { "+", OP_ADD, 9 }, { "-", OP_SUB, 9 },
+    { "*", OP_MUL, 10 }, { "/", OP_DIV, 10 }, { "%", OP_MOD, 10 },
+};
+
+static const struct { char *text; int op; } ps_assignops[] = {
+    { "=", OP_ASSIGN }, { "+=", OP_ADDEQ }, { "-=", OP_SUBEQ },
+    { "*=", OP_MULEQ }, { "/=", OP_DIVEQ }, { "%=", OP_MODEQ },
+    { "&=", OP_ANDEQ }, { "|=", OP_OREQ }, { "^=", OP_XOREQ },
+    { "<<=", OP_SHLEQ }, { ">>=", OP_SHREQ },
+};
+
+static int ps_binop_of(Parser *self, int *prec)
+{
+    int i = 0;
+    int n = (int)(sizeof ps_binops / sizeof *ps_binops);
+
+    for (i = 0; i < n; i++)
+        if (ps_at(self, ps_binops[i].text)) {
+            *prec = ps_binops[i].prec;
+            return ps_binops[i].op;
+        }
+    return OP_NONE;
+}
+
+static int ps_assignop_of(Parser *self)
+{
+    int i = 0;
+    int n = (int)(sizeof ps_assignops / sizeof *ps_assignops);
+
+    for (i = 0; i < n; i++)
+        if (ps_at(self, ps_assignops[i].text))
+            return ps_assignops[i].op;
+    return OP_NONE;
+}
+
+/* 初始化器：`{ ... }` 或表达式 */
+static Node *ps_init(Parser *self)
+{
+    Node *n = 0;
+    Node *head = 0;
+    Node **tail = &head;
+    int start = ps_tok_start(self);
+
+    if (!ps_at(self, "{"))
+        return ps_assign(self);
+    n = nd_new(self, ND_INIT);
+    ps_adv(self);
+    while (!(self->tok.kind == TK_EOF) && !ps_at(self, "}")) {
+        Node *e = ps_init(self);
+
+        *tail = e;
+        tail = &e->next;
+        if (!ps_accept(self, ","))
+            break;
+    }
+    ps_expect(self, "}");
+    n->a = head;
+    n->text = ps_span(self, start);
+    return n;
+}
+
+/* 函数字面量：`ret (params) { body }` 出现在表达式里就整段跳过 */
+static int ps_try_skip_fn_lit(Parser *self)
+{
+    Parser save = *self;
+
+    if (!(self->tok.kind == TK_KEYWORD))
+        return 0;
+    self->quiet = save.quiet + 1;
+    ps_typespec(self);
+    while (ps_at(self, "*"))
+        ps_adv(self);
+    if (!ps_at(self, "(")) {
+        *self = save;
+        return 0;
+    }
+    ps_skip_parens(self);
+    if (!ps_at(self, "{")) {
+        *self = save;
+        return 0;
+    }
+    ps_skip_braces(self);
+    return 1;
+}
+
+static Node *ps_primary(Parser *self)
+{
+    Node *n = 0;
+    int start = ps_tok_start(self);
+
+    if (ps_at(self, "(")) {
+        Node *inner = 0;
+
+        ps_adv(self);
+        inner = ps_comma_expr(self);
+        ps_expect(self, ")");
+        if (inner)
+            inner->text = ps_span(self, start);
+        return inner;
+    }
+    if (self->tok.kind == TK_NUM) {
+        n = nd_new(self, ND_NUM);
+        n->ival = self->tok.ival;
+        n->is_unsigned = self->tok.uns;
+        ps_adv(self);
+        while (self->tok.kind == TK_STR)      /* 相邻字面量拼接 */
+            ps_adv(self);
+    } else if (self->tok.kind == TK_CHAR) {
+        n = nd_new(self, ND_CHAR);
+        n->ival = self->tok.ival;
+        ps_adv(self);
+        while (self->tok.kind == TK_STR)
+            ps_adv(self);
+    } else if (self->tok.kind == TK_FLOAT) {
+        n = nd_new(self, ND_FLOAT);
+        ps_adv(self);
+    } else if (self->tok.kind == TK_STR) {
+        n = nd_new(self, ND_STR);
+        n->name = tok_str_body(&self->tok);
+        ps_adv(self);
+        while (self->tok.kind == TK_STR)
+            ps_adv(self);
+    } else if (self->tok.kind == TK_IDENT && str_is(self->tok.text, "new")) {
+        /* `new T` / `new Vect@int`：类型部分整段吃掉，检查器只关心后面怎么用 */
+        ps_adv(self);
+        n = nd_new(self, ND_UN);
+        n->name = ps_str("new");
+        ps_typespec(self);
+        while (ps_at(self, "[")) {
+            ps_adv(self);
+            if (!ps_at(self, "]"))
+                ps_expr(self);
+            ps_accept(self, "]");
+        }
+        if (ps_at(self, "("))
+            ps_skip_parens(self);
+        if (ps_at(self, "{"))
+            ps_skip_braces(self);
+        n->text = ps_span(self, start);
+        return n;
+    } else if (self->tok.kind == TK_IDENT && str_is(self->tok.text, "f")
+               && lx_peek(&self->lx, 0).kind == TK_STR) {
+        /* `f"...{v}..."` 插值字符串：按普通字符串看 */
+        ps_adv(self);                /* f */
+        n = nd_new(self, ND_STR);
+        n->name = tok_str_body(&self->tok);
+        ps_adv(self);
+        while (self->tok.kind == TK_STR)
+            ps_adv(self);
+    } else if (self->tok.kind == TK_IDENT) {
+        n = nd_new(self, ND_IDENT);
+        n->name = self->tok.text;
+        ps_adv(self);
+    } else if (ps_at(self, "{")) {
+        return ps_init(self);
+    } else if (ps_try_skip_fn_lit(self)) {
+        n = nd_new(self, ND_UNKNOWN);
+    } else {
+        ps_err(self, "expected an expression");
+        n = nd_new(self, ND_UNKNOWN);
+        if (!(self->tok.kind == TK_EOF))
+            ps_adv(self);
+    }
+    n->text = ps_span(self, start);
+    return n;
+}
+
+static Node *ps_postfix(Parser *self)
+{
+    int start = ps_tok_start(self);
+    Node *n = ps_primary(self);
+    int guard = 0;
+
+    for (guard = 0; guard < 256; guard++) {
+        if (ps_at(self, "(")) {
+            Node *call = nd_new(self, ND_CALL);
+            Node *head = 0;
+            Node **tail = &head;
+
+            ps_adv(self);
+            while (!(self->tok.kind == TK_EOF) && !ps_at(self, ")")) {
+                Node *arg = ps_assign(self);
+
+                *tail = arg;
+                tail = &arg->next;
+                if (!ps_accept(self, ","))
+                    break;
+            }
+            ps_expect(self, ")");
+            call->a = n;
+            call->b = head;
+            call->text = ps_span(self, start);
+            n = call;
+            continue;
+        }
+        if (ps_at(self, "[")) {
+            Node *idx = 0;
+
+            ps_adv(self);
+            idx = nd_new(self, ND_INDEX);
+            idx->a = n;
+            if (ps_at(self, ":")) {
+                ps_adv(self);
+                idx->c = ps_cond(self);
+                idx->op = OP_RANGE;
+            } else {
+                idx->b = ps_expr(self);
+                if (ps_at(self, ":")) {
+                    ps_adv(self);
+                    idx->c = ps_cond(self);
+                    idx->op = OP_RANGE;
+                }
+            }
+            ps_expect(self, "]");
+            idx->text = ps_span(self, start);
+            n = idx;
+            continue;
+        }
+        if (ps_at(self, ".") || ps_at(self, "->")) {
+            Node *m = nd_new(self, ND_MEMBER);
+            int arrow = ps_at(self, "->");
+
+            ps_adv(self);
+            if (self->tok.kind == TK_IDENT || self->tok.kind == TK_KEYWORD) {
+                m->name = self->tok.text;
+                ps_adv(self);
+            } else {
+                ps_err(self, "expected a member name");
+            }
+            m->op = arrow ? OP_PTR : OP_NONE;
+            m->a = n;
+            m->text = ps_span(self, start);
+            n = m;
+            continue;
+        }
+        if (ps_at(self, "++") || ps_at(self, "--")) {
+            Node *p = nd_new(self, ND_POSTFIX);
+
+            p->op = ps_at(self, "++") ? OP_INC : OP_DEC;
+            p->a = n;
+            ps_adv(self);
+            p->text = ps_span(self, start);
+            n = p;
+            continue;
+        }
+        break;
+    }
+    return n;
+}
+
+/* 当前 '(' 里是不是一个类型名？（强转、复合字面量、元组声明共用）
+ *
+ * 判定分两档：解析出来的类型**已知**（基本类型、本文件的 typedef/tag）就直接
+ * 认；只解析成「未知名字」时看 `)` 后面跟什么——`(u32)x` / `(Str){...}` 这种
+ * 「`)` 后面紧跟表达式」的形状不可能是括号表达式，当强转处理。被 import 进来的
+ * typedef 就靠这一档兜住（CLI 还会先把依赖解析一遍，让它们变成已知类型）。 */
+static int ps_is_typename(Parser *self)
+{
+    Parser save = *self;
+    Token after = { TK_EOF, 0, 0, 0, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    int ok = 0;
+    int before = 0;
+    int consumed = 0;
+    Type *t = 0;
+
+    self->quiet = save.quiet + 1;   /* 猜错了不算错，也不记账 */
+    ps_adv(self);                   /* '(' */
+    if (ps_at(self, "(")) {
+        *self = save;
+        return 0;
+    }
+    before = self->lx.pos;
+    t = ps_typespec(self);
+    consumed = self->lx.pos != before;
+    if (!consumed) {                /* 一个 token 都没吃掉：不可能是类型 */
+        *self = save;
+        return 0;
+    }
+    while (ps_at(self, "*")) {
+        ps_adv(self);
+        t = 0;                      /* 有指针后缀就一定是类型 */
+    }
+    if (ps_at(self, ")")) {
+        after = lx_peek(&self->lx, 0);
+        if (!t || t->kind != TY_UNKNOWN)
+            ok = 1;
+        else if (after.kind == TK_IDENT || after.kind == TK_NUM
+                 || after.kind == TK_CHAR || after.kind == TK_STR
+                 || after.kind == TK_FLOAT || tok_is(&after, "(")
+                 || tok_is(&after, "{"))
+            ok = 1;
+    } else if (self->tok.kind == TK_IDENT && (!t || t->kind != TY_UNKNOWN)) {
+        ok = 1;                     /* 元组解构 `(int q, int r) = f()` */
+    }
+    *self = save;
+    return ok;
+}
+
+static Node *ps_unary(Parser *self)
+{
+    int start = ps_tok_start(self);
+    Node *n = 0;
+
+    if (self->depth++ > 200) {
+        self->depth--;
+        ps_err(self, "expression too deep");
+        return nd_new(self, ND_UNKNOWN);
+    }
+    if (ps_at(self, "++") || ps_at(self, "--")) {
+        int op = ps_at(self, "++") ? OP_INC : OP_DEC;
+
+        ps_adv(self);
+        n = nd_new(self, ND_UN);
+        n->op = op;
+        n->a = ps_unary(self);
+        n->text = ps_span(self, start);
+        self->depth--;
+        return n;
+    }
+    if (ps_at(self, "&") || ps_at(self, "*") || ps_at(self, "-") || ps_at(self, "+")
+        || ps_at(self, "!") || ps_at(self, "~")) {
+        Str sym = self->tok.text;
+        int op = OP_NONE;
+
+        if (str_is(sym, "-"))
+            op = OP_NEG;
+        else if (str_is(sym, "+"))
+            op = OP_POS;
+        else if (str_is(sym, "!"))
+            op = OP_NOT;
+        else if (str_is(sym, "~"))
+            op = OP_BNOT;
+        ps_adv(self);
+        n = nd_new(self, ND_UN);
+        n->op = op;
+        n->name = sym;           /* "&" / "*" 靠名字区分 */
+        n->a = ps_unary(self);
+        n->text = ps_span(self, start);
+        self->depth--;
+        return n;
+    }
+    if (ps_at_kw(self, KW_SIZEOF)) {
+        ps_adv(self);
+        n = nd_new(self, ND_SIZEOF);
+        if (ps_at(self, "(") && ps_is_typename(self)) {
+            ps_adv(self);
+            n->type = ps_typespec(self);
+            while (ps_at(self, "*")) {
+                ps_adv(self);
+                n->type = ty_ptr(self, n->type);
+            }
+            ps_expect(self, ")");
+        } else {
+            n->a = ps_unary(self);
+        }
+        n->text = ps_span(self, start);
+        self->depth--;
+        return n;
+    }
+    if (ps_at_kw(self, KW_TRY) || ps_at_kw(self, KW_AWAIT)
+        || ps_at_kw(self, KW_SPAWN)) {
+        ps_adv(self);
+        n = ps_unary(self);
+        self->depth--;
+        return n;
+    }
+    if (ps_at(self, "@")) {
+        ps_adv(self);
+        n = nd_new(self, ND_UN);
+        n->op = OP_NONE;
+        n->name = ps_str("@");
+        n->a = ps_unary(self);
+        n->text = ps_span(self, start);
+        self->depth--;
+        return n;
+    }
+    if (ps_at(self, "(") && ps_is_typename(self)) {
+        Parser save = *self;
+
+        self->quiet = save.quiet + 1;   /* 不是强转就回退，别记账 */
+        ps_adv(self);
+        {
+            Type *t = ps_typespec(self);
+
+            while (ps_at(self, "*")) {
+                ps_adv(self);
+                t = ty_ptr(self, t);
+            }
+            if (ps_accept(self, ")")) {
+                Node *c = nd_new(self, ND_CAST);
+
+                c->type = t;
+                /* 复合字面量 `(T){...}` 与强转 `(T)x` 都建成「把右边变成 T」，
+                   右边是初始化列表还是表达式由节点的 kind 区分 */
+                c->a = ps_at(self, "{") ? ps_init(self) : ps_unary(self);
+                c->text = ps_span(self, start);
+                self->depth--;
+                return c;
+            }
+        }
+        *self = save;            /* 不是强转：回到 '(' 之前 */
+    }
+    n = ps_postfix(self);
+    self->depth--;
+    return n;
+}
+
+static Node *ps_binary(Parser *self, int minprec)
+{
+    int start = ps_tok_start(self);
+    Node *n = ps_unary(self);
+    int guard = 0;
+
+    for (guard = 0; guard < 512; guard++) {
+        int prec = 0;
+        int op = ps_binop_of(self, &prec);
+
+        if (op == OP_NONE || prec < minprec)
+            break;
+        ps_adv(self);
+        {
+            Node *b = ps_binary(self, prec + 1);
+            Node *bin = nd_new(self, ND_BIN);
+
+            bin->op = op;
+            bin->a = n;
+            bin->b = b;
+            bin->text = ps_span(self, start);
+            n = bin;
+        }
+    }
+    return n;
+}
+
+static Node *ps_cond(Parser *self)
+{
+    int start = ps_tok_start(self);
+    Node *n = ps_binary(self, 1);
+
+    if (ps_at(self, "?")) {
+        Node *c = nd_new(self, ND_COND);
+
+        ps_adv(self);
+        c->a = n;
+        c->b = ps_expr(self);
+        ps_expect(self, ":");
+        c->c = ps_cond(self);
+        c->text = ps_span(self, start);
+        return c;
+    }
+    return n;
+}
+
+static Node *ps_assign(Parser *self)
+{
+    int start = ps_tok_start(self);
+    Node *n = ps_cond(self);
+    int op = ps_assignop_of(self);
+
+    if (op != OP_NONE) {
+        Node *a = nd_new(self, ND_ASSIGN);
+
+        a->op = op;
+        a->a = n;
+        ps_adv(self);
+        a->b = ps_assign(self);
+        a->text = ps_span(self, start);
+        return a;
+    }
+    return n;
+}
+
+static Node *ps_expr(Parser *self)
+{
+    Node *n = ps_assign(self);
+
+    while (ps_at(self, ",")) {
+        Node *c = nd_new(self, ND_COMMA);
+
+        ps_adv(self);
+        c->a = n;
+        c->b = ps_assign(self);
+        n = c;
+    }
+    return n;
+}
+
+static Node *ps_comma_expr(Parser *self) { return ps_expr(self); }
+
+/* ---- 语句 ---- */
+
+/* 当前 token 是不是一条声明的开头？ */
+static int ps_is_decl(Parser *self)
+{
+    Token n1 = { TK_EOF, 0, 0, 0, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    Token n2 = { TK_EOF, 0, 0, 0, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+
+    if (self->tok.kind == TK_KEYWORD) {
+        switch (self->tok.kw) {
+        case KW_TYPEDEF: case KW_STATIC: case KW_EXTERN: case KW_CONST:
+        case KW_VOLATILE: case KW_REGISTER: case KW_INLINE: case KW_AUTO:
+        case KW_STRUCT: case KW_UNION: case KW_ENUM: case KW_VOID:
+        case KW_CHAR: case KW_SHORT: case KW_INT: case KW_LONG:
+        case KW_FLOAT: case KW_DOUBLE: case KW_SIGNED: case KW_UNSIGNED:
+        case KW_BOOL: case KW_RESTRICT: case KW_CLOSURE:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    if (ps_at(self, "@") || ps_at(self, "|"))
+        return 1;
+    if (self->tok.kind != TK_IDENT)
+        return 0;
+    if (prog_is_typename(self->prog, self->tok.text))
+        return 1;
+    n1 = lx_peek(&self->lx, 0);
+    if (n1.kind == TK_IDENT)
+        return 1;
+    if (tok_is(&n1, "@"))
+        return 1;                /* `Buf@(96) x`：泛型实例化的类型 */
+    if (tok_is(&n1, "*")) {
+        n2 = lx_peek(&self->lx, 1);
+        if (n2.kind == TK_IDENT)
+            return 1;
+    }
+    return 0;
+}
+
+/* 声明语句：`T a = 1, b[3] = {0};`（`static` 变量豁免初始化规则，标记在符号上） */
+static Stmt *ps_decl_stmt(Parser *self)
+{
+    Stmt *s = st_new(self, ST_DECL);
+    Sym *head = 0;
+    Sym **tail = &head;
+    Type *base = 0;
+    int is_static = 0;
+    int guard = 0;
+
+    self->static_seen = 0;
+    base = ps_decl_base(self);
+    is_static = self->static_seen;
+    for (guard = 0; guard < 128; guard++) {
+        Str name = { (char[:]){ 0, 0 } };
+        Type *type = 0;
+        Sym *params = 0;
+        Sym *sym = 0;
+
+        ps_decl(self, base, &name, &type, &params);
+        if (!type)
+            type = base;
+        sym = sym_new(self, name, SYM_LOCAL, type);
+        sym->is_static = is_static;
+        if (ps_accept(self, "="))
+            sym->init = ps_init(self);
+        if (ps_accept_kw(self, KW_CATCH)) {
+            if (self->tok.kind == TK_IDENT)
+                ps_adv(self);
+            if (ps_at(self, "{"))
+                ps_skip_braces(self);
+        }
+        if (name.s.len) {
+            *tail = sym;
+            tail = &sym->next;
+        }
+        if (!ps_accept(self, ","))
+            break;
+    }
+    s->sym = head;
+    if (!ps_accept(self, ";")) {
+        ps_err(self, "expected ';' after a declaration");
+        ps_resync(self);
+    }
+    return s;
+}
+
+/* 元组解构：`(int q, int r) = f();` */
+static Stmt *ps_tuple_decl(Parser *self)
+{
+    Stmt *s = st_new(self, ST_DECL);
+    Sym *head = 0;
+    Sym **tail = &head;
+    int guard = 0;
+
+    ps_adv(self);                /* '(' */
+    for (guard = 0; guard < 32; guard++) {
+        Type *base = ps_typespec(self);
+        Str name = { (char[:]){ 0, 0 } };
+        Type *type = 0;
+        Sym *params = 0;
+        Sym *sym = 0;
+
+        ps_decl(self, base, &name, &type, &params);
+        if (!type)
+            type = base;
+        sym = sym_new(self, name, SYM_LOCAL, type);
+        if (name.s.len) {
+            *tail = sym;
+            tail = &sym->next;
+        }
+        if (!ps_accept(self, ","))
+            break;
+    }
+    ps_expect(self, ")");
+    if (ps_accept(self, "=") && head)
+        head->init = ps_assign(self);
+    s->sym = head;
+    if (!ps_accept(self, ";")) {
+        ps_err(self, "expected ';' after a tuple declaration");
+        ps_resync(self);
+    }
+    return s;
+}
+
+/* 当前 '(' 是元组**类型**的开头吗？`(int, int) t = { 4, 5 };` 里类型后面
+ * 紧跟逗号，而元组解构 `(int q, int r) = f();` 后面是名字。 */
+static int ps_tuple_is_type(Parser *self)
+{
+    Parser save = *self;
+    int ok = 0;
+
+    self->quiet = save.quiet + 1;
+    ps_adv(self);
+    ps_typespec(self);
+    if (tok_is(&self->tok, ","))
+        ok = 1;
+    *self = save;
+    return ok;
+}
+
+/* 声明的基本类型：元组类型 `(int, int)` 先整段跳过，其余走 ps_typespec */
+static Type *ps_decl_base(Parser *self)
+{
+    if (ps_at(self, "(")) {
+        Type *t = ty_new(self, TY_UNKNOWN, -1);
+
+        ps_skip_parens(self);
+        return ps_post_type(self, t);
+    }
+    return ps_typespec(self);
+}
+
+/* 当前 '(' 是不是元组解构的开头？`(int q, int r) = f();` 里类型后面**有名字**，
+ * 而 `(u32)x` / `(void)u;` 的 `)` 紧跟在类型后面，是强转或括号表达式。 */
+static int ps_tuple_start(Parser *self)
+{
+    Parser save = *self;
+    int ok = 0;
+
+    self->quiet = save.quiet + 1;
+    ps_adv(self);
+    ps_typespec(self);
+    if (self->tok.kind == TK_IDENT)
+        ok = 1;
+    *self = save;
+    return ok;
+}
+
+static Stmt *ps_stmt(Parser *self)
+{
+    Stmt *s = 0;
+    Lexer before = self->lx;
+
+    self->prog->nstmt++;
+    if (ps_at(self, "{"))
+        return ps_block(self);
+    if (ps_at(self, "(")) {
+        if (ps_tuple_start(self))
+            return ps_tuple_decl(self);
+        if (ps_tuple_is_type(self))
+            return ps_decl_stmt(self);
+    }
+    if (ps_accept(self, ";"))
+        return st_new(self, ST_EXPR);
+    if (ps_at_kw(self, KW_IF)) {
+        ps_adv(self);
+        s = st_new(self, ST_IF);
+        ps_expect(self, "(");
+        s->cond = ps_expr(self);
+        ps_expect(self, ")");
+        s->body = ps_stmt(self);
+        if (ps_accept_kw(self, KW_ELSE))
+            s->els = ps_stmt(self);
+        return s;
+    }
+    if (ps_at_kw(self, KW_WHILE)) {
+        ps_adv(self);
+        s = st_new(self, ST_WHILE);
+        ps_expect(self, "(");
+        s->cond = ps_expr(self);
+        ps_expect(self, ")");
+        s->body = ps_stmt(self);
+        return s;
+    }
+    if (ps_at_kw(self, KW_DO)) {
+        ps_adv(self);
+        s = st_new(self, ST_DO);
+        s->body = ps_stmt(self);
+        if (ps_accept_kw(self, KW_WHILE)) {
+            ps_expect(self, "(");
+            s->cond = ps_expr(self);
+            ps_expect(self, ")");
+        }
+        ps_accept(self, ";");
+        return s;
+    }
+    if (ps_at_kw(self, KW_FOR)) {
+        ps_adv(self);
+        s = st_new(self, ST_FOR);
+        ps_expect(self, "(");
+        if (ps_at(self, ";")) {
+            ps_adv(self);
+        } else if (ps_is_decl(self)) {
+            s->init = ps_decl_stmt(self);
+        } else {
+            Stmt *e = st_new(self, ST_EXPR);
+
+            e->cond = ps_expr(self);
+            ps_expect(self, ";");
+            s->init = e;
+        }
+        if (!ps_at(self, ";"))
+            s->cond = ps_expr(self);
+        ps_expect(self, ";");
+        if (!ps_at(self, ")")) {
+            Stmt *e = st_new(self, ST_EXPR);
+
+            e->cond = ps_expr(self);
+            s->step = e;
+        }
+        ps_expect(self, ")");
+        s->body = ps_stmt(self);
+        return s;
+    }
+    if (ps_at_kw(self, KW_SWITCH)) {
+        ps_adv(self);
+        s = st_new(self, ST_SWITCH);
+        ps_expect(self, "(");
+        s->cond = ps_expr(self);
+        ps_expect(self, ")");
+        s->body = ps_stmt(self);
+        return s;
+    }
+    if (ps_at_kw(self, KW_CASE)) {
+        ps_adv(self);
+        s = st_new(self, ST_CASE);
+        s->cond = ps_cond(self);
+        ps_accept(self, "...");
+        ps_expect(self, ":");
+        return s;
+    }
+    if (ps_at_kw(self, KW_DEFAULT)) {
+        ps_adv(self);
+        s = st_new(self, ST_DEFAULT);
+        ps_expect(self, ":");
+        return s;
+    }
+    if (ps_at_kw(self, KW_RETURN)) {
+        ps_adv(self);
+        s = st_new(self, ST_RETURN);
+        if (!ps_at(self, ";"))
+            s->cond = ps_at(self, "{") ? ps_init(self) : ps_expr(self);
+        ps_accept(self, ";");
+        return s;
+    }
+    if (ps_at_kw(self, KW_BREAK)) {
+        ps_adv(self);
+        ps_accept(self, ";");
+        return st_new(self, ST_BREAK);
+    }
+    if (ps_at_kw(self, KW_CONTINUE)) {
+        ps_adv(self);
+        ps_accept(self, ";");
+        return st_new(self, ST_CONTINUE);
+    }
+    if (ps_at_kw(self, KW_GOTO)) {
+        ps_adv(self);
+        s = st_new(self, ST_GOTO);
+        if (self->tok.kind == TK_IDENT) {
+            s->cond = nd_new(self, ND_IDENT);
+            s->cond->name = self->tok.text;
+            ps_adv(self);
+        }
+        ps_accept(self, ";");
+        return s;
+    }
+    if (ps_at_kw(self, KW_DEFER) || ps_at_kw(self, KW_ERRDEFER)) {
+        int kind = ps_at_kw(self, KW_DEFER) ? ST_DEFER : ST_ERRDEFER;
+
+        ps_adv(self);
+        s = st_new(self, kind);
+        if (ps_at(self, "{")) {
+            s->body = ps_block(self);
+        } else {
+            s->cond = ps_expr(self);
+            ps_accept(self, ";");
+        }
+        return s;
+    }
+    if (ps_at_kw(self, KW_TRY)) {
+        ps_adv(self);
+        s = st_new(self, ST_TRY);
+        s->cond = ps_expr(self);
+        if (ps_accept_kw(self, KW_CATCH)) {
+            if (self->tok.kind == TK_IDENT)
+                ps_adv(self);
+            if (self->tok.kind == TK_IDENT)
+                ps_adv(self);
+            if (ps_at(self, "{"))
+                ps_skip_braces(self);
+        }
+        ps_accept(self, ";");
+        return s;
+    }
+    if (ps_at_kw(self, KW_FOREACH)) {
+        ps_adv(self);
+        s = st_new(self, ST_FOREACH);
+        if (ps_expect(self, "(")) {
+            int two = 0;
+
+            if (ps_at(self, "(")) {
+                ps_adv(self);
+                two = 1;
+            }
+            if (ps_is_decl(self)) {
+                Type *base = ps_typespec(self);
+                Str name = { (char[:]){ 0, 0 } };
+                Type *type = 0;
+                Sym *params = 0;
+                Sym *sym = 0;
+
+                ps_decl(self, base, &name, &type, &params);
+                if (!type)
+                    type = base;
+                sym = sym_new(self, name, SYM_LOCAL, type);
+                s->sym = sym;
+                if (ps_accept(self, ",")) {
+                    Type *base2 = ps_typespec(self);
+                    Str name2 = { (char[:]){ 0, 0 } };
+                    Type *type2 = 0;
+                    Sym *params2 = 0;
+
+                    ps_decl(self, base2, &name2, &type2, &params2);
+                    if (!type2)
+                        type2 = base2;
+                    sym->next = sym_new(self, name2, SYM_LOCAL, type2);
+                }
+            }
+            if (two)
+                ps_accept(self, ")");    /* 绑定的元组先收口 */
+            ps_accept(self, "=");
+            s->cond = ps_expr(self);
+            if (ps_accept(self, ":"))
+                s->cond2 = ps_expr(self);
+            ps_accept(self, ")");
+        }
+        s->body = ps_stmt(self);
+        return s;
+    }
+    if (ps_at_kw(self, KW_ASM)) {
+        ps_adv(self);
+        if (ps_at(self, "("))
+            ps_skip_parens(self);
+        ps_accept(self, ";");
+        return st_new(self, ST_EXPR);
+    }
+    /* 标签 */
+    if (self->tok.kind == TK_IDENT && tok_is(&lx_peek(&self->lx, 0), ":")) {
+        s = st_new(self, ST_LABEL);
+        s->cond = nd_new(self, ND_IDENT);
+        s->cond->name = self->tok.text;
+        ps_adv(self);
+        ps_adv(self);
+        s->body = ps_stmt(self);
+        return s;
+    }
+    if (ps_is_decl(self))
+        return ps_decl_stmt(self);
+    /* 表达式语句（尾部可能挂一个 `catch e { ... }`） */
+    s = st_new(self, ST_EXPR);
+    s->cond = ps_expr(self);
+    if (ps_accept_kw(self, KW_CATCH)) {
+        if (self->tok.kind == TK_IDENT)
+            ps_adv(self);
+        if (ps_at(self, "{"))
+            ps_skip_braces(self);
+    }
+    if (!ps_accept(self, ";")) {
+        ps_err(self, "expected ';' after an expression statement");
+        if (self->lx.pos == before.pos)
+            ps_adv(self);
+        ps_resync(self);
+    }
+    return s;
+}
+
+static Stmt *ps_block(Parser *self)
+{
+    Stmt *blk = st_new(self, ST_BLOCK);
+    Stmt **tail = &blk->body;
+
+    if (!ps_expect(self, "{"))
+        return blk;
+    while (!(self->tok.kind == TK_EOF) && !ps_at(self, "}")) {
+        Lexer before = self->lx;
+        Stmt *s = ps_stmt(self);
+
+        if (s) {
+            *tail = s;
+            tail = &s->next;
+        }
+        if (self->lx.pos == before.pos) {
+            ps_err(self, "no progress");
+            ps_adv(self);
+        }
+    }
+    ps_accept(self, "}");
+    return blk;
+}
+
+/* ---- 文件作用域 ---- */
+
+static void ps_push_func(Parser *self, Func *f)
+{
+    f->next = 0;
+    if (self->prog->ftail)
+        self->prog->ftail->next = f;
+    else
+        self->prog->funcs = f;
+    self->prog->ftail = f;
+    self->prog->nfunc++;
+}
+
+/* `test "描述" { ... }`：当成一个函数体来分析 */
+static void ps_test_block(Parser *self)
+{
+    Func *f = fn_new(self);
+
+    f->line = self->tok.line;
+    f->col = self->tok.col;
+    if (self->tok.kind == TK_STR) {
+        f->name = tok_str_body(&self->tok);
+        ps_adv(self);
+    }
+    f->ret = ty_new(self, TY_VOID, 0);
+    f->body = ps_block(self);
+    ps_push_func(self, f);
+}
+
+static void ps_typedef(Parser *self)
+{
+    Type *base = 0;
+    int guard = 0;
+
+    ps_adv(self);                /* typedef */
+    self->static_seen = 0;
+    base = ps_typespec(self);
+    for (guard = 0; guard < 64; guard++) {
+        Str name = { (char[:]){ 0, 0 } };
+        Type *type = 0;
+        Sym *params = 0;
+
+        ps_decl(self, base, &name, &type, &params);
+        if (!type)
+            type = base;
+        if (name.s.len)
+            prog_add(self, sym_new(self, name, SYM_TYPEDEF, type));
+        if (!ps_accept(self, ","))
+            break;
+    }
+    if (!ps_accept(self, ";")) {
+        ps_err(self, "expected ';' after a typedef");
+        ps_resync(self);
+    }
+}
+
+/* 文件作用域的一条声明：函数定义、原型或全局变量 */
+static void ps_toplevel(Parser *self)
+{
+    Type *base = 0;
+    Str name = { (char[:]){ 0, 0 } };
+    Type *type = 0;
+    Sym *params = 0;
+    int is_static = 0;
+    int guard = 0;
+
+    self->static_seen = 0;
+    if (ps_at(self, "(")) {
+        /* 元组返回类型 `(int, int) divmod(...)`：按「不透明返回类型」看 */
+        ps_skip_parens(self);
+        base = ps_post_type(self, ty_new(self, TY_UNKNOWN, -1));
+    } else {
+        base = ps_typespec(self);
+    }
+    is_static = self->static_seen;
+    ps_decl(self, base, &name, &type, &params);
+    if (!type)
+        type = base;
+    if (type->kind == TY_FUNC && ps_at(self, "{")) {
+        Func *f = fn_new(self);
+
+        f->name = name;
+        f->ret = type->elem;
+        f->params = params;
+        f->line = self->tok.line;
+        f->col = self->tok.col;
+        f->body = ps_block(self);
+        ps_push_func(self, f);
+        return;
+    }
+    if (name.s.len) {
+        Sym *s = sym_new(self, name, type->kind == TY_FUNC ? SYM_FUNC : SYM_GLOBAL,
+                         type);
+
+        s->is_static = is_static;
+        if (type->kind != TY_FUNC && ps_accept(self, "="))
+            s->init = ps_init(self);
+        prog_add(self, s);
+    }
+    for (guard = 0; guard < 64; guard++) {
+        Str name2 = { (char[:]){ 0, 0 } };
+        Type *type2 = 0;
+        Sym *params2 = 0;
+
+        if (!ps_accept(self, ","))
+            break;
+        ps_decl(self, base, &name2, &type2, &params2);
+        if (!type2)
+            type2 = base;
+        if (name2.s.len) {
+            Sym *s = sym_new(self, name2,
+                             type2->kind == TY_FUNC ? SYM_FUNC : SYM_GLOBAL, type2);
+
+            s->is_static = is_static;
+            if (type2->kind != TY_FUNC && ps_accept(self, "="))
+                s->init = ps_init(self);
+            prog_add(self, s);
+        }
+    }
+    if (!ps_accept(self, ";")) {
+        ps_err(self, "expected ';' after a declaration");
+        ps_resync(self);
+    }
+}
+
+/* 建一个空的解析器（c6 要求每个变量都有初始化器，所以用工厂函数） */
+static Parser ps_open(Arena *a, Str src)
+{
+    Token eof = { TK_EOF, 0, 1, 1, { (char[:]){ 0, 0 } }, 0, 10, 0, 0 };
+    Parser p = { lx_open(src), eof, a, 0, 0, 0, 0, 0 };
+
+    return p;
+}
+
+/* 解析一份源码，返回程序结构；所有节点都在 A 上。 */
+Program *parse_program(Arena *a, Str src)
+{
+    Parser p = ps_open(a, src);
+    Parser *self = &p;
+    Program *prog = (Program *)a->alloc(sizeof(Program), 8);
+    int guard = 0;
+
+    prog->funcs = 0;
+    prog->ftail = 0;
+    prog->syms = 0;
+    prog->nerr = 0;
+    prog->nfunc = 0;
+    prog->nstmt = 0;
+    prog->first_err_line = 0;
+    prog->first_err_col = 0;
+    prog->first_err = 0;
+    prog->nerrl = 0;
+    prog->nimports = 0;
+    self->arena = a;
+    self->prog = prog;
+    self->depth = 0;
+    self->static_seen = 0;
+    self->last_end = 0;
+    self->tok = lx_next(&self->lx);
+    for (guard = 0; guard < 1000000; guard++) {
+        Lexer before = self->lx;
+
+        if (self->tok.kind == TK_EOF)
+            break;
+        if (self->tok.kind == TK_KEYWORD
+            && (self->tok.kw == KW_MODULE || self->tok.kw == KW_IMPORT)) {
+            int is_import = self->tok.kw == KW_IMPORT;
+            int start = 0;
+
+            ps_adv(self);
+            start = ps_tok_start(self);
+            while (!(self->tok.kind == TK_EOF) && !ps_at(self, ";"))
+                ps_adv(self);
+            if (is_import && prog->nimports < 64 && self->last_end > start) {
+                Str name = { (char[:]){ self->lx.src.s.data + start,
+                                        self->last_end - start } };
+                int e = name.s.len;
+                int i = 0;
+
+                while (e > 0 && (name.s.data[e - 1] == ' '
+                                 || name.s.data[e - 1] == '\t'
+                                 || name.s.data[e - 1] == '\n'))
+                    e--;
+                for (i = 0; i < e; i++)
+                    if (name.s.data[i] == ' ' || name.s.data[i] == '\t'
+                        || name.s.data[i] == ',')
+                        break;
+                if (i == e && e > 0)
+                    prog->imports[prog->nimports++] = (Str){ (char[:]){ name.s.data,
+                                                                      e } };
+            }
+            ps_accept(self, ";");
+            continue;
+        }
+        if (ps_accept(self, ";"))
+            continue;
+        if (ps_at_kw(self, KW_TEST)) {
+            ps_adv(self);
+            ps_test_block(self);
+            continue;
+        }
+        if (ps_at_kw(self, KW_TYPEDEF)) {
+            ps_typedef(self);
+            continue;
+        }
+        if (ps_at_kw(self, KW_INTERFACE)) {
+            ps_adv(self);
+            if (self->tok.kind == TK_IDENT)
+                ps_adv(self);             /* 接口名 */
+            if (ps_at(self, "{"))
+                ps_skip_braces(self);     /* 接口声明：方法体不需要分析 */
+            else
+                ps_resync(self);
+            continue;
+        }
+        ps_toplevel(self);
+        if (self->lx.pos == before.pos) {
+            ps_err(self, "no progress at file scope");
+            ps_adv(self);
+        }
+    }
+    prog->nerr += self->lx.nerr;         /* 词法错误与解析错误一起计 */
+    return prog;
+}
+
+int parse_errors(Program *p) { return p ? p->nerr : 1; }
+
+/* ---- 自测 ---- */
+
+static Program *pp(Arena *a, const char *src)
+{
+    Str s = { (char[:]){ (char *)src, (int)strlen(src) } };
+
+    return parse_program(a, s);
+}
+
+static Func *findf(Program *p, const char *name)
+{
+    Func *f = p->funcs;
+
+    for (; f; f = f->next)
+        if (str_is(f->name, name))
+            return f;
+    return 0;
+}
+
+static Sym *finds(Program *p, const char *name)
+{
+    Str s = { (char[:]){ (char *)name, (int)strlen(name) } };
+
+    return prog_find(p, s, 0);
+}
+
+static int count_params(Sym *s)
+{
+    int n = 0;
+
+    for (; s; s = s->next)
+        n++;
+    return n;
+}
+
+test "函数、参数与返回语句" {
+    u8 buf[8192] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a, "int add(int a, int b) { return a + b; }");
+    Func *f = findf(p, "add");
+
+    if (parse_errors(p) != 0)
+        return err(1, "干净的源码不该有解析错误");
+    if (!f || !f->body || f->body->kind != ST_BLOCK)
+        return err(2, "没解析出函数体");
+    if (count_params(f->params) != 2)
+        return err(3, "参数个数不对");
+    if (!f->body->body || f->body->body->kind != ST_RETURN)
+        return err(4, "第一条语句不是 return");
+    if (!f->body->body->cond || f->body->body->cond->kind != ND_BIN
+        || f->body->body->cond->op != OP_ADD)
+        return err(5, "return 的表达式不是加法");
+    if (!str_is(f->body->body->cond->text, "a + b"))
+        return err(6, "表达式原文不对");
+    if (f->ret->kind != TY_INT || f->ret->size != 4)
+        return err(7, "返回类型不是 4 字节 int");
+}
+
+test "数组长度、切片与结构体大小" {
+    u8 buf[8192] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a, "struct P { int x, y; char c; };\n"
+                         "int g[4];\n"
+                         "int main(void) { char local[17]; return 0; }");
+    Sym *g = finds(p, "g");
+    Sym *pt = finds(p, "P");
+    Func *f = findf(p, "main");
+    Sym *local = 0;
+
+    if (parse_errors(p) != 0)
+        return err(1, "干净的源码不该有解析错误");
+    if (!g || g->type->kind != TY_ARRAY || g->type->n_elem != 4
+        || g->type->size != 16)
+        return err(2, "全局数组的长度/大小不对");
+    if (!pt || pt->kind != SYM_TAG || pt->type->size != 12)
+        return err(3, "结构体大小不对（4+4+1 对齐到 12）");
+    if (!f || !f->body->body || f->body->body->kind != ST_DECL)
+        return err(4, "第一条语句不是声明");
+    local = f->body->body->sym;
+    if (!local || local->type->n_elem != 17 || local->type->size != 17)
+        return err(5, "局部数组的长度/大小不对");
+}
+
+test "enum 常量能当数组长度，切片是 16 字节" {
+    u8 buf[8192] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a, "enum { N = 3 };\n"
+                         "int a[N];\n"
+                         "int main(void) { int[:] s = a; return 0; }");
+    Sym *s = finds(p, "a");
+
+    if (parse_errors(p) != 0)
+        return err(1, "干净的源码不该有解析错误");
+    if (!s || s->type->n_elem != 3)
+        return err(2, "enum 常量没有折进数组长度");
+    {
+        Func *f = findf(p, "main");
+        Sym *v = 0;
+
+        if (!f || !f->body->body || f->body->body->kind != ST_DECL)
+            return err(3, "main 的第一条语句不是声明");
+        v = f->body->body->sym;
+        if (!v || v->type->kind != TY_SLICE || v->type->size != 16)
+            return err(4, "切片不是两个机器字");
+    }
+}
+
+test "强转、复合字面量与括号的区分" {
+    u8 buf[8192] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a, "int f(int a) { return (a) + (int)7; }\n"
+                         "int g(int a) { u32 u = (u32)a; (void)u; return (S){ a }; }");
+    Func *f = findf(p, "f");
+    Node *e = 0;
+
+    if (!f || !f->body->body || !f->body->body->cond)
+        return err(2, "没解析出 return 表达式");
+    e = f->body->body->cond;
+    if (e->kind != ND_BIN || e->op != OP_ADD)
+        return err(3, "顶层不是加法");
+    if (e->a->kind != ND_IDENT)
+        return err(4, "(a) 被当成了强转");
+    if (e->b->kind != ND_CAST || !e->b->type || e->b->type->size != 4)
+        return err(5, "(int)7 没被识别成强转");
+    if (!str_is(e->text, "(a) + (int)7"))
+        return err(6, "表达式原文不对");
+    /* 未知类型 + `)` 后面紧跟表达式：按强转看，不报错 */
+    if (parse_errors(p) != 0)
+        return err(7, "来自 import 的未知类型不该报错");
+}
+
+test "c6 语句：defer / errdefer / try / foreach / test 块" {
+    u8 buf[16384] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a,
+        "int f(int *p) {\n"
+        "    defer free(p);\n"
+        "    try g();\n"
+        "    foreach (int v = p) {\n"
+        "        if (v < 0) return -1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n"
+        "test \"样例\" { if (f(0) != 0) return err(1, \"x\"); }\n");
+    Func *f = findf(p, "f");
+    Stmt *s = 0;
+
+    if (parse_errors(p) != 0)
+        return err(1, "合法的 c6 语句不该报解析错误");
+    if (p->nfunc != 2)
+        return err(2, "test 块没有被当成函数体");
+    if (!f || !f->body || !f->body->body)
+        return err(3, "没解析出函数体");
+    s = f->body->body;
+    if (s->kind != ST_DEFER)
+        return err(4, "第一条语句不是 defer");
+    s = s->next;
+    if (s->kind != ST_TRY)
+        return err(5, "第二条语句不是 try");
+    s = s->next;
+    if (s->kind != ST_FOREACH || !s->sym || !str_is(s->sym->name, "v"))
+        return err(6, "第三条语句不是 foreach 或绑定名不对");
+    s = s->next;
+    if (s->kind != ST_RETURN)
+        return err(7, "最后一条语句不是 return");
+}
+
+test "元组解构与多声明符" {
+    u8 buf[8192] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a, "int main(void) {\n"
+                         "    int q = 0, r = 0;\n"
+                         "    (int m, int n) = f();\n"
+                         "    return q + r + m + n;\n"
+                         "}");
+    Func *f = findf(p, "main");
+    Stmt *s = 0;
+
+    if (parse_errors(p) != 0)
+        return err(1, "干净的源码不该有解析错误");
+    if (!f || !f->body->body)
+        return err(2, "没解析出函数体");
+    s = f->body->body;
+    if (s->kind != ST_DECL || !s->sym || !s->sym->next
+        || !str_is(s->sym->name, "q") || !str_is(s->sym->next->name, "r"))
+        return err(3, "多声明符没串起来");
+    s = s->next;
+    if (s->kind != ST_DECL || !s->sym || !s->sym->next
+        || !str_is(s->sym->name, "m") || !str_is(s->sym->next->name, "n"))
+        return err(4, "元组解构没解析出来");
+    if (!s->sym->init)
+        return err(5, "元组解构的右值丢了");
+}
+
+test "import 名字记下来了（CLI 靠它解析依赖）" {
+    u8 buf[8192] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a, "module foo.bar;\nimport std.text.str;\n"
+                         "import std.core.types;\nint main(void) { return 0; }");
+
+    if (p->nimports != 2)
+        return err(1, "import 个数不对");
+    if (!str_is(p->imports[0], "std.text.str")
+        || !str_is(p->imports[1], "std.core.types"))
+        return err(2, "import 名字不对");
+}
+
+test "认不出来的构造只记账，不死循环" {
+    u8 buf[8192] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Program *p = pp(&a, "int f(void) { interface X { void g(); } return 0; }\n"
+                         "int g( { { ;\n");
+
+    if (parse_errors(p) <= 0)
+        return err(1, "坏源码应该记下解析错误");
+}
