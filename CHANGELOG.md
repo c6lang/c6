@@ -7,6 +7,23 @@
 
 ## 未发布
 
+### 修 CI：GNU make 4.3 上 `tccdefs_.h: No such file or directory`
+
+- GitHub Actions 的四个 `test (...)` 全挂在 Build 第一步：`tccpp.c:4430: fatal error:
+  tccdefs_.h: No such file or directory`，报错的两个目标是 `<builtin>: libtcc.o` 和
+  `<builtin>: tcc.o`。根因不在源码，在 `tcc/Makefile` 的标志记录 `tcc/.c6-flags`：
+  它由 makefile **解析期**的 `$(shell ...)` 写出来，而 GNU make **4.3**（Ubuntu
+  22.04 / 24.04，也就是 CI 上的 make）看不到「解析期刚创建」的文件，于是
+  `%.o : %.c $(LIBTCC_INC) $(C6FLAGS_STAMP)` 的前置判成不可生成、规则被丢弃，make
+  退到内置的 `%.o : %.c` —— 没有 `$(DEFINES)` / `$(CFLAGS)`、没有 `-DONE_SOURCE=0`、
+  也没有 `tccdefs_.h` 依赖，于是 `libtcc.c` 与 `tcc.c` 一起撞上同一个 fatal error。
+  本机 GNU make 4.4.1 看得见这个文件，所以本地一直是绿的。
+- 修法：给 `$(C6FLAGS_STAMP)` 补一条自己的规则（缺了就照同样内容写一份）。文件在的
+  时候规则不跑，不会带出多余重编；缺了也不会让对象规则失效，内置规则再没有机会顶上来。
+- 验证：GNU make 4.3（`-DCMAKE_MAKE_PROGRAM=` 指向 Debian bookworm 的 make 4.3），
+  `shared=ON` / `shared=OFF` 两种构型全新检出都能编通，`c6` / `libtcc.a` /
+  `libtcc.so` 齐全，第二次构建无动作，改 `EXTRA-DEFS` 仍会全量重编。
+
 ### 构建标志变了就全量重编（修 `tcc: error: no input files`）
 
 - `tcc/` 里的目标文件现在都依赖一份标志记录 `tcc/.c6-flags`（`CC` / `CFLAGS` /

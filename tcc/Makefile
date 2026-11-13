@@ -284,6 +284,17 @@ C6FLAGS_STAMP = .c6-flags
 C6FLAGS_NOW = $(CC) $(CFLAGS) $(DEFINES) $(LDFLAGS) $(LIBS)
 $(shell printf '%s\n' '$(C6FLAGS_NOW)' | cmp -s - $(C6FLAGS_STAMP) 2>/dev/null \
 	|| printf '%s\n' '$(C6FLAGS_NOW)' > $(C6FLAGS_STAMP))
+# The stamp needs a rule of its own, not just the parse-time $(shell) above.
+# GNU make 4.3 (Ubuntu 22.04/24.04) does not see a file that the parse-time
+# $(shell) has just created, so the stamp still looked unmakeable, make dropped
+# the object rule below and fell back to its builtin '%.o : %.c' - compiling
+# without $(DEFINES)/$(CFLAGS), without -DONE_SOURCE=0 and without the
+# tccdefs_.h dependency ('tccdefs_.h: No such file or directory' on a fresh
+# tree).  With a rule the stamp is simply written again when it is missing;
+# when it is there (the normal case) the rule never runs, so nothing is
+# rebuilt for nothing.
+$(C6FLAGS_STAMP):
+	@printf '%s\n' '$(C6FLAGS_NOW)' > $@
 endif
 endif
 
