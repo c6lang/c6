@@ -141,7 +141,7 @@
   [docs/ubcheck.md](docs/ubcheck.md) §4（分析能力）与 §8（安全级别与 Rust 级的差距）。
   再补两个可判定项：`q = realloc(p, n)` 之后旧指针作废（`UB-UAF`，原地 `p = realloc(p, n)`
   不算）、全局变量地址进线程入口 → `UB-RACE`（可能级，修法指向锁/原子量），共 15 类。
-  运行时层落地成 `make safegate`：`ubcheck` 之外再用 `c6 -b` 跑 `tests/ubsmoke.c6`
+  运行时层落地成 `make safegate`：`ubcheck` 之外再用 `c6 -b` 跑 `tests/ub/ubsmoke.c6`
   （下标来自参数、静态判不出的越界），必须被 `-b` 当场抓住才算通过。
   报告里再补两笔「没有结论」的账：`N 处没看懂`（解析器没认出来的构造）与
   `另有 N 处访问说不准`（`ub_unproven()`：下标/解引用说不准，交给 `c6 -b` 兜）——

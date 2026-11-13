@@ -2841,7 +2841,7 @@ Go 的写法**：同一个 1000 路循环，c6 版 40 行，C 状态机版 260 �
 指向 `std.os.sync` 的锁 / `std.core.atomic` 的原子量）。共 15 类。
 
 运行时那一层也落成了目标：`make safegate = ubcheck + c6 -b`。第二半跑
-`tests/ubsmoke.c6`——那处越界下标来自函数参数，静态按「说不准就不说」放过，`-b`
+`tests/ub/ubsmoke.c6`——那处越界下标来自函数参数，静态按「说不准就不说」放过，`-b`
 必须当场抓出 `BCHECK: … is outside of the region` 并让进程非 0 退出；抓不住就说明
 运行时层没生效，门不放行。
 

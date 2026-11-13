@@ -239,7 +239,7 @@ make safegate     # ubcheck（静态，整个 std/）+ c6 -b 探针（证明运�
 `ub_unproven()`（`ub_accesses()` 是访问点总数）。`--strict` 会把这行打到 stderr，
 提醒这条代码库有多少内存访问交给运行时兜。
 
-`safegate` 的第二半跑 `tests/ubsmoke.c6`：那处越界的下标来自函数参数，**静态层按
+`safegate` 的第二半跑 `tests/ub/ubsmoke.c6`：那处越界的下标来自函数参数，**静态层按
 「说不准就不说」放过**，`-b` 必须当场抓住（`BCHECK: … is outside of the region`，
 进程非 0 退出）。抓不住就说明运行时层没生效，门不放行。
 

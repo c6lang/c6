@@ -1387,13 +1387,13 @@ ubcheck: std-ub
 	echo "ubcheck: std/ 全部通过（十四类可判定 UB 0 条、无「没看懂」构造）"
 
 # 安全检查门（静态 + 运行时两层）：静态层用 stdub --strict，运行时层用 c6 -b。
-# tests/ubsmoke.c6 里那处越界的下标来自函数参数 —— 静态层按「说不准就不说」放过，
+# tests/ub/ubsmoke.c6 里那处越界的下标来自函数参数 —— 静态层按「说不准就不说」放过，
 # 运行时层必须当场抓住；抓不住说明第二层没生效，门就不该放行。
 safegate: ubcheck
 	@mkdir -p build
-	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -b -o build/ubsmoke tests/ubsmoke.c6
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -b -o build/ubsmoke tests/ub/ubsmoke.c6
 	@if ./build/ubsmoke >/dev/null 2>&1; then \
-	    echo "safegate: 运行时 -b 没抓住 tests/ubsmoke.c6 的越界，第二层失效"; exit 1; \
+	    echo "safegate: 运行时 -b 没抓住 tests/ub/ubsmoke.c6 的越界，第二层失效"; exit 1; \
 	fi
 	@echo "safegate: 运行时 -b 抓住了静态判不出的越界（变量下标）"
 	@echo "safegate: 静态 + 运行时两层都通过"

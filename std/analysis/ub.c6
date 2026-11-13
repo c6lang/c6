@@ -856,6 +856,18 @@ static int deref_check(Ctx *c, Node *target, Node *site, int wr)
     return 0;
 }
 
+/* 常量 0 的几种写法：`0`、`'\0'`、`NULL`、`nil` */
+static int zero_like(Node *n)
+{
+    if (!n)
+        return 0;
+    if (n->kind == ND_IDENT)
+        return str_is(n->name, "NULL") || str_is(n->name, "nil");
+    if (n->kind == ND_NUM || n->kind == ND_CHAR)
+        return n->ival == 0;
+    return 0;
+}
+
 /* `!p` / `p == 0` / `NULL == p` 这种「p 是空」的形状 */
 static int null_test(Node *n, Str *out)
 {
@@ -866,14 +878,12 @@ static int null_test(Node *n, Str *out)
         return 1;
     }
     if (n->kind == ND_BIN && (n->op == OP_EQ)
-        && n->a && n->a->kind == ND_IDENT && n->b
-        && (n->b->kind == ND_NUM || n->b->kind == ND_CHAR) && n->b->ival == 0) {
+        && n->a && n->a->kind == ND_IDENT && zero_like(n->b)) {
         *out = n->a->name;
         return 1;
     }
     if (n->kind == ND_BIN && (n->op == OP_EQ)
-        && n->b && n->b->kind == ND_IDENT && n->a
-        && (n->a->kind == ND_NUM || n->a->kind == ND_CHAR) && n->a->ival == 0) {
+        && n->b && n->b->kind == ND_IDENT && zero_like(n->a)) {
         *out = n->b->name;
         return 1;
     }
@@ -890,8 +900,7 @@ static int nonnull_test(Node *n, Str *out)
         return 1;
     }
     if (n->kind == ND_BIN && (n->op == OP_NE)
-        && n->a && n->a->kind == ND_IDENT && n->b
-        && (n->b->kind == ND_NUM || n->b->kind == ND_CHAR) && n->b->ival == 0) {
+        && n->a && n->a->kind == ND_IDENT && zero_like(n->b)) {
         *out = n->a->name;
         return 1;
     }
@@ -1929,6 +1938,12 @@ static void ub_decl(Ctx *c, Stmt *s)
                 v->line = y->line;
             } else if (y->init->kind == ND_IDENT) {
                 var_alias(c, y->name, y->init->name, y->type);
+            } else {
+                /* 普通初始化（函数返回值等）：状态重新开始，别继承同名旧变量 */
+                v->state = VS_UNKNOWN;
+                v->size = -1;
+                v->line = y->line;
+                v->has_range = 0;
             }
             ub_expr(c, y->init, 0);
         }
