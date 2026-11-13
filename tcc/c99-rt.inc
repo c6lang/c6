@@ -1,16 +1,24 @@
 /* ------------------------------------------------------------------------
    c6 runtime prelude for the C99 back-end.
    This text is appended to every generated file that uses c6 features.
-   It is ordinary C99 (plus POSIX threads/select for async and go).
+   It is ordinary C99 (plus POSIX threads/epoll for async and go).
    ------------------------------------------------------------------------ */
 #include <stdlib.h>
 
 #if defined(__unix__) || defined(__APPLE__) || defined(__linux__)
 # define C99_RT_POSIX 1
 # include <pthread.h>
-# include <sys/select.h>
+# include <unistd.h>
+# include <poll.h>
+# if defined(__linux__)
+#  include <sys/epoll.h>
+#  define C99_RT_EPOLL 1
+# else
+#  define C99_RT_EPOLL 0
+# endif
 #else
 # define C99_RT_POSIX 0
+# define C99_RT_EPOLL 0
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -20,6 +28,9 @@
 # define C99_RT_UNUSED
 # define __c99_rt_linkage static
 #endif
+
+/* the registry bit that says the kernel still has this fd armed */
+#define C99_REG_ARMED 0x80000000u
 
 /* c6 extension runtime: err                                              */
 /*                                                                           */
@@ -483,7 +494,7 @@ typedef struct C99CoTask {
     const char *err_msg;
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
-    int waiting;                /* parked on wait_fd, waiting for select() */
+    int waiting;                /* parked on wait_fd, waiting for epoll */
 } C99CoTask;
 
 typedef struct C99CoDesc {
@@ -512,6 +523,16 @@ struct C99CoPool {
     int *fds;
     int *evs;
     C99CoTask **leafs;
+    struct pollfd *pfds;
+#if C99_RT_EPOLL
+    /* epoll 的注册集：内核一个 fd 只能注册一次，所以按 fd 去重后再等，
+       唤醒时按 fd 把所有 park 在它上面的任务一起放行 */
+    struct epoll_event *evbuf;
+    unsigned int *reg;          /* fd -> events last told to the kernel */
+    int *slot;                  /* fd -> first leaf parked on it, -1 none */
+    int capreg;
+    int epfd, epfd_ready;
+#endif
 };
 
 C99_RT_UNUSED __c99_rt_linkage void __c99_co_free(C99CoPool *co)
@@ -519,6 +540,14 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_co_free(C99CoPool *co)
     free(co->fds);
     free(co->evs);
     free(co->leafs);
+    free(co->pfds);
+#if C99_RT_EPOLL
+    free(co->evbuf);
+    free(co->reg);
+    free(co->slot);
+    if (co->epfd_ready && co->epfd >= 0)
+        close(co->epfd);
+#endif
     free(co);
 }
 
@@ -689,31 +718,156 @@ C99_RT_UNUSED __c99_rt_linkage int __c6_co_rev(void *self)
     return ((C99CoTask *)self)->wait_rev;
 }
 
-/* Wait for FD to become ready for EV (1 = readable, 2 = writable).  libtcc1
-   carries no headers, so 'select' is declared by hand and the descriptor set
-   is a plain word array; fds must be below 1024 (FD_SETSIZE). */
+/* Ready mask of one epoll_event: the bits c6_io uses (1 = readable,
+   2 = writable, 3 = error/hangup, which lets the body see EOF). */
+C99_RT_UNUSED __c99_rt_linkage int __c99_co_rev_of(unsigned int re)
+{
+    int rev = 0;
+
+    if (re & EPOLLIN)
+        rev |= 1;
+    if (re & EPOLLOUT)
+        rev |= 2;
+    if (re & (EPOLLERR | EPOLLHUP))
+        rev |= 3;
+    return rev;
+}
+
+/* The thread's epoll instance, created on first use.  Returns -1 when the
+   platform has no epoll (the caller falls back to poll). */
+C99_RT_UNUSED __c99_rt_linkage int __c99_co_epfd(C99CoPool *co)
+{
+#if C99_RT_EPOLL
+    if (!co->epfd_ready) {
+        co->epfd = epoll_create1(0);
+        co->epfd_ready = 1;
+    }
+    return co->epfd;
+#else
+    (void)co;
+    return -1;
+#endif
+}
+
+/* Register FD with the events EV asks for and arm it for one event.  The
+   registry is indexed by descriptor number, so 'already registered?' is an
+   array read and a coroutine that waits again on the same descriptor costs
+   one epoll_ctl() per await (EPOLLONESHOT: the kernel disarms the descriptor
+   when it fires, the next await arms it again). */
+C99_RT_UNUSED __c99_rt_linkage int __c99_co_arm(C99CoPool *co, int epfd,
+                                              int fd, int ev)
+{
+#if C99_RT_EPOLL
+    unsigned int need = (unsigned int)(((ev & 1) ? EPOLLIN : 0)
+                                     | ((ev & 2) ? EPOLLOUT : 0));
+    unsigned int was = 0, cur = 0;
+    struct epoll_event e;
+
+    if (fd < 0)
+        return -1;
+    if (fd >= co->capreg) {
+        int cap = co->capreg ? co->capreg : 64;
+        unsigned int *nr = 0;
+        int *ns = 0;
+        int i = 0;
+
+        while (cap <= fd)
+            cap *= 2;
+        nr = (unsigned int *)calloc((unsigned long)cap, sizeof *nr);
+        ns = (int *)calloc((unsigned long)cap, sizeof *ns);
+        if (!nr || !ns) {
+            free(nr);
+            free(ns);
+            return -1;
+        }
+        for (i = 0; i < cap; i++)
+            ns[i] = -1;
+        if (co->reg) {
+            for (i = 0; i < co->capreg; i++) {
+                nr[i] = co->reg[i];
+                ns[i] = co->slot[i];
+            }
+            free(co->reg);
+            free(co->slot);
+        }
+        co->reg = nr;
+        co->slot = ns;
+        co->capreg = cap;
+    }
+    was = co->reg[fd];
+    cur = was & ~C99_REG_ARMED;
+    if ((was & C99_REG_ARMED) && (cur & need) == need)
+        return 0;                   /* already armed for exactly this */
+    e.events = (cur | need) | EPOLLONESHOT;
+    e.data.fd = fd;
+    if (!cur) {
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &e) != 0)
+            return -1;
+    } else if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e) != 0) {
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &e) != 0)
+            return -1;
+    }
+    co->reg[fd] = (cur | need) | C99_REG_ARMED;
+    return 0;
+#else
+    (void)co; (void)epfd; (void)fd; (void)ev;
+    return -1;
+#endif
+}
+
+/* the kernel disarmed FD when it fired: the next await arms it again */
+C99_RT_UNUSED __c99_rt_linkage void __c99_co_disarm(C99CoPool *co, int fd)
+{
+#if C99_RT_EPOLL
+    if (fd >= 0 && fd < co->capreg)
+        co->reg[fd] &= ~C99_REG_ARMED;
+#else
+    (void)co; (void)fd;
+#endif
+}
+
+/* Wait for FD to become ready for EV (1 = readable, 2 = writable).  epoll
+   (or poll where epoll is missing) has no descriptor-number limit, so any fd
+   the process can open is fine here. */
 C99_RT_UNUSED __c99_rt_linkage int __c99_co_select(int fd, int ev)
 {
 #if C99_RT_POSIX
-    fd_set r, w, e;
-    int res, rev = 0;
+    C99CoPool *co = __c99_th_co(__c99_th());
+    int epfd = 0, res = 0, rev = 0;
 
-    if (fd < 0 || fd >= FD_SETSIZE)
+    if (fd < 0)
         return -1;
-    FD_ZERO(&r); FD_ZERO(&w); FD_ZERO(&e);
-    if (ev & 1)
-        FD_SET(fd, &r);
-    if (ev & 2)
-        FD_SET(fd, &w);
-    res = select(fd + 1, &r, &w, &e, (struct timeval *)0);
-    if (res <= 0)
-        return res;
-    if (FD_ISSET(fd, &r))
-        rev |= 1;
-    if (FD_ISSET(fd, &w))
-        rev |= 2;
-    if (FD_ISSET(fd, &e))
-        rev |= 3;
+    epfd = __c99_co_epfd(co);
+# if C99_RT_EPOLL
+    if (epfd >= 0) {
+        struct epoll_event e;
+
+        if (__c99_co_arm(co, epfd, fd, ev) != 0)
+            return -1;
+        res = epoll_wait(epfd, &e, 1, -1);
+        __c99_co_disarm(co, fd);
+        if (res <= 0)
+            return res;
+        return __c99_co_rev_of(e.events);
+    }
+# endif
+    {
+        struct pollfd p;
+
+        p.fd = fd;
+        p.events = (short)(((ev & 1) ? POLLIN : 0) | ((ev & 2) ? POLLOUT : 0));
+        p.revents = 0;
+        res = poll(&p, 1, -1);
+        if (res <= 0)
+            return res;
+        if (p.revents & POLLIN)
+            rev |= 1;
+        if (p.revents & POLLOUT)
+            rev |= 2;
+        if (p.revents & (POLLERR | POLLHUP | POLLNVAL))
+            rev |= 3;               /* error/hangup: the body sees EOF */
+    }
+    (void)epfd;
     return rev;
 #else
     (void)fd; (void)ev;
@@ -778,7 +932,7 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_step_once(C99CoTask *t)
         leaf->kind = k;
         break;
     case C6_CO_KIND_IO:
-        leaf->waiting = 1;              /* the pump has to select() for it */
+        leaf->waiting = 1;              /* the pump has to poll() for it */
         break;
     case C6_CO_KIND_CHILD:
         break;
@@ -801,26 +955,122 @@ C99_RT_UNUSED __c99_rt_linkage void __c99_co_room(C99CoPool *co, int n)
     co->evs = (int *)realloc(co->evs, co->cap * sizeof *co->evs);
     co->leafs = (C99CoTask **)realloc(co->leafs,
                                       co->cap * sizeof *co->leafs);
-    if (!co->fds || !co->evs || !co->leafs)
+    co->pfds = (struct pollfd *)realloc(co->pfds,
+                                       co->cap * sizeof *co->pfds);
+#if C99_RT_EPOLL
+    co->evbuf = (struct epoll_event *)realloc(co->evbuf,
+                                       co->cap * sizeof *co->evbuf);
+    if (!co->fds || !co->evs || !co->leafs || !co->pfds
+        || !co->evbuf)
+#else
+    if (!co->fds || !co->evs || !co->leafs || !co->pfds)
+#endif
         __c99_co_trap();
 }
 
+/* Wait until at least one of the NIO parked descriptors is ready and hand each
+   parked leaf its readiness mask.  epoll does it in one call: register the
+   distinct descriptors (several coroutines may park on the same fd, but the
+   kernel allows one registration per fd, so the events are merged and every
+   leaf on that fd is woken), wait, then unregister.  Returns 0, or -1 when the
+   wait failed. */
+C99_RT_UNUSED __c99_rt_linkage int __c99_co_wait_all(C99CoPool *co, int nio)
+{
+    int epfd = __c99_co_epfd(co);
+    int i = 0, j = 0;
+
+#if C99_RT_EPOLL
+    if (epfd >= 0) {
+        int nready = 0;
+
+        int dup = 0;
+
+        for (i = 0; i < nio; i++) {
+            int fd = co->fds[i];
+
+            if (__c99_co_arm(co, epfd, fd, co->evs[i]) != 0)
+                return -1;
+            if (fd >= 0 && fd < co->capreg) {
+                if (co->slot[fd] < 0)
+                    co->slot[fd] = i;
+                else
+                    dup = 1;        /* several leaves on one fd */
+            }
+        }
+        nready = epoll_wait(epfd, co->evbuf, nio, -1);
+        for (i = 0; i < nio; i++)
+            __c99_co_disarm(co, co->fds[i]);
+        for (i = 0; i < nready; i++) {
+            int rfd = co->evbuf[i].data.fd;
+            int rev = __c99_co_rev_of(co->evbuf[i].events);
+
+            if (!rev)
+                continue;
+            if (!dup && rfd >= 0 && rfd < co->capreg && co->slot[rfd] >= 0) {
+                co->leafs[co->slot[rfd]]->wait_rev = rev;
+                co->leafs[co->slot[rfd]]->waiting = 0;
+                continue;
+            }
+            for (j = 0; j < nio; j++) {
+                if (co->fds[j] != rfd)
+                    continue;
+                co->leafs[j]->wait_rev = rev;
+                co->leafs[j]->waiting = 0;
+            }
+        }
+        for (i = 0; i < nio; i++) {
+            int fd = co->fds[i];
+
+            if (fd >= 0 && fd < co->capreg)
+                co->slot[fd] = -1;
+        }
+        if (nready <= 0)
+            return -1;
+        return 0;
+    }
+#endif
+    /* fallback: poll(2) over the same array */
+    for (i = 0; i < nio; i++) {
+        co->pfds[i].fd = co->fds[i];
+        co->pfds[i].events = (short)(((co->evs[i] & 1) ? POLLIN : 0)
+                                   | ((co->evs[i] & 2) ? POLLOUT : 0));
+        co->pfds[i].revents = 0;
+    }
+    if (poll(co->pfds, (unsigned long)nio, -1) <= 0)
+        return -1;
+    for (i = 0; i < nio; i++) {
+        int rev = 0;
+
+        if (co->pfds[i].revents & POLLIN)
+            rev |= 1;
+        if (co->pfds[i].revents & POLLOUT)
+            rev |= 2;
+        if (co->pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+            rev |= 3;               /* error/hangup: the body sees EOF */
+        if (!rev)
+            continue;               /* not this one yet: keep it parked */
+        co->leafs[i]->wait_rev = rev;
+        co->leafs[i]->waiting = 0;
+    }
+    (void)epfd;
+    return 0;
+}
 /* One round over the top-level ready list: step every task once, then wait for
    whatever is parked on a descriptor and hand each one its readiness mask.
    Finished tasks are released here; ERRS, when not NULL, collects how many of
-   them ended with 'err'.  Returns 0, or -1 when select() failed. */
+   them ended with 'err'.  Returns 0, or -1 when the wait failed. */
 C99_RT_UNUSED __c99_rt_linkage int __c99_co_pump(int *errs)
 {
     C99CoPool *co = __c99_th_co(__c99_th());
     C99CoTask *t, **pp;
-    int i, n = 0;
+    int n = 0;
 
     for (t = (C99CoTask *)co->runlist; t; t = (C99CoTask *)t->snext)
         n++;
     __c99_co_room(co, n + 1);
 
     for (;;) {
-        int nio = 0, maxfd = -1, ran = 0;
+        int nio = 0, ran = 0;
 
         pp = (C99CoTask **)&co->runlist;
         while ((t = *pp) != 0) {
@@ -838,19 +1088,17 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_pump(int *errs)
             if (k == C6_CO_KIND_IO) {
                 C99CoTask *leaf = __c99_co_leaf(t);
                 int fd = leaf->wait_fd;
-                if (fd >= 0 && fd < 1024) {
+                if (fd >= 0) {
                     if (nio >= co->cap)
                         __c99_co_room(co, nio + 1);
                     co->fds[nio] = fd;
                     co->evs[nio] = leaf->wait_ev;
                     co->leafs[nio] = leaf;
                     nio++;
-                    if (fd > maxfd)
-                        maxfd = fd;
                 } else {
-                    /* c6_io() with an fd select() cannot wait for: fail the
-                       task and release it, like __c6_co_wait() returning -1.
-                       Leaving it in the list would park it forever. */
+                    /* c6_io() with a negative fd: fail the task and release
+                       it, like __c6_co_wait() returning -1.  Leaving it in
+                       the list would park it forever. */
                     *pp = (C99CoTask *)t->snext;
                     t->snext = 0;
                     if (errs)
@@ -868,34 +1116,8 @@ C99_RT_UNUSED __c99_rt_linkage int __c99_co_pump(int *errs)
                 return 0;               /* nothing left to do */
             continue;                   /* someone made progress: go again */
         }
-#if C99_RT_POSIX
-        {
-            fd_set r, w, e;
-            FD_ZERO(&r); FD_ZERO(&w); FD_ZERO(&e);
-            for (i = 0; i < nio; i++) {
-                if (co->evs[i] & 1)
-                    FD_SET(co->fds[i], &r);
-                if (co->evs[i] & 2)
-                    FD_SET(co->fds[i], &w);
-            }
-            if (select(maxfd + 1, &r, &w, &e, (struct timeval *)0) <= 0)
-                return -1;
-            for (i = 0; i < nio; i++) {
-                int rev = 0;
-                if (FD_ISSET(co->fds[i], &r))
-                    rev |= 1;
-                if (FD_ISSET(co->fds[i], &w))
-                    rev |= 2;
-                if (!rev)
-                    continue;       /* not this one yet: keep it parked */
-                co->leafs[i]->wait_rev = rev;
-                co->leafs[i]->waiting = 0;
-            }
-        }
-#else
-        (void)i; (void)maxfd;
-        return -1;
-#endif
+        if (__c99_co_wait_all(co, nio) < 0)
+            return -1;
     }
 }
 

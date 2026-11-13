@@ -2582,7 +2582,7 @@ typedef struct TccCoTask {
     const char *err_msg;
     void *snext;                /* next task on the top-level ready list */
     int busy;                   /* currently being stepped (re-entrancy) */
-    int waiting;                /* parked on wait_fd, waiting for select() */
+    int waiting;                /* parked on wait_fd, waiting for poll() */
 } TccCoTask;
 
 /* Same rule as C6GcDesc: the compiler writes this one too, in LP64 layout, so
@@ -2600,6 +2600,64 @@ typedef struct TccCoDesc {
    pointer points at; a local lives at 'frame - offset'.  'frame_size' in the
    descriptor, not the pool, is what bounds it.  The cleanups of the body need
    no room here: their state is in that frame (docs/design/gc-design.md §9.1). */
+/* Waiting primitive: epoll(7) on Linux, poll(2) everywhere else.  Either way
+   the ready set is an array that grows with the number of parked coroutines and
+   the descriptor number is only bounded by the process's own limit, so neither
+   the number of live tasks nor the fd number has a fixed ceiling in the
+   language.  libtcc1 carries no headers, so both layouts are spelled out here.
+
+   The kernel's 'struct epoll_event' is packed: 4 bytes of events followed by 8
+   bytes of payload.  Keeping every member 32-bit reproduces that layout without
+   needing the 'packed' attribute (sizeof == 12), and the payload is read back
+   as the descriptor we put in it (epoll_data_t's fd member). */
+typedef struct TccEpollEvent {
+    unsigned int events;
+    unsigned int data_lo;
+    unsigned int data_hi;
+} TccEpollEvent;
+
+#define TCC_EPOLLIN   0x001u
+#define TCC_EPOLLOUT  0x004u
+#define TCC_EPOLLERR  0x008u
+#define TCC_EPOLLHUP  0x010u
+#define TCC_EPOLL_ADD 1
+#define TCC_EPOLL_DEL 2
+#define TCC_EPOLL_MOD 3
+/* One event per arm: the kernel disarms the descriptor when it fires, and the
+   next await arms it again with EPOLL_CTL_MOD.  A coroutine that waits again
+   on the same descriptor therefore costs one epoll_ctl() per await instead of
+   the add-and-delete pair a level-triggered registration needs. */
+#define TCC_EPOLL_ONESHOT 0x40000000u
+/* registry bookkeeping: the low bits are the events the kernel was last told
+   about, this bit says "still armed there" */
+#define TCC_REG_ARMED 0x80000000u
+
+/* One entry of the poll() fallback array: an int, two shorts, padded by the
+   compiler for whatever the target wants. */
+typedef struct TccPollFd {
+    int fd;
+    short events, revents;
+} TccPollFd;
+
+/* The bits 'c6_io' asks for, and what poll() reports back.  The values are
+   POSIX's: POLLIN = 1, POLLOUT = 4, POLLERR|POLLHUP|POLLNVAL = 8|16|32. */
+#define TCC_POLL_IN   1
+#define TCC_POLL_OUT  4
+#define TCC_POLL_BAD  56
+
+/* Only the coroutine pump needs these, and a freestanding program has no file
+   descriptors to wait for: the references are weak, so a link without libc
+   leaves them null and the pump reports failure instead of failing to link.
+   epoll is used when the platform has it (Linux); poll is the fallback.  Both
+   take arrays that grow with the number of parked coroutines, and neither has
+   a descriptor-number window like select()'s FD_SETSIZE, so the number of live
+   coroutines and the fd numbers are bounded by memory only. */
+extern int epoll_create1(int) __attribute__((weak));
+extern int epoll_ctl(int, int, int, TccEpollEvent *) __attribute__((weak));
+extern int epoll_wait(int, TccEpollEvent *, int, int) __attribute__((weak));
+extern int poll(TccPollFd *, unsigned long, int) __attribute__((weak));
+extern int close(int) __attribute__((weak));
+
 struct TccCoPool {
     /* Top-level coroutines started with 'co': they belong to no scope and no
        parent, so the scheduler below owns them from creation to completion. */
@@ -2613,6 +2671,19 @@ struct TccCoPool {
     int *fds;
     int *evs;
     TccCoTask **leafs;
+    TccPollFd *pfds;
+    /* epoll 的注册集，按 fd 直接索引：'reg[fd]' 记住内核最后被告知的事件位
+       （TCC_REG_ARMED 表示它还挂在内核里）。多个任务可以 park 在同一个 fd 上，
+       而内核一个 fd 只能注册一次，所以登记时合并 events、等待后按 fd 唤醒全部
+       挂在这个 fd 上的叶子。 */
+    unsigned int *reg;
+    /* 'slot[fd]'：这一轮里 park 在该 fd 上的第一个叶子的下标（-1 = 没有），
+       让「就绪 -> 唤醒」是 O(1) 而不是把 nio 个叶子扫一遍 */
+    int *slot;
+    int capreg;
+    TccEpollEvent *evbuf;
+    int epfd;
+    int epfd_ready;
 };
 
 static void tcc_th_co_free(TccCoPool *co)
@@ -2620,6 +2691,12 @@ static void tcc_th_co_free(TccCoPool *co)
     c6_free(co->fds);
     c6_free(co->evs);
     c6_free(co->leafs);
+    c6_free(co->pfds);
+    c6_free(co->reg);
+    c6_free(co->slot);
+    c6_free(co->evbuf);
+    if (co->epfd_ready && co->epfd >= 0 && close)
+        close(co->epfd);
     c6_free(co);
 }
 
@@ -2629,12 +2706,6 @@ static TccCoPool *tcc_th_co(TccThCtx *th)
         th->co = (TccCoPool *)tcc_th_alloc(sizeof *th->co);
     return th->co;
 }
-
-/* Only the coroutine pump needs select(); a freestanding program has no
-   file descriptors to wait for, so the reference is weak and the pump
-   reports failure instead of failing to link. */
-extern int select(int, void *, void *, void *, void *)
-    __attribute__((weak));
 
 static void tcc_co_trap(void)
 {
@@ -2795,33 +2866,147 @@ int __c6_co_rev(void *self)
     return ((TccCoTask *)self)->wait_rev;
 }
 
-/* Wait for FD to become ready for EV (1 = readable, 2 = writable).  libtcc1
-   carries no headers, so 'select' is declared by hand and the descriptor set
-   is a plain word array; fds must be below 1024 (FD_SETSIZE). */
+/* Ready mask of one epoll_event: the bits c6_io uses (1 = readable,
+   2 = writable, 3 = error/hangup, which lets the body see EOF). */
+static int tcc_co_rev_of(unsigned int re)
+{
+    int rev = 0;
+
+    if (re & TCC_EPOLLIN)
+        rev |= 1;
+    if (re & TCC_EPOLLOUT)
+        rev |= 2;
+    if (re & (TCC_EPOLLERR | TCC_EPOLLHUP))
+        rev |= 3;
+    return rev;
+}
+
+/* The thread's epoll instance, created on first use.  Returns -1 when the
+   platform has no epoll (the caller falls back to poll). */
+static int tcc_co_epfd(TccCoPool *co)
+{
+    if (!epoll_create1 || !epoll_ctl || !epoll_wait)
+        return -1;
+    if (!co->epfd_ready) {
+        co->epfd = epoll_create1(0);
+        co->epfd_ready = 1;
+    }
+    return co->epfd;
+}
+
+/* Register FD with the events EV asks for (1 = readable, 2 = writable) and arm
+   it for one event.  The registry is indexed by descriptor number, so looking
+   up "already registered?" is an array read: a program with thousands of
+   connections pays one epoll_ctl() per await, not a scan. */
+static int tcc_co_arm(TccCoPool *co, int epfd, int fd, int ev)
+{
+    unsigned int need = (unsigned int)(((ev & 1) ? TCC_EPOLLIN : 0)
+                                     | ((ev & 2) ? TCC_EPOLLOUT : 0));
+    unsigned int was = 0, cur = 0;
+    TccEpollEvent e;
+
+    if (fd < 0)
+        return -1;
+    if (fd >= co->capreg) {
+        int cap = co->capreg ? co->capreg : 64;
+        unsigned int *nr = 0;
+        int *ns = 0;
+        int i = 0;
+
+        while (cap <= fd)
+            cap *= 2;
+        nr = (unsigned int *)c6_alloc((unsigned long)cap * sizeof *nr);
+        ns = (int *)c6_alloc((unsigned long)cap * sizeof *ns);
+        if (!nr || !ns) {
+            c6_free(nr);
+            c6_free(ns);
+            return -1;
+        }
+        for (i = 0; i < cap; i++) {
+            nr[i] = 0;
+            ns[i] = -1;
+        }
+        if (co->reg) {
+            for (i = 0; i < co->capreg; i++) {
+                nr[i] = co->reg[i];
+                ns[i] = co->slot[i];
+            }
+            c6_free(co->reg);
+            c6_free(co->slot);
+        }
+        co->reg = nr;
+        co->slot = ns;
+        co->capreg = cap;
+    }
+    was = co->reg[fd];
+    cur = was & ~TCC_REG_ARMED;
+    if ((was & TCC_REG_ARMED) && (cur & need) == need)
+        return 0;                   /* already armed for exactly this */
+    e.events = (cur | need) | TCC_EPOLL_ONESHOT;
+    e.data_lo = (unsigned int)fd;
+    e.data_hi = 0;
+    if (!cur) {
+        if (epoll_ctl(epfd, TCC_EPOLL_ADD, fd, &e) != 0)
+            return -1;
+    } else if (epoll_ctl(epfd, TCC_EPOLL_MOD, fd, &e) != 0) {
+        /* the kernel forgot the descriptor (it was closed, or a level
+           registration is gone): register it again */
+        if (epoll_ctl(epfd, TCC_EPOLL_ADD, fd, &e) != 0)
+            return -1;
+    }
+    co->reg[fd] = (cur | need) | TCC_REG_ARMED;
+    return 0;
+}
+
+/* The kernel disarmed FD when it fired: the next await has to arm it again */
+static void tcc_co_disarm(TccCoPool *co, int fd)
+{
+    if (fd >= 0 && fd < co->capreg)
+        co->reg[fd] &= ~TCC_REG_ARMED;
+}
+
+/* Wait for FD to become ready for EV (1 = readable, 2 = writable).  This is
+   the path __c6_co_wait() takes for a single parked task; the pump below uses
+   one wait for all of them.  The descriptor number is passed through as is:
+   any fd the process can open is fine. */
 static int tcc_co_select(int fd, int ev)
 {
-    unsigned long r[16], w[16], e[16];
-    int i, res, rev = 0;
+    TccCoPool *co = tcc_th_co(tcc_th());
+    int epfd = 0, res = 0, rev = 0;
+    TccEpollEvent e;
 
-    if (fd < 0 || fd >= 1024)
+    if (fd < 0)
         return -1;
-    for (i = 0; i < 16; i++)
-        r[i] = w[i] = e[i] = 0;
-    if (ev & 1)
-        r[fd >> 6] |= 1UL << (fd & 63);
-    if (ev & 2)
-        w[fd >> 6] |= 1UL << (fd & 63);
-    if (!select)
+    epfd = tcc_co_epfd(co);
+    if (epfd >= 0) {
+        if (tcc_co_arm(co, epfd, fd, ev) != 0)
+            return -1;
+        res = epoll_wait(epfd, &e, 1, -1);
+        tcc_co_disarm(co, fd);
+        if (res <= 0)
+            return res;
+        return tcc_co_rev_of(e.events);
+    }
+    /* fallback: poll(2) */
+    if (!poll)
         return -1;                  /* freestanding: nothing to wait for */
-    res = select(fd + 1, r, w, e, (void *)0);
-    if (res <= 0)
-        return res;
-    if (r[fd >> 6] & (1UL << (fd & 63)))
-        rev |= 1;
-    if (w[fd >> 6] & (1UL << (fd & 63)))
-        rev |= 2;
-    if (e[fd >> 6] & (1UL << (fd & 63)))
-        rev |= 3;
+    {
+        TccPollFd p;
+
+        p.fd = fd;
+        p.events = (short)(((ev & 1) ? TCC_POLL_IN : 0)
+                         | ((ev & 2) ? TCC_POLL_OUT : 0));
+        p.revents = 0;
+        res = poll(&p, 1, -1);
+        if (res <= 0)
+            return res;
+        if (p.revents & TCC_POLL_IN)
+            rev |= 1;
+        if (p.revents & TCC_POLL_OUT)
+            rev |= 2;
+        if (p.revents & TCC_POLL_BAD)
+            rev |= 3;
+    }
     return rev;
 }
 
@@ -2882,7 +3067,7 @@ static int tcc_co_step_once(TccCoTask *t)
         leaf->kind = k;
         break;
     case C6_CO_KIND_IO:
-        leaf->waiting = 1;              /* the pump has to select() for it */
+        leaf->waiting = 1;              /* the pump has to poll() for it */
         break;
     case C6_CO_KIND_CHILD:
         break;
@@ -2905,27 +3090,115 @@ static void tcc_co_room(TccCoPool *co, int n)
     co->evs = (int *)c6_realloc(co->evs, co->cap * sizeof *co->evs);
     co->leafs = (TccCoTask **)c6_realloc(co->leafs,
                                       co->cap * sizeof *co->leafs);
-    if (!co->fds || !co->evs || !co->leafs)
+    co->pfds = (TccPollFd *)c6_realloc(co->pfds,
+                                       co->cap * sizeof *co->pfds);
+    co->evbuf = (TccEpollEvent *)c6_realloc(co->evbuf,
+                                            co->cap * sizeof *co->evbuf);
+    if (!co->fds || !co->evs || !co->leafs || !co->pfds || !co->evbuf)
         tcc_co_trap();
+}
+
+/* Wait until at least one of the NIO parked descriptors is ready and hand each
+   parked leaf its readiness mask.  epoll does it in one call: arm every parked
+   descriptor (a descriptor can be parked on by several coroutines, but the
+   kernel allows one registration per fd, so tcc_co_arm() merges the events and
+   every leaf on that fd is woken), wait once, then note that the kernel
+   disarmed whatever fired.  Returns 0, or -1 when the wait failed. */
+static int tcc_co_wait_all(TccCoPool *co, int nio)
+{
+    int epfd = tcc_co_epfd(co);
+    int i = 0, j = 0, nready = 0;
+
+    if (epfd >= 0) {
+        int dup = 0;
+
+        for (i = 0; i < nio; i++) {
+            int fd = co->fds[i];
+
+            if (tcc_co_arm(co, epfd, fd, co->evs[i]) != 0)
+                return -1;
+            if (fd >= 0 && fd < co->capreg) {
+                if (co->slot[fd] < 0)
+                    co->slot[fd] = i;
+                else
+                    dup = 1;        /* 多个叶子等同一个 fd：得全扫一遍 */
+            }
+        }
+        nready = epoll_wait(epfd, co->evbuf, nio, -1);
+        for (i = 0; i < nio; i++)
+            tcc_co_disarm(co, co->fds[i]);
+        for (i = 0; i < nready; i++) {
+            int rfd = (int)co->evbuf[i].data_lo;
+            int rev = tcc_co_rev_of(co->evbuf[i].events);
+
+            if (!rev)
+                continue;
+            if (!dup && rfd >= 0 && rfd < co->capreg && co->slot[rfd] >= 0) {
+                co->leafs[co->slot[rfd]]->wait_rev = rev;
+                co->leafs[co->slot[rfd]]->waiting = 0;
+                continue;
+            }
+            for (j = 0; j < nio; j++) {
+                if (co->fds[j] != rfd)
+                    continue;
+                co->leafs[j]->wait_rev = rev;
+                co->leafs[j]->waiting = 0;
+            }
+        }
+        for (i = 0; i < nio; i++) {
+            int fd = co->fds[i];
+
+            if (fd >= 0 && fd < co->capreg)
+                co->slot[fd] = -1;
+        }
+        if (nready <= 0)
+            return -1;
+        return 0;
+    }
+    /* fallback: poll(2) over the same array */
+    if (!poll)
+        return -1;
+    for (i = 0; i < nio; i++) {
+        co->pfds[i].fd = co->fds[i];
+        co->pfds[i].events = (short)(((co->evs[i] & 1) ? TCC_POLL_IN : 0)
+                                   | ((co->evs[i] & 2) ? TCC_POLL_OUT : 0));
+        co->pfds[i].revents = 0;
+    }
+    if (poll(co->pfds, (unsigned long)nio, -1) <= 0)
+        return -1;
+    for (i = 0; i < nio; i++) {
+        int rev = 0;
+
+        if (co->pfds[i].revents & TCC_POLL_IN)
+            rev |= 1;
+        if (co->pfds[i].revents & TCC_POLL_OUT)
+            rev |= 2;
+        if (co->pfds[i].revents & TCC_POLL_BAD)
+            rev |= 3;               /* error/hangup: the body sees EOF */
+        if (!rev)
+            continue;               /* not this one yet: keep it parked */
+        co->leafs[i]->wait_rev = rev;
+        co->leafs[i]->waiting = 0;
+    }
+    return 0;
 }
 
 /* One round over the top-level ready list: step every task once, then wait for
    whatever is parked on a descriptor and hand each one its readiness mask.
    Finished tasks are released here; ERRS, when not NULL, collects how many of
-   them ended with 'err'.  Returns 0, or -1 when select() failed. */
+   them ended with 'err'.  Returns 0, or -1 when poll() failed. */
 static int tcc_co_pump(int *errs)
 {
     TccCoPool *co = tcc_th_co(tcc_th());
-    unsigned long r[16], w[16], e[16];
     TccCoTask *t, **pp;
-    int i, n = 0;
+    int n = 0;
 
     for (t = (TccCoTask *)co->runlist; t; t = (TccCoTask *)t->snext)
         n++;
     tcc_co_room(co, n + 1);
 
     for (;;) {
-        int nio = 0, maxfd = -1, ran = 0;
+        int nio = 0, ran = 0;
 
         pp = (TccCoTask **)&co->runlist;
         while ((t = *pp) != 0) {
@@ -2943,19 +3216,17 @@ static int tcc_co_pump(int *errs)
             if (k == C6_CO_KIND_IO) {
                 TccCoTask *leaf = tcc_co_leaf(t);
                 int fd = leaf->wait_fd;
-                if (fd >= 0 && fd < 1024) {
+                if (fd >= 0) {
                     if (nio >= co->cap)
                         tcc_co_room(co, nio + 1);
                     co->fds[nio] = fd;
                     co->evs[nio] = leaf->wait_ev;
                     co->leafs[nio] = leaf;
                     nio++;
-                    if (fd > maxfd)
-                        maxfd = fd;
                 } else {
-                    /* c6_io() with an fd select() cannot wait for: fail the
-                       task and release it, like __c6_co_wait() returning -1.
-                       Leaving it in the list would park it forever. */
+                    /* c6_io() with a negative fd: fail the task and release
+                       it, like __c6_co_wait() returning -1.  Leaving it in
+                       the list would park it forever. */
                     *pp = (TccCoTask *)t->snext;
                     t->snext = 0;
                     if (errs)
@@ -2973,27 +3244,8 @@ static int tcc_co_pump(int *errs)
                 return 0;               /* nothing left to do */
             continue;                   /* someone made progress: go again */
         }
-        for (i = 0; i < 16; i++)
-            r[i] = w[i] = e[i] = 0;
-        for (i = 0; i < nio; i++) {
-            if (co->evs[i] & 1)
-                r[co->fds[i] >> 6] |= 1UL << (co->fds[i] & 63);
-            if (co->evs[i] & 2)
-                w[co->fds[i] >> 6] |= 1UL << (co->fds[i] & 63);
-        }
-        if (!select || select(maxfd + 1, r, w, e, (void *)0) <= 0)
+        if (tcc_co_wait_all(co, nio) < 0)
             return -1;
-        for (i = 0; i < nio; i++) {
-            int rev = 0;
-            if (r[co->fds[i] >> 6] & (1UL << (co->fds[i] & 63)))
-                rev |= 1;
-            if (w[co->fds[i] >> 6] & (1UL << (co->fds[i] & 63)))
-                rev |= 2;
-            if (!rev)
-                continue;           /* not this one yet: keep it parked */
-            co->leafs[i]->wait_rev = rev;
-            co->leafs[i]->waiting = 0;
-        }
     }
 }
 

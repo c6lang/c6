@@ -4421,9 +4421,9 @@ co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 
 ```
 
 读法：**建/跑/销毁一个任务 ≈ 173 ns**（纯用户态，无 syscall）；**一次真正的挂起+恢复
-≈ 2.6 us**（含 `select()` + `read()` 两次系统调用）；`co` 批量时单任务摊销 ≈ 2.1 us，
+≈ 2.6 us**（含 `epoll_wait()` + `read()` 两次系统调用）；`co` 批量时单任务摊销 ≈ 2.1 us，
 比逐个 `task` 略省一点（少了每轮的 `__c6_co_wait` 调用与 destroy）。所以这套框架的
-会话成本基本等于「一次 `select()`」——一线程挂几千路连接时，摊到每路上就是这点开销。
+会话成本基本等于「一次 `epoll_wait()`」——一线程挂几千路连接时，摊到每路上就是这点开销。
 
 ### 集成示例：`examples/stdasync5.c6`
 
@@ -4442,7 +4442,9 @@ async 一次挂起+恢复（await c6_io）: 300 ops / 760 us -> 394369 ops/s (25
 co 顶层任务批跑（__c6_co_run）: 300 ops / 486 us -> 616687 ops/s (1621 ns/op)
 ```
 
-框架整体（分层图、三种启动方式、诚实清单）见 [async-framework.md](async-framework.md)。
+框架整体（分层图、三种启动方式、诚实清单）见 [async-framework.md](async-framework.md)；
+和 C / C++ / Go / Rust / Uya 的横向对比（同一件事的写法 + 实测数据）见
+[async-comparison.md](async-comparison.md)，跑一次就是 `make bench-async`。
 
 ### 集成示例：`examples/stdub.c6`
 

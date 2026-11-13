@@ -1,0 +1,111 @@
+// bench/async/bench.uya —— Uya 侧异步基准（对照 c6 / C / C++ / Go / Rust）
+//
+// 口径与 bench/async/bench.c6 一致：
+//   create：连续「建一个任务 → 跑完 → 回收」N 次，报每任务纳秒。
+//   switch：写一个字节到管道，再 await 该 fd 可读并读回来，报每次往返纳秒。
+//
+// Uya 的 std.async 当前是「探针 + 忙轮询」模型：`block_on` 只做
+// `poll -> Pending -> 再 poll`，等待 fd 的 future 在自己的 poll 里先用
+// `poll(2)` 零超时探测，未就绪才登记 waker。单任务的 waker 最多登记 4 个
+// fd（WAKER_IO_SLOT_MAX），多路并发由线程池承担，因此本文件不测 conns。
+use std.async;
+use libc.syscall;
+
+const CREATE_N: i32 = 200000;
+const SWITCH_N: i32 = 50000;
+
+const CLOCK_MONOTONIC_ID: i32 = 1;
+
+/// 单调时钟（纳秒）。
+fn now_ns() i64 {
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    const result: !i32 = sys_clock_gettime(CLOCK_MONOTONIC_ID, &ts);
+    _ = result catch {
+        return 0 as i64;
+    };
+    const secs: i64 = ts.tv_sec;
+    const nanos: i64 = ts.tv_nsec;
+    const secs_ns: i64 = secs *% 1000000000 as i64;
+    return secs_ns +% nanos;
+}
+
+/// 最简异步任务：为了和 c6 的 `async int trivial(int)` 对齐，什么都不等。
+@async_fn
+fn trivial(v: i32) Future<!i32> {
+    return v +| 1;
+}
+
+/// 等一个 fd 可读，然后读走一个字节。
+@async_fn
+fn read_one(fd: i32) Future<!usize> {
+    const ready: usize = try @await async_wait_readable(fd, 0);
+    if ready == 0 {
+        var buf: [byte: 1] = [0];
+        const got: !isize = sys_read(fd, &buf[0], 1);
+        _ = got catch {
+            return 0 as usize;
+        };
+    }
+    return ready;
+}
+
+export fn main() i32 {
+    // ---- create ----
+    var i: i32 = 0;
+    var acc: i32 = 0;
+    const c0: i64 = now_ns();
+    while i < CREATE_N {
+        const r: !i32 = block_on<i32>(trivial(i));
+        const v: i32 = r catch {
+            0 as i32;
+        };
+        acc = acc +| v;
+        i = i + 1;
+    }
+    const c1: i64 = now_ns();
+
+    // ---- switch ----
+    var fds: [i32: 2] = [0, 0];
+    const pipe_result: !i32 = sys_pipe2(&fds[0], 0);
+    _ = pipe_result catch {
+        @println("uya,error,pipe");
+        return 1;
+    };
+    const rd: i32 = fds[0];
+    const wr: i32 = fds[1];
+    var one: [byte: 1] = [65];
+
+    var k: i32 = 0;
+    var wsum: i64 = 0;
+    const s0: i64 = now_ns();
+    while k < SWITCH_N {
+        const wrote: !isize = sys_write(wr, &one[0], 1);
+        const wn: isize = wrote catch {
+            0 as isize;
+        };
+        wsum = wsum +| wn as i64;
+        const r2: !usize = block_on<usize>(read_one(rd));
+        const got: usize = r2 catch {
+            0 as usize;
+        };
+        wsum = wsum +| got as i64;
+        k = k + 1;
+    }
+    const s1: i64 = now_ns();
+
+    _ = sys_close(rd) catch {
+        0 as i32;
+    };
+    _ = sys_close(wr) catch {
+        0 as i32;
+    };
+    _ = acc;
+
+    // 纯整数输出：run.sh 负责换算成 ns/op，避免依赖浮点格式化。
+    @println("uya,create_total_ns,${c1 -% c0}");
+    @println("uya,create_n,${CREATE_N}");
+    @println("uya,switch_total_ns,${s1 -% s0}");
+    @println("uya,switch_n,${SWITCH_N}");
+    @println("uya,switch_bytes,${wsum}");
+    return 0;
+}

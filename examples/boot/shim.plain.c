@@ -343,9 +343,11 @@ void qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void 
 /* ---- 内存里的管道：pipe/read/write/select ---- */
 
 /* 每个 `pipe(fds)` 占一对 fd（0/1、2/3、…），没有 close 可以回收，所以这个
-   数字就是一次进程里能开的管道总数：async 的每个用例各开一对，留够余量。 */
+   数字就是一次进程里能开的管道总数：async 的每个用例各开一对，留够余量。
+   容量要装得下「一次挂起几百个协程、每个写一字节」的用例（tests/async 的
+   300 协程那条），所以按 1024 给。 */
 #define SHIM_PIPES 16
-#define SHIM_CAP 64
+#define SHIM_CAP 1024
 
 struct ShimPipe {
     char buf[SHIM_CAP];
@@ -455,6 +457,57 @@ int select(int nfds, void *rd, void *wr, void *ex, void *tv)
                 ready++;
             else
                 w[idx] &= ~bit;
+        }
+    }
+    return ready;
+}
+
+/* libtcc1 的协程泵优先用 epoll(7)；裸机上没有系统调用，于是走 poll(2) 这条
+   退路，这里把它按内存管道实现出来（布局要和 libtcc1 的 TccPollFd 一致）。 */
+struct shim_pollfd {
+    int fd;
+    short events;
+    short revents;
+};
+
+#define SHIM_POLLIN 0x001
+#define SHIM_POLLOUT 0x004
+
+int poll(void *pfds, unsigned long nfds, int timeout)
+{
+    struct shim_pollfd *p = (struct shim_pollfd *)pfds;
+    unsigned long i = 0;
+    int ready = 0;
+
+    (void)timeout;                      /* 裸机单线程：没有别的事可等 */
+    for (i = 0; i < nfds; i++) {
+        int fd = p[i].fd;
+        short ev = p[i].events;
+
+        p[i].revents = 0;
+        if (fd < 0)
+            continue;
+        if (fd < 3) {                   /* 0/1/2 当控制台：永远就绪 */
+            p[i].revents = (short)(ev & (SHIM_POLLIN | SHIM_POLLOUT));
+            if (p[i].revents)
+                ready++;
+            continue;
+        }
+        if (ev & SHIM_POLLIN) {
+            struct ShimPipe *q = shim_pipe_of(fd, 0);
+
+            if (q && q->count > 0) {
+                p[i].revents = (short)(p[i].revents | SHIM_POLLIN);
+                ready++;
+            }
+        }
+        if (ev & SHIM_POLLOUT) {
+            struct ShimPipe *q = shim_pipe_of(fd, 1);
+
+            if (q && q->count < SHIM_CAP) {
+                p[i].revents = (short)(p[i].revents | SHIM_POLLOUT);
+                ready++;
+            }
         }
     }
     return ready;

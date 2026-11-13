@@ -621,6 +621,7 @@ make std-mesh     # 编译并运行 examples/stdmesh.c6（第八十一批 OBJ/ST
 make std-https    # 编译并运行 examples/stdhttps.c6（第八十二批 同步/异步 HTTPS + 性能指标）
 make std-async5   # 编译并运行 examples/stdasync5.c6（第八十三批 预算/任务组/额度/取消）
 make std-ub       # 编译并运行 examples/stdub.c6（第八十四批 lex/parse/ub 静态分析三件套）
+make bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

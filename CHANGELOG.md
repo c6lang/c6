@@ -7,6 +7,21 @@
 
 ## 未发布
 
+### 性能与基准
+
+- **一次性 epoll 注册 + O(1) 唤醒**：协程运行时的 fd 注册集改成按 fd 索引的
+  数组，等待用 `EPOLLONESHOT` 装填（触发后内核自动解除，下一次 `await` 用
+  `EPOLL_CTL_MOD` 重装），唤醒用「fd → 叶子下标」直接命中：
+  1000 路并发连接一轮收完从 10.7 µs/连接降到 **4.95 µs/连接**，
+  单次挂起+恢复从 3.95 µs 降到 **2.84 µs**（同一台机器，`make bench-async`）。
+- **六语言异步编程横向基准**：`bench/async/`（c6 `async`/`await`、C `epoll`
+  状态机与 `pthread`、C++20 协程、Go goroutine、Rust `async` 与 `std::thread`、
+  Uya `@async_fn`/`@await`）+ `make bench-async`；三项指标（create / switch /
+  conns）与 RSS 密度同口径可比。实测：c6 146 ns/任务、2836 ns/往返、369 B/
+  挂起任务；C++ 22 ns、2092 ns、168 B；Uya 421 ns、2545 ns；Go 879 ns、542 ns、
+  2.6 KB；pthread 64 µs、9.2 µs、8.5 KB。分析见新增的
+  [docs/async-comparison.md](docs/async-comparison.md)。
+
 ### 文档
 
 - **补齐第十一批的号段与状态**：`docs/reference/grammar.md` §8.1 的 std 号段表
@@ -14,6 +29,9 @@
   `docs/history/status.md` 补写第十一批小节；第十二批（regex/diff/fuzzy/wrap）
   的号段与状态一并写入。
 
+- **新增 [docs/async-comparison.md](docs/async-comparison.md)**：同一件事（等一个
+  fd 可读）在 c6 / C / C++20 / Go / Rust / Uya 里的写法、机制、内存密度与实测
+  数据，含「哪种场景选哪种」的结论表和每条指标的口径说明。
 - **标准库 API 形态要求**：`docs/stdlib.md` 的写法约定增加硬性条款——能用结构体方法
   表达的 API 必须写成方法，调用侧只写 `v.m()`/`p->m()`；自由函数只保留工厂、无接收者
   算法、一次性便捷入口和 `foreach` 的 `has`/`next`。
@@ -53,6 +71,15 @@
   double / float / long double 的成功、失败与 `try` 传播用例，
   `tests/errors/try.c6` 把原来的 float 拒绝用例换成数组拒绝用例；
   `docs/manual/errors.md`、`grammar.md` R22、`diagnostics.md` C9 同步。
+
+### 语言 / 运行时
+
+- **协程个数与 fd 号不再有固定上限**：运行时的就绪等待从 `select(2)` 换成 `epoll(7)`
+  （没有 epoll 的平台退回 `poll(2)`；`tcc/lib/libtcc1.c` 与 C99 端运行时镜像
+  `tcc/c99-rt_.h`），注册集与事件数组随挂起的任务数增长，`c6_io` 只拒绝负 fd——
+  `fd >= FD_SETSIZE(1024)` 的任务不再被当成失败回收；
+  `std/async/aio.c6` 里同样的 1024 限制一并去掉。`tests/async.c6` 新增「同时存活 300 个
+  协程」与「fd 号 2000 也能挂起」两条语言层回归。
 
 ### 标准库
 

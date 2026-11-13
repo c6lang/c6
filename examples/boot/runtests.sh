@@ -10,6 +10,7 @@
 #   gc_drop gc_thread thread thread_handle tuple_thread    spawn -> pthread_create
 #   defer_thread                                           -> clone/futex
 #   method                                                 libc 的 FILE 布局
+#   async_highfd                                           dup2/getrlimit/setrlimit
 #
 # 整个文件跳太重的话，可以只跳一个 test 块：在块上一行写 `// BARE-SKIP`
 # （harness.py 认这个标记，块号不变），例如 tests/generic_fn.c6 里起线程那块。
@@ -20,7 +21,7 @@ cd "$root"
 build=build
 mkdir -p "$build"
 
-skip=" gc_drop gc_thread thread thread_handle tuple_thread defer_thread method "
+skip=" gc_drop gc_thread thread thread_handle tuple_thread defer_thread method async_highfd "
 pass=0
 fail=0
 failed=""

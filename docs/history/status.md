@@ -31,7 +31,7 @@ cd tcc && make clean && make -j$(nproc) EXTRA-DEFS=-DC6_EXT CFLAGS="-g -O0"
 | 7 宏 `expr`/`stmt`/`ident`/`type` | ✅ | `tccgen.c`：`c6_role_of` / `c6_macro_def_parse`（文件作用域的软关键字入口，读 `ROLE NAME (ROLE param, ...) { body }`）；`tccpp.c`：`c6_macro_body_capture`（`{}` 配对捕获，`##` → `TOK_PPJOIN`）、`c6_macro_check_body`（`#`/`##` 操作数必须是 `ident` 角色；`expr` 只能一个表达式）、`c6_hygiene_body` / `c6_scan_locals` / `c6_local_name`（自动卫生重命名 `<宏名>__<变量>__h<N>`，`__local` 仍可手动标注）、`c6_macro_wrap`（`expr` → `( … )`、`stmt` → `{ … }`、`ident`/`type` 原样）、`c6_param_role`、`macro_arg_subst` 给 `expr` 实参加括号；`#macro` 只剩一条迁移诊断 |
 | 10 变量必须初始化 | ✅ | `tccgen.c`：`c6_check_var_initialized`，在 `decl()` 的对象定义分支（`has_init` 判定之后、TCC 把暂定全局改成 `extern` 之前）调用；`extern`/函数/`typedef`/`VLA`/`static`/alias 豁免；诊断使用 mangle 前的原始标识符 |
 | 11 切片 `T[:]` | ✅ | `parse_btype()` 的 `case '['`（只认 `[:]`，其余 `unget_tok` 还原）→ `c6_slice_get`（按元素类型规范化生成内部 struct，固定布局、不走 `struct_layout`，因此 `#pragma pack` 无效）；`c6_slice_subscript`（`unary()` 的 `[` 分支，下标与区间）、`c6_slice_spill`（把基值落到本地 `{data, len}` 对）、`c6_slice_convert`（数组→切片：`vstore`/`gen_assign_cast`/强转/`decl_initializer`）；`type_to_str` 打印 `T[:]`；运行期 `libtcc1.c` 的 `__tcc_slice_index` / `__tcc_slice_sub`（越界空指针写陷阱） |
-| 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task, void *frame)` 编译，`c6_async_func_begin` 生成恢复分发序言（非 0 状态就 `__c6_co_restore` + 跳恢复点）、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把错误槽 park 出去（帧住在任务里，不用搬，清理状态跟着帧走）；运行期 `libtcc1.c` 的 `__c6_co_new`（一次分配任务结构 + 帧）/ `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（按需 malloc + 手写 `select()`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
+| 12 `async`/`await` 无栈协程 | ✅ | `parse_btype()` 的 `TOK_C6_ASYNC`（`FuncAttr.func_async`）→ `c6_async_declare`（用合成 token 在文件作用域声明 `struct NAME_task`）；`c6_async_definition` 把函数体按 `int __c6_body_NAME(void *task, void *frame)` 编译，`c6_async_func_begin` 生成恢复分发序言（非 0 状态就 `__c6_co_restore` + 跳恢复点）、`c6_async_params_copy` 把形参落成普通局部、`c6_async_func_end` 生成恢复分发器、`c6_async_finish` 写 `val` 并返回 `KIND_DONE`；`c6_async_call`（`unary()` 的 `tok_identifier` 分支）把调用改写成 `__c6_co_new` + 实参拷贝；`c6_await_parse`（`unary()` 前缀分支）+ `c6_async_suspend` 把错误槽 park 出去（帧住在任务里，不用搬，清理状态跟着帧走）；运行期 `libtcc1.c` 的 `__c6_co_new`（一次分配任务结构 + 帧）/ `__c6_co_await` / `__c6_co_suspend` / `__c6_co_restore` / `__c6_co_finish` / `__c6_co_wait` / `__c6_co_destroy`（按需 malloc + 手写 `epoll`/`poll`，不依赖 libc）；预置声明在 `tccpp.c` 的 `__TCC_ASYNC_DEFINED` 段 |
 
 | 13 `co` / `task` 软关键字 | ✅ | `co`/`spawn`/`task` 不进 `tcctok.h`：词法阶段仍是标识符，`block()` 里 `tok >= TOK_IDENT` 且 `c6_soft_kw(t)` 命中、名字没有被 `VT_TYPEDEF` 占用时按关键字分派（`c6_soft_kw_shadowed`），所以 `int spawn = 1;`、`spawn(x);`、`typedef int co;`、`spawn:` 都还成立；`c6_co_parse`（`decl()` 与 `block()` 两个入口——单条语句不走 `decl()`）+ `__tcc_co_spawn`；`c6_task_decl` / `c6_task_check_handle`（`struct NAME_task` 的 `head` 必须是 `struct __c6_task`）/ `c6_task_defer_destroy`（合成一个作用域清理点，同手写 `defer`）；运行期 `libtcc1.c` 的顶层就绪链表（`snext`/`busy`/`waiting`）与 `tcc_co_pump` / `tcc_co_step_once` / `tcc_co_link` / `tcc_co_unlink` / `__c6_co_run`，`__c6_co_wait` 也改成先推进顶层任务；`async` 体里的 `err` 走 `c6_async_propagate`（`KIND_ERR`），并禁止 `async` 方法是方法；预置声明同步加 `__tcc_co_spawn` / `__c6_co_run` |
 | 14 `spawn` = OS 线程 | ✅ | `c6_spawn_parse` 只在 `.c6` 的翻译单元里生效：实参按声明形参布局拷进 `__tcc_sp_args(size)` 的堆块（对齐循环与跳板共用同一套 `align`），跳板 `static void *__c6_sp_NAME(void *)` 在 `spawn` 调用点用 `external_sym(VT_STATIC\|VT_EXTERN)` 惰性声明、由 `c6_sp_flush()` 在 TU 末尾定义（`c6_sp_pending` 链表，`c6_tu_reset` 释放），所以头文件里的原型不产生任何代码；运行期 `libtcc1.c` 新增 `__tcc_th_start`（`pthread_create` + 把 `TccThRec` 挂到本线程链表）、`tcc_th_tramp`（解开参数块、调用、释放）、`__c6_th_join_all` / `tcc_th_join_children`；`gen_function` 在 `main` 末尾插 `__c6_th_join_all()`，`tccrun.c:tcc_run_tests` 也调一次，`-run` 不会在线程还在跑时释放 JIT 内存；每线程状态（错误槽 / 插值构造器 / 协程池）从 `__thread` 改成 `pthread_key_create` + `pthread_getspecific`（`-run` 不支持 TLS）；`defer` 不在其中，它的状态在函数帧里 |
@@ -313,7 +313,7 @@ cd tcc && make clean && make -j$(nproc) EXTRA-DEFS=-DC6_EXT CFLAGS="-g -O0"
   `x = spawn;`、`spawn(x);`、`typedef int co; co v;`、`spawn:` 标签都照常工作；
   已经被 `typedef` 成类型名的 `co`/`spawn`/`task` 一定按声明解析；
 - `co` 是**同步起点**：任务在 `co` 语句处就开始跑，跑到第一个必须等待的
-  点才回到下一条语句。`await c6_io` 总要停一轮（唤醒是下一轮 `select()`
+  点才回到下一条语句。`await c6_io` 总要停一轮（唤醒是下一轮 `epoll_wait()`
   的事，即使 fd 已经就绪）；`await` 子任务不算等待，所以不碰 fd 的
   `co f();` 会在 `co` 语句里跑完，并**当场回收**（没人拿得到句柄，也没人
   观察得到）；只有 park 在 fd 上的任务才留给 `__c6_co_run()`；
@@ -328,10 +328,10 @@ cd tcc && make clean && make -j$(nproc) EXTRA-DEFS=-DC6_EXT CFLAGS="-g -O0"
   `__c6_th_join_all()`，别的线程在退出时回收自己的子线程）；不提供取消，
   也没有分离线程。跨线程共享数据要自己加锁（和 C 一样）；
 - `spawn` 只支持 ELF 目标；PE 目标上还没有线程支持，运行时会 trap；
-- `c6_io` 的 fd 超出 `[0, 1024)` 时任务按失败回收（`__c6_co_wait` 返回
-  `-1`，`__c6_co_run` 计一次失败），不会永远 park 在 select 里；
+- `c6_io` 的 fd 为负数时任务按失败回收（`__c6_co_wait` 返回 `-1`，
+  `__c6_co_run` 计一次失败），不会永远 park；非负 fd 没有上限（`epoll(7)`）；
 - 调度是**协作式**的：没有抢占，不 hook libc，阻塞的 `read`/`printf` 不会
-  自动变成让出点；`__c6_co_run()` 对顶层任务做轮转，一次 `select()`
+  自动变成让出点；`__c6_co_run()` 对顶层任务做轮转，一次 `epoll_wait()`
   等所有 park 住的 fd；
 - 任务数不设上限（每个任务一块内存，结束即释放）；`tests/async_frame.c6`
   里 200 个任务同时挂起就是这条的回归用例。
@@ -2681,7 +2681,89 @@ co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 
 验收：`make stdtest`（346 个模块、0 failure）、`make std-async5`（34 条自检全过）、
 `make check-all`。
 
-### 11.96 标准库第八十四批（静态分析三件套：lex / parse / ub）
+### 11.96 语言层：协程个数与 fd 号都不再有固定上限（`select(2)` → `epoll(7)`）
+
+上一版文档里还留着两句老话：「同时存活的协程最多 64 个」「`c6_io` 的 fd 必须在
+`[0, 1024)`」。第一句在实现上早就不成立了（任务改成一次 `malloc` 之后没有固定池），
+第二句是真的：`tcc_co_pump()` 与 `__c6_co_wait()` 都用 `select(2)` 等就绪，位图是
+`unsigned long r[16]`，所以 fd ≥ `FD_SETSIZE`(1024) 的任务会被当成「挂不上去」直接
+失败回收。这一批把这一层换成 `epoll(7)`（没有 epoll 的平台退回 `poll(2)`），
+两个上限一起消失。
+
+| 位置 | 之前 | 现在 |
+| --- | --- | --- |
+| `tcc/lib/libtcc1.c` | `select(fd+1, &r, &w, &e)` + `r[16]` 位图；`fd < 1024` 才挂 | 每线程一个 `epoll` 实例：去重登记 `EPOLL_CTL_ADD`/`MOD`、一次 `epoll_wait`、再 `DEL`；注册集与事件数组和 `fds`/`evs`/`leafs` 一起按需 `realloc`；只要 `fd >= 0` 就挂 |
+| `tcc/c99-rt_.h` | 同一份代码的 C99 镜像（`fd_set` + `FD_SETSIZE`） | 同一份代码的 epoll 版本（`#include <sys/epoll.h>`，非 Linux 退回 `poll.h`） |
+| `std/async/aio.c6` | `aio_wait` 里自己挡了 `fd >= 1024` | 只挡负 fd |
+| 文档 | 「最多 64 个」「`[0, 1024)`」 | 「只受内存/`RLIMIT_NOFILE` 约束」 |
+
+`epoll_create1`/`epoll_ctl`/`epoll_wait`（以及退路 `poll`）在 freestanding 链接里仍然是
+**弱引用**（和原来的 `select` 一样）：没有 libc 时 pump 报失败而不是链接失败。
+`EPOLLERR|EPOLLHUP`（以及 poll 的 `POLLERR|POLLHUP|POLLNVAL`）折成 `rev |= 3`，让任务
+看到 EOF/错误而不是永远 park；等待失败时和以前一样返回 -1。
+
+语言层回归（`tests/async.c6`，两条新用例）：
+
+```
+PASS: 同时存活 300 个协程（没有固定池上限）
+PASS: fd 号超过 FD_SETSIZE（1024）也能挂起
+```
+
+第一条同时挂起 300 个 `co` 任务（全 park 在同一个管道上）再 `__c6_co_run()` 跑完；
+第二条先 `setrlimit(RLIMIT_NOFILE, 4096)` 再把管道读端 `dup2` 到 **2000** 号，分别用
+`co`（pump 路径）和 `task`（`__c6_co_wait` 路径）验证——`select(2)` 时代这两条都会
+直接失败。一个 fd 被多个协程 park 时，内核只允许登记一次，所以登记集按 fd 去重、
+合并 events，`epoll_wait` 回来后再按 fd 把所有 park 在它上面的叶子一起放行
+（上面那条 300 协程共用一个管道的用例正好覆盖这条路径）。
+
+验收：`make check-all`（含 `tests/async.c6` 23 条）。
+
+**后续（同一批的收尾）**：注册集从「每轮 ADD + 每轮 DEL」改成按 fd 索引的数组
++ `EPOLLONESHOT`：登记时 ADD，触发后内核自动解除，下一次 `await` 用
+`EPOLL_CTL_MOD` 重装填；等待失败的 fd（被关掉、号码被复用）退化成 ADD。唤醒
+一侧改成「fd → 这轮挂在它上面的第一个叶子下标」的 O(1) 命中（同一个 fd 上有
+多个叶子时置 `dup` 标记，退回全扫）。1000 路连接一轮收完从 10.7 µs/连接降到
+4.95 µs/连接，单次挂起+恢复从 3.95 µs 降到 2.84 µs（`make bench-async`）。
+
+### 11.97 六语言异步编程横向基准（`bench/async/` + `docs/async-comparison.md`）
+
+「异步编程到底贵在哪」不能只靠嘴说，于是把同一件事——等一个 fd 可读，然后
+接着跑——在六种语言里各写一遍，同一台机器、单线程口径量四项指标：
+
+| | create (ns/任务) | switch (ns/往返) | conns (µs/连接) | RSS (B/挂起任务) |
+|---|---:|---:|---:|---:|
+| c6 `async`/`await` + epoll | 146 | 2836 | 5.65 | 369 |
+| C `epoll` + 手写状态机 | 13 | 1948 | 2.44 | 90 |
+| C++20 协程 + epoll | 22 | 2092 | 1.64 | 168 |
+| Rust `async` + 手写执行器 | 45 | 2726 | 3.13 | 197 |
+| Uya `@async_fn`/`@await`（探针 + 忙轮询） | 421 | 2545 | — | — |
+| Go goroutine + netpoller | 879 | 542 | 3.30 | 2585 |
+| C pthread / Rust `std::thread` | 63 568 / 49 901 | 9164 / 8606 | 10.5 / 18.7 | 8565 / 11 735 |
+
+落地物：
+
+| 文件 | 内容 |
+|---|---|
+| `bench/async/bench.c6` | c6 版（`async`/`await` + `c6_io`） |
+| `bench/async/bench_c.c` | C 版：`epoll` 状态机（默认）与 `pthread`（`threads`） |
+| `bench/async/bench_cpp.cpp` | C++20 协程 + 200 行 `epoll` 执行器 |
+| `bench/async/bench_go.go` | goroutine + `os.Pipe`（走 netpoller） |
+| `bench/async/bench_rs.rs` | Rust `async`/`await` + 手写 `epoll + Waker` 执行器 |
+| `bench/async/bench.uya` | Uya `@async_fn`/`@await` + `async_wait_readable`（create/switch） |
+| `bench/async/run.sh` | 编译 + 分段跑（每指标一个干净进程）+ 打表 |
+| `docs/async-comparison.md` | 机制对照、写法对照、数据、口径陷阱、选型建议 |
+| `Makefile` | `make bench-async` |
+
+结论写进文档：无栈协程把并发密度提高一个数量级（c6 369 B / Rust 197 B 一路，
+Go 2.6 KB，线程 8.5 KB 以上）；`create` 的差距在「谁来分配」（C 状态机一个
+指针 vs c6 任务块 + 帧两次 `malloc`）；`switch` 的差距在「几次系统调用」
+（走 epoll 的都落在 2～2.9 µs，Go 的 channel 往返 0.55 µs，线程 8～9 µs）；
+`conns` 的差距在「每次 await 要不要重新装填」。Uya 只测到 create/switch 两栏
+（`block_on` 是探针 + 忙轮询，单任务 `Waker` 最多挂 4 个 fd，单线程多路等待要
+走 `scheduler_run_task_queue_*_with_event_loop`，队列版基准留待后续）。c6 的定位是**C 的成本结构、
+Go 的写法**：同一个 1000 路循环，c6 版 40 行，C 状态机版 260 行。
+
+### 11.98 标准库第八十四批（静态分析三件套：lex / parse / ub）
 
 前八十三批都是「向外」的库（编码、协议、格式、异步）；这一批向内：**用 c6 写一个
 分析 c6 的工具**。三段流水线，分三个模块，`examples/stdub.c6` 是命令行。
@@ -2724,56 +2806,3 @@ co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 
 
 验收：`make build`、`make stdtest`（349 个模块、0 failure）、`make std-ub`
 （9 条发现、退出码 1）、`make errcheck`（15 通过）、`make selftest`。
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
