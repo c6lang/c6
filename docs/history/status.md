@@ -2914,3 +2914,19 @@ quotedprintable 3、strdist 3，逐个跑过 0 failure；`make std-mw` 60 checks
 err 号段补 `std.text.translit`=0x6165、`std.net.coap`=0x6166、`std.net.dhcp`=0x6167、
 `std.net.ssdp`=0x6168。`std/` 现在 361 个 `.c6` 文件；四个模块的 test 块逐个跑过
 （各 2 条，0 failure），`make std-proto4` 56 checks / 0 failures。
+
+### 11.102 标准库第八十八批（网络运维 + 媒体清单）
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/net/netflow.c6` | NetFlow v5：24 字节头 + N×48 记录，版本/长度校验，`count` 与实际记录数必须一致 | 2 | `NetflowHeader.parse`；`FlowDoc.open/next/count/reset`；`Flow.src_str/dst_str/next_hop_str/octets_per_packet/duration_ms`；`NetflowBuilder.init/header/record/finish` |
+| `std/net/wol.c6` | Wake-on-LAN 魔术包：6 个 0xFF + 16 份 MAC（+ 可选 6 字节 SecureOn 密码），解析要求 16 份完全一致 | 2 | `WolPacket.init/set_mac/set_password/build/parse/data/length/mac_of`；`mac_str/mac_parse` |
+| `std/data/vtt.c6` | WebVTT：`WEBVTT` 头、NOTE/STYLE/REGION 跳过、可选 cue id、`-->` 时间戳（毫秒可省小时）、settings、多行正文 | 2 | `VttDoc.open/next/count/reset`；`VttCue.start_str/end_str/duration_ms`；`parse_ts/ts_str` |
+| `std/data/zone.c6` | DNS 区域文件：`;` 注释、跨行括号、省略 owner、`$TTL`/`$ORIGIN` 伪记录、`[TTL] [IN] type rdata` | 2 | `ZoneDoc.open/next/count/reset`；`ZoneRec.owner_copy/type_name/rdata_copy`；`type_code_of/type_str` |
+
+集成示例 `examples/stdops.c6`（`make std-ops`）62 条检查：NetFlow/WoL/WebVTT/DNS
+区域各一节 + 「找主机 → 唤醒 → 记流 → 出字幕」的串联。`Makefile` 增加
+`STD_OPS_SRCS` / `std-ops`（`.PHONY`、help、`test-all`、`check-all` 同步）；
+err 号段补 `std.net.netflow`=0x6169、`std.net.wol`=0x616a、`std.data.vtt`=0x616b、
+`std.data.zone`=0x616c。`std/` 现在 365 个 `.c6` 文件；四个模块的 test 块逐个跑过
+（各 2 条，0 failure）。

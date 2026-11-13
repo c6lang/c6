@@ -1,0 +1,526 @@
+/* std/net/netflow：NetFlow v5 报文编解码——头部 + 记录游标 + 构造器。
+ *
+ *     import std.net.netflow;
+ *
+ *     NetflowHeader h = { 0 };
+ *     h.parse(buf, n);                      // 0 = 合法（版本 5，长度对得上 count）
+ *     h.count / h.unix_secs / h.flow_seq
+ *
+ *     FlowDoc d = { 0 };
+ *     Flow f = { 0 };
+ *     d.open(&h, buf, n);                   // 游标：open / next / count / reset
+ *     while (d.next(&f)) {
+ *         char src[16] = { 0 }, dst[16] = { 0 };
+ *         f.src_str(src, sizeof src);        // 方法：src_str / dst_str / octets_per_packet
+ *         f.dst_str(dst, sizeof dst);
+ *         printf("%s:%d -> %s:%d %lu 字节\n", src, f.srcport, dst, f.dstport, f.octets);
+ *     }
+ *
+ *     NetflowBuilder b = { 0 };
+ *     b.init(out, sizeof out);
+ *     b.header(1, 1000, 1700000000, 0, 42);  // 方法：header / record / finish
+ *     b.record(&f);
+ *     b.finish();
+ *
+ * 报文形状（RFC 3954 的 v5）：
+ *
+ * - 头 24 字节：version(2) count(2) sysUptime(4) unix_secs(4) unix_nsecs(4)
+ *   flow_sequence(4) engine_type(1) engine_id(1) sampling_interval(2)，全部大端；
+ * - 之后是 `count` 条 48 字节的记录，`count` 说了多少就得有多少，多一个字节都算坏；
+ * - 记录里 `first`/`last` 是相对 `sysUptime` 的毫秒偏移，不是绝对时间；
+ * - `tcp_flags` 只在 `proto = 6`（TCP）时有意义。
+ */
+#include <string.h>
+
+module std.net.netflow;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define NF5_HEADER 24
+#define NF5_RECORD 48
+#define NF5_VERSION 5
+
+struct NetflowHeader {
+    int ok;
+    int version;
+    int count;
+    unsigned long sys_uptime;
+    unsigned long unix_secs;
+    unsigned long unix_nsecs;
+    unsigned long flow_seq;
+    int engine_type;
+    int engine_id;
+    int sampling;
+};
+
+struct Flow {
+    unsigned long src;
+    unsigned long dst;
+    unsigned long nexthop;
+    int input;
+    int output;
+    unsigned long packets;
+    unsigned long octets;
+    unsigned long first;
+    unsigned long last;
+    int srcport;
+    int dstport;
+    int tcp_flags;
+    int proto;
+    int tos;
+    int src_as;
+    int dst_as;
+    int src_mask;
+    int dst_mask;
+};
+
+struct FlowDoc {
+    const unsigned char *buf;
+    int len;
+    int total;                  /* 记录总数（字段名避开方法 count） */
+    int idx;
+};
+
+struct NetflowBuilder {
+    unsigned char *buf;
+    int cap;
+    int n;
+    int want;
+    int have;
+    int ok;
+};
+
+static unsigned long nf_u32(const unsigned char *p)
+{
+    return ((unsigned long)p[0] << 24) | ((unsigned long)p[1] << 16)
+         | ((unsigned long)p[2] << 8) | (unsigned long)p[3];
+}
+
+static int nf_u16(const unsigned char *p)
+{
+    return ((int)p[0] << 8) | (int)p[1];
+}
+
+static void nf_put32(unsigned char *p, unsigned long v)
+{
+    p[0] = (unsigned char)((v >> 24) & 0xff);
+    p[1] = (unsigned char)((v >> 16) & 0xff);
+    p[2] = (unsigned char)((v >> 8) & 0xff);
+    p[3] = (unsigned char)(v & 0xff);
+}
+
+static void nf_put16(unsigned char *p, int v)
+{
+    p[0] = (unsigned char)((v >> 8) & 0xff);
+    p[1] = (unsigned char)(v & 0xff);
+}
+
+/* ---- 解析 ---- */
+
+int parse(NetflowHeader *h, const unsigned char *buf, int len)
+{
+    int need = 0;
+
+    if (!h)
+        return -1;
+    memset(h, 0, sizeof *h);
+    if (!buf || len < NF5_HEADER)
+        return -1;
+    h->version = nf_u16(buf);
+    if (h->version != NF5_VERSION)
+        return -1;
+    h->count = nf_u16(buf + 2);
+    h->sys_uptime = nf_u32(buf + 4);
+    h->unix_secs = nf_u32(buf + 8);
+    h->unix_nsecs = nf_u32(buf + 12);
+    h->flow_seq = nf_u32(buf + 16);
+    h->engine_type = buf[20];
+    h->engine_id = buf[21];
+    h->sampling = nf_u16(buf + 22);
+    need = NF5_HEADER + h->count * NF5_RECORD;
+    if (len < need)
+        return -1;
+    h->ok = 1;
+    return 0;
+}
+
+/* ---- 记录游标 ---- */
+
+int open(FlowDoc *d, const NetflowHeader *h, const unsigned char *buf, int len)
+{
+    if (!d || !h || !h->ok || !buf)
+        return -1;
+    if (len < NF5_HEADER + h->count * NF5_RECORD)
+        return -1;
+    d->buf = buf;
+    d->len = len;
+    d->total = h->count;
+    d->idx = 0;
+    return 0;
+}
+
+int next(FlowDoc *d, Flow *out)
+{
+    const unsigned char *p = 0;
+
+    if (!d || d->idx >= d->total)
+        return 0;
+    p = d->buf + NF5_HEADER + d->idx * NF5_RECORD;
+    if (out) {
+        memset(out, 0, sizeof *out);
+        out->src = nf_u32(p);
+        out->dst = nf_u32(p + 4);
+        out->nexthop = nf_u32(p + 8);
+        out->input = nf_u16(p + 12);
+        out->output = nf_u16(p + 14);
+        out->packets = nf_u32(p + 16);
+        out->octets = nf_u32(p + 20);
+        out->first = nf_u32(p + 24);
+        out->last = nf_u32(p + 28);
+        out->srcport = nf_u16(p + 32);
+        out->dstport = nf_u16(p + 34);
+        out->tcp_flags = p[37];
+        out->proto = p[38];
+        out->tos = p[39];
+        out->src_as = nf_u16(p + 40);
+        out->dst_as = nf_u16(p + 42);
+        out->src_mask = p[44];
+        out->dst_mask = p[45];
+    }
+    d->idx++;
+    return 1;
+}
+
+int count(FlowDoc *d)
+{
+    return d ? d->idx : -1;
+}
+
+void reset(FlowDoc *d)
+{
+    if (!d)
+        return;
+    d->idx = 0;
+}
+
+/* ---- Flow 上的小方法 ---- */
+
+static int nf_ip_str(unsigned long v, char *out, int cap)
+{
+    int n = 0;
+    int parts[4] = { 0 };
+
+    if (!out || cap < 8)
+        return -1;
+    parts[0] = (int)((v >> 24) & 0xff);
+    parts[1] = (int)((v >> 16) & 0xff);
+    parts[2] = (int)((v >> 8) & 0xff);
+    parts[3] = (int)(v & 0xff);
+    for (int i = 0; i < 4; i++) {
+        char tmp[4] = { 0 };
+        int k = 0;
+        int x = parts[i];
+
+        if (x >= 100)
+            tmp[k++] = (char)('0' + x / 100);
+        if (x >= 10)
+            tmp[k++] = (char)('0' + (x / 10) % 10);
+        tmp[k++] = (char)('0' + x % 10);
+        if (n + k + (i < 3 ? 1 : 0) + 1 > cap)
+            return -1;
+        memcpy(out + n, tmp, (size_t)k);
+        n += k;
+        if (i < 3)
+            out[n++] = '.';
+    }
+    out[n] = 0;
+    return n;
+}
+
+int src_str(Flow *f, char *out, int cap)
+{
+    return f ? nf_ip_str(f->src, out, cap) : -1;
+}
+
+int dst_str(Flow *f, char *out, int cap)
+{
+    return f ? nf_ip_str(f->dst, out, cap) : -1;
+}
+
+int next_hop_str(Flow *f, char *out, int cap)
+{
+    return f ? nf_ip_str(f->nexthop, out, cap) : -1;
+}
+
+/* 平均每个报文字节数；没有报文时给 0。 */
+int octets_per_packet(Flow *f)
+{
+    if (!f || f->packets == 0)
+        return 0;
+    if (f->octets / f->packets > 0x7fffffffUL)
+        return 0x7fffffff;
+    return (int)(f->octets / f->packets);
+}
+
+/* 流持续了多少毫秒（last - first，first/last 是相对 sysUptime 的偏移）。 */
+int duration_ms(Flow *f)
+{
+    if (!f)
+        return -1;
+    if (f->last < f->first)
+        return 0;               /* 序号回绕：按 0 处理 */
+    return (int)(f->last - f->first);
+}
+
+/* ---- 构造器 ---- */
+
+void init(NetflowBuilder *b, unsigned char *buf, int cap)
+{
+    if (!b)
+        return;
+    memset(b, 0, sizeof *b);
+    b->buf = buf;
+    b->cap = cap;
+    b->ok = (buf == 0 || cap < NF5_HEADER) ? 0 : 1;
+}
+
+int header(NetflowBuilder *b, int count, unsigned long uptime,
+           unsigned long unix_secs, unsigned long seq, int engine_id)
+{
+    if (!b || !b->ok || b->want != 0)
+        return -1;
+    if (count < 0 || count > 30)
+        return -1;              /* v5 一条报文最多 30 条记录 */
+    if (b->cap < NF5_HEADER + count * NF5_RECORD)
+        return -1;
+    memset(b->buf, 0, NF5_HEADER);
+    nf_put16(b->buf, NF5_VERSION);
+    nf_put16(b->buf + 2, count);
+    nf_put32(b->buf + 4, uptime);
+    nf_put32(b->buf + 8, unix_secs);
+    nf_put32(b->buf + 12, 0);
+    nf_put32(b->buf + 16, seq);
+    b->buf[20] = 0;             /* engine_type */
+    b->buf[21] = (unsigned char)(engine_id & 0xff);
+    nf_put16(b->buf + 22, 0);   /* sampling_interval */
+    b->n = NF5_HEADER;
+    b->want = count;
+    return 0;
+}
+
+int record(NetflowBuilder *b, const Flow *f)
+{
+    unsigned char *p = 0;
+
+    if (!b || !b->ok || !f || b->have >= b->want)
+        return -1;
+    if (b->n + NF5_RECORD > b->cap)
+        return -1;
+    p = b->buf + b->n;
+    memset(p, 0, NF5_RECORD);
+    nf_put32(p, f->src);
+    nf_put32(p + 4, f->dst);
+    nf_put32(p + 8, f->nexthop);
+    nf_put16(p + 12, f->input);
+    nf_put16(p + 14, f->output);
+    nf_put32(p + 16, f->packets);
+    nf_put32(p + 20, f->octets);
+    nf_put32(p + 24, f->first);
+    nf_put32(p + 28, f->last);
+    nf_put16(p + 32, f->srcport);
+    nf_put16(p + 34, f->dstport);
+    p[37] = (unsigned char)(f->tcp_flags & 0xff);
+    p[38] = (unsigned char)(f->proto & 0xff);
+    p[39] = (unsigned char)(f->tos & 0xff);
+    nf_put16(p + 40, f->src_as);
+    nf_put16(p + 42, f->dst_as);
+    p[44] = (unsigned char)(f->src_mask & 0xff);
+    p[45] = (unsigned char)(f->dst_mask & 0xff);
+    b->n += NF5_RECORD;
+    b->have++;
+    return 0;
+}
+
+int finish(NetflowBuilder *b)
+{
+    if (!b || !b->ok || b->want == 0 || b->have != b->want)
+        return -1;
+    return b->n;
+}
+
+int length(NetflowBuilder *b)
+{
+    return b ? b->n : -1;
+}
+
+int ok(NetflowBuilder *b)
+{
+    return b && b->ok;
+}
+
+/* ---- 自测 ---- */
+
+test "NetFlow v5：头部与记录游标" {
+    /* 头 24 字节 + 2 条记录 */
+    unsigned char buf[24 + 2 * 48] = { 0 };
+    NetflowHeader h = { 0 };
+    FlowDoc d = { 0 };
+    Flow f = { 0 };
+    char ip[16] = { 0 };
+
+    /* version=5, count=2, uptime=0x00010000, secs=0x65000000, seq=7 */
+    buf[0] = 0; buf[1] = 5;
+    buf[2] = 0; buf[3] = 2;
+    buf[4] = 0; buf[5] = 1; buf[6] = 0; buf[7] = 0;
+    buf[8] = 0x65; buf[9] = 0x00; buf[10] = 0; buf[11] = 0;
+    buf[16] = 0; buf[17] = 0; buf[18] = 0; buf[19] = 7;
+    buf[21] = 3;                /* engine_id */
+    /* 记录 0（48 字节，从偏移 24 起）：192.168.1.10 -> 10.0.0.5:443，
+       1 个报文 100 字节，first=8080 last=8130，TCP SYN+ACK，src_as=7，掩码 24/24 */
+    {
+        unsigned char *r = buf + 24;
+
+        r[0] = 192; r[1] = 168; r[2] = 1; r[3] = 10;          /* srcaddr */
+        r[4] = 10; r[5] = 0; r[6] = 0; r[7] = 5;              /* dstaddr */
+        r[8] = 192; r[9] = 168; r[10] = 1; r[11] = 1;         /* nexthop */
+        r[12] = 0; r[13] = 2;                                 /* input */
+        r[14] = 0; r[15] = 3;                                 /* output */
+        r[16] = 0; r[17] = 0; r[18] = 0; r[19] = 1;           /* dPkts = 1 */
+        r[20] = 0; r[21] = 0; r[22] = 0; r[23] = 100;         /* dOctets = 100 */
+        r[24] = 0; r[25] = 0; r[26] = 0x1f; r[27] = 0x90;     /* First = 8080 */
+        r[28] = 0; r[29] = 0; r[30] = 0x1f; r[31] = 0xba;     /* Last = 8122 */
+        r[32] = 0x1f; r[33] = 0x90;                           /* srcport = 8080 */
+        r[34] = 0x01; r[35] = 0xbb;                           /* dstport = 443 */
+        r[37] = 0x12;                                         /* tcp_flags */
+        r[38] = 6;                                            /* protocol = TCP */
+        r[39] = 0;                                            /* tos */
+        r[40] = 0; r[41] = 7;                                 /* src_as = 7 */
+        r[42] = 0; r[43] = 8;                                 /* dst_as = 8 */
+        r[44] = 24;                                           /* src_mask */
+        r[45] = 24;                                           /* dst_mask */
+    }
+
+    if (h.parse(buf, sizeof buf) != 0 || !h.ok)
+        return err(1, "解析失败");
+    if (h.version != 5 || h.count != 2)
+        return err(2, "版本/记录数不对");
+    if (h.sys_uptime != 0x00010000UL || h.flow_seq != 7)
+        return err(3, "uptime/seq 不对");
+    if (h.engine_id != 3)
+        return err(4, "engine_id 不对");
+    d.open(&h, buf, sizeof buf);
+    if (d.next(&f) != 1)
+        return err(5, "第一条记录没取到");
+    if (f.src_str(ip, sizeof ip) != 12 || strcmp(ip, "192.168.1.10") != 0)
+        return err(6, "源地址不对");
+    if (f.dst_str(ip, sizeof ip) != 8 || strcmp(ip, "10.0.0.5") != 0)
+        return err(7, "目的地址不对");
+    if (f.next_hop_str(ip, sizeof ip) != 11 || strcmp(ip, "192.168.1.1") != 0)
+        return err(8, "下一跳不对");
+    if (f.srcport != 8080 || f.dstport != 443 || f.proto != 6 || f.tcp_flags != 0x12)
+        return err(9, "端口/协议/标志不对");
+    if (f.packets != 1 || f.octets != 100 || f.octets_per_packet() != 100)
+        return err(10, "报文数/字节数不对");
+    if (f.src_as != 7 || f.src_mask != 24)
+        return err(11, "AS/掩码不对");
+    if (d.next(&f) != 1 || d.next(&f) != 0)
+        return err(12, "第二条之后应到底");
+    if (d.count() != 2)
+        return err(13, "游标计数应为已取到的条数（2）");
+    d.reset();
+    if (d.next(&f) != 1 || d.count() != 1)
+        return err(14, "reset 后应从头");
+    /* 坏报文：版本不对、长度不够 */
+    {
+        NetflowHeader bh = { 0 };
+        unsigned char bad[64] = { 0 };
+
+        memcpy(bad, buf, 24);
+        bad[1] = 9;
+        if (bh.parse(bad, 24) != -1)
+            return err(15, "版本 9 应失败");
+        memcpy(bad, buf, 24);
+        if (bh.parse(buf, 24 + 48) != -1)
+            return err(16, "记录不足应失败");
+    }
+}
+
+test "NetFlow v5：构造器与往返" {
+    unsigned char buf[24 + 48] = { 0 };
+    NetflowBuilder b = { 0 };
+    NetflowHeader h = { 0 };
+    FlowDoc d = { 0 };
+    Flow f = { 0 };
+    Flow got = { 0 };
+    int n = 0;
+
+    f = (Flow){ 0 };
+    f.src = 0x0a000001UL;       /* 10.0.0.1 */
+    f.dst = 0xc0a8010aUL;       /* 192.168.1.10 */
+    f.nexthop = 0;
+    f.input = 2;
+    f.output = 3;
+    f.packets = 4;
+    f.octets = 400;
+    f.first = 1000;
+    f.last = 1500;
+    f.srcport = 12345;
+    f.dstport = 53;
+    f.tcp_flags = 0x10;
+    f.proto = 17;               /* UDP */
+    f.src_as = 64512;
+    f.dst_as = 64513;
+    f.src_mask = 24;
+    f.dst_mask = 16;
+
+    b.init(buf, sizeof buf);
+    if (b.header(1, 5000, 1700000000UL, 99, 1) != 0)
+        return err(1, "header 失败");
+    if (b.record(&f) != 0)
+        return err(2, "record 失败");
+    if (b.record(&f) != -1)
+        return err(3, "超出 count 应失败");
+    n = b.finish();
+    if (n != 24 + 48)
+        return err(4, "总长不对");
+    if (h.parse(buf, n) != 0 || h.count != 1 || h.flow_seq != 99)
+        return err(5, "往返头部不一致");
+    d.open(&h, buf, n);
+    if (d.next(&got) != 1)
+        return err(6, "往返记录没取到");
+    if (got.src != f.src || got.dst != f.dst || got.packets != 4 || got.octets != 400)
+        return err(7, "往返字段不一致");
+    if (got.srcport != 12345 || got.dstport != 53 || got.proto != 17)
+        return err(8, "往返端口/协议不一致");
+    if (got.src_as != 64512 || got.dst_as != 64513 || got.dst_mask != 16)
+        return err(9, "往返 AS/掩码不一致");
+    if (got.duration_ms() != 500)
+        return err(10, "持续时长应为 500 ms");
+    if (got.octets_per_packet() != 100)
+        return err(11, "平均字节数应为 100");
+    /* 时间回绕按 0 处理 */
+    got.first = 2000;
+    got.last = 1000;
+    if (got.duration_ms() != 0)
+        return err(12, "回绕应给 0");
+    /* 零报文 */
+    got.packets = 0;
+    if (got.octets_per_packet() != 0)
+        return err(13, "零报文应给 0");
+    /* 容量不足 */
+    {
+        unsigned char small[24] = { 0 };
+        NetflowBuilder s = { 0 };
+
+        s.init(small, sizeof small);
+        if (s.header(1, 1, 0, 0, 0) != -1)
+            return err(14, "容量不足应失败");
+    }
+    /* finish 前必须有 count 条记录 */
+    b.init(buf, sizeof buf);
+    b.header(2, 0, 0, 0, 0);
+    b.record(&f);
+    if (b.finish() != -1)
+        return err(15, "记录数不足应失败");
+}

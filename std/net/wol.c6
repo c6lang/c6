@@ -1,0 +1,315 @@
+/* std/net/wol：Wake-on-LAN 魔术包（Magic Packet）编解码。
+ *
+ *     import std.net.wol;
+ *
+ *     WolPacket w = { 0 };
+ *     w.set_mac(mac6);                  // 方法：set_mac / set_password / build / parse
+ *     int n = w.build();                // 102 字节（带密码 108）
+ *     w.data() / w.length() / w.mac_of()
+ *
+ *     WolPacket got = { 0 };
+ *     got.parse(buf, n);                // 0 = 合法，并把 MAC（和密码）抠出来
+ *
+ * 魔术包形状（AMD 的 Magic Packet 规范）：
+ *
+ * - 同步流：6 个 `0xFF`；
+ * - 目标 MAC 重复 **16 遍**（共 96 字节）；
+ * - 可选 4 或 6 字节 SecureOn 密码（这里按 6 字节，和网卡工具一致）。
+ *
+ * 所以标准包正好 6 + 16*6 = 102 字节；带密码 108 字节。解析时不看 UDP 头
+ * （那是调用方的事），只认这段负载，并且要求「同步流 + 16 份完全相同的 MAC」，
+ * 任何一份不同都判非法——真实的魔术包就是这么严格。
+ */
+#include <string.h>
+
+module std.net.wol;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define WOL_SYNC 6
+#define WOL_REPEAT 16
+#define WOL_PACKET 102
+#define WOL_PACKET_PW 108
+
+struct WolPacket {
+    unsigned char mac[6];
+    unsigned char pw[6];
+    int has_pw;
+    int have_mac;
+    int bad;
+    unsigned char buf[WOL_PACKET_PW];
+    int n;
+};
+
+static int wol_hex(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* MAC 字符串 "aa:bb:cc:dd:ee:ff"（也接受 '-' 分隔）→ 6 字节；返回 0 成功。 */
+int mac_parse(const char *s, unsigned char *out)
+{
+    int k = 0;
+    int i = 0;
+
+    if (!s || !out)
+        return -1;
+    memset(out, 0, 6);
+    while (s[i] && k < 6) {
+        int hi = wol_hex((int)(unsigned char)s[i]);
+        int lo = 0;
+
+        if (hi < 0)
+            return -1;
+        lo = wol_hex((int)(unsigned char)s[i + 1]);
+        if (lo < 0)
+            return -1;
+        out[k++] = (unsigned char)((hi << 4) | lo);
+        i += 2;
+        if (s[i] == ':' || s[i] == '-')
+            i++;
+        else if (s[i] == 0)
+            break;
+        else
+            return -1;
+    }
+    if (k != 6 || s[i] != 0)
+        return -1;
+    return 0;
+}
+
+/* 6 字节 → "aa:bb:cc:dd:ee:ff"；返回长度 17。 */
+int mac_str(const unsigned char *mac, char *out, int cap)
+{
+    static const char *hex = "0123456789abcdef";
+
+    if (!mac || !out || cap < 18)
+        return -1;
+    for (int i = 0; i < 6; i++) {
+        out[i * 3] = hex[(mac[i] >> 4) & 0xf];
+        out[i * 3 + 1] = hex[mac[i] & 0xf];
+        out[i * 3 + 2] = (i < 5) ? ':' : 0;
+    }
+    return 17;
+}
+
+/* ---- 句柄 ---- */
+
+void init(WolPacket *w)
+{
+    if (!w)
+        return;
+    memset(w, 0, sizeof *w);
+}
+
+int set_mac(WolPacket *w, const unsigned char *mac)
+{
+    if (!w || !mac)
+        return -1;
+    memcpy(w->mac, mac, 6);
+    w->have_mac = 1;
+    w->bad = 0;
+    w->n = 0;
+    return 0;
+}
+
+/* 6 字节 SecureOn 密码（也接受 "aa:..." 字符串：用 mac_parse 先转）。 */
+int set_password(WolPacket *w, const unsigned char *pw6)
+{
+    if (!w || !pw6)
+        return -1;
+    memcpy(w->pw, pw6, 6);
+    w->has_pw = 1;
+    w->n = 0;
+    return 0;
+}
+
+/* 生成魔术包；返回长度，没设 MAC 返回 -1。 */
+int build(WolPacket *w)
+{
+    int o = 0;
+
+    if (!w || !w->have_mac)
+        return -1;
+    memset(w->buf, 0, sizeof w->buf);
+    for (int i = 0; i < WOL_SYNC; i++)
+        w->buf[o++] = 0xff;
+    for (int i = 0; i < WOL_REPEAT; i++) {
+        memcpy(w->buf + o, w->mac, 6);
+        o += 6;
+    }
+    if (w->has_pw) {
+        memcpy(w->buf + o, w->pw, 6);
+        o += 6;
+    }
+    w->n = o;
+    return o;
+}
+
+unsigned char *data(WolPacket *w)
+{
+    return w ? w->buf : 0;
+}
+
+int length(WolPacket *w)
+{
+    return w ? w->n : -1;
+}
+
+unsigned char *mac_of(WolPacket *w)
+{
+    return w ? w->mac : 0;
+}
+
+int has_password(WolPacket *w)
+{
+    return w ? w->has_pw : 0;
+}
+
+unsigned char *password_of(WolPacket *w)
+{
+    return w ? w->pw : 0;
+}
+
+/* 解析魔术包；0 = 合法。MAC 与密码写回句柄。 */
+int parse(WolPacket *w, const unsigned char *buf, int len)
+{
+    const unsigned char *m = 0;
+
+    if (!w)
+        return -1;
+    w->bad = 0;
+    w->n = 0;
+    w->has_pw = 0;
+    w->have_mac = 0;
+    if (!buf)
+        return -1;
+    if (len != WOL_PACKET && len != WOL_PACKET_PW)
+        return -1;
+    for (int i = 0; i < WOL_SYNC; i++)
+        if (buf[i] != 0xff)
+            return -1;
+    m = buf + WOL_SYNC;
+    for (int i = 1; i < WOL_REPEAT; i++)
+        if (memcmp(m, m + i * 6, 6) != 0)
+            return -1;          /* 16 份必须完全一样 */
+    memcpy(w->mac, m, 6);
+    w->have_mac = 1;
+    if (len == WOL_PACKET_PW) {
+        memcpy(w->pw, buf + WOL_PACKET, 6);
+        w->has_pw = 1;
+    }
+    w->n = len;
+    memcpy(w->buf, buf, (size_t)len);
+    return 0;
+}
+
+/* ---- 自测 ---- */
+
+test "WoL：魔术包构建" {
+    unsigned char mac[6] = { 0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e };
+    unsigned char pw[6] = { 1, 2, 3, 4, 5, 6 };
+    WolPacket w = { 0 };
+    int n = 0;
+
+    w.init();
+    if (w.build() != -1)
+        return err(1, "没设 MAC 不该能构建");
+    if (w.set_mac(mac) != 0)
+        return err(2, "set_mac 失败");
+    n = w.build();
+    if (n != WOL_PACKET)
+        return err(3, "标准包应为 102 字节");
+    if (w.length() != 102)
+        return err(4, "length 应为 102");
+    /* 6 个 0xFF */
+    for (int i = 0; i < 6; i++)
+        if (w.data()[i] != 0xff)
+            return err(5, "同步流不是 6 个 0xFF");
+    /* 16 份 MAC */
+    for (int i = 0; i < 16; i++)
+        if (memcmp(w.data() + 6 + i * 6, mac, 6) != 0)
+            return err(6, "MAC 重复块不对");
+    if (memcmp(w.mac_of(), mac, 6) != 0)
+        return err(7, "mac_of 不对");
+    if (w.has_password())
+        return err(8, "默认不该有密码");
+    /* 带密码 */
+    w.set_password(pw);
+    if (w.build() != WOL_PACKET_PW)
+        return err(9, "带密码应为 108 字节");
+    if (!w.has_password() || memcmp(w.password_of(), pw, 6) != 0)
+        return err(10, "密码字段不对");
+    if (memcmp(w.data() + 102, pw, 6) != 0)
+        return err(11, "密码应追在 MAC 块后面");
+}
+
+test "WoL：解析、MAC 字符串与坏包" {
+    unsigned char mac[6] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
+    unsigned char back[6] = { 0 };
+    WolPacket a = { 0 };
+    WolPacket b = { 0 };
+    char text[20] = { 0 };
+    int n = 0;
+
+    a.init();
+    a.set_mac(mac);
+    n = a.build();
+    if (b.parse(a.data(), n) != 0)
+        return err(1, "解析自己的包失败");
+    if (memcmp(b.mac_of(), mac, 6) != 0)
+        return err(2, "解析出来的 MAC 不对");
+    if (b.length() != 102 || b.has_password())
+        return err(3, "长度/密码标记不对");
+    /* 带密码往返 */
+    {
+        unsigned char pw[6] = { 9, 8, 7, 6, 5, 4 };
+        WolPacket c = { 0 };
+
+        a.set_password(pw);
+        n = a.build();
+        if (c.parse(a.data(), n) != 0 || !c.has_password())
+            return err(4, "带密码解析失败");
+        if (memcmp(c.password_of(), pw, 6) != 0)
+            return err(5, "解析出的密码不对");
+    }
+    /* MAC 字符串 */
+    if (mac_str(mac, text, sizeof text) != 17 || strcmp(text, "de:ad:be:ef:00:01") != 0)
+        return err(6, "mac_str 不对");
+    if (mac_parse(text, back) != 0 || memcmp(back, mac, 6) != 0)
+        return err(7, "mac_parse 回环不对");
+    if (mac_parse("DE-AD-BE-EF-00-01", back) != 0 || back[0] != 0xde)
+        return err(8, "大写与 '-' 分隔应接受");
+    if (mac_parse("de:ad:be:ef:00", back) != -1)
+        return err(9, "少一段应失败");
+    if (mac_parse("de:ad:be:ef:00:zz", back) != -1)
+        return err(10, "非十六进制应失败");
+    if (mac_str(mac, text, 4) != -1)
+        return err(11, "容量不足应失败");
+    /* 坏包：长度不对、某一份 MAC 不同、同步流不对 */
+    {
+        WolPacket bad = { 0 };
+
+        if (bad.parse(a.data(), 101) != -1)
+            return err(12, "长度 101 应失败");
+        {
+            unsigned char tmp[108] = { 0 };
+
+            memcpy(tmp, a.data(), 108);
+            tmp[6 + 5] ^= 0xff;         /* 第一份 MAC 的最后一个字节 */
+            if (bad.parse(tmp, 108) != -1)
+                return err(13, "MAC 各份不一致应失败");
+            memcpy(tmp, a.data(), 108);
+            tmp[0] = 0x00;
+            if (bad.parse(tmp, 108) != -1)
+                return err(14, "同步流不对应失败");
+        }
+    }
+}

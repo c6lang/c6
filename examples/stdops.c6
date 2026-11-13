@@ -1,0 +1,263 @@
+/* examples/stdops.c6 —— 第八十八批（网络运维 + 媒体清单）。
+ *
+ *     make std-ops
+ *
+ * 五节，全部方法调用（`h.parse(...)`、`d.next(&f)`、`w.build()`、`c.start_str(...)`）：
+ *   1. NetFlow v5：构造两条流记录、解析回来、算平均字节与持续时长；
+ *   2. Wake-on-LAN：构造带密码的魔术包、解析回来、MAC 字符串互转；
+ *   3. WebVTT：解析两条字幕（带 id / 带 settings），算时长；
+ *   4. DNS 区域文件：读 $TTL/$ORIGIN、SOA、NS、A 记录；
+ *   5. 串联：区域文件里找主机 -> 发 WoL -> 记一条 NetFlow -> 出一条 VTT 通知。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.net.netflow;
+import std.net.wol;
+import std.data.vtt;
+import std.data.zone;
+
+static int checks = 0;
+static int nfail = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        nfail++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* 1. NetFlow v5 */
+static void do_netflow(void)
+{
+    unsigned char buf[24 + 2 * 48] = { 0 };
+    NetflowBuilder b = { 0 };
+    NetflowHeader h = { 0 };
+    FlowDoc d = { 0 };
+    Flow f = { 0 };
+    Flow got = { 0 };
+    char src[16] = { 0 };
+    char dst[16] = { 0 };
+    int n = 0;
+
+    printf("== netflow（NetFlow v5 报文层）\n");
+    f = (Flow){ 0 };
+    f.src = 0x0a000001UL;               /* 10.0.0.1 */
+    f.dst = 0xc0a8010aUL;               /* 192.168.1.10 */
+    f.packets = 4;
+    f.octets = 400;
+    f.first = 1000;
+    f.last = 1500;
+    f.srcport = 12345;
+    f.dstport = 443;
+    f.proto = 6;
+    f.tcp_flags = 0x18;
+    f.src_as = 64512;
+    f.src_mask = 24;
+    f.dst_mask = 24;
+
+    b.init(buf, sizeof buf);
+    check(b.header(2, 5000, 1700000000UL, 7, 1) == 0, "header(2 条记录)");
+    check(b.record(&f) == 0, "第 1 条记录");
+    f.dstport = 53;
+    f.proto = 17;
+    check(b.record(&f) == 0, "第 2 条记录");
+    n = b.finish();
+    check(n == 24 + 96, "报文长度 120 字节");
+
+    check(h.parse(buf, n) == 0 && h.ok, "解析回来");
+    check(h.count == 2 && h.flow_seq == 7 && h.unix_secs == 1700000000UL,
+          "头部字段");
+    d.open(&h, buf, n);
+    check(d.next(&got) == 1, "取到第 1 条");
+    check(got.src_str(src, sizeof src) == 8 && strcmp(src, "10.0.0.1") == 0,
+          "源地址");
+    check(got.dst_str(dst, sizeof dst) == 12 && strcmp(dst, "192.168.1.10") == 0,
+          "目的地址");
+    check(got.octets_per_packet() == 100, "平均每报文 100 字节");
+    check(got.duration_ms() == 500, "持续 500 ms");
+    check(d.next(&got) == 1 && got.dstport == 53 && got.proto == 17, "第 2 条是 DNS");
+    check(d.next(&got) == 0 && d.count() == 2, "恰好两条");
+    d.reset();
+    check(d.next(&got) == 1 && d.count() == 1, "reset 后从头");
+}
+
+/* 2. Wake-on-LAN */
+static void do_wol(void)
+{
+    unsigned char mac[6] = { 0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e };
+    unsigned char pw[6] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
+    unsigned char back[6] = { 0 };
+    WolPacket w = { 0 };
+    WolPacket got = { 0 };
+    char text[20] = { 0 };
+    int n = 0;
+
+    printf("== wol（Wake-on-LAN 魔术包）\n");
+    w.init();
+    check(w.set_mac(mac) == 0, "set_mac");
+    n = w.build();
+    check(n == 102, "标准包 102 字节");
+    check(w.data()[0] == 0xff && w.data()[5] == 0xff, "6 个 0xFF 同步流");
+    check(memcmp(w.data() + 6, mac, 6) == 0, "第一份 MAC");
+    check(memcmp(w.data() + 6 + 15 * 6, mac, 6) == 0, "第 16 份 MAC");
+    check(w.set_password(pw) == 0 && w.build() == 108, "带密码 108 字节");
+    check(got.parse(w.data(), 108) == 0, "解析回来");
+    check(memcmp(got.mac_of(), mac, 6) == 0 && got.has_password(), "MAC 与密码标记");
+    check(memcmp(got.password_of(), pw, 6) == 0, "密码内容");
+    check(mac_str(mac, text, sizeof text) == 17
+          && strcmp(text, "00:1a:2b:3c:4d:5e") == 0, "MAC 字符串");
+    check(mac_parse(text, back) == 0 && memcmp(back, mac, 6) == 0, "MAC 解析回环");
+    check(mac_parse("00:1a:2b:3c:4d", back) == -1, "少一段应失败");
+}
+
+/* 3. WebVTT */
+static void do_vtt(void)
+{
+    const char *text = "WEBVTT\n"
+                       "\n"
+                       "NOTE 生成于 12:00\n"
+                       "\n"
+                       "n1\n"
+                       "00:00:01.000 --> 00:00:03.500\n"
+                       "开机中\n"
+                       "\n"
+                       "00:01:02.000 --> 00:01:05.250 align:start\n"
+                       "已就绪\n"
+                       "\n";
+    VttDoc d = { 0 };
+    VttCue c = { 0 };
+    char a[16] = { 0 };
+    char b[16] = { 0 };
+    long ms = 0;
+
+    printf("== vtt（WebVTT 字幕）\n");
+    check(d.open(text, (int)strlen(text)) == 0 && d.header_ok(), "打开（WEBVTT 头）");
+    check(parse_ts("00:01:02.250", 12, &ms) == 0 && ms == 62250, "时间戳解析");
+    check(ts_str(62250, a, sizeof a) == 12 && strcmp(a, "00:01:02.250") == 0,
+          "时间戳格式化");
+    check(d.next(&c) == 1, "第 1 条 cue（跳过 NOTE）");
+    check(c.id_len == 2 && memcmp(text + c.id_off, "n1", 2) == 0, "cue id = n1");
+    check(c.start_str(a, sizeof a) == 12 && strcmp(a, "00:00:01.000") == 0, "起始时间");
+    check(c.end_str(b, sizeof b) == 12 && strcmp(b, "00:00:03.500") == 0, "结束时间");
+    check(c.duration_ms() == 2500, "时长 2.5 秒");
+    check(c.text_len == 9 && memcmp(text + c.text_off, "开机中", 9) == 0, "正文");
+    check(d.next(&c) == 1 && c.id_len == 0, "第 2 条无 id");
+    check(c.settings_len == 11
+          && memcmp(text + c.settings_off, "align:start", 11) == 0, "settings");
+    check(c.start_ms == 62000 && c.end_ms == 65250, "第 2 条时间戳");
+    check(d.next(&c) == 0 && d.count() == 2, "恰好两条");
+}
+
+/* 4. DNS 区域文件 */
+static void do_zone(void)
+{
+    const char *text = "$TTL 300\n"
+                       "$ORIGIN lan.test.\n"
+                       "@   IN SOA ns.lan.test. admin.lan.test. (\n"
+                       "        2024010101 7200 3600 1209600 300 )\n"
+                       "    IN NS  ns.lan.test.\n"
+                       "nas IN A   192.168.7.9\n"
+                       "pc  IN A   192.168.7.20\n";
+    ZoneDoc d = { 0 };
+    ZoneRec r = { 0 };
+    char owner[96] = { 0 };
+    char type[16] = { 0 };
+    char rdata[256] = { 0 };
+    int a_records = 0;
+
+    printf("== zone（DNS 区域文件）\n");
+    check(d.open(text, (int)strlen(text)) == 0, "打开区域文件");
+    check(d.next(&r) == 1 && r.kind == ZONE_KIND_TTL && r.ttl == 300, "$TTL 300");
+    check(d.next(&r) == 1 && r.kind == ZONE_KIND_ORIGIN, "$ORIGIN");
+    check(r.owner_copy(text, owner, sizeof owner) == 9
+          && strcmp(owner, "lan.test.") == 0, "$ORIGIN 值");
+    check(d.next(&r) == 1 && r.type_code == 6, "SOA 记录");
+    check(r.rdata_copy(text, rdata, sizeof rdata) > 0
+          && strstr(rdata, "2024010101") != 0, "SOA rdata 含序列号");
+    check(d.next(&r) == 1 && r.inherit_owner && r.type_code == 2, "NS 继承 owner");
+    d.next(&r);
+    check(r.type_code == 1 && r.owner_copy(text, owner, sizeof owner) == 3
+          && strcmp(owner, "nas") == 0, "nas A 记录");
+    check(r.rdata_copy(text, rdata, sizeof rdata) == 11
+          && strcmp(rdata, "192.168.7.9") == 0, "nas 的地址");
+    a_records = 1;
+    d.next(&r);
+    check(r.type_name(type, sizeof type) == 1 && strcmp(type, "A") == 0, "pc 也是 A");
+    a_records++;
+    check(a_records == 2, "一共两条 A 记录");
+    /* 未知类型保守拒绝 */
+    {
+        ZoneDoc bd = { 0 };
+        ZoneRec br = { 0 };
+        const char *bad = "x.test. IN NAPTR 1 1 \"s\" x y z\n";
+
+        bd.open(bad, (int)strlen(bad));
+        check(bd.next(&br) == -1, "未知类型应判非法");
+    }
+}
+
+/* 5. 串联：zone 找主机 -> WoL -> NetFlow -> VTT 通知 */
+static void do_pipeline(void)
+{
+    const char *zone_text = "pc IN A 192.168.7.20\n";
+    unsigned char mac[6] = { 0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e };
+    unsigned char nfbuf[24 + 48] = { 0 };
+    ZoneDoc zd = { 0 };
+    ZoneRec zr = { 0 };
+    WolPacket w = { 0 };
+    NetflowBuilder nb = { 0 };
+    NetflowHeader nh = { 0 };
+    FlowDoc fd = { 0 };
+    Flow f = { 0 };
+    Flow got = { 0 };
+    const char *vtt_text = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\n唤醒 192.168.7.20\n";
+    VttDoc vd = { 0 };
+    VttCue vc = { 0 };
+    char ip[16] = { 0 };
+    int len = 0;
+
+    printf("== 串联：区域文件 -> 唤醒 -> 记流 -> 出字幕\n");
+    check(zd.open(zone_text, (int)strlen(zone_text)) == 0, "1) 打开区域文件");
+    check(zd.next(&zr) == 1 && zr.type_code == 1, "2) 读到 A 记录");
+    check(zr.rdata_copy(zone_text, ip, sizeof ip) == 12
+          && strcmp(ip, "192.168.7.20") == 0, "3) 取到 192.168.7.20");
+
+    w.init();
+    w.set_mac(mac);
+    len = w.build();
+    check(len == 102, "4) 构造 102 字节魔术包");
+
+    f = (Flow){ 0 };
+    f.src = 0xc0a80701UL;               /* 192.168.7.1 */
+    f.dst = 0xc0a80714UL;               /* 192.168.7.20 */
+    f.packets = 1;
+    f.octets = 102;
+    f.proto = 17;
+    f.dstport = 9;
+    nb.init(nfbuf, sizeof nfbuf);
+    check(nb.header(1, 9000, 1700000100UL, 42, 0) == 0, "5) NetFlow 头");
+    check(nb.record(&f) == 0, "6) 记一条流");
+    len = nb.finish();
+    check(nh.parse(nfbuf, len) == 0 && nh.count == 1, "7) 流记录可解析");
+    fd.open(&nh, nfbuf, len);
+    check(fd.next(&got) == 1 && got.octets == 102 && got.dstport == 9, "8) 流内容对");
+
+    check(vd.open(vtt_text, (int)strlen(vtt_text)) == 0, "9) 打开字幕");
+    check(vd.next(&vc) == 1 && vc.duration_ms() == 2000, "10) 一条 2 秒通知");
+    check(vc.text_len == 19, "11) 正文长度（唤醒 + 空格 + IP）");
+}
+
+int main(void)
+{
+    do_netflow();
+    do_wol();
+    do_vtt();
+    do_zone();
+    do_pipeline();
+    printf("\n%d check(s), %d failure(s)\n", checks, nfail);
+    return nfail == 0 ? 0 : 1;
+}

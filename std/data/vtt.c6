@@ -1,0 +1,484 @@
+/* std/data/vtt：WebVTT 字幕（W3C）——时间戳解析 + 逐条 cue 的游标。
+ *
+ *     import std.data.vtt;
+ *
+ *     VttDoc d = { 0 };
+ *     VttCue c = { 0 };
+ *     d.open(text, len);              // 游标：open / next / count / reset
+ *     while (d.next(&c)) {
+ *         char a[16] = { 0 }, b[16] = { 0 };
+ *         c.start_str(a, sizeof a);    // 方法：start_str / end_str / duration_ms
+ *         c.end_str(b, sizeof b);
+ *         printf("%s -> %s  %.3fs  %.*s\n", a, b, c.duration_ms() / 1000.0,
+ *                c.text_len, text + c.text_off);
+ *     }
+ *
+ * 只认 WebVTT 的主体：
+ *
+ * - 第一行必须是 `WEBVTT`（可以带尾巴，如 `WEBVTT - 标题`）；
+ * - 块之间用空行分隔；`NOTE` / `STYLE` / `REGION` 开头的块整块跳过（不是字幕）；
+ * - 一个 cue 可以带一行 id（可选），接下来必须是一行时间戳：
+ *   `00:00:01.000 --> 00:00:04.000`，小时可省（`01:02.500`），后面可跟 key:value 设置；
+ * - 时间戳之后的每一行都是正文，直到空行；正文原样保留（不解析 `<b>` 之类的标签）；
+ * - 坏时间戳、缺 `-->`、时间倒流都判非法，`next()` 直接停止（`bad` 置位）。
+ *
+ * 不分配、不复制：所有位置都是原文本里的偏移。
+ */
+#include <string.h>
+
+module std.data.vtt;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+struct VttCue {
+    int id_off;
+    int id_len;
+    long start_ms;
+    long end_ms;
+    int settings_off;
+    int settings_len;
+    int text_off;
+    int text_len;
+    int idx;
+};
+
+struct VttDoc {
+    const char *p;
+    int len;
+    int pos;
+    int seen;                   /* 已取到的 cue 数（字段名避开方法 count） */
+    int bad;
+    int had_header;
+};
+
+/* ---- 时间戳 ---- */
+
+static int vtt_digits(const char *s, int n, int *out)
+{
+    int v = 0;
+
+    if (n <= 0)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return -1;
+        v = v * 10 + (s[i] - '0');
+    }
+    *out = v;
+    return 0;
+}
+
+/* "HH:MM:SS.mmm" / "MM:SS.mmm" → 毫秒；返回 0 成功。 */
+int parse_ts(const char *s, int len, long *ms)
+{
+    int colons = 0;
+    int dot = -1;
+    int hh = 0;
+    int mm = 0;
+    int ss = 0;
+    int frac = 0;
+    int fdigits = 0;
+    long total = 0;
+
+    if (!s || !ms || len <= 0)
+        return -1;
+    for (int i = 0; i < len; i++) {
+        if (s[i] == ':')
+            colons++;
+        else if (s[i] == '.')
+            dot = i;
+    }
+    if (dot < 0)
+        return -1;              /* WebVTT 的时间戳必须带毫秒 */
+    /* 毫秒部分 */
+    for (int i = dot + 1; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9' || fdigits >= 3)
+            return -1;
+        frac = frac * 10 + (s[i] - '0');
+        fdigits++;
+    }
+    if (fdigits != 3)
+        return -1;
+    if (colons == 2) {
+        if (vtt_digits(s, dot - 6, &hh) < 0 || s[dot - 6] != ':'
+            || vtt_digits(s + dot - 5, 2, &mm) < 0 || s[dot - 3] != ':'
+            || vtt_digits(s + dot - 2, 2, &ss) < 0)
+            return -1;
+    } else if (colons == 1) {
+        if (vtt_digits(s, dot - 3, &mm) < 0 || s[dot - 3] != ':'
+            || vtt_digits(s + dot - 2, 2, &ss) < 0)
+            return -1;
+    } else {
+        return -1;
+    }
+    total = ((long)hh * 3600 + (long)mm * 60 + (long)ss) * 1000 + (long)frac;
+    *ms = total;
+    return 0;
+}
+
+static int vtt_put_digits(char *out, int v, int n)
+{
+    for (int i = n - 1; i >= 0; i--) {
+        out[i] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    return n;
+}
+
+/* 毫秒 → "HH:MM:SS.mmm"；返回 12。 */
+int ts_str(long ms, char *out, int cap)
+{
+    long total = 0;
+    long cs = 0;
+    int hh = 0;
+    int mm = 0;
+    int ss = 0;
+
+    if (!out || cap < 13 || ms < 0)
+        return -1;
+    total = ms;
+    cs = total % 1000;
+    total /= 1000;
+    ss = (int)(total % 60);
+    total /= 60;
+    mm = (int)(total % 60);
+    hh = (int)(total / 60);
+    if (hh > 99)
+        return -1;
+    vtt_put_digits(out, hh, 2);
+    out[2] = ':';
+    vtt_put_digits(out + 3, mm, 2);
+    out[5] = ':';
+    vtt_put_digits(out + 6, ss, 2);
+    out[8] = '.';
+    vtt_put_digits(out + 9, (int)cs, 3);
+    out[12] = 0;
+    return 12;
+}
+
+/* ---- cue 上的小方法 ---- */
+
+long duration_ms(VttCue *c)
+{
+    if (!c)
+        return -1;
+    return c->end_ms >= c->start_ms ? c->end_ms - c->start_ms : 0;
+}
+
+int start_str(VttCue *c, char *out, int cap)
+{
+    return c ? ts_str(c->start_ms, out, cap) : -1;
+}
+
+int end_str(VttCue *c, char *out, int cap)
+{
+    return c ? ts_str(c->end_ms, out, cap) : -1;
+}
+
+/* ---- 游标 ---- */
+
+/* 从 pos 起取一行，返回该行长度（不含换行），并把 *next 指向下一行。 */
+static int vtt_line(const char *p, int len, int pos, int *next)
+{
+    int end = pos;
+
+    while (end < len && p[end] != '\n')
+        end++;
+    *next = (end < len) ? end + 1 : end;
+    {
+        int n = end - pos;
+
+        if (n > 0 && p[pos + n - 1] == '\r')
+            n--;
+        return n;
+    }
+}
+
+int open(VttDoc *d, const char *text, int len)
+{
+    int n = 0;
+    int next = 0;
+
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->p = text;
+    d->len = text ? len : 0;
+    if (!text || len < 6)
+        return -1;
+    n = vtt_line(text, len, 0, &next);
+    if (n < 6 || memcmp(text, "WEBVTT", 6) != 0)
+        return -1;
+    d->had_header = 1;
+    d->pos = next;
+    return 0;
+}
+
+int header_ok(VttDoc *d)
+{
+    return d && d->had_header;
+}
+
+/* 取下一条 cue；取到返回 1，到底 0，格式错误 -1（bad 置位）。 */
+int next(VttDoc *d, VttCue *out)
+{
+    while (d && d->pos < d->len) {
+        int next = 0;
+        int n = vtt_line(d->p, d->len, d->pos, &next);
+        int start = d->pos;
+        int arrow = -1;
+        int id_off = 0;
+        int id_len = 0;
+
+        if (n == 0) {                   /* 空行 */
+            d->pos = next;
+            continue;
+        }
+        /* NOTE / STYLE / REGION 整块跳过 */
+        if ((n >= 4 && memcmp(d->p + start, "NOTE", 4) == 0)
+            || (n >= 5 && memcmp(d->p + start, "STYLE", 5) == 0)
+            || (n >= 6 && memcmp(d->p + start, "REGION", 6) == 0)) {
+            d->pos = next;
+            while (d->pos < d->len) {
+                int n2 = vtt_line(d->p, d->len, d->pos, &next);
+
+                if (n2 == 0)
+                    break;
+                d->pos = next;
+            }
+            continue;
+        }
+        /* 找 "-->"；找不到就把这一行当 id */
+        for (int i = 0; i + 3 <= n; i++)
+            if (memcmp(d->p + start + i, "-->", 3) == 0) {
+                arrow = i;
+                break;
+            }
+        if (arrow < 0) {
+            id_off = start;
+            id_len = n;
+            d->pos = next;
+            if (d->pos >= d->len) {
+                d->bad = 1;
+                return -1;
+            }
+            {
+                int next2 = 0;
+                int n2 = vtt_line(d->p, d->len, d->pos, &next2);
+
+                start = d->pos;
+                n = n2;
+                arrow = -1;
+                for (int i = 0; i + 3 <= n; i++)
+                    if (memcmp(d->p + start + i, "-->", 3) == 0) {
+                        arrow = i;
+                        break;
+                    }
+                if (arrow < 0) {
+                    d->bad = 1;
+                    return -1;
+                }
+                next = next2;
+            }
+        }
+        /* 时间戳行：<start> --> <end> [settings] */
+        {
+            int ts_from = start;
+            int ts_len = arrow;
+            int e_from = 0;
+            int e_len = 0;
+            long sms = 0;
+            long ems = 0;
+
+            while (ts_len > 0 && d->p[ts_from + ts_len - 1] == ' ')
+                ts_len--;
+            if (parse_ts(d->p + ts_from, ts_len, &sms) != 0) {
+                d->bad = 1;
+                return -1;
+            }
+            e_from = start + arrow + 3;
+            e_len = start + n - e_from;
+            while (e_len > 0 && d->p[e_from] == ' ')
+                e_from++, e_len--;
+            {
+                int k = 0;
+
+                while (k < e_len && d->p[e_from + k] != ' ')
+                    k++;
+                if (parse_ts(d->p + e_from, k, &ems) != 0) {
+                    d->bad = 1;
+                    return -1;
+                }
+                if (out) {
+                    out->settings_off = e_from + k;
+                    out->settings_len = e_len - k;
+                    while (out->settings_len > 0
+                           && d->p[out->settings_off] == ' ')
+                        out->settings_off++, out->settings_len--;
+                }
+            }
+            if (ems < sms) {
+                d->bad = 1;
+                return -1;
+            }
+            d->pos = next;
+            /* 正文：直到空行 */
+            {
+                int body_off = d->pos;
+                int body_end = d->pos;
+                int any = 0;
+
+                while (d->pos < d->len) {
+                    int nn = 0;
+                    int nl = vtt_line(d->p, d->len, d->pos, &nn);
+
+                    if (nl == 0)
+                        break;
+                    body_end = d->pos + nl;
+                    any = 1;
+                    d->pos = nn;
+                }
+                if (out) {
+                    out->id_off = id_off;
+                    out->id_len = id_len;
+                    out->start_ms = sms;
+                    out->end_ms = ems;
+                    out->text_off = body_off;
+                    out->text_len = any ? body_end - body_off : 0;
+                    out->idx = d->seen;
+                }
+            }
+            d->seen++;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int count(VttDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(VttDoc *d)
+{
+    if (!d || !d->p)
+        return;
+    d->pos = 0;
+    d->seen = 0;
+    d->bad = 0;
+    /* 跳过头部那一行 */
+    {
+        int next = 0;
+
+        vtt_line(d->p, d->len, 0, &next);
+        d->pos = next;
+    }
+}
+
+/* ---- 自测 ---- */
+
+test "WebVTT：时间戳解析与格式化" {
+    long ms = 0;
+    char buf[16] = { 0 };
+
+    if (parse_ts("00:00:01.000", 12, &ms) != 0 || ms != 1000)
+        return err(1, "00:00:01.000 应为 1000 ms");
+    if (parse_ts("01:02.500", 9, &ms) != 0 || ms != 62500)
+        return err(2, "01:02.500 应为 62500 ms");
+    if (parse_ts("01:02:03.004", 12, &ms) != 0 || ms != 3723004)
+        return err(3, "带小时的时间戳不对");
+    if (parse_ts("00:00:01", 8, &ms) != -1)
+        return err(4, "没有毫秒应失败");
+    if (parse_ts("00:00:01.00", 10, &ms) != -1)
+        return err(5, "毫秒不足 3 位应失败");
+    if (parse_ts("0:0:1.000", 9, &ms) != -1)
+        return err(6, "位数不对应失败");
+    if (ts_str(3723004, buf, sizeof buf) != 12 || strcmp(buf, "01:02:03.004") != 0)
+        return err(7, "ts_str 不对");
+    if (ts_str(62500, buf, sizeof buf) != 12 || strcmp(buf, "01:02.500") == 0)
+        return err(8, "ts_str 应补齐小时位（01:02.500 → 00:01:02.500）");
+    if (strcmp(buf, "00:01:02.500") != 0)
+        return err(9, "ts_str(62500) 应为 00:01:02.500");
+    if (ts_str(-1, buf, sizeof buf) != -1)
+        return err(10, "负值应失败");
+    if (ts_str(1000, buf, 8) != -1)
+        return err(11, "容量不足应失败");
+}
+
+test "WebVTT：cue 游标、NOTE 跳过与坏文件" {
+    const char *text = "WEBVTT - 示例\n"
+                       "\n"
+                       "NOTE 这是注释块\n"
+                       "第二行也属于注释\n"
+                       "\n"
+                       "cue-1\n"
+                       "00:00:01.000 --> 00:00:04.000\n"
+                       "第一行\n"
+                       "第二行\n"
+                       "\n"
+                       "00:01:02.500 --> 00:01:05.000 align:start\n"
+                       "只有一行\n"
+                       "\n";
+    VttDoc d = { 0 };
+    VttCue c = { 0 };
+    char a[16] = { 0 };
+    char b[16] = { 0 };
+
+    if (d.open(text, (int)strlen(text)) != 0 || !d.header_ok())
+        return err(1, "打开失败（头部应是 WEBVTT）");
+    if (d.next(&c) != 1)
+        return err(2, "第一条 cue 没取到");
+    if (c.id_len != 5 || memcmp(text + c.id_off, "cue-1", 5) != 0)
+        return err(3, "cue id 不对");
+    if (c.start_ms != 1000 || c.end_ms != 4000)
+        return err(4, "时间戳不对");
+    if (c.start_str(a, sizeof a) != 12 || strcmp(a, "00:00:01.000") != 0)
+        return err(5, "start_str 不对");
+    if (c.end_str(b, sizeof b) != 12 || strcmp(b, "00:00:04.000") != 0)
+        return err(6, "end_str 不对");
+    if (c.duration_ms() != 3000)
+        return err(7, "时长应为 3000 ms");
+    if (c.text_len != 19 || memcmp(text + c.text_off, "第一行\n第二行", 19) != 0)
+        return err(8, "正文应保留多行");
+    if (d.next(&c) != 1)
+        return err(9, "第二条 cue 没取到");
+    if (c.id_len != 0)
+        return err(10, "第二条没有 id");
+    if (c.start_ms != 62500 || c.end_ms != 65000)
+        return err(11, "第二条时间戳不对");
+    if (c.settings_len != 11
+        || memcmp(text + c.settings_off, "align:start", 11) != 0)
+        return err(12, "settings 不对");
+    if (c.text_len != 12 || memcmp(text + c.text_off, "只有一行", 12) != 0)
+        return err(13, "第二条正文不对");
+    if (d.next(&c) != 0 || d.count() != 2)
+        return err(14, "应恰好两条");
+    /* reset 后重来 */
+    d.reset();
+    if (d.next(&c) != 1 || c.id_len != 5 || d.count() != 1)
+        return err(15, "reset 后应从头开始");
+    /* 坏文件 */
+    {
+        VttDoc bad = { 0 };
+        VttCue bc = { 0 };
+        const char *noheader = "00:00:01.000 --> 00:00:02.000\nx\n";
+
+        if (bad.open(noheader, (int)strlen(noheader)) != -1)
+            return err(16, "缺 WEBVTT 头应失败");
+        noheader = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n";
+        if (bad.open(noheader, (int)strlen(noheader)) != 0)
+            return err(17, "带头应能打开");
+        noheader = "WEBVTT\n\n00:00:05.000 --> 00:00:02.000\nx\n";
+        if (bad.open(noheader, (int)strlen(noheader)) != 0)
+            return err(18, "打开不看 cue");
+        if (bad.next(&bc) != -1)
+            return err(19, "时间倒流应失败");
+        noheader = "WEBVTT\n\n00:00:01.000 -> 00:00:02.000\nx\n";
+        if (bad.open(noheader, (int)strlen(noheader)) != 0)
+            return err(20, "带头应能打开（2）");
+        if (bad.next(&bc) != -1)
+            return err(21, "缺 --> 应失败");
+    }
+}

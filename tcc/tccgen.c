@@ -13066,6 +13066,10 @@ static const struct C6ErrStdSlot {
     { "std.net.coap",           C6_ERR_SLOT_STD + 358 },
     { "std.net.dhcp",           C6_ERR_SLOT_STD + 359 },
     { "std.net.ssdp",           C6_ERR_SLOT_STD + 360 },
+    { "std.net.netflow",        C6_ERR_SLOT_STD + 361 },
+    { "std.net.wol",            C6_ERR_SLOT_STD + 362 },
+    { "std.data.vtt",           C6_ERR_SLOT_STD + 363 },
+    { "std.data.zone",          C6_ERR_SLOT_STD + 364 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

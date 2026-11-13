@@ -7,6 +7,22 @@
 
 ## 未发布
 
+### 标准库第八十八批：网络运维与媒体清单
+
+- **`std/net/netflow.c6`**：NetFlow v5（24 字节头 + N×48 记录），版本与长度校验，
+  `FlowDoc` 游标；`Flow` 上带 `src_str/dst_str/octets_per_packet/duration_ms`；
+  构造器按 `count` 校验记录数。
+- **`std/net/wol.c6`**：Wake-on-LAN 魔术包（6 个 0xFF + 16 份 MAC + 可选 SecureOn
+  密码），解析要求 16 份 MAC 完全一致；`mac_str`/`mac_parse`（大小写与 `-` 分隔都收）。
+- **`std/data/vtt.c6`**：WebVTT（`WEBVTT` 头、NOTE/STYLE/REGION 跳过、可选 cue id、
+  `-->` 时间戳、settings、多行正文），`parse_ts`/`ts_str` 处理 `HH:MM:SS.mmm`
+  与省略小时的写法。
+- **`std/data/zone.c6`**：DNS 区域文件（`;` 注释、跨行括号、省略 owner、
+  `$TTL`/`$ORIGIN` 伪记录、`[TTL] [IN] type rdata`），未知类型与 `$INCLUDE`
+  保守判非法。
+- 集成示例 `examples/stdops.c6`（`make std-ops`，62 条检查）+ `STD_OPS_SRCS` +
+  err 号段 0x6169…0x616c；`std/` 到 **365** 个模块。
+
 ### 标准库第八十七批：发现与配置协议 + 文本折叠
 
 - **`std/net/coap.c6`**（RFC 7252）：4 字节头 + token + 选项串（13/14 扩展

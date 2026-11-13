@@ -535,6 +535,7 @@
 | `examples/stdsec.c6` | （无模块） | 第八十五批（密钥交换 + 安全策略）的拼装示例（`make std-sec`）：X25519 握手、HSTS 策略库、robots 许可、base45 指纹各一节，最后串成一条「响应头 → 策略 → 许可 → 指纹」的流水线（75 条检查） |
 | `examples/stdmw.c6` | （无模块） | 第八十六批（服务端中间件语义）的拼装示例（`make std-mw`）：限流、缓存、邮件编码、模糊匹配各一节，最后串成「限流 → 缓存 → 回源」的请求路径（60 条检查） |
 | `examples/stdproto4.c6` | （无模块） | 第八十七批（发现与配置协议）的拼装示例（`make std-proto4`）：CoAP/DHCP/SSDP 三个报文层各一节 + 文本折叠，最后串成「发现 → 取数 → 写日志」（56 条检查） |
+| `examples/stdops.c6` | （无模块） | 第八十八批（网络运维 + 媒体清单）的拼装示例（`make std-ops`）：NetFlow/WoL/WebVTT/DNS 区域各一节，最后串成「找主机 → 唤醒 → 记流 → 出字幕」（62 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4703,6 +4704,89 @@ DISCOVER/REQUEST、往返解析、`find` 取消息类型与请求 IP、IPv4 格�
 M-SEARCH（自动 HOST）、解析 NOTIFY 与设备应答；translit 折叠变音符/全角/大小写
 得到 slug；最后串成「SSDP 发现 → 从 LOCATION 抠主机 → CoAP GET → 折叠写日志」
 （56 条检查）。
+
+### 第八十八批：网络运维与媒体清单（`netflow` / `wol` / `vtt` / `zone`）
+
+两个二进制协议 + 两个文本格式，接口仍是「`parse`/`next` + 句柄 + 构造器」那一套。
+
+**`std/net/netflow.c6`**（NetFlow v5）：
+
+```c
+NetflowHeader h = { 0 };
+h.parse(buf, n);                       // 版本 5 + 长度对得上 count
+FlowDoc d = { 0 }; Flow f = { 0 };
+d.open(&h, buf, n);                    // 游标：open / next / count / reset
+while (d.next(&f)) {
+    char a[16] = { 0 }, b[16] = { 0 };
+    f.src_str(a, sizeof a);            // 方法：src_str / dst_str / next_hop_str
+    f.dst_str(b, sizeof b);
+    f.octets_per_packet();             // 平均每报文字节
+    f.duration_ms();                   // last - first（回绕按 0）
+}
+
+NetflowBuilder b = { 0 };
+b.init(out, sizeof out);
+b.header(1, uptime, unix_secs, seq, engine_id);
+b.record(&f);
+b.finish();
+```
+
+**`std/net/wol.c6`**（Wake-on-LAN）：
+
+```c
+WolPacket w = { 0 };
+w.init();
+w.set_mac(mac6);                        // 方法：set_mac / set_password / build / parse
+w.set_password(pw6);                    // 可选 SecureOn 密码
+w.build();                              // 102 / 108 字节
+w.data() / w.length() / w.mac_of();
+
+mac_str(mac, text, sizeof text);        // "00:1a:2b:3c:4d:5e"
+mac_parse(text, back);                  // 也接受 '-' 分隔与大写
+```
+
+**`std/data/vtt.c6`**（WebVTT）：
+
+```c
+VttDoc d = { 0 }; VttCue c = { 0 };
+d.open(text, len);                      // 头部必须是 WEBVTT
+while (d.next(&c)) {                    // NOTE/STYLE/REGION 整块跳过
+    char a[16] = { 0 }, b[16] = { 0 };
+    c.start_str(a, sizeof a);           // 方法：start_str / end_str / duration_ms
+    c.end_str(b, sizeof b);
+    /* text + c.text_off, c.text_len 是正文（多行原样保留） */
+}
+parse_ts("01:02.500", 9, &ms);          // 毫秒可省小时
+ts_str(62500, buf, sizeof buf);         // "00:01:02.500"
+```
+
+**`std/data/zone.c6`**（DNS 区域文件）：
+
+```c
+ZoneDoc d = { 0 }; ZoneRec r = { 0 };
+d.open(text, len);
+while (d.next(&r)) {                    // 1 记录 / 0 读完 / -1 格式错误
+    char owner[96] = { 0 }, type[16] = { 0 }, rdata[256] = { 0 };
+    r.owner_copy(text, owner, sizeof owner);   // 方法：owner_copy / type_name / rdata_copy
+    r.type_name(type, sizeof type);
+    r.rdata_copy(text, rdata, sizeof rdata);   // 多行 SOA 拼成一行
+    r.inherit_owner;                     // 这一条是否继承了上一条的 owner
+}
+```
+
+支持 `;` 注释、跨行括号、省略 owner、`$TTL`/`$ORIGIN` 伪记录（也会被 `next()`
+交出来，`r.kind` 区分）；`$INCLUDE`/`$GENERATE` 与未知类型保守判非法。
+
+### 集成示例：`examples/stdops.c6`
+
+```sh
+make std-ops
+```
+
+五节：NetFlow 两条记录往返与统计；WoL 魔术包（含密码）构建/解析与 MAC 字符串；
+WebVTT 两条字幕（带 id / 带 settings，NOTE 跳过）；DNS 区域文件的 `$TTL`、
+`$ORIGIN`、跨行 SOA、继承 owner 的 NS、两条 A 记录；最后串成「区域文件找主机 →
+发 WoL → 记一条 NetFlow → 出一条 VTT 通知」（62 条检查）。
 
 ## 相关回归用例
 

@@ -1,0 +1,559 @@
+/* std/data/zone：DNS 区域文件（RFC 1035 §5 的 master file）读取器。
+ *
+ *     import std.data.zone;
+ *
+ *     ZoneDoc d = { 0 };
+ *     ZoneRec r = { 0 };
+ *     d.open(text, len);              // 游标：open / next / count / reset
+ *     while (d.next(&r)) {            // 1 = 一条记录，0 = 读完，-1 = 格式错误
+ *         char owner[96] = { 0 }, type[16] = { 0 }, rdata[256] = { 0 };
+ *         r.owner_copy(&d, owner, sizeof owner);   // 方法：owner_copy / type_str / rdata_copy
+ *         r.type_str(type, sizeof type);
+ *         r.rdata_copy(rdata, sizeof rdata);       // 多行 SOA 会拼成一行
+ *         printf("%s %ld %s %s\n", owner, r.ttl, type, rdata);
+ *     }
+ *
+ * 支持的区域文件语法：
+ *
+ * - `;` 起注释（行内也算），空行跳过；
+ * - 记录可以跨行：`(` 与 `)` 之间的换行等同于空格（SOA 常这么写）；
+ * - 省略 owner（行首是空白）表示沿用上一条的 owner；
+ * - `[TTL] [class] type rdata...` 里 TTL 与 class 都可省（class 缺省 `IN`，
+ *   TTL 缺省用 `$TTL` 的值）；
+ * - `$TTL <秒>` 与 `$ORIGIN <名字>` 是伪记录，`next()` 也把它们交出来
+ *   （`r.kind` 区分），这样调用方可以自己决定要不要用；
+ * - `$INCLUDE` / `$GENERATE` **不支持**（遇到给 `$INCLUDE` 的 kind，`ok` 置 0）。
+ *
+ * 不分配、不复制：owner 与 rdata 都是原文本里的偏移；`rdata_copy()` 才真正按
+ * 「token 之间一个空格」的规则拼出一行。
+ */
+#include <string.h>
+
+module std.data.zone;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define ZONE_MAX_TOK 32
+
+#define ZONE_KIND_RECORD 0
+#define ZONE_KIND_TTL 1
+#define ZONE_KIND_ORIGIN 2
+#define ZONE_KIND_UNSUPPORTED 3
+
+#define ZONE_CLASS_IN 1
+
+struct ZoneRec {
+    int kind;
+    int idx;
+    int line;
+    int owner_off;
+    int owner_len;
+    int has_ttl;
+    long ttl;
+    int class_code;
+    int type_code;
+    int first_tok;              /* rdata 从第几个 token 起 */
+    int ntoks;
+    int tok_off[ZONE_MAX_TOK];
+    int tok_len[ZONE_MAX_TOK];
+    int inherit_owner;
+};
+
+struct ZoneDoc {
+    const char *p;
+    int len;
+    int pos;
+    int line;
+    int seen;
+    int bad;
+    int owner_off;              /* 上一条记录的 owner（供省略 owner 时继承） */
+    int owner_len;
+    long def_ttl;
+    int has_def_ttl;
+};
+
+static int zone_low(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+static int zone_eqn(const char *a, const char *b, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (zone_low((int)(unsigned char)a[i]) != zone_low((int)(unsigned char)b[i]))
+            return 0;
+    return 1;
+}
+
+/* 类型名 → 编号；未知给 0。 */
+int type_code_of(const char *s, int len)
+{
+    if (!s || len <= 0)
+        return 0;
+    if (len == 1 && zone_eqn(s, "A", 1))
+        return 1;
+    if (len == 2 && zone_eqn(s, "NS", 2))
+        return 2;
+    if (len == 5 && zone_eqn(s, "CNAME", 5))
+        return 5;
+    if (len == 3 && zone_eqn(s, "SOA", 3))
+        return 6;
+    if (len == 3 && zone_eqn(s, "PTR", 3))
+        return 12;
+    if (len == 2 && zone_eqn(s, "MX", 2))
+        return 15;
+    if (len == 3 && zone_eqn(s, "TXT", 3))
+        return 16;
+    if (len == 4 && zone_eqn(s, "AAAA", 4))
+        return 28;
+    if (len == 3 && zone_eqn(s, "SRV", 3))
+        return 33;
+    if (len == 4 && zone_eqn(s, "CAA", 4))
+        return 257;
+    if (len == 3 && zone_eqn(s, "TLSA", 3) == 0)
+        return 0;
+    return 0;
+}
+
+/* 编号 → 类型名；未知给 "TYPE<n>"。 */
+int type_str(int code, char *out, int cap)
+{
+    const char *name = 0;
+
+    switch (code) {
+    case 1: name = "A"; break;
+    case 2: name = "NS"; break;
+    case 5: name = "CNAME"; break;
+    case 6: name = "SOA"; break;
+    case 12: name = "PTR"; break;
+    case 15: name = "MX"; break;
+    case 16: name = "TXT"; break;
+    case 28: name = "AAAA"; break;
+    case 33: name = "SRV"; break;
+    case 257: name = "CAA"; break;
+    default: name = 0; break;
+    }
+    if (!out || cap < 8)
+        return -1;
+    if (name) {
+        int n = (int)strlen(name);
+
+        if (n + 1 > cap)
+            return -1;
+        memcpy(out, name, (size_t)n + 1);
+        return n;
+    }
+    {
+        char tmp[16] = { 0 };
+        int v = code;
+        int k = 0;
+
+        for (int i = 11; i >= 0; i--) {
+            tmp[i] = (char)('0' + v % 10);
+            v /= 10;
+            k++;
+            if (v == 0)
+                break;
+        }
+        if (5 + k + 1 > cap)
+            return -1;
+        memcpy(out, "TYPE", 4);
+        memcpy(out + 4, tmp + 12 - k, (size_t)k);
+        out[4 + k] = 0;
+        return 4 + k;
+    }
+}
+
+/* 记录上的方法 */
+int owner_copy(ZoneRec *r, const char *zone_text, char *out, int cap)
+{
+    if (!r || !zone_text || !out)
+        return -1;
+    if (r->owner_len <= 0) {
+        if (cap < 2)
+            return -1;
+        out[0] = 0;
+        return 0;
+    }
+    if (r->owner_len + 1 > cap)
+        return -1;
+    memcpy(out, zone_text + r->owner_off, (size_t)r->owner_len);
+    out[r->owner_len] = 0;
+    return r->owner_len;
+}
+
+int type_of(ZoneRec *r)
+{
+    return r ? r->type_code : -1;
+}
+
+int type_name(ZoneRec *r, char *out, int cap)
+{
+    return r ? type_str(r->type_code, out, cap) : -1;
+}
+
+/* rdata 拼成一行（token 之间一个空格）；返回长度。 */
+int rdata_copy(ZoneRec *r, const char *zone_text, char *out, int cap)
+{
+    int o = 0;
+
+    if (!r || !zone_text || !out)
+        return -1;
+    for (int i = r->first_tok; i < r->ntoks; i++) {
+        if (o + r->tok_len[i] + (o > 0 ? 1 : 0) + 1 > cap)
+            return -1;
+        if (o > 0)
+            out[o++] = ' ';
+        memcpy(out + o, zone_text + r->tok_off[i], (size_t)r->tok_len[i]);
+        o += r->tok_len[i];
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* ---- 游标 ---- */
+
+int open(ZoneDoc *d, const char *text, int len)
+{
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->p = text;
+    d->len = text ? len : 0;
+    d->line = 1;
+    if (!text || len <= 0)
+        return -1;
+    return 0;
+}
+
+int count(ZoneDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(ZoneDoc *d)
+{
+    if (!d || !d->p)
+        return;
+    d->pos = 0;
+    d->line = 1;
+    d->seen = 0;
+    d->bad = 0;
+    d->owner_off = 0;
+    d->owner_len = 0;
+    d->def_ttl = 0;
+    d->has_def_ttl = 0;
+}
+
+static int zone_is_space(int c)
+{
+    return c == ' ' || c == '\t';
+}
+
+/* 从 pos 起收集一条记录的所有 token（跨行、跳过注释、剥掉括号）。 */
+static int zone_tokens(ZoneDoc *d, ZoneRec *r)
+{
+    int depth = 0;
+    int start_line = d->line;
+
+    r->ntoks = 0;
+    r->first_tok = 0;
+    while (d->pos < d->len) {
+        int c = (int)(unsigned char)d->p[d->pos];
+
+        if (c == ';') {                 /* 注释到行尾 */
+            while (d->pos < d->len && d->p[d->pos] != '\n')
+                d->pos++;
+            continue;
+        }
+        if (c == '\n') {
+            d->pos++;
+            d->line++;
+            if (depth == 0) {
+                if (r->ntoks > 0)
+                    return 0;           /* 记录结束 */
+                start_line = d->line;   /* 空行：继续找下一条 */
+            }
+            continue;
+        }
+        if (zone_is_space(c) || c == '\r') {
+            d->pos++;
+            continue;
+        }
+        if (c == '(') {
+            depth++;
+            d->pos++;
+            continue;
+        }
+        if (c == ')') {
+            if (depth > 0)
+                depth--;
+            d->pos++;
+            continue;
+        }
+        /* 一个 token */
+        {
+            int s = d->pos;
+
+            while (d->pos < d->len) {
+                int k = (int)(unsigned char)d->p[d->pos];
+
+                if (zone_is_space(k) || k == '\r' || k == '\n' || k == ';'
+                    || k == '(' || k == ')')
+                    break;
+                d->pos++;
+            }
+            if (r->ntoks >= ZONE_MAX_TOK)
+                return -1;
+            r->tok_off[r->ntoks] = s;
+            r->tok_len[r->ntoks] = d->pos - s;
+            r->ntoks++;
+        }
+    }
+    if (depth != 0)
+        return -1;                      /* 括号没闭上 */
+    return r->ntoks > 0 ? 0 : 1;        /* 1 = 到底 */
+}
+
+static int zone_all_digits(const char *s, int n)
+{
+    if (n <= 0)
+        return 0;
+    for (int i = 0; i < n; i++)
+        if (s[i] < '0' || s[i] > '9')
+            return 0;
+    return 1;
+}
+
+/* 取下一条；1 = 有，0 = 读完，-1 = 格式错误。 */
+int next(ZoneDoc *d, ZoneRec *r)
+{
+    int rc = 0;
+
+    if (!d || !r || d->bad)
+        return -1;
+    memset(r, 0, sizeof *r);
+    rc = zone_tokens(d, r);
+    if (rc != 0)
+        return rc < 0 ? -1 : 0;
+    r->idx = d->seen;
+    r->line = d->line;
+    r->class_code = ZONE_CLASS_IN;
+    /* $TTL / $ORIGIN / 不支持的伪记录 */
+    if (r->tok_len[0] > 0 && d->p[r->tok_off[0]] == '$') {
+        const char *k = d->p + r->tok_off[0];
+        int kl = r->tok_len[0];
+
+        if (kl == 4 && zone_eqn(k, "$TTL", 4)) {
+            r->kind = ZONE_KIND_TTL;
+            if (r->ntoks >= 2
+                && zone_all_digits(d->p + r->tok_off[1], r->tok_len[1])) {
+                long v = 0;
+
+                for (int i = 0; i < r->tok_len[1]; i++)
+                    v = v * 10 + (d->p[r->tok_off[1] + i] - '0');
+                d->def_ttl = v;
+                d->has_def_ttl = 1;
+                r->ttl = v;
+            }
+        } else if (kl == 7 && zone_eqn(k, "$ORIGIN", 7)) {
+            r->kind = ZONE_KIND_ORIGIN;
+            if (r->ntoks >= 2) {
+                r->owner_off = r->tok_off[1];
+                r->owner_len = r->tok_len[1];
+            }
+        } else {
+            r->kind = ZONE_KIND_UNSUPPORTED;
+            d->bad = 1;
+            return -1;
+        }
+        d->seen++;
+        return 1;
+    }
+    r->kind = ZONE_KIND_RECORD;
+    /* owner：行首没缩进就是新 owner；否则继承 */
+    {
+        int i = 0;
+        const char *t0 = d->p + r->tok_off[0];
+        int l0 = r->tok_len[0];
+        int is_class = (l0 == 2 && zone_eqn(t0, "IN", 2));
+        int is_type = type_code_of(t0, l0) != 0;
+
+        if (is_class || is_type || zone_all_digits(t0, l0)) {
+            /* 省略了 owner */
+            r->inherit_owner = 1;
+            r->owner_off = d->owner_off;
+            r->owner_len = d->owner_len;
+            i = 0;
+        } else {
+            r->owner_off = r->tok_off[0];
+            r->owner_len = l0;
+            i = 1;
+        }
+        /* [TTL] [class] type */
+        if (i < r->ntoks && zone_all_digits(d->p + r->tok_off[i], r->tok_len[i])) {
+            long v = 0;
+
+            for (int k = 0; k < r->tok_len[i]; k++)
+                v = v * 10 + (d->p[r->tok_off[i] + k] - '0');
+            r->has_ttl = 1;
+            r->ttl = v;
+            i++;
+        }
+        if (i < r->ntoks && r->tok_len[i] == 2
+            && zone_eqn(d->p + r->tok_off[i], "IN", 2)) {
+            r->class_code = ZONE_CLASS_IN;
+            i++;
+        }
+        if (i >= r->ntoks)
+            return -1;                  /* 没有类型 */
+        r->type_code = type_code_of(d->p + r->tok_off[i], r->tok_len[i]);
+        if (r->type_code == 0)
+            return -1;                  /* 不认识类型（保守拒绝） */
+        i++;
+        r->first_tok = i;
+        if (!r->has_ttl && d->has_def_ttl)
+            r->ttl = d->def_ttl;
+        if (!r->inherit_owner) {
+            d->owner_off = r->owner_off;
+            d->owner_len = r->owner_len;
+        }
+    }
+    d->seen++;
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+test "zone：基本记录、省略 owner 与 $TTL" {
+    const char *text = "$TTL 3600\n"
+                       "$ORIGIN example.com.\n"
+                       "@       IN SOA ns1.example.com. admin.example.com. (\n"
+                       "           2024010101 ; serial\n"
+                       "           7200 3600 1209600 3600 )\n"
+                       "        IN NS  ns1.example.com.\n"
+                       "        IN NS  ns2.example.com.\n"
+                       "www     IN A   192.0.2.10\n"
+                       "mail    600 A  192.0.2.20\n";
+    ZoneDoc d = { 0 };
+    ZoneRec r = { 0 };
+    char owner[96] = { 0 };
+    char type[16] = { 0 };
+    char rdata[256] = { 0 };
+
+    if (d.open(text, (int)strlen(text)) != 0)
+        return err(1, "open 失败");
+    /* $TTL */
+    if (d.next(&r) != 1 || r.kind != ZONE_KIND_TTL)
+        return err(2, "第一条应是 $TTL");
+    if (r.ttl != 3600)
+        return err(3, "$TTL 值不对");
+    /* $ORIGIN */
+    if (d.next(&r) != 1 || r.kind != ZONE_KIND_ORIGIN)
+        return err(4, "第二条应是 $ORIGIN");
+    if (r.owner_len != 12 || memcmp(text + r.owner_off, "example.com.", 12) != 0)
+        return err(5, "$ORIGIN 值不对");
+    /* SOA（跨 3 行） */
+    if (d.next(&r) != 1 || r.kind != ZONE_KIND_RECORD)
+        return err(6, "第三条应是 SOA 记录");
+    if (r.owner_copy(text, owner, sizeof owner) != 1 || strcmp(owner, "@") != 0)
+        return err(7, "owner 应是 @");
+    if (r.type_name(type, sizeof type) != 3 || strcmp(type, "SOA") != 0)
+        return err(8, "类型应是 SOA");
+    if (r.ttl != 3600)
+        return err(9, "SOA 应继承 $TTL");
+    if (r.rdata_copy(text, rdata, sizeof rdata) != 69
+        || strcmp(rdata, "ns1.example.com. admin.example.com. 2024010101 7200 3600 1209600 3600") != 0)
+        return err(10, "SOA 的 rdata 应拼成一行（去掉括号与注释）");
+    /* 继承 owner 的 NS */
+    if (d.next(&r) != 1 || !r.inherit_owner)
+        return err(11, "NS 应继承 owner");
+    if (r.owner_copy(text, owner, sizeof owner) != 1 || strcmp(owner, "@") != 0)
+        return err(12, "继承的 owner 应是 @");
+    if (r.type_name(type, sizeof type) != 2 || strcmp(type, "NS") != 0)
+        return err(13, "类型应是 NS");
+    if (r.rdata_copy(text, rdata, sizeof rdata) != 16
+        || strcmp(rdata, "ns1.example.com.") != 0)
+        return err(14, "NS 的 rdata 不对");
+    /* 第二条 NS（也继承 owner） */
+    if (d.next(&r) != 1 || !r.inherit_owner || r.type_code != 2)
+        return err(22, "第二条 NS 应继承 owner");
+    /* www */
+    if (d.next(&r) != 1 || r.owner_copy(text, owner, sizeof owner) != 3
+        || strcmp(owner, "www") != 0)
+        return err(15, "www 记录的 owner 不对");
+    if (r.type_name(type, sizeof type) != 1 || strcmp(type, "A") != 0)
+        return err(16, "类型应是 A");
+    if (r.rdata_copy(text, rdata, sizeof rdata) != 10
+        || strcmp(rdata, "192.0.2.10") != 0)
+        return err(17, "A 记录 rdata 不对");
+    /* mail：显式 TTL 600 */
+    if (d.next(&r) != 1 || !r.has_ttl || r.ttl != 600)
+        return err(18, "mail 的显式 TTL 应是 600");
+    if (d.next(&r) != 0 || d.count() != 7)
+        return err(19, "应读完 7 条（2 个伪记录 + 5 条记录）");
+}
+
+test "zone：类型表、坏输入与 reset" {
+    const char *text = "a.test. 300 IN AAAA 2001:db8::1\n"
+                       "b.test. IN MX 10 mail.test.\n"
+                       "c.test. IN TYPE999 数据\n"
+                       "d.test. IN A 1.2.3.4\n";
+    ZoneDoc d = { 0 };
+    ZoneRec r = { 0 };
+    char type[16] = { 0 };
+    char rdata[128] = { 0 };
+
+    if (type_code_of("AAAA", 4) != 28 || type_code_of("aaaa", 4) != 28)
+        return err(1, "AAAA 类型码不对");
+    if (type_code_of("NS", 2) != 2 || type_code_of("SOA", 3) != 6)
+        return err(2, "NS/SOA 类型码不对");
+    if (type_code_of("NOPE", 4) != 0)
+        return err(3, "未知类型应为 0");
+    if (type_str(33, type, sizeof type) != 3 || strcmp(type, "SRV") != 0)
+        return err(4, "type_str(33) 应为 SRV");
+    if (type_str(999, type, sizeof type) != 7 || strcmp(type, "TYPE999") != 0)
+        return err(5, "未知类型应格式化成 TYPE999");
+
+    if (d.open(text, (int)strlen(text)) != 0)
+        return err(6, "open 失败");
+    if (d.next(&r) != 1 || r.type_code != 28 || r.ttl != 300)
+        return err(7, "AAAA 记录不对");
+    if (r.rdata_copy(text, rdata, sizeof rdata) != 11
+        || strcmp(rdata, "2001:db8::1") != 0)
+        return err(8, "IPv6 rdata 不对");
+    if (d.next(&r) != 1 || r.type_code != 15)
+        return err(9, "MX 记录不对");
+    if (r.rdata_copy(text, rdata, sizeof rdata) != 13
+        || strcmp(rdata, "10 mail.test.") != 0)
+        return err(10, "MX rdata 不对");
+    /* 不认识的类型：保守拒绝 */
+    if (d.next(&r) != -1)
+        return err(11, "未知类型应判非法");
+    /* reset 后还能重来 */
+    d.reset();
+    if (d.next(&r) != 1 || r.type_code != 28)
+        return err(12, "reset 后应从头");
+    /* 括号不闭合 */
+    {
+        ZoneDoc bd = { 0 };
+        ZoneRec br = { 0 };
+        const char *bad = "x.test. IN SOA ns. admin. ( 1 2 3\n";
+
+        if (bd.open(bad, (int)strlen(bad)) != 0)
+            return err(13, "open 失败（坏文件）");
+        if (bd.next(&br) != -1)
+            return err(14, "括号不闭合应失败");
+    }
+    /* 缺类型 */
+    {
+        ZoneDoc bd = { 0 };
+        ZoneRec br = { 0 };
+        const char *bad = "x.test. 300 IN\n";
+
+        bd.open(bad, (int)strlen(bad));
+        if (bd.next(&br) != -1)
+            return err(15, "缺类型应失败");
+    }
+}
