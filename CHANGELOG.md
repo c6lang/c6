@@ -7,6 +7,20 @@
 
 ## 未发布
 
+### 标准库第八十五批：密钥交换 + 传输安全策略 + 抓取许可 + 45 进制
+
+- **`std/net/x25519.c6`**：Curve25519 密钥交换（RFC 7748），`Dh.init/agree/is_ready`
+  句柄式入口；16×16 位肢域运算、常数时间蒙太奇阶梯（条件交换用掩码）。
+- **`std/net/hsts.c6`**：HSTS 策略库（RFC 6797）——`hsts_parse` 解响应头，
+  `HstsStore.add/match/expire/prune` 判策略，`HstsDoc` 游标遍历；子域、IP 字面量、
+  时钟倒退、`max-age=0`（撤销）这些边界都在测试里。
+- **`std/net/robots.c6`**：robots.txt（RFC 9309）——`Robots.load/allowed/sitemap`
+  + `RobotsDoc` 逐行游标；最长匹配、同长 Allow 赢、`*`/`$` 通配、具体 agent 组优先。
+- **`std/encoding/base45.c6`**：Base45（RFC 9285）一次性编解码 + 流式 `B45Enc`；
+  空格是字符表成员（不能当分隔符），只有 `\t\n\r\v\f` 跳过。
+- 集成示例 `examples/stdsec.c6`（`make std-sec`，75 条检查）+ `STD_SEC_SRCS` +
+  err 号段 0x615d…0x6160；`std/` 到 **353** 个模块。
+
 ### 性能与基准
 
 - **一次性 epoll 注册 + O(1) 唤醒**：协程运行时的 fd 注册集改成按 fd 索引的

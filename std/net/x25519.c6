@@ -1,0 +1,463 @@
+/* std/net/x25519：Curve25519 上的 X25519 密钥交换（RFC 7748）。
+ *
+ *     import std.net.x25519;
+ *
+ *     Dh alice = { { 0 }, { 0 }, 0 };
+ *     Dh bob = { { 0 }, { 0 }, 0 };
+ *     alice.init(secret_a32);              // 方法：init / public_key / agree / is_ready
+ *     bob.init(secret_b32);
+ *     alice.agree(sa, bob.public_key())    // 双方算出的 sa == sb
+ *
+ * 实现要点（16 个 16 位肢、radix 2^16，p = 2^255 - 19）：
+ *
+ * - 一个域元素就是 `u32 v[16]`，每肢先按 16 位宽松归约，`fe_mul` 里用 `u64` 累加
+ *   （16×16 次乘加，最大 ~2^38，不会溢出），然后把高 16 肢折回低位（2^256 ≡ 38）；
+ * - `fe_invert` 用平方-乘链算 `z^(p-2)`（TweetNaCl 的 253 轮写法），常数时间；
+ * - 蒙哥马利阶梯按位做**条件交换**（`fe_sel`，用掩码异或，不用 if），全程无分支；
+ * - 解码时清掉最高位（RFC 7748 §5），编码前做一次规范归约（减去 p 的条件减法）。
+ *
+ * 约定：
+ *
+ * - `x25519(out, scalar, point)`：out 可以是 point（原地不冲突，内部先解码），返回 1；
+ * - `x25519_base(out, scalar)`：基点 u=9，返回 1；
+ * - `dh.init(secret32)`：clamp 私钥、算出公钥，返回 1；`dh.public_key()` 返回公钥指针；
+ * - `dh.agree(out, peer32)`：算共享密钥，全零结果（非法公钥）返回 0（不叫 `shared`
+ *   ——那是 c6 的保留字）；
+ * - `dh.is_ready()` 是否 init 过，`dh.private_key()` 取（已 clamp 的）私钥；
+ * - `is_zero(b32)` / `clamp(s32)` 是不带句柄的小工具。
+ */
+#include <string.h>
+
+module std.net.x25519;
+import std.core.types;
+
+struct Dh {
+    u8 priv[32];
+    u8 pub[32];
+    int ready;
+};
+
+/* ---- 域运算：16 肢 × 16 位 ---- */
+
+static void fe_0(u32 *r)
+{
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        r[i] = 0;
+}
+
+static void fe_1(u32 *r)
+{
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        r[i] = 0;
+    r[0] = 1;
+}
+
+static void fe_copy(u32 *r, u32 *a)
+{
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        r[i] = a[i];
+}
+
+/* 把 32 个 u64 收成 16 个 16 位肢（模 p）：高 16 肢折回低位，剩下的进位再折一次 */
+static void fe_reduce(u32 *r, u64 *t)
+{
+    u64 c = 0;
+    int i = 0;
+
+    for (i = 16; i < 32; i++)
+        t[i - 16] += 38ULL * t[i];       /* 2^256 ≡ 38 (mod p) */
+    for (i = 16; i < 32; i++)
+        t[i] = 0;
+    for (i = 0; i < 15; i++) {
+        t[i + 1] += t[i] >> 16;
+        t[i] &= 0xFFFFULL;
+    }
+    c = t[15] >> 16;
+    t[15] &= 0xFFFFULL;
+    t[0] += 38ULL * c;
+    for (i = 0; i < 15; i++) {
+        t[i + 1] += t[i] >> 16;
+        t[i] &= 0xFFFFULL;
+    }
+    c = t[15] >> 16;
+    t[15] &= 0xFFFFULL;
+    t[0] += 38ULL * c;
+    for (i = 1; i < 16; i++) {
+        t[i] += t[i - 1] >> 16;
+        t[i - 1] &= 0xFFFFULL;
+    }
+    c = t[15] >> 16;
+    t[15] &= 0xFFFFULL;
+    t[0] += 38ULL * c;
+    t[1] += t[0] >> 16;
+    t[0] &= 0xFFFFULL;
+    for (i = 0; i < 16; i++)
+        r[i] = (u32)t[i];
+}
+
+static void fe_mul(u32 *r, u32 *a, u32 *b)
+{
+    u64 t[32] = { 0 };
+    int i = 0;
+    int j = 0;
+
+    for (i = 0; i < 16; i++) {
+        u64 ai = (u64)a[i];
+
+        for (j = 0; j < 16; j++)
+            t[i + j] += ai * (u64)b[j];
+    }
+    fe_reduce(r, t);
+}
+
+static void fe_sq(u32 *r, u32 *a)
+{
+    fe_mul(r, a, a);
+}
+
+/* r = a + b（不归约，留给下一次 fe_mul/fe_reduce 收） */
+static void fe_add(u32 *r, u32 *a, u32 *b)
+{
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        r[i] = a[i] + b[i];
+}
+
+/* r = a - b。为了避免无符号下溢，这里加上 8p 的代表元（8p ≡ 0 mod p，值不变）：
+   2p = 2^256-38 的 16 位肢是 (65536-38, 65535, …, 65535)，乘 8 之后每一肢都远大于
+   b 可能取到的最大值（fe_add 的输出不会超过 2^19），所以减法不会借位穿到上面去。 */
+static void fe_sub(u32 *r, u32 *a, u32 *b)
+{
+    int i = 0;
+
+    r[0] = a[0] + 523984U - b[0];
+    for (i = 1; i < 16; i++)
+        r[i] = a[i] + 524280U - b[i];
+}
+
+/* r = a * n（n 是小常数，比如 121666） */
+static void fe_mul_small(u32 *r, u32 *a, u32 n)
+{
+    u64 t[32] = { 0 };
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        t[i] = (u64)a[i] * (u64)n;
+    fe_reduce(r, t);
+}
+
+/* 条件交换：swap=1 时交换 a、b（掩码异或，无分支） */
+static void fe_sel(u32 *a, u32 *b, u32 swap)
+{
+    u32 mask = (u32)(0U - (swap & 1U));
+    int i = 0;
+
+    for (i = 0; i < 16; i++) {
+        u32 x = mask & (a[i] ^ b[i]);
+
+        a[i] ^= x;
+        b[i] ^= x;
+    }
+}
+
+/* 逆元：r = a^(p-2) = a^(2^255-21)，指数位 0,1,3 与 5..254 置位（低位到高位的平方-乘） */
+static void fe_invert(u32 *r, u32 *a)
+{
+    u32 acc[16] = { 0 };
+    u32 base[16] = { 0 };
+    int i = 0;
+
+    fe_1(acc);
+    fe_copy(base, a);
+    for (i = 0; i < 255; i++) {
+        if (i == 0 || i == 1 || i == 3 || i >= 5)
+            fe_mul(acc, acc, base);
+        fe_sq(base, base);
+    }
+    fe_copy(r, acc);
+}
+
+/* 从 32 字节小端解出域元素（清掉最高位） */
+static void fe_frombytes(u32 *r, const u8 *s)
+{
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        r[i] = (u32)s[2 * i] | ((u32)s[2 * i + 1] << 8);
+    r[15] &= 0x7FFF;
+}
+
+/* 编码成 32 字节小端（先规范归约，保证 < p） */
+static void fe_tobytes(u8 *out, u32 *a)
+{
+    u32 r[16] = { 0 };
+    u64 t[32] = { 0 };
+    u32 borrow = 0;
+    u32 tmp[16] = { 0 };
+    int i = 0;
+
+    fe_copy(r, a);
+    /* 先整体进位两轮，把每肢压到 16 位 */
+    for (i = 0; i < 16; i++)
+        t[i] = r[i];
+    fe_reduce(r, t);
+    /* 条件减去 p = 2^255-19（肢 0 是 65536-19 = 65517，其余 65535，肢 15 是 32767） */
+    tmp[0] = 65517U;
+    for (i = 1; i < 15; i++)
+        tmp[i] = 65535U;
+    tmp[15] = 32767U;
+    /* 规范归约最多减两次：归约后的值 < 2^256 < 3p，而 3p > 2^256 说明两次够 */
+    {
+        int pass = 0;
+
+        for (pass = 0; pass < 2; pass++) {
+            u32 d[16] = { 0 };
+
+            borrow = 0;
+            for (i = 0; i < 16; i++) {
+                u32 lhs = r[i];
+                u32 rhs = tmp[i] + borrow;
+                u32 need = lhs < rhs ? 1U : 0U;
+
+                d[i] = (lhs + (need ? 65536U : 0U)) - rhs;
+                borrow = need;
+            }
+            if (borrow)
+                break;              /* r < p：已经规范 */
+            for (i = 0; i < 16; i++)
+                r[i] = d[i];
+        }
+    }
+    for (i = 0; i < 16; i++) {
+        out[2 * i] = (u8)(r[i] & 0xFF);
+        out[2 * i + 1] = (u8)((r[i] >> 8) & 0xFF);
+    }
+}
+
+/* ---- 蒙哥马利阶梯 ---- */
+
+static void x25519_core(u32 *q, const u8 *n, u32 *p)
+{
+    u8 z[32] = { 0 };
+    u32 x[16] = { 0 }, a[16] = { 0 }, b[16] = { 0 }, c[16] = { 0 };
+    u32 d[16] = { 0 }, e[16] = { 0 }, f[16] = { 0 };
+    int i = 0;
+
+    memcpy(z, n, 32);
+    z[31] = (u8)((z[31] & 127) | 64);
+    z[0] &= 248;
+    fe_copy(x, p);
+    fe_copy(b, x);          /* (b,d) = (u, 1)，(a,c) = (1, 0) */
+    fe_1(a);
+    fe_0(c);
+    fe_1(d);
+    for (i = 254; i >= 0; i--) {
+        u32 m = (u32)((z[i >> 3] >> (i & 7)) & 1);
+
+        fe_sel(a, b, m);
+        fe_sel(c, d, m);
+        fe_add(e, a, c);
+        fe_sub(a, a, c);
+        fe_add(c, b, d);
+        fe_sub(b, b, d);
+        fe_sq(d, e);
+        fe_sq(f, a);
+        fe_mul(a, c, a);
+        fe_mul(c, b, e);
+        fe_add(e, a, c);
+        fe_sub(a, a, c);
+        fe_sq(b, a);
+        fe_sub(c, d, f);
+        fe_mul_small(a, c, 121665U);
+        fe_add(a, a, d);
+        fe_mul(c, c, a);
+        fe_mul(a, d, f);
+        fe_mul(d, b, x);
+        fe_sq(b, e);
+        fe_sel(a, b, m);
+        fe_sel(c, d, m);
+    }
+    fe_invert(c, c);
+    fe_mul(a, a, c);
+    fe_copy(q, a);
+}
+
+/* ---- 对外 API ---- */
+
+void clamp(u8 *s)
+{
+    if (!s)
+        return;
+    s[0] &= 248;
+    s[31] = (u8)((s[31] & 127) | 64);
+}
+
+int is_zero(const u8 *b)
+{
+    u8 acc = 0;
+    int i = 0;
+
+    if (!b)
+        return 1;
+    for (i = 0; i < 32; i++)
+        acc |= b[i];
+    return acc == 0 ? 1 : 0;
+}
+
+int x25519(u8 *out, const u8 *scalar, const u8 *point)
+{
+    u32 p[16] = { 0 };
+    u32 q[16] = { 0 };
+
+    if (!out || !scalar || !point)
+        return -1;
+    fe_frombytes(p, point);
+    x25519_core(q, scalar, p);
+    fe_tobytes(out, q);
+    return 1;
+}
+
+int x25519_base(u8 *out, const u8 *scalar)
+{
+    u8 base[32] = { 0 };
+
+    if (!out || !scalar)
+        return -1;
+    base[0] = 9;
+    return x25519(out, scalar, base);
+}
+
+/* ---- 句柄式封装 ---- */
+
+int init(Dh *d, const u8 *secret32)
+{
+    if (!d || !secret32)
+        return -1;
+    memset(d, 0, sizeof *d);
+    memcpy(d->priv, secret32, 32);
+    clamp(d->priv);
+    if (x25519_base(d->pub, d->priv) != 1)
+        return -1;
+    d->ready = 1;
+    return 1;
+}
+
+u8 *public_key(Dh *d)
+{
+    return d ? d->pub : 0;
+}
+
+u8 *private_key(Dh *d)
+{
+    return d ? d->priv : 0;
+}
+
+int is_ready(Dh *d)
+{
+    return d ? d->ready : 0;
+}
+
+int agree(Dh *d, u8 *out, const u8 *peer32)
+{
+    if (!d || !out || !peer32 || !d->ready)
+        return -1;
+    if (x25519(out, d->priv, peer32) != 1)
+        return -1;
+    if (is_zero(out))
+        return 0;               /* 非法公钥：结果全零（RFC 7748 §6.1 要求拒绝） */
+    return 1;
+}
+
+/* ---- 自测 ---- */
+
+static void hex_to(u8 *out, const char *hex, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++) {
+        int hi = hex[2 * i];
+        int lo = hex[2 * i + 1];
+
+        hi = hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10;
+        lo = lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10;
+        out[i] = (u8)((hi << 4) | lo);
+    }
+}
+
+static int hex_eq(const u8 *got, const char *want, int n)
+{
+    u8 w[32] = { 0 };
+
+    hex_to(w, want, n);
+    return memcmp(got, w, (size_t)n) == 0 ? 1 : 0;
+}
+
+test "x25519：RFC 7748 §5.2 向量" {
+    u8 scalar[32] = { 0 }, point[32] = { 0 }, out[32] = { 0 };
+
+    hex_to(scalar, "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4", 32);
+    hex_to(point, "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c", 32);
+    if (x25519(out, scalar, point) != 1)
+        return err(1, "x25519 失败");
+    if (!hex_eq(out, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552", 32))
+        return err(2, "第一组向量不对");
+    hex_to(scalar, "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d", 32);
+    hex_to(point, "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493", 32);
+    if (x25519(out, scalar, point) != 1)
+        return err(3, "x25519 第二次失败");
+    if (!hex_eq(out, "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957", 32))
+        return err(4, "第二组向量不对");
+}
+
+test "x25519：RFC 7748 §6.1 双方一致" {
+    u8 sa[32] = { 0 }, sb[32] = { 0 };
+    u8 ka[32] = { 0 }, kb[32] = { 0 };
+    u8 pa[32] = { 0 }, pb[32] = { 0 };
+    u8 zero[32] = { 0 };
+    u8 allzero[32] = { 0 };
+    Dh a = { { 0 }, { 0 }, 0 };
+    Dh b = { { 0 }, { 0 }, 0 };
+
+    hex_to(sa, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", 32);
+    hex_to(sb, "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb", 32);
+    if (a.init(sa) != 1 || b.init(sb) != 1)
+        return err(5, "init 失败");
+    if (!a.is_ready() || !b.is_ready())
+        return err(6, "is_ready 不对");
+    if (!hex_eq(a.public_key(), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", 32))
+        return err(7, "Alice 公钥不对");
+    if (!hex_eq(b.public_key(), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", 32))
+        return err(8, "Bob 公钥不对");
+    /* 私钥已经被 clamp 过 */
+    if ((a.private_key()[0] & 7) != 0 || (a.private_key()[31] & 0xC0) != 0x40)
+        return err(9, "私钥没有 clamp");
+    if (a.agree(ka, b.public_key()) != 1 || b.agree(kb, a.public_key()) != 1)
+        return err(10, "shared 失败");
+    if (memcmp(ka, kb, 32) != 0)
+        return err(11, "双方共享密钥不一致");
+    if (!hex_eq(ka, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", 32))
+        return err(12, "共享密钥与向量不符");
+    /* 全零公钥要拒绝 */
+    if (a.agree(ka, allzero) != 0)
+        return err(13, "全零公钥应该返回 0");
+    if (x25519(pa, zero, zero) != 1)
+        return err(14, "零标量也应该能算");
+    if (!is_zero(pa))
+        return err(15, "零标量乘零点应该是 0");
+    if (x25519_base(kb, zero) != 1)
+        return err(16, "基点倍乘失败");
+    if (is_zero(kb))
+        return err(17, "clamp(全零) 之后基点的倍乘不该是全零");
+    /* clamp 的边界 */
+    memcpy(pb, sa, 32);
+    clamp(pb);
+    if ((pb[0] & 7) != 0 || (pb[31] & 0xC0) != 0x40)
+        return err(18, "clamp 结果不对");
+}

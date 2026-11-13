@@ -2806,3 +2806,24 @@ Go 的写法**：同一个 1000 路循环，c6 版 40 行，C 状态机版 260 �
 
 验收：`make build`、`make stdtest`（349 个模块、0 failure）、`make std-ub`
 （9 条发现、退出码 1）、`make errcheck`（15 通过）、`make selftest`。
+
+### 11.99 标准库第八十五批（密钥交换 + 传输安全策略 + 抓取许可 + 45 进制）
+
+四个模块都按「结构体方法」写入口，状态型的三家各带一个游标/句柄：
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/net/x25519.c6` | Curve25519 密钥交换（RFC 7748），16×16 位肢域运算、常数时间蒙哥马利阶梯、条件交换用掩码 | 2 | `Dh.init/public_key/private_key/is_ready/agree` |
+| `std/net/hsts.c6` | HSTS 策略库（RFC 6797）：头解析、主机规范化、子域、IP 字面量、过期与撤销（`max-age=0`） | 3 | `HstsStore.init/add/match/remove/find/expired/prune/count` + `HstsDoc.open/next/count/reset` |
+| `std/net/robots.c6` | robots.txt（RFC 9309）：逐行扫描、最长匹配、`*`/`$` 通配、具体 agent 组优先、Sitemap 收集 | 2 | `Robots.init/load/allowed/sitemap/count/dropped` + `RobotsDoc.open/next/count/reset` |
+| `std/encoding/base45.c6` | Base45（RFC 9285）：一次性编解码 + 流式编码器；空格是字符表成员，只有 `\t\n\r\v\f` 跳过 | 5 | `B45Enc.init/put/put_byte/finish/length/ok` |
+
+集成示例 `examples/stdsec.c6`（`make std-sec`）75 条检查，五节：X25519 握手 →
+HSTS 策略 → robots 许可 → base45 指纹 → 四者串联的流水线。`Makefile` 增加
+`std-sec` 与 `STD_SEC_SRCS`（`.PHONY`、help、`test-all`、`check-all` 同步）；
+err 号段补 `std.net.x25519`=0x615d、`std.encoding.base45`=0x615e、
+`std.net.hsts`=0x615f、`std.net.robots`=0x6160（`grammar.md` §8.1 同步）。
+
+`std/` 现在 353 个 `.c6` 文件。各模块的 test 块逐个跑过（2/5/3/2 条，0 failure），
+`make std-sec` 75 checks / 0 failures；整体扫一遍由 `make stdtest` / `make check-all`
+覆盖。

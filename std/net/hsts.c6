@@ -1,0 +1,562 @@
+/* std/net/hsts：HSTS 策略（RFC 6797）——响应头解析 + 内存策略库 + 游标。
+ *
+ *     import std.net.hsts;
+ *
+ *     HstsPolicy p = { 0 };
+ *     hsts_parse("max-age=31536000; includeSubDomains", &p);   // p.max_age=31536000
+ *
+ *     HstsStore s = { 0 };
+ *     s.init();
+ *     s.add("example.com", p.max_age, p.subdomains, now);      // 方法：init/add/match
+ *     s.match("www.example.com", now);                         // 1：要强制 https
+ *
+ *     HstsDoc d = { 0 };
+ *     HstsEntry e = { 0 };
+ *     d.open(&s);                                              // 游标：open/next/count/reset
+ *     while (d.next(&e))
+ *         printf("%s %ld\n", e.host, e.max_age);
+ *
+ * 语义按 RFC 6797 取其要点：
+ *
+ * - `max-age=0` 表示**撤销**这条策略（`add` 就变成删除），不是「立刻过期」；
+ * - `includeSubDomains` 只对**子域**生效（`a.example.com` 命中 `example.com`），
+ *   裸域 `example.com` 不受影响；
+ * - IP 字面量（`127.0.0.1`、`::1`）不适用 HSTS，`match` 一律返回 0；
+ * - 过期判断用调用方给的 `now`（秒，通常是 `time()`），不读时钟——测试和
+ *   多线程都省事；
+ * - 主机名先规范化：小写、去掉末尾的点；不做 punycode（那是 `std/text`
+ *   的活，调用方自己先转）。
+ *
+ * 容量固定（`HSTS_CAP` 条），满了 `add` 返回 -1；策略库本来就是有界缓存，
+ * 需要更大就自己套 `std.container.lru`。
+ */
+#include <string.h>
+
+module std.net.hsts;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define HSTS_CAP 24
+#define HSTS_HOST_MAX 96
+
+struct HstsEntry {
+    char host[HSTS_HOST_MAX];
+    int hostlen;
+    long max_age;               /* 秒；0 不会存进来（等于撤销） */
+    long created;               /* 写入时刻 */
+    int subdomains;             /* includeSubDomains */
+};
+
+struct HstsStore {
+    HstsEntry e[HSTS_CAP];
+    int n;
+    int drops;                  /* 满了之后被拒绝的次数 */
+};
+
+struct HstsDoc {
+    HstsStore *st;
+    int i;
+    int seen;
+};
+
+struct HstsPolicy {
+    int ok;
+    long max_age;
+    int subdomains;
+};
+
+static int hslower(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+static int hseq(char a, char b)
+{
+    return hslower((int)(unsigned char)a) == hslower((int)(unsigned char)b);
+}
+
+static int hseqn(const char *a, const char *b, int n)
+{
+    int i = 0;
+
+    for (i = 0; i < n; i++)
+        if (!a[i] || !b[i] || !hseq(a[i], b[i]))
+            return 0;
+    return 1;
+}
+
+/* 主机名规范化：小写、去末尾点、去空白；返回长度，非法 -1。 */
+int hsts_normalize(char *dst, int cap, const char *src)
+{
+    int n = 0;
+    int end = 0;
+
+    if (!dst || !src || cap < 2)
+        return -1;
+    while (*src == ' ' || *src == '\t')
+        src++;
+    while (src[n] && src[n] != ' ' && src[n] != '\t' && src[n] != '\r'
+           && src[n] != '\n')
+        n++;
+    if (n <= 0 || n >= cap)
+        return -1;
+    end = n;
+    while (end > 1 && src[end - 1] == '.')
+        end--;
+    for (int i = 0; i < end; i++) {
+        if (src[i] == ' ' || src[i] == '\t')
+            return -1;
+        dst[i] = (char)hslower((int)(unsigned char)src[i]);
+    }
+    dst[end] = 0;
+    return end;
+}
+
+/* IP 字面量（IPv4 全是数字点，或含冒号的 IPv6）不适用 HSTS。 */
+int hsts_is_ip_literal(const char *host)
+{
+    int dots = 0;
+    int digits = 0;
+
+    if (!host || !*host)
+        return 0;
+    for (const char *p = host; *p; p++) {
+        if (*p == ':')
+            return 1;
+        if (*p == '.')
+            dots++;
+        else if (*p >= '0' && *p <= '9')
+            digits++;
+        else
+            return 0;
+    }
+    return dots == 3 && digits >= 4;
+}
+
+/* 响应头解析：`max-age=<秒>`（必须）+ `includeSubDomains`（可选）。 */
+int hsts_parse(const char *text, HstsPolicy *p)
+{
+    const char *s = text;
+    int got_age = 0;
+
+    if (!p)
+        return -1;
+    memset(p, 0, sizeof *p);
+    if (!s)
+        return 0;
+    while (*s) {
+        const char *key = 0;
+        int klen = 0;
+
+        while (*s == ';' || *s == ' ' || *s == '\t' || *s == ',')
+            s++;
+        if (!*s)
+            break;
+        key = s;
+        while (*s && *s != '=' && *s != ';' && *s != ' ' && *s != '\t'
+               && *s != ',')
+            s++;
+        klen = (int)(s - key);
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (*s == '=') {
+            const char *v = 0;
+            int vlen = 0;
+
+            s++;
+            while (*s == ' ' || *s == '\t')
+                s++;
+            if (*s == '"') {
+                s++;
+                v = s;
+                while (*s && *s != '"')
+                    s++;
+                vlen = (int)(s - v);
+                if (*s == '"')
+                    s++;
+            } else {
+                v = s;
+                while (*s && *s != ';' && *s != ',' && *s != ' '
+                       && *s != '\t')
+                    s++;
+                vlen = (int)(s - v);
+            }
+            if (klen == 7 && hseqn(key, "max-age", 7)) {
+                long age = 0;
+                int i = 0;
+                int okdigit = vlen > 0;
+
+                for (i = 0; i < vlen; i++) {
+                    if (v[i] < '0' || v[i] > '9') {
+                        okdigit = 0;
+                        break;
+                    }
+                    age = age * 10 + (v[i] - '0');
+                }
+                if (okdigit) {
+                    got_age = 1;
+                    p->max_age = age;
+                }
+            }
+            continue;
+        }
+        if (klen == 17 && hseqn(key, "includesubdomains", 17)) {
+            p->subdomains = 1;
+            continue;
+        }
+        /* 其它指令（preload 等）忽略 */
+    }
+    p->ok = got_age;
+    return got_age ? 1 : 0;
+}
+
+/* ---- 策略库（方法风格） ---- */
+
+void init(HstsStore *s)
+{
+    if (!s)
+        return;
+    memset(s, 0, sizeof *s);
+}
+
+int clear(HstsStore *s)
+{
+    if (!s)
+        return -1;
+    memset(s, 0, sizeof *s);
+    return 0;
+}
+
+int count(HstsStore *s)
+{
+    return s ? s->n : -1;
+}
+
+int dropped(HstsStore *s)
+{
+    return s ? s->drops : -1;
+}
+
+/* 查找（返回下标或 -1）；不看过期，调用方自己判。 */
+int find(HstsStore *s, const char *host)
+{
+    char norm[HSTS_HOST_MAX] = { 0 };
+    int n = 0;
+
+    if (!s || !host)
+        return -1;
+    n = hsts_normalize(norm, sizeof norm, host);
+    if (n <= 0)
+        return -1;
+    for (int i = 0; i < s->n; i++)
+        if (s->e[i].hostlen == n && memcmp(s->e[i].host, norm, n) == 0)
+            return i;
+    return -1;
+}
+
+static void hsts_del_at(HstsStore *s, int idx)
+{
+    int i = 0;
+
+    for (i = idx; i + 1 < s->n; i++)
+        s->e[i] = s->e[i + 1];
+    s->n--;
+    memset(&s->e[s->n], 0, sizeof s->e[s->n]);
+}
+
+/* 写入/更新一条策略。max_age=0 表示撤销；返回 1 写入，0 撤销，-1 失败。 */
+int add(HstsStore *s, const char *host, long max_age, int subdomains, long now)
+{
+    char norm[HSTS_HOST_MAX] = { 0 };
+    int n = 0;
+    int idx = 0;
+
+    if (!s || !host || max_age < 0)
+        return -1;
+    n = hsts_normalize(norm, sizeof norm, host);
+    if (n <= 0)
+        return -1;
+    idx = find(s, host);
+    if (max_age == 0) {
+        if (idx >= 0) {
+            hsts_del_at(s, idx);
+            return 0;               /* 撤销 */
+        }
+        return 0;
+    }
+    if (idx >= 0) {
+        s->e[idx].max_age = max_age;
+        s->e[idx].created = now;
+        s->e[idx].subdomains = subdomains ? 1 : 0;
+        return 1;
+    }
+    if (s->n >= HSTS_CAP) {
+        s->drops++;
+        return -1;
+    }
+    s->e[s->n].hostlen = n;
+    memcpy(s->e[s->n].host, norm, (size_t)n + 1);
+    s->e[s->n].max_age = max_age;
+    s->e[s->n].created = now;
+    s->e[s->n].subdomains = subdomains ? 1 : 0;
+    s->n++;
+    return 1;
+}
+
+/* 显式删除；返回 1 删掉了，0 本来就没有。 */
+int remove(HstsStore *s, const char *host)
+{
+    int idx = find(s, host);
+
+    if (idx < 0)
+        return 0;
+    hsts_del_at(s, idx);
+    return 1;
+}
+
+static int hsts_live(HstsEntry *e, long now)
+{
+    if (!e || e->max_age <= 0)
+        return 0;
+    if (now < e->created)
+        return 0;               /* 时钟倒退：不信，按过期处理 */
+    return now - e->created < e->max_age;
+}
+
+int expired(HstsStore *s, long now)
+{
+    int bad = 0;
+
+    if (!s)
+        return -1;
+    for (int i = 0; i < s->n; i++)
+        if (!hsts_live(&s->e[i], now))
+            bad++;
+    return bad;
+}
+
+/* 清掉过期的；返回清掉的条数。 */
+int prune(HstsStore *s, long now)
+{
+    int removed = 0;
+    int i = 0;
+
+    if (!s)
+        return -1;
+    while (i < s->n) {
+        if (!hsts_live(&s->e[i], now)) {
+            hsts_del_at(s, i);
+            removed++;
+            continue;
+        }
+        i++;
+    }
+    return removed;
+}
+
+/* 这条主机名要不要强制 https。1 = 要，0 = 不用。 */
+int match(HstsStore *s, const char *host, long now)
+{
+    char norm[HSTS_HOST_MAX] = { 0 };
+    int n = 0;
+
+    if (!s || !host)
+        return 0;
+    n = hsts_normalize(norm, sizeof norm, host);
+    if (n <= 0 || hsts_is_ip_literal(norm))
+        return 0;
+    for (int i = 0; i < s->n; i++) {
+        HstsEntry *e = &s->e[i];
+
+        if (!hsts_live(e, now))
+            continue;
+        if (e->hostlen == n && memcmp(e->host, norm, n) == 0)
+            return 1;
+        if (e->subdomains && n > e->hostlen + 1
+            && norm[n - e->hostlen - 1] == '.'
+            && memcmp(norm + n - e->hostlen, e->host, e->hostlen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* ---- 游标：open / next / count / reset ---- */
+
+int open(HstsDoc *d, HstsStore *s)
+{
+    if (!d || !s)
+        return -1;
+    d->st = s;
+    d->i = 0;
+    d->seen = 0;
+    return 0;
+}
+
+/* 取下一条；取到返回 1（写进 out），到底返回 0。 */
+int next(HstsDoc *d, HstsEntry *out)
+{
+    if (!d || !d->st || d->i >= d->st->n)
+        return 0;
+    if (out)
+        *out = d->st->e[d->i];
+    d->i++;
+    d->seen++;
+    return 1;
+}
+
+int count(HstsDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(HstsDoc *d)
+{
+    if (!d)
+        return;
+    d->i = 0;
+    d->seen = 0;
+}
+
+/* ---- 自测 ---- */
+
+test "HSTS：响应头解析" {
+    HstsPolicy p = { 0 };
+
+    if (hsts_parse("max-age=31536000", &p) != 1 || p.max_age != 31536000
+        || p.subdomains != 0)
+        return err(1, "基本头解析不对");
+    if (hsts_parse("max-age=31536000; includeSubDomains", &p) != 1
+        || p.subdomains != 1)
+        return err(2, "includeSubDomains 没识别");
+    if (hsts_parse("  MAX-AGE=60 ; includesubdomains ", &p) != 1
+        || p.max_age != 60 || p.subdomains != 1)
+        return err(3, "大小写与空白应容忍");
+    if (hsts_parse("max-age=\"120\"; preload", &p) != 1 || p.max_age != 120)
+        return err(4, "引号值与未知指令应处理");
+    if (hsts_parse("includeSubDomains", &p) != 0 || p.ok != 0)
+        return err(5, "缺 max-age 应判失败");
+    if (hsts_parse("max-age=abc", &p) != 0)
+        return err(6, "非数字 max-age 应判失败");
+    if (hsts_parse(0, &p) != 0)
+        return err(7, "空头应判失败");
+}
+
+test "HSTS：存储、精确匹配与子域" {
+    HstsStore s = { 0 };
+    HstsEntry e = { 0 };
+    HstsDoc d = { 0 };
+    long now = 1000000;
+
+    s.init();
+    if (s.count() != 0)
+        return err(1, "初始应为空");
+    if (s.add("Example.COM", 3600, 1, now) != 1)
+        return err(2, "写入失败");
+    if (s.count() != 1)
+        return err(3, "写入后应有 1 条");
+    /* 规范化：大小写与末尾点 */
+    if (s.match("example.com", now) != 1)
+        return err(4, "精确匹配失败");
+    if (s.match("EXAMPLE.com.", now) != 1)
+        return err(5, "大小写/末尾点应规范化");
+    /* includeSubDomains 生效 */
+    if (s.match("www.example.com", now) != 1)
+        return err(6, "子域应命中");
+    if (s.match("a.b.example.com", now) != 1)
+        return err(7, "多级子域应命中");
+    /* 别的主机不命中 */
+    if (s.match("example.org", now) != 0)
+        return err(8, "别的主机不该命中");
+    if (s.match("notexample.com", now) != 0)
+        return err(9, "后缀相近但不带点的名字不该命中");
+    /* IP 字面量不适用 */
+    if (s.match("127.0.0.1", now) != 0 || s.match("::1", now) != 0)
+        return err(10, "IP 字面量不该命中");
+    /* 不带 includeSubDomains 时子域不命中 */
+    if (s.add("no-sub.test", 600, 0, now) != 1)
+        return err(11, "第二条写入失败");
+    if (s.match("no-sub.test", now) != 1 || s.match("x.no-sub.test", now) != 0)
+        return err(12, "不带 includeSubDomains 时子域不该命中");
+    /* 游标 */
+    d.open(&s);
+    if (d.count() != 0)
+        return err(13, "游标初始计数应为 0");
+    if (d.next(&e) != 1 || strcmp(e.host, "example.com") != 0)
+        return err(14, "第一条应是 example.com");
+    if (d.next(&e) != 1 || strcmp(e.host, "no-sub.test") != 0)
+        return err(15, "第二条应是 no-sub.test");
+    if (d.next(&e) != 0)
+        return err(16, "取完之后应返回 0");
+    if (d.count() != 2)
+        return err(17, "游标计数应为 2");
+    d.reset();
+    if (d.next(&e) != 1 || d.count() != 1)
+        return err(18, "reset 之后应从头开始");
+}
+
+test "HSTS：过期、撤销、容量与游标" {
+    HstsStore s = { 0 };
+    HstsDoc d = { 0 };
+    HstsEntry e = { 0 };
+    long now = 5000000;
+
+    s.init();
+    if (s.add("short.test", 100, 0, now) != 1)
+        return err(1, "写入失败");
+    if (s.match("short.test", now + 99) != 1)
+        return err(2, "还没过期应命中");
+    if (s.match("short.test", now + 100) != 0)
+        return err(3, "到点应算过期");
+    if (s.match("short.test", now - 1) != 0)
+        return err(4, "时钟倒退按过期处理");
+    if (s.expired(now + 1000) != 1)
+        return err(5, "过期计数应为 1");
+    /* max-age=0 撤销 */
+    if (s.add("short.test", 0, 0, now) != 0)
+        return err(6, "max-age=0 应撤销");
+    if (s.count() != 0)
+        return err(7, "撤销后应为空");
+    if (s.remove("nope.test") != 0)
+        return err(8, "删不存在的主机应返回 0");
+    /* prune 清掉过期的 */
+    if (s.add("a.test", 10, 0, now) != 1 || s.add("b.test", 100000, 0, now) != 1)
+        return err(9, "两条写入失败");
+    if (s.prune(now + 20) != 1 || s.count() != 1)
+        return err(10, "prune 应清掉 1 条");
+    /* 容量：写满 HSTS_CAP 条后再写应失败并计数 */
+    s.clear();
+    for (int i = 0; i < HSTS_CAP; i++) {
+        char host[32] = { 0 };
+
+        host[0] = 'h';
+        host[1] = (char)('a' + i % 26);
+        host[2] = (char)('a' + i / 26);
+        host[3] = 0;
+        if (s.add(host, 3600, 0, now) != 1)
+            return err(11, "写满之前不该失败");
+    }
+    if (s.count() != HSTS_CAP)
+        return err(12, "应正好写满");
+    if (s.add("overflow.test", 3600, 0, now) != -1 || s.dropped() != 1)
+        return err(13, "超容量应失败并计数");
+    /* 满了以后更新已有条目仍然可以 */
+    if (s.add("haa", 7200, 0, now) != 1)
+        return err(14, "满了也应能更新已有条目");
+    /* 游标走完一遍 */
+    d.open(&s);
+    {
+        int n = 0;
+
+        while (d.next(&e))
+            n++;
+        if (n != HSTS_CAP || d.count() != HSTS_CAP)
+            return err(15, "游标应走完所有条目");
+    }
+    {
+        char small[4] = { 0 };
+
+        if (hsts_normalize(small, sizeof small, "toolong.test") != -1)
+            return err(16, "规范化容量不足应失败");
+    }
+}

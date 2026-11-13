@@ -1,0 +1,477 @@
+/* std/encoding/base45：Base45（RFC 9285）编解码，外加一个流式编码器。
+ *
+ *     import std.encoding.base45;
+ *
+ *     char out[32] = { 0 };
+ *     int n = b45_encode(ab, 2, out, sizeof out);      // 3, "BB8"
+ *     b45_decode((char[:]){ out, n }, back, sizeof back);  // 2, "AB"
+ *
+ * Base45 是把**字节对**当成 16 位大端整数拆成三位的 45 进制：`v = c0 + c1*45
+ * + c2*45*45`，所以输出低位的字符在前；落单的最后一个字节只占两位。字符表是
+ * `0-9 A-Z 空格 $ % * + - . / :`——正好是二维码 alphanumeric 模式能装的 45 个
+ * 字符，这也是它存在的理由（EU DCC 的二维码就用它）。
+ *
+ * 和 `std.encoding.base32/base58` 同一个口径：**不分配**，结果写调用方缓冲，
+ * 放不下返回 -1 且一个字节都不写。解码先完整校验（`b45_decoded_len`）再写第二
+ * 遍，非法输入不会留下半截结果；`\t`/`\n`/`\r`/`\v`/`\f` 一律跳过（QR 分块
+ * 常见），但**空格不能跳**——它是字符表的第 36 个成员，跳了就把数据吃掉了。
+ * 长度一律按字符算，不看 `\0`。
+ *
+ * 流式编码器 `B45Enc` 用方法调用：`e.init(buf, cap)` / `e.put(src, n)` /
+ * `e.put_byte(c)` / `e.finish()` / `e.length()` / `e.ok()`。分多少次喂进来，
+ * 输出都和一次性编码逐字节一致（内部记住落单的那个字节）。
+ */
+#include <string.h>
+
+module std.encoding.base45;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+static char *b45_tab(void)
+{
+    return (char *)"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+}
+
+/* 字符 -> 0..44；非法给 -1。小写不接受（RFC 9285 只有大写）。 */
+static int b45_val(int c)
+{
+    static const char *tab = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+    int i = 0;
+
+    for (i = 0; i < 45; i++)
+        if (tab[i] == c)
+            return i;
+    return -1;
+}
+
+/* 只有「不在字符表里」的空白才跳过：空格本身是 base45 的第 36 个字符，
+   不能当分隔符吃掉。 */
+static int b45_space(int c)
+{
+    return c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+/* 编码后的字符数：每两个字节 3 个字符，落单一个字节 2 个。 */
+int b45_encoded_len(int n)
+{
+    if (n < 0)
+        return -1;
+    return (n / 2) * 3 + (n % 2) * 2;
+}
+
+/* 一次性编码；cap 不够返回 -1 且不写。 */
+int b45_encode(const u8 *src, int n, char *dst, int cap)
+{
+    char *tab = b45_tab();
+    int need = b45_encoded_len(n);
+    int i = 0;
+    int o = 0;
+
+    if (n < 0 || need < 0 || need > cap || (n > 0 && !src) || (need > 0 && !dst))
+        return -1;
+    while (i + 1 < n) {
+        int v = ((int)src[i] << 8) | (int)src[i + 1];
+
+        dst[o++] = tab[v % 45];
+        dst[o++] = tab[(v / 45) % 45];
+        dst[o++] = tab[v / 2025];
+        i += 2;
+    }
+    if (i < n) {
+        int v = (int)src[i];
+
+        dst[o++] = tab[v % 45];
+        dst[o++] = tab[v / 45];
+    }
+    return o;
+}
+
+/* 校验并给出解码后的字节数；非法返回 -1。 */
+int b45_decoded_len(char[:] s)
+{
+    int i = 0;
+    int used = 0;
+    int chars = 0;
+
+    if (s.len < 0)
+        return -1;
+    while (i < s.len) {
+        int c = (int)(unsigned char)s.data[i];
+
+        if (b45_space(c)) {
+            i++;
+            continue;
+        }
+        if (b45_val(c) < 0)
+            return -1;
+        chars++;
+        i++;
+    }
+    if (chars % 3 == 1)
+        return -1;          /* 一个字符凑不出任何东西 */
+    used = chars;
+    if (used % 3 == 2) {
+        int a = 0, b = 0, k = 0, v = 0;
+
+        for (i = s.len - 1; i >= 0 && k < 2; i--) {
+            int c = (int)(unsigned char)s.data[i];
+
+            if (b45_space(c))
+                continue;
+            if (k == 0)
+                b = b45_val(c);
+            else
+                a = b45_val(c);
+            k++;
+        }
+        v = a + b * 45;
+        if (v > 255)
+            return -1;      /* 两位越界 */
+        return chars / 3 * 2 + 1;
+    }
+    /* 每个三位组都要落在 16 位内 */
+    {
+        int k = 0;
+        int a = 0, b = 0, c2 = 0;
+
+        for (i = 0; i < s.len; i++) {
+            int c = (int)(unsigned char)s.data[i];
+
+            if (b45_space(c))
+                continue;
+            if (k == 0)
+                a = b45_val(c);
+            else if (k == 1)
+                b = b45_val(c);
+            else
+                c2 = b45_val(c);
+            k++;
+            if (k == 3) {
+                int v = a + b * 45 + c2 * 2025;
+
+                if (v > 65535)
+                    return -1;
+                k = 0;
+            }
+        }
+    }
+    return chars / 3 * 2;
+}
+
+int b45_valid(char[:] s)
+{
+    return b45_decoded_len(s) >= 0;
+}
+
+/* 一次性解码；cap 不够或输入非法返回 -1 且不写。 */
+int b45_decode(char[:] s, u8 *dst, int cap)
+{
+    int need = b45_decoded_len(s);
+    int i = 0;
+    int o = 0;
+    int a = 0, b = 0, c2 = 0, k = 0;
+
+    if (need < 0 || need > cap || (need > 0 && !dst) || s.len < 0)
+        return -1;
+    while (i < s.len) {
+        int c = (int)(unsigned char)s.data[i];
+
+        if (b45_space(c)) {
+            i++;
+            continue;
+        }
+        if (k == 0)
+            a = b45_val(c);
+        else if (k == 1)
+            b = b45_val(c);
+        else
+            c2 = b45_val(c);
+        k++;
+        i++;
+        if (k == 3) {
+            int v = a + b * 45 + c2 * 2025;
+
+            if (v > 65535)
+                return -1;
+            dst[o++] = (u8)(v >> 8);
+            dst[o++] = (u8)(v & 0xff);
+            k = 0;
+        }
+    }
+    if (k == 2) {
+        int v = a + b * 45;
+
+        if (v > 255)
+            return -1;
+        dst[o++] = (u8)v;
+    } else if (k == 1) {
+        return -1;
+    }
+    return o;
+}
+
+/* ---- 流式编码器（方法风格） ---- */
+
+struct B45Enc {
+    char *out;                  /* 调用方缓冲 */
+    int cap;                    /* 容量 */
+    int n;                      /* 已写字符数 */
+    int pend;                   /* 落单的那个字节（-1 表示没有） */
+    int bad;                    /* 已经失败过 */
+};
+
+void init(B45Enc *e, char *out, int cap)
+{
+    if (!e)
+        return;
+    e->out = out;
+    e->cap = cap;
+    e->n = 0;
+    e->pend = -1;
+    e->bad = (out == 0 || cap < 0) ? 1 : 0;
+}
+
+void reset(B45Enc *e)
+{
+    if (!e)
+        return;
+    e->n = 0;
+    e->pend = -1;
+    e->bad = (e->out == 0 || e->cap < 0) ? 1 : 0;
+}
+
+static void b45_enc_emit(B45Enc *e, int v, int count)
+{
+    char *tab = b45_tab();
+
+    if (e->bad)
+        return;
+    if (e->n + count > e->cap) {
+        e->bad = 1;
+        return;
+    }
+    if (count == 3) {
+        e->out[e->n] = tab[v % 45];
+        e->out[e->n + 1] = tab[(v / 45) % 45];
+        e->out[e->n + 2] = tab[v / 2025];
+    } else {
+        e->out[e->n] = tab[v % 45];
+        e->out[e->n + 1] = tab[v / 45];
+    }
+    e->n += count;
+}
+
+/* 喂一段字节；返回累计写入的字符数，失败后恒为 -1。 */
+int put(B45Enc *e, const u8 *src, int n)
+{
+    int i = 0;
+
+    if (!e || e->bad)
+        return -1;
+    if (n < 0 || (n > 0 && !src)) {
+        e->bad = 1;
+        return -1;
+    }
+    while (i < n) {
+        if (e->pend >= 0) {
+            b45_enc_emit(e, (e->pend << 8) | (int)src[i], 3);
+            e->pend = -1;
+            i++;
+            continue;
+        }
+        if (i + 1 < n) {
+            b45_enc_emit(e, ((int)src[i] << 8) | (int)src[i + 1], 3);
+            i += 2;
+            continue;
+        }
+        e->pend = (int)src[i];
+        i++;
+    }
+    return e->bad ? -1 : e->n;
+}
+
+/* 喂一个字节；返回累计写入的字符数，失败后恒为 -1。 */
+int put_byte(B45Enc *e, int c)
+{
+    u8 b = (u8)(c & 0xff);
+
+    return put(e, &b, 1);
+}
+
+/* 收尾：把落单字节补成两位。之后才能读 length()。 */
+int finish(B45Enc *e)
+{
+    if (!e || e->bad)
+        return -1;
+    if (e->pend >= 0) {
+        b45_enc_emit(e, e->pend, 2);
+        e->pend = -1;
+    }
+    return e->bad ? -1 : e->n;
+}
+
+int length(B45Enc *e)
+{
+    return e ? (e->bad ? -1 : e->n) : -1;
+}
+
+int ok(B45Enc *e)
+{
+    return e && !e->bad && e->pend < 0;
+}
+
+/* ---- 自测 ---- */
+
+static char[:] sl(const char *src)
+{
+    return (char[:]){ (char *)src, (int)strlen(src) };
+}
+
+test "RFC 9285 的四个向量：编码" {
+    char out[32] = { 0 };
+
+    if (b45_encode((const u8 *)"AB", 2, out, sizeof out) != 3
+        || memcmp(out, "BB8", 3) != 0)
+        return err(1, "AB 的向量不对");
+    if (b45_encode((const u8 *)"Hello!!", 7, out, sizeof out) != 11
+        || memcmp(out, "%69 VD92EX0", 11) != 0)
+        return err(2, "Hello!! 的向量不对");
+    if (b45_encode((const u8 *)"base-45", 7, out, sizeof out) != 11
+        || memcmp(out, "UJCLQE7W581", 11) != 0)
+        return err(3, "base-45 的向量不对");
+    if (b45_encode((const u8 *)"ietf!", 5, out, sizeof out) != 8
+        || memcmp(out, "QED8WEX0", 8) != 0)
+        return err(4, "ietf! 的向量不对");
+}
+
+test "RFC 9285 的四个向量：解码与回环" {
+    char out[32] = { 0 };
+    u8 buf[32] = { 0 };
+    char again[32] = { 0 };
+
+    if (b45_decode(sl("BB8"), buf, sizeof buf) != 2 || memcmp(buf, "AB", 2) != 0)
+        return err(1, "BB8 解码不对");
+    if (b45_decode(sl("%69 VD92EX0"), buf, sizeof buf) != 7
+        || memcmp(buf, "Hello!!", 7) != 0)
+        return err(2, "Hello!! 解码不对（空格是字符表里的第 36 个字符）");
+    /* 制表符/换行不是字符表成员，可以当分隔符跳过 */
+    if (b45_decode(sl("BB8\nBB8"), buf, sizeof buf) != 4
+        || memcmp(buf, "ABAB", 4) != 0)
+        return err(3, "换行应被跳过");
+    if (b45_decode(sl("UJCLQE7W581"), buf, sizeof buf) != 7
+        || memcmp(buf, "base-45", 7) != 0)
+        return err(3, "base-45 解码不对");
+    if (b45_decode(sl("QED8WEX0"), buf, sizeof buf) != 5
+        || memcmp(buf, "ietf!", 5) != 0)
+        return err(4, "ietf! 解码不对");
+    /* 回环：任意 8 字节 */
+    {
+        u8 src[8] = { 0, 1, 2, 0xfe, 0xff, 0x7f, 0x80, 0x55 };
+        int n = b45_encode(src, 8, out, sizeof out);
+
+        if (n != 12)
+            return err(5, "8 字节应编成 12 个字符");
+        if (b45_decode((char[:]){ out, n }, buf, sizeof buf) != 8
+            || memcmp(buf, src, 8) != 0)
+            return err(6, "8 字节回环不对");
+    }
+}
+
+test "流式编码器与一次性编码逐字节一致" {
+    u8 src[7] = { 'b', 'a', 's', 'e', '-', '4', '5' };
+    char one[32] = { 0 };
+    char two[32] = { 0 };
+    B45Enc e = { 0 };
+    int total = 0;
+
+    if (b45_encode(src, 7, one, sizeof one) != 11)
+        return err(1, "一次性编码失败");
+
+    /* 分片：1 + 1 + 2 + 3 字节 */
+    e.init(two, sizeof two);
+    total = e.put(src, 1);
+    if (total != 0)
+        return err(2, "一个字节时还不该写出字符");
+    total = e.put(src + 1, 1);
+    if (total != 3)
+        return err(3, "两个字节应写出 3 个字符");
+    total = e.put(src + 2, 2);
+    if (total != 6)
+        return err(4, "四个字节应写出 6 个字符");
+    total = e.put(src + 4, 3);
+    if (total != 9)
+        return err(5, "前六个字节应写出 9 个字符");
+    if (e.finish() != 11)
+        return err(6, "收尾后长度不对（落单字节补两位）");
+    if (!e.ok())
+        return err(7, "ok() 应为真");
+    if (memcmp(one, two, 11) != 0)
+        return err(8, "流式输出与一次性不一致");
+
+    /* 逐字节喂，含奇数长度 */
+    e.init(two, sizeof two);
+    for (int i = 0; i < 7; i++) {
+        int got = e.put_byte(src[i]);
+
+        if (got < 0)
+            return err(9, "put_byte 失败");
+    }
+    if (e.finish() != 11 || memcmp(one, two, 11) != 0)
+        return err(10, "逐字节喂的结果不一致");
+}
+
+test "非法输入与容量" {
+    char out[8] = { 0 };
+    u8 buf[8] = { 0 };
+    B45Enc e = { 0 };
+
+    /* 小写不接受 */
+    if (b45_valid(sl("bb8")))
+        return err(1, "小写不该通过");
+    /* 非字符表字符 */
+    if (b45_valid(sl("BB8!")))
+        return err(2, "感叹号不该通过");
+    /* 单字符尾巴凑不出东西 */
+    if (b45_valid(sl("BB8B")))
+        return err(3, "单字符尾巴不该通过");
+    /* 三位组越界：':' 是最高的 44，44 + 44*45 + 44*2025 = 91124 > 65535 */
+    if (b45_valid(sl(":::")))
+        return err(4, "三位组越界不该通过");
+    /* 两位组越界：':' ':' = 44 + 44*45 = 2024 > 255 */
+    if (b45_valid(sl("::")))
+        return err(5, "两位组越界不该通过");
+    /* 空输入 */
+    if (b45_encoded_len(0) != 0 || !b45_valid(sl("")))
+        return err(6, "空输入应是合法的空结果");
+    if (b45_encode((const u8 *)"", 0, out, sizeof out) != 0)
+        return err(7, "空输入编码结果应为 0");
+    /* 容量不足：一个字节都不写 */
+    memset(out, 'x', sizeof out);
+    if (b45_encode((const u8 *)"base-45", 7, out, 10) != -1 || out[0] != 'x')
+        return err(8, "容量不足应返回 -1 且不写");
+    /* 解码容量不足 */
+    if (b45_decode(sl("UJCLQE7W581"), buf, 6) != -1)
+        return err(9, "解码容量不足应返回 -1");
+    /* 流式缓冲溢出后 ok() 为假 */
+    e.init(out, 2);
+    if (e.put((const u8 *)"AB", 2) >= 0)
+        return err(10, "缓冲只有 2 字节却写出了 3 个字符");
+    if (e.ok() || e.length() != -1)
+        return err(11, "溢出后 ok()/length() 应报错");
+}
+
+test "长度函数" {
+    if (b45_encoded_len(0) != 0 || b45_encoded_len(1) != 2
+        || b45_encoded_len(2) != 3 || b45_encoded_len(3) != 5
+        || b45_encoded_len(4) != 6)
+        return err(1, "编码长度不对");
+    if (b45_decoded_len(sl("BB8")) != 2 || b45_decoded_len(sl("::")) != -1
+        || b45_decoded_len(sl("")) != 0)
+        return err(2, "解码长度不对");
+    if (b45_decoded_len(sl("BB8\tBB8")) != 4)
+        return err(3, "制表符不计长度");
+    /* 空格是合法字符，所以它是数据，不是分隔符 */
+    if (b45_decoded_len(sl("BB8 0")) != 3)
+        return err(4, "空格应作为数据参与解码（4 个字符 + 空格 = 3 字节）");
+}

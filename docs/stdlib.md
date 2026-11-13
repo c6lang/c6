@@ -532,6 +532,7 @@
 | `examples/stdhttps.c6` | （无模块） | 第八十二批的拼装示例（`make std-https`）：密钥调度对参考值、同步/异步 HTTPS 明文与加密往返、以及 async 框架开销指标 |
 | `examples/stdasync5.c6` | （无模块） | 第八十三批的拼装示例（`make std-async5`）：额度、任务组、预算、协作取消四个横切面各一节，最后打框架开销指标 |
 | `examples/stdub.c6` | （无模块） | 第八十四批（静态分析三件套）的拼装示例（`make std-ub`）：用 lex/parse/ub 分析一段 9 处 UB 的演示源码，按 `文件:行:列: 一定/可能 [UB-XXX] 标题` 打印，每条附「修法」与可直接粘贴的「代码」 |
+| `examples/stdsec.c6` | （无模块） | 第八十五批（密钥交换 + 安全策略）的拼装示例（`make std-sec`）：X25519 握手、HSTS 策略库、robots 许可、base45 指纹各一节，最后串成一条「响应头 → 策略 → 许可 → 指纹」的流水线（75 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4470,6 +4471,75 @@ stdub: 演示样例共 9 条（一定 8、可能 1）
 退出码：`0` 干净、`1` 有「一定」级问题、`2` 用法/读文件错误（「可能」级不改变退出码，
 适合放进 CI 的 `-Werror` 位置）。检查项、可信度口径、抑制写法（`// c6ub-ignore`
 或 `// c6ub-ignore UB-DIV0`）和全部限制见 [ubcheck.md](ubcheck.md)。
+### 第八十五批：密钥交换与安全策略（`x25519` / `hsts` / `robots` / `base45`）
+
+四个模块都以「结构体方法」为主入口，状态型的三家还各带一个游标/句柄：
+
+**`std/net/x25519.c6`（Curve25519 密钥交换，RFC 7748）**——16 个 16 位肢的域运算 +
+常数时间蒙哥马利阶梯（条件交换用掩码，不用分支）。
+
+```c
+Dh alice = { { 0 }, { 0 }, 0 };
+alice.init(secret32);                 // clamp + 算公钥
+alice.agree(shared, bob.public_key()); // 全零结果（非法公钥）返回 0
+alice.is_ready() / alice.private_key() / alice.public_key();
+x25519(out, scalar, point) / x25519_base(out, scalar) / clamp(s) / is_zero(b);
+```
+
+**`std/net/hsts.c6`（RFC 6797 策略库）**——解析 `Strict-Transport-Security`，按主机名
+（含子域、IP 字面量、时钟倒退）判定要不要强制 https：
+
+```c
+HstsPolicy p = { 0 };
+hsts_parse("max-age=31536000; includeSubDomains", &p);
+HstsStore st = { 0 };
+st.init();
+st.add("example.com", p.max_age, p.subdomains, now);   // max_age=0 表示撤销
+st.match("www.example.com", now);                      // 1
+st.expired(now) / st.prune(now) / st.remove(h) / st.find(h) / st.count();
+HstsDoc d = { 0 }; HstsEntry e = { 0 };
+d.open(&st); while (d.next(&e)) { /* e.host / e.max_age / e.subdomains */ }
+d.count() / d.reset();
+```
+
+**`std/net/robots.c6`（RFC 9309 抓取许可）**——逐行扫描器 + 最长匹配判定（支持 `*`
+与结尾 `$`，同长度 Allow 赢，具体 agent 组优先于 `*`）：
+
+```c
+Robots rb = { 0 };
+rb.init();
+rb.load(text, len, "c6bot");
+rb.allowed("/admin/x");        // 0
+rb.sitemap_count() / rb.sitemap(i) / rb.count() / rb.dropped();
+RobotsDoc d = { 0 }; RobotsLine ln = { 0 };
+d.open(text, len); while (d.next(&ln)) { /* ln.key / ln.val / ln.lineno */ }
+```
+
+**`std/encoding/base45.c6`（RFC 9285）**——45 进制（QR 的 alphanumeric 字符表），
+一次性编解码 + 流式编码器 `B45Enc`：
+
+```c
+char out[32]; u8 back[32];
+b45_encode((const u8 *)"Hello!!", 7, out, sizeof out);   // 11, "%69 VD92EX0"
+b45_decode((char[:]){ out, 11 }, back, sizeof back);      // 7
+B45Enc e = { 0 };
+e.init(buf, cap); e.put(src, n); e.put_byte(c); e.finish(); e.length() / e.ok();
+```
+
+两条容易踩的坑写进了测试：**空格是 base45 的第 36 个字符**（不能当分隔符跳过，只有
+`\t\n\r\v\f` 才跳）；**`max-age=0` 在 HSTS 里是「撤销」而不是「立刻过期」**。
+
+### 集成示例：`examples/stdsec.c6`
+
+```sh
+make std-sec
+```
+
+五节：X25519 双方算公钥/共享密钥一致、全零公钥被拒、clamp 三位检查；HSTS 的头解析
+（缺 `max-age` 判失败）、大小写与末尾点规范化、子域命中、过期与 `prune`、游标遍历、
+`max-age=0` 撤销；robots 的最长匹配、`$` 锚定、更长的 Allow 反超、sitemap 收集与
+游标行号；base45 的四个 RFC 向量、流式与一次性逐字节一致、非法输入与容量；最后把
+「响应头 → 策略 → 抓取许可 → 共享密钥 base45 指纹」串成一条流水线（75 条检查）。
 
 ## 相关回归用例
 

@@ -1,6 +1,6 @@
 #!/bin/sh
-# 六语言异步编程基准：c6 / C(state machine) / C(pthread) / C++20 协程 /
-# Go / Rust(async) / Rust(std 线程) / Uya(@async_fn + @await)。
+# 多语言异步编程基准：c6 / C(state machine) / C(pthread) / C++20 协程 /
+# Go / Rust(async 手写执行器) / Rust(std 线程) / Rust(tokio) / Uya(@async_fn)。
 # c6/C/C++/Go/Rust 按 BENCH_SEC 分三段各跑一次（每个指标一个干净进程，RSS
 # 增量才有意义）；Uya 侧只测 create/switch（std.async 的 block_on 是探针 +
 # 忙轮询模型，单任务 waker 最多挂 4 个 fd，多路并发由线程池承担），最后打表。
@@ -20,6 +20,21 @@ echo "== 编译 =="
 gcc -O2 -o build/bench_c bench/async/bench_c.c -lpthread
 g++ -std=c++20 -O2 -o build/bench_cpp bench/async/bench_cpp.cpp
 rustc --edition 2021 -O -o build/bench_rs bench/async/bench_rs.rs
+
+# tokio 是可选依赖：依赖已在本地 registry 里就 --offline 构建，否则试一次联网；
+# 两样都不成就跳过这一栏（其余语言照跑）。
+have_tokio=0
+if command -v cargo >/dev/null 2>&1; then
+    if (cd bench/async/tokio_bench \
+        && { cargo build --release --offline >/dev/null 2>&1 \
+             || cargo build --release >/dev/null 2>&1; }); then
+        have_tokio=1
+    else
+        echo "  ! tokio 构建失败（离线无依赖且拉不到 crates.io），跳过 tokio 两栏" >&2
+    fi
+else
+    echo "  ! 没有 cargo，跳过 tokio 两栏" >&2
+fi
 (cd bench/async && go build -o ../../build/bench_go bench_go.go)
 
 # Uya 是可选依赖：找不到编译器就跳过（其余语言照跑）。
@@ -61,6 +76,10 @@ runner "C++(C++20 协程 + epoll)"        ./build/bench_cpp
 runner "Go(goroutine + netpoller)"      ./build/bench_go
 runner "Rust(async/await + 手写执行器)" ./build/bench_rs
 runner "Rust(std::thread)"              ./build/bench_rs threads
+if [ "$have_tokio" = 1 ]; then
+    runner "Rust(tokio current_thread)"  ./bench/async/tokio_bench/target/release/bench_tokio
+    runner "Rust(tokio multi_thread x4)" ./bench/async/tokio_bench/target/release/bench_tokio mt
+fi
 
 # Uya 一次跑完 create + switch（两段都在同一个干净进程里，秒级完成）
 if [ "$have_uya" = 1 ]; then

@@ -1,0 +1,544 @@
+/* std/net/robots：robots.txt（RFC 9309）——逐行扫描器 + 策略判定 + 游标。
+ *
+ *     import std.net.robots;
+ *
+ *     Robots rb = { 0 };
+ *     rb.init();
+ *     rb.load(text, len, "c6bot");          // 方法：init / load / allowed / sitemap
+ *     rb.allowed("/private/x");             // 0：被 Disallow 挡住
+ *     rb.sitemap(0);                        // "https://example.com/sitemap.xml"
+ *
+ *     RobotsDoc d = { 0 };
+ *     RobotsLine ln = { 0 };
+ *     d.open(text, len);                    // 游标：open / next / count / reset
+ *     while (d.next(&ln))
+ *         ;                                 // ln.key / ln.val
+ *
+ * 判定按 RFC 9309 的要点：
+ *
+ * - 先按 `User-agent` 选组：**最具体的那个**（等于我们的 agent 的）优先，
+ *   没有就退到 `*`；组里没有规则就等于全允许；
+ * - 组内按「路径模式越长越优先」判定，长度相同则 **Allow 赢**（RFC 9309 §2.2.2）；
+ * - 模式支持 `*`（任意串，可多个）和结尾 `$`（锚定结尾），其余字符按字面比；
+ * - `Sitemap:` 是全局字段，不属于任何组，最多记 4 条；
+ * - 注释从 `#` 起（行内也算），空行忽略，键名大小写不敏感，值保留原样。
+ *
+ * 容量固定（32 条规则 / 4 条 sitemap），满了 `load` 记一次 `drops` 但继续扫完
+ * 其余行——策略库是有界缓存，宁可少几条规则也不要半途而废。
+ */
+#include <string.h>
+
+module std.net.robots;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define ROBOTS_RULES 32
+#define ROBOTS_PATH 96
+#define ROBOTS_AGENT 24
+#define ROBOTS_LINE 160
+#define ROBOTS_SITEMAPS 4
+
+struct RobotsRule {
+    char path[ROBOTS_PATH];
+    int len;
+    int allow;
+    int group;                  /* 组号：同一组的规则共享 agent 集合 */
+};
+
+struct Robots {
+    RobotsRule r[ROBOTS_RULES];
+    int n;
+    int drops;
+    char group_agent[ROBOTS_RULES][ROBOTS_AGENT];   /* 组号 -> agent */
+    int group_len[ROBOTS_RULES];
+    int ngroups;
+    char sitemap_url[ROBOTS_SITEMAPS][ROBOTS_PATH];
+    int nsitemaps;
+    char agent[ROBOTS_AGENT];   /* 我们用哪个 agent 判定 */
+    int agentlen;
+};
+
+struct RobotsLine {
+    char key[ROBOTS_AGENT];
+    char val[ROBOTS_LINE];
+    int keylen;
+    int vallen;
+    int lineno;
+};
+
+struct RobotsDoc {
+    const char *p;
+    int len;
+    int i;
+    int lineno;
+    int seen;
+};
+
+static int rblow(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+/* 行扫描：把 `key: value` 拆出来；注释、空行、无冒号行返回 0（跳过）。 */
+static int robots_split(const char *s, int len, RobotsLine *out)
+{
+    int i = 0;
+    int k = 0;
+    int hash = len;
+
+    if (!out)
+        return 0;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < len; i++)
+        if (s[i] == '#') {
+            hash = i;
+            break;
+        }
+    len = hash;
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t'
+                       || s[len - 1] == '\r' || s[len - 1] == '\n'))
+        len--;
+    i = 0;
+    while (i < len && (s[i] == ' ' || s[i] == '\t'))
+        i++;
+    if (i >= len)
+        return 0;
+    for (k = i; k < len && s[k] != ':'; k++)
+        ;
+    if (k >= len)
+        return 0;               /* 没有冒号：不是指令 */
+    /* 键 */
+    {
+        int kn = k;
+
+        while (kn > i && (s[kn - 1] == ' ' || s[kn - 1] == '\t'))
+            kn--;
+        if (kn - i <= 0 || kn - i >= ROBOTS_AGENT)
+            return 0;
+        for (int j = 0; j < kn - i; j++)
+            out->key[j] = (char)rblow((int)(unsigned char)s[i + j]);
+        out->key[kn - i] = 0;
+        out->keylen = kn - i;
+    }
+    /* 值 */
+    {
+        int vi = k + 1;
+        int vn = len;
+
+        while (vi < vn && (s[vi] == ' ' || s[vi] == '\t'))
+            vi++;
+        while (vn > vi && (s[vn - 1] == ' ' || s[vn - 1] == '\t'))
+            vn--;
+        if (vn - vi >= ROBOTS_LINE)
+            vn = vi + ROBOTS_LINE - 1;      /* 截断，不越界 */
+        for (int j = 0; j < vn - vi; j++)
+            out->val[j] = s[vi + j];
+        out->val[vn - vi] = 0;
+        out->vallen = vn - vi;
+    }
+    return 1;
+}
+
+/* ---- 游标 ---- */
+
+int open(RobotsDoc *d, const char *text, int len)
+{
+    if (!d)
+        return -1;
+    d->p = text;
+    d->len = text ? len : 0;
+    d->i = 0;
+    d->lineno = 0;
+    d->seen = 0;
+    return 0;
+}
+
+int next(RobotsDoc *d, RobotsLine *out)
+{
+    while (d && d->p && d->i < d->len) {
+        int start = d->i;
+        int end = d->i;
+
+        while (end < d->len && d->p[end] != '\n')
+            end++;
+        d->i = (end < d->len) ? end + 1 : end;
+        d->lineno++;
+        if (robots_split(d->p + start, end - start, out)) {
+            if (out)
+                out->lineno = d->lineno;
+            d->seen++;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int count(RobotsDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(RobotsDoc *d)
+{
+    if (!d)
+        return;
+    d->i = 0;
+    d->lineno = 0;
+    d->seen = 0;
+}
+
+/* ---- 策略库 ---- */
+
+void init(Robots *rb)
+{
+    if (!rb)
+        return;
+    memset(rb, 0, sizeof *rb);
+}
+
+int clear(Robots *rb)
+{
+    if (!rb)
+        return -1;
+    memset(rb, 0, sizeof *rb);
+    return 0;
+}
+
+int count(Robots *rb)
+{
+    return rb ? rb->n : -1;
+}
+
+int dropped(Robots *rb)
+{
+    return rb ? rb->drops : -1;
+}
+
+int sitemap_count(Robots *rb)
+{
+    return rb ? rb->nsitemaps : -1;
+}
+
+const char *sitemap(Robots *rb, int i)
+{
+    if (!rb || i < 0 || i >= rb->nsitemaps)
+        return 0;
+    return rb->sitemap_url[i];
+}
+
+static int robots_group_of(Robots *rb, const char *agent, int len)
+{
+    for (int g = 0; g < rb->ngroups; g++)
+        if (rb->group_len[g] == len
+            && memcmp(rb->group_agent[g], agent, (size_t)len) == 0)
+            return g;
+    return -1;
+}
+
+static int robots_group_new(Robots *rb, const char *agent, int len)
+{
+    int g = robots_group_of(rb, agent, len);
+
+    if (g >= 0)
+        return g;
+    if (rb->ngroups >= ROBOTS_RULES || len >= ROBOTS_AGENT) {
+        rb->drops++;
+        return -1;
+    }
+    memcpy(rb->group_agent[rb->ngroups], agent, (size_t)len);
+    rb->group_agent[rb->ngroups][len] = 0;
+    rb->group_len[rb->ngroups] = len;
+    return rb->ngroups++;
+}
+
+/* 装载：text 是我们这个站的 robots.txt，agent 是我们的产品名（可空 = "*"）。 */
+int load(Robots *rb, const char *text, int len, const char *agent)
+{
+    RobotsDoc d = { 0 };
+    RobotsLine ln = { 0 };
+    int cur = -1;
+    int in_rules = 0;
+
+    if (!rb)
+        return -1;
+    memset(rb, 0, sizeof *rb);
+    if (agent && *agent) {
+        int i = 0;
+
+        while (agent[i] && i < ROBOTS_AGENT - 1) {
+            rb->agent[i] = (char)rblow((int)(unsigned char)agent[i]);
+            i++;
+        }
+        rb->agent[i] = 0;
+        rb->agentlen = i;
+    } else {
+        rb->agent[0] = '*';
+        rb->agent[1] = 0;
+        rb->agentlen = 1;
+    }
+    d.open(text, len);
+    while (d.next(&ln)) {
+        if (ln.keylen == 10 && memcmp(ln.key, "user-agent", 10) == 0) {
+            int i = 0;
+            char tmp[ROBOTS_AGENT] = { 0 };
+            int tl = 0;
+
+            while (i < ln.vallen && ln.val[i] == ' ')
+                i++;
+            while (i < ln.vallen && tl < ROBOTS_AGENT - 1) {
+                tmp[tl++] = (char)rblow((int)(unsigned char)ln.val[i]);
+                i++;
+            }
+            tmp[tl] = 0;
+            /* 连续的 User-agent 行属于同一组 */
+            if (in_rules) {
+                cur = -1;
+                in_rules = 0;
+            }
+            if (tl > 0) {
+                int g = robots_group_new(rb, tmp, tl);
+
+                if (g >= 0)
+                    cur = g;
+            }
+            continue;
+        }
+        if (ln.keylen == 7 && memcmp(ln.key, "sitemap", 7) == 0) {
+            if (rb->nsitemaps < ROBOTS_SITEMAPS && ln.vallen > 0
+                && ln.vallen < ROBOTS_PATH) {
+                memcpy(rb->sitemap_url[rb->nsitemaps], ln.val,
+                       (size_t)ln.vallen + 1);
+                rb->nsitemaps++;
+            }
+            continue;
+        }
+        if (ln.keylen == 8 && memcmp(ln.key, "disallow", 8) == 0) {
+            in_rules = 1;
+            if (cur < 0 || ln.vallen <= 0 || ln.vallen >= ROBOTS_PATH) {
+                if (cur >= 0 && ln.vallen >= ROBOTS_PATH)
+                    rb->drops++;
+                continue;
+            }
+            if (rb->n >= ROBOTS_RULES) {
+                rb->drops++;
+                continue;
+            }
+            memcpy(rb->r[rb->n].path, ln.val, (size_t)ln.vallen + 1);
+            rb->r[rb->n].len = ln.vallen;
+            rb->r[rb->n].allow = 0;
+            rb->r[rb->n].group = cur;
+            rb->n++;
+            continue;
+        }
+        if (ln.keylen == 5 && memcmp(ln.key, "allow", 5) == 0) {
+            in_rules = 1;
+            if (cur < 0 || ln.vallen <= 0 || ln.vallen >= ROBOTS_PATH)
+                continue;
+            if (rb->n >= ROBOTS_RULES) {
+                rb->drops++;
+                continue;
+            }
+            memcpy(rb->r[rb->n].path, ln.val, (size_t)ln.vallen + 1);
+            rb->r[rb->n].len = ln.vallen;
+            rb->r[rb->n].allow = 1;
+            rb->r[rb->n].group = cur;
+            rb->n++;
+            continue;
+        }
+        /* crawl-delay / host 之类的扩展忽略 */
+    }
+    return rb->n;
+}
+
+/* 模式完整匹配：`*` 吃任意串（可多个），其余按字面比。 */
+static int robots_pat_exact(const char *pat, int plen, const char *path,
+                            int pathlen)
+{
+    if (plen <= 0)
+        return pathlen == 0;
+    if (pat[0] == '*') {
+        for (int skip = 0; skip <= pathlen; skip++)
+            if (robots_pat_exact(pat + 1, plen - 1, path + skip,
+                                 pathlen - skip))
+                return 1;
+        return 0;
+    }
+    if (pathlen <= 0)
+        return 0;
+    if (pat[0] != path[0])
+        return 0;
+    return robots_pat_exact(pat + 1, plen - 1, path + 1, pathlen - 1);
+}
+
+/* 规则匹配：结尾 `$` 要求整条路径匹配，否则只要求前缀匹配。 */
+static int robots_match_path(const char *pat, int plen, const char *path,
+                             int pathlen)
+{
+    int anchor = 0;
+
+    if (plen <= 0)
+        return 1;
+    if (pat[plen - 1] == '$') {
+        anchor = 1;
+        plen--;
+    }
+    if (anchor)
+        return robots_pat_exact(pat, plen, path, pathlen);
+    for (int take = 0; take <= pathlen; take++)
+        if (robots_pat_exact(pat, plen, path, take))
+            return 1;
+    return 0;
+}
+
+/* 这条路径允许抓吗？1 = 允许。 */
+int allowed(Robots *rb, const char *path)
+{
+    int pathlen = 0;
+    int best = -1;
+    int best_allow = 1;
+    int have_specific = 0;
+
+    if (!rb || !path)
+        return 1;
+    pathlen = (int)strlen(path);
+    if (pathlen <= 0 || path[0] != '/')
+        return 1;
+    /* 有没有「为我们这个 agent 单独写的组」：有就只看它，没有才看 "*" */
+    if (!(rb->agentlen == 1 && rb->agent[0] == '*'))
+        for (int g = 0; g < rb->ngroups; g++)
+            if (rb->group_len[g] == rb->agentlen
+                && memcmp(rb->group_agent[g], rb->agent,
+                          (size_t)rb->agentlen) == 0)
+                have_specific = 1;
+    for (int i = 0; i < rb->n; i++) {
+        int g = rb->r[i].group;
+        int is_star = rb->group_len[g] == 1 && rb->group_agent[g][0] == '*';
+        int is_me = rb->group_len[g] == rb->agentlen
+            && memcmp(rb->group_agent[g], rb->agent, (size_t)rb->agentlen) == 0;
+
+        if (have_specific) {
+            if (!is_me)
+                continue;
+        } else if (!is_star) {
+            continue;
+        }
+        if (!robots_match_path(rb->r[i].path, rb->r[i].len, path, pathlen))
+            continue;
+        if (rb->r[i].len > best) {
+            best = rb->r[i].len;
+            best_allow = rb->r[i].allow;
+        } else if (rb->r[i].len == best && rb->r[i].allow) {
+            best_allow = 1;             /* 同长度：Allow 赢 */
+        }
+    }
+    return best < 0 ? 1 : best_allow;
+}
+
+/* ---- 自测 ---- */
+
+static int rb_eq(const char *a, const char *b)
+{
+    return a && b && strcmp(a, b) == 0;
+}
+
+test "robots：逐行扫描" {
+    const char *text = "# 注释\n"
+                       "User-Agent: *\n"
+                       "\n"
+                       "Disallow: /private\n"
+                       "  Allow :  /private/ok  # 行内注释\n"
+                       "Crawl-delay: 10\n";
+    RobotsDoc d = { 0 };
+    RobotsLine ln = { 0 };
+    int n = 0;
+
+    d.open(text, (int)strlen(text));
+    if (d.next(&ln) != 1 || !rb_eq(ln.key, "user-agent") || !rb_eq(ln.val, "*"))
+        return err(1, "第一行应是 User-Agent: *");
+    if (ln.lineno != 2)
+        return err(2, "行号应是 2");
+    if (d.next(&ln) != 1 || !rb_eq(ln.key, "disallow")
+        || !rb_eq(ln.val, "/private"))
+        return err(3, "第二行应是 Disallow: /private");
+    if (d.next(&ln) != 1 || !rb_eq(ln.key, "allow")
+        || !rb_eq(ln.val, "/private/ok"))
+        return err(4, "键名应小写、行内注释应剥掉");
+    if (d.next(&ln) != 1 || !rb_eq(ln.key, "crawl-delay") || !rb_eq(ln.val, "10"))
+        return err(5, "扩展字段也该扫出来");
+    if (d.next(&ln) != 0)
+        return err(6, "到底应返回 0");
+    n = d.count();
+    if (n != 4)
+        return err(7, "一共应扫出 4 条指令");
+    d.reset();
+    if (d.next(&ln) != 1 || d.count() != 1)
+        return err(8, "reset 后应从头开始");
+}
+
+test "robots：最长匹配、通配符与组优先级" {
+    const char *text = "User-agent: *\n"
+                       "Disallow: /private\n"
+                       "Allow: /private/ok\n"
+                       "Disallow: /*.pdf$\n"
+                       "Disallow: /tmp/*/secret\n"
+                       "Sitemap: https://example.com/sitemap.xml\n"
+                       "\n"
+                       "User-agent: c6bot\n"
+                       "Disallow: /bot-only\n"
+                       "Allow: /bot-only/ok\n";
+    Robots rb = { 0 };
+    RobotsLine ln = { 0 };
+    RobotsDoc d = { 0 };
+
+    /* 先装成「别的 agent」：只有 * 组生效 */
+    rb.init();
+    if (rb.load(text, (int)strlen(text), "otherbot") != 6)
+        return err(1, "应装载 6 条规则");
+    if (rb.count() != 6)
+        return err(2, "count 应为 6");
+    if (rb.allowed("/public") != 1)
+        return err(3, "没有规则命中应允许");
+    if (rb.allowed("/private/x") != 0)
+        return err(4, "Disallow 应挡住");
+    if (rb.allowed("/private/ok/1") != 1)
+        return err(5, "更长的 Allow 应赢");
+    if (rb.allowed("/doc/a.pdf") != 0)
+        return err(6, "*.pdf 应挡住");
+    if (rb.allowed("/doc/a.pdf?x=1") != 1)
+        return err(7, "$ 锚定结尾，带查询串不该命中");
+    if (rb.allowed("/tmp/a/secret") != 0)
+        return err(8, "中间的 * 应能跨段");
+    if (rb.allowed("/tmp/a/public") != 1)
+        return err(9, "中间的 * 不该误伤别的路径");
+    if (rb.allowed("/bot-only/x") != 1)
+        return err(10, "别的 agent 不该受 c6bot 组约束");
+    if (rb.sitemap_count() != 1
+        || !rb_eq(rb.sitemap(0), "https://example.com/sitemap.xml"))
+        return err(11, "sitemap 应被收集");
+    if (rb.sitemap(1) != 0)
+        return err(12, "越界 sitemap 应给 0");
+
+    /* 再装成 c6bot：具体组优先，* 组不再参与 */
+    rb.clear();
+    if (rb.load(text, (int)strlen(text), "c6bot") != 6)
+        return err(13, "重新装载应成功");
+    if (rb.allowed("/bot-only/x") != 0)
+        return err(14, "具体组应生效");
+    if (rb.allowed("/bot-only/ok") != 1)
+        return err(15, "具体组的更长 Allow 应赢");
+    if (rb.allowed("/private/x") != 1)
+        return err(16, "有具体组时 * 组不再参与");
+    /* 空文档 / 空路径 */
+    rb.clear();
+    if (rb.load("", 0, 0) != 0 || rb.allowed("/x") != 1)
+        return err(17, "空文档应全允许");
+    if (rb.allowed("x") != 1)
+        return err(18, "非绝对路径直接允许");
+    /* 游标也能扫同一份文本 */
+    d.open(text, (int)strlen(text));
+    while (d.next(&ln))
+        ;
+    if (d.count() != 9)
+        return err(19, "游标应扫出 9 条指令");
+}

@@ -1,0 +1,20 @@
+[package]
+name = "bench_tokio"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bench_tokio"
+path = "main.rs"
+
+[dependencies]
+# 钉住 1.40：更新的 tokio 要求 rustc 1.85，本机是 1.81。
+tokio = { version = "=1.40.0", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+] }
