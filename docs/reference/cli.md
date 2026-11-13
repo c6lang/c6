@@ -81,6 +81,14 @@ CMake 内置目标。
 模式由 `-DC6_ENABLE_EXT=ON/OFF` 决定；`mode-ext` / `mode-plain` 这两个同名目标现在
 只打印重新配置的提示，不再往 `tcc/` 写 `.c6-mode` 并清理产物。
 
+c6 自己的文档由 `C6_INSTALL_DOCS`（默认 `ON`）装到 `C6_INSTALL_C6_DOCDIR`
+（默认 `<datarootdir>/doc/c6`，即 `/usr/share/doc/c6`）：`docs/` 的 33 篇文档
+保留子目录结构放在 `docs/` 下，`README.md` / `CHANGELOG.md` / `copyright` 放在
+它的上一层，因此 `docs/README.md` 里 `../README.md` 之类的相对链接仍然可用。
+上游 tcc 的 `tcc-doc.html` 仍装在 `C6_INSTALL_DOCDIR`（默认
+`<datarootdir>/doc/tcc`）。文档里指向 `examples/` / `tests/` 源码的链接只在
+仓库内有效，安装包里不携带源码。
+
 `tcc/` 里的目标文件全部依赖一份标志记录 `tcc/.c6-flags`（内容是本轮编译用的
 `CC` / `CFLAGS` / `DEFINES` / `LDFLAGS` / `LIBS`）。标志一变（切换 `build` /
 `build-plain`、换一份 `CFLAGS`），下一次 `cmake --build build` 就把所有目标文件

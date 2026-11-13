@@ -23,6 +23,9 @@ set(_c6_have_pc "@C6_INSTALL_PKGCONF@")
 set(_c6_have_libtcc_pc "@C6_INSTALL_LIBTCC_PC@")
 set(_c6_symlink "@C6_INSTALL_TCC_SYMLINK@")
 set(_c6_tccdir "@C6_TCCDIR_REL@")
+set(_c6_c6docdir "@C6_C6_DOCDIR_REL@")
+set(_c6_have_docs "@C6_INSTALL_DOCS@")
+set(_c6_src "@CMAKE_CURRENT_SOURCE_DIR@")
 set(_c6_exe_suf "@C6_TCC_EXESUF@")
 set(_c6_lib "@C6_LIBTCC_FILENAME@")
 set(_c6_cc "@CMAKE_C_COMPILER@")
@@ -57,6 +60,37 @@ foreach(_f IN ITEMS
 endforeach()
 if(_c6_symlink STREQUAL "ON" AND NOT EXISTS "${_c6_root}/${_c6_bindir}/tcc")
   message(FATAL_ERROR "check-install: 安装树里缺 bindir/tcc -> c6 兼容软链")
+endif()
+
+if(_c6_have_docs STREQUAL "ON")
+  # c6 与上游 tcc 有差异，文档必须随包分发：抽查索引、子目录、根
+  # README / CHANGELOG，并按源码树篇数核对，防止 FILES_MATCHING 漏装。
+  foreach(_f IN ITEMS
+      "${_c6_root}/${_c6_c6docdir}/docs/README.md"
+      "${_c6_root}/${_c6_c6docdir}/docs/manual/testing.md"
+      "${_c6_root}/${_c6_c6docdir}/docs/reference/cli.md"
+      "${_c6_root}/${_c6_c6docdir}/README.md"
+      "${_c6_root}/${_c6_c6docdir}/CHANGELOG.md")
+    if(NOT EXISTS "${_f}")
+      message(FATAL_ERROR "check-install: 安装树里缺 c6 文档 ${_f}")
+    endif()
+  endforeach()
+  if(EXISTS "${_c6_src}/tcc/COPYING"
+     AND NOT EXISTS "${_c6_root}/${_c6_c6docdir}/copyright")
+    message(FATAL_ERROR "check-install: 安装树里缺 c6 文档 copyright")
+  endif()
+  file(GLOB_RECURSE _c6_src_docs "${_c6_src}/docs/*.md")
+  file(GLOB_RECURSE _c6_stage_docs "${_c6_root}/${_c6_c6docdir}/docs/*.md")
+  list(LENGTH _c6_src_docs _c6_src_count)
+  list(LENGTH _c6_stage_docs _c6_stage_count)
+  if(NOT _c6_src_count EQUAL _c6_stage_count)
+    message(FATAL_ERROR
+      "check-install: c6 文档篇数不符：源码 ${_c6_src_count}，"
+      "安装树 ${_c6_stage_count}")
+  endif()
+  message(STATUS
+    "check-install: c6 文档 ${_c6_stage_count} 篇 -> "
+    "${_c6_root}/${_c6_c6docdir}/docs")
 endif()
 
 # 共享 libtcc 时，c6 可执行文件在暂存树里也要能找到库。

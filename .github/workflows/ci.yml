@@ -162,13 +162,16 @@ jobs:
             DEB)
               dpkg-deb --info packages/*.deb
               dpkg-deb --contents packages/*.deb | head -40
+              dpkg-deb --contents packages/*.deb | grep -q 'usr/share/doc/c6/docs/README.md'
               ;;
             RPM)
               rpm -qip packages/*.rpm
               rpm -qlp packages/*.rpm | head -40
+              rpm -qlp packages/*.rpm | grep -q 'usr/share/doc/c6/docs/README.md'
               ;;
             TGZ)
               tar tzf packages/*.tar.gz | head -40
+              tar tzf packages/*.tar.gz | grep -q 'usr/share/doc/c6/docs/README.md'
               ;;
           esac
 

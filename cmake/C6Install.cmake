@@ -37,6 +37,24 @@ install(FILES "${C6_TCC_DIR}/tcc-doc.info"
 install(FILES "${C6_TCC_DIR}/tcc-doc.html"
         DESTINATION "${C6_DOCDIR_REL}" OPTIONAL)
 
+# ---------------------------------------------------------------------------
+# c6 自己的文档：语言扩展、std、测试与后端只在这里有说明，和上游 tcc 的
+# tcc-doc.html 分开装。保留 docs/ 子目录结构，文档内 reference/*.md 之类的
+# 相对链接才能继续用；根 README / CHANGELOG 放在它的上一层，正好对应
+# docs/README.md 的 ../README.md 与 docs/history/ 的 ../../CHANGELOG.md。
+# ---------------------------------------------------------------------------
+if(C6_INSTALL_DOCS)
+  install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/docs/"
+          DESTINATION "${C6_C6_DOCDIR_REL}/docs"
+          FILES_MATCHING PATTERN "*.md")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+                "${CMAKE_CURRENT_SOURCE_DIR}/CHANGELOG.md"
+          DESTINATION "${C6_C6_DOCDIR_REL}")
+  # Debian 惯例 /usr/share/doc/<pkg>/copyright；CPack DEB 不会自动生成。
+  install(FILES "${C6_TCC_DIR}/COPYING"
+          DESTINATION "${C6_C6_DOCDIR_REL}" RENAME "copyright" OPTIONAL)
+endif()
+
 # 交叉产物是构建期生成的，安装时才枚举（见 cmake/c6-install-cross.cmake.in）。
 if(C6_TCC_CROSS)
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6-install-cross.cmake.in"

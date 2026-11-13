@@ -44,8 +44,8 @@ string(CONCAT CPACK_PACKAGE_DESCRIPTION
   "c6 is a small, fast C compiler derived from TinyCC, extended with\n"
   "modules, generics, slices, closures, async and a C99 output backend.\n"
   "This package ships the c6 compiler, the embeddable libtcc library,\n"
-  "the runtime library (libtcc1.a), headers, CMake package config and\n"
-  "pkgconf metadata.\n")
+  "the runtime library (libtcc1.a), headers, CMake package config,\n"
+  "pkgconf metadata and the c6 documentation under share/doc/c6.\n")
 set(CPACK_RESOURCE_FILE_LICENSE "${C6_TCC_DIR}/COPYING")
 set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
 
