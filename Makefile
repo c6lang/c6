@@ -8,7 +8,7 @@
 #   make test-plain  关闭扩展构建并跑同一套上游测试
 #   make test-all    selftest + tests2 全量 + c6selfcheck + freestanding/裸机
 #   make check-all   test-all + C99 后端用例 + 三条自举路线 + 标准库
-#                    （发布前跑这一条；五条车道并发，CHECK_SERIAL=1 则串行）
+#                    （发布前跑这一条；除 std 家族整组串行外都并发，CHECK_JOBS=1 全串行）
 #   make c99         C99 输出后端已内置在 tcc/c6（-c99 / -o *.c / -o <目录>）
 #   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
 #   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
@@ -50,6 +50,7 @@ SELFHOST_LIBS := -lm -ldl -lpthread
 HOSTCC   ?= gcc
 
 .PHONY: all bootstrap build build-plain test test-plain test-all check-all \
+        check-std-serial \
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
@@ -1582,9 +1583,10 @@ fstest-bare-smp: build
 	    examples/boot/shim.plain.c examples/boot/io.c
 
 # 标准库那一组目标：stdtest 把 std/ 下每个模块的 test 块逐个跑一遍，std-demo
-# 到 std-util 是三十批模块拼出来的集成示例。列成变量是因为 check-all 把整组
-# 当成一条「车道」串行跑（标准库的用例会往 build/ 下的固定路径写临时文件，
-# 见 scripts/check-all.sh），test-all 则把它们当普通的并列前置目标。
+# 到 std-util 是三十批模块拼出来的集成示例。列成变量是因为这组用例会往
+# build/ 下的**固定**临时路径写文件（build/fs-test/、build/std-static/、
+# build/mmap-test.bin、build/echo.sock ……），同时跑会互相踩，check-all 得让
+# 它们整组串行；test-all 则把它们当普通的并列前置目标。
 STD_TARGETS := stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt std-util
 
 test-all: selftest test c6selfcheck $(STD_TARGETS) fstest fstest-go \
@@ -1592,37 +1594,36 @@ test-all: selftest test c6selfcheck $(STD_TARGETS) fstest fstest-go \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
 
-# check-all 把完整验收拆成五条「车道」：车道之间并发跑，车道内部串行
-# （调度器是 scripts/check-all.sh，目标列表仍然写在这里）。
-#   tests     tests/ 下的用例（native + C99 两套宿主）和错误码号段表
-#   tests2    上游 tests2 全量
-#   selfhost  三条自举路线 + c6 源代码自检
-#   std       标准库（stdtest + 全部 std-* 示例）
-#   bare      freestanding / 裸机 / qemu 那一组
-# 之所以按车道并发而不是直接 make -j：std 家族的用例会往 build/ 下的固定
-# 路径写临时文件，裸机五连过去共用 build/bare.img，都只能串行；车道之间
-# 互不相干，才是能并发的那一刀。
-CHECK_LANE_TESTS    := selftest errcheck c99test c99tcc-test
-CHECK_LANE_TESTS2   := test
-CHECK_LANE_SELFHOST := c6selfcheck selfhost c99selfhost c99selfhost-tcc
-CHECK_LANE_BARE     := fstest fstest-go fstest-noos fstest-qemu \
-                       fstest-bare fstest-bare-tests fstest-bare-go \
-                       fstest-bare-handle fstest-bare-smp
+# 除标准库以外要跑的那些：tests/ 的两套宿主用例、错误码号段表、C99 后端的
+# 两套用例、三条自举路线、tests2 全量、freestanding/裸机那一组。
+# 它们之间没有共享的可写路径（tests/ 与 errbase 各自用 $$ 命名的 $TMP，
+# 自举三条路线各占 build/selfhost/<路线>，裸机五连各占 build/bare/<名字>），
+# 所以可以放心交给 make 并发。
+CHECK_PARALLEL := selftest errcheck c99test c99tcc-test \
+                  c6selfcheck selfhost c99selfhost c99selfhost-tcc \
+                  test fstest fstest-go fstest-noos fstest-qemu \
+                  fstest-bare fstest-bare-tests fstest-bare-go \
+                  fstest-bare-handle fstest-bare-smp
 
-# 完整验收：test-all 之外还有 C99 后端的两套用例（96 组各跑一遍）和三条
-# 自举路线（c6 / c99+gcc / c99+tcc，每条都比对目标文件是否逐字节相同）。
+# 共享 build/ 下固定路径的那一组：一次只跑一个（递归 make -j1）。
+# -o build：编译器由 check-all 先建好了，别在这儿再跑一遍。
+check-std-serial:
+	@MAKEFLAGS= MFLAGS= $(MAKE) --no-print-directory -j1 -o build \
+	    $(STD_TARGETS)
+
+# check-all 的并发度：默认按核数，CHECK_JOBS=1 就是整轮验收串行。
+CHECK_JOBS ?= $(JOBS)
+
+# 完整验收：test-all + errcheck + C99 后端两套用例 + 三条自举路线 + 标准库。
 # 这些目标过去只能手动跑，发布前用这一条把它们全部钉住。
 #
-# 覆盖面没变，只是从「一条条串行排队」改成「五条车道并发」：跑完会打一张
-# 每车道的结果表，失败的用例照样带 [车道名] 前缀逐行打出来。
-# 想按老样子一条跑完再跑下一条：CHECK_SERIAL=1 make check-all。
+# 并发策略：只有「共享 build/ 下固定路径」的 std 家族必须串行，于是把整组
+# 丢给 check-std-serial 里那条 -j1 的递归 make，其余目标交给 make 自己并发；
+# 输出按目标成块（--output-sync=target），不会混成一团。
+# 想按老样子一条跑完再跑下一条：make check-all CHECK_JOBS=1。
 check-all: build
-	@CHECK_LANE_TESTS="$(CHECK_LANE_TESTS)" \
-	 CHECK_LANE_TESTS2="$(CHECK_LANE_TESTS2)" \
-	 CHECK_LANE_SELFHOST="$(CHECK_LANE_SELFHOST)" \
-	 CHECK_LANE_STD="$(STD_TARGETS)" \
-	 CHECK_LANE_BARE="$(CHECK_LANE_BARE)" \
-	 ./scripts/check-all.sh
+	@MAKEFLAGS= MFLAGS= $(MAKE) --no-print-directory -j$(CHECK_JOBS) \
+	    --output-sync=target -o build $(CHECK_PARALLEL) check-std-serial
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -1773,8 +1774,8 @@ distclean:
 #   test-all         selftest + test + c6selfcheck + 标准库 + freestanding/裸机
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
 #                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img）
-#                    五条车道并发跑（tests / tests2 / selfhost / std / bare），
-#                    CHECK_SERIAL=1 则按车道顺序一条跑完再跑下一条
+#                    并发跑：共享 build/ 下固定路径的 std 家族整组串行，其余目标
+#                    都并发；CHECK_JOBS=1 则整轮验收串行
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块

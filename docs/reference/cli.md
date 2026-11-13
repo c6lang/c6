@@ -77,7 +77,7 @@
 | `make selftest` | `tests/` 下全部 c6 自测（test 块 + 编译期诊断） |
 | `make errcheck` | `errbase.def` 本身与 C126–C128 的检查 |
 | `make test-all` | `selftest` + `test` + `c6selfcheck` + 标准库 + freestanding/裸机 |
-| `make check-all` | **提交/发布前跑这一条**：`test-all` + `errcheck` + C99 后端两套 + 三条自举路线；五条车道（tests / tests2 / selfhost / std / bare）并发跑，车道内部串行。`CHECK_SERIAL=1` 则每辆车顺序跑完再跑下一辆，`scripts/check-all.sh` 是调度器 |
+| `make check-all` | **提交/发布前跑这一条**：`test-all` + `errcheck` + C99 后端两套 + 三条自举路线；只把共享 `build/` 下固定临时路径的 std 家族整组串行（`check-std-serial`），其余目标并发跑。`CHECK_JOBS=1` 则整轮串行 |
 
 ### 标准库
 

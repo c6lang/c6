@@ -150,8 +150,8 @@ make build-plain  # 上游模式（不定义 C6_EXT）
 make test         # tests2 上游全量（扩展模式）
 make test-all     # selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
 make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后端 + 三条自举路线
-                  # 五条车道并发跑（tests / tests2 / selfhost / std / bare），
-                  # CHECK_SERIAL=1 make check-all 则按车道顺序一条跑完再跑下一条
+                  # 共享 build/ 下固定路径的 std 家族整组串行，其余目标并发跑；
+                  # CHECK_JOBS=1 make check-all 则整轮串行
 ```
 
 每个目标的含义、自举三条路线怎么比对、`make help` 的完整目标表，见
