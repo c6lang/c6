@@ -107,6 +107,10 @@ static const char help[] =
 #endif
 #ifdef CONFIG_TCC_BCHECK
     "  -b           compile with built-in memory and bounds checker (implies -g)\n"
+#ifdef C6_EXT
+    "  --ub         run the c6 UB checker (stdub) on the source files\n"
+    "               (see docs/ubcheck.md; build it with 'make std-ub')\n"
+#endif
 #endif
 #ifdef CONFIG_TCC_BACKTRACE
     "  -bt[N]       link with backtrace (stack dump) support [show max N callers]\n"
@@ -544,9 +548,96 @@ static int tcc_output_for_target(TCCState *s)
 }
 #endif
 
+#ifdef C6_EXT
+/* `--ub [选项] 文件...`：把源码交给 UB 检查器 stdub。
+ *
+ * 检查器本身是用 c6 写的程序（std/analysis/ub.c6，`make std-ub` 出 build/stdub），
+ * 不在这个 C 编译器里，所以这里只做三件事：找到它、把参数原样转过去、把退出码
+ * 带回来。位置查找顺序：$C6_STDUB、./build/stdub、./stdub、与本程序同目录的
+ * stdub。找不到就直说怎么装。 */
+static int c6_ub_quote(char *dst, int cap, const char *a)
+{
+    int n = 0;
+
+    if (n < cap) dst[n++] = '\'';
+    for (; *a && n + 5 < cap; a++) {
+        if (*a == '\'') {                 /* 单引号要断开再拼接 */
+            memcpy(dst + n, "'\\''", 4);
+            n += 4;
+        } else {
+            dst[n++] = *a;
+        }
+    }
+    if (n < cap) dst[n++] = '\'';
+    if (n < cap) dst[n++] = ' ';
+    dst[n] = 0;
+    return n;
+}
+
+static int c6_run_ub(int argc, char **argv)
+{
+    char cmd[8192];
+    char one[2048];
+    const char *env = getenv("C6_STDUB");
+    const char *cand[3];
+    int k = 0, i = 0, ret = 0, nfiles = 0;
+
+    for (i = 0; i < argc; i++)
+        if (argv[i][0] != '-')
+            nfiles++;
+    if (nfiles == 0) {
+        fprintf(stderr, "c6: --ub 需要至少一个源文件\n");
+        return 2;
+    }
+    if (env && *env) {
+        cand[0] = env;                 /* 指定了就用它，不再猜别的 */
+        cand[1] = 0;
+        cand[2] = 0;
+    } else {
+        cand[0] = "build/stdub";
+        cand[1] = "stdub";
+        cand[2] = 0;
+    }
+    for (k = 0; k < 3; k++) {
+        if (!cand[k])
+            continue;
+        cmd[0] = 0;
+        c6_ub_quote(one, sizeof(one), cand[k]);
+        strcat(cmd, one);
+        for (i = 0; i < argc; i++) {
+            c6_ub_quote(one, sizeof(one), argv[i]);
+            if (strlen(cmd) + strlen(one) + 2 >= sizeof(cmd))
+                break;
+            strcat(cmd, one);
+        }
+        ret = system(cmd);
+        if (ret == -1)
+            continue;
+#ifdef _WIN32
+        return ret;
+#else
+        if (((ret >> 8) & 0xff) == 127)
+            continue;              /* 没找到这个可执行文件：试下一个位置 */
+        return (ret >> 8) & 0xff;
+#endif
+    }
+    if (env && *env)
+        fprintf(stderr, "c6: C6_STDUB 指向的 '%s' 跑不起来\n", env);
+    else
+        fprintf(stderr, "c6: 找不到 UB 检查器 stdub"
+                        "（先跑 'make std-ub'，或用 C6_STDUB=/path/to/stdub 指定）\n");
+    return 2;
+}
+#endif /* C6_EXT */
+
 int main(int argc, char **argv)
 {
     TCCState *s = 0, *s1 = 0;
+#ifdef C6_EXT
+    /* `c6 --ub 文件.c6`：直接跑 UB 检查，不编译 */
+    if (argc > 1 && (!strcmp(argv[1], "--ub") || !strcmp(argv[1], "-fub")))
+        return c6_run_ub(argc - 2, argv + 2);
+#endif
     int ret = 0, opt = 0, n = 0, t = 0, done = 0;
 #ifdef TCC_TARGET_TEXT_OUT
     int out_dir = 0;
@@ -556,6 +647,8 @@ int main(int argc, char **argv)
     int argc0 = argc;
     char **argv0 = argv;
     FILE *ppfp = NULL;
+
+
 
 #ifdef CONFIG_EMBED_C99
     if (wants_c99_output(argc, argv))

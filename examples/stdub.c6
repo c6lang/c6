@@ -58,6 +58,7 @@ struct Stats {
     int suppressed;
     int not_analyzed;
     int unproven;
+    int oom;
 };
 
 static void usage(FILE *out)
@@ -153,7 +154,17 @@ static char *read_file(const char *path, int *out_len)
 /* 分析一份源码，打印所有发现，计数累加到 ST */
 static void analyze(const char *name, char *src_text, int len, UbOpts opts, Stats *st)
 {
-    int cap = 1 << 22;
+    const char *env_cap = getenv("C6_STDUB_ARENA");
+    /* arena 按源码大小估：AST + 跨函数内联 + 分支快照大约每字节源码要几百字节，
+     * 再留 4 MB 底。C6_STDUB_ARENA 可以往上调。 */
+    long cap_l = (long)len * 512 + (1 << 22);
+    int cap = 0;
+
+    if (cap_l > (1 << 29))
+        cap_l = 1 << 29;             /* 512 MB 封顶 */
+    if (env_cap && atoi(env_cap) > 65536 && (long)atoi(env_cap) > cap_l)
+        cap_l = atoi(env_cap);
+    cap = (int)cap_l;
     u8 *arena_buf = (u8 *)malloc((size_t)cap);
     Str file = { (char[:]){ (char *)name, (int)strlen(name) } };
     Str src = { (char[:]){ src_text, len } };
@@ -193,6 +204,8 @@ static void analyze(const char *name, char *src_text, int len, UbOpts opts, Stat
     st->suppressed += ub_suppressed(u);
     st->not_analyzed += ub_not_analyzed(u);
     st->unproven += ub_unproven(u);   /* 静态说不准、只能靠运行时兜的访问点 */
+    if (ub_out_of_memory(u))
+        st->oom = 1;                  /* arena 不够：这份结果不完整 */
     if (ub_not_analyzed(u) > 0) {
         Program *p = ub_program(u);
         int k = 0;
@@ -221,7 +234,7 @@ int main(int argc, char **argv)
     int i = 0;
     int bad = 0;
     int strict = 0;
-    Stats st = { 0, 0, 0, 0, 0, 0 };
+    Stats st = { 0, 0, 0, 0, 0, 0, 0 };
 
     for (i = 1; i < argc; i++) {
         const char *z = argv[i];
@@ -308,6 +321,12 @@ int main(int argc, char **argv)
     if (strict && st.possible > 0) {
         fprintf(stderr, "stdub: --strict 下「可能」级也算失败（%d 条）\n", st.possible);
         return 1;
+    }
+    if (st.oom) {
+        fprintf(stderr, "stdub: 分析内存不够（arena 用完），上面这份结果不完整；"
+                        "把文件拆小，或用 C6_STDUB_ARENA=字节数 调大\n");
+        /* 不完整的结果不能当「通过」 */
+        return 2;
     }
     if (strict && st.unproven > 0)
         fprintf(stderr, "stdub: 另有 %d 处访问无法静态判定：这些点只能靠 c6 -b 的"

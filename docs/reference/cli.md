@@ -18,6 +18,7 @@
 | `-errbase-file=FILE` | 指定别的钉号表（必须存在，否则报 C128） |
 | `-no-errbase` | 完全不读钉号表（自动号段照旧） |
 | `-Wgeneric-depth` / `-Wno-generic-depth` | 泛型实例嵌套深度告警（默认开） |
+| `--ub FILE...`（别名 `-fub`） | 不编译，直接把源码交给 UB 检查器 `stdub`（第八十四批）：`--ub -W` 走安全门模式、`--ub -S` 走健全模式；找不到 `stdub` 时用 `C6_STDUB=/path` 指定。详见 [ubcheck.md](../ubcheck.md) |
 
 ### 后端选择
 
