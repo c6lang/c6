@@ -84,6 +84,7 @@ enum UbCheck {
     UB_NULL_ARG,
     UB_FREE_NONHEAP,
     UB_RACE,
+    UB_UNAUDITED,            /* 说不准的访问：审计模式下逐条报 */
 };
 
 /* 置信度 */
@@ -124,6 +125,7 @@ struct Finding {
 struct UbOpts {
     int max;                 /* 最多报几条；0 = 不限 */
     int quiet_uncertain;     /* 只报「一定」的 */
+    int audit_unproven;      /* 把「说不准的访问」也逐条报出来（安全门 / 审计模式） */
 };
 
 /* 变量的堆状态（只在一个函数体内直线追踪） */
@@ -179,6 +181,7 @@ struct Ctx {
     Ub *u;
     Func *fn;
     Var *vars;
+    int no_audit;            /* 下标检查里已经算过这一处，别再重复报「没审计」 */
     int in_callee;           /* 正在分析 `x->m(...)` 里的 `x->m`：c6 的方法就是
                               * 自由函数，self 可以显式为 0，不在这报空指针 */
 };
@@ -374,6 +377,7 @@ const char *ub_check_name(int check)
     case UB_NULL_ARG: return "UB-NULLARG";
     case UB_FREE_NONHEAP: return "UB-BADFREE";
     case UB_RACE: return "UB-RACE";
+    case UB_UNAUDITED: return "UB-UNAUDITED";
     default: return "UB-?";
     }
 }
@@ -396,6 +400,7 @@ const char *ub_check_title(int check)
     case UB_NULL_ARG: return "内存函数收到空指针";
     case UB_FREE_NONHEAP: return "释放的不是堆指针";
     case UB_RACE: return "跨线程共享可变状态";
+    case UB_UNAUDITED: return "没审计过的内存访问";
     default: return "未分类";
     }
 }
@@ -626,6 +631,8 @@ static int ub_ignored(Ub *u, int line, int check)
 
         if (t.s.len <= 0)
             continue;
+        if (check == UB_UNAUDITED && str_has(t, "c6ub-proven"))
+            return 1;                /* 人工审计过这一处：算「说过」 */
         if (!str_has(t, "c6ub-ignore"))
             continue;
         if (str_has(t, ub_check_name(check)))
@@ -674,6 +681,35 @@ static void ub_emit(Ub *u, int check, int conf, int line, int col, Str snip,
     u->tail = &f->next;
     u->n++;
 }
+
+/* 审计模式：这一处访问说不准，就明说出来（附「怎么写才能被证明」） */
+static void emit_unproven(Ctx *c, Node *n, Str base, int kind)
+{
+    Ub *u = c->u;
+    Str msg = { (char[:]){ 0, 0 } };
+    Str text = { (char[:]){ 0, 0 } };
+    Str code = { (char[:]){ 0, 0 } };
+    Sb *b = sb_open(u->a, 220);
+
+    if (kind == 1) {
+        sb_s(b, base);
+        sb_cs(b, " 这块内存的边界静态上定不下来（长度来自参数或运行期计算），"
+                 "这次访问没有被证明是安全的");
+    } else {
+        sb_s(b, base);
+        sb_cs(b, " 的状态静态上定不下来（可能为空、可能已释放），这次解引用没有被证明是安全的");
+    }
+    msg = sb_close(b);
+    text = ub_cat3(u->a, ub_s(u->a, "把边界写清楚让检查器能证明（例如 "),
+                   base,
+                   ub_s(u->a, " 之前加 `if (i < 0 || i >= n) return -1;`）；真的审计过了就在这一行标 `/// c6ub-proven`"));
+    code = ub_cat4(u->a, ub_s(u->a, "if (i < 0 || i >= n) return -1;   // 或者： "),
+                   base, ub_s(u->a, "[i]   /// c6ub-proven"), ub_s(u->a, ""));
+    ub_emit(u, UB_UNAUDITED, CONF_POSSIBLE, n->line, n->col,
+            ub_snip(u, n, n->line), msg, ub_fix(FIX_GUARD, n->line, text, code));
+}
+
+
 
 /* ---- 表达式小判断 ---- */
 
@@ -760,9 +796,14 @@ static int deref_check(Ctx *c, Node *target, Node *site, int wr)
         name = target->name;
         v = var_find(c, name);
         root = var_resolve(c, v);
-        u->naccess++;
-        if (v && v->state != VS_UNKNOWN)
-            u->nproven++;              /* 状态已知：这一处说得清 */
+        if (c->no_audit == 0) {        /* 下标那条路径自己记账，别重复数 */
+            u->naccess++;
+            if (v && v->state != VS_UNKNOWN)
+                u->nproven++;          /* 状态已知：这一处说得清 */
+        }
+        if (u->opts.audit_unproven && c->no_audit == 0
+            && (!root || root->state == VS_UNKNOWN))
+            emit_unproven(c, site ? site : target, name, 2);
         if (root && root->state == VS_REALLOC) {
             Str msg = { (char[:]){ 0, 0 } };
             Str text = { (char[:]){ 0, 0 } };
@@ -1175,8 +1216,12 @@ static void chk_index(Ctx *c, Node *n, int wr)
 
     if (n->op == OP_RANGE)
         return;                      /* 区间下标的两端不是元素下标 */
-    if (deref_check(c, base, n, wr))
+    c->no_audit++;
+    if (deref_check(c, base, n, wr)) {
+        c->no_audit--;
         return;
+    }
+    c->no_audit--;
     if (!ident_of(base, &name))
         return;
     v = var_find(c, name);
@@ -1189,7 +1234,8 @@ static void chk_index(Ctx *c, Node *n, int wr)
         || (t->kind == TY_PTR && v && v->size >= 0))
         u->nproven++;                  /* 这一处能判 */
     if (!hx) {
-        chk_index_range(c, n, t, v);   /* 循环变量：用常量范围判 */
+        if (!chk_index_range(c, n, t, v) && u->opts.audit_unproven)
+            emit_unproven(c, n, name, 1);   /* 审计模式：这一处说不准，明说 */
         return;
     }
     if (t->kind == TY_ARRAY && t->n_known) {
@@ -2153,7 +2199,7 @@ static void ub_stmt(Ctx *c, Stmt *s)
 
 static void ub_func(Ub *u, Func *f)
 {
-    Ctx ctx = { u, f, 0, 0 };
+    Ctx ctx = { u, f, 0, 0, 0 };
     Ctx *c = &ctx;
     Sym *p = f->params;
     Var *v = 0;
@@ -2169,7 +2215,7 @@ static void ub_func(Ub *u, Func *f)
 
 UbOpts ub_opts_default(void)
 {
-    UbOpts o = { 0, 0 };
+    UbOpts o = { 0, 0, 0 };
 
     return o;
 }
@@ -2843,4 +2889,25 @@ test "同一个缓冲区交给两个线程：共享可写状态要报" {
         return err(2, "消息里要点出数据竞争");
     if (ub_count(u) != 1)
         return err(3, "只交过一次或只交一个线程都不该报");
+}
+
+test "审计模式：说不准的访问要逐条报，标了 c6ub-proven 才放过" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Str src = { (char[:]){ "int pick(int *p, int i) { return p[i]; }\n"
+                           "int pick2(int *p, int i) { return p[i];   /// c6ub-proven\n}\n",
+                           (int)strlen("int pick(int *p, int i) { return p[i]; }\n"
+                                       "int pick2(int *p, int i) { return p[i];   /// c6ub-proven\n}\n") } };
+    UbOpts o = ub_opts_default();
+    Ub *u = 0;
+
+    o.audit_unproven = 1;
+    u = ub_open(&a, ub_lit("t.c6"), src, o);
+    ub_run(u);
+    if (!first(u, UB_UNAUDITED))
+        return err(1, "审计模式下说不准的访问要报");
+    if (ub_count(u) != 1)
+        return err(2, "标了 c6ub-proven 的那一行不该报");
+    if (ub_suppressed(u) != 1)
+        return err(3, "c6ub-proven 压掉的条数要记进账");
 }

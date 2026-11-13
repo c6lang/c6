@@ -68,6 +68,8 @@ static void usage(FILE *out)
             "  -q, --quiet-uncertain   只报「一定」的发现\n"
             "  -W, --strict            安全门模式：「可能」也算失败，\n"
             "                          「没看懂」的构造也算失败（不给通过）\n"
+            "  -S, --sound             健全模式：连「说不准的访问」都逐条报出并算失败\n"
+            "                          （每一处要么被证明、要么标 /// c6ub-proven）\n"
             "  -n N                    最多报 N 条（0 = 不限）\n"
             "  -h, --help              这份帮助\n"
             "\n"
@@ -234,6 +236,13 @@ int main(int argc, char **argv)
         }
         if (strcmp(z, "-W") == 0 || strcmp(z, "--strict") == 0) {
             strict = 1;              /* 「可能」也算失败，没看懂的构造也算失败 */
+            continue;
+        }
+        if (strcmp(z, "-S") == 0 || strcmp(z, "--sound") == 0) {
+            /* 健全模式：凡是「说不准」的访问都逐条报出来并算失败——
+               「没证明过」不许当成「没问题」，这就是安全子集的边界 */
+            strict = 1;
+            opts.audit_unproven = 1;
             continue;
         }
         if (strcmp(z, "-n") == 0) {

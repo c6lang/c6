@@ -2845,7 +2845,16 @@ Go 的写法**：同一个 1000 路循环，c6 版 40 行，C 状态机版 260 �
 必须当场抓出 `BCHECK: … is outside of the region` 并让进程非 0 退出；抓不住就说明
 运行时层没生效，门不放行。
 
-验收：`make build`、`make ubcheck`（361 个模块全通过、0 条误报、0 处没看懂）、
+再往前一步是**健全性**：`stdub -S/--sound` 把每处「说不准」的访问都报成
+`UB-UNAUDITED` 并算失败（要么补边界判断让检查器能证明，要么标 `/// c6ub-proven`
+承认人工审计）。实测整个 `std/`：**365 个模块只有 9 个能过**（deque / span / vec /
+align / err / geometry / spline / types / vector），其余 356 个共 **15 380 处**访问
+没有证明——这就是「静态证明 vs 裸指针」的事实边界，也是为什么 L5（Rust 级）必须由
+语言的所有权/借用类型来提供，而不是检查器的开关。运行时层也量了一遍：`c6 -b` 能抓
+堆/栈越界、释放后使用、重复释放、`memcpy` 超长（`exit 255`），抓不到未初始化读、
+泄漏、数据竞争。
+
+验收：`make build`、`make ubcheck`（365 个模块全通过、0 条误报、0 处没看懂）、
 `make safegate`（静态 + 运行时两层都过）、`make stdtest`（361 个模块、0 failure，
 `std/analysis/ub.c6` 71 条用例）、`make std-ub`。
 
