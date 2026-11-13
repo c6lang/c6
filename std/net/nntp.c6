@@ -1,0 +1,377 @@
+/* std/net/nntp：NNTP（RFC 3977）的报文层——命令行构造 + 响应解析 + 多行正文边界。
+ *
+ *     import std.net.nntp;
+ *
+ *     char cmd[128] = { 0 };
+ *     NntpCmd c = { 0 };
+ *     c.init(cmd, sizeof cmd);                 // 方法：init / line / line2 / finish
+ *     c.line("GROUP", "comp.lang.c");          // "GROUP comp.lang.c\r\n"
+ *     int n = c.finish();
+ *
+ *     NntpResp r = { 0 };
+ *     r.parse(buf, len);                       // "211 42 1 42 comp.lang.c\r\n"
+ *     r.code;                                  // 211
+ *     r.is_ok();                               // 2xx（成功）
+ *     r.is_multi();                            // 1xx/2xx/3xx 都可能跟多行正文
+ *     r.text_copy(buf, out, cap);              // 状态码后面的说明
+ *
+ *     // 多行响应（文章/列表）的正文终点：从 body_off 起找 CRLF . CRLF
+ *     int end = nntp_body_end(buf, len, r.body_off);
+ *
+ * 三条容易写错的规矩都处理了：
+ *
+ * - 命令行**不超过 512 字节**（含 CRLF），参数里不能有空格与 CR/LF（要就用 `line2`
+ *   分开传，或者调用方自己加引号——NNTP 没有通用引用机制）；
+ * - 响应第一行是「3 位数字 + 空格 + 说明 + CRLF」，1xx/2xx/3xx 后面可能跟多行正文，
+ *   4xx/5xx 一定没有；
+ * - 多行正文以**单独一行的 `.`** 结束（行首的 `.` 在传输时被双写，解析时要去掉——
+ *   `nntp_undot()` 干这个）。
+ */
+#include <string.h>
+
+module std.net.nntp;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define NNTP_MAX_LINE 512
+
+struct NntpResp {
+    int ok;
+    int code;
+    int text_off;
+    int text_len;
+    int body_off;               /* 首行之后的位置；没有正文时为 -1 */
+    int body_len;               /* >= 0 表示后面跟了多行正文（长度未知，用 body_end） */
+};
+
+struct NntpCmd {
+    char *out;
+    int cap;
+    int n;
+    int ok;
+};
+
+/* 解析响应首行；0 = 合法。 */
+int parse(NntpResp *r, const char *buf, int len)
+{
+    int i = 0;
+    int eol = -1;
+
+    if (!r)
+        return -1;
+    memset(r, 0, sizeof *r);
+    r->body_off = -1;
+    if (!buf || len < 5)
+        return -1;
+    for (i = 0; i + 1 < len && i <= NNTP_MAX_LINE; i++)
+        if (buf[i] == '\r' && buf[i + 1] == '\n') {
+            eol = i;
+            break;
+        }
+    if (eol < 0)
+        return -1;
+    if (buf[0] < '1' || buf[0] > '5' || buf[1] < '0' || buf[1] > '9'
+        || buf[2] < '0' || buf[2] > '9')
+        return -1;
+    if (eol > 3 && buf[3] != ' ')
+        return -1;
+    r->code = (buf[0] - '0') * 100 + (buf[1] - '0') * 10 + (buf[2] - '0');
+    r->text_off = (eol > 3) ? 4 : eol;
+    r->text_len = eol - r->text_off;
+    if (eol + 2 < len) {
+        r->body_off = eol + 2;
+        r->body_len = len - r->body_off;
+    }
+    r->ok = 1;
+    return 0;
+}
+
+int is_ok(NntpResp *r)
+{
+    return r && r->ok && r->code >= 200 && r->code < 300;
+}
+
+int is_info(NntpResp *r)
+{
+    return r && r->ok && r->code >= 100 && r->code < 200;
+}
+
+int is_continue(NntpResp *r)
+{
+    return r && r->ok && r->code >= 300 && r->code < 400;
+}
+
+int is_error(NntpResp *r)
+{
+    return r && r->ok && r->code >= 400 && r->code < 600;
+}
+
+/* 1xx/2xx/3xx 可能跟多行正文。 */
+int is_multi(NntpResp *r)
+{
+    return r && r->ok && r->code >= 100 && r->code < 400;
+}
+
+int text_copy(NntpResp *r, const char *buf, char *out, int cap)
+{
+    if (!r || !r->ok || !buf || !out || r->text_len + 1 > cap)
+        return -1;
+    if (r->text_len > 0)
+        memcpy(out, buf + r->text_off, (size_t)r->text_len);
+    out[r->text_len] = 0;
+    return r->text_len;
+}
+
+/* 多行正文的终点（指向结束行 "." 的 CRLF 之后）；找不到给 -1。 */
+int body_end(const char *buf, int len, int from)
+{
+    int i = 0;
+
+    if (!buf || from < 0 || from >= len)
+        return -1;
+    for (i = from; i + 4 <= len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '.'
+            && buf[i + 3] == '\r')
+            return i + 4;
+        if (i == from && buf[i] == '.' && buf[i + 1] == '\r' && buf[i + 2] == '\n')
+            return i + 3;
+    }
+    return -1;
+}
+
+/* 去掉行首的点双写（".foo" 传过来是 "..foo"）；返回长度。 */
+int undot(const char *in, int len, char *out, int cap)
+{
+    int o = 0;
+    int i = 0;
+
+    if (!in || !out || len < 0 || cap < len + 1)
+        return -1;
+    while (i < len) {
+        int line_start = (i == 0 || (i >= 2 && in[i - 1] == '\n'));
+        int k = i;
+
+        if (line_start && k < len && in[k] == '.') {
+            if (k + 1 < len && in[k + 1] == '.') {
+                if (o + 1 > cap)
+                    return -1;
+                out[o++] = '.';
+                i = k + 2;
+            } else {
+                /* 结束行：不输出 */
+                i = k + 1;
+            }
+            continue;
+        }
+        if (o + 1 > cap)
+            return -1;
+        out[o++] = in[i++];
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* ---- 命令行构造 ---- */
+
+void init(NntpCmd *c, char *out, int cap)
+{
+    if (!c)
+        return;
+    memset(c, 0, sizeof *c);
+    c->out = out;
+    c->cap = cap;
+    c->ok = (out == 0 || cap < 16) ? 0 : 1;
+}
+
+static int nntp_arg_ok(const char *s)
+{
+    if (!s)
+        return 0;
+    for (const char *p = s; *p; p++)
+        if (*p == ' ' || *p == '\r' || *p == '\n' || *p == '\t')
+            return 0;
+    return 1;
+}
+
+/* 追加一行命令：`CMD` 或 `CMD arg`。 */
+int line(NntpCmd *c, const char *verb, const char *arg)
+{
+    int vl = verb ? (int)strlen(verb) : 0;
+    int al = arg ? (int)strlen(arg) : 0;
+    int need = vl + (al > 0 ? 1 + al : 0) + 2;
+
+    if (!c || !c->ok || vl <= 0 || !nntp_arg_ok(verb))
+        return -1;
+    if (al > 0 && !nntp_arg_ok(arg))
+        return -1;
+    if (c->n + need > c->cap || c->n + need > NNTP_MAX_LINE)
+        return -1;
+    memcpy(c->out + c->n, verb, (size_t)vl);
+    c->n += vl;
+    if (al > 0) {
+        c->out[c->n++] = ' ';
+        memcpy(c->out + c->n, arg, (size_t)al);
+        c->n += al;
+    }
+    c->out[c->n++] = '\r';
+    c->out[c->n++] = '\n';
+    return 0;
+}
+
+/* 两个参数（例如 `NEWNEWS group wildmat`、`OVER msgid-range`）。 */
+int line2(NntpCmd *c, const char *verb, const char *a1, const char *a2)
+{
+    int vl = verb ? (int)strlen(verb) : 0;
+    int l1 = a1 ? (int)strlen(a1) : 0;
+    int l2 = a2 ? (int)strlen(a2) : 0;
+    int need = vl + (l1 ? 1 + l1 : 0) + (l2 ? 1 + l2 : 0) + 2;
+
+    if (!c || !c->ok || vl <= 0 || !nntp_arg_ok(verb) || !nntp_arg_ok(a1))
+        return -1;
+    if (l2 > 0 && !nntp_arg_ok(a2))
+        return -1;
+    if (c->n + need > c->cap || c->n + need > NNTP_MAX_LINE)
+        return -1;
+    memcpy(c->out + c->n, verb, (size_t)vl);
+    c->n += vl;
+    if (l1 > 0) {
+        c->out[c->n++] = ' ';
+        memcpy(c->out + c->n, a1, (size_t)l1);
+        c->n += l1;
+    }
+    if (l2 > 0) {
+        c->out[c->n++] = ' ';
+        memcpy(c->out + c->n, a2, (size_t)l2);
+        c->n += l2;
+    }
+    c->out[c->n++] = '\r';
+    c->out[c->n++] = '\n';
+    return 0;
+}
+
+int finish(NntpCmd *c)
+{
+    if (!c || !c->ok)
+        return -1;
+    return c->n;
+}
+
+int length(NntpCmd *c)
+{
+    return c ? c->n : -1;
+}
+
+int ok(NntpCmd *c)
+{
+    return c && c->ok;
+}
+
+/* ---- 自测 ---- */
+
+test "NNTP：响应解析与状态分类" {
+    const char *greet = "200 news.example.com ready\r\n";
+    const char *group = "211 42 1 42 comp.lang.c\r\n";
+    const char *post = "340 send article to be posted\r\n";
+    const char *errline = "411 no such group\r\n";
+    NntpResp r = { 0 };
+    char text[64] = { 0 };
+
+    if (r.parse(greet, (int)strlen(greet)) != 0 || !r.ok)
+        return err(1, "解析欢迎语失败");
+    if (r.code != 200 || !r.is_ok() || r.is_error())
+        return err(2, "200 分类不对");
+    if (r.text_copy(greet, text, sizeof text) != 22
+        || strcmp(text, "news.example.com ready") != 0)
+        return err(3, "欢迎语文本不对");
+    if (r.body_off != -1)
+        return err(4, "没有正文时 body_off 应为 -1");
+    if (r.parse(group, (int)strlen(group)) != 0 || r.code != 211)
+        return err(5, "211 解析失败");
+    if (r.text_copy(group, text, sizeof text) != 19
+        || strcmp(text, "42 1 42 comp.lang.c") != 0)
+        return err(6, "GROUP 文本不对");
+    if (r.parse(post, (int)strlen(post)) != 0 || !r.is_continue())
+        return err(7, "340 应是「继续」");
+    if (r.parse(errline, (int)strlen(errline)) != 0 || !r.is_error())
+        return err(8, "411 应是错误");
+    if (r.is_multi())
+        return err(9, "4xx 不该有多行正文");
+    /* 坏响应 */
+    {
+        NntpResp br = { 0 };
+
+        if (br.parse("20 short\r\n", 11) != -1)
+            return err(10, "状态码不足三位应失败");
+        if (br.parse("2000 bad\r\n", 10) != -1)
+            return err(11, "状态码后没有空格应失败");
+        if (br.parse("200 no crlf\n", 12) != -1)
+            return err(12, "缺 CRLF 应失败");
+        if (br.parse("abc text\r\n", 10) != -1)
+            return err(13, "非数字状态应失败");
+    }
+}
+
+test "NNTP：命令行构造、多行正文与去点双写" {
+    char cmd[128] = { 0 };
+    NntpCmd c = { 0 };
+    NntpResp r = { 0 };
+    const char *multi = "220 0 42 <msg@id> article follows\r\n"
+                        "From: a@b\r\n"
+                        "..dot line\r\n"
+                        ".\r\n";
+    char plain[128] = { 0 };
+    int n = 0;
+    int end = 0;
+
+    c.init(cmd, sizeof cmd);
+    if (c.line("GROUP", "comp.lang.c") != 0)
+        return err(1, "line 失败");
+    if (c.line("ARTICLE", 0) != 0)
+        return err(2, "无参数 line 失败");
+    n = c.finish();
+    if (n != 28 || memcmp(cmd, "GROUP comp.lang.c\r\nARTICLE\r\n", (size_t)n) != 0)
+        return err(3, "命令行拼接不对");
+    /* 两个参数 */
+    c.init(cmd, sizeof cmd);
+    if (c.line2("NEWNEWS", "comp.lang.c", "20240101") != 0)
+        return err(4, "line2 失败");
+    n = c.finish();
+    if (n != 30
+        || memcmp(cmd, "NEWNEWS comp.lang.c 20240101\r\n", (size_t)n) != 0)
+        return err(5, "line2 拼接不对");
+    /* 参数里有空格应拒绝 */
+    c.init(cmd, sizeof cmd);
+    if (c.line("GROUP", "two words") != -1)
+        return err(6, "参数含空格应拒绝");
+    if (c.line("BAD\tVERB", 0) != -1)
+        return err(7, "动词含制表符应拒绝");
+    /* 单行超 512 应拒绝 */
+    {
+        char big[600] = { 0 };
+        NntpCmd bc = { 0 };
+
+        memset(big, 'a', sizeof big - 1);
+        bc.init(cmd, sizeof cmd);
+        if (bc.line("X", big) != -1)
+            return err(8, "超长命令应拒绝");
+    }
+    /* 多行正文 */
+    if (r.parse(multi, (int)strlen(multi)) != 0 || !r.is_multi())
+        return err(9, "220 应算多行响应");
+    if (r.body_off < 0 || r.body_len <= 0)
+        return err(10, "多行响应应有正文");
+    end = body_end(multi, (int)strlen(multi), r.body_off);
+    if (end < 0)
+        return err(11, "找不到多行正文终点");
+    /* 去点双写：">.dot line" 实际是 ".dot line" */
+    n = undot(multi + r.body_off, end - r.body_off, plain, (int)sizeof plain);
+    if (n <= 0)
+        return err(12, "undot 失败");
+    if (strstr(plain, ".dot line") == 0)
+        return err(13, "点双写应还原成单个点");
+    if (strstr(plain, "..dot") != 0)
+        return err(14, "不该留下双点");
+    if (strstr(plain, "\r\n.\r\n") != 0)
+        return err(15, "结束行应被丢掉");
+}

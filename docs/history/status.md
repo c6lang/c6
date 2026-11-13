@@ -2973,3 +2973,21 @@ err 号段补 `std.net.netflow`=0x6169、`std.net.wol`=0x616a、`std.data.vtt`=0
 err 号段补 `std.text.plural`=0x616d、`std.data.mbox`=0x616e、`std.data.kdl`=0x616f、
 `std.data.rtf`=0x6170。`std/` 现在 369 个 `.c6` 文件；四个模块的 test 块逐个跑过
 （各 2 条，0 failure）。
+
+### 11.104 标准库第九十批（网络管理与可观测）
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/net/prometheus.c6` | 文本暴露格式（语法层）：`# HELP`/`# TYPE`/样本（标签与时间戳按原文本偏移交回），构造器 | 2 | `PromDoc.open/next/count/sample_count/reset`；`PromBuilder.init/help/type/sample/finish` |
+| `std/net/gemini.c6` | Gemini 协议报文层：请求行（host/port/path/query）、响应（状态码分类、META、正文），两侧构造器 | 2 | `GeminiReq.parse/host_copy/path_copy`；`GeminiResp.parse/is_*/meta_copy`；`build_request/build_header` |
+| `std/net/snmp.c6` | SNMPv2c + 最小 BER：解析 version/community/PDU/request-id/error 字段与 varbind 列表，值按原始字节透传；构造器支持 `set_pdu` 与任意类型 varbind | 2 | `SnmpMsg.parse/community_copy`；`SnmpDoc.open/next/count/reset`；`SnmpVb.oid_str/int_value`；`SnmpBuilder.init/set_pdu/varbind/get/finish` |
+| `std/net/nntp.c6` | NNTP 报文层：命令行（512 字节上限、参数禁止空白）、响应状态分类、多行正文边界、去点双写 | 2 | `NntpCmd.init/line/line2/finish`；`NntpResp.parse/is_*/text_copy`；`body_end/undot` |
+
+BSER 这套只做「短格式 + 长格式长度」，不追求通用 ASN.1：SNMP 用到的类型足够，
+`std/encoding/asn1` 仍然是通用解析的首选。
+
+集成示例 `examples/stdmgmt.c6`（`make std-mgmt`）53 条检查。`Makefile` 增加
+`STD_MGMT_SRCS` / `std-mgmt`（`.PHONY`、help、`test-all`、`check-all` 同步）；
+err 号段补 `std.net.prometheus`=0x6171、`std.net.gemini`=0x6172、
+`std.net.snmp`=0x6173、`std.net.nntp`=0x6174。`std/` 现在 373 个 `.c6` 文件；
+四个模块的 test 块逐个跑过（各 2 条，0 failure）。

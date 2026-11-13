@@ -537,6 +537,7 @@
 | `examples/stdproto4.c6` | （无模块） | 第八十七批（发现与配置协议）的拼装示例（`make std-proto4`）：CoAP/DHCP/SSDP 三个报文层各一节 + 文本折叠，最后串成「发现 → 取数 → 写日志」（56 条检查） |
 | `examples/stdops.c6` | （无模块） | 第八十八批（网络运维 + 媒体清单）的拼装示例（`make std-ops`）：NetFlow/WoL/WebVTT/DNS 区域各一节，最后串成「找主机 → 唤醒 → 记流 → 出字幕」（62 条检查） |
 | `examples/stddocs.c6` | （无模块） | 第八十九批（文档与邮件）的拼装示例（`make std-docs`）：单复数 / mbox / KDL / RTF 各一节，最后串成「配置 + 邮件 + 数量 + 正文」（48 条检查） |
+| `examples/stdmgmt.c6` | （无模块） | 第九十批（网络管理与可观测）的拼装示例（`make std-mgmt`）：Prometheus / Gemini / SNMP / NNTP 各一节，最后串成健康检查并输出暴露格式（53 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4858,6 +4859,83 @@ make std-docs
 五节：单复数与计数短语；mbox 两条消息（头部游标、续行折叠、`>From`）；KDL 嵌套
 节点与参数/属性游标；RTF 抽取（`fonttbl` 跳过、`\u20320` → 「你」）；最后串成
 「KDL 读输出目录 + mbox 取主题 + plural 生成数量 + RTF 抽正文」（48 条检查）。
+
+### 第九十批：网络管理与可观测（`prometheus` / `gemini` / `snmp` / `nntp`）
+
+**`std/net/prometheus.c6`**——Prometheus 文本暴露格式（语法层，不解释语义）：
+
+```c
+PromDoc d = { 0 }; PromSample s = { 0 };
+d.open(text, len);                       // 游标：open / next / count / sample_count / reset
+while (d.next(&s))                       // 样本 / # HELP / # TYPE / 注释
+    ;                                    // s.name_* / s.labels_* / s.value_* / s.ts_* / s.type_code
+
+PromBuilder b = { 0 };
+b.init(out, sizeof out);                 // 方法：init / help / type / sample / finish
+b.help("build_info", "构建信息");
+b.type("build_info", PROM_GAUGE);
+b.sample("build_info", "{branch=\"main\"}", "1", 0);
+```
+
+**`std/net/gemini.c6`**——Gemini 协议报文层：
+
+```c
+GeminiReq r = { 0 };
+r.parse("gemini://h.test/docs?q=1\r\n", 29);   // 0 = 合法
+r.host_copy(line, host, sizeof host);            // 缺省端口 1965
+r.path_copy(line, path, sizeof path);            // 空路径补成 "/"
+
+GeminiResp resp = { 0 };
+resp.parse(buf, n);                              // "20 text/gemini\r\n" + body
+resp.is_success() / is_redirect() / is_error() / needs_cert();
+resp.meta_copy(buf, meta, sizeof meta);
+build_request(out, cap, host, port, path, query); // 构造请求行
+build_header(out, cap, 20, "text/gemini");        // 构造响应头
+```
+
+**`std/net/snmp.c6`**——SNMPv2c（自带最小 BER）：
+
+```c
+SnmpMsg m = { 0 };
+m.parse(buf, n);                         // 0 = 合法（version 必须是 v2c=1）
+m.pdu / request_id / error_status / error_index / nvb
+m.community_copy(buf, comm, sizeof comm);
+
+SnmpDoc d = { 0 }; SnmpVb vb = { 0 };
+d.open(&m, buf);                         // 游标：open / next / count / reset
+while (d.next(&vb)) {                    // 每条：OID + 原始值
+    vb.oid_str(buf, oid, sizeof oid);    // "1.3.6.1.2.1.1.3.0"
+    vb.int_value(buf, &v);               // INTEGER/Counter32/Gauge32/TimeTicks/Counter64
+}
+
+SnmpBuilder b = { 0 };
+b.init(buf, sizeof buf, "public");       // 方法：init / set_pdu / varbind / get / finish
+b.set_pdu(SNMP_RESPONSE);
+b.varbind("1.3.6.1.2.1.1.3.0", SNMP_TIMETICKS, ticks2, 2);
+```
+
+**`std/net/nntp.c6`**——NNTP 报文层：
+
+```c
+NntpCmd c = { 0 };
+c.init(cmd, sizeof cmd);                 // 方法：init / line / line2 / finish
+c.line("GROUP", "comp.lang.c");          // 512 字节上限、参数不许带空格
+NntpResp r = { 0 };
+r.parse(buf, n);                         // 3 位状态码 + 空格 + 说明 + CRLF
+r.is_ok() / is_continue() / is_multi() / text_copy(...);
+body_end(buf, n, r.body_off);            // 多行正文以单独一行 "." 结束
+undot(in, len, out, cap);                // 行首点双写还原
+```
+
+### 集成示例：`examples/stdmgmt.c6`
+
+```sh
+make std-mgmt
+```
+
+五节：Prometheus 构造/解析；Gemini 请求行与响应状态；SNMP Response（sysDescr +
+sysUpTime）构造与解析；NNTP 命令行、多行正文与去点双写；最后串成「健康检查 →
+输出 Prometheus 暴露格式」（53 条检查）。
 
 ## 相关回归用例
 

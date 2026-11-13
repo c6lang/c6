@@ -1,0 +1,228 @@
+/* examples/stdmgmt.c6 —— 第九十批（网络管理与可观测：Prometheus / Gemini / SNMP / NNTP）。
+ *
+ *     make std-mgmt
+ *
+ * 五节，全部方法调用（`d.next(&s)`、`r.parse(...)`、`b.varbind(...)`）：
+ *   1. Prometheus 文本格式：构造指标、解析回来、逐条取样；
+ *   2. Gemini：请求行解析/构造、响应状态分类；
+ *   3. SNMP：构造 Response（OID + OCTET STRING / TimeTicks），解析并读值；
+ *   4. NNTP：命令行构造、响应解析、多行正文边界与去点双写；
+ *   5. 串联：一次「健康检查」——Gemini 探测 + NNTP 欢迎语 + SNMP uptime，
+ *      最后输出成 Prometheus 暴露格式。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.net.prometheus;
+import std.net.gemini;
+import std.net.snmp;
+import std.net.nntp;
+
+static int checks = 0;
+static int nfail = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        nfail++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* 1. Prometheus */
+static void do_prom(void)
+{
+    char out[512] = { 0 };
+    PromBuilder b = { 0 };
+    PromDoc d = { 0 };
+    PromSample s = { 0 };
+    int n = 0;
+
+    printf("== prometheus（文本暴露格式）\n");
+    b.init(out, sizeof out);
+    check(b.help("build_info", "构建信息") == 0, "HELP");
+    check(b.type("build_info", PROM_GAUGE) == 0, "TYPE gauge");
+    check(b.sample("build_info", "{branch=\"main\"}", "1", "1700000000000") == 0,
+          "sample build_info");
+    check(b.sample("up", 0, "1", 0) == 0, "sample up");
+    n = b.finish();
+    check(n > 0 && b.ok(), "finish");
+    check(d.open(out, n) == 0, "解析回去");
+    check(d.next(&s) == 1 && s.kind == 1 && s.name_len == 10, "HELP 行");
+    check(d.next(&s) == 1 && s.kind == 2 && s.type_code == PROM_GAUGE, "TYPE 行");
+    check(d.next(&s) == 1 && s.kind == 0 && s.labels_len == 15, "样本 1 带标签");
+    check(d.next(&s) == 1 && s.kind == 0 && s.labels_len == 0 && s.ts_len == 0,
+          "样本 2 无标签无时间戳");
+    check(d.sample_count() == 2, "样本计数 2");
+}
+
+/* 2. Gemini */
+static void do_gemini(void)
+{
+    GeminiReq req = { 0 };
+    GeminiResp resp = { 0 };
+    char host[64] = { 0 };
+    char path[64] = { 0 };
+    char meta[128] = { 0 };
+    char line[128] = { 0 };
+    int n = 0;
+    const char *reqline = "gemini://g.test/status?verbose=1\r\n";
+    const char *okresp = "20 text/gemini\r\n# ok\r\n";
+
+    printf("== gemini（请求/响应报文层）\n");
+    check(req.parse(reqline, (int)strlen(reqline)) == 0, "解析请求行");
+    check(req.host_copy(reqline, host, sizeof host) == 6
+          && strcmp(host, "g.test") == 0, "host");
+    check(req.port == 1965, "缺省端口");
+    check(req.path_copy(reqline, path, sizeof path) == 7
+          && strcmp(path, "/status") == 0, "path");
+    check(req.query_len == 9, "query 长度");
+    n = build_request(line, sizeof line, "g.test", 1965, "/status", "verbose=1");
+    check(n > 0 && memcmp(line, "gemini://g.test/status?verbose=1\r\n", (size_t)n) == 0,
+          "构造请求行（缺省端口不写）");
+    check(resp.parse(okresp, (int)strlen(okresp)) == 0 && resp.is_success(), "20 成功");
+    check(resp.meta_copy(okresp, meta, sizeof meta) == 11
+          && strcmp(meta, "text/gemini") == 0, "META");
+    check(resp.body_len > 0, "有正文");
+    check(build_header(line, sizeof line, 31, "gemini://x/") > 0, "构造重定向头");
+}
+
+/* 3. SNMP */
+static void do_snmp(void)
+{
+    unsigned char buf[256] = { 0 };
+    unsigned char uptime[2] = { 0x30, 0x39 };       /* 12345 TimeTicks */
+    SnmpBuilder b = { 0 };
+    SnmpMsg m = { 0 };
+    SnmpDoc d = { 0 };
+    SnmpVb vb = { 0 };
+    char comm[32] = { 0 };
+    char oid[64] = { 0 };
+    long v = 0;
+    int n = 0;
+
+    printf("== snmp（SNMPv2c 报文层）\n");
+    b.init(buf, sizeof buf, "public");
+    check(b.set_pdu(SNMP_RESPONSE) == 0, "set_pdu(Response)");
+    check(b.varbind("1.3.6.1.2.1.1.1.0", SNMP_OCTET_STRING,
+                    (const unsigned char *)"router", 6) == 0, "OID sysDescr");
+    check(b.varbind("1.3.6.1.2.1.1.3.0", SNMP_TIMETICKS, uptime, 2) == 0,
+          "OID sysUpTime");
+    n = b.finish(42);
+    check(n > 0, "finish");
+    check(m.parse(buf, n) == 0 && m.pdu == SNMP_RESPONSE, "解析回来");
+    check(m.community_copy(buf, comm, sizeof comm) == 6
+          && strcmp(comm, "public") == 0, "community");
+    check(m.nvb == 2, "两条 varbind");
+    d.open(&m, buf);
+    check(d.next(&vb) == 1 && vb.type == SNMP_OCTET_STRING, "第 1 条是字符串");
+    check(vb.oid_str(buf, oid, sizeof oid) > 0
+          && strcmp(oid, "1.3.6.1.2.1.1.1.0") == 0, "OID 1");
+    check(vb.value_len == 6 && memcmp(buf + vb.value_off, "router", 6) == 0, "值 1");
+    check(d.next(&vb) == 1 && vb.int_value(buf, &v) == 0 && v == 12345,
+          "sysUpTime = 12345");
+    check(d.next(&vb) == 0, "只有两条");
+}
+
+/* 4. NNTP */
+static void do_nntp(void)
+{
+    char cmd[128] = { 0 };
+    NntpCmd c = { 0 };
+    NntpResp r = { 0 };
+    const char *multi = "220 0 42 <m@id> article follows\r\n"
+                        "Subject: hi\r\n"
+                        "..dot\r\n"
+                        ".\r\n";
+    char plain[128] = { 0 };
+    char text[64] = { 0 };
+    int n = 0;
+    int end = 0;
+
+    printf("== nntp（NNTP 报文层）\n");
+    c.init(cmd, sizeof cmd);
+    check(c.line("GROUP", "comp.lang.c") == 0, "GROUP 命令");
+    check(c.line("QUIT", 0) == 0, "QUIT 命令");
+    n = c.finish();
+    check(n == 25 && memcmp(cmd, "GROUP comp.lang.c\r\nQUIT\r\n", (size_t)n) == 0,
+          "命令行拼接");
+    check(r.parse("200 ready\r\n", 11) == 0 && r.is_ok(), "200 欢迎语");
+    check(r.text_copy("200 ready\r\n", text, sizeof text) == 5
+          && strcmp(text, "ready") == 0, "响应文本");
+    check(r.parse(multi, (int)strlen(multi)) == 0 && r.is_multi(), "220 多行");
+    end = body_end(multi, (int)strlen(multi), r.body_off);
+    check(end > 0, "找到正文终点");
+    n = undot(multi + r.body_off, end - r.body_off, plain, (int)sizeof plain);
+    check(n > 0 && strstr(plain, "Subject: hi") != 0, "正文内容");
+    check(strstr(plain, ".dot") != 0 && strstr(plain, "..dot") == 0,
+          "点双写还原");
+}
+
+/* 5. 串联：健康检查 -> Prometheus 暴露 */
+static void do_pipeline(void)
+{
+    char out[512] = { 0 };
+    PromBuilder pb = { 0 };
+    PromDoc pd = { 0 };
+    PromSample ps = { 0 };
+    GeminiReq gr = { 0 };
+    GeminiResp gresp = { 0 };
+    NntpResp nresp = { 0 };
+    SnmpMsg sm = { 0 };
+    SnmpDoc sd = { 0 };
+    SnmpVb svb = { 0 };
+    unsigned char snmpbuf[128] = { 0 };
+    unsigned char up[2] = { 0x00, 0x64 };           /* 100 ticks */
+    SnmpBuilder sb = { 0 };
+    const char *probe = "gemini://svc.test/health\r\n";
+    const char *svc = "20 text/gemini\r\nok\r\n";
+    const char *greet = "200 news ready\r\n";
+    long uptime = 0;
+    int n = 0;
+
+    printf("== 串联：健康检查 -> Prometheus\n");
+    /* 1) Gemini 探测目标 */
+    check(gr.parse(probe, (int)strlen(probe)) == 0, "1) 解析探测 URL");
+    check(gresp.parse(svc, (int)strlen(svc)) == 0 && gresp.is_success(), "2) 探测成功");
+    /* 2) NNTP 欢迎语 */
+    check(nresp.parse(greet, (int)strlen(greet)) == 0 && nresp.is_ok(), "3) NNTP 就绪");
+    /* 3) SNMP uptime */
+    sb.init(snmpbuf, sizeof snmpbuf, "public");
+    sb.set_pdu(SNMP_RESPONSE);
+    sb.varbind("1.3.6.1.2.1.1.3.0", SNMP_TIMETICKS, up, 2);
+    n = sb.finish(7);
+    check(n > 0 && sm.parse(snmpbuf, n) == 0, "4) SNMP 响应可用");
+    sd.open(&sm, snmpbuf);
+    if (sd.next(&svb) == 1)
+        check(svb.int_value(snmpbuf, &uptime) == 0 && uptime == 100, "5) uptime = 100");
+    /* 4) 输出成 Prometheus 暴露格式 */
+    pb.init(out, sizeof out);
+    check(pb.help("svc_up", "服务是否可用") == 0, "6) HELP");
+    check(pb.type("svc_up", PROM_GAUGE) == 0, "7) TYPE");
+    check(pb.sample("svc_up", "{\"probe\":\"gemini\"}",
+                    gresp.is_success() ? "1" : "0", 0) == 0, "8) 探测样本");
+    check(pb.sample("svc_uptime_ticks", 0, "100", 0) == 0, "9) uptime 样本");
+    n = pb.finish();
+    check(n > 0 && pd.open(out, n) == 0, "10) 暴露文本可解析");
+    {
+        int samples = 0;
+
+        while (pd.next(&ps) == 1)
+            if (ps.kind == 0)
+                samples++;
+        check(samples == 2, "11) 两条样本");
+    }
+}
+
+int main(void)
+{
+    do_prom();
+    do_gemini();
+    do_snmp();
+    do_nntp();
+    do_pipeline();
+    printf("\n%d check(s), %d failure(s)\n", checks, nfail);
+    return nfail == 0 ? 0 : 1;
+}

@@ -1,0 +1,498 @@
+/* std/net/prometheus：Prometheus 文本暴露格式（text exposition format 0.0.4）。
+ *
+ *     import std.net.prometheus;
+ *
+ *     PromDoc d = { 0 };
+ *     PromSample s = { 0 };
+ *     d.open(text, len);                 // 游标：open / next / count / reset
+ *     while (d.next(&s)) {               // 一条样本
+ *         s.name_off / s.name_len        // 指标名
+ *         s.labels_off / s.labels_len    // {k="v",...} 原文（没有标签时 len=0）
+ *         s.value_off / s.value_len      // 数值原文（不转浮点，按字符串交回）
+ *         s.timestamp_off / s.ts_len     // 可选时间戳（毫秒），没有时 ts_len=0
+ *     }
+ *
+ *     PromHelp h = { 0 };                // # HELP / # TYPE 也交出来
+ *     PromBuilder b = { 0 };
+ *     b.init(out, sizeof out);
+ *     b.help("build_info", "构建信息");  // 方法：help / type / sample / finish
+ *     b.type("build_info", PROM_GAUGE);
+ *     b.sample("build_info", "{\"branch\":\"main\"}", "1", 0);
+ *     b.finish();
+ *
+ * 只做**语法层**：不解释标签语义、不做转义解码、不转数值（避免精度与单位问题，
+ * 全都以原文本偏移交回）。`# HELP` 的文本里允许出现 `\\` 与 `\\n` 转义，游标原样
+ * 返回；空行与 `#` 开头的其它注释（例如 `# EOF`）跳过。
+ */
+#include <string.h>
+
+module std.net.prometheus;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define PROM_COUNTER 1
+#define PROM_GAUGE 2
+#define PROM_HISTOGRAM 3
+#define PROM_SUMMARY 4
+#define PROM_UNTYPED 5
+
+struct PromSample {
+    int kind;                   /* 0 = 样本，1 = HELP，2 = TYPE，3 = 注释 */
+    int line;
+    int name_off;
+    int name_len;
+    int labels_off;
+    int labels_len;
+    int value_off;
+    int value_len;
+    int ts_off;
+    int ts_len;
+    int text_off;               /* HELP 文本 / TYPE 名的起点 */
+    int text_len;
+    int type_code;              /* kind = TYPE 时有效 */
+};
+
+struct PromDoc {
+    const char *p;
+    int len;
+    int pos;
+    int line;
+    int seen;
+    int bad;
+    int samples;
+};
+
+struct PromBuilder {
+    char *out;
+    int cap;
+    int n;
+    int good;                   /* 字段名避开方法 ok() */
+};
+
+static int prom_at(PromDoc *d, int i)
+{
+    return (i >= 0 && i < d->len) ? (int)(unsigned char)d->p[i] : 0;
+}
+
+static int prom_space(int c)
+{
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+int open(PromDoc *d, const char *text, int len)
+{
+    if (!d)
+        return -1;
+    memset(d, 0, sizeof *d);
+    d->p = text;
+    d->len = text ? len : 0;
+    d->line = 1;
+    return text ? 0 : -1;
+}
+
+int count(PromDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+int sample_count(PromDoc *d)
+{
+    return d ? d->samples : -1;
+}
+
+void reset(PromDoc *d)
+{
+    if (!d || !d->p)
+        return;
+    d->pos = 0;
+    d->line = 1;
+    d->seen = 0;
+    d->bad = 0;
+    d->samples = 0;
+}
+
+static int prom_line_end(PromDoc *d, int from)
+{
+    int i = from;
+
+    while (i < d->len && d->p[i] != '\n')
+        i++;
+    return i;
+}
+
+static int prom_type_code(const char *s, int len)
+{
+    if (len == 7 && memcmp(s, "counter", 7) == 0)
+        return PROM_COUNTER;
+    if (len == 5 && memcmp(s, "gauge", 5) == 0)
+        return PROM_GAUGE;
+    if (len == 9 && memcmp(s, "histogram", 9) == 0)
+        return PROM_HISTOGRAM;
+    if (len == 7 && memcmp(s, "summary", 7) == 0)
+        return PROM_SUMMARY;
+    if (len == 7 && memcmp(s, "untyped", 7) == 0)
+        return PROM_UNTYPED;
+    return 0;
+}
+
+/* 取下一行；1 = 有（样本或指令），0 = 读完，-1 = 语法错。 */
+int next(PromDoc *d, PromSample *s)
+{
+    if (!d || !s || d->bad)
+        return -1;
+    memset(s, 0, sizeof *s);
+    while (d->pos < d->len) {
+        int start = d->pos;
+        int end = prom_line_end(d, start);
+        int i = start;
+        int ln = end - start;
+
+        d->pos = (end < d->len) ? end + 1 : end;
+        s->line = d->line;
+        d->line++;
+        if (ln > 0 && d->p[end - 1] == '\r')
+            ln--;
+        while (i < start + ln && prom_space((int)(unsigned char)d->p[i]))
+            i++;
+        if (i >= start + ln) {
+            s->kind = 3;        /* 空行 */
+            d->seen++;
+            return 1;
+        }
+        if (d->p[i] == '#') {
+            int k = i + 1;
+            int cmd = 0;
+            int after = 0;
+
+            while (k < start + ln && prom_space((int)(unsigned char)d->p[k]))
+                k++;
+            cmd = k;
+            while (k < start + ln && !prom_space((int)(unsigned char)d->p[k]))
+                k++;
+            if (k - cmd == 4 && memcmp(d->p + cmd, "HELP", 4) == 0)
+                s->kind = 1;
+            else if (k - cmd == 4 && memcmp(d->p + cmd, "TYPE", 4) == 0)
+                s->kind = 2;
+            else
+                s->kind = 3;
+            after = k;
+            while (after < start + ln && prom_space((int)(unsigned char)d->p[after]))
+                after++;
+            if (s->kind == 1 || s->kind == 2) {
+                int nm = after;
+
+                while (after < start + ln
+                       && !prom_space((int)(unsigned char)d->p[after]))
+                    after++;
+                s->name_off = nm;
+                s->name_len = after - nm;
+                while (after < start + ln
+                       && prom_space((int)(unsigned char)d->p[after]))
+                    after++;
+                s->text_off = after;
+                s->text_len = start + ln - after;
+                if (s->kind == 2)
+                    s->type_code = prom_type_code(d->p + s->text_off, s->text_len);
+                if (s->name_len <= 0) {
+                    d->bad = 1;
+                    return -1;
+                }
+            }
+            d->seen++;
+            return 1;
+        }
+        /* 样本：name{[labels]} value [timestamp] */
+        {
+            int nm = i;
+
+            while (i < start + ln) {
+                int c = (int)(unsigned char)d->p[i];
+
+                if (prom_space(c) || c == '{')
+                    break;
+                i++;
+            }
+            if (i == nm) {
+                d->bad = 1;
+                return -1;
+            }
+            s->name_off = nm;
+            s->name_len = i - nm;
+            s->labels_off = 0;
+            s->labels_len = 0;
+            if (i < start + ln && d->p[i] == '{') {
+                int ls = i;
+
+                while (i < start + ln && d->p[i] != '}')
+                    i++;
+                if (i >= start + ln) {
+                    d->bad = 1;
+                    return -1;  /* 标签没闭合 */
+                }
+                i++;
+                s->labels_off = ls;
+                s->labels_len = i - ls;
+            }
+            while (i < start + ln && prom_space((int)(unsigned char)d->p[i]))
+                i++;
+            s->value_off = i;
+            while (i < start + ln && !prom_space((int)(unsigned char)d->p[i]))
+                i++;
+            s->value_len = i - s->value_off;
+            if (s->value_len <= 0) {
+                d->bad = 1;
+                return -1;      /* 缺数值 */
+            }
+            while (i < start + ln && prom_space((int)(unsigned char)d->p[i]))
+                i++;
+            if (i < start + ln) {
+                s->ts_off = i;
+                while (i < start + ln && !prom_space((int)(unsigned char)d->p[i]))
+                    i++;
+                s->ts_len = i - s->ts_off;
+            }
+            s->kind = 0;
+            d->samples++;
+        }
+        d->seen++;
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- 构造器 ---- */
+
+void init(PromBuilder *b, char *out, int cap)
+{
+    if (!b)
+        return;
+    memset(b, 0, sizeof *b);
+    b->out = out;
+    b->cap = cap;
+    b->good = (out == 0 || cap < 8) ? 0 : 1;
+}
+
+static void prom_put(PromBuilder *b, const char *s, int n)
+{
+    if (!b->good)
+        return;
+    if (b->n + n > b->cap) {
+        b->good = 0;
+        return;
+    }
+    memcpy(b->out + b->n, s, (size_t)n);
+    b->n += n;
+}
+
+static int prom_strlen(const char *s)
+{
+    return s ? (int)strlen(s) : 0;
+}
+
+int help(PromBuilder *b, const char *name, const char *text)
+{
+    int nl = prom_strlen(name);
+    int tl = prom_strlen(text);
+
+    if (!b || !b->good || nl <= 0 || !text)
+        return -1;
+    prom_put(b, "# HELP ", 7);
+    prom_put(b, name, nl);
+    prom_put(b, " ", 1);
+    prom_put(b, text, tl);
+    prom_put(b, "\n", 1);
+    return b->good ? 0 : -1;
+}
+
+int type(PromBuilder *b, const char *name, int code)
+{
+    const char *txt = 0;
+
+    if (!b || !b->good || !name)
+        return -1;
+    if (code == PROM_COUNTER)
+        txt = "counter";
+    else if (code == PROM_GAUGE)
+        txt = "gauge";
+    else if (code == PROM_HISTOGRAM)
+        txt = "histogram";
+    else if (code == PROM_SUMMARY)
+        txt = "summary";
+    else if (code == PROM_UNTYPED)
+        txt = "untyped";
+    else
+        return -1;
+    prom_put(b, "# TYPE ", 7);
+    prom_put(b, name, prom_strlen(name));
+    prom_put(b, " ", 1);
+    prom_put(b, txt, prom_strlen(txt));
+    prom_put(b, "\n", 1);
+    return b->good ? 0 : -1;
+}
+
+/* labels 传 "{\"k\":\"v\"}" 或 0；ts 传 0 表示不带时间戳。 */
+int sample(PromBuilder *b, const char *name, const char *labels, const char *value,
+           const char *ts)
+{
+    if (!b || !b->good || !name || !value)
+        return -1;
+    prom_put(b, name, prom_strlen(name));
+    if (labels && *labels)
+        prom_put(b, labels, prom_strlen(labels));
+    prom_put(b, " ", 1);
+    prom_put(b, value, prom_strlen(value));
+    if (ts && *ts) {
+        prom_put(b, " ", 1);
+        prom_put(b, ts, prom_strlen(ts));
+    }
+    prom_put(b, "\n", 1);
+    return b->good ? 0 : -1;
+}
+
+int finish(PromBuilder *b)
+{
+    if (!b || !b->good)
+        return -1;
+    return b->n;
+}
+
+int length(PromBuilder *b)
+{
+    return b ? b->n : -1;
+}
+
+int ok(PromBuilder *b)
+{
+    return b && b->good;
+}
+
+/* ---- 自测 ---- */
+
+test "Prometheus：样本与指令游标" {
+    const char *text = "# HELP build_info 构建信息\n"
+                       "# TYPE build_info gauge\n"
+                       "build_info{branch=\"main\",rev=\"abc\"} 1 1700000000000\n"
+                       "\n"
+                       "# EOF\n"
+                       "http_requests_total{code=\"200\"} 1027\n";
+    PromDoc d = { 0 };
+    PromSample s = { 0 };
+    int samples = 0;
+
+    if (d.open(text, (int)strlen(text)) != 0)
+        return err(1, "open 失败");
+    /* HELP */
+    if (d.next(&s) != 1 || s.kind != 1)
+        return err(2, "第一条应是 HELP");
+    if (s.name_len != 10 || memcmp(text + s.name_off, "build_info", 10) != 0)
+        return err(3, "HELP 的指标名不对");
+    if (s.text_len != 12 || memcmp(text + s.text_off, "构建信息", 12) != 0)
+        return err(4, "HELP 文本不对");
+    /* TYPE */
+    if (d.next(&s) != 1 || s.kind != 2 || s.type_code != PROM_GAUGE)
+        return err(5, "TYPE 应是 gauge");
+    /* 样本（带标签和时间戳） */
+    if (d.next(&s) != 1 || s.kind != 0)
+        return err(6, "第三条应是样本");
+    if (s.name_len != 10 || s.labels_len != 25)
+        return err(7, "样本名字/标签长度不对");
+    if (memcmp(text + s.labels_off, "{branch=\"main\",", 15) != 0)
+        return err(8, "标签原文不对");
+    if (s.value_len != 1 || memcmp(text + s.value_off, "1", 1) != 0)
+        return err(9, "数值不对");
+    if (s.ts_len != 13 || memcmp(text + s.ts_off, "1700000000000", 13) != 0)
+        return err(10, "时间戳不对");
+    /* 空行与 # EOF 跳过 */
+    if (d.next(&s) != 1 || s.kind != 3)
+        return err(11, "空行应作为注释返回");
+    if (d.next(&s) != 1 || s.kind != 3)
+        return err(12, "# EOF 应作为注释返回");
+    /* 不带时间戳的样本 */
+    if (d.next(&s) != 1 || s.kind != 0 || s.ts_len != 0)
+        return err(13, "最后一条样本不该有时间戳");
+    if (s.labels_len != 12)
+        return err(14, "最后一条应有 12 字节标签");
+    samples = d.sample_count();
+    if (samples != 2)
+        return err(15, "样本计数应为 2");
+    if (d.next(&s) != 0)
+        return err(16, "应读完");
+    d.reset();
+    if (d.next(&s) != 1 || d.count() != 1)
+        return err(17, "reset 后应从头");
+}
+
+test "Prometheus：构造器与坏输入" {
+    char out[256] = { 0 };
+    PromBuilder b = { 0 };
+    PromDoc d = { 0 };
+    PromSample s = { 0 };
+    int n = 0;
+
+    b.init(out, sizeof out);
+    if (b.help("build_info", "构建信息") != 0)
+        return err(1, "help 失败");
+    if (b.type("build_info", PROM_GAUGE) != 0)
+        return err(2, "type 失败");
+    if (b.sample("build_info", "{\"branch\":\"main\"}", "1", "1700000000000") != 0)
+        return err(3, "sample 失败");
+    if (b.sample("up", 0, "1", 0) != 0)
+        return err(4, "无标签无时间戳的样本失败");
+    n = b.finish();
+    if (n <= 0 || !b.ok())
+        return err(5, "finish 失败");
+    if (d.open(out, n) != 0)
+        return err(6, "往返 open 失败");
+    if (d.next(&s) != 1 || s.kind != 1)
+        return err(7, "往返 HELP 丢失");
+    if (d.next(&s) != 1 || s.kind != 2 || s.type_code != PROM_GAUGE)
+        return err(8, "往返 TYPE 丢失");
+    if (d.next(&s) != 1 || s.kind != 0 || s.labels_len == 0 || s.ts_len == 0)
+        return err(9, "往返样本字段不全");
+    if (d.next(&s) != 1 || s.kind != 0 || s.labels_len != 0 || s.ts_len != 0)
+        return err(10, "往返 up 样本不该有标签/时间戳");
+    if (d.sample_count() != 2)
+        return err(11, "往返样本数应为 2");
+    /* 坏输入：标签没闭合、缺数值、TYPE 没名字 */
+    {
+        PromDoc bd = { 0 };
+        PromSample bs = { 0 };
+        const char *t1 = "m{code=\"200\" 1\n";
+
+        bd.open(t1, (int)strlen(t1));
+        if (bd.next(&bs) != -1)
+            return err(12, "标签没闭合应失败");
+    }
+    {
+        PromDoc bd = { 0 };
+        PromSample bs = { 0 };
+        const char *t2 = "m{a=\"b\"}\n";
+
+        bd.open(t2, (int)strlen(t2));
+        if (bd.next(&bs) != -1)
+            return err(13, "缺数值应失败");
+    }
+    {
+        PromDoc bd = { 0 };
+        PromSample bs = { 0 };
+        const char *t3 = "# TYPE \n";
+
+        bd.open(t3, (int)strlen(t3));
+        if (bd.next(&bs) != -1)
+            return err(14, "TYPE 缺名字应失败");
+    }
+    /* 容量不足 */
+    {
+        char small[16] = { 0 };
+        PromBuilder sb = { 0 };
+
+        sb.init(small, sizeof small);
+        if (sb.help("very_long_metric_name", "描述很长很长") != -1 || sb.ok())
+            return err(15, "容量不足后 ok() 应为假");
+    }
+    /* 非法类型码 */
+    b.init(out, sizeof out);
+    if (b.type("x", 99) != -1)
+        return err(16, "非法类型码应拒绝");
+}

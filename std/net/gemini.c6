@@ -1,0 +1,414 @@
+/* std/net/gemini：Gemini 协议（gemini://，Gemini spec 0.16.1）的报文层。
+ *
+ *     import std.net.gemini;
+ *
+ *     GeminiReq req = { 0 };
+ *     req.parse("gemini://example.com/docs?q=1\r\n", 30);   // 0 = 合法
+ *     req.host // "example.com"；req.port = 1965（缺省）
+ *     req.path // "/docs"；req.query = "q=1"
+ *
+ *     GeminiResp resp = { 0 };
+ *     resp.parse(buf, n);              // "<STATUS><SP><META>\r\n" + body
+ *     resp.status; resp.is_success(); resp.is_redirect();
+ *     resp.meta_copy(buf, out, cap);   // META（MIME 或重定向 URL 或提示语）
+ *     resp.body_off / resp.body_len;   // 30/31 之外的状态没有正文
+ *
+ * 协议本身很小，但有两条容易写错：
+ *
+ * - 请求行是**完整 URL + CRLF**，长度上限 1024 字节（含 CRLF）；
+ * - 响应头是「两位状态码 + 一个空格 + META + CRLF」，META 最长 1024 字节，
+ *   而且 **2xx 才有正文**（3x 是重定向、4x/5x 是错误，6x 是客户端证书）。
+ *
+ * 这里只做解析与构造，不碰 TCP（那是 `std.net.tcp`）也不碰 TLS。
+ */
+#include <string.h>
+
+module std.net.gemini;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define GEMINI_DEFAULT_PORT 1965
+#define GEMINI_MAX_LINE 1024
+
+struct GeminiReq {
+    int ok;
+    int scheme_len;
+    int host_off;
+    int host_len;
+    int port;
+    int path_off;
+    int path_len;
+    int query_off;
+    int query_len;
+};
+
+struct GeminiResp {
+    int ok;
+    int status;
+    int meta_off;
+    int meta_len;
+    int body_off;
+    int body_len;
+};
+
+static int gem_cmp_n(const char *a, const char *b, int n)
+{
+    for (int i = 0; i < n; i++)
+        if ((unsigned char)a[i] != (unsigned char)b[i])
+            return 0;
+    return 1;
+}
+
+/* 解析请求行（含结尾 CRLF）；0 = 合法。 */
+int parse(GeminiReq *r, const char *line, int len)
+{
+    int i = 0;
+    int host_start = 0;
+    int body_end = 0;
+
+    if (!r)
+        return -1;
+    memset(r, 0, sizeof *r);
+    r->port = GEMINI_DEFAULT_PORT;
+    if (!line || len <= 0)
+        return -1;
+    /* 去掉 CRLF */
+    body_end = len;
+    while (body_end > 0 && (line[body_end - 1] == '\n' || line[body_end - 1] == '\r'))
+        body_end--;
+    if (body_end <= 0 || body_end > GEMINI_MAX_LINE - 2)
+        return -1;
+    len = body_end;
+    /* scheme */
+    if (len < 9 || !gem_cmp_n(line, "gemini://", 9))
+        return -1;
+    r->scheme_len = 9;
+    i = 9;
+    /* host[:port] */
+    host_start = i;
+    while (i < len && line[i] != '/' && line[i] != '?' && line[i] != ':')
+        i++;
+    if (i == host_start)
+        return -1;
+    r->host_off = host_start;
+    r->host_len = i - host_start;
+    if (i < len && line[i] == ':') {
+        int p = 0;
+        int digits = 0;
+
+        i++;
+        while (i < len && line[i] >= '0' && line[i] <= '9') {
+            p = p * 10 + (line[i] - '0');
+            i++;
+            digits++;
+            if (digits > 5)
+                return -1;
+        }
+        if (digits == 0 || p <= 0 || p > 65535)
+            return -1;
+        r->port = p;
+    }
+    /* path */
+    r->path_off = i;
+    while (i < len && line[i] != '?')
+        i++;
+    r->path_len = i - r->path_off;
+    if (r->path_len == 0) {
+        r->path_off = 0;        /* 空路径等价于 "/"：调用方自己补 */
+        r->path_len = 0;
+    }
+    /* query */
+    if (i < len && line[i] == '?') {
+        i++;
+        r->query_off = i;
+        r->query_len = len - i;
+    }
+    r->ok = 1;
+    return 0;
+}
+
+int host_copy(GeminiReq *r, const char *line, char *out, int cap)
+{
+    if (!r || !r->ok || !line || !out || r->host_len + 1 > cap)
+        return -1;
+    memcpy(out, line + r->host_off, (size_t)r->host_len);
+    out[r->host_len] = 0;
+    return r->host_len;
+}
+
+int path_copy(GeminiReq *r, const char *line, char *out, int cap)
+{
+    int n = r && r->ok ? r->path_len : -1;
+
+    if (n < 0 || !line || !out)
+        return -1;
+    if (n == 0) {               /* 空路径按 "/" 处理 */
+        if (cap < 2)
+            return -1;
+        out[0] = '/';
+        out[1] = 0;
+        return 1;
+    }
+    if (n + 1 > cap)
+        return -1;
+    memcpy(out, line + r->path_off, (size_t)n);
+    out[n] = 0;
+    return n;
+}
+
+/* 解析响应：头一行 + 可选正文。0 合法。 */
+int parse(GeminiResp *r, const char *buf, int len)
+{
+    int i = 0;
+    int crlf = -1;
+
+    if (!r)
+        return -1;
+    memset(r, 0, sizeof *r);
+    if (!buf || len < 4)
+        return -1;
+    /* 找头行的 CRLF，最多 1024+2 */
+    for (i = 0; i + 1 < len && i < GEMINI_MAX_LINE + 2; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n') {
+            crlf = i;
+            break;
+        }
+    }
+    if (crlf < 0 || crlf < 3)
+        return -1;
+    if (buf[0] < '0' || buf[0] > '9' || buf[1] < '0' || buf[1] > '9')
+        return -1;
+    if (buf[2] != ' ')
+        return -1;
+    r->status = (buf[0] - '0') * 10 + (buf[1] - '0');
+    r->meta_off = 3;
+    r->meta_len = crlf - 3;
+    if (r->meta_len > GEMINI_MAX_LINE)
+        return -1;
+    if (r->status >= 20 && r->status < 30) {
+        r->body_off = crlf + 2;
+        r->body_len = len - r->body_off;
+        if (r->body_len < 0)
+            r->body_len = 0;
+    }
+    r->ok = 1;
+    return 0;
+}
+
+int is_success(GeminiResp *r)
+{
+    return r && r->ok && r->status >= 20 && r->status < 30;
+}
+
+int is_redirect(GeminiResp *r)
+{
+    return r && r->ok && r->status >= 30 && r->status < 40;
+}
+
+int is_error(GeminiResp *r)
+{
+    return r && r->ok
+        && ((r->status >= 40 && r->status < 50)
+            || (r->status >= 50 && r->status < 60));
+}
+
+int needs_cert(GeminiResp *r)
+{
+    return r && r->ok && r->status >= 60 && r->status < 70;
+}
+
+int meta_copy(GeminiResp *r, const char *buf, char *out, int cap)
+{
+    if (!r || !r->ok || !buf || !out || r->meta_len + 1 > cap)
+        return -1;
+    memcpy(out, buf + r->meta_off, (size_t)r->meta_len);
+    out[r->meta_len] = 0;
+    return r->meta_len;
+}
+
+/* 构造响应头（不含正文）；返回头长。 */
+int build_header(char *out, int cap, int status, const char *meta)
+{
+    int ml = meta ? (int)strlen(meta) : 0;
+
+    if (!out || cap < 6 || status < 10 || status > 69)
+        return -1;
+    if (ml > GEMINI_MAX_LINE)
+        return -1;
+    if (5 + ml + 1 > cap)
+        return -1;
+    out[0] = (char)('0' + status / 10);
+    out[1] = (char)('0' + status % 10);
+    out[2] = ' ';
+    if (ml > 0)
+        memcpy(out + 3, meta, (size_t)ml);
+    out[3 + ml] = '\r';
+    out[4 + ml] = '\n';
+    return 5 + ml;
+}
+
+/* 构造请求行（含 CRLF）；返回长度。 */
+int build_request(char *out, int cap, const char *host, int port, const char *path,
+                  const char *query)
+{
+    int hl = host ? (int)strlen(host) : 0;
+    int pl = path ? (int)strlen(path) : 0;
+    int ql = query ? (int)strlen(query) : 0;
+    int o = 0;
+
+    if (!out || cap < 16 || hl <= 0)
+        return -1;
+    if (port < 0 || port > 65535)
+        return -1;
+    if (9 + hl + 6 + pl + ql + 2 + 2 > cap)
+        return -1;
+    memcpy(out, "gemini://", 9);
+    o = 9;
+    memcpy(out + o, host, (size_t)hl);
+    o += hl;
+    if (port != 0 && port != GEMINI_DEFAULT_PORT) {
+        char tmp[8] = { 0 };
+        int k = 0;
+        int v = port;
+
+        while (v > 0 && k < 7) {
+            tmp[k++] = (char)('0' + v % 10);
+            v /= 10;
+        }
+        out[o++] = ':';
+        for (int i = k - 1; i >= 0; i--)
+            out[o++] = tmp[i];
+    }
+    if (pl == 0) {
+        out[o++] = '/';
+    } else {
+        memcpy(out + o, path, (size_t)pl);
+        o += pl;
+    }
+    if (ql > 0) {
+        out[o++] = '?';
+        memcpy(out + o, query, (size_t)ql);
+        o += ql;
+    }
+    out[o++] = '\r';
+    out[o++] = '\n';
+    return o;
+}
+
+/* ---- 自测 ---- */
+
+test "Gemini：请求行解析与构造" {
+    GeminiReq r = { 0 };
+    char host[64] = { 0 };
+    char path[64] = { 0 };
+    char out[128] = { 0 };
+    int n = 0;
+    const char *line = "gemini://example.com/docs?q=1\r\n";
+
+    if (r.parse(line, (int)strlen(line)) != 0 || !r.ok)
+        return err(1, "解析请求失败");
+    if (r.host_copy(line, host, sizeof host) != 11
+        || strcmp(host, "example.com") != 0)
+        return err(2, "host 不对");
+    if (r.port != 1965)
+        return err(3, "缺省端口应是 1965");
+    if (r.path_copy(line, path, sizeof path) != 5
+        || strcmp(path, "/docs") != 0)
+        return err(4, "path 不对");
+    if (r.query_len != 3 || memcmp(line + r.query_off, "q=1", 3) != 0)
+        return err(5, "query 不对");
+    /* 显式端口 + 空路径 */
+    {
+        const char *l2 = "gemini://h.test:1999\r\n";
+
+        if (r.parse(l2, (int)strlen(l2)) != 0 || r.port != 1999)
+            return err(6, "显式端口解析失败");
+        if (r.path_copy(l2, path, sizeof path) != 1 || strcmp(path, "/") != 0)
+            return err(7, "空路径应补成 /");
+    }
+    /* 构造 */
+    n = build_request(out, sizeof out, "example.com", 0, "/a", "x=1");
+    if (n <= 0)
+        return err(8, "build_request 失败");
+    if (memcmp(out, "gemini://example.com/a?x=1\r\n", (size_t)n) != 0)
+        return err(9, "构造结果不对");
+    n = build_request(out, sizeof out, "example.com", 1999, 0, 0);
+    if (n <= 0 || memcmp(out, "gemini://example.com:1999/\r\n", (size_t)n) != 0)
+        return err(10, "带端口的构造结果不对");
+    /* 坏请求 */
+    {
+        GeminiReq br = { 0 };
+
+        if (br.parse("http://example.com/\r\n", 22) != -1)
+            return err(11, "非 gemini scheme 应失败");
+        if (br.parse("gemini:///x\r\n", 14) != -1)
+            return err(12, "空 host 应失败");
+        if (br.parse("gemini://h:0/\r\n", 15) != -1)
+            return err(13, "端口 0 应失败");
+        if (br.parse("gemini://h:99999/\r\n", 19) != -1)
+            return err(14, "端口越界应失败");
+    }
+}
+
+test "Gemini：响应解析与状态分类" {
+    GeminiResp r = { 0 };
+    char meta[128] = { 0 };
+    char out[64] = { 0 };
+    const char *ok_resp = "20 text/gemini\r\n# 标题\n正文\n";
+    const char *redir = "31 gemini://other.test/x\r\n";
+    const char *errs = "51 not found\r\n";
+    int n = 0;
+
+    if (r.parse(ok_resp, (int)strlen(ok_resp)) != 0 || !r.ok)
+        return err(1, "解析 20 响应失败");
+    if (r.status != 20 || !r.is_success() || r.is_redirect() || r.is_error())
+        return err(2, "20 的状态分类不对");
+    if (r.meta_copy(ok_resp, meta, sizeof meta) != 11
+        || strcmp(meta, "text/gemini") != 0)
+        return err(3, "META 不对");
+    if (r.body_len <= 0 || memcmp(ok_resp + r.body_off, "# 标题", 8) != 0)
+        return err(4, "正文不对");
+    /* 3x 重定向：没有正文 */
+    if (r.parse(redir, (int)strlen(redir)) != 0 || r.status != 31)
+        return err(5, "31 解析失败");
+    if (!r.is_redirect() || r.is_success() || r.body_len != 0)
+        return err(6, "31 不该有正文");
+    if (r.meta_copy(redir, meta, sizeof meta) != 21
+        || strcmp(meta, "gemini://other.test/x") != 0)
+        return err(7, "重定向 URL 不对");
+    /* 4x/5x 错误 */
+    if (r.parse(errs, (int)strlen(errs)) != 0 || !r.is_error())
+        return err(8, "51 应算错误");
+    /* 6x 需要证书 */
+    {
+        const char *cert = "60 client certificate required\r\n";
+
+        if (r.parse(cert, (int)strlen(cert)) != 0 || !r.needs_cert())
+            return err(9, "60 应算需要证书");
+    }
+    /* 构造响应头 */
+    n = build_header(out, sizeof out, 20, "text/plain");
+    if (n != 5 + 10 || memcmp(out, "20 text/plain\r\n", (size_t)n) != 0)
+        return err(10, "响应头构造不对");
+    n = build_header(out, sizeof out, 31, "gemini://x/");
+    if (n <= 0 || memcmp(out, "31 gemini://x/\r\n", (size_t)n) != 0)
+        return err(11, "重定向头构造不对");
+    /* 坏响应 */
+    {
+        GeminiResp br = { 0 };
+
+        if (br.parse("XX bad\r\n", 7) != -1)
+            return err(12, "非数字状态应失败");
+        if (br.parse("200 no space\r\n", 13) != -1)
+            return err(13, "状态后必须有一个空格");
+        if (br.parse("20 text/gemini\n", 15) != -1)
+            return err(14, "头行必须以 CRLF 结尾");
+        if (br.parse("20\r\n", 4) != -1)
+            return err(15, "太短应失败");
+    }
+    if (build_header(out, 4, 20, "x") != -1)
+        return err(16, "容量不足应失败");
+    if (build_header(out, sizeof out, 99, "x") != -1)
+        return err(17, "非法状态码应失败");
+}

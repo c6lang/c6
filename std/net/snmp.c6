@@ -1,0 +1,884 @@
+/* std/net/snmp：SNMPv2c 报文（RFC 3416 的 BER 子集）——解析 + 变量绑定游标 + 构造器。
+ *
+ *     import std.net.snmp;
+ *
+ *     SnmpMsg m = { 0 };
+ *     m.parse(buf, n);                  // 0 = 合法（version=1 即 v2c）
+ *     m.pdu; m.request_id; m.error_status; m.error_index;
+ *     m.community_copy(buf, out, cap);
+ *
+ *     SnmpDoc d = { 0 };
+ *     SnmpVb vb = { 0 };
+ *     d.open(&m, buf, n);               // 游标：open / next / count / reset
+ *     while (d.next(&vb)) {             // 每条变量绑定：OID + 值
+ *         vb.oid_str(buf, oid, sizeof oid);       // "1.3.6.1.2.1.1.1.0"
+ *         vb.type;                                // SNMP_OCTET_STRING 等
+ *         vb.value_off / vb.value_len;            // 值的原始字节
+ *     }
+ *
+ *     char req[256] = { 0 };
+ *     SnmpBuilder b = { 0 };
+ *     b.init(req, sizeof req, "public");          // 方法：init / get / finish
+ *     b.get(1, "1.3.6.1.2.1.1.1.0");
+ *     b.get(2, "1.3.6.1.2.1.1.3.0");
+ *     int len = b.finish();
+ *
+ * 只实现 SNMPv2c（version = 1）最常用的 PDU：GetRequest(A0)/GetNextRequest(A1)/
+ * Response(A2)/SetRequest(A3)/GetBulk(A5)。v1 与 SNMPv3 不认（v3 有加密/USM，属于
+ * 另一个量级）。
+ *
+ * BER 只做「短格式 + 长格式长度」和一个整数/OID 解码；值一律以**原始字节**交回
+ * （`type` 给类型码），不在这里做类型转换——这样 noSuchObject/exception 值也能原样
+ * 透传。
+ */
+#include <string.h>
+
+module std.net.snmp;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define SNMP_V2C 1
+
+#define SNMP_GET 0xa0
+#define SNMP_GETNEXT 0xa1
+#define SNMP_RESPONSE 0xa2
+#define SNMP_SET 0xa3
+#define SNMP_GETBULK 0xa5
+
+#define SNMP_INTEGER 0x02
+#define SNMP_OCTET_STRING 0x04
+#define SNMP_NULL 0x05
+#define SNMP_OID 0x06
+#define SNMP_IPADDRESS 0x40
+#define SNMP_COUNTER32 0x41
+#define SNMP_GAUGE32 0x42
+#define SNMP_TIMETICKS 0x43
+#define SNMP_COUNTER64 0x46
+#define SNMP_NOSUCHOBJECT 0x80
+#define SNMP_NOSUCHINSTANCE 0x81
+#define SNMP_ENDOFMIBVIEW 0x82
+
+struct SnmpMsg {
+    int ok;
+    int version;
+    int community_off;
+    int community_len;
+    int pdu;
+    long request_id;
+    int error_status;
+    int error_index;
+    int vbs_off;                /* 变量绑定列表内容起点 */
+    int vbs_end;
+    int nvb;
+};
+
+struct SnmpVb {
+    int oid_off;                /* OID 的**内容**字节（不含 0x06/长度） */
+    int oid_len;
+    int type;
+    int value_off;
+    int value_len;
+    int idx;
+};
+
+struct SnmpDoc {
+    const unsigned char *buf;
+    int start;
+    int pos;
+    int end;
+    int seen;
+    int bad;
+};
+
+struct SnmpBuilder {
+    unsigned char *buf;
+    int cap;
+    int n;
+    int nvb;
+    int body_start;             /* varbind list 起点（最后回填长度） */
+    int good;                   /* 字段名避开方法 ok() */
+    int pdu;                    /* 默认 GetRequest，可改成 Response/Set */
+    unsigned char community[32];
+    int community_len;
+};
+
+/* ---- 最小 BER ---- */
+
+/* 读一个 TLV；成功返回 0，并写 *tag/*off/*len，*next 指向下一个 TLV。 */
+static int ber_read(const unsigned char *buf, int pos, int end, int *tag,
+                    int *off, int *len, int *next)
+{
+    int t = 0;
+    int l = 0;
+    int p = pos;
+
+    if (p >= end)
+        return -1;
+    t = buf[p++];
+    if (p >= end)
+        return -1;
+    l = buf[p++];
+    if (l & 0x80) {
+        int k = l & 0x7f;
+
+        if (k <= 0 || k > 3 || p + k > end)
+            return -1;
+        l = 0;
+        for (int i = 0; i < k; i++)
+            l = (l << 8) | buf[p++];
+    }
+    if (l < 0 || p + l > end)
+        return -1;
+    *tag = t;
+    *off = p;
+    *len = l;
+    *next = p + l;
+    return 0;
+}
+
+static long ber_int(const unsigned char *buf, int off, int len)
+{
+    long v = 0;
+    int neg = 0;
+
+    if (len <= 0)
+        return 0;
+    neg = (buf[off] & 0x80) ? 1 : 0;
+    for (int i = 0; i < len; i++)
+        v = (v << 8) | buf[off + i];
+    if (neg && len < 8)
+        v -= (long)1 << (len * 8);
+    return v;
+}
+
+/* BER 长度写法；返回写入字节数。 */
+static int ber_put_len(unsigned char *buf, int len)
+{
+    if (len < 0x80) {
+        buf[0] = (unsigned char)len;
+        return 1;
+    }
+    if (len < 0x100) {
+        buf[0] = 0x81;
+        buf[1] = (unsigned char)len;
+        return 2;
+    }
+    buf[0] = 0x82;
+    buf[1] = (unsigned char)((len >> 8) & 0xff);
+    buf[2] = (unsigned char)(len & 0xff);
+    return 3;
+}
+
+/* 把 "1.3.6.1.2.1.1.1.0" 编成 OID 内容字节；返回字节数，失败 -1。 */
+int oid_encode(const char *text, unsigned char *out, int cap)
+{
+    int o = 0;
+    long parts[64] = { 0 };
+    int np = 0;
+    const char *p = text;
+
+    if (!text || !out || cap <= 0)
+        return -1;
+    while (*p && np < 64) {
+        long v = 0;
+        int digits = 0;
+
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (*p - '0');
+            p++;
+            digits++;
+            if (v > 0xffffffffL)
+                return -1;
+        }
+        if (digits == 0)
+            return -1;
+        parts[np++] = v;
+        if (*p == '.')
+            p++;
+        else if (*p == 0)
+            break;
+        else
+            return -1;
+    }
+    if (np < 2)
+        return -1;
+    /* 前两个数字合成第一个字节 */
+    if (parts[0] > 2 || (parts[0] < 2 && parts[1] > 39))
+        return -1;
+    if (o + 1 > cap)
+        return -1;
+    out[o++] = (unsigned char)(parts[0] * 40 + parts[1]);
+    for (int i = 2; i < np; i++) {
+        unsigned long v = (unsigned long)parts[i];
+        unsigned char tmp[6] = { 0 };
+        int k = 0;
+
+        if (v == 0) {
+            if (o + 1 > cap)
+                return -1;
+            out[o++] = 0;
+            continue;
+        }
+        while (v > 0 && k < 6) {
+            tmp[k++] = (unsigned char)(v & 0x7f);
+            v >>= 7;
+        }
+        if (o + k > cap)
+            return -1;
+        for (int j = k - 1; j >= 0; j--) {
+            unsigned char byte = tmp[j];
+
+            if (j > 0)
+                byte |= 0x80;
+            out[o++] = byte;
+        }
+    }
+    return o;
+}
+
+/* OID 内容字节 → "1.3.6..."；返回长度。 */
+int oid_decode(const unsigned char *buf, int off, int len, char *out, int cap)
+{
+    int o = 0;
+    int first = 0;
+    unsigned long v = 0;
+    int have = 0;
+    int idx = off;
+    int end = off + len;
+
+    if (!buf || !out || cap < 4 || len <= 0)
+        return -1;
+    first = buf[idx++];
+    o += 0;
+    /* 第一个字节 = 40*x + y */
+    {
+        char tmp[8] = { 0 };
+        int k = 0;
+        int a = first / 40;
+        int b = first % 40;
+
+        if (a > 2) {
+            a = 2;
+            b = first - 80;
+        }
+        if (a >= 10)
+            return -1;
+        tmp[k++] = (char)('0' + a);
+        tmp[k++] = '.';
+        if (b >= 10) {
+            tmp[k++] = (char)('0' + b / 10);
+            tmp[k++] = (char)('0' + b % 10);
+        } else {
+            tmp[k++] = (char)('0' + b);
+        }
+        if (o + k + 1 > cap)
+            return -1;
+        memcpy(out + o, tmp, (size_t)k);
+        o += k;
+    }
+    while (idx < end) {
+        int byte = buf[idx++];
+
+        v = (v << 7) | (unsigned long)(byte & 0x7f);
+        have = 1;
+        if (!(byte & 0x80)) {
+            char tmp[12] = { 0 };
+            int k = 0;
+            unsigned long x = v;
+
+            do {
+                tmp[k++] = (char)('0' + (int)(x % 10));
+                x /= 10;
+            } while (x > 0 && k < 11);
+            if (o + 1 + k + 1 > cap)
+                return -1;
+            out[o++] = '.';
+            for (int j = k - 1; j >= 0; j--)
+                out[o++] = tmp[j];
+            v = 0;
+            have = 0;
+        }
+    }
+    if (have)
+        return -1;              /* 最后一个子标识没结束 */
+    out[o] = 0;
+    return o;
+}
+
+/* ---- 解析 ---- */
+
+int parse(SnmpMsg *m, const unsigned char *buf, int len)
+{
+    int tag = 0;
+    int off = 0;
+    int l = 0;
+    int next = 0;
+    int outer_end = 0;
+    int q = 0;
+
+    if (!m)
+        return -1;
+    memset(m, 0, sizeof *m);
+    if (!buf || len < 8)
+        return -1;
+    /* 外层 SEQUENCE */
+    if (ber_read(buf, 0, len, &tag, &off, &l, &next) < 0 || tag != 0x30)
+        return -1;
+    outer_end = off + l;
+    q = off;
+    /* version */
+    if (ber_read(buf, q, outer_end, &tag, &off, &l, &next) < 0
+        || tag != SNMP_INTEGER)
+        return -1;
+    m->version = (int)ber_int(buf, off, l);
+    if (m->version != SNMP_V2C)
+        return -1;
+    q = next;
+    /* community */
+    if (ber_read(buf, q, outer_end, &tag, &off, &l, &next) < 0
+        || tag != SNMP_OCTET_STRING)
+        return -1;
+    m->community_off = off;
+    m->community_len = l;
+    q = next;
+    /* PDU */
+    {
+        int pdu_tag = 0;
+        int pdu_off = 0;
+        int pdu_len = 0;
+        int pdu_next = 0;
+        int pdu_end = 0;
+        int r = 0;
+
+        if (ber_read(buf, q, outer_end, &pdu_tag, &pdu_off, &pdu_len, &pdu_next) < 0)
+            return -1;
+        if (pdu_tag != SNMP_GET && pdu_tag != SNMP_GETNEXT
+            && pdu_tag != SNMP_RESPONSE && pdu_tag != SNMP_SET
+            && pdu_tag != SNMP_GETBULK)
+            return -1;
+        m->pdu = pdu_tag;
+        pdu_end = pdu_off + pdu_len;
+        r = pdu_off;
+        /* request-id */
+        if (ber_read(buf, r, pdu_end, &tag, &off, &l, &next) < 0
+            || tag != SNMP_INTEGER)
+            return -1;
+        m->request_id = ber_int(buf, off, l);
+        r = next;
+        /* error-status */
+        if (ber_read(buf, r, pdu_end, &tag, &off, &l, &next) < 0
+            || tag != SNMP_INTEGER)
+            return -1;
+        m->error_status = (int)ber_int(buf, off, l);
+        r = next;
+        /* error-index */
+        if (ber_read(buf, r, pdu_end, &tag, &off, &l, &next) < 0
+            || tag != SNMP_INTEGER)
+            return -1;
+        m->error_index = (int)ber_int(buf, off, l);
+        r = next;
+        /* varbind list */
+        {
+            int list_tag = 0;
+            int list_off = 0;
+            int list_len = 0;
+            int list_next = 0;
+            int k = 0;
+            int cnt = 0;
+
+            if (ber_read(buf, r, pdu_end, &list_tag, &list_off, &list_len,
+                         &list_next) < 0 || list_tag != 0x30)
+                return -1;
+            m->vbs_off = list_off;
+            m->vbs_end = list_off + list_len;
+            k = list_off;
+            while (k < m->vbs_end) {
+                int vt = 0;
+                int vo = 0;
+                int vl = 0;
+                int vn = 0;
+
+                if (ber_read(buf, k, m->vbs_end, &vt, &vo, &vl, &vn) < 0
+                    || vt != 0x30)
+                    return -1;
+                k = vn;
+                cnt++;
+            }
+            m->nvb = cnt;
+        }
+        q = pdu_next;
+        (void)q;
+    }
+    m->ok = 1;
+    return 0;
+}
+
+int community_copy(SnmpMsg *m, const unsigned char *buf, char *out, int cap)
+{
+    if (!m || !m->ok || !buf || !out || m->community_len + 1 > cap)
+        return -1;
+    memcpy(out, buf + m->community_off, (size_t)m->community_len);
+    out[m->community_len] = 0;
+    return m->community_len;
+}
+
+/* ---- 变量绑定游标 ---- */
+
+int open(SnmpDoc *d, const SnmpMsg *m, const unsigned char *buf)
+{
+    if (!d || !m || !m->ok || !buf)
+        return -1;
+    d->buf = buf;
+    d->start = m->vbs_off;
+    d->pos = m->vbs_off;
+    d->end = m->vbs_end;
+    d->seen = 0;
+    d->bad = 0;
+    return 0;
+}
+
+int next(SnmpDoc *d, SnmpVb *out)
+{
+    int tag = 0;
+    int off = 0;
+    int len = 0;
+    int next_pos = 0;
+    int q = 0;
+    int oid_tag = 0;
+    int oid_off = 0;
+    int oid_len = 0;
+    int oid_next = 0;
+    int val_tag = 0;
+    int val_off = 0;
+    int val_len = 0;
+    int val_next = 0;
+
+    if (!d || d->bad)
+        return -1;
+    if (d->pos >= d->end)
+        return 0;
+    if (ber_read(d->buf, d->pos, d->end, &tag, &off, &len, &next_pos) < 0
+        || tag != 0x30) {
+        d->bad = 1;
+        return -1;
+    }
+    q = off;
+    if (ber_read(d->buf, q, off + len, &oid_tag, &oid_off, &oid_len, &oid_next) < 0
+        || oid_tag != SNMP_OID) {
+        d->bad = 1;
+        return -1;
+    }
+    q = oid_next;
+    if (ber_read(d->buf, q, off + len, &val_tag, &val_off, &val_len, &val_next) < 0) {
+        d->bad = 1;
+        return -1;
+    }
+    if (out) {
+        out->oid_off = oid_off;
+        out->oid_len = oid_len;
+        out->type = val_tag;
+        out->value_off = val_off;
+        out->value_len = val_len;
+        out->idx = d->seen;
+    }
+    d->pos = next_pos;
+    d->seen++;
+    return 1;
+}
+
+int count(SnmpDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(SnmpDoc *d)
+{
+    if (!d || !d->buf)
+        return;
+    d->pos = d->start;
+    d->seen = 0;
+    d->bad = 0;
+}
+
+int oid_str(SnmpVb *vb, const unsigned char *buf, char *out, int cap)
+{
+    if (!vb || !buf)
+        return -1;
+    return oid_decode(buf, vb->oid_off, vb->oid_len, out, cap);
+}
+
+int int_value(SnmpVb *vb, const unsigned char *buf, long *out)
+{
+    if (!vb || !buf || !out)
+        return -1;
+    if (vb->type != SNMP_INTEGER && vb->type != SNMP_COUNTER32
+        && vb->type != SNMP_GAUGE32 && vb->type != SNMP_TIMETICKS
+        && vb->type != SNMP_COUNTER64)
+        return -1;
+    *out = ber_int(buf, vb->value_off, vb->value_len);
+    return 0;
+}
+
+/* ---- 构造器 ---- */
+
+void init(SnmpBuilder *b, unsigned char *out, int cap, const char *community)
+{
+    int cl = 0;
+
+    if (!b)
+        return;
+    memset(b, 0, sizeof *b);
+    b->buf = out;
+    b->cap = cap;
+    b->good = (out == 0 || cap < 32) ? 0 : 1;
+    b->pdu = SNMP_GET;
+    cl = community ? (int)strlen(community) : 0;
+    if (cl >= (int)sizeof b->community)
+        b->good = 0;
+    else {
+        memcpy(b->community, community ? community : "", (size_t)cl + 1);
+        b->community_len = cl;
+    }
+}
+
+/* 设置 PDU 类型（SNMP_GET / SNMP_RESPONSE / SNMP_SET ...）；默认 GetRequest。 */
+int set_pdu(SnmpBuilder *b, int tag)
+{
+    if (!b || !b->good)
+        return -1;
+    if (tag != SNMP_GET && tag != SNMP_GETNEXT && tag != SNMP_RESPONSE
+        && tag != SNMP_SET && tag != SNMP_GETBULK)
+        return -1;
+    b->pdu = tag;
+    return 0;
+}
+
+/* 追加一条 varbind：OID + 任意值（type 给类型码，val 可为空）。 */
+int varbind(SnmpBuilder *b, const char *oid, int vtype, const unsigned char *val,
+            int vlen)
+{
+    unsigned char oidbuf[64] = { 0 };
+    int oidlen = 0;
+    int bl = 0;
+    int inner = 0;
+    int lb = 0;
+    unsigned char body[256] = { 0 };
+    unsigned char hdr[8] = { 0 };
+
+    if (!b || !b->good || !oid || vlen < 0 || (vlen > 0 && !val))
+        return -1;
+    oidlen = oid_encode(oid, oidbuf, (int)sizeof oidbuf);
+    if (oidlen < 0)
+        return -1;
+    body[bl++] = SNMP_OID;
+    lb = ber_put_len(hdr, oidlen);
+    memcpy(body + bl, hdr, (size_t)lb);
+    bl += lb;
+    if (bl + oidlen > (int)sizeof body)
+        return -1;
+    memcpy(body + bl, oidbuf, (size_t)oidlen);
+    bl += oidlen;
+    if (vtype == SNMP_NULL) {
+        body[bl++] = SNMP_NULL;
+        body[bl++] = 0;
+    } else {
+        body[bl++] = (unsigned char)vtype;
+        lb = ber_put_len(hdr, vlen);
+        memcpy(body + bl, hdr, (size_t)lb);
+        bl += lb;
+        if (bl + vlen > (int)sizeof body)
+            return -1;
+        if (vlen > 0) {
+            memcpy(body + bl, val, (size_t)vlen);
+            bl += vlen;
+        }
+    }
+    inner = bl;
+    if (b->n + inner + 4 > b->cap)
+        return -1;
+    b->buf[b->n++] = 0x30;
+    lb = ber_put_len(hdr, inner);
+    memcpy(b->buf + b->n, hdr, (size_t)lb);
+    b->n += lb;
+    memcpy(b->buf + b->n, body, (size_t)bl);
+    b->n += bl;
+    b->nvb++;
+    return 0;
+}
+
+/* 追加一条 GetRequest 的 varbind（OID + NULL）。 */
+int get(SnmpBuilder *b, long request_id, const char *oid)
+{
+    (void)request_id;
+    return varbind(b, oid, SNMP_NULL, 0, 0);
+}
+
+/* 收尾：在已有的 varbind 串前面补上 version/community/PDU 头。
+   布局：[SEQ][version INT][community OCTET][PDU][reqid INT][err INT][err_idx INT][vblist SEQ][varbinds] */
+int finish(SnmpBuilder *b, long request_id)
+{
+    unsigned char reqid[10] = { 0 };
+    int rl = 0;
+    int vblen = 0;
+    int vblist_total = 0;
+    int pdu_body = 0;
+    int pdu_total = 0;
+    int comm_total = 0;
+    int content = 0;
+    int outer_hdr = 0;
+    int inner_hdr = 0;
+    unsigned char tmp[8] = { 0 };
+    int o = 0;
+
+    if (!b || !b->good || b->n == 0)
+        return -1;
+    /* request-id 的 BER 整数（正数，必要时补前导 0） */
+    {
+        unsigned long u = (unsigned long)(request_id < 0 ? -request_id : request_id);
+        unsigned char rev[8] = { 0 };
+        int k = 0;
+
+        if (u == 0) {
+            rev[k++] = 0;
+        } else {
+            while (u > 0 && k < 8) {
+                rev[k++] = (unsigned char)(u & 0xff);
+                u >>= 8;
+            }
+            if (rev[k - 1] & 0x80)
+                rev[k++] = 0;
+        }
+        for (int i = 0; i < k; i++)
+            reqid[i] = rev[k - 1 - i];
+        rl = k;
+    }
+    vblen = b->n;
+    /* 逐层算长度（整数 TLV 都是 tag+len+1 = 3 字节） */
+    {
+        int lb = ber_put_len(tmp, vblen);
+
+        vblist_total = 1 + lb + vblen;
+    }
+    pdu_body = 2 + rl + 3 + 3 + vblist_total;
+    {
+        int lb = ber_put_len(tmp, pdu_body);
+
+        pdu_total = 1 + lb + pdu_body;
+    }
+    comm_total = 2 + b->community_len;
+    content = 3 + comm_total + pdu_total;
+    {
+        int lb = ber_put_len(tmp, content);
+
+        outer_hdr = 1 + lb;
+    }
+    inner_hdr = outer_hdr + 3 + comm_total + 1
+              + ber_put_len(tmp, pdu_body) + 2 + rl + 3 + 3
+              + 1 + ber_put_len(tmp, vblen);
+    if (inner_hdr + vblen > b->cap)
+        return -1;
+    /* 把 varbinds 整体右移，给头部腾地方 */
+    memmove(b->buf + inner_hdr, b->buf, (size_t)vblen);
+    /* 写头部 */
+    {
+        int lb = 0;
+
+        b->buf[o++] = 0x30;
+        lb = ber_put_len(b->buf + o, content);
+        o += lb;
+        b->buf[o++] = SNMP_INTEGER;
+        b->buf[o++] = 1;
+        b->buf[o++] = SNMP_V2C;
+        b->buf[o++] = SNMP_OCTET_STRING;
+        b->buf[o++] = (unsigned char)b->community_len;
+        memcpy(b->buf + o, b->community, (size_t)b->community_len);
+        o += b->community_len;
+        b->buf[o++] = (unsigned char)b->pdu;
+        lb = ber_put_len(b->buf + o, pdu_body);
+        o += lb;
+        b->buf[o++] = SNMP_INTEGER;
+        b->buf[o++] = (unsigned char)rl;
+        memcpy(b->buf + o, reqid, (size_t)rl);
+        o += rl;
+        b->buf[o++] = SNMP_INTEGER;
+        b->buf[o++] = 1;
+        b->buf[o++] = 0;
+        b->buf[o++] = SNMP_INTEGER;
+        b->buf[o++] = 1;
+        b->buf[o++] = 0;
+        b->buf[o++] = 0x30;
+        lb = ber_put_len(b->buf + o, vblen);
+        o += lb;
+    }
+    b->n = inner_hdr + vblen;
+    return b->n;
+}
+
+int length(SnmpBuilder *b)
+{
+    return b ? b->n : -1;
+}
+
+int ok(SnmpBuilder *b)
+{
+    return b && b->good;
+}
+
+int varbind_count(SnmpBuilder *b)
+{
+    return b ? b->nvb : -1;
+}
+
+/* ---- 自测 ---- */
+
+test "SNMP：解析 GetResponse 与变量绑定游标" {
+    unsigned char buf[256] = { 0 };
+    unsigned char uptime[2] = { 0x30, 0x39 };       /* 12345 TimeTicks */
+    SnmpBuilder b = { 0 };
+    SnmpMsg m = { 0 };
+    SnmpDoc d = { 0 };
+    SnmpVb vb = { 0 };
+    char comm[32] = { 0 };
+    char oid[64] = { 0 };
+    long v = 0;
+    int n = 0;
+
+    b.init(buf, sizeof buf, "public");
+    if (!b.ok())
+        return err(1, "builder init 失败");
+    if (b.set_pdu(SNMP_RESPONSE) != 0)
+        return err(2, "set_pdu 失败");
+    if (b.varbind("1.3.6.1.2.1.1.1.0", SNMP_OCTET_STRING,
+                  (const unsigned char *)"rou", 3) != 0)
+        return err(3, "第 1 条 varbind 失败");
+    if (b.varbind("1.3.6.1.2.1.1.3.0", SNMP_TIMETICKS, uptime, 2) != 0)
+        return err(4, "第 2 条 varbind 失败");
+    if (b.varbind_count() != 2)
+        return err(5, "varbind_count 应为 2");
+    n = b.finish(258);
+    if (n <= 0)
+        return err(6, "finish 失败");
+
+    if (m.parse(buf, n) != 0 || !m.ok)
+        return err(7, "解析失败");
+    if (m.version != SNMP_V2C || m.pdu != SNMP_RESPONSE)
+        return err(8, "version/PDU 不对");
+    if (m.community_copy(buf, comm, sizeof comm) != 6
+        || strcmp(comm, "public") != 0)
+        return err(9, "community 不对");
+    if (m.request_id != 258 || m.error_status != 0 || m.error_index != 0)
+        return err(10, "request-id/error 字段不对");
+    if (m.nvb != 2)
+        return err(11, "应有 2 条 varbind");
+    d.open(&m, buf);
+    if (d.next(&vb) != 1)
+        return err(12, "第一条 varbind 没取到");
+    if (vb.type != SNMP_OCTET_STRING || vb.value_len != 3
+        || memcmp(buf + vb.value_off, "rou", 3) != 0)
+        return err(13, "第一条的值不对");
+    if (vb.oid_str(buf, oid, sizeof oid) <= 0)
+        return err(14, "OID 解码失败");
+    if (strcmp(oid, "1.3.6.1.2.1.1.1.0") != 0)
+        return err(15, "OID 1 不对");
+    if (d.next(&vb) != 1)
+        return err(16, "第二条 varbind 没取到");
+    if (vb.type != SNMP_TIMETICKS)
+        return err(17, "第二条应是 TimeTicks");
+    if (vb.int_value(buf, &v) != 0 || v != 12345)
+        return err(18, "TimeTicks 值不对");
+    if (vb.oid_str(buf, oid, sizeof oid) <= 0
+        || strcmp(oid, "1.3.6.1.2.1.1.3.0") != 0)
+        return err(19, "OID 2 不对");
+    if (d.next(&vb) != 0 || d.count() != 2)
+        return err(20, "应恰好两条");
+    d.reset();
+    if (d.next(&vb) != 1 || d.count() != 1)
+        return err(21, "reset 后应从头");
+}
+
+test "SNMP：OID 编解码、构造器与坏报文" {
+    unsigned char enc[64] = { 0 };
+    unsigned char buf[256] = { 0 };
+    char text[64] = { 0 };
+    int n = 0;
+
+    n = oid_encode("1.3.6.1.2.1.1.1.0", enc, sizeof enc);
+    if (n != 8 || enc[0] != 0x2b)
+        return err(1, "OID 编码字节不对（1.3 => 0x2b，共 8 字节）");
+    if (oid_decode(enc, 0, n, text, sizeof text) != 17
+        || strcmp(text, "1.3.6.1.2.1.1.1.0") != 0)
+        return err(2, "OID 回环不对");
+    if (oid_encode("3.1", enc, sizeof enc) != -1)
+        return err(3, "非法 OID（首段 > 2）应失败");
+    if (oid_encode("1", enc, sizeof enc) != -1)
+        return err(4, "少于两段应失败");
+    /* 构造 GetRequest 两条 OID，再解析回来 */
+    {
+        SnmpBuilder b = { 0 };
+        SnmpMsg m = { 0 };
+        SnmpDoc d = { 0 };
+        SnmpVb vb = { 0 };
+        char oid[64] = { 0 };
+        int total = 0;
+
+        b.init(buf, sizeof buf, "public");
+        if (b.get(1, "1.3.6.1.2.1.1.1.0") != 0)
+            return err(5, "get 第 1 条失败");
+        if (b.get(2, "1.3.6.1.2.1.1.5.0") != 0)
+            return err(6, "get 第 2 条失败");
+        total = b.finish(0x0102);
+        if (total <= 0)
+            return err(7, "finish 失败");
+        if (m.parse(buf, total) != 0 || m.nvb != 2)
+            return err(8, "往返解析失败");
+        if (m.pdu != SNMP_GET)
+            return err(9, "往返 PDU 应是 GetRequest");
+        d.open(&m, buf);
+        if (d.next(&vb) != 1 || vb.oid_str(buf, oid, sizeof oid) <= 0
+            || strcmp(oid, "1.3.6.1.2.1.1.1.0") != 0)
+            return err(10, "往返第 1 条 OID 不对");
+        if (vb.type != SNMP_NULL || vb.value_len != 0)
+            return err(11, "GetRequest 的值应是 NULL");
+        /* 坏报文 */
+        {
+            SnmpMsg bm = { 0 };
+            unsigned char bad[8] = { 0x31, 0x03, 0x02, 0x01, 0x00 };
+
+            if (bm.parse(bad, 5) != -1)
+                return err(12, "外层不是 SEQUENCE 应失败");
+        }
+        {
+            SnmpMsg bm = { 0 };
+            unsigned char copy[256] = { 0 };
+
+            memcpy(copy, buf, (size_t)total);
+            copy[4] = 0;        /* version 改成 0（v1，不支持） */
+            if (bm.parse(copy, total) != -1)
+                return err(13, "version 不是 1 应失败");
+        }
+        {
+            SnmpMsg bm = { 0 };
+
+            if (bm.parse(buf, 1) != -1)
+                return err(14, "太短应失败");
+        }
+        /* 非法 PDU 类型 */
+        {
+            SnmpBuilder bb = { 0 };
+
+            bb.init(buf, sizeof buf, "public");
+            if (bb.set_pdu(0x99) != -1)
+                return err(15, "非法 PDU 类型应拒绝");
+        }
+        /* 容量不足 */
+        {
+            unsigned char small[24] = { 0 };
+            SnmpBuilder sb = { 0 };
+
+            sb.init(small, sizeof small, "public");
+            if (sb.ok())
+                return err(16, "容量太小应 init 失败");
+        }
+    }
+}

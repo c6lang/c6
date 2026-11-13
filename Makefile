@@ -48,7 +48,7 @@ HOSTCC   ?= gcc
         selftest clean distclean help check-tcc mode-ext mode-plain c99 c99test \
         c99tcc-test c6selfcheck selfhost c99selfhost c99selfhost-tcc \
         stdtest errcheck std-demo std-tour std-kit std-box std-web std-net \
-        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs bench-async ubcheck safegate
+        std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt bench-async ubcheck safegate
 
 all: build
 
@@ -1447,6 +1447,16 @@ std-docs: build
 	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stddocs $(STD_DOCS_SRCS)
 	./build/stddocs
 
+# 标准库第九十批（网络管理与可观测）：
+# prometheus（文本暴露格式）/ gemini（协议报文）/ snmp（SNMPv2c BER）/ nntp（NNTP）。
+STD_MGMT_SRCS := examples/stdmgmt.c6 std/core/types.c6 std/net/prometheus.c6 \
+                 std/net/gemini.c6 std/net/snmp.c6 std/net/nntp.c6
+
+std-mgmt: build
+	@mkdir -p build
+	./$(TCC_DIR)/c6 -B $(TCC_DIR) -I . -o build/stdmgmt $(STD_MGMT_SRCS)
+	./build/stdmgmt
+
 # 无 libc（freestanding）冒烟测试：不链接 crt / libc，入口是 _start
 fstest: build
 	./tcc/c6 -B tcc -static -nostdlib -o build/freestanding_fstr \
@@ -1551,7 +1561,7 @@ fstest-bare-smp: build
 	    examples/boot/smp_bare.c6 examples/boot/sched.plain.c \
 	    examples/boot/shim.plain.c examples/boot/io.c
 
-test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs fstest fstest-go \
+test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt fstest fstest-go \
 	  fstest-noos fstest-qemu \
 	  fstest-bare fstest-bare-tests fstest-bare-go fstest-bare-handle \
 	  fstest-bare-smp
@@ -1566,7 +1576,7 @@ test-all: selftest test c6selfcheck stdtest std-demo std-tour std-kit std-box st
 # 是三十批模块拼出来的集成示例。以后 test-all 增删标准库目标，也不会悄悄改变
 # check-all 的语义。
 check-all: test-all errcheck c99test c99tcc-test selfhost c99selfhost c99selfhost-tcc \
-           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs
+           stdtest std-demo std-tour std-kit std-box std-web std-net std-more std-next std-node std-form std-embed std-text std-num std-pack std-conf std-cli std-wire std-algo std-thread std-term std-client std-serve std-crypto std-fsx std-cipher std-data std-calc std-arch std-bin std-img std-enc std-gfx std-doc std-proto std-exec std-ser std-sys std-hash std-legacy std-font std-disk std-transcode std-audio std-proto2 std-ds std-words std-math2 std-time std-packet std-db std-hash2 std-ordered std-bwt std-subs std-creds std-geo std-pkg std-check std-linux std-bin2 std-clean std-color std-cont std-stats std-search std-audio2 std-proto3 std-markup std-textan std-cfg2 std-match std-async std-async2 std-math3 std-linalg std-search2 std-graph2 std-async3 std-geo2 std-async4 std-mesh std-https std-async5 std-ub std-sec std-mw std-proto4 std-ops std-docs std-mgmt
 
 # C99 输出后端已内置在 tcc/c6 里：同一份二进制用 -c99（或 -o *.c、
 # -o <目录>）产出 C 源码。保留这个目标只是为了兼容旧脚本。
@@ -1810,6 +1820,7 @@ distclean:
 #   std-proto4       编译并运行 examples/stdproto4.c6（第八十七批，CoAP/DHCP/SSDP + 文本折叠）
 #   std-ops          编译并运行 examples/stdops.c6（第八十八批，NetFlow/WoL/WebVTT/DNS 区域）
 #   std-docs         编译并运行 examples/stddocs.c6（第八十九批，单复数/mbox/KDL/RTF）
+#   std-mgmt         编译并运行 examples/stdmgmt.c6（第九十批，Prometheus/Gemini/SNMP/NNTP）
 #
 # 基准
 #   bench-async      六语言异步编程基准：c6 / C(epoll、pthread) / C++20 协程 /

@@ -7,6 +7,20 @@
 
 ## 未发布
 
+### 标准库第九十批：网络管理与可观测
+
+- **`std/net/prometheus.c6`**：Prometheus 文本暴露格式（语法层）。样本/`# HELP`/
+  `# TYPE`/注释都交出来，标签与数值按原文本偏移返回；构造器 `help/type/sample`。
+- **`std/net/gemini.c6`**：Gemini 协议报文层。请求行解析（host/port/path/query）、
+  响应状态分类（2x/3x/4x/5x/6x）与 META/正文，两侧都能构造。
+- **`std/net/snmp.c6`**：SNMPv2c + 最小 BER。解析 version/community/PDU/
+  request-id/error 字段与 varbind 列表；值按原始字节透传，`int_value` 解数值；
+  构造器支持 `set_pdu`（Get/GetNext/Response/Set/GetBulk）与任意类型 varbind。
+- **`std/net/nntp.c6`**：NNTP 报文层。命令行（512 字节上限、参数禁止空白）、
+  响应状态分类、多行正文边界 `body_end`、行首点双写还原 `undot`。
+- 集成示例 `examples/stdmgmt.c6`（`make std-mgmt`，53 条检查）+ `STD_MGMT_SRCS` +
+  err 号段 0x6171…0x6174；`std/` 到 **373** 个模块。
+
 ### 标准库第八十九批：文档与邮件
 
 - **`std/text/plural.c6`**：英文单复数——不规则表（person/child/mouse…）、不可数表、
