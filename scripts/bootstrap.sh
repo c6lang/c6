@@ -4,6 +4,10 @@
 # 过、或配置比 ./configure 旧（configure 被本仓库改过，例如新增 C99 目标）
 # 时跑一次 ./configure，生成构建配置。
 #
+# 注意：CMake 现在是仓库唯一的构建入口，configure 与参数校验都由
+# `cmake -S . -B build` 完成（还带 config.mak / config.h 的签名校验）。
+# 本脚本只为兼容旧流程保留，不再由任何构建目标调用；请直接用 CMake。
+#
 # 改 TCC 源码就直接改 tcc/ 里的文件，按普通提交走；不存在“重新同步工作树”
 # 这回事，所以手改不会被覆盖。
 set -eu
@@ -34,13 +38,13 @@ fi
 echo "bootstrap: 配置 $TCC_DIR（./configure --prefix=tcc/dist）"
 ( cd "$TCC_DIR" && ./configure --prefix="$TCC_DIR/dist" >/dev/null )
 
-cat <<EOF
+cat <<'EOF'
 
-bootstrap: 完成。下一步：
+bootstrap: 完成。CMake 是仓库唯一的构建入口，本脚本只作兼容保留：
 
-  make build        # 打开扩展构建（EXTRA-DEFS=-DC6_EXT）
-  make selftest     # 跑 tests/ 下的 c6 自测
-  make test         # 跑上游 tests2 全量测试
+  cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
+  cmake --build build --parallel
+  ctest --test-dir build --output-on-failure
   ./tcc/c6 -B tcc -run hello.c6  # c6 代码放进 .c6 文件，后缀就是开关
 
 EOF

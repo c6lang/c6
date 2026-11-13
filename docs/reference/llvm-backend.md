@@ -84,7 +84,7 @@ tcc: no runtime for target 'wasm32-unknown-unknown': .../libtcc1-wasm32.a is mis
 
 ```
 scripts/build-wasm-runtime.sh wasm32-unknown-unknown   # -> tcc/libtcc1-wasm32.a
-make wasmrt WASM_TRIPLE=wasm32-unknown-unknown         # 同上
+cmake -S . -B build -DC6_WASM_TRIPLE=wasm32-unknown-unknown && cmake --build build --target wasmrt         # 同上
 ```
 
 脚本用 clang `--target=<triple> -O1 -c` 编 `libtcc1.c stdatomic.c builtin.c
@@ -197,7 +197,7 @@ elem:   i64.const 94545115086849, funcs=[27, 28, 107]
 在此之前 wasm 冒烟跑 `wasm32`：
 
 ```
-make wasmtest                                  # 默认 wasm32-unknown-unknown
+cmake --build build --target wasmtest                                  # 默认 wasm32-unknown-unknown
 ./scripts/wasm-smoke.sh aarch64-unknown-linux-gnu   # 只出文件，没有 node 侧验证
 ```
 
@@ -207,11 +207,11 @@ make wasmtest                                  # 默认 wasm32-unknown-unknown
 想看看 GC 在 wasm 上怎么跑，最快的路径是
 
 ```
-make wasmrt      # 编 tcc/libtcc1-wasm32.a
-make wasmtest    # 出 .wasm 并用 node 跑，其中包括 examples/gc_demo.c6
+cmake --build build --target wasmrt      # 编 tcc/libtcc1-wasm32.a
+cmake --build build --target wasmtest    # 出 .wasm 并用 node 跑，其中包括 examples/gc_demo.c6
 ```
 
-`make wasmtest` 最后一项就是仓库自带的 GC 演示：`printf` 走运行库的控制台，
+`cmake --build build --target wasmtest` 最后一项就是仓库自带的 GC 演示：`printf` 走运行库的控制台，
 `spawn`/`async` 走内联线程和协程，node 里跑出 `全部检查通过`、`main()` 返回 0。
 
 一次调用里的所有源文件合成**一个** `.ll`（与 `-o out.c` 把多个源文件合成一份
@@ -293,7 +293,7 @@ IR 文本当成符号名输出过）。符号名本身也要做边界检查和�
 ## 跑测试
 
 ```
-make build
+cmake --build build
 BACKEND=llvm LLVMCC=/usr/lib/llvm-19/bin/clang ./tests/run-tests.sh
 ```
 
@@ -328,7 +328,7 @@ BACKEND=llvm LLVMCC=/usr/lib/llvm-19/bin/clang ./tests/run-tests.sh
 | `tcc/libtcc.c` | `TCC_OUTPUT_LLVM`、`-c`/`-test` 的输出类型 |
 | `tcc/lib/wasm-rt.c` | 目标运行库的 libc/线程桩 + ILP32 适配（只在 `__wasm__` 编） |
 | `scripts/build-wasm-runtime.sh` | 交叉编 `tcc/libtcc1-<arch>.a` |
-| `scripts/wasm-smoke.sh` | `--target` 的端到端冒烟（`make wasmtest`） |
+| `scripts/wasm-smoke.sh` | `--target` 的端到端冒烟（`cmake --build build --target wasmtest`） |
 | `tests/run-tests.sh` | `BACKEND=llvm` 分支 |
 
 ### 外部函数的声明

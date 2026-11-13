@@ -1,0 +1,140 @@
+# check-install：由 c6/CMakeLists.txt 生成，通过 `cmake -P` 执行。
+#
+# 把 install() 结果装进 DESTDIR 暂存树，然后：
+#   1. 检查编译器 / libtcc / 头文件是否都在；
+#   2. 用暂存树里的 c6Config.cmake 配置、编译并运行一个 find_package(c6)
+#      消费方（真的链接 c6::libtcc，而不只是检查文件存在）；
+#   3. 用暂存树里的 c6.pc 跑一遍 pkgconf 的三个典型查询。
+# 生成的目录都在 CMake 构建目录里，不会污染源码树。
+
+set(_c6_bin "@CMAKE_CURRENT_BINARY_DIR@")
+set(_c6_cmake "@CMAKE_COMMAND@")
+set(_c6_prefix_rel "@C6_INSTALL_PREFIX_REL@")
+set(_c6_bindir "@C6_BINDIR_REL@")
+set(_c6_libdir "@C6_LIBDIR_REL@")
+set(_c6_includedir "@C6_INCLUDEDIR_REL@")
+set(_c6_pkgconfig "@C6_PKGCONFIG_DIR_REL@")
+set(_c6_packagedir "@C6_PACKAGE_DIR@")
+set(_c6_have_cmake_pkg "@C6_INSTALL_CMAKE_PACKAGE@")
+set(_c6_have_pc "@C6_INSTALL_PKGCONF@")
+set(_c6_exe_suf "@C6_TCC_EXESUF@")
+set(_c6_lib "@C6_LIBTCC_FILENAME@")
+set(_c6_cc "@CMAKE_C_COMPILER@")
+
+set(_c6_stage "${_c6_bin}/check-install/stage")
+set(_c6_consumer "${_c6_bin}/check-install/consumer")
+file(REMOVE_RECURSE "${_c6_stage}" "${_c6_consumer}")
+file(MAKE_DIRECTORY "${_c6_stage}" "${_c6_consumer}")
+
+message(STATUS "check-install: DESTDIR=${_c6_stage} cmake --install ${_c6_bin}")
+execute_process(
+  COMMAND "${_c6_cmake}" -E env "DESTDIR=${_c6_stage}"
+          "${_c6_cmake}" --install "${_c6_bin}"
+  RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _r EQUAL 0)
+  message(FATAL_ERROR "check-install: 安装失败 (${_r})\n${_out}\n${_err}")
+endif()
+
+set(_c6_root "${_c6_stage}/${_c6_prefix_rel}")
+foreach(_f IN ITEMS
+    "${_c6_root}/${_c6_bindir}/c6${_c6_exe_suf}"
+    "${_c6_root}/${_c6_libdir}/${_c6_lib}"
+    "${_c6_root}/${_c6_includedir}/libtcc.h")
+  if(NOT EXISTS "${_f}")
+    message(FATAL_ERROR "check-install: 安装树里缺 ${_f}")
+  endif()
+endforeach()
+
+# 共享 libtcc 时，c6 可执行文件在暂存树里也要能找到库。
+set(_c6_run_env "${_c6_cmake}" -E env
+    "LD_LIBRARY_PATH=${_c6_root}/${_c6_libdir}")
+execute_process(
+  COMMAND ${_c6_run_env} "${_c6_root}/${_c6_bindir}/c6${_c6_exe_suf}" -v
+  RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _r EQUAL 0)
+  message(FATAL_ERROR "check-install: c6 -v 失败 (${_r})\n${_out}\n${_err}")
+endif()
+message(STATUS "check-install: c6 -v -> ${_out}")
+
+if(_c6_have_pc)
+  set(_c6_pc_dir "${_c6_root}/${_c6_pkgconfig}")
+  if(NOT EXISTS "${_c6_pc_dir}/c6.pc")
+    message(FATAL_ERROR "check-install: 安装树里缺 ${_c6_pc_dir}/c6.pc")
+  endif()
+  find_program(_c6_pkgconf NAMES pkgconf pkg-config)
+  if(_c6_pkgconf)
+    foreach(_c6_pc_args IN ITEMS
+        "--modversion;c6"
+        "--cflags;--libs;c6"
+        "--static;--libs;c6")
+      execute_process(
+        COMMAND "${_c6_cmake}" -E env "PKG_CONFIG_PATH=${_c6_pc_dir}"
+                "${_c6_pkgconf}" ${_c6_pc_args}
+        RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+      if(NOT _r EQUAL 0)
+        message(FATAL_ERROR
+          "check-install: pkgconf ${_c6_pc_args} 失败 (${_r})\n${_err}")
+      endif()
+      message(STATUS "check-install: pkgconf ${_c6_pc_args} -> ${_out}")
+    endforeach()
+  else()
+    message(STATUS "check-install: 没找到 pkgconf，跳过 .pc 运行时校验")
+  endif()
+endif()
+
+if(_c6_have_cmake_pkg)
+  set(_c6_config_dir "${_c6_root}/${_c6_packagedir}")
+  foreach(_f IN ITEMS
+      "${_c6_config_dir}/c6Config.cmake"
+      "${_c6_config_dir}/c6ConfigVersion.cmake"
+      "${_c6_config_dir}/c6Targets.cmake")
+    if(NOT EXISTS "${_f}")
+      message(FATAL_ERROR "check-install: 安装树里缺 ${_f}")
+    endif()
+  endforeach()
+
+  file(WRITE "${_c6_consumer}/CMakeLists.txt"
+"cmake_minimum_required(VERSION 3.18)
+project(c6-consumer LANGUAGES C)
+find_package(c6 REQUIRED COMPONENTS libtcc compiler)
+add_executable(c6-consumer main.c)
+target_link_libraries(c6-consumer PRIVATE c6::libtcc)
+")
+  file(WRITE "${_c6_consumer}/main.c"
+"#include <libtcc.h>
+#include <stdio.h>
+int main(void)
+{
+    TCCState *s = tcc_new();
+    if (!s) { fprintf(stderr, \"tcc_new() failed\\n\"); return 1; }
+    tcc_delete(s);
+    puts(\"libtcc ok\");
+    return 0;
+}
+")
+
+  # c6_DIR 直接指向暂存树：configure_package_config_file 生成的路径以
+  # PACKAGE_PREFIX_DIR 为基准，所以 DESTDIR 里的配置也能正确重定位。
+  execute_process(
+    COMMAND "${_c6_cmake}" -S "${_c6_consumer}" -B "${_c6_consumer}/build"
+            "-Dc6_DIR=${_c6_config_dir}" "-DCMAKE_C_COMPILER=${_c6_cc}"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _r EQUAL 0)
+    message(FATAL_ERROR "check-install: 消费方 configure 失败 (${_r})\n${_out}\n${_err}")
+  endif()
+  execute_process(
+    COMMAND "${_c6_cmake}" --build "${_c6_consumer}/build"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _r EQUAL 0)
+    message(FATAL_ERROR "check-install: 消费方编译失败 (${_r})\n${_out}\n${_err}")
+  endif()
+  execute_process(
+    COMMAND ${_c6_run_env} "${_c6_consumer}/build/c6-consumer"
+    RESULT_VARIABLE _r OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _r EQUAL 0)
+    message(FATAL_ERROR "check-install: 消费方运行失败 (${_r})\n${_out}\n${_err}")
+  endif()
+  message(STATUS "check-install: find_package(c6) 消费方运行 -> ${_out}")
+endif()
+
+message(STATUS "check-install: 通过（stage=${_c6_stage}）")

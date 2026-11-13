@@ -17,7 +17,7 @@ usage() {
     cat <<'EOF'
 usage: scripts/wasm-smoke.sh [triple]
 
-端到端冒烟：tcc --target=<triple> 出 .wasm，再用 node 跑一遍。需要先 make build。
+端到端冒烟：tcc --target=<triple> 出 .wasm，再用 node 跑一遍。需要先 cmake --build build。
 
 arguments:
   triple                 默认 wasm32-unknown-unknown
@@ -59,7 +59,7 @@ fail=0
 
 say() { printf '%s\n' "$*"; }
 
-[ -x "$TCC" ] || { say "wasm-smoke: 先跑 make build"; exit 1; }
+[ -x "$TCC" ] || { say "wasm-smoke: 先跑 cmake --build build"; exit 1; }
 
 cat > "$TMP/prog.c6" <<'EOF'
 /* 纯计算的入口：不碰 libc */

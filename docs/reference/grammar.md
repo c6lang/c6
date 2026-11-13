@@ -1293,7 +1293,7 @@ app.cli      0x6101
 ```sh
 ./tcc/c6 -B tcc -I . -emit-errbase       # 钉住当前能看见的所有模块
 ./tcc/c6 -B tcc -run app/main.c6         # 读 errbase.def，id 不再变
-make errcheck                             # 表是最新的、约束都还在报错
+cmake --build build --target errcheck                             # 表是最新的、约束都还在报错
 ```
 
 用例：[tests/err_ids.c6](../../tests/err_ids.c6)（号段结构与 std 内置号段）、

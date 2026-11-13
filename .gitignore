@@ -7,8 +7,10 @@
 *.a
 *.exe
 
-# 自举产物（make selfhost / make c99selfhost）
+# 自举产物（cmake --build build --target selfhost / c99selfhost）
 /build/
+# CPack 打包产物（cpack -B packages）
+/packages/
 # tokio 基准的 cargo 产物
 bench/async/tokio_bench/target/
 # uya 构建缓存（bench/async/run.sh 会建）

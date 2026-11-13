@@ -82,43 +82,40 @@ c6 是 [TinyCC](https://github.com/TinyCC/tinycc) 的一个分支，在不破坏
 
 ## 快速开始
 
-依赖：`git`、`make`、C 编译器（gcc/clang）、`binutils`；用 CMake 构建时还需要 `cmake`（≥ 3.18）。
+依赖：`cmake`（≥ 3.20，文档与 CI 使用 `ctest --test-dir`）、`make`、C 编译器（gcc/clang）、`binutils`。缺少工具链时构建会
+直接报错，请先按系统包管理器手动安装；不需要联网拉取源码。
 
 ```sh
-# 1. 配置（只有第一次需要；tcc/ 源码就在仓库里，不用联网拉取）
-./scripts/bootstrap.sh          # 等价于 make bootstrap
+# 1. 配置（只有第一次需要；tcc/ 源码就在仓库里）
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
 
-# 2. 构建（打开扩展；会先自动执行 bootstrap）
-make build                      # 等价于 make -C tcc -j EXTRA-DEFS=-DC6_EXT
+# 2. 构建（打开扩展：EXTRA-DEFS=-DC6_EXT，产物 tcc/c6）
+cmake --build build --parallel
 
-# 3. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
+# 3. 跑测试
+ctest --test-dir build --output-on-failure
+
+# 4. 运行（-B tcc 让编译器找到未安装的 libtcc1.a 与运行时头文件）
 ./tcc/c6 -B tcc -run hello.c6   # c6 代码放在 .c6 文件里，后缀就是开关
 
-# 4. 提交前验证：一条命令跑完整回归（最慢的一条，见「构建与验证」）
-make check-all
+# 5. 提交前验证：一条命令跑完整回归（最慢的一条，见「构建与验证」）
+cmake --build build --target check-all
 ```
 
-构建与安装也可以全程走 CMake（推荐，见[使用 CMake 构建与安装](#使用-cmake-构建与安装推荐)）：
+`cmake -S . -B build` 取代了原来的 `scripts/bootstrap.sh`：它在 `tcc/` 里跑一次
+`configure`，把安装目录与编译开关全部从 c6 侧传进去，并把参数记进签名戳；参数变化
+时先清掉旧目标文件再重配。`tcc/` 里的 `configure` 与 `Makefile` 一行都没改。
 
-```sh
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build build --parallel
-```
+### 构建、测试与安装
 
-`make build` / `make selftest` / `make test-all` / `make check-all` 都会先跑 `bootstrap`：
-`tcc/` 已经配置过（有 `config.mak`）就直接跳过，没有才跑一次 `./configure`。
+CMake 是仓库唯一的构建入口。根 `Makefile` 不再是构建系统，它只定义完整回归矩阵
+（130+ 个 `std-*`、freestanding、自举等用例）：配置阶段 CMake 会扫描它，为其中每个
+目标生成同名的 CMake target，先构建好 `tcc/c6` 再让 make 只负责跑用例。
+`scripts/` 里的 wasm 脚本由 CMake 直接调用，`bootstrap.sh` 仅作为兼容脚本保留。
 
-`tcc/` 是普通源码：上游 TinyCC 的基线提交 2d3eea2 先整体导入，之后每个 c6 补丁一个提交
-（提交说明就是补丁标题）。要改 TCC 就直接改 `tcc/` 里的文件、按普通提交提交——没有
-“重新同步工作树”这回事，手改不会被覆盖。`make distclean` 清理构建产物和 configure 结果，
-不会删源码。
-
-### 使用 CMake 构建与安装（推荐）
-
-CMake 是构建入口：`tcc/` 里的 `configure` 与 `Makefile` 一行都没改，所有编译参数都从
-c6 侧传进去（configure 的安装目录与开关、make 的 `EXTRA-DEFS` / `CFLAGS` / `VAR=...`）。
-`tcc/` 里唯一新增的是 configure 自己生成的 `config.mak`、`config.h` 及构建产物，
-本来就在 `tcc/.gitignore` 里。
+所有编译参数都从 c6 侧传进去（configure 的安装目录与开关、make 的 `EXTRA-DEFS` /
+`CFLAGS` / `VAR=...`）。`tcc/` 里唯一新增的是 configure 自己生成的 `config.mak`、
+`config.h` 及构建产物，本来就在 `tcc/.gitignore` 里。
 
 ```sh
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
@@ -136,7 +133,7 @@ DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 D
 
 | 参数 | 默认 | 作用 |
 | --- | --- | --- |
-| `C6_ENABLE_EXT` | `ON` | 传 `EXTRA-DEFS=-DC6_EXT`；`OFF` 等价于 `make build-plain` |
+| `C6_ENABLE_EXT` | `ON` | 传 `EXTRA-DEFS=-DC6_EXT`；`OFF` 等价于 `cmake --build build --target build-plain` |
 | `C6_EXTRA_DEFS` | 空 | 追加宏，例如 `-DC6_FOO` |
 | `C6_TCC_CFLAGS` | `-g -O0 -Wall -Wno-unused-result` | `tcc/Makefile` 的 `CFLAGS` |
 | `C6_TCC_CC` | `CMAKE_C_COMPILER` | `configure --cc` |
@@ -147,15 +144,26 @@ DESTDIR="$PWD/pkg" cmake --install build   # 打包；直接装系统则去掉 D
 | `C6_INSTALL_TCCDIR` | `<libdir>/tcc` | 运行时库（`libtcc1.a`）目录 |
 | `C6_INSTALL_DOCDIR` | `<datarootdir>/doc/tcc` | 文档目录 |
 | `C6_INSTALL_TCC_SYMLINK` | `ON` | 安装 `bin/tcc -> c6` 兼容软链 |
+| `C6_INSTALL_CMAKE_PACKAGE` / `C6_INSTALL_PKGCONF` | `ON` | 安装 `c6Config.cmake` / `c6.pc` |
+| `C6_HOSTCC` / `C6_SELFTEST` / `C6_ERRBASE` | `gcc` / 两个测试脚本 | 转发给回归矩阵的原 `HOSTCC` / `SELFTEST` / `ERRBASE` |
+| `C6_CHECK_JOBS` / `C6_LEGACY_MAKE_VARS` | 空 | `check-all` 并发数；额外转发给回归矩阵的 `VAR=值` |
+| `C6_LLVMCC` / `C6_LLVMAR` / `C6_NODE` / `C6_WASM_TRIPLE` | 空 | wasm 目标的工具链与 triple（留空交给脚本探测） |
+| `C6_PACKAGE_RELEASE` / `C6_PACKAGE_PRERELEASE` | `1` / 自动 | DEB/RPM 的 Release 与预发布标记 |
 
 `tcc/` 是树内构建，同一时间只有一套配置生效：换了 `configure` 参数（或另建一个
 参数不同的构建目录）时，CMake 会先清掉 `tcc/` 的旧目标文件再全量重编，避免
 `libtcc.a` / `libtcc.so` 混用非 `-fPIC` 的目标文件。
 
 `cmake --build build --target build-plain` 是上游模式；`--target bootstrap` 重新跑
-configure；`--target tcc-distclean` 清掉 configure 结果（之后要重新 `cmake -S . -B build`）。
-完整回归矩阵（`std-*`、`freestanding`、自举）仍由旧 Makefile 驱动，CMake 侧用
-`cmake --build build --target check-all` 桥接。
+configure；`--target c6-clean` 清构建产物，`--target clean-all` 连 configure 结果一起清
+（之后再重新 `cmake -S . -B build`）。`--target c6-help` 打印常用命令与用例清单，
+`--target help` 列出全部 CMake target。
+
+回归矩阵的每个用例都有同名 CMake target，例如
+`cmake --build build --target std-util`、`--target fstest-bare-smp`、
+`--target check-all`。这些目标用 `make -o build` 跳过重编，直接复用 CMake 构建好的
+编译器；clang / node / qemu 这类可选工具缺失时，对应用例会跳过或明确报错，不会
+自动安装。
 
 安装后同时提供两套库配置，供下游工程直接消费 `libtcc`：
 
@@ -176,29 +184,23 @@ cc $(pkgconf --cflags --libs c6) app.c -o app
 
 `c6.pc` 的 `prefix` 由 `${pcfiledir}` 反推，装到 `DESTDIR` 暂存目录里再搬走也照样能用。
 
-### 源码编译安装（旧 Makefile 流程）
+### 打包与发布
+
+CPack 复用同一套 `install()` 清单，产出 TGZ / DEB / RPM：
 
 ```sh
-# 1. 配置安装位置
-pushd tcc >/dev/null 
-./configure \
-    --prefix=/usr \
-    --docdir=/usr/share/doc/tcc \
-    --disable-static
-popd >/dev/null
-
-# 2. 编译
-make build
-
-# 3. 测试
-export LD_LIBRARY_PATH="tcc${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" 
-make test
-
-# 4. 安装到系统
-cd tcc
-make install
-ln -sf /usr/bin/c6 /usr/bin/tcc
+cpack --config build/CPackConfig.cmake -G TGZ -B packages
+cpack --config build/CPackConfig.cmake -G DEB -B packages
+cpack --config build/CPackConfig.cmake -G RPM -B packages  # 需要 rpmbuild
 ```
+
+`cmake --build build --target check-install` 会把安装树装进
+`build/check-install/stage`，再用其中的 `c6Config.cmake` 编译运行一个
+`find_package(c6)` 消费方，并用 `pkgconf` 校验 `c6.pc`；CI 每次构建都会跑这一条。
+
+GitHub Actions（`.github/workflows/ci.yml`）在 push / PR 上做两版 Ubuntu × 静态/共享
+`libtcc` 的编译、CTest 与安装校验，并产出三种包；手动触发 `full_regression` 时额外
+跑 `check-all`；打 `v*` tag 时把包与 `SHA256SUMS` 发布到 GitHub Release。
 
 ### Arch Linux 安装
 
@@ -220,13 +222,14 @@ yay -Syu c6
 │   ├── design/         设计文档与实现说明：讲为什么这么做
 │   ├── history/        实施记录与状态：讲做到哪一步了
 │   └── stdlib.md       标准库 std/ 的设计、API 与写法约定
-├── scripts/            bootstrap.sh，以及裸机/wasm 辅助脚本
+├── scripts/            wasm 辅助脚本；bootstrap.sh 仅作兼容脚本（功能已并入 CMake）
 ├── std/                标准库：一个文件一个 module（std/container/vec.c6 -> std.container.vec）
 ├── tests/              c6 全部自测：test 块、编译期诊断、上游 tests2
 ├── examples/           可运行示例：每个特性一个 *_demo.c6，wordcount 是集成示例
-├── CMakeLists.txt      CMake 构建入口：编译/安装/测试 + 生成库配置
-├── cmake/              c6Config / c6Targets / c6.pc 模板与安装期脚本
-├── Makefile            旧构建入口（完整测试矩阵，make help 看全部目标）
+├── CMakeLists.txt      CMake 唯一构建入口：配置/编译/安装/测试/回归/打包
+├── cmake/              c6Config / c6Targets / c6.pc / CPack 与安装期脚本
+├── .github/workflows/  GitHub Actions：编译测试、DEB/RPM/TGZ 打包与发布
+├── Makefile            回归矩阵定义（不再是构建入口；同名目标由 CMake 自动生成）
 └── tcc/                TCC 源码树：上游基线 + 每个 c6 补丁一个提交（不改动）
 ```
 
@@ -238,7 +241,7 @@ yay -Syu c6
 | 写 c6 代码 | [docs/manual/](docs/manual/)（语法与陷阱）+ [docs/stdlib.md](docs/stdlib.md)（标准库 API） |
 | 查语法规范 | [docs/reference/grammar.md](docs/reference/grammar.md)（EBNF 增量语法、静态约束、重写规则） |
 | 查报错信息 | [docs/reference/diagnostics.md](docs/reference/diagnostics.md)（C1–C134 约束与诊断文本） |
-| 查命令行/构建目标 | [docs/reference/cli.md](docs/reference/cli.md)（编译器选项 + 全部 make 目标） |
+| 查命令行/构建目标 | [docs/reference/cli.md](docs/reference/cli.md)（编译器选项 + 全部 CMake 构建目标） |
 | 改编译器 | [docs/design/plan.md](docs/design/plan.md) → [docs/design/implementation-notes.md](docs/design/implementation-notes.md) → [grammar.md §11](docs/reference/grammar.md#11-实现位置)（实现位置表） |
 | 看实现进度 | [docs/history/status.md](docs/history/status.md)（分阶段状态）+ [CHANGELOG.md](CHANGELOG.md) |
 | 后端（C99 / LLVM） | [docs/reference/c99-backend.md](docs/reference/c99-backend.md)、[docs/reference/llvm-backend.md](docs/reference/llvm-backend.md) |
@@ -249,31 +252,29 @@ yay -Syu c6
 ## 构建与验证
 
 ```sh
-make build        # 扩展模式（EXTRA-DEFS=-DC6_EXT）
-make build-plain  # 上游模式（不定义 C6_EXT）
-make test         # tests2 上游全量（扩展模式）
-make test-all     # selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
-make check-all    # 提交/发布前跑这一条：test-all + errcheck + C99 后端 + 三条自举路线
-                  # 共享 build/ 下固定路径的 std 家族整组串行，其余目标并发跑；
-                  # CHECK_JOBS=1 make check-all 则整轮串行
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build --parallel                  # 扩展模式（EXTRA-DEFS=-DC6_EXT）
+cmake --build build --target build-plain       # 上游模式（不定义 C6_EXT）
+ctest --test-dir build --output-on-failure     # 5 个 CTest 用例
+cmake --build build --target test-all          # selftest + tests2 + c6selfcheck + 标准库 + freestanding/裸机
+cmake --build build --target check-all         # 再加 errcheck、C99 后端、三条自举路线（发布前跑这一条）
+cmake -S . -B build -DC6_CHECK_JOBS=1 && cmake --build build --target check-all  # 整轮串行
+cmake --build build --target check-install     # 校验装出去的 CMake / pkgconf 库配置
+cmake --build build --target c6-help           # 常用命令与用例清单
 ```
 
-对应的 CMake 命令：
-
-```sh
-cmake -S . -B build
-cmake --build build --parallel          # 等于 make build
-cmake --build build --target build-plain
-cmake --build build --target check-all  # 桥接旧 Makefile 的完整回归
-ctest --test-dir build --output-on-failure
-```
+`ctest` 的 5 个用例是 `c6-selftest`、`c6-errcheck`、`c6-tests2`、
+`c6-c99-selftest`、`c6-c99tcc-selftest`；只想跑上游 tests2 用
+`ctest --test-dir build -R c6-tests2`。`cmake --build build --target check-all` 里共享
+`build/` 固定路径的 `std-*` 家族整组串行，其余目标并发跑。完整目标清单用
+`cmake --build build --target help` 查看。
 
 构建标志（`-DC6_EXT`、`CFLAGS`）记在 `tcc/.c6-flags` 里，所有目标文件都依赖它：
-切模式或换 `CFLAGS` 后下一次 `make` 自动全量重编。别手工删一部分产物——`C6_EXT`
-会改 `struct TCCState` 的布局，混编出来的 `c6` 能链接，但任何输入都报
-`tcc: error: no input files`（详见 [docs/reference/cli.md](docs/reference/cli.md#构建)）。
+切模式或换 `CFLAGS` 后下一次 `cmake --build build` 自动全量重编。别手工删一部分
+产物——`C6_EXT` 会改 `struct TCCState` 的布局，混编出来的 `c6` 能链接，但任何输入
+都报 `tcc: error: no input files`（详见 [docs/reference/cli.md](docs/reference/cli.md#构建)）。
 
-每个目标的含义、自举三条路线怎么比对、`make help` 的完整目标表，见
+每个目标的含义、自举三条路线怎么比对，见
 [docs/reference/cli.md](docs/reference/cli.md)；测试怎么组织、诊断用例怎么写，见
 [docs/manual/testing.md](docs/manual/testing.md)。
 
@@ -663,94 +664,94 @@ printf("%s\n", b->cstr());
 ```sh
 ./tcc/c6 -B tcc -I . -o build/app app.c6 \
     std/container/vec.c6 std/text/fmt.c6 std/core/types.c6 std/text/str.c6 std/container/sort.c6 std/core/err.c6
-make stdtest     # 跑 std/ 下全部 test 块（模块数与块数以实际输出为准）
-make std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
-make std-tour    # 编译并运行 examples/stdtour.c6（第二批模块的拼装示例）
-make std-kit     # 编译并运行 examples/stdkit.c6（第三批模块的拼装示例）
-make std-box     # 编译并运行 examples/stdbox.c6（第四批模块的拼装示例）
-make std-embed   # 编译并运行 examples/stdembed.c6（第十一批嵌入式模块的拼装示例）
-make std-text    # 编译并运行 examples/stdtext.c6（第十二批文本算法模块的拼装示例）
-make std-num     # 编译并运行 examples/stdnum.c6（第十三批数值类型模块的拼装示例）
-make std-pack    # 编译并运行 examples/stdpack.c6（第十四批压缩与文本编码模块的拼装示例）
-make std-conf    # 编译并运行 examples/stdconf.c6（第十五批配置与文档格式模块的拼装示例）
-make std-cli     # 编译并运行 examples/stdcli.c6（第十六批命令行工具基础模块的拼装示例）
-make std-wire    # 编译并运行 examples/stdwire.c6（第十七批网络协议基础模块的拼装示例）
-make std-algo    # 编译并运行 examples/stdalgo.c6（第十八批算法与容器模块的拼装示例）
-make std-thread  # 编译并运行 examples/stdthread.c6（第十九批并发与同步模块的拼装示例）
-make std-term    # 编译并运行 examples/stdterm.c6（第二十批终端与进程控制模块的拼装示例）
-make std-client  # 编译并运行 examples/stdclient.c6（第二十一批网络客户端模块的拼装示例）
-make std-serve   # 编译并运行 examples/stdserve.c6（第二十二批 Web 服务端模块的拼装示例）
-make std-crypto  # 编译并运行 examples/stdcrypto.c6（第二十三批摘要与密钥派生模块的拼装示例）
-make std-fsx     # 编译并运行 examples/stdfsx.c6（第二十四批文件系统进阶模块的拼装示例）
-make std-cipher  # 编译并运行 examples/stdcipher.c6（第二十五批对称加密基础模块的拼装示例）
-make std-data    # 编译并运行 examples/stddata.c6（第二十六批数据格式模块的拼装示例）
-make std-calc    # 编译并运行 examples/stdcalc.c6（第二十七批数值工具模块的拼装示例）
-make std-arch    # 编译并运行 examples/stdarch.c6（第二十八批压缩与归档模块的拼装示例）
-make std-bin     # 编译并运行 examples/stdbin.c6（第二十九批二进制文件格式模块的拼装示例）
-make std-img     # 编译并运行 examples/stdimg.c6（第三十批图像解码模块的拼装示例）
-make std-enc     # 编译并运行 examples/stdenc.c6（第三十一批编码与凭据模块的拼装示例）
-make std-gfx     # 编译并运行 examples/stdgfx.c6（第三十二批图像与 LZW 模块的拼装示例）
-make std-doc     # 编译并运行 examples/stddoc.c6（第三十三批结构化文本格式模块的拼装示例）
-make std-proto   # 编译并运行 examples/stdproto.c6（第三十四批网络协议编解码模块的拼装示例）
-make std-exec    # 编译并运行 examples/stdexec.c6（第三十五批二进制容器格式模块的拼装示例）
-make std-ser     # 编译并运行 examples/stdser.c6（第三十六批序列化与标记模块的拼装示例）
-make std-sys     # 编译并运行 examples/stdsys.c6（第三十七批系统视图模块的拼装示例）
-make std-hash    # 编译并运行 examples/stdhash.c6（第三十八批哈希与校验模块的拼装示例）
-make std-legacy  # 编译并运行 examples/stdlegacy.c6（第三十九批老图形格式模块的拼装示例）
-make std-font    # 编译并运行 examples/stdfont.c6（第四十批字体与矢量模块的拼装示例）
-make std-disk    # 编译并运行 examples/stddisk.c6（第四十一批分区与文件系统模块的拼装示例）
-make std-transcode # 编译并运行 examples/stdtranscode.c6（第四十二批老式文本编码模块的拼装示例）
-make std-audio    # 编译并运行 examples/stdaudio.c6（第四十三批音频容器模块的拼装示例）
-make std-proto2   # 编译并运行 examples/stdproto2.c6（第四十四批文本行协议模块的拼装示例）
-make std-ds       # 编译并运行 examples/stdstruct.c6（第四十五批基础数据结构模块的拼装示例）
-make std-words    # 编译并运行 examples/stdwords.c6（第四十六批文本变换模块的拼装示例）
-make std-math2    # 编译并运行 examples/stdnumeric.c6（第四十七批数值工具模块的拼装示例，链接带 -lm）
-make std-time     # 编译并运行 examples/stdtime.c6（第四十八批时间工具模块的拼装示例）
-make std-packet   # 编译并运行 examples/stdpacket.c6（第四十九批网络报文模块的拼装示例）
-make std-db       # 编译并运行 examples/stddb.c6（第五十批日志与数据库模块的拼装示例）
-make std-hash2    # 编译并运行 examples/stdhash2.c6（第五十一批非加密散列模块的拼装示例）
-make std-ordered  # 编译并运行 examples/stdordered.c6（第五十二批有序容器模块的拼装示例）
-make std-bwt      # 编译并运行 examples/stdcmp.c6（第五十三批变换式压缩积木模块的拼装示例）
-make std-subs     # 编译并运行 examples/stdsubs.c6（第五十四批字幕与播放列表模块的拼装示例）
-make std-creds    # 编译并运行 examples/stdcreds.c6（第五十五批凭据与配置模块的拼装示例）
-make std-geo      # 编译并运行 examples/stdgeo.c6（第五十六批地理编码模块的拼装示例，链接带 -lm）
-make std-pkg      # 编译并运行 examples/stdpkg.c6（第五十七批目标文件与包模块的拼装示例）
-make std-check    # 编译并运行 examples/stdcheck.c6（第五十八批校验与纠错模块的拼装示例）
-make std-linux    # 编译并运行 examples/stdlinux.c6（第五十九批 Linux 配置文本模块的拼装示例）
-make std-bin2     # 编译并运行 examples/stdbin2.c6（第六十批二进制与数值工具模块的拼装示例，链接带 -lm）
-make std-clean    # 编译并运行 examples/stdclean.c6（第六十一批文本清洗与标注模块的拼装示例）
-make std-color    # 编译并运行 examples/stdcolor.c6（第六十二批颜色与单位模块的拼装示例）
-make std-cont     # 编译并运行 examples/stdcontainers.c6（第六十三批基础容器补充模块的拼装示例）
-make std-stats    # 编译并运行 examples/stdstats2.c6（第六十四批统计小工具模块的拼装示例，链接带 -lm）
-make std-search   # 编译并运行 examples/stdsearch.c6（第六十五批字符串算法模块的拼装示例）
-make std-audio2   # 编译并运行 examples/stdlegacy2.c6（第六十六批老音频格式头模块的拼装示例）
-make std-proto3   # 编译并运行 examples/stdnet2.c6（第六十七批小型文本协议模块的拼装示例）
-make std-markup   # 编译并运行 examples/stdmarkup.c6（第六十八批轻量标记语言模块的拼装示例）
-make std-textan   # 编译并运行 examples/stdtextan.c6（第六十九批文本分析模块的拼装示例）
-make std-cfg2     # 编译并运行 examples/stdcfg.c6（第七十批系统配置文件模块的拼装示例）
-make std-match    # 编译并运行 examples/stdmatch.c6（第七十一批匹配与对齐模块的拼装示例）
-make std-async    # 编译并运行 examples/stdasync.c6（第七十二批异步编程基础模块的拼装示例）
-make std-async2   # 编译并运行 examples/stdasync2.c6（第七十三批 executor/asio/retry/awaitgroup 示例）
-make std-math3    # 编译并运行 examples/stdmath3.c6（第七十四批数值方法与拟合模块的拼装示例）
-make std-linalg   # 编译并运行 examples/stdlinalg.c6（第七十五批线性代数模块的拼装示例）
-make std-search2  # 编译并运行 examples/stdsearch2.c6（第七十六批检索与关键词模块的拼装示例）
-make std-graph2   # 编译并运行 examples/stdgraph2.c6（第七十七批图算法进阶模块的拼装示例）
-make std-async3   # 编译并运行 examples/stdasync3.c6（第七十八批 co / async-await 框架示例）
-make std-geo2     # 编译并运行 examples/stdgeo2.c6（第七十九批计算几何模块的拼装示例）
-make std-async4   # 编译并运行 examples/stdasync4.c6（第八十批语言级 async 示例）
-make std-mesh     # 编译并运行 examples/stdmesh.c6（第八十一批 OBJ/STL/PLY/MTL 示例）
-make std-https    # 编译并运行 examples/stdhttps.c6（第八十二批 同步/异步 HTTPS + 性能指标）
-make std-async5   # 编译并运行 examples/stdasync5.c6（第八十三批 预算/任务组/额度/取消）
-make std-ub       # 编译并运行 examples/stdub.c6（第八十四批 lex/parse/ub 静态分析三件套）
-make std-sec      # 编译并运行 examples/stdsec.c6（第八十五批 密钥交换 + 安全策略）
-make std-mw       # 编译并运行 examples/stdmw.c6（第八十六批 限流/缓存/邮件编码/模糊匹配）
-make std-proto4   # 编译并运行 examples/stdproto4.c6（第八十七批 CoAP/DHCP/SSDP + 文本折叠）
-make std-ops      # 编译并运行 examples/stdops.c6（第八十八批 NetFlow/WoL/WebVTT/DNS 区域）
-make std-docs     # 编译并运行 examples/stddocs.c6（第八十九批 单复数/mbox/KDL/RTF）
-make std-mgmt     # 编译并运行 examples/stdmgmt.c6（第九十批 Prometheus/Gemini/SNMP/NNTP）
-make std-util     # 编译并运行 examples/stdutil.c6（第九十一批 CIDR/字节序/排序键/断词）
+cmake --build build --target stdtest     # 跑 std/ 下全部 test 块（模块数与块数以实际输出为准）
+cmake --build build --target std-demo    # 编译并运行 examples/wordcount.c6（用到 8 个模块）
+cmake --build build --target std-tour    # 编译并运行 examples/stdtour.c6（第二批模块的拼装示例）
+cmake --build build --target std-kit     # 编译并运行 examples/stdkit.c6（第三批模块的拼装示例）
+cmake --build build --target std-box     # 编译并运行 examples/stdbox.c6（第四批模块的拼装示例）
+cmake --build build --target std-embed   # 编译并运行 examples/stdembed.c6（第十一批嵌入式模块的拼装示例）
+cmake --build build --target std-text    # 编译并运行 examples/stdtext.c6（第十二批文本算法模块的拼装示例）
+cmake --build build --target std-num     # 编译并运行 examples/stdnum.c6（第十三批数值类型模块的拼装示例）
+cmake --build build --target std-pack    # 编译并运行 examples/stdpack.c6（第十四批压缩与文本编码模块的拼装示例）
+cmake --build build --target std-conf    # 编译并运行 examples/stdconf.c6（第十五批配置与文档格式模块的拼装示例）
+cmake --build build --target std-cli     # 编译并运行 examples/stdcli.c6（第十六批命令行工具基础模块的拼装示例）
+cmake --build build --target std-wire    # 编译并运行 examples/stdwire.c6（第十七批网络协议基础模块的拼装示例）
+cmake --build build --target std-algo    # 编译并运行 examples/stdalgo.c6（第十八批算法与容器模块的拼装示例）
+cmake --build build --target std-thread  # 编译并运行 examples/stdthread.c6（第十九批并发与同步模块的拼装示例）
+cmake --build build --target std-term    # 编译并运行 examples/stdterm.c6（第二十批终端与进程控制模块的拼装示例）
+cmake --build build --target std-client  # 编译并运行 examples/stdclient.c6（第二十一批网络客户端模块的拼装示例）
+cmake --build build --target std-serve   # 编译并运行 examples/stdserve.c6（第二十二批 Web 服务端模块的拼装示例）
+cmake --build build --target std-crypto  # 编译并运行 examples/stdcrypto.c6（第二十三批摘要与密钥派生模块的拼装示例）
+cmake --build build --target std-fsx     # 编译并运行 examples/stdfsx.c6（第二十四批文件系统进阶模块的拼装示例）
+cmake --build build --target std-cipher  # 编译并运行 examples/stdcipher.c6（第二十五批对称加密基础模块的拼装示例）
+cmake --build build --target std-data    # 编译并运行 examples/stddata.c6（第二十六批数据格式模块的拼装示例）
+cmake --build build --target std-calc    # 编译并运行 examples/stdcalc.c6（第二十七批数值工具模块的拼装示例）
+cmake --build build --target std-arch    # 编译并运行 examples/stdarch.c6（第二十八批压缩与归档模块的拼装示例）
+cmake --build build --target std-bin     # 编译并运行 examples/stdbin.c6（第二十九批二进制文件格式模块的拼装示例）
+cmake --build build --target std-img     # 编译并运行 examples/stdimg.c6（第三十批图像解码模块的拼装示例）
+cmake --build build --target std-enc     # 编译并运行 examples/stdenc.c6（第三十一批编码与凭据模块的拼装示例）
+cmake --build build --target std-gfx     # 编译并运行 examples/stdgfx.c6（第三十二批图像与 LZW 模块的拼装示例）
+cmake --build build --target std-doc     # 编译并运行 examples/stddoc.c6（第三十三批结构化文本格式模块的拼装示例）
+cmake --build build --target std-proto   # 编译并运行 examples/stdproto.c6（第三十四批网络协议编解码模块的拼装示例）
+cmake --build build --target std-exec    # 编译并运行 examples/stdexec.c6（第三十五批二进制容器格式模块的拼装示例）
+cmake --build build --target std-ser     # 编译并运行 examples/stdser.c6（第三十六批序列化与标记模块的拼装示例）
+cmake --build build --target std-sys     # 编译并运行 examples/stdsys.c6（第三十七批系统视图模块的拼装示例）
+cmake --build build --target std-hash    # 编译并运行 examples/stdhash.c6（第三十八批哈希与校验模块的拼装示例）
+cmake --build build --target std-legacy  # 编译并运行 examples/stdlegacy.c6（第三十九批老图形格式模块的拼装示例）
+cmake --build build --target std-font    # 编译并运行 examples/stdfont.c6（第四十批字体与矢量模块的拼装示例）
+cmake --build build --target std-disk    # 编译并运行 examples/stddisk.c6（第四十一批分区与文件系统模块的拼装示例）
+cmake --build build --target std-transcode # 编译并运行 examples/stdtranscode.c6（第四十二批老式文本编码模块的拼装示例）
+cmake --build build --target std-audio    # 编译并运行 examples/stdaudio.c6（第四十三批音频容器模块的拼装示例）
+cmake --build build --target std-proto2   # 编译并运行 examples/stdproto2.c6（第四十四批文本行协议模块的拼装示例）
+cmake --build build --target std-ds       # 编译并运行 examples/stdstruct.c6（第四十五批基础数据结构模块的拼装示例）
+cmake --build build --target std-words    # 编译并运行 examples/stdwords.c6（第四十六批文本变换模块的拼装示例）
+cmake --build build --target std-math2    # 编译并运行 examples/stdnumeric.c6（第四十七批数值工具模块的拼装示例，链接带 -lm）
+cmake --build build --target std-time     # 编译并运行 examples/stdtime.c6（第四十八批时间工具模块的拼装示例）
+cmake --build build --target std-packet   # 编译并运行 examples/stdpacket.c6（第四十九批网络报文模块的拼装示例）
+cmake --build build --target std-db       # 编译并运行 examples/stddb.c6（第五十批日志与数据库模块的拼装示例）
+cmake --build build --target std-hash2    # 编译并运行 examples/stdhash2.c6（第五十一批非加密散列模块的拼装示例）
+cmake --build build --target std-ordered  # 编译并运行 examples/stdordered.c6（第五十二批有序容器模块的拼装示例）
+cmake --build build --target std-bwt      # 编译并运行 examples/stdcmp.c6（第五十三批变换式压缩积木模块的拼装示例）
+cmake --build build --target std-subs     # 编译并运行 examples/stdsubs.c6（第五十四批字幕与播放列表模块的拼装示例）
+cmake --build build --target std-creds    # 编译并运行 examples/stdcreds.c6（第五十五批凭据与配置模块的拼装示例）
+cmake --build build --target std-geo      # 编译并运行 examples/stdgeo.c6（第五十六批地理编码模块的拼装示例，链接带 -lm）
+cmake --build build --target std-pkg      # 编译并运行 examples/stdpkg.c6（第五十七批目标文件与包模块的拼装示例）
+cmake --build build --target std-check    # 编译并运行 examples/stdcheck.c6（第五十八批校验与纠错模块的拼装示例）
+cmake --build build --target std-linux    # 编译并运行 examples/stdlinux.c6（第五十九批 Linux 配置文本模块的拼装示例）
+cmake --build build --target std-bin2     # 编译并运行 examples/stdbin2.c6（第六十批二进制与数值工具模块的拼装示例，链接带 -lm）
+cmake --build build --target std-clean    # 编译并运行 examples/stdclean.c6（第六十一批文本清洗与标注模块的拼装示例）
+cmake --build build --target std-color    # 编译并运行 examples/stdcolor.c6（第六十二批颜色与单位模块的拼装示例）
+cmake --build build --target std-cont     # 编译并运行 examples/stdcontainers.c6（第六十三批基础容器补充模块的拼装示例）
+cmake --build build --target std-stats    # 编译并运行 examples/stdstats2.c6（第六十四批统计小工具模块的拼装示例，链接带 -lm）
+cmake --build build --target std-search   # 编译并运行 examples/stdsearch.c6（第六十五批字符串算法模块的拼装示例）
+cmake --build build --target std-audio2   # 编译并运行 examples/stdlegacy2.c6（第六十六批老音频格式头模块的拼装示例）
+cmake --build build --target std-proto3   # 编译并运行 examples/stdnet2.c6（第六十七批小型文本协议模块的拼装示例）
+cmake --build build --target std-markup   # 编译并运行 examples/stdmarkup.c6（第六十八批轻量标记语言模块的拼装示例）
+cmake --build build --target std-textan   # 编译并运行 examples/stdtextan.c6（第六十九批文本分析模块的拼装示例）
+cmake --build build --target std-cfg2     # 编译并运行 examples/stdcfg.c6（第七十批系统配置文件模块的拼装示例）
+cmake --build build --target std-match    # 编译并运行 examples/stdmatch.c6（第七十一批匹配与对齐模块的拼装示例）
+cmake --build build --target std-async    # 编译并运行 examples/stdasync.c6（第七十二批异步编程基础模块的拼装示例）
+cmake --build build --target std-async2   # 编译并运行 examples/stdasync2.c6（第七十三批 executor/asio/retry/awaitgroup 示例）
+cmake --build build --target std-math3    # 编译并运行 examples/stdmath3.c6（第七十四批数值方法与拟合模块的拼装示例）
+cmake --build build --target std-linalg   # 编译并运行 examples/stdlinalg.c6（第七十五批线性代数模块的拼装示例）
+cmake --build build --target std-search2  # 编译并运行 examples/stdsearch2.c6（第七十六批检索与关键词模块的拼装示例）
+cmake --build build --target std-graph2   # 编译并运行 examples/stdgraph2.c6（第七十七批图算法进阶模块的拼装示例）
+cmake --build build --target std-async3   # 编译并运行 examples/stdasync3.c6（第七十八批 co / async-await 框架示例）
+cmake --build build --target std-geo2     # 编译并运行 examples/stdgeo2.c6（第七十九批计算几何模块的拼装示例）
+cmake --build build --target std-async4   # 编译并运行 examples/stdasync4.c6（第八十批语言级 async 示例）
+cmake --build build --target std-mesh     # 编译并运行 examples/stdmesh.c6（第八十一批 OBJ/STL/PLY/MTL 示例）
+cmake --build build --target std-https    # 编译并运行 examples/stdhttps.c6（第八十二批 同步/异步 HTTPS + 性能指标）
+cmake --build build --target std-async5   # 编译并运行 examples/stdasync5.c6（第八十三批 预算/任务组/额度/取消）
+cmake --build build --target std-ub       # 编译并运行 examples/stdub.c6（第八十四批 lex/parse/ub 静态分析三件套）
+cmake --build build --target std-sec      # 编译并运行 examples/stdsec.c6（第八十五批 密钥交换 + 安全策略）
+cmake --build build --target std-mw       # 编译并运行 examples/stdmw.c6（第八十六批 限流/缓存/邮件编码/模糊匹配）
+cmake --build build --target std-proto4   # 编译并运行 examples/stdproto4.c6（第八十七批 CoAP/DHCP/SSDP + 文本折叠）
+cmake --build build --target std-ops      # 编译并运行 examples/stdops.c6（第八十八批 NetFlow/WoL/WebVTT/DNS 区域）
+cmake --build build --target std-docs     # 编译并运行 examples/stddocs.c6（第八十九批 单复数/mbox/KDL/RTF）
+cmake --build build --target std-mgmt     # 编译并运行 examples/stdmgmt.c6（第九十批 Prometheus/Gemini/SNMP/NNTP）
+cmake --build build --target std-util     # 编译并运行 examples/stdutil.c6（第九十一批 CIDR/字节序/排序键/断词）
 # 覆盖面盘点（还缺什么、什么时候到头）：docs/stdlib-coverage.md
-make bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
+cmake --build build --target bench-async  # 六语言异步基准：c6 / C / C++20 / Go / Rust / Uya 打一张对比表
 ```
 
 设计原则、每个模块的 API、写法约定和编译器层面的已知限制都写在

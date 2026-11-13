@@ -28,7 +28,7 @@
 ```
 
 > `import` 只带来**声明**：模块的函数体要把它自己的 `.c6` 文件一起编进程序。
-> 上例里用到 `std/` 下哪个 `.c6` 就编哪个；`make std-demo` 是这条命令的缩写。
+> 上例里用到 `std/` 下哪个 `.c6` 就编哪个；`cmake --build build --target std-demo` 是这条命令的缩写。
 >
 > 模块之间有依赖：`std/container/vec.c6` 的 `sort`/`sort_lex` 用 `std/container/sort.c6` 的内核，
 > 而 `std/container/sort.c6` 又 `import std.text.str`/`std.core.err`/`std.core.types`——所以用
@@ -449,96 +449,96 @@
 | 文件 | 模块 | 内容 |
 | --- | --- | --- |
 | `examples/wordcount.c6` | （无模块） | 把上面几块拼起来的示例程序：入口 `main` 只能写在**不属于任何模块**的文件里 |
-| `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`make std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带自检 |
-| `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`make std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带自检 |
-| `examples/stdbox.c6` | （无模块） | 第四批模块的拼装示例（`make std-box`）：json/sha256/csv/env 各一节，自带自检 |
-| `examples/stdweb.c6` | （无模块） | 第五批模块的拼装示例（`make std-web`）：base64/url/uuid/mime 各一节，自带自检 |
-| `examples/stdnet.c6` | （无模块） | 第六批模块的拼装示例（`make std-net`）：inet/bitbuf/pqueue/ini 各一节，自带自检 |
-| `examples/stdmore.c6` | （无模块） | 第七批模块的拼装示例（`make std-more`）：bitset/glob/base32/http 各一节，自带自检 |
-| `examples/stdnext.c6` | （无模块） | 第八批模块的拼装示例（`make std-next`）：base58/varint/semver/cookie 各一节，自带自检 |
-| `examples/stdnode.c6` | （无模块） | 第九批模块的拼装示例（`make std-node`）：list/ring/utf16/ansi 各一节，自带自检 |
-| `examples/stdform.c6` | （无模块） | 第十批模块的拼装示例（`make std-form`）：props/multipart/punycode/width 各一节，自带自检 |
-| `examples/stdembed.c6` | （无模块） | 第十一批（嵌入式基础）的拼装示例（`make std-embed`）：fixed/crc/pool/frame 各一节，串成「采样 → 定点 → 分帧 → 校验 → 池」链路，自带自检 |
-| `examples/stdtext.c6` | （无模块） | 第十二批（文本算法）的拼装示例（`make std-text`）：regex 拆日志、fuzzy 命令补全、wrap 帮助折行、diff 配置对比，自带自检 |
-| `examples/stdnum.c6` | （无模块） | 第十三批（数值类型）的拼装示例（`make std-num`）：bignum 阶乘与进制、decimal 金额税额、rational 调和级数、complex 乘法与模，自带自检 |
-| `examples/stdpack.c6` | （无模块） | 第十四批（压缩与文本编码）的拼装示例（`make std-pack`）：lz4 压缩遥测帧、rle+delta 压采样、base85 转文本、hexdump 文本化，自带自检 |
-| `examples/stdconf.c6` | （无模块） | 第十五批（配置与文档格式）的拼装示例（`make std-conf`）：toml 读配置、xml 扫文档、query 解析/构建查询串、template 生成报告，自带自检 |
-| `examples/stdcli.c6` | （无模块） | 第十六批（命令行工具基础）的拼装示例（`make std-cli`）：args 解析参数、natural 排序与人类可读化、table 排版、proc 跑子进程，自带自检 |
-| `examples/stdwire.c6` | （无模块） | 第十七批（网络协议基础）的拼装示例（`make std-wire`）：sha1 向量、ws 握手/分帧、dns 查询与响应、loopback TCP 往返，自带自检 |
-| `examples/stdalgo.c6` | （无模块） | 第十八批（算法与容器）的拼装示例（`make std-algo`）：依赖拓扑排序 + 最短路、LRU 缓存、命令前缀树、地址区间，自带自检 |
-| `examples/stdthread.c6` | （无模块） | 第十九批（并发与同步）的拼装示例（`make std-thread`）：原子计数 + 自旋锁、互斥锁 + 条件变量握手、线程池跑任务、通道收发，自带自检 |
-| `examples/stdterm.c6` | （无模块） | 第二十批（终端与进程控制）的拼装示例（`make std-term`）：伪终端检测/窗口大小/原始模式、信号处理与屏蔽、管道读写与 EOF、poll 多路等待，自带自检 |
-| `examples/stdclient.c6` | （无模块） | 第二十一批（网络客户端）的拼装示例（`make std-client`）：UDP 绑定/连接/空报文/超时、UDS socketpair 与路径 socket、resolv.conf 解析 + 本地 DNS 子进程上的一次 A 查询、本地 HTTP 子进程上的一次 chunked GET，自带自检 |
-| `examples/stdserve.c6` | （无模块） | 第二十二批（Web 服务端）的拼装示例（`make std-serve`）：httpd 收请求、router 分发（参数/通配符）、assets 发静态文件（含 403 越界）、session 的 Set-Cookie 往返，客户端用 `std.net.httpc` 打回本地服务端子进程，自带自检 |
-| `examples/stdcrypto.c6` | （无模块） | 第二十三批（消息摘要与密钥派生）的拼装示例（`make std-crypto`）：md5 的 RFC 1321 向量与流式喂入、sha512/sha384 与 HMAC-SHA-512、HKDF 的 RFC 5869 用例、PBKDF2 的 RFC 6070 用例，最后用 HMAC-SHA-256 演示 token 签发/篡改检测，自带自检 |
-| `examples/stdfsx.c6` | （无模块） | 第二十四批（文件系统进阶）的拼装示例（`make std-fsx`）：临时文件/目录、匿名与文件映射（改字节后 sync 回盘）、目录树统计与删树、跨进程抢锁与超时等待，自带自检 |
-| `examples/stdcipher.c6` | （无模块） | 第二十五批（对称加密基础）的拼装示例（`make std-cipher`）：AES 的 FIPS 197 三组向量与 SP 800-38A CTR、ChaCha20 的 RFC 8439 块/加密向量、Poly1305 的 RFC 向量与流式喂入、`/dev/urandom` 随机，最后做一次 ChaCha20+Poly1305 的 encrypt-then-MAC 与篡改检测 |
-| `examples/stddata.c6` | （无模块） | 第二十六批（数据格式）的拼装示例（`make std-data`）：同一份嵌套数据走 bencode/msgpack/cbor 三种编码并核对规范字节，再用 PEM 封装一段 DER 并多块拆封 |
-| `examples/stdcalc.c6` | （无模块） | 第二十七批（数值工具）的拼装示例（`make std-calc`）：Welford 统计与分位数/直方图/相关、2x2 乘法与 3x3 行列式和线性方程组、3-4-5 向量与矩形交并、lerp/remap/缓动/Catmull-Rom |
-| `examples/stdarch.c6` | （无模块） | 第二十八批（压缩与归档）的拼装示例（`make std-arch`）：deflate 的 fixed/stored 往返、zlib 头与 Adler-32、gzip 头与 CRC-32/ISIZE、tar 两个文件的读写，最后把 tar 再用 gzip 压成 `.tar.gz` 并解压重读 |
-| `examples/stdbin.c6` | （无模块） | 第二十九批（二进制文件格式）的拼装示例（`make std-bin`）：解析 48 字节 WAV、遍历 70 字节 PNG 并把 IDAT 交给 zlib 解出像素、读 320 字节 ELF64 的节名、解 225 字节 ZIP 的 stored/deflate 两个条目 |
-| `examples/stdimg.c6` | （无模块） | 第三十批（图像解码）的拼装示例（`make std-img`）：同一张 2x2 图分别用 BMP（24 位自下而上）、TGA（RLE）、QOI（RGB 流）、PNM（P6）解成 RGBA 后逐像素比对，再用 QOI 编码器写回解一遍 |
-| `examples/stdenc.c6` | （无模块） | 第三十一批（编码与凭据）的拼装示例（`make std-enc`）：手写 DER 逐层读 INTEGER/OID/UTF8String/UTCTime、解析一张 829 字节自签证书、HS256 令牌验签与改字节/换密钥的拒绝、RFC 4226 与 RFC 6238 的 OTP 向量与时间窗口 |
-| `examples/stdgfx.c6` | （无模块） | 第三十二批（图像与 LZW）的拼装示例（`make std-gfx`）：LZW 编码→解码往返、3x2 透明 GIF、4x3 未压缩 RGB TIFF、同一张图的 32 位 DIB 与 PNG 两个 ICO 负载（结果必须逐字节一致），最后把 ICO 里那段 PNG 单独交给 `png_decode` |
-| `examples/stddoc.c6` | （无模块） | 第三十三批（结构化文本格式）的拼装示例（`make std-doc`）：HTML 分词后数标签/取 `href`/看 `script` 原文/解实体，遍历一份 YAML 配置把缩进还原成层级并解引号，展开一张折行的 vCard，读一份含两个事件的 iCalendar |
-| `examples/stdproto.c6` | （无模块） | 第三十四批（网络协议编解码）的拼装示例（`make std-proto`）：解析 SSE 事件流（含多行 data）、构造 SOCKS5 问候与域名 CONNECT 并解应答、构造/解析 MQTT CONNECT 与 PUBLISH 并做主题通配、Snappy 压缩往返 |
-| `examples/stdexec.c6` | （无模块） | 第三十五批（二进制容器格式）的拼装示例（`make std-exec`）：内存里现场拼出 cpio 归档（目录+文件+收尾）、PE32+ 映像（节表 + RVA 映射）、Mach-O 64 位映像（`LC_SEGMENT_64` + `LC_MAIN`）与 wasm 模块（导出表），再逐个解析 |
-| `examples/stdser.c6` | （无模块） | 第三十六批（序列化与标记）的拼装示例（`make std-ser`）：现场拼 BSON 与 UBJSON 文档、解一段 plistlib 生成的二进制 plist（58 字节）、把一段 Markdown 渲染成 HTML |
-| `examples/stdsys.c6` | （无模块） | 第三十七批（系统视图）的拼装示例（`make std-sys`）：打印 uname/负载/运行时长/CPU/页大小、rlimit/rusage、当前用户与主组，再用伪终端跑 `sh -c` 并抓它的输出 |
-| `examples/stdhash.c6` | （无模块） | 第三十八批（哈希与校验）的拼装示例（`make std-hash`）：SHA-3-256/SHAKE128、BLAKE2s-256/128、CRC-32C、XXH32/XXH64 的已知向量与流式一致性 |
-| `examples/stdlegacy.c6` | （无模块） | 第三十九批（老图形格式）的拼装示例（`make std-legacy`）：现场拼 PCX（调色板 + RLE）、Radiance HDR（RGBE + 色调映射）、XBM、XPM 四种老格式再解析 |
-| `examples/stdfont.c6` | （无模块） | 第四十批（字体与矢量）的拼装示例（`make std-font`）：现场拼 BDF 字体、WOFF 容器、SVG 路径与最小 TrueType，各自解析一遍 |
-| `examples/stddisk.c6` | （无模块） | 第四十一批（分区与文件系统）的拼装示例（`make std-disk`）：现场拼 MBR+GPT、FAT16 BPB 与目录、ISO 9660 卷与目录记录、ext2 超级块与 inode |
-| `examples/stdtranscode.c6` | （无模块） | 第四十二批（老式文本编码）的拼装示例（`make std-transcode`）：basE91、uuencode、yEnc、EBCDIC 各编码一遍再解回原文 |
-| `examples/stdaudio.c6` | （无模块） | 第四十三批（音频容器）的拼装示例（`make std-audio`）：MP3 标签与帧头、Ogg 页与 Opus 头、FLAC 的 STREAMINFO/VORBIS_COMMENT、MIDI 轨事件 |
-| `examples/stdproto2.c6` | （无模块） | 第四十四批（文本行协议）的拼装示例（`make std-proto2`）：SMTP 应答/命令/DATA 点填充、FTP 应答/PASV/列表行、RESP 编解码、Telnet IAC 协商与去转义 |
-| `examples/stdstruct.c6` | （无模块） | 第四十五批（基础数据结构）的拼装示例（`make std-ds`）：树状数组、线段树、并查集、布隆过滤器各跑一遍 |
-| `examples/stdwords.c6` | （无模块） | 第四十六批（文本变换）的拼装示例（`make std-words`）：slug 化、五种命名风格、罗马数字全范围往返、Soundex/Metaphone |
-| `examples/stdnumeric.c6` | （无模块） | 第四十七批（数值工具）的拼装示例（`make std-math2`）：矢量运算、多项式求值/求导/求根、FFT 往返与单频频谱、样条采样；链接带 `-lm` |
-| `examples/stdtime.c6` | （无模块） | 第四十八批（时间工具）的拼装示例（`make std-time`）：日历换算、ISO 8601 解析/格式化、时长解析/格式化、cron 匹配与下次运行 |
-| `examples/stdpacket.c6` | （无模块） | 第四十九批（网络报文）的拼装示例（`make std-packet`）：NTP 时间戳与偏移、syslog 两种 RFC、STUN 属性与 XOR 地址、TFTP 四种报文 |
-| `examples/stddb.c6` | （无模块） | 第五十批（日志与数据库）的拼装示例（`make std-db`）：环形日志过滤与 dump、SQLite 文件头/页/单元、PostgreSQL 报文与启动包、MySQL 握手与 COM_QUERY |
-| `examples/stdhash2.c6` | （无模块） | 第五十一批（非加密散列补齐）的拼装示例（`make std-hash2`）：FNV（一次性 + 流式）、Adler-32（合并）、MurmurHash3 32/128、SipHash 2-4/1-3 |
-| `examples/stdordered.c6` | （无模块） | 第五十二批（有序容器）的拼装示例（`make std-ordered`）：Treap 排名/第 k 小、堆 top-k 与排序、跳表有序遍历、频次计数器 |
-| `examples/stdcmp.c6` | （无模块） | 第五十三批（变换式压缩积木）的拼装示例（`make std-bwt`）：BWT↔逆变换、MTF、差分（字节与时间戳）、规范 Huffman 往返 |
-| `examples/stdsubs.c6` | （无模块） | 第五十四批（字幕与播放列表）的拼装示例（`make std-subs`）：四种文本格式都用游标方法（`doc.open`/`doc.next`/`doc.count`/`doc.seek`）演示 |
-| `examples/stdcreds.c6` | （无模块） | 第五十五批（凭据与配置）的拼装示例（`make std-creds`）：netrc 查找、ssh 主机匹配与选项、公钥行、crontab 定时行与环境变量，全部方法调用 |
-| `examples/stdgeo.c6` | （无模块） | 第五十六批（地理编码）的拼装示例（`make std-geo`）：球面距离/方位/包围盒（方法）、Geohash、Maidenhead 网格、度分秒格式化；链接带 `-lm` |
-| `examples/stdpkg.c6` | （无模块） | 第五十七批（目标文件与包）的拼装示例（`make std-pkg`）：ar 成员与按名查找、COFF 节、Java class 常量池与方法、RPM 头取值 |
-| `examples/stdcheck.c6` | （无模块） | 第五十八批（校验与纠错）的拼装示例（`make std-check`）：Luhn/ISBN/Verhoeff 校验位、CRC-8/16 流式与方法、汉明纠 1 位错、经典密码往返 |
-| `examples/stdlinux.c6` | （无模块） | 第五十九批（Linux 配置文本）的拼装示例（`make std-linux`）：/proc/mounts 反转义、fstab 查找、os-release 取值、unit 文件分段取值 |
-| `examples/stdbin2.c6` | （无模块） | 第六十批（二进制与数值工具）的拼装示例（`make std-bin2`）：LE/BE 读写、按位打包、fp16/bf16 转换、对齐工具；链接带 `-lm` |
-| `examples/stdclean.c6` | （无模块） | 第六十一批（文本清洗与标注）的拼装示例（`make std-clean`）：SanOpts 清洗、TabStops 展开/还原、Quoter 引用往返、NatoOpts 拼读解码 |
-| `examples/stdcolor.c6` | （无模块） | 第六十二批（颜色与单位）的拼装示例（`make std-color`）：颜色 hex/HSL/混合/对比度、GIMP 调色板、命名颜色与最近匹配、单位换算 |
-| `examples/stdcontainers.c6` | （无模块） | 第六十三批（基础容器补充）的拼装示例（`make std-cont`）：栈做括号匹配、队列验回绕、槽位分配与复用、多重集合计数与最多次数 |
-| `examples/stdstats2.c6` | （无模块） | 第六十四批（统计小工具）的拼装示例（`make std-stats`）：直方图分箱与众数箱、SMA/EMA、序列均值/标准差/相关、分位数与四分位；链接带 `-lm` |
-| `examples/stdsearch.c6` | （无模块） | 第六十五批（字符串算法）的拼装示例（`make std-search`）：KMP/BMH 查找与计数、后缀数组检索与 LCP、回文与异位词 |
-| `examples/stdlegacy2.c6` | （无模块） | 第六十六批（老音频格式头）的拼装示例（`make std-audio2`）：AIFF 块与 80 位采样率、AU 编码、VOC 块遍历、IRCAM 浮点采样率 |
-| `examples/stdnet2.c6` | （无模块） | 第六十七批（小型文本协议）的拼装示例（`make std-proto3`）：IRC 消息解析与构造、Gopher 菜单遍历、WHOIS 字段取值、ident 端口对与应答 |
-| `examples/stdmarkup.c6` | （无模块） | 第六十八批（轻量标记语言）的拼装示例（`make std-markup`）：reST 结构、Org 的 TODO/标签/链接、LaTeX 章节与转义、POD 段落与 strip |
-| `examples/stdtextan.c6` | （无模块） | 第六十九批（文本分析）的拼装示例（`make std-textan`）：切词统计、切句、字符三元组频次、Flesch 可读性与年级 |
-| `examples/stdcfg.c6` | （无模块） | 第七十批（系统配置文件）的拼装示例（`make std-cfg2`）：`.env` 取值、`hosts` 别名查找、`resolv.conf` 统计、`known_hosts` 匹配 |
-| `examples/stdmatch.c6` | （无模块） | 第七十一批（匹配与对齐）的拼装示例（`make std-match`）：多模式扫描、滚动哈希查找、区间集合合并/挖洞、GATTACA 序列比对 |
-| `examples/stdasync.c6` | （无模块） | 第七十二批（异步编程基础）的拼装示例（`make std-async`）：Future 回调与 all/any、定时器堆、协作式任务、poll 事件循环 + 定时器 |
-| `examples/stdasync2.c6` | （无模块） | 第七十三批（async 之上再盖一层）的拼装示例（`make std-async2`）：事件循环 tick、按行异步读、退避重试、完成计数组 |
-| `examples/stdmath3.c6` | （无模块） | 第七十四批（数值方法与拟合）的拼装示例（`make std-math3`）：三种求根、RK4/Euler 对比、黄金分割/三分/网格求极小、直线与二次最小二乘 |
-| `examples/stdlinalg.c6` | （无模块） | 第七十五批（线性代数）的拼装示例（`make std-linalg`）：LU 求解/求逆/行列式、Jacobi 特征值与幂法、8 阶 Poisson 三对角、CSR 的 SpMV 与转置 |
-| `examples/stdsearch2.c6` | （无模块） | 第七十六批（检索与关键词）的拼装示例（`make std-search2`）：倒排索引单词/AND 查询、BM25 长短文档对比、词频 Top-3、词干化五例 |
-| `examples/stdgraph2.c6` | （无模块） | 第七十七批（图算法进阶）的拼装示例（`make std-graph2`）：Kruskal/Prim 互验、CLRS 最大流、Tarjan 分量、Kuhn 匹配 |
-| `examples/stdasync3.c6` | （无模块） | 第七十八批（co / async-await 框架）的拼装示例（`make std-async3`）：三种挂起点、宏式线性 await、结构化并发（含失败传播）、并发额度转交 |
-| `examples/stdgeo2.c6` | （无模块） | 第七十九批（计算几何）的拼装示例（`make std-geo2`）：凸包面积/周长/点内、凹多边形形心与边游标、线段相交/共线重叠/投影、最近点对分治 vs 暴力 |
-| `examples/stdasync4.c6` | （无模块） | 第八十批（语言级 async）的拼装示例（`make std-async4`）：`async`/`await` 的行读写、`AChan` 收发、`apump_fd` 转发、`Rt.wait`/`Rt.run` 驱动 |
-| `examples/stdmesh.c6` | （无模块） | 第八十一批（三维网格）的拼装示例（`make std-mesh`）：OBJ 四面体（顶点/面游标 + 包围盒）、STL ASCII 与二进制（面积）、PLY 四边形面、MTL 材质查表 |
-| `examples/stdhttps.c6` | （无模块） | 第八十二批的拼装示例（`make std-https`）：密钥调度对参考值、同步/异步 HTTPS 明文与加密往返、以及 async 框架开销指标 |
-| `examples/stdasync5.c6` | （无模块） | 第八十三批的拼装示例（`make std-async5`）：额度、任务组、预算、协作取消四个横切面各一节，最后打框架开销指标 |
-| `examples/stdub.c6` | （无模块） | 第八十四批（静态分析三件套）的拼装示例（`make std-ub`）：用 lex/parse/ub 分析一段 9 处 UB 的演示源码，按 `文件:行:列: 一定/可能 [UB-XXX] 标题` 打印，每条附「修法」与可直接粘贴的「代码」 |
-| `examples/stdsec.c6` | （无模块） | 第八十五批（密钥交换 + 安全策略）的拼装示例（`make std-sec`）：X25519 握手、HSTS 策略库、robots 许可、base45 指纹各一节，最后串成一条「响应头 → 策略 → 许可 → 指纹」的流水线（75 条检查） |
-| `examples/stdmw.c6` | （无模块） | 第八十六批（服务端中间件语义）的拼装示例（`make std-mw`）：限流、缓存、邮件编码、模糊匹配各一节，最后串成「限流 → 缓存 → 回源」的请求路径（60 条检查） |
-| `examples/stdproto4.c6` | （无模块） | 第八十七批（发现与配置协议）的拼装示例（`make std-proto4`）：CoAP/DHCP/SSDP 三个报文层各一节 + 文本折叠，最后串成「发现 → 取数 → 写日志」（56 条检查） |
-| `examples/stdops.c6` | （无模块） | 第八十八批（网络运维 + 媒体清单）的拼装示例（`make std-ops`）：NetFlow/WoL/WebVTT/DNS 区域各一节，最后串成「找主机 → 唤醒 → 记流 → 出字幕」（62 条检查） |
-| `examples/stddocs.c6` | （无模块） | 第八十九批（文档与邮件）的拼装示例（`make std-docs`）：单复数 / mbox / KDL / RTF 各一节，最后串成「配置 + 邮件 + 数量 + 正文」（48 条检查） |
-| `examples/stdmgmt.c6` | （无模块） | 第九十批（网络管理与可观测）的拼装示例（`make std-mgmt`）：Prometheus / Gemini / SNMP / NNTP 各一节，最后串成健康检查并输出暴露格式（53 条检查） |
-| `examples/stdutil.c6` | （无模块） | 第九十一批（网段/字节序/排序键/断词）的拼装示例（`make std-util`）：四个模块各一节，最后串成「主机清单 → 归组 → 排序 → 折行」（45 条检查） |
+| `examples/stdtour.c6` | （无模块） | 新模块的拼装示例（`cmake --build build --target std-tour`）：strbuf/path/hash/bits/utf8/deque 各一节，自带自检 |
+| `examples/stdkit.c6` | （无模块） | 第三批模块的拼装示例（`cmake --build build --target std-kit`）：ascii/num/codec/rand/fs/set 各一节，自带自检 |
+| `examples/stdbox.c6` | （无模块） | 第四批模块的拼装示例（`cmake --build build --target std-box`）：json/sha256/csv/env 各一节，自带自检 |
+| `examples/stdweb.c6` | （无模块） | 第五批模块的拼装示例（`cmake --build build --target std-web`）：base64/url/uuid/mime 各一节，自带自检 |
+| `examples/stdnet.c6` | （无模块） | 第六批模块的拼装示例（`cmake --build build --target std-net`）：inet/bitbuf/pqueue/ini 各一节，自带自检 |
+| `examples/stdmore.c6` | （无模块） | 第七批模块的拼装示例（`cmake --build build --target std-more`）：bitset/glob/base32/http 各一节，自带自检 |
+| `examples/stdnext.c6` | （无模块） | 第八批模块的拼装示例（`cmake --build build --target std-next`）：base58/varint/semver/cookie 各一节，自带自检 |
+| `examples/stdnode.c6` | （无模块） | 第九批模块的拼装示例（`cmake --build build --target std-node`）：list/ring/utf16/ansi 各一节，自带自检 |
+| `examples/stdform.c6` | （无模块） | 第十批模块的拼装示例（`cmake --build build --target std-form`）：props/multipart/punycode/width 各一节，自带自检 |
+| `examples/stdembed.c6` | （无模块） | 第十一批（嵌入式基础）的拼装示例（`cmake --build build --target std-embed`）：fixed/crc/pool/frame 各一节，串成「采样 → 定点 → 分帧 → 校验 → 池」链路，自带自检 |
+| `examples/stdtext.c6` | （无模块） | 第十二批（文本算法）的拼装示例（`cmake --build build --target std-text`）：regex 拆日志、fuzzy 命令补全、wrap 帮助折行、diff 配置对比，自带自检 |
+| `examples/stdnum.c6` | （无模块） | 第十三批（数值类型）的拼装示例（`cmake --build build --target std-num`）：bignum 阶乘与进制、decimal 金额税额、rational 调和级数、complex 乘法与模，自带自检 |
+| `examples/stdpack.c6` | （无模块） | 第十四批（压缩与文本编码）的拼装示例（`cmake --build build --target std-pack`）：lz4 压缩遥测帧、rle+delta 压采样、base85 转文本、hexdump 文本化，自带自检 |
+| `examples/stdconf.c6` | （无模块） | 第十五批（配置与文档格式）的拼装示例（`cmake --build build --target std-conf`）：toml 读配置、xml 扫文档、query 解析/构建查询串、template 生成报告，自带自检 |
+| `examples/stdcli.c6` | （无模块） | 第十六批（命令行工具基础）的拼装示例（`cmake --build build --target std-cli`）：args 解析参数、natural 排序与人类可读化、table 排版、proc 跑子进程，自带自检 |
+| `examples/stdwire.c6` | （无模块） | 第十七批（网络协议基础）的拼装示例（`cmake --build build --target std-wire`）：sha1 向量、ws 握手/分帧、dns 查询与响应、loopback TCP 往返，自带自检 |
+| `examples/stdalgo.c6` | （无模块） | 第十八批（算法与容器）的拼装示例（`cmake --build build --target std-algo`）：依赖拓扑排序 + 最短路、LRU 缓存、命令前缀树、地址区间，自带自检 |
+| `examples/stdthread.c6` | （无模块） | 第十九批（并发与同步）的拼装示例（`cmake --build build --target std-thread`）：原子计数 + 自旋锁、互斥锁 + 条件变量握手、线程池跑任务、通道收发，自带自检 |
+| `examples/stdterm.c6` | （无模块） | 第二十批（终端与进程控制）的拼装示例（`cmake --build build --target std-term`）：伪终端检测/窗口大小/原始模式、信号处理与屏蔽、管道读写与 EOF、poll 多路等待，自带自检 |
+| `examples/stdclient.c6` | （无模块） | 第二十一批（网络客户端）的拼装示例（`cmake --build build --target std-client`）：UDP 绑定/连接/空报文/超时、UDS socketpair 与路径 socket、resolv.conf 解析 + 本地 DNS 子进程上的一次 A 查询、本地 HTTP 子进程上的一次 chunked GET，自带自检 |
+| `examples/stdserve.c6` | （无模块） | 第二十二批（Web 服务端）的拼装示例（`cmake --build build --target std-serve`）：httpd 收请求、router 分发（参数/通配符）、assets 发静态文件（含 403 越界）、session 的 Set-Cookie 往返，客户端用 `std.net.httpc` 打回本地服务端子进程，自带自检 |
+| `examples/stdcrypto.c6` | （无模块） | 第二十三批（消息摘要与密钥派生）的拼装示例（`cmake --build build --target std-crypto`）：md5 的 RFC 1321 向量与流式喂入、sha512/sha384 与 HMAC-SHA-512、HKDF 的 RFC 5869 用例、PBKDF2 的 RFC 6070 用例，最后用 HMAC-SHA-256 演示 token 签发/篡改检测，自带自检 |
+| `examples/stdfsx.c6` | （无模块） | 第二十四批（文件系统进阶）的拼装示例（`cmake --build build --target std-fsx`）：临时文件/目录、匿名与文件映射（改字节后 sync 回盘）、目录树统计与删树、跨进程抢锁与超时等待，自带自检 |
+| `examples/stdcipher.c6` | （无模块） | 第二十五批（对称加密基础）的拼装示例（`cmake --build build --target std-cipher`）：AES 的 FIPS 197 三组向量与 SP 800-38A CTR、ChaCha20 的 RFC 8439 块/加密向量、Poly1305 的 RFC 向量与流式喂入、`/dev/urandom` 随机，最后做一次 ChaCha20+Poly1305 的 encrypt-then-MAC 与篡改检测 |
+| `examples/stddata.c6` | （无模块） | 第二十六批（数据格式）的拼装示例（`cmake --build build --target std-data`）：同一份嵌套数据走 bencode/msgpack/cbor 三种编码并核对规范字节，再用 PEM 封装一段 DER 并多块拆封 |
+| `examples/stdcalc.c6` | （无模块） | 第二十七批（数值工具）的拼装示例（`cmake --build build --target std-calc`）：Welford 统计与分位数/直方图/相关、2x2 乘法与 3x3 行列式和线性方程组、3-4-5 向量与矩形交并、lerp/remap/缓动/Catmull-Rom |
+| `examples/stdarch.c6` | （无模块） | 第二十八批（压缩与归档）的拼装示例（`cmake --build build --target std-arch`）：deflate 的 fixed/stored 往返、zlib 头与 Adler-32、gzip 头与 CRC-32/ISIZE、tar 两个文件的读写，最后把 tar 再用 gzip 压成 `.tar.gz` 并解压重读 |
+| `examples/stdbin.c6` | （无模块） | 第二十九批（二进制文件格式）的拼装示例（`cmake --build build --target std-bin`）：解析 48 字节 WAV、遍历 70 字节 PNG 并把 IDAT 交给 zlib 解出像素、读 320 字节 ELF64 的节名、解 225 字节 ZIP 的 stored/deflate 两个条目 |
+| `examples/stdimg.c6` | （无模块） | 第三十批（图像解码）的拼装示例（`cmake --build build --target std-img`）：同一张 2x2 图分别用 BMP（24 位自下而上）、TGA（RLE）、QOI（RGB 流）、PNM（P6）解成 RGBA 后逐像素比对，再用 QOI 编码器写回解一遍 |
+| `examples/stdenc.c6` | （无模块） | 第三十一批（编码与凭据）的拼装示例（`cmake --build build --target std-enc`）：手写 DER 逐层读 INTEGER/OID/UTF8String/UTCTime、解析一张 829 字节自签证书、HS256 令牌验签与改字节/换密钥的拒绝、RFC 4226 与 RFC 6238 的 OTP 向量与时间窗口 |
+| `examples/stdgfx.c6` | （无模块） | 第三十二批（图像与 LZW）的拼装示例（`cmake --build build --target std-gfx`）：LZW 编码→解码往返、3x2 透明 GIF、4x3 未压缩 RGB TIFF、同一张图的 32 位 DIB 与 PNG 两个 ICO 负载（结果必须逐字节一致），最后把 ICO 里那段 PNG 单独交给 `png_decode` |
+| `examples/stddoc.c6` | （无模块） | 第三十三批（结构化文本格式）的拼装示例（`cmake --build build --target std-doc`）：HTML 分词后数标签/取 `href`/看 `script` 原文/解实体，遍历一份 YAML 配置把缩进还原成层级并解引号，展开一张折行的 vCard，读一份含两个事件的 iCalendar |
+| `examples/stdproto.c6` | （无模块） | 第三十四批（网络协议编解码）的拼装示例（`cmake --build build --target std-proto`）：解析 SSE 事件流（含多行 data）、构造 SOCKS5 问候与域名 CONNECT 并解应答、构造/解析 MQTT CONNECT 与 PUBLISH 并做主题通配、Snappy 压缩往返 |
+| `examples/stdexec.c6` | （无模块） | 第三十五批（二进制容器格式）的拼装示例（`cmake --build build --target std-exec`）：内存里现场拼出 cpio 归档（目录+文件+收尾）、PE32+ 映像（节表 + RVA 映射）、Mach-O 64 位映像（`LC_SEGMENT_64` + `LC_MAIN`）与 wasm 模块（导出表），再逐个解析 |
+| `examples/stdser.c6` | （无模块） | 第三十六批（序列化与标记）的拼装示例（`cmake --build build --target std-ser`）：现场拼 BSON 与 UBJSON 文档、解一段 plistlib 生成的二进制 plist（58 字节）、把一段 Markdown 渲染成 HTML |
+| `examples/stdsys.c6` | （无模块） | 第三十七批（系统视图）的拼装示例（`cmake --build build --target std-sys`）：打印 uname/负载/运行时长/CPU/页大小、rlimit/rusage、当前用户与主组，再用伪终端跑 `sh -c` 并抓它的输出 |
+| `examples/stdhash.c6` | （无模块） | 第三十八批（哈希与校验）的拼装示例（`cmake --build build --target std-hash`）：SHA-3-256/SHAKE128、BLAKE2s-256/128、CRC-32C、XXH32/XXH64 的已知向量与流式一致性 |
+| `examples/stdlegacy.c6` | （无模块） | 第三十九批（老图形格式）的拼装示例（`cmake --build build --target std-legacy`）：现场拼 PCX（调色板 + RLE）、Radiance HDR（RGBE + 色调映射）、XBM、XPM 四种老格式再解析 |
+| `examples/stdfont.c6` | （无模块） | 第四十批（字体与矢量）的拼装示例（`cmake --build build --target std-font`）：现场拼 BDF 字体、WOFF 容器、SVG 路径与最小 TrueType，各自解析一遍 |
+| `examples/stddisk.c6` | （无模块） | 第四十一批（分区与文件系统）的拼装示例（`cmake --build build --target std-disk`）：现场拼 MBR+GPT、FAT16 BPB 与目录、ISO 9660 卷与目录记录、ext2 超级块与 inode |
+| `examples/stdtranscode.c6` | （无模块） | 第四十二批（老式文本编码）的拼装示例（`cmake --build build --target std-transcode`）：basE91、uuencode、yEnc、EBCDIC 各编码一遍再解回原文 |
+| `examples/stdaudio.c6` | （无模块） | 第四十三批（音频容器）的拼装示例（`cmake --build build --target std-audio`）：MP3 标签与帧头、Ogg 页与 Opus 头、FLAC 的 STREAMINFO/VORBIS_COMMENT、MIDI 轨事件 |
+| `examples/stdproto2.c6` | （无模块） | 第四十四批（文本行协议）的拼装示例（`cmake --build build --target std-proto2`）：SMTP 应答/命令/DATA 点填充、FTP 应答/PASV/列表行、RESP 编解码、Telnet IAC 协商与去转义 |
+| `examples/stdstruct.c6` | （无模块） | 第四十五批（基础数据结构）的拼装示例（`cmake --build build --target std-ds`）：树状数组、线段树、并查集、布隆过滤器各跑一遍 |
+| `examples/stdwords.c6` | （无模块） | 第四十六批（文本变换）的拼装示例（`cmake --build build --target std-words`）：slug 化、五种命名风格、罗马数字全范围往返、Soundex/Metaphone |
+| `examples/stdnumeric.c6` | （无模块） | 第四十七批（数值工具）的拼装示例（`cmake --build build --target std-math2`）：矢量运算、多项式求值/求导/求根、FFT 往返与单频频谱、样条采样；链接带 `-lm` |
+| `examples/stdtime.c6` | （无模块） | 第四十八批（时间工具）的拼装示例（`cmake --build build --target std-time`）：日历换算、ISO 8601 解析/格式化、时长解析/格式化、cron 匹配与下次运行 |
+| `examples/stdpacket.c6` | （无模块） | 第四十九批（网络报文）的拼装示例（`cmake --build build --target std-packet`）：NTP 时间戳与偏移、syslog 两种 RFC、STUN 属性与 XOR 地址、TFTP 四种报文 |
+| `examples/stddb.c6` | （无模块） | 第五十批（日志与数据库）的拼装示例（`cmake --build build --target std-db`）：环形日志过滤与 dump、SQLite 文件头/页/单元、PostgreSQL 报文与启动包、MySQL 握手与 COM_QUERY |
+| `examples/stdhash2.c6` | （无模块） | 第五十一批（非加密散列补齐）的拼装示例（`cmake --build build --target std-hash2`）：FNV（一次性 + 流式）、Adler-32（合并）、MurmurHash3 32/128、SipHash 2-4/1-3 |
+| `examples/stdordered.c6` | （无模块） | 第五十二批（有序容器）的拼装示例（`cmake --build build --target std-ordered`）：Treap 排名/第 k 小、堆 top-k 与排序、跳表有序遍历、频次计数器 |
+| `examples/stdcmp.c6` | （无模块） | 第五十三批（变换式压缩积木）的拼装示例（`cmake --build build --target std-bwt`）：BWT↔逆变换、MTF、差分（字节与时间戳）、规范 Huffman 往返 |
+| `examples/stdsubs.c6` | （无模块） | 第五十四批（字幕与播放列表）的拼装示例（`cmake --build build --target std-subs`）：四种文本格式都用游标方法（`doc.open`/`doc.next`/`doc.count`/`doc.seek`）演示 |
+| `examples/stdcreds.c6` | （无模块） | 第五十五批（凭据与配置）的拼装示例（`cmake --build build --target std-creds`）：netrc 查找、ssh 主机匹配与选项、公钥行、crontab 定时行与环境变量，全部方法调用 |
+| `examples/stdgeo.c6` | （无模块） | 第五十六批（地理编码）的拼装示例（`cmake --build build --target std-geo`）：球面距离/方位/包围盒（方法）、Geohash、Maidenhead 网格、度分秒格式化；链接带 `-lm` |
+| `examples/stdpkg.c6` | （无模块） | 第五十七批（目标文件与包）的拼装示例（`cmake --build build --target std-pkg`）：ar 成员与按名查找、COFF 节、Java class 常量池与方法、RPM 头取值 |
+| `examples/stdcheck.c6` | （无模块） | 第五十八批（校验与纠错）的拼装示例（`cmake --build build --target std-check`）：Luhn/ISBN/Verhoeff 校验位、CRC-8/16 流式与方法、汉明纠 1 位错、经典密码往返 |
+| `examples/stdlinux.c6` | （无模块） | 第五十九批（Linux 配置文本）的拼装示例（`cmake --build build --target std-linux`）：/proc/mounts 反转义、fstab 查找、os-release 取值、unit 文件分段取值 |
+| `examples/stdbin2.c6` | （无模块） | 第六十批（二进制与数值工具）的拼装示例（`cmake --build build --target std-bin2`）：LE/BE 读写、按位打包、fp16/bf16 转换、对齐工具；链接带 `-lm` |
+| `examples/stdclean.c6` | （无模块） | 第六十一批（文本清洗与标注）的拼装示例（`cmake --build build --target std-clean`）：SanOpts 清洗、TabStops 展开/还原、Quoter 引用往返、NatoOpts 拼读解码 |
+| `examples/stdcolor.c6` | （无模块） | 第六十二批（颜色与单位）的拼装示例（`cmake --build build --target std-color`）：颜色 hex/HSL/混合/对比度、GIMP 调色板、命名颜色与最近匹配、单位换算 |
+| `examples/stdcontainers.c6` | （无模块） | 第六十三批（基础容器补充）的拼装示例（`cmake --build build --target std-cont`）：栈做括号匹配、队列验回绕、槽位分配与复用、多重集合计数与最多次数 |
+| `examples/stdstats2.c6` | （无模块） | 第六十四批（统计小工具）的拼装示例（`cmake --build build --target std-stats`）：直方图分箱与众数箱、SMA/EMA、序列均值/标准差/相关、分位数与四分位；链接带 `-lm` |
+| `examples/stdsearch.c6` | （无模块） | 第六十五批（字符串算法）的拼装示例（`cmake --build build --target std-search`）：KMP/BMH 查找与计数、后缀数组检索与 LCP、回文与异位词 |
+| `examples/stdlegacy2.c6` | （无模块） | 第六十六批（老音频格式头）的拼装示例（`cmake --build build --target std-audio2`）：AIFF 块与 80 位采样率、AU 编码、VOC 块遍历、IRCAM 浮点采样率 |
+| `examples/stdnet2.c6` | （无模块） | 第六十七批（小型文本协议）的拼装示例（`cmake --build build --target std-proto3`）：IRC 消息解析与构造、Gopher 菜单遍历、WHOIS 字段取值、ident 端口对与应答 |
+| `examples/stdmarkup.c6` | （无模块） | 第六十八批（轻量标记语言）的拼装示例（`cmake --build build --target std-markup`）：reST 结构、Org 的 TODO/标签/链接、LaTeX 章节与转义、POD 段落与 strip |
+| `examples/stdtextan.c6` | （无模块） | 第六十九批（文本分析）的拼装示例（`cmake --build build --target std-textan`）：切词统计、切句、字符三元组频次、Flesch 可读性与年级 |
+| `examples/stdcfg.c6` | （无模块） | 第七十批（系统配置文件）的拼装示例（`cmake --build build --target std-cfg2`）：`.env` 取值、`hosts` 别名查找、`resolv.conf` 统计、`known_hosts` 匹配 |
+| `examples/stdmatch.c6` | （无模块） | 第七十一批（匹配与对齐）的拼装示例（`cmake --build build --target std-match`）：多模式扫描、滚动哈希查找、区间集合合并/挖洞、GATTACA 序列比对 |
+| `examples/stdasync.c6` | （无模块） | 第七十二批（异步编程基础）的拼装示例（`cmake --build build --target std-async`）：Future 回调与 all/any、定时器堆、协作式任务、poll 事件循环 + 定时器 |
+| `examples/stdasync2.c6` | （无模块） | 第七十三批（async 之上再盖一层）的拼装示例（`cmake --build build --target std-async2`）：事件循环 tick、按行异步读、退避重试、完成计数组 |
+| `examples/stdmath3.c6` | （无模块） | 第七十四批（数值方法与拟合）的拼装示例（`cmake --build build --target std-math3`）：三种求根、RK4/Euler 对比、黄金分割/三分/网格求极小、直线与二次最小二乘 |
+| `examples/stdlinalg.c6` | （无模块） | 第七十五批（线性代数）的拼装示例（`cmake --build build --target std-linalg`）：LU 求解/求逆/行列式、Jacobi 特征值与幂法、8 阶 Poisson 三对角、CSR 的 SpMV 与转置 |
+| `examples/stdsearch2.c6` | （无模块） | 第七十六批（检索与关键词）的拼装示例（`cmake --build build --target std-search2`）：倒排索引单词/AND 查询、BM25 长短文档对比、词频 Top-3、词干化五例 |
+| `examples/stdgraph2.c6` | （无模块） | 第七十七批（图算法进阶）的拼装示例（`cmake --build build --target std-graph2`）：Kruskal/Prim 互验、CLRS 最大流、Tarjan 分量、Kuhn 匹配 |
+| `examples/stdasync3.c6` | （无模块） | 第七十八批（co / async-await 框架）的拼装示例（`cmake --build build --target std-async3`）：三种挂起点、宏式线性 await、结构化并发（含失败传播）、并发额度转交 |
+| `examples/stdgeo2.c6` | （无模块） | 第七十九批（计算几何）的拼装示例（`cmake --build build --target std-geo2`）：凸包面积/周长/点内、凹多边形形心与边游标、线段相交/共线重叠/投影、最近点对分治 vs 暴力 |
+| `examples/stdasync4.c6` | （无模块） | 第八十批（语言级 async）的拼装示例（`cmake --build build --target std-async4`）：`async`/`await` 的行读写、`AChan` 收发、`apump_fd` 转发、`Rt.wait`/`Rt.run` 驱动 |
+| `examples/stdmesh.c6` | （无模块） | 第八十一批（三维网格）的拼装示例（`cmake --build build --target std-mesh`）：OBJ 四面体（顶点/面游标 + 包围盒）、STL ASCII 与二进制（面积）、PLY 四边形面、MTL 材质查表 |
+| `examples/stdhttps.c6` | （无模块） | 第八十二批的拼装示例（`cmake --build build --target std-https`）：密钥调度对参考值、同步/异步 HTTPS 明文与加密往返、以及 async 框架开销指标 |
+| `examples/stdasync5.c6` | （无模块） | 第八十三批的拼装示例（`cmake --build build --target std-async5`）：额度、任务组、预算、协作取消四个横切面各一节，最后打框架开销指标 |
+| `examples/stdub.c6` | （无模块） | 第八十四批（静态分析三件套）的拼装示例（`cmake --build build --target std-ub`）：用 lex/parse/ub 分析一段 9 处 UB 的演示源码，按 `文件:行:列: 一定/可能 [UB-XXX] 标题` 打印，每条附「修法」与可直接粘贴的「代码」 |
+| `examples/stdsec.c6` | （无模块） | 第八十五批（密钥交换 + 安全策略）的拼装示例（`cmake --build build --target std-sec`）：X25519 握手、HSTS 策略库、robots 许可、base45 指纹各一节，最后串成一条「响应头 → 策略 → 许可 → 指纹」的流水线（75 条检查） |
+| `examples/stdmw.c6` | （无模块） | 第八十六批（服务端中间件语义）的拼装示例（`cmake --build build --target std-mw`）：限流、缓存、邮件编码、模糊匹配各一节，最后串成「限流 → 缓存 → 回源」的请求路径（60 条检查） |
+| `examples/stdproto4.c6` | （无模块） | 第八十七批（发现与配置协议）的拼装示例（`cmake --build build --target std-proto4`）：CoAP/DHCP/SSDP 三个报文层各一节 + 文本折叠，最后串成「发现 → 取数 → 写日志」（56 条检查） |
+| `examples/stdops.c6` | （无模块） | 第八十八批（网络运维 + 媒体清单）的拼装示例（`cmake --build build --target std-ops`）：NetFlow/WoL/WebVTT/DNS 区域各一节，最后串成「找主机 → 唤醒 → 记流 → 出字幕」（62 条检查） |
+| `examples/stddocs.c6` | （无模块） | 第八十九批（文档与邮件）的拼装示例（`cmake --build build --target std-docs`）：单复数 / mbox / KDL / RTF 各一节，最后串成「配置 + 邮件 + 数量 + 正文」（48 条检查） |
+| `examples/stdmgmt.c6` | （无模块） | 第九十批（网络管理与可观测）的拼装示例（`cmake --build build --target std-mgmt`）：Prometheus / Gemini / SNMP / NNTP 各一节，最后串成健康检查并输出暴露格式（53 条检查） |
+| `examples/stdutil.c6` | （无模块） | 第九十一批（网段/字节序/排序键/断词）的拼装示例（`cmake --build build --target std-util`）：四个模块各一节，最后串成「主机清单 → 归组 → 排序 → 折行」（45 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -547,7 +547,7 @@
 | `std/analysis/parse.c6` | `std.analysis.parse` | 务实的递归下降解析器（AST 全放调用方 `Arena`）：`parse_program(a, src)` 给 `Program`（函数表/符号表/`nerr`），认函数、参数、局部声明、赋值/二元/三元/调用/下标/成员、`if`/`while`/`for`/`do`/`switch`/`return`/`break`/`continue`/`defer`/`errdefer`/`try`/`catch`/`foreach`/`test`/元组解构/复合字面量/强转/`sizeof`/`new T`；**认不出来的构造只记账不炸**（`Program.nerr` + `errl/errc` 前 32 条），调用方据此报「这块没检查」 |
 | `std/analysis/ub.c6` | `std.analysis.ub` | 未定义行为检查引擎：`ub_open`/`ub_set_program`/`ub_run`/`ub_findings`，15 类检查（除零、`INT_MIN/-1`、常量溢出、移位、数组与堆越界、空指针解引用、释放后使用/重复释放、返回局部地址、读未初始化堆、零长数组、`memcpy` 重叠、空指针实参、释放非堆指针）；会顺别名（`q = p`）、跨函数（调用点内联：`drop2(p) → drop1(p)` 两层也追，实参的常量与堆块大小会带进被调函数）、循环变量的常量范围（`for (i < 7) a[i]`）、`strcpy` 字面量长度和 `*(a + k)` 判越界，认 `realloc` 接手后作废的旧指针，并在全局变量地址进线程入口时报「可能的数据竞争」，还识别 `if (p)` / `p && …` / `if (!p) return;` 这些守卫，每条给「一定/可能」两档可信度与**具体修法**（`Fix.text` + 可直接粘贴的 `Fix.code`），支持 `// c6ub-ignore` 抑制，同一行同类只报一遍；`ub_accesses()`/`ub_unproven()` 给出「分析了多少处访问、其中多少处说不准」（说不准的交给 `c6 -b` 运行时兜）；`UbOpts.audit_unproven` 打开后每处说不准的访问都报成 `UB-UNAUDITED`（`/// c6ub-proven` 可标审计过） |
 | `std/text/markdown.c6` | `std.text.markdown` | Markdown（CommonMark 常用子集）→ HTML，零分配，结果写调用方缓冲区：`markdown_render` 支持 ATX 标题、段落、围栏代码（带语言名给 `class="language-xx"`）、引用、无序/有序列表、分隔线；`markdown_inline` 支持 `` `code` ``、粗体、斜体、`[文字](链接)`、`<http://…>` 自动链接、反斜杠转义，正文 `& < > "` 会转义；不做嵌套列表/表格/HTML 透传 |
-`std/` 下每个 `.c6` 都自带 `test` 块，`make stdtest` 逐个跑，输出形如（数字会随模块增加变化，
+`std/` 下每个 `.c6` 都自带 `test` 块，`cmake --build build --target stdtest` 逐个跑，输出形如（数字会随模块增加变化，
 以实际输出为准）：
 
 ```
@@ -3077,7 +3077,7 @@ foreach (int i = step_range(5, -1, -2)) { ... } /* 5,3,1 */
 ### 集成示例：`examples/wordcount.c6`
 
 ```sh
-make std-demo
+cmake --build build --target std-demo
 ```
 
 输出：
@@ -3098,7 +3098,7 @@ make std-demo
 ### 集成示例：`examples/stdtour.c6`
 
 ```sh
-make std-tour
+cmake --build build --target std-tour
 ```
 
 ```
@@ -3119,7 +3119,7 @@ stdtour: 73 check(s), 0 failure(s)
 ### 集成示例：`examples/stdkit.c6`
 
 ```sh
-make std-kit
+cmake --build build --target std-kit
 ```
 
 ```
@@ -3136,7 +3136,7 @@ fs 的 mkdir_p → 写文件 → stat → 目录遍历 → rename → 清理、s
 ### 集成示例：`examples/stdbox.c6`
 
 ```sh
-make std-box
+cmake --build build --target std-box
 ```
 
 ```
@@ -3243,7 +3243,7 @@ sha256 的空串与 `"abc"` 向量、分片与一次性一致、RFC 4231 的 HMA
 ### 集成示例：`examples/stdmore.c6`
 
 ```sh
-make std-more
+cmake --build build --target std-more
 ```
 
 ```
@@ -3258,7 +3258,7 @@ stdmore: 28 check(s), 0 failure(s)
 ### 集成示例：`examples/stdnext.c6`
 
 ```sh
-make std-next
+cmake --build build --target std-next
 ```
 
 ```
@@ -3272,7 +3272,7 @@ stdnext: 23 check(s), 0 failure(s)
 ### 集成示例：`examples/stdnode.c6`
 
 ```sh
-make std-node
+cmake --build build --target std-node
 ```
 
 ```
@@ -3286,7 +3286,7 @@ stdnode: 17 check(s), 0 failure(s)
 ### 集成示例：`examples/stdform.c6`
 
 ```sh
-make std-form
+cmake --build build --target std-form
 ```
 
 ```
@@ -3304,7 +3304,7 @@ punycode 把 `münchen.de`/`中文.cn` 转成 A-label 再转回来 → width 按
 ### 集成示例：`examples/stdembed.c6`
 
 ```sh
-make std-embed
+cmake --build build --target std-embed
 ```
 
 ```
@@ -3322,7 +3322,7 @@ crc 算 Modbus 请求的 CRC-16、1-Wire ROM 的 CRC-8、CRC-32C 与 Fletcher/LR
 ### 集成示例：`examples/stdtext.c6`
 
 ```sh
-make std-text
+cmake --build build --target std-text
 ```
 
 ```
@@ -3342,7 +3342,7 @@ wrap 把中英混排的帮助文本折成 34 列（首行缩进 2、续行 6）�
 ### 集成示例：`examples/stdnum.c6`
 
 ```sh
-make std-num
+cmake --build build --target std-num
 ```
 
 ```
@@ -3360,7 +3360,7 @@ stdnum: 21 check(s), 0 failure(s)
 ### 集成示例：`examples/stdpack.c6`
 
 ```sh
-make std-pack
+cmake --build build --target std-pack
 ```
 
 ```
@@ -3384,7 +3384,7 @@ stdpack: 24 check(s), 0 failure(s)
 ### 集成示例：`examples/stdconf.c6`
 
 ```sh
-make std-conf
+cmake --build build --target std-conf
 ```
 
 ```
@@ -3408,7 +3408,7 @@ Makefile 里显式列出九个模块正文（toml 依赖 str+num+err，其余只
 ### 集成示例：`examples/stdcli.c6`
 
 ```sh
-make std-cli
+cmake --build build --target std-cli
 ```
 
 ```
@@ -3440,7 +3440,7 @@ stdcli: 17 check(s), 0 failure(s)
 ### 集成示例：`examples/stdwire.c6`
 
 ```sh
-make std-wire
+cmake --build build --target std-wire
 ```
 
 ```
@@ -3464,7 +3464,7 @@ types）。
 ### 集成示例：`examples/stdalgo.c6`
 
 ```sh
-make std-algo
+cmake --build build --target std-algo
 ```
 
 ```
@@ -3487,7 +3487,7 @@ stdalgo: 26 check(s), 0 failure(s)
 ### 集成示例：`examples/stdthread.c6`
 
 ```sh
-make std-thread
+cmake --build build --target std-thread
 ```
 
 ```
@@ -3510,7 +3510,7 @@ Makefile 里显式列出六个模块正文（chan 依赖 sync，其余各自只�
 ### 集成示例：`examples/stdterm.c6`
 
 ```sh
-make std-term
+cmake --build build --target std-term
 ```
 
 ```
@@ -3535,7 +3535,7 @@ stdterm: 45 check(s), 0 failure(s)
 ### 集成示例：`examples/stdclient.c6`
 
 ```sh
-make std-client
+cmake --build build --target std-client
 ```
 
 ```
@@ -3565,7 +3565,7 @@ stdclient: 36 check(s), 0 failure(s)
 ### 集成示例：`examples/stdserve.c6`
 
 ```sh
-make std-serve
+cmake --build build --target std-serve
 ```
 
 ```
@@ -3580,14 +3580,14 @@ stdserve: 28 check(s), 0 failure(s)
 发：参数路由（`hello, ada`）、`a.txt`（`Content-Type: text/plain`）、目录
 （落到 `index.html`）、`..%2f` 编码越界（403）、`/login`（拿到 `Set-Cookie:
 sid=...`）、带 Cookie 的 `/me`（`user=ada`）、不带 Cookie 的 `/me`（401）。
-所以这一批的客户端和服务端在同一个示例里互相验证，`make std-serve` 不联网。
+所以这一批的客户端和服务端在同一个示例里互相验证，`cmake --build build --target std-serve` 不联网。
 Makefile 里显式列出十九个模块正文（httpd 要 http/tcp，assets 还要
 mime/url/fs/io/path/err，session 要 rand/time/cookie，客户端要 httpc）。
 
 ### 集成示例：`examples/stdcrypto.c6`
 
 ```sh
-make std-crypto
+cmake --build build --target std-crypto
 ```
 
 ```
@@ -3611,7 +3611,7 @@ hkdf 要 sha256，pbkdf2 要 sha1+sha256）。
 ### 集成示例：`examples/stdfsx.c6`
 
 ```sh
-make std-fsx
+cmake --build build --target std-fsx
 ```
 
 ```
@@ -3636,7 +3636,7 @@ lock 要 time，temp 只借 Str 类型）。
 ### 集成示例：`examples/stdcipher.c6`
 
 ```sh
-make std-cipher
+cmake --build build --target std-cipher
 ```
 
 ```
@@ -3661,7 +3661,7 @@ Gentlemen..."），并解密还原；「Poly1305」验 RFC 8439 §2.5.2 的 tag�
 ### 集成示例：`examples/stddata.c6`
 
 ```sh
-make std-data
+cmake --build build --target std-data
 ```
 
 ```
@@ -3682,7 +3682,7 @@ stddata: 15 check(s), 0 failure(s)
 ### 集成示例：`examples/stdcalc.c6`
 
 ```sh
-make std-calc
+cmake --build build --target std-calc
 ```
 
 ```
@@ -3704,7 +3704,7 @@ stdcalc: 32 check(s), 0 failure(s)
 ### 集成示例：`examples/stdarch.c6`
 
 ```sh
-make std-arch
+cmake --build build --target std-arch
 ```
 
 ```
@@ -3727,7 +3727,7 @@ stored 兜底也往返；zlib 套上 `78 01` 头与 Adler-32；gzip 套上 10 �
 ### 集成示例：`examples/stdbin.c6`
 
 ```sh
-make std-bin
+cmake --build build --target std-bin
 ```
 
 ```
@@ -3754,7 +3754,7 @@ stdbin: 20 check(s), 0 failure(s)
 ### 集成示例：`examples/stdimg.c6`
 
 ```sh
-make std-img
+cmake --build build --target std-img
 ```
 
 ```
@@ -3774,7 +3774,7 @@ BGR 换序、QOI 的 RGB 操作码、PNM 的头解析。QOI 那一节还把解�
 ### 集成示例：`examples/stdenc.c6`
 
 ```sh
-make std-enc
+cmake --build build --target std-enc
 ```
 
 ```
@@ -3806,7 +3806,7 @@ otp 打 RFC 4226 的前五个计数器码与 RFC 6238 的 `t=1234567890` 八位�
 ### 集成示例：`examples/stdgfx.c6`
 
 ```sh
-make std-gfx
+cmake --build build --target std-gfx
 ```
 
 ```
@@ -3833,7 +3833,7 @@ LZW 那一节用 256 字节的周期序列把字典撑到码宽增长再解回�
 ### 集成示例：`examples/stddoc.c6`
 
 ```sh
-make std-doc
+cmake --build build --target std-doc
 ```
 
 ```
@@ -3860,7 +3860,7 @@ iCalendar 各用一次折行（`Grace\r\n  Hopper`、`long\r\n  wrapped summary`
 ### 集成示例：`examples/stdproto.c6`
 
 ```sh
-make std-proto
+cmake --build build --target std-proto
 ```
 
 ```
@@ -3889,7 +3889,7 @@ PUBLISH，解出包号/载荷并跑 `home/+` 与 `factory/#` 两条通配；Snap
 ### 集成示例：`examples/stdexec.c6`
 
 ```sh
-make std-exec
+cmake --build build --target std-exec
 ```
 
 ```
@@ -3914,7 +3914,7 @@ Mach-O 只写一个 `LC_SEGMENT_64`（一个 `__text` 节）加一条 `LC_MAIN`�
 ### 集成示例：`examples/stdser.c6`
 
 ```sh
-make std-ser
+cmake --build build --target std-ser
 ```
 
 四种格式各一节：BSON 现场拼 `{svc:"api", port:8080, tags:["a","b"]}`、UBJSON
@@ -3924,7 +3924,7 @@ Markdown 把一段带标题/列表/代码块的文档渲染成 HTML。
 ### 集成示例：`examples/stdsys.c6`
 
 ```sh
-make std-sys
+cmake --build build --target std-sys
 ```
 
 四节：`sysinfo` 打印内核版本、主机名、CPU 数、页大小、运行时长与负载；
@@ -3935,7 +3935,7 @@ make std-sys
 ### 集成示例：`examples/stdhash.c6`
 
 ```sh
-make std-hash
+cmake --build build --target std-hash
 ```
 
 四节各自对已知向量：`SHA3-256("abc")`、`SHAKE128("",32)`、`BLAKE2s-256("abc")`、
@@ -3945,7 +3945,7 @@ make std-hash
 ### 集成示例：`examples/stdlegacy.c6`
 
 ```sh
-make std-legacy
+cmake --build build --target std-legacy
 ```
 
 四节各自现场拼一份数据：PCX 走「头 + RLE 行 + 768 字节 VGA 调色板」；HDR 走
@@ -3955,7 +3955,7 @@ make std-legacy
 ### 集成示例：`examples/stdfont.c6`
 
 ```sh
-make std-font
+cmake --build build --target std-font
 ```
 
 四节：BDF 走「头 + 度量 + 位图」并校验首行与中间行；WOFF 造两张表（一张未压缩、
@@ -3966,7 +3966,7 @@ make std-font
 ### 集成示例：`examples/stddisk.c6`
 
 ```sh
-make std-disk
+cmake --build build --target std-disk
 ```
 
 四节：MBR 先当纯 MBR 读（一个保护性分区），再叠上 GPT 头与一张表项（名字 `EFI`）；
@@ -3977,7 +3977,7 @@ FAT16 走「BPB + 一条 `README.TXT` 目录项 + 小写查找」；ISO 9660 拼
 ### 集成示例：`examples/stdtranscode.c6`
 
 ```sh
-make std-transcode
+cmake --build build --target std-transcode
 ```
 
 四节：basE91 用已知向量核字符表（对 ASCII 文本会略微膨胀，1.23 字符/字节是给
@@ -3988,7 +3988,7 @@ yEnc 校验转义、`=ybegin` 头部字段与往返；EBCDIC 校验 CP037 的码
 ### 集成示例：`examples/stdaudio.c6`
 
 ```sh
-make std-audio
+cmake --build build --target std-audio
 ```
 
 四节：MP3 造「ID3v2 头 + ID3v1 尾 + 一帧」，验证跳过标签后的首帧定位与帧长；
@@ -3999,7 +3999,7 @@ VORBIS_COMMENT 两块，验证按位打包的采样率与注释；MIDI 造一条
 ### 集成示例：`examples/stdproto2.c6`
 
 ```sh
-make std-proto2
+cmake --build build --target std-proto2
 ```
 
 四节：SMTP 走「多行应答 + 末行应答 + EHLO + DATA 点填充」并验证 CR/LF 注入被拒；
@@ -4009,7 +4009,7 @@ FTP 走「220 + PASV 解析 + RETR + LIST/MLSD 行」；RESP 解批量串与整�
 ### 集成示例：`examples/stdstruct.c6`
 
 ```sh
-make std-ds
+cmake --build build --target std-ds
 ```
 
 四节：树状数组用 2 的幂做数据，核对前缀和、区间和与「首个前缀和 >= target」的
@@ -4020,7 +4020,7 @@ make std-ds
 ### 集成示例：`examples/stdwords.c6`
 
 ```sh
-make std-words
+cmake --build build --target std-words
 ```
 
 四节：slug 把标题折成 URL（含 UTF-8 去音标）；命名风格把 `HTTPServerConfig` 转成
@@ -4030,7 +4030,7 @@ make std-words
 ### 集成示例：`examples/stdnumeric.c6`
 
 ```sh
-make std-math2
+cmake --build build --target std-math2
 ```
 
 四节：矢量算长度/点积/叉积/投影/夹角；多项式算 `p(2)`、`p'(2)`、乘法与求根；
@@ -4040,7 +4040,7 @@ FFT 用 16 点单频余弦验证「第 2 与第 14 频点幅度 = n/2」并做�
 ### 集成示例：`examples/stdtime.c6`
 
 ```sh
-make std-time
+cmake --build build --target std-time
 ```
 
 四节：日历算「2024-02-29 是第几天/星期几/第几周」并反解 epoch 起点；ISO 8601 解析
@@ -4050,7 +4050,7 @@ make std-time
 ### 集成示例：`examples/stdpacket.c6`
 
 ```sh
-make std-packet
+cmake --build build --target std-packet
 ```
 
 四节：NTP 拼一个服务器应答、算参考时间戳与「服务器快 5 秒」的偏移估计；syslog 解析
@@ -4060,7 +4060,7 @@ make std-packet
 ### 集成示例：`examples/stddb.c6`
 
 ```sh
-make std-db
+cmake --build build --target std-db
 ```
 
 四节：日志先用 `LOG_INFO` 档位验证 DEBUG 被过滤、环形覆盖后 dump 从最旧的可用记录
@@ -4071,7 +4071,7 @@ make std-db
 ### 集成示例：`examples/stdhash2.c6`
 
 ```sh
-make std-hash2
+cmake --build build --target std-hash2
 ```
 
 四节：FNV 打一遍一次性与流式（确认分片结果一致）；Adler-32 校验已知向量并用
@@ -4081,7 +4081,7 @@ make std-hash2
 ### 集成示例：`examples/stdordered.c6`
 
 ```sh
-make std-ordered
+cmake --build build --target std-ordered
 ```
 
 四节：Treap 插 10 个键后查排名、第 k 小与删除后的第 k 小；堆用 8 个乱序值取前 3 大、
@@ -4091,7 +4091,7 @@ make std-ordered
 ### 集成示例：`examples/stdcmp.c6`
 
 ```sh
-make std-bwt
+cmake --build build --target std-bwt
 ```
 
 四节：BWT 用 `banana` 核 `nnbaaa`/主行号 3，再用一段重复子串多的文本验证「变换后
@@ -4101,7 +4101,7 @@ make std-bwt
 ### 集成示例：`examples/stdsubs.c6`
 
 ```sh
-make std-subs
+cmake --build build --target std-subs
 ```
 
 四节全是**方法调用**：SRT 用 `doc.open/next/count/seek/rewind` 逐条打印并跳到 3 秒；
@@ -4112,7 +4112,7 @@ ASS 用 `doc.title()` 取标题、`doc.seek(3000)` 定位；LRC 用 `doc.tag("ti
 ### 集成示例：`examples/stdcreds.c6`
 
 ```sh
-make std-creds
+cmake --build build --target std-creds
 ```
 
 四节都用游标方法：netrc 用 `doc.find` 精确命中再退回 `default`；ssh config 用
@@ -4123,7 +4123,7 @@ make std-creds
 ### 集成示例：`examples/stdgeo.c6`
 
 ```sh
-make std-geo
+cmake --build build --target std-geo
 ```
 
 四节：geo 算北京→上海的距离与方位、10 公里目的地、5 公里包围盒并用
@@ -4134,7 +4134,7 @@ Maidenhead 把 `(41.714, -72.727)` 编成 `FN31pr` 再解出格子与中心；dm
 ### 集成示例：`examples/stdpkg.c6`
 
 ```sh
-make std-pkg
+cmake --build build --target std-pkg
 ```
 
 四节都用游标方法：ar 现场拼两个成员后 `doc.next(&m)` 逐条打印并用 `doc.find` 按名查；
@@ -4145,7 +4145,7 @@ COFF 造一个 `.text` 节验证 `doc.section(0, &s)`；Java class 造三个常�
 ### 集成示例：`examples/stdcheck.c6`
 
 ```sh
-make std-check
+cmake --build build --target std-check
 ```
 
 四节：校验位用 Luhn/ISBN-10(`X`)/ISBN-13/Verhoeff 各验一条合法与非法号，并现场用
@@ -4157,7 +4157,7 @@ make std-check
 ### 集成示例：`examples/stdlinux.c6`
 
 ```sh
-make std-linux
+cmake --build build --target std-linux
 ```
 
 四节：mounts 逐条打印并用 `unescape` 还原 `/mnt/my\040disk`；fstab 用 `doc.find` 查
@@ -4167,7 +4167,7 @@ unit 文件用 `doc.next` 打印 `[段] 键=值`、再用 `doc.get("Service","Ex
 ### 集成示例：`examples/stdbin2.c6`
 
 ```sh
-make std-bin2
+cmake --build build --target std-bin2
 ```
 
 四节：binio 用 `w.put_u16le`/`w.put_u32be` 写一段再 `r.u16le()`/`r.u64be()` 读回，
@@ -4178,7 +4178,7 @@ make std-bin2
 ### 集成示例：`examples/stdclean.c6`
 
 ```sh
-make std-clean
+cmake --build build --target std-clean
 ```
 
 四节都用方法：`o.apply` 把 `"  hello\t\tworld\r\n  "` 洗成 `hello world`、再用
@@ -4189,7 +4189,7 @@ make std-clean
 ### 集成示例：`examples/stdcolor.c6`
 
 ```sh
-make std-color
+cmake --build build --target std-color
 ```
 
 四节都用方法：`c.hex`/`c.hsl` 打印 `#3366CC` 的表示与 HSL、`c.lerp` 与白色各半得到
@@ -4200,7 +4200,7 @@ make std-color
 ### 集成示例：`examples/stdcontainers.c6`
 
 ```sh
-make std-cont
+cmake --build build --target std-cont
 ```
 
 四节都用方法：栈拿来判括号是否配平（`{(})` 要能发现、`((` 要报缺右括号）；队列放
@@ -4210,7 +4210,7 @@ make std-cont
 ### 集成示例：`examples/stdstats2.c6`
 
 ```sh
-make std-stats
+cmake --build build --target std-stats
 ```
 
 四节都用方法：直方图把 20 个样本分进 5 箱并打印箱宽与箱中心均值、用 `h.mode` 找众数
@@ -4221,7 +4221,7 @@ p25/p50/p75/IQR。链接带 `-lm`。
 ### 集成示例：`examples/stdsearch.c6`
 
 ```sh
-make std-search
+cmake --build build --target std-search
 ```
 
 四节都用方法：KMP 在「the quick brown fox…」里找 `the`（首次 0、两次）并用单字母
@@ -4232,7 +4232,7 @@ make std-search
 ### 集成示例：`examples/stdlegacy2.c6`
 
 ```sh
-make std-audio2
+cmake --build build --target std-audio2
 ```
 
 四节：AIFF 现场拼 `COMM`/`SSND` 两个块，验证 80 位扩展浮点的采样率（8000 Hz）、
@@ -4243,7 +4243,7 @@ make std-audio2
 ### 集成示例：`examples/stdnet2.c6`
 
 ```sh
-make std-proto3
+cmake --build build --target std-proto3
 ```
 
 四节都用方法：IRC 解析 `:nick!user@host PRIVMSG #chan :Hello there` 并取 nick、认出
@@ -4254,7 +4254,7 @@ ident 构造 `USERID` 应答再解回来，并验证 `ERROR` 应答长度。
 ### 集成示例：`examples/stdmarkup.c6`
 
 ```sh
-make std-markup
+cmake --build build --target std-markup
 ```
 
 四节都用游标方法：reST 打印每条的 `rst_kind_name` 与层级、`doc.heading_level('=')` 查
@@ -4265,7 +4265,7 @@ make std-markup
 ### 集成示例：`examples/stdtextan.c6`
 
 ```sh
-make std-textan
+cmake --build build --target std-textan
 ```
 
 四节都用方法：`WordDoc` 切出 9 个词并打印前几个、`word_count`/`average_len` 做统计；
@@ -4276,7 +4276,7 @@ make std-textan
 ### 集成示例：`examples/stdcfg.c6`
 
 ```sh
-make std-cfg2
+cmake --build build --target std-cfg2
 ```
 
 四节都用方法：`DotEnv` 读 `PORT`/`HOST`/`DEBUG`（引号与尾部注释都处理掉）；`HostsDoc`
@@ -4287,7 +4287,7 @@ make std-cfg2
 ### 集成示例：`examples/stdmatch.c6`
 
 ```sh
-make std-match
+cmake --build build --target std-match
 ```
 
 四节都用方法：`Aho` 用四个 DNA 模式扫描 `ushers` 并打印 `[id]@位置`；`Rk` 找 `needle`
@@ -4297,7 +4297,7 @@ make std-match
 ### 集成示例：`examples/stdasync.c6`
 
 ```sh
-make std-async
+cmake --build build --target std-async
 ```
 
 四节都用方法：`Future` 先挂 `then` 再 `resolve(7)`，重复 resolve 无效，并用
@@ -4309,7 +4309,7 @@ make std-async
 ### 集成示例：`examples/stdasync2.c6`
 
 ```sh
-make std-async2
+cmake --build build --target std-async2
 ```
 
 四节都用方法：`Executor` 同时挂任务、定时器与管道读事件，打印每个 `tick` 处理的事件数；
@@ -4320,7 +4320,7 @@ make std-async2
 ### 集成示例：`examples/stdmath3.c6`
 
 ```sh
-make std-math3
+cmake --build build --target std-math3
 ```
 
 四节都用方法：`Solve` 用二分（42 次）、牛顿（6 次）与割线分别求 √2 并打印残差；
@@ -4331,7 +4331,7 @@ make std-math3
 ### 集成示例：`examples/stdlinalg.c6`
 
 ```sh
-make std-linalg
+cmake --build build --target std-linalg
 ```
 
 四节都用方法：`Lu` 对 3×3 矩阵分解后打印 `det = 4`、解出 `(1,1,1)`、验 `A·A⁻¹`；
@@ -4342,7 +4342,7 @@ make std-linalg
 ### 集成示例：`examples/stdsearch2.c6`
 
 ```sh
-make std-search2
+cmake --build build --target std-search2
 ```
 
 四节都用方法：`InvIndex` 建 3 篇文档的索引（4 个词槽、7 个倒排项）后查 `fast` 与
@@ -4353,7 +4353,7 @@ make std-search2
 ### 集成示例：`examples/stdgraph2.c6`
 
 ```sh
-make std-graph2
+cmake --build build --target std-graph2
 ```
 
 四节都用方法：`Mst` 对 5 个点 6 条边跑 Kruskal（总权 11，打印选中的四条边）再用
@@ -4365,7 +4365,7 @@ make std-graph2
 ### 集成示例：`examples/stdasync3.c6`
 
 ```sh
-make std-async3
+cmake --build build --target std-async3
 ```
 
 四节都用方法：`Co` 手写状态机（sleep 30ms → 等 Future → 让出一次 → 结束，打印拿到的
@@ -4376,7 +4376,7 @@ make std-async3
 ### 集成示例：`examples/stdgeo2.c6`
 
 ```sh
-make std-geo2
+cmake --build build --target std-geo2
 ```
 
 四节都用方法：`Hull` 从 6 个点里算出 4 个顶点的凸包（面积/周长都是 16，打印第 3 个
@@ -4387,7 +4387,7 @@ make std-geo2
 ### 集成示例：`examples/stdasync4.c6`
 
 ```sh
-make std-async4
+cmake --build build --target std-async4
 ```
 
 四节都是「建任务 → 驱动 → 看结果」：`aio_write_all` 写两行、`aio_read_line` 逐行读回
@@ -4408,7 +4408,7 @@ make std-async4
 ### 集成示例：`examples/stdmesh.c6`
 
 ```sh
-make std-mesh
+cmake --build build --target std-mesh
 ```
 
 四节都走「载入 → 游标 → 计数/包围盒」：OBJ 里数出 4 顶点 4 面、法向 1 个、包围盒
@@ -4419,7 +4419,7 @@ MTL 先遍历两块材质，再 `find("red")` 取 `Kd`/`Ns`/`map_Kd`，`find("st
 ### 集成示例：`examples/stdhttps.c6`
 
 ```sh
-make std-https
+cmake --build build --target std-https
 ```
 
 四节：`Tls13.handshake()` 派生出的握手 client key 前四字节与参考值一致；同步 `Https`
@@ -4441,7 +4441,7 @@ co 顶层任务批跑（__c6_co_run）: 500 ops / 1048 us -> 477048 ops/s (2096 
 ### 集成示例：`examples/stdasync5.c6`
 
 ```sh
-make std-async5
+cmake --build build --target std-async5
 ```
 
 五节：`APool` 限 2 个在飞（第三个被拒但仍可跑，`active=2 peak=2 denied=1`）、
@@ -4457,12 +4457,12 @@ co 顶层任务批跑（__c6_co_run）: 300 ops / 486 us -> 616687 ops/s (1621 n
 
 框架整体（分层图、三种启动方式、诚实清单）见 [async-framework.md](async-framework.md)；
 和 C / C++ / Go / Rust / Uya 的横向对比（同一件事的写法 + 实测数据）见
-[async-comparison.md](async-comparison.md)，跑一次就是 `make bench-async`。
+[async-comparison.md](async-comparison.md)，跑一次就是 `cmake --build build --target bench-async`。
 
 ### 集成示例：`examples/stdub.c6`
 
 ```sh
-make std-ub                 # 不带参数：分析内置的演示源码
+cmake --build build --target std-ub                 # 不带参数：分析内置的演示源码
 ./build/stdub 你的文件.c6    # 带参数：分析真实文件
 ```
 
@@ -4544,7 +4544,7 @@ e.init(buf, cap); e.put(src, n); e.put_byte(c); e.finish(); e.length() / e.ok();
 ### 集成示例：`examples/stdsec.c6`
 
 ```sh
-make std-sec
+cmake --build build --target std-sec
 ```
 
 五节：X25519 双方算公钥/共享密钥一致、全零公钥被拒、clamp 三位检查；HSTS 的头解析
@@ -4615,7 +4615,7 @@ m.best_index() / m.best_score() / m.count() / m.reset();
 ### 集成示例：`examples/stdmw.c6`
 
 ```sh
-make std-mw
+cmake --build build --target std-mw
 ```
 
 五节：令牌桶的突发/补充/重试与滑动窗口的 1 秒滑出；`Cache-Control` 解析、新鲜度
@@ -4699,7 +4699,7 @@ t.finish();
 ### 集成示例：`examples/stdproto4.c6`
 
 ```sh
-make std-proto4
+cmake --build build --target std-proto4
 ```
 
 五节：CoAP 构造 GET /temp 并解析回来（选项游标 + 码点格式化）；DHCP 构造
@@ -4783,7 +4783,7 @@ while (d.next(&r)) {                    // 1 记录 / 0 读完 / -1 格式错误
 ### 集成示例：`examples/stdops.c6`
 
 ```sh
-make std-ops
+cmake --build build --target std-ops
 ```
 
 五节：NetFlow 两条记录往返与统计；WoL 魔术包（含密码）构建/解析与 MAC 字符串；
@@ -4854,7 +4854,7 @@ d.plain_text(out, sizeof out);             // 整篇
 ### 集成示例：`examples/stddocs.c6`
 
 ```sh
-make std-docs
+cmake --build build --target std-docs
 ```
 
 五节：单复数与计数短语；mbox 两条消息（头部游标、续行折叠、`>From`）；KDL 嵌套
@@ -4931,7 +4931,7 @@ undot(in, len, out, cap);                // 行首点双写还原
 ### 集成示例：`examples/stdmgmt.c6`
 
 ```sh
-make std-mgmt
+cmake --build build --target std-mgmt
 ```
 
 五节：Prometheus 构造/解析；Gemini 请求行与响应状态；SNMP Response（sysDescr +
@@ -4996,7 +4996,7 @@ h.config(&min_len, &min_head, &min_tail);
 ### 集成示例：`examples/stdutil.c6`
 
 ```sh
-make std-util
+cmake --build build --target std-util
 ```
 
 五节：CIDR 解析/包含/子网划分；大端小端读写与换序；排序键（大小写/标点/数字）；
@@ -5008,163 +5008,163 @@ make std-util
 * `tests/generic_scope.c6` + `tests/tu/generic_scope.c6`：模板实例的作用域
   边界（字段名 vs 同名方法、方法形参名不漏到调用方、两个 TU 都实例化同一
   模板时方法体是弱符号）。
-* `make stdtest`：`std/` 下每个模块的全部 `test` 块。
-* `make std-demo`：`examples/wordcount.c6` 那个集成示例。
-* `make std-tour`：`examples/stdtour.c6`，新模块的拼装示例（自带自检）。
-* `make std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（自带自检）。
-* `make std-box`：`examples/stdbox.c6`，第四批模块的拼装示例（自带自检）。
-* `make std-web`：`examples/stdweb.c6`，第五批模块的拼装示例（自带自检）。
-* `make std-net`：`examples/stdnet.c6`，第六批模块的拼装示例（自带自检）。
-* `make std-more`：`examples/stdmore.c6`，第七批模块的拼装示例（自带自检）。
-* `make std-next`：`examples/stdnext.c6`，第八批模块的拼装示例（自带自检）。
-* `make std-node`：`examples/stdnode.c6`，第九批模块的拼装示例（自带自检）。
-* `make std-form`：`examples/stdform.c6`，第十批模块的拼装示例（自带自检）。
-* `make std-embed`：`examples/stdembed.c6`，第十一批（嵌入式基础）模块的拼装示例
+* `cmake --build build --target stdtest`：`std/` 下每个模块的全部 `test` 块。
+* `cmake --build build --target std-demo`：`examples/wordcount.c6` 那个集成示例。
+* `cmake --build build --target std-tour`：`examples/stdtour.c6`，新模块的拼装示例（自带自检）。
+* `cmake --build build --target std-kit`：`examples/stdkit.c6`，第三批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-box`：`examples/stdbox.c6`，第四批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-web`：`examples/stdweb.c6`，第五批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-net`：`examples/stdnet.c6`，第六批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-more`：`examples/stdmore.c6`，第七批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-next`：`examples/stdnext.c6`，第八批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-node`：`examples/stdnode.c6`，第九批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-form`：`examples/stdform.c6`，第十批模块的拼装示例（自带自检）。
+* `cmake --build build --target std-embed`：`examples/stdembed.c6`，第十一批（嵌入式基础）模块的拼装示例
   （自带自检）。
-* `make std-text`：`examples/stdtext.c6`，第十二批（文本算法）模块的拼装示例
+* `cmake --build build --target std-text`：`examples/stdtext.c6`，第十二批（文本算法）模块的拼装示例
   （自带自检）。
-* `make std-num`：`examples/stdnum.c6`，第十三批（数值类型）模块的拼装示例
+* `cmake --build build --target std-num`：`examples/stdnum.c6`，第十三批（数值类型）模块的拼装示例
   （自带自检）。
-* `make std-pack`：`examples/stdpack.c6`，第十四批（压缩与文本编码）模块的拼装
+* `cmake --build build --target std-pack`：`examples/stdpack.c6`，第十四批（压缩与文本编码）模块的拼装
   示例（自带自检）。
-* `make std-conf`：`examples/stdconf.c6`，第十五批（配置与文档格式）模块的拼装
+* `cmake --build build --target std-conf`：`examples/stdconf.c6`，第十五批（配置与文档格式）模块的拼装
   示例（自带自检）。
-* `make std-cli`：`examples/stdcli.c6`，第十六批（命令行工具基础）模块的拼装
+* `cmake --build build --target std-cli`：`examples/stdcli.c6`，第十六批（命令行工具基础）模块的拼装
   示例（自带自检）。
-* `make std-wire`：`examples/stdwire.c6`，第十七批（网络协议基础）模块的拼装
+* `cmake --build build --target std-wire`：`examples/stdwire.c6`，第十七批（网络协议基础）模块的拼装
   示例（自带自检）。
-* `make std-algo`：`examples/stdalgo.c6`，第十八批（算法与容器）模块的拼装
+* `cmake --build build --target std-algo`：`examples/stdalgo.c6`，第十八批（算法与容器）模块的拼装
   示例（自带自检）。
-* `make std-thread`：`examples/stdthread.c6`，第十九批（并发与同步）模块的拼装
+* `cmake --build build --target std-thread`：`examples/stdthread.c6`，第十九批（并发与同步）模块的拼装
   示例（自带自检）。
-* `make std-term`：`examples/stdterm.c6`，第二十批（终端与进程控制）模块的拼装
+* `cmake --build build --target std-term`：`examples/stdterm.c6`，第二十批（终端与进程控制）模块的拼装
   示例（自带自检）。
-* `make std-client`：`examples/stdclient.c6`，第二十一批（网络客户端）模块的拼装
+* `cmake --build build --target std-client`：`examples/stdclient.c6`，第二十一批（网络客户端）模块的拼装
   示例（自带自检）。
-* `make std-serve`：`examples/stdserve.c6`，第二十二批（Web 服务端）模块的拼装
+* `cmake --build build --target std-serve`：`examples/stdserve.c6`，第二十二批（Web 服务端）模块的拼装
   示例（自带自检）。
-* `make std-crypto`：`examples/stdcrypto.c6`，第二十三批（摘要与密钥派生）模块的
+* `cmake --build build --target std-crypto`：`examples/stdcrypto.c6`，第二十三批（摘要与密钥派生）模块的
   拼装示例（自带自检）。
-* `make std-fsx`：`examples/stdfsx.c6`，第二十四批（文件系统进阶）模块的拼装
+* `cmake --build build --target std-fsx`：`examples/stdfsx.c6`，第二十四批（文件系统进阶）模块的拼装
   示例（自带自检）。
-* `make std-cipher`：`examples/stdcipher.c6`，第二十五批（对称加密基础）模块的
+* `cmake --build build --target std-cipher`：`examples/stdcipher.c6`，第二十五批（对称加密基础）模块的
   拼装示例（自带自检）。
-* `make std-data`：`examples/stddata.c6`，第二十六批（数据格式）模块的拼装示例
+* `cmake --build build --target std-data`：`examples/stddata.c6`，第二十六批（数据格式）模块的拼装示例
   （自带自检）。
-* `make std-calc`：`examples/stdcalc.c6`，第二十七批（数值工具）模块的拼装示例
+* `cmake --build build --target std-calc`：`examples/stdcalc.c6`，第二十七批（数值工具）模块的拼装示例
   （自带自检）。
-* `make std-arch`：`examples/stdarch.c6`，第二十八批（压缩与归档）模块的拼装
+* `cmake --build build --target std-arch`：`examples/stdarch.c6`，第二十八批（压缩与归档）模块的拼装
   示例（自带自检）。
-* `make std-bin`：`examples/stdbin.c6`，第二十九批（二进制文件格式）模块的
+* `cmake --build build --target std-bin`：`examples/stdbin.c6`，第二十九批（二进制文件格式）模块的
   拼装示例（自带自检）。
-* `make std-img`：`examples/stdimg.c6`，第三十批（图像解码）模块的拼装示例
+* `cmake --build build --target std-img`：`examples/stdimg.c6`，第三十批（图像解码）模块的拼装示例
   （自带自检）。
-* `make std-enc`：`examples/stdenc.c6`，第三十一批（编码与凭据）模块的拼装示例
+* `cmake --build build --target std-enc`：`examples/stdenc.c6`，第三十一批（编码与凭据）模块的拼装示例
   （自带自检）。
-* `make std-gfx`：`examples/stdgfx.c6`，第三十二批（图像与 LZW）模块的拼装示例
+* `cmake --build build --target std-gfx`：`examples/stdgfx.c6`，第三十二批（图像与 LZW）模块的拼装示例
   （自带自检）。
-* `make std-doc`：`examples/stddoc.c6`，第三十三批（结构化文本格式）模块的拼装
+* `cmake --build build --target std-doc`：`examples/stddoc.c6`，第三十三批（结构化文本格式）模块的拼装
   示例（自带自检）。
-* `make std-proto`：`examples/stdproto.c6`，第三十四批（网络协议编解码）模块的
+* `cmake --build build --target std-proto`：`examples/stdproto.c6`，第三十四批（网络协议编解码）模块的
   拼装示例（自带自检）。
-* `make std-exec`：`examples/stdexec.c6`，第三十五批（二进制容器格式）模块的拼装
+* `cmake --build build --target std-exec`：`examples/stdexec.c6`，第三十五批（二进制容器格式）模块的拼装
   示例（自带自检）。
-* `make std-ser`：`examples/stdser.c6`，第三十六批（序列化与标记）模块的拼装示例
+* `cmake --build build --target std-ser`：`examples/stdser.c6`，第三十六批（序列化与标记）模块的拼装示例
   （自带自检）。
-* `make std-sys`：`examples/stdsys.c6`，第三十七批（系统视图）模块的拼装示例
+* `cmake --build build --target std-sys`：`examples/stdsys.c6`，第三十七批（系统视图）模块的拼装示例
   （自带自检）。
-* `make std-hash`：`examples/stdhash.c6`，第三十八批（哈希与校验）模块的拼装示例
+* `cmake --build build --target std-hash`：`examples/stdhash.c6`，第三十八批（哈希与校验）模块的拼装示例
   （自带自检）。
-* `make std-legacy`：`examples/stdlegacy.c6`，第三十九批（老图形格式）模块的拼装
+* `cmake --build build --target std-legacy`：`examples/stdlegacy.c6`，第三十九批（老图形格式）模块的拼装
   示例（自带自检）。
-* `make std-font`：`examples/stdfont.c6`，第四十批（字体与矢量）模块的拼装示例
+* `cmake --build build --target std-font`：`examples/stdfont.c6`，第四十批（字体与矢量）模块的拼装示例
   （自带自检，链接带 `-lm`）。
-* `make std-disk`：`examples/stddisk.c6`，第四十一批（分区与文件系统）模块的拼装
+* `cmake --build build --target std-disk`：`examples/stddisk.c6`，第四十一批（分区与文件系统）模块的拼装
   示例（自带自检）。
-* `make std-transcode`：`examples/stdtranscode.c6`，第四十二批（老式文本编码）模块
+* `cmake --build build --target std-transcode`：`examples/stdtranscode.c6`，第四十二批（老式文本编码）模块
   的拼装示例（自带自检）。
-* `make std-audio`：`examples/stdaudio.c6`，第四十三批（音频容器）模块的拼装示例
+* `cmake --build build --target std-audio`：`examples/stdaudio.c6`，第四十三批（音频容器）模块的拼装示例
   （自带自检）。
-* `make std-proto2`：`examples/stdproto2.c6`，第四十四批（文本行协议）模块的拼装
+* `cmake --build build --target std-proto2`：`examples/stdproto2.c6`，第四十四批（文本行协议）模块的拼装
   示例（自带自检）。
-* `make std-ds`：`examples/stdstruct.c6`，第四十五批（基础数据结构）模块的拼装
+* `cmake --build build --target std-ds`：`examples/stdstruct.c6`，第四十五批（基础数据结构）模块的拼装
   示例（自带自检）。
-* `make std-words`：`examples/stdwords.c6`，第四十六批（文本变换）模块的拼装示例
+* `cmake --build build --target std-words`：`examples/stdwords.c6`，第四十六批（文本变换）模块的拼装示例
   （自带自检）。
-* `make std-math2`：`examples/stdnumeric.c6`，第四十七批（数值工具）模块的拼装示例
+* `cmake --build build --target std-math2`：`examples/stdnumeric.c6`，第四十七批（数值工具）模块的拼装示例
   （自带自检，链接带 `-lm`）。
-* `make std-time`：`examples/stdtime.c6`，第四十八批（时间工具）模块的拼装示例
+* `cmake --build build --target std-time`：`examples/stdtime.c6`，第四十八批（时间工具）模块的拼装示例
   （自带自检）。
-* `make std-packet`：`examples/stdpacket.c6`，第四十九批（网络报文）模块的拼装示例
+* `cmake --build build --target std-packet`：`examples/stdpacket.c6`，第四十九批（网络报文）模块的拼装示例
   （自带自检）。
-* `make std-db`：`examples/stddb.c6`，第五十批（日志与数据库）模块的拼装示例
+* `cmake --build build --target std-db`：`examples/stddb.c6`，第五十批（日志与数据库）模块的拼装示例
   （自带自检）。
-* `make std-hash2`：`examples/stdhash2.c6`，第五十一批（非加密散列补齐）模块的拼装
+* `cmake --build build --target std-hash2`：`examples/stdhash2.c6`，第五十一批（非加密散列补齐）模块的拼装
   示例（自带自检）。
-* `make std-ordered`：`examples/stdordered.c6`，第五十二批（有序容器）模块的拼装示例
+* `cmake --build build --target std-ordered`：`examples/stdordered.c6`，第五十二批（有序容器）模块的拼装示例
   （自带自检）。
-* `make std-bwt`：`examples/stdcmp.c6`，第五十三批（变换式压缩积木）模块的拼装示例
+* `cmake --build build --target std-bwt`：`examples/stdcmp.c6`，第五十三批（变换式压缩积木）模块的拼装示例
   （自带自检）。
-* `make std-subs`：`examples/stdsubs.c6`，第五十四批（字幕与播放列表）模块的拼装示例
+* `cmake --build build --target std-subs`：`examples/stdsubs.c6`，第五十四批（字幕与播放列表）模块的拼装示例
   （自带自检，全部用结构体方法调用）。
-* `make std-creds`：`examples/stdcreds.c6`，第五十五批（凭据与配置）模块的拼装示例
+* `cmake --build build --target std-creds`：`examples/stdcreds.c6`，第五十五批（凭据与配置）模块的拼装示例
   （自带自检，全部用结构体方法调用）。
-* `make std-geo`：`examples/stdgeo.c6`，第五十六批（地理编码）模块的拼装示例
+* `cmake --build build --target std-geo`：`examples/stdgeo.c6`，第五十六批（地理编码）模块的拼装示例
   （自带自检，链接带 `-lm`）。
-* `make std-pkg`：`examples/stdpkg.c6`，第五十七批（目标文件与包）模块的拼装示例
+* `cmake --build build --target std-pkg`：`examples/stdpkg.c6`，第五十七批（目标文件与包）模块的拼装示例
   （自带自检，全部用结构体方法调用）。
-* `make std-check`：`examples/stdcheck.c6`，第五十八批（校验与纠错）模块的拼装示例
+* `cmake --build build --target std-check`：`examples/stdcheck.c6`，第五十八批（校验与纠错）模块的拼装示例
   （自带自检）。
-* `make std-linux`：`examples/stdlinux.c6`，第五十九批（Linux 配置文本）模块的拼装
+* `cmake --build build --target std-linux`：`examples/stdlinux.c6`，第五十九批（Linux 配置文本）模块的拼装
   示例（自带自检）。
-* `make std-bin2`：`examples/stdbin2.c6`，第六十批（二进制与数值工具）模块的拼装
+* `cmake --build build --target std-bin2`：`examples/stdbin2.c6`，第六十批（二进制与数值工具）模块的拼装
   示例（自带自检，链接带 `-lm`）。
-* `make std-clean`：`examples/stdclean.c6`，第六十一批（文本清洗与标注）模块的拼装
+* `cmake --build build --target std-clean`：`examples/stdclean.c6`，第六十一批（文本清洗与标注）模块的拼装
   示例（自带自检）。
-* `make std-color`：`examples/stdcolor.c6`，第六十二批（颜色与单位）模块的拼装示例
+* `cmake --build build --target std-color`：`examples/stdcolor.c6`，第六十二批（颜色与单位）模块的拼装示例
   （自带自检）。
-* `make std-cont`：`examples/stdcontainers.c6`，第六十三批（基础容器补充）模块的拼装
+* `cmake --build build --target std-cont`：`examples/stdcontainers.c6`，第六十三批（基础容器补充）模块的拼装
   示例（自带自检）。
-* `make std-stats`：`examples/stdstats2.c6`，第六十四批（统计小工具）模块的拼装示例
+* `cmake --build build --target std-stats`：`examples/stdstats2.c6`，第六十四批（统计小工具）模块的拼装示例
   （自带自检，链接带 `-lm`）。
-* `make std-search`：`examples/stdsearch.c6`，第六十五批（字符串算法）模块的拼装示例
+* `cmake --build build --target std-search`：`examples/stdsearch.c6`，第六十五批（字符串算法）模块的拼装示例
   （自带自检）。
-* `make std-audio2`：`examples/stdlegacy2.c6`，第六十六批（老音频格式头）模块的拼装
+* `cmake --build build --target std-audio2`：`examples/stdlegacy2.c6`，第六十六批（老音频格式头）模块的拼装
   示例（自带自检）。
-* `make std-proto3`：`examples/stdnet2.c6`，第六十七批（小型文本协议）模块的拼装示例
+* `cmake --build build --target std-proto3`：`examples/stdnet2.c6`，第六十七批（小型文本协议）模块的拼装示例
   （自带自检）。
-* `make std-markup`：`examples/stdmarkup.c6`，第六十八批（轻量标记语言）模块的拼装
+* `cmake --build build --target std-markup`：`examples/stdmarkup.c6`，第六十八批（轻量标记语言）模块的拼装
   示例（自带自检）。
-* `make std-textan`：`examples/stdtextan.c6`，第六十九批（文本分析）模块的拼装示例
+* `cmake --build build --target std-textan`：`examples/stdtextan.c6`，第六十九批（文本分析）模块的拼装示例
   （自带自检）。
-* `make std-cfg2`：`examples/stdcfg.c6`，第七十批（系统配置文件）模块的拼装示例
+* `cmake --build build --target std-cfg2`：`examples/stdcfg.c6`，第七十批（系统配置文件）模块的拼装示例
   （自带自检）。
-* `make std-match`：`examples/stdmatch.c6`，第七十一批（匹配与对齐）模块的拼装示例
+* `cmake --build build --target std-match`：`examples/stdmatch.c6`，第七十一批（匹配与对齐）模块的拼装示例
   （自带自检）。
-* `make std-async`：`examples/stdasync.c6`，第七十二批（异步编程基础）模块的拼装示例
+* `cmake --build build --target std-async`：`examples/stdasync.c6`，第七十二批（异步编程基础）模块的拼装示例
   （自带自检）。
-* `make std-async2`：`examples/stdasync2.c6`，第七十三批（async 之上再盖一层）模块的拼装
+* `cmake --build build --target std-async2`：`examples/stdasync2.c6`，第七十三批（async 之上再盖一层）模块的拼装
   示例（自带自检）。
-* `make std-math3`：`examples/stdmath3.c6`，第七十四批（数值方法与拟合）模块的拼装示例
+* `cmake --build build --target std-math3`：`examples/stdmath3.c6`，第七十四批（数值方法与拟合）模块的拼装示例
   （自带自检）。
-* `make std-linalg`：`examples/stdlinalg.c6`，第七十五批（线性代数）模块的拼装示例
+* `cmake --build build --target std-linalg`：`examples/stdlinalg.c6`，第七十五批（线性代数）模块的拼装示例
   （自带自检）。
-* `make std-search2`：`examples/stdsearch2.c6`，第七十六批（检索与关键词）模块的拼装示例
+* `cmake --build build --target std-search2`：`examples/stdsearch2.c6`，第七十六批（检索与关键词）模块的拼装示例
   （自带自检）。
-* `make std-graph2`：`examples/stdgraph2.c6`，第七十七批（图算法进阶）模块的拼装示例
+* `cmake --build build --target std-graph2`：`examples/stdgraph2.c6`，第七十七批（图算法进阶）模块的拼装示例
   （自带自检）。
-* `make std-async3`：`examples/stdasync3.c6`，第七十八批（co / async-await 框架）模块的
+* `cmake --build build --target std-async3`：`examples/stdasync3.c6`，第七十八批（co / async-await 框架）模块的
   拼装示例（自带自检）。
-* `make std-geo2`：`examples/stdgeo2.c6`，第七十九批（计算几何）模块的拼装示例
+* `cmake --build build --target std-geo2`：`examples/stdgeo2.c6`，第七十九批（计算几何）模块的拼装示例
   （自带自检）。
-* `make std-async4`：`examples/stdasync4.c6`，第八十批（语言级 async）模块的拼装示例
+* `cmake --build build --target std-async4`：`examples/stdasync4.c6`，第八十批（语言级 async）模块的拼装示例
   （自带自检）。
-* `make std-mesh`：`examples/stdmesh.c6`，第八十一批（OBJ/STL/PLY/MTL）模块的拼装示例
+* `cmake --build build --target std-mesh`：`examples/stdmesh.c6`，第八十一批（OBJ/STL/PLY/MTL）模块的拼装示例
   （自带自检）。
-* `make std-https`：`examples/stdhttps.c6`，第八十二批（同步/异步 HTTPS + 性能指标）
+* `cmake --build build --target std-https`：`examples/stdhttps.c6`，第八十二批（同步/异步 HTTPS + 性能指标）
   模块的拼装示例（自带自检与实测指标）。
-* `make std-async5`：`examples/stdasync5.c6`，第八十三批（预算/任务组/额度/取消）
-* `make std-ub`：`examples/stdub.c6`，第八十四批（lex/parse/ub 静态分析三件套）
+* `cmake --build build --target std-async5`：`examples/stdasync5.c6`，第八十三批（预算/任务组/额度/取消）
+* `cmake --build build --target std-ub`：`examples/stdub.c6`，第八十四批（lex/parse/ub 静态分析三件套）
   四个横切面的拼装示例（自带自检与实测指标）。
 * `std/net/inet.c6` 的「RFC 5952 压缩」用例：8 组输入对 8 组期望输出，含
   `2001:db8:0:0:1:0:0:1`、同长零段取第一个（`1:0:0:2:0:0:3:4`）、

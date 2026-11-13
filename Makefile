@@ -1,31 +1,24 @@
 # c6 —— 带语言扩展的 TinyCC
 #
-#   make bootstrap   准备构建（tcc/ 源码已在仓库里；缺 config.mak 时跑 configure）
-#   make build       以扩展模式构建（EXTRA-DEFS=-DC6_EXT）
-#   make build-plain 以上游模式构建（不定义 C6_EXT）
-#   make selftest    跑 tests/ 下所有 c6 自测（test 块 + 编译期诊断）
-#   make test        跑 tests2 上游全量测试（扩展模式）
-#   make test-plain  关闭扩展构建并跑同一套上游测试
-#   make test-all    selftest + tests2 全量 + c6selfcheck + freestanding/裸机
-#   make check-all   test-all + C99 后端用例 + 三条自举路线 + 标准库
-#                    （发布前跑这一条；除 std 家族整组串行外都并发，CHECK_JOBS=1 全串行）
-#   make c99         C99 输出后端已内置在 tcc/c6（-c99 / -o *.c / -o <目录>）
-#   make c99test     与 selftest 相同的用例走 C99 后端（生成 C，再用 gcc 编译运行）
-#   make c99tcc-test 同一批用例，但生成 C 的宿主编译器换成 tcc 自己（不依赖 gcc）
-#   make c6selfcheck tcc 自己的源码拷成 .c6 后用 c6 规则编译（初始化规则 + C99 后端）
-#   make selfhost    用 tcc 自举自己（stage1 -> stage2，比对目标文件）
-#   make c99selfhost 用 C99 后端自举自己（生成 C -> gcc -> stage2 -> stage3）
-#   make c99selfhost-tcc 同上，但生成 C 之后由 tcc 自己编译（整条链不需要 gcc）
-#   make wasmrt      编目标平台的运行库 tcc/libtcc1-<arch>.a（需要 clang）
-#   make wasmtest    tcc --target=<triple> 出 .wasm 再用 node 跑（见 docs/reference/llvm-backend.md）
-#   make clean       清理 tcc/ 的构建产物和自举产物
-#   make distclean   清理 tcc/ 的构建产物和 configure 结果（不删源码）
+# 本文件不再是构建入口。CMake 是唯一入口：cmake -S . -B build 负责配置
+# tcc/configure，cmake --build build 负责编译，ctest 负责日常测试。
+# 这里只保存完整回归矩阵（std-* / fstest* / 自举 / C99 后端等用例）的定义；
+# CMake 在配置阶段扫描本文件，为每个 target 生成同名 CMake target，先构建好
+# tcc/c6 再以 make -o build 调用这里跑用例，不会用旧参数重编编译器。
 #
-# C6_EXT 是编译期开关，切换模式时会自动先清理旧产物。
+#   cmake --build build --target check-all   # 发布前完整验收
+#   cmake --build build --target help       # 列出全部 CMake target
+#   cmake --build build --target c6-help    # 打印常用命令 + 本文件的用例清单
+#
+# 每个目标的语义见 docs/reference/cli.md 与本文件末尾的 help 清单。
+# C6_EXT 由 -DC6_ENABLE_EXT=ON/OFF 决定，CMake 会在参数变化时清理旧产物再重编。
 
 TCC_DIR  := tcc
-SELFTEST := tests/run-tests.sh
-ERRBASE := tests/run-errbase.sh
+# 用 ?= 而不是 :=：check-all / check-std-serial 的递归 make 会清空 MAKEFLAGS，
+# 顶层 make 的命令行变量到不了那一层；CMake 同时把变量放进环境，递归层靠
+# 环境变量（?= 不会覆盖环境）拿到同一份设置。
+SELFTEST ?= tests/run-tests.sh
+ERRBASE ?= tests/run-errbase.sh
 JOBS     ?= $(shell nproc 2>/dev/null || echo 4)
 CFLAGS   ?= -g -O0 -Wall -Wno-unused-result
 EXT      := EXTRA-DEFS=-DC6_EXT
@@ -41,7 +34,7 @@ SELFHOST_C99TCC := $(SELFHOST)/c99tcc
 # 所以每条各给一个目录（examples/boot/build.sh 认 BARE_BUILD）。
 BARE     := build/bare
 # 自举时编译 tcc 自己用的定义：ONE_SOURCE 把整个编译器塞进一个编译单元，
-# C6_EXT 打开 c6 扩展（与 make build 的 EXTRA-DEFS 一致）
+# C6_EXT 打开 c6 扩展（与 cmake --build build 的 EXTRA-DEFS 一致）
 SELFHOST_DEFS := -DONE_SOURCE=1 -DC6_EXT
 # c6selfcheck 也要带 C6_EXT：源码里 #ifdef C6_EXT 的那一半（扩展的实现）
 # 只有在打开扩展时才会被编到，不带它这项检查就只能覆盖编译器的一半。
@@ -1480,8 +1473,8 @@ fstest: build
 	./build/freestanding_fstr
 
 # wasm / 交叉目标：先编出目标运行库，再冒烟（需要 clang；跑起来需要 node）
-#   make wasmrt    只构建 tcc/libtcc1-<arch>.a
-#   make wasmtest  用 tcc --target=<triple> 出 .wasm，再用 node 跑一遍
+#   cmake --build build --target wasmrt    只构建 tcc/libtcc1-<arch>.a
+#   cmake --build build --target wasmtest  用 tcc --target=<triple> 出 .wasm，再用 node 跑一遍
 LLVMCC      ?= clang
 WASM_TRIPLE ?= wasm32-unknown-unknown
 
@@ -1620,7 +1613,7 @@ CHECK_JOBS ?= $(JOBS)
 # 并发策略：只有「共享 build/ 下固定路径」的 std 家族必须串行，于是把整组
 # 丢给 check-std-serial 里那条 -j1 的递归 make，其余目标交给 make 自己并发；
 # 输出按目标成块（--output-sync=target），不会混成一团。
-# 想按老样子一条跑完再跑下一条：make check-all CHECK_JOBS=1。
+# 想按老样子一条跑完再跑下一条：cmake -S . -B build -DC6_CHECK_JOBS=1 && cmake --build build --target check-all。
 check-all: build
 	@MAKEFLAGS= MFLAGS= $(MAKE) --no-print-directory -j$(CHECK_JOBS) \
 	    --output-sync=target -o build $(CHECK_PARALLEL) check-std-serial
@@ -1656,7 +1649,7 @@ bench-async: build
 # c6 只认 .c6 后缀，而 tcc 的源码必须保持 .c（上游 C），所以这里把 tcc.c
 # 拷成 build/ 下的 .c6 再编：TU 的语言由顶层文件的后缀决定，#include 进来
 # 的 .c/.h 跟着同一份规则走，检查范围和以前用 -std=c6 时完全一样。
-# 编译时带 -DC6_EXT（和 make build 一致）：不带它，#ifdef C6_EXT 里的
+# 编译时带 -DC6_EXT（和 CMake 构建一致）：不带它，#ifdef C6_EXT 里的
 # 扩展实现根本不会进语法检查，规则就只能管到编译器的一半。
 # 翻译出来的 C 还要交给宿主编译器编译一遍：c6 模式下输出文件自带运行时
 # 前导（里面 include 了宿主的头文件），声明块里的原型必须不能和它们冲突。
@@ -1753,18 +1746,18 @@ distclean:
 # --- help begin
 # c6 —— 带语言扩展的 TinyCC
 #
-# 用法：make <目标>。提交/发布前跑 make check-all。
-# 编译器选项、环境变量、每个目标的细节见 docs/reference/cli.md。
+# 用法：cmake --build build --target <目标>（CMake 是唯一入口）。
+# 提交/发布前跑 cmake --build build --target check-all。
+# 目标名与下面的清单一致；编译器选项、环境变量见 docs/reference/cli.md。
 #
 # 构建
-#   bootstrap        首次配置 tcc/（已有 config.mak 就跳过，不联网）
+#   bootstrap        重新跑 configure（等价 cmake -S . -B build）
 #   build            扩展模式构建（EXTRA-DEFS=-DC6_EXT，产物 tcc/c6）
 #   build-plain      上游模式构建（不定义 C6_EXT）
 #   check-tcc        检查 tcc/ 源码是否完整
-#   mode-ext         切到扩展模式（模式变化时自动清理旧产物）
-#   mode-plain       切到上游模式
-#   clean            清理构建产物与自举产物
-#   distclean        连 configure 结果一起清理（不删源码）
+#   mode-ext/-plain  模式由 -DC6_ENABLE_EXT 决定，这两个目标只打印提示
+#   c6-clean         清理构建产物与自举产物
+#   clean-all        连 configure 结果一起清理（不删源码；distclean 是别名）
 #
 # 测试与回归
 #   test             上游 tests2 全量（扩展模式）
@@ -1775,7 +1768,7 @@ distclean:
 #   check-all        提交/发布前跑这一条（test-all + errcheck + C99 后端 + 三条自举
 #                    + 标准库的 stdtest/std-demo/tour/kit/box/web/net/more/next/node/form/embed/text/num/pack/conf/cli/wire/algo/thread/term/client/serve/crypto/fsx/cipher/data/calc/arch/bin/img）
 #                    并发跑：共享 build/ 下固定路径的 std 家族整组串行，其余目标
-#                    都并发；CHECK_JOBS=1 则整轮验收串行
+#                    都并发；-DC6_CHECK_JOBS=1 则整轮验收串行
 #
 # 标准库
 #   stdtest          std/ 下每个模块的 test 块
