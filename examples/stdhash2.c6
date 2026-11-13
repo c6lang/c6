@@ -1,6 +1,6 @@
 /* examples/stdhash2.c6 —— 第五十一批（非加密散列补齐）的集成示例。
  *
- *     make std-hash2
+ *     cmake --build build --target std-hash2
  *
  * 四节：FNV-1/FNV-1a（32/64，含流式）、Adler-32（流式 + 合并）、
  * MurmurHash3（32 位与 128 位）、SipHash-2-4 / 1-3（带密钥 + 定时安全比较）。

@@ -1,6 +1,6 @@
 /* examples/stdnumeric.c6 —— 第四十七批（数值工具）的集成示例。
  *
- *     make std-math2
+ *     cmake --build build --target std-math2
  *
  * 四节：矢量运算、多项式（求值/求导/求根）、FFT（往返还原与单频频谱）、
  * 曲线插值（贝塞尔 / Catmull-Rom 采样）。链接需要 `-lm`。

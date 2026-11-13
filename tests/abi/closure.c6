@@ -6,7 +6,7 @@
  * `__c6_code` 并按 c6 的调用约定传 env（那属于闭包自己的事）。
  *
  * 编译（仓库根目录）：
- *   make selftest
+ *   cmake --build build --target selftest
  */
 closure int(int) c6_make(int n);
 long plain_hold(closure int(int) f);

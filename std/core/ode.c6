@@ -22,7 +22,7 @@
  * - `o.at(i)` 取第 i 个分量（越界返回 0），`o.time()` 当前 `t`，`o.dim()` 维数，
  *   `o.steps()` 累计步数，`o.evaluations()` 累计调用导函数次数；
  * - 精度：Euler 一阶、中点二阶、RK4 四阶（`dt` 减半误差大约降 2/4/16 倍）；
- * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <stdio.h>

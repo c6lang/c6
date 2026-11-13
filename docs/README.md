@@ -45,7 +45,7 @@
 | [stdlib.md](stdlib.md) | 标准库设计与 API | 现行 | 用 `std/` |
 | [reference/grammar.md](reference/grammar.md) | 语法规范（EBNF + 重写规则） | 现行 | 查精确语法 |
 | [reference/diagnostics.md](reference/diagnostics.md) | 诊断码 C1–C134 | 现行 | 查报错、加检查 |
-| [reference/cli.md](reference/cli.md) | 编译器选项 + make 目标 | 现行 | 构建、跑测试 |
+| [reference/cli.md](reference/cli.md) | 编译器选项 + CMake 构建目标 | 现行 | 构建、跑测试 |
 | [reference/c99-backend.md](reference/c99-backend.md) | C99 输出后端 | 现行 | 跨平台、自举 |
 | [reference/llvm-backend.md](reference/llvm-backend.md) | LLVM IR 后端 | 现行 | 交叉编译 |
 | [design/plan.md](design/plan.md) | 语言设计总方案 | 现行 | 改语义前 |
@@ -64,7 +64,7 @@
 1. **一篇只讲一件事**：用法进 `manual/`，规范进 `reference/`，动机进 `design/`，进度进 `history/`。
 2. **相对链接**：所有跨文档链接写相对路径。移动/重命名文档后要全仓库更新
    `docs/...` 引用（C 源码注释里也有），再用链接检查确认零断链。
-3. **数字不写死**：模块数、用例数、自检条数不抄进文档，改成「见 `make X` 输出」，
+3. **数字不写死**：模块数、用例数、自检条数不抄进文档，改成「见对应 CMake 目标的输出」，
    或只在一处（`history/status.md` 的验收口径）出现。
 4. **单一事实源**：错误码号段以项目根 `errbase.def` 为准；语法以 `grammar.md` 为准；
    诊断文本以 `diagnostics.md` 为准；其余文档只引用、不复制。

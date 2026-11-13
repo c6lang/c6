@@ -1,6 +1,6 @@
 /* examples/stdsearch.c6 —— 第六十五批（字符串算法）的集成示例。
  *
- *     make std-search
+ *     cmake --build build --target std-search
  *
  * 四节：KMP 查找、BMH 查找、后缀数组（查找 + LCP）、回文与异位词。
  * 全部用**方法**（`k.find`、`h.count`、`x.search`、`a.same`）。

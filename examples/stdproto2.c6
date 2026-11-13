@@ -1,6 +1,6 @@
 /* examples/stdproto2.c6 —— 第四十四批（文本行协议）的集成示例。
  *
- *     make std-proto2
+ *     cmake --build build --target std-proto2
  *
  * 四节：SMTP（应答 + 命令 + DATA 点填充）、FTP（应答 + PASV + LIST/MLSD 行）、
  * Redis RESP（解析 + 命令编码）、Telnet（IAC 协商 + 去转义）。

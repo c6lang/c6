@@ -1,5 +1,5 @@
 /* safegate 的运行时探针：这里的越界**静态**判不出来（下标来自参数），
- * 只有运行时检查（`c6 -b`）能当场抓住。make safegate 用它证明第二层是活的。 */
+ * 只有运行时检查（`c6 -b`）能当场抓住。cmake --build build --target safegate 用它证明第二层是活的。 */
 #include <stdio.h>
 
 int pick(int *a, int i) { return a[i]; }

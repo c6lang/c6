@@ -1,6 +1,6 @@
 /* examples/stdmarkup.c6 —— 第六十八批（轻量标记语言）的集成示例。
  *
- *     make std-markup
+ *     cmake --build build --target std-markup
  *
  * 四节：reST、Org-mode、LaTeX、POD。都用**游标方法**（`doc.next`、`doc.rewind`）。
  */

@@ -39,7 +39,8 @@ examples:
   ./scripts/build-wasm-runtime.sh
   LLVMCC=/usr/lib/llvm-19/bin/clang ./scripts/build-wasm-runtime.sh \
       aarch64-unknown-linux-gnu
-  make wasmrt WASM_TRIPLE=wasm32-unknown-unknown
+  cmake -S . -B build -DC6_WASM_TRIPLE=wasm32-unknown-unknown
+  cmake --build build --target wasmrt
 
 用 clang 交叉编 tcc/lib 下的 C 源，跳过 atomic.S / alloca.S（x86 汇编）和
 tcov.c（x86 覆盖钩子）。运行期要的 libc / 线程符号由 -nostdlib 链接时的桩

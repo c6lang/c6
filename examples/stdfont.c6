@@ -1,6 +1,6 @@
 /* examples/stdfont.c6 —— 第四十批（字体与矢量）的集成示例。
  *
- *     make std-font
+ *     cmake --build build --target std-font
  *
  * 四节：BDF 位图字体（度量 + 位图）、WOFF 容器（表目录）、SVG 路径（规范化 +
  * 包围盒）、TrueType（表目录 + cmap + hmtx）。数据都现场拼在内存里。

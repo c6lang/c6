@@ -1,6 +1,6 @@
 /* examples/stdhttps.c6 —— 第八十二批（同步 HTTPS / 异步 HTTPS / 语言级 async 性能指标）。
  *
- *     make std-https
+ *     cmake --build build --target std-https
  *
  * 四节：
  *   1. tlskdf：从固定 ECDHE 共享密钥 + transcript hash 派生密钥，和参考值对比；

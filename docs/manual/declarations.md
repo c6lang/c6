@@ -150,7 +150,7 @@ int a[n];                 ->  不用改（VLA 豁免）
   这也是 `static` 豁免的实际好处：常驻状态照原样写 `static int n;`，
   不必为了过检查把大缓冲区搬进 `.data`。
 
-TCC 自己的源码也遵守这条规则（`make c6selfcheck` 把 `tcc.c` 拷成 `.c6` 后再
+TCC 自己的源码也遵守这条规则（`cmake --build build --target c6selfcheck` 把 `tcc.c` 拷成 `.c6` 后再
 按 c6 规则编译一遍来检查），因此 c6 规则编 tcc 自己不会撞上这条诊断；带
 `-DC6_EXT` 也一样，`#ifdef C6_EXT` 里的扩展实现同样补了初始化器：
 

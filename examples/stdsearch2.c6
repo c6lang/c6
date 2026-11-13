@@ -1,6 +1,6 @@
 /* examples/stdsearch2.c6 —— 第七十六批（检索与关键词）的集成示例。
  *
- *     make std-search2
+ *     cmake --build build --target std-search2
  *
  * 四节：倒排索引（单词/AND 查询）、BM25 打分、词频关键词 Top-N、轻量词干化。
  */

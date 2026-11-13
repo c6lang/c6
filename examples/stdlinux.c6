@@ -1,6 +1,6 @@
 /* examples/stdlinux.c6 —— 第五十九批（Linux 配置文本）的集成示例。
  *
- *     make std-linux
+ *     cmake --build build --target std-linux
  *
  * 四节：`/proc/mounts`、`/etc/fstab`、`/etc/os-release`、systemd unit 文件。
  * 全部用游标方法（`doc.open` / `doc.next` / `doc.find` / `doc.get`）。

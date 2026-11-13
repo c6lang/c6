@@ -1,6 +1,6 @@
 /* examples/stdmath3.c6 —— 第七十四批（数值方法与拟合）的集成示例。
  *
- *     make std-math3
+ *     cmake --build build --target std-math3
  *
  * 四节：Solve 求根（二分/牛顿/割线）、Ode 定步长积分（RK4/中点/Euler 精度对比）、
  * Optimize 一维极值、Fit 最小二乘拟合。

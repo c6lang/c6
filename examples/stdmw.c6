@@ -1,6 +1,6 @@
 /* examples/stdmw.c6 —— 第八十六批（服务端中间件语义：限流 / 缓存 / 邮件编码 / 模糊匹配）。
  *
- *     make std-mw
+ *     cmake --build build --target std-mw
  *
  * 五节，每节都按方法风格调用（`b.take(now)`、`c.lookup(k, now)`、`e.put(...)`）：
  *   1. 限流：令牌桶（允许突发）与滑动窗口（严格 1 秒）；

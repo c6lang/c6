@@ -5,21 +5,27 @@
 # 增量才有意义）；Uya 侧只测 create/switch（std.async 的 block_on 是探针 +
 # 忙轮询模型，单任务 waker 最多挂 4 个 fd，多路并发由线程池承担），最后打表。
 #
-#   make bench-async
-#   ./bench/async/run.sh            # 结果同时写到 build/bench-async.csv
+#   cmake --build build --target bench-async
+#   ctest --test-dir build -R '^bench-async$' --output-on-failure
+#   ./bench/async/run.sh   # 单独运行，结果写到仓库根的 build/bench-async.csv
 set -e
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-mkdir -p build
-csv=build/bench-async.csv
+# CTest 注入 C6_CASE_OUT（build/tests/bench-async）作为独立输出目录，避免
+# 与其它用例抢源码树里的 build/；单独运行时退回原来的 build/。
+# 统一转成绝对路径，后面 `cd bench/async` 里的 go build 也能用同一个 $out。
+out=${C6_CASE_OUT:-build}
+mkdir -p "$out"
+out=$(CDPATH= cd -- "$out" && pwd)
+csv=$out/bench-async.csv
 : > "$csv"
 
 echo "== 编译 =="
-./tcc/c6 -B tcc -I . -o build/bench_c6 bench/async/bench.c6 std/os/time.c6
-gcc -O2 -o build/bench_c bench/async/bench_c.c -lpthread
-g++ -std=c++20 -O2 -o build/bench_cpp bench/async/bench_cpp.cpp
-rustc --edition 2021 -O -o build/bench_rs bench/async/bench_rs.rs
+./tcc/c6 -B tcc -I . -o "$out/bench_c6" bench/async/bench.c6 std/os/time.c6
+gcc -O2 -o "$out/bench_c" bench/async/bench_c.c -lpthread
+g++ -std=c++20 -O2 -o "$out/bench_cpp" bench/async/bench_cpp.cpp
+rustc --edition 2021 -O -o "$out/bench_rs" bench/async/bench_rs.rs
 
 # tokio 是可选依赖：依赖已在本地 registry 里就 --offline 构建，否则试一次联网；
 # 两样都不成就跳过这一栏（其余语言照跑）。
@@ -35,7 +41,7 @@ if command -v cargo >/dev/null 2>&1; then
 else
     echo "  ! 没有 cargo，跳过 tokio 两栏" >&2
 fi
-(cd bench/async && go build -o ../../build/bench_go bench_go.go)
+(cd bench/async && go build -o "$out/bench_go" bench_go.go)
 
 # Uya 是可选依赖：找不到编译器就跳过（其余语言照跑）。
 uya_root=${UYA_ROOT:-}
@@ -44,7 +50,7 @@ if [ -z "$uya_root" ] && command -v uya >/dev/null 2>&1; then
 fi
 have_uya=0
 if [ -n "$uya_root" ] && [ -d "$uya_root" ] && command -v uya >/dev/null 2>&1; then
-    if UYA_ROOT="$uya_root" uya build bench/async/bench.uya -o build/bench_uya >/dev/null 2>&1; then
+    if UYA_ROOT="$uya_root" uya build bench/async/bench.uya -o "$out/bench_uya" >/dev/null 2>&1; then
         have_uya=1
     else
         echo "  ! uya 构建失败，跳过 Uya 一栏" >&2
@@ -69,13 +75,13 @@ runner() {
 }
 
 echo "== 跑 =="
-runner "c6(async/await + epoll)"        ./build/bench_c6
-runner "C(epoll + 状态机)"              ./build/bench_c
-runner "C(pthread 一任务一线程)"        ./build/bench_c threads
-runner "C++(C++20 协程 + epoll)"        ./build/bench_cpp
-runner "Go(goroutine + netpoller)"      ./build/bench_go
-runner "Rust(async/await + 手写执行器)" ./build/bench_rs
-runner "Rust(std::thread)"              ./build/bench_rs threads
+runner "c6(async/await + epoll)"        "$out/bench_c6"
+runner "C(epoll + 状态机)"              "$out/bench_c"
+runner "C(pthread 一任务一线程)"        "$out/bench_c" threads
+runner "C++(C++20 协程 + epoll)"        "$out/bench_cpp"
+runner "Go(goroutine + netpoller)"      "$out/bench_go"
+runner "Rust(async/await + 手写执行器)" "$out/bench_rs"
+runner "Rust(std::thread)"              "$out/bench_rs" threads
 if [ "$have_tokio" = 1 ]; then
     runner "Rust(tokio current_thread)"  ./bench/async/tokio_bench/target/release/bench_tokio
     runner "Rust(tokio multi_thread x4)" ./bench/async/tokio_bench/target/release/bench_tokio mt
@@ -83,7 +89,7 @@ fi
 
 # Uya 一次跑完 create + switch（两段都在同一个干净进程里，秒级完成）
 if [ "$have_uya" = 1 ]; then
-    ./build/bench_uya | awk -F, -v label="Uya(async_fn + await)" '
+    "$out/bench_uya" | awk -F, -v label="Uya(async_fn + await)" '
         { v[$2] = $3 }
         END {
             if (v["create_n"] + 0 > 0)

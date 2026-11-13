@@ -17,7 +17,7 @@
 ## 1. 跑起来
 
 ```sh
-make std-ub                   # 先编出检查器（build/stdub），并跑内置演示样例
+cmake --build build --target std-ub                   # 先编出检查器（build/stdub），并跑内置演示样例
 ./build/stdub 你的文件.c6      # 真实文件，可以给多个
 ./build/stdub std             # 给目录就**递归**扫里面所有 *.c6（子目录一起）
 ./tcc/c6 --ub 你的文件.c6      # 同一个检查器，从编译器入口调（等价于上面这条）
@@ -43,7 +43,7 @@ make std-ub                   # 先编出检查器（build/stdub），并跑内�
 放进 CI 就是一行：
 
 ```sh
-make std-ub                                   # 先把工具本身编出来
+cmake --build build --target std-ub                                   # 先把工具本身编出来
 ./build/stdub -W src/*.c6 || exit 1            # 有任何不确定/没看懂就不给过
 ```
 
@@ -228,7 +228,7 @@ c6 有裸指针、指针算术和 `malloc/free`，「过检」能达到的级别
 * 需要运行时才能知道的 8 个缺陷（下标来自参数、`strcpy` 源来自参数、`*(base + k)`
   的 base 来自参数…）：**4/8 报出**，另外 4 个静态上不可判定——它们属于 L4 的地盘。
 * 拿 `std/` 全部 357 个模块跑一遍：**0 条误报**、**0 处「没看懂」**（这是「报告可用」
-  的底线，也是 `make ubcheck` 的通过条件）。
+  的底线，也是 `cmake --build build --target ubcheck` 的通过条件）。
 
 所以：
 
@@ -243,13 +243,13 @@ c6 有裸指针、指针算术和 `malloc/free`，「过检」能达到的级别
 ```sh
 ./build/stdub -W src/*.c6          # 1. 静态门：可判定项 + 不许有没看懂的构造
 c6 -b -I . -o app src/*.c6         # 2. 运行时门：-b 给每次访问加边界/内存检查
-./app && make stdtest              # 3. 跑起来：把路径真的走一遍（含单元测试）
+./app && cmake --build build --target stdtest              # 3. 跑起来：把路径真的走一遍（含单元测试）
 ```
 
 仓库里这两层已经合成一个目标：
 
 ```sh
-make safegate     # ubcheck（静态，整个 std/）+ c6 -b 探针（证明运行时层是活的）
+cmake --build build --target safegate     # ubcheck（静态，整个 std/）+ c6 -b 探针（证明运行时层是活的）
 ```
 
 给目录时会用 `std.os.walk` 往下钻：只收普通文件、后缀 `.c6`，符号链接不跟随，
@@ -272,7 +272,7 @@ make safegate     # ubcheck（静态，整个 std/）+ c6 -b 探针（证明运�
 ### stdub 能不能做到 L4 / L5
 
 **L4（运行时检查）：不能由 stdub 本体做到，但可以托管。** L4 的定义就是「在真实执行
-里插检查」，一个纯静态扫描器做不到。做法是把两层拼起来——这就是 `make safegate`：
+里插检查」，一个纯静态扫描器做不到。做法是把两层拼起来——这就是 `cmake --build build --target safegate`：
 
 * 静态层 `stdub -W`：可判定项清零、没看懂的构造判失败；
 * 运行时层 `c6 -b`：实测能抓住**堆越界、栈数组越界、释放后使用、重复释放、
@@ -341,8 +341,8 @@ async 是单线程协作式，但 `std.os.thread` 共享状态仍需人工保证
 ## 10. 回归
 
 ```sh
-make std-ub      # 编译并跑 examples/stdub.c6（演示 9 条：一定 8、可能 1）
-make stdtest     # 三个模块的 test 块全绿（349 个模块、0 failure）
+cmake --build build --target std-ub      # 编译并跑 examples/stdub.c6（演示 9 条：一定 8、可能 1）
+cmake --build build --target stdtest     # 三个模块的 test 块全绿（349 个模块、0 failure）
 ```
 
 `std/analysis/ub.c6` 自己的用例覆盖了每类检查的正例和反例，也包括「只报一遍」

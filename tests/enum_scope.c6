@@ -9,7 +9,7 @@
  * 运行（仓库根目录）：
  *   ./tcc/tcc -B tcc -test tests/enum_scope.c6
  * 或直接：
- *   make selftest
+ *   cmake --build build --target selftest
  */
 
 enum Color { Color.RED = 1, Color.GREEN = 2, Color.BLUE };

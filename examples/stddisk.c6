@@ -1,6 +1,6 @@
 /* examples/stddisk.c6 —— 第四十一批（分区与文件系统）的集成示例。
  *
- *     make std-disk
+ *     cmake --build build --target std-disk
  *
  * 四节：MBR + GPT 分区表、FAT16 引导扇区与目录、ISO 9660 主卷与目录记录、
  * ext2 超级块与 inode。四份数据都在内存里现场拼。

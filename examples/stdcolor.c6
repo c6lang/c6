@@ -1,6 +1,6 @@
 /* examples/stdcolor.c6 —— 第六十二批（颜色与单位）的集成示例。
  *
- *     make std-color
+ *     cmake --build build --target std-color
  *
  * 四节：颜色转换（Color 方法）、调色板文件、命名颜色（含最近匹配）、单位换算
  * （Conv 方法）。链接需要 `-lm`？不需要——color 刻意不用 libm。

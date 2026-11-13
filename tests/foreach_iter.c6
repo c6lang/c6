@@ -10,7 +10,7 @@
  * 运行（仓库根目录）：
  *   ./tcc/tcc -B tcc -test tests/foreach_iter.c6
  * 或直接：
- *   make selftest
+ *   cmake --build build --target selftest
  */
 #include <stdio.h>
 #include <string.h>

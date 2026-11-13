@@ -1,6 +1,6 @@
 /* examples/stdexec.c6 —— 第三十五批（二进制容器格式）的集成示例。
  *
- *     make std-exec
+ *     cmake --build build --target std-exec
  *
  * 四个模块都只看容器结构。示例在内存里现场拼出四种容器再解析：
  * cpio 归档（文件 + 目录 + 收尾）、PE32+ 映像（节表与 RVA）、Mach-O 64 位

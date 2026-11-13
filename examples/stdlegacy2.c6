@@ -1,6 +1,6 @@
 /* examples/stdlegacy2.c6 —— 第六十六批（老音频格式头）的集成示例。
  *
- *     make std-audio2
+ *     cmake --build build --target std-audio2
  *
  * 四节：AIFF（FORM 块 + 80 位采样率）、AU、VOC（块遍历）、IRCAM。都是纯头解析。
  */

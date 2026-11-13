@@ -1,7 +1,7 @@
 /* 最小引导器：512 字节的 BIOS 引导扇区，把 c6 程序从磁盘读进来、切成
  * 长模式、跳到它那里。中间没有内核、没有 libc、没有 syscall。
  *
- *   make fstest-bare        （见 examples/boot/build.sh）
+ *   cmake --build build --target fstest-bare        （见 examples/boot/build.sh）
  *
  * 做的事按顺序：
  *   1. 实模式：打开 A20、装 GDT，进 32 位保护模式；

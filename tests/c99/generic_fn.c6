@@ -5,7 +5,7 @@
  * 一致。模板体在编译单元末尾排队编译，输出的是同一个普通函数。
  *
  * 运行（仓库根目录）：
- *   make c99test
+ *   cmake --build build --target c99test
  */
 // EXIT 0
 // OUTPUT 1 2 6

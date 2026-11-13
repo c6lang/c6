@@ -1,6 +1,6 @@
 /* examples/stdtranscode.c6 —— 第四十二批（老式文本编码）的集成示例。
  *
- *     make std-transcode
+ *     cmake --build build --target std-transcode
  *
  * 四节：basE91、uuencode、yEnc、EBCDIC（CP037）。都是「二进制/字符集 ↔ 文本」
  * 的老编码，示例里各自编码一遍再解回原文。

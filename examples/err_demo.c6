@@ -1,7 +1,7 @@
 /* err / errdefer / defer 用法演示
  *
  * 编译运行（在仓库根目录）：
- *   make build
+ *   cmake --build build
  *   ./tcc/tcc -B tcc -run examples/err_demo.c6
  *
  * 用 err(id, msg) 的函数必须声明成 'T!error'，调用方必须用 try 或 catch 消费

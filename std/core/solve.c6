@@ -20,7 +20,7 @@
  * - `s.secant(x0, x1)` 不需要导数，两点重合返回 -1；
  * - `s.root()` 最后一次的根，`s.residual()` 它的函数值，`s.iters()` 迭代次数，
  *   `s.error()` 失败原因（0 正常、-1 参数、-2 导数太小、-3 区间没有异号）；
- * - 全部是 `double`，需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 全部是 `double`，需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <string.h>

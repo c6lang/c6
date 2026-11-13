@@ -1,10 +1,13 @@
 #!/bin/sh
-# c6 错误码号段表（errbase.def）的检查：`make errcheck` 调用。
+# c6 错误码号段表（errbase.def）的检查：`cmake --build build --target errcheck` 调用。
 #
 # 这个脚本守两件事：
 #   1. 仓库根目录的 errbase.def 与「现在 --emit-errbase 会产出的东西」一致：
 #      有人加了模块却忘了重新钉号，或者手改表改了别人的号，都在这里报出来。
 #   2. 表本身的各种约束（C126/C127/C128）真的会报错，而不是被静默接受。
+#   3. 一次把全部模块喂给同一个进程：泛型方法签名曾在这里被重复释放，
+#      把 token 池整块复位，存活的模板体被覆盖后段错误。别把这步拆成
+#      多次调用，跨 TU 的状态累积正是它盯的东西。
 #
 # 环境变量 TCC 覆盖编译器路径（默认 <仓库>/tcc/c6）。
 set -u
@@ -26,7 +29,7 @@ pass() { npass=$((npass + 1)); echo "ok   $1"; }
 fail() { nfail=$((nfail + 1)); echo "FAIL: $1" >&2; shift; [ $# -eq 0 ] || printf '%s\n' "$@" | sed 's/^/      /' >&2; }
 
 if [ ! -x "$TCC" ]; then
-    echo "run-errbase: 找不到 $TCC，先执行 'make build'" >&2
+    echo "run-errbase: 找不到 $TCC，先执行 'cmake --build build'" >&2
     exit 1
 fi
 

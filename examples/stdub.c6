@@ -1,6 +1,6 @@
 /* stdub：用 std.analysis.ub 检查 c6 源码里的未定义行为。
  *
- *     make build && ./tcc/c6 -B tcc -run examples/stdub.c6 文件.c6
+ *     cmake --build build && ./tcc/c6 -B tcc -run examples/stdub.c6 文件.c6
  *     ./tcc/c6 -B tcc -run examples/stdub.c6 std               # 目录递归扫 *.c6
  *     ./tcc/c6 -B tcc -run examples/stdub.c6 -q 文件.c6      # 只报「一定」
  *     ./tcc/c6 -B tcc -run examples/stdub.c6                 # 自带的演示样例

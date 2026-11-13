@@ -1,6 +1,6 @@
 /* examples/stdproto.c6 —— 第三十四批（网络协议编解码）的集成示例。
  *
- *     make std-proto
+ *     cmake --build build --target std-proto
  *
  * 四个模块都只做字节层：sse 解析事件流，socks5 构造/解析握手报文，mqtt 构造
  * 与解析报文并做主题通配，snappy 压一段重复文本再解回来。每节自检。

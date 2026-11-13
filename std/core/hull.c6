@@ -24,7 +24,7 @@
  * - `h.area()` 面积（逆时针有向面积取绝对），`h.perimeter()` 周长；
  * - `h.contains(x, y)` 是否在凸包内或边界上（顶点数 1/2 时按点/线段处理）；
  * - 共线判定是 `cross <= 0`（严格凸包，共线点只保留端点）；
- * - 需要 `-lm`（`Makefile` 的 `std-*` 目标已经带上）。
+ * - 需要 `-lm`（回归脚本的 `std-*` 用例已经带上）。
  */
 #include <math.h>
 #include <stdlib.h>

@@ -1,6 +1,6 @@
 /* 裸机上的 c6 程序：没有内核、没有 libc、没有 syscall
  *
- *   make fstest-bare
+ *   cmake --build build --target fstest-bare
  *
  * 由 examples/boot/boot.S 里的最小引导器把机器带进长模式后调用 _start()。
  * 程序能用的只有自己写的 boot_putc / boot_exit（两个都只是 outb 指令），以及

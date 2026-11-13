@@ -1,6 +1,6 @@
 /* examples/stdgeo.c6 —— 第五十六批（地理编码）的集成示例。
  *
- *     make std-geo
+ *     cmake --build build --target std-geo
  *
  * 四节：球面距离/方位/包围盒（geo）、Geohash、Maidenhead 网格、度分秒。
  * 链接需要 `-lm`。包围盒与 DMS 都用**结构体方法**（`box.contains(p)`、`d.to_deg()`）。

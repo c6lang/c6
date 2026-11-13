@@ -2,7 +2,7 @@
  * 让构建脚本按**普通 C**编它（c6 模式要求每个变量都有初始化器，而这里的 4MB
  * 堆必须落在 .bss 里，不能写 `= {0}` 把它搬进 .data）。
  *
- *   make fstest-bare-tests
+ *   cmake --build build --target fstest-bare-tests
  *
  * 没有内核，所以这里没有 syscall：输出是 qemu 的 0xE9 调试口，管道是内存里的
  * 一个环，select 就是"现在有没有数据/有没有空位"，stat/getpid/usleep 是骗人的
