@@ -170,6 +170,8 @@ struct Ub {
     int n;
     int nsuppressed;
     FreeSum *fsum;
+    int naccess;             /* 分析过的内存访问点（下标 / 解引用） */
+    int nproven;             /* 其中能静态判定的（常量、范围、状态已知） */
 };
 
 struct Ctx {
@@ -756,6 +758,9 @@ static int deref_check(Ctx *c, Node *target, Node *site, int wr)
         name = target->name;
         v = var_find(c, name);
         root = var_resolve(c, v);
+        u->naccess++;
+        if (v && v->state != VS_UNKNOWN)
+            u->nproven++;              /* 状态已知：这一处说得清 */
         if (root && root->state == VS_REALLOC) {
             Str msg = { (char[:]){ 0, 0 } };
             Str text = { (char[:]){ 0, 0 } };
@@ -1166,12 +1171,16 @@ static void chk_index(Ctx *c, Node *n, int wr)
     v = var_find(c, name);
     t = ident_type(c, name);
     hx = node_const_int(u->prog, n->b, &idx);
+    if (!t)
+        return;
+    u->naccess++;
+    if (hx || (t->kind == TY_ARRAY && t->n_known)
+        || (t->kind == TY_PTR && v && v->size >= 0))
+        u->nproven++;                  /* 这一处能判 */
     if (!hx) {
         chk_index_range(c, n, t, v);   /* 循环变量：用常量范围判 */
         return;
     }
-    if (!t)
-        return;
     if (t->kind == TY_ARRAY && t->n_known) {
         if (idx < 0 || idx >= t->n_elem) {
             Str msg = ub_cat4(u->a, name,
@@ -2120,6 +2129,8 @@ Ub *ub_open(Arena *a, Str file, Str src, UbOpts opts)
     u->n = 0;
     u->nsuppressed = 0;
     u->fsum = 0;
+    u->naccess = 0;
+    u->nproven = 0;
     return u;
 }
 
@@ -2144,6 +2155,17 @@ Finding *ub_findings(Ub *u) { return u->list; }
 int ub_count(Ub *u) { return u->n; }
 
 int ub_suppressed(Ub *u) { return u->nsuppressed; }
+
+/* 有多少处访问**说不准**（静态判不了，只能靠运行时检查兜） */
+int ub_unproven(Ub *u)
+{
+    int n = u->naccess - u->nproven;
+
+    return n > 0 ? n : 0;
+}
+
+/* 分析过的访问点总数（下标 + 解引用），CLI 用来说覆盖率 */
+int ub_accesses(Ub *u) { return u->naccess; }
 
 /* 解析器没看懂的构造个数：这些区域**没有**被检查过 */
 int ub_not_analyzed(Ub *u)
@@ -2727,4 +2749,19 @@ test "全局变量的地址交给线程：可能的数据竞争" {
         return err(3, "修法要指向锁或原子量");
     if (!str_has(f->fix.code, "lock"))
         return err(4, "修法代码要给出加锁的写法");
+}
+
+test "覆盖率账本：说不准的访问点要能数出来" {
+    u8 buf[262144] = { 0 };
+    Arena a = arena_make(buf, sizeof buf);
+    Ub *u = run1(&a,
+                 "int pick(int *p, int i) { return p[i]; }\n"
+                 "int ok(void) { int a[4] = { 1 }; return a[2]; }\n", UB_NONE);
+
+    if (ub_unproven(u) == 0)
+        return err(1, "参数下标那处应该算「说不准」");
+    if (ub_accesses(u) < 2)
+        return err(2, "两处下标访问都要记进账本");
+    if (ub_count(u) != 0)
+        return err(3, "这两处都不该报问题");
 }

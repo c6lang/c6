@@ -2847,7 +2847,7 @@ Go 的写法**：同一个 1000 路循环，c6 版 40 行，C 状态机版 260 �
 
 验收：`make build`、`make ubcheck`（361 个模块全通过、0 条误报、0 处没看懂）、
 `make safegate`（静态 + 运行时两层都过）、`make stdtest`（361 个模块、0 failure，
-`std/analysis/ub.c6` 70 条用例）、`make std-ub`。
+`std/analysis/ub.c6` 71 条用例）、`make std-ub`。
 
 ### 11.99 标准库第八十五批（密钥交换 + 传输安全策略 + 抓取许可 + 45 进制）
 
