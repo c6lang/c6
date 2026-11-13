@@ -13058,6 +13058,10 @@ static const struct C6ErrStdSlot {
     { "std.encoding.base45",    C6_ERR_SLOT_STD + 350 },
     { "std.net.hsts",           C6_ERR_SLOT_STD + 351 },
     { "std.net.robots",         C6_ERR_SLOT_STD + 352 },
+    { "std.net.ratelimit",      C6_ERR_SLOT_STD + 353 },
+    { "std.net.httpcache",      C6_ERR_SLOT_STD + 354 },
+    { "std.encoding.quotedprintable", C6_ERR_SLOT_STD + 355 },
+    { "std.text.strdist",       C6_ERR_SLOT_STD + 356 },
 };
 
 /* fnv1a32 of the dotted module name: the automatic slot is a pure function

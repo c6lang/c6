@@ -1,0 +1,359 @@
+/* std/net/ratelimit：限流器——令牌桶 + 滑动窗口，两个句柄都走方法调用。
+ *
+ *     import std.net.ratelimit;
+ *
+ *     Bucket b = { 0 };
+ *     b.init(10, 5);                 // 容量 10 个、每秒补 5 个
+ *     if (b.take(now_ms))            // 1：拿到令牌；0：被限流
+ *         serve();
+ *     else
+ *         sleep_ms(b.retry_after(now_ms));
+ *
+ *     Window w = { 0 };
+ *     w.init(100);                   // 每 1000 ms 最多 100 次
+ *     w.allow(now_ms);               // 1/0，滑动窗口
+ *
+ * 两种限流口径一起给，因为它们的语义不一样：
+ *
+ * - **令牌桶**（`Bucket`）：允许突发。容量 `cap` 是突发上限，`rate` 是稳态速率
+ *   （每秒补几个）。补令牌用整数毫秒算，不引入浮点，所以「1 秒 5 个」精确等于
+ *   「200 ms 补 1 个」。
+ * - **滑动窗口**（`Window`）：把 1 秒切成 10 个 100 ms 的槽，只统计最近 1 秒。
+ *   它不会因为窗口边界出现「前一秒末尾 100 次 + 这一秒开头 100 次」的双倍突发，
+ *   代价是极短时间内的抖动（同一个 100 ms 槽内允许打满 `limit`）。
+ *
+ * 两者都**不读时钟**，`now_ms` 由调用方传（`std/os/time.c6` 的 `time_ms()` 或
+ * 测试里的假时钟都行）；时钟倒退按「不回补」处理，只把 `last` 拉回去。
+ */
+#include <string.h>
+
+module std.net.ratelimit;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define RL_WINDOW_SLOTS 10
+
+struct Bucket {
+    long cap;                   /* 突发上限 */
+    long fill;                  /* 每秒补充量 */
+    long tok;                   /* 当前可用令牌 */
+    long last;                  /* 上次结算时刻（ms） */
+    long ok_n;                  /* 累计放行 */
+    long no_n;                  /* 累计拒绝 */
+};
+
+struct Window {
+    long max;                   /* 每 1000 ms 的上限 */
+    long counts[RL_WINDOW_SLOTS];       /* 每个 100 ms 槽的计数 */
+    long slot_ms[RL_WINDOW_SLOTS];      /* 槽对应的 100 ms 起点 */
+    long granted;
+    long denied;
+};
+
+/* ---- 令牌桶 ---- */
+
+int take_n(Bucket *b, long n, long now_ms);     /* take() 先用到 */
+
+void init(Bucket *b, long capacity, long rate_per_sec)
+{
+    if (!b)
+        return;
+    memset(b, 0, sizeof *b);
+    b->cap = capacity > 0 ? capacity : 1;
+    b->fill = rate_per_sec > 0 ? rate_per_sec : 0;
+    b->tok = b->cap;            /* 一开始是满的：允许一次突发 */
+}
+
+/* 按时间补充令牌；时钟倒退不回补。 */
+void refill(Bucket *b, long now_ms)
+{
+    long elapsed = 0;
+    long add = 0;
+
+    if (!b)
+        return;
+    if (b->last == 0) {
+        b->last = now_ms;
+        return;
+    }
+    if (now_ms <= b->last) {
+        b->last = now_ms;       /* 倒退：只把基准拉回去 */
+        return;
+    }
+    elapsed = now_ms - b->last;
+    if (b->fill <= 0) {
+        b->last = now_ms;
+        return;
+    }
+    add = elapsed * b->fill / 1000;
+    if (add > 0) {
+        b->tok += add;
+        if (b->tok > b->cap)
+            b->tok = b->cap;
+        /* 只推进「用掉的那部分时间」，余下的零头下次继续攒 */
+        b->last += add * 1000 / b->fill;
+    }
+}
+
+int take(Bucket *b, long now_ms)
+{
+    return take_n(b, 1, now_ms);
+}
+
+/* 一次要 n 个令牌；不够就一个都不给（不部分扣）。 */
+int take_n(Bucket *b, long n, long now_ms)
+{
+    if (!b || n <= 0)
+        return 0;
+    refill(b, now_ms);
+    if (b->tok < n) {
+        b->no_n++;
+        return 0;
+    }
+    b->tok -= n;
+    b->ok_n++;
+    return 1;
+}
+
+long avail(Bucket *b)
+{
+    return b ? b->tok : -1;
+}
+
+long capacity(Bucket *b)
+{
+    return b ? b->cap : -1;
+}
+
+long rate(Bucket *b)
+{
+    return b ? b->fill : -1;
+}
+
+long granted(Bucket *b)
+{
+    return b ? b->ok_n : -1;
+}
+
+long denied(Bucket *b)
+{
+    return b ? b->no_n : -1;
+}
+
+/* 还要等多少毫秒才够 n 个令牌；已经够就 0，永远不够（n > cap）给 -1。 */
+long retry_after(Bucket *b, long n, long now_ms)
+{
+    long need = 0;
+
+    if (!b || n <= 0)
+        return 0;
+    refill(b, now_ms);
+    if (b->tok >= n)
+        return 0;
+    if (n > b->cap)
+        return -1;
+    need = n - b->tok;
+    if (b->fill <= 0)
+        return -1;
+    return (need * 1000 + b->fill - 1) / b->fill;       /* 向上取整 */
+}
+
+/* ---- 滑动窗口 ---- */
+
+void init(Window *w, long limit)
+{
+    if (!w)
+        return;
+    memset(w, 0, sizeof *w);
+    w->max = limit > 0 ? limit : 1;
+}
+
+/* 当前 100 ms 槽的起点。 */
+static long rl_slot_start(long now_ms)
+{
+    return now_ms - now_ms % 100;
+}
+
+/* 当前 1 秒内的计数。槽号 = (now/100) % 10，所以旧的槽会被新数据覆盖，
+   不需要「淘汰」——只要比较 slot_ms 就能知道它是不是这一轮的。 */
+long count(Window *w, long now_ms)
+{
+    long total = 0;
+    int i = 0;
+
+    if (!w)
+        return -1;
+    for (i = 0; i < RL_WINDOW_SLOTS; i++)
+        if (w->slot_ms[i] > now_ms - 1000 && w->slot_ms[i] <= now_ms)
+            total += w->counts[i];
+    return total;
+}
+
+/* 记一次请求；放行返回 1，被限流返回 0。 */
+int allow(Window *w, long now_ms)
+{
+    long start = 0;
+    int idx = 0;
+
+    if (!w)
+        return 0;
+    if (count(w, now_ms) >= w->max) {
+        w->denied++;
+        return 0;
+    }
+    start = rl_slot_start(now_ms);
+    idx = (int)((start / 100) % RL_WINDOW_SLOTS);
+    if (idx < 0)
+        idx += RL_WINDOW_SLOTS;
+    if (w->slot_ms[idx] != start) {
+        w->slot_ms[idx] = start;
+        w->counts[idx] = 0;
+    }
+    w->counts[idx]++;
+    w->granted++;
+    return 1;
+}
+
+long limit(Window *w)
+{
+    return w ? w->max : -1;
+}
+
+long wgranted(Window *w)
+{
+    return w ? w->granted : -1;
+}
+
+long wdenied(Window *w)
+{
+    return w ? w->denied : -1;
+}
+
+void reset(Window *w)
+{
+    if (!w)
+        return;
+    memset(w->counts, 0, sizeof w->counts);
+    memset(w->slot_ms, 0, sizeof w->slot_ms);
+    w->granted = 0;
+    w->denied = 0;
+}
+
+/* ---- 自测 ---- */
+
+test "令牌桶：容量、补充与重试" {
+    Bucket b = { 0 };
+
+    b.init(10, 5);              /* 容量 10，每秒 5 个 */
+    if (b.capacity() != 10 || b.rate() != 5 || b.avail() != 10)
+        return err(1, "初始应是满桶");
+    /* 一次打满 10 个 */
+    for (int i = 0; i < 10; i++)
+        if (!b.take(1000))
+            return err(2, "容量内应全部放行");
+    if (b.avail() != 0 || b.granted() != 10)
+        return err(3, "打满后应为 0");
+    if (b.take(1000) != 0 || b.denied() != 1)
+        return err(4, "空桶应拒绝");
+    /* 200 ms 补 1 个 */
+    b.refill(1200);
+    if (b.avail() != 1)
+        return err(5, "200 ms 应补 1 个");
+    if (b.take(1200) != 1 || b.avail() != 0)
+        return err(6, "补上的令牌应能用掉");
+    /* 补令牌不超过容量 */
+    b.refill(100000);
+    if (b.avail() != 10)
+        return err(7, "长时间空闲应补满但不超过容量");
+    /* retry_after：空桶 + 速率 5/s ⇒ 1 个要 200 ms */
+    b.take_n(10, 5000);
+    if (b.avail() != 0)
+        return err(8, "清空失败");
+    if (b.retry_after(1, 5000) != 200)
+        return err(9, "retry_after 应为 200 ms");
+    if (b.retry_after(11, 5000) != -1)
+        return err(10, "超过容量应给 -1");
+    if (b.retry_after(1, 5200) != 0)
+        return err(11, "补上之后 retry_after 应为 0");
+}
+
+test "令牌桶：take_n、时钟倒退与边界" {
+    Bucket b = { 0 };
+    Bucket z = { 0 };
+
+    b.init(5, 10);
+    if (b.take_n(3, 1000) != 1 || b.avail() != 2)
+        return err(1, "take_n 应扣 3 个");
+    if (b.take_n(3, 1000) != 0 || b.avail() != 2)
+        return err(2, "不够时不该部分扣");
+    if (b.take_n(0, 1000) != 0)
+        return err(3, "n=0 应拒绝");
+    /* 时钟倒退：不回补、不崩 */
+    if (b.avail() != 2)
+        return err(4, "倒退时不该改可用数");
+    if (b.take(900) != 1 || b.avail() != 1)
+        return err(5, "倒退后仍能按当前余额取");
+    /* rate=0：只吃初始容量 */
+    z.init(2, 0);
+    if (z.take(1000) != 1 || z.take(1000) != 1 || z.take(1000) != 0)
+        return err(6, "rate=0 时只有初始容量");
+    if (z.retry_after(1, 100000) != -1)
+        return err(7, "rate=0 时永远补不上");
+    /* 坏参数 */
+    if (z.capacity() != 2 || z.rate() != 0)
+        return err(8, "字段读取不对");
+}
+
+test "滑动窗口：1 秒内限额与滑出" {
+    Window w = { 0 };
+
+    w.init(5);
+    if (w.limit() != 5)
+        return err(1, "limit 不对");
+    /* 同一 100 ms 槽内打满 */
+    for (int i = 0; i < 5; i++)
+        if (!w.allow(1000))
+            return err(2, "限额内应放行");
+    if (w.allow(1050) != 0 || w.wdenied() != 1)
+        return err(3, "超出应拒绝");
+    if (w.count(1050) != 5)
+        return err(4, "计数应为 5");
+    /* 500 ms 后仍在 1 秒窗口内，不能放行 */
+    if (w.allow(1500) != 0)
+        return err(5, "1 秒内不该恢复");
+    /* 1100 ms 之后，1000 那一槽滑出，能放 5 个 */
+    if (w.count(2000) != 0)
+        return err(6, "滑出后计数应归零");
+    for (int i = 0; i < 5; i++)
+        if (!w.allow(2000))
+            return err(7, "滑出后应重新放行");
+    if (w.wgranted() != 10)
+        return err(8, "累计放行应为 10");
+}
+
+test "滑动窗口：分槽、复位与坏参数" {
+    Window w = { 0 };
+
+    w.init(4);
+    /* 每 100 ms 放 1 个，跨 4 个槽 */
+    if (!w.allow(1000) || !w.allow(1100) || !w.allow(1200) || !w.allow(1300))
+        return err(1, "4 个槽各放 1 个应成功");
+    if (w.allow(1400) != 0)
+        return err(2, "第 5 个应被拒");
+    if (w.count(1450) != 4)
+        return err(3, "1 秒内计数应为 4");
+    /* 1000 那一槽滑出后，只剩 3 个 */
+    if (w.count(2050) != 3)
+        return err(4, "滑出 1 槽后应为 3");
+    if (w.allow(2050) != 1)
+        return err(5, "腾出位置后应放行");
+    w.reset();
+    if (w.count(3000) != 0 || w.wgranted() != 0 || w.wdenied() != 0)
+        return err(6, "reset 后应清零");
+    if (!w.allow(3000))
+        return err(7, "reset 后应能放行");
+    /* 空句柄全走安全分支 */
+    if (w.allow(3100) != 1)
+        return err(8, "reset 后的窗口应继续可用");
+}

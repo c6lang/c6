@@ -2827,3 +2827,24 @@ err 号段补 `std.net.x25519`=0x615d、`std.encoding.base45`=0x615e、
 `std/` 现在 353 个 `.c6` 文件。各模块的 test 块逐个跑过（2/5/3/2 条，0 failure），
 `make std-sec` 75 checks / 0 failures；整体扫一遍由 `make stdtest` / `make check-all`
 覆盖。
+
+### 11.100 标准库第八十六批（服务端中间件语义：限流 / 缓存 / 邮件编码 / 模糊匹配）
+
+四个模块都是「判断型」库：不碰 IO、不读时钟，时间由调用方传入（测试里可以喂假时钟）。
+
+| 模块 | 内容 | test 块 | 方法入口 |
+|---|---|---:|---|
+| `std/net/ratelimit.c6` | 令牌桶（允许突发、整数毫秒补充）+ 滑动窗口（10 个 100 ms 槽，不会在窗口边界双倍突发） | 4 | `Bucket.init/refill/take/take_n/retry_after/avail/capacity/rate/denied`；`Window.init/allow/count/limit/wgranted/wdenied/reset` |
+| `std/net/httpcache.c6` | RFC 9111 判断要点：`Cache-Control` 解析、新鲜期（s-maxage 优先）、可存性、ETag 弱/强比较、定容缓存槽（近似 LFU 淘汰）+ 游标 | 3 | `CacheControl.lifetime/storable`；`Cache.init/put/lookup/etag_of/purge/expire/count/evictions`；`CacheDoc.open/next/count/reset` |
+| `std/encoding/quotedprintable.c6` | RFC 2045 QP：行宽 76 + 软换行、行尾空白必须编码；只有一份编码状态机（一次性编码与长度函数都复用它） | 3 | `QpEnc.init/put/finish/length/ok`；`qp_encode/qp_decode/qp_decoded_len/qp_valid` |
+| `std/text/strdist.c6` | Levenshtein / OSA（相邻换位）/ Hamming / LCS / Jaro / Jaro-Winkler，全部千分制整数；`Matcher` 做「批量模糊找一个」 | 3 | `Matcher.init/consider/best_index/best_score/threshold/count/reset`；`lev/osa/hamming/lcs/jaro_milli/jaro_winkler_milli/similarity_milli` |
+
+集成示例 `examples/stdmw.c6`（`make std-mw`）60 条检查，五节：令牌桶与滑动窗口、
+缓存判断与游标、QP 一次性/流式一致、距离与最佳匹配、以及「限流 → 缓存 → 回源」
+的请求路径（8 个请求里 4 个被限流、1 个回源、3 个命中缓存）。`Makefile` 增加
+`STD_MW_SRCS` / `std-mw`（`.PHONY`、help、`test-all`、`check-all` 同步）；
+err 号段补 `std.net.ratelimit`=0x6161、`std.net.httpcache`=0x6162、
+`std.encoding.quotedprintable`=0x6163、`std.text.strdist`=0x6164。
+
+`std/` 现在 357 个 `.c6` 文件。各模块 test 块：ratelimit 4、httpcache 3、
+quotedprintable 3、strdist 3，逐个跑过 0 failure；`make std-mw` 60 checks / 0 failures。

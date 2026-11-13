@@ -1,0 +1,205 @@
+/* examples/stdmw.c6 —— 第八十六批（服务端中间件语义：限流 / 缓存 / 邮件编码 / 模糊匹配）。
+ *
+ *     make std-mw
+ *
+ * 五节，每节都按方法风格调用（`b.take(now)`、`c.lookup(k, now)`、`e.put(...)`）：
+ *   1. 限流：令牌桶（允许突发）与滑动窗口（严格 1 秒）；
+ *   2. 缓存：Cache-Control 解析 + 新鲜度判定 + 缓存槽与游标；
+ *   3. 邮件编码：Quoted-Printable 一次性与流式编码；
+ *   4. 模糊匹配：编辑距离 + Jaro-Winkler + 最佳匹配器；
+ *   5. 串联：一次「限流 → 缓存查询 → 回源 → 模糊找资源」的请求路径。
+ */
+#include <stdio.h>
+#include <string.h>
+
+import std.core.types;
+import std.net.ratelimit;
+import std.net.httpcache;
+import std.encoding.quotedprintable;
+import std.text.strdist;
+
+static int checks = 0;
+static int nfail = 0;
+
+static void check(int cond, const char *what)
+{
+    checks++;
+    if (!cond) {
+        nfail++;
+        printf("   ✗ %s\n", what);
+    }
+}
+
+/* 1. 限流 */
+static void do_limit(void)
+{
+    Bucket b = { 0 };
+    Window w = { 0 };
+    long now = 10000;
+
+    printf("== ratelimit（令牌桶 / 滑动窗口）\n");
+    b.init(5, 2);                       /* 容量 5，每秒补 2 个 */
+    check(b.capacity() == 5 && b.rate() == 2, "init 参数");
+    {
+        int got = 0;
+
+        for (int i = 0; i < 5; i++)
+            got += b.take(now);
+        check(got == 5, "容量内 5 个全放行");
+    }
+    check(b.take(now) == 0, "第 6 个被拒");
+    check(b.denied() == 1, "拒绝计数 1");
+    b.refill(now + 500);                /* 500 ms 补 1 个 */
+    check(b.avail() == 1, "500 ms 补 1 个");
+    check(b.retry_after(2, now + 500) == 500, "再要 2 个还得等 500 ms");
+    check(b.take_n(2, now + 500) == 0, "不够时不部分扣");
+    check(b.avail() == 1, "余额没动");
+
+    w.init(3);                          /* 每秒 3 次 */
+    check(w.allow(now) && w.allow(now + 100) && w.allow(now + 200), "前 3 次放行");
+    check(w.allow(now + 250) == 0, "第 4 次被拒");
+    check(w.count(now + 900) == 3, "1 秒内计数 3");
+    check(w.count(now + 1300) == 0, "滑出后计数归零");
+    check(w.allow(now + 1300) == 1, "滑出后放行");
+    check(w.wdenied() == 1 && w.wgranted() == 4, "窗口累计计数");
+}
+
+/* 2. 缓存 */
+static void do_cache(void)
+{
+    CacheControl cc = { 0 };
+    Cache c = { 0 };
+    CacheDoc d = { 0 };
+    CacheSlot sl = { 0 };
+    long now = 20000;
+
+    printf("== httpcache（Cache-Control / 新鲜度 / 缓存槽）\n");
+    check(cc_parse("public, max-age=60, must-revalidate", &cc) == 1, "解析 Cache-Control");
+    check(cc.lifetime() == 60 && cc.storable() == 1 && cc.must_reval == 1,
+          "新鲜期与可存性");
+    check(cc_parse("private, max-age=600", &cc) == 1 && cc.storable() == 0,
+          "private 不进共享缓存");
+    check(cc_parse("max-age=10, s-maxage=30", &cc) == 1 && cc.lifetime() == 30,
+          "s-maxage 优先");
+
+    c.init();
+    check(c.put("/index.html", "\"v1\"", 60 * 1000, 0, now) == 1,
+          "写入 /index.html（life 用毫秒）");
+    check(c.put("/a.css", "W/\"c3\"", 600 * 1000, 0, now) == 1, "写入 /a.css");
+    check(c.lookup("/index.html", now + 30000) == 1, "30 秒时仍新鲜");
+    check(c.lookup("/index.html", now + 60000) == 2, "60 秒时过期要回源校验");
+    check(c.lookup("/missing", now) == 0, "未命中");
+    check(strcmp(c.etag_of("/index.html"), "\"v1\"") == 0, "取 ETag");
+    check(etag_weak_match("W/\"v1\"", "\"v1\"") == 1, "弱比较忽略 W/");
+    check(etag_match("W/\"v1\"", "\"v1\"") == 0, "强比较不接受 W/");
+
+    d.open(&c);
+    check(d.next(&sl) == 1 && strcmp(sl.key, "/index.html") == 0, "第一条 /index.html");
+    check(d.next(&sl) == 1 && strcmp(sl.key, "/a.css") == 0, "第二条 /a.css");
+    check(d.next(&sl) == 0 && d.count() == 2, "只有两条");
+    check(c.expire(now + 3600000) == 2 && c.count() == 0, "过期清掉两条");
+}
+
+/* 3. Quoted-Printable */
+static void do_qp(void)
+{
+    char enc[128] = { 0 };
+    char stream[128] = { 0 };
+    u8 back[64] = { 0 };
+    u8 text[16] = { 0 };
+    QpEnc e = { 0 };
+    int n1 = 0;
+
+    printf("== quotedprintable（邮件编码）\n");
+    check(qp_encode((const u8 *)"a=b", 3, enc, sizeof enc) == 5, "a=b 编成 5 个字符");
+    check(memcmp(enc, "a=3Db", 5) == 0, "向量 a=3Db");
+    check(qp_encode((const u8 *)"caf\xc3\xa9", 5, enc, sizeof enc) == 9,
+          "UTF-8 逐字节转义（3 + 2×3）");
+    check(memcmp(enc, "caf=C3=A9", 9) == 0, "向量 caf=C3=A9");
+    check(qp_decode((char[:]){ enc, 9 }, back, sizeof back) == 5, "解回 5 字节");
+    check(memcmp(back, "caf\xc3\xa9", 5) == 0, "解回内容一致");
+    /* 行尾空白必须编码 */
+    check(qp_encode((const u8 *)"x  ", 3, enc, sizeof enc) == 7
+          && memcmp(enc, "x=20=20", 7) == 0, "行尾两个空格都编码");
+    /* 流式与一次性一致 */
+    memcpy(text, "hello=q", 7);
+    n1 = qp_encode(text, 7, enc, sizeof enc);
+    e.init(stream, sizeof stream);
+    check(e.put(text, 3) >= 0 && e.put(text + 3, 4) >= 0, "分两片喂");
+    check(e.finish() == n1 && e.ok(), "收尾长度与一次性一致");
+    check(memcmp(enc, stream, (size_t)n1) == 0, "输出逐字节一致");
+    check(qp_decode((char[:]){ stream, n1 }, back, sizeof back) == 7
+          && memcmp(back, text, 7) == 0, "回环一致");
+    check(qp_valid((char[:]){ "=ZZ", 3 }) == 0, "=ZZ 非法");
+}
+
+/* 4. 模糊匹配 */
+static void do_match(void)
+{
+    Matcher m = { { 0 }, 0, 0, -1, 0, 0 };
+
+    printf("== strdist（距离 / 相似度 / 最佳匹配）\n");
+    check(lev("kitten", 6, "sitting", 7) == 3, "Levenshtein(kitten,sitting)=3");
+    check(osa("ca", 2, "ac", 2) == 1, "OSA 允许相邻换位");
+    check(hamming("karolin", 7, "kathrin", 7) == 3, "Hamming=3");
+    check(lcs("ABCBDAB", 7, "BDCABA", 6) == 4, "LCS=4");
+    check(similarity_milli("abc", 3, "abd", 3) == 667, "相似度 667");
+
+    m.init("index.html", 10, 700);
+    check(m.consider("index.htm", 9) >= 700, "index.htm 够阈值");
+    check(m.best_index() == 0, "第一个候选是最佳");
+    check(m.consider("about.html", 10) < 700, "about.html 不够阈值");
+    check(m.best_index() == 0 && m.count() == 2, "低分不顶替");
+    check(m.consider("index.htmls", 11) >= 700, "更接近的候选");
+    check(m.best_index() == 2, "新最佳是第 3 个");
+    m.reset();
+    check(m.best_index() == -1 && m.count() == 0, "reset 清空");
+}
+
+/* 5. 串联：限流 -> 缓存 -> 模糊找 */
+static void do_pipeline(void)
+{
+    Bucket b = { 0 };
+    CacheControl cc = { 0 };
+    Cache c = { 0 };
+    Matcher m = { { 0 }, 0, 0, -1, 0, 0 };
+    long now = 30000;
+    int served = 0;
+    int cached = 0;
+    int limited = 0;
+
+    printf("== 串联：限流 + 缓存 + 模糊找\n");
+    b.init(4, 1);
+    cc_parse("max-age=30", &cc);
+    c.init();
+    m.init("/index.html", 11, 600);
+    for (int i = 0; i < 8; i++) {
+        if (!b.take(now + (long)i * 100)) {
+            limited++;
+            continue;
+        }
+        if (c.lookup("/index.html", now + (long)i * 100) == 1) {
+            cached++;
+            continue;
+        }
+        served++;
+        c.put("/index.html", "\"v3\"", cc.lifetime() * 1000, 0, now + (long)i * 100);
+    }
+    check(limited == 4, "8 个请求里 4 个被限流");
+    check(served == 1, "只有第一个真正回源");
+    check(cached == 3, "其余 3 个命中缓存");
+    check(m.consider("/index.htm", 11) >= 600, "模糊找到 /index.htm");
+    check(m.best_index() == 0, "最佳是第 1 个候选");
+    check(c.count() == 1, "缓存里只有一条");
+}
+
+int main(void)
+{
+    do_limit();
+    do_cache();
+    do_qp();
+    do_match();
+    do_pipeline();
+    printf("\n%d check(s), %d failure(s)\n", checks, nfail);
+    return nfail == 0 ? 0 : 1;
+}

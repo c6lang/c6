@@ -1,0 +1,544 @@
+/* std/encoding/quotedprintable：Quoted-Printable（RFC 2045 §6.7）编解码 + 流式编码器。
+ *
+ *     import std.encoding.quotedprintable;
+ *
+ *     char out[64] = { 0 };
+ *     int n = qp_encode((const u8 *)"a=b", 3, out, sizeof out);   // 5, "a=3Db"
+ *     qp_decode((char[:]){ out, n }, back, sizeof back);           // 3, "a=b"
+ *
+ *     QpEnc e = { 0 };
+ *     e.init(buf, sizeof buf);      // 方法：init / put / finish / length / ok
+ *     e.put(data, len);
+ *     e.finish();
+ *
+ * 编码规则（照 RFC 2045 的硬要求）：
+ *
+ * - 可打印字符 `!`..`~`（含空格和制表符）原样输出；`=` 必须写成 `=3D`；
+ * - 其它字节（`0x00`..`0x1F`、`0x7F`..`0xFF`）写成 `=XX`（大写十六进制）；
+ * - 行宽不超过 76 个字符，超了插入软换行 `=\r\n`；
+ * - 行尾的空格/制表符必须编码（否则会被传输链吃掉）——流式编码器在
+ *   `put()` 里先缓存行尾空白，等到确定后面还有内容时才决定怎么写。
+ *
+ * 解码比编码宽松（现实里的邮件都这么发）：
+ *
+ * - `=XX` 解码；`=` 后面不是两位十六进制就是非法，整体失败；
+ * - 软换行 `=` + CRLF / LF 直接丢掉，不算内容；
+ * - 硬换行前的行尾空格/制表符按「传输填充」剥掉（RFC 允许接收方这么做）；
+ * - 其它字符原样拷贝，不做字符集转换。
+ *
+ * 和 base32/base45 一个口径：**不分配**，结果写调用方缓冲，放不下返回 -1 且一个
+ * 字节都不写。
+ */
+#include <string.h>
+
+module std.encoding.quotedprintable;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define QP_LINE_MAX 76
+
+static int qp_hexval(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int qp_literal(int c)
+{
+    return c >= 33 && c <= 126 && c != '=';
+}
+
+/* 编码后的字符数（含软换行）；未知时给 -1。 */
+int qp_encoded_len(const u8 *src, int n)
+{
+    int total = 0;
+    int col = 0;
+
+    if (n < 0)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        int c = src[i];
+        int esc = !qp_literal(c);
+
+        if (c == ' ' || c == '\t') {
+            int j = i;
+
+            while (j < n && (src[j] == ' ' || src[j] == '\t'))
+                j++;
+            if (j >= n || src[j] == '\n' || src[j] == '\r')
+                esc = 1;
+        }
+        if (c == '\r' || c == '\n') {
+            total += 1;
+            col = 0;
+            continue;
+        }
+        if (!esc) {
+            if (col + 1 > QP_LINE_MAX - 1) {   /* 给行尾的 '=' 留位置 */
+                total += 3;                     /* "=\r\n" */
+                col = 0;
+            }
+            total += 1;
+            col += 1;
+        } else {
+            if (col + 3 > QP_LINE_MAX - 1) {
+                total += 3;
+                col = 0;
+            }
+            total += 3;
+            col += 3;
+        }
+    }
+    return total;
+}
+
+/* 编码；cap 不够返回 -1 且不写。 */
+int qp_encode(const u8 *src, int n, char *dst, int cap)
+{
+    static const char *hex = "0123456789ABCDEF";
+    int need = qp_encoded_len(src, n);
+    int o = 0;
+    int col = 0;
+    int i = 0;
+
+    if (need < 0 || need > cap || (n > 0 && !src) || (need > 0 && !dst))
+        return -1;
+    while (i < n) {
+        int c = src[i];
+        int last = (i == n - 1);
+        int span = qp_literal(c) ? 1 : 3;
+
+        if (c == '\r' || c == '\n') {     /* 真实换行：原样，列归零 */
+            if (o + 1 > cap)
+                return -1;
+            dst[o++] = (char)c;
+            col = 0;
+            i++;
+            continue;
+        }
+
+        /* 行尾的空白必须编码（一整串空白只要后面紧跟换行/EOF，就整串转义） */
+        int must_encode = !qp_literal(c);
+        (void)last;
+        if (c == ' ' || c == '\t') {
+            int j = i;
+
+            while (j < n && (src[j] == ' ' || src[j] == '\t'))
+                j++;
+            if (j >= n || src[j] == '\n' || src[j] == '\r')
+                must_encode = 1;
+        }
+        if (must_encode)
+            span = 3;
+        if (col + span > QP_LINE_MAX - 1) {
+            dst[o++] = '=';
+            dst[o++] = '\r';
+            dst[o++] = '\n';
+            col = 0;
+        }
+        if (must_encode) {
+            dst[o++] = '=';
+            dst[o++] = hex[(c >> 4) & 0xf];
+            dst[o++] = hex[c & 0xf];
+            col += 3;
+        } else {
+            dst[o++] = (char)c;
+            col += 1;
+        }
+        i++;
+    }
+    return o;
+}
+
+/* 校验并给出解码后的字节数；非法返回 -1。口径必须和 qp_decode 完全一致
+   （行尾填充空白要剥掉），否则「先量再写」会错位。 */
+int qp_decoded_len(char[:] s)
+{
+    int i = 0;
+    int n = 0;
+    int tail_sp = 0;            /* 输出末尾连续的空格/制表符个数 */
+
+    if (s.len < 0 || (!s.data && s.len > 0))
+        return -1;
+    while (i < s.len) {
+        int c = (int)(unsigned char)s.data[i];
+
+        if (c == '=') {
+            if (i + 1 < s.len && s.data[i + 1] == '\n') {
+                i += 2;
+                continue;
+            }
+            if (i + 2 < s.len && s.data[i + 1] == '\r' && s.data[i + 2] == '\n') {
+                i += 3;
+                continue;
+            }
+            if (i + 2 >= s.len)
+                return -1;
+            if (qp_hexval((int)(unsigned char)s.data[i + 1]) < 0
+                || qp_hexval((int)(unsigned char)s.data[i + 2]) < 0)
+                return -1;
+            i += 3;
+            n++;
+            tail_sp = 0;        /* 转义出来的字节按内容算，不是填充 */
+            continue;
+        }
+        if (c == '\r') {
+            i++;
+            continue;
+        }
+        if (c == '\n') {
+            n -= tail_sp;
+            tail_sp = 0;
+            i++;
+            continue;
+        }
+        i++;
+        n++;
+        if (c == ' ' || c == '\t')
+            tail_sp++;
+        else
+            tail_sp = 0;
+    }
+    return n;
+}
+
+int qp_valid(char[:] s)
+{
+    return qp_decoded_len(s) >= 0;
+}
+
+/* 解码；cap 不够或输入非法返回 -1 且不写。 */
+int qp_decode(char[:] s, u8 *dst, int cap)
+{
+    int need = qp_decoded_len(s);
+    int i = 0;
+    int o = 0;
+    int tail_sp = 0;            /* 末尾未转义的空白个数（=20 不算） */
+
+    if (need < 0 || need > cap || (need > 0 && !dst))
+        return -1;
+    while (i < s.len) {
+        int c = (int)(unsigned char)s.data[i];
+
+        if (c == '=') {
+            if (i + 1 < s.len && s.data[i + 1] == '\n') {
+                i += 2;
+                continue;
+            }
+            if (i + 2 < s.len && s.data[i + 1] == '\r'
+                && s.data[i + 2] == '\n') {
+                i += 3;
+                continue;
+            }
+            dst[o++] = (u8)(qp_hexval((int)(unsigned char)s.data[i + 1]) << 4
+                            | qp_hexval((int)(unsigned char)s.data[i + 2]));
+            tail_sp = 0;        /* 转义出来的是内容，不剥 */
+            i += 3;
+            continue;
+        }
+        if (c == '\r') {
+            i++;
+            continue;
+        }
+        if (c == '\n') {
+            o -= tail_sp;       /* 只剥未转义的行尾填充 */
+            tail_sp = 0;
+            i++;
+            continue;
+        }
+        dst[o++] = (u8)c;
+        i++;
+        if (c == ' ' || c == '\t')
+            tail_sp++;
+        else
+            tail_sp = 0;
+    }
+    return o;
+}
+
+/* ---- 流式编码器 ---- */
+
+struct QpEnc {
+    char *out;
+    int cap;
+    int n;
+    int col;
+    int pend_sp;                /* 待定的行尾空白个数 */
+    int bad;
+};
+
+void init(QpEnc *e, char *out, int cap)
+{
+    if (!e)
+        return;
+    e->out = out;
+    e->cap = cap;
+    e->n = 0;
+    e->col = 0;
+    e->pend_sp = 0;
+    e->bad = (out == 0 || cap < 0) ? 1 : 0;
+}
+
+static void qp_emit(QpEnc *e, const char *bytes, int len)
+{
+    if (e->bad)
+        return;
+    if (e->n + len > e->cap) {
+        e->bad = 1;
+        return;
+    }
+    memcpy(e->out + e->n, bytes, (size_t)len);
+    e->n += len;
+}
+
+static void qp_soft_break(QpEnc *e)
+{
+    qp_emit(e, "=\r\n", 3);
+    e->col = 0;
+}
+
+/* 把待定的行尾空白真正写出去（按 =20 / =09 编码）。 */
+static void qp_flush_spaces(QpEnc *e)
+{
+    while (e->pend_sp > 0) {
+        if (e->col + 3 > QP_LINE_MAX - 1)
+            qp_soft_break(e);
+        qp_emit(e, e->pend_sp == 1 ? "=20" : "=09", 3);
+        e->pend_sp--;
+        e->col += 3;
+    }
+}
+
+/* 喂一段字节；返回累计写入的字符数，失败后恒为 -1。 */
+int put(QpEnc *e, const u8 *src, int n)
+{
+    static const char *hex = "0123456789ABCDEF";
+    int i = 0;
+
+    if (!e || e->bad)
+        return -1;
+    if (n < 0 || (n > 0 && !src)) {
+        e->bad = 1;
+        return -1;
+    }
+    while (i < n) {
+        int c = src[i];
+
+        if (c == '\r' || c == '\n') {
+            /* 硬换行：先吐掉待定空白（编码），再原样输出换行 */
+            qp_flush_spaces(e);
+            if (c == '\r') {
+                qp_emit(e, "\r", 1);
+                e->col = 0;
+                i++;
+                continue;
+            }
+            qp_emit(e, "\n", 1);
+            e->col = 0;
+            i++;
+            continue;
+        }
+        if (c == ' ' || c == '\t') {
+            qp_flush_spaces(e);
+            e->pend_sp = (c == ' ') ? 1 : 2;
+            i++;
+            continue;
+        }
+        qp_flush_spaces(e);
+        if (qp_literal(c)) {
+            if (e->col + 1 > QP_LINE_MAX - 1)
+                qp_soft_break(e);
+            {
+                char one = (char)c;
+
+                qp_emit(e, &one, 1);
+            }
+            e->col += 1;
+            i++;
+            continue;
+        }
+        if (e->col + 3 > QP_LINE_MAX - 1)
+            qp_soft_break(e);
+        {
+            char tb[3] = { '=', 0, 0 };
+
+            tb[1] = hex[(c >> 4) & 0xf];
+            tb[2] = hex[c & 0xf];
+            qp_emit(e, tb, 3);
+        }
+        e->col += 3;
+        i++;
+    }
+    return e->bad ? -1 : e->n;
+}
+
+/* 收尾：行尾待定空白必须编码，否则丢弃（不在结尾凭空加换行）。 */
+int finish(QpEnc *e)
+{
+    if (!e || e->bad)
+        return -1;
+    qp_flush_spaces(e);
+    return e->bad ? -1 : e->n;
+}
+
+int length(QpEnc *e)
+{
+    return e ? (e->bad ? -1 : e->n) : -1;
+}
+
+int ok(QpEnc *e)
+{
+    return e && !e->bad;
+}
+
+/* ---- 自测 ---- */
+
+static char[:] qsl(const char *src)
+{
+    return (char[:]){ (char *)src, (int)strlen(src) };
+}
+
+test "QP：编码向量与行宽" {
+    char out[256] = { 0 };
+    u8 bin[8] = { 0x00, 0x1f, 0x7f, 0xff, '=', 'a', 0xc3, 0xa9 };
+
+    /* 纯可打印 */
+    if (qp_encode((const u8 *)"hello", 5, out, sizeof out) != 5
+        || memcmp(out, "hello", 5) != 0)
+        return err(1, "可打印字符应原样");
+    /* '=' 必须转义 */
+    if (qp_encode((const u8 *)"a=b", 3, out, sizeof out) != 5
+        || memcmp(out, "a=3Db", 5) != 0)
+        return err(2, "= 应写成 =3D");
+    /* 非 ASCII 与二进制 */
+    if (qp_encode(bin, 8, out, sizeof out) != 22
+        || memcmp(out, "=00=1F=7F=FF=3Da=C3=A9", 22) != 0)
+        return err(3, "非可打印字节应逐字节转义（大写十六进制）");
+    /* 行宽：100 个 'a' 必须插软换行，且每段 ≤ 76 */
+    {
+        u8 aaa[100] = { 0 };
+        int n = 0;
+        int line = 0;
+        int maxlen = 0;
+
+        memset(aaa, 'a', sizeof aaa);
+        n = qp_encode(aaa, 100, out, sizeof out);
+        if (n <= 0)
+            return err(4, "编码 100 个 a 失败");
+        for (int i = 0; i < n; i++) {
+            if (out[i] == '\n') {
+                if (line > maxlen)
+                    maxlen = line;
+                line = 0;
+                continue;
+            }
+            if (out[i] != '\r')
+                line++;
+        }
+        if (line > maxlen)
+            maxlen = line;
+        if (maxlen > 76)
+            return err(5, "行宽超过 76");
+        if (n != qp_encoded_len(aaa, 100))
+            return err(6, "长度函数与编码结果不一致");
+    }
+}
+
+test "QP：解码、软换行与非法输入" {
+    u8 back[256] = { 0 };
+
+    if (qp_decode(qsl("a=3Db"), back, sizeof back) != 3
+        || memcmp(back, "a=b", 3) != 0)
+        return err(1, "=3D 应解回 =");
+    /* 软换行两种写法 */
+    if (qp_decode(qsl("ab=\r\ncd"), back, sizeof back) != 4
+        || memcmp(back, "abcd", 4) != 0)
+        return err(2, "软换行（CRLF）应丢掉");
+    if (qp_decode(qsl("ab=\ncd"), back, sizeof back) != 4
+        || memcmp(back, "abcd", 4) != 0)
+        return err(3, "软换行（LF）应丢掉");
+    /* 硬换行前的填充空白剥掉 */
+    if (qp_decode(qsl("ab  \r\ncd"), back, sizeof back) != 4
+        || memcmp(back, "abcd", 4) != 0)
+        return err(4, "行尾填充空白应剥掉");
+    /* 转义的空白解得回来 */
+    if (qp_decode(qsl("ab=20=09\r\ncd"), back, sizeof back) != 6
+        || memcmp(back, "ab \tcd", 6) != 0)
+        return err(5, "=20/=09 应解回空格和制表符");
+    /* 大小写十六进制都收 */
+    if (qp_decode(qsl("=c3=A9"), back, sizeof back) != 2
+        || back[0] != 0xc3 || back[1] != 0xa9)
+        return err(6, "十六进制大小写都应接受");
+    /* 非法：=ZZ、孤零零的 =、截断的 =A */
+    if (qp_valid(qsl("=ZZ")))
+        return err(7, "=ZZ 应判非法");
+    if (qp_valid(qsl("abc=")))
+        return err(8, "孤立的 = 应判非法");
+    if (qp_valid(qsl("=A")))
+        return err(9, "截断的转义应判非法");
+    /* 容量不足不写 */
+    memset(back, 'x', sizeof back);
+    if (qp_decode(qsl("=41=42"), back, 1) != -1 || back[0] != 'x')
+        return err(10, "解码容量不足应返回 -1 且不写");
+    if (qp_encode((const u8 *)"hello", 5, (char *)back, 4) != -1)
+        return err(11, "编码容量不足应返回 -1");
+    if (qp_decoded_len(qsl("")) != 0)
+        return err(12, "空输入应解出 0 字节");
+}
+
+test "QP：流式编码器与一次性一致" {
+    u8 src[40] = { 0 };
+    char one[256] = { 0 };
+    char two[256] = { 0 };
+    QpEnc e = { 0 };
+    int n1 = 0;
+
+    /* 混入需要转义的字节、连续空格和 UTF-8 尾巴 */
+    for (int i = 0; i < 20; i++)
+        src[i] = (u8)('a' + i % 26);
+    src[20] = ' ';
+    src[21] = ' ';
+    src[22] = 'Z';      /* QP 里的裸换行是行分隔符，不是数据，所以这里不放 '\n' */
+    src[23] = '=';
+    src[24] = 0xe9;
+    n1 = qp_encode(src, 25, one, sizeof one);
+    if (n1 <= 0)
+        return err(1, "一次性编码失败");
+    /* 分三片喂 */
+    e.init(two, sizeof two);
+    if (e.put(src, 7) < 0 || e.put(src + 7, 9) < 0 || e.put(src + 16, 9) < 0)
+        return err(2, "分片喂失败");
+    if (e.finish() < 0 || !e.ok())
+        return err(3, "收尾失败");
+    if (e.length() != n1)
+        return err(4, "流式长度与一次性不一致");
+    if (memcmp(one, two, (size_t)n1) != 0)
+        return err(5, "流式输出与一次性不一致");
+    /* 解回来应与源一致 */
+    {
+        u8 back[64] = { 0 };
+
+        if (qp_decode((char[:]){ two, n1 }, back, sizeof back) != 25
+            || memcmp(back, src, 25) != 0)
+            return err(6, "回环不一致");
+    }
+    /* 缓冲溢出后 ok() 为假 */
+    e.init(two, 4);
+    if (e.put(src, 20) >= 0 || e.ok() || e.length() != -1)
+        return err(7, "溢出后应报错");
+    /* 结尾空格必须编码（否则会被传输链吃掉） */
+    {
+        char tail[16] = { 0 };
+        u8 t[2] = { 'a', ' ' };
+        int n = qp_encode(t, 2, tail, sizeof tail);
+
+        if (n != 4 || memcmp(tail, "a=20", 4) != 0)
+            return err(8, "结尾空格应编码成 =20");
+    }
+}

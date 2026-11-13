@@ -533,6 +533,7 @@
 | `examples/stdasync5.c6` | （无模块） | 第八十三批的拼装示例（`make std-async5`）：额度、任务组、预算、协作取消四个横切面各一节，最后打框架开销指标 |
 | `examples/stdub.c6` | （无模块） | 第八十四批（静态分析三件套）的拼装示例（`make std-ub`）：用 lex/parse/ub 分析一段 9 处 UB 的演示源码，按 `文件:行:列: 一定/可能 [UB-XXX] 标题` 打印，每条附「修法」与可直接粘贴的「代码」 |
 | `examples/stdsec.c6` | （无模块） | 第八十五批（密钥交换 + 安全策略）的拼装示例（`make std-sec`）：X25519 握手、HSTS 策略库、robots 许可、base45 指纹各一节，最后串成一条「响应头 → 策略 → 许可 → 指纹」的流水线（75 条检查） |
+| `examples/stdmw.c6` | （无模块） | 第八十六批（服务端中间件语义）的拼装示例（`make std-mw`）：限流、缓存、邮件编码、模糊匹配各一节，最后串成「限流 → 缓存 → 回源」的请求路径（60 条检查） |
 
 | `std/data/bson.c6` | `std.data.bson` | BSON（MongoDB 的二进制 JSON，零分配）：`bson_open` 校验总长度与结尾 `0x00`，`next` 逐元素给类型/名字/值视图；标量访问器 `bson_string`/`bson_int64`（int32 做符号扩展）/`bson_double`/`bson_bool`/`bson_binary`/`bson_objectid`；`bson_subdoc` 进子文档与数组，`bson_find` 按名字找。unknown/regex/code/decimal128 等未支持类型按坏数据（-1） |
 | `std/data/ubjson.c6` | `std.data.ubjson` | UBJSON（零分配，扁平事件流）：`ubj_open` + `next` 吐标量与 `UBJ_ARRAY`/`UBJ_OBJECT`/`UBJ_KEY`/`UBJ_END`；解 `Z N T F i U I l L d D H C S`，支持 `$`（统一类型）与 `#`（计数）优化容器，计数读满自动闭合；深度上限 16、计数上限 1e6 |
@@ -4540,6 +4541,76 @@ make std-sec
 `max-age=0` 撤销；robots 的最长匹配、`$` 锚定、更长的 Allow 反超、sitemap 收集与
 游标行号；base45 的四个 RFC 向量、流式与一次性逐字节一致、非法输入与容量；最后把
 「响应头 → 策略 → 抓取许可 → 共享密钥 base45 指纹」串成一条流水线（75 条检查）。
+
+### 第八十六批：服务端中间件语义（`ratelimit` / `httpcache` / `quotedprintable` / `strdist`）
+
+四个模块全是「判断型」的库：不碰 IO、不读时钟、时间由调用方传，方便测试和复用。
+
+**`std/net/ratelimit.c6`**——两种限流口径，句柄方法：
+
+```c
+Bucket b = { 0 };
+b.init(10, 5);                       // 容量 10、每秒补 5
+if (!b.take(now_ms))                 // 1 = 放行，0 = 限流
+    sleep_ms(b.retry_after(1, now_ms));
+b.refill(now_ms) / b.take_n(n, now) / b.avail() / b.capacity() / b.rate() / b.denied();
+
+Window w = { 0 };
+w.init(100);                         // 每 1000 ms 最多 100 次（10 个 100 ms 槽）
+w.allow(now_ms) / w.count(now_ms) / w.limit() / w.wgranted() / w.wdenied() / w.reset();
+```
+
+**`std/net/httpcache.c6`**——RFC 9111 的判断要点 + 定容缓存槽 + 游标：
+
+```c
+CacheControl cc = { 0 };
+cc_parse("public, max-age=60, must-revalidate", &cc);
+cc.lifetime();                       // s-maxage 优先，其次 max-age
+cc.storable();                       // no-store/no-cache/private 时为 0
+
+Cache c = { 0 };
+c.init();
+c.put("/index.html", "\"v1\"", 60 * 1000, 0, now);   // life 与 now 同单位
+c.lookup("/index.html", now + 30000);                   // 1 新鲜 / 2 过期回源 / 0 未命中
+c.etag_of(key) / c.purge(key) / c.expire(now) / c.count() / c.evictions();
+CacheDoc d = { 0 }; CacheSlot sl = { 0 };
+d.open(&c); while (d.next(&sl)) { /* sl.key / sl.etag / sl.hits */ }
+```
+
+**`std/encoding/quotedprintable.c6`**——RFC 2045 的 QP 编解码，只有一份编码逻辑
+（`qp_encode()` 就是流式编码器一次性喂完，`qp_encoded_len()` 是同一状态机只计数）：
+
+```c
+qp_encode((const u8 *)"a=b", 3, out, sizeof out);     // 5, "a=3Db"
+qp_decode((char[:]){ out, 5 }, back, sizeof back);     // 3
+QpEnc e = { 0 };
+e.init(buf, cap); e.put(data, len); e.finish(); e.length() / e.ok();
+```
+
+**`std/text/strdist.c6`**——距离/相似度全部千分制整数（不引浮点），外加最佳匹配器：
+
+```c
+lev("kitten", 6, "sitting", 7);                  // 3
+osa("ca", 2, "ac", 2);                           // 1（允许相邻换位）
+hamming("karolin", 7, "kathrin", 7);             // 3
+lcs("ABCBDAB", 7, "BDCABA", 6);                  // 4
+jaro_milli(a, alen, b, blen) / jaro_winkler_milli(...) / similarity_milli(...);
+Matcher m = { 0 };
+m.init("index.html", 10, 700);                   // 阈值 700/1000
+m.consider("index.htm", 9);                      // 打分并记住最佳
+m.best_index() / m.best_score() / m.count() / m.reset();
+```
+
+### 集成示例：`examples/stdmw.c6`
+
+```sh
+make std-mw
+```
+
+五节：令牌桶的突发/补充/重试与滑动窗口的 1 秒滑出；`Cache-Control` 解析、新鲜度
+边界、ETag 弱/强比较、缓存槽淘汰与游标；QP 的一次性/流式一致与行尾空白编码；
+编辑距离/Jaro-Winkler/最佳匹配器；最后串成一条「限流 → 缓存 → 回源 → 模糊找资源」
+的请求路径（8 个请求里 4 个被限流、1 个回源、3 个命中缓存）。
 
 ## 相关回归用例
 

@@ -1,0 +1,411 @@
+/* std/text/strdist：字符串距离与相似度——编辑距离、Jaro、最佳匹配器。
+ *
+ *     import std.text.strdist;
+ *
+ *     lev("kitten", 6, "sitting", 7);            // 3（Levenshtein）
+ *     osa("ca", 2, "ac", 2);                     // 1（允许相邻换位）
+ *     hamming("karolin", 7, "kathrin", 7);       // 3（等长逐位比）
+ *     lcs("ABCBDAB", 7, "BDCABA", 6);            // 4（最长公共子序列）
+ *     jaro_milli("MARTHA", 6, "MARHTA", 6);      // 944（千分制）
+ *     jaro_winkler_milli("MARTHA", 6, "MARHTA", 6);   // 960 左右
+ *
+ *     Matcher m = { 0 };
+ *     m.init("hello", 5, 600);                   // 阈值 600/1000
+ *     m.consider("hallo", 5);                     // 800
+ *     m.consider("world", 5);                     // 200（低于阈值，不记最佳）
+ *     m.best_index();                             // 0
+ *
+ * 设计取舍：
+ *
+ * - 所有函数都吃 `(指针, 长度)`，不看 `\0`（字符串里有 0 字节也不会截断）；
+ * - 相似度一律用**千分制整数**（0..1000），不引浮点：比较、排序、落库都不会
+ *   因为浮点误差抖；
+ * - 长度上限 `SD_MAX = 256`，超了返回 -1（内部用固定数组，两次分配都没有）；
+ * - `Matcher` 是句柄：`init` 定种子和阈值，`consider` 逐个候选打分并记住最佳，
+ *   `best_index/best_score/count/reset` 收尾——批量「模糊找一个」的常见形态。
+ */
+#include <string.h>
+
+module std.text.strdist;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define SD_MAX 256
+
+struct Matcher {
+    char needle[SD_MAX];
+    int nlen;
+    int thresh;                 /* 千分制阈值 */
+    int best_i;                 /* 最佳候选的下标（-1 = 还没有） */
+    int best_s;                 /* 最佳分数 */
+    int seen;                   /* 累计 consider 次数 */
+};
+
+static int sd_check(int a, int b)
+{
+    if (a < 0 || b < 0 || a > SD_MAX || b > SD_MAX)
+        return 0;
+    return 1;
+}
+
+/* Levenshtein 编辑距离；超长给 -1。 */
+int lev(const char *a, int alen, const char *b, int blen)
+{
+    int prev[SD_MAX + 1] = { 0 };
+    int cur[SD_MAX + 1] = { 0 };
+    int i = 0;
+    int j = 0;
+
+    if (!sd_check(alen, blen) || (alen > 0 && !a) || (blen > 0 && !b))
+        return -1;
+    if (alen == 0)
+        return blen;
+    if (blen == 0)
+        return alen;
+    for (j = 0; j <= blen; j++)
+        prev[j] = j;
+    for (i = 1; i <= alen; i++) {
+        cur[0] = i;
+        for (j = 1; j <= blen; j++) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int del = prev[j] + 1;
+            int ins = cur[j - 1] + 1;
+            int sub = prev[j - 1] + cost;
+            int best = del < ins ? del : ins;
+
+            cur[j] = best < sub ? best : sub;
+        }
+        for (j = 0; j <= blen; j++)
+            prev[j] = cur[j];
+    }
+    return prev[blen];
+}
+
+/* 最优字符串对齐距离（允许相邻换位，即 OSA；比 Levenshtein 多一个换位项）。
+   用三行滚动数组，栈占用 O(m)，和 Levenshtein 一个量级。 */
+int osa(const char *a, int alen, const char *b, int blen)
+{
+    int row0[SD_MAX + 1] = { 0 };       /* i-2 */
+    int row1[SD_MAX + 1] = { 0 };       /* i-1 */
+    int row2[SD_MAX + 1] = { 0 };       /* i   */
+    int i = 0;
+    int j = 0;
+
+    if (!sd_check(alen, blen) || (alen > 0 && !a) || (blen > 0 && !b))
+        return -1;
+    for (j = 0; j <= blen; j++) {
+        row1[j] = j;                    /* i = 0 那一行 */
+    }
+    for (i = 1; i <= alen; i++) {
+        row2[0] = i;
+        for (j = 1; j <= blen; j++) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int best = row1[j] + 1;     /* 删 */
+
+            if (row2[j - 1] + 1 < best)
+                best = row2[j - 1] + 1; /* 插 */
+            if (row1[j - 1] + cost < best)
+                best = row1[j - 1] + cost;      /* 换 */
+            if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]
+                && row0[j - 2] + 1 < best)
+                best = row0[j - 2] + 1; /* 相邻换位 */
+            row2[j] = best;
+        }
+        /* 行整体下移：row0 <- row1 <- row2 */
+        for (j = 0; j <= blen; j++) {
+            row0[j] = row1[j];
+            row1[j] = row2[j];
+        }
+    }
+    return row1[blen];
+}
+
+/* 汉明距离：必须等长，否则 -1。 */
+int hamming(const char *a, int alen, const char *b, int blen)
+{
+    int n = 0;
+
+    if (!sd_check(alen, blen) || alen != blen || (alen > 0 && (!a || !b)))
+        return -1;
+    for (int i = 0; i < alen; i++)
+        if (a[i] != b[i])
+            n++;
+    return n;
+}
+
+/* 最长公共子序列长度。 */
+int lcs(const char *a, int alen, const char *b, int blen)
+{
+    int prev[SD_MAX + 1] = { 0 };
+    int cur[SD_MAX + 1] = { 0 };
+    int i = 0;
+    int j = 0;
+
+    if (!sd_check(alen, blen) || (alen > 0 && !a) || (blen > 0 && !b))
+        return -1;
+    for (j = 0; j <= blen; j++)
+        prev[j] = 0;
+    for (i = 1; i <= alen; i++) {
+        cur[0] = 0;
+        for (j = 1; j <= blen; j++) {
+            if (a[i - 1] == b[j - 1])
+                cur[j] = prev[j - 1] + 1;
+            else
+                cur[j] = prev[j] > cur[j - 1] ? prev[j] : cur[j - 1];
+        }
+        for (j = 0; j <= blen; j++)
+            prev[j] = cur[j];
+    }
+    return prev[blen];
+}
+
+/* Jaro 相似度（千分制）。 */
+int jaro_milli(const char *a, int alen, const char *b, int blen)
+{
+    char am[SD_MAX] = { 0 };
+    char bm[SD_MAX] = { 0 };
+    int window = 0;
+    int m = 0;
+    int t = 0;
+    int i = 0;
+    int j = 0;
+    int k = 0;
+
+    if (!sd_check(alen, blen) || (alen > 0 && !a) || (blen > 0 && !b))
+        return -1;
+    if (alen == 0 && blen == 0)
+        return 1000;
+    if (alen == 0 || blen == 0)
+        return 0;
+    window = (alen > blen ? alen : blen) / 2 - 1;
+    if (window < 0)
+        window = 0;
+    for (i = 0; i < alen; i++) {
+        int lo = i - window < 0 ? 0 : i - window;
+        int hi = i + window >= blen ? blen - 1 : i + window;
+
+        for (j = lo; j <= hi; j++)
+            if (!bm[j] && a[i] == b[j]) {
+                am[i] = 1;
+                bm[j] = 1;
+                m++;
+                break;
+            }
+    }
+    if (m == 0)
+        return 0;
+    /* 换位数：匹配序列里顺序不一致的字符对，除以 2 */
+    k = 0;
+    for (i = 0; i < alen; i++) {
+        if (!am[i])
+            continue;
+        while (!bm[k])
+            k++;
+        if (a[i] != b[k])
+            t++;
+        k++;
+    }
+    t /= 2;
+    return ((int)(1000 * (long)m / alen) + (int)(1000 * (long)m / blen)
+            + (int)(1000 * (long)(m - t) / m)) / 3;
+}
+
+/* Jaro-Winkler：公共前缀（最多 4）加权，p = 0.1。 */
+int jaro_winkler_milli(const char *a, int alen, const char *b, int blen)
+{
+    int base = jaro_milli(a, alen, b, blen);
+    int prefix = 0;
+
+    if (base < 0)
+        return -1;
+    while (prefix < 4 && prefix < alen && prefix < blen
+           && a[prefix] == b[prefix])
+        prefix++;
+    if (prefix == 0)
+        return base;
+    return base + (prefix * 100 * (1000 - base)) / 1000;
+}
+
+/* 千分制相似度：1000 - 归一化编辑距离。 */
+int similarity_milli(const char *a, int alen, const char *b, int blen)
+{
+    int d = lev(a, alen, b, blen);
+    int longest = alen > blen ? alen : blen;
+
+    if (d < 0)
+        return -1;
+    if (longest == 0)
+        return 1000;
+    return 1000 - (int)(1000 * (long)d / longest);
+}
+
+/* ---- 最佳匹配器（方法风格） ---- */
+
+void init(Matcher *m, const char *needle, int nlen, int thresh)
+{
+    if (!m)
+        return;
+    memset(m, 0, sizeof *m);
+    m->best_i = -1;
+    m->thresh = thresh < 0 ? 0 : (thresh > 1000 ? 1000 : thresh);
+    if (!needle || nlen <= 0 || nlen > SD_MAX) {
+        m->nlen = 0;
+        return;
+    }
+    memcpy(m->needle, needle, (size_t)nlen);
+    m->nlen = nlen;
+}
+
+/* 给一个候选打分（Jaro-Winkler），够阈值就记进最佳；返回分数。 */
+int consider(Matcher *m, const char *cand, int clen)
+{
+    int score = 0;
+
+    if (!m || m->nlen <= 0)
+        return -1;
+    m->seen++;
+    score = jaro_winkler_milli(m->needle, m->nlen, cand, clen);
+    if (score < 0)
+        return -1;
+    if (score >= m->thresh && score > m->best_s) {
+        m->best_s = score;
+        m->best_i = m->seen - 1;
+    }
+    return score;
+}
+
+int best_index(Matcher *m)
+{
+    return m ? m->best_i : -1;
+}
+
+int best_score(Matcher *m)
+{
+    return m ? m->best_s : -1;
+}
+
+int threshold(Matcher *m)
+{
+    return m ? m->thresh : -1;
+}
+
+int count(Matcher *m)
+{
+    return m ? m->seen : -1;
+}
+
+void reset(Matcher *m)
+{
+    if (!m)
+        return;
+    m->best_i = -1;
+    m->best_s = 0;
+    m->seen = 0;
+}
+
+/* ---- 自测 ---- */
+
+test "编辑距离：Levenshtein / OSA / Hamming / LCS" {
+    if (lev("kitten", 6, "sitting", 7) != 3)
+        return err(1, "kitten→sitting 应为 3");
+    if (lev("flaw", 4, "lawn", 4) != 2)
+        return err(2, "flaw→lawn 应为 2");
+    if (lev("", 0, "abc", 3) != 3 || lev("abc", 3, "", 0) != 3)
+        return err(3, "空串距离应为另一个串长");
+    if (lev("same", 4, "same", 4) != 0)
+        return err(4, "相同串应为 0");
+    /* OSA 允许相邻换位 */
+    if (lev("ca", 2, "ac", 2) != 2)
+        return err(5, "Levenshtein 的换位算 2 步");
+    if (osa("ca", 2, "ac", 2) != 1)
+        return err(6, "OSA 的换位算 1 步");
+    if (osa("kitten", 6, "sitting", 7) != 3)
+        return err(7, "OSA 对非换位应和 Levenshtein 一致");
+    /* Hamming 必须等长 */
+    if (hamming("karolin", 7, "kathrin", 7) != 3)
+        return err(8, "Hamming 向量不对");
+    if (hamming("abc", 3, "abcd", 4) != -1)
+        return err(9, "不等长应给 -1");
+    /* LCS */
+    if (lcs("ABCBDAB", 7, "BDCABA", 6) != 4)
+        return err(10, "LCS 应为 4");
+    if (lcs("abc", 3, "abc", 3) != 3 || lcs("abc", 3, "xyz", 3) != 0)
+        return err(11, "LCS 边界不对");
+    /* 超长拒绝 */
+    {
+        char big[SD_MAX + 8] = { 0 };
+
+        memset(big, 'x', sizeof big - 1);
+        if (lev(big, SD_MAX + 1, "a", 1) != -1)
+            return err(12, "超长应给 -1");
+    }
+}
+
+test "相似度：Jaro / Jaro-Winkler / 归一化" {
+    int j = jaro_milli("MARTHA", 6, "MARHTA", 6);
+    int jw = jaro_winkler_milli("MARTHA", 6, "MARHTA", 6);
+
+    if (j < 940 || j > 946)
+        return err(1, "Jaro(MARTHA,MARHTA) 应约 944");
+    if (jw < 958 || jw > 964)
+        return err(2, "Jaro-Winkler 应约 961");
+    /* 完全相同 = 1000；完全不同 = 0 */
+    if (jaro_milli("abc", 3, "abc", 3) != 1000)
+        return err(3, "相同串应为 1000");
+    if (jaro_milli("abc", 3, "xyz", 3) != 0)
+        return err(4, "无公共字符应为 0");
+    if (jaro_milli("", 0, "", 0) != 1000 || jaro_milli("", 0, "a", 1) != 0)
+        return err(5, "空串边界不对");
+    /* 前缀越接近，Winkler 加分越多 */
+    if (jaro_winkler_milli("prefix", 6, "preface", 7)
+        <= jaro_milli("prefix", 6, "preface", 7))
+        return err(6, "有公共前缀时 Winkler 应更高");
+    /* 归一化相似度 */
+    if (similarity_milli("kitten", 6, "sitting", 7) != 572)
+        return err(7, "kitten/sitting 相似度应为 572（1000 - 3*1000/7 取整）");
+    if (similarity_milli("abc", 3, "abc", 3) != 1000
+        || similarity_milli("", 0, "", 0) != 1000)
+        return err(8, "相同串相似度应为 1000");
+}
+
+test "最佳匹配器：阈值、计数与复位" {
+    Matcher m = { { 0 }, 0, 0, -1, 0, 0 };
+
+    m.init("hello", 5, 600);
+    if (m.threshold() != 600)
+        return err(1, "阈值不对");
+    if (m.best_index() != -1 || m.count() != 0)
+        return err(2, "初始应没有最佳");
+    if (m.consider("hallo", 5) < 600)
+        return err(3, "hallo 应接近 hello");
+    if (m.best_index() != 0)
+        return err(4, "第一个候选应成为最佳");
+    if (m.consider("world", 5) >= 600)
+        return err(5, "world 不该过阈值");
+    if (m.best_index() != 0 || m.count() != 2)
+        return err(6, "低分不该顶替最佳");
+    if (m.consider("hellos", 6) < 600 || m.best_index() != 2)
+        return err(7, "hellos 应成为新的最佳");
+    /* 分数相同时保留先来的 */
+    {
+        Matcher n = { { 0 }, 0, 0, -1, 0, 0 };
+
+        n.init("abc", 3, 0);
+        if (n.consider("abc", 3) != 1000)
+            return err(8, "完全相同应为 1000");
+        if (n.consider("abc", 3) != 1000 || n.best_index() != 0)
+            return err(9, "分数相同时应保留第一个");
+    }
+    m.reset();
+    if (m.count() != 0 || m.best_index() != -1 || m.best_score() != 0)
+        return err(10, "reset 应清空");
+    /* 空句柄安全 */
+    {
+        Matcher e = { { 0 }, 0, 0, -1, 0, 0 };
+
+        e.init(0, 0, 500);
+        if (e.consider("x", 1) != -1 || e.best_index() != -1)
+            return err(11, "空种子应安全失败");
+    }
+}

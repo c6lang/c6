@@ -7,6 +7,22 @@
 
 ## 未发布
 
+### 标准库第八十六批：服务端中间件语义（限流 / 缓存 / 邮件编码 / 模糊匹配）
+
+- **`std/net/ratelimit.c6`**：令牌桶（`Bucket.take/take_n/retry_after`，整数毫秒
+  补充、允许突发）与滑动窗口（`Window.allow/count`，10 个 100 ms 槽，窗口边界不
+  双倍突发）两种口径。
+- **`std/net/httpcache.c6`**：RFC 9111 的判断要点——`CacheControl` 解析
+  （s-maxage 优先、no-store/no-cache/private 不可存）、新鲜度边界、ETag 弱/强比较，
+  以及定容缓存槽 `Cache.put/lookup/etag_of/expire`（近似 LFU 淘汰）+ `CacheDoc` 游标。
+- **`std/encoding/quotedprintable.c6`**：RFC 2045 QP 编解码。只有一份编码状态机：
+  `qp_encode()` 是流式 `QpEnc` 一次性喂完，`qp_encoded_len()` 是同一状态机只计数，
+  所以「算出来的长度」和「写出来的字节」永远一致；行尾空白按 `=20`/`=09` 编码。
+- **`std/text/strdist.c6`**：Levenshtein / OSA / Hamming / LCS / Jaro / Jaro-Winkler，
+  相似度一律千分制整数；`Matcher` 句柄把「阈值 + 逐个候选打分 + 记住最佳」做成方法。
+- 集成示例 `examples/stdmw.c6`（`make std-mw`，60 条检查）+ `STD_MW_SRCS` +
+  err 号段 0x6161…0x6164；`std/` 到 **357** 个模块。
+
 ### 标准库第八十五批：密钥交换 + 传输安全策略 + 抓取许可 + 45 进制
 
 - **`std/net/x25519.c6`**：Curve25519 密钥交换（RFC 7748），`Dh.init/agree/is_ready`

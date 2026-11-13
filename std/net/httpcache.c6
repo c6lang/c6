@@ -1,0 +1,554 @@
+/* std/net/httpcache：HTTP 缓存语义（RFC 9111 的要点）+ 一个定容缓存槽。
+ *
+ *     import std.net.httpcache;
+ *
+ *     CacheControl cc = { 0 };
+ *     cc_parse("public, max-age=60, must-revalidate", &cc);
+ *     cc.lifetime();                 // 60（s-maxage 优先，否则 max-age）
+ *     cc.storable();                 // 1（no-store/no-cache/private 时是 0）
+ *
+ *     Cache c = { 0 };
+ *     c.init();
+ *     c.put("/index.html", "\"v1\"", cc.lifetime(), 0, now);
+ *     c.lookup("/index.html", now + 30);   // 1 = 新鲜，2 = 过期但要回源校验，0 = 未命中
+ *
+ *     CacheDoc d = { 0 };
+ *     CacheSlot sl = { 0 };
+ *     d.open(&c);                           // 游标：open / next / count / reset
+ *     while (d.next(&sl))
+ *         printf("%s hits=%d\n", sl.key, sl.hits);
+ *
+ * 这里刻意**只做判断，不做 IO**：缓存能不能存、新不新鲜、要不要带
+ * `If-None-Match` 回源，都是纯函数/方法；真正的 `GET` 交给 `std.net.httpc`。
+ *
+ * 语义要点：
+ *
+ * - 新鲜度：`s-maxage` > `max-age`（前者给共享缓存用），两者都没有就是不新鲜；
+ * - `no-store` / `no-cache` / `private` 的响应不进共享缓存（`storable()` 为 0）；
+ * - `must-revalidate` 意味着过期后**不能**拿旧的凑合，必须回源；
+ * - ETag 比较用弱比较（忽略 `W/` 前缀，RFC 9110 §8.8.3.2），`etag_match()`
+ *   是强比较（带 `W/` 的直接不等）；
+ * - 槽满时淘汰 `hits` 最少的那条（近似 LFU），`evictions()` 记数；
+ * - `stored` / `life` / `now` **只要同单位**（`fresh()` 只做减法），示例里一律用
+ *   毫秒，所以 `cc.lifetime()`（秒）要先 `* 1000`。
+ */
+#include <string.h>
+
+module std.net.httpcache;
+import std.core.types;
+
+enum Error { OK = 0, PARSE = 1, INVAL = 2, RANGE = 3 };
+
+#define HCP_SLOTS 16
+#define HCP_KEY 80
+#define HCP_ETAG 48
+
+struct CacheControl {
+    int ok;                     /* 有没有 max-age/s-maxage */
+    long max_age;
+    long s_maxage;
+    int no_store;
+    int no_cache;
+    int must_reval;
+    int is_public;
+    int is_private;
+    int immutable;
+};
+
+struct CacheSlot {
+    char key[HCP_KEY];
+    int keylen;
+    char etag[HCP_ETAG];
+    int etaglen;
+    long stored;
+    long life;
+    int must_reval;
+    int hits;
+    int used;
+};
+
+struct Cache {
+    CacheSlot s[HCP_SLOTS];
+    int n;
+    int evicted;
+};
+
+struct CacheDoc {
+    Cache *c;
+    int i;
+    int seen;
+};
+
+/* ---- Cache-Control 解析 ---- */
+
+static int hcp_low(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+static int hcp_eqn(const char *a, const char *b, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (!a[i] || !b[i] || hcp_low((int)(unsigned char)a[i])
+                         != hcp_low((int)(unsigned char)b[i]))
+            return 0;
+    return 1;
+}
+
+/* 解析 Cache-Control；返回 1 = 有 max-age/s-maxage，0 = 没有（仍算解析成功）。 */
+int cc_parse(const char *text, CacheControl *cc)
+{
+    const char *s = text;
+
+    if (!cc)
+        return -1;
+    memset(cc, 0, sizeof *cc);
+    if (!s)
+        return 0;
+    while (*s) {
+        const char *key = 0;
+        int klen = 0;
+
+        while (*s == ',' || *s == ' ' || *s == '\t')
+            s++;
+        if (!*s)
+            break;
+        key = s;
+        while (*s && *s != '=' && *s != ',' && *s != ' ' && *s != '\t')
+            s++;
+        klen = (int)(s - key);
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (klen == 7 && hcp_eqn(key, "max-age", 7) && *s == '=') {
+            long v = 0;
+            int digits = 0;
+
+            s++;
+            if (*s == '"')
+                s++;
+            while (*s >= '0' && *s <= '9') {
+                v = v * 10 + (*s - '0');
+                s++;
+                digits++;
+            }
+            if (*s == '"')
+                s++;
+            if (digits > 0) {
+                cc->max_age = v;
+                cc->ok = 1;
+            }
+            continue;
+        }
+        if (klen == 8 && hcp_eqn(key, "s-maxage", 8) && *s == '=') {
+            long v = 0;
+            int digits = 0;
+
+            s++;
+            while (*s >= '0' && *s <= '9') {
+                v = v * 10 + (*s - '0');
+                s++;
+                digits++;
+            }
+            if (digits > 0) {
+                cc->s_maxage = v;
+                cc->ok = 1;
+            }
+            continue;
+        }
+        if (klen == 8 && hcp_eqn(key, "no-store", 8))
+            cc->no_store = 1;
+        else if (klen == 8 && hcp_eqn(key, "no-cache", 8))
+            cc->no_cache = 1;
+        else if (klen == 7 && hcp_eqn(key, "private", 7))
+            cc->is_private = 1;
+        else if (klen == 6 && hcp_eqn(key, "public", 6))
+            cc->is_public = 1;
+        else if (klen == 9 && hcp_eqn(key, "immutable", 9))
+            cc->immutable = 1;
+        else if (klen == 15 && hcp_eqn(key, "must-revalidate", 15))
+            cc->must_reval = 1;
+        /* 其它指令（stale-while-revalidate、扩展字段）忽略 */
+    }
+    return cc->ok;
+}
+
+/* 新鲜期：s-maxage 优先，其次 max-age；都没有给 -1（= 不新鲜）。 */
+long lifetime(CacheControl *cc)
+{
+    if (!cc)
+        return -1;
+    if (cc->s_maxage > 0)
+        return cc->s_maxage;
+    if (cc->max_age > 0)
+        return cc->max_age;
+    return -1;
+}
+
+/* 能不能进共享缓存。 */
+int storable(CacheControl *cc)
+{
+    if (!cc)
+        return 0;
+    if (cc->no_store || cc->no_cache || cc->is_private)
+        return 0;
+    return 1;
+}
+
+/* now - stored < life 就是新鲜。 */
+int fresh(long stored, long life, long now)
+{
+    if (life < 0)
+        return 0;
+    if (now < stored)
+        return 0;               /* 时钟倒退：按不新鲜处理 */
+    return now - stored < life;
+}
+
+/* 弱比较：忽略 W/ 前缀（RFC 9110 §8.8.3.2）。 */
+int etag_weak_match(const char *a, const char *b)
+{
+    if (!a || !b)
+        return 0;
+    if (a[0] == 'W' && a[1] == '/')
+        a += 2;
+    if (b[0] == 'W' && b[1] == '/')
+        b += 2;
+    return strcmp(a, b) == 0;
+}
+
+/* 强比较：带 W/ 的直接不等。 */
+int etag_match(const char *a, const char *b)
+{
+    if (!a || !b)
+        return 0;
+    if ((a[0] == 'W' && a[1] == '/') || (b[0] == 'W' && b[1] == '/'))
+        return 0;
+    return strcmp(a, b) == 0;
+}
+
+/* ---- 缓存槽（方法风格） ---- */
+
+void init(Cache *c)
+{
+    if (!c)
+        return;
+    memset(c, 0, sizeof *c);
+}
+
+int count(Cache *c)
+{
+    return c ? c->n : -1;
+}
+
+int evictions(Cache *c)
+{
+    return c ? c->evicted : -1;
+}
+
+static int hcp_find(Cache *c, const char *key)
+{
+    int klen = (int)strlen(key);
+
+    for (int i = 0; i < HCP_SLOTS; i++)
+        if (c->s[i].used && c->s[i].keylen == klen
+            && memcmp(c->s[i].key, key, (size_t)klen) == 0)
+            return i;
+    return -1;
+}
+
+/* 找一个空槽；没有就淘汰 hits 最少的那条。 */
+static int hcp_victim(Cache *c)
+{
+    int best = -1;
+
+    for (int i = 0; i < HCP_SLOTS; i++)
+        if (!c->s[i].used)
+            return i;
+    for (int i = 0; i < HCP_SLOTS; i++)
+        if (best < 0 || c->s[i].hits < c->s[best].hits)
+            best = i;
+    c->evicted++;
+    return best;
+}
+
+/* 写入/刷新一条；返回 1 新写入，2 覆盖已有，-1 失败。 */
+int put(Cache *c, const char *key, const char *etag, long life, int must_reval,
+        long now)
+{
+    int idx = 0;
+    int klen = 0;
+    int elen = 0;
+    int overwrite = 0;
+
+    if (!c || !key)
+        return -1;
+    klen = (int)strlen(key);
+    elen = etag ? (int)strlen(etag) : 0;
+    if (klen <= 0 || klen >= HCP_KEY || elen >= HCP_ETAG || life < 0)
+        return -1;
+    idx = hcp_find(c, key);
+    if (idx >= 0) {
+        overwrite = 1;
+    } else {
+        idx = hcp_victim(c);
+        if (idx < 0)
+            return -1;
+        memset(&c->s[idx], 0, sizeof c->s[idx]);
+        memcpy(c->s[idx].key, key, (size_t)klen + 1);
+        c->s[idx].keylen = klen;
+        c->s[idx].used = 1;
+        c->n++;
+    }
+    if (elen > 0)
+        memcpy(c->s[idx].etag, etag, (size_t)elen + 1);
+    else
+        c->s[idx].etag[0] = 0;
+    c->s[idx].etaglen = elen;
+    c->s[idx].stored = now;
+    c->s[idx].life = life;
+    c->s[idx].must_reval = must_reval ? 1 : 0;
+    return overwrite ? 2 : 1;
+}
+
+/* 查：1 = 新鲜（直接用），2 = 过期（带验证器回源），0 = 没这条。 */
+int lookup(Cache *c, const char *key, long now)
+{
+    int idx = 0;
+
+    if (!c || !key)
+        return 0;
+    idx = hcp_find(c, key);
+    if (idx < 0)
+        return 0;
+    c->s[idx].hits++;
+    if (fresh(c->s[idx].stored, c->s[idx].life, now))
+        return 1;
+    return 2;
+}
+
+/* 取某条的 ETag（给 If-None-Match 用）；没有给 0。 */
+const char *etag_of(Cache *c, const char *key)
+{
+    int idx = 0;
+
+    if (!c || !key)
+        return 0;
+    idx = hcp_find(c, key);
+    if (idx < 0 || c->s[idx].etaglen <= 0)
+        return 0;
+    return c->s[idx].etag;
+}
+
+int purge(Cache *c, const char *key)
+{
+    int idx = 0;
+
+    if (!c || !key)
+        return 0;
+    idx = hcp_find(c, key);
+    if (idx < 0)
+        return 0;
+    memset(&c->s[idx], 0, sizeof c->s[idx]);
+    c->n--;
+    return 1;
+}
+
+/* 清掉所有已过期的；返回清掉的条数。 */
+int expire(Cache *c, long now)
+{
+    int removed = 0;
+
+    if (!c)
+        return -1;
+    for (int i = 0; i < HCP_SLOTS; i++) {
+        if (!c->s[i].used)
+            continue;
+        if (!fresh(c->s[i].stored, c->s[i].life, now)) {
+            memset(&c->s[i], 0, sizeof c->s[i]);
+            c->n--;
+            removed++;
+        }
+    }
+    return removed;
+}
+
+/* ---- 游标 ---- */
+
+int open(CacheDoc *d, Cache *c)
+{
+    if (!d || !c)
+        return -1;
+    d->c = c;
+    d->i = 0;
+    d->seen = 0;
+    return 0;
+}
+
+/* 取下一条；取到返回 1（写进 out），到底返回 0。 */
+int next(CacheDoc *d, CacheSlot *out)
+{
+    if (!d || !d->c)
+        return 0;
+    while (d->i < HCP_SLOTS) {
+        CacheSlot *sl = &d->c->s[d->i];
+
+        d->i++;
+        if (!sl->used)
+            continue;
+        if (out)
+            *out = *sl;
+        d->seen++;
+        return 1;
+    }
+    return 0;
+}
+
+int count(CacheDoc *d)
+{
+    return d ? d->seen : -1;
+}
+
+void reset(CacheDoc *d)
+{
+    if (!d)
+        return;
+    d->i = 0;
+    d->seen = 0;
+}
+
+/* ---- 自测 ---- */
+
+test "Cache-Control：解析与新鲜期" {
+    CacheControl cc = { 0 };
+
+    if (cc_parse("public, max-age=60, must-revalidate", &cc) != 1)
+        return err(1, "解析失败");
+    if (cc.max_age != 60 || cc.must_reval != 1 || cc.is_public != 1)
+        return err(2, "字段不对");
+    if (cc.lifetime() != 60 || cc.storable() != 1)
+        return err(3, "lifetime/storable 不对");
+    /* s-maxage 优先 */
+    if (cc_parse("max-age=60, s-maxage=120", &cc) != 1 || cc.lifetime() != 120)
+        return err(4, "s-maxage 应优先");
+    /* no-store / no-cache / private 都不能进共享缓存 */
+    if (cc_parse("no-store, max-age=60", &cc) != 1 || cc.storable() != 0)
+        return err(5, "no-store 不该可存");
+    if (cc_parse("no-cache", &cc) != 0 || cc.storable() != 0)
+        return err(6, "no-cache 不该可存");
+    if (cc_parse("private, max-age=10", &cc) != 1 || cc.storable() != 0)
+        return err(7, "private 不该可存");
+    /* 引号值、大小写、空白 */
+    if (cc_parse("  MAX-AGE=\"30\" , immutable ", &cc) != 1 || cc.max_age != 30
+        || cc.immutable != 1)
+        return err(8, "引号/大小写应容忍");
+    /* 没有 max-age：解析成功但 lifetime 是 -1 */
+    if (cc_parse("must-revalidate", &cc) != 0 || cc.lifetime() != -1)
+        return err(9, "缺 max-age 应给 -1");
+    /* 新鲜度边界 */
+    if (!fresh(1000, 60, 1059) || fresh(1000, 60, 1060))
+        return err(10, "新鲜度边界应在 60 秒处");
+    if (fresh(1000, 60, 999) || fresh(1000, -1, 1000))
+        return err(11, "时钟倒退/无新鲜期都不新鲜");
+}
+
+test "缓存槽：写入、命中、过期与游标" {
+    Cache c = { 0 };
+    CacheDoc d = { 0 };
+    CacheSlot sl = { 0 };
+
+    c.init();
+    if (c.count() != 0)
+        return err(1, "初始应为空");
+    if (c.put("/a", "\"v1\"", 60, 0, 1000) != 1)
+        return err(2, "写入失败");
+    if (c.put("/a", "\"v2\"", 60, 0, 1000) != 2)
+        return err(3, "重复写入应覆盖");
+    if (c.count() != 1)
+        return err(4, "覆盖不该增加条数");
+    if (c.lookup("/a", 1030) != 1)
+        return err(5, "应命中且新鲜");
+    if (c.lookup("/a", 1060) != 2)
+        return err(6, "过期应返回 2（回源校验）");
+    if (c.lookup("/missing", 1030) != 0)
+        return err(7, "不存在应返回 0");
+    if (!etag_of(&c, "/a") || strcmp(c.etag_of("/a"), "\"v2\"") != 0)
+        return err(8, "ETag 应可取出");
+    if (etag_of(&c, "/missing") != 0)
+        return err(9, "没有 ETag 应给 0");
+    /* 游标 */
+    if (c.put("/b", "W/\"x\"", 5, 1, 2000) != 1)
+        return err(10, "第二条写入失败");
+    d.open(&c);
+    if (d.next(&sl) != 1 || strcmp(sl.key, "/a") != 0)
+        return err(11, "第一条应是 /a");
+    if (d.next(&sl) != 1 || strcmp(sl.key, "/b") != 0 || sl.must_reval != 1)
+        return err(12, "第二条应是 /b 且带 must-revalidate");
+    if (d.next(&sl) != 0 || d.count() != 2)
+        return err(13, "应恰好两条");
+    d.reset();
+    if (d.next(&sl) != 1 || d.count() != 1)
+        return err(14, "reset 后应从头开始");
+    /* purge / expire */
+    if (c.purge("/a") != 1 || c.count() != 1)
+        return err(15, "purge 应删掉");
+    if (c.purge("/a") != 0)
+        return err(16, "重复 purge 应返回 0");
+    if (c.expire(3000) != 1 || c.count() != 0)
+        return err(17, "expire 应清掉 /b");
+}
+
+test "缓存槽：容量淘汰、ETag 比较与坏参数" {
+    Cache c = { 0 };
+    CacheDoc d = { 0 };
+    CacheSlot sl = { 0 };
+    char key[32] = { 0 };
+
+    c.init();
+    for (int i = 0; i < HCP_SLOTS; i++) {
+        key[0] = 'k';
+        key[1] = (char)('a' + i);
+        key[2] = 0;
+        if (c.put(key, "\"e\"", 1000, 0, 0) != 1)
+            return err(1, "写满之前不该失败");
+    }
+    if (c.count() != HCP_SLOTS)
+        return err(2, "应正好写满");
+    /* 让 ka 有 3 次命中，其它 0 次，再写一条就该淘汰 kb（hits 最少） */
+    if (c.lookup("ka", 0) != 1 || c.lookup("ka", 0) != 1 || c.lookup("ka", 0) != 1)
+        return err(3, "ka 应命中");
+    if (c.put("new", "\"n\"", 10, 0, 0) != 1)
+        return err(4, "满了应淘汰后写入");
+    if (c.evictions() != 1)
+        return err(5, "应记一次淘汰");
+    if (c.lookup("kb", 0) != 0)
+        return err(6, "hits 最少的 kb 应被淘汰");
+    if (c.lookup("ka", 0) != 1 || c.lookup("new", 0) != 1)
+        return err(7, "其它条目应还在");
+    /* 游标只有 HCP_SLOTS 条 */
+    d.open(&c);
+    {
+        int n = 0;
+
+        while (d.next(&sl))
+            n++;
+        if (n != HCP_SLOTS || d.count() != HCP_SLOTS)
+            return err(8, "游标应走完所有条目");
+    }
+    /* ETag 弱比较 vs 强比较 */
+    if (!etag_weak_match("W/\"abc\"", "\"abc\"") || !etag_weak_match("\"a\"", "\"a\""))
+        return err(9, "弱比较应忽略 W/");
+    if (etag_match("W/\"abc\"", "\"abc\"") || !etag_match("\"abc\"", "\"abc\""))
+        return err(10, "强比较不接受 W/");
+    if (etag_weak_match("\"a\"", "\"b\"") || etag_weak_match(0, "\"a\""))
+        return err(11, "不同/空指针应不匹配");
+    /* 坏参数 */
+    if (c.put("x", "\"e\"", -1, 0, 0) != -1)
+        return err(12, "负新鲜期应拒绝");
+    {
+        char big[HCP_KEY + 8] = { 0 };
+
+        memset(big, 'z', sizeof big - 1);
+        if (c.put(big, "\"e\"", 10, 0, 0) != -1)
+            return err(13, "超长 key 应拒绝");
+    }
+}
