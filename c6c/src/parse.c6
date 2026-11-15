@@ -1187,6 +1187,24 @@ static int is_typename_tok(Tok *t)
  * 调用，16 太紧；64 够用，栈上的临时数组也就 64 字节。 */
 #define PA_ARG_MAX 64
 
+/* 多维 VLA **形参**的形状（`void f(int n, int m, int a[n][m])` 里的 a）。
+ *
+ * 为什么单独记一份：形参表里 n/m 的值还没有，算不出行 stride（见 dims_apply
+ * 里的注释）。声明符上只留"每一维是常量还是哪个形参名"，等 pa_func_def 在
+ * 函数入口按槽里的值现算（pa_vla_param_prep）。记录挂在函数声明符的
+ * `pvla_head` 链上，按 `idx`（第几个形参）对号——形参的声明符是临时对象，
+ * 用完就没了，所以记录要复制到 arena 里。 */
+typedef struct PVla {
+    struct PVla *next;      /* 同一个函数声明符上的下一条记录 */
+    u8 idx;                 /* 这是第几个形参（== d->nparams，绑帧时对号） */
+    u8 nd;                  /* 维度数（>= 2 才有这条记录） */
+    u8 k[8];                /* 每一维：0 = 常量，1 = 简单标识符 */
+    u32 c[8];               /* k == 0：常量长度（0 = 空着的维度） */
+    const char *nm[8];      /* k == 1：名字（一般就是前面的形参名） */
+    u32 nl[8];              /* k == 1：名字长度 */
+    u32 esz;                /* 最内层元素大小（字节） */
+} PVla;
+
 typedef struct Declarator {
     const char *name;
     u32 nlen;
@@ -1214,6 +1232,9 @@ typedef struct Declarator {
     u8 vla_multi;       /* 1 = 多维 VLA，vla_bytes/vla_str 有效 */
     u32 vla_str[8];     /* 行 stride（vreg，字节；最内维不用，按元素大小缩放） */
     u32 vla_bytes;      /* 整块字节数（vreg） */
+    u8 ptr_depth;       /* 这个声明符里已经吃掉几层 `*`（`int (*p)[m]` 要认出来） */
+    PVla pvla;          /* 多维 VLA 形参的形状（见 PVla；nd == 0 = 不是） */
+    PVla *pvla_head;    /* 函数声明符：形参们留下的形状记录链 */
     u32 type;           /* 解析出来的完整类型（形参/抽象声明符也要用） */
     u8 mgd;             /* `@T`：托管引用（机器层面还是 T *，但要插引用计数） */
     u8 mgd_kind;        /* 0=强引用 1=weak（不加计数） 2=own（同强引用） */
@@ -5568,6 +5589,15 @@ static int pa_bracket_is_vla(void)
 
 static u32 gen_bin2(u32 a, u32 aty, u8 op, u32 b, u32 bty);
 
+/* dims_apply 的附加输入：每一维在**源码里长什么样**（和 dims[]/dimv[]/dimr[]
+ * 平行）。普通的常量维度只用 dims[] 就够了，但多层 VLA **形参**的 stride 要等
+ * 形参有值以后再算，那时得知道"第 i 维写的是哪个名字"，所以声明处把名字也
+ * 留下来（见 decl_apply_suffix 里填它们的那段）。 */
+static u8 PA_DIMK[16];          /* 0 = 常量，1 = 简单标识符，2 = 其它表达式 */
+static const char *PA_DIMN[16]; /* k == 1：标识符 */
+static u32 PA_DIML[16];         /* k == 1：标识符长度 */
+static u32 PA_DIMC[16];         /* k == 0：常量值 */
+
 /* 一串数组维度 → 类型。全是常量就是普通数组；只要有一维是运行期长度，这个
  * 对象就是 C99 VLA（`int b[n][m]`）。
  *
@@ -5591,13 +5621,54 @@ static u32 dims_apply(u32 t, Declarator *d, u32 *dims, u32 *dimv, u8 *dimr, int 
         else if (dimr[i] == 2)
             npar++;
     }
-    /* 多维 VLA 形参：`int a[n][m]` 的 stride 要用形参 n/m 在**函数入口**算，
-     * 而解析形参表时这些名字还没绑上槽，这里算不出来。一维 `int a[n]` 不用
-     * stride，照旧支持；与其静默算错，不如明说。 */
-    if (npar > 0 && nd > 1 && nrun == 0)
-        pa_error("暂不支持多维 VLA 形参（`int a[n][m]`）：vla stride 要用形参的值在"
-                 "函数入口算，形参表里还看不到它。一维 `int a[n]` 可以；多维请"
-                 "显式传形状、或者用 `int *a` + 自己算下标");
+    /* 指向变长数组的指针（`int (*p)[m]`、`int (*p)[n][m]`）：运行期 stride 得
+     * 跟着**这个指针**走，类型里没有地方放它（c6c 的类型是静态 id）。以前这条
+     * 会静默按 `sizeof(元素)` 缩放，`p[i][j]` 读出来是垃圾；与其算错，不如说清。
+     * 多维 VLA 本身请写成 `int a[n][m]` 这种"数组形参"形式（那条现在支持）。 */
+    if (d && d->ptr_depth > 0 && (nrun > 0 || npar > 0)) {
+        pa_error("暂不支持指向变长数组的指针（`int (*p)[m]`）：运行期 stride 没有"
+                 "地方放；请写成数组形参 `int p[][m]`、或自己按 `p[i * m + j]` 算");
+    }
+    /* 多维 VLA 形参：`int a[n][m]`。形参表里 n/m 还没有值、槽也还没建，这里
+     * **算不出**行 stride，所以一条 IR 都不发——只把形状（每一维是常量还是哪个
+     * 名字）记到声明符上，等 pa_func_def 绑帧时在函数入口现算（见
+     * pa_vla_param_prep）。类型表示成和块作用域多维 VLA 一样的 k 层指针
+     * （`int a[n][m]` → `int **`），于是 `a[i][j]` 直接走 gen_postfix_ops 里
+     * 现成的多维 VLA 下标逻辑，三个后端一行都不用改。
+     * 一维 `int a[n]` 不用 stride，仍然落到下面的普通常量数组那条路。 */
+    if (nrun == 0 && npar > 0 && nd > 1 && d) {
+        int okk = 1;
+
+        if (nd > 8) {
+            /* pvla.k[] 只有 8 格（真要有 9 维再改，现在报清楚） */
+            pa_error("多维 VLA 形参最多 8 维");
+            okk = 0;
+        }
+        /* 只有**内层**维度的长度会进 stride：stride[nd-2] = len[nd-1] * sizeof(T)，
+         * stride[i] = len[i+1] * stride[i+1]。最外层那一维（len[0]）除了 sizeof
+         * 之外没有任何用处，而形参的 sizeof 是"指针大小"，本来就不用它——所以
+         * `int a[n + 1][m]` 这种最外层写表达式的形式放行，内层只收常量/形参名。 */
+        for (i = 1; okk && i < nd; i++) {
+            if (PA_DIMK[i] > 1) {
+                pa_error("多维 VLA 形参：内层维度只支持常量或形参名"
+                         "（`int a[n][m]`、`int a[n][5]`），不支持复合表达式");
+                okk = 0;
+            }
+        }
+        if (okk) {
+            d->pvla.nd = (u8)nd;
+            d->pvla.esz = ty_size(t) ? ty_size(t) : 1;
+            for (i = 0; i < nd && i < 8; i++) {
+                d->pvla.k[i] = PA_DIMK[i] > 1 ? 2 : PA_DIMK[i];
+                d->pvla.c[i] = PA_DIMC[i];
+                d->pvla.nm[i] = PA_DIMN[i];
+                d->pvla.nl[i] = PA_DIML[i];
+            }
+        }
+        for (i = 0; i < nd; i++)
+            t = ty_ptr(t);
+        return t;
+    }
     if (nrun == 0) {
         /* 普通常量数组。`[` 空着的维度是 0（不完整类型），照原样留着。 */
         while (nd > 0)
@@ -6517,6 +6588,18 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
         d->pmgd[d->nparams] = (u8)(pd.mgd ? (pd.mgd_kind == 1 ? 2 : 1) : 0);
         d->pshared[d->nparams] = pd.mgd_shared;
         d->pconst[d->nparams] = pd.obj_const;
+        /* 多层 VLA 形参（`int a[n][m]`）：形状记到函数声明符上，等 pa_func_def
+         * 绑帧时算 stride。pd 是这一轮的临时声明符，所以记录要复制进 arena
+         * ——函数定义可能在这之后才用到它（pa_func_def 在 parse_declarator
+         * 返回之后才跑）。 */
+        if (pd.pvla.nd >= 2) {
+            PVla *pv = arena_alloc(&A_main, sizeof(PVla));
+
+            *pv = pd.pvla;
+            pv->idx = (u8)d->nparams;
+            pv->next = d->pvla_head;
+            d->pvla_head = pv;
+        }
         if (pd.name) {
             d->pname[d->nparams] = pd.name;
             d->plen[d->nparams] = pd.nlen;
@@ -6573,6 +6656,12 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
         if (pa_is_ch('[')) {
             u32 cnt = 0;
             u8 bq = 0;
+            /* 这一维的"源码形态"，跟着 dims[]/dimr[] 一起交给 dims_apply
+             * （多层 VLA 形参要等到函数入口才能按名字取值，见 PA_DIMK） */
+            u8 dk = 0;
+            const char *dnm = NULL;
+            u32 dnl = 0;
+            u32 dc = 0;
 
             pa_advance();
             if (pa_is_ch(':')) {
@@ -6622,6 +6711,7 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                     dimv[nd] = value_of(gen_assign());
                     dimr[nd] = 1;
                     dims[nd] = 0;
+                    PA_DIMK[nd] = 2;    /* 运行期表达式（形参那条路不给它用） */
                     nd++;
                 } else {
                     pa_error("数组维度太多（上限 16）");
@@ -6636,6 +6726,8 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                  * 求值也不能求值（还没进函数体）。以前这里按常量表达式求，
                  * 于是 `int sum(int n, int a[n])` 直接报"未知名字 n"。 */
                 int dep = 1;
+                int ntok = 0;
+                Tok *t0 = pa_cur();
 
                 while (pa_cur()->kind != TK_EOF) {
                     if (pa_is_ch('[')) {
@@ -6643,16 +6735,37 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                     } else if (pa_is_ch(']') && --dep == 0) {
                         break;
                     }
+                    if (ntok == 0)
+                        t0 = pa_cur();
+                    ntok++;
                     pa_advance();
                 }
                 cnt = 0;
-                if (nd < 16)
+                if (nd < 16) {
                     dimr[nd] = 2;       /* 2 = 形参的运行期维度（不求值） */
+                    /* 长度这里求不了，但**形态**得记下来：多层 VLA 形参
+                     * （`int a[n][m]`）的行 stride 要等形参有值才算，那时只能
+                     * 按名字去找形参槽；写成别的表达式（`[n + 1]`）就没法
+                     * 支持了，dimr[] 里分不出这两种，所以在 dims_apply 之前
+                     * 记清楚（诊断的措辞也靠它，见那里的 for 循环）。 */
+                    if (ntok == 1 && t0->kind == TK_IDENT) {
+                        dk = 1;
+                        dnm = tok_data(t0);
+                        dnl = t0->len;
+                    } else {
+                        dk = 2;
+                    }
+                }
             } else {
                 cnt = (u32)const_expr();
+                dc = cnt;
             }
             pa_expect_ch(']');
             if (nd < 16) {
+                PA_DIMK[nd] = dk;
+                PA_DIMN[nd] = dnm;
+                PA_DIML[nd] = dnl;
+                PA_DIMC[nd] = dc;
                 dims[nd++] = cnt;
             } else {
                 t = ty_array(t, cnt);
@@ -6795,6 +6908,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
                 pq[nptr] = q;
         }
         nptr++;
+        d->ptr_depth++;
         skip_attributes();
     }
     if (pa_is_ch('(') && pa_peek(1)->kind == TK_PUNCT
@@ -18435,6 +18549,73 @@ static void fndef_check(Sym *fn)
     }
 }
 
+/* --- 多层 VLA 形参的行 stride ---------------------------------------------
+ *
+ * `void f(int n, int m, int a[n][m])`：形参 a 在 C 里退化成 `int (*)[m]`，
+ * c6c 内部表示成 k 层指针 + 每一维的运行期行 stride（和块作用域的
+ * `int b[n][m]` 一模一样，见 dims_apply）。声明处算不出来，是因为那时形参
+ * n/m 还没有槽；现在绑完帧了，照同一个公式在函数入口补上：
+ *     stride[nd-2] = len[nd-1] * sizeof(T)
+ *     stride[i]    = len[i+1] * stride[i+1]
+ * len[k] 要么是常量（`int a[n][5]`），要么是某个形参名 —— 从它的槽里 load。
+ * 算完挂到 Sym 上，`a[i][j]` 就走 gen_postfix_ops 里现成的多维 VLA 下标
+ * 逻辑，native / C99 / LLVM 三个后端一行都不用改。
+ *
+ * 注意这里**不**设 Sym.vla_cnt：形参的 `sizeof a` 是"指针大小"（8），不是
+ * 整块数组的字节数；pa_vla_sizeof 看到 vla_cnt == 0 就走普通 sizeof。 */
+
+/* 第 k 维长度 → vreg（常量发 CONST，名字就从槽里 load） */
+static u32 pa_pvla_len(PVla *pv, int k)
+{
+    Sym *s = NULL;
+    u32 v = 0;
+
+    if (pv->k[k] == 0) {
+        v = irfn_vreg(&FN);
+        irfn_push(&FN, IR_CONST, IRT_U64, v, 0, 0, 0, pv->c[k]);
+        return v;
+    }
+    s = sym_find(pv->nm[k], pv->nl[k]);
+    /* 解析形参表时 pa_bracket_is_vla() 已经确认过它是个运行期名字（不是枚举
+     * 常量）；走到这里还查不到对象，只可能是名字指向了函数之类。与其按 0
+     * 静默算错、让下标跑到别的行上去，不如报清楚。 */
+    if (!s || (s->kind != SC_PARAM && s->kind != SC_LOCAL && s->kind != SC_GLOBAL)) {
+        pa_error("多层 VLA 形参的内维只支持常量或形参名：'%.*s' 不是可用的对象",
+                 (int)pv->nl[k], pv->nm[k]);
+        v = irfn_vreg(&FN);
+        irfn_push(&FN, IR_CONST, IRT_U64, v, 0, 0, 0, 1);
+        return v;
+    }
+    return load_lval(ident_addr(s), s->type);
+}
+
+static void pa_vla_param_prep(Sym *p, PVla *pv)
+{
+    u32 str[8] = {0};
+    u32 esz = 0;
+    u32 acc = 0;
+    int nd = 0;
+    int i = 0;
+
+    if (!pv || pv->nd < 2)
+        return;
+    nd = pv->nd > 8 ? 8 : (int)pv->nd;
+    esz = pv->esz ? pv->esz : 1;
+    for (i = nd - 2; i >= 0; i--) {
+        u32 kk = acc;
+
+        if (!kk) {
+            kk = irfn_vreg(&FN);
+            irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, esz);
+        }
+        acc = gen_bin2(pa_pvla_len(pv, i + 1), ty_ulong(), IR_MUL, kk, ty_ulong());
+        str[i] = acc;
+    }
+    p->vla_nd = (u8)nd;
+    for (i = 0; i + 1 < nd && i < 8; i++)
+        p->vla_str[i] = str[i];
+}
+
 static void pa_func_def(Sym *fn, Declarator *d)
 {
     u32 i = 0;
@@ -18670,6 +18851,17 @@ static void pa_func_def(Sym *fn, Declarator *d)
             }
         }
         p->slot = slot;
+        /* 多层 VLA 形参（`int a[n][m]`）：槽都建好了，按声明处记下的形状
+         * 现算行 stride（见 pa_vla_param_prep）。前面那些形参的符号已经进
+         * 表了，所以这里 sym_find 能拿到 n/m 的槽。 */
+        {
+            PVla *pv = d->pvla_head;
+
+            while (pv && pv->idx != (u8)i)
+                pv = pv->next;
+            if (pv)
+                pa_vla_param_prep(p, pv);
+        }
         /* 托管形参：任务自己持有一份引用（形参本身照旧是借来的）。
          * 这样创建者随后放手，任务也不会立刻断掉（tests/gc_async.c6）。 */
         if (CUR_TASK_TY && p->is_mgd && TASK_MG_N < TASK_MG_CAP) {
