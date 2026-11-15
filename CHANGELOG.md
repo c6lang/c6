@@ -23,6 +23,12 @@
   程序参数与退出码原样透传（被信号杀按 shell 惯例 `128+sig`），临时文件在子
   进程结束后删除；首行 `#!` 当空白，所以 `#!/path/to/c6c -run` 可直接当脚本
   解释器。回归 `make -C c6c runflag`。
+- `-test` / `-test-filter=子串`：跑 `test "…" { }` 块、不执行用户 main（合成
+  入口叫 `c6c_test_main`，用户的 `main` 留在符号表里但不调用）。输出协议与
+  tcc 的 native 运行器逐字一致：每块一行 `PASS: 描述` / `FAIL: 描述: 错误消息`
+  （FAIL 走 stderr）、收尾 `N test(s), M failure(s)`、失败数当退出码；零块或
+  过滤空了静默退出 0。不给 `-o` 就编到临时 ELF 再 `exec`（和 `-run` 同一条
+  路），给了 `-o` 只写文件。回归 `make -C c6c testflag`（19 条）。
 - 验收（仓库内一条命令 `make -C c6c check-all`）：
   - 自举 fixpoint 逐字节相同（`c6c2 == c6c3`）；
   - tests 前端 123/0、跑通 67/0，std 模块 377/377，编译期诊断 314/314；

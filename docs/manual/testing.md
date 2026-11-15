@@ -24,6 +24,20 @@ test "add works" {
 
 运行器输出 `PASS:` / `FAIL:` 行与 `N test(s), M failure(s)`，全部通过时退出码为 0。
 
+自举编译器 `c6c` 是同一套开关和输出协议（`PASS:` / `FAIL: 描述: 错误消息` 走
+stderr、收尾统计在 stdout 最后一行、失败数当退出码、零块静默退出 0），所以
+上面那几条命令把它换上去就行：
+
+```sh
+./c6c/build/c6c -test tests/slice.c6
+./c6c/build/c6c -test -test-filter=切片 tests/slice.c6
+./c6c/build/c6c -test -o /tmp/slice tests/slice.c6 && /tmp/slice   # 只写文件，之后自己跑
+```
+
+`-test` 下用户 `main` 不执行；不给 `-o` 时编到临时 ELF 再 `exec`（和 `-run`
+同一条路）。只支持 native 后端，`-nostdlib` 会缺报告用的运行时助手。
+回归：`make -C c6c testflag`。
+
 
 ## 测试
 
