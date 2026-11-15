@@ -19,7 +19,7 @@ RUNS   ?= 5
 SRCS := $(wildcard src/*.c6)
 
 .PHONY: all g2c-check tests1-check scoreboard build scan unit irtest hello ctest runflag testflag tcc-tests bench bench-c6c lint selfhost \
-        selftest stdtest test c99test llvmtest build-tcc check-all check-all-perf help
+        selftest stdtest test c99test c99suite llvmtest build-tcc check-all check-all-perf help
 
 all: build
 
@@ -182,14 +182,22 @@ tests2-check: $(BUILD)/c6c
 tests1-check: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c ROOT=$(ROOT) ./tests/tcc-tests1.sh
 
+# 语言层 C99 的外部闸门：c-testsuite（third_party/c-testsuite/，scc 来源 150 条）。
+# 口径是"语言 100% 兼容 C99，库不管"：LANG（前端编不过）与 OUT（输出不符）必须为 0，
+# LIB（链接期缺符号，运行期没实现）单独计数、不挡闸门；超出口径的用例（C11 才有的
+# 语言特性）登记在 tests/c99-out-of-scope.txt，单列一类 N/A。LANG+OUT 已经清零，
+# 所以它现在是 check-all 的一部分。
+c99suite: $(BUILD)/c6c
+	@C6C=$(BUILD)/c6c ROOT=$(ROOT) ./tests/c99-suite.sh -j $(JOBS)
+
 llvmtest: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c LLC=$(LLVM_LLC) CC=$(CC) CORPUS=$(CURDIR)/tests/c ./tests/llvm-diff.sh
 
 # 验收（1）(2) (3)：功能面。跑分不在里面——验收（4）那几条硬指标（自编译
 # ≤100 ms、峰值 RSS ≤32 MB、4x 输入 ≤2.6x）随时可能因为机器负载抖动，
 # 拿它挡功能验收只会让人学会忽略红灯。要连跑分一起验就用 check-all-perf。
-check-all: unit irtest hello ctest runflag testflag selfhost selftest stdtest test diagtest c99test llvmtest build-tcc
-	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 能编出 tcc）"
+check-all: unit irtest hello ctest runflag testflag selfhost selftest stdtest test diagtest c99test c99suite llvmtest build-tcc
+	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 语言层 C99 外部闸门 / 能编出 tcc）"
 
 # 验收（4）：性能与内存硬指标（门槛在 bench/thresholds.json）
 check-all-perf: check-all bench-c6c

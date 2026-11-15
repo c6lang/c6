@@ -11,11 +11,19 @@
 typedef struct SrcFile {
     struct SrcFile *next;   /* 所有已加载文件（按加载顺序，id 递增） */
     char *path;             /* 显示用；"-" 表示命令行/合成内容 */
+    char *disp;             /* `#line N "file"` 给的名字（__FILE__ / 诊断用）；NULL = 用 path */
     char *data;
     size_t size;
     u32 *lines;             /* 行首偏移，lines[0] = 0 */
     u32 nlines;
     u32 line_cap;
+    /* `#line N` 的行号映射：从 lm_off[i] 这个字节偏移起，物理行 lm_phys[i]
+     * 报成 lm_log[i]，之后的物理行顺延。按偏移升序追加（pp.c6 登记）。 */
+    u32 *lm_off;
+    u32 *lm_phys;
+    u32 *lm_log;
+    u32 nlm;
+    u32 lm_cap;
     u32 id;
     u8 owned;               /* 1 = data 是 malloc 的（命令行内容） */
     u8 pragma_once;         /* 见过 #pragma once */
@@ -282,12 +290,14 @@ static void src_build_lines(SrcFile *f)
     f->line_cap = cap;
 }
 
-static u32 src_line_of(SrcFile *f, u32 off)
+/* 物理行号（只看源码里的换行，不认 `#line`）。列号计算要用它。 */
+static u32 src_phys_line_of(SrcFile *f, u32 off)
 {
+    u32 lo = 0, hi = 0;
+
     if (!f->lines)
         src_build_lines(f);
-    u32 lo = 0, hi = f->nlines;
-
+    hi = f->nlines;
     while (lo + 1 < hi) {
         u32 mid = (lo + hi) / 2;
         if (f->lines[mid] <= off)
@@ -296,4 +306,52 @@ static u32 src_line_of(SrcFile *f, u32 off)
             hi = mid;
     }
     return lo + 1;
+}
+
+/* 对外报的行号：`#line` 之后按指令里的数算（C99 6.10.4）。 */
+static u32 src_line_of(SrcFile *f, u32 off)
+{
+    u32 phys = src_phys_line_of(f, off);
+    u32 i = f->nlm;
+
+    while (i > 0) {
+        if (f->lm_off[i - 1] <= off)
+            return f->lm_log[i - 1] + (phys - f->lm_phys[i - 1]);
+        i--;
+    }
+    return phys;
+}
+
+/* 登记一条 `#line N`：从字节偏移 off 开始（= 指令那一行之后的第一个字节）
+ * 的行按 logical 报。`#line 1000` 后面那一行__LINE__ 就是 1000。 */
+static void src_line_mark(SrcFile *f, u32 off, u32 logical)
+{
+    u32 phys = src_phys_line_of(f, off);
+
+    if (f->nlm + 1 > f->lm_cap) {
+        u32 ncap = f->lm_cap ? f->lm_cap * 2 : 8;
+        u32 *no = arena_alloc(&A_main, (size_t)ncap * sizeof(u32));
+        u32 *np = arena_alloc(&A_main, (size_t)ncap * sizeof(u32));
+        u32 *nl = arena_alloc(&A_main, (size_t)ncap * sizeof(u32));
+
+        if (f->nlm) {
+            memcpy(no, f->lm_off, (size_t)f->nlm * sizeof(u32));
+            memcpy(np, f->lm_phys, (size_t)f->nlm * sizeof(u32));
+            memcpy(nl, f->lm_log, (size_t)f->nlm * sizeof(u32));
+        }
+        f->lm_off = no;
+        f->lm_phys = np;
+        f->lm_log = nl;
+        f->lm_cap = ncap;
+    }
+    f->lm_off[f->nlm] = off;
+    f->lm_phys[f->nlm] = phys;
+    f->lm_log[f->nlm] = logical ? logical : 1;
+    f->nlm++;
+}
+
+/* 对外报的文件名：`#line N "file"` 改过就用它（__FILE__ 与诊断口径一致）。 */
+static const char *src_path_of(SrcFile *f)
+{
+    return (f && f->disp) ? f->disp : (f ? f->path : "-");
 }
