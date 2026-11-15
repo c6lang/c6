@@ -3477,3 +3477,64 @@ make -C c6c selfhost BOOTSTRAP=host                             # c6c2 == c6c3�
 * 因此 `tcc/` 目录本身、以及 tcc 侧的 115 个 CTest 用例仍在，只是它们现在
   描述的是**另一个产品**（c6 = tcc 扩展版），不再是 c6c 的前置条件。
 
+
+## 第 197 轮：`-c` 出 ET_REL 目标文件（链接器的第一块地基）
+
+上一轮把 tcc 从**构建链**上摘掉了，这一轮开始补"产品位"的硬缺口 ①：
+c6c 以前根本没有目标文件——`-c` 也出一份**可执行**的静态 ELF（单文件
+freestanding，`_start` 直接调 main），所以"一个源文件一个 `.o`、最后链起来"
+这条最普通的工程流一步都走不了。没有 `.o`，自己的链接器也就没有输入。
+
+**做法**：新增 `src/obj.c6`（≈450 行）。它不重新算任何东西——前面几节早就把
+"将来要重定位的地方"记全了，exec 路径最后一次性把它们拍成绝对地址，`-c` 只是
+换个出口：把这些记录翻成 `.rela.*`。
+
+| 记录 | 来源 | 变成 |
+| --- | --- | --- |
+| `X64.fix[]` | 代码里的 rel32（call / lea rip+disp32） | `R_X86_64_PC32`；目标未定义时 `PLT32`（和 gcc 一个口径） |
+| `X64.labs_patch[]` | 代码里的 `&&label` imm64 | `R_X86_64_64`（`.text` 段符号 + 加数） |
+| `DFIX[]` | 数据里的符号地址（`&f`、`p = "x"`、`&a[3]`） | `R_X86_64_64` + 符号 + 解析期算好的加数 |
+| `C99_RLOFF[]` | 数据里指向数据段内部的裸偏移（字符串字面量） | `R_X86_64_64`（有名字用符号，没名字挂 `.data` 段符号） |
+| `CLBL[]` | 数据里的 `&&label` | `R_X86_64_64`（`.text` 段符号） |
+
+段表：`.text` / `.data` / `.rela.text` / `.rela.data` / `.symtab` / `.strtab` /
+`.shstrtab` / `.note.GNU-stack`；符号按"本地在前、全局在后"排（`sh_info` 是
+全局起点），TU 私有的名字给 `LOCAL`：字符串字面量 `.LC<n>`、`static` 的
+`helper$2`（`tu_static_name` 的后缀）、编译器自己的 TLS 记账格 `__c6_tls_*`。
+
+**踩到的三个坑**（都记在这儿，下次少走）：
+
+1. `extern T x;` 在单镜像路径上历史行为是"给一格零初始化存储"——`rt.c6` 的
+   `extern char **environ;` 就吃这格。改成纯引用之后每个程序都报
+   `未定义的符号 'environ'`（`make test` 52 个失败）。所以按模式分叉：`-c`
+   走 C99 6.9.2p2 的真语义（不分配、只登记引用），单镜像保持原样，等运行时有
+   自己的 `environ` 定义再统一。
+2. `__c6_tls_img/len/delta` 每 TU 各发一份，做成 `GLOBAL` 就是链接期
+   "multiple definition"（两个 `.o` 一链就炸）。改成 `LOCAL`。
+3. c6 语言规则"文件作用域对象必须带初始化器"把 `u32 sh_name[OBJ_NSEC];` 拦下来
+   ——gcc 能编、c6c 自己编不过（自举时才暴露）。初始化器补上。
+
+**实测**（同一台机器）：
+
+```
+c6c -c one.c6 -o one.o            # 代码 521 字节 / 数据 86 字节 / 13 符号 / 5 条 .rela.text
+c6c -c lib.c6 -o lib.o && c6c -c main.c6 -o main.o && cc main.o lib.o -o prog
+  → counter=8 lib_add=38          # 跨 TU 全局可读可写、外部函数经 PLT32 解析
+make -C c6c objcheck              # 11/11：单/多 TU + readelf 结构核对
+make -C c6c check-all             # 全绿（fixpoint / 三后端 / tests / std / 诊断 / c99suite / build-tcc 118/144）
+```
+
+`make test` 里 `async` 那条在 8 MB 栈下会段错误——**不是这一轮引入的**：改动前
+的二进制（20:05 那份）用同样的 `ulimit -s 8192` 跑同一条用例，退出码一样是 139；
+Makefile 里本来也记着"`async` 在共享 runner 上偶发段错误"。跑全量时用
+`C6C_TEST_STACK=0` 就绕过去了。
+
+**这一轮之后还差的**（硬缺口 ① 的后半 + 其余四件）：
+
+* **自己的链接器**：现在 `.o` 还得借系统 `cc` 的链接器。下一步是
+  `c6c -o prog a.o b.o`：合并同名 `.text/.data`、按符号表解析 `UND`、套用五类
+  重定位、补 `.bss`。1200–1600 行那个估算是从这一步开始算的。
+* `.bss`（零初始化数据现在也落在 `.data` 里，`.o` 会白占空间）、weak / 可见性 /
+  段 GC、`-fPIC` 与 `-shared`。
+* 硬缺口 ②③④⑤（动态链接 / libtcc 嵌入、x86-64 之外的 native 后端、`-g` /
+  独立 `.s` / `-b`、库形态与 `find_package(c6 COMPONENTS libtcc)`）都还没动。
