@@ -13,8 +13,22 @@
 # 编译天然依赖它：tcc 先编好，c6c 才有得编。
 
 set(C6C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/c6c")
-set(C6C_STAGE0 "${C6_TCC_DIR}/c6${C6_TCC_EXESUF}")
 set(C6C_BIN "${C6C_DIR}/build/c6c")
+
+# 引导编译器（stage0）：
+#   C6_ENABLE_TCC=ON（默认）→ 仓库自己的 tcc/c6，-B tcc 带 crt / libtcc1.a；
+#   C6_ENABLE_TCC=OFF        → 宿主 C 编译器，`-x c` 直接编 c6c 的单 TU 源码。
+# 两条路的产物同一份源码、同一套语义，验收（fixpoint / 三后端 / 语料）与
+# stage0 无关；OFF 这条路**不需要任何 tcc 构建产物**。
+if(C6_ENABLE_TCC)
+  set(C6C_STAGE0 "${C6_TCC_DIR}/c6${C6_TCC_EXESUF}")
+  set(_c6c_bootstrap_args "C6C=${C6C_STAGE0}" "BDIR=${C6_TCC_DIR}")
+  set(_c6c_stage0_dep "${C6C_STAGE0}")
+else()
+  set(C6C_STAGE0 "${CMAKE_C_COMPILER}")
+  set(_c6c_bootstrap_args "BOOTSTRAP=host" "HOSTCC=${CMAKE_C_COMPILER}")
+  set(_c6c_stage0_dep "")
+endif()
 
 # 引导编译器 tcc/c6 在 shared 形态（-DC6_TCC_SHARED_LIBTCC=ON）下自己就是链到
 # libtcc.so 的：构建树里的 c6 没有 rpath，直接执行会报
@@ -42,16 +56,25 @@ file(GLOB C6C_SRCS CONFIGURE_DEPENDS "${C6C_DIR}/src/*.c6")
 if(EXISTS "${C6C_DIR}/Makefile")
   add_custom_command(
     OUTPUT "${C6C_BIN}"
-    COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" build
-            "C6C=${C6C_STAGE0}" "BDIR=${C6_TCC_DIR}"
-    DEPENDS ${C6C_SRCS} "${C6C_STAGE0}"
+    COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" build ${_c6c_bootstrap_args}
+    DEPENDS ${C6C_SRCS} ${_c6c_stage0_dep}
     COMMENT "c6c: 用 ${C6C_STAGE0} 编出自举编译器 (c6c/build/c6c)"
     VERBATIM)
 
   add_custom_target(c6c ALL DEPENDS "${C6C_BIN}")
-  # 引导编译器 tcc/c6 是 tcc-build 的产物：显式连上依赖，`--target c6c` 从
-  # 干净目录也能一次编到底。
-  add_dependencies(c6c tcc-build)
+  # 引导编译器是 tcc/c6 时，它是 tcc-build 的产物：显式连上依赖，
+  # `--target c6c` 从干净目录也能一次编到底。stage0 换成宿主 cc 时没有这个
+  # 依赖，c6c 也从 tcc 的构建链里彻底摘出来。
+  if(C6_ENABLE_TCC)
+    add_dependencies(c6c tcc-build)
+  else()
+    # 不建 tcc，但 tcc 的**配置文件**还是要生成：c6c 的 build-tcc 把
+    # tcc/*.c 当语料编，那份源码 `#include "config.h"`。tcc-config 只同步
+    # config.mak / config.h / config.texi，不碰 tcc 的编译产物。
+    add_dependencies(c6c tcc-config)
+    add_dependencies(c6 c6c)
+    add_dependencies(build c6c)
+  endif()
   set_target_properties(c6c PROPERTIES
     ADDITIONAL_CLEAN_FILES "${C6C_BIN}")
 endif()
@@ -67,7 +90,7 @@ endif()
 if(BUILD_TESTING AND EXISTS "${C6C_DIR}/Makefile")
   add_test(NAME c6c-build
            COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" build
-                   "C6C=${C6C_STAGE0}" "BDIR=${C6_TCC_DIR}")
+                   ${_c6c_bootstrap_args})
   set_tests_properties(c6c-build PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "c6c"
@@ -86,8 +109,7 @@ if(BUILD_TESTING AND EXISTS "${C6C_DIR}/Makefile")
   # c6c 编出上游 tcc 并让它跑 tests2（含**第三代 selfhost**）。
   add_test(NAME c6c-check-all
            COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" check-all
-                   "ROOT=${CMAKE_CURRENT_SOURCE_DIR}" "C6C=${C6C_STAGE0}"
-                   "BDIR=${C6_TCC_DIR}")
+                   "ROOT=${CMAKE_CURRENT_SOURCE_DIR}" ${_c6c_bootstrap_args})
   set_tests_properties(c6c-check-all PROPERTIES
     WORKING_DIRECTORY "${C6C_DIR}"
     LABELS "c6c"

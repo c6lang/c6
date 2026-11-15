@@ -6,6 +6,22 @@
 不链接 `libtcc`、不复制 `tcc/` 的源码（`make c6c-lint` 机器可查）。仓库里的 `tcc/` 只承担
 两件事：**引导第一步**（用它编出 c6c stage1）和**差分测试的 oracle**。
 
+这两件事里的第一件**已经可以不用 tcc**：c6c 的源码是 C99 兼容的单 TU
+（`src/c6c.c6` 把各模块 `#include` 进来），所以 stage0 可以换成宿主 C 编译器：
+
+```sh
+make -C c6c build BOOTSTRAP=host HOSTCC=gcc     # 只要一个 C 编译器
+cmake -S . -B build -DC6_ENABLE_TCC=OFF         # 连 tcc 都不构建
+```
+
+`tcc/` 剩下的是"语料 + oracle"这一件事：`make build-tcc` / `tests1` / `tests2`
+仍然编它的源码来量 c6c 的深浅，但**不需要 tcc 的产品构建**（不经过 CMake 的
+tcc 目标、不安装、不出 `libtcc`）。其中 `build-tcc` 要的 `tcc/libtcc1.a` 是
+运行时，必须由能用的 tcc 编（宿主 cc 编的等价物会让成绩从 118/144 掉到
+102/144）；`tcc/c6` 缺席时 Makefile 用宿主 cc 把 `tcc/tcc.c` 编一个**参考
+tcc** 当夹具，再由它编运行时——不安装、不进交付物。CI 的 `no-tcc` 作业就是
+这条路的机器证据（构建完断言 `tcc/c6` 不存在，再跑 `ctest -L c6c`）。
+
 | 文档 | 内容 |
 |---|---|
 | [docs/plan.md](docs/plan.md) | 目标、验收口径、实测基线、阶段计划、风险 |

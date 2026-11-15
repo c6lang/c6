@@ -3,15 +3,34 @@
 # 这个 Makefile 不引用 tcc/ 的源码：tcc 只作为 bootstrap 第一步与 oracle，
 # 路径从 C6C 传进来。顶层 Makefile 有同名转发目标（make c6c-bench 等）。
 #
-#   make bench        用 tcc/c6 跑基线（P0 起的现状）
+#   make bench        用 tcc/c6 跑基线（P0 起的现状；BOOTSTRAP=host 时不可用）
 #   make bench-c6c    用 c6c 跑并按 thresholds.json 断言（P3b 之后才有意义）
 #   make lint         隔离检查：不 include tcc 头、不链接 libtcc、不复制 tcc 源码
 #   make fast         快速门禁（≈40 s，含外部 c-testsuite 与上游 tests1·tests2）
 #   make check-all    最终验收（P8-1 之前各目标会如实报“未实现”）
+#
+# 引导编译器（stage0）可换，`BOOTSTRAP` 选路：
+#
+#   BOOTSTRAP=tcc（默认）  ../tcc/c6 编 stage1，`-B ../tcc` 带 tcc 的 crt /
+#                          libtcc1.a。要求先构建 tcc。
+#   BOOTSTRAP=host        宿主 C 编译器直接编 stage1：c6c 的源码是 C99 兼容的
+#                          单 TU（src/c6c.c6 把各模块 #include 进来），
+#                          `cc -x c -O2 -o build/c6c src/c6c.c6` 就够了。
+#                          这条路**不需要任何 tcc 二进制**，CI 的 no-tcc 作业
+#                          与 `cmake -DC6_ENABLE_TCC=OFF` 都走它。
+#
+# 两条路的产物是同一份源码编出来的同一套语义：fixpoint（c6c2 == c6c3）与
+# 其余验收都与 stage0 无关。
 
 PYTHON ?= python3
-C6C    ?= ../tcc/c6          # 引导编译器（tcc/c6；P4 之后可以是 c6c 自己）
+BOOTSTRAP ?= tcc             # tcc | host（见上面的说明）
+# CMAKE 只在需要生成 tcc 的配置头时用到（见 build-tcc）；不要写成行尾注释，
+# GNU make 会把注释前的空格留在变量值里，`"$(CMAKE)"` 就找不到命令了。
+CMAKE  ?= cmake
+C6C    ?= ../tcc/c6          # BOOTSTRAP=tcc 的引导编译器
 BDIR   ?= ../tcc             # tcc 的 -B：crt / libtcc1.a
+HOSTCC ?= cc                 # BOOTSTRAP=host 的引导编译器
+HOSTCFLAGS ?= -O2            # 引导编译器的编译参数（不是 c6c 编用户代码的参数）
 BUILD  ?= build
 C6FLAGS ?= -g
 ROOT   ?= ..
@@ -24,13 +43,23 @@ SRCS := $(wildcard src/*.c6)
 
 all: build
 
-# stage1：由 tcc/c6 编出 c6c（单 TU，见 src/c6c.c6 顶部注释）
+# stage1：单 TU 引导（见 src/c6c.c6 顶部注释）。BOOTSTRAP 决定用谁编这一遍。
 build: $(BUILD)/c6c
-	@echo "c6c: $(BUILD)/c6c 已就绪（P1：只有 --scan / -fsyntax-only）"
+	@echo "c6c: $(BUILD)/c6c 已就绪（stage0 = $(BOOTSTRAP)）"
 
+ifeq ($(BOOTSTRAP),host)
+$(BUILD)/c6c: $(SRCS)
+	@mkdir -p $(BUILD)
+	$(HOSTCC) -x c $(HOSTCFLAGS) -o $@ src/c6c.c6
+else ifeq ($(BOOTSTRAP),tcc)
 $(BUILD)/c6c: $(SRCS)
 	@mkdir -p $(BUILD)
 	$(C6C) -B $(BDIR) $(C6FLAGS) -o $@ src/c6c.c6
+else
+$(BUILD)/c6c: $(SRCS)
+	@echo "c6c: BOOTSTRAP=$(BOOTSTRAP) 不认识（只有 tcc / host）" >&2
+	@exit 1
+endif
 
 # 用 c6c 自己的词法扫一遍 tcc 的全部源码与 std/ 的 153 个模块（P1-4）
 # il-gen.c 自带 `#error this code has bit-rotted since 2003`，是上游故意留的。
@@ -51,6 +80,9 @@ stdtest: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c ROOT=$(ROOT) ./tests/std-tests.sh -j $(JOBS)
 
 bench:
+	@test -x $(C6C) || { \
+	  echo "c6c: bench 拿 $(C6C) 当基线，它不存在（BOOTSTRAP=host / 无 tcc 时不适用）" >&2; \
+	  echo "c6c: 改用 make bench-c6c（只量 c6c 自己）" >&2; exit 1; }
 	$(PYTHON) bench/bench.py --root $(ROOT) --cc $(C6C) --runs $(RUNS) \
 	    --json bench/last.json
 
@@ -145,7 +177,54 @@ diagtest: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c ROOT=$(ROOT) ./tests/diag-tests.sh -j $(JOBS) $(if $(V),-v)
 
 # 目标（2）的 G2c：用 c6c 编出 tcc 本体，再由这个 tcc 跑上游 tests2。
-build-tcc: $(BUILD)/c6c-opt
+#
+# 这一步编的是 tcc 的**源码**（语料），而那份源码要用三个**生成**物：
+#   config.h / config.mak —— tcc/CMakeLists.txt 生成（tcc-config 目标）
+#   tccdefs_.h            —— tcc/Makefile 的规则：`cc -DC2STR tcc/conftest.c`
+#                            出 c2str.exe，再由它把 include/tccdefs.h 转成
+#                            tccdefs_.h
+#   libtcc1.a             —— tcc 的 C 运行库。它**必须由能用的 tcc 编**：上游
+#                            允许 `x86_64-libtcc1-usegcc=yes` 用宿主 cc 编，
+#                            但实测那样编出来的运行时会让 c6c 编出的 tcc 少过
+#                            一批用例（102/144、第三代 selfhost 坏 8），而用
+#                            tcc 编的是 118/144、坏 0（与 tcc 自己构建的运行时
+#                            逐条一致）。tcc/ 里还没有 c6 时，这里先用宿主 cc
+#                            把 tcc 源码编成一个**参考 tcc**（`make -C tcc c6`，
+#                            和产品构建同一条 cc 编译链，只是不经过 CMake、
+#                            不安装、不进任何交付物），再由它编 libtcc1.a。
+#                            这一步同时带 EXTRA-DEFS=-DC6_EXT：tcc/Makefile 里
+#                            写得很清楚，tcc.h 的 struct TCCState 按这个宏开合
+#                            字段，运行时与编译器两侧不一致就是静默错编译。
+# 三个都不需要**产品构建**的 tcc（一个靠 cmake，另外两个靠宿主 cc），
+# 所以纯 Makefile 流程——BOOTSTRAP=host、根本没走过 CMake 的检出——也能把
+# 语料备齐，然后由 c6c 编出的那个 tcc 真的跑起 tests2。
+# 已经由 tcc 的 CMake 构建备好时这三步都是空操作。
+# 语料运行时用的 EXTRA-DEFS，与产品构建的默认（C6_ENABLE_EXT=ON）一致。
+# 单独一行赋值：行尾注释会把注释前的空格留在值里，而这个值是用引号传下去的。
+C6EXT ?= -DC6_EXT
+TCC_CONFIG_STAMP := $(BUILD)/tcc-config.stamp
+$(TCC_CONFIG_STAMP):
+	@mkdir -p $(BUILD)
+	@if [ ! -f "$(ROOT)/tcc/config.h" ]; then \
+	  echo "c6c: 生成 tcc 的配置头（只跑 tcc-config，不编 tcc）"; \
+	  "$(CMAKE)" -S "$(ROOT)/tcc" -B "$(BUILD)/tcc-config" > /dev/null && \
+	  "$(CMAKE)" --build "$(BUILD)/tcc-config" --target tcc-config > /dev/null; \
+	fi
+	@if [ ! -f "$(ROOT)/tcc/tccdefs_.h" ]; then \
+	  echo "c6c: 生成 tcc/tccdefs_.h（tcc/Makefile 的规则，用宿主 cc）"; \
+	  $(MAKE) -C "$(ROOT)/tcc" tccdefs_.h EXTRA-DEFS="$(C6EXT)" > /dev/null; \
+	fi
+	@if [ ! -f "$(ROOT)/tcc/libtcc1.a" ]; then \
+	  if [ ! -x "$(ROOT)/tcc/c6" ]; then \
+	    echo "c6c: 用宿主 cc 编一个参考 tcc（G2c 的运行时夹具，不安装）"; \
+	    $(MAKE) -C "$(ROOT)/tcc" c6 EXTRA-DEFS="$(C6EXT)" > /dev/null; \
+	  fi; \
+	  echo "c6c: 用参考 tcc 编 tcc 的 C 运行库 libtcc1.a"; \
+	  $(MAKE) -C "$(ROOT)/tcc/lib" EXTRA-DEFS="$(C6EXT)" > /dev/null; \
+	fi
+	@touch $@
+
+build-tcc: $(BUILD)/c6c-opt $(TCC_CONFIG_STAMP)
 	@mkdir -p $(BUILD)
 	@$(BUILD)/c6c-opt -o $(BUILD)/tcc-c6c -DONE_SOURCE=1 \
 	    -I$(ROOT)/tcc -I$(abspath include) $(ROOT)/tcc/tcc.c

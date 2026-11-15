@@ -3400,3 +3400,80 @@ int main(void) { struct S t = mk(3.0); return t.a == 3.0 ? 0 : 1; }
 * `int *p = q;`（`q` 是普通全局变量）：c6c 历史上落的是 `&q`，gcc 报
   "initializer element is not constant"。这条**没动**——改它要连带确认现有
   用例，留作已知偏差。
+
+## 第 196 轮：让 tcc 退出工具链（stage0 可换 + CI `no-tcc`）
+
+问题不是"c6c 能不能编 tcc"（G2c 早就绿了），而是"**构建 c6c 还要不要先有 tcc**"。
+答案原来是要：`make -C c6c build` 的 stage0 写死 `../tcc/c6 -B ../tcc`，CMake 的
+`c6c` 目标也 `add_dependencies(c6c tcc-build)`。于是 tcc 是 c6c 的前置条件，
+而 c6c 的 `build-tcc` 只把它当**语料**——这两件事被混在一条依赖链上。
+
+这一轮把前置条件摘掉，把 tcc 降到"语料 + oracle"：
+
+| 改动 | 位置 | 结果 |
+| --- | --- | --- |
+| 引导器可选 | `c6c/Makefile` 的 `BOOTSTRAP=tcc\|host` | `BOOTSTRAP=host` 走 `$(HOSTCC) -x c -O2 -o build/c6c src/c6c.c6`；`tcc` 仍是默认 |
+| 构建开关 | `C6_ENABLE_TCC`（默认 ON） | OFF 时 `add_subdirectory(tcc)` 不执行，c6c 的 stage0 换成 `CMAKE_C_COMPILER`，`c6c` 不再依赖 `tcc-build` |
+| 依赖关系 | `cmake/C6C.cmake` | OFF 时反过来 `c6` / `build` 依赖 `c6c`（ALL 上只有 c6c） |
+| 侧翼 | 安装 / `find_package(c6)` / pkgconf / CPack / wasm / `check-install` / `test-plain` / `c6-clean` | OFF 时逐个退化成打印说明，不生成指向不存在产物的清单 |
+| tcc 侧用例 | `cmake/C6Testing.cmake` | OFF 时 115 个 tcc 回归用例**不注册**（它们描述 tcc 产品面），`check-all` / `test-all` 等聚合入口改为打印"用 `ctest -L c6c`"；汇总行明确写"CTest 用例 0 个（tcc 侧 114 个未注册）" |
+| 机器证据 | `.github/workflows/ci.yml` 的 `no-tcc` 作业 | 只用 cmake+gcc 配置构建，**断言 `tcc/c6`、`tcc/libtcc.a` 不存在**，再跑 `ctest -L c6c -LE perf` + `make -C c6c selfhost BOOTSTRAP=host` |
+
+为什么这条路是通的：c6c 从 P1 起就是**单 TU**（`src/c6c.c6` 把 `arena/mod/src/
+diag/lex/pp/macro/parse/type/sym/ir/x64/c99/llvm/elf/main` 逐个 `#include` 进来），
+源码本身是 C99 兼容的——`make bench-c6c` 的测量二进制一直就是
+`gcc -O3 -x c src/c6c.c6`。也就是说"宿主 cc 能编 c6c"这件事在仓库里已经成立了
+几十轮，只是从来没被当成**引导**路径用；把 tcc 从引导链上摘下来不需要新代码，
+只需要把这条既存事实做成选项并钉进 CI。
+
+实测（同一台机器，本轮的 OFF 构建）：
+
+```
+cmake -S . -B build -DC6_ENABLE_TCC=OFF -DBUILD_TESTING=ON     # 配置 0.2 s
+cmake --build build --parallel                                  # 只有 c6c，24 s
+  → c6c: build/c6c 已就绪（stage0 = host）
+ls tcc/c6 tcc/libtcc.a                                          # 都不存在
+ctest --test-dir build -L c6c -LE perf                          # 5/5 全绿（328 s）
+  → 3/5 c6c-check-all                                            … Passed 326.16 sec
+make -C c6c selfhost BOOTSTRAP=host                             # c6c2 == c6c3（逐字节）
+```
+
+**语料侧的三个生成物**（`build-tcc` 要编 `tcc/tcc.c`，那份源码 `#include`
+不少生成文件；把它们备齐并不需要 tcc 的产品构建）：
+
+| 生成物 | 谁生成 | 要 tcc 二进制吗 |
+| --- | --- | --- |
+| `tcc/config.h` / `config.mak` / `config.texi` | `tcc/CMakeLists.txt` 的 `tcc-config` 目标（纯 cmake，OFF 时也照跑，因为 `tcc/CMakeLists.txt` 新增了 `TCC_CONFIGURE_ONLY` 只留配置不留构建目标） | 不要 |
+| `tcc/tccdefs_.h` | `tcc/Makefile` 自己的规则：宿主 `cc -DC2STR` 出 `c2str.exe`，再由它把 `include/tccdefs.h` 转成 `tccdefs_.h`（12,227 字节） | 不要 |
+| `tcc/libtcc1.a` | tcc 的 C 运行库，必须由**能用的 tcc** 编 | 要 |
+
+第三项是唯一绕不开 tcc 的地方，也是这一轮踩得最久的坑：
+
+* 先试上游的 `x86_64-libtcc1-usegcc=yes`（宿主 cc 编运行时）→ c6c 编出的 tcc
+  跑 tests2 只过 **102/144**、第三代 selfhost 抽查 4 条**坏 8**；
+* 再试不带 `EXTRA-DEFS=-DC6_EXT` 的 cc 运行时 → **95/144**、坏 8（`tcc.h` 的
+  `struct TCCState` 按这个宏开合字段，运行时与编译器两侧不一致就是静默错编译，
+  `tcc/Makefile` 里写着这条警告）；
+* 最后让 `tcc/c6` 缺席时先用宿主 cc 把 `tcc/tcc.c` 编一个**参考 tcc**
+  （`make -C tcc c6 EXTRA-DEFS=-DC6_EXT`，和产品构建同一条 cc 编译链，不经过
+  CMake、不安装、不进交付物），再由它编 `libtcc1.a` → **118/144、坏 0**，与
+  tcc 自己的 CMake 构建逐条一致。
+
+所以 G2c 的语义要写清楚：它判的是"c6c 编出的 tcc 能不能工作"，因此必须有一个
+已知能工作的 tcc 来供运行时；OFF 模式把这个夹具现编出来，而不是把 tcc 变成
+构建前置条件。`build-tcc` 的三步都做完了才轮到 c6c 的那一遍。
+
+**没做的、也就是 tcc 还没退的那一半**（都写在这里，不藏在别处）：
+
+* **发布形态**：OFF 模式下不生成安装清单——c6c 装出去之后怎么找自己的
+  `include/` 与 `lib/rt.c6`（默认搜索路径、`-B` 语义）还没定，这是下一步；
+  今天的 c6c 仍要 `-I<repo>/c6c/include` 才编带系统头的程序。
+* **libtcc / 动态链接 / `.o`**：c6c 只出静态 ELF，没有 ET_REL 与链接器
+  （设计里估 1200–1600 行），所以它还编不出 `libtcc.so`、也接不了系统的
+  `.so`。下游 `find_package(c6 COMPONENTS libtcc)` 这类用法仍然只有 tcc 能提供。
+* **多架构 / `-g` / `-b` / 独立汇编源**：c6c 的 native 后端只有 x86-64，
+  其余靠 C99 / LLVM 后端（要外部 gcc/llc）；`-g`、`-b` 边界检查、tccasm 那种
+  独立 `.s` 都没有。
+* 因此 `tcc/` 目录本身、以及 tcc 侧的 115 个 CTest 用例仍在，只是它们现在
+  描述的是**另一个产品**（c6 = tcc 扩展版），不再是 c6c 的前置条件。
+

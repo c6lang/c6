@@ -4,6 +4,11 @@
 # config.texi，并定义 tcc-build / tcc-build-plain / tcc-config 等目标；这里只把
 # c6 侧的参数传下去，再从 tcc::c6 / tcc::libtcc 读回产物信息。不再运行
 # tcc/configure，也不需要签名戳：配置同步与清理由 CMake 的构建依赖驱动。
+#
+# `C6_ENABLE_TCC=OFF`（tcc 退出工具链）时这一层仍然 add_subdirectory，但传
+# `TCC_CONFIGURE_ONLY=ON`：**只生成配置文件，不定义任何构建/安装目标**。
+# 为什么还需要生成配置：c6c 的 build-tcc / tests1 / tests2 拿 tcc 的源码当
+# 语料编，`#include "config.h"` 是那份语料的一部分；没有构建产物也照样要它。
 
 set(_c6_extra_defs "")
 if(C6_ENABLE_EXT)
@@ -45,6 +50,15 @@ endif()
 # 宏带进编译期，`c6 -v` 打印的就是它；tcc/VERSION 仍只当上游兼容版本。
 set(C6_RELEASE_VERSION "${C6_VERSION_RAW}")
 
+if(C6_ENABLE_TCC)
+  set(TCC_CONFIGURE_ONLY OFF)
+else()
+  set(TCC_CONFIGURE_ONLY ON)
+  message(STATUS
+    "c6: C6_ENABLE_TCC=OFF —— 只生成 tcc 的配置文件，不构建 tcc；"
+    "c6c 的 stage0 = 宿主 C 编译器 (${C6_HOSTCC})")
+endif()
+
 add_subdirectory("${C6_TCC_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tcc")
 
 # 产物路径只通过 tcc::c6 / tcc::libtcc 暴露；这里只把父项目后续模块仍要
@@ -54,7 +68,6 @@ add_subdirectory("${C6_TCC_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tcc")
 
 set(C6_TCC_VERSION "${TCC_VERSION}")
 set(C6_TCC_VERSION_NUMERIC "${TCC_VERSION_NUMERIC}")
-set(C6_VERSION_NUMERIC "${PROJECT_VERSION}")
 set(C6_LIBTCC_FILENAME "${TCC_LIBTCC_FILENAME}")
 set(C6_LIBTCC_KIND "${TCC_LIBTCC_KIND}")
 set(C6_TCC_STATIC "${TCC_STATIC}")
@@ -63,3 +76,4 @@ set(C6_TCC_DLLSUF "${TCC_DLLSUF}")
 set(C6_TCC_EXESUF "${TCC_EXESUF}")
 set(C6_INTERFACE_LINK_LIBS "${TCC_INTERFACE_LINK_LIBS}")
 set(C6_PC_PRIVATE_LIBS "${TCC_PC_PRIVATE_LIBS}")
+set(C6_VERSION_NUMERIC "${PROJECT_VERSION}")
