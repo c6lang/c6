@@ -96,6 +96,40 @@ static struct P rec(int n)
 	return p;
 }
 
+
+/* 零形参函数返回聚合（`struct P mk(void)`）：这条以前在 C99 后端失效——
+ * c6c 把 `(void)`/`()` 这种无形参表当成"可以多传实参"，聚合返回的隐藏实参
+ * 就被排除了；再加上"拿 vreg 0 当没结果槽"的哨兵，零形参函数的结果槽正好是
+ * vreg 0，于是悄悄退回"返回被调方帧地址"，`gcc -O1` 下读出来是垃圾。 */
+static struct P mk_zero(void)
+{
+	struct P p;
+
+	p.x = 21;
+	p.y = 22;
+	return p;
+}
+
+static struct P mk_empty()
+{
+	struct P p = {23, 24};
+
+	return p;
+}
+
+static int zero_arg_agg(void)
+{
+	struct P a = mk_zero();
+	struct P b = mk_empty();
+	int bad = 0;
+
+	if (a.x != 21 || a.y != 22)
+		bad++;
+	if (b.x != 23 || b.y != 24)
+		bad++;
+	return bad;
+}
+
 int main(void)
 {
 	struct P a = mk(3);
@@ -122,6 +156,8 @@ int main(void)
 	/* 再走一遍"取成员前先过一次函数调用"（以前最容易在这里读到脏值） */
 	if (mk(9).y != 10)
 		bad++;
+	/* 零形参函数返回聚合（`mk_zero(void)` / `mk_empty()`） */
+	bad += zero_arg_agg();
 	printf("agg ok=%d bad=%d\n", bad == 0, bad);
 	return bad != 0;
 }
