@@ -6,8 +6,6 @@
 104_inline	要 tcc 自己 libtcc1.a 里的 check_exports；上游 tests2/Makefile 自己就是用 104+_inline.c 替代（只编不跑），而那份变体 c6c 已干净编过
 113_btdll	需要 tcc 自己的 tcc_backtrace
 114_bound_signal	要 tcc 的 -b 边界检查运行时：用例有 main、会被真跑，光补 __sigsetjmp 不够（要 pthread/fork/signal/longjmp 一整套）
-120_alias	要第二个 TU（inunit2.c），没有链接器；上游同样用 120+_alias.c 替代，c6c 已干净编过那份变体
-146_tls_extern	TLS 本身是好的（144_tls 就是靠 lib/rt.c6 的 TLS 过的），缺的只是"值定义在另一个 TU" —— 没有链接器
 140_arm64_extasm	arm64 汇编（上游在 x86-64 上也跳）
 145_winarm64_interlocked	要 windows.h + win-arm64 内建函数（上游也跳）
 99_fastcall	i386 的 fastcall 调用约定（上游只在 i386 上跑）
