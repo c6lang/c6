@@ -17,7 +17,8 @@ enum {
     M_E,
     M_OBJ,      /* -c：单文件、freestanding、_start 直接调 main */
     M_EXE,      /* 默认：单文件 + 自带运行时 → 可执行文件 */
-    M_RUN       /* -run：编到临时 ELF，exec 它（不落盘、不留输出） */
+    M_RUN,      /* -run：编到临时 ELF，exec 它（不落盘、不留输出） */
+    M_LINK      /* 输入是 .o：调自己的静态链接器（ld.c6）链成可执行文件 */
 };
 
 typedef struct Opts {
@@ -51,6 +52,13 @@ typedef struct Opts {
      * -test 就是"跑起来"），给了 -o 就只写文件不跑。 */
     int test;
     const char *test_filter;
+    /* -Wl,--allow-undefined：链接时未定义符号按 0 处理（只打一条汇总警告）。
+     * 过渡手段——把带 libc 名字的 .o（比如 rt.o）先链成静态程序；真正的解法
+     * 是动态链接（DT_NEEDED + PLT/GOT），见 c6c/docs/todo.md。 */
+    int allow_undef;
+    /* -Wl,--dynamic：链接出动态可执行文件（DT_NEEDED libc.so.6 + PLT/GOT），
+     * 未定义的**函数**从 libc 解析，不再按 0 处理。 */
+    int dyn_link;
 } Opts;
 
 static Opts O;
@@ -74,7 +82,8 @@ static void usage(FILE *fp)
         "  --ir-demo            打印 hello 形态的 IR dump\n"
         "  -fsyntax-only        只查错不出码（语法在 P3）\n"
         "  -E                   预处理输出到 stdout\n"
-        "  -c                   单文件 freestanding 可执行文件（不带运行时）\n"
+        "  -c                   只编不链：输出可重定位目标文件（ET_REL，.o），\n"
+        "                       不带运行时、不查 main；一个输入出一个 .o\n"
         "  -run 文件 [参数...]   编成临时 ELF 后立刻执行（参数原样传给 main；\n"
         "                       退出码照抄；不写输出文件，仅 native 后端）\n"
         "  -test                跑所有 `test \"…\" { }` 块（用户 main 不执行）：\n"
@@ -560,6 +569,19 @@ static int parse_args(int argc, char **argv)
                 diag_error_plain("不认识的 -std=%s（支持 c89/c99/c11 及其 gnu 变体）", sv);
                 return -1;
             }
+        } else if (strcmp(a, "-Wl,--allow-undefined") == 0) {
+            /* 必须在下面那条"吞掉所有 -W*"之前，否则会被静默忽略 */
+            O.allow_undef = 1;
+        } else if (strcmp(a, "-Wl,--dynamic") == 0) {
+            O.dyn_link = 1;
+        } else if (strncmp(a, "-Wl,", 4) == 0) {
+            /* -Wl, 开头的是**链接器**选项：不认识的必须报错，不能落进下面
+             * 那条"吞掉所有 -W*"的兜底里——否则 `-Wl,--dynamic` 拼错一个字母
+             * 会被静默忽略，链接还是静态的，症状是"我明明开了动态链接"却
+             * 报未定义符号。 */
+            diag_error_plain("不认识的链接器选项 '%s'（支持 -Wl,--allow-undefined"
+                             " / -Wl,--dynamic）", a);
+            return -1;
         } else if (a[0] == '-' && (a[1] == 'W' || a[1] == 'w')) {
             /* 告警开关：接受并记下来，目前没有告警子系统，静默忽略。
              * tests/errors/*.c6 的 `// FLAGS -Wgeneric-depth` 靠它才不吃错。 */
@@ -581,6 +603,32 @@ static int parse_args(int argc, char **argv)
                 O.run_argi = i;
                 break;
             }
+        }
+    }
+    /* 输入里有 .o：那是"链接"，不是"编译"。混着给不接——c6c 自己的多 TU
+     * 编译走单镜像那条路（几个源文件一次压成一份 ELF），而"边编边链"这一版
+     * 故意不做：先让 .o → 可执行这一步独立立起来，边界才清楚。 */
+    if (O.nfiles > 0) {
+        int nobj = 0;
+        int k = 0;
+
+        for (k = 0; k < O.nfiles; k++) {
+            const char *nm = O.files[k];
+            size_t len = strlen(nm);
+
+            if (len > 2 && nm[len - 2] == '.' && nm[len - 1] == 'o')
+                nobj++;
+        }
+        if (nobj) {
+            if (nobj != O.nfiles) {
+                diag_error_plain("把 .o 和源文件混在一起给不行：先分别 -c，再一次链接");
+                return -1;
+            }
+            if (O.mode != M_EXE) {
+                diag_error_plain("链接 .o 时不能用 -c/-E/-fsyntax-only/-run");
+                return -1;
+            }
+            O.mode = M_LINK;
         }
     }
     if (O.run && !O.test) {
@@ -632,6 +680,28 @@ static int parse_args(int argc, char **argv)
 
 static char C6C_SELF_DIR[512];
 
+/* -c 没给 -o 时的默认输出名：`src/foo.c6` → `foo.o`（和 gcc 同一个习惯：
+ * 只留下文件名、去掉 .c6 / .c 后缀）。 */
+static const char *obj_default_out(const char *src, char *buf, size_t n)
+{
+    const char *base = src ? src : "a.c6";
+    const char *slash = base ? strrchr(base, '/') : NULL;
+    size_t len = 0;
+
+    if (slash)
+        base = slash + 1;
+    len = base ? strlen(base) : 0;
+    if (len > 3 && strcmp(base + len - 3, ".c6") == 0)
+        len -= 3;
+    else if (len > 2 && strcmp(base + len - 2, ".c") == 0)
+        len -= 2;
+    if (len + 3 > n)
+        len = n > 3 ? n - 3 : 0;
+    memcpy(buf, base, len);
+    memcpy(buf + len, ".o", 3);
+    return buf;
+}
+
 /* 从 argv[0] 推出编译器自己的目录，供自带 include/ 使用 */
 static void setup_self_dir(const char *argv0)
 {
@@ -661,6 +731,11 @@ static void setup_incdirs(void)
         if (NINCDIR < MAX_INCDIRS)
             INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
         snprintf(bd, sizeof(bd), "%s/../include", C6C_SELF_DIR);
+        if (NINCDIR < MAX_INCDIRS)
+            INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+        /* 装出来的布局：<prefix>/bin/c6 + <prefix>/lib/c6/include（和 tcc 的
+         * <prefix>/lib/tcc 一个意思——自带头文件不跟 C 库的 include 抢地方）。 */
+        snprintf(bd, sizeof(bd), "%s/../lib/c6/include", C6C_SELF_DIR);
         if (NINCDIR < MAX_INCDIRS)
             INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
     }
@@ -750,6 +825,8 @@ static int run_elf(char **pargv)
     return 128 + (st & 0x7f);
 }
 
+/* 库形态（libc6c）不要 main：宿主程序自己有。见 src/c6c-lib.c6。 */
+#ifndef C6C_NO_MAIN
 int main(int argc, char **argv)
 {
     pp_init_time();
@@ -768,17 +845,35 @@ int main(int argc, char **argv)
     setup_incdirs();
 
     switch (O.mode) {
+    case M_LINK: {
+        /* 只做链接：所有输入都是 ET_REL 目标文件，产出静态可执行文件。
+         * 退出码 0 = 成功，2 = 链接失败（ld.c6 里已经把原因写到 stderr 了）。 */
+        ld_set_allow_undef(O.allow_undef);
+        ld_set_dynamic(O.dyn_link);
+        return ld_link(O.files, O.nfiles, O.out ? O.out : "a.out");
+    }
     case M_OBJ:
     case M_EXE:
     case M_RUN: {
-        /* 三个模式都出"可直接执行的 ELF"，区别只有输出到哪、带不带运行时。
-         * 真正的 ET_REL 目标文件 + 自己的链接器在 P4 落地。 */
+        /* M_OBJ 出 ET_REL（真正的 .o，可重定位，见 obj.c6）；M_EXE / M_RUN 出
+         * 可直接执行的静态 ELF。 */
         SrcFile *sf = NULL;
+        char objname[512] = {0};
         const char *out = O.out ? O.out : "a.out";
         /* -run 和"没给 -o 的 -test"都走临时 ELF：编完就地 exec，退出码照抄 */
         int tmp_out = (O.mode == M_RUN) || (O.test && !O.out);
         int rc = 0;
 
+        if (O.mode == M_OBJ && !O.out)
+            out = obj_default_out(O.files[0], objname, sizeof(objname));
+        if (O.mode == M_OBJ && O.nfiles > 1) {
+            /* 一个 .o 对应一个 TU。多个输入要分别出 .o，那得把编译拆成多次
+             * 跑（符号表 / 数据段 / 代码段都是整份镜像一份）。先如实拒绝，
+             * 别把两个 TU 悄悄并进一个 .o —— 那样链接期符号会重复。 */
+            diag_error_plain("-c 一次只编一个源文件（多个输入请分别出 .o）");
+            return 2;
+        }
+        pa_set_reloc(O.mode == M_OBJ);
         if (tmp_out) {
             if (run_make_tmp() < 0)
                 return 2;
@@ -957,3 +1052,4 @@ int main(int argc, char **argv)
     }
     return 0;
 }
+#endif /* C6C_NO_MAIN */

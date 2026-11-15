@@ -506,6 +506,18 @@ static u32 x64_data_sym(X64State *st, const char *name, u32 img_off)
     return i;
 }
 
+/* 只登记"这是个数据符号"的引用（**不**定义它）：出 .o 时用来把 extern 数据
+ * （`extern char **environ;`）标成 STT_OBJECT——链接器靠这个区分"能动态导入
+ * 的函数"和"要做 COPY 重定位的数据"。标成代码符号会让链接器把它当函数，
+ * 发一条 PLT 桩子，取到的地址就不是那个变量了。 */
+static u32 x64_data_ref(X64State *st, const char *name)
+{
+    u32 i = x64_sym(st, name);
+
+    st->sym[i].is_data = 1;
+    return i;
+}
+
 /* lea reg, [rip+rel32]，目标走重定位（位置无关，不需要可写代码段） */
 static void x64_lea_sym(X64State *st, int reg, u32 sym)
 {
@@ -557,6 +569,11 @@ static int x64_emit_asmblob(X64State *st, u32 symi)
     return 1;
 }
 
+/* `-c`（ET_REL）模式：这里不拍绝对地址，只把"还没有定义、但编译器自带跳板"
+ * 的符号补齐（跳板是代码段的一部分，属于本 TU），剩下的交给 obj.c6 落成重
+ * 定位。未定义符号在这种情况下是**正常**的：它对应一条 UND 重定位。 */
+static int X64_OBJ;
+
 static void x64_resolve(X64State *st)
 {
     u32 i = 0;
@@ -574,6 +591,8 @@ static void x64_resolve(X64State *st)
         if (!st->sym[f->sym].defined && x64_emit_asmblob(st, f->sym))
             target = st->sym[f->sym].off;
         if (!st->sym[f->sym].defined) {
+            if (X64_OBJ)
+                continue;           /* -c：留给链接器，落成 UND 重定位 */
             /* C6C_ALLOW_UNDEF=1：不报错停在这里，而是把所有缺失的符号列一遍
              * （诊断"这份源码还差哪些运行时函数"用；产物不能用）。 */
             if (ALLOW_UNDEF) {
@@ -591,6 +610,8 @@ static void x64_resolve(X64State *st)
             exit(2);
         }
         rel = target - next;
+        if (X64_OBJ)
+            continue;               /* -c：rel32 留给重定位表，别在这里拍死 */
         img_patch32(st->im, f->patch, rel);
     }
 }

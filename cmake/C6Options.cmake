@@ -25,6 +25,7 @@ option(C6_TCC_SHARED_LIBTCC "CONFIG_static=no，产出 libtcc.so" OFF)
 option(C6_INSTALL_CMAKE_PACKAGE "安装 c6Config.cmake / c6Targets.cmake" ON)
 option(C6_INSTALL_PKGCONF "安装 c6.pc" ON)
 option(C6_INSTALL_LIBTCC_PC "额外安装 libtcc.pc 兼容名" ON)
+option(C6_INSTALL_C6LIB "安装 c6c 的嵌入库 libc6c.a/.so 与头文件（c6lib.h、tcc 兼容头）" ON)
 option(C6_INSTALL_TCC_SYMLINK "安装 bindir/tcc -> c6 兼容软链" ON)
 option(C6_INSTALL_DOCS "安装 c6 的 docs/、README、CHANGELOG 与 license" ON)
 set(C6_INSTALL_TCCDIR "" CACHE STRING

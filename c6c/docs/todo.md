@@ -3477,3 +3477,292 @@ make -C c6c selfhost BOOTSTRAP=host                             # c6c2 == c6c3�
 * 因此 `tcc/` 目录本身、以及 tcc 侧的 115 个 CTest 用例仍在，只是它们现在
   描述的是**另一个产品**（c6 = tcc 扩展版），不再是 c6c 的前置条件。
 
+
+## 第 197 轮：`-c` 出 ET_REL 目标文件（链接器的第一块地基）
+
+上一轮把 tcc 从**构建链**上摘掉了，这一轮开始补"产品位"的硬缺口 ①：
+c6c 以前根本没有目标文件——`-c` 也出一份**可执行**的静态 ELF（单文件
+freestanding，`_start` 直接调 main），所以"一个源文件一个 `.o`、最后链起来"
+这条最普通的工程流一步都走不了。没有 `.o`，自己的链接器也就没有输入。
+
+**做法**：新增 `src/obj.c6`（≈450 行）。它不重新算任何东西——前面几节早就把
+"将来要重定位的地方"记全了，exec 路径最后一次性把它们拍成绝对地址，`-c` 只是
+换个出口：把这些记录翻成 `.rela.*`。
+
+| 记录 | 来源 | 变成 |
+| --- | --- | --- |
+| `X64.fix[]` | 代码里的 rel32（call / lea rip+disp32） | `R_X86_64_PC32`；目标未定义时 `PLT32`（和 gcc 一个口径） |
+| `X64.labs_patch[]` | 代码里的 `&&label` imm64 | `R_X86_64_64`（`.text` 段符号 + 加数） |
+| `DFIX[]` | 数据里的符号地址（`&f`、`p = "x"`、`&a[3]`） | `R_X86_64_64` + 符号 + 解析期算好的加数 |
+| `C99_RLOFF[]` | 数据里指向数据段内部的裸偏移（字符串字面量） | `R_X86_64_64`（有名字用符号，没名字挂 `.data` 段符号） |
+| `CLBL[]` | 数据里的 `&&label` | `R_X86_64_64`（`.text` 段符号） |
+
+段表：`.text` / `.data` / `.rela.text` / `.rela.data` / `.symtab` / `.strtab` /
+`.shstrtab` / `.note.GNU-stack`；符号按"本地在前、全局在后"排（`sh_info` 是
+全局起点），TU 私有的名字给 `LOCAL`：字符串字面量 `.LC<n>`、`static` 的
+`helper$2`（`tu_static_name` 的后缀）、编译器自己的 TLS 记账格 `__c6_tls_*`。
+
+**踩到的三个坑**（都记在这儿，下次少走）：
+
+1. `extern T x;` 在单镜像路径上历史行为是"给一格零初始化存储"——`rt.c6` 的
+   `extern char **environ;` 就吃这格。改成纯引用之后每个程序都报
+   `未定义的符号 'environ'`（`make test` 52 个失败）。所以按模式分叉：`-c`
+   走 C99 6.9.2p2 的真语义（不分配、只登记引用），单镜像保持原样，等运行时有
+   自己的 `environ` 定义再统一。
+2. `__c6_tls_img/len/delta` 每 TU 各发一份，做成 `GLOBAL` 就是链接期
+   "multiple definition"（两个 `.o` 一链就炸）。改成 `LOCAL`。
+3. c6 语言规则"文件作用域对象必须带初始化器"把 `u32 sh_name[OBJ_NSEC];` 拦下来
+   ——gcc 能编、c6c 自己编不过（自举时才暴露）。初始化器补上。
+
+**实测**（同一台机器）：
+
+```
+c6c -c one.c6 -o one.o            # 代码 521 字节 / 数据 86 字节 / 13 符号 / 5 条 .rela.text
+c6c -c lib.c6 -o lib.o && c6c -c main.c6 -o main.o && cc main.o lib.o -o prog
+  → counter=8 lib_add=38          # 跨 TU 全局可读可写、外部函数经 PLT32 解析
+make -C c6c objcheck              # 11/11：单/多 TU + readelf 结构核对
+make -C c6c check-all             # 全绿（fixpoint / 三后端 / tests / std / 诊断 / c99suite / build-tcc 118/144）
+```
+
+`make test` 里 `async` 那条在 8 MB 栈下会段错误——**不是这一轮引入的**：改动前
+的二进制（20:05 那份）用同样的 `ulimit -s 8192` 跑同一条用例，退出码一样是 139；
+Makefile 里本来也记着"`async` 在共享 runner 上偶发段错误"。跑全量时用
+`C6C_TEST_STACK=0` 就绕过去了。
+
+**这一轮之后还差的**（硬缺口 ① 的后半 + 其余四件）：
+
+* **自己的链接器**：现在 `.o` 还得借系统 `cc` 的链接器。下一步是
+  `c6c -o prog a.o b.o`：合并同名 `.text/.data`、按符号表解析 `UND`、套用五类
+  重定位、补 `.bss`。1200–1600 行那个估算是从这一步开始算的。
+* `.bss`（零初始化数据现在也落在 `.data` 里，`.o` 会白占空间）、weak / 可见性 /
+  段 GC、`-fPIC` 与 `-shared`。
+* 硬缺口 ②③④⑤（动态链接 / libtcc 嵌入、x86-64 之外的 native 后端、`-g` /
+  独立 `.s` / `-b`、库形态与 `find_package(c6 COMPONENTS libtcc)`）都还没动。
+
+## 第 198 轮：自己的静态链接器（`c6c -o prog a.o b.o`）
+
+上一轮把 `.o` 做出来了，可"最后一步"还得借系统 `cc`。这一轮把它也拿回来：
+新增 `src/ld.c6`（≈800 行），输入 ELF64 `ET_REL`，输出 `ET_EXEC`。
+
+**它做的四件事**：
+
+1. **归并段**：`.text` / `.rodata`(.rodata.*) / `.data`(.data.*) / `.bss` /
+   `.init_array` / `.fini_array`；`.comment`、`.note*`、`.eh_frame`、调试段
+   丢掉（连带丢掉指向它们的重定位）。每个输入段在归并段里的起点记下来，
+   后面重定位和布局都靠它。
+2. **符号解析**：本地符号按各自 `.o` 的段起点算地址；全局按名字，强定义盖
+   弱定义，两个强定义报"重复定义"（带上是哪两个 `.o`）；`SHN_COMMON` 当
+   BSS 格子；未定义默认硬报错（退出码 2 + 名字 + 在哪条 `.rela` 里引用的）。
+3. **重定位**：`R_X86_64_64` / `PC32` / `PLT32`（按 PC32 处理）/ `32` /
+   `32S`，越界报错不静默截断。
+4. **合成 `_start`**：取 `argc/argv/envp`（`envp = argv + 8*(argc+1)`）→ 逐个
+   `call` `.init_array` → `call main` → 逐个 `call` `.fini_array`（倒序）→
+   `syscall 60` 退出。栈对齐按 SysV：入口 `rsp%16==0`，`call` 压 8 字节后
+   函数里看到的正是 `rsp%16==8`。
+
+**产物布局**（文件偏移与虚拟地址恒等映射，所以 `p_offset%0x1000 ==
+p_vaddr%0x1000` 自然成立）：`[ELF 头 + 3 个程序头][.text/.rodata: PT_LOAD
+R+X][页对齐][.data/.init_array/.fini_array: PT_LOAD R+W，.bss 走 p_memsz]`
+`+ PT_GNU_STACK(RW)`（不可执行栈）。
+
+**这一轮踩的四个坑**（都进注释了）：
+
+1. **重定位写错地方**：`r_offset` 是**输入段内**的偏移，落到归并缓冲区要加
+   这一段在归并段里的起点，算 `P` 时同理。第一版漏了这步，`R_X86_64_64`
+   写到别的函数头上——症状是 `SIGILL`（好在那条用例的退出码把它抓出来了）。
+2. **析构函数踩掉 main 的返回值**：`call main; mov rdi,rax; <dtor 调用>` 这
+   个顺序里，`rax` 已经被最后一个析构函数的返回值覆盖。改成
+   `call main; mov rbx,rax; <dtor>; mov rdi,rbx`（`rbx` 是调用者保存寄存
+   器，被调函数保证不破坏）。症状：`main` 返回 3，进程却以 0 退出。
+3. **TLS 记账格跨 `.o`**：跑 TLS 初始化的构造函数在 `rt.o` 里，读的是 `rt.o`
+   自己那三个格子（`__c6_tls_img/len/delta`，全零）。用户 TU 里真有 `__thread`
+   变量时 TLS 块压根没建，一访问就段错。链接器现在做一件事：**恰好一个**
+   `.o` 带 TLS 时，把它的三个值抄给所有 `len==0` 的 `.o`；两个以上就报错
+   （各 TU 的 `%fs:` 位移都从 0 附近算，合并要改代码里的位移，重定位里没有）。
+4. **asmblob 的指令跳板重复定义**：`__c6_fsbase`、`__c6_atomic_inc` 这些
+   `asmblob.c6` 里的跳板是"哪个 TU 用到就在那个 TU 发一份"，做成 `GLOBAL`
+   以后两个用了 TLS 的 `.o` 一链就"重复定义 `__c6_fsbase`"。改成 `LOCAL`
+   （它们没有状态，各留各的正是内联语义）。
+
+**实测**（同一台机器）：
+
+```
+c6c -c a.c6 -o a.o && c6c -c b.c6 -o b.o
+c6c -o prog b.o a.o && ./prog; echo $?      # → 45（1+2+42，跨 TU 全局+函数）
+c6c -o prog2 a.o b.o && ./prog2             # → 45（链接顺序无关）
+c6c -c lib/rt.c6 -o rt.o                    # 285144 代码 / 154703 数据 / 400 符号 / 564 重定位
+c6c -Wl,--allow-undefined -o hello hello.o rt.o && ./hello
+  → "hello from c6c linker"，退出码 3；警告：1 个未定义符号按 0 处理（environ）
+c6c -Wl,--allow-undefined -o tlsprog tls.o rt.o && ./tlsprog   # → tv=7
+make -C c6c ldcheck                         # 13/13
+make -C c6c selfhost                        # fixpoint 逐字节相同（3573052 字节）
+make -C c6c fast                            # 全绿（objcheck + ldcheck 都在里面）
+```
+
+**还差的（硬缺口①的尾巴 + 其余四件）**：
+
+* **动态链接**：`DT_NEEDED libc.so.6` + `.plt`/`.got.plt` + `.rela.plt` +
+  `PT_INTERP`。这是硬缺口②的一半，也是"`rt.o` 不用 `--allow-undefined` 就能
+  链接"的前提：那 23 个 libc 名字（`environ`、`openat`、`feof` …）从
+  libc.so.6 解析。做完它，链接器才算真能替掉 `cc`。
+* `.a` 静态库（`ar` 那一层）、`--gc-sections`、`-shared`/`-fPIC`、符号版本、
+  调试信息的重定位。
+* 硬缺口②的另半（**可嵌入的编译库**：`libtcc` 那种"编到内存里再执行"的
+  API）、③（x86-64 之外的 native 后端）、④（`-g` / 独立 `.s` / `-b`）。
+
+## 第 199 轮：库形态（`libc6c`）+ 没有 tcc 的安装契约
+
+硬缺口②的另半（**可嵌入的编译库**）和⑤（**库形态与安装契约**）一起做：
+这两件本来就互相咬合——库没有安装契约就没人用得上，安装契约没有库就没东西可装。
+
+### (1) 嵌入 API：`src/embed.c6` + `include/c6lib.h`
+
+同一份源码（`src/c6c-lib.c6` = `-DC6C_NO_MAIN` + `#include "c6c.c6"`）编成
+`libc6c.a` / `libc6c.so`，导出 `c6_new` / `c6_delete` / `c6_error` /
+`c6_add_include_path` / `c6_set_runtime_path` / `c6_define_symbol` /
+`c6_compile_file` / `c6_compile_string` / `c6_relocate` / `c6_get_symbol` /
+`c6_run` / `c6_output_file`。
+
+三个坑（都是踩过才写下来的）：
+
+1. **库形态没有 `argv[0]`**：命令行那套靠 `argv[0]` 推自带 `include/` 和
+   `lib/rt.c6`，库形态下这条线索不存在。解决办法是编译期塞宏
+   （`C6_DEFAULT_RT` / `C6_DEFAULT_INC`），第一次编译时惰性
+   `setup_incdirs()`；`parse.c6` 加了 `PA_RT_OVERRIDE` + `pa_set_runtime()`
+   让 `find_runtime()` 先看这个覆盖值。
+2. **镜像装到哪儿**：native 后端的地址是绝对的（`ELF_BASE_VA = 0x400000`），
+   所以 `c6_relocate()` 用 `mmap(MAP_FIXED_NOREPLACE)` 把镜像钉回原位；
+   被占了就如实报错，而不是"跑起来崩在别处"。
+3. **`va_list` 没法给初始化器**：c6 要求局部对象带初始化器，而 x86-64 的
+   `va_list` 是数组类型。与其和语法较劲，`c6_set_err` 改成收已经格式化好的
+   字符串——调用点也没几个。
+
+`c6_get_symbol()` 会顺手 `c6_relocate()`：忘了那一步的调用方拿到 `NULL`
+会以为是"没有这个符号"，这种误解比多一次 relocate 贵得多。
+
+### (2) `tcc_*` 兼容层：`include/tcc-compat.h`
+
+声明 tcc 那套名字（`tcc_new` / `tcc_compile_string` / `tcc_relocate` /
+`tcc_run` / `tcc_get_symbol` / `tcc_output_file` / `tcc_set_options` /
+`tcc_add_include_path` / `tcc_define_symbol`），实现一一接到 `c6_*` 上。
+原本用 tcc 嵌入库的程序换掉头文件和库就能编过、跑出一样的结果。
+
+差异如实写进注释而不是藏着：一个 `C6State` 只编一次；`tcc_set_error_func`
+收了回调但诊断仍走 stderr；`tcc_add_file` 只收源文件；`tcc_set_options`
+只认 `-I/-D/-U`。
+
+### (3) 没有 tcc 的安装契约（`cmake -DC6_ENABLE_TCC=OFF`）
+
+以前 `C6Install.cmake` 和 `C6LibraryConfig.cmake` 在 OFF 时直接 `return()`
+——"没有 tcc 就没有库可描述"。库形态落地以后这个前提不成立了，所以补齐：
+
+```
+bin/c6                                  编译器
+include/c6lib.h  include/libtcc.h       宿主用的头（兼容层装成 libtcc.h）
+lib/libc6c.a     lib/libc6c.so          嵌入库
+lib/c6/rt.c6     lib/c6/include/*.h     编译器自带的运行时与头文件
+lib/cmake/c6/c6Config.cmake             find_package(c6)
+lib/pkgconfig/{c6,c6lib}.pc             pkgconf
+```
+
+两个刻意的决定：
+
+* **自带头文件放 `lib/c6/include`，不放 `include/`**。放 `include/` 会把
+  c6 自己的 `stdio.h` 塞进宿主程序的搜索路径（`pkgconf --cflags` 一条
+  `-I` 就盖掉系统头，`-Wbuiltin-declaration-mismatch` 立刻出现）。配套给
+  `setup_incdirs()` 加了 `<bin>/../lib/c6/include`、给 `find_runtime()` 加了
+  `<bin>/../lib/c6/rt.c6` 两个候选——和 tcc 的 `<prefix>/lib/tcc` 一个意思。
+* **`find_package(c6 COMPONENTS libtcc)` 在 OFF 下由 `libc6c` 顶上**：
+  `c6Targets.cmake.in` 里没有真 libtcc 时把 `c6::libtcc` 做成指向
+  `c6::c6lib` 的 INTERFACE target，头文件是装成 `libtcc.h` 的兼容层。
+  有 tcc 的构建里一切照旧（兼容头不装，免得抢同一个 `libtcc.h`）。
+
+### 实测
+
+```
+make -C c6c libc6c         # build/libc6c.a (1198488) + libc6c.so (740184)
+make -C c6c embedcheck     # 6/6
+make -C c6c pkgcheck       # 7/7
+cmake -S . -B b -DC6_ENABLE_TCC=OFF && cmake --install b --prefix /tmp/p9inst
+  → bin/c6, include/{c6lib.h,libtcc.h}, lib/libc6c.{a,so}, lib/c6/{rt.c6,include/},
+    lib/cmake/c6/c6Config.cmake, lib/pkgconfig/{c6,c6lib}.pc
+find_package(c6 COMPONENTS libtcc) 消费者 → "from libtcc component"，退出 0
+pkgconf --cflags --libs c6lib      → -I…/include -L…/lib -lc6c（-Wall -Werror 过）
+/tmp/p9inst/bin/c6 -o /tmp/h /tmp/h.c6 && /tmp/h    # → "hdrs ok 5"
+make -C c6c selfhost               # fixpoint 逐字节相同（3607607 字节，5113 符号）
+make -C c6c fast                   # 全绿（embedcheck + pkgcheck 都在里面）
+```
+
+**还差的**：硬缺口①的尾巴（`.a` 静态库、`--gc-sections`、`-shared`/`-fPIC`）、
+②的另一半（**动态链接**：`DT_NEEDED` + `.plt`/`.got.plt` + `PT_INTERP`，
+让 `rt.o` 那 23 个 libc 名字从 libc.so.6 解析、不用 `--allow-undefined`）、
+③（x86-64 之外的 native 后端）、④（`-g` / 独立 `.s` / `-b`）。
+
+## 第 200 轮：动态链接（`-Wl,--dynamic`）
+
+硬缺口②的另一半。静态链接那一版把 libc 的名字按 0 处理（或者逼用户加
+`-Wl,--allow-undefined`）；这一轮把它变成真的：出 ELF 动态可执行文件，让
+ld.so 把 libc.so.6 映射进来，`rt.o` 里那 22 个函数（`vsprintf`、`openat`、
+`feof`……）从 libc 解析。
+
+### 做出来的东西
+
+```
+PT_INTERP                     /lib64/ld-linux-x86-64.so.2
+.dynstr/.dynsym/.hash         导入符号的名字与表项（SysV 哈希）
+.rela.plt + .plt + .got.plt   每个导入函数一条 R_X86_64_JUMP_SLOT
+.dynamic                      DT_NEEDED libc.so.6 / DT_PLTGOT / DT_JMPREL /
+                              DT_FLAGS = BIND_NOW（非惰性绑定）
+```
+
+PLT 桩子只有 6 字节（`ff 25 <rel32>`）：非惰性绑定下 ld.so 启动时就把所有
+JUMP_SLOT 解完，不需要 plt0 那套 push/jmp 协商，也就少一处可能对不齐的地方。
+`.got.plt` 保留 3 个 ld.so 自用槽（`_DYNAMIC` / `link_map` / 解析器）。
+
+文件布局沿用"VA = 0x400000 + 文件偏移"这条老规矩，所以两个 `PT_LOAD` 的
+`p_offset % 0x1000 == p_vaddr % 0x1000` 自动成立：
+
+```
+[头+5 个程序头][.interp][.text][.rodata][.dynstr][.dynsym][.hash][.rela.plt][.plt]
+--- 翻页 ---
+[.got.plt][.data][.init_array][.fini_array][.dynamic][.bss（只算 memsz）]
+```
+
+### 踩的坑
+
+1. **`.dynamic` 落进了 `.data` 中间**：`ld_dyn_plan()` 的局部量用 `LD_NIMP`
+   初始化，但 `ld_dyn_collect()` 在**后面**才跑——尺寸全是按 0 个导入算的，
+   写文件时又按 22 个导入写，于是后面每一段都往前顶，`.dynamic` 的偏移落在
+   `.data` 内。readelf 一句"1 entry (NULL)"就是这个症状。先收集、再算尺寸。
+2. **PT_DYNAMIC 的 filesz 比实际写出的字节多 16**：leaving 尾巴不在文件里，
+   readelf 直接报"动态段越过了文件尾"。写完整块（补 0）才对。
+3. **`-Wl,--dynamic` 拼错会被静默忽略**：原来 `-W*` 是个兜底（吞掉所有告警
+   开关），`-Wl,` 开头的链接器选项也落进去了——症状是"我明明开了动态链接"
+   却报未定义符号。现在 `-Wl,` 前缀单独一类，不认识就报错。
+4. **`environ` 被当成函数**：链接器靠 `.o` 符号表的 `st_info` 区分函数/数据，
+   而 `extern char **environ;` 这条纯引用在出 `.o` 时被标成了 `NOTYPE`。
+   给 `x64.c6` 加了 `x64_data_ref()`（只标 `is_data`、不定义），`obj.c6`
+   把未定义的数据符号写成 `STT_OBJECT`。链接器这才知道"这个不能发 PLT 桩子"。
+5. **数据符号不能硬报错**：动态链接下遇到 `OBJECT` 类未定义符号要按 0 处理并
+   点名警告，不能掉进"未定义的符号"那条错误里——否则 `rt.o` 永远链不上。
+
+### 实测
+
+```
+c6c -c app.c6 -o app.o
+c6c -Wl,--dynamic -o app app.o rt.o
+  → c6c: app（动态链接 libc.so.6：导入 22 个函数 / 代码 285400 字节 / …）
+./app → "dyn pid=2743716 ppid_ok=1 len=7 cwd=/tmp/p9d"，退出码 7（= main 返回值）
+readelf -d → DT_NEEDED libc.so.6、PLTGOT、PLTRELSZ 528、JMPREL、FLAGS BIND_NOW
+readelf -l → ET_EXEC、2 个 PT_LOAD（0x400000 R+E / 0x447000 R+W）、PT_INTERP、PT_DYNAMIC
+readelf -r --use-dynamic → 22 条 R_X86_64_JUMP_SLOT（= 导入个数）
+ldd → linux-vdso.so.1 / libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
+make -C c6c dyncheck   # 14/14
+make -C c6c selfhost   # fixpoint 逐字节相同（3646295 字节 / 5174 符号）
+make -C c6c fast       # 全绿
+```
+
+**还差的**：`environ` 那类数据符号的 COPY 重定位；`-shared`/`-fPIC` 产物；
+符号版本与 `.rela.dyn` 的 `R_X86_64_RELATIVE`；`.a` 静态库与 `--gc-sections`
+（硬缺口①的尾巴）。硬缺口③（x86-64 之外的 native 后端）、④（`-g` / 独立
+`.s` / `-b`）仍未动。

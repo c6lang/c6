@@ -9,10 +9,9 @@ Name: @C6_PC_NAME@
 Description: @C6_PC_DESCRIPTION@
 URL: https://github.com/c6lang/c6
 Version: @C6_VERSION_RAW@
-Libs: -L${libdir} -ltcc
+Libs: -L${libdir} @C6_PC_LIBS@
 Libs.private: @C6_PC_PRIVATE_LIBS@
 Cflags: -I${includedir}
 
 # 变量：pkgconf --variable=c6 c6 / pkgconf --variable=tccdir c6
-c6=${bindir}/c6@C6_TCC_EXESUF@
-libtcc1=${tccdir}/libtcc1.a
+@C6_PC_VARS@

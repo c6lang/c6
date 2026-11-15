@@ -1,11 +1,27 @@
 # 安装：复刻 tcc/Makefile 的 install-unx 清单，支持 DESTDIR 与 --prefix 落点。
 
-# C6_ENABLE_TCC=OFF 时没有 tcc 的 install-unx 清单可复刻：c6c 的安装布局
-# （二进制 + 自带 include/ 与 rt.c6 的落点、默认搜索路径）是下一步，
-# 这一轮先把"能构建、能验收、不需要 tcc"这条路打通并钉进 CI。
+# C6_ENABLE_TCC=OFF：没有 tcc 的 install-unx 清单可抄，这份清单按 c6c 自己的
+# 搜索规则来定落点——
+#   * c6c 用 argv[0] 推自己的目录，找 <bin>/../include 和 <bin>/../lib/rt.c6
+#     （见 src/main.c6 的 setup_incdirs / src/parse.c6 的 find_runtime）；
+#   * 所以 bin/c6 + include/ + lib/rt.c6 三件套装进去，二进制搬家也能自己找到
+#     自带头文件和运行时；
+#   * 嵌入库 libc6c.a/.so 与它的头文件在 C6C.cmake 里装。
 if(NOT C6_ENABLE_TCC)
-  message(STATUS
-    "c6: C6_ENABLE_TCC=OFF —— 本次不生成安装/库配置清单（c6c 的发布布局是下一步）")
+  install(PROGRAMS "${C6C_DIR}/build/c6c"
+          DESTINATION "${C6_BINDIR_REL}"
+          RENAME "c6${C6_TCC_EXESUF}")
+
+  # 自带头文件（stddef.h / stdarg.h / stdint.h …）装到 <prefix>/lib/c6/include，
+  # 不装进 <prefix>/include：那一层是给**宿主 C 程序**用的（c6lib.h / libtcc.h），
+  # 把 c6 自己的 stdio.h 塞进去会把系统头文件盖掉，pkgconf 的 Cflags 就没法用了。
+  file(GLOB _c6c_hdrs "${C6C_DIR}/include/*.h")
+  install(FILES ${_c6c_hdrs} DESTINATION "${C6_LIBDIR_REL}/c6/include")
+  install(DIRECTORY "${C6C_DIR}/include/sys"
+          DESTINATION "${C6_LIBDIR_REL}/c6/include")
+
+  # 自带运行时源码：编译时被拼进 TU，装在 <prefix>/lib/c6/rt.c6 才找得到。
+  install(FILES "${C6C_DIR}/lib/rt.c6" DESTINATION "${C6_LIBDIR_REL}/c6")
   return()
 endif()
 

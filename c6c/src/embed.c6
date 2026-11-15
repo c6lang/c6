@@ -1,0 +1,489 @@
+/* embed.c6 —— c6c 的"库形态"：编到内存里直接跑（tcc 的嵌入 API 那种用法）。
+ *
+ * 为什么要有这一层：c6c 一直是"命令行编译器"——读文件、写 ELF、退出。而
+ * tcc 的 tcc_new / tcc_compile_string / tcc_run 那套的关键是**把编译器嵌进
+ * 别人的程序**：
+ *
+ *     C6State *s = c6_new();
+ *     c6_add_include_path(s, "include");
+ *     if (c6_compile_string(s, "int main(void){return 42;}") == 0) {
+ *         int rc = c6_run(s, argc, argv);        // 就地跑 main，rc == 42
+ *     }
+ *     c6_delete(s);
+ *
+ * 做得到的原因是 native 后端的产物本来就是"一整块可以平铺到固定地址的
+ * 镜像"（[ELF 头][数据][代码]，VA = ELF_BASE_VA + 偏移，见 src/elf.c6）：
+ * 把它 mmap 到 0x400000，找 `main` 的地址直接调用就行——不必 exec、不必 fork、
+ * 不必落盘（编译期的中间文件只用来装那块镜像，跑完就删）。
+ *
+ * 边界（这一版刻意不做，别当成 bug）：
+ *   * **一次编译**：编译器的全局状态（符号表 / 代码镜像 / 预处理栈）是按
+ *     "一次编译一个程序"设计的。要在一个进程里编多次，得先做完整的 state
+ *     隔离；现在第二次编译请新建进程（或 c6_delete 后再 c6_new——见
+ *     c6_reset 的注释，做了力所能及的重置）。
+ *   * 只能跑 native 后端编出来的东西（C99 / LLVM 后端是"生成文本"，
+ *     接回来跑还得再编一遍）。
+ *   * 镜像按固定地址 0x400000 装入；这个地址被占（极少见）就如实报错，
+ *     不做搬迁——搬迁等于重写链接器。
+ *   * 错误处理：编译期诊断仍然打到 stderr（c6c 的 diag 模块没做回调），
+ *     c6_error() 只回"这一步失败了"这类概括信息。
+ */
+
+#define C6_OUT_MEM 0
+#define C6_OUT_EXE 1
+#define C6_OUT_OBJ 2
+
+typedef struct C6State {
+    char err[512];
+    char srcpath[512];
+    char outpath[512];
+    u8 *image;                  /* 镜像文件内容（装入前） */
+    u32 image_size;
+    void *mapped;               /* mmap 到 ELF_BASE_VA 的那块 */
+    u32 mapped_size;
+    int ncompile;
+} C6State;
+
+/* 错误串就是一条已经格式化好的消息：c6 的文件作用域/局部对象都要求带初始化器，
+ * 而 va_list 在 x86-64 上是数组类型、没法给初始化器——与其和语法较劲，不如
+ * 让调用方自己 snprintf（调用点也没几个）。 */
+static void c6_set_err(C6State *s, const char *msg)
+{
+    if (!s)
+        return;
+    snprintf(s->err, sizeof(s->err), "%s", msg);
+}
+
+const char *c6_error(C6State *s) { return s ? s->err : ""; }
+
+/* 库形态没有 argv[0] 可推自带运行时在哪儿，所以：编译期塞一个默认路径
+ * （C6_DEFAULT_RT，见 c6c/Makefile 的 libc6c 目标），运行期还能再改。 */
+#ifndef C6_DEFAULT_RT
+#define C6_DEFAULT_RT ""
+#endif
+#ifndef C6_DEFAULT_INC
+#define C6_DEFAULT_INC ""
+#endif
+
+int c6_set_runtime_path(C6State *s, const char *path)
+{
+    if (!s || !path) {
+        c6_set_err(s, "参数为空");
+        return -1;
+    }
+    pa_set_runtime(path);
+    return 0;
+}
+
+C6State *c6_new(void)
+{
+    C6State *s = (C6State *)calloc(1, sizeof(C6State));
+
+    if (!s)
+        return NULL;
+    s->err[0] = 0;
+    if (C6_DEFAULT_RT[0])
+        pa_set_runtime(C6_DEFAULT_RT);
+    /* 自带运行时要 include c6c 自己的那套头（stddef.h / stdio.h …）：
+     * 命令行形态靠 setup_incdirs() 按自身路径补，库形态只能靠编译期塞进来。 */
+    return s;
+}
+
+void c6_delete(C6State *s)
+{
+    if (!s)
+        return;
+    if (s->mapped) {
+        munmap(s->mapped, s->mapped_size);
+        s->mapped = NULL;
+    }
+    free(s->image);
+    if (s->srcpath[0])
+        unlink(s->srcpath);
+    if (s->outpath[0])
+        unlink(s->outpath);
+    free(s);
+}
+
+/* 头文件搜索路径 / 宏：都只是往编译器的选项表里塞，和命令行同一条路 */
+int c6_add_include_path(C6State *s, const char *path)
+{
+    if (!s || !path)
+        return -1;
+    if (O.nincs >= MAX_INC) {
+        snprintf(s->err, sizeof(s->err), "-I 路径太多（上限 %d）", MAX_INC);
+        return -1;
+    }
+    O.incs[O.nincs++] = path;
+    return 0;
+}
+
+int c6_define_symbol(C6State *s, const char *name, const char *value)
+{
+    static char buf[512];
+
+    if (!s || !name)
+        return -1;
+    if (O.ndefs >= MAX_DEF) {
+        snprintf(s->err, sizeof(s->err), "-D 太多（上限 %d）", MAX_DEF);
+        return -1;
+    }
+    if (value) {
+        snprintf(buf, sizeof(buf), "%s=%s", name, value);
+        O.defs[O.ndefs++] = buf;
+    } else {
+        O.defs[O.ndefs++] = name;
+    }
+    return 0;
+}
+
+/* 把源码落到临时文件：前端要的是"文件"（#include 的相对路径、诊断里的
+ * 行号都按文件走），这里不为了"从内存读"去改一条已经稳了的前端路径。 */
+static int c6_write_temp(C6State *s, const char *src, size_t len, char *path, size_t pn)
+{
+    int fd = 0;
+    size_t done = 0;
+
+    snprintf(path, pn, "/tmp/c6lib-XXXXXX");
+    fd = mkstemp(path);
+    if (fd < 0) {
+        c6_set_err(s, "建不了临时文件（/tmp）");
+        return -1;
+    }
+    while (done < len) {
+        ssize_t n = write(fd, src + done, len - done);
+
+        if (n <= 0) {
+            close(fd);
+            unlink(path);
+            c6_set_err(s, "写临时文件失败");
+            return -1;
+        }
+        done += (size_t)n;
+    }
+    close(fd);
+    return 0;
+}
+
+/* 真正跑一趟编译：解析 + 出码 + 写 ELF，产物读进内存 */
+int c6_compile_file(C6State *s, const char *path)
+{
+    SrcFile *sf = NULL;
+    FILE *f = NULL;
+    long sz = 0;
+    int rc = 0;
+    int fd = 0;
+
+    if (!s || !path) {
+        c6_set_err(s, "参数为空");
+        return -1;
+    }
+    if (s->ncompile > 0) {
+        /* 见文件头：全局状态不隔离，第二次编译拒绝而不是给出错误结果 */
+        c6_set_err(s, "一个 C6State 只能编译一次（第二次请新建进程）");
+        return -1;
+    }
+    snprintf(s->outpath, sizeof(s->outpath), "/tmp/c6lib-out-XXXXXX");
+    fd = mkstemp(s->outpath);
+    if (fd < 0) {
+        s->outpath[0] = 0;
+        c6_set_err(s, "建不了临时输出文件（/tmp）");
+        return -1;
+    }
+    close(fd);
+
+    /* include 目录表（INCDIR[]）是命令行形态在 main() 里一次性装好的，库形态
+     * 没有那一步——第一次编译时补上。c6_add_include_path 必须在编译之前调，
+     * 因为这一步之后 O.incs 就不再往表里搬了。 */
+    {
+        static int inc_ready;
+
+        if (!inc_ready) {
+            if (C6_DEFAULT_INC[0] && O.nincs < MAX_INC)
+                O.incs[O.nincs++] = C6_DEFAULT_INC;
+            setup_incdirs();
+            inc_ready = 1;
+        }
+    }
+    PA_QUIET_OUT = 1;
+    pp_reset();
+    sf = src_load(path);
+    if (!sf) {
+        PA_QUIET_OUT = 0;
+        snprintf(s->err, sizeof(s->err), "打不开源文件 '%s'", path);
+        return -1;
+    }
+    pp_push_file(sf, -1);
+    push_defines();
+    rc = pa_compile_ex(s->outpath, "c6lib", 1);
+    PA_QUIET_OUT = 0;
+    s->ncompile++;
+    if (rc) {
+        c6_set_err(s, "编译失败（诊断见 stderr）");
+        return -1;
+    }
+    f = fopen(s->outpath, "rb");
+    if (!f) {
+        snprintf(s->err, sizeof(s->err), "读不到编译产物 '%s'", s->outpath);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) <= 0) {
+        fclose(f);
+        c6_set_err(s, "编译产物是空的");
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    s->image = (u8 *)malloc((size_t)sz);
+    if (!s->image) {
+        fclose(f);
+        snprintf(s->err, sizeof(s->err), "内存不足（%ld 字节的镜像）", sz);
+        return -1;
+    }
+    if (fread(s->image, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f);
+        c6_set_err(s, "读编译产物不完整");
+        return -1;
+    }
+    fclose(f);
+    s->image_size = (u32)sz;
+    unlink(s->outpath);
+    s->outpath[0] = 0;
+    return 0;
+}
+
+int c6_compile_string(C6State *s, const char *src)
+{
+    if (!s || !src) {
+        c6_set_err(s, "参数为空");
+        return -1;
+    }
+    if (s->ncompile > 0) {
+        c6_set_err(s, "一个 C6State 只能编译一次（第二次请新建进程）");
+        return -1;
+    }
+    if (c6_write_temp(s, src, strlen(src), s->srcpath, sizeof(s->srcpath)) < 0)
+        return -1;
+    return c6_compile_file(s, s->srcpath);
+}
+
+/* 把镜像平铺到 ELF_BASE_VA：native 后端的产物用的是绝对地址，非搬不可 */
+int c6_relocate(C6State *s)
+{
+    if (!s || !s->image) {
+        c6_set_err(s, "还没编过东西");
+        return -1;
+    }
+    if (s->mapped)
+        return 0;
+    s->mapped_size = s->image_size;
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    s->mapped = mmap((void *)(unsigned long)ELF_BASE_VA, s->image_size,
+                     PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (s->mapped == MAP_FAILED) {
+        s->mapped = NULL;
+        snprintf(s->err, sizeof(s->err), "地址 0x%x 已被占用，镜像装不进去",
+                 (unsigned)ELF_BASE_VA);
+        return -1;
+    }
+    memcpy(s->mapped, s->image, s->image_size);
+    return 0;
+}
+
+/* 取符号地址（数据符号的 off 是数据段内偏移，要加 ELF_HDR） */
+void *c6_get_symbol(C6State *s, const char *name)
+{
+    size_t n = 0;
+    u32 h = 0;
+    u32 j = 0;
+
+    if (!s || !name || !s->image)
+        return NULL;
+    /* 取符号前必须先装入（native 后端的地址是绝对的）；这里顺手relocate，
+     * 免得调用方因为忘了那一步拿到 NULL 却以为是"没有这个符号"。 */
+    if (!s->mapped && c6_relocate(s) != 0)
+        return NULL;
+    n = strlen(name);
+    h = x64_sym_hash(name, n);
+    j = X64_SYM_HEAD[h % X64_SYMB];
+    while (j) {
+        X64Sym *sym = &X64.sym[j - 1];
+
+        j = sym->next_same;
+        if (sym->hash != h || !sym->defined || !sym->name || strlen(sym->name) != n
+            || memcmp(sym->name, name, n) != 0)
+            continue;
+        if (sym->is_data)
+            return (void *)(unsigned long)(ELF_BASE_VA + ELF_HDR + sym->off);
+        return (void *)(unsigned long)sym->va;
+    }
+    return NULL;
+}
+
+/* 跑起来：先按源码顺序调构造函数（TLS 初始化就在这里），再调 main */
+int c6_run(C6State *s, int argc, char **argv)
+{
+    typedef int (*C6Main)(int, char **);
+    C6Main fn = NULL;
+    u32 i = 0;
+
+    if (!s) {
+        return -1;
+    }
+    if (c6_relocate(s) < 0)
+        return -1;
+    for (i = 0; i < NCTOR; i++) {
+        X64Sym *c = (CTORS[i] < X64.nsym) ? &X64.sym[CTORS[i]] : NULL;
+
+        if (c && c->defined)
+            ((void (*)(void))(unsigned long)c->va)();
+    }
+    fn = (C6Main)c6_get_symbol(s, "main");
+    if (!fn) {
+        c6_set_err(s, "源码里没有 'main'");
+        return -1;
+    }
+    return fn(argc, argv);
+}
+
+/* 把镜像写成文件（相当于 -o）：给"先编后跑"或者要落盘的场景留个口子 */
+int c6_output_file(C6State *s, const char *path)
+{
+    FILE *f = NULL;
+
+    if (!s || !s->image || !path) {
+        c6_set_err(s, "还没编过东西");
+        return -1;
+    }
+    f = fopen(path, "wb");
+    if (!f) {
+        snprintf(s->err, sizeof(s->err), "写不了 '%s'", path);
+        return -1;
+    }
+    if (fwrite(s->image, 1, s->image_size, f) != (size_t)s->image_size) {
+        fclose(f);
+        snprintf(s->err, sizeof(s->err), "写 '%s' 不完整", path);
+        return -1;
+    }
+    fclose(f);
+    chmod(path, 0755);
+    return 0;
+}
+
+/* ---- tcc_* 兼容层 ---------------------------------------------------------
+ * 光有 c6_* 那套还不够：别人的程序（和各种构建脚本）写的是 tcc_new /
+ * tcc_compile_string / tcc_run。这一层把两套名字接起来，语义一一对得上，所以
+ * "把 tcc 换掉"的时候调用方代码不用改。
+ *
+ * 差异如实摆在这儿（不是 bug）：
+ *   * tcc_set_output_type 只区分"内存/可执行/目标文件"的意图，实际产物由
+ *     c6_output_file / c6_run 决定；
+ *   * tcc_set_options 只认 -I/-D/-U 这类简单选项（c6c 的选项表就是这么排的）；
+ *   * tcc_set_error_func 收了回调但编译期诊断仍然走 stderr（c6c 的 diag 模块
+ *     没有回调钩子）；
+ *   * tcc_add_file 只支持 .c6/.c 源文件（不支持 .o/.a）。
+ */
+#define TCC_OUTPUT_MEMORY 1
+#define TCC_OUTPUT_EXE    2
+#define TCC_OUTPUT_DLL    3
+#define TCC_OUTPUT_OBJ    4
+
+typedef C6State TCCState;
+
+TCCState *tcc_new(void) { return c6_new(); }
+
+void tcc_delete(TCCState *s) { c6_delete(s); }
+
+void tcc_cleanup(void) { }
+
+void tcc_set_output_type(TCCState *s, int type)
+{
+    (void)s;
+    (void)type;                 /* 见上头：产物形态由 run/output_file 决定 */
+}
+
+int tcc_add_include_path(TCCState *s, const char *path)
+{
+    return c6_add_include_path(s, path) == 0 ? 0 : -1;
+}
+
+void tcc_define_symbol(TCCState *s, const char *name, const char *value)
+{
+    c6_define_symbol(s, name, value);
+}
+
+void tcc_undefine_symbol(TCCState *s, const char *name)
+{
+    if (s && name && O.nundefs < MAX_DEF)
+        O.undefs[O.nundefs++] = name;
+}
+
+/* 只认 -I 目录、-D 名字[=值]、-U 名字；别的选项如实报"不认识" */
+int tcc_set_options(TCCState *s, const char *opts)
+{
+    const char *p = opts;
+
+    if (!s || !opts)
+        return -1;
+    while (*p) {
+        char tok[512] = {0};
+        size_t n = 0;
+
+        while (*p == ' ')
+            p++;
+        if (!*p)
+            break;
+        while (*p && *p != ' ' && n + 1 < sizeof(tok))
+            tok[n++] = *p++;
+        tok[n] = 0;
+        if (tok[0] == '-' && tok[1] == 'I')
+            c6_add_include_path(s, arena_strdup(&A_main, tok + 2));
+        else if (tok[0] == '-' && tok[1] == 'D')
+            c6_define_symbol(s, arena_strdup(&A_main, tok + 2), NULL);
+        else if (tok[0] == '-' && tok[1] == 'U')
+            tcc_undefine_symbol(s, arena_strdup(&A_main, tok + 2));
+        else {
+            snprintf(s->err, sizeof(s->err), "不认识的选项 '%s'（兼容层只收 -I/-D/-U）", tok);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int tcc_compile_string(TCCState *s, const char *src)
+{
+    return c6_compile_string(s, src) == 0 ? 0 : -1;
+}
+
+int tcc_add_file(TCCState *s, const char *path)
+{
+    return c6_compile_file(s, path) == 0 ? 0 : -1;
+}
+
+int tcc_relocate(TCCState *s, void *ptr)
+{
+    (void)ptr;                  /* TCC_RELOCATE_AUTO：不关心装到哪儿 */
+    return c6_relocate(s) == 0 ? 0 : -1;
+}
+
+void *tcc_get_symbol(TCCState *s, const char *name)
+{
+    return c6_get_symbol(s, name);
+}
+
+int tcc_run(TCCState *s, int argc, char **argv)
+{
+    return c6_run(s, argc, argv);
+}
+
+int tcc_output_file(TCCState *s, const char *path)
+{
+    return c6_output_file(s, path) == 0 ? 0 : -1;
+}
+
+const char *c6_strerror(TCCState *s) { return c6_error(s); }
