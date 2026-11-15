@@ -30,7 +30,7 @@ make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
 | 编译期诊断 | `make diagtest` | 314/314 | ✅ |
 | 三后端同一套用例 | `make c99test llvmtest` | C99 33/33、LLVM 29/29（LLVM 有 4 条走 `tests/c/llvm-only.txt`，见文末已知缺陷） | ✅ |
 | 能编出 tcc 并自检 | `make build-tcc` | 出体，且这个 tcc 跑 tests2 **118/144** | ✅ |
-| 语言层 C99 外部闸门 | `make c99suite` | 语言层 100%：`LANG+OUT == 0`（当前 通过 149 / 超出口径 1） | ✅ 见 (5) |
+| 语言层 C99 外部闸门 | `make c99suite`（`check-all` 里也有） | 语言层 100%：`LANG+OUT == 0`（当前 通过 149 / 超出口径 1） | ✅ 见 (5) |
 
 ## (2) G2c：c6c 编出 tcc，这个 tcc 跑上游用例
 
@@ -81,8 +81,8 @@ i386/arm64/win-arm64 代码、`114` 要 tcc 的 `-b` 边界检查运行时。剩
 （6.7.2.1p13），卡点在同构匿名聚合共用 type id：`struct { struct {int d;}; struct
 {int e;}; }` 里 `e` 的偏移取成 0。
 
-这条闸门还没并进 `check-all`：先把 `LANG+OUT` 清零，再接进去（`c6c/Makefile` 里
-`c99suite` 目标旁边有注释记着这件事）。
+这条闸门现在是 `check-all` 的一部分（`LANG+OUT` 已经清零）。它只依赖 gcc 当 oracle，
+跑一遍十几秒，`-j` 默认跟着 `JOBS` 走。
 
 ## (4) 性能与内存
 
