@@ -9,7 +9,7 @@
 | 文档 | 内容 |
 |---|---|
 | [docs/plan.md](docs/plan.md) | 目标、验收口径、实测基线、阶段计划、风险 |
-| [docs/design.md](docs/design.md) | 架构、流式 IR（16 字节/条）、三后端、类型表位分配、镜像与落盘 |
+| [docs/design.md](docs/design.md) | 架构、流式 IR（24 字节/条）、三后端、类型表位分配、镜像与落盘 |
 | [docs/concurrency.md](docs/concurrency.md) | 协程 / 线程 / 原子 / TLS |
 | [docs/modules.md](docs/modules.md) | 模块前缀、`import`、std/ 的 153 个模块 |
 | [docs/todo.md](docs/todo.md) | 逐轮账本：做过什么、结论是什么、哪些是硬限制 |
