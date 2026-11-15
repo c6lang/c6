@@ -125,6 +125,7 @@ static u32 iface_find(const char *nm, u32 nl)
 }
 
 static void data_fixup_add(u32 data_off, u32 sym);
+static void data_fixup_add_ex(u32 data_off, u32 sym, i64 add);
 
 #define VT_MAX 64
 static u32 VT_IF[VT_MAX];
@@ -2811,6 +2812,13 @@ static i64 char_lit_val(Tok *t)
  * 这里走一条独立的递归下降，只做整数运算（不产生 IR）。 */
 static i64 const_expr(void);
 
+/* 全局地址常量里的偏移必须是**整数常量表达式**（C99 6.6p9）。这里的常量求值
+ * 对全局变量的名字是宽容的——直接给它的 `s->val`（数据段偏移/符号下标），
+ * 因为别的地方（`int a[N];` 这类，N 恰好是个全局量）历来这么用。地址常量
+ * 这条路上不能宽容：`&A[i]`（i 是全局变量）会拿符号下标当元素下标，编出一个
+ * 野指针。要严格时把 CONST_NOREF 打开，让 const_primary 见到全局变量就报错。 */
+static int CONST_NOREF;
+
 static i64 const_unary(void)
 {
     if (pa_accept_ch('-'))
@@ -3057,6 +3065,10 @@ static i64 const_unary(void)
             }
         }
         if (s && (s->kind == SC_ENUMC || s->kind == SC_GLOBAL)) {
+            if (s->kind == SC_GLOBAL && CONST_NOREF)
+                /* 地址常量里的偏移不能引用全局对象：它的值是运行期的 */
+                pa_error("'%.*s' 不是常量：静态初始化器里的偏移要整数常量表达式",
+                         (int)pa_cur()->len, tok_data(pa_cur()));
             pa_advance();
             return s->val;
         }
@@ -13373,6 +13385,7 @@ static int pa_at_typename(void);
 static u32 pa_take_paren_type(void);
 static int pa_skip_empty_compound(void);
 static void data_fixup_add(u32 data_off, u32 sym);
+static void data_fixup_add_ex(u32 data_off, u32 sym, i64 add);
 static void code_lbl_fixup_add(u32 data_off, u32 fnseq, u32 lbl);
 static void data_fixup_drop_range(u32 lo, u32 hi);
 
@@ -13781,6 +13794,224 @@ static int gen_glob_compound_addr(u32 data_off)
     return 1;
 }
 
+/* ---------- 全局初始化器里的地址常量（C99 6.6p7 / 6.6p9）----------
+ * 静态初始化的指针只允许两种东西：空指针常量，和**地址常量**——一个全局
+ * 对象或函数的地址加一个整数常量偏移。以前这里只认 `&g` / `&f` / `g` 三种
+ * 裸形式，`A + 2`、`&g.m`、`&g[i]`、`&g.a.b[2].c` 全掉进"全局地址初始化器只
+ * 支持 &全局/函数"那条诊断（标准要求支持，gcc/clang 也都支持）。
+ *
+ * 读出来的东西化成 (符号, 字节加数) 一对，落成一条**带加数**的数据段重定位
+ * （data_fixup_add_ex）：native / C99 / LLVM 三个后端都按这一份记录回填地址，
+ * 所以这段逻辑只写一遍，后端只在"算最终地址"那一行加个加数。
+ *
+ * "看"和"吃"故意分成两步：这个判断挂在"指针类型的全局初始化器"那条通用路上，
+ * 凡是不长成地址常量的（`0`、字符串、复合字面量、`&&label`…）都得原样退回去
+ * 让别的分支处理。glob_addr_start() 只看不吃，返回 0 时游标必须原地不动。 */
+typedef struct GlobAddr {
+    u32 sym;      /* ELF 符号下标 */
+    i64 add;      /* 字节加数：成员偏移 + 常量下标 × 元素大小 */
+    u32 pty;      /* 结果指针指向的类型（指针算术按它缩放） */
+    int has_pty;  /* 0 = 函数指针/普通全局变量：不能再做指针算术 */
+} GlobAddr;
+
+/* 前瞻：当前位置是不是"地址常量"的开头？**不吃 token**。
+ * `amp` = 前面的 `&` 已经被吃掉了。
+ * 返回 0 = 不是（调用点必须按别的东西解释这个初始化器）；
+ *      1 = 名字开头；2 = 整数在左的 `2 + A`。 */
+static int glob_addr_start(int amp)
+{
+    Tok *t = pa_cur();
+    Sym *s = NULL;
+
+    if (!amp && t && t->kind == TK_NUM) {
+        /* `2 + A`：整数在左。标准 6.6p9 的字面是"地址常量 + 整数常量"，
+         * 但加法交换律下 gcc/clang 都收这个顺序，我们照收——以前它会掉进
+         * 常量表达式求值，把数组名当符号下标算，静默编出一个野指针。
+         * 左边只认**单个整数字面量**：`(2*3) + A` 这种要真求值，留给常量
+         * 表达式那条路。 */
+        Tok *op = pa_peek(1);
+        Tok *id = pa_peek(2);
+        Sym *is = NULL;
+
+        if (!(op->kind == TK_PUNCT && tok_eq(op, "+")))
+            return 0;
+        if (id->kind != TK_IDENT)
+            return 0;
+        is = sym_find(tok_data(id), id->len);
+        if (!is || is->kind != SC_GLOBAL || is->is_tls || !ty_is_array(is->type))
+            return 0;
+        return 2;
+    }
+    if (!(t && t->kind == TK_IDENT))
+        return 0;
+    s = sym_find(tok_data(t), t->len);
+    if (!s || !(s->kind == SC_GLOBAL || s->is_func))
+        /* `&局部变量` / `&this.that`：交给 glob_addr_parse 报准确诊断 */
+        return amp;
+    if (amp)
+        return 1;
+    /* 没有 `&`：只有数组名和函数名会**退化**成地址常量。后面跟着 `[`/`.`/
+     * `->`/`(` 时那是取值或调用（`A[2]` 是元素的值，不是地址），不是地址
+     * 常量。必须在这里就拦住：常量求值对全局变量的名字是宽容的（见
+     * CONST_NOREF 那段注释），放它过去会变成"静默拿 &A 当地址"的错码。 */
+    if (pa_is_ch('[') || pa_is_ch('.') || pa_is_punct("->") || pa_is_ch('('))
+        return 3;
+    if (pa_is_ch('+') || pa_is_ch('-'))
+        /* `A + 2` 是数组退化后的指针算术；`q + 2`（q 是普通全局变量）不是
+         * 常量，函数名加偏移更是无意义——都留给下面报错。 */
+        return s->is_func || ty_is_array(s->type);
+    return 1;
+}
+
+/* 报完错把这个初始化器剩下的 token 吃掉。不清理的话，`&q->x;` 里的 `->x`
+ * 会漏到声明解析器手上，一条真错后面跟着二十条"顶层声明缺名字"的假错。 */
+static void glob_addr_skip_rest(void)
+{
+    int depth = 0;
+
+    for (;;) {
+        Tok *t = pa_cur();
+
+        if (t->kind == TK_EOF)
+            return;
+        if (t->kind == TK_PUNCT) {
+            if (TOK_EQ(t, "(") || TOK_EQ(t, "[") || TOK_EQ(t, "{")) {
+                depth++;
+            } else if (TOK_EQ(t, ")") || TOK_EQ(t, "]") || TOK_EQ(t, "}")) {
+                if (depth == 0)
+                    return;                /* 收尾的括号留给外层 */
+                depth--;
+            } else if (depth == 0 && (TOK_EQ(t, ",") || TOK_EQ(t, ";"))) {
+                return;                    /* 到下一个初始化器/声明结尾了 */
+            }
+        }
+        pa_advance();
+    }
+}
+
+/* 真读一遍：吃掉整段地址常量，记一条带加数的重定位。
+ * 读不动的（非常量下标、`->`、`&局部变量`）就地报准确诊断、丢掉尾巴后返回，
+ * 调用点直接结束这个初始化器——不再往下掉到"常量表达式"那条路上二次报错。 */
+static void glob_addr_parse(u32 data_off, int amp, int num_first)
+{
+    Tok *t = pa_cur();
+    Sym *s = NULL;
+    GlobAddr ga = {0, 0, 0, 0};
+    u32 ty = 0;
+    i64 lead = 0;      /* `2 + A` 里左边那个整数 */
+
+    /* 偏移必须是整数常量表达式：这一段里 const_primary 见到全局变量就报错 */
+    CONST_NOREF = 1;
+    if (num_first && t && t->kind == TK_NUM) {
+        lead = (i64)int_lit_val(tok_data(t), t->len);
+        pa_advance();                    /* 整数 */
+        pa_advance();                    /* `+`（glob_addr_start 已经验过） */
+        t = pa_cur();
+    }
+    if (!(t && t->kind == TK_IDENT)) {
+        pa_error("全局地址初始化器只支持 &全局/函数");
+        goto bad;
+    }
+    s = sym_find(tok_data(t), t->len);
+    if (!s || !(s->kind == SC_GLOBAL || s->is_func)) {
+        pa_error("'&%.*s' 不是地址常量：只有全局对象、函数的地址（可以带常量"
+                 "下标/成员偏移）能用在静态初始化里",
+                 (int)t->len, tok_data(t));
+        goto bad;
+    }
+    if (s->is_tls) {
+        pa_error("'%.*s' 是 __thread 变量：线程局部量的地址要运行期才算",
+                 (int)t->len, tok_data(t));
+        goto bad;
+    }
+    ga.sym = addr_sym_of(s);
+    ty = s->type;
+    pa_advance();
+    if (amp) {
+        /* `&obj` 指向对象本身，然后可以逐段走 `.成员` / `[常量]` */
+        ga.pty = ty;
+        ga.has_pty = 1;
+        for (;;) {
+            if (pa_accept_ch('[')) {
+                i64 k = const_expr();
+                i64 esz = 0;
+
+                pa_expect_ch(']');
+                if (!ty_is_array(ga.pty)) {
+                    pa_error("地址常量里的下标只能用在数组上；指针变量的值是运行期"
+                             "的，不是地址常量");
+                    goto bad;
+                }
+                esz = (i64)ty_size(ty_target(ga.pty));
+                ga.add += k * esz;
+                ga.pty = ty_target(ga.pty);
+            } else if (pa_accept_ch('.')) {
+                Tok *mt = pa_cur();
+                u32 mty = 0;
+                u32 moff = 0;
+
+                if (mt->kind != TK_IDENT || !ty_is_agg(ga.pty)
+                    || !agg_find_promoted(ga.pty, tok_data(mt), mt->len, &mty, &moff)) {
+                    pa_error("'%.*s' 不是这个结构体/联合体的成员", (int)mt->len,
+                             tok_data(mt));
+                    goto bad;
+                }
+                if (AGG_FOUND_BITS != 0) {
+                    pa_error("位域没有地址（C99 6.5.3.2p1）");
+                    goto bad;
+                }
+                pa_advance();
+                ga.add += (i64)moff;
+                ga.pty = mty;
+            } else if (pa_is_punct("->")) {
+                pa_error("'->' 要先读出运行期的指针值，不是地址常量；静态初始化里"
+                         "请写成 '&对象.成员'");
+                goto bad;
+            } else {
+                break;
+            }
+        }
+    } else if (pa_is_ch('[') || pa_is_ch('.') || pa_is_punct("->") || pa_is_ch('(')) {
+        /* `int *p = A[2];` / `s.m` / `f()`：取到的是运行期的值 */
+        pa_error("'%.*s' 取的是运行期的值，不是地址常量：静态初始化的指针只能"
+                 "是全局对象/函数的地址加常量偏移（要地址请写 '&…'）",
+                 (int)t->len, tok_data(t));
+        goto bad;
+    } else if (s->is_func) {
+        ga.has_pty = 0;                    /* 函数指针：谈不上缩放 */
+    } else if (ty_is_array(ty)) {
+        ga.pty = ty_target(ty);            /* 数组名退化：指向元素 */
+        ga.has_pty = 1;
+    } else {
+        /* 普通全局变量：历史上就当"这个符号的地址"落地（加数只能是 0，
+         * glob_addr_start 已经保证后面没有 `+`/`-`）。 */
+        ga.has_pty = 0;
+    }
+    /* 指针算术：`A + 2`、`&A[4] - 1`，只认整数常量（标准口径） */
+    if (num_first && ga.has_pty)
+        ga.add += lead * (i64)ty_size(ga.pty);   /* `2 + A` 里前置的那个整数 */
+    while (pa_is_ch('+') || pa_is_ch('-')) {
+        int neg = pa_is_ch('-');
+        i64 k = 0;
+        i64 esz = 0;
+
+        if (!ga.has_pty) {
+            pa_error("全局初始化器里的指针算术只支持数组名/对象地址加减常量");
+            goto bad;
+        }
+        pa_advance();
+        k = const_expr();
+        esz = (i64)ty_size(ga.pty);
+        ga.add += neg ? -(k * esz) : (k * esz);
+    }
+    CONST_NOREF = 0;
+    data_fixup_add_ex(data_off, ga.sym, ga.add);
+    return;
+bad:
+    CONST_NOREF = 0;
+    glob_addr_skip_rest();
+}
+
 static void gen_glob_obj(u32 goff, u32 ty, u32 off)
 {
     if (ty_size(ty) == 0 && pa_skip_empty_compound())
@@ -13889,25 +14120,18 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
      * 读出来是 5e-324 这种鬼值（131_return_struct_in_reg 就是这样）。 */
     /* 全局聚合里的**地址常量**：`{ sys_one, &g, tab }`。
      * 以前这条路只认数字/浮点，函数名和全局符号名落进去就是 0——静态函数
-     * 指针表整张都是空的（tcc 的 90_struct-init 正是这么崩的）。 */
+     * 指针表整张都是空的（tcc 的 90_struct-init 正是这么崩的）。
+     * `&g.m` / `&g[i]` / `A + 2` 这类带偏移的形式由 glob_addr_parse 统一处理。 */
     if (ty_is_ptr(ty)) {
         int amp = pa_accept_ch('&');
+        int ak = 0;
 
         if (amp && gen_glob_compound_addr(goff + off))
             return;
-        if (pa_cur()->kind == TK_IDENT) {
-            Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
-
-            if (t && (t->kind == SC_GLOBAL || t->is_func)) {
-                u32 sym = addr_sym_of(t);
-
-                pa_advance();
-                if (!pa_is_ch('[') && !pa_is_ch('.') && !pa_is_ch('+')
-                    && !pa_is_ch('-')) {
-                    data_fixup_add(goff + off, sym);
-                    return;
-                }
-            }
+        ak = glob_addr_start(amp);
+        if (ak) {
+            glob_addr_parse(goff + off, amp, ak == 2);
+            return;
         }
         if (amp)
             pa_error("全局地址初始化器只支持 &全局/函数");
@@ -18669,10 +18893,16 @@ static void synth_test_main(void)
 
 /* ---------- 数据段重定位 ----------
  * 全局指针初始化器可能是"某个函数/全局的地址"，解析到这里时它的 VA 还没定
- * （函数甚至还没编译），所以先记 (数据偏移, 符号) 的对，等布局完成再回填。 */
+ * （函数甚至还没编译），所以先记 (数据偏移, 符号, 加数) 的三元组，等布局完成
+ * 再回填。
+ *
+ * 加数是 C99 6.6p9 里那个"整数常量偏移"：`int *p = A + 2;`、`&s.m`、
+ * `&a[3].x` 都是"符号地址 + 常量"，落地时只有一条重定位——三个后端
+ * （native / C99 / LLVM）都按这一份记录算地址，不必各写一遍。 */
 #define DFIX_MAX 4096
 static u32 DFIX_OFF[DFIX_MAX];
 static u32 DFIX_SYM[DFIX_MAX];
+static i64 DFIX_ADD[DFIX_MAX];
 static u32 NDFIX;
 
 /* 数据段里 `&&label` 的重定位：地址要等代码段起点定下来才能算，所以先记
@@ -18705,12 +18935,13 @@ static void data_fixup_drop_range(u32 lo, u32 hi)
             continue;
         DFIX_OFF[k] = DFIX_OFF[i];
         DFIX_SYM[k] = DFIX_SYM[i];
+        DFIX_ADD[k] = DFIX_ADD[i];
         k++;
     }
     NDFIX = k;
 }
 
-static void data_fixup_add(u32 data_off, u32 sym)
+static void data_fixup_add_ex(u32 data_off, u32 sym, i64 add)
 {
     if (NDFIX >= DFIX_MAX) {
         pa_error("数据段重定位太多（上限 %d）", DFIX_MAX);
@@ -18718,7 +18949,13 @@ static void data_fixup_add(u32 data_off, u32 sym)
     }
     DFIX_OFF[NDFIX] = data_off;
     DFIX_SYM[NDFIX] = sym;
+    DFIX_ADD[NDFIX] = add;
     NDFIX++;
+}
+
+static void data_fixup_add(u32 data_off, u32 sym)
+{
+    data_fixup_add_ex(data_off, sym, 0);
 }
 
 /* C99 后端的数据段：一块字节数组 + 初始化函数里补重定位 */
@@ -18739,11 +18976,14 @@ static void c99_emit_data(void)
         char sn[256] = {0};
 
         c99_sym(DFIX_SYM[i], sn, sizeof(sn));
+        /* 加数是解析期算好的字节偏移（`A + 2` / `&s.m`），直接折进地址里 */
         if (X64.sym[DFIX_SYM[i]].is_data)
             fprintf(f, "  c6_st8(D + %u, (uint64_t)(uintptr_t)(D + %d));\n",
-                    DFIX_OFF[i], (int)(X64.sym[DFIX_SYM[i]].off - (u32)ELF_HDR));
+                    DFIX_OFF[i],
+                    (int)((i64)(X64.sym[DFIX_SYM[i]].off - (u32)ELF_HDR) + DFIX_ADD[i]));
         else
-            fprintf(f, "  c6_st8(D + %u, (uint64_t)(uintptr_t)&%s);\n", DFIX_OFF[i], sn);
+            fprintf(f, "  c6_st8(D + %u, (uint64_t)(uintptr_t)((char *)&%s + %d));\n",
+                    DFIX_OFF[i], sn, (int)DFIX_ADD[i]);
     }
     for (i = 0; i < C99_NRL; i++)
         fprintf(f, "  c6_st8(D + %u, (uint64_t)(uintptr_t)(D + %u));\n", C99_RLOFF[i],
@@ -18756,7 +18996,7 @@ static void data_fixups_apply(void)
     u32 i = 0;
 
     for (i = 0; i < NDFIX; i++) {
-        u64 va = (u64)X64.sym[DFIX_SYM[i]].va;
+        u64 va = (u64)X64.sym[DFIX_SYM[i]].va + (u64)DFIX_ADD[i];
         u32 k = 0;
 
         for (k = 0; k < 8; k++)
@@ -19014,29 +19254,19 @@ static void gen_one_global(u32 ty, Declarator *d)
         code_lbl_fixup_add(s->goff, x64_cur_fnseq(&X64), l);
         return;
     }
-    /* `&x` / 函数名 / `&arr[0]` 这类地址常量：留给布局后回填 */
+    /* `&x` / 函数名 / `&arr[0]` / `A + 2` / `&s.m` 这类地址常量：留给布局后回填。
+     * 加数（成员偏移、常量下标）在 glob_addr_parse 里就算好，三个后端共用。 */
     if (ty_is_ptr(ty)) {
-        int took = 0;
         int amp = pa_accept_ch('&');
+        int ak = 0;
 
         if (amp && gen_glob_compound_addr(s->goff))
             return;
-        if (pa_cur()->kind == TK_IDENT) {
-            Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
-
-            if (t && (t->kind == SC_GLOBAL || t->is_func)) {
-                u32 sym = addr_sym_of(t);
-
-                pa_advance();
-                if (!pa_is_ch('[') && !pa_is_ch('.') && !pa_is_ch('+')
-                    && !pa_is_ch('-')) {
-                    data_fixup_add(s->goff, sym);
-                    took = 1;
-                }
-            }
-        }
-        if (took)
+        ak = glob_addr_start(amp);
+        if (ak) {
+            glob_addr_parse(s->goff, amp, ak == 2);
             return;
+        }
         if (amp)
             pa_error("全局地址初始化器只支持 &全局/函数");
     }
