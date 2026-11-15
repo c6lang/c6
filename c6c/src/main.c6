@@ -787,6 +787,9 @@ int main(int argc, char **argv)
         }
         if (O.test)
             pa_set_test_mode(O.test_filter ? O.test_filter : "");
+        /* 告诉前端"这次编了几个输入文件"：单文件走快路（static 符号不改名），
+         * 多文件才需要按 TU 分家。放在分支之前，两种模式都覆盖到。 */
+        pa_set_nfiles((u32)(O.nfiles > 0 ? O.nfiles : 1));
         if (O.nfiles > 1) {
             /* 多 TU：一个源文件 = 一个翻译单元。符号表 / 数据段 / 代码段
              * 整份镜像一份（外部符号按名字互认），文件作用域的 static 按
@@ -913,6 +916,7 @@ int main(int argc, char **argv)
          * `-fsyntax-only` 会把一堆本来没问题的模块判死（std 的 153 个模块全靠
          * 这条路径量，口径错了数就是假的）。 */
         PA_SYNTAX_ONLY = 1;
+        pa_set_nfiles((u32)(O.nfiles > 0 ? O.nfiles : 1));
         return pa_compile_ex(0, argv[0], !O.nostdlib);
     }
     default:
