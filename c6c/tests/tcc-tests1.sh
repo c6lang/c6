@@ -40,6 +40,13 @@ for src in "$DIR"/*.c; do
         skip=$((skip + 1))
         [ $VERBOSE = 1 ] && printf '跳过     %-18s 需要 tcc 自身构建产物/多 TU\n' "$base"
         continue ;;
+    # boundtest 要 tcc 的 -b 边界检查运行时，还要一个 1..18 的命令行参数；
+    # 上游自己也只在 `make btest` 里手动跑它（不在常规套件里），所以这里跳过。
+    # 注意：它**已经能编过**了（`alloca(strlen(s)+1)` 这种运行期大小支持之后）。
+    boundtest)
+        skip=$((skip + 1))
+        [ $VERBOSE = 1 ] && printf '跳过     %-18s 要 -b 边界检查运行时 + 参数（上游也只手动跑）\n' "$base"
+        continue ;;
     esac
     if ! "$CC" -I"$DIR" -I"$ROOT/tcc" "$src" -o "$TMP/$base" >"$TMP/$base.log" 2>&1; then
         if grep -q '未定义的符号' "$TMP/$base.log"; then
