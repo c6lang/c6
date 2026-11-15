@@ -110,3 +110,30 @@ c6c 只产静态 ELF，`exec` 它没有 ld.so / PLT 的额外成本，也正好�
 路径），给了 `-o` 就只写文件不跑。只支持 native 后端；`-c`、`-E`、
 `-fsyntax-only`、`--emit-c`、`--emit-llvm`、`-nostdlib` 都跟它互斥。
 回归：`make -C c6c testflag`。
+
+## 出目标文件：`-c`
+
+`-c` 只编不链，输出**可重定位目标文件**（ET_REL `.o`）：段表、符号表、
+`.rela.text` / `.rela.data` 都按 System V x86-64 ABI 走，所以系统的链接器
+能直接接住它——一条源文件一个 `.o`，跨 TU 的全局变量和函数按名字互认。
+
+```sh
+./c6c/build/c6c -c lib.c6  -o lib.o        # 一个 TU 一个 .o
+./c6c/build/c6c -c main.c6 -o main.o
+cc main.o lib.o -o prog && ./prog          # 交给系统链接器
+```
+
+口径细节：
+
+* 外部函数调用落成 `R_X86_64_PLT32` + `UND` 符号（和 gcc 一样，动态链接时
+  才进 PLT），段内/本 TU 已定义的调用落成 `R_X86_64_PC32`；
+* 数据段里指向别处的地址（`&f`、`p = "x"`、`&&label`）是 `R_X86_64_64`，
+  不是拍死的常量——`.o` 里没有绝对地址；
+* TU 私有的名字（字符串字面量 `.LC<n>`、`static` 的 `helper$2`、编译器自己的
+  TLS 记账格 `__c6_tls_*`）是 `LOCAL`，两个 `.o` 不会撞车；
+* `extern int counter;` 在 `-c` 下**只是引用**（C99 6.9.2p2），不分配存储；
+* `-c` 不出 `_start`、不带运行时、不查 `main`，一次只编一个源文件。
+
+还没有的：c6c 自己的链接器（现在得借系统 `cc` 的）、`.bss`（零初始化数据也
+落在 `.data` 里）、weak / 可见性 / 段 GC、`-fPIC` 与 `-shared`。
+回归：`make -C c6c objcheck`（单/多 TU 真编、真链、真跑 + readelf 结构核对）。

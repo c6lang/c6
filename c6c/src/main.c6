@@ -74,7 +74,8 @@ static void usage(FILE *fp)
         "  --ir-demo            打印 hello 形态的 IR dump\n"
         "  -fsyntax-only        只查错不出码（语法在 P3）\n"
         "  -E                   预处理输出到 stdout\n"
-        "  -c                   单文件 freestanding 可执行文件（不带运行时）\n"
+        "  -c                   只编不链：输出可重定位目标文件（ET_REL，.o），\n"
+        "                       不带运行时、不查 main；一个输入出一个 .o\n"
         "  -run 文件 [参数...]   编成临时 ELF 后立刻执行（参数原样传给 main；\n"
         "                       退出码照抄；不写输出文件，仅 native 后端）\n"
         "  -test                跑所有 `test \"…\" { }` 块（用户 main 不执行）：\n"
@@ -632,6 +633,28 @@ static int parse_args(int argc, char **argv)
 
 static char C6C_SELF_DIR[512];
 
+/* -c 没给 -o 时的默认输出名：`src/foo.c6` → `foo.o`（和 gcc 同一个习惯：
+ * 只留下文件名、去掉 .c6 / .c 后缀）。 */
+static const char *obj_default_out(const char *src, char *buf, size_t n)
+{
+    const char *base = src ? src : "a.c6";
+    const char *slash = base ? strrchr(base, '/') : NULL;
+    size_t len = 0;
+
+    if (slash)
+        base = slash + 1;
+    len = base ? strlen(base) : 0;
+    if (len > 3 && strcmp(base + len - 3, ".c6") == 0)
+        len -= 3;
+    else if (len > 2 && strcmp(base + len - 2, ".c") == 0)
+        len -= 2;
+    if (len + 3 > n)
+        len = n > 3 ? n - 3 : 0;
+    memcpy(buf, base, len);
+    memcpy(buf + len, ".o", 3);
+    return buf;
+}
+
 /* 从 argv[0] 推出编译器自己的目录，供自带 include/ 使用 */
 static void setup_self_dir(const char *argv0)
 {
@@ -771,14 +794,25 @@ int main(int argc, char **argv)
     case M_OBJ:
     case M_EXE:
     case M_RUN: {
-        /* 三个模式都出"可直接执行的 ELF"，区别只有输出到哪、带不带运行时。
-         * 真正的 ET_REL 目标文件 + 自己的链接器在 P4 落地。 */
+        /* M_OBJ 出 ET_REL（真正的 .o，可重定位，见 obj.c6）；M_EXE / M_RUN 出
+         * 可直接执行的静态 ELF。 */
         SrcFile *sf = NULL;
+        char objname[512] = {0};
         const char *out = O.out ? O.out : "a.out";
         /* -run 和"没给 -o 的 -test"都走临时 ELF：编完就地 exec，退出码照抄 */
         int tmp_out = (O.mode == M_RUN) || (O.test && !O.out);
         int rc = 0;
 
+        if (O.mode == M_OBJ && !O.out)
+            out = obj_default_out(O.files[0], objname, sizeof(objname));
+        if (O.mode == M_OBJ && O.nfiles > 1) {
+            /* 一个 .o 对应一个 TU。多个输入要分别出 .o，那得把编译拆成多次
+             * 跑（符号表 / 数据段 / 代码段都是整份镜像一份）。先如实拒绝，
+             * 别把两个 TU 悄悄并进一个 .o —— 那样链接期符号会重复。 */
+            diag_error_plain("-c 一次只编一个源文件（多个输入请分别出 .o）");
+            return 2;
+        }
+        pa_set_reloc(O.mode == M_OBJ);
         if (tmp_out) {
             if (run_make_tmp() < 0)
                 return 2;

@@ -1,0 +1,607 @@
+/* obj.c6 —— ET_REL 目标文件写出器（`c6c -c`）：可重定位的 .text / .data，
+ * 加上 .symtab / .strtab / .rela.text / .rela.data / .shstrtab。
+ *
+ * 为什么要有这一节：在此之前 c6c 的 -c 也出一份**可执行**的静态 ELF
+ * （单文件 freestanding，_start 直接调 main），所以"编一组源文件、各自出 .o、
+ * 再链起来"这条最普通的工程流走不通——没有 .o，链接器就没有能接的东西，
+ * 也就没有 c6c 顶替 tcc 的第一块地基。这一节补的就是它。
+ *
+ * 为什么能做得这么薄：前面几节早就把"将来要重定位的东西"记全了，只是 exec
+ * 路径最后一次性把它们拍成了绝对地址。五类记录一一对应五类重定位：
+ *
+ *   X64.fix[]        代码里的 rel32（call / lea rip+disp32）→ R_X86_64_PC32；
+ *                    外部符号走 PLT32（和 gcc 一个口径，动态链接时才进 PLT）
+ *   X64.labs_patch[] 代码里的 `&&label` imm64              → R_X86_64_64（.text 段符号）
+ *   DFIX[]           数据里的符号地址（`&f`、`p = "x"`）    → R_X86_64_64
+ *   C99_RLOFF[]      数据里指向数据段内部的裸偏移（字符串字面量）→ R_X86_64_64
+ *   CLBL[]           数据里的 `&&label`                     → R_X86_64_64（.text 段符号）
+ *
+ * 段内标号（if/while 的跳转）本来就在同一段里、相对位移解析期就算完了，
+ * 不需要重定位——这也是这一节能只处理"跨段 / 跨符号"引用的原因。
+ */
+
+/* ELF 常量（只列这一节用到的；elf.c6 里那套是 exec 侧的） */
+#define OBJ_SHT_PROGBITS   1u
+#define OBJ_SHT_SYMTAB     2u
+#define OBJ_SHT_STRTAB     3u
+#define OBJ_SHT_RELA       4u
+#define OBJ_SHF_WRITE      0x1u
+#define OBJ_SHF_ALLOC      0x2u
+#define OBJ_SHF_EXEC       0x4u
+#define OBJ_R_X86_64_64    1u
+#define OBJ_R_X86_64_PC32  2u
+#define OBJ_R_X86_64_PLT32 4u
+#define OBJ_STB_LOCAL      0u
+#define OBJ_STB_GLOBAL     1u
+#define OBJ_STT_NOTYPE     0u
+#define OBJ_STT_OBJECT     1u
+#define OBJ_STT_FUNC       2u
+#define OBJ_STT_SECTION    3u
+#define OBJ_SHN_UNDEF      0u
+#define OBJ_SHN_TEXT       1u
+#define OBJ_SHN_DATA       2u
+#define OBJ_NSEC           9u
+#define OBJ_SYM_TEXT       1u      /* .text 段符号在符号表里的下标 */
+#define OBJ_SYM_DATA       2u      /* .data 段符号 */
+#define OBJ_SYM_FIRST      3u      /* 第一个真正的符号 */
+
+typedef struct ObjBuf {
+    u8 *p;
+    u32 n;
+    u32 cap;
+} ObjBuf;
+
+static void ob_room(ObjBuf *b, u32 need)
+{
+    u32 ncap = b->cap ? b->cap : 256;
+    u8 *np = NULL;
+
+    if (b->n + need <= b->cap)
+        return;
+    while (ncap < b->n + need)
+        ncap += ncap / 2 + 256;
+    np = realloc(b->p, ncap);
+    if (!np)
+        return;
+    memset(np + b->cap, 0, (size_t)(ncap - b->cap));
+    b->p = np;
+    b->cap = ncap;
+}
+
+static u32 ob_reserve(ObjBuf *b, u32 n)
+{
+    u32 off = b->n;
+
+    ob_room(b, n);
+    b->n += n;
+    return off;
+}
+
+static void ob_u8(ObjBuf *b, u32 v)
+{
+    u32 o = ob_reserve(b, 1);
+
+    b->p[o] = (u8)v;
+}
+
+static void ob_u16(ObjBuf *b, u32 v)
+{
+    u32 o = ob_reserve(b, 2);
+
+    b->p[o] = (u8)(v & 0xFF);
+    b->p[o + 1] = (u8)((v >> 8) & 0xFF);
+}
+
+static void ob_u32(ObjBuf *b, u32 v)
+{
+    u32 o = ob_reserve(b, 4);
+
+    memcpy(b->p + o, &v, 4);
+}
+
+static void ob_u64(ObjBuf *b, u64 v)
+{
+    u32 o = ob_reserve(b, 8);
+    u32 lo = (u32)(v & 0xFFFFFFFFu);
+    u32 hi = (u32)(v >> 32);
+
+    memcpy(b->p + o, &lo, 4);
+    memcpy(b->p + o + 4, &hi, 4);
+}
+
+static void ob_zero(ObjBuf *b, u32 n)
+{
+    ob_reserve(b, n);
+}
+
+static void ob_copy(ObjBuf *b, const void *src, u32 n)
+{
+    u32 o = 0;
+
+    if (!n)
+        return;
+    o = ob_reserve(b, n);
+    memcpy(b->p + o, src, n);
+}
+
+static void ob_align(ObjBuf *b, u32 a)
+{
+    while (a && (b->n % a))
+        ob_u8(b, 0);
+}
+
+/* 回填（头部字段最后才知道）。和 elf.c6 里那组同义，只是作用在 ObjBuf 上。 */
+static void ob_patch16(ObjBuf *b, u32 off, u32 v)
+{
+    b->p[off] = (u8)(v & 0xFF);
+    b->p[off + 1] = (u8)((v >> 8) & 0xFF);
+}
+
+static void ob_patch32(ObjBuf *b, u32 off, u32 v)
+{
+    memcpy(b->p + off, &v, 4);
+}
+
+static void ob_patch64(ObjBuf *b, u32 off, u64 v)
+{
+    u32 lo = (u32)(v & 0xFFFFFFFFu);
+    u32 hi = (u32)(v >> 32);
+
+    memcpy(b->p + off, &lo, 4);
+    memcpy(b->p + off + 4, &hi, 4);
+}
+
+/* --- 字符串表（.strtab / .shstrtab）：去重，一个名字只存一份 --- */
+
+typedef struct ObjStr {
+    ObjBuf b;
+    const char **name;
+    u32 *off;
+    u32 n;
+    u32 cap;
+} ObjStr;
+
+static void ob_str_init(ObjStr *s)
+{
+    ob_u8(&s->b, 0);            /* 下标 0 永远是空串 */
+}
+
+static u32 ob_str(ObjStr *s, const char *name)
+{
+    u32 i = 0;
+
+    if (!s->b.n)
+        ob_str_init(s);
+    for (i = 0; i < s->n; i++)
+        if (strcmp(s->name[i], name) == 0)
+            return s->off[i];
+    if (s->n >= s->cap) {
+        u32 nc = s->cap ? s->cap * 2 : 256;
+        const char **nn = (const char **)realloc((void *)s->name,
+                                                 (size_t)nc * sizeof(char *));
+        u32 *no = (u32 *)realloc(s->off, (size_t)nc * sizeof(u32));
+
+        if (!nn || !no)
+            return 0;
+        s->name = nn;
+        s->off = no;
+        s->cap = nc;
+    }
+    s->name[s->n] = name;
+    s->off[s->n] = s->b.n;
+    s->n++;
+    ob_copy(&s->b, name, (u32)strlen(name) + 1);
+    return s->off[s->n - 1];
+}
+
+static void ob_str_free(ObjStr *s)
+{
+    free(s->b.p);
+    free((void *)s->name);
+    free(s->off);
+    s->b.p = NULL;
+    s->name = NULL;
+    s->off = NULL;
+    s->n = 0;
+    s->cap = 0;
+}
+
+/* --- 符号表 --- */
+
+typedef struct ObjSym {
+    u32 name;       /* .strtab 偏移 */
+    u8 info;        /* bind << 4 | type */
+    u16 shndx;
+    u64 value;
+} ObjSym;
+
+typedef struct ObjSyms {
+    ObjSym *e;
+    u32 n;
+    u32 cap;
+} ObjSyms;
+
+static void ob_sym_add(ObjSyms *s, u32 name, u8 info, u16 shndx, u64 value)
+{
+    if (s->n >= s->cap) {
+        u32 nc = s->cap ? s->cap * 2 : 1024;
+        ObjSym *ne = (ObjSym *)realloc(s->e, (size_t)nc * sizeof(ObjSym));
+
+        if (!ne)
+            return;
+        s->e = ne;
+        s->cap = nc;
+    }
+    s->e[s->n].name = name;
+    s->e[s->n].info = info;
+    s->e[s->n].shndx = shndx;
+    s->e[s->n].value = value;
+    s->n++;
+}
+
+/* 落一个符号的 24 字节（ELF64 的 Elf64_Sym） */
+static void ob_sym_write(ObjBuf *b, const ObjSym *s)
+{
+    ob_u32(b, s->name);
+    ob_u8(b, s->info);
+    ob_u8(b, 0);            /* st_other：默认可见性 */
+    ob_u16(b, s->shndx);
+    ob_u64(b, s->value);
+    ob_u64(b, 0);           /* st_size：c6c 不追每个符号的大小，链接器不依赖它 */
+}
+
+/* 落一条重定位（ELF64 的 Elf64_Rela，24 字节） */
+static void ob_rela_add(ObjBuf *b, u32 off, u32 sym, u32 type, i64 add)
+{
+    ob_u64(b, (u64)off);
+    ob_u64(b, ((u64)sym << 32) | (u64)type);
+    ob_u64(b, (u64)add);
+}
+
+/* 名字是不是"本 TU 私有"：字符串字面量 `.LC<n>`、静态符号 `helper$2`
+ * （tu_static_name 加的后缀）、汇编器内部的段内标号。私有的给 LOCAL，
+ * 不污染链接期的全局命名空间。 */
+static int ob_sym_local(const char *name)
+{
+    if (!name || !name[0])
+        return 1;
+    if (name[0] == '.')
+        return 1;
+    /* 编译器自己的 TLS 记账格（`__c6_tls_img` / `__c6_tls_len` /
+     * `__c6_tls_delta`）：每个 TU 都会发一份，做成全局就"重复定义"。它们是
+     * 本 TU 的运行期私有数据，链接期不该有人看见。 */
+    if (strncmp(name, "__c6_tls_", 9) == 0)
+        return 1;
+    return strchr(name, '$') != NULL;
+}
+
+/* 符号的段内值：.text 用 CODE_IMG 坐标，.data 减掉文件头的 120 字节。 */
+static u64 ob_sym_value(const X64Sym *s)
+{
+    if (!s->defined)
+        return 0;
+    if (s->is_data)
+        return (u64)(s->off - (u32)ELF_HDR);
+    return (u64)s->off;
+}
+
+/* 数据段偏移 off 落在哪个数据符号上（取起点不晚于 off 且最靠后的那个）。
+ * 找不到就返回 0，调用方退回 .data 段符号 + 加数——链接器只认 S + A。 */
+static u32 ob_data_owner(u32 off)
+{
+    u32 i = 0;
+    u32 best = 0;
+
+    for (i = 0; i < X64.nsym; i++) {
+        X64Sym *s = &X64.sym[i];
+
+        if (!s->defined || !s->is_data || !s->name || s->off < (u32)ELF_HDR)
+            continue;
+        if (s->off - (u32)ELF_HDR > off)
+            continue;
+        if (!best || X64.sym[best].off < s->off)
+            best = i;
+    }
+    return best;
+}
+
+/* 写出目标文件。调用前：解析完、x64_resolve 跑过（跳板补齐、未定义不报错）。 */
+static void obj_write(const char *path)
+{
+    ObjBuf relat = {0};         /* .rela.text */
+    ObjBuf relad = {0};         /* .rela.data */
+    ObjBuf symtab = {0};
+    ObjBuf f = {0};             /* 整份文件 */
+    ObjStr str = {0};
+    ObjStr shstr = {0};
+    ObjSyms loc = {0};          /* 本地符号（含 0 号与两个段符号） */
+    ObjSyms glob = {0};
+    ObjSyms all = {0};          /* 本地 + 全局，最终顺序 */
+    u32 *map = NULL;            /* X64 符号 id → ELF 符号下标 */
+    u8 *seen = NULL;            /* 数据段里已落过重定位的字节（去重） */
+    u32 i = 0;
+    u32 nlocal = 0;
+    u32 off_text = 0;
+    u32 off_data = 0;
+    u32 off_relat = 0;
+    u32 off_relad = 0;
+    u32 off_sym = 0;
+    u32 off_str = 0;
+    u32 off_shstr = 0;
+    u32 off_shdr = 0;
+    u32 sh_name[OBJ_NSEC] = {0};
+    FILE *out = NULL;
+
+    if (!CODE_IMG.n && !DATA_IMG.n) {
+        fprintf(stderr, "c6c: 没有可写出的内容\n");
+        return;
+    }
+    ob_str_init(&str);
+    ob_str_init(&shstr);
+
+    /* 0 号符号 + 两个段符号（LOCAL，当"段内偏移"的载体） */
+    ob_sym_add(&loc, 0, 0, OBJ_SHN_UNDEF, 0);
+    ob_sym_add(&loc, ob_str(&str, ".text"),
+               (u8)((OBJ_STB_LOCAL << 4) | OBJ_STT_SECTION), OBJ_SHN_TEXT, 0);
+    ob_sym_add(&loc, ob_str(&str, ".data"),
+               (u8)((OBJ_STB_LOCAL << 4) | OBJ_STT_SECTION), OBJ_SHN_DATA, 0);
+
+    map = (u32 *)calloc(X64.nsym ? X64.nsym : 1, sizeof(u32));
+    if (!map) {
+        ob_str_free(&str);
+        ob_str_free(&shstr);
+        return;
+    }
+
+    /* 先本地、后全局：ELF 要求 sh_info 之前的全是 LOCAL，链接器按这个分界
+     * 建全局符号表。 */
+    for (i = 0; i < X64.nsym; i++) {
+        X64Sym *s = &X64.sym[i];
+        int local = 0;
+        u8 bind = OBJ_STB_GLOBAL;
+        u8 type = OBJ_STT_NOTYPE;
+        u16 shndx = OBJ_SHN_UNDEF;
+
+        if (!s->name || !s->name[0])
+            continue;           /* 无名符号：重定位里退化成 0 号 */
+        local = ob_sym_local(s->name);
+        bind = (u8)(local ? OBJ_STB_LOCAL : OBJ_STB_GLOBAL);
+        if (s->defined && s->is_data) {
+            type = OBJ_STT_OBJECT;
+            shndx = OBJ_SHN_DATA;
+        } else if (s->defined) {
+            type = OBJ_STT_FUNC;
+            shndx = OBJ_SHN_TEXT;
+        }
+        ob_sym_add(local ? &loc : &glob, ob_str(&str, s->name),
+                   (u8)((bind << 4) | type), shndx, ob_sym_value(s));
+    }
+    nlocal = loc.n;
+    for (i = 0; i < loc.n; i++)
+        ob_sym_add(&all, loc.e[i].name, loc.e[i].info, loc.e[i].shndx, loc.e[i].value);
+    for (i = 0; i < glob.n; i++)
+        ob_sym_add(&all, glob.e[i].name, glob.e[i].info, glob.e[i].shndx, glob.e[i].value);
+
+    /* 回填 map：顺序必须和上面分类一致（本地一段、全局一段） */
+    {
+        u32 li = OBJ_SYM_FIRST;
+        u32 gi = nlocal;
+
+        for (i = 0; i < X64.nsym; i++) {
+            X64Sym *s = &X64.sym[i];
+
+            if (!s->name || !s->name[0]) {
+                map[i] = 0;
+                continue;
+            }
+            map[i] = ob_sym_local(s->name) ? li++ : gi++;
+        }
+    }
+
+    /* --- .rela.text：代码里的跨符号引用 --- */
+    for (i = 0; i < X64.nfix; i++) {
+        X64Fix *fx = &X64.fix[i];
+        u32 type = X64.sym[fx->sym].defined ? OBJ_R_X86_64_PC32 : OBJ_R_X86_64_PLT32;
+
+        /* rel32 的 PC 是字段末尾：reloc 算的是 S + A - P，所以 A = -4 */
+        ob_rela_add(&relat, fx->patch, map[fx->sym], type, -4);
+    }
+    for (i = 0; i < X64.nlabs_fix; i++)
+        ob_rela_add(&relat, X64.labs_patch[i], OBJ_SYM_TEXT, OBJ_R_X86_64_64,
+                    (i64)X64.labs_val[i]);
+
+    /* --- .rela.data：数据里的地址 --- */
+    seen = (u8 *)calloc(DATA_IMG.n ? DATA_IMG.n : 1, 1);
+    if (!seen) {
+        free(map);
+        ob_str_free(&str);
+        ob_str_free(&shstr);
+        free(loc.e);
+        free(glob.e);
+        free(all.e);
+        return;
+    }
+    for (i = 0; i < NDFIX; i++) {
+        u32 off = DFIX_OFF[i];
+
+        if (off + 8 > DATA_IMG.n || seen[off])
+            continue;
+        seen[off] = 1;
+        ob_rela_add(&relad, off, map[DFIX_SYM[i]], OBJ_R_X86_64_64, DFIX_ADD[i]);
+    }
+    for (i = 0; i < C99_NRL; i++) {
+        u32 off = C99_RLOFF[i];
+        u32 owner = 0;
+
+        if (off + 8 > DATA_IMG.n || seen[off])
+            continue;
+        seen[off] = 1;
+        owner = ob_data_owner(C99_RLTGT[i]);
+        if (owner)
+            ob_rela_add(&relad, off, map[owner], OBJ_R_X86_64_64,
+                        (i64)C99_RLTGT[i] - (i64)ob_sym_value(&X64.sym[owner]));
+        else
+            ob_rela_add(&relad, off, OBJ_SYM_DATA, OBJ_R_X86_64_64, (i64)C99_RLTGT[i]);
+    }
+    for (i = 0; i < NCLBL; i++) {
+        u32 off = CLBL_OFF[i];
+
+        if (off + 8 > DATA_IMG.n || seen[off])
+            continue;
+        seen[off] = 1;
+        ob_rela_add(&relad, off, OBJ_SYM_TEXT, OBJ_R_X86_64_64,
+                    (i64)x64_lbl_off(&X64, CLBL_FN[i], CLBL_LBL[i]));
+    }
+
+    /* 段名先进 shstrtab：它的内容必须**先定稿**，否则整份文件的偏移全要重排 */
+    sh_name[0] = 0;
+    sh_name[1] = ob_str(&shstr, ".text");
+    sh_name[2] = ob_str(&shstr, ".data");
+    sh_name[3] = ob_str(&shstr, ".rela.text");
+    sh_name[4] = ob_str(&shstr, ".rela.data");
+    sh_name[5] = ob_str(&shstr, ".symtab");
+    sh_name[6] = ob_str(&shstr, ".strtab");
+    sh_name[7] = ob_str(&shstr, ".shstrtab");
+    sh_name[8] = ob_str(&shstr, ".note.GNU-stack");
+
+    for (i = 0; i < all.n; i++)
+        ob_sym_write(&symtab, &all.e[i]);
+
+    /* --- 拼文件 --- */
+    ob_zero(&f, ELF_EHDR);              /* 头先占位，字段最后回填 */
+    ob_align(&f, 16);
+    off_text = f.n;
+    ob_copy(&f, CODE_IMG.p, CODE_IMG.n);
+    ob_align(&f, 8);
+    off_data = f.n;
+    ob_copy(&f, DATA_IMG.p, DATA_IMG.n);
+    ob_align(&f, 8);
+    off_relat = f.n;
+    ob_copy(&f, relat.p, relat.n);
+    ob_align(&f, 8);
+    off_relad = f.n;
+    ob_copy(&f, relad.p, relad.n);
+    ob_align(&f, 8);
+    off_sym = f.n;
+    ob_copy(&f, symtab.p, symtab.n);
+    off_str = f.n;
+    ob_copy(&f, str.b.p, str.b.n);
+    off_shstr = f.n;
+    ob_copy(&f, shstr.b.p, shstr.b.n);
+    ob_align(&f, 8);
+    off_shdr = f.n;
+
+    /* 9 个段头，每个 64 字节 */
+    for (i = 0; i < OBJ_NSEC; i++) {
+        u32 ty = 0;
+        u64 flags = 0;
+        u64 sz = 0;
+        u32 off = 0;
+        u32 link = 0;
+        u32 info = 0;
+        u64 align = 1;
+        u64 ent = 0;
+
+        if (i == 1) {                   /* .text */
+            ty = OBJ_SHT_PROGBITS;
+            flags = OBJ_SHF_ALLOC | OBJ_SHF_EXEC;
+            sz = CODE_IMG.n;
+            off = off_text;
+            align = 16;
+        } else if (i == 2) {            /* .data */
+            ty = OBJ_SHT_PROGBITS;
+            flags = OBJ_SHF_ALLOC | OBJ_SHF_WRITE;
+            sz = DATA_IMG.n;
+            off = off_data;
+            align = 8;
+        } else if (i == 3) {            /* .rela.text */
+            ty = OBJ_SHT_RELA;
+            sz = relat.n;
+            off = off_relat;
+            link = 5;                   /* .symtab */
+            info = OBJ_SHN_TEXT;
+            align = 8;
+            ent = 24;
+        } else if (i == 4) {            /* .rela.data */
+            ty = OBJ_SHT_RELA;
+            sz = relad.n;
+            off = off_relad;
+            link = 5;
+            info = OBJ_SHN_DATA;
+            align = 8;
+            ent = 24;
+        } else if (i == 5) {            /* .symtab */
+            ty = OBJ_SHT_SYMTAB;
+            sz = symtab.n;
+            off = off_sym;
+            link = 6;                   /* .strtab */
+            info = nlocal;              /* 第一个全局符号的下标 */
+            align = 8;
+            ent = 24;
+        } else if (i == 6) {            /* .strtab */
+            ty = OBJ_SHT_STRTAB;
+            sz = str.b.n;
+            off = off_str;
+        } else if (i == 7) {            /* .shstrtab */
+            ty = OBJ_SHT_STRTAB;
+            sz = shstr.b.n;
+            off = off_shstr;
+        } else if (i == 8) {            /* .note.GNU-stack：空段，只为告诉链接器
+                                         * "这个栈不用可执行" */
+            ty = OBJ_SHT_PROGBITS;
+        }
+        ob_u32(&f, sh_name[i]);
+        ob_u32(&f, ty);
+        ob_u64(&f, flags);
+        ob_u64(&f, 0);                  /* sh_addr：可重定位文件里是 0 */
+        ob_u64(&f, (u64)off);
+        ob_u64(&f, sz);
+        ob_u32(&f, link);
+        ob_u32(&f, info);
+        ob_u64(&f, align);
+        ob_u64(&f, ent);
+    }
+
+    /* ELF 头 */
+    ob_patch32(&f, 0, 0x464C457Fu);             /* \x7fELF */
+    f.p[4] = 2;                                 /* ELFCLASS64 */
+    f.p[5] = 1;                                 /* ELFDATA2LSB */
+    f.p[6] = 1;                                 /* EV_CURRENT */
+    ob_patch16(&f, 16, 1);                      /* e_type = ET_REL */
+    ob_patch16(&f, 18, 0x3E);                   /* e_machine = EM_X86_64 */
+    ob_patch32(&f, 20, 1);                      /* e_version */
+    ob_patch64(&f, 24, 0);                      /* e_entry：可重定位文件没有入口 */
+    ob_patch64(&f, 32, 0);                      /* e_phoff */
+    ob_patch64(&f, 40, (u64)off_shdr);          /* e_shoff */
+    ob_patch32(&f, 48, 0);                      /* e_flags */
+    ob_patch16(&f, 52, ELF_EHDR);               /* e_ehsize */
+    ob_patch16(&f, 54, 0);                      /* e_phentsize */
+    ob_patch16(&f, 56, 0);                      /* e_phnum */
+    ob_patch16(&f, 58, 64);                     /* e_shentsize */
+    ob_patch16(&f, 60, OBJ_NSEC);               /* e_shnum */
+    ob_patch16(&f, 62, 7);                      /* e_shstrndx */
+
+    out = fopen(path, "wb");
+    if (!out) {
+        fprintf(stderr, "c6c: 无法写出 %s\n", path);
+    } else {
+        if (fwrite(f.p, 1, (size_t)f.n, out) != (size_t)f.n)
+            fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
+        fclose(out);
+        printf("c6c: %s（ET_REL：代码 %u 字节 / 数据 %u 字节 / 符号 %u 个 / "
+               "重定位 %u 条）\n",
+               path, CODE_IMG.n, DATA_IMG.n, all.n, (relat.n + relad.n) / 24u);
+    }
+
+    free(map);
+    free(seen);
+    free(relat.p);
+    free(relad.p);
+    free(symtab.p);
+    free(f.p);
+    free(loc.e);
+    free(glob.e);
+    free(all.e);
+    ob_str_free(&str);
+    ob_str_free(&shstr);
+}

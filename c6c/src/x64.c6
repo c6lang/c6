@@ -557,6 +557,11 @@ static int x64_emit_asmblob(X64State *st, u32 symi)
     return 1;
 }
 
+/* `-c`（ET_REL）模式：这里不拍绝对地址，只把"还没有定义、但编译器自带跳板"
+ * 的符号补齐（跳板是代码段的一部分，属于本 TU），剩下的交给 obj.c6 落成重
+ * 定位。未定义符号在这种情况下是**正常**的：它对应一条 UND 重定位。 */
+static int X64_OBJ;
+
 static void x64_resolve(X64State *st)
 {
     u32 i = 0;
@@ -574,6 +579,8 @@ static void x64_resolve(X64State *st)
         if (!st->sym[f->sym].defined && x64_emit_asmblob(st, f->sym))
             target = st->sym[f->sym].off;
         if (!st->sym[f->sym].defined) {
+            if (X64_OBJ)
+                continue;           /* -c：留给链接器，落成 UND 重定位 */
             /* C6C_ALLOW_UNDEF=1：不报错停在这里，而是把所有缺失的符号列一遍
              * （诊断"这份源码还差哪些运行时函数"用；产物不能用）。 */
             if (ALLOW_UNDEF) {
@@ -591,6 +598,8 @@ static void x64_resolve(X64State *st)
             exit(2);
         }
         rel = target - next;
+        if (X64_OBJ)
+            continue;               /* -c：rel32 留给重定位表，别在这里拍死 */
         img_patch32(st->im, f->patch, rel);
     }
 }

@@ -1284,6 +1284,19 @@ static void pa_set_nfiles(u32 n)
     PA_NFILES = n ? n : 1;
 }
 
+/* -c（ET_REL）：驱动在开编之前打开。打开之后 pa_finish 走 obj.c6 那条路：
+ * 不查 main、不容错未定义符号、不拍绝对地址（见 obj.c6 的说明）。 */
+static int PA_RELOC;
+
+/* obj.c6 在本文件之后 include（它要用 DFIX / CLBL 这些解析期的记录），
+ * 这里先声明。 */
+static void obj_write(const char *path);
+
+static void pa_set_reloc(int v)
+{
+    PA_RELOC = v ? 1 : 0;
+}
+
 /* 文件作用域 `static` 的**发射名**：拿不到模块前缀那套（static 本来就
  * 不跨模块），换成 TU 后缀 —— `helper$2`。符号表里仍是短名 `helper`
  * （本 TU 内的解析、诊断、方法表全按短名走），只有落到镜像里的名字分家：
@@ -19368,6 +19381,23 @@ static void gen_one_global(u32 ty, Declarator *d)
                 TLS_REF[NTLS_REF++] = r;
             return;
         }
+        /* 纯 C 的 `extern T x;`（本 TU 没声明过这个对象，定义在别处）：
+         * **出 .o 时**只登记一个"引用"符号，不分配存储——C99 6.9.2p2 里带
+         * extern 的文件作用域声明不是定义，给了空间就会在两个 .o 里各定义
+         * 一次、链接期重复定义。地址走 X64 符号表（此时未定义），由 -c 落成
+         * 一条重定位，链接器去别的 .o 里找。
+         *
+         * 单镜像（-c 之外）这条路上历史行为是"给一格零初始化的存储"：
+         * rt.c6 的 `extern char **environ;` 就靠这格（只有调 execve 时才读），
+         * 改成纯引用会让每个程序都报"未定义的符号 environ"。所以这里按模式
+         * 分叉，而不是一刀切——等运行时有自己的 environ 定义再统一。 */
+        if (PA_RELOC) {
+            Sym *r2 = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
+
+            r2->is_extern = 1;
+            r2->val = (i64)x64_sym(&X64, r2->name);
+            return;
+        }
     }
     s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
     sz = ty_size(ty) ? ty_size(ty) : 8;
@@ -20693,13 +20723,14 @@ static int pa_finish(const char *out)
         fprintf(stderr, "c6c: %d 个错误，不写输出\n", PA_ERRS + DG.errors);
         return 1;
     }
-    if (PA_LINK_UNDEF) {
+    if (PA_LINK_UNDEF && !PA_RELOC) {
         /* `extern __thread` 到最后没人定义：tls_finish 已经按链接期的口径
-         * 报过名字了，这里只负责别写出一个读 0 的产物。 */
+         * 报过名字了，这里只负责别写出一个读 0 的产物。
+         * -c 例外：可重定位文件里"未定义"是正常状态，由链接器去别处找。 */
         fprintf(stderr, "c6c: 有未定义的外部符号，不写输出\n");
         return 1;
     }
-    if (!PA_MAIN && !PA_SYNTAX_ONLY) {
+    if (!PA_MAIN && !PA_SYNTAX_ONLY && !PA_RELOC) {
         fprintf(stderr, "c6c: 没有 main（可执行文件需要入口）\n");
         return 1;
     }
@@ -20776,9 +20807,22 @@ static int pa_finish(const char *out)
          * 补丁偏移仍留在 CODE_IMG 坐标里，相对位移的基准交给 X64.im_base。 */
         u32 code_off = 0;
         u32 entry_off = 0;
-        u32 main_sym = (u32)PA_MAIN->val;
+        u32 main_sym = 0;
         u32 i = 0;
 
+        /* -c：出 ET_REL。没有入口、不拍绝对地址——_start 也不该有（一个 .o
+         * 里塞个 _start，多 TU 一链就重定义）。这里只把编译器自带跳板补进
+         * 代码段，剩下的交给 obj.c6 落重定位。 */
+        if (PA_RELOC) {
+            X64_OBJ = 1;
+            X64.im_base = 0;
+            x64_resolve(&X64);
+            code_len = CODE_IMG.n;
+            obj_write(out);
+            return rc;
+        }
+
+        main_sym = (u32)PA_MAIN->val;
         entry_off = CODE_IMG.n;
         x64_emit_start(&X64, main_sym, CTORS, NCTOR, DTORS, NDTOR);
 
