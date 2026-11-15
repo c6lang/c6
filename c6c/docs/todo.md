@@ -2959,3 +2959,23 @@ _Static_assert(__builtin_types_compatible_p(const int *, int *) == 0,
 加宽的代价评估过：IR 记录 16 → 24 字节、`parse.c6` 603 处机械改动、三后端只读
 字段不用改、fixpoint 不受影响、峰值 RSS +5%、时间 +2~3%。属于"该排期但不该
 为了记分板"的项。
+
+### LLVM 静态数据那条：又往前定位了一步（同一对象有两个符号）
+
+上一段说"符号偏移和初值写进去的位置对不上"。这一轮把两边都打了日志，结论更准：
+
+```
+[dbgB] braced goff=154620 ty=244 off=0 size=12        ← static int a[3] = {7,8,9} 的初值写在这里
+[dbgS] id=385 off=154740 data=154620                  ← 确实有个符号正好在 154620
+[dbgA] addr sym=… data=32840 …                        ← 但代码里读 a 用的是**另一个**符号
+```
+
+也就是说**同一个对象在数据段里被分了两块**：声明拿到的槽（代码引用它）和初始化器
+写入的槽（另起一份）。所以运行时读出来是 0——不是"数据没写"，是"写的不是同一块"。
+
+下一步该查的：`static int a[3]` 这种声明为什么会被分配两次数据槽——要么
+`sym_add` 在"先声明后初始化"两条路上给了两个 id，要么初始化器那条路自己又
+`data_alloc` 了一次（`gen_glob_braced_new()` 收到的 `goff` 是调用方给的，顺着
+`gen_glob_obj()` 的顶层调用点往回找就能看到）。修好后
+`tests/c/llvm-only.txt` 里那三条（`init_bound` / `cleanup_attr` /
+`alloca_runtime`）就能放回 LLVM 后端跑。
