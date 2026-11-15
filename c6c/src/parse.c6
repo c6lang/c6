@@ -8809,20 +8809,32 @@ static u32 gen_postfix(void)
     if (t->kind == TK_IDENT && (TOK_EQ(t, "alloca") || TOK_EQ(t, "__builtin_alloca"))) {
         if (CUR_TASK_TY)
             pa_error("async 函数里不能用 alloca");
-        /* alloca/__builtin_alloca：大小是编译期常量时直接开一个栈槽（帧里预留），
-         * 非常量大小这条路没实现（要动 rsp，先留着报错，不静默）。 */
+        /* alloca/__builtin_alloca：两条路。
+         *   - 大小是**字面量**：直接开一个帧槽（不碰 rsp，函数尾声自然回收）；
+         *   - 大小是运行期表达式（`alloca(strlen(s)+1)`、`alloca(n*2)`）：走
+         *     VLA 那条 IR_ALLOCA（`rsp - align16(字节数)`），三个后端都已经
+         *     实现了。以前这里报"必须是编译期常量"，tcc 上游的 boundtest.c
+         *     正是拿它当标准用法。 */
         u64 n = 0;
         u32 addr = 0;
 
         pa_advance();
         pa_expect_ch('(');
-        if (!parse_const_u64(&n))
-            pa_error("alloca 的大小必须是编译期常量");
-        pa_expect_ch(')');
-        {
-            u32 slot = frame_slots_for((u32)n);
+        if (pa_cur()->kind == TK_NUM && parse_const_u64(&n)) {
+            pa_expect_ch(')');
+            {
+                u32 slot = frame_slots_for((u32)n);
+
+                addr = irfn_vreg(&FN);
+                irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
+            }
+        } else {
+            u32 cnt = value_of(gen_assign());
+
+            pa_expect_ch(')');
             addr = irfn_vreg(&FN);
-            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
+            /* imm = 1：a 直接就是字节数 */
+            irfn_push(&FN, IR_ALLOCA, IRT_PTR, (u16)addr, (u16)cnt, 0, 0, 1);
         }
         GEN_TY = ty_ptr(ty_void());
         return gen_postfix_ops(addr);
