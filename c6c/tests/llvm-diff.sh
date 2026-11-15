@@ -56,5 +56,17 @@ done
 echo "c6c: LLVM IR 后端 vs native 后端（$CORPUS）：一致 $ok / 不一致 $bad"
 if [ "$bad" -ne 0 ]; then
     echo "c6c: 不一致项：$badlist"
+    # 失败原因都在每例的 .llog 里（llc / cc 的 stderr）。以前只在临时目录里
+    # 留着、trap 一删就没了，CI 上只能看到 "(link)" 这种分类，等于没信息；
+    # 这里把最后一例的日志尾巴打出来（真要逐例看得自己跑一遍 -v 口径）。
+    for f in "$CORPUS"/*.c; do
+        n=$(basename "$f" .c)
+        case " $badlist " in
+        *" $n("*)
+            echo "---- $n 的日志（最后 6 行）"
+            tail -6 "$TMP/$n.llog" 2>/dev/null
+            ;;
+        esac
+    done | head -80
     exit 1
 fi
