@@ -82,6 +82,22 @@ if(BUILD_TESTING AND EXISTS "${C6C_DIR}/Makefile")
     LABELS "c6c"
     TIMEOUT 1800)
 
+  # 一条命令的入口（和仓库里 `check-install` 同一个风格）：
+  #   cmake --build build --target check-c6c       验收 (1)(2)(3) + 上游 tests1/tests2
+  #   cmake --build build --target check-c6c-perf  再加上验收 (4)
+  add_custom_target(check-c6c
+    COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -R "^c6c-" -LE perf
+    DEPENDS c6c
+    USES_TERMINAL
+    COMMENT "c6c: 验收 (1)(2)(3)：fixpoint / 三后端 / 语料 / 编出 tcc + 第三代 selfhost / 上游 tests1·tests2")
+
+  add_custom_target(check-c6c-perf
+    COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -R "^c6c-|^c6c$"
+    COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -L perf
+    DEPENDS c6c
+    USES_TERMINAL
+    COMMENT "c6c: 上面全部 + 验收 (4) 性能/内存")
+
   # 验收 (4)：性能与内存门槛。门槛是按开发机定的，CI 的共享 runner 抖动 ±10%
   # 会误报，所以单独挂 `perf`，CI 里用 `-LE perf` 排除。
   add_test(NAME c6c-bench
