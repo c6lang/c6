@@ -1,5 +1,7 @@
 #!/bin/sh
-# c6 编译期诊断用例：tests/errors/*.c6 里每条
+# c6 编译期诊断用例：tests/errors/*.c6（c6 与 c6c 共用的那批）以及
+# c6c/tests/errors/*.c6（**只有 c6c 实现**的诊断，比如 C99 6.10.3p4 的宏实参
+# 个数——引导编译器 c6 没这条，放进共用目录会让 c6 侧的套件红）里每条
 #     // EXPECT <片段名>: error: <诊断文本>
 # 都要求"用 -D<片段名> 编这个文件时，真的报出这段文本"。
 # 不带 -D 时是文件的正常路径，必须编得过去（`test` 目标已经在查那条，
@@ -69,7 +71,7 @@ one_file() {
 }
 
 i=0
-for f in "$ROOT"/tests/errors/*.c6; do
+for f in "$ROOT"/tests/errors/*.c6 "$ROOT"/c6c/tests/errors/*.c6; do
     [ -f "$f" ] || continue
     i=$((i + 1))
     if [ "$JOBS" -le 1 ]; then
@@ -89,7 +91,7 @@ txt=0
 skip=0
 nfile=0
 i=0
-for f in "$ROOT"/tests/errors/*.c6; do
+for f in "$ROOT"/tests/errors/*.c6 "$ROOT"/c6c/tests/errors/*.c6; do
     [ -f "$f" ] || continue
     i=$((i + 1))
     nfile=$((nfile + 1))
