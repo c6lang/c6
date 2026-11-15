@@ -84,6 +84,7 @@ G2c 的夹具：判的是"c6c 编出的 tcc 能不能工作"，就得有一个�
 | 整条命令 | `make check-all` | exit 0 | ✅ `c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 能编出 tcc）` |
 | 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅ 逐字节相同（大小随源码变，比的是 c6c2 与 c6c3 相等） |
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
+| 自己的静态链接器 | `make ldcheck` | 13/13：两个自足 `.o` 真链真跑（退出码 45）、`rt.o` 的 **564 条重定位**全部应用后 hello 输出与退出码都对、构造函数在 `main` 之前、跨 `.o` TLS 记账格、缺符号退出码 2、`readelf` 结构（ET_EXEC / 两个 PT_LOAD / 栈不可执行） | ✅ |
 | `-c` 出可重定位目标文件 | `make objcheck` | 11/11：单/多 TU 真编、系统链接器真链、真跑；ET_REL 类型 / 段表 / `PLT32+UND` / `R_X86_64_64` / `LOCAL` 绑定逐条核对 | ✅ |
 | tests/ 语料 | `make test` | 前端 124/0、跑通 67/0；前端回归（gcc oracle）34/34 | ✅ |
 | std/ 模块 | `make stdtest` | 377/377 | ✅ |
