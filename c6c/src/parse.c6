@@ -14610,6 +14610,26 @@ static u32 DF_EXCEPT = MGD_NO_SLOT;   /* `return p` 交出去的那个槽：跳�
 static int NDF;
 static int DEF_DEPTH;          /* 块嵌套深度：函数体是 1 */
 static int LOOP_DFB[PA_MAXLOOP];   /* 进循环时的 DEF_DEPTH */
+/* 当前块的**祖先链**：BLK_CHAIN[d] 是现在第 d 层那个块的编号。
+ * goto 要判断"跳到标号时到底退出了哪几层"，光比深度不够——标号可能和
+ * goto 同一深度、但在**兄弟块**里（tcc tests2/101_cleanup 的 `goto outside;`
+ * 就是这样：goto 在外层 if 的块里、标号在另一个 if 的嵌块里、深度还更深），
+ * 只比深度会一条清理都不跑。所以标号定义时把当时的链抄一份，goto 时求公共
+ * 前缀，分叉点以上的层就是要退出的层。 */
+#define BLK_MAXDEPTH 128
+static u32 BLK_CHAIN[BLK_MAXDEPTH];
+static u32 BLK_SEQ;            /* 块编号发号器 */
+
+/* 进了新的一层块：给它发一个新编号（编号只用来判"是不是同一个块"）。 */
+static void blk_chain_push(void)
+{
+    if (DEF_DEPTH < BLK_MAXDEPTH)
+        BLK_CHAIN[DEF_DEPTH] = ++BLK_SEQ;
+}
+
+/* 标号定义时把当前的块链抄一份（内存从 arena 拿，一条几十字节）。
+ * 层数超过 BLK_MAXDEPTH 就不抄，goto 那边退回"按深度"的老算法。 */
+static void blk_chain_save(u32 gi, int depth);
 
 /* `__attribute__((cleanup(fn)))`：作用域退出时调 `fn(&变量)`（和 C 的语义
  * 一致：按声明的逆序）。
@@ -14940,6 +14960,7 @@ static void gen_block(void)
     pa_expect_ch('{');
     scope_enter();
     DEF_DEPTH++;
+    blk_chain_push();
     if (NLOOP > 0 && NLOOP - 1 < PA_MAXLOOP && !LOOP_BODY[NLOOP - 1])
         LOOP_BODY[NLOOP - 1] = SCOPE;
     while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF)
@@ -15092,7 +15113,20 @@ static u32 GLBL_LEN[GOTO_MAX];
 static u32 GLBL_ID[GOTO_MAX];
 static int GLBL_DEPTH[GOTO_MAX];   /* 标号所在块深度（goto 按它决定跑哪些清理） */
 static int GLBL_DEF[GOTO_MAX];     /* 标号已经定义过了（前向 goto 还不知道深度） */
+static u32 *GLBL_CHAIN[GOTO_MAX];  /* 定义时抄下来的块链（NULL = 太深，没抄） */
 static u32 NGLBL;
+
+static void blk_chain_save(u32 gi, int depth)
+{
+    int d = 0;
+
+    GLBL_CHAIN[gi] = NULL;
+    if (depth <= 0 || depth >= BLK_MAXDEPTH)
+        return;
+    GLBL_CHAIN[gi] = arena_alloc(&A_main, (size_t)(depth + 1) * sizeof(u32));
+    for (d = 1; d <= depth; d++)
+        GLBL_CHAIN[gi][d] = BLK_CHAIN[d];
+}
 
 static u32 goto_label(const char *nm, u32 len)
 {
@@ -15686,6 +15720,7 @@ static void gen_stmt(void)
             u32 l = goto_label(tok_data(pa_cur()), pa_cur()->len);
             int gi = 0;
             int ld = 0;
+            int lgi = -1;
 
             pa_advance();
             pa_expect_ch(';');
@@ -15696,6 +15731,7 @@ static void gen_stmt(void)
             for (gi = 0; gi < NGLBL; gi++)
                 if (GLBL_ID[gi] == l && GLBL_DEF[gi]) {
                     ld = GLBL_DEPTH[gi];
+                    lgi = gi;
                     fwd = 0;
                 }
             /* 变长数组的栈空间只在**回边**上回收（向后 goto = 自己搭的循环，
@@ -15706,10 +15742,32 @@ static void gen_stmt(void)
              * 抹成 0，ret 直接蹦到野地址）。 */
             if (!fwd)
                 gen_vla_restore();
-            /* 只跑**比标号更深**的作用域的清理：同一个作用域里 `again:` 之后
+            /* 只跑**退出掉的那些**作用域的清理：同一个作用域里 `again:` 之后
              * 注册的 defer，跳回 `again:` 时还活着，不能重复执行
-             * （tests/defer_scope.c6 的"重复注册只跑一次"）。 */
-            defer_run(ld > 0 ? ld + 1 : 1, 0);
+             * （tests/defer_scope.c6 的"重复注册只跑一次"）。
+             *
+             * 判"退出了哪几层"不能只看深度：标号可能和 goto 在同一深度、但在
+             * 兄弟块里（跳过去其实退出了当前这些块），也可能比 goto 更深。
+             * 所以拿块链求公共前缀——第 c 层还在一起、第 c+1 层就分叉了，
+             * 那么 c+1 层及更深的全退出了。 */
+            {
+                /* 前向 goto 还不知道标号在多深，但有一点是确定的：**不可能退出
+                 * 函数体**（第 1 层）。所以起点至少是 2 —— 从 1 起会把函数体
+                 * 自己的 cleanup 提前跑一遍（tcc tests2/101_cleanup 的 check()
+                 * 里，`goto out` 把 `str: wololo` 打在了最前面，等函数真的返回时
+                 * 又跑一遍，第二次打出来的是被改过的 "fail"）。 */
+                int from = ld > 0 ? ld + 1 : 2;
+
+                if (!fwd && lgi >= 0 && GLBL_CHAIN[lgi]) {
+                    int c = 0;
+
+                    while (c < DEF_DEPTH && c < ld && c + 1 < BLK_MAXDEPTH
+                           && BLK_CHAIN[c + 1] == GLBL_CHAIN[lgi][c + 1])
+                        c++;
+                    from = c + 1;
+                }
+                defer_run(from, 0);
+            }
             irfn_push(&FN, IR_JMP, IRT_VOID, 0, l, 0, 0, 0);
         } else {
             pa_error("goto 后面要标号名或 '*' 表达式");
@@ -15760,6 +15818,7 @@ static void gen_stmt(void)
         for (gi = 0; gi < NGLBL; gi++)
             if (GLBL_ID[gi] == l) {
                 GLBL_DEPTH[gi] = DEF_DEPTH;
+                blk_chain_save((u32)gi, DEF_DEPTH);
                 GLBL_DEF[gi] = 1;
             }
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l, 0, 0, 0);
@@ -16021,6 +16080,21 @@ static void gen_stmt(void)
             } else {
                 if (ty_is_scalar(CUR_RET_TY) && rty != CUR_RET_TY)
                     v = gen_convert(v, rty, CUR_RET_TY);
+                /* `return agg;` 且本函数还有没跑的 cleanup：C 的语义是**先把
+                 * 返回值拷出去、再跑 cleanup**（gcc 就这么排）。不拷的话，
+                 * 那种会改写原对象的 cleanup（`my_cleanup2` 把每个成员改写成
+                 * 0x90…）会把调用者看到的返回值一起改掉——tcc tests2/
+                 * 101_cleanup 的 test_cleanup2/3/4/6 就是这么错的。
+                 * 没有 cleanup 时不拷，热路径上不多一条。 */
+                if (ty_is_agg(CUR_RET_TY) && CL_N > 0 && ty_size(CUR_RET_TY)) {
+                    u32 rsz = ty_size(CUR_RET_TY);
+                    u32 raddr = irfn_vreg(&FN);
+
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, raddr, 0, 0, 0,
+                              X64_SLOT(frame_slots_for(rsz)));
+                    irfn_push(&FN, IR_COPY, IRT_U8, raddr, v, 0, 0, rsz);
+                    v = raddr;
+                }
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
                 irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, v, 0, 0, 0);
@@ -16629,6 +16703,7 @@ static void gen_stmt(void)
          * 就销毁），所以这里单独开一层深度。continue 不清理它，break 和循环正常
          * 结束要清理它（C 标准：离开作用域就跑 cleanup 函数）。 */
         DEF_DEPTH++;
+        blk_chain_push();
         if (!pa_accept_ch(';')) {
             if (is_typename_tok(pa_cur()))
                 gen_local_decl(1);
