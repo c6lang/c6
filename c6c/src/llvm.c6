@@ -651,15 +651,85 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
             ll_put(out, o->dst, t1);
             break;
         case IR_VASTART:
-            /* va_start 在函数入口已经发过（见上面 is_variadic 那段） */
-            break;
-        case IR_VAARG:
-            if (!f->is_variadic) {
-                fprintf(out, "  store i64 0, ptr %%s%u\n", (unsigned)o->dst);
-                break;
-            }
+            /* va_start 作用在**前端那个 va_list 对象**上（`va_list` 是
+             * `__c6c_va_elem[1]`，24 字节，形状就是 SysV 的）。以前这里啥都
+             * 不发、函数入口无条件对后端自己的 `%ap` 发一次，于是"把 va_list
+             * 传给别的函数"必然失效——`printf` → `vfprintf(ap)` 这条路上
+             * 上游 printf 打出来的数字全是 0（`printf("%d", 7)` 印 0，而同一个
+             * backend 里自己写 `va_arg` 的函数是好的）。 */
+            ll_get(out, o->a, a1, sizeof(a1));
             snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
-            fprintf(out, "  %s = va_arg ptr %%ap, i64\n", t1);
+            fprintf(out, "  %s = inttoptr i64 %s to ptr\n", t1, a1);
+            fprintf(out, "  call void @llvm.va_start.p0(ptr %s)\n", t1);
+            break;
+        case IR_VAARG: {
+            char ps[64] = {0};
+
+            /* 从**前端传进来的** va_list（o->a 是指向那 24 字节对象的指针）
+             * 里取，不是从后端入口那个 `%ap`。所以这里不能再看"当前函数自己
+             * 是不是变参"：`vfprintf(fmt, va_list ap)` 这种把 va_list 往下传
+             * 的函数自己不是变参，照样要能取——以前这一支直接写 0，
+             * `printf("%d", 7)` 于是印 0。 */
+            ll_get(out, o->a, a1, sizeof(a1));
+            snprintf(ps, sizeof(ps), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = inttoptr i64 %s to ptr\n", ps, a1);
+            /* 手写 SysV 的 va_arg，**不用 llvm.va_arg**：-O0 下它对"不是本
+             * 函数 alloca 出来的 va_list 指针"（比如调用者帧里那个对象，
+             * 我们只是把地址传进来）会退化成空指针，一取就段错误——
+             * `-O2` 恰好能绕过去，所以 `llc -O0`（验收用的就是它）+ 转发
+             * va_list 必崩。字段布局就是 SysV：
+             *   { u32 gp_offset, u32 fp_offset, void *overflow, void *reg_save }
+             * c6c 自己的约定是"变参一律走整型槽"（浮点按位模式进整型寄存器），
+             * 所以只走整型那一支。 */
+            {
+                char gs2[32] = {0}, op2[64] = {0}, gp2[32] = {0};
+                char rp2[64] = {0}, rs2[32] = {0}, of2[32] = {0};
+                char in2[64] = {0}, cd2[32] = {0}, va2[32] = {0};
+                char vb2[32] = {0}, vp2[32] = {0}, n8[32] = {0};
+                char ng2[32] = {0}, na2[64] = {0}, no2[32] = {0};
+                char os2[64] = {0};
+
+                snprintf(gs2, sizeof(gs2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = load i32, ptr %s\n", gs2, ps);
+                snprintf(op2, sizeof(op2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = getelementptr i8, ptr %s, i64 8\n", op2, ps);
+                snprintf(gp2, sizeof(gp2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = load ptr, ptr %s\n", gp2, op2);
+                snprintf(rp2, sizeof(rp2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = getelementptr i8, ptr %s, i64 16\n", rp2, ps);
+                snprintf(rs2, sizeof(rs2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = load ptr, ptr %s\n", rs2, rp2);
+                snprintf(of2, sizeof(of2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = zext i32 %s to i64\n", of2, gs2);
+                snprintf(in2, sizeof(in2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = getelementptr i8, ptr %s, i64 %s\n", in2, rs2, of2);
+                /* 还有整型寄存器槽可拿：gp_offset <= 40（40+8 = 48 = 寄存器区大小） */
+                snprintf(cd2, sizeof(cd2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = icmp ule i32 %s, 40\n", cd2, gs2);
+                /* 两个候选都先读出来：拿不到的那一支读的是栈上紧邻的位置，不越界 */
+                snprintf(va2, sizeof(va2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = load i64, ptr %s\n", va2, in2);
+                snprintf(vb2, sizeof(vb2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = load i64, ptr %s\n", vb2, gp2);
+                snprintf(vp2, sizeof(vp2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = select i1 %s, i64 %s, i64 %s\n",
+                        vp2, cd2, va2, vb2);
+                /* 推进状态：从寄存器区取就 gp_offset += 8，否则 gp_offset = 48
+                 * （后面再取都走溢出区）；溢出区的指针只在走溢出区时 +8。 */
+                snprintf(n8, sizeof(n8), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = add i32 %s, 8\n", n8, gs2);
+                snprintf(ng2, sizeof(ng2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = select i1 %s, i32 %s, i32 48\n", ng2, cd2, n8);
+                fprintf(out, "  store i32 %s, ptr %s\n", ng2, ps);
+                snprintf(na2, sizeof(na2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = getelementptr i8, ptr %s, i64 8\n", na2, gp2);
+                snprintf(no2, sizeof(no2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = select i1 %s, ptr %s, ptr %s\n", no2, cd2, gp2, na2);
+                snprintf(os2, sizeof(os2), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = getelementptr i8, ptr %s, i64 8\n", os2, ps);
+                fprintf(out, "  store ptr %s, ptr %s\n", no2, os2);
+                snprintf(t1, sizeof(t1), "%s", vp2);
+            }
             /* 取出的宽度按 type 收窄（和 C99 的 va_arg(t, uint64_t) 后再截断一致） */
             if (o->type == IRT_U8 || o->type == IRT_I8 || o->type == IRT_U16
                 || o->type == IRT_I16 || o->type == IRT_U32 || o->type == IRT_I32) {
@@ -678,6 +748,7 @@ static void llvm_emit_fn(IrFn *f, u32 func_sym)
                 ll_put(out, o->dst, t1);
             }
             break;
+        }
         case IR_SEXT:
         case IR_ZEXT:
         case IR_TRUNC:
