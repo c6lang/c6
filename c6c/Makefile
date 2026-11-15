@@ -39,7 +39,8 @@ RUNS   ?= 5
 SRCS := $(wildcard src/*.c6)
 
 .PHONY: all g2c-check tests1-check scoreboard build scan unit irtest hello ctest runflag testflag tcc-tests bench bench-c6c lint selfhost \
-        selftest stdtest test c99test c99suite llvmtest build-tcc fast check-all check-all-perf help
+        selftest stdtest test c99test c99suite llvmtest build-tcc fast check-all check-all-perf help \
+        objcheck ldcheck libc6c embedcheck
 
 all: build
 
@@ -140,6 +141,40 @@ testflag: $(BUILD)/c6c
 # tcc 上游 tests2 记分板（目标 3 的度量尺）
 tcc-tests: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c ./tests/tcc-tests2.sh -j $(JOBS)
+
+# -c：出 ET_REL 目标文件。单/多 TU 都真编、真用系统链接器链、真跑，
+# 再用 readelf 核对"外部调用是 PLT32 + UND、数据里的地址是 R_X86_64_64"。
+objcheck: $(BUILD)/c6c
+	@C6C=$(BUILD)/c6c ./tests/obj-check.sh
+
+# 库形态：把 c6c 编成能嵌进别人程序的编译器（src/embed.c6 的 c6_* API）。
+# 同一份源码，用 -DC6C_NO_MAIN 关掉 main()；lib/rt.c6 与 include/ 的绝对路径
+# 在编译期塞进去（库形态没有 argv[0] 可推，见 src/embed.c6）。
+LIBC6C_DEFS = -DC6_DEFAULT_RT='"$(abspath lib/rt.c6)"' -DC6_DEFAULT_INC='"$(abspath include)"'
+
+libc6c:
+	@mkdir -p $(BUILD)
+	$(HOSTCC) -x c $(HOSTCFLAGS) -fPIC $(LIBC6C_DEFS) -c -o $(BUILD)/libc6c.o src/c6c-lib.c6
+	ar rcs $(BUILD)/libc6c.a $(BUILD)/libc6c.o
+	$(HOSTCC) -x c $(HOSTCFLAGS) -fPIC -shared $(LIBC6C_DEFS) -o $(BUILD)/libc6c.so src/c6c-lib.c6
+	@echo "c6c: $(BUILD)/libc6c.a + $(BUILD)/libc6c.so（嵌入 API：include/c6lib.h）"
+
+# 嵌入 API 的回归：编一个宿主程序链上 libc6c，把 c6 源码编进内存里跑
+embedcheck: libc6c
+	@C6C_LIB=$(abspath $(BUILD)) C6C_INC=$(abspath include) ./tests/embed-check.sh
+
+# 库形态与安装契约：C6_ENABLE_TCC=OFF 的安装树 + find_package + pkgconf
+pkgcheck: libc6c
+	@./tests/pkgcheck.sh
+
+# 动态链接的回归：-Wl,--dynamic 出 DT_NEEDED libc.so.6 的可执行文件，真调 libc
+dyncheck: build
+	@C6C=$(abspath $(BUILD)/c6c) ./tests/dyn-check.sh
+
+# 自己的链接器（src/ld.c6）：.o → 可执行文件。纯自足的两个 .o、真实规模的
+# rt.o（564 条重定位）、构造函数顺序、跨 .o 的 TLS 记账格、缺符号报错。
+ldcheck: $(BUILD)/c6c
+	@C6C=$(BUILD)/c6c ./tests/ld-check.sh
 
 lint:
 	./scripts/lint.sh
@@ -287,8 +322,8 @@ llvmtest: $(BUILD)/c6c
 #   tests1-check  tcc 上游 tests/ 那批老式单文件用例
 # llvmtest 留在这里：26 s 换一条确定性的后端闸门（同一份语料 native vs LLVM）。
 # CMake 侧的 `cmake --build build --target fast` 就是这条（c6c 替换 c6 的快车道）。
-fast: lint unit irtest hello ctest runflag testflag tests2-check tests1-check c99suite llvmtest
-	@echo "c6c: fast 通过（快速门禁 ≈40 s：前端/IR/ELF 骨架 + -run/-test + 外部语料 c99suite / 上游 tests1·tests2 + LLVM 后端对齐）"
+fast: lint unit irtest hello ctest runflag testflag objcheck ldcheck dyncheck embedcheck pkgcheck tests2-check tests1-check c99suite llvmtest
+	@echo "c6c: fast 通过（快速门禁 ≈40 s：前端/IR/ELF 骨架 + -run/-test/-c/链接 + 外部语料 c99suite / 上游 tests1·tests2 + LLVM 后端对齐）"
 
 # 验收（1）(2) (3)：功能面。跑分不在里面——验收（4）那几条硬指标（自编译
 # ≤100 ms、峰值 RSS ≤32 MB、4x 输入 ≤2.6x）随时可能因为机器负载抖动，
@@ -298,8 +333,8 @@ fast: lint unit irtest hello ctest runflag testflag tests2-check tests1-check c9
 # CI 红了至少能一眼看出是不是后端真的坏了。
 # 上游 tests1/tests2 两条闸门不在这个依赖里（它们是独立的记分板入口），
 # CMake 侧 `cmake --build build --target check-all-c6c` 会把它们一起跑完。
-check-all: unit irtest hello ctest runflag testflag selfhost selftest stdtest diagtest c99test c99suite llvmtest test build-tcc
-	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 语言层 C99 外部闸门 / 能编出 tcc）"
+check-all: unit irtest hello ctest runflag testflag objcheck ldcheck dyncheck embedcheck pkgcheck selfhost selftest stdtest diagtest c99test c99suite llvmtest test build-tcc
+	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / ET_REL + 链接器 + 动态链接 + 嵌入库 / 语言层 C99 外部闸门 / 能编出 tcc）"
 
 # 验收（4）：性能与内存硬指标（门槛在 bench/thresholds.json）
 check-all-perf: check-all bench-c6c

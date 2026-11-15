@@ -77,6 +77,37 @@ if(EXISTS "${C6C_DIR}/Makefile")
   endif()
   set_target_properties(c6c PROPERTIES
     ADDITIONAL_CLEAN_FILES "${C6C_BIN}")
+
+  # 库形态：同一份源码（src/c6c-lib.c6，用 -DC6C_NO_MAIN 关掉 main()）编成
+  # libc6c.a / libc6c.so，导出 c6_* 那套嵌入 API 和 tcc_* 兼容层。
+  # 它**不是** libtcc：不链接 tcc、不 include tcc 的头，只是把同一类能力
+  # （把编译器嵌进宿主程序）用 c6c 自己的实现提供出来。
+  set(C6C_LIB_A "${C6C_DIR}/build/libc6c.a")
+  set(C6C_LIB_SO "${C6C_DIR}/build/libc6c.so")
+  add_custom_command(
+    OUTPUT "${C6C_LIB_A}" "${C6C_LIB_SO}"
+    COMMAND ${_c6c_make_cmd} -C "${C6C_DIR}" libc6c
+            "HOSTCC=${CMAKE_C_COMPILER}" "BUILD=build"
+    DEPENDS ${C6C_SRCS} "${C6C_DIR}/Makefile"
+    COMMENT "c6c: 编出嵌入库 libc6c.a / libc6c.so（宿主 C 编译器，-DC6C_NO_MAIN）"
+    VERBATIM)
+  add_custom_target(c6c-lib ALL DEPENDS "${C6C_LIB_A}" "${C6C_LIB_SO}")
+
+  if(C6_INSTALL_C6LIB)
+    install(FILES "${C6C_DIR}/include/c6lib.h"
+            DESTINATION "${C6_INCLUDEDIR_REL}")
+    install(FILES "${C6C_LIB_A}"
+            DESTINATION "${C6_LIBDIR_REL}")
+    install(PROGRAMS "${C6C_LIB_SO}"
+            DESTINATION "${C6_LIBDIR_REL}")
+    # tcc 的嵌入 API 兼容头：装的时候用它的标准名，原本用 tcc 的程序不用改。
+    # 只在**没有 tcc** 的时候装——两个都装会抢同一个 libtcc.h。
+    if(NOT C6_ENABLE_TCC)
+      install(FILES "${C6C_DIR}/include/tcc-compat.h"
+              DESTINATION "${C6_INCLUDEDIR_REL}"
+              RENAME "libtcc.h")
+    endif()
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

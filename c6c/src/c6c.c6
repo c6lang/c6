@@ -51,4 +51,7 @@ typedef int64_t i64;
 #include "sym.c6"
 #include "parse.c6"
 #include "llvm.c6"
+#include "obj.c6"
+#include "ld.c6"
 #include "main.c6"
+#include "embed.c6"

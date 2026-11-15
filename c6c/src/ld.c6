@@ -1,0 +1,1572 @@
+/* ld.c6 —— 静态链接器：把若干个 ET_REL 目标文件拼成一个能跑的 ET_EXEC。
+ *
+ * 为什么自己写：`.o` 出来以后，"最后一步"以前一直借系统 cc 的链接器。tcc 的
+ * 产品位里这一步是自己的（tcc 自己落 PLT/GOT、自己写 ehdr/phdr），c6c 要顶
+ * 上去就得有一份——而且 c6c 单镜像模式的布局知识（代码在低地址、数据在后、
+ * 入口是合成的 _start）本来就够用，缺的只是"把别人的 .o 读回来"。
+ *
+ * 能力边界（这一版是**静态**链接）：
+ *   * 输入：ELF64 ET_REL，机器码字段按 x86-64 解释；c6c 自己出的 .o 与
+ *     gcc/cc -c 出的简单 C 目标文件都能吃。
+ *   * 归并的输出段：.text / .rodata(.rodata.*) / .data(.data.*) / .bss /
+ *     .init_array / .fini_array；其余（.comment / .note 系列 / .eh_frame /
+ *     .debug 系列）丢掉。
+ *   * 重定位：R_X86_64_64 / PC32 / PLT32 / 32 / 32S，越界报错，不静默截断。
+ *   * 符号：本地（STB_LOCAL）在各自 .o 内可见；全局按名字解析，强定义覆盖
+ *     弱定义，两个强定义报错；未定义符号默认**硬报错**，开了
+ *     -Wl,--allow-undefined 才按 0 处理并打一条汇总警告。
+ *   * 入口：合成 `_start`——取 argc/argv/envp、依次跑 .init_array、调 main、
+ *     跑 .fini_array、syscall 60 退出（退出码 = main 返回值）。
+ *   * 不做：动态链接（DT_NEEDED / PLT / GOT）、TLS 段、`.a` 静态库、
+ *     --gc-sections、符号版本、-shared/-fPIC、重定位到调试信息。
+ *     这些是硬缺口②（动态链接 + 可嵌入的编译库）的事，见 docs/todo.md。
+ *
+ * 两个容易踩的线，改的时候留意：
+ *   1. 文件偏移与虚拟地址**恒等映射**（VA = 基址 + 偏移）：PT_LOAD 的
+ *      p_offset % 0x1000 == p_vaddr % 0x1000 才成立，别单独挪一段的偏移。
+ *   2. call 的 rel32 是相对**字段末尾**的：算位移时 P 要加 4（lea/rip 相对
+ *      的 disp32 同理）。这一条错了整个程序会跳飞，症状还特别像"符号解析错了"。
+ */
+
+#define LD_MAXOBJ 64
+
+/* 输出的"段"编号（不是 ELF 段号，是归并目标） */
+#define LDO_NONE   0
+#define LDO_TEXT   1
+#define LDO_RODATA 2
+#define LDO_DATA   3
+#define LDO_BSS    4
+#define LDO_INIT   5
+#define LDO_FINI   6
+
+/* ELF 常量（obj.c6 里那套是写出侧的，这里补读入侧用到的） */
+#define LD_SHT_RELA       4u
+#define LD_SHT_NOBITS     8u
+#define LD_SHT_INIT_ARRAY 14u
+#define LD_SHT_FINI_ARRAY 15u
+#define LD_SHF_ALLOC      0x2u
+#define LD_SHF_EXEC       0x4u
+#define LD_STB_LOCAL      0u
+#define LD_STB_GLOBAL     1u
+#define LD_STB_WEAK       2u
+#define LD_SHN_UNDEF      0u
+#define LD_SHN_ABS        0xfff1u
+#define LD_SHN_COMMON     0xfff2u
+#define LD_R_64           1u
+#define LD_R_PC32         2u
+#define LD_R_PLT32        4u
+#define LD_R_32           10u
+#define LD_R_32S          11u
+#define LD_BASE_VA        0x400000u
+#define LD_PAGE           0x1000u
+#define LD_EHDR           64u
+#define LD_PHDR           56u
+#define LD_NPHDR          3u
+
+static u32 LD_NPH = 3u;   /* 程序头个数：静态 3 个，动态链接 5 个 */
+
+/* 动态链接（-Wl,--dynamic）的开关与导入表：具体实现见下面"动态链接"那一段，
+ * 但重定位阶段（ld_relocate_all）就要用它，所以在文件顶部先声明。 */
+#define LD_MAXIMP 512
+static int LD_DYN;
+static void ld_set_dynamic(int on) { LD_DYN = on; }
+static const char *LD_IMPN[LD_MAXIMP];
+static u32 LD_NIMP;
+static u32 ld_dyn_lookup(const char *name);
+static u64 ld_dyn_plt(const char *name);
+
+static int LD_ALLOW_UNDEF;      /* -Wl,--allow-undefined：未定义符号按 0 处理 */
+static u32 LD_NUNDEF;           /* 按 0 处理掉的未定义符号个数 */
+static char LD_UNDEF_NAMES[256];/* 前几个名字（汇总警告里列出来） */
+
+static void ld_set_allow_undef(int on) { LD_ALLOW_UNDEF = on; }
+
+/* ---- 小工具：从映像里按小端读字段（不假设对齐，输入文件是任意字节流） ---- */
+static u16 ld_rd16(const u8 *p, u32 off) { return (u16)(p[off] | ((u16)p[off + 1] << 8)); }
+
+static u32 ld_rd32(const u8 *p, u32 off)
+{
+    return (u32)p[off] | ((u32)p[off + 1] << 8) | ((u32)p[off + 2] << 16)
+           | ((u32)p[off + 3] << 24);
+}
+
+static u64 ld_rd64(const u8 *p, u32 off)
+{
+    u64 lo = ld_rd32(p, off);
+    u64 hi = ld_rd32(p, off + 4);
+
+    return lo | (hi << 32);
+}
+
+static void ld_wr32(u8 *p, u32 off, u32 v)
+{
+    p[off] = (u8)v;
+    p[off + 1] = (u8)(v >> 8);
+    p[off + 2] = (u8)(v >> 16);
+    p[off + 3] = (u8)(v >> 24);
+}
+
+static void ld_wr64(u8 *p, u32 off, u64 v)
+{
+    ld_wr32(p, off, (u32)v);
+    ld_wr32(p, off + 4, (u32)(v >> 32));
+}
+
+/* ---- 输入目标文件 ---- */
+typedef struct LdObj {
+    char path[512];
+    u8 *img;
+    u32 len;
+    u32 shoff;
+    u32 shnum;
+    u32 shstrndx;
+    u32 symtab;                 /* .symtab 段下标（0 = 没有） */
+    u32 strtab;                 /* 关联的 .strtab */
+    u32 nsym;
+    u64 *sec_off;               /* 各输入段在自己输出段里的起点 */
+    u8 *sec_out;                /* 各输入段归到哪个输出段 */
+    u32 *symmap;                /* 本 .o 的符号下标 → 全局符号 id + 1（0 = 不是全局） */
+} LdObj;
+
+/* ---- 全局符号表 ---- */
+typedef struct LdGSym {
+    const char *name;
+    int obj;                    /* 定义所在对象（-1 = 还没人定义） */
+    u32 shndx;                  /* 定义所在输入段 */
+    u64 value;                  /* 段内偏移（或 ABS 的绝对值） */
+    u8 bind;                    /* STB_GLOBAL / STB_WEAK */
+    u8 type;                    /* STT_FUNC / STT_OBJECT / STT_NOTYPE */
+    u8 defined;
+    u8 used;                    /* 有没有被引用过（引用但没人定义 → 报错） */
+} LdGSym;
+
+static LdObj LD_O[LD_MAXOBJ];
+static int LD_NOBJ;
+static LdGSym *LD_G;
+static u32 LD_NG;
+static u32 LD_CG;
+
+/* 归并缓冲区 */
+static ObjBuf LD_TEXT;
+static ObjBuf LD_RO;
+static ObjBuf LD_DATA;
+static ObjBuf LD_INIT;
+static ObjBuf LD_FINI;
+static u64 LD_BSS;
+static u64 LD_BSS_ALIGN = 8;
+
+/* 各归并段最终的起始虚拟地址 */
+static u64 LD_VA_TEXT;
+static u64 LD_VA_RO;
+static u64 LD_VA_DATA;
+static u64 LD_VA_INIT;
+static u64 LD_VA_FINI;
+static u64 LD_VA_BSS;
+
+/* ---- 符号表管理 ---- */
+static u32 ld_gfind(const char *name, int create)
+{
+    u32 i = 0;
+
+    for (i = 0; i < LD_NG; i++)
+        if (strcmp(LD_G[i].name, name) == 0)
+            return i;
+    if (!create)
+        return 0xffffffffu;
+    if (LD_NG == LD_CG) {
+        u32 nc = LD_CG ? LD_CG * 2u : 256u;
+        LdGSym *ng = (LdGSym *)calloc(nc, sizeof(LdGSym));
+
+        if (!ng)
+            return 0xffffffffu;
+        if (LD_G) {
+            memcpy(ng, LD_G, (size_t)LD_NG * sizeof(LdGSym));
+            free(LD_G);
+        }
+        LD_G = ng;
+        LD_CG = nc;
+    }
+    memset(&LD_G[LD_NG], 0, sizeof(LdGSym));
+    LD_G[LD_NG].name = name;
+    LD_G[LD_NG].obj = -1;
+    LD_G[LD_NG].bind = LD_STB_GLOBAL;
+    return LD_NG++;
+}
+
+/* 把一个定义塞进全局符号表：强的覆盖弱的，两个强的报重复定义。 */
+static int ld_gdefine(u32 g, int obj, u32 shndx, u64 value, u8 bind)
+{
+    LdGSym *s = &LD_G[g];
+
+    if (!s->defined) {
+        s->obj = obj;
+        s->shndx = shndx;
+        s->value = value;
+        s->bind = bind;
+        s->defined = 1;
+        return 0;
+    }
+    if (s->bind == LD_STB_WEAK && bind == LD_STB_GLOBAL) {
+        s->obj = obj;
+        s->shndx = shndx;
+        s->value = value;
+        s->bind = bind;
+        return 0;
+    }
+    if (bind == LD_STB_WEAK)
+        return 0;               /* 已有的强定义留着 */
+    fprintf(stderr, "c6c: 重复定义 '%s'（%s 与 %s）\n", s->name,
+            s->obj >= 0 ? LD_O[s->obj].path : "?", LD_O[obj].path);
+    return 1;
+}
+
+/* ---- 读一个目标文件 ---- */
+static int ld_load(LdObj *o, const char *path)
+{
+    FILE *f = NULL;
+    long sz = 0;
+
+    memset(o, 0, sizeof(*o));
+    if (strlen(path) >= sizeof(o->path)) {
+        fprintf(stderr, "c6c: 路径太长：%s\n", path);
+        return 1;
+    }
+    strcpy(o->path, path);
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "c6c: 打不开 %s\n", path);
+        return 1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) <= 0) {
+        fprintf(stderr, "c6c: %s 不是有效文件\n", path);
+        fclose(f);
+        return 1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return 1;
+    }
+    o->img = (u8 *)malloc((size_t)sz);
+    if (!o->img) {
+        fclose(f);
+        return 1;
+    }
+    if (fread(o->img, 1, (size_t)sz, f) != (size_t)sz) {
+        fprintf(stderr, "c6c: 读 %s 不完整\n", path);
+        fclose(f);
+        return 1;
+    }
+    fclose(f);
+    o->len = (u32)sz;
+
+    if (o->len < LD_EHDR || o->img[0] != 0x7f || o->img[1] != 'E' || o->img[2] != 'L'
+        || o->img[3] != 'F') {
+        fprintf(stderr, "c6c: %s 不是 ELF\n", path);
+        return 1;
+    }
+    if (o->img[4] != 2) {
+        fprintf(stderr, "c6c: %s 不是 ELF64（这一版只认 64 位）\n", path);
+        return 1;
+    }
+    if (ld_rd16(o->img, 16) != 1) {
+        fprintf(stderr, "c6c: %s 不是可重定位文件（e_type=%u）\n", path,
+                (unsigned)ld_rd16(o->img, 16));
+        return 1;
+    }
+    if (ld_rd16(o->img, 18) != 0x3e) {
+        fprintf(stderr, "c6c: %s 的机器类型不是 x86-64（e_machine=0x%x）\n", path,
+                (unsigned)ld_rd16(o->img, 18));
+        return 1;
+    }
+    o->shoff = ld_rd32(o->img, 40);
+    o->shnum = ld_rd16(o->img, 60);
+    o->shstrndx = ld_rd16(o->img, 62);
+    if (o->shnum && o->shoff + (u32)o->shnum * 64u > o->len) {
+        fprintf(stderr, "c6c: %s 的段表越界\n", path);
+        return 1;
+    }
+    o->sec_off = (u64 *)calloc(o->shnum ? o->shnum : 1, sizeof(u64));
+    o->sec_out = (u8 *)calloc(o->shnum ? o->shnum : 1, 1);
+    if (!o->sec_off || !o->sec_out) {
+        fprintf(stderr, "c6c: 内存不足（%s）\n", path);
+        return 1;
+    }
+    /* 找出 .symtab / .strtab */
+    {
+        u32 i = 0;
+
+        for (i = 0; i < o->shnum; i++) {
+            u32 base = o->shoff + i * 64u;
+            u32 ty = ld_rd32(o->img, base + 4);
+
+            if (ty == 2 && !o->symtab) {
+                o->symtab = i;
+                o->strtab = ld_rd32(o->img, base + 40);
+                o->nsym = (u32)(ld_rd64(o->img, base + 32) / 24u);
+            }
+        }
+    }
+    o->symmap = (u32 *)calloc(o->nsym ? o->nsym : 1, sizeof(u32));
+    if (!o->symmap) {
+        fprintf(stderr, "c6c: 内存不足（%s）\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+/* 输入段的类型/标志/名字（段名在 .shstrtab 里） */
+static const char *ld_sec_name(LdObj *o, u32 i)
+{
+    u32 base = o->shoff + i * 64u;
+    u32 noff = ld_rd32(o->img, base);
+    u32 sbase = 0;
+
+    if (!o->shstrndx || o->shstrndx >= o->shnum)
+        return "";
+    sbase = o->shoff + o->shstrndx * 64u;
+    {
+        u32 soff = (u32)ld_rd64(o->img, sbase + 24);
+
+        return (const char *)(o->img + soff + noff);
+    }
+}
+
+/* 段名 → 归并目标 */
+static int ld_sec_class(LdObj *o, u32 i)
+{
+    u32 base = o->shoff + i * 64u;
+    u32 ty = ld_rd32(o->img, base + 4);
+    u64 flags = ld_rd64(o->img, base + 8);
+    const char *nm = ld_sec_name(o, i);
+
+    if (ty == LD_SHT_INIT_ARRAY || strcmp(nm, ".init_array") == 0)
+        return LDO_INIT;
+    if (ty == LD_SHT_FINI_ARRAY || strcmp(nm, ".fini_array") == 0)
+        return LDO_FINI;
+    if (!(flags & LD_SHF_ALLOC))
+        return LDO_NONE;                /* .comment/.note/.debug/.eh_frame 都在这 */
+    if (flags & LD_SHF_EXEC)
+        return LDO_TEXT;
+    if (ty == LD_SHT_NOBITS)
+        return LDO_BSS;
+    if (strcmp(nm, ".rodata") == 0 || strncmp(nm, ".rodata.", 8) == 0)
+        return LDO_RODATA;
+    if (strncmp(nm, ".text", 5) == 0)
+        return LDO_TEXT;
+    if (strncmp(nm, ".data", 5) == 0)
+        return LDO_DATA;
+    if (strncmp(nm, ".bss", 4) == 0)
+        return LDO_BSS;
+    if (strncmp(nm, ".tdata", 6) == 0 || strncmp(nm, ".tbss", 5) == 0)
+        return LDO_NONE;                /* TLS 段这一版不支持 */
+    return LDO_NONE;
+}
+
+static ObjBuf *ld_out_buf(int cls)
+{
+    if (cls == LDO_TEXT)
+        return &LD_TEXT;
+    if (cls == LDO_RODATA)
+        return &LD_RO;
+    if (cls == LDO_DATA)
+        return &LD_DATA;
+    if (cls == LDO_INIT)
+        return &LD_INIT;
+    if (cls == LDO_FINI)
+        return &LD_FINI;
+    return NULL;
+}
+
+static u64 ld_align_up(u64 v, u64 a)
+{
+    if (a <= 1)
+        return v;
+    return (v + a - 1u) / a * a;
+}
+
+/* 把各输入段拷进归并缓冲区（第一遍：定布局、记段内起点） */
+static int ld_layout_inputs(void)
+{
+    int k = 0;
+
+    for (k = 0; k < LD_NOBJ; k++) {
+        LdObj *o = &LD_O[k];
+        u32 i = 0;
+
+        for (i = 1; i < o->shnum; i++) {
+            u32 base = o->shoff + i * 64u;
+            u32 ty = ld_rd32(o->img, base + 4);
+            u64 flags = ld_rd64(o->img, base + 8);
+            u32 off = (u32)ld_rd64(o->img, base + 24);
+            u64 size = ld_rd64(o->img, base + 32);
+            u64 al = ld_rd64(o->img, base + 48);
+            int cls = ld_sec_class(o, i);
+            ObjBuf *b = ld_out_buf(cls);
+
+            o->sec_out[i] = (u8)cls;
+            if (cls == LDO_NONE)
+                continue;
+            if (al == 0 || al > 4096)
+                al = (flags & LD_SHF_EXEC) ? 16 : 8;
+            if (cls == LDO_BSS) {
+                LD_BSS = ld_align_up(LD_BSS, al);
+                o->sec_off[i] = LD_BSS;
+                LD_BSS += size;
+                if (al > LD_BSS_ALIGN)
+                    LD_BSS_ALIGN = al;
+                continue;
+            }
+            if (size && (u64)off + size > (u64)o->len) {
+                fprintf(stderr, "c6c: %s 的段 %u 越界\n", o->path, (unsigned)i);
+                return 1;
+            }
+            ob_align(b, (u32)(al > 16 ? 16 : al));
+            o->sec_off[i] = b->n;
+            if (size) {
+                if (ty == LD_SHT_NOBITS)
+                    ob_zero(b, (u32)size);
+                else
+                    ob_copy(b, o->img + off, (u32)size);
+            }
+        }
+    }
+    return 0;
+}
+
+/* 收集全局符号（第二遍） */
+static int ld_collect_symbols(void)
+{
+    int k = 0;
+
+    for (k = 0; k < LD_NOBJ; k++) {
+        LdObj *o = &LD_O[k];
+        u32 i = 0;
+        const char *str = NULL;
+        u32 symoff = 0;
+
+        if (!o->symtab || !o->nsym || o->strtab >= o->shnum)
+            continue;
+        symoff = (u32)ld_rd64(o->img, o->shoff + o->symtab * 64u + 24);
+        str = (const char *)(o->img + ld_rd64(o->img, o->shoff + o->strtab * 64u + 24));
+        for (i = 0; i < o->nsym; i++) {
+            u32 sb = symoff + i * 24u;
+            u8 info = o->img[sb + 4];
+            u8 bind = (u8)(info >> 4);
+            u32 noff = ld_rd32(o->img, sb);
+            u16 shndx = ld_rd16(o->img, sb + 6);
+            u64 value = ld_rd64(o->img, sb + 8);
+            const char *nm = str + noff;
+            u32 g = 0;
+            int rc = 0;
+
+            if (bind == LD_STB_LOCAL || !nm[0])
+                continue;
+            g = ld_gfind(nm, 1);
+            if (g == 0xffffffffu) {
+                fprintf(stderr, "c6c: 符号表满了（%s）\n", o->path);
+                return 1;
+            }
+            if (!LD_G[g].type || LD_G[g].type == 0u)
+                LD_G[g].type = (u8)(info & 0x0fu);
+            o->symmap[i] = g + 1u;
+            if (!nm[0])
+                continue;
+            if (shndx == LD_SHN_UNDEF)
+                continue;               /* 引用：等别人定义 */
+            if (shndx == LD_SHN_ABS) {
+                if (LD_G[g].defined)
+                    continue;
+                LD_G[g].obj = k;
+                LD_G[g].shndx = shndx;
+                LD_G[g].value = value;
+                LD_G[g].bind = bind;
+                LD_G[g].defined = 1;
+                continue;
+            }
+            if (shndx == LD_SHN_COMMON) {
+                /* 常见符号（-fcommon 的暂定定义）：按 BSS 里的格子处理 */
+                u64 al = value;
+
+                if (al == 0 || al > 4096)
+                    al = 8;
+                LD_BSS = ld_align_up(LD_BSS, al);
+                if (LD_G[g].defined)
+                    continue;
+                LD_G[g].obj = k;
+                LD_G[g].shndx = LD_SHN_ABS;
+                LD_G[g].value = 0;      /* 全零的常见符号：地址稍后补 */
+                LD_G[g].bind = bind;
+                LD_G[g].defined = 1;
+                continue;
+            }
+            if (shndx >= o->shnum) {
+                fprintf(stderr, "c6c: %s 的符号 '%s' 段号越界（%u）\n", o->path, nm,
+                        (unsigned)shndx);
+                return 1;
+            }
+            rc = ld_gdefine(g, k, shndx, value, bind);
+            if (rc)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* 符号地址：本地符号按本 .o 的段起点算，全局按解析出来的定义算 */
+static u64 ld_gsym_addr(u32 g)
+{
+    LdGSym *s = &LD_G[g];
+    LdObj *o = NULL;
+
+    if (!s->defined)
+        return 0;
+    if (s->shndx == LD_SHN_ABS)
+        return s->value;
+    o = &LD_O[s->obj];
+    if (s->shndx >= o->shnum)
+        return 0;
+    switch (o->sec_out[s->shndx]) {
+    case LDO_TEXT:
+        return LD_VA_TEXT + o->sec_off[s->shndx] + s->value;
+    case LDO_RODATA:
+        return LD_VA_RO + o->sec_off[s->shndx] + s->value;
+    case LDO_DATA:
+        return LD_VA_DATA + o->sec_off[s->shndx] + s->value;
+    case LDO_INIT:
+        return LD_VA_INIT + o->sec_off[s->shndx] + s->value;
+    case LDO_FINI:
+        return LD_VA_FINI + o->sec_off[s->shndx] + s->value;
+    case LDO_BSS:
+        return LD_VA_BSS + o->sec_off[s->shndx] + s->value;
+    default:
+        return 0;
+    }
+}
+
+static u64 ld_sym_addr(LdObj *o, u32 symidx)
+{
+    u32 symoff = (u32)ld_rd64(o->img, o->shoff + o->symtab * 64u + 24);
+    u32 sb = symoff + symidx * 24u;
+    u8 info = o->img[sb + 4];
+    u8 bind = (u8)(info >> 4);
+    u16 shndx = ld_rd16(o->img, sb + 6);
+    u64 value = ld_rd64(o->img, sb + 8);
+
+    if (symidx == 0)
+        return 0;
+    if (bind == LD_STB_LOCAL) {
+        if (shndx == LD_SHN_ABS)
+            return value;
+        if (shndx >= o->shnum)
+            return 0;
+        switch (o->sec_out[shndx]) {
+        case LDO_TEXT:
+            return LD_VA_TEXT + o->sec_off[shndx] + value;
+        case LDO_RODATA:
+            return LD_VA_RO + o->sec_off[shndx] + value;
+        case LDO_DATA:
+            return LD_VA_DATA + o->sec_off[shndx] + value;
+        case LDO_INIT:
+            return LD_VA_INIT + o->sec_off[shndx] + value;
+        case LDO_FINI:
+            return LD_VA_FINI + o->sec_off[shndx] + value;
+        case LDO_BSS:
+            return LD_VA_BSS + o->sec_off[shndx] + value;
+        default:
+            return 0;
+        }
+    }
+    if (o->symmap[symidx])
+        return ld_gsym_addr(o->symmap[symidx] - 1u);
+    return 0;
+}
+
+/* 某个输入段在最终地址空间里的起点 */
+static u64 ld_sec_va(LdObj *o, u32 shndx)
+{
+    if (shndx >= o->shnum)
+        return 0;
+    switch (o->sec_out[shndx]) {
+    case LDO_TEXT:
+        return LD_VA_TEXT + o->sec_off[shndx];
+    case LDO_RODATA:
+        return LD_VA_RO + o->sec_off[shndx];
+    case LDO_DATA:
+        return LD_VA_DATA + o->sec_off[shndx];
+    case LDO_INIT:
+        return LD_VA_INIT + o->sec_off[shndx];
+    case LDO_FINI:
+        return LD_VA_FINI + o->sec_off[shndx];
+    case LDO_BSS:
+        return LD_VA_BSS + o->sec_off[shndx];
+    default:
+        return 0;
+    }
+}
+
+/* 应用一个重定位。where 是归并缓冲区的字节，woff 是"这条重定位在输出段里
+ * 的位置"，P 是它最终的虚拟地址。 */
+static int ld_apply(u8 *where, u32 woff, u64 P, u32 type, u64 S, i64 A, const char *what)
+{
+    switch (type) {
+    case LD_R_64:
+        ld_wr64(where, woff, S + (u64)A);
+        return 0;
+    case LD_R_PC32:
+    case LD_R_PLT32: {
+        i64 d = (i64)S + A - (i64)P;
+
+        if (d < -2147483648LL || d > 2147483647LL) {
+            fprintf(stderr, "c6c: 重定位越界（PC32，%s）：位移 %lld\n", what,
+                    (long long)d);
+            return 1;
+        }
+        ld_wr32(where, woff, (u32)(i64)d);
+        return 0;
+    }
+    case LD_R_32:
+        ld_wr32(where, woff, (u32)(S + (u64)A));
+        return 0;
+    case LD_R_32S: {
+        i64 v = (i64)S + A;
+
+        if (v < -2147483648LL || v > 2147483647LL) {
+            fprintf(stderr, "c6c: 重定位越界（32S，%s）：值 %lld\n", what, (long long)v);
+            return 1;
+        }
+        ld_wr32(where, woff, (u32)(i64)v);
+        return 0;
+    }
+    default:
+        fprintf(stderr, "c6c: 不支持的重定位类型 %u（%s）\n", (unsigned)type, what);
+        return 1;
+    }
+}
+
+/* 遍历所有 .rela.*：把引用落到归并缓冲区的字节上 */
+static int ld_relocate_all(void)
+{
+    int k = 0;
+
+    for (k = 0; k < LD_NOBJ; k++) {
+        LdObj *o = &LD_O[k];
+        u32 i = 0;
+
+        for (i = 1; i < o->shnum; i++) {
+            u32 base = o->shoff + i * 64u;
+            u32 ty = ld_rd32(o->img, base + 4);
+            u32 info = ld_rd32(o->img, base + 44);
+            u64 sz = ld_rd64(o->img, base + 32);
+            u32 roff = (u32)ld_rd64(o->img, base + 24);
+            ObjBuf *b = NULL;
+            u8 *where = NULL;
+            u64 tva = 0;
+            u32 n = (u32)(sz / 24u);
+            u32 j = 0;
+
+            if (ty != LD_SHT_RELA)
+                continue;
+            if (info >= o->shnum)
+                continue;
+            b = ld_out_buf(o->sec_out[info]);
+            if (!b)
+                continue;               /* 目标段被丢了：这条重定位一并放弃 */
+            where = b->p;
+            tva = ld_sec_va(o, info);
+            for (j = 0; j < n; j++) {
+                u32 rb = roff + j * 24u;
+                u64 off = ld_rd64(o->img, rb);
+                u64 ri = ld_rd64(o->img, rb + 8);
+                u32 sym = (u32)(ri >> 32);
+                u32 rtype = (u32)(ri & 0xffffffffu);
+                i64 addend = (i64)ld_rd64(o->img, rb + 16);
+                u64 S = 0;
+                u64 woff = 0;
+
+                /* r_offset 是**输入段内**的偏移：落到输出缓冲区时要加上
+                 * 这一段在归并段里的起点，算 P（字段地址）时同理。以前漏了
+                 * 这一步，重定位写在别的函数头上——症状是 SIGILL。 */
+                woff = (u64)o->sec_off[info] + off;
+                if (woff + 8u > (u64)b->n) {
+                    fprintf(stderr, "c6c: %s 的重定位越界（段 %u 偏移 %llu）\n", o->path,
+                            (unsigned)i, (unsigned long long)off);
+                    return 1;
+                }
+                if (sym >= o->nsym) {
+                    fprintf(stderr, "c6c: %s 的重定位符号下标越界（%u）\n", o->path,
+                            (unsigned)sym);
+                    return 1;
+                }
+                if (sym && o->symmap[sym] && !LD_G[o->symmap[sym] - 1u].defined) {
+                    LD_G[o->symmap[sym] - 1u].used = 1;
+                    /* 动态链接：函数走 PLT 桩子（地址在 ld_dyn_plt 里算好），
+                     * 数据符号这一版不导入（见文件头注释），仍按 0 处理。 */
+                    if (LD_DYN && ld_dyn_lookup(LD_G[o->symmap[sym] - 1u].name) != 0xffffffffu) {
+                        S = ld_dyn_plt(LD_G[o->symmap[sym] - 1u].name);
+                        if (ld_apply(where, (u32)woff, tva + off, rtype, S, addend, o->path))
+                            return 1;
+                        continue;
+                    }
+                    /* 动态链接下的数据符号：这一版不做 COPY 重定位，按 0 处理
+                     * （ld_dyn_collect 已经把名字数进警告里了），不在这里报错 */
+                    if (LD_DYN) {
+                        if (ld_apply(where, (u32)woff, tva + off, rtype, 0, addend, o->path))
+                            return 1;
+                        continue;
+                    }
+                    if (!LD_ALLOW_UNDEF) {
+                        fprintf(stderr, "c6c: 未定义的符号 '%s'（%s 在 %s 里引用）\n",
+                                LD_G[o->symmap[sym] - 1u].name,
+                                ld_sec_name(o, i), o->path);
+                        return 1;
+                    }
+                    if (LD_NUNDEF < 6u) {
+                        if (LD_NUNDEF)
+                            strncat(LD_UNDEF_NAMES, " ",
+                                    sizeof(LD_UNDEF_NAMES) - strlen(LD_UNDEF_NAMES) - 1u);
+                        strncat(LD_UNDEF_NAMES, LD_G[o->symmap[sym] - 1u].name,
+                                sizeof(LD_UNDEF_NAMES) - strlen(LD_UNDEF_NAMES) - 1u);
+                    }
+                    LD_NUNDEF++;
+                }
+                S = ld_sym_addr(o, sym);
+                if (ld_apply(where, (u32)woff, tva + off, rtype, S, addend, o->path))
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---- 合成的 _start ----
+ * 逐条列出来，省得以后有人对着字节猜：
+ *   48 8B 3C 24           mov  rdi, [rsp]        argc
+ *   48 8D 74 24 08        lea  rsi, [rsp+8]      argv
+ *   48 89 F8              mov  rax, rdi
+ *   48 8D 54 24 08        lea  rdx, [rsp+8]      p = argv
+ * L: 48 85 C0            test rax, rax
+ *   74 09                 jz   D
+ *   48 83 C2 08           add  rdx, 8
+ *   48 FF C8              dec  rax
+ *   EB F2                 jmp  L
+ * D: 48 83 C2 08         add  rdx, 8             envp = argv + 8*(argc+1)
+ *   <每个构造函数一条 E8 rel32>
+ *   E8 rel32              call main
+ *   48 89 C3              mov  rbx, rax          先把 main 的返回值存起来
+ *   <每个析构函数一条 E8 rel32，倒序>
+ *   48 89 DF              mov  rdi, rbx
+ *   B8 3C 00 00 00        mov  eax, 60
+ *   0F 05                 syscall
+ *   F4                    hlt
+ * 栈对齐：进程入口 rsp 是 16 字节对齐的，call 压 8 字节后进入函数时
+ * rsp%16==8——SysV 要求的正是这个。
+ */
+static u32 ld_stub_off;                 /* _start 在 .text 里的偏移 */
+static u32 ld_stub_nctor;
+static u32 ld_stub_nctor_off;           /* 第一处 call 的 rel32 字段偏移 */
+static u32 ld_stub_main_field;
+static u32 ld_stub_ndtor;
+static u32 ld_stub_ndtor_off;
+
+static void ld_emit_stub(void)
+{
+    static const u8 head[] = {
+        0x48, 0x8B, 0x3C, 0x24,             /* mov rdi,[rsp] */
+        0x48, 0x8D, 0x74, 0x24, 0x08,       /* lea rsi,[rsp+8] */
+        0x48, 0x89, 0xF8,                   /* mov rax,rdi */
+        0x48, 0x8D, 0x54, 0x24, 0x08,       /* lea rdx,[rsp+8] */
+        0x48, 0x85, 0xC0,                   /* test rax,rax */
+        0x74, 0x09,                         /* jz D */
+        0x48, 0x83, 0xC2, 0x08,             /* add rdx,8 */
+        0x48, 0xFF, 0xC8,                   /* dec rax */
+        0xEB, 0xF2,                         /* jmp L */
+        0x48, 0x83, 0xC2, 0x08              /* D: add rdx,8 */
+    };
+    u32 i = 0;
+
+    ld_stub_off = LD_TEXT.n;
+    for (i = 0; i < sizeof(head); i++)
+        ob_u8(&LD_TEXT, head[i]);
+    ld_stub_nctor = (u32)(LD_INIT.n / 8u);
+    ld_stub_ndtor = (u32)(LD_FINI.n / 8u);
+    ld_stub_nctor_off = LD_TEXT.n;
+    for (i = 0; i < ld_stub_nctor; i++) {   /* 每处先占位：E8 + 4 字节 0 */
+        ob_u8(&LD_TEXT, 0xE8);
+        ob_u32(&LD_TEXT, 0);
+    }
+    ld_stub_main_field = LD_TEXT.n + 1u;
+    ob_u8(&LD_TEXT, 0xE8);
+    ob_u32(&LD_TEXT, 0);
+    /* main 的返回值先落进 rbx（被调用者保存寄存器，析构函数不会破坏它）：
+     * 不然跑完析构函数再取 rax，取到的是最后一个析构函数的返回值——症状是
+     * main 返回 3、进程却以 0 退出。 */
+    ob_u8(&LD_TEXT, 0x48);
+    ob_u8(&LD_TEXT, 0x89);
+    ob_u8(&LD_TEXT, 0xC3);
+    ld_stub_ndtor_off = LD_TEXT.n;
+    for (i = 0; i < ld_stub_ndtor; i++) {
+        ob_u8(&LD_TEXT, 0xE8);
+        ob_u32(&LD_TEXT, 0);
+    }
+    ob_u8(&LD_TEXT, 0x48);                  /* mov rdi,rbx */
+    ob_u8(&LD_TEXT, 0x89);
+    ob_u8(&LD_TEXT, 0xDF);
+    ob_u8(&LD_TEXT, 0xB8);                  /* mov eax,60 */
+    ob_u32(&LD_TEXT, 60);
+    ob_u8(&LD_TEXT, 0x0F);                  /* syscall */
+    ob_u8(&LD_TEXT, 0x05);
+    ob_u8(&LD_TEXT, 0xF4);                  /* hlt（兜底） */
+}
+
+static void ld_patch_call(u32 field, u64 target)
+{
+    i64 d = (i64)target - (i64)(LD_VA_TEXT + field + 4u);
+
+    ld_wr32(LD_TEXT.p, field, (u32)(i64)d);
+}
+
+/* ---- 写出可执行文件 ---- */
+static void ld_write_exe(const char *path, u64 entry)
+{
+    ObjBuf f = {0};
+    u64 text_off = 0;
+    u64 ro_off = 0;
+    u64 data_off = 0;
+    u64 data_sz = 0;
+    u64 mem_sz = 0;
+
+    ob_zero(&f, LD_EHDR + LD_NPH * LD_PHDR);
+    ob_align(&f, 16);
+    text_off = f.n;
+    ob_copy(&f, LD_TEXT.p, LD_TEXT.n);
+    ob_align(&f, 16);
+    ro_off = f.n;
+    ob_copy(&f, LD_RO.p, LD_RO.n);
+    data_off = ld_align_up(f.n, LD_PAGE);
+    while (f.n < data_off)
+        ob_u8(&f, 0);
+    ob_copy(&f, LD_DATA.p, LD_DATA.n);
+    ob_align(&f, 8);
+    ob_copy(&f, LD_INIT.p, LD_INIT.n);
+    ob_align(&f, 8);
+    ob_copy(&f, LD_FINI.p, LD_FINI.n);
+    data_sz = f.n - data_off;
+    mem_sz = data_sz + ld_align_up(LD_BSS, LD_BSS_ALIGN);
+
+    /* ELF 头 */
+    ob_patch32(&f, 0, 0x464C457Fu);
+    f.p[4] = 2;
+    f.p[5] = 1;
+    f.p[6] = 1;
+    ob_patch16(&f, 16, 2);                          /* ET_EXEC */
+    ob_patch16(&f, 18, 0x3E);                       /* EM_X86_64 */
+    ob_patch32(&f, 20, 1);                          /* e_version */
+    ob_patch64(&f, 24, entry);                      /* e_entry */
+    ob_patch64(&f, 32, LD_EHDR);                    /* e_phoff */
+    ob_patch64(&f, 40, 0);                          /* e_shoff：不写段表 */
+    ob_patch32(&f, 48, 0);
+    ob_patch16(&f, 52, LD_EHDR);
+    ob_patch16(&f, 54, LD_PHDR);
+    ob_patch16(&f, 56, (u32)LD_NPH);
+    ob_patch16(&f, 58, 64);
+    ob_patch16(&f, 60, 0);
+    ob_patch16(&f, 62, 0);
+
+    /* 程序头 0：R+X，文件头 + 代码 + 只读数据 */
+    {
+        u32 p = LD_EHDR;
+
+        ob_patch32(&f, p, 1);                       /* PT_LOAD */
+        ob_patch32(&f, p + 4, 5);                   /* R|X */
+        ob_patch64(&f, p + 8, 0);                   /* p_offset */
+        ob_patch64(&f, p + 16, LD_BASE_VA);
+        ob_patch64(&f, p + 24, LD_BASE_VA);
+        ob_patch64(&f, p + 32, ro_off + LD_RO.n);   /* p_filesz */
+        ob_patch64(&f, p + 40, ro_off + LD_RO.n);   /* p_memsz */
+        ob_patch64(&f, p + 48, LD_PAGE);            /* p_align */
+    }
+    /* 程序头 1：R+W，已初始化数据 + .init_array/.fini_array + .bss（memsz） */
+    {
+        u32 p = LD_EHDR + LD_PHDR;
+
+        ob_patch32(&f, p, 1);
+        ob_patch32(&f, p + 4, 6);                   /* R|W */
+        ob_patch64(&f, p + 8, data_off);
+        ob_patch64(&f, p + 16, LD_BASE_VA + data_off);
+        ob_patch64(&f, p + 24, LD_BASE_VA + data_off);
+        ob_patch64(&f, p + 32, data_sz);
+        ob_patch64(&f, p + 40, mem_sz);
+        ob_patch64(&f, p + 48, LD_PAGE);
+    }
+    /* 程序头 2：PT_GNU_STACK，不可执行栈 */
+    {
+        u32 p = LD_EHDR + 2u * LD_PHDR;
+
+        ob_patch32(&f, p, 0x6474e551u);
+        ob_patch32(&f, p + 4, 6);                   /* R|W，没有 X */
+        ob_patch64(&f, p + 48, 16);
+    }
+
+    {
+        FILE *out = fopen(path, "wb");
+
+        if (!out) {
+            fprintf(stderr, "c6c: 无法写出 %s\n", path);
+        } else {
+            if (fwrite(f.p, 1, (size_t)f.n, out) != (size_t)f.n)
+                fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
+            fclose(out);
+            chmod(path, 0755);
+            printf("c6c: %s（静态链接：代码 %u 字节 / 只读 %u / 数据 %u / bss %llu / "
+                   "入口 0x%llx）\n",
+                   path, LD_TEXT.n, LD_RO.n,
+                   (u32)(data_sz), (unsigned long long)LD_BSS, (unsigned long long)entry);
+        }
+    }
+    free(f.p);
+}
+
+/* ---- TLS 记账格的跨 .o 传递 ----
+ * c6c 的 TLS 模型（见 c6c/lib/rt.c6 的 c6c_tls_setup）：每个 TU 在数据段里
+ * 放一小段 TLS 初值 blob，外加三个格子——img（blob 地址）、len（长度）、
+ * delta（blob 相对**本 TU**数据段起点的偏移）。代码里的 TLS 访问编成
+ * `%fs:<goff>`，goff 也是本 TU 的偏移，所以"img/len/delta + 代码"在一个 TU
+ * 内部自洽，跟 TU 的数据段被搬到哪儿无关。
+ *
+ * 问题在于跑 setup 的构造函数在 rt.o 里，它读的是 rt.o 自己那三个格子
+ * （len=0）——用户 TU 里真有 TLS 变量时，TLS 块压根没建，程序一访问就段错。
+ * 所以链接器做一件事：**恰好一个** TU 带 TLS 时，把它的三个值抄给所有
+ * len==0 的 TU（它们的格子全零，抄进去就一致了）。
+ *
+ * 两个以上 TU 都带 TLS 就不行了：各 TU 的 goff 都从 0 附近算，跨 TU 会重叠，
+ * 要合并必须改代码里的 `%fs:` 位移（重定位里没有这些），所以如实报错。
+ */
+static int ld_tls_fixup(void)
+{
+    int k = 0;
+    int owner = -1;
+    u64 img = 0;
+    u64 len = 0;
+    u64 delta = 0;
+
+    for (k = 0; k < LD_NOBJ; k++) {
+        LdObj *o = &LD_O[k];
+        u32 i = 0;
+        u32 s_img = 0xffffffffu;
+        u32 s_len = 0xffffffffu;
+        u32 s_del = 0xffffffffu;
+        u64 vlen = 0;
+        u32 symoff = 0;
+        const char *str = NULL;
+
+        if (!o->symtab || !o->nsym)
+            continue;
+        symoff = (u32)ld_rd64(o->img, o->shoff + o->symtab * 64u + 24);
+        str = (const char *)(o->img + ld_rd64(o->img, o->shoff + o->strtab * 64u + 24));
+        for (i = 0; i < o->nsym; i++) {
+            u32 sb = symoff + i * 24u;
+            const char *nm = str + ld_rd32(o->img, sb);
+
+            if (!nm[0] || ld_rd16(o->img, sb + 6) >= o->shnum)
+                continue;
+            if (strcmp(nm, "__c6_tls_img") == 0)
+                s_img = i;
+            else if (strcmp(nm, "__c6_tls_len") == 0)
+                s_len = i;
+            else if (strcmp(nm, "__c6_tls_delta") == 0)
+                s_del = i;
+        }
+        if (s_len == 0xffffffffu || s_img == 0xffffffffu || s_del == 0xffffffffu)
+            continue;
+        vlen = ld_rd64(LD_DATA.p, (u32)(ld_sym_addr(o, s_len) - LD_VA_DATA));
+        if (vlen == 0)
+            continue;
+        if (owner >= 0) {
+            fprintf(stderr, "c6c: %s 和 %s 都带 TLS 变量；链接器这一版不合并 "
+                            "TLS 段（c6c 的 TLS 偏移按 TU 分配，跨 .o 会重叠）\n",
+                    LD_O[owner].path, o->path);
+            return 1;
+        }
+        owner = k;
+        /* 格子里的**内容**才是 blob 地址（重定位刚把它填好），别拿格子自己的地址 */
+        img = ld_rd64(LD_DATA.p, (u32)(ld_sym_addr(o, s_img) - LD_VA_DATA));
+        len = vlen;
+        delta = ld_rd64(LD_DATA.p, (u32)(ld_sym_addr(o, s_del) - LD_VA_DATA));
+    }
+    if (owner < 0)
+        return 0;
+    for (k = 0; k < LD_NOBJ; k++) {
+        LdObj *o = &LD_O[k];
+        u32 i = 0;
+        u32 symoff = 0;
+        const char *str = NULL;
+
+        if (k == owner || !o->symtab || !o->nsym)
+            continue;
+        symoff = (u32)ld_rd64(o->img, o->shoff + o->symtab * 64u + 24);
+        str = (const char *)(o->img + ld_rd64(o->img, o->shoff + o->strtab * 64u + 24));
+        for (i = 0; i < o->nsym; i++) {
+            u32 sb = symoff + i * 24u;
+            const char *nm = str + ld_rd32(o->img, sb);
+            u64 addr = 0;
+            u64 v = 0;
+
+            if (!nm[0] || ld_rd16(o->img, sb + 6) >= o->shnum)
+                continue;
+            if (o->sec_out[ld_rd16(o->img, sb + 6)] != LDO_DATA)
+                continue;
+            addr = ld_sym_addr(o, i);
+            if (addr < LD_VA_DATA || addr + 8u > LD_VA_DATA + LD_DATA.n)
+                continue;
+            if (strcmp(nm, "__c6_tls_img") == 0)
+                v = img;
+            else if (strcmp(nm, "__c6_tls_len") == 0)
+                v = len;
+            else if (strcmp(nm, "__c6_tls_delta") == 0)
+                v = delta;
+            else
+                continue;
+            ld_wr64(LD_DATA.p, (u32)(addr - LD_VA_DATA), v);
+        }
+    }
+    return 0;
+}
+
+/* ---- 动态链接：DT_NEEDED / PT_INTERP / PLT / GOT（-Wl,--dynamic） ----
+ *
+ * 静态链接（默认）把 libc 的名字按 0 处理或者报错；开了动态链接就老实做
+ * 一个 ELF 动态可执行文件，让 ld.so 把 libc.so.6 映射进来：
+ *
+ *   PT_INTERP                      /lib64/ld-linux-x86-64.so.2
+ *   .dynstr/.dynsym/.hash          导入符号的名字与表项（SysV 哈希，够 ld.so 用）
+ *   .rela.plt + .plt + .got.plt    每个导入函数一条 JUMP_SLOT 重定位
+ *   .dynamic                       DT_NEEDED libc.so.6 这些标签
+ *
+ * 走非惰性绑定（DT_FLAGS 里置 DF_BIND_NOW）：ld.so 启动时把所有 JUMP_SLOT
+ * 解完，PLT 桩子就只剩一条 jmp [rip+got]——省掉 plt0 那套 push/jmp 协商，
+ * 也少一处可能对不齐的地方。
+ *
+ * 边界（这一版没做，不是 bug）：
+ *   * **函数**能动态导入；**数据**符号（`environ` 那种）需要 COPY 重定位
+ *     （非 PIC 代码里它是绝对地址，只有把 libc 的定义拷进本程序的 .bss 才
+ *     成立），没做——遇到就按 0 处理并把名字报出来；
+ *   * 不支持 -shared / -fPIC 产物、符号版本（.gnu.version）、
+ *     .rela.dyn 里的 R_X86_64_RELATIVE（本程序是固定基址的 ET_EXEC）。
+ */
+#define LD_DYN_INTERP   "/lib64/ld-linux-x86-64.so.2"
+#define LD_DYN_LIBC     "libc.so.6"
+#define LD_R_JUMP_SLOT  7u
+#define LD_STT_OBJECT   1u
+
+#define LD_DT_NULL      0u
+#define LD_DT_NEEDED    1u
+#define LD_DT_PLTRELSZ  2u
+#define LD_DT_PLTGOT    3u
+#define LD_DT_HASH      4u
+#define LD_DT_STRTAB    5u
+#define LD_DT_SYMTAB    6u
+#define LD_DT_STRSZ     10u
+#define LD_DT_SYMENT    11u
+#define LD_DT_JMPREL    23u
+#define LD_DT_PLTREL    20u
+#define LD_DT_BIND_NOW  24u
+#define LD_DT_FLAGS     30u
+#define LD_DF_BIND_NOW  8u
+#define LD_DT_NUM       14u             /* .dynamic 预留槽数（含结尾 DT_NULL） */
+
+static u32 LD_NUNDEF_DATA;              /* 数据符号（没做 COPY）：个数 + 名字 */
+static char LD_DATA_NAMES[200];
+
+/* 动态段的文件偏移（VA = LD_BASE_VA + 偏移，和静态布局同一条规矩） */
+static u64 LD_OFF_INTERP;
+static u64 LD_OFF_TEXT;
+static u64 LD_OFF_RO;
+static u64 LD_OFF_DYNSTR;
+static u64 LD_OFF_DYNSYM;
+static u64 LD_OFF_HASH;
+static u64 LD_OFF_RELAPLT;
+static u64 LD_OFF_PLT;
+static u64 LD_OFF_GOT;
+static u64 LD_OFF_DATA;
+static u64 LD_OFF_INIT;
+static u64 LD_OFF_FINI;
+static u64 LD_OFF_DYN;
+static u64 LD_OFF_DATA_PAGE;            /* 第二个 PT_LOAD 的起点（页对齐） */
+
+static u64 LD_VA_INTERP;
+static u64 LD_VA_DYNSTR;
+static u64 LD_VA_DYNSYM;
+static u64 LD_VA_HASH;
+static u64 LD_VA_RELAPLT;
+static u64 LD_VA_PLT;
+static u64 LD_VA_GOT;
+static u64 LD_VA_DYN;
+
+static u32 LD_INTERP_N;
+static u32 LD_DYNSTR_N;                 /* .dynstr 的字节数（DT_STRSZ 用） */
+static u32 LD_IMPOFF[LD_MAXIMP];        /* 名字在 .dynstr 里的偏移 */
+static u32 LD_LIBCOFF;                  /* "libc.so.6" 在 .dynstr 里的偏移 */
+
+static u32 ld_dyn_lookup(const char *name)
+{
+    u32 i = 0;
+
+    for (i = 0; i < LD_NIMP; i++)
+        if (strcmp(LD_IMPN[i], name) == 0)
+            return i;
+    return 0xffffffffu;
+}
+
+/* 收集要动态导入的符号：已定义的不算；数据符号单独挑出来（见文件头注释） */
+static int ld_dyn_collect(void)
+{
+    u32 g = 0;
+
+    LD_NIMP = 0;
+    LD_NUNDEF_DATA = 0;
+    LD_DATA_NAMES[0] = 0;
+    for (g = 0; g < LD_NG; g++) {
+        LdGSym *s = &LD_G[g];
+
+        if (s->defined || !s->name || !s->name[0])
+            continue;
+        if (s->type == LD_STT_OBJECT) {
+            if (LD_NUNDEF_DATA < 6u) {
+                strncat(LD_DATA_NAMES, LD_NUNDEF_DATA ? " " : "",
+                        sizeof(LD_DATA_NAMES) - strlen(LD_DATA_NAMES) - 1u);
+                strncat(LD_DATA_NAMES, s->name,
+                        sizeof(LD_DATA_NAMES) - strlen(LD_DATA_NAMES) - 1u);
+            }
+            LD_NUNDEF_DATA++;
+            continue;
+        }
+        if (LD_NIMP >= LD_MAXIMP) {
+            fprintf(stderr, "c6c: 动态导入的符号太多（上限 %d）\n", LD_MAXIMP);
+            return 1;
+        }
+        LD_IMPN[LD_NIMP] = s->name;
+        LD_NIMP++;
+    }
+    return 0;
+}
+
+/* 未定义符号 → 它的 PLT 桩子地址（0 = 不是动态导入） */
+static u64 ld_dyn_plt(const char *name)
+{
+    u32 k = 0;
+
+    if (!LD_DYN || !name)
+        return 0;
+    k = ld_dyn_lookup(name);
+    if (k == 0xffffffffu)
+        return 0;
+    return LD_VA_PLT + (u64)k * 6u;
+}
+
+/* 算出全部落点并填好动态段的内容（顺带把 LD_VA_* 定下来，重定位要用） */
+static int ld_dyn_plan(void)
+{
+    u64 off = 0;
+    u64 dynstr_n = 1;
+    u64 plt_n = 0;
+    u64 got_n = 0;
+    u64 relapl_n = 0;
+    u64 dynsym_n = 0;
+    u64 hash_n = 0;
+    u32 i = 0;
+
+    /* 先收导入表：下面所有尺寸都由它算出来（以前把这步排在了尺寸后面，
+     * 症状是 .dynamic 落进了 .data 中间、文件尾部多出一截） */
+    if (ld_dyn_collect())
+        return 1;
+    plt_n = (u64)LD_NIMP * 6u;
+    got_n = 8u * (3u + (u64)LD_NIMP);
+    relapl_n = 24u * (u64)LD_NIMP;
+    dynsym_n = 24u * (1u + (u64)LD_NIMP);
+    hash_n = 4u * (4u + (u64)LD_NIMP);
+    LD_INTERP_N = (u32)strlen(LD_DYN_INTERP) + 1u;
+    for (i = 0; i < LD_NIMP; i++)
+        dynstr_n += (u64)strlen(LD_IMPN[i]) + 1u;
+    dynstr_n += (u64)strlen(LD_DYN_LIBC) + 1u;
+    LD_DYNSTR_N = (u32)dynstr_n;
+
+    /* 文件布局：头+程序头 → .interp → .text → .rodata → 动态只读段
+     * →（翻页）→ .got.plt → .data → .init_array → .fini_array → .dynamic */
+    LD_NPH = 5u;
+    off = LD_EHDR + (u64)LD_NPH * LD_PHDR;
+    LD_OFF_INTERP = ld_align_up(off, 8);
+    off = LD_OFF_INTERP + LD_INTERP_N;
+    LD_OFF_TEXT = ld_align_up(off, 16);
+    off = LD_OFF_TEXT + LD_TEXT.n;
+    LD_OFF_RO = ld_align_up(off, 16);
+    off = LD_OFF_RO + LD_RO.n;
+    LD_OFF_DYNSTR = ld_align_up(off, 8);
+    off = LD_OFF_DYNSTR + dynstr_n;
+    LD_OFF_DYNSYM = ld_align_up(off, 8);
+    off = LD_OFF_DYNSYM + dynsym_n;
+    LD_OFF_HASH = ld_align_up(off, 8);
+    off = LD_OFF_HASH + hash_n;
+    LD_OFF_RELAPLT = ld_align_up(off, 8);
+    off = LD_OFF_RELAPLT + relapl_n;
+    LD_OFF_PLT = ld_align_up(off, 16);
+    off = LD_OFF_PLT + plt_n;
+    LD_OFF_DATA_PAGE = ld_align_up(off, LD_PAGE);
+    LD_OFF_GOT = LD_OFF_DATA_PAGE;
+    off = LD_OFF_GOT + got_n;
+    LD_OFF_DATA = ld_align_up(off, 16);
+    off = LD_OFF_DATA + LD_DATA.n;
+    LD_OFF_INIT = ld_align_up(off, 8);
+    off = LD_OFF_INIT + LD_INIT.n;
+    LD_OFF_FINI = ld_align_up(off, 8);
+    off = LD_OFF_FINI + LD_FINI.n;
+    LD_OFF_DYN = ld_align_up(off, 8);
+    off = LD_OFF_DYN + (u64)LD_DT_NUM * 16u;
+
+    LD_VA_INTERP = LD_BASE_VA + LD_OFF_INTERP;
+    LD_VA_TEXT = LD_BASE_VA + LD_OFF_TEXT;
+    LD_VA_RO = LD_BASE_VA + LD_OFF_RO;
+    LD_VA_DYNSTR = LD_BASE_VA + LD_OFF_DYNSTR;
+    LD_VA_DYNSYM = LD_BASE_VA + LD_OFF_DYNSYM;
+    LD_VA_HASH = LD_BASE_VA + LD_OFF_HASH;
+    LD_VA_RELAPLT = LD_BASE_VA + LD_OFF_RELAPLT;
+    LD_VA_PLT = LD_BASE_VA + LD_OFF_PLT;
+    LD_VA_GOT = LD_BASE_VA + LD_OFF_GOT;
+    LD_VA_DATA = LD_BASE_VA + LD_OFF_DATA;
+    LD_VA_INIT = LD_BASE_VA + LD_OFF_INIT;
+    LD_VA_FINI = LD_BASE_VA + LD_OFF_FINI;
+    LD_VA_BSS = LD_BASE_VA + ld_align_up(off, LD_BSS_ALIGN);
+    LD_VA_DYN = LD_BASE_VA + LD_OFF_DYN;
+
+    /* 名字在 .dynstr 里的偏移（第 0 字节是空串） */
+    {
+        u32 n = 1;
+
+        for (i = 0; i < LD_NIMP; i++) {
+            LD_IMPOFF[i] = n;
+            n += (u32)strlen(LD_IMPN[i]) + 1u;
+        }
+        LD_LIBCOFF = n;
+    }
+    return 0;
+}
+
+/* 往输出缓冲里跳着写：中间空出来的地方补 0（段与段之间的对齐空洞） */
+static void ld_pad_to(ObjBuf *f, u64 off)
+{
+    while (f->n < off)
+        ob_u8(f, 0);
+}
+
+/* 写出动态段 + 动态可执行文件 */
+static void ld_write_exe_dyn(const char *path, u64 entry)
+{
+    ObjBuf f = {0};
+    u64 data_sz = 0;
+    u64 mem_sz = 0;
+    u32 i = 0;
+
+    ob_zero(&f, (u32)(LD_EHDR + (u64)LD_NPH * LD_PHDR));
+
+    /* .interp */
+    ld_pad_to(&f, LD_OFF_INTERP);
+    ob_copy(&f, LD_DYN_INTERP, LD_INTERP_N);
+    /* .text / .rodata */
+    ld_pad_to(&f, LD_OFF_TEXT);
+    ob_copy(&f, LD_TEXT.p, LD_TEXT.n);
+    ld_pad_to(&f, LD_OFF_RO);
+    ob_copy(&f, LD_RO.p, LD_RO.n);
+    /* .dynstr */
+    ld_pad_to(&f, LD_OFF_DYNSTR);
+    ob_u8(&f, 0);
+    for (i = 0; i < LD_NIMP; i++) {
+        ob_copy(&f, LD_IMPN[i], (u32)strlen(LD_IMPN[i]));
+        ob_u8(&f, 0);
+    }
+    ob_copy(&f, LD_DYN_LIBC, (u32)strlen(LD_DYN_LIBC));
+    ob_u8(&f, 0);
+    /* .dynsym：0 号是空项，之后每个导入一项（UND + FUNC） */
+    ld_pad_to(&f, LD_OFF_DYNSYM);
+    ob_zero(&f, 24);
+    for (i = 0; i < LD_NIMP; i++) {
+        ob_u32(&f, LD_IMPOFF[i]);      /* st_name */
+        ob_u8(&f, 0x12);               /* STB_GLOBAL | STT_FUNC */
+        ob_u8(&f, 0);                  /* st_other */
+        ob_u16(&f, 0);                 /* st_shndx = SHN_UNDEF */
+        ob_u64(&f, 0);                 /* st_value */
+        ob_u64(&f, 0);                 /* st_size */
+    }
+    /* .hash：SysV 哈希。只查本程序自己的符号时才会被用到，做成"一个桶串全链" */
+    ld_pad_to(&f, LD_OFF_HASH);
+    ob_u32(&f, 1);                     /* nbucket */
+    ob_u32(&f, 1u + LD_NIMP);          /* nchain */
+    ob_u32(&f, LD_NIMP ? 1u : 0u);     /* bucket[0] */
+    for (i = 0; i < LD_NIMP; i++)
+        ob_u32(&f, (i + 2u < 1u + LD_NIMP) ? i + 2u : 0u);
+    /* .rela.plt：每个导入一条 JUMP_SLOT，落在它自己的 GOT 格子上 */
+    ld_pad_to(&f, LD_OFF_RELAPLT);
+    for (i = 0; i < LD_NIMP; i++) {
+        ob_u64(&f, LD_VA_GOT + 8u * (3u + (u64)i));      /* r_offset */
+        ob_u64(&f, (((u64)(i + 1u)) << 32) | (u64)LD_R_JUMP_SLOT);
+        ob_u64(&f, 0);                                   /* r_addend */
+    }
+    /* .plt：每个导入一条 jmp QWORD PTR [rip+rel32] */
+    ld_pad_to(&f, LD_OFF_PLT);
+    for (i = 0; i < LD_NIMP; i++) {
+        u64 got = LD_VA_GOT + 8u * (3u + (u64)i);
+        i64 d = (i64)got - (i64)(LD_VA_PLT + (u64)i * 6u + 6u);
+
+        ob_u8(&f, 0xFF);
+        ob_u8(&f, 0x25);
+        ob_u32(&f, (u32)(i64)d);
+    }
+    /* .got.plt：0/1/2 号是 ld.so 自己用的保留槽（_DYNAMIC / link_map /
+     * 解析器），导入项从 3 号开始，初值 0（非惰性绑定，ld.so 会填） */
+    ld_pad_to(&f, LD_OFF_GOT);
+    ob_u64(&f, LD_VA_DYN);
+    ob_u64(&f, 0);
+    ob_u64(&f, 0);
+    for (i = 0; i < LD_NIMP; i++)
+        ob_u64(&f, 0);
+    /* .data / .init_array / .fini_array */
+    ld_pad_to(&f, LD_OFF_DATA);
+    ob_copy(&f, LD_DATA.p, LD_DATA.n);
+    ld_pad_to(&f, LD_OFF_INIT);
+    ob_copy(&f, LD_INIT.p, LD_INIT.n);
+    ld_pad_to(&f, LD_OFF_FINI);
+    ob_copy(&f, LD_FINI.p, LD_FINI.n);
+    /* .dynamic */
+    ld_pad_to(&f, LD_OFF_DYN);
+    ob_u64(&f, LD_DT_NEEDED);
+    ob_u64(&f, LD_LIBCOFF);
+    ob_u64(&f, LD_DT_HASH);
+    ob_u64(&f, LD_VA_HASH);
+    ob_u64(&f, LD_DT_STRTAB);
+    ob_u64(&f, LD_VA_DYNSTR);
+    ob_u64(&f, LD_DT_SYMTAB);
+    ob_u64(&f, LD_VA_DYNSYM);
+    ob_u64(&f, LD_DT_STRSZ);
+    ob_u64(&f, (u64)LD_DYNSTR_N);
+    ob_u64(&f, LD_DT_SYMENT);
+    ob_u64(&f, 24);
+    ob_u64(&f, LD_DT_PLTGOT);
+    ob_u64(&f, LD_VA_GOT);
+    ob_u64(&f, LD_DT_PLTRELSZ);
+    ob_u64(&f, 24u * (u64)LD_NIMP);
+    ob_u64(&f, LD_DT_PLTREL);
+    ob_u64(&f, 7u);                    /* DT_RELA */
+    ob_u64(&f, LD_DT_JMPREL);
+    ob_u64(&f, LD_VA_RELAPLT);
+    ob_u64(&f, LD_DT_FLAGS);
+    ob_u64(&f, LD_DF_BIND_NOW);
+    ob_u64(&f, LD_DT_BIND_NOW);
+    ob_u64(&f, 0);
+    ob_u64(&f, LD_DT_NULL);
+    ob_u64(&f, 0);
+    /* PT_DYNAMIC 的 filesz 是预留的整块：留白也要在文件里，否则 readelf
+     * 会说"动态段越过了文件尾" */
+    ld_pad_to(&f, LD_OFF_DYN + (u64)LD_DT_NUM * 16u);
+
+    data_sz = f.n - LD_OFF_DATA_PAGE;
+    mem_sz = data_sz + ld_align_up(LD_BSS, LD_BSS_ALIGN);
+
+    /* ELF 头 */
+    ob_patch32(&f, 0, 0x464C457Fu);
+    f.p[4] = 2;
+    f.p[5] = 1;
+    f.p[6] = 1;
+    ob_patch16(&f, 16, 2);                          /* ET_EXEC */
+    ob_patch16(&f, 18, 0x3E);                       /* EM_X86_64 */
+    ob_patch32(&f, 20, 1);
+    ob_patch64(&f, 24, entry);
+    ob_patch64(&f, 32, LD_EHDR);
+    ob_patch64(&f, 40, 0);
+    ob_patch32(&f, 48, 0);
+    ob_patch16(&f, 52, LD_EHDR);
+    ob_patch16(&f, 54, LD_PHDR);
+    ob_patch16(&f, 56, (u32)LD_NPH);
+    ob_patch16(&f, 58, 64);
+    ob_patch16(&f, 60, 0);
+    ob_patch16(&f, 62, 0);
+
+    /* 程序头 0：R+X 的第一段（头 + .interp + 代码 + 只读数据 + 动态只读段） */
+    {
+        u32 p = LD_EHDR;
+
+        ob_patch32(&f, p, 1);                       /* PT_LOAD */
+        ob_patch32(&f, p + 4, 5);                   /* R|X */
+        ob_patch64(&f, p + 8, 0);
+        ob_patch64(&f, p + 16, LD_BASE_VA);
+        ob_patch64(&f, p + 24, LD_BASE_VA);
+        ob_patch64(&f, p + 32, LD_OFF_DATA_PAGE);
+        ob_patch64(&f, p + 40, LD_OFF_DATA_PAGE);
+        ob_patch64(&f, p + 48, LD_PAGE);
+    }
+    /* 程序头 1：R+W（.got.plt / .data / .init_array / .fini_array / .dynamic） */
+    {
+        u32 p = LD_EHDR + LD_PHDR;
+
+        ob_patch32(&f, p, 1);
+        ob_patch32(&f, p + 4, 6);                   /* R|W */
+        ob_patch64(&f, p + 8, LD_OFF_DATA_PAGE);
+        ob_patch64(&f, p + 16, LD_BASE_VA + LD_OFF_DATA_PAGE);
+        ob_patch64(&f, p + 24, LD_BASE_VA + LD_OFF_DATA_PAGE);
+        ob_patch64(&f, p + 32, data_sz);
+        ob_patch64(&f, p + 40, mem_sz);
+        ob_patch64(&f, p + 48, LD_PAGE);
+    }
+    /* 程序头 2：PT_INTERP */
+    {
+        u32 p = LD_EHDR + 2u * LD_PHDR;
+
+        ob_patch32(&f, p, 3);
+        ob_patch32(&f, p + 4, 4);                   /* R */
+        ob_patch64(&f, p + 8, LD_OFF_INTERP);
+        ob_patch64(&f, p + 16, LD_VA_INTERP);
+        ob_patch64(&f, p + 24, LD_VA_INTERP);
+        ob_patch64(&f, p + 32, LD_INTERP_N);
+        ob_patch64(&f, p + 40, LD_INTERP_N);
+        ob_patch64(&f, p + 48, 1);
+    }
+    /* 程序头 3：PT_DYNAMIC */
+    {
+        u32 p = LD_EHDR + 3u * LD_PHDR;
+
+        ob_patch32(&f, p, 2);
+        ob_patch32(&f, p + 4, 6);                   /* R|W */
+        ob_patch64(&f, p + 8, LD_OFF_DYN);
+        ob_patch64(&f, p + 16, LD_VA_DYN);
+        ob_patch64(&f, p + 24, LD_VA_DYN);
+        ob_patch64(&f, p + 32, (u64)LD_DT_NUM * 16u);
+        ob_patch64(&f, p + 40, (u64)LD_DT_NUM * 16u);
+        ob_patch64(&f, p + 48, 8);
+    }
+    /* 程序头 4：PT_GNU_STACK（不可执行栈） */
+    {
+        u32 p = LD_EHDR + 4u * LD_PHDR;
+
+        ob_patch32(&f, p, 0x6474e551u);
+        ob_patch32(&f, p + 4, 6);
+        ob_patch64(&f, p + 48, 16);
+    }
+
+    {
+        FILE *out = fopen(path, "wb");
+
+        if (!out) {
+            fprintf(stderr, "c6c: 无法写出 %s\n", path);
+        } else {
+            if (fwrite(f.p, 1, (size_t)f.n, out) != (size_t)f.n)
+                fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
+            fclose(out);
+            chmod(path, 0755);
+            printf("c6c: %s（动态链接 %s：导入 %u 个函数 / 代码 %u 字节 / "
+                   "只读 %u / 数据 %u / bss %llu / 入口 0x%llx）\n",
+                   path, LD_DYN_LIBC, (unsigned)LD_NIMP, LD_TEXT.n, LD_RO.n,
+                   (u32)data_sz, (unsigned long long)LD_BSS,
+                   (unsigned long long)entry);
+        }
+    }
+    free(f.p);
+}
+
+/* ---- 入口：把 files[] 链成 out ---- */
+static int ld_link(const char **files, int nfiles, const char *out)
+{
+    int k = 0;
+    u32 gmain = 0;
+    u64 entry = 0;
+    u32 i = 0;
+    u64 ro_end = 0;
+    u64 data_off = 0;
+
+    LD_NOBJ = 0;
+    LD_NG = 0;
+    if (nfiles <= 0) {
+        fprintf(stderr, "c6c: 没有输入文件\n");
+        return 2;
+    }
+    if (nfiles > LD_MAXOBJ) {
+        fprintf(stderr, "c6c: 一次最多链接 %d 个目标文件\n", LD_MAXOBJ);
+        return 2;
+    }
+    for (k = 0; k < nfiles; k++) {
+        if (ld_load(&LD_O[k], files[k]))
+            return 2;
+        LD_NOBJ++;
+    }
+    if (ld_layout_inputs())
+        return 2;
+    if (ld_collect_symbols())
+        return 2;
+
+    /* 找 main：_start 要靠它；没有就如实说清 */
+    gmain = ld_gfind("main", 0);
+    if (gmain == 0xffffffffu || !LD_G[gmain].defined) {
+        fprintf(stderr, "c6c: 找不到 'main'（链接一个可执行文件需要入口）\n");
+        return 2;
+    }
+
+    ld_emit_stub();
+
+    /* 定最终地址：文件头 + 代码 + 只读 是第一个 PT_LOAD，数据是第二个。
+     * 动态链接时整张地图（动态只读段 + .got.plt + .dynamic）由 ld_dyn_plan 定。 */
+    if (LD_DYN) {
+        if (ld_dyn_plan())
+            return 2;
+    } else {
+        u64 text_off = ld_align_up(LD_EHDR + LD_NPH * LD_PHDR, 16);
+
+        LD_VA_TEXT = LD_BASE_VA + text_off;
+        ro_end = text_off + LD_TEXT.n;
+        LD_VA_RO = LD_BASE_VA + ld_align_up(ro_end, 16);
+        ro_end = ld_align_up(ro_end, 16) + LD_RO.n;
+        data_off = ld_align_up(ro_end, LD_PAGE);
+        LD_VA_DATA = LD_BASE_VA + data_off;
+        LD_VA_INIT = LD_VA_DATA + ld_align_up(LD_DATA.n, 8);
+        LD_VA_FINI = LD_VA_INIT + ld_align_up(LD_INIT.n, 8);
+        LD_VA_BSS = LD_VA_FINI + ld_align_up(LD_FINI.n, 8);
+    }
+
+    if (ld_relocate_all())
+        return 2;
+    if (ld_tls_fixup())
+        return 2;
+    if (LD_NUNDEF)
+        fprintf(stderr, "c6c: 警告：%u 个未定义符号按 0 处理（-Wl,--allow-undefined）：%s%s\n",
+                (unsigned)LD_NUNDEF, LD_UNDEF_NAMES, LD_NUNDEF > 6u ? " …" : "");
+
+    /* 构造/析构函数在 .init_array 里已经是绝对地址了（上面刚重定位过），
+     * 逐条取回来补进 _start 的 call。 */
+    for (i = 0; i < ld_stub_nctor; i++) {
+        u64 fn = ld_rd64(LD_INIT.p, i * 8u);
+        u32 field = ld_stub_nctor_off + i * 5u + 1u;
+
+        if (!fn) {
+            fprintf(stderr, "c6c: .init_array 第 %u 项是空指针\n", (unsigned)i);
+            return 2;
+        }
+        ld_patch_call(field, fn);
+    }
+    for (i = 0; i < ld_stub_ndtor; i++) {
+        u64 fn = ld_rd64(LD_FINI.p, (ld_stub_ndtor - 1u - i) * 8u);
+        u32 field = ld_stub_ndtor_off + i * 5u + 1u;
+
+        if (!fn)
+            continue;
+        ld_patch_call(field, fn);
+    }
+    ld_patch_call(ld_stub_main_field, ld_gsym_addr(gmain));
+
+    entry = LD_VA_TEXT + ld_stub_off;
+    if (LD_DYN) {
+        if (LD_NUNDEF_DATA)
+            fprintf(stderr, "c6c: 警告：%u 个数据符号没有动态导入（这一版不做 COPY "
+                            "重定位，按 0 处理）：%s%s\n",
+                    (unsigned)LD_NUNDEF_DATA, LD_DATA_NAMES,
+                    LD_NUNDEF_DATA > 6u ? " …" : "");
+        ld_write_exe_dyn(out, entry);
+    } else {
+        ld_write_exe(out, entry);
+    }
+    return 0;
+}

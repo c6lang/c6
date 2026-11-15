@@ -1,0 +1,14 @@
+/* c6c-lib.c6 —— 库形态的翻译单元：同一份编译器源码，去掉 main()，带 API。
+ *
+ * 为什么用"同一份源码 + 一个宏"而不是另立一套：c6c 是单 TU 设计的（各模块
+ * 靠 #include 串起来、共享全局状态），把它拆成"库"和"命令行"两条独立的源
+ * 只会让两边慢慢长歪。这里只做一件事——把 main() 关掉（C6C_NO_MAIN），
+ * 于是 c6_* 那套 API（src/embed.c6）就成了入口。
+ *
+ * 构建（见 c6c/Makefile 的 libc6c 目标）：
+ *   cc -x c -O2 -fPIC -shared -o libc6c.so src/c6c-lib.c6
+ *   cc -x c -O2 -c -o libc6c.o src/c6c-lib.c6 && ar rcs libc6c.a libc6c.o
+ */
+
+#define C6C_NO_MAIN 1
+#include "c6c.c6"
