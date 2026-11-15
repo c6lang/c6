@@ -5,6 +5,46 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 未发布 — 2026-11-15
+
+### `make -C c6c check-all` 不再卡死：`-j` 以前在 dash 下等于没限流
+
+- 现象：`check-all` 在小机器/CI 上偶发"卡死"，或者跑到一半出现一整轮
+  "跑不通的： async"；`-j N` 调小也看不出区别。
+- 根因（两条，都跟并发有关）：
+  1. 五个用例驱动的限流写的是 `if [ "$(jobs -p | wc -l)" -ge "$JOBS" ]`。
+     `$(…)` 是**子 shell**，dash（Ubuntu 的 `/bin/sh`）里它看不见父 shell 的
+     作业表，`jobs -p` **恒为空** → 计数恒为 0 → 限流从来不会触发。于是
+     `c99suite` 把 150 条用例、`test` 把 130 多个 `.c6`、`stdtest` 把 377 个模块
+     一次性全起起来；每条背后还有 gcc/cc/被测程序。44 核开发机上看不出来，
+     2~4 核的 runner 或笔记本上直接把机器拖进 swap——表现就是"卡死"，
+     对负载敏感的 `async` 系列还会真的段错误（本机复现：`-j 2` 峰值 21 个
+     c6c 同时跑，`async` 挂）。
+  2. 编译器调用、被测程序的运行**没有任何时间上限**（只有少数几处有
+     `timeout`，而且都是不带 `-k` 的）。任何一个 `c6c` 在输入上死循环、
+     或者被测程序接了/屏蔽了 SIGTERM，`timeout` 的 SIGTERM 就不生效，
+     整轮验收永久挂在那里。
+- 修法：
+  - 五个驱动（`c99-suite` / `run-tests` / `diag-tests` / `std-tests` /
+    `tcc-tests2`）把限流换成**自己数批次数**（`nrun` 累加、满一批 `wait`
+    后清零），POSIX sh 下都成立；实测 `-j 3` 峰值就是 3 个 c6c 进程。
+  - 所有 `timeout` 一律带 `-k`（先 SIGTERM，几秒后 SIGKILL）；`c99-suite`
+    / `run-tests` / `diag-tests` / `std-tests` / `tcc-tests2` / `tcc-self-check`
+    的**编译器调用**也加了上限（`C6C_TMO`，默认 120 s；`tcc-self-check` 编
+    tcc.c 是 300 s），`c99-diff` / `llvm-diff` 的三步编译和两边程序运行同样
+    有上限。卡死会被判成一条失败，而不是把 check-all 挂住。
+- 顺手修掉：
+  - `c99-suite.sh`：结论缺失（子进程被打死）以前会被 `[ -f "$v" ] || continue`
+    静默跳过——挂掉的用例从总数里消失，闸门反而变绿。现在先占位 `MISS`，
+    汇总时单列并挡闸门；编译超时单列 `TMO`（也挡闸门），运行超时不再笼统
+    记成"退出码 124"。
+  - `std-tests.sh`：编译失败但没有诊断输出（多半是超时）时，`r.$i` 是空文件，
+    汇总按"通过"算——现在算失败。
+  - `run-tests.sh` / `diag-tests.sh`：没有结论的用例单列出来并算失败
+    （以前直接 `continue`）。
+  - `llvm-diff.sh`：`tests/c/llvm-only.txt` 非空时 `skip=$((skip+1))` 撞上
+    `set -u`，脚本在第一条上就 "skip: unbound variable" 死掉。
+
 ## 0.6.0 — 2026-11-15
 
 这个发布号的内容是**语言层 C99 收口**：先引一份外部标准用例当闸门，再把闸门和
