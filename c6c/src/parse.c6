@@ -12487,8 +12487,13 @@ static u32 gen_mul(void)
             u32 b = value_of(gen_unary());
             u32 bty = GEN_TY;
             u32 bty2 = ty_promote(GEN_TY);
-            /* 无符号操作数要走 div（idiv 会算成有符号） */
-            u8 op = (!ty_is_signed(aty2) || !ty_is_signed(bty2)) ? IR_UDIV : IR_DIV;
+            /* 走 idiv 还是 div，要看**转换之后**的公共类型有没有符号：
+             * C99 6.3.1.8 规定"unsigned int 能装进 long 就转成 long"，
+             * 所以 `long / unsigned int` 是有符号除法。以前按"任一操作数无
+             * 符号就无符号"判，`long l = -2; unsigned u = 2; l / u` 算成
+             * 9223372036854775807（`%` 同理）。 */
+            u32 cty2 = cmp_common_ty(aty2, bty2);
+            u8 op = (ty_is_float(cty2) || ty_is_signed(cty2)) ? IR_DIV : IR_UDIV;
 
             if (ty_is_cplx(aty2) || ty_is_cplx(bty2))
                 a = cplx_bin(IR_DIV, av, aty2, b, bty2);
@@ -12500,7 +12505,9 @@ static u32 gen_mul(void)
             u32 aty2 = ty_promote(aty);
             u32 b = value_of(gen_unary());
             u32 bty2 = ty_promote(GEN_TY);
-            u8 op = (!ty_is_signed(aty2) || !ty_is_signed(bty2)) ? IR_UMOD : IR_MOD;
+            u32 cty2 = cmp_common_ty(aty2, bty2);
+            /* 同上：`%` 的有符号性也看转换后的公共类型 */
+            u8 op = (ty_is_float(cty2) || ty_is_signed(cty2)) ? IR_MOD : IR_UMOD;
 
             a = gen_bin2(av, aty2, op, b, bty2);
             aty = GEN_TY;
@@ -14764,8 +14771,12 @@ static void init_body(u32 top)
                 INIT_CUR = init_leaf_at(doff + (ty_size(dty) ? ty_size(dty) : 1));
                 continue;
             }
+            /* 用**设计符指到的那个成员**的类型（`dty`）落值，不能用叶表里
+             * 那个叶子的类型：联合体在叶表里只登记第一个成员（C 规定不带
+             * 设计符时只初始化第一个），于是 `union U a = { .f = 1.0f };`
+             * 会按 `int` 存成 1，读 `a.f` 得到 5.6e-45 这种垃圾。 */
             if (li < LF_N)
-                init_store(LF_OFF[li], LF_TY[li], LF_BITS[li], LF_BOFF[li]);
+                init_store(LF_OFF[li], dty, dbits, dboff);
             else if (INIT_IS_GLOB)
                 gen_glob_obj(INIT_GOFF, dty, doff);
             else
