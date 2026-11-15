@@ -86,7 +86,11 @@ static void ll_put(FILE *f, u32 v, const char *val)
     fprintf(f, "  store i64 %s, ptr %%s%u\n", val, (unsigned)v);
 }
 
-/* 按类型宽度从内存读（零扩展），和 C99 的 c6_ld1/2/4/8 一个口径 */
+/* 按类型宽度从内存读，和 C99 的 c6_ld1/2/4/8 一个口径。
+ *
+ * 有符号窄类型必须 sext，无符号才 zext：`int i = -1` 的槽里是 0xFFFFFFFF，
+ * 零扩读成 4294967295 之后，符号提升 / 除法 / 算术右移 / int→double 全错。
+ * IRT_U8/U16/U32、指针、浮点位模式都保持零扩。 */
 static void ll_load_ty(FILE *f, u8 ty, u32 v, char *o, size_t n)
 {
     u32 sz = ir_type_size(ty);
@@ -106,7 +110,10 @@ static void ll_load_ty(FILE *f, u8 ty, u32 v, char *o, size_t n)
     }
     snprintf(t, sizeof(t), "%%t%d", LL_TMP++);
     fprintf(f, "  %s = load i%d, ptr %s\n", t, (int)(sz * 8), p);
-    fprintf(f, "  %s = zext i%d %s to i64\n", o, (int)(sz * 8), t);
+    if (ir_type_signed(ty))
+        fprintf(f, "  %s = sext i%d %s to i64\n", o, (int)(sz * 8), t);
+    else
+        fprintf(f, "  %s = zext i%d %s to i64\n", o, (int)(sz * 8), t);
 }
 
 /* 按类型宽度写内存（截断），val 是一个 i64 值表达式 */

@@ -64,17 +64,24 @@ static void c99_sym(u32 sym, char *buf, size_t n)
     buf[k] = 0;
 }
 
-/* 按类型宽度从内存读（零扩展）；浮点按位模式原样搬 */
+/* 按类型宽度从内存读；浮点按位模式原样搬。
+ *
+ * 有符号窄类型必须走**符号扩展**的载入助手（c6_ld1s/2s/4s），不能一律零扩：
+ * `int i = -1` 的槽里躺的是 0xFFFFFFFF，零扩读出来就是 4294967295，
+ * 于是符号提升、除法、算术右移、int→double 全跟着错（native 后端用
+ * movsx/movsxd，口径正好相反）。IRT_U8/U16/U32 和指针继续零扩，
+ * IRT_F32/F64 是位模式也不该 sext。8 字节满载没有扩展可做。 */
 static void c99_emit_load(FILE *f, u8 ty, u32 dst, u32 a)
 {
     u32 sz = ir_type_size(ty);
+    const char *suf = (sz < 8 && ir_type_signed(ty)) ? "s" : "";
 
     if (sz == 1)
-        fprintf(f, "  R(%u) = c6_ld1((void*)R(%u));\n", dst, a);
+        fprintf(f, "  R(%u) = c6_ld1%s((void*)R(%u));\n", dst, suf, a);
     else if (sz == 2)
-        fprintf(f, "  R(%u) = c6_ld2((void*)R(%u));\n", dst, a);
+        fprintf(f, "  R(%u) = c6_ld2%s((void*)R(%u));\n", dst, suf, a);
     else if (sz == 4)
-        fprintf(f, "  R(%u) = c6_ld4((void*)R(%u));\n", dst, a);
+        fprintf(f, "  R(%u) = c6_ld4%s((void*)R(%u));\n", dst, suf, a);
     else
         fprintf(f, "  R(%u) = c6_ld8((void*)R(%u));\n", dst, a);
 }
@@ -538,6 +545,13 @@ static void c99_prologue(void)
             " return v; }\n"
             "static uint64_t c6_ld8(const void *p) { uint64_t v; memcpy(&v,p,8);"
             " return v; }\n"
+            /* 有符号窄载入：读出来先按源宽度解释成有符号，再升到 64 位
+             * （写回 uint64_t 时补的是符号位，不是 0）。 */
+            "static uint64_t c6_ld1s(const void *p) { return (uint64_t)(int8_t)*(const uint8_t*)p; }\n"
+            "static uint64_t c6_ld2s(const void *p) { uint16_t v; memcpy(&v,p,2);"
+            " return (uint64_t)(int16_t)v; }\n"
+            "static uint64_t c6_ld4s(const void *p) { uint32_t v; memcpy(&v,p,4);"
+            " return (uint64_t)(int32_t)v; }\n"
             "static void c6_st1(void *p, uint64_t v) { *(uint8_t*)p = (uint8_t)v; }\n"
             "static void c6_st2(void *p, uint64_t v) { uint16_t x = (uint16_t)v;"
             " memcpy(p,&x,2); }\n"
