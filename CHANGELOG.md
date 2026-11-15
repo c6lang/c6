@@ -32,6 +32,12 @@
 - 性能（`make -C c6c bench-c6c`，gcc -O3 编的 c6c-opt，best-of-5）：
   编 tcc.c **112 ms / 25 MB**、自编译 **88 ms / 22 MB**、预处理 57 ms，
   每行成本随规模收敛到 1.0（线性度断言通过）。
+- `c6c --version` 打 `c6c 0.3.0（c6 的自举编译器；native / C99 / LLVM IR
+  三后端）`，版本号跟仓库根 `VERSION` 的发布号走（以前是第一阶段留下的
+  "0.0.1 / P1 骨架"）。
+- 顺手修掉两类会让结果悄悄错的问题：vreg/标号超过 16 位上限现在**报错**
+  （以前静默绕回、算错结果）；`ty_qual()`/`ty_unqual()` 把 `nkid`/`a` 当
+  `nbits` 传给 interning 的潜伏空指针。
 
 ### `tcc/tcc.h`：纯 C 构建（不带 `C6_EXT`）也要有 `C6_ROLE_*`
 
