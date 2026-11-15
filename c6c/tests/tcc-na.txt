@@ -11,5 +11,4 @@
 140_arm64_extasm	arm64 汇编（上游在 x86-64 上也跳）
 145_winarm64_interlocked	要 windows.h + win-arm64 内建函数（上游也跳）
 99_fastcall	i386 的 fastcall 调用约定（上游只在 i386 上跑）
-101_cleanup	用例要 65536 个同时活跃的栈槽，vreg 是 16 位（IR op 一条 16 字节）；现在会明确报"函数太大：虚拟寄存器超过 16 位上限"，不再静默算错
 94_generic	要**指向对象的**限定符进类型 id：`const int *` 必须和 `int *` 不同 id（指针层限定符已经有了，缺的是 `const` 修饰基类型这一层；`_Generic(ptr, int *:1, int * const:2, default:20)` 现在是 2、应为 20）

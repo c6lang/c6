@@ -2338,25 +2338,25 @@ static void task_new(void)
     TASK_MG_N = 0;
     c1 = irfn_vreg(&FN);
     c2 = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)c1, 0, 0, 0, 1);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)c2, 0, 0, 0,
+    irfn_push(&FN, IR_CONST, IRT_U64, c1, 0, 0, 0, 1);
+    irfn_push(&FN, IR_CONST, IRT_U64, c2, 0, 0, 0,
               ty_size(CUR_TASK_TY) ? ty_size(CUR_TASK_TY) : 8);
-    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)c1, 0, 0, 0);
-    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)c2, 0, 0, 1);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, c1, 0, 0, 0);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, c2, 0, 0, 1);
     t = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CALL, IRT_PTR, (u16)t, 0, 0, 0, x64_sym(&X64, "calloc"));
+    irfn_push(&FN, IR_CALL, IRT_PTR, t, 0, 0, 0, x64_sym(&X64, "calloc"));
     FN.ops[FN.n - 1].narg = 2;
     a = irfn_vreg(&FN);
-    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)a, 0, 0, 0, X64_SLOT(TASK_SLOT));
-    irfn_push(&FN, IR_STORE, IRT_U64, (u16)a, (u16)t, 0, 0, 0);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, a, 0, 0, 0, X64_SLOT(TASK_SLOT));
+    irfn_push(&FN, IR_STORE, IRT_U64, a, t, 0, 0, 0);
     /* 任务结构登记到协程上：函数体可能停在某个 `await`，创建者那时还没拿到
      * 返回值，只能从协程记录里取（__c6_co_start 就是读它）。 */
     {
         u32 pa2 = irfn_vreg(&FN);
         u32 pv2 = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)t, 0, 0, 0);
-        irfn_push(&FN, IR_CALL, IRT_VOID, (u16)pv2, 0, 0, 0,
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, t, 0, 0, 0);
+        irfn_push(&FN, IR_CALL, IRT_VOID, pv2, 0, 0, 0,
                   x64_sym(&X64, "__c6_co_publish"));
         FN.ops[FN.n - 1].narg = 1;
         (void)pa2;
@@ -2379,18 +2379,18 @@ static void async_unwind_gate(void)
     if (!CUR_TASK_TY)
         return;
     uv = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CALL, IRT_I64, (u16)uv, 0, 0, 0,
+    irfn_push(&FN, IR_CALL, IRT_I64, uv, 0, 0, 0,
               x64_sym(&X64, "__c6_co_unwind_pending"));
     FN.ops[FN.n - 1].narg = 0;
     z = irfn_vreg(&FN);
     cc = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)z, 0, 0, 0, 0);
-    irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc, (u16)uv, (u16)z, 0, 0);
+    irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
+    irfn_push(&FN, IR_CMP, IRT_I64, cc, uv, z, 0, 0);
     FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
     lclean = irfn_label(&FN);
     cont = irfn_label(&FN);
-    irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cc, (u16)lclean, (u16)cont, 0);
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lclean, 0, 0, 0);
+    irfn_push(&FN, IR_BR, IRT_VOID, 0, cc, lclean, cont, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lclean, 0, 0, 0);
     /* 回卷：就地收尾——把**此刻**还登记着的清理体（defer、errdefer、托管
      * 局部量）逆序跑掉，任务按失败结，然后直接返回。放在挂起点原地而不是跳到
      * 函数末尾，是因为块的清理代码就发在块尾，跳过去会把它整个跳过
@@ -2401,9 +2401,9 @@ static void async_unwind_gate(void)
         defer_run(1, 1);
         dt = task_get();
         task_seal(dt);
-        irfn_push(&FN, IR_RET, IRT_PTR, 0, (u16)dt, 0, 0, 0);
+        irfn_push(&FN, IR_RET, IRT_PTR, 0, dt, 0, 0, 0);
     }
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)cont, 0, 0, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, cont, 0, 0, 0);
 }
 
 static u32 task_get(void)
@@ -2411,8 +2411,8 @@ static u32 task_get(void)
     u32 a = irfn_vreg(&FN);
     u32 t = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)a, 0, 0, 0, X64_SLOT(TASK_SLOT));
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)t, (u16)a, 0, 0, 0);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, a, 0, 0, 0, X64_SLOT(TASK_SLOT));
+    irfn_push(&FN, IR_LOAD, IRT_PTR, t, a, 0, 0, 0);
     return t;
 }
 
@@ -2432,30 +2432,30 @@ static void task_seal(u32 tsk)
     if (!CUR_FALLIBLE)
         return;
     f = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CALL, IRT_I64, (u16)f, 0, 0, 0,
+    irfn_push(&FN, IR_CALL, IRT_I64, f, 0, 0, 0,
               x64_sym(&X64, "__tcc_err_flag_get"));
     FN.ops[FN.n - 1].narg = 0;
     if (TASK_ERR_SLOT) {
         a = irfn_vreg(&FN);
         e = irfn_vreg(&FN);
         c = irfn_vreg(&FN);
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)a, 0, 0, 0, X64_SLOT(TASK_ERR_SLOT));
-        irfn_push(&FN, IR_LOAD, IRT_I64, (u16)e, (u16)a, 0, 0, 0);
-        irfn_push(&FN, IR_CMP, IRT_I64, (u16)c, (u16)f, (u16)e, 0, 0);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, a, 0, 0, 0, X64_SLOT(TASK_ERR_SLOT));
+        irfn_push(&FN, IR_LOAD, IRT_I64, e, a, 0, 0, 0);
+        irfn_push(&FN, IR_CMP, IRT_I64, c, f, e, 0, 0);
         FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
         f = c;
     }
     {
         u32 ka = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)ka, (u16)tsk, 0, 0,
+        irfn_push(&FN, IR_LEA, IRT_PTR, ka, tsk, 0, 0,
                   task_off("kind", 4));
-        irfn_push(&FN, IR_STORE, IRT_U64, (u16)ka, (u16)f, 0, 0, 0);
+        irfn_push(&FN, IR_STORE, IRT_U64, ka, f, 0, 0, 0);
     }
     if (TASK_ERR_SLOT) {
         u32 z = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CALL, IRT_VOID, (u16)z, 0, 0, 0,
+        irfn_push(&FN, IR_CALL, IRT_VOID, z, 0, 0, 0,
                   x64_sym(&X64, "__tcc_err_clear"));
         FN.ops[FN.n - 1].narg = 0;
     }
@@ -2478,9 +2478,10 @@ static int PA_TYPE_ATOM;
 
 /* __attribute__((constructor)) 收集表：进程入口在 main 之前按序调用 */
 /* c6 的 `test "名字" { … }` 块：编成一个 int(void) 函数，失败返回非 0。
- * 名字进表里，`--run-tests` 时按顺序调用（P6-5）。 */
+ * 名字进表里，-test / 合成的测试入口按顺序调用。 */
 static u32 TESTS[512];
-static const char *TEST_NAMES[512];
+static const char *TEST_NAMES[512];    /* "test:描述"（旧版 FAIL 行用） */
+static const char *TEST_DESCS[512];    /* 只有描述：-test 的 PASS/FAIL/过滤用 */
 static u32 NTESTS;
 
 static u32 CTORS[256];
@@ -2496,6 +2497,16 @@ static int PA_SAW_ENUM;
 static int PA_SYNTAX_ONLY;
 /* -run：输出只是临时 ELF，别把临时文件名报出来（main.c6 里置 1） */
 static int PA_QUIET_OUT;
+/* -test：跑 test 块、不跑用户 main（和 tcc 的 -test 同语义、同输出协议）。
+ * PA_TEST_FILTER 是 -test-filter 给的子串，NULL/空串表示全跑。 */
+static int PA_TEST_MODE;
+static const char *PA_TEST_FILTER;
+
+void pa_set_test_mode(const char *filter)
+{
+    PA_TEST_MODE = 1;
+    PA_TEST_FILTER = filter;
+}
 
 /* 吞掉多余的初始化器元素：跳到 depth 0 处的 ',' 或 '}'（都不吃掉） */
 static void skip_init_list(void)
@@ -6652,7 +6663,7 @@ static u32 load_lval(u32 addr, u32 ty)
 {
     u32 d = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_LOAD, ir_ty_of(ty), (u16)d, (u16)addr, 0, 0, 0);
+    irfn_push(&FN, IR_LOAD, ir_ty_of(ty), d, addr, 0, 0, 0);
     return d;
 }
 
@@ -6663,10 +6674,10 @@ static void store_lval(u32 addr, u32 ty, u32 val)
      * 1/2/4/8 的宽度，写成它只会拷头 8 字节（踩过：结构体拷贝只过前 8 字节，
      * 编译器自己编译自己时整个预处理器都读不出 token）。 */
     if (ty_is_agg(ty) || ty_is_array(ty)) {
-        irfn_push(&FN, IR_COPY, IRT_U8, (u16)addr, (u16)val, 0, 0, ty_size(ty));
+        irfn_push(&FN, IR_COPY, IRT_U8, addr, val, 0, 0, ty_size(ty));
         return;
     }
-    irfn_push(&FN, IR_STORE, ir_ty_of(ty), (u16)addr, (u16)val, 0, 0, 0);
+    irfn_push(&FN, IR_STORE, ir_ty_of(ty), addr, val, 0, 0, 0);
 }
 
 /* 位域写入：读存储单元 → 清掉这一段 → 把值左移掩码后或进去 → 写回单元。
@@ -6678,7 +6689,7 @@ static u32 bf_k(u64 c)
 {
     u32 v = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_CONSTK, IRT_U64, (u16)v, 0, 0, 0, irfn_kconst(&FN, c));
+    irfn_push(&FN, IR_CONSTK, IRT_U64, v, 0, 0, 0, irfn_kconst(&FN, c));
     return v;
 }
 
@@ -6686,7 +6697,7 @@ static u32 bf_bin(u8 op, u32 a, u32 b)
 {
     u32 d = irfn_vreg(&FN);
 
-    irfn_push(&FN, op, IRT_U64, (u16)d, (u16)a, (u16)b, 0, 0);
+    irfn_push(&FN, op, IRT_U64, d, a, b, 0, 0);
     return d;
 }
 
@@ -6735,9 +6746,9 @@ static void store_lval_bits(u32 addr, u32 ty, u32 bits, u32 bo, u32 val)
     if (bo > 0) {
         u32 k = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)k, 0, 0, 0, bo);
+        irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, bo);
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_SHL, IRT_U64, (u16)d, (u16)val, (u16)k, 0, 0);
+        irfn_push(&FN, IR_SHL, IRT_U64, d, val, k, 0, 0);
     } else {
         d = val;
     }
@@ -6749,16 +6760,16 @@ static void store_lval_bits(u32 addr, u32 ty, u32 bits, u32 bo, u32 val)
         u64 fmask = (bits >= 64) ? ~0ULL : ((1ULL << bits) - 1);
 
         keep = ~(fmask << bo);
-        irfn_push(&FN, IR_CONSTK, IRT_U64, (u16)mk, 0, 0, 0, irfn_kconst(&FN, fmask << bo));
-        irfn_push(&FN, IR_AND, IRT_U64, (u16)a1, (u16)d, (u16)mk, 0, 0);
+        irfn_push(&FN, IR_CONSTK, IRT_U64, mk, 0, 0, 0, irfn_kconst(&FN, fmask << bo));
+        irfn_push(&FN, IR_AND, IRT_U64, a1, d, mk, 0, 0);
         {
             u32 km = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONSTK, IRT_U64, (u16)km, 0, 0, 0, irfn_kconst(&FN, keep));
-            irfn_push(&FN, IR_AND, IRT_U64, (u16)a2, (u16)old, (u16)km, 0, 0);
+            irfn_push(&FN, IR_CONSTK, IRT_U64, km, 0, 0, 0, irfn_kconst(&FN, keep));
+            irfn_push(&FN, IR_AND, IRT_U64, a2, old, km, 0, 0);
         }
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_OR, IRT_U64, (u16)d, (u16)a1, (u16)a2, 0, 0);
+        irfn_push(&FN, IR_OR, IRT_U64, d, a1, a2, 0, 0);
     }
     store_lval(addr, ty, d);
 }
@@ -6785,13 +6796,13 @@ static u32 clos_alloc(u32 code_sym, u32 extra)
     u32 code = irfn_vreg(&FN);
     u32 msym = x64_sym(&X64, "malloc");
 
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)msz, 0, 0, 0, 8 + extra);
-    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)msz, 0, 0, 0);
-    irfn_push(&FN, IR_CALL, IRT_PTR, (u16)env, 0, 0, 0, msym);
+    irfn_push(&FN, IR_CONST, IRT_U64, msz, 0, 0, 0, 8 + extra);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, msz, 0, 0, 0);
+    irfn_push(&FN, IR_CALL, IRT_PTR, env, 0, 0, 0, msym);
     FN.ops[FN.n - 1].narg = 1;
-    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)code, 0, 0, 0, code_sym);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, code, 0, 0, 0, code_sym);
     FN.ops[FN.n - 1].flags = 2;
-    irfn_push(&FN, IR_STORE, IRT_U64, (u16)env, (u16)code, 0, 0, 0);
+    irfn_push(&FN, IR_STORE, IRT_U64, env, code, 0, 0, 0);
     return env;
 }
 
@@ -6837,13 +6848,13 @@ static u32 clos_thunk(u32 fty)
         FN.params[FN.nparams++] = slots[i];
     }
     tgt = irfn_vreg(&FN);
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)tgt, (u16)gen_addr_off(slots[0], 8), 0, 0, 0);
+    irfn_push(&FN, IR_LOAD, IRT_PTR, tgt, gen_addr_off(slots[0], 8), 0, 0, 0);
     for (i = 0; i < np + nx && i < 16; i++)
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)slots[i + 1], 0, 0, i);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, slots[i + 1], 0, 0, i);
     dst = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CALLI, ir_ty_of(ty_target(fty)), (u16)dst, (u16)tgt, 0, 0, 0);
+    irfn_push(&FN, IR_CALLI, ir_ty_of(ty_target(fty)), dst, tgt, 0, 0, 0);
     FN.ops[FN.n - 1].narg = (u8)(np + nx < 16 ? np + nx : 16);
-    irfn_push(&FN, IR_RET, ir_ty_of(ty_target(fty)), 0, (u16)dst, 0, 0, 0);
+    irfn_push(&FN, IR_RET, ir_ty_of(ty_target(fty)), 0, dst, 0, 0, 0);
     x64_compile(&X64, &FN, tsym);
     tmpl_restore_state(&sv);
     if (n0)
@@ -6862,7 +6873,7 @@ static u32 clos_of_fn(u32 tgt, u32 fty)
     u32 env = clos_alloc(clos_thunk(fty), 8);
     u32 t8 = gen_addr_off(env, 8);
 
-    irfn_push(&FN, IR_STORE, IRT_U64, (u16)t8, (u16)tgt, 0, 0, 0);
+    irfn_push(&FN, IR_STORE, IRT_U64, t8, tgt, 0, 0, 0);
     return env;
 }
 
@@ -6906,29 +6917,29 @@ static u32 spawn_thunk(int n, u32 mgdmask)
     envs = irfn_vreg(&FN);
     FN.params[FN.nparams++] = envs;
     tg = irfn_vreg(&FN);
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)tg, (u16)gen_addr_off(envs, 8), 0, 0, 0);
+    irfn_push(&FN, IR_LOAD, IRT_PTR, tg, gen_addr_off(envs, 8), 0, 0, 0);
     for (i = 0; i < (u32)n && i < 16; i++) {
         u32 av = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_LOAD, IRT_U64, (u16)av,
-                  (u16)gen_addr_off(envs, 16 + 8 * i), 0, 0, 0);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)av, 0, 0, i);
+        irfn_push(&FN, IR_LOAD, IRT_U64, av,
+                  gen_addr_off(envs, 16 + 8 * i), 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, av, 0, 0, i);
     }
     dst = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CALLI, IRT_I64, (u16)dst, (u16)tg, 0, 0, 0);
+    irfn_push(&FN, IR_CALLI, IRT_I64, dst, tg, 0, 0, 0);
     FN.ops[FN.n - 1].narg = (u8)(n < 16 ? n : 16);
     /* 托管实参：线程体已经返回，实参块那一份计数该还回去 */
     for (i = 0; i < (u32)n && i < 16; i++)
         if (mgdmask & (1u << i)) {
             u32 rv = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_LOAD, IRT_U64, (u16)rv,
-                      (u16)gen_addr_off(envs, 16 + 8 * i), 0, 0, 0);
+            irfn_push(&FN, IR_LOAD, IRT_U64, rv,
+                      gen_addr_off(envs, 16 + 8 * i), 0, 0, 0);
             mgd_release(rv);
         }
     /* 中转函数把被调函数的返回值交出去：句柄的 h->value() 就是它
      * （`thread h = spawn f(x); h->value()`）。 */
-    irfn_push(&FN, IR_RET, IRT_I64, 0, (u16)dst, 0, 0, 0);
+    irfn_push(&FN, IR_RET, IRT_I64, 0, dst, 0, 0, 0);
     /* 中转函数也是"函数"：C99/LLVM 后端要按自己的方式发出去，不能只写镜像 */
     if (C99_MODE || llvm_mode())
         be_emit_fn(&FN, tsym);
@@ -7000,17 +7011,17 @@ static u32 load_bf(u32 addr, u32 ty, u32 bits, u32 bo, int is_signed, int zero_e
     if (bo > 0) {
         u32 k = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)k, 0, 0, 0, bo);
+        irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, bo);
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_SHR, IRT_U64, (u16)d, (u16)v2, (u16)k, 0, 0);
+        irfn_push(&FN, IR_SHR, IRT_U64, d, v2, k, 0, 0);
     }
     if (bits < 64) {
         u32 m = irfn_vreg(&FN);
         u32 d2 = irfn_vreg(&FN);
         u64 mask = (1ULL << bits) - 1;
 
-        irfn_push(&FN, IR_CONSTK, IRT_U64, (u16)m, 0, 0, 0, irfn_kconst(&FN, mask));
-        irfn_push(&FN, IR_AND, IRT_U64, (u16)d2, (u16)d, (u16)m, 0, 0);
+        irfn_push(&FN, IR_CONSTK, IRT_U64, m, 0, 0, 0, irfn_kconst(&FN, mask));
+        irfn_push(&FN, IR_AND, IRT_U64, d2, d, m, 0, 0);
         d = d2;
     }
     if (is_signed && !zero_ext && bits < 64) {
@@ -7018,9 +7029,9 @@ static u32 load_bf(u32 addr, u32 ty, u32 bits, u32 bo, int is_signed, int zero_e
         u32 a1 = irfn_vreg(&FN);
         u32 a2 = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)sh, 0, 0, 0, 64 - bits);
-        irfn_push(&FN, IR_SHL, IRT_U64, (u16)a1, (u16)d, (u16)sh, 0, 0);
-        irfn_push(&FN, IR_SAR, IRT_U64, (u16)a2, (u16)a1, (u16)sh, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, sh, 0, 0, 0, 64 - bits);
+        irfn_push(&FN, IR_SHL, IRT_U64, a1, d, sh, 0, 0);
+        irfn_push(&FN, IR_SAR, IRT_U64, a2, a1, sh, 0, 0);
         d = a2;
     }
     return d;
@@ -7049,7 +7060,7 @@ static void store_conv(u32 addr, u32 ty, u32 v, u32 vty)
         sym = iface_vtbl(ifx, sty);
 
         store_conv(gen_addr_off(addr, 0), ty_ptr(ty_void()), v, ty_ptr(ty_void()));
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)vv, 0, 0, 0, sym);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, vv, 0, 0, 0, sym);
         FN.ops[FN.n - 1].flags = 2;
         store_conv(gen_addr_off(addr, 8), ty_ptr(ty_void()), vv, ty_ptr(ty_void()));
         return;
@@ -7086,9 +7097,9 @@ static u32 mgd_call1(const char *fn, u32 v)
         return 0;
     /* v 一定是真的虚寄存器（vreg 0 也是合法的）；槽里存的 0 到运行时就是
      * NULL，release(NULL) 直接返回。 */
-    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)v, 0, 0, 0);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, v, 0, 0, 0);
     d = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CALL, IRT_VOID, (u16)d, 0, 0, 0, (u32)ms->val);
+    irfn_push(&FN, IR_CALL, IRT_VOID, d, 0, 0, 0, (u32)ms->val);
     FN.ops[FN.n - 1].narg = 1;
     return d;
 }
@@ -7152,12 +7163,12 @@ static void mgd_weak(u32 slot_addr, u32 val)
 
     if (!ms || !ms->is_func)
         return;
-    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)slot_addr, 0, 0, 0);
-    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)val, 0, 0, 1);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, slot_addr, 0, 0, 0);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, val, 0, 0, 1);
     {
         u32 d = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CALL, IRT_VOID, (u16)d, 0, 0, 0, (u32)ms->val);
+        irfn_push(&FN, IR_CALL, IRT_VOID, d, 0, 0, 0, (u32)ms->val);
         FN.ops[FN.n - 1].narg = 2;
     }
 }
@@ -7246,17 +7257,17 @@ static u32 value_of(u32 v)
             if (bo > 0) {
                 u32 k = irfn_vreg(&FN);
 
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)k, 0, 0, 0, bo);
+                irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, bo);
                 d = irfn_vreg(&FN);
-                irfn_push(&FN, IR_SHR, IRT_U64, (u16)d, (u16)v2, (u16)k, 0, 0);
+                irfn_push(&FN, IR_SHR, IRT_U64, d, v2, k, 0, 0);
             }
             if (bits < 64) {
                 u32 m = irfn_vreg(&FN);
                 u32 d2 = irfn_vreg(&FN);
                 u64 mask = (1ULL << bits) - 1;
 
-                irfn_push(&FN, IR_CONSTK, IRT_U64, (u16)m, 0, 0, 0, irfn_kconst(&FN, mask));
-                irfn_push(&FN, IR_AND, IRT_U64, (u16)d2, (u16)d, (u16)m, 0, 0);
+                irfn_push(&FN, IR_CONSTK, IRT_U64, m, 0, 0, 0, irfn_kconst(&FN, mask));
+                irfn_push(&FN, IR_AND, IRT_U64, d2, d, m, 0, 0);
                 d = d2;
             }
             /* 枚举类型的位域不符号扩展：tcc 对"只用正数的枚举"按零扩展，
@@ -7267,9 +7278,9 @@ static u32 value_of(u32 v)
                 u32 a1 = irfn_vreg(&FN);
                 u32 a2 = irfn_vreg(&FN);
 
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)sh, 0, 0, 0, 64 - bits);
-                irfn_push(&FN, IR_SHL, IRT_U64, (u16)a1, (u16)d, (u16)sh, 0, 0);
-                irfn_push(&FN, IR_SAR, IRT_U64, (u16)a2, (u16)a1, (u16)sh, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_U64, sh, 0, 0, 0, 64 - bits);
+                irfn_push(&FN, IR_SHL, IRT_U64, a1, d, sh, 0, 0);
+                irfn_push(&FN, IR_SAR, IRT_U64, a2, a1, sh, 0, 0);
                 d = a2;
             }
             v2 = d;
@@ -7294,7 +7305,7 @@ static u32 ident_addr(Sym *s)
             u32 ea = ident_addr(ev);
 
             ep = irfn_vreg(&FN);
-            irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)ep, (u16)ea, 0, 0, 0);
+            irfn_push(&FN, IR_LOAD, IRT_PTR, ep, ea, 0, 0, 0);
             return gen_addr_off(ep, idx < FL_CAP_MAX ? FLCAP_OFF[idx] : 8);
         }
     }
@@ -7308,17 +7319,17 @@ static u32 ident_addr(Sym *s)
             u32 off = irfn_vreg(&FN);
             u32 r = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CALL, IRT_U64, (u16)fs, 0, 0, 0, fsfn);
+            irfn_push(&FN, IR_CALL, IRT_U64, fs, 0, 0, 0, fsfn);
             FN.ops[FN.n - 1].narg = 0;
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)off, 0, 0, 0, s->goff);
-            irfn_push(&FN, IR_ADD, IRT_PTR, (u16)r, (u16)fs, (u16)off, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, off, 0, 0, 0, s->goff);
+            irfn_push(&FN, IR_ADD, IRT_PTR, r, fs, off, 0, 0);
             return r;
         }
         /* 全局符号：rip 相对 + 重定位（位置无关；做 .o 时直接变 R_X86_64_PC32） */
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)v, 0, 0, 0, (u32)s->val);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, v, 0, 0, 0, (u32)s->val);
         FN.ops[FN.n - 1].flags = 2;
     } else {
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)v, 0, 0, 0, X64_SLOT(s->slot));
+        irfn_push(&FN, IR_ADDR, IRT_PTR, v, 0, 0, 0, X64_SLOT(s->slot));
     }
     return v;
 }
@@ -7497,7 +7508,7 @@ static u32 gen_str_from(const char *str, u32 len)
     snprintf(nm, sizeof(nm), ".LC%u", NLIT++);
     sym = x64_data_sym(&X64, nm, ELF_HDR + off);
     v = irfn_vreg(&FN);
-    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)v, 0, 0, 0, sym);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, v, 0, 0, 0, sym);
     FN.ops[FN.n - 1].flags = 2;
     GEN_TY = ty_ptr(ty_char());
     return v;
@@ -7509,7 +7520,7 @@ static u32 gen_string(void)
     u32 v = irfn_vreg(&FN);
 
     (void)off;
-    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)v, 0, 0, 0, LIT_SYM);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, v, 0, 0, 0, LIT_SYM);
     FN.ops[FN.n - 1].flags = 2;
     GEN_TY = ty_ptr(WIDE_LIT ? ty_int() : ty_char());
     return v;
@@ -7638,10 +7649,10 @@ static u32 gen_call(Sym *fs)
                         u32 vv2 = irfn_vreg(&FN);
                         u32 sym2 = iface_vtbl(ifx, sty2);
 
-                        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)ta2, 0, 0, 0, X64_SLOT(ts2));
+                        irfn_push(&FN, IR_ADDR, IRT_PTR, ta2, 0, 0, 0, X64_SLOT(ts2));
                         store_conv(gen_addr_off(ta2, 0), ty_ptr(ty_void()), av,
                                    ty_ptr(ty_void()));
-                        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)vv2, 0, 0, 0, sym2);
+                        irfn_push(&FN, IR_ADDR, IRT_PTR, vv2, 0, 0, 0, sym2);
                         FN.ops[FN.n - 1].flags = 2;
                         store_conv(gen_addr_off(ta2, 8), ty_ptr(ty_void()), vv2,
                                    ty_ptr(ty_void()));
@@ -7655,12 +7666,12 @@ static u32 gen_call(Sym *fs)
                     u32 lv = irfn_vreg(&FN);
                     u32 a8 = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)taddr, 0, 0, 0, X64_SLOT(tslot));
-                    irfn_push(&FN, IR_STORE, IRT_PTR, (u16)taddr, (u16)av, 0, 0, 0);
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)lv, 0, 0, 0,
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, taddr, 0, 0, 0, X64_SLOT(tslot));
+                    irfn_push(&FN, IR_STORE, IRT_PTR, taddr, av, 0, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, lv, 0, 0, 0,
                               ty_array_n(aty) ? ty_array_n(aty) : 1);
-                    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a8, (u16)taddr, 0, 0, 8);
-                    irfn_push(&FN, IR_STORE, IRT_U64, (u16)a8, (u16)lv, 0, 0, 0);
+                    irfn_push(&FN, IR_LEA, IRT_PTR, a8, taddr, 0, 0, 8);
+                    irfn_push(&FN, IR_STORE, IRT_U64, a8, lv, 0, 0, 0);
                     av = taddr;
                     aty = pty;
                 }
@@ -7681,8 +7692,8 @@ static u32 gen_call(Sym *fs)
                     u32 tslot = frame_slots_for(sz);
                     u32 taddr = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)taddr, 0, 0, 0, X64_SLOT(tslot));
-                    irfn_push(&FN, IR_COPY, IRT_U8, (u16)taddr, (u16)av, 0, 0, sz);
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, taddr, 0, 0, 0, X64_SLOT(tslot));
+                    irfn_push(&FN, IR_COPY, IRT_U8, taddr, av, 0, 0, sz);
                     av = taddr;
                 }
                 args[narg] = av;
@@ -7719,7 +7730,7 @@ static u32 gen_call(Sym *fs)
         while (narg < np0 && narg < 16) {
             u32 z0 = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)z0, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, z0, 0, 0, 0, 0);
             args[narg] = z0;
             narg++;
         }
@@ -7736,30 +7747,30 @@ static u32 gen_call(Sym *fs)
         u32 cov = irfn_vreg(&FN);
         u32 tsk2 = 0;
 
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)tgv2, 0, 0, 0, (u32)fs->val);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, tgv2, 0, 0, 0, (u32)fs->val);
         FN.ops[FN.n - 1].flags = 2;
-        irfn_push(&FN, IR_STORE, IRT_U64, (u16)gen_addr_off(env2, 8), (u16)tgv2, 0, 0, 0);
+        irfn_push(&FN, IR_STORE, IRT_U64, gen_addr_off(env2, 8), tgv2, 0, 0, 0);
         for (i = 0; i < narg; i++) {
-            irfn_push(&FN, IR_STORE, IRT_U64, (u16)gen_addr_off(env2, 16 + 8 * i),
-                      (u16)args[i], 0, 0, 0);
+            irfn_push(&FN, IR_STORE, IRT_U64, gen_addr_off(env2, 16 + 8 * i),
+                      args[i], 0, 0, 0);
             /* 这里**不** retain：任务体在入口处会为每个托管形参在前缀里留一份
              * （见函数声明那一段），创建者手上那份照旧归自己。 */
         }
         {
             u32 nf = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)nf, 0, 0, 0,
+            irfn_push(&FN, IR_CONST, IRT_U64, nf, 0, 0, 0,
                       (u32)(PA_CO_STMT ? 1 : 0));
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)env2, 0, 0, 0);
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)nf, 0, 0, 1);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, env2, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, nf, 0, 0, 1);
         }
-        irfn_push(&FN, IR_CALL, IRT_PTR, (u16)cov, 0, 0, 0,
+        irfn_push(&FN, IR_CALL, IRT_PTR, cov, 0, 0, 0,
                   x64_sym(&X64, "__c6_co_new"));
         FN.ops[FN.n - 1].narg = 2;
         FN.ops[FN.n - 1].narg = 1;
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)cov, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, cov, 0, 0, 0);
         tsk2 = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CALL, IRT_PTR, (u16)tsk2, 0, 0, 0,
+        irfn_push(&FN, IR_CALL, IRT_PTR, tsk2, 0, 0, 0,
                   x64_sym(&X64, "__c6_co_launch"));
         FN.ops[FN.n - 1].narg = 1;
         dst = tsk2;
@@ -7768,9 +7779,9 @@ static u32 gen_call(Sym *fs)
         return dst;
     }
     for (i = 0; i < narg; i++)
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)args[i], 0, 0, i);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, args[i], 0, 0, i);
     dst = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(fs->type)), (u16)dst, 0, 0, 0,
+    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(fs->type)), dst, 0, 0, 0,
               (u32)fs->val);
     FN.ops[FN.n - 1].narg = (u8)narg;
     if (ty_func_variadic(fs->type))
@@ -7878,7 +7889,7 @@ static u32 gen_postfix_ops(u32 v)
 
                     pa_advance();
                     zero0 = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)zero0, 0, 0, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, zero0, 0, 0, 0, 0);
                     lo = zero0;
                     if (!pa_is_ch(']')) {
                         hi = value_of(gen_expr());
@@ -7886,36 +7897,36 @@ static u32 gen_postfix_ops(u32 v)
                         hi = slice_len_load(slice_src);
                     } else if (ty_is_ptr(bty) || ty_is_array(bty)) {
                         hi = irfn_vreg(&FN);
-                        irfn_push(&FN, IR_CONST, IRT_U64, (u16)hi, 0, 0, 0,
+                        irfn_push(&FN, IR_CONST, IRT_U64, hi, 0, 0, 0,
                                   ty_is_array(bty) ? ty_array_n(bty) : 0);
                     } else {
                         hi = irfn_vreg(&FN);
-                        irfn_push(&FN, IR_CONST, IRT_U64, (u16)hi, 0, 0, 0, 0);
+                        irfn_push(&FN, IR_CONST, IRT_U64, hi, 0, 0, 0, 0);
                     }
                     pa_expect_ch(']');
                     tmp = frame_slots_for(16);
                     ta = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)ta, 0, 0, 0, X64_SLOT(tmp));
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, ta, 0, 0, 0, X64_SLOT(tmp));
                     pv = irfn_vreg(&FN);
                     if (se == 1 || se == 2 || se == 4 || se == 8) {
-                        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)pv, (u16)base, (u16)lo, 0, se);
+                        irfn_push(&FN, IR_LEA, IRT_PTR, pv, base, lo, 0, se);
                     } else {
                         u32 kk = irfn_vreg(&FN);
                         u32 mm = irfn_vreg(&FN);
 
-                        irfn_push(&FN, IR_CONST, IRT_U64, (u16)kk, 0, 0, 0, se);
-                        irfn_push(&FN, IR_MUL, IRT_U64, (u16)mm, (u16)lo, (u16)kk, 0, 0);
-                        irfn_push(&FN, IR_ADD, IRT_PTR, (u16)pv, (u16)base, (u16)mm, 0, 0);
+                        irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, se);
+                        irfn_push(&FN, IR_MUL, IRT_U64, mm, lo, kk, 0, 0);
+                        irfn_push(&FN, IR_ADD, IRT_PTR, pv, base, mm, 0, 0);
                     }
                     lv = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_SUB, IRT_U64, (u16)lv, (u16)hi, (u16)lo, 0, 0);
+                    irfn_push(&FN, IR_SUB, IRT_U64, lv, hi, lo, 0, 0);
                     {
                         u32 a1 = irfn_vreg(&FN);
                         u32 a2 = irfn_vreg(&FN);
 
-                        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a1, (u16)ta, 0, 0, 0);
+                        irfn_push(&FN, IR_LEA, IRT_PTR, a1, ta, 0, 0, 0);
                         store_conv(a1, ty_ptr(selt), pv, ty_ptr(selt));
-                        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a2, (u16)ta, 0, 0, 8);
+                        irfn_push(&FN, IR_LEA, IRT_PTR, a2, ta, 0, 0, 8);
                         store_conv(a2, ty_ulong(), lv, ty_ulong());
                     }
                     GEN_TY = ty_slice_chk(selt);
@@ -7954,35 +7965,35 @@ static u32 gen_postfix_ops(u32 v)
                     hi = slice_len_load(slice_src);
                 } else if (ty_is_array(bty)) {
                     hi = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)hi, 0, 0, 0, ty_array_n(bty));
+                    irfn_push(&FN, IR_CONST, IRT_U64, hi, 0, 0, 0, ty_array_n(bty));
                 } else {
                     hi = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)hi, 0, 0, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, hi, 0, 0, 0, 0);
                 }
                 pa_expect_ch(']');
                 tmp = frame_slots_for(16);
                 ta = irfn_vreg(&FN);
-                irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)ta, 0, 0, 0, X64_SLOT(tmp));
+                irfn_push(&FN, IR_ADDR, IRT_PTR, ta, 0, 0, 0, X64_SLOT(tmp));
                 pv = irfn_vreg(&FN);
                 if (se == 1 || se == 2 || se == 4 || se == 8) {
-                    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)pv, (u16)base, (u16)lo, 0, se);
+                    irfn_push(&FN, IR_LEA, IRT_PTR, pv, base, lo, 0, se);
                 } else {
                     u32 kk = irfn_vreg(&FN);
                     u32 mm = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)kk, 0, 0, 0, se);
-                    irfn_push(&FN, IR_MUL, IRT_U64, (u16)mm, (u16)lo, (u16)kk, 0, 0);
-                    irfn_push(&FN, IR_ADD, IRT_PTR, (u16)pv, (u16)base, (u16)mm, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, se);
+                    irfn_push(&FN, IR_MUL, IRT_U64, mm, lo, kk, 0, 0);
+                    irfn_push(&FN, IR_ADD, IRT_PTR, pv, base, mm, 0, 0);
                 }
                 lv = irfn_vreg(&FN);
-                irfn_push(&FN, IR_SUB, IRT_U64, (u16)lv, (u16)hi, (u16)lo, 0, 0);
+                irfn_push(&FN, IR_SUB, IRT_U64, lv, hi, lo, 0, 0);
                 {
                     u32 a1 = irfn_vreg(&FN);
                     u32 a2 = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a1, (u16)ta, 0, 0, 0);
+                    irfn_push(&FN, IR_LEA, IRT_PTR, a1, ta, 0, 0, 0);
                     store_conv(a1, ty_ptr(selt), pv, ty_ptr(selt));
-                    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a2, (u16)ta, 0, 0, 8);
+                    irfn_push(&FN, IR_LEA, IRT_PTR, a2, ta, 0, 0, 8);
                     store_conv(a2, ty_ulong(), lv, ty_ulong());
                 }
                 GEN_TY = ty_slice_chk(selt);
@@ -8003,14 +8014,14 @@ static u32 gen_postfix_ops(u32 v)
                 esz = 1;
             off = irfn_vreg(&FN);
             if (esz == 1 || esz == 2 || esz == 4 || esz == 8) {
-                irfn_push(&FN, IR_LEA, IRT_PTR, (u16)off, (u16)base, (u16)idx, 0, esz);
+                irfn_push(&FN, IR_LEA, IRT_PTR, off, base, idx, 0, esz);
             } else {
                 u32 k = irfn_vreg(&FN);
                 u32 m = irfn_vreg(&FN);
 
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)k, 0, 0, 0, esz);
-                irfn_push(&FN, IR_MUL, IRT_U64, (u16)m, (u16)idx, (u16)k, 0, 0);
-                irfn_push(&FN, IR_ADD, IRT_PTR, (u16)off, (u16)base, (u16)m, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, esz);
+                irfn_push(&FN, IR_MUL, IRT_U64, m, idx, k, 0, 0);
+                irfn_push(&FN, IR_ADD, IRT_PTR, off, base, m, 0, 0);
             }
             mark_lval(off, elem);
             /* `h->arr[0]`：托管数组字段的元素也是托管引用（成员那一层已经把
@@ -8047,11 +8058,11 @@ static u32 gen_postfix_ops(u32 v)
                 }
                 pa_expect_ch(')');
             }
-            irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)code, (u16)envv, 0, 0, 0);
+            irfn_push(&FN, IR_LOAD, IRT_PTR, code, envv, 0, 0, 0);
             for (i2 = 0; i2 < narg; i2++)
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)args[i2], 0, 0, i2);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, args[i2], 0, 0, i2);
             dst = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CALLI, ir_ty_of(ty_target(cft2)), (u16)dst, (u16)code, 0, 0, 0);
+            irfn_push(&FN, IR_CALLI, ir_ty_of(ty_target(cft2)), dst, code, 0, 0, 0);
             FN.ops[FN.n - 1].narg = (u8)narg;
             if (ty_func_variadic(cft2))
                 FN.ops[FN.n - 1].flags |= 1;   /* 变参：实参个数按实际传的算 */
@@ -8085,9 +8096,9 @@ static u32 gen_postfix_ops(u32 v)
                 pa_expect_ch(')');
             }
             for (i2 = 0; i2 < narg; i2++)
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)args[i2], 0, 0, i2);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, args[i2], 0, 0, i2);
             dst = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CALLI, ir_ty_of(ty_target(ft)), (u16)dst, (u16)fptr, 0, 0, 0);
+            irfn_push(&FN, IR_CALLI, ir_ty_of(ty_target(ft)), dst, fptr, 0, 0, 0);
             FN.ops[FN.n - 1].narg = (u8)narg;
             if (ty_func_variadic(ft))
                 FN.ops[FN.n - 1].flags |= 1;
@@ -8112,9 +8123,9 @@ static u32 gen_postfix_ops(u32 v)
             pa_advance();
             ao = value_of(v);
             av3 = irfn_vreg(&FN);
-            irfn_push(&FN, IR_LEA, IRT_PTR, (u16)av3, (u16)ao, 0, 0, 56);
+            irfn_push(&FN, IR_LEA, IRT_PTR, av3, ao, 0, 0, 56);
             vv3 = irfn_vreg(&FN);
-            irfn_push(&FN, IR_LOAD, IRT_I64, (u16)vv3, (u16)av3, 0, 0, 0);
+            irfn_push(&FN, IR_LOAD, IRT_I64, vv3, av3, 0, 0, 0);
             GEN_TY = ty_long();
             PEND_LVAL = 0;
             v = vv3;
@@ -8148,17 +8159,17 @@ static u32 gen_postfix_ops(u32 v)
             if (m == 3) {
                 u32 zv = 0;
 
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)tv, 0, 0, 0);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, tv, 0, 0, 0);
                 zv = irfn_vreg(&FN);
-                irfn_push(&FN, IR_CALL, IRT_VOID, (u16)zv, 0, 0, 0,
+                irfn_push(&FN, IR_CALL, IRT_VOID, zv, 0, 0, 0,
                           x64_sym(&X64, "__c6_co_destroy"));
                 FN.ops[FN.n - 1].narg = 1;
                 dv = irfn_vreg(&FN);
-                irfn_push(&FN, IR_CONST, IRT_I64, (u16)dv, 0, 0, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_I64, dv, 0, 0, 0, 0);
             } else {
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)tv, 0, 0, 0);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, tv, 0, 0, 0);
                 dv = irfn_vreg(&FN);
-                irfn_push(&FN, IR_CALL, IRT_I64, (u16)dv, 0, 0, 0,
+                irfn_push(&FN, IR_CALL, IRT_I64, dv, 0, 0, 0,
                           x64_sym(&X64, m == 1 ? "__c6_co_state"
                                                : (m == 2 ? "__c6_co_kind"
                                                          : (m == 4 ? "__c6_co_start"
@@ -8169,8 +8180,8 @@ static u32 gen_postfix_ops(u32 v)
                     u32 z2 = irfn_vreg(&FN);
                     u32 c2 = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_CONST, IRT_I64, (u16)z2, 0, 0, 0, 0xFFFFFFFFu);
-                    irfn_push(&FN, IR_CMP, IRT_I64, (u16)c2, (u16)dv, (u16)z2, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_I64, z2, 0, 0, 0, 0xFFFFFFFFu);
+                    irfn_push(&FN, IR_CMP, IRT_I64, c2, dv, z2, 0, 0);
                     FN.ops[FN.n - 1].flags = (u8)IRCC_EQ;
                     dv = c2;
                 }
@@ -8194,7 +8205,7 @@ static u32 gen_postfix_ops(u32 v)
                 pa_advance();
                 pa_expect_ch(')');
             }
-            irfn_push(&FN, IR_CONST, IRT_I64, (u16)wv, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_I64, wv, 0, 0, 0, 0);
             GEN_TY = ty_int();
             PEND_LVAL = 0;
             v = wv;
@@ -8210,7 +8221,7 @@ static u32 gen_postfix_ops(u32 v)
                 pa_advance();
                 pa_expect_ch(')');
             }
-            irfn_push(&FN, IR_CONST, IRT_I64, (u16)vv2, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_I64, vv2, 0, 0, 0, 0);
             GEN_TY = ty_int();
             PEND_LVAL = 0;
             v = vv2;
@@ -8230,9 +8241,9 @@ static u32 gen_postfix_ops(u32 v)
                 pa_advance();
                 pa_expect_ch(')');
             }
-            irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)hp2, (u16)hv2, 0, 0, 0);
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)hp2, 0, 0, 0);
-            irfn_push(&FN, IR_CALL, IRT_I64, (u16)dv2, 0, 0, 0, fs2);
+            irfn_push(&FN, IR_LOAD, IRT_PTR, hp2, hv2, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, hp2, 0, 0, 0);
+            irfn_push(&FN, IR_CALL, IRT_I64, dv2, 0, 0, 0, fs2);
             FN.ops[FN.n - 1].narg = 1;
             GEN_TY = is_done ? ty_int() : ty_ptr(ty_void());
             PEND_LVAL = 0;
@@ -8248,7 +8259,7 @@ static u32 gen_postfix_ops(u32 v)
             pa_advance();
             pa_advance();
             pa_expect_ch(')');
-            irfn_push(&FN, IR_CONST, IRT_I64, (u16)dv3, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_I64, dv3, 0, 0, 0, 0);
             GEN_TY = ty_int();
             PEND_LVAL = 0;
             v = dv3;
@@ -8268,11 +8279,11 @@ static u32 gen_postfix_ops(u32 v)
             pa_advance();                    /* join */
             pa_advance();                    /* ( */
             pa_expect_ch(')');
-            irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)a0, (u16)hv, 0, 0, 0);
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)zz, 0, 0, 0, 0);
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)a0, 0, 0, 0);
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)zz, 0, 0, 1);
-            irfn_push(&FN, IR_CALL, IRT_I64, (u16)dd, 0, 0, 0, pj);
+            irfn_push(&FN, IR_LOAD, IRT_PTR, a0, hv, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, zz, 0, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, a0, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, zz, 0, 0, 1);
+            irfn_push(&FN, IR_CALL, IRT_I64, dd, 0, 0, 0, pj);
             FN.ops[FN.n - 1].narg = 2;
             GEN_TY = ty_int();
             PEND_LVAL = 0;
@@ -8363,15 +8374,15 @@ static u32 gen_postfix_ops(u32 v)
                         continue;
                     }
                     selfv = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)selfv, (u16)addr, 0, 0, 0);
+                    irfn_push(&FN, IR_LOAD, IRT_PTR, selfv, addr, 0, 0, 0);
                     {
                         u32 a8 = gen_addr_off(addr, 8);
                         u32 vtv = irfn_vreg(&FN);
 
-                        irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)vtv, (u16)a8, 0, 0, 0);
+                        irfn_push(&FN, IR_LOAD, IRT_PTR, vtv, a8, 0, 0, 0);
                         fnv = irfn_vreg(&FN);
-                        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)fnv, (u16)vtv, 0, 0, mi * 8);
-                        irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)fnv, (u16)fnv, 0, 0, 0);
+                        irfn_push(&FN, IR_LEA, IRT_PTR, fnv, vtv, 0, 0, mi * 8);
+                        irfn_push(&FN, IR_LOAD, IRT_PTR, fnv, fnv, 0, 0, 0);
                     }
                     avs[narg++] = selfv;
                     if (pa_accept_ch('(')) {
@@ -8386,9 +8397,9 @@ static u32 gen_postfix_ops(u32 v)
                         }
                     }
                     for (k = 0; k < narg; k++)
-                        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)avs[k], 0, 0, k);
+                        irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k], 0, 0, k);
                     dst3 = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_CALLI, IRT_I64, (u16)dst3, (u16)fnv, 0, 0, 0);
+                    irfn_push(&FN, IR_CALLI, IRT_I64, dst3, fnv, 0, 0, 0);
                     FN.ops[FN.n - 1].narg = (u8)narg;
                     GEN_TY = IFACE_RET[ifix][mi] ? IFACE_RET[ifix][mi] : ty_int();
                     PEND_LVAL = 0;
@@ -8432,9 +8443,9 @@ static u32 gen_postfix_ops(u32 v)
                         }
                     }
                     for (k2 = 0; k2 < narg; k2++)
-                        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)avs[k2], 0, 0, k2);
+                        irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k2], 0, 0, k2);
                     dst2 = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(ms->type)), (u16)dst2,
+                    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(ms->type)), dst2,
                               0, 0, 0, (u32)ms->val);
                     FN.ops[FN.n - 1].narg = (u8)narg;
                     GEN_TY = ty_target(ms->type);
@@ -8521,9 +8532,9 @@ static u32 gen_postfix_ops(u32 v)
                         }
                     }
                     for (k2 = 0; k2 < narg; k2++)
-                        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)avs[k2], 0, 0, k2);
+                        irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k2], 0, 0, k2);
                     dst3 = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(ms->type)), (u16)dst3,
+                    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(ms->type)), dst3,
                               0, 0, 0, (u32)ms->val);
                     FN.ops[FN.n - 1].narg = (u8)narg;
                     GEN_TY = ty_target(ms->type);
@@ -8539,7 +8550,7 @@ static u32 gen_postfix_ops(u32 v)
             a2 = addr;
             if (off) {
                 a2 = irfn_vreg(&FN);
-                irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a2, (u16)addr, 0, 0, off);
+                irfn_push(&FN, IR_LEA, IRT_PTR, a2, addr, 0, 0, off);
             }
             mark_lval(a2, mty);
             if (mgdst_kind(bty, AGG_FOUND_IDX))
@@ -8576,11 +8587,11 @@ static u32 gen_postfix_ops(u32 v)
                            : load_lval(addr, ty);
                 one = irfn_vreg(&FN);
                 /* 指针的 ++/-- 要按**元素大小**步进（`struct R *q; q++` 加的是 24） */
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)one, 0, 0, 0,
+                irfn_push(&FN, IR_CONST, IRT_U64, one, 0, 0, 0,
                           ty_is_ptr(ty) ? (ty_size(ty_target(ty)) ? ty_size(ty_target(ty)) : 1) : 1);
                 nv = irfn_vreg(&FN);
-                irfn_push(&FN, inc ? IR_ADD : IR_SUB, ir_ty_of(ty), (u16)nv, (u16)old_v,
-                          (u16)one, 0, 0);
+                irfn_push(&FN, inc ? IR_ADD : IR_SUB, ir_ty_of(ty), nv, old_v,
+                          one, 0, 0);
                 if (bb)
                     store_lval_bits(addr, ty, bb, bb_off, nv);
                 else
@@ -8673,9 +8684,9 @@ static u32 gen_int_lit(u64 c, u32 ty)
     u32 irt = ir_ty_of(ty);
 
     if (c <= 0xFFFFFFFFULL)
-        irfn_push(&FN, IR_CONST, irt, (u16)d, 0, 0, 0, (u32)c);
+        irfn_push(&FN, IR_CONST, irt, d, 0, 0, 0, (u32)c);
     else
-        irfn_push(&FN, IR_CONSTK, irt, (u16)d, 0, 0, 0, irfn_kconst(&FN, c));
+        irfn_push(&FN, IR_CONSTK, irt, d, 0, 0, 0, irfn_kconst(&FN, c));
     GEN_TY = ty;
     return d;
 }
@@ -8785,7 +8796,7 @@ static u32 gen_postfix(void)
         u32 d = irfn_vreg(&FN);
 
         pa_advance();
-        irfn_push(&FN, IR_CONSTK, ir_ty_of(fty), (u16)d, 0, 0, 0,
+        irfn_push(&FN, IR_CONSTK, ir_ty_of(fty), d, 0, 0, 0,
                   irfn_kconst(&FN, bits));
         GEN_TY = fty;
         return gen_postfix_ops(d);
@@ -8853,15 +8864,15 @@ static u32 gen_postfix(void)
             Sym *gm2 = sym_find("c6c_err_msg", 11);
 
             if (gm2) {
-                irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)msv, (u16)ident_addr(gm2), 0, 0, 0);
+                irfn_push(&FN, IR_LOAD, IRT_PTR, msv, ident_addr(gm2), 0, 0, 0);
             } else {
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)msv, 0, 0, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_U64, msv, 0, 0, 0, 0);
             }
             /* id 是运行期算出来的 vreg，不是常量——以前这里把 vreg 号当成立即数
              * 塞进 IR_CONST，`__tcc_err_set` 收到的 id 全是错的。 */
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)d, 0, 0, 0);
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)msv, 0, 0, 1);
-            irfn_push(&FN, IR_CALL, IRT_VOID, (u16)ign, 0, 0, 0,
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, d, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, msv, 0, 0, 1);
+            irfn_push(&FN, IR_CALL, IRT_VOID, ign, 0, 0, 0,
                       x64_sym(&X64, "__tcc_err_set"));
             FN.ops[FN.n - 1].narg = 2;
         }
@@ -8912,7 +8923,7 @@ static u32 gen_postfix(void)
         if (ty_is_ptr(mty3)) {
             u32 z0 = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)z0, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, z0, 0, 0, 0, 0);
             store_lval(maddr, mty3, z0);
         }
         GEN_TY = mty2;
@@ -8940,7 +8951,7 @@ static u32 gen_postfix(void)
                 u32 slot = frame_slots_for((u32)n);
 
                 addr = irfn_vreg(&FN);
-                irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
+                irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
             }
         } else {
             u32 cnt = value_of(gen_assign());
@@ -8948,7 +8959,7 @@ static u32 gen_postfix(void)
             pa_expect_ch(')');
             addr = irfn_vreg(&FN);
             /* imm = 1：a 直接就是字节数 */
-            irfn_push(&FN, IR_ALLOCA, IRT_PTR, (u16)addr, (u16)cnt, 0, 0, 1);
+            irfn_push(&FN, IR_ALLOCA, IRT_PTR, addr, cnt, 0, 0, 1);
         }
         GEN_TY = ty_ptr(ty_void());
         return gen_postfix_ops(addr);
@@ -8963,13 +8974,13 @@ static u32 gen_postfix(void)
         for (k = 0; k < 7; k++) {
             u32 a = value_of(gen_assign());
 
-            irfn_push(&FN, IR_ARG, IRT_VOID, 0, (u16)a, 0, 0, k);
+            irfn_push(&FN, IR_ARG, IRT_VOID, 0, a, 0, 0, k);
             if (!pa_accept_ch(','))
                 break;
         }
         pa_expect_ch(')');
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CALL, IRT_I64, (u16)d, 0, 0, 0, 0);
+        irfn_push(&FN, IR_CALL, IRT_I64, d, 0, 0, 0, 0);
         FN.ops[FN.n - 1].flags |= 2;
         GEN_TY = ty_long();
         return d;
@@ -8988,9 +8999,9 @@ static u32 gen_postfix(void)
         ap = value_of(gen_assign());
         if (kind == 0) {
             pa_expect_ch(')');
-            irfn_push(&FN, IR_VASTART, IRT_VOID, 0, (u16)ap, 0, 0, FN.nparams * 8);
+            irfn_push(&FN, IR_VASTART, IRT_VOID, 0, ap, 0, 0, FN.nparams * 8);
             d = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 0);
             GEN_TY = ty_int();
             return d;
         }
@@ -8999,20 +9010,20 @@ static u32 gen_postfix(void)
             ty = parse_typename();
             pa_expect_ch(')');
             d = irfn_vreg(&FN);
-            irfn_push(&FN, IR_VAARG, ir_ty_of(ty), (u16)d, (u16)ap, 0, 0, 0);
+            irfn_push(&FN, IR_VAARG, ir_ty_of(ty), d, ap, 0, 0, 0);
             if (ty_size(ty) < 8 && ty_size(ty) > 0) {
                 u32 t2 = irfn_vreg(&FN);
 
-                irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), (u16)t2, (u16)d, 0, 0, 0);
+                irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), t2, d, 0, 0, 0);
                 d = t2;
             }
             GEN_TY = ty;
             return d;
         }
         pa_expect_ch(')');
-        irfn_push(&FN, IR_VAEND, IRT_VOID, 0, (u16)ap, 0, 0, 0);
+        irfn_push(&FN, IR_VAEND, IRT_VOID, 0, ap, 0, 0, 0);
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 0);
         GEN_TY = ty_int();
         return d;
     }
@@ -9202,16 +9213,16 @@ static u32 gen_postfix(void)
         pa_expect_ch(')');
         if (xchg) {
             fn = x64_sym(&X64, "__c6_at_xchg");
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)p, 0, 0, 0);
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)v2, 0, 0, 1);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, p, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, v2, 0, 0, 1);
             {
                 u32 sz = irfn_vreg(&FN);
 
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)sz, 0, 0, 0, ty_size(pty));
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)sz, 0, 0, 2);
+                irfn_push(&FN, IR_CONST, IRT_U64, sz, 0, 0, 0, ty_size(pty));
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, sz, 0, 0, 2);
             }
             old = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CALL, IRT_U64, (u16)old, 0, 0, 0, fn);
+            irfn_push(&FN, IR_CALL, IRT_U64, old, 0, 0, 0, fn);
             FN.ops[FN.n - 1].narg = 3;
             if (rp)
                 store_conv(rp, pty, old, pty);
@@ -9220,19 +9231,19 @@ static u32 gen_postfix(void)
         }
         /* fetch_add/sub/and/or/xor：__c6_at_rmw(p, v, op, 宽度) 返回旧值 */
         fn = x64_sym(&X64, "__c6_at_rmw");
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)p, 0, 0, 0);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)v2, 0, 0, 1);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, p, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, v2, 0, 0, 1);
         {
             u32 opv = irfn_vreg(&FN);
             u32 sz = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)opv, 0, 0, 0, (u32)aop);
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)opv, 0, 0, 2);
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)sz, 0, 0, 0, ty_size(pty));
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)sz, 0, 0, 3);
+            irfn_push(&FN, IR_CONST, IRT_U64, opv, 0, 0, 0, (u32)aop);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, opv, 0, 0, 2);
+            irfn_push(&FN, IR_CONST, IRT_U64, sz, 0, 0, 0, ty_size(pty));
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, sz, 0, 0, 3);
         }
         old = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CALL, IRT_U64, (u16)old, 0, 0, 0, fn);
+        irfn_push(&FN, IR_CALL, IRT_U64, old, 0, 0, 0, fn);
         FN.ops[FN.n - 1].narg = 4;
         if (!ret_new) {
             GEN_TY = pty;
@@ -9240,8 +9251,8 @@ static u32 gen_postfix(void)
         }
         /* add_fetch / sub_fetch：新值 = 旧值 ± v（这些不成对使用，够用） */
         nv = irfn_vreg(&FN);
-        irfn_push(&FN, aop == 0 ? IR_ADD : IR_SUB, ir_ty_of(pty), (u16)nv, (u16)old,
-                  (u16)v2, 0, 0);
+        irfn_push(&FN, aop == 0 ? IR_ADD : IR_SUB, ir_ty_of(pty), nv, old,
+                  v2, 0, 0);
         GEN_TY = pty;
         return gen_postfix_ops(nv);
     }
@@ -9269,14 +9280,14 @@ static u32 gen_postfix(void)
         pa_expect_ch(')');
         /* __c6_at_cas(p, &expected, desired, 宽度)：1 = 换成，0 = 没换成
          * （没换成时它已经把实际值写进 *expected 了） */
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)p, 0, 0, 0);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)pe, 0, 0, 1);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)pd, 0, 0, 2);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, p, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, pe, 0, 0, 1);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, pd, 0, 0, 2);
         sz = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)sz, 0, 0, 0, ty_size(pty));
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)sz, 0, 0, 3);
+        irfn_push(&FN, IR_CONST, IRT_U64, sz, 0, 0, 0, ty_size(pty));
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, sz, 0, 0, 3);
         r = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CALL, IRT_U64, (u16)r, 0, 0, 0, x64_sym(&X64, "__c6_at_cas"));
+        irfn_push(&FN, IR_CALL, IRT_U64, r, 0, 0, 0, x64_sym(&X64, "__c6_at_cas"));
         FN.ops[FN.n - 1].narg = 4;
         GEN_TY = ty_int();
         return gen_postfix_ops(r);
@@ -9312,7 +9323,7 @@ static u32 gen_postfix(void)
         /* C11 6.2.7p1：**顶层**限定符不参与兼容性判断（`int *` 与 `int *const`
          * 兼容），嵌套层的参与（`int **` 与 `int *restrict *` 不兼容）。
          * 常量上下文那条路一直就是这么做的，这里对齐。 */
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0,
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0,
                   ty_unqual(a) == ty_unqual(b) ? 1 : 0);
         GEN_TY = ty_int();
         return gen_postfix_ops(d);
@@ -9331,7 +9342,7 @@ static u32 gen_postfix(void)
         }
         pa_expect_ch(')');
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 1);
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 1);
         GEN_TY = ty_int();
         return gen_postfix_ops(d);
     }
@@ -9366,7 +9377,7 @@ static u32 gen_postfix(void)
         }
         pa_expect_ch(')');
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, off);
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, off);
         GEN_TY = ty_ulong();
         return gen_postfix_ops(d);
     }
@@ -9377,12 +9388,12 @@ static u32 gen_postfix(void)
         pa_expect_ch('(');
         pa_expect_ch(')');
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_I64, (u16)d, 0, 0, 0, 134);
+        irfn_push(&FN, IR_CONST, IRT_I64, d, 0, 0, 0, 134);
         {
             u32 v = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONST, IRT_I64, (u16)v, 0, 0, 0, 60);
-            irfn_push(&FN, IR_CALL, IRT_I64, 0, (u16)v, (u16)d, 0, 1);
+            irfn_push(&FN, IR_CONST, IRT_I64, v, 0, 0, 0, 60);
+            irfn_push(&FN, IR_CALL, IRT_I64, 0, v, d, 0, 1);
         }
         GEN_TY = ty_void();
         return 0;
@@ -9429,7 +9440,7 @@ static u32 gen_postfix(void)
                         u32 dv = irfn_vreg(&FN);
 
 
-                        irfn_push(&FN, IR_CONST, IRT_U64, (u16)dv, 0, 0, 0,
+                        irfn_push(&FN, IR_CONST, IRT_U64, dv, 0, 0, 0,
                                   (u32)qs->val);
                         GEN_TY = ty_int();
                         PEND_LVAL = 0;
@@ -9559,12 +9570,12 @@ static u32 gen_postfix(void)
                     int assign_ctx = 0;
 
                     pa_advance();       /* 吃掉标识符，否则解析器原地打转 */
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)sa, 0, 0, 0, X64_SLOT(pself->slot));
-                    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)sv, (u16)sa, 0, 0, 0);
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, sa, 0, 0, 0, X64_SLOT(pself->slot));
+                    irfn_push(&FN, IR_LOAD, IRT_PTR, sv, sa, 0, 0, 0);
                     if (moff4) {
-                        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)ma, (u16)sv, 0, 0, moff4);
+                        irfn_push(&FN, IR_LEA, IRT_PTR, ma, sv, 0, 0, moff4);
                     } else {
-                        irfn_push(&FN, IR_MOV, IRT_PTR, (u16)ma, (u16)sv, 0, 0, 0);
+                        irfn_push(&FN, IR_MOV, IRT_PTR, ma, sv, 0, 0, 0);
                     }
                     GEN_TY = mty4;
                     PEND_LVAL = 1;
@@ -9633,9 +9644,9 @@ static u32 gen_postfix(void)
                     u32 k2 = 0;
                     u32 dst2 = 0;
 
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)sa2, 0, 0, 0,
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, sa2, 0, 0, 0,
                               X64_SLOT(pself2->slot));
-                    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)sv2, (u16)sa2, 0, 0, 0);
+                    irfn_push(&FN, IR_LOAD, IRT_PTR, sv2, sa2, 0, 0, 0);
                     avs[narg++] = sv2;
                     pa_advance();       /* 名字 */
                     if (pa_accept_ch('(')) {
@@ -9650,9 +9661,9 @@ static u32 gen_postfix(void)
                         }
                     }
                     for (k2 = 0; k2 < narg; k2++)
-                        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)avs[k2], 0, 0, k2);
+                        irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k2], 0, 0, k2);
                     dst2 = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(fs->type)), (u16)dst2,
+                    irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(fs->type)), dst2,
                               0, 0, 0, (u32)fs->val);
                     FN.ops[FN.n - 1].narg = (u8)narg;
                     GEN_TY = ty_target(fs->type);
@@ -9750,7 +9761,7 @@ static u32 gen_postfix(void)
                          (int)t->len, tok_data(t));
             pa_advance();
             d = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, (u32)s->val);
+            irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, (u32)s->val);
             GEN_TY = ty_int();
             return gen_postfix_ops(d);
         }
@@ -9930,16 +9941,16 @@ static u32 fstr_bool_str(u32 hv)
     u32 l2 = irfn_label(&FN);
     u32 l3 = irfn_label(&FN);
 
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)z, 0, 0, 0, 0);
-    irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc, (u16)hv, (u16)z, 0, 0);
+    irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
+    irfn_push(&FN, IR_CMP, IRT_I64, cc, hv, z, 0, 0);
     FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
-    irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cc, (u16)l1, (u16)l2, 0);
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l1, 0, 0, 0);
-    irfn_push(&FN, IR_MOV, IRT_PTR, (u16)rt, (u16)fstr_str_addr("\"true\""), 0, 0, 0);
-    irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)l3, 0, 0, 0);
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l2, 0, 0, 0);
-    irfn_push(&FN, IR_MOV, IRT_PTR, (u16)rt, (u16)fstr_str_addr("\"false\""), 0, 0, 0);
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l3, 0, 0, 0);
+    irfn_push(&FN, IR_BR, IRT_VOID, 0, cc, l1, l2, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l1, 0, 0, 0);
+    irfn_push(&FN, IR_MOV, IRT_PTR, rt, fstr_str_addr("\"true\""), 0, 0, 0);
+    irfn_push(&FN, IR_JMP, IRT_VOID, 0, l3, 0, 0, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l2, 0, 0, 0);
+    irfn_push(&FN, IR_MOV, IRT_PTR, rt, fstr_str_addr("\"false\""), 0, 0, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l3, 0, 0, 0);
     return rt;
 }
 
@@ -9950,8 +9961,8 @@ static u32 fstr_load(u32 sadd, u32 ty, u32 off)
     u32 a = irfn_vreg(&FN);
     u32 v = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a, (u16)sadd, 0, 0, off);
-    irfn_push(&FN, IR_LOAD, ir_ty_of(ty), (u16)v, (u16)a, 0, 0, 0);
+    irfn_push(&FN, IR_LEA, IRT_PTR, a, sadd, 0, 0, off);
+    irfn_push(&FN, IR_LOAD, ir_ty_of(ty), v, a, 0, 0, 0);
     return v;
 }
 
@@ -9969,16 +9980,16 @@ static u32 fstr_skip_space(u32 sadd)
     u32 l1 = irfn_label(&FN);
     u32 l2 = irfn_label(&FN);
 
-    irfn_push(&FN, IR_MOV, IRT_PTR, (u16)p, (u16)sadd, 0, 0, 0);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)i, 0, 0, 0, 0);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)one, 0, 0, 0, 1);
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l1, 0, 0, 0);
-    irfn_push(&FN, IR_LOAD, IRT_U8, (u16)c, (u16)p, 0, 0, 0);
-    irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc, (u16)c, (u16)one, 0, 0);
+    irfn_push(&FN, IR_MOV, IRT_PTR, p, sadd, 0, 0, 0);
+    irfn_push(&FN, IR_CONST, IRT_U64, i, 0, 0, 0, 0);
+    irfn_push(&FN, IR_CONST, IRT_U64, one, 0, 0, 0, 1);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l1, 0, 0, 0);
+    irfn_push(&FN, IR_LOAD, IRT_U8, c, p, 0, 0, 0);
+    irfn_push(&FN, IR_CMP, IRT_I64, cc, c, one, 0, 0);
     FN.ops[FN.n - 1].flags = (u8)IRCC_LT;
-    irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cc, (u16)l2, (u16)l1, 0);
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l2, 0, 0, 0);
-    irfn_push(&FN, IR_MOV, IRT_PTR, (u16)a, (u16)p, 0, 0, 0);
+    irfn_push(&FN, IR_BR, IRT_VOID, 0, cc, l2, l1, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l2, 0, 0, 0);
+    irfn_push(&FN, IR_MOV, IRT_PTR, a, p, 0, 0, 0);
     return a;
 }
 
@@ -10113,15 +10124,15 @@ static u32 fstr_fmt_arg(char *fmt, u32 *fl, u32 ty, u32 hv,
         u32 alt = irfn_vreg(&FN);
         u32 r = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)ba, 0, 0, 0, X64_SLOT(buf));
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)alt, 0, 0, 0, 0);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, ba, 0, 0, 0, X64_SLOT(buf));
+        irfn_push(&FN, IR_CONST, IRT_U64, alt, 0, 0, 0, 0);
         for (i = 0; i < nf; i++)
             if (flg[i] == '#')
                 FN.ops[FN.n - 1].imm = 1;
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)ba, 0, 0, 0);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)arg, 0, 0, 1);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)alt, 0, 0, 2);
-        irfn_push(&FN, IR_CALL, IRT_PTR, (u16)r, 0, 0, 0,
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, ba, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, arg, 0, 0, 1);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, alt, 0, 0, 2);
+        irfn_push(&FN, IR_CALL, IRT_PTR, r, 0, 0, 0,
                   x64_sym(&X64, "__c6_fmt_bin"));
         FN.ops[FN.n - 1].narg = 3;
         kind = 1;
@@ -10145,7 +10156,7 @@ static u32 fstr_fmt_arg(char *fmt, u32 *fl, u32 ty, u32 hv,
         if (!uns && ty_size(ty) > 0 && ty_size(ty) < 8 && ty_is_signed(ty)) {
             u32 d = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_SEXT, IRT_I64, (u16)d, (u16)arg, 0, 0, 0);
+            irfn_push(&FN, IR_SEXT, IRT_I64, d, arg, 0, 0, 0);
             arg = d;
         }
         lm[nl++] = 'l';
@@ -10627,23 +10638,23 @@ static u32 gen_unary(void)
             slot = frame_slots_for(1024);
         }
         aptr = irfn_vreg(&FN);
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)aptr, 0, 0, 0, X64_SLOT(slot));
+        irfn_push(&FN, IR_ADDR, IRT_PTR, aptr, 0, 0, 0, X64_SLOT(slot));
         cfmt = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONSTK, IRT_PTR, (u16)cfmt, 0, 0, 0,
+        irfn_push(&FN, IR_CONSTK, IRT_PTR, cfmt, 0, 0, 0,
                   irfn_kconst(&FN, (u64)DATA_VA(foff)));
         ccap = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)ccap, 0, 0, 0, 1024);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)aptr, 0, 0, 0);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)ccap, 0, 0, 1);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)cfmt, 0, 0, 2);
+        irfn_push(&FN, IR_CONST, IRT_U64, ccap, 0, 0, 0, 1024);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, aptr, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, ccap, 0, 0, 1);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, cfmt, 0, 0, 2);
         {
             u32 k2 = 0;
 
             for (k2 = 0; k2 < na; k2++)
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)av[k2], 0, 0, 3 + k2);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, av[k2], 0, 0, 3 + k2);
         }
         dst = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CALL, IRT_I64, (u16)dst, 0, 0, 0, x64_sym(&X64, "snprintf"));
+        irfn_push(&FN, IR_CALL, IRT_I64, dst, 0, 0, 0, x64_sym(&X64, "snprintf"));
         FN.ops[FN.n - 1].narg = (u8)(3 + na);
         GEN_TY = ty_ptr(ty_char());
         E_WAS_CALL = 1;            /* `@f"…"` 也是新引用（帧内缓冲，够用就行） */
@@ -10699,21 +10710,21 @@ static u32 gen_unary(void)
 
                 /* 任务还没结束就在这里挂起（`await` 的语义），结束时返回 */
                 if (!was_io) {
-                    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)av, 0, 0, 0);
-                    irfn_push(&FN, IR_CALL, IRT_I64, (u16)aw, 0, 0, 0,
+                    irfn_push(&FN, IR_ARG, IRT_U64, 0, av, 0, 0, 0);
+                    irfn_push(&FN, IR_CALL, IRT_I64, aw, 0, 0, 0,
                               x64_sym(&X64, "__c6_co_await"));
                     FN.ops[FN.n - 1].narg = 1;
                     async_unwind_gate();
                 }
 
-                irfn_push(&FN, IR_LEA, IRT_PTR, (u16)la, (u16)av, 0, 0, (u32)moff2);
+                irfn_push(&FN, IR_LEA, IRT_PTR, la, av, 0, 0, (u32)moff2);
                 if (ty_is_agg(mty2) || ty_is_array(mty2)) {
                     /* `t->val` 本身是聚合体：按地址约定，地址就是那个 LEA */
                     GEN_TY = mty2;
                     PEND_LVAL = 0;
                     return gen_postfix_ops(la);
                 }
-                irfn_push(&FN, IR_LOAD, ir_ty_of(mty2), (u16)lv, (u16)la, 0, 0, 0);
+                irfn_push(&FN, IR_LOAD, ir_ty_of(mty2), lv, la, 0, 0, 0);
                 GEN_TY = mty2;
                 PEND_LVAL = 0;
                 return gen_postfix_ops(lv);
@@ -10772,16 +10783,16 @@ static u32 gen_unary(void)
         tv = value_of(gen_unary());
         tty = GEN_TY;
         tfl = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CALL, IRT_I32, (u16)tfl, 0, 0, 0,
+        irfn_push(&FN, IR_CALL, IRT_I32, tfl, 0, 0, 0,
                   x64_sym(&X64, "__tcc_err_flag_get"));
         FN.ops[FN.n - 1].narg = 0;
         lret = irfn_label(&FN);
         lend = irfn_label(&FN);
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)tfl, (u16)lret, (u16)lend, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lret, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, tfl, lret, lend, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lret, 0, 0, 0);
         defer_run(1, 1);                 /* 错误路径：errdefer 也要跑 */
-        irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, (u16)tv, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+        irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, tv, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         GEN_TY = tty;
         return gen_postfix_ops(tv);
     }
@@ -10793,7 +10804,7 @@ static u32 gen_unary(void)
 
         pa_advance();
         pa_advance();
-        irfn_push(&FN, IR_LABELADDR, IRT_PTR, (u16)d, (u16)l, 0, 0, 0);
+        irfn_push(&FN, IR_LABELADDR, IRT_PTR, d, l, 0, 0, 0);
         GEN_TY = ty_ptr(ty_void());
         return gen_postfix_ops(d);
     }
@@ -10922,9 +10933,9 @@ static u32 gen_unary(void)
             env = clos_alloc(thunk, 16 + 8 * sn + aggsz);
         }
         tgtv = irfn_vreg(&FN);
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)tgtv, 0, 0, 0, (u32)ss->val);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, tgtv, 0, 0, 0, (u32)ss->val);
         FN.ops[FN.n - 1].flags = 2;
-        irfn_push(&FN, IR_STORE, IRT_U64, (u16)gen_addr_off(env, 8), (u16)tgtv, 0, 0, 0);
+        irfn_push(&FN, IR_STORE, IRT_U64, gen_addr_off(env, 8), tgtv, 0, 0, 0);
         {
             u32 aggoff = 16 + 8 * sn;
 
@@ -10933,13 +10944,13 @@ static u32 gen_unary(void)
                     u32 asz = ty_size(sargty[i2]);
                     u32 dstv = gen_addr_off(env, aggoff);
 
-                    irfn_push(&FN, IR_COPY, IRT_U64, (u16)dstv, (u16)sargs[i2], 0, 0, asz);
+                    irfn_push(&FN, IR_COPY, IRT_U64, dstv, sargs[i2], 0, 0, asz);
                     irfn_push(&FN, IR_STORE, IRT_U64,
-                              (u16)gen_addr_off(env, 16 + 8 * i2), (u16)dstv, 0, 0, 0);
+                              gen_addr_off(env, 16 + 8 * i2), dstv, 0, 0, 0);
                     aggoff += (asz + 7) / 8 * 8;
                 } else {
                     irfn_push(&FN, IR_STORE, IRT_U64,
-                              (u16)gen_addr_off(env, 16 + 8 * i2), (u16)sargs[i2], 0, 0, 0);
+                              gen_addr_off(env, 16 + 8 * i2), sargs[i2], 0, 0, 0);
                 }
                 /* 实参块持有自己那一份（线程退出时由中转函数还回来） */
                 if (sargmgd[i2])
@@ -10947,24 +10958,24 @@ static u32 gen_unary(void)
             }
         }
         thsz = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)thsz, 0, 0, 0, 16);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)thsz, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, thsz, 0, 0, 0, 16);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, thsz, 0, 0, 0);
         th = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CALL, IRT_PTR, (u16)th, 0, 0, 0, msym);
+        irfn_push(&FN, IR_CALL, IRT_PTR, th, 0, 0, 0, msym);
         FN.ops[FN.n - 1].narg = 1;
         zv = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)zv, 0, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, zv, 0, 0, 0, 0);
         startv = irfn_vreg(&FN);
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)startv, 0, 0, 0, thr);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, startv, 0, 0, 0, thr);
         FN.ops[FN.n - 1].flags = 2;
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)th, 0, 0, 0);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)zv, 0, 0, 1);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)startv, 0, 0, 2);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)env, 0, 0, 3);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, th, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, zv, 0, 0, 1);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, startv, 0, 0, 2);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, env, 0, 0, 3);
         {
             u32 d2 = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CALL, IRT_I64, (u16)d2, 0, 0, 0, pc);
+            irfn_push(&FN, IR_CALL, IRT_I64, d2, 0, 0, 0, pc);
             FN.ops[FN.n - 1].narg = 4;
         }
         GEN_TY = ty_thread();
@@ -11027,13 +11038,13 @@ static u32 gen_unary(void)
                     if (sz == 1 || sz == 2 || sz == 4 || sz == 8) {
                         u32 lv = irfn_vreg(&FN);
 
-                        irfn_push(&FN, IR_LOAD, ir_ty_of(os->type), (u16)lv,
-                                  (u16)ident_addr(os), 0, 0, 0);
-                        irfn_push(&FN, IR_STORE, ir_ty_of(os->type), (u16)dst,
-                                  (u16)lv, 0, 0, 0);
+                        irfn_push(&FN, IR_LOAD, ir_ty_of(os->type), lv,
+                                  ident_addr(os), 0, 0, 0);
+                        irfn_push(&FN, IR_STORE, ir_ty_of(os->type), dst,
+                                  lv, 0, 0, 0);
                     } else {
-                        irfn_push(&FN, IR_COPY, IRT_U8, (u16)dst,
-                                  (u16)ident_addr(os), 0, 0, sz);
+                        irfn_push(&FN, IR_COPY, IRT_U8, dst,
+                                  ident_addr(os), 0, 0, sz);
                     }
                 }
                 GEN_TY = ty_closure(FL[fi].fty);
@@ -11092,21 +11103,21 @@ static u32 gen_unary(void)
             u32 dsym = mgd_desc(ty);
 
             /* 描述符：让运行时知道怎么析构、哪些字段是托管引用 */
-            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)dv, 0, 0, 0, dsym);
+            irfn_push(&FN, IR_ADDR, IRT_PTR, dv, 0, 0, 0, dsym);
             FN.ops[FN.n - 1].flags = 2;
             if (is_arr) {
-                irfn_push(&FN, IR_MOV, IRT_U64, (u16)nv, (u16)ncnt, 0, 0, 0);
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)ev, 0, 0, 0, esz);
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)nv, 0, 0, 0);
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)ev, 0, 0, 1);
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)dv, 0, 0, 2);
+                irfn_push(&FN, IR_MOV, IRT_U64, nv, ncnt, 0, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_U64, ev, 0, 0, 0, esz);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, nv, 0, 0, 0);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, ev, 0, 0, 1);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, dv, 0, 0, 2);
             } else {
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)nv, 0, 0, 0, esz);
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)nv, 0, 0, 0);
-                irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)dv, 0, 0, 1);
+                irfn_push(&FN, IR_CONST, IRT_U64, nv, 0, 0, 0, esz);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, nv, 0, 0, 0);
+                irfn_push(&FN, IR_ARG, IRT_U64, 0, dv, 0, 0, 1);
             }
             d = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CALL, IRT_PTR, (u16)d, 0, 0, 0, (u32)ms->val);
+            irfn_push(&FN, IR_CALL, IRT_PTR, d, 0, 0, 0, (u32)ms->val);
             FN.ops[FN.n - 1].narg = (u32)(is_arr ? 3 : 2);
         }
         GEN_TY = ty_ptr(ty);
@@ -11123,10 +11134,10 @@ static u32 gen_unary(void)
 
         pa_advance();
         v = value_of(gen_unary());
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)v, (u16)l_bad, (u16)l_ok, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l_bad, 0, 0, 0);
-        irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, (u16)v, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l_ok, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, v, l_bad, l_ok, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l_bad, 0, 0, 0);
+        irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, v, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l_ok, 0, 0, 0);
         GEN_TY = ty_int();
         return v;
     }
@@ -11181,18 +11192,18 @@ static u32 gen_unary(void)
         u32 d = irfn_vreg(&FN);
 
         if (ty_is_float(ty)) {
-            irfn_push(&FN, IR_FNEG, ir_ty_of(ty), (u16)d, (u16)a, 0, 0, 0);
+            irfn_push(&FN, IR_FNEG, ir_ty_of(ty), d, a, 0, 0, 0);
             GEN_TY = ty;
             return d;
         }
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)z, 0, 0, 0, 0);
-        irfn_push(&FN, IR_SUB, ir_ty_of(ty), (u16)d, (u16)z, (u16)a, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
+        irfn_push(&FN, IR_SUB, ir_ty_of(ty), d, z, a, 0, 0);
         /* 一元负号也要按类型宽度回绕：`-(unsigned)0x80000002` 在 32 位里是
          * 0x7FFFFFFE，用 64 位中间值下去除就会算错（踩过 61_integers）。 */
         if (ty_is_int(ty) && ty_size(ty) < 8) {
             u32 t2 = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), (u16)t2, (u16)d, 0, 0, 0);
+            irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), t2, d, 0, 0, 0);
             d = t2;
         }
         GEN_TY = ty;
@@ -11205,8 +11216,8 @@ static u32 gen_unary(void)
         u32 z = irfn_vreg(&FN);
         u32 d = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)z, 0, 0, 0, 0);
-        irfn_push(&FN, IR_CMP, IRT_U64, (u16)d, (u16)a, (u16)z, 0, IRCC_EQ);
+        irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
+        irfn_push(&FN, IR_CMP, IRT_U64, d, a, z, 0, IRCC_EQ);
         irfn_setcc(&FN, IRCC_EQ);
         GEN_TY = ty_int();
         return d;
@@ -11216,7 +11227,7 @@ static u32 gen_unary(void)
         u32 ty = GEN_TY;
         u32 d = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_NOT, ir_ty_of(ty), (u16)d, (u16)a, 0, 0, 0);
+        irfn_push(&FN, IR_NOT, ir_ty_of(ty), d, a, 0, 0, 0);
         GEN_TY = ty;
         return d;
     }
@@ -11246,10 +11257,10 @@ static u32 gen_unary(void)
             old_v = bb ? load_bf(addr, ty, bb, bb_off, ty_is_signed(ty), PEND_BF_ENUM)
                        : load_lval(addr, ty);
             one = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)one, 0, 0, 0,
+            irfn_push(&FN, IR_CONST, IRT_U64, one, 0, 0, 0,
                       ty_is_ptr(ty) ? (ty_size(ty_target(ty)) ? ty_size(ty_target(ty)) : 1) : 1);
             nv = irfn_vreg(&FN);
-            irfn_push(&FN, inc ? IR_ADD : IR_SUB, ir_ty_of(ty), (u16)nv, (u16)old_v, (u16)one,
+            irfn_push(&FN, inc ? IR_ADD : IR_SUB, ir_ty_of(ty), nv, old_v, one,
                       0, 0);
             if (bb)
                 store_lval_bits(addr, ty, bb, bb_off, nv);
@@ -11285,7 +11296,7 @@ static u32 gen_unary(void)
                 if (paren > 0)
                     pa_expect_ch(')');
                 kk = irfn_vreg(&FN);
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)kk, 0, 0, 0, vesz);
+                irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, vesz);
                 vv = gen_bin2(vcnt, ty_ulong(), IR_MUL, kk, ty_ulong());
                 GEN_TY = ty_ulong();
                 return vv;
@@ -11354,7 +11365,7 @@ static u32 gen_unary(void)
             PEND_LVAL = 0;
         }
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0,
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0,
                   is_align ? (u32)ty_align_of(ty) : ty_size(ty));
         GEN_TY = ty_ulong();
         return d;
@@ -11403,10 +11414,10 @@ static u32 gen_unary(void)
                     iface_check_impl(sty3, ifx3);
                     sym3 = iface_vtbl(ifx3, sty3);
 
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)ta3, 0, 0, 0, X64_SLOT(ts3));
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, ta3, 0, 0, 0, X64_SLOT(ts3));
                     store_conv(gen_addr_off(ta3, 0), ty_ptr(ty_void()), av3,
                                ty_ptr(ty_void()));
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)vv3, 0, 0, 0, sym3);
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, vv3, 0, 0, 0, sym3);
                     FN.ops[FN.n - 1].flags = 2;
                     store_conv(gen_addr_off(ta3, 8), ty_ptr(ty_void()), vv3,
                                ty_ptr(ty_void()));
@@ -11437,7 +11448,7 @@ static u32 gen_unary(void)
                 u32 capn = (1024u / esz) ? (1024u / esz) : 1;
 
                 slot = frame_slots_for(capn * esz);
-                irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
+                irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
                 gen_init_obj(addr, ty_array(et, capn), 0);
                 /* 复合字面量是左值（`&(int[]){…}` 要能取地址） */
                 PEND_LVAL = 1;
@@ -11447,7 +11458,7 @@ static u32 gen_unary(void)
                 return addr;
             }
             slot = frame_slots_for(ty_size(ty));
-            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
+            irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
             gen_init_obj(addr, ty, 0);
             PEND_LVAL = 1;
             PEND_TY = ty;
@@ -11529,12 +11540,12 @@ static u32 gen_convert(u32 v, u32 from, u32 to)
         if (ty_size(from) == ty_size(to))
             return v;
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_FCVT, ir_ty_of(to), (u16)d, (u16)v, 0, 0, 0);
+        irfn_push(&FN, IR_FCVT, ir_ty_of(to), d, v, 0, 0, 0);
         return d;
     }
     if (!ff && ft) {
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_I2F, ir_ty_of(to), (u16)d, (u16)v, 0, 0, 0);
+        irfn_push(&FN, IR_I2F, ir_ty_of(to), d, v, 0, 0, 0);
         /* 64 位无符号源：cvtsi2sd 按有符号读会算出负数，后端要走移位套路 */
         if (ty_size(from) >= 8 && !ty_is_signed(from))
             FN.ops[FN.n - 1].flags |= 1;
@@ -11542,20 +11553,20 @@ static u32 gen_convert(u32 v, u32 from, u32 to)
     }
     if (ff && !ft) {
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_F2I, ir_ty_of(from), (u16)d, (u16)v, 0, 0, 0);
+        irfn_push(&FN, IR_F2I, ir_ty_of(from), d, v, 0, 0, 0);
         if (ty_is_int(to) && ty_size(to) >= 8 && !ty_is_signed(to))
             FN.ops[FN.n - 1].flags |= 1;
         if (ty_is_int(to) && ty_size(to) < 8) {
             u32 t2 = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_TRUNC, ir_ty_of(to), (u16)t2, (u16)d, 0, 0, 0);
+            irfn_push(&FN, IR_TRUNC, ir_ty_of(to), t2, d, 0, 0, 0);
             d = t2;
         }
         return d;
     }
     if (ty_is_int(to) && ty_size(to) < 8) {
         d = irfn_vreg(&FN);
-        irfn_push(&FN, IR_TRUNC, ir_ty_of(to), (u16)d, (u16)v, 0, 0, 0);
+        irfn_push(&FN, IR_TRUNC, ir_ty_of(to), d, v, 0, 0, 0);
         return d;
     }
     return v;
@@ -11583,7 +11594,7 @@ static u32 gen_bin2(u32 a, u32 aty, u8 op, u32 b, u32 bty)
             op = IR_FDIV;
         a = gen_convert(a, aty, ty);
         b = gen_convert(b, bty, ty);
-        irfn_push(&FN, op, ir_ty_of(ty), (u16)d, (u16)a, (u16)b, 0, 0);
+        irfn_push(&FN, op, ir_ty_of(ty), d, a, b, 0, 0);
         GEN_TY = ty;
         return d;
     }
@@ -11597,13 +11608,13 @@ static u32 gen_bin2(u32 a, u32 aty, u8 op, u32 b, u32 bty)
         else if (!ty_is_signed(bty))
             ty = bty;
     }
-    irfn_push(&FN, op, ir_ty_of(ty), (u16)d, (u16)a, (u16)b, 0, 0);
+    irfn_push(&FN, op, ir_ty_of(ty), d, a, b, 0, 0);
     /* 窄于 8 字节的整数运算要按类型宽度回绕（unsigned 取模 2^n 的语义）。
      * 少了它，`-(UINT_MAX/2+3)/2` 会拿 64 位中间值去除，结果高 32 位是垃圾。 */
     if (ty_is_int(ty) && ty_size(ty) < 8) {
         u32 t2 = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), (u16)t2, (u16)d, 0, 0, 0);
+        irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), t2, d, 0, 0, 0);
         d = t2;
     }
     GEN_TY = ty;
@@ -11620,7 +11631,7 @@ static u32 gen_cast_to(u32 v, u32 ty)
     if (ty_size(ty) >= 8)
         return v;
     d = irfn_vreg(&FN);
-    irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), (u16)d, (u16)v, 0, 0, 0);
+    irfn_push(&FN, IR_TRUNC, ir_ty_of(ty), d, v, 0, 0, 0);
     return d;
 }
 
@@ -11665,9 +11676,9 @@ static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty)
     d = irfn_vreg(&FN);
     /* 浮点比较要知道宽度，才能选 ucomiss 还是 ucomisd */
     if (ty_is_float(cty))
-        irfn_push(&FN, IR_CMP, ir_ty_of(cty), (u16)d, (u16)a, (u16)b, 0, cc);
+        irfn_push(&FN, IR_CMP, ir_ty_of(cty), d, a, b, 0, cc);
     else
-        irfn_push(&FN, IR_CMP, IRT_U64, (u16)d, (u16)a, (u16)b, 0, cc);
+        irfn_push(&FN, IR_CMP, IRT_U64, d, a, b, 0, cc);
     irfn_setcc(&FN, cc);
     GEN_TY = ty_int();
     return d;
@@ -11677,7 +11688,7 @@ static u32 gen_cmp2(u32 a, u32 b, u8 cc)
 {
     u32 d = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_CMP, IRT_U64, (u16)d, (u16)a, (u16)b, 0, cc);
+    irfn_push(&FN, IR_CMP, IRT_U64, d, a, b, 0, cc);
     irfn_setcc(&FN, cc);
     GEN_TY = ty_int();
     return d;
@@ -11756,11 +11767,11 @@ static u32 gen_add(void)
                     u32 k = irfn_vreg(&FN);
                     u32 s = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)k, 0, 0, 0, esz);
-                    irfn_push(&FN, IR_MUL, IRT_U64, (u16)s, (u16)b, (u16)k, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, esz);
+                    irfn_push(&FN, IR_MUL, IRT_U64, s, b, k, 0, 0);
                     bv = s;
                 }
-                irfn_push(&FN, is_sub ? IR_SUB : IR_ADD, IRT_PTR, (u16)d, (u16)av, (u16)bv,
+                irfn_push(&FN, is_sub ? IR_SUB : IR_ADD, IRT_PTR, d, av, bv,
                           0, 0);
                 aty = ty_ptr(elem);
                 GEN_TY = aty;
@@ -11769,12 +11780,12 @@ static u32 gen_add(void)
                 /* 指针差：字节差 / 元素大小 */
                 u32 esz = ty_size(ty_target(aty));
 
-                irfn_push(&FN, IR_SUB, IRT_U64, (u16)d, (u16)av, (u16)b, 0, 0);
+                irfn_push(&FN, IR_SUB, IRT_U64, d, av, b, 0, 0);
                 if (esz > 1) {
                     u32 k = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)k, 0, 0, 0, esz);
-                    irfn_push(&FN, IR_DIV, IRT_I64, (u16)d, (u16)d, (u16)k, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, esz);
+                    irfn_push(&FN, IR_DIV, IRT_I64, d, d, k, 0, 0);
                 }
                 aty = ty_long();
                 GEN_TY = aty;
@@ -11794,11 +11805,11 @@ static u32 gen_shift_one(u32 a, u32 aty, u8 op, u32 b)
 {
     u32 d = irfn_vreg(&FN);
 
-    irfn_push(&FN, op, ir_ty_of(aty), (u16)d, (u16)a, (u16)b, 0, 0);
+    irfn_push(&FN, op, ir_ty_of(aty), d, a, b, 0, 0);
     if (ty_is_int(aty) && ty_size(aty) < 8) {
         u32 t2 = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_TRUNC, ir_ty_of(aty), (u16)t2, (u16)d, 0, 0, 0);
+        irfn_push(&FN, IR_TRUNC, ir_ty_of(aty), t2, d, 0, 0, 0);
         d = t2;
     }
     GEN_TY = aty;
@@ -11957,16 +11968,16 @@ static u32 gen_land(void)
         u32 av = value_of(a);
         u32 b = 0;
 
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)av, (u16)ltest, (u16)lfalse, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltest, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, av, ltest, lfalse, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltest, 0, 0, 0);
         b = value_of(gen_bitor());
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)b, (u16)ltrue, (u16)lfalse, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltrue, 0, 0, 0);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 1);
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ldone, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lfalse, 0, 0, 0);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ldone, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, b, ltrue, lfalse, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltrue, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 1);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, ldone, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lfalse, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ldone, 0, 0, 0);
         a = d;
         GEN_TY = ty_int();
     }
@@ -11986,16 +11997,16 @@ static u32 gen_lor(void)
         u32 av = value_of(a);
         u32 b = 0;
 
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)av, (u16)ltrue, (u16)ltest, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltest, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, av, ltrue, ltest, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltest, 0, 0, 0);
         b = value_of(gen_land());
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)b, (u16)ltrue, (u16)lfalse, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltrue, 0, 0, 0);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 1);
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ldone, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lfalse, 0, 0, 0);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ldone, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, b, ltrue, lfalse, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltrue, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 1);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, ldone, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lfalse, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, d, 0, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ldone, 0, 0, 0);
         a = d;
         GEN_TY = ty_int();
     }
@@ -12074,8 +12085,8 @@ static u32 slice_len_load(u32 sadd)
     u32 la = irfn_vreg(&FN);
     u32 lv = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)la, (u16)sadd, 0, 0, 8);
-    irfn_push(&FN, IR_LOAD, IRT_U64, (u16)lv, (u16)la, 0, 0, 0);
+    irfn_push(&FN, IR_LEA, IRT_PTR, la, sadd, 0, 0, 8);
+    irfn_push(&FN, IR_LOAD, IRT_U64, lv, la, 0, 0, 0);
     return lv;
 }
 
@@ -12110,12 +12121,12 @@ static u32 gen_cond(void)
         {
             u32 fl = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CALL, IRT_I32, (u16)fl, 0, 0, 0,
+            irfn_push(&FN, IR_CALL, IRT_I32, fl, 0, 0, 0,
                       x64_sym(&X64, "__tcc_err_flag_get"));
             FN.ops[FN.n - 1].narg = 0;
-            irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)fl, (u16)lbody, (u16)lend, 0);
+            irfn_push(&FN, IR_BR, IRT_VOID, 0, fl, lbody, lend, 0);
         }
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbody, 0, 0, 0);
         scope_enter();
         if (pa_is_ch('(')) {
             /* `catch (e) { … }`：括号包着的绑定 */
@@ -12130,16 +12141,16 @@ static u32 gen_cond(void)
 
                 pa_advance();
                 e->slot = slot;
-                irfn_push(&FN, IR_CALL, IRT_I32, (u16)idv, 0, 0, 0,
+                irfn_push(&FN, IR_CALL, IRT_I32, idv, 0, 0, 0,
                           x64_sym(&X64, "__tcc_err_id_get"));
                 FN.ops[FN.n - 1].narg = 0;
-                irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
-                irfn_push(&FN, IR_STORE, IRT_I32, (u16)addr, (u16)idv, 0, 0, 0);
+                irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
+                irfn_push(&FN, IR_STORE, IRT_I32, addr, idv, 0, 0, 0);
                 if (gm) {
                     u32 mv = irfn_vreg(&FN);
                     u32 a8 = gen_addr_off(addr, 8);
 
-                    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)mv, (u16)ident_addr(gm), 0, 0, 0);
+                    irfn_push(&FN, IR_LOAD, IRT_PTR, mv, ident_addr(gm), 0, 0, 0);
                     store_conv(a8, ty_ptr(ty_char()), mv, ty_ptr(ty_char()));
                 }
             }
@@ -12153,18 +12164,18 @@ static u32 gen_cond(void)
 
             pa_advance();
             e->slot = slot;
-            irfn_push(&FN, IR_CALL, IRT_I32, (u16)idv, 0, 0, 0,
+            irfn_push(&FN, IR_CALL, IRT_I32, idv, 0, 0, 0,
                       x64_sym(&X64, "__tcc_err_id_get"));
             FN.ops[FN.n - 1].narg = 0;
-            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
-            irfn_push(&FN, IR_STORE, IRT_I32, (u16)addr, (u16)idv, 0, 0, 0);
+            irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
+            irfn_push(&FN, IR_STORE, IRT_I32, addr, idv, 0, 0, 0);
             {
                 /* 消息从运行时的错误槽取（`c6c_err_msg` 是运行时 TU 里的
                  * static，主 TU 的符号表里根本没有，以前这里永远取不到）。 */
                 u32 mv = irfn_vreg(&FN);
                 u32 a8 = gen_addr_off(addr, 8);
 
-                irfn_push(&FN, IR_CALL, IRT_PTR, (u16)mv, 0, 0, 0,
+                irfn_push(&FN, IR_CALL, IRT_PTR, mv, 0, 0, 0,
                           x64_sym(&X64, "__tcc_err_msg_get"));
                 FN.ops[FN.n - 1].narg = 0;
                 store_conv(a8, ty_ptr(ty_char()), mv, ty_ptr(ty_char()));
@@ -12176,7 +12187,7 @@ static u32 gen_cond(void)
              * "调用方处理错误后可以继续"就是被这个挂住的）。 */
             u32 cl = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CALL, IRT_VOID, (u16)cl, 0, 0, 0,
+            irfn_push(&FN, IR_CALL, IRT_VOID, cl, 0, 0, 0,
                       x64_sym(&X64, "__tcc_err_clear"));
             FN.ops[FN.n - 1].narg = 0;
         }
@@ -12189,7 +12200,7 @@ static u32 gen_cond(void)
         if (!PA_LAST_TERM)
             pa_error("'catch' body must end with 'return', 'err()' or 'goto'");
         scope_leave();
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         GEN_TY = vty;
         c = v0;
         E_CALL_FALLIBLE = 4;    /* 这一次已经被处理掉了 */
@@ -12208,8 +12219,8 @@ static u32 gen_cond(void)
         int tnpc = 0;      /* 两支各自是不是空指针常量（决定 void* 那半让不让位） */
         int enpc = 0;
 
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cv, (u16)lthen, (u16)lelse, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lthen, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, cv, lthen, lelse, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lthen, 0, 0, 0);
         if (pa_is_ch(':')) {
             /* GNU `a ?: b`：中间项省略，值就是条件表达式的值（只求值一次） */
             t = cv;
@@ -12221,13 +12232,13 @@ static u32 gen_cond(void)
             tnpc = E_NPC;
             pa_expect_ch(':');
         }
-        irfn_push(&FN, IR_MOV, ir_ty_of(ty), (u16)d, (u16)t, 0, 0, 0);
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lend, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lelse, 0, 0, 0);
+        irfn_push(&FN, IR_MOV, ir_ty_of(ty), d, t, 0, 0, 0);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, lend, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lelse, 0, 0, 0);
         e = value_of(gen_cond());
         enpc = E_NPC;
-        irfn_push(&FN, IR_MOV, ir_ty_of(ty), (u16)d, (u16)e, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+        irfn_push(&FN, IR_MOV, ir_ty_of(ty), d, e, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         /* 结果类型按两支合并（IR 里 d 是 8 字节槽，写进去的位不变） */
         ty = ty_ternary(ty, GEN_TY, tnpc, enpc);
         GEN_TY = ty;
@@ -12364,9 +12375,9 @@ static u32 gen_assign(void)
 
                     if (esz > 1) {
                         k = irfn_vreg(&FN);
-                        irfn_push(&FN, IR_CONST, IRT_U64, (u16)k, 0, 0, 0, esz);
+                        irfn_push(&FN, IR_CONST, IRT_U64, k, 0, 0, 0, esz);
                         m = irfn_vreg(&FN);
-                        irfn_push(&FN, IR_MUL, IRT_U64, (u16)m, (u16)r, (u16)k, 0, 0);
+                        irfn_push(&FN, IR_MUL, IRT_U64, m, r, k, 0, 0);
                         r = m;
                     }
                 }
@@ -12480,9 +12491,9 @@ static u32 gen_addr_off(u32 addr, u32 off)
     if (off == 0)
         return addr;
     c = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)c, 0, 0, 0, off);
+    irfn_push(&FN, IR_CONST, IRT_U64, c, 0, 0, 0, off);
     d = irfn_vreg(&FN);
-    irfn_push(&FN, IR_ADD, IRT_U64, (u16)d, (u16)addr, (u16)c, 0, 0);
+    irfn_push(&FN, IR_ADD, IRT_U64, d, addr, c, 0, 0);
     return d;
 }
 
@@ -12494,8 +12505,8 @@ static void gen_zero_obj(u32 addr, u32 sz)
         return;
     /* IR_MEMSET：dst = 目标地址，a = 填充字节，imm = 字节数 */
     z = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)z, 0, 0, 0, 0);
-    irfn_push(&FN, IR_MEMSET, IRT_U8, (u16)addr, (u16)z, 0, 0, sz);
+    irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
+    irfn_push(&FN, IR_MEMSET, IRT_U8, addr, z, 0, 0, sz);
 }
 
 
@@ -13826,7 +13837,7 @@ static void init_body(u32 top)
                             u32 dv = gen_addr_off(INIT_ADDR, boff + k * esz);
                             u32 sv = gen_addr_off(INIT_ADDR, blob);
 
-                            irfn_push(&FN, IR_MEMCPY, IRT_VOID, (u16)dv, (u16)sv,
+                            irfn_push(&FN, IR_MEMCPY, IRT_VOID, dv, sv,
                                       0, 0, esz);
                         }
                     }
@@ -14082,7 +14093,7 @@ static void init_body(u32 top)
 
                 if (ty_is_agg(vty)) {
                     irfn_push(&FN, IR_COPY, IRT_U8,
-                              (u16)gen_addr_off(INIT_ADDR, toff), (u16)v, 0, 0,
+                              gen_addr_off(INIT_ADDR, toff), v, 0, 0,
                               ty_size(tty));
                     INIT_CUR = init_leaf_at(toff + (ty_size(tty) ? ty_size(tty) : 1));
                     init_mark();
@@ -14246,7 +14257,7 @@ static void gen_init_obj(u32 addr, u32 ty, u32 off)
                 nc = n;
             gen_zero_obj(a2, n);
             INIT_COUNT = STR_LIT_N + 1;   /* `char s[] = "…"` 的元素个数 */
-            irfn_push(&FN, IR_COPY, IRT_U8, (u16)a2, (u16)src, 0, 0, nc);
+            irfn_push(&FN, IR_COPY, IRT_U8, a2, src, 0, 0, nc);
             return;
         }
         /* 不是花括号：两种可能——同类型的聚合表达式（`struct S s = t;` /
@@ -14348,16 +14359,16 @@ static void gen_init_obj(u32 addr, u32 ty, u32 off)
                 }
 
                 if (ty_is_array(ety)) {
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)lv, 0, 0, 0,
+                    irfn_push(&FN, IR_CONST, IRT_U64, lv, 0, 0, 0,
                               ty_array_n(ety) ? ty_array_n(ety) : 1);
-                    irfn_push(&FN, IR_MOV, IRT_PTR, (u16)dv, (u16)v, 0, 0, 0);
+                    irfn_push(&FN, IR_MOV, IRT_PTR, dv, v, 0, 0, 0);
                 } else if (arr_len) {
                     /* 数组在表达式中已经退化成指针了，长度得从声明处拿 */
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)lv, 0, 0, 0, arr_len);
-                    irfn_push(&FN, IR_MOV, IRT_PTR, (u16)dv, (u16)v, 0, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, lv, 0, 0, 0, arr_len);
+                    irfn_push(&FN, IR_MOV, IRT_PTR, dv, v, 0, 0, 0);
                 } else {
-                    irfn_push(&FN, IR_MOV, IRT_PTR, (u16)dv, (u16)v, 0, 0, 0);
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)lv, 0, 0, 0, lit_len);
+                    irfn_push(&FN, IR_MOV, IRT_PTR, dv, v, 0, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, lv, 0, 0, 0, lit_len);
                 }
                 store_conv(a2, ty_ptr(ty_slice_elem(ty)), dv, ty_ptr(ty_slice_elem(ty)));
                 a8 = gen_addr_off(addr, off + 8);
@@ -14367,7 +14378,7 @@ static void gen_init_obj(u32 addr, u32 ty, u32 off)
             if (ty_is_agg(ety) || ty_is_array(ety)) {
                 u32 a2 = gen_addr_off(addr, off);
 
-                irfn_push(&FN, IR_COPY, IRT_U8, (u16)a2, (u16)v, 0, 0, ty_size(ty));
+                irfn_push(&FN, IR_COPY, IRT_U8, a2, v, 0, 0, ty_size(ty));
                 return;
             }
             store_conv(gen_addr_off(addr, off + eo), et, v, ety);
@@ -14430,16 +14441,16 @@ static void gen_one_local(u32 ty, Declarator *d)
             u32 z = irfn_vreg(&FN);
 
             SCOPE->vla_save = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)z, 0, 0, 0, 0);
-            irfn_push(&FN, IR_ALLOCA, IRT_PTR, (u16)SCOPE->vla_save, (u16)z, 0, 0, 1);
+            irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
+            irfn_push(&FN, IR_ALLOCA, IRT_PTR, SCOPE->vla_save, z, 0, 0, 1);
         }
-        irfn_push(&FN, IR_ALLOCA, IRT_PTR, (u16)p, (u16)d->vla_cnt, 0, 0, d->vla_esz);
+        irfn_push(&FN, IR_ALLOCA, IRT_PTR, p, d->vla_cnt, 0, 0, d->vla_esz);
         s = sym_add(d->name, d->nlen, ty, SC_LOCAL);
         s->vla_cnt = d->vla_cnt;
         s->vla_esz = d->vla_esz;
         s->slot = irfn_vreg(&FN);
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)s->slot, 0, 0, 0, X64_SLOT(s->slot));
-        irfn_push(&FN, IR_STORE, IRT_U64, (u16)s->slot, (u16)p, 0, 0, 0);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, s->slot, 0, 0, 0, X64_SLOT(s->slot));
+        irfn_push(&FN, IR_STORE, IRT_U64, s->slot, p, 0, 0, 0);
         return;
     }
     if (ty_is_func(ty)) {
@@ -14645,7 +14656,7 @@ static void gen_one_local(u32 ty, Declarator *d)
             if (d->mgd && d->mgd_kind == 1) {
                 /* 弱引用：只登记槽，不加计数、不拥有对象 */
                 s->is_mgd = 2;
-                irfn_push(&FN, IR_MOV, ir_ty_of(ty), (u16)s->slot, (u16)r, 0, 0, 0);
+                irfn_push(&FN, IR_MOV, ir_ty_of(ty), s->slot, r, 0, 0, 0);
                 mgd_weak(ident_addr(s), r);
                 return;
             }
@@ -14663,7 +14674,7 @@ static void gen_one_local(u32 ty, Declarator *d)
                 s->is_own = (u8)(d->mgd_kind == 2 ? 1 : 0);
                 mgd_defer_push(s->slot);
             }
-            irfn_push(&FN, IR_MOV, ir_ty_of(ty), (u16)s->slot, (u16)r, 0, 0, 0);
+            irfn_push(&FN, IR_MOV, ir_ty_of(ty), s->slot, r, 0, 0, 0);
             /* `task t = f(...)`：句柄管的是任务本身的生命周期，离开作用域要
              * `__c6_co_destroy()`——挂起着就让体回卷（defer/errdefer 都跑、
              * 帧里的托管引用放掉），跑完的顺手回收。tests/task_method.c6 和
@@ -14671,7 +14682,7 @@ static void gen_one_local(u32 ty, Declarator *d)
             if (ty_is_taskh(ty))
                 task_defer_push(s->slot);
         } else {
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)s->slot, 0, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, s->slot, 0, 0, 0, 0);
             if (d->mgd && d->mgd_kind != 1) {
                 s->is_mgd = 1;
                 mgd_defer_push(s->slot);
@@ -14769,7 +14780,7 @@ static void gen_vla_restore_loop(void)
     Scope *b = NLOOP > 0 ? LOOP_BODY[NLOOP - 1] : NULL;
 
     if (b && b->vla_save)
-        irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, (u16)b->vla_save, 0, 0, 0);
+        irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, b->vla_save, 0, 0, 0);
     else
         gen_vla_restore();
 }
@@ -14782,7 +14793,7 @@ static void gen_vla_restore(void)
 
     for (; sc; sc = sc->up)
         if (sc->vla_save) {
-            irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, (u16)sc->vla_save, 0, 0, 0);
+            irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, sc->vla_save, 0, 0, 0);
             return;
         }
 }
@@ -14808,10 +14819,10 @@ static void mgd_release_slot(u32 slot)
     u32 v = irfn_vreg(&FN);
     u32 z = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)a, 0, 0, 0, X64_SLOT(slot));
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)v, (u16)a, 0, 0, 0);
-    irfn_push(&FN, IR_CONST, IRT_U64, (u16)z, 0, 0, 0, 0);
-    irfn_push(&FN, IR_STORE, IRT_PTR, (u16)a, (u16)z, 0, 0, 0);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, a, 0, 0, 0, X64_SLOT(slot));
+    irfn_push(&FN, IR_LOAD, IRT_PTR, v, a, 0, 0, 0);
+    irfn_push(&FN, IR_CONST, IRT_U64, z, 0, 0, 0, 0);
+    irfn_push(&FN, IR_STORE, IRT_PTR, a, z, 0, 0, 0);
     mgd_release(v);
 }
 
@@ -14821,8 +14832,8 @@ static void mgd_retain_slot(u32 slot)
     u32 a = irfn_vreg(&FN);
     u32 v = irfn_vreg(&FN);
 
-    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)a, 0, 0, 0, X64_SLOT(slot));
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)v, (u16)a, 0, 0, 0);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, a, 0, 0, 0, X64_SLOT(slot));
+    irfn_push(&FN, IR_LOAD, IRT_PTR, v, a, 0, 0, 0);
     mgd_retain(v);
 }
 
@@ -14833,6 +14844,26 @@ static u32 DF_EXCEPT = MGD_NO_SLOT;   /* `return p` 交出去的那个槽：跳�
 static int NDF;
 static int DEF_DEPTH;          /* 块嵌套深度：函数体是 1 */
 static int LOOP_DFB[PA_MAXLOOP];   /* 进循环时的 DEF_DEPTH */
+/* 当前块的**祖先链**：BLK_CHAIN[d] 是现在第 d 层那个块的编号。
+ * goto 要判断"跳到标号时到底退出了哪几层"，光比深度不够——标号可能和
+ * goto 同一深度、但在**兄弟块**里（tcc tests2/101_cleanup 的 `goto outside;`
+ * 就是这样：goto 在外层 if 的块里、标号在另一个 if 的嵌块里、深度还更深），
+ * 只比深度会一条清理都不跑。所以标号定义时把当时的链抄一份，goto 时求公共
+ * 前缀，分叉点以上的层就是要退出的层。 */
+#define BLK_MAXDEPTH 128
+static u32 BLK_CHAIN[BLK_MAXDEPTH];
+static u32 BLK_SEQ;            /* 块编号发号器 */
+
+/* 进了新的一层块：给它发一个新编号（编号只用来判"是不是同一个块"）。 */
+static void blk_chain_push(void)
+{
+    if (DEF_DEPTH < BLK_MAXDEPTH)
+        BLK_CHAIN[DEF_DEPTH] = ++BLK_SEQ;
+}
+
+/* 标号定义时把当前的块链抄一份（内存从 arena 拿，一条几十字节）。
+ * 层数超过 BLK_MAXDEPTH 就不抄，goto 那边退回"按深度"的老算法。 */
+static void blk_chain_save(u32 gi, int depth);
 
 /* `__attribute__((cleanup(fn)))`：作用域退出时调 `fn(&变量)`（和 C 的语义
  * 一致：按声明的逆序）。
@@ -14887,9 +14918,9 @@ static void cleanup_run(int from_scope, int pop)
             dst = irfn_vreg(&FN);
             have = 1;
         }
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)av, 0, 0, 0, X64_SLOT(CL_RECS[i].slot));
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)av, 0, 0, 0);
-        irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(CL_RECS[i].fnty)), (u16)dst, 0, 0, 0,
+        irfn_push(&FN, IR_ADDR, IRT_PTR, av, 0, 0, 0, X64_SLOT(CL_RECS[i].slot));
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, av, 0, 0, 0);
+        irfn_push(&FN, IR_CALL, ir_ty_of(ty_target(CL_RECS[i].fnty)), dst, 0, 0, 0,
                   CL_RECS[i].fnval);
         FN.ops[FN.n - 1].narg = 1;
     }
@@ -14897,7 +14928,7 @@ static void cleanup_run(int from_scope, int pop)
         CL_N = i;
 }
 
-static u16 defer_map_label(u16 *oldl, u16 *newl, int *nl, u16 id)
+static u32 defer_map_label(u32 *oldl, u32 *newl, int *nl, u32 id)
 {
     int i = 0;
 
@@ -14907,15 +14938,15 @@ static u16 defer_map_label(u16 *oldl, u16 *newl, int *nl, u16 id)
     if (*nl >= 64)
         return id;
     oldl[*nl] = id;
-    newl[*nl] = (u16)irfn_label(&FN);
+    newl[*nl] = irfn_label(&FN);
     (*nl)++;
     return newl[*nl - 1];
 }
 
 static void defer_emit(int idx)
 {
-    u16 oldl[64] = {0};
-    u16 newl[64] = {0};
+    u32 oldl[64] = {0};
+    u32 newl[64] = {0};
     int nl = 0;
     u32 k = 0;
 
@@ -14956,8 +14987,8 @@ static void mgd_defer_push(u32 slot_v)
         u32 sa = irfn_vreg(&FN);
         u32 sv = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)sa, 0, 0, 0, X64_SLOT(slot_v));
-        irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)sv, (u16)sa, 0, 0, 0);
+        irfn_push(&FN, IR_ADDR, IRT_PTR, sa, 0, 0, 0, X64_SLOT(slot_v));
+        irfn_push(&FN, IR_LOAD, IRT_PTR, sv, sa, 0, 0, 0);
         mgd_release(sv);
     }
     nops = FN.n - start;
@@ -14988,10 +15019,10 @@ static void task_defer_push(u32 slot_v)
         u32 sv = irfn_vreg(&FN);
         u32 cv = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)sa, 0, 0, 0, X64_SLOT(slot_v));
-        irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)sv, (u16)sa, 0, 0, 0);
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)sv, 0, 0, 0);
-        irfn_push(&FN, IR_CALL, IRT_VOID, (u16)cv, 0, 0, 0,
+        irfn_push(&FN, IR_ADDR, IRT_PTR, sa, 0, 0, 0, X64_SLOT(slot_v));
+        irfn_push(&FN, IR_LOAD, IRT_PTR, sv, sa, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, sv, 0, 0, 0);
+        irfn_push(&FN, IR_CALL, IRT_VOID, cv, 0, 0, 0,
                   x64_sym(&X64, "__c6_co_destroy"));
         FN.ops[FN.n - 1].narg = 1;
     }
@@ -15163,6 +15194,7 @@ static void gen_block(void)
     pa_expect_ch('{');
     scope_enter();
     DEF_DEPTH++;
+    blk_chain_push();
     if (NLOOP > 0 && NLOOP - 1 < PA_MAXLOOP && !LOOP_BODY[NLOOP - 1])
         LOOP_BODY[NLOOP - 1] = SCOPE;
     while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF)
@@ -15170,7 +15202,7 @@ static void gen_block(void)
     defer_run_pop(DEF_DEPTH);
     DEF_DEPTH--;
     if (SCOPE && SCOPE->vla_save)
-        irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, (u16)SCOPE->vla_save, 0, 0, 0);
+        irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, SCOPE->vla_save, 0, 0, 0);
     scope_leave();
     pa_expect_ch('}');
 }
@@ -15228,22 +15260,22 @@ static void gen_switch(void)
 
             chain[nchain].op = IR_CONSTK;      /* case 值可能是 64 位 */
             chain[nchain].type = IRT_U64;
-            chain[nchain].dst = (u16)t;
+            chain[nchain].dst = t;
             chain[nchain].imm = irfn_kconst(&FN, c->lo);
             nchain++;
             o = &chain[nchain];
             o->op = IR_CMP;
             o->type = IRT_U64;
-            o->dst = (u16)cnd;
-            o->a = (u16)cv;
-            o->b = (u16)t;
+            o->dst = cnd;
+            o->a = cv;
+            o->b = t;
             o->flags = IRCC_EQ;    /* CMP 的条件码放在 flags 里（不是 imm） */
             nchain++;
             o = &chain[nchain];
             o->op = IR_BR;
-            o->a = (u16)cnd;
-            o->b = (u16)c->lbl;
-            o->c = (u16)lnext;
+            o->a = cnd;
+            o->b = c->lbl;
+            o->c = lnext;
             nchain++;
         } else {
             u32 lchk = irfn_label(&FN);
@@ -15254,58 +15286,58 @@ static void gen_switch(void)
 
             chain[nchain].op = IR_CONSTK;      /* case 值可能是 64 位 */
             chain[nchain].type = IRT_U64;
-            chain[nchain].dst = (u16)t;
+            chain[nchain].dst = t;
             chain[nchain].imm = irfn_kconst(&FN, c->lo);
             nchain++;
             o = &chain[nchain];
             o->op = IR_CMP;
             o->type = IRT_U64;
-            o->dst = (u16)c1;
-            o->a = (u16)cv;
-            o->b = (u16)t;
+            o->dst = c1;
+            o->a = cv;
+            o->b = t;
             o->flags = sw_uns ? IRCC_UGE : IRCC_GE;
             nchain++;
             o = &chain[nchain];
             o->op = IR_BR;
-            o->a = (u16)c1;
-            o->b = (u16)lchk;
-            o->c = (u16)lnext;
+            o->a = c1;
+            o->b = lchk;
+            o->c = lnext;
             nchain++;
             chain[nchain].op = IR_LABEL;
-            chain[nchain].a = (u16)lchk;
+            chain[nchain].a = lchk;
             nchain++;
             chain[nchain].op = IR_CONSTK;      /* case 值可能是 64 位 */
             chain[nchain].type = IRT_U64;
-            chain[nchain].dst = (u16)t2;
+            chain[nchain].dst = t2;
             chain[nchain].imm = irfn_kconst(&FN, c->hi);
             nchain++;
             o = &chain[nchain];
             o->op = IR_CMP;
             o->type = IRT_U64;
-            o->dst = (u16)c2;
-            o->a = (u16)cv;
-            o->b = (u16)t2;
+            o->dst = c2;
+            o->a = cv;
+            o->b = t2;
             o->flags = sw_uns ? IRCC_ULE : IRCC_LE;
             nchain++;
             o = &chain[nchain];
             o->op = IR_BR;
-            o->a = (u16)c2;
-            o->b = (u16)c->lbl;
-            o->c = (u16)lnext;
+            o->a = c2;
+            o->b = c->lbl;
+            o->c = lnext;
             nchain++;
         }
         chain[nchain].op = IR_LABEL;
-        chain[nchain].a = (u16)lnext;
+        chain[nchain].a = lnext;
         nchain++;
     }
     /* 都不匹配 → default（没有 default 就跳到末尾） */
     chain[nchain].op = IR_JMP;
-    chain[nchain].a = (u16)(st->has_def ? st->def_lbl : st->end_lbl);
+    chain[nchain].a = (st->has_def ? st->def_lbl : st->end_lbl);
     nchain++;
     irfn_insert(&FN, st->ins_at, chain, nchain);
     if (!st->has_def)
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)st->def_lbl, 0, 0, 0);
-    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)st->end_lbl, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, st->def_lbl, 0, 0, 0);
+    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, st->end_lbl, 0, 0, 0);
 }
 
 /* 名字标号：goto 与 label 用同一张表，先到先得（前向 goto 也成立） */
@@ -15315,7 +15347,20 @@ static u32 GLBL_LEN[GOTO_MAX];
 static u32 GLBL_ID[GOTO_MAX];
 static int GLBL_DEPTH[GOTO_MAX];   /* 标号所在块深度（goto 按它决定跑哪些清理） */
 static int GLBL_DEF[GOTO_MAX];     /* 标号已经定义过了（前向 goto 还不知道深度） */
+static u32 *GLBL_CHAIN[GOTO_MAX];  /* 定义时抄下来的块链（NULL = 太深，没抄） */
 static u32 NGLBL;
+
+static void blk_chain_save(u32 gi, int depth)
+{
+    int d = 0;
+
+    GLBL_CHAIN[gi] = NULL;
+    if (depth <= 0 || depth >= BLK_MAXDEPTH)
+        return;
+    GLBL_CHAIN[gi] = arena_alloc(&A_main, (size_t)(depth + 1) * sizeof(u32));
+    for (d = 1; d <= depth; d++)
+        GLBL_CHAIN[gi][d] = BLK_CHAIN[d];
+}
 
 static u32 goto_label(const char *nm, u32 len)
 {
@@ -15759,14 +15804,14 @@ static u32 gen_iface_call(u32 addr, u32 mi, u32 ret_ty, u32 *args, u32 nargs)
     u32 dst = irfn_vreg(&FN);
     u32 k = 0;
 
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)selfv, (u16)addr, 0, 0, 0);
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)vtv, (u16)vt8, 0, 0, 0);
-    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)fnv, (u16)vtv, 0, 0, mi * 8);
-    irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)fnv, (u16)fnv, 0, 0, 0);
-    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)selfv, 0, 0, 0);
+    irfn_push(&FN, IR_LOAD, IRT_PTR, selfv, addr, 0, 0, 0);
+    irfn_push(&FN, IR_LOAD, IRT_PTR, vtv, vt8, 0, 0, 0);
+    irfn_push(&FN, IR_LEA, IRT_PTR, fnv, vtv, 0, 0, mi * 8);
+    irfn_push(&FN, IR_LOAD, IRT_PTR, fnv, fnv, 0, 0, 0);
+    irfn_push(&FN, IR_ARG, IRT_U64, 0, selfv, 0, 0, 0);
     for (k = 0; k < nargs; k++)
-        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)args[k], 0, 0, k + 1);
-    irfn_push(&FN, IR_CALLI, ir_ty_of(ret_ty), (u16)dst, (u16)fnv, 0, 0, 0);
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, args[k], 0, 0, k + 1);
+    irfn_push(&FN, IR_CALLI, ir_ty_of(ret_ty), dst, fnv, 0, 0, 0);
     FN.ops[FN.n - 1].narg = (u8)(nargs + 1);
     return dst;
 }
@@ -15902,13 +15947,14 @@ static void gen_stmt(void)
             v = value_of(gen_expr());
             pa_expect_ch(';');
             gen_vla_restore();
-            irfn_push(&FN, IR_JMPIND, IRT_VOID, 0, (u16)v, 0, 0, 0);
+            irfn_push(&FN, IR_JMPIND, IRT_VOID, 0, v, 0, 0, 0);
             return;
         }
         if (pa_cur()->kind == TK_IDENT) {
             u32 l = goto_label(tok_data(pa_cur()), pa_cur()->len);
             int gi = 0;
             int ld = 0;
+            int lgi = -1;
 
             pa_advance();
             pa_expect_ch(';');
@@ -15919,6 +15965,7 @@ static void gen_stmt(void)
             for (gi = 0; gi < NGLBL; gi++)
                 if (GLBL_ID[gi] == l && GLBL_DEF[gi]) {
                     ld = GLBL_DEPTH[gi];
+                    lgi = gi;
                     fwd = 0;
                 }
             /* 变长数组的栈空间只在**回边**上回收（向后 goto = 自己搭的循环，
@@ -15929,11 +15976,33 @@ static void gen_stmt(void)
              * 抹成 0，ret 直接蹦到野地址）。 */
             if (!fwd)
                 gen_vla_restore();
-            /* 只跑**比标号更深**的作用域的清理：同一个作用域里 `again:` 之后
+            /* 只跑**退出掉的那些**作用域的清理：同一个作用域里 `again:` 之后
              * 注册的 defer，跳回 `again:` 时还活着，不能重复执行
-             * （tests/defer_scope.c6 的"重复注册只跑一次"）。 */
-            defer_run(ld > 0 ? ld + 1 : 1, 0);
-            irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)l, 0, 0, 0);
+             * （tests/defer_scope.c6 的"重复注册只跑一次"）。
+             *
+             * 判"退出了哪几层"不能只看深度：标号可能和 goto 在同一深度、但在
+             * 兄弟块里（跳过去其实退出了当前这些块），也可能比 goto 更深。
+             * 所以拿块链求公共前缀——第 c 层还在一起、第 c+1 层就分叉了，
+             * 那么 c+1 层及更深的全退出了。 */
+            {
+                /* 前向 goto 还不知道标号在多深，但有一点是确定的：**不可能退出
+                 * 函数体**（第 1 层）。所以起点至少是 2 —— 从 1 起会把函数体
+                 * 自己的 cleanup 提前跑一遍（tcc tests2/101_cleanup 的 check()
+                 * 里，`goto out` 把 `str: wololo` 打在了最前面，等函数真的返回时
+                 * 又跑一遍，第二次打出来的是被改过的 "fail"）。 */
+                int from = ld > 0 ? ld + 1 : 2;
+
+                if (!fwd && lgi >= 0 && GLBL_CHAIN[lgi]) {
+                    int c = 0;
+
+                    while (c < DEF_DEPTH && c < ld && c + 1 < BLK_MAXDEPTH
+                           && BLK_CHAIN[c + 1] == GLBL_CHAIN[lgi][c + 1])
+                        c++;
+                    from = c + 1;
+                }
+                defer_run(from, 0);
+            }
+            irfn_push(&FN, IR_JMP, IRT_VOID, 0, l, 0, 0, 0);
         } else {
             pa_error("goto 后面要标号名或 '*' 表达式");
             while (!pa_is_ch(';') && pa_cur()->kind != TK_EOF)
@@ -15964,8 +16033,8 @@ static void gen_stmt(void)
                 pa_error("'co' 的操作数必须是一次 async 调用");
             (void)cv;
             /* `co` 没有句柄：跑完由调度侧（__c6_co_run）自动回收并计失败 */
-            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)cv, 0, 0, 0);
-            irfn_push(&FN, IR_CALL, IRT_VOID, (u16)dv, 0, 0, 0,
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, cv, 0, 0, 0);
+            irfn_push(&FN, IR_CALL, IRT_VOID, dv, 0, 0, 0,
                       x64_sym(&X64, "__c6_co_detach"));
             FN.ops[FN.n - 1].narg = 1;
         }
@@ -15983,9 +16052,10 @@ static void gen_stmt(void)
         for (gi = 0; gi < NGLBL; gi++)
             if (GLBL_ID[gi] == l) {
                 GLBL_DEPTH[gi] = DEF_DEPTH;
+                blk_chain_save((u32)gi, DEF_DEPTH);
                 GLBL_DEF[gi] = 1;
             }
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)l, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, l, 0, 0, 0);
         /* 标号后面**必须**接着生成被标号的那条语句。原来这里直接 return，
          * 于是 `if (c) lab: stmt;` 里的 stmt 会被当成 if 之后的**另一条语句**，
          * 条件为假时照样执行——tcc 里 `if (t0 == TOK_PPJOIN) bad_twosharp: …`
@@ -16019,7 +16089,7 @@ static void gen_stmt(void)
         } else {
             pa_error("case 只能出现在 switch 里");
         }
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbl, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbl, 0, 0, 0);
         /* 和名字标号同一条规矩：`case N:` 后面那条语句是**被标号**的语句，
          * 必须在这儿一起生成。`switch (x) case 1: return 1;` 这种不带花括号的
          * switch 以前就把 `return 1;` 漏在了 switch 外面——x 不是 1 也照跑
@@ -16032,7 +16102,7 @@ static void gen_stmt(void)
         pa_expect_ch(':');
         if (NSW > 0) {
             SW[NSW - 1].has_def = 1;
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)SW[NSW - 1].def_lbl, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, SW[NSW - 1].def_lbl, 0, 0, 0);
         } else {
             pa_error("default 只能出现在 switch 里");
         }
@@ -16071,7 +16141,7 @@ static void gen_stmt(void)
                 task_seal(tsk2);
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
-                irfn_push(&FN, IR_RET, IRT_PTR, 0, (u16)tsk2, 0, 0, 0);
+                irfn_push(&FN, IR_RET, IRT_PTR, 0, tsk2, 0, 0, 0);
                 return;
             }
             defer_run(1, on_err);
@@ -16086,7 +16156,7 @@ static void gen_stmt(void)
             u32 slot = frame_slots_for(sz ? sz : 8);
             u32 addr = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
+            irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(slot));
             gen_init_obj(addr, aty, 0);
             pa_expect_ch(';');
             if (CUR_TASK_TY) {
@@ -16098,18 +16168,18 @@ static void gen_stmt(void)
 
                     if (voff) {
                         dst2 = irfn_vreg(&FN);
-                        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)dst2, (u16)tsk, 0, 0, voff);
+                        irfn_push(&FN, IR_LEA, IRT_PTR, dst2, tsk, 0, 0, voff);
                     }
-                    irfn_push(&FN, IR_COPY, IRT_U8, (u16)dst2, (u16)addr, 0, 0,
+                    irfn_push(&FN, IR_COPY, IRT_U8, dst2, addr, 0, 0,
                               sz ? sz : 8);
                 }
                 task_seal(tsk);
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
-                irfn_push(&FN, IR_RET, IRT_PTR, 0, (u16)tsk, 0, 0, 0);
+                irfn_push(&FN, IR_RET, IRT_PTR, 0, tsk, 0, 0, 0);
             } else {
                 defer_run(1, on_err);
-                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, (u16)addr, 0, 0, 0);
+                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, addr, 0, 0, 0);
             }
             return;
         }
@@ -16157,21 +16227,21 @@ static void gen_stmt(void)
                 dst2 = tsk;
                 if (voff) {
                     dst2 = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_LEA, IRT_PTR, (u16)dst2, (u16)tsk, 0, 0, voff);
+                    irfn_push(&FN, IR_LEA, IRT_PTR, dst2, tsk, 0, 0, voff);
                 }
-                irfn_push(&FN, IR_STORE, IRT_U64, (u16)dst2, (u16)v, 0, 0, 0);
+                irfn_push(&FN, IR_STORE, IRT_U64, dst2, v, 0, 0, 0);
                 {
                     u32 ov = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)tsk, 0, 0, 0);
-                    irfn_push(&FN, IR_CALL, IRT_VOID, (u16)ov, 0, 0, 0,
+                    irfn_push(&FN, IR_ARG, IRT_U64, 0, tsk, 0, 0, 0);
+                    irfn_push(&FN, IR_CALL, IRT_VOID, ov, 0, 0, 0,
                               x64_sym(&X64, "__c6_co_ownval"));
                     FN.ops[FN.n - 1].narg = 1;
                 }
                 task_seal(tsk);
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
-                irfn_push(&FN, IR_RET, IRT_PTR, 0, (u16)tsk, 0, 0, 0);
+                irfn_push(&FN, IR_RET, IRT_PTR, 0, tsk, 0, 0, 0);
                 return;
             }
             if (ret_mgd && PEND_MGD_SYM && PEND_MGD_SYM->kind == SC_LOCAL) {
@@ -16185,7 +16255,7 @@ static void gen_stmt(void)
                 v = rv;
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
-                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, (u16)v, 0, 0, 0);
+                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, v, 0, 0, 0);
                 return;
             }
             v_took = mgd_tmp_take(v);
@@ -16219,16 +16289,16 @@ static void gen_stmt(void)
 
                     if (voff) {
                         dst2 = irfn_vreg(&FN);
-                        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)dst2, (u16)tsk, 0, 0, voff);
+                        irfn_push(&FN, IR_LEA, IRT_PTR, dst2, tsk, 0, 0, voff);
                     }
                     if (ty_is_agg(rty))
                         /* 聚合表达式：v 是它的地址，按字节拷进 val。
                          * 看的是**表达式**的类型：`return err(9, "…")` 在元组
                          * 返回的 async 函数里也合法，那时 v 是标量，不能当地址拷。 */
-                        irfn_push(&FN, IR_COPY, IRT_U8, (u16)dst2, (u16)v, 0, 0,
+                        irfn_push(&FN, IR_COPY, IRT_U8, dst2, v, 0, 0,
                                   ty_size(rty) ? ty_size(rty) : 8);
                     else
-                        irfn_push(&FN, IR_STORE, IRT_U64, (u16)dst2, (u16)v, 0, 0, 0);
+                        irfn_push(&FN, IR_STORE, IRT_U64, dst2, v, 0, 0, 0);
                     /* `return new T;`（新引用）也是"交进 val 槽"：记上标记，
                      * 销毁任务时由运行时放掉，`t->val` 也就按托管字段处理
                      * （tests/gc_async.c6 的 t4_make_fresh 这条）。 */
@@ -16239,8 +16309,8 @@ static void gen_stmt(void)
                         u8 vc9[1] = {0};
 
                         mgdst_add(CUR_TASK_TY, vi9, vk9, vc9, 1, (u32)pa_cur()->file);
-                        irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)tsk, 0, 0, 0);
-                        irfn_push(&FN, IR_CALL, IRT_VOID, (u16)ov2, 0, 0, 0,
+                        irfn_push(&FN, IR_ARG, IRT_U64, 0, tsk, 0, 0, 0);
+                        irfn_push(&FN, IR_CALL, IRT_VOID, ov2, 0, 0, 0,
                                   x64_sym(&X64, "__c6_co_ownval"));
                         FN.ops[FN.n - 1].narg = 1;
                     }
@@ -16248,13 +16318,28 @@ static void gen_stmt(void)
                 task_seal(tsk);
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
-                irfn_push(&FN, IR_RET, IRT_PTR, 0, (u16)tsk, 0, 0, 0);
+                irfn_push(&FN, IR_RET, IRT_PTR, 0, tsk, 0, 0, 0);
             } else {
                 if (ty_is_scalar(CUR_RET_TY) && rty != CUR_RET_TY)
                     v = gen_convert(v, rty, CUR_RET_TY);
+                /* `return agg;` 且本函数还有没跑的 cleanup：C 的语义是**先把
+                 * 返回值拷出去、再跑 cleanup**（gcc 就这么排）。不拷的话，
+                 * 那种会改写原对象的 cleanup（`my_cleanup2` 把每个成员改写成
+                 * 0x90…）会把调用者看到的返回值一起改掉——tcc tests2/
+                 * 101_cleanup 的 test_cleanup2/3/4/6 就是这么错的。
+                 * 没有 cleanup 时不拷，热路径上不多一条。 */
+                if (ty_is_agg(CUR_RET_TY) && CL_N > 0 && ty_size(CUR_RET_TY)) {
+                    u32 rsz = ty_size(CUR_RET_TY);
+                    u32 raddr = irfn_vreg(&FN);
+
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, raddr, 0, 0, 0,
+                              X64_SLOT(frame_slots_for(rsz)));
+                    irfn_push(&FN, IR_COPY, IRT_U8, raddr, v, 0, 0, rsz);
+                    v = raddr;
+                }
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
-                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, (u16)v, 0, 0, 0);
+                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, v, 0, 0, 0);
             }
         }
         return;
@@ -16269,20 +16354,20 @@ static void gen_stmt(void)
         pa_expect_ch('(');
         c = value_of(gen_expr());
         pa_expect_ch(')');
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)lthen, (u16)lelse, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lthen, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, c, lthen, lelse, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lthen, 0, 0, 0);
         gen_stmt();
         mv_save_tmp();          /* then 分支的状态 */
         mv_restore();           /* else 从"进来时"的状态开始 */
         if (PA_ACCEPT_IDENT("else")) {
-            irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lend, 0, 0, 0);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lelse, 0, 0, 0);
+            irfn_push(&FN, IR_JMP, IRT_VOID, 0, lend, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lelse, 0, 0, 0);
             gen_stmt();
         } else {
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lelse, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lelse, 0, 0, 0);
         }
         mv_union_tmp();         /* 汇合：任一条路移走了就算移走 */
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         mv_pop();
         return;
     }
@@ -16444,16 +16529,16 @@ static void gen_stmt(void)
 
                 ety_el = ty_slice_elem(ivty);
 
-                irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)dv, (u16)base, 0, 0, 0);
-                irfn_push(&FN, IR_MOV, IRT_PTR, (u16)pslot, (u16)dv, 0, 0, 0);
-                irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a8, (u16)base, 0, 0, 8);
-                irfn_push(&FN, IR_LOAD, IRT_U64, (u16)nslot, (u16)a8, 0, 0, 0);
+                irfn_push(&FN, IR_LOAD, IRT_PTR, dv, base, 0, 0, 0);
+                irfn_push(&FN, IR_MOV, IRT_PTR, pslot, dv, 0, 0, 0);
+                irfn_push(&FN, IR_LEA, IRT_PTR, a8, base, 0, 0, 8);
+                irfn_push(&FN, IR_LOAD, IRT_U64, nslot, a8, 0, 0, 0);
             } else if (ty_is_array(ivty)) {
                 ety_el = ty_target(ivty);
                 if (ty_array_n(ivty) == 0)
                     pa_error("cannot iterate over an array of unknown length");
-                irfn_push(&FN, IR_MOV, IRT_PTR, (u16)pslot, (u16)base, 0, 0, 0);
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)nslot, 0, 0, 0, ty_array_n(ivty));
+                irfn_push(&FN, IR_MOV, IRT_PTR, pslot, base, 0, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_U64, nslot, 0, 0, 0, ty_array_n(ivty));
             } else if (ty_is_agg(ivty)
                        || (ty_is_ptr(ivty) && ty_is_agg(ty_target(ivty)))) {
                 /* 迭代器协议：可迭代值的类型提供 `has(T *)` / `next(T *)`。
@@ -16555,8 +16640,8 @@ static void gen_stmt(void)
                 } else {
                     itslot = frame_slots_for(ty_size(ivty) ? ty_size(ivty) : 8);
                     itaddr = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)itaddr, 0, 0, 0, X64_SLOT(itslot));
-                    irfn_push(&FN, IR_COPY, IRT_U8, (u16)itaddr, (u16)base, 0, 0,
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, itaddr, 0, 0, 0, X64_SLOT(itslot));
+                    irfn_push(&FN, IR_COPY, IRT_U8, itaddr, base, 0, 0,
                               ty_size(ivty) ? ty_size(ivty) : 8);
                 }
                 iter_has = sh ? (u32)sh->val : 0;
@@ -16584,13 +16669,13 @@ static void gen_stmt(void)
                 u32 cnt = irfn_vreg(&FN);
 
                 ety_el = ty_char();
-                irfn_push(&FN, IR_MOV, IRT_PTR, (u16)pslot, (u16)base, 0, 0, 0);
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)cnt, 0, 0, 0, (u32)lit_n);
-                irfn_push(&FN, IR_MOV, IRT_U64, (u16)nslot, (u16)cnt, 0, 0, 0);
+                irfn_push(&FN, IR_MOV, IRT_PTR, pslot, base, 0, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_U64, cnt, 0, 0, 0, (u32)lit_n);
+                irfn_push(&FN, IR_MOV, IRT_U64, nslot, cnt, 0, 0, 0);
             } else {
                 pa_error("foreach 只能遍历数组或切片");
-                irfn_push(&FN, IR_MOV, IRT_PTR, (u16)pslot, (u16)base, 0, 0, 0);
-                irfn_push(&FN, IR_CONST, IRT_U64, (u16)nslot, 0, 0, 0, 0);
+                irfn_push(&FN, IR_MOV, IRT_PTR, pslot, base, 0, 0, 0);
+                irfn_push(&FN, IR_CONST, IRT_U64, nslot, 0, 0, 0, 0);
             }
         }
         pa_expect_ch(')');
@@ -16603,7 +16688,7 @@ static void gen_stmt(void)
             lbody = irfn_label(&FN);
             lcont = irfn_label(&FN);
             lend = irfn_label(&FN);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltop, 0, 0, 0);
             {
                 u32 hv = 0;
 
@@ -16611,13 +16696,13 @@ static void gen_stmt(void)
                     hv = gen_iface_call(iaddr, iter_mi_has, ty_int(), NULL, 0);
                 else {
                     hv = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)iaddr, 0, 0, 0);
-                    irfn_push(&FN, IR_CALL, IRT_I32, (u16)hv, 0, 0, 0, iter_has);
+                    irfn_push(&FN, IR_ARG, IRT_U64, 0, iaddr, 0, 0, 0);
+                    irfn_push(&FN, IR_CALL, IRT_I32, hv, 0, 0, 0, iter_has);
                     FN.ops[FN.n - 1].narg = 1;
                 }
-                irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)hv, (u16)lbody, (u16)lend, 0);
+                irfn_push(&FN, IR_BR, IRT_VOID, 0, hv, lbody, lend, 0);
             }
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbody, 0, 0, 0);
             if (vbind) {
                 u32 elty0 = two ? bty[1] : bty[0];
                 u32 nv = 0;
@@ -16626,8 +16711,8 @@ static void gen_stmt(void)
                     nv = gen_iface_call(iaddr, iter_mi_next, elty0, NULL, 0);
                 else {
                     nv = irfn_vreg(&FN);
-                    irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)iaddr, 0, 0, 0);
-                    irfn_push(&FN, IR_CALL, ir_ty_of(elty0), (u16)nv, 0, 0, 0, iter_next);
+                    irfn_push(&FN, IR_ARG, IRT_U64, 0, iaddr, 0, 0, 0);
+                    irfn_push(&FN, IR_CALL, ir_ty_of(elty0), nv, 0, 0, 0, iter_next);
                     FN.ops[FN.n - 1].narg = 1;
                 }
                 if (bmgd[two ? (nb >= 2 ? 1 : 0) : 0] && !bnamed[two ? (nb >= 2 ? 1 : 0) : 0]) {
@@ -16640,11 +16725,11 @@ static void gen_stmt(void)
                      * ps)` 里 p.a 读到的是栈地址）。 */
                     u32 bdst = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)bdst, 0, 0, 0, X64_SLOT(vbind));
-                    irfn_push(&FN, IR_COPY, IRT_U8, (u16)bdst, (u16)nv, 0, 0,
+                    irfn_push(&FN, IR_ADDR, IRT_PTR, bdst, 0, 0, 0, X64_SLOT(vbind));
+                    irfn_push(&FN, IR_COPY, IRT_U8, bdst, nv, 0, 0,
                               ty_size(elty0));
                 } else {
-                    irfn_push(&FN, IR_MOV, ir_ty_of(elty0), (u16)vbind, (u16)nv, 0, 0, 0);
+                    irfn_push(&FN, IR_MOV, ir_ty_of(elty0), vbind, nv, 0, 0, 0);
                 }
             }
             LOOP_BRK[NLOOP] = lend;
@@ -16660,15 +16745,15 @@ static void gen_stmt(void)
                 pa_error("foreach 后面要一个 { … } 块");
             mv_loop_leave();
             NLOOP--;
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lcont, 0, 0, 0);
             /* 托管绑定：每轮收尾把这一轮拿到的引用放掉（`lcont` 之后才放，
              * 这样 `continue` 也走得到；出口再放一次，兜住 `break`）。 */
             if (bmgd[0] && bnamed[0])
                 mgd_release_slot(vbind);
             if (two && bmgd[1] && bnamed[1])
                 mgd_release_slot(vbind);
-            irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+            irfn_push(&FN, IR_JMP, IRT_VOID, 0, ltop, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
             if (iter_own)
                 mgd_release(islot);
             if (bmgd[0] && bnamed[0])
@@ -16698,21 +16783,21 @@ static void gen_stmt(void)
                  * 0:3) { i = 99; }` 里改绑定不能影响迭代次数。 */
                 u32 rcnt = irfn_vreg(&FN);
 
-                irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), (u16)rcnt, (u16)rlo, 0, 0, 0);
+                irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), rcnt, rlo, 0, 0, 0);
                 ltop = irfn_label(&FN);
                 lbody = irfn_label(&FN);
                 lcont = irfn_label(&FN);
                 lend = irfn_label(&FN);
-                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
+                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltop, 0, 0, 0);
                 {
                     u32 c2 = irfn_vreg(&FN);
                     u8 cc = ty_is_signed(bty[0]) ? IRCC_LT : IRCC_ULT;
 
-                    irfn_push(&FN, IR_CMP, IRT_U64, (u16)c2, (u16)rcnt, (u16)rhi, 0, cc);
+                    irfn_push(&FN, IR_CMP, IRT_U64, c2, rcnt, rhi, 0, cc);
                     FN.ops[FN.n - 1].flags = cc;
-                    irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c2, (u16)lbody, (u16)lend, 0);
-                    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
-                    irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), (u16)lb, (u16)rcnt, 0, 0, 0);
+                    irfn_push(&FN, IR_BR, IRT_VOID, 0, c2, lbody, lend, 0);
+                    irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbody, 0, 0, 0);
+                    irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), lb, rcnt, 0, 0, 0);
                 }
                 LOOP_BRK[NLOOP] = lend;
                 LOOP_CNT[NLOOP] = lcont;
@@ -16726,17 +16811,17 @@ static void gen_stmt(void)
                     pa_error("foreach 后面要一个 { … } 块");
                 mv_loop_leave();
                 NLOOP--;
-                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
+                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lcont, 0, 0, 0);
                 {
                     u32 one = irfn_vreg(&FN);
                     u32 nx = irfn_vreg(&FN);
 
-                    irfn_push(&FN, IR_CONST, IRT_U64, (u16)one, 0, 0, 0, 1);
-                    irfn_push(&FN, IR_ADD, IRT_U64, (u16)nx, (u16)rcnt, (u16)one, 0, 0);
-                    irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), (u16)rcnt, (u16)nx, 0, 0, 0);
+                    irfn_push(&FN, IR_CONST, IRT_U64, one, 0, 0, 0, 1);
+                    irfn_push(&FN, IR_ADD, IRT_U64, nx, rcnt, one, 0, 0);
+                    irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), rcnt, nx, 0, 0, 0);
                 }
-                irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
-                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+                irfn_push(&FN, IR_JMP, IRT_VOID, 0, ltop, 0, 0, 0);
+                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
             }
             scope_leave();
             return;
@@ -16746,21 +16831,21 @@ static void gen_stmt(void)
         /* 下标也放隐藏槽：`foreach ((size_t i, int v) = a) { i = 99; }` 里改
          * 绑定不能影响迭代（绑定每轮拿一份副本）。 */
         islot = irfn_vreg(&FN);
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)islot, 0, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, islot, 0, 0, 0, 0);
         ltop = irfn_label(&FN);
         lbody = irfn_label(&FN);
         lcont = irfn_label(&FN);
         lend = irfn_label(&FN);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltop, 0, 0, 0);
         {
             u32 c2 = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CMP, IRT_U64, (u16)c2, (u16)islot, (u16)nslot, 0, IRCC_ULT);
+            irfn_push(&FN, IR_CMP, IRT_U64, c2, islot, nslot, 0, IRCC_ULT);
             irfn_setcc(&FN, IRCC_ULT);
-            irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c2, (u16)lbody, (u16)lend, 0);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
+            irfn_push(&FN, IR_BR, IRT_VOID, 0, c2, lbody, lend, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbody, 0, 0, 0);
             if (two && bsl[0])
-                irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), (u16)bsl[0], (u16)islot, 0, 0, 0);
+                irfn_push(&FN, IR_MOV, ir_ty_of(bty[0]), bsl[0], islot, 0, 0, 0);
         }
         if (vbind) {
             u32 vt = two ? bty[1] : bty[0];
@@ -16772,15 +16857,15 @@ static void gen_stmt(void)
             u32 m = irfn_vreg(&FN);
             u32 a = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)off, 0, 0, 0, esz);
-            irfn_push(&FN, IR_MUL, IRT_U64, (u16)m, (u16)islot, (u16)off, 0, 0);
-            irfn_push(&FN, IR_LEA, IRT_PTR, (u16)a, (u16)pslot, (u16)m, 0, 0);
-            irfn_push(&FN, IR_LOAD, ir_ty_of(et2), (u16)vbind, (u16)a, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, off, 0, 0, 0, esz);
+            irfn_push(&FN, IR_MUL, IRT_U64, m, islot, off, 0, 0);
+            irfn_push(&FN, IR_LEA, IRT_PTR, a, pslot, m, 0, 0);
+            irfn_push(&FN, IR_LOAD, ir_ty_of(et2), vbind, a, 0, 0, 0);
             /* 元素类型和绑定类型不同时按赋值规则转换（char -> long 之类） */
             if (et2 != vt) {
                 u32 cv = gen_convert(vbind, et2, vt);
 
-                irfn_push(&FN, IR_MOV, ir_ty_of(vt), (u16)vbind, (u16)cv, 0, 0, 0);
+                irfn_push(&FN, IR_MOV, ir_ty_of(vt), vbind, cv, 0, 0, 0);
             }
             /* 托管元素是**借**的（数组还持有它）：绑定加一次计数，每轮收尾
              * 放掉（不然后面 a[0] = 0 一放，活计数就对不上了）。 */
@@ -16799,19 +16884,19 @@ static void gen_stmt(void)
             pa_error("foreach 后面要一个 { … } 块");
         mv_loop_leave();
         NLOOP--;
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lcont, 0, 0, 0);
         if (vbind && bmgd[two ? 1 : 0] && bnamed[two ? 1 : 0])
             mgd_release_slot(vbind);
         {
             u32 one = irfn_vreg(&FN);
             u32 nx = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_CONST, IRT_U64, (u16)one, 0, 0, 0, 1);
-            irfn_push(&FN, IR_ADD, IRT_U64, (u16)nx, (u16)islot, (u16)one, 0, 0);
-            irfn_push(&FN, IR_MOV, IRT_U64, (u16)islot, (u16)nx, 0, 0, 0);
+            irfn_push(&FN, IR_CONST, IRT_U64, one, 0, 0, 0, 1);
+            irfn_push(&FN, IR_ADD, IRT_U64, nx, islot, one, 0, 0);
+            irfn_push(&FN, IR_MOV, IRT_U64, islot, nx, 0, 0, 0);
         }
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, ltop, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         if (vbind && bmgd[two ? 1 : 0] && bnamed[two ? 1 : 0])
             mgd_release_slot(vbind);
         scope_leave();
@@ -16827,12 +16912,12 @@ static void gen_stmt(void)
 
         /* 标签必须在条件**之前**发出：条件本身会产生算 cmp 的指令，
          * 标签放在后面会让回边跳过条件求值（死循环）。 */
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltop, 0, 0, 0);
         pa_expect_ch('(');
         c = value_of(gen_expr());
         pa_expect_ch(')');
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)lbodY, (u16)lend, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbodY, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, c, lbodY, lend, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbodY, 0, 0, 0);
         LOOP_BRK[NLOOP] = lend;
         LOOP_CNT[NLOOP] = ltop;
         LOOP_DFB[NLOOP] = DEF_DEPTH;
@@ -16842,8 +16927,8 @@ static void gen_stmt(void)
         gen_stmt();
         mv_loop_leave();
         NLOOP--;
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, ltop, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         return;
     }
     if (PA_ACCEPT_IDENT("for")) {
@@ -16861,6 +16946,7 @@ static void gen_stmt(void)
          * 就销毁），所以这里单独开一层深度。continue 不清理它，break 和循环正常
          * 结束要清理它（C 标准：离开作用域就跑 cleanup 函数）。 */
         DEF_DEPTH++;
+        blk_chain_push();
         if (!pa_accept_ch(';')) {
             if (is_typename_tok(pa_cur()))
                 gen_local_decl(1);
@@ -16869,18 +16955,18 @@ static void gen_stmt(void)
                 pa_expect_ch(';');
             }
         }
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltop, 0, 0, 0);
         if (!pa_accept_ch(';')) {
             u32 c = value_of(gen_expr());
 
             pa_expect_ch(';');
-            irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)lbody, (u16)lclean, 0);
+            irfn_push(&FN, IR_BR, IRT_VOID, 0, c, lbody, lclean, 0);
         } else {
             /* 空条件 `for (init; ; incr)`：没有条件分支，就得有**无条件**跳进
              * 循环体。少了这一条，控制流从 ltop 直接落到 lcont（先跑 incr）再
              * 跳回 ltop，循环体永远进不去——编译出来的程序死循环且一行 print
              * 都不出。tcc 的 `for (popt = tcc_options; ; ++popt)` 正好踩这个。 */
-            irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
+            irfn_push(&FN, IR_JMP, IRT_VOID, 0, lbody, 0, 0, 0);
         }
         /* 源码顺序是 init; cond; incr; body，而 IR 里 body 要在 incr 之后执行，
          * 所以先跳过 incr 把 body 接在后面（token 只读一遍，不回头）。 */
@@ -16892,30 +16978,30 @@ static void gen_stmt(void)
         NLOOP++;
             gen_vla_loop_push();
             LOOP_OWN[NLOOP - 1] = 1;      /* for 自己那层 init 作用域 */
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbody, 0, 0, 0);
             mv_loop_enter();
             gen_stmt();
             mv_loop_leave();
             NLOOP--;
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
-            irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lcont, 0, 0, 0);
+            irfn_push(&FN, IR_JMP, IRT_VOID, 0, ltop, 0, 0, 0);
             /* 循环正常结束（条件不成立落到 lclean）也要跑 init 作用域的清理。
              * 放在 lend 之前：break 跳过去时不能重复跑。 */
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lclean, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lclean, 0, 0, 0);
             defer_run_pop(DEF_DEPTH);
             DEF_DEPTH--;
             if (SCOPE && SCOPE->vla_save)
-                irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, (u16)SCOPE->vla_save, 0, 0, 0);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+                irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, SCOPE->vla_save, 0, 0, 0);
+            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
             scope_leave();
             return;
         }
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, lcont, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lcont, 0, 0, 0);
         (void)value_of(gen_expr());
         pa_expect_ch(')');
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, ltop, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lbody, 0, 0, 0);
         LOOP_BRK[NLOOP] = lend;
         LOOP_CNT[NLOOP] = lcont;
         LOOP_DFB[NLOOP] = DEF_DEPTH;
@@ -16926,14 +17012,14 @@ static void gen_stmt(void)
         gen_stmt();
         mv_loop_leave();
         NLOOP--;
-        irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
+        irfn_push(&FN, IR_JMP, IRT_VOID, 0, lcont, 0, 0, 0);
         /* 循环正常结束：init 作用域的清理（和上面那条分支同理） */
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lclean, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lclean, 0, 0, 0);
         defer_run_pop(DEF_DEPTH);
         DEF_DEPTH--;
         if (SCOPE && SCOPE->vla_save)
-            irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, (u16)SCOPE->vla_save, 0, 0, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+            irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, SCOPE->vla_save, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         scope_leave();
         return;
     }
@@ -16943,7 +17029,7 @@ static void gen_stmt(void)
         u32 lend = irfn_label(&FN);
         u32 c = 0;
 
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, ltop, 0, 0, 0);
         LOOP_BRK[NLOOP] = lend;
         LOOP_CNT[NLOOP] = lcont;
         LOOP_DFB[NLOOP] = DEF_DEPTH;
@@ -16953,7 +17039,7 @@ static void gen_stmt(void)
         gen_stmt();
         mv_loop_leave();
         NLOOP--;
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lcont, 0, 0, 0);
         if (!PA_ACCEPT_IDENT("while")) {
             pa_error("do 后面要 while");
             return;
@@ -16962,8 +17048,8 @@ static void gen_stmt(void)
         c = value_of(gen_expr());
         pa_expect_ch(')');
         pa_expect_ch(';');
-        irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)ltop, (u16)lend, 0);
-        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
+        irfn_push(&FN, IR_BR, IRT_VOID, 0, c, ltop, lend, 0);
+        irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lend, 0, 0, 0);
         return;
     }
     if (PA_ACCEPT_IDENT("break")) {
@@ -16975,7 +17061,7 @@ static void gen_stmt(void)
              * 那层也要清理（LOOP_DFB + 0）。其它循环没有这一层，照旧 +1。 */
             defer_run(LOOP_DFB[NLOOP - 1] + (LOOP_OWN[NLOOP - 1] ? 0 : 1), 0);
             gen_vla_restore_loop();
-            irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)LOOP_BRK[NLOOP - 1], 0, 0, 0);
+            irfn_push(&FN, IR_JMP, IRT_VOID, 0, LOOP_BRK[NLOOP - 1], 0, 0, 0);
         } else {
             pa_error("break 不在循环里");
         }
@@ -16995,7 +17081,7 @@ static void gen_stmt(void)
                 cn--;
             defer_run(LOOP_DFB[cn] + 1, 0);
             gen_vla_restore_loop();
-            irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)LOOP_CNT[NLOOP - 1], 0, 0, 0);
+            irfn_push(&FN, IR_JMP, IRT_VOID, 0, LOOP_CNT[NLOOP - 1], 0, 0, 0);
         }
         else
             pa_error("continue 不在循环里");
@@ -17146,10 +17232,10 @@ static void gen_stmt(void)
                 sz = 8;
             is->slot = frame_slots_for(sz);
             a = ident_addr(is);
-            irfn_push(&FN, IR_COPY, IRT_U8, (u16)a, (u16)r, 0, 0, sz);
+            irfn_push(&FN, IR_COPY, IRT_U8, a, r, 0, 0, sz);
         } else {
             is->slot = irfn_vreg(&FN);
-            irfn_push(&FN, IR_MOV, ir_ty_of(vty), (u16)is->slot, (u16)r, 0, 0, 0);
+            irfn_push(&FN, IR_MOV, ir_ty_of(vty), is->slot, r, 0, 0, 0);
         }
         pa_expect_ch(';');
         return;
@@ -17358,12 +17444,12 @@ static void pa_func_def(Sym *fn, Declarator *d)
             u32 e3 = irfn_vreg(&FN);
 
             TASK_ERR_SLOT = frame_slots_for(8);
-            irfn_push(&FN, IR_CALL, IRT_I64, (u16)e1, 0, 0, 0,
+            irfn_push(&FN, IR_CALL, IRT_I64, e1, 0, 0, 0,
                       x64_sym(&X64, "__tcc_err_flag_get"));
             FN.ops[FN.n - 1].narg = 0;
-            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)e3, 0, 0, 0,
+            irfn_push(&FN, IR_ADDR, IRT_PTR, e3, 0, 0, 0,
                       X64_SLOT(TASK_ERR_SLOT));
-            irfn_push(&FN, IR_STORE, IRT_U64, (u16)e3, (u16)e1, 0, 0, 0);
+            irfn_push(&FN, IR_STORE, IRT_U64, e3, e1, 0, 0, 0);
         } else {
             TASK_ERR_SLOT = 0;
         }
@@ -17417,7 +17503,7 @@ static void pa_func_def(Sym *fn, Declarator *d)
                 if (from) {
                     u32 cv = gen_convert(slot, from, pty);
 
-                    irfn_push(&FN, IR_MOV, ir_ty_of(pty), (u16)slot, (u16)cv, 0, 0, 0);
+                    irfn_push(&FN, IR_MOV, ir_ty_of(pty), slot, cv, 0, 0, 0);
                 }
             }
             if (ty_is_array(pty))
@@ -17441,8 +17527,8 @@ static void pa_func_def(Sym *fn, Declarator *d)
                 u32 obj = frame_slots_for(osz);
                 u32 addr = irfn_vreg(&FN);
 
-                irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(obj));
-                irfn_push(&FN, IR_COPY, IRT_U8, (u16)addr, (u16)slot, 0, 0, osz);
+                irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0, X64_SLOT(obj));
+                irfn_push(&FN, IR_COPY, IRT_U8, addr, slot, 0, 0, osz);
                 slot = obj;
             }
         }
@@ -17455,12 +17541,12 @@ static void pa_func_def(Sym *fn, Declarator *d)
             u32 tk = task_get();
             u32 ma = irfn_vreg(&FN);
 
-            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)pa, 0, 0, 0, X64_SLOT(slot));
-            irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)pv, (u16)pa, 0, 0, 0);
+            irfn_push(&FN, IR_ADDR, IRT_PTR, pa, 0, 0, 0, X64_SLOT(slot));
+            irfn_push(&FN, IR_LOAD, IRT_PTR, pv, pa, 0, 0, 0);
             mgd_retain(pv);
-            irfn_push(&FN, IR_LEA, IRT_PTR, (u16)ma, (u16)tk, 0, 0,
+            irfn_push(&FN, IR_LEA, IRT_PTR, ma, tk, 0, 0,
                       task_off("m0", 2) + 8 * TASK_MG_N);
-            irfn_push(&FN, IR_STORE, IRT_U64, (u16)ma, (u16)pv, 0, 0, 0);
+            irfn_push(&FN, IR_STORE, IRT_U64, ma, pv, 0, 0, 0);
             TASK_MG_N++;
         }
     }
@@ -17469,15 +17555,15 @@ static void pa_func_def(Sym *fn, Declarator *d)
         u32 na = irfn_vreg(&FN);
         u32 tk = task_get();
 
-        irfn_push(&FN, IR_CONST, IRT_U64, (u16)nv, 0, 0, 0, TASK_MG_N);
-        irfn_push(&FN, IR_LEA, IRT_PTR, (u16)na, (u16)tk, 0, 0, task_off("nmgd", 4));
-        irfn_push(&FN, IR_STORE, IRT_U64, (u16)na, (u16)nv, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_U64, nv, 0, 0, 0, TASK_MG_N);
+        irfn_push(&FN, IR_LEA, IRT_PTR, na, tk, 0, 0, task_off("nmgd", 4));
+        irfn_push(&FN, IR_STORE, IRT_U64, na, nv, 0, 0, 0);
     }
     if (CUR_TASK_TY) {
         /* 起点闸门：任务结构和托管实参前缀都备好了，先把句柄交回创建者 */
         u32 gv = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CALL, IRT_VOID, (u16)gv, 0, 0, 0,
+        irfn_push(&FN, IR_CALL, IRT_VOID, gv, 0, 0, 0,
                   x64_sym(&X64, "__c6_co_gate"));
         FN.ops[FN.n - 1].narg = 0;
     }
@@ -17489,12 +17575,12 @@ static void pa_func_def(Sym *fn, Declarator *d)
         u32 dt = task_get();
 
         task_seal(dt);
-        irfn_push(&FN, IR_RET, IRT_PTR, 0, (u16)dt, 0, 0, 0);
+        irfn_push(&FN, IR_RET, IRT_PTR, 0, dt, 0, 0, 0);
     } else {
         u32 zero = irfn_vreg(&FN);
 
-        irfn_push(&FN, IR_CONST, IRT_I64, (u16)zero, 0, 0, 0, 0);
-        irfn_push(&FN, IR_RET, IRT_I64, 0, (u16)zero, 0, 0, 0);
+        irfn_push(&FN, IR_CONST, IRT_I64, zero, 0, 0, 0, 0);
+        irfn_push(&FN, IR_RET, IRT_I64, 0, zero, 0, 0, 0);
     }
     scope_leave();
     if (C99_MODE || llvm_mode()) {
@@ -17527,77 +17613,153 @@ static void pa_func_def(Sym *fn, Declarator *d)
 }
 
 
-/* 只有 `test "…" { }` 块、没有 main 的源文件（tests/ 下大多数就是这种）：
- * 合成一个入口，把每个 c6test_N() 跑一遍，**失败数当返回值**。
- * 这样 `c6c x.c6 -o x && ./x` 就能直接跑那 1157 个 test 块，
- * 不用等外部驱动。 */
+/* -test 的过滤：描述里含这个子串的块才跑（tcc 的 tcc_run_tests 用 strstr，
+ * 语义一样；没有 -test-filter 时全跑）。 */
+static int test_wanted(u32 i)
+{
+    if (!PA_TEST_FILTER || !PA_TEST_FILTER[0])
+        return 1;
+    if (!TEST_DESCS[i])
+        return 0;
+    return strstr(TEST_DESCS[i], PA_TEST_FILTER) != NULL;
+}
+
+/* 合成测试入口：
+ *
+ *   - 普通编译（源文件只有 `test "…" { }` 块、没有 main，tests/ 下大多数就是
+ *     这种）：把每个 c6test_N() 跑一遍，**失败数当返回值**。这样
+ *     `c6c x.c6 -o x && ./x` 就能直接跑那些 test 块，不用等外部驱动。
+ *   - -test：用户的 main 不算数（入口换成这里合成的），按 tcc 的输出协议报告
+ *     —— 每块 PASS/FAIL 行 + 收尾统计都由运行期助手 __c6c_test_run /
+ *     __c6c_test_summary 打，失败数当退出码。一个块都没有（或被过滤空了）时
+ *     静默返回 0，和 tcc 一致。
+ *
+ * 入口符号在 -test 下叫 c6c_test_main：用户的 main 还在符号表里（名字不能
+ * 撞车），但 _start 调的是这个 —— tcc 的 C99 后端也是改名后换自己的入口。 */
 static void synth_test_main(void)
 {
     u32 i = 0;
     u32 acc = 0;
+    u32 nrun = 0;
     u32 zero = 0;
+    u32 one = 0;
+    int nsel = 0;
     Sym *s = NULL;
+    Sym *hf = NULL;
+    Sym *hs = NULL;
 
-    if (PA_MAIN || NTESTS == 0 || PA_SYNTAX_ONLY || PA_ERRS || DG.errors)
+    if (PA_SYNTAX_ONLY || PA_ERRS || DG.errors)
         return;
-    irfn_reset(&FN, "main");
+    /* 普通编译里用户 main 优先；-test 下它不参与 */
+    if (!PA_TEST_MODE && (PA_MAIN || NTESTS == 0))
+        return;
+    for (i = 0; i < NTESTS; i++)
+        if (test_wanted(i))
+            nsel++;
+    if (PA_TEST_MODE) {
+        hf = sym_find("__c6c_test_run", 14);
+        hs = sym_find("__c6c_test_summary", 18);
+    }
+    irfn_reset(&FN, PA_TEST_MODE ? "c6c_test_main" : "main");
     memset(FSTR_SLOT, 0, sizeof(FSTR_SLOT));
     FSTR_DEPTH = 0;
     CUR_RET_TY = ty_int();
     FN.is_variadic = 0;
     zero = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CONST, IRT_I64, (u16)zero, 0, 0, 0, 0);
+    irfn_push(&FN, IR_CONST, IRT_I64, zero, 0, 0, 0, 0);
+    one = irfn_vreg(&FN);
+    irfn_push(&FN, IR_CONST, IRT_I64, one, 0, 0, 0, 1);
     acc = irfn_vreg(&FN);
-    irfn_push(&FN, IR_CONST, IRT_I64, (u16)acc, 0, 0, 0, 0);
-    for (i = 0; i < NTESTS; i++) {
-        u32 r = irfn_vreg(&FN);
-        u32 pf = 0;
-        u32 msg = 0;
-        u32 arg = 0;
-        char line[160] = {0};
-        u32 ln = 0;
-        Sym *ps = sym_find("printf", 6);
+    irfn_push(&FN, IR_CONST, IRT_I64, acc, 0, 0, 0, 0);
+    nrun = irfn_vreg(&FN);
+    irfn_push(&FN, IR_CONST, IRT_I64, nrun, 0, 0, 0, 0);
+    if (PA_TEST_MODE && hf && hs) {
+        for (i = 0; i < NTESTS; i++) {
+            u32 fa = 0;
+            u32 dv = 0;
+            u32 r = 0;
+            const char *desc = TEST_DESCS[i];
 
-        irfn_push(&FN, IR_CALL, IRT_I64, (u16)r, 0, 0, 0, TESTS[i]);
-        /* 失败计数按"非 0 记 1"，不把返回值加起来（err() 的返回值大小没意义） */
-        {
-            u32 cc0 = irfn_vreg(&FN);
-
-            /* 条件码放在 flags 域（irfn_push 的最后一个参数是 imm，不是 cc） */
-            irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc0, (u16)r, (u16)zero, 0, 0);
-            FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
-            irfn_push(&FN, IR_ADD, IRT_I64, (u16)acc, (u16)acc, (u16)cc0, 0, 0);
-        }
-        if (!ps)
-            goto acc_only;
-        /* 哪条挂了要看得见：if (r) printf("FAIL %s\n", "test:…") */
-        {
-            u32 cc = irfn_vreg(&FN);
-            u32 lp = irfn_label(&FN);
-            u32 le = irfn_label(&FN);
-
-            irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc, (u16)r, (u16)zero, 0, 0);
-            FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
-            irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cc, (u16)lp, (u16)le, 0);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lp, 0, 0, 0);
-            ln = (u32)snprintf(line, sizeof(line), "FAIL %s\n",
-                               TEST_NAMES[i] ? TEST_NAMES[i] : "?");
+            if (!test_wanted(i))
+                continue;
+            if (!desc)
+                desc = "?";
             if (getenv("C6C_DBG_TESTS"))
-                fprintf(stderr, "[test] %s\n", TEST_NAMES[i] ? TEST_NAMES[i] : "?");
-            msg = gen_str_from(line, ln);
-            arg = irfn_vreg(&FN);
-            irfn_push(&FN, IR_ARG, IRT_VOID, 0, (u16)msg, 0, 0, 0);
-            pf = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CALL, IRT_I64, (u16)pf, 0, 0, 0, (u32)ps->val);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)le, 0, 0, 0);
+                fprintf(stderr, "[test] %s\n", desc);
+            /* acc += __c6c_test_run(&c6test_i, "描述"); nrun++; */
+            fa = irfn_vreg(&FN);
+            /* 函数地址：flags=2 才是"符号地址 + rip 相对重定位"（flags=0 是
+             * [rbp+imm] 的栈槽，拿它当函数指针会跳到栈上） */
+            irfn_push(&FN, IR_ADDR, IRT_PTR, fa, 0, 0, 0, TESTS[i]);
+            FN.ops[FN.n - 1].flags = 2;
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, fa, 0, 0, 0);
+            dv = gen_str_from(desc, (u32)strlen(desc));
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, dv, 0, 0, 1);
+            r = irfn_vreg(&FN);
+            irfn_push(&FN, IR_CALL, IRT_I64, r, 0, 0, 0, (u32)hf->val);
+            FN.ops[FN.n - 1].narg = 2;
+            irfn_push(&FN, IR_ADD, IRT_I64, acc, acc, r, 0, 0);
+            irfn_push(&FN, IR_ADD, IRT_I64, nrun, nrun, one, 0, 0);
         }
-    acc_only:
-        ;
+        /* 一个块都没跑到：静默（tcc 的 -test 也是这样，不打印 0 test(s)） */
+        if (nsel > 0) {
+            u32 sv = irfn_vreg(&FN);
+
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, nrun, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, acc, 0, 0, 1);
+            irfn_push(&FN, IR_CALL, IRT_I64, sv, 0, 0, 0, (u32)hs->val);
+            FN.ops[FN.n - 1].narg = 2;
+        }
+    } else {
+        for (i = 0; i < NTESTS; i++) {
+            u32 r = irfn_vreg(&FN);
+            u32 pf = 0;
+            u32 msg = 0;
+            u32 arg = 0;
+            char line[160] = {0};
+            u32 ln = 0;
+            Sym *ps = sym_find("printf", 6);
+
+            irfn_push(&FN, IR_CALL, IRT_I64, r, 0, 0, 0, TESTS[i]);
+            /* 失败计数按"非 0 记 1"，不把返回值加起来（err() 的返回值大小没意义） */
+            {
+                u32 cc0 = irfn_vreg(&FN);
+
+                /* 条件码放在 flags 域（irfn_push 的最后一个参数是 imm，不是 cc） */
+                irfn_push(&FN, IR_CMP, IRT_I64, cc0, r, zero, 0, 0);
+                FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
+                irfn_push(&FN, IR_ADD, IRT_I64, acc, acc, cc0, 0, 0);
+            }
+            if (!ps)
+                continue;
+            /* 哪条挂了要看得见：if (r) printf("FAIL %s\n", "test:…") */
+            {
+                u32 cc = irfn_vreg(&FN);
+                u32 lp = irfn_label(&FN);
+                u32 le = irfn_label(&FN);
+
+                irfn_push(&FN, IR_CMP, IRT_I64, cc, r, zero, 0, 0);
+                FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
+                irfn_push(&FN, IR_BR, IRT_VOID, 0, cc, lp, le, 0);
+                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, lp, 0, 0, 0);
+                ln = (u32)snprintf(line, sizeof(line), "FAIL %s\n",
+                                   TEST_NAMES[i] ? TEST_NAMES[i] : "?");
+                if (getenv("C6C_DBG_TESTS"))
+                    fprintf(stderr, "[test] %s\n", TEST_NAMES[i] ? TEST_NAMES[i] : "?");
+                msg = gen_str_from(line, ln);
+                arg = irfn_vreg(&FN);
+                irfn_push(&FN, IR_ARG, IRT_VOID, 0, msg, 0, 0, 0);
+                pf = irfn_vreg(&FN);
+                irfn_push(&FN, IR_CALL, IRT_I64, pf, 0, 0, 0, (u32)ps->val);
+                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, le, 0, 0, 0);
+            }
+        }
     }
-    irfn_push(&FN, IR_RET, IRT_I64, 0, (u16)acc, 0, 0, 0);
-    s = sym_add("main", 4, ty_func(ty_int(), NULL, 0, 0), SC_GLOBAL);
+    irfn_push(&FN, IR_RET, IRT_I64, 0, acc, 0, 0, 0);
+    s = sym_add(PA_TEST_MODE ? "c6c_test_main" : "main",
+                PA_TEST_MODE ? 13 : 4, ty_func(ty_int(), NULL, 0, 0), SC_GLOBAL);
     s->is_func = 1;
-    s->val = (i64)x64_sym(&X64, "main");
+    s->val = (i64)x64_sym(&X64, PA_TEST_MODE ? "c6c_test_main" : "main");
     PA_MAIN = s;
     if (C99_MODE || llvm_mode()) {
         be_emit_fn(&FN, (u32)s->val);
@@ -17712,6 +17874,7 @@ static void gen_one_global(u32 ty, Declarator *d)
     int was_big = 0;
     int ate_eq = 0;      /* `[] = {…}` 那条路已经把 `=` 吃掉、把体重新压回源栈了 */
     u32 was_min = 0;     /* 收缩时不许低于这个长度（前面那条声明写死了长度时用） */
+    u32 goff = 0;        /* 分配好的数据段偏移；初始化器解析期间符号表可能搬家 */
 
     if (!d->name)
         return;
@@ -17811,6 +17974,12 @@ static void gen_one_global(u32 ty, Declarator *d)
     sz = ty_size(ty) ? ty_size(ty) : 8;
     s->goff = data_alloc(sz, ty_align_of(ty));
     s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+    /* `s` 指向符号表里的槽：解析初始化器的过程中只要再 `sym_add` 一次
+     * （字符串字面量、枚举、匿名聚合……），符号表就可能扩容搬家，`s` 就成了
+     * 悬垂指针。之前就是这样把 `static int g = 42` 的 42 写到了别的偏移上，
+     * 于是代码读 `D+83` 拿到 0（LLVM 后端上一整类"静态初值读出来是 0"的
+     * 现象都出自这里）。分配到的 goff 先抄进局部量，后面只用它。 */
+    goff = s->goff;
     /* `__thread`：存储照旧在数据段里（初始化器一条都不用改），只是访问换成
      * `%fs + goff`，并把 [goff, goff+sz) 记进 TLS 影像范围。 */
     if (PA_TLS) {
@@ -17827,17 +17996,19 @@ static void gen_one_global(u32 ty, Declarator *d)
         u32 et = ty_is_array(ty) ? ty_target(ty) : 0;
         u32 end_alloc = DATA_IMG.n;
 
-        gen_glob_braced_new(s->goff, ty, 0);
+        gen_glob_braced_new(goff, ty, 0);
         if (was_inc && et && ty_is_array(s->type)) {
             u32 real = INIT_CNT_OK ? INIT_COUNT : 1;
 
             if (real < was_min)
                 real = was_min;
-            s->type = ty_array(et, real);
+            s = sym_find(d->name, d->nlen);
+            if (s)
+                s->type = ty_array(et, real);
             /* 预留的尾巴收回来。只有当它仍是数据段末尾时才安全（初始化器里
              * 要是有字符串字面量，字面量已经排在后面了，那就留着这块空地）。 */
             if (was_big && DATA_IMG.n == end_alloc) {
-                u32 real = s->goff + ty_size(s->type);
+                u32 real = goff + ty_size(s->type);
 
                 if (real < DATA_IMG.n)
                     DATA_IMG.n = real;
@@ -17849,7 +18020,7 @@ static void gen_one_global(u32 ty, Declarator *d)
         /* `struct P g = (struct P){ 1, 2 };` —— 数据段也吃复合字面量 */
         u32 ex = pa_take_paren_type();
 
-        gen_glob_braced_new(s->goff, ty, 0);
+        gen_glob_braced_new(goff, ty, 0);
         while (ex--)
             pa_expect_ch(')');
         return;
@@ -17863,14 +18034,14 @@ static void gen_one_global(u32 ty, Declarator *d)
         if (ty_is_array(ty)) {
             u32 k = n + 1 < sz ? n + 1 : sz;
 
-            memcpy(DATA_IMG.p + s->goff, DATA_IMG.p + off, k);
+            memcpy(DATA_IMG.p + goff, DATA_IMG.p + off, k);
         } else if (ty_is_ptr(ty)) {
             u64 va = (u64)DATA_VA(off);
             u32 i2 = 0;
 
             for (i2 = 0; i2 < 8; i2++)
-                DATA_IMG.p[s->goff + i2] = (u8)(va >> (8 * i2));
-            c99_reloc_add(s->goff, off);
+                DATA_IMG.p[goff + i2] = (u8)(va >> (8 * i2));
+            c99_reloc_add(goff, off);
         } else {
             pa_error("字符串初始化器只能给数组或指针");
         }
@@ -18015,14 +18186,14 @@ static void gen_one_global(u32 ty, Declarator *d)
                 *(double *)&bits = dv;
             }
         }
-        glob_store(s->goff, 0, ty, bits);
+        glob_store(goff, 0, ty, bits);
         return;
     }
     {
         i64 v = 0;
 
         v = const_expr();
-        glob_store(s->goff, 0, ty, (u64)v);
+        glob_store(goff, 0, ty, (u64)v);
     }
 }
 
@@ -18239,6 +18410,7 @@ static void pa_parse_tu(void)
         if (PA_IS_IDENT("test") && c6_kw()
             && (pa_peek(1)->kind == TK_STR || TOK_EQ(pa_peek(1), "{"))) {
             char nm[128] = {0};
+            char desc[128] = {0};
             Declarator td = {0};
 
             pa_advance();
@@ -18252,9 +18424,16 @@ static void pa_parse_tu(void)
                 while (nl0 > 0 && nl0 < pa_cur()->len && ((u8)nd0[nl0] & 0xC0) == 0x80)
                     nl0--;
                 snprintf(nm, sizeof(nm), "test:%.*s", (int)nl0, nd0);
+                /* 字符串 token 的文本带引号，报告行只写描述本身（和 tcc 的
+                 * C6TestEntry.desc 一样），否则 PASS/FAIL 行会多一对引号。 */
+                if (nl0 >= 2 && nd0[0] == '"' && nd0[nl0 - 1] == '"')
+                    snprintf(desc, sizeof(desc), "%.*s", (int)(nl0 - 2), nd0 + 1);
+                else
+                    snprintf(desc, sizeof(desc), "%.*s", (int)nl0, nd0);
                 pa_advance();
             } else {
                 snprintf(nm, sizeof(nm), "test#%u", NTESTS);
+                snprintf(desc, sizeof(desc), "#%u", NTESTS);
             }
             {
                 char fn[64] = {0};
@@ -18271,6 +18450,8 @@ static void pa_parse_tu(void)
                 if (NTESTS < 512) {
                     TESTS[NTESTS] = (u32)s->val;
                     TEST_NAMES[NTESTS] = arena_strdup(&A_main, nm);
+                    /* 报告行/过滤用描述本身（"test:" 前缀和引号已经去掉） */
+                    TEST_DESCS[NTESTS] = arena_strdup(&A_main, desc);
                     NTESTS++;
                 }
                 pa_func_def(s, &td);

@@ -688,7 +688,7 @@ testing / methods / tuples / fstrings / gc / concurrency / macros / freestanding
 | P6-2 | 错误通道 | 🟡 `T!error` 当 `T`、`err(a,b)` 当 int、`expr catch e { … }` 已实现（错误载荷 `e` 只有 `id` 字段）；`defer`/`errdefer`/`try`/`or`/号段未做 | `docs/manual/errors.md` |
 | P6-3 | 切片 `T[:]` / `s[a:b]` | 🟡 类型/声明/`s[i]`/数组实参隐式转换都通了（std 19→28/153）；子切片、越界检查、切片形参的运行时行为还要修 | `docs/manual/slices.md` |
 | P6-4 | `foreach`、`match` | 🟡 `foreach` 已实现并端到端验证：数组/切片，`(T v = it)` 单绑定=值、`((T i, T v) = it)` 双绑定=下标+值（求和/索引都验过）。还差**迭代器协议**（`has/next`）和区间 `lo:hi`——std 里 56 处报错现在是"foreach 只能遍历数组或切片"。`match` 未做 | `docs/manual/foreach.md` |
-| P6-5 | `test { … }` 块 | 🟡 能解析成函数并登记；`tests/` 121 个 c6 用例里 **29 个能编过**（缺泛型/defer/match/await/closure）。`--run-tests` 运行器未做 | `make c6c-test` |
+| P6-5 | `test { … }` 块 | 🟡 能解析成函数并登记；`-test` / `-test-filter` 运行器已实现（输出协议与 tcc 的 native 运行器一致，`make testflag` 19 条）。`tests/` 121 个 c6 用例里 **29 个能编过**（缺泛型/defer/match/await/closure） | `make c6c-test` |
 | P6-6 | 方法调用 `v.method()`（= `f(v, …)`）、元组、fstring、c6 宏 | 🟡 方法调用语法糖已实现（std 31→68 的主力）；其余未做 | `docs/manual/{methods,tuples,fstrings,macros}.md` |
 | P6-7 | managed 引用 / GC / 并发 | ⬜ | `docs/manual/{gc,concurrency}.md` |
 | P6-8 | `std/` 153 模块全绿 | 🟡 **115/153**（0→19 模块/测试块 →28 切片 →31 catch →68 方法调用 →114 foreach 迭代器 →115 fcntl）；剩 38：泛型 `struct Deque@T`（8+10 处）、`defer`、`await`/`closure`、`match` | `make stdtest` |
@@ -728,7 +728,7 @@ P6-5（test 块）→ 其余。
 | P5-3 | 元组 `(T1,T2)` + 解构 + sret/寄存器对 | `tests/tuple*.c6` 绿 | ⬜ |
 | P5-4 | `foreach`（数组/切片/区间/迭代器协议） | `tests/foreach*.c6` 绿 | ⬜ |
 | P5-5 | `interface` + vtable + 胖指针 | `tests/iface*.c6` 绿 | ⬜ |
-| P5-6 | `test` 块 + `-test` + `-test-filter` | `tests/test-block.c6` 绿 | ⬜ |
+| P5-6 | `test` 块 + `-test` + `-test-filter` | `tests/test-block.c6` 绿 | ✅ `tests/test-block.c6` 在 c6c 下 7 test(s) / 0 failure(s)，`-D FAILING_BLOCK` 报 `FAIL: … : on purpose` 且退出码非 0，用户 main 不执行；`make c6c-testflag` 19 条|
 | P5-7 | 诊断号 C1–C134 逐条实现（337 条 `EXPECT`） | `make c6c-errcheck` 全绿 | ⬜ |
 | P5-8 | 上游 `tests2` 全量（VLA/computed goto 缺口据实上报） | `make c6c-test` 绿（缺口单列） | 🟡 93/144 |
 
@@ -753,7 +753,7 @@ P6-5（test 块）→ 其余。
 | P7-2 | 文本后端性能：`.c` ≤120 ms、`.ll` ≤200 ms（现状 569 / 1186） | `make c6c-bench` 断言 | ⬜ |
 | P7-3 | 并行模块编译（DAG + N worker + 固定合并顺序） | 8 线程 ≤0.3× tcc；输出与串行逐字节相同 | ⬜ |
 | P7-4 | 增量缓存（内容寻址） | 二次自举 ≤10 ms | ⬜ |
-| P7-5 | 自研链接（不 spawn `ld`）与 `-run`/`-test`（可选） | 链接 ≤5 ms；`-test` 绿 | 🟡 `-run` 已落地（编到临时 ELF 再 exec；首行 `#!` 当空白，可当脚本解释器；test 块由合成入口跑，失败数当退出码，`make c6c-runflag` 覆盖）；自研链接未做 |
+| P7-5 | 自研链接（不 spawn `ld`）与 `-run`/`-test`（可选） | 链接 ≤5 ms；`-test` 绿 | 🟡 `-run` 已落地（编到临时 ELF 再 exec；首行 `#!` 当空白，可当脚本解释器，`make c6c-runflag` 覆盖）；`-test`/`-test-filter` 已落地（用户 main 不执行、PASS/FAIL 行 + `N test(s), M failure(s)` 收尾、失败数当退出码、零块静默，`make c6c-testflag` 覆盖）；自研链接未做 |
 
 ## P8 交付
 
@@ -3045,3 +3045,171 @@ int main(void) { int foreach = 1; goto defer_label; }   /* 局部名 / 标号 */
 库那一侧（`assert.h` / `complex.h` / `math.h` / `setjmp.h` / `signal.h` / `time.h` /
 `wchar.h` / `locale.h` / `inttypes.h` / `threads.h` / `uchar.h` 缺、`float.h` 与
 `limits.h` 不全）按目标口径"库不管"不计入，但列在这儿免得当成已完成。
+
+### LLVM 静态数据那条：定位到"标量初始化器没写进数据段"
+
+上一段说"同一对象被分了两块"，这轮再打点，结论修正成更简单的一条：
+
+```c
+static int g = 42;
+```
+
+编出来的 IR 里，代码读 `@__c6l_D + 83`（GEP 偏移**正确**），而 `@__c6l_D0`
+常量块的**第 83 个字节是 0**——`42` 根本没写进去。也就是说不是"写的不是同一块"，
+而是**标量全局的初值没进数据段**——这一条是确证的（D0 第 83 字节是 0，42 丢了）。
+
+但数组那条路还有**第二个**问题：`static int a[3] = {7,8,9}` 的 D0 里 7/8/9
+确实落在 154620，代码读的也是 154620（三处 GEP 都对），跑出来仍然是 0——
+说明 `c6c_init_data()` 那次 memcpy 在运行期没生效（或者更早的读越过了它）。
+两条得分开查，别以为修好标量就通了。
+
+下一步：查 `gen_one_global()` 里 `!pa_is_ch('{')` 之后那条标量赋值路径
+（`glob_store(s->goff, 0, ty, v)` 之类）在 LLVM 模式下是不是被跳过了——
+`data_u64`/`glob_store` 直接写 `DATA_IMG`，前端不应该分后端；怀疑是标量初值
+走了一条"运行期赋值"的 IR 路径（native 能跑，LLVM 的 `c6c_init_data` 覆盖不到）。
+
+**顺带修掉一个真的悬垂指针**（不是上面那个症状的成因）：`gen_one_global()` 里
+`s = sym_add(...)` 拿到的是符号表里的槽，而解析初始化器（`const_expr()`、
+`gen_glob_braced_new()` 里的 `str_lit_data()` 等）会继续 `sym_add`，符号表一扩容
+搬家 `s` 就悬垂了。现在把 `data_alloc` 得到的 `goff` 立刻抄进局部量，后面只用
+它；`s->type = …` 那处先 `sym_find` 重新取一次。改完全绿（fixpoint 11092320 →
+11103840），但 LLVM 那条症状没变，说明成因在别处（`glob_store` 收到的 goff 仍然
+是 154620，说明 scalar 初值走的根本是 `gen_glob_braced_new → INIT_GOFF` 那条路）。
+
+**最新一次排查把范围缩到"IR 和数据都对、运行期还是 0"**：
+
+```
+static int g = 42;
+例：代码里 %t2 = getelementptr i8, ptr @__c6l_D, i64 154620；随后 load i32
+    D0 的第 154620 字节确实是 42；c6c_init_data() 跑完之后 D[154620] 也确实是 42
+    （gdb 里 x/8xb 直接看的内存），可 printf 出来仍是 0。
+```
+
+也就是说前端、IR、数据段初始化**三样都对**，问题在"读那个地址的时候拿到的不是
+那块内存"这个层面（怀疑点：`@__c6l_D` 的 `internal global` 与 `main` 里那次
+`c6c_init_data()` 调用之间被 llc 重排，或 `c6_main` 的 `inttoptr + load` 序列
+被别名分析挪到了 init 之前）。下一次直接用 gdb 在 `c6_main` 里断在 `%t7` 那条
+load 上看实际地址和内容，就能定性。**别再从"初值没写进去"这个方向查了。**
+
+**再进一步（gdb 实测）**：在 `c6_printf` 入口断下来看寄存器，参数**是对的**——
+
+```
+Breakpoint at c6_printf
+rdi = 0x8b6c50 <__c6l_D+154624>  "%d\n"
+rsi = 0x2a                       42
+```
+
+也就是说 `c6_main` 把 `D+154620` 那个 42 **正确地**读出来并当第二个实参传进去了，
+是 `c6_printf`（c6c 自带运行时里那个 printf）把它打成了 0。所以整条链的定性是：
+
+```
+前端 ✓  IR ✓  数据段 ✓  取值并传参 ✓        ← 全部正确
+c6_printf 里的变参取值 ✗                     ← 问题在这里
+```
+
+下一次直接看 `c6_printf` 怎么走 `va_start`/`va_arg`（它自己就是 c6c 编出来的），
+对比"能跑对的 29 条 LLVM 用例"里 printf 的调用形状，就能定位。**别再查前端和
+数据段了**，那两段已经用 gdb 证伪。
+
+**再往下试了两条，把范围压到"变参读取"本身**：
+
+```c
+printf("%s|%d\n", "hi", 7);   /* LLVM 后端打出 "(null)|0"，native 打出 "hi|7" */
+```
+
+也就是**所有**变参在 LLVM 后端都读成 0/null。检查过的事实：`c6_printf` 的定义确实
+带 `...`（`define i64 @c6_printf(i64 %arg0, ...)`）、`%struct.__va_list_tag` 在模块
+开头有正确定义（`{ i32, i32, ptr, ptr }`）、入口有 `call void @llvm.va_start.p0(ptr %ap)`、
+取参是 `va_arg ptr %ap, i64`——形状全对，而且 gdb 里 `c6_printf` 入口的 `rsi` 就是
+传进来的值。所以嫌疑落在"`va_start` 的调用点落在 `memset`/若干 `getelementptr`
+之后，llc 在 -O0 下把寄存器 save area 的处理放错了位置"这一类 ABI 细节上。
+
+"把 `va_start` 提到函数第一条指令"这条**试过了、没用**（照样 `(null)|0`），所以
+不是指令顺序的问题。剩下最靠谱的改法是：跟 native 后端一样**自己摆 va_list**
+——`x64.c6` 里那块（`gp_offset / fp_offset / overflow_arg_area / reg_save_area`，
+`IR_VASTART` 的 case 就是）是能跑通的，LLVM 后端照抄成"手写一张 va_list 结构 +
+`va_arg` 也按那张结构取"，绕开 `llvm.va_start` 这个 intrinsic 就行。
+
+**又排除了两条**：`llc -O1` / `-O2` 编同一份 IR 结果一样（`(null)|0`），所以不是
+`-O0` 的寄存器 save-area 摆放问题；`va_start` 提到第一条指令也试过、同样无效。
+剩下大概率是 c6c 给变参函数生成的帧形状（一个巨大的 `alloca [frame x i8]` +
+`memset`）和 `llvm.va_start` 的 lowering 不兼容。
+
+**注意**：上一版这里写的"照抄 x64.c6 手写 va_list"在 LLVM 这边**行不通**——手写
+需要拿到调用者的 `reg_save_area`，而那东西只有 `llvm.va_start` 能提供（native
+后端能手写是因为它的 prologue 自己控制）。所以下一步该做的是**找出 `llvm.va_start`
+为什么在这份 IR 上失效**，方向有两个：
+1. 造一份最小复现（一个只有 `printf("%d", 1)` 的 .ll），手工删掉 `FR`/`memset`/
+   帧槽 GEP 这些"噪声"，看删到哪一步开始变好——能直接指认冲突点；
+2. 或者绕开 `%ap`：让 c6c 的变参函数**别用 va_list**，而是由调用点把实参先摊进
+   一个数组再传指针（相当于自己定一套变参 ABI，`lib/rt.c6` 里的 printf/scanf
+   族跟着改）。这条路更土但一定能通，代价是 c6c 编出的代码与 C 的 varargs 不互通。
+
+**又做了一组对照实验**（都能立刻复现）：
+
+| 实验 | 结果 |
+|---|---|
+| 手写最小 `.ll`：`%struct.__va_list_tag` 定义 + `%ap = alloca` + `llvm.va_start` + `va_arg i64` + 调用 | **42** ✓（机制本身没问题） |
+| 把 `c6_printf` 从我们生成的 .ll 里裁出来单独跑 | 依赖 `@__c6l_D`、`@c6_c6c_sys3` 等一堆别的东西，裁不干净 |
+| 删掉 `c6_printf` prologue 里的 `memset(%FR, …)` | 仍然 `(null)|0` |
+| `llc -O1` / `-O2` | 仍然 `(null)|0` |
+
+结论：`va_start` 的机制没问题，是我们给它生成的**函数形状**（一个巨大的
+`alloca [frame x i8]` + 几百条 `%sN = getelementptr` 帧槽 + 之后才 `va_start`）
+触发了 lowering 的问题。下一步最有价值的实验是**手工把 `c6_printf` 简化成一个
+只有 `va_start`/`va_arg`/`printf` 的等价函数**（保住它的形参个数与帧槽布局），
+逐次删东西直到恢复正确——能直接指认是哪一块触发的。
+### 根因找到了（LLVM 变参）：`IR_VASTART` / `IR_VAARG` 忽略了 IR 契约里的 `a`
+
+`design.md` 里这两个 op 的契约是 **`a` = va_list 的地址**（native 后端的
+`case IR_VAARG` 就是 `x_ld64(…, R_RBP, X64_SLOT(o.a))` 从槽里取出那个地址）。
+LLVM 后端不是这么干的：
+
+```c
+case IR_VASTART:  /* 空操作：va_start 在函数入口对私有的 %ap 发过一次 */ break;
+case IR_VAARG:
+    if (!f->is_variadic) { store i64 0, ptr %s<dst>; break; }   /* ← 直接写 0 */
+    %t = va_arg ptr %ap, i64                                     /* ← 用私有的 %ap */
+```
+
+而 c6c 运行时的形状是 `printf(fmt, ...) { va_list ap; va_start(ap, fmt);
+c6c_vfmt(..., ap); }`：`c6c_vfmt` **不是变参函数**，它拿到的是别人传进来的
+va_list。于是它的每个 `va_arg` 都走 `!is_variadic` 那条、直接写 0 —— LLVM 后端
+**所有**变参都读成 0 的原因就是这两行。
+
+修的方向（试过两条、都还差一点，留给以后）：
+
+1. `IR_VASTART` 里对 `a` 发 `llvm.va_start`：LLVM 要求 `va_start` 在入口块里，
+   而我们的 `IR_VASTART` 出现在语句位置上 ⇒ `llc` 不报错但运行期段错误（实测 139）；
+2. 入口抓 `%ap`、`IR_VASTART` 时 `memcpy` 24 字节到用户的 va_list，
+   `IR_VAARG` 用 `inttoptr(a)` 后 `va_arg`：能编过，但仍然段错误——差的是
+   `a` 那个 vreg 里到底放的是"va_list 的地址"还是"va_list 本身"，得对齐
+   native 后端 `IR_VAARG` 的读法（`x_ld64(…, X64_SLOT(o.a))` 是**取槽内容**）。
+
+结论：这是**一行契约没实现**的 bug，不是玄学；下次按第 2 条、把 `a` 的语义对齐
+native 就能通。**注意**它不影响四条验收（`llvmtest` 的 29 条不读变参，一直是绿的）。
+
+**第三次尝试（按契约实现）与 gdb 结果**：把 `IR_VASTART` 改成"入口抓 `%ap` →
+`memcpy` 24 字节进用户那个 va_list"，`IR_VAARG` 改成 `inttoptr(a)` 后 `va_arg`，
+IR 形状完全正确（`%ap = alloca [1 x va_list_tag]` + `va_start(%ap)` +
+`memcpy(%t16, %ap, 24)` + `va_arg ptr %t398, i64`），但运行时还是段错误：
+
+```
+SIGSEGV in c6_c6c_vfmt ← c6_printf ← c6_main
+gdb: c6c_vfmt(rdi=fmt, rsi=cap, rdx=fmt2, rcx=0x7fffffffc110)   ← va_list 指针是像样的栈地址
+```
+
+也就是说**指针传对了、内容不对**（`va_list` 里的 `reg_save_area` 是垃圾）。到此为止
+可以有把握地说：问题在 `llvm.va_start` 与 c6c 给变参函数生成的帧形状（
+`%FR = alloca [frame x i8]` + `memset` + 几百条 `%sN` GEP）之间的相互作用，
+不在前端、不在数据段、不在调用约定、也不在 `IR_VAARG` 的读法（这三条都已用
+gdb 逐一证伪）。下一步该拿一份**手写 .ll**（在 `va_start` 之前放一个大的
+alloca + memset + 一批 GEP）复现，把触发条件缩到最小。
+
+**第四次（组合）也试了**：`va_start` 放到函数第一条指令 + `IR_VASTART`/`IR_VAARG`
+按契约实现，两个改动一起上——仍然 SIGSEGV 在 `c6c_vfmt` 的 `va_arg`。所以可以确定
+**`llvm.va_start(%ap)` 在 c6c 生成的这种帧上产出的 va_list 本身就是坏的**（指针对、
+内容里的 `reg_save_area` 是垃圾），跟 `IR_VAARG` 的读法无关。留给以后的最后一招：
+别用 `va_start` 的 intrinsic，改成在 `printf` 这一层**自己摊参数**（c6c 有
+`__builtin_syscall` 那种 6 参数上限的做法，可以扩展成一个 `__c6_va_arr` 数组 +
+计数，`c6c_vfmt` 按数组取）——土，但一定能通，而且不影响 native 后端。

@@ -18,7 +18,7 @@ RUNS   ?= 5
 
 SRCS := $(wildcard src/*.c6)
 
-.PHONY: all g2c-check tests1-check scoreboard build scan unit irtest hello ctest runflag tcc-tests bench bench-c6c lint selfhost \
+.PHONY: all g2c-check tests1-check scoreboard build scan unit irtest hello ctest runflag testflag tcc-tests bench bench-c6c lint selfhost \
         selftest stdtest test c99test c99suite llvmtest build-tcc check-all check-all-perf help
 
 all: build
@@ -98,6 +98,11 @@ ctest: $(BUILD)/c6c
 # -run：编到临时 ELF 再 exec。退出码/参数/test 块/临时文件清理/模式互斥
 runflag: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c ./tests/run-flag.sh
+
+# -test：跑 test 块、不跑用户 main。PASS/FAIL/收尾统计的输出协议、
+# -test-filter、失败数当退出码、零块静默——和 tcc 的 native 运行器同一口径。
+testflag: $(BUILD)/c6c
+	@C6C=$(BUILD)/c6c ./tests/test-flag.sh
 
 # tcc 上游 tests2 记分板（目标 3 的度量尺）
 tcc-tests: $(BUILD)/c6c
@@ -191,7 +196,7 @@ llvmtest: $(BUILD)/c6c
 # 验收（1）(2) (3)：功能面。跑分不在里面——验收（4）那几条硬指标（自编译
 # ≤100 ms、峰值 RSS ≤32 MB、4x 输入 ≤2.6x）随时可能因为机器负载抖动，
 # 拿它挡功能验收只会让人学会忽略红灯。要连跑分一起验就用 check-all-perf。
-check-all: unit irtest hello ctest runflag selfhost selftest stdtest test diagtest c99test c99suite llvmtest build-tcc
+check-all: unit irtest hello ctest runflag testflag selfhost selftest stdtest test diagtest c99test c99suite llvmtest build-tcc
 	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 语言层 C99 外部闸门 / 能编出 tcc）"
 
 # 验收（4）：性能与内存硬指标（门槛在 bench/thresholds.json）
