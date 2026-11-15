@@ -645,14 +645,19 @@ static void x64_func_begin(X64State *st, const char *name, u32 nslot)
         x_alu_ri64(st->im, 5, R_RSP, st->frame);   /* 81 /5 = sub */
 }
 
-/* 给已经编译好的函数再挂一个名字（同一个 off/va）：模板实例接收者的方法
- * 既要能被 c6 用短名调，也要能被纯 C 的 TU 按 '<实例名>_<函数名>' 调。 */
+/* 给已经编好的东西再挂一个名字（同一个 off/va）：
+ *   - 模板实例接收者的方法：既要能被 c6 用短名调，也要能被纯 C 的 TU 按
+ *     '<实例名>_<函数名>' 调；
+ *   - `__attribute__((alias("target")))` / `__asm__("target")`：连**对象**也
+ *     可以是别名（`int alias_int __attribute__((alias("g_int")))`），所以
+ *     is_data 要跟着目标走——数据符号的 off 是镜像坐标（含 ELF 头），代码
+ *     符号的 off 还要在收尾时平移，两种待遇不能混。 */
 static void x64_alias_idx(X64State *st, u32 a, u32 b)
 {
     st->sym[a].off = st->sym[b].off;
     st->sym[a].va = st->sym[b].va;
     st->sym[a].defined = 1;
-    st->sym[a].is_data = 0;
+    st->sym[a].is_data = st->sym[b].is_data;
 }
 
 static void x64_func_end(X64State *st)

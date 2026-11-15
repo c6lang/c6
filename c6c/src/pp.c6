@@ -194,6 +194,20 @@ static void cur_file_sync(void)
 static int raw_next(Tok *out);
 static int pp_next(Tok *out);
 
+/* 把预处理器整个放回"什么都没读过"的状态：文件栈清空、条件编译栈清空、
+ * 回推缓冲清空。**宏定义不在这里清**——宏活在下一个合成文件（-D 拼出来的
+ * 那个）里，每个翻译单元自己压一份，天然按 TU 复位。
+ *
+ * 放在 pp.c6（而不是 main.c6）：parse.c6 的多 TU 驱动也要用它，而 parse.c6
+ * 在 main.c6 之前编。 */
+static void pp_reset(void)
+{
+    PP_TOP = NULL;
+    COND = NULL;
+    NPUSHBACK = 0;
+    INCLUDE_DEPTH = 0;
+}
+
 /* 语法分析阶段不需要换行 token（pa_fill 里本来也是拿到就扔），但每个换行
  * 都要走一遍 词法 + 预处理 的完整流水线——44K 行的 tcc.c 就是 44K 次白跑。
  * 由 pa_compile_ex 在非 -E 模式下置 1。 */

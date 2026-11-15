@@ -29,6 +29,10 @@ typedef struct Opts {
     int nundefs;
     const char *files[MAX_SRC];
     int nfiles;
+    /* 每个源文件出现的那一刻，命令行上已经攒了多少个 -D / -U（见
+     * push_defines_at：`-D` 只作用于它后面的文件） */
+    int fdefs[MAX_SRC];
+    int fundefs[MAX_SRC];
     int nostdlib;
     const char *out;
     const char *bdir;
@@ -143,14 +147,6 @@ static u64 ST_tok;
 static u64 ST_kind[8];
 static u64 ST_lines;
 static u64 ST_bytes;
-
-static void pp_reset(void)
-{
-    PP_TOP = NULL;
-    COND = NULL;
-    NPUSHBACK = 0;
-    INCLUDE_DEPTH = 0;
-}
 
 static void push_defines(void);
 
@@ -392,17 +388,23 @@ static const char *const BUILTIN_DEFS =
     "#define __REGISTER_PREFIX__\n"
     ;
 
-/* 内建宏 + -D + -U 拼成一个合成文件，走同一条预处理路径 */
-static void push_defines(void)
+/* 内建宏 + -D + -U 拼成一个合成文件，走同一条预处理路径。
+ *
+ * `-D`/`-U` **按位置生效**：只作用于它**后面**出现的源文件。单文件调用和
+ * 以前的语义完全一样（只有一个文件，选项在文件前后都一样）；多 TU 时才分得
+ * 出差别 —— 每个 TU 有一份自己的宏状态，`c6c a.c -DDEFS b.c` 就是"a.c 不带、
+ * b.c 带"。上游 tests2/146_tls_extern 那条用例正好要这个形状（同一个文件编
+ * 两遍、一遍给定义一遍引用），而它没有办法用别的写法表达。 */
+static void push_defines_at(int ndefs, int nundefs)
 {
     size_t cap = 2048 + strlen(BUILTIN_DEFS), n = 0;
     char *buf = NULL;
     int i = 0;
     SrcFile *f = NULL;
 
-    for (i = 0; i < O.ndefs; i++)
+    for (i = 0; i < ndefs; i++)
         cap += strlen(O.defs[i]) + 16;
-    for (i = 0; i < O.nundefs; i++)
+    for (i = 0; i < nundefs; i++)
         cap += strlen(O.undefs[i]) + 16;
     buf = arena_alloc(&A_main, cap);
     n = (size_t)snprintf(buf, cap, "%s", BUILTIN_DEFS);
@@ -411,7 +413,7 @@ static void push_defines(void)
         n += (size_t)snprintf(buf + n, cap - n, "#define __STDC_VERSION__ 201112L\n");
     else if (O.std == 0)
         n += (size_t)snprintf(buf + n, cap - n, "#define __STDC_VERSION__ 199901L\n");
-    for (i = 0; i < O.ndefs; i++) {
+    for (i = 0; i < ndefs; i++) {
         const char *d = O.defs[i];
         const char *eq = strchr(d, '=');
         int r = 0;
@@ -422,13 +424,18 @@ static void push_defines(void)
         if (r > 0)
             n += (size_t)r;
     }
-    for (i = 0; i < O.nundefs; i++) {
+    for (i = 0; i < nundefs; i++) {
         int r = snprintf(buf + n, cap - n, "#undef %s\n", O.undefs[i]);
         if (r > 0)
             n += (size_t)r;
     }
     f = src_new("<命令行 -D>", buf, n, 1);
     pp_push_file(f, -1);
+}
+
+static void push_defines(void)
+{
+    push_defines_at(O.ndefs, O.nundefs);
 }
 
 static int parse_args(int argc, char **argv)
@@ -560,6 +567,8 @@ static int parse_args(int argc, char **argv)
                 diag_error_plain("源文件太多（上限 %d）", MAX_SRC);
                 return -1;
             }
+            O.fdefs[O.nfiles] = O.ndefs;
+            O.fundefs[O.nfiles] = O.nundefs;
             O.files[O.nfiles++] = a;
             if (O.run && !O.test) {
                 /* 它就是程序，argv[0] 用源文件名（和 tcc -run 一致）；
@@ -771,32 +780,53 @@ int main(int argc, char **argv)
             out = RUN_PATH;
             PA_QUIET_OUT = 1;   /* 临时文件名不值得刷屏 */
         }
-        /* 多个源文件：按命令行顺序依次压进预处理器的文件栈，等于把它们
-         * 接连编成同一个 TU（和 `import` 的 `
-#include` 展开同一个模型）。
-         * 真正的 ET_REL 目标文件 + 链接器还没做，这里先保证 c6 那套
-         * "主文件 + tests/tu/*.c6 实现单元"能在一次调用里编出来。 */
-        pp_reset();
-        {
-            int fi = O.nfiles - 1;
+        if (O.test)
+            pa_set_test_mode(O.test_filter ? O.test_filter : "");
+        if (O.nfiles > 1) {
+            /* 多 TU：一个源文件 = 一个翻译单元。符号表 / 数据段 / 代码段
+             * 整份镜像一份（外部符号按名字互认），文件作用域的 static 按
+             * TU 分家（见 parse.c6 的 tu_static_name、sym.c6 的 sym_tu_begin）。
+             * 自带运行时是 TU 0。 */
+            int fi = 0;
 
-            for (; fi >= 0; fi--) {
+            rc = pa_begin_multi(out, argv[0],
+                                (O.mode == M_EXE || O.mode == M_RUN || tmp_out)
+                                && !O.nostdlib);
+            for (fi = 0; rc == 0 && fi < O.nfiles; fi++) {
+                pp_reset();
                 sf = src_load(O.files[fi]);
                 if (!sf) {
                     diag_error_plain("打不开源文件 '%s'", O.files[fi]);
-                    PA_QUIET_OUT = 0;
-                    if (tmp_out)
-                        unlink(RUN_PATH);
-                    return 2;
+                    rc = 2;
+                    break;
                 }
                 pp_push_file(sf, -1);
+                push_defines_at(O.fdefs[fi], O.fundefs[fi]);
+                pa_parse_new_tu();
+                if (DG.errors > 200) {
+                    diag_error_plain("错误太多，停止（%d）", DG.errors);
+                    rc = 1;
+                }
             }
+            if (rc == 0)
+                rc = pa_finish(out);
+        } else {
+            /* 单个源文件：和以前完全一样（一个 TU，自带运行时接在后面）。
+             * 这条路的字节级行为不能变——自举 fixpoint 就是它编出来的。 */
+            pp_reset();
+            sf = src_load(O.files[0]);
+            if (!sf) {
+                diag_error_plain("打不开源文件 '%s'", O.files[0]);
+                PA_QUIET_OUT = 0;
+                if (tmp_out)
+                    unlink(RUN_PATH);
+                return 2;
+            }
+            pp_push_file(sf, -1);
+            push_defines();
+            rc = pa_compile_ex(out, argv[0],
+                               (O.mode == M_EXE || O.mode == M_RUN || tmp_out) && !O.nostdlib);
         }
-        push_defines();
-        if (O.test)
-            pa_set_test_mode(O.test_filter ? O.test_filter : "");
-        rc = pa_compile_ex(out, argv[0],
-                           (O.mode == M_EXE || O.mode == M_RUN || tmp_out) && !O.nostdlib);
         PA_QUIET_OUT = 0;
         if (O.verbose)
             mod_report();

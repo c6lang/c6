@@ -1166,6 +1166,63 @@ static const char *emit_name(const char *nm)
 }
 
 static void pa_func_def(Sym *s, Declarator *d);
+/* ---- 多 TU ----
+ *
+ * 命令行上一个源文件 = 一个翻译单元（main.c6 逐文件调 pa_parse_new_tu）。
+ * 符号表、类型表、数据段、代码段仍然是**整份镜像一份**：外部符号按名字
+ * intern，所以"TU1 定义、TU2 引用"天然接得上，缺谁由最后的回填
+ * （x64_resolve）一次性报出来。TU 之间真正要分家的只有文件作用域的
+ * `static`：符号表用 sym_tu_begin() 摘掉前一个 TU 的，发射名用
+ * tu_static_name() 加 `$<TU>` 后缀。自带运行时算 TU 0，命令行上的源文件
+ * 从 TU 1 起。 */
+static u32 PA_TU;
+/* 文件作用域 `static` 的**发射名**：拿不到模块前缀那套（static 本来就
+ * 不跨模块），换成 TU 后缀 —— `helper$2`。符号表里仍是短名 `helper`
+ * （本 TU 内的解析、诊断、方法表全按短名走），只有落到镜像里的名字分家：
+ * 两个 TU 各写一个 `static int helper(void)` 时，它们是两段互不相干的代码。
+ * `$` 在 ELF 符号名里合法，C99/LLVM 后端本来就会把它换成 `_`。 */
+static const char *tu_static_name(const char *nm)
+{
+    char buf[256] = {0};
+
+    if (!nm)
+        return nm;
+    snprintf(buf, sizeof(buf), "%s$%u", nm, (unsigned)PA_TU);
+    return arena_strdup(&A_main, buf);
+}
+
+/* 数据段初始化器里写函数名（`static struct Big (*p)(int) = big;`）时，要
+ * 重定位到哪个符号：非 static 的用**源码名**（方法/模板实例的真符号是
+ * `<结构体>_<函数名>`，源码名是那条弱别名，纯 C 的 TU 也按它调）；static
+ * 的只有带 TU 后缀的那一个名字（它没有弱别名，源码名在镜像里不存在）。 */
+static u32 addr_sym_of(Sym *t)
+{
+    if (t->is_func && !t->is_static)
+        return x64_sym(&X64, t->name);
+    return (u32)t->val;
+}
+
+/* `__attribute__((alias("target")))` / `__asm__("target")`：这个名字**没有
+ * 自己的代码/存储**，只是 target 的第二个入口。target 可能写在本 TU 后面，
+ * 也可能在别的 TU 里（120_alias 的 asm_for_target 就是），所以先记账，
+ * 等所有 TU 解析完、回填之前一次性接上（x64_alias_idx 就是"名字 → 偏移表"
+ * 里再加一条）。 */
+#define ALIAS_MAX 256
+static const char *ALIAS_FROM[ALIAS_MAX];
+static const char *ALIAS_TO[ALIAS_MAX];
+static u32 NALIAS;
+
+static void alias_register(const char *from, const char *to)
+{
+    if (!from || !to || !to[0] || from[0] == 0)
+        return;
+    if (NALIAS >= ALIAS_MAX)
+        return;
+    ALIAS_FROM[NALIAS] = from;
+    ALIAS_TO[NALIAS] = to;
+    NALIAS++;
+}
+
 static u32 gen_expr(void);
 static u32 gen_assign(void);
 static u32 value_of(u32 v);
@@ -2461,6 +2518,13 @@ static void task_seal(u32 tsk)
     }
 }
 static u32 NSTATIC;
+/* `extern __thread` 的引用表：偏移要等所有 TU 解析完（tls_finish）才知道，
+ * 先记下来，那时把值写进各自的 tls_slot。 */
+#define TLS_REF_MAX 256
+static Sym *TLS_REF[TLS_REF_MAX];
+static u32 NTLS_REF;
+/* 某个 `extern __thread` 到最后都没人定义：报一条"未定义的符号"，不写产物 */
+static int PA_LINK_UNDEF;      /* 有符号到最后没定义：不写产物 */
 /* 刚扫到 `__attribute__((packed))`（由 parse_agg_spec 取走并作用到那个结构体） */
 static int SAW_PACKED;
 /* 结构体嵌套时 TY_PACK 的存档栈（每个 parse_agg_spec 进体前压、出体后弹） */
@@ -5935,6 +5999,30 @@ static void skip_paren_group(void)
 /* `__attribute__((cleanup(fn)))`：作用域退出时调 fn(&变量) */
 static const char *SAW_CLEANUP;
 static u32 SAW_CLEANUP_LEN;
+/* `__attribute__((alias("目标")))` 里的目标名；`__asm__("目标")` 是同一件事
+ * 的另一种拼法（`void f(void) __asm__("target");`）。两者都"给这个名字
+ * 换个落点"，所以合成一个 SAW_ALIAS 交给声明处处理。
+ *
+ * 只在**文件作用域声明**里认（PA_AT_DECL）：函数体里的 `asm("nop")` 是内联
+ * 汇编，它的字符串不是符号名，认错了会把下一条声明做成别名。 */
+static const char *SAW_ALIAS;
+static const char *SAW_ASMNAME;
+static int PA_AT_DECL;
+
+/* 字符串 token 的文本带引号：属性里的符号名要去掉 */
+static const char *sa_str_tok(Tok *t)
+{
+    const char *s = NULL;
+    u32 n = 0;
+
+    if (!t)
+        return NULL;
+    s = tok_data(t);
+    n = t->len;
+    if (n >= 2 && s[0] == '"' && s[n - 1] == '"')
+        return arena_strndup(&A_main, s + 1, n - 2);
+    return arena_strndup(&A_main, s, n);
+}
 
 /* skip_attributes 里那一长串 `pa_is_ident(...)` 在每个声明上都要跑一遍，
  * 每次都是一次 memcmp。先用 token 哈希快筛（标识符的哈希词法层已经算好了），
@@ -6034,6 +6122,16 @@ static void skip_attributes(void)
                             SAW_ALIGN = (int)strtol(ab, NULL, 0);
                         }
                     }
+                    /* `__attribute__((alias("目标")))`：这个名字没有自己的
+                     * 代码/存储，只是目标的另一个入口 */
+                    if (PA_AT_DECL && c->kind == TK_IDENT && TOK_EQ(c, "alias")) {
+                        Tok *nx3 = pa_peek(1);
+                        Tok *ny3 = pa_peek(2);
+
+                        if (nx3 && ny3 && nx3->kind == TK_PUNCT && tok_eq(nx3, "(")
+                            && ny3->kind == TK_STR)
+                            SAW_ALIAS = sa_str_tok(ny3);
+                    }
                     pa_advance();
                 }
             } else {
@@ -6050,7 +6148,19 @@ static void skip_attributes(void)
                    || PA_IS_IDENT("__const") || PA_IS_IDENT("__volatile__")) {
             pa_advance();
         } else if (PA_IS_IDENT("__asm__") || PA_IS_IDENT("__asm") || PA_IS_IDENT("asm")) {
+            Tok *s1 = pa_peek(1);
+            Tok *s2 = pa_peek(2);
+
+            /* `void f(void) __asm__("target");`：asm 标签 = 别名。
+             * 只有 `asm("名字")` 这个形状才算（带冒号的是内联汇编）。 */
             pa_advance();
+            if (PA_AT_DECL && s1 && s2 && s1->kind == TK_PUNCT && tok_eq(s1, "(")
+                && s2->kind == TK_STR) {
+                Tok *s3 = pa_peek(2);
+
+                if (s3 && s3->kind == TK_PUNCT && tok_eq(s3, ")"))
+                    SAW_ASMNAME = sa_str_tok(s2);
+            }
             skip_paren_group();
         } else {
             break;
@@ -7321,7 +7431,18 @@ static u32 ident_addr(Sym *s)
 
             irfn_push(&FN, IR_CALL, IRT_U64, fs, 0, 0, 0, fsfn);
             FN.ops[FN.n - 1].narg = 0;
-            irfn_push(&FN, IR_CONST, IRT_U64, off, 0, 0, 0, s->goff);
+            if (s->tls_ref) {
+                /* `extern __thread`：偏移这时候还不知道（定义可能在后面的
+                 * TU 里），从数据槽里**读**——tls_finish() 在所有 TU 解析完
+                 * 之后把定义处的偏移写进去。 */
+                u32 ad = irfn_vreg(&FN);
+
+                irfn_push(&FN, IR_ADDR, IRT_PTR, ad, 0, 0, 0, (u32)s->val);
+                FN.ops[FN.n - 1].flags = 2;
+                irfn_push(&FN, IR_LOAD, IRT_U64, off, ad, 0, 0, 0);
+            } else {
+                irfn_push(&FN, IR_CONST, IRT_U64, off, 0, 0, 0, s->goff);
+            }
             irfn_push(&FN, IR_ADD, IRT_PTR, r, fs, off, 0, 0);
             return r;
         }
@@ -13079,10 +13200,8 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
 
             if (t && (t->kind == SC_GLOBAL || t->is_func)) {
-                u32 sym = (u32)t->val;
+                u32 sym = addr_sym_of(t);
 
-                if (t->is_func)
-                    sym = x64_sym(&X64, arena_strndup(&A_main, tok_data(pa_cur()), pa_cur()->len));
                 pa_advance();
                 if (!pa_is_ch('[') && !pa_is_ch('.') && !pa_is_ch('+')
                     && !pa_is_ch('-')) {
@@ -13860,10 +13979,7 @@ static void init_body(u32 top)
                         gs = sym_find(tok_data(vt), vt->len);
                     if (gs && (gs->kind == SC_GLOBAL || gs->is_func)) {
                         /* `[0 ... 3] = &func`：每个元素一条重定位 */
-                        u32 sym = (u32)gs->val;
-
-                        if (gs->is_func)
-                            sym = x64_sym(&X64, arena_strndup(&A_main, tok_data(vt), vt->len));
+                        u32 sym = addr_sym_of(gs);
                         pa_advance();
                         for (k = lo; k <= hi && k < n; k++)
                             data_fixup_add(INIT_GOFF + boff + k * esz, sym);
@@ -14456,14 +14572,24 @@ static void gen_one_local(u32 ty, Declarator *d)
     if (ty_is_func(ty)) {
         /* 块作用域的函数声明（`void f(void);` / `extern void f(void);`）：
          * 登记成全局符号，块里不分配存储。符号按名字 intern，所以文件后面
-         * 真正的定义会落在同一个 ELF 符号上（tcc tests2 105_local_extern）。 */
+         * 真正的定义会落在同一个 ELF 符号上（tcc tests2 105_local_extern）。
+         * 名字要跟**文件作用域**那条声明走：它要是 `static`，落点就是带
+         * TU 后缀的发射名——129_scopes 里 `{ int f6(int); … }` 的 f6 在文件
+         * 作用域是 static，按裸名字查就指向镜像里不存在的符号。 */
         const char *nm = arena_strndup(&A_main, d->name, d->nlen);
         Sym *fs = sym_find(nm, d->nlen);
 
         if (!fs || !fs->is_func) {
+            Sym *top = sym_find_file_scope(nm, d->nlen);
+
             fs = sym_add(nm, d->nlen, ty, SC_GLOBAL);
             fs->is_func = 1;
-            fs->val = (i64)x64_sym(&X64, emit_name(nm));
+            if (top && top->is_func && top->is_static) {
+                fs->is_static = 1;
+                fs->val = (i64)x64_sym(&X64, emit_name(tu_static_name(nm)));
+            } else {
+                fs->val = (i64)x64_sym(&X64, emit_name(nm));
+            }
         }
         return;
     }
@@ -17965,15 +18091,41 @@ static void gen_one_global(u32 ty, Declarator *d)
     if (PA_EXTERN) {
         Sym *ex = sym_find(d->name, d->nlen);
 
-        if (ex && ex->kind == SC_GLOBAL && ex->goff) {
+        if (ex && ex->kind == SC_GLOBAL && ex->goff && !ex->tls_ref) {
             ex->is_extern = 1;
+            return;
+        }
+        /* `extern __thread T x;`：值在**别的 TU** 里定义，编译这一刻还看不到
+         * 它的数据段偏移。所以这里不分配存储，只登记一个"引用"符号，偏移装
+         * 在一格数据里，等所有 TU 解析完由 tls_finish() 回填（寻址见
+         * ident_addr 的 TLS 分支）。单 TU 里也走这条路：`extern __thread`
+         * 后面才定义是合法的。 */
+        if (PA_TLS) {
+            Sym *r = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
+            char sn[256] = {0};
+
+            r->is_tls = 1;
+            r->is_extern = 1;
+            r->tls_ref = 1;
+            r->tls_slot = data_alloc(8, 8);
+            snprintf(sn, sizeof(sn), "__c6_tlsoff.%s", r->name);
+            r->val = (i64)x64_data_sym(&X64, sn, ELF_HDR + r->tls_slot);
+            if (NTLS_REF < TLS_REF_MAX)
+                TLS_REF[NTLS_REF++] = r;
             return;
         }
     }
     s = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
     sz = ty_size(ty) ? ty_size(ty) : 8;
     s->goff = data_alloc(sz, ty_align_of(ty));
-    s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+    /* 文件作用域的 static：发射名带 TU 后缀，两个 TU 的同名 static 是
+     * 两段互不相干的数据（符号表里仍是短名，见 tu_static_name） */
+    if (SCOPE && !SCOPE->up && PA_STATIC) {
+        s->is_static = 1;
+        s->val = (i64)x64_data_sym(&X64, tu_static_name(s->name), ELF_HDR + s->goff);
+    } else {
+        s->val = (i64)x64_data_sym(&X64, s->name, ELF_HDR + s->goff);
+    }
     /* `s` 指向符号表里的槽：解析初始化器的过程中只要再 `sym_add` 一次
      * （字符串字面量、枚举、匿名聚合……），符号表就可能扩容搬家，`s` 就成了
      * 悬垂指针。之前就是这样把 `static int g = 42` 的 42 写到了别的偏移上，
@@ -18100,10 +18252,8 @@ static void gen_one_global(u32 ty, Declarator *d)
             Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
 
             if (t && (t->kind == SC_GLOBAL || t->is_func)) {
-                u32 sym = (u32)t->val;
+                u32 sym = addr_sym_of(t);
 
-                if (t->is_func)
-                    sym = x64_sym(&X64, arena_strndup(&A_main, tok_data(pa_cur()), pa_cur()->len));
                 pa_advance();
                 if (!pa_is_ch('[') && !pa_is_ch('.') && !pa_is_ch('+')
                     && !pa_is_ch('-')) {
@@ -18596,6 +18746,8 @@ static void pa_parse_tu(void)
         }
         SAW_CTOR = 0;
         SAW_DTOR = 0;
+        SAW_ALIAS = NULL;
+        SAW_ASMNAME = NULL;
         PA_STATIC = 0;
         PA_EXTERN = 0;
         /* 函数模板定义：`|T| T f(…) { … }`——只捕获 token，调用点再重放 */
@@ -18789,10 +18941,12 @@ static void pa_parse_tu(void)
             }
             continue;
         }
+        PA_AT_DECL = 1;             /* 这条声明里认 alias / asm 标签 */
         base = parse_typespec();
         if (ty_is_taskh(base))
             pa_error("'task' can only be used inside a function");
         gen_decl_from_spec(base);
+        PA_AT_DECL = 0;
         tmpl_drain();
     }
     /* 最后一次顶层声明里登记的模板实例化（以及函数字面量）还要再排空一次，
@@ -18829,6 +18983,7 @@ static void gen_decl_from_spec(u32 base)
 {
     Declarator d = {0};
     Sym *s = NULL;
+    const char *al = NULL;
     u32 ty = 0;
     int base_mgd_ptr = PA_MGD_PTR;      /* `@T a, b;` 的 @ 要给每个声明符 */
     int base_mgd_kind = PA_MGD_KIND;
@@ -18843,6 +18998,11 @@ static void gen_decl_from_spec(u32 base)
         PA_MGD_KIND = base_mgd_kind;
         PA_TLS = base_tls;
         ty = parse_declarator(base, &d);
+        /* `name __attribute__((alias("目标")))` / `name __asm__("目标")`：
+         * 属性可能写在后缀（参数表 / 数组）之后，所以只能等声明符解析完再看。 */
+        al = SAW_ALIAS ? SAW_ALIAS : SAW_ASMNAME;
+        SAW_ALIAS = NULL;
+        SAW_ASMNAME = NULL;
         /* `int!error x = 1;`：`!error` 只挂在函数声明符上
          * （tests/errors/try.c6 的 test_fallible_not_a_function）。 */
         if (PA_FALLIBLE && !d.is_func) {
@@ -18857,8 +19017,11 @@ static void gen_decl_from_spec(u32 base)
         }
         if (d.is_func) {
             const char *nm = arena_strndup(&A_main, d.name, d.nlen);
+            const char *enf = NULL;     /* 落到镜像里的名字（static 带 TU 后缀） */
+            int fscope_static = (SCOPE && !SCOPE->up && PA_STATIC);
             int had_proto = 0;
 
+            enf = fscope_static ? tu_static_name(nm) : nm;
             s = sym_find(nm, d.nlen);
             if (s && s->is_func && ty_func_nparams(s->type) > 0)
                 had_proto = 1;
@@ -18880,6 +19043,10 @@ static void gen_decl_from_spec(u32 base)
                 if (!s || !s->is_func) {
                     s = sym_add(nm, d.nlen, ty, SC_GLOBAL);
                     s->is_func = 1;
+                    /* 文件作用域的 static：只在本 TU 可见（sym_tu_begin 靠这个
+                     * 标记摘符号），发射名带 TU 后缀 */
+                    if (fscope_static)
+                        s->is_static = 1;
                     /* 首形参是指针的普通函数也进方法表：`int port(Tcp *self)`
                      * 这种"显式接收者"风格的方法调用糖要靠它挑对重载。 */
                     if (ty_func_nparams(ty) > 0 && ty_is_ptr(ty_func_param(ty, 0))) {
@@ -18890,8 +19057,12 @@ static void gen_decl_from_spec(u32 base)
                             tin = sym_tag_name(self_ty2);
                         meth_add(s, self_ty2);
                     }
-                    s->val = (i64)x64_sym(&X64, nm);
+                    s->val = (i64)x64_sym(&X64, enf);
                 }
+                /* `__attribute__((alias("target")))` / `__asm__("target")`：
+                 * 这个名字只是 target 的另一个入口，没有自己的代码/存储。 */
+                if (al && s)
+                    alias_register(enf, al);
                 /* `!error` 是这一条声明上的事实：立刻落到符号上。原型没有
                  * 函数体、走不到 pa_func_def，留着会把标记传给下一条声明
                  * （`tests/errors/drop_bad.c6` 顶上那条 `int!error boom(void);`）。 */
@@ -18937,7 +19108,13 @@ static void gen_decl_from_spec(u32 base)
                          * 源码名当弱别名：纯 C 的 TU 才写得出的那个名字，
                          * 和"同名方法按接收者区分"靠的都是它。 */
                         snprintf(mn, sizeof(mn), "%s_%s", tn2, s->name);
-                        s->val = (i64)x64_sym(&X64, emit_name(mn));
+                        /* static 的函数名带 TU 后缀（见 tu_static_name）：
+                         * 方法真名也得带，否则两个 TU 各自的同名 static 方法
+                         * 会撞到同一个符号上。 */
+                        if (s->is_static)
+                            s->val = (i64)x64_sym(&X64, emit_name(tu_static_name(mn)));
+                        else
+                            s->val = (i64)x64_sym(&X64, emit_name(mn));
                         if (s->len == 4 && memcmp(s->name, "drop", 4) == 0
                             && ty_func_nparams(ty) == 1) {
                             if (ty_func_ret(ty) != ty_void())
@@ -18953,7 +19130,7 @@ static void gen_decl_from_spec(u32 base)
                             drop_reg(st, (u32)s->val);
                         }
                         if (!fn_overload_taken(s->name, s->len, s->type))
-                            s->alias = s->name;
+                            s->alias = s->is_static ? tu_static_name(s->name) : s->name;
                     }
                 }
             }
@@ -18994,6 +19171,20 @@ static void gen_decl_from_spec(u32 base)
             if (d.knr && !had_proto)
                 s->type = ty_func(ty_target(ty), NULL, 0, 0);
             break;
+        }
+        /* `int alias_int __attribute__((alias("g_int")));`：这个名字没有自己
+         * 的存储，只是目标的另一个入口（偏移等所有 TU 解析完再接）。 */
+        if (al) {
+            Sym *va = sym_find(d.name, d.nlen);
+
+            if (!va || va->kind != SC_GLOBAL) {
+                va = sym_add(d.name, d.nlen, ty, SC_GLOBAL);
+                va->val = (i64)x64_sym(&X64, va->name);
+            }
+            alias_register(va->name, al);
+            if (!pa_accept_ch(','))
+                break;
+            continue;
         }
         gen_one_global(ty, &d);
         if (!pa_accept_ch(','))
@@ -19058,6 +19249,22 @@ static void tls_globals_init(void)
 /* 解析完再回填：影像范围只有全部声明过完才知道。 */
 static void tls_finish(void)
 {
+    u32 i = 0;
+
+    /* `extern __thread` 的引用：偏移现在定得下来了（所有 TU 都解析完），
+     * 写进各自的数据槽。没人定义就按"未定义的符号"报——和链接期同一口径，
+     * 而且这时候还没写产物。 */
+    for (i = 0; i < NTLS_REF; i++) {
+        Sym *r = TLS_REF[i];
+        Sym *d = sym_find_def(r->name, r->len);
+
+        if (d && d->is_tls && d->goff)
+            glob_store(r->tls_slot, 0, ty_ulong(), (u64)d->goff);
+        else {
+            fprintf(stderr, "c6c: 未定义的符号 '%s'\n", r->name);
+            PA_LINK_UNDEF = 1;
+        }
+    }
     if (NTLS == 0) {
         glob_store(SYM_TLS_IMG->goff, 0, ty_ptr(ty_void()), 0);
         glob_store(SYM_TLS_LEN->goff, 0, ty_ulong(), 0);
@@ -19076,11 +19283,13 @@ static void ir_overflow_error(void)
     pa_error("函数太大：虚拟寄存器/标号超过 16 位上限（65535）");
 }
 
-static int pa_compile_ex(const char *out, const char *argv0, int with_rt)
+/* ---- 一次编译的公共前半段 ----
+ *
+ * 多 TU 和单 TU 都从这里起步：清全局状态、开输出后端。**不解析任何 TU**，
+ * 也不碰预处理栈——那是调用方的事（单 TU 时源文件已经在栈里了；多 TU 时
+ * 每个 TU 由 main.c6 压、由 pa_parse_new_tu() 解析）。 */
+static int pa_setup(const char *out)
 {
-    int rc = 0;
-    u32 code_len = 0;       /* 报"字节数"用的是纯代码长度（不含回填期补的跳板） */
-
     sym_init();
     tt_init();
     tykw_init();
@@ -19092,7 +19301,9 @@ static int pa_compile_ex(const char *out, const char *argv0, int with_rt)
     TLS_LO = 0;
     TLS_HI = 0;
     NTLS = 0;
+    NTLS_REF = 0;
     PA_TLS = 0;
+    PA_TU = 0;
     tls_globals_init();
     NLOOP = 0;
     PA_MAIN = NULL;
@@ -19116,28 +19327,120 @@ static int pa_compile_ex(const char *out, const char *argv0, int with_rt)
     }
     if (llvm_mode() && !llvm_open(out))
         return 1;
-    if (with_rt) {
-        const char *rt = find_runtime(argv0);
+    return 0;
+}
 
-        if (!rt) {
-            fprintf(stderr, "c6c: 找不到自带运行时 lib/rt.c6（可用 $C6C_RT 指定，"
-                            "或用 -nostdlib 关掉）\n");
-            return 1;
-        }
-        {
-            SrcFile *rf = src_load(rt);
+/* 自带运行时压进预处理栈（找不着就报错）。压完由调用方决定它属于哪个 TU：
+ * 单 TU 时它接在调用方的文件后面（同一个 TU），多 TU 时它就是 TU 0。 */
+static int pa_push_rt(const char *argv0)
+{
+    const char *rt = find_runtime(argv0);
 
-            if (rf)
-                pp_push_file(rf, -1);
-        }
+    if (!rt) {
+        fprintf(stderr, "c6c: 找不到自带运行时 lib/rt.c6（可用 $C6C_RT 指定，"
+                        "或用 -nostdlib 关掉）\n");
+        return 1;
     }
+    {
+        SrcFile *rf = src_load(rt);
+
+        if (rf)
+            pp_push_file(rf, -1);
+    }
+    return 0;
+}
+
+/* ---- 多 TU 驱动 ----
+ *
+ * 单文件调用和以前完全一样（一个 TU，自带运行时接在同一个 TU 里）；
+ * 命令行上有多个源文件时才逐个走 pa_parse_new_tu()。 */
+static void pa_parse_new_tu(void)
+{
+    PA_TU++;
+    /* 前一个 TU 的文件作用域 static 到此为止（符号表 + TU 后缀，见 sym.c6） */
+    sym_tu_begin(PA_TU);
+    /* 预处理器栈是调用方刚 reset 干净的，解析窗口里却还可能留着上一个 TU
+     * 尾巴上的 token（含 EOF）：不清掉的话新 TU 一进来就看见 EOF，整个 TU
+     * 静默空跑。 */
+    pa_win_clear();
+    NSRC = 0;
+    PA_HEAD = 0;
     pa_parse_tu();
+}
+
+/* 多 TU 的起手：初始化 + 自带运行时作为 TU 0 单独解析。
+ * 返回 0 表示可以开始逐个 pa_parse_new_tu()。 */
+static int pa_begin_multi(const char *out, const char *argv0, int with_rt)
+{
+    if (pa_setup(out))
+        return 1;
+    if (with_rt) {
+        pp_reset();
+        if (pa_push_rt(argv0))
+            return 1;
+        pa_parse_new_tu();
+    }
+    return 0;
+}
+
+/* `__attribute__((alias("目标")))` / `__asm__("目标")` 的收尾：所有 TU 都
+ * 解析完了、目标的偏移定下来了，把别名接到同一个 off/va 上。
+ * 目标没定义就按链接期的口径报（上游那条用例的注释也写着"不在同一个单元里
+ * 定义就不该编过"）。 */
+static void alias_apply(void)
+{
+    u32 i = 0;
+
+    for (i = 0; i < NALIAS; i++) {
+        u32 from = x64_sym(&X64, ALIAS_FROM[i]);
+        u32 to = x64_sym(&X64, emit_name(ALIAS_TO[i]));
+
+        if (!X64.sym[to].defined) {
+            fprintf(stderr, "c6c: 未定义的符号 '%s'\n", ALIAS_TO[i]);
+            PA_LINK_UNDEF = 1;
+            continue;
+        }
+        x64_alias_idx(&X64, from, to);
+    }
+}
+
+static int pa_finish(const char *out);
+
+static int pa_compile_ex(const char *out, const char *argv0, int with_rt)
+{
+    int rc = 0;
+    u32 code_len = 0;       /* 报"字节数"用的是纯代码长度（不含回填期补的跳板） */
+    int setup_rc = 0;
+
+    setup_rc = pa_setup(out);
+    if (setup_rc)
+        return setup_rc;
+    if (with_rt && pa_push_rt(argv0))
+        return 1;
+    pa_parse_tu();
+    return pa_finish(out);
+}
+
+/* 收尾：所有 TU 都解析完了才走到这里 —— TLS 回填、引用环检查、合成测试入口、
+ * 缺 main 的检查，最后出码（native / C99 / LLVM IR 三选一）。 */
+static int pa_finish(const char *out)
+{
+    int rc = 0;
+    u32 code_len = 0;       /* 报"字节数"用的是纯代码长度（不含回填期补的跳板） */
+
+    alias_apply();              /* 别名属性：目标偏移现在定下来了 */
     tls_finish();
     gc_cycle_check();
     synth_test_main();          /* 全局作用域还在，才能找到 printf */
     scope_leave();
     if (PA_ERRS || DG.errors) {
         fprintf(stderr, "c6c: %d 个错误，不写输出\n", PA_ERRS + DG.errors);
+        return 1;
+    }
+    if (PA_LINK_UNDEF) {
+        /* `extern __thread` 到最后没人定义：tls_finish 已经按链接期的口径
+         * 报过名字了，这里只负责别写出一个读 0 的产物。 */
+        fprintf(stderr, "c6c: 有未定义的外部符号，不写输出\n");
         return 1;
     }
     if (!PA_MAIN && !PA_SYNTAX_ONLY) {
