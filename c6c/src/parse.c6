@@ -650,6 +650,22 @@ static int PA_HAVE;
  * token，profiler 里 pa_fill 一项就占 16%。 */
 static int PA_HEAD;
 
+/* 窗口里“当前 token”的地址，PA_HAVE == 0 时为 NULL。
+ *
+ * pa_cur() 是**全编译器调用次数最多的函数**（tcc.c 上一次编译 648 万次，
+ * 加上 pa_is_punct 319 万、pa_is_ident 239 万），原来每次都要
+ * `PA_HAVE 判断 + PA_HEAD 取模 + PA_BUF 基址` 三条 load 加几条 lea。
+ * 把地址缓存在这里之后只剩一条 load 一次判断，省下约 4 条指令/次。
+ * 只在 pa_fill 结尾和 pa_advance 结尾写，另外 PA_HAVE 清零的地方统一走
+ * pa_win_clear()。 */
+static Tok *PA_CURP;
+
+C6C_INLINE void pa_win_clear(void)
+{
+    PA_HAVE = 0;
+    PA_CURP = NULL;
+}
+
 /* ---------- 模板（泛型）的 token 重放 ----------
  * c6 的模板在声明处只**捕获 token 区间**，实例化时把这段 token 重放一遍，
  * 参数名临时绑成 typedef——不需要"类型替换"那套机械，模板体里写什么就按
@@ -701,7 +717,7 @@ static void pa_src_push_back(Tok *t, u32 n)
 
         for (q = 0; q < ns; q++)
             save[q] = *pa_peek((int)q);
-        PA_HAVE = 0;
+        pa_win_clear();
         pa_src_push(save, ns);
     }
     pa_src_push(t, n);
@@ -751,8 +767,9 @@ static void pa_fill(int want)
         }
         PA_HAVE++;
         if (k == TK_EOF)
-            return;
+            break;
     }
+    PA_CURP = PA_HAVE > 0 ? &PA_BUF[PA_HEAD] : NULL;
 }
 
 static Tok *pa_peek_slow(int k)
@@ -793,11 +810,14 @@ C6C_INLINE Tok *pa_peek(int k)
 
 C6C_INLINE Tok *pa_cur(void)
 {
-    if (PA_HAVE > 0)
-        return &PA_BUF[PA_HEAD];
+    Tok *t = PA_CURP;
+
+    if (t)
+        return t;
     pa_fill(1);
-    if (PA_HAVE > 0)
-        return &PA_BUF[PA_HEAD];
+    t = PA_CURP;
+    if (t)
+        return t;
     return pa_peek(0);
 }
 
@@ -810,6 +830,31 @@ static void pa_advance(void)
         PA_HEAD = 0;
     PA_HAVE--;
     pa_fill(1);
+    PA_CURP = PA_HAVE > 0 ? &PA_BUF[PA_HEAD] : NULL;
+}
+
+/* 单字符标点：`pa_is_punct("}")` 这一类占全部标点判断的九成二（550/597 个
+ * 调用点）。走字符串版要先 load 首字节、再查 s[t->len] 是不是 0、最后还要进
+ * tok_eq 循环，二十条指令才能说一句“不是”；单字符版只要 kind / len / 首字节
+ * 三条判断，十亿级调用次数下这笔差值是实打实的。调用点统一换成 pa_is_ch。 */
+C6C_INLINE int pa_is_ch(int ch)
+{
+    Tok *t = pa_cur();
+    const char *d = NULL;
+
+    if (t->kind != TK_PUNCT || t->len != 1)
+        return 0;
+    d = tok_data(t);
+    return (u8)d[0] == (u8)(ch & 0xFF);
+}
+
+C6C_INLINE int pa_accept_ch(int ch)
+{
+    if (pa_is_ch(ch)) {
+        pa_advance();
+        return 1;
+    }
+    return 0;
 }
 
 C6C_INLINE int pa_is_punct(const char *s)
@@ -932,6 +977,12 @@ static void pa_error(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+
+static void pa_expect_ch(int ch)
+{
+    if (!pa_accept_ch(ch))
+        pa_error("这里要 '%c'（当前是 '%.*s'）", ch, (int)pa_cur()->len, tok_data(pa_cur()));
 }
 
 static void pa_expect_punct(const char *s)
@@ -1319,7 +1370,7 @@ static int pa_at_tuple_type(void)
     int comma = 0;
     int k = 0;
 
-    if (!pa_is_punct("("))
+    if (!pa_is_ch('('))
         return 0;
     for (k = 0; k < PA_LOOK; k++) {
         Tok *q = pa_peek(k);
@@ -1609,7 +1660,7 @@ static void cm_push_expansion(CMacro *m, Tok *args, const u32 *aoff, const u32 *
 
             for (q = 0; q < ns; q++)
                 save[q] = *pa_peek((int)q);
-            PA_HAVE = 0;
+            pa_win_clear();
             pa_src_push(save, ns);
         }
         pa_src_push(out, no);
@@ -1625,8 +1676,8 @@ static int cm_collect_args(CMacro *m, u32 *aoff, u32 *alen)
     int n = 0;
     u32 used = 0;
 
-    pa_expect_punct("(");
-    if (pa_accept_punct(")"))
+    pa_expect_ch('(');
+    if (pa_accept_ch(')'))
         return (m->np == 0) ? 0 : 0;
     for (;;) {
         u32 k = cm_read_arg(CM_ARGS + used, (u32)CM_ARG_MAX - used);
@@ -1637,11 +1688,11 @@ static int cm_collect_args(CMacro *m, u32 *aoff, u32 *alen)
         }
         used += k;
         n++;
-        if (pa_accept_punct(","))
+        if (pa_accept_ch(','))
             continue;
         break;
     }
-    pa_expect_punct(")");
+    pa_expect_ch(')');
     return n;
 }
 
@@ -1677,8 +1728,8 @@ static int cm_try_define(void)
     m->name = tok_data(pa_cur());
     m->nlen = pa_cur()->len;
     pa_advance();                                /* 名字 */
-    pa_expect_punct("(");
-    if (!pa_accept_punct(")")) {
+    pa_expect_ch('(');
+    if (!pa_accept_ch(')')) {
         for (;;) {
             int pr = -1;
 
@@ -1706,13 +1757,13 @@ static int cm_try_define(void)
                 m->np++;
             }
             pa_advance();
-            if (pa_accept_punct(","))
+            if (pa_accept_ch(','))
                 continue;
             break;
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
     }
-    if (!pa_is_punct("{"))
+    if (!pa_is_ch('{'))
         return 1;
     ntok = tmpl_capture_body();
     if (ntok >= 2) {
@@ -2558,15 +2609,15 @@ static i64 const_expr(void);
 
 static i64 const_unary(void)
 {
-    if (pa_accept_punct("-"))
+    if (pa_accept_ch('-'))
         return -(i64)const_unary();
-    if (pa_accept_punct("+"))
+    if (pa_accept_ch('+'))
         return (i64)const_unary();
-    if (pa_accept_punct("~"))
+    if (pa_accept_ch('~'))
         return ~(i64)const_unary();
-    if (pa_accept_punct("!"))
+    if (pa_accept_ch('!'))
         return const_unary() == 0 ? 1 : 0;
-    if (pa_accept_punct("&")) {
+    if (pa_accept_ch('&')) {
         /* offsetof 的经典写法：`&((T *)0)->m` 的值就是成员偏移。真实代码里
          * `#define offsetof(t,m) ((size_t)&((t *)0)->m)` 到处都是（tcc 自己
          * 的 tccdbg.c / tccelf.c 用了三百多处）。外层可能还套着括号。 */
@@ -2575,36 +2626,36 @@ static i64 const_unary(void)
         u32 mty = 0;
         int extra = 0;
 
-        while (extra < 4 && pa_is_punct("(") && !is_typename_tok(pa_peek(1))) {
+        while (extra < 4 && pa_is_ch('(') && !is_typename_tok(pa_peek(1))) {
             pa_advance();
             extra++;
         }
-        if (pa_is_punct("(") && (is_typename_tok(pa_peek(1))
+        if (pa_is_ch('(') && (is_typename_tok(pa_peek(1))
             || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT
                 && tok_eq(pa_peek(2), "@")))) {
             pa_advance();
             ty = parse_typename();
-            if (pa_is_punct(",")) {
+            if (pa_is_ch(',')) {
                 /* `sizeof((int, int))`：元组类型 */
                 u32 tys[TUPLE_MAXN] = {0};
                 u32 tn = 0;
 
                 tys[tn++] = ty;
-                while (tn < TUPLE_MAXN && pa_accept_punct(","))
+                while (tn < TUPLE_MAXN && pa_accept_ch(','))
                     tys[tn++] = parse_typename();
                 ty = ty_tuple_chk(tys, tn);
             }
-            pa_expect_punct(")");
-            if (pa_accept_punct("(")) {
+            pa_expect_ch(')');
+            if (pa_accept_ch('(')) {
                 if (pa_cur()->kind == TK_NUM)
                     pa_advance();
-                (void)pa_accept_punct(")");
+                (void)pa_accept_ch(')');
             } else if (pa_cur()->kind == TK_NUM) {
                 pa_advance();
             }
             /* 先把外层多余的 ')' 吃掉，然后才是成员链 */
             while (extra > 0) {
-                pa_expect_punct(")");
+                pa_expect_ch(')');
                 extra--;
             }
             for (;;) {
@@ -2615,7 +2666,7 @@ static i64 const_unary(void)
 
                 if (pa_accept_punct("->"))
                     arrow = 1;
-                else if (!pa_accept_punct("."))
+                else if (!pa_accept_ch('.'))
                     break;
                 if (arrow)
                     ty = ty_target(ty);
@@ -2658,10 +2709,10 @@ static i64 const_unary(void)
             FN.n = save0;
             PEND_LVAL = 0;
         }
-        while (pa_accept_punct(",")) {
+        while (pa_accept_ch(',')) {
             if (pa_is_ident("default")) {
                 pa_advance();
-                pa_expect_punct(":");
+                pa_expect_ch(':');
                 dflt = const_expr();
                 has_dflt = 1;
                 continue;
@@ -2669,7 +2720,7 @@ static i64 const_unary(void)
             {
                 u32 at = parse_typename();
 
-                pa_expect_punct(":");
+                pa_expect_ch(':');
                 if (!found && ty_unqual(at) == ty_unqual(cty)) {
                     hit = const_expr();
                     found = 1;
@@ -2694,7 +2745,7 @@ static i64 const_unary(void)
                 }
             }
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         if (found)
             return hit;
         if (has_dflt)
@@ -2711,9 +2762,9 @@ static i64 const_unary(void)
         pa_advance();
         pa_advance();
         a = parse_typename();
-        pa_expect_punct(",");
+        pa_expect_ch(',');
         b = parse_typename();
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         return a == b ? 1 : 0;
     }
     if (pa_is_ident("sizeof") || pa_is_ident("__alignof__")
@@ -2729,10 +2780,10 @@ static i64 const_unary(void)
             (void)pa_accept_ident("alignof");
             is_align = 1;
         }
-        if (pa_is_punct("(") && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "@")))) {
+        if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "@")))) {
             pa_advance();
             ty = parse_typename();
-            pa_expect_punct(")");
+            pa_expect_ch(')');
             return (i64)(is_align ? (u32)ty_align_of(ty) : ty_size(ty));
         }
         {
@@ -2749,18 +2800,18 @@ static i64 const_unary(void)
             return (i64)(is_align ? (u32)ty_align_of(ty2) : ty_size(ty2));
         }
     }
-    if (pa_is_punct("(") && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "@")))) {
+    if (pa_is_ch('(') && (is_typename_tok(pa_peek(1)) || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), "@")))) {
         u32 ty = 0;
 
         pa_advance();
         ty = parse_typename();
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         return (i64)const_unary();
     }
-    if (pa_accept_punct("(")) {
+    if (pa_accept_ch('(')) {
         i64 v = const_expr();
 
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         return v;
     }
     if (pa_cur()->kind == TK_NUM) {
@@ -2820,13 +2871,13 @@ static i64 const_mul(void)
     i64 v = const_unary();
 
     for (;;) {
-        if (pa_accept_punct("*")) {
+        if (pa_accept_ch('*')) {
             v = v * const_unary();
-        } else if (pa_accept_punct("/")) {
+        } else if (pa_accept_ch('/')) {
             i64 r = const_unary();
 
             v = r ? v / r : 0;
-        } else if (pa_accept_punct("%")) {
+        } else if (pa_accept_ch('%')) {
             i64 r = const_unary();
 
             v = r ? v % r : 0;
@@ -2841,9 +2892,9 @@ static i64 const_add(void)
     i64 v = const_mul();
 
     for (;;) {
-        if (pa_accept_punct("+"))
+        if (pa_accept_ch('+'))
             v = v + const_mul();
-        else if (pa_accept_punct("-"))
+        else if (pa_accept_ch('-'))
             v = v - const_mul();
         else
             return v;
@@ -2869,11 +2920,11 @@ static i64 const_rel(void)
     i64 v = const_shift();
 
     for (;;) {
-        if (pa_accept_punct("<"))
+        if (pa_accept_ch('<'))
             v = v < const_shift() ? 1 : 0;
         else if (pa_accept_punct("<="))
             v = v <= const_shift() ? 1 : 0;
-        else if (pa_accept_punct(">"))
+        else if (pa_accept_ch('>'))
             v = v > const_shift() ? 1 : 0;
         else if (pa_accept_punct(">="))
             v = v >= const_shift() ? 1 : 0;
@@ -2900,7 +2951,7 @@ static i64 const_band(void)
 {
     i64 v = const_eq();
 
-    while (pa_accept_punct("&"))
+    while (pa_accept_ch('&'))
         v = v & const_eq();
     return v;
 }
@@ -2909,7 +2960,7 @@ static i64 const_bxor(void)
 {
     i64 v = const_band();
 
-    while (pa_accept_punct("^"))
+    while (pa_accept_ch('^'))
         v = v ^ const_band();
     return v;
 }
@@ -2918,7 +2969,7 @@ static i64 const_bor(void)
 {
     i64 v = const_bxor();
 
-    while (pa_accept_punct("|"))
+    while (pa_accept_ch('|'))
         v = v | const_bxor();
     return v;
 }
@@ -2951,11 +3002,11 @@ static i64 const_cond(void)
 {
     i64 c = const_lor();
 
-    if (pa_accept_punct("?")) {
+    if (pa_accept_ch('?')) {
         i64 a = const_expr();
         i64 b = 0;
 
-        pa_expect_punct(":");
+        pa_expect_ch(':');
         b = const_cond();
         return c ? a : b;
     }
@@ -3209,7 +3260,7 @@ static void pa_push_tokens(Tok *t, u32 n)
 
         for (q = 0; q < ns; q++)
             save[q] = *pa_peek((int)q);
-        PA_HAVE = 0;
+        pa_win_clear();
         pa_src_push(save, ns);
     }
     pa_src_push(t, n);
@@ -3240,7 +3291,7 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
         u32 e = body_capture(tmp, CAP_MAX);
         int nested = 0;
 
-        if (e > 0 && !pa_is_punct("{")) {
+        if (e > 0 && !pa_is_ch('{')) {
             int d2 = 0;
             u32 i2 = 0;
 
@@ -3271,9 +3322,9 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
             pa_push_tokens(pc2, e);
         }
     }
-    pa_expect_punct("{");
+    pa_expect_ch('{');
     PA_SAW_ENUM = 0;
-    while (!pa_is_punct("}") && pa_cur()->kind != TK_EOF) {
+    while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF) {
         u32 base = 0;
         int any = 0;
         int memb_is_enum = 0;
@@ -3319,7 +3370,7 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
              *   - 不带体（`T at(int i);`）—— 模板里也不许，方法必须有体；
              *   - 非模板结构体里带体 —— 普通结构体不能内联定义函数。 */
             if (ty_is_func(mty) && d.name) {
-                if (!pa_is_punct("{"))
+                if (!pa_is_ch('{'))
                     pa_error("a member function needs a body: write '%.*s(...) { ... }' "
                              "in the template", (int)d.nlen, d.name);
                 /* 带体的成员函数只有**模板**结构体里才有意义：模板体是在实例化
@@ -3330,7 +3381,7 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
                              "outside it", (int)d.nlen, d.name);
             }
             /* c6 结构体内的方法 */
-            if (ty_is_func(mty) && d.name && pa_is_punct("{")) {
+            if (ty_is_func(mty) && d.name && pa_is_ch('{')) {
                 u32 np = ty_func_nparams(mty);
                 u32 ps[17] = {0};
                 u32 i2 = 0;
@@ -3371,7 +3422,7 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
                      * 得先自己吃掉，否则它会一路吃到别的成员的 `}` 上。 */
                     pa_advance();
                     skip_init_list();
-                    if (pa_is_punct("}"))
+                    if (pa_is_ch('}'))
                         pa_advance();
                     memb_method = 1;
                     break;
@@ -3389,7 +3440,7 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
                 names = agg_grow(names, n, cap, sizeof(char *));
                 lens = agg_grow(lens, n, cap, sizeof(u32));
             }
-            if (pa_accept_punct(":")) {
+            if (pa_accept_ch(':')) {
                 u32 w = (u32)const_expr();
 
                 /* 最高位标记"位域"；没有声明符的（`unsigned : 32;`）再加次高位
@@ -3446,12 +3497,12 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
             }
             n++;
             any = 1;
-            if (!pa_accept_punct(","))
+            if (!pa_accept_ch(','))
                 break;
         }
         (void)any;
         if (!memb_method)
-            pa_expect_punct(";");
+            pa_expect_ch(';');
         /* 增量注册已看到的成员（方法体只能看到前面声明的成员） */
         if (n > 0) {
             u32 t2 = complete_id ? ty_agg_complete(complete_id, mem, bits, n, is_union)
@@ -3460,7 +3511,7 @@ static u32 parse_struct_body(u32 complete_id, u32 tag, int is_union)
             agg_names_set(t2, names, lens, n);
         }
     }
-    pa_expect_punct("}");
+    pa_expect_ch('}');
     ty = complete_id ? ty_agg_complete(complete_id, mem, bits, n, is_union)
                      : ty_agg(mem, bits, n, is_union, tag);
     if (getenv("C6C_DBG_AGG"))
@@ -3791,7 +3842,7 @@ static u32 tmpl_inst(Tmpl *t, const u32 *args)
 
         for (q2 = 0; q2 < ns; q2++)
             save[q2] = *pa_peek((int)q2);
-        PA_HAVE = 0;
+        pa_win_clear();
         pa_src_push(save, ns);
     }
     pa_src_push(t->toks, t->n);
@@ -3813,7 +3864,7 @@ static u32 tmpl_inst(Tmpl *t, const u32 *args)
         tmpl_body_sv = PA_TMPL_BODY;
         PA_TMPL_BODY = 1;
         ty = parse_typespec();
-        while (pa_accept_punct("*"))
+        while (pa_accept_ch('*'))
             ty = ty_ptr(ty);
         if (ty && pa_cur()->kind == TK_IDENT) {
             /* 顺手按实例名登记成 typedef，`MyVec@int x;` 这种写法也能直接用 */
@@ -3822,7 +3873,7 @@ static u32 tmpl_inst(Tmpl *t, const u32 *args)
             (void)td;
             pa_advance();
         }
-        (void)pa_accept_punct(";");
+        (void)pa_accept_ch(';');
         PA_TMPL_BODY = tmpl_body_sv;
         tmpl_restore_state(&tmpl_sv);
         if (n0)
@@ -3922,13 +3973,13 @@ static u32 tmpl_capture_body(void)
         while (pa_cur()->kind != TK_EOF) {
             int last = 0;
 
-            if (pa_is_punct("{")) {
+            if (pa_is_ch('{')) {
                 depth++;
                 seen_brace = 1;
-            } else if (pa_is_punct("}")) {
+            } else if (pa_is_ch('}')) {
                 depth--;
                 last = (depth == 0);
-            } else if (!seen_brace && pa_is_punct(";")) {
+            } else if (!seen_brace && pa_is_ch(';')) {
                 last = 1;
             }
             pa_advance();
@@ -3981,7 +4032,7 @@ static u32 tmpl_arg_ty(int allow_ptr)
      * `Vect@T *self` 里那个星号是指向实例的指针，被当成模板实参就会变成
      * `Vect@(T*)`——成员指针于是指向指针，下标步长翻倍（踩过）。 */
     if (allow_ptr) {
-        while (pa_accept_punct("*"))
+        while (pa_accept_ch('*'))
             t = ty_ptr(t);
     }
     return t;
@@ -4037,9 +4088,9 @@ static u32 tmpl_parse_args(Tmpl *t, u32 *args, int paren)
         pa_error("'%.*s' takes a value argument here: write '%.*s@(...)'",
                  (int)t->nlen, t->name, (int)t->nlen, t->name);
     if (paren)
-        pa_expect_punct("(");
+        pa_expect_ch('(');
     while (na < TMPL_NPARAM && na < t->nparam && pa_cur()->kind != TK_EOF) {
-        if (paren && pa_is_punct(")"))
+        if (paren && pa_is_ch(')'))
             break;
         if (t->pkind[na]) {
             i64 v4 = (i64)const_expr();
@@ -4076,11 +4127,11 @@ static u32 tmpl_parse_args(Tmpl *t, u32 *args, int paren)
         na++;
         if (!paren)
             break;
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
     if (paren)
-        pa_expect_punct(")");
+        pa_expect_ch(')');
     /* 实参个数必须和形参个数对上（tests/errors/generic.c6 的 zero_arg 等） */
     if (t && t->name && na < t->nparam)
         pa_error("'%.*s' needs %u type argument(s) (got %u)",
@@ -4135,7 +4186,7 @@ static void tmpl_poke(Tmpl *t, u32 n, int semi, const char *mname)
 
         for (q2 = 0; q2 < ns; q2++)
             save[q2] = *pa_peek((int)q2);
-        PA_HAVE = 0;
+        pa_win_clear();
         pa_src_push(save, ns);
     }
     pa_src_push(toks, n);
@@ -4301,7 +4352,7 @@ static void fnlit_drain(void)
 
             for (q = 0; q < ns; q++)
                 save[q] = *pa_peek((int)q);
-            PA_HAVE = 0;
+            pa_win_clear();
             pa_src_push(save, ns);
         }
         pa_src_push(FL[i].toks, FL[i].n);
@@ -4638,7 +4689,7 @@ static u32 parse_agg_spec(int is_union)
         PACK_SAVE[NPACK_SAVE & 31] = save_pk;
         NPACK_SAVE++;
     }
-    if (pa_cur()->kind == TK_IDENT && !pa_is_punct("{")) {
+    if (pa_cur()->kind == TK_IDENT && !pa_is_ch('{')) {
         /* 标签名走一张独立的表：用 SC_TAG 符号存 */
         tn = tok_data(pa_cur());
         tlen = pa_cur()->len;
@@ -4647,7 +4698,7 @@ static u32 parse_agg_spec(int is_union)
     /* 泛型：`struct Vect@T { … }` 是模板定义，`struct Vect@int` 是实例。
      * 实例化出来的类型名本身就是类型，前面不能再带 `struct`/`union`
      * （tests/errors/generic.c6 的 test_drop_struct）。 */
-    if (tn && pa_is_punct("@")) {
+    if (tn && pa_is_ch('@')) {
         /* 往后找一个"这个 `@…` 是定义还是实例"的判据：跳过实参/形参表，
          * 后面跟 `{` 的是模板定义（`struct Vect@T { … }` /
          * `struct Vect@(T) { … }`），否则就是实例，而实例前面不能带
@@ -4694,7 +4745,7 @@ static u32 parse_agg_spec(int is_union)
                      && (tok_eq(nx2, "{") || tok_eq(nx2, ";"))))
             pa_error("an instance drops 'struct': write the instance name on its own");
     }
-    if (tn && pa_is_punct("@")) {
+    if (tn && pa_is_ch('@')) {
         const char *pn = NULL;
         u32 plen = 0;
         const char *par_n[TMPL_NPARAM] = {0};
@@ -4710,7 +4761,7 @@ static u32 parse_agg_spec(int is_union)
             int is_def = 0;
 
             pa_advance();                 /* 吃掉 '@' */
-            if (pa_is_punct("(")) {
+            if (pa_is_ch('(')) {
                 int depth = 0;
                 int k = 0;
 
@@ -4812,7 +4863,7 @@ static u32 parse_agg_spec(int is_union)
                 if (was_fwd) {
                     while (pa_cur()->kind == TK_IDENT) {
                         pa_advance();
-                        if (!pa_accept_punct(","))
+                        if (!pa_accept_ch(','))
                             break;
                     }
                 }
@@ -4829,8 +4880,8 @@ static u32 parse_agg_spec(int is_union)
                 npar = 1;
                 pa_advance();
             } else {
-                pa_expect_punct("(");
-                while (npar < TMPL_NPARAM && !pa_is_punct(")")) {
+                pa_expect_ch('(');
+                while (npar < TMPL_NPARAM && !pa_is_ch(')')) {
                     /* 两种写法：`T`（类型形参）/ `int N`（值形参，按常量绑定） */
                     if (pa_cur()->kind != TK_IDENT)
                         break;
@@ -4856,15 +4907,15 @@ static u32 parse_agg_spec(int is_union)
                         npar++;
                         pa_advance();
                     }
-                    if (!pa_accept_punct(","))
+                    if (!pa_accept_ch(','))
                         break;
                 }
-                pa_expect_punct(")");
+                pa_expect_ch(')');
             }
             pn = par_n[0];
             plen = par_len[0];
         }
-        if (pa_is_punct("{")) {
+        if (pa_is_ch('{')) {
             /* 定义：只捕获 token，不解析（参数名此刻还没有具体类型） */
             u32 ntok = tmpl_capture_body();
             Tmpl *t = NULL;
@@ -4913,7 +4964,7 @@ static u32 parse_agg_spec(int is_union)
             return ty_int();       /* 定义本身不产生类型；声明处会忽略 */
         }
     }
-    if (pa_is_punct("{")) {
+    if (pa_is_ch('{')) {
         char nm[256] = {0};
         u32 k = tlen < 200 ? tlen : 200;
         u32 cid = 0;
@@ -4949,7 +5000,7 @@ static u32 parse_agg_spec(int is_union)
         }
         /* `struct Vect@int v;`：实例化出来的类型名本身就是类型，前面不能再
          * 带 `struct`（tests/errors/generic.c6 的 test_drop_struct）。 */
-        if (pa_is_punct("@"))
+        if (pa_is_ch('@'))
             pa_error("an instance drops 'struct': write the instance name on its own");
         if (tn) {
             if (s)
@@ -5046,7 +5097,7 @@ static u32 parse_enum_spec(void)
      * `(area << 27) | (slot << 12) | code`（docs/modules.md M5）。 */
     u32 ebase = 0;
 
-    if (pa_cur()->kind == TK_IDENT && !pa_is_punct("{")) {
+    if (pa_cur()->kind == TK_IDENT && !pa_is_ch('{')) {
         /* 标签名：登记到标签表，这样裸 tag 也能当类型用（`Color c;`）。
          * 枚举在 c6c 里就是 int，不做范围检查。 */
         if (!sym_find_tag(tok_data(pa_cur()), pa_cur()->len)) {
@@ -5068,9 +5119,9 @@ static u32 parse_enum_spec(void)
     }
     if (has_tag && etaglen == 5 && memcmp(etag, "Error", 5) == 0 && CUR_FILE)
         ebase = mod_err_base(mod_of_file((u32)CUR_FILE->id));
-    if (!pa_accept_punct("{"))
+    if (!pa_accept_ch('{'))
         return ty_int();
-    while (!pa_is_punct("}") && pa_cur()->kind != TK_EOF) {
+    while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF) {
         Tok *t = pa_cur();
         char nm[256] = {0};
         u32 k = 0;
@@ -5085,7 +5136,7 @@ static u32 parse_enum_spec(void)
         pa_advance();
         /* c6 的限定成员名 `Color.RED`：常量同时按 "Color.RED" 登记，
          * 这样两个枚举可以有同名的成员（C 的裸名会撞车）。 */
-        if (pa_is_punct(".") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
+        if (pa_is_ch('.') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
             && pa_peek(1)->len + k + 1 < sizeof(nm)) {
             char bare[256] = {0};
             u32 bk = 0;
@@ -5104,7 +5155,7 @@ static u32 parse_enum_spec(void)
             k = k + 1 + bk;
             pa_advance();
             pa_advance();
-            if (pa_accept_punct("="))
+            if (pa_accept_ch('='))
                 val = (u32)(i32)const_expr();
             s = sym_add(nm, k, ty_int(), SC_ENUMC);
             s->val = (i64)(val ? (val | ebase) : 0u);
@@ -5122,11 +5173,11 @@ static u32 parse_enum_spec(void)
                 }
             }
             val++;
-            if (!pa_accept_punct(","))
+            if (!pa_accept_ch(','))
                 break;
             continue;
         }
-        if (pa_accept_punct("="))
+        if (pa_accept_ch('='))
             val = (u32)(i32)const_expr();
         /* 模块的错误码表：成员值会加在号段的低 12 位上，超出 12 位会撞进
          * 邻居的号段（docs/modules.md M5 / tests/errors/err_code.c6）。 */
@@ -5161,10 +5212,10 @@ static u32 parse_enum_spec(void)
             }
         }
         val++;
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
-    pa_expect_punct("}");
+    pa_expect_ch('}');
     if (has_tag)
         HAS_ENUM_TAG = 1;
     return ty_int();
@@ -5177,7 +5228,7 @@ static u32 parse_typeof(void)
 
     pa_advance();
     skip_attributes();
-    pa_expect_punct("(");
+    pa_expect_ch('(');
     if (is_typename_tok(pa_cur())) {
         ty = parse_typename();
     } else {
@@ -5192,7 +5243,7 @@ static u32 parse_typeof(void)
         FN.n = save;
         PEND_LVAL = 0;
     }
-    pa_expect_punct(")");
+    pa_expect_ch(')');
     return ty;
 }
 
@@ -5293,12 +5344,12 @@ static u32 parse_closure_type(void)
 
     pa_advance();                        /* closure */
     rty = parse_typespec();
-    while (pa_accept_punct("*"))
+    while (pa_accept_ch('*'))
         rty = ty_ptr(rty);
     int variadic = 0;
 
-    pa_expect_punct("(");
-    while (np < TY_PARAM_MAX && !pa_is_punct(")") && pa_cur()->kind != TK_EOF) {
+    pa_expect_ch('(');
+    while (np < TY_PARAM_MAX && !pa_is_ch(')') && pa_cur()->kind != TK_EOF) {
         u32 pt = 0;
 
         /* `closure int(int, ...)`：省略号表示变参（词法上是**一个** token） */
@@ -5308,16 +5359,16 @@ static u32 parse_closure_type(void)
             break;
         }
         pt = parse_typespec();
-        while (pa_accept_punct("*"))
+        while (pa_accept_ch('*'))
             pt = ty_ptr(pt);
         /* 形参名可以写（只做提示，不进类型） */
         if (pa_cur()->kind == TK_IDENT)
             pa_advance();
         pts[np++] = pt;
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
-    pa_expect_punct(")");
+    pa_expect_ch(')');
     return ty_closure(ty_func(rty, pts, np, variadic));
 }
 
@@ -5354,14 +5405,14 @@ static u32 parse_typespec(void)
     /* 声明位置上的 _Alignas(...) 直接忽略 */
     while (pa_is_ident("_Alignas") || pa_is_ident("alignas")) {
         pa_advance();
-        if (pa_is_punct("("))
+        if (pa_is_ch('('))
             skip_paren_group();
     }
     int nsigned = 0;
 
     /* 元组类型 `(T1, T2, …)`：写在类型位置、以 `(` 开头、里面有逗号。
      * 只有一个元素时 `(T)` 就是 T（括号而已）。 */
-    if (pa_is_punct("(") && !PA_TYPE_ATOM) {
+    if (pa_is_ch('(') && !PA_TYPE_ATOM) {
         u32 tys[TUPLE_MAXN] = {0};
         u32 tn = 0;
 
@@ -5371,22 +5422,22 @@ static u32 parse_typespec(void)
         if (pa_is_ident("error"))
             pa_error("'error' can only be a return type, not a tuple element");
         tys[tn++] = parse_typename();
-        if (pa_is_punct(",")) {
-            while (tn < TUPLE_MAXN && pa_accept_punct(",")) {
+        if (pa_is_ch(',')) {
+            while (tn < TUPLE_MAXN && pa_accept_ch(',')) {
                 if (pa_is_ident("error"))
                     pa_error("'error' can only be a return type, not a tuple element");
                 tys[tn++] = parse_typename();
             }
-            pa_expect_punct(")");
+            pa_expect_ch(')');
             /* 元组作 `!error` 返回类型：`(int, int)!error f()` */
-            if (pa_is_punct("!") && pa_peek(1)->kind == TK_IDENT) {
+            if (pa_is_ch('!') && pa_peek(1)->kind == TK_IDENT) {
                 PA_FALLIBLE = 1;
                 pa_advance();
                 pa_advance();
             }
             return ty_tuple_chk(tys, tn);
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         return tys[0];
     }
     /* 托管引用 `@T`：表示上和 `T *` 一样（对象头 + 引用计数还没做，
@@ -5401,7 +5452,7 @@ static u32 parse_typespec(void)
             PA_MGD_SHARED = 1;
         pa_advance();
     }
-    if (pa_is_punct("@")) {
+    if (pa_is_ch('@')) {
         u32 it = 0;
         int save_at = PA_TYPE_ATOM;
 
@@ -5429,7 +5480,7 @@ static u32 parse_typespec(void)
         }
         /* c6 错误通道返回类型：`T!error`。完整语义（错误值是个带 id 的载荷、
          * catch 绑定）还没做，这里先按 `T` 解析，返回 err(id,msg) 就是那个 id。 */
-        if (pa_is_punct("!") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
+        if (pa_is_ch('!') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
             if (base && ty_is_array(base))
                 pa_error("'!error' 不支持数组返回类型");
             PA_FALLIBLE = 1;
@@ -5440,11 +5491,11 @@ static u32 parse_typespec(void)
         /* c6 切片类型：`T[:]`（写在类型位置，名字在后面：`int[:] s`）。
          * 不看 PA_TYPE_ATOM：类型位置上的 `[` 只可能是切片后缀，而函数字面量
          * 解析返回类型时正是 PA_TYPE_ATOM 状态（`int[:](int[:] s) { … }`）。 */
-        if (!PA_TMPL_ARG && pa_is_punct("[") && pa_peek(1)
+        if (!PA_TMPL_ARG && pa_is_ch('[') && pa_peek(1)
             && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ":")) {
             pa_advance();
             pa_advance();
-            pa_expect_punct("]");
+            pa_expect_ch(']');
             if (base == ty_void())
                 pa_error("'[:]' 不能是 void 元素类型");
             base = ty_slice_chk(base ? base : ty_int());
@@ -5463,7 +5514,7 @@ static u32 parse_typespec(void)
             pa_advance();
             pa_advance();
             base = parse_typename();
-            pa_expect_punct(")");
+            pa_expect_ch(')');
             continue;
         }
         if (pa_accept_ident("_Atomic")) { continue; }    /* 限定符位置 */
@@ -5478,7 +5529,7 @@ static u32 parse_typespec(void)
         if (pa_is_ident("_Alignas") || pa_is_ident("alignas")) {
             /* `int _Alignas(16) i2;`：对齐说明符可以出现在类型说明符中间 */
             pa_advance();
-            if (pa_is_punct("("))
+            if (pa_is_ch('('))
                 skip_paren_group();
             continue;
         }
@@ -5511,16 +5562,16 @@ static u32 parse_typespec(void)
             PA_ASYNC = 1;
             /* `async (int, int) f(…)`：返回类型是元组。元组那条分支在说明符
              * 循环之前就判过了（那时当前还是 `async`），所以这里补一次。 */
-            if (pa_is_punct("(")) {
+            if (pa_is_ch('(')) {
                 u32 tys[TUPLE_MAXN] = {0};
                 u32 tn = 0;
 
                 pa_advance();
                 tys[tn++] = parse_typename();
-                while (tn < TUPLE_MAXN && pa_accept_punct(","))
+                while (tn < TUPLE_MAXN && pa_accept_ch(','))
                     tys[tn++] = parse_typename();
-                pa_expect_punct(")");
-                if (pa_is_punct("!") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
+                pa_expect_ch(')');
+                if (pa_is_ch('!') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
                     PA_FALLIBLE = 1;
                     pa_advance();
                     pa_advance();
@@ -5531,7 +5582,7 @@ static u32 parse_typespec(void)
         }
         /* `@T` / `weak @T` / `shared @T` / `own @T` 也能出现在**说明符循环里**
          * （`static @Node give(...)`）：c6c 里 `@T` 的表示就是 `T *`。 */
-        if (pa_is_punct("@")) {
+        if (pa_is_ch('@')) {
             u32 it2 = 0;
             int save_at2 = PA_TYPE_ATOM;
 
@@ -5593,10 +5644,10 @@ static u32 parse_typespec(void)
 
             pa_advance();
             tys[tn++] = parse_typename();
-            while (tn < TUPLE_MAXN && pa_accept_punct(","))
+            while (tn < TUPLE_MAXN && pa_accept_ch(','))
                 tys[tn++] = parse_typename();
-            pa_expect_punct(")");
-            if (pa_is_punct("!") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
+            pa_expect_ch(')');
+            if (pa_is_ch('!') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
                 PA_FALLIBLE = 1;
                 pa_advance();
                 pa_advance();
@@ -5621,16 +5672,16 @@ static u32 parse_typespec(void)
 
                 pa_advance();               /* 名字 */
                 pa_advance();               /* @ */
-                if (pa_is_punct("("))
+                if (pa_is_ch('('))
                     paren = 1;
                 (void)tmpl_parse_args(tp, args, paren);
                 base = tmpl_inst(tp, args);
                 /* 实例后面还可能跟切片后缀：`Vect@int[:] s = arr;` */
-                while (!PA_TMPL_ARG && pa_is_punct("[") && pa_peek(1)->kind == TK_PUNCT
+                while (!PA_TMPL_ARG && pa_is_ch('[') && pa_peek(1)->kind == TK_PUNCT
                        && tok_eq(pa_peek(1), ":")) {
                     pa_advance();
                     pa_advance();
-                    pa_expect_punct("]");
+                    pa_expect_ch(']');
                     if (base == ty_void())
                         pa_error("'[:]' 不能是 void 元素类型");
                     base = ty_slice_chk(base);
@@ -5689,7 +5740,7 @@ static u32 parse_typespec(void)
                 /* c6 的 `T!error` 后缀：typedef 名（`i64!error fs_size(...)`）
                  * 是在循环之后才认的，循环里那段 `!error` 处理走不到，
                  * 得在这里补一次，否则 `i64` 被当成声明符名字，报"顶层声明缺名字" */
-                if (pa_is_punct("!") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
+                if (pa_is_ch('!') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT) {
                     if (base && ty_is_array(base))
                         pa_error("'!error' 不支持数组返回类型");
                     PA_FALLIBLE = 1;
@@ -5699,11 +5750,11 @@ static u32 parse_typespec(void)
                 /* typedef 名后面也可能直接跟切片后缀：`Row[:] rows`（c6 允许
                  * 把 `[:]` 写在类型位置）。循环里那个检查走不到这里，因为
                  * typedef 名是在循环**之后**才认的。 */
-                while (!PA_TMPL_ARG && pa_is_punct("[") && pa_peek(1)->kind == TK_PUNCT
+                while (!PA_TMPL_ARG && pa_is_ch('[') && pa_peek(1)->kind == TK_PUNCT
                        && tok_eq(pa_peek(1), ":")) {
                     pa_advance();
                     pa_advance();
-                    pa_expect_punct("]");
+                    pa_expect_ch(']');
                     if (base == ty_void())
                         pa_error("'[:]' 不能是 void 元素类型");
                     base = ty_slice_chk(base);
@@ -5744,7 +5795,7 @@ static void skip_paren_group(void)
     int depth = 0;
     int n = 0;
 
-    if (!pa_is_punct("("))
+    if (!pa_is_ch('('))
         return;
     do {
         Tok *t = pa_cur();
@@ -5900,7 +5951,7 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
      * 而以裸标识符开头的只能是 `int f(a, b)` 这种。 */
     if (pa_cur()->kind == TK_IDENT && !is_typename_tok(pa_cur()))
         d->knr = 1;
-    if (pa_accept_punct(")"))
+    if (pa_accept_ch(')'))
         return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
     if (pa_is_ident("void") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), ")")) {
         pa_advance();
@@ -5936,10 +5987,10 @@ static u32 parse_param_list(u32 fnret, Declarator *d)
             break;
         }
         d->nparams++;
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
-    pa_expect_punct(")");
+    pa_expect_ch(')');
     return ty_func(fnret, d->ptype, d->nparams, (u32)d->variadic);
 }
 
@@ -5965,15 +6016,15 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
         u32 dims[16] = {0};
         int nd = 0;
 
-    while (pa_is_punct("(") || pa_is_punct("[")) {
-        if (pa_is_punct("[")) {
+    while (pa_is_ch('(') || pa_is_ch('[')) {
+        if (pa_is_ch('[')) {
             u32 cnt = 0;
 
             pa_advance();
-            if (pa_is_punct(":")) {
+            if (pa_is_ch(':')) {
                 /* c6 切片：`T[:]` */
                 pa_advance();
-                pa_expect_punct("]");
+                pa_expect_ch(']');
                 while (nd > 0)
                     t = ty_array(t, dims[--nd]);
                 t = ty_slice_chk(t);
@@ -5985,9 +6036,9 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                    || pa_is_ident("static") || pa_is_ident("__restrict")
                    || pa_is_ident("__restrict__"))
                 pa_advance();
-            if (pa_is_punct("]")) {
+            if (pa_is_ch(']')) {
                 cnt = 0;
-            } else if (pa_is_punct("*")) {
+            } else if (pa_is_ch('*')) {
                 /* `int x[const *]`：C99 的"未指定大小的 VLA 形参"，* 是占位符 */
                 pa_advance();
                 cnt = 0;
@@ -5999,7 +6050,7 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
                 d->vla = 1;
                 d->vla_cnt = n;
                 d->vla_esz = ty_size(t) ? ty_size(t) : 1;
-                pa_expect_punct("]");
+                pa_expect_ch(']');
                 while (nd > 0)
                     t = ty_array(t, dims[--nd]);
                 t = ty_ptr(t);
@@ -6008,7 +6059,7 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
             } else {
                 cnt = (u32)const_expr();
             }
-            pa_expect_punct("]");
+            pa_expect_ch(']');
             if (nd < 16) {
                 dims[nd++] = cnt;
             } else {
@@ -6029,7 +6080,7 @@ static u32 decl_apply_suffix(u32 ty, Declarator *d, int at_target)
     for (i = 0; i < nptr; i++)
         t = ty_ptr(t);
     /* `int f(int n)!error;`：错误标记也可以写在声明符（参数表）之后 */
-    if (pa_is_punct("!") && pa_peek(1)->kind == TK_IDENT) {
+    if (pa_is_ch('!') && pa_peek(1)->kind == TK_IDENT) {
         PA_FALLIBLE = 1;
         pa_advance();
         pa_advance();
@@ -6116,7 +6167,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
         PA_MGD_SHARED = 0;
     }
     skip_attributes();
-    while (pa_accept_punct("*")) {
+    while (pa_accept_ch('*')) {
         /* 指针限定符可以叠加、重复：`int *restrict`、`const char * const *`…
          * （tcc 自己的源码里满是 `*restrict`）
          *
@@ -6136,7 +6187,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
         nptr++;
         skip_attributes();
     }
-    if (pa_is_punct("(") && pa_peek(1)->kind == TK_PUNCT
+    if (pa_is_ch('(') && pa_peek(1)->kind == TK_PUNCT
         && (tok_eq(pa_peek(1), "*") || tok_eq(pa_peek(1), "("))) {
         /* 嵌套声明符 (*name)(…)：括号里的 `*` 比外面的后缀更"紧"，
          * 而**外层**的指针反而套在最里面（贴着 base）。
@@ -6150,7 +6201,7 @@ static u32 parse_declarator(u32 base, Declarator *d)
 
         pa_advance();                 /* ( */
         inner = parse_declarator(base, d);
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         d->type = decl_fill_hole(inner, nptr, d);
         d->is_func = ty_is_func(d->type);
         return d->type;
@@ -6334,14 +6385,14 @@ static void parse_static_assert_rest(void)
 {
     i64 v = 1;
 
-    pa_expect_punct("(");
+    pa_expect_ch('(');
     v = const_expr();
-    if (pa_accept_punct(",")) {
+    if (pa_accept_ch(',')) {
         if (pa_cur()->kind == TK_STR)
             pa_advance();
     }
-    pa_expect_punct(")");
-    pa_expect_punct(";");
+    pa_expect_ch(')');
+    pa_expect_ch(';');
     if (!v)
         pa_error("_Static_assert 失败");
 }
@@ -7316,8 +7367,8 @@ static u32 gen_call(Sym *fs)
     u8 argmgd[PA_ARG_MAX] = {0};       /* 哪个实参是托管引用（async 要把它挂住） */
     u32 mgdmask2 = 0;
 
-    pa_expect_punct("(");
-    if (!pa_accept_punct(")")) {
+    pa_expect_ch('(');
+    if (!pa_accept_ch(')')) {
         for (;;) {
             if (narg >= PA_ARG_MAX) {
                 pa_error("实参太多（上限 64）");
@@ -7418,10 +7469,10 @@ static u32 gen_call(Sym *fs)
                 args[narg] = av;
             }
             narg++;
-            if (!pa_accept_punct(","))
+            if (!pa_accept_ch(','))
                 break;
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
     }
     /* 同名方法按**接收者**挑：`area(&c)` / `area(&r)` 在符号表里是同一个
      * 名字的多个函数（tests/method.c6 的 Circle_area / Rect_area），光按
@@ -7524,7 +7575,7 @@ static u32 slice_len_load(u32 sadd);
 static u32 gen_postfix_ops(u32 v)
 {
     for (;;) {
-        if (pa_accept_punct("[")) {
+        if (pa_accept_ch('[')) {
             u32 base = 0;
             u32 bty = 0;
             u32 slice_src = 0;
@@ -7547,7 +7598,7 @@ static u32 gen_postfix_ops(u32 v)
                     u32 mo = 0;
                     u32 mty = 0;
 
-                    pa_expect_punct("]");
+                    pa_expect_ch(']');
                     PEND_LVAL = 0;
                     if (k >= ty_member_n(ty0)) {
                         pa_error("元组下标越界");
@@ -7585,7 +7636,7 @@ static u32 gen_postfix_ops(u32 v)
                 }
                 /* 子切片 `s[lo:hi]`：两个边界都可以省。缺省上界要么是数组长度，
                  * 要么是切片自己的 len（指针不知道长度，按 0 算）。 */
-                if (pa_is_punct(":")) {
+                if (pa_is_ch(':')) {
                     u32 lo = 0;
                     u32 hi = 0;
                     u32 zero0 = 0;
@@ -7610,7 +7661,7 @@ static u32 gen_postfix_ops(u32 v)
                     zero0 = irfn_vreg(&FN);
                     irfn_push(&FN, IR_CONST, IRT_U64, (u16)zero0, 0, 0, 0, 0);
                     lo = zero0;
-                    if (!pa_is_punct("]")) {
+                    if (!pa_is_ch(']')) {
                         hi = value_of(gen_expr());
                     } else if (was_slice) {
                         hi = slice_len_load(slice_src);
@@ -7622,7 +7673,7 @@ static u32 gen_postfix_ops(u32 v)
                         hi = irfn_vreg(&FN);
                         irfn_push(&FN, IR_CONST, IRT_U64, (u16)hi, 0, 0, 0, 0);
                     }
-                    pa_expect_punct("]");
+                    pa_expect_ch(']');
                     tmp = frame_slots_for(16);
                     ta = irfn_vreg(&FN);
                     irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)ta, 0, 0, 0, X64_SLOT(tmp));
@@ -7657,7 +7708,7 @@ static u32 gen_postfix_ops(u32 v)
                 }
             }
             idx = value_of(gen_expr());
-            if (pa_is_punct(":")) {
+            if (pa_is_ch(':')) {
                 /* `s[lo:hi]`：把刚算出来的 lo 交给子切片那条路 */
                 u32 lo = idx;
                 u32 hi = 0;
@@ -7678,7 +7729,7 @@ static u32 gen_postfix_ops(u32 v)
                         pa_error("cannot slice an array of unknown length");
                 }
                 pa_advance();
-                if (!pa_is_punct("]")) {
+                if (!pa_is_ch(']')) {
                     hi = value_of(gen_expr());
                 } else if (was_slice) {
                     hi = slice_len_load(slice_src);
@@ -7689,7 +7740,7 @@ static u32 gen_postfix_ops(u32 v)
                     hi = irfn_vreg(&FN);
                     irfn_push(&FN, IR_CONST, IRT_U64, (u16)hi, 0, 0, 0, 0);
                 }
-                pa_expect_punct("]");
+                pa_expect_ch(']');
                 tmp = frame_slots_for(16);
                 ta = irfn_vreg(&FN);
                 irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)ta, 0, 0, 0, X64_SLOT(tmp));
@@ -7722,7 +7773,7 @@ static u32 gen_postfix_ops(u32 v)
                 v = ta;
                 continue;
             }
-            pa_expect_punct("]");
+            pa_expect_ch(']');
             if (!ty_is_ptr(bty) && !ty_is_array(bty)) {
                 pa_error("下标访问的对象不是数组也不是指针");
                 bty = ty_ptr(ty_int());
@@ -7754,7 +7805,7 @@ static u32 gen_postfix_ops(u32 v)
         {
         u32 cft2 = 0;
 
-        if (pa_is_punct("(") && ty_is_closure(GEN_TY, &cft2)) {
+        if (pa_is_ch('(') && ty_is_closure(GEN_TY, &cft2)) {
             u32 envv = value_of(v);
             u32 code = irfn_vreg(&FN);
             u32 args[16] = {0};
@@ -7764,7 +7815,7 @@ static u32 gen_postfix_ops(u32 v)
 
             args[narg++] = envv;
             pa_advance();
-            if (!pa_accept_punct(")")) {
+            if (!pa_accept_ch(')')) {
                 for (;;) {
                     if (narg >= PA_ARG_MAX) {
                         pa_error("实参太多（上限 64）");
@@ -7772,10 +7823,10 @@ static u32 gen_postfix_ops(u32 v)
                     }
                     args[narg] = value_of(gen_assign());
                     narg++;
-                    if (!pa_accept_punct(","))
+                    if (!pa_accept_ch(','))
                         break;
                 }
-                pa_expect_punct(")");
+                pa_expect_ch(')');
             }
             irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)code, (u16)envv, 0, 0, 0);
             for (i2 = 0; i2 < narg; i2++)
@@ -7791,7 +7842,7 @@ static u32 gen_postfix_ops(u32 v)
         }
         }
         /* 间接调用：`(*fp)(…)` 或 `fp(…)`，fp 的类型是"指向函数的指针" */
-        if (pa_is_punct("(")
+        if (pa_is_ch('(')
             && (ty_is_func(GEN_TY) || (ty_is_ptr(GEN_TY) && ty_is_func(ty_target(GEN_TY))))) {
             u32 ft = ty_is_func(GEN_TY) ? GEN_TY : ty_target(GEN_TY);
             u32 fptr = value_of(v);
@@ -7801,7 +7852,7 @@ static u32 gen_postfix_ops(u32 v)
             u32 dst = 0;
 
             pa_advance();
-            if (!pa_accept_punct(")")) {
+            if (!pa_accept_ch(')')) {
                 for (;;) {
                     if (narg >= PA_ARG_MAX) {
                         pa_error("实参太多（上限 64）");
@@ -7809,10 +7860,10 @@ static u32 gen_postfix_ops(u32 v)
                     }
                     args[narg] = value_of(gen_assign());
                     narg++;
-                    if (!pa_accept_punct(","))
+                    if (!pa_accept_ch(','))
                         break;
                 }
-                pa_expect_punct(")");
+                pa_expect_ch(')');
             }
             for (i2 = 0; i2 < narg; i2++)
                 irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)args[i2], 0, 0, i2);
@@ -7870,9 +7921,9 @@ static u32 gen_postfix_ops(u32 v)
                 m = 3;
             pa_advance();
             pa_advance();
-            if (pa_is_punct("(")) {
+            if (pa_is_ch('(')) {
                 pa_advance();
-                pa_expect_punct(")");
+                pa_expect_ch(')');
             }
             tv = value_of(v);
             if (m == 3) {
@@ -7920,9 +7971,9 @@ static u32 gen_postfix_ops(u32 v)
 
             pa_advance();
             pa_advance();
-            if (pa_is_punct("(")) {
+            if (pa_is_ch('(')) {
                 pa_advance();
-                pa_expect_punct(")");
+                pa_expect_ch(')');
             }
             irfn_push(&FN, IR_CONST, IRT_I64, (u16)wv, 0, 0, 0, 0);
             GEN_TY = ty_int();
@@ -7936,9 +7987,9 @@ static u32 gen_postfix_ops(u32 v)
 
             pa_advance();
             pa_advance();
-            if (pa_is_punct("(")) {
+            if (pa_is_ch('(')) {
                 pa_advance();
-                pa_expect_punct(")");
+                pa_expect_ch(')');
             }
             irfn_push(&FN, IR_CONST, IRT_I64, (u16)vv2, 0, 0, 0, 0);
             GEN_TY = ty_int();
@@ -7956,9 +8007,9 @@ static u32 gen_postfix_ops(u32 v)
 
             pa_advance();
             pa_advance();
-            if (pa_is_punct("(")) {      /* `h->done()` 也认 */
+            if (pa_is_ch('(')) {      /* `h->done()` 也认 */
                 pa_advance();
-                pa_expect_punct(")");
+                pa_expect_ch(')');
             }
             irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)hp2, (u16)hv2, 0, 0, 0);
             irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)hp2, 0, 0, 0);
@@ -7977,7 +8028,7 @@ static u32 gen_postfix_ops(u32 v)
             pa_advance();
             pa_advance();
             pa_advance();
-            pa_expect_punct(")");
+            pa_expect_ch(')');
             irfn_push(&FN, IR_CONST, IRT_I64, (u16)dv3, 0, 0, 0, 0);
             GEN_TY = ty_int();
             PEND_LVAL = 0;
@@ -7997,7 +8048,7 @@ static u32 gen_postfix_ops(u32 v)
             pa_advance();                    /* -> */
             pa_advance();                    /* join */
             pa_advance();                    /* ( */
-            pa_expect_punct(")");
+            pa_expect_ch(')');
             irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)a0, (u16)hv, 0, 0, 0);
             irfn_push(&FN, IR_CONST, IRT_U64, (u16)zz, 0, 0, 0, 0);
             irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)a0, 0, 0, 0);
@@ -8009,7 +8060,7 @@ static u32 gen_postfix_ops(u32 v)
             v = dd;
             continue;
         }
-        if (pa_is_punct(".") || pa_is_punct("->")) {
+        if (pa_is_ch('.') || pa_is_punct("->")) {
             int is_arrow = pa_is_punct("->");
             u32 base = 0;
 
@@ -8104,15 +8155,15 @@ static u32 gen_postfix_ops(u32 v)
                         irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)fnv, (u16)fnv, 0, 0, 0);
                     }
                     avs[narg++] = selfv;
-                    if (pa_accept_punct("(")) {
-                        if (!pa_accept_punct(")")) {
+                    if (pa_accept_ch('(')) {
+                        if (!pa_accept_ch(')')) {
                             for (;;) {
                                 if (narg < 16)
                                     avs[narg++] = value_of(gen_assign());
-                                if (!pa_accept_punct(","))
+                                if (!pa_accept_ch(','))
                                     break;
                             }
-                            pa_expect_punct(")");
+                            pa_expect_ch(')');
                         }
                     }
                     for (k = 0; k < narg; k++)
@@ -8144,21 +8195,21 @@ static u32 gen_postfix_ops(u32 v)
                     /* 只有"正好一个接收者参数"的 drop 才是析构；同名但带
                      * 别的参数的是普通方法（`std/container/span.c6` 的
                      * `Span drop(Span *self, int n)`）。 */
-                    if (!pa_is_punct("("))
+                    if (!pa_is_ch('('))
                         pa_error("method '%.*s' must be called", (int)mlen, mname);
                     if (ms->len == 4 && memcmp(ms->name, "drop", 4) == 0
                         && ty_func_nparams(ms->type) == 1 && drop_is_sym((u32)ms->val))
                         pa_error("析构函数不能直接调用：最后一个引用放掉时它自己会跑（`p = NULL` 就够了）");
                     avs[narg++] = is_arrow ? base : addr;
-                    if (pa_accept_punct("(")) {
-                        if (!pa_accept_punct(")")) {
+                    if (pa_accept_ch('(')) {
+                        if (!pa_accept_ch(')')) {
                             for (;;) {
                                 if (narg < 16)
                                     avs[narg++] = value_of(gen_assign());
-                                if (!pa_accept_punct(","))
+                                if (!pa_accept_ch(','))
                                     break;
                             }
-                            pa_expect_punct(")");
+                            pa_expect_ch(')');
                         }
                     }
                     for (k2 = 0; k2 < narg; k2++)
@@ -8236,18 +8287,18 @@ static u32 gen_postfix_ops(u32 v)
                     /* 方法只能**调用**：写成值（`p->vec_sum`）拿到的是把
                      * 接收者当唯一实参的一次调用，语义完全不同
                      * （tests/errors/method.c6 的两条 without_call）。 */
-                    if (!pa_is_punct("("))
+                    if (!pa_is_ch('('))
                         pa_error("method '%.*s' must be called", (int)mlen, mname);
                     avs[narg++] = is_arrow ? base : addr;
-                    if (pa_accept_punct("(")) {
-                        if (!pa_accept_punct(")")) {
+                    if (pa_accept_ch('(')) {
+                        if (!pa_accept_ch(')')) {
                             for (;;) {
                                 if (narg < 16)
                                     avs[narg++] = value_of(gen_assign());
-                                if (!pa_accept_punct(","))
+                                if (!pa_accept_ch(','))
                                     break;
                             }
-                            pa_expect_punct(")");
+                            pa_expect_ch(')');
                         }
                     }
                     for (k2 = 0; k2 < narg; k2++)
@@ -8439,17 +8490,17 @@ static double const_fprim(int *ok)
     Tok *t = pa_cur();
     double v = 0;
 
-    if (pa_accept_punct("(")) {
+    if (pa_accept_ch('(')) {
         v = const_fexpr(ok);
-        if (pa_is_punct(")"))
+        if (pa_is_ch(')'))
             pa_advance();
         else
             *ok = 0;
         return v;
     }
-    if (pa_accept_punct("-"))
+    if (pa_accept_ch('-'))
         return -const_fprim(ok);
-    if (pa_accept_punct("+"))
+    if (pa_accept_ch('+'))
         return const_fprim(ok);
     if (t->kind == TK_NUM) {
         if (is_float_lit(tok_data(t), t->len)) {
@@ -8470,9 +8521,9 @@ static double const_fmul(int *ok)
     double v = const_fprim(ok);
 
     for (;;) {
-        if (pa_accept_punct("*")) {
+        if (pa_accept_ch('*')) {
             v = v * const_fprim(ok);
-        } else if (pa_accept_punct("/")) {
+        } else if (pa_accept_ch('/')) {
             double r = const_fprim(ok);
 
             if (r == 0) {
@@ -8491,9 +8542,9 @@ static double const_fexpr(int *ok)
     double v = const_fmul(ok);
 
     for (;;) {
-        if (pa_accept_punct("+"))
+        if (pa_accept_ch('+'))
             v = v + const_fmul(ok);
-        else if (pa_accept_punct("-"))
+        else if (pa_accept_ch('-'))
             v = v - const_fmul(ok);
         else
             return v;
@@ -8562,7 +8613,7 @@ static u32 gen_postfix(void)
         pa_advance();
         pa_advance();
         d = value_of(gen_assign());
-        if (pa_accept_punct(",")) {
+        if (pa_accept_ch(',')) {
             /* 消息存进运行时的全局，`catch e { e.msg }` 从那里取 */
             u32 mv = value_of(gen_assign());
             Sym *g = sym_find("c6c_err_msg", 11);
@@ -8573,7 +8624,7 @@ static u32 gen_postfix(void)
                 store_conv(a, ty_ptr(ty_char()), mv, cur_op_ty());
             }
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         /* 同时把运行时的错误状态置上：`T!error` 函数的调用方靠它判断
          * （值本身仍是 id，测试块 `return err(N, …)` 的约定不变）。 */
         {
@@ -8619,7 +8670,7 @@ static u32 gen_postfix(void)
         maddr = PEND_ADDR;
         mty3 = PEND_TY;
         mv2 = value_of(mv2);
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         if (!mlval)
             pa_error("'move' 需要一个左值（要能把源槽清零）");
         /* 只接受"槽里的托管引用"：`move(3)` / `move(s.p)` 这种没有源槽可清零 */
@@ -8659,10 +8710,10 @@ static u32 gen_postfix(void)
         u32 addr = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         if (!parse_const_u64(&n))
             pa_error("alloca 的大小必须是编译期常量");
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         {
             u32 slot = frame_slots_for((u32)n);
             addr = irfn_vreg(&FN);
@@ -8677,15 +8728,15 @@ static u32 gen_postfix(void)
         u32 k = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         for (k = 0; k < 7; k++) {
             u32 a = value_of(gen_assign());
 
             irfn_push(&FN, IR_ARG, IRT_VOID, 0, (u16)a, 0, 0, k);
-            if (!pa_accept_punct(","))
+            if (!pa_accept_ch(','))
                 break;
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         d = irfn_vreg(&FN);
         irfn_push(&FN, IR_CALL, IRT_I64, (u16)d, 0, 0, 0, 0);
         FN.ops[FN.n - 1].flags |= 2;
@@ -8702,10 +8753,10 @@ static u32 gen_postfix(void)
         u32 d = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         ap = value_of(gen_assign());
         if (kind == 0) {
-            pa_expect_punct(")");
+            pa_expect_ch(')');
             irfn_push(&FN, IR_VASTART, IRT_VOID, 0, (u16)ap, 0, 0, FN.nparams * 8);
             d = irfn_vreg(&FN);
             irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 0);
@@ -8713,9 +8764,9 @@ static u32 gen_postfix(void)
             return d;
         }
         if (kind == 1) {
-            pa_expect_punct(",");
+            pa_expect_ch(',');
             ty = parse_typename();
-            pa_expect_punct(")");
+            pa_expect_ch(')');
             d = irfn_vreg(&FN);
             irfn_push(&FN, IR_VAARG, ir_ty_of(ty), (u16)d, (u16)ap, 0, 0, 0);
             if (ty_size(ty) < 8 && ty_size(ty) > 0) {
@@ -8727,7 +8778,7 @@ static u32 gen_postfix(void)
             GEN_TY = ty;
             return d;
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         irfn_push(&FN, IR_VAEND, IRT_VOID, 0, (u16)ap, 0, 0, 0);
         d = irfn_vreg(&FN);
         irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 0);
@@ -8752,7 +8803,7 @@ static u32 gen_postfix(void)
         int def = -1;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         {
             u32 save0 = FN.n;
 
@@ -8762,7 +8813,7 @@ static u32 gen_postfix(void)
             PEND_LVAL = 0;
         }
         sel = FN.n;
-        while (pa_accept_punct(",")) {
+        while (pa_accept_ch(',')) {
             u32 at = 0;
             u32 st = 0;
             u32 v2 = 0;
@@ -8774,7 +8825,7 @@ static u32 gen_postfix(void)
             } else {
                 at = parse_typename();
             }
-            pa_expect_punct(":");
+            pa_expect_ch(':');
             st = FN.n;
             v2 = value_of(gen_assign());
             if (nassoc < 32) {
@@ -8785,7 +8836,7 @@ static u32 gen_postfix(void)
                 nassoc++;
             }
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         for (k = 0; k < nassoc; k++) {
             if (aty[k] == 0) {
                 if (def < 0)
@@ -8831,16 +8882,16 @@ static u32 gen_postfix(void)
         u32 rp = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         p = value_of(gen_assign());
         pty = ty_is_ptr(GEN_TY) ? ty_target(GEN_TY) : ty_int();
         if (generic) {
-            pa_expect_punct(",");
+            pa_expect_ch(',');
             rp = value_of(gen_assign());     /* &结果 */
         }
-        while (pa_accept_punct(","))
+        while (pa_accept_ch(','))
             (void)value_of(gen_assign());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         d = load_lval(p, pty);
         if (generic && rp)
             store_conv(rp, pty, d, pty);
@@ -8854,16 +8905,16 @@ static u32 gen_postfix(void)
         u32 v2 = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         p = value_of(gen_assign());
         pty = ty_is_ptr(GEN_TY) ? ty_target(GEN_TY) : ty_int();
-        pa_expect_punct(",");
+        pa_expect_ch(',');
         v2 = value_of(gen_assign());
         if (generic)
             v2 = load_lval(v2, pty);         /* 参数是 &值 */
-        while (pa_accept_punct(","))
+        while (pa_accept_ch(','))
             (void)value_of(gen_assign());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         store_conv(p, pty, v2, pty);
         GEN_TY = ty_void();
         return 0;
@@ -8871,10 +8922,10 @@ static u32 gen_postfix(void)
     if (tok_eq(t, "__atomic_thread_fence") || tok_eq(t, "__atomic_signal_fence")
         || tok_eq(t, "__sync_synchronize")) {
         pa_advance();
-        if (pa_accept_punct("(")) {
-            while (!pa_is_punct(")") && pa_cur()->kind != TK_EOF)
-                (void)value_of(gen_assign()), pa_accept_punct(",");
-            pa_expect_punct(")");
+        if (pa_accept_ch('(')) {
+            while (!pa_is_ch(')') && pa_cur()->kind != TK_EOF)
+                (void)value_of(gen_assign()), pa_accept_ch(',');
+            pa_expect_ch(')');
         }
         GEN_TY = ty_void();
         return 0;
@@ -8904,20 +8955,20 @@ static u32 gen_postfix(void)
             : tok_eq(t, "__atomic_fetch_or") ? 3 : 4;
         ret_new = tok_eq(t, "__atomic_add_fetch") || tok_eq(t, "__atomic_sub_fetch");
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         p = value_of(gen_assign());
         pty = ty_is_ptr(GEN_TY) ? ty_target(GEN_TY) : ty_int();
-        pa_expect_punct(",");
+        pa_expect_ch(',');
         v2 = value_of(gen_assign());
         if (generic) {
             /* __atomic_exchange(ptr, &值, &旧值, order)：两个都是指针 */
             v2 = load_lval(v2, pty);
-            pa_expect_punct(",");
+            pa_expect_ch(',');
             rp = value_of(gen_assign());
         }
-        while (pa_accept_punct(","))
+        while (pa_accept_ch(','))
             (void)value_of(gen_assign());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         if (xchg) {
             fn = x64_sym(&X64, "__c6_at_xchg");
             irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)p, 0, 0, 0);
@@ -8973,18 +9024,18 @@ static u32 gen_postfix(void)
         u32 sz = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         p = value_of(gen_assign());
         pty = ty_is_ptr(GEN_TY) ? ty_target(GEN_TY) : ty_int();
-        pa_expect_punct(",");
+        pa_expect_ch(',');
         pe = value_of(gen_assign());
-        pa_expect_punct(",");
+        pa_expect_ch(',');
         pd = value_of(gen_assign());
         if (generic)
             pd = load_lval(pd, pty);        /* 参数是 &值 */
-        while (pa_accept_punct(","))
+        while (pa_accept_ch(','))
             (void)value_of(gen_assign());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         /* __c6_at_cas(p, &expected, desired, 宽度)：1 = 换成，0 = 没换成
          * （没换成时它已经把实际值写进 *expected 了） */
         irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)p, 0, 0, 0);
@@ -9004,26 +9055,26 @@ static u32 gen_postfix(void)
         u32 v = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         v = value_of(gen_assign());
-        while (pa_accept_punct(","))
+        while (pa_accept_ch(','))
             (void)value_of(gen_assign());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         return gen_postfix_ops(v);
     }
     if (tok_eq(t, "__builtin_constant_p")) {
         u32 d = 0;
 
         pa_advance();
-        pa_expect_punct("(");
-        if (!pa_is_punct(")")) {
+        pa_expect_ch('(');
+        if (!pa_is_ch(')')) {
             u32 sv = FN.n;
 
             (void)gen_assign();
             FN.n = sv;
             PEND_LVAL = 0;
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         d = irfn_vreg(&FN);
         irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, 1);
         GEN_TY = ty_int();
@@ -9035,9 +9086,9 @@ static u32 gen_postfix(void)
         u32 d = 0;
 
         pa_advance();
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         ty = parse_typename();
-        pa_expect_punct(",");
+        pa_expect_ch(',');
         {
             int first = 1;
 
@@ -9053,12 +9104,12 @@ static u32 gen_postfix(void)
                     break;
                 off += mo;
                 first = 0;
-                if (!pa_accept_punct("."))
+                if (!pa_accept_ch('.'))
                     break;
             }
             (void)first;
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         d = irfn_vreg(&FN);
         irfn_push(&FN, IR_CONST, IRT_U64, (u16)d, 0, 0, 0, off);
         GEN_TY = ty_ulong();
@@ -9068,8 +9119,8 @@ static u32 gen_postfix(void)
         u32 d = 0;
 
         pa_advance();
-        pa_expect_punct("(");
-        pa_expect_punct(")");
+        pa_expect_ch('(');
+        pa_expect_ch(')');
         d = irfn_vreg(&FN);
         irfn_push(&FN, IR_CONST, IRT_I64, (u16)d, 0, 0, 0, 134);
         {
@@ -9332,15 +9383,15 @@ static u32 gen_postfix(void)
                     irfn_push(&FN, IR_LOAD, IRT_PTR, (u16)sv2, (u16)sa2, 0, 0, 0);
                     avs[narg++] = sv2;
                     pa_advance();       /* 名字 */
-                    if (pa_accept_punct("(")) {
-                        if (!pa_accept_punct(")")) {
+                    if (pa_accept_ch('(')) {
+                        if (!pa_accept_ch(')')) {
                             for (;;) {
                                 if (narg < 16)
                                     avs[narg++] = value_of(gen_assign());
-                                if (!pa_accept_punct(","))
+                                if (!pa_accept_ch(','))
                                     break;
                             }
-                            pa_expect_punct(")");
+                            pa_expect_ch(')');
                         }
                     }
                     for (k2 = 0; k2 < narg; k2++)
@@ -9369,7 +9420,7 @@ static u32 gen_postfix(void)
 
                 pa_advance();           /* 名字 */
                 pa_advance();           /* @ */
-                na = tmpl_parse_args(t0, args, pa_is_punct("("));
+                na = tmpl_parse_args(t0, args, pa_is_ch('('));
                 fsym = tmpl_func_sig(t0, args, na);
                 /* 函数体排进 worklist，等这条顶层声明做完再发射 */
                 if (NFW < FW_MAX) {
@@ -9403,7 +9454,7 @@ static u32 gen_postfix(void)
                     tmpl_mangle_name(t0, args, na, nm, sizeof(nm));
                     s2 = sym_find(nm, (u32)strlen(nm));
                     if (s2 && s2->is_func) {
-                        if (pa_is_punct("("))
+                        if (pa_is_ch('('))
                             return gen_postfix_ops(gen_call(s2));
                         GEN_TY = ty_ptr(s2->type);
                         return gen_postfix_ops(ident_addr(s2));
@@ -9477,7 +9528,7 @@ static u32 gen_postfix(void)
         GEN_TY = ty_int();
         return 0;
     }
-    if (pa_is_punct("(") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "{")) {
+    if (pa_is_ch('(') && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "{")) {
         /* GNU 语句表达式 ({ ... })：值取块里最后一条表达式语句的值 */
         u32 v = 0;
         u32 vt = 0;
@@ -9485,17 +9536,17 @@ static u32 gen_postfix(void)
         pa_advance();                  /* ( */
         BLOCK_HAS = 0;
         gen_block();
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         v = BLOCK_HAS ? BLOCK_VAL : 0;
         vt = BLOCK_HAS ? BLOCK_TY : ty_int();
         PEND_LVAL = 0;
         GEN_TY = vt;
         return gen_postfix_ops(v);
     }
-    if (pa_accept_punct("(")) {
+    if (pa_accept_ch('(')) {
         u32 r = gen_expr();
 
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         return gen_postfix_ops(r);
     }
     pa_error("这里要一个表达式（当前是 '%.*s'）", (int)t->len, tok_data(t));
@@ -9580,7 +9631,7 @@ static int fstr_hole_expr(const char *raw, u32 hfile, u32 hs, u32 hlen,
 
         for (q2 = 0; q2 < save_n; q2++)
             sv[q2] = *pa_peek((int)q2);
-        PA_HAVE = 0;
+        pa_win_clear();
         pa_src_push(sv, save_n);
     }
     pa_src_push(toks, n);
@@ -9607,7 +9658,7 @@ static u32 fstr_str_addr(const char *lit)
 
         for (q = 0; q < save_n; q++)
             sv[q] = *pa_peek((int)q);
-        PA_HAVE = 0;
+        pa_win_clear();
         pa_src_push(sv, save_n);
     }
     pa_src_push(t, 1);
@@ -9933,7 +9984,7 @@ static u32 gen_unary(void)
      * 换成实参，调一次 snprintf 进栈上缓冲。**只支持 `{标识符}` 形式的洞**
      * （表达式要能重入词法器，那是另一件事），够 tests/ 里的用法了。 */
     if ((pa_is_ident("f") && pa_peek(1) && pa_peek(1)->kind == TK_STR)
-        || (pa_is_punct("@") && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
+        || (pa_is_ch('@') && pa_peek(1) && pa_peek(1)->kind == TK_IDENT
             && tok_eq(pa_peek(1), "f") && pa_peek(2) && pa_peek(2)->kind == TK_STR)) {
         char fmt[512] = {0};
         u32 fl = 0;
@@ -9962,12 +10013,12 @@ static u32 gen_unary(void)
              * `const char *p = @f"…"`（把新引用交给普通指针）都得报。 */
             u8 dm = PA_DECL_INIT_MGD;
 
-            if (dm == 2 && !(pa_is_punct("@") ? 1 : 0))
+            if (dm == 2 && !(pa_is_ch('@') ? 1 : 0))
                 pa_error("f-string: 普通文本是借来的，不能存进托管引用（写 @f\"…\"）");
-            else if (dm == 1 && pa_is_punct("@"))
+            else if (dm == 1 && pa_is_ch('@'))
                 pa_error("f-string: 新建的引用不能存进普通指针（目标要写成 @char）");
         }
-        if (pa_is_punct("@")) {
+        if (pa_is_ch('@')) {
             pa_advance();
             fdm = 1;             /* `@f".."` 是托管文本，不能跟普通的共用缓冲 */
         }
@@ -10496,7 +10547,7 @@ static u32 gen_unary(void)
 
                 pa_advance();
                 pa_advance();               /* @ */
-                tna = tmpl_parse_args(st, targs, pa_is_punct("("));
+                tna = tmpl_parse_args(st, targs, pa_is_ch('('));
                 (void)tmpl_func_sig(st, targs, tna);
                 tmpl_mangle_name(st, targs, tna, tnm2, sizeof(tnm2));
                 ss = sym_find(tnm2, (u32)strlen(tnm2));
@@ -10537,7 +10588,7 @@ static u32 gen_unary(void)
         }
         pa_advance();
         pa_advance();                        /* ( */
-        if (!pa_accept_punct(")")) {
+        if (!pa_accept_ch(')')) {
             for (;;) {
                 if (sn >= PA_ARG_MAX) {
                     pa_error("spawn 实参太多（上限 16）");
@@ -10566,10 +10617,10 @@ static u32 gen_unary(void)
                         mgdmask |= 1u << sn;
                     sn++;
                 }
-                if (!pa_accept_punct(","))
+                if (!pa_accept_ch(','))
                     break;
             }
-            pa_expect_punct(")");
+            pa_expect_ch(')');
         }
         thunk = spawn_thunk((int)sn, mgdmask);
         /* 聚合实参按值传到线程里：参数块后面留一块副本区，spawn 处就把结构体
@@ -10730,14 +10781,14 @@ static u32 gen_unary(void)
         E_NEW_SEEN = 1;
         E_NEW_SHARED = PA_MGD_SHARED ? 1 : 0;
         PA_MGD_SHARED = 0;
-        while (pa_accept_punct("*"))
+        while (pa_accept_ch('*'))
             ty = ty_ptr(ty);
         esz = ty_size(ty) ? ty_size(ty) : 8;
-        if (pa_accept_punct("[")) {
+        if (pa_accept_ch('[')) {
             /* `new T[n]`：元素个数是运行期值，运行时要靠它逐个析构 */
             ncnt = value_of(gen_expr());
 
-            pa_expect_punct("]");
+            pa_expect_ch(']');
             is_arr = 1;
         }
         ms = sym_find(is_arr ? "__c6_gc_new_arr" : "__c6_gc_new",
@@ -10792,7 +10843,7 @@ static u32 gen_unary(void)
         GEN_TY = ty_int();
         return v;
     }
-    if (pa_accept_punct("&")) {
+    if (pa_accept_ch('&')) {
         u32 a = 0;
         int sav_amp = PA_AMP;
 
@@ -10820,7 +10871,7 @@ static u32 gen_unary(void)
         GEN_TY = ty_ptr(PEND_TY);
         return PEND_ADDR;
     }
-    if (pa_accept_punct("*")) {
+    if (pa_accept_ch('*')) {
         u32 p = 0;
         u32 ty = 0;
 
@@ -10836,7 +10887,7 @@ static u32 gen_unary(void)
         mark_lval(p, ty_target(ty));
         return p;
     }
-    if (pa_accept_punct("-")) {
+    if (pa_accept_ch('-')) {
         u32 a = value_of(gen_unary());
         u32 ty = ty_promote(GEN_TY);
         u32 z = irfn_vreg(&FN);
@@ -10860,9 +10911,9 @@ static u32 gen_unary(void)
         GEN_TY = ty;
         return d;
     }
-    if (pa_accept_punct("+"))
+    if (pa_accept_ch('+'))
         return gen_unary();
-    if (pa_accept_punct("!")) {
+    if (pa_accept_ch('!')) {
         u32 a = value_of(gen_unary());
         u32 z = irfn_vreg(&FN);
         u32 d = irfn_vreg(&FN);
@@ -10873,7 +10924,7 @@ static u32 gen_unary(void)
         GEN_TY = ty_int();
         return d;
     }
-    if (pa_accept_punct("~")) {
+    if (pa_accept_ch('~')) {
         u32 a = value_of(gen_unary());
         u32 ty = GEN_TY;
         u32 d = irfn_vreg(&FN);
@@ -10935,7 +10986,7 @@ static u32 gen_unary(void)
             (void)pa_accept_ident("alignof");
             is_align = 1;
         }
-        if (pa_is_punct("(") && (is_typename_tok(pa_peek(1))
+        if (pa_is_ch('(') && (is_typename_tok(pa_peek(1))
             || (pa_peek(1)->kind == TK_IDENT && pa_peek(2)->kind == TK_PUNCT
                 && tok_eq(pa_peek(2), "@"))
             /* `sizeof(@Node)` / `sizeof(weak @Node)`：托管类型的写法 */
@@ -10953,24 +11004,24 @@ static u32 gen_unary(void)
                 && sizeof_inner_type_end()))) {
             pa_advance();
             ty = parse_typename();
-            if (pa_is_punct(",")) {
+            if (pa_is_ch(',')) {
                 /* `sizeof((int, int))`：元组类型 */
                 u32 tys[TUPLE_MAXN] = {0};
                 u32 tn = 0;
 
                 tys[tn++] = ty;
-                while (tn < TUPLE_MAXN && pa_accept_punct(","))
+                while (tn < TUPLE_MAXN && pa_accept_ch(','))
                     tys[tn++] = parse_typename();
                 ty = ty_tuple_chk(tys, tn);
             }
-            pa_expect_punct(")");
-        } else if (!is_align && pa_is_punct("(") && pa_peek(1)->kind == TK_STR
+            pa_expect_ch(')');
+        } else if (!is_align && pa_is_ch('(') && pa_peek(1)->kind == TK_STR
                    && pa_peek(2)->kind == TK_PUNCT && tok_eq(pa_peek(2), ")")) {
             /* sizeof("abc") 同 sizeof "abc"：括号里就一个字符串字面量 */
             pa_advance();
             (void)str_lit_data();
             ty = ty_array(ty_char(), STR_LIT_N + 1);
-            pa_expect_punct(")");
+            pa_expect_ch(')');
         } else if (!is_align && pa_cur()->kind == TK_STR) {
             /* sizeof "abc" 是 4 不是 8：字符串字面量的类型是 char[N]（含结尾 0），
              * 按表达式求值只会拿到退化后的 char *。tcc 的
@@ -10998,7 +11049,7 @@ static u32 gen_unary(void)
         GEN_TY = ty_ulong();
         return d;
     }
-    if (pa_is_punct("(")
+    if (pa_is_ch('(')
         && (is_typename_tok(pa_peek(1)) || tok_eq(pa_peek(1), "typeof")
             || (NIFACE > 0 && pa_peek(1)->kind == TK_IDENT
                 && iface_find(tok_data(pa_peek(1)), pa_peek(1)->len) < IFACE_MAX)
@@ -11012,21 +11063,21 @@ static u32 gen_unary(void)
         SAW_TYPE_QUAL = 0;
         ty = parse_typename();
         CAST_QUAL = SAW_TYPE_QUAL;
-        if (pa_is_punct(",")) {
+        if (pa_is_ch(',')) {
             /* `(int, int){…}`：元组类型 */
             u32 tys[TUPLE_MAXN] = {0};
             u32 tn = 0;
 
             tys[tn++] = ty;
-            while (tn < TUPLE_MAXN && pa_accept_punct(","))
+            while (tn < TUPLE_MAXN && pa_accept_ch(','))
                 tys[tn++] = parse_typename();
             ty = ty_tuple_chk(tys, tn);
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         {
             u32 ifx3 = 0;
 
-            if (NIFACE > 0 && ty_is_iface(ty, &ifx3) && !pa_is_punct("{")) {
+            if (NIFACE > 0 && ty_is_iface(ty, &ifx3) && !pa_is_ch('{')) {
                 u32 av3 = gen_unary();
                 u32 aty3 = cur_op_ty();
 
@@ -11063,7 +11114,7 @@ static u32 gen_unary(void)
                 return gen_postfix_ops(av3);
             }
         }
-        if (pa_is_punct("{")) {
+        if (pa_is_ch('{')) {
             /* 复合字面量 (T){...}：在栈上开个临时对象，就地初始化，值是它的地址 */
             u32 slot = 0;
             u32 addr = irfn_vreg(&FN);
@@ -11328,13 +11379,13 @@ static u32 gen_mul(void)
     u32 aty = cur_op_ty();
 
     for (;;) {
-        if (pa_accept_punct("*")) {
+        if (pa_accept_ch('*')) {
             u32 av = value_of(a);
             u32 b = value_of(gen_unary());
 
             a = gen_bin2(av, aty, IR_MUL, b, GEN_TY);
             aty = GEN_TY;
-        } else if (pa_accept_punct("/")) {
+        } else if (pa_accept_ch('/')) {
             u32 av = value_of(a);
             u32 aty2 = ty_promote(aty);
             u32 b = value_of(gen_unary());
@@ -11344,7 +11395,7 @@ static u32 gen_mul(void)
 
             a = gen_bin2(av, aty2, op, b, bty2);
             aty = GEN_TY;
-        } else if (pa_accept_punct("%")) {
+        } else if (pa_accept_ch('%')) {
             u32 av = value_of(a);
             u32 aty2 = ty_promote(aty);
             u32 b = value_of(gen_unary());
@@ -11370,9 +11421,9 @@ static u32 gen_add(void)
         u32 b = 0;
         u32 bty = 0;
 
-        if (pa_accept_punct("+")) {
+        if (pa_accept_ch('+')) {
             is_sub = 0;
-        } else if (pa_accept_punct("-")) {
+        } else if (pa_accept_ch('-')) {
             is_sub = 1;
         } else {
             return a;
@@ -11487,10 +11538,10 @@ static u32 gen_rel(void)
         } else if (pa_accept_punct(">=")) {
             cc = IRCC_GE;
             ucc = IRCC_UGE;
-        } else if (pa_accept_punct("<")) {
+        } else if (pa_accept_ch('<')) {
             cc = IRCC_LT;
             ucc = IRCC_ULT;
-        } else if (pa_accept_punct(">")) {
+        } else if (pa_accept_ch('>')) {
             cc = IRCC_GT;
             ucc = IRCC_UGT;
         } else {
@@ -11542,7 +11593,7 @@ static u32 gen_bitand(void)
     u32 a = gen_eq();
     u32 aty = cur_op_ty();
 
-    while (pa_accept_punct("&")) {
+    while (pa_accept_ch('&')) {
         u32 av = value_of(a);
         u32 b = value_of(gen_eq());
 
@@ -11557,7 +11608,7 @@ static u32 gen_bitxor(void)
     u32 a = gen_bitand();
     u32 aty = cur_op_ty();
 
-    while (pa_accept_punct("^")) {
+    while (pa_accept_ch('^')) {
         u32 av = value_of(a);
         u32 b = value_of(gen_bitand());
 
@@ -11572,7 +11623,7 @@ static u32 gen_bitor(void)
     u32 a = gen_bitxor();
     u32 aty = cur_op_ty();
 
-    while (pa_accept_punct("|")) {
+    while (pa_accept_ch('|')) {
         u32 av = value_of(a);
         u32 b = value_of(gen_bitxor());
 
@@ -11756,7 +11807,7 @@ static u32 gen_cond(void)
         }
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
         scope_enter();
-        if (pa_is_punct("(")) {
+        if (pa_is_ch('(')) {
             /* `catch (e) { … }`：括号包着的绑定 */
             pa_advance();
             if (pa_cur()->kind == TK_IDENT) {
@@ -11782,7 +11833,7 @@ static u32 gen_cond(void)
                     store_conv(a8, ty_ptr(ty_char()), mv, ty_ptr(ty_char()));
                 }
             }
-            pa_expect_punct(")");
+            pa_expect_ch(')');
         }
         if (pa_cur()->kind == TK_IDENT) {
             Sym *e = sym_add(tok_data(pa_cur()), pa_cur()->len, ty_errpay(), SC_LOCAL);
@@ -11819,7 +11870,7 @@ static u32 gen_cond(void)
                       x64_sym(&X64, "__tcc_err_clear"));
             FN.ops[FN.n - 1].narg = 0;
         }
-        if (pa_is_punct("{"))
+        if (pa_is_ch('{'))
             gen_block();
         else
             pa_error("catch 后面要一个 { … } 块");
@@ -11834,7 +11885,7 @@ static u32 gen_cond(void)
         E_CALL_FALLIBLE = 4;    /* 这一次已经被处理掉了 */
     }
 
-    if (pa_accept_punct("?")) {
+    if (pa_accept_ch('?')) {
         u32 lelse = irfn_label(&FN);
         u32 lthen = irfn_label(&FN);
         u32 lend = irfn_label(&FN);
@@ -11849,7 +11900,7 @@ static u32 gen_cond(void)
 
         irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cv, (u16)lthen, (u16)lelse, 0);
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lthen, 0, 0, 0);
-        if (pa_is_punct(":")) {
+        if (pa_is_ch(':')) {
             /* GNU `a ?: b`：中间项省略，值就是条件表达式的值（只求值一次） */
             t = cv;
             ty = cty;
@@ -11858,7 +11909,7 @@ static u32 gen_cond(void)
             t = value_of(gen_expr());
             ty = GEN_TY;
             tnpc = E_NPC;
-            pa_expect_punct(":");
+            pa_expect_ch(':');
         }
         irfn_push(&FN, IR_MOV, ir_ty_of(ty), (u16)d, (u16)t, 0, 0, 0);
         irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lend, 0, 0, 0);
@@ -12033,7 +12084,7 @@ static u32 gen_expr(void)
     u32 v = gen_assign();
 
     /* 逗号运算符：值取最右操作数（左边只求值） */
-    while (pa_accept_punct(",")) {
+    while (pa_accept_ch(',')) {
         v = value_of(gen_assign());
         if (PEND_LVAL) {
             /* 保留左值性：最右操作数是左值时整体也是左值 */
@@ -12196,11 +12247,11 @@ static void data_fixup_drop_range(u32 lo, u32 hi);
 static void gen_glob_desig_fill(u32 goff, u32 ty, u32 off)
 {
     for (;;) {
-        if (pa_accept_punct("[")) {
+        if (pa_accept_ch('[')) {
             u32 i = (u32)const_expr();
             u32 et = 0;
 
-            pa_expect_punct("]");
+            pa_expect_ch(']');
             if (!ty_is_array(ty))
                 return;
             et = ty_target(ty);
@@ -12210,7 +12261,7 @@ static void gen_glob_desig_fill(u32 goff, u32 ty, u32 off)
             off += i * ty_size(et);
             continue;
         }
-        if (pa_accept_punct(".")) {
+        if (pa_accept_ch('.')) {
             const char *nm = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : NULL;
             u32 nl = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
             int idx = 0;
@@ -12233,7 +12284,7 @@ static void gen_glob_desig_fill(u32 goff, u32 ty, u32 off)
         }
         break;
     }
-    pa_expect_punct("=");
+    pa_expect_ch('=');
     gen_glob_obj(goff, ty, off);
 }
 
@@ -12248,32 +12299,32 @@ static void gen_glob_braced(u32 goff, u32 ty, u32 off)
         u32 n = ty_array_n(ty);
 
         for (;;) {
-            if (pa_is_punct("}") || pa_cur()->kind == TK_EOF)
+            if (pa_is_ch('}') || pa_cur()->kind == TK_EOF)
                 break;
-            if (!first && !pa_accept_punct(","))
+            if (!first && !pa_accept_ch(','))
                 break;
             first = 0;
-            if (pa_is_punct("}"))
+            if (pa_is_ch('}'))
                 break;
-            if (pa_accept_punct("[")) {
+            if (pa_accept_ch('[')) {
                 u32 lo = (u32)const_expr();
                 u32 hi = lo;
                 u32 k = 0;
 
                 if (pa_accept_punct("..."))
                     hi = (u32)const_expr();
-                pa_expect_punct("]");
-                if (pa_is_punct(".") || pa_is_punct("[")) {
+                pa_expect_ch(']');
+                if (pa_is_ch('.') || pa_is_ch('[')) {
                     gen_glob_desig_fill(goff, et, off + lo * esz);
                 } else {
-                    pa_expect_punct("=");
+                    pa_expect_ch('=');
                     for (k = lo; k <= hi && k < n; k++)
                         gen_glob_obj(goff, et, off + k * esz);
                 }
                 cur = hi + 1;
                 continue;
             }
-            if (pa_is_punct(".") && ty_is_agg(ty))
+            if (pa_is_ch('.') && ty_is_agg(ty))
                 break;
             if (cur >= n) {
                 skip_init_list();
@@ -12290,19 +12341,19 @@ static void gen_glob_braced(u32 goff, u32 ty, u32 off)
         u32 n = ty_member_n(ty);
 
         if (n == 0) {
-            if (!pa_is_punct("}"))
+            if (!pa_is_ch('}'))
                 gen_glob_obj(goff, ty, off);
             return;
         }
         for (;;) {
-            if (pa_is_punct("}") || pa_cur()->kind == TK_EOF)
+            if (pa_is_ch('}') || pa_cur()->kind == TK_EOF)
                 break;
-            if (!first && !pa_accept_punct(","))
+            if (!first && !pa_accept_ch(','))
                 break;
             first = 0;
-            if (pa_is_punct("}"))
+            if (pa_is_ch('}'))
                 break;
-            if (pa_accept_punct(".")) {
+            if (pa_accept_ch('.')) {
                 const char *nm = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : NULL;
                 u32 nl = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
                 int idx = 0;
@@ -12319,10 +12370,10 @@ static void gen_glob_braced(u32 goff, u32 ty, u32 off)
                     break;
                 }
                 idx = agg_find_member(ty, nm, nl);
-                if (pa_is_punct(".") || pa_is_punct("[")) {
+                if (pa_is_ch('.') || pa_is_ch('[')) {
                     gen_glob_desig_fill(goff, mty, off + moff);
                 } else {
-                    pa_expect_punct("=");
+                    pa_expect_ch('=');
                     GLOB_BF_BITS = idx >= 0 ? ty_member_bits(ty, (u32)idx) : 0;
                     GLOB_BF_BITOFF = idx >= 0 ? ty_member_bitoff(ty, (u32)idx) : 0;
                     gen_glob_obj(goff, mty, off + moff);
@@ -12396,7 +12447,7 @@ static int pa_at_typename(void)
     }
     /* 托管类型开头的类型位置：`@int` / `weak @Node` / `shared @T` / `own @T`。
      * 函数字面量的返回类型就可能是 `@int`（`tests/fn_lit.c6`）。 */
-    if (pa_is_punct("@"))
+    if (pa_is_ch('@'))
         return 1;
     if (pa_cur()->kind == TK_IDENT
         && (pa_is_ident("weak") || pa_is_ident("shared") || pa_is_ident("own"))
@@ -12435,7 +12486,7 @@ static int pa_is_compound_lit(void)
 {
     int i = 0;
 
-    if (!pa_is_punct("("))
+    if (!pa_is_ch('('))
         return 0;
     /* 元组/单类型都能这么认：`(int, int){…}`、`(struct S){…}`、`(int){…}`
      * ——括号里是类型、闭括号后面紧跟 `{`。 */
@@ -12506,14 +12557,14 @@ static u32 pa_take_paren_type(void)
 {
     u32 extra = 0;
 
-    while (pa_is_punct("(")) {
+    while (pa_is_ch('(')) {
         pa_advance();
         extra++;
     }
     while (tykw_is_qual(pa_cur()))
         pa_advance();
     (void)parse_typespec();
-    while (pa_accept_punct(")"))
+    while (pa_accept_ch(')'))
         ;
     return extra ? extra - 1 : 0;
 }
@@ -12528,9 +12579,9 @@ static int pa_skip_empty_compound(void)
     ex = pa_take_paren_type();
     pa_advance();                    /* { */
     skip_init_list();
-    pa_expect_punct("}");
+    pa_expect_ch('}');
     while (ex--)
-        pa_expect_punct(")");
+        pa_expect_ch(')');
     return 1;
 }
 
@@ -12544,7 +12595,7 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
      * （tests/errors/slice.c6 的 test_file_scope_array / test_unknown_length）。 */
     /* 静态存储期的闭包只能用 NULL 起步：闭包对象是运行期现开的
      * （tests/errors/closure_convert.c6 的 test_static / test_static_local）。 */
-    if (ty_is_closure(ty, NULL) && !pa_is_punct("{") && in_c6_tu()) {
+    if (ty_is_closure(ty, NULL) && !pa_is_ch('{') && in_c6_tu()) {
         Tok *t0 = pa_cur();
 
         if (!(t0 && ((t0->kind == TK_NUM && tok_data(t0)[0] == '0')
@@ -12553,7 +12604,7 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
             pa_error("a closure is not a constant expression: initialize it at run "
                      "time ('NULL' is fine at file scope)");
     }
-    if (ty_is_slice(ty) && !pa_is_punct("{") && in_c6_tu()) {
+    if (ty_is_slice(ty) && !pa_is_ch('{') && in_c6_tu()) {
         pa_error("a slice cannot be initialized from an array in a static "
                  "initializer; use '{ data, len }'");
     }
@@ -12571,25 +12622,25 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
 
         gen_glob_braced_new(goff, ty, off);
         while (ex--)
-            pa_expect_punct(")");
+            pa_expect_ch(')');
         return;
     }
     /* 标量上的花括号（`(int){5}` / `{ {5} }`）：剥一层再走标量那条路 */
-    if (!ty_is_agg(ty) && !ty_is_array(ty) && pa_is_punct("{")) {
+    if (!ty_is_agg(ty) && !ty_is_array(ty) && pa_is_ch('{')) {
         pa_advance();
         gen_glob_obj(goff, ty, off);
-        while (!pa_is_punct("}") && pa_cur()->kind != TK_EOF) {
-            if (!pa_accept_punct(","))
+        while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF) {
+            if (!pa_accept_ch(','))
                 break;
-            if (pa_is_punct("}"))
+            if (pa_is_ch('}'))
                 break;
             init_skip_value();
         }
-        pa_expect_punct("}");
+        pa_expect_ch('}');
         return;
     }
     if (ty_is_agg(ty) || ty_is_array(ty)) {
-        if (pa_is_punct("{")) {
+        if (pa_is_ch('{')) {
             gen_glob_braced_new(goff, ty, off);
             return;
         }
@@ -12636,7 +12687,7 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
      * 以前这条路只认数字/浮点，函数名和全局符号名落进去就是 0——静态函数
      * 指针表整张都是空的（tcc 的 90_struct-init 正是这么崩的）。 */
     if (ty_is_ptr(ty)) {
-        int amp = pa_accept_punct("&");
+        int amp = pa_accept_ch('&');
 
         if (pa_cur()->kind == TK_IDENT) {
             Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
@@ -12647,8 +12698,8 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
                 if (t->is_func)
                     sym = x64_sym(&X64, arena_strndup(&A_main, tok_data(pa_cur()), pa_cur()->len));
                 pa_advance();
-                if (!pa_is_punct("[") && !pa_is_punct(".") && !pa_is_punct("+")
-                    && !pa_is_punct("-")) {
+                if (!pa_is_ch('[') && !pa_is_ch('.') && !pa_is_ch('+')
+                    && !pa_is_ch('-')) {
                     data_fixup_add(goff + off, sym);
                     return;
                 }
@@ -12665,8 +12716,8 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
         {
             double dv = 0;
 
-            if (pa_cur()->kind == TK_NUM || pa_is_punct("-") || pa_is_punct("+")
-                || pa_is_punct("(")) {
+            if (pa_cur()->kind == TK_NUM || pa_is_ch('-') || pa_is_ch('+')
+                || pa_is_ch('(')) {
                 int ok = 1;
 
                 dv = const_fexpr(&ok);
@@ -12726,12 +12777,12 @@ static void gen_init_obj(u32 addr, u32 ty, u32 off);
 static void gen_desig_fill(u32 addr, u32 ty, u32 off)
 {
     for (;;) {
-        if (pa_accept_punct("[")) {
+        if (pa_accept_ch('[')) {
             u32 i = 0;
             u32 et = 0;
 
             i = (u32)const_expr();
-            pa_expect_punct("]");
+            pa_expect_ch(']');
             if (!ty_is_array(ty)) {
                 pa_error("下标指示符用在了非数组上");
                 return;
@@ -12743,7 +12794,7 @@ static void gen_desig_fill(u32 addr, u32 ty, u32 off)
             off += i * ty_size(et);
             continue;
         }
-        if (pa_accept_punct(".")) {
+        if (pa_accept_ch('.')) {
             const char *nm = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : NULL;
             u32 nl = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
             int idx = 0;
@@ -12770,7 +12821,7 @@ static void gen_desig_fill(u32 addr, u32 ty, u32 off)
         }
         break;
     }
-    pa_expect_punct("=");
+    pa_expect_ch('=');
     gen_init_obj(addr, ty, off);
 }
 
@@ -12785,32 +12836,32 @@ static void gen_init_braced(u32 addr, u32 ty, u32 off)
         u32 n = ty_array_n(ty);
 
         for (;;) {
-            if (pa_is_punct("}") || pa_cur()->kind == TK_EOF)
+            if (pa_is_ch('}') || pa_cur()->kind == TK_EOF)
                 break;
-            if (!first && !pa_accept_punct(","))
+            if (!first && !pa_accept_ch(','))
                 break;
             first = 0;
-            if (pa_is_punct("}"))
+            if (pa_is_ch('}'))
                 break;
-            if (pa_accept_punct("[")) {
+            if (pa_accept_ch('[')) {
                 u32 lo = (u32)const_expr();
                 u32 hi = lo;
                 u32 k = 0;
 
                 if (pa_accept_punct("..."))
                     hi = (u32)const_expr();
-                pa_expect_punct("]");
-                if (pa_is_punct(".") || pa_is_punct("[")) {
+                pa_expect_ch(']');
+                if (pa_is_ch('.') || pa_is_ch('[')) {
                     gen_desig_fill(addr, et, off + lo * esz);   /* 链式：只填首元素 */
                 } else {
-                    pa_expect_punct("=");
+                    pa_expect_ch('=');
                     for (k = lo; k <= hi && k < n; k++)
                         gen_init_obj(addr, et, off + k * esz);
                 }
                 cur = hi + 1;
                 continue;
             }
-            if (pa_is_punct(".") && ty_is_agg(ty))
+            if (pa_is_ch('.') && ty_is_agg(ty))
                 break;                       /* 走到下面的聚合分支 */
             if (cur >= n) {
                 skip_init_list();
@@ -12825,7 +12876,7 @@ static void gen_init_braced(u32 addr, u32 ty, u32 off)
     }
     if (!ty_is_agg(ty)) {
         /* 标量套了一层花括号：{5} */
-        if (ty_member_n(ty) == 0 && !pa_is_punct("}")) {
+        if (ty_member_n(ty) == 0 && !pa_is_ch('}')) {
             gen_init_obj(addr, ty, off);
             return;
         }
@@ -12834,14 +12885,14 @@ static void gen_init_braced(u32 addr, u32 ty, u32 off)
         u32 n = ty_member_n(ty);
 
         for (;;) {
-            if (pa_is_punct("}") || pa_cur()->kind == TK_EOF)
+            if (pa_is_ch('}') || pa_cur()->kind == TK_EOF)
                 break;
-            if (!first && !pa_accept_punct(","))
+            if (!first && !pa_accept_ch(','))
                 break;
             first = 0;
-            if (pa_is_punct("}"))
+            if (pa_is_ch('}'))
                 break;
-            if (pa_accept_punct(".")) {
+            if (pa_accept_ch('.')) {
                 const char *nm = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : NULL;
                 u32 nl = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
                 int idx = 0;
@@ -12858,10 +12909,10 @@ static void gen_init_braced(u32 addr, u32 ty, u32 off)
                     break;
                 }
                 idx = agg_find_member(ty, nm, nl);
-                if (pa_is_punct(".") || pa_is_punct("[")) {
+                if (pa_is_ch('.') || pa_is_ch('[')) {
                     gen_desig_fill(addr, mty, off + moff);
                 } else {
-                    pa_expect_punct("=");
+                    pa_expect_ch('=');
                     gen_init_obj(addr, mty, off + moff);
                 }
                 cur = idx >= 0 ? (u32)idx + 1 : 0;
@@ -13244,12 +13295,12 @@ static int init_desig(u32 *ty, u32 *off)
             INIT_COLON = 1;
             continue;
         }
-        if (pa_accept_punct("[")) {
+        if (pa_accept_ch('[')) {
             u32 i = 0;
             u32 et = 0;
 
             i = (u32)const_expr();
-            pa_expect_punct("]");
+            pa_expect_ch(']');
             if (!ty_is_array(*ty)) {
                 pa_error("设计符 '[...]' 用在了非数组上");
                 return 0;
@@ -13261,7 +13312,7 @@ static int init_desig(u32 *ty, u32 *off)
             *off += i * ty_size(et);
             continue;
         }
-        if (pa_accept_punct(".")) {
+        if (pa_accept_ch('.')) {
             const char *nm = pa_cur()->kind == TK_IDENT ? tok_data(pa_cur()) : NULL;
             u32 nl = pa_cur()->kind == TK_IDENT ? pa_cur()->len : 0;
             u32 mty = 0;
@@ -13291,10 +13342,10 @@ static void init_brace(u32 ty, u32 off)
 {
     u32 my = 0;
 
-    pa_expect_punct("{");
+    pa_expect_ch('{');
     if (LV_DEPTH >= INIT_LV_MAX - 1) {
         skip_init_list();
-        pa_expect_punct("}");
+        pa_expect_ch('}');
         return;
     }
     my = LV_DEPTH;
@@ -13303,7 +13354,7 @@ static void init_brace(u32 ty, u32 off)
     LV_DEPTH = my + 1;
     init_body(my);
     LV_DEPTH = my;
-    pa_expect_punct("}");
+    pa_expect_ch('}');
     /* 零字节的聚合成员（`struct {} empty;`）不占叶子，游标要**停在原地**：
      * 加 1 会把它推过下一个成员，`{ 1, (empty_s){}, 022 }` 里的 022 就被
      * 「游标走完了」那条早退吞掉了。 */
@@ -13337,25 +13388,25 @@ static void init_body(u32 top)
     int first = 1;
 
     for (;;) {
-        if (pa_is_punct("}") || pa_cur()->kind == TK_EOF)
+        if (pa_is_ch('}') || pa_cur()->kind == TK_EOF)
             break;
-        if (!first && !pa_accept_punct(","))
+        if (!first && !pa_accept_ch(','))
             break;
         first = 0;
-        if (pa_is_punct("}"))
+        if (pa_is_ch('}'))
             break;
         /* 游标走完了：多余的值吞掉别报错。但**设计符不算多余**——它会把
          * 游标拽回去（`{.b = 8, .a = 7}` 里第二个设计符是往回走的），
          * 早退会把它静默丢掉。 */
         if (INIT_CUR >= LF_N
-            && !(pa_is_punct("[") || pa_is_punct(".")
+            && !(pa_is_ch('[') || pa_is_ch('.')
                  || (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
                      && tok_eq(pa_peek(1), ":")))) {
             skip_init_list();
             break;
         }
         /* 区间设计符 `[lo ... hi] = v` */
-        if (pa_is_punct("[") && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT
+        if (pa_is_ch('[') && pa_peek(2) && pa_peek(2)->kind == TK_PUNCT
             && tok_eq(pa_peek(2), "...")) {
             u32 bty = LV_TY[top];
             u32 boff = LV_OFF[top];
@@ -13367,8 +13418,8 @@ static void init_body(u32 top)
             lo = (u32)const_expr();
             pa_expect_punct("...");
             hi = (u32)const_expr();
-            pa_expect_punct("]");
-            pa_expect_punct("=");
+            pa_expect_ch(']');
+            pa_expect_ch('=');
             if (!ty_is_array(bty)) {
                 pa_error("区间设计符只能用在数组上");
                 init_skip_value();
@@ -13381,7 +13432,7 @@ static void init_body(u32 top)
 
                 /* 值只求一次，然后抄给区间里的每个元素（C 就是这么规定的；
                  * `[6 ... 10] = elt` 里 elt 是个变量，重复解析根本做不到）。 */
-                if (pa_is_punct("{")) {
+                if (pa_is_ch('{')) {
                     /* `[0 ... 2] = {{3,4,5},{6,7,8}}`：花括号只能解析一次，
                      * 所以先填第一个元素，再把它的字节抄给区间里其余元素
                      * （数据段直接 memcpy；局部变量用 IR_MEMCPY）。 */
@@ -13417,7 +13468,7 @@ static void init_body(u32 top)
                     Tok *vt = pa_cur();
                     Sym *gs = NULL;
 
-                    (void)pa_accept_punct("&");
+                    (void)pa_accept_ch('&');
                     vt = pa_cur();
                     if (vt->kind == TK_IDENT)
                         gs = sym_find(tok_data(vt), vt->len);
@@ -13458,7 +13509,7 @@ static void init_body(u32 top)
             }
             continue;
         }
-        if (pa_is_punct("[") || pa_is_punct(".")
+        if (pa_is_ch('[') || pa_is_ch('.')
             || (pa_cur()->kind == TK_IDENT && pa_peek(1)->kind == TK_PUNCT
                 && tok_eq(pa_peek(1), ":"))) {
             u32 dty = LV_TY[top];
@@ -13473,12 +13524,12 @@ static void init_body(u32 top)
             if (li < LF_N && LF_OFF[li] != doff)
                 li = LF_N;
             INIT_CUR = li;
-            if (!pa_accept_punct("=") && !INIT_COLON) {
+            if (!pa_accept_ch('=') && !INIT_COLON) {
                 pa_error("设计符后面要 '='");
                 init_skip_value();
                 continue;
             }
-            if (pa_is_punct("{")) {
+            if (pa_is_ch('{')) {
                 init_brace(dty, doff);
                 continue;
             }
@@ -13537,7 +13588,7 @@ static void init_body(u32 top)
         /* `{ (char *)"html", … }`：字符串字面量外面套一层强转。以前只有裸
          * 字面量才认，套了 `(char *)` 就走到 const_expr，报"要一个常量表达式"
          * （std/net/mime.c6 的 mime_tab）。 */
-        if (INIT_IS_GLOB && !pa_is_compound_lit() && pa_is_punct("(")
+        if (INIT_IS_GLOB && !pa_is_compound_lit() && pa_is_ch('(')
             && is_typename_tok(pa_peek(1)) && INIT_CUR < LF_N
             && ty_is_ptr(LF_TY[INIT_CUR])) {
             u32 li2 = INIT_CUR;
@@ -13546,7 +13597,7 @@ static void init_body(u32 top)
             /* pa_take_paren_type 遇到 `(char *)` 会停在 `*` 上（指针归声明符管），
              * 所以 `*` 和 `)` 都自己吃掉 */
             for (;;) {
-                if (pa_is_punct("*") || pa_is_punct(")")) {
+                if (pa_is_ch('*') || pa_is_ch(')')) {
                     pa_advance();
                     continue;
                 }
@@ -13582,13 +13633,13 @@ static void init_body(u32 top)
 
                 init_brace(tty, toff);
                 while (ex--)
-                    pa_expect_punct(")");
+                    pa_expect_ch(')');
             } else {
                 (void)pa_skip_empty_compound();
             }
             continue;
         }
-        if (pa_is_punct("{")) {
+        if (pa_is_ch('{')) {
             u32 d = top + 1;
             u32 tgt_ty = 0;
             u32 tgt_off = 0;
@@ -13617,19 +13668,19 @@ static void init_body(u32 top)
                 u32 li = INIT_CUR;
 
                 pa_advance();
-                if (!pa_is_punct("}")) {
+                if (!pa_is_ch('}')) {
                     if (li < LF_N)
                         init_store(LF_OFF[li], LF_TY[li], LF_BITS[li], LF_BOFF[li]);
                     else
                         skip_init_list();
-                    while (pa_accept_punct(",")) {
-                        if (pa_is_punct("}"))
+                    while (pa_accept_ch(',')) {
+                        if (pa_is_ch('}'))
                             break;
                         init_skip_value();
                     }
                 }
                 INIT_CUR = li + 1;
-                pa_expect_punct("}");
+                pa_expect_ch('}');
             }
             continue;
         }
@@ -13709,7 +13760,7 @@ static void gen_glob_braced_new(u32 goff, u32 ty, u32 off)
         INIT_CUR = save_cur;
         pa_advance();                       /* 对象太大：退回旧实现 */
         gen_glob_braced(goff, ty, off);
-        pa_expect_punct("}");
+        pa_expect_ch('}');
         return;
     }
     INIT_IS_GLOB = 1;
@@ -13746,7 +13797,7 @@ static void gen_local_braced_new(u32 addr, u32 ty, u32 off)
         INIT_CUR = save_cur;
         pa_advance();                       /* 对象太大：退回旧实现 */
         gen_init_braced(addr, ty, off);
-        pa_expect_punct("}");
+        pa_expect_ch('}');
         return;
     }
     INIT_IS_GLOB = 0;
@@ -13775,26 +13826,26 @@ static void gen_init_obj(u32 addr, u32 ty, u32 off)
 
         gen_local_braced_new(addr, ty, off);
         while (ex--)
-            pa_expect_punct(")");
+            pa_expect_ch(')');
         return;
     }
     /* 标量上的花括号：`(int){5}`、`{ {5} }`。C 允许给标量套花括号，
      * 但叶子引擎只吃聚合，所以这里自己剥一层（多出来的项按 GNU 语义忽略）。 */
-    if (!ty_is_agg(ty) && !ty_is_array(ty) && pa_is_punct("{")) {
+    if (!ty_is_agg(ty) && !ty_is_array(ty) && pa_is_ch('{')) {
         pa_advance();
         gen_init_obj(addr, ty, off);
-        while (!pa_is_punct("}") && pa_cur()->kind != TK_EOF) {
-            if (!pa_accept_punct(","))
+        while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF) {
+            if (!pa_accept_ch(','))
                 break;
-            if (pa_is_punct("}"))
+            if (pa_is_ch('}'))
                 break;
             init_skip_value();
         }
-        pa_expect_punct("}");
+        pa_expect_ch('}');
         return;
     }
     if (ty_is_agg(ty) || ty_is_array(ty)) {
-        if (pa_is_punct("{")) {
+        if (pa_is_ch('{')) {
             gen_local_braced_new(addr, ty, off);
             return;
         }
@@ -13980,7 +14031,7 @@ static void gen_one_local(u32 ty, Declarator *d)
      * 本来就是 0）。这跟 C 的"未初始化是未定义值"不是一回事：c6 认为读
      * 一个没写过初值的变量一定是 bug。 */
     if (in_c6_tu() && !PA_TMPL_BODY && !PA_SIG_ONLY && !PA_STATIC && !PA_EXTERN && !ty_is_func(ty)
-        && !d->vla && !pa_is_punct("=") && !pa_is_punct("{"))
+        && !d->vla && !pa_is_ch('=') && !pa_is_ch('{'))
         pa_error("variable '%s' must be initialized",
                  arena_strndup(&A_main, d->name, d->nlen));
     if (in_c6_tu() && !PA_SIG_ONLY && !d->mgd && ty_has_mgd(ty)) {
@@ -14060,7 +14111,7 @@ static void gen_one_local(u32 ty, Declarator *d)
         Tok *body = NULL;
         u32 nbody = 0;
 
-        if (pa_is_punct("=") && pa_peek(1)->kind == TK_PUNCT
+        if (pa_is_ch('=') && pa_peek(1)->kind == TK_PUNCT
             && tok_eq(pa_peek(1), "{")) {
             body = arena_alloc(&A_main, (size_t)CAP_MAX * sizeof(Tok));
             pa_advance();                  /* 吃掉 `=`，游标停到 `{` */
@@ -14082,7 +14133,7 @@ static void gen_one_local(u32 ty, Declarator *d)
             s->type = ty_array(et, cnt);
             return;
         }
-        if (pa_accept_punct("=")) {
+        if (pa_accept_ch('=')) {
             gen_init_obj(ident_addr(s), ty_array(et, capn), 0);
             cnt = INIT_CNT_OK ? INIT_COUNT : capn;
             s->type = ty_array(et, cnt);
@@ -14097,8 +14148,8 @@ static void gen_one_local(u32 ty, Declarator *d)
         s = sym_add(d->name, d->nlen, ty, SC_LOCAL);
         s->slot = frame_slots_for(ty_size(ty));
         gen_zero_obj(ident_addr(s), ty_size(ty));
-        if (pa_accept_punct("=")) {
-            if (pa_is_punct("{")) {
+        if (pa_accept_ch('=')) {
+            if (pa_is_ch('{')) {
                 gen_init_obj(ident_addr(s), ty, 0);
             } else {
                 u32 r0 = gen_assign();
@@ -14126,13 +14177,13 @@ static void gen_one_local(u32 ty, Declarator *d)
             s->is_own = (u8)(d->mgd_kind == 2 ? 1 : 0);
         }
         gen_zero_obj(ident_addr(s), sz);
-        if (pa_accept_punct("="))
+        if (pa_accept_ch('='))
             gen_init_obj(ident_addr(s), ty, 0);
     } else {
         s->slot = irfn_vreg(&FN);
-        if (ty == ty_thread() && !pa_is_punct("="))
+        if (ty == ty_thread() && !pa_is_ch('='))
             pa_error("task/thread 声明要带初始化器，类型从初始化器推出来");
-        if (pa_accept_punct("=")) {
+        if (pa_accept_ch('=')) {
             u32 r0 = 0;
             u32 vty = 0;
             int rmgd = 0;
@@ -14269,7 +14320,7 @@ static void gen_local_decl(int need_semi)
         if (d2.name)
             sym_add(d2.name, d2.nlen, t2, SC_TYPEDEF);
         if (need_semi)
-            pa_expect_punct(";");
+            pa_expect_ch(';');
         return;
     }
     PA_STATIC = 0;
@@ -14310,11 +14361,11 @@ static void gen_local_decl(int need_semi)
             if (vs && cs && cs->is_func)
                 gen_cleanup_defer(vs, cs);
         }
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
     if (need_semi)
-        pa_expect_punct(";");
+        pa_expect_ch(';');
     }
 }
 
@@ -14649,7 +14700,7 @@ static void gen_destructure(void)
             /* `(int q, …)`：类型 + 名字 */
             u32 ty = parse_typespec();
 
-            while (pa_accept_punct("*"))
+            while (pa_accept_ch('*'))
                 ty = ty_ptr(ty);
             if (pa_cur()->kind != TK_IDENT) {
                 pa_error("解构模式里要一个名字");
@@ -14681,12 +14732,12 @@ static void gen_destructure(void)
             (void)lv;
         }
         n++;
-        if (pa_accept_punct(","))
+        if (pa_accept_ch(','))
             continue;
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         break;
     }
-    pa_expect_punct("=");
+    pa_expect_ch('=');
     /* 所有元素都是 `_`：这个解构什么都不做（tests/errors/tuple.c6 的
      * test_all_discard）。 */
     {
@@ -14701,7 +14752,7 @@ static void gen_destructure(void)
     }
     v = value_of(gen_assign());
     vty = cur_op_ty();
-    pa_expect_punct(";");
+    pa_expect_ch(';');
     if (!ty_is_agg(vty)) {
         pa_error("解构的右边不是元组");
         return;
@@ -14732,19 +14783,19 @@ static void gen_destructure(void)
 
 static void gen_block(void)
 {
-    pa_expect_punct("{");
+    pa_expect_ch('{');
     scope_enter();
     DEF_DEPTH++;
     if (NLOOP > 0 && NLOOP - 1 < PA_MAXLOOP && !LOOP_BODY[NLOOP - 1])
         LOOP_BODY[NLOOP - 1] = SCOPE;
-    while (!pa_is_punct("}") && pa_cur()->kind != TK_EOF)
+    while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF)
         gen_stmt();
     defer_run_pop(DEF_DEPTH);
     DEF_DEPTH--;
     if (SCOPE && SCOPE->vla_save)
         irfn_push(&FN, IR_SETRSP, IRT_VOID, 0, (u16)SCOPE->vla_save, 0, 0, 0);
     scope_leave();
-    pa_expect_punct("}");
+    pa_expect_ch('}');
 }
 
 static void gen_switch(void)
@@ -14762,12 +14813,12 @@ static void gen_switch(void)
         pa_error("switch 嵌套太深（上限 %d）", SW_MAX);
         return;
     }
-    pa_expect_punct("(");
+    pa_expect_ch('(');
     cv = value_of(gen_expr());
     /* case 区间比较的符号性跟 switch 表达式一致：`case 10^18ULL ... 10^19ULL`
      * 用有符号的 jle 会把上界当负数，整个区间恒不匹配（踩过）。 */
     sw_uns = !ty_is_signed(GEN_TY);
-    pa_expect_punct(")");
+    pa_expect_ch(')');
     si = NSW++;
     st = &SW[si];
     memset(st, 0, sizeof(*st));
@@ -15066,7 +15117,7 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
     if (iso && !mem)
         return 0;
     pa_advance();
-    if (!pa_is_punct("("))
+    if (!pa_is_ch('('))
         return 0;
     pa_advance();
     ASM_UNBAL++;
@@ -15104,7 +15155,7 @@ static int asm_one_operand(AxBind *binds, u32 *nbinds, char **otext)
     } else {
         return 0;
     }
-    if (!pa_accept_punct(")"))
+    if (!pa_accept_ch(')'))
         return 0;
     ASM_UNBAL--;
     (void)isread;
@@ -15119,7 +15170,7 @@ static int asm_operand_list(AxBind *binds, u32 *nbinds, char **otext)
     for (;;) {
         if (!asm_one_operand(binds, nbinds, otext))
             return 0;
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
     return 1;
@@ -15131,7 +15182,7 @@ static void asm_skip_clobbers(void)
 {
     while (pa_cur()->kind == TK_STR) {
         pa_advance();
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
 }
@@ -15148,7 +15199,7 @@ static void asm_label_list(AxGoto *gt, u32 *ngt)
             (*ngt)++;
         }
         pa_advance();
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
 }
@@ -15165,9 +15216,9 @@ static void asm_skip_group(void)
     ASM_UNBAL = 0;
 
     while (pa_cur()->kind != TK_EOF) {
-        if (pa_is_punct("(")) {
+        if (pa_is_ch('(')) {
             depth++;
-        } else if (pa_is_punct(")")) {
+        } else if (pa_is_ch(')')) {
             depth--;
             if (!depth) {
                 pa_advance();
@@ -15207,10 +15258,10 @@ static int try_stmt_asm(void)
             isn = 1;
         pa_advance();
     }
-    if (!pa_is_punct("(")) {
-        while (!pa_is_punct(";") && pa_cur()->kind != TK_EOF)
+    if (!pa_is_ch('(')) {
+        while (!pa_is_ch(';') && pa_cur()->kind != TK_EOF)
             pa_advance();
-        if (pa_is_punct(";"))
+        if (pa_is_ch(';'))
             pa_advance();
         return 1;
     }
@@ -15223,28 +15274,28 @@ static int try_stmt_asm(void)
         ok = 0;
     }
     /* 输出段 / 输入段 / clobber 段 / 标号段（后面几段都可以没有） */
-    if (ok && pa_accept_punct(":")) {
+    if (ok && pa_accept_ch(':')) {
         ok = asm_operand_list(binds, &nbinds, otext);
-        if (ok && pa_accept_punct(":")) {
+        if (ok && pa_accept_ch(':')) {
             ok = asm_operand_list(binds, &nbinds, otext);
-            if (ok && pa_accept_punct(":")) {
+            if (ok && pa_accept_ch(':')) {
                 asm_skip_clobbers();
-                if (pa_accept_punct(":") && isn)
+                if (pa_accept_ch(':') && isn)
                     asm_label_list(gts, &ngts);
             }
         }
     }
     if (!ok || !tpl) {
         asm_skip_group();
-        if (pa_is_punct(";"))
+        if (pa_is_ch(';'))
             pa_advance();
         return 1;
     }
-    if (pa_is_punct(")"))
+    if (pa_is_ch(')'))
         pa_advance();
     else
         asm_skip_group();
-    if (pa_is_punct(";"))
+    if (pa_is_ch(';'))
         pa_advance();
     txt = asm_subst(tpl, tlen, otext, nbinds, &xlen);
     if (!txt)
@@ -15273,10 +15324,10 @@ static int try_toplevel_asm(void)
            || pa_is_ident("__inline__")) {
         pa_advance();
     }
-    if (!pa_is_punct("(")) {
-        while (!pa_is_punct(";") && pa_cur()->kind != TK_EOF)
+    if (!pa_is_ch('(')) {
+        while (!pa_is_ch(';') && pa_cur()->kind != TK_EOF)
             pa_advance();
-        if (pa_is_punct(";"))
+        if (pa_is_ch(';'))
             pa_advance();
         return 1;
     }
@@ -15284,11 +15335,11 @@ static int try_toplevel_asm(void)
     if (pa_cur()->kind == TK_STR)
         tpl = asm_concat_str(&tlen);
     /* 文件作用域上不该有操作数；有多余的东西就整组跳掉，别乱吃 token */
-    if (pa_is_punct(")"))
+    if (pa_is_ch(')'))
         pa_advance();
     else
         asm_skip_group();
-    if (pa_is_punct(";"))
+    if (pa_is_ch(';'))
         pa_advance();
     if (tpl && tlen && asmx_piece(tpl, tlen, NULL, 0, NULL, 0, &idx))
         (void)asmx_flush(&X64, idx);
@@ -15304,7 +15355,7 @@ static int try_pack_directive(void)
     if (!PACK_SEEN || !pa_is_ident("__c6_pack"))
         return 0;
     pa_advance();
-    pa_expect_punct("(");
+    pa_expect_ch('(');
     if (pa_cur()->kind == TK_NUM) {
         char nb[24] = {0};
         u32 k = pa_cur()->len < 20 ? pa_cur()->len : 20;
@@ -15314,8 +15365,8 @@ static int try_pack_directive(void)
         v = strtol(nb, NULL, 0);
         pa_advance();
     }
-    pa_expect_punct(")");
-    pa_accept_punct(";");
+    pa_expect_ch(')');
+    pa_accept_ch(';');
     TY_PACK = (int)v;
     return 1;
 }
@@ -15466,13 +15517,13 @@ static void gen_stmt(void)
         if (PA_IN_DEFER)
             pa_error("'goto' is not allowed in a defer body");
         PA_LAST_TERM = 1;
-        if (pa_is_punct("*")) {
+        if (pa_is_ch('*')) {
             /* GNU 计算 goto：`goto *expr;` */
             u32 v = 0;
 
             pa_advance();
             v = value_of(gen_expr());
-            pa_expect_punct(";");
+            pa_expect_ch(';');
             gen_vla_restore();
             irfn_push(&FN, IR_JMPIND, IRT_VOID, 0, (u16)v, 0, 0, 0);
             return;
@@ -15483,7 +15534,7 @@ static void gen_stmt(void)
             int ld = 0;
 
             pa_advance();
-            pa_expect_punct(";");
+            pa_expect_ch(';');
             /* 前向 goto 这时还不知道标号在多深（按老规矩全跑一遍）；
              * 向后 goto 标号已经定义过，深度是准的。 */
             int fwd = 1;
@@ -15508,9 +15559,9 @@ static void gen_stmt(void)
             irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)l, 0, 0, 0);
         } else {
             pa_error("goto 后面要标号名或 '*' 表达式");
-            while (!pa_is_punct(";") && pa_cur()->kind != TK_EOF)
+            while (!pa_is_ch(';') && pa_cur()->kind != TK_EOF)
                 pa_advance();
-            if (pa_is_punct(";"))
+            if (pa_is_ch(';'))
                 pa_advance();
         }
         return;
@@ -15541,7 +15592,7 @@ static void gen_stmt(void)
                       x64_sym(&X64, "__c6_co_detach"));
             FN.ops[FN.n - 1].narg = 1;
         }
-        pa_expect_punct(";");
+        pa_expect_ch(';');
         return;
     }
     /* 名字标号：IDENT ':' */
@@ -15563,7 +15614,7 @@ static void gen_stmt(void)
          * 条件为假时照样执行——tcc 里 `if (t0 == TOK_PPJOIN) bad_twosharp: …`
          * 就是靠这个把每一条 #define 都判成错的。C 里标号后面一定跟语句，
          * 只有 `lab: }`（C23）这种才没有。 */
-        if (!pa_is_punct("}"))
+        if (!pa_is_ch('}'))
             gen_stmt();
         return;
     }
@@ -15579,7 +15630,7 @@ static void gen_stmt(void)
             hi = const_expr();
             is_range = 1;
         }
-        pa_expect_punct(":");
+        pa_expect_ch(':');
         lbl = irfn_label(&FN);
         if (NSW > 0 && SW[NSW - 1].ncase < SW_MAXCASE) {
             SwCase *c = &SW[NSW - 1].cs[SW[NSW - 1].ncase++];
@@ -15595,7 +15646,7 @@ static void gen_stmt(void)
         return;
     }
     if (pa_accept_ident("default")) {
-        pa_expect_punct(":");
+        pa_expect_ch(':');
         if (NSW > 0) {
             SW[NSW - 1].has_def = 1;
             irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)SW[NSW - 1].def_lbl, 0, 0, 0);
@@ -15608,11 +15659,11 @@ static void gen_stmt(void)
         gen_switch();
         return;
     }
-    if (pa_is_punct("{")) {
+    if (pa_is_ch('{')) {
         gen_block();
         return;
     }
-    if (pa_accept_punct(";"))
+    if (pa_accept_ch(';'))
         return;
     if (pa_accept_ident("return")) {
         if (PA_IN_DEFER)
@@ -15625,7 +15676,7 @@ static void gen_stmt(void)
         /* `return err(...)` 是错误路径：errdefer 也要跑。其余正常路径只跑 defer。 */
         if (pa_is_ident("err") && pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "("))
             on_err = 1;
-        if (pa_is_punct(";")) {
+        if (pa_is_ch(';')) {
             pa_advance();
             if (CUR_TASK_TY) {
                 /* `async void f()`：`return;` 也得把任务结构交出去——
@@ -15644,7 +15695,7 @@ static void gen_stmt(void)
         }
         /* `return {a, b};`：按返回类型就地初始化一个临时聚合，返回它的地址
          * （元组/struct 的按值返回本来就走"地址"这条约定）。 */
-        if (pa_is_punct("{") && ty_is_agg(CUR_TASK_TY ? CUR_TASK_VAL : CUR_RET_TY)) {
+        if (pa_is_ch('{') && ty_is_agg(CUR_TASK_TY ? CUR_TASK_VAL : CUR_RET_TY)) {
             u32 aty = CUR_TASK_TY ? CUR_TASK_VAL : CUR_RET_TY;
             u32 sz = ty_size(aty);
             u32 slot = frame_slots_for(sz ? sz : 8);
@@ -15652,7 +15703,7 @@ static void gen_stmt(void)
 
             irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)addr, 0, 0, 0, X64_SLOT(slot));
             gen_init_obj(addr, aty, 0);
-            pa_expect_punct(";");
+            pa_expect_ch(';');
             if (CUR_TASK_TY) {
                 /* async：值放进任务结构的 val（偏移 0），返回任务指针 */
                 u32 tsk = task_get();
@@ -15715,7 +15766,7 @@ static void gen_stmt(void)
                 if (PEND_MGD_SYM && PEND_MGD_SYM->kind == SC_LOCAL)
                     DF_EXCEPT = PEND_MGD_SYM->slot;
                 v = value_of(v);
-                pa_expect_punct(";");
+                pa_expect_ch(';');
                 tsk = task_get();
                 voff = task_val_off();
                 dst2 = tsk;
@@ -15743,7 +15794,7 @@ static void gen_stmt(void)
             } else if (ret_mgd) {
                 u32 rv = 0;
 
-                pa_expect_punct(";");
+                pa_expect_ch(';');
                 rv = value_of(v);
                 mgd_retain(rv);
                 v = rv;
@@ -15759,7 +15810,7 @@ static void gen_stmt(void)
              * （tests/tuple_async.c6 的嵌套 await 踩过）。 */
             if (!(CUR_TASK_TY && ty_is_agg(rty)))
                 v = value_of(v);
-            pa_expect_punct(";");
+            pa_expect_ch(';');
             /* 按**函数声明的返回类型**转换。少了这步，返回 signed char 的函数
              * 会把 0x80 原样带回去（调用方按 signed char 解释就是 +128），返回
              * float 的函数会把 double 的位模式整个带回去（踩过）。 */
@@ -15830,9 +15881,9 @@ static void gen_stmt(void)
         u32 lend = irfn_label(&FN);
         u32 c = 0;
 
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         c = value_of(gen_expr());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)lthen, (u16)lelse, 0);
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lthen, 0, 0, 0);
         gen_stmt();
@@ -15885,8 +15936,8 @@ static void gen_stmt(void)
         u32 rhi = 0;
 
         scope_enter();
-        pa_expect_punct("(");
-        two = pa_accept_punct("(");
+        pa_expect_ch('(');
+        two = pa_accept_ch('(');
         for (;;) {
             Declarator dn = {0};
             u32 t1 = 0;
@@ -15896,7 +15947,7 @@ static void gen_stmt(void)
             {
                 int head_ty = is_typename_tok(pa_cur());
 
-                if (pa_is_punct("@") || pa_is_ident("shared") || pa_is_ident("weak")
+                if (pa_is_ch('@') || pa_is_ident("shared") || pa_is_ident("weak")
                     || pa_is_ident("own"))
                     head_ty = 1;      /* `@T` / `shared @T` 也是类型写法 */
                 if (!head_ty && pa_cur()->kind == TK_IDENT) {
@@ -15949,12 +16000,12 @@ static void gen_stmt(void)
                 }
                 nb++;
             }
-            if (!pa_accept_punct(","))
+            if (!pa_accept_ch(','))
                 break;
         }
         if (two)
-            pa_expect_punct(")");
-        pa_expect_punct("=");
+            pa_expect_ch(')');
+        pa_expect_ch('=');
         {
             int had_lval = PEND_LVAL;
             int iv_lval = 0;
@@ -15987,16 +16038,16 @@ static void gen_stmt(void)
              * `had_lval` 是**进 gen_assign 之前**的快照，和 `lo` 是不是左值没
              * 关系；下界是变量时 `iv` 拿到的是它的地址，当循环下界用就一次都
              * 不转（`foreach (int i = lo:hi)`）。 */
-            if (two && pa_is_punct(":"))
+            if (two && pa_is_ch(':'))
                 pa_error("a range yields only an index");
-            if (!two && nb >= 1 && pa_is_punct(":")) {
+            if (!two && nb >= 1 && pa_is_ch(':')) {
                 rlo = iv_lval ? load_lval(base, ivty) : value_of(iv);
                 pa_advance();
                 rhi = value_of(gen_assign());
                 is_range = 1;
                 islot = bsl[0];
                 nslot = 0;
-                pa_expect_punct(")");
+                pa_expect_ch(')');
                 goto range_done;
             }
             pslot = irfn_vreg(&FN);
@@ -16156,7 +16207,7 @@ static void gen_stmt(void)
                 irfn_push(&FN, IR_CONST, IRT_U64, (u16)nslot, 0, 0, 0, 0);
             }
         }
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         vbind = two ? (nb >= 2 ? bsl[1] : 0) : bsl[0];
         if (is_iter) {
             /* while (has(&it)) { v = next(&it); body } */
@@ -16217,7 +16268,7 @@ static void gen_stmt(void)
         NLOOP++;
             gen_vla_loop_push();
             mv_loop_enter();
-            if (pa_is_punct("{"))
+            if (pa_is_ch('{'))
                 gen_block();
             else
                 pa_error("foreach 后面要一个 { … } 块");
@@ -16283,7 +16334,7 @@ static void gen_stmt(void)
                 NLOOP++;
                 gen_vla_loop_push();
                 mv_loop_enter();
-                if (pa_is_punct("{"))
+                if (pa_is_ch('{'))
                     gen_block();
                 else
                     pa_error("foreach 后面要一个 { … } 块");
@@ -16356,7 +16407,7 @@ static void gen_stmt(void)
         NLOOP++;
         gen_vla_loop_push();
         mv_loop_enter();
-        if (pa_is_punct("{"))
+        if (pa_is_ch('{'))
             gen_block();
         else
             pa_error("foreach 后面要一个 { … } 块");
@@ -16391,9 +16442,9 @@ static void gen_stmt(void)
         /* 标签必须在条件**之前**发出：条件本身会产生算 cmp 的指令，
          * 标签放在后面会让回边跳过条件求值（死循环）。 */
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         c = value_of(gen_expr());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)lbodY, (u16)lend, 0);
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbodY, 0, 0, 0);
         LOOP_BRK[NLOOP] = lend;
@@ -16418,25 +16469,25 @@ static void gen_stmt(void)
          * lend（它已经就地跑过清理了），所以两条出口不会重复。 */
         u32 lclean = irfn_label(&FN);
 
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         scope_enter();
         /* `for (T v = …; …)`：init 里声明的变量属于 for 自己的作用域（循环结束
          * 就销毁），所以这里单独开一层深度。continue 不清理它，break 和循环正常
          * 结束要清理它（C 标准：离开作用域就跑 cleanup 函数）。 */
         DEF_DEPTH++;
-        if (!pa_accept_punct(";")) {
+        if (!pa_accept_ch(';')) {
             if (is_typename_tok(pa_cur()))
                 gen_local_decl(1);
             else {
                 (void)value_of(gen_expr());
-                pa_expect_punct(";");
+                pa_expect_ch(';');
             }
         }
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
-        if (!pa_accept_punct(";")) {
+        if (!pa_accept_ch(';')) {
             u32 c = value_of(gen_expr());
 
-            pa_expect_punct(";");
+            pa_expect_ch(';');
             irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)lbody, (u16)lclean, 0);
         } else {
             /* 空条件 `for (init; ; incr)`：没有条件分支，就得有**无条件**跳进
@@ -16447,7 +16498,7 @@ static void gen_stmt(void)
         }
         /* 源码顺序是 init; cond; incr; body，而 IR 里 body 要在 incr 之后执行，
          * 所以先跳过 incr 把 body 接在后面（token 只读一遍，不回头）。 */
-        if (pa_accept_punct(")")) {
+        if (pa_accept_ch(')')) {
             LOOP_BRK[NLOOP] = lend;
             LOOP_CNT[NLOOP] = lcont;
             LOOP_DFB[NLOOP] = DEF_DEPTH;
@@ -16476,7 +16527,7 @@ static void gen_stmt(void)
         irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lcont, 0, 0, 0);
         (void)value_of(gen_expr());
-        pa_expect_punct(")");
+        pa_expect_ch(')');
         irfn_push(&FN, IR_JMP, IRT_VOID, 0, (u16)ltop, 0, 0, 0);
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lbody, 0, 0, 0);
         LOOP_BRK[NLOOP] = lend;
@@ -16521,10 +16572,10 @@ static void gen_stmt(void)
             pa_error("do 后面要 while");
             return;
         }
-        pa_expect_punct("(");
+        pa_expect_ch('(');
         c = value_of(gen_expr());
-        pa_expect_punct(")");
-        pa_expect_punct(";");
+        pa_expect_ch(')');
+        pa_expect_ch(';');
         irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)c, (u16)ltop, (u16)lend, 0);
         irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lend, 0, 0, 0);
         return;
@@ -16532,7 +16583,7 @@ static void gen_stmt(void)
     if (pa_accept_ident("break")) {
         if (PA_IN_DEFER)
             pa_error("'break' is not allowed in a defer body");
-        pa_expect_punct(";");
+        pa_expect_ch(';');
         if (NLOOP > 0) {
             /* `for` 的 init 声明在自己的那一层作用域里：break 跳出整个循环，
              * 那层也要清理（LOOP_DFB + 0）。其它循环没有这一层，照旧 +1。 */
@@ -16547,7 +16598,7 @@ static void gen_stmt(void)
     if (pa_accept_ident("continue")) {
         if (PA_IN_DEFER)
             pa_error("'continue' is not allowed in a defer body");
-        pa_expect_punct(";");
+        pa_expect_ch(';');
         if (NLOOP > 0) {
             /* switch 不是 continue 的目标：跳过它，落到外层真正的循环上
              * （`for (…) { switch (i) { case 0: continue; } }` 里循环体那个块
@@ -16568,7 +16619,7 @@ static void gen_stmt(void)
      * `(arr[0], arr[1]) = f();`。判据只有一条：括号里 depth 1 上有逗号，
      * 且闭括号后面紧跟 `=`——逗号表达式不能做赋值目标，所以不会误判。
      * 另外还有"元组类型的局部声明"：闭括号后面跟的是标识符。 */
-    if (pa_is_punct("(")) {
+    if (pa_is_ch('(')) {
         int depth = 0;
         int has_comma = 0;
         int q = 0;
@@ -16633,7 +16684,7 @@ static void gen_stmt(void)
     }
     /* 托管引用/所有权修饰符开头的局部声明：`@T p = new T;`、
      * `shared @T q = …;` */
-    if (pa_is_punct("@")
+    if (pa_is_ch('@')
         || ((pa_is_ident("shared") || pa_is_ident("weak") || pa_is_ident("own"))
             && (pa_peek(1)->kind == TK_PUNCT && tok_eq(pa_peek(1), "@")))) {
         gen_local_decl(1);
@@ -16668,7 +16719,7 @@ static void gen_stmt(void)
             u32 v = gen_expr();
 
             (void)v;
-            pa_expect_punct(";");
+            pa_expect_ch(';');
             return;
         }
     }
@@ -16713,7 +16764,7 @@ static void gen_stmt(void)
             is->slot = irfn_vreg(&FN);
             irfn_push(&FN, IR_MOV, ir_ty_of(vty), (u16)is->slot, (u16)r, 0, 0, 0);
         }
-        pa_expect_punct(";");
+        pa_expect_ch(';');
         return;
     }
     E_CALL_FALLIBLE = 0;
@@ -16733,7 +16784,7 @@ static void gen_stmt(void)
     /* 语句结束：没落到托管量上的 `new T`（`new T;`、`f(new T)` 之类）在这里
      * 释放。 */
     mgd_tmp_flush();
-    pa_expect_punct(";");
+    pa_expect_ch(';');
     return;
 }
 
@@ -17280,10 +17331,10 @@ static void gen_one_global(u32 ty, Declarator *d)
     /* c6：文件作用域的对象也是"定义"，一样要写初始化器。`static`/`extern`
      * 例外：前者本来就落在数据段里（0），后者只是引用。 */
     if (in_c6_tu() && !PA_TMPL_BODY && !PA_SIG_ONLY && !PA_STATIC && !PA_EXTERN && !ty_is_func(ty)
-        && !pa_is_punct("=") && !pa_is_punct("{"))
+        && !pa_is_ch('=') && !pa_is_ch('{'))
         pa_error("variable '%s' must be initialized",
                  arena_strndup(&A_main, d->name, d->nlen));
-    if (ty_is_array(ty) && ty_array_n(ty) == 0 && pa_is_punct("=")
+    if (ty_is_array(ty) && ty_array_n(ty) == 0 && pa_is_ch('=')
         && pa_peek(1)->kind == TK_STR) {
         /* `char s[] = "…"`（可能带相邻字面量拼接）：先把数据段写出来才知道
          * 元素个数，所以顺序反过来——先取字符串，再定类型、再登记符号。 */
@@ -17302,7 +17353,7 @@ static void gen_one_global(u32 ty, Declarator *d)
                ? (size_t)ty_size(ty) : (size_t)(WIDE_LIT ? n * 4 : n));
         return;
     }
-    if (ty_is_array(ty) && ty_array_n(ty) == 0 && pa_is_punct("=")) {
+    if (ty_is_array(ty) && ty_array_n(ty) == 0 && pa_is_ch('=')) {
         was_inc = 1;
         Tok *nx = pa_peek(1);
 
@@ -17383,9 +17434,9 @@ static void gen_one_global(u32 ty, Declarator *d)
         s->is_mgd = (u8)(d->mgd_kind == 1 ? 2 : 1);
     if (ty == ty_thread() && PA_TASK_KW == 1)
         pa_error("task 只能在函数里声明");   /* 全局托管量：2 = 弱 */
-    if (!ate_eq && !pa_accept_punct("="))
+    if (!ate_eq && !pa_accept_ch('='))
         return;
-    if (pa_is_punct("{")) {
+    if (pa_is_ch('{')) {
         u32 et = ty_is_array(ty) ? ty_target(ty) : 0;
         u32 end_alloc = DATA_IMG.n;
 
@@ -17413,7 +17464,7 @@ static void gen_one_global(u32 ty, Declarator *d)
 
         gen_glob_braced_new(s->goff, ty, 0);
         while (ex--)
-            pa_expect_punct(")");
+            pa_expect_ch(')');
         return;
     }
     if (pa_cur()->kind == TK_STR) {
@@ -17483,7 +17534,7 @@ static void gen_one_global(u32 ty, Declarator *d)
     /* `&x` / 函数名 / `&arr[0]` 这类地址常量：留给布局后回填 */
     if (ty_is_ptr(ty)) {
         int took = 0;
-        int amp = pa_accept_punct("&");
+        int amp = pa_accept_ch('&');
 
         if (pa_cur()->kind == TK_IDENT) {
             Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
@@ -17494,8 +17545,8 @@ static void gen_one_global(u32 ty, Declarator *d)
                 if (t->is_func)
                     sym = x64_sym(&X64, arena_strndup(&A_main, tok_data(pa_cur()), pa_cur()->len));
                 pa_advance();
-                if (!pa_is_punct("[") && !pa_is_punct(".") && !pa_is_punct("+")
-                    && !pa_is_punct("-")) {
+                if (!pa_is_ch('[') && !pa_is_ch('.') && !pa_is_ch('+')
+                    && !pa_is_ch('-')) {
                     data_fixup_add(s->goff, sym);
                     took = 1;
                 }
@@ -17555,8 +17606,8 @@ static void gen_one_global(u32 ty, Declarator *d)
         {
             double dv = 0;
 
-            if (pa_cur()->kind == TK_NUM || pa_is_punct("-") || pa_is_punct("+")
-                || pa_is_punct("(")) {
+            if (pa_cur()->kind == TK_NUM || pa_is_ch('-') || pa_is_ch('+')
+                || pa_is_ch('(')) {
                 int ok = 1;
 
                 dv = const_fexpr(&ok);
@@ -17733,7 +17784,7 @@ static void pa_parse_tu(void)
         u32 ty = 0;
         Sym *s = NULL;
 
-        if (pa_accept_punct(";"))
+        if (pa_accept_ch(';'))
             continue;
         /* 文件作用域 asm（定义符号用）：必须在 parse_typespec 之前认——
          * 那边 skip_attributes 会把 `asm` 当属性关键字默默吃掉。 */
@@ -17769,8 +17820,8 @@ static void pa_parse_tu(void)
                 mnm[ml] = 0;
                 pa_advance();
             }
-            pa_expect_punct(")");
-            (void)pa_accept_punct(";");
+            pa_expect_ch(')');
+            (void)pa_accept_ch(';');
             if (ml) {
                 if (mod_of_file((u32)mfile))
                     pa_error("module '%s' already declared in this file", mnm);
@@ -17847,21 +17898,21 @@ static void pa_parse_tu(void)
             pa_advance();
             /* `import a.b.c;` → 模块文件 a/b/c.c6。单 TU 口径：把模块源码
              * 文本内联进来（模块系统真正的导出改名/pic 还没做，见 todo）。 */
-            while (pa_cur()->kind != TK_EOF && !pa_is_punct(";")) {
+            while (pa_cur()->kind != TK_EOF && !pa_is_ch(';')) {
                 if (pa_cur()->kind == TK_IDENT && pn < 240) {
                     u32 k = 0;
 
                     for (k = 0; k < pa_cur()->len && pn < 240; k++)
                         path[pn++] = tok_data(pa_cur())[k];
-                } else if (pa_is_punct(".") && pn < 240) {
+                } else if (pa_is_ch('.') && pn < 240) {
                     path[pn++] = '/';
-                } else if (pa_is_punct("{")) {
+                } else if (pa_is_ch('{')) {
                     skip_paren_group();
                     continue;
                 }
                 pa_advance();
             }
-            if (pa_is_punct(";"))
+            if (pa_is_ch(';'))
                 pa_advance();
             if (pn + 4 < 250) {
                 path[pn] = 0;
@@ -17897,12 +17948,12 @@ static void pa_parse_tu(void)
             } else {
                 idx = IFACE_MAX;
             }
-            pa_expect_punct("{");
+            pa_expect_ch('{');
             PA_IN_PROTO = 1;
-            while (!pa_is_punct("}") && pa_cur()->kind != TK_EOF) {
+            while (!pa_is_ch('}') && pa_cur()->kind != TK_EOF) {
                 u32 rty = parse_typespec();
 
-                while (pa_accept_punct("*"))
+                while (pa_accept_ch('*'))
                     rty = ty_ptr(rty);
                 if (pa_cur()->kind == TK_IDENT) {
                     if (idx < IFACE_MAX && IFACE_NM[idx] < IFACE_NMET) {
@@ -17918,12 +17969,12 @@ static void pa_parse_tu(void)
                     pa_advance();
                 }
                 /* 形参类型要记下来：判断"某个类型实现了这个接口"时要逐个比 */
-                if (pa_is_punct("(") && idx < IFACE_MAX && IFACE_NM[idx] > 0) {
+                if (pa_is_ch('(') && idx < IFACE_MAX && IFACE_NM[idx] > 0) {
                     u32 kk = IFACE_NM[idx] - 1;
                     u32 npf = 0;
 
                     pa_advance();
-                    if (!pa_accept_punct(")")) {
+                    if (!pa_accept_ch(')')) {
                         for (;;) {
                             Declarator pd2 = {0};
                             int new_tag = 0;
@@ -17944,19 +17995,19 @@ static void pa_parse_tu(void)
                             if (npf < IFACE_NPARAM)
                                 IFACE_PTY[idx][kk][npf] = pt2;
                             npf++;
-                            if (!pa_accept_punct(","))
+                            if (!pa_accept_ch(','))
                                 break;
                         }
-                        pa_expect_punct(")");
+                        pa_expect_ch(')');
                     }
                     IFACE_NP[idx][kk] = npf;
                 }
-                if (!pa_accept_punct(";"))
+                if (!pa_accept_ch(';'))
                     break;
             }
             PA_IN_PROTO = 0;
-            pa_expect_punct("}");
-            (void)pa_accept_punct(";");
+            pa_expect_ch('}');
+            (void)pa_accept_ch(';');
             if (idx < IFACE_MAX) {
                 (void)ty_iface(idx);
             }
@@ -17969,7 +18020,7 @@ static void pa_parse_tu(void)
 
             if (d2.name)
                 sym_add(d2.name, d2.nlen, t2, SC_TYPEDEF);
-            pa_expect_punct(";");
+            pa_expect_ch(';');
             continue;
         }
         SAW_CTOR = 0;
@@ -17977,7 +18028,7 @@ static void pa_parse_tu(void)
         PA_STATIC = 0;
         PA_EXTERN = 0;
         /* 函数模板定义：`|T| T f(…) { … }`——只捕获 token，调用点再重放 */
-        if (pa_is_punct("|")) {
+        if (pa_is_ch('|')) {
             const char *pn[4] = {0};
             u32 pl[4] = {0};
             int pk[4] = {0};
@@ -18032,10 +18083,10 @@ static void pa_parse_tu(void)
                 }
                 np++;
                 pa_advance();
-                if (!pa_accept_punct(","))
+                if (!pa_accept_ch(','))
                     break;
             }
-            pa_expect_punct("|");
+            pa_expect_ch('|');
             ntok = tmpl_capture_body();
             /* `|T| typedef <spec> <名字>;`：typedef 模板。体里没有 `{`，
              * 实例化时按 `typedef` 后面那段重新解析一遍。 */
@@ -18060,7 +18111,7 @@ static void pa_parse_tu(void)
                     /* 有花括号时捕捉停在 `}`，后面的 `<名字> ;` 还没吃到——
                      * 解析器正好停在那里，接着收。 */
                     while (ntok < CAP_MAX && pa_cur()->kind != TK_EOF) {
-                        int done = pa_is_punct(";");
+                        int done = pa_is_ch(';');
 
                         CAP_TOK[ntok++] = *pa_cur();
                         pa_advance();
@@ -18229,7 +18280,7 @@ static void gen_decl_from_spec(u32 base)
         }
         if (!d.name) {
             /* `struct S { ... };` / `enum { ... };`：定义本身就是全部内容 */
-            if (!pa_accept_punct(";"))
+            if (!pa_accept_ch(';'))
                 pa_error("顶层声明缺名字");
             break;
         }
@@ -18277,7 +18328,7 @@ static void gen_decl_from_spec(u32 base)
                     s->fallible = 1;
                     PA_FALLIBLE = 0;
                 }
-                if (pa_is_punct(";")) {
+                if (pa_is_ch(';')) {
                     pa_advance();
                     break;
                 }
@@ -18335,7 +18386,7 @@ static void gen_decl_from_spec(u32 base)
             /* K&R 旧式定义：`int f(a, b) float a; float b; { … }`
              * 参数表里只有名字（类型默认 int），真正的类型写在 `{` 前面的
              * 声明列表里。这里把声明里的类型回填到参数上。 */
-            while (d.knr && !pa_is_punct("{") && pa_cur()->kind != TK_EOF) {
+            while (d.knr && !pa_is_ch('{') && pa_cur()->kind != TK_EOF) {
                 u32 b2 = parse_typespec();
 
                 for (;;) {
@@ -18351,10 +18402,10 @@ static void gen_decl_from_spec(u32 base)
                                 d.pknr[k] = 1;
                             }
                     }
-                    if (!pa_accept_punct(","))
+                    if (!pa_accept_ch(','))
                         break;
                 }
-                pa_expect_punct(";");
+                pa_expect_ch(';');
             }
             d.knr_conv = (u8)(d.knr && !had_proto);
             pa_func_def(s, &d);
@@ -18365,7 +18416,7 @@ static void gen_decl_from_spec(u32 base)
             break;
         }
         gen_one_global(ty, &d);
-        if (!pa_accept_punct(","))
+        if (!pa_accept_ch(','))
             break;
     }
 }
