@@ -159,7 +159,13 @@ static void pp_push_tokens(Tok *t, u32 n)
 
 static void pp_pushback(Tok *t, int kind)
 {
-    if (kind == TK_EOF)
+    /* 真的 EOF 不用回推（词法源再取一次还是 EOF），但 `expand_array` 拿来当
+     * "这段实参到此为止"的边界 token 也是 TK_EOF 造的，那个必须回推：丢了它，
+     * 嵌套的实参预展开会越过实参边界、一路读进外层源码。
+     * 症状是 `#define A(a,b) a(b)` 里的 `A(M,1);` 展开成 `M;(1)` —— 实参 M
+     * 把后面的 ';' 一起吞了，于是 `a(b)` 拼出来的 `M(` 被 ';' 撑开，M 再也
+     * 调不起来（c-testsuite single-exec/00138）。 */
+    if (kind == TK_EOF && !(t->flags & TF_SYN))
         return;
     if (NPUSHBACK >= 8)
         return;
