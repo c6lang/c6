@@ -3953,3 +3953,41 @@ $ make -C c6c selfhost # fixpoint 逐字节相同（3767373 字节 / 5499 符号
 **范围**：整数/指针运算、控制流、调用、递归、结构体、全局数据都能出文本；浮点、
 变参、内联汇编、TLS 尚未实现——遇到会点名报错并拒绝写文件（所以现在还不能用
 `-S` 编带 `rt.c6` 的程序）。这是 ④ 的最后一件：`-g`/`-b`/`-S` 三样都落地了。
+
+## 第 206 轮：第二套 native 后端（aarch64）
+
+硬缺口③：x86-64 之外的 **native** 后端。`src/aout.c6`（新，~700 行）把 IR 落成
+aarch64 汇编文本——指令选择、调用约定、栈帧都是 c6c 自己写的，系统汇编器只负责
+编码。上一轮做的 `-S`（文本后端）正好是这一轮的地基。
+
+同一套语义（同一份 IR、同一套槽位模型）：
+
+```
+序言   stp x29,x30,[sp,#-16]! / mov x29,sp / sub sp,sp,frame
+槽位   x29 - 16*(n+1)；偏移超过 ldr/str 的 ±256 就先进 x17（超过 4095 用 movz/movk 拼）
+二元   a → x0，b → x1；结果写 dst 槽
+比较   cmp + cset（eq/ne/lt/le/gt/ge/lo/ls/hi/hs 与 IR 的条件码一一对应）
+除法   sdiv / udiv；取模用 sdiv+msub（C99 的截断语义与 aarch64 一致，不用改）
+调用   实参 → x0..x7（>8 个暂不支持），bl 目标，结果在 x0
+返回   mov sp,x29 / ldp x29,x30,[sp],#16 / ret
+退出   mov x8,#93 / svc #0
+```
+
+**实测**：
+
+```
+$ c6c -S --target=aarch64 -nostdlib prog.c6 -o prog.s
+c6c: prog.s（aarch64 汇编文本：2 个函数 / 2144 字节）
+$ clang --target=aarch64-linux-gnu -c prog.s -o prog.o
+$ ld.lld -m aarch64elf -e _start -o prog.elf prog.o
+$ qemu-aarch64 ./prog.elf; echo $?
+50                     # 与 x86-64 后端一致
+$ make -C c6c a64check # 11/11（八个程序 + 指令/退出约定 + 拒绝未实现 op）
+$ make -C c6c selfhost # fixpoint 逐字节相同（3816960 字节 / 5758 符号）
+```
+
+**范围**：整数/指针运算、控制流、调用（≤8 实参）、递归、结构体、全局数据、
+`_start` 可用；浮点、变参、VLA、内联汇编、TLS、>8 实参明确报错并拒绝写文件。
+机器码编码与 ELF 写出仍借系统工具（clang/ld.lld）——c6c 这一侧是"指令选择 +
+调用约定"，与 x86-64 后端（连编码和 ELF 都自己写）相比这一步是租来的，文档里
+写清楚。

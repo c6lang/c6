@@ -64,6 +64,8 @@ typedef struct Opts {
     int bcheck;
     /* -g：调试信息（行号表 + DWARF 段，-c 出的 .o 里带上） */
     int debug;
+    /* --target=aarch64：第二套 native 后端（只出汇编文本，配 -S 用） */
+    int target_a64;
 } Opts;
 
 static Opts O;
@@ -95,6 +97,7 @@ static void usage(FILE *fp)
         "                       PASS/FAIL 行 + \"N test(s), M failure(s)\" 收尾，\n"
         "                       失败数当退出码；给 -o 就只写文件不跑\n"
         "  -test-filter=子串     只跑描述里含这个子串的 test 块（-test 用）\n"
+        "  --target=aarch64     第二套 native 后端：出 aarch64 汇编文本（要配 -S）\n"
         "  -S                   只出汇编文本（x86-64 / GNU as 语法，交给 as 或 cc 汇编）\n"
         "  -g                   调试信息：行号表 + DWARF 段（-c 出的 .o 里带上，\n"
         "                       用系统 cc/gcc 链接后可 gdb/addr2line）\n"
@@ -500,6 +503,12 @@ static int parse_args(int argc, char **argv)
             O.mode = M_E;
         } else if (strcmp(a, "-c") == 0) {
             O.mode = M_OBJ;
+        } else if (strcmp(a, "--target=aarch64") == 0) {
+            /* 第二套 native 后端：出 aarch64 汇编文本（必须配 -S） */
+            O.target_a64 = 1;
+        } else if (strncmp(a, "--target=", 9) == 0) {
+            diag_error_plain("不认识的 --target=%s（只支持 x86-64 默认与 aarch64）", a + 9);
+            return -1;
         } else if (strcmp(a, "-S") == 0) {
             /* 出汇编文本（x86-64，GNU as 语法），不写 ELF */
             O.mode = M_ASM;
@@ -889,6 +898,11 @@ int main(int argc, char **argv)
         if (O.mode == M_ASM && !O.out)
             out = obj_default_out(O.files[0], objname, sizeof(objname));
         aso_set_mode(O.mode == M_ASM);
+        aout_set_target(O.target_a64);
+        if (O.target_a64 && O.mode != M_ASM) {
+            diag_error_plain("--target=aarch64 现在只支持 -S（出汇编文本）");
+            return 2;
+        }
         if (O.mode == M_OBJ && O.nfiles > 1) {
             /* 一个 .o 对应一个 TU。多个输入要分别出 .o，那得把编译拆成多次
              * 跑（符号表 / 数据段 / 代码段都是整份镜像一份）。先如实拒绝，

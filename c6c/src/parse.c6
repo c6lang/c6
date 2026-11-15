@@ -20858,6 +20858,10 @@ static int pa_finish(const char *out)
     if (llvm_mode())
         return llvm_finish(out);
     if (aso_on()) {                 /* -S：写汇编文本，不写 ELF */
+        if (aout_on()) {
+            aout_write(out);
+            return aout_had_error() ? 1 : 0;
+        }
         aso_write(out);
         return aso_had_error() ? 1 : 0;
     }

@@ -376,7 +376,40 @@ cc $(pkgconf --cflags --libs c6lib) host.c -o host   # → -lc6c
 `include/` 干净 / `find_package` 消费者真编真跑 / `pkgconf` 旗子
 `-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 自找头文件与运行时）。
 
-## x86-64 之外：IR 与目标无关，aarch64 实测
+## 第二套 native 后端：aarch64
+
+`--target=aarch64 -S` 让 c6c 自己生成 **aarch64 汇编**（`src/aout.c6`）——指令
+选择、调用约定、栈帧都是 c6c 这一侧的事，汇编器只负责编码：
+
+```sh
+./c6c/build/c6c -S --target=aarch64 -nostdlib prog.c6 -o prog.s
+clang --target=aarch64-linux-gnu -c prog.s -o prog.o
+ld.lld -m aarch64elf -e _start -o prog.elf prog.o
+qemu-aarch64 ./prog.elf; echo $?        # 与 x86-64 后端的退出码一致
+```
+
+和 x86-64 后端**同一套语义**（同一份 IR、同一套槽位模型）：
+
+| 事项 | x86-64 | aarch64 |
+| --- | --- | --- |
+| 函数序言 | `push rbp; mov rbp,rsp; sub rsp,frame` | `stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,frame` |
+| vreg 槽位 | `[rbp-16*(n+1)]` | `x29 - 16*(n+1)`（偏移大时先算进 x17） |
+| 二元运算 | a→rax、b→rcx | a→x0、b→x1 |
+| 比较 | `cmp` + `setcc`（0/1） | `cmp` + `cset`（0/1） |
+| 分支 | `test` + `jne` | `cbnz` |
+| 调用 | rdi/rsi/…/r9 | x0..x7 |
+| 返回 | `leave; ret` | `mov sp,x29; ldp x29,x30,[sp],#16; ret` |
+| 退出 | `mov eax,60; syscall` | `mov x8,#93; svc #0` |
+
+范围（v1）：整数/指针运算、控制流、调用（≤8 实参）、递归、结构体、全局数据、
+`_start`。浮点、变参、VLA、内联汇编、TLS、>8 实参一律明确报错（
+`c6c: aarch64 后端暂不支持 …`）并拒绝写文件。
+
+回归：`make -C c6c a64check`（11 条：八个程序都是「c6c 出 aarch64 汇编 → clang
+汇编 → ld.lld 链接 → qemu 真跑」，退出码与 x86-64 后端逐一相同；汇编里是
+aarch64 指令、`_start` 走 `svc #0`；未实现的 op 拒绝写文件）。
+
+## x86-64 之外：IR 与目标无关，经 LLVM 落到 aarch64
 
 c6c 自己的 native 后端只出 x86-64 机器码；但 IR（`src/ir.c6`，24 字节定长记录）
 是**与目标无关**的，`--emit-llvm` 出来的 `.ll` 交给任何 LLVM 目标后端都能落到
