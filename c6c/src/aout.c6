@@ -1,0 +1,652 @@
+/* aout.c6 —— 第二套 native 后端：IR → **aarch64** 汇编文本（GNU as / clang 都收）。
+ *
+ * 为什么这一侧先出文本：c6c 的 x86-64 后端自己编码机器码、自己写 ELF；aarch64
+ * 这边先只做**指令选择 + 调用约定**，编码交给系统汇编器，链接交给 ld.lld，运行
+ * 交给 qemu-aarch64。指令是 c6c 自己选的（不是把整份 IR 丢给 LLVM），所以这是
+ * 一套真的 aarch64 代码生成器；只是"字节化"这一步借了现成的汇编器。
+ *
+ * 与 x86-64 后端同一套语义（IR 一样、槽位模型一样）：
+ *   帧：stp x29, x30, [sp, #-16]! / mov x29, sp / sub sp, sp, #frame
+ *   每个 vreg 一个槽：x29 - 16*(n+1)
+ *   二元运算：a → x0，b → x1，结果写 dst 槽
+ *   比较：cmp + cset（0/1 物化）；分支看槽里的 0/非 0
+ *   调用：IR_ARG 收实参 → x0..x7，bl 目标，结果在 x0
+ *   返回：mov sp, x29 / ldp x29, x30, [sp], #16 / ret
+ *
+ * 槽位寻址：槽偏移一旦超过 ldr/str 的立即数范围（±256）就不能直接写
+ * `[x29, #-off]`，所以统一走 x17：`sub x17, x29, #off`（超过 4095 就先
+ * movz/movk 出来再 sub），然后 `ldr/str [x17]`。
+ *
+ * 范围（v1）：整数/指针的全部运算、控制流、调用、数据段、_start。浮点、变参、
+ * VLA（ALLOCA/SETRSP）、内联汇编、TLS、>8 个实参一律明确报错——不静默出错产物。
+ */
+static int AOUT_ON;
+static void aout_set_target(int on) { AOUT_ON = on ? 1 : 0; }
+static int aout_on(void) { return AOUT_ON; }
+
+static ObjBuf AOUT;
+static u32 AOUT_FNIDX;
+static int AOUT_BAD;
+static const char *AOUT_ARGREG[8] = {"x0", "x1", "x2", "x3",
+                                     "x4", "x5", "x6", "x7"};
+
+static void aout_emit(const char *s)
+{
+    ob_copy(&AOUT, s, (u32)strlen(s));
+}
+
+static void aout_line(const char *s)
+{
+    aout_emit("\t");
+    aout_emit(s);
+    aout_emit("\n");
+}
+
+static void aout_symname(const char *name)
+{
+    u32 i = 0;
+
+    if (!name) {
+        aout_emit("<null>");
+        return;
+    }
+    for (i = 0; name[i]; i++) {
+        char c = name[i];
+
+        if (c == '$')
+            c = '.';
+        ob_u8(&AOUT, (u32)(u8)c);
+    }
+}
+
+static void aout_sym(u32 symidx)
+{
+    if (symidx < X64.nsym)
+        aout_symname(X64.sym[symidx].name);
+    else
+        aout_emit("<sym?>");
+}
+
+static void aout_lbl(u32 l)
+{
+    char b[48] = {0};
+
+    snprintf(b, sizeof(b), ".L%u_%u", (unsigned)AOUT_FNIDX, (unsigned)l);
+    aout_emit(b);
+}
+
+/* 任意 64 位立即数：movz + movk 拼（aarch64 的 mov 只吃 16 位立即数） */
+static void aout_mov_imm(const char *reg, u64 v)
+{
+    char b[64] = {0};
+    u32 shift = 0;
+    int done = 0;
+
+    for (shift = 0; shift < 64u; shift += 16u) {
+        u32 part = (u32)((v >> shift) & 0xFFFFu);
+
+        if (!part)
+            continue;
+        snprintf(b, sizeof(b), "\t%s\t%s, #%u%s\n", done ? "movk" : "movz", reg,
+                 (unsigned)part, shift ? ", lsl #16" : "");
+        if (shift == 32u)
+            snprintf(b, sizeof(b), "\t%s\t%s, #%u, lsl #32\n", done ? "movk" : "movz",
+                     reg, (unsigned)part);
+        else if (shift == 48u)
+            snprintf(b, sizeof(b), "\t%s\t%s, #%u, lsl #48\n", done ? "movk" : "movz",
+                     reg, (unsigned)part);
+        aout_emit(b);
+        done = 1;
+    }
+    if (!done) {
+        snprintf(b, sizeof(b), "\tmovz\t%s, #0\n", reg);
+        aout_emit(b);
+    }
+}
+
+/* 槽 n 的地址算进 tmp（默认 x17） */
+static void aout_addr(u32 n, const char *tmp)
+{
+    u32 off = 16u * (n + 1u);
+    char b[64] = {0};
+
+    if (off <= 4095u) {
+        snprintf(b, sizeof(b), "\tsub\t%s, x29, #%u\n", tmp, (unsigned)off);
+        aout_emit(b);
+    } else {
+        aout_mov_imm(tmp, (u64)off);
+        snprintf(b, sizeof(b), "\tsub\t%s, x29, %s\n", tmp, tmp);
+        aout_emit(b);
+    }
+}
+
+static void aout_ld(u32 n, const char *reg)
+{
+    aout_addr(n, "x17");
+    aout_emit("\tldr\t");
+    aout_emit(reg);
+    aout_emit(", [x17]\n");
+}
+
+static void aout_st(u32 n, const char *reg)
+{
+    aout_addr(n, "x17");
+    aout_emit("\tstr\t");
+    aout_emit(reg);
+    aout_emit(", [x17]\n");
+}
+
+/* 宽度：1/2/4/8（浮点除外，v1 不支持） */
+static int aout_width(int type)
+{
+    switch (type) {
+    case IRT_U8:
+    case IRT_I8:
+        return 1;
+    case IRT_U16:
+    case IRT_I16:
+        return 2;
+    case IRT_U32:
+    case IRT_I32:
+    case IRT_F32:
+        return 4;
+    default:
+        return 8;
+    }
+}
+
+static int aout_signed(int type)
+{
+    return type == IRT_I8 || type == IRT_I16 || type == IRT_I32 || type == IRT_I64;
+}
+
+static void aout_bad(const IrFn *f, const IrOp *o, const char *why)
+{
+    fprintf(stderr, "c6c: aarch64 后端暂不支持 %s（函数 %s，%s）\n", ir_name(o->op),
+            f && f->name ? f->name : "?", why);
+    AOUT_BAD = 1;
+}
+
+static const char *aout_cond(u8 cc)
+{
+    switch (cc) {
+    case IRCC_EQ:
+        return "eq";
+    case IRCC_NE:
+        return "ne";
+    case IRCC_LT:
+        return "lt";
+    case IRCC_LE:
+        return "le";
+    case IRCC_GT:
+        return "gt";
+    case IRCC_GE:
+        return "ge";
+    case IRCC_ULT:
+        return "lo";
+    case IRCC_ULE:
+        return "ls";
+    case IRCC_UGT:
+        return "hi";
+    case IRCC_UGE:
+        return "hs";
+    default:
+        return "eq";
+    }
+}
+
+static void aout_compile(X64State *st, IrFn *f, u32 func_sym)
+{
+    u32 i = 0;
+    u32 k = 0;
+    u32 arg_v[16] = {0};
+    u32 narg = 0;
+    u32 frame = 16u * (f->nvreg + 8u);
+    char b[96] = {0};
+
+    AOUT_FNIDX++;
+    aout_emit("\n\t.text\n");
+    if (func_sym < X64.nsym) {
+        const char *nm = X64.sym[func_sym].name;
+
+        if (nm && nm[0] != '.' && !strchr(nm, '$')) {
+            aout_emit("\t.globl\t");
+            aout_symname(nm);
+            aout_emit("\n");
+        }
+        aout_emit("\t.p2align 2\n");
+        aout_symname(nm);
+        aout_emit(":\n");
+    }
+    aout_line("stp\tx29, x30, [sp, #-16]!");
+    aout_line("mov\tx29, sp");
+    if (frame) {
+        snprintf(b, sizeof(b), "\tsub\tsp, sp, #%u\n", (unsigned)frame);
+        aout_emit(b);
+    }
+    for (i = 0; i < f->nparams && i < 16u; i++) {
+        if (i < 8u)
+            aout_st(f->params[i], AOUT_ARGREG[i]);
+        else
+            aout_bad(f, &f->ops[0], ">8 个形参（栈上传参还没写）");
+    }
+    if (f->is_variadic) {
+        fprintf(stderr, "c6c: aarch64 后端暂不支持变参函数（%s）\n",
+                f->name ? f->name : "?");
+        AOUT_BAD = 1;
+    }
+
+    for (i = 0; i < f->n; i++) {
+        IrOp o = f->ops[i];
+        int w = aout_width(o.type);
+        int sgn = aout_signed(o.type);
+
+        switch (o.op) {
+        case IR_NOP:
+            break;
+        case IR_COMMENT:
+            if (o.imm & AX_MARK)
+                aout_bad(f, &o, "内联汇编");
+            break;
+        case IR_LABEL:
+            aout_lbl(o.a);
+            aout_emit(":\n");
+            break;
+        case IR_CONST:
+            aout_mov_imm("x0", (u64)o.imm);
+            aout_st(o.dst, "x0");
+            break;
+        case IR_CONSTK:
+            aout_mov_imm("x0", f->kpool ? f->kpool[o.imm] : 0);
+            aout_st(o.dst, "x0");
+            break;
+        case IR_MOV:
+            aout_ld(o.a, "x0");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_LOAD:
+            aout_ld(o.a, "x0");
+            if (w == 1)
+                aout_emit(sgn ? "\tldrsb\tx0, [x0]\n" : "\tldrb\tw0, [x0]\n");
+            else if (w == 2)
+                aout_emit(sgn ? "\tldrsh\tx0, [x0]\n" : "\tldrh\tw0, [x0]\n");
+            else if (w == 4)
+                aout_emit(sgn ? "\tldrsw\tx0, [x0]\n" : "\tldr\tw0, [x0]\n");
+            else
+                aout_emit("\tldr\tx0, [x0]\n");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_STORE:
+            aout_ld(o.dst, "x0");               /* 地址 */
+            aout_ld(o.a, "x1");                 /* 值 */
+            if (w == 1)
+                aout_emit("\tstrb\tw1, [x0]\n");
+            else if (w == 2)
+                aout_emit("\tstrh\tw1, [x0]\n");
+            else if (w == 4)
+                aout_emit("\tstr\tw1, [x0]\n");
+            else
+                aout_emit("\tstr\tx1, [x0]\n");
+            break;
+        case IR_ADDR:
+            if (o.flags & 2u) {
+                aout_emit("\tadrp\tx0, ");
+                aout_sym(o.imm);
+                aout_emit("\n\tadd\tx0, x0, :lo12:");
+                aout_sym(o.imm);
+                aout_emit("\n");
+            } else if (o.flags & 1u) {
+                aout_mov_imm("x0", (u64)o.imm);
+            } else {
+                /* 栈上地址：x29 + imm（imm 是负的槽偏移） */
+                if (o.imm == 0) {
+                    aout_line("mov\tx0, x29");
+                } else {
+                    snprintf(b, sizeof(b), "\tsub\tx0, x29, #%u\n",
+                             (unsigned)(-(i64)(i32)o.imm));
+                    aout_emit(b);
+                }
+            }
+            if (o.a) {
+                aout_ld(o.a, "x1");
+                aout_line("add\tx0, x0, x1");
+            }
+            aout_st(o.dst, "x0");
+            break;
+        case IR_LEA:
+            aout_ld(o.a, "x0");
+            if (o.b) {
+                aout_ld(o.b, "x1");
+                aout_mov_imm("x2", (u64)o.imm);
+                aout_line("madd\tx0, x1, x2, x0");   /* x0 = x1*x2 + x0 */
+            } else if (o.imm) {
+                aout_mov_imm("x1", (u64)o.imm);
+                aout_line("add\tx0, x0, x1");
+            }
+            aout_st(o.dst, "x0");
+            break;
+        case IR_COPY:                           /* *dst = *a，imm 字节 */
+            aout_ld(o.dst, "x0");
+            aout_ld(o.a, "x1");
+            aout_mov_imm("x2", (u64)o.imm);
+            aout_emit("\t1:\tcbz\tx2, 2f\n");
+            aout_line("ldrb\tw3, [x1], #1");
+            aout_line("strb\tw3, [x0], #1");
+            aout_line("sub\tx2, x2, #1");
+            aout_line("b\t1b");
+            aout_emit("\t2:\n");
+            break;
+        case IR_MEMCPY:
+            aout_ld(o.dst, "x0");
+            aout_ld(o.a, "x1");
+            aout_ld(o.b, "x2");
+            aout_emit("\t1:\tcbz\tx2, 2f\n");
+            aout_line("ldrb\tw3, [x1], #1");
+            aout_line("strb\tw3, [x0], #1");
+            aout_line("sub\tx2, x2, #1");
+            aout_line("b\t1b");
+            aout_emit("\t2:\n");
+            break;
+        case IR_MEMSET:
+            aout_ld(o.dst, "x0");
+            aout_ld(o.a, "x2");
+            aout_ld(o.b, "x1");
+            aout_emit("\t1:\tcbz\tx2, 2f\n");
+            aout_line("strb\tw1, [x0], #1");
+            aout_line("sub\tx2, x2, #1");
+            aout_line("b\t1b");
+            aout_emit("\t2:\n");
+            break;
+        case IR_ADD:
+        case IR_SUB:
+        case IR_AND:
+        case IR_OR:
+        case IR_XOR:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            snprintf(b, sizeof(b), "\t%s\tx0, x0, x1\n",
+                     o.op == IR_ADD ? "add" : o.op == IR_SUB ? "sub"
+                     : o.op == IR_AND ? "and" : o.op == IR_OR ? "orr" : "eor");
+            aout_emit(b);
+            aout_st(o.dst, "x0");
+            break;
+        case IR_MUL:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("mul\tx0, x0, x1");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_DIV:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("sdiv\tx0, x0, x1");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_MOD:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("sdiv\tx2, x0, x1");
+            aout_line("msub\tx0, x2, x1, x0");    /* x0 = x0 - x2*x1 */
+            aout_st(o.dst, "x0");
+            break;
+        case IR_UDIV:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("udiv\tx0, x0, x1");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_UMOD:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("udiv\tx2, x0, x1");
+            aout_line("msub\tx0, x2, x1, x0");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_NEG:
+            aout_ld(o.a, "x0");
+            aout_line("neg\tx0, x0");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_NOT:
+            aout_ld(o.a, "x0");
+            aout_line("mvn\tx0, x0");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_SHL:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("lslv\tx0, x0, x1");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_SHR:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("lsrv\tx0, x0, x1");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_SAR:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("asrv\tx0, x0, x1");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_SEXT:
+            aout_ld(o.a, "x0");
+            if (w == 1)
+                aout_line("sxtb\tx0, w0");
+            else if (w == 2)
+                aout_line("sxth\tx0, w0");
+            else if (w == 4)
+                aout_line("sxtw\tx0, w0");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_ZEXT:
+        case IR_TRUNC:
+        case IR_BITCAST:
+            aout_ld(o.a, "x0");
+            if (w == 1)
+                aout_line("and\tx0, x0, #0xff");
+            else if (w == 2)
+                aout_line("and\tx0, x0, #0xffff");
+            else if (w == 4)
+                aout_line("mov\tw0, w0");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_CMP:
+            aout_ld(o.a, "x0");
+            aout_ld(o.b, "x1");
+            aout_line("cmp\tx0, x1");
+            snprintf(b, sizeof(b), "\tcset\tx0, %s\n", aout_cond(o.flags));
+            aout_emit(b);
+            aout_st(o.dst, "x0");
+            break;
+        case IR_BR:
+            aout_ld(o.a, "x0");
+            aout_emit("\tcbnz\tx0, ");
+            aout_lbl(o.b);
+            aout_emit("\n\tb\t");
+            aout_lbl(o.c);
+            aout_emit("\n");
+            break;
+        case IR_JMP:
+            aout_emit("\tb\t");
+            aout_lbl(o.a);
+            aout_emit("\n");
+            break;
+        case IR_JMPIND:
+            aout_ld(o.a, "x9");
+            aout_line("br\tx9");
+            break;
+        case IR_LABELADDR:
+            aout_emit("\tadr\tx0, ");
+            aout_lbl(o.a);
+            aout_emit("\n");
+            aout_st(o.dst, "x0");
+            break;
+        case IR_ARG:
+            if (narg < 16u)
+                arg_v[narg] = o.a;
+            narg++;
+            break;
+        case IR_CALL:
+            if (narg > 8u) {
+                aout_bad(f, &o, "超过 8 个实参（栈上传参还没写）");
+                break;
+            }
+            for (k = 0; k < narg; k++)
+                aout_ld(arg_v[k], AOUT_ARGREG[k]);
+            aout_emit("\tbl\t");
+            aout_sym(o.imm);
+            aout_emit("\n");
+            narg = 0;
+            if (o.dst)
+                aout_st(o.dst, "x0");
+            break;
+        case IR_CALLI:
+            if (narg > 8u) {
+                aout_bad(f, &o, "超过 8 个实参（栈上传参还没写）");
+                break;
+            }
+            aout_ld(o.a, "x19");
+            for (k = 0; k < narg; k++)
+                aout_ld(arg_v[k], AOUT_ARGREG[k]);
+            aout_line("blr\tx19");
+            narg = 0;
+            if (o.dst)
+                aout_st(o.dst, "x0");
+            break;
+        case IR_RET:
+            if (o.type != IRT_VOID)
+                aout_ld(o.a, "x0");
+            aout_line("mov\tsp, x29");
+            aout_line("ldp\tx29, x30, [sp], #16");
+            aout_line("ret");
+            break;
+        case IR_TRAP:
+            aout_line("brk\t#0");
+            break;
+        default:
+            aout_bad(f, &o, "这个 op 的 aarch64 形式还没写");
+            break;
+        }
+        if (AOUT_BAD)
+            return;
+    }
+    (void)st;
+}
+
+/* 数据段：把 DATA_IMG 原样写出来，符号按偏移插标签（和 x86-64 的 -S 同一套） */
+static void aout_write_data(void)
+{
+    u32 i = 0;
+    u32 off = 0;
+    u32 *sorted = NULL;
+    u32 ng = 0;
+    u32 ns = 0;
+
+    for (i = 0; i < X64.nsym; i++) {
+        X64Sym *s = &X64.sym[i];
+
+        if (!s->name || !s->name[0] || !s->is_data || !s->defined)
+            continue;
+        if (s->off < ELF_HDR || s->off - ELF_HDR > DATA_IMG.n)
+            continue;
+        ng++;
+    }
+    if (ng == 0)
+        return;
+    sorted = (u32 *)malloc(sizeof(u32) * (size_t)ng);
+    if (!sorted)
+        return;
+    for (i = 0; i < X64.nsym && ns < ng; i++) {
+        X64Sym *s = &X64.sym[i];
+        u32 off2 = 0;
+        u32 k = 0;
+
+        if (!s->name || !s->name[0] || !s->is_data || !s->defined)
+            continue;
+        if (s->off < ELF_HDR || s->off - ELF_HDR > DATA_IMG.n)
+            continue;
+        off2 = s->off - ELF_HDR;
+        k = ns;
+        while (k > 0 && (X64.sym[sorted[k - 1]].off - ELF_HDR) > off2) {
+            sorted[k] = sorted[k - 1];
+            k--;
+        }
+        sorted[k] = i;
+        ns++;
+    }
+    aout_emit("\n\t.data\n");
+    for (i = 0; i < ns; i++) {
+        X64Sym *s = &X64.sym[sorted[i]];
+        u32 target = s->off - ELF_HDR;
+
+        while (off < target && off < DATA_IMG.n) {
+            char b[24] = {0};
+
+            snprintf(b, sizeof(b), "\t.byte\t%u\n", (unsigned)DATA_IMG.p[off]);
+            aout_emit(b);
+            off++;
+        }
+        aout_emit("\t.p2align 3\n");
+        if (s->name[0] != '.' && !strchr(s->name, '$')) {
+            aout_emit("\t.globl\t");
+            aout_symname(s->name);
+            aout_emit("\n");
+        }
+        aout_symname(s->name);
+        aout_emit(":\n");
+    }
+    while (off < DATA_IMG.n) {
+        char b[24] = {0};
+
+        snprintf(b, sizeof(b), "\t.byte\t%u\n", (unsigned)DATA_IMG.p[off]);
+        aout_emit(b);
+        off++;
+    }
+    free(sorted);
+}
+
+/* aarch64 的 _start：bl main 之后 x0 就是退出码，直接 exit(93) */
+static void aout_write_start(void)
+{
+    aout_emit("\n\t.text\n\t.globl\t_start\n\t.p2align 2\n_start:\n");
+    aout_line("bl\tmain");
+    aout_line("mov\tx8, #93");
+    aout_line("svc\t#0");
+}
+
+static int aout_had_error(void) { return AOUT_BAD; }
+
+static void aout_write(const char *path)
+{
+    FILE *out = NULL;
+    ObjBuf body = {0};
+    ObjBuf all = {0};
+
+    body = AOUT;
+    AOUT.p = NULL;
+    AOUT.n = 0;
+    AOUT.cap = 0;
+    aout_write_data();
+    aout_write_start();
+    aout_emit("\n\t.section\t.note.GNU-stack,\"\",@progbits\n");
+    ob_copy(&all, body.p, body.n);
+    ob_copy(&all, AOUT.p, AOUT.n);
+    AOUT = all;
+    free(body.p);
+    if (AOUT_BAD) {
+        fprintf(stderr, "c6c: aarch64 后端有上面那些没实现的东西，不写 %s\n", path);
+        return;
+    }
+    out = fopen(path, "wb");
+    if (!out) {
+        fprintf(stderr, "c6c: 无法写出 %s\n", path);
+        return;
+    }
+    if (fwrite(AOUT.p, 1, (size_t)AOUT.n, out) != (size_t)AOUT.n)
+        fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
+    fclose(out);
+    printf("c6c: %s（aarch64 汇编文本：%u 个函数 / %u 字节）\n", path,
+           (unsigned)AOUT_FNIDX, (unsigned)AOUT.n);
+}

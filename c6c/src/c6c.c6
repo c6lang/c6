@@ -53,6 +53,7 @@ typedef int64_t i64;
 #include "llvm.c6"
 #include "obj.c6"
 #include "asmout.c6"
+#include "aout.c6"
 #include "dw.c6"
 #include "ld.c6"
 #include "main.c6"

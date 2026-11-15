@@ -171,6 +171,10 @@ pkgcheck: libc6c
 asmcheck: build
 	@C6C=$(abspath $(BUILD)/c6c) ./tests/asmcheck.sh
 
+# 第二套 native 后端（aarch64）：c6c 自己选指令 → 汇编文本 → clang/ld.lld → qemu 真跑
+a64check: build
+	@C6C=$(abspath $(BUILD)/c6c) ./tests/a64check.sh
+
 # 跨目标：c6c 的 IR 经 llc 落到 aarch64，在 qemu 上真跑（缺 llc/clang/ld.lld/
 # qemu-aarch64 就自己跳过；它验的是"IR 与目标无关"，不是"c6c 有 aarch64 后端"）
 archcheck: build
@@ -339,7 +343,7 @@ llvmtest: $(BUILD)/c6c
 #   tests1-check  tcc 上游 tests/ 那批老式单文件用例
 # llvmtest 留在这里：26 s 换一条确定性的后端闸门（同一份语料 native vs LLVM）。
 # CMake 侧的 `cmake --build build --target fast` 就是这条（c6c 替换 c6 的快车道）。
-fast: lint unit irtest hello ctest runflag testflag objcheck ldcheck dyncheck bcheck dbgcheck asmcheck archcheck embedcheck pkgcheck tests2-check tests1-check c99suite llvmtest
+fast: lint unit irtest hello ctest runflag testflag objcheck ldcheck dyncheck bcheck dbgcheck asmcheck a64check archcheck embedcheck pkgcheck tests2-check tests1-check c99suite llvmtest
 	@echo "c6c: fast 通过（快速门禁 ≈40 s：前端/IR/ELF 骨架 + -run/-test/-c/链接 + 外部语料 c99suite / 上游 tests1·tests2 + LLVM 后端对齐）"
 
 # 验收（1）(2) (3)：功能面。跑分不在里面——验收（4）那几条硬指标（自编译
@@ -350,8 +354,8 @@ fast: lint unit irtest hello ctest runflag testflag objcheck ldcheck dyncheck bc
 # CI 红了至少能一眼看出是不是后端真的坏了。
 # 上游 tests1/tests2 两条闸门不在这个依赖里（它们是独立的记分板入口），
 # CMake 侧 `cmake --build build --target check-all-c6c` 会把它们一起跑完。
-check-all: unit irtest hello ctest runflag testflag objcheck ldcheck dyncheck bcheck dbgcheck asmcheck archcheck embedcheck pkgcheck selfhost selftest stdtest diagtest c99test c99suite llvmtest test build-tcc
-	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / ET_REL + 链接器 + 动态链接 + -g/-b/-S + 嵌入库 / 语言层 C99 外部闸门 / 能编出 tcc）"
+check-all: unit irtest hello ctest runflag testflag objcheck ldcheck dyncheck bcheck dbgcheck asmcheck a64check archcheck embedcheck pkgcheck selfhost selftest stdtest diagtest c99test c99suite llvmtest test build-tcc
+	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / ET_REL + 链接器 + 动态链接 + -g/-b/-S + aarch64 后端 + 嵌入库 / 语言层 C99 外部闸门 / 能编出 tcc）"
 
 # 验收（4）：性能与内存硬指标（门槛在 bench/thresholds.json）
 check-all-perf: check-all bench-c6c

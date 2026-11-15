@@ -1344,6 +1344,11 @@ static int aso_on(void);
 static void aso_compile(X64State *st, IrFn *f, u32 func_sym);
 static void aso_write(const char *path);
 static int aso_had_error(void);
+/* 第二套 native 后端：aarch64 汇编文本（定义在 aout.c6） */
+static int aout_on(void);
+static void aout_compile(X64State *st, IrFn *f, u32 func_sym);
+static void aout_write(const char *path);
+static int aout_had_error(void);
 
 static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
 {
@@ -1364,7 +1369,10 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
             ir_dump(stderr, &f->ops[q]);
     }
     if (aso_on()) {
-        aso_compile(st, f, func_sym);
+        if (aout_on())
+            aout_compile(st, f, func_sym);   /* --target=aarch64 */
+        else
+            aso_compile(st, f, func_sym);
         return;
     }
     st->fn = f;
