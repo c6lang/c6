@@ -1,0 +1,802 @@
+/* type.c6 —— 类型表：hash-consing，同构类型共享一个 id，**类型相等就是 id 相等**。
+ *
+ * 为什么不抄 tcc 的 CType（按值复制、到处逐字段比）：
+ *   1. 每处比较都是 5~10 个字段的分支，越到后期越多（tcc 里 CType 的比较散在 30 处）；
+ *   2. 按值复制意味着 struct 布局要反复算（tcc 里一次编译算几十万次）；
+ *   3. id 相等可以直接当哈希键：符号表、泛型单态化、`.c6i` 序列化都要“类型键”。
+ * 代价是每个类型一次 intern（哈希 + 字段比较），20k 类型 < 2 ms。
+ *
+ * 一个 C 语义细节：**同结构不同标签的两个 struct 是不同类型**（C11 6.2.7），
+ * 所以 STRUCT/UNION/ENUM 的键里带 `tag`（声明层发的序号）；匿名结构（tag=0）
+ * 才按形状 intern——复合字面量正需要这个。
+ *
+ * 内存所有权：`kids` 由类型表复制；`offs`/`bits` 由调用方用 arena 建好交进来
+ * （省一次复制，见 ty_agg）。
+ */
+
+enum {
+    TY_VOID = 0, TY_BOOL,
+    TY_CHAR, TY_SCHAR, TY_UCHAR,
+    TY_SHORT, TY_USHORT, TY_INT, TY_UINT,
+    TY_LONG, TY_ULONG, TY_LLONG, TY_ULLONG,
+    TY_FLOAT, TY_DOUBLE, TY_LDOUBLE,
+    TY_PTR, TY_ARRAY, TY_FUNC, TY_STRUCT, TY_UNION, TY_ENUM,
+    TY_CLOSURE,          /* closure RET(params)：单字，指向 {fn, 捕获…} 的堆对象 */
+    TY_THREAD,           /* thread：单字，指向 {pthread_t, 闭包} 的堆对象 */
+    TY_TASK,             /* task：async 句柄，指向 {kind, state, val} 的堆对象 */
+    TY_NKIND
+};
+
+/* 限定符（bitmask，进 intern 键） */
+#define TQ_CONST    1
+#define TQ_VOLATILE 2
+#define TQ_RESTRICT 4
+
+#define TY_NO_TAG 0u
+#define TY_BIT_U  0x80000000u   /* 位宽字段里的“无符号位域”标记 */
+#define TY_PARAM_MAX 64         /* 形参个数上限（超出走 arena，见 ty_func） */
+
+typedef struct C6Type {
+    u8 kind;
+    u8 qual;
+    u16 align;       /* 字节对齐（_Alignof 直接读它） */
+    u32 size;        /* 字节；函数类型为 0，不完整数组为 0 */
+    u32 nkid;
+    u32 a;           /* ARRAY: 元素数（0=不完整）/ FUNC: 形参个数 / AGG: 成员数 */
+    u32 b;           /* FUNC: 是否变参 / AGG: 是否 union */
+    u32 tag;         /* 有标签的 struct/union/enum 序号；匿名=0 */
+    u32 hash;
+    const u32 *kids; /* PTR: [元类型] / ARRAY: [元素] / FUNC: [返回,形参...] / AGG: [成员...] */
+    const u32 *offs; /* AGG: 每个成员的字节偏移 */
+    const u32 *bits; /* AGG: 每个成员的位宽（0=普通成员） */
+} C6Type;
+
+/* 类型记录按 1024 一块分块存：翻倍扩容要复制，在 arena 里复制过的旧数组永远
+ * 收不回来（20k 类型试过：分块前 arena 4.20 MB，分块后 1.6 MB）。 */
+#define TY_BLOCK_BITS 10
+#define TY_BLOCK_SIZE (1u << TY_BLOCK_BITS)
+#define TY_BLOCK_MASK (TY_BLOCK_SIZE - 1u)
+
+typedef struct TypeTable {
+    u32 *buckets;    /* 开放寻址，存类型 id */
+    u32 cap;
+    u32 n;           /* 已 intern 的类型个数 */
+    C6Type **ch;     /* 块指针数组 */
+    u32 chcap;
+} TypeTable;
+
+#define TY_AT(id) (&TT.ch[(id) >> TY_BLOCK_BITS][(id) & TY_BLOCK_MASK])
+
+static TypeTable TT;
+
+static u32 ty_intern_full(u8 kind, u8 qual, u16 align, u32 size, u32 nkid, u32 a, u32 b,
+                          u32 tag, const u32 *kids, u32 nbits, const u32 *bits,
+                          const u32 *offs);
+static void tt_grow(void);
+static u32 ty_size(u32 id);
+static u16 ty_align_of(u32 id);
+
+/* 每个 32 位值一次乘法（FNV-1a 的做法）。原来是逐字节四次乘法，而
+ * ty_intern_full 每个类型至少要混 6 个值 —— 类型 interning 占 3% 的指令，
+ * 大头就在这条串行的乘法链上。哈希只决定桶号，桶里 ty_same 还会逐项比，
+ * 换混合函数不影响语义。 */
+static u64 ty_hash_mix(u64 h, u32 v)
+{
+    return (h ^ (u64)v) * 0x100000001b3ULL;
+}
+
+static u32 ty_hash(u8 kind, u8 qual, u16 align, u32 size, u32 nkid, u32 a, u32 b,
+                   u32 tag, const u32 *kids, u32 nbits, const u32 *bits)
+{
+    u64 h = 0xcbf29ce484222325ULL;
+    u32 i = 0;
+
+    h = ty_hash_mix(h, (u32)kind | ((u32)qual << 8) | ((u32)align << 16));
+    h = ty_hash_mix(h, size);
+    h = ty_hash_mix(h, nkid);
+    h = ty_hash_mix(h, a);
+    h = ty_hash_mix(h, b);
+    h = ty_hash_mix(h, tag);
+    for (i = 0; i < nkid; i++)
+        h = ty_hash_mix(h, kids[i]);
+    for (i = 0; i < nbits; i++)
+        h = ty_hash_mix(h, bits[i]);
+    return (u32)(h ^ (h >> 32));
+}
+
+static int ty_same(const C6Type *t, u8 kind, u8 qual, u16 align, u32 size, u32 nkid,
+                   u32 a, u32 b, u32 tag, const u32 *kids, u32 nbits, const u32 *bits)
+{
+    u32 i = 0;
+
+    if (t->kind != kind || t->qual != qual || t->align != align || t->size != size ||
+        t->nkid != nkid || t->a != a || t->b != b || t->tag != tag)
+        return 0;
+    for (i = 0; i < nkid; i++)
+        if (t->kids[i] != kids[i])
+            return 0;
+    for (i = 0; i < nbits; i++)
+        if (!t->bits || t->bits[i] != bits[i])
+            return 0;
+    return 1;
+}
+
+static u32 *ty_dup(const u32 *src, u32 n)
+{
+    u32 *p = NULL;
+
+    if (!n)
+        return NULL;
+    p = arena_alloc(&A_main, (size_t)n * sizeof(u32));
+    memcpy(p, src, (size_t)n * sizeof(u32));
+    return p;
+}
+
+static void tt_init(void)
+{
+    u32 i = 0;
+
+    TT.cap = 1024;
+    TT.n = 0;
+    TT.buckets = arena_zalloc(&A_main, (size_t)TT.cap * sizeof(u32));
+    TT.chcap = 16;
+    TT.ch = arena_zalloc(&A_main, (size_t)TT.chcap * sizeof(C6Type *));
+    for (i = 0; i < TT.cap; i++)
+        TT.buckets[i] = 0xFFFFFFFFu;
+    /* id 0 保留成“无效类型”：前端到处用 `if (!ty)` 当哨兵，
+     * 如果第一个真类型拿到 id 0，就会被当成“没有类型”
+     * （踩过：`char *msg` 的 char 是 id 0 → 走进 `if (!base)` → 变成 int，
+     *  于是 `msg[1]` 按 4 字节步长取址、按 int 读）。 */
+    (void)ty_intern_full(TY_VOID, 0, 1, 0, 0, 0, 0, 0xFFFFFFFEu, NULL, 0, NULL, NULL);
+}
+
+static void tt_grow(void)
+{
+    u32 ncap = TT.cap * 2;
+    u32 *nb = arena_zalloc(&A_main, (size_t)ncap * sizeof(u32));
+    u32 i = 0;
+
+    for (i = 0; i < ncap; i++)
+        nb[i] = 0xFFFFFFFFu;
+    for (i = 0; i < TT.n; i++) {
+        u32 slot = TY_AT(i)->hash & (ncap - 1);
+
+        while (nb[slot] != 0xFFFFFFFFu)
+            slot = (slot + 1) & (ncap - 1);
+        nb[slot] = i;
+    }
+    TT.buckets = nb;
+    TT.cap = ncap;
+}
+
+static u32 ty_intern_full(u8 kind, u8 qual, u16 align, u32 size, u32 nkid, u32 a, u32 b,
+                          u32 tag, const u32 *kids, u32 nbits, const u32 *bits,
+                          const u32 *offs)
+{
+    u32 h = 0;
+    u32 slot = 0;
+    C6Type *t = NULL;
+
+    if (!TT.cap)
+        tt_init();
+    /* 先扩容再定位：否则算出来的 slot 属于旧表 */
+    if ((u64)(TT.n + 1) * 10 >= (u64)TT.cap * 7)
+        tt_grow();
+    h = ty_hash(kind, qual, align, size, nkid, a, b, tag, kids, nbits, bits);
+    slot = h & (TT.cap - 1);
+    while (TT.buckets[slot] != 0xFFFFFFFFu) {
+        t = TY_AT(TT.buckets[slot]);
+        if (t->hash == h &&
+            ty_same(t, kind, qual, align, size, nkid, a, b, tag, kids, nbits, bits))
+            return TT.buckets[slot];
+        slot = (slot + 1) & (TT.cap - 1);
+    }
+    if (!(TT.n & TY_BLOCK_MASK)) {
+        u32 blk = TT.n >> TY_BLOCK_BITS;
+
+        if (blk >= TT.chcap) {
+            u32 ncap = TT.chcap * 2;
+            C6Type **nch = arena_zalloc(&A_main, (size_t)ncap * sizeof(C6Type *));
+
+            memcpy(nch, TT.ch, (size_t)TT.chcap * sizeof(C6Type *));
+            TT.ch = nch;
+            TT.chcap = ncap;
+        }
+        TT.ch[blk] = arena_alloc(&A_main, (size_t)TY_BLOCK_SIZE * sizeof(C6Type));
+    }
+    t = TY_AT(TT.n);
+    memset(t, 0, sizeof(*t));
+    t->kind = kind;
+    t->qual = qual;
+    t->align = align;
+    t->size = size;
+    t->nkid = nkid;
+    t->a = a;
+    t->b = b;
+    t->tag = tag;
+    t->hash = h;
+    t->kids = ty_dup(kids, nkid);
+    t->offs = nkid ? offs : NULL;      /* 所有权：调用方给的 arena 数组 */
+    t->bits = nbits ? bits : NULL;
+    TT.buckets[slot] = TT.n;
+    TT.n++;
+    return TT.n - 1;
+}
+
+static u32 ty_leaf(u8 kind, u8 qual, u32 size, u16 align)
+{
+    return ty_intern_full(kind, qual, align, size, 0, 0, 0, TY_NO_TAG, NULL, 0, NULL, NULL);
+}
+
+static u32 ty_void(void)    { return ty_leaf(TY_VOID, 0, 0, 1); }
+static u32 ty_bool(void)    { return ty_leaf(TY_BOOL, 0, 1, 1); }
+static u32 ty_char(void)    { return ty_leaf(TY_CHAR, 0, 1, 1); }
+static u32 ty_schar(void)   { return ty_leaf(TY_SCHAR, 0, 1, 1); }
+static u32 ty_uchar(void)   { return ty_leaf(TY_UCHAR, 0, 1, 1); }
+static u32 ty_short(void)   { return ty_leaf(TY_SHORT, 0, 2, 2); }
+static u32 ty_ushort(void)  { return ty_leaf(TY_USHORT, 0, 2, 2); }
+static u32 ty_int(void)     { return ty_leaf(TY_INT, 0, 4, 4); }
+static u32 ty_uint(void)    { return ty_leaf(TY_UINT, 0, 4, 4); }
+static u32 ty_long(void)    { return ty_leaf(TY_LONG, 0, 8, 8); }
+static u32 ty_ulong(void)   { return ty_leaf(TY_ULONG, 0, 8, 8); }
+static u32 ty_llong(void)   { return ty_leaf(TY_LLONG, 0, 8, 8); }
+static u32 ty_ullong(void)  { return ty_leaf(TY_ULLONG, 0, 8, 8); }
+static u32 ty_float(void)   { return ty_leaf(TY_FLOAT, 0, 4, 4); }
+static u32 ty_double(void)  { return ty_leaf(TY_DOUBLE, 0, 8, 8); }
+static u32 ty_ldouble(void) { return ty_leaf(TY_LDOUBLE, 0, 16, 16); }
+
+/* typeof：类型已经是 intern 过的 id，重新限定只需要再 intern 一次 */
+static u32 ty_qual(u32 id, u8 add)
+{
+    C6Type *t = TY_AT(id);
+
+    return ty_intern_full(t->kind, (u8)(t->qual | add), t->align, t->size, t->nkid,
+                          t->a, t->b, t->tag, t->kids, t->nkid, t->bits, t->offs);
+}
+
+static u32 ty_ptr(u32 elem)
+{
+    u32 k = elem;
+
+    return ty_intern_full(TY_PTR, 0, 8, 8, 1, 0, 0, TY_NO_TAG, &k, 0, NULL, NULL);
+}
+
+/* 闭包类型：一个机器字，指向堆上的 {代码指针, 捕获变量…}。
+ * 和函数指针**不同**——调用要把闭包自己当隐藏的首参传进去。 */
+/* 到底有没有闭包类型：没有的话 store_conv 那条热路径可以直接跳过检查 */
+static int TY_HAS_CLOSURE;
+
+static u32 ty_closure(u32 fty)
+{
+    u32 k = fty;
+
+    TY_HAS_CLOSURE = 1;
+
+    return ty_intern_full(TY_CLOSURE, 0, 8, 8, 1, 0, 0, TY_NO_TAG, &k, 0, NULL, NULL);
+}
+
+static int ty_is_closure(u32 id, u32 *fty)
+{
+    C6Type *t = TY_AT(id);
+
+    if (t->kind != TY_CLOSURE)
+        return 0;
+    if (fty)
+        *fty = t->kids[0];
+    return 1;
+}
+
+/* 去掉顶层的 const/volatile/restrict：`_Generic` 匹配按 C11 要忽略它们
+ * （控制表达式走左值转换、分支里的 `(float const)*` 强转也丢顶层限定符）。 */
+static u32 ty_unqual(u32 t)
+{
+    C6Type *x = TY_AT(t);
+
+    if (!x->qual)
+        return t;
+    return ty_intern_full(x->kind, 0, x->align, x->size, x->nkid, x->a, x->b,
+                          x->tag, x->kids, x->a, x->bits, x->offs);
+}
+
+static u32 ty_thread(void)
+{
+    return ty_intern_full(TY_THREAD, 0, 8, 8, 0, 0, 0, TY_NO_TAG, NULL, 0, NULL, NULL);
+}
+
+static int ty_is_thread(u32 id)
+{
+    return TY_AT(id)->kind == TY_THREAD;
+}
+
+/* `task t = f(x);` 的句柄类型：和 thread 一样是单字，但方法表不一样
+ * （wait/done/kind/cancel/start + val，见 parse.c6 的内建成员）。 */
+static u32 ty_task(void)
+{
+    return ty_intern_full(TY_TASK, 0, 8, 8, 0, 0, 0, TY_NO_TAG, NULL, 0, NULL, NULL);
+}
+
+static int ty_is_taskh(u32 id)
+{
+    return TY_AT(id)->kind == TY_TASK;
+}
+
+static u32 ty_array(u32 elem, u32 n)
+{
+    u32 k = elem;
+    u32 size = n ? ty_size(elem) * n : 0;
+
+    return ty_intern_full(TY_ARRAY, 0, ty_align_of(elem), size, 1, n, 0, TY_NO_TAG,
+                          &k, 0, NULL, NULL);
+}
+
+static u32 ty_func(u32 ret, const u32 *params, u32 n, u32 variadic)
+{
+    u32 sc[TY_PARAM_MAX] = {0};
+    u32 *kids = sc;
+    u32 r = 0;
+
+    if (n + 1 > TY_PARAM_MAX) {
+        kids = arena_alloc(&A_main, (size_t)(n + 1) * sizeof(u32));
+    }
+    kids[0] = ret;
+    if (n)
+        memcpy(kids + 1, params, (size_t)n * sizeof(u32));
+    r = ty_intern_full(TY_FUNC, 0, 1, 0, n + 1, n, variadic, TY_NO_TAG, kids, 0, NULL, NULL);
+    return r;
+}
+
+/* struct/union 布局（SysV x86_64，无 #pragma pack 时这套就够）。
+ * 位域：放得进当前单元就复用单元，放不进就跳到下一个单元；:0 只做对齐。 */
+/* 打包布局：`#pragma pack(N)` 和 `__attribute__((packed))` 都落到这个量上。
+ * 0 = 自然对齐；N = 成员对齐不超过 N；1 = packed（等价于 pack(1)）。
+ * pp.c6 / parse.c6 设置它，布局时读。 */
+static int TY_PACK;
+/* `__attribute__((aligned(N)))` / `__declspec(align(N))` 作用在结构体上：
+ * 结构体对齐（以及总大小的取整）至少是 N。0 = 没写。 */
+static int TY_ALIGN;
+
+typedef struct AggLay {
+    u32 *offs;
+    u32 *bcopy;
+    u32 size;
+    u32 align;
+} AggLay;
+
+static void agg_layout(const u32 *mem, const u32 *bits, u32 n, int is_union, AggLay *L)
+{
+    u32 *offs = arena_alloc(&A_main, (size_t)(n ? n : 1) * sizeof(u32));
+    u32 *bcopy = arena_alloc(&A_main, (size_t)(n ? n : 1) * sizeof(u32));
+    u32 i = 0;
+    u32 maxalign = 1;
+    u64 bitpos = 0;
+    u32 unit_used = 0;
+    u32 unit_bits = 0;
+    u32 unit_off = 0;
+
+    for (i = 0; i < n; i++) {
+        u32 al = ty_align_of(mem[i]);
+        u32 sz = ty_size(mem[i]);
+        u32 raw = bits ? bits[i] : 0;
+        u32 isbf = (raw & 0x80000000u) ? 1u : 0u;
+        u32 bw = isbf ? (raw & 0xFFu) : 0u;   /* 位宽只占低 8 位，其余是标记 */
+        /* 成员级 `__attribute__((aligned(N)))` 编码在 bits[] 的 14..29 位
+         * （log2(N)+1，0 = 没写）：解析器在 parse_struct_body 里写进来。 */
+        u32 mal = (raw >> 14) & 0xFFFFu;
+        int anon = (raw & 0x2000u) ? 1 : 0;   /* 无名位域（`:32` / `:0`） */
+
+        if (mal) {
+            u32 ma = 1u << ((mal - 1) & 31);
+
+            if (ma > al)
+                al = ma;
+        }
+        if (TY_PACK && al > (u32)TY_PACK)
+            al = (u32)TY_PACK;          /* 打包：成员对齐压到 N */
+        if (!anon && al > maxalign)
+            maxalign = al;              /* 无名位域不抬对齐（gcc 的口径） */
+        if (is_union) {
+            offs[i] = 0;
+            bcopy[i] = raw;
+            if (sz > (u32)(bitpos / 8))
+                bitpos = (u64)sz * 8;
+            continue;
+        }
+        if (!isbf) {
+            /* 普通成员（没有 0x80000000 标记；位域即使是零宽也会带这个标记） */
+            bitpos = (bitpos + (u64)al * 8 - 1) / ((u64)al * 8) * ((u64)al * 8);
+            offs[i] = (u32)(bitpos / 8);
+            bcopy[i] = raw;
+            bitpos += (u64)sz * 8;
+            unit_used = 0;
+            unit_bits = 0;
+            continue;
+        }
+        bcopy[i] = raw;
+        if (bw == 0) {
+            /* 无名 `:0`：只把当前位置对齐到该类型宽度，不占位 */
+            bitpos = (bitpos + (u64)sz * 8 - 1) / ((u64)sz * 8) * ((u64)sz * 8);
+            offs[i] = (u32)(bitpos / 8);
+            bcopy[i] = (raw & 0x2000u) | 0x80000000u;   /* 记住"无名" */
+            unit_used = 0;
+            unit_bits = 0;
+            continue;
+        }
+        /* 成员上写了 aligned(N)：字段起点先对到 N 字节边界（packed 里 N 被压到
+         * pack 的粒度）。tests2/95_bitfields 的 `A char a:4` 靠这个。 */
+        if (mal) {
+            u64 unit = (u64)al * 8;
+
+            bitpos = (bitpos + unit - 1) / unit * unit;
+        }
+        /* 位域按 SysV 的规矩放：从当前位位置开始，**只要不跨过按声明类型宽度
+         * 划的单元边界**就不挪；跨了就挪到下一个边界。`char x; unsigned a:3`
+         * 里 a 从字节 1 开始（单元是结构起点算的 32 位块），而
+         * `unsigned z:28` 在 bit 19 时跨了 32 位边界，得挪到 bit 32。
+         * packed 结构体里 gcc 是**连续紧排**的，不做这个跳跃。 */
+        {
+            u64 uend = ((bitpos / ((u64)sz * 8)) + 1) * ((u64)sz * 8);
+
+            if (!TY_PACK && bitpos + bw > uend)
+                bitpos = uend;
+            unit_off = (u32)(bitpos / 8);
+            unit_used = (u32)(bitpos % 8);
+            offs[i] = unit_off;
+            /* 成员偏移指向存储单元起始字节，位偏移单独编码 */
+            bcopy[i] = (raw & 0x40002000u) | 0x80000000u | (unit_used << 8) | bw;
+            bitpos += bw;
+        }
+    }
+    if (TY_ALIGN && (u32)TY_ALIGN > maxalign)
+        maxalign = (u32)TY_ALIGN;
+    {
+        u64 szb = (bitpos + 7) / 8;
+
+        /* 空 struct/union（GNU 扩展）大小是 0，不是 1：gcc/tcc 都这样，
+         * `struct { u8 a; empty_s e; u8 b; }` 因此是 2 字节而不是 3。 */
+        if (!n)
+            szb = 0;
+        szb = (szb + maxalign - 1) / maxalign * maxalign;
+        L->offs = offs;
+        L->bcopy = bcopy;
+        L->size = (u32)szb;
+        L->align = maxalign;
+    }
+}
+
+static u32 ty_agg(const u32 *mem, const u32 *bits, u32 n, int is_union, u32 tag)
+{
+    AggLay L = {0};
+
+    agg_layout(mem, bits, n, is_union, &L);
+    return ty_intern_full(is_union ? TY_UNION : TY_STRUCT, 0, (u16)L.align, L.size, n, n,
+                          is_union ? 1u : 0u, tag, mem, n, L.bcopy, L.offs);
+}
+
+/* 补全一个已经存在的（前置声明出来的）类型 id。
+ * `typedef struct X X; ... struct X { … };` 必须让先前那个 id 变成完整类型，
+ * 否则所有早先写的 `X *p` 都查不到成员——tcc 的 TCCState 正是这个形状。 */
+static u32 ty_agg_complete(u32 id, const u32 *mem, const u32 *bits, u32 n, int is_union)
+{
+    AggLay L = {0};
+    C6Type *t = TY_AT(id);
+
+    agg_layout(mem, bits, n, is_union, &L);
+    t->align = (u16)L.align;
+    t->size = L.size;
+    t->nkid = n;
+    t->a = n;
+    t->b = is_union ? 1u : 0u;
+    t->kids = ty_dup(mem, n);
+    t->offs = L.offs;
+    t->bits = n ? L.bcopy : NULL;
+    return id;
+}
+
+/* --- 查询 --- */
+static u32 ty_size(u32 id) { return TY_AT(id)->size; }
+static u16 ty_align_of(u32 id) { return TY_AT(id)->align; }
+static u8 ty_kind(u32 id) { return TY_AT(id)->kind; }
+static int ty_is_int(u32 id)
+{
+    u8 k = TY_AT(id)->kind;
+
+    return k >= TY_CHAR && k <= TY_ULLONG;
+}
+static int ty_is_float(u32 id)
+{
+    u8 k = TY_AT(id)->kind;
+
+    return k == TY_FLOAT || k == TY_DOUBLE || k == TY_LDOUBLE;
+}
+static int ty_is_ptr(u32 id) { return TY_AT(id)->kind == TY_PTR; }
+static int ty_is_agg(u32 id)
+{
+    u8 k = TY_AT(id)->kind;
+
+    return k == TY_STRUCT || k == TY_UNION;
+}
+static int ty_is_union(u32 id) { return TY_AT(id)->kind == TY_UNION; }
+static u32 ty_target(u32 id)
+{
+    u8 k = TY_AT(id)->kind;
+
+    if (k == TY_PTR || k == TY_ARRAY || k == TY_FUNC)
+        return TY_AT(id)->kids[0];
+    return id;
+}
+static u32 ty_array_n(u32 id) { return TY_AT(id)->kind == TY_ARRAY ? TY_AT(id)->a : 0; }
+static int ty_is_array(u32 id) { return TY_AT(id)->kind == TY_ARRAY; }
+static u32 ty_func_variadic(u32 id)
+{
+    return TY_AT(id)->kind == TY_FUNC ? TY_AT(id)->b : 0;
+}
+static int ty_is_func(u32 id) { return TY_AT(id)->kind == TY_FUNC; }
+static u32 ty_func_nparams(u32 id)
+{
+    return TY_AT(id)->kind == TY_FUNC ? TY_AT(id)->a : 0;
+}
+static u32 ty_func_ret(u32 id)
+{
+    return TY_AT(id)->kind == TY_FUNC ? TY_AT(id)->kids[0] : 0;
+}
+
+static u32 ty_func_param(u32 id, u32 i)
+{
+    if (TY_AT(id)->kind != TY_FUNC || i >= TY_AT(id)->a)
+        return 0;
+    return TY_AT(id)->kids[i + 1];
+}
+static int ty_is_scalar(u32 id)
+{
+    u8 k = TY_AT(id)->kind;
+
+    return k != TY_VOID && k != TY_STRUCT && k != TY_UNION && k != TY_ARRAY && k != TY_FUNC;
+}
+static int ty_is_signed(u32 id)
+{
+    u8 k = TY_AT(id)->kind;
+
+    return k == TY_CHAR || k == TY_SCHAR || k == TY_SHORT || k == TY_INT || k == TY_LONG ||
+           k == TY_LLONG || k == TY_FLOAT || k == TY_DOUBLE || k == TY_LDOUBLE;
+}
+static u32 ty_member_n(u32 id) { return TY_AT(id)->a; }
+static u32 ty_member(u32 id, u32 i) { return TY_AT(id)->kids[i]; }
+static u32 ty_member_off(u32 id, u32 i) { return TY_AT(id)->offs[i]; }
+/* 无名成员（`unsigned : 32;` / `:0`）：不占初始化器位置、不抬结构体对齐
+ * （gcc 就是这个口径：`{int a; unsigned :32; int b; unsigned long long :64;
+ * int c;}` 是 28 字节、对齐 4，不是 32）。 */
+static int ty_member_anon(u32 id, u32 i)
+{
+    return (TY_AT(id)->bits[i] & 0x2000u) ? 1 : 0;
+}
+
+/* 位域：宽度（0 = 普通成员）、存储单元内的位偏移 */
+static u32 ty_member_bits(u32 id, u32 i)
+{
+    u32 raw = TY_AT(id)->bits[i];
+
+    return (raw & 0x80000000u) ? (raw & 0xFFu) : 0;
+}
+
+/* 成员 i 是不是位域（含零宽、含无名）？ty_member_bits() 只返回**宽度**、
+ * 把标志位剥掉了，普通成员的宽度也是 0 ——「是不是位域」只能看 bits[] 的
+ * 原始标记。初始化器的按位置填充要用它跳过无名位域。 */
+static u32 ty_member_is_bf(u32 id, u32 i)
+{
+    return (TY_AT(id)->bits[i] & 0x80000000u) ? 1 : 0;
+}
+
+/* 枚举位域：按零扩展（tcc 的约定） */
+static u32 ty_member_enum_bf(u32 id, u32 i)
+{
+    u32 raw = TY_AT(id)->bits[i];
+
+    return (raw & 0x40000000u) ? 1 : 0;
+}
+
+static u32 ty_member_bitoff(u32 id, u32 i)
+{
+    u32 raw = TY_AT(id)->bits[i];
+
+    return (raw & 0x80000000u) ? ((raw >> 8) & 0x3Fu) : 0;
+}
+
+/* --- 自测：--type-selftest --- */
+typedef struct TyProbe {
+    const char *n;
+    u32 id;
+    u32 sz;
+    u32 al;
+} TyProbe;
+
+static int type_selftest(void)
+{
+    int bad = 0;
+
+    tt_init();
+
+    /* 1. 基础类型大小/对齐 */
+    {
+        TyProbe base[16] = {{0}};
+        u32 nb = 0;
+        u32 i = 0;
+
+        base[nb].n = "void"; base[nb].id = ty_void(); base[nb].sz = 0; base[nb].al = 1; nb++;
+        base[nb].n = "char"; base[nb].id = ty_char(); base[nb].sz = 1; base[nb].al = 1; nb++;
+        base[nb].n = "short"; base[nb].id = ty_short(); base[nb].sz = 2; base[nb].al = 2; nb++;
+        base[nb].n = "int"; base[nb].id = ty_int(); base[nb].sz = 4; base[nb].al = 4; nb++;
+        base[nb].n = "long"; base[nb].id = ty_long(); base[nb].sz = 8; base[nb].al = 8; nb++;
+        base[nb].n = "llong"; base[nb].id = ty_llong(); base[nb].sz = 8; base[nb].al = 8; nb++;
+        base[nb].n = "float"; base[nb].id = ty_float(); base[nb].sz = 4; base[nb].al = 4; nb++;
+        base[nb].n = "double"; base[nb].id = ty_double(); base[nb].sz = 8; base[nb].al = 8; nb++;
+        base[nb].n = "ldouble"; base[nb].id = ty_ldouble(); base[nb].sz = 16; base[nb].al = 16; nb++;
+        for (i = 0; i < nb; i++)
+            if (ty_size(base[i].id) != base[i].sz || ty_align_of(base[i].id) != base[i].al) {
+                printf("type: 失败：%s 是 %u/%u，应为 %u/%u\n", base[i].n,
+                       ty_size(base[i].id), ty_align_of(base[i].id), base[i].sz, base[i].al);
+                bad++;
+            }
+    }
+
+    /* 2a. 指针必须真的指向它的元类型（曾经 kids 串了，导致 char* 的元素类型是 int） */
+    if (ty_target(ty_ptr(ty_char())) != ty_char() ||
+        ty_target(ty_ptr(ty_long())) != ty_long() ||
+        ty_size(ty_target(ty_ptr(ty_char()))) != 1) {
+        printf("type: 失败：ptr 的元类型串了（char* 的元素 %u/%u）\n",
+               ty_target(ty_ptr(ty_char())), ty_size(ty_target(ty_ptr(ty_char()))));
+        bad++;
+    }
+
+    /* 2. hash-consing：同构同 id，异构不同 id */
+    if (ty_ptr(ty_int()) != ty_ptr(ty_int())) {
+        printf("type: 失败：ptr(int) 两次 intern 不同 id\n");
+        bad++;
+    }
+    if (ty_ptr(ty_int()) == ty_ptr(ty_long())) {
+        printf("type: 失败：ptr(int) 与 ptr(long) 同 id\n");
+        bad++;
+    }
+    if (ty_array(ty_int(), 3) == ty_array(ty_int(), 4)) {
+        printf("type: 失败：int[3] 与 int[4] 同 id\n");
+        bad++;
+    }
+    if (ty_size(ty_array(ty_int(), 3)) != 12 || ty_align_of(ty_array(ty_int(), 3)) != 4) {
+        printf("type: 失败：int[3] 大小/对齐错\n");
+        bad++;
+    }
+    if (ty_size(ty_array(ty_int(), 0)) != 0) {
+        printf("type: 失败：不完整数组大小应为 0\n");
+        bad++;
+    }
+    if (ty_qual(ty_int(), TQ_CONST) == ty_int()) {
+        printf("type: 失败：const int 与 int 同 id\n");
+        bad++;
+    }
+    if (ty_qual(ty_int(), TQ_CONST) != ty_qual(ty_int(), TQ_CONST)) {
+        printf("type: 失败：const int 两次 intern 不同 id\n");
+        bad++;
+    }
+    {
+        u32 p2[2] = {ty_int(), ty_long()};
+
+        if (ty_func(ty_int(), p2, 2, 0) != ty_func(ty_int(), p2, 2, 0)) {
+            printf("type: 失败：同签名函数类型不同 id\n");
+            bad++;
+        }
+        if (ty_func(ty_int(), p2, 2, 0) == ty_func(ty_int(), p2, 2, 1)) {
+            printf("type: 失败：变参与非变参函数同 id\n");
+            bad++;
+        }
+        if (ty_size(ty_func(ty_int(), p2, 2, 0)) != 0) {
+            printf("type: 失败：函数类型大小应为 0\n");
+            bad++;
+        }
+    }
+
+    /* 3. struct 布局 */
+    {
+        u32 m[2] = {0};
+        u32 s = 0;
+
+        m[0] = ty_char();
+        m[1] = ty_int();
+        s = ty_agg(m, NULL, 2, 0, 1);
+        if (ty_size(s) != 8 || ty_align_of(s) != 4 || ty_member_off(s, 0) != 0 ||
+            ty_member_off(s, 1) != 4) {
+            printf("type: 失败：{char;int} 布局 %u/%u off %u/%u\n", ty_size(s),
+                   ty_align_of(s), ty_member_off(s, 0), ty_member_off(s, 1));
+            bad++;
+        }
+        m[1] = ty_long();
+        s = ty_agg(m, NULL, 2, 0, 2);
+        if (ty_size(s) != 16 || ty_align_of(s) != 8 || ty_member_off(s, 1) != 8) {
+            printf("type: 失败：{char;long} 布局 %u/%u off %u\n", ty_size(s),
+                   ty_align_of(s), ty_member_off(s, 1));
+            bad++;
+        }
+        s = ty_agg(m, NULL, 2, 1, 3);
+        if (ty_size(s) != 8 || ty_align_of(s) != 8) {
+            printf("type: 失败：union {char;long} 布局 %u/%u\n", ty_size(s), ty_align_of(s));
+            bad++;
+        }
+    }
+
+    /* 4. 位域布局 */
+    {
+        u32 m[3] = {0};
+        u32 bw[3] = {0};
+        u32 s = 0;
+
+        /* 编码约定：位域在 bits[] 里一定带 0x80000000（见 agg_layout），
+         * 不带就是普通成员——自测也按这个约定写。 */
+        m[0] = ty_int(); bw[0] = 3u | 0x80000000u;
+        m[1] = ty_int(); bw[1] = 5u | 0x80000000u;
+        m[2] = ty_int(); bw[2] = 24u | 0x80000000u;
+        s = ty_agg(m, bw, 3, 0, 4);
+        if (ty_size(s) != 4) {
+            printf("type: 失败：{int a:3,b:5,c:24} 应为 4 字节，实际 %u\n", ty_size(s));
+            bad++;
+        }
+        m[0] = ty_int(); bw[0] = 3u | 0x80000000u;
+        m[1] = ty_int(); bw[1] = 30u | 0x80000000u;
+        s = ty_agg(m, bw, 2, 0, 5);
+        if (ty_size(s) != 8) {
+            printf("type: 失败：{int a:3,b:30} 应为 8 字节（跨单元），实际 %u\n", ty_size(s));
+            bad++;
+        }
+        if (ty_member_bits(s, 0) != 3 || ty_member_bits(s, 1) != 30) {
+            printf("type: 失败：位宽没存住\n");
+            bad++;
+        }
+    }
+
+    /* 5. 同形状不同标签必须是不同类型；匿名结构按形状 intern */
+    {
+        u32 m[1] = {0};
+        u32 a = 0;
+        u32 b = 0;
+        u32 c = 0;
+
+        m[0] = ty_int();
+        a = ty_agg(m, NULL, 1, 0, 100);
+        b = ty_agg(m, NULL, 1, 0, 101);
+        c = ty_agg(m, NULL, 1, 0, 0);
+        if (a == b) {
+            printf("type: 失败：不同标签的同形 struct 同 id\n");
+            bad++;
+        }
+        if (c != ty_agg(m, NULL, 1, 0, 0)) {
+            printf("type: 失败：匿名 struct 没有按形状 intern\n");
+            bad++;
+        }
+    }
+
+    /* 6. 规模：20k 个不同类型，含扩容；查旧类型仍然命中 */
+    {
+        u32 k = 0;
+        u32 first = 0;
+
+        first = ty_array(ty_int(), 1);
+        for (k = 1; k <= 20000; k++) {
+            u32 id = ty_array(ty_int(), k);
+
+            if (ty_size(id) != k * 4) {
+                printf("type: 失败：int[%u] 大小 %u\n", k, ty_size(id));
+                bad++;
+                break;
+            }
+        }
+        if (ty_array(ty_int(), 1) != first) {
+            printf("type: 失败：20k 类型之后查表拿不到同一个 id\n");
+            bad++;
+        }
+    }
+
+    if (bad) {
+        printf("type: 自测失败 %d 项\n", bad);
+        return 1;
+    }
+    printf("type: 自测通过（%u 个类型，桶 %u，arena %.2f MB）\n", TT.n, TT.cap,
+           (double)A_main.total / (1024.0 * 1024.0));
+    return 0;
+}

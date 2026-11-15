@@ -1,0 +1,54 @@
+/* diag.c6 —— 诊断器（design.md §12：带列号与源码片段，不像 tcc 只有行号）
+ *
+ * 位置一律是 (SrcFile, off)：行号由行号表二分算出，列号 = off - 行首 + 1。
+ * 输出格式与 gcc/tcc 一致（path:line:col: error: msg），编辑器与 CI 都能直接解析。
+ */
+
+typedef struct Diag {
+    int errors;
+    int warnings;
+} Diag;
+
+static Diag DG;
+
+static void diag_vreport(int is_err, SrcFile *f, u32 off, const char *fmt, va_list ap)
+{
+    if (f) {
+        u32 line = src_line_of(f, off);
+        u32 col = off - f->lines[line - 1] + 1;
+        fprintf(stderr, "%s:%u:%u: %s: ", f->path, line, col, is_err ? "error" : "warning");
+    } else {
+        fprintf(stderr, "c6c: %s: ", is_err ? "error" : "warning");
+    }
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    if (is_err)
+        DG.errors++;
+    else
+        DG.warnings++;
+}
+
+static void diag_error(SrcFile *f, u32 off, const char *fmt, ...)
+{
+    va_list ap = {0};
+    va_start(ap, fmt);
+    diag_vreport(1, f, off, fmt, ap);
+    va_end(ap);
+}
+
+static void diag_warn(SrcFile *f, u32 off, const char *fmt, ...)
+{
+    va_list ap = {0};
+    va_start(ap, fmt);
+    diag_vreport(0, f, off, fmt, ap);
+    va_end(ap);
+}
+
+/* 驱动层面的错误（参数不对、找不到文件）：没有源码位置 */
+static void diag_error_plain(const char *fmt, ...)
+{
+    va_list ap = {0};
+    va_start(ap, fmt);
+    diag_vreport(1, NULL, 0, fmt, ap);
+    va_end(ap);
+}

@@ -1,0 +1,12 @@
+{
+  "note": "c6c 的性能/内存门槛（bench.py --assert 用）。数字来自 docs/plan.md §2/§3 的实测基线与预算。",
+  "native_ms": 135,
+  "c99_ms": 150,
+  "llvm_ms": 250,
+  "max_rss_mb": 32,
+  "linearity_ratio": 2.6,
+  "linearity_note": "4x 输入对应的时间比（任务书口径：≤2.6x）。注意这个门槛比参考实现自己还严 —— tcc 同口径实测 3.76x/4.21x，c6c 实测 3.5x/3.9x；所以这条现在不达标，但也不算退步。",
+  "self_ms": 100,
+    "pp_ms": 120,
+  "pp_note": "只用预处理层（-E）编 tcc.c 的门槛；tcc 同口径实测 110 ms，c6c P1-3b 实测 85 ms"
+}

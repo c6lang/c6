@@ -1,0 +1,967 @@
+/* llvm.c6 —— LLVM IR 后端：把 IR 翻成文本 LLVM IR（.ll），交给 llc/clang 出机器码。
+ *
+ * 口径和 native / C99 后端**完全一样**（design.md §7）：
+ *   - 虚拟寄存器一律 64 位，落在同一个字节帧里（`%rbp - 16*i - 16`），
+ *     所以"取地址再存"的别名行为和另外两个后端逐条对齐；
+ *   - 浮点是位模式（i64 里装 f32/f64 的位），要算的时候 bitcast 出来；
+ *   - 聚合按地址传、调用约定是"全部 i64 参数"；
+ *   - 数据段是一块 `@__c6l_D`，初值用 `@__c6l_D0` 常量块 memcpy 进去，
+ *     符号地址的重定位在 `c6c_init_data()` 里回填（和 C99 后端同一张表）。
+ *
+ * 为什么调用点走 `bitcast ptr @f to ptr` 再 call：
+ *   前端的调用是"无原型"的（C 里没见到声明就 `f()` 就是这样），同一个
+ *   符号在不同调用点的实参个数可以不同。LLVM 的直接调用要求签名一致，
+ *   而**不透明指针**下的函数指针调用不看被调函数的签名，正好对上 C 的老
+ *   式调用语义；llc 之后就是一条普通 call。
+ *
+ * 三条约束照抄 C99 后端：不常驻 IR、输出稳定（不写地址和时间）、
+ * 不依赖 libc 的 C ABI（运行时在 lib/rt.c6 里，后端编的是同一份源码）。
+ */
+
+static FILE *LL_OUT;        /* 最终 .ll */
+static FILE *LL_FNOUT;      /* 函数体暂存（模块要先发数据块和声明） */
+static int LL_MODE;
+static char LL_TMPNAME[512];
+
+#define LL_FN_MAX 8192
+static char LL_FNNAME[LL_FN_MAX][192];
+static u32 LL_NFN;
+
+#define LL_REF_MAX 16384
+static u32 LL_REF[LL_REF_MAX];
+static u32 LL_NREF;
+
+static int LL_TMP;          /* SSA 临时名计数器（每个函数清零） */
+
+static void llvm_set_mode(void) { LL_MODE = 1; }
+static int llvm_mode(void) { return LL_MODE; }
+
+/* 符号名：ELF 符号可能是 `printf`、`a$b`、`.L1`，统一改成合法 LLVM 标识符。
+ * 用户名字一律 `c6_` 前缀，内部辅助用具名 `__c6l_`，两边不会撞。 */
+static void llvm_sym(u32 sym, char *buf, size_t n)
+{
+    const char *s = (sym < X64.nsym && X64.sym[sym].name) ? X64.sym[sym].name : "?";
+    size_t i = 0;
+    size_t k = 0;
+
+    buf[k++] = 'c';
+    buf[k++] = '6';
+    buf[k++] = '_';
+    for (i = 0; s[i] && k + 4 < n; i++) {
+        char c = s[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '_') {
+            buf[k++] = c;
+        } else {
+            buf[k++] = '_';
+            buf[k++] = "0123456789abcdef"[(c >> 4) & 0xF];
+            buf[k++] = "0123456789abcdef"[c & 0xF];
+        }
+    }
+    buf[k] = 0;
+}
+
+/* 记一个"这个符号被引用过"（收尾时要给它发 declare） */
+static void llvm_ref(u32 sym)
+{
+    u32 i = 0;
+
+    for (i = 0; i < LL_NREF; i++)
+        if (LL_REF[i] == sym)
+            return;
+    if (LL_NREF < LL_REF_MAX)
+        LL_REF[LL_NREF++] = sym;
+}
+
+/* R(v) 的值：`%v<k> = load i64, ptr %s<v>`（帧槽指针在函数入口一次发完） */
+static void ll_get(FILE *f, u32 v, char *o, size_t n)
+{
+    snprintf(o, n, "%%v%d", LL_TMP++);
+    fprintf(f, "  %s = load i64, ptr %%s%u\n", o, (unsigned)v);
+}
+
+static void ll_put(FILE *f, u32 v, const char *val)
+{
+    fprintf(f, "  store i64 %s, ptr %%s%u\n", val, (unsigned)v);
+}
+
+/* 按类型宽度从内存读（零扩展），和 C99 的 c6_ld1/2/4/8 一个口径 */
+static void ll_load_ty(FILE *f, u8 ty, u32 v, char *o, size_t n)
+{
+    u32 sz = ir_type_size(ty);
+    char a[32] = {0};
+    char p[32] = {0};
+    char t[32] = {0};
+
+    /* IR_LOAD 的 a 是**装着地址的虚寄存器**：先取值，再当指针用。
+     * （踩过：直接 load %s<v> 读到的是地址自己的字节。） */
+    ll_get(f, v, a, sizeof(a));
+    snprintf(p, sizeof(p), "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = inttoptr i64 %s to ptr\n", p, a);
+    snprintf(o, n, "%%v%d", LL_TMP++);
+    if (sz >= 8) {
+        fprintf(f, "  %s = load i64, ptr %s\n", o, p);
+        return;
+    }
+    snprintf(t, sizeof(t), "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = load i%d, ptr %s\n", t, (int)(sz * 8), p);
+    fprintf(f, "  %s = zext i%d %s to i64\n", o, (int)(sz * 8), t);
+}
+
+/* 按类型宽度写内存（截断），val 是一个 i64 值表达式 */
+static void ll_store_ty(FILE *f, u8 ty, u32 addr_vreg, const char *val)
+{
+    u32 sz = ir_type_size(ty);
+    char a[32] = {0};
+    char p[32] = {0};
+    char t[32] = {0};
+
+    ll_get(f, addr_vreg, a, sizeof(a));
+    snprintf(p, sizeof(p), "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = inttoptr i64 %s to ptr\n", p, a);
+    if (sz >= 8) {
+        fprintf(f, "  store i64 %s, ptr %s\n", val, p);
+        return;
+    }
+    snprintf(t, sizeof(t), "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = trunc i64 %s to i%d\n", t, val, (int)(sz * 8));
+    fprintf(f, "  store i%d %s, ptr %s\n", (int)(sz * 8), t, p);
+}
+
+/* i64 位模式 → double / float */
+static void ll_as_f64(FILE *f, u32 v, char *o, size_t n)
+{
+    char t[32] = {0};
+
+    ll_get(f, v, t, sizeof(t));
+    snprintf(o, n, "%%d%d", LL_TMP++);
+    fprintf(f, "  %s = bitcast i64 %s to double\n", o, t);
+}
+
+static void ll_as_f32(FILE *f, u32 v, char *o, size_t n)
+{
+    char t[32] = {0};
+    char h[32] = {0};
+
+    ll_get(f, v, t, sizeof(t));
+    snprintf(h, sizeof(h), "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = trunc i64 %s to i32\n", h, t);
+    snprintf(o, n, "%%h%d", LL_TMP++);
+    fprintf(f, "  %s = bitcast i32 %s to float\n", o, h);
+}
+
+/* double / float → i64 位模式 */
+static void ll_of_f64(FILE *f, const char *d, char *o, size_t n)
+{
+    snprintf(o, n, "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = bitcast double %s to i64\n", o, d);
+}
+
+static void ll_of_f32(FILE *f, const char *h, char *o, size_t n)
+{
+    char t[32] = {0};
+
+    snprintf(t, sizeof(t), "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = bitcast float %s to i32\n", t, h);
+    snprintf(o, n, "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = zext i32 %s to i64\n", o, t);
+}
+
+/* 定长符号位扩展/截断：TRUNC/SEXT/ZEXT 到目标宽度（有符号类型补符号位） */
+static void ll_narrow(FILE *f, u8 ty, u32 dst, u32 a)
+{
+    int uns = (ty == IRT_U8 || ty == IRT_U16 || ty == IRT_U32 || ty == IRT_U64
+               || ty == IRT_PTR || ty == IRT_F32 || ty == IRT_F64);
+    u32 bits = ir_type_size(ty) * 8;
+    char v[48] = {0};
+    char t[48] = {0};
+
+    if (ty == IRT_VOID || ir_type_size(ty) >= 8) {
+        ll_get(f, a, v, sizeof(v));
+        ll_put(f, dst, v);
+        return;
+    }
+    ll_get(f, a, v, sizeof(v));
+    snprintf(t, sizeof(t), "%%t%d", LL_TMP++);
+    fprintf(f, "  %s = trunc i64 %s to i%u\n", t, v, (unsigned)bits);
+    snprintf(v, sizeof(v), "%%t%d", LL_TMP++);
+    if (uns)
+        fprintf(f, "  %s = zext i%u %s to i64\n", v, (unsigned)bits, t);
+    else
+        fprintf(f, "  %s = sext i%u %s to i64\n", v, (unsigned)bits, t);
+    ll_put(f, dst, v);
+}
+
+/* 函数体。缓冲到暂存流里，模块收尾时再拼到数据块/声明之后。 */
+static void llvm_emit_fn(IrFn *f, u32 func_sym)
+{
+    FILE *out = LL_FNOUT;
+    char nm[256] = {0};
+    char curname[256] = {0};
+    u32 i = 0;
+    u32 k = 0;
+    u32 na = 0;
+    u32 av[64] = {0};
+    u32 frame = 0;
+    int term = 0;           /* 当前基本块已经有终结指令了吗 */
+    u32 labs[512] = {0};
+    u32 nlabs = 0;
+
+    if (!out)
+        return;
+    llvm_sym(func_sym, nm, sizeof(nm));
+    snprintf(curname, sizeof(curname), "%s", nm);
+    if (LL_NFN < LL_FN_MAX) {
+        snprintf(LL_FNNAME[LL_NFN], sizeof(LL_FNNAME[0]), "%s", nm);
+        LL_NFN++;
+    }
+    LL_TMP = 0;
+
+    /* 形参一律 i64；变参函数带 `...`（va_list 走真 ABI） */
+    fprintf(out, "define i64 @%s(", nm);
+    for (k = 0; k < f->nparams; k++)
+        fprintf(out, "%si64 %%arg%u", k ? ", " : "", k);
+    if (f->is_variadic) {
+        if (f->nparams == 0)
+            fprintf(out, "i64 %%arg0, ");
+        else
+            fprintf(out, ", ");
+        fprintf(out, "...");
+    }
+    fprintf(out, ") {\n");
+
+    /* 帧：和 C99/native 同一套（每个虚拟寄存器 16 字节，另加形参区） */
+    frame = 16u * (f->nvreg + 8 + 2);
+    frame = (frame + 15u) & ~15u;
+    fprintf(out, "  %%FR = alloca [%u x i8], align 16\n", frame + 64);
+    fprintf(out, "  %%rbp = getelementptr i8, ptr %%FR, i64 %u\n", frame);
+    fprintf(out, "  call void @llvm.memset.p0.i64(ptr %%FR, i8 0, i64 %u, i1 false)\n",
+            frame + 64);
+    /* 帧槽指针一次发完：R(v) 的地址就是 %rbp - 16*(v+1) */
+    for (k = 0; k < f->nvreg + 16; k++)
+        fprintf(out, "  %%s%u = getelementptr i8, ptr %%rbp, i64 %d\n", k,
+                -16 * (int)(k + 1));
+    if (f->is_variadic) {
+        fprintf(out, "  %%ap = alloca [1 x %%struct.__va_list_tag]\n");
+        fprintf(out, "  call void @llvm.va_start.p0(ptr %%ap)\n");
+    }
+    /* 形参落槽：函数体里对参数的引用是"取槽地址再 load" */
+    for (k = 0; k < f->nparams; k++)
+        fprintf(out, "  store i64 %%arg%u, ptr %%s%u\n", k, (unsigned)f->params[k]);
+
+    /* 计算 goto 的目标表先扫一遍（indirectbr 要求列出所有目的块） */
+    for (i = 0; i < f->n; i++)
+        if (f->ops[i].op == IR_LABEL && nlabs < 512)
+            labs[nlabs++] = f->ops[i].a;
+
+    for (i = 0; i < f->n; i++) {
+        IrOp *o = &f->ops[i];
+        char a1[48] = {0};
+        char b1[48] = {0};
+        char r1[48] = {0};
+        char p1[48] = {0};
+        char t1[48] = {0};
+
+        switch (o->op) {
+        case IR_NOP:
+        case IR_SETRSP:
+        case IR_VAEND:
+            break;
+        case IR_CONST: {
+            i64 cv = (i64)(u32)o->imm;
+
+            if (o->type == IRT_U8)
+                cv = (i64)(u8)cv;
+            else if (o->type == IRT_U16)
+                cv = (i64)(u16)cv;
+            else if (o->type == IRT_U32)
+                cv = (i64)(u32)cv;
+            else if (o->type == IRT_I8)
+                cv = (i64)(int8_t)(u8)cv;
+            else if (o->type == IRT_I16)
+                cv = (i64)(int16_t)(u16)cv;
+            else if (o->type == IRT_I32)
+                cv = (i64)(i32)(u32)cv;
+            fprintf(out, "  store i64 %lld, ptr %%s%u\n", (long long)cv, (unsigned)o->dst);
+            break;
+        }
+        case IR_CONSTK:
+            fprintf(out, "  store i64 %lld, ptr %%s%u\n", (long long)f->kpool[o->imm],
+                    (unsigned)o->dst);
+            break;
+        case IR_MOV:
+            ll_get(out, o->a, a1, sizeof(a1));
+            ll_put(out, o->dst, a1);
+            break;
+        case IR_LOAD:
+            ll_load_ty(out, o->type, o->a, a1, sizeof(a1));
+            ll_put(out, o->dst, a1);
+            break;
+        case IR_STORE:
+            ll_get(out, o->a, a1, sizeof(a1));
+            ll_store_ty(out, o->type, o->dst, a1);
+            break;
+        case IR_ADDR:
+            if (o->flags & 2) {
+                if (o->imm < X64.nsym && X64.sym[o->imm].is_data) {
+                    snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+                    fprintf(out, "  %s = getelementptr i8, ptr @__c6l_D, i64 %d\n", p1,
+                            (int)(X64.sym[o->imm].off - (u32)ELF_HDR));
+                } else {
+                    char sn[256] = {0};
+
+                    llvm_sym(o->imm, sn, sizeof(sn));
+                    llvm_ref(o->imm);
+                    snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+                    fprintf(out, "  %s = bitcast ptr @%s to ptr\n", p1, sn);
+                }
+                snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = ptrtoint ptr %s to i64\n", r1, p1);
+            } else if (o->flags & 1) {
+                snprintf(r1, sizeof(r1), "%u", (unsigned)o->imm);
+            } else {
+                snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = getelementptr i8, ptr %%rbp, i64 %d\n", p1, (int)o->imm);
+                snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = ptrtoint ptr %s to i64\n", r1, p1);
+            }
+            if (o->a) {
+                ll_get(out, o->a, a1, sizeof(a1));
+                snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = add i64 %s, %s\n", t1, r1, a1);
+                snprintf(r1, sizeof(r1), "%s", t1);
+            }
+            ll_put(out, o->dst, r1);
+            break;
+        case IR_LEA: {
+            u32 sc = (o->imm == 2 || o->imm == 4 || o->imm == 8) ? o->imm : 1;
+
+            ll_get(out, o->a, a1, sizeof(a1));
+            if (o->b) {
+                ll_get(out, o->b, b1, sizeof(b1));
+                if (sc == 1) {
+                    snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                    fprintf(out, "  %s = add i64 %s, %s\n", t1, a1, b1);
+                } else {
+                    snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                    fprintf(out, "  %s = mul i64 %s, %u\n", t1, b1, (unsigned)sc);
+                    snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+                    fprintf(out, "  %s = add i64 %s, %s\n", r1, a1, t1);
+                    snprintf(t1, sizeof(t1), "%s", r1);
+                }
+            } else if (o->imm) {
+                snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = add i64 %s, %u\n", t1, a1, (unsigned)o->imm);
+            } else {
+                snprintf(t1, sizeof(t1), "%s", a1);
+            }
+            ll_put(out, o->dst, t1);
+            break;
+        }
+        case IR_ALLOCA:
+            ll_get(out, o->a, a1, sizeof(a1));
+            snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = mul i64 %s, %u\n", t1, a1, (unsigned)o->imm);
+            snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = call ptr @__c6l_alloca(i64 %s)\n", p1, t1);
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = ptrtoint ptr %s to i64\n", r1, p1);
+            ll_put(out, o->dst, r1);
+            break;
+        case IR_COPY:
+        case IR_MEMCPY:
+            ll_get(out, o->dst, a1, sizeof(a1));
+            snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = inttoptr i64 %s to ptr\n", p1, a1);
+            ll_get(out, o->a, b1, sizeof(b1));
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = inttoptr i64 %s to ptr\n", r1, b1);
+            fprintf(out, "  call void @llvm.memcpy.p0.p0.i64(ptr %s, ptr %s, i64 %u,"
+                         " i1 false)\n", p1, r1, (unsigned)o->imm);
+            break;
+        case IR_MEMSET:
+            ll_get(out, o->dst, a1, sizeof(a1));
+            snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = inttoptr i64 %s to ptr\n", p1, a1);
+            ll_get(out, o->a, b1, sizeof(b1));
+            snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = trunc i64 %s to i8\n", t1, b1);
+            fprintf(out, "  call void @llvm.memset.p0.i64(ptr %s, i8 %s, i64 %u,"
+                         " i1 false)\n", p1, t1, (unsigned)o->imm);
+            break;
+        case IR_ADD:
+        case IR_SUB:
+        case IR_MUL:
+        case IR_DIV:
+        case IR_MOD:
+        case IR_UDIV:
+        case IR_UMOD:
+        case IR_AND:
+        case IR_OR:
+        case IR_XOR: {
+            const char *op = "add";
+
+            if (o->op == IR_SUB)
+                op = "sub";
+            else if (o->op == IR_MUL)
+                op = "mul";
+            else if (o->op == IR_DIV)
+                op = "sdiv";
+            else if (o->op == IR_MOD)
+                op = "srem";
+            else if (o->op == IR_UDIV)
+                op = "udiv";
+            else if (o->op == IR_UMOD)
+                op = "urem";
+            else if (o->op == IR_AND)
+                op = "and";
+            else if (o->op == IR_OR)
+                op = "or";
+            else if (o->op == IR_XOR)
+                op = "xor";
+            ll_get(out, o->a, a1, sizeof(a1));
+            ll_get(out, o->b, b1, sizeof(b1));
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = %s i64 %s, %s\n", r1, op, a1, b1);
+            ll_put(out, o->dst, r1);
+            break;
+        }
+        case IR_SHL:
+        case IR_SHR:
+        case IR_SAR: {
+            const char *op = (o->op == IR_SHL) ? "shl" : (o->op == IR_SHR ? "lshr" : "ashr");
+
+            ll_get(out, o->a, a1, sizeof(a1));
+            ll_get(out, o->b, b1, sizeof(b1));
+            snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = and i64 %s, 63\n", t1, b1);
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = %s i64 %s, %s\n", r1, op, a1, t1);
+            ll_put(out, o->dst, r1);
+            break;
+        }
+        case IR_NEG:
+            ll_get(out, o->a, a1, sizeof(a1));
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = sub i64 0, %s\n", r1, a1);
+            ll_put(out, o->dst, r1);
+            break;
+        case IR_NOT:
+            ll_get(out, o->a, a1, sizeof(a1));
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = xor i64 %s, -1\n", r1, a1);
+            ll_put(out, o->dst, r1);
+            break;
+        case IR_CMP: {
+            static const char *const ICC[10] = {
+                "eq", "ne", "slt", "sle", "sgt", "sge", "ult", "ule", "ugt", "uge"
+            };
+            static const char *const FCC[10] = {
+                "oeq", "une", "olt", "ole", "ogt", "oge", "ult", "ule", "ugt", "uge"
+            };
+            const char *pred = "eq";
+            int fp = (o->type == IRT_F32 || o->type == IRT_F64);
+
+            if (o->flags < 10)
+                pred = fp ? FCC[o->flags] : ICC[o->flags];
+            if (fp) {
+                if (o->type == IRT_F32) {
+                    ll_as_f32(out, o->a, a1, sizeof(a1));
+                    ll_as_f32(out, o->b, b1, sizeof(b1));
+                    snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                    fprintf(out, "  %s = fcmp %s float %s, %s\n", t1, pred, a1, b1);
+                } else {
+                    ll_as_f64(out, o->a, a1, sizeof(a1));
+                    ll_as_f64(out, o->b, b1, sizeof(b1));
+                    snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                    fprintf(out, "  %s = fcmp %s double %s, %s\n", t1, pred, a1, b1);
+                }
+            } else {
+                ll_get(out, o->a, a1, sizeof(a1));
+                ll_get(out, o->b, b1, sizeof(b1));
+                snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = icmp %s i64 %s, %s\n", t1, pred, a1, b1);
+            }
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = zext i1 %s to i64\n", r1, t1);
+            ll_put(out, o->dst, r1);
+            break;
+        }
+        case IR_BR:
+            ll_get(out, o->a, a1, sizeof(a1));
+            snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = icmp ne i64 %s, 0\n", t1, a1);
+            fprintf(out, "  br i1 %s, label %%L%u, label %%L%u\n", t1, (unsigned)o->b,
+                    (unsigned)o->c);
+            term = 1;
+            break;
+        case IR_JMP:
+            fprintf(out, "  br label %%L%u\n", (unsigned)o->a);
+            term = 1;
+            break;
+        case IR_LABEL:
+            /* LLVM 的基本块必须有终结指令：IR 里"顺序落到下一个标签"的写法
+             * 在这里要补一条 br（native 后端靠相邻代码自然落下）。 */
+            if (!term)
+                fprintf(out, "  br label %%L%u\n", (unsigned)o->a);
+            fprintf(out, "L%u:\n", (unsigned)o->a);
+            term = 0;
+            break;
+        case IR_ARG:
+            if (na < 24)
+                av[na] = o->a;
+            na++;
+            break;
+        case IR_CALL:
+        case IR_CALLI: {
+            char qs[64][32] = {{0}};
+
+            if (o->op == IR_CALL && (o->flags & 2)) {
+                /* 系统调用约定：arg0 = 调用号，其余按顺序进内核参数 */
+                snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = bitcast ptr @syscall to ptr\n", p1);
+            } else if (o->op == IR_CALL) {
+                char sn[256] = {0};
+
+                llvm_sym(o->imm, sn, sizeof(sn));
+                llvm_ref(o->imm);
+                snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = bitcast ptr @%s to ptr\n", p1, sn);
+            } else {
+                ll_get(out, o->a, a1, sizeof(a1));
+                snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = inttoptr i64 %s to ptr\n", p1, a1);
+            }
+            /* 实参先全部取到 SSA 名里，最后再发 call 指令——
+             * 不能一边拼 call 一边发 load（那样 load 会插进实参表中间）。 */
+            for (k = 0; k < na && k < 24; k++)
+                ll_get(out, av[k], qs[k], sizeof(qs[k]));
+            snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = call i64 %s(", r1, p1);
+            for (k = 0; k < na && k < 24; k++)
+                fprintf(out, "%si64 %s", k ? ", " : "", qs[k]);
+            fprintf(out, ")\n");
+            na = 0;
+            ll_put(out, o->dst, r1);
+            break;
+        }
+        case IR_RET:
+            /* 注意别拿 `a == 0` 当"没有返回值"：虚寄存器 0 是合法的，
+             * `int main(void) { return 77; }` 里 77 就落在 vreg 0 上
+             * （踩过：返回常量全变 0）。只有 type 是 void 才没有值。 */
+            if (o->type == IRT_VOID) {
+                fprintf(out, "  ret i64 0\n");
+            } else {
+                ll_get(out, o->a, a1, sizeof(a1));
+                fprintf(out, "  ret i64 %s\n", a1);
+            }
+            term = 1;
+            break;
+        case IR_TRAP:
+            fprintf(out, "  call void @llvm.trap()\n  unreachable\n");
+            term = 1;
+            break;
+        case IR_COMMENT:
+            fprintf(out, "  ; %u\n", (unsigned)o->imm);
+            break;
+        case IR_FADD:
+        case IR_FSUB:
+        case IR_FMUL:
+        case IR_FDIV: {
+            const char *op = "fadd";
+
+            if (o->op == IR_FSUB)
+                op = "fsub";
+            else if (o->op == IR_FMUL)
+                op = "fmul";
+            else if (o->op == IR_FDIV)
+                op = "fdiv";
+            if (o->type == IRT_F32) {
+                ll_as_f32(out, o->a, a1, sizeof(a1));
+                ll_as_f32(out, o->b, b1, sizeof(b1));
+                snprintf(t1, sizeof(t1), "%%h%d", LL_TMP++);
+                fprintf(out, "  %s = %s float %s, %s\n", t1, op, a1, b1);
+                ll_of_f32(out, t1, r1, sizeof(r1));
+            } else {
+                ll_as_f64(out, o->a, a1, sizeof(a1));
+                ll_as_f64(out, o->b, b1, sizeof(b1));
+                snprintf(t1, sizeof(t1), "%%d%d", LL_TMP++);
+                fprintf(out, "  %s = %s double %s, %s\n", t1, op, a1, b1);
+                ll_of_f64(out, t1, r1, sizeof(r1));
+            }
+            ll_put(out, o->dst, r1);
+            break;
+        }
+        case IR_FNEG:
+            if (o->type == IRT_F32) {
+                ll_as_f32(out, o->a, a1, sizeof(a1));
+                snprintf(t1, sizeof(t1), "%%h%d", LL_TMP++);
+                fprintf(out, "  %s = fneg float %s\n", t1, a1);
+                ll_of_f32(out, t1, r1, sizeof(r1));
+            } else {
+                ll_as_f64(out, o->a, a1, sizeof(a1));
+                snprintf(t1, sizeof(t1), "%%d%d", LL_TMP++);
+                fprintf(out, "  %s = fneg double %s\n", t1, a1);
+                ll_of_f64(out, t1, r1, sizeof(r1));
+            }
+            ll_put(out, o->dst, r1);
+            break;
+        case IR_FCVT:
+            if (o->type == IRT_F64) {
+                ll_as_f32(out, o->a, a1, sizeof(a1));
+                snprintf(t1, sizeof(t1), "%%d%d", LL_TMP++);
+                fprintf(out, "  %s = fpext float %s to double\n", t1, a1);
+                ll_of_f64(out, t1, r1, sizeof(r1));
+            } else {
+                ll_as_f64(out, o->a, a1, sizeof(a1));
+                snprintf(t1, sizeof(t1), "%%h%d", LL_TMP++);
+                fprintf(out, "  %s = fptrunc double %s to float\n", t1, a1);
+                ll_of_f32(out, t1, r1, sizeof(r1));
+            }
+            ll_put(out, o->dst, r1);
+            break;
+        case IR_I2F:
+            ll_get(out, o->a, a1, sizeof(a1));
+            if (o->type == IRT_F32) {
+                snprintf(t1, sizeof(t1), "%%h%d", LL_TMP++);
+                fprintf(out, "  %s = %s i64 %s to float\n", t1,
+                        (o->flags & 1) ? "uitofp" : "sitofp", a1);
+                ll_of_f32(out, t1, r1, sizeof(r1));
+            } else {
+                snprintf(t1, sizeof(t1), "%%d%d", LL_TMP++);
+                fprintf(out, "  %s = %s i64 %s to double\n", t1,
+                        (o->flags & 1) ? "uitofp" : "sitofp", a1);
+                ll_of_f64(out, t1, r1, sizeof(r1));
+            }
+            ll_put(out, o->dst, r1);
+            break;
+        case IR_F2I:
+            if (o->type == IRT_F32) {
+                ll_as_f32(out, o->a, a1, sizeof(a1));
+                snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = %s float %s to i64\n", t1,
+                        (o->flags & 1) ? "fptoui" : "fptosi", a1);
+            } else {
+                ll_as_f64(out, o->a, a1, sizeof(a1));
+                snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = %s double %s to i64\n", t1,
+                        (o->flags & 1) ? "fptoui" : "fptosi", a1);
+            }
+            ll_put(out, o->dst, t1);
+            break;
+        case IR_VASTART:
+            /* va_start 在函数入口已经发过（见上面 is_variadic 那段） */
+            break;
+        case IR_VAARG:
+            if (!f->is_variadic) {
+                fprintf(out, "  store i64 0, ptr %%s%u\n", (unsigned)o->dst);
+                break;
+            }
+            snprintf(t1, sizeof(t1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = va_arg ptr %%ap, i64\n", t1);
+            /* 取出的宽度按 type 收窄（和 C99 的 va_arg(t, uint64_t) 后再截断一致） */
+            if (o->type == IRT_U8 || o->type == IRT_I8 || o->type == IRT_U16
+                || o->type == IRT_I16 || o->type == IRT_U32 || o->type == IRT_I32) {
+                u32 bits = ir_type_size(o->type) * 8;
+                int uns = (o->type == IRT_U8 || o->type == IRT_U16 || o->type == IRT_U32);
+
+                snprintf(r1, sizeof(r1), "%%t%d", LL_TMP++);
+                fprintf(out, "  %s = trunc i64 %s to i%u\n", r1, t1, (unsigned)bits);
+                snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+                if (uns)
+                    fprintf(out, "  %s = zext i%u %s to i64\n", p1, (unsigned)bits, r1);
+                else
+                    fprintf(out, "  %s = sext i%u %s to i64\n", p1, (unsigned)bits, r1);
+                ll_put(out, o->dst, p1);
+            } else {
+                ll_put(out, o->dst, t1);
+            }
+            break;
+        case IR_SEXT:
+        case IR_ZEXT:
+        case IR_TRUNC:
+            ll_narrow(out, o->type, o->dst, o->a);
+            break;
+        case IR_BITCAST:
+            ll_get(out, o->a, a1, sizeof(a1));
+            ll_put(out, o->dst, a1);
+            break;
+        case IR_LABELADDR:
+            fprintf(out, "  store i64 ptrtoint (ptr blockaddress(@%s, %%L%u) to i64),"
+                         " ptr %%s%u\n", curname, (unsigned)o->a, (unsigned)o->dst);
+            break;
+        case IR_JMPIND:
+            ll_get(out, o->a, a1, sizeof(a1));
+            snprintf(p1, sizeof(p1), "%%t%d", LL_TMP++);
+            fprintf(out, "  %s = inttoptr i64 %s to ptr\n", p1, a1);
+            fprintf(out, "  indirectbr ptr %s, [", p1);
+            for (k = 0; k < nlabs; k++)
+                fprintf(out, "%slabel %%L%u", k ? ", " : "", (unsigned)labs[k]);
+            if (nlabs == 0)
+                fprintf(out, "label %%L0");
+            fprintf(out, "]\n");
+            term = 1;
+            break;
+        default:
+            fprintf(out, "  ; 未实现 op %u\n", (unsigned)o->op);
+            fprintf(out, "  store i64 0, ptr %%s%u\n", (unsigned)o->dst);
+            break;
+        }
+    }
+    if (!term)
+        fprintf(out, "  ret i64 0\n");
+    fprintf(out, "}\n\n");
+}
+
+/* 打开暂存流（最终文件由 llvm_finish 组装） */
+static int llvm_open(const char *out)
+{
+    LL_OUT = fopen(out, "w");
+    if (!LL_OUT) {
+        fprintf(stderr, "c6c: 写不了 %s\n", out);
+        return 0;
+    }
+    snprintf(LL_TMPNAME, sizeof(LL_TMPNAME), "%s.fn", out);
+    LL_FNOUT = fopen(LL_TMPNAME, "w");
+    if (!LL_FNOUT) {
+        fprintf(stderr, "c6c: 写不了 %s\n", LL_TMPNAME);
+        return 0;
+    }
+    return 1;
+}
+
+/* 头部：变参结构、intrinsic 声明、内部辅助（alloca 用撞针分配器） */
+static void llvm_blobs(FILE *cf);
+
+static void llvm_prologue(FILE *cf, u32 dn)
+{
+    fprintf(cf,
+            "; 由 c6c 的 LLVM IR 后端生成（不要手改）\n"
+            "%%struct.__va_list_tag = type { i32, i32, ptr, ptr }\n"
+            "\n"
+            "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"
+            "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n"
+            "declare void @llvm.va_start.p0(ptr)\n"
+            "declare void @llvm.va_end.p0(ptr)\n"
+            "declare void @llvm.trap()\n"
+            "declare i64 @syscall(i64, ...)\n"
+            "\n"
+            "@__c6l_buf = internal global [4194304 x i8] zeroinitializer\n"
+            "@__c6l_at = internal global i64 0\n"
+            "\n"
+            "define internal ptr @__c6l_alloca(i64 %%n) {\n"
+            "  %%t0 = load i64, ptr @__c6l_at\n"
+            "  %%t1 = add i64 %%t0, 15\n"
+            "  %%t2 = and i64 %%t1, -16\n"
+            "  %%t3 = add i64 %%t2, %%n\n"
+            "  %%t4 = icmp ugt i64 %%t3, 4194304\n"
+            "  br i1 %%t4, label %%oom, label %%ok\n"
+            "oom:\n"
+            "  ret ptr @__c6l_buf\n"
+            "ok:\n"
+            "  store i64 %%t3, ptr @__c6l_at\n"
+            "  %%p = getelementptr i8, ptr @__c6l_buf, i64 %%t2\n"
+            "  ret ptr %%p\n"
+            "}\n"
+            "\n"
+            "@__c6l_D = internal global [%u x i8] zeroinitializer\n", (unsigned)dn);
+    llvm_blobs(cf);
+}
+
+/* 汇编跳板（src/asmblob.c6）：native 后端把这些字节直接写进镜像，LLVM 后端
+ * 没有字节可写，就把同一段 GAS 文本用 `module asm` 交给汇编器。符号按本后端
+ * 的前缀（`c6_`）重命名，文本里所有 `__c6_` 也跟着改——`call __c6_co_entry`
+ * 于是指向本模块里的 `c6___c6_co_entry`。 */
+static void llvm_blobs(FILE *cf)
+{
+    u32 i = 0;
+
+    if (NASMBLOB == 0)
+        return;
+    fprintf(cf, "\n; 汇编跳板\n");
+    for (i = 0; i < NASMBLOB; i++) {
+        const AsmBlob *b = &ASMBLOBS[i];
+        const char *t = b->text;
+        char line[1200] = {0};
+        u32 k = 0;
+        u32 j = 0;
+
+        for (; t && t[j]; j++) {
+            if (t[j] == '_' && t[j + 1] == '_' && t[j + 2] == 'c' && t[j + 3] == '6'
+                && t[j + 4] == '_') {
+                if (k + 8 < sizeof(line)) {
+                    line[k++] = 'c';
+                    line[k++] = '6';
+                    line[k++] = '_';
+                    line[k++] = '_';
+                    line[k++] = '_';
+                    line[k++] = 'c';
+                    line[k++] = '6';
+                    line[k++] = '_';
+                }
+                j += 4;
+                continue;
+            }
+            if (t[j] == '\n') {
+                line[k] = 0;
+                fprintf(cf, "module asm \"%s\\0A\"\n", line);
+                k = 0;
+                continue;
+            }
+            if (t[j] == '"') {
+                if (k + 2 < sizeof(line)) {
+                    line[k++] = '\\';
+                    line[k++] = '"';
+                }
+                continue;
+            }
+            if (t[j] == '\\') {
+                if (k + 2 < sizeof(line)) {
+                    line[k++] = '\\';
+                    line[k++] = '\\';
+                }
+                continue;
+            }
+            if (k + 2 < sizeof(line))
+                line[k++] = t[j];
+        }
+        if (k > 0) {
+            line[k] = 0;
+            fprintf(cf, "module asm \"%s\\0A\"\n", line);
+        }
+    }
+}
+
+/* 数据段初值：一整块常量，init_data 里 memcpy 进可写的那块 */
+static void llvm_emit_dataconst(FILE *cf, u32 dn)
+{
+    u32 i = 0;
+
+    fprintf(cf, "@__c6l_D0 = internal constant [%u x i8] c\"", (unsigned)dn);
+    for (i = 0; i < dn; i++) {
+        u8 b = (i < DATA_IMG.n) ? DATA_IMG.p[i] : (u8)0;
+
+        if (b >= 32 && b < 127 && b != '"' && b != '\\') {
+            fprintf(cf, "%c", (char)b);
+        } else {
+            fprintf(cf, "\\%02X", (unsigned)b);
+        }
+    }
+    fprintf(cf, "\"\n\n");
+}
+
+static void llvm_emit_datainit(FILE *cf, u32 dn)
+{
+    u32 i = 0;
+
+    fprintf(cf, "define void @c6c_init_data() {\n");
+    fprintf(cf, "  call void @llvm.memcpy.p0.p0.i64(ptr @__c6l_D, ptr @__c6l_D0,"
+                 " i64 %u, i1 false)\n", (unsigned)dn);
+    for (i = 0; i < NDFIX; i++) {
+        fprintf(cf, "  %%q%u = getelementptr i8, ptr @__c6l_D, i64 %u\n", (unsigned)i,
+                (unsigned)DFIX_OFF[i]);
+        if (X64.sym[DFIX_SYM[i]].is_data) {
+            fprintf(cf, "  store i64 ptrtoint (ptr getelementptr (i8, ptr @__c6l_D,"
+                         " i64 %d) to i64), ptr %%q%u\n",
+                    (int)(X64.sym[DFIX_SYM[i]].off - (u32)ELF_HDR), (unsigned)i);
+        } else {
+            char sn[256] = {0};
+
+            llvm_sym(DFIX_SYM[i], sn, sizeof(sn));
+            fprintf(cf, "  store i64 ptrtoint (ptr @%s to i64), ptr %%q%u\n", sn,
+                    (unsigned)i);
+        }
+    }
+    for (i = 0; i < C99_NRL; i++) {
+        fprintf(cf, "  %%r%u = getelementptr i8, ptr @__c6l_D, i64 %u\n", (unsigned)i,
+                (unsigned)C99_RLOFF[i]);
+        fprintf(cf, "  store i64 ptrtoint (ptr getelementptr (i8, ptr @__c6l_D, i64 %u)"
+                     " to i64), ptr %%r%u\n", (unsigned)C99_RLTGT[i], (unsigned)i);
+    }
+    fprintf(cf, "  ret void\n}\n\n");
+}
+
+/* 收尾：拼模块（头部 → 数据 → 外部符号声明 → 函数体 → init_data → 入口） */
+static int llvm_finish(const char *out)
+{
+    FILE *cf = LL_OUT;
+    char buf[65536] = {0};
+    char mn[256] = {0};
+    u32 dn = DATA_IMG.n ? DATA_IMG.n : 8;
+    u32 i = 0;
+    u32 k = 0;
+    FILE *in = NULL;
+    size_t got = 0;
+
+    if (!cf || !PA_MAIN) {
+        fprintf(stderr, "c6c: LLVM IR 后端：没有可用的入口\n");
+        return 1;
+    }
+    llvm_prologue(cf, dn);
+    llvm_emit_dataconst(cf, dn);
+    /* 外部符号：引用过但本模块没定义的，发一条 declare（调用点走 bitcast，
+     * 签名只作占位，不影响实参传递） */
+    for (i = 0; i < LL_NREF; i++) {
+        char sn[256] = {0};
+        int defined = 0;
+
+        llvm_sym(LL_REF[i], sn, sizeof(sn));
+        for (k = 0; k < LL_NFN; k++)
+            if (strcmp(LL_FNNAME[k], sn) == 0) {
+                defined = 1;
+                break;
+            }
+        if (!defined)
+            fprintf(cf, "declare i64 @%s(i64, ...)\n", sn);
+    }
+    fprintf(cf, "\n");
+    fclose(LL_FNOUT);
+    LL_FNOUT = NULL;
+    in = fopen(LL_TMPNAME, "r");
+    if (in) {
+        while ((got = fread(buf, 1, sizeof(buf), in)) > 0)
+            fwrite(buf, 1, got, cf);
+        fclose(in);
+    }
+    remove(LL_TMPNAME);
+
+    llvm_emit_datainit(cf, dn);
+
+    /* 入口：init_data → 构造器 → 真 main → 析构器 */
+    llvm_sym((u32)PA_MAIN->val, mn, sizeof(mn));
+    fprintf(cf, "define i32 @main(i32 %%argc, ptr %%argv) {\n");
+    fprintf(cf, "  call void @c6c_init_data()\n");
+    for (i = 0; i < NCTOR; i++) {
+        char cn[256] = {0};
+
+        llvm_sym(CTORS[i], cn, sizeof(cn));
+        fprintf(cf, "  %%c%u = bitcast ptr @%s to ptr\n", (unsigned)i, cn);
+        fprintf(cf, "  %%cr%u = call i64 %%c%u()\n", (unsigned)i, (unsigned)i);
+    }
+    fprintf(cf, "  %%a0 = sext i32 %%argc to i64\n");
+    fprintf(cf, "  %%a1 = ptrtoint ptr %%argv to i64\n");
+    fprintf(cf, "  %%mf = bitcast ptr @%s to ptr\n", mn);
+    fprintf(cf, "  %%rv = call i64 %%mf(i64 %%a0, i64 %%a1)\n");
+    for (i = 0; i < NDTOR; i++) {
+        char xn[256] = {0};
+
+        llvm_sym(DTORS[i], xn, sizeof(xn));
+        fprintf(cf, "  %%d%u = bitcast ptr @%s to ptr\n", (unsigned)i, xn);
+        fprintf(cf, "  %%dr%u = call i64 %%d%u()\n", (unsigned)i, (unsigned)i);
+    }
+    fprintf(cf, "  %%rc = trunc i64 %%rv to i32\n");
+    fprintf(cf, "  ret i32 %%rc\n}\n");
+    fclose(cf);
+    printf("c6c: %s（LLVM IR 后端，%u 个符号）\n", out, (unsigned)X64.nsym);
+    return 0;
+}
+
+/* 后端派发：C99 走 c99_emit_fn，LLVM 走 llvm_emit_fn */
+static void be_emit_fn(IrFn *f, u32 func_sym)
+{
+    if (c99_mode())
+        c99_emit_fn(f, func_sym);
+    if (llvm_mode())
+        llvm_emit_fn(f, func_sym);
+}

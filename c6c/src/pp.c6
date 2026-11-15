@@ -1,0 +1,1384 @@
+/* pp.c6 —— 预处理：输入栈、指令、条件编译、#if 求值、-E 输出（P1-3b）
+ *
+ * 输入栈里放两种源：文件（自己的 Lex 位置）与 token 列表（宏展开结果）。
+ * 文件源在行首看到 '#' 就走指令；token 列表源里不认指令（C 标准如此）。
+ * 被条件编译关掉的区域：token 直接丢，不展开宏（否则 #if 0 里的坏代码也会炸）。
+ */
+
+#define MAX_INCDIRS 32
+#define MAX_NEST 64
+
+typedef struct Src {
+    struct Src *up;
+    u8 is_file;
+    Lex lex;              /* is_file：文件位置 */
+    SrcFile *f;
+    int dir_index;        /* 从哪个 -I 目录打开（#include_next 用），-1 = 当前目录 */
+    Tok *t;               /* !is_file：token 列表 */
+    u32 n, i;
+    int depth;
+    u32 idx;              /* PP_STACK 下标；0xFFFFFFFF = 不在固定栈上 */
+    u32 emark;            /* 压栈时的展开结果池水位：弹栈时回卷到它 */
+} Src;
+
+typedef struct Cond {
+    struct Cond *up;
+    u8 active;
+    u8 seen_true;
+} Cond;
+
+/* 固定栈：宏展开的压栈次数是十万量级，每个 Src 都从 arena 要的话
+ * 光这一项就是十几 MB（实测 44 MB → 26 MB 的主要来源）。栈是严格 LIFO，
+ * 直接复用数组元素即可；超深（正常代码走不到）才回退 arena。 */
+#define PP_STACK_CAP 1024
+static Src PP_STACK[PP_STACK_CAP];
+static u32 PP_DEPTH;
+static Src *PP_TOP;
+static Cond *COND;
+static const char *INCDIR[MAX_INCDIRS];
+static int NINCDIR;
+static int INCLUDE_DEPTH;
+static Tok PUSHBACK[8];
+static int NPUSHBACK;
+static SrcFile *CUR_FILE;
+static char DATE_BUF[16] = {0};      /* "Mmm dd yyyy" */
+static char TIME_BUF[16] = {0};      /* "hh:mm:ss"   */      /* 最近打开的文件源：__FILE__/__LINE__ 与合成 token 用 */
+
+/* 实参草稿池：宏调用期间有效，调用返回就回卷（严格 LIFO，嵌套安全）。
+ * 为什么单独一个池：实参只活在一次展开里，而展开结果要活到被消费完。
+ * 不这么做的话每层宏调用都会向 arena 要几个小数组，tcc.c 能吃掉几十 MB。 */
+static Tok *ARG_BASE;
+static u32 ARG_CAP, ARG_N;
+
+static u32 arg_mark(void)
+{
+    return ARG_N;
+}
+
+static void arg_reset(u32 mark)
+{
+    ARG_N = mark;
+}
+
+static Tok *arg_alloc(u32 n)
+{
+    Tok *p = NULL;
+    if (!ARG_BASE) {
+        /* 32K 个 token：tcc.c 全量预处理的高水位是 10803（libtcc1.c 更低），
+         * 原来一次要 1M 个 token = 32 MB。真的爆了就退到 arena（下面那条路径）。 */
+        ARG_CAP = 1u << 15;
+        ARG_BASE = malloc((size_t)ARG_CAP * sizeof(Tok));
+        if (!ARG_BASE)
+            return tok_list_alloc(n);
+        ARG_N = 0;
+    }
+    if (ARG_N + n > ARG_CAP)
+        return tok_list_alloc(n);   /* 回退到 arena：正常代码走不到 */
+    p = ARG_BASE + ARG_N;
+    ARG_N += n;
+    /* 不清零：实参草稿池的每个格子都是先写后读（`cur[cn++] = a`），读取方
+     * expand_macro 只按 argn[] 给的长度走。原来每要一小段就要一次 memset，
+     * profile 里这份清零占 0.9%。 */
+    return p;
+}
+
+/* 时间戳只在启动时取一次：C 标准说同一次翻译里 __DATE__/__TIME__ 恒定 */
+static void pp_init_time(void)
+{
+    static const char *const MON[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    time_t now = time(NULL);
+    struct tm *lt = localtime(&now);
+
+    if (!lt) {
+        snprintf(DATE_BUF, sizeof(DATE_BUF), "Jan  1 1970");
+        snprintf(TIME_BUF, sizeof(TIME_BUF), "00:00:00");
+        return;
+    }
+    snprintf(DATE_BUF, sizeof(DATE_BUF), "%s %2d %d", MON[lt->tm_mon % 12],
+             lt->tm_mday, lt->tm_year + 1900);
+    snprintf(TIME_BUF, sizeof(TIME_BUF), "%02d:%02d:%02d", lt->tm_hour,
+             lt->tm_min, lt->tm_sec);
+}
+
+static Src *pp_new_src(void)
+{
+    Src *s = NULL;
+
+    if (PP_DEPTH < PP_STACK_CAP) {
+        u32 i = PP_DEPTH++;
+        s = &PP_STACK[i];
+        memset(s, 0, sizeof(Src));
+        s->idx = i;
+        return s;
+    }
+    s = arena_zalloc_t(&A_main, sizeof(Src), A_SRC);
+    s->idx = 0xFFFFFFFFu;
+    return s;
+}
+
+static void pp_drop_src(Src *s)
+{
+    if (!s)
+        return;
+    if (s->idx != 0xFFFFFFFFu)
+        PP_DEPTH = s->idx;
+}
+
+static int pp_active(void)
+{
+    return COND == NULL || COND->active;
+}
+
+static void pp_push_file(SrcFile *f, int dir_index)
+{
+    Src *s = pp_new_src();
+    s->emark = exp_mark();
+    s->up = PP_TOP;
+    s->is_file = 1;
+    s->f = f;
+    s->dir_index = dir_index;
+    s->depth = INCLUDE_DEPTH;
+    lex_init(&s->lex, f);
+    PP_TOP = s;
+    CUR_FILE = f;
+}
+
+static void pp_push_tokens(Tok *t, u32 n)
+{
+    Src *s = pp_new_src();
+    s->emark = exp_mark();   /* 弹栈时只回卷本帧之后产生的展开结果 */
+    s->up = PP_TOP;
+    s->t = t;
+    s->n = n;
+    s->i = 0;
+    PP_TOP = s;
+}
+
+static void pp_pushback(Tok *t, int kind)
+{
+    if (kind == TK_EOF)
+        return;
+    if (NPUSHBACK >= 8)
+        return;
+    PUSHBACK[NPUSHBACK++] = *t;
+}
+
+/* 当前文件源的原始 token（不认指令、不查缓冲） */
+static int file_tok(Tok *t)
+{
+    if (!PP_TOP || !PP_TOP->is_file)
+        return TK_EOF;
+    return lex_next(&PP_TOP->lex, t);
+}
+
+/* 文件栈弹出后要把 CUR_FILE 找回到仍在栈里的最近一个文件源。
+ * 忘了这一步的代价：合成文件（-D 拼出来的那个）弹栈后 CUR_FILE 还是它，
+ * 于是后面的 #include "x.h" 按“当前文件所在目录”找不到 —— 曾经连 tcc.h 都找不到。 */
+static void cur_file_sync(void)
+{
+    Src *s = PP_TOP;
+    while (s && !s->is_file)
+        s = s->up;
+    CUR_FILE = s ? s->f : NULL;
+}
+
+static int raw_next(Tok *out);
+static int pp_next(Tok *out);
+
+/* 语法分析阶段不需要换行 token（pa_fill 里本来也是拿到就扔），但每个换行
+ * 都要走一遍 词法 + 预处理 的完整流水线——44K 行的 tcc.c 就是 44K 次白跑。
+ * 由 pa_compile_ex 在非 -E 模式下置 1。 */
+static int PP_SKIP_NL;
+/* 出现过 `#pragma pack` 才需要在语法分析阶段检查 `__c6_pack` 指令 */
+static int PACK_SEEN;
+
+static void handle_directive(void);
+
+/* 指令后面那一整行（到换行/EOF 为止） */
+static void dir_line(Tok **line, u32 *n)
+{
+    u32 cap = 8, cnt = 0;
+    Tok *l = tok_list_alloc_t(cap, A_DIR);
+
+    for (;;) {
+        Tok t = {0};
+        int k = file_tok(&t);
+        if (k == TK_EOF || k == TK_NL)
+            break;
+        if (cnt + 1 > cap) {
+            Tok *nl = tok_list_alloc_t(cap * 2, A_DIR);
+            memcpy(nl, l, (size_t)cnt * sizeof(Tok));
+            l = nl;
+            cap *= 2;
+        }
+        l[cnt++] = t;
+    }
+    *line = l;
+    *n = cnt;
+}
+
+static void skip_line(void)
+{
+    Tok t = {0};
+    for (;;) {
+        int k = file_tok(&t);
+        if (k == TK_EOF || k == TK_NL)
+            break;
+    }
+}
+
+static int raw_next(Tok *out)
+{
+    for (;;) {
+        Src *s = NULL;
+
+        if (NPUSHBACK > 0) {
+            *out = PUSHBACK[--NPUSHBACK];
+            return out->kind;
+        }
+        s = PP_TOP;
+        if (!s) {
+            memset(out, 0, sizeof(*out));
+            out->kind = TK_EOF;
+            return TK_EOF;
+        }
+        if (s->is_file) {
+            /* 直接词法到 out 里：原来先建一个局部 Tok、再整块拷给 out，
+             * 每个 token 两次 40 字节的搬运（profile 里是实打实的开销）。
+             * out 只是调用方的临时落脚点，中途丢弃的 token 写进去也没关系。 */
+            int k = lex_next(&s->lex, out);
+
+            if (k == TK_EOF) {
+                INCLUDE_DEPTH = s->depth;
+                exp_reset(s->emark);
+                pp_drop_src(s);
+                PP_TOP = s->up;
+                cur_file_sync();
+                continue;
+            }
+            if (out->kind == TK_PUNCT && out->len == 1 && (out->flags & TF_BOL)
+                && tok_data(out)[0] == '#') {
+                handle_directive();
+                continue;
+            }
+            if (!pp_active())
+                continue;
+            if (out->kind == TK_NL && PP_SKIP_NL)
+                continue;
+            return k;
+        }
+        if (s->i >= s->n) {
+            exp_reset(s->emark);
+            pp_drop_src(s);
+            PP_TOP = s->up;
+            cur_file_sync();
+            continue;
+        }
+        *out = s->t[s->i++];
+        return out->kind;
+    }
+}
+
+/* ---- #if 的常量表达式求值 ---- */
+
+typedef struct Ev {
+    Tok *t;
+    u32 n;
+    u32 i;
+    int err;
+} Ev;
+
+static int ev_is(Ev *e, const char *s)
+{
+    if (e->i < e->n && tok_eq(&e->t[e->i], s)) {
+        e->i++;
+        return 1;
+    }
+    return 0;
+}
+
+static i64 ev_num(const Tok *t)
+{
+    char buf[80] = {0};
+    u32 n = t->len < 79 ? t->len : 79;
+    u32 i = 0;
+    i64 v = 0;
+    int base = 10;
+    const char *d = tok_data(t);
+
+    memcpy(buf, d, n);
+    buf[n] = 0;
+    while (n > 0 && (buf[n - 1] == 'u' || buf[n - 1] == 'U' || buf[n - 1] == 'l' || buf[n - 1] == 'L'))
+        buf[--n] = 0;
+    if (n > 2 && buf[0] == '0' && (buf[1] == 'b' || buf[1] == 'B')) {
+        for (i = 2; i < n; i++)
+            v = (v << 1) | (buf[i] == '1' ? 1 : 0);
+        return v;
+    }
+    (void)base;
+    return (i64)strtoull(buf, NULL, 0);
+}
+
+static i64 ev_char(const Tok *t)
+{
+    const char *d = tok_data(t);
+    u32 n = t->len;
+    u32 i = 1;
+    i64 v = 0;
+
+    if (n >= 2 && d[1] == '\\') {
+        i = 2;
+        switch (d[i]) {
+        case 'n': v = '\n'; i++; break;
+        case 't': v = '\t'; i++; break;
+        case 'r': v = '\r'; i++; break;
+        case '0': v = 0; i++; break;
+        case '\\': v = '\\'; i++; break;
+        case '\'': v = '\''; i++; break;
+        case '"': v = '"'; i++; break;
+        default: v = (u8)d[i]; i++; break;
+        }
+        return v;
+    }
+    if (n >= 2)
+        return (u8)d[1];
+    return 0;
+}
+
+static i64 ev_cond(Ev *e);
+static i64 ev_unary(Ev *e);
+
+static i64 ev_prim(Ev *e)
+{
+    Tok *t = NULL;
+
+    if (e->i >= e->n) {
+        e->err = 1;
+        return 0;
+    }
+    t = &e->t[e->i];
+    if (t->kind == TK_PUNCT && t->len == 1 && tok_data(t)[0] == '(') {
+        i64 v = 0;
+        e->i++;
+        v = ev_cond(e);
+        if (!(e->i < e->n && tok_data(&e->t[e->i])[0] == ')'))
+            e->err = 1;
+        else
+            e->i++;
+        return v;
+    }
+    e->i++;
+    if (t->kind == TK_NUM)
+        return ev_num(t);
+    if (t->kind == TK_CHAR)
+        return ev_char(t);
+    return 0;   /* 剩下的标识符按 0（C 标准） */
+}
+
+static i64 ev_unary(Ev *e)
+{
+    if (ev_is(e, "!"))
+        return !ev_unary(e);
+    if (ev_is(e, "~"))
+        return ~ev_unary(e);
+    if (ev_is(e, "-"))
+        return -ev_unary(e);
+    if (ev_is(e, "+"))
+        return ev_unary(e);
+    return ev_prim(e);
+}
+
+static i64 ev_mul(Ev *e)
+{
+    i64 v = ev_unary(e);
+    for (;;) {
+        if (ev_is(e, "*")) v *= ev_unary(e);
+        else if (ev_is(e, "/")) { i64 r = ev_unary(e); if (r == 0) { e->err = 1; return 0; } v /= r; }
+        else if (ev_is(e, "%")) { i64 r = ev_unary(e); if (r == 0) { e->err = 1; return 0; } v %= r; }
+        else return v;
+    }
+}
+
+static i64 ev_add(Ev *e)
+{
+    i64 v = ev_mul(e);
+    for (;;) {
+        if (ev_is(e, "+")) v += ev_mul(e);
+        else if (ev_is(e, "-")) v -= ev_mul(e);
+        else return v;
+    }
+}
+
+static i64 ev_shift(Ev *e)
+{
+    i64 v = ev_add(e);
+    for (;;) {
+        if (ev_is(e, "<<")) v <<= ev_add(e);
+        else if (ev_is(e, ">>")) v >>= ev_add(e);
+        else return v;
+    }
+}
+
+static i64 ev_rel(Ev *e)
+{
+    i64 v = ev_shift(e);
+    for (;;) {
+        if (ev_is(e, "<=")) v = v <= ev_shift(e);
+        else if (ev_is(e, ">=")) v = v >= ev_shift(e);
+        else if (ev_is(e, "<")) v = v < ev_shift(e);
+        else if (ev_is(e, ">")) v = v > ev_shift(e);
+        else return v;
+    }
+}
+
+static i64 ev_eq(Ev *e)
+{
+    i64 v = ev_rel(e);
+    for (;;) {
+        if (ev_is(e, "==")) v = (v == ev_rel(e));
+        else if (ev_is(e, "!=")) v = (v != ev_rel(e));
+        else return v;
+    }
+}
+
+static i64 ev_band(Ev *e)
+{
+    i64 v = ev_eq(e);
+    while (ev_is(e, "&"))
+        v &= ev_eq(e);
+    return v;
+}
+
+static i64 ev_bxor(Ev *e)
+{
+    i64 v = ev_band(e);
+    while (ev_is(e, "^"))
+        v ^= ev_band(e);
+    return v;
+}
+
+static i64 ev_bor(Ev *e)
+{
+    i64 v = ev_bxor(e);
+    while (ev_is(e, "|"))
+        v |= ev_bxor(e);
+    return v;
+}
+
+static i64 ev_land(Ev *e)
+{
+    i64 v = ev_bor(e);
+    for (;;) {
+        if (!ev_is(e, "&&"))
+            return v;
+        {
+            i64 r = ev_bor(e);
+            v = (v && r);
+        }
+    }
+}
+
+static i64 ev_lor(Ev *e)
+{
+    i64 v = ev_land(e);
+    for (;;) {
+        if (!ev_is(e, "||"))
+            return v;
+        {
+            i64 r = ev_land(e);
+            v = (v || r);
+        }
+    }
+}
+
+static i64 ev_cond(Ev *e)
+{
+    i64 c = ev_lor(e);
+    if (ev_is(e, "?")) {
+        i64 a = ev_cond(e);
+        i64 b = 0;
+        if (!ev_is(e, ":")) {
+            e->err = 1;
+            return 0;
+        }
+        b = ev_cond(e);
+        return c ? a : b;
+    }
+    return c;
+}
+
+static SrcFile *find_include(const char *name, int quoted, int start, int *dir_index);
+static char *unquote(const Tok *t);
+
+/* __has_include(...)：先展开参数（可能是宏），再按 "..." 或 <...> 求值。
+ * 找到就给 1，找不到给 0——和 tcc/gcc 一致。 */
+static int has_include_arg(Tok *line, u32 n, u32 i)
+{
+    Tok *b = tok_list_alloc(n + 8);
+    Tok *ex = NULL;
+    u32 bn = 0;
+    u32 exn = 0;
+    u32 k = 0;
+    int quoted = 0;
+    int di = 0;
+    char *nm = NULL;
+
+    for (k = i; k < n; k++)
+        b[bn++] = line[k];
+    expand_array(b, bn, &ex, &exn);
+    if (exn == 0)
+        return 0;
+    if (ex[0].kind == TK_STR) {
+        quoted = 1;
+        nm = unquote(&ex[0]);
+    } else if (ex[0].kind == TK_PUNCT && tok_data(&ex[0])[0] == '<') {
+        /* <foo.h>：把中间的记号拼起来 */
+        u32 total = 0;
+
+        for (k = 1; k < exn && !(ex[k].kind == TK_PUNCT && tok_data(&ex[k])[0] == '>'); k++)
+            total += ex[k].len + 1;
+        nm = arena_alloc(&A_main, total + 2);
+        total = 0;
+        for (k = 1; k < exn && !(ex[k].kind == TK_PUNCT && tok_data(&ex[k])[0] == '>'); k++) {
+            memcpy(nm + total, tok_data(&ex[k]), ex[k].len);
+            total += ex[k].len;
+            nm[total] = ' ';
+            total++;
+        }
+        nm[total] = 0;
+        if (total > 0)
+            nm[total - 1] = 0;
+    } else {
+        return 0;
+    }
+    return find_include(nm, quoted, 0, &di) != NULL;
+}
+
+/* 先处理 defined，再展开宏，再求值 */
+static i64 eval_pp_expr(Tok *line, u32 n)
+{
+    Tok *b = tok_list_alloc(n + 8);
+    u32 bn = 0, i = 0;
+    Tok *ex = NULL;
+    u32 exn = 0;
+    Ev e = {0};
+
+    for (i = 0; i < n; i++) {
+        if (line[i].kind == TK_IDENT
+            && (tok_eq(&line[i], "__has_include")
+                || tok_eq(&line[i], "__has_include_next"))) {
+            u32 j = i + 1;
+            u32 depth = 0;
+            int val = 0;
+            char *one = arena_alloc(&A_main, 2);
+
+            if (j < n && line[j].kind == TK_PUNCT && tok_data(&line[j])[0] == '(') {
+                j++;
+                depth = 1;
+                val = has_include_arg(line, n, j);
+                for (; j < n && depth > 0; j++) {
+                    if (line[j].kind == TK_PUNCT && tok_data(&line[j])[0] == '(')
+                        depth++;
+                    else if (line[j].kind == TK_PUNCT && tok_data(&line[j])[0] == ')')
+                        depth--;
+                }
+            }
+            one[0] = val ? '1' : '0';
+            one[1] = 0;
+            b[bn++] = tok_syn(TK_NUM, one, 1, CUR_FILE, 0);
+            i = j - 1;
+            continue;
+        }
+        if (line[i].kind == TK_IDENT && tok_eq(&line[i], "defined")) {
+            u32 j = i + 1;
+            int paren = 0;
+            int val = 0;
+            char *one = arena_alloc(&A_main, 2);
+            if (j < n && line[j].kind == TK_PUNCT && tok_data(&line[j])[0] == '(') {
+                paren = 1;
+                j++;
+            }
+            if (j < n && line[j].kind == TK_IDENT) {
+                val = macro_defined(&line[j]);
+                j++;
+            }
+            if (paren && j < n && tok_data(&line[j])[0] == ')')
+                j++;
+            one[0] = val ? '1' : '0';
+            one[1] = 0;
+            b[bn++] = tok_syn(TK_NUM, one, 1, CUR_FILE, 0);
+            i = j - 1;
+            continue;
+        }
+        b[bn++] = line[i];
+    }
+    expand_array(b, bn, &ex, &exn);
+    e.t = ex;
+    e.n = exn;
+    e.i = 0;
+    e.err = 0;
+    return ev_cond(&e);
+}
+
+/* ---- 指令 ---- */
+
+static void do_define(void)
+{
+    Tok nm = {0};
+    Tok *line = NULL;
+    u32 nline = 0;
+    Macro *m = NULL;
+    u32 i = 0;
+    int k = file_tok(&nm);
+
+    if (k != TK_IDENT) {
+        diag_error(PP_TOP->f, nm.off, "#define 后面必须是标识符");
+        skip_line();
+        return;
+    }
+    dir_line(&line, &nline);
+    m = arena_zalloc_t(&A_main, sizeof(Macro), A_MSTRUCT);
+    m->name = arena_strndup_t(&A_main, tok_data(&nm), nm.len, A_MSTRUCT);
+    m->nlen = nm.len;
+    m->hash = tok_hash(m->name, nm.len);
+    if (nline > 0 && line[0].kind == TK_PUNCT && tok_data(&line[0])[0] == '('
+        && !(line[0].flags & TF_SPACE)) {
+        m->is_func = 1;
+        i = 1;
+        if (i < nline && tok_data(&line[i])[0] == ')') {
+            i++;
+        } else {
+            for (;;) {
+                if (i >= nline) {
+                    diag_error(PP_TOP->f, nm.off, "宏 '%s' 的参数表没有结束", m->name);
+                    return;
+                }
+                if (line[i].kind == TK_PUNCT && line[i].len == 3
+                    && memcmp(tok_data(&line[i]), "...", 3) == 0) {
+                    m->variadic = 1;
+                    i++;
+                    if (i < nline && tok_data(&line[i])[0] == ')')
+                        i++;
+                    break;
+                }
+                if (line[i].kind != TK_IDENT) {
+                    diag_error(PP_TOP->f, line[i].off, "宏 '%s' 的参数名不合法", m->name);
+                    return;
+                }
+                /* GNU 具名可变参：`#define f(a, rest...)`。glibc/linux 头文件在
+                 * 老编译器分支里常用（例如 __struct_group），不收就会把整片
+                 * 头文件判成错误。rest 只占可变参那一个槽，不占 nparams。 */
+                if (i + 1 < nline && line[i + 1].kind == TK_PUNCT
+                    && line[i + 1].len == 3
+                    && memcmp(tok_data(&line[i + 1]), "...", 3) == 0) {
+                    m->variadic = 1;
+                    m->vname = arena_strndup(&A_main, tok_data(&line[i]), line[i].len);
+                    i += 2;
+                    if (i < nline && tok_data(&line[i])[0] == ')')
+                        i++;
+                    break;
+                }
+                if (m->nparams < MAX_PARAMS)
+                    m->pname[m->nparams++] = arena_strndup(&A_main, tok_data(&line[i]), line[i].len);
+                i++;
+                if (i < nline && tok_data(&line[i])[0] == ',') {
+                    i++;
+                    continue;
+                }
+                if (i < nline && tok_data(&line[i])[0] == ')') {
+                    i++;
+                    break;
+                }
+                diag_error(PP_TOP->f, nm.off, "宏 '%s' 的参数表不合法", m->name);
+                return;
+            }
+        }
+    }
+    m->nbody = nline > i ? nline - i : 0;
+    /* body 缓冲复用：头文件被重复包含时（tcc.h 有 13 次）同一批 #define 会
+     * 重来一遍，不复用就每遍都在 arena 里堆一份新的宏体。实测这一项从
+     * 44 MB 降到 ~20 MB。 */
+    {
+        Macro *old = macro_lookup(m->name, m->hash);
+        if (old && old->bodycap >= m->nbody) {
+            m->body = old->body;
+            m->bodycap = old->bodycap;
+        } else {
+            m->body = tok_list_alloc_t(m->nbody ? m->nbody : 1, A_MBODY);
+            m->bodycap = m->nbody;
+        }
+    }
+    if (m->nbody)
+        memcpy(m->body, line + i, (size_t)m->nbody * sizeof(Tok));
+    macro_add(m);
+}
+
+/* 规范化路径：去掉 "." 段、把 "a/b/../c" 折叠成 "a/c"。`#pragma once` 靠路径
+ * 字符串判断"同一个文件"，不规范化的话 "x.h"、"./x.h"、"sub/../x.h" 会被当成
+ * 三个文件，pragma once 就失效了（tcc tests2 的 18_include 踩过）。 */
+static char *path_canon(const char *in)
+{
+    size_t n = strlen(in);
+    char *out = arena_alloc(&A_main, n + 4);
+    size_t o = 0;
+    size_t i = 0;
+    int abs = (n > 0 && in[0] == '/');
+
+    if (abs) {
+        out[o] = '/';
+        o++;
+        i = 1;
+    }
+    while (i < n) {
+        size_t st = i;
+        size_t len = 0;
+
+        while (i < n && in[i] != '/')
+            i++;
+        len = i - st;
+        if (len == 0 || (len == 1 && in[st] == '.')) {
+            if (i < n)
+                i++;
+            continue;
+        }
+        if (len == 2 && in[st] == '.' && in[st + 1] == '.') {
+            /* 回退一段；但上一段本身就是 ".."（或已到顶）时只能把 ".." 留着
+             * ——相对路径开头的 ".." 是语义的一部分（踩过：../tcc/... 被吃掉） */
+            size_t ls = o;
+            int last_is_dotdot = 0;
+
+            if (o > 0 && out[o - 1] == '/')
+                ls--;
+            {
+                size_t bs = ls;
+
+                while (bs > 0 && out[bs - 1] != '/')
+                    bs--;
+                if (ls - bs == 2 && out[bs] == '.' && out[bs + 1] == '.')
+                    last_is_dotdot = 1;
+                if (ls == bs)
+                    last_is_dotdot = -1;        /* 没有上一段 */
+                if (!last_is_dotdot) {
+                    o = bs;
+                    if (o > 0 && out[o - 1] == '/')
+                        o--;
+                }
+            }
+            if (last_is_dotdot) {
+                if (o > 0 && out[o - 1] != '/') {
+                    out[o] = '/';
+                    o++;
+                }
+                out[o] = '.';
+                out[o + 1] = '.';
+                o = o + 2;
+            }
+            if (i < n)
+                i++;
+            continue;
+        }
+        if (o > 0 && out[o - 1] != '/') {
+            out[o] = '/';
+            o++;
+        }
+        memcpy(out + o, in + st, len);
+        o = o + len;
+        if (i < n)
+            i++;
+    }
+    out[o] = 0;
+    if (o == 0) {
+        out[0] = '.';
+        out[1] = 0;
+    }
+    return out;
+}
+
+static char *path_join(const char *dir, const char *name)
+{
+    size_t a = strlen(dir), b = strlen(name);
+    char *p = arena_alloc(&A_main, a + b + 2);
+    int need = (a > 0 && dir[a - 1] != '/');
+    memcpy(p, dir, a);
+    if (need)
+        p[a++] = '/';
+    memcpy(p + a, name, b);
+    p[a + b] = 0;
+    return path_canon(p);
+}
+
+static SrcFile *already_loaded(const char *path)
+{
+    SrcFile *f = FILES.head;
+    for (; f; f = f->next)
+        if (f->owned == 0 && strcmp(f->path, path) == 0)
+            return f;
+    return NULL;
+}
+
+/* 打开 include 文件：quoted 先找当前文件所在目录；start 用于 #include_next */
+static SrcFile *find_include(const char *name, int quoted, int start, int *dir_index)
+{
+    int i = start;
+
+    name = path_canon(name);        /* 三种拼法要落到同一个 SrcFile（pragma once） */
+    if (quoted) {
+        const char *slash = strrchr(CUR_FILE ? CUR_FILE->path : "?", '/');
+        if (slash) {
+            char *dir = arena_strndup(&A_main, CUR_FILE->path, (size_t)(slash - CUR_FILE->path));
+            char *p = path_join(dir, name);
+            SrcFile *f = already_loaded(p);
+            if (f) {
+                *dir_index = -1;
+                return f;
+            }
+            f = src_load(p);
+            if (f) {
+                *dir_index = -1;
+                return f;
+            }
+        } else {
+            SrcFile *f = already_loaded(name);
+            if (!f)
+                f = src_load(name);
+            if (f) {
+                *dir_index = -1;
+                return f;
+            }
+        }
+    }
+    for (; i < NINCDIR; i++) {
+        char *p = path_join(INCDIR[i], name);
+        SrcFile *f = already_loaded(p);
+        if (!f)
+            f = src_load(p);
+        if (f) {
+            *dir_index = i;
+            return f;
+        }
+    }
+    return NULL;
+}
+
+static char *unquote(const Tok *t)
+{
+    const char *d = tok_data(t);
+    u32 n = t->len;
+    u32 i = 0, j = 0;
+    char *p = arena_alloc(&A_main, n + 1);
+
+    for (i = 1; i + 1 < n; i++) {
+        if (d[i] == '\\' && i + 2 < n) {
+            i++;
+            p[j++] = d[i];
+        } else {
+            p[j++] = d[i];
+        }
+    }
+    p[j] = 0;
+    return p;
+}
+
+static void do_include(int is_next)
+{
+    Tok *line = NULL;
+    u32 n = 0;
+    char *name = NULL;
+    int quoted = 0;
+    int start = 0;
+    int dir_index = -1;
+    SrcFile *f = NULL;
+
+    dir_line(&line, &n);
+    if (n == 0) {
+        diag_error(PP_TOP->f, 0, "#include 缺少文件名");
+        return;
+    }
+    if (line[0].kind == TK_STR) {
+        name = unquote(&line[0]);
+        quoted = 1;
+    } else if (tok_data(&line[0])[0] == '<') {
+        u32 i = 0, tot = 0;
+        char *p = NULL;
+        for (i = 1; i < n && tok_data(&line[i])[0] != '>'; i++)
+            tot += line[i].len;
+        p = arena_alloc(&A_main, tot + 1);
+        tot = 0;
+        for (i = 1; i < n && tok_data(&line[i])[0] != '>'; i++) {
+            memcpy(p + tot, tok_data(&line[i]), line[i].len);
+            tot += line[i].len;
+        }
+        p[tot] = 0;
+        name = p;
+    } else {
+        Tok *ex = NULL;
+        u32 exn = 0;
+        expand_array(line, n, &ex, &exn);
+        if (exn > 0 && ex[0].kind == TK_STR) {
+            name = unquote(&ex[0]);
+            quoted = 1;
+        }
+    }
+    if (!name) {
+        diag_error(PP_TOP->f, line[0].off, "#include 的文件名不是字符串");
+        return;
+    }
+    if (INCLUDE_DEPTH >= MAX_NEST) {
+        diag_error(PP_TOP->f, line[0].off, "#include 嵌套太深（%d 层）", MAX_NEST);
+        return;
+    }
+    if (is_next && PP_TOP->is_file)
+        start = PP_TOP->dir_index + 1;
+    f = find_include(name, quoted, start, &dir_index);
+    if (!f) {
+        diag_error(PP_TOP->f, line[0].off, "找不到头文件 '%s'", name);
+        return;
+    }
+    if (f->pragma_once && f->included)
+        return;
+    f->included = 1;
+    INCLUDE_DEPTH++;
+    pp_push_file(f, dir_index);
+    CUR_FILE = f;
+}
+
+static void do_conditional(int kind)
+{
+    Cond *c = arena_zalloc(&A_main, sizeof(Cond));
+
+    c->up = COND;
+    COND = c;
+    if (c->up && !c->up->active) {
+        c->active = 0;
+        c->seen_true = 1;
+        skip_line();
+        return;
+    }
+    if (kind == 0) {
+        Tok *line = NULL;
+        u32 n = 0;
+        i64 v = 0;
+        dir_line(&line, &n);
+        if (n == 0) {
+            diag_error(PP_TOP->f, 0, "#if 缺少表达式");
+            c->active = 0;
+            c->seen_true = 1;
+            return;
+        }
+        v = eval_pp_expr(line, n);
+        c->active = v != 0;
+        c->seen_true = c->active;
+        return;
+    }
+    {
+        Tok nm = {0};
+        int d = 0;
+        int k = file_tok(&nm);
+        if (k != TK_IDENT) {
+            diag_error(PP_TOP->f, nm.off, "#ifdef/#ifndef 后面必须是标识符");
+            c->active = 0;
+            c->seen_true = 1;
+            return;
+        }
+        d = macro_defined(&nm);
+        skip_line();
+        c->active = (kind == 1) ? d : !d;
+        c->seen_true = c->active;
+    }
+}
+
+static void do_elif(void)
+{
+    Cond *c = COND;
+    Tok *line = NULL;
+    u32 n = 0;
+
+    if (!c) {
+        diag_error(PP_TOP->f, 0, "#elif 没有对应的 #if");
+        skip_line();
+        return;
+    }
+    if (c->seen_true || (c->up && !c->up->active)) {
+        c->active = 0;
+        skip_line();
+        return;
+    }
+    dir_line(&line, &n);
+    if (n == 0) {
+        diag_error(PP_TOP->f, 0, "#elif 缺少表达式");
+        c->active = 0;
+        return;
+    }
+    c->active = eval_pp_expr(line, n) != 0;
+    if (c->active)
+        c->seen_true = 1;
+}
+
+static void handle_directive(void)
+{
+    Tok t = {0};
+    int k = file_tok(&t);
+    const char *d = NULL;
+
+    if (k == TK_EOF)
+        return;
+    if (k == TK_NL)
+        return;   /* 光秃秃一个 #：合法，空指令 */
+    if (t.kind != TK_IDENT) {
+        diag_error(PP_TOP->f, t.off, "不认识的预处理指令");
+        skip_line();
+        return;
+    }
+    d = tok_data(&t);
+#define DIR_IS(s) (t.len == (u32)strlen(s) && memcmp(d, s, t.len) == 0)
+    if (DIR_IS("define")) {
+        if (pp_active()) do_define(); else skip_line();
+    } else if (DIR_IS("undef")) {
+        Tok nm = {0};
+        if (pp_active()) {
+            if (file_tok(&nm) == TK_IDENT)
+                macro_undef(tok_data(&nm), nm.len);
+            else
+                diag_error(PP_TOP->f, nm.off, "#undef 后面必须是标识符");
+        }
+        skip_line();
+    } else if (DIR_IS("include")) {
+        if (pp_active()) do_include(0); else skip_line();
+    } else if (DIR_IS("include_next")) {
+        if (pp_active()) do_include(1); else skip_line();
+    } else if (DIR_IS("if")) {
+        do_conditional(0);
+    } else if (DIR_IS("ifdef")) {
+        do_conditional(1);
+    } else if (DIR_IS("ifndef")) {
+        do_conditional(2);
+    } else if (DIR_IS("elif")) {
+        do_elif();
+    } else if (DIR_IS("else")) {
+        Cond *c = COND;
+        skip_line();
+        if (!c) {
+            diag_error(PP_TOP->f, t.off, "#else 没有对应的 #if");
+            return;
+        }
+        c->active = !c->seen_true;
+        c->seen_true = 1;
+    } else if (DIR_IS("endif")) {
+        Cond *c = COND;
+        skip_line();
+        if (!c)
+            diag_error(PP_TOP->f, t.off, "#endif 没有对应的 #if");
+        else
+            COND = c->up;
+    } else if (DIR_IS("line")) {
+        skip_line();
+    } else if (DIR_IS("pragma")) {
+        Tok *line = NULL;
+        u32 n = 0;
+        dir_line(&line, &n);
+        if (pp_active() && n > 1 && line[0].kind == TK_IDENT && tok_eq(&line[0], "pack")) {
+            /* `#pragma pack(push,1)` / `pack(pop)` / `pack(N)`。预处理是**整趟跑完**
+             * 才进语法分析的，所以这里不能直接改布局用的全局——那会让所有结构体
+             * 都用最后一个 pack 值。往 token 流里塞一条 `__c6_pack(N);`，
+             * 由语法分析在遇到它的位置生效。 */
+            u32 k = 1;
+            int v = -1;
+
+            while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
+                k++;
+            k++;
+            if (k < n && line[k].kind == TK_IDENT && tok_eq(&line[k], "push")) {
+                k++;
+                v = 0;
+                if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ',')
+                    k++;             /* `pack(push,1)` 里那个逗号 */
+                if (k < n && line[k].kind == TK_NUM) {
+                    char lb[24] = {0};
+                    u32 lk = line[k].len < 20 ? line[k].len : 20;
+
+                    memcpy(lb, tok_data(&line[k]), lk);
+                    lb[lk] = 0;
+                    v = (int)strtol(lb, NULL, 0);
+                }
+            } else if (k < n && line[k].kind == TK_IDENT && tok_eq(&line[k], "pop")) {
+                v = 0;
+            } else if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ')') {
+                v = 0;                   /* `pack()` = 恢复自然对齐 */
+            } else if (k < n && line[k].kind == TK_NUM) {
+                char lb[24] = {0};
+                u32 lk = line[k].len < 20 ? line[k].len : 20;
+
+                memcpy(lb, tok_data(&line[k]), lk);
+                lb[lk] = 0;
+                v = (int)strtol(lb, NULL, 0);
+            }
+            PACK_SEEN = 1;
+            if (v >= 0) {
+                char nb[24] = {0};
+                Tok t0 = tok_syn(TK_IDENT, "__c6_pack", 9, NULL, 0);
+                Tok t1 = tok_syn(TK_PUNCT, "(", 1, NULL, 0);
+                Tok t2 = {0};
+                Tok t3 = tok_syn(TK_PUNCT, ")", 1, NULL, 0);
+                Tok t4 = tok_syn(TK_PUNCT, ";", 1, NULL, 0);
+
+                snprintf(nb, sizeof(nb), "%d", v);
+                t2 = tok_syn(TK_NUM, arena_strdup(&A_main, nb), (u32)strlen(nb), NULL, 0);
+                /* pp_pushback 是栈：反着塞，取出来才是 `__c6_pack ( N ) ;` */
+                pp_pushback(&t4, TK_PUNCT);
+                pp_pushback(&t3, TK_PUNCT);
+                pp_pushback(&t2, TK_NUM);
+                pp_pushback(&t1, TK_PUNCT);
+                pp_pushback(&t0, TK_IDENT);
+            }
+        } else if (pp_active() && n > 0 && line[0].kind == TK_IDENT && tok_eq(&line[0], "once")) {
+            if (PP_TOP->is_file)
+                PP_TOP->f->pragma_once = 1;
+        } else if (pp_active() && n > 1 && line[0].kind == TK_IDENT
+                   && (tok_eq(&line[0], "push_macro") || tok_eq(&line[0], "pop_macro"))) {
+            /* #pragma push_macro("name") / pop_macro("name") */
+            int is_push = tok_eq(&line[0], "push_macro");
+            u32 k = 1;
+
+            while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
+                k++;
+            k++;
+            if (k < n && line[k].kind == TK_STR) {
+                char *nm = unquote(&line[k]);
+
+                if (is_push)
+                    macro_save_push(nm);
+                else
+                    macro_save_pop(nm);
+            }
+        }
+        /* 其它 pragma 一律忽略（与 tcc 一致，也对 glibc 头友好） */
+    } else if (DIR_IS("error")) {
+        Tok *line = NULL;
+        u32 n = 0;
+        dir_line(&line, &n);
+        if (pp_active())
+            diag_error(PP_TOP->f, t.off, "#error %s", n > 0 ? tok_data(&line[0]) : "");
+    } else if (DIR_IS("warning")) {
+        Tok *line = NULL;
+        u32 n = 0;
+        dir_line(&line, &n);
+        if (pp_active())
+            diag_warn(PP_TOP->f, t.off, "#warning %s", n > 0 ? tok_data(&line[0]) : "");
+    } else {
+        if (pp_active())
+            diag_warn(PP_TOP->f, t.off, "忽略未知的预处理指令 '#%s'", d);
+        skip_line();
+    }
+#undef DIR_IS
+}
+
+/* ---- 宏展开的主循环 ---- */
+
+static u32 PP_COUNTER;
+
+static int pp_next(Tok *out)
+{
+    for (;;) {
+        /* out 就是本轮的“当前 token”：不再往局部 Tok 里拷一遍（每个 token
+         * 40 字节，40 万 token 上是 16 MB 的搬运）。除了本函数没有别的东西
+         * 会写 out，宏展开那条路用的是自己的缓冲。 */
+        int k = raw_next(out);
+        Macro *m = NULL;
+        Hide *hs = NULL;
+
+        if (k == TK_EOF)
+            return k;
+        if (out->kind != TK_IDENT)
+            return k;
+        /* 五个内建宏先按"长度 8..11 且以 __ 开头"过滤：绝大多数标识符是普通
+         * 名字，一次判断就能跳过 5 次字符串比较（profiler 里 pp_next 占 6%）。 */
+        if (!(out->len >= 8 && out->len <= 11 && tok_data(out)[0] == '_'
+              && tok_data(out)[1] == '_')) {
+            m = macro_find(out);
+            hs = (Hide *)out->hs;
+            if (!m || hide_has(hs, m))
+                return k;
+            goto have_macro;
+        }
+        if (tok_eq(out, "__LINE__")) {
+            char *buf = arena_alloc(&A_main, 24);
+            int n = snprintf(buf, 24, "%u", src_line_of(file_by_id(out->file), out->off));
+            *out = tok_syn(TK_NUM, buf, (u32)n, CUR_FILE, 0);
+            return TK_NUM;
+        }
+        if (tok_eq(out, "__COUNTER__")) {
+            char *buf = arena_alloc(&A_main, 24);
+            int n = snprintf(buf, 24, "%u", PP_COUNTER++);
+
+            *out = tok_syn(TK_NUM, buf, (u32)n, CUR_FILE, 0);
+            return TK_NUM;
+        }
+        if (tok_eq(out, "__DATE__") || tok_eq(out, "__TIME__")) {
+            /* 标准要求是“本次翻译”的时间戳。不能拿编 c6c 那个编译器的
+             * __DATE__，否则会印出 c6c 二进制的构建日期。 */
+            const char *v = tok_eq(out, "__DATE__") ? DATE_BUF : TIME_BUF;
+            size_t len = strlen(v) + 3;
+            char *buf = arena_alloc(&A_main, len);
+            int n = snprintf(buf, len, "\"%s\"", v);
+            *out = tok_syn(TK_STR, buf, (u32)n, CUR_FILE, 0);
+            return TK_STR;
+        }
+        if (tok_eq(out, "__FILE__")) {
+            SrcFile *f = file_by_id(out->file);
+            size_t len = strlen(f->path) + 3;
+            char *buf = arena_alloc(&A_main, len);
+            int n = snprintf(buf, len, "\"%s\"", f->path);
+            *out = tok_syn(TK_STR, buf, (u32)n, CUR_FILE, 0);
+            return TK_STR;
+        }
+        m = macro_find(out);
+        hs = (Hide *)out->hs;
+        if (!m || hide_has(hs, m))
+            return k;
+have_macro:
+        if (!m->is_func) {
+            Tok *ex = NULL;
+            u32 exn = 0;
+            u32 q = 0;
+            Hide *nh = hide_cons(m, hs);
+            {
+                u32 em = exp_mark();
+                expand_macro(m, NULL, NULL, 0, &ex, &exn);
+                for (q = 0; q < exn; q++)
+                    ex[q].hs = ex[q].hs ? hide_union(nh, (Hide *)ex[q].hs) : nh;
+                pp_push_tokens(ex, exn);
+                PP_TOP->emark = em;
+            }
+            continue;
+        }
+        /* 函数宏：后面必须紧跟 '('（跨行允许，中间的换行直接吃掉） */
+        Tok nx = {0};
+        for (;;) {
+            k = raw_next(&nx);
+            if (k == TK_NL)
+                continue;
+            break;
+        }
+        if (!(k == TK_PUNCT && nx.len == 1 && tok_data(&nx)[0] == '(')) {
+            pp_pushback(&nx, k);
+            return out->kind;
+        }
+        {
+            int maxargs = m->nparams + (m->variadic ? 1 : 0);
+            Tok **args = arena_zalloc(&A_main, (size_t)(maxargs + 1) * sizeof(Tok *));
+            u32 *argn = arena_zalloc(&A_main, (size_t)(maxargs + 1) * sizeof(u32));
+            int nargs = 0;
+            int depth = 0;
+            u32 cap = 2, cn = 0;
+            u32 am = arg_mark();
+            Tok *cur = arg_alloc(cap);
+            Tok *ex = NULL;
+            u32 exn = 0;
+            Hide *nh = NULL;
+            Hide *hs_close = NULL;
+            u32 q = 0;
+
+            for (;;) {
+                Tok a = {0};
+                int ka = raw_next(&a);
+                if (ka == TK_EOF) {
+                    diag_error(CUR_FILE, out->off, "宏 '%s' 的参数没有结束（缺少 ')'）", m->name);
+                    break;
+                }
+                if (a.kind == TK_NL)
+                    continue;
+                if (ka == TK_PUNCT && a.len == 1 && tok_data(&a)[0] == '(')
+                    depth++;
+                if (ka == TK_PUNCT && a.len == 1 && tok_data(&a)[0] == ')') {
+                    if (depth == 0) {
+                        hs_close = (Hide *)a.hs;
+                        if (cn > 0 || nargs > 0 || maxargs == 0) {
+                            if (nargs < maxargs + 1) {
+                                args[nargs] = cur;
+                                argn[nargs] = cn;
+                                nargs++;
+                            }
+                        }
+                        break;
+                    }
+                    depth--;
+                }
+                if (ka == TK_PUNCT && a.len == 1 && tok_data(&a)[0] == ',' && depth == 0
+                    && (!m->variadic || nargs < m->nparams)) {
+                    if (nargs < maxargs + 1) {
+                        args[nargs] = cur;
+                        argn[nargs] = cn;
+                        nargs++;
+                    }
+                    cur = arg_alloc(cap);
+                    cn = 0;
+                    continue;
+                }
+                if (cn + 1 > cap) {
+                    Tok *nc = arg_alloc(cap * 2);
+                    memcpy(nc, cur, (size_t)cn * sizeof(Tok));
+                    cur = nc;
+                    cap *= 2;
+                }
+                cur[cn++] = a;
+            }
+            if (m->variadic && nargs == m->nparams && nargs < maxargs + 1) {
+                args[nargs] = tok_list_alloc(1);
+                argn[nargs] = 0;
+                nargs++;
+            }
+            nh = hide_cons(m, hide_and(hs, hs_close));
+            u32 em = exp_mark();
+            expand_macro(m, args, argn, nargs, &ex, &exn);
+            /* 关键：不能无脑覆盖 token 原有的隐藏集。实参预展开来的 token 身上
+             * 带着“我已经是 m0 展开出来的”这个信息（如自引用宏），覆盖掉就会
+             * 二次展开 —— 曾把 dwarf_data4(eh_frame_section, 0) 展开成
+             * section_ptr_add((s1-> s1->eh_frame_section), 4)。 */
+            for (q = 0; q < exn; q++)
+                ex[q].hs = ex[q].hs ? hide_union(nh, (Hide *)ex[q].hs) : nh;
+            pp_push_tokens(ex, exn);
+            PP_TOP->emark = em;
+            arg_reset(am);
+            continue;
+        }
+    }
+}
+
+/* 把一段 token 完整展开（实参、#if 表达式用）：用“边界 token”知道什么时候停 */
+static void expand_array(Tok *in, u32 n, Tok **out, u32 *outn)
+{
+    Src *save = PP_TOP;
+    u32 save_depth = PP_DEPTH;
+    u32 save_exp = exp_mark();
+    Tok marker = {0};
+    u32 cap = n + 8, cnt = 0;
+    Tok *buf = arg_alloc(cap);
+
+    marker.kind = TK_EOF;
+    marker.flags = TF_SYN;
+    marker.syn = "";
+    marker.file = CUR_FILE ? (u16)CUR_FILE->id : 0;
+    pp_push_tokens(&marker, 1);
+    pp_push_tokens(in, n);
+    for (;;) {
+        Tok t = {0};
+        int k = pp_next(&t);
+        if (k == TK_EOF)
+            break;
+        if (cnt + 1 > cap) {
+            Tok *nb = arg_alloc(cap * 2);
+            memcpy(nb, buf, (size_t)cnt * sizeof(Tok));
+            buf = nb;
+            cap *= 2;
+        }
+        buf[cnt++] = t;
+    }
+    PP_TOP = save;
+    PP_DEPTH = save_depth;
+    exp_reset(save_exp);
+    *out = buf;
+    *outn = cnt;
+}

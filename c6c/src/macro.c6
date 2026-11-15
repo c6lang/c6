@@ -1,0 +1,436 @@
+/* macro.c6 —— 宏表与展开（P1-3b）
+ *
+ * 三条要点（design.md §2）：
+ *  1. 宏体 = 定义处的 token 区间，展开时重放，不复制文本；
+ *  2. 递归靠**隐藏集**（hideset）而不是深度计数：`#define A A` 立刻停，
+ *     互递归（A→B→A）也停；
+ *  3. 只有 `#` 字符串化与 `##` 拼接会合成新 token（TF_SYN + 自带文本），
+ *     不进任何字符串表。
+ */
+
+#define MAX_PARAMS 16
+#define MACRO_BUCKETS 4096
+
+typedef struct Hide {
+    struct Hide *up;
+    const struct Macro *m;
+} Hide;
+
+typedef struct Macro {
+    struct Macro *next;        /* 桶内链 */
+    char *name;
+    u32 nlen;                  /* name 长度：查表时别再 strlen（profiler 里 7%） */
+    u32 hash;
+    u8 is_func;
+    u8 variadic;
+    u8 nparams;
+    char *vname;               /* GNU 具名可变参：`#define f(a, rest...)` 的 rest */
+    char *pname[MAX_PARAMS];
+    Tok *body;
+    u32 nbody;
+    u32 bodycap;               /* body 缓冲容量（重复 #define 时复用，省 arena） */
+} Macro;
+
+static Macro *MACROS[MACRO_BUCKETS];
+static u32 MACRO_COUNT;
+
+/* 由 pp.c6 提供：把一段 token 完整展开（实参展开、#if 求值都用它） */
+static void expand_array(Tok *in, u32 n, Tok **out, u32 *outn);
+
+static Hide *hide_cons(const Macro *m, Hide *up)
+{
+    Hide *h = arena_alloc_t(&A_main, sizeof(Hide), A_HIDE);
+    h->m = m;
+    h->up = up;
+    return h;
+}
+
+/* 隐藏集并集：a ∪ b（保持元素顺序，长度有限，直接展开成数组再倒着 cons） */
+static Hide *hide_union(Hide *a, Hide *b)
+{
+    Hide *arr[64] = {0};
+    Hide *p = NULL;
+    Hide *r = b;
+    int n = 0;
+
+    for (p = a; p && n < 64; p = p->up)
+        arr[n++] = p;
+    while (n > 0)
+        r = hide_cons(arr[--n]->m, r);
+    return r;
+}
+
+static int hide_has(Hide *h, const Macro *m)
+{
+    for (; h; h = h->up)
+        if (h->m == m)
+            return 1;
+    return 0;
+}
+
+/* 隐藏集的交集：Prosser 算法里扩展结果的隐藏集 = 宏名记号的隐藏集 ∩ 调用
+ * 收尾记号（右括号）的隐藏集，再并上宏自己。只用并集的话，`CAT(A,B)(x)`
+ * 这种"展开结果又调用另一个宏"的链会被自己的祖先名字挡住，CAT 就不再展开。 */
+static Hide *hide_and(Hide *a, Hide *b)
+{
+    Hide *r = NULL;
+    Hide *p = NULL;
+
+    for (p = a; p; p = p->up)
+        if (hide_has(b, p->m))
+            r = hide_cons(p->m, r);
+    return r;
+}
+
+
+/* 展开结果池：**按帧 LIFO 回收**。
+ *
+ * 宏展开产物的寿命就是“被消费完”为止，而消费是严格 LIFO 的（压一帧、读完、
+ * 弹帧），所以给它单独一个池，帧弹出时整段回卷。以前直接吃 arena，实测
+ * 18.16 MB 全堆在这里（arena 总计 28.48 MB）。 */
+static Tok *EXP_BASE;
+static u32 EXP_CAP, EXP_N;
+
+static Tok *tok_list_alloc(u32 n);
+
+static u32 exp_mark(void)
+{
+    return EXP_N;
+}
+
+static void exp_reset(u32 mark)
+{
+    if (mark <= EXP_N)
+        EXP_N = mark;
+}
+
+static Tok *exp_alloc(u32 n)
+{
+    Tok *p = NULL;
+
+    if (!EXP_BASE) {
+        EXP_CAP = 1u << 16;
+        EXP_BASE = malloc((size_t)EXP_CAP * sizeof(Tok));
+        if (!EXP_BASE)
+            return tok_list_alloc(n);
+    }
+    if (EXP_N + n > EXP_CAP)
+        return tok_list_alloc(n);      /* 回退 arena：正常代码走不到 */
+    p = EXP_BASE + EXP_N;
+    EXP_N += n;
+    return p;
+}
+
+static Tok *tok_list_alloc(u32 n)
+{
+    Tok *t = arena_zalloc(&A_main, (size_t)(n ? n : 1) * sizeof(Tok));
+    return t;
+}
+
+static Tok *tok_list_alloc_t(u32 n, int tag)
+{
+    return arena_zalloc_t(&A_main, (size_t)(n ? n : 1) * sizeof(Tok), tag);
+}
+
+static Tok tok_syn(int kind, char *text, u32 len, SrcFile *at, u32 off)
+{
+    Tok t = {0};
+    t.kind = (u16)kind;
+    t.flags = TF_SYN;
+    t.syn = text;
+    t.off = off;
+    t.len = len;
+    t.hash = tok_hash(text, len);
+    t.file = at ? (u16)at->id : 0;
+    return t;
+}
+
+static Macro *macro_find(const Tok *t)
+{
+    Macro *m = MACROS[t->hash % MACRO_BUCKETS];
+    const char *d = tok_data(t);
+
+    for (; m; m = m->next)
+        if (m->hash == t->hash && m->nlen == t->len
+            && memcmp(m->name, d, t->len) == 0)
+            return m;
+    return NULL;
+}
+
+static void macro_undef(const char *name, u32 len);
+
+/* ---- #pragma push_macro / pop_macro -------------------------------------
+ * 按名字保存/恢复宏定义。节点全是 arena 分配的，所以 push 只需要抓住指针，
+ * pop 时把当前定义摘掉、把旧节点挂回去。`#define push_macro ...` 之类不影响
+ * 这里——我们看的是 pragma 行里的原始标识符，不做宏展开。 */
+typedef struct MacroSaved {
+    struct MacroSaved *next;
+    const char *name;
+    Macro *m;                       /* NULL = 当时该名字没有定义 */
+} MacroSaved;
+
+static MacroSaved *MSAVE = NULL;
+
+static void macro_save_push(const char *name)
+{
+    MacroSaved *s = arena_alloc(&A_main, sizeof(MacroSaved));
+    Tok t = tok_syn(TK_IDENT, name, (u32)strlen(name), NULL, 0);
+
+    s->name = arena_strdup(&A_main, name);
+    s->m = macro_find(&t);
+    s->next = MSAVE;
+    MSAVE = s;
+}
+
+static void macro_save_pop(const char *name)
+{
+    MacroSaved **pp = &MSAVE;
+
+    while (*pp) {
+        MacroSaved *s = *pp;
+
+        if (strcmp(s->name, name) == 0) {
+            *pp = s->next;
+            macro_undef(name, (u32)strlen(name));
+            if (s->m) {
+                u32 b = s->m->hash % MACRO_BUCKETS;
+
+                s->m->next = MACROS[b];
+                MACROS[b] = s->m;
+                MACRO_COUNT++;
+            }
+            return;
+        }
+        pp = &s->next;
+    }
+}
+
+static int macro_defined(const Tok *t)
+{
+    /* __has_include 是内建的运算符，但 `#ifdef __has_include` 必须为真 */
+    if (t->kind == TK_IDENT
+        && (tok_eq(t, "__has_include") || tok_eq(t, "__has_include_next")))
+        return 1;
+    return macro_find(t) != NULL;
+}
+
+
+/* 按名字找已存在的定义（重复 #define 时用来复用 body 缓冲） */
+static Macro *macro_lookup(const char *name, u32 hash)
+{
+    u32 len = (u32)strlen(name);
+    Macro *m = MACROS[hash % MACRO_BUCKETS];
+
+    for (; m; m = m->next)
+        if (m->hash == hash && m->nlen == len
+            && memcmp(m->name, name, len) == 0)
+            return m;
+    return NULL;
+}
+
+/* 定义同一个名字两次时**必须替换**旧定义（C 标准 6.10.3）。这里先把自己摘干净
+ * 再挂上 —— 以前是无脑前插，于是 #undef 只摘掉一个节点，旧定义还留在链上继续
+ * 展开（tcc.h 里 #undef _tcc_error 就被这么架空了）。 */
+static void macro_add(Macro *m)
+{
+    u32 b = m->hash % MACRO_BUCKETS;
+    macro_undef(m->name, m->nlen);
+    m->next = MACROS[b];
+    MACROS[b] = m;
+    MACRO_COUNT++;
+}
+
+static void macro_undef(const char *name, u32 len)
+{
+    u32 h = tok_hash(name, len);
+    Macro **pp = &MACROS[h % MACRO_BUCKETS];
+
+    while (*pp) {
+        Macro *m = *pp;
+        if (m->hash == h && m->nlen == len && memcmp(m->name, name, len) == 0) {
+            *pp = m->next;          /* 同名节点可能不止一个，全部摘掉 */
+            MACRO_COUNT--;
+            continue;
+        }
+        pp = &m->next;
+    }
+}
+
+static int tok_is_param(Macro *m, const Tok *t, int *idx)
+{
+    int i = 0;
+    const char *d = NULL;
+
+    if (t->kind != TK_IDENT)
+        return 0;
+    d = tok_data(t);
+    for (i = 0; i < m->nparams; i++) {
+        u32 len = (u32)strlen(m->pname[i]);
+        if (len == t->len && memcmp(m->pname[i], d, len) == 0) {
+            *idx = i;
+            return 1;
+        }
+    }
+    if (m->variadic && t->len == 11 && memcmp(d, "__VA_ARGS__", 11) == 0) {
+        *idx = m->nparams;
+        return 1;
+    }
+    /* GNU 具名可变参（`#define f(a, rest...)`）：rest 与 __VA_ARGS__ 等价 */
+    if (m->variadic && m->vname) {
+        u32 len = (u32)strlen(m->vname);
+        if (len == t->len && memcmp(m->vname, d, len) == 0) {
+            *idx = m->nparams;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* # 参数 —— 拼成字符串字面量（实参不再展开） */
+static Tok stringize(Tok *arg, u32 n, SrcFile *at)
+{
+    size_t cap = 32, len = 0;
+    char *buf = arena_alloc(&A_main, cap);
+    u32 i = 0;
+
+    buf[len++] = '"';
+    for (i = 0; i < n; i++) {
+        const char *d = tok_data(&arg[i]);
+        u32 k = 0;
+        if (len + arg[i].len * 2 + 4 > cap) {
+            size_t ncap = cap * 2 + arg[i].len * 2 + 16;
+            char *nb = arena_alloc(&A_main, ncap);
+            memcpy(nb, buf, len);
+            buf = nb;
+            cap = ncap;
+        }
+        if (i > 0 && (arg[i].flags & TF_SPACE))
+            buf[len++] = ' ';
+        for (k = 0; k < arg[i].len; k++) {
+            char c = d[k];
+            if (c == '"' || c == '\\')
+                buf[len++] = '\\';
+            buf[len++] = c;
+        }
+    }
+    buf[len++] = '"';
+    return tok_syn(TK_STR, buf, (u32)len, at, 0);
+}
+
+/* ## 拼接：文本直接相接，类型按首字符定 */
+static Tok paste_tok(Tok a, Tok b, SrcFile *at)
+{
+    u32 n = a.len + b.len;
+    char *buf = arena_alloc(&A_main, n + 1);
+    u32 i = 0;
+    int c = 0;
+    int kind = TK_PUNCT;
+
+    for (i = 0; i < a.len; i++)
+        buf[i] = tok_data(&a)[i];
+    for (i = 0; i < b.len; i++)
+        buf[a.len + i] = tok_data(&b)[i];
+    buf[n] = 0;
+    c = (u8)buf[0];
+    if (c >= '0' && c <= '9')
+        kind = TK_NUM;
+    else if (is_ident_start(c))
+        kind = TK_IDENT;
+    return tok_syn(kind, buf, n, at, 0);
+}
+
+/* 展开一个宏：args 是未展开的实参 */
+static void expand_macro(Macro *m, Tok **args, u32 *argn, int nargs, Tok **out, u32 *outn)
+{
+    u32 cap = m->nbody + 4, n = 0;
+    Tok *r = exp_alloc(cap);
+    Tok **aexp = NULL;
+    u32 *naexp = NULL;
+    u32 i = 0;
+
+    if (m->is_func && nargs > 0) {
+        aexp = arena_zalloc(&A_main, (size_t)nargs * sizeof(Tok *));
+        naexp = arena_zalloc(&A_main, (size_t)nargs * sizeof(u32));
+        for (i = 0; i < (u32)nargs; i++)
+            expand_array(args[i], argn[i], &aexp[i], &naexp[i]);
+    }
+
+    for (i = 0; i < m->nbody; i++) {
+        Tok *b = &m->body[i];
+        int pi = 0;
+
+        if (b->kind == TK_PUNCT && b->len == 1 && tok_data(b)[0] == '#'
+            && i + 1 < m->nbody && tok_is_param(m, &m->body[i + 1], &pi)) {
+            u32 an = (pi < nargs) ? argn[pi] : 0;
+            Tok *ap = (pi < nargs) ? args[pi] : NULL;
+            if (n + 2 > cap) {
+                Tok *nr = exp_alloc(cap * 2 + 8);
+                memcpy(nr, r, (size_t)n * sizeof(Tok));
+                r = nr;
+                cap = cap * 2 + 8;
+            }
+            r[n++] = stringize(ap, an, file_by_id(m->body[i + 1].file));
+            i++;
+            continue;
+        }
+        if (b->kind == TK_PUNCT && b->len == 2 && memcmp(tok_data(b), "##", 2) == 0) {
+            Tok rhs = {0};
+            int got = 0;
+            i++;
+            if (i >= m->nbody)
+                break;
+            if (tok_is_param(m, &m->body[i], &pi)) {
+                u32 an = (pi < nargs) ? argn[pi] : 0;
+                Tok *ap = (pi < nargs) ? args[pi] : NULL;
+                if (an > 0) {
+                    rhs = ap[0];
+                    got = 1;
+                }
+            } else {
+                rhs = m->body[i];
+                got = 1;
+            }
+            if (got) {
+                if (n > 0)
+                    r[n - 1] = paste_tok(r[n - 1], rhs, file_by_id(m->body[i].file));
+                else
+                    r[n++] = rhs;
+            }
+            continue;
+        }
+        if (tok_is_param(m, b, &pi)) {
+            u32 an = (pi < nargs) ? argn[pi] : 0;
+            Tok *ap = (pi < nargs) ? args[pi] : NULL;
+            int adj_paste = (i + 1 < m->nbody && m->body[i + 1].kind == TK_PUNCT
+                             && m->body[i + 1].len == 2
+                             && memcmp(tok_data(&m->body[i + 1]), "##", 2) == 0);
+            Tok *use = ap;
+            u32 un = an;
+            u32 k = 0;
+
+            if (!adj_paste && aexp && pi < nargs) {
+                use = aexp[pi];
+                un = naexp[pi];
+            }
+            if (n + un + 2 > cap) {
+                u32 ncap = cap * 2 + un + 8;
+                Tok *nr = exp_alloc(ncap);
+                memcpy(nr, r, (size_t)n * sizeof(Tok));
+                r = nr;
+                cap = ncap;
+            }
+            for (k = 0; k < un; k++)
+                r[n++] = use[k];
+            continue;
+        }
+        if (n + 2 > cap) {
+            Tok *nr = exp_alloc(cap * 2 + 8);
+            memcpy(nr, r, (size_t)n * sizeof(Tok));
+            r = nr;
+            cap = cap * 2 + 8;
+        }
+        r[n++] = *b;
+    }
+    *out = r;
+    *outn = n;
+}

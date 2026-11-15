@@ -1,0 +1,130 @@
+{
+  "note": "2026-11-13 实测基线。用 bench.py 对仓库外的 tcc/c6（v0.9.28rc main@8b5d729）测得；产物写 /tmp，仓库零改动。tcc.c 的 ONE_SOURCE 预处理行数 57,517。",
+  "date": "2026-11-13",
+  "machine": {
+    "cpu": "Intel Xeon E5-2696 v4 @ 2.20GHz",
+    "cores": 44,
+    "note": "CPU scaling MHz 83%；bench 未绑核，绝对数留 ±10% 余量"
+  },
+  "compiler": {
+    "path": "tcc/c6",
+    "version": "0.9.28rc main@8b5d729",
+    "built_with": "gcc -O2"
+  },
+  "runs": 3,
+  "pp_lines": 57517,
+  "workloads": [
+    {
+      "name": "native:tcc.c",
+      "cmd": "/media/winger/_dde_data/superc/tcc/c6 -B tcc -DONE_SOURCE=1 -DC6_EXT -c tcc/tcc.c -o /tmp/c6c-bench-0j7_id9q/tcc.o",
+      "ms": 132.0743040414527,
+      "rss_mb": 15.10546875,
+      "out_bytes": 1463730,
+      "rc": 0
+    },
+    {
+      "name": "preprocess:tcc.c",
+      "cmd": "/media/winger/_dde_data/superc/tcc/c6 -B tcc -DONE_SOURCE=1 -DC6_EXT -E tcc/tcc.c",
+      "ms": 106.53940303018317,
+      "rss_mb": 15.10546875,
+      "out_bytes": null,
+      "rc": 0
+    },
+    {
+      "name": "c99:tcc.c",
+      "cmd": "/media/winger/_dde_data/superc/tcc/c6 -B tcc -DONE_SOURCE=1 -DC6_EXT -c99 -o /tmp/c6c-bench-0j7_id9q/tcc.c tcc/tcc.c",
+      "ms": 572.9182499926537,
+      "rss_mb": 25.9921875,
+      "out_bytes": 7923734,
+      "rc": 0
+    },
+    {
+      "name": "llvm:tcc.c",
+      "cmd": "/media/winger/_dde_data/superc/tcc/c6 -B tcc -DONE_SOURCE=1 -DC6_EXT -o /tmp/c6c-bench-0j7_id9q/tcc.ll tcc/tcc.c",
+      "ms": 1194.373167003505,
+      "rss_mb": 46.8046875,
+      "out_bytes": 18884600,
+      "rc": 0
+    },
+    {
+      "name": "gcc -O0:tcc.c",
+      "cmd": "gcc -O0 -w -DONE_SOURCE=1 -DC6_EXT -I tcc -c tcc/tcc.c -o /tmp/c6c-bench-0j7_id9q/gcc.o",
+      "ms": 2599.131635040976,
+      "rss_mb": 137.34765625,
+      "out_bytes": 955208,
+      "rc": 0
+    },
+    {
+      "name": "synth:5k funcs",
+      "cmd": "/media/winger/_dde_data/superc/tcc/c6 -B tcc -c /tmp/c6c-bench-0j7_id9q/syn5000.c -o /tmp/c6c-bench-0j7_id9q/syn5000.o",
+      "ms": 17.45722600026056,
+      "rss_mb": 16.48046875,
+      "out_bytes": 699406,
+      "rc": 0
+    },
+    {
+      "name": "synth:20k funcs",
+      "cmd": "/media/winger/_dde_data/superc/tcc/c6 -B tcc -c /tmp/c6c-bench-0j7_id9q/syn20000.c -o /tmp/c6c-bench-0j7_id9q/syn20000.o",
+      "ms": 65.58504700660706,
+      "rss_mb": 16.48046875,
+      "out_bytes": 2809406,
+      "rc": 0
+    },
+    {
+      "name": "synth:80k funcs",
+      "cmd": "/media/winger/_dde_data/superc/tcc/c6 -B tcc -c /tmp/c6c-bench-0j7_id9q/syn80000.c -o /tmp/c6c-bench-0j7_id9q/syn80000.o",
+      "ms": 275.83113400032744,
+      "rss_mb": 41.703125,
+      "out_bytes": 11269406,
+      "rc": 0
+    }
+  ],
+  "linearity": [
+    {
+      "from": 5000,
+      "to": 20000,
+      "ratio": 3.7568996933205856
+    },
+    {
+      "from": 20000,
+      "to": 80000,
+      "ratio": 4.205701552253826
+    }
+  ],
+  "derived": {
+    "native_us_per_pp_line": 2.3,
+    "native_share_of_preprocess": "preprocess 107 ms / native 132 ms = 81%",
+    "codegen_only_ms": 25,
+    "synthetic_note": "tcc 4x 输入 ≈ 3.76x/4.21x（≈1.0x/行，接近线性）；uya 4x → 10x（2.5x/行）"
+  },
+  "manual_probe": {
+    "note": "这些是 bench.py 之外的一次性探针，命令都在 docs/plan.md §3 里",
+    "tcc_E_pure_lex_print_ms": 61,
+    "tcc_E_system_headers_only_ms": 10,
+    "tcc_empty_file_ms": 1.0,
+    "tcc_with_g_ms": 146,
+    "gcc_O2_tcc_c_ms": 16500,
+    "uya_self_compile_ms": 12500,
+    "uya_self_compile_rss_mb": 2326,
+    "uya_self_compile_lines": 211572,
+    "uya_self_compile_out_mb": 10.7,
+    "uya_synth_5k_ms": 491,
+    "uya_synth_5k_rss_mb": 195,
+    "uya_synth_20k_ms": 4969,
+    "uya_synth_20k_rss_mb": 715,
+    "err_flag_get_ns": 13.5,
+    "plain_call_ns": 2.95,
+    "try_loop_ns_per_iter": 30.4,
+    "plain_loop_ns_per_iter": 3.4,
+    "tcc_source_gnu_features": {
+      "__attribute__": 84,
+      "__asm__": 29,
+      "__builtin_*": 100,
+      "typeof": 12,
+      "long double": 116,
+      "restrict": 18,
+      "__extension__": 1,
+      "system_headers_lines": 4711
+    }
+  }
+}
