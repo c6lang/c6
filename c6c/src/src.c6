@@ -215,6 +215,15 @@ static SrcFile *src_load(const char *path)
         return NULL;
     p = m;
     p[st.st_size] = 0;
+    /* `#!/path/to/c6c -run`：tcc 的 -run 靠"行首 #! 忽略掉"支持 C 脚本，
+     * 这里把首行抹成空白——行号不变，MAP_PRIVATE 也不会写回文件。 */
+    if (st.st_size > 1 && p[0] == '#' && p[1] == '!') {
+        size_t k = 0;
+
+        while (k < (size_t)st.st_size && p[k] != '\n')
+            k++;
+        memset(p, ' ', k);
+    }
     {
         /* `.c6` 文件先把 c6 的 module/import 改写成预处理指令 */
         size_t plen = strlen(path);

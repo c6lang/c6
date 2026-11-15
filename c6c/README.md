@@ -43,4 +43,25 @@ make -C c6c tests2-check ROOT=$PWD  # 只跑 tcc 上游 tests2 的闸门
 `make -C c6c lint` 仍然机器检查目录边界（不 `#include` `tcc/*.h`、不链接
 `libtcc`、不复制 `tcc/` 源码）。
 
+## 直接跑 c6 源码：`-run`
+
+```sh
+./c6c/build/c6c -run hello.c6          # 编到 $TMPDIR 的临时 ELF，exec 完就删
+./c6c/build/c6c -run app.c6 a b        # 参数原样交给 main（argv[0] 是源文件名）
+./c6c/build/c6c -run my_test.c6        # 只有 test 块的文件：合成入口，失败数当退出码
+```
+
+也能直接当脚本解释器用（内核把脚本路径排在 `-run` 后面）：
+
+```c
+#!/path/to/c6c/build/c6c -run
+```
+
+`-run` 走的是"落一份临时 ELF 再 `exec`"，不是 tcc 那种 mmap + 重定位的 JIT：
+c6c 只产静态 ELF，`exec` 它没有 ld.so / PLT 的额外成本，也正好绕开 c6c
+还没有动态链接这件事。退出码照抄程序（被信号杀按 shell 惯例 `128+sig`），
+临时文件在子进程结束后删除，落在 `$TMPDIR`（默认 `/tmp`）。只支持 native
+后端；`-o`、`-c`、`-E`、`-fsyntax-only`、`--emit-c`、`--emit-llvm` 都跟它互斥。
+回归：`make -C c6c runflag`。
+
 许可证：`LICENSE` 为 MIT，与 `tcc/`（LGPL-2.1）严格分离；若项目所有者另有安排，替换本文件即可。
