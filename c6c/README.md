@@ -347,3 +347,27 @@ cc $(pkgconf --cflags --libs c6lib) host.c -o host   # → -lc6c
 回归：`make -C c6c pkgcheck`（7 条：无 tcc 也能 configure / 安装树齐全 /
 `include/` 干净 / `find_package` 消费者真编真跑 / `pkgconf` 旗子
 `-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 自找头文件与运行时）。
+
+## x86-64 之外：IR 与目标无关，aarch64 实测
+
+c6c 自己的 native 后端只出 x86-64 机器码；但 IR（`src/ir.c6`，24 字节定长记录）
+是**与目标无关**的，`--emit-llvm` 出来的 `.ll` 交给任何 LLVM 目标后端都能落到
+别的架构。这条链在这里被真跑验过（`make -C c6c archcheck`）：
+
+```sh
+./c6c/build/c6c --emit-llvm -nostdlib calc.c6 -o calc.ll
+grep -v '^module asm' calc.ll > calc.pure.ll     # 运行时跳板是 x86-64 内联汇编
+llc -march=aarch64 -filetype=obj -o calc.o calc.pure.ll
+clang --target=aarch64-linux-gnu -c start.s -o start.o   # 自己写的 _start（svc #0）
+ld.lld -m aarch64elf -e _start -o calc.elf start.o mem.o calc.o
+qemu-aarch64 ./calc.elf; echo $?        # → 91，和 x86-64 后端一致
+```
+
+口径（别读错）：这不是"c6c 有 aarch64 native 后端"。目前的三个后端是
+**native x86-64 / C99 / LLVM IR**；跨到 aarch64 走的是第三条路 + LLVM。运行时
+（`lib/rt.c6`）里的 syscall 跳板是 x86-64 内联汇编，所以跨目标只覆盖"自己算、
+不碰运行时"的程序；`llc` 会把零初始化变成 `memset` 调用，宿主侧得自己补。
+
+回归：`make -C c6c archcheck`（4 条：x86-64 对照 91、IR→aarch64 汇编里是 aarch64
+指令且没有 x86 寄存器、产物是 ARM aarch64 ELF、qemu 上跑出 91；缺
+llc/clang/ld.lld/qemu-aarch64 时自动跳过）。
