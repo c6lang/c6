@@ -1,0 +1,701 @@
+/* asmout.c6 —— -S：把 IR 落成 **x86-64 汇编文本**（GNU as，Intel 语法）。
+ *
+ * 与 native 后端（x64.c6）的关系：同一份 IR、同一套约定——
+ *   * 每个 vreg 一个栈槽，槽号 n 在 [rbp - 16*(n+1)]（和 X64_SLOT 一致）；
+ *   * 二元运算：a → rax、b → rcx，结果写回 dst 的槽；
+ *   * 比较结果物化成 0/1 存进 dst；分支看槽里的 0/非 0；
+ *   * 调用：IR_ARG 依次收实参，IR_CALL 时装进 SysV 寄存器（多余的上栈）；
+ *   * 序言 push rbp / mov rbp,rsp / sub rsp,frame；IR_RET 里 leave / ret。
+ * 所以它和 native 后端出的是**同一串语义**，只是这边写成文本，交给 as 去编码。
+ *
+ * 为什么不是"反汇编"：文本是从 IR 直接生成的，标签、符号名、函数范围都在手，
+ * 不需要从字节反推；也因此能把数据段原样写出来（.byte）。
+ *
+ * 范围（v1）：整数/指针的全部运算、控制流、调用、数据段、`_start`。浮点、
+ * 变参、内联汇编、TLS 一律**明确报错**（不做"静默出一份错的 .s"）——这些要到
+ * 后面补；错误信息会点名是哪个 op、哪个函数。
+ */
+static int ASO_ON;
+static void aso_set_mode(int on) { ASO_ON = on ? 1 : 0; }
+static int aso_on(void) { return ASO_ON; }
+
+static ObjBuf ASO;              /* 整份 .s 文本 */
+static u32 ASO_FNIDX;           /* 当前函数序号（标签前缀） */
+static int ASO_BAD;             /* 出过错：最后不写文件 */
+static const char *ASO_ARGREG[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+
+static void aso_emit(const char *s)
+{
+    ob_copy(&ASO, s, (u32)strlen(s));
+}
+
+static void aso_emit_line(const char *s)
+{
+    aso_emit("\t");
+    aso_emit(s);
+    aso_emit("\n");
+}
+
+static void aso_emit_num(i64 v)
+{
+    char b[32] = {0};
+
+    snprintf(b, sizeof(b), "%lld", (long long)v);
+    aso_emit(b);
+}
+
+/* 符号名进 .s 之前要把 `$` 换掉（`tu_static_name()` 用 `$1` 后缀标 TU 私有名，
+ * gas 的符号名里收不了它）。所有引用都走这里，改名是自洽的。 */
+static void aso_emit_symname(const char *name)
+{
+    u32 i = 0;
+
+    if (!name) {
+        aso_emit("<null>");
+        return;
+    }
+    for (i = 0; name[i]; i++) {
+        char c = name[i];
+
+        if (c == '$')
+            c = '.';
+        ob_u8(&ASO, (u32)(u8)c);
+    }
+}
+
+static void aso_sym(u32 symidx)
+{
+    if (symidx < X64.nsym)
+        aso_emit_symname(X64.sym[symidx].name);
+    else
+        aso_emit("<sym?>");
+}
+
+/* [rbp - 16*(n+1)]：和 native 后端同一个槽位公式 */
+static void aso_slot(u32 n)
+{
+    aso_emit("[rbp-");
+    {
+        char b[32] = {0};
+
+        snprintf(b, sizeof(b), "%d", (int)(16 * (n + 1)));
+        aso_emit(b);
+    }
+    aso_emit("]");
+}
+
+static void aso_lbl(u32 l)
+{
+    char b[48] = {0};
+
+    snprintf(b, sizeof(b), ".L%u_%u", (unsigned)ASO_FNIDX, (unsigned)l);
+    aso_emit(b);
+}
+
+/* 装载槽 → 寄存器 / 寄存器 → 槽 */
+static void aso_ld(u32 n, const char *reg)
+{
+    aso_emit("\tmov\t");
+    aso_emit(reg);
+    aso_emit(", ");
+    aso_slot(n);
+    aso_emit("\n");
+}
+
+static void aso_st(u32 n, const char *reg)
+{
+    aso_emit("\tmov\t");
+    aso_slot(n);
+    aso_emit(", ");
+    aso_emit(reg);
+    aso_emit("\n");
+}
+
+static int aso_width(int type)
+{
+    switch (type) {
+    case IRT_U8:
+    case IRT_I8:
+        return 1;
+    case IRT_U16:
+    case IRT_I16:
+        return 2;
+    case IRT_U32:
+    case IRT_I32:
+    case IRT_F32:
+        return 4;
+    default:
+        return 8;
+    }
+}
+
+static int aso_signed(int type)
+{
+    return type == IRT_I8 || type == IRT_I16 || type == IRT_I32 || type == IRT_I64;
+}
+
+static void aso_bad_op(const IrFn *f, const IrOp *o, const char *why)
+{
+    fprintf(stderr, "c6c: -S 暂不支持 %s（函数 %s，%s）\n", ir_name(o->op),
+            f && f->name ? f->name : "?", why);
+    ASO_BAD = 1;
+}
+
+/* 条件码 → setcc 后缀 */
+static const char *aso_cc(u8 cc)
+{
+    switch (cc) {
+    case IRCC_EQ:
+        return "e";
+    case IRCC_NE:
+        return "ne";
+    case IRCC_LT:
+        return "l";
+    case IRCC_LE:
+        return "le";
+    case IRCC_GT:
+        return "g";
+    case IRCC_GE:
+        return "ge";
+    case IRCC_ULT:
+        return "b";
+    case IRCC_ULE:
+        return "be";
+    case IRCC_UGT:
+        return "a";
+    case IRCC_UGE:
+        return "ae";
+    default:
+        return "e";
+    }
+}
+
+static const char *aso_jcc(u8 cc)
+{
+    switch (cc) {
+    case IRCC_EQ:
+        return "je";
+    case IRCC_NE:
+        return "jne";
+    case IRCC_LT:
+        return "jl";
+    case IRCC_LE:
+        return "jle";
+    case IRCC_GT:
+        return "jg";
+    case IRCC_GE:
+        return "jge";
+    case IRCC_ULT:
+        return "jb";
+    case IRCC_ULE:
+        return "jbe";
+    case IRCC_UGT:
+        return "ja";
+    case IRCC_UGE:
+        return "jae";
+    default:
+        return "je";
+    }
+}
+
+static void aso_compile(X64State *st, IrFn *f, u32 func_sym);
+
+/* 一个函数：序言 + 每条 op + 尾声 */
+static void aso_compile(X64State *st, IrFn *f, u32 func_sym)
+{
+    u32 i = 0;
+    u32 k = 0;
+    u32 arg_v[16] = {0};
+    u32 narg = 0;
+    u32 frame = 16u * (f->nvreg + 8u);
+    char b[64] = {0};
+
+    ASO_FNIDX++;
+    aso_emit("\n\t.text\n");
+    if (func_sym < X64.nsym) {
+        const char *nm = X64.sym[func_sym].name;
+
+        if (nm && nm[0] != '.' && !strchr(nm, '$')) {
+            aso_emit("\t.globl\t");
+            aso_emit_symname(nm);
+            aso_emit("\n");
+        }
+        aso_emit_symname(nm);
+        aso_emit(":\n");
+    }
+    aso_emit_line("push\trbp");
+    aso_emit_line("mov\trbp, rsp");
+    snprintf(b, sizeof(b), "\tsub\trsp, %u\n", frame);
+    aso_emit(b);
+
+    /* 形参：ABI 寄存器 → 槽（第 7 个起在栈上） */
+    for (i = 0; i < f->nparams && i < 16u; i++) {
+        if (i < 6u) {
+            aso_st(f->params[i], ASO_ARGREG[i]);
+        } else {
+            snprintf(b, sizeof(b), "\tmov\trax, [rbp+%u]\n", 16u + (i - 6u) * 8u);
+            aso_emit(b);
+            aso_st(f->params[i], "rax");
+        }
+    }
+    if (f->is_variadic) {
+        /* 变参函数要把前 6 个整数寄存器和浮点寄存器存到帧底（见 native 后端
+         * 的 X64_VA_BYTES）。-S v1 不支持变参的**定义**，直接报错。 */
+        fprintf(stderr, "c6c: -S 暂不支持变参函数（%s）\n", f->name ? f->name : "?");
+        ASO_BAD = 1;
+    }
+
+    for (i = 0; i < f->n; i++) {
+        IrOp o = f->ops[i];
+        int w = aso_width(o.type);
+        int sgn = aso_signed(o.type);
+
+        switch (o.op) {
+        case IR_NOP:
+            break;
+        case IR_COMMENT:
+            if (o.imm & AX_MARK)
+                aso_bad_op(f, &o, "内联汇编");
+            break;
+        case IR_LABEL:
+            aso_lbl(o.a);
+            aso_emit(":\n");
+            break;
+        case IR_CONST:
+            snprintf(b, sizeof(b), "\tmov\trax, %u\n", (unsigned)o.imm);
+            aso_emit(b);
+            aso_st(o.dst, "rax");
+            break;
+        case IR_CONSTK:
+            snprintf(b, sizeof(b), "\tmov\trax, %llu\n",
+                     (unsigned long long)(f->kpool ? f->kpool[o.imm] : 0));
+            aso_emit(b);
+            aso_st(o.dst, "rax");
+            break;
+        case IR_MOV:
+            aso_ld(o.a, "rax");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_LOAD:
+            aso_ld(o.a, "rax");
+            if (w == 1) {
+                snprintf(b, sizeof(b), "\t%s\trax, byte ptr [rax]\n",
+                         sgn ? "movsx" : "movzx");
+                aso_emit(b);
+            } else if (w == 2) {
+                snprintf(b, sizeof(b), "\t%s\trax, word ptr [rax]\n",
+                         sgn ? "movsx" : "movzx");
+                aso_emit(b);
+            } else if (w == 4) {
+                aso_emit(sgn ? "\tmovsxd\trax, dword ptr [rax]\n"
+                             : "\tmov\teax, dword ptr [rax]\n");
+            } else {
+                aso_emit("\tmov\trax, qword ptr [rax]\n");
+            }
+            aso_st(o.dst, "rax");
+            break;
+        case IR_STORE:
+            aso_ld(o.dst, "rax");               /* 地址 */
+            aso_ld(o.a, "rdx");                 /* 值 */
+            if (w == 1)
+                aso_emit("\tmov\tbyte ptr [rax], dl\n");
+            else if (w == 2)
+                aso_emit("\tmov\tword ptr [rax], dx\n");
+            else if (w == 4)
+                aso_emit("\tmov\tdword ptr [rax], edx\n");
+            else
+                aso_emit("\tmov\tqword ptr [rax], rdx\n");
+            break;
+        case IR_ADDR:
+            if (o.flags & 2u) {
+                aso_emit("\tlea\trax, ");
+                aso_sym(o.imm);
+                aso_emit("[rip]\n");
+            } else if (o.flags & 1u) {
+                snprintf(b, sizeof(b), "\tmov\trax, %u\n", (unsigned)o.imm);
+                aso_emit(b);
+            } else {
+                snprintf(b, sizeof(b), "\tlea\trax, [rbp%+d]\n", (int)o.imm);
+                aso_emit(b);
+            }
+            if (o.a) {
+                aso_ld(o.a, "rcx");
+                aso_emit("\tadd\trax, rcx\n");
+            }
+            aso_st(o.dst, "rax");
+            break;
+        case IR_ALLOCA:
+            aso_ld(o.a, "rax");
+            if (o.imm > 1) {
+                snprintf(b, sizeof(b), "\timul\trax, %u\n", (unsigned)o.imm);
+                aso_emit(b);
+            }
+            aso_emit_line("add\trax, 15");
+            aso_emit_line("and\trax, -16");
+            aso_emit_line("sub\trsp, rax");
+            aso_st(o.dst, "rsp");
+            break;
+        case IR_SETRSP:
+            aso_ld(o.a, "rsp");
+            break;
+        case IR_LEA:
+            aso_ld(o.a, "rax");
+            if (o.b) {
+                aso_ld(o.b, "rcx");
+                if (o.imm == 1u || o.imm == 2u || o.imm == 4u || o.imm == 8u) {
+                    snprintf(b, sizeof(b), "\tlea\trax, [rax+rcx*%u]\n", (unsigned)o.imm);
+                    aso_emit(b);
+                } else {
+                    snprintf(b, sizeof(b), "\timul\trcx, %u\n", (unsigned)o.imm);
+                    aso_emit(b);
+                    aso_emit_line("add\trax, rcx");
+                }
+            } else if (o.imm) {
+                snprintf(b, sizeof(b), "\tadd\trax, %u\n", (unsigned)o.imm);
+                aso_emit(b);
+            }
+            aso_st(o.dst, "rax");
+            break;
+        case IR_COPY:                           /* *dst = *a，imm 字节 */
+            aso_ld(o.dst, "rdi");
+            aso_ld(o.a, "rsi");
+            snprintf(b, sizeof(b), "\tmov\trcx, %u\n", (unsigned)o.imm);
+            aso_emit(b);
+            aso_emit_line("rep movsb");
+            break;
+        case IR_MEMCPY:
+            aso_ld(o.dst, "rdi");
+            aso_ld(o.a, "rsi");
+            aso_ld(o.b, "rcx");
+            aso_emit_line("rep movsb");
+            break;
+        case IR_MEMSET:
+            aso_ld(o.dst, "rdi");
+            aso_ld(o.a, "rcx");
+            aso_ld(o.b, "rax");
+            aso_emit_line("rep stosb");
+            break;
+        case IR_ADD:
+        case IR_SUB:
+        case IR_AND:
+        case IR_OR:
+        case IR_XOR:
+            aso_ld(o.a, "rax");
+            aso_ld(o.b, "rcx");
+            snprintf(b, sizeof(b), "\t%s\trax, rcx\n",
+                     o.op == IR_ADD ? "add" : o.op == IR_SUB ? "sub"
+                     : o.op == IR_AND ? "and" : o.op == IR_OR ? "or" : "xor");
+            aso_emit(b);
+            aso_st(o.dst, "rax");
+            break;
+        case IR_MUL:
+            aso_ld(o.a, "rax");
+            aso_ld(o.b, "rcx");
+            aso_emit_line("imul\trax, rcx");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_DIV:
+        case IR_MOD:
+        case IR_UDIV:
+        case IR_UMOD:
+            aso_ld(o.a, "rax");
+            aso_ld(o.b, "rcx");
+            if (o.op == IR_DIV || o.op == IR_MOD)
+                aso_emit_line("cqo");
+            else
+                aso_emit_line("xor\trdx, rdx");
+            aso_emit((o.op == IR_DIV || o.op == IR_MOD) ? "\tidiv\trcx\n" : "\tdiv\trcx\n");
+            aso_st(o.dst, (o.op == IR_MOD || o.op == IR_UMOD) ? "rdx" : "rax");
+            break;
+        case IR_NEG:
+            aso_ld(o.a, "rax");
+            aso_emit_line("neg\trax");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_NOT:
+            aso_ld(o.a, "rax");
+            aso_emit_line("not\trax");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_SHL:
+        case IR_SHR:
+        case IR_SAR:
+            aso_ld(o.a, "rax");
+            aso_ld(o.b, "rcx");
+            aso_emit(o.op == IR_SHL ? "\tshl\trax, cl\n"
+                     : o.op == IR_SHR ? "\tshr\trax, cl\n" : "\tsar\trax, cl\n");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_SEXT:
+            aso_ld(o.a, "rax");
+            if (aso_width(o.type) == 1)
+                aso_emit_line("movsx\trax, al");
+            else if (aso_width(o.type) == 2)
+                aso_emit_line("movsx\trax, ax");
+            else if (aso_width(o.type) == 4)
+                aso_emit_line("movsxd\trax, eax");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_ZEXT:
+            aso_ld(o.a, "rax");
+            if (aso_width(o.type) == 1)
+                aso_emit_line("movzx\trax, al");
+            else if (aso_width(o.type) == 2)
+                aso_emit_line("movzx\trax, ax");
+            else if (aso_width(o.type) == 4)
+                aso_emit_line("mov\teax, eax");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_TRUNC:
+        case IR_BITCAST:
+            aso_ld(o.a, "rax");
+            if (aso_width(o.type) == 1)
+                aso_emit_line("movzx\trax, al");
+            else if (aso_width(o.type) == 2)
+                aso_emit_line("movzx\trax, ax");
+            else if (aso_width(o.type) == 4)
+                aso_emit_line("mov\teax, eax");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_CMP:
+            aso_ld(o.a, "rax");
+            aso_ld(o.b, "rcx");
+            aso_emit_line("cmp\trax, rcx");
+            snprintf(b, sizeof(b), "\tset%s\tal\n", aso_cc(o.flags));
+            aso_emit(b);
+            aso_emit_line("movzx\teax, al");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_BR:
+            aso_ld(o.a, "rax");                 /* 条件值 */
+            aso_emit_line("test\trax, rax");
+            aso_emit("\tjne\t");
+            aso_lbl(o.b);
+            aso_emit("\n\tjmp\t");
+            aso_lbl(o.c);
+            aso_emit("\n");
+            break;
+        case IR_JMP:
+            aso_emit("\tjmp\t");
+            aso_lbl(o.a);
+            aso_emit("\n");
+            break;
+        case IR_JMPIND:
+            aso_ld(o.a, "rax");
+            aso_emit_line("jmp\trax");
+            break;
+        case IR_LABELADDR:
+            aso_emit("\tlea\trax, [rip+");
+            aso_lbl(o.a);
+            aso_emit("]\n");
+            aso_st(o.dst, "rax");
+            break;
+        case IR_ARG:
+            if (narg < 16u)
+                arg_v[narg] = o.a;
+            narg++;
+            break;
+        case IR_CALL:
+        case IR_CALLI:
+            if (o.op == IR_CALL) {
+                /* 栈实参先压（右到左），再装寄存器 */
+                if (narg > 6u) {
+                    k = narg;
+                    while (k > 6u) {
+                        k--;
+                        aso_ld(arg_v[k], "rax");
+                        aso_emit_line("push\trax");
+                    }
+                }
+                for (k = 0; k < narg && k < 6u; k++)   /* k：别用 i，i 是外层 op 游标 */
+                    aso_ld(arg_v[k], ASO_ARGREG[k]);
+                if (o.imm < X64.nsym) {
+                    aso_emit("\tcall\t");
+                    aso_emit_symname(X64.sym[o.imm].name);
+                    aso_emit("\n");
+                } else {
+                    aso_bad_op(f, &o, "调用的符号下标越界");
+                }
+                if (narg > 6u) {
+                    snprintf(b, sizeof(b), "\tadd\trsp, %u\n", (narg - 6u) * 8u);
+                    aso_emit(b);
+                }
+            } else {
+                aso_ld(o.a, "r11");
+                if (narg > 6u) {
+                    k = narg;
+                    while (k > 6u) {
+                        k--;
+                        aso_ld(arg_v[k], "rax");
+                        aso_emit_line("push\trax");
+                    }
+                }
+                for (k = 0; k < narg && k < 6u; k++)   /* k：别用 i，i 是外层 op 游标 */
+                    aso_ld(arg_v[k], ASO_ARGREG[k]);
+                aso_emit_line("call\tr11");
+                if (narg > 6u) {
+                    snprintf(b, sizeof(b), "\tadd\trsp, %u\n", (narg - 6u) * 8u);
+                    aso_emit(b);
+                }
+            }
+            narg = 0;
+            if (o.dst)
+                aso_st(o.dst, "rax");
+            break;
+        case IR_RET:
+            if (o.type != IRT_VOID)
+                aso_ld(o.a, "rax");
+            aso_emit_line("leave");
+            aso_emit_line("ret");
+            break;
+        case IR_TRAP:
+            aso_emit_line("ud2");
+            break;
+        default:
+            aso_bad_op(f, &o, "这个 op 的文本形式还没写");
+            break;
+        }
+        if (ASO_BAD)
+            return;
+    }
+    (void)st;
+}
+
+/* 数据段：把 DATA_IMG 原样写出来，符号按偏移插标签 */
+static void aso_write_data(void)
+{
+    u32 i = 0;
+    u32 nglob = 0;
+    u32 off = 0;
+    u32 *sorted = NULL;
+    u32 nsorted = 0;
+
+    aso_emit("\n\t.data\n");
+    for (i = 0; i < X64.nsym; i++) {
+        X64Sym *s = &X64.sym[i];
+
+        if (!s->name || !s->name[0] || !s->is_data || !s->defined)
+            continue;
+        if (s->off < ELF_HDR || s->off - ELF_HDR > DATA_IMG.n)
+            continue;
+        nglob++;
+    }
+    if (nglob == 0)
+        return;
+    sorted = (u32 *)malloc(sizeof(u32) * (size_t)nglob);
+    if (!sorted)
+        return;
+    for (i = 0; i < X64.nsym && nsorted < nglob; i++) {
+        X64Sym *s = &X64.sym[i];
+        u32 k = 0;
+        u32 off2 = 0;
+
+        if (!s->name || !s->name[0] || !s->is_data || !s->defined)
+            continue;
+        if (s->off < ELF_HDR || s->off - ELF_HDR > DATA_IMG.n)
+            continue;
+        off2 = s->off - ELF_HDR;
+        /* 按偏移插入排序 */
+        k = nsorted;
+        while (k > 0 && (X64.sym[sorted[k - 1]].off - ELF_HDR) > off2) {
+            sorted[k] = sorted[k - 1];
+            k--;
+        }
+        sorted[k] = i;
+        nsorted++;
+    }
+    /* .globl 先声明 */
+    for (i = 0; i < nsorted; i++) {
+        X64Sym *s = &X64.sym[sorted[i]];
+
+        if (s->name[0] == '.' || strchr(s->name, '$'))
+            continue;
+        aso_emit("\t.globl\t");
+        aso_emit_symname(s->name);
+        aso_emit("\n");
+    }
+    for (i = 0; i < nsorted; i++) {
+        X64Sym *s = &X64.sym[sorted[i]];
+        u32 target = s->off - ELF_HDR;
+        u32 k = 0;
+
+        while (off < target && off < DATA_IMG.n) {
+            char b[16] = {0};
+
+            snprintf(b, sizeof(b), "\t.byte\t%u\n", (unsigned)DATA_IMG.p[off]);
+            aso_emit(b);
+            off++;
+            k++;
+            if (k > 4096)
+                break;
+        }
+        aso_emit_symname(s->name);
+        aso_emit(":\n");
+    }
+    while (off < DATA_IMG.n) {
+        char b[16] = {0};
+
+        snprintf(b, sizeof(b), "\t.byte\t%u\n", (unsigned)DATA_IMG.p[off]);
+        aso_emit(b);
+        off++;
+    }
+    free(sorted);
+}
+
+/* `_start`：和 ld.c6 里合成的那段同一个语义（argc/argv → main → exit） */
+static void aso_write_start(void)
+{
+    if (X64.nsym == 0)
+        return;
+    aso_emit("\n\t.text\n\t.globl\t_start\n_start:\n");
+    aso_emit_line("mov\trdi, [rsp]");
+    aso_emit_line("lea\trsi, [rsp+8]");
+    aso_emit_line("call\tmain");
+    aso_emit_line("mov\tedi, eax");
+    aso_emit_line("mov\teax, 60");
+    aso_emit_line("syscall");
+    aso_emit_line("hlt");
+}
+
+static int aso_had_error(void) { return ASO_BAD; }
+
+static void aso_write(const char *path)
+{
+    FILE *out = NULL;
+    ObjBuf body = {0};
+
+    /* 先写正文（函数），最后拼上前导：Intel 语法声明必须在最前 */
+    body = ASO;
+    ASO.p = NULL;
+    ASO.n = 0;
+    ASO.cap = 0;
+    aso_write_data();
+    aso_write_start();
+    aso_emit("\n\t.section\t.note.GNU-stack,\"\",@progbits\n");
+    {
+        /* 前导 + 正文 */
+        ObjBuf all = {0};
+        const char *head = "\t.intel_syntax noprefix\n";
+
+        ob_copy(&all, head, (u32)strlen(head));
+        ob_copy(&all, body.p, body.n);
+        ob_copy(&all, ASO.p, ASO.n);
+        free(ASO.p);
+        ASO = all;
+        free(body.p);
+    }
+    if (ASO_BAD) {
+        fprintf(stderr, "c6c: -S 有上面那些没实现的东西，不写 %s\n", path);
+        return;
+    }
+    out = fopen(path, "wb");
+    if (!out) {
+        fprintf(stderr, "c6c: 无法写出 %s\n", path);
+        return;
+    }
+    if (fwrite(ASO.p, 1, (size_t)ASO.n, out) != (size_t)ASO.n)
+        fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
+    fclose(out);
+    printf("c6c: %s（汇编文本：%u 个函数 / %u 字节）\n", path, (unsigned)ASO_FNIDX,
+           (unsigned)ASO.n);
+}
