@@ -3029,6 +3029,7 @@ int main(void) { int foreach = 1; goto defer_label; }   /* 局部名 / 标号 */
 | `sizeof` 变长数组 | 运行期 `cnt * esz`（长度在声明时已经算成 vreg，记在 `Sym.vla_cnt` 上） |
 | VLA 形参 `int a[n]` | 只当"VLA 形参"记号，长度表达式跳过不求值（以前按常量表达式求，报"未知名字 n"） |
 | `-std=` / `__STDC_VERSION__` | 收 `c89/c99/c11` 及 gnu 变体（语法不变）：`__STDC_VERSION__` 按级别给，c89 里不定义 |
+| `_Complex`（C99 6.2.5p11 / 6.5.5p5） | 表示成两个分量的普通结构体（`__c6_cplx_f/d/l`，见 `BUILTIN_DEFS`），所以 sizeof／对齐／按值传参／返回／整体拷贝全走现成的聚合路径，三个后端一行没改；只有算术/比较/转换在 `cplx_*` 里拆成标量。带 `__real__`/`__imag__`（GNU，读写分量） |
 
 ### 还没做的 C99 语言特性（都不挡现在的闸门，但都是真缺口）
 
@@ -3037,7 +3038,6 @@ int main(void) { int foreach = 1; goto defer_label; }   /* 局部名 / 标号 */
 | 多维变长数组 | **明确报错**（以前静默算错）：行 stride 是运行期的，要走"指针到 VLA"那条路 | `int b[n][m];` |
 | 指向变长数组的指针 | 静默算错（同上那条路的另一半）。`int (*p)[n];` 现在会把 `p` 当 VLA 对象分配 | `int (*p)[n]; int a[3][2]; p = a;` |
 | VLA 的 `goto`/`continue` 跨作用域 | `79_vla_continue`（test3）、`vla_test`（test2）仍挂 | 见 tests2 的 n/a 清单 |
-| `_Complex` / `_Imaginary` | 当实数处理（加减小对、乘除静默错）。C99 只强制 `_Complex`，`_Imaginary` 是可选的 | `double _Complex z = 1.0; z *= z;` |
 | `_Alignas(N)` | 只被 `skip_paren_group()` 吃掉，没真对齐（C11 特性，不属 C99） | `_Alignas(16) int x;` |
 | `_Generic` | 缺 C11 的类型合并细则（限定符要进嵌套层级 type id），卡 `94_generic`、`100_c99array-decls` | — |
 | `inline` | 只置 `PA_INLINE_SEEN`，没有 C99 的 inline/extern inline 语义（单 TU 行为是对的） | — |
@@ -3213,3 +3213,10 @@ alloca + memset + 一批 GEP）复现，把触发条件缩到最小。
 别用 `va_start` 的 intrinsic，改成在 `printf` 这一层**自己摊参数**（c6c 有
 `__builtin_syscall` 那种 6 参数上限的做法，可以扩展成一个 `__c6_va_arr` 数组 +
 计数，`c6c_vfmt` 按数组取）——土，但一定能通，而且不影响 native 后端。
+
+### 顺手发现（没修）：LLVM 后端的变参没把 double 放进 XMM
+
+`printf("%g", 3.0)` 走 `--emit-llvm` 出来的程序打出来是 `0`，native 和 C99
+后端都对（用 `HEAD` 的二进制复现过，是**既有**问题，和复数无关）。LLVM 那边
+把 double 实参按 i64 传了，被调方从 XMM 读不到值。所以 `tests/c/` 里但凡要
+printf 的用例都过不了 LLVM 后端——复数那个用例因此只用退出码判对错。

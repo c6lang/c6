@@ -335,6 +335,11 @@ static const char *const BUILTIN_DEFS =
     "#define __builtin_realloc(a,b) realloc(a,b)\n"
     "#define __builtin_free(a) free(a)\n"
     "#define __builtin_strdup(a) strdup(a)\n"
+    /* C99 的 `_Complex`：表示成两个分量的结构体（parse.c6 的 cplx_*）。
+     * 三个宽度各一个，`_Complex` 说明符在类型层映射过来。 */
+    "struct __c6_cplx_f { float __re, __im; };\n"
+    "struct __c6_cplx_d { double __re, __im; };\n"
+    "struct __c6_cplx_l { long double __re, __im; };\n"
     "#define __STDC__ 1\n"
     "#define __STDC_HOSTED__ 1\n"
     "#define __x86_64 1\n"
