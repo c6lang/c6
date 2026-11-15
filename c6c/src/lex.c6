@@ -186,6 +186,93 @@ static int is_digit(int c)
     return c >= '0' && c <= '9';
 }
 
+/* --- 通用字符名（C99 6.4.3）--------------------------------------------------
+ * 标识符里可以写 `\uXXXX` / `\UXXXXXXXX`。做法是把整个名字重建成 UTF-8 字节串：
+ * `\u00e9` 于是和源码里直接写的 `é` 成了同一个标识符（符号表、宏表都按字节比），
+ * 不用在比较的地方再做归一化。字符串/字符常量里的 UCN 走另一条路（esc_decode）。 */
+static int lex_hex(u32 c)
+{
+    if (c >= '0' && c <= '9')
+        return (int)(c - '0');
+    if (c >= 'a' && c <= 'f')
+        return (int)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F')
+        return (int)(c - 'A' + 10);
+    return -1;
+}
+
+static u32 ucn_utf8(u32 cp, char *out)
+{
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* 从 L->pos 起扫一个可能带 UCN 的标识符（L->pos 可能就指着 `\u`）。 */
+static void lex_ucn_ident(Lex *L, Tok *t)
+{
+    char *d = L->data;
+    u32 p = L->pos;
+    u32 start = L->pos;
+    u32 cap = 1024;
+    char *buf = arena_alloc(&A_main, cap);
+    u32 n = 0;
+
+    for (;;) {
+        u32 c = (u8)d[p];
+
+        if (c == '\\' && (d[p + 1] == 'u' || d[p + 1] == 'U')) {
+            int want = d[p + 1] == 'u' ? 4 : 8;
+            int k = 0;
+            u32 cp = 0;
+
+            p += 2;
+            for (k = 0; k < want; k++) {
+                int hv = lex_hex((u8)d[p]);
+
+                if (hv < 0)
+                    break;
+                cp = cp * 16 + (u32)hv;
+                p++;
+            }
+            if (k != want)
+                break;                  /* 位数不够：当普通反斜杠，交给上层报错 */
+            if (n + 4 >= cap)
+                break;
+            n += ucn_utf8(cp, buf + n);
+            continue;
+        }
+        if (!IDENT_TAB[c] || n + 2 >= cap)
+            break;
+        buf[n++] = (char)c;
+        p++;
+    }
+    buf[n] = 0;
+    L->pos = p;
+    t->kind = TK_IDENT;
+    t->off = start;
+    t->len = n;
+    t->syn = buf;
+    t->hash = tok_hash(buf, n);
+}
+
 static void lex_init(Lex *L, SrcFile *f)
 {
     L->f = f;
@@ -457,6 +544,41 @@ static void lex_punct(Lex *L, Tok *t)
     u32 c1 = (u8)d[start + 1];
     u32 len = 1;
 
+    /* C99 6.4.6 digraph：`<: :> <% %>` 等同于 `[ ] { }`，`%:` 是 `#`，
+     * `%:%:` 是 `##`。只在**标点**位置成立（字符串/字符常量里的 `%:` 走
+     * scan_quote 那条路，根本不经过这里）。token 的文本换成主拼写：tok_data
+     * 读的是 t->syn，所以 `[` 和 `<:` 在后续所有比较/拼接/`-E` 输出里完全
+     * 一样；off 仍指源码，诊断的列号还是对的。 */
+    if (c0 == '<' || c0 == ':' || c0 == '%') {
+        const char *dg = NULL;
+        u32 dgl = 1;
+        u32 dgn = 2;
+
+        if (c0 == '%' && d[start + 1] == ':' && d[start + 2] == '%'
+            && d[start + 3] == ':') {
+            dg = "##";
+            dgl = 2;
+            dgn = 4;
+        } else if (c0 == '<' && d[start + 1] == ':') {
+            dg = "[";
+        } else if (c0 == ':' && d[start + 1] == '>') {
+            dg = "]";
+        } else if (c0 == '<' && d[start + 1] == '%') {
+            dg = "{";
+        } else if (c0 == '%' && d[start + 1] == '>') {
+            dg = "}";
+        } else if (c0 == '%' && d[start + 1] == ':') {
+            dg = "#";
+        }
+        if (dg) {
+            L->pos = start + dgn;
+            t->kind = TK_PUNCT;
+            t->off = start;
+            t->len = dgl;
+            t->syn = (char *)dg;
+            return;
+        }
+    }
     /* 三字符的只有 `<<=` `>>=` `...`：头两个字节相同，第三个是 '=' 或 '.' */
     if (c1 == c0 && (c0 == '<' || c0 == '>' || c0 == '.')
         && (u8)d[start + 2] == (c0 == '.' ? '.' : '=')) {
@@ -489,6 +611,7 @@ static int lex_next(Lex *L, Tok *t)
      * 省掉一条每 token 都要过一遍的分支。 */
     t->hash = 0;
     t->hs = NULL;
+    t->syn = NULL;      /* digraph 那种要换拼写的 token 会自己填（见 lex_punct） */
     t->file = L->id;
     t->flags = (u8)((u32)L->at_bol << 1);
     if (LEX_SKIP_TAB[(u8)d[L->pos]])
@@ -514,7 +637,8 @@ static int lex_next(Lex *L, Tok *t)
     }
     L->at_bol = 0;
 
-    if (is_ident_start(c)) {
+    if (is_ident_start(c)
+        || (c == '\\' && (d[L->pos + 1] == 'u' || d[L->pos + 1] == 'U'))) {
         /* 扫标识符的同时算哈希：绝大多数 token 是标识符，之前是先扫一遍、
          * 再单独 `tok_hash` 跑一遍，同样的字节走了两趟。 */
         {
@@ -529,6 +653,12 @@ static int lex_next(Lex *L, Tok *t)
                 p++;
             L->pos = p;
             t->hash = tok_hash(d + start, p - start);
+            /* 名字里带 `\u`/`\U`（C99 的 UCN）：这条路要重建一份 UTF-8 文本 */
+            if (d[p] == '\\' && (d[p + 1] == 'u' || d[p + 1] == 'U')) {
+                L->pos = start;         /* 整个名字从头重扫（带上前面的普通字符） */
+                lex_ucn_ident(L, t);
+                return t->kind;
+            }
         }
         t->off = start;
         t->len = L->pos - start;
@@ -553,8 +683,10 @@ static int lex_next(Lex *L, Tok *t)
         lex_punct(L, t);
     }
     /* 文本指针在这里一次算好（见 tok_data 的说明）：原来每个 token 的每次
-     * 取值都要重走一遍 file_by_id()。 */
-    t->syn = d + t->off;
+     * 取值都要重走一遍 file_by_id()。digraph 的 token 已经在 lex_punct 里
+     * 换成主拼写的静态串，别再覆盖回去。 */
+    if (!t->syn)
+        t->syn = d + t->off;
     return t->kind;
 }
 
