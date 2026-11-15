@@ -11758,7 +11758,12 @@ static u32 gen_convert(u32 v, u32 from, u32 to)
      * 少了这条就按"窄化成 1 字节"处理：`_Bool b = 5;` 存的是 5、
      * `_Bool c = 300;` 存 44（踩过，gcc 两边都是 1）。浮点源同理
      * （`_Bool t = 0.5;` 是 1，不是 0）。 */
-    if (ty_kind(to) == TY_BOOL && ty_kind(from) != TY_BOOL) {
+    /* 只管纯 C 的 TU（`.c`）。c6 的 `.c6` 世界里 `bool` 的转换和托管引用
+     * （`@T` 的 retain/release）缠在一起，套上"和 0 比"会把生命周期算乱
+     * ——tests/fstr.c6 的 `@f".."` 循环用例当场漏引用、整个程序段错误。
+     * C99 的转换规则是给 C 用的，`.c6` 保持原样。 */
+    if (!in_c6_tu() && ty_kind(to) == TY_BOOL && ty_kind(from) != TY_BOOL
+        && ty_is_scalar(from)) {
         u32 z = gen_convert(gen_int_lit(0, ty_int()), ty_int(), from);
         /* 浮点源要按**浮点**比：gen_cmp3 只有在 cty 是浮点类型时才吐浮点
          * 比较，给 ty_int() 会把 double 的位模式当整数看（`_Bool t = 0.5`
