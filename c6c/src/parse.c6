@@ -19395,7 +19395,7 @@ static void gen_one_global(u32 ty, Declarator *d)
             Sym *r2 = sym_add(d->name, d->nlen, ty, SC_GLOBAL);
 
             r2->is_extern = 1;
-            r2->val = (i64)x64_sym(&X64, r2->name);
+            r2->val = (i64)x64_data_ref(&X64, r2->name);
             return;
         }
     }

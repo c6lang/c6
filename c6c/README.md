@@ -162,10 +162,10 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
 
 口径与限制（都是刻意的，写在这儿免得被当成 bug）：
 
-* **静态**链接。要调 libc 就得接 libc.so.6（`DT_NEEDED` + PLT/GOT + 动态
-  loader），那是下一步；现在给带 libc 名字的 `.o`（比如自带运行时 `rt.o`
-  里 `environ`、`openat` 那些）用 `-Wl,--allow-undefined`：未定义符号按 0
-  处理并打一条汇总警告——只要运行路径不碰它就能跑。
+* 默认**静态**链接：给带 libc 名字的 `.o`（比如自带运行时 `rt.o` 里
+  `environ`、`openat` 那些）要么加 `-Wl,--dynamic` 走动态链接，要么用
+  `-Wl,--allow-undefined` 把未定义符号按 0 处理（打一条汇总警告，只要运行
+  路径不碰它就能跑）。
 * 多 TU 的 **TLS** 不合并：c6c 的 TLS 偏移按 TU 分配，跨 `.o` 会重叠。
   恰好一个 `.o` 带 TLS 时，链接器会把它的 `__c6_tls_img/len/delta` 抄给
   其它 `.o`（构造函数在运行时那侧，它得知道有 TLS 块要建）；两个以上就
@@ -174,6 +174,44 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
 
 回归：`make -C c6c ldcheck`（纯自足两个 `.o` / 真实规模的 `rt.o` 564 条
 重定位 / 构造函数顺序 / 跨 `.o` TLS / 缺符号报错 / `readelf` 结构核对）。
+
+## 动态链接：`c6c -Wl,--dynamic -o prog a.o rt.o`
+
+加 `-Wl,--dynamic`，链接器就出一个**动态可执行文件**，把 libc 交给 ld.so：
+
+```sh
+./c6c/build/c6c -c app.c6 -o app.o
+./c6c/build/c6c -Wl,--dynamic -o app app.o rt.o
+./app                 # app.c6 里调 printf/getpid/getcwd…… 都真的走 libc
+```
+
+产物里有：
+
+* `PT_INTERP` → `/lib64/ld-linux-x86-64.so.2`；
+* `.dynstr` / `.dynsym` / `.hash`（SysV 哈希）——导入符号的名字与表项；
+* `.rela.plt` + `.plt` + `.got.plt`——每个导入函数一条 `R_X86_64_JUMP_SLOT`；
+* `.dynamic`——`DT_NEEDED libc.so.6`、`DT_STRTAB`/`DT_SYMTAB`、`DT_PLTGOT`、
+  `DT_JMPREL`，外加 `DT_FLAGS = BIND_NOW`（非惰性绑定：ld.so 启动时把
+  JUMP_SLOT 全解完，PLT 桩子就只剩一条 `jmp [rip+got]`）。
+
+所以 `rt.o` 里那 22 个 libc 函数（`vsprintf`、`openat`、`feof`……）不用再
+`--allow-undefined` 了——它们真从 libc.so.6 解析，`getpid()` 返回的 pid 就是
+真 pid。
+
+口径与限制：
+
+* 只做**函数**的动态导入。**数据**符号（`environ` 那种）需要 COPY 重定位
+  （非 PIC 代码里它是绝对地址，得把 libc 的定义拷进本程序的 `.bss`），这一版
+  没做——链接器会点名列一条警告，然后按 0 处理；只要运行路径不读它就没影响。
+* 不做 `-shared` / `-fPIC` 产物、符号版本（`.gnu.version`）、
+  `.rela.dyn` 里的 `R_X86_64_RELATIVE`（本程序是固定基址的 ET_EXEC）。
+* 默认仍是静态链接：动态是**显式**选项（`-Wl,--dynamic`），拼错的链接器
+  选项会直接报错，不会被当成告警开关静默忽略。
+
+回归：`make -C c6c dyncheck`（14 条：不加 `--allow-undefined` 也能链、链接器
+自报导入个数、数据符号点名警告、产物真跑且 libc 返回值对、`readelf` 逐项核对
+ET_EXEC / 两个 `PT_LOAD` / `PT_INTERP` / `PT_DYNAMIC` / `DT_NEEDED` /
+`BIND_NOW` / JUMP_SLOT 条数、`ldd` 认得 libc、默认静态仍会对未定义符号报错）。
 
 ## 库形态：把 c6c 嵌进别人的程序
 
