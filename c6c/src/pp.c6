@@ -573,8 +573,8 @@ static i64 eval_pp_expr(Tok *line, u32 n)
 
     for (i = 0; i < n; i++) {
         if (line[i].kind == TK_IDENT
-            && (tok_eq(&line[i], "__has_include")
-                || tok_eq(&line[i], "__has_include_next"))) {
+            && (TOK_EQ(&line[i], "__has_include")
+                || TOK_EQ(&line[i], "__has_include_next"))) {
             u32 j = i + 1;
             u32 depth = 0;
             int val = 0;
@@ -597,7 +597,7 @@ static i64 eval_pp_expr(Tok *line, u32 n)
             i = j - 1;
             continue;
         }
-        if (line[i].kind == TK_IDENT && tok_eq(&line[i], "defined")) {
+        if (line[i].kind == TK_IDENT && TOK_EQ(&line[i], "defined")) {
             u32 j = i + 1;
             int paren = 0;
             int val = 0;
@@ -1084,7 +1084,7 @@ static void handle_directive(void)
         Tok *line = NULL;
         u32 n = 0;
         dir_line(&line, &n);
-        if (pp_active() && n > 1 && line[0].kind == TK_IDENT && tok_eq(&line[0], "pack")) {
+        if (pp_active() && n > 1 && line[0].kind == TK_IDENT && TOK_EQ(&line[0], "pack")) {
             /* `#pragma pack(push,1)` / `pack(pop)` / `pack(N)`。预处理是**整趟跑完**
              * 才进语法分析的，所以这里不能直接改布局用的全局——那会让所有结构体
              * 都用最后一个 pack 值。往 token 流里塞一条 `__c6_pack(N);`，
@@ -1095,7 +1095,7 @@ static void handle_directive(void)
             while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
                 k++;
             k++;
-            if (k < n && line[k].kind == TK_IDENT && tok_eq(&line[k], "push")) {
+            if (k < n && line[k].kind == TK_IDENT && TOK_EQ(&line[k], "push")) {
                 k++;
                 v = 0;
                 if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ',')
@@ -1108,7 +1108,7 @@ static void handle_directive(void)
                     lb[lk] = 0;
                     v = (int)strtol(lb, NULL, 0);
                 }
-            } else if (k < n && line[k].kind == TK_IDENT && tok_eq(&line[k], "pop")) {
+            } else if (k < n && line[k].kind == TK_IDENT && TOK_EQ(&line[k], "pop")) {
                 v = 0;
             } else if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ')') {
                 v = 0;                   /* `pack()` = 恢复自然对齐 */
@@ -1138,13 +1138,13 @@ static void handle_directive(void)
                 pp_pushback(&t1, TK_PUNCT);
                 pp_pushback(&t0, TK_IDENT);
             }
-        } else if (pp_active() && n > 0 && line[0].kind == TK_IDENT && tok_eq(&line[0], "once")) {
+        } else if (pp_active() && n > 0 && line[0].kind == TK_IDENT && TOK_EQ(&line[0], "once")) {
             if (PP_TOP->is_file)
                 PP_TOP->f->pragma_once = 1;
         } else if (pp_active() && n > 1 && line[0].kind == TK_IDENT
-                   && (tok_eq(&line[0], "push_macro") || tok_eq(&line[0], "pop_macro"))) {
+                   && (TOK_EQ(&line[0], "push_macro") || TOK_EQ(&line[0], "pop_macro"))) {
             /* #pragma push_macro("name") / pop_macro("name") */
-            int is_push = tok_eq(&line[0], "push_macro");
+            int is_push = TOK_EQ(&line[0], "push_macro");
             u32 k = 1;
 
             while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
@@ -1208,30 +1208,30 @@ static int pp_next(Tok *out)
                 return k;
             goto have_macro;
         }
-        if (tok_eq(out, "__LINE__")) {
+        if (TOK_EQ(out, "__LINE__")) {
             char *buf = arena_alloc(&A_main, 24);
             int n = snprintf(buf, 24, "%u", src_line_of(file_by_id(out->file), out->off));
             *out = tok_syn(TK_NUM, buf, (u32)n, CUR_FILE, 0);
             return TK_NUM;
         }
-        if (tok_eq(out, "__COUNTER__")) {
+        if (TOK_EQ(out, "__COUNTER__")) {
             char *buf = arena_alloc(&A_main, 24);
             int n = snprintf(buf, 24, "%u", PP_COUNTER++);
 
             *out = tok_syn(TK_NUM, buf, (u32)n, CUR_FILE, 0);
             return TK_NUM;
         }
-        if (tok_eq(out, "__DATE__") || tok_eq(out, "__TIME__")) {
+        if (TOK_EQ(out, "__DATE__") || TOK_EQ(out, "__TIME__")) {
             /* 标准要求是“本次翻译”的时间戳。不能拿编 c6c 那个编译器的
              * __DATE__，否则会印出 c6c 二进制的构建日期。 */
-            const char *v = tok_eq(out, "__DATE__") ? DATE_BUF : TIME_BUF;
+            const char *v = TOK_EQ(out, "__DATE__") ? DATE_BUF : TIME_BUF;
             size_t len = strlen(v) + 3;
             char *buf = arena_alloc(&A_main, len);
             int n = snprintf(buf, len, "\"%s\"", v);
             *out = tok_syn(TK_STR, buf, (u32)n, CUR_FILE, 0);
             return TK_STR;
         }
-        if (tok_eq(out, "__FILE__")) {
+        if (TOK_EQ(out, "__FILE__")) {
             SrcFile *f = file_by_id(out->file);
             size_t len = strlen(f->path) + 3;
             char *buf = arena_alloc(&A_main, len);
