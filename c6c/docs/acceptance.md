@@ -137,9 +137,9 @@ tcc tests2：通过 112 / 架构性 n/a 10 / 仅编译 8 / 上游 expect 旧 14 
 |---|---|
 | `94_generic` | 指向对象的 `const` 要进类型 id（`_Generic(const int *, int *:…)` 必须不匹配） |
 | `101_cleanup` | 65536 个同时活跃的栈槽，vreg 是 16 位 |
-| `104_inline` / `113_btdll` / `114_bound_signal` | 要 tcc 自己 `libtcc1.a` 里的 `check_exports` / `tcc_backtrace` / `-b` 边界检查 |
-| `120_alias` / `146_tls_extern` | 要第二个 TU（没有链接器） |
-| `99_fastcall` / `140_arm64_extasm` / `145_winarm64_interlocked` | i386 / arm64 / win-arm64，上游自己在 x86-64 上也跳 |
+| `104_inline` | 要 tcc 自己 `libtcc1.a` 里的 `check_exports`；上游本来就用 `104+_inline.c` 替代（只编不跑），那份变体 c6c 已干净编过 |
+| `120_alias` / `146_tls_extern` | 要第二个 TU（没有链接器）。`146` 不是 TLS 没做——TLS 是好的，缺的只是'值定义在另一个 TU'；`120` 上游同样用 `120+_alias.c` 替代 |
+| `99_fastcall` / `140_arm64_extasm` / `145_winarm64_interlocked` | i386 / arm64 / win-arm64，上游自己在 x86-64 上也跳（`145` 要 `windows.h` + win-arm64 内建） |
 
 ### 验收（4）最新一次实测（补完初始化器修复之后）
 
