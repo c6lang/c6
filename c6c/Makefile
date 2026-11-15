@@ -191,12 +191,16 @@ c99suite: $(BUILD)/c6c
 	@C6C=$(BUILD)/c6c ROOT=$(ROOT) ./tests/c99-suite.sh -j $(JOBS)
 
 llvmtest: $(BUILD)/c6c
+	@echo "c6c: llvmtest 用 LLC=$(LLVM_LLC) CC=$(CC)"
 	@C6C=$(BUILD)/c6c LLC=$(LLVM_LLC) CC=$(CC) CORPUS=$(CURDIR)/tests/c ./tests/llvm-diff.sh
 
 # 验收（1）(2) (3)：功能面。跑分不在里面——验收（4）那几条硬指标（自编译
 # ≤100 ms、峰值 RSS ≤32 MB、4x 输入 ≤2.6x）随时可能因为机器负载抖动，
 # 拿它挡功能验收只会让人学会忽略红灯。要连跑分一起验就用 check-all-perf。
-check-all: unit irtest hello ctest runflag testflag selfhost selftest stdtest test diagtest c99test c99suite llvmtest build-tcc
+# 顺序有讲究：`llvmtest` 放前面。它是**确定性**的后端闸门（同一份语料三方对齐），
+# 而 `test` 里有个别用例（`async`）在共享 runner 上偶发段错误——先跑确定的那条，
+# CI 红了至少能一眼看出是不是后端真的坏了。
+check-all: unit irtest hello ctest runflag testflag selfhost selftest stdtest diagtest c99test c99suite llvmtest test build-tcc
 	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 语言层 C99 外部闸门 / 能编出 tcc）"
 
 # 验收（4）：性能与内存硬指标（门槛在 bench/thresholds.json）
