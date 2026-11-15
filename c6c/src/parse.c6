@@ -944,6 +944,7 @@ static u32 cplx_bin(u8 op, u32 a, u32 aty, u32 b, u32 bty);
 static u32 cplx_cmp(u8 cc, u32 a, u32 aty, u32 b, u32 bty);
 static u32 cplx_neg(u32 a, u32 cty);
 static u32 gen_int_lit(u64 c, u32 ty);
+static u32 gen_cmp3(u32 a, u32 aty, u32 b, u32 bty, u8 cc, u32 cty);
 
 /* 上限可调：环境变量 C6C_MAX_ERRORS（默认 20），调大是为了能一次看清
  * 大文件（比如 tcc.h）里所有独立的错误点。 */
@@ -10399,6 +10400,7 @@ static int pa_vla_sizeof(u32 *cnt_out, u32 *esz_out)
         return 0;
     *cnt_out = sy->vla_cnt;
     *esz_out = sy->vla_esz ? sy->vla_esz : 1;
+    /* 1 = 源码写成 `sizeof(v)`；2 = 写成 `sizeof v`（不带括号） */
     return paren ? 1 : 2;
 }
 
@@ -11468,10 +11470,13 @@ static u32 gen_unary(void)
                 u32 kk = 0;
                 u32 vv = 0;
 
-                if (paren > 0)
+                /* 返回值 1 = 源码里带括号（`sizeof(v)`），2 = 不带（`sizeof v`）。
+                 * 别写成 `paren > 0`：2 也大于 0，会多啃一个 token 再要 `)`，
+                 * `sizeof v` 就直接编不过（踩过）。 */
+                if (paren == 1)
                     pa_advance();               /* `(` */
                 pa_advance();                   /* 数组名 */
-                if (paren > 0)
+                if (paren == 1)
                     pa_expect_ch(')');
                 kk = irfn_vreg(&FN);
                 irfn_push(&FN, IR_CONST, IRT_U64, kk, 0, 0, 0, vesz);
@@ -11749,6 +11754,19 @@ static u32 gen_convert(u32 v, u32 from, u32 to)
             pa_error("a closure cannot be converted to 'void *': closures are opaque");
     }
 
+    /* C99 6.3.1.2：任何标量转 `_Bool` 都是"跟 0 比"，结果是 0 或 1。
+     * 少了这条就按"窄化成 1 字节"处理：`_Bool b = 5;` 存的是 5、
+     * `_Bool c = 300;` 存 44（踩过，gcc 两边都是 1）。浮点源同理
+     * （`_Bool t = 0.5;` 是 1，不是 0）。 */
+    if (ty_kind(to) == TY_BOOL && ty_kind(from) != TY_BOOL) {
+        u32 z = gen_convert(gen_int_lit(0, ty_int()), ty_int(), from);
+        /* 浮点源要按**浮点**比：gen_cmp3 只有在 cty 是浮点类型时才吐浮点
+         * 比较，给 ty_int() 会把 double 的位模式当整数看（`_Bool t = 0.5`
+         * 于是得到 0）。 */
+        u32 ct = ty_is_float(from) ? from : ty_int();
+
+        return gen_cmp3(v, from, z, from, IRCC_NE, ct);
+    }
     if (ff && ft) {
         if (ty_size(from) == ty_size(to))
             return v;
@@ -14002,6 +14020,17 @@ static void init_store(u32 off, u32 ty, u32 bits, u32 boff)
         gen_glob_obj(INIT_GOFF, ty, off);
         GLOB_BF_BITS = 0;
         GLOB_BF_BITOFF = 0;
+    } else if (bits) {
+        /* 位域成员的初始化器不能"按字节写整个字"：`struct {unsigned a:3, b:5;}
+         * x = {5, 17};` 两个成员落在同一个 4 字节字里，后写的会把先写的整个
+         * 盖掉——读出来是 a=1 b=2（踩过）。按位宽/位偏移塞进去才和赋值一致
+         * （赋值那条路走的就是 store_lval_bits）。 */
+        u32 v = value_of(gen_assign());
+        u32 vty = GEN_TY;
+
+        if (vty != ty)
+            v = gen_convert(v, vty, ty);
+        store_lval_bits(gen_addr_off(INIT_ADDR, off), ty, bits, boff, v);
     } else {
         gen_init_obj(INIT_ADDR, ty, off);
     }
@@ -14052,8 +14081,12 @@ static void init_sync(u32 top)
 /* 设计符链：`[i]` / `.name` 任意串联，返回最终目标的类型与绝对偏移 */
 static int INIT_COLON;     /* 上一次设计符用的是上古 `name:` 写法（不需要 '='） */
 
-static int init_desig(u32 *ty, u32 *off)
+/* `bits`/`boff`：设计符指到的是位域成员时带出位宽和位偏移——同字节里的几个
+ * 位域 LF_OFF 一样，光按字节偏移找叶子会永远落到第一个（`.b = 3` 写进 `.a`）。 */
+static int init_desig(u32 *ty, u32 *off, u32 *bits, u32 *boff)
 {
+    *bits = 0;
+    *boff = 0;
     INIT_COLON = 0;
     for (;;) {
         /* 上古 GNU 写法：`{ a: 1, b: 2 }`（成员名 + 冒号） */
@@ -14072,6 +14105,8 @@ static int init_desig(u32 *ty, u32 *off)
             }
             *ty = mty;
             *off += moff;
+            *bits = AGG_FOUND_BITS;
+            *boff = AGG_FOUND_BITOFF;
             INIT_COLON = 1;
             continue;
         }
@@ -14090,6 +14125,8 @@ static int init_desig(u32 *ty, u32 *off)
                 return 0;
             *ty = et;
             *off += i * ty_size(et);
+            *bits = 0;
+            *boff = 0;
             continue;
         }
         if (pa_accept_ch('.')) {
@@ -14109,6 +14146,8 @@ static int init_desig(u32 *ty, u32 *off)
             }
             *ty = mty;
             *off += moff;
+            *bits = AGG_FOUND_BITS;
+            *boff = AGG_FOUND_BITOFF;
             continue;
         }
         break;
@@ -14294,13 +14333,20 @@ static void init_body(u32 top)
                 && TOK_EQ(pa_peek(1), ":"))) {
             u32 dty = LV_TY[top];
             u32 doff = LV_OFF[top];
+            u32 dbits = 0;
+            u32 dboff = 0;
             u32 li = 0;
 
-            if (!init_desig(&dty, &doff)) {
+            if (!init_desig(&dty, &doff, &dbits, &dboff)) {
                 init_skip_value();
                 continue;
             }
             li = init_leaf_at(doff);
+            if (dbits) {
+                /* 位域：同字节的叶子要按**位偏移**再挑一次（见 init_desig 注释） */
+                while (li < LF_N && LF_OFF[li] == doff && LF_BOFF[li] != dboff)
+                    li++;
+            }
             if (li < LF_N && LF_OFF[li] != doff)
                 li = LF_N;
             INIT_CUR = li;
