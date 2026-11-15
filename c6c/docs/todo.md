@@ -3219,7 +3219,31 @@ alloca + memset + 一批 GEP）复现，把触发条件缩到最小。
 `__builtin_syscall` 那种 6 参数上限的做法，可以扩展成一个 `__c6_va_arr` 数组 +
 计数，`c6c_vfmt` 按数组取）——土，但一定能通，而且不影响 native 后端。
 
-### 顺手发现（没修）：LLVM 后端的变参没把 double 放进 XMM
+### 已修：LLVM 后端的变参（va_start / va_arg）
+
+以前 `va_start`/`va_arg` 全落在"函数入口自己的 `%ap`"上，**前端那个 va_list
+对象从来没被初始化**。后果不只是浮点：
+
+* `printf("%d", 7)` 印 `0`（runtime 的 printf 把 ap 转给 vfprintf，读的是垃圾）；
+* 任何"把 va_list 往下传"的函数（vprintf/vfprintf/vsnprintf）全废；
+* `llc -O0` 下直接段错误（`llvm.va_arg` 对"不是本函数 alloca 出来的 va_list
+  指针"会退化成空指针）。
+
+现在：
+
+1. `IR_VASTART` 对**前端那个对象**（`va_list` 是 `__c6c_va_elem[1]`，24 字节，
+   形状就是 SysV 的）发 `llvm.va_start`；
+2. `IR_VAARG` 手写 SysV 取字（gp_offset/overflow_arg_area/reg_save_area
+   三个字段自己算），不再用 `llvm.va_arg`，也不再要求"当前函数自己是变参"；
+3. 顺手把 `llvm-only.txt` 里三条**过时**的排除去掉（init_bound /
+   alloca_runtime / qualifier_types 早就好了，只是没人复查），只留
+   cleanup_attr（它生成的 IR 有个块缺终结指令，`llc -O0` 报
+   "expected instruction opcode"，是另一条既有缺陷）。
+
+`tests/c/varargs.c` 是新加的门：`%d %g %s %c %llu`、va_copy、vsnprintf、
+转发 va_list 都有，三后端输出逐字节一致。
+
+### 老记录（修之前的样子）：LLVM 后端的变参没把 double 放进 XMM
 
 `printf("%g", 3.0)` 走 `--emit-llvm` 出来的程序打出来是 `0`，native 和 C99
 后端都对（用 `HEAD` 的二进制复现过，是**既有**问题，和复数无关）。LLVM 那边
