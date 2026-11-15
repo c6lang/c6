@@ -1,0 +1,290 @@
+/* src.c6 —— 源文件 mmap + 行号表（design.md §2）
+ *
+ * 一条铁律：**不逐 token 记行号**。每个文件建一张 u32 行首偏移表（4 B/行），
+ * 诊断时二分查找。uya 的单趟原型就是在 line_of(pos) 上每 token 重算行号，
+ * 543 秒全耗在那里（docs/single_pass_plan.md）。
+ *
+ * mmap 长度取 size+1，保证 data[size] 一定是可读的 0：
+ * 文件大小正好是页的整数倍时，多映射一页才不会越界。
+ */
+
+typedef struct SrcFile {
+    struct SrcFile *next;   /* 所有已加载文件（按加载顺序，id 递增） */
+    char *path;             /* 显示用；"-" 表示命令行/合成内容 */
+    char *data;
+    size_t size;
+    u32 *lines;             /* 行首偏移，lines[0] = 0 */
+    u32 nlines;
+    u32 line_cap;
+    u32 id;
+    u8 owned;               /* 1 = data 是 malloc 的（命令行内容） */
+    u8 pragma_once;         /* 见过 #pragma once */
+    u8 included;            /* 已经被 include 过（配合 pragma_once） */
+} SrcFile;
+
+typedef struct SrcTable {
+    SrcFile *head;
+    SrcFile *tail;
+    u32 n;
+    size_t bytes;
+    SrcFile *by_id[8192];
+} SrcTable;
+
+static SrcTable FILES;
+
+static SrcFile *file_by_id(u32 id)
+{
+    if (id >= 8192)
+        return FILES.head;
+    return FILES.by_id[id];
+}
+
+static SrcFile *src_new(const char *path, char *data, size_t size, u8 owned)
+{
+    SrcFile *f = arena_zalloc(&A_main, sizeof(SrcFile));
+    u32 cap = 1, n = 0;
+    size_t i = 0;
+
+    f->path = arena_strdup(&A_main, path);
+    f->data = data;
+    f->size = size;
+    f->owned = owned;
+    f->id = FILES.n++;
+
+    /* 行号表**按需**建：只有报错、`__LINE__`、`#line` 才用得到它，正常编译
+     * 一个错都不出的时候这 44K 行白扫一遍（profiler 里占 1.8%）。 */
+    f->lines = NULL;
+    f->nlines = 0;
+    f->line_cap = 0;
+    (void)cap;
+    (void)n;
+    (void)i;
+
+    if (FILES.tail)
+        FILES.tail->next = f;
+    else
+        FILES.head = f;
+    FILES.tail = f;
+    if (f->id < 8192)
+        FILES.by_id[f->id] = f;
+    FILES.bytes += size;
+    return f;
+}
+
+/* c6 模块头改写（P6-1b 的第一步：单 TU 口径）。
+ *
+ * `.c6` 源文件里的 `module a.b.c;` 和 `import a.b.c;` 不是 C 的语法，但它们可以
+ * 在**读文件时**改写成预处理指令：
+ *     module a.b.c;   →   空行（保持行号）
+ *     import a.b.c;   →   #include "a/b/c.c6"
+ * 这样模块的声明就被文本内联进来，`import std.core.types;` 之后 `u8` 就能用了。
+ * 真正的模块系统（导出改名、单独编译、`as` 别名）另算，见 todo P6-1b。
+ */
+/* 改写时顺手记下来的模块头：`module a.b;` 与 `import a.b;` 的名字。
+ * 真正的登记在 src_load 拿到 file id 之后做（docs/modules.md M1）。 */
+typedef struct ModHdr {
+    char module[MOD_NAME_MAX];
+    char imports[16][MOD_NAME_MAX];
+    u32 nimport;
+} ModHdr;
+
+static ModHdr MODHDR;
+
+static char *c6_rewrite_modules(const char *data, size_t size, int *out_owned)
+{
+    size_t i = 0;
+    size_t cap = size + 4096;
+    char *out = malloc(cap);
+    size_t o = 0;
+
+    memset(&MODHDR, 0, sizeof(MODHDR));
+    *out_owned = 0;
+    if (!out)
+        return NULL;
+    while (i < size) {
+        size_t ls = i;
+        size_t le = i;
+
+        while (le < size && data[le] != '\n')
+            le++;
+        /* 行首空白 */
+        {
+            size_t k = ls;
+
+            while (k < le && (data[k] == ' ' || data[k] == '\t'))
+                k++;
+            if (le - k > 7 && memcmp(data + k, "module ", 7) == 0) {
+                size_t j = k + 7;
+                int mn = 0;
+
+                /* 点分名字抄进 MODHDR，M2 起要用它做前缀改写 */
+                while (j < le && data[j] != ';' && data[j] != ' ' && mn < MOD_NAME_MAX - 1)
+                    MODHDR.module[mn++] = data[j++];
+                MODHDR.module[mn] = 0;
+                /* 改写成一条**声明**，交给前端按真正的（预处理之后的）
+                 * 顺序判定："module 必须是文件里的第一个声明"、"同一个文件
+                 * 不能写两次"这些规则在原始文本上看不出来 —— `#if` 的各个
+                 * 分支在改写阶段全都还摆在那里（tests/errors/module.c6）。 */
+                while (o + (size_t)mn + 40 > cap) { cap *= 2; out = realloc(out, cap); }
+                o += (size_t)snprintf(out + o, cap - o,
+                                      "__c6_module_decl(\"%s\");", MODHDR.module);
+                out[o++] = '\n';
+                i = (le < size) ? le + 1 : le;
+                continue;
+            }
+            if (le - k > 7 && memcmp(data + k, "import ", 7) == 0) {
+                char path[256] = {0};
+                int pn = 0;
+                size_t j = k + 7;
+
+                while (j < le && data[j] != ';' && data[j] != ' ' && pn < 240) {
+                    if (data[j] == '.')
+                        path[pn++] = '/';
+                    else
+                        path[pn++] = data[j];
+                    j++;
+                }
+                path[pn] = 0;
+                if (MODHDR.nimport < 16) {
+                    int dn = 0;
+                    size_t dj = k + 7;
+
+                    /* 记点分原名（path 里已经换成 / 了，所以再走一遍） */
+                    while (dj < le && data[dj] != ';' && data[dj] != ' '
+                           && dn < MOD_NAME_MAX - 1) {
+                        MODHDR.imports[MODHDR.nimport][dn++] = data[dj++];
+                    }
+                    MODHDR.imports[MODHDR.nimport][dn] = 0;
+                    if (dn)
+                        MODHDR.nimport++;
+                }
+                while (o + 24 + (size_t)pn > cap) { cap *= 2; out = realloc(out, cap); }
+                o += (size_t)snprintf(out + o, cap - o, "#include \"%s.c6\"", path);
+                if (le < size)
+                    out[o++] = '\n';
+                i = (le < size) ? le + 1 : le;
+                continue;
+            }
+        }
+        /* 普通行：原样拷 */
+        while (o + (le - ls) + 2 > cap) { cap *= 2; out = realloc(out, cap); }
+        for (i = ls; i < le; i++)
+            out[o++] = data[i];
+        if (le < size) {
+            out[o++] = '\n';
+            i = le + 1;
+        } else {
+            i = le;
+        }
+    }
+    out[o] = 0;
+    *out_owned = 1;
+    return out;
+}
+
+/* 把改写阶段抄下来的 module/import 名字登记到模块表（M1：只记账） */
+static void src_note_modhdr(SrcFile *f)
+{
+    u32 i = 0;
+
+    if (!f)
+        return;
+    /* 模块的登记跟着改写出来的 `__c6_module_decl("…")` 走（前端按预处理之后
+     * 的顺序判定），这里只记 import。 */
+    for (i = 0; i < MODHDR.nimport; i++)
+        mod_add_import(mod_intern(MODHDR.imports[i]));
+}
+
+static SrcFile *src_load(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    struct stat st = {0};
+    char *p = NULL;
+    void *m = NULL;
+
+    if (fd < 0)
+        return NULL;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return NULL;
+    }
+    /* PROT_WRITE 是为了给末尾补那个 0（MAP_PRIVATE，不会写回文件） */
+    m = mmap(NULL, (size_t)st.st_size + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED)
+        return NULL;
+    p = m;
+    p[st.st_size] = 0;
+    {
+        /* `.c6` 文件先把 c6 的 module/import 改写成预处理指令 */
+        size_t plen = strlen(path);
+        int owned = 0;
+
+        if (st.st_size > 0 && plen > 3 && strcmp(path + plen - 3, ".c6") == 0) {
+            char *rw = c6_rewrite_modules(p, (size_t)st.st_size, &owned);
+
+            if (rw && owned) {
+                SrcFile *nf = src_new(path, rw, strlen(rw), 1);
+
+                src_note_modhdr(nf);
+                return nf;
+            }
+        }
+    }
+    return src_new(path, p, (size_t)st.st_size, 0);
+}
+
+/* 命令行 -D 之类的合成内容：拷进 arena，交给同一套词法 */
+static SrcFile *src_synthetic(const char *name, const char *text)
+{
+    size_t n = strlen(text);
+    char *p = arena_alloc(&A_main, n + 1);
+    memcpy(p, text, n);
+    p[n] = 0;
+    return src_new(name, p, n, 1);
+}
+
+/* 行号：二分行首表。返回 1 基行号。 */
+/* 行号表：扫一遍填完（容量不够就翻倍，arena 里的浪费无所谓）。 */
+static void src_build_lines(SrcFile *f)
+{
+    u32 cap = 4096;
+    u32 n = 0;
+    size_t i = 0;
+
+    if (f->lines)
+        return;
+    f->lines = arena_alloc(&A_main, (size_t)cap * sizeof(u32));
+    f->lines[n++] = 0;
+    for (i = 0; i < f->size; i++) {
+        if (f->data[i] == '\n') {
+            if (n + 1 >= cap) {
+                u32 ncap = cap * 2;
+                u32 *nl = arena_alloc(&A_main, (size_t)ncap * sizeof(u32));
+
+                memcpy(nl, f->lines, (size_t)n * sizeof(u32));
+                f->lines = nl;
+                cap = ncap;
+            }
+            f->lines[n++] = (u32)(i + 1);
+        }
+    }
+    f->nlines = n;
+    f->line_cap = cap;
+}
+
+static u32 src_line_of(SrcFile *f, u32 off)
+{
+    if (!f->lines)
+        src_build_lines(f);
+    u32 lo = 0, hi = f->nlines;
+
+    while (lo + 1 < hi) {
+        u32 mid = (lo + hi) / 2;
+        if (f->lines[mid] <= off)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo + 1;
+}

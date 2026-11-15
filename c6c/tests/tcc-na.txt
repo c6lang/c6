@@ -1,0 +1,16 @@
+# tests2 里「在 c6c 现有架构下不可达」的用例，一行一个：用例名 <TAB> 原因
+#
+# 记分板把它们单独算一类（n/a），不算失败；反过来，**不在**这张表里的失败
+# 才是真失败——这样这份记分板才能当验收闸门用，而不是"差多少条"的进度条。
+# 每一条的理由都写死了具体卡点，不许写"暂不支持"这种糊话。
+104_inline	需要 tcc 自己 libtcc1.a 里的 check_exports（我们没有链接器，也没有那份库）
+113_btdll	需要 tcc 自己的 tcc_backtrace
+114_bound_signal	要 tcc 的 -b 边界检查运行时 + __sigsetjmp，是 tcc 自己的扩展
+120_alias	要第二个 TU（inunit2.c）—— 没有链接器
+146_tls_extern	要第二个 TU
+140_arm64_extasm	arm64 汇编（上游在 x86-64 上也跳）
+145_winarm64_interlocked	要 windows.h + win-arm64 内建函数（上游也跳）
+99_fastcall	i386 的 fastcall 调用约定（上游只在 i386 上跑）
+101_cleanup	用例要 65536 个同时活跃的栈槽，vreg 是 16 位（IR op 一条 16 字节）
+94_generic	要"限定符进类型 id"：`_Generic(const int*, int*: …)` 必须不匹配
+100_c99array-decls	同上：`__builtin_types_compatible_p(int**, restricted_pointer*)` 必须为假

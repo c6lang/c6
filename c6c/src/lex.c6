@@ -1,0 +1,474 @@
+/* lex.c6 —— 词法（design.md §2：span token、零 intern、行号表二分）
+ *
+ * Token 是源码里的一个区间 (off,len)：标识符不复制、不建字符串表。
+ * 只有指向源码的 offset 和长度，加一个扫描时算好的 FNV-1a 哈希（宏表查表用，
+ * 免得每次查表再重算）。
+ *
+ * P1 阶段只做“原始 token + 注释/空白/续行 + 数字/字符串/字符”这一层；
+ * #include / 宏展开在 P1-3b（同一文件往下加，token 结构不变）。
+ */
+
+enum {
+    TK_EOF = 0,
+    TK_IDENT,
+    TK_NUM,
+    TK_STR,
+    TK_CHAR,
+    TK_PUNCT,
+    TK_NL
+};
+
+#define TF_SPACE 1u   /* 前面有空白或注释（-E 输出要还原成一个空格） */
+#define TF_BOL   2u   /* 本行第一个 token（指令只在行首认） */
+#define TF_SYN   4u   /* 合成 token：off 指向合成缓冲 */
+
+typedef struct Tok {
+    u32 off;
+    u32 len;
+    u32 hash;
+    u16 kind;
+    u16 file;
+    u8 flags;
+    void *hs;        /* 隐藏集（宏展开用；NULL = 空），见 pp.c6 */
+    char *syn;       /* token 的文本：源码 token = 源码缓冲 + off，合成的 = 自带缓冲 */
+} Tok;
+
+/* 和字面量比名字。**不要用 strlen(s)**：tok_eq 是最高频函数之一（profiler 里
+ * 8.8%），strlen 每个 token 都要跑一遍（还占 7%）。直接按 t->len 逐字节比，
+ * 提前遇到 '\0' 就说明长度不够。 */
+/* 强制内联：它是全编译器调用次数最多的判断（每 token 几十次），外提成函数调用
+ * 的固定开销就占 12% 以上（profiler 实测）。 */
+#if defined(__GNUC__) && !defined(_C6C_)
+#define C6C_INLINE static inline __attribute__((always_inline))
+#else
+#define C6C_INLINE static inline
+#endif
+
+/* token 的文本：源码里就是那一段（不复制），合成的就用自带缓冲。
+ *
+ * **指针在建立 token 时就解引用好**（放在 t->syn 里）：tok_data 是调用次数最多
+ * 的取值函数（每次 tok_eq / pa_is_punct 都要一次），原来每次都要
+ * `file_by_id(t->file)->data + t->off` —— 两条互相依赖的 load 加一个分支，
+ * 在 profile 里占 4% 的指令。现在只有一条 load（NULL 只会出现在临时清零的
+ * EOF 哨兵上，那种 token 的 len 恒为 0）。 */
+C6C_INLINE const char *tok_data(const Tok *t)
+{
+    return t->syn ? t->syn : "";
+}
+
+C6C_INLINE int tok_eq(const Tok *t, const char *s)
+{
+    const char *d = tok_data(t);
+    u32 i = 0;
+
+    for (i = 0; i < t->len; i++) {
+        if (s[i] == 0 || s[i] != d[i])
+            return 0;
+    }
+    return s[t->len] == 0;
+}
+
+typedef struct Lex {
+    SrcFile *f;
+    char *data;      /* == f->data：热路径上省掉一次 load */
+    u32 pos;
+    u32 size;        /* == f->size：注释扫描要用上界 */
+    u16 id;          /* == f->id */
+    u8 at_bol;
+} Lex;
+
+static const char *const PUNCT2[] = {
+    "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||",
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "##", "::", NULL
+};
+
+/* 双/三字符标点的判定表，键 = (首字节 << 8) | 次字节。
+ *
+ * 原来是“先扫 22 项 PUNCT2、再扫 3 项 PUNCT3”，`*`/`=`/`-`/`>` 这些常见标点每个
+ * 都要线性走一遍（profile 里这两条循环占 2%）。查表后一次 load 就能定长度：
+ * 表里只有 22 个非零项，实际被访问到的只有两三条 cache line。
+ * 三字符的只有 `<<=`、`>>=`、`...`，共同点是头两个字节相同，单独一个判断。 */
+static u8 PUNCT2_TAB[65536];
+static int PUNCT2_INIT;
+
+static void punct_tab_init(void)
+{
+    int i = 0;
+
+    for (i = 0; PUNCT2[i]; i++)
+        PUNCT2_TAB[((u32)(u8)PUNCT2[i][0] << 8) | (u8)PUNCT2[i][1]] = 1;
+    PUNCT2_INIT = 1;
+}
+
+/* 标识符哈希：一次混 8 个字节的 FNV-1a（读的范围永远在 token 里，不会越界），
+ * 尾巴不足 8 字节的部分攒成一个字再混一次。
+ *
+ * 原来是逐字节攒 4 个再乘，一趟循环要 13 条指令/字节；标识符扫描那条循环在
+ * profile 里占到 5%。现在结尾扫描单独用一条 5 条指令/字节的紧循环（见下面
+ * ident 分支），哈希走这条整字的。哈希值只用来定符号表/宏表/关键字表的桶号，
+ * 桶里还有 tok_eq 兜底，所以换算法不影响语义；但**所有**等于 t->hash 的
+ * 预计算值都必须用这个函数算（TYKW_HASH / SA_HASH / 宏表都是）。 */
+static u32 tok_hash(const char *p, u32 n)
+{
+    u64 h = 2166136261u;
+    u64 acc = 0;     /* 尾巴最多 7 个字节，32 位会移出界，所以用 64 位攒 */
+    u32 i = 0;
+    u32 k = 0;
+
+    /* 一次混 8 个字节（读的范围永远在 [p, p+n) 里，不会越界），剩下的尾巴
+     * 再按字节攒成一个字混进去。 */
+    while (i + 8 <= n) {
+        u64 w = 0;
+
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ULL;
+        i += 8;
+    }
+    for (k = 0; i < n; i++, k++)
+        acc |= (u64)(u8)p[i] << (k * 8);
+    h = (h ^ acc) * 0x100000001b3ULL;
+    return (u32)(h ^ (h >> 32));
+}
+
+/* 标识符首字符/后续字符用查表代替逐字节比较（词法层是 profiler 第一热点，
+ * 每个 token 都要跑几遍这个判断）。表在第一次用时初始化。 */
+static u8 IDENT_TAB[256];
+static int IDENT_TAB_INIT;
+
+static void ident_tab_init(void)
+{
+    int i = 0;
+
+    for (i = 0; i < 256; i++) {
+        int start = (i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z')
+                    || i == '_' || i == '$' || i >= 0x80;
+
+        IDENT_TAB[i] = (u8)(start ? 3 : ((i >= '0' && i <= '9') ? 2 : 0));
+    }
+    IDENT_TAB_INIT = 1;
+}
+
+C6C_INLINE int is_ident_start(int c)
+{
+    if (!IDENT_TAB_INIT)
+        ident_tab_init();
+    return IDENT_TAB[c & 0xFF] & 1;
+}
+
+C6C_INLINE int is_ident_cont(int c)
+{
+    if (!IDENT_TAB_INIT)
+        ident_tab_init();
+    return IDENT_TAB[c & 0xFF] != 0;
+}
+
+static int is_digit(int c)
+{
+    return c >= '0' && c <= '9';
+}
+
+static void lex_init(Lex *L, SrcFile *f)
+{
+    L->f = f;
+    L->data = f->data;
+    L->pos = 0;
+    L->size = (u32)f->size;
+    L->id = (u16)f->id;
+    L->at_bol = 1;
+}
+
+/* 跳过空白、注释、反斜杠续行；顺带置 TF_SPACE */
+/* 哪些字节需要走 lex_skip（空白、换行、反斜杠续行、注释）。绝大多数字符
+ * 不是这些，一次查表就能跳过整个跳过逻辑（lex_next 是 profiler 里第一热点）。 */
+static const u8 LEX_SKIP_TAB[256] = {
+    [' '] = 1, ['\t'] = 1, ['\v'] = 1, ['\f'] = 1, ['\r'] = 1,
+    ['\n'] = 1, ['/'] = 1, ['\\'] = 1
+};
+
+/* 只有空格和制表符（最常见的空白）：一次跳完一整段，别在 lex_skip 里
+ * 一个字符一个字符地过分支。 */
+static const u8 LEX_SP_TAB[256] = {[' '] = 1, ['\t'] = 1};
+
+/* 块注释扫描：tcc.c 的注释有两百多万字节，原来那个逐字节的
+ * "while (d[p] && !(d[p] == '*' && d[p+1] == '/')) p++;" 在 profile 里占 2%。
+ * 现在一次读 8 字节，用 SWAR 位运算判断这 8 个字节里有没有 '*'（不需要 SSE，
+ * 也不越过文件末尾——只有 p+8 <= size 时才整字读，尾巴仍走逐字节）。
+ * 返回右括号之后的位置；没找到返回 size+1（调用方据此报“注释没有结束”）。 */
+#define SWAR_ONES 0x0101010101010101ULL
+#define SWAR_HIGH 0x8080808080808080ULL
+#define SWAR_STAR 0x2a2a2a2a2a2a2a2aULL   /* 8 个 '*' */
+
+static u32 lex_block_comment_end(const char *d, u32 p, u32 size)
+{
+    for (;;) {
+        while (p + 8 <= size) {
+            u64 w = 0;
+            u64 z = 0;
+
+            memcpy(&w, d + p, 8);
+            z = w ^ SWAR_STAR;
+            if ((z - SWAR_ONES) & ~z & SWAR_HIGH)
+                break;              /* 这 8 个字节里至少有一个 '*' */
+            p += 8;
+        }
+        while (p < size && d[p] != '*')
+            p++;
+        if (p >= size)
+            return size + 1;
+        if (d[p + 1] == '/')        /* d[size] 恒为 0，所以这读永远合法 */
+            return p + 2;
+        p++;
+    }
+}
+
+static void lex_skip(Lex *L, Tok *t)
+{
+    char *d = L->data;
+
+    for (;;) {
+        int c = (u8)d[L->pos];
+
+        if (c == 0)
+            return;
+        if (LEX_SP_TAB[c]) {
+            u32 p = L->pos;
+
+            while (LEX_SP_TAB[(u8)d[p]])
+                p++;
+            L->pos = p;
+            t->flags |= TF_SPACE;
+            continue;
+        }
+        if (c == '\\' && d[L->pos + 1] == '\n') {
+            L->pos += 2;
+            t->flags |= TF_SPACE;
+            continue;
+        }
+        if (c == '\\' && d[L->pos + 1] == '\r' && d[L->pos + 2] == '\n') {
+            L->pos += 3;
+            t->flags |= TF_SPACE;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r') {
+            L->pos++;
+            t->flags |= TF_SPACE;
+            continue;
+        }
+        if (c == '/' && d[L->pos + 1] == '/') {
+            while (d[L->pos] && d[L->pos] != '\n')
+                L->pos++;
+            t->flags |= TF_SPACE;
+            continue;
+        }
+        if (c == '/' && d[L->pos + 1] == '*') {
+            u32 start = L->pos;
+            u32 end = lex_block_comment_end(d, start + 2, L->size);
+
+            if (end > L->size) {
+                diag_error(L->f, start, "注释没有结束（缺少 */）");
+                return;
+            }
+            L->pos = end;
+            t->flags |= TF_SPACE;
+            continue;
+        }
+        return;
+    }
+}
+
+/* 数字：C 的 pp-number 规则（1e+5、0x1p-3、1.0f、0b1010 都整体算一个 token） */
+static void lex_number(Lex *L, Tok *t)
+{
+    char *d = L->data;
+    u32 start = L->pos;
+
+    while (d[L->pos]) {
+        int c = (u8)d[L->pos];
+        if ((c == 'e' || c == 'E' || c == 'p' || c == 'P')
+            && (d[L->pos + 1] == '+' || d[L->pos + 1] == '-')) {
+            L->pos += 2;
+            continue;
+        }
+        if (is_ident_cont(c) || c == '.')
+            L->pos++;
+        else
+            break;
+    }
+    t->kind = TK_NUM;
+    t->off = start;
+    t->len = L->pos - start;
+}
+
+/* 字符串/字符字面量：跳过转义，允许行尾续行 */
+/* 宽/UTF 前缀：L"…" u"…" U"…" u8"…"（以及字符常量）。前缀并进同一个 token，
+ * 解析期再按前缀决定元素宽度。 */
+static int lex_is_char_prefix(const char *d, u32 pos, u32 len)
+{
+    if (len == 1 && (d[pos] == 'L' || d[pos] == 'u' || d[pos] == 'U'))
+        return 1;
+    if (len == 2 && d[pos] == 'u' && d[pos + 1] == '8')
+        return 1;
+    return 0;
+}
+
+static void lex_quote(Lex *L, Tok *t, int q);
+static int lex_is_char_prefix(const char *d, u32 pos, u32 len);
+
+static void lex_quote(Lex *L, Tok *t, int q)
+{
+    char *d = L->data;
+    u32 start = L->pos;
+
+    L->pos++;
+    for (;;) {
+        int c = (u8)d[L->pos];
+        if (c == 0 || c == '\n') {
+            diag_error(L->f, start, "%s没有结束", q == '"' ? "字符串" : "字符常量");
+            t->kind = q == '"' ? TK_STR : TK_CHAR;
+            t->off = start;
+            t->len = L->pos - start;
+            return;
+        }
+        if (c == '\\' && d[L->pos + 1]) {
+            L->pos += 2;
+            continue;
+        }
+        L->pos++;
+        if (c == q)
+            break;
+    }
+    t->kind = q == '"' ? TK_STR : TK_CHAR;
+    t->off = start;
+    t->len = L->pos - start;
+}
+
+static void lex_punct(Lex *L, Tok *t)
+{
+    char *d = L->data;
+    u32 start = L->pos;
+    u32 c0 = (u8)d[start];
+    u32 c1 = (u8)d[start + 1];
+    u32 len = 1;
+
+    /* 三字符的只有 `<<=` `>>=` `...`：头两个字节相同，第三个是 '=' 或 '.' */
+    if (c1 == c0 && (c0 == '<' || c0 == '>' || c0 == '.')
+        && (u8)d[start + 2] == (c0 == '.' ? '.' : '=')) {
+        len = 3;
+        L->pos = start + 3;
+        t->kind = TK_PUNCT;
+        t->off = start;
+        t->len = 3;
+        return;
+    }
+    if (!PUNCT2_INIT)
+        punct_tab_init();
+    if (PUNCT2_TAB[(c0 << 8) | c1])
+        len = 2;
+    L->pos = start + len;
+    t->kind = TK_PUNCT;
+    t->off = start;
+    t->len = len;
+}
+
+/* 取下一个原始 token。返回 kind。 */
+static int lex_next(Lex *L, Tok *t)
+{
+    char *d = L->data;
+    u32 start = 0;
+    int c = 0;
+
+    /* 只清用得到的字段（32 字节整块 memset 在 40 万 token 上是实打实的开销）。
+     * flags 用移位代替三元式：at_bol 只有 0/1，`<< 1` 正好是 TF_BOL，
+     * 省掉一条每 token 都要过一遍的分支。 */
+    t->hash = 0;
+    t->hs = NULL;
+    t->file = L->id;
+    t->flags = (u8)((u32)L->at_bol << 1);
+    if (LEX_SKIP_TAB[(u8)d[L->pos]])
+        lex_skip(L, t);
+
+    c = (u8)d[L->pos];
+    start = L->pos;
+    if (c == 0) {
+        t->kind = TK_EOF;
+        t->off = L->pos;
+        t->len = 0;
+        t->syn = d + t->off;
+        return TK_EOF;
+    }
+    if (c == '\n') {
+        L->pos++;
+        t->kind = TK_NL;
+        t->off = start;
+        t->len = 1;
+        t->syn = d + start;
+        L->at_bol = 1;
+        return TK_NL;
+    }
+    L->at_bol = 0;
+
+    if (is_ident_start(c)) {
+        /* 扫标识符的同时算哈希：绝大多数 token 是标识符，之前是先扫一遍、
+         * 再单独 `tok_hash` 跑一遍，同样的字节走了两趟。 */
+        {
+            const u8 *tab = IDENT_TAB;
+            const u8 *dd = (const u8 *)d;
+            u32 p = L->pos;
+
+            /* 第一趟只找结尾（一趟 5 条指令/字节，顺手算哈希要 13 条）；
+             * 第二趟交给 tok_hash 整字混。两趟加起来比原来的一趟还便宜，
+             * 因为第一趟的循环体短到能全速跑。 */
+            while (tab[dd[p]])
+                p++;
+            L->pos = p;
+            t->hash = tok_hash(d + start, p - start);
+        }
+        t->off = start;
+        t->len = L->pos - start;
+        /* 宽/UTF 字面量前缀：L"…" u8"…" 之类，前缀并进字面量 token */
+        if ((d[L->pos] == '"' || d[L->pos] == '\'')
+            && lex_is_char_prefix(d, start, t->len)) {
+            int q = d[L->pos];
+
+            lex_quote(L, t, q);
+            t->off = start;                      /* 含前缀 */
+            t->len = L->pos - start;
+        } else {
+            t->kind = TK_IDENT;
+        }
+    } else if (is_digit(c) || (c == '.' && is_digit((u8)d[L->pos + 1]))) {
+        lex_number(L, t);
+    } else if (c == '"') {
+        lex_quote(L, t, '"');
+    } else if (c == '\'') {
+        lex_quote(L, t, '\'');
+    } else {
+        lex_punct(L, t);
+    }
+    /* 文本指针在这里一次算好（见 tok_data 的说明）：原来每个 token 的每次
+     * 取值都要重走一遍 file_by_id()。 */
+    t->syn = d + t->off;
+    return t->kind;
+}
+
+static const char *tok_kind_name(int kind)
+{
+    switch (kind) {
+    case TK_EOF:   return "eof";
+    case TK_IDENT: return "ident";
+    case TK_NUM:   return "num";
+    case TK_STR:   return "str";
+    case TK_CHAR:  return "char";
+    case TK_PUNCT: return "punct";
+    case TK_NL:    return "nl";
+    default:       return "?";
+    }
+}
+
+/* 便于诊断：把 token 文本抄进调用者的缓冲（截断到 cap-1） */
+static void tok_text(SrcFile *f, const Tok *t, char *buf, size_t cap)
+{
+    size_t n = t->len < cap - 1 ? t->len : cap - 1;
+    memcpy(buf, f->data + t->off, n);
+    buf[n] = 0;
+}

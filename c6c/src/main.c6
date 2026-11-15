@@ -1,0 +1,698 @@
+/* main.c6 —— 驱动
+ *
+ * P1 能做到哪儿就说到哪儿：
+ *   --scan / -fsyntax-only   预处理 + 词法 + 诊断（语法分析与 codegen 在 P3/P2）
+ *   -E                       预处理输出到 stdout（带 # 行标记）
+ *   -c                       目标文件（P2）
+ * 参数形状（-I/-D/-U/-B/-o）按最终版收，避免以后改 CLI。
+ */
+
+#define MAX_INC 32
+#define MAX_DEF 64
+#define MAX_SRC 256
+
+enum {
+    M_SCAN = 0,
+    M_CHECK,
+    M_E,
+    M_OBJ,      /* -c：单文件、freestanding、_start 直接调 main */
+    M_EXE       /* 默认：单文件 + 自带运行时 → 可执行文件 */
+};
+
+typedef struct Opts {
+    const char *incs[MAX_INC];
+    int nincs;
+    const char *defs[MAX_DEF];
+    int ndefs;
+    const char *undefs[MAX_DEF];
+    int nundefs;
+    const char *files[MAX_SRC];
+    int nfiles;
+    int nostdlib;
+    const char *out;
+    const char *bdir;
+    int verbose;
+    int mode;
+} Opts;
+
+static Opts O;
+static const char *progname = "c6c";
+
+static void usage(FILE *fp)
+{
+    fprintf(fp,
+        "用法：%s [选项] 文件...\n"
+        "\n"
+        "  -I 目录              头文件搜索路径（可多次）\n"
+        "  -D 名字[=值]         预定义宏（可多次）\n"
+        "  -U 名字              取消预定义\n"
+        "  -B 目录              libtcc1.a / crt 所在目录（同时用它下面的 include）\n"
+        "  -o 文件              输出文件\n"
+        "  --scan               只做预处理+词法并打印统计\n"
+        "  --hello 文件          直接发一个 _start+main(42) 的 ELF（P2-2 骨架）\n"
+        "  --type-selftest      类型表 hash-consing/布局自测（P3-1）\n"
+        "  --ir-selftest        IR v1 编解码/指纹自测（P2-1）\n"
+        "  --ir-demo            打印 hello 形态的 IR dump\n"
+        "  -fsyntax-only        只查错不出码（语法在 P3）\n"
+        "  -E                   预处理输出到 stdout\n"
+        "  -c                   单文件 freestanding 可执行文件（不带运行时）\n"
+        "  -nostdlib            不自动带上 c6c 自带运行时（lib/rt.c6）\n"
+        "  -v                   详细输出\n"
+        "  --version            版本\n"
+        "  -h                   这份帮助\n",
+        progname);
+}
+
+static double now_ms(void)
+{
+    struct timespec ts = {0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* ---- 输出缓冲：满 1 MB 就 write(2)，绝不把整份输出拼在内存里 ---- */
+typedef struct Out {
+    char *buf;
+    size_t cap;
+    size_t n;
+} Out;
+
+static Out OUTBUF;
+
+static void out_flush(Out *o)
+{
+    size_t off = 0;
+    while (off < o->n) {
+        ssize_t w = write(1, o->buf + off, o->n - off);
+        if (w <= 0)
+            break;
+        off += (size_t)w;
+    }
+    o->n = 0;
+}
+
+static void out_putn(Out *o, const char *p, size_t n)
+{
+    if (o->n + n > o->cap) {
+        out_flush(o);
+        if (n > o->cap) {
+            size_t off = 0;
+            while (off < n) {
+                ssize_t w = write(1, p + off, n - off);
+                if (w <= 0)
+                    break;
+                off += (size_t)w;
+            }
+            return;
+        }
+    }
+    memcpy(o->buf + o->n, p, n);
+    o->n += n;
+}
+
+static void out_putc(Out *o, char c)
+{
+    if (o->n + 1 > o->cap)
+        out_flush(o);
+    o->buf[o->n++] = c;
+}
+
+/* ---- 统计（P1 的验收口径：行/秒、µs/行、MB/s）---- */
+static u64 ST_tok;
+static u64 ST_kind[8];
+static u64 ST_lines;
+static u64 ST_bytes;
+
+static void pp_reset(void)
+{
+    PP_TOP = NULL;
+    COND = NULL;
+    NPUSHBACK = 0;
+    INCLUDE_DEPTH = 0;
+}
+
+static void push_defines(void);
+
+static void scan_one(const char *path)
+{
+    SrcFile *f = src_load(path);
+    Tok t = {0};
+    u64 ntok = 0;
+
+    if (!f) {
+        diag_error_plain("打不开源文件 '%s'", path);
+        return;
+    }
+    pp_reset();
+    pp_push_file(f, -1);
+    push_defines();
+    for (;;) {
+        int k = pp_next(&t);
+        if (k == TK_EOF)
+            break;
+        ntok++;
+        if (k >= 0 && k < 8)
+            ST_kind[k]++;
+        if (DG.errors > 200) {
+            diag_error_plain("错误太多，停止（%d）", DG.errors);
+            break;
+        }
+    }
+    ST_tok += ntok;
+}
+
+static void stat_totals(void)
+{
+    SrcFile *f = FILES.head;
+    ST_lines = 0;
+    ST_bytes = 0;
+    for (; f; f = f->next) {
+        if (f->owned)
+            continue;
+        ST_lines += f->nlines;
+        ST_bytes += f->size;
+    }
+}
+
+static void print_stats(double ms)
+{
+    double per_line = ST_lines ? ms * 1000.0 / (double)ST_lines : 0.0;
+    double lines_per_s = ms > 0.0 ? (double)ST_lines * 1000.0 / ms : 0.0;
+    double mb_per_s = ms > 0.0 ? (double)ST_bytes / 1024.0 / 1024.0 * 1000.0 / ms : 0.0;
+    double per_tok = ST_tok ? ms * 1000.0 / (double)ST_tok : 0.0;
+
+    printf("c6c: %d 个文件 / %lu 行 / %.2f MB / %lu token / arena %.2f MB\n",
+           O.nfiles, (unsigned long)ST_lines, (double)ST_bytes / 1048576.0,
+           (unsigned long)ST_tok, (double)A_main.total / 1048576.0);
+    printf("c6c: %.1f ms → %.1f 万行/s（%.2f µs/行，%.2f µs/token），%.1f MB/s\n",
+           ms, lines_per_s / 10000.0, per_line, per_tok, mb_per_s);
+    printf("c6c: token 分布 ident %lu / num %lu / str %lu / char %lu / punct %lu / nl %lu\n",
+           (unsigned long)ST_kind[TK_IDENT], (unsigned long)ST_kind[TK_NUM],
+           (unsigned long)ST_kind[TK_STR], (unsigned long)ST_kind[TK_CHAR],
+           (unsigned long)ST_kind[TK_PUNCT], (unsigned long)ST_kind[TK_NL]);
+}
+
+/* ---- -E ----
+ *
+ * 目标：**行号保真**。源文件里的 token（不是宏展开出来的）按它自己的行号输出，
+ * 行号跳跃小于 8 行就补空行，否则打 `# 行 "文件"` 标记。这样 tcc 收下这份输出时
+ * 报错位置就是原始文件的行号 —— G2c 调 tcc 的 C 代码时，这就是唯一的定位手段。
+ * 宏展开出来的 token（hs != NULL）不参与行号推进，也不打标记。
+ */
+static void emit_marker(SrcFile *sf, u32 line)
+{
+    char hdr[512] = {0};
+    int hn = snprintf(hdr, sizeof(hdr), "\n# %u \"%s\"\n", line, sf->path);
+    if (hn > 0)
+        out_putn(&OUTBUF, hdr, (size_t)hn);
+}
+
+/* 空格规则：源里的空白（TF_SPACE）之外，还要防“粘成一个 token”：
+ *   extern int   → 两个标识符必须隔开（吃过这个亏：输出成了 externint）
+ *   - -          → 两个标点可能拼成 -- 之类
+ */
+static int emit_needs_space(int prev_kind, int kind)
+{
+    int prev_word = (prev_kind == TK_IDENT || prev_kind == TK_NUM
+                     || prev_kind == TK_STR || prev_kind == TK_CHAR);
+    int cur_word = (kind == TK_IDENT || kind == TK_NUM
+                    || kind == TK_STR || kind == TK_CHAR);
+    if (prev_word && cur_word)
+        return 1;
+    if (prev_kind == TK_PUNCT && kind == TK_PUNCT)
+        return 1;
+    return 0;
+}
+
+static void emit_one(const char *path)
+{
+    SrcFile *f = src_load(path);
+    Tok t = {0};
+    SrcFile *lastf = NULL;
+    u32 lastline = 1;
+    int prev_kind = 0;
+
+    if (!f) {
+        diag_error_plain("打不开源文件 '%s'", path);
+        return;
+    }
+    pp_push_file(f, -1);
+    push_defines();
+    for (;;) {
+        int k = pp_next(&t);
+        /* 合成 token（__LINE__/__FILE__/__DATE__ 的结果）没有可信的源位置，不参与行号推进 */
+    int expanded = (t.hs != NULL) || (t.flags & TF_SYN);
+
+        if (k == TK_EOF)
+            break;
+        if (t.kind == TK_NL) {
+            out_putc(&OUTBUF, '\n');
+            lastline++;          /* 换行本身也让物理行号 +1，别再重复垫 */
+            continue;
+        }
+        if (!expanded) {
+            SrcFile *sf = file_by_id(t.file);
+
+            if (!sf && FILES.head)
+                sf = FILES.head;
+            u32 line = src_line_of(sf, t.off);
+            if (sf != lastf) {
+                emit_marker(sf, line);
+                lastf = sf;
+                lastline = line;
+            } else if (line != lastline) {
+                if (line > lastline && line - lastline <= 8) {
+                    while (lastline < line) {
+                        out_putc(&OUTBUF, '\n');
+                        lastline++;
+                    }
+                } else {
+                    out_putc(&OUTBUF, '\n');
+                    emit_marker(sf, line);
+                    lastline = line;
+                }
+            }
+        }
+        if ((t.flags & TF_SPACE) || emit_needs_space(prev_kind, t.kind))
+            out_putc(&OUTBUF, ' ');
+        out_putn(&OUTBUF, tok_data(&t), t.len);
+        prev_kind = t.kind;
+    }
+    out_putc(&OUTBUF, '\n');
+}
+
+/* 内建宏：没有它们，glibc 的头文件会走错分支（例如 stubs-32.h） */
+/* 内建宏：**对着 tcc 的预定义集抄**（tcc -E -dM 的实测结果）。
+ *
+ * 为什么不照 gcc 的抄：G2c 要求 c6c 编出来的东西 tcc 也能编，而 glibc 的
+ * 头文件按 __GNUC__ 分支选路。tcc 不定义 __GNUC__，于是走“非 GNU 编译器”
+ * 那条路（比如 dlfcn.h 里 Dl_serinfo 用老式数组而不是零长数组 + 匿名 union）。
+ * 我们跟着 tcc 走，风险最小；多出来的 GNU 拼写用等价的 C 关键字映射掉，
+ * 使输出与 tcc 的 -E 逐 token 同构（这是 P1-3b 的对齐口径）。
+ */
+static const char *const BUILTIN_DEFS =
+    /* GCC 内建函数：按同名 libc 函数/普通写法展开。真实代码（尤其 tcc 自己的
+     * 测试）到处用 __builtin_*，逐个在 IR 里实现不划算，语义上它们就是这些。 */
+    "#define __builtin_memcpy(a,b,c) memcpy(a,b,c)\n"
+    "#define __builtin_memmove(a,b,c) memmove(a,b,c)\n"
+    "#define __builtin_memset(a,b,c) memset(a,b,c)\n"
+    "#define __builtin_memcmp(a,b,c) memcmp(a,b,c)\n"
+    "#define __builtin_strlen(a) strlen(a)\n"
+    "#define __builtin_strcpy(a,b) strcpy(a,b)\n"
+    "#define __builtin_strncpy(a,b,c) strncpy(a,b,c)\n"
+    "#define __builtin_strcmp(a,b) strcmp(a,b)\n"
+    "#define __builtin_strncmp(a,b,c) strncmp(a,b,c)\n"
+    "#define __builtin_strcat(a,b) strcat(a,b)\n"
+    "#define __builtin_strncat(a,b,c) strncat(a,b,c)\n"
+    "#define __builtin_strchr(a,b) strchr(a,b)\n"
+    "#define __builtin_strrchr(a,b) strrchr(a,b)\n"
+    "#define __builtin_abort() abort()\n"
+    "#define __builtin_exit(a) exit(a)\n"
+    "#define __builtin_alloca(a) alloca(a)\n"
+    "#define __builtin_malloc(a) malloc(a)\n"
+    "#define __builtin_calloc(a,b) calloc(a,b)\n"
+    "#define __builtin_realloc(a,b) realloc(a,b)\n"
+    "#define __builtin_free(a) free(a)\n"
+    "#define __builtin_strdup(a) strdup(a)\n"
+    "#define __STDC__ 1\n"
+    "#define __STDC_VERSION__ 199901L\n"
+    "#define __STDC_HOSTED__ 1\n"
+    "#define __x86_64 1\n"
+    "#define __x86_64__ 1\n"
+    "#define __amd64__ 1\n"
+    "#define __linux 1\n"
+    "#define __linux__ 1\n"
+    "#define __unix 1\n"
+    "#define __unix__ 1\n"
+    "#define __LP64__ 1\n"
+    "#define __CHAR_BIT__ 8\n"
+    "#define __SIZEOF_INT__ 4\n"
+    "#define __SIZEOF_LONG__ 8\n"
+    "#define __SIZEOF_LONG_LONG__ 8\n"
+    "#define __SIZEOF_POINTER__ 8\n"
+    "#define __SIZE_TYPE__ unsigned long\n"
+    "#define __PTRDIFF_TYPE__ long\n"
+    "#define __WCHAR_TYPE__ int\n"
+    "#define __WINT_TYPE__ unsigned int\n"
+    "#define __INT32_TYPE__ int\n"
+    "#define __INT64_TYPE__ long\n"
+    "#define __INTPTR_TYPE__ __PTRDIFF_TYPE__\n"
+    "#define __UINTPTR_TYPE__ unsigned __PTRDIFF_TYPE__\n"
+    "#define __INT_MAX__ 0x7fffffff\n"
+    "#define __LONG_MAX__ 0x7fffffffffffffffL\n"
+    "#define __LONG_LONG_MAX__ 0x7fffffffffffffffLL\n"
+    "#define __ORDER_LITTLE_ENDIAN__ 1234\n"
+    "#define __ORDER_BIG_ENDIAN__ 4321\n"
+    "#define __BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__\n"
+    "#define __TINYC__ 928\n"
+    "#define __c6c__ 1\n"
+    "#define __VERSION__ \"c6c\"\n"
+    /* glibc 的 __has_* 探测：tcc 一律给 0 */
+    "#define __has_attribute(x) 0\n"
+    "#define __has_builtin(x) 0\n"
+    "#define __has_feature(x) 0\n"
+    "#define _Nonnull\n"
+    "#define _Nullable\n"
+    "#define _Nullable_result\n"
+    "#define _Null_unspecified\n"
+    /* GNU 拼写 → C 关键字（tcc 是当关键字处理的，我们是标识符，所以要映射） */
+    "#define __inline inline\n"
+    "#define __inline__ inline\n"
+    "#define __restrict restrict\n"
+    "#define __restrict__ restrict\n"
+    "#define __signed signed\n"
+    "#define __signed__ signed\n"
+    "#define __const const\n"
+    "#define __const__ const\n"
+    "#define __volatile volatile\n"
+    "#define __volatile__ volatile\n"
+    "#define __typeof__ typeof\n"
+    "#define __extension__\n"
+    "#define __USER_LABEL_PREFIX__\n"
+    "#define __REGISTER_PREFIX__\n"
+    ;
+
+/* 内建宏 + -D + -U 拼成一个合成文件，走同一条预处理路径 */
+static void push_defines(void)
+{
+    size_t cap = 2048 + strlen(BUILTIN_DEFS), n = 0;
+    char *buf = NULL;
+    int i = 0;
+    SrcFile *f = NULL;
+
+    for (i = 0; i < O.ndefs; i++)
+        cap += strlen(O.defs[i]) + 16;
+    for (i = 0; i < O.nundefs; i++)
+        cap += strlen(O.undefs[i]) + 16;
+    buf = arena_alloc(&A_main, cap);
+    n = (size_t)snprintf(buf, cap, "%s", BUILTIN_DEFS);
+    for (i = 0; i < O.ndefs; i++) {
+        const char *d = O.defs[i];
+        const char *eq = strchr(d, '=');
+        int r = 0;
+        if (eq)
+            r = snprintf(buf + n, cap - n, "#define %.*s %s\n", (int)(eq - d), d, eq + 1);
+        else
+            r = snprintf(buf + n, cap - n, "#define %s 1\n", d);
+        if (r > 0)
+            n += (size_t)r;
+    }
+    for (i = 0; i < O.nundefs; i++) {
+        int r = snprintf(buf + n, cap - n, "#undef %s\n", O.undefs[i]);
+        if (r > 0)
+            n += (size_t)r;
+    }
+    f = src_new("<命令行 -D>", buf, n, 1);
+    pp_push_file(f, -1);
+}
+
+static int parse_args(int argc, char **argv)
+{
+    int i = 0;
+
+    O.bdir = ".";
+    O.mode = M_EXE;
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+            usage(stdout);
+            exit(0);
+        } else if (strcmp(a, "--version") == 0) {
+            printf("c6c 0.0.1（P1 骨架，自举链 tcc/c6 -> c6c）\n");
+            exit(0);
+        } else if (strcmp(a, "-v") == 0) {
+            O.verbose = 1;
+        } else if (strcmp(a, "--hello") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "c6c: --hello 需要输出文件名\n");
+                return 2;
+            }
+            exit(x64_hello(argv[++i]));
+        } else if (strcmp(a, "--type-selftest") == 0) {
+            exit(type_selftest());
+        } else if (strcmp(a, "--ir-selftest") == 0) {
+            exit(ir_selftest());
+        } else if (strcmp(a, "--ir-demo") == 0) {
+            ir_demo(stdout);
+            exit(0);
+        } else if (strcmp(a, "--scan") == 0) {
+            O.mode = M_SCAN;
+        } else if (strcmp(a, "-fsyntax-only") == 0 || strcmp(a, "--check") == 0) {
+            O.mode = M_CHECK;
+        } else if (strcmp(a, "-E") == 0) {
+            O.mode = M_E;
+        } else if (strcmp(a, "-c") == 0) {
+            O.mode = M_OBJ;
+        } else if (strcmp(a, "--emit-c") == 0) {
+            c99_set_mode();      /* C99 后端：-o 写的是 .c 源文件 */
+        } else if (strcmp(a, "--emit-llvm") == 0) {
+            llvm_set_mode();     /* LLVM IR 后端：-o 写的是 .ll */
+        } else if (strcmp(a, "-nostdlib") == 0) {
+            O.nostdlib = 1;
+        } else if (a[0] == '-' && (a[1] == 'I' || a[1] == 'D' || a[1] == 'U'
+                                   || a[1] == 'B' || a[1] == 'o')) {
+            const char *val = a + 2;
+            if (*val == 0) {
+                if (i + 1 >= argc) {
+                    diag_error_plain("%s 需要参数", a);
+                    return -1;
+                }
+                i++;
+                val = argv[i];
+            }
+            if (a[1] == 'I') {
+                if (O.nincs < MAX_INC)
+                    O.incs[O.nincs++] = val;
+            } else if (a[1] == 'D') {
+                if (O.ndefs < MAX_DEF)
+                    O.defs[O.ndefs++] = val;
+            } else if (a[1] == 'U') {
+                if (O.nundefs < MAX_DEF)
+                    O.undefs[O.nundefs++] = val;
+            } else if (a[1] == 'o') {
+                O.out = val;
+            } else if (a[1] == 'B') {
+                O.bdir = val;
+            }
+        } else if (a[0] == '-' && (a[1] == 'W' || a[1] == 'w')) {
+            /* 告警开关：接受并记下来，目前没有告警子系统，静默忽略。
+             * tests/errors/*.c6 的 `// FLAGS -Wgeneric-depth` 靠它才不吃错。 */
+            continue;
+        } else if (a[0] == '-' && a[1] != 0) {
+            diag_error_plain("未知选项 '%s'（用 -h 看用法）", a);
+            return -1;
+        } else {
+            if (O.nfiles >= MAX_SRC) {
+                diag_error_plain("源文件太多（上限 %d）", MAX_SRC);
+                return -1;
+            }
+            O.files[O.nfiles++] = a;
+        }
+    }
+    return 0;
+}
+
+static char C6C_SELF_DIR[512];
+
+/* 从 argv[0] 推出编译器自己的目录，供自带 include/ 使用 */
+static void setup_self_dir(const char *argv0)
+{
+    const char *slash = argv0 ? strrchr(argv0, '/') : NULL;
+    size_t n = 0;
+
+    if (!slash)
+        return;
+    n = (size_t)(slash - argv0);
+    if (n == 0 || n >= sizeof(C6C_SELF_DIR))
+        return;
+    memcpy(C6C_SELF_DIR, argv0, n);
+    C6C_SELF_DIR[n] = 0;
+}
+
+static void setup_incdirs(void)
+{
+    int i = 0;
+    char bd[512] = {0};
+
+    for (i = 0; i < O.nincs && NINCDIR < MAX_INCDIRS; i++)
+        INCDIR[NINCDIR++] = O.incs[i];
+    /* c6c 自带的 include/（stddef.h / stdarg.h / stdbool.h …）排最前：
+     * 优先按 -B 给的目录，其次按 argv[0] 所在目录，最后按源码树相对路径。 */
+    if (C6C_SELF_DIR[0]) {
+        snprintf(bd, sizeof(bd), "%s/include", C6C_SELF_DIR);
+        if (NINCDIR < MAX_INCDIRS)
+            INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+        snprintf(bd, sizeof(bd), "%s/../include", C6C_SELF_DIR);
+        if (NINCDIR < MAX_INCDIRS)
+            INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+    }
+    snprintf(bd, sizeof(bd), "%s/include", O.bdir);
+    if (NINCDIR < MAX_INCDIRS)
+        INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+    if (NINCDIR < MAX_INCDIRS)
+        INCDIR[NINCDIR++] = "/usr/local/include";
+    if (NINCDIR < MAX_INCDIRS)
+        INCDIR[NINCDIR++] = "/usr/include/x86_64-linux-gnu";
+    if (NINCDIR < MAX_INCDIRS)
+        INCDIR[NINCDIR++] = "/usr/include";
+    if (O.verbose) {
+        int k = 0;
+
+        fprintf(stderr, "c6c: include 目录 %d 个：", NINCDIR);
+        for (k = 0; k < NINCDIR; k++)
+            fprintf(stderr, " %s", INCDIR[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
+int main(int argc, char **argv)
+{
+    pp_init_time();
+    double t0 = 0.0, ms = 0.0;
+    int i = 0;
+
+    if (argc > 0 && argv[0] && argv[0][0])
+        progname = argv[0];
+    if (parse_args(argc, argv) < 0)
+        return 2;
+    if (O.nfiles == 0) {
+        usage(stderr);
+        return 2;
+    }
+    setup_self_dir(argv[0]);
+    setup_incdirs();
+
+    switch (O.mode) {
+    case M_OBJ:
+    case M_EXE: {
+        /* 现在两个模式都出"可直接执行的 ELF"，区别只有带不带自带运行时。
+         * 真正的 ET_REL 目标文件 + 自己的链接器在 P4 落地。 */
+        SrcFile *sf = NULL;
+        int rc = 0;
+
+        /* 多个源文件：按命令行顺序依次压进预处理器的文件栈，等于把它们
+         * 接连编成同一个 TU（和 `import` 的 `#include` 展开同一个模型）。
+         * 真正的 ET_REL 目标文件 + 链接器还没做，这里先保证 c6 那套
+         * "主文件 + tests/tu/*.c6 实现单元"能在一次调用里编出来。 */
+        pp_reset();
+        {
+            int fi = O.nfiles - 1;
+
+            for (; fi >= 0; fi--) {
+                sf = src_load(O.files[fi]);
+                if (!sf) {
+                    diag_error_plain("打不开源文件 '%s'", O.files[fi]);
+                    return 2;
+                }
+                pp_push_file(sf, -1);
+            }
+        }
+        push_defines();
+        rc = pa_compile_ex(O.out ? O.out : "a.out", argv[0],
+                           O.mode == M_EXE && !O.nostdlib);
+        if (O.verbose)
+            mod_report();
+        return rc;
+    }
+    case M_SCAN: {
+        /* 只做预处理 + 词法：不出码、不做语法分析，只数 token 报速度 */
+        SrcFile *sf = NULL;
+        double ms = 0.0;
+
+        if (O.nfiles > 1) {
+            diag_error_plain("--scan 一次一个文件");
+            return 2;
+        }
+        sf = src_load(O.files[0]);
+        if (!sf) {
+            diag_error_plain("打不开源文件 '%s'", O.files[0]);
+            return 2;
+        }
+        pp_reset();
+        pp_push_file(sf, -1);
+        push_defines();
+        t0 = now_ms();
+        for (;;) {
+            Tok t = {0};
+
+            if (pp_next(&t) == TK_EOF)
+                break;
+            ST_tok++;
+            if (t.kind >= 0 && t.kind < 8)
+                ST_kind[t.kind]++;
+        }
+        ms = now_ms() - t0;
+        stat_totals();
+        print_stats(ms);
+        return DG.errors ? 1 : 0;
+    }
+    case M_CHECK: {
+        SrcFile *sf = NULL;
+
+        if (O.nfiles < 1) {
+            diag_error_plain("没有输入文件");
+            return 2;
+        }
+        /* 和 M_EXE/M_OBJ 一样：命令行上有几个源文件就压几个。跨翻译单元的
+         * 检查（引用环这类要整个程序的）只有把第二个单元也解析出来才看得见
+         * —— 以前这里只读 O.files[0]，`-fsyntax-only a.c6 b.c6` 静默丢掉
+         * b.c6（tests/errors/gc_cycle_cross_tu.c6 + tests/tu/ 那两个文件）。 */
+        pp_reset();
+        {
+            int fi = O.nfiles - 1;
+
+            for (; fi >= 0; fi--) {
+                sf = src_load(O.files[fi]);
+                if (!sf) {
+                    diag_error_plain("打不开源文件 '%s'", O.files[fi]);
+                    return 2;
+                }
+                pp_push_file(sf, -1);
+            }
+        }
+        push_defines();
+        /* 真做语法检查：完整跑一遍前端（不写输出、不要求 main）。
+         * 自带运行时**要照样带**：不带的话 printf/setenv/fork 这些声明就看不见，
+         * `-fsyntax-only` 会把一堆本来没问题的模块判死（std 的 153 个模块全靠
+         * 这条路径量，口径错了数就是假的）。 */
+        PA_SYNTAX_ONLY = 1;
+        return pa_compile_ex(0, argv[0], !O.nostdlib);
+    }
+    default:
+        break;
+    }
+
+    OUTBUF.cap = 1024 * 1024;
+    OUTBUF.buf = malloc(OUTBUF.cap);
+    OUTBUF.n = 0;
+    if (!OUTBUF.buf) {
+        diag_error_plain("分配输出缓冲失败");
+        return 2;
+    }
+
+    t0 = now_ms();
+    if (O.mode == M_E) {
+        for (i = 0; i < O.nfiles; i++) {
+            pp_reset();
+            emit_one(O.files[i]);
+        }
+        out_flush(&OUTBUF);
+    } else {
+        for (i = 0; i < O.nfiles; i++) {
+            pp_reset();
+            scan_one(O.files[i]);
+        }
+    }
+    ms = now_ms() - t0;
+
+    stat_totals();
+    if (O.mode != M_E)
+        print_stats(ms);
+    if (O.verbose)
+        arena_report();
+    if (DG.errors) {
+        fprintf(stderr, "c6c: %d 个错误\n", DG.errors);
+        return 1;
+    }
+    return 0;
+}

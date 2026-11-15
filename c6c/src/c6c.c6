@@ -1,0 +1,51 @@
+/* c6c.c6 —— c6c 的 stage1 入口：单 TU 引导（C6-BOOT 子集）
+ *
+ * 为什么是单 TU 而不是一模块一文件：
+ *   stage1 要能被 tcc/c6 编出来，而 tcc 的单趟编译对“先声明后用”有顺序要求；
+ *   拆成多 TU 会引入 .c6i 模块接口（P4-4）这一层，把引导链拖长。
+ *   所以 P1–P3b 全部走单 TU，std/ 与外部模块才用 import/.c6i。
+ *
+ * 只 include 系统头（不用 tcc/*.h）：目录边界由 make c6c-lint 机器检查。
+ *
+ * 构建：
+ *   ../tcc/c6 -B ../tcc -o build/c6c src/c6c.c6
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int32_t i32;
+typedef int64_t i64;
+
+#include "arena.c6"
+#include "mod.c6"
+#include "src.c6"
+#include "diag.c6"
+#include "ir.c6"
+#include "type.c6"
+#include "elf.c6"
+#include "asmblob.c6"
+#include "x64.c6"
+#include "asmx.c6"
+#include "c99.c6"
+#include "lex.c6"
+#include "macro.c6"
+#include "pp.c6"
+#include "sym.c6"
+#include "parse.c6"
+#include "llvm.c6"
+#include "main.c6"

@@ -1,0 +1,1381 @@
+/* asmx.c6 —— 内联汇编（`asm` / `__asm__`）的 x86-64 迷你汇编器（native 后端用）。
+ *
+ * 为什么要有这一层：自举链上不许依赖外部 as/gcc，而 tcc 的 tests2 里有一批
+ * 用例靠 asm 定义符号（85 的 vide、98 的 _us/_ss/_uc/_sc）或靠 `asm goto`
+ * 跳进 C 标号（127）。以前 __asm__ 被整段吃掉，这些用例就成了"缺外部符号"
+ * 或者行为不对。
+ *
+ * 范围：只翻**够用**的子集（标签、常见指令、常见指示符）。翻不动就整段放弃
+ * ——调用方保持老行为（静默丢弃）。绝不能因为汇编里有一句不认识就把本来能
+ * 编过的用例变成编不过（99_fastcall 的 i386 代码就是这种，跳过即可）。
+ *
+ * 三段流水：
+ *   asmx_piece()  解析一段汇编文本 → 字节 + 重定位项（进全局表）
+ *   asmx_flush()  把某段字节放进代码镜像：登记标签符号、落重定位
+ * 文件作用域 asm 解析完立刻 flush（此刻代码镜像正好停在这个位置）；
+ * 函数内 asm 走 IR 里的一个标记（见 parse.c6 的 try_stmt_asm），出码时 flush。
+ *
+ * 两条容易踩的线：
+ *   1. 外部重定位记的是**相对本段起点**的偏移。段的落点要等 flush 才知道
+ *      （前面还有别的函数的代码），所以翻译时不能把绝对偏移写死。
+ *   2. 段内自己的标号（`1:`、`.Lx:`、`vide:`）在**翻译期**就地回填：它们和
+ *      引用同处一段，段整体搬走时相对距离不变。
+ */
+
+#define AXK_NONE 0
+#define AXK_REG  1
+#define AXK_IMM  2
+#define AXK_MEM  3
+#define AXK_SYM  4      /* 光秃秃的符号：分支目标 */
+#define AXK_GOTO 5      /* `%l[name]`：asm goto 的 C 标号 */
+
+/* 一条外部重定位：kind 0 = 符号（走 X64.fix，按 rel32 回填），
+ * kind 1 = 函数内标号（走 X64.lbl_fix，由 x64_patch_labels 回填）。 */
+typedef struct AxFix {
+    u32 at;
+    u32 sym;
+    u32 lbl;
+    u8 kind;
+} AxFix;
+
+/* 本段定义出来的符号（标签）：flush 时登记成 x64 符号 */
+typedef struct AxRef {
+    const char *name;
+    u32 at;
+} AxRef;
+
+typedef struct AxPiece {
+    const u8 *code;
+    u32 len;
+    u32 fix0;
+    u32 nfix;
+    u32 ref0;
+    u32 nref;
+} AxPiece;
+
+/* 操作数绑定（函数内 asm 的 %0/%1…）：把帧槽装进一个物理寄存器，
+ * 需要写回的（输出约束）在段尾再存回去。帧槽布局见 X64_SLOT。 */
+typedef struct AxBind {
+    u32 disp;
+    int reg;
+    int store;
+} AxBind;
+
+/* asm goto 的标号名 → 函数内标号 id */
+typedef struct AxGoto {
+    const char *name;
+    u32 id;
+} AxGoto;
+
+#define AX_MAXPIECE 512
+#define AX_MAXFIX  4096
+#define AX_MAXREF  2048
+#define AX_MAXLBL  96
+#define AX_MAXLFIX 256
+#define AX_MAXBIND 6
+#define AX_MAXGOTO 16
+
+static AxFix AX_FIX[AX_MAXFIX];
+static u32 NAXFIX;
+static AxRef AX_REF[AX_MAXREF];
+static u32 NAXREF;
+static AxPiece AX_PIECE[AX_MAXPIECE];
+static u32 NAXPIECE;
+
+/* 翻译期状态 */
+static Image AX_IM;                 /* 当前段的字节 */
+static int AX_BAD;                  /* 翻不动：整段作废 */
+static u32 AX_FIX0;                 /* 本段第一个外部重定位的下标 */
+static u32 AX_REF0;                 /* 本段第一个符号定义的下标 */
+static const char *AX_LNAME[AX_MAXLBL];
+static u32 AX_LOFF[AX_MAXLBL];
+static int AX_LDEF[AX_MAXLBL];
+static u32 AX_NLBL;
+static u32 AX_LFIXAT[AX_MAXLFIX];
+static u32 AX_LFIXL[AX_MAXLFIX];
+static u32 AX_NLFIX;
+
+static const AxBind *AX_BIND;
+static u32 AX_NBIND;
+static const AxGoto *AX_GOTO;
+static u32 AX_NGOTO;
+
+static const char *AX_P;
+static const char *AX_E;
+static char AX_WBUF[160];
+static u32 AX_WLEN;
+
+/* 操作数 */
+typedef struct AxOp {
+    int kind;
+    int reg;            /* AXK_REG 的寄存器号 / AXK_MEM 的基址 */
+    int size;           /* 位宽 8/16/32/64（寄存器名自带的宽度） */
+    int idx;            /* AXK_MEM 的 index，-1 = 没有 */
+    int scale;
+    int rip;
+    int indirect;
+    int have_disp;
+    int disp;           /* 只支持 32 位范围内的位移（够用） */
+    const char *sym;
+    u32 symlen;
+} AxOp;
+
+/* ---- 寄存器表 ---------------------------------------------------------- */
+
+static const char *const AX_RN64[16] = {
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+};
+static const char *const AX_RN32[16] = {
+    "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
+    "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"
+};
+static const char *const AX_RN16[16] = {
+    "ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
+    "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"
+};
+static const char *const AX_RN8[16] = {
+    "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil",
+    "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"
+};
+
+/* AX_WBUF（长 AX_WLEN）和字面量相等？ */
+static int ax_w_is(const char *s)
+{
+    u32 n = 0;
+
+    if (strlen(s) != AX_WLEN)
+        return 0;
+    for (n = 0; n < AX_WLEN; n++)
+        if (s[n] != AX_WBUF[n])
+            return 0;
+    return 1;
+}
+
+/* 寄存器名 → 号（失败 -1），宽度写进 *size */
+static int ax_reg_of(int *size)
+{
+    int k = 0;
+
+    for (k = 0; k < 16; k++) {
+        if (ax_w_is(AX_RN64[k])) {
+            *size = 64;
+            return k;
+        }
+        if (ax_w_is(AX_RN32[k])) {
+            *size = 32;
+            return k;
+        }
+        if (ax_w_is(AX_RN16[k])) {
+            *size = 16;
+            return k;
+        }
+        if (ax_w_is(AX_RN8[k])) {
+            *size = 8;
+            return k;
+        }
+    }
+    return -1;
+}
+
+/* ---- 文本扫描 ---------------------------------------------------------- */
+
+static void ax_sp(void)
+{
+    while (AX_P < AX_E && (*AX_P == ' ' || *AX_P == '\t' || *AX_P == '\r'))
+        AX_P++;
+}
+
+/* 跳过语句分隔符与 `#` 注释 */
+static void ax_sep(void)
+{
+    for (;;) {
+        if (AX_P >= AX_E)
+            return;
+        if (*AX_P == ' ' || *AX_P == '\t' || *AX_P == '\r' || *AX_P == '\n'
+            || *AX_P == ';' || *AX_P == ',') {
+            AX_P++;
+            continue;
+        }
+        if (*AX_P == '#') {
+            while (AX_P < AX_E && *AX_P != '\n')
+                AX_P++;
+            continue;
+        }
+        return;
+    }
+}
+
+/* 跳到本行剩余部分（不认识但可以忽略的指示符用） */
+static void ax_eol(void)
+{
+    while (AX_P < AX_E && *AX_P != '\n' && *AX_P != ';' && *AX_P != '#')
+        AX_P++;
+}
+
+static int ax_ch_ident(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+           || c == '_' || c == '.' || c == '$';
+}
+
+/* 读一个标识符到 AX_WBUF */
+static int ax_word(void)
+{
+    AX_WLEN = 0;
+    ax_sp();
+    while (AX_P < AX_E && ax_ch_ident(*AX_P)) {
+        if (AX_WLEN + 1 < sizeof(AX_WBUF))
+            AX_WBUF[AX_WLEN++] = *AX_P;
+        AX_P++;
+    }
+    AX_WBUF[AX_WLEN] = 0;
+    return AX_WLEN > 0;
+}
+
+/* 数字（十进制/十六进制，带可选符号）*/
+static int ax_num(int *out)
+{
+    int v = 0;
+    int neg = 0;
+    int any = 0;
+
+    ax_sp();
+    if (AX_P < AX_E && (*AX_P == '-' || *AX_P == '+')) {
+        neg = (*AX_P == '-');
+        AX_P++;
+        ax_sp();
+    }
+    if (AX_P >= AX_E)
+        return 0;
+    if (*AX_P == '0' && AX_P + 1 < AX_E && (AX_P[1] == 'x' || AX_P[1] == 'X')) {
+        AX_P += 2;
+        for (;;) {
+            int d = -1;
+            char c = 0;
+
+            if (AX_P >= AX_E)
+                break;
+            c = *AX_P;
+            if (c >= '0' && c <= '9')
+                d = c - '0';
+            else if (c >= 'a' && c <= 'f')
+                d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F')
+                d = c - 'A' + 10;
+            if (d < 0)
+                break;
+            v = v * 16 + d;
+            AX_P++;
+            any = 1;
+        }
+    } else if (*AX_P >= '0' && *AX_P <= '9') {
+        while (AX_P < AX_E && *AX_P >= '0' && *AX_P <= '9') {
+            v = v * 10 + (*AX_P - '0');
+            AX_P++;
+            any = 1;
+        }
+    }
+    if (!any)
+        return 0;
+    *out = neg ? -v : v;
+    return 1;
+}
+
+/* ---- 输出辅助 ---------------------------------------------------------- */
+
+static void ax_rex(int w, int r, int x, int b)
+{
+    x_rex(&AX_IM, w, r, x, b);
+}
+
+/* rel32 落点：立刻占 4 字节，回填留到后面 */
+static void ax_fix_sym(const char *name, u32 n)
+{
+    if (NAXFIX >= AX_MAXFIX) {
+        AX_BAD = 1;
+        img_u32(&AX_IM, 0);
+        return;
+    }
+    AX_FIX[NAXFIX].at = AX_IM.n;
+    AX_FIX[NAXFIX].sym = x64_sym(&X64, arena_strndup(&A_main, name, n));
+    AX_FIX[NAXFIX].lbl = 0;
+    AX_FIX[NAXFIX].kind = 0;
+    NAXFIX++;
+    img_u32(&AX_IM, 0);
+}
+
+static void ax_fix_lbl(u32 id)
+{
+    if (NAXFIX >= AX_MAXFIX) {
+        AX_BAD = 1;
+        img_u32(&AX_IM, 0);
+        return;
+    }
+    AX_FIX[NAXFIX].at = AX_IM.n;
+    AX_FIX[NAXFIX].sym = 0;
+    AX_FIX[NAXFIX].lbl = id;
+    AX_FIX[NAXFIX].kind = 1;
+    NAXFIX++;
+    img_u32(&AX_IM, 0);
+}
+
+/* 段内标号的引用：排队到段尾一起回填 */
+static void ax_fix_local(u32 li)
+{
+    if (AX_NLFIX >= AX_MAXLFIX) {
+        AX_BAD = 1;
+        img_u32(&AX_IM, 0);
+        return;
+    }
+    AX_LFIXAT[AX_NLFIX] = AX_IM.n;
+    AX_LFIXL[AX_NLFIX] = li;
+    AX_NLFIX++;
+    img_u32(&AX_IM, 0);
+}
+
+/* 查段内标号；没有返回 -1 */
+static int ax_lbl_find(const char *name, u32 n, int make)
+{
+    u32 i = 0;
+
+    for (i = 0; i < AX_NLBL; i++)
+        if (strlen(AX_LNAME[i]) == n && memcmp(AX_LNAME[i], name, n) == 0)
+            return (int)i;
+    if (!make || AX_NLBL >= AX_MAXLBL)
+        return -1;
+    AX_LNAME[AX_NLBL] = arena_strndup(&A_main, name, n);
+    AX_LOFF[AX_NLBL] = 0;
+    AX_LDEF[AX_NLBL] = 0;
+    AX_NLBL++;
+    return (int)(AX_NLBL - 1);
+}
+
+/* ---- 操作数解析 -------------------------------------------------------- */
+
+static int ax_operand(AxOp *o);
+
+/* `disp(%base,%idx,scale)` / `(%base)` / `sym(%rip)`：AX_P 停在 '(' */
+static int ax_mem_rest(AxOp *o)
+{
+    if (AX_P >= AX_E || *AX_P != '(')
+        return 1;
+    AX_P++;
+    o->kind = AXK_MEM;
+    ax_sp();
+    if (AX_P < AX_E && *AX_P == '%') {
+        AX_P++;
+        if (!ax_word())
+            return 0;
+        if (ax_w_is("rip") || ax_w_is("eip")) {
+            o->rip = 1;
+        } else {
+            int sz = 0;
+            int r = ax_reg_of(&sz);
+
+            if (r < 0)
+                return 0;
+            o->reg = r;
+            o->size = sz;
+        }
+    }
+    ax_sp();
+    while (AX_P < AX_E && *AX_P == ',') {
+        AX_P++;
+        ax_sp();
+        if (AX_P < AX_E && *AX_P == '%') {
+            int sz = 0;
+            int r = 0;
+
+            AX_P++;
+            if (!ax_word())
+                return 0;
+            r = ax_reg_of(&sz);
+            if (r < 0)
+                return 0;
+            o->idx = r;
+        }
+        ax_sp();
+        if (AX_P < AX_E && *AX_P == ',') {
+            AX_P++;
+            if (!ax_num(&o->scale))
+                return 0;
+        }
+        ax_sp();
+    }
+    if (AX_P >= AX_E || *AX_P != ')')
+        return 0;
+    AX_P++;
+    return 1;
+}
+
+/* 第一个操作数：`$imm` / `%reg` / `%l[name]` / `mem` / `sym` */
+static int ax_operand(AxOp *o)
+{
+    memset(o, 0, sizeof(AxOp));
+    o->kind = AXK_NONE;
+    o->reg = -1;
+    o->idx = -1;
+    o->scale = 1;
+    ax_sp();
+    if (AX_P >= AX_E)
+        return 0;
+    if (*AX_P == '*') {
+        o->indirect = 1;
+        AX_P++;
+        ax_sp();
+    }
+    if (AX_P >= AX_E)
+        return 0;
+    if (*AX_P == '$') {
+        AX_P++;
+        o->kind = AXK_IMM;
+        if (!ax_num(&o->disp))
+            return 0;
+        o->have_disp = 1;
+        return 1;
+    }
+    if (*AX_P == '%') {
+        /* `%l[name]`：asm goto 的 C 标号 */
+        if (AX_P + 2 < AX_E && AX_P[1] == 'l' && AX_P[2] == '[') {
+            u32 n = 0;
+
+            AX_P += 3;
+            while (AX_P < AX_E && *AX_P != ']' && n + 1 < sizeof(AX_WBUF))
+                AX_WBUF[n++] = *AX_P++;
+            AX_WBUF[n] = 0;
+            if (AX_P < AX_E && *AX_P == ']')
+                AX_P++;
+            o->kind = AXK_GOTO;
+            o->sym = arena_strndup(&A_main, AX_WBUF, n);
+            o->symlen = n;
+            return 1;
+        }
+        AX_P++;
+        if (!ax_word())
+            return 0;
+        {
+            int sz = 0;
+            int r = ax_reg_of(&sz);
+
+            if (r < 0)
+                return 0;
+            o->kind = AXK_REG;
+            o->reg = r;
+            o->size = sz;
+        }
+        return 1;
+    }
+    if (*AX_P == '(')
+        return ax_mem_rest(o);
+    if (*AX_P == '-' || (*AX_P >= '0' && *AX_P <= '9')) {
+        if (!ax_num(&o->disp))
+            return 0;
+        o->have_disp = 1;
+        ax_sp();
+        if (AX_P < AX_E && *AX_P == '(')
+            return ax_mem_rest(o);
+        o->kind = AXK_IMM;
+        return 1;
+    }
+    /* 符号：分支目标，或者 `sym(%rip)` */
+    if (!ax_word())
+        return 0;
+    o->sym = arena_strndup(&A_main, AX_WBUF, AX_WLEN);
+    o->symlen = AX_WLEN;
+    o->kind = AXK_SYM;
+    ax_sp();
+    if (AX_P < AX_E && *AX_P == '(') {
+        o->kind = AXK_MEM;
+        return ax_mem_rest(o);
+    }
+    return 1;
+}
+
+/* ---- ModRM ------------------------------------------------------------ */
+
+/* REX 必须在 opcode **之前**：先调这个，再写 opcode，最后 ax_rm 写 ModRM。
+ * （踩过：把 REX 和 ModRM 一起写在 opcode 后面，`cmp $0, %r11d` 编成了
+ *  `83 41 fb 00` —— 0x41 被当成 ModRM，整条指令变成 `cmp [rcx-5], 0`，于是
+ *  asm goto 一执行就踩到野地址直接段错误。） */
+static void ax_rex_for(int regf, AxOp *m, int w)
+{
+    if (m->kind == AXK_REG) {
+        ax_rex(w, regf, 0, m->reg);
+        return;
+    }
+    if (m->kind == AXK_MEM && !m->rip && m->reg >= 0) {
+        ax_rex(w, regf, m->idx >= 0 ? m->idx : 0, m->reg);
+        return;
+    }
+    ax_rex(w, regf, 0, 0);
+}
+
+/* 只写 ModRM/SIB/disp（REX 由 ax_rex_for 提前发）*/
+static void ax_rm(int regf, AxOp *m)
+{
+    if (m->kind == AXK_REG) {
+        x_modrm(&AX_IM, 3, regf, m->reg & 7);
+        return;
+    }
+    if (m->kind != AXK_MEM && m->kind != AXK_SYM) {
+        AX_BAD = 1;
+        return;
+    }
+    if (m->rip) {
+        x_modrm(&AX_IM, 0, regf, 5);
+        if (m->sym)
+            ax_fix_sym(m->sym, m->symlen);
+        else
+            img_u32(&AX_IM, 0);
+        return;
+    }
+    if (m->kind == AXK_SYM || m->reg < 0) {
+        /* 绝对地址 disp32：要 abs32 重定位，后端没有 → 放弃整段 */
+        x_modrm(&AX_IM, 0, regf, 4);
+        x_sib(&AX_IM, 0, 4, 5);
+        img_u32(&AX_IM, (u32)m->disp);
+        if (m->kind == AXK_SYM)
+            AX_BAD = 1;
+        return;
+    }
+    {
+        int b = m->reg;
+        int x = m->idx;
+        int need_sib = ((b & 7) == 4) || (x >= 0);
+        int mod = 0;
+        u32 d = (u32)m->disp;
+
+        if (m->have_disp && m->disp != 0)
+            mod = (m->disp >= -128 && m->disp <= 127) ? 1 : 2;
+        else if ((b & 7) == 5)
+            mod = 1;                /* rbp/r13 没有 mod=00 的编码 */
+        x_modrm(&AX_IM, mod, regf, need_sib ? 4 : (b & 7));
+        if (need_sib)
+            x_sib(&AX_IM, x >= 0 ? m->scale : 0, x >= 0 ? x : 4, b & 7);
+        if (mod == 1)
+            img_u8(&AX_IM, d & 0xff);
+        else if (mod == 2)
+            img_u32(&AX_IM, d);
+    }
+}
+
+/* opcode(+ModRM) 形式：[0x66][REX][op1][op2][ModRM/SIB/disp] */
+static void ax_emit_rm(u8 op1, u8 op2, int regf, AxOp *m, int w, int p66)
+{
+    if (p66)
+        img_u8(&AX_IM, 0x66);
+    ax_rex_for(regf, m, w);
+    if (op1)
+        img_u8(&AX_IM, op1);
+    if (op2)
+        img_u8(&AX_IM, op2);
+    ax_rm(regf, m);
+}
+
+/* 立即数（宽度按 size）*/
+static void ax_imm(int v, int size)
+{
+    if (size == 8)
+        img_u8(&AX_IM, (u32)v);
+    else if (size == 16)
+        img_u16(&AX_IM, (u32)v);
+    else
+        img_u32(&AX_IM, (u32)v);
+}
+
+/* ---- 指令 ------------------------------------------------------------- */
+
+/* 条件码：返回 0..15，未知 -1。两套别名（b/c/nae、ge/nl…）一起认。 */
+static int ax_cc(void)
+{
+    static const char *const N[16] = {
+        "o", "no", "b", "ae", "e", "ne", "be", "a",
+        "s", "ns", "p", "np", "l", "ge", "le", "g"
+    };
+    static const char *const N2[16] = {
+        "o", "no", "c", "nb", "z", "nz", "na", "nbe",
+        "s", "ns", "pe", "po", "nge", "nl", "ng", "nle"
+    };
+    int i = 0;
+
+    for (i = 0; i < 16; i++)
+        if (ax_w_is(N[i]) || ax_w_is(N2[i]))
+            return i;
+    return -1;
+}
+
+/* 分支目标（jmp/jcc/call）*/
+static int ax_branch(AxOp *t, u8 opc_near, int cc)
+{
+    u32 k = 0;
+
+    if (cc >= 0) {
+        img_u8(&AX_IM, 0x0F);
+        img_u8(&AX_IM, (u32)(0x80 + cc));
+    } else {
+        img_u8(&AX_IM, opc_near);
+    }
+    if (t->kind == AXK_GOTO) {
+        for (k = 0; k < AX_NGOTO; k++)
+            if (strlen(AX_GOTO[k].name) == t->symlen
+                && memcmp(AX_GOTO[k].name, t->sym, t->symlen) == 0) {
+                ax_fix_lbl(AX_GOTO[k].id);
+                return 1;
+            }
+        AX_BAD = 1;
+        img_u32(&AX_IM, 0);
+        return 1;
+    }
+    if (t->kind == AXK_SYM) {
+        int li = ax_lbl_find(t->sym, t->symlen, 0);
+
+        if (li >= 0)
+            ax_fix_local((u32)li);
+        else
+            ax_fix_sym(t->sym, t->symlen);
+        return 1;
+    }
+    if (t->indirect && (t->kind == AXK_REG || t->kind == AXK_MEM)) {
+        /* `jmp *%rax` (FF /4) / `call *%rax` (FF /2) */
+        ax_emit_rm(0xFF, 0, (cc >= 0 || opc_near == 0xE8) ? 2 : 4, t, 0, 0);
+        return 1;
+    }
+    return 0;
+}
+
+/* 二元 ALU：ext 是 0x80/0x81/0x83 组的扩展号，base 是 00/08/… 那族 */
+static int ax_alu2(int ext, int base, AxOp *s, AxOp *d, int size)
+{
+    if (s->kind == AXK_IMM) {
+        if (size == 8) {
+            ax_emit_rm(0x80, 0, ext, d, 0, 0);
+            img_u8(&AX_IM, (u32)s->disp);
+            return 1;
+        }
+        if (s->disp >= -128 && s->disp <= 127) {
+            ax_emit_rm(0x83, 0, ext, d, size == 64, size == 16);
+            img_u8(&AX_IM, (u32)s->disp);
+        } else {
+            ax_emit_rm(0x81, 0, ext, d, size == 64, size == 16);
+            ax_imm(s->disp, 32);
+        }
+        return 1;
+    }
+    if (s->kind == AXK_REG && (d->kind == AXK_REG || d->kind == AXK_MEM)) {
+        ax_emit_rm((u8)(base + 1), 0, s->reg, d, size == 64, size == 16);
+        return 1;
+    }
+    if ((s->kind == AXK_MEM || s->kind == AXK_SYM) && d->kind == AXK_REG) {
+        ax_emit_rm((u8)(base + 3), 0, d->reg, s, size == 64, size == 16);
+        return 1;
+    }
+    return 0;
+}
+
+/* F6/F7 组：0=inc 1=dec（其实是 FF）2=not 3=neg 4=mul 5=imul 6=div 7=idiv */
+static int ax_un(int ext, AxOp *d, int size)
+{
+    if (ext <= 1) {
+        ax_emit_rm(0xFF, 0, ext, d, size == 64, size == 16);
+        return 1;
+    }
+    ax_emit_rm((u8)(size == 8 ? 0xF6 : 0xF7), 0, ext, d, size == 64, size == 16);
+    return 1;
+}
+
+/* 位移：ext 4=shl 5=shr 7=sar 0=rol 1=ror */
+static int ax_shift(int ext, AxOp *cnt, AxOp *d, int size)
+{
+    if (cnt->kind == AXK_REG && cnt->reg == 1 && cnt->size == 8) {
+        ax_emit_rm((u8)(size == 8 ? 0xD2 : 0xD3), 0, ext, d, size == 64, size == 16);
+        return 1;
+    }
+    if (cnt->kind == AXK_IMM) {
+        ax_emit_rm((u8)(size == 8 ? 0xC0 : 0xC1), 0, ext, d, size == 64, size == 16);
+        img_u8(&AX_IM, (u32)(cnt->disp & 0xff));
+        return 1;
+    }
+    return 0;
+}
+
+/* movzx / movsx：源宽度 sw，目的宽度 dw */
+static int ax_movx(int sign, AxOp *s, AxOp *d, int sw, int dw)
+{
+    u8 op2 = 0;
+
+    if (d->kind != AXK_REG)
+        return 0;
+    if (sw == 4 && dw == 8) {
+        if (!sign)
+            return 0;
+        ax_emit_rm(0x63, 0, d->reg, s, 1, 0);   /* movsxd r64, r/m32 */
+        return 1;
+    }
+    if (sw != 1 && sw != 2)
+        return 0;
+    if (sw == 1)
+        op2 = sign ? 0xBE : 0xB6;
+    else
+        op2 = sign ? 0xBF : 0xB7;
+    /* 目的宽度 16 时不加 0x66：那会把目的寄存器变成 16 位，高位留旧值
+     *（x64.c6 里踩过同一个坑） */
+    ax_emit_rm(0x0F, op2, d->reg, s, dw == 64, 0);
+    return 1;
+}
+
+static int ax_mov(AxOp *s, AxOp *d, int size)
+{
+    if (s->kind == AXK_IMM) {
+        if (d->kind == AXK_REG) {
+            if (size == 8) {
+                ax_rex(0, 0, 0, d->reg);
+                img_u8(&AX_IM, (u32)(0xB0 + (d->reg & 7)));
+                img_u8(&AX_IM, (u32)s->disp);
+            } else if (size == 64) {
+                ax_rex(1, 0, 0, d->reg);
+                img_u8(&AX_IM, 0xC7);
+                x_modrm(&AX_IM, 3, 0, d->reg & 7);
+                img_u32(&AX_IM, (u32)s->disp);
+            } else {
+                if (size == 16)
+                    img_u8(&AX_IM, 0x66);
+                ax_rex(0, 0, 0, d->reg);
+                img_u8(&AX_IM, (u32)(0xB8 + (d->reg & 7)));
+                ax_imm(s->disp, size);
+            }
+            return 1;
+        }
+        if (d->kind == AXK_MEM || d->kind == AXK_SYM) {
+            ax_emit_rm((u8)(size == 8 ? 0xC6 : 0xC7), 0, 0, d, size == 64, size == 16);
+            ax_imm(s->disp, size == 8 ? 8 : 32);
+            return 1;
+        }
+        return 0;
+    }
+    if (s->kind == AXK_REG) {
+        ax_emit_rm((u8)(size == 8 ? 0x88 : 0x89), 0, s->reg, d, size == 64, size == 16);
+        return 1;
+    }
+    if (s->kind == AXK_MEM || s->kind == AXK_SYM) {
+        if (d->kind != AXK_REG)
+            return 0;
+        ax_emit_rm((u8)(size == 8 ? 0x8A : 0x8B), 0, d->reg, s, size == 64, size == 16);
+        return 1;
+    }
+    return 0;
+}
+
+/* 带后缀的助记符族（"movl" 的 l、"shlq" 的 q）。先整名查，查不到再剥后缀。 */
+static const char *const AX_FAM[30] = {
+    "mov", "lea", "add", "or", "adc", "sbb", "and", "sub", "xor", "cmp",
+    "test", "inc", "dec", "not", "neg", "mul", "imul", "div", "idiv",
+    "shl", "sal", "shr", "sar", "rol", "ror", "push", "pop", "xchg", "ret", "nop"
+};
+
+static int ax_fam_id(const char *s)
+{
+    int i = 0;
+
+    for (i = 0; i < 30; i++)
+        if (strcmp(s, AX_FAM[i]) == 0)
+            return i + 1;
+    return 0;
+}
+
+/* 一条指令。助记符在 AX_WBUF/AX_WLEN 里，AX_P 停在它之后 */
+static int ax_insn(void)
+{
+    AxOp o1 = {0};
+    AxOp o2 = {0};
+    AxOp o3 = {0};
+    int size = 0;
+    int cc = -1;
+    char mn[160] = {0};
+    char base[160] = {0};
+    int fam = 0;
+    int isn = 0;
+    u32 k = 0;
+
+    for (k = 0; k < AX_WLEN && k + 1 < sizeof(mn); k++)
+        mn[k] = AX_WBUF[k];
+    mn[k] = 0;
+    ax_sp();
+    if (AX_P < AX_E && *AX_P != '\n' && *AX_P != ';' && *AX_P != '#') {
+        if (!ax_operand(&o1))
+            return 0;
+        ax_sp();
+        if (AX_P < AX_E && *AX_P == ',') {
+            AX_P++;
+            if (!ax_operand(&o2))
+                return 0;
+            ax_sp();
+            if (AX_P < AX_E && *AX_P == ',') {
+                AX_P++;
+                if (!ax_operand(&o3))
+                    return 0;
+            }
+        }
+    }
+    if (o1.kind == AXK_NONE)
+        isn = 0;
+    else if (o2.kind == AXK_NONE)
+        isn = 1;
+    else if (o3.kind == AXK_NONE)
+        isn = 2;
+    else
+        isn = 3;
+
+    /* 位宽：寄存器操作数优先，其次助记符后缀 */
+    if (o2.kind == AXK_REG)
+        size = o2.size;
+    else if (o1.kind == AXK_REG)
+        size = o1.size;
+    else
+        size = 32;
+
+    /* 无操作数的（先认整名，别名也认） */
+    if (strcmp(mn, "ret") == 0) {
+        if (isn >= 1 && o1.kind == AXK_IMM) {
+            img_u8(&AX_IM, 0xC2);
+            img_u16(&AX_IM, (u32)o1.disp);
+        } else {
+            img_u8(&AX_IM, 0xC3);
+        }
+        return 1;
+    }
+    if (strcmp(mn, "nop") == 0) {
+        img_u8(&AX_IM, 0x90);
+        return 1;
+    }
+    if (strcmp(mn, "hlt") == 0) {
+        img_u8(&AX_IM, 0xF4);
+        return 1;
+    }
+    if (strcmp(mn, "leave") == 0) {
+        img_u8(&AX_IM, 0xC9);
+        return 1;
+    }
+    if (strcmp(mn, "int3") == 0) {
+        img_u8(&AX_IM, 0xCC);
+        return 1;
+    }
+    if (strcmp(mn, "cld") == 0) {
+        img_u8(&AX_IM, 0xFC);
+        return 1;
+    }
+    if (strcmp(mn, "std") == 0) {
+        img_u8(&AX_IM, 0xFD);
+        return 1;
+    }
+    if (strcmp(mn, "syscall") == 0) {
+        img_u8(&AX_IM, 0x0F);
+        img_u8(&AX_IM, 0x05);
+        return 1;
+    }
+    if (strcmp(mn, "cqto") == 0 || strcmp(mn, "cltd") == 0 || strcmp(mn, "cqo") == 0) {
+        img_u8(&AX_IM, 0x48);
+        img_u8(&AX_IM, 0x99);
+        return 1;
+    }
+    if (strcmp(mn, "cltq") == 0 || strcmp(mn, "cdqe") == 0) {
+        img_u8(&AX_IM, 0x48);
+        img_u8(&AX_IM, 0x98);
+        return 1;
+    }
+    if (strcmp(mn, "jmp") == 0)
+        return ax_branch(&o1, 0xE9, -1);
+    if (strcmp(mn, "call") == 0)
+        return ax_branch(&o1, 0xE8, -1);
+    /* jcc / setcc */
+    if (mn[0] == 'j' && AX_WLEN >= 2) {
+        for (k = 0; k + 1 < sizeof(AX_WBUF) && mn[k + 1]; k++)
+            AX_WBUF[k] = mn[k + 1];
+        AX_WLEN = k;
+        AX_WBUF[k] = 0;
+        cc = ax_cc();
+        if (cc >= 0)
+            return ax_branch(&o1, 0, cc);
+    }
+    if (strncmp(mn, "set", 3) == 0 && AX_WLEN >= 4) {
+        for (k = 0; k + 1 < sizeof(AX_WBUF) && mn[k + 3]; k++)
+            AX_WBUF[k] = mn[k + 3];
+        AX_WLEN = k;
+        AX_WBUF[k] = 0;
+        cc = ax_cc();
+        if (cc >= 0) {
+            ax_emit_rm(0x0F, (u8)(0x90 + cc), 0, &o1, 0, 0);
+            return 1;
+        }
+    }
+
+    /* movz/movs：两个后缀（源宽 + 目的宽），必须在"剥后缀"之前认 */
+    if (strncmp(mn, "movz", 4) == 0 || strncmp(mn, "movs", 4) == 0) {
+        int sign = (mn[3] == 's');
+        int sw = 0;
+        int dw = 32;
+
+        if (strlen(mn) >= 6) {
+            if (mn[4] == 'b')
+                sw = 1;
+            else if (mn[4] == 'w')
+                sw = 2;
+            else if (mn[4] == 'l')
+                sw = 4;
+            if (mn[5] == 'q')
+                dw = 64;
+            else if (mn[5] == 'l')
+                dw = 32;
+            else if (mn[5] == 'w')
+                dw = 16;
+        }
+        if (sw && (sw < dw))
+            return ax_movx(sign, &o1, &o2, sw, dw);
+        return 0;
+    }
+
+    fam = ax_fam_id(mn);
+    if (!fam) {
+        /* 剥一个宽度后缀再认；剥完不认识就还是原文（call/idiv 之类） */
+        u32 n = (u32)strlen(mn);
+        int suf = 0;
+
+        if (n >= 2) {
+            char c = mn[n - 1];
+
+            if (c == 'b')
+                suf = 8;
+            else if (c == 'w')
+                suf = 16;
+            else if (c == 'l')
+                suf = 32;
+            else if (c == 'q')
+                suf = 64;
+        }
+        if (suf) {
+            u32 q = 0;
+
+            for (q = 0; q + 1 < sizeof(base) && q < n - 1; q++)
+                base[q] = mn[q];
+            base[q] = 0;
+            fam = ax_fam_id(base);
+            if (fam) {
+                size = suf;
+                for (q = 0; q + 1 < sizeof(mn) && base[q]; q++)
+                    mn[q] = base[q];
+                mn[q] = 0;
+            } else {
+                return 0;
+            }
+        }
+    }
+    if (!fam)
+        return 0;
+
+    switch (fam) {
+    case 1:
+        return ax_mov(&o1, &o2, size);
+    case 2:                             /* lea */
+        if (o2.kind != AXK_REG)
+            return 0;
+        ax_emit_rm(0x8D, 0, o2.reg, &o1, size == 64, 0);
+        return 1;
+    case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10:
+        return ax_alu2(fam - 3, (fam - 3) * 8, &o1, &o2, size);
+    case 11:                            /* test */
+        if (o1.kind == AXK_IMM) {
+            ax_emit_rm((u8)(size == 8 ? 0xF6 : 0xF7), 0, 0, &o2, size == 64, size == 16);
+            ax_imm(o1.disp, size == 8 ? 8 : 32);
+            return 1;
+        }
+        if (o1.kind == AXK_REG) {
+            ax_emit_rm((u8)(size == 8 ? 0x84 : 0x85), 0, o1.reg, &o2, size == 64,
+                       size == 16);
+            return 1;
+        }
+        return 0;
+    case 12:                            /* inc */
+        return ax_un(0, &o1, size);
+    case 13:                            /* dec */
+        return ax_un(1, &o1, size);
+    case 14:                            /* not */
+        return ax_un(2, &o1, size);
+    case 15:                            /* neg */
+        return ax_un(3, &o1, size);
+    case 16:                            /* mul */
+        return ax_un(4, &o1, size);
+    case 17:                            /* imul */
+        if (isn == 3 && o2.kind == AXK_REG) {
+            int s8 = (o3.disp >= -128 && o3.disp <= 127);
+
+            ax_emit_rm((u8)(s8 ? 0x6B : 0x69), 0, o2.reg, &o1, size == 64, size == 16);
+            ax_imm(o3.disp, s8 ? 8 : 32);
+            return 1;
+        }
+        if (isn == 2 && o2.kind == AXK_REG) {
+            ax_emit_rm(0x0F, 0xAF, o2.reg, &o1, size == 64, 0);
+            return 1;
+        }
+        return ax_un(5, &o1, size);
+    case 18:                            /* div */
+        return ax_un(6, &o1, size);
+    case 19:                            /* idiv */
+        return ax_un(7, &o1, size);
+    case 20: case 21:                   /* shl / sal */
+        return ax_shift(4, &o1, &o2, size);
+    case 22:                            /* shr */
+        return ax_shift(5, &o1, &o2, size);
+    case 23:                            /* sar */
+        return ax_shift(7, &o1, &o2, size);
+    case 24:                            /* rol */
+        return ax_shift(0, &o1, &o2, size);
+    case 25:                            /* ror */
+        return ax_shift(1, &o1, &o2, size);
+    case 26:                            /* push */
+        if (o1.kind == AXK_REG) {
+            ax_rex(0, 0, 0, o1.reg);
+            img_u8(&AX_IM, (u32)(0x50 + (o1.reg & 7)));
+            return 1;
+        }
+        if (o1.kind == AXK_IMM) {
+            if (o1.disp >= -128 && o1.disp <= 127) {
+                img_u8(&AX_IM, 0x6A);
+                img_u8(&AX_IM, (u32)(o1.disp & 0xff));
+            } else {
+                img_u8(&AX_IM, 0x68);
+                img_u32(&AX_IM, (u32)o1.disp);
+            }
+            return 1;
+        }
+        return 0;
+    case 27:                            /* pop */
+        if (o1.kind == AXK_REG) {
+            ax_rex(0, 0, 0, o1.reg);
+            img_u8(&AX_IM, (u32)(0x58 + (o1.reg & 7)));
+            return 1;
+        }
+        return 0;
+    case 28:                            /* xchg */
+        if (o1.kind != AXK_REG)
+            return 0;
+        ax_emit_rm((u8)(size == 8 ? 0x86 : 0x87), 0, o1.reg, &o2, size == 64,
+                   size == 16);
+        return 1;
+    default:
+        return 0;
+    }
+    (void)base;
+}
+
+/* ---- 指示符与标签 ------------------------------------------------------ */
+
+static int ax_directive(void)
+{
+    int v = 0;
+
+    if (ax_w_is(".byte") || ax_w_is(".word") || ax_w_is(".short") || ax_w_is(".value")
+        || ax_w_is(".long") || ax_w_is(".int") || ax_w_is(".quad") || ax_w_is(".8byte")
+        || ax_w_is(".4byte") || ax_w_is(".2byte")) {
+        int sz = 4;
+
+        if (ax_w_is(".byte"))
+            sz = 1;
+        else if (ax_w_is(".word") || ax_w_is(".short") || ax_w_is(".value")
+                 || ax_w_is(".2byte"))
+            sz = 2;
+        else if (ax_w_is(".quad") || ax_w_is(".8byte"))
+            sz = 8;
+        for (;;) {
+            ax_sp();
+            if (AX_P >= AX_E || *AX_P == '\n' || *AX_P == ';' || *AX_P == '#')
+                break;
+            if (!ax_num(&v))
+                return 0;
+            if (sz == 1)
+                img_u8(&AX_IM, (u32)v);
+            else if (sz == 2)
+                img_u16(&AX_IM, (u32)v);
+            else if (sz == 4)
+                img_u32(&AX_IM, (u32)v);
+            else
+                img_u64(&AX_IM, (u64)v);
+            ax_sp();
+            if (AX_P < AX_E && *AX_P == ',')
+                AX_P++;
+        }
+        return 1;
+    }
+    if (ax_w_is(".string") || ax_w_is(".asciz") || ax_w_is(".ascii")) {
+        int z = !ax_w_is(".ascii");
+
+        ax_sp();
+        if (AX_P >= AX_E || *AX_P != '"')
+            return 0;
+        AX_P++;
+        while (AX_P < AX_E && *AX_P != '"') {
+            u32 c = (u32)(u8)*AX_P;
+
+            if (*AX_P == '\\' && AX_P + 1 < AX_E) {
+                AX_P++;
+                c = (u32)(u8)*AX_P;
+                if (c == 'n')
+                    c = 10;
+                else if (c == 't')
+                    c = 9;
+                else if (c == 'r')
+                    c = 13;
+                else if (c == '0')
+                    c = 0;
+                else if (c == '\\')
+                    c = 92;
+                else if (c == '"')
+                    c = 34;
+            }
+            img_u8(&AX_IM, c);
+            AX_P++;
+        }
+        if (AX_P < AX_E && *AX_P == '"')
+            AX_P++;
+        if (z)
+            img_u8(&AX_IM, 0);
+        return 1;
+    }
+    if (ax_w_is(".zero") || ax_w_is(".space") || ax_w_is(".skip")) {
+        u32 n = 0;
+        u32 i = 0;
+
+        if (!ax_num(&v))
+            return 0;
+        n = (u32)(v > 0 ? v : 0);
+        for (i = 0; i < n; i++)
+            img_u8(&AX_IM, 0);
+        return 1;
+    }
+    /* 其余（.globl/.text/.data/.align/.type/.size/.section/.cfi_*…）对这个
+     * 迷你汇编器没有意义：整行吞掉。 */
+    ax_eol();
+    return 1;
+}
+
+/* 定义一个标签（AX_WBUF/AX_WLEN）。 */
+static int ax_def_label(void)
+{
+    int li = -1;
+
+    /* 纯数字标签（`1:`）可以重复出现，我们这个子集不支持 `1f/1b` 引用，
+     * 记下来没有意义，直接当成分隔符。 */
+    if (AX_WBUF[0] >= '0' && AX_WBUF[0] <= '9')
+        return 1;
+    li = ax_lbl_find(AX_WBUF, AX_WLEN, 1);
+    if (li < 0) {
+        AX_BAD = 1;
+        return 1;
+    }
+    AX_LOFF[li] = AX_IM.n;
+    AX_LDEF[li] = 1;
+    /* 非 `.L` 开头的标签是给外面看的符号（C 那边要能调 vide()） */
+    if (AX_WBUF[0] != '.' && NAXREF < AX_MAXREF) {
+        AX_REF[NAXREF].name = arena_strndup(&A_main, AX_WBUF, AX_WLEN);
+        AX_REF[NAXREF].at = AX_IM.n;
+        NAXREF++;
+    }
+    return 1;
+}
+
+/* 一行：标签 / 指示符 / 指令 */
+static int ax_line(void)
+{
+    const char *save = AX_P;
+
+    ax_sp();
+    if (AX_P >= AX_E)
+        return 1;
+    if (ax_ch_ident(*AX_P)) {
+        if (!ax_word())
+            return 0;
+        if (AX_P < AX_E && *AX_P == ':') {
+            AX_P++;
+            return ax_def_label();
+        }
+        AX_P = save;
+        ax_sp();
+        if (ax_word()) {
+            if (AX_WBUF[0] == '.')
+                return ax_directive();
+            return ax_insn();
+        }
+    }
+    return 0;
+}
+
+/* 预扫描：把文本里所有 `名字:` 先登记进标号表（前向跳转要靠它）。 */
+static void ax_prelabel(void)
+{
+    const char *p = AX_P;
+
+    while (p < AX_E) {
+        char c = *p;
+        const char *st = p;
+        u32 n = 0;
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '.')) {
+            p++;
+            continue;
+        }
+        /* 前面是 '%' 的（%fs:0）不是标签 */
+        if (st > AX_P && st[-1] == '%') {
+            p++;
+            continue;
+        }
+        while (p < AX_E && ax_ch_ident(*p))
+            p++;
+        n = (u32)(p - st);
+        if (p < AX_E && *p == ':' && n > 0 && n + 1 < sizeof(AX_WBUF)) {
+            u32 k = 0;
+
+            for (k = 0; k < n; k++)
+                AX_WBUF[k] = st[k];
+            AX_WBUF[n] = 0;
+            AX_WLEN = n;
+            if (!(AX_WBUF[0] >= '0' && AX_WBUF[0] <= '9'))
+                (void)ax_lbl_find(AX_WBUF, n, 1);
+        }
+    }
+}
+
+static int ax_body(void)
+{
+    while (!AX_BAD) {
+        ax_sep();
+        if (AX_P >= AX_E)
+            return 1;
+        if (!ax_line())
+            return 0;
+    }
+    return 0;
+}
+
+/* ---- 对外接口 ---------------------------------------------------------- */
+
+/* 把这些绑定装进物理寄存器：帧槽布局 X64_SLOT(v) = -16*(v+1)。 */
+static void ax_binds_in(void)
+{
+    u32 i = 0;
+
+    for (i = 0; i < AX_NBIND; i++)
+        x_ld64(&AX_IM, AX_BIND[i].reg, R_RBP, AX_BIND[i].disp);
+}
+
+static void ax_binds_out(void)
+{
+    u32 i = 0;
+
+    for (i = 0; i < AX_NBIND; i++)
+        if (AX_BIND[i].store)
+            x_st64(&AX_IM, R_RBP, AX_BIND[i].disp, AX_BIND[i].reg);
+}
+
+/* 解析一段汇编文本，成功返回 1（段下标进 *out），翻不动返回 0 */
+static int asmx_piece(const char *tpl, u32 tlen, const AxBind *bind, u32 nbind,
+                      const AxGoto *gt, u32 ngt, u32 *out)
+{
+    u32 i = 0;
+    AxPiece *pc = NULL;
+
+    if (NAXPIECE >= AX_MAXPIECE)
+        return 0;
+    if (NAXFIX + 16 >= AX_MAXFIX || NAXREF + 16 >= AX_MAXREF)
+        return 0;
+    AX_BAD = 0;
+    img_init(&AX_IM, 256);
+    AX_FIX0 = NAXFIX;
+    AX_REF0 = NAXREF;
+    AX_NLBL = 0;
+    AX_NLFIX = 0;
+    AX_BIND = bind;
+    AX_NBIND = nbind;
+    AX_GOTO = gt;
+    AX_NGOTO = ngt;
+    AX_P = tpl;
+    AX_E = tpl + tlen;
+
+    ax_prelabel();
+    ax_binds_in();
+    if (!ax_body()) {
+        free(AX_IM.p);
+        return 0;
+    }
+    ax_binds_out();
+    if (!AX_BAD) {
+        for (i = 0; i < AX_NLFIX; i++) {
+            u32 li = AX_LFIXL[i];
+            u32 at = AX_LFIXAT[i];
+
+            if (li >= AX_NLBL || !AX_LDEF[li]) {
+                AX_BAD = 1;
+                break;
+            }
+            img_patch32(&AX_IM, at, AX_LOFF[li] - (at + 4));
+        }
+    }
+    if (AX_BAD || AX_IM.n == 0) {
+        free(AX_IM.p);
+        return 0;
+    }
+    *out = NAXPIECE;
+    pc = &AX_PIECE[NAXPIECE++];
+    pc->len = AX_IM.n;
+    pc->code = (const u8 *)arena_alloc(&A_main, AX_IM.n ? AX_IM.n : 1);
+    memcpy((void *)pc->code, AX_IM.p, AX_IM.n);
+    pc->fix0 = AX_FIX0;
+    pc->nfix = NAXFIX - AX_FIX0;
+    pc->ref0 = AX_REF0;
+    pc->nref = NAXREF - AX_REF0;
+    free(AX_IM.p);
+    AX_IM.p = NULL;
+    AX_IM.n = 0;
+    AX_IM.cap = 0;
+    return 1;
+}
+
+/* 把一段字节放进代码镜像：登记标签符号 + 落重定位。返回段起点（镜像偏移）。 */
+static u32 asmx_flush(X64State *st, u32 idx)
+{
+    AxPiece *pc = NULL;
+    u32 base = 0;
+    u32 i = 0;
+
+    if (idx >= NAXPIECE)
+        return st->im->n;
+    pc = &AX_PIECE[idx];
+    base = st->im->n;
+    for (i = 0; i < pc->len; i++)
+        img_u8(st->im, pc->code[i]);
+    for (i = 0; i < pc->nref; i++) {
+        u32 s = x64_sym(st, AX_REF[pc->ref0 + i].name);
+
+        /* 符号偏移按**镜像坐标**记（base 是 CODE_IMG 里的落点，代码段在最终
+         * 镜像里从 im_base 处开始），跟 x64.c6 里别的登记点保持一致。 */
+        st->sym[s].off = base + AX_REF[pc->ref0 + i].at + st->im_base;
+        st->sym[s].va = ELF_BASE_VA + st->sym[s].off;
+        st->sym[s].defined = 1;
+        st->sym[s].is_data = 0;
+    }
+    for (i = 0; i < pc->nfix; i++) {
+        AxFix *f = &AX_FIX[pc->fix0 + i];
+
+        if (f->kind == 0) {
+            x64_fix_room(st);
+            st->fix[st->nfix].patch = base + f->at;
+            st->fix[st->nfix].sym = f->sym;
+            st->fix[st->nfix].addend = 0;
+            st->fix[st->nfix].kind = 0;
+            st->nfix++;
+        } else if (st->nlbl_fix < X64_MAXLBL) {
+            st->lbl_fix_patch[st->nlbl_fix] = base + f->at;
+            st->lbl_fix_id[st->nlbl_fix] = f->lbl;
+            st->nlbl_fix++;
+        }
+    }
+    return base;
+}

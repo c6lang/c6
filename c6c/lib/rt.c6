@@ -1,0 +1,3839 @@
+/* c6c 自带运行时（freestanding）。
+ *
+ * 被自动 include 到用户 TU 的最前面（`-nostdlib` 关掉这一行为）。
+ * 只用系统调用 + 编译器内建，**不依赖任何 libc**，也不假设动态链接器存在。
+ * 约定：文件系统/进程相关的极端细节走 Linux x86-64 的裸调用号。
+ */
+#ifndef _C6C_RT_C6
+#define _C6C_RT_C6
+
+#include <stddef.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+/* ---------- 系统调用 ---------- */
+#define C6C_SYS_READ 0
+#define C6C_SYS_WRITE 1
+#define C6C_SYS_OPEN 2
+#define C6C_SYS_CLOSE 3
+#define C6C_SYS_STAT 4
+#define C6C_SYS_FSTAT 5
+#define C6C_SYS_LSTAT 6
+#define C6C_SYS_LSEEK 8
+#define C6C_SYS_MMAP 9
+#define C6C_SYS_BRK 12
+#define C6C_SYS_EXIT 60
+#define C6C_SYS_EXIT_GROUP 231
+#define C6C_SYS_MPROTECT 10
+#define C6C_SYS_MUNMAP 11
+#define C6C_SYS_MKDIR 83
+#define C6C_SYS_CHMOD 90
+#define C6C_SYS_TIME 201
+#define C6C_SYS_GETPID 39
+#define C6C_SYS_CLOCK_GETTIME 228
+#define C6C_SYS_NANOSLEEP 35
+#define C6C_SYS_OPENAT 257
+#define C6C_SYS_FORK 57
+#define C6C_SYS_WAIT4 61
+#define C6C_SYS_IOCTL 16
+#define C6C_SYS_GETPID2 39
+#define C6C_SYS_GETUID 102
+#define C6C_SYS_GETEUID 107
+#define C6C_SYS_SETSID 112
+#define C6C_SYS_NICE 34
+#define C6C_SYS_DUP 32
+#define C6C_SYS_DUP2 33
+
+static long c6c_sys1(long nr, long a)
+{
+    return __builtin_syscall(nr, a);
+}
+
+static long c6c_sys2(long nr, long a, long b)
+{
+    return __builtin_syscall(nr, a, b);
+}
+
+static long c6c_sys3(long nr, long a, long b, long c)
+{
+    return __builtin_syscall(nr, a, b, c);
+}
+
+static long c6c_sys4(long nr, long a, long b, long c, long d)
+{
+    return __builtin_syscall(nr, a, b, c, d);
+}
+
+static long c6c_sys6(long nr, long a, long b, long c, long d, long e, long f)
+{
+    return __builtin_syscall(nr, a, b, c, d, e, f);
+}
+
+/* ---------- 基本 I/O ---------- */
+static long c6c_strlen(const char *s)
+{
+    long n = 0;
+
+    while (s[n])
+        n++;
+    return n;
+}
+
+long write(long fd, const void *buf, unsigned long n)
+{
+    return c6c_sys3(C6C_SYS_WRITE, fd, (long)buf, (long)n);
+}
+
+long read(long fd, void *buf, unsigned long n)
+{
+    return c6c_sys3(C6C_SYS_READ, fd, (long)buf, (long)n);
+}
+
+long close(long fd)
+{
+    return c6c_sys1(C6C_SYS_CLOSE, fd);
+}
+
+/* `pipe(int fds[2])`：系统调用 22 */
+long pipe(int *fds)
+{
+    return c6c_sys1(22, (long)fds);
+}
+
+long lseek(long fd, long off, long whence)
+{
+    return c6c_sys3(C6C_SYS_LSEEK, fd, off, whence);
+}
+
+long open(const char *path, long flags, long mode)
+{
+    return c6c_sys3(C6C_SYS_OPEN, (long)path, flags, mode);
+}
+
+/* 文件系统元信息：struct stat 的布局在 include/sys/stat.h 里，按内核那份抄 */
+struct stat;
+
+int stat(const char *path, struct stat *st)
+{
+    return (int)c6c_sys2(C6C_SYS_STAT, (long)path, (long)st);
+}
+
+int fstat(int fd, struct stat *st)
+{
+    return (int)c6c_sys2(C6C_SYS_FSTAT, fd, (long)st);
+}
+
+int lstat(const char *path, struct stat *st)
+{
+    return (int)c6c_sys2(C6C_SYS_LSTAT, (long)path, (long)st);
+}
+
+int mkdir(const char *path, unsigned int mode)
+{
+    return (int)c6c_sys2(C6C_SYS_MKDIR, (long)path, (long)mode);
+}
+
+int chmod(const char *path, unsigned int mode)
+{
+    return (int)c6c_sys2(C6C_SYS_CHMOD, (long)path, (long)mode);
+}
+
+/* mmap 按 POSIX 的约定返回：出错给 MAP_FAILED（(void *)-1），**不是**内核
+ * 那句 -errno。直接透传负数会让 `mmap(...) != MAP_FAILED` 这种判断误判成成功，
+ * 接着去写那块没映射的地址（tests2/119_random_stuff.c 的 tst_const_addr 就是
+ * 这么段错误的：`MAP_FIXED` 在 0x20000000 上被内核拒了，拿回来 -EINVAL）。 */
+void *mmap(void *addr, unsigned long len, long prot, long flags, long fd, long off)
+{
+    long r = c6c_sys6(C6C_SYS_MMAP, (long)addr, (long)len, prot, flags, fd, off);
+
+    if (r < 0 && r > -4096)
+        return (void *)-1;
+    return (void *)r;
+}
+
+int munmap(void *addr, unsigned long len)
+{
+    long r = c6c_sys2(C6C_SYS_MUNMAP, (long)addr, (long)len);
+
+    return (int)((r < 0 && r > -4096) ? -1 : r);
+}
+
+int mprotect(void *addr, unsigned long len, long prot)
+{
+    return (int)c6c_sys3(C6C_SYS_MPROTECT, (long)addr, (long)len, prot);
+}
+
+void exit(int code)
+{
+    c6c_sys1(C6C_SYS_EXIT_GROUP, (long)code);
+    c6c_sys1(C6C_SYS_EXIT, (long)code);
+}
+
+void _exit(int code)
+{
+    c6c_sys1(C6C_SYS_EXIT_GROUP, (long)code);
+    c6c_sys1(C6C_SYS_EXIT, (long)code);
+}
+
+void abort(void)
+{
+    c6c_sys1(C6C_SYS_EXIT_GROUP, 134);
+    c6c_sys1(C6C_SYS_EXIT, 134);
+}
+
+/* ---------- 信号 ---------- */
+/* tests2/114_bound_signal.c 要按 pid 发信号（tcc 的 libc 有这两个）。 */
+int kill(int pid, int sig)
+{
+    return (int)c6c_sys2(62 /* kill */, (long)pid, (long)sig);
+}
+
+int raise(int sig)
+{
+    return (int)c6c_sys2(62 /* kill */, c6c_sys1(39 /* getpid */, 0), (long)sig);
+}
+
+/* ---------- 资源限制 ---------- */
+/* tests/async_highfd.c6 这些用例要探 fd 上限（c6 的 `await c6_io` 支持高 fd）。
+ * 真实现走 prlimit64（老 getrlimit 在内核里也是它），拿不到就编不过。 */
+struct c6c_rlimit {
+    unsigned long cur;
+    unsigned long max;
+};
+
+int getrlimit(int res, struct c6c_rlimit *rl)
+{
+    if (!rl)
+        return -1;
+    if (c6c_sys4(302 /* prlimit64 */, 0, (long)res, 0, (long)rl) == 0)
+        return 0;
+    return (int)c6c_sys2(97 /* getrlimit */, (long)res, (long)rl);
+}
+
+int setrlimit(int res, const struct c6c_rlimit *rl)
+{
+    if (!rl)
+        return -1;
+    if (c6c_sys4(302 /* prlimit64 */, 0, (long)res, (long)rl, 0) == 0)
+        return 0;
+    return (int)c6c_sys2(160 /* setrlimit */, (long)res, (long)rl);
+}
+
+/* ---------- 内存 ---------- */
+static char *c6c_brk_cur = 0;
+static long c6c_brk_left = 0;
+
+static void *c6c_mem_zero(void *p, long n)
+{
+    char *q = (char *)p;
+    long i = 0;
+
+    for (i = 0; i < n; i++)
+        q[i] = 0;
+    return p;
+}
+
+static void c6c_mem_copy(void *dst, const void *src, long n)
+{
+    char *d = (char *)dst;
+    const char *s = (const char *)src;
+    long i = 0;
+
+    for (i = 0; i < n; i++)
+        d[i] = s[i];
+}
+
+/* 最近一次 err(id, msg) 的消息指针。`catch e { e.msg }` 从这里取。 */
+char *c6c_err_msg = 0;
+
+/* 错误槽的读写口子：c6 的 err()/try/catch 是前端直接发的，但"当前有没有
+ * 错误"这件事得有地方存，测试和用户代码都按 __tcc_err_* 这组名字访问。 */
+/* spawn 起的线程入口：参数块的头两个字是 { 代码指针, 目标 }, 代码按
+ * "void (*)(void *env)" 的约定接收整个参数块。 */
+void c6c_th_join_all(void);
+
+/* 源码里显式调用的 `__c6_th_join_all()`：等所有 spawn 出去的线程。 */
+void __c6_th_join_all(void)
+{
+    c6c_th_join_all();
+}
+
+/* 进程收尾：把 spawn 出去还活着的线程等回来。_start 在 main 之后、真正
+ * 退进程之前跑析构函数，所以挂在这里正好（tests/exit/go_join.c6 期望
+ * main 的 defer 先跑、线程的输出再出现，退出码还是 main 的 7）。 */
+__attribute__((destructor)) static void c6c_th_drain_dtor(void)
+{
+    c6c_th_join_all();
+}
+
+/* ---------- GC / 协程的内建（目前是"如实报告未跟踪"的桩） ----------
+ * c6c 的 `@T` 现在就是 `T *`：没有对象头、没有引用计数、没有协程调度。
+ * 这几组名字是 c6 源码（tests/、std/）直接调用的内建，先提供出来让程序
+ * 能编、能跑，并且**语义上和实现一致**：
+ *   - `__c6_gc_live()`         → 当前跟踪的对象数 = 0（本来就没跟踪）
+ *   - `__c6_gc_refcount(p)`    → 非空指针给 1（一个引用），空给 0
+ *   - `__c6_gc_shutdown()`     → 无事可做
+ *   - `__c6_gc_drain_budget(n)`→ 返回 0（没有待回收的）
+ * 协程那组（`__c6_co_*`）同理：没有调度器，run/wait 就是同步跑一次。
+ * 真正实现 GC 和协程时，替换这一整段即可（见 docs/todo.md 的"接手先看"）。 */
+/* 托管字符串的字节长度（不含结尾 NUL）。c6c 的 `@char` 就是 `char *`，
+ * 没有额外头部，所以直接量。 */
+long __c6_str_len(const char *s)
+{
+    return s ? (long)strlen(s) : 0;
+}
+
+/* ---------- 引用计数 GC（阶段 P1：分配、计数、释放） ----------
+ * 对象头紧挨在负载前面（16 字节）：`{ 引用计数, 字节数 }`。负载指针就是
+ * `new T` 的返回值，也是 `@T` 的表示——所以 `@T` 和 `T *` 在机器层面仍然
+ * 是同一个东西，区别只在前端给不给它插 retain/release。
+ * `__c6_gc_live()` 是活对象数，测试拿它断言"没有泄漏"。 */
+/* 类型描述符：编译器给每个 `new T` 用到的结构体类型发一份。
+ * `drop` 是 T 的析构（`void drop(struct T *self)`），没有就是空；
+ * `foff` 是 T 里所有 `@U` 字段的偏移表，释放到零时按表逐个放下层引用。 */
+typedef struct C6GcDesc {
+    void (*drop)(void *self);
+    const long *foff;
+    long nfoff;
+} C6GcDesc;
+
+typedef struct C6GcHdr {
+    long rc;
+    long sz;
+    const C6GcDesc *desc;
+    long esz;                    /* 数组元素大小（0 = 单个对象） */
+    long nel;                    /* 数组元素个数 */
+} C6GcHdr;
+
+static long c6_gc_live_n;
+
+/* 弱引用登记表：对象真正释放时把指向它的弱槽写成空。
+ * 槽是栈上的托管量，所以只在"对象还活着"的这段时间里有效。 */
+#define C6_WEAK_MAX 4096
+static void **c6_weak_slot[C6_WEAK_MAX];
+static void *c6_weak_obj[C6_WEAK_MAX];
+static long c6_weak_n;
+
+void __c6_gc_weak(void **slot, void *p)
+{
+    long i = 0;
+
+    if (!slot)
+        return;
+    /* 同一个槽只留一条登记（重新绑定就换对象） */
+    for (i = 0; i < c6_weak_n; i++)
+        if (c6_weak_slot[i] == slot) {
+            c6_weak_obj[i] = p;
+            *slot = p;
+            return;
+        }
+    if (!p) {
+        *slot = NULL;
+        return;
+    }
+    if (c6_weak_n < C6_WEAK_MAX) {
+        c6_weak_slot[c6_weak_n] = slot;
+        c6_weak_obj[c6_weak_n] = p;
+        c6_weak_n++;
+    }
+    *slot = p;
+}
+
+static void c6_weak_clear(void *p)
+{
+    long i = 0;
+
+    for (i = 0; i < c6_weak_n; ) {
+        if (c6_weak_obj[i] == p) {
+            if (c6_weak_slot[i])
+                *c6_weak_slot[i] = NULL;
+            c6_weak_n--;
+            c6_weak_slot[i] = c6_weak_slot[c6_weak_n];
+            c6_weak_obj[i] = c6_weak_obj[c6_weak_n];
+            continue;
+        }
+        i++;
+    }
+}
+
+static void *c6_gc_alloc(long sz, const C6GcDesc *desc, long esz, long nel)
+{
+    C6GcHdr *h = malloc((size_t)sz + sizeof(C6GcHdr));
+
+    if (!h)
+        return NULL;
+    h->rc = 1;
+    h->sz = sz;
+    h->desc = desc;
+    h->esz = esz;
+    h->nel = nel;
+    memset((char *)h + sizeof(C6GcHdr), 0, (size_t)sz);
+    c6_gc_live_n++;
+    return (char *)h + sizeof(C6GcHdr);
+}
+
+void *__c6_gc_new(long sz, const C6GcDesc *desc)
+{
+    return c6_gc_alloc(sz, desc, 0, 0);
+}
+
+/* `new T[n]`：元素析构/字段释放按 esz 步进逐个跑 */
+void *__c6_gc_new_arr(long n, long esz, const C6GcDesc *desc)
+{
+    return c6_gc_alloc(n * esz, desc, esz, n);
+}
+
+/* 引用计数是原子的：`shared @T` 的计数可以从一个线程转到另一个线程，两个
+ * 线程同时对同一个对象加减也不能丢更新（tests/gc_thread.c6）。这俩是编译器
+ * 自带的汇编跳板（lock xadd），见 src/asmblob.c6。 */
+long __c6_atomic_inc(void *p);
+long __c6_atomic_dec(void *p);
+
+void __c6_gc_retain(void *p)
+{
+    if (p)
+        __c6_atomic_inc(&((C6GcHdr *)((char *)p - sizeof(C6GcHdr)))->rc);
+}
+
+void __c6_gc_release(void *p);
+
+/* 一个对象（或一个数组元素）的销毁：先析构，再放托管字段 */
+static void c6_gc_destroy(void *p, const C6GcDesc *d)
+{
+    long i = 0;
+
+    if (d && d->drop)
+        d->drop(p);
+    if (d && d->foff)
+        for (i = 0; i < d->nfoff; i++) {
+            void **fp = (void **)((char *)p + d->foff[i]);
+
+            __c6_gc_release(*fp);
+            *fp = NULL;
+        }
+}
+
+void __c6_gc_release(void *p)
+{
+    C6GcHdr *h = NULL;
+
+    if (!p)
+        return;
+    h = (C6GcHdr *)((char *)p - sizeof(C6GcHdr));
+    if (__c6_atomic_dec(&h->rc) > 0)
+        return;
+    c6_gc_live_n--;
+    if (h->nel > 1 || (h->nel == 1 && h->esz)) {
+        long k = 0;
+
+        for (k = 0; k < h->nel; k++)
+            c6_gc_destroy((char *)p + k * h->esz, h->desc);
+    } else {
+        c6_gc_destroy(p, h->desc);
+    }
+    /* 指向它的弱引用变空，最后才真正 free */
+    c6_weak_clear(p);
+    free(h);
+}
+
+long __c6_gc_live(void)
+{
+    return c6_gc_live_n;
+}
+
+long __c6_gc_refcount(const void *p)
+{
+    if (!p)
+        return 0;
+    return ((C6GcHdr *)((char *)p - sizeof(C6GcHdr)))->rc;
+}
+
+void __c6_gc_shutdown(void)
+{
+}
+
+long __c6_gc_drain_budget(long n)
+{
+    (void)n;
+    return 0;
+}
+
+/* 协程内建：c6c 没有协程调度器，任务就是同步跑完的函数。所以
+ * `__c6_co_wait()` 永远返回 0（已完成）、`destroy` 无事可做、`kind` 报 0。
+ * 语义和实现一致：`async` 函数现在就是普通函数。 */
+/* 协程状态/事件码（c6 源码里按名字用）。任务同步跑完，所以 kind 只可能
+ * 是 DONE 或 ERR；事件码目前没有真正的等待。 */
+enum {
+    C6_CO_KIND_DONE = 0,
+    C6_CO_KIND_ERR = 1,
+    C6_CO_KIND_RUNNING = 2,   /* `start()` 之后还挂着（既没结束也没出错） */
+    C6_CO_STATE_NEW = 0,
+    C6_CO_STATE_DONE = -1,
+    C6_CO_EV_READ = 1,      /* 见 docs/reference/grammar.md：READ=1 / WRITE=2 */
+    C6_CO_EV_WRITE = 2
+};
+
+/* 任务结构的头两个字段是编译器织进去的：
+ *     long kind;   0 = 成功，1 = 出错（async 函数收尾时按错误标志写）
+ *     long state;  0 = C6_CO_STATE_NEW，-1 = C6_CO_STATE_DONE
+ * 第三个字段才是返回值 val。c6c 没有调度器，任务体在创建时同步跑完，
+ * 所以 `wait()` 做的只是"把它标成已结束"；`done()` 之前是 0，之后是 1，
+ * 这正是句柄方法的可观察语义。 */
+/* 任务结构的布局由编译器织出来（parse.c6 里的合成），固定是
+ *     { void *m0..m3; long kind; long state; long nmgd; T val; }
+ * 前 32 字节是托管实参的引用前缀，nmgd 说明填了几个。 */
+#define C6_TASK_M0_OFF    0
+#define C6_TASK_MG_CAP    4
+#define C6_TASK_KIND_OFF  32
+#define C6_TASK_STATE_OFF 40
+#define C6_TASK_NMGD_OFF  48
+#define C6_TASK_VAL_OFF   56
+
+#define C6C_SYS_FUTEX_ 202
+#define C6C_SYS_GETTID_ 186
+#define C6C_CLONE_VM 0x00000100l
+#define C6C_CLONE_FS 0x00000200l
+#define C6C_CLONE_FILES 0x00000400l
+#define C6C_CLONE_SIGHAND 0x00000800l
+#define C6C_CLONE_THREAD 0x00010000l
+#define C6C_CLONE_SYSVSEM 0x00040000l
+#define C6C_FUTEX_WAIT_ 0
+#define C6C_FUTEX_WAKE_ 1
+
+static void c6c_th_lock(void);          /* 分槽位用（定义在下面线程那节） */
+static void c6c_th_unlock(void);
+
+struct c6c_pollfd {
+    int fd;
+    short events;
+    short revents;
+};
+
+/* ---------- 协程调度器（`async` / `await` / `co`） ----------
+ *
+ * 每个任务有自己的栈，但**任何时刻只有一个在跑**：谁跑由一对计数器交接决定
+ * （in = 允许跑的格数，out = 交回控制权的次数）。
+ *
+ *   co_resume(c)：c->in++、唤醒 in，然后阻塞等 c->out 涨一格；
+ *   co_yield(c) ：c->out++、唤醒 out，然后等 c->in 涨一格。
+ *
+ * 于是"挂起"就是把控制权交回调度侧。`await t` 在 t 还没结束时把当前协程标成
+ * `blocked_on = t`、让出；调度侧（c6c_co_pump）顺着等待链挑下一个能跑的推进。
+ *
+ * 没有对应 C6Co 的任务（老口径：任务体在创建时同步跑完）照旧按"已结束"处理。
+ */
+#define C6_CO_STACK (64 * 1024)
+
+typedef struct C6Co {
+    struct C6Co *resumer;       /* 谁把我恢复起来的（让出时交回给它） */
+    void *(*fn)(void *);
+    void *arg;
+    void *task;                 /* 任务结构（函数体的返回值 / publish） */
+    long done;
+    long state;                 /* 0 new 1 running 2 blocked 3 done */
+    void *blocked_on;
+    int wait_fd;                /* `await c6_io(fd, ev)`：挂在哪个 fd 上 */
+    int wait_ev;
+    int waiting;
+    int detached;               /* `co f()`：跑完由调度侧自动回收 */
+    int poisoned;               /* 撞上"永不就绪"的等待点：任务按失败结 */
+    int unwind;                 /* 销毁挂起的任务：下次恢复就回卷 */
+    int val_mgd;                /* 任务的 val 槽持有一份托管引用 */
+    int nogate;                 /* `co f()`：语句处就直接跑，不停在起点闸门上 */
+    int exited;                 /* 线程已经走到"不再碰 C6Co"那一步了 */
+    void *stack;
+    long tid;
+    struct C6Co *next;
+} C6Co;
+
+static C6Co *C6_CO_ALL;         /* 还活着的协程 */
+static C6Co *C6_CO_IDLE;        /* 跑完了、栈还能再用的槽 */
+static C6Co *C6_CO_CUR;         /* 当前在跑的那个（同一时刻只有一个） */
+
+long __c6_co_spawn(unsigned long flags, void *sp, void *slot);
+
+/* 执行权令牌：同一时刻只有 TURN 指向的那个在跑，NULL 表示主线程在跑。
+ *
+ *   co_give(to)      ：把令牌交出去（TURN = to，序号 +1，唤醒所有等待者）
+ *   co_await_turn(me)：等到令牌指向 me
+ *
+ * 用一根令牌而不是给每对线程记交接计数：计数要在"查值 → 进内核"之间取期望值，
+ * 嵌套 resume（协程里再起协程）时很容易错一拍就卡死（踩过）。令牌只有一个
+ * 变量，谁醒来谁重查，错了最多多醒一次。 */
+static C6Co *C6_CO_TURN;
+static long C6_CO_SEQ;
+
+static void c6c_co_give(C6Co *to)
+{
+    C6_CO_TURN = to;
+    __c6_atomic_inc(&C6_CO_SEQ);
+    c6c_sys6(C6C_SYS_FUTEX_, (long)&C6_CO_SEQ, C6C_FUTEX_WAKE_, 0x7fffffff, 0, 0, 0);
+}
+
+static void c6c_co_await_turn(C6Co *me)
+{
+    while (C6_CO_TURN != me) {
+        long seen = C6_CO_SEQ;
+
+        if (C6_CO_TURN == me)
+            break;
+        c6c_sys6(C6C_SYS_FUTEX_, (long)&C6_CO_SEQ, C6C_FUTEX_WAIT_, seen, 0, 0, 0);
+    }
+}
+
+/* 协程入口：由 __c6_co_spawn 在新线程上调用。永不返回。 */
+void __c6_co_entry(void *slot)
+{
+    C6Co *c = (C6Co *)slot;
+    void *r = 0;
+
+    c6c_co_await_turn(c);               /* 等第一次 resume */
+    C6_CO_CUR = c;
+    c->state = 1;
+    r = c->fn ? c->fn(c->arg) : 0;
+    if (r)
+        c->task = r;
+    /* 撞过"永不就绪"的等待点（`await c6_io(-1, …)`）：任务按失败结 */
+    if (c->poisoned && r)
+        *(long *)((char *)r + C6_TASK_KIND_OFF) = C6_CO_KIND_ERR;
+    c->done = 1;
+    c->state = 3;
+    C6_CO_CUR = 0;
+    c->exited = 1;                      /* 从这一句起不再碰 C6Co 的内存 */
+    c6c_co_give(c->resumer);            /* 交回控制权，之后不再醒来 */
+    c6c_sys1(C6C_SYS_EXIT, 0);
+    for (;;)
+        ;
+}
+
+/* 协程侧让出（被再次 resume 时从这里继续） */
+static void c6c_co_yield(C6Co *c)
+{
+    C6Co *back = c->resumer;
+
+    /* 交令牌之前先把"谁在跑"清掉：不然恢复方醒来时读到的是**上一个**跑过的
+     * 协程，resume 就会把它当成自己的调用者（resumer 变成自己 → 自己给自己
+     * 令牌 → 死循环，踩过）。 */
+    C6_CO_CUR = 0;
+    c6c_co_give(back);
+    c6c_co_await_turn(c);
+    C6_CO_CUR = c;
+    c->state = 1;
+}
+
+/* 调度侧：把 c 推进一格（跑到下一个挂起点或结束） */
+static void c6c_co_resume(C6Co *c)
+{
+    C6Co *save = C6_CO_CUR;
+
+    /* 协程不能恢复自己（resumer 变成自己就是一个死循环：给自己令牌、
+     * 立刻又拿回来）。调度侧挑错了对象时退回"主线程"。 */
+    if (save == c)
+        save = 0;
+    c->resumer = save;
+    C6_CO_CUR = c;
+    c6c_co_give(c);
+    c6c_co_await_turn(save);
+    /* 恢复"谁在跑"：从协程里起协程（`co` 写在 async 体里）时，回来的是那个
+     * 协程自己，不是调度侧。 */
+    C6_CO_CUR = save;
+}
+
+static C6Co *c6c_co_find(void *task)
+{
+    C6Co *c = C6_CO_ALL;
+
+    if (!task)
+        return 0;
+    for (; c; c = c->next)
+        if (c->task == task)
+            return c;
+    return 0;
+}
+
+/* 一次 poll：把在等 fd 的协程里**已经就绪**的放行（清 waiting）。timeout < 0
+ * 表示阻塞等（没有等待者时立刻返回 0）。返回就绪的个数。 */
+static long c6c_co_poll_ready(long timeout)
+{
+    struct c6c_pollfd pf[64] = {0};
+    long np = 0;
+    long r = 0;
+    C6Co *c = 0;
+    long k = 0;
+
+    for (c = C6_CO_ALL; c; c = c->next) {
+        int seen = 0;
+
+        if (c->done || !c->waiting || c->wait_fd < 0)
+            continue;
+        for (k = 0; k < np; k++)
+            if (pf[k].fd == c->wait_fd)
+                seen = 1;
+        if (seen || np >= 64)
+            continue;
+        pf[np].fd = c->wait_fd;
+        pf[np].events = (short)c->wait_ev;
+        pf[np].revents = 0;
+        np++;
+    }
+    if (np == 0)
+        return 0;
+    r = c6c_sys3(7 /* poll */, (long)pf, np, timeout);
+    if (r <= 0)
+        return 0;
+    for (c = C6_CO_ALL; c; c = c->next) {
+        if (c->done || !c->waiting || c->wait_fd < 0)
+            continue;
+        for (k = 0; k < np; k++)
+            if (pf[k].fd == c->wait_fd && pf[k].revents) {
+                c->waiting = 0;
+                break;
+            }
+    }
+    return r;
+}
+
+/* 推进一格：等待点已经放行的直接恢复；还在等 fd 的就单独 poll 到就绪。 */
+static void c6c_co_step(C6Co *c)
+{
+    long r = 0;
+
+    if (!c || c->done)
+        return;
+    if (c->waiting) {
+        struct c6c_pollfd p[1] = {0};
+
+        p[0].fd = c->wait_fd;
+        p[0].events = (short)c->wait_ev;
+        p[0].revents = 0;
+        r = c6c_sys3(7 /* poll */, (long)p, 1, -1);
+        if (r < 0)
+            return;
+        c->waiting = 0;
+    }
+    c6c_co_resume(c);
+}
+
+/* 把 target 推到结束。路上顺手推进别的协程（"co 出去的顶层任务"不能被外层的
+ * 挂起冻住）：先非阻塞 poll 把就绪的等待者放行，再在"别人"里挑一个能跑的，
+ * 没有才顺着 target 的等待链走，实在都在等 fd 才阻塞。 */
+static void c6c_co_pump(C6Co *target)
+{
+    long guard = 0;
+
+    while (target && !target->done && guard++ < 1000000) {
+        C6Co *c = 0;
+        C6Co *nx = 0;
+        C6Co *chain = 0;
+        int depth = 0;
+
+        (void)c6c_co_poll_ready(0);
+        for (nx = C6_CO_ALL; nx; nx = nx->next)
+            if (nx != target && nx != C6_CO_CUR && !nx->done && !nx->waiting
+                && !nx->blocked_on) {
+                c = nx;
+                break;
+            }
+        if (!c) {
+            chain = target;
+            while (chain && !chain->done && chain->blocked_on && depth++ < 64) {
+                C6Co *n = c6c_co_find(chain->blocked_on);
+
+                if (!n || n->done)
+                    break;
+                chain = n;
+            }
+            if (chain && chain != target && !chain->done && !chain->waiting)
+                c = chain;
+        }
+        if (!c && !target->waiting)
+            c = target;
+        if (!c) {
+            if (c6c_co_poll_ready(-1) <= 0)
+                break;              /* 没有等待者了也没得跑 */
+            continue;
+        }
+        c6c_co_resume(c);
+    }
+}
+
+/* 分一个协程槽：空闲链表里有就复用（栈留着给下一个），没有就新开一个 */
+static C6Co *c6c_co_alloc(void)
+{
+    C6Co *c = C6_CO_IDLE;
+
+    if (c) {
+        C6_CO_IDLE = c->next;
+    } else {
+        c = (C6Co *)calloc(1, sizeof(C6Co));
+        if (!c)
+            return 0;
+        c->stack = (void *)c6c_sys6(C6C_SYS_MMAP, 0, C6_CO_STACK, 3,
+                                    0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
+        if ((long)c->stack < 0 && (long)c->stack > -4096) {
+            free(c);
+            return 0;
+        }
+    }
+    c->next = C6_CO_ALL;
+    C6_CO_ALL = c;
+    c->resumer = 0;
+    c->fn = 0;
+    c->arg = 0;
+    c->task = 0;
+    c->done = 0;
+    c->state = 0;
+    c->blocked_on = 0;
+    c->wait_fd = -1;
+    c->wait_ev = 0;
+    c->waiting = 0;
+    c->detached = 0;
+    c->poisoned = 0;
+    c->unwind = 0;
+    c->val_mgd = 0;
+    c->nogate = 0;
+    c->exited = 0;
+    c->tid = 0;
+    return c;
+}
+
+/* 退役：从"活着"的链表摘下来，挂回空闲链表（栈跟着槽复用） */
+static void c6c_co_retire(C6Co *c)
+{
+    C6Co **pp = &C6_CO_ALL;
+
+    for (; *pp; pp = &(*pp)->next)
+        if (*pp == c) {
+            *pp = c->next;
+            break;
+        }
+    /* 交令牌之前旧线程就把 exited 置好了，这里只需要一个防御性自旋 */
+    {
+        long spins = 0;
+
+        while (!c->exited && spins++ < 10000000l)
+            c6c_sys1(24 /* sched_yield */, 0);
+    }
+    c->next = C6_CO_IDLE;
+    C6_CO_IDLE = c;
+}
+
+/* 编译器把 `async f(a)` 编成：__c6_co_new(实参块) →
+ * __c6_co_launch(co)。launch 里起线程并**立刻恢复一次**，于是 `co f()` 的
+ * 语义就是"语句处先跑到第一个挂起点"。（名字不能叫 __c6_co_start：那是个
+ * 老的汇编跳板名，重名会让调用点落到 1 字节的 ret 上，返回垃圾。） */
+void *__c6_co_new(void *env, long nogate)
+{
+    C6Co *c = 0;
+
+    c = c6c_co_alloc();
+
+    if (!c)
+        return 0;
+    c->nogate = nogate ? 1 : 0;
+    /* 实参块的头两个字是 { 代码指针, 目标 }，代码按 `void *(*)(void *env)` 的
+     * 约定接收整块（和 spawn 的线程入口一个口径，见 __c6_thr_start）。 */
+    c->fn = *(void *(**)(void *))env;
+    c->arg = env;
+    return c;
+}
+
+void *__c6_co_launch(void *h)
+{
+    C6Co *c = (C6Co *)h;
+    unsigned long sp = 0;
+    long tid = 0;
+
+    if (!c)
+        return 0;
+    sp = ((unsigned long)c->stack + C6_CO_STACK) / 16ul * 16ul - 16ul;
+    tid = __c6_co_spawn(C6C_CLONE_VM | C6C_CLONE_FS | C6C_CLONE_FILES
+                        | C6C_CLONE_SIGHAND | C6C_CLONE_THREAD | C6C_CLONE_SYSVSEM,
+                        (void *)sp, c);
+    if (tid < 0)
+        return 0;
+    c->tid = tid;
+    c6c_co_resume(c);                  /* 立刻跑到第一个挂起点 */
+    return c->task;
+}
+
+/* 协程体里拿到任务结构之后回填（编译器在 task_new 末尾发这条） */
+void __c6_co_publish(void *task)
+{
+    if (C6_CO_CUR && task)
+        C6_CO_CUR->task = task;
+}
+
+void *__c6_co_task(void *h)
+{
+    C6Co *c = (C6Co *)h;
+
+    return c ? c->task : 0;
+}
+
+/* `co f()`：跑完由调度侧自动回收（不产生句柄）。参数是任务指针（`co` 那一侧
+ * 拿到的是表达式值，也就是任务结构），按任务反查协程。 */
+void __c6_co_detach(void *task)
+{
+    C6Co *c = c6c_co_find(task);
+
+    if (c)
+        c->detached = 1;
+}
+
+/* `await t`：t 还没跑完就把自己挂到它上面，一直让到它结束。返回 kind。 */
+/* 起点闸门：`task t = f(a);` 建完就该把句柄交回去，函数体等第一次驱动
+ * （`__c6_co_wait` / `await` / `__c6_co_run`）才开始跑。闸门放在任务结构
+ * （含托管实参前缀）都准备好之后，所以创建者立刻就能看到 +1 的计数。
+ * `co f(a);` 是同步起点，跳过闸门直接跑到第一个挂起点。 */
+void __c6_co_gate(void)
+{
+    C6Co *self = C6_CO_CUR;
+
+    if (!self || self->nogate)
+        return;
+    self->state = 2;
+    c6c_co_yield(self);           /* 只停一轮：下一次驱动就直接进函数体 */
+    self->state = 1;
+}
+
+/* 体里每个挂起点之后都会问一句：正被回卷吗？（编译器发的检查） */
+int __c6_co_unwind_pending(void)
+{
+    return (C6_CO_CUR && C6_CO_CUR->unwind) ? 1 : 0;
+}
+
+/* `async @T f()` 的返回值由任务的 val 槽持有一份，销毁时放掉 */
+void __c6_co_ownval(void *task)
+{
+    C6Co *c = c6c_co_find(task);
+
+    if (c)
+        c->val_mgd = 1;
+}
+
+long __c6_co_await(void *task)
+{
+    C6Co *self = C6_CO_CUR;
+    C6Co *c = 0;
+    long guard = 0;
+
+    if (!task)
+        return 0;
+    if (!self)
+        return *(long *)((char *)task + C6_TASK_KIND_OFF);
+    for (;;) {
+        c = c6c_co_find(task);
+        if (!c || c->done)
+            break;
+        if (guard++ > 1000000 || self->unwind)
+            break;                      /* 被销毁：别等一个永远不结束的任务 */
+        self->blocked_on = task;
+        self->state = 2;
+        c6c_co_yield(self);
+    }
+    self->blocked_on = 0;
+    self->state = 1;
+    return *(long *)((char *)task + C6_TASK_KIND_OFF);
+}
+
+static long c6c_co_reap_done(void);
+void __c6_co_destroy(void *task);
+
+/* 事件循环（`__c6_co_run()`）：把还活着的协程都推到结束——有能跑的就先跑
+ * 一格（链表头是最后建的，也就是 LIFO 轮转），都在等 fd 才阻塞 poll。
+ * 返回这一轮里失败的 detached 任务数。 */
+long __c6_co_run(void)
+{
+    long bad = 0;
+    long guard = 0;
+
+
+    for (;;) {
+        C6Co *c = 0;
+
+        bad += c6c_co_reap_done();      /* 跑完的 `co` 任务就地回收并计数 */
+        if (guard++ > 1000000)
+            break;
+        for (c = C6_CO_ALL; c; c = c->next)
+            if (!c->done && !c->waiting) {
+                c6c_co_resume(c);
+                break;
+            }
+        if (c)
+            continue;
+        if (c6c_co_poll_ready(-1) <= 0)
+            break;                      /* 没人等了也没得跑：收工 */
+    }
+    bad += c6c_co_reap_done();
+    return bad;
+}
+
+/* 收掉跑完的 detached 协程（`co f()` 没有句柄），返回其中失败的个数 */
+static long c6c_co_reap_done(void)
+{
+    long bad = 0;
+    C6Co *c = C6_CO_ALL;
+
+    while (c) {
+        C6Co *nx = c->next;
+
+        if (c->detached && (c->done || c->poisoned)) {
+            if (c->poisoned
+                || (c->task && *(long *)((char *)c->task + C6_TASK_KIND_OFF) == C6_CO_KIND_ERR))
+                bad++;
+            if (c->poisoned && c->task)
+                *(long *)((char *)c->task + C6_TASK_KIND_OFF) = C6_CO_KIND_ERR;
+            if (c->task)
+                __c6_co_destroy(c->task);
+            else
+                c6c_co_retire(c);
+        }
+        c = nx;
+    }
+    return bad;
+}
+
+long __c6_co_wait(void *task)
+{
+    C6Co *c = 0;
+
+    if (!task)
+        return -1;
+    c = c6c_co_find(task);
+    /* 挂在"永不就绪"的等待点（`await c6_io(-1, …)`）上的任务：帧留在原地等
+     * destroy 来回卷，wait 直接报失败，不能傻等（约束 C32）。 */
+    if (c && !c->done && c->poisoned)
+        return -1;
+    if (c && !c->done)
+        c6c_co_pump(c);
+    /* 挂在"永不就绪"的等待点上的：按失败报，别谎报成功。等真 fd 的
+     * 继续往下推（poll 到就绪就接着跑），有上限免得死循环。 */
+    if (c && !c->done && c->poisoned && c->waiting)
+        return -1;
+    {
+        long rounds = 0;
+
+        while (c && !c->done && rounds++ < 1000) {
+            if (c->poisoned && c->waiting)
+                return -1;
+            if (!c6c_co_pump(c))
+                break;
+        }
+    }
+    *(long *)((char *)task + C6_TASK_STATE_OFF) = C6_CO_STATE_DONE;
+    return *(long *)((char *)task + C6_TASK_KIND_OFF) == C6_CO_KIND_ERR ? -1 : 0;
+}
+
+/* 回收：挂起的任务先驱动到结束（这样帧里的托管引用会照常按作用域放掉，
+ * "销毁挂起的任务会回卷"就是这条），再放手任务结构的引用前缀，最后 free。
+ * 协程槽退役回 C6_CO_IDLE，栈留着给下一个协程用。 */
+void __c6_co_destroy(void *task)
+{
+    long n = 0;
+    long i = 0;
+    C6Co *c = 0;
+
+    if (!task)
+        return;
+    c = c6c_co_find(task);
+    if (c) {
+        if (!c->done && (c->waiting || c->poisoned)) {
+            /* 挂着：别硬推（它等的 fd 永远不会就绪）。设 unwind 再恢复一次，
+             * 体里挂起点的检查会跳到回卷出口，把 defer/errdefer 和栈上那些
+             * 托管局部量都收拾干净，然后正常结束。 */
+            c->waiting = 0;
+            c->unwind = 1;
+            c6c_co_resume(c);
+            c->unwind = 0;
+        }
+        if (!c->done)
+            c6c_co_pump(c);
+        if (c->val_mgd)
+            __c6_gc_release(*(void **)((char *)task + C6_TASK_VAL_OFF));
+        c6c_co_retire(c);
+    }
+    n = *(long *)((char *)task + C6_TASK_NMGD_OFF);
+    if (n > C6_TASK_MG_CAP)
+        n = C6_TASK_MG_CAP;
+    for (i = 0; i < n; i++)
+        __c6_gc_release(*(void **)((char *)task + C6_TASK_M0_OFF + i * 8));
+    free(task);
+}
+
+long __c6_co_kind(void *task)
+{
+    return task ? *(long *)((char *)task + C6_TASK_KIND_OFF) : C6_CO_KIND_DONE;
+}
+
+/* `t->start()`：把任务跑到第一个挂起点（或者跑完），返回 kind。
+ * `task t = f(a);` 只是建任务（体停在起点闸门上），`start()` 才真正跑；
+ * 跑完返回 C6_CO_KIND_DONE(0)，挂在等待点上返回 C6_CO_KIND_RUNNING(2)。 */
+long __c6_co_start(void *task)
+{
+    C6Co *c = 0;
+
+    if (!task)
+        return C6_CO_KIND_DONE;
+    c = c6c_co_find(task);
+    if (!c)
+        return C6_CO_KIND_DONE;
+    if (!c->done && !c->unwind)
+        c6c_co_resume(c);
+    if (c->done)
+        return *(long *)((char *)task + C6_TASK_KIND_OFF);
+    return c->poisoned ? C6_CO_KIND_ERR : C6_CO_KIND_RUNNING;
+}
+
+long __c6_co_kind(void *task);
+
+long __c6_co_state(void *task)
+{
+    if (!task)
+        return C6_CO_STATE_DONE;
+    return *(long *)((char *)task + C6_TASK_STATE_OFF);
+}
+
+/* `await c6_io(fd, ev)`：c6 里这是"挂起到 fd 就绪"。c6c 没有协程调度器，
+ * 任务都是同步跑完的，所以这里退化成一次**非阻塞** poll：立刻就绪返回 1，
+ * 否则返回 0（不会挂起）。fd < 0 一律报 0（永不就绪）。 */
+int c6_io(int fd, int ev)
+{
+    struct c6c_pollfd p[1] = {0};
+    long r = 0;
+    long g = 0;
+    short want = (short)(ev == C6_CO_EV_WRITE ? 4 : 1);   /* POLLOUT : POLLIN */
+
+    if (fd < 0) {
+        /* 永不就绪（约束 C32）：任务按失败结，协程**挂在这里**——帧不散，
+         * 等 `__c6_co_destroy()` 来回收（那时会设 unwind，醒过来走回卷）。 */
+        C6Co *self = C6_CO_CUR;
+
+        if (!self)
+            return -1;
+        self->poisoned = 1;
+        self->state = 2;
+        self->wait_fd = -1;
+        self->wait_ev = 0;
+        self->waiting = 1;
+        while (self->waiting && !self->unwind && g++ < 1000000)
+            c6c_co_yield(self);
+        self->waiting = 0;
+        self->state = 1;
+        return -1;
+    }
+    if (!C6_CO_CUR) {              /* 不在协程里：退化成一次非阻塞 poll */
+        p[0].fd = fd;
+        p[0].events = want;
+        p[0].revents = 0;
+        r = c6c_sys3(7 /* poll */, (long)p, 1, 0);
+        return r > 0 ? 1 : 0;
+    }
+    /* 在协程里：挂到 (fd, ev) 上**停一轮**（即使已经就绪也停，约束 C31），
+     * 由调度器（__c6_co_run）poll 到就绪后再恢复。 */
+    C6_CO_CUR->wait_fd = fd;
+    C6_CO_CUR->wait_ev = (int)want;
+    C6_CO_CUR->waiting = 1;
+    C6_CO_CUR->state = 2;
+    while (C6_CO_CUR->waiting && !C6_CO_CUR->unwind && g++ < 1000000)
+        c6c_co_yield(C6_CO_CUR);
+    C6_CO_CUR->state = 1;
+    return 1;
+}
+
+
+
+/* ---------- 真线程（clone 系统调用 + 编译器自带的汇编跳板） ----------
+ *
+ * 之前这里是一组"同步跑一遍就返回"的 pthread 桩，所以 spawn/thread 的用例
+ * 全都过不了：它们要的是"spawn 立刻返回、线程真的并发"。
+ *
+ * 起线程的那几步（clone 的 syscall、子线程第一句 `mov rbp,rsp`）在 C 层面
+ * 表达不出来——子线程是从 syscall 返回进来的，rsp 已经换到新栈，rbp 还指在
+ * 父线程的帧上，任何 rbp 相对寻址都会踩错。所以这一段是编译器自带的汇编
+ * 跳板 `__c6_th_spawn()`（见 src/asmblob.c6）：父线程拿 tid，子线程在新栈上
+ * 直接进 `__c6_th_entry()`。
+ *
+ * 限制：`C6C_TH_CUR`（子线程要接手哪个槽位）是一个全局，所以并发地
+ * pthread_create 需要自己串行化；tests/ 里的用法（主线程 spawn）没有这个
+ * 问题，写在这里免得踩坑。
+ */
+
+/* 编译器自带的汇编跳板（src/asmblob.c6）：父线程返回 tid，子线程在新栈上
+ * 进 __c6_th_entry()。 */
+long __c6_th_spawn(unsigned long flags, void *sp, void *slot);
+int __c6_tsl(void *p);                 /* 自旋锁（编译器自带的汇编跳板） */
+void __c6_unlock_(void *p);
+
+#define C6C_TH_MAX 128
+#define C6C_TH_STACK (256 * 1024)
+
+typedef struct C6CTh {
+    unsigned long tid;
+    void *(*fn)(void *);
+    void *arg;
+    void *ret;
+    long done;
+    void *stack;
+} C6CTh;
+
+static C6CTh C6C_THS[C6C_TH_MAX];
+static int C6C_THN;
+static int C6C_TH_LOCK;                 /* 保护"分槽位"这一段 */
+
+static void c6c_th_lock(void)
+{
+    while (!__c6_tsl(&C6C_TH_LOCK))
+        ;
+}
+
+static void c6c_th_unlock(void)
+{
+    __c6_unlock_(&C6C_TH_LOCK);
+}
+
+static int c6c_th_new(void)
+{
+    int i = 0;
+
+    for (i = 0; i < C6C_THN; i++)
+        if (!C6C_THS[i].stack)
+            return i;
+    if (C6C_THN >= C6C_TH_MAX)
+        return -1;
+    return C6C_THN++;
+}
+
+static void c6c_th_wait_done(long *p)
+{
+    while (!*p)
+        c6c_sys6(C6C_SYS_FUTEX_, (long)p, C6C_FUTEX_WAIT_, 0, 0, 0, 0);
+}
+
+/* ---------- 线程局部存储（__thread / _Thread_local） ----------
+ *
+ * 编译期把每个 `__thread` 全局量照常摆在数据段里（初始化器也照常写进去），
+ * 同时给出三个量：影像地址 __c6_tls_img、长度 __c6_tls_len、以及影像相对
+ * 数据段起点的偏移 __c6_tls_delta。变量本身的寻址在代码里已经编成
+ * `%fs + 数据段偏移`（见 src/parse.c6 的 ident_addr）。
+ *
+ * 运行期要做的事：给**每个线程**开一块、把影像拷到 `块首 + delta` 上，然后把
+ * %fs 设成块首——于是编译期那个常量偏移正好落进拷贝里的变量上。
+ * 主线程在 c6c_tls_init（构造函数，_start 调 main 之前跑）里做一次，
+ * 子线程在 __c6_th_entry 里做一次。
+ *
+ * 没有 `__thread` 的程序：__c6_tls_len 是 0，这里什么都不做（只多一次比较）。
+ */
+extern void *__c6_tls_img;
+extern unsigned long __c6_tls_len;
+extern unsigned long __c6_tls_delta;
+
+long __c6_fsbase(void);                 /* 编译器自带的汇编跳板 */
+
+/* 每个线程一份 TLS 块。布局（M = mmap 的块首，也就是 %fs）：
+ *
+ *   M            : M 自己（自指针，`%fs:0` 就读到基址）
+ *   M + delta    : 数据段里 [TLS_LO, TLS_HI) 那一小段的拷贝
+ *
+ * delta 是影像相对数据段起点的偏移，所以拷贝里第 goff 个字节就在
+ * M + goff 上——正好和编译期生成的 `%fs:goff` 对齐，编译期不用知道
+ * 任何运行期常量。 */
+void c6c_tls_setup(void)
+{
+    unsigned long n = __c6_tls_len;
+    unsigned long delta = __c6_tls_delta;
+    void *m = 0;
+
+    if (n == 0)
+        return;
+    m = (void *)c6c_sys6(C6C_SYS_MMAP, 0, delta + n + 64, 3,
+                         0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
+    if (!m || (long)m <= 0)             /* mmap 出错按 POSIX 给 MAP_FAILED */
+        return;
+    memcpy((char *)m + delta, __c6_tls_img, n);
+    *(void **)m = m;
+    /* arch_prctl(ARCH_SET_FS = 0x1002, 基址)：只换段基址，不动线程栈 */
+    c6c_sys2(158 /* arch_prctl */, 0x1002, (long)m);
+}
+
+/* 构造函数：_start 在 main 之前按源码顺序调用（见 src/x64.c6 的
+ * x64_emit_start）。主线程的线程块必须在这之前就位，否则 main 里第一次
+ * 读 `__thread` 变量就是 `%fs:偏移` 而 %fs 还是 0——直接段错误。 */
+__attribute__((constructor)) static void c6c_tls_init(void)
+{
+    c6c_tls_setup();
+}
+
+/* 子线程入口：由跳板在新栈上调用。**只用全局**，永不返回。 */
+void __c6_th_entry(void *slot)
+{
+    int i = (int)(long)slot;
+    void *(*fn)(void *) = C6C_THS[i].fn;
+    void *arg = C6C_THS[i].arg;
+    void *r = 0;
+
+    /* 线程局部量：子线程要自己一份（%fs 是从父线程继承来的，直接写会踩
+     * 主线程的值——tests2/144_tls 第 40 行起的整段就是查这个）。 */
+    c6c_tls_setup();
+    r = fn ? fn(arg) : 0;
+
+    C6C_THS[i].ret = r;
+    C6C_THS[i].done = 1;
+    c6c_sys6(C6C_SYS_FUTEX_, (long)&C6C_THS[i].done, C6C_FUTEX_WAKE_, 1, 0, 0, 0);
+    c6c_sys1(C6C_SYS_EXIT, 0);
+    for (;;)
+        ;
+}
+
+int pthread_create(unsigned long *th, const void *attr, void *(*fn)(void *), void *arg)
+{
+    int i = 0;
+    void *st = 0;
+    unsigned long sp = 0;
+    long tid = 0;
+
+    (void)attr;
+    c6c_th_lock();                     /* 分槽位 + 起线程：别的线程也在 spawn */
+    i = c6c_th_new();
+    if (i < 0) {
+        c6c_th_unlock();
+        return -1;
+    }
+    st = (void *)c6c_sys6(C6C_SYS_MMAP, 0, C6C_TH_STACK, 3,
+                          0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
+    if ((long)st < 0 && (long)st > -4096)
+        return -1;
+    sp = ((unsigned long)st + C6C_TH_STACK) / 16ul * 16ul - 16ul;
+    C6C_THS[i].fn = fn;
+    C6C_THS[i].arg = arg;
+    C6C_THS[i].ret = 0;
+    C6C_THS[i].done = 0;
+    C6C_THS[i].stack = st;
+    C6C_THS[i].tid = 0;
+    tid = __c6_th_spawn(C6C_CLONE_VM | C6C_CLONE_FS | C6C_CLONE_FILES
+                        | C6C_CLONE_SIGHAND | C6C_CLONE_THREAD | C6C_CLONE_SYSVSEM,
+                        (void *)sp, (void *)(long)i);
+    if (tid < 0)
+        return -1;
+    C6C_THS[i].tid = (unsigned long)tid;
+    if (th)
+        *th = (unsigned long)&C6C_THS[i];
+    c6c_th_unlock();
+    return 0;
+}
+
+/* 句柄的三个方法（编译器把 h->done()/h->value() 编成对这三个的调用） */
+int __c6_th_done(void *h)
+{
+    C6CTh *t = (C6CTh *)h;
+
+    return t && t->done ? 1 : 0;
+}
+
+void *__c6_th_value(void *h)
+{
+    C6CTh *t = (C6CTh *)h;
+
+    return t ? t->ret : 0;
+}
+
+int pthread_join(unsigned long th, void **ret)
+{
+    C6CTh *t = (C6CTh *)th;
+
+    if (!t)
+        return -1;
+    c6c_th_wait_done(&t->done);
+    if (ret)
+        *ret = t->ret;
+    return 0;
+}
+
+/* 等所有还活着的线程（main 退出前、以及 __c6_th_join_all() 用） */
+void c6c_th_join_all(void)
+{
+    int i = 0;
+
+    for (i = 0; i < C6C_THN; i++)
+        if (C6C_THS[i].stack && !C6C_THS[i].done)
+            c6c_th_wait_done(&C6C_THS[i].done);
+}
+
+void *__c6_thr_start(void *env)
+{
+    void *(*code)(void *) = *(void *(**)(void *))env;
+
+    return code(env);            /* 返回值给句柄的 h->value() */
+}
+
+/* ---------- 原子读改写（`__atomic_*` 内建的后端） ----------
+ *
+ * 前端把 `__atomic_fetch_add(p, v, order)` 之类翻成对这些函数的调用：整套
+ * 「读 → 算 → 写」在锁里做完，中间别的线程插不进来。以前前端直接发
+ * 「load; 算; store」三条 IR，16 个真线程各加一万次就丢更新
+ * （tests2/124_atomic_counter 三行全 FAILURE）。
+ *
+ * 实现是一把全局自旋锁（__c6_tsl，汇编跳板里就是 xchg）：宽度只分 1/2/4/8
+ * 四档，按宽度手工读写。锁里只有几条指令，争用下吞吐比 lock 前缀指令差，
+ * 但语义是原子的——这些用例要的是正确性，不是吞吐。
+ *
+ * 没走内建的普通读改写（`++counter->uc`）仍然不原子：那是普通对象，
+ * gcc 也只在 _Atomic / volatile 上发 lock。
+ */
+static volatile int C6C_AT_LOCK = 0;
+
+#define C6C_AT_ADD 0
+#define C6C_AT_SUB 1
+#define C6C_AT_AND 2
+#define C6C_AT_OR  3
+#define C6C_AT_XOR 4
+
+/* 抢锁用 test-and-test-and-set：先**只读**地等（等待者共享一条缓存行，不
+ * 互相抢），看到空了再 xchg 抢。直接 xchg 重试的话 16 个线程互相把缓存行
+ * 打来打去，tests2/124 的 16×10000×4 次要跑成分钟级。 */
+static void c6c_at_lock(void)
+{
+    for (;;) {
+        if (!C6C_AT_LOCK && __c6_tsl((int *)&C6C_AT_LOCK))
+            return;
+        while (C6C_AT_LOCK)
+            ;
+    }
+}
+
+static unsigned long c6c_at_get(void *p, long sz)
+{
+    if (sz == 1)
+        return *(unsigned char *)p;
+    if (sz == 2)
+        return *(unsigned short *)p;
+    if (sz == 4)
+        return *(unsigned int *)p;
+    return *(unsigned long *)p;
+}
+
+static void c6c_at_put(void *p, unsigned long v, long sz)
+{
+    if (sz == 1) {
+        *(unsigned char *)p = (unsigned char)v;
+        return;
+    }
+    if (sz == 2) {
+        *(unsigned short *)p = (unsigned short)v;
+        return;
+    }
+    if (sz == 4) {
+        *(unsigned int *)p = (unsigned int)v;
+        return;
+    }
+    *(unsigned long *)p = v;
+}
+
+/* fetch 系列：返回**改之前**的值 */
+unsigned long __c6_at_rmw(void *p, unsigned long v, long op, long sz)
+{
+    unsigned long old = 0;
+    unsigned long nv = 0;
+
+    c6c_at_lock();
+    old = c6c_at_get(p, sz);
+    if (op == C6C_AT_ADD)
+        nv = old + v;
+    else if (op == C6C_AT_SUB)
+        nv = old - v;
+    else if (op == C6C_AT_AND)
+        nv = old & v;
+    else if (op == C6C_AT_OR)
+        nv = old | v;
+    else
+        nv = old ^ v;
+    c6c_at_put(p, nv, sz);
+    __c6_unlock_((int *)&C6C_AT_LOCK);
+    return old;
+}
+
+unsigned long __c6_at_xchg(void *p, unsigned long v, long sz)
+{
+    unsigned long old = 0;
+
+    c6c_at_lock();
+    old = c6c_at_get(p, sz);
+    c6c_at_put(p, v, sz);
+    __c6_unlock_((int *)&C6C_AT_LOCK);
+    return old;
+}
+
+/* 比较交换：成功返回 1；失败把**实际值**写回 *expected（C11 的语义） */
+int __c6_at_cas(void *p, void *expected, unsigned long desired, long sz)
+{
+    unsigned long exp = 0;
+    unsigned long cur = 0;
+
+    c6c_at_lock();
+    exp = c6c_at_get(expected, sz);
+    cur = c6c_at_get(p, sz);
+    if (cur == exp) {
+        c6c_at_put(p, desired, sz);
+        __c6_unlock_((int *)&C6C_AT_LOCK);
+        return 1;
+    }
+    c6c_at_put(expected, cur, sz);
+    __c6_unlock_((int *)&C6C_AT_LOCK);
+    return 0;
+}
+
+/* atomic_flag：走 __c6_xchg8（xchg 指令，真原子、不用全局锁）。
+ * 这个典型用法 `while (atomic_flag_test_and_set(&f)); ... ; atomic_flag_clear(&f);`
+ * 是个自旋锁，等待者每圈都要抢一次——套上全局锁的话等待者把持有者饿死，
+ * tests2/124 的第三个用例 4 线程 2000 步就要 8 秒多。 */
+long __c6_xchg8(void *p, long v);
+
+_Bool atomic_flag_test_and_set(void *object)
+{
+    return __c6_xchg8(object, 1) ? 1 : 0;
+}
+
+void atomic_flag_clear(void *object)
+{
+    *(unsigned char *)object = 0;      /* store 后 xchg 的等待者立刻可见 */
+}
+
+static int c6c_err_flag;
+static int c6c_err_id;
+
+int __tcc_err_flag_get(void)
+{
+    return c6c_err_flag;
+}
+
+int __tcc_err_id_get(void)
+{
+    return c6c_err_id;
+}
+
+const char *__tcc_err_msg_get(void)
+{
+    return c6c_err_msg;
+}
+
+void __tcc_err_clear(void)
+{
+    c6c_err_flag = 0;
+    c6c_err_id = 0;
+    c6c_err_msg = 0;
+}
+
+void __tcc_err_set(int id, const char *msg)
+{
+    c6c_err_flag = 1;
+    c6c_err_id = id;
+    c6c_err_msg = (char *)msg;
+}
+
+void *malloc(long n)
+{
+    char *p = 0;
+    long need = (n + 15) & ~15L;
+
+    if (need <= 0)
+        need = 16;
+    if (need > c6c_brk_left) {
+        long cur = c6c_sys1(C6C_SYS_BRK, 0);
+        long want = need + 1048576;
+        long got = c6c_sys1(C6C_SYS_BRK, cur + want);
+
+        if (got < cur + need)
+            return 0;
+        c6c_brk_cur = (char *)cur;
+        c6c_brk_left = got - cur;
+    }
+    p = c6c_brk_cur;
+    c6c_brk_cur = p + need;
+    c6c_brk_left = c6c_brk_left - need;
+    return p;
+}
+
+/* calloc：malloc 那块 brk 内存本来就是零，但语义上还是要清零（复用的槽） */
+void *calloc(long n, long sz)
+{
+    long total = n * sz;
+    char *p = 0;
+    long i = 0;
+
+    if (n == 0 || sz == 0)
+        total = 1;
+    p = (char *)malloc(total);
+    if (!p)
+        return 0;
+    for (i = 0; i < total; i++)
+        p[i] = 0;
+    return p;
+}
+
+void free(void *p)
+{
+    (void)p;   /* 复用先不做：c6c 的运行时够用就行 */
+}
+
+void *realloc(void *old, long n)
+{
+    void *p = malloc(n);
+
+    if (!p)
+        return 0;
+    if (old)
+        c6c_mem_copy(p, old, n);
+    return p;
+}
+
+/* ---------- string.h ---------- */
+void *memcpy(void *dst, const void *src, long n)
+{
+    c6c_mem_copy(dst, src, n);
+    return dst;
+}
+
+void *memmove(void *dst, const void *src, long n)
+{
+    char *d = (char *)dst;
+    const char *s = (const char *)src;
+    long i = 0;
+
+    if (d <= s) {
+        for (i = 0; i < n; i++)
+            d[i] = s[i];
+    } else {
+        for (i = n - 1; i >= 0; i--)
+            d[i] = s[i];
+    }
+    return dst;
+}
+
+void *memset(void *dst, int c, long n)
+{
+    char *d = (char *)dst;
+    long i = 0;
+
+    for (i = 0; i < n; i++)
+        d[i] = (char)c;
+    return dst;
+}
+
+int memcmp(const void *a, const void *b, long n)
+{
+    const unsigned char *x = (const unsigned char *)a;
+    const unsigned char *y = (const unsigned char *)b;
+    long i = 0;
+
+    for (i = 0; i < n; i++) {
+        if (x[i] != y[i])
+            return (int)x[i] - (int)y[i];
+    }
+    return 0;
+}
+
+long strlen(const char *s)
+{
+    return c6c_strlen(s);
+}
+
+char *strcpy(char *dst, const char *src)
+{
+    long i = 0;
+
+    while (src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = 0;
+    return dst;
+}
+
+char *strncpy(char *dst, const char *src, long n)
+{
+    long i = 0;
+
+    while (i < n && src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    while (i < n) {
+        dst[i] = 0;
+        i++;
+    }
+    return dst;
+}
+
+char *strcat(char *dst, const char *src)
+{
+    long i = c6c_strlen(dst);
+    long j = 0;
+
+    while (src[j]) {
+        dst[i + j] = src[j];
+        j++;
+    }
+    dst[i + j] = 0;
+    return dst;
+}
+
+char *strncat(char *dst, const char *src, long n)
+{
+    long i = c6c_strlen(dst);
+    long j = 0;
+
+    while (j < n && src[j]) {
+        dst[i + j] = src[j];
+        j++;
+    }
+    dst[i + j] = 0;
+    return dst;
+}
+
+int strcmp(const char *a, const char *b)
+{
+    long i = 0;
+
+    while (a[i] && a[i] == b[i])
+        i++;
+    return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
+}
+
+int strncmp(const char *a, const char *b, long n)
+{
+    long i = 0;
+
+    while (i < n && a[i] && a[i] == b[i])
+        i++;
+    if (i >= n)
+        return 0;
+    return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
+}
+
+char *strchr(const char *s, int c)
+{
+    long i = 0;
+
+    while (s[i]) {
+        if ((unsigned char)s[i] == (unsigned char)c)
+            return (char *)s + i;
+        i++;
+    }
+    if ((unsigned char)c == 0)
+        return (char *)s + i;
+    return 0;
+}
+
+char *strrchr(const char *s, int c)
+{
+    long i = c6c_strlen(s);
+
+    /* 从尾部往回找，**找到就返回**。以前把匹配结果一路覆盖下去，最后留下的是
+     * 最靠前的那个——正好和 strrchr 的语义相反（tcc tests2 28_strings 踩到）。 */
+    while (i >= 0) {
+        if ((unsigned char)s[i] == (unsigned char)c)
+            return (char *)s + i;
+        i--;
+    }
+    return 0;
+}
+
+char *strstr(const char *hay, const char *needle)
+{
+    long i = 0;
+    long j = 0;
+    long n = c6c_strlen(needle);
+
+    if (n == 0)
+        return (char *)hay;
+    while (hay[i]) {
+        j = 0;
+        while (j < n && hay[i + j] == needle[j])
+            j++;
+        if (j == n)
+            return (char *)hay + i;
+        i++;
+    }
+    return 0;
+}
+
+char *strdup(const char *s)
+{
+    long n = c6c_strlen(s);
+    char *p = (char *)malloc(n + 1);
+
+    if (!p)
+        return 0;
+    c6c_mem_copy(p, s, n + 1);
+    return p;
+}
+
+/* ---------- 数字 → 字符串 ---------- */
+static long c6c_utoa(char *buf, unsigned long v, long base, long upper, long prec)
+{
+    char tmp[32] = {0};
+    long n = 0;
+    long i = 0;
+    const char *dig_lo = "0123456789abcdef";
+    const char *dig_hi = "0123456789ABCDEF";
+    const char *dig = upper ? dig_hi : dig_lo;
+
+    do {
+        tmp[n] = dig[v % (unsigned long)base];
+        n++;
+        v = v / (unsigned long)base;
+    } while (v != 0);
+    while ((n + 0) < prec) {
+        tmp[n] = '0';
+        n++;
+    }
+    for (i = 0; i < n; i++)
+        buf[i] = tmp[n - 1 - i];
+    return n;
+}
+
+/* ---------- 格式化 ---------- */
+static void c6c_out(char *out, long cap, long *n, const char *s, long len)
+{
+    long k = 0;
+
+    for (k = 0; k < len; k++) {
+        if (*n < cap - 1)
+            out[*n] = s[k];
+        (*n)++;
+    }
+}
+
+static void c6c_pad(char *out, long cap, long *n, long width, char pc)
+{
+    long k = 0;
+
+    for (k = 0; k < width; k++) {
+        if (*n < cap - 1)
+            out[*n] = pc;
+        (*n)++;
+    }
+}
+
+/* 浮点 → 文本：%f/%e/%g（conv 只收小写）。返回值是 body 的长度，*sign 是符号字符
+ * （0 表示不需要符号）。dv 的位模式从 va_arg 按 8 字节整型取出——本地约定里
+ * double 就是走整型寄存器传的，所以变参函数里也能拿到。 */
+static long c6c_fmt_double(char *body, double dv, long conv, long p, long alt, char *sign)
+{
+    unsigned long sc = 1;
+    unsigned long uval = 0;
+    unsigned long ip = 0;
+    unsigned long fp = 0;
+    long exp10 = 0;
+    long k = 0;
+    long len = 0;
+    long is_g = conv == 'g';
+    double orig = 0;
+    char frac[40] = {0};
+
+    *sign = 0;
+    if (dv != dv) {                    /* NaN：自己不等于自己 */
+        body[0] = 'n';
+        body[1] = 'a';
+        body[2] = 'n';
+        return 3;
+    }
+    if (dv < 0) {
+        *sign = '-';
+        dv = -dv;
+    }
+    orig = dv;
+    if (dv >= 1.8e308) {
+        body[0] = 'i';
+        body[1] = 'n';
+        body[2] = 'f';
+        return 3;
+    }
+    if (conv == 'e' || conv == 'g') {
+        if (dv != 0) {
+            while (dv >= 10.0) {
+                dv = dv / 10.0;
+                exp10++;
+            }
+            while (dv < 1.0) {
+                dv = dv * 10.0;
+                exp10--;
+            }
+        }
+    }
+    if (conv == 'g') {
+        long sig = p == 0 ? 1 : p;
+
+        if (exp10 < -4 || exp10 >= sig) {
+            conv = 'e';
+            p = sig - 1;
+        } else {
+            conv = 'f';
+            p = sig - 1 - exp10;
+            if (p < 0)
+                p = 0;
+            dv = orig;                    /* 还原量级：上面只是借归一化算指数 */
+        }
+    }
+    for (k = 0; k < p; k++)
+        sc = sc * 10;
+    /* 整数部分和小数部分分开算：整体乘 10^p 会超 53 位精度，
+     * 1234567890123.0 会印成 ...000064（踩过） */
+    if (dv < 18446744073709551616.0) {        /* 2^64：u64 装得下的都要取整数部分 */
+        ip = (unsigned long)dv;
+    } else {
+        ip = 0;
+    }
+    {
+        double t = (dv - (double)ip) * (double)sc;
+
+        if (t < 18446744073709551615.0)
+            uval = (unsigned long)(t + 0.5);
+        else
+            uval = 0;
+    }
+    if (uval >= sc) {                             /* 小数进位到整数部分 */
+        uval = uval - sc;
+        ip++;
+    }
+    fp = uval;
+    if (conv == 'e' && ip >= 10) {                /* 9.999 → 10.00：指数进位 */
+        ip = ip / 10;
+        exp10++;
+    }
+    len = c6c_utoa(body, ip, 10, 0, 1);
+    if (p > 0) {
+        long fl = 0;
+
+        body[len] = '.';
+        len++;
+        fl = c6c_utoa(frac, fp, 10, 0, p);
+        for (k = 0; k < fl; k++)
+            body[len + k] = frac[k];
+        len = len + fl;
+    } else if (alt) {
+        body[len] = '.';
+        len++;
+    }
+    if (is_g && !alt) {                           /* %g 去掉尾零 */
+        while (len > 1 && body[len - 1] == '0')
+            len--;
+        if (len > 1 && body[len - 1] == '.')
+            len--;
+    }
+    if (conv == 'e') {
+        long e2 = exp10 < 0 ? -exp10 : exp10;
+        long fl = 0;
+
+        body[len] = 'e';
+        len++;
+        body[len] = exp10 < 0 ? '-' : '+';
+        len++;
+        fl = c6c_utoa(frac, (unsigned long)e2, 10, 0, 2);
+        for (k = 0; k < fl; k++)
+            body[len + k] = frac[k];
+        len = len + fl;
+    }
+    return len;
+}
+
+long c6c_vfmt(char *out, long cap, const char *fmt, va_list ap)
+{
+    long n = 0;
+    long i = 0;
+    char body[512] = {0};
+
+    while (fmt[i]) {
+        char c = fmt[i];
+        long bodylen = 0;
+        long j = 0;
+        long ljust = 0;
+        long zero = 0;
+        long plus = 0;
+        long space = 0;
+        long alt = 0;
+        long width = 0;
+        long prec = -1;
+        long longs = 0;
+        char conv = 0;
+        char sign = 0;
+        char prefix[3] = {0};
+        long plen = 0;
+        long pad = 0;
+        long k = 0;
+
+        if (c != '%') {
+            if (n < cap - 1)
+                out[n] = c;
+            n++;
+            i++;
+            continue;
+        }
+        i++;
+        while (fmt[i]) {
+            char f = fmt[i];
+            long hit = 1;
+
+            if (f == '-')
+                ljust = 1;
+            else if (f == '0')
+                zero = 1;
+            else if (f == '+')
+                plus = 1;
+            else if (f == ' ')
+                space = 1;
+            else if (f == '#')
+                alt = 1;
+            else
+                hit = 0;
+            if (!hit)
+                break;
+            i++;
+        }
+        if (fmt[i] == '*') {
+            long w = (long)va_arg(ap, int);
+
+            i++;
+            if (w < 0) {
+                ljust = 1;
+                w = -w;
+            }
+            width = w;
+        } else {
+            while (fmt[i] >= '0' && fmt[i] <= '9') {
+                width = width * 10 + (long)(fmt[i] - '0');
+                i++;
+            }
+        }
+        if (fmt[i] == '.') {
+            i++;
+            if (fmt[i] == '*') {
+                prec = (long)va_arg(ap, int);
+                i++;
+            } else {
+                prec = 0;
+                while (fmt[i] >= '0' && fmt[i] <= '9') {
+                    prec = prec * 10 + (long)(fmt[i] - '0');
+                    i++;
+                }
+            }
+        }
+        while (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'z' || fmt[i] == 't'
+               || fmt[i] == 'j' || fmt[i] == 'L') {
+            if (fmt[i] == 'l' || fmt[i] == 'z' || fmt[i] == 't' || fmt[i] == 'j')
+                longs = 1;
+            i++;
+        }
+        conv = fmt[i];
+        if (conv)
+            i++;
+        if (conv == 0)
+            break;
+        if (conv == '%') {
+            if (n < cap - 1)
+                out[n] = '%';
+            n++;
+            continue;
+        }
+        if (conv == 'c') {
+            long v = (long)va_arg(ap, int);
+
+            body[0] = (char)v;
+            bodylen = 1;
+            pad = width - bodylen;
+            if (!ljust)
+                c6c_pad(out, cap, &n, pad, ' ');
+            c6c_out(out, cap, &n, body, bodylen);
+            if (ljust)
+                c6c_pad(out, cap, &n, pad, ' ');
+            continue;
+        }
+        if (conv == 's') {
+            char *s = (char *)va_arg(ap, char *);
+
+            if (!s)
+                s = "(null)";
+            bodylen = c6c_strlen(s);
+            if (prec >= 0 && bodylen > prec)
+                bodylen = prec;
+            pad = width - bodylen;
+            if (!ljust)
+                c6c_pad(out, cap, &n, pad, ' ');
+            c6c_out(out, cap, &n, s, bodylen);
+            if (ljust)
+                c6c_pad(out, cap, &n, pad, ' ');
+            continue;
+        }
+        if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E'
+            || conv == 'g' || conv == 'G') {
+            unsigned long raw = (unsigned long)va_arg(ap, unsigned long);
+            double dv = 0;
+            long lc = (conv >= 'A' && conv <= 'Z') ? conv + 32 : conv;
+
+            *(unsigned long *)&dv = raw;
+            bodylen = c6c_fmt_double(body, dv, lc, prec < 0 ? 6 : prec, alt, &sign);
+            if (conv >= 'A' && conv <= 'Z') {
+                /* %E / %G：小写生成，最后整段转大写 */
+                for (k = 0; k < bodylen; k++)
+                    if (body[k] >= 'a' && body[k] <= 'z')
+                        body[k] = (char)(body[k] - 32);
+            }
+            pad = width - bodylen - (sign ? 1 : 0);
+            if (zero && !ljust) {
+                if (sign) {
+                    c6c_out(out, cap, &n, &sign, 1);
+                    sign = 0;
+                }
+                c6c_pad(out, cap, &n, pad, '0');
+            } else if (!ljust) {
+                c6c_pad(out, cap, &n, pad, ' ');
+            }
+            if (sign)
+                c6c_out(out, cap, &n, &sign, 1);
+            c6c_out(out, cap, &n, body, bodylen);
+            if (ljust)
+                c6c_pad(out, cap, &n, pad, ' ');
+            continue;
+        }
+        if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X'
+            || conv == 'o' || conv == 'p') {
+            unsigned long v = 0;
+            long base = 10;
+            long upper = 0;
+            long neg = 0;
+
+            if (conv == 'p') {
+                v = (unsigned long)va_arg(ap, void *);
+                base = 16;
+                alt = 1;
+            } else if (conv == 'u') {
+                v = longs ? (unsigned long)va_arg(ap, unsigned long)
+                          : (unsigned long)va_arg(ap, unsigned int);
+            } else if (conv == 'd' || conv == 'i') {
+                long sv = longs ? (long)va_arg(ap, long) : (long)va_arg(ap, int);
+
+                if (sv < 0) {
+                    neg = 1;
+                    v = (unsigned long)(-sv);
+                } else {
+                    v = (unsigned long)sv;
+                }
+            } else {
+                v = longs ? (unsigned long)va_arg(ap, unsigned long)
+                          : (unsigned long)va_arg(ap, unsigned int);
+                base = (conv == 'o') ? 8 : 16;
+                upper = (conv == 'X');
+            }
+            if (prec < 0)
+                prec = 1;
+            bodylen = c6c_utoa(body, v, base, upper, prec);
+            if (neg)
+                sign = '-';
+            else if (plus)
+                sign = '+';
+            else if (space)
+                sign = ' ';
+            if (alt && base == 16) {
+                prefix[0] = '0';
+                prefix[1] = upper ? 'X' : 'x';
+                plen = 2;
+            } else if (alt && base == 8 && body[0] != '0') {
+                prefix[0] = '0';
+                plen = 1;
+            }
+            pad = width - bodylen - plen - (sign ? 1 : 0);
+            if (zero && !ljust && prec == 1) {
+                if (sign) {
+                    c6c_out(out, cap, &n, &sign, 1);
+                    sign = 0;
+                }
+                c6c_out(out, cap, &n, prefix, plen);
+                plen = 0;
+                c6c_pad(out, cap, &n, pad, '0');
+            } else if (!ljust) {
+                c6c_pad(out, cap, &n, pad, ' ');
+            }
+            if (sign)
+                c6c_out(out, cap, &n, &sign, 1);
+            if (plen)
+                c6c_out(out, cap, &n, prefix, plen);
+            c6c_out(out, cap, &n, body, bodylen);
+            if (ljust)
+                c6c_pad(out, cap, &n, pad, ' ');
+            continue;
+        }
+        /* 不认识的转换就原样印出来，方便定位 */
+        body[0] = '%';
+        body[1] = conv;
+        bodylen = 2;
+        if (prec >= 0) {
+            for (k = 0; k < 0; k++)
+                j = j;
+        }
+        c6c_out(out, cap, &n, body, bodylen);
+    }
+    if (cap > 0) {
+        if (n < cap)
+            out[n] = 0;
+        else
+            out[cap - 1] = 0;
+    }
+    return n;
+}
+
+/* ---------- stdio ---------- */
+static char c6c_obuf[8192] = {0};
+
+int printf(const char *fmt, ...)
+{
+    va_list ap = {0};
+    long n = 0;
+
+    va_start(ap, fmt);
+    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
+    va_end(ap);
+    if (n > (long)sizeof(c6c_obuf) - 1)
+        n = (long)sizeof(c6c_obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, 1, (long)c6c_obuf, n);
+    return (int)n;
+}
+
+int vfprintf(void *f, const char *fmt, va_list ap)
+{
+    long n = 0;
+    long fd = (long)f;
+
+    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
+    if (n > (long)sizeof(c6c_obuf) - 1)
+        n = (long)sizeof(c6c_obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, fd, (long)c6c_obuf, n);
+    return (int)n;
+}
+
+int vprintf(const char *fmt, va_list ap)
+{
+    return vfprintf((void *)1, fmt, ap);
+}
+
+int fprintf(void *f, const char *fmt, ...)
+{
+    va_list ap = {0};
+    long n = 0;
+    long fd = (long)f;
+
+    va_start(ap, fmt);
+    n = c6c_vfmt(c6c_obuf, (long)sizeof(c6c_obuf), fmt, ap);
+    va_end(ap);
+    if (n > (long)sizeof(c6c_obuf) - 1)
+        n = (long)sizeof(c6c_obuf) - 1;
+    c6c_sys3(C6C_SYS_WRITE, fd, (long)c6c_obuf, n);
+    return (int)n;
+}
+
+int sprintf(char *dst, const char *fmt, ...)
+{
+    va_list ap = {0};
+    long n = 0;
+
+    va_start(ap, fmt);
+    n = c6c_vfmt(dst, 0x7FFFFFFF, fmt, ap);
+    va_end(ap);
+    return (int)n;
+}
+
+/* f-string 的 `{x;b}`：printf 没有二进制转换，编译器为它调这个。
+ * 写进调用者给的缓冲（够 72 字节），返回同一个指针。 */
+char *__c6_fmt_bin(char *buf, unsigned long long v, int alt)
+{
+    char tmp[72] = {0};
+    int n = 0;
+    int i = 0;
+
+    while (v != 0 && n < 64) {
+        tmp[n++] = (char)('0' + (int)(v & 1u));
+        v = v >> 1;
+    }
+    if (n == 0)
+        tmp[n++] = '0';
+    if (alt) {
+        buf[i++] = '0';
+        buf[i++] = 'b';
+    }
+    while (n > 0)
+        buf[i++] = tmp[--n];
+    buf[i] = 0;
+    return buf;
+}
+
+int snprintf(char *dst, long cap, const char *fmt, ...)
+{
+    va_list ap = {0};
+    long n = 0;
+
+    va_start(ap, fmt);
+    n = c6c_vfmt(dst, cap, fmt, ap);
+    va_end(ap);
+    return (int)n;
+}
+
+int vsnprintf(char *dst, long cap, const char *fmt, va_list ap)
+{
+    return (int)c6c_vfmt(dst, cap, fmt, ap);
+}
+
+int puts(const char *s)
+{
+    long n = c6c_strlen(s);
+
+    c6c_sys3(C6C_SYS_WRITE, 1, (long)s, n);
+    c6c_sys3(C6C_SYS_WRITE, 1, (long)"\n", 1);
+    return (int)n + 1;
+}
+
+int putchar(int c)
+{
+    char b[1] = {0};
+
+    b[0] = (char)c;
+    c6c_sys3(C6C_SYS_WRITE, 1, (long)b, 1);
+    return (int)(unsigned char)c;
+}
+
+int fputs(const char *s, void *f)
+{
+    long fd = (long)f;
+
+    return (int)c6c_sys3(C6C_SYS_WRITE, fd, (long)s, c6c_strlen(s));
+}
+
+int fgetc(void *f)
+{
+    char b[1] = {0};
+
+    if (c6c_sys3(C6C_SYS_READ, (long)f, (long)b, 1) != 1)
+        return -1;
+    return (int)(unsigned char)b[0];
+}
+
+int getc(void *f)
+{
+    return fgetc(f);
+}
+
+int fputc(int c, void *f)
+{
+    char b[1] = {0};
+
+    b[0] = (char)c;
+    if (c6c_sys3(C6C_SYS_WRITE, (long)f, (long)b, 1) != 1)
+        return -1;
+    return (int)(unsigned char)c;
+}
+
+int putc(int c, void *f)
+{
+    return fputc(c, f);
+}
+
+char *fgets(char *buf, int n, void *f)
+{
+    int i = 0;
+    char ch[1] = {0};
+
+    while (i < n - 1) {
+        if (c6c_sys3(C6C_SYS_READ, (long)f, (long)ch, 1) != 1)
+            break;
+        buf[i] = ch[0];
+        i++;
+        if (ch[0] == '\n')
+            break;
+    }
+    buf[i] = 0;
+    if (i == 0)
+        return 0;
+    return buf;
+}
+
+int remove(const char *path)
+{
+    return (int)c6c_sys1(87, (long)path);   /* SYS_unlink */
+}
+
+int rename(const char *a, const char *b)
+{
+    return (int)c6c_sys2(82, (long)a, (long)b);   /* SYS_rename */
+}
+
+int getchar(void)
+{
+    char b[1] = {0};
+
+    if (c6c_sys3(C6C_SYS_READ, 0, (long)b, 1) != 1)
+        return -1;
+    return (int)(unsigned char)b[0];
+}
+
+void *fopen(const char *path, const char *mode)
+{
+    long flags = 0;
+    long fd = 0;
+
+    if (mode[0] == 'r')
+        flags = 0;
+    else if (mode[0] == 'w')
+        flags = 0x241;      /* O_WRONLY|O_CREAT|O_TRUNC */
+    else if (mode[0] == 'a')
+        flags = 0x441;      /* O_WRONLY|O_CREAT|O_APPEND */
+    fd = c6c_sys3(C6C_SYS_OPEN, (long)path, flags, 0666);
+    if (fd < 0)
+        return 0;
+    return (void *)fd;
+}
+
+int fclose(void *f)
+{
+    return (int)c6c_sys1(C6C_SYS_CLOSE, (long)f);
+}
+
+long fread(void *buf, long size, long n, void *f)
+{
+    long want = size * n;
+    long got = c6c_sys3(C6C_SYS_READ, (long)f, (long)buf, want);
+
+    if (got <= 0)
+        return 0;
+    return got / size;
+}
+
+long fwrite(const void *buf, long size, long n, void *f)
+{
+    long want = size * n;
+    long got = c6c_sys3(C6C_SYS_WRITE, (long)f, (long)buf, want);
+
+    if (got <= 0)
+        return 0;
+    return got / size;
+}
+
+int fflush(void *f)
+{
+    (void)f;
+    return 0;
+}
+
+int atoi(const char *s)
+{
+    long v = 0;
+    long neg = 0;
+    long i = 0;
+
+    while (s[i] == ' ' || s[i] == '\t' || s[i] == '\n')
+        i++;
+    if (s[i] == '-') {
+        neg = 1;
+        i++;
+    } else if (s[i] == '+') {
+        i++;
+    }
+    while (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10 + (long)(s[i] - '0');
+        i++;
+    }
+    return (int)(neg ? -v : v);
+}
+
+long strtol(const char *s, char **end, int base)
+{
+    long v = 0;
+    long neg = 0;
+    long i = 0;
+    long d = 0;
+
+    while (s[i] == ' ' || s[i] == '\t' || s[i] == '\n')
+        i++;
+    if (s[i] == '-') {
+        neg = 1;
+        i++;
+    } else if (s[i] == '+') {
+        i++;
+    }
+    if (base == 0) {
+        base = 10;
+        if (s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+            base = 16;
+            i = i + 2;
+        } else if (s[i] == '0') {
+            base = 8;
+        }
+    } else if (base == 16 && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i = i + 2;
+    }
+    while (1) {
+        char c = s[i];
+
+        d = -1;
+        if (c >= '0' && c <= '9')
+            d = (long)(c - '0');
+        else if (c >= 'a' && c <= 'z')
+            d = (long)(c - 'a') + 10;
+        else if (c >= 'A' && c <= 'Z')
+            d = (long)(c - 'A') + 10;
+        if (d < 0 || d >= base)
+            break;
+        v = v * base + d;
+        i++;
+    }
+    if (end)
+        *end = (char *)s + i;
+    return neg ? -v : v;
+}
+
+long strtoul(const char *s, char **end, int base)
+{
+    return strtol(s, end, base);
+}
+
+unsigned long long strtoull(const char *s, char **end, int base)
+{
+    return (unsigned long long)strtol(s, end, base);
+}
+
+long long strtoll(const char *s, char **end, int base)
+{
+    return (long long)strtol(s, end, base);
+}
+
+/* ctype（只做 ASCII） */
+int isdigit(int c) { return c >= '0' && c <= '9'; }
+int isalpha(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+int isalnum(int c) { return isdigit(c) || isalpha(c); }
+int isspace(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+int isupper(int c) { return c >= 'A' && c <= 'Z'; }
+int islower(int c) { return c >= 'a' && c <= 'z'; }
+int isprint(int c) { return c >= 0x20 && c < 0x7F; }
+int isxdigit(int c) { return isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+int toupper(int c) { return islower(c) ? c - 32 : c; }
+int tolower(int c) { return isupper(c) ? c + 32 : c; }
+
+
+/* ---------- 环境变量 ----------
+ * 入口只在 rdx 里给了 envp，运行时这边拿不到寄存器，所以直接读
+ * /proc/self/environ（NUL 分隔的 NAME=VALUE 串）。第一次调用时读进一块
+ * 静态缓冲，之后只做扫描。 */
+/* 64 KB：/proc/self/environ 里放的是整份环境，8 KB 的缓冲会截断尾巴
+ * （踩过：C6C_RT 恰好在末尾，于是 getenv 永远找不到） */
+static char c6c_envbuf[65536] = {0};
+static long c6c_envlen;
+
+static void c6c_env_load(void)
+{
+    long fd = 0;
+    long n = 0;
+
+    if (c6c_envlen)
+        return;
+    fd = open("/proc/self/environ", 0, 0);
+    if (fd < 0) {
+        c6c_envlen = -1;
+        return;
+    }
+    for (;;) {
+        long got = read(fd, c6c_envbuf + n, (long)sizeof(c6c_envbuf) - 1 - n);
+
+        if (got <= 0)
+            break;
+        n += got;
+        if (n >= (long)sizeof(c6c_envbuf) - 1)
+            break;
+    }
+    close(fd);
+    c6c_envbuf[n] = 0;
+    c6c_envlen = n ? n : -1;
+}
+
+/* _SC_* 名字（和 Linux 的编号一致，include/unistd.h 里写的是同一套） */
+#define C6C_SC_ARG_MAX              0
+#define C6C_SC_CLK_TCK              2
+#define C6C_SC_OPEN_MAX             4
+#define C6C_SC_PAGESIZE             30
+#define C6C_SC_NPROCESSORS_CONF     83
+#define C6C_SC_NPROCESSORS_ONLN     84
+
+/* 在线 CPU 个数：读 /sys/devices/system/cpu/online 的 "0-N" 形式，
+ * 读不到就给 1（宁可少开线程，也不要算错）。 */
+static long c6c_ncpu(void)
+{
+    char b[128] = {0};
+    long fd = 0;
+    long n = 0;
+    long i = 0;
+    long lo = -1;
+    long hi = -1;
+    int dash = 0;
+
+    fd = open("/sys/devices/system/cpu/online", 0, 0);
+    if (fd < 0)
+        return 1;
+    n = read(fd, b, (long)sizeof(b) - 1);
+    close(fd);
+    if (n <= 0)
+        return 1;
+    b[n] = 0;
+    for (i = 0; i < n; i++) {
+        char c = b[i];
+
+        if (c >= '0' && c <= '9') {
+            long v = (long)(c - '0');
+
+            if (dash) {
+                hi = (hi < 0 ? 0 : hi) * 10 + v;
+            } else {
+                lo = (lo < 0 ? 0 : lo) * 10 + v;
+            }
+        } else if (c == '-') {
+            dash = 1;
+        } else if (c == ',') {
+            break;
+        }
+    }
+    if (dash == 0)
+        hi = lo;
+    if (lo < 0 || hi < 0 || hi < lo)
+        return 1;
+    return hi - lo + 1;
+}
+
+long sysconf(int name)
+{
+    switch (name) {
+    case C6C_SC_PAGESIZE:
+        return 4096;
+    case C6C_SC_NPROCESSORS_ONLN:
+    case C6C_SC_NPROCESSORS_CONF:
+        return c6c_ncpu();
+    case C6C_SC_CLK_TCK:
+        return 100;
+    case C6C_SC_OPEN_MAX:
+        return 1024;
+    case C6C_SC_ARG_MAX:
+        return 131072;
+    }
+    return -1;
+}
+
+/* 临时名里那 6 位随机数的计数器（mkstemp/mkdtemp 共用） */
+static unsigned int c6c_mktemp_n;
+
+/* `mkdtemp`：把模板的 XXXXXX 换掉再 mkdir */
+char *mkdtemp(char *tmpl)
+{
+    long n = strlen(tmpl);
+    unsigned int v = 0;
+    int i = 0;
+
+    if (n < 6)
+        return NULL;
+    v = (unsigned int)getpid() * 2246822519u + c6c_mktemp_n * 2654435761u + 7919u;
+    c6c_mktemp_n++;
+    for (i = 0; i < 6; i++) {
+        long k = n - 6 + i;
+        unsigned int d = v % 36u;
+
+        tmpl[k] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        v /= 36u;
+    }
+    if (mkdir(tmpl, 0700) != 0)
+        return NULL;
+    return tmpl;
+}
+
+/* `access`：用 faccessat(AT_FDCWD, path, mode, 0)（269 号） */
+#define C6C_SYS_FACCESSAT 269
+#define C6C_AT_FDCWD (-100)
+
+int access(const char *path, int mode)
+{
+    return (int)c6c_sys4(C6C_SYS_FACCESSAT, C6C_AT_FDCWD, (long)path, mode, 0);
+}
+
+/* pty：`posix_openpt` 就是开 /dev/ptmx，剩下几个是 ioctl 封装。 */
+int posix_openpt(int flags)
+{
+    return (int)open("/dev/ptmx", O_RDWR | (flags & O_NONBLOCK), 0);
+}
+
+int grantpt(int fd)
+{
+    (void)fd;
+    return 0;
+}
+
+int unlockpt(int fd)
+{
+    int zero = 0;
+    /* TIOCSPTLCK = 0x40045431 */
+    return (int)ioctl(fd, 0x40045431ul, &zero);
+}
+
+char *ptsname(int fd)
+{
+    int n = -1;
+    static char buf[64];
+    int i = 0;
+
+    /* TIOCGPTN = 0x80045430 */
+    if (ioctl(fd, 0x80045430ul, &n) != 0)
+        return NULL;
+    for (i = 0; i < 64; i++)
+        buf[i] = 0;
+    {
+        const char *pre = "/dev/pts/";
+        int k = 0;
+
+        while (pre[k]) {
+            buf[k] = pre[k];
+            k++;
+        }
+        /* 十进制 */
+        if (n == 0) {
+            buf[k++] = '0';
+        } else {
+            char tmp[16] = {0};
+            int t = 0;
+
+            while (n > 0) {
+                tmp[t++] = (char)('0' + n % 10);
+                n /= 10;
+            }
+            while (t > 0)
+                buf[k++] = tmp[--t];
+        }
+        buf[k] = 0;
+    }
+    return buf;
+}
+
+/* setenv/unsetenv：改不了内核给的那块 environ，所以在运行时这边维护一张
+ * 覆盖表，getenv 先查它。表和比较函数要排在 getenv 前面。 */
+#define C6C_SETENV_MAX 32
+static const char *c6c_setenv_k[C6C_SETENV_MAX];
+static const char *c6c_setenv_v[C6C_SETENV_MAX];
+static int c6c_setenv_n;
+
+static int c6c_streq_n(const char *a, const char *b, long n)
+{
+    long i = 0;
+
+    for (i = 0; i < n; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
+char *getenv(const char *name)
+{
+    long nl = strlen(name);
+    long i = 0;
+    int k = 0;
+
+    for (k = 0; k < c6c_setenv_n; k++)
+        if (c6c_streq_n(c6c_setenv_k[k], name, nl) && c6c_setenv_k[k][nl] == 0)
+            return (char *)c6c_setenv_v[k];
+    c6c_env_load();
+    if (c6c_envlen < 0)
+        return NULL;
+    while (i < c6c_envlen) {
+        const char *e = c6c_envbuf + i;
+        long el = strlen(e);
+        long k = 0;
+
+        for (k = 0; k < nl; k++)
+            if (e[k] != name[k])
+                break;
+        if (k == nl && e[nl] == '=')
+            return (char *)e + nl + 1;
+        i += el + 1;
+    }
+    return NULL;
+}
+
+void *memchr(const void *s, int c, unsigned long n)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned long i = 0;
+
+    for (i = 0; i < n; i++)
+        if (p[i] == (unsigned char)c)
+            return (void *)(p + i);
+    return NULL;
+}
+
+unsigned long strspn(const char *s, const char *accept)
+{
+    unsigned long n = 0;
+
+    while (s[n] && strchr(accept, s[n]))
+        n++;
+    return n;
+}
+
+unsigned long strcspn(const char *s, const char *reject)
+{
+    unsigned long n = 0;
+
+    while (s[n] && !strchr(reject, s[n]))
+        n++;
+    return n;
+}
+
+char *strpbrk(const char *s, const char *accept)
+{
+    while (*s) {
+        if (strchr(accept, *s))
+            return (char *)s;
+        s++;
+    }
+    return NULL;
+}
+
+/* qsort：堆排 + 手写交换（不额外要内存，元素大小任意） */
+static void c6c_swap(char *a, char *b, unsigned long n)
+{
+    unsigned long i = 0;
+
+    for (i = 0; i < n; i++) {
+        char t = a[i];
+
+        a[i] = b[i];
+        b[i] = t;
+    }
+}
+
+static void c6c_sift(char *base, unsigned long start, unsigned long n, unsigned long sz,
+                     int (*cmp)(const void *, const void *))
+{
+    unsigned long root = start;
+
+    for (;;) {
+        unsigned long child = root * 2 + 1;
+        unsigned long sw = root;
+
+        if (child < n
+            && cmp(base + sw * sz, base + child * sz) < 0)
+            sw = child;
+        if (child + 1 < n
+            && cmp(base + sw * sz, base + (child + 1) * sz) < 0)
+            sw = child + 1;
+        if (sw == root)
+            return;
+        c6c_swap(base + root * sz, base + sw * sz, sz);
+        root = sw;
+    }
+}
+
+void qsort(void *base, unsigned long n, unsigned long sz,
+           int (*cmp)(const void *, const void *))
+{
+    char *b = (char *)base;
+    unsigned long i = 0;
+
+    if (n < 2 || !sz)
+        return;
+    i = n / 2;
+    while (i > 0) {
+        i--;
+        c6c_sift(b, i, n, sz, cmp);
+    }
+    i = n - 1;
+    while (i > 0) {
+        c6c_swap(b, b + i * sz, sz);
+        c6c_sift(b, 0, i, sz, cmp);
+        i--;
+    }
+}
+
+void *bsearch(const void *key, const void *base, unsigned long n, unsigned long sz,
+              int (*cmp)(const void *, const void *))
+{
+    const char *b = (const char *)base;
+    unsigned long lo = 0;
+    unsigned long hi = n;
+
+    while (lo < hi) {
+        unsigned long mid = lo + (hi - lo) / 2;
+        int c = cmp(key, b + mid * sz);
+
+        if (c == 0)
+            return (void *)(b + mid * sz);
+        if (c < 0)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return NULL;
+}
+
+long time(long *t)
+{
+    long v = c6c_sys1(C6C_SYS_TIME, 0);
+
+    if (t)
+        *t = v;
+    return v;
+}
+
+int getpid(void)
+{
+    return (int)c6c_sys1(C6C_SYS_GETPID, 0);
+}
+
+int getuid(void)
+{
+    return (int)c6c_sys1(C6C_SYS_GETUID, 0);
+}
+
+int geteuid(void)
+{
+    return (int)c6c_sys1(C6C_SYS_GETEUID, 0);
+}
+
+int setsid(void)
+{
+    return (int)c6c_sys1(C6C_SYS_SETSID, 0);
+}
+
+int dup(int fd)
+{
+    return (int)c6c_sys1(C6C_SYS_DUP, fd);
+}
+
+int dup2(int oldfd, int newfd)
+{
+    return (int)c6c_sys2(C6C_SYS_DUP2, oldfd, newfd);
+}
+
+/* nice()：成功返回**新的** nice 值（syscall 就是这么报的） */
+int nice(int inc)
+{
+    return (int)c6c_sys1(C6C_SYS_NICE, inc);
+}
+
+/* ---------- 进程 / 终端 / 临时文件 ---------- */
+
+int wait(int *status)
+{
+    return waitpid(-1, status, 0);
+}
+
+int fork(void)
+{
+    return (int)c6c_sys1(C6C_SYS_FORK, 0);
+}
+
+int waitpid(int pid, int *status, int options)
+{
+    return (int)c6c_sys4(C6C_SYS_WAIT4, pid, (long)status, options, 0);
+}
+
+long ioctl(int fd, unsigned long req, void *arg)
+{
+    return c6c_sys3(C6C_SYS_IOCTL, fd, (long)req, (long)arg);
+}
+
+/* `isatty(fd)` 就是 ioctl(TCGETS)：能拿到终端参数就是 tty。 */
+#define C6C_TCGETS 0x5401
+
+int usleep(unsigned int usec)
+{
+    struct timespec ts = {0};
+
+    ts.tv_sec = (long)(usec / 1000000u);
+    ts.tv_nsec = (long)((usec % 1000000u) * 1000u);
+    return (int)c6c_sys2(C6C_SYS_NANOSLEEP, (long)&ts, 0);
+}
+
+int isatty(int fd)
+{
+    char buf[64] = {0};
+    long r = ioctl(fd, C6C_TCGETS, buf);
+
+    return r == 0 ? 1 : 0;
+}
+
+/* 模板里的 `XXXXXX` 换成"pid + 递增计数"，O_CREAT|O_EXCL 保证不撞。 */
+int mkstemp(char *tmpl)
+{
+    long n = strlen(tmpl);
+    unsigned int v = 0;
+    int i = 0;
+    int fd = 0;
+
+    if (n < 6)
+        return -1;
+    v = (unsigned int)getpid() * 2654435761u + c6c_mktemp_n * 40503u + 12345u;
+    c6c_mktemp_n++;
+    for (i = 0; i < 6; i++) {
+        long k = n - 6 + i;
+        unsigned int d = v % 36u;
+
+        tmpl[k] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        v /= 36u;
+    }
+    fd = (int)open(tmpl, O_CREAT | O_EXCL | O_RDWR, 0600);
+    return fd < 0 ? -1 : fd;
+}
+
+static int c6c_setenv_find(const char *name, long nl)
+{
+    int i = 0;
+
+    for (i = 0; i < c6c_setenv_n; i++)
+        if (c6c_streq_n(c6c_setenv_k[i], name, nl) && c6c_setenv_k[i][nl] == 0)
+            return i;
+    return -1;
+}
+
+int setenv(const char *name, const char *val, int overwrite)
+{
+    long nl = strlen(name);
+    int i = c6c_setenv_find(name, nl);
+
+    if (i >= 0) {
+        if (!overwrite)
+            return 0;
+        c6c_setenv_v[i] = val;
+        return 0;
+    }
+    if (c6c_setenv_n >= C6C_SETENV_MAX)
+        return -1;
+    c6c_setenv_k[c6c_setenv_n] = name;
+    c6c_setenv_v[c6c_setenv_n] = val;
+    c6c_setenv_n++;
+    return 0;
+}
+
+int unsetenv(const char *name)
+{
+    long nl = strlen(name);
+    int i = c6c_setenv_find(name, nl);
+
+    if (i < 0)
+        return 0;
+    for (; i + 1 < c6c_setenv_n; i++) {
+        c6c_setenv_k[i] = c6c_setenv_k[i + 1];
+        c6c_setenv_v[i] = c6c_setenv_v[i + 1];
+    }
+    c6c_setenv_n--;
+    return 0;
+}
+
+int clock_gettime(int clk, struct timespec *ts)
+{
+    return (int)c6c_sys2(C6C_SYS_CLOCK_GETTIME, clk, (long)ts);
+}
+
+/* struct tm 的布局（glibc：9 个 int + long + 指针），用私有镜像结构写，
+ * 免得和 <time.h> 的定义撞车 */
+struct tm;
+
+typedef struct C6CTm {
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
+    long tm_gmtoff;
+    const char *tm_zone;
+} C6CTm;
+
+static C6CTm c6c_tm;
+
+static void c6c_tm_fill(C6CTm *t, long tt)
+{
+    long days = tt / 86400;
+    long rem = tt % 86400;
+    long z = days + 719468;
+    long era = (z >= 0 ? z : z - 146096) / 146097;
+    long doe = z - era * 146097;
+    long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long y = yoe + era * 400;
+    long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    long mp = (5 * doy + 2) / 153;
+
+    if (rem < 0) {
+        rem += 86400;
+        days--;
+    }
+    t->tm_hour = (int)(rem / 3600);
+    t->tm_min = (int)((rem % 3600) / 60);
+    t->tm_sec = (int)(rem % 60);
+    t->tm_mday = (int)(doy - (153 * mp + 2) / 5 + 1);
+    t->tm_mon = (int)(mp < 10 ? mp + 2 : mp - 10);
+    t->tm_year = (int)(y + (t->tm_mon <= 1) - 1900);
+    t->tm_wday = (int)((days + 4) % 7);
+    if (t->tm_wday < 0)
+        t->tm_wday += 7;
+    t->tm_yday = (int)doy;
+    t->tm_isdst = 0;
+    t->tm_gmtoff = 0;
+    t->tm_zone = "UTC";
+}
+
+struct tm *gmtime(const long *tt)
+{
+    if (!tt)
+        return NULL;
+    c6c_tm_fill(&c6c_tm, *tt);
+    return (struct tm *)&c6c_tm;
+}
+
+struct tm *localtime(const long *tt)
+{
+    return gmtime(tt);          /* 不做时区换算：先按 UTC 用 */
+}
+
+long mktime(struct tm *t)
+{
+    C6CTm *m = (C6CTm *)t;
+    long y = m->tm_year + 1900;
+    long mo = m->tm_mon;
+    long days = 0;
+    long era = 0;
+    long yoe = 0;
+    long doy = 0;
+    long doe = 0;
+    long z = 0;
+
+    y -= mo <= 1;
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = y - era * 400;
+    doy = (153 * (mo > 1 ? mo - 2 : mo + 10) + 2) / 5 + m->tm_mday - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    z = era * 146097 + doe - 719468;
+    days = z;
+    return days * 86400 + m->tm_hour * 3600 + m->tm_min * 60 + m->tm_sec;
+}
+
+double difftime(long a, long b)
+{
+    return (double)(a - b);
+}
+
+static void c6c_tm_pad2(char *out, long *n, int v)
+{
+    out[(*n)++] = (char)('0' + (v / 10) % 10);
+    out[(*n)++] = (char)('0' + v % 10);
+}
+
+unsigned long strftime(char *out, unsigned long cap, const char *fmt, struct tm *t)
+{
+    C6CTm *m = (C6CTm *)t;
+    long n = 0;
+    long i = 0;
+
+    if (!cap)
+        return 0;
+    while (fmt[i] && n + 8 < (long)cap) {
+        if (fmt[i] != '%') {
+            out[n++] = fmt[i++];
+            continue;
+        }
+        i++;
+        switch (fmt[i]) {
+        case 'Y': n += (long)snprintf(out + n, cap - (unsigned long)n, "%d", m->tm_year + 1900); i++; break;
+        case 'm': c6c_tm_pad2(out, &n, m->tm_mon + 1); i++; break;
+        case 'd': c6c_tm_pad2(out, &n, m->tm_mday); i++; break;
+        case 'H': c6c_tm_pad2(out, &n, m->tm_hour); i++; break;
+        case 'M': c6c_tm_pad2(out, &n, m->tm_min); i++; break;
+        case 'S': c6c_tm_pad2(out, &n, m->tm_sec); i++; break;
+        case '%': out[n++] = '%'; i++; break;
+        default: out[n++] = '%'; break;
+        }
+    }
+    out[n < (long)cap ? n : (long)cap - 1] = 0;
+    return (unsigned long)n;
+}
+
+char *strerror(int e)
+{
+    (void)e;
+    return (char *)"error";
+}
+
+static unsigned long c6c_rand_state = 12345;
+
+int rand(void)
+{
+    c6c_rand_state = c6c_rand_state * 1103515245UL + 12345UL;
+
+    return (int)((c6c_rand_state >> 16) & 0x7FFFFFFF);
+}
+
+void srand(unsigned int seed)
+{
+    c6c_rand_state = seed;
+}
+
+long long llabs(long long v)
+{
+    return v < 0 ? -v : v;
+}
+
+long labs(long v)
+{
+    return v < 0 ? -v : v;
+}
+
+int abs(int v)
+{
+    return v < 0 ? -v : v;
+}
+
+long long atoll(const char *s)
+{
+    return (long long)strtol(s, NULL, 10);
+}
+
+double strtod(const char *s, char **end)
+{
+    double v = 0.0;
+    double scale = 0.1;
+    int neg = 0;
+    long i = 0;
+    int frac = 0;
+
+    while (s[i] == ' ' || s[i] == '\t' || s[i] == '\n')
+        i++;
+    if (s[i] == '-') {
+        neg = 1;
+        i++;
+    } else if (s[i] == '+') {
+        i++;
+    }
+    while (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10.0 + (double)(s[i] - '0');
+        i++;
+    }
+    if (s[i] == '.') {
+        i++;
+        frac = 1;
+        while (s[i] >= '0' && s[i] <= '9') {
+            v += scale * (double)(s[i] - '0');
+            scale *= 0.1;
+            i++;
+        }
+    }
+    (void)frac;
+    /* 指数部分：以前完全没处理，于是 `.123E12` 只解析出 0.123、`1e19` 只解析出
+     * 1——用 c6c 编出来的 tcc 因此把浮点字面量算错（tcc tests2 的
+     * 70_floating_point_literals、134_double_to_signed 就是这么挂的）。 */
+    if (s[i] == 'e' || s[i] == 'E') {
+        int eneg = 0;
+        long e = 0;
+        long k = i + 1;
+        int any = 0;
+
+        if (s[k] == '-') {
+            eneg = 1;
+            k++;
+        } else if (s[k] == '+') {
+            k++;
+        }
+        while (s[k] >= '0' && s[k] <= '9') {
+            any = 1;
+            if (e < 400)
+                e = e * 10 + (s[k] - '0');
+            k++;
+        }
+        if (any) {
+            while (e-- > 0) {
+                if (eneg)
+                    v /= 10.0;
+                else
+                    v *= 10.0;
+            }
+            i = k;
+        }
+    }
+    if (end)
+        *end = (char *)s + i;
+    return neg ? -v : v;
+}
+
+double atof(const char *s)
+{
+    return strtod(s, NULL);
+}
+
+/* getloadavg()：读 /proc/loadavg 的前三个数。c6c 没有 libc，自己解析。 */
+int getloadavg(double *av, int n)
+{
+    char buf[128] = {0};
+    long fd = -1;
+    long r = 0;
+    int i = 0;
+    char *p = buf;
+
+    if (n <= 0 || !av)
+        return -1;
+    fd = open("/proc/loadavg", 0, 0);
+    if (fd < 0)
+        return -1;
+    r = read(fd, buf, (long)sizeof(buf) - 1);
+    close(fd);
+    if (r <= 0)
+        return -1;
+    buf[r] = 0;
+    for (i = 0; i < n && i < 3; i++) {
+        av[i] = strtod(p, &p);
+        while (*p == ' ')
+            p++;
+    }
+    return i;
+}
+
+/* memmem()：找子串（找不到返回 NULL） */
+void *memmem(const void *hay, size_t hn, const void *needle, size_t nn)
+{
+    const char *h = (const char *)hay;
+    const char *nd = (const char *)needle;
+    size_t i = 0;
+
+    if (nn == 0)
+        return (void *)h;
+    if (hn < nn)
+        return 0;
+    for (i = 0; i + nn <= hn; i++)
+        if (h[i] == nd[0] && !memcmp(h + i, nd, nn))
+            return (void *)(h + i);
+    return 0;
+}
+
+/* ---------- 断言 / 线程桩 ----------
+ * 真实代码（包括 tcc 的测试）会直接引用 glibc 的这些符号。c6c 的运行时是单线程
+ * 的，所以线程相关的都做成"同步执行 + 立即返回"的桩：语义上退化成串行，
+ * 但不静默——注释在这里写清楚。 */
+void __assert_fail(const char *expr, const char *file, unsigned int line, const char *func)
+{
+    printf("%s:%u: %s: Assertion `%s' failed.\n", file, (unsigned long)line, func, expr);
+    exit(1);
+}
+
+/* pthread_create / pthread_join：真线程，见下面的 c6c_th_*（clone + 汇编写跳板）。 */
+
+int pthread_condattr_init(void *a) { (void)a; return 0; }
+int pthread_condattr_destroy(void *a) { (void)a; return 0; }
+int pthread_condattr_setpshared(void *a, int v) { (void)a; (void)v; return 0; }
+int pthread_cond_init(void *c, const void *a) { (void)c; (void)a; return 0; }
+int pthread_cond_destroy(void *c) { (void)c; return 0; }
+int pthread_cond_wait(void *c, void *m) { (void)c; (void)m; return 0; }
+int pthread_cond_signal(void *c) { (void)c; return 0; }
+int pthread_cond_broadcast(void *c) { (void)c; return 0; }
+int pthread_mutex_init(void *m, const void *a) { (void)m; (void)a; return 0; }
+int pthread_mutex_destroy(void *m) { (void)m; return 0; }
+int pthread_mutex_lock(void *m) { (void)m; return 0; }
+int pthread_mutex_unlock(void *m) { (void)m; return 0; }
+int pthread_attr_init(void *a) { (void)a; return 0; }
+int pthread_attr_destroy(void *a) { (void)a; return 0; }
+
+
+/* ---------- 给 tcc 这类"真程序"补的运行时 ----------
+ * 目标是让 c6c 编出来的 tcc 能链接。语义上能做的就做（getcwd/unlink/文件定位），
+ * 做不了或没有意义的明确退化：没有动态链接（dlopen 一律 NULL）、没有信号
+ * （sigaction 返回 0）、没有真线程（sem_* 是空操作）、没有真正的 longjmp
+ * （直接退出，避免静默走错路）。每一条都在这里写清楚。 */
+char *getcwd(char *buf, size_t size)
+{
+    long r = c6c_sys2(79 /* getcwd */, (long)buf, (long)size);
+
+    if (r < 0)
+        return 0;
+    return buf;
+}
+
+int unlink(const char *path)
+{
+    long r = c6c_sys1(87 /* unlink */, (long)path);
+
+    return (int)r;
+}
+
+int execvp(const char *file, char *const argv[])
+{
+    long r = c6c_sys3(59 /* execve */, (long)file, (long)argv, (long)environ);
+
+    return (int)r;
+}
+
+/* realpath：相对路径按 cwd 展开、折叠 "." / ".." / 多余斜杠，最后确认文件存在。
+ * resolved 为 NULL 时自己 malloc（glibc 的行为）。以前这里是个只会填 cwd 的桩，
+ * 于是 tcc（用 c6c 编出来的那个）里 `#pragma once` 的
+ * `normalized_PATHCMP()` 永远失败，同一个头文件被包含好几次
+ * （tcc tests2 的 18_include 就是这么暴露的）。 */
+char *realpath(const char *path, char *resolved)
+{
+    static char full[4096];
+    static char out[4096];
+    int fl = 0;
+    int ol = 1;
+    int i = 0;
+    char *buf = resolved;
+
+    if (!path || !*path)
+        return 0;
+    if (path[0] != '/') {
+        if (!getcwd(full, (int)sizeof(full)))
+            return 0;
+        fl = (int)strlen(full);
+        if (fl > 0 && full[fl - 1] != '/' && fl < (int)sizeof(full) - 1)
+            full[fl++] = '/';
+    }
+    for (i = 0; path[i] && fl < (int)sizeof(full) - 1; i++)
+        full[fl++] = path[i];
+    full[fl] = 0;
+
+    out[0] = '/';
+    out[1] = 0;
+    i = 0;
+    while (full[i]) {
+        int s = 0;
+        int n = 0;
+
+        while (full[i] == '/')
+            i++;
+        s = i;
+        while (full[i] && full[i] != '/')
+            i++;
+        n = i - s;
+        if (n == 0)
+            continue;
+        if (n == 1 && full[s] == '.')
+            continue;
+        if (n == 2 && full[s] == '.' && full[s + 1] == '.') {
+            while (ol > 1 && out[ol - 1] != '/')
+                ol--;
+            if (ol > 1)
+                ol--;
+            out[ol] = 0;
+            continue;
+        }
+        if (ol > 1 && out[ol - 1] != '/' && ol < (int)sizeof(out) - 1)
+            out[ol++] = '/';
+        {
+            int k = 0;
+
+            for (k = 0; k < n && ol < (int)sizeof(out) - 1; k++)
+                out[ol++] = full[s + k];
+        }
+        out[ol] = 0;
+    }
+    if (out[0] != '/') {
+        out[0] = '/';
+        ol = 1;
+        out[1] = 0;
+    }
+    /* 必须真的存在（access(F_OK)） */
+    if ((long)c6c_sys2(21 /* access */, (long)out, 0) != 0)
+        return 0;
+    if (!buf) {
+        buf = (char *)malloc((long)ol + 1);
+        if (!buf)
+            return 0;
+    }
+    for (i = 0; i <= ol; i++)
+        buf[i] = out[i];
+    return buf;
+}
+
+int gettimeofday(void *tv, void *tz)
+{
+    (void)tz;
+    return (int)c6c_sys2(96 /* gettimeofday */, (long)tv, 0);
+}
+
+/* 约定：FILE* 就是文件描述符本身（见上面的 fopen） */
+int fseek(FILE *f, long off, int whence)
+{
+    long r = c6c_sys3(C6C_SYS_LSEEK, (long)f, off, (long)whence);
+
+    return r < 0 ? -1 : 0;
+}
+
+long ftell(FILE *f)
+{
+    return c6c_sys3(C6C_SYS_LSEEK, (long)f, 0, 1 /* SEEK_CUR */);
+}
+
+FILE *fdopen(int fd, const char *mode)
+{
+    (void)mode;
+    return (FILE *)(long)fd;
+}
+
+FILE *freopen(const char *path, const char *mode, FILE *f)
+{
+    (void)f;
+    return (FILE *)fopen(path, mode);
+}
+
+/* libc 自己那份：c6 里只引用不定义要写 extern */
+extern char **environ;
+
+float strtof(const char *s, char **end)
+{
+    return (float)strtod(s, end);
+}
+
+long double strtold(const char *s, char **end)
+{
+    return (long double)strtod(s, end);
+}
+
+long double ldexpl(long double x, int e)
+{
+    long double r = x;
+    int i = 0;
+
+    for (i = 0; i < (e > 0 ? e : -e); i++)
+        r = (e > 0) ? r * 2.0L : r / 2.0L;
+    return r;
+}
+
+/* 动态链接：c6c 产出静态可执行文件，没有 .so 可加载 */
+void *dlopen(const char *path, int flags) { (void)path; (void)flags; return 0; }
+void *dlsym(void *h, const char *name) { (void)h; (void)name; return 0; }
+int dlclose(void *h) { (void)h; return 0; }
+char *dlerror(void) { return (char *)"dynamic loading is not available"; }
+
+/* 信号：c6c 的运行时没有信号投递 */
+int sigemptyset(void *set) { (void)set; return 0; }
+int sigaddset(void *set, int s) { (void)set; (void)s; return 0; }
+int sigprocmask(int how, const void *set, void *old) { (void)how; (void)set; (void)old; return 0; }
+int sigaction(int s, const void *act, void *old) { (void)s; (void)act; (void)old; return 0; }
+
+/* 信号量：单线程，空操作 */
+int sem_init(void *s, int pshared, unsigned int v) { (void)s; (void)pshared; (void)v; return 0; }
+int sem_wait(void *s) { (void)s; return 0; }
+int sem_post(void *s) { (void)s; return 0; }
+int sem_destroy(void *s) { (void)s; return 0; }
+
+/* longjmp：没有可恢复的栈上下文（要保存 rsp/rip），明确退出而不是静默错走 */
+int _setjmp(void *buf) { (void)buf; return 0; }
+void longjmp(void *buf, int v)
+{
+    (void)buf;
+    (void)v;
+    _exit(2);
+}
+
+
+/* ---------- 数学函数（double） ----------
+ * 目标不是 bit 级复刻 libm，而是"6 位小数跟 glibc 一致"。用的都是收敛很快的
+ * 级数 + 区间归约，误差在 1e-15 量级，远小于 %f 的 1e-6 需求。
+ * 注意：只处理 double（c6c 的 long double 就是 double）。 */
+
+double fabs(double x) { return x < 0 ? -x : x; }
+
+double floor(double x)
+{
+    double t = (double)(long)x;
+
+    if (t > x)
+        t -= 1.0;
+    return t;
+}
+
+double ceil(double x)
+{
+    double t = (double)(long)x;
+
+    if (t < x)
+        t += 1.0;
+    return t;
+}
+
+double fmod(double x, double y)
+{
+    double q = 0;
+
+    if (y == 0.0)
+        return 0.0;
+    q = x / y;
+    q = (double)(long)q;            /* 向零取整 */
+    return x - q * y;
+}
+
+double sqrt(double x)
+{
+    double g = 0;
+    int i = 0;
+
+    if (x <= 0.0)
+        return 0.0;
+    g = x > 1.0 ? x : 1.0;
+    for (i = 0; i < 60; i++)
+        g = 0.5 * (g + x / g);
+    return g;
+}
+
+/* exp(x)：先折半到 |r| <= 0.5，再 Taylor，最后平方回去 */
+double exp(double x)
+{
+    double r = x;
+    double sum = 1.0;
+    double term = 1.0;
+    int k = 0;
+    int i = 0;
+
+    while (r > 0.5) { r = r * 0.5; k++; }
+    while (r < -0.5) { r = r * 0.5; k++; }
+    for (i = 1; i < 30; i++) {
+        term = term * r / (double)i;
+        sum = sum + term;
+    }
+    for (i = 0; i < k; i++)
+        sum = sum * sum;
+    return sum;
+}
+
+/* log(x)：用 x = m * 2^e 归约，m 再折到 [sqrt(0.5), sqrt(2)]，用 atanh 级数 */
+double log(double x)
+{
+    double m = x;
+    double s = 0;
+    double z = 0;
+    double term = 0;
+    double sum = 0;
+    int e = 0;
+    int i = 0;
+
+    if (x <= 0.0)
+        return -1.0e308;
+    /* 归约方向别搞反：除以 2 指数 +1，乘以 2 指数 -1 */
+    while (m >= 1.4142135623730951) { m = m * 0.5; e++; }
+    while (m < 0.7071067811865476) { m = m * 2.0; e--; }
+    z = (m - 1.0) / (m + 1.0);
+    term = z;
+    sum = z;
+    for (i = 3; i < 60; i += 2) {
+        term = term * z * z;
+        sum = sum + term / (double)i;
+    }
+    s = 2.0 * sum + (double)e * 0.6931471805599453;
+    return s;
+}
+
+double log10(double x) { return log(x) / 2.302585092994046; }
+double log2(double x) { return log(x) / 0.6931471805599453; }
+
+double pow(double x, double y)
+{
+    if (y == 0.0)
+        return 1.0;
+    if (x == 0.0)
+        return 0.0;
+    if (x < 0.0) {
+        double t = exp(y * log(-x));
+
+        return (fmod(y, 2.0) == 0.0) ? t : -t;
+    }
+    return exp(y * log(x));
+}
+
+/* 三角：先把 x 归约到 [-pi, pi]，再折到 [-pi/2, pi/2] 用 Taylor */
+#define C6C_PI 3.141592653589793
+#define C6C_2PI 6.283185307179586
+
+static double c6c_sin_small(double x)
+{
+    double term = x;
+    double sum = x;
+    int i = 0;
+
+    for (i = 1; i < 15; i++) {
+        term = -term * x * x / (double)((2 * i) * (2 * i + 1));
+        sum = sum + term;
+    }
+    return sum;
+}
+
+static double c6c_cos_small(double x)
+{
+    double term = 1.0;
+    double sum = 1.0;
+    int i = 0;
+
+    for (i = 1; i < 15; i++) {
+        term = -term * x * x / (double)((2 * i - 1) * (2 * i));
+        sum = sum + term;
+    }
+    return sum;
+}
+
+static double c6c_reduce(double x)
+{
+    long k = 0;
+
+    /* 归约到 [-pi, pi] */
+    k = (long)(x / C6C_2PI);
+    x = x - (double)k * C6C_2PI;
+    return x;
+}
+
+double sin(double x)
+{
+    double r = c6c_reduce(x);
+
+    if (r > C6C_PI / 2.0)
+        r = C6C_PI - r;
+    else if (r < -C6C_PI / 2.0)
+        r = -C6C_PI - r;
+    return c6c_sin_small(r);
+}
+
+double cos(double x)
+{
+    double r = c6c_reduce(x);
+
+    if (r > C6C_PI)
+        r = r - C6C_2PI;
+    else if (r < -C6C_PI)
+        r = r + C6C_2PI;
+    return c6c_cos_small(r);
+}
+
+double tan(double x) { return sin(x) / cos(x); }
+
+/* atan：|x|>1 用 pi/2 - atan(1/x)，小值用级数（x/(1+x^2) 形式收敛慢，用折半） */
+double atan(double x)
+{
+    double s = 0;
+    double t = 0;
+    double sum = 0;
+    double term = 0;
+    int k = 0;
+    int i = 0;
+
+    if (x < 0.0)
+        return -atan(-x);
+    if (x > 1.0)
+        return C6C_PI / 2.0 - atan(1.0 / x);
+    /* 折半 4 次：atan(x) = 2*atan(x / (1 + sqrt(1 + x^2))) */
+    for (k = 0; k < 4; k++)
+        x = x / (1.0 + sqrt(1.0 + x * x));
+    term = x;
+    sum = x;
+    t = x * x;
+    for (i = 3; i < 40; i += 2) {
+        term = -term * t;
+        sum = sum + term / (double)i;
+    }
+    s = sum;
+    for (k = 0; k < 4; k++)
+        s = s * 2.0;
+    return s;
+}
+
+double asin(double x)
+{
+    if (x >= 1.0)
+        return C6C_PI / 2.0;
+    if (x <= -1.0)
+        return -C6C_PI / 2.0;
+    return atan(x / sqrt(1.0 - x * x));
+}
+
+double acos(double x) { return C6C_PI / 2.0 - asin(x); }
+
+double sinh(double x)
+{
+    double e = exp(x);
+
+    return (e - 1.0 / e) * 0.5;
+}
+
+double cosh(double x)
+{
+    double e = exp(x);
+
+    return (e + 1.0 / e) * 0.5;
+}
+
+double tanh(double x)
+{
+    double e = exp(2.0 * x);
+
+    return (e - 1.0) / (e + 1.0);
+}
+
+
+double round(double x)
+{
+    double t = (double)(long)x;
+
+    if (x >= 0) {
+        if (x - t >= 0.5)
+            t += 1.0;
+    } else {
+        if (t - x >= 0.5)
+            t -= 1.0;
+    }
+    return t;
+}
+
+double trunc(double x) { return (double)(long)x; }
+
+double rint(double x) { return round(x); }
+double nearbyint(double x) { return round(x); }
+double copysign(double x, double y)
+{
+    double a = fabs(x);
+
+    return (y < 0 || (y == 0 && 1.0 / y < 0)) ? -a : a;
+}
+double ldexp(double x, int e)
+{
+    double r = x;
+    int i = 0;
+
+    for (i = 0; i < (e > 0 ? e : -e); i++)
+        r = (e > 0) ? r * 2.0 : r / 2.0;
+    return r;
+}
+double frexp(double x, int *e)
+{
+    int k = 0;
+
+    if (x == 0.0) { *e = 0; return 0.0; }
+    while (fabs(x) >= 1.0) { x = x * 0.5; k++; }
+    while (fabs(x) < 0.5) { x = x * 2.0; k--; }
+    *e = k;
+    return x;
+}
+double modf(double x, double *ip)
+{
+    double t = trunc(x);
+
+    *ip = t;
+    return x - t;
+}
+double cbrt(double x) { return x < 0 ? -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0); }
+double hypot(double x, double y) { return sqrt(x * x + y * y); }
+double fmax(double x, double y) { return x > y ? x : y; }
+double fmin(double x, double y) { return x < y ? x : y; }
+double expm1(double x) { return exp(x) - 1.0; }
+double log1p(double x) { return log(1.0 + x); }
+double asinh(double x) { return log(x + sqrt(x * x + 1.0)); }
+double acosh(double x) { return log(x + sqrt(x * x - 1.0)); }
+double atanh(double x) { return 0.5 * log((1.0 + x) / (1.0 - x)); }
+
+#endif /* _C6C_RT_C6 */

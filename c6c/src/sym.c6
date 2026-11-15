@@ -1,0 +1,298 @@
+/* sym.c6 —— 符号表与作用域（声明层的最小实现）。
+ *
+ * 结构选择：链式哈希桶 + 每作用域一条“本作用域声明的符号”链。
+ * 进作用域压一层、出作用域把这一层声明的符号从桶里摘掉——比“带作用域序号的
+ * 哈希表 + 出作用域扫全表”省一个数量级（函数里每个 `{}` 都要进出）。
+ *
+ * 符号里只放“编译期就定下来的东西”：类型 id（type.c6 的 intern id）、
+ * 存储类、局部槽号或全局数据偏移。名字指向源文件（零复制）。
+ */
+
+enum {
+    SC_UNDEF = 0,
+    SC_GLOBAL,      /* 函数或全局变量 */
+    SC_LOCAL,
+    SC_PARAM,
+    SC_TYPEDEF,
+    SC_ENUMC,       /* 枚举常量，值在 Sym.val */
+    SC_TAG          /* struct/union 标签，类型在 Sym.val */
+};
+
+typedef struct Sym {
+    struct Sym *next;      /* 哈希桶链 */
+    struct Sym *scope_next;/* 本作用域链 */
+    const char *name;
+    u32 len;
+    u32 hash;
+    u32 type;              /* 类型 id */
+    u8 kind;
+    u8 is_static;
+    u8 is_extern;
+    u8 is_func;
+    u8 is_mgd;             /* 托管引用（`@T`）：退出作用域/赋值时要动计数 */
+    u8 is_shared;          /* `shared @T`：跨线程共享的槽/形参 */
+    u8 is_own;             /* `own @T`：所有权转移的槽（不能被闭包捕获） */
+    u8 fallible;           /* 返回类型带 `!error`：调用结果必须 try/catch */
+    u8 is_const;           /* 这个**对象**是只读的（`int *const p` / `const int x`） */
+    u8 is_tls;             /* `__thread`：线程局部量，寻址走 %fs + goff */
+    u32 slot;              /* 局部/形参：虚拟寄存器槽号 */
+    u32 goff;              /* 全局：数据段偏移 */
+    const char *alias;     /* 模板实例接收者的方法：<实例名>_<函数名> 别名 */
+    i64 val;               /* 枚举常量值 / 数组长度等 */
+} Sym;
+
+typedef struct Scope {
+    struct Scope *up;
+    Sym *head;
+    u32 vla_save;       /* 这个块里第一个 VLA 之前的 rsp（vreg，0 = 没有） */
+} Scope;
+
+#define SYM_NBUCKET 4096
+
+static Sym *SYM_BUCKET[SYM_NBUCKET];
+static Scope *SCOPE;
+static u32 SYM_COUNT;
+
+/* 全局数据段（已初始化的全局变量/字符串字面量都放这里） */
+static Image DATA_IMG;
+
+static u32 sym_hash_str(const char *s, u32 len)
+{
+    u32 h = 2166136261u;
+    u32 i = 0;
+
+    for (i = 0; i < len; i++) {
+        h ^= (u8)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void sym_init(void)
+{
+    memset(SYM_BUCKET, 0, sizeof(SYM_BUCKET));
+    SCOPE = NULL;
+    SYM_COUNT = 0;
+    img_init(&DATA_IMG, 4096);
+}
+
+static void scope_enter(void)
+{
+    Scope *s = arena_zalloc(&A_main, sizeof(Scope));
+
+    s->up = SCOPE;
+    s->head = NULL;
+    SCOPE = s;
+}
+
+static void scope_leave(void)
+{
+    Scope *s = SCOPE;
+    Sym *p = NULL;
+
+    if (!s)
+        return;
+    for (p = s->head; p; p = p->scope_next) {
+        u32 b = p->hash & (SYM_NBUCKET - 1);
+        Sym **pp = &SYM_BUCKET[b];
+
+        while (*pp) {
+            if (*pp == p) {
+                *pp = p->next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+    }
+    SCOPE = s->up;
+}
+
+/* C 有两个独立的名字空间：普通标识符（变量/函数/typedef/枚举常量）和
+ * 标签（struct/union/enum 名）。两者必须分开，否则 `typedef struct S {…} S;`
+ * 之后再来一句 `struct S *p;`，后者补登记的前置标签就会把 typedef 顶掉，
+ * 后面所有 `S x;` 全部退化成"未声明的类型"。 */
+#define SYM_NS_TAG 1
+
+static u32 sym_hash_ns(const char *name, u32 len, int ns)
+{
+    u32 h = sym_hash_str(name, len);
+
+    return ns ? (h ^ 0x9e3779b9u) : h;
+}
+
+static Sym *sym_find_raw(const char *name, u32 len, int ns)
+{
+    u32 h = sym_hash_ns(name, len, ns);
+    u32 b = h & (SYM_NBUCKET - 1);
+    Sym *p = SYM_BUCKET[b];
+
+    for (; p; p = p->next)
+        if (p->hash == h && p->len == len && memcmp(p->name, name, len) == 0)
+            return p;
+    return NULL;
+}
+
+/* 符号表里始终存**短名**（模块前缀只在发射层加，见 docs/modules.md M2'）。
+ * 但源码里可以写模块成员的前缀化 C 名（`tu__module__add`，上游 tests/module.c6
+ * 就是这么用的），全限定名 `tu.module.add` 也会先被语法层改写成
+ * `tu__module__add`。所以查不到时把已知的模块前缀剥掉再查一遍。 */
+static Sym *sym_find_ns(const char *name, u32 len, int ns)
+{
+    Sym *p = sym_find_raw(name, len, ns);
+    u32 i = 0;
+
+    if (p)
+        return p;
+    for (i = 0; i < NMOD; i++) {
+        const char *pfx = MODS[i].prefix;
+        u32 pl = (u32)strlen(pfx);
+
+        if (pl && len > pl && memcmp(name, pfx, pl) == 0) {
+            p = sym_find_raw(name + pl, len - pl, ns);
+            if (p)
+                return p;
+        }
+    }
+    return NULL;
+}
+
+static Sym *sym_find(const char *name, u32 len)
+{
+    return sym_find_ns(name, len, 0);
+}
+
+static Sym *sym_find_tag(const char *name, u32 len)
+{
+    return sym_find_ns(name, len, SYM_NS_TAG);
+}
+
+/* 调试开关只查一次环境变量：这个函数每个符号都要走一遍，getenv 在 profile 里
+ * 占 1.2%（一万次调用，每次几百条指令的线性 environ 扫描）。 */
+static int DBG_SYM = -1;
+
+static Sym *sym_add_ns(const char *name, u32 len, u32 type, u8 kind, int ns)
+{
+    if (DBG_SYM < 0)
+        DBG_SYM = getenv("C6C_DBG_SYM") ? 1 : 0;
+    u32 h = sym_hash_ns(name, len, ns);
+    u32 b = h & (SYM_NBUCKET - 1);
+    Sym *p = arena_zalloc(&A_main, sizeof(Sym));
+
+    /* 名字统一存成 NUL 结尾的副本：x64 符号表/诊断都要 C 字符串，
+     * 直接存 token 指针（不结尾）会让 strlen 一直读到文件尾。 */
+    p->name = arena_strndup(&A_main, name, len);
+    p->len = len;
+    p->hash = h;
+    p->type = type;
+    p->kind = kind;
+    p->next = SYM_BUCKET[b];
+    SYM_BUCKET[b] = p;
+    if (DBG_SYM && len == 7 && memcmp(name, "Section", 7) == 0)
+        fprintf(stderr, "       [dbg] sym_add Section kind=%d type=%u scope=%p\n",
+                (int)kind, (unsigned)type, (void *)SCOPE);
+    p->scope_next = SCOPE ? SCOPE->head : NULL;
+    if (SCOPE)
+        SCOPE->head = p;
+    SYM_COUNT++;
+    return p;
+}
+
+static Sym *sym_add(const char *name, u32 len, u32 type, u8 kind)
+{
+    return sym_add_ns(name, len, type, kind, 0);
+}
+
+/* 登记到"不被作用域回收"的位置：模板结构体的实例可能是在某个函数体里
+ * 第一次用 `Buf@(16)` 时惰性展开的，方法符号就落进了那个块作用域；块一结束
+ * 符号被摘掉，而实例本身是缓存着的，第二次 `Buf@(16)` 不会再展开一遍——
+ * 于是"结构体没有成员"（std/text/fmt.c6 的 write_pad 就是这么丢的）。
+ * 方法本质上是全局函数，登记时就不挂到作用域链上。 */
+static Sym *sym_add_gl(const char *name, u32 len, u32 type, u8 kind)
+{
+    Sym *p = sym_add_ns(name, len, type, kind, 0);
+
+    if (p && SCOPE) {
+        /* 从当前作用域的链上摘下来 */
+        Sym **pp = &SCOPE->head;
+
+        while (*pp) {
+            if (*pp == p) {
+                *pp = p->scope_next;
+                break;
+            }
+            pp = &(*pp)->scope_next;
+        }
+        p->scope_next = NULL;
+    }
+    return p;
+}
+
+/* 这个符号是不是**当前**作用域声明的（出作用域时会被摘掉的那一批）。
+ * 内层重定义同名 struct 时必须新建一层，否则会把外层的标签改掉——
+ * tcc tests2 的 129_scopes 就是 `{ struct xx7 { int c; } x; { struct xx7 { int a, b; } … }`
+ * 这个形状，外层 x.c 在内层块结束后就查不到了。 */
+static int sym_in_cur_scope(Sym *s)
+{
+    Sym *p = SCOPE ? SCOPE->head : NULL;
+
+    for (; p; p = p->scope_next)
+        if (p == s)
+            return 1;
+    return 0;
+}
+
+/* 类型 id → 标签名（'struct Vec' 的 'Vec'）。方法在 C 层面输出成
+ * `<结构体>_<方法>`，要能从这个类型反查名字，而标签在符号表里是按名字
+ * 找类型的方向存的，所以这里另记一张反查表。 */
+#define TAGNAME_MAX 512
+static u32 TAGNAME_TY[TAGNAME_MAX];
+static const char *TAGNAME_NM[TAGNAME_MAX];
+static u32 NTAGNAME;
+
+static const char *sym_tag_name(u32 ty)
+{
+    u32 i = 0;
+
+    for (i = 0; i < NTAGNAME; i++)
+        if (TAGNAME_TY[i] == ty)
+            return TAGNAME_NM[i];
+    return NULL;
+}
+
+/* 类型 id → 标签名只记反查表，不进标签名字空间：interface 签名里第一次出现的
+ * tag 是原型作用域的（见 parse.c6 的 PA_IN_PROTO），它的名字只为了诊断里能
+ * 打印出来，不能让别人 `struct P` 找到它。 */
+static void sym_tag_disp(const char *name, u32 len, u32 type)
+{
+    if (NTAGNAME < TAGNAME_MAX && len && !sym_tag_name(type)) {
+        char *cp = arena_alloc(&A_main, (size_t)len + 1);
+        u32 i = 0;
+
+        for (i = 0; i < len; i++)
+            cp[i] = name[i];
+        cp[len] = 0;
+        TAGNAME_TY[NTAGNAME] = type;
+        TAGNAME_NM[NTAGNAME] = cp;
+        NTAGNAME++;
+    }
+}
+
+static Sym *sym_add_tag(const char *name, u32 len, u32 type)
+{
+    sym_tag_disp(name, len, type);
+    return sym_add_ns(name, len, type, SC_TAG, SYM_NS_TAG);
+}
+
+/* 全局数据：分配并清零 n 字节，返回偏移 */
+static u32 data_alloc(u32 n, u32 align)
+{
+    u32 off = DATA_IMG.n;
+
+    if (align > 1)
+        off = (off + align - 1) / align * align;
+    if (off + n > DATA_IMG.cap)
+        img_grow(&DATA_IMG, off + n);
+    memset(DATA_IMG.p + off, 0, n);
+    DATA_IMG.n = off + n;
+    return off;
+}

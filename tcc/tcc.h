@@ -700,6 +700,15 @@ typedef struct DLLReference {
 #define C6_ROLE_STMT  2
 #define C6_ROLE_IDENT 3
 #define C6_ROLE_TYPE  4
+#else
+/* 纯 C 构建（不带 C6_EXT）：c6 宏的角色常量仍然要存在——tccpp.c 里判断
+ * "参数是不是 expr 角色"的那行在两种构建下都编译。值本身无关紧要，
+ * 因为不带 C6_EXT 时根本不会有宏被标成 expr 角色。 */
+#define C6_ROLE_NONE  0
+#define C6_ROLE_EXPR  1
+#define C6_ROLE_STMT  2
+#define C6_ROLE_IDENT 3
+#define C6_ROLE_TYPE  4
 #endif
 
 /* field 'Sym.r' for C labels */

@@ -1,0 +1,238 @@
+/* elf.c6 —— 最小的 ELF64 写出器：静态可执行、单 PT_LOAD（RWX）。
+ *
+ * 为什么先做“单段 RWX”：第一个里程碑要的是**能跑**，不是加固。真正的段划分
+ * （text RX / rodata R / data RW）和重定位、符号表在 P2-2 的后续提交里补，
+ * 那部分的坑（.bss 长零段、段对齐、PT_LOAD 的 p_offset%page 约束）单独立项。
+ *
+ * 地址映射：单段从文件偏移 0 映射到 0x400000，所以
+ *   VA = 0x400000 + 文件偏移
+ * 代码里所有地址都按这个式子换算（写立即数、算 rel32 都用它）。
+ */
+
+#define ELF_BASE_VA 0x400000u
+#define ELF_EHDR 64
+#define ELF_PHDR 56
+#define ELF_HDR   (ELF_EHDR + ELF_PHDR)
+
+typedef struct Image {
+    u8 *p;
+    u32 n;      /* 已用字节 */
+    u32 cap;
+} Image;
+
+/* 输出缓冲走 malloc/realloc，不进 arena：arena 只增不减，而这两个镜像
+ * 一路上都是"翻倍再拷"——2.45 MB 的代码镜像按翻倍长起来会留下 8 MB 的旧块
+ * （旧块里的内容 memcpy 过一次，页面全脏，实打实占 RSS）。换成 realloc
+ * 之后同一份内容只占一份内存。 */
+static void img_init(Image *im, u32 cap)
+{
+    im->p = calloc(cap ? cap : 1, 1);
+    im->n = 0;
+    im->cap = cap;
+}
+
+static void img_grow(Image *im, u32 need)
+{
+    u32 ncap = im->cap ? im->cap : 4096;
+    u32 old = im->cap;
+    u8 *np = NULL;
+
+    /* 1.5 倍 + 常数：2 倍增长在"刚好差一点"的时候会白留一半 */
+    while (ncap < need)
+        ncap += ncap / 2 + 4096;
+    np = realloc(im->p, ncap);
+    if (!np)
+        return;                     /* 内存耗尽：后面的写入会踩到自己的脚，和 arena 一样 */
+    memset(np + old, 0, ncap - old); /* 新补的部分要清零：对齐填充、空洞都靠这个 */
+    im->p = np;
+    im->cap = ncap;
+}
+
+/* 给镜像留出**确定**大小的余量（不足才长），只清真正会用到的那一段。
+ *
+ * 为什么不让 img_grow 干这件事：它的 1.5 倍增长对 10 MB 级的镜像意味着
+ * “再清 3~5 MB 的零页”，而那些页往往只是为了追加几十字节的收尾数据
+ * （asmblob 跳板是回填阶段才发的，自编译时一共 144 字节）。按需给 64 KB
+ * 余量的代价是 64 KB，按 1.5 倍涨的代价是 5.3 MB——两者都是实打实的 RSS。 */
+static void img_slack(Image *im, u32 extra)
+{
+    u32 ncap = 0;
+    u8 *np = NULL;
+
+    if (im->cap - im->n >= extra)
+        return;
+    ncap = im->n + extra;
+    np = realloc(im->p, ncap);
+    if (!np)
+        return;
+    if (ncap > im->cap)
+        memset(np + im->cap, 0, ncap - im->cap);
+    im->p = np;
+    im->cap = ncap;
+}
+
+static u32 img_reserve(Image *im, u32 n)
+{
+    u32 off = im->n;
+
+    if (im->n + n > im->cap)
+        img_grow(im, im->n + n);
+    im->n += n;
+    return off;
+}
+
+static void img_u8(Image *im, u32 v)
+{
+    u32 off = img_reserve(im, 1);
+
+    im->p[off] = (u8)v;
+}
+
+static void img_u16(Image *im, u32 v)
+{
+    u32 off = img_reserve(im, 2);
+    u16 v16 = (u16)v;
+
+    memcpy(im->p + off, &v16, 2);
+}
+
+/* 整块写：目标就是 x86-64 这种小端机器（镜像是 ELF，本来就按小端拼），
+ * 4 次单字节存 + 3 次移位不如一次 4 字节存。 */
+static void img_u32(Image *im, u32 v)
+{
+    u32 off = img_reserve(im, 4);
+
+    memcpy(im->p + off, &v, 4);
+}
+
+static void img_u64(Image *im, u64 v)
+{
+    img_u32(im, (u32)(v & 0xFFFFFFFFu));
+    img_u32(im, (u32)(v >> 32));
+}
+
+static void img_patch32(Image *im, u32 off, u32 v)
+{
+    im->p[off] = (u8)(v & 0xFF);
+    im->p[off + 1] = (u8)((v >> 8) & 0xFF);
+    im->p[off + 2] = (u8)((v >> 16) & 0xFF);
+    im->p[off + 3] = (u8)((v >> 24) & 0xFF);
+}
+
+static void img_patch16(Image *im, u32 off, u32 v)
+{
+    im->p[off] = (u8)(v & 0xFF);
+    im->p[off + 1] = (u8)((v >> 8) & 0xFF);
+}
+
+static void img_patch64(Image *im, u32 off, u64 v)
+{
+    img_patch32(im, off, (u32)(v & 0xFFFFFFFFu));
+    img_patch32(im, off + 4, (u32)(v >> 32));
+}
+
+static void img_copy(Image *im, const char *s, u32 n)
+{
+    u32 off = img_reserve(im, n);
+
+    memcpy(im->p + off, s, n);
+}
+
+/* 写 ELF 头 + 程序头。单段：从偏移 0 到文件尾，RWX。
+ * 单独拆出来是为了让“分块写出”（elf_write_parts）复用同一套字段——
+ * 收尾时按 [头][数据段][代码段] 三块直接写，不必先把它们拼成一份连续镜像。 */
+static void elf_hdr_fill(u8 *p, u32 total, u32 entry_off)
+{
+    Image h = {0};
+    u32 i = 0;
+
+    h.p = p;
+    h.n = ELF_HDR;
+    h.cap = ELF_HDR;
+
+    for (i = 0; i < ELF_HDR; i++)
+        h.p[i] = 0;
+    h.p[0] = 0x7F;
+    h.p[1] = 'E';
+    h.p[2] = 'L';
+    h.p[3] = 'F';
+    h.p[4] = 2;     /* ELFCLASS64 */
+    h.p[5] = 1;     /* ELFDATA2LSB */
+    h.p[6] = 1;     /* EV_CURRENT */
+    h.p[7] = 0;     /* ELFOSABI_SYSV */
+    img_patch16(&h, 16, 2);                             /* e_type = ET_EXEC */
+    img_patch16(&h, 18, 0x3E);                          /* e_machine = EM_X86_64 */
+    img_patch32(&h, 20, 1);                             /* e_version */
+    img_patch64(&h, 24, (u64)ELF_BASE_VA + entry_off);  /* e_entry */
+    img_patch64(&h, 32, (u64)ELF_EHDR);                 /* e_phoff */
+    img_patch64(&h, 40, 0);                             /* e_shoff */
+    img_patch32(&h, 48, 0);                             /* e_flags */
+    img_patch16(&h, 52, ELF_EHDR);                      /* e_ehsize */
+    img_patch16(&h, 54, ELF_PHDR);                      /* e_phentsize */
+    img_patch16(&h, 56, 1);                             /* e_phnum */
+    img_patch16(&h, 58, 0);                             /* e_shentsize */
+    img_patch16(&h, 60, 0);                             /* e_shnum */
+    img_patch16(&h, 62, 0);                             /* e_shstrndx */
+
+    /* 程序头：p_type=PT_LOAD、p_flags=R|W|X、p_offset=0、p_vaddr=ELF_BASE_VA、
+     * p_filesz=p_memsz=total、p_align=0x1000。 */
+    {
+        u32 ph = ELF_EHDR;
+
+        img_patch32(&h, ph + 0, 1);                 /* PT_LOAD */
+        img_patch32(&h, ph + 4, 7);                 /* PF_R|PF_W|PF_X */
+        img_patch64(&h, ph + 8, 0);                 /* p_offset */
+        img_patch64(&h, ph + 16, (u64)ELF_BASE_VA); /* p_vaddr */
+        img_patch64(&h, ph + 24, (u64)ELF_BASE_VA); /* p_paddr */
+        img_patch64(&h, ph + 32, (u64)total);       /* p_filesz */
+        img_patch64(&h, ph + 40, (u64)total);       /* p_memsz */
+        img_patch64(&h, ph + 48, 0x1000);           /* p_align */
+    }
+}
+
+/* 写 ELF 头 + 程序头。调用方负责在镜像开头预留 ELF_HDR（= 120）字节并传 hdr=0。 */
+static void elf_write(const char *path, Image *im, u32 hdr, u32 entry_off)
+{
+    u32 total = im->n;
+    FILE *f = NULL;
+
+    elf_hdr_fill(im->p + hdr, total, entry_off);
+
+    f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "c6c: 无法写出 %s\n", path);
+        return;
+    }
+    if (fwrite(im->p, 1, (size_t)total, f) != (size_t)total)
+        fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
+    fclose(f);
+    /* 可执行位：静态二进制必须 +x 才能直接跑 */
+    chmod(path, 0755);
+}
+
+/* 分块写出：[ELF 头 120][数据段][代码段]。
+ *
+ * 为什么要有这一版：以前收尾时先把数据段和代码段 memcpy 进一份新的连续镜像
+ * （自编译时 10.6 MB），再写文件——那份镜像纯属中间产物，峰值 RSS 里有
+ * 10.6 MB 是它。文件布局本来就是三段顺序拼接，直接分段 fwrite 结果逐字节
+ * 相同，却不必多一份内存。 */
+static void elf_write_parts(const char *path, u8 *hdr, const Image *data, const Image *code,
+                            u32 entry_off)
+{
+    u32 total = ELF_HDR + data->n + code->n;
+    FILE *f = NULL;
+
+    elf_hdr_fill(hdr, total, entry_off);
+
+    f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "c6c: 无法写出 %s\n", path);
+        return;
+    }
+    if (fwrite(hdr, 1, ELF_HDR, f) != ELF_HDR
+        || (data->n && fwrite(data->p, 1, (size_t)data->n, f) != (size_t)data->n)
+        || (code->n && fwrite(code->p, 1, (size_t)code->n, f) != (size_t)code->n))
+        fprintf(stderr, "c6c: 写入 %s 不完整\n", path);
+    fclose(f);
+    chmod(path, 0755);
+}

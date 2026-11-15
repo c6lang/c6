@@ -1,0 +1,181 @@
+/* 编译器自带的汇编跳板（raw machine code blobs）
+ *
+ * 有些事在 C 层面表达不出来：新栈上起线程（子线程是从 syscall 返回进来的，
+ * rbp 还指在父线程的帧上）、协程换栈（要动 rsp 和 callee-saved）。这两件事
+ * 各需要几条指令，c6c 又不能凭空把汇编字符串变成机器码（没有汇编器）。
+ *
+ * 办法：在开发时用 `gcc -c` 汇编一次，把字节冻结在这里。三个后端各按自己的
+ * 方式嵌入：
+ *   - native（x64.c6）：直接用这里的 code 字节，rel 处按普通 call 重定位；
+ *   - C99：把 text（GAS 语法）原样发成 `__asm__(...)`；
+ *   - LLVM：发成 module-level asm。
+ *
+ * 每个 blob 的 code/text 必须严格对应（下面附了反汇编，改的时候两边一起改）。
+ */
+
+typedef struct AsmRel {
+    u32 at;                 /* 相对 blob 起点的偏移（rel32 的落点） */
+    const char *sym;
+} AsmRel;
+
+typedef struct AsmBlob {
+    const char *name;
+    const u8 *code;
+    u32 len;
+    u32 nrel;
+    AsmRel rel[2];
+    const char *text;
+} AsmBlob;
+
+/* long __c6_th_spawn(unsigned long flags, void *sp, void *slot)
+ *   49 89 d1            mov  %rdx,%r9        ; 子线程的槽位号
+ *   b8 38 00 00 00      mov  $56,%eax        ; clone
+ *   48 31 d2            xor  %rdx,%rdx       ; ptid = 0
+ *   4d 31 d2            xor  %r10,%r10       ; ctid = 0
+ *   4d 31 c0            xor  %r8,%r8         ; tls = 0
+ *   0f 05               syscall
+ *   48 85 c0            test %rax,%rax
+ *   74 01               je   子线程
+ *   c3                  ret                  ; 父线程：返回 tid
+ *   4c 89 cf            mov  %r9,%rdi        ; 子线程：槽位号当第一个实参
+ *   e8 xx xx xx xx      call __c6_th_entry
+ *   f4                  hlt
+ * 整个 "起线程" 都在这里做完，C 那一侧只传 flags、栈顶、槽位号。槽位号**走
+ * 寄存器**交给子线程，不经过全局，所以父线程不需要等子线程接手（早先那版用
+ * 全局 + futex 握手，父线程在握手上让出 CPU，子线程常常在 spawn 返回前就把
+ * 整个函数体跑完了）。 */
+static const u8 ASM_TH_SPAWN[34] = {
+    0x49, 0x89, 0xd1, 0xb8, 0x38, 0x00, 0x00, 0x00, 0x48, 0x31, 0xd2, 0x4d,
+    0x31, 0xd2, 0x4d, 0x31, 0xc0, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x74, 0x01,
+    0xc3, 0x4c, 0x89, 0xcf, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xf4
+};
+
+/* void __c6_swapstack(void **save_sp, void *new_sp)
+ *   55 53 41 54 41 55 41 56 41 57   push %rbp/%rbx/%r12/%r13/%r14/%r15
+ *   48 89 27                        mov  %rsp,(%rdi)   ; *save_sp = 当前栈指针
+ *   48 89 f4                        mov  %rsi,%rsp     ; 切到对方栈
+ *   41 5f 41 5e 41 5d 41 5c 5b 5d   pop  %r15..%rbp    ; 弹回对方的 callee-saved
+ *   c3                              ret                ; 回到对方上次 swapstack 之后
+ * 单向"跳过去"，不需要返回值：被切回来时调用者会从自己那次 swapstack 之后继续。 */
+static const u8 ASM_SWAPSTACK[36] = {
+    0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    0x48, 0x89, 0x27, 0x48, 0x89, 0xf4,
+    0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5b, 0x5d,
+    0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+};
+
+/* long __c6_co_spawn(unsigned long flags, void *sp, void *slot)
+ * 和 __c6_th_spawn 一模一样，只是子线程进的是 __c6_co_entry（协程入口：
+ * 先等第一次 resume，再跑函数体，跑完把控制权交回去）。 */
+static const u8 ASM_CO_SPAWN[34] = {
+    0x49, 0x89, 0xd1, 0xb8, 0x38, 0x00, 0x00, 0x00, 0x48, 0x31, 0xd2, 0x4d,
+    0x31, 0xd2, 0x4d, 0x31, 0xc0, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x74, 0x01,
+    0xc3, 0x4c, 0x89, 0xcf, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xf4
+};
+
+/* int __c6_tsl(void *p)：自旋锁的原子获取（xchg 自带 lock 语义）
+ *   b8 01 00 00 00   mov  $1,%eax
+ *   87 07            xchg %eax,(%rdi)
+ *   83 f0 01         xor  $1,%eax     ; 返回"之前是 0 吗"→ 1 = 拿到
+ *   c3               ret
+ * void __c6_unlock_(void *p)：放锁（x86 的普通 store 对别的核可见）
+ *   c7 07 00 00 00 00  movl $0,(%rdi)
+ *   c3                 ret */
+static const u8 ASM_TSL[12] = {
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x87, 0x07, 0x83, 0xf0, 0x01, 0xc3, 0x90
+};
+static const u8 ASM_UNLOCK_[7] = {
+    0xc7, 0x07, 0x00, 0x00, 0x00, 0x00, 0xc3
+};
+
+/* long __c6_atomic_inc(void *p) / long __c6_atomic_dec(void *p)
+ *   lock xadd 做原子加减，返回**加完之后**的值。引用计数要能跨线程
+ *   （tests/gc_thread.c6 里两个线程同时对同一个对象加减），普通 rc++ 会丢更新。
+ *   48 c7 c0 01 00 00 00   mov $1,%rax
+ *   f0 48 0f c1 07         lock xadd %rax,(%rdi)
+ *   48 ff c0               inc %rax
+ *   c3                     ret
+ *   （dec 同理，imm 是 -1、最后 dec） */
+static const u8 ASM_ATOMIC_INC[16] = {
+    0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0xf0,
+    0x48, 0x0f, 0xc1, 0x07, 0x48, 0xff, 0xc0, 0xc3
+};
+static const u8 ASM_ATOMIC_DEC[16] = {
+    0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xf0,
+    0x48, 0x0f, 0xc1, 0x07, 0x48, 0xff, 0xc8, 0xc3
+};
+
+/* void __c6_co_start(void)：就一条 ret。新协程的初始栈按 swapstack 的"弹 6 个
+ * callee-saved 再 ret"摆好，返回地址指向这里；这里再 ret 就进了协程体
+ * （协程体地址摆在它上面一格）——所以它只是给栈布局当第一跳。 */
+
+
+/* long __c6_fsbase(void)：读 %fs 的段基址。
+ *   64 48 8b 04 25 00 00 00 00   mov %fs:0, %rax   ; fs 段基址 + 0 = 基址本身
+ *   c3                           ret
+ * 线程局部变量（`__thread`）的地址 = 这个基址 + 数据段偏移，运行期由
+ * lib/rt.c6 的 c6c_tls_setup() 给每个线程各设一份（arch_prctl ARCH_SET_FS）。
+ * 内核/CPU 没有别的办法在普通指令里读段基址（rdfsbase 要 FSGSBASE 位）。 */
+static const u8 ASM_FSBASE[11] = {
+    0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xc3, 0x90
+};
+
+/* long __c6_xchg8(void *p, long v)：1 字节的原子交换，返回**旧值**（0 或 1）。
+ *   89 f0        mov %esi,%eax
+ *   86 07        xchg %al,(%rdi)      ; 内存 xchg 隐含 lock，硬件保证原子
+ *   0f b6 c0     movzbl %al,%eax
+ *   c3           ret
+ * 自旋锁要靠它：走运行期的全局锁的话，等待者在锁上排队，持有者反倒抢不到，
+ * 16 个线程的 spinlock 用例能拖到分钟级（tests2/124 第三个用例）。 */
+static const u8 ASM_XCHG8[8] = { 0x89, 0xf0, 0x86, 0x07, 0x0f, 0xb6, 0xc0, 0xc3 };
+
+#define ASM_REL1(a) { (a), 0 }
+
+static const AsmBlob ASMBLOBS[] = {
+    { "__c6_th_spawn", ASM_TH_SPAWN, 34, 1, { { 29, "__c6_th_entry" } },
+      ".text\n.globl __c6_th_spawn\n__c6_th_spawn:\n"
+      "\tmov %rdx, %r9\n\tmov $56, %eax\n\txor %rdx, %rdx\n"
+      "\txor %r10, %r10\n\txor %r8, %r8\n\tsyscall\n\ttest %rax, %rax\n"
+      "\tje 1f\n\tret\n1:\n\tmov %r9, %rdi\n\tcall __c6_th_entry\n\thlt\n" },
+    { "__c6_swapstack", ASM_SWAPSTACK, 36, 0, { { 0, 0 } },
+      ".text\n.globl __c6_swapstack\n__c6_swapstack:\n"
+      "\tpush %rbp\n\tpush %rbx\n\tpush %r12\n\tpush %r13\n\tpush %r14\n"
+      "\tpush %r15\n\tmov %rsp, (%rdi)\n\tmov %rsi, %rsp\n"
+      "\tpop %r15\n\tpop %r14\n\tpop %r13\n\tpop %r12\n\tpop %rbx\n"
+      "\tpop %rbp\n\tret\n" },
+    { "__c6_tsl", ASM_TSL, 12, 0, { { 0, 0 } },
+      ".text\n.globl __c6_tsl\n__c6_tsl:\n"
+      "\tmov $1, %eax\n\txchg %eax, (%rdi)\n\txor $1, %eax\n\tret\n" },
+    { "__c6_unlock_", ASM_UNLOCK_, 7, 0, { { 0, 0 } },
+      ".text\n.globl __c6_unlock_\n__c6_unlock_:\n\tmovl $0, (%rdi)\n\tret\n" },
+    { "__c6_co_spawn", ASM_CO_SPAWN, 34, 1, { { 29, "__c6_co_entry" } },
+      ".text\n.globl __c6_co_spawn\n__c6_co_spawn:\n"
+      "\tmov %rdx, %r9\n\tmov $56, %eax\n\txor %rdx, %rdx\n"
+      "\txor %r10, %r10\n\txor %r8, %r8\n\tsyscall\n\ttest %rax, %rax\n"
+      "\tje 1f\n\tret\n1:\n\tmov %r9, %rdi\n\tcall __c6_co_entry\n\thlt\n" },
+    { "__c6_atomic_inc", ASM_ATOMIC_INC, 16, 0, { { 0, 0 } },
+      ".text\n.globl __c6_atomic_inc\n__c6_atomic_inc:\n"
+      "\tmov $1, %rax\n\tlock xadd %rax, (%rdi)\n\tinc %rax\n\tret\n" },
+    { "__c6_atomic_dec", ASM_ATOMIC_DEC, 16, 0, { { 0, 0 } },
+      ".text\n.globl __c6_atomic_dec\n__c6_atomic_dec:\n"
+      "\tmov $-1, %rax\n\tlock xadd %rax, (%rdi)\n\tdec %rax\n\tret\n" },
+    { "__c6_xchg8", ASM_XCHG8, 8, 0, { { 0, 0 } },
+      ".text\n.globl __c6_xchg8\n__c6_xchg8:\n"
+      "\tmov %esi, %eax\n\txchg %al, (%rdi)\n\tmovzbl %al, %eax\n\tret\n" },
+    { "__c6_fsbase", ASM_FSBASE, 10, 0, { { 0, 0 } },
+      ".text\n.globl __c6_fsbase\n__c6_fsbase:\n\tmov %fs:0, %rax\n\tret\n" },
+};
+
+#define NASMBLOB ((u32)(sizeof(ASMBLOBS) / sizeof(ASMBLOBS[0])))
+
+static const AsmBlob *asmblob_find(const char *name)
+{
+    u32 i = 0;
+
+    if (!name)
+        return NULL;
+    for (i = 0; i < NASMBLOB; i++)
+        if (strcmp(ASMBLOBS[i].name, name) == 0)
+            return &ASMBLOBS[i];
+    return NULL;
+}
