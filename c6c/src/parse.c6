@@ -2463,9 +2463,10 @@ static int PA_TYPE_ATOM;
 
 /* __attribute__((constructor)) 收集表：进程入口在 main 之前按序调用 */
 /* c6 的 `test "名字" { … }` 块：编成一个 int(void) 函数，失败返回非 0。
- * 名字进表里，`--run-tests` 时按顺序调用（P6-5）。 */
+ * 名字进表里，-test / 合成的测试入口按顺序调用。 */
 static u32 TESTS[512];
-static const char *TEST_NAMES[512];
+static const char *TEST_NAMES[512];    /* "test:描述"（旧版 FAIL 行用） */
+static const char *TEST_DESCS[512];    /* 只有描述：-test 的 PASS/FAIL/过滤用 */
 static u32 NTESTS;
 
 static u32 CTORS[256];
@@ -2481,6 +2482,16 @@ static int PA_SAW_ENUM;
 static int PA_SYNTAX_ONLY;
 /* -run：输出只是临时 ELF，别把临时文件名报出来（main.c6 里置 1） */
 static int PA_QUIET_OUT;
+/* -test：跑 test 块、不跑用户 main（和 tcc 的 -test 同语义、同输出协议）。
+ * PA_TEST_FILTER 是 -test-filter 给的子串，NULL/空串表示全跑。 */
+static int PA_TEST_MODE;
+static const char *PA_TEST_FILTER;
+
+void pa_set_test_mode(const char *filter)
+{
+    PA_TEST_MODE = 1;
+    PA_TEST_FILTER = filter;
+}
 
 /* 吞掉多余的初始化器元素：跳到 depth 0 处的 ',' 或 '}'（都不吃掉） */
 static void skip_init_list(void)
@@ -17283,77 +17294,153 @@ static void pa_func_def(Sym *fn, Declarator *d)
 }
 
 
-/* 只有 `test "…" { }` 块、没有 main 的源文件（tests/ 下大多数就是这种）：
- * 合成一个入口，把每个 c6test_N() 跑一遍，**失败数当返回值**。
- * 这样 `c6c x.c6 -o x && ./x` 就能直接跑那 1157 个 test 块，
- * 不用等外部驱动。 */
+/* -test 的过滤：描述里含这个子串的块才跑（tcc 的 tcc_run_tests 用 strstr，
+ * 语义一样；没有 -test-filter 时全跑）。 */
+static int test_wanted(u32 i)
+{
+    if (!PA_TEST_FILTER || !PA_TEST_FILTER[0])
+        return 1;
+    if (!TEST_DESCS[i])
+        return 0;
+    return strstr(TEST_DESCS[i], PA_TEST_FILTER) != NULL;
+}
+
+/* 合成测试入口：
+ *
+ *   - 普通编译（源文件只有 `test "…" { }` 块、没有 main，tests/ 下大多数就是
+ *     这种）：把每个 c6test_N() 跑一遍，**失败数当返回值**。这样
+ *     `c6c x.c6 -o x && ./x` 就能直接跑那些 test 块，不用等外部驱动。
+ *   - -test：用户的 main 不算数（入口换成这里合成的），按 tcc 的输出协议报告
+ *     —— 每块 PASS/FAIL 行 + 收尾统计都由运行期助手 __c6c_test_run /
+ *     __c6c_test_summary 打，失败数当退出码。一个块都没有（或被过滤空了）时
+ *     静默返回 0，和 tcc 一致。
+ *
+ * 入口符号在 -test 下叫 c6c_test_main：用户的 main 还在符号表里（名字不能
+ * 撞车），但 _start 调的是这个 —— tcc 的 C99 后端也是改名后换自己的入口。 */
 static void synth_test_main(void)
 {
     u32 i = 0;
     u32 acc = 0;
+    u32 nrun = 0;
     u32 zero = 0;
+    u32 one = 0;
+    int nsel = 0;
     Sym *s = NULL;
+    Sym *hf = NULL;
+    Sym *hs = NULL;
 
-    if (PA_MAIN || NTESTS == 0 || PA_SYNTAX_ONLY || PA_ERRS || DG.errors)
+    if (PA_SYNTAX_ONLY || PA_ERRS || DG.errors)
         return;
-    irfn_reset(&FN, "main");
+    /* 普通编译里用户 main 优先；-test 下它不参与 */
+    if (!PA_TEST_MODE && (PA_MAIN || NTESTS == 0))
+        return;
+    for (i = 0; i < NTESTS; i++)
+        if (test_wanted(i))
+            nsel++;
+    if (PA_TEST_MODE) {
+        hf = sym_find("__c6c_test_run", 14);
+        hs = sym_find("__c6c_test_summary", 18);
+    }
+    irfn_reset(&FN, PA_TEST_MODE ? "c6c_test_main" : "main");
     memset(FSTR_SLOT, 0, sizeof(FSTR_SLOT));
     FSTR_DEPTH = 0;
     CUR_RET_TY = ty_int();
     FN.is_variadic = 0;
     zero = irfn_vreg(&FN);
     irfn_push(&FN, IR_CONST, IRT_I64, (u16)zero, 0, 0, 0, 0);
+    one = irfn_vreg(&FN);
+    irfn_push(&FN, IR_CONST, IRT_I64, (u16)one, 0, 0, 0, 1);
     acc = irfn_vreg(&FN);
     irfn_push(&FN, IR_CONST, IRT_I64, (u16)acc, 0, 0, 0, 0);
-    for (i = 0; i < NTESTS; i++) {
-        u32 r = irfn_vreg(&FN);
-        u32 pf = 0;
-        u32 msg = 0;
-        u32 arg = 0;
-        char line[160] = {0};
-        u32 ln = 0;
-        Sym *ps = sym_find("printf", 6);
+    nrun = irfn_vreg(&FN);
+    irfn_push(&FN, IR_CONST, IRT_I64, (u16)nrun, 0, 0, 0, 0);
+    if (PA_TEST_MODE && hf && hs) {
+        for (i = 0; i < NTESTS; i++) {
+            u32 fa = 0;
+            u32 dv = 0;
+            u32 r = 0;
+            const char *desc = TEST_DESCS[i];
 
-        irfn_push(&FN, IR_CALL, IRT_I64, (u16)r, 0, 0, 0, TESTS[i]);
-        /* 失败计数按"非 0 记 1"，不把返回值加起来（err() 的返回值大小没意义） */
-        {
-            u32 cc0 = irfn_vreg(&FN);
-
-            /* 条件码放在 flags 域（irfn_push 的最后一个参数是 imm，不是 cc） */
-            irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc0, (u16)r, (u16)zero, 0, 0);
-            FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
-            irfn_push(&FN, IR_ADD, IRT_I64, (u16)acc, (u16)acc, (u16)cc0, 0, 0);
-        }
-        if (!ps)
-            goto acc_only;
-        /* 哪条挂了要看得见：if (r) printf("FAIL %s\n", "test:…") */
-        {
-            u32 cc = irfn_vreg(&FN);
-            u32 lp = irfn_label(&FN);
-            u32 le = irfn_label(&FN);
-
-            irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc, (u16)r, (u16)zero, 0, 0);
-            FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
-            irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cc, (u16)lp, (u16)le, 0);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lp, 0, 0, 0);
-            ln = (u32)snprintf(line, sizeof(line), "FAIL %s\n",
-                               TEST_NAMES[i] ? TEST_NAMES[i] : "?");
+            if (!test_wanted(i))
+                continue;
+            if (!desc)
+                desc = "?";
             if (getenv("C6C_DBG_TESTS"))
-                fprintf(stderr, "[test] %s\n", TEST_NAMES[i] ? TEST_NAMES[i] : "?");
-            msg = gen_str_from(line, ln);
-            arg = irfn_vreg(&FN);
-            irfn_push(&FN, IR_ARG, IRT_VOID, 0, (u16)msg, 0, 0, 0);
-            pf = irfn_vreg(&FN);
-            irfn_push(&FN, IR_CALL, IRT_I64, (u16)pf, 0, 0, 0, (u32)ps->val);
-            irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)le, 0, 0, 0);
+                fprintf(stderr, "[test] %s\n", desc);
+            /* acc += __c6c_test_run(&c6test_i, "描述"); nrun++; */
+            fa = irfn_vreg(&FN);
+            /* 函数地址：flags=2 才是"符号地址 + rip 相对重定位"（flags=0 是
+             * [rbp+imm] 的栈槽，拿它当函数指针会跳到栈上） */
+            irfn_push(&FN, IR_ADDR, IRT_PTR, (u16)fa, 0, 0, 0, TESTS[i]);
+            FN.ops[FN.n - 1].flags = 2;
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)fa, 0, 0, 0);
+            dv = gen_str_from(desc, (u32)strlen(desc));
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)dv, 0, 0, 1);
+            r = irfn_vreg(&FN);
+            irfn_push(&FN, IR_CALL, IRT_I64, (u16)r, 0, 0, 0, (u32)hf->val);
+            FN.ops[FN.n - 1].narg = 2;
+            irfn_push(&FN, IR_ADD, IRT_I64, (u16)acc, (u16)acc, (u16)r, 0, 0);
+            irfn_push(&FN, IR_ADD, IRT_I64, (u16)nrun, (u16)nrun, (u16)one, 0, 0);
         }
-    acc_only:
-        ;
+        /* 一个块都没跑到：静默（tcc 的 -test 也是这样，不打印 0 test(s)） */
+        if (nsel > 0) {
+            u32 sv = irfn_vreg(&FN);
+
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)nrun, 0, 0, 0);
+            irfn_push(&FN, IR_ARG, IRT_U64, 0, (u16)acc, 0, 0, 1);
+            irfn_push(&FN, IR_CALL, IRT_I64, (u16)sv, 0, 0, 0, (u32)hs->val);
+            FN.ops[FN.n - 1].narg = 2;
+        }
+    } else {
+        for (i = 0; i < NTESTS; i++) {
+            u32 r = irfn_vreg(&FN);
+            u32 pf = 0;
+            u32 msg = 0;
+            u32 arg = 0;
+            char line[160] = {0};
+            u32 ln = 0;
+            Sym *ps = sym_find("printf", 6);
+
+            irfn_push(&FN, IR_CALL, IRT_I64, (u16)r, 0, 0, 0, TESTS[i]);
+            /* 失败计数按"非 0 记 1"，不把返回值加起来（err() 的返回值大小没意义） */
+            {
+                u32 cc0 = irfn_vreg(&FN);
+
+                /* 条件码放在 flags 域（irfn_push 的最后一个参数是 imm，不是 cc） */
+                irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc0, (u16)r, (u16)zero, 0, 0);
+                FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
+                irfn_push(&FN, IR_ADD, IRT_I64, (u16)acc, (u16)acc, (u16)cc0, 0, 0);
+            }
+            if (!ps)
+                continue;
+            /* 哪条挂了要看得见：if (r) printf("FAIL %s\n", "test:…") */
+            {
+                u32 cc = irfn_vreg(&FN);
+                u32 lp = irfn_label(&FN);
+                u32 le = irfn_label(&FN);
+
+                irfn_push(&FN, IR_CMP, IRT_I64, (u16)cc, (u16)r, (u16)zero, 0, 0);
+                FN.ops[FN.n - 1].flags = (u8)IRCC_NE;
+                irfn_push(&FN, IR_BR, IRT_VOID, 0, (u16)cc, (u16)lp, (u16)le, 0);
+                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)lp, 0, 0, 0);
+                ln = (u32)snprintf(line, sizeof(line), "FAIL %s\n",
+                                   TEST_NAMES[i] ? TEST_NAMES[i] : "?");
+                if (getenv("C6C_DBG_TESTS"))
+                    fprintf(stderr, "[test] %s\n", TEST_NAMES[i] ? TEST_NAMES[i] : "?");
+                msg = gen_str_from(line, ln);
+                arg = irfn_vreg(&FN);
+                irfn_push(&FN, IR_ARG, IRT_VOID, 0, (u16)msg, 0, 0, 0);
+                pf = irfn_vreg(&FN);
+                irfn_push(&FN, IR_CALL, IRT_I64, (u16)pf, 0, 0, 0, (u32)ps->val);
+                irfn_push(&FN, IR_LABEL, IRT_VOID, 0, (u16)le, 0, 0, 0);
+            }
+        }
     }
     irfn_push(&FN, IR_RET, IRT_I64, 0, (u16)acc, 0, 0, 0);
-    s = sym_add("main", 4, ty_func(ty_int(), NULL, 0, 0), SC_GLOBAL);
+    s = sym_add(PA_TEST_MODE ? "c6c_test_main" : "main",
+                PA_TEST_MODE ? 13 : 4, ty_func(ty_int(), NULL, 0, 0), SC_GLOBAL);
     s->is_func = 1;
-    s->val = (i64)x64_sym(&X64, "main");
+    s->val = (i64)x64_sym(&X64, PA_TEST_MODE ? "c6c_test_main" : "main");
     PA_MAIN = s;
     if (C99_MODE || llvm_mode()) {
         be_emit_fn(&FN, (u32)s->val);
@@ -18001,6 +18088,7 @@ static void pa_parse_tu(void)
         /* c6 的 `test "名字" { … }` 块：当函数编，失败返回非 0 */
         if (PA_IS_IDENT("test") && (pa_peek(1)->kind == TK_STR || TOK_EQ(pa_peek(1), "{"))) {
             char nm[128] = {0};
+            char desc[128] = {0};
             Declarator td = {0};
 
             pa_advance();
@@ -18014,9 +18102,16 @@ static void pa_parse_tu(void)
                 while (nl0 > 0 && nl0 < pa_cur()->len && ((u8)nd0[nl0] & 0xC0) == 0x80)
                     nl0--;
                 snprintf(nm, sizeof(nm), "test:%.*s", (int)nl0, nd0);
+                /* 字符串 token 的文本带引号，报告行只写描述本身（和 tcc 的
+                 * C6TestEntry.desc 一样），否则 PASS/FAIL 行会多一对引号。 */
+                if (nl0 >= 2 && nd0[0] == '"' && nd0[nl0 - 1] == '"')
+                    snprintf(desc, sizeof(desc), "%.*s", (int)(nl0 - 2), nd0 + 1);
+                else
+                    snprintf(desc, sizeof(desc), "%.*s", (int)nl0, nd0);
                 pa_advance();
             } else {
                 snprintf(nm, sizeof(nm), "test#%u", NTESTS);
+                snprintf(desc, sizeof(desc), "#%u", NTESTS);
             }
             {
                 char fn[64] = {0};
@@ -18033,6 +18128,8 @@ static void pa_parse_tu(void)
                 if (NTESTS < 512) {
                     TESTS[NTESTS] = (u32)s->val;
                     TEST_NAMES[NTESTS] = arena_strdup(&A_main, nm);
+                    /* 报告行/过滤用描述本身（"test:" 前缀和引号已经去掉） */
+                    TEST_DESCS[NTESTS] = arena_strdup(&A_main, desc);
                     NTESTS++;
                 }
                 pa_func_def(s, &td);
