@@ -12695,8 +12695,9 @@ static int pa_is_compound_lit(void)
     return pa_peek(i)->kind == TK_PUNCT && TOK_EQ(pa_peek(i), "{");
 }
 
-/* 吃掉 `(T)` 前缀，停在 `{` 上；返回多出来的左括号个数（收尾要补上 `)`） */
-static u32 pa_take_paren_type(void)
+/* 吃掉 `(T)` 前缀，停在 `{` 上；返回多出来的左括号个数（收尾要补上 `)`）。
+ * `ty_out` 非空时把 `(T)` 里的类型（含 `*` / `[N]` 这类声明符）一起带出来。 */
+static u32 pa_take_paren_type_ex(u32 *ty_out)
 {
     u32 extra = 0;
 
@@ -12706,10 +12707,24 @@ static u32 pa_take_paren_type(void)
     }
     while (tykw_is_qual(pa_cur()))
         pa_advance();
-    (void)parse_typespec();
+    {
+        u32 t = parse_typespec();
+
+        if (ty_out) {
+            Declarator ad = {0};
+
+            t = parse_declarator(t, &ad);
+            *ty_out = t;
+        }
+    }
     while (pa_accept_ch(')'))
         ;
     return extra ? extra - 1 : 0;
+}
+
+static u32 pa_take_paren_type(void)
+{
+    return pa_take_paren_type_ex(NULL);
 }
 
 /* 零字节对象的复合字面量（`empty_s x = (empty_s){}`）：没有字节要写，跳过 */
@@ -12723,6 +12738,54 @@ static int pa_skip_empty_compound(void)
     pa_advance();                    /* { */
     skip_init_list();
     pa_expect_ch('}');
+    while (ex--)
+        pa_expect_ch(')');
+    return 1;
+}
+
+/* 匿名的静态存储期复合字面量（`&(T){…}`）一处一个名字 */
+static u32 NCL_LIT;
+
+/* `&(T){ … }`：文件作用域里取复合字面量的地址。
+ *
+ * C99 6.5.2.5p5：文件作用域的复合字面量是**静态存储期**对象，所以它的存储
+ * 直接落在数据段里（语义上就是 `static T cl;` 加一次静态初始化），指针指过去
+ * 是一个常量地址。以前这里只认 `&全局` / `&函数`，见到复合字面量就报
+ * "全局地址初始化器只支持 &全局/函数"（c-testsuite single-exec/00149、00150）。
+ *
+ * 进来时游标停在 `&` 后面；返回 1 表示已经把这个初始化器整段吃干净。 */
+static int gen_glob_compound_addr(u32 data_off)
+{
+    u32 cty = 0;
+    u32 ex = 0;
+
+    if (!pa_is_compound_lit())
+        return 0;
+    ex = pa_take_paren_type_ex(&cty);
+    if (ty_is_array(cty) && ty_array_n(cty) == 0) {
+        /* `&(int[]){1,2}`：长度得数一遍初始化器才知道（同 gen_one_global
+         * 里 `T x[] = {…}` 那条路）——先把花括号体抓下来数顶层逗号，再把类型
+         * 定死、把体放回源栈，后面照常按 `{` 走。 */
+        Tok *body = arena_alloc(&A_main, (size_t)CAP_MAX * sizeof(Tok));
+        u32 ncap = body_capture(body, CAP_MAX);
+
+        cty = ty_array(ty_target(cty), CAP_BOUND > 0 ? CAP_BOUND : 1);
+        pa_src_push_back(body, ncap);
+    }
+    if (ty_size(cty) > 0) {
+        u32 soff = data_alloc(ty_size(cty), ty_align_of(cty));
+        char nm[40] = {0};
+        u32 n = (u32)snprintf(nm, sizeof(nm), "__c6_cl_%u", (unsigned)NCL_LIT++);
+        u32 sym = x64_data_sym(&X64, arena_strndup(&A_main, nm, n), ELF_HDR + soff);
+
+        gen_glob_braced_new(soff, cty, 0);
+        data_fixup_add(data_off, sym);
+    } else {
+        /* 零字节对象（`&(empty_s){}`）：没有字节要写 */
+        pa_advance();                    /* { */
+        skip_init_list();
+        pa_expect_ch('}');
+    }
     while (ex--)
         pa_expect_ch(')');
     return 1;
@@ -12832,6 +12895,8 @@ static void gen_glob_obj(u32 goff, u32 ty, u32 off)
     if (ty_is_ptr(ty)) {
         int amp = pa_accept_ch('&');
 
+        if (amp && gen_glob_compound_addr(goff + off))
+            return;
         if (pa_cur()->kind == TK_IDENT) {
             Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
 
@@ -17679,6 +17744,8 @@ static void gen_one_global(u32 ty, Declarator *d)
         int took = 0;
         int amp = pa_accept_ch('&');
 
+        if (amp && gen_glob_compound_addr(s->goff))
+            return;
         if (pa_cur()->kind == TK_IDENT) {
             Sym *t = sym_find(tok_data(pa_cur()), pa_cur()->len);
 
