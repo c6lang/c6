@@ -134,7 +134,7 @@ endif()
 # 4. 注册测试
 # ---------------------------------------------------------------------------
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND C6_ENABLE_TCC)
   # ---- 日常 5 个：直接调测试运行器，不走回归脚本 ----
   set(_c6_daily_env ${_c6_test_env}
     "TCC=${C6_TCC_DIR}/c6${C6_TCC_EXESUF}"
@@ -218,6 +218,13 @@ if(BUILD_TESTING)
       set_property(TEST "${_case}" APPEND PROPERTY RESOURCE_LOCK "${_lock}")
     endforeach()
   endforeach()
+elseif(BUILD_TESTING)
+  # C6_ENABLE_TCC=OFF：tcc 侧 115 个回归用例全部以 tcc/c6 为被测编译器，
+  # 没有 tcc 就没有可测对象。c6c 的验收不在这里，它在 label `c6c` 上
+  # （见 cmake/C6C.cmake），所以这里如实说明而不是静默注册一堆必红的用例。
+  message(STATUS
+    "c6: C6_ENABLE_TCC=OFF —— 不注册 tcc 侧 CTest 用例；跑 c6c 的验收用 "
+    "`ctest -L c6c -LE perf` 或 `make -C c6c check-all BOOTSTRAP=host`")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -235,7 +242,7 @@ set(_c6_reserved_targets
   check-all test-all check-std-serial test-plain check-aux)
 foreach(_case IN LISTS _c6_cases)
   if(NOT _case IN_LIST _c6_reserved_targets)
-    if(BUILD_TESTING)
+    if(BUILD_TESTING AND C6_ENABLE_TCC)
       add_custom_target("${_case}"
         COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${CMAKE_CURRENT_BINARY_DIR}"
                 -R "^${_case}$" --output-on-failure
@@ -245,7 +252,7 @@ foreach(_case IN LISTS _c6_cases)
     else()
       add_custom_target("${_case}"
         COMMAND "${CMAKE_COMMAND}" -E echo
-          "c6: 测试未注册，请用 -DBUILD_TESTING=ON 重新配置后再跑 ${_case}"
+          "c6: 测试未注册（-DBUILD_TESTING=ON 且 C6_ENABLE_TCC=ON 才有 tcc 侧用例）"
         VERBATIM)
     endif()
     add_dependencies("${_case}" c6)
@@ -261,6 +268,14 @@ function(c6_add_ctest_target target)
     add_custom_target("${target}"
       COMMAND "${CMAKE_COMMAND}" -E echo
         "c6: 测试未注册，请用 -DBUILD_TESTING=ON 重新配置"
+      VERBATIM)
+    return()
+  endif()
+  if(NOT C6_ENABLE_TCC)
+    add_custom_target("${target}"
+      COMMAND "${CMAKE_COMMAND}" -E echo
+        "c6: ${target} 是 tcc 侧的聚合入口；本次 C6_ENABLE_TCC=OFF。"
+        "跑 c6c 的验收用 `ctest -L c6c -LE perf` 或 `make -C c6c check-all BOOTSTRAP=host`"
       VERBATIM)
     return()
   endif()

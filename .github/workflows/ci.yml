@@ -122,6 +122,62 @@ jobs:
         run: ctest --test-dir build -L perf --output-on-failure
 
   # -------------------------------------------------------------------------
+  # no-tcc：tcc 退出工具链的那条路（`-DC6_ENABLE_TCC=OFF`）。
+  #
+  # 只用一个系统 C 编译器把 c6c 编出来：c6c 的源码是 C99 兼容的单 TU
+  # （`src/c6c.c6` 把各模块 #include 进来），所以 stage0 可以是 cc，
+  # 整条**构建**里没有任何 tcc 构建产物——不编 tcc、不链 libtcc。tcc/ 只以
+  # 源码形式留下（c6c 的 build-tcc 与 tests1/tests2 闸门把它当语料）。
+  #
+  # 验收阶段会有一次例外，写在下面 ctest 那步的注释里：G2c 要一个能用的 tcc
+  # 来编 tcc 的运行时（libtcc1.a），c6c/Makefile 会用 cc 现编一个当夹具。
+  #
+  # 这条作业是"能退"的机器证据：它红了就说明 c6c 又悄悄依赖上 tcc 了。
+  # -------------------------------------------------------------------------
+  no-tcc:
+    name: no-tcc (只靠 cc 引导 c6c)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make gcc binutils python3
+
+      - name: Configure and build without tcc
+        run: |
+          cmake -S . -B build-notcc \
+            -DC6_ENABLE_TCC=OFF \
+            -DCMAKE_C_COMPILER=gcc \
+            -DBUILD_TESTING=ON
+          cmake --build build-notcc --parallel "$(nproc)"
+          ls -l c6c/build/c6c
+          # 硬证据：构建完也没有 tcc 编译器、也没有 libtcc。
+          test ! -e tcc/c6
+          test ! -e tcc/libtcc.a
+          test ! -e tcc/libtcc.so
+          # 构建阶段唯一碰 tcc/ 的是它的**配置文件**（config.h / config.mak），
+          # 由 tcc/CMakeLists.txt 生成：c6c 的 build-tcc 把 tcc 的源码当语料编，
+          # 那份源码 `#include "config.h"`。它不是 tcc 的构建产物。
+
+      # 验收 (1)(2)(3)：自举 fixpoint / 三后端 / tests+std+诊断 / 编出 tcc
+      # 并让它跑上游 tests1·tests2。G2c 判的是"c6c 编出的 tcc 能不能工作"，
+      # 所以需要一个已知能工作的 tcc 来编 tcc 的 C 运行库 libtcc1.a：宿主 cc
+      # 直接编的运行时不等价（实测 102/144，第三代 selfhost 坏 8），
+      # c6c/Makefile 因此在这里用 cc 现编 `tcc/c6` 当夹具（不安装、不进交付物），
+      # 编出的 c6c-built tcc 逐条对齐产品构建的 118/144、坏 0。
+      - name: 验收 c6c（stage0 = gcc）
+        run: ctest --test-dir build-notcc -L c6c -LE perf --output-on-failure
+
+      # 同一件事的 Makefile 入口，顺带证明 `make -C c6c` 不经过 CMake 也能走。
+      - name: make -C c6c selfhost（BOOTSTRAP=host）
+        run: make -C c6c selfhost BOOTSTRAP=host HOSTCC=gcc
+
+  # -------------------------------------------------------------------------
   # 完整回归矩阵（91 个 std-*、自举、freestanding、tests2 等）。
   # 手动触发或 v* tag 发布时运行；release 依赖本 job，tag 上不会被跳过。
   # -------------------------------------------------------------------------

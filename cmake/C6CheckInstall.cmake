@@ -1,6 +1,13 @@
 # check-install：把 install() 结果装进 DESTDIR 暂存树，再校验安装清单、
 # 用装出去的 c6 加 -B 编译运行、跑 find_package(c6) 消费方与版本负例、
 # 核对 pkgconf 的 prefix 重定位。CI 与本地共用这一条验收链路。
+if(NOT C6_ENABLE_TCC)
+  add_custom_target(check-install
+    COMMAND "${CMAKE_COMMAND}" -E echo
+      "c6: check-install 校验的是 tcc 安装树；本次 C6_ENABLE_TCC=OFF"
+    VERBATIM)
+  return()
+endif()
 set(C6_INSTALL_PREFIX_REL "${CMAKE_INSTALL_PREFIX}")
 string(REGEX REPLACE "^/+" "" C6_INSTALL_PREFIX_REL "${C6_INSTALL_PREFIX_REL}")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/c6-check-install.cmake.in"

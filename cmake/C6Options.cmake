@@ -7,6 +7,9 @@
 
 set(C6_TCC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tcc" CACHE PATH
     "tcc 源码树；其中的 CMakeLists.txt 生成配置、Makefile 负责编译")
+option(C6_ENABLE_TCC
+  "构建/安装 tcc（c6 的 LGPL 实现）；OFF = 只构建 c6c，用宿主 C 编译器引导"
+  ON)
 option(C6_ENABLE_EXT "给 tcc/Makefile 传 EXTRA-DEFS=-DC6_EXT" ON)
 set(C6_EXTRA_DEFS "" CACHE STRING
     "追加到 EXTRA-DEFS 的宏，空格分隔，例如 -DC6_EXT -DFOO")

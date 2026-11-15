@@ -69,11 +69,19 @@ include("${C6_MODULE_DIR}/C6Testing.cmake")
 
 math(EXPR _c6_gate_count
      "${C6_REGRESSION_CASE_COUNT} - ${C6_AUX_CASE_COUNT}")
-message(STATUS
-  "c6 ${C6_VERSION_RAW}: ext=${C6_ENABLE_EXT}, ${C6_LIBTCC_FILENAME}, "
-  "prefix=${CMAKE_INSTALL_PREFIX}, tccdir=${C6_INSTALL_TCCDIR}, "
-  "CTest 用例 ${C6_REGRESSION_CASE_COUNT} 个"
-  "（门禁 ${_c6_gate_count} / aux ${C6_AUX_CASE_COUNT}）")
+if(C6_ENABLE_TCC)
+  message(STATUS
+    "c6 ${C6_VERSION_RAW}: ext=${C6_ENABLE_EXT}, ${C6_LIBTCC_FILENAME}, "
+    "prefix=${CMAKE_INSTALL_PREFIX}, tccdir=${C6_INSTALL_TCCDIR}, "
+    "CTest 用例 ${C6_REGRESSION_CASE_COUNT} 个"
+    "（门禁 ${_c6_gate_count} / aux ${C6_AUX_CASE_COUNT}）")
+else()
+  message(STATUS
+    "c6 ${C6_VERSION_RAW}: ext=${C6_ENABLE_EXT}, 无 tcc（C6_ENABLE_TCC=OFF，"
+    "c6c 的 stage0 = ${C6_HOSTCC}）, prefix=${CMAKE_INSTALL_PREFIX}, "
+    "CTest 只注册 c6c 自己的用例（label c6c / perf；tcc 侧 "
+    "${C6_REGRESSION_CASE_COUNT} 个未注册）")
+endif()
 
 # CPack 必须在所有 install() 规则之后加载；模块名不与内置 CPack 冲突。
 include("${C6_MODULE_DIR}/C6Packaging.cmake")
