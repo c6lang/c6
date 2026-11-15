@@ -82,10 +82,10 @@ else
     bad "链接器报出动态链接" "$(cat "$WORK/link.log")"
 fi
 
-if grep -q "数据符号" "$WORK/link.err"; then
-    ok "数据符号（environ 那类）如实警告，没有悄悄按 0 处理"
+if grep -q "1 个数据 COPY\|数据 COPY" "$WORK/link.log"; then
+    ok "数据符号走 COPY 重定位（链接器把个数报出来）"
 else
-    bad "数据符号警告" "$(cat "$WORK/link.err")"
+    bad "数据符号 COPY" "$(cat "$WORK/link.log")"
 fi
 
 # --- 2. 真跑：libc 函数返回的值要出现在输出里 ---
@@ -151,6 +151,51 @@ if have readelf; then
     fi
 else
     echo "skip readelf 结构核对（没装 readelf）"
+fi
+
+# --- 3b. COPY 重定位：libc 里的数据符号真被拷进来（optind 静态初值是 1） ---
+cat >"$WORK/copy.c6" <<'EOF'
+int printf(const char *fmt, ...);
+extern int optind;
+
+int main(void)
+{
+    printf("optind=%d\n", optind);
+    return optind == 1 ? 7 : 1;
+}
+EOF
+if "$C6C" -c "$WORK/copy.c6" -o "$WORK/copy.o" >/dev/null 2>&1 &&
+        "$C6C" -Wl,--dynamic -o "$WORK/copyp" "$WORK/copy.o" "$WORK/rt.o" \
+            >"$WORK/copy.log" 2>&1; then
+    got=$("$WORK/copyp")
+    rc=$?
+    if [ "$rc" = 7 ] && [ "$got" = "optind=1" ]; then
+        ok "COPY 重定位：optind 从 libc 拷进来（值 1、大小 4 字节）"
+    else
+        bad "COPY 重定位的值" "退出码 $rc，输出『$got』"
+    fi
+    if have readelf; then
+        sym=$(readelf -sW --use-dynamic "$WORK/copyp" 2>/dev/null)
+        if printf '%s\n' "$sym" | grep -q " 8 OBJECT  GLOBAL DEFAULT  ABS environ"; then
+            ok "environ 在 .dynsym 里是 8 字节的 OBJECT（大小取自 libc 的符号表）"
+        else
+            bad "environ 的 dynsym 项" "$(printf '%s\n' "$sym" | grep environ | head -1)"
+        fi
+        dyn=$(readelf -dW "$WORK/copyp" 2>/dev/null)
+        if printf '%s\n' "$dyn" | grep -q "(RELA)" && printf '%s\n' "$dyn" | grep -q "(RELASZ)"; then
+            ok "DT_RELA / DT_RELASZ 存在（COPY 走 .rela.dyn）"
+        else
+            bad "DT_RELA" "$(printf '%s\n' "$dyn" | grep -E 'RELA' | tr '\n' ' ')"
+        fi
+        ncopy=$(readelf -rW --use-dynamic "$WORK/copyp" 2>/dev/null | grep -c COPY)
+        if [ "$ncopy" -ge 1 ]; then
+            ok "R_X86_64_COPY 重定位条目在（$ncopy 条）"
+        else
+            bad "COPY 重定位条目" "没找到"
+        fi
+    fi
+else
+    bad "COPY 用例链接" "$(tail -3 "$WORK/copy.log" 2>/dev/null)"
 fi
 
 # --- 4. 默认还是静态：不加 -Wl,--dynamic 时未定义符号照样报错 ---

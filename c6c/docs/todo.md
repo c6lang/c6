@@ -3798,3 +3798,42 @@ BAD 越界没被拦住                            # 不加 -b 时默认行为没
 **这一项还剩**：`-g` 调试信息（要新增行号表 + DWARF 段，ET_REL 与可执行文件
 两侧都得带段表）、独立 `.s` 汇编输出（native 后端目前直接出字节，没有文本
 汇编器这一层）。
+
+## 第 202 轮：动态链接的数据符号（COPY 重定位）
+
+上一轮留了个口子：动态链接只导**函数**，`extern int optind;` 这类数据符号按
+0 处理。非 PIC 代码里数据符号是绝对地址，唯一的正解是 ELF 的 COPY 重定位：
+
+* 链接器在 `.bss` 里给每个要 COPY 的数据符号划一块（16 字节对齐），把它在
+  `.dynsym` 里登记成**有定义**的 `OBJECT`（`SHN_ABS` + 地址 + 大小）；
+* `.rela.dyn` 里每个符号一条 `R_X86_64_COPY`，`.dynamic` 补
+  `DT_RELA`/`DT_RELASZ`/`DT_RELAENT`；
+* ld.so 启动时跳过本程序自己的定义（`ELF_RTYPE_CLASS_COPY`），去 libc 里找
+  真定义，按大小拷到我们那块地上。
+
+**大小不能猜**：一律当 8 会在 4 字节对象（`optind`）上多读 4 字节，页边界上
+真的会踩到未映射内存。所以链接时就地去 `/lib/x86_64-linux-gnu/libc.so.6` 的
+`.dynsym` 里查 `st_size`（找不到退 `lib64` / `/usr/lib` 几个常见路径）。
+
+踩的坑：查 libc 符号表时用了 `rewind(fp)`，**selfhost 直接断在**
+`未定义的符号 'rewind'`——自举链上链接器不给这个函数。换成
+`fseek(fp, 0, SEEK_SET)`。
+
+**实测**：
+
+```
+$ c6c -c opt.c6 -o opt.o && c6c -Wl,--dynamic -o optp opt.o rt.o
+c6c: optp（动态链接 libc.so.6：导入 21 个函数 / 2 个数据 COPY / …）
+$ ./optp
+optind=1                        # libc 里的静态初值，真拷进来了
+$ readelf -sW --use-dynamic optp | grep -E 'optind|environ'
+    22: 00000000004470c0     4 OBJECT  GLOBAL DEFAULT  ABS optind
+    23: 00000000004470d0     8 OBJECT  GLOBAL DEFAULT  ABS environ
+$ make -C c6c dyncheck          # 18/18（新增 4 条 COPY 相关）
+$ make -C c6c selfhost          # fixpoint 逐字节相同（3671644 字节 / 5203 符号）
+```
+
+**仍然没有的**：libc 的启动初始化（`__libc_start_main`）。本程序的 `_start`
+直接调 `main`，所以"libc 启动时才填"的量（`environ`、`stdout` 缓冲）拷进来
+还是 0；纯函数调用不受影响。要做全，得让 `_start` 走 `__libc_start_main`
+（它会跑 `atexit`/构造/`environ` 初始化），那是下一件事。

@@ -198,11 +198,19 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
 `--allow-undefined` 了——它们真从 libc.so.6 解析，`getpid()` 返回的 pid 就是
 真 pid。
 
+数据符号走 **COPY 重定位**：`extern int optind;`、`extern char **environ;`
+这类在非 PIC 代码里是绝对地址，链接器在 `.bss` 里划一块、发一条
+`R_X86_64_COPY`（进 `.rela.dyn`，配 `DT_RELA`/`DT_RELASZ`），ld.so 启动时把
+libc 里那份定义拷过来——大小是从 libc.so.6 的 `.dynsym` 现查的（`optind` 4
+字节、`environ` 8 字节），不是一律当 8 猜。
+
 口径与限制：
 
-* 只做**函数**的动态导入。**数据**符号（`environ` 那种）需要 COPY 重定位
-  （非 PIC 代码里它是绝对地址，得把 libc 的定义拷进本程序的 `.bss`），这一版
-  没做——链接器会点名列一条警告，然后按 0 处理；只要运行路径不读它就没影响。
+* **libc 的启动初始化没做**：本程序的 `_start` 直接调 `main`，不经过
+  `__libc_start_main`。所以"libc 启动时才填"的全局量（`environ`、`stdout`
+  的缓冲区之类）拷进来仍是 0；纯函数的 libc 调用（`printf`/`getpid`/
+  `malloc`/`strlen`……）不受影响。要用环境变量就自己读 `/proc/self/environ`
+  或 `argv`（`rt.c6` 里就是这么干的）。
 * 不做 `-shared` / `-fPIC` 产物、符号版本（`.gnu.version`）、
   `.rela.dyn` 里的 `R_X86_64_RELATIVE`（本程序是固定基址的 ET_EXEC）。
 * 默认仍是静态链接：动态是**显式**选项（`-Wl,--dynamic`），拼错的链接器
