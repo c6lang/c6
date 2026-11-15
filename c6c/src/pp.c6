@@ -159,7 +159,13 @@ static void pp_push_tokens(Tok *t, u32 n)
 
 static void pp_pushback(Tok *t, int kind)
 {
-    if (kind == TK_EOF)
+    /* 真的 EOF 不用回推（词法源再取一次还是 EOF），但 `expand_array` 拿来当
+     * "这段实参到此为止"的边界 token 也是 TK_EOF 造的，那个必须回推：丢了它，
+     * 嵌套的实参预展开会越过实参边界、一路读进外层源码。
+     * 症状是 `#define A(a,b) a(b)` 里的 `A(M,1);` 展开成 `M;(1)` —— 实参 M
+     * 把后面的 ';' 一起吞了，于是 `a(b)` 拼出来的 `M(` 被 ';' 撑开，M 再也
+     * 调不起来（c-testsuite single-exec/00138）。 */
+    if (kind == TK_EOF && !(t->flags & TF_SYN))
         return;
     if (NPUSHBACK >= 8)
         return;
@@ -1022,6 +1028,149 @@ static void do_elif(void)
         c->seen_true = 1;
 }
 
+/* `#pragma` 那一行的内容：认识的（pack / once / push_macro / pop_macro）生效，
+ * 其余一律忽略（与 tcc 一致，也对 glibc 头友好）。
+ *
+ * `_Pragma("…")`（C99 6.10.9）走的是同一条路：它就是个一元运算符，把字符串
+ * de-stringize 之后当成 pragma 的内容。 */
+static void pp_pragma_line(Tok *line, u32 n)
+{
+    if (pp_active() && n > 1 && line[0].kind == TK_IDENT && TOK_EQ(&line[0], "pack")) {
+        /* `#pragma pack(push,1)` / `pack(pop)` / `pack(N)`。预处理是**整趟跑完**
+         * 才进语法分析的，所以这里不能直接改布局用的全局——那会让所有结构体
+         * 都用最后一个 pack 值。往 token 流里塞一条 `__c6_pack(N);`，
+         * 由语法分析在遇到它的位置生效。 */
+        u32 k = 1;
+        int v = -1;
+
+        while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
+            k++;
+        k++;
+        if (k < n && line[k].kind == TK_IDENT && TOK_EQ(&line[k], "push")) {
+            k++;
+            v = 0;
+            if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ',')
+                k++;             /* `pack(push,1)` 里那个逗号 */
+            if (k < n && line[k].kind == TK_NUM) {
+                char lb[24] = {0};
+                u32 lk = line[k].len < 20 ? line[k].len : 20;
+
+                memcpy(lb, tok_data(&line[k]), lk);
+                lb[lk] = 0;
+                v = (int)strtol(lb, NULL, 0);
+            }
+        } else if (k < n && line[k].kind == TK_IDENT && TOK_EQ(&line[k], "pop")) {
+            v = 0;
+        } else if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ')') {
+            v = 0;                   /* `pack()` = 恢复自然对齐 */
+        } else if (k < n && line[k].kind == TK_NUM) {
+            char lb[24] = {0};
+            u32 lk = line[k].len < 20 ? line[k].len : 20;
+
+            memcpy(lb, tok_data(&line[k]), lk);
+            lb[lk] = 0;
+            v = (int)strtol(lb, NULL, 0);
+        }
+        PACK_SEEN = 1;
+        if (v >= 0) {
+            char nb[24] = {0};
+            Tok t0 = tok_syn(TK_IDENT, "__c6_pack", 9, NULL, 0);
+            Tok t1 = tok_syn(TK_PUNCT, "(", 1, NULL, 0);
+            Tok t2 = {0};
+            Tok t3 = tok_syn(TK_PUNCT, ")", 1, NULL, 0);
+            Tok t4 = tok_syn(TK_PUNCT, ";", 1, NULL, 0);
+
+            snprintf(nb, sizeof(nb), "%d", v);
+            t2 = tok_syn(TK_NUM, arena_strdup(&A_main, nb), (u32)strlen(nb), NULL, 0);
+            /* pp_pushback 是栈：反着塞，取出来才是 `__c6_pack ( N ) ;` */
+            pp_pushback(&t4, TK_PUNCT);
+            pp_pushback(&t3, TK_PUNCT);
+            pp_pushback(&t2, TK_NUM);
+            pp_pushback(&t1, TK_PUNCT);
+            pp_pushback(&t0, TK_IDENT);
+        }
+    } else if (pp_active() && n > 0 && line[0].kind == TK_IDENT && TOK_EQ(&line[0], "once")) {
+        if (PP_TOP->is_file)
+            PP_TOP->f->pragma_once = 1;
+    } else if (pp_active() && n > 1 && line[0].kind == TK_IDENT
+               && (TOK_EQ(&line[0], "push_macro") || TOK_EQ(&line[0], "pop_macro"))) {
+        /* #pragma push_macro("name") / pop_macro("name") */
+        int is_push = TOK_EQ(&line[0], "push_macro");
+        u32 k = 1;
+
+        while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
+            k++;
+        k++;
+        if (k < n && line[k].kind == TK_STR) {
+            char *nm = unquote(&line[k]);
+
+            if (is_push)
+                macro_save_push(nm);
+            else
+                macro_save_pop(nm);
+        }
+    }
+    /* 其它 pragma 一律忽略（与 tcc 一致，也对 glibc 头友好） */
+}
+
+/* `_Pragma ( "…" )`：吃掉这三个 token，把里面的内容按 pragma 处理。
+ * 认不认识无所谓，关键是不能漏到语法分析里（glibc 的头文件里到处都是
+ * `_Pragma("GCC visibility push(default)")` 这种）。 */
+static void pp_do_pragma_op(void)
+{
+    Tok t = {0};
+    Tok str = {0};
+    char *txt = NULL;
+    SrcFile sf = {0};
+    Lex L = {0};
+    Tok line[32] = {0};
+    u32 n = 0;
+    int k = 0;
+
+    do {
+        k = raw_next(&t);
+    } while (k == TK_NL);
+    if (!(k == TK_PUNCT && TOK_EQ(&t, "("))) {
+        if (k != TK_EOF)
+            pp_pushback(&t, k);
+        return;
+    }
+    do {
+        k = raw_next(&t);
+    } while (k == TK_NL);
+    if (k != TK_STR) {
+        if (k != TK_EOF)
+            pp_pushback(&t, k);
+        return;
+    }
+    str = t;
+    do {
+        k = raw_next(&t);
+    } while (k == TK_NL);
+    if (!(k == TK_PUNCT && TOK_EQ(&t, ")")) && k != TK_EOF)
+        pp_pushback(&t, k);
+
+    txt = unquote(&str);
+    if (!txt || !txt[0])
+        return;
+    sf.path = "-";
+    sf.data = txt;
+    sf.size = strlen(txt);
+    sf.id = CUR_FILE ? CUR_FILE->id : 0;
+    lex_init(&L, &sf);
+    while (n < 32) {
+        Tok pt = {0};
+        int kk = lex_next(&L, &pt);
+
+        if (kk == TK_EOF || kk == TK_NL)
+            break;
+        pt.flags |= TF_SYN;
+        line[n++] = pt;
+    }
+    if (n)
+        pp_pragma_line(line, n);
+}
+
 static void handle_directive(void)
 {
     Tok t = {0};
@@ -1079,87 +1228,54 @@ static void handle_directive(void)
         else
             COND = c->up;
     } else if (DIR_IS("line")) {
-        skip_line();
+        /* `#line N` / `#line N "文件"`（C99 6.10.4）。实参是 pp-tokens，
+         * **先宏展开**再看：`#define line 1000` + `#line line` 必须认成
+         * `#line 1000`（c-testsuite single-exec/00152 就是这条）。 */
+        Tok *line = NULL;
+        u32 n = 0;
+
+        dir_line(&line, &n);
+        if (!pp_active())
+            return;
+        {
+            Tok *ex = NULL;
+            u32 exn = 0;
+            u32 want = 0;
+            int have_num = 0;
+
+            if (n > 0) {
+                expand_array(line, n, &ex, &exn);
+                if (exn > 0 && ex[0].kind == TK_NUM) {
+                    char nb[24] = {0};
+                    u32 k = ex[0].len < 20 ? ex[0].len : 20;
+
+                    memcpy(nb, tok_data(&ex[0]), k);
+                    nb[k] = 0;
+                    want = (u32)strtoul(nb, NULL, 10);
+                    have_num = 1;
+                } else {
+                    diag_error(PP_TOP->f, line[0].off, "#line 后面要一个十进制行号");
+                }
+                if (exn > 1 && ex[1].kind == TK_STR && PP_TOP->f) {
+                    /* 去掉两边引号：`#line 7 "x.c"` 之后 __FILE__ 就是 x.c */
+                    const char *s = tok_data(&ex[1]);
+                    u32 sl = ex[1].len;
+
+                    if (sl >= 2 && s[0] == '"' && s[sl - 1] == '"') {
+                        s += 1;
+                        sl -= 2;
+                    }
+                    PP_TOP->f->disp = arena_strndup(&A_main, s, sl);
+                }
+            }
+            if (have_num && PP_TOP->f)
+                src_line_mark(PP_TOP->f, PP_TOP->lex.pos, want);
+        }
     } else if (DIR_IS("pragma")) {
         Tok *line = NULL;
         u32 n = 0;
         dir_line(&line, &n);
-        if (pp_active() && n > 1 && line[0].kind == TK_IDENT && TOK_EQ(&line[0], "pack")) {
-            /* `#pragma pack(push,1)` / `pack(pop)` / `pack(N)`。预处理是**整趟跑完**
-             * 才进语法分析的，所以这里不能直接改布局用的全局——那会让所有结构体
-             * 都用最后一个 pack 值。往 token 流里塞一条 `__c6_pack(N);`，
-             * 由语法分析在遇到它的位置生效。 */
-            u32 k = 1;
-            int v = -1;
-
-            while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
-                k++;
-            k++;
-            if (k < n && line[k].kind == TK_IDENT && TOK_EQ(&line[k], "push")) {
-                k++;
-                v = 0;
-                if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ',')
-                    k++;             /* `pack(push,1)` 里那个逗号 */
-                if (k < n && line[k].kind == TK_NUM) {
-                    char lb[24] = {0};
-                    u32 lk = line[k].len < 20 ? line[k].len : 20;
-
-                    memcpy(lb, tok_data(&line[k]), lk);
-                    lb[lk] = 0;
-                    v = (int)strtol(lb, NULL, 0);
-                }
-            } else if (k < n && line[k].kind == TK_IDENT && TOK_EQ(&line[k], "pop")) {
-                v = 0;
-            } else if (k < n && line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == ')') {
-                v = 0;                   /* `pack()` = 恢复自然对齐 */
-            } else if (k < n && line[k].kind == TK_NUM) {
-                char lb[24] = {0};
-                u32 lk = line[k].len < 20 ? line[k].len : 20;
-
-                memcpy(lb, tok_data(&line[k]), lk);
-                lb[lk] = 0;
-                v = (int)strtol(lb, NULL, 0);
-            }
-            PACK_SEEN = 1;
-            if (v >= 0) {
-                char nb[24] = {0};
-                Tok t0 = tok_syn(TK_IDENT, "__c6_pack", 9, NULL, 0);
-                Tok t1 = tok_syn(TK_PUNCT, "(", 1, NULL, 0);
-                Tok t2 = {0};
-                Tok t3 = tok_syn(TK_PUNCT, ")", 1, NULL, 0);
-                Tok t4 = tok_syn(TK_PUNCT, ";", 1, NULL, 0);
-
-                snprintf(nb, sizeof(nb), "%d", v);
-                t2 = tok_syn(TK_NUM, arena_strdup(&A_main, nb), (u32)strlen(nb), NULL, 0);
-                /* pp_pushback 是栈：反着塞，取出来才是 `__c6_pack ( N ) ;` */
-                pp_pushback(&t4, TK_PUNCT);
-                pp_pushback(&t3, TK_PUNCT);
-                pp_pushback(&t2, TK_NUM);
-                pp_pushback(&t1, TK_PUNCT);
-                pp_pushback(&t0, TK_IDENT);
-            }
-        } else if (pp_active() && n > 0 && line[0].kind == TK_IDENT && TOK_EQ(&line[0], "once")) {
-            if (PP_TOP->is_file)
-                PP_TOP->f->pragma_once = 1;
-        } else if (pp_active() && n > 1 && line[0].kind == TK_IDENT
-                   && (TOK_EQ(&line[0], "push_macro") || TOK_EQ(&line[0], "pop_macro"))) {
-            /* #pragma push_macro("name") / pop_macro("name") */
-            int is_push = TOK_EQ(&line[0], "push_macro");
-            u32 k = 1;
-
-            while (k < n && !(line[k].kind == TK_PUNCT && tok_data(&line[k])[0] == '('))
-                k++;
-            k++;
-            if (k < n && line[k].kind == TK_STR) {
-                char *nm = unquote(&line[k]);
-
-                if (is_push)
-                    macro_save_push(nm);
-                else
-                    macro_save_pop(nm);
-            }
-        }
-        /* 其它 pragma 一律忽略（与 tcc 一致，也对 glibc 头友好） */
+        pp_pragma_line(line, n);
     } else if (DIR_IS("error")) {
         Tok *line = NULL;
         u32 n = 0;
@@ -1198,6 +1314,11 @@ static int pp_next(Tok *out)
             return k;
         if (out->kind != TK_IDENT)
             return k;
+        /* C99 的 `_Pragma("…")` 一元运算符（不能当宏名，所以放在宏查表之前） */
+        if (out->len == 7 && memcmp(tok_data(out), "_Pragma", 7) == 0) {
+            pp_do_pragma_op();
+            continue;
+        }
         /* 五个内建宏先按"长度 8..11 且以 __ 开头"过滤：绝大多数标识符是普通
          * 名字，一次判断就能跳过 5 次字符串比较（profiler 里 pp_next 占 6%）。 */
         if (!(out->len >= 8 && out->len <= 11 && tok_data(out)[0] == '_'
@@ -1233,9 +1354,10 @@ static int pp_next(Tok *out)
         }
         if (TOK_EQ(out, "__FILE__")) {
             SrcFile *f = file_by_id(out->file);
-            size_t len = strlen(f->path) + 3;
+            const char *fn = src_path_of(f);
+            size_t len = strlen(fn) + 3;
             char *buf = arena_alloc(&A_main, len);
-            int n = snprintf(buf, len, "\"%s\"", f->path);
+            int n = snprintf(buf, len, "\"%s\"", fn);
             *out = tok_syn(TK_STR, buf, (u32)n, CUR_FILE, 0);
             return TK_STR;
         }

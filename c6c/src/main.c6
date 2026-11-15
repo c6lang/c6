@@ -34,6 +34,11 @@ typedef struct Opts {
     const char *bdir;
     int verbose;
     int mode;
+    /* `-std=`：0 = 默认/c99（`__STDC_VERSION__` 199901L）、1 = c89（不定义）、
+     * 2 = c11（201112L）。c6c 的语法一直是"C99 加一些扩展"，所以这个选项
+     * 不改语法，只管那条宏——但构建系统传的 `-std=c99` / `-std=gnu99` 必须
+     * 能接住，不能当未知选项打死。 */
+    int std;
     /* -run：run_argi 是「程序自己的 argv[0]」在编译器 argv 里的下标；
      * 从那儿往后的所有参数原样交给程序（tcc 同款语义）。 */
     int run;
@@ -57,6 +62,7 @@ static void usage(FILE *fp)
         "  -U 名字              取消预定义\n"
         "  -B 目录              libtcc1.a / crt 所在目录（同时用它下面的 include）\n"
         "  -o 文件              输出文件\n"
+        "  -std=c89|c99|c11     `__STDC_VERSION__` 按这个给（语法不变；gnu 变体也认）\n"
         "  --scan               只做预处理+词法并打印统计\n"
         "  --hello 文件          直接发一个 _start+main(42) 的 ELF（P2-2 骨架）\n"
         "  --type-selftest      类型表 hash-consing/布局自测（P3-1）\n"
@@ -330,7 +336,6 @@ static const char *const BUILTIN_DEFS =
     "#define __builtin_free(a) free(a)\n"
     "#define __builtin_strdup(a) strdup(a)\n"
     "#define __STDC__ 1\n"
-    "#define __STDC_VERSION__ 199901L\n"
     "#define __STDC_HOSTED__ 1\n"
     "#define __x86_64 1\n"
     "#define __x86_64__ 1\n"
@@ -401,6 +406,11 @@ static void push_defines(void)
         cap += strlen(O.undefs[i]) + 16;
     buf = arena_alloc(&A_main, cap);
     n = (size_t)snprintf(buf, cap, "%s", BUILTIN_DEFS);
+    /* `__STDC_VERSION__` 跟着 `-std=` 走（c89 里根本没有这条宏） */
+    if (O.std == 2)
+        n += (size_t)snprintf(buf + n, cap - n, "#define __STDC_VERSION__ 201112L\n");
+    else if (O.std == 0)
+        n += (size_t)snprintf(buf + n, cap - n, "#define __STDC_VERSION__ 199901L\n");
     for (i = 0; i < O.ndefs; i++) {
         const char *d = O.defs[i];
         const char *eq = strchr(d, '=');
@@ -517,6 +527,26 @@ static int parse_args(int argc, char **argv)
                 O.out = val;
             } else if (a[1] == 'B') {
                 O.bdir = val;
+            }
+        } else if (a[0] == '-' && strncmp(a, "-std=", 5) == 0) {
+            /* 只认标准里那几个拼法（gcc/clang 都收这些别名）；语法不变，
+             * 只决定 `__STDC_VERSION__`。 */
+            const char *sv = a + 5;
+
+            if (strncmp(sv, "c89", 3) == 0 || strncmp(sv, "c90", 3) == 0
+                || strncmp(sv, "gnu89", 5) == 0 || strncmp(sv, "iso9899:1990", 12) == 0)
+                O.std = 1;
+            else if (strncmp(sv, "c99", 3) == 0 || strncmp(sv, "gnu99", 5) == 0
+                     || strncmp(sv, "iso9899:1999", 12) == 0)
+                O.std = 0;
+            else if (strncmp(sv, "c11", 3) == 0 || strncmp(sv, "gnu11", 5) == 0
+                     || strncmp(sv, "c17", 3) == 0 || strncmp(sv, "gnu17", 5) == 0
+                     || strncmp(sv, "c18", 3) == 0 || strncmp(sv, "gnu18", 5) == 0
+                     || strncmp(sv, "iso9899:2011", 12) == 0)
+                O.std = 2;
+            else {
+                diag_error_plain("不认识的 -std=%s（支持 c89/c99/c11 及其 gnu 变体）", sv);
+                return -1;
             }
         } else if (a[0] == '-' && (a[1] == 'W' || a[1] == 'w')) {
             /* 告警开关：接受并记下来，目前没有告警子系统，静默忽略。

@@ -35,6 +35,8 @@ typedef struct Sym {
     u8 fallible;           /* 返回类型带 `!error`：调用结果必须 try/catch */
     u8 is_const;           /* 这个**对象**是只读的（`int *const p` / `const int x`） */
     u8 is_tls;             /* `__thread`：线程局部量，寻址走 %fs + goff */
+    u32 vla_cnt;           /* VLA 对象：长度（vreg，运行期算好的）；0 = 不是 VLA */
+    u32 vla_esz;           /* VLA 对象：元素大小（sizeof 要按 cnt*esz 现算） */
     u32 slot;              /* 局部/形参：虚拟寄存器槽号 */
     u32 goff;              /* 全局：数据段偏移 */
     const char *alias;     /* 模板实例接收者的方法：<实例名>_<函数名> 别名 */
