@@ -174,3 +174,78 @@ cc main.o lib.o -o prog && ./prog          # 交给系统链接器
 
 回归：`make -C c6c ldcheck`（纯自足两个 `.o` / 真实规模的 `rt.o` 564 条
 重定位 / 构造函数顺序 / 跨 `.o` TLS / 缺符号报错 / `readelf` 结构核对）。
+
+## 库形态：把 c6c 嵌进别人的程序
+
+`src/embed.c6` 把编译器包成一套 API（`include/c6lib.h`），同一份源码用
+`-DC6C_NO_MAIN` 关掉 `main()` 就能编成库：
+
+```sh
+make -C c6c libc6c            # → c6c/build/libc6c.a + libc6c.so
+```
+
+```c
+#include <c6lib.h>
+
+C6State *s = c6_new();
+c6_compile_string(s, "int printf(const char*,...);"
+                     "int main(void){ printf(\"hi\\n\"); return 42; }");
+if (c6_run(s, 0, NULL) != 42)          /* 编进内存，就地跑 */
+    fprintf(stderr, "%s\n", c6_error(s));
+void *m = c6_get_symbol(s, "main");    /* 取符号地址（必要时先 relocate） */
+c6_output_file(s, "prog");             /* 或者落盘成可执行文件 */
+c6_delete(s);
+```
+
+API 一览：`c6_new` / `c6_delete` / `c6_error` / `c6_add_include_path` /
+`c6_set_runtime_path` / `c6_define_symbol` / `c6_compile_file` /
+`c6_compile_string` / `c6_relocate` / `c6_get_symbol` / `c6_run` /
+`c6_output_file`。库形态没有 `argv[0]` 可推，所以 `lib/rt.c6` 和自带
+`include/` 的绝对路径在编译期就塞进去（`C6_DEFAULT_RT` / `C6_DEFAULT_INC`）。
+
+**`tcc_*` 兼容层**：`include/tcc-compat.h` 声明的是 tcc 那套名字
+（`tcc_new` / `tcc_compile_string` / `tcc_relocate` / `tcc_run` /
+`tcc_get_symbol` / `tcc_output_file` / `tcc_set_options`），实现一一接到
+`c6_*` 上。原本用 tcc 嵌入库的程序，把包含路径和链接库换掉就能编过、跑出
+一样的结果——这是"顶替 tcc 产品位"里最实的一步。
+
+口径与限制：一个 `C6State` 只能编一次（第二次如实拒绝，不做静默错结果）；
+`tcc_set_error_func` 收了回调但诊断仍走 stderr；`tcc_add_file` 只收
+`.c6`/`.c` 源文件，不收 `.o`/`.a`；`tcc_set_options` 只认 `-I`/`-D`/`-U`。
+
+回归：`make -C c6c embedcheck`（6 条：动态库 / 静态库 / 落盘后独立跑 /
+编译失败被报告 / 二次编译被拒绝 / `tcc_*` 兼容层）。
+
+## 安装与包契约：没有 tcc 也能装出全套
+
+`cmake -DC6_ENABLE_TCC=OFF` 时安装清单按 c6c 自己的搜索规则来定落点：
+
+```
+bin/c6                                  编译器（c6c 编的）
+include/c6lib.h  include/libtcc.h       宿主 C 程序用的头（兼容层装成 libtcc.h）
+lib/libc6c.a     lib/libc6c.so          嵌入库
+lib/c6/rt.c6     lib/c6/include/*.h     编译器自带的运行时与头文件
+lib/cmake/c6/c6Config.cmake             find_package(c6)
+lib/pkgconfig/{c6,c6lib}.pc             pkgconf
+```
+
+c6c 用 `argv[0]` 推自己的目录去找 `<bin>/../lib/c6/{include,rt.c6}`，所以
+整棵树搬走、换前缀都还能自己找到自带头文件。
+
+两种用法，`C6_ENABLE_TCC=OFF` 下都成立：
+
+```cmake
+find_package(c6 0.1 REQUIRED COMPONENTS libtcc)   # 没有 tcc 时由 libc6c 顶上
+target_link_libraries(app PRIVATE c6::libtcc)     # 也可以直接用 c6::c6lib
+```
+
+```sh
+cc $(pkgconf --cflags --libs c6lib) host.c -o host   # → -lc6c
+```
+
+注意 `include/` 里只放宿主用的两个头：c6 自己的 `stdio.h`/`stddef.h` 在
+`lib/c6/include/`，装到系统 includedir 会把宿主程序的系统头文件盖掉。
+
+回归：`make -C c6c pkgcheck`（7 条：无 tcc 也能 configure / 安装树齐全 /
+`include/` 干净 / `find_package` 消费者真编真跑 / `pkgconf` 旗子
+`-Wall -Werror` 过得去 / 搬到别的前缀的 `c6` 自找头文件与运行时）。

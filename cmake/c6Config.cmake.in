@@ -18,8 +18,14 @@ set(C6_LIBTCC_FILENAME "@C6_LIBTCC_FILENAME@")
 set_and_check(C6_BINDIR "@PACKAGE_C6_BINDIR@")
 set_and_check(C6_LIBDIR "@PACKAGE_C6_LIBDIR@")
 set_and_check(C6_INCLUDE_DIR "@PACKAGE_C6_INCLUDEDIR@")
-set_and_check(C6_TCCDIR "@PACKAGE_C6_TCCDIR@")
+# tcc 目录只在有 tcc 的构建里存在；库形态（C6_ENABLE_TCC=OFF）下别 check，
+# 否则 find_package 会因为"少一个目录"直接失败。
+set(C6_TCCDIR "@PACKAGE_C6_TCCDIR@")
+if(EXISTS "${C6_TCCDIR}")
+  set_and_check(C6_TCCDIR "${C6_TCCDIR}")
+endif()
 
+set(C6_C6LIB_LIBRARY "${C6_LIBDIR}/libc6c.a")
 set(C6_EXECUTABLE "${C6_BINDIR}/c6@C6_TCC_EXESUF@")
 set(C6_LIBTCC_LIBRARY "${C6_LIBDIR}/@C6_LIBTCC_FILENAME@")
 set(C6_LIBRARIES "${C6_LIBTCC_LIBRARY}")
@@ -28,8 +34,15 @@ set(C6_INCLUDE_DIRS "${C6_INCLUDE_DIR}")
 include("${CMAKE_CURRENT_LIST_DIR}/c6Targets.cmake")
 
 foreach(_c6_comp IN LISTS c6_FIND_COMPONENTS)
-  if(_c6_comp STREQUAL "libtcc" AND EXISTS "${C6_LIBTCC_LIBRARY}")
+  if(_c6_comp STREQUAL "libtcc" AND (EXISTS "${C6_LIBTCC_LIBRARY}"
+                                     OR EXISTS "${C6_C6LIB_LIBRARY}"))
+    # 有 tcc 的 libtcc 就用它；没有就用 c6c 的嵌入库（tcc_* 兼容层顶上）。
+    if(NOT EXISTS "${C6_LIBTCC_LIBRARY}")
+      message(STATUS "c6: 没有 tcc 的 libtcc，用 c6c 的嵌入库 (libc6c) 顶替")
+    endif()
     set(c6_libtcc_FOUND TRUE)
+  elseif(_c6_comp STREQUAL "c6lib" AND EXISTS "${C6_C6LIB_LIBRARY}")
+    set(c6_c6lib_FOUND TRUE)
   elseif(_c6_comp STREQUAL "compiler" AND EXISTS "${C6_EXECUTABLE}")
     set(c6_compiler_FOUND TRUE)
   else()

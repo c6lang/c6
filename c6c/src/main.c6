@@ -720,6 +720,11 @@ static void setup_incdirs(void)
         snprintf(bd, sizeof(bd), "%s/../include", C6C_SELF_DIR);
         if (NINCDIR < MAX_INCDIRS)
             INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
+        /* 装出来的布局：<prefix>/bin/c6 + <prefix>/lib/c6/include（和 tcc 的
+         * <prefix>/lib/tcc 一个意思——自带头文件不跟 C 库的 include 抢地方）。 */
+        snprintf(bd, sizeof(bd), "%s/../lib/c6/include", C6C_SELF_DIR);
+        if (NINCDIR < MAX_INCDIRS)
+            INCDIR[NINCDIR++] = arena_strdup(&A_main, bd);
     }
     snprintf(bd, sizeof(bd), "%s/include", O.bdir);
     if (NINCDIR < MAX_INCDIRS)
@@ -807,6 +812,8 @@ static int run_elf(char **pargv)
     return 128 + (st & 0x7f);
 }
 
+/* 库形态（libc6c）不要 main：宿主程序自己有。见 src/c6c-lib.c6。 */
+#ifndef C6C_NO_MAIN
 int main(int argc, char **argv)
 {
     pp_init_time();
@@ -1031,3 +1038,4 @@ int main(int argc, char **argv)
     }
     return 0;
 }
+#endif /* C6C_NO_MAIN */
