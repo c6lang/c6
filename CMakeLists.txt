@@ -8,6 +8,7 @@
 #   C6Options          参数与安装路径
 #   C6Tcc              add_subdirectory(tcc)，传参数并读回 tcc 导出的产物信息
 #   C6Build            构建目标（薄封装 tcc-build）
+#   C6C                c6c（用 c6 写的自举编译器）的编译目标与 CTest 验收
 #   C6Install          install() 清单
 #   C6LibraryConfig    find_package(c6) / pkgconf 库配置
 #   C6Wasm             wasm 目标（直调 scripts/）
@@ -58,6 +59,7 @@ set(C6_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include("${C6_MODULE_DIR}/C6Options.cmake")
 include("${C6_MODULE_DIR}/C6Tcc.cmake")
 include("${C6_MODULE_DIR}/C6Build.cmake")
+include("${C6_MODULE_DIR}/C6C.cmake")
 include("${C6_MODULE_DIR}/C6Install.cmake")
 include("${C6_MODULE_DIR}/C6LibraryConfig.cmake")
 include("${C6_MODULE_DIR}/C6Wasm.cmake")
