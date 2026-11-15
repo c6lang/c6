@@ -42,7 +42,7 @@
 #define OBJ_SHN_UNDEF      0u
 #define OBJ_SHN_TEXT       1u
 #define OBJ_SHN_DATA       2u
-#define OBJ_NSEC           13u
+#define OBJ_NSEC           19u
 #define OBJ_SYM_TEXT       1u      /* .text 段符号在符号表里的下标 */
 #define OBJ_SYM_DATA       2u      /* .data 段符号 */
 #define OBJ_SYM_FIRST      3u      /* 第一个真正的符号 */
@@ -53,13 +53,38 @@
 #define OBJ_SEC_FINI       10u
 #define OBJ_SEC_RELA_INIT  11u
 #define OBJ_SEC_RELA_FINI  12u
+/* -g 的四个 DWARF 段 + 它们的两张重定位表（下标同样写死，追加在后面） */
+#define OBJ_SEC_DEBUG_ABBREV 13u
+#define OBJ_SEC_DEBUG_INFO   14u
+#define OBJ_SEC_DEBUG_LINE   15u
+#define OBJ_SEC_DEBUG_STR    16u
+#define OBJ_SEC_RELA_DBGI    17u
+#define OBJ_SEC_RELA_DBGL    18u
 #define OBJ_SEC_SHSTRTAB   7u
+
+/* dw.c6 的段序号（两个文件共用同一套编号） */
+#define DW_SEC_ABBREV 0
+#define DW_SEC_INFO   1
+#define DW_SEC_LINE   2
+#define DW_SEC_STR    3
+#define DW_SEC_RELAI  4
+#define DW_SEC_RELAL  5
+
+/* -g：调试信息（DWARF 由 dw.c6 造，本文件只负责把它挂进段表与文件） */
+static int OBJ_DEBUG;
+static const char *OBJ_DEBUG_SRC = "<unknown>";
+static void obj_set_debug(int on) { OBJ_DEBUG = on ? 1 : 0; }
+static void obj_set_debug_src(const char *path) { OBJ_DEBUG_SRC = path; }
 
 typedef struct ObjBuf {
     u8 *p;
     u32 n;
     u32 cap;
 } ObjBuf;
+
+/* dw.c6（本文件之后 include）提供：造 DWARF、以及按序号取那几块缓冲区 */
+static void dw_build(const char *srcpath, u32 text_size);
+static ObjBuf *dw_sec(int which);
 
 static void ob_room(ObjBuf *b, u32 need)
 {
@@ -349,6 +374,12 @@ static void obj_write(const char *path)
     u32 off_fini = 0;
     u32 off_relai = 0;
     u32 off_relaf = 0;
+    u32 off_dbga = 0;
+    u32 off_dbgi = 0;
+    u32 off_dbgl = 0;
+    u32 off_dbgs = 0;
+    u32 off_rela_dbgi = 0;
+    u32 off_rela_dbgl = 0;
     u32 off_sym = 0;
     u32 off_str = 0;
     u32 off_shstr = 0;
@@ -512,6 +543,17 @@ static void obj_write(const char *path)
     sh_name[OBJ_SEC_FINI] = ob_str(&shstr, ".fini_array");
     sh_name[OBJ_SEC_RELA_INIT] = ob_str(&shstr, ".rela.init_array");
     sh_name[OBJ_SEC_RELA_FINI] = ob_str(&shstr, ".rela.fini_array");
+    if (OBJ_DEBUG) {
+        sh_name[OBJ_SEC_DEBUG_ABBREV] = ob_str(&shstr, ".debug_abbrev");
+        sh_name[OBJ_SEC_DEBUG_INFO] = ob_str(&shstr, ".debug_info");
+        sh_name[OBJ_SEC_DEBUG_LINE] = ob_str(&shstr, ".debug_line");
+        sh_name[OBJ_SEC_DEBUG_STR] = ob_str(&shstr, ".debug_str");
+        sh_name[OBJ_SEC_RELA_DBGI] = ob_str(&shstr, ".rela.debug_info");
+        sh_name[OBJ_SEC_RELA_DBGL] = ob_str(&shstr, ".rela.debug_line");
+    }
+
+    if (OBJ_DEBUG)
+        dw_build(OBJ_DEBUG_SRC, CODE_IMG.n);
 
     for (i = 0; i < all.n; i++)
         ob_sym_write(&symtab, &all.e[i]);
@@ -543,6 +585,32 @@ static void obj_write(const char *path)
     off_relaf = f.n;
     ob_copy(&f, relaf.p, relaf.n);
     ob_align(&f, 8);
+    off_dbgi = 0;
+    off_dbgl = 0;
+    off_dbga = 0;
+    off_dbgs = 0;
+    off_rela_dbgi = 0;
+    off_rela_dbgl = 0;
+    if (OBJ_DEBUG) {
+        off_dbga = f.n;
+        ob_copy(&f, dw_sec(DW_SEC_ABBREV)->p, dw_sec(DW_SEC_ABBREV)->n);
+        ob_align(&f, 8);
+        off_dbgi = f.n;
+        ob_copy(&f, dw_sec(DW_SEC_INFO)->p, dw_sec(DW_SEC_INFO)->n);
+        ob_align(&f, 8);
+        off_dbgl = f.n;
+        ob_copy(&f, dw_sec(DW_SEC_LINE)->p, dw_sec(DW_SEC_LINE)->n);
+        ob_align(&f, 8);
+        off_dbgs = f.n;
+        ob_copy(&f, dw_sec(DW_SEC_STR)->p, dw_sec(DW_SEC_STR)->n);
+        ob_align(&f, 8);
+        off_rela_dbgi = f.n;
+        ob_copy(&f, dw_sec(DW_SEC_RELAI)->p, dw_sec(DW_SEC_RELAI)->n);
+        ob_align(&f, 8);
+        off_rela_dbgl = f.n;
+        ob_copy(&f, dw_sec(DW_SEC_RELAL)->p, dw_sec(DW_SEC_RELAL)->n);
+        ob_align(&f, 8);
+    }
     off_sym = f.n;
     ob_copy(&f, symtab.p, symtab.n);
     off_str = f.n;
@@ -622,6 +690,40 @@ static void obj_write(const char *path)
             }
             align = 8;
             ent = 8;
+        } else if (OBJ_DEBUG && (i == OBJ_SEC_DEBUG_ABBREV || i == OBJ_SEC_DEBUG_INFO
+                                 || i == OBJ_SEC_DEBUG_LINE || i == OBJ_SEC_DEBUG_STR)) {
+            ObjBuf *b = NULL;
+
+            ty = OBJ_SHT_PROGBITS;
+            if (i == OBJ_SEC_DEBUG_ABBREV) {
+                b = dw_sec(DW_SEC_ABBREV);
+                off = off_dbga;
+            } else if (i == OBJ_SEC_DEBUG_INFO) {
+                b = dw_sec(DW_SEC_INFO);
+                off = off_dbgi;
+            } else if (i == OBJ_SEC_DEBUG_LINE) {
+                b = dw_sec(DW_SEC_LINE);
+                off = off_dbgl;
+            } else {
+                b = dw_sec(DW_SEC_STR);
+                off = off_dbgs;
+            }
+            sz = b ? b->n : 0;
+            align = 1;
+        } else if (OBJ_DEBUG && (i == OBJ_SEC_RELA_DBGI || i == OBJ_SEC_RELA_DBGL)) {
+            ty = OBJ_SHT_RELA;
+            if (i == OBJ_SEC_RELA_DBGI) {
+                sz = dw_sec(DW_SEC_RELAI)->n;
+                off = off_rela_dbgi;
+                info = OBJ_SEC_DEBUG_INFO;
+            } else {
+                sz = dw_sec(DW_SEC_RELAL)->n;
+                off = off_rela_dbgl;
+                info = OBJ_SEC_DEBUG_LINE;
+            }
+            link = 5;                   /* .symtab */
+            align = 8;
+            ent = 24;
         } else if (i == OBJ_SEC_RELA_INIT || i == OBJ_SEC_RELA_FINI) {
             ty = OBJ_SHT_RELA;
             if (i == OBJ_SEC_RELA_INIT) {

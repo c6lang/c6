@@ -1,0 +1,303 @@
+/* dw.c6 —— -g 的 DWARF 输出：编译单元 + 函数 + 行号表（DWARF v4 的一个子集）。
+ *
+ * 为什么是"子集"：调试时最常用的三件事是**函数名**、**函数地址范围**、
+ * **指令地址→源码行**。这三件只用到 .debug_info（CU + DW_TAG_subprogram）、
+ * .debug_abbrev、.debug_str、.debug_line 四个段；变量/类型/作用域那套 DIE
+ * 生成是另一件事（要完整的类型→DIE 映射），这里不做——gdb 没有它照样能按
+ * 函数名和行号停下、能 backtrace。
+ *
+ * 地址怎么落：.o 里的地址一律是 **.text 段内偏移**，配一条 R_X86_64_64
+ * 重定位（.rela.debug_info / .rela.debug_line，符号是 .text 段符号、加数是
+ * 偏移），链接器补成最终地址。这也是为什么这些地址字段在文件里写 0。
+ *
+ * 数据来源是 x64.c6 收集的两张表：X64_DBGFN（函数 [start,end) + 行表区间）
+ * 和 X64_DBGLN（代码偏移 → 源码行）。不开 -g 时两张表都是空的，这个文件
+ * 一行都不会跑。
+ */
+
+/* 段序号 DW_SEC_* 定义在 obj.c6（本文件在它之后 include） */
+
+static ObjBuf DW_ABBREV;
+static ObjBuf DW_INFO;
+static ObjBuf DW_LINE;
+static ObjBuf DW_STR;
+static ObjBuf DW_RELAI;                 /* .rela.debug_info */
+static ObjBuf DW_RELAL;                 /* .rela.debug_line */
+static u32 DW_FNNAME[X64_DBGFN_MAX];    /* 每个函数名在 .debug_str 里的偏移 */
+
+static ObjBuf *dw_sec(int which)
+{
+    switch (which) {
+    case DW_SEC_ABBREV:
+        return &DW_ABBREV;
+    case DW_SEC_INFO:
+        return &DW_INFO;
+    case DW_SEC_LINE:
+        return &DW_LINE;
+    case DW_SEC_STR:
+        return &DW_STR;
+    case DW_SEC_RELAI:
+        return &DW_RELAI;
+    case DW_SEC_RELAL:
+        return &DW_RELAL;
+    default:
+        return NULL;
+    }
+}
+
+/* .debug_str 里放字符串，返回偏移；重复的复用（函数名就那几十个，线性找） */
+static u32 dw_str(const char *s)
+{
+    u32 i = 0;
+
+    if (!s)
+        s = "";
+    while (i < DW_STR.n) {
+        const char *p = (const char *)(DW_STR.p + i);
+
+        if (strcmp(p, s) == 0)
+            return i;
+        i += (u32)strlen(p) + 1u;
+    }
+    i = DW_STR.n;
+    ob_copy(&DW_STR, s, (u32)strlen(s) + 1u);
+    return i;
+}
+
+static void dw_uleb(ObjBuf *b, u32 v)
+{
+    do {
+        u8 byte = (u8)(v & 0x7fu);
+
+        v >>= 7;
+        if (v)
+            byte = (u8)(byte | 0x80u);
+        ob_u8(b, byte);
+    } while (v);
+}
+
+static void dw_sleb(ObjBuf *b, i64 v)
+{
+    int more = 1;
+
+    while (more) {
+        u8 byte = (u8)((u64)v & 0x7fu);
+        i64 rest = v >> 7;
+
+        if ((rest == 0 && (byte & 0x40u) == 0) || (rest == -1 && (byte & 0x40u) != 0)) {
+            more = 0;
+        } else {
+            byte = (u8)(byte | 0x80u);
+        }
+        ob_u8(b, byte);
+        v = rest;
+    }
+}
+
+/* 一条 .rela.* 项：24 字节，格式与 ELF64 Rela 一致 */
+static void dw_rela(ObjBuf *b, u32 off, u32 sym, u32 type, u64 add)
+{
+    ob_u64(b, (u64)off);
+    ob_u64(b, ((u64)sym << 32) | (u64)type);
+    ob_u64(b, add);
+}
+
+/* abbrev 表：1 = 编译单元（有子项），2 = 函数（无子项） */
+static void dw_abbrev(void)
+{
+    /* 1: DW_TAG_compile_unit */
+    dw_uleb(&DW_ABBREV, 1);
+    dw_uleb(&DW_ABBREV, 0x11);          /* DW_TAG_compile_unit */
+    ob_u8(&DW_ABBREV, 1);               /* DW_CHILDREN_yes */
+    dw_uleb(&DW_ABBREV, 0x03);          /* DW_AT_name */
+    dw_uleb(&DW_ABBREV, 0x0e);          /*   DW_FORM_strp */
+    dw_uleb(&DW_ABBREV, 0x1b);          /* DW_AT_comp_dir */
+    dw_uleb(&DW_ABBREV, 0x0e);
+    dw_uleb(&DW_ABBREV, 0x11);          /* DW_AT_low_pc */
+    dw_uleb(&DW_ABBREV, 0x01);          /*   DW_FORM_addr */
+    dw_uleb(&DW_ABBREV, 0x12);          /* DW_AT_high_pc */
+    dw_uleb(&DW_ABBREV, 0x06);          /*   DW_FORM_data4（v4：相对 low_pc 的长度） */
+    dw_uleb(&DW_ABBREV, 0x10);          /* DW_AT_stmt_list */
+    dw_uleb(&DW_ABBREV, 0x17);          /*   DW_FORM_sec_offset */
+    ob_u8(&DW_ABBREV, 0);
+    ob_u8(&DW_ABBREV, 0);
+    /* 2: DW_TAG_subprogram */
+    dw_uleb(&DW_ABBREV, 2);
+    dw_uleb(&DW_ABBREV, 0x2e);          /* DW_TAG_subprogram */
+    ob_u8(&DW_ABBREV, 0);               /* DW_CHILDREN_no */
+    dw_uleb(&DW_ABBREV, 0x03);          /* DW_AT_name */
+    dw_uleb(&DW_ABBREV, 0x0e);
+    dw_uleb(&DW_ABBREV, 0x11);          /* DW_AT_low_pc */
+    dw_uleb(&DW_ABBREV, 0x01);
+    dw_uleb(&DW_ABBREV, 0x12);          /* DW_AT_high_pc */
+    dw_uleb(&DW_ABBREV, 0x06);
+    dw_uleb(&DW_ABBREV, 0x3f);          /* DW_AT_external */
+    dw_uleb(&DW_ABBREV, 0x19);          /*   DW_FORM_flag_present */
+    ob_u8(&DW_ABBREV, 0);
+    ob_u8(&DW_ABBREV, 0);
+    ob_u8(&DW_ABBREV, 0);               /* 表结束 */
+}
+
+/* 把一份路径拆成"目录 / 文件名"；没有 '/' 时目录用 "." */
+static void dw_split_path(const char *path, char *dir, u32 dcap, char *base, u32 bcap)
+{
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    u32 n = 0;
+
+    if (!path || !path[0]) {
+        strcpy(dir, ".");
+        strcpy(base, "<unknown>");
+        return;
+    }
+    if (!slash) {
+        strcpy(dir, ".");
+        snprintf(base, bcap, "%s", path);
+        return;
+    }
+    n = (u32)(slash - path);
+    if (n == 0)
+        n = 1;                          /* `/x.c` 的目录是 "/" */
+    if (n >= dcap)
+        n = dcap - 1u;
+    memcpy(dir, path, n);
+    dir[n] = 0;
+    snprintf(base, bcap, "%s", slash + 1);
+}
+
+/* 造四个段（与两个重定位段）；text_size 是 .text 的总长度 */
+static void dw_build(const char *srcpath, u32 text_size)
+{
+    char dir[512] = {0};
+    char base[512] = {0};
+    u32 i = 0;
+    u32 f = 0;
+    u32 name_off = 0;
+    u32 dir_off = 0;
+    u32 off_len = 0;
+    u32 hdr_len_off = 0;
+    u32 cu_lowpc = 0;
+    u32 lowpc = 0;
+    u32 addr_off = 0;
+    static const u8 std_len[12] = {0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1};
+
+    DW_ABBREV.n = 0;
+    DW_INFO.n = 0;
+    DW_LINE.n = 0;
+    DW_STR.n = 0;
+    DW_RELAI.n = 0;
+    DW_RELAL.n = 0;
+
+    dw_split_path(srcpath, dir, sizeof(dir), base, sizeof(base));
+    dw_abbrev();
+    name_off = dw_str(base);
+    dir_off = dw_str(dir);
+    for (i = 0; i < X64_NDBGFN; i++)
+        DW_FNNAME[i] = dw_str(X64_DBGFN[i].name);
+
+    /* --- .debug_info --- */
+    off_len = DW_INFO.n;
+    ob_u32(&DW_INFO, 0);                /* unit_length：最后回填 */
+    ob_u16(&DW_INFO, 4);                /* version */
+    ob_u32(&DW_INFO, 0);                /* debug_abbrev_offset */
+    ob_u8(&DW_INFO, 8);                 /* address_size */
+    dw_uleb(&DW_INFO, 1);               /* CU DIE */
+    ob_u32(&DW_INFO, name_off);
+    ob_u32(&DW_INFO, dir_off);
+    cu_lowpc = DW_INFO.n;
+    ob_u64(&DW_INFO, 0);
+    ob_u32(&DW_INFO, text_size);        /* high_pc = 长度 */
+    ob_u32(&DW_INFO, 0);                /* stmt_list = 0 */
+    dw_rela(&DW_RELAI, cu_lowpc, OBJ_SYM_TEXT, 1u, 0);
+    for (f = 0; f < X64_NDBGFN; f++) {
+        X64DbgFn *fn = &X64_DBGFN[f];
+        u32 len = fn->end > fn->start ? fn->end - fn->start : 0;
+
+        if (len == 0)
+            continue;                   /* 没出码的函数（只声明）不写 DIE */
+        dw_uleb(&DW_INFO, 2);
+        ob_u32(&DW_INFO, DW_FNNAME[f]);
+        lowpc = DW_INFO.n;
+        ob_u64(&DW_INFO, 0);
+        ob_u32(&DW_INFO, len);
+        dw_rela(&DW_RELAI, lowpc, OBJ_SYM_TEXT, 1u, (u64)fn->start);
+    }
+    ob_u8(&DW_INFO, 0);                 /* CU 子项结束 */
+    ob_patch32(&DW_INFO, off_len, DW_INFO.n - off_len - 4u);
+
+    /* --- .debug_line（v4） --- */
+    off_len = DW_LINE.n;
+    ob_u32(&DW_LINE, 0);
+    ob_u16(&DW_LINE, 4);
+    hdr_len_off = DW_LINE.n;
+    ob_u32(&DW_LINE, 0);
+    ob_u8(&DW_LINE, 1);                 /* minimum_instruction_length */
+    ob_u8(&DW_LINE, 1);                 /* maximum_operations_per_instruction */
+    ob_u8(&DW_LINE, 1);                 /* default_is_stmt */
+    ob_u8(&DW_LINE, (u8)(-5 & 0xFF));   /* line_base = -5 */
+    ob_u8(&DW_LINE, 14);                /* line_range */
+    ob_u8(&DW_LINE, 13);                /* opcode_base */
+    for (i = 0; i < 12u; i++)
+        ob_u8(&DW_LINE, std_len[i]);
+    ob_copy(&DW_LINE, dir, (u32)strlen(dir) + 1u);      /* include_directories[1] */
+    ob_u8(&DW_LINE, 0);                                 /* 列表结束 */
+    ob_copy(&DW_LINE, base, (u32)strlen(base) + 1u);    /* file_names[1] */
+    dw_uleb(&DW_LINE, 1);               /* dir 索引 */
+    dw_uleb(&DW_LINE, 0);               /* mtime */
+    dw_uleb(&DW_LINE, 0);               /* size */
+    ob_u8(&DW_LINE, 0);                 /* 列表结束 */
+    ob_patch32(&DW_LINE, hdr_len_off, DW_LINE.n - hdr_len_off - 4u);
+
+    /* 行号程序：每个函数一条 sequence */
+    for (f = 0; f < X64_NDBGFN; f++) {
+        X64DbgFn *fn = &X64_DBGFN[f];
+        u32 line = 1;
+        u32 addr = 0;
+        u32 k = 0;
+
+        if (fn->end <= fn->start)
+            continue;
+        ob_u8(&DW_LINE, 0);             /* 扩展操作码 */
+        dw_uleb(&DW_LINE, 9);           /* 长度：opcode(1) + 地址(8) */
+        ob_u8(&DW_LINE, 2);             /* DW_LNE_set_address */
+        addr_off = DW_LINE.n;
+        ob_u64(&DW_LINE, 0);
+        dw_rela(&DW_RELAL, addr_off, OBJ_SYM_TEXT, 1u, (u64)fn->start);
+        /* 函数入口那一行也要有一行记录：不然 gdb 的 `info line 函数名`（它按
+         * 入口地址查）会说"没有行号信息"——第一条语句的行记录通常在序言之后。 */
+        if (fn->nlines > 0) {
+            u32 first = X64_DBGLN_LINE[fn->lstart];
+
+            if (first != 0 && first != line) {
+                ob_u8(&DW_LINE, 3);         /* DW_LNS_advance_line */
+                dw_sleb(&DW_LINE, (i64)first - (i64)line);
+                line = first;
+            }
+            ob_u8(&DW_LINE, 1);             /* DW_LNS_copy：地址还是入口 */
+        }
+        for (k = 0; k < fn->nlines; k++) {
+            u32 idx = fn->lstart + k;
+            u32 off = 0;
+            u32 ln = 0;
+
+            if (idx >= X64_NDBGLN)
+                break;
+            off = X64_DBGLN_OFF[idx];
+            ln = X64_DBGLN_LINE[idx];
+            if (ln != 0 && ln != line) {
+                ob_u8(&DW_LINE, 3);     /* DW_LNS_advance_line */
+                dw_sleb(&DW_LINE, (i64)ln - (i64)line);
+                line = ln;
+            }
+            if (off != addr) {
+                ob_u8(&DW_LINE, 2);     /* DW_LNS_advance_pc */
+                dw_uleb(&DW_LINE, off - addr);
+                addr = off;
+            }
+            ob_u8(&DW_LINE, 1);         /* DW_LNS_copy */
+        }
+        ob_u8(&DW_LINE, 0);             /* 扩展：DW_LNE_end_sequence */
+        dw_uleb(&DW_LINE, 1);
+        ob_u8(&DW_LINE, 1);
+    }
+    ob_patch32(&DW_LINE, off_len, DW_LINE.n - off_len - 4u);
+}
