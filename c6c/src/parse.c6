@@ -17154,6 +17154,14 @@ static u32 iface_slot(u32 ifx, const char *nm, u32 nl)
 
 static void gen_stmt(void)
 {
+    /* -g：语句开头更新当前行，后面每条 IR 记录都会带上它（见 irfn_push）。
+     * 放在这一层是因为它是"语句"的唯一入口：表达式里再怎么跨行，行号也只会
+     * 前进到语句粒度——调试时按语句停就够了，不必精确到子表达式。 */
+    if (ir_lines_on() && pa_cur()) {
+        Tok *t0 = pa_cur();
+
+        FN.cur_line = src_line_of(file_by_id(t0->file), t0->off);
+    }
     /* 进新语句了：上一个 `return` 的操作数已经编完 */
     PA_RET_EXPR = 0;
     PA_LAST_TERM = 0;

@@ -1303,8 +1303,46 @@ static void x64_narrow_ret(Image *im, u8 type)
     img_u8(im, 0xC0);
 }
 
+/* ---- -g：把"函数范围 + 每条指令的源码行"记下来（DWARF 在 dw.c6 里写） ----
+ * 这里只收集：函数名、函数在代码镜像里的 [start, end)，以及一串
+ * (代码偏移, 源码行)。obj.c6 出目标文件时把它变成 .debug_line/.debug_info。 */
+#define X64_DBGFN_MAX 8192
+#define X64_DBGLN_MAX 200000
+
+typedef struct X64DbgFn {
+    const char *name;
+    u32 start;
+    u32 end;
+    u32 lstart;             /* 这个函数的行表从 X64_DBGLN 的哪一项起 */
+    u32 nlines;
+} X64DbgFn;
+
+static X64DbgFn X64_DBGFN[X64_DBGFN_MAX];
+static u32 X64_NDBGFN;
+static u32 X64_DBGLN_OFF[X64_DBGLN_MAX];
+static u32 X64_DBGLN_LINE[X64_DBGLN_MAX];
+static u32 X64_NDBGLN;
+static int X64_DBG;
+static int X64_DBG_OVER;         /* 表满了：只记一次，不刷屏 */
+
+static void x64_set_debug(int on) { X64_DBG = on ? 1 : 0; }
+
+static void x64_dbg_line(u32 off, u32 line)
+{
+    if (X64_NDBGLN >= X64_DBGLN_MAX) {
+        X64_DBG_OVER = 1;
+        return;
+    }
+    X64_DBGLN_OFF[X64_NDBGLN] = off;
+    X64_DBGLN_LINE[X64_NDBGLN] = line;
+    X64_NDBGLN++;
+}
+
 static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
 {
+    u32 dbg_fn = 0xffffffffu;
+    u32 dbg_start = 0;
+    u32 dbg_last_line = 0xffffffffu;
     u32 i = 0;
     u32 arg_v[64] = {0};   /* SysV：前 6 个走寄存器，其余压栈 */
     u32 narg = 0;
@@ -1321,6 +1359,14 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
     st->fn = f;
     st->va_bytes = f->is_variadic ? X64_VA_BYTES : 0;
     st->va_lbl = X64_MAXLBL;
+    if (X64_DBG && X64_NDBGFN < X64_DBGFN_MAX) {
+        dbg_fn = X64_NDBGFN++;
+        X64_DBGFN[dbg_fn].name = f->name;
+        X64_DBGFN[dbg_fn].start = st->im->n;
+        X64_DBGFN[dbg_fn].lstart = X64_NDBGLN;
+        X64_DBGFN[dbg_fn].nlines = 0;
+        dbg_start = st->im->n;
+    }
     x64_func_begin(st, st->sym[func_sym].name, f->nvreg + 8);
     /* 形参：ABI 寄存器 → 槽 */
     for (i = 0; i < f->nparams; i++) {
@@ -1341,6 +1387,12 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
     for (i = 0; i < f->n; i++) {
         IrOp o = {0};
 
+        /* -g：行号变了就在当前位置记一项（语句粒度） */
+        if (dbg_fn != 0xffffffffu && f->lines && f->lines[i] != dbg_last_line) {
+            dbg_last_line = f->lines[i];
+            x64_dbg_line(st->im->n - dbg_start, dbg_last_line);
+            X64_DBGFN[dbg_fn].nlines = X64_NDBGLN - X64_DBGFN[dbg_fn].lstart;
+        }
         o = f->ops[i];
         switch (o.op) {
         case IR_CALLI: {
@@ -1604,4 +1656,6 @@ static void x64_compile(X64State *st, IrFn *f, u32 func_sym)
         }
     }
     x64_func_end(st);
+    if (dbg_fn != 0xffffffffu)
+        X64_DBGFN[dbg_fn].end = st->im->n;
 }

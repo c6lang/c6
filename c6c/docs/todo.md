@@ -3837,3 +3837,51 @@ $ make -C c6c selfhost          # fixpoint 逐字节相同（3671644 字节 / 52
 直接调 `main`，所以"libc 启动时才填"的量（`environ`、`stdout` 缓冲）拷进来
 还是 0；纯函数调用不受影响。要做全，得让 `_start` 走 `__libc_start_main`
 （它会跑 `atexit`/构造/`environ` 初始化），那是下一件事。
+
+## 第 203 轮：`-g` 调试信息（DWARF v4 子集）
+
+硬缺口④的第二件。目标不是"完整 DWARF"，而是调试时最常用的三件事：**函数名**、
+**函数地址范围**、**指令地址→源码行**。为此只要四个段 + 两张重定位表。
+
+### 三段流水
+
+1. `ir.c6`：每条 IR 记录多一条平行的**行号旁表**（`IrFn.lines`），行号由前端
+   在 `gen_stmt()` 开头写进 `IrFn.cur_line`——语句粒度，表达式跨行不影响。
+2. `x64.c6`：出码时把"代码偏移 → 行"记进 `X64_DBGLN`，每个函数的
+   `[start, end)` 记进 `X64_DBGFN`。
+3. `dw.c6`（新）：造 `.debug_abbrev`/`.debug_info`/`.debug_line`/`.debug_str`，
+   并给每个地址字段配一条 `R_X86_64_64`（符号是 `.text` 段符号、加数是偏移）。
+   `obj.c6` 从 13 个段扩到 19 个（6 个是 `-g` 才出现的）。
+
+### 踩的坑
+
+1. **行号旁表一直是 NULL**：`irfn_reset()` 里 `ops` 容量固定 4096 起步，而我只在
+   `irfn_push()` 的**扩容分支**里分配 `lines`——前 4096 条记录永远拿不到行号，
+   症状是 `.debug_line` 里只有 `set_address`、一行记录都没有。改成 reset 里
+   按 `cap` 分配、扩容时同步。
+2. **`info line 函数名` 说没有行号**：第一条行记录在序言之后，函数入口地址
+   不在任何一行里。加了"序列开头先按第一行的行号 copy 一条"（地址还是入口）。
+3. **地址字段必须带重定位**：.o 里写的是 `.text` 段内偏移，绝对地址要等链接器
+   定；不配 `R_X86_64_64` 的话 gdb 拿到的是 0x0 附近的一堆假地址。
+
+### 实测
+
+```
+$ c6c -g -c prog.c6 -o prog.o
+$ readelf -SW prog.o | grep debug
+  [13] .debug_abbrev … [14] .debug_info … [15] .debug_line … [16] .debug_str …
+  [17] .rela.debug_info … [18] .rela.debug_line …
+$ readelf --debug-dump=decodedline prog.o
+dbg.c6   5  0x19    dbg.c6  10 0xc3   dbg.c6  11 0xe2   dbg.c6  12 0x101
+dbg.c6  14 0x172   dbg.c6  15 0x1c0
+$ cc -g -o prog prog.o && gdb -batch -ex 'info line main' -ex 'break main' prog
+Line 10 of "dbg.c6" starts at address 0x11f8 <main> …
+Breakpoint 1 at 0x1203: file dbg.c6, line 10.
+$ make -C c6c dbgcheck   # 9/9
+$ make -C c6c selfhost   # fixpoint 逐字节相同（3711463 字节 / 5252 符号）
+```
+
+**口径**：只有"编译单元 + 子程序"两级 DIE，没有变量/类型信息（`info locals`
+是空的）；只对 `-c` 的产物生效（`-o` 出的可执行文件没有段表）。
+
+**这一项还剩**：独立 `.s` 汇编输出（native 后端直接出字节，没有文本汇编器层）。

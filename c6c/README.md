@@ -221,6 +221,35 @@ libc 里那份定义拷过来——大小是从 libc.so.6 的 `.dynsym` 现查�
 ET_EXEC / 两个 `PT_LOAD` / `PT_INTERP` / `PT_DYNAMIC` / `DT_NEEDED` /
 `BIND_NOW` / JUMP_SLOT 条数、`ldd` 认得 libc、默认静态仍会对未定义符号报错）。
 
+## 调试信息：`-g`
+
+`-g` 配 `-c` 出 .o，里面带一套 DWARF（v4 子集）：**函数名、函数地址范围、
+指令地址→源码行**。用系统 `cc` 链成可执行文件就能直接调试：
+
+```sh
+./c6c/build/c6c -g -c prog.c6 -o prog.o
+cc -g -o prog prog.o                     # 或者 cc -g -o prog prog.o rt.o
+gdb prog -ex 'break main' -ex run -ex bt
+# → Breakpoint 1, main () at prog.c6:10
+addr2line -e prog -f 0x…                 # → main prog.c6:10
+```
+
+写进去的段：`.debug_abbrev` / `.debug_info` / `.debug_line` / `.debug_str`，
+外加 `.rela.debug_info` / `.rela.debug_line`——.o 里的地址是 **`.text` 段内
+偏移**，配 `R_X86_64_64` 重定位让链接器补成最终地址（这也是为什么地址字段在
+文件里写 0）。
+
+* 粒度是**语句**：表达式里跨行不影响，按语句停下就够了；
+* 只有 DIE 是"编译单元 + 子程序"，**没有变量/类型信息**（gdb 里能按函数和行
+  停、能 backtrace、能看源码，`info locals` 是空的）；
+* 只对 `-c` 的产物生效：`-o`（c6c 自己链的可执行文件）没有段表，也就没带
+  调试信息——要调试就走 `-c` + 系统 cc；
+* 不加 `-g` 时目标文件里一个 `.debug_*` 段都没有（默认行为不变）。
+
+回归：`make -C c6c dbgcheck`（9 条：六个段齐全、地址字段带重定位、行号表覆盖
+源码每一行、DIE 里有 add/main、系统 cc 链得上跑得出、`addr2line` 与 `gdb` 都
+认得出 `dbg.c6:10`、不加 `-g` 时没有调试段）。
+
 ## 边界检查：`-b`
 
 加 `-b`，数组下标在取址之前先过一道检查：

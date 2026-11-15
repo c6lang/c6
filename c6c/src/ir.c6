@@ -16,6 +16,10 @@
 #define IR_REC 24
 #define IRK_N 55
 
+/* -g：把每条 IR 记录的源码行记进旁表（与 ops 平行）。默认关——多一次存储和
+ * 一份数组，正常编译不需要。行号由前端在语句开头写进 IrFn.cur_line。 */
+static int IR_LINES;
+
 /* op 集合（v1）。顺序即编码，**只能追加，不能插队**（IR 哈希是验收的一部分）。 */
 enum {
     IR_NOP = 0,
@@ -441,6 +445,9 @@ typedef struct IrFn {
     u32 nparams;
     int is_variadic;    /* 变参函数：帧底留寄存器保存区 */
     const char *name;
+    u32 *lines;         /* -g：每条 op 对应的源码行（与 ops 平行；不开 -g 时为 NULL） */
+    u32 lcap;           /* lines 的容量（跟 cap 同进同退） */
+    u32 cur_line;       /* 前端在语句开头更新它 */
     u64 *kpool;         /* 64 位字面量池（每函数一份，函数结束即可丢） */
     u32 nk;
     u32 kcap;
@@ -471,6 +478,12 @@ static void irfn_reset(IrFn *f, const char *name)
     f->nparams = 0;
     f->name = name;
     f->nk = 0;
+    f->cur_line = 0;
+    /* -g：ops 的容量是固定 4096 起步的，别只靠在 push 里扩容那条路分配 */
+    if (IR_LINES && (!f->lines || f->lcap < f->cap)) {
+        f->lines = arena_zalloc(&A_main, (size_t)f->cap * sizeof(u32));
+        f->lcap = f->cap;
+    }
 }
 
 /* vreg/label 的编号在 IR 里是 32 位（一条 op 24 字节，四个操作数字段各 32 位）。
@@ -478,6 +491,10 @@ static void irfn_reset(IrFn *f, const char *name)
  * 复用旧槽，程序不报错、结果错（tcc tests2/101_cleanup 就是这么错的）。
  * 加宽后阈值留在 0xFFFFFFF0：越界仍然是“不可能发生的量”，真发生了就置位，
  * 由前端在 TU 收尾时报一条明确的编译错误。 */
+static void ir_set_lines(int on) { IR_LINES = on ? 1 : 0; }
+
+static int ir_lines_on(void) { return IR_LINES; }
+
 static int IR_OVERFLOW;
 static void (*IR_ON_OVERFLOW)(void);
 static int ir_overflowed(void)
@@ -546,6 +563,14 @@ static void irfn_push(IrFn *f, u8 op, u8 type, u32 dst, u32 a, u32 b, u32 c, u32
         memcpy(np, f->ops, (size_t)f->n * sizeof(IrOp));
         f->ops = np;
         f->cap = ncap;
+        if (IR_LINES) {
+            u32 *nl = arena_zalloc(&A_main, (size_t)ncap * sizeof(u32));
+
+            if (f->lines)
+                memcpy(nl, f->lines, (size_t)f->n * sizeof(u32));
+            f->lines = nl;
+            f->lcap = ncap;
+        }
     }
     o.op = op;
     o.type = type;
@@ -555,6 +580,8 @@ static void irfn_push(IrFn *f, u8 op, u8 type, u32 dst, u32 a, u32 b, u32 c, u32
     o.c = c;
     o.imm = imm;
     f->ops[f->n++] = o;
+    if (IR_LINES && f->lines)
+        f->lines[f->n - 1] = f->cur_line;
 }
 
 static void irfn_setcc(IrFn *f, u8 cc)
