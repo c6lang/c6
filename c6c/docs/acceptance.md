@@ -4,8 +4,14 @@
 `ROOT` 指向放 `tcc/` 的那个检出。
 
 ```sh
-make -s check-all       ROOT=/path/to/superc C6C=$PWD/build/c6c   # 验收 (1)(2)(3)
-make -s check-all-perf  ROOT=/path/to/superc C6C=$PWD/build/c6c   # 上面 + 验收 (4)
+# CMake 入口（仓库根，CI 走这条）
+cmake -S . -B build -DBUILD_TESTING=ON && cmake --build build --parallel
+ctest --test-dir build -L c6c -LE perf --output-on-failure   # 验收 (1)(2)(3)
+ctest --test-dir build -L perf --output-on-failure           # 验收 (4)
+
+# 或者直接调 c6c 自己的 Makefile（等价，`make -C c6c` 也行）
+make -s check-all       ROOT=/path/to/superc   # 验收 (1)(2)(3)
+make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
 ```
 
 ## (1) `check-all`：自举 + 三后端 + 语料
