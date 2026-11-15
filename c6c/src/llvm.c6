@@ -950,15 +950,22 @@ static void llvm_emit_datainit(FILE *cf, u32 dn)
         fprintf(cf, "  %%q%u = getelementptr i8, ptr @__c6l_D, i64 %u\n", (unsigned)i,
                 (unsigned)DFIX_OFF[i]);
         if (X64.sym[DFIX_SYM[i]].is_data) {
+            /* DFIX_ADD 是解析期算好的字节加数（`A + 2` / `&s.m`），折进 GEP */
             fprintf(cf, "  store i64 ptrtoint (ptr getelementptr (i8, ptr @__c6l_D,"
                          " i64 %d) to i64), ptr %%q%u\n",
-                    (int)(X64.sym[DFIX_SYM[i]].off - (u32)ELF_HDR), (unsigned)i);
+                    (int)((i64)(X64.sym[DFIX_SYM[i]].off - (u32)ELF_HDR) + DFIX_ADD[i]),
+                    (unsigned)i);
         } else {
             char sn[256] = {0};
 
             llvm_sym(DFIX_SYM[i], sn, sizeof(sn));
-            fprintf(cf, "  store i64 ptrtoint (ptr @%s to i64), ptr %%q%u\n", sn,
-                    (unsigned)i);
+            if (DFIX_ADD[i] != 0)
+                fprintf(cf, "  store i64 ptrtoint (ptr getelementptr (i8, ptr @%s,"
+                             " i64 %d) to i64), ptr %%q%u\n", sn, (int)DFIX_ADD[i],
+                        (unsigned)i);
+            else
+                fprintf(cf, "  store i64 ptrtoint (ptr @%s to i64), ptr %%q%u\n", sn,
+                        (unsigned)i);
         }
     }
     for (i = 0; i < C99_NRL; i++) {
