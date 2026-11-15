@@ -3086,3 +3086,18 @@ printf("%s|%d\n", "hi", 7);   /* LLVM 后端打出 "(null)|0"，native 打出 "h
 2. 或者绕开 `%ap`：让 c6c 的变参函数**别用 va_list**，而是由调用点把实参先摊进
    一个数组再传指针（相当于自己定一套变参 ABI，`lib/rt.c6` 里的 printf/scanf
    族跟着改）。这条路更土但一定能通，代价是 c6c 编出的代码与 C 的 varargs 不互通。
+
+**又做了一组对照实验**（都能立刻复现）：
+
+| 实验 | 结果 |
+|---|---|
+| 手写最小 `.ll`：`%struct.__va_list_tag` 定义 + `%ap = alloca` + `llvm.va_start` + `va_arg i64` + 调用 | **42** ✓（机制本身没问题） |
+| 把 `c6_printf` 从我们生成的 .ll 里裁出来单独跑 | 依赖 `@__c6l_D`、`@c6_c6c_sys3` 等一堆别的东西，裁不干净 |
+| 删掉 `c6_printf` prologue 里的 `memset(%FR, …)` | 仍然 `(null)|0` |
+| `llc -O1` / `-O2` | 仍然 `(null)|0` |
+
+结论：`va_start` 的机制没问题，是我们给它生成的**函数形状**（一个巨大的
+`alloca [frame x i8]` + 几百条 `%sN = getelementptr` 帧槽 + 之后才 `va_start`）
+触发了 lowering 的问题。下一步最有价值的实验是**手工把 `c6_printf` 简化成一个
+只有 `va_start`/`va_arg`/`printf` 的等价函数**（保住它的形参个数与帧槽布局），
+逐次删东西直到恢复正确——能直接指认是哪一块触发的。
