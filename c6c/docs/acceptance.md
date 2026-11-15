@@ -25,10 +25,10 @@ make -s check-all-perf  ROOT=/path/to/superc   # 上面 + 验收 (4)
 | 整条命令 | `make check-all` | exit 0 | ✅ `c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 能编出 tcc）` |
 | 自举 fixpoint 逐字节 | `make selfhost` | `c6c2 == c6c3` | ✅（11089552 字节逐字节相同） |
 | 类型表 / IR 自测 | `make unit` | 全过 | ✅ |
-| tests/ 语料 | `make test` | 前端 123/0、跑通 67/0 | ✅ |
+| tests/ 语料 | `make test` | 前端 123/0、跑通 67/0；前端回归（gcc oracle）34/34 | ✅ |
 | std/ 模块 | `make stdtest` | 377/377 | ✅ |
 | 编译期诊断 | `make diagtest` | 314/314 | ✅ |
-| 三后端同一套用例 | `make c99test llvmtest` | C99 31/31、LLVM 29/29（LLVM 有 2 条走 `tests/c/llvm-only.txt`，见文末已知缺陷） | ✅ |
+| 三后端同一套用例 | `make c99test llvmtest` | C99 33/33、LLVM 29/29（LLVM 有 4 条走 `tests/c/llvm-only.txt`，见文末已知缺陷） | ✅ |
 | 能编出 tcc 并自检 | `make build-tcc` | 出体，且这个 tcc 跑 tests2 **118/144** | ✅ |
 
 ## (2) G2c：c6c 编出 tcc，这个 tcc 跑上游用例
