@@ -5,6 +5,41 @@
 > 这里是**按特性归档的变更史**（不是逐条 commit 日志）。每条给一个代表性提交的短
 > hash，完整历史用 `git log` 查。日期取该特性的收尾提交。
 
+## 未发布 — 修 CI（v0.3.0 tag 上红的两处）
+
+v0.3.0 tag 的流水线挂在两处，都是"本机能过、CI 上才炸"的口径，这次一起修掉：
+
+### shared libtcc 形态下 c6c 编不动（`tcc/c6` 找不到 `libtcc.so`）
+
+- 现象：`-DC6_TCC_SHARED_LIBTCC=ON` 的矩阵里 `cmake --build` 走到 c6c 就报
+  `tcc/c6: error while loading shared libraries: libtcc.so`，打包 job（同为
+  shared 形态）跟着跑不起来，`release` 因此永远等不到包。
+- 原因：引导编译器 tcc/c6 在 shared 形态下自己就链到 `libtcc.so`，而构建树里
+  的 c6 没有 rpath、`libtcc.so` 又不在默认搜索路径上；编译期没有任何地方给它
+  注 `LD_LIBRARY_PATH`（注入只做在 CTest 用例的 ENVIRONMENT 里）。
+- 修法：`cmake/C6C.cmake` 里凡是**要执行** c6 的地方（c6c 的自定义命令 +
+  `c6c-build` / `c6c-check-all` / `c6c-tests1` / `c6c-tests2` / `c6c-bench`）
+  统一补 `LD_LIBRARY_PATH`，静态形态下什么都不加。
+- 顺手：`tcc/libtcc.so` 补进 `tcc/.gitignore`（这个形态的构建产物原来会把工作树
+  弄脏）。
+
+### c6c 释放长链是递归的：8 MB 默认栈段错误
+
+- 现象：c6c job 的 `make test` 在 CI 上挂 `gc_field`（"跑不通的： gc_field"）。
+  本机 64 MB 栈能过，CI 上栈小就直接段错误。
+- 原因：`lib/rt.c6` 的 `__c6_gc_release` 命中 `rc==0` 后就地销毁字段，字段的
+  release 再递归进来；`tests/gc_field.c6` 的 20001 节点长链要几千帧，约 30 MB 栈。
+- 修法：加待销毁队列——release 归零只入队，由一个循环逐个销毁（`tcc` 侧
+  `lib/libtcc1.c` 的 drain 队列同口径）。栈深与链长无关，1 MB 栈也能跑完长链。
+- 顺带把这条口径钉住：`c6c/tests/run-tests.sh` 现在默认在 **8 MB 栈**下跑每个
+  用例（`C6C_TEST_STACK=0` 关掉，非 Linux 自动关掉），免得开发机的大栈再把
+  这类问题藏到 CI。
+
+### `tests/defer_scope.c6` 深递归条数 20000 → 10000
+
+- 那一档只是为了证明"没有 8192 条记录的上限"，而每帧约 500 B 栈：20000 层在
+  8 MB 栈上会真段错误（那是递归吃栈，不是记录上限）。10000 层仍远大于 8192。
+
 ## 0.3.0 — 2026-11-15
 
 这个发布号的全部内容是一个东西：独立子目录 **`c6c/`** ——用 c6 语言自己写的、
