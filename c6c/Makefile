@@ -6,6 +6,7 @@
 #   make bench        用 tcc/c6 跑基线（P0 起的现状）
 #   make bench-c6c    用 c6c 跑并按 thresholds.json 断言（P3b 之后才有意义）
 #   make lint         隔离检查：不 include tcc 头、不链接 libtcc、不复制 tcc 源码
+#   make fast         快速门禁（≈40 s，含外部 c-testsuite 与上游 tests1·tests2）
 #   make check-all    最终验收（P8-1 之前各目标会如实报“未实现”）
 
 PYTHON ?= python3
@@ -19,7 +20,7 @@ RUNS   ?= 5
 SRCS := $(wildcard src/*.c6)
 
 .PHONY: all g2c-check tests1-check scoreboard build scan unit irtest hello ctest runflag testflag tcc-tests bench bench-c6c lint selfhost \
-        selftest stdtest test c99test c99suite llvmtest build-tcc check-all check-all-perf help
+        selftest stdtest test c99test c99suite llvmtest build-tcc fast check-all check-all-perf help
 
 all: build
 
@@ -194,12 +195,30 @@ llvmtest: $(BUILD)/c6c
 	@echo "c6c: llvmtest 用 LLC=$(LLVM_LLC) CC=$(CC)"
 	@C6C=$(BUILD)/c6c LLC=$(LLVM_LLC) CC=$(CC) CORPUS=$(CURDIR)/tests/c ./tests/llvm-diff.sh
 
+# 快速门禁（实测 ≈40 s）：改一行代码先跑这条。闸门口径和 check-all 完全一致，
+# 只是把"重复跑一整遍全量编译/全量语料"的那几条挪出去：
+#   selfhost + selftest   自举 fixpoint（两遍 ~11 MB 全量编译）
+#   stdtest               377 个 std 模块
+#   test + diagtest       主仓 120+ 用例与 316 条编译期诊断
+#   c99test               C99 后端差分，51 条要 165 s（每条 gcc -O0 编两次）
+#   build-tcc             c6c 编出上游 tcc，再由它跑上游 tests2 + 第三代 selfhost
+# 留下的都是秒级、确定性的闸门，而且**外部语料是它们的一部分**，不是可选项：
+#   c99suite      third_party/c-testsuite 的 150 条外部 C99 用例（语言层闸门）
+#   tests2-check  tcc 上游 tests2 逐条比对（tests/tcc-na.txt 之外不许有意外失败）
+#   tests1-check  tcc 上游 tests/ 那批老式单文件用例
+# llvmtest 留在这里：26 s 换一条确定性的后端闸门（同一份语料 native vs LLVM）。
+# CMake 侧的 `cmake --build build --target fast` 就是这条（c6c 替换 c6 的快车道）。
+fast: lint unit irtest hello ctest runflag testflag tests2-check tests1-check c99suite llvmtest
+	@echo "c6c: fast 通过（快速门禁 ≈40 s：前端/IR/ELF 骨架 + -run/-test + 外部语料 c99suite / 上游 tests1·tests2 + LLVM 后端对齐）"
+
 # 验收（1）(2) (3)：功能面。跑分不在里面——验收（4）那几条硬指标（自编译
 # ≤100 ms、峰值 RSS ≤32 MB、4x 输入 ≤2.6x）随时可能因为机器负载抖动，
 # 拿它挡功能验收只会让人学会忽略红灯。要连跑分一起验就用 check-all-perf。
 # 顺序有讲究：`llvmtest` 放前面。它是**确定性**的后端闸门（同一份语料三方对齐），
 # 而 `test` 里有个别用例（`async`）在共享 runner 上偶发段错误——先跑确定的那条，
 # CI 红了至少能一眼看出是不是后端真的坏了。
+# 上游 tests1/tests2 两条闸门不在这个依赖里（它们是独立的记分板入口），
+# CMake 侧 `cmake --build build --target check-all-c6c` 会把它们一起跑完。
 check-all: unit irtest hello ctest runflag testflag selfhost selftest stdtest diagtest c99test c99suite llvmtest test build-tcc
 	@echo "c6c: check-all 通过（验收 1~3：自举 fixpoint / 三后端 / tests+std+诊断 / 语言层 C99 外部闸门 / 能编出 tcc）"
 
@@ -208,4 +227,4 @@ check-all-perf: check-all bench-c6c
 	@echo "c6c: check-all-perf 通过（含性能/内存硬指标）"
 
 help:
-	@sed -n '2,11p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
+	@sed -n '1,11p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
