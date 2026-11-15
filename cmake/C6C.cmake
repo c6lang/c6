@@ -52,6 +52,15 @@ if(BUILD_TESTING AND EXISTS "${C6C_DIR}/Makefile")
     LABELS "c6c"
     TIMEOUT 600)
 
+  # 目录边界检查（不 include tcc 头、不链接 libtcc、不引用 tcc 的 .c、不出现
+  # LGPL 头、必需文件齐全）。纯 shell + grep，几百毫秒。
+  add_test(NAME c6c-lint
+           COMMAND "${C6_MAKE_EXECUTABLE}" -C "${C6C_DIR}" lint)
+  set_tests_properties(c6c-lint PROPERTIES
+    WORKING_DIRECTORY "${C6C_DIR}"
+    LABELS "c6c"
+    TIMEOUT 300)
+
   # 验收 (1)(2)(3)：自举 fixpoint 逐字节、三后端同一套语料、tests+std+诊断、
   # c6c 编出上游 tcc 并让它跑 tests2（含**第三代 selfhost**）。
   add_test(NAME c6c-check-all
