@@ -926,6 +926,28 @@ static u32 BLOCK_TY;
 static int BLOCK_HAS;
 static u32 METHOD_SELF_TY;  /* 结构体内方法：接收者类型（0 = 普通函数） */
 static u32 CUR_RET_TY;      /* 当前函数的返回类型（return 要按它转换） */
+/* 聚合按值返回的"结果槽"（**只给 C99 输出后端**用）：C 的语义是调用者提供
+ * 位置、被调方写进去；C99 后端以前返回的是被调方帧里那个临时对象的地址，
+ * 调用方拿到就已经失效——它生成的 C 在 `gcc -O1` 下读到被复用的栈，
+ * `struct S s = f();` 全是垃圾（native/LLVM 后端各自有自洽的约定，不受影响）。
+ * 约定：这种函数多收一个隐藏形参（排在所有显式形参后面），`return <聚合>`
+ * 把对象拷进去、再把这个指针原样返回。只在 C99 后端开，所以同一个程序里
+ * 每一对调用点/定义都一致；变参函数不参与（位置对不齐）。 */
+static u32 CUR_SRET;
+
+/* 聚合按值返回走"调用者给槽"那套约定吗？ */
+static int agg_ret_abi(u32 fty, u32 rty)
+{
+    if (!C99_MODE)
+        return 0;               /* native / LLVM 后端保持各自的既有约定 */
+    if (!rty || !ty_is_agg(rty) || ty_size(rty) == 0)
+        return 0;
+    if (fty && ty_func_variadic(fty))
+        return 0;
+    if (fty && ty_is_closure(fty, NULL))
+        return 0;               /* 闭包走 thunk，隐藏实参位置对不齐 */
+    return 1;
+}
 static u32 ty_promote(u32 ty);
 static u32 gen_unary(void);
 static int parse_const_u64(u64 *out);
@@ -7844,6 +7866,36 @@ static void iface_check_impl(u32 ty, u32 ifx)
     }
 }
 
+/* 聚合按值返回的调用方：在实参表末尾补一个隐藏实参——调用方帧里那块结果槽
+ * 的地址（见 CUR_SRET）。返回 0 表示这次调用不走这套。 */
+static u32 sret_slot(u32 ret_ty)
+{
+    u32 addr = 0;
+
+    if (!ret_ty || !ty_is_agg(ret_ty) || ty_size(ret_ty) == 0)
+        return 0;
+    if (!C99_MODE)
+        return 0;
+    addr = irfn_vreg(&FN);
+    irfn_push(&FN, IR_ADDR, IRT_PTR, addr, 0, 0, 0,
+              X64_SLOT(frame_slots_for(ty_size(ret_ty))));
+    return addr;
+}
+
+static u32 sret_pass(u32 *args, u32 *narg, u32 fty)
+{
+    u32 addr = 0;
+
+    if (!fty || !agg_ret_abi(fty, ty_target(fty)))
+        return 0;
+    addr = sret_slot(ty_target(fty));
+    if (addr && *narg < 16) {
+        args[*narg] = addr;
+        (*narg)++;
+    }
+    return addr;
+}
+
 static u32 gen_call(Sym *fs)
 {
     /* 记下这次调用可不可失败：catch / 表达式语句要据此判断 */
@@ -8040,6 +8092,7 @@ static u32 gen_call(Sym *fs)
         E_WAS_CALL = 1;
         return dst;
     }
+    (void)sret_pass(args, &narg, fs->type);
     for (i = 0; i < narg; i++)
         irfn_push(&FN, IR_ARG, IRT_U64, 0, args[i], 0, 0, i);
     dst = irfn_vreg(&FN);
@@ -8357,6 +8410,7 @@ static u32 gen_postfix_ops(u32 v)
                 }
                 pa_expect_ch(')');
             }
+            (void)sret_pass(args, &narg, ft);
             for (i2 = 0; i2 < narg; i2++)
                 irfn_push(&FN, IR_ARG, IRT_U64, 0, args[i2], 0, 0, i2);
             dst = irfn_vreg(&FN);
@@ -8658,6 +8712,13 @@ static u32 gen_postfix_ops(u32 v)
                             pa_expect_ch(')');
                         }
                     }
+                    {
+                        u32 irt = IFACE_RET[ifix][mi] ? IFACE_RET[ifix][mi] : ty_int();
+                        u32 sv = sret_slot(irt);
+
+                        if (sv && narg < 16)
+                            avs[narg++] = sv;
+                    }
                     for (k = 0; k < narg; k++)
                         irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k], 0, 0, k);
                     dst3 = irfn_vreg(&FN);
@@ -8704,6 +8765,7 @@ static u32 gen_postfix_ops(u32 v)
                             pa_expect_ch(')');
                         }
                     }
+                    (void)sret_pass(avs, &narg, ms->type);
                     for (k2 = 0; k2 < narg; k2++)
                         irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k2], 0, 0, k2);
                     dst2 = irfn_vreg(&FN);
@@ -8793,6 +8855,7 @@ static u32 gen_postfix_ops(u32 v)
                             pa_expect_ch(')');
                         }
                     }
+                    (void)sret_pass(avs, &narg, ms->type);
                     for (k2 = 0; k2 < narg; k2++)
                         irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k2], 0, 0, k2);
                     dst3 = irfn_vreg(&FN);
@@ -9922,6 +9985,7 @@ static u32 gen_postfix(void)
                             pa_expect_ch(')');
                         }
                     }
+                    (void)sret_pass(avs, &narg, fs->type);
                     for (k2 = 0; k2 < narg; k2++)
                         irfn_push(&FN, IR_ARG, IRT_U64, 0, avs[k2], 0, 0, k2);
                     dst2 = irfn_vreg(&FN);
@@ -10498,6 +10562,29 @@ static u32 gen_bin2(u32 a, u32 aty, u8 op, u32 b, u32 bty);
 /* `sizeof` 的操作数是不是一个 VLA 对象：`名字` 或 `(名字)`。
  * 返回 1 = 带括号、2 = 不带括号（调用方据此吃 token），0 = 不是。
  * 长度和元素大小从符号上取（声明时算好的）。 */
+/* `return <聚合>` 的两步：先把对象拷进调用者给的槽（**要在跑 cleanup 之前**，
+ * C 的语义是"先把返回值定下来再清场"），再发那条 IR_RET。 */
+static u32 ret_agg_copy(u32 v)
+{
+    u32 ty = CUR_RET_TY;
+
+    if (CUR_SRET && ty_is_agg(ty) && ty_size(ty)) {
+        irfn_push(&FN, IR_COPY, IRT_U8, CUR_SRET, v, 0, 0, ty_size(ty));
+        return CUR_SRET;
+    }
+    return v;
+}
+
+static void ret_emit(u32 v)
+{
+    u32 ty = CUR_RET_TY;
+
+    if (CUR_SRET && ty_is_agg(ty) && ty_size(ty))
+        irfn_push(&FN, IR_RET, IRT_PTR, 0, v, 0, 0, 0);
+    else
+        irfn_push(&FN, IR_RET, ir_ty_of(ty), 0, v, 0, 0, 0);
+}
+
 static int pa_vla_sizeof(u32 *cnt_out, u32 *esz_out)
 {
     Tok *t = pa_cur();
@@ -16382,6 +16469,7 @@ static u32 gen_iface_call(u32 addr, u32 mi, u32 ret_ty, u32 *args, u32 nargs)
     u32 fnv = irfn_vreg(&FN);
     u32 dst = irfn_vreg(&FN);
     u32 k = 0;
+    u32 sv = sret_slot(ret_ty);
 
     irfn_push(&FN, IR_LOAD, IRT_PTR, selfv, addr, 0, 0, 0);
     irfn_push(&FN, IR_LOAD, IRT_PTR, vtv, vt8, 0, 0, 0);
@@ -16390,8 +16478,10 @@ static u32 gen_iface_call(u32 addr, u32 mi, u32 ret_ty, u32 *args, u32 nargs)
     irfn_push(&FN, IR_ARG, IRT_U64, 0, selfv, 0, 0, 0);
     for (k = 0; k < nargs; k++)
         irfn_push(&FN, IR_ARG, IRT_U64, 0, args[k], 0, 0, k + 1);
+    if (sv)
+        irfn_push(&FN, IR_ARG, IRT_U64, 0, sv, 0, 0, nargs + 1);
     irfn_push(&FN, IR_CALLI, ir_ty_of(ret_ty), dst, fnv, 0, 0, 0);
-    FN.ops[FN.n - 1].narg = (u8)(nargs + 1);
+    FN.ops[FN.n - 1].narg = (u8)(nargs + 1 + (sv ? 1 : 0));
     return dst;
 }
 
@@ -16757,8 +16847,10 @@ static void gen_stmt(void)
                 DF_EXCEPT = MGD_NO_SLOT;
                 irfn_push(&FN, IR_RET, IRT_PTR, 0, tsk, 0, 0, 0);
             } else {
+                u32 rvv = ret_agg_copy(addr);
+
                 defer_run(1, on_err);
-                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, addr, 0, 0, 0);
+                ret_emit(rvv);
             }
             return;
         }
@@ -16916,9 +17008,10 @@ static void gen_stmt(void)
                     irfn_push(&FN, IR_COPY, IRT_U8, raddr, v, 0, 0, rsz);
                     v = raddr;
                 }
+                v = ret_agg_copy(v);
                 defer_run(1, on_err);
                 DF_EXCEPT = MGD_NO_SLOT;
-                irfn_push(&FN, IR_RET, ir_ty_of(CUR_RET_TY), 0, v, 0, 0, 0);
+                ret_emit(v);
             }
         }
         return;
@@ -18127,6 +18220,19 @@ static void pa_func_def(Sym *fn, Declarator *d)
                       task_off("m0", 2) + 8 * TASK_MG_N);
             irfn_push(&FN, IR_STORE, IRT_U64, ma, pv, 0, 0, 0);
             TASK_MG_N++;
+        }
+    }
+    /* 聚合按值返回（只有 C99 后端）：多接一个隐藏指针形参，`return <聚合>`
+     * 往里写、再把它原样返回。见 CUR_SRET。 */
+    CUR_SRET = 0;
+    if (agg_ret_abi(fn->type, CUR_RET_TY)) {
+        if (FN.nparams >= 16) {
+            pa_error("形参太多：聚合按值返回还要多接一个隐藏形参（上限 16 个）");
+        } else {
+            u32 rs = irfn_vreg(&FN);
+
+            FN.params[FN.nparams++] = rs;
+            CUR_SRET = rs;
         }
     }
     if (CUR_TASK_TY && TASK_MG_N) {
